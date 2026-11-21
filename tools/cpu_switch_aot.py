@@ -3,8 +3,8 @@
 Each export takes three integer words in RCX, RDX and R8 and returns RAX. The
 translator follows branches and jump-table entries from the export, so data
 placed after the code (as MSVC does with its tables) is never decoded. An
-indirect JMP is accepted only at the end of one of these sequences, reached by
-the fallthrough of an unsigned bound check on the index:
+indirect JMP through a register is accepted only at the end of one of these
+sequences, reached by the fallthrough of an unsigned bound check on the index:
 
     mov E32, [B+I*4+table]; add E, B; jmp E   B = image base (MSVC)
     movsxd E, [B+I*4];      add E, B; jmp E   B = table      (LLVM)
@@ -28,14 +28,34 @@ the flags unchanged (moves, LEA, NOT, SETcc, CMOVcc) may sit between them.
 A forward pass records how many low bytes (0, 1, 2 or 8) of each register every
 path defines. A read needs as many defined bytes as it uses, and an 8- or 16-bit
 write keeps the other bytes of its register. The return width is the number of
-consecutive low RAX bytes that are definitely defined at every reachable RET or
-RET 0: 0, 1, 2 or 8, the lower bound over joins and over returns. It counts
+consecutive low RAX bytes that are definitely defined at every reachable normal
+return: 0, 1, 2 or 8, the lower bound over joins and over returns. A RET or
+RET 0 contributes the bytes defined there; a tail jump (below) contributes the
+number of guaranteed low RAX bytes that its binding states. The width counts
 defined bytes and does not establish a source-language type. It is None when no
-RET is reachable, which describes the reachable control flow and makes no
-termination claim. The generated source states the width unless it is 8.
+normal return is reachable, which describes the reachable control flow and makes
+no termination claim. The generated source states the width unless it is 8, and
+always for a function with a tail jump.
+
+A tail jump through the import address table, jmp QWORD PTR [rip+slot], is
+translated only through an explicit binding (--bind, as in cpu_call_aot.py): the
+provider DLL and the slot's import by name or #ordinal, the number of integer
+arguments the import takes (3 or 4, passed in RCX, RDX, R8 and R9) and the number
+of guaranteed low RAX bytes of its return (0, 1, 2 or 8; 0 is a normal return
+with no guaranteed result bits). Like an export's own argument count, both are
+chosen by whoever invokes the translator; neither is derived from the machine
+code or the provider. The two counts are independent: every register the import
+takes must be fully defined at the jump, so a three-argument export can pass a
+fourth argument only after writing R9 itself. The jump becomes
+"return import(...);" and ends the path, so no register or flag clobber after
+the call is modeled. Stack and floating-point arguments are not forwarded. One
+binding covers one IAT slot for all exports of a run. The import's name must not
+be one that the prelude's <cstdlib> or <cstring> declares, such as free or
+memset: MSVC rejects the redeclaration.
 """
 
 import argparse
+from collections import namedtuple
 from pathlib import Path
 import struct
 
@@ -43,6 +63,7 @@ import pefile
 from iced_x86 import (ConditionCode as CC, Decoder, FlowControl, MemorySizeExt, Mnemonic as M, OpKind,
                       Register as R, RegisterExt)
 
+from cpu_call_aot import resolve_import
 from cpu_leaf_aot import export_rva
 from cpu_ranges import function_ranges, image_bytes
 
@@ -54,6 +75,10 @@ NAMES = {R.RAX: "rax", R.RCX: "rcx", R.RDX: "rdx", R.RBX: "rbx", R.RSP: "rsp", R
 ARGUMENT_REGISTERS = (R.RCX, R.RDX, R.R8, R.R9)
 ARGUMENT_COUNTS = (3, 4)
 DEFAULT_ARGUMENTS = 3
+# The import a tail jump calls. provider: DLL path; symbol: export name or "#ordinal"; link_name: import-library
+# name for an ordinal; arguments: integer arguments the import takes (one of ARGUMENT_COUNTS, independent of the
+# entry's count); return_bytes: guaranteed low RAX bytes of its return.
+Binding = namedtuple("Binding", "provider symbol link_name arguments return_bytes")
 VOLATILE = {R.RAX, R.RCX, R.RDX, R.R8, R.R9, R.R10, R.R11}
 HIGH_BYTES = {R.AH, R.BH, R.CH, R.DH}
 ALU = {M.ADD: "+", M.SUB: "-", M.AND: "&", M.OR: "|", M.XOR: "^"}
@@ -123,6 +148,8 @@ class Function:
         self.ending = {}
         self.successors = {}
         self.dispatches = {}
+        self.tails = {}  # tail jump RVA -> IAT slot RVA
+        self.tail = None  # (slot, C name, Binding) once bound
 
     def decode(self, ip):
         for begin, end, data in self.ranges:
@@ -170,6 +197,12 @@ class Function:
                 targets = [ins.near_branch_target]
             elif flow == FlowControl.RETURN and ins.mnemonic == M.RET and (ins.op_count == 0 or ins.immediate(0) == 0):
                 targets = []
+            elif (flow == FlowControl.INDIRECT_BRANCH and ins.op0_kind == OpKind.MEMORY
+                  and ins.memory_base == R.RIP and ins.memory_index == R.NONE and not ins.has_segment_prefix
+                  and MemorySizeExt.size(ins.memory_size) == 8):
+                # A tail jump through a 64-bit slot (the IAT); the 67h form (EIP base) stays rejected.
+                targets = []
+                self.tails[ip] = ins.ip_rel_memory_address
             elif flow == FlowControl.INDIRECT_BRANCH and ins.op0_kind == OpKind.REGISTER:
                 targets = []
                 indirect.append(ip)
@@ -580,14 +613,47 @@ def flag_producer(function, edges, consumer):
     raise ValueError(f"flag producer too far before RVA {consumer.ip:#x}")
 
 
-def lift(pe, name, arguments=DEFAULT_ARGUMENTS):
-    """Translate one export that takes the given number of integer arguments, 3 or 4."""
+def bind_tail(pe, function, binding):
+    """Resolve the one IAT slot that the function's tail jumps use against the explicit binding."""
+    slots = sorted(set(function.tails.values()))
+    if not slots:
+        return
+    if binding is None:
+        raise ValueError(f"no binding for the tail jump through IAT slot RVA {slots[0]:#x} "
+                         f"at RVA {min(function.tails):#x}")
+    if len(slots) > 1:
+        raise ValueError(f"tail jump through a second IAT slot RVA {slots[1]:#x}")
+    if binding.arguments not in ARGUMENT_COUNTS or binding.return_bytes not in (0, 1, 2, 8):
+        raise ValueError(f"unsupported binding of {binding.symbol}: {binding.arguments!r} import arguments "
+                         f"(expected 3 or 4) and {binding.return_bytes!r} return bytes (expected 0, 1, 2 or 8)")
+    symbol = resolve_import(pe, slots[0], Path(binding.provider), binding.symbol, binding.link_name)
+    function.tail = (slots[0], symbol, binding)
+
+
+def return_note(function):
+    """The return width as the CLI and the generated comment state it."""
+    width = function.return_width
+    if width is None:
+        return "no reachable normal return"
+    if function.tail is None:
+        return f"{width} low byte(s) are defined at every reachable RET"
+    _, symbol, binding = function.tail
+    rets = ("no RET is reachable" if function.ret_width is None
+            else f"{function.ret_width} defined at every reachable RET")
+    return (f"{width} low byte(s) at every reachable normal return: {rets}, {binding.return_bytes} "
+            f"guaranteed after every tail jump to {symbol} as the binding states")
+
+
+def lift(pe, name, arguments=DEFAULT_ARGUMENTS, binding=None):
+    """Translate one export that takes the given number of integer arguments, 3 or 4; binding is the import
+    that its tail jumps call, if it has any."""
     if not isinstance(arguments, int) or arguments not in ARGUMENT_COUNTS:
         raise ValueError(f"unsupported argument count {arguments!r} for export {name}: expected 3 or 4")
     entry = export_rva(pe, name)
     function = Function(pe, entry)
     function.arguments = ARGUMENT_REGISTERS[:arguments]
     edges = function.explore()
+    bind_tail(pe, function, binding)
     lifter = Lifter()
     order = sorted(function.instructions)
     instructions = function.instructions
@@ -622,6 +688,14 @@ def lift(pe, name, arguments=DEFAULT_ARGUMENTS):
             body[ip] = "\n    ".join(lines)
             # The guest jump target has no host meaning after the dispatch.
             effects[ip] = ({}, {}, {target})
+        elif ip in function.tails:
+            # The bound import returns to this function's caller; its argument registers must be fully
+            # defined and hold no guest address. The path ends here, so nothing after the call is modelled.
+            _, symbol, bound = function.tail
+            forwarded = ARGUMENT_REGISTERS[:bound.arguments]
+            lifter.used.update(forwarded)
+            body[ip] = f"return {symbol}({', '.join(NAMES[r] for r in forwarded)});"
+            effects[ip] = (dict.fromkeys(forwarded, 8), {}, set())
         elif ip in skipped:
             # The table load reads the 64-bit index; it and the add leave guest addresses behind.
             effects[ip] = ({loads[ip]: 8} if ip in loads else {}, {}, {full(ins.op0_register)})
@@ -669,7 +743,11 @@ def lift(pe, name, arguments=DEFAULT_ARGUMENTS):
             if guest:
                 raise ValueError(f"return value may hold a guest address at RVA {ip:#x}")
             widths.append(defined)
-    # Consecutive low RAX bytes defined at every reachable RET; None when no RET is reachable.
+    function.ret_width = min(widths) if widths else None
+    if function.tails:
+        # A tail jump returns what the import returns: the binding states how many low bytes that guarantees.
+        widths.append(function.tail[2].return_bytes)
+    # Consecutive low RAX bytes defined at every reachable normal return; None when none is reachable.
     function.return_width = min(widths) if widths else None
 
     labels = set(edges)
@@ -699,10 +777,9 @@ def lift(pe, name, arguments=DEFAULT_ARGUMENTS):
     signature = (f'extern "C" __declspec(dllexport) word lifted_{name}'
                  f'({", ".join(f"word {NAMES[r]}" for r in function.arguments)})')
     comment = []
-    if function.return_width is None:
-        comment = ["// RAX: no reachable normal return"]
-    elif function.return_width < 8:
-        comment = [f"// RAX: {function.return_width} low byte(s) are defined at every reachable RET"]
+    if function.return_width is None or function.return_width < 8 or function.tail:
+        # A width that depends on a binding is always stated.
+        comment = [f"// RAX: {return_note(function)}"]
     source = [*comment, signature + " {", *("    " + d for d in declarations), *text, "}"]
     return "\n".join(source), function
 
@@ -736,32 +813,66 @@ def parse_entry(spec):
     return name, int(count)
 
 
-def translate_pe(pe, names):
+def translate_pe(pe, names, binding=None):
     if pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20B:
         raise ValueError("expected AMD64 PE32+")
-    functions = [lift(pe, *parse_entry(name)) for name in names]
-    return PRELUDE + "\n".join(f"\n{source}" for source, _ in functions) + "\n", [f for _, f in functions]
+    functions = [lift(pe, *parse_entry(name), binding=binding) for name in names]
+    tails = sorted({f.tail[:2] for _, f in functions if f.tail})
+    if binding is not None and not tails:
+        raise ValueError(f"binding {Path(binding.provider).name}!{binding.symbol} supplied but no tail jump uses it")
+    if len(tails) > 1:
+        raise ValueError(f"tail jump through a second IAT slot RVA {tails[1][0]:#x}")
+    imports = ""
+    if tails:
+        symbol = tails[0][1]
+        imports = (f"\n// {symbol}: bound import with {binding.arguments} integer argument(s) and "
+                   f"{binding.return_bytes} guaranteed low RAX byte(s), as the binding states; neither "
+                   "number is read from the provider\n"
+                   f'extern "C" __declspec(dllimport) word {symbol}({", ".join(["word"] * binding.arguments)});\n')
+    return (PRELUDE + imports + "\n".join(f"\n{source}" for source, _ in functions) + "\n",
+            [f for _, f in functions])
 
 
-def translate(image, names):
+def translate(image, names, binding=None):
     with pefile.PE(str(image), fast_load=True) as pe:
-        return translate_pe(pe, names)
+        return translate_pe(pe, names, binding)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0], epilog=(
+        "A binding covers the one IAT slot that the exports' tail jumps use. The bound import takes three or four "
+        "integer arguments in RCX, RDX, R8 and R9 (--import-arguments, independent of each export's own count) and "
+        "returns in RAX; stack and floating-point arguments are not forwarded. Its name must not be one that "
+        "<cstdlib> or <cstring> declares (free, memset, strlen, ...)."))
     parser.add_argument("image", type=Path)
     parser.add_argument("exports", help='comma-separated export names; "name:4" translates that export with a '
                                         "fourth integer argument in R9, and the host must pass four")
     parser.add_argument("output", type=Path)
+    parser.add_argument("--bind", nargs=2, metavar=("PROVIDER_DLL", "SYMBOL"),
+                        help="provider and export name or #ordinal of the import that a tail jump calls")
+    parser.add_argument("--link-name", help="local import-library symbol for an ordinal binding")
+    parser.add_argument("--import-arguments", type=int, choices=ARGUMENT_COUNTS,
+                        help="integer arguments the bound import takes; stated by the binding, not derived from "
+                             "the provider (required with --bind)")
+    parser.add_argument("--return-bytes", type=int, choices=(0, 1, 2, 8),
+                        help="guaranteed low RAX bytes of the bound import's return, 0 for none; stated by "
+                             "the binding, not derived from the provider (required with --bind)")
     args = parser.parse_args()
+    binding = None
+    if args.bind:
+        if args.import_arguments is None or args.return_bytes is None:
+            parser.error("--bind requires --import-arguments and --return-bytes")
+        binding = Binding(Path(args.bind[0]), args.bind[1], args.link_name, args.import_arguments, args.return_bytes)
+    elif args.link_name is not None or args.import_arguments is not None or args.return_bytes is not None:
+        parser.error("--link-name, --import-arguments and --return-bytes require --bind")
     try:
-        source, functions = translate(args.image, args.exports.split(","))
+        source, functions = translate(args.image, args.exports.split(","), binding)
         args.output.write_text(source, encoding="utf-8")
         for function in functions:
             print(f"RVA {function.entry:#x}: {len(function.instructions)} instructions, "
                   f"{sum(len(d[1]) for d in function.dispatches.values())} table entries, "
-                  + ("no reachable normal return" if function.return_width is None else
+                  + (f"RAX: {return_note(function)}" if function.tail else
+                     "no reachable normal return" if function.return_width is None else
                      f"{function.return_width} defined RAX byte(s) at every reachable RET"))
     except (ValueError, OSError, pefile.PEFormatError) as error:
         parser.exit(1, f"{error}\n")
