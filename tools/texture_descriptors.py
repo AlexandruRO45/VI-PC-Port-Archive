@@ -5,8 +5,10 @@ from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from itertools import pairwise
 import json
+import os
 from pathlib import Path
 import struct
+import sys
 from typing import BinaryIO, NamedTuple
 import zlib
 
@@ -33,6 +35,7 @@ class Tables(NamedTuple):
     boundaries: int
     records: int
     logical_size: int
+    version: int
 
 
 class PageMap(NamedTuple):
@@ -80,13 +83,32 @@ def read_tables(stream: BinaryIO) -> Tables:
     # The first stored range can include alignment padding beyond its logical end.
     extent = min(second.stored - first.stored, second.logical)
     metadata = PagedResource(stream, [Segment(first.stored, extent, extent, "raw")])
-    tag, records = struct.unpack("<4s4xI4x", metadata.read(0, 16))
+    tag, version, records = struct.unpack("<4sII4x", metadata.read(0, 16))
     if tag != b"ETPF":
         raise ValueError("Expected ETPF at the first RDS5 boundary")
     table_bytes = records * 16
     if table_bytes > min(1 << 20, extent - 16):
         raise ValueError("ETPF descriptor table exceeds its first range or 1 MiB budget")
-    return Tables(archive, metadata, count, records, logical_size)
+    return Tables(archive, metadata, count, records, logical_size, version)
+
+
+def descriptor_indices(stream: BinaryIO, key: int) -> list[int]:
+    if not 0 <= key < 1 << 64:
+        raise ValueError("Texture key must be an unsigned 64-bit integer")
+    tables = read_tables(stream)
+    if tables.version != 0x27a:
+        raise ValueError("Unsupported ETPF key-table version")
+    keys_start = 16 + tables.records * 16
+    keys_size = tables.records * 8
+    if keys_start + keys_size > tables.metadata.size:
+        raise ValueError("ETPF key table exceeds its first range")
+    matches: list[int] = []
+    for offset in range(0, keys_size, 4096):
+        batch = tables.metadata.read(keys_start + offset, min(4096, keys_size - offset))
+        for index, (candidate,) in enumerate(struct.iter_unpack("<Q", batch), start=offset // 8):
+            if candidate == key:
+                matches.append(index)
+    return matches
 
 
 def page_address(location: int, logical_size: int) -> int:
@@ -176,23 +198,44 @@ def zlib_segment(stream: BinaryIO, index: int) -> ZlibSegment:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("archive", type=Path)
+    parser.add_argument("archives", metavar="archive", type=Path, nargs="+")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--raw-page-map", type=int, metavar="INDEX",
                       help="Report offsets of a zero-based descriptor's first 4 KiB page in a verified raw range")
     mode.add_argument("--zlib-segment", type=int, metavar="INDEX",
                       help="Verify the zlib interval containing the descriptor's first page and report its extents")
+    mode.add_argument("--lookup-key", metavar="KEY",
+                      help="Find all descriptor indices for a decimal or 0x-prefixed 64-bit texture key")
     args = parser.parse_args()
+    archive = args.archives[0]
     try:
-        with args.archive.open("rb") as file:
-            if args.zlib_segment is not None:
-                print(json.dumps(asdict(zlib_segment(file, args.zlib_segment)), indent=2))
-            elif args.raw_page_map is None:
-                counts = inventory(file)
-                print(json.dumps({"descriptor_count": sum(counts.values()), "groups": [
-                    {**item._asdict(), "count": counts[item]} for item in sorted(counts)
-                ]}, indent=2))
-            else:
-                print(json.dumps(raw_page_map(file, args.raw_page_map)._asdict(), indent=2))
+        if args.lookup_key is not None:
+            key = int(args.lookup_key, 16 if args.lookup_key.lower().startswith("0x") else 10)
+            seen: set[tuple[int, int]] = set()
+            matches: list[dict[str, str | int]] = []
+            for archive in args.archives:
+                with archive.open("rb") as file:
+                    stat = os.fstat(file.fileno())
+                    identity = (stat.st_dev, stat.st_ino)
+                    if identity in seen:
+                        raise ValueError("Duplicate archive input")
+                    seen.add(identity)
+                    matches.extend({"archive": str(archive), "descriptor_index": index}
+                                   for index in descriptor_indices(file, key))
+            json.dump({"matches": matches}, sys.stdout, indent=2)
+            print()
+        else:
+            if len(args.archives) != 1:
+                parser.error("Multiple archives require --lookup-key")
+            with archive.open("rb") as file:
+                if args.zlib_segment is not None:
+                    print(json.dumps(asdict(zlib_segment(file, args.zlib_segment)), indent=2))
+                elif args.raw_page_map is None:
+                    counts = inventory(file)
+                    print(json.dumps({"descriptor_count": sum(counts.values()), "groups": [
+                        {**item._asdict(), "count": counts[item]} for item in sorted(counts)
+                    ]}, indent=2))
+                else:
+                    print(json.dumps(raw_page_map(file, args.raw_page_map)._asdict(), indent=2))
     except (OSError, ValueError) as exc:
-        parser.exit(1, f"{args.archive}: {exc}\n")
+        parser.exit(1, f"{archive}: {exc}\n")

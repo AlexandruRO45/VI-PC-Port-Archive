@@ -67,6 +67,78 @@ def zlib_page_archive() -> tuple[bytearray, bytes, bytes]:
 
 
 class ResourceChecks(unittest.TestCase):
+    def test_texture_key_matches(self) -> None:
+        tool = Path(__file__).resolve().parents[1] / "tools" / "texture_descriptors.py"
+        key = 0xFEDCBA9876543210
+        with TemporaryDirectory() as directory:
+            first = Path(directory) / "assets.ttpf"
+            second = Path(directory) / "pack" / "assets.ttpf"
+            second.parent.mkdir()
+            for path, keys in ((first, [key - (1 << 32), key, key + 1]),
+                               (second, [key, key, (1 << 64) - 1])):
+                archive = raw_page_archive()
+                struct.pack_into("<4sIII", archive, 256, b"ETPF", 0x27a, len(keys), 0)
+                struct.pack_into("<3Q", archive, 272 + len(keys) * 16, *keys)
+                path.write_bytes(archive)
+
+            def lookup(value: str, *paths: Path) -> subprocess.CompletedProcess[str]:
+                return subprocess.run([sys.executable, "-B", tool, "--lookup-key", value, *paths],
+                                      text=True, capture_output=True)
+
+            for value, expected in (
+                (hex(key), [(second, 0), (second, 1), (first, 1)]),
+                (str(key - (1 << 32)), [(first, 0)]), (hex(key + 1), [(first, 2)]),
+                (str((1 << 64) - 1), [(second, 2)]), ("0", []),
+            ):
+                with self.subTest(value=value):
+                    result = lookup(value, second, first)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads(result.stdout), {"matches": [
+                        {"archive": str(path), "descriptor_index": index} for path, index in expected]})
+            alias = Path(directory) / "alias.ttpf"
+            alias.hardlink_to(first)
+            for value, paths in ((hex(key), [first, first]), (hex(key), [first, alias]),
+                                 ("-1", [first]), (str(1 << 64), [first])):
+                with self.subTest(value=value, paths=len(paths)):
+                    failed = lookup(value, *paths)
+                    self.assertNotEqual(failed.returncode, 0)
+                    self.assertEqual(failed.stdout, "")
+
+    def test_texture_key_table_bounds(self) -> None:
+        from texture_descriptors import descriptor_indices
+
+        # The largest supported descriptor array occupies exactly 1 MiB.
+        count = 65536
+        extent = ((16 + count * 24 + 4095) // 4096) * 4096
+        archive = bytearray(256 + extent)
+        struct.pack_into("<4sIQ4I", archive, 0, b"RDS5", 2, extent, 1, 0,
+                         ((extent // 4096 % 4) << 30) | (len(archive) // 256), extent // 16384)
+        struct.pack_into("<4sIII", archive, 256, b"ETPF", 0x27a, count, 0)
+        keys_start = 272 + count * 16
+        struct.pack_into("<Q", archive, keys_start + (count - 1) * 8, (1 << 64) - 1)
+
+        class KeyTableOnly(io.BytesIO):
+            def read(self, size: int = -1, /) -> bytes:
+                pos = self.tell()
+                if not 0 <= size <= 4096 or not any(
+                    left <= pos <= pos + size <= right for left, right in
+                    ((0, 32), (256, 272), (keys_start, keys_start + count * 8))
+                ):
+                    raise AssertionError("Lookup read outside bounded metadata or key array")
+                return super().read(size)
+
+        self.assertEqual(descriptor_indices(KeyTableOnly(archive), (1 << 64) - 1), [count - 1])
+        for field, value, reason in ((260, 0, "version"), (264, count + 1, "budget")):
+            changed = archive.copy()
+            struct.pack_into("<I", changed, field, value)
+            with self.assertRaisesRegex(ValueError, reason):
+                descriptor_indices(KeyTableOnly(changed), 19)
+        # Descriptor array fits in the first range but its key array ends beyond it.
+        changed = raw_page_archive()
+        struct.pack_into("<II", changed, 260, 0x27a, 171)
+        with self.assertRaisesRegex(ValueError, "key table"):
+            descriptor_indices(io.BytesIO(changed), 19)
+
     def test_verified_zlib_segment(self) -> None:
         tool = Path(__file__).resolve().parents[1] / "tools" / "texture_descriptors.py"
         archive, packed, plain = zlib_page_archive()
