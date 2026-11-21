@@ -50,7 +50,8 @@ def lower(body, initial, globals_, calls, exits):
              "bool zero=false, carry=false;", "rsp = reinterpret_cast<word>(frame);", *initial]
     allowed = {i.ip for i in body} | set(exits)
     xmm = {R.XMM0: "xmm0", R.XMM1: "xmm1", R.XMM2: "xmm2"}
-    has_xmm_math = any(i.mnemonic in (M.VMOVDQU, M.VPSRLDQ, M.VPADDD, M.VMOVD) for i in body)
+    has_xmm_math = any(i.mnemonic in (M.VMOVDQU, M.VPSRLDQ, M.VMOVD)
+                       or (i.mnemonic == M.VPADDD and i.op2_kind != K.MEMORY) for i in body)
     if has_xmm_math:
         lines.append("__m128i xmm0{}, xmm1{}, xmm2{};")
     # Unaligned YMM copies and VEX zeroing in the descriptor builder need
@@ -107,6 +108,8 @@ def lower(body, initial, globals_, calls, exits):
             stmt = write(f"int64_t(int32_t({operand(1)}))")
         elif op == M.CMOVNE:
             stmt = write(f"zero ? {operand(0)} : {operand(1)}")
+        elif op == M.CMOVE:
+            stmt = write(f"zero ? {operand(1)} : {operand(0)}")
         elif op == M.CMOVBE:
             stmt = write(f"(carry || zero) ? {operand(1)} : {operand(0)}")
         elif op == M.LEA:
@@ -119,12 +122,13 @@ def lower(body, initial, globals_, calls, exits):
             lhs, rhs = operand(i.op_count - 2), operand(i.op_count - 1)
             stmt = (f"{{ const int64_t product = int64_t(int32_t({lhs})) * int32_t({rhs}); "
                     f"carry = product != int32_t(product); {write('product')} }}")
-        elif op == M.SHL and i.op1_kind == K.IMMEDIATE8 and RegisterExt.size(i.op0_register) in (4, 8):
+        elif op in (M.SHL, M.SHR) and i.op1_kind == K.IMMEDIATE8 and RegisterExt.size(i.op0_register) in (4, 8):
             size = RegisterExt.size(i.op0_register)
             bits = 8 * size
             count = i.immediate(1) & (bits - 1)
-            stmt = (f"{{ const {UINT[size]} a = {operand(0)}, v = a << {count}; "
-                    f"carry = ((a >> {bits-count}) & 1) != 0; zero = v == 0; {write('v')} }}") if count else ";"
+            shift, last = ("<<", bits-count) if op == M.SHL else (">>", count-1)
+            stmt = (f"{{ const {UINT[size]} a = {operand(0)}, v = a {shift} {count}; "
+                    f"carry = ((a >> {last}) & 1) != 0; zero = v == 0; {write('v')} }}") if count else ";"
         elif op in (M.ADD, M.AND, M.OR, M.XOR, M.INC, M.DEC, M.SUB, M.SBB):
             operator = {M.ADD: "+", M.INC: "+", M.DEC: "-", M.AND: "&", M.OR: "|", M.XOR: "^", M.SUB: "-", M.SBB: "-"}[op]
             rhs = "1" if op in (M.INC, M.DEC) else operand(1)
@@ -134,6 +138,26 @@ def lower(body, initial, globals_, calls, exits):
                       M.INC: "", M.DEC: "", M.XOR: "carry = false;", M.AND: "carry = false;", M.OR: "carry = false;"}[op]
             stmt = (f"{{ const {width} a = {operand(0)}, b = static_cast<{width}>({rhs}); "
                     f"const {width} v = static_cast<{width}>({expr}); {update} zero = v == 0; {write('v')} }}")
+        elif op in (M.VMOVQ, M.VMOVSD, M.VMOVHPD) and has_wide:
+            lanes = {R.XMM0: "wide0", R.XMM1: "wide1", R.XMM2: "wide2"}
+            if i.op1_kind == K.MEMORY and op != M.VMOVHPD:
+                dst = lanes[i.op0_register]
+                stmt = f"{dst} = {{}}; memcpy({dst}.data(), reinterpret_cast<const void*>({address()}), 8);"
+            elif i.op0_kind == K.MEMORY:
+                start = 8 if op == M.VMOVHPD else 0
+                stmt = f"memcpy(reinterpret_cast<void*>({address()}), {lanes[i.op1_register]}.data()+{start}, 8);"
+            else:
+                raise ValueError(f"unsupported vector move at {i.ip:#x}")
+        elif has_wide and op in (M.VPADDD, M.VPSRLD):
+            lanes = {R.XMM0: "wide0", R.XMM1: "wide1", R.XMM2: "wide2"}
+            src, dst = lanes[i.op1_register], lanes[i.op0_register]
+            operation = (f"+ load<uint32_t>(({address()}) + n)" if op == M.VPADDD
+                         else f">> {i.immediate(2)}")
+            if op == M.VPSRLD and i.immediate(2) >= 32:
+                raise ValueError("unsupported packed shift count")
+            stmt = (f"{{ auto input = {src}; {dst} = {{}}; for (size_t n=0; n<16; n+=4) {{ "
+                    f"auto v = load<uint32_t>(reinterpret_cast<word>(input.data()+n)) {operation}; "
+                    f"memcpy({dst}.data()+n, &v, 4); }} }}")
         elif op == M.VMOVUPS and i.op1_kind == K.MEMORY:
             stmt = f"{wide[i.op0_register]} = load<std::array<uint8_t,32>>({address()});"
         elif op == M.VMOVUPS and i.op0_kind == K.MEMORY:

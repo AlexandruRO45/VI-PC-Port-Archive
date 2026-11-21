@@ -135,7 +135,7 @@ void check_ffx_recurrent(ID3D12Device* device)
             throw std::runtime_error("Unexpected initial resource table or cursor");
         RecurrentBinding binding{probe};
         run_recurrent(binding, provider, config);
-        auto wanted_indices = std::array<uint32_t, 24>{};
+        auto wanted_indices = std::array<uint32_t, 25>{};
         wanted_indices.fill(UINT32_MAX);
         wanted_indices[13] = 1;
         if (binding.result != S_OK || !binding.resource || provider.resources != wanted_indices ||

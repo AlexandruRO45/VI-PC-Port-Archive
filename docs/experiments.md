@@ -169,7 +169,39 @@ The resource record stores the UAV base at +0x34 and the count at +0x38, both 1.
 
 The same `ffx_recurrent_hardware` and `ffx_recurrent_warp` commands above run the pixel check. A source-built compute shader writes a coordinate-dependent RGBA pattern through the original shader-visible UAV. A second pass writes a different pattern through a copy of the CPU UAV mirror. For shader access the probe copies the CPU-only SRV and UAV mirror into a separate, shader-visible test heap. A read shader samples the SRV at texel centers and writes packed RGBA bytes to a buffer. A separate `CopyTextureRegion` reads the original resource pointer directly. After a fence, both paths must match the CPU's expected RGBA value for every pixel. [D3D12 descriptor copying](https://learn.microsoft.com/en-us/windows/win32/direct3d12/copying-descriptors)
 
-Both adapters passed both patterns at 1920×1080 and 1600×900. Each adapter checked 7,027,200 pixels through the SRV and the same number through direct copies, with zero mismatches, debug errors or warnings. The local build executes the package-derived view creation through the cursor update at RVA `0x389b`. Public Windows CI runs the source-owned WARP control. The test shaders exercise descriptor access. The remaining provider resource loop and the full upscaling dispatch are still open. [Provider loop follow-up #44](https://github.com/R0Y00/Xbox2Windows/issues/44)
+Both adapters passed both patterns at 1920×1080 and 1600×900. Each adapter checked 7,027,200 pixels through the SRV and the same number through direct copies, with zero mismatches, debug errors or warnings. The local build executes the package-derived view creation through the cursor update at RVA `0x389b`. Public Windows CI runs the source-owned WARP control. The test shaders exercise descriptor access. The provider loop is covered below.
+
+### Provider resource loop and returned handles
+
+At 1280×720 render and 1920×1080 output, the default provider visits twelve candidate descriptors in order. The builder at RVA `0xbf60` emits 104 bytes per candidate. The loop at `0xd1d0` skips ID 23 when bit 9 of the create flags is clear. The index destination is `provider + 0x148 + 4 * ID`. Three callbacks also allocate an upload resource from the same cursor.
+
+| ID | Resource (FSR4UPSCALER_ prefix) | Shape | Default index | Index with flag 0x200 |
+| ---: | --- | --- | ---: | ---: |
+| 13 | Recurrent | 1920×1080 RGBA8 | 1 | 1 |
+| 14 | History | 1920×1080 RGBA16F | 2 | 2 |
+| 15 | HistoryReprojected | 1920×1080 RGBA16F | 3 | 3 |
+| 16 | RcasIntermediary | 1920×1080 RGB9E5 | 4 | 4 |
+| 5 | AutoExposure | 8-byte raw buffer | 5 | 5 |
+| 17 | DefaultExposure | 1×1 RG32F | 7 | 7 |
+| 6 | SpdAtomicCounter | 1×1 R32_UINT | 9 | 9 |
+| 7 | Luma_Mip_5 | 80×45 R32F | 11 | 11 |
+| 22 | ScratchBuffer | 21,045,760-byte raw buffer | 12 | 12 |
+| 20 | InitializerBuffer | 131,072-byte raw buffer | 13 | 13 |
+| 21 | InitializerBuffer_Upload | 131,072-byte upload buffer | 14 | 14 |
+| 23 | DebugInformation | 1920×1080 R16_UNORM | 0 (skipped) | 15 |
+
+The uploads for IDs 5, 17 and 6 occupy slots 6, 8 and 10 respectively. ID 21 is a named provider resource with its own index. The package row loop treats the zero height of ID 5 as zero rows to initialize, despite its eight-byte input payload. ID 17 supplies two float ones and ID 6 supplies a zero fill. The desktop binding uses committed resources, creates SRVs and paired UAVs for eligible resources, and submits the initialization copies with a fence. Default-heap buffers use desktop COMMON state and implicit promotion.
+
+On success, the translated loop copies all 25 indices to the mirror at +0x1ac and writes the provider pointer through the output argument at RVA `0xd263`. The loader returns a separate 16-byte wrapper containing the callback table and that same provider pointer. With flags 0 and 0x200 both adapters returned 0, with next resource indices 15 and 16 respectively. Injecting a callback return of 7 at ID 20 returned 3 through the provider and loader, left both output handles null, preserved the previous resource indices, and left the mirror untouched. The test checks every live backend record against its D3D12 object, both index tables, and the loader wrapper fields. All three cases completed with zero debug errors or warnings on the RTX 4060 Laptop and WARP.
+
+The first desktop format difference occurs at ID 16. WARP exposed typed RGB9E5 UAV stores. The RTX driver (32.0.16.1656) lacked that capability, so the binding created an R32_UINT texture and views for the packed bits. Shader packing, filtering and complete upscaling output remain unverified.
+
+The local build translates the descriptor builder, debug flag, loop and writeback, resource-slot reservation, upload-descriptor construction, and selected create-export branches. Registry selection and the backend device callbacks are bound on the host. When the pinned loader DLL is beside the upscaler DLL, the probe also executes the recompiled loader create path against that provider. Public CI runs the source-owned provider control on WARP. Configure the local package build as in the recurrent texture test above and run:
+
+```powershell
+cmake --build out/build/ffx-device --target offscreen_check
+ctest --test-dir out/build/ffx-device -R '^ffx_provider_loop_' --no-tests=error -V
+```
 
 ### FidelityFX context creation and ownership
 

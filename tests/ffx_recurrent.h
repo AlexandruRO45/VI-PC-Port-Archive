@@ -10,8 +10,8 @@ static_assert(offsetof(RecurrentConfig, output_width) == 0x1c);
 struct RecurrentProvider {
     FfxSlotOutput slot;
     uint8_t pad[0x148 - sizeof(FfxSlotOutput)]{};
-    std::array<uint32_t, 24> resources;
-    uint8_t reserved[0x228 - 0x1a8]{};
+    std::array<uint32_t, 25> resources, mirror;
+    uint8_t reserved[0x228 - 0x210]{};
     uint32_t render[2]{}, output[2]{};
 };
 static_assert(offsetof(RecurrentProvider, resources) == 0x148 && offsetof(RecurrentProvider, output) == 0x230);

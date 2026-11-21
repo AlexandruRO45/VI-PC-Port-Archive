@@ -11,6 +11,7 @@
 #include <cstring>
 #include "triangle_vs.h"
 #include "triangle_ps.h"
+#include "ffx_provider_loop.h"
 #include "desktop_gpu.h"
 
 #ifdef OFFSCREEN_AGILITY_620
@@ -344,6 +345,8 @@ int main(int argc, char** argv)
             check_compute(device.Get(), operation == "--compute-tables");
         } else if (argc == 3 && operation == "--ffx-device-init") {
             check_ffx_device_init(device.Get());
+        } else if (argc == 3 && operation == "--ffx-provider-loop") {
+            check_ffx_provider_loop(device.Get());
         } else if (argc == 3 && operation == "--ffx-recurrent") {
             check_ffx_recurrent(device.Get());
         } else if (operation == "--check-bc7-tail") {
