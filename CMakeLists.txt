@@ -1681,7 +1681,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_crc_castagnoli>" "$<TARGET_FILE:cpu_crc_castagnoli_lifted>")
     add_library(cpu_exe_second_provider SHARED tests/cpu/exe_second_provider.cpp)
     target_link_libraries(cpu_exe_second_provider PRIVATE cpu_exe_io)
-    foreach(variant IN ITEMS original inverted pair swapped framed image two_providers)
+    foreach(variant IN ITEMS original inverted pair swapped framed image two_providers nested nested_bypass)
         set(native cpu_exe_${variant})
         set(lifted ${native}_lifted)
         add_executable(${native} tests/cpu/exe_entry.asm)
@@ -1713,6 +1713,13 @@ if(EXISTS "${INTAKE_PYTHON}")
         endif()
         set_target_properties(${native} PROPERTIES LINKER_LANGUAGE CXX)
         target_compile_definitions(${native} PRIVATE IMPORT_MIX)
+        if(variant MATCHES "^nested(_bypass)?$")
+            target_sources(${native} PRIVATE tests/cpu/exe_nested.asm)
+            target_compile_definitions(${native} PRIVATE NESTED_TARGET)
+        endif()
+        if(variant STREQUAL "nested_bypass")
+            target_compile_definitions(${native} PRIVATE BYPASS_WRAPPER)
+        endif()
         if(variant STREQUAL "inverted")
             target_compile_definitions(${native} PRIVATE FLIP_SELECTOR)
         endif()
@@ -1764,6 +1771,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/exe_entry_check.py" --targets
         "$<TARGET_FILE:cpu_exe_pair>" "$<TARGET_FILE:cpu_exe_pair_lifted>"
         "$<TARGET_FILE:cpu_exe_swapped>" "$<TARGET_FILE:cpu_exe_swapped_lifted>")
+    add_test(NAME cpu_aot_exe_nested_calls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/exe_entry_check.py" --nested
+        "$<TARGET_FILE:cpu_exe_nested>" "$<TARGET_FILE:cpu_exe_nested_lifted>"
+        "$<TARGET_FILE:cpu_exe_nested_bypass>" "$<TARGET_FILE:cpu_exe_nested_bypass_lifted>")
     add_test(NAME cpu_aot_ordinal_import COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/import_check.py" "$<TARGET_FILE:cpu_ordinal_original>"
         "$<TARGET_FILE:cpu_ordinal_original_lifted>" "$<TARGET_FILE:cpu_ordinal_provider>"
