@@ -1,13 +1,13 @@
-"""Lower two x64 heap callers, specializing writable callback slots to their initial null value."""
+"""Lower the Bink callback setter and heap callers to a Windows DLL."""
 import argparse
 from pathlib import Path
 
 import pefile
-from iced_x86 import Decoder, Mnemonic as M, OpKind as K, Register as R
+from iced_x86 import Decoder, MemorySizeExt, Mnemonic as M, OpKind as K, Register as R
 
 from cpu_leaf_aot import export_rva
 from cpu_ranges import function_ranges, image_bytes
-from ffx_version_query import INTEGER_HEADER, lower, region
+from ffx_version_query import INTEGER_HEADER, REGS, lower, region
 
 
 def import_name(pe, ins, slots):
@@ -27,12 +27,12 @@ def import_name(pe, ins, slots):
     return None
 
 
-def release_body(pe, start, slots):
+def leaf_body(pe, start, slots):
     # A tail-calling leaf may have no .pdata. Stop at its last reachable
     # return/tail, including forward skip and null-pointer branches.
     section = pe.get_section_by_rva(start)
     if not section:
-        raise ValueError("release entry outside image")
+        raise ValueError("leaf entry outside image")
     available = min(section.SizeOfRawData, section.Misc_VirtualSize) - (start - section.VirtualAddress)
     code = image_bytes(pe, start, min(512, available), executable=True)
     body = []
@@ -46,10 +46,10 @@ def release_body(pe, start, slots):
             furthest = max(furthest, ins.near_branch_target)
         if ins.ip >= furthest and ins.mnemonic in (M.RET, M.JMP):
             return body
-    raise ValueError("unbounded or invalid release leaf")
+    raise ValueError("unbounded or invalid leaf")
 
 
-def null_global(pe, rva):
+def check_callback_slot(pe, rva):
     section = pe.get_section_by_rva(rva)
     if not section or not section.Characteristics & 0x80000000:
         raise ValueError("expected a writable callback slot")
@@ -59,10 +59,34 @@ def null_global(pe, rva):
     backed = min(8, max(0, section.SizeOfRawData - offset))
     if backed and any(image_bytes(pe, rva, backed)):
         raise ValueError("expected a null initial callback")
-    return "reinterpret_cast<word>(&null_callback)"
 
 
-def translate(pe, start, allocate, module):
+def callback_setter(pe):
+    entry = export_rva(pe, "BinkSetMemory")
+    first = Decoder(64, image_bytes(pe, entry, 5, executable=True), ip=entry).decode()
+    if first.mnemonic == M.JMP and first.op0_kind == K.NEAR_BRANCH64:
+        entry = first.near_branch_target
+    body = leaf_body(pe, entry, {})
+    if len(body) != 3 or body[-1].mnemonic != M.RET:
+        raise ValueError("expected a two-slot callback setter")
+    sources = {R.RCX: "alloc_slot", R.RDX: "free_slot"}
+    slots, stores = {}, {}
+    for ins in body[:-1]:
+        if (ins.mnemonic != M.MOV or ins.op0_kind != K.MEMORY or not ins.is_ip_rel_memory_operand
+                or ins.op1_register not in sources or MemorySizeExt.size(ins.memory_size) != 8):
+            raise ValueError("unexpected callback setter store")
+        rva = ins.ip_rel_memory_address
+        check_callback_slot(pe, rva)
+        slot = sources[ins.op1_register]
+        slots[rva] = slot
+        stores[ins.ip] = f"{slot}.store({REGS[ins.op1_register]});"
+    if set(slots.values()) != set(sources.values()):
+        raise ValueError("setter must bind two distinct callback slots")
+    setter = lower(body, ["rcx = allocate; rdx = release;"], {}, {}, {}, host_ops=stores)
+    return setter, slots
+
+
+def translate(pe, start, allocate, module, callback_slots):
     pe.parse_data_directories(directories=[1])
     slots = {imp.address - pe.OPTIONAL_HEADER.ImageBase: imp.name
              for desc in pe.DIRECTORY_ENTRY_IMPORT if desc.dll.lower() == module
@@ -71,9 +95,9 @@ def translate(pe, start, allocate, module):
         (bounds,) = function_ranges(pe, start)
         body = region(pe, *bounds)
     else:
-        body = release_body(pe, start, slots)
+        body = leaf_body(pe, start, slots)
     expected = b"XMemAlloc" if allocate else b"XMemFree"
-    globals_, host_ops = {}, {}
+    host_ops = {}
     bound = 0
     for ins in body:
         op = ins.mnemonic
@@ -95,18 +119,24 @@ def translate(pe, start, allocate, module):
             if op != M.MOV or ins.op1_kind != K.MEMORY or ins.op0_register != R.RAX:
                 raise ValueError("unsupported access to image data")
             rva = ins.ip_rel_memory_address
-            globals_[rva] = null_global(pe, rva)
+            if rva not in callback_slots or MemorySizeExt.size(ins.memory_size) != 8:
+                raise ValueError("load does not match a registered callback slot")
+            host_ops[ins.ip] = f"rax = {callback_slots[rva]}.load();"
         elif op in (M.PUSH, M.POP) and ins.op0_register == R.RBX:
             host_ops[ins.ip] = ("rsp -= 8; store<word>(rsp, rbx);" if op == M.PUSH
                                 else "rbx = load<word>(rsp); rsp += 8;")
-        elif ((op == M.CALL and ins.op0_register == R.RAX)
-              or (op == M.JMP and ins.op0_kind == K.MEMORY)):
-            # Private allocator callbacks are never installed in this replay.
-            host_ops[ins.ip] = "std::abort();"
+        elif allocate and op == M.CALL and ins.op0_register == R.RAX:
+            host_ops[ins.ip] = "rax = reinterpret_cast<word>(reinterpret_cast<Allocate>(rax)(rcx));"
+        elif (not allocate and op == M.JMP and ins.op0_kind == K.MEMORY
+              and ins.memory_base in REGS and ins.memory_index == R.NONE
+              and MemorySizeExt.size(ins.memory_size) == 8):
+            address = f"{REGS[ins.memory_base]} + {ins.memory_displacement}ull"
+            host_ops[ins.ip] = (f"load<Release>({address})(reinterpret_cast<void*>(rcx)); "
+                                "return 0;")
     if bound != 1:
         raise ValueError(f"expected exactly one {expected.decode()} transfer")
     return lower(body, ["rsp = reinterpret_cast<word>(frame + 12);", "rcx = argument;"],
-                 globals_, {}, {}, host_ops=host_ops)
+                 {}, {}, {}, host_ops=host_ops)
 
 
 def generate(image, entries):
@@ -119,13 +149,22 @@ def generate(image, entries):
         else:
             alloc, free = (export_rva(pe, n) for n in ("heap_request", "heap_release"))
             module = b"cpu_bink_heap_provider.dll"
-        request = translate(pe, alloc, True, module)
-        release = translate(pe, free, False, module)
+        setter, slots = callback_setter(pe)
+        request = translate(pe, alloc, True, module, slots)
+        release = translate(pe, free, False, module, slots)
     return INTEGER_HEADER + """
-#include <cstdlib>
+#include <atomic>
+using Allocate = void* (*)(word);
+using Release = void (*)(void*);
 extern "C" __declspec(dllimport) void* XMemAlloc(word, word);
 extern "C" __declspec(dllimport) void XMemFree(void*, word);
-static constexpr word null_callback = 0;
+static std::atomic<word> alloc_slot{0}, free_slot{0};
+static word set_memory(word allocate, word release) {
+""" + setter + """
+}
+extern "C" __declspec(dllexport) void BinkSetMemory(Allocate allocate, Release release) {
+    set_memory(reinterpret_cast<word>(allocate), reinterpret_cast<word>(release));
+}
 static word request(word argument) {
 """ + request + """
 }

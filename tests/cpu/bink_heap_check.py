@@ -8,6 +8,8 @@ WORD = C.c_uint64
 PTR = C.c_void_p
 ALLOC = C.CFUNCTYPE(PTR, WORD, WORD)
 FREE = C.CFUNCTYPE(None, PTR, WORD)
+CUSTOM_ALLOC = C.CFUNCTYPE(PTR, WORD)
+CUSTOM_FREE = C.CFUNCTYPE(None, PTR)
 ATTRIBUTES = 0x05e50000
 GUARD = 0xad
 
@@ -42,6 +44,94 @@ class HeapTrace:
         if freed:
             del self.live[base]
         self.calls.append(("free", base, flags, freed))
+
+
+class CallbackPair:
+    def __init__(self, provider, residue):
+        self.heap = HeapTrace(provider)
+        self.heap.residue = residue
+        # The custom callbacks take one argument. The test uses Windows storage
+        # behind them and keeps the callback objects alive across replacements.
+        self.allocate = CUSTOM_ALLOC(lambda size: self.heap.allocate(size, ATTRIBUTES))
+        self.release = CUSTOM_FREE(lambda base: self.heap.release(base, ATTRIBUTES))
+
+
+def check_block(pointer, size, heap, release=None):
+    base, = heap.live
+    assert heap.calls == [("alloc", size + 64, ATTRIBUTES, base)], heap.calls
+    assert base % 32 == heap.residue
+    offset = 64 - heap.residue
+    assert pointer == base + offset and pointer % 32 == 0
+    raw, granted = heap.live[base]
+    start = pointer - raw
+    expected = bytearray([GUARD]) * (granted + 96)
+    expected[start-2:start] = bytes((3 if release else 0, offset))
+    if release:
+        address = C.cast(release, PTR).value
+        expected[start-16:start-8] = address.to_bytes(8, "little")
+    C.memset(pointer, 0x59, size)
+    expected[start:start+size] = bytes([0x59]) * size
+    assert C.string_at(raw, len(expected)) == expected
+    return base
+
+
+def check_custom(lib, provider, fallback):
+    a = CallbackPair(provider, 7)
+    b = CallbackPair(provider, 19)
+    lib.BinkSetMemory.argtypes, lib.BinkSetMemory.restype = [CUSTOM_ALLOC, CUSTOM_FREE], None
+    try:
+        lib.BinkSetMemory(a.allocate, a.release)
+        old = lib.heap_request(33)
+        old_base = check_block(old, 33, a.heap, a.release)
+        lib.BinkSetMemory(b.allocate, b.release)
+        new = lib.heap_request(129)
+        new_base = check_block(new, 129, b.heap, b.release)
+        lib.heap_release(old)
+        assert a.heap.calls == [("alloc", 97, ATTRIBUTES, old_base),
+                                ("free", old_base, ATTRIBUTES, True)]
+        assert b.heap.calls == [("alloc", 193, ATTRIBUTES, new_base)]
+        lib.BinkSetMemory(CUSTOM_ALLOC(), CUSTOM_FREE())
+        lib.heap_release(new)
+        assert b.heap.calls == [("alloc", 193, ATTRIBUTES, new_base),
+                                ("free", new_base, ATTRIBUTES, True)]
+        assert not a.heap.live and not b.heap.live and fallback.calls == []
+
+        # Keep the relative call order at the custom-to-default boundary.
+        attempts = []
+        def decline(size):
+            attempts.append((size, len(fallback.calls)))
+            return None
+        decline_hook = CUSTOM_ALLOC(decline)
+        lib.BinkSetMemory(decline_hook, a.release)
+        pointer = lib.heap_request(65)
+        base = check_block(pointer, 65, fallback)
+        lib.BinkSetMemory(b.allocate, b.release)
+        lib.heap_release(pointer)
+        assert fallback.calls == [("alloc", 129, ATTRIBUTES, base),
+                                  ("free", base, ATTRIBUTES, True)]
+        assert len(a.heap.calls) == len(b.heap.calls) == 2
+
+        lib.BinkSetMemory(decline_hook, a.release)
+        fallback.fail = True
+        assert lib.heap_request(0x100000001) is None
+        assert fallback.calls[2:] == [("alloc", 0x100000041, ATTRIBUTES, None)]
+        assert attempts == [(129, 0), (0x100000041, 2)]
+        # The other failure return from the custom allocator ends the request.
+        refused = []
+        def refuse(size):
+            refused.append(size)
+            return WORD(-1).value
+        refuse_hook = CUSTOM_ALLOC(refuse)
+        lib.BinkSetMemory(refuse_hook, b.release)
+        assert lib.heap_request(9) is None
+        lib.heap_release(None)
+        assert refused == [73] and len(fallback.calls) == 3
+        assert len(a.heap.calls) == len(b.heap.calls) == 2
+    finally:
+        lib.BinkSetMemory(CUSTOM_ALLOC(), CUSTOM_FREE())
+        for heap in (a.heap, b.heap):
+            for raw, _ in heap.live.values():
+                provider.windows_release(raw, ATTRIBUTES)
 
 
 def check(path, provider):
@@ -98,12 +188,14 @@ def check(path, provider):
             assert trace.calls == [("free", base, ATTRIBUTES, True)], trace.calls
             trace.calls.clear()
         assert not trace.live
+        check_custom(lib, provider, trace)
     finally:
         provider.bind_heap_observers(ALLOC(), FREE())
         for raw, _ in trace.live.values():
             provider.windows_release(raw, ATTRIBUTES)
     print(f"{path.name}: 32 base residues, 32 matching releases, 3 allocator failures, "
-          "2 early rejects and null release passed")
+          "2 early rejects and null release passed; custom A/B ownership, null fallback, "
+          "double failure and custom refusal passed")
 
 
 def main(provider_path, *images):
