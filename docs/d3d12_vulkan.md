@@ -254,7 +254,7 @@ Two pieces of milestone M2 that the device does not use yet, built and tested on
     a table that has grown gets a new buffer behind binding 2: `flush_needs_idle()` says when a flush would do
     either, so the owner can wait until no command buffer that uses the set is still running.
 
-Started for the compute path (no pipelines yet):
+The compute path, end to end:
 - `runtime/src/shader_library.h` finds the translated SPIR-V for a shader the game hands to D3D12 (section 3.6).
   It extracts the FSSM program from the DXBC container (DXIL → XDAT entry 0x0D → XBCH → zlib) and looks up its
   SHA-256 as `fssm_sha256` in `spirv/index.json`. Its own inflate, SHA-256 and JSON reader keep it free of
@@ -262,14 +262,30 @@ Started for the compute path (no pipelines yet):
 - Root signatures use the model already on `main` (`runtime/src/root_signature.h`, `rt::rootsig`): `parse_rts0`
   reads the serialized blob and `pack()` lays out the 32 user-data dwords by the section 3.5 default mapping,
   refusing anything that would spill.
-- The IR records `Dispatch` with its user data captured at record time. Replay binds the pipeline, pushes the
-  144-byte block (s0..s31, heap base, code base) and dispatches. Not wired up yet: the GPU address arena,
-  `CreateRootSignature`, compute PSOs and the command list's root-argument setters.
+- **GPU address arena** (section 3.3, when the device has `bufferDeviceAddress`): one host-visible,
+  device-addressable buffer, 256 MiB by default (`LEONIDA_ARENA_MB`, at most 4095 MiB, so every VA fits 32-bit
+  table pointers).
+  - Default-heap buffers are 64 KiB-aligned ranges in it, zeroed through its mapping; their console VA is the offset.
+  - Shader-visible descriptor heaps also live in it: the CPU handle is its host mapping and the GPU handle is the VA,
+    so descriptor bytes the application writes itself are what shaders load.
+  - Upload and readback buffers keep their own memory, and their VA is their device address minus the heap base.
+  - Shader programs (FSSM blobs) are copied in as the code base.
+- **`CreateRootSignature`** parses the blob with `parse_rts0` and keeps each parameter's place from `pack()`; a
+  signature `pack()` refuses (more than 32 user dwords: the spill layout is open) is refused with its reason.
+  **`CreateComputePipelineState`** (PC slot 11, Xbox slot 62 through the proxy) finds the shader by its FSSM
+  hash, builds a pipeline with the 144-byte push-constant range and registers it for replay. Shaders that declare
+  set-0 bindings are refused with a log until the bindless set exists (M2).
+- **Command list**: `Set{Compute,Graphics}RootSignature` (which clears the arguments, as D3D12 leaves them
+  undefined), `SetPipelineState`, the 32-bit constant, root view and descriptor-table setters, `SetDescriptorHeaps`
+  and `ClearState`. A wrong parameter type or out-of-range constants makes `Close` return `E_INVALIDARG`.
+  `Dispatch` records the block as it is at that moment. Replay binds the pipeline, pushes s0..s31, the heap base
+  and the code base, and dispatches.
 
-Known gaps: the game's present entry point (DXGI factory/swapchain or `PresentX`; the presenter above is what
-either calls), HDR and fullscreen; shader-resource, UAV and constant-buffer views, samplers, root signatures, PSOs,
-draws, volume attachment views, placed and reserved resources, `GetGPUVirtualAddress` (the shared buffer arena),
-depth-stencil resolves and `ResolveSubresourceRegion`, and 1D textures;
+Known gaps: set 0 in pipelines (`vulkan_bindless.h` above is not used by the device yet) and therefore every
+translated shader that declares bindings; graphics PSOs, input layouts and draws; `requiredSubgroupSize = 64` for
+wave64 compute; the game's present entry point (DXGI factory/swapchain or `PresentX`; the presenter above is what
+either calls), HDR and fullscreen; shader-resource, UAV and constant-buffer views, samplers, volume attachment
+views, placed and reserved resources, depth-stencil resolves and `ResolveSubresourceRegion`, and 1D textures;
 default-heap buffers are not zero-filled yet; a fence cannot be signalled to a lower value (Vulkan timelines only
 increase; such a signal is reported and dropped); enhanced-barrier access bits are not filtered against the
 sync scope, so a combination D3D12 accepts but Vulkan does not would show up as a validation error; the GCL8
@@ -319,6 +335,12 @@ and any validation error fails them.
   repeats on a standalone device, the path `LEONIDA_D3D12=vulkan` takes.
 - `d3d12_descriptor_test`: descriptor copies through the proxy, checked on the slots' bytes: one run, range lists
   of different shapes on each side, null size arrays, and a destination longer than its source.
+- `d3d12_compute_test`: the compute path through the proxy. It creates a root signature from the PC serializer's
+  blob, and a PSO through slot 62 from a container shaped like the game's, found in a translator-style index by its
+  FSSM hash (an unknown program is refused). It sets root constants, a root UAV and a descriptor table whose
+  application-written entry points at an upload buffer, then runs two dispatches that change s0 and the UAV in
+  between. The results come back through a readback buffer. The shader, `test/glsl/cs_user_data.comp`, is GLSL
+  written to the translator's push-constant and address contract, compiled with `glslangValidator`.
 - `d3d12_present_test`: milestone M0. It opens a window and presents 60 frames, each one: reset the list, move
   the back buffer `PRESENT` → `RENDER_TARGET`, clear, move it back, execute, present, signal a fence. It then
   resizes the window, which recreates the swapchain and scales the blit, and switches to unsynchronised presents.
