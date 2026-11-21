@@ -133,6 +133,27 @@ def check_desktop_forwarders():
     report = trace(inventory, "entry.exe")
     assert not report["findings"] and "known.dll" in report["unlinked_in_this_graph"]
 
+    # A forwarder in the System32 copy of a known DLL can name a packaged module. That module is loaded,
+    # and the package chain's terminal status decides the edge, not the first hop's System32 table.
+    tables["known.dll"].update({"Fwd": "target.Fwd", "Gap": "target.Gap"})
+    tables["target.dll"] = {"Fwd": None, "Gap": None}
+    package["target.dll"] = (["bin/target.dll"], {"Fwd": None})
+    forward, gap = packaged("known.dll", "Fwd"), packaged("known.dll", "Gap")
+    assert forward["status"] == "export_present" and gap["status"] == "export_not_found"
+    assert [(s["provider"], s["package"]) for s in forward["chain"]] == [("known.dll", False), ("bin/target.dll", True)]
+    assert resolve_desktop("known.dll", "Gap", "entry.exe", contracts, tables.get)["status"] == "export_present"
+    inventory["images"]["bin/target.dll"] = {"sha256": "fixture", "exports": [{"name": "Fwd"}]}
+    row.update(symbol="Fwd", desktop_export="export_present", desktop_resolution=resolve("known.dll", "Fwd"),
+               package_resolution=forward)
+    report = trace(inventory, "entry.exe")
+    assert not report["findings"] and "known.dll" in report["unlinked_in_this_graph"]
+    assert report["reachable"]["bin/target.dll"]["path"] == ("entry.exe", "bin/target.dll")
+    assert report["reachable"]["bin/target.dll"]["reasons"] == ("forwarder",)
+    row.update(symbol="Gap", desktop_resolution=resolve("known.dll", "Gap"), package_resolution=gap)
+    report = trace(inventory, "entry.exe")
+    finding, = report["findings"]
+    assert finding["problem"] == "export_not_found" and finding["package_chain"] == gap["chain"]
+    assert "bin/target.dll" in report["reachable"]
 
 def main():
     loader = "amd_fidelityfx_loader_xbox.dll"
