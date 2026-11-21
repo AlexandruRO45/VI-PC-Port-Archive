@@ -894,6 +894,45 @@ A local scan of the inspected package's 16 DLLs together with this `xmem.dll` (`
 | `xmem_shim_query` | Graphics memory from `XMemAlloc` passes both BVH predicates and keeps the sentinel after `+0x30`, through the pseudo-handle and a real handle. After `XMemFree` the address reads as `MEM_FREE` with a clear tail. Heap memory fails the tail check, and an address outside user space returns `FALSE` without touching the buffer. |
 | `xmem_shim_working_set` | Returns `FALSE` with `ERROR_NOT_SUPPORTED` and leaves the output untouched, so the callers' value is zero. |
 
+### Attribute words at xmem call sites
+
+`tools/xmem_attribute_scan.py` reads a PE image without loading or running it. It reports the attribute word at each call or tail jump into `xmem.dll`'s `XMemAlloc` or `XMemFree`, from a normal or delay-load import. It finds sites reached through the IAT slot, through an import thunk, or through a register loaded from the slot.
+
+Code is decoded one `.pdata` function at a time, and linearly between functions, so memory stays bounded for a large image.
+
+From each site the scanner walks backwards over the function's control flow to every definition of RDX:
+- **Jumps:** jumps inside the function are followed. A join reports each distinct definition, and a loop that does not change RDX adds nothing.
+- **Calls:** a call on the path may change RDX under the Microsoft x64 convention, so it ends that path as unknown. Non-volatile registers are followed across calls.
+- **Immediates:** an immediate, including `xor edx, edx`, is a constant. A 32-bit register copy keeps only the low 32 bits.
+- **Data loads:** a load from RIP-relative data is a constant when the data is in a read-only section. In a writable section it is a constant only when no RIP-relative instruction in the image writes it. Otherwise it is reported as data, with its initial value and writers. Writes through pointers are not tracked.
+- **Function entry:** reaching the entry means the caller supplies RDX, and direct calls and jumps to it are resolved one level deep. An exported function can also be called from outside the image, so its sites never count as complete.
+- **Everything else:** partial-register writes, arithmetic, pointer loads, blocks reached only through jump tables, and chained unwind fragments are reported as computed or unknown, never as constants.
+
+Constant words are decoded with the `era_heap` layout and classified with `era_heap::allocate`'s desktop rules for a non-zero size.
+
+The report lists each site with its route and region, and the import thunks found. Its summary gives:
+- every distinct word with its sites;
+- the words for which `era_heap` returns null;
+- the sites with a path that does not end in a constant.
+
+`--fail-on-null` and `--fail-on-unresolved` exit with 1 in those cases.
+
+| CTest case | Inputs and checks |
+|---|---|
+| `xmem_attribute_scan` | Two source-built MASM fixtures are linked against the desktop `xmem.dll` import library. `tests/cpu/xmem_attributes.asm` has 22 sites, one per form: IAT call with unwind data, linker thunk, writable and read-only constant data, written data, register copy, call through a register, exported and internal pass-throughs with a caller, 64-bit immediate with a reserved bit, `xor`, a computed word, direct and indirect jumps, if/else joins with equal and different words, a loop, a call that clobbers RDX, a non-volatile register across a call, a 32-bit copy of a 64-bit constant, and a partial-register write. Each site's route, source, word and classification must match, as must the summary and the exit codes of both flags. `tests/cpu/xmem_delay.asm` is linked with `/DELAYLOAD:xmem.dll` and has one site through the delay-load IAT. The 13 decoding cases also run in the Linux Python job. |
+
+Sixteen mutants of the scanner each fail this test. They cover call clobbering, join following, merging, read-only data, writers, truncation, export completeness, thunks, delay imports, indirect blocks, register following, `xor`, partial writes, caller resolution, register calls, and the null flag.
+
+A local read-only scan of the inspected package's 16 DLLs found `xmem` call sites in two of them. All five are constant on every path and resolve to the two words already pinned in `era_heap_observed_words`:
+- the Bink DLL: two sites, both through linker import thunks, word `0x05e50000` (heap, 32-byte alignment);
+- the AMD upscaler: three sites through the IAT slot, word `0xa8004000` (memory type 5, an allocation-granularity graphics allocation), loaded from a read-only section.
+
+One full decoding pass over the largest DLL, 0.7 MB of code with 2,452 `.pdata` functions, read 342,768 instructions in 0.07 s.
+
+```powershell
+.\out\pe-env\Scripts\python.exe -B tools/xmem_attribute_scan.py "game-files/<build-directory>/<image>" --output out/xmem-scan.json --fail-on-null
+```
+
 ### Desktop GPU addresses for title allocations
 
 On the console a graphics allocation's CPU pointer is also its GPU virtual address. Titles pass those addresses to D3D12 calls, and the BVH builder's shaders read 64-bit addresses from their input records. A desktop D3D12 resource gets a GPU virtual address chosen by the driver.

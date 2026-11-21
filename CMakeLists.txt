@@ -485,6 +485,15 @@ if(EXISTS "${INTAKE_PYTHON}")
     cpu_asm_fixture(cpu_callback callback)
     cpu_asm_fixture(cpu_version_query version_query)
     cpu_asm_fixture(cpu_heap_layout heap_layout)
+    # Attribute words at xmem call sites, read from a source-built image (tools/xmem_attribute_scan.py).
+    cpu_asm_fixture(cpu_xmem_attributes xmem_attributes)
+    target_link_libraries(cpu_xmem_attributes PRIVATE xmem_shim)
+    cpu_asm_fixture(cpu_xmem_delay xmem_delay)
+    target_link_libraries(cpu_xmem_delay PRIVATE xmem_shim)
+    target_link_options(cpu_xmem_delay PRIVATE /DELAYLOAD:xmem.dll)
+    add_test(NAME xmem_attribute_scan COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/xmem_attribute_scan_check.py" "$<TARGET_FILE:cpu_xmem_attributes>"
+        "$<TARGET_FILE:cpu_xmem_delay>")
     cpu_asm_fixture(cpu_bink_heap bink_heap)
     add_library(cpu_bink_heap_provider SHARED tests/cpu/bink_heap_provider.cpp src/era_heap.cpp)
     target_include_directories(cpu_bink_heap_provider PRIVATE src)
