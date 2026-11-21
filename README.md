@@ -32,7 +32,7 @@ Review `gpu-report-hardware.md` and paste it in the [hardware coverage thread (#
 |---|---:|---|---|---|
 | NVIDIA GeForce RTX 2060 | 32 | Skipped | 408 queries passed | [Maintainer baseline](docs/experiments.md#independent-bvh-checks-on-pc) |
 | NVIDIA GeForce RTX 3070 (driver 32.0.16.1088) | 32 | Skipped, lane range 32–32 | 408 queries passed | [RTX 3070 report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7063566753) |
-| NVIDIA GeForce RTX 4060 Laptop GPU | 32 | Skipped | 408 queries passed | [Second maintainer workstation](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7058907095) |
+| NVIDIA GeForce RTX 4060 Laptop GPU | 32 | Skipped | 408 queries passed | [Second maintainer workstation](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7058907095) · [Independent Windows run, driver 32.0.16.2124](https://github.com/R0Y00/Xbox2Windows/issues/60) |
 | NVIDIA GeForce RTX 5070 | 32 on both drivers | Skipped on both, lane range 32–32 | 408 queries passed per run | [32.0.16.1692, debug layer unavailable](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7063361337) · [32.0.16.2135 retest, debug layer enabled](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7063626309) |
 | AMD Radeon RX 6600 (driver 32.0.21045.16010) | 32 | Passed, 64 lanes | 408 queries passed | [RX 6600 report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7063312495) · [32.0.11037.4004 retest](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7063794169) |
 | AMD Radeon RX 6750 XT (driver 32.0.21045.29003) | 32 | Passed, 64 lanes | 408 queries passed | [RX 6750 XT report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7062253227) |
@@ -46,6 +46,9 @@ Review `gpu-report-hardware.md` and paste it in the [hardware coverage thread (#
 | AMD Radeon RX 9060 XT (driver 32.0.32029.2010) | 64 | Passed, 64 lanes | 408 queries passed | [Hardware report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7064143537) |
 | NVIDIA GeForce RTX 4060 (driver 32.0.16.1088) | 32 | Skipped, lane range 32–32 | 408 queries passed | [Hardware report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7064173447) |
 | NVIDIA GeForce RTX 4050 Laptop GPU (driver 32.0.16.1088) | 32 | Skipped, lane range 32–32 | 408 queries passed | [Hardware report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7064193927) |
+| NVIDIA GeForce RTX 2060 SUPER (driver 32.0.16.2124) | 32 | Skipped, lane range 32–32 | 408 queries passed | [Windows hardware report](https://github.com/R0Y00/Xbox2Windows/issues/57) |
+| NVIDIA GeForce RTX 3060 (driver 32.0.16.2124) | 32 | Skipped, lane range 32–32 | 408 queries passed | [Windows hardware report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7064352679) |
+| Intel Arc B570 (driver 32.0.101.9175) | 32 | Skipped, lane range 16–32 | 408 queries passed | [Windows hardware report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7064376175) |
 | Microsoft WARP (software) | 4 | Skipped | 408 queries passed | [Maintainer baseline](docs/experiments.md#independent-bvh-checks-on-pc) |
 
 On CachyOS, an RTX 3060 completed 408 comparisons through Proton and vkd3d-proton with NVIDIA driver 620.70.06. The adapter reported a 32-lane maximum and skipped forced wave64. [Linux translation-layer report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7064204388)

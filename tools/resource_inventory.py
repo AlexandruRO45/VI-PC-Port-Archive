@@ -32,23 +32,33 @@ def signature(header):
     return "unclassified"
 
 
+def _parts_overlap(spans):
+    """Compare physical part extents, independent of offset-table ordering."""
+    ordered = sorted(spans)
+    return any(left[1] > right[0] for left, right in zip(ordered, ordered[1:]))
+
+
 def parts(blob):
     if len(blob) < 32 or blob[:4] != b"DXBC":
         raise ValueError("Expected a DXBC container")
     version, size, count = struct.unpack_from("<3I", blob, 20)
-    end = 32 + 4 * count
-    if version != 1 or size != len(blob) or end > size:
+    table_end = 32 + 4 * count
+    if version != 1 or size != len(blob) or table_end > size:
         raise ValueError("Container header disagrees with inventory")
     result = {}
+    spans = []
     for index in range(count):
         offset, = struct.unpack_from("<I", blob, 32 + 4 * index)
-        if offset < end or offset + 8 > size:
+        if offset < table_end or offset + 8 > size:
             raise ValueError("Invalid container part offset")
         tag, length = struct.unpack_from("<4sI", blob, offset)
-        end = offset + 8 + length
-        if end > size or tag in result:
+        part_end = offset + 8 + length
+        if part_end > size or tag in result:
             raise ValueError("Invalid container part")
-        result[tag] = blob[offset + 8:end]
+        spans.append((offset, part_end))
+        result[tag] = blob[offset + 8:part_end]
+    if _parts_overlap(spans):
+        raise ValueError("Overlapping container parts")
     return result
 
 
@@ -59,17 +69,21 @@ def dxil_program(data, offset):
     version, size, parts = struct.unpack_from("<III", data, offset + 20)
     if version != 1 or size > len(data) - offset or not 0 < parts <= (size - 32) // 4:
         return False
-    last_end = 32 + parts * 4
+    table_end = 32 + parts * 4
+    spans = []
+    seen_tags = set()
     program = False
     for i in range(parts):
         relative, = struct.unpack_from("<I", data, offset + 32 + 4 * i)
-        if relative < last_end or relative + 8 > size:
+        if relative < table_end or relative + 8 > size:
             return False
         start = offset + relative
         tag, extent = struct.unpack_from("<4sI", data, start)
-        last_end = relative + 8 + extent
-        if last_end > size:
+        part_end = relative + 8 + extent
+        if part_end > size or tag in seen_tags:
             return False
+        seen_tags.add(tag)
+        spans.append((relative, part_end))
         if tag == b"DXIL" and extent >= 24:
             body = start + 8
             _, words, magic, _, delta, length = struct.unpack_from("<II4sIII", data, body)
@@ -78,7 +92,7 @@ def dxil_program(data, offset):
                     8 + delta + length <= words * 4 <= extent and
                     data[bitcode:bitcode + 4] == b"BC\xc0\xde"):
                 program = True
-    return program
+    return program and not _parts_overlap(spans)
 
 
 def shader_markers(data):
