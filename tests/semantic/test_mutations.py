@@ -32,8 +32,8 @@ MUTATIONS = [
      'f = ("S" if op.endswith("i32") else "U") + ("Max" if "min" in op else "Min")',
      "test_ps_ops"),
     ("v_bfe_i32 extracted as unsigned", TRANSLATOR,
-     'f = "OpBitFieldSExtract" if op.endswith("i32") else "OpBitFieldUExtract"\n            self.emit(f"{r} = {f} %uint {x} {om} {wm}")',
-     'f = "OpBitFieldUExtract"\n            self.emit(f"{r} = {f} %uint {x} {om} {wm}")',
+     'f = "OpBitFieldSExtract" if op.endswith("i32") else "OpBitFieldUExtract"\n            self.emit(f"{r} = {f} %uint {x} {om} {wc}")',
+     'f = "OpBitFieldUExtract"\n            self.emit(f"{r} = {f} %uint {x} {om} {wc}")',
      "test_ps_ops"),
     ("v_pk_fma_f16 multiplies src0 by itself", TRANSLATOR,
      'OpExtInst %v2float %glsl Fma {vx} {vy} {srcs[2]}',
@@ -103,8 +103,11 @@ MUTATIONS = [
 
 
 def run_semantics(tools_dir):
-    env = dict(os.environ, LEONIDA_TOOLS_DIR=tools_dir, PYTHONDONTWRITEBYTECODE="1")
-    p = subprocess.run([sys.executable, "-m", "unittest", "test_ps_semantics", "-v"], cwd=HERE, env=env,
+    # The child finds test_ps_semantics through PYTHONPATH, not cwd=HERE: Windows refuses a working directory longer
+    # than 258 characters (WinError 267), which a checkout in a deep folder reaches.
+    path = os.pathsep.join(filter(None, [HERE, os.environ.get("PYTHONPATH")]))
+    env = dict(os.environ, LEONIDA_TOOLS_DIR=tools_dir, PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=path)
+    p = subprocess.run([sys.executable, "-m", "unittest", "test_ps_semantics", "-v"], env=env,
                        capture_output=True, text=True, timeout=300)
     return p.returncode, p.stdout + p.stderr
 

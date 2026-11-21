@@ -107,6 +107,16 @@ class ArgparseDefaultsAndTypesTest(unittest.TestCase):
                 self.assertEqual(ctx.exception.code, 2)
                 self.assertIn("invalid int value", mock_err.getvalue())
 
+    def test_zero_or_negative_jobs_rejected_by_argparse(self):
+        # 0 would start no translation shard and merge an empty index; a negative count, the same.
+        for jobs in ("0", "-2"):
+            with patch.object(sys, "argv", ["make_game.py", "--jobs", jobs]):
+                with patch("sys.stderr", new_callable=io.StringIO) as mock_err:
+                    with self.assertRaises(SystemExit) as ctx:
+                        make_game.main()
+                    self.assertEqual(ctx.exception.code, 2, jobs)
+                    self.assertIn("must be at least 1", mock_err.getvalue())
+
     def test_unrecognized_argument_rejected(self):
         with patch.object(sys, "argv", ["make_game.py", "--unrecognized-option"]):
             with patch("sys.stderr", new_callable=io.StringIO) as mock_err:
@@ -208,7 +218,8 @@ class StageValidationAndSequencingTest(unittest.TestCase):
                                             self.assertEqual(ret, 0)
 
         expected_calls = [
-            call.shaders(os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), unittest.mock.ANY),
+            call.shaders(os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), unittest.mock.ANY,
+                         emulate=unittest.mock.ANY, keep_emulated=True),
             call.assets(os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), False, unittest.mock.ANY),
             call.runtime(os.path.abspath(self.game_dir), os.path.abspath(self.out_dir), unittest.mock.ANY),
             call.pipelines(os.path.abspath(self.work_dir), os.path.abspath(self.out_dir)),
@@ -281,10 +292,12 @@ class JobsHandlingTest(unittest.TestCase):
                     with patch("make_game.check", return_value={"expected_exe": "g.exe"}):
                         with patch("make_game.preflight"):
                             with patch("make_game.log"):
-                                with patch("make_game.shaders") as mock_shaders:
+                                with patch("make_game.shaders") as mock_shaders, \
+                                        patch("make_game.wave64_emulate", return_value=True):
                                     ret = make_game.main()
                                     self.assertEqual(ret, 0)
-                                    mock_shaders.assert_called_once_with(os.path.abspath(game), os.path.abspath(work), 6)
+                                    mock_shaders.assert_called_once_with(os.path.abspath(game), os.path.abspath(work), 6,
+                                                                         emulate=True, keep_emulated=True)
 
     def test_custom_jobs_forwarded_to_assets(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -325,6 +338,14 @@ class JobsHandlingTest(unittest.TestCase):
 
 class WavValidationTest(unittest.TestCase):
     """Test --wav validation in preflight and assets stage behavior."""
+
+    def setUp(self):
+        # preflight runs `dotnet --list-sdks` (#223). Follow the test's faked shutil.which instead: the SDK counts as
+        # installed exactly when the test says dotnet is on PATH, so no real dotnet is needed and none is consulted.
+        patcher = patch("make_game.dotnet_sdk_ok", side_effect=lambda: bool(shutil.which("dotnet")))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
 
     @patch.object(sys, "version_info", (3, 11, 0))
     @patch("make_game.ensure_submodule")
@@ -429,8 +450,10 @@ class WavValidationTest(unittest.TestCase):
             os.makedirs(game, exist_ok=True)
 
             manifest_dir = os.path.join(out, "audio")
-            with open(os.path.join(manifest_dir, "audio_manifest.json"), "w", encoding="utf-8") as f:
-                f.write("{}")
+            # A step counts as done by its marker, not by its folder (a stopped run leaves the folder too).
+            for name in ("audio_manifest.json", "ogg.done", "xma.done"):
+                with open(os.path.join(manifest_dir, name), "w", encoding="utf-8") as f:
+                    f.write("{}")
 
             with patch("make_game.rpf9dump", return_value="fake_dump"):
                 with patch("make_game.log"):
@@ -453,8 +476,9 @@ class WavValidationTest(unittest.TestCase):
 
             manifest_dir = os.path.join(out, "audio")
             os.makedirs(manifest_dir, exist_ok=True)
-            with open(os.path.join(manifest_dir, "audio_manifest.json"), "w", encoding="utf-8") as f:
-                f.write("{}")
+            for name in ("audio_manifest.json", "ogg.done", "xma.done"):
+                with open(os.path.join(manifest_dir, name), "w", encoding="utf-8") as f:
+                    f.write("{}")
             os.makedirs(os.path.join(manifest_dir, "ogg"), exist_ok=True)
             os.makedirs(os.path.join(manifest_dir, "xma"), exist_ok=True)
             os.makedirs(game, exist_ok=True)
@@ -469,6 +493,13 @@ class WavValidationTest(unittest.TestCase):
 
 class PathContainmentAndDiskSpaceTest(unittest.TestCase):
     """Test rejection of output paths inside game folder and preflight disk space checks."""
+
+    def setUp(self):
+        # preflight runs `dotnet --list-sdks` (#223). Follow the test's faked shutil.which instead: the SDK counts as
+        # installed exactly when the test says dotnet is on PATH, so no real dotnet is needed and none is consulted.
+        patcher = patch("make_game.dotnet_sdk_ok", side_effect=lambda: bool(shutil.which("dotnet")))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_out_inside_game_folder_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -490,6 +521,22 @@ class PathContainmentAndDiskSpaceTest(unittest.TestCase):
             game = os.path.join(tmp, "game")
             out = os.path.join(tmp, "out")
             work = os.path.join(game, "work")
+            os.makedirs(game)
+            with patch.object(sys, "argv", ["make_game.py", "--game", game, "--out", out, "--work", work]):
+                with patch("make_game.below_normal"):
+                    with patch("make_game.check", return_value={"expected_exe": "g.exe"}):
+                        with patch("sys.stderr", new_callable=io.StringIO) as mock_err:
+                            with self.assertRaises(SystemExit) as ctx:
+                                make_game.main()
+                            self.assertEqual(ctx.exception.code, 1)
+                            self.assertIn("--out and --work must be outside the game folder", mock_err.getvalue())
+
+    @unittest.skipUnless(os.name == "nt", "paths compare without case only on Windows")
+    def test_out_inside_game_folder_in_other_case_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game = os.path.join(tmp, "Game")
+            out = os.path.join(tmp, "GAME", "out")      # the same folder on Windows
+            work = os.path.join(tmp, "work")
             os.makedirs(game)
             with patch.object(sys, "argv", ["make_game.py", "--game", game, "--out", out, "--work", work]):
                 with patch("make_game.below_normal"):

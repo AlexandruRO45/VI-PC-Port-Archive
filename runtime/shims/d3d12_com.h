@@ -1,5 +1,5 @@
 // D3D12 COM objects over the Vulkan backend (src/vulkan_backend.h): command allocator, graphics command list,
-// command queue and fence. Their vtables are the Windows SDK's (ID3D12GraphicsCommandList7, ID3D12CommandQueue,
+// command queue and fence. Their vtables are the Windows SDK's (ID3D12GraphicsCommandList8, ID3D12CommandQueue,
 // ID3D12CommandAllocator, ID3D12Fence1); every method not implemented here is a generated stub that reports its
 // name once (tools/gen_d3d12_stubs.py). The Xbox-specific slots measured for the device do not apply to these
 // interfaces as far as is known; docs/d3d12_vulkan.md section 3.1 lists what is still unverified.
@@ -36,6 +36,8 @@ struct VulkanDeviceInfo {
     VkQueue queue = VK_NULL_HANDLE;  // a graphics queue; every D3D12 queue of the device submits to it
     std::uint32_t queue_family = 0;
     bool separate_depth_stencil_layouts = true;
+    std::uint32_t max_push_constants_size = 0;
+    bool push_constants_need_fallback = false;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive
@@ -53,8 +55,23 @@ void set_device_outer(ID3D12Device* device, IUnknown* outer);
 // The VkImage behind a texture created by such a device, or VK_NULL_HANDLE. For tests and the swapchain.
 VkImage vulkan_image(ID3D12Resource* resource);
 
+// Whether both resources use the requested typed, non-integer colour format for a regional average resolve.
+bool color_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D12Resource* src);
+
+// The maxPushConstantsSize in bytes of the Vulkan physical device behind `device`, or 0 if not a Vulkan device.
+std::uint32_t device_max_push_constants_size(ID3D12Device* device);
+
+// True when `device`'s Vulkan physical device has maxPushConstantsSize < 144 bytes, requiring
+// the uniform-buffer fallback for the 16-byte tail (heap/code base).
+bool device_push_constants_need_fallback(ID3D12Device* device);
+
 // ExecuteCommandLists returns void; this is what the last call on the queue did.
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue);
+
+// The front/back stencil references last recorded by ID3D12GraphicsCommandList8::OMSetFrontAndBackStencilRef on
+// `list`. The values are kept for the future pipeline path, which is what would apply them. False when `list` is
+// not one of this module's command lists.
+bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT& back);
 
 inline leonida::ResourceId resource_id(const ID3D12Resource* resource) {
     return reinterpret_cast<leonida::ResourceId>(resource);

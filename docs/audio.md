@@ -99,7 +99,13 @@ then 16 bytes per channel:
 At the `0x55` data offset, each chunk starts with a 24-byte record per channel. The record's `+4` word is the
 channel's subblock count and `+8` is a repeated-prefix sample count to skip. The channel data are its run of
 2048-byte subblocks after the 2048-aligned header. The skipped samples repeat the previous chunk's tail, so the
-exporter drops whole packets until the count is consumed. Each Opus channel becomes one mono Ogg Opus file.
+exporter drops whole packets until the count is consumed. Each descriptor channel becomes one Ogg Opus file.
+
+The descriptor's `channels` field is the number of channel groups, not necessarily the packet channel count.
+An Opus packet's TOC stereo bit (`packet[0] & 0x04`) gives the real count, and the descriptor's `samples` field
+counts interleaved samples across those packet channels. The exporter therefore writes a stereo Ogg with
+`OpusHead channels=2` and `samples / 2` as the end granule when the packets are stereo; mono groups keep their
+count unchanged. Reading `samples` as a frame count produces a file that reports twice its real duration.
 
 ## What the exporters write
 
@@ -113,7 +119,9 @@ exporter drops whole packets until the count is consumed. Each Opus channel beco
 | `python -I tools/audio_wav.py <ogg dir> --out <wav dir> [--jobs N]` | 16-bit PCM WAV mirroring the Ogg tree; `--jobs` ffmpeg processes at once |
 
 `audio_manifest.json` is the bank index: each bank's `Path`, `Offset`, `Size`, and its `Streams` with `Index`,
-`Id` (hex), `Codec`, `Channels`, `SampleRate`, `DurationSeconds` and `IsStreamed`.
+`Id` (hex), `Codec`, `Channels`, `SampleRate`, `DurationSeconds` and `IsStreamed`. For streamed music,
+`Channels` is the Opus packet channel count and `DurationSeconds` is per channel: the tag `0x48` descriptor's
+interleaved sample count is divided by that channel count.
 
 `audio_wav.py` runs ffmpeg with `-c:a pcm_s16le` at the stream's own rate and channel count, and trims to the Ogg
 Opus end granule. Existing `.wav` files are skipped, so a stopped run continues. With no `--out`, a directory writes
@@ -154,6 +162,10 @@ a dry music bed or like pure audience noise; the in-game result is the mix.
 Use the bank name, stream count, duration and channel count together before deciding what a bank is. Station
 programming is assembled by the game from many assets, so a lone AWC is rarely a complete station.
 
+The music/radio **config table** is a separate structure: 1,589 records with exact durations, AWC stream ids,
+contiguous station grouping and no per-track start offsets. See [audio_config.md](audio_config.md) for the record
+layout and the station-content references.
+
 ## Never commit or share extracted audio
 
 Extracted banks, Ogg Opus, WAV, XMA2 and the manifest are game data. Keep them in the work folder, never in the
@@ -166,6 +178,11 @@ the audio itself is not. See the ground rules in [design.md](design.md#ground-ru
 - 300 random Opus streams decode with ffmpeg with no errors; their lengths match the declared sample counts.
 - All 1,818 XMA2 streams decode after `rpf9dump xma`.
 - A 4-channel streamed-music bank gives four 42.0 s mono channels with real levels and no decoder errors.
+- A 1-channel streamed-music descriptor can carry stereo Opus packets; it exports as one stereo Ogg with the
+  interleaved sample count halved, and a 3-channel descriptor with stereo packets exports three stereo Oggs.
+- In the 3,008-bank / 3,116-channel streamed-music census, 2,501 of 2,958 one-channel descriptors carry stereo
+  packets; the 50 multi-channel descriptors split into 20 all-stereo and 30 all-mono banks, with no channel
+  mixing TOC stereo bits. 61 representative exports decode cleanly.
 - All exported WAVs decode. Codec 2 values are stored as-is, so a float WAV can exceed ±1.
 
 The tools export the streams and channels as stored. They do not reconstruct runtime mixing, looping, ducking or

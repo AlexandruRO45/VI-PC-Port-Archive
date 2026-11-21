@@ -32,7 +32,7 @@ const char* name(leonida::ReplayResult result) {
     case leonida::ReplayResult::unresolved_resource: return "unknown resource";
     case leonida::ReplayResult::invalid_subresource: return "invalid subresource";
     case leonida::ReplayResult::invalid_clear: return "invalid clear";
-    case leonida::ReplayResult::invalid_copy: return "invalid copy";
+    case leonida::ReplayResult::invalid_copy: return "invalid copy or resolve";
     case leonida::ReplayResult::unsupported: return "unsupported";
     }
     return "?";
@@ -55,16 +55,19 @@ private:
 };
 
 class GraphicsCommandList final
-    : public Child<GraphicsCommandList, ID3D12GraphicsCommandList7Stubs, ID3D12Object, ID3D12DeviceChild,
+    : public Child<GraphicsCommandList, ID3D12GraphicsCommandList8Stubs, ID3D12Object, ID3D12DeviceChild,
                     ID3D12CommandList, ID3D12GraphicsCommandList, ID3D12GraphicsCommandList1,
                     ID3D12GraphicsCommandList2, ID3D12GraphicsCommandList3, ID3D12GraphicsCommandList4,
-                    ID3D12GraphicsCommandList5, ID3D12GraphicsCommandList6, ID3D12GraphicsCommandList7> {
+                    ID3D12GraphicsCommandList5, ID3D12GraphicsCommandList6, ID3D12GraphicsCommandList7,
+                    ID3D12GraphicsCommandList8> {
 public:
     // {2f8a7c33-91d4-4b6e-8e05-6d3f1a9b2c47}
     static constexpr GUID kTag{0x2f8a7c33, 0x91d4, 0x4b6e, {0x8e, 0x05, 0x6d, 0x3f, 0x1a, 0x9b, 0x2c, 0x47}};
     explicit GraphicsCommandList(D3D12_COMMAND_LIST_TYPE type) : type_(type) {}
 
     const leonida::CommandList& commands() const { return list_; }
+    UINT front_stencil_ref() const { return front_stencil_ref_; }
+    UINT back_stencil_ref() const { return back_stencil_ref_; }
 
     D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE GetType() override { return type_; }
 
@@ -78,6 +81,7 @@ public:
         if (!allocator) return E_INVALIDARG;
         if (!list_.reset()) return E_FAIL;  // D3D12 resets only closed lists
         invalid_ = false;
+        front_stencil_ref_ = back_stencil_ref_ = 0;  // Reset returns every list state to its default
         if (state) stub("ID3D12GraphicsCommandList::Reset(initial pipeline state)");
         return S_OK;
     }
@@ -156,6 +160,23 @@ public:
         check(list_.copy_resource({resource_id(dst), resource_id(src)}));
     }
 
+    // The format picks the member of a typeless family to resolve as; the textures' own format is used.
+    void STDMETHODCALLTYPE ResolveSubresource(ID3D12Resource* dst, UINT dst_subresource, ID3D12Resource* src,
+                                              UINT src_subresource, DXGI_FORMAT) override {
+        check(list_.resolve_subresource({resource_id(dst), dst_subresource, resource_id(src), src_subresource}));
+    }
+
+    void STDMETHODCALLTYPE ResolveSubresourceRegion(ID3D12Resource* dst, UINT dst_subresource, UINT x, UINT y,
+                                                     ID3D12Resource* src, UINT src_subresource, D3D12_RECT* rect,
+                                                     DXGI_FORMAT format, D3D12_RESOLVE_MODE mode) override {
+        if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT || mode != D3D12_RESOLVE_MODE_AVERAGE ||
+            !color_resolve_format_matches(format, dst, src))
+            return check(false);
+        leonida::ResolveRegion region{x, y, std::nullopt};
+        if (rect) region.src_rect = leonida::Rect{rect->left, rect->top, rect->right, rect->bottom};
+        check(list_.resolve_subresource({resource_id(dst), dst_subresource, resource_id(src), src_subresource, region}));
+    }
+
     void STDMETHODCALLTYPE ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE view, const FLOAT color[4], UINT count,
                                                  const D3D12_RECT* rects) override {
         if (!view.ptr || !color) return check(false);
@@ -169,6 +190,16 @@ public:
         if (!view.ptr) return check(false);
         check(list_.clear_depth_stencil(*reinterpret_cast<const leonida::TargetView*>(view.ptr), u(flags), depth,
                                         stencil, to_rects(count, rects)));
+    }
+
+    // GCL8. Vulkan can set the two faces independently with vkCmdSetStencilReference(VK_STENCIL_FACE_FRONT_BIT /
+    // BACK_BIT), but that state only matters when a pipeline uses it, and this layer has no pipeline or draw path
+    // yet. Retain the values for that path and report that nothing consumed them, rather than emit a call whose
+    // effect no later command can observe.
+    void STDMETHODCALLTYPE OMSetFrontAndBackStencilRef(UINT front, UINT back) override {
+        front_stencil_ref_ = front;
+        back_stencil_ref_ = back;
+        stub("ID3D12GraphicsCommandList8::OMSetFrontAndBackStencilRef (recorded; no pipeline path applies it)");
     }
 
     static GraphicsCommandList* from(IUnknown* object) { return Child::from<GraphicsCommandList>(object); }
@@ -202,6 +233,8 @@ private:
     D3D12_COMMAND_LIST_TYPE type_;
     leonida::CommandList list_;
     bool invalid_ = false;
+    UINT front_stencil_ref_ = 0;
+    UINT back_stencil_ref_ = 0;
 };
 
 class Fence final
@@ -401,6 +434,14 @@ HRESULT create_fence(leonida::VulkanContext& context, UINT64 initial_value, D3D1
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue) {
     const CommandQueue* q = CommandQueue::from(queue);
     return q ? q->last_result() : leonida::ReplayResult::unsupported;
+}
+
+bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT& back) {
+    const GraphicsCommandList* l = GraphicsCommandList::from(list);
+    if (!l) return false;
+    front = l->front_stencil_ref();
+    back = l->back_stencil_ref();
+    return true;
 }
 
 }  // namespace rt::d3d12

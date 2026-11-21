@@ -2,10 +2,12 @@
 
 // The command-list IR (docs/d3d12_vulkan.md section 3.2): what a D3D12 command list records, kept until
 // ExecuteCommandLists replays it on Vulkan (vulkan_replay.h). This slice covers legacy and enhanced barriers and
-// render-target and depth-stencil clears (whole views or rectangles), and copies. It has no Windows or Vulkan dependency.
+// render-target and depth-stencil clears (whole views or rectangles), copies and resolves. It has no Windows or
+// Vulkan dependency.
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <variant>
 #include <vector>
@@ -268,6 +270,22 @@ struct CopyResource {
     ResourceId src;
 };
 
+struct ResolveRegion {
+    std::uint32_t dst_x;
+    std::uint32_t dst_y;
+    std::optional<Rect> src_rect;
+};
+
+// Without a region, both subresources have the same extent. A region with no source rectangle takes the
+// entire source to the given destination offset. The resolve uses the images' own format.
+struct ResolveSubresource {
+    ResourceId dst;
+    std::uint32_t dst_subresource;
+    ResourceId src;
+    std::uint32_t src_subresource;
+    std::optional<ResolveRegion> region = std::nullopt;
+};
+
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
 inline constexpr std::uint32_t texture_data_pitch_alignment = 256;
 inline constexpr std::uint32_t texture_data_placement_alignment = 512;
@@ -288,7 +306,7 @@ struct ClearDepthStencil {
 
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
-                             CopyResource>;
+                             CopyResource, ResolveSubresource>;
 
 class CommandList {
 public:
@@ -348,6 +366,18 @@ public:
     bool copy_resource(const CopyResource& copy) {
         if (!copy.dst || !copy.src || copy.dst == copy.src) return false;
         return append(copy);
+    }
+
+    // A resource has one sample count, so it cannot be resolved into itself.
+    bool resolve_subresource(const ResolveSubresource& resolve) {
+        if (!resolve.dst || !resolve.src || resolve.dst == resolve.src) return false;
+        if (const auto& region = resolve.region) {
+            if (region->dst_x > INT32_MAX || region->dst_y > INT32_MAX) return false;
+            if (const auto& r = region->src_rect;
+                r && (r->left < 0 || r->top < 0 || r->right <= r->left || r->bottom <= r->top))
+                return false;
+        }
+        return append(resolve);
     }
 
     // ClearRenderTargetView; the resource must be in render_target state at execution. No rects: the whole view.

@@ -17,13 +17,46 @@ import pytest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
+import mc_command  # noqa: E402
 import rdna2spirv  # noqa: E402
+
+
+def _repair_stdin_handle():
+    """Windows, under pytest's fd capture: give the children the tests start a stdin that is open.
+
+    The capture replaces fd 0 with os.dup2(), which closes the handle fd 0 had, while the process's
+    STD_INPUT_HANDLE keeps that handle's number. subprocess starts from GetStdHandle(), not from fd 0, so a child
+    started without stdin=/input= fails with "[WinError 6] The handle is invalid" or, when the number has been
+    reused meanwhile, gets whatever file now has it. Which one depends on what ran before, so the failures move
+    from run to run. With -s or --capture=sys, and without pytest, the two handles agree and nothing is done.
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+    import msvcrt
+    kernel32 = ctypes.WinDLL("kernel32")
+    kernel32.GetStdHandle.restype = ctypes.c_void_p
+    kernel32.GetStdHandle.argtypes = [ctypes.c_uint32]
+    kernel32.SetStdHandle.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+    std_input = 0xFFFFFFF6                              # STD_INPUT_HANDLE, (DWORD)-10
+    handle = kernel32.GetStdHandle(std_input)
+    try:
+        fd0 = msvcrt.get_osfhandle(0)
+    except OSError:
+        fd0 = None
+    if not handle or handle == fd0:                     # no stdin at all (subprocess copes), or not redirected
+        return
+    # A NUL of our own, never closed: fd 0's handle would go stale again the next time the capture swaps fd 0.
+    kernel32.SetStdHandle(std_input, msvcrt.get_osfhandle(os.open(os.devnull, os.O_RDONLY)))
+
+
+_repair_stdin_handle()      # before the llvm-mc probe below, which is the first child
 
 
 def _has_amdgpu(mc):
     """True if this llvm-mc was built with the AMDGPU target (the official Windows release archives are not)."""
     try:
-        r = subprocess.run([mc, "--version"], capture_output=True, text=True, timeout=60)
+        r = subprocess.run(mc + ["--version"], capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
         return False
     return "amdgcn" in r.stdout
@@ -33,12 +66,14 @@ def _find_llvm_mc():
     candidates = []
     env = os.environ.get("LLVM_MC")
     if env:
-        candidates.append(shutil.which(env))      # None when the path doesn't exist
-    candidates.append(shutil.which("llvm-mc"))
+        candidates.append(mc_command.split_command(env))
+    found = shutil.which("llvm-mc")
+    if found:
+        candidates.append([found])
     # Debian/Ubuntu install it versioned, out of PATH.
-    candidates += sorted(glob.glob("/usr/lib/llvm-*/bin/llvm-mc"), reverse=True)
+    candidates += [[p] for p in sorted(glob.glob("/usr/lib/llvm-*/bin/llvm-mc"), reverse=True)]
     # Default location of the official Windows installer, which doesn't add LLVM to PATH unless asked to.
-    candidates += glob.glob(r"C:\Program Files\LLVM\bin\llvm-mc.exe")
+    candidates += [[p] for p in glob.glob(r"C:\Program Files\LLVM\bin\llvm-mc.exe")]
     for c in candidates:
         if c and _has_amdgpu(c):
             return c
@@ -72,13 +107,14 @@ def make_dxbc(chunks):
 
 
 def signature_chunk(fourcc, elements):
-    """ISG1/OSG1 chunk. elements = [(register, system value, mask)]: system value 1 is SV_Position, 0 is a plain
-    varying. Semantic names are left out (offset 0): the translator only reads register, system value, component
-    type and the two masks."""
+    """ISG1/OSG1 chunk. elements = [(register, system value, mask)] or [(register, system value, mask, sem_idx)].
+    System value 1 is SV_Position, 2 is SV_ClipDistance, 3 is SV_CullDistance, 0 is a plain varying."""
     out = struct.pack("<II", len(elements), 8)
-    for reg, sysv, mask in elements:
+    for item in elements:
+        reg, sysv, mask = item[:3]
+        sem = item[3] if len(item) > 3 else 0
         # stream, name offset, semantic index, system value, component type (3 = float), register, masks, padding
-        out += struct.pack("<6I", 0, 0, 0, sysv, 3, reg) + bytes([mask, mask, 0, 0]) + struct.pack("<I", 0)
+        out += struct.pack("<6I", 0, 0, sem, sysv, 3, reg) + bytes([mask, mask, 0, 0]) + struct.pack("<I", 0)
     return fourcc, out
 
 
@@ -98,11 +134,17 @@ def mesh_psv0_chunk(threads=(128, 1, 1), max_vertices=64, max_primitives=64, top
 GS_TRI_DXBC = make_dxbc([signature_chunk(b"ISG1", [(0, 1, 0xF), (1, 0, 0xF)]),      # SV_Position reg 0, TEXCOORD0 reg 1
                          signature_chunk(b"OSG1", [(0, 1, 0xF), (1, 0, 0xF)])])
 MS_TRI_DXBC = make_dxbc([mesh_psv0_chunk()])                                          # 128 threads, 64/64, triangles
-SAMPLE_DXBC = {"gs_tri": GS_TRI_DXBC, "ms_tri": MS_TRI_DXBC}
+MS_CLIP_DXBC = make_dxbc([mesh_psv0_chunk(),
+                          signature_chunk(b"OSG1", [(0, 1, 0xF), (1, 2, 0x1)])])      # SV_Position + SV_ClipDistance.x
+SAMPLE_DXBC = {"gs_tri": GS_TRI_DXBC, "ms_tri": MS_TRI_DXBC, "ms_clip": MS_CLIP_DXBC,
+               "ms_v5_workgroup": make_dxbc([mesh_psv0_chunk(threads=(32, 1, 1), max_vertices=3,
+                                                           max_primitives=1, group_shared=128)])}
 
-# spirv-val errors on valid-looking output, by sample. ms_tri: SPIRV-Tools 2025.1 (Ubuntu 24.04) rejects the
-# CullPrimitiveEXT output although it is declared as the spec asks (PerPrimitiveEXT array of bool, MeshEXT model).
-KNOWN_VAL_ISSUES = {"ms_tri": "VUID-CullPrimitiveEXT-CullPrimitiveEXT-07036"}
+# spirv-val errors on valid-looking output, by sample.
+# CullPrimitiveEXT used to need a waiver for SPIRV-Tools ≤2025.1 (#5980) when emitted as OpTypeArray of
+# bool; the translator now uses the Block+bool-member form (also allowed by VUID-07036), which those
+# validators accept. Keep this map for unrelated known false positives.
+KNOWN_VAL_ISSUES = {}
 
 # Compute shaders take their system registers from the FSSM header (rdna2spirv.translate reads it from
 # <disasm dir>/../fssm/<name>.fssm): word 0x138 is COMPUTE_PGM_RSRC2, words 0x13C/0x140/0x144 the thread-group size.
@@ -120,7 +162,7 @@ class Shader:
             rsrc2, (lx, ly, lz) = cs_header
             (workdir / "fssm").mkdir(exist_ok=True)
             (workdir / "fssm" / f"{name}.fssm").write_bytes(bytes(0x138) + struct.pack("<4I", rsrc2, lx, ly, lz))
-        cmd = [LLVM_MC, "-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
+        cmd = LLVM_MC + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
         for ln in asm.splitlines():
             s = ln.strip()
             if not s:

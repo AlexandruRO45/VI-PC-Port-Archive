@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Numerics;
+using System.Text.Json;
 using RpfPreview.Core;
 
 // Metadata only: palette slots are not per-vertex joint indices or weights.
@@ -48,6 +49,9 @@ internal sealed class SkeletonExport
             Meshes = meshes
         };
     }
+
+    internal static void WriteMetadata(string path, object metadata, JsonSerializerOptions options) =>
+        Util.WriteAllText(path, JsonSerializer.Serialize(metadata, options));
 
     private static float[] Elements(Matrix4x4 m) =>
         [m.M11, m.M12, m.M13, m.M14, m.M21, m.M22, m.M23, m.M24,

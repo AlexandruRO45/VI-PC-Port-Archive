@@ -4,23 +4,26 @@ This integration depends on **unmerged rpf9-explorer PR #3**, commit
 `374f9a74df49ea22d8ac6e095196f56a03994de3`. The submodule pin is explicit;
 do not merge this dependency change without maintainer review.
 
-## Compatibility with Leonida PR #162
+## Upstream integration and dependency boundary
 
-ASSET-10 is coordinated in Leonida issue #156. PR #96 is already merged and
-indexes animation/rig metadata; this exporter uses the separate dependency API,
-so it neither replaces nor duplicates that research.
+ASSET-10 was claimed and reported in Leonida issue #156; current coordination is
+continued in issue #374. PR #96's merged animation/rig metadata index remains
+separate from this dependency API. No skeleton parser is duplicated here.
 
-PR #162 (reviewed at `65d927b61a88640d65317918923995aa39e1cd5f`) moves `Util` to
-its own file and adds `Util.WriteAllText(string path, string text)`, backed by
-`WriteAtomic(string path, Action<string> write)`. Once that PR is integrated,
-replace **only the sidecar's** `File.WriteAllText` call in `Program.cs` with
-`Util.WriteAllText`. Preserve #162's OBJ/DDS/audio calls and its helper/tests.
-Then rerun all three smoke suites below and #162's updated diagnostics. This
-is a prepared compatibility change, not a claim that atomic writes are currently
-integrated or tested in this branch. No duplicate atomic writer is added here.
-Same-file overlap is known; actual textual conflicts require a fetched upstream
-and #162 branch before they can be assessed. Stopped sidecar writes can leave a
-partial final file until the helper is adopted; use fresh outputs and check status.
+This branch merges upstream main at `d937b7f092dbc188b59754e5c73c1a9dac553cf9`,
+including merged PR #162. Its existing `Util.WriteAllText` / `WriteAtomic` helper
+now writes the sidecar through `<path>.partial`, then renames the complete file.
+The upstream OBJ, DDS and audio writers and atomic-write diagnostics are retained
+unchanged. There is no second atomic implementation. Serialization completes
+before writing; failed writes remove their temporary output. Existing final files
+survive a failed replacement. This is per-file atomicity, not a transaction across
+OBJ, metadata and textures, and it is not a power-loss durability guarantee.
+
+`SkeletonExport` is the small exporter boundary around the dependency API. Both
+compilation and runtime still require the pinned unmerged skeleton PR. Synthetic
+tests verify metadata and writes, but do not make the feature independent of that
+parser. A supported merged revision, or an explicit maintainer decision to accept
+this pin, is needed before describing dependency integration as resolved.
 
 Normal OBJ export is unchanged. For local research, a caller who has independently
 identified the correct external drawable may opt into JSON sidecars:
@@ -68,5 +71,9 @@ dotnet run --project third_party/rpf9-explorer/Tests/SkeletonSmoke -c Release
 The synthetic tests check serialized hierarchy, matrix elements against an
 independent bind-space coordinate calculation, repeated/reordered palettes,
 missing and ambiguous bindings, malformed skeletons, explicit file/offset loading,
-invalid offsets, whole-model rejection, CLI opt-out, and OBJ
-non-mutation. They do not demonstrate a deformed real character.
+invalid offsets, whole-model rejection, CLI opt-out, deterministic/culture-independent
+JSON, and OBJ non-mutation. The production sidecar-writing path is checked for
+stale temporary files, replacement, serialization failure and rename failure;
+fault injection also verifies that the shared writer preserves a previous final
+sidecar after an interrupted replacement. They do not demonstrate a deformed
+real character.

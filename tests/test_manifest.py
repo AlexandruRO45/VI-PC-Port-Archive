@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "manifest.py")
@@ -68,6 +69,19 @@ class ManifestWalkTest(unittest.TestCase):
         for rel, abs_path in entries:
             self.assertTrue(os.path.isabs(abs_path))
             self.assertTrue(os.path.exists(abs_path))
+
+    def test_walk_reports_an_unreadable_subdirectory(self):
+        blocked = os.path.join(self.pkg, "sub", "deep")
+        scandir = os.scandir
+
+        def scan(path):
+            if path == blocked:
+                raise PermissionError(f"cannot read {path}")
+            return scandir(path)
+
+        with patch.object(os, "scandir", side_effect=scan):
+            with self.assertRaises(PermissionError):
+                list(manifest.walk(self.pkg))
 
 
 class ManifestCreateVerifyTest(unittest.TestCase):
@@ -292,6 +306,86 @@ class ManifestCliTest(unittest.TestCase):
         p_verify = self.run_cli("verify", self.pkg, "--manifest", self.out_manifest, "--jobs", "1")
         self.assertEqual(p_verify.returncode, 1)
         self.assertIn("problem(s)", p_verify.stdout)
+
+    def test_cli_rejects_invalid_game_directories(self):
+        # Start with a valid empty manifest, which would otherwise verify even if the scan never ran.
+        empty = os.path.join(self.tmp.name, "empty")
+        os.mkdir(empty)
+        self.assertEqual(self.run_cli("create", empty, "--out", self.out_manifest).returncode, 0)
+        self.assertEqual(self.run_cli("verify", empty, "--manifest", self.out_manifest).returncode, 0)
+        with open(self.out_manifest, "rb") as f:
+            original = f.read()
+
+        for game_dir in (os.path.join(self.tmp.name, "missing"), os.path.join(self.pkg, "sample.dat")):
+            for command, option in (("create", "--out"), ("verify", "--manifest")):
+                with self.subTest(game_dir=game_dir, command=command):
+                    result = self.run_cli(command, game_dir, option, self.out_manifest)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn(os.path.basename(game_dir), result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    with open(self.out_manifest, "rb") as f:
+                        self.assertEqual(f.read(), original)
+
+    def test_cli_verify_reports_a_damaged_manifest_without_a_traceback(self):
+        damaged = {
+            "truncated": b'{"created": "x", "files": {"sample.dat": {"si',
+            "not_utf8": b'\xff\xfe{"files": {}}',
+            "not_an_object": b"[]",
+            "files_is_a_list": b'{"files": []}',
+            "no_files": b'{"created": "x"}',
+            "entry_is_a_number": b'{"files": {"sample.dat": 5}}',
+            "no_sha256": b'{"files": {"sample.dat": {"size": 22}}}',
+            "size_is_a_string": b'{"files": {"sample.dat": {"size": "22", "sha256": "00"}}}',
+        }
+        for name, data in damaged.items():
+            with self.subTest(name=name):
+                path = os.path.join(self.tmp.name, f"{name}.json")
+                with open(path, "wb") as f:
+                    f.write(data)
+                result = self.run_cli("verify", self.pkg, "--manifest", path, "--jobs", "1")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("ERROR:", result.stderr)
+                self.assertIn(f"{name}.json", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(result.stdout, "")
+
+
+class ManifestAtomicCreateTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.pkg = os.path.join(self.tmp.name, "pkg")
+        os.makedirs(self.pkg)
+        with open(os.path.join(self.pkg, "sample.dat"), "wb") as f:
+            f.write(b"atomic create payload")
+        self.out = os.path.join(self.tmp.name, "manifest.json")
+
+    def create(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return manifest.create(self.pkg, self.out, jobs=1)
+
+    def test_an_interrupted_create_keeps_the_previous_manifest(self):
+        self.assertEqual(self.create(), 0)
+        with open(self.out, "rb") as f:
+            original = f.read()
+        with open(os.path.join(self.pkg, "added.dat"), "wb") as f:
+            f.write(b"new file")
+
+        for error in (OSError, KeyboardInterrupt):
+            with self.subTest(error=error.__name__):
+                def fail(obj, f, **kwargs):
+                    f.write('{"created": "')
+                    raise error("stopped")
+                with patch.object(manifest.json, "dump", side_effect=fail):
+                    with self.assertRaises(error):
+                        self.create()
+                with open(self.out, "rb") as f:
+                    self.assertEqual(f.read(), original)
+                self.assertEqual(sorted(os.listdir(self.tmp.name)), ["manifest.json", "pkg"])
+
+        self.assertEqual(self.create(), 0)
+        self.assertEqual(sorted(manifest.load_manifest(self.out)), ["added.dat", "sample.dat"])
 
 
 class ManifestBelowNormalTest(unittest.TestCase):

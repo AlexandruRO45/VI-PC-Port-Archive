@@ -46,6 +46,21 @@ class TestParse(unittest.TestCase):
                          ["LSCH", "LENM", "LGID", "LRSC", "CHKS"])
         self.assertEqual(got["sections"][2]["size"], 8)
         self.assertEqual(got["sections"][0]["payload"], 3)
+        self.assertEqual(got["rsc_version"], 122)
+        self.assertEqual(got["checksum_size"], 0)
+        self.assertEqual(got["checksum"], "00000000")
+
+    def test_rsc_and_checksum_fields(self):
+        blob = make_psin([
+            ("LRSC", b"0DRP\x7a\x00\x00\x00"),
+            ("CHKS", struct.pack(">I", 5392) + b"\x99\xfe\x66\x9f"),
+        ])
+        got = P.parse(blob)
+        self.assertTrue(got["complete"])
+        self.assertEqual(got["rsc_version"], 122)
+        self.assertEqual(got["sections"][0]["rsc_magic"], "0DRP")
+        self.assertEqual(got["checksum_size"], 5392)
+        self.assertEqual(got["checksum"], "99fe669f")
 
     def test_not_psin(self):
         self.assertIsNone(P.parse(b"NOPE" + b"\x00" * 20))
@@ -56,6 +71,20 @@ class TestParse(unittest.TestCase):
         got = P.parse(blob)
         self.assertFalse(got["complete"])
         self.assertIn("outside", got["error"])
+
+    def test_first_section_must_exist(self):
+        for padding in (0, 1, 7):
+            with self.subTest(padding=padding):
+                blob = make_psin([], first=32, table_bytes=16) + b"\0" * padding
+                got = P.parse(blob)
+                self.assertFalse(got["complete"])
+                self.assertEqual(got["sections"], [])
+                self.assertIn("first section header", got["error"])
+
+    def test_empty_first_section_payload_is_valid(self):
+        got = P.parse(make_psin([("LSCH", b"")], first=32, table_bytes=16))
+        self.assertTrue(got["complete"])
+        self.assertEqual(got["sections"][0]["size"], 8)
 
     def test_truncated_section(self):
         blob = make_psin([("LSCH", b"\x00" * 8)])
@@ -84,13 +113,27 @@ class TestCli(unittest.TestCase):
                 f.write(good)
             with open(os.path.join(tmp, "00000002.bin"), "wb") as f:
                 f.write(b"not a psin")
+            with open(os.path.join(tmp, "00000003.bin"), "wb") as f:
+                f.write(make_psin([]))
             p = subprocess.run([sys.executable, "-I", TOOL, tmp, "--json"],
                                capture_output=True, text=True)
             self.assertEqual(p.returncode, 0, p.stderr)
             doc = json.loads(p.stdout)
-            self.assertEqual(doc["summary"]["files"], 1)
+            self.assertEqual(doc["summary"]["files"], 2)
             self.assertEqual(doc["summary"]["complete"], 1)
+            self.assertEqual(doc["summary"]["incomplete"], 1)
             self.assertEqual(doc["summary"]["section_tags"], {"CHKS": 1, "LSCH": 1})
+
+    def test_limit_below_one_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "00000001.bin")
+            with open(path, "wb") as f:
+                f.write(make_psin([("LSCH", b"")]))
+            for value in ("0", "-1"):
+                p = subprocess.run([sys.executable, "-I", TOOL, tmp, "--limit", value],
+                                   capture_output=True, text=True)
+                self.assertEqual(p.returncode, 2)
+                self.assertIn("must be at least 1", p.stderr)
 
 
 if __name__ == "__main__":

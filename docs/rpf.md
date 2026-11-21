@@ -25,6 +25,9 @@ The walker starts at `--start` or the header's data offset, finds a zlib header 
 magic, inflates the stream, and continues after the bytes it actually consumed. `--index-only` records the
 streams without writing the inflated files; `--limit` bounds a sample; `--start` starts at a known offset.
 
+`--start` must be 0 or more and `--limit` at least 1 (decimal or `0x` hex). An out-of-range value stops with a
+one-line error and exit code 2 before any output is written, rather than silently scanning everything or nothing.
+
 `<out_dir>/index.json` contains:
 
 - `summary`: archive, files, compressed/inflated bytes, Bink 2 bytes/files, zero padding, unread bytes, span;
@@ -75,6 +78,10 @@ both paths. It is used to check exported assets without keeping a second copy.
 
 ## See also
 
-- [docs/design.md](design.md) — the asset-stage table, coverage numbers and the recovery approach.
+- [docs/design.md](design.md) - the asset-stage table, coverage numbers and the recovery approach.
+- [docs/page_directory.md](page_directory.md) - the `0DRP` page directory layout, `q38` resource boundaries and
+  `tools/page_index.py`.
+- [docs/story.md](story.md) - measured `story000`/`shared_minigame000` composition, nested RPF9 sub-archives and the `PSIN`/`RSC8` headers.
+- [docs/restofworld.md](restofworld.md) - measured composition of the rest-of-world and script archives.
 - `docs/audio.md` - AWC layout and the audio exporters, once the audio guide is merged.
 - the related-projects page - the rpf9-explorer/PercyStar/SCARAB licence boundaries.

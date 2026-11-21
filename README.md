@@ -46,11 +46,12 @@ work on booting can start as soon as one is available to a developer.
 | Finding and checking your copy (Xbox Series 1.0.2.1) | ✅ Works |
 | Shaders: carve, unpack native RDNA2 code, disassemble | ✅ All 26,503 |
 | Shaders: RDNA2 → SPIR-V translation | ✅ **All 26,503**: 2,236 VS, 12,101 PS, 2,689 CS, 9,282 mesh, 195 geometry. All pass `spirv-val`, with a per-shader metadata index for pipeline creation. ⚠️ 21,545 are wave64: exact on 64-wide subgroups (AMD), and cross-half wave ops are approximate on 32-wide (NVIDIA) |
-| Shader translator checked on a real GPU | ⚠️ Vertex fetch, texture sampling, exports, ALU ops, partial-register ops, barycentrics, wave-uniform branches and compute (LDS, barriers, buffer stores) checked on one GPU |
+| Shader translator checked on a real GPU | ⚠️ The hand-written GPU tests (vertex fetch, texture sampling, exports, ALU ops, partial-register ops, barycentrics, wave-uniform branches, compute LDS/barriers/buffer stores, wave64 masks) pass on 13 GPUs reported in [#166](https://github.com/ItsNotRexed/Leonida/issues/166): NVIDIA Turing, Ampere, Ada and Blackwell; AMD RDNA2 and RDNA3 (Windows driver and RADV); Apple M1 (MoltenVK, no geometry or mesh stages). Wave64 tests need 64-wide subgroups (AMD) or `LEONIDA_W64_EMULATE=1`; `cs_w64x_partial` still fails on native wave64 until #204. These are small test shaders: the game's own shaders are checked by `spirv-val` and by driver pipeline creation (`vk_pipeline_check`), not by their output |
 | Models (OBJ with real names, UVs, material references) | ✅ Exported. Not all layouts are decoded yet |
 | Texture dictionaries and world texture pools (DDS) | ✅ Exported. Some pool entries (BCPack) are skipped |
 | Audio banks (AWC: Opus, XMA2) | ✅ Exported whole. Opus repackaged **losslessly** as Ogg Opus; PCM (codec 0/2) as WAV; XMA2 decoded with ffmpeg. `--wav` adds 16-bit PCM WAV ([notes](docs/audio.md)) |
-| PE loader and import shims | ⚠️ Skeleton. Untested against the real executable |
+| Music/radio config | ? Measured. **1,589** audio-config records with exact durations and AWC stream ids; station grouping and content-id lists; no per-track start offsets ([notes](docs/audio_config.md)) |
+| PE loader and import shims | ⚠️ Runs a stand-in executable end to end (`gta6rt --run`: CRT startup, statics, heap, files, threads, GDK imports through the shims, exit code back). Untested against the real executable |
 | Xbox D3D12 → Vulkan | ⚠️ In progress. A Vulkan-backed device behind the Xbox-ABI proxy creates queues, command lists, fences, descriptor heaps, views and committed resources; barriers, clears, uploads and copies (BC included) run on Vulkan, checked on one GPU. No shader views, pipelines, draws or swapchain yet ([plan](docs/d3d12_vulkan.md)) |
 | Booting, story mode, anything playable | ❌ No |
 
@@ -83,8 +84,9 @@ Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` arc
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
 - [Vulkan SDK](https://vulkan.lunarg.com/), for `spirv-as` / `spirv-val`.
 - [LLVM 21+](https://github.com/llvm/llvm-project/releases) with the **AMDGPU target** for `llvm-mc`. The official
-  Windows build has no AMDGPU target: on Windows install `llvm-21` in WSL and set `LLVM_MC` to the whole command,
-  `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"` (see
+  Windows build has no AMDGPU target. On Windows, `scripts\build_llvm_mc.ps1` builds a native `llvm-mc.exe` with it
+  (no WSL; needs git and the Visual Studio C++ tools below) and sets `LLVM_MC`. Or install `llvm-21` in WSL and set
+  `LLVM_MC` to the whole command, `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"` (see
   [docs/design.md](docs/design.md#disassembling-shaders)). On Linux, `llvm-mc` on PATH is enough.
 - Visual Studio 2022 with **Desktop development with C++**, for the runtime stage.
 - [ffmpeg](https://ffmpeg.org/download.html) on PATH (optional: decodes the XMA2 streams, and required for `--wav`).
@@ -97,7 +99,16 @@ python -I make_game.py --check                         # check your copy, build 
 python -I make_game.py --game "D:\path\to\your\package" --out "D:\Games\Leonida" --work "E:\leonida-work"
 python -I make_game.py --stages shaders,assets         # only some stages
 python -I make_game.py --game "D:\path\to\your\package" --wav   # also decode Opus to PCM WAV (large)
+python -I make_game.py --wave64-emulate off            # auto (default), on or off; see below
 ```
+
+`--wave64-emulate` decides whether wave64 compute and mesh shaders are translated to be exact on any subgroup size
+(see "Wave64 emulation" in [docs/design.md](docs/design.md)). NVIDIA and Intel GPUs have 32-wide subgroups and need
+it. The default, `auto`, asks `vulkaninfo` (part of the Vulkan SDK) and turns it on unless every GPU reports 64-wide
+subgroups, or when it can't tell; it also turns it on when the GPU the runtime would use can't be made to run
+compute and mesh shaders 64-wide. The mode is saved next to the translated shaders, and changing it translates them
+again. With `auto`, shaders already translated with emulation are kept even when this run would not emulate (they are
+exact on every GPU); `--wave64-emulate off` translates them natively.
 
 Stages run in order: `check`, `shaders`, `assets`, `runtime`, `pipelines` (creates every translated shader on your
 GPU driver and saves a pipeline cache, so the first boot doesn't compile them). The shader translation is the longest step: it runs
@@ -118,6 +129,10 @@ cmake --build runtime/build/linux --parallel
 
 Pass the directory containing `index.json` and the translated SPIR-V files to `vk_pipeline_check`.
 
+`make_game.py` runs on Linux too, without the `runtime` stage, which builds on Windows only for now: without
+`--stages` it is left out, and asking for it fails before any work starts. The `pipelines` stage uses the
+`vk_pipeline_check` built above (`runtime/build/linux`, or `runtime/build`).
+
 ## How it works
 
 | Piece | What it does | Where |
@@ -129,7 +144,8 @@ Pass the directory containing `index.json` and the translated SPIR-V files to `v
 | Research tools | PE/RTTI inspection, raw carving, texture tiling probes, GPU test harnesses | `tools/`, `runtime/test/` |
 
 The translator's runtime contract (user SGPRs, push constants, memory model, bindless images, vertex fetch,
-system values) and all the format notes are in [docs/design.md](docs/design.md). The Xbox D3D12 plan is in
+system values) and all the format notes are in [docs/design.md](docs/design.md); the format, asset, runtime
+and validation notes are indexed in [docs/README.md](docs/README.md). The Xbox D3D12 plan is in
 [docs/d3d12_vulkan.md](docs/d3d12_vulkan.md). Audio bank formats and the export tools are in
 [docs/audio.md](docs/audio.md); [docs/related_projects.md](docs/related_projects.md) records the prior art we may
 read and the licence limits on it.
@@ -138,7 +154,9 @@ read and the licence limits on it.
 
 The biggest open pieces:
 
-- **Compute, mesh and geometry shaders**: their per-stage system-value register layout.
+- **Shader translator on hardware**: compute, mesh and geometry now translate (see the translator contract in
+  [docs/design.md](docs/design.md)); still open are the vertex-shader input layout (`v0` = `VertexIndex` is
+  unverified if the console runs VS as NGG) and wave64 cross-half code in VS/PS/GS on 32-wide subgroups.
 - **Xbox D3D12 → Vulkan**: the `d3d12_xs` command list and descriptor heap model.
 - **Model layouts** the decoder rejects today.
 
@@ -151,6 +169,8 @@ pull requests.
   decoders used by `tools/rpf9dump` (git submodule).
 - [Mesa](https://gitlab.freedesktop.org/mesa/mesa) (MIT): GFX10 resource-descriptor layout (`tools/gfx10_formats.json`),
   and the ACO/RADV rules used as reference for 16-bit results and shader system registers.
+- [libHttpClient](https://github.com/microsoft/libHttpClient) (MIT) by Microsoft: the XTaskQueue/XAsync implementation
+  in `third_party/xtaskqueue`, used by the offline `xgameruntime` shim.
 - [LLVM](https://llvm.org/): AMDGPU disassembler.
 - Logo: ["Grand Theft Auto VI" icon by SlyDevil](https://www.steamgriddb.com/icon/122618) on SteamGridDB.
 - [SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools): assembly and validation.

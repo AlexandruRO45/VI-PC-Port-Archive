@@ -5,6 +5,7 @@
 // a message instead of being followed out of bounds. The truncation case covers every length of a valid image.
 #include <windows.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -13,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "../shims/shims.h"
 #include "../src/pe_loader.h"
 
 namespace {
@@ -80,6 +82,67 @@ std::filesystem::path write_image(const std::vector<uint8_t>& bytes) {
     out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<long long>(bytes.size()));
     return p;
 }
+
+std::filesystem::path write_image_as(const std::vector<uint8_t>& bytes, const std::string& name) {
+    auto p = g_dir / name;
+    std::ofstream out(p, std::ios::binary);
+    if (!out) throw std::runtime_error("cannot write " + p.string());
+    out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<long long>(bytes.size()));
+    return p;
+}
+
+// An image whose only export, "fwd", forwards to `target`: the address-table entry points at a string inside the
+// export directory, which is how a forwarder is encoded.
+std::vector<uint8_t> make_forwarder_image(const char* target, uint64_t image_base) {
+    auto img = make_image();
+    std::fill(img.begin() + 0x200, img.begin() + 0x400, uint8_t{0});  // real tables end in a zero descriptor
+    nt_of(img)->OptionalHeader.ImageBase = image_base;
+    auto* ed = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(img.data() + 0x200);
+    ed->Base = 1;
+    ed->NumberOfFunctions = 1;
+    ed->AddressOfFunctions = 0x1100;
+    ed->NumberOfNames = 1;
+    ed->AddressOfNames = 0x1120;
+    ed->AddressOfNameOrdinals = 0x1140;
+    *reinterpret_cast<uint32_t*>(img.data() + 0x300) = 0x1160;  // funcs[0]: inside the export directory
+    *reinterpret_cast<uint32_t*>(img.data() + 0x320) = 0x1180;  // the export's name
+    *reinterpret_cast<uint16_t*>(img.data() + 0x340) = 0;
+    std::memcpy(img.data() + 0x360, target, std::strlen(target) + 1);
+    std::memcpy(img.data() + 0x380, "fwd\0", 4);
+    auto& dir = nt_of(img)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    dir.VirtualAddress = 0x1000;
+    dir.Size = 0x200;  // covers the forwarder string at RVA 0x1160
+    return img;
+}
+
+// An image importing `dll`!`symbol` by name.
+std::vector<uint8_t> make_import_image(const char* dll, const char* symbol) {
+    auto img = make_image();
+    std::fill(img.begin() + 0x200, img.begin() + 0x400, uint8_t{0});
+    auto* d = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(img.data() + 0x200);
+    d->Name = 0x1060;  // past the zero descriptor that ends the table
+    d->OriginalFirstThunk = 0x1100;
+    d->FirstThunk = 0x1180;  // the address table the loader fills
+    *reinterpret_cast<uint64_t*>(img.data() + 0x300) = 0x1120;  // hint/name
+    *reinterpret_cast<uint16_t*>(img.data() + 0x320) = 0;
+    std::memcpy(img.data() + 0x322, symbol, std::strlen(symbol) + 1);
+    std::memcpy(img.data() + 0x260, dll, std::strlen(dll) + 1);
+    auto& dir = nt_of(img)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    dir.VirtualAddress = 0x1000;
+    dir.Size = sizeof(IMAGE_IMPORT_DESCRIPTOR);
+    return img;
+}
+
+void* host_symbol(const char* dll, const char* name) {
+    HMODULE h = GetModuleHandleA(dll);
+    return h ? reinterpret_cast<void*>(GetProcAddress(h, name)) : nullptr;
+}
+
+// A shim table for the forwarder test, so the test does not depend on the real xmem shim. Registering it at startup
+// exercises the same registry a packaged module reaches.
+int g_test_shim_target = 0;
+void* test_shim_function() { return &g_test_shim_target; }
+SHIM_TABLE(test_forwarder_shim, {"testshim.dll", "F", reinterpret_cast<void*>(&test_shim_function)});
 
 // 0 when the image loaded, 1 when it was rejected. A crash here is a test failure, which is the point.
 int load(const std::filesystem::path& p, std::string& error) {
@@ -467,6 +530,214 @@ void test_initialise_rejects() {
     }
 }
 
+void test_forwarded_exports() {
+    {
+        const char* what = "a forwarded export binds to its target instead of into the string";
+        write_image_as(make_forwarder_image("KERNEL32.GetCurrentProcessId", 0x180000000), "prov.dll");
+        auto importer = write_image_as(make_import_image("prov.dll", "fwd"), "importer.exe");
+        try {
+            rt::Loader loader(g_dir);
+            rt::Module& m = loader.load(importer);
+            void* expected = host_symbol("kernel32.dll", "GetCurrentProcessId");
+            if (!expected) return failed(what, "GetCurrentProcessId is not loaded in this process");
+            if (m.imports.size() != 1)
+                return failed(what, "the importer has " + std::to_string(m.imports.size()) + " import record(s)");
+            if (m.imports[0].binding != rt::Binding::Host)
+                return failed(what, "the import did not bind through the forwarder to the host");
+            if (*reinterpret_cast<void**>(m.base + 0x1180) != expected)
+                return failed(what, "the address table does not hold the forwarded target");
+            rt::Module* prov = nullptr;
+            for (auto* mod : loader.modules())
+                if (mod->name == "prov.dll") prov = mod;
+            if (!prov) return failed(what, "the provider module was not loaded");
+            if (prov->exports.count("fwd")) return failed(what, "the forwarder was stored as a code export");
+            auto it = prov->forwarders.find("fwd");
+            if (it == prov->forwarders.end() || it->second != "KERNEL32.GetCurrentProcessId")
+                return failed(what, "the forwarder string was not recorded");
+            pass(what);
+        } catch (const std::exception& e) {
+            failed(what, e.what());
+        }
+    }
+    {
+        const char* what = "a forwarder to a module that isn't there binds as unimplemented";
+        write_image_as(make_forwarder_image("NOPE_MISSING_TARGET.f", 0x180000000), "prov.dll");
+        auto importer = write_image_as(make_import_image("prov.dll", "fwd"), "importer.exe");
+        try {
+            rt::Loader loader(g_dir);
+            rt::Module& m = loader.load(importer);
+            if (m.imports.size() != 1 || m.imports[0].binding != rt::Binding::Unimplemented)
+                return failed(what, "the import did not end up unimplemented");
+            if (!*reinterpret_cast<void**>(m.base + 0x1180))
+                return failed(what, "the address table was left null instead of a failure thunk");
+            pass(what);
+        } catch (const std::exception& e) {
+            failed(what, e.what());
+        }
+    }
+    {
+        const char* what = "forwarders that point at each other stop instead of recursing";
+        write_image_as(make_forwarder_image("prov_b.fwd", 0x180000000), "prov_a.dll");
+        write_image_as(make_forwarder_image("prov_a.fwd", 0x190000000), "prov_b.dll");
+        auto importer = write_image_as(make_import_image("prov_a.dll", "fwd"), "importer.exe");
+        try {
+            rt::Loader loader(g_dir);
+            rt::Module& m = loader.load(importer);
+            if (m.imports.size() != 1 || m.imports[0].binding != rt::Binding::Unimplemented)
+                return failed(what, "a forwarder loop did not end as unimplemented");
+            pass(what);
+        } catch (const std::exception& e) {
+            failed(what, e.what());
+        }
+    }
+    {
+        const char* what = "a forwarder to a shimmed module binds to the shim";
+        write_image_as(make_forwarder_image("testshim.F", 0x180000000), "prov_shim.dll");
+        auto importer = write_image_as(make_import_image("prov_shim.dll", "fwd"), "importer_shim.exe");
+        try {
+            rt::Loader loader(g_dir);
+            rt::Module& m = loader.load(importer);
+            if (m.imports.size() != 1 || m.imports[0].binding != rt::Binding::Shim)
+                return failed(what, "the import did not bind as a shim");
+            if (*reinterpret_cast<void**>(m.base + 0x1180) != reinterpret_cast<void*>(&test_shim_function))
+                return failed(what, "the address table does not hold the shim function");
+            pass(what);
+        } catch (const std::exception& e) {
+            failed(what, e.what());
+        }
+    }
+}
+
+void test_delay_descriptor_fields() {
+    {
+        // Without dlattrRva the fields are 32-bit virtual addresses, which cannot address an x64 image.
+        auto img = make_image();
+        std::fill(img.begin() + 0x200, img.begin() + 0x400, uint8_t{0});
+        auto* d = reinterpret_cast<IMAGE_DELAYLOAD_DESCRIPTOR*>(img.data() + 0x200);
+        d->Attributes.AllAttributes = 0;
+        d->DllNameRVA = 0x1060;  // past the zero descriptor that ends the table
+        d->ImportAddressTableRVA = 0x1180;
+        std::memcpy(img.data() + 0x260, "kernel32.dll\0", 13);
+        auto& dir = nt_of(img)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+        dir.VirtualAddress = 0x1000;
+        dir.Size = sizeof(IMAGE_DELAYLOAD_DESCRIPTOR);
+        expect_rejects("a delay-import descriptor without the RVA attribute", img);
+    }
+    {
+        const char* what = "a delay import with no name table binds through its address table";
+        auto img = make_image();
+        std::fill(img.begin() + 0x200, img.begin() + 0x400, uint8_t{0});
+        auto* d = reinterpret_cast<IMAGE_DELAYLOAD_DESCRIPTOR*>(img.data() + 0x200);
+        d->Attributes.AllAttributes = 1;  // dlattrRva
+        d->DllNameRVA = 0x1060;  // past the zero descriptor that ends the table
+        d->ImportNameTableRVA = 0;
+        d->ImportAddressTableRVA = 0x1180;
+        std::memcpy(img.data() + 0x260, "kernel32.dll\0", 13);
+        *reinterpret_cast<uint64_t*>(img.data() + 0x380) = 0x1120;  // RVA 0x1180: the single hint/name entry
+        *reinterpret_cast<uint16_t*>(img.data() + 0x320) = 0;
+        std::memcpy(img.data() + 0x322, "GetCurrentProcessId\0", 20);
+        auto& dir = nt_of(img)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+        dir.VirtualAddress = 0x1000;
+        dir.Size = sizeof(IMAGE_DELAYLOAD_DESCRIPTOR);
+        try {
+            rt::Loader loader(g_dir);
+            rt::Module& m = loader.load(write_image_as(img, "delay.exe"));
+            void* expected = host_symbol("kernel32.dll", "GetCurrentProcessId");
+            if (m.imports.size() != 1) return failed(what, "expected one bound import");
+            if (m.imports[0].binding != rt::Binding::Host) return failed(what, "the delay import did not bind to the host");
+            if (*reinterpret_cast<void**>(m.base + 0x1180) != expected)
+                return failed(what, "the address table does not hold the host function");
+            pass(what);
+        } catch (const std::exception& e) {
+            failed(what, e.what());
+        }
+    }
+}
+
+// make_image() plus an exception directory at RVA 0x1100 whose entries all share one minimal UNWIND_INFO at 0x1180
+// (version 1, no flags, no prologue, no codes). Every RVA here lies inside the single .text section, so file offset
+// = RVA - 0x1000 + 0x200.
+constexpr uint32_t kPdataRva = 0x1100;
+constexpr uint32_t kUnwindRva = 0x1180;
+
+std::vector<uint8_t> make_unwind_image(const std::vector<RUNTIME_FUNCTION>& entries) {
+    auto img = make_image();
+    std::memset(img.data() + 0x200 + (kPdataRva - 0x1000), 0, 0x100);
+    const uint8_t unwind_info[4] = {1, 0, 0, 0};
+    std::memcpy(img.data() + 0x200 + (kUnwindRva - 0x1000), unwind_info, sizeof(unwind_info));
+    std::memcpy(img.data() + 0x200 + (kPdataRva - 0x1000), entries.data(), entries.size() * sizeof(RUNTIME_FUNCTION));
+    auto& dir = nt_of(img)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    dir.VirtualAddress = kPdataRva;
+    dir.Size = static_cast<DWORD>(entries.size() * sizeof(RUNTIME_FUNCTION));
+    nt_of(img)->OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+    return img;
+}
+
+void test_unwind_registration() {
+    const std::vector<RUNTIME_FUNCTION> entries = {{0x1000, 0x1010, kUnwindRva}, {0x1010, 0x1020, kUnwindRva}};
+    uintptr_t pc = 0;
+    {
+        auto img = make_unwind_image(entries);
+        auto p = write_image(img);
+        try {
+            rt::Loader loader(g_dir);
+            rt::Module& m = loader.load(p);
+            pc = reinterpret_cast<uintptr_t>(m.base) + 0x1014;  // inside the second function
+            DWORD64 image_base = 0;
+            auto* found = RtlLookupFunctionEntry(pc, &image_base, nullptr);
+            if (m.function_count != 2)
+                failed("the exception directory is registered", "function_count is " + std::to_string(m.function_count));
+            else if (!found)
+                failed("the exception directory is registered", "RtlLookupFunctionEntry found nothing");
+            else if (image_base != reinterpret_cast<DWORD64>(m.base) ||
+                     reinterpret_cast<uint8_t*>(found) != m.base + kPdataRva + sizeof(RUNTIME_FUNCTION))
+                failed("the exception directory is registered", "the lookup returned the wrong entry or image base");
+            else
+                pass("the exception directory is registered");
+        } catch (const std::exception& e) {
+            failed("the exception directory is registered", e.what());
+        }
+        DWORD64 image_base = 0;
+        if (pc && RtlLookupFunctionEntry(pc, &image_base, nullptr))
+            failed("the unwind table is removed with the loader", "the lookup still finds the freed image");
+        else
+            pass("the unwind table is removed with the loader");
+    }
+    {
+        // The system loader drops a trailing partial entry rather than rejecting the image; so does this one.
+        auto img = make_unwind_image(entries);
+        nt_of(img)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size += 5;
+        auto p = write_image(img);
+        try {
+            rt::Loader loader(g_dir);
+            rt::Module& m = loader.load(p);
+            if (m.function_count != 2)
+                failed("a trailing partial unwind entry is ignored", "function_count is " + std::to_string(m.function_count));
+            else
+                pass("a trailing partial unwind entry is ignored");
+        } catch (const std::exception& e) {
+            failed("a trailing partial unwind entry is ignored", e.what());
+        }
+    }
+    // A zero-length entry appears in a shipped Windows image (symcryptk.dll), so it has to be accepted.
+    expect_loads("a zero-length unwind entry is accepted",
+                 make_unwind_image({{0x1000, 0x1000, kUnwindRva}, {0x1000, 0x1020, kUnwindRva}}));
+    {
+        auto img = make_unwind_image(entries);
+        nt_of(img)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress = 0x1FF0;
+        expect_rejects("an exception directory past the image", img);
+    }
+    expect_rejects("an unwind entry ending past the image",
+                   make_unwind_image({{0x1000, 0x2001, kUnwindRva}}));
+    expect_rejects("an unwind entry that ends before it starts",
+                   make_unwind_image({{0x1010, 0x1000, kUnwindRva}}));
+    expect_rejects("unwind entries out of order",
+                   make_unwind_image({{0x1010, 0x1020, kUnwindRva}, {0x1000, 0x1010, kUnwindRva}}));
+    expect_rejects("overlapping unwind entries",
+                   make_unwind_image({{0x1000, 0x1018, kUnwindRva}, {0x1010, 0x1020, kUnwindRva}}));
+    expect_rejects("unwind data past the image", make_unwind_image({{0x1000, 0x1010, 0x1FFE}}));
+}
+
 }  // namespace
 
 int main() {
@@ -489,6 +760,9 @@ int main() {
     test_delay_imports();
     test_initialise();
     test_initialise_rejects();
+    test_delay_descriptor_fields();
+    test_forwarded_exports();
+    test_unwind_registration();
 
     std::filesystem::remove_all(g_dir, ec);
     std::printf("\n%d checks, %d failed\n", g_checks, g_failed);

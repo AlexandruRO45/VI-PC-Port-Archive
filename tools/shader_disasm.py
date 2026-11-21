@@ -13,32 +13,18 @@ Set LLVM_MC to llvm-mc's path, or to a whole command such as
 """
 import argparse
 import os
-import shlex
 import struct
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from mc_command import mc_command  # noqa: E402
+
 TRIPLE = "amdgcn--amdpal"
 ENDPGM = b"\x00\x00\x81\xbf"
 PROBE = "0x00 0x00 0x81 0xbf"  # s_endpgm: the one instruction every shader ends with
 FAILED = []                    # (path, first stderr line) for shaders that produced no disassembly
-
-
-def split_command(raw: str) -> list:
-    """Split LLVM_MC without eating the backslashes of a Windows path (POSIX shlex would)."""
-    if os.name != "nt":
-        return shlex.split(raw)
-    parts = shlex.split(raw, posix=False)
-    return [p[1:-1] if len(p) > 1 and p[0] == p[-1] == '"' else p for p in parts]
-
-
-def mc_command() -> list:
-    """LLVM_MC is a path, or a command line: 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'."""
-    raw = os.environ.get("LLVM_MC", "llvm-mc").strip()
-    if os.path.isfile(raw):
-        return [raw]                    # a plain path, spaces and all
-    return split_command(raw) or ["llvm-mc"]
 
 
 MC = mc_command()
@@ -49,6 +35,17 @@ def fail(msg: str) -> "None":
     sys.exit(1)
 
 
+def positive_int(text: str) -> int:
+    """--jobs 0 made ThreadPoolExecutor raise, and --limit -1 silently dropped the last file."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def probe(mcpu: str) -> None:
     """Disassemble one s_endpgm first, so a missing tool or AMDGPU target fails now and not per shader."""
     try:
@@ -56,13 +53,15 @@ def probe(mcpu: str) -> None:
                            input=PROBE, capture_output=True, text=True,
                            creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
     except OSError as e:
-        fail(f"'{MC[0]}' could not be started: {e}. Put llvm-mc on PATH or set LLVM_MC to it, e.g.\n"
+        fail(f"'{MC[0]}' could not be started: {e}. Put llvm-mc on PATH or set LLVM_MC to it (on Windows,\n"
+             f"scripts\\build_llvm_mc.ps1 builds one and sets it), e.g.\n"
              f"  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc")
     if p.returncode != 0 or "s_endpgm" not in p.stdout:
         why = (p.stderr.strip().splitlines() or [f"exit code {p.returncode}"])[0]
         fail(f"'{' '.join(MC)}' did not disassemble an s_endpgm: {why}\n"
              f"The disassembler needs LLVM 21+ with the AMDGPU target. The official Windows LLVM build has no\n"
-             f"AMDGPU target; run it from WSL instead (docs/design.md, 'Disassembling shaders'), e.g.\n"
+             f"AMDGPU target: build a native one with scripts\\build_llvm_mc.ps1, or run it from WSL\n"
+             f"(docs/design.md, 'Disassembling shaders'), e.g.\n"
              f"  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc")
 
 
@@ -82,7 +81,9 @@ def code_range(b: bytes):
     """The code section offset is the u32 at 0xC0; instructions start 0x28 bytes into it and run to the last
     4-byte-aligned s_endpgm in the blob (some blobs hold several programs). Found by correlating against
     clean decodes of 154 random shaders."""
-    off = struct.unpack_from("<I", b, 0xC0)[0]
+    # A blob too short to hold the offset goes to the scan like any other header miss; reading it anyway raised
+    # struct.error, which stopped the whole run (and make_game.py at the same blob on every rerun).
+    off = struct.unpack_from("<I", b, 0xC0)[0] if len(b) >= 0xC4 else 0
     start = off + 0x28
     if 0 < off and start < len(b):
         last = b.rfind(ENDPGM, start)
@@ -128,16 +129,19 @@ def main():
     ap.add_argument("src")
     ap.add_argument("--out")
     ap.add_argument("--mcpu", default="gfx1013")
-    ap.add_argument("--limit", type=int)
-    ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
+    ap.add_argument("--limit", type=positive_int)
+    ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
     a = ap.parse_args()
+    if not os.path.isfile(a.src) and not os.path.isdir(a.src):
+        fail(f"{a.src} is not a file or folder")
     files = [a.src] if os.path.isfile(a.src) else sorted(
         os.path.join(a.src, f) for f in os.listdir(a.src) if f.endswith(".fssm"))
+    if not files:
+        fail(f"no .fssm files in {a.src}")
     files = files[: a.limit] if a.limit else files
     out = a.out or os.path.join(os.path.dirname(files[0]), "..", "disasm")
     os.makedirs(out, exist_ok=True)
-    if files:
-        probe(a.mcpu)
+    probe(a.mcpu)
     from collections import Counter
     with ThreadPoolExecutor(a.jobs) as ex:
         res = Counter(ex.map(lambda p: one(p, out, a.mcpu), files))

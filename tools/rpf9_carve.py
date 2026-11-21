@@ -28,19 +28,50 @@ def below_normal():
         k.SetPriorityClass(k.GetCurrentProcess(), 0x00004000)
 
 
+def offset(text):
+    """--start: 0 or more, decimal or 0x hex."""
+    try:
+        value = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be 0 or more") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be 0 or more")
+    return value
+
+
+def byte_count(text):
+    """--limit: at least 1; 0 used to mean no limit and a negative value silently scanned less."""
+    try:
+        value = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be at least 1") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("archive")
     ap.add_argument("out")
-    ap.add_argument("--start", type=int)
-    ap.add_argument("--limit", type=int)
+    ap.add_argument("--start", type=offset)
+    ap.add_argument("--limit", type=byte_count)
     ap.add_argument("--index-only", action="store_true")
     a = ap.parse_args()
     below_normal()
+    try:
+        size = os.path.getsize(a.archive)
+    except OSError as e:
+        sys.exit(f"{a.archive}: {e.strerror or e}")
+    if size == 0:
+        sys.exit(f"{a.archive}: empty file")
+    if size < 8:
+        sys.exit(f"{a.archive}: too short for an RPF9 header ({size} bytes)")
+    if a.start is not None and not 0 <= a.start < size:
+        sys.exit(f"{a.archive}: --start {a.start} is outside the file (0..{size - 1})")
     os.makedirs(a.out, exist_ok=True)
     with open(a.archive, "rb") as fh:
         m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
-        size = len(m)
         pos = a.start if a.start is not None else struct.unpack_from("<I", m, 4)[0]
         end = min(size, pos + a.limit) if a.limit else size
         rows, last, unread, zero = [], pos, 0, 0
@@ -51,6 +82,9 @@ def main() -> int:
                 break
             s = mt.start()
             if m[s:s + 3] == b"KB2":
+                if s + 0x1C > size:   # header cut off by the end of the file (a truncated copy): not a video
+                    pos = s + 1
+                    continue
                 blen = struct.unpack_from("<I", m, s + 4)[0] + 8
                 w, h = struct.unpack_from("<II", m, s + 0x14)
                 if not (64 <= blen <= size - s and 16 <= w <= 8192 and 16 <= h <= 8192):
@@ -117,6 +151,7 @@ def main() -> int:
     with open(os.path.join(a.out, "index.json"), "w", encoding="utf-8") as f:
         json.dump({"summary": summary, "files": rows}, f)
     print(json.dumps(summary, indent=1))
+    span = max(1, span)   # an empty data area (or --start at the end) has nothing to divide by
     print(f"readable: {total / span:.1%}, zero padding {zero / span:.1%}, unread {unread / span:.1%}")
     return 0
 

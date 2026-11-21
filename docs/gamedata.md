@@ -76,6 +76,40 @@ The four non-XML structured payloads are the only readable binary metadata here:
 The two large opaque blobs (1.04 MB and 3.27 MB) have no recognised header and are left as binary. No model,
 texture or audio signature is present in `common.rpf`; the two opaque blobs are not identified.
 
+## MHIU and PAMH arrays
+
+`tools/gamedata_maps.py` decodes both map payloads. It reads a carve directory, groups the 64 KiB
+streams and prints or writes header fields and grid dimensions only; the grid bytes stay local.
+
+```powershell
+python -I tools/gamedata_maps.py <work>\carve\common --json maps.json
+```
+
+Both payloads start with a 44-byte header. The checksum field is not CRC32 or Adler32 of the payload;
+the algorithm is still unknown.
+
+| Header field | `MHIU` | `PAMH` |
+|---|---|---|
+| `magic` | 0x00 | 0x00 |
+| `version` / second u16 | 0x04 / 0x06 | 0x04 / 0x06 |
+| checksum | 0x28 | 0x08 |
+| width, height (`u16` each) | not in the header | 0x0C, 0x0E |
+| six `float32` bounds | 0x0C | 0x10 |
+| data size | 0x24 | 0x28 |
+
+`PAMH` stores its grid dimensions in the header. Its data is `height` records of eight bytes
+`{u16 reserved = 0, u16 width, u32 row * width}`, followed by `width * height` little-endian `u16`
+values. The measured payload is 144 x 164, with 164 row records and 23,616 cells.
+
+`MHIU` does not store a grid edge. Its data is a zero-filled prefix followed by a square byte grid
+that ends at the payload end; the reader takes the largest square with an all-zero prefix. The two
+measured payloads resolve to 1090 x 1090 after a 1,027-byte prefix and 1100 x 1100 after a 432-byte
+prefix. The role of that prefix is not decoded.
+
+The grids are stored as raw normalized values. A mapping from the values to the world Z bounds is
+possible but not confirmed, so the reader reports the arrays and dimensions without interpreting
+them as heights.
+
 ## XML documents
 
 257 documents start with an XML declaration and all 257 parse as well-formed XML with a standard parser.
@@ -176,6 +210,62 @@ A runtime consumer needs:
 - strict handling of the 9 tail-only and 1 unattributed blocks: they are incomplete evidence, not documents
   to guess at.
 
+## XML catalog
+
+`tools/gamedata_xml.py` turns a carve into a per-file and per-root catalog. It is stdlib-only and rebuilds
+multi-stream documents with `gamedata_index.py`, so it reads the same 267 XML payloads the index reports:
+
+```powershell
+python -I tools/gamedata_xml.py <work>\carve\common --json xml.json --csv xml.csv --check
+```
+
+The file rows carry offset/bytes/chunks, root, category, element count, maximum depth, attribute names, `$(name)`
+and `platform:/` counts, include-like counts and the well-formed/fragment flags. The root rows add the
+element-name and attribute histograms and the reference targets. `--check` separates a rootless fragment, a
+tail-only document and a malformed document instead of treating all three as parse failures.
+
+Measured over the 267 payloads (43,284,925 B):
+
+| Measure | Value |
+|---|---:|
+| Well-formed | 259 (257 with a declaration, 2 tail-only) |
+| Truncated at the start | 7 |
+| Rootless fragment | 1 |
+| Malformed | 0 |
+| Named roots / catalogued roots | 118 (+1 unattributed) / 118 |
+| Elements / distinct element names | 428,611 / 5,293 |
+| Attribute names / `type` values / `content` kinds | 33 / 318 / 7 |
+| Maximum depth | 17 |
+| Comment starts (all / declaration-bearing) | 507 / 412 |
+| `filename` / `parentPath` / `parentFile` / XInclude | 3,315 / 40 / 3 / 0 |
+| `platform:/` references (levels / other) | 2,674 (2,346 / 328) |
+| `$(common)` / `$(root)` / `$(target)` references | 588 / 28 / 23 |
+
+Macro counts cover all element text; 587 of the 588 `$(common)` hits are in `<filename>` elements, which is the
+filename-only bucket in the table above.
+
+The root and element distribution is the one in the tables above: the five repeated roots hold 141 of the 266
+documents, and the element histogram is dominated by the general node names `Item` (118,179), `item` (16,316)
+and `Name` (12,850). The long tail is per-system parameter names; the manifest and timecycle names are a small
+part of it. A category is a dispatch bucket, not a schema: for the 266 documents the catalog reproduces the
+file and root counts in the functional table and assigns each root one category. No root has more than one
+handler.
+
+Reference handling is narrow. Every `$(...)` and `platform:/` string is element text, not an attribute; no
+document uses XInclude. The macro alphabet is `$(common)`, `$(target)` and `$(root)`, and the platform targets
+split into `platform:/levels/` and everything else. `filename` is the only include-like element with a large
+population; `parentPath`/`parentFile` are the only relative references outside it. A resolver therefore needs
+four prefix rules and a content-set/mount walk, not a general include processor.
+
+A runtime dispatcher needs the 118-root table (or an RTTI class bridge), the 12 category buckets, the 318-value
+`type` registry, the 33-name attribute whitelist, the `content=` array decoders and a streaming reader for the
+14 MB document. The mount/reference half of that layer is measured separately in
+[gamedata_graph.md](gamedata_graph.md): 25 manifest documents, 30 content-set ids, 12 resolved include edges
+and 3,343 reachable target references. It also needs to mark the 9 tail-only documents and the one rootless
+block as incomplete evidence: `gamedata_xml.py --check` is the reference for that split. The catalog is a local work product. Only
+aggregate counts and schema/root/element/attribute names belong in git; the CSV/JSON, the element values, the
+`type`/`content` values and per-file paths stay on the local machine. The tests are synthetic.
+
 ## Relationship to `data.rpf` and `script.rpf`
 
 | Archive | Size | Streams | Inflated | Dominant payloads | XML | `RBF0` | `PSIN` |
@@ -212,8 +302,8 @@ resolved without the table of contents. No XInclude (`xi:include`) elements occu
 ## Readable vs binary
 
 Readable: the 266 XML documents, 3 text/INI-like files, and the two `MHIU` blobs plus `PAMH`/`SPS1Z` headers.
-The XML is ordinary text and can be consumed by any parser. The `MHIU` payloads carry a 4-byte magic and
-low-valued arrays; `PAMH` has a 4-byte magic and a header. Neither is decoded here. `SPS1Z` is a NUL-separated
+The XML is ordinary text and can be consumed by any parser. `tools/gamedata_maps.py` decodes the `MHIU`
+headers and square byte grids and the `PAMH` header, row table and u16 grid. `SPS1Z` is a NUL-separated
 table of path/key strings with per-entry type/length markers; its structure is visible but its consumer is not
 implemented.
 
@@ -233,5 +323,6 @@ it applies to this note as well.
 
 The most useful next step is a **schema bridge**, not more carving: check whether the 118 XML root tags match
 RTTI class names in the executable, then build a streaming reader that dispatches on root and `type`. That
-turns the measured XML into the runtime's config layer without hand-writing 5,293 tags. The second candidate
-is decoding the `MHIU`/`PAMH` arrays, the only structured binary payloads in this archive.
+turns the measured XML into the runtime's config layer without hand-writing 5,293 tags. The `MHIU`/`PAMH`
+arrays are decoded by `tools/gamedata_maps.py`; their checksum algorithm, the MHIU prefix and the value-to-Z
+mapping remain open.

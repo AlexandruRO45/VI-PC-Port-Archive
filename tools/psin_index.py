@@ -63,11 +63,17 @@ def parse(blob):
         "version": version,
         "table_bytes": table_bytes,
         "sections": [],
+        "rsc_version": None,
+        "checksum_size": None,
+        "checksum": "",
         "complete": False,
         "error": "",
     }
     if first < HEADER or first > len(blob):
         record["error"] = f"first section offset {first} is outside the file"
+        return record
+    if len(blob) - first < SECTION_HEADER:
+        record["error"] = f"missing or truncated first section header at {first}"
         return record
     offset = first
     while offset + SECTION_HEADER <= len(blob):
@@ -79,12 +85,25 @@ def parse(blob):
         if size < SECTION_HEADER or offset + size > len(blob):
             record["error"] = f"section {tag.decode('latin-1')} at {offset} has size {size}"
             break
-        record["sections"].append({
+        payload_off = offset + SECTION_HEADER
+        section = {
             "tag": tag.decode("latin-1"),
             "offset": offset,
             "size": size,
             "payload": size - SECTION_HEADER,
-        })
+        }
+        if tag == b"LRSC" and size - SECTION_HEADER >= 8 and blob[payload_off:payload_off + 4] == b"0DRP":
+            section["rsc_magic"] = "0DRP"
+            section["rsc_version"] = _u32_le(blob, payload_off + 4)
+            if record["rsc_version"] is None:
+                record["rsc_version"] = section["rsc_version"]
+        elif tag == b"CHKS" and size - SECTION_HEADER >= 8:
+            section["checksum_size"] = _u32_be(blob, payload_off)
+            section["checksum"] = blob[payload_off + 4:payload_off + 8].hex()
+            if record["checksum_size"] is None:
+                record["checksum_size"] = section["checksum_size"]
+                record["checksum"] = section["checksum"]
+        record["sections"].append(section)
         offset += size
     if not record["error"] and offset != len(blob):
         record["error"] = f"section walk ended at {offset} of {len(blob)}"
@@ -133,14 +152,27 @@ def summarize(records):
         "versions": {str(k): v for k, v in sorted(versions.items())},
         "section_tags": dict(sorted(tags.items())),
         "section_bytes": sum(s["size"] for r in records for s in r["sections"]),
+        "rsc_122": sum(1 for r in records if r["rsc_version"] == 122),
+        "checksummed": sum(1 for r in records if r["checksum_size"] is not None),
     }
+
+
+def count(text):
+    """--limit: 0 or a negative value used to mean no limit (0 is falsy, a negative count is never reached)."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
 
 
 def main():
     ap = argparse.ArgumentParser(description="Index PSIN metadata containers.")
     ap.add_argument("src", help="PSIN file or directory of carved .bin streams")
     ap.add_argument("--json", action="store_true", help="write records and summary as JSON")
-    ap.add_argument("--limit", type=int, help="stop after this many PSIN files")
+    ap.add_argument("--limit", type=count, help="stop after this many PSIN files")
     a = ap.parse_args()
 
     records = collect(a.src, a.limit)
@@ -152,9 +184,15 @@ def main():
     for r in records:
         tags = " ".join(f"{s['tag']}:{s['size']}" for s in r["sections"]) or "-"
         state = "ok" if r["complete"] else f"INCOMPLETE ({r['error']})"
-        print(f"{r['file']}  size={r['size']}  v={r['version']}  {state}  {tags}")
+        extra = ""
+        if r["rsc_version"] is not None:
+            extra += f"  rsc={r['rsc_version']}"
+        if r["checksum_size"] is not None:
+            extra += f"  chks={r['checksum_size']}"
+        print(f"{r['file']}  size={r['size']}  v={r['version']}  {state}  {tags}{extra}")
     print(f"{summary['files']} PSIN files, {summary['complete']} complete, "
-          f"{summary['incomplete']} incomplete; tags {summary['section_tags']}")
+          f"{summary['incomplete']} incomplete; tags {summary['section_tags']}; "
+          f"rsc122 {summary['rsc_122']}, checksummed {summary['checksummed']}")
     return 0
 
 

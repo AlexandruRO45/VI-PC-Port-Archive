@@ -87,6 +87,53 @@ try
     Reject(() => exporter.CreateMetadata(mixed), "partially resolvable model rejected as a whole");
 }
 finally { if (File.Exists(temp)) File.Delete(temp); }
+string outputDir = Path.Combine(Path.GetTempPath(), "leonida-sidecar-" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(outputDir);
+try
+{
+    string sidecar = Path.Combine(outputDir, "synthetic.skeleton.json");
+    var options = new JsonSerializerOptions { WriteIndented = true };
+    string expected = JsonSerializer.Serialize(exporter.CreateMetadata(model), options);
+    File.WriteAllText(sidecar + ".partial", "stale interrupted output");
+    SkeletonExport.WriteMetadata(sidecar, exporter.CreateMetadata(model), options);
+    Check(File.ReadAllText(sidecar) == expected && !File.Exists(sidecar + ".partial"), "atomic sidecar replaces stale temporary output");
+    File.WriteAllText(sidecar, "previous version");
+    SkeletonExport.WriteMetadata(sidecar, exporter.CreateMetadata(model), options);
+    Check(File.ReadAllText(sidecar) == expected, "atomic sidecar replaces an existing final file");
+    try
+    {
+        Util.WriteAtomic(sidecar, temporary => { File.WriteAllText(temporary, "truncated"); throw new IOException("synthetic write failure"); });
+        throw new Exception("atomic writer swallowed failure");
+    }
+    catch (IOException) { checks++; }
+    Check(File.ReadAllText(sidecar) == expected && !File.Exists(sidecar + ".partial"), "interrupted replacement preserves previous valid sidecar");
+    try
+    {
+        SkeletonExport.WriteMetadata(sidecar, new { NonFinite = double.NaN }, options);
+        throw new Exception("invalid JSON number was serialized");
+    }
+    catch (ArgumentException) { checks++; }
+    Check(File.ReadAllText(sidecar) == expected && !File.Exists(sidecar + ".partial"), "serialization failure preserves previous valid sidecar");
+    string blocked = Path.Combine(outputDir, "blocked.skeleton.json");
+    Directory.CreateDirectory(blocked);
+    try
+    {
+        SkeletonExport.WriteMetadata(blocked, exporter.CreateMetadata(model), options);
+        throw new Exception("failed destination was accepted");
+    }
+    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { checks++; }
+    Check(!File.Exists(blocked + ".partial"), "failed rename cleans up sidecar temporary file");
+    Directory.Delete(blocked);
+    Check(RageModelDecoder.CreateObj(model) == objBefore, "atomic sidecar path preserves OBJ serialization");
+}
+finally
+{
+    // Delete only the named synthetic outputs; never recurse through a caller path.
+    foreach (string file in Directory.GetFiles(outputDir)) File.Delete(file);
+    string blocked = Path.Combine(outputDir, "blocked.skeleton.json");
+    if (Directory.Exists(blocked)) Directory.Delete(blocked);
+    Directory.Delete(outputDir);
+}
 Console.WriteLine($"Skeleton metadata export: {checks} checks passed (synthetic, CPU only).");
 void Check(bool ok, string why) { if (!ok) throw new Exception(why); checks++; }
 void Reject(Action action, string why)
