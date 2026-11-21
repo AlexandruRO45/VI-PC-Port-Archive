@@ -124,12 +124,10 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             stmt = write(operand(1))
         elif op == M.MOVSXD:
             stmt = write(f"int64_t(int32_t({operand(1)}))")
-        elif op == M.CMOVNE:
-            stmt = write(f"zero ? {operand(0)} : {operand(1)}")
-        elif op == M.CMOVE:
-            stmt = write(f"zero ? {operand(1)} : {operand(0)}")
-        elif op == M.CMOVBE:
-            stmt = write(f"(carry || zero) ? {operand(1)} : {operand(0)}")
+        elif op in (M.CMOVE, M.CMOVNE, M.CMOVA, M.CMOVAE, M.CMOVB, M.CMOVBE):
+            cond = {M.CMOVE: "zero", M.CMOVNE: "!zero", M.CMOVA: "!carry && !zero",
+                    M.CMOVAE: "!carry", M.CMOVB: "carry", M.CMOVBE: "carry || zero"}[op]
+            stmt = write(f"({cond}) ? {operand(1)} : {operand(0)}")
         elif op == M.LEA:
             stmt = write(address())
         elif op == M.CMP:
@@ -232,8 +230,10 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             stmt = write(f"_mm_cvtsi128_si32({xmm[i.op1_register]})")
         elif op == M.NOP or (op == M.XCHG and i.op0_register == i.op1_register == R.AX):
             stmt = ";"
-        elif op == M.SETE:
-            stmt = write("zero")
+        elif op in (M.SETE, M.SETNE, M.SETA, M.SETAE, M.SETB, M.SETBE):
+            cond = {M.SETE: "zero", M.SETNE: "!zero", M.SETA: "!carry && !zero",
+                    M.SETAE: "!carry", M.SETB: "carry", M.SETBE: "carry || zero"}[op]
+            stmt = write(f"({cond})")
         elif op == M.CALL:
             stmt = calls[i.ip]
         elif op == M.RET:
