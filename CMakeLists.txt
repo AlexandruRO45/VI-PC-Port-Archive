@@ -648,6 +648,17 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_bmi1 COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/bmi1.py"
         check "$<TARGET_FILE:cpu_bmi1>" "$<TARGET_FILE:cpu_bmi1_lifted>")
     set_tests_properties(cpu_aot_bmi1 PROPERTIES SKIP_RETURN_CODE 77)
+    cpu_asm_fixture(cpu_sse41_42_misc sse41_42_misc)
+    set(sse41_42_misc_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_sse41_42_misc_lifted.cpp")
+    add_custom_command(OUTPUT "${sse41_42_misc_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/sse41_42_misc.py"
+            emit "$<TARGET_FILE:cpu_sse41_42_misc>" "${sse41_42_misc_fixture}"
+        DEPENDS cpu_sse41_42_misc tests/cpu/sse41_42_misc.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_sse41_42_misc_lifted SHARED "${sse41_42_misc_fixture}")
+    add_test(NAME cpu_aot_sse41_42_misc COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/sse41_42_misc.py"
+        check "$<TARGET_FILE:cpu_sse41_42_misc>" "$<TARGET_FILE:cpu_sse41_42_misc_lifted>")
+    set_tests_properties(cpu_aot_sse41_42_misc PROPERTIES SKIP_RETURN_CODE 77)
     cpu_translation(cpu_callback cpu_chained_aot call_context CALLBACK_OFFSET 8)
     cpu_asm_fixture(cpu_destroy destroy)
     target_link_libraries(cpu_destroy PRIVATE ucrt.lib)
