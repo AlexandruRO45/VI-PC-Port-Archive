@@ -65,11 +65,31 @@ def api_sets(system):
 
 
 def exports(pe):
+    """Read the export tables as stored.
+
+    pefile stops reading names at the first one outside its character set, lists the remaining
+    named exports as bare ordinals, cuts names at 512 bytes and gives up after 8,192 entries.
+    """
     directory = getattr(pe, "DIRECTORY_ENTRY_EXPORT", None)
     if not directory:
         return []
-    return [dict(ordinal=s.ordinal, name=label(s.name), forwarder=label(s.forwarder))
-            for s in directory.symbols if s.address]
+    d = directory.struct
+    start, size = pe.OPTIONAL_HEADER.DATA_DIRECTORY[0].VirtualAddress, pe.OPTIONAL_HEADER.DATA_DIRECTORY[0].Size
+
+    def array(form, rva, count):
+        return struct.unpack(f"<{count}{form}", pe.get_data(rva, struct.calcsize(form) * count))
+
+    functions = array("I", d.AddressOfFunctions, d.NumberOfFunctions)
+    names = array("I", d.AddressOfNames, d.NumberOfNames)
+    indices = array("H", d.AddressOfNameOrdinals, d.NumberOfNames)
+    if any(i >= len(functions) for i in indices):
+        raise ValueError("Export name ordinal is outside the export address table")
+    entries = [(i, pe.get_string_at_rva(rva)) for rva, i in zip(names, indices)]
+    named = set(indices)
+    entries += [(i, None) for i in range(len(functions)) if i not in named]
+    return [dict(ordinal=d.Base + i, name=label(name),
+                 forwarder=label(pe.get_string_at_rva(functions[i])) if start <= functions[i] < start + size else None)
+            for i, name in entries if functions[i]]
 
 
 def export_keys(rows):

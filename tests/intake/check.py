@@ -195,6 +195,21 @@ def check(folder, fixture, provider):
     assert "occupies" in run(2, fixture)["error"]
     torrent.write_bytes(b"different")
     assert "Torrent hash differs" in run(2)["error"]
+    # pefile stops reading export names at the first one outside its character set and lists the
+    # rest as bare ordinals. A same-length rename of the first name must leave named_value bound.
+    rejected = folder / "rejected-export"
+    rejected.mkdir()
+    shutil.copyfile(fixture, rejected / slot)
+    with pefile.PE(str(provider)) as pe:
+        stored = {s.name: s.ordinal for s in pe.DIRECTORY_ENTRY_EXPORT.symbols}
+        alias, = [s for s in pe.DIRECTORY_ENTRY_EXPORT.symbols if s.name == b"named_alias"]
+        pe.set_bytes_at_offset(alias.name_offset, b"named alias")
+        pe.write(str(rejected / provider.name))
+    inventory = scan(rejected)
+    assert {(e["ordinal"], e["name"]) for e in inventory["images"][provider.name]["exports"]} == {
+        (stored[b"named_alias"], "named alias"), (stored[b"named_value"], "named_value"), (77, None)}
+    named, = [r for r in inventory["imports"] if r["symbol"] == "named_value"]
+    assert named["bundle_exports_in"] == [provider.name]
     check_modified_directory(folder, fixture, provider)
 
 
