@@ -56,13 +56,20 @@ def check(native_path, lifted_path):
     out_n = (ctypes.c_uint8 * 32)()
     out_l = (ctypes.c_uint8 * 32)()
 
-    # Include exact-cancellation values where fused multiply-add differs from unfused a*b + c.
+    # Include raw-bit qNaN/sNaN cases in each operand position to verify x86 NaN sign/payload propagation.
+    qnan32 = struct.unpack("<f", struct.pack("<I", 0x7fc12345))[0]
+    snan32 = struct.unpack("<f", struct.pack("<I", 0x7f812345))[0]
+    qnan64 = struct.unpack("<d", struct.pack("<Q", 0x7ff8000012345678))[0]
+    snan64 = struct.unpack("<d", struct.pack("<Q", 0x7ff0000012345678))[0]
     f32_triples = (
         (1.0 + 2.0**-23, 1.0 - 2.0**-23, -1.0),
         (1.5, -2.25, 3.75),
         (0.0, -0.0, 0.0),
         (1e20, 1e20, -1e38),
         (-3.25, 4.5, -0.125),
+        (1.0, 1.0, qnan32),
+        (1.0, qnan32, 2.0),
+        (snan32, 1.0, 2.0),
     )
     f64_triples = (
         (1.0 + 2.0**-52, 1.0 - 2.0**-52, -1.0),
@@ -70,6 +77,9 @@ def check(native_path, lifted_path):
         (0.0, -0.0, 0.0),
         (1e150, 1e150, -1e299),
         (-3.25, 4.5, -0.125),
+        (1.0, 1.0, qnan64),
+        (1.0, qnan64, 2.0),
+        (snan64, 1.0, 2.0),
     )
     pad_a = bytes(range(0x10, 0x30))
     pad_b = bytes(range(0x40, 0x60))

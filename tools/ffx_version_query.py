@@ -31,6 +31,21 @@ template<class T> T load(word address) {
 template<class T> void store(word address, T v) {
     memcpy(reinterpret_cast<void*>(address), &v, sizeof v);
 }
+template<class F, class U> static F quiet_nan(F x) {
+    U bits; memcpy(&bits, &x, sizeof bits);
+    bits |= (sizeof(U) == 4) ? static_cast<U>(0x00400000u) : static_cast<U>(0x0008000000000000ull);
+    memcpy(&x, &bits, sizeof bits);
+    return x;
+}
+template<class F, class U> static F fma_x86(F s0, F s1, F s2, int order, bool neg_p, bool neg_c) {
+    if (std::isnan(s0)) return quiet_nan<F, U>(s0);
+    if (std::isnan(s1)) return quiet_nan<F, U>(s1);
+    if (std::isnan(s2)) return quiet_nan<F, U>(s2);
+    const F a = order == 132 ? s0 : s1;
+    const F b = order == 213 ? s0 : s2;
+    const F c = order == 231 ? s0 : (order == 132 ? s1 : s2);
+    return std::fma(neg_p ? -a : a, b, neg_c ? -c : c);
+}
 """
 HEADER = INTEGER_HEADER + "struct Query { word type, next, effect, device, count, ids, names; };\n"
 
@@ -218,16 +233,15 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
                     f"memcpy({dst}.data()+n, &v, 4); }} }}")
         elif has_wide and i.encoding == EncodingKind.VEX and op in fma_scalar:
             kind, order, is_f64 = fma_scalar[op]
-            ftype, fn, sz = ("double", "std::fma", 8) if is_f64 else ("float", "std::fmaf", 4)
+            ftype, utype, sz = ("double", "uint64_t", 8) if is_f64 else ("float", "uint32_t", 4)
             dst, src1 = wide_any[i.op0_register], wide_any[i.op1_register]
             s0 = f"load<{ftype}>(reinterpret_cast<word>({dst}.data()))"
             s1 = f"load<{ftype}>(reinterpret_cast<word>({src1}.data()))"
             s2 = (f"load<{ftype}>({address()})" if i.op2_kind == K.MEMORY
                   else f"load<{ftype}>(reinterpret_cast<word>({wide_any[i.op2_register]}.data()))")
-            a, b, c = (s0, s2, s1) if order == "132" else (s1, s0, s2) if order == "213" else (s1, s2, s0)
-            neg_a = "-" if kind in ("nmadd", "nmsub") else ""
-            neg_c = "-" if kind in ("msub", "nmsub") else ""
-            stmt = (f"{{ const {ftype} r = {fn}({neg_a}({a}), ({b}), {neg_c}({c})); "
+            neg_p = "true" if kind in ("nmadd", "nmsub") else "false"
+            neg_c = "true" if kind in ("msub", "nmsub") else "false"
+            stmt = (f"{{ const {ftype} r = fma_x86<{ftype}, {utype}>({s0}, {s1}, {s2}, {order}, {neg_p}, {neg_c}); "
                     f"auto keep = {dst}; {dst} = {{}}; memcpy({dst}.data(), keep.data(), 16); memcpy({dst}.data(), &r, {sz}); }}")
         elif op == M.VMOVUPS and i.op1_kind == K.MEMORY:
             stmt = f"{wide[i.op0_register]} = load<std::array<uint8_t,32>>({address()});"
