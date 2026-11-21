@@ -16,7 +16,7 @@ from cpu_ranges import function_ranges
 from cpu_sse_aot import translate
 
 SIGNATURES = {"blend_ss": "f:ffqf", "blend_sd": "d:ddqd", "convert": "q:fdq", "from_int": "d:qq",
-              "classify_ss": "q:ff", "classify_sd": "q:dq"}
+              "classify_ss": "q:ff", "classify_sd": "q:dq", "round_trip": "f:f"}
 GUARD = bytes.fromhex("5a5a1234a5a54321")
 FILL = 0xa5
 MASK32 = 0xffffffff
@@ -84,6 +84,7 @@ def cases():
         for step in (0, 1, 5, 11, 17, 23, 29, 31):
             found.append(("convert", (f, DOUBLES[(i + step * (i + 1)) % len(DOUBLES)], None), bytes([FILL]) * 80))
     found += [("from_int", (n, None), bytes([FILL]) * 32) for n in INTEGERS]
+    found += [("round_trip", (f,), b"") for f in SINGLES]
     return found
 
 
@@ -184,6 +185,11 @@ def known_answers():
         ("classify_sd", (double(2.0), None), struct.pack("<Q", double(1.0)), 2, struct.pack("<Q", double(1.0))),
         ("classify_sd", (double(1.0), None), struct.pack("<Q", double(2.0)), 4, struct.pack("<Q", double(2.0))),
         ("classify_sd", (0x7ff0000000000001, None), struct.pack("<Q", 0), 8, struct.pack("<Q", 0)),
+        # The conversion pair quiets a signalling NaN and keeps a quiet one and a number unchanged.
+        ("round_trip", (0x7f800001,), b"", 0x7fc00001, b""),
+        ("round_trip", (0xffa00000,), b"", 0xffe00000, b""),
+        ("round_trip", (0x7fc12345,), b"", 0x7fc12345, b""),
+        ("round_trip", (single(-2.75),), b"", single(-2.75), b""),
     ]
 
 
@@ -213,6 +219,9 @@ def check(original, lifted, swapped, swapped_lifted):
             # b + a differs from a + b only in which NaN payload survives.
             if name == "blend_ss" and not (is_nan(values[0], 4) and is_nan(values[1], 4)):
                 raise AssertionError(f"swapped addition changed {name}{values}")
+            # Dropping the conversion pair differs only for a signalling NaN.
+            if name == "round_trip" and not (is_nan(values[0], 4) and not values[0] & 0x400000):
+                raise AssertionError(f"dropping the conversion pair changed {name}{values}")
     if not all(changed.values()):
         raise AssertionError(f"swapped-operand control matched the original: {changed}")
     print(f"{len(known_answers())} fixed results and {matched} calls match on the result and the guarded "

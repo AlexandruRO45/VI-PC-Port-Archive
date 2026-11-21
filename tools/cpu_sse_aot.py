@@ -193,7 +193,7 @@ class ScalarLifter(Lifter):
             width = 12 - source
             bits = self.source(ins, 1, source, reads)
             writes.update(parts(destination, width))
-            value = f"static_cast<{TYPES[width]}>(cast<{TYPES[source]}>({bits}))"
+            value = f"resize<{TYPES[width]}>(cast<{TYPES[source]}>({bits}))"
             return self.assign(destination, width, f"cast<{unsigned(width)}>({value})"), reads, writes
         width = COMPARES[mnemonic]
         if next_ins is None or next_ins.flow_control != FlowControl.CONDITIONAL_BRANCH:
@@ -360,6 +360,12 @@ template <class Float, class Bits> static Bits arith(Bits a, Bits b, char op) {
 template <class Integer, class Float> static Integer truncate(Float value) {
     const Float limit = -static_cast<Float>(std::numeric_limits<Integer>::min());
     return value >= -limit && value < limit ? static_cast<Integer>(value) : std::numeric_limits<Integer>::min();
+}
+// CVTSS2SD and CVTSD2SS: the volatile input keeps every conversion, so a pair is not folded to an
+// identity. Each one quiets a signalling NaN and, with DAZ or FTZ set, flushes denormals, as on hardware.
+template <class To, class From> static To resize(From value) {
+    volatile From input = value;
+    return static_cast<To>(input);
 }
 // ZF, PF and CF of COMISS, UCOMISS, COMISD and UCOMISD as bits 2, 1 and 0.
 template <class Float> static unsigned compare(Float a, Float b) {

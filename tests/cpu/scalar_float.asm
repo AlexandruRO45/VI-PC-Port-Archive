@@ -169,4 +169,17 @@ sd_below:
     or eax, 4
     ret
 classify_sd ENDP
+
+; round_trip(f): CVTSS2SD then CVTSD2SS. Each conversion quiets a signalling NaN, so the pair is
+; not an identity. The swapped-operand build keeps the value with MOVSS instead.
+round_trip PROC FRAME
+    .endprolog
+IFDEF SWAP_OPERANDS
+    movss xmm0, xmm0
+ELSE
+    cvtss2sd xmm0, xmm0
+    cvtsd2ss xmm0, xmm0
+ENDIF
+    ret
+round_trip ENDP
 END
