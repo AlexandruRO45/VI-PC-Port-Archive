@@ -856,7 +856,6 @@ def check_rgb_sample_draw(directory: Path, compiler: str, renderer: str, backend
 
 
 def check_render(directory, compiler, renderer, backend):
-    check_rgb_sample_draw(directory, compiler, renderer, backend)
     for swap in (False, True):
         source = directory / "fixture.hlsl"
         shader = directory / "fixture.cso"
@@ -870,6 +869,7 @@ def check_render(directory, compiler, renderer, backend):
             wrong = subprocess.run([*draw, "rgba"], capture_output=True, text=True)
             if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
                 raise AssertionError("The renderer failed to detect the changed channel order")
+    check_rgb_sample_draw(directory, compiler, renderer, backend)
     program = arithmetic()
     source.write_text(translate(program), encoding="ascii")
     subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
