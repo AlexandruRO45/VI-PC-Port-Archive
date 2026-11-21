@@ -209,7 +209,36 @@ The provider-loop CTests above also exercise resource ID 16 after successful con
 
 On the RTX 4060 Laptop the writer packs RGB into an R32_UINT UAV and the reader unpacks it to floats. The shared HLSL helpers clamp finite inputs to [0, 65408], choose a shared exponent and round the three 9-bit mantissas to nearest even. On WARP the typed RGB9E5 views perform the conversion. A second WARP context forces the packed path to exercise the fallback in public CI. A double-precision CPU reference checks the stored bits and all four decoded components, including the implied alpha of 1. The inputs cover all 32 exponents, channel permutations, half steps, exponent carry, underflow, negative values and saturation. The native reference also accepts the documented nearest rounding alternative at ties. [Direct3D RGB9E5 conversion](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#19.3.2)
 
-On both local adapters the storage words and decoded channels matched nearest-even on every input. Both debug layers reported zero warnings and errors. The package supplies the local resource-creation path. These shaders test integer-coordinate texel loads. The package shader's access to the intermediate, filtering and a full upscaling dispatch remain open.
+On both local adapters the storage words and decoded channels matched nearest-even on every input. Both debug layers reported zero warnings and errors. The package supplies the local resource-creation path. These shaders test integer-coordinate texel loads. The next experiment traces the first package writer and reader of this intermediate.
+
+### FSR4 dispatch through the RCAS input
+
+With sharpening enabled, the default i8 graph first touches the physical ID 16 texture in `FFX_FSR4_PASS_26`. It writes `rw_mlsr_output_color` (logical ID 10, UAV `u2`). The following `FFX_FSR4_RCAS_PASS` reads `r_rcas_input` (ID 16, SRV `t18`) and writes the external `rw_rcas_output` (ID 11, UAV `u11`). Each RCAS lane computes four output pixels. For each pixel it loads the center and four axial neighbors at integer texel coordinates. The native program contains 20 RGB `image_load` instructions with half-precision returns, four stores and zero sampler bindings.
+
+| Provider RVA | Evidence from the pinned upscaler |
+|---|---|
+| `0xed10`, `0x1220f`, `0x13278` | Dispatch copies the sharpening byte into the staged constants at offset `0x5c`. When enabled, mirror entry 10 receives primary entry 16. When disabled, mirror entries 10 and 11 both receive the external output. |
+| `0x1357d`, `0x13752`, `0x1375f` | The graph builder supplies workgroup counts. The scheduling loop indexes the pipeline array with stride `0x9690` and calls `0xe1d0`. The reflection check walks all 27 graph shader records in order. Case 26 selects the container at `0xa0e90`. |
+| `0xe244`, `0xe2b9`, `0xe363`, `0xe3cd` | The scheduler resolves SRVs through the primary resource array and UAVs through the mirror, sets the job type to compute (2), then calls the enqueue callback. |
+| `0x137b2`, `0x13898`, `0x138ac` | The sharpening flag gates the extra RCAS job. The separate pipeline at provider offset `0x248` selects the RCAS container at `0x701b0`. The provider then calls the execute callback. |
+
+The package build translates the x64 alias updates and the two grid calculations. At 1920×1080 they produce 60×34×1 and 120×68×1 groups. The GPU replay uses an 8×4 logical image, one group per job, on the actual provider intermediate at index 4. Pass 26 has 256 threads per group and RCAS has 64. The host binds source-owned scene and history inputs as RGB buffers, supplies zero scratch and unit exposure, and uses the provider's history and recurrent UAVs. Eight active lanes take the producer's direct texture path. The full-wave LDS optimization and the preceding 26 graph jobs remain open.
+
+Both desktop shaders come from offline decoding of the pinned native streams (3,482 producer instructions before specialization and 437 RCAS instructions). LLVM 15's gfx1030 decoder covers the producer's i8 dot instructions and its gfx1013 decoder covers RCAS. The translator keeps the original packed literal DWORDs, including the zero high half of the packed offset that decrements x. [AMD RDNA 2 instruction set](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
+
+The GPU test checks all 32 intermediate texels and 257 surrounding guard texels. It then compares all 256 final pixels, including edges between different colors, with an independent FP32 five-tap reference (per-channel tolerance 2.5% plus 0.00005 for packed-half arithmetic). Alpha must equal red. RTX 4060 Laptop passed using R32_UINT. WARP passed with native RGB9E5 and with forced R32_UINT. Both debug layers reported zero errors and warnings. These are controlled single-group results.
+
+From a VS x64 developer shell at the repository root, set `$upscaler` to the pinned local DLL. The middle command runs in WSL with Python 3 and libLLVM 15 installed. All extracted programs and generated shaders stay under `out/`.
+
+```powershell
+./out/pe-env/Scripts/python.exe -B tools/ffx_dispatch_profile.py $upscaler out/ffx-dispatch
+wsl -d Ubuntu-22.04 -- python3 -B tools/ffx_dispatch_aot.py out/ffx-dispatch --llvm libLLVM-15.so.1
+cmake --preset dev -B out/build/ffx-device "-DFFX_UPSCALER_IMAGE=$upscaler" "-DFFX_DISPATCH_SHADER_DIR=$PWD/out/ffx-dispatch"
+cmake --build out/build/ffx-device --target offscreen_check
+ctest --test-dir out/build/ffx-device -R '^ffx_provider_loop_' --no-tests=error -V
+```
+
+The local log reports `dispatch=package-aot`. Public Windows CI runs source-built descriptor and dispatch controls on WARP (`dispatch=desktop-control`). Linux CI assembles an independent integer-coordinate regression for the translator.
 
 ### FidelityFX context creation and ownership
 

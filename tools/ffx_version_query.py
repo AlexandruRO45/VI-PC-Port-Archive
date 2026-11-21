@@ -122,12 +122,15 @@ def lower(body, initial, globals_, calls, exits):
             lhs, rhs = operand(i.op_count - 2), operand(i.op_count - 1)
             stmt = (f"{{ const int64_t product = int64_t(int32_t({lhs})) * int32_t({rhs}); "
                     f"carry = product != int32_t(product); {write('product')} }}")
-        elif op in (M.SHL, M.SHR) and i.op1_kind == K.IMMEDIATE8 and RegisterExt.size(i.op0_register) in (4, 8):
+        elif op == M.CDQ:
+            stmt = "rdx = uint32_t(int32_t(rax) >> 31);"
+        elif op in (M.SHL, M.SHR, M.SAR) and i.op1_kind == K.IMMEDIATE8 and RegisterExt.size(i.op0_register) in (4, 8):
             size = RegisterExt.size(i.op0_register)
             bits = 8 * size
             count = i.immediate(1) & (bits - 1)
             shift, last = ("<<", bits-count) if op == M.SHL else (">>", count-1)
-            stmt = (f"{{ const {UINT[size]} a = {operand(0)}, v = a {shift} {count}; "
+            lhs = f"int{bits}_t(a)" if op == M.SAR else "a"
+            stmt = (f"{{ const {UINT[size]} a = {operand(0)}, v = {lhs} {shift} {count}; "
                     f"carry = ((a >> {last}) & 1) != 0; zero = v == 0; {write('v')} }}") if count else ";"
         elif op in (M.ADD, M.AND, M.OR, M.XOR, M.INC, M.DEC, M.SUB, M.SBB):
             operator = {M.ADD: "+", M.INC: "+", M.DEC: "-", M.AND: "&", M.OR: "|", M.XOR: "^", M.SUB: "-", M.SBB: "-"}[op]

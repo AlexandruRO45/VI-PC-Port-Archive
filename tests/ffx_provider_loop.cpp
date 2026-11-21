@@ -380,6 +380,7 @@ void check_ffx_provider_loop(ID3D12Device* device)
             if (scenario == 0)
                 supports_native_rcas = format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
             check_rcas_views(ctx, index, read<uint32_t>(records, 64 * index + 0x34));
+            check_ffx_dispatch(ctx, records);
         }
     }
 }

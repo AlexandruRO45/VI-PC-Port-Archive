@@ -188,6 +188,33 @@ set(INTAKE_PYTHON "${CMAKE_SOURCE_DIR}/out/pe-env/Scripts/python.exe" CACHE FILE
     "Native x64 Python with pefile for static intake tests")
 target_sources(offscreen_check PRIVATE tests/ffx_device_init.cpp tests/ffx_backend_slots.cpp tests/ffx_recurrent.cpp tests/ffx_provider_loop.cpp)
 set(FFX_UPSCALER_IMAGE "" CACHE FILEPATH "Local Xbox upscaler DLL for offline backend translation")
+set(FFX_DISPATCH_SHADER_DIR "" CACHE PATH "Directory containing the two locally translated FSR4 compute shaders")
+if(FFX_DISPATCH_SHADER_DIR)
+    if(NOT FFX_UPSCALER_IMAGE)
+        message(FATAL_ERROR "Package dispatch replay requires FFX_UPSCALER_IMAGE")
+    endif()
+    target_compile_definitions(offscreen_check PRIVATE FFX_DISPATCH_AOT)
+endif()
+target_sources(offscreen_check PRIVATE tests/ffx_dispatch.cpp)
+foreach(stage IN ITEMS producer rcas)
+    set(shader "${CMAKE_CURRENT_SOURCE_DIR}/tests/ffx_dispatch_control.hlsl")
+    set(entry "${stage}")
+    if(FFX_DISPATCH_SHADER_DIR)
+        set(shader "${FFX_DISPATCH_SHADER_DIR}/${stage}.hlsl")
+        set(entry main)
+    endif()
+    foreach(storage IN ITEMS Native Packed)
+        set(symbol "${stage}${storage}")
+        set(header "${CMAKE_CURRENT_BINARY_DIR}/${symbol}.h")
+        add_custom_command(OUTPUT "${header}"
+            COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E "${entry}" -D "STORAGE_${storage}=1"
+                -I "${CMAKE_CURRENT_SOURCE_DIR}/tests" -Vn "${symbol}" -Fh "${header}"
+                -Fo "${CMAKE_CURRENT_BINARY_DIR}/${symbol}.cso" "${shader}"
+            DEPENDS "${shader}" tests/ffx_dispatch_io.hlsli src/rgb9e5.hlsli
+            BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/${symbol}.cso" VERBATIM)
+        target_sources(offscreen_check PRIVATE "${header}")
+    endforeach()
+endforeach()
 if(FFX_UPSCALER_IMAGE)
     if(NOT EXISTS "${INTAKE_PYTHON}" OR NOT EXISTS "${FFX_UPSCALER_IMAGE}")
         message(FATAL_ERROR "Package translation requires INTAKE_PYTHON and FFX_UPSCALER_IMAGE")
@@ -195,7 +222,7 @@ if(FFX_UPSCALER_IMAGE)
     set(device_slice "${CMAKE_CURRENT_BINARY_DIR}/ffx_device_slice.cpp")
     add_custom_command(OUTPUT "${device_slice}"
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/ffx_device_init.py" "${FFX_UPSCALER_IMAGE}" "${device_slice}"
-        DEPENDS "${FFX_UPSCALER_IMAGE}" tools/ffx_device_init.py tools/ffx_recurrent.py tools/ffx_provider_loop.py tools/ffx_version_query.py tools/cpu_ranges.py tools/cpu_leaf_aot.py
+        DEPENDS "${FFX_UPSCALER_IMAGE}" tools/ffx_device_init.py tools/ffx_recurrent.py tools/ffx_provider_loop.py tools/ffx_dispatch_profile.py tools/ffx_version_query.py tools/cpu_ranges.py tools/cpu_leaf_aot.py
         VERBATIM)
     target_sources(offscreen_check PRIVATE "${device_slice}")
     target_include_directories(offscreen_check PRIVATE "${CMAKE_SOURCE_DIR}/tests")

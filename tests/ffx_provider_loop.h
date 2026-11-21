@@ -33,3 +33,8 @@ void check_rcas_views(LoopContext& ctx, uint32_t index, uint32_t uav_slot);
 #ifdef FFX_LOOP_LOADER
 uint32_t check_loop_loader(LoopContext& ctx, void** inner, const RecurrentConfig& config);
 #endif
+void dispatch_aliases(RecurrentProvider& provider, bool sharpen);
+void check_ffx_dispatch(LoopContext& ctx, const void* records);
+using DispatchGrid = std::array<uint32_t,3>;
+DispatchGrid producer_grid(uint32_t width, uint32_t height);
+DispatchGrid rcas_grid(uint32_t width, uint32_t height);
