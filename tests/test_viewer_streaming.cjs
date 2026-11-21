@@ -216,7 +216,10 @@ test('the demonstration camera orbits while looking at the same point', async ()
 test('the tour button and Escape return control to manual flight', () => {
     const listeners = new Map();
     const tour = { setAttribute(name, value) { this[name] = value; } };
-    const start = { classList: { toggle(name, hidden) { this[name] = hidden; } } };
+    const start = {
+        classList: { toggle(name, hidden) { this[name] = hidden; } },
+        focus() { this.focused = true; },
+    };
     const context = vm.createContext({
         addEventListener: (name, fn) => listeners.set(name, fn),
         document: {
@@ -235,7 +238,34 @@ test('the tour button and Escape return control to manual flight', () => {
     listeners.get('keydown')({ code: 'Escape' });
     assert.equal(tour['aria-pressed'], 'false');
     assert.equal(start.classList.hidden, false);
+    assert.equal(start.focused, true);
     tour.onclick();
     tour.onclick();
     assert.equal(tour['aria-pressed'], 'false');
+});
+
+test('pointer-lock failures move focus to the canvas and show the drag hint once', async () => {
+    const listeners = new Map();
+    const start = { classList: { toggle(name, hidden) { this[name] = hidden; } } };
+    const help = { hints: 0, insertAdjacentHTML() { this.hints++; } };
+    const canvas = {
+        addEventListener() {},
+        focus() { this.focused = true; },
+        requestPointerLock() { return Promise.reject(new Error('pointer lock denied')); },
+    };
+    const context = vm.createContext({
+        addEventListener() {},
+        document: {
+            getElementById: id => ({ start, tour: {}, help })[id],
+            addEventListener: (name, fn) => listeners.set(name, fn),
+        },
+        renderer: { domElement: canvas },
+    });
+    vm.runInContext(html.slice(html.indexOf('// ---------- freecam ----------'), begin), context);
+
+    await start.onclick();
+    assert.equal(start.classList.hidden, true);
+    assert.equal(canvas.focused, true);
+    listeners.get('pointerlockerror')();
+    assert.equal(help.hints, 1);
 });

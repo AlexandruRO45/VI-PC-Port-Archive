@@ -31,7 +31,7 @@ asked to rebase or close. GPU test results go in [#166](https://github.com/ItsNo
 - Viewer streaming tests: `node --test tests/test_viewer_streaming.cjs` (Node.js 22+, no packages,
   browser, network or game data). These execute the viewer streaming code with a synthetic loader and clock.
   For a visual check, run `python -I viewer/serve.py` and open [the test terrain tour](http://127.0.0.1:8765/?test&tour).
-  Use **Auto tour** or **Esc** to pause the demonstration and return to free flight.
+  Use **Auto tour** or **Esc** to pause the demonstration. **Free flight** can be activated with Enter.
 - Tool checks: `python -m compileall -q make_game.py tools tests`. The optional
   `vk_pipeline_check <spirv dir> [cache.bin] [--jobs N]` creates a module (and, for compute shaders, a
   pipeline) for every translated shader and reports failures plus the saved cache path.

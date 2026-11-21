@@ -14,7 +14,9 @@
   #banner.hidden { display: none; }
   #help { position: fixed; bottom: 12px; left: 12px; background: var(--panel); padding: 10px 12px; border-radius: 8px; color: var(--dim); }
   #help kbd { color: var(--fg); background: #1c2129; padding: 0 5px; border-radius: 3px; }
-  #start { position: fixed; inset: 0; display: grid; place-items: center; background: rgba(0,0,0,.15); cursor: pointer; font-size: 15px; }
+  #start { position: fixed; inset: 0; width: 100%; height: 100%; border: 0; padding: 0; display: grid; place-items: center; background: rgba(0,0,0,.15); color: var(--fg); cursor: pointer; font: inherit; font-size: 15px; }
+  #start span { background: var(--panel); padding: 8px 12px; border-radius: 6px; }
+  #start:focus-visible span { outline: 2px solid var(--accent); }
   #start.hidden { display: none; }
   #tour { position: fixed; bottom: 12px; right: 12px; z-index: 1; background: var(--bg); color: var(--fg); border: 1px solid var(--dim); border-radius: 6px; padding: 8px 12px; cursor: pointer; font: inherit; }
   #tour[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
@@ -34,7 +36,7 @@
   <kbd>W A S D</kbd> move · <kbd>Q</kbd>/<kbd>E</kbd> down/up · <kbd>Shift</kbd> fast · <kbd>Ctrl</kbd> slow · wheel: speed<br>
   <kbd>F</kbd> wireframe · <kbd>T</kbd> textures/clay · <kbd>G</kbd> chunk bounds · <kbd>R</kbd> back to spawn · <kbd>Esc</kbd> release mouse
 </div>
-<div id="start">Click to fly</div>
+<button id="start" type="button"><span>Free flight</span></button>
 <button id="tour" type="button" aria-pressed="false" hidden>Auto tour</button>
 
 <script type="importmap">
@@ -114,6 +116,7 @@ function buildTestChunk([cx, cz, size]) {
 const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
 renderer.setSize(innerWidth, innerHeight);
+renderer.domElement.tabIndex = -1;
 document.body.prepend(renderer.domElement);
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x9cc3e6);
@@ -133,6 +136,9 @@ let touring = false, tourSeconds = 0;
 function updateStartPrompt() {
   start.classList.toggle("hidden", locked || dragLook || touring);
 }
+function focusFreeFlight() {
+  (dragLook ? renderer.domElement : start).focus();
+}
 function setTour(active) {
   touring = active;
   tour.setAttribute("aria-pressed", String(active));
@@ -140,11 +146,25 @@ function setTour(active) {
   updateStartPrompt();
 }
 tour.onclick = () => setTour(!touring);
+function enableDragLook() {
+  if (dragLook) return;
+  dragLook = true;
+  updateStartPrompt();
+  document.getElementById("help").insertAdjacentHTML("beforeend", "<br>mouse lock unavailable here: drag to look");
+  focusFreeFlight();
+}
 start.onclick = async () => {
   try { await renderer.domElement.requestPointerLock(); }
-  catch { dragLook = true; updateStartPrompt(); document.getElementById("help").insertAdjacentHTML("beforeend", "<br>mouse lock unavailable here: drag to look"); }
+  catch { enableDragLook(); }
 };
-document.addEventListener("pointerlockchange", () => { locked = document.pointerLockElement === renderer.domElement; updateStartPrompt(); });
+document.addEventListener("pointerlockerror", enableDragLook);
+document.addEventListener("pointerlockchange", () => {
+  const wasLocked = locked;
+  locked = document.pointerLockElement === renderer.domElement;
+  updateStartPrompt();
+  if (locked) renderer.domElement.focus();
+  else if (wasLocked && !touring) focusFreeFlight();
+});
 renderer.domElement.addEventListener("mousedown", () => { dragging = true; });
 addEventListener("mouseup", () => { dragging = false; });
 addEventListener("mousemove", e => {
@@ -157,7 +177,10 @@ addEventListener("keydown", e => {
   if (e.code === "KeyF" && !e.repeat) wire = !wire, applyWire();
   if (e.code === "KeyT" && !e.repeat) clay = !clay, applyClay();
   if (e.code === "KeyG" && !e.repeat) showBounds = !showBounds, boundsGroup.visible = showBounds;
-  if (e.code === "Escape" && touring) setTour(false);
+  if (e.code === "Escape" && touring) {
+    setTour(false);
+    focusFreeFlight();
+  }
   if (e.code === "KeyR") {
     if (touring) setTour(false);
     camera.position.fromArray(world.spawn);
