@@ -1294,6 +1294,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((with_constants(HALF_BODY), translate))
     fixtures.append((dual_program(swap_weights=True), translate_dual))
     fixtures.append((with_constants(LITERAL_FMA_BODY), translate))
+    fixtures.append((offset_nibbles(), translate))
     for index, (instructions, lower_fixture) in enumerate(fixtures):
         source = directory / "fixture.s"
         obj = directory / "fixture.o"
