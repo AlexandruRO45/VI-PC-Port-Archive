@@ -1,6 +1,6 @@
 # Xbox2Windows
 
-Xbox2Windows investigates **static recompilation of Xbox Series X|S (Scarlett) software for x64 Windows**, using Grand Theft Auto VI as its case study. The CPU experiments translate source-built x64 functions from PE machine code through C++ to new Windows DLLs, including a direct call and cross-DLL imports by name and ordinal. The shader experiment translates selected gfx1013 pixel shaders through HLSL to desktop DXIL. Other experiments test the Windows runtime, render recovered texture levels and read script state data. Title CPU code execution, full-game startup and frame rate remain unverified.
+Xbox2Windows investigates **static recompilation of Xbox Series X|S (Scarlett) software for x64 Windows**. The CPU experiments translate source-built x64 functions from PE machine code through C++ to new Windows DLLs, including a direct call and cross-DLL imports by name and ordinal. The shader experiment translates selected gfx1013 pixel shaders through HLSL to desktop DXIL. Other experiments test the Windows runtime, render recovered texture levels and read script state data. Title CPU code execution, full-game startup and frame rate remain unverified.
 
 ## Current results and open work
 
@@ -83,7 +83,7 @@ An independent contributor passed all three smoke tests from a clean checkout of
 
 For task ownership, evidence requirements and PR review, see the [contribution guide](CONTRIBUTING.md). [Open an issue](https://github.com/R0Y00/Xbox2Windows/issues/new/choose) · [Community conduct](CODE_OF_CONDUCT.md) · [Private security reports](SECURITY.md)
 
-## GTA VI case study and provenance
+## Case study and provenance
 
 The installation metadata inspected for this case study lists a Scarlett executable. The main executable was absent from the inspected files. The public regression suite uses source-built fixtures and independently built shaders. [Intake methods and evidence](docs/experiments.md#static-executable-intake)
 
