@@ -57,10 +57,10 @@ def decode_s_reg(reg_id: int) -> str:
 
 
 def decode_v_reg(reg_id: int) -> str:
-    """Decode vector register or inline constant."""
-    if reg_id <= 255:
-        return f"v{reg_id}"
-    return decode_s_reg(reg_id - 256)
+    """Decode a 9-bit VOP SRC0 operand: 0..255 scalar/constant, 256..511 VGPR."""
+    if 256 <= reg_id <= 511:
+        return f"v{reg_id - 256}"
+    return decode_s_reg(reg_id)
 
 
 # Instruction Opcode Tables

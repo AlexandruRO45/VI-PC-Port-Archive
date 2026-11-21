@@ -6,7 +6,7 @@ import re
 import struct
 
 from pixel_aot import disassemble
-from ffx_scratch_reference import make_reference
+from ffx_scratch_reference import make_reference, simm16
 
 
 DIGEST = {
@@ -56,7 +56,7 @@ OPS = {
     "xor_b32": "{0}^{1}", "and_or_b32": "({0}&{1})|{2}",
     "lshl_or_b32": "({0}<<{1})|{2}", "lshl4_add_u32": "({0}<<4)+{1}",
     "lshl_add_u32": "({0}<<{1})+{2}", "lshlrev_b32": "{1}<<{0}", "lshrrev_b32": "{1}>>{0}",
-    "lshr_b32": "{0}>>{1}", "lshl_b32": "{0}<<{1}", "brev_b32": "reversebits({0})",
+    "lshr_b32": "{0}>>({1}&31u)", "lshl_b32": "{0}<<({1}&31u)", "brev_b32": "reversebits({0})",
     "max_i32": "max(asint({0}),asint({1}))", "min_i32": "min(asint({0}),asint({1}))",
     "max_u32": "max({0},{1})", "abs_i32": "abs(asint({0}))",
     "med3_i32": "median_i(asint({0}),asint({1}),asint({2}))",
@@ -67,6 +67,15 @@ OPS = {
     "dot4_i32_i8": "idot({0},{1},{2})", "dot4c_i32_i8": "idot({0},{1},{d})",
     "pack_b32_f16": "({0}&65535u)|({1}<<16)",
 }
+
+SALU_SCC = {
+    "add_u32": "sadd_u({0},{1},scc)", "lshl4_add_u32": "slshl4_add_u({0},{1},scc)",
+    "addk_i32": "sadd_i({d},{0},scc)", "sub_i32": "ssub_i({0},{1},scc)",
+    "min_u32": "smin_u({0},{1},scc)", "max_u32": "smax_u({0},{1},scc)",
+    "min_i32": "smin_i({0},{1},scc)", "max_i32": "smax_i({0},{1},scc)",
+    "abs_i32": "sabs_i({0},scc)",
+}
+SALU_NZ_SCC = {"and_b32", "or_b32", "xor_b32", "lshl_b32", "lshr_b32", "bfe_u32", "bfe_i32"}
 
 FLOAT = {
     "add_f32": "{0}+{1}", "sub_f32": "{0}-{1}", "mul_f32": "{0}*{1}", "exp_f32": "exp2({0})",
@@ -132,7 +141,12 @@ def alu(mn, tokens, mods):
         a, b = ["0", "0"] if inputs[-1] == "0" else registers(inputs[-1])
         x, y = registers(dest)
         return f"{{ uint2 t=uint2({a},{b}); {x}=t.x; {y}=t.y; }}"
-    args = list(map(word, inputs))
+    if mn in ("s_movk_i32", "s_addk_i32", "s_mulk_i32"):
+        if len(inputs) != 1:
+            raise ValueError(f"Expected one SOPK immediate for {mn}")
+        args = [f"0x{simm16(inputs[0]):x}u"]
+    else:
+        args = list(map(word, inputs))
     if op == "dot4_i32_i8" and mods:
         if mods == "op_sel_hi:[1,0,1]":
             args[1] = f"(({args[1]}&65535u)*65537u)"
@@ -147,8 +161,10 @@ def alu(mn, tokens, mods):
         if mods == "mul:2":
             expr = f"2.0*({expr})"
         return f"{dest} = asuint({expr});"
+    if mn.startswith("s_") and op in SALU_SCC:
+        return f"{dest} = {SALU_SCC[op].format(*args, d=dest)};"
     stmt = f"{dest} = {OPS[op].format(*args, d=dest)};"
-    if mn.startswith("s_bfe_"):
+    if mn.startswith("s_") and op in SALU_NZ_SCC:
         stmt += f" scc = {dest} != 0u;"
     return stmt
 
@@ -245,6 +261,9 @@ def predecessor(name, instructions, initializer):
         elif mn.startswith("v_add_co_ci"):
             # Both carry outputs are dead before their next use.
             stmt = f"{args[0]} = {word(args[2])}+{word(args[3])}+{word(args[4])};"
+        elif mn.startswith("s_cmp_"):
+            cmp = {"s_cmp_eq_i32": "==", "s_cmp_lg_i32": "!="}[mn]
+            stmt = f"scc = {word(args[0])}{cmp}{word(args[1])};"
         else:
             stmt = alu(mn, args, mods)
         if padding and (mn.startswith("v_") and not mn.startswith("v_cmpx") or mn.startswith("buffer_store")):

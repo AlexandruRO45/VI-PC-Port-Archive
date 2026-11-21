@@ -695,6 +695,18 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_native_tls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_tls_check.py" "$<TARGET_FILE:cpu_tls_original>"
         "$<TARGET_FILE:cpu_tls_refuse>" "$<TARGET_FILE:cpu_tls_sink>" "$<TARGET_FILE:pe_map>")
+    foreach(variant IN ITEMS original no_tls)
+        add_executable(cpu_exe_start_${variant} tests/cpu/exe_start.asm)
+        set_target_properties(cpu_exe_start_${variant} PROPERTIES LINKER_LANGUAGE CXX)
+        target_link_options(cpu_exe_start_${variant} PRIVATE /ENTRY:exe_entry /NODEFAULTLIB /SUBSYSTEM:CONSOLE
+            /DYNAMICBASE /INCREMENTAL:NO)
+        target_link_libraries(cpu_exe_start_${variant} PRIVATE cpu_import_provider)
+    endforeach()
+    target_compile_definitions(cpu_exe_start_no_tls PRIVATE NO_TLS)
+    add_test(NAME cpu_native_exe_start COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/native_exe_start_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_exe_start_original>" "$<TARGET_FILE:cpu_exe_start_no_tls>"
+        "$<TARGET_FILE:cpu_import_provider>" "$<TARGET_FILE:cpu_import_altered>")
     add_library(cpu_frame_host SHARED tests/cpu/frame_host.cpp)
     add_library(cpu_frame_guest SHARED tests/cpu/tls_route.asm tests/cpu/frame_route.def)
     set_target_properties(cpu_frame_guest PROPERTIES LINKER_LANGUAGE CXX)

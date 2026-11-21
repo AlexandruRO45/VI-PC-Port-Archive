@@ -441,7 +441,7 @@ The local Bink DLL imports ordinal 1 from XAudio2_9.dll. A read-only check confi
 
 ## Mapping an image without LoadLibrary
 
-`tools/pe_map.cpp` maps an x64 PE32+ image into memory it allocates itself, away from the preferred base, and applies its DIR64 base relocations. It binds ordinary and delay imports through a resolver supplied by the host, sets section protections, records the actual base in the mapped headers and registers `.pdata` with `RtlAddFunctionTable`. The original machine code runs unchanged. Header fields are checked against the file and image size before use. It then calls TLS callbacks and the entry point. TLS data templates are rejected. [Issue #46](https://github.com/R0Y00/Xbox2Windows/issues/46)
+`tools/pe_map.cpp` maps an x64 PE32+ image into memory it allocates itself, away from the preferred base, and applies its DIR64 base relocations. It binds ordinary and delay imports through a resolver supplied by the host, sets section protections, records the actual base in the mapped headers and registers `.pdata` with `RtlAddFunctionTable`. The original machine code runs unchanged. Header fields are checked against the file and image size before use. It then calls TLS callbacks and the entry point of a DLL; `pe_map_run` starts an EXE. TLS data templates are rejected. [Issue #46](https://github.com/R0Y00/Xbox2Windows/issues/46)
 
 ```powershell
 cmake --build --preset dev --target pe_map cpu_reloc_original cpu_import_original_lifted cpu_ordinal_original_lifted cpu_import_altered cpu_ordinal_altered cpu_register_probe cpu_two_imports
@@ -488,6 +488,27 @@ Like the Windows loader, `pe_map` finds the TLS directory by its address and doe
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^cpu_native_tls$' -V
+```
+
+### Starting a mapped EXE
+
+`pe_map_image` maps an EXE without notifying it, as `LoadLibrary` does. `pe_map_run(mapped, &exit_code)` starts it: it calls the TLS callbacks in table order with `DLL_PROCESS_ATTACH` and a null reserved argument, then the entry point on the calling thread, and stores the entry point's return value in `exit_code`. It returns 0 and runs nothing for an image with `IMAGE_FILE_DLL` set, for an image without an entry point and for an unreadable callback list. `mapped` must be a live base returned by `pe_map_image`; the headers are read without validation, as in `pe_map_export`. The entry point and callbacks are arbitrary code running in the host process on the calling thread, so an image that crashes, hangs or calls `ExitProcess` takes the host with it; run unknown images in a child process, as the test does. Start each mapping at most once. The caller keeps the mapping live until the call returns and prevents any thread, TLS callback or entry point from starting or releasing the same mapping during that call. The PEB argument that Windows passes to an EXE's entry point is not forwarded, and no process-detach notification follows, because the host process goes on running.
+
+`cpu_exe_start_original` is a source-built EXE without a C runtime. Its TLS callback and its entry point each append one base-4 digit to a log, then the entry point calls the named import `cpu_import_provider!mix_args(5, 3, out)`, which returns 13, and returns `(log << 8) | 13`. A process launch of the EXE makes that value its exit code. `cpu_native_exe_start` compares the launch with `pe_map_image` and `pe_map_run` in a child process:
+
+- Original: both give `0x60d`: the callback (digit 1, reserved null) ran before the entry point (digit 2), and the import returned 13.
+- `cpu_exe_start_no_tls` has no TLS directory. Both give `0x20d`, so the log reflects the callback.
+- The original bound to `cpu_import_altered`, whose `mix_args` returns one more, gives `0x60e` under `pe_map`.
+- With `IMAGE_FILE_DLL` set in a copy, `pe_map_run` returns 0 and leaves the exit code untouched.
+- With the entry point moved into `.data` in a copy, the Windows launch faults with `0xc0000005`, while `pe_map_image` refuses it as "entry point outside executable section" and nothing runs.
+
+As a one-off manual check (not in CI), I removed the callback loop from `pe_map_run`; the test then failed with `mapped original 0x20d != native 0x60d`.
+
+This shows one EXE with an ordered start log and an import bound through the resolver. It does not run a C runtime startup, which would call `ExitProcess` in the host. It does not cover implicit TLS data, a second thread's TLS callbacks, static initializers in imported DLLs, `GetModuleHandle(NULL)` (which still returns the host) or the PEB. Those remain untested or unsupported. Measured on Windows 11 build 26300. [Issue #165](https://github.com/R0Y00/Xbox2Windows/issues/165)
+
+```powershell
+cmake --build --preset dev --target pe_map cpu_exe_start_original cpu_exe_start_no_tls cpu_import_provider cpu_import_altered
+ctest --preset dev --no-tests=error -R '^cpu_native_exe_start$' -V
 ```
 
 ### An empty relocation directory away from the preferred base

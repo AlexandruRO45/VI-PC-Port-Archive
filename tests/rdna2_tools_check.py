@@ -118,6 +118,16 @@ class TestRdna2Disasm(unittest.TestCase):
             ("000182be", "s_mov_b64", "s_mov_b64 s2, s0"),
             ("00008080", "s_sub_u32", "s_sub_u32 s0, s0, s0"),
             ("0000027e", "v_nop", "v_nop"),
+            # VOP1 9-bit SRC0: 0..255 scalar/constant, 256..511 VGPR
+            ("0103007e", "v_mov_b32_e32", "v_mov_b32_e32 v0, v1"),
+            ("0102007e", "v_mov_b32_e32", "v_mov_b32_e32 v0, s1"),
+            ("f202047e", "v_mov_b32_e32", "v_mov_b32_e32 v2, 1.0"),
+            ("f002067e", "v_mov_b32_e32", "v_mov_b32_e32 v3, 0.5"),
+            ("8002087e", "v_mov_b32_e32", "v_mov_b32_e32 v4, 0"),
+            # VOP2 9-bit SRC0 (VGPR vs SGPR vs inline constant)
+            ("01050602", "v_add_f32_e32", "v_add_f32_e32 v3, v1, v2"),
+            ("01040602", "v_add_f32_e32", "v_add_f32_e32 v3, s1, v2"),
+            ("f0040602", "v_add_f32_e32", "v_add_f32_e32 v3, 0.5, v2"),
         ]
         for hex_str, expected_op, expected_asm in vectors:
             raw = bytes.fromhex(hex_str)
@@ -150,6 +160,11 @@ class TestRdna2Disasm(unittest.TestCase):
         fixture_instructions = [
             "s_nop 0",
             "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v0, v1",
+            "v_mov_b32_e32 v0, s1",
+            "v_mov_b32_e32 v2, 1.0",
+            "v_mov_b32_e32 v3, 0.5",
+            "v_mov_b32_e32 v4, 0",
             "s_endpgm",
         ]
 
@@ -204,6 +219,12 @@ class TestRdna2Disasm(unittest.TestCase):
                 rdna2_op, llvm_op,
                 f"Instruction {i}: disasm_rdna2 opcode '{rdna2_op}' does not match LLVM opcode '{llvm_op}'"
             )
+            if orig_op.startswith("v_"):
+                self.assertEqual(
+                    " ".join(rdna2_rec["assembly"].lower().split()),
+                    " ".join(llvm_line.lower().split()),
+                    f"Instruction {i}: disasm_rdna2 '{rdna2_rec['assembly']}' does not match LLVM '{llvm_line}'"
+                )
 
 
 class TestRdna2Extractor(unittest.TestCase):

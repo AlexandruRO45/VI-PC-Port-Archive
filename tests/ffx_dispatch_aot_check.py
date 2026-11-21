@@ -7,8 +7,8 @@ import sys
 import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-from ffx_dispatch_aot import disassemble, predecessor, translate
-from ffx_scratch_reference import network
+from ffx_dispatch_aot import alu, disassemble, predecessor, translate
+from ffx_scratch_reference import network, simm16
 
 
 def asint(x):
@@ -43,23 +43,110 @@ def rdna_bfe(src, offset, width, signed_ext):
     return sum(bit << i for i, bit in enumerate(field + [fill] * (32 - width)))
 
 
+def sadd_u_hlsl(a, b):
+    a, b = a & 0xffffffff, b & 0xffffffff
+    r = (a + b) & 0xffffffff
+    return r, (1 if r < a else 0)
+
+
+def slshl4_add_u_hlsl(a, b):
+    a, b = a & 0xffffffff, b & 0xffffffff
+    shifted = (a << 4) & 0xffffffff
+    r = (shifted + b) & 0xffffffff
+    return r, (1 if ((a >> 28) != 0 or r < shifted) else 0)
+
+
+def sadd_i_hlsl(a, b):
+    a, b = a & 0xffffffff, b & 0xffffffff
+    r = (a + b) & 0xffffffff
+    scc = (((~(a ^ b)) & (a ^ r)) >> 31) & 1
+    return r, scc
+
+
+def ssub_i_hlsl(a, b):
+    a, b = a & 0xffffffff, b & 0xffffffff
+    r = (a - b) & 0xffffffff
+    scc = (((a ^ b) & (a ^ r)) >> 31) & 1
+    return r, scc
+
+
+def smin_u_hlsl(a, b):
+    a, b = a & 0xffffffff, b & 0xffffffff
+    scc = 1 if a < b else 0
+    return (a if scc else b), scc
+
+
+def smax_u_hlsl(a, b):
+    a, b = a & 0xffffffff, b & 0xffffffff
+    scc = 1 if a > b else 0
+    return (a if scc else b), scc
+
+
+def smin_i_hlsl(a, b):
+    a, b = a & 0xffffffff, b & 0xffffffff
+    scc = 1 if asint(a) < asint(b) else 0
+    return (a if scc else b), scc
+
+
+def smax_i_hlsl(a, b):
+    a, b = a & 0xffffffff, b & 0xffffffff
+    scc = 1 if asint(a) > asint(b) else 0
+    return (a if scc else b), scc
+
+
+def sabs_i_hlsl(a):
+    a &= 0xffffffff
+    r = (0 - a) & 0xffffffff if asint(a) < 0 else a
+    return r, (1 if r != 0 else 0)
+
+
+SALU_HELPERS = {
+    "sadd_u": sadd_u_hlsl,
+    "slshl4_add_u": slshl4_add_u_hlsl,
+    "sadd_i": sadd_i_hlsl,
+    "ssub_i": ssub_i_hlsl,
+    "smin_u": smin_u_hlsl,
+    "smax_u": smax_u_hlsl,
+    "smin_i": smin_i_hlsl,
+    "smax_i": smax_i_hlsl,
+    "sabs_i": sabs_i_hlsl,
+}
+
+
 def eval_generated(shader, init):
-    env = {f"s{i}": 0 for i in range(16)}
-    env.update({f"v{i}": 0 for i in range(16)})
-    env.update(scc=0, exec_lo=1, bfe_u=bfe_u_hlsl, bfe_i=bfe_i_hlsl, **init)
+    env = {f"s{i}": 0 for i in range(32)}
+    env.update({f"v{i}": 0 for i in range(32)})
+    env.update(
+        scc=0, exec_lo=1, bfe_u=bfe_u_hlsl, bfe_i=bfe_i_hlsl,
+        asint=asint, min=min, max=max,
+        reversebits=lambda x: int(f"{x & 0xffffffff:032b}"[::-1], 2),
+        mul_high=lambda a, b: ((a & 0xffffffff) * (b & 0xffffffff)) >> 32,
+        **init,
+    )
     for raw in shader.splitlines():
         if not raw.startswith("    "):
             continue
         line = raw.strip()
         if line.startswith("if (exec_lo) { ") and line.endswith(" }"):
             line = line[len("if (exec_lo) { "):-2]
+        if m := re.fullmatch(r"\{\s*uint2 t=uint2\(([^,]+),([^)]+)\);\s*(\w+)=t\.x;\s*(\w+)=t\.y;\s*\}", line):
+            a_expr, b_expr, dst_lo, dst_hi = m.groups()
+            a_val = int(eval(re.sub(r"\b(0x[0-9a-fA-F]+|\d+)u\b", r"\1", a_expr), {"__builtins__": {}}, env)) & 0xffffffff
+            b_val = int(eval(re.sub(r"\b(0x[0-9a-fA-F]+|\d+)u\b", r"\1", b_expr), {"__builtins__": {}}, env)) & 0xffffffff
+            env[dst_lo], env[dst_hi] = a_val, b_val
+            continue
         for part in line.split(";"):
             part = part.strip()
             if not part or "," in part.split("=", 1)[0]:
                 continue
             lhs, rhs = (x.strip() for x in part.split("=", 1))
             py_rhs = re.sub(r"\b(0x[0-9a-fA-F]+|\d+)u\b", r"\1", rhs)
-            if "?" in py_rhs:
+            if m := re.fullmatch(r"(s\w+)\((.+),scc\)", py_rhs):
+                fn, arg_str = m.groups()
+                fn_args = [int(eval(a.strip(), {"__builtins__": {}}, env)) for a in arg_str.split(",")]
+                val, new_scc = SALU_HELPERS[fn](*fn_args)
+                env["scc"] = new_scc & 0xffffffff
+            elif "?" in py_rhs:
                 cond, rest = py_rhs.split("?", 1)
                 t_val, f_val = rest.split(":", 1)
                 val = eval(t_val, {"__builtins__": {}}, env) if eval(cond, {"__builtins__": {}}, env) else eval(f_val, {"__builtins__": {}}, env)
@@ -159,6 +246,178 @@ def check_bfe(assembler, objcopy, library):
     assert (set_neg["s6"], set_neg["v9"], set_neg["s10"]) == ((-8) & 0xffffffff, 202, 303)
 
 
+def check_salu_sopk_and_scc(assembler, objcopy, library):
+    hlsli = (Path(__file__).resolve().parent / "ffx_dispatch_io.hlsli").read_text(encoding="ascii")
+    for helper in SALU_HELPERS:
+        assert f"uint {helper}(" in hlsli
+
+    assert simm16("0") == 0 and simm16("0x7fff") == 0x7fff
+    assert simm16("0x8000") == 0xffff8000 and simm16("0xffff") == 0xffffffff
+    assert simm16("-1") == 0xffffffff and simm16("-32768") == 0xffff8000
+    for bad in ("0x10000", "-32769"):
+        try:
+            simm16(bad)
+            raise AssertionError(f"Accepted out-of-range SOPK immediate {bad}")
+        except ValueError:
+            pass
+    try:
+        alu("s_movk_i32", ["s0", "0x10000"], "")
+        raise AssertionError("Accepted out-of-range SOPK immediate in alu()")
+    except ValueError:
+        pass
+
+    edges = (0, 1, 2, 0x0fffffff, 0x10000000, 0x7ffffffe, 0x7fffffff,
+             0x80000000, 0x80000001, 0xffff0000, 0xfffffffe, 0xffffffff)
+    for a in edges:
+        abs_ref = abs(asint(a)) & 0xffffffff
+        assert sabs_i_hlsl(a) == (abs_ref, int(abs_ref != 0))
+        for b in edges:
+            assert sadd_u_hlsl(a, b) == ((a + b) & 0xffffffff, int(a + b >= (1 << 32)))
+            wide_shift = (a << 4) + b
+            assert slshl4_add_u_hlsl(a, b) == (wide_shift & 0xffffffff, int(wide_shift >= (1 << 32)))
+            sum_i = asint(a) + asint(b)
+            assert sadd_i_hlsl(a, b) == (sum_i & 0xffffffff, int(not (-0x80000000 <= sum_i <= 0x7fffffff)))
+            diff_i = asint(a) - asint(b)
+            assert ssub_i_hlsl(a, b) == (diff_i & 0xffffffff, int(not (-0x80000000 <= diff_i <= 0x7fffffff)))
+            assert smin_u_hlsl(a, b) == (min(a, b), int(a < b))
+            assert smax_u_hlsl(a, b) == (max(a, b), int(a > b))
+            assert smin_i_hlsl(a, b) == ((a if asint(a) < asint(b) else b), int(asint(a) < asint(b)))
+            assert smax_i_hlsl(a, b) == ((a if asint(a) > asint(b) else b), int(asint(a) > asint(b)))
+
+    def assemble(text):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src, obj, out = (root / ("salu." + ext) for ext in ("s", "o", "bin"))
+            src.write_text(text, encoding="ascii")
+            subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-filetype=obj",
+                            src, "-o", obj], check=True)
+            subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, out], check=True)
+            code = out.read_bytes()
+        return code, disassemble(code, library, offsets=True)
+
+    # Non-SCC-writing scalar instructions (including negative SOPK immediates)
+    # and vector ALU instructions must preserve both scc=1 and scc=0.
+    preserve_code, preserve_ins = assemble(
+        "s_cmp_eq_i32 s0, s1\n"
+        "s_movk_i32 s4, -1\n"
+        "s_movk_i32 s5, -32768\n"
+        "s_movk_i32 s6, 0\n"
+        "s_mulk_i32 s7, -3\n"
+        "s_mov_b32 s10, s2\n"
+        "s_mov_b64 s[12:13], s[2:3]\n"
+        "s_mul_i32 s16, s2, s3\n"
+        "s_mul_hi_u32 s17, s2, s3\n"
+        "s_brev_b32 s18, s2\n"
+        "v_add_nc_u32 v4, v1, v2\n"
+        "v_min_i32 v5, v1, v2\n"
+        "v_xor_b32 v6, v1, v1\n"
+        "s_cselect_b32 s19, s2, s3\n"
+        "v_cndmask_b32_e64 v7, v1, v2, src_scc\n"
+        "s_endpgm\n"
+    )
+    for shader in (translate("rcas", preserve_ins, preserve_code),
+                   predecessor("pass25", preserve_ins, b"")):
+        assert "s4 = 0xffffffffu;" in shader and "s5 = 0xffff8000u;" in shader
+        assert "s7 = s7*0xfffffffdu;" in shader
+        kept_one = eval_generated(shader, dict(s0=9, s1=9, s2=0x80000003, s3=2, s7=0x10002, v1=11, v2=22))
+        assert (kept_one["s4"], kept_one["s5"], kept_one["s6"]) == (0xffffffff, 0xffff8000, 0)
+        assert kept_one["s7"] == (0x10002 * -3) & 0xffffffff
+        assert (kept_one["s12"], kept_one["s13"], kept_one["s17"], kept_one["s18"]) == (0x80000003, 2, 1, 0xc0000001)
+        assert (kept_one["s19"], kept_one["v7"], kept_one["scc"]) == (0x80000003, 22, 1)
+        kept_zero = eval_generated(shader, dict(s0=9, s1=10, s2=0x80000003, s3=2, s7=0, v1=11, v2=22))
+        assert (kept_zero["s7"], kept_zero["s19"], kept_zero["v7"], kept_zero["scc"]) == (0, 2, 11, 0)
+
+    # SCC-writing scalar instructions must both clear stale scc=1 and set scc=1
+    # according to carry, signed overflow, relational winner, or nonzero result,
+    # including when the destination aliases a source SGPR.
+    scc_code, scc_ins = assemble(
+        "s_cmp_eq_i32 s31, 0\n"
+        "s_addk_i32 s4, -2\n"
+        "s_cselect_b32 s16, s2, s3\n"
+        "s_cmp_eq_i32 s31, 0\n"
+        "s_add_u32 s5, s5, s1\n"
+        "s_cselect_b32 s17, s2, s3\n"
+        "s_cmp_eq_i32 s31, 0\n"
+        "s_lshl4_add_u32 s6, s0, s1\n"
+        "s_cselect_b32 s18, s2, s3\n"
+        "s_cmp_eq_i32 s31, 0\n"
+        "s_sub_i32 s7, s7, s1\n"
+        "s_cselect_b32 s19, s2, s3\n"
+        "s_cmp_eq_i32 s31, 0\n"
+        "s_min_u32 s20, s10, s11\n"
+        "s_cselect_b32 s21, s2, s3\n"
+        "s_cmp_lg_i32 s31, 0\n"
+        "s_min_i32 s22, s10, s11\n"
+        "s_cselect_b32 s23, s2, s3\n"
+        "s_cmp_eq_i32 s31, 0\n"
+        "s_max_u32 s24, s10, s10\n"
+        "s_cselect_b32 s25, s2, s3\n"
+        "s_cmp_eq_i32 s31, 0\n"
+        "s_abs_i32 s26, s12\n"
+        "s_cselect_b32 s27, s2, s3\n"
+        "s_cmp_lg_i32 s31, 0\n"
+        "s_lshl_b32 s28, s13, 36\n"
+        "v_cndmask_b32_e64 v8, v1, v2, src_scc\n"
+        "s_cmp_eq_i32 s31, 0\n"
+        "s_and_b32 s29, s13, 0\n"
+        "s_cselect_b32 s30, s2, s3\n"
+        "s_endpgm\n"
+    )
+    for shader in (translate("rcas", scc_ins, scc_code),
+                   predecessor("pass25", scc_ins, b"")):
+        # With s31=0, s_cmp_eq_i32 presets scc=1 and s_cmp_lg_i32 presets scc=0,
+        # verifying both 1->0 clearing and 0->1 setting on non-overflowing inputs.
+        no_ovf = eval_generated(shader, dict(
+            s0=0x01000000, s1=1, s2=111, s3=222,
+            s4=0x10001, s5=5, s7=0,
+            s10=0xffffffff, s11=1, s12=0, s13=3, s31=0, v1=10, v2=20,
+        ))
+        assert (no_ovf["s4"], no_ovf["s16"]) == (0xffff, 222)
+        assert (no_ovf["s5"], no_ovf["s17"]) == (6, 222)
+        assert (no_ovf["s6"], no_ovf["s18"]) == (0x10000001, 222)
+        assert (no_ovf["s7"], no_ovf["s19"]) == (0xffffffff, 222)
+        assert (no_ovf["s20"], no_ovf["s21"]) == (1, 222)
+        assert (no_ovf["s22"], no_ovf["s23"]) == (0xffffffff, 111)
+        assert (no_ovf["s24"], no_ovf["s25"]) == (0xffffffff, 222)
+        assert (no_ovf["s26"], no_ovf["s27"]) == (0, 222)
+        assert (no_ovf["s28"], no_ovf["v8"]) == (48, 20)
+        assert (no_ovf["s29"], no_ovf["s30"]) == (0, 222)
+
+        # With s31=1, s_cmp_eq_i32 presets scc=0 and s_cmp_lg_i32 presets scc=1,
+        # verifying 0->1 setting on signed/unsigned overflow (including s_lshl4_add_u32
+        # shifting a nonzero upper nibble out of 32 bits and s_abs_i32 on INT_MIN)
+        # and 1->0 clearing when s_lshl_b32 produces zero.
+        ovf = eval_generated(shader, dict(
+            s0=0x10000000, s1=1, s2=111, s3=222,
+            s4=0x80000000, s5=0xffffffff, s7=0x80000000,
+            s10=1, s11=5, s12=0x80000000, s13=0, s31=1, v1=10, v2=20,
+        ))
+        assert (ovf["s4"], ovf["s16"]) == (0x7ffffffe, 111)
+        assert (ovf["s5"], ovf["s17"]) == (0, 111)
+        assert (ovf["s6"], ovf["s18"]) == (1, 111)
+        assert (ovf["s7"], ovf["s19"]) == (0x7fffffff, 111)
+        assert (ovf["s20"], ovf["s21"]) == (1, 111)
+        assert (ovf["s22"], ovf["s23"]) == (1, 111)
+        assert (ovf["s26"], ovf["s27"]) == (0x80000000, 111)
+        assert (ovf["s28"], ovf["v8"]) == (0, 10)
+
+    # Scratch CPU reference must sign-extend SOPK immediates identically to predecessor().
+    ref_code, ref_ins = assemble(
+        "buffer_load_dwordx4 v[0:3], v4, s[8:11], 0 offen\n"
+        "s_movk_i32 s4, -16\n"
+        "s_addk_i32 s4, -2\n"
+        "s_mulk_i32 s4, -3\n"
+        "v_xor_b32 v0, s4, v0\n"
+        "s_movk_i32 s5, -1\n"
+        "s_addk_i32 s5, 0x7fff\n"
+        "v_xor_b32 v1, s5, v1\n"
+        "buffer_store_dwordx4 v[0:3], v4, s[8:11], 0 offen\n"
+        "s_endpgm\n"
+    )
+    taps = [[0x10000000, 0xabcdef00, 3, 4]]
+    assert network(ref_ins, taps, b"", 24) == [0x10000000 ^ 54, 0xabcdef00 ^ 0x7ffe, 3, 4]
+
+
 def main(assembler, objcopy, library):
     # A signed i8 dot product, replicated low half, clamp and byte insert
     # have independent integer answers on these source-owned test operands.
@@ -192,6 +451,7 @@ def main(assembler, objcopy, library):
     assert "0xffffu >> 16" in hlsl and "0xffffffffu" not in hlsl
     assert "load16(uint2(v4 & 65535u, v4>>16))" in hlsl
     check_bfe(assembler, objcopy, library)
+    check_salu_sopk_and_scc(assembler, objcopy, library)
 
 
 if __name__ == "__main__":

@@ -531,3 +531,36 @@ extern "C" __declspec(dllexport) void pe_map_release(void* mapped) {
     if (pdata.Size) RtlDeleteFunctionTable(reinterpret_cast<PRUNTIME_FUNCTION>(base + pdata.VirtualAddress));
     VirtualFree(base, 0, MEM_RELEASE);
 }
+
+// Start a mapped EXE on the calling thread the way the loader starts a process: TLS callbacks in table
+// order with DLL_PROCESS_ATTACH and a null reserved argument, then the entry point, whose return value is
+// the exit code Windows would use. Measured on Windows 11 build 26300 with tests/cpu/exe_start.asm.
+//
+// Preconditions, none of which is checked:
+// - `mapped` is a base returned by pe_map_image, still live and not yet released. Like pe_map_export,
+//   this reads the headers of the argument directly, so any other pointer is undefined behavior.
+// - The caller trusts the image. The entry point and the callbacks are arbitrary machine code that runs
+//   in the host process with the host's privileges. They can crash, hang or terminate it (an entry point
+//   that calls ExitProcess ends the host), and they run on the calling thread, so their stack, TLS and
+//   loader-lock state are the caller's. Run untrusted or unknown images in a child process.
+// pe_map_image maps an EXE without notifying it, like LoadLibrary, so nothing has run before this call.
+// Start once per mapping. The caller keeps it live throughout the call and prevents any thread,
+// TLS callback or entry point from re-entering run or releasing this mapping during startup.
+//
+// Returns 0 without running anything for a DLL, which pe_map_image already notified, for an image without
+// an entry point, for a null exit_code and for an unreadable TLS callback list. The PEB argument that
+// Windows passes to the entry point is not forwarded, and no process-detach notification follows because
+// the process goes on.
+extern "C" __declspec(dllexport) int pe_map_run(void* mapped, std::uint32_t* exit_code) {
+    auto* base = static_cast<std::uint8_t*>(mapped);
+    const auto* nt = Image{base, 0}.headers();
+    if (!exit_code || (nt->FileHeader.Characteristics & IMAGE_FILE_DLL) || !nt->OptionalHeader.AddressOfEntryPoint)
+        return 0;
+    const Image image{base, nt->OptionalHeader.SizeOfImage};
+    std::vector<PIMAGE_TLS_CALLBACK> callbacks;
+    if (tls_callbacks(image, nt, callbacks)) return 0;
+    for (auto callback : callbacks) callback(base, DLL_PROCESS_ATTACH, nullptr);
+    using Entry = DWORD(WINAPI*)(void*);
+    *exit_code = reinterpret_cast<Entry>(base + nt->OptionalHeader.AddressOfEntryPoint)(nullptr);
+    return 1;
+}
