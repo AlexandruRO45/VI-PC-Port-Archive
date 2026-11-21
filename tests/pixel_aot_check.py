@@ -1067,6 +1067,18 @@ def check_controls(directory):
     must_reject(translate, program[:-1])
     for wait in ("s_waitcnt vmcnt(0)", "s_waitcnt lgkmcnt(0)"):
         must_reject(translate, [line for line in program if line != wait])
+    for exp_inst in ("s_waitcnt_expcnt null, 0x0", "s_waitcnt_expcnt null, 0x3", "s_waitcnt_expcnt null, 0",
+                     "s_waitcnt_expcnt s0, 0x0", "s_waitcnt_expcnt 0x3", "s_waitcnt_expcnt 0",
+                     "s_waitcnt expcnt(0)", "s_waitcnt expcnt(7)"):
+        assert "return float4(" in translate([exp_inst] + program)
+        assert translate(program[:-1] + [exp_inst, program[-1]]) == translate(program)
+    must_reject(translate, program + ["s_waitcnt_expcnt null, 0"])
+    must_reject(translate, ["s_waitcnt_expcnt null, 0x8"] + program)
+    must_reject(translate, ["s_waitcnt_expcnt null, 8"] + program)
+    must_reject(translate, ["s_waitcnt_expcnt 0x8"] + program)
+    must_reject(translate, ["s_waitcnt_expcnt invalid"] + program)
+    must_reject(translate, ["s_waitcnt_expcnt null, invalid"] + program)
+    must_reject(translate, ["s_waitcnt expcnt(8)"] + program)
 
     wait = program.index("s_waitcnt vmcnt(0)")
     overwrite = "v_floor_f32_e32 v13, 1.0"
@@ -1244,6 +1256,8 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((with_constants(HALF_BODY), translate))
     fixtures.append((dual_program(swap_weights=True), translate_dual))
     fixtures.append((with_constants(LITERAL_FMA_BODY), translate))
+    exp_sync_program = ["s_waitcnt_expcnt null, 0"] + assembly(False)[:-1] + ["s_waitcnt_expcnt null, 0", "s_endpgm"]
+    fixtures.append((exp_sync_program, translate))
     for index, (instructions, lower_fixture) in enumerate(fixtures):
         source = directory / "fixture.s"
         obj = directory / "fixture.o"
@@ -1304,6 +1318,11 @@ def check_render(directory, compiler, renderer, backend):
             wrong = subprocess.run([*draw, "rgba"], capture_output=True, text=True)
             if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
                 raise AssertionError("The renderer failed to detect the changed channel order")
+    for exp_shader_inst in ("s_waitcnt_expcnt null, 0x3", "s_waitcnt expcnt(0)"):
+        exp_program = [exp_shader_inst] + assembly(False)[:-1] + [exp_shader_inst, "s_endpgm"]
+        source.write_text(translate(exp_program), encoding="ascii")
+        subprocess.run([compiler, "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        subprocess.run([renderer, backend, "--check-pixel", shader, "rgba"], check=True)
     program = arithmetic()
     source.write_text(translate(program), encoding="ascii")
     subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
