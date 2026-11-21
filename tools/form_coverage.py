@@ -54,6 +54,8 @@ CPU_FIXTURES = {
     "working_set_delta": "cpu_working_set_delta",
     "exe_entry": "cpu_aot_exe_entry",
     "address_size": "cpu_aot_address_size",
+    "avx_int_regs": "cpu_aot_avx_int_regs",
+    "avx_move_regs": "cpu_aot_avx_move_regs",
     "call_pair": "cpu_aot_call_pair",
     "bmi1": "cpu_aot_bmi1",
     "register_probe": None,  # measurement harness
