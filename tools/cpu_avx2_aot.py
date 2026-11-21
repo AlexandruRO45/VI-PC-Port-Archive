@@ -1,31 +1,35 @@
-"""Lift bounded Windows x64 leaf functions with register-domain AVX2 instructions to C++.
+"""Lift bounded Windows x64 leaf functions with AVX2 instructions to C++.
 
 Each export uses the leaf ABI void fn(word rcx, word rdx, word r8), where rcx,
 rdx and r8 carry flat host pointers to caller-owned buffers. YMM0..YMM5 are
 modeled as portable 256-bit value structs (four 64-bit lanes); every VEX write
 to an XMM destination zeroes bits 128..255 of the corresponding YMM register.
 
-Supported AVX2 instructions (18 forms from docs/coverage/x64_zen2.tsv group AVX2):
+Supported AVX2 instructions (all 28 forms from docs/coverage/x64_zen2.tsv group AVX2):
   - 128-bit lane broadcast/permute: vbroadcasti128 (m128), vextracti128,
     vinserti128, vperm2i128
   - Element broadcasts: vpbroadcastb, vpbroadcastw, vpbroadcastd, vpbroadcastq
   - Lane permutes: vpermd, vpermpd, vpermps, vpermq
   - Blend: vpblendd
   - Variable shifts: vpsllvd, vpsllvq, vpsravd, vpsrlvd, vpsrlvq
+  - Indexed gathers (VSIB): vgatherdps, vgatherdpd, vgatherqps, vgatherqpd,
+    vpgatherdd, vpgatherdq, vpgatherqd, vpgatherqq
+  - Masked loads and stores: vpmaskmovd, vpmaskmovq
 
 Transport/ABI glue: vmovdqu (128/256-bit flat load, store and register copy),
 vzeroupper and terminal ret.
 
-Memory-domain AVX2 forms (vgather*, vpgather*, vpmaskmov*), memory operands on
-the 17 register-domain AVX2 forms, nonvolatile vector registers (XMM6..XMM15 /
-YMM6..YMM15), EVEX encodings, branches and all other instructions are rejected.
+Memory operands on the 17 register-only AVX2 forms, overlapping gather
+dest/index/mask registers, invalid VSIB scales or addressing modes, nonvolatile
+vector registers (XMM6..XMM15 / YMM6..YMM15), EVEX encodings, instruction
+prefixes, branches and all other instructions are rejected.
 """
 
 import argparse
 from pathlib import Path
 
 import pefile
-from iced_x86 import Code, Decoder, Mnemonic as M, OpKind, Register as R, RegisterExt
+from iced_x86 import Code, Decoder, DecoderOptions, EncodingKind, Mnemonic as M, OpKind, Register as R, RegisterExt
 
 from cpu_leaf_aot import bounded_code, export_rva
 
@@ -36,18 +40,44 @@ VOLATILE_YMM = {getattr(R, f"YMM{i}"): i for i in range(6)}
 NONVOLATILE_VEC = ({getattr(R, f"XMM{i}") for i in range(6, 16)}
                    | {getattr(R, f"YMM{i}") for i in range(6, 16)})
 
-MEMORY_DOMAIN_AVX2 = {
-    M.VGATHERDPD, M.VGATHERDPS, M.VGATHERQPD, M.VGATHERQPS,
-    M.VPGATHERDD, M.VPGATHERDQ, M.VPGATHERQD, M.VPGATHERQQ,
-    M.VPMASKMOVD, M.VPMASKMOVQ,
-}
-
 REGISTER_ONLY_AVX2 = {
     M.VEXTRACTI128, M.VINSERTI128, M.VPERM2I128,
     M.VPBROADCASTB, M.VPBROADCASTW, M.VPBROADCASTD, M.VPBROADCASTQ,
     M.VPERMD, M.VPERMPD, M.VPERMPS, M.VPERMQ,
     M.VPBLENDD,
     M.VPSLLVD, M.VPSLLVQ, M.VPSRAVD, M.VPSRLVD, M.VPSRLVQ,
+}
+
+# (helper_name, element_count, dest_and_mask_is_ymm, index_is_ymm, index_elem_bits)
+GATHER_SPECS = {
+    Code.VEX_VGATHERDPS_XMM_VM32X_XMM: ("op_gather_d32_i32", 4, False, False, 32),
+    Code.VEX_VGATHERDPS_YMM_VM32Y_YMM: ("op_gather_d32_i32", 8, True, True, 32),
+    Code.VEX_VPGATHERDD_XMM_VM32X_XMM: ("op_gather_d32_i32", 4, False, False, 32),
+    Code.VEX_VPGATHERDD_YMM_VM32Y_YMM: ("op_gather_d32_i32", 8, True, True, 32),
+    Code.VEX_VGATHERDPD_XMM_VM32X_XMM: ("op_gather_d64_i32", 2, False, False, 32),
+    Code.VEX_VGATHERDPD_YMM_VM32X_YMM: ("op_gather_d64_i32", 4, True, False, 32),
+    Code.VEX_VPGATHERDQ_XMM_VM32X_XMM: ("op_gather_d64_i32", 2, False, False, 32),
+    Code.VEX_VPGATHERDQ_YMM_VM32X_YMM: ("op_gather_d64_i32", 4, True, False, 32),
+    Code.VEX_VGATHERQPS_XMM_VM64X_XMM: ("op_gather_d32_i64", 2, False, False, 64),
+    Code.VEX_VGATHERQPS_XMM_VM64Y_XMM: ("op_gather_d32_i64", 4, False, True, 64),
+    Code.VEX_VPGATHERQD_XMM_VM64X_XMM: ("op_gather_d32_i64", 2, False, False, 64),
+    Code.VEX_VPGATHERQD_XMM_VM64Y_XMM: ("op_gather_d32_i64", 4, False, True, 64),
+    Code.VEX_VGATHERQPD_XMM_VM64X_XMM: ("op_gather_d64_i64", 2, False, False, 64),
+    Code.VEX_VGATHERQPD_YMM_VM64Y_YMM: ("op_gather_d64_i64", 4, True, True, 64),
+    Code.VEX_VPGATHERQQ_XMM_VM64X_XMM: ("op_gather_d64_i64", 2, False, False, 64),
+    Code.VEX_VPGATHERQQ_YMM_VM64Y_YMM: ("op_gather_d64_i64", 4, True, True, 64),
+}
+
+# (is_store, element_bits, is_ymm)
+MASKMOV_SPECS = {
+    Code.VEX_VPMASKMOVD_XMM_XMM_M128: (False, 32, False),
+    Code.VEX_VPMASKMOVD_YMM_YMM_M256: (False, 32, True),
+    Code.VEX_VPMASKMOVQ_XMM_XMM_M128: (False, 64, False),
+    Code.VEX_VPMASKMOVQ_YMM_YMM_M256: (False, 64, True),
+    Code.VEX_VPMASKMOVD_M128_XMM_XMM: (True, 32, False),
+    Code.VEX_VPMASKMOVD_M256_YMM_YMM: (True, 32, True),
+    Code.VEX_VPMASKMOVQ_M128_XMM_XMM: (True, 64, False),
+    Code.VEX_VPMASKMOVQ_M256_YMM_YMM: (True, 64, True),
 }
 
 ALLOWED_CODES = {
@@ -85,6 +115,8 @@ ALLOWED_CODES = {
     Code.VEX_VPSRLVD_YMM_YMM_YMMM256,
     Code.VEX_VPSRLVQ_XMM_XMM_XMMM128,
     Code.VEX_VPSRLVQ_YMM_YMM_YMMM256,
+    *GATHER_SPECS,
+    *MASKMOV_SPECS,
 }
 
 BROADCAST_HELPERS = {
@@ -289,6 +321,131 @@ static Vec256 op_vpsrlvq(const Vec256& src1, const Vec256& src2, bool wide) {
     }
     return out;
 }
+
+static std::uint32_t load32(word address) {
+    std::uint32_t val = 0u;
+    std::memcpy(&val, reinterpret_cast<const void*>(address), 4);
+    return val;
+}
+
+static std::uint64_t load64(word address) {
+    std::uint64_t val = 0ull;
+    std::memcpy(&val, reinterpret_cast<const void*>(address), 8);
+    return val;
+}
+
+static void store32(word address, std::uint32_t val) {
+    std::memcpy(reinterpret_cast<void*>(address), &val, 4);
+}
+
+static void store64(word address, std::uint64_t val) {
+    std::memcpy(reinterpret_cast<void*>(address), &val, 8);
+}
+
+static word sign_extend32(std::uint32_t v) {
+    return static_cast<word>(static_cast<std::int64_t>(static_cast<std::int32_t>(v)));
+}
+
+static void op_gather_d32_i32(Vec256& dest, word base, word disp, word scale,
+                              const Vec256& vindex, Vec256& mask, unsigned count) {
+    for (unsigned i = 0; i < count; ++i) {
+        if ((lane32(mask, i) & 0x80000000u) != 0u) {
+            const word addr = base + sign_extend32(lane32(vindex, i)) * scale + disp;
+            set_lane32(dest, i, load32(addr));
+        }
+    }
+    if (count == 4u) {
+        dest.q[2] = 0ull;
+        dest.q[3] = 0ull;
+    }
+    mask = Vec256{};
+}
+
+static void op_gather_d64_i32(Vec256& dest, word base, word disp, word scale,
+                              const Vec256& vindex, Vec256& mask, unsigned count) {
+    for (unsigned i = 0; i < count; ++i) {
+        if ((mask.q[i] & 0x8000000000000000ull) != 0ull) {
+            const word addr = base + sign_extend32(lane32(vindex, i)) * scale + disp;
+            dest.q[i] = load64(addr);
+        }
+    }
+    if (count == 2u) {
+        dest.q[2] = 0ull;
+        dest.q[3] = 0ull;
+    }
+    mask = Vec256{};
+}
+
+static void op_gather_d32_i64(Vec256& dest, word base, word disp, word scale,
+                              const Vec256& vindex, Vec256& mask, unsigned count) {
+    for (unsigned i = 0; i < count; ++i) {
+        if ((lane32(mask, i) & 0x80000000u) != 0u) {
+            const word addr = base + vindex.q[i] * scale + disp;
+            set_lane32(dest, i, load32(addr));
+        }
+    }
+    if (count == 2u) {
+        dest.q[1] = 0ull;
+    }
+    dest.q[2] = 0ull;
+    dest.q[3] = 0ull;
+    mask = Vec256{};
+}
+
+static void op_gather_d64_i64(Vec256& dest, word base, word disp, word scale,
+                              const Vec256& vindex, Vec256& mask, unsigned count) {
+    for (unsigned i = 0; i < count; ++i) {
+        if ((mask.q[i] & 0x8000000000000000ull) != 0ull) {
+            const word addr = base + vindex.q[i] * scale + disp;
+            dest.q[i] = load64(addr);
+        }
+    }
+    if (count == 2u) {
+        dest.q[2] = 0ull;
+        dest.q[3] = 0ull;
+    }
+    mask = Vec256{};
+}
+
+static Vec256 op_vpmaskmovd_load(const Vec256& mask, word address, bool wide) {
+    Vec256 out{};
+    const unsigned lanes = wide ? 8u : 4u;
+    for (unsigned i = 0; i < lanes; ++i) {
+        if ((lane32(mask, i) & 0x80000000u) != 0u) {
+            set_lane32(out, i, load32(address + static_cast<word>(i) * 4ull));
+        }
+    }
+    return out;
+}
+
+static Vec256 op_vpmaskmovq_load(const Vec256& mask, word address, bool wide) {
+    Vec256 out{};
+    const unsigned lanes = wide ? 4u : 2u;
+    for (unsigned i = 0; i < lanes; ++i) {
+        if ((mask.q[i] & 0x8000000000000000ull) != 0ull) {
+            out.q[i] = load64(address + static_cast<word>(i) * 8ull);
+        }
+    }
+    return out;
+}
+
+static void op_vpmaskmovd_store(word address, const Vec256& mask, const Vec256& src, bool wide) {
+    const unsigned lanes = wide ? 8u : 4u;
+    for (unsigned i = 0; i < lanes; ++i) {
+        if ((lane32(mask, i) & 0x80000000u) != 0u) {
+            store32(address + static_cast<word>(i) * 4ull, lane32(src, i));
+        }
+    }
+}
+
+static void op_vpmaskmovq_store(word address, const Vec256& mask, const Vec256& src, bool wide) {
+    const unsigned lanes = wide ? 4u : 2u;
+    for (unsigned i = 0; i < lanes; ++i) {
+        if ((mask.q[i] & 0x8000000000000000ull) != 0ull) {
+            store64(address + static_cast<word>(i) * 8ull, src.q[i]);
+        }
+    }
+}
 """
 
 
@@ -315,6 +472,26 @@ def flat_address(ins):
     return f"({name} + {disp:#x}ull)" if disp else name
 
 
+def vsib_address(ins, expected_idx_wide, expected_idx_bits):
+    """Validate and extract (base_name, disp_u64, scale, idx_reg_num) from a VSIB memory operand."""
+    if not ins.is_vsib:
+        raise ValueError(f"expected VSIB memory operand at RVA {ins.ip:#x}: {ins}")
+    if (expected_idx_bits == 32 and not ins.is_vsib32) or (expected_idx_bits == 64 and not ins.is_vsib64):
+        raise ValueError(f"VSIB index width mismatch at RVA {ins.ip:#x}: {ins}")
+    base = ins.memory_base
+    if (ins.is_ip_rel_memory_operand or base in (R.NONE, R.RIP, R.EIP, R.RSP, R.ESP)
+            or not RegisterExt.is_gpr64(base) or base not in ARGUMENTS):
+        raise ValueError(f"unsupported memory operand at RVA {ins.ip:#x}: {ins}")
+    scale = ins.memory_index_scale
+    if scale not in (1, 2, 4, 8):
+        raise ValueError(f"unsupported VSIB scale {scale} at RVA {ins.ip:#x}: {ins}")
+    idx_num, idx_wide = vec_index(ins.memory_index, ins)
+    if idx_wide != expected_idx_wide:
+        raise ValueError(f"VSIB index register width mismatch at RVA {ins.ip:#x}: {ins}")
+    disp = ins.memory_displacement & ((1 << 64) - 1)
+    return ARGUMENTS[base], disp, scale, idx_num
+
+
 def lift_code(name, start, raw):
     """Decode and lift one bounded straight-line AVX2 leaf function."""
     instructions = list(Decoder(64, raw, ip=start))
@@ -322,6 +499,15 @@ def lift_code(name, start, raw):
         raise ValueError(f"truncated instruction stream in {name} at RVA {start:#x}")
     if any(ins.is_invalid for ins in instructions):
         bad = next(ins for ins in instructions if ins.is_invalid)
+        probe = next(iter(Decoder(64, raw[bad.ip - start:], DecoderOptions.NO_INVALID_CHECK, ip=bad.ip)), None)
+        if probe is not None and not probe.is_invalid and probe.code in GATHER_SPECS:
+            dst_idx, _ = vec_index(probe.op_register(0), probe)
+            idx_idx, _ = vec_index(probe.memory_index, probe)
+            mask_idx, _ = vec_index(probe.op_register(2), probe)
+            if len({dst_idx, idx_idx, mask_idx}) != 3:
+                raise ValueError(
+                    f"overlapping gather registers (dest=ymm{dst_idx}, index=ymm{idx_idx}, mask=ymm{mask_idx}) "
+                    f"at RVA {bad.ip:#x}: {probe}")
         raise ValueError(f"invalid instruction at RVA {bad.ip:#x}")
 
     used = set()
@@ -350,11 +536,10 @@ def lift_code(name, start, raw):
             raise ValueError(f"unreachable instruction after ret at RVA {ins.ip:#x}: {ins}")
         if ins.has_lock_prefix or ins.has_rep_prefix or ins.has_repne_prefix or ins.has_segment_prefix:
             raise ValueError(f"unsupported instruction prefix at RVA {ins.ip:#x}: {ins}")
-        if ins.op_mask != R.NONE or ins.zeroing_masking or ins.is_broadcast:
+        if (ins.op_code().encoding == EncodingKind.EVEX or ins.op_mask != R.NONE
+                or ins.zeroing_masking or ins.is_broadcast):
             raise ValueError(f"unsupported EVEX instruction at RVA {ins.ip:#x}: {ins}")
         mnemonic = ins.mnemonic
-        if mnemonic in MEMORY_DOMAIN_AVX2:
-            raise ValueError(f"unsupported memory-domain AVX2 instruction at RVA {ins.ip:#x}: {ins}")
         if mnemonic in REGISTER_ONLY_AVX2 and any(
                 ins.op_kind(i) == OpKind.MEMORY for i in range(ins.op_count)):
             raise ValueError(
@@ -442,6 +627,49 @@ def lift_code(name, start, raw):
             helper = SHIFT_HELPERS[mnemonic]
             statements.append(f"{dst} = {helper}({src1}, {src2}, {'true' if wide else 'false'});")
             defined.add(dst_idx)
+        elif ins.code in GATHER_SPECS:
+            helper, count, dst_wide_exp, idx_wide_exp, idx_bits = GATHER_SPECS[ins.code]
+            if ins.op0_kind != OpKind.REGISTER or ins.op1_kind != OpKind.MEMORY or ins.op2_kind != OpKind.REGISTER:
+                raise ValueError(f"unsupported gather operands at RVA {ins.ip:#x}: {ins}")
+            dst_idx, dst_wide = vec_index(ins.op_register(0), ins)
+            mask_idx, mask_wide = vec_index(ins.op_register(2), ins)
+            base_name, disp, scale, idx_idx = vsib_address(ins, idx_wide_exp, idx_bits)
+            if dst_wide != dst_wide_exp or mask_wide != dst_wide_exp:
+                raise ValueError(f"gather operand width mismatch at RVA {ins.ip:#x}: {ins}")
+            if len({dst_idx, idx_idx, mask_idx}) != 3:
+                raise ValueError(
+                    f"overlapping gather registers (dest=ymm{dst_idx}, index=ymm{idx_idx}, mask=ymm{mask_idx}) "
+                    f"at RVA {ins.ip:#x}: {ins}")
+            for reg_idx in (dst_idx, idx_idx, mask_idx):
+                if reg_idx not in defined:
+                    raise ValueError(f"undefined vector register ymm{reg_idx} at RVA {ins.ip:#x}: {ins}")
+                used.add(reg_idx)
+            statements.append(
+                f"{helper}(ymm{dst_idx}, {base_name}, {disp:#x}ull, {scale}ull, "
+                f"ymm{idx_idx}, ymm{mask_idx}, {count}u);")
+        elif ins.code in MASKMOV_SPECS:
+            is_store, elem_bits, wide = MASKMOV_SPECS[ins.code]
+            if is_store:
+                if ins.op0_kind != OpKind.MEMORY or ins.op1_kind != OpKind.REGISTER or ins.op2_kind != OpKind.REGISTER:
+                    raise ValueError(f"unsupported vpmaskmov store operands at RVA {ins.ip:#x}: {ins}")
+                mask_name, mask_wide = read_vec(1, ins)
+                src_name, src_wide = read_vec(2, ins)
+                if mask_wide != wide or src_wide != wide:
+                    raise ValueError(f"vpmaskmov width mismatch at RVA {ins.ip:#x}: {ins}")
+                addr = flat_address(ins)
+                helper = "op_vpmaskmovd_store" if elem_bits == 32 else "op_vpmaskmovq_store"
+                statements.append(f"{helper}({addr}, {mask_name}, {src_name}, {'true' if wide else 'false'});")
+            else:
+                if ins.op0_kind != OpKind.REGISTER or ins.op1_kind != OpKind.REGISTER or ins.op2_kind != OpKind.MEMORY:
+                    raise ValueError(f"unsupported vpmaskmov load operands at RVA {ins.ip:#x}: {ins}")
+                mask_name, mask_wide = read_vec(1, ins)
+                dst_idx, dst_name, dst_wide = write_vec(0, ins)
+                if mask_wide != wide or dst_wide != wide:
+                    raise ValueError(f"vpmaskmov width mismatch at RVA {ins.ip:#x}: {ins}")
+                addr = flat_address(ins)
+                helper = "op_vpmaskmovd_load" if elem_bits == 32 else "op_vpmaskmovq_load"
+                statements.append(f"{dst_name} = {helper}({mask_name}, {addr}, {'true' if wide else 'false'});")
+                defined.add(dst_idx)
         else:
             raise ValueError(f"unsupported instruction at RVA {ins.ip:#x}: {ins}")
 

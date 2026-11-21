@@ -39,3 +39,28 @@ EXPORTS
     op_psrlvq_ymm
     op_zeroupper
     op_pipeline
+    op_gatherdps_xmm
+    op_gatherdps_ymm
+    op_gatherdps_ymm_scale1_disp
+    op_gatherdpd_xmm
+    op_gatherdpd_ymm
+    op_gatherqps_xmm_vm64x
+    op_gatherqps_xmm_vm64y
+    op_gatherqpd_xmm
+    op_gatherqpd_ymm
+    op_pgatherdd_xmm
+    op_pgatherdd_ymm
+    op_pgatherdq_xmm
+    op_pgatherdq_ymm
+    op_pgatherqd_xmm_vm64x
+    op_pgatherqd_xmm_vm64y
+    op_pgatherqq_xmm
+    op_pgatherqq_ymm
+    op_pmaskmovd_load_xmm
+    op_pmaskmovd_load_ymm
+    op_pmaskmovq_load_xmm
+    op_pmaskmovq_load_ymm
+    op_pmaskmovd_store_xmm
+    op_pmaskmovd_store_ymm
+    op_pmaskmovq_store_xmm
+    op_pmaskmovq_store_ymm

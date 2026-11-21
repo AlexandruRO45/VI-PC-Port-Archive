@@ -434,4 +434,312 @@ op_pipeline PROC FRAME
     ret
 op_pipeline ENDP
 
+; --- Memory-domain AVX2: indexed gathers (VSIB) ---
+; ABI for gather exports:
+;   RCX = const void* base (inside caller-owned guarded data buffer)
+;   RDX = const void* ctrl (96 bytes: [0..31]=init dest, [32..63]=vindex, [64..95]=mask)
+;   R8  = void*       out  (64 bytes: [0..31]=post-gather ymm0, [32..63]=post-gather ymm2 mask)
+
+op_gatherdps_xmm PROC FRAME
+    .endprolog
+    vmovdqu ymm0, YMMWORD PTR [rdx]
+    vmovdqu ymm1, YMMWORD PTR [rdx + 32]
+    vmovdqu ymm2, YMMWORD PTR [rdx + 64]
+    vgatherdps xmm0, DWORD PTR [rcx + xmm1*4], xmm2
+    vmovdqu YMMWORD PTR [r8], ymm0
+    vmovdqu YMMWORD PTR [r8 + 32], ymm2
+    vzeroupper
+    ret
+op_gatherdps_xmm ENDP
+
+op_gatherdps_ymm PROC FRAME
+    .endprolog
+    vmovdqu ymm0, YMMWORD PTR [rdx]
+    vmovdqu ymm1, YMMWORD PTR [rdx + 32]
+    vmovdqu ymm2, YMMWORD PTR [rdx + 64]
+IFDEF ALTER_IMM
+    vgatherdps ymm0, DWORD PTR [rcx + ymm1*4 + 16], ymm2
+ELSE
+    vgatherdps ymm0, DWORD PTR [rcx + ymm1*4], ymm2
+ENDIF
+    vmovdqu YMMWORD PTR [r8], ymm0
+    vmovdqu YMMWORD PTR [r8 + 32], ymm2
+    vzeroupper
+    ret
+op_gatherdps_ymm ENDP
+
+op_gatherdps_ymm_scale1_disp PROC FRAME
+    .endprolog
+    vmovdqu ymm0, YMMWORD PTR [rdx]
+    vmovdqu ymm1, YMMWORD PTR [rdx + 32]
+    vmovdqu ymm2, YMMWORD PTR [rdx + 64]
+    vgatherdps ymm0, DWORD PTR [rcx + ymm1*1 - 16], ymm2
+    vmovdqu YMMWORD PTR [r8], ymm0
+    vmovdqu YMMWORD PTR [r8 + 32], ymm2
+    vzeroupper
+    ret
+op_gatherdps_ymm_scale1_disp ENDP
+
+op_gatherdpd_xmm PROC FRAME
+    .endprolog
+    vmovdqu ymm0, YMMWORD PTR [rdx]
+    vmovdqu ymm1, YMMWORD PTR [rdx + 32]
+    vmovdqu ymm2, YMMWORD PTR [rdx + 64]
+    vgatherdpd xmm0, QWORD PTR [rcx + xmm1*8], xmm2
+    vmovdqu YMMWORD PTR [r8], ymm0
+    vmovdqu YMMWORD PTR [r8 + 32], ymm2
+    vzeroupper
+    ret
+op_gatherdpd_xmm ENDP
+
+op_gatherdpd_ymm PROC FRAME
+    .endprolog
+    vmovdqu ymm0, YMMWORD PTR [rdx]
+    vmovdqu ymm1, YMMWORD PTR [rdx + 32]
+    vmovdqu ymm2, YMMWORD PTR [rdx + 64]
+    vgatherdpd ymm0, QWORD PTR [rcx + xmm1*8 + 16], ymm2
+    vmovdqu YMMWORD PTR [r8], ymm0
+    vmovdqu YMMWORD PTR [r8 + 32], ymm2
+    vzeroupper
+    ret
+op_gatherdpd_ymm ENDP
+
+op_gatherqps_xmm_vm64x PROC FRAME
+    .endprolog
+    vmovdqu ymm0, YMMWORD PTR [rdx]
+    vmovdqu ymm1, YMMWORD PTR [rdx + 32]
+    vmovdqu ymm2, YMMWORD PTR [rdx + 64]
+    vgatherqps xmm0, DWORD PTR [rcx + xmm1*4], xmm2
+    vmovdqu YMMWORD PTR [r8], ymm0
+    vmovdqu YMMWORD PTR [r8 + 32], ymm2
+    vzeroupper
+    ret
+op_gatherqps_xmm_vm64x ENDP
+
+op_gatherqps_xmm_vm64y PROC FRAME
+    .endprolog
+    vmovdqu ymm0, YMMWORD PTR [rdx]
+    vmovdqu ymm1, YMMWORD PTR [rdx + 32]
+    vmovdqu ymm2, YMMWORD PTR [rdx + 64]
+    vgatherqps xmm0, DWORD PTR [rcx + ymm1*4], xmm2
+    vmovdqu YMMWORD PTR [r8], ymm0
+    vmovdqu YMMWORD PTR [r8 + 32], ymm2
+    vzeroupper
+    ret
+op_gatherqps_xmm_vm64y ENDP
+
+op_gatherqpd_xmm PROC FRAME
+    .endprolog
+    vmovdqu ymm0, YMMWORD PTR [rdx]
+    vmovdqu ymm1, YMMWORD PTR [rdx + 32]
+    vmovdqu ymm2, YMMWORD PTR [rdx + 64]
+    vgatherqpd xmm0, QWORD PTR [rcx + xmm1*8], xmm2
+    vmovdqu YMMWORD PTR [r8], ymm0
+    vmovdqu YMMWORD PTR [r8 + 32], ymm2
+    vzeroupper
+    ret
+op_gatherqpd_xmm ENDP
+
+op_gatherqpd_ymm PROC FRAME
+    .endprolog
+    vmovdqu ymm0, YMMWORD PTR [rdx]
+    vmovdqu ymm1, YMMWORD PTR [rdx + 32]
+    vmovdqu ymm2, YMMWORD PTR [rdx + 64]
+    vgatherqpd ymm0, QWORD PTR [rcx + ymm1*8 - 24], ymm2
+    vmovdqu YMMWORD PTR [r8], ymm0
+    vmovdqu YMMWORD PTR [r8 + 32], ymm2
+    vzeroupper
+    ret
+op_gatherqpd_ymm ENDP
+
+op_pgatherdd_xmm PROC FRAME
+    .endprolog
+    vmovdqu ymm0, YMMWORD PTR [rdx]
+    vmovdqu ymm1, YMMWORD PTR [rdx + 32]
+    vmovdqu ymm2, YMMWORD PTR [rdx + 64]
+    vpgatherdd xmm0, DWORD PTR [rcx + xmm1*2 + 8], xmm2
+    vmovdqu YMMWORD PTR [r8], ymm0
+    vmovdqu YMMWORD PTR [r8 + 32], ymm2
+    vzeroupper
+    ret
+op_pgatherdd_xmm ENDP
+
+op_pgatherdd_ymm PROC FRAME
+    .endprolog
+    vmovdqu ymm0, YMMWORD PTR [rdx]
+    vmovdqu ymm1, YMMWORD PTR [rdx + 32]
+    vmovdqu ymm2, YMMWORD PTR [rdx + 64]
+    vpgatherdd ymm0, DWORD PTR [rcx + ymm1*4], ymm2
+    vmovdqu YMMWORD PTR [r8], ymm0
+    vmovdqu YMMWORD PTR [r8 + 32], ymm2
+    vzeroupper
+    ret
+op_pgatherdd_ymm ENDP
+
+op_pgatherdq_xmm PROC FRAME
+    .endprolog
+    vmovdqu ymm0, YMMWORD PTR [rdx]
+    vmovdqu ymm1, YMMWORD PTR [rdx + 32]
+    vmovdqu ymm2, YMMWORD PTR [rdx + 64]
+    vpgatherdq xmm0, QWORD PTR [rcx + xmm1*1], xmm2
+    vmovdqu YMMWORD PTR [r8], ymm0
+    vmovdqu YMMWORD PTR [r8 + 32], ymm2
+    vzeroupper
+    ret
+op_pgatherdq_xmm ENDP
+
+op_pgatherdq_ymm PROC FRAME
+    .endprolog
+    vmovdqu ymm0, YMMWORD PTR [rdx]
+    vmovdqu ymm1, YMMWORD PTR [rdx + 32]
+    vmovdqu ymm2, YMMWORD PTR [rdx + 64]
+    vpgatherdq ymm0, QWORD PTR [rcx + xmm1*8], ymm2
+    vmovdqu YMMWORD PTR [r8], ymm0
+    vmovdqu YMMWORD PTR [r8 + 32], ymm2
+    vzeroupper
+    ret
+op_pgatherdq_ymm ENDP
+
+op_pgatherqd_xmm_vm64x PROC FRAME
+    .endprolog
+    vmovdqu ymm0, YMMWORD PTR [rdx]
+    vmovdqu ymm1, YMMWORD PTR [rdx + 32]
+    vmovdqu ymm2, YMMWORD PTR [rdx + 64]
+    vpgatherqd xmm0, DWORD PTR [rcx + xmm1*1 - 8], xmm2
+    vmovdqu YMMWORD PTR [r8], ymm0
+    vmovdqu YMMWORD PTR [r8 + 32], ymm2
+    vzeroupper
+    ret
+op_pgatherqd_xmm_vm64x ENDP
+
+op_pgatherqd_xmm_vm64y PROC FRAME
+    .endprolog
+    vmovdqu ymm0, YMMWORD PTR [rdx]
+    vmovdqu ymm1, YMMWORD PTR [rdx + 32]
+    vmovdqu ymm2, YMMWORD PTR [rdx + 64]
+    vpgatherqd xmm0, DWORD PTR [rcx + ymm1*4 + 12], xmm2
+    vmovdqu YMMWORD PTR [r8], ymm0
+    vmovdqu YMMWORD PTR [r8 + 32], ymm2
+    vzeroupper
+    ret
+op_pgatherqd_xmm_vm64y ENDP
+
+op_pgatherqq_xmm PROC FRAME
+    .endprolog
+    vmovdqu ymm0, YMMWORD PTR [rdx]
+    vmovdqu ymm1, YMMWORD PTR [rdx + 32]
+    vmovdqu ymm2, YMMWORD PTR [rdx + 64]
+    vpgatherqq xmm0, QWORD PTR [rcx + xmm1*8], xmm2
+    vmovdqu YMMWORD PTR [r8], ymm0
+    vmovdqu YMMWORD PTR [r8 + 32], ymm2
+    vzeroupper
+    ret
+op_pgatherqq_xmm ENDP
+
+op_pgatherqq_ymm PROC FRAME
+    .endprolog
+    vmovdqu ymm0, YMMWORD PTR [rdx]
+    vmovdqu ymm1, YMMWORD PTR [rdx + 32]
+    vmovdqu ymm2, YMMWORD PTR [rdx + 64]
+    vpgatherqq ymm0, QWORD PTR [rcx + ymm1*8], ymm2
+    vmovdqu YMMWORD PTR [r8], ymm0
+    vmovdqu YMMWORD PTR [r8 + 32], ymm2
+    vzeroupper
+    ret
+op_pgatherqq_ymm ENDP
+
+; --- Memory-domain AVX2: masked loads and stores ---
+; ABI for vpmaskmov load exports:
+;   RCX = const void* src_mem
+;   RDX = const void* ctrl (64 bytes: [0..31]=pre-seed ymm0, [32..63]=mask ymm1)
+;   R8  = void*       out  (64 bytes: [0..31]=post-load ymm0, [32..63]=post-load ymm1 mask)
+; ABI for vpmaskmov store exports:
+;   RCX = const void* src_vec (32 bytes -> ymm2)
+;   RDX = const void* mask_vec (32 bytes -> ymm1)
+;   R8  = void*       dst_mem (pre-seeded memory destination)
+
+op_pmaskmovd_load_xmm PROC FRAME
+    .endprolog
+    vmovdqu ymm0, YMMWORD PTR [rdx]
+    vmovdqu ymm1, YMMWORD PTR [rdx + 32]
+    vpmaskmovd xmm0, xmm1, XMMWORD PTR [rcx]
+    vmovdqu YMMWORD PTR [r8], ymm0
+    vmovdqu YMMWORD PTR [r8 + 32], ymm1
+    vzeroupper
+    ret
+op_pmaskmovd_load_xmm ENDP
+
+op_pmaskmovd_load_ymm PROC FRAME
+    .endprolog
+    vmovdqu ymm0, YMMWORD PTR [rdx]
+    vmovdqu ymm1, YMMWORD PTR [rdx + 32]
+IFDEF ALTER_IMM
+    vpmaskmovd ymm0, ymm1, YMMWORD PTR [rcx + 16]
+ELSE
+    vpmaskmovd ymm0, ymm1, YMMWORD PTR [rcx]
+ENDIF
+    vmovdqu YMMWORD PTR [r8], ymm0
+    vmovdqu YMMWORD PTR [r8 + 32], ymm1
+    vzeroupper
+    ret
+op_pmaskmovd_load_ymm ENDP
+
+op_pmaskmovq_load_xmm PROC FRAME
+    .endprolog
+    vmovdqu ymm0, YMMWORD PTR [rdx]
+    vmovdqu ymm1, YMMWORD PTR [rdx + 32]
+    vpmaskmovq xmm0, xmm1, XMMWORD PTR [rcx]
+    vmovdqu YMMWORD PTR [r8], ymm0
+    vmovdqu YMMWORD PTR [r8 + 32], ymm1
+    vzeroupper
+    ret
+op_pmaskmovq_load_xmm ENDP
+
+op_pmaskmovq_load_ymm PROC FRAME
+    .endprolog
+    vmovdqu ymm0, YMMWORD PTR [rdx]
+    vmovdqu ymm1, YMMWORD PTR [rdx + 32]
+    vpmaskmovq ymm0, ymm1, YMMWORD PTR [rcx]
+    vmovdqu YMMWORD PTR [r8], ymm0
+    vmovdqu YMMWORD PTR [r8 + 32], ymm1
+    vzeroupper
+    ret
+op_pmaskmovq_load_ymm ENDP
+
+op_pmaskmovd_store_xmm PROC FRAME
+    .endprolog
+    vmovdqu ymm2, YMMWORD PTR [rcx]
+    vmovdqu ymm1, YMMWORD PTR [rdx]
+    vpmaskmovd XMMWORD PTR [r8], xmm1, xmm2
+    vzeroupper
+    ret
+op_pmaskmovd_store_xmm ENDP
+
+op_pmaskmovd_store_ymm PROC FRAME
+    .endprolog
+    vmovdqu ymm2, YMMWORD PTR [rcx]
+    vmovdqu ymm1, YMMWORD PTR [rdx]
+    vpmaskmovd YMMWORD PTR [r8], ymm1, ymm2
+    vzeroupper
+    ret
+op_pmaskmovd_store_ymm ENDP
+
+op_pmaskmovq_store_xmm PROC FRAME
+    .endprolog
+    vmovdqu ymm2, YMMWORD PTR [rcx]
+    vmovdqu ymm1, YMMWORD PTR [rdx]
+    vpmaskmovq XMMWORD PTR [r8], xmm1, xmm2
+    vzeroupper
+    ret
+op_pmaskmovq_store_xmm ENDP
+
+op_pmaskmovq_store_ymm PROC FRAME
+    .endprolog
+    vmovdqu ymm2, YMMWORD PTR [rcx]
+    vmovdqu ymm1, YMMWORD PTR [rdx]
+    vpmaskmovq YMMWORD PTR [r8], ymm1, ymm2
+    vzeroupper
+    ret
+op_pmaskmovq_store_ymm ENDP
+
 END
