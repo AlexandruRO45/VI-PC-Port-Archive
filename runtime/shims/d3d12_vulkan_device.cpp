@@ -166,6 +166,8 @@ struct DeviceState {
     std::unique_ptr<leonida::BindlessSet> bindless;
     leonida::BindlessRegistry bindless_registry;
     leonida::RetirementQueue retirement;
+    std::map<leonida::DescriptorKey, VkSampler> samplers;  // live S# -> VkSampler, retired on replacement
+    std::uint64_t retire_timeline = 0;
 
     std::uint64_t next_console_va = 0x100000000ull;
     std::uint64_t allocate_va(std::uint64_t bytes) {
@@ -300,6 +302,7 @@ public:
 
     leonida::ResourceId id() const { return resource_id(this); }
     VkImage image() const { return image_; }
+    VkBuffer buffer() const { return buffer_; }
     std::uint64_t console_va() const { return console_va_; }
     UINT64 STDMETHODCALLTYPE GetGPUVirtualAddress() override { return console_va_; }
 
@@ -1153,8 +1156,24 @@ public:
         }
         const leonida::DescriptorKey key = leonida::make_ssharp_key(words.data());
         state_.bindless->insert_key(key, index);
+        // Replacing an S# retires the old VkSampler at the next timeline value; the collect() below runs only after
+        // the queue is idle, so no command buffer can still be sampling through it.
+        if (const auto it = state_.samplers.find(key); it != state_.samplers.end()) {
+            const VkSampler old = it->second;
+            state_.retirement.retire(++state_.retire_timeline,
+                                     [vk = state_.context->vk, device = state_.info.device, old] {
+                                         vk.vkDestroySampler(device, old, nullptr);
+                                     });
+            it->second = vk_sampler;
+        } else {
+            state_.samplers.emplace(key, vk_sampler);
+        }
         if (state_.bindless->flush_needs_idle()) state_.context->vk.vkDeviceWaitIdle(state_.info.device);
         state_.bindless->flush();
+        if (state_.retire_timeline) {
+            state_.context->vk.vkDeviceWaitIdle(state_.info.device);
+            state_.retirement.collect(state_.retire_timeline);
+        }
     }
     void STDMETHODCALLTYPE CreateUnorderedAccessView(ID3D12Resource* resource,
                                                      ID3D12Resource* counter_resource,
@@ -1225,9 +1244,12 @@ public:
                 s_at = 0;
                 continue;
             }
+            // The handles name the start of the range; d_at/s_at is how far into it this pass already copied. Both
+            // sides must be offset, or a multi-range copy writes its second pass over the first one.
             const UINT copied = rt::d3d12::copy_slots_between(
-                destination_heap->base(), destination_heap->slot_count(), d_slot, source_heap->base(),
-                source_heap->slot_count(), s_slot, destination_heap->stride(), std::min(d_size - d_at, s_size - s_at));
+                destination_heap->base(), destination_heap->slot_count(), d_slot + d_at, source_heap->base(),
+                source_heap->slot_count(), s_slot + s_at, destination_heap->stride(),
+                std::min(d_size - d_at, s_size - s_at));
             if (!copied) {
                 ++d;
                 d_at = 0;
@@ -1235,7 +1257,7 @@ public:
                 s_at = 0;
                 continue;
             }
-            destination_heap->mark_dirty(d_slot, copied);
+            destination_heap->mark_dirty(d_slot + d_at, copied);
             d_at += copied;
             s_at += copied;
             if (d_at >= d_size) {
@@ -1537,6 +1559,7 @@ public:
         return resource ? resource->id() : 0;
     }
     leonida::RetirementQueue& retirement() { return state_.retirement; }
+    DeviceState& mutable_state() { return state_; }
 
     void create_bindless(PFN_vkGetDeviceProcAddr get_device_proc) {
         if (state_.bindless || !get_device_proc) return;
@@ -1585,6 +1608,17 @@ VkImage vulkan_image(ID3D12Resource* resource) {
 VkPipeline vulkan_pipeline(ID3D12PipelineState* state) {
     const PipelineState* p = PipelineState::from<PipelineState>(state);
     return p ? p->pipeline() : VK_NULL_HANDLE;
+}
+
+VkBuffer vulkan_buffer_for_va(ID3D12Device* device, std::uint64_t va, std::uint64_t* base_va) {
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (!real) real = device;
+    Device* d = Device::from<Device>(real);
+    if (!d) return VK_NULL_HANDLE;
+    Resource* resource = resource_for_va(d->mutable_state(), va);
+    if (!resource) return VK_NULL_HANDLE;
+    if (base_va) *base_va = resource->console_va();
+    return resource->buffer();
 }
 
 std::uint32_t device_max_push_constants_size(ID3D12Device* device) {

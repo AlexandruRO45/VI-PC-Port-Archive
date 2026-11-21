@@ -483,6 +483,11 @@ struct ReplayFunctions {
     PFN_vkCmdDrawIndexed draw_indexed = nullptr;
     PFN_vkCmdSetViewport set_viewport = nullptr;
     PFN_vkCmdSetScissor set_scissor = nullptr;
+    PFN_vkCmdBindVertexBuffers bind_vertex_buffers = nullptr;
+    PFN_vkCmdBindIndexBuffer bind_index_buffer = nullptr;
+    // console/GPU VA -> VkBuffer, with the buffer's base VA so an offset view can be expressed.
+    VkBuffer (*buffer_lookup)(std::uint64_t va, std::uint64_t* base_va, void* user) = nullptr;
+    void* buffer_user = nullptr;
     VkViewport viewport{};
     VkRect2D scissor{};
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
@@ -967,6 +972,33 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         if (const auto* pso = std::get_if<SetPipelineState>(&command)) {
             bound_pipeline = vk.pipeline_lookup ? vk.pipeline_lookup(pso->pipeline_state, vk.pipeline_user)
                                                 : VK_NULL_HANDLE;
+            continue;
+        }
+        if (const auto* ia = std::get_if<IASetVertexBuffers>(&command)) {
+            if (!vk.bind_vertex_buffers || !vk.buffer_lookup) continue;
+            std::array<VkBuffer, max_vertex_buffers> buffers{};
+            std::array<VkDeviceSize, max_vertex_buffers> offsets{};
+            std::uint32_t bound = 0;
+            for (const auto& entry : ia->buffers) {
+                std::uint64_t base = 0;
+                const VkBuffer buffer = vk.buffer_lookup(entry.gpu_va, &base, vk.buffer_user);
+                if (!buffer) continue;
+                buffers[bound] = buffer;
+                offsets[bound] = entry.offset + (entry.gpu_va - base);
+                ++bound;
+            }
+            if (bound)
+                vk.bind_vertex_buffers(command_buffer, ia->start_slot, bound, buffers.data(), offsets.data());
+            continue;
+        }
+        if (const auto* ia = std::get_if<IASetIndexBuffer>(&command)) {
+            if (!vk.bind_index_buffer || !vk.buffer_lookup) continue;
+            std::uint64_t base = 0;
+            const VkBuffer buffer = vk.buffer_lookup(ia->gpu_va, &base, vk.buffer_user);
+            if (buffer)
+                vk.bind_index_buffer(command_buffer, buffer,
+                                     ia->offset + (ia->gpu_va - base),
+                                     ia->format == 57u ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
             continue;
         }
         if (const auto* draw = std::get_if<DrawInstanced>(&command)) {

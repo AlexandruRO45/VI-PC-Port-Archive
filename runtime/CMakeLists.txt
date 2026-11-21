@@ -389,6 +389,7 @@ if(Vulkan_FOUND)
     target_link_libraries(d3d12_descriptor_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_descriptor_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_descriptor_test PRIVATE /W4 /permissive- /utf-8)
+  add_test(NAME d3d12_descriptor COMMAND d3d12_descriptor_test)
 
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
     if(TARGET gta6rt)
@@ -427,6 +428,13 @@ if(Vulkan_FOUND)
   target_compile_definitions(first_draw_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(first_draw_test PRIVATE /W4 /permissive- /utf-8)
   add_test(NAME first_draw COMMAND first_draw_test)
+  # Textured quad: bindless texture/sampler arrays, push-constant index and IR input assembly (PR C/M1).
+  add_executable(first_texture_test test/first_texture_test.cpp)
+  target_include_directories(first_texture_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(first_texture_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  target_compile_definitions(first_texture_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(first_texture_test PRIVATE /W4 /permissive- /utf-8)
+  add_test(NAME first_texture COMMAND first_texture_test)
   # D3D12 view -> GFX10 descriptor encoders (P2 of docs/d3d12_vulkan_analysis.md). Needs the Vulkan headers for
   # VkFormat, no GPU and no game data.
   add_executable(descriptor_scan_test test/descriptor_scan_test.cpp)

@@ -176,12 +176,21 @@ public:
                                  "separateDepthStencilLayouts\n");
             return false;
         }
+        // The bindless set samples texture arrays indexed by a push constant, so the tests need descriptor indexing.
+        const bool bindless_ok = features12.descriptorIndexing && features12.runtimeDescriptorArray &&
+                                 features12.shaderSampledImageArrayNonUniformIndexing;
         VkPhysicalDeviceVulkan13Features enable13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
         enable13.dynamicRendering = VK_TRUE;
         enable13.synchronization2 = VK_TRUE;
         VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable13};
         enable12.timelineSemaphore = VK_TRUE;
         enable12.separateDepthStencilLayouts = VK_TRUE;
+        if (bindless_ok) {
+            enable12.descriptorIndexing = VK_TRUE;
+            enable12.runtimeDescriptorArray = VK_TRUE;
+            enable12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+            enable12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+        }
 
         const float priority = 1.0f;
         VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};

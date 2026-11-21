@@ -301,6 +301,7 @@ struct ClearDepthStencil {
 // resolves the handles to heaps and descriptors; until draws exist the commands are recorded and validated only.
 inline constexpr std::uint32_t max_descriptor_heaps = 2;  // D3D12 allows one CBV/SRV/UAV and one sampler heap
 inline constexpr std::uint32_t max_root_parameters = 64;
+inline constexpr std::uint32_t max_vertex_buffers = 32;
 
 struct SetDescriptorHeaps {
     std::vector<std::uintptr_t> heaps;
@@ -346,11 +347,31 @@ struct DrawIndexedInstanced {
     std::uint32_t start_instance;
 };
 
+// Input assembly (the last D3D12 state the draw path needs). A view names its buffer by console/GPU VA, which the
+// replay resolves to the VkBuffer through the device's VA map; the COM layer only ever sees a VA.
+struct VertexBufferBinding {
+    std::uint64_t gpu_va;
+    std::uint32_t stride;
+    std::uint32_t offset;
+};
+
+struct IASetVertexBuffers {
+    std::uint32_t start_slot;
+    std::vector<VertexBufferBinding> buffers;
+};
+
+struct IASetIndexBuffer {
+    std::uint64_t gpu_va;
+    std::uint32_t offset;
+    std::uint32_t format;  // DXGI_FORMAT_R16_UINT or DXGI_FORMAT_R32_UINT
+};
+
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
                              CopyResource, ResolveSubresource, SetDescriptorHeaps, SetGraphicsRootDescriptorTable,
                              SetComputeRootDescriptorTable, SetPipelineState, SetGraphicsRootSignature,
-                             SetComputeRootSignature, DrawInstanced, DrawIndexedInstanced>;
+                             SetComputeRootSignature, DrawInstanced, DrawIndexedInstanced, IASetVertexBuffers,
+                             IASetIndexBuffer>;
 
 class CommandList {
 public:
@@ -473,6 +494,24 @@ public:
         return append(SetComputeRootSignature{root_signature});
     }
 
+    // Input assembly. Up to 32 slots, non-zero VAs, a stride the vertex stage can walk and the two index widths the
+    // PC ABI uses; anything else is the caller's bug.
+    bool set_vertex_buffers(std::uint32_t start_slot, std::span<const VertexBufferBinding> buffers) {
+        if (closed_ || buffers.empty() || start_slot >= max_vertex_buffers ||
+            start_slot + buffers.size() > max_vertex_buffers)
+            return false;
+        for (const auto& buffer : buffers)
+            if (!buffer.gpu_va || !buffer.stride) return false;
+        IASetVertexBuffers command{start_slot, {}};
+        command.buffers.assign(buffers.begin(), buffers.end());
+        return append(std::move(command));
+    }
+
+    bool set_index_buffer(std::uint64_t gpu_va, std::uint32_t offset, std::uint32_t format) {
+        if (closed_ || !gpu_va) return false;
+        if (format != 57u /*DXGI_FORMAT_R16_UINT*/ && format != 42u /*DXGI_FORMAT_R32_UINT*/) return false;
+        return append(IASetIndexBuffer{gpu_va, offset, format});
+    }
     // Draws. Only the counts that D3D12 itself requires are checked here: a zero vertex/index count or a zero
     // instance count is invalid; the vertex/index buffers, PSO and root signature are checked at replay.
     bool draw_instanced(std::uint32_t vertex_count_per_instance, std::uint32_t instance_count = 1,

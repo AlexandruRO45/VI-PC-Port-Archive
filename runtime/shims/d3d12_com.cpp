@@ -99,6 +99,22 @@ public:
         check(list_.set_descriptor_heaps(ids));
     }
 
+    void STDMETHODCALLTYPE IASetVertexBuffers(UINT start_slot, UINT views,
+                                              const D3D12_VERTEX_BUFFER_VIEW* vertex_buffers) override {
+        if (!vertex_buffers || !views) return;
+        std::vector<leonida::VertexBufferBinding> bindings(views);
+        for (UINT i = 0; i < views; ++i) {
+            bindings[i].gpu_va = vertex_buffers[i].BufferLocation;
+            bindings[i].stride = vertex_buffers[i].StrideInBytes;
+            bindings[i].offset = 0;
+        }
+        check(list_.set_vertex_buffers(start_slot, bindings));
+    }
+
+    void STDMETHODCALLTYPE IASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW* view) override {
+        if (!view) return;
+        check(list_.set_index_buffer(view->BufferLocation, 0, view->Format));
+    }
     void STDMETHODCALLTYPE SetPipelineState(ID3D12PipelineState* pipeline_state) override {
         if (pipeline_state) check(list_.set_pipeline_state(reinterpret_cast<std::uintptr_t>(pipeline_state)));
     }
