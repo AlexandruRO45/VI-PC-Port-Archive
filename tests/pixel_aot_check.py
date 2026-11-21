@@ -1838,13 +1838,17 @@ def check_render(directory, compiler, renderer, backend):
 
     # The NVIDIA driver (32.0.16.2124, RTX 5060 Ti) refuses PSO creation for the curve program
     # under -denorm preserve (E_OUTOFMEMORY). Its rows contain no binary32 subnormals, so the
-    # mode cannot change the exported bits; record this fixture's mode as any, not the assumption.
+    # mode cannot change the exported bits; record this fixture's mode as any, not the assumption,
+    # and assert that mode independence on every expected word instead of arguing it.
     for program_fn, case_fn, mode in ((curve, curve_case, "any"),
                                       (shaping, shaping_case, F32_DENORM_MODE)):
         source.write_text(translate(program_fn()), encoding="ascii")
         compile_shader(compiler, source, shader, mode=mode)
         for gain in (.75, 1.125):
             case = case_fn(directory, gain)
+            if mode != F32_DENORM_MODE:
+                words = struct.unpack("<256f", case.read_bytes()[256:1280])
+                assert all(flush_ftz(word) == word for word in words), program_fn.__name__
             draw = [renderer, backend, "--check-pixel-case", shader, case]
             subprocess.run(draw, check=True)
         corrupted = bytearray(case.read_bytes())
