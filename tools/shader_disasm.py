@@ -115,11 +115,13 @@ def one(path, out, mcpu):
         FAILED.append((path, reason))
         return "failed"
     name = os.path.splitext(os.path.basename(path))[0]
-    with open(os.path.join(out, name + ".s"), "w", encoding="utf-8") as f:
+    path = os.path.join(out, name + ".s")
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
         f.write(f"; {name}  code 0x{start:x}..0x{end:x} ({how}), {mcpu}, {bad} invalid words\n")
         f.write(asm)
         if err.strip():
             f.write("\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n")
+    os.replace(path + ".tmp", path)
     return "clean" if bad == 0 else "invalid words"
 
 

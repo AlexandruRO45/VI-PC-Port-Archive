@@ -273,6 +273,23 @@ def check(game: str, full: bool) -> dict:
 
 
 # ---------------------------------------------------------------- shaders
+def shader_files(folder: str, suffix: str) -> set[str]:
+    if not os.path.isdir(folder):
+        return set()
+    with os.scandir(folder) as entries:
+        return {e.name[:-len(suffix)] for e in entries
+                if e.name.endswith(suffix) and e.is_file() and e.stat().st_size > 0}
+
+
+def translated(spirv: str, expected: set[str]) -> bool:
+    try:
+        with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
+            index = json.load(f)
+    except (FileNotFoundError, ValueError):
+        return False
+    return isinstance(index, dict) and expected == index.keys() and expected <= shader_files(spirv, ".spv")
+
+
 def shaders(game: str, work: str, jobs: int) -> None:
     src = os.path.join(game, "shaders.rpf")
     sh = os.path.join(work, "shaders")
@@ -280,9 +297,15 @@ def shaders(game: str, work: str, jobs: int) -> None:
     if not os.path.isfile(os.path.join(dxbc, "index.json")):
         log("shaders: carving shaders.rpf")
         py("shader_carve.py", src, dxbc)
-    if not os.path.isdir(os.path.join(dxbc, "fssm")):
+    expected = shader_files(dxbc, ".dxbc")
+    if not expected:
+        fail("shaders: no carved DXBC files")
+    native = os.path.join(dxbc, "fssm")
+    if not os.path.isfile(os.path.join(dxbc, "fssm_index.json")) or shader_files(native, ".fssm") != expected:
         log("shaders: unpacking native code")
         py("fssm_unpack.py", dxbc)
+        if shader_files(native, ".fssm") != expected:
+            fail("shaders: incomplete native code after unpacking")
     # rdna2spirv.py finds index.json, the .dxbc files and fssm/ in the parent of the .s files' folder, so the
     # disassembly must sit inside the carve folder: next to it, every stage reads as "?" and is rejected.
     disasm = os.path.join(dxbc, "disasm")
@@ -291,23 +314,30 @@ def shaders(game: str, work: str, jobs: int) -> None:
         log("shaders: moving disasm into the carve folder and translating again")
         os.rename(old, disasm)
         shutil.rmtree(os.path.join(sh, "spirv"), ignore_errors=True)
-    if not os.path.isdir(disasm) or len(os.listdir(disasm)) < 1000:
+    if shader_files(disasm, ".s") != expected:
         need(os.environ.get("LLVM_MC", "llvm-mc"),
              "Install LLVM 21 or newer with the AMDGPU target, or set LLVM_MC to llvm-mc's full path.")
         log("shaders: disassembling (gfx1013)")
         py("shader_disasm.py", os.path.join(dxbc, "fssm"), "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs)
+        if shader_files(disasm, ".s") != expected:
+            fail("shaders: incomplete disassembly")
     spirv = os.path.join(sh, "spirv")
-    if not os.path.isdir(spirv) or len(os.listdir(spirv)) < 1000:
+    if not translated(spirv, expected):
         need("spirv-as", "Install the Vulkan SDK (it includes spirv-as and spirv-val) and reopen the terminal.")
         need("spirv-val", "Install the Vulkan SDK and reopen the terminal.")
         log(f"shaders: translating RDNA2 to SPIR-V on {jobs} processes (the longest step)")
         translate(disasm, spirv, jobs)
+        if not translated(spirv, expected):
+            fail("shaders: merged index or translated modules are incomplete")
     log("shaders: done")
 
 
 def translate(disasm: str, spirv: str, jobs: int) -> None:
     """rdna2spirv.py runs on one core: start one --shard per job side by side, then merge their index parts."""
     os.makedirs(spirv, exist_ok=True)
+    index = os.path.join(spirv, "index.json")
+    if os.path.isfile(index):
+        os.remove(index)  # publish a fresh index only after all shards and stubs finish
     for f in os.listdir(spirv):  # parts from an earlier run with another --jobs would be merged in too
         if f.startswith("index.part") and f.endswith(".json"):
             os.remove(os.path.join(spirv, f))
@@ -378,17 +408,32 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
     if not os.path.isdir(xma_dir):
         log("assets: XMA2 streams")
         run([exe, "xma", os.path.join(game, "audio.rpf"), out])
-        ff = shutil.which("ffmpeg")
-        if ff:
-            log("assets: XMA2 -> PCM WAV (ffmpeg)")
-            for root, _, files in os.walk(xma_dir):
-                for f in files:
-                    if f.endswith(".xma.wav"):
-                        src = os.path.join(root, f)
-                        subprocess.run([ff, "-v", "error", "-y", "-i", src, "-c:a", "pcm_s16le", src[:-8] + ".wav"])
-        else:
-            log("assets: ffmpeg not on PATH: XMA2 streams kept as .xma.wav (ffmpeg decodes them)")
+    decode_xma(xma_dir)
     log("assets: done")
+
+
+def decode_xma(folder: str) -> None:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        log("assets: XMA2 streams kept; rerun with ffmpeg on PATH to decode them")
+        return
+    for root, _, files in os.walk(folder):
+        for name in files:
+            if not name.endswith(".xma.wav"):
+                continue
+            src = os.path.join(root, name)
+            dst = src.removesuffix(".xma.wav") + ".wav"
+            if os.path.isfile(dst) and os.path.getsize(dst) > 0:
+                continue
+            tmp = dst + ".part.wav"
+            try:
+                result = subprocess.run([ffmpeg, "-v", "error", "-y", "-i", src, "-c:a", "pcm_s16le", tmp])
+                if result.returncode:
+                    fail(f"ffmpeg exited with {result.returncode} decoding {src}")
+                os.replace(tmp, dst)
+            finally:
+                if os.path.isfile(tmp):
+                    os.remove(tmp)
 
 
 # ---------------------------------------------------------------- runtime
