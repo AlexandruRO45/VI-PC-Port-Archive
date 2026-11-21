@@ -121,6 +121,10 @@ public:
     leonida::SubgroupSizeCaps subgroup;
     bool custom_border_color = false;  // VK_EXT_custom_border_color and customBorderColors enabled
     bool custom_border_color_without_format = false;
+    // VK_KHR_fragment_shading_rate with pipelineFragmentShadingRate (and attachmentFragmentShadingRate), when
+    // create() was asked for it and the GPU has it.
+    bool fragment_shading_rate = false;
+    bool attachment_fragment_shading_rate = false;
 
     Device() = default;
     Device(const Device&) = delete;
@@ -166,9 +170,12 @@ public:
     unsigned known_validation_errors() const { return known_validation_error_count(); }
 
     // presentation: also enable VK_KHR_surface + VK_KHR_win32_surface and VK_KHR_swapchain (Windows only).
-    bool create(bool presentation = false) { return initialize(presentation) == DeviceStatus::ready; }
+    // shading_rate: also enable VK_KHR_fragment_shading_rate where the GPU has it (see fragment_shading_rate).
+    bool create(bool presentation = false, bool shading_rate = false) {
+        return initialize(presentation, shading_rate) == DeviceStatus::ready;
+    }
 
-    DeviceStatus initialize(bool presentation = false) {
+    DeviceStatus initialize(bool presentation = false, bool shading_rate = false) {
         const auto failure = [](const char* call, VkResult result) {
             std::fprintf(stderr, "%s failed (VkResult %d)\n", call, static_cast<int>(result));
             return DeviceStatus::failed;
@@ -576,6 +583,23 @@ public:
         if (shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 #endif
         if (custom_border_color) device_extensions.push_back(custom_border_color_name);
+        VkPhysicalDeviceFragmentShadingRateFeaturesKHR enable_rate{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR};
+        if (shading_rate && has_device_extension(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME)) {
+            VkPhysicalDeviceFragmentShadingRateFeaturesKHR rate{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR};
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &rate};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            if (rate.pipelineFragmentShadingRate) {
+                enable_rate.pipelineFragmentShadingRate = VK_TRUE;
+                enable_rate.attachmentFragmentShadingRate = rate.attachmentFragmentShadingRate;
+                enable_rate.pNext = *v13_.next();  // where later feature structs go since #1706
+                *v13_.next() = &enable_rate;
+                device_extensions.push_back(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
+                fragment_shading_rate = true;
+                attachment_fragment_shading_rate = rate.attachmentFragmentShadingRate == VK_TRUE;
+            }
+        }
         device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
         device_info.ppEnabledExtensionNames = device_extensions.data();
         result = instance_fn<PFN_vkCreateDevice>("vkCreateDevice")(physical, &device_info, nullptr, &device);
@@ -594,6 +618,18 @@ public:
         pool.queueFamilyIndex = family;
         result = fn<PFN_vkCreateCommandPool>("vkCreateCommandPool")(device, &pool, nullptr, &pool_);
         return result == VK_SUCCESS ? DeviceStatus::ready : failure("vkCreateCommandPool", result);
+    }
+
+    bool has_device_extension(const char* name) const {
+        const auto enumerate =
+            instance_fn<PFN_vkEnumerateDeviceExtensionProperties>("vkEnumerateDeviceExtensionProperties");
+        std::uint32_t count = 0;
+        enumerate(physical, nullptr, &count, nullptr);
+        std::vector<VkExtensionProperties> extensions(count);
+        enumerate(physical, nullptr, &count, extensions.data());
+        for (const auto& extension : extensions)
+            if (std::strcmp(extension.extensionName, name) == 0) return true;
+        return false;
     }
 
     bool depth_format_usable(VkFormat format) const {

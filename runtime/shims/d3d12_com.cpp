@@ -310,7 +310,8 @@ public:
         record_dispatch(x, y, z);
     }
 
-    // ClearState returns every piece of list state to its default, as Reset does (stencil references included).
+    // ClearState returns every piece of list state to its default, as Reset does (stencil references and the
+    // shading rate, combiners and rate image included).
     void STDMETHODCALLTYPE ClearState(ID3D12PipelineState* state) override {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         reset_state(state);
@@ -791,6 +792,35 @@ public:
         check(list_.copy_acceleration_structure({dest, source, static_cast<std::uint32_t>(mode)}));
     }
 
+    // GCL5: variable rate shading, applied at each draw through VK_KHR_fragment_shading_rate (vulkan_replay.h).
+    // A null combiner array means {passthrough, passthrough}, and a combiner outside the enum combines as
+    // passthrough, both as D3D12 documents them. A rate outside the enum is an invalid call. In a bundle both calls
+    // are deferred like the other state calls, so the rate is the executing list's afterwards.
+    void STDMETHODCALLTYPE RSSetShadingRate(D3D12_SHADING_RATE rate,
+                                            const D3D12_SHADING_RATE_COMBINER* combiners) override {
+        namespace vrs = leonida::d3d12_shading_rate;
+        if (!vrs::valid_rate(u(rate))) return check(false);
+        std::array<std::uint32_t, 2> combined{};
+        for (std::size_t i = 0; i < combined.size(); ++i) {
+            const std::uint32_t combiner = combiners ? u(combiners[i]) : vrs::combiner_passthrough;
+            combined[i] = combiner <= vrs::combiner_sum ? combiner : vrs::combiner_passthrough;
+        }
+        const std::uint32_t value = u(rate);
+        const auto apply = [=](GraphicsCommandList& l) {
+            l.shading_rate_ = value;
+            l.shading_rate_combiners_ = combined;
+        };
+        if (defer(apply)) return;
+        apply(*this);
+    }
+
+    // The image is read at each draw, which is when D3D12 requires it to be in SHADING_RATE_SOURCE. Null unbinds it.
+    void STDMETHODCALLTYPE RSSetShadingRateImage(ID3D12Resource* image) override {
+        const leonida::ResourceId id = resource_id(image);
+        if (defer([=](GraphicsCommandList& l) { l.shading_rate_image_ = id; })) return;
+        shading_rate_image_ = id;
+    }
+
     static GraphicsCommandList* from(IUnknown* object) { return Child::from<GraphicsCommandList>(object); }
 
 private:
@@ -996,6 +1026,9 @@ private:
     bool draw_views_stale_ = true;
     leonida::TargetView depth_{};
     std::array<float, 4> blend_factor_{1, 1, 1, 1};
+    std::uint32_t shading_rate_ = leonida::d3d12_shading_rate::rate_1x1;
+    std::array<std::uint32_t, 2> shading_rate_combiners_{};  // passthrough, passthrough
+    leonida::ResourceId shading_rate_image_ = 0;
 
     // The root signatures and pipeline states this recording uses. D3D12 lets an application release them right
     // after Set*RootSignature / SetPipelineState; the list keeps them until Reset or its own release, so the root
@@ -1061,6 +1094,9 @@ private:
         draw_views_stale_ = true;
         depth_ = {};
         blend_factor_ = {1, 1, 1, 1};
+        shading_rate_ = leonida::d3d12_shading_rate::rate_1x1;
+        shading_rate_combiners_ = {};
+        shading_rate_image_ = 0;
         set_pipeline(state);
     }
 
@@ -1103,7 +1139,8 @@ private:
         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
         leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, index_, topology_, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances,
-                           first, base_vertex, first_instance};
+                           first, base_vertex, first_instance, shading_rate_, shading_rate_combiners_,
+                           shading_rate_image_};
         check(list_.draw(std::move(draw)));
     }
 };
