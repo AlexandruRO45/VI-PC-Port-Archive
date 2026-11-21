@@ -40,7 +40,7 @@ struct Ref {
 void* slot(void* object, unsigned index) { return (*reinterpret_cast<void***>(object))[index]; }
 
 D3D12_RESOURCE_DESC texture_desc(UINT width, UINT height, DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags,
-                                 UINT16 mips = 1, UINT16 layers = 1) {
+                                 UINT16 mips = 1, UINT16 layers = 1, UINT sample_count = 1) {
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = width;
@@ -48,7 +48,7 @@ D3D12_RESOURCE_DESC texture_desc(UINT width, UINT height, DXGI_FORMAT format, D3
     desc.DepthOrArraySize = layers;
     desc.MipLevels = mips;
     desc.Format = format;
-    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Count = sample_count;
     desc.Flags = flags;
     return desc;
 }
@@ -180,6 +180,57 @@ int compare_footprints(ID3D12Device* ours) {
     return mismatches;
 }
 
+// GetResourceAllocationInfo must match the PC runtime's exactly, since applications use it to compute
+// resource sizes and alignments. Returns the number of mismatches, or -1 when the host has no D3D12 device.
+int compare_allocation_info(ID3D12Device* ours) {
+    const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const auto create = d3d12 ? reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
+                                    reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
+                              : nullptr;
+    Ref<ID3D12Device> host;
+    if (!create || FAILED(create(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) return -1;
+
+    struct Case {
+        D3D12_RESOURCE_DESC desc;
+    };
+    const Case cases[] = {
+        {buffer_desc(300)},
+        {buffer_desc(1024 * 1024)},
+        {texture_desc(8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 1, 1)},
+        {texture_desc(8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 4, 2)},
+        {texture_desc(13, 7, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_NONE, 4)},
+        {texture_desc(10, 6, DXGI_FORMAT_BC1_UNORM, D3D12_RESOURCE_FLAG_NONE, 4)},
+        {texture_desc(4, 4, DXGI_FORMAT_BC7_UNORM_SRGB, D3D12_RESOURCE_FLAG_NONE, 1, 3)},
+        {texture_desc(16, 16, DXGI_FORMAT_BC5_UNORM, D3D12_RESOURCE_FLAG_NONE, 5)},
+        {texture_desc(8, 8, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, 2)},
+        {texture_desc(8, 8, DXGI_FORMAT_D24_UNORM_S8_UINT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, 2, 2)},
+        {texture_desc(300, 5, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)},
+        {texture_desc(8, 8, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)},
+        {texture_desc(8, 8, DXGI_FORMAT_D16_UNORM, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, 4)},
+        {texture_desc(6, 6, DXGI_FORMAT_R32_TYPELESS, D3D12_RESOURCE_FLAG_NONE)},
+        // MSAA textures
+        {texture_desc(8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, 1, 1, 4)},
+        {texture_desc(16, 16, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, 1, 1, 4)},
+        // Volume texture
+        {volume_desc(5)},
+    };
+
+    int mismatches = 0;
+    for (const Case& c : cases) {
+        D3D12_RESOURCE_ALLOCATION_INFO a{}, b{};
+        ours->GetResourceAllocationInfo(1, &c.desc, &a);
+        host->GetResourceAllocationInfo(1, &c.desc, &b);
+        if (a.SizeInBytes == b.SizeInBytes && a.Alignment == b.Alignment)
+            continue;
+        if (mismatches++ < 24)
+            std::fprintf(stderr,
+                         "allocation format %d: ours size %llu align %llu; host size %llu align %llu\n",
+                         int(c.desc.Format), (unsigned long long)a.SizeInBytes, (unsigned long long)a.Alignment,
+                         (unsigned long long)b.SizeInBytes, (unsigned long long)b.Alignment);
+    }
+    return mismatches;
+}
+
 }  // namespace
 
 int main() {
@@ -274,6 +325,11 @@ int main() {
         if (footprint_mismatches < 0)
             std::printf("GetCopyableFootprints: no host D3D12 device to compare with, skipped\n");
         EXPECT(footprint_mismatches <= 0);
+
+        const int allocation_mismatches = compare_allocation_info(device.p);
+        if (allocation_mismatches < 0)
+            std::printf("GetResourceAllocationInfo: no host D3D12 device to compare with, skipped\n");
+        EXPECT(allocation_mismatches <= 0);
 
         // Command objects; their GetDevice is the proxy, never the inner device.
         D3D12_COMMAND_QUEUE_DESC queue_desc{};

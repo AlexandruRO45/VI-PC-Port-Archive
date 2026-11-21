@@ -629,6 +629,69 @@ public:
         if (total) *total = end - base;
     }
 
+    // Resource allocation info: size and alignment for a resource description.
+    // Implements D3D12's rules locally; d3d12_vulkan_device_test compares every output with the PC runtime's.
+    void STDMETHODCALLTYPE GetResourceAllocationInfo(UINT visibleMask, const D3D12_RESOURCE_DESC* desc,
+                                                     D3D12_RESOURCE_ALLOCATION_INFO* info) override {
+        const auto fail = [&] {
+            if (info) *info = {UINT64_MAX, UINT64_MAX};
+        };
+        if (!desc || !info) return fail();
+        if (visibleMask == 0 || visibleMask > 1) return fail();  // single adapter only
+
+        const auto align = [](UINT64 value, UINT64 to) { return (value + to - 1) / to * to; };
+        constexpr UINT64 default_alignment = 64ull * 1024;  // D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT
+        constexpr UINT64 msaa_alignment = 4ull * 1024 * 1024;  // D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
+
+        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            UINT64 size = desc->Width;
+            if (desc->Alignment) {
+                if (desc->Alignment < default_alignment) return fail();
+                size = align(size, desc->Alignment);
+            }
+            *info = {align(size, default_alignment), default_alignment};
+            return;
+        }
+
+        const bool volume = desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        if (!volume && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+            log_once("GetResourceAllocationInfo dimension not supported:", desc->Dimension);
+            return fail();
+        }
+        const bool is_msaa = desc->SampleDesc.Count > 1;
+        const UINT64 alignment = is_msaa ? msaa_alignment : default_alignment;
+
+        const Format format = vulkan_format(desc->Format, true);  // typeless depth families are planar either way
+        UINT mips = desc->MipLevels;
+        const UINT depth = volume ? desc->DepthOrArraySize : 1;
+        if (!mips)
+            for (UINT64 size = std::max<UINT64>({desc->Width, desc->Height, depth}); size; size >>= 1) ++mips;
+        const UINT planes = (format.aspects & VK_IMAGE_ASPECT_STENCIL_BIT) ? 2 : 1;
+        const UINT per_plane = mips * (volume ? 1 : desc->DepthOrArraySize);
+        if (!format.format || per_plane * planes == 0) return fail();
+
+        UINT64 total_size = 0;
+        for (UINT i = 0; i < per_plane * planes; ++i) {
+            const UINT index = i, plane = index / per_plane, mip = index % mips;
+            const VkImageAspectFlags aspect =
+                planes == 2 ? (plane ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT) : format.aspects;
+            const leonida::BlockFormat block = leonida::block_format(format.format, aspect);
+            if (!block.bytes) return fail();
+            const UINT width = std::max<UINT>(1, UINT(desc->Width >> mip));
+            const UINT height = std::max<UINT>(1, UINT(desc->Height >> mip));
+            const UINT blocks_wide = (width + block.block - 1) / block.block;
+            const UINT blocks_high = (height + block.block - 1) / block.block;
+            const UINT64 row_size = UINT64(blocks_wide) * block.bytes;
+            // Planar depth-stencil rows padded to 512 bytes (2 * 256), others to 256 bytes.
+            const UINT pitch = UINT(align(row_size, planes == 2 ? 2 * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT
+                                                                : D3D12_TEXTURE_DATA_PITCH_ALIGNMENT));
+            const UINT slices = std::max(1u, depth >> mip);
+            const UINT64 total_rows = UINT64(blocks_high) * slices;
+            total_size += (total_rows - 1) * pitch + row_size;
+        }
+        *info = {align(total_size, alignment), alignment};
+    }
+
     HRESULT STDMETHODCALLTYPE CheckFeatureSupport(D3D12_FEATURE feature, void* data, UINT size) override {
         log_once("CheckFeatureSupport feature", feature);
         if (!data) return E_INVALIDARG;
