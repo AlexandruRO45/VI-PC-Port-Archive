@@ -6,10 +6,11 @@ Xbox Series 1.0.2.1 package. No game data is in this file; counts, aggregate bou
 
 ## How much was read
 
-`levels.rpf` is 76,155,065,056 bytes (70.92 GiB), so it was sampled in four windows rather than scanned whole.
-`packs.rpf`, `data.rpf` and `common.rpf` are small enough to index completely. All indexes were made with the
-corrected RPF9 carver from PR #90 (`--index-only`), which advances by the actual stream length. Every stream is
-zlib; "unread" is non-zero bytes between streams that did not inflate, not a second storage format.
+`levels.rpf` is 76,155,065,056 bytes (70.92 GiB). The first pass below sampled four windows; the full census
+later in this file scanned the whole data area. `packs.rpf`, `data.rpf` and `common.rpf` are small enough to
+index completely. All indexes were made with the corrected RPF9 carver from PR #90 (`--index-only`), which
+advances by the actual stream length. File and system-page streams are zlib; some graphics pages and four
+continuation pages are stored raw, so "unread" is non-zlib payload between streams, not a second file format.
 
 | Area | Bytes covered | Streams | Stored | Inflated | Zero | Unread | Coverage |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -23,7 +24,116 @@ zlib; "unread" is non-zero bytes between streams that did not inflate, not a sec
 
 The four `levels.rpf` windows cover 5,153,960,755 bytes, 6.77% of the archive. The sampled stream split is
 ~2.36 GiB in 20–21 GiB, 1.77 GiB in 40–41 GiB and 1.92 GiB in 70–70.8 GiB; the first two GiB are anomalous (see
-the metadata family below). Positions and counts are therefore sample measurements, not whole-map totals.
+the metadata family below). These are sample measurements; the full census below replaces their totals.
+
+## Full census
+
+`tools/world_census.py` scanned the whole `levels.rpf` data area in 36 independent 2 GiB shards with 12
+processes. Each shard has an 8 MiB warm-up overlap so a resource that starts just before a boundary is still
+parsed; 1,140 resource starts were re-read in the overlap and counted once by offset. The walker inflates
+every zlib stream, validates the 0x7a header/schema, joins contiguous zlib continuation pages, and joins a raw
+(uncompressed) continuation page when the system pointers resolve past the first page. Every map payload is
+SHA-1 hashed for duplicate detection. The merge step measures every byte and audits the unread ranges for a
+0x7a signature or an unaligned zlib stream that inflates to one.
+
+The run took 241.4 s wall (238.2 s inside the shard pool, 2,093.9 s summed across shards), read all 36 shards,
+and used no partial result. The archive is 76,155,065,056 bytes; its data area is 76,154,954,352 bytes.
+
+| Class | Bytes | Share |
+|---|---:|---:|
+| zlib stream payload | 74,877,281,159 | 98.322% |
+| raw system continuation | 44,304 | <0.001% |
+| raw graphics page (declared 0x6 extent) | 2,762,232 | 0.004% |
+| zero padding | 1,058,806,784 | 1.390% |
+| unread non-zlib | 216,059,873 | 0.284% |
+| **accounted** | **76,154,954,352** | **100%** |
+
+Zlib coverage is 98.322%, but every byte is accounted for. The 216.1 MB unread range is non-zlib payload
+between streams. The audit found 23 additional `0DRP` + 0x7a hits there; none has a valid 0x7a schema, so none
+is a map or map metadata. It also found zero raw map/meta resources and zero unaligned zlib streams that
+inflate to a 0x7a header. No map resource is in the unread range.
+
+| Item | Count |
+|---|---:|
+| placement map files (`CMapData` + `CEntityDef`) | 23,535 |
+| entities (`CEntityDef`) | 1,670,442 |
+| map files that join a continuation | 2,868 |
+| map files whose continuation page is raw | 3 |
+| `CMapData`-only metadata resources (no `CEntityDef`) | 138,839 |
+| other 0x7a meta resources | 26,075 |
+| zlib stream visits (includes warm-up re-reads) | 1,122,614 |
+| byte-identical duplicate maps | 0 |
+| duplicate 32-bit map-name hashes | 0 |
+| entity blocks in graphics pages | 0 |
+| unresolved or truncated map resources | 0 |
+
+The 23,535 maps contain 1,670,442 entities: HD 1,153,122; LOD 100,960; SLOD1 16,828; SLOD2 1,708; SLOD3 601;
+SLOD4 352; ORPHAN_HD 396,871. Mean density is 70.98 entities per map (maximum 1,851); the largest map payload
+is 506,080 bytes. The global entity bounds are x −16,237.0…5,550.0, y −8,672.0…10,300.0, z −367.3941…1,663.4242
+metres. Maps span 0x1e0bed010 (8,065,568,784) to 0xfb883d010 (67,520,155,664); the 0–6 GiB and 64–70.92 GiB
+windows contain none. No map payload repeats: 23,535 unique SHA-1s and 23,535 unique map-name hashes.
+
+Four resources need an uncompressed system continuation page: three placement maps (7 entities) and one
+`CMapData`-only metadata resource. They are complete after the raw page is joined. The maximum page count for
+a map is two. The two earlier passes sampled 9,918 maps / 680,228 entities (~55%). If that byte share is exact,
+a linear extrapolation gives 18,033 maps / 1,236,778 entities, 23.4% / 26.0% below the measured total. The
+sample's 68.6 entities per map is close to the full 71.0, but its map density (254/GiB at 55% coverage) is
+below the full 331.8/GiB, so byte coverage alone did not predict the map count. The measured total sits inside
+the second pass's block range of 16k–39.6k maps and 1.03M–2.64M entities.
+
+SixNG's published external measurement is 30,785 map files / 2,249,490 entities; this package measures 76.5% /
+74.3% of those. That figure is external context, not a correction to this census: this census measures this
+1.0.2.1 package with the map/entity definition above.
+
+The 138,839 `CMapData`-only resources are metadata, not placement: they carry a `CMapData` root and
+container-LOD blocks but no `CEntityDef` struct, so they have no entities to count. They account for 1.23 GiB
+inflated and are reported separately, not included in the 23,535.
+
+### Per-shard census
+
+Each row is one 2 GiB scan window. The first/last map columns are exact byte offsets of the first and last
+placement resource owned by that window; `s` is that shard's elapsed time. The total row's `s` is the sum
+across shards, not wall time.
+
+| # | Window (GiB) | Maps | Entities | First map | Last map | s |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 0.000–2.000 | 0 | 0 | — | — | 68.1 |
+| 1 | 2.000–4.000 | 0 | 0 | — | — | 78.5 |
+| 2 | 4.000–6.000 | 0 | 0 | — | — | 64.3 |
+| 3 | 6.000–8.000 | 498 | 36,480 | 0x1e0bed010 | 0x1e26f7010 | 60.7 |
+| 4 | 8.000–10.000 | 2,466 | 163,572 | 0x20ac57010 | 0x27ffec010 | 69.4 |
+| 5 | 10.000–12.000 | 1,992 | 142,180 | 0x2800b4010 | 0x2f923f010 | 65.0 |
+| 6 | 12.000–14.000 | 1,318 | 115,571 | 0x34901a010 | 0x363067010 | 58.0 |
+| 7 | 14.000–16.000 | 2,451 | 173,999 | 0x39511f010 | 0x3e06a0010 | 70.1 |
+| 8 | 16.000–18.000 | 2,174 | 145,118 | 0x417ec1010 | 0x46b205010 | 68.1 |
+| 9 | 18.000–20.000 | 1,201 | 87,603 | 0x4a9ac4010 | 0x4fef80010 | 60.0 |
+| 10 | 20.000–22.000 | 1,811 | 147,930 | 0x506c7b010 | 0x57e5f8010 | 67.9 |
+| 11 | 22.000–24.000 | 1,773 | 120,843 | 0x5a80f3010 | 0x5fb646010 | 67.6 |
+| 12 | 24.000–26.000 | 1,048 | 84,407 | 0x60e69c010 | 0x65b3e7010 | 58.4 |
+| 13 | 26.000–28.000 | 1,967 | 153,904 | 0x68111d010 | 0x6f9038010 | 69.3 |
+| 14 | 28.000–30.000 | 1,405 | 73,294 | 0x715a52010 | 0x767442010 | 66.8 |
+| 15 | 30.000–32.000 | 259 | 19,093 | 0x787216010 | 0x7d5231010 | 55.3 |
+| 16 | 32.000–34.000 | 244 | 17,946 | 0x804a96010 | 0x86c32e010 | 52.2 |
+| 17 | 34.000–36.000 | 221 | 16,061 | 0x885536010 | 0x8cfcbb010 | 50.9 |
+| 18 | 36.000–38.000 | 237 | 23,186 | 0x909b84010 | 0x959df8010 | 49.6 |
+| 19 | 38.000–40.000 | 209 | 13,476 | 0x98982e010 | 0x9ffbbd010 | 49.7 |
+| 20 | 40.000–42.000 | 198 | 17,346 | 0xa003c6010 | 0xa4693f010 | 48.1 |
+| 21 | 42.000–44.000 | 188 | 15,215 | 0xa8e4cc010 | 0xaf8f2c010 | 44.6 |
+| 22 | 44.000–46.000 | 165 | 10,637 | 0xb2395f010 | 0xb51351010 | 46.0 |
+| 23 | 46.000–48.000 | 105 | 7,999 | 0xb879e2010 | 0xb91311010 | 37.1 |
+| 24 | 48.000–50.000 | 130 | 8,537 | 0xc1c336010 | 0xc703a7010 | 42.6 |
+| 25 | 50.000–52.000 | 262 | 13,100 | 0xc81c50010 | 0xcec270010 | 56.0 |
+| 26 | 52.000–54.000 | 214 | 11,942 | 0xd14132010 | 0xd59837010 | 55.2 |
+| 27 | 54.000–56.000 | 226 | 10,658 | 0xd86d83010 | 0xdf546f010 | 52.3 |
+| 28 | 56.000–58.000 | 276 | 16,731 | 0xe07218010 | 0xe7a774010 | 60.1 |
+| 29 | 58.000–60.000 | 215 | 9,842 | 0xe9bda2010 | 0xef0989010 | 55.4 |
+| 30 | 60.000–62.000 | 178 | 9,766 | 0xf0f08b010 | 0xf52595010 | 54.1 |
+| 31 | 62.000–64.000 | 104 | 4,006 | 0xf80eb4010 | 0xfb883d010 | 59.1 |
+| 32 | 64.000–66.000 | 0 | 0 | — | — | 75.0 |
+| 33 | 66.000–68.000 | 0 | 0 | — | — | 68.3 |
+| 34 | 68.000–70.000 | 0 | 0 | — | — | 61.4 |
+| 35 | 70.000–70.925 | 0 | 0 | — | — | 28.7 |
+| **total** | **0.000–70.925** | **23,535** | **1,670,442** | **0x1e0bed010** | **0xfb883d010** | **2,093.9** |
 
 ## Composition
 
@@ -54,7 +164,9 @@ small continuation stream (usually 1–2 KiB) that the next stream scan alone wo
 joins that continuation when the schema still has unresolved pointers. The join turns 630 first-page maps into
 698 complete map files and 55,564 entities into 75,551. The other sampled windows do not change. This is a
 format rule, not a heuristic: the continuation is reached by system pointers in the first page, and the joined
-schema then validates.
+schema then validates. The full census also found four resources whose continuation page is stored raw rather
+than zlib. The extent is still the unresolved system pointer range; joining 44,304 raw bytes completes three
+placement maps (7 entities) and one `CMapData`-only metadata resource.
 
 ## Signatures and strings
 
@@ -160,6 +272,9 @@ table, not fixed offsets.
 | 70–70.8 GiB | 0 | 0 | 0 | — |
 | **sampled** | **794** | **82,463** | — | — |
 
+This table is the four-window sample retained to show the per-window method; the full census above measures
+23,535 map files and 1,670,442 entities.
+
 The 20–21 GiB LOD split: HD 53,551; LOD 2,119; SLOD1 230; SLOD2 40; SLOD3 11; SLOD4 10; ORPHAN_HD 19,590.
 `lodDist` is -1 for 74,375 entities (98.4%, meaning archetype default); the rest are 10–1200 m.
 `parentIndex` is -1 for 19,874 entities (26.3%); the rest point at another entity. The 40–41 GiB window splits
@@ -172,10 +287,10 @@ the sampled streams. Placement is per-entity position + quaternion + scale, not 
 pattern in the 0–2 GiB family is a hash-table slot, not a matrix row.
 
 For context, SixNG's published full-archive measurement is 30,785 map files and 2,249,490 entities in
-`levels.rpf` (https://github.com/holdmysocks/SixNG). The sample here is 2.6% of those files and 3.7% of those
-entities; per-file density is higher in the sampled city/foothill windows (104 vs 73 entities), which is
-expected for a non-uniform map. (The 20–21 GiB window alone averages 108 entities per map.) That full number
-is external evidence, not a measurement made here.
+`levels.rpf` (https://github.com/holdmysocks/SixNG). The full census above is 23,535 map files and 1,670,442
+entities, 76.5% and 74.3% of that external count. The gap audit found no 0x7a resource in the unread bytes, so
+the difference is not a coverage hole in this scan; a different package build or a different map/entity
+definition would produce the external total. That number is context, not a correction to this census.
 
 ## What is readable, what is hash-only
 
@@ -187,12 +302,12 @@ Readable:
 
 Hash-only or opaque:
 - the RPF directory table and therefore original file names; resource names must be recovered from payloads;
-- map file `name`/`parent` (32-bit hashes; `parent` is 0 in every sampled file);
+- map file `name`/`parent` (32-bit hashes; `parent` is nonzero for 2,089 of the 23,535 maps);
 - most `archetypeName` values. The repo's model manifest reports 155,598 models with names/bounds; this light
   check used 61,861 name hashes recovered from sampled drawables, fragments and `packs.rpf`, not the full
-  manifest join. 5,538 of the 75,551 entities matched (7.3%). The remaining 92.7% are hash-only without a full
-  name index and the bbox/archive-order linking step used by SixNG. This is a lower bound, not a claim that the
-  names do not exist;
+  manifest join. 5,538 of the 75,551 entities in the 20–21 GiB window matched (7.3%). The remaining 92.7% are
+  hash-only without a full name index and the bbox/archive-order linking step used by SixNG. This is a lower
+  bound, not a claim that the names do not exist;
 - texture keys do not appear in placement records. They are 64-bit asset keys in model materials, so a runtime
   resolves placement → archetype → model → material asset key;
 - the 0–2 GiB 7-struct family's field semantics and most of its payload;
@@ -204,8 +319,9 @@ Hash-only or opaque:
 ## What a runtime needs
 
 1. **RPF9 page reader.** Read the `9FPR` header; the data area starts at the u32 at +0x04. Streams start on a
-   16-byte boundary and are zlib. Join a system page and its contiguous graphics pages; for 0x7a resources also
-   join the small continuation page when the schema's pointers reach it.
+   16-byte boundary; file/system pages are zlib and some graphics pages are raw. Join a system page and its
+   contiguous graphics pages; for 0x7a resources also join the continuation page when the schema's pointers
+   reach it, whether that page is zlib or raw.
 2. **0x7a schema parser.** Validate the header and tables, then read instance blocks. Do not assume fixed
    offsets: field offsets come from the resource's member table. The map root/entity hashes above identify
    placement files.
@@ -222,20 +338,30 @@ Hash-only or opaque:
 
 ## Tool
 
-`tools/world_index.py` scans an RPF9 archive or a directory of carved streams and writes JSON/CSV with
-`offset, size, signature, version, kind, structs, blocks, entities, extents, position bounds, LOD counts`.
-It implements the header/schema validation above and the continuation join. It does not decrypt anything,
-does not extract models/textures, and keeps the output aggregate (one row per resource, no entity dump).
+`tools/world_index.py` is the single-window scanner and the 0x7a library. It scans an RPF9 archive or a
+directory of carved streams and writes JSON/CSV with `offset, size, signature, version, kind, structs, blocks,
+entities, extents, position bounds, LOD counts`. It implements the header/schema validation above and the
+continuation join. It does not decrypt anything, does not extract models/textures, and keeps the output
+aggregate (one row per resource, no entity dump).
+
+`tools/world_census.py` is the whole-archive driver. It shards the data area, scans shards in parallel, joins
+zlib and raw continuation pages, hashes map payloads for duplicate detection, measures every byte, and audits
+the unread ranges. It writes `summary.json`, `maps.json` and one `shard_*.json` per window; no payload is kept.
 
 ```powershell
+python -I tools\world_census.py <levels.rpf> --shard-size 2147483648 --jobs 12 --out work\world\census
+python -I tools\world_census.py <levels.rpf> --out work\world\census --merge-only
 python -I tools\world_index.py <levels.rpf> --start 21474836480 --limit 1073741824 `
     --out work\world\levels-20-21.json --csv work\world\levels-20-21.csv
+python -I tests\test_world_census.py
 python -I tests\test_world_index.py
 ```
 
-For a 76 GB archive always bound the run with `--start/--limit`; the tool records the window in its summary.
-A 0x7a resource split beyond the first continuation, or a map whose entity block lives in a graphics page, is
-reported with fewer entities or as `meta` rather than guessed.
+`world_index.py` still needs `--start/--limit` for a large archive. `world_census.py` is the whole-archive path;
+`--resume` reuses complete shards and `--merge-only` reports the coverage already on disk. A map whose entity
+block lives in a 0x6 graphics page is counted with fewer entities (the census found 0 such blocks); a resource
+needing more than 64 pages or a page above the 64 MiB cap is treated as incomplete rather than guessed (the
+census found 0).
 
 ## No-sharing rule
 
