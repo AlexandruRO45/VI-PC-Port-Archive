@@ -11,6 +11,8 @@
 #include <vector>
 
 #include "first_draw_shaders.h"
+#include <windows.h>
+
 #include "shims.h"
 
 namespace {
@@ -213,6 +215,107 @@ int render_triangle() {
 
 }  // namespace
 
-extern "C" int __cdecl LeonidaRenderTriangle(void) { return render_triangle(); }
+// Loads the BMP the renderer wrote into a 32-bit pixel buffer (top-down RGBA).
+bool load_bmp_pixels(const char* path, std::vector<std::uint8_t>& pixels, int& width, int& height) {
+    std::FILE* f = std::fopen(path, "rb");
+    if (!f) return false;
+    std::uint8_t header[54]{};
+    if (std::fread(header, 1, 54, f) != 54) { std::fclose(f); return false; }
+    std::memcpy(&width, header + 18, 4);
+    std::memcpy(&height, header + 22, 4);
+    const std::uint32_t offset = *reinterpret_cast<const std::uint32_t*>(header + 10);
+    const std::uint32_t row_bytes = (std::uint32_t(width) * 3 + 3) & ~3u;
+    std::fseek(f, long(offset), SEEK_SET);
+    std::vector<std::uint8_t> bgr(std::size_t(row_bytes) * height);
+    if (std::fread(bgr.data(), 1, bgr.size(), f) != bgr.size()) { std::fclose(f); return false; }
+    std::fclose(f);
+    pixels.resize(std::size_t(width) * height * 4);
+    for (int y = 0; y < height; ++y) {
+        const std::uint8_t* row = bgr.data() + std::size_t(height - 1 - y) * row_bytes;
+        for (int x = 0; x < width; ++x) {
+            pixels[(std::size_t(y) * width + x) * 4 + 0] = row[x * 3 + 2];
+            pixels[(std::size_t(y) * width + x) * 4 + 1] = row[x * 3 + 1];
+            pixels[(std::size_t(y) * width + x) * 4 + 2] = row[x * 3 + 0];
+            pixels[(std::size_t(y) * width + x) * 4 + 3] = 255;
+        }
+    }
+    return true;
+}
 
-SHIM_TABLE(d3d12, {"d3d12.dll", "LeonidaRenderTriangle", reinterpret_cast<void*>(&LeonidaRenderTriangle)});
+// Creates a real Win32 window, blits the rendered frame into it for a second (the message loop keeps it alive), and
+// captures the window back into window_capture.bmp. No Vulkan swapchain yet: this is a GDI presenter over the same
+// Vulkan-rendered pixels.
+int present_window() {
+    if (render_triangle() != 0) return 1;
+    std::vector<std::uint8_t> pixels;
+    int width = 0, height = 0;
+    if (!load_bmp_pixels("hello_triangle.bmp", pixels, width, height)) return 2;
+
+    WNDCLASSEXA wc{};
+    wc.cbSize = sizeof(wc);
+    wc.style = CS_OWNDC;
+    wc.lpfnWndProc = DefWindowProcA;
+    wc.hInstance = GetModuleHandleA(nullptr);
+    wc.hCursor = LoadCursorA(nullptr, IDC_ARROW);
+    wc.lpszClassName = "LeonidaHelloClass";
+    if (!RegisterClassExA(&wc)) return 3;
+    HWND hwnd = CreateWindowExA(0, wc.lpszClassName, "Leonida - Hello Triangle (PE loader)", WS_OVERLAPPEDWINDOW,
+                                CW_USEDEFAULT, CW_USEDEFAULT, 640, 480, nullptr, nullptr, wc.hInstance, nullptr);
+    if (!hwnd) return 4;
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    int frames = 0;
+    const DWORD start = GetTickCount();
+    while (GetTickCount() - start < 1500) {
+        MSG msg{};
+        while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageA(&msg);
+        }
+        HDC dc = GetDC(hwnd);
+        StretchDIBits(dc, 0, 0, 640, 480, 0, 0, width, height, pixels.data(), &bmi, DIB_RGB_COLORS, SRCCOPY);
+        ReleaseDC(hwnd, dc);
+        ++frames;
+        Sleep(16);
+    }
+
+    // Capture the window's client area back to a BMP: the proof that the pixels reached the screen surface.
+    HDC window_dc = GetDC(hwnd);
+    HDC memory_dc = CreateCompatibleDC(window_dc);
+    HBITMAP bitmap = CreateCompatibleBitmap(window_dc, 640, 480);
+    HGDIOBJ old = SelectObject(memory_dc, bitmap);
+    BitBlt(memory_dc, 0, 0, 640, 480, window_dc, 0, 0, SRCCOPY);
+    BITMAPINFO capture_info = bmi;
+    capture_info.bmiHeader.biWidth = 640;
+    capture_info.bmiHeader.biHeight = 480;
+    std::vector<std::uint8_t> captured(std::size_t(640) * 480 * 4);
+    GetDIBits(memory_dc, bitmap, 0, 480, captured.data(), &capture_info, DIB_RGB_COLORS);
+    SelectObject(memory_dc, old);
+    DeleteObject(bitmap);
+    DeleteDC(memory_dc);
+    ReleaseDC(hwnd, window_dc);
+    write_bmp("window_capture.bmp", captured.data(), 640, 480);
+
+    DestroyWindow(hwnd);
+    UnregisterClassA(wc.lpszClassName, wc.hInstance);
+    std::FILE* log = std::fopen("leonida_window.log", "w");
+    if (log) {
+        std::fprintf(log, "frames=%d width=%d height=%d\n", frames, width, height);
+        std::fclose(log);
+    }
+    return frames > 0 ? 0 : 5;
+}
+
+extern "C" int __cdecl LeonidaRenderTriangle(void) { return render_triangle(); }
+extern "C" int __cdecl LeonidaPresentWindow(void) { return present_window(); }
+
+SHIM_TABLE(d3d12, {"d3d12.dll", "LeonidaRenderTriangle", reinterpret_cast<void*>(&LeonidaRenderTriangle)},
+                    {"d3d12.dll", "LeonidaPresentWindow", reinterpret_cast<void*>(&LeonidaPresentWindow)});

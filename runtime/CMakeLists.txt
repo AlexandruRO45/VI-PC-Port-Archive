@@ -439,7 +439,7 @@ if(Vulkan_FOUND)
   find_program(LEONIDA_LIB_EXE NAMES lib)
   if(LEONIDA_LIB_EXE)
     set(LEONIDA_HARNESS_DEF ${CMAKE_CURRENT_BINARY_DIR}/d3d12.def)
-    file(WRITE ${LEONIDA_HARNESS_DEF} "LIBRARY d3d12.dll\nEXPORTS\n  LeonidaRenderTriangle\n")
+    file(WRITE ${LEONIDA_HARNESS_DEF} "LIBRARY d3d12.dll\nEXPORTS\n  LeonidaRenderTriangle\n  LeonidaPresentWindow\n")
     add_custom_command(
       OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/d3d12.lib
       COMMAND ${LEONIDA_LIB_EXE} /def:${LEONIDA_HARNESS_DEF} /machine:x64 /out:${CMAKE_CURRENT_BINARY_DIR}/d3d12.lib

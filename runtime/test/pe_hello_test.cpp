@@ -69,6 +69,17 @@ int main(int argc, char** argv) {
             }
             std::printf("pe_hello_test: %zu lit pixels written by the harness\n", lit);
             EXPECT(lit > 100);
+            const std::vector<std::uint8_t> capture = read_file("window_capture.bmp");
+            EXPECT(capture.size() > 54);
+            std::FILE* log = std::fopen("leonida_window.log", "rb");
+            int frames = 0;
+            if (log) {
+                char line[128]{};
+                if (std::fgets(line, sizeof(line), log)) std::sscanf(line, "frames=%d", &frames);
+                std::fclose(log);
+            }
+            std::printf("pe_hello_test: window frames=%d capture=%zu bytes\n", frames, capture.size());
+            EXPECT(frames > 0);
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "pe_hello_test: exception: %s\n", e.what());
