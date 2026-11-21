@@ -657,7 +657,7 @@ class Machine:
                     elif sb < 12:
                         k = sb & 3
                         src = lo if k < 2 else hi
-                        val = 0xFF if (src >> (15 + 8 * (k & 1))) & 1 else 0
+                        val = 0xFF if (src >> (15 + 16 * (k & 1))) & 1 else 0    # bit 7 of byte 1 or 3 of the half
                     else:
                         val = 0 if sb == 12 else 0xFF
                     r |= val << (8 * i)

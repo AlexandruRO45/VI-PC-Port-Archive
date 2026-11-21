@@ -128,6 +128,23 @@ class CpuRefTest(unittest.TestCase):
         self.assertEqual(self.vgpr(r, 6), 0x000044DD)    # bytes 0, 4; sign 0; zero
         self.assertEqual(self.vgpr(r, 7), 0xFFFFDDDD)    # byte 0, sign of src1 half, 0xff
 
+    def test_permute_sign_selectors(self):
+        # Selectors 8, 9, 10, 11 give 0xff if bit 7 of byte 1, 3, 5, 7 of {src0, src1} is set (docs/design.md,
+        # "Byte permute"). In both inputs bytes 2 and 3 of each half differ in bit 7, so reading bit 23 for
+        # selectors 9 and 11 gives another result.
+        r = self.execute("""
+            v_mov_b32 v0, 0x11a23344
+            v_mov_b32 v1, 0x803b4cdd
+            v_mov_b32 v2, 0x0b0a0908
+            v_perm_b32 v3, v0, v1, v2
+            v_mov_b32 v0, 0x915dc344
+            v_mov_b32 v1, 0x1eb7cc22
+            v_perm_b32 v4, v0, v1, v2
+            s_endpgm
+        """)
+        self.assertEqual(self.vgpr(r, 3), 0x0000FF00)    # only bit 31 of src1 is set
+        self.assertEqual(self.vgpr(r, 4), 0xFFFF00FF)    # all but bit 31 of src1
+
     def test_mul_hi_and_mad(self):
         r = self.execute("""
             v_mul_hi_u32 v0, 0xffffffff, 0xffffffff
