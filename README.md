@@ -24,6 +24,13 @@ Download the [Windows x64 GPU check and SHA-256](https://github.com/R0Y00/Xbox2W
 .\Run-GpuCheck.ps1
 ```
 
+For source-built diagnostics, `--bvh-shuffle` and `--bvh-shuffle-16/32/64`
+check independent non-uniform native-wave shuffles, including the permutation
+reported in [issue #145](https://github.com/R0Y00/Xbox2Windows/issues/145).
+The forced sizes return capability SKIP when unavailable (for example, native
+Wave64 on an RTX 3060); they do not emulate unsupported native waves.
+[Reproduction and oracle](docs/experiments.md#diagnosing-independent-native-wave-shuffles)
+
 Review `gpu-report-hardware.md` and paste it in the [hardware coverage thread (#1)](https://github.com/R0Y00/Xbox2Windows/issues/1). Reports with a failure or capability skip are welcome. [Package instructions](tools/gpu-check/README.md)
 
 ### Hardware coverage

@@ -23,6 +23,7 @@ void check_bvh_packed(ID3D12Device* device);
 void check_bvh_hits(ID3D12Device* device);
 bool check_bvh_differential(ID3D12Device* device);
 bool check_bvh_waves(ID3D12Device* device, bool force64);
+bool check_bvh_shuffle(ID3D12Device* device, unsigned forced_width);
 bool check_ray_query(ID3D12Device* device);
 bool check_dxr_update(ID3D12Device* device);
 

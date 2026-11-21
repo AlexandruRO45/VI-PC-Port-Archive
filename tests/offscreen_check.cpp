@@ -383,6 +383,13 @@ int main(int argc, char** argv)
             check_bvh_reads(device.Get());
         } else if (argc == 3 && (operation == "--bvh-waves" || operation == "--bvh-wave64")) {
             if (!check_bvh_waves(device.Get(), operation == "--bvh-wave64")) return 77;
+        } else if (argc == 3 && (operation == "--bvh-shuffle" || operation == "--bvh-shuffle-16" ||
+                                  operation == "--bvh-shuffle-32" || operation == "--bvh-shuffle-64")) {
+            unsigned width = 0;
+            if (operation == "--bvh-shuffle-16") width = 16;
+            if (operation == "--bvh-shuffle-32") width = 32;
+            if (operation == "--bvh-shuffle-64") width = 64;
+            if (!check_bvh_shuffle(device.Get(), width)) return 77;
         } else if (argc == 3 && operation == "--buffer-ops") {
             check_buffer_ops(device.Get());
         } else if (argc == 3 && operation == "--ray-query") {

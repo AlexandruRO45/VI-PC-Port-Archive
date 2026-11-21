@@ -71,7 +71,24 @@ foreach(entry IN ITEMS DualUav SampleMip WriteRecurrent)
         BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/${entry}.cso" VERBATIM)
     target_sources(offscreen_check PRIVATE "${header}")
 endforeach()
-target_sources(offscreen_check PRIVATE tests/bvh_reads_waves.cpp tests/bvh_hits.cpp)
+target_sources(offscreen_check PRIVATE tests/bvh_reads_waves.cpp tests/bvh_hits.cpp tests/bvh_shuffle_probe.cpp)
+foreach(size IN ITEMS Default 16 32 64)
+    set(header "${CMAKE_CURRENT_BINARY_DIR}/Shuffle${size}.h")
+    set(defines)
+    set(model cs_6_0)
+    if(NOT size STREQUAL "Default")
+        set(defines -D "FORCE_WAVE_SIZE=${size}")
+        set(model cs_6_6)
+    endif()
+    add_custom_command(OUTPUT "${header}"
+        COMMAND "${DXC_EXECUTABLE}" -T ${model} -E ShuffleProbe ${defines}
+            -Vn "Shuffle${size}" -Fh "${header}"
+            -Fo "${CMAKE_CURRENT_BINARY_DIR}/Shuffle${size}.cso"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/bvh_shuffle_probe.hlsl"
+        DEPENDS tests/bvh_shuffle_probe.hlsl
+        BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/Shuffle${size}.cso" VERBATIM)
+    target_sources(offscreen_check PRIVATE "${header}")
+endforeach()
 target_sources(offscreen_check PRIVATE tests/bvh_atomics.cpp tests/bvh_numeric.cpp)
 foreach(entry IN ITEMS InitBounds AtomicBounds QueryBounds NumericBounds)
     set(bounds_source tests/bvh_atomics.hlsl)
@@ -145,6 +162,14 @@ foreach(adapter IN ITEMS hardware warp)
     foreach(work IN ITEMS reads waves wave64 hits differential atomics numeric packed)
         add_test(NAME bvh_${work}_${adapter} COMMAND offscreen_check ${adapter} --bvh-${work})
         set_tests_properties(bvh_${work}_${adapter} PROPERTIES TIMEOUT 45)
+    endforeach()
+    foreach(width IN ITEMS default 16 32 64)
+        set(arg --bvh-shuffle-${width})
+        if(width STREQUAL "default")
+            set(arg --bvh-shuffle)
+        endif()
+        add_test(NAME bvh_shuffle_${width}_${adapter} COMMAND offscreen_check ${adapter} ${arg})
+        set_tests_properties(bvh_shuffle_${width}_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     endforeach()
     set_tests_properties(bvh_wave64_${adapter} bvh_differential_${adapter} PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(bvh_buffer_ops_${adapter} PROPERTIES TIMEOUT 45)
@@ -343,6 +368,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/bcpack_check.py")
     add_test(NAME resource_range_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/resource_ranges_check.py")
+    add_test(NAME bvh_shuffle_oracle_math COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/bvh_shuffle_oracle_check.py")
     foreach(adapter IN ITEMS hardware warp)
         add_test(NAME pixel_aot_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw "${DXC_EXECUTABLE}"
