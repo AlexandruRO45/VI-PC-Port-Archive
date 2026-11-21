@@ -346,6 +346,15 @@ def ceiling():
     ])
 
 
+def reciprocal_iflag():
+    return with_constants([
+        "v_rcp_iflag_f32_e32 v12, s44",
+        "v_rcp_iflag_f32_e64 v13, -|s45|",
+        "v_rcp_iflag_f32_e64 v14, |s46|",
+        "v_rcp_iflag_f32_e64 v15, |s47| clamp",
+    ])
+
+
 # The gfx10 predicate number is a four-bit truth table. Bits 0..3 select
 # less, equal, greater and unordered respectively, independent of the HLSL.
 PREDICATES = ("f", "lt", "eq", "le", "gt", "lg", "ge", "o",
@@ -1329,6 +1338,34 @@ def check_ceiling_draws(directory, compiler, renderer, backend):
         raise AssertionError("Replacing ceiling with floor escaped detection")
 
 
+def check_reciprocal_iflag_draws(directory, compiler, renderer, backend):
+    instructions = reciprocal_iflag()
+    source = directory / "rcp_iflag.hlsl"
+    shader = directory / "rcp_iflag.cso"
+    case = directory / "rcp_iflag.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+    source.write_text(translate(instructions), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    inf = math.inf
+    # Powers of two have exact reciprocals, so no rounding difference can hide a fault.
+    # A zero operand gives an infinity of its sign, and clamp turns +inf into 1.
+    for (a, b, c, d), expected in (((2.0, 4.0, -0.125, 0.5), (0.5, -0.25, 8.0, 1.0)),
+                                   ((-0.25, 0.5, 16.0, 4.0), (-4.0, -2.0, 0.0625, 0.25)),
+                                   ((0.0, 0.0, -0.0, 0.0), (inf, -inf, inf, 1.0))):
+        constants = bytearray(256)
+        struct.pack_into("<4f", constants, 12, a, b, c, d)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+
+    wrong = [line.replace("v_rcp_iflag_f32", "v_sqrt_f32") for line in instructions]
+    source.write_text(translate(wrong), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    result = subprocess.run(draw, capture_output=True, text=True)
+    if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
+        raise AssertionError("Replacing the reciprocal with a square root escaped detection")
+
+
 def check_render(directory, compiler, renderer, backend):
     check_movk_draw(directory, compiler, renderer, backend)
     check_half_draw(directory, compiler, renderer, backend)
@@ -1418,6 +1455,7 @@ def check_render(directory, compiler, renderer, backend):
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("The renderer failed to detect the missing absolute value")
     check_ceiling_draws(directory, compiler, renderer, backend)
+    check_reciprocal_iflag_draws(directory, compiler, renderer, backend)
     source.write_text(translate(select()), encoding="ascii")
     subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
     for constants in ((.5, .75, .375, .25), (.125, .5, 1.0, 0.0)):

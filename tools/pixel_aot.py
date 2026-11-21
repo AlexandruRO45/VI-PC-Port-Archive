@@ -170,6 +170,8 @@ def registers(first, last, count):
 
 ALU = {
     "log": (1, "log2({0})"), "exp": (1, "exp2({0})"), "rcp": (1, "(1.0f / {0})"),
+    # Same reciprocal; the integer-divide flag it raises has no desktop equivalent.
+    "rcp_iflag": (1, "(1.0f / {0})"),
     "sqrt": (1, "sqrt({0})"), "rsq": (1, "rsqrt({0})"),
     "floor": (1, "floor({0})"), "ceil": (1, "ceil({0})"), "fract": (1, "fract32({0})"),
     "trunc": (1, "trunc({0})"),
@@ -583,7 +585,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             value = fp_operand(src, scalar, vector, pending, sample_pending)
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {value};")
-        elif m := match(r"v_(log|exp|rcp|sqrt|rsq|floor|ceil|fract|trunc|add|mul|max|min|sub|subrev|mul_legacy|fma|fmac)_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
+        elif m := match(r"v_(log|exp|rcp_iflag|rcp|sqrt|rsq|floor|ceil|fract|trunc|add|mul|max|min|sub|subrev|mul_legacy|fma|fmac)_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
             op, dst, operands, clamp = m.groups()
             tokens = operands.split(", ")
             if op == "fmac":
