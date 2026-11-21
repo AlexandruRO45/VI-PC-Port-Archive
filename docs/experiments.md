@@ -880,7 +880,7 @@ This covers only the two root-signature imports observed in the pre-executable D
 | CTest case | Inputs and checks |
 |---|---|
 | `d3d12_xs_shim_exports` | Both names resolve through `GetProcAddress` inside `d3d12_xs.dll`, and the test's named import accepts `0x03000000` while desktop `d3d12.dll` rejects it with `E_INVALIDARG`. |
-| `d3d12_xs_shim_serialize` | Baseline and console-tagged (`0x01000000`, `0x02000000`, `0x03000000`) v1.1 and v1.0 descriptors serialize identically to desktop `d3d12.dll` without mutating caller input while preserving desktop flags. Unobserved flag bits (`0x04000000`, `0x07000000`, `0x80000000`) return `E_INVALIDARG`, and a null descriptor or unknown version fails with the same HRESULT as desktop `d3d12.dll`. |
+| `d3d12_xs_shim_serialize` | Baseline and console-tagged (`0x01000000`, `0x02000000`, `0x03000000`) v1.1 and v1.0 descriptors serialize identically to desktop `d3d12.dll` without mutating caller input while preserving desktop flags. Unobserved flag bits (`0x04000000`, `0x07000000`, `0x08000000`) return `E_INVALIDARG`, and a null descriptor or unknown version fails with the same HRESULT as desktop `d3d12.dll`. |
 | `d3d12_xs_shim_deserialize` | Round-trips a sanitized blob from `d3d12_xs.dll` and reads the embedded `RTS0` part of `pso_compute_embedded`; rejects `pso_compute_stripped` and empty/null buffers with `E_INVALIDARG`. |
 | `d3d12_xs_shim_warp_root` | Serializes a v1.1 `SRV(t0),UAV(u0),RootConstants(16,b0)` descriptor tagged with `0x03000000` through `d3d12_xs.dll` (verified rejected by desktop `d3d12.dll`), creates a WARP `ID3D12RootSignature`, and builds a compute PSO with `pso_compute_stripped`. |
 

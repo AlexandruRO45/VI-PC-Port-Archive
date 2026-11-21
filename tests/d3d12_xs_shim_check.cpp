@@ -160,7 +160,7 @@ bool serialize_checks()
 
     // Negative controls: unobserved invalid flag bits must still return E_INVALIDARG, and null
     // descriptor or unknown version must fail with the exact same HRESULT as desktop d3d12.dll.
-    for (const std::uint32_t bad_bits : {0x04000000u, 0x07000000u, 0x80000000u}) {
+    for (const std::uint32_t bad_bits : {0x04000000u, 0x07000000u, 0x08000000u}) {
         D3D12_VERSIONED_ROOT_SIGNATURE_DESC bad = base_v11;
         bad.Desc_1_1.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(bad_bits);
         ComPtr<ID3DBlob> desktop_bad, shim_bad;
