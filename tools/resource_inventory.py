@@ -64,7 +64,7 @@ def parts(blob):
 
 def dxil_program(data, offset):
     """Check container/part extents and DXIL bitcode framing; no shader execution."""
-    if len(data) - offset < 32:
+    if offset < 0 or len(data) - offset < 32 or data[offset:offset + 4] != b"DXBC":
         return False
     version, size, parts = struct.unpack_from("<III", data, offset + 20)
     if version != 1 or size > len(data) - offset or not 0 < parts <= (size - 32) // 4:

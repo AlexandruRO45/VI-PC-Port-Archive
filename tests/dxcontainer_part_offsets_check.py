@@ -50,6 +50,19 @@ class DXContainerPartOffsets(unittest.TestCase):
         self.assertEqual(shader_markers(normal)["framed_dxil_programs"], 1)
         self.assertEqual(shader_markers(reversed_offsets)["framed_dxil_programs"], 1)
 
+    def test_non_dxbc_magic_and_negative_offsets_rejected(self):
+        valid = container()
+        for magic in (b"XXXX", b"DXIL", b"\0\0\0\0"):
+            corrupted = magic + valid[4:]
+            with self.assertRaisesRegex(ValueError, "Expected a DXBC container"):
+                parts(corrupted)
+            self.assertFalse(dxil_program(corrupted, 0))
+            self.assertEqual(shader_markers(corrupted)["framed_dxil_programs"], 0)
+        padded = b"prefix" + valid + b"tail"
+        self.assertTrue(dxil_program(padded, 6))
+        for bad_offset in (-1, -len(padded), -len(padded) + 6, len(padded) - 31):
+            self.assertFalse(dxil_program(padded, bad_offset))
+
     def test_overlap_rejected_regardless_of_directory_order(self):
         for reversed_directory in (False, True):
             with self.subTest(reversed_directory=reversed_directory):
