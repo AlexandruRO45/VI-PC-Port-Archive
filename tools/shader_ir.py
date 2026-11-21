@@ -116,6 +116,11 @@ def parse_line(line):
     if not code:
         return None
     op, _, rest = code.partition(" ")
+    # Assembler directives (.text, .amdgcn_next_shader, ...) carry no encoding and are not
+    # instructions. LLVM 21 omits the leading directive; LLVM 18 emits a tab-prefixed
+    # `.text`, which used to reach the translator as enc=None.
+    if op.startswith("."):
+        return None
     # sendmsg(MSG_GS, GS_OP_NOP) contains a comma: keep it as one operand.
     rest = SENDMSG.sub(lambda m: m.group(0).replace(", ", "|").replace(",", "|"), rest)
     mods = MODWORDS.findall(rest)

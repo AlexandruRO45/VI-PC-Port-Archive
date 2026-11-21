@@ -41,7 +41,7 @@ work on booting can start as soon as one is available to a developer.
 |---|---|
 | Finding and checking your copy (Xbox Series 1.0.2.1) | ✅ Works |
 | Shaders: carve, unpack native RDNA2 code, disassemble | ✅ All 26,503 |
-| Shaders: RDNA2 → SPIR-V translation | ✅ **All 26,503**: 2,236 VS, 12,101 PS, 2,689 CS, 9,282 mesh, 195 geometry. All pass `spirv-val`, with a per-shader metadata index for pipeline creation. ⚠️ 21,545 are wave64: exact on 64-wide subgroups (AMD), and cross-half wave ops are approximate on 32-wide (NVIDIA) |
+| Shaders: RDNA2 → SPIR-V translation | ✅ **All 26,503**: 2,236 VS, 12,101 PS, 2,689 CS, 9,282 mesh, 195 geometry. All pass `spirv-val` with **SPIRV-Tools 2026.4 or newer**, with a per-shader metadata index for pipeline creation. ⚠️ SPIRV-Tools 2025.1 rejects the valid mesh output: its `CullPrimitiveEXT` rule accepts only a scalar bool, while the spec (and current main) accepts a scalar or an array of bool, which is what the translator emits. ⚠️ 21,545 are wave64: exact on 64-wide subgroups (AMD), and cross-half wave ops are approximate on 32-wide (NVIDIA) |
 | Shader translator checked on a real GPU | ⚠️ Vertex fetch, texture sampling, exports, ALU ops, partial-register ops, barycentrics, wave-uniform branches and compute (LDS, barriers, buffer stores) checked on one GPU |
 | Models (OBJ with real names, UVs, material references) | ✅ Exported. Not all layouts are decoded yet |
 | Texture dictionaries and world texture pools (DDS) | ✅ Exported. Some pool entries (BCPack) are skipped |
@@ -77,7 +77,8 @@ Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` arc
 - **Windows 10/11 x64**, with about **350 GB** free for work files. They can go on another drive with `--work`.
 - [Python 3.11+](https://www.python.org/downloads/) (tick "Add python.exe to PATH").
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
-- [Vulkan SDK](https://vulkan.lunarg.com/), for `spirv-as` / `spirv-val`.
+- [Vulkan SDK](https://vulkan.lunarg.com/), for `spirv-as` / `spirv-val`. Use SPIRV-Tools 2026.4 or newer: the
+  2025.1 `CullPrimitiveEXT` check accepts only a scalar bool and rejects every mesh shader this project emits.
 - [LLVM 21+](https://github.com/llvm/llvm-project/releases) with the **AMDGPU target** for `llvm-mc`. The official
   Windows build has no AMDGPU target: on Windows install `llvm-21` in WSL and set
   `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"` (see [docs/design.md](docs/design.md#disassembling-shaders)).
