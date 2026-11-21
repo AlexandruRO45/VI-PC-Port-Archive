@@ -481,6 +481,51 @@ class Gen:
         srcs = a[-2:]
         self.compare("v_cmp_" + op[len("v_cmpx_"):], [None] + list(srcs), scalar=False, exec_only=True)
 
+    def bitcmp(self, op, a):
+        """s_bitcmp0/1_b32/b64: test if bit (a[1]) of scalar a[0] is 0 or 1, result in SCC."""
+        is_64 = op.endswith("b64")
+        test_one = op.startswith("s_bitcmp1")
+        if self.holds_lane_mask(a[0]):
+            lo, hi = self.wave_mask(a[0])
+            if not is_64 and self.wave64:
+                half = self.mask_half(a[0])
+                if half == "hi":
+                    lo = hi
+        elif is_64 and a[0]["k"] == "sgpr" and a[0].get("n") == 2:
+            lo, hi = self.load_reg("sgpr", a[0]["r"]), self.load_reg("sgpr", a[0]["r"] + 1)
+        elif is_64 and a[0]["k"] == "imm":
+            v = a[0]["v"] & 0xFFFFFFFFFFFFFFFF
+            lo, hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
+        elif is_64:
+            lo, hi = self.mask_src(a[0]), self.cu(0)
+        else:
+            lo = self.src_u(a[0])
+
+        sh = self.src_u(a[1])
+        mask_bits = 63 if is_64 else 31
+        m = self.tmp()
+        self.emit(f"{m} = OpBitwiseAnd %uint {sh} {self.cu(mask_bits)}")
+
+        if is_64:
+            is_hi = self.tmp()
+            self.emit(f"{is_hi} = OpUGreaterThanEqual %bool {m} {self.cu(32)}")
+            word = self.tmp()
+            self.emit(f"{word} = OpSelect %uint {is_hi} {hi} {lo}")
+            sh32 = self.tmp()
+            self.emit(f"{sh32} = OpBitwiseAnd %uint {m} {self.cu(31)}")
+        else:
+            word = lo
+            sh32 = m
+
+        shifted, bit = self.tmp(), self.tmp()
+        self.emit(f"{shifted} = OpShiftRightLogical %uint {word} {sh32}")
+        self.emit(f"{bit} = OpBitwiseAnd %uint {shifted} {self.cu(1)}")
+        cond = self.tmp()
+        self.emit(f"{cond} = {'OpINotEqual' if test_one else 'OpIEqual'} %bool {bit} {self.cu(0)}")
+        res = self.tmp()
+        self.emit(f"{res} = OpSelect %uint {cond} {self.cu(1)} {self.cu(0)}")
+        self.emit(f"OpStore %scc {res}")
+
     def swizzle(self, a, mods, ins):
         """ds_swizzle_b32 vD, vS offset:swizzle(...): a subgroup shuffle (one invocation per lane)."""
         line = " ".join(m for m in mods) + " " + " ".join(x.get("t", "") for x in a if x["k"] in ("special", "raw"))
@@ -1860,7 +1905,7 @@ class Gen:
             self.emit(f"{m1} = OpISub %uint {one} {self.cu(1)}")
             self.emit(f"{r} = OpShiftLeftLogical %uint {m1} {om}")
             self.dst(a[0], r)
-        elif op in ("s_bcnt1_i32_b64", "s_bcnt1_i32_b32"):
+        elif op in ("s_bcnt1_i32_b64", "s_bcnt1_i32_b32", "s_bcnt0_i32_b64", "s_bcnt0_i32_b32"):
             if self.holds_lane_mask(a[1]):
                 lo, hi = self.wave_mask(a[1])
                 if op.endswith("b32") and self.wave64:
@@ -1871,10 +1916,24 @@ class Gen:
                 lo, hi = self.load_reg("sgpr", a[1]["r"]), self.load_reg("sgpr", a[1]["r"] + 1)
             else:
                 lo, hi = (self.mask_src(a[1]), self.cu(0)) if op.endswith("b64") else (self.src_u(a[1]), self.cu(0))
+            if "bcnt0" in op:
+                nlo = self.tmp()
+                self.emit(f"{nlo} = OpNot %uint {lo}")
+                lo = nlo
+                if op.endswith("b64"):
+                    nhi = self.tmp()
+                    self.emit(f"{nhi} = OpNot %uint {hi}")
+                    hi = nhi
             c1, c2, r = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{c1} = OpBitCount %uint {lo}")
-            self.emit(f"{c2} = OpBitCount %uint {hi}")
-            self.emit(f"{r} = OpIAdd %uint {c1} {c2}")
+            if op.endswith("b64") or "bcnt1" in op:
+                # s_bcnt1_i32_b32 counts the high word too: for a lane mask of a wave32 shader running in a 64-lane
+                # subgroup (graphics stages can't request 32) the other lanes' bits are there; otherwise hi is 0.
+                # s_bcnt0_i32_b32 counts zeros of the low word only (~0 in the high word would add 32).
+                self.emit(f"{c2} = OpBitCount %uint {hi}")
+                self.emit(f"{r} = OpIAdd %uint {c1} {c2}")
+            else:
+                r = c1
             self.dst(a[0], r)
             z = self.tmp()
             self.emit(f"{z} = OpSelect %uint {self.tmp_bool_nz(r)} {self.cu(1)} {self.cu(0)}")
@@ -1884,8 +1943,8 @@ class Gen:
             r = self.tmp()
             self.emit(f"{r} = OpISub %uint {y} {x}")
             self.dst(a[0], r)
-        elif op in ("s_ff1_i32_b64", "s_ff1_i32_b32"):          # the 32-bit form only for a lane mask
-            # Lowest set bit of a 64-bit mask, -1 if none. For a lane mask that is the wave's first set lane.
+        elif op in ("s_ff1_i32_b64", "s_ff1_i32_b32", "s_ff0_i32_b64", "s_ff0_i32_b32"):
+            # Lowest set (ff1) or zero (ff0) bit of a mask, -1 if none. For a lane mask that is the wave's first lane.
             if self.holds_lane_mask(a[1]):
                 lo, hi = self.wave_mask(a[1])
                 if op.endswith("b32") and self.wave64:
@@ -1896,20 +1955,33 @@ class Gen:
                 lo, hi = self.mask_src(a[1]), self.cu(0)
             else:
                 lo, hi = self.load_reg("sgpr", a[1]["r"]), self.load_reg("sgpr", a[1]["r"] + 1)
+            if "ff0" in op:
+                nlo = self.tmp()
+                self.emit(f"{nlo} = OpNot %uint {lo}")
+                lo = nlo
+                if op.endswith("b64"):
+                    nhi = self.tmp()
+                    self.emit(f"{nhi} = OpNot %uint {hi}")
+                    hi = nhi
             l, h, hp, lz, r = (self.tmp() for _ in range(5))
             self.emit(f"{l} = OpExtInst %int %glsl FindILsb {self.as_int(lo)}")
-            self.emit(f"{h} = OpExtInst %int %glsl FindILsb {self.as_int(hi)}")
-            hu = self.tmp()
-            self.emit(f"{hu} = OpBitcast %uint {h}")
-            hz = self.tmp()
-            self.emit(f"{hz} = OpIEqual %bool {hi} {self.cu(0)}")
-            self.emit(f"{hp} = OpIAdd %uint {hu} {self.cu(32)}")
-            hsel = self.tmp()
-            self.emit(f"{hsel} = OpSelect %uint {hz} {self.cu(0xFFFFFFFF)} {hp}")
-            self.emit(f"{lz} = OpIEqual %bool {lo} {self.cu(0)}")
-            lu = self.tmp()
-            self.emit(f"{lu} = OpBitcast %uint {l}")
-            self.emit(f"{r} = OpSelect %uint {lz} {hsel} {lu}")
+            if op.endswith("b64"):
+                self.emit(f"{h} = OpExtInst %int %glsl FindILsb {self.as_int(hi)}")
+                hu = self.tmp()
+                self.emit(f"{hu} = OpBitcast %uint {h}")
+                hz = self.tmp()
+                self.emit(f"{hz} = OpIEqual %bool {hi} {self.cu(0)}")
+                self.emit(f"{hp} = OpIAdd %uint {hu} {self.cu(32)}")
+                hsel = self.tmp()
+                self.emit(f"{hsel} = OpSelect %uint {hz} {self.cu(0xFFFFFFFF)} {hp}")
+                self.emit(f"{lz} = OpIEqual %bool {lo} {self.cu(0)}")
+                lu = self.tmp()
+                self.emit(f"{lu} = OpBitcast %uint {l}")
+                self.emit(f"{r} = OpSelect %uint {lz} {hsel} {lu}")
+            else:
+                lu = self.tmp()
+                self.emit(f"{lu} = OpBitcast %uint {l}")
+                r = lu
             self.dst(a[0], r)
         elif op == "ds_swizzle_b32":
             self.swizzle(a, mods, ins)
@@ -2239,7 +2311,10 @@ class Gen:
             # 16-bit integer ops on the low halves (op_sel picks high halves in the VOP3 form). Per Mesa ACO
             # (can_use_opsel): the opsel-capable VOP3 (_e64) forms are partial writes that keep the high half,
             # and the VOP2 (_e32) forms define the whole register (high half modelled as zero).
-            e64 = ins["op"].endswith("_e64")
+            # VOP3 = an 8-byte encoding. LLVM 21 prints the VOP3 form of these ops without the _e64 suffix (every
+            # one in the game's shaders), so the mnemonic alone would make them VOP2 writes and zero the high half.
+            enc = ins.get("enc")
+            e64 = len(enc) == 16 if enc else ins["op"].endswith("_e64")
             sel = next((m for m in mods if m.startswith("op_sel:")), "op_sel:[0,0,0]")
             sb = [int(x) for x in sel.split("[")[1].rstrip("]").split(",")] + [0, 0, 0]
             if not e64 and sb[:2] != [0, 0]:
@@ -2605,7 +2680,7 @@ class Gen:
             self.dst(a[0], r)
         elif op.startswith("s_load_dword") or op.startswith("s_buffer_load_dword"):
             self.scalar_load(op, a, ins["mods"])
-        elif op in ("s_lshl_b64", "s_lshr_b64"):
+        elif op in ("s_lshl_b64", "s_lshr_b64", "s_ashr_i64"):
             # 64-bit shift of an SGPR pair by (src1 & 63); SCC = result != 0.
             d, x = a[0], a[1]
             if d["k"] != "sgpr" or d.get("n") != 2:
@@ -2625,7 +2700,15 @@ class Gen:
             self.emit(f"{v64} = OpBitwiseOr %ulong {t} {l64}")
             self.emit(f"{m} = OpBitwiseAnd %uint {sh} {self.cu(63)}")
             self.emit(f"{s64} = OpUConvert %ulong {m}")
-            self.emit(f"{r} = {'OpShiftLeftLogical' if op == 's_lshl_b64' else 'OpShiftRightLogical'} %ulong {v64} {s64}")
+            if op == "s_ashr_i64":
+                vs64, rs64 = self.tmp(), self.tmp()
+                self.emit(f"{vs64} = OpBitcast %long {v64}")
+                self.emit(f"{rs64} = OpShiftRightArithmetic %long {vs64} {s64}")
+                self.emit(f"{r} = OpBitcast %ulong {rs64}")
+            elif op == "s_lshl_b64":
+                self.emit(f"{r} = OpShiftLeftLogical %ulong {v64} {s64}")
+            else:
+                self.emit(f"{r} = OpShiftRightLogical %ulong {v64} {s64}")
             self.emit(f"{rlo} = OpUConvert %uint {r}")
             self.emit(f"{rh} = OpShiftRightLogical %ulong {r} %c64_32")
             self.emit(f"{rhi} = OpUConvert %uint {rh}")
@@ -2898,6 +2981,8 @@ class Gen:
             if ty == "i32" and v & 0x8000:
                 v -= 0x10000
             self.compare("s_cmp_" + op[len("s_cmpk_"):], [a[0], {"k": "imm", "v": v}], scalar=True)
+        elif op.startswith("s_bitcmp"):
+            self.bitcmp(op, a)
         elif op == "s_bfm_b32":
             # Bitfield mask: ((1 << width) - 1) << offset, width/offset from the low 5 bits of the sources.
             w, o = self.src_u(a[1]), self.src_u(a[2])

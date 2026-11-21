@@ -15,7 +15,8 @@ import check
 WAVE64_DUMPS = {n: w for n, w in check.CS_DUMPS if n not in ("cs_store", "cs_wave64_ballot")}
 
 
-TOTAL = 22 + len(WAVE64_DUMPS)   # every test check.py runs (including the three clip fixtures)
+# Include cs_wavemask and the two store tests in addition to the named test groups.
+TOTAL = len(check.COMPUTE) + 1 + len(check.CS_DUMPS) + 2 + len(check.CLIP_TESTS) + len(check.PIXEL_TESTS)
 
 
 class Wave64Checks(unittest.TestCase):
