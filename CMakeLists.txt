@@ -452,6 +452,31 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME cpu_bink_package_descriptors COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/cpu/bink_descriptors_check.py" "$<TARGET_FILE:cpu_bink_package_descriptors>")
     endif()
+    function(bink_frame_integration name driver descriptors heap)
+        # Link identical translated objects to the shared DLL and to the recording
+        # provider so a failing allocation can be injected at the import boundary.
+        add_library(${name}_objects OBJECT "${driver}" "${CMAKE_CURRENT_BINARY_DIR}/${descriptors}.cpp"
+            "${CMAKE_CURRENT_BINARY_DIR}/${heap}.cpp")
+        add_library(${name} SHARED $<TARGET_OBJECTS:${name}_objects>)
+        target_link_libraries(${name} PRIVATE xmem_shim)
+        add_library(${name}_observed SHARED $<TARGET_OBJECTS:${name}_objects>)
+        target_link_libraries(${name}_observed PRIVATE cpu_bink_heap_provider)
+        add_test(NAME ${name} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/cpu/bink_frame_heap_check.py" "$<TARGET_FILE:${name}>"
+            "$<TARGET_FILE:${name}_observed>" "$<TARGET_FILE:xmem_shim>" "$<TARGET_FILE:cpu_bink_heap_provider>")
+    endfunction()
+    bink_frame_integration(cpu_bink_frame_to_heap tests/cpu/bink_frame_control.cpp
+        cpu_bink_descriptors_lifted cpu_bink_heap_lifted)
+    if(BINK_DESCRIPTOR_IMAGE AND BINK_DESCRIPTOR_IMAGE STREQUAL BINK_HEAP_IMAGE AND BINK_GROUP_ENTRY)
+        set(frame_driver "${CMAKE_CURRENT_BINARY_DIR}/bink_frame_driver.cpp")
+        add_custom_command(OUTPUT "${frame_driver}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/bink_frame_aot.py"
+                "${BINK_DESCRIPTOR_IMAGE}" "${frame_driver}"
+            DEPENDS "${BINK_DESCRIPTOR_IMAGE}" tools/bink_frame_aot.py tools/bink_descriptors_aot.py
+                tools/bink_heap_aot.py tools/ffx_version_query.py tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        bink_frame_integration(cpu_bink_package_frame_to_heap "${frame_driver}"
+            cpu_bink_package_descriptors cpu_bink_package_lifted)
+    endif()
     set(heap_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_heap_layout_lifted.cpp")
     add_custom_command(OUTPUT "${heap_fixture}"
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/heap_layout.py"
