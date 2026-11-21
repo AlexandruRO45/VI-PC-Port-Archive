@@ -71,6 +71,9 @@ python -I tools/audio_config.py <carve dir or blob> [--json] [--names FILE] [--j
   string when a NUL-separated local name pool is supplied.
 - `joaat` and `normalized_name` are the shared hash helpers.
 - Text output prints one line per record and a summary; `--json` writes `{records, summary}`.
+- With no `--json`, a bank with no records (all missing or filtered out by `--min-ms`/`--max-ms`) is reported as
+  `ERROR: <src>: no music records found ...` on stderr with exit code 1, instead of a formatting traceback.
+  `--json` still writes an empty summary for such a bank.
 
 `--names` is optional. The package's debug name stream and the localization credits are local game
 files; nothing from them is committed.

@@ -105,6 +105,21 @@ class TestCli(unittest.TestCase):
             self.assertEqual(doc["records"][0]["name"], name)
             self.assertEqual(doc["records"][0]["stream_id"], hb & A.STREAM_MASK)
 
+    def test_zero_records_is_a_clear_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = os.path.join(tmp, "empty.bin")
+            with open(empty, "wb") as f:
+                f.write(b"\x00" * 4)
+            p = subprocess.run([sys.executable, "-I", TOOL, empty], capture_output=True, text=True)
+            self.assertEqual(p.returncode, 1, p.stderr)
+            self.assertIn("no music records found", p.stderr)
+            self.assertIn(empty, p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            # The machine-readable path stays usable: an empty bank has an empty summary, not a crash.
+            p = subprocess.run([sys.executable, "-I", TOOL, empty, "--json"], capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(json.loads(p.stdout)["summary"]["records"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

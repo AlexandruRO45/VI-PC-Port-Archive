@@ -75,6 +75,39 @@ class CarveEdgeTest(unittest.TestCase):
         self.assertEqual(doc["summary"]["files"], 0)
         self.assertEqual(doc["summary"]["span"], 0)
 
+    def test_empty_and_short_archives_are_empty_indexes(self):
+        # mmap used to raise on an empty file, and the header unpack on anything under 8 bytes (#281).
+        for data in (b"", b"RPF", b"RPF9"):
+            doc = carve(self, data)
+            self.assertEqual((doc["summary"]["files"], doc["summary"]["span"]), (0, 0))
+
+    def test_start_at_or_past_end_is_a_one_line_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "x.rpf")
+            make_archive(arc)
+            end = os.path.getsize(arc)
+            for start in (end, end + 1):
+                out = os.path.join(tmp, "out")
+                p = subprocess.run([sys.executable, "-I", TOOL, arc, out, "--index-only",
+                                    "--start", str(start)], capture_output=True, text=True)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertIn("--start", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertFalse(os.path.exists(os.path.join(out, "index.json")))
+
+    def test_header_start_past_end_is_a_one_line_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "x.rpf")
+            out = os.path.join(tmp, "out")
+            with open(arc, "wb") as f:
+                f.write(b"RPF9" + struct.pack("<I", 0x1000))   # 8-byte file, data start far past its end
+            p = subprocess.run([sys.executable, "-I", TOOL, arc, out, "--index-only"],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertIn("data start", p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            self.assertFalse(os.path.exists(out))
+
 
 if __name__ == "__main__":
     unittest.main()

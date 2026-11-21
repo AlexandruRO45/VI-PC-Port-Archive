@@ -324,11 +324,14 @@ def scan_rpf(path, start=None, limit=None, progress=None):
     """Walk an RPF9 data area. Returns (records, summary). No tables of contents are read or decrypted."""
     rows = []
     with open(path, "rb") as fh:
-        m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+        # mmap refuses an empty file; an empty buffer walks the same code and finds no streams (#281)
+        m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) if os.fstat(fh.fileno()).st_size else b""
         size = len(m)
-        first = struct.unpack_from("<I", m, 4)[0] if size >= 8 else 0
+        first = struct.unpack_from("<I", m, 4)[0] if size >= 8 else size
         pos = start if start is not None else first
         if not 0 <= pos <= size:
+            if size:
+                m.close()
             raise ValueError("start offset is outside the archive")
         end = min(size, pos + limit) if limit else size
         span_start = pos
@@ -380,7 +383,8 @@ def scan_rpf(path, start=None, limit=None, progress=None):
         z, u = _gap(m[last:end])
         zero += z
         unread += u
-        m.close()
+        if size:
+            m.close()
     summary = summarise(rows, end - span_start, zero, unread)
     summary["mode"] = "rpf9"
     summary["archive"] = path
@@ -445,12 +449,34 @@ def write_output(path, rows, summary):
                         for i, c in enumerate(COLUMNS)])
 
 
+def offset(text):
+    """--start: 0 or more, decimal or 0x hex (a negative value scanned nothing)."""
+    try:
+        value = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be 0 or more") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be 0 or more")
+    return value
+
+
+def byte_count(text):
+    """--limit: at least 1, decimal or 0x hex (0 used to mean no limit)."""
+    try:
+        value = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be at least 1") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source", help="an .rpf archive or a directory of carved .bin files")
     ap.add_argument("out", help="output path ending in .csv or .json")
-    ap.add_argument("--start", type=lambda s: int(s, 0), help="first byte to scan (default: the RPF data start)")
-    ap.add_argument("--limit", type=lambda s: int(s, 0), help="number of bytes to scan")
+    ap.add_argument("--start", type=offset, help="first byte to scan (default: the RPF data start)")
+    ap.add_argument("--limit", type=byte_count, help="number of bytes to scan")
     ap.add_argument("--rigs", metavar="PATH", help="write parsed RBF0 rig-set/rig and SKEL_ JSON here")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
@@ -460,7 +486,11 @@ def main():
         def progress(n, pos, end):
             if not a.quiet:
                 print(f"[{pos / max(1, end):6.1%}] {n} streams", flush=True)
-        rows, summary = scan_rpf(a.source, a.start, a.limit, progress)
+        try:
+            rows, summary = scan_rpf(a.source, a.start, a.limit, progress)
+        except (OSError, ValueError) as e:
+            print(f"{a.source}: {e}", file=sys.stderr)
+            return 2
     write_output(a.out, rows, summary)
     if a.rigs:
         if os.path.isdir(a.source):

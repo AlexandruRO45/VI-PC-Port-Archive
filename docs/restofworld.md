@@ -338,6 +338,10 @@ python -I tools/restofworld_index.py <archive.rpf> <work>\index.json
 python -I tests/test_restofworld_index.py
 ```
 
+`--start` must be 0 or more and `--limit` at least 1 (decimal or `0x` hex); a bad range stops with a one-line
+error and exit code 2. An empty archive, or one shorter than its 8-byte header, gives an index with no files
+instead of a traceback.
+
 For the map/meta split, run the `world_index.py` from `docs/world.md` over the same archive; it reports
 `maps`, `meta`, `entities` and the `0x7a` version without decoding geometry. The index tool walks readable
 streams; the nine `RSC8` headers in the story-rest unread gap come from a raw-file scan, not from the

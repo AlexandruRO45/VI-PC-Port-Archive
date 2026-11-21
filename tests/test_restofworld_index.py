@@ -253,6 +253,34 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual([r["signature"] for r in rows], ["psin", "0drp"])
         self.assertEqual(summary["span"], limit)
 
+    def test_empty_and_short_archives_have_no_streams(self):
+        for name, data in (("empty.rpf", b""), ("short.rpf", b"RPF9")):
+            path = os.path.join(self.root, name)
+            with open(path, "wb") as f:
+                f.write(data)
+            rows, summary = restofworld_index.scan_rpf(path)
+            self.assertEqual(rows, [])
+            self.assertEqual((summary["files"], summary["span"]), (0, 0))
+            out = os.path.join(self.root, name + ".json")
+            proc = subprocess.run([sys.executable, "-I", TOOL, path, out, "--quiet"],
+                                  capture_output=True, text=True, encoding="utf-8", errors="replace")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertNotIn("Traceback", proc.stderr)
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["summary"]["files"], 0)
+
+    def test_bad_scan_arguments_are_one_line_errors(self):
+        for flag, value, message in (("--start", "-1", "must be 0 or more"),
+                                     ("--limit", "0", "must be at least 1"),
+                                     ("--start", "0x7fffffff", "start offset is outside the archive")):
+            out = os.path.join(self.root, "bad.json")
+            proc = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet", flag, value],
+                                  capture_output=True, text=True, encoding="utf-8", errors="replace")
+            self.assertEqual(proc.returncode, 2, proc.stderr)
+            self.assertIn(message, proc.stderr)
+            self.assertNotIn("Traceback", proc.stderr)
+            self.assertFalse(os.path.exists(out))
+
     def test_csv_and_json(self):
         rows, summary = restofworld_index.scan_rpf(self.rpf)
         csv_path = os.path.join(self.root, "out.csv")

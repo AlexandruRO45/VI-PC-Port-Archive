@@ -201,6 +201,11 @@ def main():
     names = load_names(a.names) if a.names else None
     records = collect(a.src, a.min_ms, a.max_ms, names, a.join)
     summary = summarize(records)
+    if not records and not a.json:
+        # The summary has no id_min/id_max to print; an empty bank is bad input, not an empty table.
+        print(f"ERROR: {a.src}: no music records found with durations {a.min_ms}..{a.max_ms} ms",
+              file=sys.stderr)
+        return 1
 
     if a.json:
         json.dump({"records": records, "summary": summary}, sys.stdout, indent=1)

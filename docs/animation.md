@@ -390,7 +390,9 @@ python -I tools/anim_index.py <work>\anim-carve <work>\anim-index.json
 ```
 
 `tools/anim_index.py` reports `MoVE`, `0DRP`, `pack:/`, `SKEL_`, `RBF0`, `PSIN`, type-hash and 2/3 clip headers,
-plus `raw:<hex>` for anything it does not recognise. It writes no payloads.
+plus `raw:<hex>` for anything it does not recognise. It writes no payloads. `--start` must be 0 or more and
+`--limit` at least 1 (decimal or `0x` hex); a bad range stops with a one-line error and exit code 2. An empty
+archive, or one shorter than its 8-byte header, gives an index with no files instead of a traceback.
 
 ## No-sharing rule
 

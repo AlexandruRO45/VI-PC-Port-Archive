@@ -7,6 +7,7 @@ Every byte here is built by the test. No game file, game asset path or game name
 import csv
 import json
 import os
+import subprocess
 import struct
 import sys
 import tempfile
@@ -14,6 +15,7 @@ import unittest
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TOOL = os.path.join(ROOT, "tools", "rbf0_index.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import rbf0_index  # noqa: E402
@@ -199,6 +201,48 @@ class JoinTest(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["chunks"], 1)
         self.assertEqual(summary["streams"], 2)
+
+
+class InputTest(unittest.TestCase):
+    """Empty archives have no resources; bad ranges end with a line on stderr, not a traceback."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_empty_and_short_archives_have_no_resources(self):
+        for name, data in (("empty.rpf", b""), ("short.rpf", b"RBF0")):
+            path = os.path.join(self.root, name)
+            with open(path, "wb") as f:
+                f.write(data)
+            rows, records, summary = rbf0_index.scan_rpf(path)
+            self.assertEqual((rows, records), ([], []))
+            self.assertEqual((summary["streams"], summary["span"]), (0, 0))
+            out = os.path.join(self.root, name + ".json")
+            p = subprocess.run([sys.executable, "-I", TOOL, path, out, "--quiet"],
+                               capture_output=True, text=True, encoding="utf-8", errors="replace")
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["summary"]["streams"], 0)
+
+    def test_bad_scan_arguments_are_one_line_errors(self):
+        path = os.path.join(self.root, "one.rpf")
+        with open(path, "wb") as f:
+            f.write(b"RBF0" + struct.pack("<I", 0x100) + bytes(0x100))
+        for flag, value, message in (("--start", "-1", "must be 0 or more"),
+                                     ("--limit", "0", "must be at least 1"),
+                                     ("--start", "0x7fffffff", "start offset is outside the archive")):
+            out = os.path.join(self.root, "bad.json")
+            p = subprocess.run([sys.executable, "-I", TOOL, path, out, "--quiet", flag, value],
+                               capture_output=True, text=True, encoding="utf-8", errors="replace")
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertIn(message, p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            self.assertFalse(os.path.exists(out))
 
 
 class OutputTest(unittest.TestCase):
