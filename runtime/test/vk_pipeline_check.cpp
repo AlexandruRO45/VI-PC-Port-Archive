@@ -422,6 +422,7 @@ int main(int argc, char** argv) {
             if (feat == "geometryShader" && !f2.features.geometryShader) return "no geometryShader";
             if (feat == "fragmentShaderBarycentric" && !(ext_bary && bary.fragmentShaderBarycentric)) return "no fragmentShaderBarycentric";
             if (feat == "fragmentShaderPixelInterlock" && !(ext_lock && lock.fragmentShaderPixelInterlock)) return "no fragmentShaderPixelInterlock";
+            if (feat == "shaderClipDistance" && !f2.features.shaderClipDistance) return "no shaderClipDistance";
             if (feat == "shaderFloat64" && !f2.features.shaderFloat64) return "no shaderFloat64";
             if (feat == "shaderInt64" && !f2.features.shaderInt64) return "no shaderInt64";
             if (feat == "bufferDeviceAddress" && !f12.bufferDeviceAddress) return "no bufferDeviceAddress";

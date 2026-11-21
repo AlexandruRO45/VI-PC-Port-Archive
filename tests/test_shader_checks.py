@@ -15,7 +15,7 @@ import check
 WAVE64_DUMPS = {n: w for n, w in check.CS_DUMPS if n not in ("cs_store", "cs_wave64_ballot")}
 
 
-TOTAL = 19 + len(WAVE64_DUMPS)   # every test check.py runs (19 = the compute, store and pixel tests)
+TOTAL = 22 + len(WAVE64_DUMPS)   # every test check.py runs (including the three clip fixtures)
 
 
 class Wave64Checks(unittest.TestCase):
@@ -51,7 +51,7 @@ class Wave64Checks(unittest.TestCase):
                 (spirv / "cs_wave64_ballot.spv").touch()
             output = io.StringIO()
             with (patch.object(sys, "argv", ["check.py", tmp]), patch.object(check, "run", side_effect=harness),
-                  patch.object(check, "pixel_test", return_value=""), contextlib.redirect_stdout(output)):
+                  patch.object(check, "clip_test", return_value=""), patch.object(check, "pixel_test", return_value=""), contextlib.redirect_stdout(output)):
                 status = check.main()
         return status, output.getvalue()
 

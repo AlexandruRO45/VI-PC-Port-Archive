@@ -74,6 +74,7 @@ class Gen:
         self.body = []
         self.consts = {}
         self.n = 0
+        self.clip_xy = False
         self.outputs = {}
         self.inputs = {}
         self.interpolated = set()   # inputs read through v_interp_p1/p2; the rest are flat (v_interp_mov only)
@@ -4322,6 +4323,15 @@ class Gen:
                     comps.append(self.src_f(x))
         while len(comps) < 4:
             comps.append("%f0")
+        if tgt == "pos1" and self.clip_xy:
+            active = self.active_b()
+            for idx, component in enumerate(comps[:2]):
+                ptr, old, value = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{ptr} = OpAccessChain %_ptr_Output_float %out_clip {self.cu(idx)}")
+                self.emit(f"{old} = OpLoad %float {ptr}")
+                self.emit(f"{value} = OpSelect %float {active} {component} {old}")
+                self.emit(f"OpStore {ptr} {value}")
+            return
         comps = comps[:4]
         v = self.tmp()
         self.emit(f"{v} = OpCompositeConstruct %v4float {' '.join(comps)}")
@@ -4396,6 +4406,8 @@ def assemble(gen):
                  (["%images_3d"] if gen.uses_tex_3d else []) + (["%simages3d"] if gen.uses_storage3d else [])
     if sg:
         iface += ["%sg_lane"]
+    if gen.clip_xy:
+        iface.append("%out_clip")
     if gen.writes_depth:
         iface += ["%out_depth"]
     iface += [f"%vin{reg}" for reg, _ in gen.vertex_inputs] + ["%user_data"]
@@ -4409,6 +4421,8 @@ def assemble(gen):
         (["RuntimeDescriptorArray"] if tex else []) + (["GroupNonUniform", "GroupNonUniformShuffle"] if sg else []) + \
         (["ImageQuery"] if gen.uses_query else []) + (["Sampled1D"] if gen.uses_tex_1d else []) + \
         (["MinLod"] if gen.uses_minlod else []) + (["ImageGatherExtended"] if gen.uses_img_offset else []) +         (["FragmentBarycentricKHR"] if bary else [])
+    if gen.clip_xy:
+        caps.append("ClipDistance")
     if gen.uses_vote:
         caps += [c for c in ("GroupNonUniform", "GroupNonUniformVote") if c not in caps]
     if gen.uses_ballot:
@@ -4666,6 +4680,12 @@ def assemble(gen):
                   "%_ptr_Input_v4u = OpTypePointer Input %v4uint_in", "%_ptr_Input_v4i = OpTypePointer Input %v4int_in"]
         for reg, ctype in gen.vertex_inputs:
             dec.append(f"OpDecorate %vin{reg} Location {reg}")
+    if gen.clip_xy:
+        types += [f"%clip_array = OpTypeArray %float {gen.cu(2)}",
+                  "%_ptr_Output_clip = OpTypePointer Output %clip_array",
+                  "%_ptr_Output_float = OpTypePointer Output %float"]
+        gvars.append("%out_clip = OpVariable %_ptr_Output_clip Output")
+        dec.append("OpDecorate %out_clip BuiltIn ClipDistance")
     if gen.writes_depth:
         types += ["%_ptr_Output_float = OpTypePointer Output %float"]
         dec += ["OpDecorate %out_depth BuiltIn FragDepth"]
@@ -5070,22 +5090,48 @@ def same_encoding(raw, printed, op):
     return vop3p and two_src and diff == 1 << 14
 
 
-def output_signature(path, name):
-    """OSG1 elements as (register, system value), one per register (first element wins)."""
+def output_elements(path, name):
+    """OSG1 records in stream order: register, system value, semantic index, type and mask."""
     dxbc = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), name + ".dxbc")
-    d = open(dxbc, "rb").read()
+    with open(dxbc, "rb") as f:
+        d = f.read()
     for k in range(struct.unpack_from("<I", d, 28)[0]):
         off = struct.unpack_from("<I", d, 32 + 4 * k)[0]
         if d[off:off + 4] == b"OSG1":
             p = d[off + 8:off + 8 + struct.unpack_from("<I", d, off + 4)[0]]
             cnt, eo = struct.unpack_from("<II", p, 0)
-            seen = {}
+            elements = []
             for i in range(cnt):
                 e = p[eo + 32 * i:eo + 32 * i + 32]
-                _, _, _, sysv, _, reg = struct.unpack_from("<6I", e, 0)
-                seen.setdefault(reg, sysv)
-            return sorted(seen.items())
+                _, _, index, sysv, ctype, reg = struct.unpack_from("<6I", e, 0)
+                elements.append((reg, sysv, index, ctype, e[24]))
+            return elements
     return []
+
+
+def output_signature(path, name):
+    seen = {}
+    for reg, sysv, _, _, _ in output_elements(path, name):
+        seen.setdefault(reg, sysv)
+    return sorted(seen.items())
+
+
+def exports_clip_xy(path, name, insns):
+    # A second position slot can carry miscellaneous per-vertex data. Only use
+    # the measured layout: one pos1 with x and y, no later position slots, float clip0.xy
+    # and no competing system-value outputs.
+    extra = [i for i in insns if i["op"] == "exp" and i["args"] and
+             i["args"][0].get("t", "").startswith("pos") and i["args"][0]["t"] != "pos0"]
+    if len(extra) != 1 or extra[0]["args"][0]["t"] != "pos1" or "compr" in extra[0]["mods"]:
+        return False
+    if any(x.get("t") == "off" for x in extra[0]["args"][1:3]):
+        return False
+    try:
+        elements = output_elements(path, name)
+    except FileNotFoundError:
+        return False
+    special = [(sv, index, kind, mask) for _, sv, index, kind, mask in elements if sv not in (0, 1)]
+    return special == [(2, 0, 3, 3)]
 
 
 def mesh_psv(path, name):
@@ -5148,6 +5194,7 @@ def translate(path):
         if any(i.get("normalized") for i in insns):
             raise Unsupported("reachable instruction with normalized encoding")
     g = Gen(stage)
+    g.clip_xy = stage == "vs" and exports_clip_xy(path, info["name"], insns)
     g.wave64 = any(WAVE64_RE.search(" ".join([i["op"]] + [x.get("t", "") for x in i["args"]])) or
                    (base_op(i["op"]).endswith("_b64") and any(x.get("t") in ("exec", "vcc") for x in i["args"]))
                    for i in insns)
@@ -5460,7 +5507,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
     caps = sorted(set(re.findall(r"OpCapability (\w+)", asm)))
     exts = sorted(set(re.findall(r'OpExtension "([^"]+)"', asm)))
     binds = sorted({int(b) for b in re.findall(r"OpDecorate %\w+ Binding (\d+)", asm)})
-    feats = {"FragmentBarycentricKHR": "fragmentShaderBarycentric",
+    feats = {"ClipDistance": "shaderClipDistance", "FragmentBarycentricKHR": "fragmentShaderBarycentric",
              "FragmentShaderPixelInterlockEXT": "fragmentShaderPixelInterlock",
              "MeshShadingEXT": "meshShader", "Geometry": "geometryShader", "Float64": "shaderFloat64",
              "Int64": "shaderInt64", "StorageImageWriteWithoutFormat": "shaderStorageImageWriteWithoutFormat",

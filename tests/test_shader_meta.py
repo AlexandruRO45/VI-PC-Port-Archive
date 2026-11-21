@@ -157,6 +157,25 @@ class DxbcMetaTests(unittest.TestCase):
 
 
 class ShaderMetaIntegrationTests(unittest.TestCase):
+    def test_clip_distance_requires_unambiguous_vertex_exports(self):
+        clip = ("SV_ClipDistance", 0, 5, 3, 0, 2, 3)
+        cull = ("SV_CullDistance", 0, 6, 1, 0, 3, 3)
+        pos1 = "exp pos1 v2, v3, off, off done"
+        for elements, exports, expected in (
+            ([clip], [pos1], True),
+            ([], [pos1], False),
+            ([clip, cull], [pos1], False),
+            ([clip], [pos1, "exp pos2 v0, v1, off, off"], False),
+            ([clip], ["exp pos1 off, v3, off, off done"], False),
+            ([clip], [], False),
+        ):
+            with self.subTest(elements=elements, exports=exports):
+                _, payload = isg1_chunk(elements)
+                lines = ["exp pos0 v0, v1, v2, v3", *exports, "s_endpgm"]
+                asm, meta = translate_synthetic("vs_clip_test", lines, make_dxbc([(b"OSG1", payload)]))
+                self.assertEqual("BuiltIn ClipDistance" in asm, expected)
+                self.assertEqual("shaderClipDistance" in meta["features"], expected)
+
     def test_ptr64_const32_stride_literal_sampler_and_fssm_hash(self):
         # User SGPRs:
         #   s[0:1] -> 64-bit descriptor-table pointer, offset by (s2 << 5) (32-byte T# stride)
