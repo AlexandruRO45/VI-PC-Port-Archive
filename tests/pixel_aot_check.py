@@ -831,6 +831,52 @@ def check_half_draw(directory, compiler, renderer, backend):
         raise AssertionError("A wrong s_ashr_i64 count escaped detection in channel 1")
 
 
+BITWISE_WORDS = (0x3fc00000, 0x00e00000, 0x00400000, 35)
+BITWISE_BODY = [
+    "v_mov_b32_e32 v18, 1.0",
+    "v_or_b32_e32 v18, s45, v18",
+    "v_and_b32_e32 v12, s44, v18",
+    "v_mov_b32_e32 v19, 2.0",
+    "v_xor_b32_e32 v13, s46, v19",
+    "v_mov_b32_e32 v20, 0x10000000",
+    "v_lshlrev_b32_e32 v20, s47, v20",
+    "v_lshrrev_b32_e32 v14, 1, v20",
+    "v_mov_b32_e32 v21, 0xf0000000",
+    "v_ashrrev_i32_e32 v22, 4, v21",
+    "v_mov_b32_e32 v23, -4.0",
+    "v_xor_b32_e32 v15, v23, v22",
+]
+
+
+def check_vector_bitwise_draw(directory, compiler, renderer, backend):
+    source = directory / "bitwise.hlsl"
+    shader = directory / "bitwise.cso"
+    case = directory / "bitwise.case"
+    instructions = with_constants(BITWISE_BODY)
+    source.write_text(translate(instructions), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    constants = bytearray(256)
+    struct.pack_into("<4I", constants, 12, *BITWISE_WORDS)
+    expected = [1.5, 3.0, 2.0, 1.0]
+    assert all(half_rtz(x) == x for x in expected)
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+    subprocess.run(draw, check=True)
+    for old, new, label in (
+        ("v_ashrrev_i32_e32 v22, 4, v21", "v_lshrrev_b32_e32 v22, 4, v21", "arithmetic vs logical shift"),
+        ("v_xor_b32_e32 v13, s46, v19", "v_and_b32_e32 v13, s46, v19", "xor vs and"),
+        ("v_and_b32_e32 v12, s44, v18", "v_or_b32_e32 v12, s44, v18", "and vs or"),
+        ("v_lshrrev_b32_e32 v14, 1, v20", "v_ashrrev_i32_e32 v14, 1, v20", "logical vs arithmetic shift"),
+    ):
+        mutated = [line.replace(old, new) for line in instructions]
+        assert mutated != instructions, label
+        source.write_text(translate(mutated), encoding="ascii")
+        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Mutation of {label} escaped detection")
+
+
 def arithmetic():
     """Add, multiply, reversed subtraction and moves on the sample and constant words 8 to 11."""
     program = assembly(False)
@@ -1783,6 +1829,7 @@ def check_controls(directory):
     for register in ("v12", "v13", "v14", "v15"):
         must_reject(translate, program[:wait] + [f"v_mov_b32_e32 {register}, 1.0"] + program[wait:])
     must_reject(translate, program[:wait] + ["v_ceil_f32_e32 v12, 1.0"] + program[wait:])
+    must_reject(translate, program[:wait] + ["v_and_b32_e32 v12, s44, v12"] + program[wait:])
     free = translate(program[:wait] + ["v_mov_b32_e32 v21, 1.0"] + program[wait:])
     assert free.index("tex.Sample") < free.index("= 1.0f;") < free.index("= sample16.x;")
     late = translate(program[:wait+1] + ["v_mov_b32_e32 v12, 1.0"] + program[wait+1:])
@@ -1791,12 +1838,16 @@ def check_controls(directory):
     must_reject(translate, program[:pos] + ["v_mov_b32_e32 v20, v16"] + program[pos:])
     pos = program.index("s_wqm_b64 exec, exec") + 1
     must_reject(translate, program[:pos] + ["v_mov_b32_e32 v20, 1.0"] + program[pos:])
+    must_reject(translate, program[:pos] + ["v_and_b32_e32 v18, s44, v12"] + program[pos:])
     pos = program.index("v_interp_p1_f32_e32 v9, v0, attr0.y")
     partial = program[:pos] + ["v_interp_p1_f32_e32 v10, v0, attr0.x"] + program[pos:]
     translate(partial)  # an unpaired first phase is allowed, but its partial value is not numeric
     must_reject(translate, [line.replace("v18, v12", "v18, v10") for line in partial])
     pos = program.index("s_waitcnt lgkmcnt(0)", program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0x20"))
     must_reject(translate, program[:pos] + ["v_mov_b32_e64 v19, s46"] + program[pos:])
+    must_reject(translate, with_constants(["v_and_b32_e32 v12, v50, v12"]))
+    must_reject(translate, with_constants(["v_and_b32_e32 v12, v0, v12"]))
+    must_reject(translate, with_constants(["v_and_b32_e32 v256, s44, v12"]))
 
     for old, new in (("0x40", "0x48"), ("0xc", "0xfe"), ("0xc", "0x100"),
                      ("s_waitcnt lgkmcnt(0)", "s_nop 0"), ("s[44:47], 0xc", "s[40:43], 0xc")):
@@ -2022,6 +2073,19 @@ def check_controls(directory):
     wqm = base_ld.index("s_wqm_b64 exec, exec") + 1
     must_reject(translate, base_ld[:wqm] + ["v_ldexp_f32 v20, 1.0, 2"] + base_ld[wqm:])
 
+    # 32-bit vector bitwise logic and shift controls.
+    bitwise_source = translate(with_constants(BITWISE_BODY))
+    for expected in (
+        "asfloat(asuint(params[0].w) & asuint(alu21));",
+        "asfloat(asuint(params[1].x) | asuint(alu20));",
+        "asfloat(asuint(params[1].y) ^ asuint(alu23));",
+        "asfloat(asuint(alu25) << (asuint(params[1].z) & 31u));",
+        "asfloat(asuint(alu26) >> (1u & 31u));",
+        "asfloat(asuint(asint(asuint(alu28)) >> (4u & 31u)));",
+        "asfloat(asuint(alu30) ^ asuint(alu29));",
+    ):
+        assert expected in bitwise_source, expected
+
 
 def check_program_extent(directory, library):
     # A conditional jumps over the early exit. The alternate block starts
@@ -2087,6 +2151,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((attribute_color(rg), translate_attribute) for rg in (False, True))
     exp_sync_program = ["s_waitcnt_expcnt null, 0"] + assembly(False)[:-1] + ["s_waitcnt_expcnt null, 0", "s_endpgm"]
     fixtures.append((exp_sync_program, translate))
+    fixtures.append((with_constants(BITWISE_BODY), translate))
     for index, (instructions, lower_fixture) in enumerate(fixtures):
         source = directory / "fixture.s"
         obj = directory / "fixture.o"
@@ -2363,6 +2428,7 @@ def check_render(directory, compiler, renderer, backend):
                 raise AssertionError("The renderer failed to detect the changed channel order")
     check_movk_draw(directory, compiler, renderer, backend)
     check_half_draw(directory, compiler, renderer, backend)
+    check_vector_bitwise_draw(directory, compiler, renderer, backend)
     for exp_shader_inst in ("s_waitcnt_expcnt null, 0x3", "s_waitcnt expcnt(0)"):
         exp_program = [exp_shader_inst] + assembly(False)[:-1] + [exp_shader_inst, "s_endpgm"]
         source.write_text(translate(exp_program), encoding="ascii")

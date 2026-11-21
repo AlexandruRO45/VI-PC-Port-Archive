@@ -27,6 +27,10 @@ def check_scanner_tracks_pixel_aot():
         opcode = f"v_{name}_f32"
         assert is_opcode_recognized(opcode) and is_opcode_recognized(opcode + "_e32"), opcode
         assert is_instruction_supported(f"{opcode}_e32 v1, v2, v3"), opcode
+    if hasattr(pixel_aot, "VECTOR_BITWISE_32"):
+        for opcode in pixel_aot.VECTOR_BITWISE_32:
+            assert is_opcode_recognized(opcode) and is_opcode_recognized(opcode + "_e32"), opcode
+            assert is_instruction_supported(f"{opcode}_e32 v1, v2, v3"), opcode
 
 
 def check():

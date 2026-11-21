@@ -158,7 +158,12 @@ class TestRdna2Disasm(unittest.TestCase):
             ("01040606", "v_add_f32_e32", "v_add_f32_e32 v3, s1, v2"),
             ("f0040606", "v_add_f32_e32", "v_add_f32_e32 v3, 0.5, v2"),
             ("01050610", "v_mul_f32_e32", "v_mul_f32_e32 v3, v1, v2"),
+            ("0105062c", "v_lshrrev_b32_e32", "v_lshrrev_b32_e32 v3, v1, v2"),
+            ("01050630", "v_ashrrev_i32_e32", "v_ashrrev_i32_e32 v3, v1, v2"),
+            ("01050634", "v_lshlrev_b32_e32", "v_lshlrev_b32_e32 v3, v1, v2"),
             ("01050636", "v_and_b32_e32", "v_and_b32_e32 v3, v1, v2"),
+            ("01050638", "v_or_b32_e32", "v_or_b32_e32 v3, v1, v2"),
+            ("0105063a", "v_xor_b32_e32", "v_xor_b32_e32 v3, v1, v2"),
             ("0105064a", "v_add_nc_u32_e32", "v_add_nc_u32_e32 v3, v1, v2"),
             ("01050656", "v_fmac_f32_e32", "v_fmac_f32_e32 v3, v1, v2"),
         ]
@@ -651,6 +656,12 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertEqual(res["unsupported_count"], 1)
         self.assertEqual(res["support_percentage"], 50.0)
         self.assertEqual(res["unsupported_details"][0]["raw"], "v_imaginary_opcode_xyz v0, v1")
+
+    def test_supported_vector_bitwise_instructions(self):
+        """Vector 32-bit bitwise logic and shift instructions must be supported by the scanner."""
+        for op in ("v_and_b32_e32", "v_or_b32_e32", "v_xor_b32_e32",
+                   "v_lshlrev_b32_e32", "v_lshrrev_b32_e32", "v_ashrrev_i32_e32"):
+            self.assertTrue(is_instruction_supported(f"{op} v1, v2, v3"), op)
 
     def test_cli_scanner(self):
         """Invoke scanner via its actual CLI entry point on synthetic assembly file."""

@@ -343,6 +343,14 @@ INT_COMPARE = {
     "f": "false", "lt": "{0} < {1}", "eq": "{0} == {1}", "le": "{0} <= {1}",
     "gt": "{0} > {1}", "ne": "{0} != {1}", "ge": "{0} >= {1}", "t": "true",
 }
+VECTOR_BITWISE_32 = {
+    "v_and_b32": "asfloat({0} & {1})",
+    "v_or_b32": "asfloat({0} | {1})",
+    "v_xor_b32": "asfloat({0} ^ {1})",
+    "v_lshlrev_b32": "asfloat({1} << ({0} & 31u))",
+    "v_lshrrev_b32": "asfloat({1} >> ({0} & 31u))",
+    "v_ashrrev_i32": "asfloat(asuint(asint({1}) >> ({0} & 31u)))",
+}
 LANE_MASK = r"(vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
 SALU_BIT64 = {
     "and": "uint2({0} & {2}, {1} & {3})",
@@ -408,6 +416,14 @@ SALU_HELPERS = {
         "}"
     ),
 }
+
+
+def vgpr_name(token):
+    if not (m := re.fullmatch(r"v(\d+)", token)):
+        raise ValueError(f"Expected a vector register, got {token}")
+    if not 0 <= int(m.group(1)) <= 255:
+        raise ValueError(f"Vector register out of range: {token}")
+    return token
 
 
 def sgpr_name(token):
@@ -522,6 +538,14 @@ def int_operand(token, scalar, vector, pending, sample_dest, *, signed):
     if signed and bits.startswith("asuint(") and bits.endswith(")"):
         return f"asint({bits[7:-1]})"
     return f"asint({bits})" if signed else bits
+
+
+def u32_operand(token, scalar, vector, pending, sample_dest):
+    if token.startswith("v"):
+        vgpr_name(token)
+        if token not in vector:
+            raise ValueError(f"Vector register not initialized: {token}")
+    return int_operand(token, scalar, vector, pending, sample_dest, signed=False)
 
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *, second_texture_offset=None):
@@ -796,6 +820,18 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             value = fp_operand(src, scalar, vector, pending, sample_dest)
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {value};")
+        elif m := match(rf"({'|'.join(VECTOR_BITWISE_32)})(?:_e32|_e64)? (v\d+), ([^,]+), ([^,]+)"):
+            op, dst, src0, src1 = m.groups()
+            vgpr_name(dst)
+            if mask != "entry":
+                raise ValueError("Invalid vector bitwise operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            a = u32_operand(src0, scalar, vector, pending, sample_dest)
+            b = u32_operand(src1, scalar, vector, pending, sample_dest)
+            expr = VECTOR_BITWISE_32[op].format(a, b)
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = {expr};")
         elif m := match(r"v_(log|exp|rcp|sqrt|rsq|floor|ceil|fract|trunc|frexp_mant|add|mul|max|min|sub|subrev|mul_legacy|fma|fmac|mad|mac|min3|max3|med3)_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
             op, dst, operands, clamp = m.groups()
             tokens = operands.split(", ")

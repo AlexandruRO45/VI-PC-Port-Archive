@@ -38,6 +38,7 @@ except ImportError:
 # The floating-point ALU forms come from pixel_aot's own table, so the scanner cannot drift from it.
 PIXEL_ALU_NAMES = tuple(pixel_aot.ALU) if pixel_aot is not None else ()
 SUPPORTED_ALU = {f"v_{name}_f32" for name in PIXEL_ALU_NAMES}
+PIXEL_BITWISE_NAMES = tuple(pixel_aot.VECTOR_BITWISE_32) if pixel_aot is not None and hasattr(pixel_aot, "VECTOR_BITWISE_32") else ()
 
 SUPPORTED_INSTRUCTIONS_REGEX = [
     r"s_inst_prefetch\s+.*",
@@ -53,6 +54,7 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"v_interp_p[12]_f32_e32\s+v\d+,\s+v\d+,\s+attr0\.[xy]",
     r"image_sample\s+v\[\d+:\d+\],\s+v\[\d+:\d+\],\s+s\[\d+:\d+\],\s+s\[\d+:\d+\]\s+dmask:0xf\s+dim:SQ_RSRC_IMG_2D",
     r"v_(?:" + "|".join(map(re.escape, PIXEL_ALU_NAMES)) + r")_f32(?:_e32|_e64)?\s+v\d+,\s+.*",
+    r"(?:" + "|".join(map(re.escape, PIXEL_BITWISE_NAMES)) + r")(?:_e32|_e64)?\s+v\d+,\s+.*",
     r"v_cvt_pkrtz_f16_f32_e32\s+v\d+,\s+v\d+,\s+v\d+",
     r"exp\s+mrt0\s+v\d+,\s+v\d+,\s+v\d+,\s+v\d+\s+done\s+compr\s+vm",
     r"s_endpgm",
