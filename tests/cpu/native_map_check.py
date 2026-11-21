@@ -271,6 +271,63 @@ def check_delay_directory(mapper, image, provider):
           "table, and rejects a directory past the image (format) and a descriptor naming a DLL (unsupported)")
 
 
+kernel.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD]
+kernel.VirtualAlloc.restype = ctypes.c_void_p
+kernel.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD]
+
+
+def check_reloc_address_zero(mapper, image, provider):
+    """A relocation directory at address 0 is absent whatever its Size, under Windows and pe_map.
+
+    The copy keeps the linked Size. Both loaders must place it away from its reserved preferred base
+    without applying the DIR64 entry: pe_map must not parse the headers at RVA 0 as relocation blocks.
+    """
+    preferred, _, stored, _ = describe(image)
+    (rva, value), = stored.items()
+    with pefile.PE(str(image)) as pe:
+        relocs = pe.OPTIONAL_HEADER.DATA_DIRECTORY[5]
+        address = relocs.get_field_absolute_offset("VirtualAddress")
+        built = relocs.Size
+        size = pe.OPTIONAL_HEADER.SizeOfImage
+    if not built:
+        raise AssertionError(f"{image.name}: fixture must have a relocation directory")
+    data = bytearray(image.read_bytes())
+    struct.pack_into("<I", data, address, 0)
+    bindings = {provider.name.casefold(): ctypes.CDLL(str(provider))}
+    with TemporaryDirectory() as temp:
+        copy = Path(temp) / image.name
+        copy.write_bytes(data)
+        (Path(temp) / provider.name).write_bytes(provider.read_bytes())
+        # Hold the preferred base so neither loader can map the copy there. If the reservation fails,
+        # part of that range is already in use, which blocks it just as well; the bases are checked below.
+        held = kernel.VirtualAlloc(preferred, size, 0x2000, 0x01)  # MEM_RESERVE, PAGE_NOACCESS
+        try:
+            # Windows: the copy has no entry point, so loading it runs nothing in the image.
+            module = kernel.LoadLibraryExW(str(copy), None, LOAD_ALTERED_SEARCH)
+            if not module:
+                raise AssertionError(f"relocations at address 0: LoadLibraryExW failed with {ctypes.get_last_error()}")
+            try:
+                windows = module, ctypes.c_uint64.from_address(module + rva).value
+            finally:
+                kernel.FreeLibrary(module)
+            base, status, detail, _ = mapper(copy, bindings)
+        finally:
+            if held:
+                kernel.VirtualFree(held, 0, 0x8000)  # MEM_RELEASE
+    if status != STATUS["ok"] or not base:
+        raise AssertionError(f"relocations at address 0, Size {built}: pe_map failed with {status}: {detail}")
+    try:
+        mapped = base, ctypes.c_uint64.from_address(base + rva).value
+    finally:
+        mapper.release(base)
+    for name, (at, slot) in (("LoadLibraryExW", windows), ("pe_map", mapped)):
+        if at == preferred or slot != value:
+            raise AssertionError(f"relocations at address 0: {name} mapped at {at:#x} (preferred {preferred:#x}) "
+                                 f"with DIR64 at {rva:#x} holding {slot:#x}, expected the linked {value:#x}")
+    print(f"{image.name}: relocation directory at address 0 with Size {built} is ignored by LoadLibraryExW and "
+          f"pe_map; both map away from {preferred:#x} and leave the DIR64 entry at {value:#x}")
+
+
 def check_empty_export_slot(mapper, image):
     """Zero one export address table slot: its name must no longer resolve, the other export still must."""
     with pefile.PE(str(image)) as pe:
@@ -311,6 +368,7 @@ def main():
     probe = register_probe(str(args.probe))
     check_empty_export_slot(mapper, args.probe)
     check_delay_directory(mapper, args.named[0], args.named[2])
+    check_reloc_address_zero(mapper, args.reloc[0], args.reloc[1])
     for case, paths, symbol in (("named", args.named, "mix_args"), ("ordinal", args.ordinal, 77)):
         original, lifted, provider, altered = paths
         natives = [("native LoadLibrary", ctypes.CDLL(str(original)).call_mix),
