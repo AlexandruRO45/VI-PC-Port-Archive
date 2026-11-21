@@ -5,6 +5,7 @@
 #include "d3d12_com.h"
 
 #include "../src/descriptor_handles.h"  // slot arithmetic and dirty ranges (P0/P1)
+#include "../src/descriptor_views.h"    // D3D12 view descriptions -> GFX10 T#/V#
 #include "../src/descriptor_sizes.h"    // per-type slot sizes
 #include "d3d12_stubs.h"  // generated
 #include "d3d12_com_object.h"
@@ -153,6 +154,16 @@ struct DeviceState {
     // constructor and unregister in their destructor; a lookup holds the lock only for the scan.
     std::mutex descriptor_heaps_mutex;
     std::vector<DescriptorHeap*> descriptor_heaps;
+
+    // The console GPU VA space: one linear arena for now, so a resource can hand a valid address to a descriptor.
+    // Reserving a real range and growing it at a frame boundary is docs/d3d12_vulkan.md section 3.3's plan.
+    std::uint64_t next_console_va = 0x100000000ull;
+    std::uint64_t allocate_va(std::uint64_t bytes) {
+        const std::uint64_t aligned = (std::max<std::uint64_t>(bytes, 0x10000) + 0xFFFF) & ~std::uint64_t(0xFFFF);
+        const std::uint64_t va = next_console_va;
+        next_console_va += aligned;
+        return va;
+    }
 };
 
 class DescriptorHeap final
@@ -261,7 +272,9 @@ public:
 
     Resource(DeviceState& device, const D3D12_RESOURCE_DESC& desc, const D3D12_HEAP_PROPERTIES& heap,
              D3D12_HEAP_FLAGS heap_flags)
-        : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags) {}
+        : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags),
+          console_va_(device.allocate_va(std::max<std::uint64_t>(desc.Width * std::max<UINT>(desc.Height, 1),
+                                                                0x10000))) {}
 
     ~Resource() override {
         auto& vk = device_.context->vk;
@@ -274,6 +287,8 @@ public:
 
     leonida::ResourceId id() const { return resource_id(this); }
     VkImage image() const { return image_; }
+    std::uint64_t console_va() const { return console_va_; }
+    UINT64 STDMETHODCALLTYPE GetGPUVirtualAddress() override { return console_va_; }
 
     HRESULT create_buffer() {
         auto& vk = device_.context->vk;
@@ -392,6 +407,7 @@ private:
     D3D12_RESOURCE_DESC desc_;
     D3D12_HEAP_PROPERTIES heap_;
     D3D12_HEAP_FLAGS heap_flags_;
+    std::uint64_t console_va_ = 0;
     VkImage image_ = VK_NULL_HANDLE;
     VkBuffer buffer_ = VK_NULL_HANDLE;
     VkDeviceMemory memory_ = VK_NULL_HANDLE;
@@ -564,6 +580,100 @@ public:
         std::memcpy(reinterpret_cast<void*>(destination.ptr), &view, sizeof(view));
     }
 
+    // ---- CBV/SRV/UAV views (P2 slice): encode the GFX10 descriptor and write the heap slot ----
+
+    // Writes an 8-dword T#/V# into a CBV/SRV/UAV heap slot and marks it dirty for the bindless scan. The view's
+    // registration in bindless set 0 (VkImageView/buffer index) belongs to the #157 work; this writes what a shader
+    // reads from a descriptor table.
+    bool write_view(D3D12_CPU_DESCRIPTOR_HANDLE destination, const void* words, std::size_t bytes) {
+        if (!destination.ptr) return false;
+        DescriptorHeap* heap = heap_of(state_, reinterpret_cast<const void*>(destination.ptr));
+        std::uint32_t slot = 0;
+        if (!heap || heap->type() != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ||
+            !heap->slot_of(reinterpret_cast<const void*>(destination.ptr), &slot)) {
+            log_once("descriptor write outside a CBV/SRV/UAV heap", 0);
+            return false;
+        }
+        std::memcpy(reinterpret_cast<void*>(destination.ptr), words, std::min(bytes, std::size_t(heap->stride())));
+        heap->mark_dirty(slot, 1);
+        return true;
+    }
+
+    void STDMETHODCALLTYPE CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
+                                                   D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
+        if (!desc) return;
+        leonida::gfx10::BufferWords words{};
+        if (!rt::d3d12::views::encode_cbv(desc->BufferLocation, desc->SizeInBytes, words))
+            log_once("constant buffer view rejected, size", int(desc->SizeInBytes));
+        else
+            write_view(destination, words.data(), sizeof(words));
+    }
+
+    void STDMETHODCALLTYPE CreateShaderResourceView(ID3D12Resource* resource,
+                                                    const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
+                                                    D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
+        const Resource* r = Resource::from<Resource>(resource);
+        if (!r || !desc) return;
+        const D3D12_RESOURCE_DESC rd = const_cast<Resource*>(r)->GetDesc();
+        const VkFormat view_format =
+            vulkan_format(desc->Format == DXGI_FORMAT_UNKNOWN ? rd.Format : desc->Format, false).format;
+        if (desc->ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
+            leonida::gfx10::BufferWords words{};
+            const rt::d3d12::views::BufferResource buffer{r->console_va(), rd.Width};
+            if (rt::d3d12::views::encode_buffer_srv(*desc, buffer, view_format, words))
+                write_view(destination, words.data(), sizeof(words));
+            else
+                log_once("buffer SRV not encoded, format", int(desc->Format));
+            return;
+        }
+        leonida::gfx10::ImageWords words{};
+        rt::d3d12::views::TextureResource texture{};
+        texture.address = r->console_va();
+        texture.width = static_cast<std::uint32_t>(rd.Width);
+        texture.height = rd.Height;
+        texture.depth = rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? rd.DepthOrArraySize : 1;
+        texture.mip_levels = rd.MipLevels;
+        texture.array_layers = rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : rd.DepthOrArraySize;
+        texture.samples = std::max(rd.SampleDesc.Count, 1u);
+        if (rt::d3d12::views::encode_texture_srv(*desc, texture, view_format, words))
+            write_view(destination, words.data(), sizeof(words));
+        else
+            log_once("texture SRV not encoded, dimension", int(desc->ViewDimension));
+    }
+
+    void STDMETHODCALLTYPE CreateUnorderedAccessView(ID3D12Resource* resource,
+                                                     ID3D12Resource* counter_resource,
+                                                     const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc,
+                                                     D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
+        if (counter_resource) log_once("UAV counter resources are not bound yet", 0);
+        const Resource* r = Resource::from<Resource>(resource);
+        if (!r || !desc) return;
+        const D3D12_RESOURCE_DESC rd = const_cast<Resource*>(r)->GetDesc();
+        const VkFormat view_format =
+            vulkan_format(desc->Format == DXGI_FORMAT_UNKNOWN ? rd.Format : desc->Format, false).format;
+        if (desc->ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
+            leonida::gfx10::BufferWords words{};
+            const rt::d3d12::views::BufferResource buffer{r->console_va(), rd.Width};
+            if (rt::d3d12::views::encode_buffer_uav(*desc, buffer, view_format, words))
+                write_view(destination, words.data(), sizeof(words));
+            else
+                log_once("buffer UAV not encoded, format", int(desc->Format));
+            return;
+        }
+        leonida::gfx10::ImageWords words{};
+        rt::d3d12::views::TextureResource texture{};
+        texture.address = r->console_va();
+        texture.width = static_cast<std::uint32_t>(rd.Width);
+        texture.height = rd.Height;
+        texture.depth = rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? rd.DepthOrArraySize : 1;
+        texture.mip_levels = rd.MipLevels;
+        texture.array_layers = rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : rd.DepthOrArraySize;
+        texture.samples = std::max(rd.SampleDesc.Count, 1u);
+        if (rt::d3d12::views::encode_texture_uav(*desc, texture, view_format, words))
+            write_view(destination, words.data(), sizeof(words));
+        else
+            log_once("texture UAV not encoded, dimension", int(desc->ViewDimension));
+    }
     // A descriptor is its slot's bytes (a TargetView in RTV and DSV heaps, otherwise what the shader loads), so a
     // copy is a byte copy. D3D12 walks the destination and source ranges together, one descriptor at a time; a
     // null size array means every range holds one descriptor. Whichever side runs out first ends the copy.

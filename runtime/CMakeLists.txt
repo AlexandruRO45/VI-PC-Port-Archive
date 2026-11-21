@@ -376,6 +376,14 @@ if(Vulkan_FOUND)
     target_link_libraries(gfx10_descriptors_test PRIVATE Vulkan::Headers)
     add_test(NAME gfx10_descriptors COMMAND gfx10_descriptors_test)
   endif()
+  # D3D12 view -> GFX10 descriptor encoders (P2 of docs/d3d12_vulkan_analysis.md). Needs the Vulkan headers for
+  # VkFormat, no GPU and no game data.
+  add_executable(descriptor_views_test test/descriptor_views_test.cpp)
+  target_include_directories(descriptor_views_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(descriptor_views_test PRIVATE Vulkan::Headers)
+  target_compile_definitions(descriptor_views_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(descriptor_views_test PRIVATE /W4 /permissive- /utf-8)
+  add_test(NAME descriptor_views COMMAND descriptor_views_test)
 else()
   message(STATUS "Vulkan SDK not found: GPU test tools, vk_pipeline_check, d3d12_state_map_test and "
                  "gfx10_descriptors_test are not built")
