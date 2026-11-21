@@ -209,6 +209,38 @@ def run_cmd(cmd: list[str], env: dict | None = None) -> tuple[int, str]:
     return p.returncode, (p.stdout + "\n" + p.stderr).strip()
 
 
+# Compute tests that print out[0..7] (vk_compute_test ... dump) and the words they must give. All but cs_store need a
+# full 64-wide compute subgroup; a device without one skips them (as check.py does) instead of failing them.
+CS_DUMP_WANTS = {
+    "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800],
+    "cs_wave64_ballot": [32, 16, 24, 40, 8, 48],
+    "cs_wm_half_ops": [32, 16, 16, 0, 16],
+    "cs_wm_half_cmp": [1, 0, 1, 1],
+    "cs_wm_bfm64": [16, 8, 8, 40],
+    "cs_wm_scc_rfl": [55, 48],
+}
+NEEDS_WAVE64 = frozenset(CS_DUMP_WANTS) - {"cs_store"}
+
+
+def run_cs_dump(vk_compute: str, spv: str, name: str, env: dict | None = None) -> tuple[bool | None, str]:
+    """Run one dump test. Returns (True, words) or (False, why); ok is None when the device can't run it."""
+    want = CS_DUMP_WANTS[name]
+    cmd = [vk_compute, spv, "1", "dump"]
+    if name in NEEDS_WAVE64:
+        cmd.append("--require-wave64")
+    rc, msg = run_cmd(cmd, env=env)
+    if name in NEEDS_WAVE64 and rc == 77:   # vk_compute_test: no 64-wide compute subgroup on this device
+        return None, "full 64-wide compute subgroups unavailable"
+    dump = re.search(r"^out\[0\.\.7\] = ((?:[0-9]+ ){7}[0-9]+)$", msg, re.MULTILINE)   # eight decimal words, as check.py
+    if rc != 0 or not dump:
+        return False, msg
+    if name in NEEDS_WAVE64 and "compute subgroup size: 64" not in msg.splitlines():
+        return False, "64-wide subgroup was not confirmed (rebuild vk_compute_test)"
+    vals = [int(x) for x in dump.group(1).split()[:len(want)]]
+    fmt = hex if name == "cs_store" else str
+    return vals == want, " ".join(fmt(x) for x in vals)
+
+
 def check_pixel_const(raw_path: str, want: tuple[int, int, int, int]) -> tuple[bool, str]:
     px = read_raw_u32(raw_path)
     if len(px) != 64 * 64:
@@ -377,7 +409,7 @@ def run_suite(a, work: str) -> int:
     vk_store = os.path.join(a.build, "vk_store_test" + ext)
     vk_harness = os.path.join(a.build, "vk_harness" + ext)
 
-    results: list[tuple[str, bool, str]] = []
+    results: list[tuple[str, bool | None, str]] = []
     for fname in asm_files:
         name = os.path.splitext(fname)[0]
         spv = os.path.join(spirv_dir, f"{name}.spv")
@@ -397,25 +429,9 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_bvh":
             rc, msg = run_cmd([vk_compute, spv, "1", "bvh"], env=cs_env)
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
-        elif name in ("cs_store", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl"):
-            cs_dump_wants = {
-                "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800],
-                "cs_wave64_ballot": [32, 16, 24, 40, 8, 48],
-                "cs_wm_half_ops": [32, 16, 16, 0, 16],
-                "cs_wm_half_cmp": [1, 0, 1, 1],
-                "cs_wm_bfm64": [16, 8, 8, 40],
-                "cs_wm_scc_rfl": [55, 48],
-            }
-            want = cs_dump_wants[name]
-            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
-            dump_line = next((ln for ln in msg.splitlines() if "out[0..7] =" in ln), "")
-            if rc == 0 and dump_line:
-                vals = [int(x) for x in dump_line.split("=")[1].split()[:len(want)]]
-                ok = vals == want
-                fmt = hex if name == "cs_store" else str
-                results.append((name, ok, " ".join(fmt(x) for x in vals)))
-            else:
-                results.append((name, False, msg))
+        elif name in CS_DUMP_WANTS:
+            ok, detail = run_cs_dump(vk_compute, spv, name, cs_env)
+            results.append((name, ok, detail))
         elif name == "cs_imgstore":
             rc, msg = run_cmd([vk_store, spv])
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
@@ -470,15 +486,21 @@ def run_suite(a, work: str) -> int:
                 ok, detail = check_grad(raw, 0.5, 1.0)
                 results.append((name, ok, detail))
 
+    return report(results)
+
+
+def report(results: list[tuple[str, bool | None, str]]) -> int:
+    """Print the results (ok None = skipped: the device can't run it) and return the exit status."""
     print("\n=== GPU TEST RESULTS ===")
-    passed = 0
+    passed = skipped = 0
     for name, ok, detail in results:
-        tag = "PASS" if ok else "FAIL"
-        if ok:
-            passed += 1
+        tag = "SKIP" if ok is None else "PASS" if ok else "FAIL"
+        passed += ok is True
+        skipped += ok is None
         print(f"  {tag:4s}  {name:<20s}  {detail}")
-    print(f"\n{passed}/{len(results)} passed")
-    return 0 if passed == len(results) else 1
+    ran = len(results) - skipped
+    print(f"\n{passed}/{ran} passed" + (f", {skipped} skipped" if skipped else ""))
+    return 0 if passed == ran else 1
 
 
 if __name__ == "__main__":
