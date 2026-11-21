@@ -392,8 +392,13 @@ def run_suite(a, work: str) -> int:
     if a.filter:
         asm_files = [f for f in asm_files if a.filter in f]
 
+    # ps_flat uses vs_ids as its vertex shader even when the filter selects only ps_flat.
+    build_files = asm_files
+    if "ps_flat.asm" in asm_files and "vs_ids.asm" not in asm_files:
+        build_files = [*asm_files, "vs_ids.asm"]
+
     # 1. Create synthetic DXBC / FSSM metadata + assemble .asm -> .s
-    for fname in asm_files:
+    for fname in build_files:
         name = os.path.splitext(fname)[0]
         if name == "gs_tri":
             dxbc = make_dxbc([
