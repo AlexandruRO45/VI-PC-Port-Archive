@@ -639,6 +639,23 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(r"v_cvt_f32_ubyte([0-3])(?:_e32|_e64)? (v\d+), ([vs]\d+|0x[0-9a-f]{1,8}|\d+)( clamp)?"):
+            # Byte N of the source word as an unsigned integer. The source is read as bits,
+            # so float modifiers do not apply and are rejected by the pattern.
+            byte, dst, source, clamp = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid conversion")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            if re.fullmatch(r"0x[0-9a-f]{1,8}|\d+", source):
+                word = f"{int(source, 0) & 0xffffffff}u"
+            else:
+                word = f"asuint({fp_operand(source, scalar, vector, pending, sample_pending)})"
+            expression = f"float(({word} >> {8 * int(byte)}u) & 0xffu)"
+            if clamp:
+                expression = f"saturate({expression})"
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = {expression};")
         elif m := match(r"v_cvt_pkrtz_f16_f32_e32 (v\d+), (v\d+), (v\d+)"):
             dst, lo, hi = m.groups()
             pair = (vector[lo], vector[hi])

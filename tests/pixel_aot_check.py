@@ -337,6 +337,16 @@ def absolute_value():
     return program
 
 
+def unpack_bytes():
+    # Each output takes a different byte of a constant word, in e32 and e64 forms.
+    return with_constants([
+        "v_cvt_f32_ubyte0_e32 v12, s44",
+        "v_cvt_f32_ubyte1_e64 v13, s45",
+        "v_cvt_f32_ubyte2_e32 v14, s46",
+        "v_cvt_f32_ubyte3_e64 v15, s47 clamp",
+    ])
+
+
 def ceiling():
     return with_constants([
         "v_ceil_f32_e32 v12, s44",
@@ -1329,6 +1339,34 @@ def check_ceiling_draws(directory, compiler, renderer, backend):
         raise AssertionError("Replacing ceiling with floor escaped detection")
 
 
+def check_unpack_byte_draws(directory, compiler, renderer, backend):
+    instructions = unpack_bytes()
+    source = directory / "ubyte.hlsl"
+    shader = directory / "ubyte.cso"
+    case = directory / "ubyte.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+    source.write_text(translate(instructions), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    # Every word is a normal binary32 value, so its bits survive the constant buffer, and
+    # all four bytes of each word differ, so reading the wrong byte changes the result.
+    for words in ((0x40ff8001, 0x3e7f02c3, 0x41a5005a, 0x00102030 | 0x3f000000),
+                  (0x4280ff7f, 0x3f11fe22, 0x407f8013, 0x00000000 | 0x40c08070)):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        values = [float((word >> 8 * n) & 0xff) for n, word in enumerate(words)]
+        values[3] = min(values[3], 1.0)
+        case.write_bytes(constants + struct.pack("<4f", *values) * 64)
+        subprocess.run(draw, check=True)
+
+    wrong = [line.replace("ubyte1", "ubyte0") for line in instructions]
+    source.write_text(translate(wrong), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    result = subprocess.run(draw, capture_output=True, text=True)
+    if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
+        raise AssertionError("Reading the wrong byte escaped detection")
+
+
 def check_render(directory, compiler, renderer, backend):
     check_movk_draw(directory, compiler, renderer, backend)
     check_half_draw(directory, compiler, renderer, backend)
@@ -1418,6 +1456,7 @@ def check_render(directory, compiler, renderer, backend):
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("The renderer failed to detect the missing absolute value")
     check_ceiling_draws(directory, compiler, renderer, backend)
+    check_unpack_byte_draws(directory, compiler, renderer, backend)
     source.write_text(translate(select()), encoding="ascii")
     subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
     for constants in ((.5, .75, .375, .25), (.125, .5, 1.0, 0.0)):
