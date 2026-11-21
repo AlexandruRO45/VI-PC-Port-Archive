@@ -27,7 +27,7 @@ EXE = ".exe" if os.name == "nt" else ""
 UNSUPPORTED = 77                                       # a test tool exits with this when the device lacks a feature
 
 COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh", "1", "bvh"),
-           ("cs_workgroup_yz", "2x3x4", "workgroup_yz")]
+           ("cs_workgroup_yz", "2x3x4", "workgroup_yz"), ("cs_bounds", "1", "bounds")]
 CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800]
 CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
 WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm")
@@ -124,6 +124,11 @@ def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expe
     if mode == "workgroup_yz":
         if "2x3x4 workgroup Y/Z: 0 mismatches" in out.splitlines():
             return ""
+    elif mode == "bounds":
+        want = [0x12345678, 0x12345678, 0, 0xEEEEEEEE, 0xEEEEEEEE]
+        m = re.search(r"^out\\[0\\.\\.7\\] = ((?:[0-9]+ ){7}[0-9]+)$", out, re.MULTILINE)
+        if m and [int(x) for x in m.group(1).split()][:len(want)] == want:
+            return ""
     elif expected_words is not None:
         m = re.search(r"^out\[0\.\.7\] = ((?:[0-9]+ ){7}[0-9]+)$", out, re.MULTILINE)
         if m and [int(x) for x in m.group(1).split()][:len(expected_words)] == expected_words:
@@ -146,6 +151,8 @@ def mesh_w64x_test(tools, spirv, name):
     with tempfile.TemporaryDirectory(prefix="leonida-mesh-") as tmp:
         raw = Path(tmp) / "pixels.raw"
         r = subprocess.run([os.path.join(tools, "vk_harness" + EXE), shader, fs, raw], capture_output=True, text=True, env=env)
+        if r.returncode == UNSUPPORTED:
+            return Skip("SKIP (mesh shaders unavailable on this device)")
         if r.returncode or not raw.is_file():
             return failure(r.returncode, r.stdout + r.stderr, 2)
         data = raw.read_bytes()
