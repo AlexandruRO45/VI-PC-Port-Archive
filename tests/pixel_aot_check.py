@@ -337,6 +337,16 @@ def absolute_value():
     return program
 
 
+def offset_nibbles():
+    # The low four bits of each constant word as a signed offset in sixteenths.
+    return with_constants([
+        "v_cvt_off_f32_i4_e32 v12, s44",
+        "v_cvt_off_f32_i4_e64 v13, s45",
+        "v_cvt_off_f32_i4_e32 v14, s46",
+        "v_cvt_off_f32_i4_e64 v15, s47 clamp",
+    ])
+
+
 def ceiling():
     return with_constants([
         "v_ceil_f32_e32 v12, s44",
@@ -1329,6 +1339,48 @@ def check_ceiling_draws(directory, compiler, renderer, backend):
         raise AssertionError("Replacing ceiling with floor escaped detection")
 
 
+def check_offset_nibble_draws(directory, compiler, renderer, backend):
+    instructions = offset_nibbles()
+    source = directory / "cvt_off.hlsl"
+    shader = directory / "cvt_off.cso"
+    case = directory / "cvt_off.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+    source.write_text(translate(instructions), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+
+    def offset(nibble):
+        return (nibble - 16 if nibble & 8 else nibble) / 16
+
+    # Each word is a normal binary32 value whose upper bits are set, so a result that used
+    # more than bits 3:0 would change. All 16 nibbles appear across the four draws, and
+    # the clamped lane sees both signs.
+    high = 0x3f5a6b70
+    nibbles = list(range(16))
+    for start in range(0, 16, 4):
+        group = nibbles[start:start + 4]
+        words = [high | n for n in group]
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        values = [offset(n) for n in group]
+        values[3] = min(1.0, max(0.0, values[3]))
+        # Python's integer results lose the sign of zero; nibble 0 gives +0.0 either way.
+        case.write_bytes(constants + struct.pack("<4f", *values) * 64)
+        subprocess.run(draw, check=True)
+
+    # Reading the nibble as unsigned changes every result with bit 3 set.
+    unsigned = translate(instructions).replace("asint(", "(")
+    source.write_text(unsigned, encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    words = [high | 0x8, high | 0x9, high | 0xf, high | 0xc]
+    constants = bytearray(256)
+    struct.pack_into("<4I", constants, 12, *words)
+    case.write_bytes(constants + struct.pack("<4f", -0.5, -0.4375, -0.0625, 0.0) * 64)
+    result = subprocess.run(draw, capture_output=True, text=True)
+    if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
+        raise AssertionError("Reading the nibble without its sign escaped detection")
+
+
 def check_render(directory, compiler, renderer, backend):
     check_movk_draw(directory, compiler, renderer, backend)
     check_half_draw(directory, compiler, renderer, backend)
@@ -1418,6 +1470,7 @@ def check_render(directory, compiler, renderer, backend):
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("The renderer failed to detect the missing absolute value")
     check_ceiling_draws(directory, compiler, renderer, backend)
+    check_offset_nibble_draws(directory, compiler, renderer, backend)
     source.write_text(translate(select()), encoding="ascii")
     subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
     for constants in ((.5, .75, .375, .25), (.125, .5, 1.0, 0.0)):
