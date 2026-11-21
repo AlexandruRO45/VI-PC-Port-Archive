@@ -210,7 +210,58 @@ def check(folder, fixture, provider):
         (stored[b"named_alias"], "named alias"), (stored[b"named_value"], "named_value"), (77, None)}
     named, = [r for r in inventory["imports"] if r["symbol"] == "named_value"]
     assert named["bundle_exports_in"] == [provider.name]
+    check_export_reads(folder, provider)
     check_modified_directory(folder, fixture, provider)
+
+
+def check_export_reads(folder, provider):
+    """A name, forwarder or table outside section file data stops the scan with its RVA."""
+
+    def patched(name, change):
+        target = folder / f"export-{name}"
+        target.mkdir()
+        with pefile.PE(str(provider)) as pe:
+            d = pe.DIRECTORY_ENTRY_EXPORT.struct
+            rva = change(pe, d, pe.get_section_by_rva(d.AddressOfNames))
+            pe.write(str(target / provider.name))
+        return target, rva
+
+    def outside(pe, d, section):
+        rva = pe.OPTIONAL_HEADER.SizeOfImage + 0x100
+        pe.set_dword_at_rva(d.AddressOfNames, rva)
+        return rva
+
+    def unterminated(pe, d, section):
+        # The last byte of the section's file data, followed by no NUL.
+        rva = section.VirtualAddress + section.SizeOfRawData - 1
+        section.Misc_VirtualSize = section.SizeOfRawData
+        pe.set_bytes_at_rva(rva, b"x")
+        pe.set_dword_at_rva(d.AddressOfNames + 4 * (d.NumberOfNames - 1), rva)
+        return rva
+
+    def short_names(pe, d, section):
+        d.NumberOfNames = (section.VirtualAddress + section.SizeOfRawData - d.AddressOfNames) // 4 + 1
+        return d.AddressOfNames
+
+    def forwarder(pe, d, section):
+        directory = pe.OPTIONAL_HEADER.DATA_DIRECTORY[0]
+        rva = pe.OPTIONAL_HEADER.SizeOfImage + 0x100
+        directory.Size = rva + 0x100 - directory.VirtualAddress
+        pe.set_dword_at_rva(d.AddressOfFunctions + 4 * (77 - d.Base), rva)
+        return rva
+
+    for name, change, message in (
+            ("outside", outside, "Export name at RVA {:#x} is outside the file's sections"),
+            ("unterminated", unterminated, "Unterminated export name at RVA {:#x}"),
+            ("short-names", short_names, "Export name pointer table at RVA {:#x} is outside the file's sections"),
+            ("forwarder", forwarder, "Export forwarder at RVA {:#x} is outside the file's sections")):
+        target, rva = patched(name, change)
+        try:
+            scan(target)
+        except ValueError as error:
+            assert str(error) == message.format(rva), (name, error)
+        else:
+            raise AssertionError(f"{name}: the scan accepted an unreadable export")
 
 
 def check_modified_directory(folder, fixture, provider):
