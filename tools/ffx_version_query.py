@@ -4,7 +4,7 @@ import hashlib
 from pathlib import Path
 
 import pefile
-from iced_x86 import Decoder, MemorySizeExt, Mnemonic as M, OpKind as K, Register as R, RegisterExt
+from iced_x86 import Decoder, EncodingKind, MemorySizeExt, Mnemonic as M, OpKind as K, Register as R, RegisterExt
 
 from cpu_leaf_aot import export_rva
 from cpu_ranges import function_ranges, image_bytes
@@ -58,7 +58,12 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
     # Unaligned YMM copies and VEX zeroing in the descriptor builder need
     # only byte storage on the desktop host.
     wide = {R.YMM0: "wide0", R.YMM1: "wide1", R.YMM2: "wide2"}
-    has_wide = any(i.mnemonic == M.VMOVUPS for i in body)
+    wide_xmm = {R.XMM0: "wide0", R.XMM1: "wide1", R.XMM2: "wide2"}
+    pmov_ext = {
+        getattr(M, f"PMOV{k.upper()}{p.upper()}"): (k == "sx", {"b": 1, "w": 2, "d": 4}[p[0]], {"w": 2, "d": 4, "q": 8}[p[1]])
+        for k in ("sx", "zx") for p in ("bw", "bd", "bq", "wd", "wq", "dq")
+    }
+    has_wide = any(i.mnemonic in (M.VMOVUPS, M.MOVDQU) or i.mnemonic in pmov_ext for i in body)
     if has_wide:
         if has_xmm_math:
             raise ValueError("mixed vector arithmetic and wide descriptor copies are unsupported")
@@ -210,6 +215,28 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             stmt = (f"{{ auto input = {src}; {dst} = {{}}; for (size_t n=0; n<16; n+=4) {{ "
                     f"auto v = load<uint32_t>(reinterpret_cast<word>(input.data()+n)) {operation}; "
                     f"memcpy({dst}.data()+n, &v, 4); }} }}")
+        elif has_wide and i.encoding == EncodingKind.LEGACY and op == M.MOVDQU:
+            if i.op1_kind == K.MEMORY and i.op0_register in wide_xmm:
+                stmt = f"memcpy({wide_xmm[i.op0_register]}.data(), reinterpret_cast<const void*>({address()}), 16);"
+            elif i.op0_kind == K.MEMORY and i.op1_register in wide_xmm:
+                stmt = f"memcpy(reinterpret_cast<void*>({address()}), {wide_xmm[i.op1_register]}.data(), 16);"
+            elif i.op0_register in wide_xmm and i.op1_register in wide_xmm:
+                stmt = f"memcpy({wide_xmm[i.op0_register]}.data(), {wide_xmm[i.op1_register]}.data(), 16);"
+            else:
+                raise ValueError(f"unsupported query operation at {i.ip:#x}: {i}")
+        elif has_wide and i.encoding == EncodingKind.LEGACY and i.op0_register in wide_xmm and op in pmov_ext:
+            signed, src_sz, dst_sz = pmov_ext[op]
+            lanes = 16 // dst_sz
+            src_t = f"int{8 * src_sz}_t" if signed else UINT[src_sz]
+            dst_t = f"int{8 * dst_sz}_t" if signed else UINT[dst_sz]
+            dst = wide_xmm[i.op0_register]
+            if i.op1_kind == K.MEMORY:
+                src_init = f"const auto in1 = load<std::array<uint8_t,{lanes * src_sz}>>({address()});"
+            else:
+                src_init = f"const auto in1 = {wide_xmm[i.op1_register]};"
+            stmt = (f"{{ {src_init} for (size_t k = 0; k < {lanes}; ++k) {{ "
+                    f"const {dst_t} v = static_cast<{dst_t}>(load<{src_t}>(reinterpret_cast<word>(in1.data() + k * {src_sz}))); "
+                    f"memcpy({dst}.data() + k * {dst_sz}, &v, {dst_sz}); }} }}")
         elif op == M.VMOVUPS and i.op1_kind == K.MEMORY:
             stmt = f"{wide[i.op0_register]} = load<std::array<uint8_t,32>>({address()});"
         elif op == M.VMOVUPS and i.op0_kind == K.MEMORY:
