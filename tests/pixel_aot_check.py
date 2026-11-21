@@ -365,6 +365,47 @@ def ceiling():
     ])
 
 
+# v_sin_f32 and v_cos_f32 take revolutions, sin(2 * pi * x). D3D bounds sin and cos only to 0.0008
+# absolute in [-100 pi, 100 pi], so each result is quantized to 1/32 steps by exact operations
+# (times 32, plus 0.5, floor, times 1/32) and every reference lies at least 0.1 step from a boundary.
+TRIG_BODY = [
+    "v_sin_f32_e32 v12, s44",
+    "v_cos_f32_e32 v13, s45",
+    "v_sin_f32_e64 v14, -|s46|",
+    "v_cos_f32_e64 v15, -s47 clamp",
+] + [line for reg in ("v12", "v13", "v14", "v15") for line in (
+    f"v_mul_f32_e32 {reg}, 0x42000000, {reg}",
+    f"v_add_f32_e32 {reg}, 0.5, {reg}",
+    f"v_floor_f32_e32 {reg}, {reg}",
+    f"v_mul_f32_e32 {reg}, 0x3d000000, {reg}",
+)]
+# Each case covers all four quadrants across its channels and one input of millions of turns, where
+# multiplying the unreduced input by 2 pi in binary32 moves the quantized result by 20 or more steps.
+TRIG_CASES = (
+    (-4000000.25, 0.125, -0.375, 0.5),
+    (-0.125, 4000000.25, 2.75, -0.125),
+    (0.25, -1.625, -4000000.5, 0.0),
+    (-0.375, 0.375, 0.0625, 2000000.75),
+)
+
+
+def trig_reference(case, swap=False):
+    """The quantized four channels of TRIG_BODY, from a double-precision reduction of each input."""
+    channels = []
+    for kind, x, saturate in zip(("sin", "cos", "sin", "cos"), (case[0], case[1], -abs(case[2]), -case[3]),
+                                 (False, False, False, True)):
+        if swap:
+            kind = "cos" if kind == "sin" else "sin"
+        value = (math.sin if kind == "sin" else math.cos)(2 * math.pi * math.remainder(x, 1.0))
+        if saturate:
+            value = min(1.0, max(0.0, value))
+        scaled = value * 32 + 0.5
+        # Only a drawn reference needs the margin; the swapped values merely have to differ from it.
+        assert swap or abs(scaled - round(scaled)) >= 0.1, (case, kind, value)
+        channels.append(math.floor(scaled) / 32)
+    return channels
+
+
 # The gfx10 predicate number is a four-bit truth table. Bits 0..3 select
 # less, equal, greater and unordered respectively, independent of the HLSL.
 PREDICATES = ("f", "lt", "eq", "le", "gt", "lg", "ge", "o",
@@ -1457,6 +1498,11 @@ def check_controls(directory):
     for register in ("v12", "v13", "v14", "v15"):
         must_reject(translate, program[:wait] + [f"v_mov_b32_e32 {register}, 1.0"] + program[wait:])
     must_reject(translate, program[:wait] + ["v_ceil_f32_e32 v12, 1.0"] + program[wait:])
+    must_reject(translate, program[:wait] + ["v_sin_f32_e32 v12, 1.0"] + program[wait:])
+    must_reject(translate, program[:wait] + ["v_cos_f32_e64 v13, 1.0"] + program[wait:])
+    trig = translate(with_constants(TRIG_BODY))
+    assert trig.count("sin32(") == 3 and trig.count("cos32(") == 3, trig  # two calls plus each definition
+    assert "saturate(cos32((-params" in trig and "sin32((-abs(" in trig and "cos32(params" in trig, trig
     free = translate(program[:wait] + ["v_mov_b32_e32 v21, 1.0"] + program[wait:])
     assert free.index("tex.Sample") < free.index("= 1.0f;") < free.index("= sample16.x;")
     late = translate(program[:wait+1] + ["v_mov_b32_e32 v12, 1.0"] + program[wait+1:])
@@ -1632,7 +1678,8 @@ def check_controls(directory):
 def check_binary(directory, assembler, objcopy, library):
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
                 (arithmetic(), translate), (with_scalar_constant_reads(), translate), (truncate_values(), translate),
-                (affine_coordinates(), translate), (ceiling(), translate), (scalar64(), translate)]
+                (affine_coordinates(), translate), (ceiling(), translate), (scalar64(), translate),
+                (with_constants(TRIG_BODY), translate)]
     fixtures.append((with_constants(CLASS_BODY), translate))
     fixtures.extend((predicate_group(first), translate) for first in range(0, 16, 4))
     fixtures.extend((int_predicate_group(kind, encoding, first), translate)
@@ -1713,6 +1760,55 @@ def check_affine_lod_draw(directory: Path, compiler: str, renderer: str, backend
         raise AssertionError("The draw accepted a missing helper-lane gradient")
 
 
+def check_trig_draws(directory, compiler, renderer, backend):
+    source = directory / "trig.hlsl"
+    shader = directory / "trig.cso"
+    case = directory / "trig.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+    instructions = with_constants(TRIG_BODY)
+    hlsl = translate(instructions)
+
+    def write_case(inputs):
+        constants = bytearray(256)
+        struct.pack_into("<4f", constants, 12, *inputs)
+        case.write_bytes(constants + struct.pack("<4f", *trig_reference(inputs)) * 64)
+
+    source.write_text(hlsl, encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    for inputs in TRIG_CASES:
+        write_case(inputs)
+        subprocess.run(draw, check=True)
+
+    def mismatches(text):
+        source.write_text(text, encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        detected = []
+        for inputs in TRIG_CASES:
+            write_case(inputs)
+            wrong = subprocess.run(draw, capture_output=True, text=True)
+            if wrong.returncode not in (0, 1) or (wrong.returncode == 1) != ("pixel_mismatch" in wrong.stderr):
+                raise AssertionError(f"Unexpected renderer result {wrong.returncode}: {wrong.stderr}")
+            detected.append(wrong.returncode == 1)
+        return detected
+
+    # Both controls change at least one quantized channel of every case by many steps.
+    swapped = [line.replace("v_sin_f32", "v_tmp").replace("v_cos_f32", "v_sin_f32").replace("v_tmp", "v_cos_f32")
+               for line in instructions]
+    assert all(trig_reference(inputs, swap=True) != trig_reference(inputs) for inputs in TRIG_CASES)
+    reduced_argument = "(turns(value) * 6.28318548f)"
+    assert hlsl.count(reduced_argument) == 2, hlsl
+    for name, text in (("calls swapped between sine and cosine", translate(swapped)),
+                       ("radians instead of turns", hlsl.replace(reduced_argument, "(value)"))):
+        if not all(mismatches(text)):
+            raise AssertionError(f"Sine and cosine with {name} escaped detection")
+    # Without the reduction, a binary32 x * 2 pi of the large inputs moves each case by 20 or more steps.
+    # Whether the adapter shows it depends on the precision of its own sin and cos argument handling, so
+    # the count is reported rather than required; the reduced draws above must match on every adapter.
+    unreduced = mismatches(hlsl.replace(reduced_argument, "(value * 6.28318548f)"))
+    print(f"trig_unreduced_mismatches={sum(unreduced)}/{len(unreduced)}")
+
+
 def check_render(directory, compiler, renderer, backend):
     for swap in (False, True):
         source = directory / "fixture.hlsl"
@@ -1729,6 +1825,7 @@ def check_render(directory, compiler, renderer, backend):
                 raise AssertionError("The renderer failed to detect the changed channel order")
     check_movk_draw(directory, compiler, renderer, backend)
     check_half_draw(directory, compiler, renderer, backend)
+    check_trig_draws(directory, compiler, renderer, backend)
     program = arithmetic()
     source.write_text(translate(program), encoding="ascii")
     subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)

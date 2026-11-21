@@ -160,6 +160,19 @@ float mad32(float a, float b, float c) {
     precise float sum = product + ftz32(c);
     return ftz32(sum);
 }
+// v_sin_f32 and v_cos_f32 take revolutions: sin(2 * pi * x). Removing the nearest integer is exact in
+// binary32 and keeps the radian argument within [-pi, pi], where D3D bounds the sin and cos error;
+// x * 2 * pi on the unreduced input would round away the fraction of a large argument. Inputs of at
+// most half a turn pass unchanged, so -0 keeps its sign. An infinity reduces to NaN.
+float turns(float value) {
+    return abs(value) > 0.5f ? value - round(value) : value;
+}
+float sin32(float value) {
+    return sin(turns(value) * 6.28318548f);
+}
+float cos32(float value) {
+    return cos(turns(value) * 6.28318548f);
+}
 // Finite binary32 to binary16, round toward zero, then widen for the float target.
 float export16(float value) {
     uint h = f32tof16(value);
@@ -196,7 +209,7 @@ ALU = {
     "log": (1, "log2({0})"), "exp": (1, "exp2({0})"), "rcp": (1, "(1.0f / {0})"),
     "sqrt": (1, "sqrt({0})"), "rsq": (1, "rsqrt({0})"),
     "floor": (1, "floor({0})"), "ceil": (1, "ceil({0})"), "fract": (1, "fract32({0})"),
-    "trunc": (1, "trunc({0})"),
+    "trunc": (1, "trunc({0})"), "sin": (1, "sin32({0})"), "cos": (1, "cos32({0})"),
     "add": (2, "({0} + {1})"), "mul": (2, "({0} * {1})"),
     "max": (2, "max({0}, {1})"), "min": (2, "min({0}, {1})"), "sub": (2, "({0} - {1})"),
     "subrev": (2, "({1} - {0})"),
@@ -641,7 +654,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             value = fp_operand(src, scalar, vector, pending, sample_pending)
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {value};")
-        elif m := match(r"v_(log|exp|rcp|sqrt|rsq|floor|ceil|fract|trunc|add|mul|max|min|sub|subrev|mul_legacy|fma|fmac|mad|mac)_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
+        elif m := match(r"v_(log|exp|rcp|sqrt|rsq|floor|ceil|fract|trunc|sin|cos|add|mul|max|min|sub|subrev|mul_legacy|fma|fmac|mad|mac)_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
             op, dst, operands, clamp = m.groups()
             tokens = operands.split(", ")
             if op in ("fmac", "mac"):
