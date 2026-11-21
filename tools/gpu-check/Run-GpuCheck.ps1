@@ -3,7 +3,9 @@
 param(
     [ValidateSet('hardware', 'warp')]
     [string]$Backend = 'hardware',
-    [string]$ReportPath
+    [string]$ReportPath,
+    # Part of the name of the GPU to test on a PC with more than one, for example 'Radeon'.
+    [string]$Adapter
 )
 
 $ErrorActionPreference = 'Stop'
@@ -18,6 +20,7 @@ $report.Add('')
 $report.Add("Source commit: $revision")
 $report.Add("Windows build: $($windows.CurrentBuildNumber).$($windows.UBR)")
 $report.Add("Backend: $Backend")
+if ($Adapter) { $report.Add("Adapter filter: $Adapter") }
 $report.Add('')
 $failed = $false
 foreach ($test in 'dual-uav', 'texture-mips', 'bvh-waves', 'bvh-wave64', 'bvh-differential', 'bvh-packed', 'bvh-atomics', 'bvh-numeric', 'bvh-root-roundtrip', 'dxr-update') {
@@ -28,6 +31,7 @@ foreach ($test in 'dual-uav', 'texture-mips', 'bvh-waves', 'bvh-wave64', 'bvh-di
     $process.StartInfo.CreateNoWindow = $true
     $process.StartInfo.RedirectStandardOutput = $true
     $process.StartInfo.RedirectStandardError = $true
+    if ($Adapter) { $process.StartInfo.EnvironmentVariables['XBOX2WINDOWS_ADAPTER'] = $Adapter }
     try {
         [void]$process.Start()
         $stdout = $process.StandardOutput.ReadToEndAsync()

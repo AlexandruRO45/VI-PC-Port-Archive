@@ -3,6 +3,7 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 #include <cstdio>
+#include <cwchar>
 #include <fstream>
 #include <stdexcept>
 #include <string_view>
@@ -32,6 +33,18 @@ void check(HRESULT hr, const char* stage)
     }
 }
 
+bool contains_ignoring_case(const wchar_t* text, const wchar_t* part)
+{
+    const size_t length = std::wcslen(part);
+    for (; *text; ++text) {
+        if (_wcsnicmp(text, part, length) == 0) return true;
+    }
+    return false;
+}
+
+// Without XBOX2WINDOWS_ADAPTER, the first D3D12 hardware adapter in high-performance order is used.
+// With it, the first whose description contains the value, ignoring case, so a PC with several GPUs
+// can test each one. A value that matches no adapter is an error, not a skipped test.
 ComPtr<IDXGIAdapter1> select_adapter(IDXGIFactory6* factory, bool warp)
 {
     ComPtr<IDXGIAdapter1> adapter;
@@ -39,18 +52,24 @@ ComPtr<IDXGIAdapter1> select_adapter(IDXGIFactory6* factory, bool warp)
         check(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)), "EnumWarpAdapter");
         return adapter;
     }
+    wchar_t wanted[128]{};
+    const DWORD filter = GetEnvironmentVariableW(L"XBOX2WINDOWS_ADAPTER", wanted, 128);
+    if (filter >= 128) throw std::runtime_error("XBOX2WINDOWS_ADAPTER is longer than 127 characters");
     for (UINT index = 0;; ++index) {
         HRESULT hr = factory->EnumAdapterByGpuPreference(index, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
                                                         IID_PPV_ARGS(adapter.ReleaseAndGetAddressOf()));
         if (hr == DXGI_ERROR_NOT_FOUND) {
-            return {};
+            if (!filter) return {};
+            std::fprintf(stderr, "No D3D12 hardware adapter matches XBOX2WINDOWS_ADAPTER=%ls\n", wanted);
+            throw std::runtime_error("Select adapter");
         }
         check(hr, "Enumerate hardware");
         DXGI_ADAPTER_DESC1 desc{};
         check(adapter->GetDesc1(&desc), "Adapter description");
         if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
             SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), nullptr))) {
-            return adapter;
+            if (!filter || contains_ignoring_case(desc.Description, wanted)) return adapter;
+            std::fprintf(stderr, "XBOX2WINDOWS_ADAPTER: skipping %ls\n", desc.Description);
         }
     }
 }
