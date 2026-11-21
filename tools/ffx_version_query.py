@@ -58,7 +58,10 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
     # Unaligned YMM copies and VEX zeroing in the descriptor builder need
     # only byte storage on the desktop host.
     wide = {R.YMM0: "wide0", R.YMM1: "wide1", R.YMM2: "wide2"}
-    has_wide = any(i.mnemonic == M.VMOVUPS for i in body)
+    wide_any = {**wide, R.XMM0: "wide0", R.XMM1: "wide1", R.XMM2: "wide2"}
+    avx2_wide_ops = (M.VPBROADCASTB, M.VPBROADCASTW, M.VPBROADCASTD, M.VPBROADCASTQ,
+                     M.VPSLLVD, M.VPSRLVD, M.VPSRAVD, M.VPSLLVQ, M.VPSRLVQ)
+    has_wide = any(i.mnemonic == M.VMOVUPS or i.mnemonic in avx2_wide_ops for i in body)
     if has_wide:
         if has_xmm_math:
             raise ValueError("mixed vector arithmetic and wide descriptor copies are unsupported")
@@ -210,6 +213,36 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             stmt = (f"{{ auto input = {src}; {dst} = {{}}; for (size_t n=0; n<16; n+=4) {{ "
                     f"auto v = load<uint32_t>(reinterpret_cast<word>(input.data()+n)) {operation}; "
                     f"memcpy({dst}.data()+n, &v, 4); }} }}")
+        elif has_wide and op in (M.VPBROADCASTB, M.VPBROADCASTW, M.VPBROADCASTD, M.VPBROADCASTQ):
+            elem_size = {M.VPBROADCASTB: 1, M.VPBROADCASTW: 2, M.VPBROADCASTD: 4, M.VPBROADCASTQ: 8}[op]
+            vec_size = RegisterExt.size(i.op0_register)
+            w = UINT[elem_size]
+            dst = wide_any[i.op0_register]
+            src_expr = (f"load<{w}>({address()})" if i.op1_kind == K.MEMORY
+                        else f"load<{w}>(reinterpret_cast<word>({wide_any[i.op1_register]}.data()))")
+            stmt = (f"{{ const {w} elem = {src_expr}; {dst} = {{}}; "
+                    f"for (size_t n = 0; n < {vec_size}; n += {elem_size}) memcpy({dst}.data() + n, &elem, {elem_size}); }}")
+        elif has_wide and op in (M.VPSLLVD, M.VPSRLVD, M.VPSRAVD, M.VPSLLVQ, M.VPSRLVQ):
+            elem_size = 8 if op in (M.VPSLLVQ, M.VPSRLVQ) else 4
+            bits, w = 8 * elem_size, UINT[elem_size]
+            vec_size = RegisterExt.size(i.op0_register)
+            dst, src1 = wide_any[i.op0_register], wide_any[i.op1_register]
+            if i.op2_kind == K.MEMORY:
+                cnt_init = f"const word caddr = {address()};"
+                cnt_expr = f"load<{w}>(caddr + n)"
+            else:
+                cnt_init = f"const auto in2 = {wide_any[i.op2_register]};"
+                cnt_expr = f"load<{w}>(reinterpret_cast<word>(in2.data() + n))"
+            if op in (M.VPSLLVD, M.VPSLLVQ):
+                op_expr = f"c >= {bits}u ? static_cast<{w}>(0) : static_cast<{w}>(a << c)"
+            elif op in (M.VPSRLVD, M.VPSRLVQ):
+                op_expr = f"c >= {bits}u ? static_cast<{w}>(0) : static_cast<{w}>(a >> c)"
+            else:
+                op_expr = "static_cast<uint32_t>(static_cast<int32_t>(a) >> (c >= 32u ? 31u : c))"
+            stmt = (f"{{ const auto in1 = {src1}; {cnt_init} {dst} = {{}}; "
+                    f"for (size_t n = 0; n < {vec_size}; n += {elem_size}) {{ "
+                    f"const {w} a = load<{w}>(reinterpret_cast<word>(in1.data() + n)), c = {cnt_expr}; "
+                    f"const {w} v = {op_expr}; memcpy({dst}.data() + n, &v, {elem_size}); }} }}")
         elif op == M.VMOVUPS and i.op1_kind == K.MEMORY:
             stmt = f"{wide[i.op0_register]} = load<std::array<uint8_t,32>>({address()});"
         elif op == M.VMOVUPS and i.op0_kind == K.MEMORY:
