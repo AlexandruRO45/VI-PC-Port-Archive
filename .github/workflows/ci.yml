@@ -26,6 +26,11 @@ jobs:
           cmake --build runtime/build --config RelWithDebInfo
       - name: Build rpf9dump
         run: dotnet build tools/rpf9dump/rpf9dump.csproj -c Release
+      - name: Synthetic exporter and skeleton checks
+        run: |
+          dotnet run --project tests/Rpf9DumpDiagnostics -c Release
+          dotnet run --project tests/Rpf9DumpSkeletonExport -c Release
+          dotnet run --project third_party/rpf9-explorer/Tests/SkeletonSmoke -c Release
       - name: No game data tracked
         shell: bash
         run: |
