@@ -288,7 +288,11 @@ The compute path, end to end:
     topology, vertex strides, stencil references and the blend factor are dynamic.
   - **Formats:** dynamic rendering takes the RTV and DSV formats.
   - **Refused with a log:** hull, domain and geometry stages, stream output, MSAA, set-0 bindings, and two stages
-    that both read their code base (question 14).
+    that both read their code base (question 14, section 5.2).
+  - **Push constants:** both PSO paths declare the 144-byte block as one range. Its stage flags are the whole
+    stage table the graphics path accepts, and the replay pushes with the same flags. A device whose
+    `maxPushConstantsSize` is below 144 (#224's `push_constants_need_fallback`) has every PSO refused, with the
+    limit in the log, until the uniform-buffer tail exists.
 
   The command list keeps the input-assembler, viewport, scissor, render-target (read at `OMSetRenderTargets`, as
   D3D12 does), blend-factor and stencil-reference state, including CommandList8's front/back references. Each
@@ -972,6 +976,21 @@ contract, not a runtime bug:
 - A second option is a per-stage uniform/storage buffer for the code base, patched in at pipeline creation. That
   adds a descriptor binding and a load per `s_getpc`, but avoids growing push constants. Decide after measuring
   how many real PSOs have two code-base stages.
+
+**Measured (stages):** 662 of the 25,734 disassembled shaders contain `s_getpc_b64`. The translator at 83d0637
+(`uses_code_base`, set unless the instruction is part of a folded far branch) gives, for those 662:
+
+| Stage | Read the code base | Stage total in the index |
+|---|---|---|
+| VS | 53 | 2,236 |
+| PS | 92 | 12,101 |
+| MS | 246 | 9,282 |
+| CS | 263 of 271 | 2,689 |
+
+Which VS and PS share a PSO is only known when the game creates it, so the pair count is still open.
+`CreateGraphicsPipelineState` refuses a pair where both read it, with a log, so the first boot measures it. MS+PS
+pipelines (not accepted yet) are the likelier case: every MS that uses `s_getpc_b64` reads its code base. An index
+written by an older translator may have no `uses_code_base` entries at all, so count with the current one.
 
 **Measured:** across the GPU test fleet (Issue #166), desktop NVIDIA (Turing, Ampere, Ada, Blackwell: 256 bytes), desktop AMD (RDNA2: 256 bytes) and Apple Silicon (MoltenVK: 4096 bytes) all satisfy the 144-byte contract natively (`maxPushConstantsSize >= 144`). On Intel Arc (Alchemist, Battlemage), Vulkan exposes the 128-byte specification minimum (`maxPushConstantsSize == 128`), which cannot fit the 16-byte tail (dwords 32–35: heap base and code base) inside push constants. The runtime detects `maxPushConstantsSize < 144` at device creation (`d3d12_vulkan_device.cpp`) and flags `push_constants_need_fallback` for the uniform-buffer fallback.
 
