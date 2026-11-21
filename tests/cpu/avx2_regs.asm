@@ -742,4 +742,37 @@ op_pmaskmovq_store_ymm PROC FRAME
     ret
 op_pmaskmovq_store_ymm ENDP
 
+; --- XMM-width vmovdqu load/store and register copy paths ---
+
+op_movdqu_store128 PROC FRAME
+    .endprolog
+    vmovdqu xmm0, XMMWORD PTR [rcx]
+    vmovdqu XMMWORD PTR [r8], xmm0
+    vzeroupper
+    ret
+op_movdqu_store128 ENDP
+
+op_movdqu_copy128 PROC FRAME
+    .endprolog
+    vmovdqu xmm0, XMMWORD PTR [rcx]
+    vmovdqu xmm1, xmm0
+    vmovdqu YMMWORD PTR [r8], ymm1
+    vzeroupper
+    ret
+op_movdqu_copy128 ENDP
+
+; --- Gather rooted in RDX instead of RCX (ctrl moves to RCX) ---
+
+op_pgatherdd_ymm_rdx PROC FRAME
+    .endprolog
+    vmovdqu ymm0, YMMWORD PTR [rcx]
+    vmovdqu ymm1, YMMWORD PTR [rcx + 32]
+    vmovdqu ymm2, YMMWORD PTR [rcx + 64]
+    vpgatherdd ymm0, DWORD PTR [rdx + ymm1*4 + 8], ymm2
+    vmovdqu YMMWORD PTR [r8], ymm0
+    vmovdqu YMMWORD PTR [r8 + 32], ymm2
+    vzeroupper
+    ret
+op_pgatherdd_ymm_rdx ENDP
+
 END

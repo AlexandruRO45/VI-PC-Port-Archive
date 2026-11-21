@@ -39,6 +39,8 @@ EXPORTS
     op_psrlvq_ymm
     op_zeroupper
     op_pipeline
+    op_movdqu_store128
+    op_movdqu_copy128
     op_gatherdps_xmm
     op_gatherdps_ymm
     op_gatherdps_ymm_scale1_disp
@@ -64,3 +66,4 @@ EXPORTS
     op_pmaskmovd_store_ymm
     op_pmaskmovq_store_xmm
     op_pmaskmovq_store_ymm
+    op_pgatherdd_ymm_rdx

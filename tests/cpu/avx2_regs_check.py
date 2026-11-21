@@ -9,7 +9,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 import pefile
-from iced_x86 import Code, Decoder, Encoder, Instruction, MemoryOperand, Register as R
+from iced_x86 import Code, Encoder, Instruction, MemoryOperand, Register as R
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 from cpu_avx2_aot import lift_code, translate, vsib_address
@@ -62,6 +62,8 @@ EXPORTS = (
     "op_psrlvq_ymm",
     "op_zeroupper",
     "op_pipeline",
+    "op_movdqu_store128",
+    "op_movdqu_copy128",
 )
 
 
@@ -275,6 +277,10 @@ def reference(name, a, b, altered=False):
         return a[:16] + b"\x00" * 16
     if name == "op_pipeline":
         return ref_pipeline(a, b)
+    if name == "op_movdqu_store128":
+        return a[:16] + FILL[16:]
+    if name == "op_movdqu_copy128":
+        return a[:16] + b"\x00" * 16
     raise ValueError(f"unknown export {name}")
 
 
@@ -419,7 +425,10 @@ GATHER_SPECS = (
     ("op_pgatherqd_xmm_vm64y", 32, 64, 4, 4, 12, None),
     ("op_pgatherqq_xmm", 64, 64, 2, 8, 0, None),
     ("op_pgatherqq_ymm", 64, 64, 4, 8, 0, None),
+    ("op_pgatherdd_ymm_rdx", 32, 32, 8, 4, 8, None),
 )
+
+RDX_BASE_GATHERS = {"op_pgatherdd_ymm_rdx"}
 
 # (export_name, elem_bits, wide, alt_disp)
 MASKMOV_LOAD_SPECS = (
@@ -655,11 +664,14 @@ def maskmov_cases_for(elem_bits, wide):
     return cases
 
 
-def invoke_gather(fn, data_buf_raw, base_ptr, init_dest, vindex, mask):
+def invoke_gather(fn, data_buf_raw, base_ptr, init_dest, vindex, mask, rdx_base=False):
     ctrl = ctypes.create_string_buffer(init_dest + vindex + mask, 96)
     guarded_out = ctypes.create_string_buffer(GUARD_PRE + OUT_FILL_64 + GUARD_POST, 96)
     out_ptr = ctypes.addressof(guarded_out) + len(GUARD_PRE)
-    fn(base_ptr, ctypes.addressof(ctrl), out_ptr)
+    if rdx_base:
+        fn(ctypes.addressof(ctrl), base_ptr, out_ptr)
+    else:
+        fn(base_ptr, ctypes.addressof(ctrl), out_ptr)
     raw = guarded_out.raw
     if raw[:16] != GUARD_PRE or raw[80:] != GUARD_POST:
         raise AssertionError("guard bytes corrupted around gather output buffer")
@@ -739,8 +751,9 @@ def check_guard_page_fault_suppression(native_mem, lifted_mem):
             mask = pack_mask_bits(elem_bits, active, non_msb_noise=True)
             want = ref_gather(page0_data, g_base_off, init_dest, vindex, mask,
                               elem_bits, idx_bits, count, scale, disp)
-            got_n = invoke_gather(native_mem[name], None, g_base, init_dest, vindex, mask)
-            got_l = invoke_gather(lifted_mem[name], None, g_base, init_dest, vindex, mask)
+            rdx_base = name in RDX_BASE_GATHERS
+            got_n = invoke_gather(native_mem[name], None, g_base, init_dest, vindex, mask, rdx_base)
+            got_l = invoke_gather(lifted_mem[name], None, g_base, init_dest, vindex, mask, rdx_base)
             assert_equal_output("guard-native", name, 0, got_n, want)
             assert_equal_output("guard-lifted", name, 0, got_l, want)
             checked += 1
@@ -828,8 +841,9 @@ def check_differential(native_path, lifted_path, altered_path):
             want = ref_gather(known_data, DATA_BASE_OFFSET, init_dest, vindex, mask,
                               elem_bits, idx_bits, count, scale, disp)
             ptr = 0 if null_base else base_ptr
-            got_n = invoke_gather(native_mem[name], guarded_data, ptr, init_dest, vindex, mask)
-            got_l = invoke_gather(lifted_mem[name], guarded_data, ptr, init_dest, vindex, mask)
+            rdx_base = name in RDX_BASE_GATHERS
+            got_n = invoke_gather(native_mem[name], guarded_data, ptr, init_dest, vindex, mask, rdx_base)
+            got_l = invoke_gather(lifted_mem[name], guarded_data, ptr, init_dest, vindex, mask, rdx_base)
             assert_equal_output("native", name, idx, got_n, want)
             assert_equal_output("lifted", name, idx, got_l, want)
             mem_total += 1
