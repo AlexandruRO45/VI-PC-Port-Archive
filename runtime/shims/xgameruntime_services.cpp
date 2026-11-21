@@ -217,14 +217,30 @@ struct XGameSaveContainerInfo {
 using BlobInfoCallback = bool(CALLBACK*)(const XGameSaveBlobInfo*, void*);
 using ContainerInfoCallback = bool(CALLBACK*)(const XGameSaveContainerInfo*, void*);
 
-// Container and blob names become folder and file names. Anything outside [A-Za-z0-9._-] (and a leading '.') is
-// written as %XX, so every name round-trips, none can leave the save folder, and no encoded name starts with '~',
-// which marks the temporary files of an update in progress.
+// Container and blob names become folder and file names. Anything outside [A-Za-z0-9._-], a leading or trailing '.',
+// and the first character of a Windows device name are written as %XX, so every name round-trips, none can leave
+// the save folder, and no encoded name starts with '~', which marks the temporary files of an update in progress.
+// Names that differ only in case still share a file on NTFS (whether XGameSave names are case-sensitive: VERIFY).
+// Windows device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9, also with an extension) can't be file or folder names,
+// and Win32 strips a trailing '.' or ' ': escaping the first character of the one and the last of the other keeps
+// every name a distinct, real file.
+bool reserved_device_name(const std::string& name) {
+    std::string stem = name.substr(0, name.find('.'));
+    for (auto& c : stem) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    if (stem == "CON" || stem == "PRN" || stem == "AUX" || stem == "NUL") return true;
+    return stem.size() == 4 && (stem.rfind("COM", 0) == 0 || stem.rfind("LPT", 0) == 0) && stem[3] >= '1' &&
+           stem[3] <= '9';
+}
+
 std::string encode_name(const std::string& name) {
     static const char* hex = "0123456789ABCDEF";
+    const bool device = reserved_device_name(name);
     std::string out;
-    for (unsigned char c : name) {
-        if (std::isalnum(c) || c == '_' || c == '-' || (c == '.' && !out.empty())) out += static_cast<char>(c);
+    for (size_t i = 0; i < name.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(name[i]);
+        const bool last = i + 1 == name.size();
+        const bool plain = std::isalnum(c) || c == '_' || c == '-' || (c == '.' && i > 0 && !last);
+        if (plain && !(device && i == 0)) out += static_cast<char>(c);
         else { out += '%'; out += hex[c >> 4]; out += hex[c & 15]; }
     }
     return out;

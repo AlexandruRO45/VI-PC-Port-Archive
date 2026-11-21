@@ -227,6 +227,27 @@ int main() {
     quota(provider, &quota_after);
     check(quota_after == quota_before - 2, "the quota goes down by the bytes stored");
 
+    // Names Windows can't store as given: a device name and a trailing dot (reported in #279 review).
+    for (const char* odd : {"NUL", "com1.dat", "a.", "a"}) {
+        void* c = nullptr, *u = nullptr;
+        get<HRESULT(__stdcall*)(void*, const char*, void**)>("XGameSaveCreateContainer")(provider, odd, &c);
+        get<HRESULT(__stdcall*)(void*, const char*, void**)>("XGameSaveCreateUpdate")(c, "", &u);
+        const uint8_t one = static_cast<uint8_t>(std::strlen(odd));
+        write(u, "x", &one, 1);
+        get<HRESULT(__stdcall*)(void*)>("XGameSaveSubmitUpdate")(u);
+        get<void(__stdcall*)(void*)>("XGameSaveCloseUpdate")(u);
+        get<void(__stdcall*)(void*)>("XGameSaveCloseContainer")(c);
+    }
+    containers.clear();
+    get<HRESULT(__stdcall*)(void*, void*, bool(CALLBACK*)(const XGameSaveContainerInfo*, void*))>(
+        "XGameSaveEnumerateContainerInfo")(provider, &containers, collect_containers);
+    int odd_found = 0;
+    for (auto& e : containers)
+        odd_found += e == "NUL:1" || e == "com1.dat:1" || e == "a.:1" || e == "a:1";
+    check(odd_found == 4, "\"NUL\", \"com1.dat\", \"a.\" and \"a\" are four distinct containers that enumerate back by name");
+    for (const char* odd : {"NUL", "com1.dat", "a.", "a"})
+        get<HRESULT(__stdcall*)(void*, const char*)>("XGameSaveDeleteContainer")(provider, odd);
+
     get<void(__stdcall*)(void*)>("XGameSaveCloseContainer")(container);
     auto del = get<HRESULT(__stdcall*)(void*, const char*)>("XGameSaveDeleteContainer");
     check(del(provider, "slot 1/main") == S_OK, "XGameSaveDeleteContainer removes the container");
