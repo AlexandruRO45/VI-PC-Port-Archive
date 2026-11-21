@@ -554,6 +554,35 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/import_check.py" "$<TARGET_FILE:cpu_import_original>"
         "$<TARGET_FILE:cpu_import_original_lifted>" "$<TARGET_FILE:cpu_import_provider>"
         "$<TARGET_FILE:cpu_import_altered>" "$<TARGET_FILE:cpu_register_probe>")
+    add_library(cpu_exe_io SHARED tests/cpu/exe_io.cpp)
+    foreach(variant IN ITEMS original inverted)
+        set(native cpu_exe_${variant})
+        set(lifted ${native}_lifted)
+        add_executable(${native} tests/cpu/exe_entry.asm tests/cpu/direct.asm)
+        set_target_properties(${native} PROPERTIES LINKER_LANGUAGE CXX)
+        target_compile_definitions(${native} PRIVATE IMPORT_MIX)
+        if(variant STREQUAL "inverted")
+            target_compile_definitions(${native} PRIVATE FLIP_SELECTOR)
+        endif()
+        target_link_options(${native} PRIVATE /ENTRY:native_entry /NODEFAULTLIB /INCREMENTAL:NO)
+        set(source "${CMAKE_CURRENT_BINARY_DIR}/${lifted}.cpp")
+        add_custom_command(OUTPUT "${source}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_exe_aot.py"
+                "$<TARGET_FILE:${native}>" "$<TARGET_FILE:cpu_exe_io>"
+                "$<TARGET_FILE:cpu_import_provider>" "${source}"
+            DEPENDS ${native} cpu_exe_io cpu_import_provider tools/cpu_exe_aot.py
+                tools/cpu_call_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py tools/ffx_version_query.py
+            VERBATIM)
+        add_executable(${lifted} "${source}")
+        target_link_options(${lifted} PRIVATE /INCREMENTAL:NO)
+        foreach(program IN ITEMS ${native} ${lifted})
+            target_link_libraries(${program} PRIVATE cpu_exe_io cpu_import_provider)
+        endforeach()
+    endforeach()
+    add_test(NAME cpu_aot_exe_entry COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/exe_entry_check.py"
+        "$<TARGET_FILE:cpu_exe_original>" "$<TARGET_FILE:cpu_exe_original_lifted>"
+        "$<TARGET_FILE:cpu_exe_inverted>" "$<TARGET_FILE:cpu_exe_inverted_lifted>")
     add_test(NAME cpu_aot_ordinal_import COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/import_check.py" "$<TARGET_FILE:cpu_ordinal_original>"
         "$<TARGET_FILE:cpu_ordinal_original_lifted>" "$<TARGET_FILE:cpu_ordinal_provider>"

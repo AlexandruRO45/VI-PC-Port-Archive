@@ -28,6 +28,24 @@ dumpbin /imports .\out\build\dev\d3d12_sdk_check.exe
 
 Build outputs and downloaded tool sources live under `out/`. [Microsoft xbdepends documentation](https://learn.microsoft.com/en-us/samples/microsoft/xbox-gdk-samples/xbdepends/)
 
+## Source-built EXE entry to a DLL import
+
+MSVC assembles a small CRT-free [EXE entry](../tests/cpu/exe_entry.asm) and links it with the existing `call_mix` fixture. The [translator](../tools/cpu_exe_aot.py) starts at the PE's `AddressOfEntryPoint`, reads its unwind-bounded instruction range, follows the relative call to `call_mix`, and resolves its IAT slot against `cpu_import_provider.dll!mix_args`. It emits both functions as C++. The translated EXE uses ordinary Windows C++ startup to enter the generated `main`. Both versions use the same native provider and the same I/O DLL.
+
+The [Windows test](../tests/cpu/exe_entry_check.py) sends one byte to each child. The provider records its two incoming integers and writes the computed word through its third argument. The I/O DLL sends the recorded integers to stderr and the eight output bytes to stdout. The test reads both pipes and the process exit code.
+
+| Input byte | Integers received by the DLL | Output bytes in write order | Exit code |
+| --- | --- | --- | --- |
+| `00` | `0x100000303`, `0xfffffffd` | `11 03 00 00 00 00 00 00` | `0x60d` |
+| `01` | `0x30`, `0x06` | `35 00 00 00 00 00 00 00` | `0x57` |
+
+A second build flips the selector's conditional jump. The same translator compiles that EXE, and both inverted programs must exchange the two rows in all three observations. Empty input returns 2 with both pipes empty in all four programs. The ordinary process launch and the first exit code follow the contributor's [mapped-process experiment](https://github.com/R0Y00/Xbox2Windows/issues/165). That experiment covers TLS startup separately.
+
+```powershell
+cmake --build --preset dev --target cpu_exe_original_lifted cpu_exe_inverted_lifted
+ctest --preset dev --no-tests=error -R '^cpu_aot_exe_entry$' -V
+```
+
 ## Offline CPU leaf recompilation
 
 With the Python-enabled Windows dev preset configured, run:
