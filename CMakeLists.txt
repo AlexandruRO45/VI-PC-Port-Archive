@@ -434,6 +434,18 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_entry_order COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/entry_order_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_entry_order>" "$<TARGET_FILE:cpu_entry_order_lifted>")
+    foreach(variant IN ITEMS original swapped)
+        cpu_asm_fixture(cpu_float_${variant} scalar_float)
+        cpu_translation(cpu_float_${variant} cpu_sse_aot
+            "blend_ss=f:ffqf,blend_sd=d:ddqd,convert=q:fdq,from_int=d:qq,classify_ss=q:ff,classify_sd=q:dq")
+        add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/cpu_float_${variant}_lifted.cpp" APPEND
+            DEPENDS tools/cpu_switch_aot.py)
+    endforeach()
+    target_compile_definitions(cpu_float_swapped PRIVATE SWAP_OPERANDS)
+    add_test(NAME cpu_aot_scalar_float COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/scalar_float_check.py"
+        "$<TARGET_FILE:cpu_float_original>" "$<TARGET_FILE:cpu_float_original_lifted>"
+        "$<TARGET_FILE:cpu_float_swapped>" "$<TARGET_FILE:cpu_float_swapped_lifted>")
     cpu_asm_fixture(cpu_chained chained)
     cpu_translation(cpu_chained cpu_chained_aot choose_value)
     cpu_asm_fixture(cpu_chained_jne chained)
