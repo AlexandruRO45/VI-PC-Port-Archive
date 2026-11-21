@@ -17,6 +17,21 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SHADER_DIR = os.path.join(ROOT, "runtime", "test", "shaders")
 TRANSLATOR = os.path.join(ROOT, "tools", "rdna2spirv.py")
 
+# A filtered run still has to build the shaders its selected tests draw with.
+ASM_DEPENDENCIES = {"ps_flat.asm": ("vs_ids.asm",)}
+
+
+def select_asm_files(shader_dir: str, filter_text: str) -> tuple[list[str], list[str]]:
+    """Return (selected tests, files to build): dependencies come along but are not run as tests."""
+    available = sorted(f for f in os.listdir(shader_dir) if f.endswith(".asm"))
+    selected = [f for f in available if filter_text in f] if filter_text else available
+    build = list(selected)
+    for name in selected:
+        for dep in ASM_DEPENDENCIES.get(name, ()):
+            if dep not in build:
+                build.append(dep)
+    return selected, build
+
 
 def make_dxbc(chunks: list[tuple[bytes, bytes]]) -> bytes:
     """Build a minimal DXBC container from (fourcc, payload) pairs."""
@@ -388,12 +403,10 @@ def run_suite(a, work: str) -> int:
     for d in (fssm_dir, disasm_dir, spirv_dir, raw_dir):
         os.makedirs(d, exist_ok=True)
 
-    asm_files = sorted(f for f in os.listdir(SHADER_DIR) if f.endswith(".asm"))
-    if a.filter:
-        asm_files = [f for f in asm_files if a.filter in f]
+    asm_files, build_files = select_asm_files(SHADER_DIR, a.filter)
 
     # 1. Create synthetic DXBC / FSSM metadata + assemble .asm -> .s
-    for fname in asm_files:
+    for fname in build_files:
         name = os.path.splitext(fname)[0]
         if name == "gs_tri":
             dxbc = make_dxbc([
