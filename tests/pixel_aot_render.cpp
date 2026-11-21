@@ -45,6 +45,8 @@ struct PixelInput {
     std::vector<Color> expected;
     std::vector<BYTE> secondRows;
     std::vector<Word> constants = std::vector<Word>(64);
+    bool integerRT = false;      // bit 0 of the optional case-trailer flags byte
+    std::vector<BYTE> nanMask;   // 64 per-texel NaN-class mask bytes, empty without a trailer
 };
 
 struct MipDraw {
@@ -88,7 +90,8 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
     desc.SampleMask = UINT_MAX;
     desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     desc.NumRenderTargets = desc.SampleDesc.Count = 1;
-    desc.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    desc.RTVFormats[0] = input.integerRT ? DXGI_FORMAT_R32G32B32A32_UINT
+                                         : DXGI_FORMAT_R32G32B32A32_FLOAT;
     ComPtr<ID3D12PipelineState> pso;
     check(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso)), "Translated pixel pipeline");
 
@@ -237,10 +240,37 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
                 const auto offset = y * resultLayout.Footprint.RowPitch / 4 + x * 4;
                 Color actual;
                 std::memcpy(actual.data(), words.data() + offset, sizeof(actual));
-                const auto matches = [&](const Color& ref) {
-                    return std::memcmp(actual.data(), ref.data(), sizeof(actual)) == 0;
+                const auto bits = [](float value) {
+                    UINT word;
+                    std::memcpy(&word, &value, sizeof(word));
+                    return word;
                 };
-                bool matched = matches(expected);
+                const auto is_nan_bits = [](UINT word) {
+                    return (word & 0x7f800000u) == 0x7f800000u && (word & 0x007fffffu) != 0u;
+                };
+                // Per-channel compare against one expected texel. Unmasked channels are strict
+                // bitwise. A masked channel accepts a NaN against an expected NaN of any sign or
+                // payload and still logs both raw words; masking a channel whose expected word is
+                // not NaN is a case-format error.
+                const auto matches_at = [&](size_t index) {
+                    const auto& reference = sampled.expected[index];
+                    const BYTE mask = index < sampled.nanMask.size() ? sampled.nanMask[index] : BYTE{0};
+                    for (size_t c = 0; c < actual.size(); ++c) {
+                        const UINT expected_bits = bits(reference[c]);
+                        const UINT actual_bits = bits(actual[c]);
+                        if (mask >> c & 1) {
+                            if (!is_nan_bits(expected_bits))
+                                throw std::runtime_error("NaN-class mask on a channel whose expected word is not NaN");
+                            std::printf("nan_class x=%u y=%u ch=%zu expected=%08x actual=%08x\n",
+                                        x, y, c, expected_bits, actual_bits);
+                            if (!is_nan_bits(actual_bits)) return false;
+                        } else if (expected_bits != actual_bits) {
+                            return false;
+                        }
+                    }
+                    return true;
+                };
+                bool matched = matches_at(sampleY * sampled.width + sampleX);
                 // The exact texel is always tried first. Neighbors are admitted only
                 // for magnified tail draws, which sample through the root signature's
                 // single static sampler (MIN_MAG_MIP_POINT, clamp addressing).
@@ -260,14 +290,15 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
                     const UINT nearX = neighbor(numeratorX, 2 * width, sampleX, sampled.width);
                     const UINT nearY = neighbor(numeratorY, 2 * height, sampleY, sampled.height);
                     // Each candidate must match as a whole RGBA texel.
-                    matched = matches(sampled.expected[sampleY * sampled.width + nearX]) ||
-                              matches(sampled.expected[nearY * sampled.width + sampleX]) ||
-                              matches(sampled.expected[nearY * sampled.width + nearX]);
+                    matched = matches_at(sampleY * sampled.width + nearX) ||
+                              matches_at(nearY * sampled.width + sampleX) ||
+                              matches_at(nearY * sampled.width + nearX);
                 }
                 if (!matched) {
                     std::fprintf(stderr, "pixel_mismatch x=%u y=%u\n", x, y);
                     for (size_t c = 0; c < actual.size(); ++c)
-                        std::fprintf(stderr, "channel=%zu expected=%g actual=%g\n", c, expected[c], actual[c]);
+                        std::fprintf(stderr, "channel=%zu expected=%g actual=%g expected_bits=%08x actual_bits=%08x\n",
+                                     c, expected[c], actual[c], bits(expected[c]), bits(actual[c]));
                     throw std::runtime_error("AOT color export differs from CPU reference");
                 }
                 if (capture) {
@@ -309,8 +340,22 @@ void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB,
         std::ifstream file(reference, std::ios::binary);
         file.read(reinterpret_cast<char*>(input.constants.data()), input.constants.size() * sizeof(Word));
         file.read(reinterpret_cast<char*>(input.expected.data()), input.expected.size() * sizeof(Color));
-        if (!file || file.peek() != std::char_traits<char>::eof())
+        if (!file)
             throw std::runtime_error("Expected a 256-byte constant buffer and 64 float4 reference colors");
+        if (file.peek() != std::char_traits<char>::eof()) {
+            BYTE flags = 0;
+            file.read(reinterpret_cast<char*>(&flags), 1);
+            if (flags & 0xfeu)
+                throw std::runtime_error("Unknown case trailer flag bits");
+            input.integerRT = (flags & 1u) != 0;
+            if (file.peek() != std::char_traits<char>::eof()) {
+                input.nanMask.resize(64);
+                file.read(reinterpret_cast<char*>(input.nanMask.data()),
+                          static_cast<std::streamsize>(input.nanMask.size()));
+                if (!file || file.peek() != std::char_traits<char>::eof())
+                    throw std::runtime_error("Case trailer must hold one flags byte and 64 mask bytes");
+            }
+        }
     }
     std::vector<PixelInput> levels;
     levels.push_back(std::move(input));

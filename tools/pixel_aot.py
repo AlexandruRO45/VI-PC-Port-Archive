@@ -386,15 +386,20 @@ def int_operand(token, scalar, vector, pending, sample_pending, *, signed):
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *, second_texture_offset=None):
     """Track descriptor provenance, interpolation and packed exports through register writes."""
+def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *,
+          second_texture_offset=None, integer_export=False):
+    """Track descriptor provenance, interpolation and packed or uncompressed exports."""
     if (texture_sgpr == interp_sgpr or not 0 <= texture_sgpr <= 105 or not 0 <= interp_sgpr <= 105
             or len(sampler) != 4 or any(not 0 <= word <= 0xffffffff for word in sampler)):
         raise ValueError("Invalid scalar inputs or sampler descriptor words")
     scalar = {f"s{texture_sgpr}": "texture_ptr", f"s{interp_sgpr}": "interp_base"}
     vector = {"v0": "bary_i", "v1": "bary_j"}
+    preamble = (PREAMBLE.replace("float4 main(float2 uv : TEXCOORD0)",
+                                 "uint4 main(float2 uv : TEXCOORD0)") if integer_export else PREAMBLE)
     # Each emitted value has a unique identity. Entry-only writes never gain a helper definition.
     # The boolean records whether the quad value depends on interpolated coordinates.
     quad_values = {"uv.x": True, "uv.y": True}
-    lines = [PREAMBLE]
+    lines = [preamble]
     if constant_descriptor is not None:
         if constant_descriptor < 0 or constant_descriptor % 4:
             raise ValueError("Invalid constant descriptor offset")
@@ -710,12 +715,23 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Unsupported pack operand")
             vector[dst] = pair
         elif m := match(r"exp mrt0,? (v\d+), \1, (v\d+), \2 done compr vm"):
+            if integer_export:
+                raise ValueError("Integer export requires the uncompressed export form")
             pairs = [vector[v] for v in m.groups()]
             if mask != "entry" or exported or not all(isinstance(p, tuple) and len(p)==2 and
                     all(v.startswith(("sample", "alu")) for v in p) for p in pairs):
                 raise ValueError("Unsupported export")
             args = [f"export16({v})" for pair in pairs for v in pair]
             lines.append(f"    return float4({', '.join(args)});")
+            exported = True
+        elif m := match(r"exp mrt0,? (v\d+), (v\d+), (v\d+), (v\d+) done vm"):
+            # Four distinct registers of computed or sampled values, exported as raw binary32.
+            values = [vector[v] for v in m.groups()]
+            if (mask != "entry" or exported or len(set(m.groups())) != 4 or not all(
+                    isinstance(v, str) and v.startswith(("sample", "alu")) for v in values)):
+                raise ValueError("Unsupported export")
+            args = [f"asuint({v})" for v in values] if integer_export else values
+            lines.append(f"    return {'uint4' if integer_export else 'float4'}({', '.join(args)});")
             exported = True
         elif line == "s_endpgm" and exported:
             ended = True
@@ -725,7 +741,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         raise ValueError("Unexpected sample count or missing color export")
     if helpers:
         defs = [body for name, body in SALU_HELPERS.items() if name in helpers]
-        pos = lines.index(PREAMBLE)
+        pos = lines.index(preamble)
         lines[pos:pos] = defs
     return "\n".join([*lines, "}",""])
 
