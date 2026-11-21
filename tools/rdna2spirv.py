@@ -18,6 +18,7 @@ Usage (needs spirv-as/spirv-val on PATH, from the Vulkan SDK or spirv-tools):
 Writes <name>.spvasm and <name>.spv for each translated shader and prints coverage + validation results.
 """
 import argparse
+import hashlib
 import os
 import re
 import struct
@@ -4977,36 +4978,48 @@ def read_before_write_vgprs(insns):
     return set(first)
 
 
-def input_signature_full(path, name):
-    """ISG1 elements as (system value, declared mask, read/write mask)."""
+def input_signature_rows(path, name):
+    """Yield each ISG1 row with the chunk its semantic name offsets refer to."""
     dxbc = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), name + ".dxbc")
-    d = open(dxbc, "rb").read()
+    with open(dxbc, "rb") as f:
+        d = f.read()
     for k in range(struct.unpack_from("<I", d, 28)[0]):
         off = struct.unpack_from("<I", d, 32 + 4 * k)[0]
         if d[off:off + 4] == b"ISG1":
             p = d[off + 8:off + 8 + struct.unpack_from("<I", d, off + 4)[0]]
             cnt, eo = struct.unpack_from("<II", p, 0)
-            return [(struct.unpack_from("<I", p, eo + 32 * i + 12)[0], p[eo + 32 * i + 24], p[eo + 32 * i + 25])
-                    for i in range(cnt)]
-    return []
+            for i in range(cnt):
+                start = eo + 32 * i
+                yield p, p[start:start + 32]
+            return
+
+
+def input_signature_full(path, name):
+    """ISG1 elements as (system value, declared mask, read/write mask)."""
+    return [(struct.unpack_from("<I", row, 12)[0], row[24], row[25])
+            for _, row in input_signature_rows(path, name)]
 
 
 def input_signature(path, name):
     """ISG1 elements of the shader's DXBC container: (register, mask, system value, component type)."""
-    dxbc = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), name + ".dxbc")
-    d = open(dxbc, "rb").read()
-    for k in range(struct.unpack_from("<I", d, 28)[0]):
-        off = struct.unpack_from("<I", d, 32 + 4 * k)[0]
-        if d[off:off + 4] == b"ISG1":
-            p = d[off + 8:off + 8 + struct.unpack_from("<I", d, off + 4)[0]]
-            cnt, eo = struct.unpack_from("<II", p, 0)
-            out = []
-            for i in range(cnt):
-                e = p[eo + 32 * i:eo + 32 * i + 32]
-                _, _, _, sysv, ctype, reg = struct.unpack_from("<6I", e, 0)
-                out.append((reg, e[24], sysv, ctype))
-            return out
-    return []
+    out = []
+    for _, row in input_signature_rows(path, name):
+        _, _, _, sysv, ctype, reg = struct.unpack_from("<6I", row)
+        out.append((reg, row[24], sysv, ctype))
+    return out
+
+
+def vertex_input_signature(path, name):
+    out = []
+    for chunk, row in input_signature_rows(path, name):
+        stream, offset, index, sysv, ctype, reg, mask, reads, _, precision = struct.unpack_from("<6IBBHI", row)
+        end = chunk.index(b"\0", offset)
+        if end == offset:
+            raise ValueError("empty ISG1 semantic name")
+        out.append({"semantic_name": chunk[offset:end].decode("utf-8"), "semantic_index": index,
+                    "register": reg, "mask": mask, "component_type": ctype, "system_value": sysv,
+                    "read_mask": reads, "stream": stream, "min_precision": precision})
+    return out
 
 
 def same_encoding(raw, printed, op):
@@ -5385,7 +5398,7 @@ def branch_condition(g, op):
     return b
 
 
-def shader_meta(g, asm):
+def shader_meta(g, asm, path, name):
     """What a runtime needs to create the pipeline for this module without inspecting it: stage, wave size,
     Vulkan features/extensions it requires, descriptor bindings (set 0), push-constant size, workgroup size,
     LDS bytes, mesh/geometry limits, and the input/output locations."""
@@ -5422,6 +5435,21 @@ def shader_meta(g, asm):
         m["lds_bytes"] = 4 * g.lds_dwords
     if g.vertex_inputs:
         m["vertex_inputs"] = [{"location": r, "type": {1: "uint", 2: "sint"}.get(t, "float")} for r, t in g.vertex_inputs]
+    # Hand-authored disassembly may not have the original binaries alongside it.
+    shader_dir = os.path.dirname(os.path.dirname(os.path.realpath(path)))
+    try:
+        with open(os.path.join(shader_dir, "fssm", name + ".fssm"), "rb") as f:
+            m["fssm_sha256"] = hashlib.file_digest(f, "sha256").hexdigest()
+    except OSError:
+        pass
+    if g.stage == "vs":
+        try:
+            signature = vertex_input_signature(path, name)
+        except (OSError, struct.error, ValueError):
+            pass
+        else:
+            if signature:
+                m["vertex_input_signature"] = signature
     if g.frag_inputs:
         m["ps_system_inputs"] = sorted({str(c) for c in g.frag_inputs.values()})
     outs = sorted(int("".join(ch for ch in t if ch.isdigit()) or 0) for t in g.outputs.values() if t != "pos0")
@@ -5496,7 +5524,7 @@ def main():
         if r.returncode == 0:
             valid += 1
             try:
-                meta[name] = shader_meta(translate.last_gen, asm)
+                meta[name] = shader_meta(translate.last_gen, asm, p, name)
             except Exception as e:  # noqa: BLE001 - metadata must never cost a translation
                 meta[name] = {"error": f"{type(e).__name__}: {e}"}
         else:

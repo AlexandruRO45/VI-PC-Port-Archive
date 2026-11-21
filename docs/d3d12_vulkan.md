@@ -363,8 +363,6 @@ dump; nothing from those files is in this repository):
 - the descriptor stride(s) implied by descriptor address arithmetic;
 - whether the shader uses the code base (`s_getpc_b64`) and, if so, in which stage;
 - the literal S# values it builds from immediates;
-- the input signature (semantic name/index, register, mask, component type), not just the register numbers;
-- the FSSM content hash (the PSO lookup key, section 3.6);
 - the descriptor-table / heap-direct-indexing mode the shader was compiled for.
 
 The runtime can then reconcile the root signature with the shader's reads and fail loudly on a mismatch instead of
@@ -372,11 +370,14 @@ rendering silently wrong.
 
 ### 3.6 Shader identity, PSOs and feature selection
 
-A D3D12 PSO carries DXBC containers, not SPIR-V. The layer identifies a shader by hashing the **FSSM payload** (the
-native RDNA2 program inside the container) and looking it up in a build-time table keyed by `(stage, hash)`. The
-build emits that hash for every translation; the runtime extracts the FSSM chunk from the DXBC container the same
-way `tools/fssm_unpack.py` does. The current `spirv/index.json` is keyed by carve name, which the runtime may not
-have; add the content hash to the index.
+A D3D12 PSO carries DXBC containers, not SPIR-V. The layer can build a lookup keyed by `(stage, fssm_sha256)`
+from the entries in `spirv/index.json`. When the **FSSM payload** is available, its hash is the lowercase
+SHA-256 digest of the complete unpacked blob. The runtime can extract the same blob from its DXBC container
+using the format documented in `tools/fssm_unpack.py`.
+
+When available, vertex shader entries also record `vertex_input_signature` with semantic names and indices,
+registers, masks and numeric D3D component types from ISG1. Existing indexes gain these fields on retranslation.
+The ISG1 layout follows [Microsoft's DXIL container definition](https://github.com/microsoft/DirectXShaderCompiler/blob/main/include/dxc/DxilContainer/DxilContainer.h).
 
 Pipeline creation:
 
@@ -393,7 +394,7 @@ Pipeline creation:
   **location = D3D input register**, not the semantic's HLSL slot. Match the layout element's semantic name/index
   to the ISG1 element to get the register, then create a `VkVertexInputAttributeDescription` with that location
   and the DXGI format. Resolve `D3D12_APPEND_ALIGNED_ELEMENT` against the preceding element and honour
-  `InputSlotClass`/`InstanceDataStepRate`. The index entry needs the semantic map (section 3.5).
+  `InputSlotClass`/`InstanceDataStepRate`.
 - Enable the features the index entry lists: barycentrics, fragment interlock, mesh, geometry, Float64, Int64,
   buffer device address, storage image without format, maintenance8.
 - Request `requiredSubgroupSize = 64` for wave64 shaders when `VK_EXT_subgroup_size_control` offers it (AMD).
