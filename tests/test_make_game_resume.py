@@ -20,7 +20,8 @@ class ResumeTest(unittest.TestCase):
         spirv = dxbc.parent / "spirv"
         for folder in (dxbc / "disasm", dxbc / "fssm", spirv):
             folder.mkdir(parents=True)
-        for rel in ("example.dxbc", "fssm/example.fssm", "disasm/example.s", "index.json", "fssm_index.json"):
+        for rel in ("example.dxbc", "fssm/example.fssm", "disasm/example.s",
+                    "index.json", "fssm_index.json", "disasm.done"):
             (dxbc / rel).write_text("fixture")
         for i in range(1001):
             (spirv / f"leftover{i}.spv").touch()

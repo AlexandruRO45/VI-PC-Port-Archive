@@ -250,6 +250,11 @@ def check_bitmask_perm(raw_path: str) -> tuple[bool, str]:
     return (bad == 0 and judged > 0), (first if bad else f"{judged}/{judged} pixels in lanes 0-31 exact")
 
 
+# Test shaders that need memory or push constants only the semantic-test interpreter sets up (tests/semantic).
+# On the GPU harness they would read an unset descriptor; ps_vcc_x2 loses the device that way.
+INTERPRETER_ONLY = {"ps_vcc_x2": "needs the seeded V# memory of tests/semantic; checked there"}
+
+
 def check_flat(raw_path: str) -> tuple[bool, str]:
     """ps_flat with vs_ids: the integer IDs come from the first (provoking) vertex, the UVs still interpolate."""
     data = open(raw_path, "rb").read()
@@ -380,6 +385,9 @@ def run_suite(a, work: str) -> int:
     results: list[tuple[str, bool, str]] = []
     for fname in asm_files:
         name = os.path.splitext(fname)[0]
+        if name in INTERPRETER_ONLY:
+            results.append((name, None, "SKIP (" + INTERPRETER_ONLY[name] + ")"))
+            continue
         spv = os.path.join(spirv_dir, f"{name}.spv")
         if not os.path.isfile(spv):
             results.append((name, False, "missing .spv (translation failed)"))
@@ -397,6 +405,15 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_bvh":
             rc, msg = run_cmd([vk_compute, spv, "1", "bvh"], env=cs_env)
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+        elif name == "cs_wavemask":
+            # Whole-wave mask test, as in check.py: needs a 64-wide subgroup, skipped where the device has none.
+            rc, msg = run_cmd([vk_compute, spv, "1", "wavemask", "--require-wave64"], env=cs_env)
+            if rc == 77:
+                results.append((name, None, "SKIP (no 64-wide compute subgroup on this device)"))
+            elif rc == 0 and "compute subgroup size: 64" not in msg.splitlines():
+                results.append((name, False, "64-wide subgroup was not confirmed (rebuild vk_compute_test)"))
+            else:
+                results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
         elif name in ("cs_store", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl"):
             cs_dump_wants = {
                 "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800],
@@ -442,6 +459,8 @@ def run_suite(a, work: str) -> int:
                 "ps_scc": (1, 1, 3, 0x80000000),
                 "ps_sdwa": (0x000000F1, 0xFFFEFFF2, 0x3C003344, 0xFFF70000),
                 "ps_legacy_mul": (0, 0, 0, 0x40C00000),        # same expectation as check.py
+                "ps_ops5": (0x12340010, 0xBEEF0800, 0xAAAAFFFF, 0xDEADBC00),   # from the .asm headers
+                "ps_ops6": (0xF800FFFF, 0x01000010, 0x00800800, 0x8000FFF0),
             }
             if name in const_wants:
                 ok, detail = check_pixel_const(raw, const_wants[name])
