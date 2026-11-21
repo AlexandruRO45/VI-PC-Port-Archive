@@ -272,7 +272,18 @@ if(Vulkan_FOUND)
       DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py
       COMMENT "Generating D3D12 COM stubs"
       VERBATIM)
-    add_library(gta6rt_d3d12_com STATIC shims/d3d12_com.cpp shims/d3d12_vulkan_device.cpp ${LEONIDA_STUBS})
+    # The DXGI chains span the DXGI headers.
+    set(LEONIDA_DXGI_STUBS ${CMAKE_CURRENT_BINARY_DIR}/generated/dxgi_stubs.h)
+    add_custom_command(
+      OUTPUT ${LEONIDA_DXGI_STUBS}
+      COMMAND Python3::Interpreter -I ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py --out ${LEONIDA_DXGI_STUBS}
+              --header dxgi.h --header dxgi1_2.h --header dxgi1_3.h --header dxgi1_4.h --header dxgi1_5.h
+              IDXGISwapChain3 IDXGIFactory5 IDXGIAdapter1
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py
+      COMMENT "Generating DXGI COM stubs"
+      VERBATIM)
+    add_library(gta6rt_d3d12_com STATIC shims/d3d12_com.cpp shims/d3d12_vulkan_device.cpp shims/dxgi_swapchain.cpp
+                shims/dxgi_factory.cpp ${LEONIDA_STUBS} ${LEONIDA_DXGI_STUBS})
     target_include_directories(gta6rt_d3d12_com PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_link_libraries(gta6rt_d3d12_com PUBLIC Vulkan::Headers)
     target_compile_definitions(gta6rt_d3d12_com PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -301,8 +312,15 @@ if(Vulkan_FOUND)
       target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(gta6rt PRIVATE LEONIDA_VULKAN_DEVICE)
     endif()
+
+    # M0: a window, the DXGI factory, adapter and swapchain, and 60 frames of clear + present. Needs a desktop
+    # session, so it is a tool, not a ctest test, like the other GPU tests.
+    add_executable(vk_present_test test/vk_present_test.cpp)
+    target_link_libraries(vk_present_test PRIVATE gta6rt_d3d12_com user32)
+    target_compile_definitions(vk_present_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(vk_present_test PRIVATE /W4 /permissive- /utf-8)
   else()
-    message(STATUS "Python 3 or Windows missing: the D3D12 COM objects and d3d12_com_test are not built")
+    message(STATUS "Python 3 or Windows missing: the D3D12 COM objects, d3d12_com_test and vk_present_test are not built")
   endif()
 
   # Needs only the Vulkan headers, not a GPU.

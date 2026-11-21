@@ -93,6 +93,9 @@ when the Vulkan SDK is found:
 
 - `vk_harness` — hand-written RDNA2 shader programs on a real Vulkan device.
 - `vk_texture_test`, `vk_compute_test`, `vk_store_test` — texture, LDS/compute, and buffer-store paths.
+- `vk_present_test` — milestone M0: a window, the layer's DXGI factory and adapter (the Vulkan device), an
+  `IDXGISwapChain3` over a Vulkan swapchain on the layer's command queue, and 60 frames of clear + present;
+  the last back buffer is read back and checked. Needs a desktop session.
 - `vk_command_replay_test`, `d3d12_com_test`, `d3d12_vulkan_device_test` — the D3D12 command path on
   Vulkan: replay, the COM command objects, and the Vulkan device behind the Xbox-ABI proxy. Set
   `LEONIDA_VK_VALIDATION=1` to run them under the Khronos validation layer.

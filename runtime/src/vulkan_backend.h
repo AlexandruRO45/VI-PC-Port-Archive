@@ -281,6 +281,21 @@ public:
         return context_.vk.vkQueueWaitIdle(queue_) == VK_SUCCESS;
     }
 
+    // IDXGISwapChain::Present: `ready` (a binary semaphore) is signalled after everything submitted so far, and the
+    // presentation engine waits for it before showing `image`. Pending Wait()s are attached to that signal.
+    // Returns vkQueuePresentKHR's result, or VK_ERROR_UNKNOWN when the signalling submission fails.
+    VkResult present(PFN_vkQueuePresentKHR queue_present, VkSwapchainKHR swapchain, std::uint32_t image,
+                     VkSemaphore ready) {
+        if (!submit(VK_NULL_HANDLE, VK_NULL_HANDLE, 0, ready)) return VK_ERROR_UNKNOWN;
+        VkPresentInfoKHR info{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+        info.waitSemaphoreCount = 1;
+        info.pWaitSemaphores = &ready;
+        info.swapchainCount = 1;
+        info.pSwapchains = &swapchain;
+        info.pImageIndices = &image;
+        return queue_present(queue_, &info);
+    }
+
 private:
     VkCommandBuffer acquire() {
         std::uint64_t done = 0;
@@ -302,13 +317,19 @@ private:
         return command_buffer;
     }
 
-    bool submit(VkCommandBuffer command_buffer, VkSemaphore fence, std::uint64_t value) {
+    // `binary`, when set, is a binary semaphore signalled with the batch (its value in the timeline info is ignored).
+    bool submit(VkCommandBuffer command_buffer, VkSemaphore fence, std::uint64_t value,
+                VkSemaphore binary = VK_NULL_HANDLE) {
         const std::uint64_t ticket = ++submitted_;
         std::vector<VkSemaphore> signals{progress_};
         std::vector<std::uint64_t> signal_values{ticket};
         if (fence) {
             signals.push_back(fence);
             signal_values.push_back(value);
+        }
+        if (binary) {
+            signals.push_back(binary);
+            signal_values.push_back(0);
         }
         const std::vector<VkPipelineStageFlags> stages(waits_.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};

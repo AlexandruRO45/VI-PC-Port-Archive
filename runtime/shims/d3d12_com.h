@@ -61,6 +61,21 @@ leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue);
 // not one of this module's command lists.
 bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT& back);
 
+// An ID3D12Resource over a Vulkan image someone else owns, such as a swapchain image. The object is the image's
+// ResourceId: it is registered with the context in `layout` on creation and removed on its last Release.
+HRESULT create_image_resource(leonida::VulkanContext& context, const leonida::ResourceBinding& binding,
+                              VkImageLayout layout, const D3D12_RESOURCE_DESC& desc, REFIID riid, void** out);
+
+// For the DXGI swapchain, which presents on the queue it was created with: VulkanQueue::present and
+// VulkanQueue::idle under the queue's lock. Fail (VK_ERROR_INITIALIZATION_FAILED / false) for a queue that is not
+// one of ours.
+VkResult present_on_queue(ID3D12CommandQueue* queue, PFN_vkQueuePresentKHR queue_present, VkSwapchainKHR swapchain,
+                          std::uint32_t image, VkSemaphore ready);
+bool wait_idle(ID3D12CommandQueue* queue);
+
+// The Vulkan queue family a queue of ours runs on (what a swapchain on it must be able to present from).
+bool queue_family(ID3D12CommandQueue* queue, std::uint32_t* family);
+
 inline leonida::ResourceId resource_id(const ID3D12Resource* resource) {
     return reinterpret_cast<leonida::ResourceId>(resource);
 }

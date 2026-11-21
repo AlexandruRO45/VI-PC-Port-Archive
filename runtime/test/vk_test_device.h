@@ -1,5 +1,6 @@
 // Shared setup for the GPU tests of the D3D12 layer: a Vulkan 1.3 device with dynamicRendering, synchronization2,
 // timelineSemaphore and separateDepthStencilLayouts, images, buffers and one-shot submissions.
+// create(true) also enables presentation: VK_KHR_surface and VK_KHR_win32_surface, and VK_KHR_swapchain.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; Device::validation_errors() counts errors.
 #pragma once
 
@@ -80,7 +81,7 @@ public:
 
     unsigned validation_errors() const { return validation_error_count(); }
 
-    bool create() {
+    bool create(bool presentation = false) {
         instance_proc = load_vulkan();
         if (!instance_proc) return false;
         const auto create_instance = reinterpret_cast<PFN_vkCreateInstance>(instance_proc(nullptr, "vkCreateInstance"));
@@ -110,6 +111,11 @@ public:
         app.apiVersion = VK_API_VERSION_1_3;
         VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
         instance_info.pApplicationInfo = &app;
+        std::vector<const char*> instance_extensions;
+        if (presentation) {
+            instance_extensions.push_back("VK_KHR_surface");
+            instance_extensions.push_back("VK_KHR_win32_surface");
+        }
         if (validation) {
             std::uint32_t count = 0;
             enumerate_layers(&count, nullptr);
@@ -124,9 +130,10 @@ public:
             instance_info.pNext = &messenger_info;
             instance_info.enabledLayerCount = 1;
             instance_info.ppEnabledLayerNames = &layer;
-            instance_info.enabledExtensionCount = 1;
-            instance_info.ppEnabledExtensionNames = &debug_utils;
+            instance_extensions.push_back(debug_utils);
         }
+        instance_info.enabledExtensionCount = std::uint32_t(instance_extensions.size());
+        instance_info.ppEnabledExtensionNames = instance_extensions.data();
         if (create_instance(&instance_info, nullptr, &instance) != VK_SUCCESS) return false;
         if (validation &&
             instance_fn<PFN_vkCreateDebugUtilsMessengerEXT>("vkCreateDebugUtilsMessengerEXT")(
@@ -195,6 +202,11 @@ public:
         device_info.queueCreateInfoCount = 1;
         device_info.pQueueCreateInfos = &queue_info;
         device_info.pEnabledFeatures = &enable;
+        const char* swapchain_extension = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+        if (presentation) {
+            device_info.enabledExtensionCount = 1;
+            device_info.ppEnabledExtensionNames = &swapchain_extension;
+        }
         if (instance_fn<PFN_vkCreateDevice>("vkCreateDevice")(physical, &device_info, nullptr, &device) != VK_SUCCESS)
             return false;
         device_proc = instance_fn<PFN_vkGetDeviceProcAddr>("vkGetDeviceProcAddr");

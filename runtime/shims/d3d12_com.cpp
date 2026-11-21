@@ -317,7 +317,9 @@ public:
 
     CommandQueue(leonida::VulkanContext& context, VkQueue queue, std::uint32_t family,
                  const D3D12_COMMAND_QUEUE_DESC& desc)
-        : desc_(desc), queue_(context, queue, family) {}
+        : desc_(desc), family_(family), queue_(context, queue, family) {}
+
+    std::uint32_t family() const { return family_; }
 
     bool ok() const { return queue_.ok(); }
     leonida::ReplayResult last_result() const { return last_result_; }
@@ -358,13 +360,54 @@ public:
         return S_OK;
     }
 
+    VkResult present(PFN_vkQueuePresentKHR queue_present, VkSwapchainKHR swapchain, std::uint32_t image,
+                     VkSemaphore ready) {
+        std::lock_guard lock(mutex_);
+        return queue_.present(queue_present, swapchain, image, ready);
+    }
+
+    bool idle() {
+        std::lock_guard lock(mutex_);
+        return queue_.idle();
+    }
+
     static CommandQueue* from(IUnknown* object) { return Child::from<CommandQueue>(object); }
 
 private:
     D3D12_COMMAND_QUEUE_DESC desc_;
+    std::uint32_t family_;
     std::mutex mutex_;
     leonida::VulkanQueue queue_;
     leonida::ReplayResult last_result_ = leonida::ReplayResult::success;
+};
+
+// A texture over an image the layer does not own (a swapchain image). Only what a back buffer needs is
+// implemented; the rest are generated stubs. Textures have no GPU virtual address.
+class ImageResource final
+    : public Child<ImageResource, ID3D12ResourceStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
+                    ID3D12Resource> {
+public:
+    // {5c2e9a14-7b3d-4f61-a0c8-2d94e6b1f37a}
+    static constexpr GUID kTag{0x5c2e9a14, 0x7b3d, 0x4f61, {0xa0, 0xc8, 0x2d, 0x94, 0xe6, 0xb1, 0xf3, 0x7a}};
+
+    ImageResource(leonida::VulkanContext& context, const D3D12_RESOURCE_DESC& desc) : context_(context), desc_(desc) {}
+    ~ImageResource() override { context_.remove_resource(resource_id(this)); }
+
+    D3D12_RESOURCE_DESC STDMETHODCALLTYPE GetDesc() override { return desc_; }
+    D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override { return 0; }
+    HRESULT STDMETHODCALLTYPE GetHeapProperties(D3D12_HEAP_PROPERTIES* properties, D3D12_HEAP_FLAGS* flags) override {
+        if (properties) {
+            *properties = {};
+            properties->Type = D3D12_HEAP_TYPE_DEFAULT;
+            properties->CreationNodeMask = properties->VisibleNodeMask = 1;
+        }
+        if (flags) *flags = D3D12_HEAP_FLAG_NONE;
+        return S_OK;
+    }
+
+private:
+    leonida::VulkanContext& context_;
+    D3D12_RESOURCE_DESC desc_;
 };
 
 }  // namespace
@@ -424,6 +467,34 @@ bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT&
     if (!l) return false;
     front = l->front_stencil_ref();
     back = l->back_stencil_ref();
+    return true;
+}
+
+HRESULT create_image_resource(leonida::VulkanContext& context, const leonida::ResourceBinding& binding,
+                              VkImageLayout layout, const D3D12_RESOURCE_DESC& desc, REFIID riid, void** out) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!binding.image) return E_INVALIDARG;
+    auto* object = new ImageResource(context, desc);
+    context.add_resource(resource_id(object), binding, layout);
+    return hand_out(object, riid, out);  // a refused riid deletes the object, which unregisters it
+}
+
+VkResult present_on_queue(ID3D12CommandQueue* queue, PFN_vkQueuePresentKHR queue_present, VkSwapchainKHR swapchain,
+                          std::uint32_t image, VkSemaphore ready) {
+    CommandQueue* q = CommandQueue::from(queue);
+    return q ? q->present(queue_present, swapchain, image, ready) : VK_ERROR_INITIALIZATION_FAILED;
+}
+
+bool wait_idle(ID3D12CommandQueue* queue) {
+    CommandQueue* q = CommandQueue::from(queue);
+    return q && q->idle();
+}
+
+bool queue_family(ID3D12CommandQueue* queue, std::uint32_t* family) {
+    const CommandQueue* q = CommandQueue::from(queue);
+    if (!q || !family) return false;
+    *family = q->family();
     return true;
 }
 
