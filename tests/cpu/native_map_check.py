@@ -35,6 +35,9 @@ class Mapper:
         self.export = lib.pe_map_export
         self.export.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         self.export.restype = ctypes.c_void_p
+        self.resolved = lib.pe_map_export_resolved
+        self.resolved.argtypes = [ctypes.c_void_p, ctypes.c_char_p, Resolver]
+        self.resolved.restype = ctypes.c_void_p
         self.release = lib.pe_map_release
         self.release.argtypes = [ctypes.c_void_p]
 

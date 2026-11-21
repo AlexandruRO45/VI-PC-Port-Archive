@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <new>
 #include <string>
@@ -487,35 +488,80 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
     return base;
 }
 
+namespace {
+
+struct ExportLookup {
+    DWORD rva = 0;
+    const char* forwarder = nullptr;
+};
+
+// Finds one named export. The export directory, its three tables and the forwarder string are
+// checked against the live page protection, as the TLS path does.
+bool find_export(const Image& image, const IMAGE_NT_HEADERS64* nt, const char* name, ExportLookup& out) {
+    const auto& exports = directory(nt, IMAGE_DIRECTORY_ENTRY_EXPORT);
+    const auto* dir = exports.Size ? image.at<IMAGE_EXPORT_DIRECTORY>(exports.VirtualAddress) : nullptr;
+    if (!dir || !readable(dir, sizeof(IMAGE_EXPORT_DIRECTORY))) return false;
+    const auto* names = image.at<DWORD>(dir->AddressOfNames, dir->NumberOfNames);
+    const auto* ordinals = image.at<WORD>(dir->AddressOfNameOrdinals, dir->NumberOfNames);
+    const auto* functions = image.at<DWORD>(dir->AddressOfFunctions, dir->NumberOfFunctions);
+    if (!names || !ordinals || !functions) return false;
+    if (!readable(names, sizeof(DWORD) * dir->NumberOfNames) ||
+        !readable(ordinals, sizeof(WORD) * dir->NumberOfNames) ||
+        !readable(functions, sizeof(DWORD) * dir->NumberOfFunctions)) return false;
+    for (DWORD i = 0; i < dir->NumberOfNames; ++i) {
+        const char* exported = readable_string(image, names[i]);
+        if (!exported || std::strcmp(exported, name) != 0) continue;
+        if (ordinals[i] >= dir->NumberOfFunctions) return false;
+        const DWORD rva = functions[ordinals[i]];
+        // A forwarded export points back into the export directory, where its target string lives.
+        if (rva >= exports.VirtualAddress && rva - exports.VirtualAddress < exports.Size) {
+            out.forwarder = readable_string(image, rva);
+            return out.forwarder != nullptr;
+        }
+        out.rva = rva;
+        return true;
+    }
+    return false;
+}
+
+}  // namespace
+
 // Only valid for a base returned by pe_map_image, whose headers were validated and are read-only.
 extern "C" __declspec(dllexport) void* pe_map_export(void* mapped, const char* name) {
     const auto* nt = Image{static_cast<std::uint8_t*>(mapped), 0}.headers();
     const Image image{static_cast<std::uint8_t*>(mapped), nt->OptionalHeader.SizeOfImage};
-    const auto& exports = directory(nt, IMAGE_DIRECTORY_ENTRY_EXPORT);
-    const auto* dir = exports.Size ? image.at<IMAGE_EXPORT_DIRECTORY>(exports.VirtualAddress) : nullptr;
-    // A mapped section can lack read access, by its characteristics or after a run-time reprotect.
-    // Image bounds alone do not make the export tables readable, so every read below is checked
-    // against the live protection first, as the TLS path already does.
-    if (!dir || !readable(dir, sizeof(IMAGE_EXPORT_DIRECTORY))) return nullptr;
-    const auto* names = image.at<DWORD>(dir->AddressOfNames, dir->NumberOfNames);
-    const auto* ordinals = image.at<WORD>(dir->AddressOfNameOrdinals, dir->NumberOfNames);
-    const auto* functions = image.at<DWORD>(dir->AddressOfFunctions, dir->NumberOfFunctions);
-    if (!names || !ordinals || !functions) return nullptr;
-    if (!readable(names, sizeof(DWORD) * dir->NumberOfNames) ||
-        !readable(ordinals, sizeof(WORD) * dir->NumberOfNames) ||
-        !readable(functions, sizeof(DWORD) * dir->NumberOfFunctions)) return nullptr;
-    for (DWORD i = 0; i < dir->NumberOfNames; ++i) {
-        const char* exported = readable_string(image, names[i]);
-        if (!exported || std::strcmp(exported, name) != 0) continue;
-        if (ordinals[i] >= dir->NumberOfFunctions) return nullptr;
-        const DWORD rva = functions[ordinals[i]];
-        // Forwarded exports point back into the export directory; they are not code here.
-        if (rva >= exports.VirtualAddress && rva - exports.VirtualAddress < exports.Size) return nullptr;
-        // An empty slot (RVA 0) names no code; returning the image base would be wrong. An exported
-        // address must be accessible, but it may be execute-only, so readable() is not used here.
-        return rva && rva < image.size && accessible(image.base + rva) ? image.base + rva : nullptr;
+    ExportLookup found;
+    // A forwarded export is not code in this image, so this entry point keeps returning null.
+    if (!find_export(image, nt, name, found) || found.forwarder) return nullptr;
+    // An empty slot (RVA 0) names no code; returning the image base would be wrong. An exported
+    // address must be accessible, but it may be execute-only, so readable() is not used here.
+    return found.rva && found.rva < image.size && accessible(image.base + found.rva)
+        ? image.base + found.rva : nullptr;
+}
+
+// Like pe_map_export, but a forwarded export is resolved through the host resolver. The forwarder
+// string is "Module.Symbol" or "Module.#ordinal", with the module as the linker recorded it.
+extern "C" __declspec(dllexport) void* pe_map_export_resolved(void* mapped, const char* name, Resolver resolve) {
+    const auto* nt = Image{static_cast<std::uint8_t*>(mapped), 0}.headers();
+    const Image image{static_cast<std::uint8_t*>(mapped), nt->OptionalHeader.SizeOfImage};
+    ExportLookup found;
+    if (!find_export(image, nt, name, found)) return nullptr;
+    if (!found.forwarder)
+        return found.rva && found.rva < image.size && accessible(image.base + found.rva)
+            ? image.base + found.rva : nullptr;
+    if (!resolve) return nullptr;
+    const std::string target(found.forwarder);
+    const auto dot = target.rfind('.');
+    if (dot == std::string::npos || dot == 0 || dot + 1 == target.size()) return nullptr;
+    const std::string module = target.substr(0, dot);
+    const std::string symbol = target.substr(dot + 1);
+    if (symbol.front() == '#') {
+        char* end = nullptr;
+        const auto ordinal = std::strtoul(symbol.c_str() + 1, &end, 10);
+        if (!end || *end || ordinal == 0 || ordinal > 0xffff) return nullptr;
+        return resolve(module.c_str(), nullptr, static_cast<std::uint32_t>(ordinal));
     }
-    return nullptr;
+    return resolve(module.c_str(), symbol.c_str(), 0);
 }
 
 extern "C" __declspec(dllexport) void pe_map_release(void* mapped) {

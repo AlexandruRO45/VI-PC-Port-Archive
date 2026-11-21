@@ -475,6 +475,14 @@ ctest --preset dev --no-tests=error -R '^cpu_native_reloc_free$' -V
 ctest --preset dev --no-tests=error -R '^cpu_native_mutation$' -V
 ```
 
+### Forwarded exports
+
+`cpu_forwarder` exports `local_value` and forwards `mix_args` to `cpu_import_provider.mix_args`; the linker records that string in the export directory. `pe_map_export` keeps returning null for the forwarder. `pe_map_export_resolved` follows the string through the host resolver, and the returned address matched `GetProcAddress` on a `LoadLibrary` copy in `cpu_native_forwarder`. `local_value` resolves to the same RVA under both loaders. An absent name and a resolver that returns null give null. The `Module.#ordinal` form is parsed but has no fixture yet.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_forwarder$' -V
+```
+
 ## Switch dispatch through jump tables
 
 Compilers lower a dense `switch` to a bounds check and an indirect `JMP` through a table of 32-bit entries. The [jump-table translator](../tools/cpu_switch_aot.py) recognizes the two x64 layouts in common use. MSVC stores image-relative entries and loads them through a register holding `__ImageBase`. LLVM stores signed offsets from the table and adds the table address. The translator reads the table from the PE, then emits a C++ `switch` whose cases jump to labels at the decoded targets. The host compiler builds its own dispatch from that switch.
