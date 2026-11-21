@@ -105,9 +105,11 @@ bool serialize_checks()
     base_v11.Desc_1_1.Flags = desktop_flag;
 
     ComPtr<ID3DBlob> desktop_v11, shim_v11;
-    if (FAILED(desktop.serialize(&base_v11, &desktop_v11, nullptr)) ||
-        FAILED(D3D12SerializeVersionedRootSignature(&base_v11, &shim_v11, nullptr)) ||
-        !same_blob(desktop_v11.Get(), shim_v11.Get())) {
+    const HRESULT base_desktop_hr = desktop.serialize(&base_v11, &desktop_v11, nullptr);
+    const HRESULT base_shim_hr = D3D12SerializeVersionedRootSignature(&base_v11, &shim_v11, nullptr);
+    if (FAILED(base_desktop_hr) || FAILED(base_shim_hr) || !same_blob(desktop_v11.Get(), shim_v11.Get())) {
+        std::fprintf(stderr, "v1.1 baseline: desktop=0x%08lx shim=0x%08lx\n",
+                     static_cast<unsigned long>(base_desktop_hr), static_cast<unsigned long>(base_shim_hr));
         return false;
     }
 
@@ -125,6 +127,8 @@ bool serialize_checks()
         if (desktop_hr != E_INVALIDARG || rejected || FAILED(shim_hr) ||
             !same_blob(sanitized.Get(), desktop_v11.Get()) ||
             tagged.Desc_1_1.Flags != expected_flags) {
+            std::fprintf(stderr, "v1.1 tagged 0x%08x: desktop=0x%08lx shim=0x%08lx\n",
+                         bits, static_cast<unsigned long>(desktop_hr), static_cast<unsigned long>(shim_hr));
             return false;
         }
     }
@@ -142,33 +146,52 @@ bool serialize_checks()
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC tagged_v10 = base_v10;
     tagged_v10.Desc_1_0.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(
         static_cast<std::uint32_t>(desktop_flag) | observed_console_flags);
-    if (FAILED(desktop.serialize(&base_v10, &desktop_v10, nullptr)) ||
-        desktop.serialize(&tagged_v10, &rejected_v10, nullptr) != E_INVALIDARG || rejected_v10 ||
-        FAILED(D3D12SerializeVersionedRootSignature(&tagged_v10, &shim_v10, nullptr)) ||
-        !same_blob(shim_v10.Get(), desktop_v10.Get())) {
+    const HRESULT v10_base_hr = desktop.serialize(&base_v10, &desktop_v10, nullptr);
+    const HRESULT v10_desktop_hr = desktop.serialize(&tagged_v10, &rejected_v10, nullptr);
+    const HRESULT v10_shim_hr = D3D12SerializeVersionedRootSignature(&tagged_v10, &shim_v10, nullptr);
+    if (FAILED(v10_base_hr) || v10_desktop_hr != E_INVALIDARG || rejected_v10 ||
+        FAILED(v10_shim_hr) || !same_blob(shim_v10.Get(), desktop_v10.Get())) {
+        std::fprintf(stderr, "v1.0 tagged: base=0x%08lx desktop=0x%08lx shim=0x%08lx\n",
+                     static_cast<unsigned long>(v10_base_hr),
+                     static_cast<unsigned long>(v10_desktop_hr),
+                     static_cast<unsigned long>(v10_shim_hr));
         return false;
     }
 
-    // Negative controls: unobserved invalid flag bits, null descriptor, and unknown version must fail.
+    // Negative controls: unobserved invalid flag bits must still return E_INVALIDARG, and null
+    // descriptor or unknown version must fail with the exact same HRESULT as desktop d3d12.dll.
     for (const std::uint32_t bad_bits : {0x04000000u, 0x07000000u, 0x80000000u}) {
         D3D12_VERSIONED_ROOT_SIGNATURE_DESC bad = base_v11;
         bad.Desc_1_1.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(bad_bits);
-        ComPtr<ID3DBlob> blob;
-        if (D3D12SerializeVersionedRootSignature(&bad, &blob, nullptr) != E_INVALIDARG || blob) {
+        ComPtr<ID3DBlob> desktop_bad, shim_bad;
+        const HRESULT desktop_hr = desktop.serialize(&bad, &desktop_bad, nullptr);
+        const HRESULT shim_hr = D3D12SerializeVersionedRootSignature(&bad, &shim_bad, nullptr);
+        if (desktop_hr != E_INVALIDARG || desktop_bad || shim_hr != E_INVALIDARG || shim_bad) {
+            std::fprintf(stderr, "bad_bits 0x%08x: desktop=0x%08lx shim=0x%08lx\n",
+                         bad_bits, static_cast<unsigned long>(desktop_hr), static_cast<unsigned long>(shim_hr));
             return false;
         }
     }
-    ComPtr<ID3DBlob> null_blob;
-    if (D3D12SerializeVersionedRootSignature(nullptr, &null_blob, nullptr) != E_INVALIDARG || null_blob) {
+    ComPtr<ID3DBlob> desktop_null, shim_null;
+    const HRESULT desktop_null_hr = desktop.serialize(nullptr, &desktop_null, nullptr);
+    const HRESULT shim_null_hr = D3D12SerializeVersionedRootSignature(nullptr, &shim_null, nullptr);
+    if (!FAILED(desktop_null_hr) || desktop_null || shim_null_hr != desktop_null_hr || shim_null) {
+        std::fprintf(stderr, "null desc: desktop=0x%08lx shim=0x%08lx\n",
+                     static_cast<unsigned long>(desktop_null_hr), static_cast<unsigned long>(shim_null_hr));
         return false;
     }
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC bad_ver{};
     bad_ver.Version = static_cast<D3D_ROOT_SIGNATURE_VERSION>(99);
-    ComPtr<ID3DBlob> bad_ver_blob;
-    if (D3D12SerializeVersionedRootSignature(&bad_ver, &bad_ver_blob, nullptr) != E_INVALIDARG || bad_ver_blob) {
+    ComPtr<ID3DBlob> desktop_ver, shim_ver;
+    const HRESULT desktop_ver_hr = desktop.serialize(&bad_ver, &desktop_ver, nullptr);
+    const HRESULT shim_ver_hr = D3D12SerializeVersionedRootSignature(&bad_ver, &shim_ver, nullptr);
+    if (!FAILED(desktop_ver_hr) || desktop_ver || shim_ver_hr != desktop_ver_hr || shim_ver) {
+        std::fprintf(stderr, "bad version: desktop=0x%08lx shim=0x%08lx\n",
+                     static_cast<unsigned long>(desktop_ver_hr), static_cast<unsigned long>(shim_ver_hr));
         return false;
     }
-    std::puts("v11_cases=4 v10_cases=1 negative_cases=5");
+    std::printf("v11_cases=4 v10_cases=1 negative_cases=5 null_hr=0x%08lx bad_ver_hr=0x%08lx\n",
+                static_cast<unsigned long>(shim_null_hr), static_cast<unsigned long>(shim_ver_hr));
     return true;
 }
 
