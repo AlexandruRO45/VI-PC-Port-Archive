@@ -10,6 +10,27 @@ from bcpack_probe import probe
 
 
 class TextureChecks(unittest.TestCase):
+    def test_constant_lane_with_two_refills(self):
+        prefix = bytearray(48)
+        prefix[4::8] = bytes.fromhex("de 05 03 0c 86 4e")
+
+        result, = probe(prefix, 25000, prefetch_mask=0x10, prefetch=b"\xac")
+
+        self.assertEqual(result["lane"], 4)
+        self.assertEqual(result["refill_bytes"], 2)
+        self.assertEqual(result["first_refill_offset"], 48)
+        self.assertTrue(result["first_refill_matches"])
+
+        # Lane 4 consumes AC then 7D. Other lanes shift its packet offsets.
+        for byte, expected in ((0x7D, True), (0x7C, False)):
+            result, = probe(prefix, 25000, prefetch_mask=0x11, prefetch=bytes([0, 0xAC]),
+                            next_mask=0x14, next_bytes=bytes([0, byte]))
+            self.assertEqual(result["second_refill_offset"], 51)
+            self.assertTrue(result["first_refill_matches"])
+            self.assertEqual(result["second_refill_matches"], expected)
+        with self.assertRaises(ValueError):
+            probe(prefix, 25000, next_mask=0x10)
+
     def test_constant_lane(self):
         prefix = bytearray(48)
         prefix[4::8] = bytes.fromhex("de 03 01 00 40 02")
