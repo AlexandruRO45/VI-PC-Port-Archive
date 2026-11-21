@@ -167,6 +167,7 @@ struct DeviceState {
     leonida::BindlessRegistry bindless_registry;
     leonida::RetirementQueue retirement;
     std::map<leonida::DescriptorKey, VkSampler> samplers;  // live S# -> VkSampler, retired on replacement
+    std::map<leonida::DescriptorKey, VkImageView> image_views;  // live T# -> VkImageView, retired on replacement
     std::uint64_t retire_timeline = 0;
 
     std::uint64_t next_console_va = 0x100000000ull;
@@ -861,6 +862,14 @@ public:
     ~Device() override {
         state_.bindless.reset();  // views/samplers must go before the Vulkan device they belong to
         if (state_.context) {
+            for (const auto& entry : state_.image_views)
+                state_.context->vk.vkDestroyImageView(state_.info.device, entry.second, nullptr);
+            state_.image_views.clear();
+            for (const auto& entry : state_.samplers)
+                state_.context->vk.vkDestroySampler(state_.info.device, entry.second, nullptr);
+            state_.samplers.clear();
+        }
+        if (state_.context) {
             std::lock_guard lock(state_.context->submit_mutex());
             state_.context->vk.vkDeviceWaitIdle(state_.info.device);
         }
@@ -1100,7 +1109,13 @@ public:
         viewer.mip_levels = r->mip_levels();
         viewer.array_layers = r->array_layers();
         viewer.depth = r->depth();
-        const VkImageView image_view = state_.context->image_view(viewer, range, view_type);
+        VkImageViewCreateInfo srv_view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        srv_view_info.image = viewer.image;
+        srv_view_info.viewType = view_type;
+        srv_view_info.format = viewer.format;
+        srv_view_info.subresourceRange = range;
+        VkImageView image_view = VK_NULL_HANDLE;
+        state_.context->vk.vkCreateImageView(state_.info.device, &srv_view_info, nullptr, &image_view);
         if (!image_view) {
             log_once("image view creation failed for an SRV", int(desc->ViewDimension));
             return;
@@ -1109,10 +1124,24 @@ public:
         if (!index) {
             log_once("bindless image array is full, dimension", int(dimension));
             return;
+        }        const leonida::DescriptorKey view_key = leonida::make_tsharp_key(words.data());
+        state_.bindless->insert_key(view_key, index);
+        if (const auto it = state_.image_views.find(view_key); it != state_.image_views.end()) {
+            const VkImageView old = it->second;
+            state_.retirement.retire(++state_.retire_timeline,
+                                     [vk = state_.context->vk, device = state_.info.device, old] {
+                                         vk.vkDestroyImageView(device, old, nullptr);
+                                     });
+            it->second = image_view;
+        } else {
+            state_.image_views.emplace(view_key, image_view);
         }
-        state_.bindless->insert_key(leonida::make_tsharp_key(words.data()), index);
         if (state_.bindless->flush_needs_idle()) state_.context->vk.vkDeviceWaitIdle(state_.info.device);
         state_.bindless->flush();
+        if (state_.retire_timeline) {
+            state_.context->vk.vkDeviceWaitIdle(state_.info.device);
+            state_.retirement.collect(state_.retire_timeline);
+        }
     }
 
     HRESULT STDMETHODCALLTYPE CreatePipelineState(const D3D12_PIPELINE_STATE_STREAM_DESC* desc, REFIID riid,
