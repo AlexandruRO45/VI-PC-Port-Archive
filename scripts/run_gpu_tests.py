@@ -452,6 +452,13 @@ def run_suite(a, work: str) -> int:
         if name == "cs_workgroup_yz":
             rc, msg = run_cmd([vk_compute, spv, "2x3x4", "workgroup_yz"], env=cs_env)
             results.append((name, rc == 0 and "2x3x4 workgroup Y/Z: 0 mismatches" in msg.splitlines(), msg))
+        elif name == "cs_bounds":
+            rc, msg = run_cmd([vk_compute, spv, "1", "bounds"], env=cs_env)
+            line = next((ln for ln in msg.splitlines() if "out[0..7] =" in ln), "")
+            values = [int(x) for x in line.split("=", 1)[1].split()] if line else []
+            want = [0x12345678, 0x12345678, 0, 0xEEEEEEEE, 0xEEEEEEEE]
+            ok = rc == 0 and values[:len(want)] == want
+            results.append((name, ok, msg.splitlines()[-1] if msg else "no test output"))
         elif name == "cs_lds":
             rc, msg = run_cmd([vk_compute, spv, "4", "mirror64"], env=cs_env)
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
@@ -561,7 +568,9 @@ def run_suite(a, work: str) -> int:
             raw = os.path.join(raw_dir, f"{name}.raw")
             env = dict(gfx_env or os.environ, VKH_GS=spv)
             rc, msg = run_cmd([vk_harness, vs_tri, fs_loc1, raw], env=env)
-            if rc != 0:
+            if rc == 77:
+                results.append((name, None, "SKIP (geometry shaders unavailable on this device)"))
+            elif rc != 0:
                 results.append((name, False, msg))
             else:
                 ok, detail = check_grad(raw, 0.0, 0.0)
@@ -574,7 +583,9 @@ def run_suite(a, work: str) -> int:
             # the wave64 compute dumps are.
             no64 = (name == "ms_w64x_ballot" and os.environ.get("LEONIDA_W64_EMULATE") != "1" and
                     not any(int(x) >= 64 for x in re.findall(r"subgroup \d+\.\.(\d+)", msg)))
-            if rc != 0:
+            if rc == 77:
+                results.append((name, None, "SKIP (mesh shaders unavailable on this device)"))
+            elif rc != 0:
                 results.append((name, False, msg))
             elif no64:
                 results.append((name, None, "SKIP (no 64-wide subgroup on this device)"))
@@ -585,7 +596,9 @@ def run_suite(a, work: str) -> int:
             raw = os.path.join(raw_dir, f"{name}.raw")
             env = dict(gfx_env or os.environ, VKH_MESH="1")
             rc, msg = run_cmd([vk_harness, spv, fs_passthru, raw], env=env)
-            if rc != 0:
+            if rc == 77:
+                results.append((name, None, "SKIP (mesh shaders unavailable on this device)"))
+            elif rc != 0:
                 results.append((name, False, msg))
             else:
                 ok, detail = check_clip_half(raw, 0.5, 1.0)
