@@ -754,7 +754,8 @@ op_movdqu_store128 ENDP
 
 op_movdqu_copy128 PROC FRAME
     .endprolog
-    vmovdqu xmm0, XMMWORD PTR [rcx]
+    vmovdqu ymm0, YMMWORD PTR [rcx]
+    vmovdqu ymm1, YMMWORD PTR [rdx]
     vmovdqu xmm1, xmm0
     vmovdqu YMMWORD PTR [r8], ymm1
     vzeroupper
