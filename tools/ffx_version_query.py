@@ -31,6 +31,21 @@ template<class T> T load(word address) {
 template<class T> void store(word address, T v) {
     memcpy(reinterpret_cast<void*>(address), &v, sizeof v);
 }
+template<class F, class U> static F quiet_nan(F x) {
+    U bits; memcpy(&bits, &x, sizeof bits);
+    bits |= (sizeof(U) == 4) ? static_cast<U>(0x00400000u) : static_cast<U>(0x0008000000000000ull);
+    memcpy(&x, &bits, sizeof bits);
+    return x;
+}
+template<class F, class U> static F fma_x86(F s0, F s1, F s2, int order, bool neg_p, bool neg_c) {
+    if (std::isnan(s0)) return quiet_nan<F, U>(s0);
+    if (std::isnan(s1)) return quiet_nan<F, U>(s1);
+    if (std::isnan(s2)) return quiet_nan<F, U>(s2);
+    const F a = order == 132 ? s0 : s1;
+    const F b = order == 213 ? s0 : s2;
+    const F c = order == 231 ? s0 : (order == 132 ? s1 : s2);
+    return std::fma(neg_p ? -a : a, b, neg_c ? -c : c);
+}
 """
 HEADER = INTEGER_HEADER + "struct Query { word type, next, effect, device, count, ids, names; };\n"
 
@@ -218,7 +233,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
                     f"memcpy({dst}.data()+n, &v, 4); }} }}")
         elif has_wide and i.encoding == EncodingKind.VEX and op in fma_packed:
             kind, order, is_f64 = fma_packed[op]
-            ftype, fn, sz = ("double", "std::fma", 8) if is_f64 else ("float", "std::fmaf", 4)
+            ftype, utype, sz = ("double", "uint64_t", 8) if is_f64 else ("float", "uint32_t", 4)
             vec_size = RegisterExt.size(i.op0_register)
             dst, src1 = wide_any[i.op0_register], wide_any[i.op1_register]
             if i.op2_kind == K.MEMORY:
@@ -227,19 +242,19 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
                 s2_init, s2_expr = f"const auto in2 = {wide_any[i.op2_register]};", f"load<{ftype}>(reinterpret_cast<word>(in2.data() + n))"
             s0 = f"load<{ftype}>(reinterpret_cast<word>(in0.data() + n))"
             s1 = f"load<{ftype}>(reinterpret_cast<word>(in1.data() + n))"
-            a, b, c = (s0, s2_expr, s1) if order == "132" else (s1, s0, s2_expr) if order == "213" else (s1, s2_expr, s0)
-            a_arg = f"-({a})" if kind in ("nmadd", "nmsub") else f"({a})"
+            neg_p = "true" if kind in ("nmadd", "nmsub") else "false"
             if kind in ("msub", "nmsub"):
-                c_arg = f"-({c})"
+                neg_c = "true"
             elif kind == "maddsub":
-                c_arg = f"(lane & 1u) ? ({c}) : -({c})"
+                neg_c = "(lane & 1u) == 0u"
             elif kind == "msubadd":
-                c_arg = f"(lane & 1u) ? -({c}) : ({c})"
+                neg_c = "(lane & 1u) != 0u"
             else:
-                c_arg = f"({c})"
+                neg_c = "false"
             stmt = (f"{{ const auto in0 = {dst}, in1 = {src1}; {s2_init} {dst} = {{}}; "
                     f"for (size_t lane = 0; lane < {vec_size // sz}; ++lane) {{ const size_t n = lane * {sz}; "
-                    f"const {ftype} r = {fn}({a_arg}, ({b}), {c_arg}); memcpy({dst}.data() + n, &r, {sz}); }} }}")
+                    f"const {ftype} r = fma_x86<{ftype}, {utype}>({s0}, {s1}, {s2_expr}, {order}, {neg_p}, {neg_c}); "
+                    f"memcpy({dst}.data() + n, &r, {sz}); }} }}")
         elif op == M.VMOVUPS and i.op1_kind == K.MEMORY:
             stmt = f"{wide[i.op0_register]} = load<std::array<uint8_t,32>>({address()});"
         elif op == M.VMOVUPS and i.op0_kind == K.MEMORY:

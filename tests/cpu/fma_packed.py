@@ -56,13 +56,18 @@ def check(native_path, lifted_path):
     out_n = (ctypes.c_uint8 * 32)()
     out_l = (ctypes.c_uint8 * 32)()
 
-    ps_a = struct.pack("<8f", 1.0 + 2.0**-23, 1.5, -2.25, 0.0, 1e20, -3.25, 7.5, -0.5)
-    ps_b = struct.pack("<8f", 1.0 - 2.0**-23, -2.25, 4.0, -0.0, 1e20, 4.5, -0.25, 8.0)
-    ps_c = struct.pack("<8f", -1.0, 3.75, 0.5, 0.0, -1e38, -0.125, 1.25, 2.0)
+    qnan32 = struct.unpack("<f", struct.pack("<I", 0x7fc00123))[0]
+    snan32 = struct.unpack("<f", struct.pack("<I", 0x7f800123))[0]
+    qnan64 = struct.unpack("<d", struct.pack("<Q", 0x7ff8000012345678))[0]
+    snan64 = struct.unpack("<d", struct.pack("<Q", 0x7ff0000012345678))[0]
 
-    pd_a = struct.pack("<4d", 1.0 + 2.0**-52, 1.5, -3.25, 1e150)
-    pd_b = struct.pack("<4d", 1.0 - 2.0**-52, -2.25, 4.5, 1e150)
-    pd_c = struct.pack("<4d", -1.0, 3.75, -0.125, -1e299)
+    ps_a = struct.pack("<8f", 1.0 + 2.0**-23, 1.5, -2.25, 0.0, 1e20, snan32, 1.0, 1.0)
+    ps_b = struct.pack("<8f", 1.0 - 2.0**-23, -2.25, 4.0, -0.0, 1e20, 4.5, qnan32, 2.0)
+    ps_c = struct.pack("<8f", -1.0, 3.75, 0.5, 0.0, -1e38, -0.125, 1.25, qnan32)
+
+    pd_a = struct.pack("<4d", 1.0 + 2.0**-52, snan64, 1.0, 1.0)
+    pd_b = struct.pack("<4d", 1.0 - 2.0**-52, -2.25, qnan64, 2.0)
+    pd_c = struct.pack("<4d", -1.0, 3.75, -0.125, qnan64)
 
     cases = 0
     for name in EXPORTS:
