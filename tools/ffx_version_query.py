@@ -48,7 +48,7 @@ def region(pe, start, end):
 def lower(body, initial, globals_, calls, exits, *, host_ops=None):
     """Emit only query integer operations. All external edges and calls need named bindings."""
     lines = ["word frame[16]{};", "word " + ", ".join(r + "=0" for r in REGS.values()) + ";",
-             "bool zero=false, carry=false;", "rsp = reinterpret_cast<word>(frame);", *initial]
+             "bool zero=false, carry=false, overflow=false;", "rsp = reinterpret_cast<word>(frame);", *initial]
     allowed = {i.ip for i in body} | set(exits)
     xmm = {R.XMM0: "xmm0", R.XMM1: "xmm1", R.XMM2: "xmm2"}
     has_xmm_math = any(i.mnemonic in (M.VMOVDQU, M.VPSRLDQ, M.VMOVD)
@@ -134,11 +134,13 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             stmt = write(address())
         elif op == M.CMP:
             # Sign-extended immediates arrive as 64-bit values; compare at the destination width.
-            width = UINT[MemorySizeExt.size(i.memory_size) if i.op0_kind == K.MEMORY else RegisterExt.size(i.op0_register)]
-            stmt = (f"{{ const {width} a = {operand(0)}, b = static_cast<{width}>({operand(1)}); "
-                    f"zero = a == b; carry = a < b; }}")
+            size = MemorySizeExt.size(i.memory_size) if i.op0_kind == K.MEMORY else RegisterExt.size(i.op0_register)
+            width = UINT[size]
+            stmt = (f"{{ const {width} a = {operand(0)}, b = static_cast<{width}>({operand(1)}), "
+                    f"d = static_cast<{width}>(a - b); "
+                    f"zero = a == b; carry = a < b; overflow = (((a ^ b) & (a ^ d)) >> {8 * size - 1}) != 0; }}")
         elif op == M.TEST:
-            stmt = f"zero = (({operand(0)} & {operand(1)}) == 0); carry = false;"
+            stmt = f"zero = (({operand(0)} & {operand(1)}) == 0); carry = false; overflow = false;"
         elif op == M.IMUL and i.op_count in (2, 3) and RegisterExt.size(i.op0_register) == 4:
             lhs, rhs = operand(i.op_count - 2), operand(i.op_count - 1)
             stmt = (f"{{ const int64_t product = int64_t(int32_t({lhs})) * int32_t({rhs}); "
@@ -157,12 +159,28 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
         elif op in (M.ADD, M.AND, M.OR, M.XOR, M.INC, M.DEC, M.SUB, M.SBB):
             operator = {M.ADD: "+", M.INC: "+", M.DEC: "-", M.AND: "&", M.OR: "|", M.XOR: "^", M.SUB: "-", M.SBB: "-"}[op]
             rhs = "1" if op in (M.INC, M.DEC) else operand(1)
-            width = UINT[MemorySizeExt.size(i.memory_size) if i.op0_kind == K.MEMORY else RegisterExt.size(i.op0_register)]
+            size = MemorySizeExt.size(i.memory_size) if i.op0_kind == K.MEMORY else RegisterExt.size(i.op0_register)
+            width = UINT[size]
+            sign_shift = 8 * size - 1
             expr = f"a {operator} b" + (" - word(carry)" if op == M.SBB else "")
-            update = {M.ADD: "carry = v < a;", M.SUB: "carry = a < b;", M.SBB: "carry = a < b || (carry && a == b);",
-                      M.INC: "", M.DEC: "", M.XOR: "carry = false;", M.AND: "carry = false;", M.OR: "carry = false;"}[op]
+            update = {
+                M.ADD: f"carry = v < a; overflow = (((~(a ^ b)) & (a ^ v)) >> {sign_shift}) != 0;",
+                M.SUB: f"carry = a < b; overflow = (((a ^ b) & (a ^ v)) >> {sign_shift}) != 0;",
+                M.SBB: f"carry = a < b || (carry && a == b); overflow = (((a ^ b) & (a ^ v)) >> {sign_shift}) != 0;",
+                M.INC: f"overflow = (((~(a ^ b)) & (a ^ v)) >> {sign_shift}) != 0;",
+                M.DEC: f"overflow = (((a ^ b) & (a ^ v)) >> {sign_shift}) != 0;",
+                M.XOR: "carry = false; overflow = false;",
+                M.AND: "carry = false; overflow = false;",
+                M.OR: "carry = false; overflow = false;",
+            }[op]
             stmt = (f"{{ const {width} a = {operand(0)}, b = static_cast<{width}>({rhs}); "
                     f"const {width} v = static_cast<{width}>({expr}); {update} zero = v == 0; {write('v')} }}")
+        elif op in (M.ADCX, M.ADOX) and RegisterExt.size(i.op0_register) in (4, 8):
+            width = UINT[RegisterExt.size(i.op0_register)]
+            flag = "carry" if op == M.ADCX else "overflow"
+            stmt = (f"{{ const {width} a = {operand(0)}, b = {operand(1)}, "
+                    f"v = static_cast<{width}>(a + b + static_cast<{width}>({flag})); "
+                    f"{flag} = v < a || ({flag} && v == a); {write('v')} }}")
         elif op in (M.ANDN, M.BEXTR, M.BLSI, M.BLSMSK, M.BLSR, M.TZCNT) and RegisterExt.size(i.op0_register) in (4, 8):
             size = RegisterExt.size(i.op0_register)
             width, bits = UINT[size], 8 * size
@@ -234,6 +252,8 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             stmt = ";"
         elif op == M.SETE:
             stmt = write("zero")
+        elif op == M.SETO:
+            stmt = write("overflow")
         elif op == M.CALL:
             stmt = calls[i.ip]
         elif op == M.RET:

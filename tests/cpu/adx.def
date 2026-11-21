@@ -1,0 +1,6 @@
+EXPORTS
+    adcx32_op
+    adcx64_op
+    adox32_op
+    adox64_op
+    adx_dual64
