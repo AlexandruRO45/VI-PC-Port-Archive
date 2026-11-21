@@ -121,7 +121,7 @@ constexpr const char* TOO_MANY_TLS_CALLBACKS = "more than 256 TLS callbacks";
 // TLS callbacks of a mapped, relocated image in table order. Returns null or the reason the list is rejected.
 const char* tls_callbacks(const Image& image, const IMAGE_NT_HEADERS64* nt, std::vector<PIMAGE_TLS_CALLBACK>& out) {
     const auto& dir = directory(nt, IMAGE_DIRECTORY_ENTRY_TLS);
-    if (!dir.Size) return nullptr;
+    if (!dir.VirtualAddress) return nullptr;
     const auto* tls = image.at<IMAGE_TLS_DIRECTORY64>(dir.VirtualAddress);
     if (!tls) return "TLS directory outside image";
     // Sections are already protected here, both after mapping and on release.
@@ -207,7 +207,6 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
         || opt.SizeOfHeaders > opt.SizeOfImage || opt.SizeOfHeaders > raw.size())
         return fail(MAP_FORMAT, "section table outside headers");
 
-    if (directory(nt, IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT).Size) return fail(MAP_UNSUPPORTED, "delay imports");
     if (opt.AddressOfEntryPoint && !executable(nt, opt.AddressOfEntryPoint))
         return fail(MAP_FORMAT, "entry point outside executable section");
 
@@ -260,10 +259,20 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
     // TLS data needs a slot in each thread's ThreadLocalStoragePointer array, which ntdll owns.
     // Only an empty template is accepted. Unlike Windows, which assigns an index even for an
     // empty template, pe_map leaves AddressOfIndex as linked.
+    // Like the Windows loader, the TLS and delay-import directories are found by their address
+    // alone; Size is not used. Measured on Windows 11 build 26200: a TLS directory with Size 0, 1
+    // or 39 still runs its callback, one with address 0 is ignored whatever its Size, and one that
+    // does not fit in the image fails the load. The loader does not read the delay-import directory
+    // at all; pe_map rejects a malformed one and one that lists a DLL.
+    const auto& delay = directory(nt, IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT);
+    if (delay.VirtualAddress) {
+        const auto* first = image.at<IMAGE_DELAYLOAD_DESCRIPTOR>(delay.VirtualAddress);
+        if (!first) return release(fail(MAP_FORMAT, "delay import directory outside image"));
+        if (first->DllNameRVA) return release(fail(MAP_UNSUPPORTED, "delay imports"));
+    }
     const auto& tls = directory(nt, IMAGE_DIRECTORY_ENTRY_TLS);
-    if (tls.Size) {
-        const auto* t = tls.Size >= sizeof(IMAGE_TLS_DIRECTORY64)
-            ? image.at<IMAGE_TLS_DIRECTORY64>(tls.VirtualAddress) : nullptr;
+    if (tls.VirtualAddress) {
+        const auto* t = image.at<IMAGE_TLS_DIRECTORY64>(tls.VirtualAddress);
         if (!t) return release(fail(MAP_FORMAT, "TLS directory outside image"));
         if (t->EndAddressOfRawData != t->StartAddressOfRawData || t->SizeOfZeroFill)
             return release(fail(MAP_UNSUPPORTED, "TLS data"));
@@ -302,14 +311,24 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
         offset += length;
     }
 
+    // Like the Windows loader, find the import table by its address and walk it to the null
+    // descriptor; the directory Size is not used. Measured on Windows 11 builds 26200 and 26300: copies with
+    // Size 0, 19 or 20 still load and bind every slot. Each descriptor is bounds-checked on its own.
     const auto& imports = directory(nt, IMAGE_DIRECTORY_ENTRY_IMPORT);
-    if (imports.Size) {
-        const auto descriptors = imports.Size / sizeof(IMAGE_IMPORT_DESCRIPTOR);
-        if (!descriptors) return release(fail(MAP_FORMAT, "import directory smaller than one descriptor"));
-        if (!resolve) return release(fail(MAP_UNRESOLVED_IMPORT, "imports present without a resolver"));
-        const auto* desc = image.at<IMAGE_IMPORT_DESCRIPTOR>(imports.VirtualAddress, descriptors);
-        if (!desc) return release(fail(MAP_FORMAT, "import directory outside image"));
-        for (std::uint64_t d = 0; d < descriptors && desc[d].Name; ++d) {
+    if (imports.VirtualAddress) {
+        std::uint64_t descriptors = 0;
+        for (;; ++descriptors) {
+            const auto* d = image.at<IMAGE_IMPORT_DESCRIPTOR>(
+                imports.VirtualAddress + descriptors * sizeof(IMAGE_IMPORT_DESCRIPTOR));
+            if (!d) return release(fail(MAP_FORMAT, "import directory outside image"));
+            if (!d->Name) break;
+        }
+        // The walked table, terminator included, is what IAT writes must not overlap.
+        const IMAGE_DATA_DIRECTORY walked{
+            imports.VirtualAddress, static_cast<DWORD>((descriptors + 1) * sizeof(IMAGE_IMPORT_DESCRIPTOR))};
+        if (descriptors && !resolve) return release(fail(MAP_UNRESOLVED_IMPORT, "imports present without a resolver"));
+        const auto* desc = image.at<IMAGE_IMPORT_DESCRIPTOR>(imports.VirtualAddress, descriptors + 1);
+        for (std::uint64_t d = 0; d < descriptors; ++d) {
             const char* name_in_image = image.string(desc[d].Name);
             if (!name_in_image) return release(fail(MAP_FORMAT, "import DLL name outside image"));
             // Keep a copy: an IAT write below may legally overlap the string in the image.
@@ -318,7 +337,7 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
             const DWORD lookup = desc[d].OriginalFirstThunk ? desc[d].OriginalFirstThunk : desc[d].FirstThunk;
             for (std::uint64_t i = 0;; ++i) {
                 const auto* word = image.at<std::uint64_t>(lookup + 8 * i);
-                if (!word || !writable(desc[d].FirstThunk + 8 * i, imports))
+                if (!word || !writable(desc[d].FirstThunk + 8 * i, walked))
                     return release(fail(MAP_FORMAT, "import thunk for %s outside image", dll));
                 if (!*word) break;
                 const bool by_ordinal = IMAGE_SNAP_BY_ORDINAL64(*word);

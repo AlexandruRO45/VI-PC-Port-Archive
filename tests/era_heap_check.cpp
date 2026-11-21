@@ -9,6 +9,7 @@
 #include <memory>
 #include <string_view>
 #include <thread>
+#include <vector>
 #ifdef _DEBUG
 #include <crtdbg.h>
 #endif
@@ -113,6 +114,39 @@ bool caller_layout_checks()
     return true;
 }
 
+bool reuse_checks()
+{
+    using Byte = unsigned char;
+    using Block = std::unique_ptr<void, decltype(&era_heap::release)>;
+    constexpr Byte dirty = 0xa5;
+    // A released block keeps its contents in the CRT heap. Dirty one, then hold up to 32
+    // fresh blocks of the same shape until that address comes back. Each must read as zero.
+    unsigned cases = 0, recycled = 0;
+    for (unsigned exponent : {4u, 6u, 12u}) {
+        for (std::size_t bytes : {64u, 257u, 4096u}) {
+            const auto flags = std::uint64_t{exponent} << 24;
+            auto* p = static_cast<Byte*>(era_heap::allocate(bytes, flags));
+            if (!p) return false;
+            std::fill_n(p, bytes, dirty);
+            const auto released = reinterpret_cast<std::uintptr_t>(p);
+            era_heap::release(p);
+            std::vector<Block> held;
+            for (int attempt = 0; attempt < 32; ++attempt) {
+                held.emplace_back(era_heap::allocate(bytes, flags), era_heap::release);
+                auto* q = static_cast<Byte*>(held.back().get());
+                if (!q || !std::all_of(q, q + bytes, [](Byte b) { return b == 0; })) return false;
+                if (reinterpret_cast<std::uintptr_t>(q) == released) {
+                    ++recycled;
+                    break;
+                }
+            }
+            ++cases;
+        }
+    }
+    std::printf("reuse_cases=%u recycled_address=%u\n", cases, recycled);
+    return true;
+}
+
 bool concurrency_checks()
 {
     constexpr std::size_t bytes = 511;
@@ -155,6 +189,8 @@ int main(int argc, char** argv)
         passed = failure_checks();
     } else if (scenario == "caller_layout"sv) {
         passed = caller_layout_checks();
+    } else if (scenario == "reuse"sv) {
+        passed = reuse_checks();
     } else if (scenario == "concurrency"sv) {
         passed = concurrency_checks();
     } else {

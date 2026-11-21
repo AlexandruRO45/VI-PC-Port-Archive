@@ -17,6 +17,9 @@ STATUS = {"ok": 0, "format": 2, "unresolved": 5, "unsupported": 6, "init_failed"
 kernel = ctypes.WinDLL("kernel32", use_last_error=True)
 kernel.GetProcAddress.argtypes = [wintypes.HMODULE, ctypes.c_void_p]
 kernel.GetProcAddress.restype = ctypes.c_void_p
+kernel.LoadLibraryExW.argtypes = [wintypes.LPCWSTR, wintypes.HANDLE, wintypes.DWORD]
+kernel.LoadLibraryExW.restype = wintypes.HMODULE
+kernel.FreeLibrary.argtypes = [wintypes.HMODULE]
 lookup_entry = kernel.RtlLookupFunctionEntry
 lookup_entry.argtypes = [ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64), ctypes.c_void_p]
 lookup_entry.restype = ctypes.c_void_p
@@ -128,11 +131,9 @@ def check_rejections(mapper, image, provider, symbol):
         length = imports.get_field_absolute_offset("Size")
         size = pe.OPTIONAL_HEADER.SizeOfImage
     bindings = {provider.name.casefold(): ctypes.CDLL(str(provider))}
-    descriptor = 20  # sizeof(IMAGE_IMPORT_DESCRIPTOR)
     for field, value, expected, message in (
             (entry, size + 0x1000, "format", "entry point outside executable section"),
-            (address, size - 4, "format", "import directory outside image"),
-            (length, descriptor - 1, "format", "import directory smaller than one descriptor")):
+            (address, size - 4, "format", "import directory outside image")):
         data = bytearray(image.read_bytes())
         struct.pack_into("<I", data, field, value)
         with TemporaryDirectory() as temp:
@@ -141,8 +142,133 @@ def check_rejections(mapper, image, provider, symbol):
             base, status, detail, requests = mapper(damaged, bindings)
         if base or status != STATUS[expected] or detail != message or requests:
             raise AssertionError(f"{message} control: {base=} {status=} {detail=} {requests=}")
-    print(f"{image.name}: rejected unbound {identity}, an entry point and an import directory outside the image "
-          "and one smaller than a descriptor")
+    print(f"{image.name}: rejected unbound {identity}, an entry point and an import directory outside the image")
+
+
+LOAD_SEARCH = 0x00000100 | 0x00001000  # LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS
+kernel.LoadLibraryExW.argtypes = [wintypes.LPCWSTR, wintypes.HANDLE, wintypes.DWORD]
+kernel.LoadLibraryExW.restype = wintypes.HMODULE
+kernel.FreeLibrary.argtypes = [wintypes.HMODULE]
+kernel.GetModuleHandleExW.argtypes = [wintypes.DWORD, ctypes.c_void_p, ctypes.POINTER(wintypes.HMODULE)]
+FROM_ADDRESS_UNCHANGED = 0x4 | 0x2  # GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | _UNCHANGED_REFCOUNT
+
+
+def bound_symbol(value, slots):
+    """Return (dll, symbol) of the slot entry whose provider export equals value, or None."""
+    owner = wintypes.HMODULE()
+    if not kernel.GetModuleHandleExW(FROM_ADDRESS_UNCHANGED, ctypes.c_void_p(value), ctypes.byref(owner)):
+        return None
+    for dll, symbol in slots.values():
+        if kernel.GetProcAddress(owner, symbol.encode()) == value:
+            return dll, symbol
+    return None
+
+
+def check_import_walk(mapper, image, providers):
+    """Patch the import directory Size of a two-descriptor image and compare pe_map with Windows.
+
+    The Windows loader finds the import table by address and walks to the null descriptor, so a Size
+    that is zero, below one descriptor or ends after the first descriptor still binds every slot.
+    """
+    with pefile.PE(str(image)) as pe:
+        imports = pe.OPTIONAL_HEADER.DATA_DIRECTORY[1]
+        length = imports.get_field_absolute_offset("Size")
+        built = imports.Size
+        slots = {d.struct.FirstThunk + 8 * i: (d.dll.decode().casefold(), imp.name.decode())
+                 for d in pe.DIRECTORY_ENTRY_IMPORT for i, imp in enumerate(d.imports)}
+    if sorted(dll for dll, _ in slots.values()) != sorted(p.name.casefold() for p in providers):
+        raise AssertionError(f"{image.name}: expected one import from each provider, got {slots}")
+    descriptor = 20  # sizeof(IMAGE_IMPORT_DESCRIPTOR)
+    if built != 3 * descriptor:
+        raise AssertionError(f"{image.name}: import directory Size {built}, expected two descriptors and a terminator")
+    modules = {p.name.casefold(): ctypes.CDLL(str(p)) for p in providers}
+    for value in (built, 0, descriptor - 1, descriptor):
+        data = bytearray(image.read_bytes())
+        struct.pack_into("<I", data, length, value)
+        with TemporaryDirectory() as temp:
+            copy = Path(temp) / image.name
+            copy.write_bytes(data)
+            for p in providers:
+                (Path(temp) / p.name).write_bytes(p.read_bytes())
+            # Windows: only the IAT is read after the load; nothing in the image runs (no entry point).
+            module = kernel.LoadLibraryExW(str(copy), None, LOAD_SEARCH)
+            if not module:
+                raise AssertionError(f"Size {value}: LoadLibraryExW failed with {ctypes.get_last_error()}")
+            try:
+                windows = {slot: bound_symbol(ctypes.c_uint64.from_address(module + slot).value, slots)
+                           for slot in slots}
+            finally:
+                kernel.FreeLibrary(module)
+            base, status, detail, requests = mapper(copy, modules)
+        if status != STATUS["ok"] or not base:
+            raise AssertionError(f"Size {value}: pe_map failed with {status}: {detail}")
+        try:
+            mapped = {slot: bound_symbol(ctypes.c_uint64.from_address(base + slot).value, slots) for slot in slots}
+        finally:
+            mapper.release(base)
+        if sorted((dll.casefold(), item) for dll, item in requests) != sorted(slots.values()):
+            raise AssertionError(f"Size {value}: unexpected import requests {requests}")
+        if windows != slots or mapped != slots:
+            raise AssertionError(f"Size {value}: expected {slots}, Windows bound {windows}, pe_map bound {mapped}")
+    print(f"{image.name}: import directory Size {built}, 0, {descriptor - 1} and {descriptor} bind both slots "
+          "under LoadLibraryExW and pe_map")
+
+
+LOAD_ALTERED_SEARCH = 0x8  # LOAD_WITH_ALTERED_SEARCH_PATH: dependencies from the image's own folder
+
+
+def check_delay_directory(mapper, image, provider):
+    """The Windows loader does not read the delay-import directory; pe_map separates its cases.
+
+    An address of 0 or an empty table maps like Windows, a directory outside the image is malformed,
+    and a descriptor that names a DLL is unsupported. The named fixture has no delay imports.
+    """
+    with pefile.PE(str(image)) as pe:
+        delay = pe.OPTIONAL_HEADER.DATA_DIRECTORY[13]
+        address, size = (delay.get_field_absolute_offset(f) for f in ("VirtualAddress", "Size"))
+        if delay.VirtualAddress or delay.Size:
+            raise AssertionError(f"{image.name}: fixture must have no delay-import directory")
+        imports = pe.OPTIONAL_HEADER.DATA_DIRECTORY[1].VirtualAddress
+        image_size = pe.OPTIONAL_HEADER.SizeOfImage
+        align = pe.OPTIONAL_HEADER.SectionAlignment
+        rdata = next(s for s in pe.sections if s.Name.rstrip(b"\0") == b".rdata")
+    # The rest of the .rdata page past VirtualSize is mapped and zero under both loaders: an empty table.
+    empty = (rdata.VirtualAddress + rdata.Misc_VirtualSize + 7) & ~7
+    if empty + 32 > (rdata.VirtualAddress + rdata.Misc_VirtualSize + align - 1) & ~(align - 1):
+        raise AssertionError(f"{image.name}: no room for an empty delay descriptor in .rdata")
+    # 8 bytes into the import descriptor, ForwarderChain (0) and Name line up with a delay
+    # descriptor's Attributes and DllNameRVA: a descriptor that names the provider DLL.
+    named = imports + 8
+    cases = (
+        ("empty table, Size 0", [(address, empty)], "ok", ""),
+        ("empty table, Size 32", [(address, empty), (size, 32)], "ok", ""),
+        ("address 0, Size 32", [(size, 32)], "ok", ""),
+        ("address past the image", [(address, image_size + 0x1000), (size, 32)], "format",
+         "delay import directory outside image"),
+        ("descriptor naming a DLL, Size 0", [(address, named)], "unsupported", "delay imports"),
+    )
+    bindings = {provider.name.casefold(): ctypes.CDLL(str(provider))}
+    for name, edits, expected, message in cases:
+        data = bytearray(image.read_bytes())
+        for offset, value in edits:
+            struct.pack_into("<I", data, offset, value)
+        with TemporaryDirectory() as temp:
+            copy = Path(temp) / image.name
+            copy.write_bytes(data)
+            (Path(temp) / provider.name).write_bytes(provider.read_bytes())
+            # Windows: the copy has no entry point, so loading it runs nothing in the image.
+            module = kernel.LoadLibraryExW(str(copy), None, LOAD_ALTERED_SEARCH)
+            if not module:
+                raise AssertionError(f"delay {name}: LoadLibraryExW failed with {ctypes.get_last_error()}")
+            kernel.FreeLibrary(module)
+            base, status, detail, requests = mapper(copy, bindings)
+        if base:
+            mapper.release(base)
+        if status != STATUS[expected] or detail != message or bool(base) != (expected == "ok") \
+                or bool(requests) != (expected == "ok"):
+            raise AssertionError(f"delay {name}: {base=} {status=} {detail=} {requests=}")
+    print(f"{image.name}: Windows loads every delay-import variant; pe_map maps an address of 0 and an empty "
+          "table, and rejects a directory past the image (format) and a descriptor naming a DLL (unsupported)")
 
 
 def check_empty_export_slot(mapper, image):
@@ -179,10 +305,12 @@ def main():
     parser.add_argument("--ordinal", type=Path, nargs=4, metavar=("ORIGINAL", "LIFTED", "PROVIDER", "ALTERED"),
                         required=True)
     parser.add_argument("--reloc", type=Path, nargs=3, metavar=("ORIGINAL", "PROVIDER", "ALTERED"), required=True)
+    parser.add_argument("--two", type=Path, nargs=3, metavar=("IMAGE", "PROVIDER", "SECOND_PROVIDER"), required=True)
     args = parser.parse_args()
     mapper = Mapper(args.mapper)
     probe = register_probe(str(args.probe))
     check_empty_export_slot(mapper, args.probe)
+    check_delay_directory(mapper, args.named[0], args.named[2])
     for case, paths, symbol in (("named", args.named, "mix_args"), ("ordinal", args.ordinal, 77)):
         original, lifted, provider, altered = paths
         natives = [("native LoadLibrary", ctypes.CDLL(str(original)).call_mix),
@@ -196,6 +324,8 @@ def main():
         raise AssertionError("relocation fixture must have exactly one DIR64 entry")
     check_mapping(mapper, "relocated", original, provider, "mix_args", probe, natives)
     check_mapping(mapper, "relocated with altered shim", original, provider, "mix_args", probe, [], altered)
+    image, *providers = args.two
+    check_import_walk(mapper, image, providers)
 
 
 if __name__ == "__main__":

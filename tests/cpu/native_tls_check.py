@@ -96,7 +96,42 @@ def check(original, refuse, sink, mapper):
             raise AssertionError(f"refuse failures: native={native['failure']} mapped={mapped['failure']}")
     print("native and mapped: TLS callback then entry point on attach and on detach, reserved null; "
           "a FALSE entry point is followed by a full detach and the load fails")
+    check_directory_fields(original, sink, mapper)
     check_rejections(original, sink, mapper)
+
+
+ERROR_NOACCESS = 998
+
+
+def check_directory_fields(image, sink, mapper):
+    """The loader finds the TLS directory by address alone; compare patched copies with Windows."""
+    with pefile.PE(str(image)) as pe:
+        tls = pe.OPTIONAL_HEADER.DATA_DIRECTORY[9]
+        address, size = (tls.get_field_absolute_offset(f) for f in ("VirtualAddress", "Size"))
+        built, image_size = tls.Size, pe.OPTIONAL_HEADER.SizeOfImage
+    if built != 40:  # sizeof(IMAGE_TLS_DIRECTORY64)
+        raise AssertionError(f"TLS directory Size {built}, expected 40")
+    same = (("Size 0", size, 0), ("Size 1", size, 1), ("Size 39", size, 39), ("address 0", address, 0))
+    failing = (("address past the image", address, image_size + 0x1000),
+               ("directory ending past the image", address, image_size - 8))
+    for name, offset, value in same + failing:
+        copy = bytearray(Path(image).read_bytes())
+        struct.pack_into("<I", copy, offset, value)
+        with TemporaryDirectory() as temp:
+            damaged = Path(temp) / Path(image).name
+            damaged.write_bytes(copy)
+            native, mapped = child("native", damaged, sink, mapper), child("mapped", damaged, sink, mapper)
+        if (name, offset, value) in same:
+            if native != mapped or native["failure"] is not None:
+                raise AssertionError(f"TLS {name}: native={native} mapped={mapped}")
+            callbacks = any(call[0] == TLS for call in native["attach"])
+            if callbacks != (offset == size):
+                raise AssertionError(f"TLS {name}: callback ran={callbacks} under Windows")
+        elif (native != {"failure": ERROR_NOACCESS, "attach": []}
+              or mapped != {"failure": [STATUS["format"], "TLS directory outside image"], "attach": []}):
+            raise AssertionError(f"TLS {name}: native={native} mapped={mapped}")
+    print("TLS directory with Size 0, 1 or 39: callback and entry point run under Windows and pe_map; "
+          "address 0: entry point only under both; a directory past the image fails both loads")
 
 
 def check_rejections(image, sink_path, mapper_path):

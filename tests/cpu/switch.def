@@ -1,0 +1,5 @@
+EXPORTS
+    select_rva
+    select_rel
+    run_ops
+    shift_narrow
