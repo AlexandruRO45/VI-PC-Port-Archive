@@ -112,24 +112,26 @@ table of contents.
 
 ### Functional categories
 
-The 118 root elements group into these categories. Counts and bytes cover the 266 recoverable documents
-(41.2 MiB), not the one unattributed block.
+The 118 root elements group into these categories. The catalog assigns each root exactly one bucket and keeps
+the one rootless payload as `uncatalogued`, so the table covers all 267 XML payloads, not only the 266
+root-bearing documents.
 
-| Category | Files | Inflated B | Roots | Representative root elements |
-|---|---:|---:|---:|---|
-| time, weather, sky, water | 87 | 17,339,011 | 13 | `timecycle_modifier_data`, `timecycle_keyframe_data`, `CContentsOfWeatherXmlFile`, `ShoreWavePlacementData` |
-| vehicles, tyres, handling data | 45 | 19,618,605 | 12 | `CVehiclePoints`, `CVehicleBoneOffsetsArray`, `CTyreDataSet`, `CVehiclePerformanceMaps` |
-| peds, schedules, appearance | 29 | 2,029,321 | 29 | `CPedScheduleInfoManager`, `CPedVariationBodyTypeManager`, `CPairedPedDataBlock`, `CEnergyConfigInfos` |
-| tuning, parameters, effects | 28 | 343,601 | 14 | `CTuningFile`, `CCoverProcessorTuning`, `GridAtlasInfo`, `PatchConstants` |
-| mount / content manifests | 25 | 450,316 | 2 | `CDataFileMgr__ContentChangeSetDef`, `CDataFileMgr__ContentDef` |
-| world, navigation, map | 19 | 1,660,133 | 19 | `GameShape__Data__LocationNameLoopkup`, `PathingStyleData`, `CTrainConfigs`, `CHazardNodes` |
-| combat and AI behaviour | 13 | 809,074 | 13 | `CCombatInfoMgr`, `CFiringPatternInfoManager`, `CFleeDecisionMakerData`, `Combat__GoalData__Store` |
-| animation, poses, weapons | 6 | 162,778 | 6 | `WeaponAnimations__FullbodyControllerData`, `WeaponAnimations__ConfigData`, `CAimUpperBodyDataBlock` |
-| damage | 5 | 485,482 | 1 | `CDamageDataManager` |
-| audio, video, speech | 4 | 13,741 | 4 | `LandingPageVideos`, `CTVPlaylistContainer`, `naSpeechEventTypeBatchRequestParams` |
-| missions, scenarios, respawn | 3 | 57,327 | 3 | `CDynamicScenarioManager`, `CMissions`, `Respawn__MetaData` |
-| conversation | 2 | 250,000 | 2 | `CConversationList`, `CConversationDictionary` |
-| **total** | **266** | **43,219,389** | **118** | |
+| Category | Payloads | Documents | Inflated B | Roots | Representative root elements |
+|---|---:|---:|---:|---:|---|
+| time, weather, sky, water | 87 | 87 | 17,346,469 | 13 | `timecycle_modifier_data`, `timecycle_keyframe_data`, `CContentsOfWeatherXmlFile`, `ShoreWavePlacementData` |
+| vehicles, tyres, handling data | 45 | 45 | 19,659,241 | 12 | `CVehiclePoints`, `CVehicleBoneOffsetsArray`, `CTyreDataSet`, `CVehiclePerformanceMaps` |
+| peds, schedules, appearance | 29 | 29 | 2,022,591 | 29 | `CPedScheduleInfoManager`, `CPedVariationBodyTypeManager`, `CPairedPedDataBlock`, `CEnergyConfigInfos` |
+| tuning, parameters, effects | 28 | 28 | 382,303 | 14 | `CTuningFile`, `CCoverProcessorTuning`, `GridAtlasInfo`, `PatchConstants` |
+| mount / content manifests | 25 | 25 | 450,316 | 2 | `CDataFileMgr__ContentChangeSetDef`, `CDataFileMgr__ContentDef` |
+| world, navigation, map | 19 | 19 | 1,614,455 | 19 | `GameShape__Data__LocationNameLoopkup`, `PathingStyleData`, `CTrainConfigs`, `CHazardNodes` |
+| combat and AI behaviour | 13 | 13 | 881,064 | 13 | `CCombatInfoMgr`, `CFiringPatternInfoManager`, `CFleeDecisionMakerData`, `Combat__GoalData__Store` |
+| animation, poses, weapons | 6 | 6 | 56,400 | 6 | `WeaponAnimations__FullbodyControllerData`, `WeaponAnimations__ConfigData`, `CStandardPosesManager` |
+| damage | 5 | 5 | 485,482 | 1 | `CDamageDataManager` |
+| audio, video, speech | 4 | 4 | 13,741 | 4 | `LandingPageVideos`, `CTVPlaylistContainer`, `naSpeechEventTypeBatchRequestParams` |
+| missions, scenarios, respawn | 3 | 3 | 57,327 | 3 | `CDynamicScenarioManager`, `CMissions`, `Respawn__MetaData` |
+| conversation | 2 | 2 | 250,000 | 2 | `CConversationList`, `CConversationDictionary` |
+| `uncatalogued` (no root) | 1 | 0 | 65,536 | 0 | - |
+| **total** | **267** | **266** | **43,284,925** | **118** | |
 
 This archive has no root element for popcycle, weapon stats or handling. Weapon-related documents here cover
 loadouts, combat references and animation configuration. Vehicle handling-style values appear under the
@@ -175,6 +177,75 @@ A runtime consumer needs:
 - streaming rather than whole-file parsing for the 14 MB table;
 - strict handling of the 9 tail-only and 1 unattributed blocks: they are incomplete evidence, not documents
   to guess at.
+
+## XML catalog
+
+`tools/gamedata_xml.py` builds on the index: it joins each XML payload's streams, parses it and writes
+per-document rows plus a per-root and per-category catalog as JSON/CSV. It is stdlib-only:
+
+```powershell
+python -I tools/gamedata_xml.py <work>\carve\common --json xml.json --csv xml.csv --check
+```
+
+The document rows carry offset, bytes, chunks, root, category, element count, maximum depth, attribute names,
+status flags (`header`, `complete`, `tail_only`, `truncated`, `fragment`, `malformed`), a names-only
+`root|attributes|elements` signature, `$(name)`/`platform:/` counts and include-like counts. The root catalog
+adds the element-name and attribute histograms, distinct-signature count and status counts. The category
+catalog keeps every payload, including `uncatalogued`. `--check` separates a rootless fragment, a tail-only
+document and a malformed document.
+
+Measured over the 267 XML payloads (43,284,925 B):
+
+| Bucket | Payloads | Documents | Inflated B | Status |
+|---|---:|---:|---:|---|
+| XML declaration | 257 | 257 | 42,559,973 | all 257 parse |
+| Tail-only | 9 | 9 | 659,416 | 2 parse from retained bytes, 7 truncated |
+| Unattributed | 1 | 0 | 65,536 | no root element |
+| **total** | **267** | **266** | **43,284,925** | 259 well-formed, 0 malformed |
+
+The 266 root-bearing documents are 43,219,389 B (41.2 MiB); the unattributed block is the remaining 65,536 B.
+The index calls a document complete when its closing root is present, so the 9 tails count as complete
+documents; 7 of them are still truncated at the start and the catalog flags that. The unattributed block is
+the only index-incomplete payload.
+
+| Measure | Value |
+|---|---:|
+| Documents / named roots / categories | 266 / 118 / 12 (+1 uncatalogued bucket) |
+| Complete / incomplete payloads | 266 / 1 |
+| Declaration / tail-only / truncated | 257 / 9 / 7 |
+| Well-formed / malformed | 259 / 0 |
+| Elements / distinct element names | 428,611 / 5,293 |
+| Attribute names / `type` values / `content` kinds | 33 / 318 / 7 |
+| Maximum depth | 17 |
+| Comment starts (all / declaration-bearing) | 507 / 412 |
+| `filename` / `parentPath` / `parentFile` / XInclude | 3,315 / 40 / 3 / 0 |
+| `platform:/` references (levels / other) | 2,674 (2,346 / 328) |
+| `$(common)` / `$(root)` / `$(target)` references | 588 / 28 / 23 |
+
+Macro counts cover all element text; 587 of the 588 `$(common)` hits are in `<filename>` elements, which is the
+filename-only bucket above.
+
+The root and element distribution is the one in the tables above: the five repeated roots hold 141 of the 266
+documents, and the element histogram is dominated by the general node names `Item` (118,179), `item` (16,316)
+and `Name` (12,850). The long tail is per-system parameter names; the manifest and timecycle names are a small
+part of it. A category is a dispatch bucket, not a schema: each root has exactly one category, and a root
+outside the measured table falls into `uncatalogued` rather than disappearing. The 259 parseable documents
+yield 259 signatures; identical signatures are the same root and name set even when values differ, and the
+per-root distinct count shows where a root has more than one name set.
+
+Reference handling is narrow. Every `$(...)` and `platform:/` string is element text, not an attribute; no
+document uses XInclude. The macro alphabet is `$(common)`, `$(target)` and `$(root)`, and the platform targets
+split into `platform:/levels/` and everything else. `filename` is the only include-like element with a large
+population; `parentPath`/`parentFile` are the only relative references outside it. A resolver therefore needs
+four prefix rules and a content-set/mount walk, not a general include processor.
+
+A runtime dispatcher needs the 118-root table (or an RTTI class bridge), the 12 category buckets plus the
+`uncatalogued` fallback, the 318-value `type` registry, the 33-name attribute whitelist, the `content=` array
+decoders and a streaming reader for the 14 MB document. It also needs to mark the 9 tail-only documents and
+the one rootless block as incomplete evidence: `gamedata_xml.py --check` is the reference for that split. The
+catalog is a local work product. Only aggregate counts and schema/root/element/attribute names belong in git;
+the CSV/JSON, the element values, the `type`/`content` values and per-file paths stay on the local machine.
+The tests are synthetic.
 
 ## Relationship to `data.rpf` and `script.rpf`
 
