@@ -678,6 +678,19 @@ Like the TLS and ordinary import tables, the delay-import directory is found by 
 ctest --preset dev --no-tests=error -R '^cpu_native_delay$' -V
 ```
 
+### Candidate programs for a named SGD5 effect
+
+Supply the expected effect name, the group range, the program-array offset and the effect-record range. Use physical byte offsets in decimal or hexadecimal. Both ranges end at the first byte after the selected data.
+
+```text
+python -B tools/sgd5_effects.py archive.bin EFFECT --group GROUP_START GROUP_END --arrays ARRAY_OFFSET --record EFFECT_START EFFECT_END
+ctest --preset dev --no-tests=error -R "^sgd5_effect_candidates$" -V
+```
+
+The report follows the effect's stored list order. Each entry gives its stored group, zero-based program index, name, numeric DXIL shader kind and decoded-container SHA-256. Check the DXIL kind when interpreting a group label. A stored VS group can contain a mesh shader (kind 13).
+
+Two independently located local effects yielded 5 and 81 candidates across all groups. Their pixel lists contained 2 and 41 candidates respectively, and every pixel-container digest matched an independent decode. Identifying which candidate a draw uses still requires evidence of pass selection.
+
 ## Offline pixel shader recompilation
 
 `tools/pixel_aot.py` extracts one named pixel program from a local archive, decodes gfx1013 instructions with LLVM and emits HLSL. DXC compiles the result to desktop DXIL before the draw. The lowerer tracks register writes across whole-quad interpolation of attribute 0, a scalar texture-descriptor load, a 2D RGBA sample, packed round-toward-zero binary16 conversions and one compressed color export. Unknown instructions, mismatched bindings and reads before the required wait cause translation to fail. [LLVM disassembler API](https://llvm.org/docs/doxygen/group__LLVMCDisassembler.html) · [Leonida public format reference](https://github.com/ItsNotRexed/Leonida/blob/56f023a10a726da20702d4e121656ceda2391d93/tools/fssm_unpack.py)

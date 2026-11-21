@@ -47,6 +47,7 @@ jobs:
           python -B tests/bcpack_check.py
           python -B tests/form_coverage_check.py
           python -B tests/resource_ranges_check.py
+          python -B tests/sgd5_effects_check.py
           python -B tests/dxcontainer_part_offsets_check.py
           python -B tests/layout_chunks_check.py
           python -B tests/dependency_paths_check.py
