@@ -30,6 +30,12 @@ template<class T> T load(word address) {
 template<class T> void store(word address, T v) {
     memcpy(reinterpret_cast<void*>(address), &v, sizeof v);
 }
+[[noreturn]] static void raise_de() {
+    volatile uint32_t zero_divisor = 0;
+    volatile uint32_t sink = 1u / zero_divisor;
+    (void)sink;
+    for (;;) {}
+}
 """
 HEADER = INTEGER_HEADER + "struct Query { word type, next, effect, device, count, ids, names; };\n"
 
@@ -206,10 +212,13 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
                             f"rax = (p0 & 0xffffffffull) | (mid << 32); rdx = p3 + (p1 >> 32) + (p2 >> 32) + (mid >> 32); carry = rdx != 0; }}")
             elif op == M.DIV:
                 if size == 4:
-                    stmt = (f"{{ const uint64_t num = (static_cast<uint64_t>(static_cast<uint32_t>(rdx)) << 32) | static_cast<uint32_t>(rax); "
-                            f"const uint32_t den = {operand(0)}; rax = static_cast<uint32_t>(num / den); rdx = static_cast<uint32_t>(num % den); }}")
+                    stmt = (f"{{ const uint32_t hi = static_cast<uint32_t>(rdx), den = {operand(0)}; "
+                            f"if (den == 0u || hi >= den) raise_de(); "
+                            f"const uint64_t num = (static_cast<uint64_t>(hi) << 32) | static_cast<uint32_t>(rax); "
+                            f"rax = static_cast<uint32_t>(num / den); rdx = static_cast<uint32_t>(num % den); }}")
                 else:
                     stmt = (f"{{ uint64_t hi = rdx, lo = rax, den = {operand(0)}, q = 0; "
+                            f"if (den == 0ull || hi >= den) raise_de(); "
                             f"for (int b = 63; b >= 0; --b) {{ const bool top = (hi >> 63) != 0; "
                             f"hi = (hi << 1) | ((lo >> b) & 1u); if (top || hi >= den) {{ hi -= den; q |= 1ull << b; }} }} "
                             f"rax = q; rdx = hi; }}")
@@ -217,15 +226,23 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
                 if size == 4:
                     stmt = (f"{{ const int64_t num = static_cast<int64_t>((static_cast<uint64_t>(static_cast<uint32_t>(rdx)) << 32) | static_cast<uint32_t>(rax)); "
                             f"const int32_t den = static_cast<int32_t>({operand(0)}); "
-                            f"rax = static_cast<uint32_t>(static_cast<int32_t>(num / den)); rdx = static_cast<uint32_t>(static_cast<int32_t>(num % den)); }}")
+                            f"if (den == 0 || (num == (-9223372036854775807ll - 1) && den == -1)) raise_de(); "
+                            f"const int64_t q = num / den, r = num % den; "
+                            f"if (q < -2147483648ll || q > 2147483647ll) raise_de(); "
+                            f"rax = static_cast<uint32_t>(static_cast<int32_t>(q)); rdx = static_cast<uint32_t>(static_cast<int32_t>(r)); }}")
                 else:
                     stmt = (f"{{ uint64_t hi = rdx, lo = rax, d = {operand(0)}; "
+                            f"if (d == 0ull) raise_de(); "
                             f"const bool neg_n = (hi >> 63) != 0, neg_d = (d >> 63) != 0; "
                             f"if (neg_n) {{ lo = 0ull - lo; hi = ~hi + (lo == 0ull ? 1ull : 0ull); }} "
-                            f"if (neg_d) {{ d = 0ull - d; }} uint64_t q = 0; "
+                            f"if (neg_d) {{ d = 0ull - d; }} "
+                            f"if (hi >= d) raise_de(); "
+                            f"uint64_t q = 0; "
                             f"for (int b = 63; b >= 0; --b) {{ const bool top = (hi >> 63) != 0; "
                             f"hi = (hi << 1) | ((lo >> b) & 1u); if (top || hi >= d) {{ hi -= d; q |= 1ull << b; }} }} "
-                            f"rax = (neg_n != neg_d) ? (0ull - q) : q; rdx = neg_n ? (0ull - hi) : hi; }}")
+                            f"const bool neg_q = neg_n != neg_d; "
+                            f"if ((!neg_q && q > 0x7fffffffffffffffull) || (neg_q && q > 0x8000000000000000ull)) raise_de(); "
+                            f"rax = neg_q ? (0ull - q) : q; rdx = neg_n ? (0ull - hi) : hi; }}")
         elif op in (M.XADD, M.CMPXCHG):
             size = MemorySizeExt.size(i.memory_size) if i.op0_kind == K.MEMORY else RegisterExt.size(i.op0_register)
             if size not in (4, 8):
@@ -233,11 +250,21 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             width = UINT[size]
             if op == M.XADD:
                 src_dst = reg(i.op1_register)
-                stmt = (f"{{ const {width} a = {operand(0)}, b = {operand(1)}, v = static_cast<{width}>(a + b); "
-                        f"carry = v < a; zero = v == 0; {src_dst} = a; {write('v')} }}")
+                if i.op0_kind == K.MEMORY:
+                    stmt = (f"{{ const word addr = {address()}; const {width} a = load<{width}>(addr), b = {operand(1)}, "
+                            f"v = static_cast<{width}>(a + b); carry = v < a; zero = v == 0; "
+                            f"{src_dst} = a; store<{width}>(addr, v); }}")
+                else:
+                    stmt = (f"{{ const {width} a = {operand(0)}, b = {operand(1)}, v = static_cast<{width}>(a + b); "
+                            f"carry = v < a; zero = v == 0; {src_dst} = a; {write('v')} }}")
             else:  # M.CMPXCHG
-                stmt = (f"{{ const {width} acc = static_cast<{width}>(rax), d = {operand(0)}, s = {operand(1)}; "
-                        f"zero = acc == d; carry = acc < d; if (zero) {{ {write('s')} }} else {{ rax = d; }} }}")
+                if i.op0_kind == K.MEMORY:
+                    stmt = (f"{{ const word addr = {address()}; const {width} acc = static_cast<{width}>(rax), "
+                            f"d = load<{width}>(addr), s = {operand(1)}; zero = acc == d; carry = acc < d; "
+                            f"if (zero) {{ store<{width}>(addr, s); }} else {{ rax = d; }} }}")
+                else:
+                    stmt = (f"{{ const {width} acc = static_cast<{width}>(rax), d = {operand(0)}, s = {operand(1)}; "
+                            f"zero = acc == d; carry = acc < d; if (zero) {{ {write('s')} }} else {{ rax = d; }} }}")
         elif op in (M.VMOVQ, M.VMOVSD, M.VMOVHPD) and has_wide:
             lanes = {R.XMM0: "wide0", R.XMM1: "wide1", R.XMM2: "wide2"}
             if i.op1_kind == K.MEMORY and op != M.VMOVHPD:

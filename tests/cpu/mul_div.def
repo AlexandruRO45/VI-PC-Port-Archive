@@ -9,3 +9,4 @@ EXPORTS
     xadd64_op
     cmpxchg32_op
     cmpxchg64_op
+    xadd64_mem

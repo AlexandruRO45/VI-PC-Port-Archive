@@ -135,4 +135,13 @@ cmpxchg64_op PROC FRAME
     ret
 cmpxchg64_op ENDP
 
+; Memory-operand XADD where source register is also the address base: xadd [rcx], rcx.
+; Returns old memory value (now in RCX) via RAX; memory at original RCX receives old + addr.
+xadd64_mem PROC FRAME
+    .endprolog
+    xadd qword ptr [rcx], rcx
+    mov rax, rcx
+    ret
+xadd64_mem ENDP
+
 END

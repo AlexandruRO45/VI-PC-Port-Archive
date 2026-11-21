@@ -12,7 +12,7 @@ from ffx_version_query import INTEGER_HEADER, lower, region
 
 U64 = ctypes.c_uint64
 EXPORTS = ("mul32_op", "mul64_op", "div32_op", "div64_op", "idiv32_op", "idiv64_op",
-           "xadd32_op", "xadd64_op", "cmpxchg32_op", "cmpxchg64_op")
+           "xadd32_op", "xadd64_op", "cmpxchg32_op", "cmpxchg64_op", "xadd64_mem")
 
 
 def emit(image, output):
@@ -37,6 +37,7 @@ def load_lib(path):
     for name in ("cmpxchg32_op", "cmpxchg64_op"):
         fn = getattr(lib, name)
         fn.argtypes, fn.restype = [U64, U64, U64, ctypes.POINTER(U64)], U64
+    lib.xadd64_mem.argtypes, lib.xadd64_mem.restype = [U64, U64, U64, U64], U64
     return lib
 
 
@@ -158,7 +159,43 @@ def check(native_path, lifted_path):
                         )
                 cases += 1
 
-    print(f"{cases} MUL, DIV, IDIV, XADD, and CMPXCHG cases matched native and translated DLLs")
+    # Memory-operand XADD where base == src: xadd qword ptr [rcx], rcx must write to original rcx.
+    mem_slot = U64(0)
+    addr = ctypes.addressof(mem_slot)
+    for initial in (0, 1, 0x123456789abcdef0, 0xffffffffffffffff):
+        want_sum = (initial + addr) & 0xffffffffffffffff
+        for lib, label in ((native, "native"), (lifted, "lifted")):
+            mem_slot.value = initial
+            got_old = lib.xadd64_mem(addr, 0, 0, 0)
+            if (got_old, mem_slot.value) != (initial, want_sum):
+                raise AssertionError(
+                    f"{label} xadd64_mem({initial:#x}) = ({got_old:#x}, {mem_slot.value:#x}), "
+                    f"expected ({initial:#x}, {want_sum:#x})"
+                )
+        cases += 1
+
+    # #DE fault checks: zero divisor and quotient overflow must fault on both native and lifted DLLs.
+    de_cases = (
+        ("div32_op", 7, 0, 0),
+        ("div32_op", 0, 1, 1),
+        ("div64_op", 7, 0, 0),
+        ("div64_op", 0, 1, 1),
+        ("idiv32_op", 7, 0, 0),
+        ("idiv32_op", 0x80000000, 0xffffffff, 0xffffffff),
+        ("idiv64_op", 7, 0, 0),
+        ("idiv64_op", 0x8000000000000000, 0xffffffffffffffff, 0xffffffffffffffff),
+    )
+    for name, lo_u, hi_u, den_u in de_cases:
+        for lib, label in ((native, "native"), (lifted, "lifted")):
+            try:
+                getattr(lib, name)(lo_u, hi_u, den_u, ctypes.byref(out1))
+            except OSError:
+                pass
+            else:
+                raise AssertionError(f"{label} {name}({lo_u:#x}, {hi_u:#x}, {den_u:#x}) failed to raise #DE")
+        cases += 1
+
+    print(f"{cases} MUL, DIV, IDIV, XADD, and CMPXCHG cases (including xadd [rcx],rcx and #DE faults) matched native and translated DLLs")
 
 
 if __name__ == "__main__":
