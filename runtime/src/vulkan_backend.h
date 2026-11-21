@@ -32,9 +32,11 @@ struct VulkanDeviceFunctions {
     X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateBuffer) X(vkDestroyBuffer)                  \
     X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory)  \
     X(vkUnmapMemory) X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdCopyImage)  \
-    X(vkCmdResolveImage) X(vkCmdBindPipeline) X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCreateShaderModule)       \
-    X(vkDestroyShaderModule) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) X(vkCreateComputePipelines)      \
-    X(vkDestroyPipeline) X(vkGetBufferDeviceAddress)
+    X(vkCmdResolveImage) X(vkCmdBindPipeline) X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCreateShaderModule)   \
+    X(vkDestroyShaderModule) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) X(vkCreateComputePipelines)  \
+    X(vkDestroyPipeline) X(vkGetBufferDeviceAddress) X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer)        \
+    X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetPrimitiveTopology) X(vkCmdSetStencilReference)            \
+    X(vkCmdSetBlendConstants) X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -82,6 +84,29 @@ public:
         replay_.compute_pipeline = [this](std::uintptr_t id) -> const ComputePipeline* {
             const auto it = pipelines_.find(id);
             return it == pipelines_.end() ? nullptr : &it->second;
+        };
+        replay_.bind_vertex_buffers2 = vk.vkCmdBindVertexBuffers2;
+        replay_.bind_index_buffer = vk.vkCmdBindIndexBuffer;
+        replay_.set_viewport = vk.vkCmdSetViewport;
+        replay_.set_scissor = vk.vkCmdSetScissor;
+        replay_.set_primitive_topology = vk.vkCmdSetPrimitiveTopology;
+        replay_.set_stencil_reference = vk.vkCmdSetStencilReference;
+        replay_.set_blend_constants = vk.vkCmdSetBlendConstants;
+        replay_.draw = vk.vkCmdDraw;
+        replay_.draw_indexed = vk.vkCmdDrawIndexed;
+        replay_.graphics_pipeline = [this](std::uintptr_t id) -> const GraphicsPipeline* {
+            const auto it = graphics_pipelines_.find(id);
+            return it == graphics_pipelines_.end() ? nullptr : &it->second;
+        };
+        // Called with mutex_ held. A linear search: fine for the first frames, an interval map when it shows.
+        replay_.buffer_at = [this](std::uint64_t va, std::uint64_t size, VkBuffer& buffer, VkDeviceSize& offset) {
+            for (const auto& [id, b] : resources_) {
+                if (b.image || !b.buffer || va < b.va || va - b.va >= b.size || size > b.size - (va - b.va)) continue;
+                buffer = b.buffer;
+                offset = b.buffer_offset + (va - b.va);
+                return true;
+            }
+            return false;
         };
         replay_.image_view = [this](const ResourceBinding& r, const VkImageSubresourceRange& range) {
             return view(r, range);
@@ -145,6 +170,11 @@ public:
     void remove_pipeline(std::uintptr_t id) {
         std::lock_guard lock(mutex_);
         pipelines_.erase(id);
+        graphics_pipelines_.erase(id);
+    }
+    void add_graphics_pipeline(std::uintptr_t id, const GraphicsPipeline& pipeline) {
+        std::lock_guard lock(mutex_);
+        graphics_pipelines_[id] = pipeline;
     }
 
     // For tests and traces.
@@ -170,7 +200,7 @@ private:
     // Called with mutex_ held (from prepare). Views live until their image is removed.
     VkImageView view(const ResourceBinding& r, const VkImageSubresourceRange& range) {
         const auto key = std::make_tuple(r.image, range.aspectMask, range.baseMipLevel, range.baseArrayLayer,
-                                         range.layerCount);
+                                         range.layerCount, r.format);
         if (const auto it = views_.find(key); it != views_.end()) return it->second;
         VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         info.image = r.image;
@@ -189,8 +219,10 @@ private:
     std::mutex submit_mutex_;
     std::unordered_map<ResourceId, ResourceBinding> resources_;
     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
+    std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;
     LayoutTracker tracker_;
-    std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> views_;
+    std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>, VkImageView>
+        views_;
     ReplayFunctions replay_;
 };
 
