@@ -6,6 +6,9 @@
 
 #include "../src/descriptor_handles.h"  // slot arithmetic and dirty ranges (P0/P1)
 #include "../src/descriptor_views.h"    // D3D12 view descriptions -> GFX10 T#/V#
+#include "../src/bindless_registry.h"   // key -> bindless index
+#include "../src/retirement.h"          // fence-value deferred release
+#include "../src/vulkan_bindless.h"     // set 0: images, samplers, descriptor table
 #include "../src/descriptor_sizes.h"    // per-type slot sizes
 #include "d3d12_stubs.h"  // generated
 #include "d3d12_com_object.h"
@@ -157,6 +160,11 @@ struct DeviceState {
 
     // The console GPU VA space: one linear arena for now, so a resource can hand a valid address to a descriptor.
     // Reserving a real range and growing it at a frame boundary is docs/d3d12_vulkan.md section 3.3's plan.
+    // Set 0 for every pipeline: images, samplers and the descriptor hash table. Created once the device exists.
+    std::unique_ptr<leonida::BindlessSet> bindless;
+    leonida::BindlessRegistry bindless_registry;
+    leonida::RetirementQueue retirement;
+
     std::uint64_t next_console_va = 0x100000000ull;
     std::uint64_t allocate_va(std::uint64_t bytes) {
         const std::uint64_t aligned = (std::max<std::uint64_t>(bytes, 0x10000) + 0xFFFF) & ~std::uint64_t(0xFFFF);
@@ -1010,6 +1018,20 @@ public:
 private:
     IUnknown* identity() { return outer_ ? outer_ : static_cast<ID3D12Device*>(this); }
 
+public:
+    // Set 0 and its layout for the pipeline layouts the device hands out. Null when the set could not be made.
+    VkDescriptorSet bindless_set() const { return state_.bindless ? state_.bindless->set() : VK_NULL_HANDLE; }
+    VkDescriptorSetLayout bindless_layout() const {
+        return state_.bindless ? state_.bindless->layout() : VK_NULL_HANDLE;
+    }
+    leonida::BindlessSet* bindless() const { return state_.bindless.get(); }
+    leonida::RetirementQueue& retirement() { return state_.retirement; }
+
+    void create_bindless(PFN_vkGetDeviceProcAddr get_device_proc) {
+        if (state_.bindless || !get_device_proc) return;
+        state_.bindless = std::make_unique<leonida::BindlessSet>(get_device_proc, state_.info.device, state_.memory);
+    }
+
     DeviceState state_;
     OwnedRuntime owned_;
     IUnknown* outer_ = nullptr;  // the Xbox-ABI proxy, which owns a reference to this device
@@ -1025,6 +1047,9 @@ HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** o
         device->Release();
         return E_FAIL;
     }
+    const auto get_device_proc =
+        reinterpret_cast<PFN_vkGetDeviceProcAddr>(info.get_instance_proc(info.instance, "vkGetDeviceProcAddr"));
+    device->create_bindless(get_device_proc);
     return hand_out(device, riid, out);
 }
 

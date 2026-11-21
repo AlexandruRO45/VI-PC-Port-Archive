@@ -406,6 +406,13 @@ if(Vulkan_FOUND)
     target_link_libraries(gfx10_descriptors_test PRIVATE Vulkan::Headers)
     add_test(NAME gfx10_descriptors COMMAND gfx10_descriptors_test)
   endif()
+  # First draw (milestone M1): a real triangle through the bindless set, a pipeline and an offscreen render pass.
+  add_executable(first_draw_test test/first_draw_test.cpp)
+  target_include_directories(first_draw_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(first_draw_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  target_compile_definitions(first_draw_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(first_draw_test PRIVATE /W4 /permissive- /utf-8)
+  add_test(NAME first_draw COMMAND first_draw_test)
   # D3D12 view -> GFX10 descriptor encoders (P2 of docs/d3d12_vulkan_analysis.md). Needs the Vulkan headers for
   # VkFormat, no GPU and no game data.
   add_executable(descriptor_scan_test test/descriptor_scan_test.cpp)

@@ -470,6 +470,21 @@ struct ReplayFunctions {
     PFN_vkCmdResolveImage resolve_image = nullptr;              // resolves
     // Returns a 2D-array view of the range (caller-owned, alive until execution completes); rectangle clears.
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
+    // Draws (milestone M1). The device supplies the bindless set, the pipeline lookup and the commands; a draw
+    // without them is skipped rather than emitted half-bound. The viewport/scissor are the harness's, until the IR
+    // carries its own.
+    VkPipelineLayout bindless_layout = VK_NULL_HANDLE;
+    VkDescriptorSet bindless_set = VK_NULL_HANDLE;
+    VkPipeline (*pipeline_lookup)(std::uintptr_t id, void* user) = nullptr;
+    void* pipeline_user = nullptr;
+    PFN_vkCmdBindPipeline bind_pipeline = nullptr;
+    PFN_vkCmdBindDescriptorSets bind_descriptor_sets = nullptr;
+    PFN_vkCmdDraw draw = nullptr;
+    PFN_vkCmdDrawIndexed draw_indexed = nullptr;
+    PFN_vkCmdSetViewport set_viewport = nullptr;
+    PFN_vkCmdSetScissor set_scissor = nullptr;
+    VkViewport viewport{};
+    VkRect2D scissor{};
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
 };
 
@@ -942,10 +957,42 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
     const auto commands = prepared.list->commands();
     const bool separate = vk.separate_depth_stencil_layouts;
     const VulkanAccess transfer_dst = vulkan_access(d3d12_state::copy_dest, false);
+    VkPipeline bound_pipeline = VK_NULL_HANDLE;
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
         const auto& p = prepared.commands[i];
+
+        // Pipeline state and draws: the state is tracked here, so the draw binds the pipeline the list selected.
+        if (const auto* pso = std::get_if<SetPipelineState>(&command)) {
+            bound_pipeline = vk.pipeline_lookup ? vk.pipeline_lookup(pso->pipeline_state, vk.pipeline_user)
+                                                : VK_NULL_HANDLE;
+            continue;
+        }
+        if (const auto* draw = std::get_if<DrawInstanced>(&command)) {
+            if (!vk.draw || !bound_pipeline) continue;
+            if (vk.bind_pipeline) vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, bound_pipeline);
+            if (vk.bindless_set && vk.bind_descriptor_sets)
+                vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.bindless_layout, 0, 1,
+                                        &vk.bindless_set, 0, nullptr);
+            if (vk.set_viewport) vk.set_viewport(command_buffer, 0, 1, &vk.viewport);
+            if (vk.set_scissor) vk.set_scissor(command_buffer, 0, 1, &vk.scissor);
+            vk.draw(command_buffer, draw->vertex_count_per_instance, draw->instance_count, draw->start_vertex,
+                    draw->start_instance);
+            continue;
+        }
+        if (const auto* draw = std::get_if<DrawIndexedInstanced>(&command)) {
+            if (!vk.draw_indexed || !bound_pipeline) continue;
+            if (vk.bind_pipeline) vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, bound_pipeline);
+            if (vk.bindless_set && vk.bind_descriptor_sets)
+                vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.bindless_layout, 0, 1,
+                                        &vk.bindless_set, 0, nullptr);
+            if (vk.set_viewport) vk.set_viewport(command_buffer, 0, 1, &vk.viewport);
+            if (vk.set_scissor) vk.set_scissor(command_buffer, 0, 1, &vk.scissor);
+            vk.draw_indexed(command_buffer, draw->index_count_per_instance, draw->instance_count, draw->start_index,
+                            draw->base_vertex, draw->start_instance);
+            continue;
+        }
         const ResourceId id = std::visit(
             [](const auto& c) -> ResourceId {
                 using T = std::decay_t<decltype(c)>;
