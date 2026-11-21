@@ -51,3 +51,37 @@ def test_small_fixed_seed_run_is_clean():
 
 def test_self_test_passes():
     assert sd.self_test() is True
+
+@pytest.mark.parametrize(("option", "value"), [
+    ("--programs", "0"), ("--programs", "-3"),
+    ("--max-ops", "0"), ("--max-ops", "-2"),
+    ("--limit", "0"), ("--limit", "-2"),
+])
+def test_cli_rejects_nonpositive_counts(option, value, monkeypatch, capsys):
+    monkeypatch.setattr(sd, "run_suite", lambda *args, **kwargs: pytest.fail("runner must not start"))
+    with pytest.raises(SystemExit) as exc:
+        sd.main([option, value])
+    assert exc.value.code == 2
+    error = capsys.readouterr().err
+    assert option in error
+    assert "positive integer" in error
+
+
+def test_cli_accepts_positive_boundaries(monkeypatch, capsys):
+    calls = []
+
+    def fake_runner(programs, seed, max_ops, limit=None):
+        calls.append((programs, seed, max_ops, limit))
+        return {"pass": 1, "mismatch": 0, "skip": {}, "harness-error": 0}, None
+
+    monkeypatch.setattr(sd, "run_suite", fake_runner)
+    assert sd.main(["--programs", "1", "--max-ops", "1", "--limit", "1", "--seed", "7"]) == 0
+    assert calls == [(1, 7, 1, 1)]
+    assert "1 pass" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("mode", ["--self-test", "--list-ops"])
+def test_utility_modes_skip_runner(mode, monkeypatch):
+    monkeypatch.setattr(sd, "run_suite", lambda *args, **kwargs: pytest.fail("runner must not start"))
+    monkeypatch.setattr(sd, "self_test", lambda: True)
+    assert sd.main([mode]) == 0
