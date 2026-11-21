@@ -155,7 +155,9 @@ when the Vulkan SDK is found:
 - `vk_texture_test`, `vk_compute_test`, `vk_store_test` — texture, LDS/compute, and buffer-store paths.
 - `vk_command_replay_test`, `d3d12_com_test`, `d3d12_vulkan_device_test` — the D3D12 command path on
   Vulkan: replay, the COM command objects, and the Vulkan device behind the Xbox-ABI proxy. Set
-  `LEONIDA_VK_VALIDATION=1` to run them under the Khronos validation layer.
+  `LEONIDA_VK_VALIDATION=1` to run them under the Khronos validation layer. They count only validation-type
+  errors: loader and layer messages, such as a third-party implicit layer that fails to load, are printed but
+  don't fail the run; to silence one, set `VK_LOADER_LAYERS_DISABLE=<layer name pattern>`.
 - `vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--start I] [--count N] [--max-bytes N]` -
   creates a shader module and, for compute shaders, a pipeline for every entry in the translator's
   `index.json`; reports `MODULE FAIL` / `PIPELINE FAIL` per shader and a summary. `--max-bytes`
