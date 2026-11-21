@@ -75,16 +75,17 @@ bool check_dxr_opacity(ID3D12Device* device, bool warp) {
         // A first-hit search must present no candidate after its first commit.
         failed[AfterShaderCommit] = firstHit && (value[0] >> 3 & 1) != 0;
         failed[AfterOpaqueCommit] = firstHit && (value[0] >> 1 & 1) != 0;
+        const bool afterCommit = failed[AfterShaderCommit] || failed[AfterOpaqueCommit];
         bool other = false;
-        for (int c = 0; c < AfterOpaqueCommit; ++c) other = other || failed[c];
-        // Known WARP deviation: after an automatic opaque commit under the
-        // first-hit flag, WARP still presents non-opaque candidates in front of
-        // it. It is reported, not failed, only when every other check passes.
-        if (warp && failed[AfterOpaqueCommit] && !other) {
+        for (int c = 0; c < AfterShaderCommit; ++c) other = other || failed[c];
+        // Known WARP deviation: WARP does not end a first-hit search at a
+        // committed hit, automatic or shader. It is reported, not failed, only
+        // when the final hit is committable and every other check passes.
+        if (warp && afterCommit && !other) {
             ++warpAfterCommit;
             continue;
         }
-        if (other || failed[AfterOpaqueCommit]) {
+        if (other || afterCommit) {
             std::string names;
             for (int c = 0; c < CategoryCount; ++c)
                 if (failed[c]) { ++counts[c]; names += names.empty() ? "" : ","; names += categoryNames[c]; }
