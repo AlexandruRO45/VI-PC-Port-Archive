@@ -37,6 +37,13 @@ This mode is intended for a matching model collection, not a heterogeneous archi
 Meshes without palettes or with missing/ambiguous bindings fail rather than receive
 guessed assignments. In this mode a failed resource makes the command exit nonzero.
 
+The supported layout is the pinned dependency's external-drawable wrapper lookup
+and a valid model hash-palette table. A directly referenced skeleton header that
+the convenience lookup does not recognize, or a model for which the palette API
+returns no table, remains unsupported and is rejected. Equal joint counts do not
+justify assuming that vertex indices address the skeleton directly. This exporter
+does not add a second parser or an implicit identity-mapping fallback.
+
 Each successful model receives `<stem>.skeleton.json` with joint hashes, nullable
 parents, inverse bind matrices, and per-mesh palette hashes and joint indices in
 original slot order. Matrices are flattened row-major System.Numerics row-vector
