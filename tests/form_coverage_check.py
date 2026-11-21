@@ -197,6 +197,17 @@ def check_shader_records():
     with tempfile.TemporaryDirectory() as tmp:
         pixel.check_controls(Path(tmp))
     assert "s_nop" not in pixel.ACCEPTED and "image_sample" in pixel.ACCEPTED
+    # The scalar ALU fixture counts its SOP1, SOP2, SOPK and SOPC forms; the neighbours the controls
+    # reject (s_addc_u32, s_cmp_eq_u64, s_cmpk_eq_u32, s_cselect_b64) stay out.
+    scalar = {"s_movk_i32", "s_not_b32", "s_add_u32", "s_sub_u32", "s_add_i32", "s_sub_i32", "s_mul_i32",
+              "s_min_u32", "s_max_u32", "s_min_i32", "s_max_i32", "s_and_b32", "s_or_b32", "s_xor_b32",
+              "s_andn2_b32", "s_orn2_b32", "s_lshl_b32", "s_lshr_b32", "s_ashr_i32", "s_cselect_b32",
+              *(f"s_cmp_{r}_{t}32" for r in ("eq", "lg", "gt", "ge", "lt", "le") for t in "iu")}
+    for name in ("gfx1013.tsv", "rdna2.tsv"):
+        forms = fc.gfx_forms(pixel.ACCEPTED, fc.load_reference(name))
+        assert {form for _, form in forms} >= scalar, sorted(scalar - {form for _, form in forms})
+        assert not {"s_addc_u32", "s_cmp_eq_u64", "s_cmpk_eq_u32", "s_cselect_b64"} & {f for _, f in forms}
+        assert {group for group, form in forms if form in scalar} == {"SOP1", "SOP2", "SOPC", "SOPK"}
 
 
 def check_parsing():

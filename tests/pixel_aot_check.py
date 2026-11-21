@@ -440,6 +440,217 @@ def select_case(directory, fold, limit, capped, unequal):
     return path
 
 
+# Scalar ALU producers in the scalar() fixture. Each SCC result sets its own bit of s60 through
+# s_cselect_b32; each result value is mixed into the hash in s61. a to d are constant words 3 to 6.
+SCALAR_STEPS = (
+    ("s_add_u32 s62, s44, s45", True), ("s_sub_u32 s62, s46, s47", True),
+    ("s_add_i32 s62, s46, s45", True), ("s_sub_i32 s62, s46, s45", True),
+    ("s_min_u32 s62, s45, s44", True), ("s_min_i32 s62, s44, s45", True),
+    ("s_max_u32 s62, s44, s45", True), ("s_max_i32 s62, s45, s44", True),
+    ("s_and_b32 s62, s44, s47", True), ("s_xor_b32 s62, s44, s45", True),
+    ("s_lshr_b32 s62, s46, 31", True),
+    ("s_cmp_eq_u32 s44, s45", False), ("s_cmp_lg_u32 s44, s45", False),
+    ("s_cmp_gt_i32 s45, s44", False), ("s_cmp_ge_i32 s44, s45", False),
+    ("s_cmp_lt_i32 s44, s45", False), ("s_cmp_le_i32 s45, s44", False),
+    ("s_cmp_gt_u32 s44, s45", False), ("s_cmp_ge_u32 s45, s44", False),
+    ("s_cmp_lt_u32 s45, s44", False), ("s_cmp_le_u32 s44, s45", False),
+    ("s_cmp_eq_i32 s47, -1", False), ("s_cmp_lg_i32 s46, 0x80000000", False),
+)
+# Results that leave SCC unused or unchanged; s_cselect_b32 here selects between two registers.
+SCALAR_VALUES = ("s_mul_i32 s62, s44, s46", "s_or_b32 s62, s45, s46", "s_andn2_b32 s62, s44, s45",
+                 "s_orn2_b32 s62, s47, s44", "s_not_b32 s62, s46", "s_lshl_b32 s62, s44, s47",
+                 "s_ashr_i32 s62, s46, s44", "s_cmp_lt_u32 s44, s45", "s_cselect_b32 s62, s46, s47")
+# Two constant sets; every SCC bit differs between them, so both arms of each select are drawn.
+SCALAR_WORDS = ((0xfffffff0, 0x20, 0x80000000, 1), (5, 5, 0x7fffffff, 0xffffffff))
+
+
+def scalar_body():
+    body = ["s_mov_b32 s60, 0", "s_movk_i32 s61, 0xff80"]
+    for bit, (step, value) in enumerate(SCALAR_STEPS):
+        flag = 1 << bit
+        body += [step, f"s_cselect_b32 s63, {flag if flag <= 64 else hex(flag)}, 0", "s_or_b32 s60, s60, s63"]
+        if value:
+            body += ["s_mul_i32 s61, s61, 31", "s_add_u32 s61, s61, s62"]
+    for step in SCALAR_VALUES:
+        body.append(step)
+        if step.startswith("s_cselect") or not step.startswith("s_cmp"):
+            body += ["s_mul_i32 s61, s61, 31", "s_add_u32 s61, s61, s62"]
+    # Fold the 32-bit hash to 17 bits and spread 23 flag bits and 17 hash bits over four channels,
+    # ten bits each, exported as 1 + k / 1024, which binary16 holds exactly.
+    body += ["s_lshr_b32 s63, s61, 17", "s_xor_b32 s61, s61, s63", "s_and_b32 s61, s61, 0x1ffff",
+             "s_and_b32 s56, s60, 0x3ff",
+             "s_lshr_b32 s57, s60, 10", "s_and_b32 s57, s57, 0x3ff",
+             "s_lshr_b32 s58, s60, 20", "s_lshl_b32 s63, s61, 3", "s_or_b32 s58, s58, s63",
+             "s_and_b32 s58, s58, 0x3ff",
+             "s_lshr_b32 s59, s61, 7"]
+    for channel in range(4):
+        body += [f"s_lshl_b32 s{56 + channel}, s{56 + channel}, 13",
+                 f"s_or_b32 s{56 + channel}, s{56 + channel}, 1.0",
+                 f"v_mov_b32_e32 v{12 + channel}, s{56 + channel}"]
+    return body
+
+
+def scalar():
+    return with_constants(scalar_body())
+
+
+def scalar_reference(body, words):
+    """Run body on Python integers; returns the four exported channels and every select's arm."""
+    mask = 0xffffffff
+    regs = dict(zip(("s44", "s45", "s46", "s47"), words))
+    scc, arms, out = None, [], {}
+
+    def signed(x):
+        return x - (1 << 32) if x >> 31 else x
+
+    def read(token):
+        if token in regs:
+            return regs[token]
+        if token == "1.0":
+            return 0x3f800000
+        return int(token, 0) & mask
+
+    for line in body:
+        op, operands = line.split(" ", 1)
+        args = operands.split(", ")
+        if op.startswith("v_mov_b32"):
+            out[args[0]] = regs[args[1]]
+            continue
+        x, *rest = map(read, args[1:] if not op.startswith("s_cmp") else args)
+        y = rest[0] if rest else None
+        if op.startswith("s_cmp_"):
+            relation, kind = op[6:8], op[9]
+            left, right = (signed(x), signed(y)) if kind == "i" else (x, y)
+            scc = {"eq": left == right, "lg": left != right, "gt": left > right, "ge": left >= right,
+                   "lt": left < right, "le": left <= right}[relation]
+            continue
+        name = op[2:]
+        if name == "mov_b32":
+            result = x
+        elif name == "movk_i32":
+            result = (x - 0x10000 if x & 0x8000 else x) & mask
+        elif name == "cselect_b32":
+            assert scc is not None
+            arms.append(scc)
+            result = x if scc else y
+        elif name in ("add_u32", "sub_u32"):
+            wide = x + y if name == "add_u32" else x - y
+            result, scc = wide & mask, not 0 <= wide <= mask
+        elif name in ("add_i32", "sub_i32"):
+            wide = signed(x) + signed(y) if name == "add_i32" else signed(x) - signed(y)
+            result, scc = wide & mask, not -2**31 <= wide < 2**31
+        elif name == "mul_i32":
+            result = (x * y) & mask
+        elif name in ("min_u32", "max_u32", "min_i32", "max_i32"):
+            key = signed if name.endswith("i32") else (lambda v: v)
+            scc = key(x) < key(y) if name.startswith("min") else key(x) > key(y)
+            result = x if scc else y
+        elif name == "not_b32":
+            result = ~x & mask
+            scc = result != 0
+        else:
+            result = {"and_b32": lambda: x & y, "or_b32": lambda: x | y, "xor_b32": lambda: x ^ y,
+                      "andn2_b32": lambda: x & ~y, "orn2_b32": lambda: x | ~y,
+                      "lshl_b32": lambda: x << (y & 31), "lshr_b32": lambda: x >> (y & 31),
+                      "ashr_i32": lambda: signed(x) >> (y & 31)}[name]() & mask
+            scc = result != 0
+        regs[args[0]] = result
+    channels = []
+    for n in range(12, 16):
+        value = struct.unpack("<f", struct.pack("<I", out[f"v{n}"]))[0]
+        assert 1 <= value < 2 and half_rtz(value) == value, value
+        channels.append(value)
+    return channels, arms
+
+
+def scalar_case(directory, words):
+    """Constant words 3 to 6 as raw 32-bit patterns, then the uniform color expected at every texel."""
+    case = bytearray(256)
+    struct.pack_into("<4I", case, 12, *words)
+    channels, _ = scalar_reference(scalar_body(), words)
+    case.extend(struct.pack("<4f", *channels) * 64)
+    path = directory / "scalar.case"
+    path.write_bytes(case)
+    return path
+
+
+# Mutations a draw must detect: signedness of a shift and of a comparison, and the sources of a subtraction.
+SCALAR_MUTATIONS = (("s_ashr_i32", "s_lshr_b32"), ("s_cmp_lt_i32", "s_cmp_lt_u32"),
+                    ("s_sub_u32 s62, s46, s47", "s_sub_u32 s62, s47, s46"))
+
+
+def scalar_detecting_words(old, new):
+    """The first constant set whose reference changes under the mutation."""
+    body = scalar_body()
+    changed = [line.replace(old, new) for line in body]
+    assert changed != body, old
+    return next(words for words in SCALAR_WORDS
+                if scalar_reference(changed, words)[0] != scalar_reference(body, words)[0])
+
+
+def check_scalar_controls():
+    body = scalar_body()
+    program = scalar()
+    source = translate(program)
+    for expected in ("= asuint(params[0].w) + asuint(params[1].x);", " < asuint(params[0].w)) ? 1u : 0u;",
+                     "= (asuint(params[1].y) < asuint(params[1].z)) ? 2u : 0u;",
+                     "= ((~(asuint(params[1].y) ^ asuint(params[1].x)) & (asuint(params[1].y) ^ salu",
+                     "= asuint(min(asint(asuint(params[0].w)), asint(asuint(params[1].x))));",
+                     "= (asint(asuint(params[1].x)) > asint(asuint(params[0].w))) ? 8192u : 0u;",
+                     "= (asint(asuint(params[1].z)) == asint(4294967295u)) ? 2097152u : 0u;",
+                     "= asuint(params[0].w) & ~asuint(params[1].x);", "= ~asuint(params[1].y);",
+                     "= asuint(asint(asuint(params[1].y)) >> (asuint(params[0].w) & 31u));",
+                     "= 4294967168u * 31u;", "? asuint(params[1].y) : asuint(params[1].z);",
+                     " | asuint(1.0f);", "= asfloat(salu"):
+        assert expected in source, expected
+    # Both arms of every flag select are drawn across the two constant sets.
+    flags = [scalar_reference(body, words)[1] for words in SCALAR_WORDS]
+    assert len(flags[0]) == len(SCALAR_STEPS) + 1
+    assert all(a != b for a, b in zip(flags[0][:-1], flags[1][:-1])), flags
+    for old, new in SCALAR_MUTATIONS:
+        scalar_detecting_words(old, new)
+    # SCC exists only after a tracked write; the exec-mask operations overwrite it.
+    base = assembly(False)
+    wqm = base.index("s_wqm_b64 exec, exec")
+    andexec = base.index("s_and_b64 exec, exec, s[50:51]")
+    translate(base[:andexec] + ["s_cmp_eq_u32 1, 1", "s_cselect_b32 s62, 1, 0"] + base[andexec:])
+    must_reject(translate, base[:andexec] + ["s_cselect_b32 s62, 1, 0"] + base[andexec:])
+    must_reject(translate, base[:andexec] + ["s_cmp_eq_u32 1, 1"] + base[andexec:andexec + 1]
+                + ["s_cselect_b32 s62, 1, 0"] + base[andexec + 1:])
+    must_reject(translate, base[:wqm] + ["s_cmp_eq_u32 1, 1"] + base[wqm:wqm + 1]
+                + ["s_cselect_b32 s62, 1, 0"] + base[wqm + 1:])
+    # A scalar result is not a known constant, so it cannot supply a sampler word or address.
+    for old, new in (("s_mov_b32 s40, 1", "s_add_u32 s40, 0, 1"), ("s_mov_b32 s21, 0", "s_and_b32 s21, 0, 0")):
+        must_reject(translate, [line.replace(old, new) for line in base])
+    # Neighbouring forms that the lowerer does not implement, operand kinds it cannot read, and
+    # destinations other than plain scalar registers.
+    first = "s_add_u32 s62, s44, s45"
+    for new in ("s_addc_u32 s62, s44, s45", "s_subb_u32 s62, s44, s45", "s_mul_hi_u32 s62, s44, s45",
+                "s_absdiff_i32 s62, s44, s45", "s_nand_b32 s62, s44, s45", "s_xnor_b32 s62, s44, s45",
+                "s_bfe_u32 s62, s44, s45", "s_lshl1_add_u32 s62, s44, s45", "s_abs_i32 s62, s44",
+                "s_brev_b32 s62, s44", "s_and_b64 s[62:63], s[44:45], s[46:47]",
+                "s_add_u32 s62, s[44:45], s45", "s_add_u32 s62, s44", "s_add_u32 s62, s44, s45, s46",
+                "s_add_u32 s62, -s44, s45", "s_add_u32 s62, s28, s45", "s_add_u32 s62, s20, s45",
+                "s_add_u32 s62, s90, s45", "s_add_u32 s62, vcc_lo, s45", "s_add_u32 s62, exec_lo, s45",
+                "s_add_u32 s62, v12, s45", "s_add_u32 m0, s44, s45", "s_add_u32 vcc_lo, s44, s45",
+                "s_add_u32 s62, s44, |s45|",
+                "s_cmp_eq_u64 s[44:45], s[46:47]", "s_bitcmp1_b32 s44, s45", "s_cmpk_eq_u32 s44, 0x10",
+                "s_cmp_lt_i32 s44", "s_cmp_lt_f32 s44, s45"):
+        changed = [line.replace(first, new) for line in program]
+        assert changed != program, new
+        must_reject(translate, changed)
+    flag = program.index(first) + 1
+    for new in ("s_cselect_b64 s[62:63], s44, s45", "s_cmovk_i32 s63, 0x1", "s_cselect_b32 s63, s28, 0",
+                "s_cselect_b32 vcc_lo, 1, 0"):
+        must_reject(translate, program[:flag] + [new] + program[flag + 1:])
+    # Before lgkmcnt(0) the constant words are still loading: neither read nor overwrite them.
+    load = program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc") + 1
+    for line in ("s_add_u32 s62, s44, 1", "s_add_u32 s45, 1, 1", "s_cmp_eq_u32 s46, 0",
+                 "s_cselect_b32 s47, 1, 0"):
+        must_reject(translate, program[:load] + ["s_cmp_eq_u32 1, 1", line] + program[load:])
+    translate(program[:load] + ["s_cmp_eq_u32 1, 1", "s_cselect_b32 s62, 1, 0"] + program[load:])
+
+
 def check_constant_descriptor_bounds() -> None:
     for offset in (0, 28, 32):
         program = [line.replace("s[20:21], 0x40", f"s[20:21], {offset:#x}")
@@ -483,6 +694,7 @@ def check_scalar_constant_reads() -> None:
 def check_controls(directory):
     check_constant_descriptor_bounds()
     check_scalar_constant_reads()
+    check_scalar_controls()
     archive = directory / "input.bin"
     code = bytes.fromhex("000080bf 000081bf")  # s_nop 0 followed by s_endpgm
     record = envelope(code)
@@ -618,6 +830,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((predicate_group(first), translate) for first in range(0, 16, 4))
     fixtures.extend((dual_program(case), translate_dual) for case in DUAL_CASES)
     fixtures.append((dual_program(swap_weights=True), translate_dual))
+    fixtures.append((scalar(), translate))
     for instructions, lower_fixture in fixtures:
         source = directory / "fixture.s"
         obj = directory / "fixture.o"
@@ -757,6 +970,18 @@ def check_render(directory, compiler, renderer, backend):
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Swapped blend weights escaped detection")
     check_fract_draw(directory, compiler, renderer, backend)
+    source.write_text(translate(scalar()), encoding="ascii")
+    subprocess.run([compiler, "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    for words in SCALAR_WORDS:
+        case = scalar_case(directory, words)
+        subprocess.run([renderer, backend, "--check-pixel-case", shader, case], check=True)
+    for old, new in SCALAR_MUTATIONS:
+        case = scalar_case(directory, scalar_detecting_words(old, new))
+        source.write_text(translate([line.replace(old, new) for line in scalar()]), encoding="ascii")
+        subprocess.run([compiler, "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        wrong = subprocess.run([renderer, backend, "--check-pixel-case", shader, case], capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Replacing {old} with {new} escaped detection")
     return 0
 
 
