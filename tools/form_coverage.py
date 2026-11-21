@@ -54,6 +54,7 @@ CPU_FIXTURES = {
     "exe_entry": "cpu_aot_exe_entry",
     "address_size": "cpu_aot_address_size",
     "call_pair": "cpu_aot_call_pair",
+    "vex_words": "cpu_aot_vex_words",
     "register_probe": None,  # measurement harness
     "two_imports": None,     # mapped and run unchanged by pe_map
     "exe_start": None,       # mapped and run unchanged by pe_map
