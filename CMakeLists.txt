@@ -17,7 +17,7 @@ add_test(NAME desktop_bvh_root_flags COMMAND d3d12_sdk_check bvh-flags)
 add_executable(era_heap_check tests/era_heap_check.cpp src/era_heap.cpp)
 target_include_directories(era_heap_check PRIVATE src)
 target_compile_features(era_heap_check PRIVATE cxx_std_20)
-foreach(scenario IN ITEMS allocation failure concurrency caller_layout reuse observed_words large_alignment)
+foreach(scenario IN ITEMS allocation failure concurrency caller_layout reuse observed_words large_alignment graphics_types)
     add_test(NAME era_heap_${scenario} COMMAND era_heap_check ${scenario})
 endforeach()
 
