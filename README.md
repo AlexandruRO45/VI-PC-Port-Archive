@@ -12,7 +12,7 @@ Xbox2Windows investigates **static recompilation of Xbox Series X|S (Scarlett) s
 | Shader translation | Supported pixel programs sample a texture, read constants and export color. D3D12 readback is checked against a CPU reference. [Translation and bindings](docs/experiments.md#offline-pixel-shader-recompilation) | Supply a source-built instruction case with known register inputs and an expected color. |
 | BC7 textures | A translated shader samples recovered mip levels on hardware and WARP. Requests for missing high-resolution levels use the first resident level. [Mip fallback tests](docs/experiments.md#drawing-bc7-textures-with-a-recompiled-pixel-shader) | Match a variable BCPack lane against independently known BC7 blocks. [Issue #15](https://github.com/R0Y00/Xbox2Windows/issues/15) |
 | Script states | A native x64 probe follows state-tree links and reproduces distinct camera limits for front and rear selections. The replay supplies the selection requests. [State replay](docs/experiments.md#state-linked-settings-in-a-script-archive) | Identify an event or caller that supplies a context and state ID, with a control input that takes a different branch. [Issue #19](https://github.com/R0Y00/Xbox2Windows/issues/19) |
-| Windows runtime and GPU | Source-built checks cover PE imports, heap operations, root signatures, compute and ray tracing. Four Radeon GPUs passed the native wave64 BVH test. [Hardware coverage](#hardware-coverage) · [Experiment notes](docs/experiments.md) | Run the standalone GPU check on an adapter missing from the table and share the report in [the hardware thread](https://github.com/R0Y00/Xbox2Windows/issues/1). |
+| Windows runtime and GPU | Source-built checks cover PE imports, heap operations, root signatures, compute and ray tracing. Five Radeon GPUs passed the native wave64 BVH test. [Hardware coverage](#hardware-coverage) · [Experiment notes](docs/experiments.md) | Share a run on a new adapter or a driver retest in [the hardware thread](https://github.com/R0Y00/Xbox2Windows/issues/1). |
 
 The public suite builds its own fixtures. A contributor can reproduce the checks below on a PC without a game installation. The standalone release packages the GPU check. To run the script, shader and texture development suite, build from source.
 
@@ -31,15 +31,17 @@ Review `gpu-report-hardware.md` and paste it in the [hardware coverage thread (#
 | Adapter or backend | Default native lanes | Forced wave64 | BVH differential | Evidence |
 |---|---:|---|---|---|
 | NVIDIA GeForce RTX 2060 | 32 | Skipped | 408 queries passed | [Maintainer baseline](docs/experiments.md#independent-bvh-checks-on-pc) |
+| NVIDIA GeForce RTX 3070 (driver 32.0.16.1088) | 32 | Skipped, lane range 32–32 | 408 queries passed | [RTX 3070 report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7063566753) |
 | NVIDIA GeForce RTX 4060 Laptop GPU | 32 | Skipped | 408 queries passed | [Second maintainer workstation](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7058907095) |
-| NVIDIA GeForce RTX 5070 (driver 32.0.16.1692) | 32 | Skipped, lane range 32–32 | 408 queries passed | [RTX 5070 report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7063361337) |
+| NVIDIA GeForce RTX 5070 | 32 on both drivers | Skipped on both, lane range 32–32 | 408 queries passed per run | [32.0.16.1692, debug layer unavailable](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7063361337) · [32.0.16.2135 retest, debug layer enabled](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7063626309) |
 | AMD Radeon RX 6600 (driver 32.0.21045.16010) | 32 | Passed, 64 lanes | 408 queries passed | [RX 6600 report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7063312495) |
 | AMD Radeon RX 6750 XT (driver 32.0.21045.29003) | 32 | Passed, 64 lanes | 408 queries passed | [RX 6750 XT report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7062253227) |
+| AMD Radeon RX 6800 XT (driver 32.0.21043.5001) | 32 | Passed, 64 lanes | 408 queries passed | [RX 6800 XT report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7063629409) |
 | AMD Radeon RX 9070 (driver 32.0.22042.14002) | 64 | Passed, 64 lanes | 408 queries passed | [RX 9070 report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7062384428) |
 | AMD Radeon RX 9070 XT (driver 32.0.32015.16001) | 64 | Passed, 64 lanes | 408 queries passed | [RX 9070 XT report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7063426420) |
 | Microsoft WARP (software) | 4 | Skipped | 408 queries passed | [Maintainer baseline](docs/experiments.md#independent-bvh-checks-on-pc) |
 
-The five community GPU reports used commit `def386a`. Each Radeon completed all 38 forced-wave64 groups with zero mismatches. The RX 9070 XT also ran all three checks with the D3D12 debug layer enabled and reported zero warnings and errors.
+The eight community reports cover seven GPU models at commit `def386a`. Each Radeon completed all 38 forced-wave64 groups with zero mismatches. The RX 9070 XT, RTX 3070 and RTX 5070 driver retest reported zero D3D12 debug warnings and errors in their passing checks.
 
 Maintainers link independent results to the original report and record the adapter, driver, commit and outcome. Names or handles are added on request. The hardware-report and independent-build milestones are complete. The remaining community milestone is a fix verified by the contributor who reported the problem.
 

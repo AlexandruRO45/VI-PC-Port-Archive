@@ -10,7 +10,9 @@ You can contribute a hardware result, a source-built failing case, a documentati
 
 ## Build and test
 
-Hardware reporters can use the [standalone package](tools/gpu-check/README.md). Paste the generated Markdown into issue #1. For a first-build report, use a clean checkout and post the three smoke-test outcomes to issue #2. Maintainers verify each incoming result, link the source report in the README coverage table, and record repeated runs on the same adapter as follow-ups. Link a feedback-driven fix to its report and ask the reporter to verify the change.
+Hardware reporters can use the [standalone package](tools/gpu-check/README.md). Paste the generated Markdown into the [ongoing hardware thread](https://github.com/R0Y00/Xbox2Windows/issues/1). Maintainers verify each incoming result, link the source report in the README coverage table, and record repeated runs on the same adapter as follow-ups.
+
+The [first independent clean build](https://github.com/R0Y00/Xbox2Windows/issues/2#issuecomment-7063351821) records the toolchain and three smoke-test outcomes. If a clean build fails on your machine, open a [build bug report](https://github.com/R0Y00/Xbox2Windows/issues/new?template=bug_report.md) with the commit, toolchain, first failing command and diagnostic. Link a feedback-driven fix to its report and ask the reporter to verify the change.
 
 Start with the [first build](README.md#first-build). Create the Python environment before configuring to include the script-path host and Python-driven script, texture, shader and PE checks. List the tests registered in your environment with `ctest --preset dev -N`, then run the closest group from the [experiment table](README.md#choose-an-experiment). Use `--no-tests=error` when checking a new filter so an empty selection fails.
 
