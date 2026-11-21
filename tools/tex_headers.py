@@ -18,7 +18,10 @@ import struct
 import sys
 from collections import Counter
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:  # only scan_archive needs it; the header and mipmap helpers are standard library
+    np = None
 
 DXGI = {
     2: "R32G32B32A32_FLOAT", 3: "R32G32B32A32_UINT", 4: "R32G32B32A32_SINT",
@@ -266,6 +269,8 @@ def parse_dds_header(data):
 
 
 def scan_archive(carve, arch):
+    if np is None:
+        raise SystemExit("scan_archive requires numpy (pip install numpy)")
     with open(os.path.join(carve, arch, "index.json"), encoding="utf-8") as f:
         files = sorted(json.load(f)["files"], key=lambda r: r["off"])
     out = []
