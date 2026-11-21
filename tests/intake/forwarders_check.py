@@ -119,6 +119,25 @@ def check(root, caller, forward, provider):
 
     check_descriptor_names(root, caller, report, entry)
 
+    # The loader maps a KnownDLL from System32 before it searches the application directory, so a
+    # package file named kernel32.dll is never loaded. Its exports must not decide KERNEL32 imports.
+    shadow = root / "kernel32.dll"
+    shutil.copyfile(provider, shadow)
+    shadowed = scan(root)
+    shadow.unlink()
+    assert "kernel32.dll" in shadowed["known_dlls"] and "kernel32.dll" in shadowed["images"]
+    system = [r for r in shadowed["imports"] if r["image"] == entry and r["dll"] == "kernel32.dll"]
+    assert system and all(r["bundle_exports_in"] == [] for r in system)
+    for r in system:
+        assert r["package_resolution"]["status"] == r["desktop_resolution"]["status"] == "export_present"
+        first = r["package_resolution"]["chain"][0]
+        assert (first["provider"], first["package"], first["known_dll"]) == ("kernel32.dll", False, True)
+        assert [(s["provider"], s["symbol"], s["package"]) for s in r["package_resolution"]["chain"]] == [
+            (s["provider"], s["symbol"], False) for s in r["desktop_resolution"]["chain"]]
+    shadowed_paths = trace(shadowed, entry)
+    assert "kernel32.dll" in shadowed_paths["unlinked_in_this_graph"]
+    assert not any(f["dll"] == "kernel32.dll" for f in shadowed_paths["findings"])
+
     # Older inventories lack package chains and keep the first-hop bundled result.
     for row in report["imports"]:
         del row["package_resolution"]

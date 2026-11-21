@@ -39,6 +39,9 @@ def trace(report, entry):
                           "LoadLibraryExA", "LoadLibraryExW"}:
                 lookups.append(dict(image=image, symbol=symbol, kind=kind))
             package = row.get("package_resolution")
+            if package and package["chain"][0].get("known_dll"):
+                # The loader maps a known DLL from System32, so a package copy with that name is not loaded.
+                providers = []
             if len(providers) == 1:
                 targets.add((kind, providers[0]))
                 if providers[0] in row["bundle_exports_in"]:
