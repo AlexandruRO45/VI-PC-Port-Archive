@@ -224,6 +224,18 @@ struct DeviceState {
     }
 };
 
+// The Vulkan format for a texture this layer can create, with the D24 fallback; VK_FORMAT_UNDEFINED, after a log
+// line, when it cannot. Committed and placed textures share it so both refuse the same formats for the same reason.
+Format texture_format(const DeviceState& device, const D3D12_RESOURCE_DESC& desc) {
+    Format format = vulkan_format(desc.Format, desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    if (format.format == VK_FORMAT_D24_UNORM_S8_UINT && !device.depth_usable(format.format)) {
+        log_once("D24_UNORM_S8_UINT unavailable, using D32_SFLOAT_S8_UINT; format", desc.Format);
+        format.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+    }
+    if (format.format == VK_FORMAT_UNDEFINED) log_once("texture format not supported yet:", desc.Format);
+    return format;
+}
+
 class DescriptorHeap final
     : public Child<DescriptorHeap, ID3D12DescriptorHeapStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
                    ID3D12DescriptorHeap> {
@@ -279,6 +291,12 @@ public:
     Resource(DeviceState& device, const D3D12_RESOURCE_DESC& desc, const D3D12_HEAP_PROPERTIES& heap,
              D3D12_HEAP_FLAGS heap_flags)
         : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags) {}
+
+    // A placed resource lives inside a heap's arena range: the heap owns the range, so only the console VA is kept
+    // here and nothing goes back to the arena when this object dies.
+    Resource(DeviceState& device, const D3D12_RESOURCE_DESC& desc, const D3D12_HEAP_PROPERTIES& heap,
+             D3D12_HEAP_FLAGS heap_flags, VkDeviceSize placed_va)
+        : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags), va_(placed_va) {}
 
     ~Resource() override {
         auto& vk = device_.context->vk;
@@ -348,6 +366,20 @@ public:
         }
         binding.buffer = buffer_;
         binding.va = va_;
+        device_.context->add_resource(id(), binding);
+        return S_OK;
+    }
+
+    // A placed buffer is a range of the heap's arena memory: it has no VkBuffer of its own and its console VA is
+    // where it sits in the arena. The arena is host-visible, so an upload or readback place maps that same range.
+    HRESULT create_placed_buffer() {
+        if (!device_.arena.mapped) return E_OUTOFMEMORY;
+        if (cpu_visible()) mapped_ = device_.arena.mapped + va_;
+        std::memset(device_.arena.mapped + va_, 0, std::size_t(desc_.Width));  // a fresh place reads as zeroed
+        leonida::ResourceBinding binding{};
+        binding.size = desc_.Width;
+        binding.buffer = device_.arena.buffer;
+        binding.buffer_offset = va_;
         device_.context->add_resource(id(), binding);
         return S_OK;
     }
@@ -567,6 +599,38 @@ bool equal_semantic(const std::string& a, const char* b) {
         if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i]))) return false;
     return true;
 }
+// A heap (section 3.3): a range of the GPU address arena, as large as the game asked for, so a placed buffer can
+// name any 64 KiB-aligned offset in it. Textures placed in it still get their own VkDeviceMemory; the offset is only
+// their key, which keeps optimal-tiling images out of the arena's memory type.
+class Heap final
+    : public Child<Heap, ID3D12HeapStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12Heap> {
+public:
+    // {5d20c7a4-8e13-4b6d-9f27-3a1c94e0b7d8}
+    static constexpr GUID kTag{0x5d20c7a4, 0x8e13, 0x4b6d, {0x9f, 0x27, 0x3a, 0x1c, 0x94, 0xe0, 0xb7, 0xd8}};
+
+    Heap(DeviceState& device, const D3D12_HEAP_DESC& desc) : device_(device), desc_(desc) {
+        reserved_ = device_.arena.mapped &&
+                    device_.arena_allocate(desc_.SizeInBytes, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, offset_);
+    }
+
+    ~Heap() override {
+        if (reserved_) device_.arena_release(offset_, desc_.SizeInBytes);
+    }
+
+    D3D12_HEAP_DESC STDMETHODCALLTYPE GetDesc() override { return desc_; }
+
+    bool reserved() const { return reserved_; }
+    VkDeviceSize offset() const { return offset_; }
+    UINT64 bytes() const { return desc_.SizeInBytes; }
+    const D3D12_HEAP_PROPERTIES& properties() const { return desc_.Properties; }
+    D3D12_HEAP_FLAGS flags() const { return desc_.Flags; }
+
+private:
+    DeviceState& device_;
+    D3D12_HEAP_DESC desc_;
+    VkDeviceSize offset_ = 0;
+    bool reserved_ = false;
+};
 
 class RootSignature final
     : public Child<RootSignature, ID3D12RootSignatureStubs, ID3D12Object, ID3D12DeviceChild, ID3D12RootSignature> {
@@ -1295,13 +1359,8 @@ public:
                                                     D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)))) {
             hr = E_INVALIDARG;  // D3D12: a multisampled texture is a single-mip 2D render target or depth-stencil
         } else {
-            Format format = vulkan_format(desc->Format, desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
-            if (format.format == VK_FORMAT_D24_UNORM_S8_UINT && !state_.depth_usable(format.format)) {
-                log_once("D24_UNORM_S8_UINT unavailable, using D32_SFLOAT_S8_UINT; format", desc->Format);
-                format.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
-            }
+            const Format format = texture_format(state_, *desc);
             if (format.format == VK_FORMAT_UNDEFINED) {
-                log_once("texture format not supported yet:", desc->Format);
                 hr = E_INVALIDARG;
             } else {
                 hr = resource->create_texture(format);
@@ -1312,6 +1371,75 @@ public:
             return hr;
         }
         if (!out) {  // a capability check: D3D12 allows a null output
+            resource->Release();
+            return S_FALSE;
+        }
+        return hand_out(resource, riid, out);
+    }
+
+    // Heaps and placed resources (section 3.3). A heap reserves its size in the arena, so a buffer placed at a
+    // 64 KiB-aligned offset is simply that offset into the arena, and its console VA is the heap's place plus it.
+    HRESULT STDMETHODCALLTYPE CreateHeap(const D3D12_HEAP_DESC* desc, REFIID riid, void** out) override {
+        if (out) *out = nullptr;
+        if (!desc || !desc->SizeInBytes) return E_INVALIDARG;
+        if (!state_.arena.mapped) {
+            log_once("heaps need the GPU address arena (bufferDeviceAddress); heap size in KiB:",
+                     int(desc->SizeInBytes / 1024));
+            return E_NOTIMPL;
+        }
+        auto* heap = new Heap(state_, *desc);
+        heap->attach_device(identity());
+        if (!heap->reserved()) {
+            log_once("GPU address arena full (raise LEONIDA_ARENA_MB); heap size in KiB:", int(desc->SizeInBytes / 1024));
+            heap->Release();
+            return E_OUTOFMEMORY;
+        }
+        if (!out) {
+            heap->Release();
+            return S_FALSE;
+        }
+        return hand_out(heap, riid, out);
+    }
+
+    HRESULT STDMETHODCALLTYPE CreatePlacedResource(ID3D12Heap* heap_interface, UINT64 heap_offset,
+                                                   const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES,
+                                                   const D3D12_CLEAR_VALUE*, REFIID riid, void** out) override {
+        if (out) *out = nullptr;
+        auto* heap = Heap::from<Heap>(heap_interface);
+        if (!heap || !desc) return E_INVALIDARG;
+        if (heap_offset % D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {
+            log_once("placed resource offset not 64 KiB aligned:", int(heap_offset));
+            return E_INVALIDARG;
+        }
+        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            if (heap_offset + desc->Width > heap->bytes()) return E_INVALIDARG;
+        } else if (heap_offset >= heap->bytes()) {
+            return E_INVALIDARG;
+        }
+        if (desc->Layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE) {
+            log_once("tiled placed resource not supported yet; dimension", int(desc->Dimension));
+            return E_NOTIMPL;
+        }
+        // Only buffers are addressable, as in D3D12: a placed texture keeps a null VA and its own Vulkan image.
+        const VkDeviceSize placed_va = desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? heap->offset() + heap_offset : 0;
+        auto* resource = new Resource(state_, *desc, heap->properties(), heap->flags(), placed_va);
+        resource->attach_device(identity());
+        HRESULT hr = E_NOTIMPL;
+        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            hr = resource->create_placed_buffer();
+        } else if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+            log_once("placed resource dimension not supported:", int(desc->Dimension));
+        } else if (desc->SampleDesc.Count > 1) {
+            log_once("multisampled placed resource not supported; samples", int(desc->SampleDesc.Count));
+        } else {
+            const Format format = texture_format(state_, *desc);
+            hr = format.format == VK_FORMAT_UNDEFINED ? E_INVALIDARG : resource->create_texture(format);
+        }
+        if (FAILED(hr)) {
+            resource->Release();
+            return hr;
+        }
+        if (!out) {
             resource->Release();
             return S_FALSE;
         }

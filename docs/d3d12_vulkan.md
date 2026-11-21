@@ -308,7 +308,7 @@ translated shader that declares bindings; tessellation, geometry and mesh pipeli
 viewports, primitive restart; `requiredSubgroupSize = 64` for wave64 compute; the game's present entry point (DXGI
 factory/swapchain or `PresentX`; the presenter above is what
 either calls), HDR and fullscreen; shader-resource, UAV and constant-buffer views, samplers, volume attachment
-views, placed and reserved resources, depth-stencil resolves and `ResolveSubresourceRegion`, and 1D textures;
+views, reserved resources, depth-stencil resolves and `ResolveSubresourceRegion`, and 1D textures;
 default-heap buffers are not zero-filled yet; a fence cannot be signalled to a lower value (Vulkan timelines only
 increase; such a signal is reported and dropped); enhanced-barrier access bits are not filtered against the
 sync scope, so a combination D3D12 accepts but Vulkan does not would show up as a validation error; the GCL8
@@ -407,6 +407,7 @@ The layer therefore owns the console VAs. It returns them from `ID3D12Resource::
 | Address space | Two ranges. A **BDA arena** holds buffers, descriptor heaps and shader code; its device address is `heap_base`. A separate **image key range** supplies unique console VAs for images; those keys are never added to `heap_base`. The arena's `VkBuffer` is created with all buffer usages the game can bind (uniform, storage, vertex, index, indirect, transfer) plus `SHADER_DEVICE_ADDRESS`, and its memory with `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT`. |
 | Buffers | A buffer resource is a range in the arena's single `VkBuffer`: offset = its console VA, size = the resource size. Buffer commands bind the arena buffer with that offset, so its device address is exactly `arena_bda + offset`; no per-resource `VkBuffer` object is needed. |
 | Images | Each image gets a unique console VA key and lives in its own `VkDeviceMemory` (or a suballocated device-local image heap) with optimal tiling. Shader image access goes through the T#/hash table, so nothing dereferences the key. Keeping images out of the arena avoids forcing optimal-tiled images into the arena's memory type and keeps the arena sized by buffers, not textures. |
+| Heaps and placed resources | `CreateHeap` reserves the requested size in the arena, so a buffer placed at a 64 KiB-aligned offset is that offset into the arena and its console VA is the heap's place plus the offset. A placed texture gets its own `VkDeviceMemory` and a null VA, as in D3D12. Tiled (`64KB_UNDEFINED_SWIZZLE`) placements are refused with `E_NOTIMPL`; reserved resources are not implemented. |
 | Descriptor heaps | Shader-visible CBV/SRV/UAV and sampler heaps are allocated in the low 4 GB of the arena. RTV/DSV heaps are host-side only. |
 | Shader code | Each FSSM blob is uploaded to the arena; its console VA is the code base. |
 | Upload/readback | `D3D12_HEAP_TYPE_UPLOAD`/`READBACK` resources are separate host-visible buffers outside the arena. Their console VAs are only used by copy APIs; if the game binds one as a vertex/index buffer or reads it in a shader, the layer biases the view/descriptor by `-heap_base` so the shader's addition lands on the host BDA (**Assumption**, to verify). |
