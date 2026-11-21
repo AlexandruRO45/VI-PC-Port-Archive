@@ -482,6 +482,18 @@ For each candidate the tool records SHA-256, architecture, entry RVA and section
 
 `pe.startup.locations` lists TLS callbacks in table order followed by the executable entry. Each location includes its RVA, section and file offset. When the x64 exception directory supplies a covering function interval, the report includes its inclusive start, exclusive end and unwind data RVA. A location can legitimately lack a covering record. An absent or unusable table leaves the independently observed startup locations available. In the local debug fixture the table had 110 records, one covering its TLS callback. The entry had no covering record. CTest cross-checks against pefile and exercises both absent and incomplete directories. [Microsoft x64 unwind data](https://learn.microsoft.com/en-us/cpp/build/exception-handling-x64)
 
+### Bink allocation and release on the Windows heap
+
+The local test lowers the two default-allocator callers from x64 machine code to C++, links the result to a Windows process-heap adapter, and runs the new DLL. The translator resolves the named PE imports, including tail transfers through linker thunks. It specializes the callback slots to their initial null values. Custom Bink allocators and the console-specific meaning of the heap attributes remain open.
+
+On Windows, the public native fixture, its translation and the locally translated callers passed the same checks:
+
+- Lengths 0 and `0xffffffff` returned null before reaching the allocator. Three forced allocation failures returned null after one request each. The largest input, `0x100000001`, verified 64-bit size handling without a large allocation.
+- Each accepted length requested 64 extra bytes with attributes `0x05e50000`. Returning heap-backed storage at each of the 32 possible base residues produced a 32-byte-aligned user pointer. The check wrote the entire payload and compared both header bytes and the surrounding guards.
+- With 32 allocations live, releasing them in reverse order passed each original base to the adapter once with the allocation attributes. All 32 backing blocks were freed by `HeapFree`. Releasing null made no allocator call.
+
+For the public control, build `cpu_bink_heap_lifted` in the dev preset, then run `ctest --preset dev -R '^cpu_aot_bink_heap$' --no-tests=error -V`. For a local package, set the CMake cache entries `BINK_HEAP_IMAGE` to the DLL path and `BINK_HEAP_ENTRIES` to the semicolon-separated allocation and release function **entry** RVAs for that image. Build `cpu_bink_package_lifted` and run `cpu_aot_bink_package_heap`. Generated translations stay in the build directory.
+
 ## Six API call sites
 
 After loading the toolchain, inspect three local DLLs. `out/calls/six-apis.json` records image SHA-256, import slots, callers of thunks, embedded container sections and code references. Addresses below are RVAs in the relevant DLL. Indirect calls need execution evidence to identify the selected path.

@@ -303,6 +303,36 @@ if(EXISTS "${INTAKE_PYTHON}")
     cpu_asm_fixture(cpu_callback callback)
     cpu_asm_fixture(cpu_version_query version_query)
     cpu_asm_fixture(cpu_heap_layout heap_layout)
+    cpu_asm_fixture(cpu_bink_heap bink_heap)
+    add_library(cpu_bink_heap_provider SHARED tests/cpu/bink_heap_provider.cpp)
+    target_link_libraries(cpu_bink_heap PRIVATE cpu_bink_heap_provider)
+    function(bink_heap_translation target image dependency)
+        set(cpp "${CMAKE_CURRENT_BINARY_DIR}/${target}.cpp")
+        add_custom_command(OUTPUT "${cpp}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/bink_heap_aot.py"
+                "${image}" "${cpp}" ${ARGN}
+            DEPENDS ${dependency} tools/bink_heap_aot.py tools/ffx_version_query.py
+                tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+        add_library(${target} SHARED "${cpp}")
+        target_link_libraries(${target} PRIVATE cpu_bink_heap_provider)
+    endfunction()
+    bink_heap_translation(cpu_bink_heap_lifted "$<TARGET_FILE:cpu_bink_heap>" cpu_bink_heap)
+    add_test(NAME cpu_aot_bink_heap COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/bink_heap_check.py" "$<TARGET_FILE:cpu_bink_heap_provider>"
+        "$<TARGET_FILE:cpu_bink_heap>" "$<TARGET_FILE:cpu_bink_heap_lifted>")
+    set(BINK_HEAP_IMAGE "" CACHE FILEPATH "Local PE containing the Bink allocation and release callers")
+    set(BINK_HEAP_ENTRIES "" CACHE STRING "Two semicolon-separated entry RVAs (allocation;release)")
+    if(BINK_HEAP_IMAGE)
+        list(LENGTH BINK_HEAP_ENTRIES entry_count)
+        if(NOT entry_count EQUAL 2)
+            message(FATAL_ERROR "Provide both BINK_HEAP_ENTRIES for the selected local image")
+        endif()
+        bink_heap_translation(cpu_bink_package_lifted "${BINK_HEAP_IMAGE}" "${BINK_HEAP_IMAGE}"
+            --entries ${BINK_HEAP_ENTRIES})
+        add_test(NAME cpu_aot_bink_package_heap COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/cpu/bink_heap_check.py" "$<TARGET_FILE:cpu_bink_heap_provider>"
+            "$<TARGET_FILE:cpu_bink_package_lifted>")
+    endif()
     set(heap_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_heap_layout_lifted.cpp")
     add_custom_command(OUTPUT "${heap_fixture}"
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/heap_layout.py"

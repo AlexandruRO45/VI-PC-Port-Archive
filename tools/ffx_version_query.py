@@ -44,7 +44,7 @@ def region(pe, start, end):
     return ins
 
 
-def lower(body, initial, globals_, calls, exits):
+def lower(body, initial, globals_, calls, exits, *, host_ops=None):
     """Emit only query integer operations. All external edges and calls need named bindings."""
     lines = ["word frame[16]{};", "word " + ", ".join(r + "=0" for r in REGS.values()) + ";",
              "bool zero=false, carry=false;", "rsp = reinterpret_cast<word>(frame);", *initial]
@@ -95,7 +95,9 @@ def lower(body, initial, globals_, calls, exits):
                 value = f"({reg(dest)} & ~{(1 << (8*size))-1}ull) | {value}"
             return f"{reg(dest)} = {value};"
 
-        if op in (M.JE, M.JNE, M.JAE, M.JA, M.JB, M.JBE, M.JMP):
+        if host_ops and i.ip in host_ops:
+            stmt = host_ops[i.ip]
+        elif op in (M.JE, M.JNE, M.JAE, M.JA, M.JB, M.JBE, M.JMP):
             target = i.near_branch_target
             if target not in allowed:
                 raise ValueError(f"unbound branch at {i.ip:#x}")

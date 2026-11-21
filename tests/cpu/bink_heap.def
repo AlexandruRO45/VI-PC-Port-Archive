@@ -1,0 +1,3 @@
+EXPORTS
+    heap_request
+    heap_release

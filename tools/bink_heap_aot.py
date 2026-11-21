@@ -1,0 +1,153 @@
+"""Lower two x64 heap callers, specializing writable callback slots to their initial null value."""
+import argparse
+from pathlib import Path
+
+import pefile
+from iced_x86 import Decoder, Mnemonic as M, OpKind as K, Register as R
+
+from cpu_leaf_aot import export_rva
+from cpu_ranges import function_ranges, image_bytes
+from ffx_version_query import INTEGER_HEADER, lower, region
+
+
+def import_name(pe, ins, slots):
+    if ins.mnemonic not in (M.CALL, M.JMP):
+        return None
+    if ins.op0_kind == K.NEAR_BRANCH64:
+        target = ins.near_branch_target
+        # A rel32 call or tail jump can target the linker-generated IAT thunk.
+        code = pe.get_data(target, 6)
+        thunk = Decoder(64, code, ip=target).decode()
+        if thunk.mnemonic != M.JMP or not thunk.is_ip_rel_memory_operand:
+            return None
+        image_bytes(pe, target, thunk.len, executable=True)
+        ins = thunk
+    if ins.is_ip_rel_memory_operand:
+        return slots.get(ins.ip_rel_memory_address)
+    return None
+
+
+def release_body(pe, start, slots):
+    # A tail-calling leaf may have no .pdata. Stop at its last reachable
+    # return/tail, including forward skip and null-pointer branches.
+    section = pe.get_section_by_rva(start)
+    if not section:
+        raise ValueError("release entry outside image")
+    available = min(section.SizeOfRawData, section.Misc_VirtualSize) - (start - section.VirtualAddress)
+    code = image_bytes(pe, start, min(512, available), executable=True)
+    body = []
+    furthest = start
+    for ins in Decoder(64, code, ip=start):
+        if ins.is_invalid:
+            break
+        body.append(ins)
+        imported = import_name(pe, ins, slots)
+        if ins.op0_kind == K.NEAR_BRANCH64 and ins.mnemonic != M.CALL and not imported:
+            furthest = max(furthest, ins.near_branch_target)
+        if ins.ip >= furthest and ins.mnemonic in (M.RET, M.JMP):
+            return body
+    raise ValueError("unbounded or invalid release leaf")
+
+
+def null_global(pe, rva):
+    section = pe.get_section_by_rva(rva)
+    if not section or not section.Characteristics & 0x80000000:
+        raise ValueError("expected a writable callback slot")
+    offset = rva - section.VirtualAddress
+    if offset + 8 > section.Misc_VirtualSize:
+        raise ValueError("truncated callback slot")
+    backed = min(8, max(0, section.SizeOfRawData - offset))
+    if backed and any(image_bytes(pe, rva, backed)):
+        raise ValueError("expected a null initial callback")
+    return "reinterpret_cast<word>(&null_callback)"
+
+
+def translate(pe, start, allocate, module):
+    pe.parse_data_directories(directories=[1])
+    slots = {imp.address - pe.OPTIONAL_HEADER.ImageBase: imp.name
+             for desc in pe.DIRECTORY_ENTRY_IMPORT if desc.dll.lower() == module
+             for imp in desc.imports}
+    if allocate:
+        (bounds,) = function_ranges(pe, start)
+        body = region(pe, *bounds)
+    else:
+        body = release_body(pe, start, slots)
+    expected = b"XMemAlloc" if allocate else b"XMemFree"
+    globals_, host_ops = {}, {}
+    bound = 0
+    for ins in body:
+        op = ins.mnemonic
+        name = import_name(pe, ins, slots)
+        if name:
+            if name != expected:
+                raise ValueError("unexpected heap import")
+            if allocate and op == M.CALL:
+                statement = "rax = reinterpret_cast<word>(XMemAlloc(rcx, rdx));"
+            elif not allocate and op in (M.CALL, M.JMP):
+                statement = "XMemFree(reinterpret_cast<void*>(rcx), rdx);"
+                if op == M.JMP:
+                    statement += " return 0;"
+            else:
+                raise ValueError("unsupported heap transfer")
+            host_ops[ins.ip] = statement
+            bound += 1
+        elif ins.is_ip_rel_memory_operand:
+            if op != M.MOV or ins.op1_kind != K.MEMORY or ins.op0_register != R.RAX:
+                raise ValueError("unsupported access to image data")
+            rva = ins.ip_rel_memory_address
+            globals_[rva] = null_global(pe, rva)
+        elif op in (M.PUSH, M.POP) and ins.op0_register == R.RBX:
+            host_ops[ins.ip] = ("rsp -= 8; store<word>(rsp, rbx);" if op == M.PUSH
+                                else "rbx = load<word>(rsp); rsp += 8;")
+        elif ((op == M.CALL and ins.op0_register == R.RAX)
+              or (op == M.JMP and ins.op0_kind == K.MEMORY)):
+            # Private allocator callbacks are never installed in this replay.
+            host_ops[ins.ip] = "std::abort();"
+    if bound != 1:
+        raise ValueError(f"expected exactly one {expected.decode()} transfer")
+    return lower(body, ["rsp = reinterpret_cast<word>(frame + 12);", "rcx = argument;"],
+                 globals_, {}, {}, host_ops=host_ops)
+
+
+def generate(image, entries):
+    with pefile.PE(str(image), fast_load=True) as pe:
+        if pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20b:
+            raise ValueError("expected AMD64 PE32+")
+        if entries:
+            alloc, free = entries
+            module = b"xmem.dll"
+        else:
+            alloc, free = (export_rva(pe, n) for n in ("heap_request", "heap_release"))
+            module = b"cpu_bink_heap_provider.dll"
+        request = translate(pe, alloc, True, module)
+        release = translate(pe, free, False, module)
+    return INTEGER_HEADER + """
+#include <cstdlib>
+extern "C" __declspec(dllimport) void* XMemAlloc(word, word);
+extern "C" __declspec(dllimport) void XMemFree(void*, word);
+static constexpr word null_callback = 0;
+static word request(word argument) {
+""" + request + """
+}
+static word release(word argument) {
+""" + release + """
+}
+extern "C" __declspec(dllexport) void* heap_request(word bytes) {
+    return reinterpret_cast<void*>(request(bytes));
+}
+extern "C" __declspec(dllexport) void heap_release(void* pointer) {
+    release(reinterpret_cast<word>(pointer));
+}
+"""
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("image", type=Path)
+    parser.add_argument("output", type=Path)
+    parser.add_argument("--entries", nargs=2, type=lambda value: int(value, 0),
+                        metavar=("ALLOC_RVA", "FREE_RVA"))
+    args = parser.parse_args()
+    if args.output.suffix.lower() != ".cpp" or args.output.resolve() == args.image.resolve():
+        parser.error("choose a distinct .cpp output")
+    args.output.write_text(generate(args.image, args.entries), encoding="ascii")
