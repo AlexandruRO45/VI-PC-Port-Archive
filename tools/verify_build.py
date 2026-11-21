@@ -113,24 +113,52 @@ def verify_pieces(root, entries, sizes, piece_length, hashes):
     return {"piece_bytes": piece_length, "total": count, "matched": count - len(issues), "issues": issues}
 
 
-def read_layout(path):
-    chunks = ET.parse(path).getroot().findall("Chunk")
-    targets = {}
-    for chunk in chunks:
+def read_layout_chunks(path):
+    """Return each layout chunk with its marker and destination files."""
+    chunks = []
+    for chunk in ET.parse(path).getroot().findall("Chunk"):
+        files = []
         for group in chunk.findall("FileGroup"):
             directory = group.attrib["DestinationPath"].replace("\\", "/").strip("/")
-            name = "/".join(filter(None, [directory, group.attrib["Include"]]))
-            targets.setdefault(name, []).append(chunk.attrib["Id"])
-    return {chunk.attrib["Id"]: chunk.get("Marker") for chunk in chunks}, targets
+            files.append("/".join(filter(None, [directory, group.attrib["Include"]])))
+        chunks.append({"id": chunk.attrib["Id"], "marker": chunk.get("Marker"), "files": files})
+    return chunks
+
+
+def layout_targets(chunks):
+    targets = {}
+    for chunk in chunks:
+        for name in chunk["files"]:
+            targets.setdefault(name, []).append(chunk["id"])
+    return targets
+
+
+def read_layout(path):
+    chunks = read_layout_chunks(path)
+    return {chunk["id"]: chunk["marker"] for chunk in chunks}, layout_targets(chunks)
 
 
 def compare_layout(path, payload, disk):
-    chunks, targets = read_layout(path)
+    chunks = read_layout_chunks(path)
+    targets = layout_targets(chunks)
+    absent_from_torrent = {p: targets[p] for p in sorted(targets.keys() - payload)}
+    absent_from_disk = {p: targets[p] for p in sorted(targets.keys() - disk)}
+    summary = []
+    for chunk in chunks:
+        summary.append({
+            "id": chunk["id"],
+            "marker": chunk["marker"],
+            "files": len(chunk["files"]),
+            "absent_from_torrent": [name for name in chunk["files"] if name in absent_from_torrent],
+            "absent_from_disk": [name for name in chunk["files"] if name in absent_from_disk],
+        })
     return {
         "source": path.name, "chunks": len(chunks), "target_count": len(targets),
-        "absent_from_torrent": {p: targets[p] for p in sorted(targets.keys() - payload)},
-        "absent_from_disk": {p: targets[p] for p in sorted(targets.keys() - disk)},
+        "absent_from_torrent": absent_from_torrent,
+        "absent_from_disk": absent_from_disk,
         "torrent_paths_outside_layout": sorted(payload - targets.keys()),
+        "chunk_summary": summary,
+        "launch_marker": next((chunk["id"] for chunk in summary if chunk["marker"] == "Launch"), None),
     }
 
 

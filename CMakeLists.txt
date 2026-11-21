@@ -392,4 +392,6 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME static_exe_intake COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/intake/check.py" "$<TARGET_FILE:intake_candidate>"
         "$<TARGET_FILE:intake_provider>")
+    add_test(NAME layout_chunk_summary COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/layout_chunks_check.py")
 endif()
