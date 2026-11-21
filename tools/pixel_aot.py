@@ -355,6 +355,8 @@ def fp_operand(token, scalar, vector, pending, sample_pending):
 # LLVM's SIPeepholeSDWA, UNUSED_PAD zeroes the other bits and UNUSED_PRESERVE keeps them from the destination.
 SDWA_SEL = {"BYTE_0": (0, 8), "BYTE_1": (8, 8), "BYTE_2": (16, 8), "BYTE_3": (24, 8),
             "WORD_0": (0, 16), "WORD_1": (16, 16), "DWORD": (0, 32)}
+# Exact arithmetic with SDWA forms on gfx1013 (docs/coverage/gfx1013.tsv).
+SDWA_ALU = ("add", "sub", "subrev", "mul", "mul_legacy", "max", "min", "floor", "ceil", "fract", "trunc")
 
 
 def sdwa_source(word, sel, sext):
@@ -630,6 +632,26 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"(-{expression})"
             if clamp:
                 expression = f"saturate({expression})"
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(rf"v_({'|'.join(SDWA_ALU)})_f32_sdwa (v\d+), (.+?)( clamp)? dst_sel:(BYTE_[0-3]|WORD_[01]|DWORD) dst_unused:(UNUSED_PAD|UNUSED_SEXT|UNUSED_PRESERVE) src0_sel:DWORD( src1_sel:DWORD)?"):
+            # SDWA forms of exact arithmetic take whole-dword sources, so the binary32 denormal mode never applies
+            # to a zero-extended field; the result is placed like an SDWA move.
+            op, dst, operands, clamp, dst_sel, unused, src1_sel = m.groups()
+            tokens = operands.split(", ")
+            arity, template = ALU[op]
+            if mask != "entry" or len(tokens) != arity or bool(src1_sel) != (arity == 2):
+                raise ValueError("Invalid arithmetic operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            old = vector.get(dst)
+            if old is not None and not isinstance(old, str):
+                raise ValueError("Unsupported arithmetic destination")
+            expression = template.format(*[fp_operand(t, scalar, vector, pending, sample_pending) for t in tokens])
+            if clamp:
+                expression = f"saturate({expression})"
+            if dst_sel != "DWORD":
+                expression = f"asfloat({sdwa_dest(f'asuint({expression})', dst_sel, unused, old)})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
         elif m := match(r"v_mov_b32(?:_e32|_e64)? (v\d+), (-?\d+(?:\.\d+)?|0x[0-9a-f]{1,8}|[vs]\d+)"):
