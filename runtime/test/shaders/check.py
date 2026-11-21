@@ -137,6 +137,8 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             ("cs_wm_as_data", [0xfafafafa, 0xfafafafa, 0x7d7d7d7d, 0xfa, 0xfafafafa, 0xafafafaf, 0xfafafafb, 0xfafafafd]),
             ("cs_wm_as_data2", [0xffff0000, 0x10000, 0xff, 0xff, 24, 2, 0xffff0001, 0xffff0000]),
             ("cs_wm_as_data32", [0xfafafafa, 0xfafafaf, 0xfafbf900, 0xfafafafa]),
+            ("cs_wm_as_data64", [0xa0a0a0a, 0xfa00fa00, 0xf5f5f5f5, 0x5fa05fa, 0xfafafafa, 0xfafafafa, 0xff00ff00, 0xfafafafa]),
+            ("cs_wm_as_exec", [0, 1, 0, 1, 0, 0, 0, 0]),
             # mask-only wave64: s_bcnt1_i32_b64 on ordinary SGPRs, no WAVE64_RE EXEC markers (#210 / SHADER-28)
             ("cs_w64_mask_detect", [48]),
             # a wave64 v_cmp_e64 SDST printed as one SGPR writes the pair: SCC and s_bcnt1 of an AND of two compares

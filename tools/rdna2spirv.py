@@ -287,8 +287,8 @@ class Gen:
                 self.x_gen += 1
 
     # ---- register access ----
-    def load_reg(self, kind, r):
-        if (kind, r) in self.mask_data:  # a lane mask read as data: the wave's bits, not this lane's (mask_as_data)
+    def load_reg(self, kind, r, raw=False):
+        if not raw and (kind, r) in self.mask_data:  # a lane mask read as data: the wave's bits, not this lane's (mask_as_data)
             return self.mask_data[(kind, r)]
         arr = "%vgpr" if kind == "vgpr" else "%sgpr"
         p, t = self.tmp(), self.tmp()
@@ -994,7 +994,21 @@ class Gen:
             val = self.sdwa_dst(a, val)
         if a["k"] == "special" and a["t"] == "null":
             return                                    # result discarded
-        if a["k"] == "special" and a["t"] in ("exec_lo", "exec"):
+        if a["k"] == "special" and a["t"] == "exec_lo":
+            # A lane is active iff its bit is set: (val >> (lane & 31)) & 1. For a lane mask (this lane's 0 or ~0)
+            # that is the same as val != 0; a lane mask read as data (mask_as_data) has the wave's bits instead.
+            # In wave64 only lanes 0-31 change (exec_hi is left alone).
+            sh, bit = self.tmp(), self.tmp()
+            self.emit(f"{sh} = OpBitwiseAnd %uint {self.wave_lane()} {self.cu(31)}")
+            self.emit(f"{bit} = OpBitFieldUExtract %uint {val} {sh} {self.cu(1)}")
+            if self.wave64:
+                on = self.tmp()
+                self.emit(f"{on} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+                self.exec_half_write(0, on)
+            else:
+                self.set_exec(bit)
+            return
+        if a["k"] == "special" and a["t"] == "exec":
             self.set_exec(val)
             return
         if a["k"] == "vgpr" and a.get("n", 1) == 1:
@@ -3893,6 +3907,13 @@ class Gen:
             out[key] = hi if k == lane_masks.MASK_HI else lo
         return out
 
+    def mask_data64(self, a):
+        """A 64-bit SALU op (s_and_b64 …, s_cselect_b64) whose lane-mask sources are read as data here
+        (lane_masks.data_reads, mask_as_data): the wave's bits are in mask_data, so it takes the data path on both
+        words. Not when a source is EXEC/VCC itself (the mask path keeps those per lane)."""
+        return bool(self.mask_data) and all(
+            x["k"] in ("sgpr", "imm") or (x["k"] == "special" and x.get("t") == "null") for x in a[1:3])
+
     def lane_bits(self, b):
         """This lane's bool as its bit of a 64-lane mask: (lanes 0-31 word, lanes 32-63 word), one of them 0."""
         lane = self.wave_lane()
@@ -3910,16 +3931,17 @@ class Gen:
         bit per lane, so lane L takes its bit L: of the 64-bit value (`wide`, the default: a 64-bit SALU operand or
         the VALU mask of a wave64; inline constants sign-extended, a literal with a zero high word, as src64_data)
         or of the 32-bit value with L mod 32 (a b32 op). Until 2026-11-22 every lane took bit 0 (0xff00 was no
-        lane, 5 every lane)."""
+        lane, 5 every lane). Always this lane's bit, even when the same register is also read as data in the
+        instruction (v_cndmask_b32 v1, s20, 0, s[20:21])."""
         if a["k"] == "sgpr":
             if self.holds_lane_mask(a):
                 if self.wave64 and wide and a.get("n") == 2:
-                    lo, hi = self.load_reg("sgpr", a["r"]), self.load_reg("sgpr", a["r"] + 1)
+                    lo, hi = self.load_reg("sgpr", a["r"], raw=True), self.load_reg("sgpr", a["r"] + 1, raw=True)
                     up, sel = self.tmp(), self.tmp()
                     self.emit(f"{up} = OpUGreaterThanEqual %bool {self.wave_lane()} {self.cu(32)}")
                     self.emit(f"{sel} = OpSelect %uint {up} {hi} {lo}")
                     return sel
-                return self.load_reg("sgpr", a["r"])
+                return self.load_reg("sgpr", a["r"], raw=True)
             # Not known to hold a mask: the SGPR may hold a constant (s_mov_b32 s20, 0x3ffffc00) that is the same in
             # every invocation, so lane L takes its bit L, as for an immediate. Until 2026-11-22 the raw value was used
             # and any non-zero constant enabled every lane. A mask the analysis missed is still exact: each
@@ -7173,7 +7195,7 @@ class Gen:
             inv = op in ("s_nand_b64", "s_nor_b64", "s_xnor_b64")
             if op.endswith("_mask") or \
                     (a[0]["k"] == "special" and a[0].get("t", "").startswith(("exec", "vcc"))) or \
-                    self.is_mask_op(a[1]) or self.is_mask_op(a[2]):
+                    ((self.is_mask_op(a[1]) or self.is_mask_op(a[2])) and not self.mask_data64(a)):
                 x, y = self.mask_src(a[1]), self.mask_src(a[2])
                 r = self.tmp()
                 if op.endswith("n2_b64"):
@@ -7211,7 +7233,7 @@ class Gen:
                 self.scc_nonzero(orr)
         elif op == "s_cselect_b64":
             if (a[0]["k"] == "special" and a[0].get("t", "").startswith(("exec", "vcc"))) or \
-                    self.is_mask_op(a[1]) or self.is_mask_op(a[2]):
+                    ((self.is_mask_op(a[1]) or self.is_mask_op(a[2])) and not self.mask_data64(a)):
                 x, y = self.mask_src(a[1]), self.mask_src(a[2])
                 c, b, r = self.tmp(), self.tmp(), self.tmp()
                 self.emit(f"{c} = OpLoad %uint %scc")
