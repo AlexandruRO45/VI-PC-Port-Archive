@@ -4,7 +4,7 @@ import hashlib
 from pathlib import Path
 
 import pefile
-from iced_x86 import Decoder, MemorySizeExt, Mnemonic as M, OpKind as K, Register as R, RegisterExt
+from iced_x86 import Decoder, EncodingKind, MemorySizeExt, Mnemonic as M, OpKind as K, Register as R, RegisterExt
 
 from cpu_leaf_aot import export_rva
 from cpu_ranges import function_ranges, image_bytes
@@ -213,11 +213,11 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             stmt = (f"{{ auto input = {src}; {dst} = {{}}; for (size_t n=0; n<16; n+=4) {{ "
                     f"auto v = load<uint32_t>(reinterpret_cast<word>(input.data()+n)) {operation}; "
                     f"memcpy({dst}.data()+n, &v, 4); }} }}")
-        elif has_wide and op == M.VBROADCASTI128 and i.op1_kind == K.MEMORY:
+        elif has_wide and i.encoding == EncodingKind.VEX and op == M.VBROADCASTI128 and i.op1_kind == K.MEMORY:
             dst = wide[i.op0_register]
             stmt = (f"{{ const auto lane = load<std::array<uint8_t,16>>({address()}); "
                     f"memcpy({dst}.data(), lane.data(), 16); memcpy({dst}.data() + 16, lane.data(), 16); }}")
-        elif has_wide and op == M.VEXTRACTI128:
+        elif has_wide and i.encoding == EncodingKind.VEX and op == M.VEXTRACTI128:
             src = wide[i.op1_register]
             off = 16 if (i.immediate(2) & 1) else 0
             if i.op0_kind == K.MEMORY:
@@ -225,13 +225,13 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             else:
                 dst = wide_any[i.op0_register]
                 stmt = f"{{ const auto in1 = {src}; {dst} = {{}}; memcpy({dst}.data(), in1.data() + {off}, 16); }}"
-        elif has_wide and op == M.VINSERTI128:
+        elif has_wide and i.encoding == EncodingKind.VEX and op == M.VINSERTI128:
             dst, src1 = wide[i.op0_register], wide[i.op1_register]
             off = 16 if (i.immediate(3) & 1) else 0
             src2_expr = (f"load<std::array<uint8_t,16>>({address()})" if i.op2_kind == K.MEMORY
                          else f"load<std::array<uint8_t,16>>(reinterpret_cast<word>({wide_any[i.op2_register]}.data()))")
             stmt = f"{{ auto out = {src1}; const auto lane = {src2_expr}; memcpy(out.data() + {off}, lane.data(), 16); {dst} = out; }}"
-        elif has_wide and op == M.VPBLENDD:
+        elif has_wide and i.encoding == EncodingKind.VEX and op == M.VPBLENDD:
             vec_size = RegisterExt.size(i.op0_register)
             dst, src1 = wide_any[i.op0_register], wide_any[i.op1_register]
             imm = i.immediate(3)
@@ -243,7 +243,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
                     f"for (size_t lane = 0; lane < {vec_size // 4}; ++lane) {{ const size_t n = lane * 4; "
                     f"const uint32_t v = (({imm}u >> lane) & 1u) ? {s2_ptr} : load<uint32_t>(reinterpret_cast<word>(in1.data() + n)); "
                     f"memcpy({dst}.data() + n, &v, 4); }} }}")
-        elif has_wide and op == M.VPERM2I128:
+        elif has_wide and i.encoding == EncodingKind.VEX and op == M.VPERM2I128:
             dst, src1 = wide[i.op0_register], wide[i.op1_register]
             imm = i.immediate(3)
             s2_init = (f"const auto in2 = load<std::array<uint8_t,32>>({address()});" if i.op2_kind == K.MEMORY
@@ -254,7 +254,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
                 src_arr, src_off = ("in1", 0) if (sel & 3) == 0 else ("in1", 16) if (sel & 3) == 1 else ("in2", 0) if (sel & 3) == 2 else ("in2", 16)
                 return f"memcpy({dst}.data() + {out_off}, {src_arr}.data() + {src_off}, 16);"
             stmt = f"{{ const auto in1 = {src1}; {s2_init} {_lane_copy(imm & 0xf, 0)} {_lane_copy((imm >> 4) & 0xf, 16)} }}"
-        elif has_wide and op in (M.VPERMD, M.VPERMPS):
+        elif has_wide and i.encoding == EncodingKind.VEX and op in (M.VPERMD, M.VPERMPS):
             dst, idx_reg = wide[i.op0_register], wide[i.op1_register]
             s2_init = (f"const auto src = load<std::array<uint8_t,32>>({address()});" if i.op2_kind == K.MEMORY
                        else f"const auto src = {wide[i.op2_register]};")
@@ -262,7 +262,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
                     f"for (size_t lane = 0; lane < 8; ++lane) {{ "
                     f"const size_t pick = load<uint32_t>(reinterpret_cast<word>(idx.data() + lane * 4)) & 7u; "
                     f"memcpy({dst}.data() + lane * 4, src.data() + pick * 4, 4); }} }}")
-        elif has_wide and op in (M.VPERMQ, M.VPERMPD):
+        elif has_wide and i.encoding == EncodingKind.VEX and op in (M.VPERMQ, M.VPERMPD):
             dst = wide[i.op0_register]
             imm = i.immediate(2)
             s1_init = (f"const auto src = load<std::array<uint8_t,32>>({address()});" if i.op1_kind == K.MEMORY

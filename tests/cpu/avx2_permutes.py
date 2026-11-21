@@ -5,6 +5,7 @@ import struct
 import sys
 
 import pefile
+from iced_x86 import Decoder
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 from cpu_leaf_aot import export_rva
@@ -116,11 +117,25 @@ def check(native_path, lifted_path):
     print(f"{cases} AVX2 lane, blend, and cross-lane permute cases matched native and translated DLLs")
 
 
+def check_rejections():
+    # EVEX scalar-broadcast vpermd ymm0, ymm1, dword ptr [rdx]{1to8} (62 f2 75 38 36 02) must be rejected.
+    insns = list(Decoder(64, bytes.fromhex("62 f2 75 38 36 02 c3"), ip=0x1000))
+    assert insns[0].is_broadcast
+    try:
+        lower(insns, [], {}, {}, {})
+    except ValueError as exc:
+        if not str(exc).startswith("unsupported query operation at 0x1000"):
+            raise AssertionError(f"unexpected diagnostic {exc}") from exc
+    else:
+        raise AssertionError("accepted EVEX broadcast vpermd")
+
+
 if __name__ == "__main__":
     mode, native, other = sys.argv[1:]
     if mode == "emit":
         emit(Path(native), Path(other))
     elif mode == "check":
+        check_rejections()
         check(native, other)
     else:
         raise ValueError(mode)
