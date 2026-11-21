@@ -228,7 +228,7 @@ def check_predicate_draws(directory, compiler, renderer, backend):
 def half_rtz(x):
     bits, = struct.unpack("<H", struct.pack("<e", x))
     rounded, = struct.unpack("<e", struct.pack("<H", bits))
-    return struct.unpack("<e", struct.pack("<H", bits - (rounded > x)))[0]
+    return struct.unpack("<e", struct.pack("<H", bits - (abs(rounded) > abs(x))))[0]
 
 
 def arithmetic():
@@ -556,6 +556,16 @@ def check_render(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Stale reference accepted after moving the comparison threshold")
+    # Binary32 values on either side of a half-ULP midpoint, in both signs.
+    values = (1 + 3 / 4096, 1 + 1 / 4096, -1 - 3 / 4096, -1 - 1 / 4096)
+    constants = bytearray(256)
+    struct.pack_into("<4f", constants, 12, *values)
+    program = with_constants([f"v_sub_f32_e64 v{12 + i}, s{44 + i}, 0" for i in range(4)])
+    source.write_text(translate(program), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    case = directory / "signed-export.case"
+    case.write_bytes(constants + struct.pack("<4f", *map(half_rtz, values)) * 64)
+    subprocess.run([renderer, backend, "--check-pixel-case", shader, case], check=True)
     check_predicate_draws(directory, compiler, renderer, backend)
     capture = directory / "blend.rgba"
     draw = [renderer, backend, "--dual-pixel", shader, capture]
