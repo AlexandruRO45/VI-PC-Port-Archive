@@ -197,6 +197,25 @@ def check_shader_records():
     with tempfile.TemporaryDirectory() as tmp:
         pixel.check_controls(Path(tmp))
     assert "s_nop" not in pixel.ACCEPTED and "image_sample" in pixel.ACCEPTED
+    # Every newly lowered 64-bit SOP1/SOP2 and 32-bit BFE form is counted in both gfx1013 and rdna2,
+    # while rejected neighbors (exec save/restore, #257 ops, 64-bit BFE/cselect) stay out of covered.
+    scalar64_forms = {
+        ("SOP1", "s_cmov_b64"), ("SOP1", "s_not_b64"), ("SOP1", "s_brev_b64"),
+        ("SOP2", "s_and_b64"), ("SOP2", "s_or_b64"), ("SOP2", "s_xor_b64"),
+        ("SOP2", "s_andn2_b64"), ("SOP2", "s_orn2_b64"),
+        ("SOP2", "s_lshl_b64"), ("SOP2", "s_lshr_b64"), ("SOP2", "s_ashr_i64"),
+        ("SOP2", "s_bfm_b64"), ("SOP2", "s_bfe_u32"), ("SOP2", "s_bfe_i32"),
+    }
+    rejected_forms = {
+        "s_and_saveexec_b64", "s_or_saveexec_b64", "s_andn2_saveexec_b64",
+        "s_cselect_b64", "s_bfe_u64", "s_bfe_i64", "s_nand_b64", "s_nor_b64", "s_xnor_b64",
+        "s_cmp_eq_u64", "s_bitcmp1_b64", "s_bfm_b32",
+        "s_add_u32", "s_and_b32", "s_not_b32", "s_cmp_eq_i32", "s_cselect_b32",
+    }
+    assert not (pixel.ACCEPTED & rejected_forms), pixel.ACCEPTED & rejected_forms
+    for name in ("gfx1013.tsv", "rdna2.tsv"):
+        covered = fc.gfx_forms(pixel.ACCEPTED, fc.load_reference(name))
+        assert scalar64_forms <= covered, (name, scalar64_forms - covered)
 
 
 def check_parsing():
