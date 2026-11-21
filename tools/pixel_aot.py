@@ -334,6 +334,8 @@ def fp_operand(token, scalar, vector, pending, sample_pending):
         if token in pending:
             raise ValueError("Constant read before load completion")
         value = (vector if token.startswith("v") else scalar)[token]
+        if isinstance(value, tuple) and value[0] == "uint":
+            return f"asfloat({value[1]})"
         if isinstance(value, int):
             return f"asfloat({value}u)"
         if isinstance(value, tuple) and len(value) == 2 and value[0] == "uint":
@@ -478,6 +480,33 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     raise ValueError("Invalid movk immediate")
                 val = (val if val < 0x8000 else val - 0x10000) & 0xffffffff
             scalar[dst] = val
+        elif m := match(r"(s_addk_i32|s_mulk_i32) (s\d+), (-?\d+|0x[0-9a-f]+)"):
+            op, dst, imm = m.groups()
+            if dst in pending:
+                raise ValueError("Unresolved scalar memory dependency")
+            
+            value = scalar[dst]
+            if isinstance(value, tuple) and value[0] == "uint":
+                operand = value[1]
+            elif isinstance(value, int):
+                operand = f"{value}u"
+            elif isinstance(value, str) and value.startswith("params["):
+                operand = f"asuint({value})"
+            else:
+                raise ValueError("Expected a numeric scalar operand")
+            
+            word = int(imm, 16) if imm.startswith("0x") else int(imm)
+            if not (-0x8000 <= word <= 0xffff if imm.startswith("-") else 0 <= word <= 0xffff):
+                raise ValueError("Invalid sopk immediate")
+            
+            signed = word - 0x10000 if word >= 0 and word & 0x8000 else word
+            addend = signed & 0xffffffff
+            operation = "+" if op == "s_addk_i32" else "*"
+            scalar[dst] = ("uint", f"alu{i}")
+            lines.append(f"    uint alu{i} = ({operand} {operation} {addend}u);")
+
+            if op == "s_addk_i32":
+                scc = f"((({operand} ^ alu{i}) & ({addend}u ^ alu{i}) & 0x80000000u) != 0u)"
         elif m := match(r"s_load_dwordx8 s\[(\d+):(\d+)\], s\[(\d+):(\d+)\], (null|0x[0-9a-f]+)"):
             dst = registers(*m.groups()[:2], 8)
             addr = registers(*m.groups()[2:4], 2)

@@ -29,6 +29,9 @@ def check_denominators():
         reference = fc.load_reference(name)
         assert {group for group, _ in reference} == ENCODINGS, name
         assert ("SOPP", "s_endpgm") in reference and ("EXP", "exp") in reference
+        assert ("SOPK", "s_addk_i32") in reference and ("SOPK", "s_mulk_i32") in reference
+        assert fc.gfx_forms({"s_addk_i32", "s_mulk_i32"}, reference) == {
+            ("SOPK", "s_addk_i32"), ("SOPK", "s_mulk_i32")}
     gfx1013, rdna2 = fc.load_reference("gfx1013.tsv"), fc.load_reference("rdna2.tsv")
     assert ("SMEM", "s_atomic_add") in gfx1013 and ("SMEM", "s_atomic_add") not in rdna2
     # The LLVM syntax-doc parser: short headings, operand-less instructions, and the trailing index.
