@@ -7630,6 +7630,104 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
     return m
 
 
+# Barycentric fallback for devices without VK_KHR_fragment_shader_barycentric (RDNA1 and older on RADV, Intel Gen9):
+# the raw i/j a pixel shader reads come from an ordinary interpolated input that a pass-through geometry shader
+# writes, instead of from BaryCoordKHR. Fragment inputs end at Location 31 (maxFragmentInputComponents = 128).
+LAST_INPUT_LOCATION = 31
+
+
+def bary_from_location(asm, loc):
+    """The pixel shader `asm` reading %bary (BaryCoordKHR) from the interpolated vec3 input at Location `loc`."""
+    edits = {"OpCapability FragmentBarycentricKHR": None,
+             'OpExtension "SPV_KHR_fragment_shader_barycentric"': None,
+             "OpDecorate %bary BuiltIn BaryCoordKHR": f"OpDecorate %bary Location {loc}"}
+    out, seen = [], set()
+    for ln in asm.split("\n"):
+        key = ln.strip()
+        if key in edits:
+            seen.add(key)
+            if edits[key] is None:
+                continue
+            ln = ln.replace(key, edits[key])
+        out.append(ln)
+    if len(seen) != len(edits):
+        raise ValueError("not a pixel shader reading BaryCoordKHR")
+    return "\n".join(out)
+
+
+def bary_gs_asm(locations, bary_loc):
+    """Pass-through geometry shader for bary_from_location(): copies each triangle's Position and the vec4 varyings
+    at `locations`, and gives its three vertices the corners (1,0,0), (0,1,0), (0,0,1) at Location `bary_loc`.
+    Interpolated like any smooth input (perspective-correct), the corner is BaryCoordKHR. The vertex shader can't
+    write it: in an indexed mesh one vertex may be corner 1 of a triangle and corner 2 of the next. Vertex order is
+    kept, so the provoking vertex (Flat inputs) and the winding stay the same. Not carried: a vertex shader's
+    ClipDistance, CullDistance, Layer and ViewportIndex (such a pipeline would lose them)."""
+    locs = sorted(set(locations))
+    pairs = [("%in_pos", "%out_pos")] + [(f"%in{n}", f"%out{n}") for n in locs]
+    iface = [v for pair in pairs for v in pair] + ["%out_bary"]
+    a = ["OpCapability Geometry", "OpMemoryModel Logical GLSL450",
+         f'OpEntryPoint Geometry %main "main" {" ".join(iface)}',
+         "OpExecutionMode %main Triangles", "OpExecutionMode %main Invocations 1",
+         "OpExecutionMode %main OutputTriangleStrip", "OpExecutionMode %main OutputVertices 3",
+         "OpDecorate %in_pos BuiltIn Position", "OpDecorate %out_pos BuiltIn Position",
+         f"OpDecorate %out_bary Location {bary_loc}"]
+    a += [f"OpDecorate {v} Location {n}" for n in locs for v in (f"%in{n}", f"%out{n}")]
+    a += ["%void = OpTypeVoid", "%fn = OpTypeFunction %void", "%float = OpTypeFloat 32", "%uint = OpTypeInt 32 0",
+          "%v3float = OpTypeVector %float 3", "%v4float = OpTypeVector %float 4",
+          "%u0 = OpConstant %uint 0", "%u1 = OpConstant %uint 1", "%u2 = OpConstant %uint 2",
+          "%u3 = OpConstant %uint 3", "%f0 = OpConstant %float 0", "%f1 = OpConstant %float 1",
+          "%corner0 = OpConstantComposite %v3float %f1 %f0 %f0",
+          "%corner1 = OpConstantComposite %v3float %f0 %f1 %f0",
+          "%corner2 = OpConstantComposite %v3float %f0 %f0 %f1",
+          "%arr_v4 = OpTypeArray %v4float %u3", "%_ptr_Input_arr = OpTypePointer Input %arr_v4",
+          "%_ptr_Input_v4 = OpTypePointer Input %v4float", "%_ptr_Output_v4 = OpTypePointer Output %v4float",
+          "%_ptr_Output_v3 = OpTypePointer Output %v3float"]
+    a += [f"{src} = OpVariable %_ptr_Input_arr Input" for src, _ in pairs]
+    a += [f"{dst} = OpVariable %_ptr_Output_v4 Output" for _, dst in pairs]
+    a += ["%out_bary = OpVariable %_ptr_Output_v3 Output",
+          "%main = OpFunction %void None %fn", "%entry = OpLabel"]
+    for v in range(3):
+        for src, dst in pairs:
+            a += [f"{src}_p{v} = OpAccessChain %_ptr_Input_v4 {src} %u{v}",
+                  f"{src}_v{v} = OpLoad %v4float {src}_p{v}", f"OpStore {dst} {src}_v{v}"]
+        a += [f"OpStore %out_bary %corner{v}", "OpEmitVertex"]
+    a += ["OpEndPrimitive", "OpReturn", "OpFunctionEnd"]
+    return "\n".join(a) + "\n"
+
+
+def spirv_build(base, asm, keep_asm=True):
+    """Write <base>.spvasm, assemble it into <base>.spv and validate that. Returns "" when valid, else the error."""
+    sa, sv = base + ".spvasm", base + ".spv"
+    with open(sa, "w") as f:
+        f.write(asm)
+    r = subprocess.run(["spirv-as", sa, "-o", sv, "--target-env", "vulkan1.2"], capture_output=True, text=True)
+    if r.returncode == 0:
+        r = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand", sv],
+                           capture_output=True, text=True)  # Offset on non-gather: VK_KHR_maintenance8
+    if not keep_asm:
+        os.remove(sa)
+    return "" if r.returncode == 0 else (r.stderr.strip() or f"exit {r.returncode}")
+
+
+def write_bary_fallback(out, name, asm, g, keep_asm=True):
+    """For a pixel shader that reads raw barycentrics: write <name>.bary.spv (bary_from_location) and
+    <name>.bary_gs.spv (bary_gs_asm) next to <name>.spv and return the index.json entry describing them, or None.
+    A runtime without fragmentShaderBarycentric draws with these two instead of <name>.spv; it then needs
+    geometryShader instead of fragmentShaderBarycentric."""
+    if g.stage != "ps" or not any(str(c).startswith("bary") for c in g.frag_inputs.values()):
+        return None
+    locs = sorted(set(g.inputs.values()))
+    loc = locs[-1] + 1 if locs else 0
+    if loc > LAST_INPUT_LOCATION:
+        return {"error": "no free input Location"}
+    entry = {"location": loc, "ps": name + ".bary.spv", "gs": name + ".bary_gs.spv"}
+    for key, text in (("ps", bary_from_location(asm, loc)), ("gs", bary_gs_asm(locs, loc))):
+        err = spirv_build(os.path.join(out, entry[key][:-len(".spv")]), text, keep_asm)
+        if err:
+            return {"error": f"{entry[key]}: {err.splitlines()[0][:200]}"}
+    return entry
+
+
 def write_index(path, index):
     """Write an index under another name and rename it into place, so a run stopped part-way never leaves half of
     one: make_game.py takes these files as proof that a shard, or the whole translation, finished."""
@@ -7717,25 +7815,22 @@ def main():
             why[f"translator error {type(e).__name__}"] += 1
             continue
         ok += 1
-        sa = os.path.join(a.out, name + ".spvasm")
-        sv = os.path.join(a.out, name + ".spv")
-        with open(sa, "w") as f:
-            f.write(asm)
-        r = subprocess.run(["spirv-as", sa, "-o", sv, "--target-env", "vulkan1.2"], capture_output=True, text=True)
-        if r.returncode == 0:
-            r = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand", sv],
-                               capture_output=True, text=True)  # Offset on non-gather: VK_KHR_maintenance8
-        if r.returncode == 0:
+        err = spirv_build(os.path.join(a.out, name), asm, keep_asm=not a.no_asm)
+        if not err:
             valid += 1
             try:
                 fssm_sidecar = os.path.join(a.fssm_dir, name + ".fssm") if a.fssm_dir else None
                 meta[name] = shader_meta(translate.last_gen, asm, src_path=p, fssm_path=fssm_sidecar)
             except Exception as e:  # noqa: BLE001 - metadata must never cost a translation
                 meta[name] = {"error": f"{type(e).__name__}: {e}"}
+            try:
+                fallback = write_bary_fallback(a.out, name, asm, translate.last_gen, keep_asm=not a.no_asm)
+            except Exception as e:  # noqa: BLE001 - nor may the optional barycentric fallback
+                fallback = {"error": f"{type(e).__name__}: {e}"}
+            if fallback:
+                meta[name]["bary_fallback"] = fallback
         else:
-            why["INVALID: " + (r.stderr.strip().splitlines() or ["?"])[0][:90]] += 1
-        if a.no_asm and os.path.exists(sa):
-            os.remove(sa)
+            why["INVALID: " + err.splitlines()[0][:90]] += 1
     import json as _js
     idx_path = os.path.join(a.out, f"index.part{shard}.json" if shard is not None else "index.json")
     old = {}

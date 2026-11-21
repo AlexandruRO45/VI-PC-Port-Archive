@@ -168,6 +168,15 @@ int main(int argc, char** argv) {
         for (auto& x : exts) if (!std::strcmp(x.extensionName, e)) return true;
         return false;
     };
+    // VKH_BARY_PS=<fs.spv> + VKH_BARY_GS=<gs.spv>: the translator's barycentric fallback for this fragment shader
+    // (index.json "bary_fallback"), drawn instead of it when the device lacks VK_KHR_fragment_shader_barycentric.
+    // VKH_BARY=gs uses the fallback anyway, VKH_BARY=builtin never does.
+    const char* bary_mode = std::getenv("VKH_BARY");
+    const bool force_gs = bary_mode && !std::strcmp(bary_mode, "gs");
+    const bool force_builtin = bary_mode && !std::strcmp(bary_mode, "builtin");
+    const bool bary_fallback = std::getenv("VKH_BARY_PS") && std::getenv("VKH_BARY_GS") && !force_builtin &&
+                               (force_gs || !has(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME));
+    if (bary_fallback) std::fprintf(stderr, "barycentrics: geometry-shader fallback\n");
     // A translated pixel shader that reads BaryCoordKHR aborts the driver when the device lacks barycentrics
     // (llvmpipe and other software devices), so the suite reports it as unsupported instead. 77 is the existing
     // "this device cannot run the test" code (runtime/test/shaders/check.py, scripts/run_gpu_tests.py).
@@ -182,7 +191,7 @@ int main(int argc, char** argv) {
             needs_float64 = true;
         i += words;
     }
-    if (needs_barycentric && !has(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
+    if (needs_barycentric && !bary_fallback && !has(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
         std::fprintf(stderr, "unsupported: %s reads BaryCoordKHR and the device has no %s\n",
                      argv[2], VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
         return 77;
@@ -248,8 +257,10 @@ int main(int argc, char** argv) {
     dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = uint32_t(enable.size()); dci.ppEnabledExtensionNames = enable.data();
     dci.pNext = chain;
-    // VKH_GS=<geometry.spv>: insert a geometry stage between the vertex and fragment shaders.
-    const char* gs_path = std::getenv("VKH_GS");
+    const char* fs_path = bary_fallback ? std::getenv("VKH_BARY_PS") : argv[2];
+    // VKH_GS=<geometry.spv>: insert a geometry stage under test between the vertex and fragment shaders.
+    const char* test_gs = bary_fallback ? nullptr : std::getenv("VKH_GS");
+    const char* gs_path = bary_fallback ? std::getenv("VKH_BARY_GS") : test_gs;
     if (gs_path && !f2q.features.geometryShader) {   // MoltenVK: Metal has no geometry stage
         std::fprintf(stderr, "unsupported: no geometryShader\n");
         return 77;
@@ -361,7 +372,7 @@ int main(int argc, char** argv) {
         return vkCreateShaderModule(dev, &smi, nullptr, m);
     };
     VkShaderModule vs, fs;
-    CHECK(module(argv[1], &vs)); CHECK(module(argv[2], &fs));
+    CHECK(module(argv[1], &vs)); CHECK(module(fs_path, &fs));
     VkPipelineShaderStageCreateInfo stages[3]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
                                               {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
                                               {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
@@ -384,9 +395,9 @@ int main(int argc, char** argv) {
         req_sg >= sgProps.minSubgroupSize && req_sg <= sgProps.maxSubgroupSize) {
         if (mesh && (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_MESH_BIT_EXT))
             stages[0].pNext = &reqSg;
-        else if (gs_path && (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_GEOMETRY_BIT))
+        else if (test_gs && (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_GEOMETRY_BIT))
             stages[2].pNext = &reqSg;
-        else if (!mesh && !gs_path && (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_FRAGMENT_BIT))
+        else if (!mesh && !test_gs && (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_FRAGMENT_BIT))
             stages[1].pNext = &reqSg;
     }
     VkPipelineVertexInputStateCreateInfo vin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};

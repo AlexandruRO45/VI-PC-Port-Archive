@@ -128,9 +128,12 @@ def main():
         combined.update(validated)
         index.write_text(json.dumps(combined, indent=2) + "\n", encoding="utf-8")
         for n in validated:
-            for suffix in (".spv", ".spvasm"):
-                artifact = built / (n + suffix)
-                artifact.replace(spirv / artifact.name)
+            # .bary / .bary_gs: the barycentric fallback (index.json "bary_fallback"), for raw-barycentric PS only
+            for stem in (n, n + ".bary", n + ".bary_gs"):
+                for suffix in (".spv", ".spvasm"):
+                    artifact = built / (stem + suffix)
+                    if stem == n or artifact.exists():
+                        artifact.replace(spirv / artifact.name)
         index.replace(published_index)
         sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "tools"))
         import spirv_stubs

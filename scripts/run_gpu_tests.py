@@ -805,6 +805,10 @@ def run_suite(a, work: str) -> int:
             raw = os.path.join(raw_dir, f"{name}.raw")
             vs = os.path.join(spirv_dir, "vs_ids.spv") if name == "ps_flat" else vs_tri   # check.py draws ps_flat with vs_ids
             env = dict(gfx_env or os.environ, **PIXEL_ENV[name]) if name in PIXEL_ENV else gfx_env
+            fallback = index.get(name, {}).get("bary_fallback", {})
+            if "location" in fallback:   # raw barycentrics: vk_harness draws these without the extension
+                env = dict(env or os.environ, VKH_BARY_PS=os.path.join(spirv_dir, fallback["ps"]),
+                           VKH_BARY_GS=os.path.join(spirv_dir, fallback["gs"]))
             rc, msg = run_cmd([vk_harness, vs, spv, raw], env=env)
             if rc == 77:   # vk_harness: the device lacks a feature this shader needs (e.g. barycentrics)
                 results.append((name, None, unsupported_skip(msg)))

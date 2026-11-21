@@ -14,6 +14,9 @@ to check a translator that emulates wave64 on them. scripts/run_gpu_tests.py bui
 fs_passthru.spv; here the mesh checks run when those files are in <out dir>/spirv.
 ps_tex is skipped when the device lacks a feature the bindless set or the shader needs.
 ps_texoff (texel offsets, on vk_texture_test's texture) is skipped on a device without VK_KHR_maintenance8.
+Pixel tests that read raw barycentrics (ps_bary, ps_uniform_branch, ps_scc_mask32): on a device without
+VK_KHR_fragment_shader_barycentric they are drawn through the translator's geometry-shader fallback (VKH_BARY=gs or
+VKH_BARY=builtin forces one path).
 """
 import collections
 import json
@@ -354,13 +357,29 @@ def mesh_w64x_test(tools, spirv, name):
     return "" if not wrong else f"{wrong} of {len(px)} pixels differ (blue {px[0][2]:.3g} at pixel 0, want 0.5)"
 
 
-def subgroup_size(spirv, name):
-    """The wave size the translator recorded for a shader (index.json), or None."""
+def index_entry(spirv, name):
+    """What the translator recorded for a shader (index.json), or {}."""
     try:
         with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
-            return json.load(f).get(name, {}).get("subgroup_size")
+            return json.load(f).get(name, {})
     except (OSError, ValueError):
-        return None
+        return {}
+
+
+def harness_env(spirv, name):
+    """vk_harness settings from the shader's index.json entry."""
+    entry, env = index_entry(spirv, name), dict(os.environ)
+    # Draw at the shader's own wave size, as run_gpu_tests.py does (#146): a wave32 pixel shader run as wave64
+    # (RADV's default on RDNA1) reads lanes it was never written for.
+    if entry.get("subgroup_size"):
+        env["VKH_SUBGROUP_SIZE"] = str(entry["subgroup_size"])
+    # Raw barycentrics: the harness draws the geometry-shader fallback where the device lacks the extension
+    # (VKH_BARY=gs or builtin picks one path on any device).
+    fallback = entry.get("bary_fallback", {})
+    if "location" in fallback:
+        env["VKH_BARY_PS"] = os.path.join(spirv, fallback["ps"])
+        env["VKH_BARY_GS"] = os.path.join(spirv, fallback["gs"])
+    return env
 
 
 def bindless_test(tools, spirv):
@@ -417,12 +436,9 @@ def texture_gradient_a16_test(tools: str, spirv: str, name: str = "ps_texture_gr
 
 
 def pixels(tools, spirv, name, fmt):
-    # Draw at the shader's own wave size, as run_gpu_tests.py does (#146): a wave32 pixel shader run as wave64
-    # (RADV's default on RDNA1) reads lanes it was never written for.
-    sg = subgroup_size(spirv, name)
-    env = dict(os.environ, VKH_SUBGROUP_SIZE=str(sg)) if sg else None
+    env = harness_env(spirv, name)
     if name in PIXEL_ENV:
-        env = dict(env or os.environ, **PIXEL_ENV[name])
+        env.update(PIXEL_ENV[name])
     with tempfile.TemporaryDirectory(prefix="leonida-pixels-") as tmp:
         raw = Path(tmp) / "pixels.raw"
         code, out = run(os.path.join(tools, "vk_harness" + EXE), os.path.join(spirv, "vs_ids.spv"),

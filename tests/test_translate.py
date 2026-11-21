@@ -983,3 +983,27 @@ def test_remaining_d16_paths_avoid_packhalf2x16(make_shader):
     spv2 = sh2.translate()
     sh2.validate(spv2)
     assert "PackHalf2x16" not in spv2
+
+
+def test_bary_fallback_reads_a_location_and_validates(make_shader, tmp_path):
+    """Raw barycentrics without VK_KHR_fragment_shader_barycentric: <name>.bary.spv reads them from the first free
+    input Location, which the pass-through geometry shader <name>.bary_gs.spv writes. Both must validate."""
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "ps_bary.asm"), encoding="utf-8") as f:
+        shader = make_shader(f.read(), "ps_bary")
+    asm = shader.translate()
+    entry = rdna2spirv.write_bary_fallback(str(tmp_path), "ps_bary", asm, rdna2spirv.translate.last_gen)
+    assert entry == {"location": 1, "ps": "ps_bary.bary.spv", "gs": "ps_bary.bary_gs.spv"}   # attr0 is Location 0
+    ps = (tmp_path / "ps_bary.bary.spvasm").read_text()
+    assert "BaryCoordKHR" not in ps and "FragmentBarycentric" not in ps and "OpDecorate %bary Location 1" in ps
+    gs = (tmp_path / "ps_bary.bary_gs.spvasm").read_text()
+    assert "OpDecorate %out_bary Location 1" in gs and "OpDecorate %out0 Location 0" in gs
+    assert gs.count("OpEmitVertex") == 3
+    assert (tmp_path / "ps_bary.bary.spv").is_file() and (tmp_path / "ps_bary.bary_gs.spv").is_file()
+
+
+def test_no_bary_fallback_without_raw_barycentrics(make_shader, tmp_path):
+    shader = make_shader(program(SUPPORTED["v_mov"]))
+    asm = shader.translate()
+    assert rdna2spirv.write_bary_fallback(str(tmp_path), "ps_test", asm, rdna2spirv.translate.last_gen) is None
+    with pytest.raises(ValueError):
+        rdna2spirv.bary_from_location(asm, 0)
