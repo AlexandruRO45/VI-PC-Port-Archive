@@ -189,6 +189,18 @@ def truncate_values() -> list[str]:
     ])
 
 
+def rounding():
+    """Round scaled samples up and to nearest even, and a constant tie through the VOP3 encoding."""
+    return with_constants([
+        "v_mul_f32_e32 v18, s44, v12",
+        "v_ceil_f32_e32 v12, v18",
+        "v_mul_f32_e32 v19, s44, v13",
+        "v_rndne_f32_e32 v13, v19",
+        "v_rndne_f32_e64 v14, s45",
+        "v_ceil_f32_e64 v15, -s46",
+    ])
+
+
 def select(wave64=False):
     """Compare into lane masks and select; LLVM names the masks by wavefront width."""
     vcc, first, second = ("vcc", "s[52:53]", "s[54:55]") if wave64 else ("vcc_lo", "s52", "s53")
@@ -409,6 +421,27 @@ def truncate_case(directory: Path, bias: float, green: float, blue: float, alpha
     return path
 
 
+def rndne(x):
+    """Round a binary32 value to the nearest integer, ties to even (Python's round on a float)."""
+    return float(round(x))
+
+
+def rounding_case(directory, scale, tie, bias):
+    """Expected colors for rounding(). The scale is a power of two, so each product is exact and
+    only the rounding mode decides the result. The constants keep every result away from -0."""
+    assert math.frexp(scale)[0] == 0.5, scale
+    case = bytearray(256)
+    struct.pack_into("<4f", case, 12, scale, tie, bias, 0)
+    for y in RAMP:
+        for x in RAMP:
+            r, g = single(x / 255), single(y / 255)
+            color = (math.ceil(scale * r), rndne(scale * g), rndne(single(tie)), math.ceil(-single(bias)))
+            case.extend(struct.pack("<4f", *map(half_rtz, map(float, color))))
+    path = directory / "rounding.case"
+    path.write_bytes(case)
+    return path
+
+
 def absolute_case(directory):
     case = bytearray(256)
     for y in RAMP:
@@ -496,7 +529,7 @@ def check_controls(directory):
         must_reject(native_program, archive, "fixture")
 
     # LLVM 15 prints "exp mrt0 v16, ..."; newer LLVM prints "exp mrt0, v16, ...".
-    for program in (assembly(False), assembly(True), curve(), shaping(), arithmetic()):
+    for program in (assembly(False), assembly(True), curve(), shaping(), arithmetic(), rounding()):
         modern = [line.replace("exp mrt0 ", "exp mrt0, ") for line in program]
         assert modern != program
         assert translate(modern) == translate(program)
@@ -514,6 +547,22 @@ def check_controls(directory):
     program.remove("v_trunc_f32_e32 v13, s45")
     program.insert(wait, "v_trunc_f32_e32 v13, s45")
     must_reject(translate, program)
+
+    source = translate(rounding())
+    for expected in ("= ceil(alu", "= round(alu", "= round(params[1].x);", "= ceil((-params[1].y));"):
+        assert expected in source, expected
+    # Neighbouring forms: other widths, output modifiers, a second source and the IEEE-flag reciprocal.
+    for old, new in (("v_ceil_f32_e32 v12, v18", "v_ceil_f16_e32 v12, v18"),
+                     ("v_ceil_f32_e32 v12, v18", "v_ceil_f64_e32 v[12:13], v[18:19]"),
+                     ("v_rndne_f32_e32 v13, v19", "v_rndne_f16_e32 v13, v19"),
+                     ("v_rndne_f32_e32 v13, v19", "v_rndne_f32_e32 v13, v19, v18"),
+                     ("v_rndne_f32_e64 v14, s45", "v_rndne_f32_e64 v14, s45 mul:2"),
+                     ("v_ceil_f32_e64 v15, -s46", "v_ceil_f32_e64 v15, -s46 div:2"),
+                     ("v_ceil_f32_e64 v15, -s46", "v_rcp_iflag_f32_e64 v15, -s46"),
+                     ("v_ceil_f32_e64 v15, -s46", "v_ceil_f32_e64 v15, -s28")):
+        changed = [line.replace(old, new) for line in rounding()]
+        assert changed != rounding()
+        must_reject(translate, changed)
 
     program = absolute_value()
     alternate = [line.replace("|v12|", "abs(v12)") for line in program]
@@ -614,7 +663,7 @@ def check_controls(directory):
 
 def check_binary(directory, assembler, objcopy, library):
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
-                (arithmetic(), translate), (with_scalar_constant_reads(), translate), (truncate_values(), translate)]
+                (arithmetic(), translate), (with_scalar_constant_reads(), translate), (truncate_values(), translate), (rounding(), translate)]
     fixtures.extend((predicate_group(first), translate) for first in range(0, 16, 4))
     fixtures.extend((dual_program(case), translate_dual) for case in DUAL_CASES)
     fixtures.append((dual_program(swap_weights=True), translate_dual))
@@ -705,6 +754,26 @@ def check_render(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Rounding toward negative infinity escaped detection")
+
+    source.write_text(translate(rounding()), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    # Ties go to even (2.5 to 2, -3.5 to -4), unlike rounding half away from zero or half up.
+    for constants in ((4.0, 2.5, 1.25), (8.0, -3.5, -0.75)):
+        draw = [renderer, backend, "--check-pixel-case", shader, rounding_case(directory, *constants)]
+        subprocess.run(draw, check=True)
+    for old, new, failure in (("v_rndne_f32_e32", "v_floor_f32_e32", "Flooring instead of rounding"),
+                              ("v_ceil_f32_e32", "v_floor_f32_e32", "Flooring instead of ceiling")):
+        source.write_text(translate([line.replace(old, new) for line in rounding()]), encoding="ascii")
+        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"{failure} escaped detection")
+    # Rounding half up gives -3 for the -3.5 tie, so the same draw must catch it.
+    source.write_text(translate(rounding()).replace("round(", "floor(0.5f + "), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Rounding ties up instead of to even escaped detection")
 
     program = absolute_value()
     case = absolute_case(directory)

@@ -197,6 +197,17 @@ def check_shader_records():
     with tempfile.TemporaryDirectory() as tmp:
         pixel.check_controls(Path(tmp))
     assert "s_nop" not in pixel.ACCEPTED and "image_sample" in pixel.ACCEPTED
+    # The rounding fixture covers both encodings of v_ceil_f32 and v_rndne_f32 once its test passes.
+    rounding = {("VOP1", "v_ceil_f32"), ("VOP1", "v_rndne_f32"),
+                ("VOP3", "v_ceil_f32_e64"), ("VOP3", "v_rndne_f32_e64")}
+    assert rounding <= gfx and rounding <= fc.gfx_forms(pixel.ACCEPTED, gfx)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = sample_repo(Path(tmp) / "repo", {})
+        words = {"v_ceil_f32_e32", "v_ceil_f32_e64", "v_rndne_f32_e32", "v_rndne_f32_e64"}
+        assert words <= pixel.ACCEPTED
+        covered = fc.measure({"pixel_aot_warp": "pass"}, root, {"pixel_aot_warp": set(pixel.ACCEPTED)})
+        without = fc.measure({"pixel_aot_warp": "pass"}, root, {"pixel_aot_warp": pixel.ACCEPTED - words})
+        assert covered["gfx1013"]["covered"] == without["gfx1013"]["covered"] + len(rounding)
 
 
 def check_parsing():
