@@ -33,6 +33,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     const bool workgroup_yz = !std::strcmp(argv[3], "workgroup_yz");
+    const bool bounds = !std::strcmp(argv[3], "bounds");
     if (workgroup_yz && std::strcmp(argv[2], "2x3x4")) {
         std::fprintf(stderr, "workgroup_yz expects a 2x3x4 dispatch\n");
         return 2;
@@ -187,6 +188,7 @@ int main(int argc, char** argv) {
     uint32_t pc[36] = {};
     pc[0] = 0; pc[1] = 0; pc[2] = 0xFFFFFFFFu; pc[3] = 0;     // V#: base 0, stride 0, num_records max
     pc[32] = uint32_t(heap); pc[33] = uint32_t(heap >> 32);    // heap base
+    if (bounds) pc[6] = 16;   // second V#: only bytes 0..15 are addressable by cs_bounds
     VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpci.queueFamilyIndex = qi;
     VkCommandPool pool; CHECK(vkCreateCommandPool(dev, &cpci, nullptr, &pool));
@@ -249,6 +251,13 @@ int main(int argc, char** argv) {
         }
         std::printf("single-group origins: %u/%u matched\n", origins - wrong_origins, origins);
         return bad || wrong_origins ? 1 : 0;
+    }
+    if (bounds) {
+        // The second V# is limited to 16 bytes. Its OOB store at byte 16 must not modify out[4],
+        // and its OOB load must return zero before being copied to out[2].
+        const uint32_t want[5] = {0x12345678u, 0x12345678u, 0u, 0xEEEEEEEEu, 0xEEEEEEEEu};
+        for (uint32_t i = 0; i < 5; ++i)
+            if (out[i] != want[i]) { if (!bad) first_bad = i; ++bad; }
     }
     if (!std::strcmp(argv[3], "mirror64")) {
         for (uint32_t g = 0; g < groups; g++)
