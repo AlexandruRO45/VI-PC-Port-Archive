@@ -113,6 +113,15 @@ float export16(float value) {
     if (abs(f16tof32(h)) > abs(value)) h--;
     return f16tof32(h);
 }
+// Float to integer as on the native target: truncate, NaN to zero, saturate at the type limits.
+uint f2u(float value) {
+    return isnan(value) || value <= 0 ? 0u : value >= 4294967296.0f ? 0xffffffffu : (uint)value;
+}
+int f2i(float value) {
+    if (isnan(value)) return 0;
+    if (value <= -2147483648.0f) return (int)0x80000000u;
+    return value >= 2147483648.0f ? 0x7fffffff : (int)value;
+}
 float4 main(float2 uv : TEXCOORD0) : SV_Target0 {"""
 
 
@@ -143,6 +152,14 @@ COMPARE = {
     "nge": "({0} < {1} || isnan({0}) || isnan({1}))", "nlg": "({0} == {1} || isnan({0}) || isnan({1}))",
     "ngt": "({0} <= {1} || isnan({0}) || isnan({1}))", "nle": "({0} > {1} || isnan({0}) || isnan({1}))",
     "neq": "!({0} == {1})", "nlt": "({0} >= {1} || isnan({0}) || isnan({1}))",
+}
+# 32-bit integer operations on register bits. Shift counts use their low five bits, as on the target.
+INTEGER = {
+    "and_b32": (2, "{0} & {1}"), "or_b32": (2, "{0} | {1}"), "xor_b32": (2, "{0} ^ {1}"),
+    "not_b32": (1, "~{0}"), "bfi_b32": (3, "({0} & {1}) | (~{0} & {2})"),
+    "lshlrev_b32": (2, "{1} << ({0} & 31u)"), "lshrrev_b32": (2, "{1} >> ({0} & 31u)"),
+    "ashrrev_i32": (2, "asuint(asint({1}) >> ({0} & 31u))"),
+    "cvt_f32_u32": (1, "asuint((float){0})"), "cvt_f32_i32": (1, "asuint((float)asint({0}))"),
 }
 LANE_MASK = r"(vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
 
@@ -180,6 +197,15 @@ def fp_operand(token, scalar, vector, pending, sample_pending):
     if re.fullmatch(r"\d+\.\d+", token):
         return token + "f"
     raise ValueError(f"Unsupported arithmetic operand {token}")
+
+
+def int_operand(token, scalar, vector, pending, sample_pending):
+    """Bits of an operand to an integer operation; these operations take no source modifiers."""
+    if re.fullmatch(r"-?\d+|0x[0-9a-f]{1,8}", token):
+        return f"{int(token, 0) & 0xffffffff}u"
+    if not re.fullmatch(r"-?\d+\.\d+|[vs]\d+", token):
+        raise ValueError(f"Unsupported integer operand {token}")
+    return f"asuint({fp_operand(token, scalar, vector, pending, sample_pending)})"
 
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *, second_texture_offset=None):
@@ -336,6 +362,24 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(rf"v_({'|'.join(INTEGER)}|cvt_u32_f32|cvt_i32_f32)(?:_e32|_e64)? (v\d+), (.+)"):
+            op, dst, operands = m.groups()
+            tokens = operands.split(", ")
+            if mask != "entry" or dst in sample_dest:
+                raise ValueError("Invalid integer operation")
+            if op in ("cvt_u32_f32", "cvt_i32_f32"):
+                # The float source accepts the usual modifiers; the result is an integer.
+                if len(tokens) != 1:
+                    raise ValueError("Invalid integer conversion")
+                value = fp_operand(tokens[0], scalar, vector, pending, sample_pending)
+                expression = f"asuint(f2u({value}))" if op == "cvt_u32_f32" else f"asuint(f2i({value}))"
+            else:
+                arity, template = INTEGER[op]
+                if len(tokens) != arity:
+                    raise ValueError("Invalid integer operation")
+                expression = template.format(*(int_operand(t, scalar, vector, pending, sample_pending) for t in tokens))
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat({expression});")
         elif m := match(rf"v_cmp_({'|'.join(COMPARE)})_f32(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
             op, dst, *tokens = m.groups()
             regs = lane_mask(dst)

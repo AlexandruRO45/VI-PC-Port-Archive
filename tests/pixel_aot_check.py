@@ -215,6 +215,80 @@ def absolute_value():
     return program
 
 
+def bits():
+    """Integer and bitwise operations on sample bits, with shift counts, a NaN and an overflow
+    from constant words 3 to 6. Every result is an integer below 2**24 scaled by a power of two."""
+    return with_constants([
+        "v_mul_f32_e32 v20, 0x43800000, v12",
+        "v_mul_f32_e32 v21, 0x43800000, v13",
+        "v_lshlrev_b32_e32 v18, s44, v12",
+        "v_lshrrev_b32_e32 v18, s45, v18",
+        "v_and_b32_e32 v18, 0xfe, v18",
+        "v_cvt_f32_u32_e32 v18, v18",
+        "v_mul_f32_e32 v12, 0x3b800000, v18",
+        "v_xor_b32_e32 v19, 0x80000000, v13",
+        "v_ashrrev_i32_e32 v19, 20, v19",
+        "v_not_b32_e32 v19, v19",
+        "v_cvt_f32_i32_e32 v19, v19",
+        "v_mul_f32_e32 v13, 0x3a000000, v19",
+        "v_cvt_u32_f32_e32 v22, v20",
+        "v_cvt_u32_f32_e32 v23, v21",
+        "v_bfi_b32 v22, 0xf0, v22, v23",
+        "v_or_b32_e32 v22, 0x100, v22",
+        "v_cvt_f32_u32_e32 v22, v22",
+        "v_mul_f32_e32 v14, 0x3b000000, v22",
+        "v_cvt_i32_f32_e64 v24, -v20",
+        "v_cvt_u32_f32_e64 v25, -v20",
+        "v_cvt_u32_f32_e32 v26, s46",
+        "v_cvt_i32_f32_e32 v27, s46",
+        "v_cvt_u32_f32_e32 v28, s47",
+        "v_xor_b32_e32 v24, v24, v28",
+        "v_or_b32_e32 v24, v24, v25",
+        "v_or_b32_e32 v24, v24, v26",
+        "v_or_b32_e32 v24, v24, v27",
+        "v_cvt_f32_i32_e32 v24, v24",
+        "v_mul_f32_e32 v15, 0x3b800000, v24",
+    ])
+
+
+def bits_case(directory, words):
+    """Expected colors for bits() with constant words 3 to 6 given as raw 32-bit patterns."""
+    def u(x):
+        return struct.unpack("<I", struct.pack("<f", x))[0]
+
+    def f(n):
+        return struct.unpack("<f", struct.pack("<I", n & 0xffffffff))[0]
+
+    def to_u32(x):
+        return 0 if math.isnan(x) or x <= 0 else 0xffffffff if x >= 2**32 else int(x)
+
+    def to_i32(x):
+        return 0 if math.isnan(x) else max(-2**31, min(2**31 - 1, int(x))) if math.isfinite(x) else (
+            2**31 - 1 if x > 0 else -2**31)
+
+    left, right, nan, big = words
+    case = bytearray(256)
+    struct.pack_into("<4I", case, 12, *words)
+    for y in RAMP:
+        for x in RAMP:
+            r, g = single(x / 255), single(y / 255)
+            red = (((u(r) << (left & 31)) & 0xffffffff) >> (right & 31)) & 0xfe
+            signed = (u(g) ^ 0x80000000) - 2**32  # the sign bit is set, so this is negative
+            green = ~(signed >> 20)
+            n, m = to_u32(256 * r), to_u32(256 * g)
+            blue = ((0xf0 & n) | (~0xf0 & m)) | 0x100
+            alpha = (to_i32(-256 * r) & 0xffffffff) ^ to_u32(f(big))
+            alpha |= to_u32(-256 * r) | to_u32(f(nan)) | (to_i32(f(nan)) & 0xffffffff)
+            alpha -= (alpha >> 31) << 32
+            color = (red / 256, green / 2048, blue / 512, alpha / 256)
+            for value in color:
+                assert single(value) == value and abs(value) < 2, value
+            case.extend(struct.pack("<4f", *map(half_rtz, color)))
+    path = directory / "bits.case"
+    path.write_bytes(case)
+    return path
+
+
 # The gfx10 predicate number is a four-bit truth table. Bits 0..3 select
 # less, equal, greater and unordered respectively, independent of the HLSL.
 PREDICATES = ("f", "lt", "eq", "le", "gt", "lg", "ge", "o",
@@ -480,6 +554,55 @@ def check_scalar_constant_reads() -> None:
     must_reject(translate, alias[:wait + 1] + [load] + alias[wait + 1:])
 
 
+def check_bits_controls():
+    program = bits()
+    source = translate(program)
+    for expected in ("asfloat(asuint(sample16.x) << (asuint(params[0].w) & 31u))",
+                     ">> (asuint(params[1].x) & 31u)", "asfloat(254u & asuint(alu",
+                     "asfloat(2147483648u ^ asuint(sample16.y))", "asfloat(asuint(asint(asuint(alu27)) >> (20u & 31u)))",
+                     "asfloat(~asuint(alu", "asfloat(asuint((float)asint(asuint(alu",
+                     "asfloat(asuint((float)asuint(alu", "asfloat((240u & asuint(alu",
+                     "| (~240u & asuint(alu", "asfloat(256u | asuint(alu",
+                     "asfloat(asuint(f2i((-alu", "asfloat(asuint(f2u((-alu",
+                     "asfloat(asuint(f2u(params[1].y)))", "asfloat(asuint(f2i(params[1].y)))"):
+        assert expected in source, expected
+    # A float inline constant is its binary32 pattern; an integer one is the value itself.
+    for operand, expected in (("1.0", "asuint(1.0f)"), ("-0.5", "asuint((-0.5f))"), ("-4", "4294967292u"),
+                              ("64", "64u"), ("s47", "asuint(params[1].z)")):
+        changed = [line.replace("v_or_b32_e32 v22, 0x100, v22", f"v_or_b32_e32 v22, {operand}, v22")
+                   for line in program]
+        assert f"asfloat({expected} | asuint(alu" in translate(changed), operand
+    assert "f2u(abs(alu" in translate([line.replace("v28, s47", "v28, |v20|") for line in program])
+    for old, new in (("v24, v24, v28", "v24, -v24, v28"), ("v24, v24, v28", "v24, |v24|, v28"),
+                     ("v_not_b32_e32 v19, v19", "v_not_b32_e32 v19, -v19"),
+                     ("v_cvt_f32_u32_e32 v22, v22", "v_cvt_f32_u32_e64 v22, v22 clamp"),
+                     ("v_cvt_u32_f32_e32 v28, s47", "v_cvt_u32_f32_e64 v28, s47 clamp"),
+                     ("v_cvt_u32_f32_e32 v28, s47", "v_cvt_u32_f32_e32 v28, s47, s46"),
+                     ("v_bfi_b32 v22, 0xf0, v22, v23", "v_bfi_b32 v22, 0xf0, v22"),
+                     ("v_not_b32_e32 v19, v19", "v_not_b32_e32 v19, v19, v19"),
+                     ("v_and_b32_e32 v18, 0xfe, v18", "v_and_b32_e32 v18, v18"),
+                     ("v_and_b32_e32 v18, 0xfe, v18", "v_and_b32_e32 v18, 0xfe, v10"),
+                     ("v_or_b32_e32 v22, 0x100, v22", "v_or_b32_e32 v22, 0x100, v16"),
+                     ("v_or_b32_e32 v22, 0x100, v22", "v_add_nc_u32_e32 v22, 0x100, v22"),
+                     ("v_or_b32_e32 v22, 0x100, v22", "v_or3_b32 v22, 0x100, v22, v23"),
+                     ("v_lshrrev_b32_e32 v18, s45, v18", "v_bfe_u32 v18, v18, s45, 8"),
+                     ("v_cvt_f32_u32_e32 v18, v18", "v_cvt_f32_ubyte0_e32 v18, v18"),
+                     ("v_cvt_i32_f32_e64 v24, -v20", "v_cvt_flr_i32_f32_e64 v24, -v20"),
+                     ("v_cvt_u32_f32_e32 v26, s46", "v_cvt_u32_f32_e32 v26, s28")):
+        changed = [line.replace(old, new) for line in program]
+        assert changed != program, new
+        must_reject(translate, changed)
+    wait = program.index("s_waitcnt vmcnt(0)")
+    for line in ("v_and_b32_e32 v21, 1, v12", "v_and_b32_e32 v12, 1, v21", "v_cvt_u32_f32_e32 v21, v13"):
+        must_reject(translate, program[:wait] + [line] + program[wait:])
+    late = translate(program[:wait + 1] + ["v_not_b32_e32 v12, 0"] + program[wait + 1:])
+    assert "asfloat(~0u)" in late
+    pos = program.index("s_wqm_b64 exec, exec") + 1
+    must_reject(translate, program[:pos] + ["v_not_b32_e32 v20, 0"] + program[pos:])
+    pos = program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc") + 1
+    must_reject(translate, program[:pos] + ["v_xor_b32_e32 v20, s44, v20"] + program[pos:])
+
+
 def check_controls(directory):
     check_constant_descriptor_bounds()
     check_scalar_constant_reads()
@@ -589,6 +712,7 @@ def check_controls(directory):
                      "params[0].w < sample16.x", "sample16.y >= params[1].x",
                      "? 1.0f : asfloat(0u);", "? sample16.w : params[1].z;"):
         assert expected in source, expected
+    check_bits_controls()
     for wave64 in (False, True):
         program = select(wave64)
         mask = "s[52:53]" if wave64 else "s52"
@@ -614,7 +738,7 @@ def check_controls(directory):
 
 def check_binary(directory, assembler, objcopy, library):
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
-                (arithmetic(), translate), (with_scalar_constant_reads(), translate), (truncate_values(), translate)]
+                (arithmetic(), translate), (with_scalar_constant_reads(), translate), (truncate_values(), translate), (bits(), translate)]
     fixtures.extend((predicate_group(first), translate) for first in range(0, 16, 4))
     fixtures.extend((dual_program(case), translate_dual) for case in DUAL_CASES)
     fixtures.append((dual_program(swap_weights=True), translate_dual))
@@ -731,6 +855,26 @@ def check_render(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Stale reference accepted after moving the comparison threshold")
+    source.write_text(translate(bits()), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    for words in ((36, 20, 0x7fc00000, 0x50000000), (35, 21, 0xffc00001, 0x7f800000)):
+        case = bits_case(directory, words)
+        draw = [renderer, backend, "--check-pixel-case", shader, case]
+        subprocess.run(draw, check=True)
+    # Below 2**32, so the unsigned conversion no longer saturates to all ones.
+    corrupted = bytearray(case.read_bytes())
+    struct.pack_into("<I", corrupted, 24, 0x4f000000)
+    case.write_bytes(corrupted)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Stale reference accepted after removing the conversion overflow")
+    logical = [line.replace("v_ashrrev_i32", "v_lshrrev_b32") for line in bits()]
+    source.write_text(translate(logical), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    wrong = subprocess.run([renderer, backend, "--check-pixel-case", shader, bits_case(directory, words)],
+                           capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("A logical shift in place of the arithmetic shift escaped detection")
     # Binary32 values on either side of a half-ULP midpoint, in both signs.
     values = (1 + 3 / 4096, 1 + 1 / 4096, -1 - 3 / 4096, -1 - 1 / 4096)
     constants = bytearray(256)
