@@ -338,11 +338,14 @@ def absolute_value():
 
 
 def legacy_multiply_add():
+    # gfx10 allows two scalar operands per VOP3 instruction, so two constants move to VGPRs.
     return with_constants([
-        "v_mad_legacy_f32 v12, s44, s45, s46",
-        "v_mad_legacy_f32 v13, s45, s44, -s47",
-        "v_mad_legacy_f32 v14, |s46|, s47, s44",
-        "v_mad_legacy_f32 v15, s44, s47, s46 clamp",
+        "v_mov_b32_e32 v18, s46",
+        "v_mov_b32_e32 v19, s47",
+        "v_mad_legacy_f32 v12, s44, s45, v18",
+        "v_mad_legacy_f32 v13, s45, s44, -v19",
+        "v_mad_legacy_f32 v14, |v18|, s47, s44",
+        "v_mad_legacy_f32 v15, s44, v19, v18 clamp",
     ])
 
 
