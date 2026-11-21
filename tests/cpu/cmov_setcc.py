@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 
 import pefile
+from iced_x86 import Decoder
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 from cpu_leaf_aot import export_rva
@@ -87,11 +88,20 @@ def check(native_path, lifted_path):
     print(f"{cases} CMOVcc and SETcc cases (cmova/ae/b/e, seta/ae/b/be/ne) matched native and translated DLLs")
 
 
+def check_memory_source_read():
+    # x86 reads a CMOVcc memory source unconditionally even when the predicate is false.
+    # 41 0F 47 00 = cmova eax, dword ptr [r8]
+    emitted = lower(list(Decoder(64, bytes.fromhex("39 c9 41 0f 47 00 c3"), ip=0x1000)), [], {}, {}, {})
+    if "load_always<uint32_t>(r8 + 0ull)" not in emitted:
+        raise AssertionError(f"expected unconditional volatile read for CMOV memory source:\n{emitted}")
+
+
 if __name__ == "__main__":
     mode, native, other = sys.argv[1:]
     if mode == "emit":
         emit(Path(native), Path(other))
     elif mode == "check":
         check(native, other)
+        check_memory_source_read()
     else:
         raise ValueError(mode)

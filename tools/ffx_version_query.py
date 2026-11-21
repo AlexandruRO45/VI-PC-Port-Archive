@@ -27,6 +27,13 @@ static_assert(sizeof(void*) == sizeof(word));
 template<class T> T load(word address) {
     T v; memcpy(&v, reinterpret_cast<const void*>(address), sizeof v); return v;
 }
+template<class T> T load_always(word address) {
+    T v;
+    const volatile auto* p = reinterpret_cast<const volatile uint8_t*>(address);
+    auto* q = reinterpret_cast<uint8_t*>(&v);
+    for (size_t i = 0; i < sizeof v; ++i) q[i] = p[i];
+    return v;
+}
 template<class T> void store(word address, T v) {
     memcpy(reinterpret_cast<void*>(address), &v, sizeof v);
 }
@@ -127,7 +134,11 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
         elif op in (M.CMOVE, M.CMOVNE, M.CMOVA, M.CMOVAE, M.CMOVB, M.CMOVBE):
             cond = {M.CMOVE: "zero", M.CMOVNE: "!zero", M.CMOVA: "!carry && !zero",
                     M.CMOVAE: "!carry", M.CMOVB: "carry", M.CMOVBE: "carry || zero"}[op]
-            stmt = write(f"({cond}) ? {operand(1)} : {operand(0)}")
+            if i.op1_kind == K.MEMORY:
+                width = UINT[MemorySizeExt.size(i.memory_size)]
+                stmt = f"{{ const {width} src = load_always<{width}>({address()}); {write(f'({cond}) ? src : {operand(0)}')} }}"
+            else:
+                stmt = write(f"({cond}) ? {operand(1)} : {operand(0)}")
         elif op == M.LEA:
             stmt = write(address())
         elif op == M.CMP:
