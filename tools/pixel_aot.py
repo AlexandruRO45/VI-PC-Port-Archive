@@ -644,14 +644,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Invalid arithmetic operation")
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
-            old = vector.get(dst)
-            if old is not None and not isinstance(old, str):
-                raise ValueError("Unsupported arithmetic destination")
             expression = template.format(*[fp_operand(t, scalar, vector, pending, sample_pending) for t in tokens])
             if clamp:
                 expression = f"saturate({expression})"
             if dst_sel != "DWORD":
-                expression = f"asfloat({sdwa_dest(f'asuint({expression})', dst_sel, unused, old)})"
+                expression = f"asfloat({sdwa_dest(f'asuint({expression})', dst_sel, unused, vector.get(dst))})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
         elif m := match(r"v_mov_b32(?:_e32|_e64)? (v\d+), (-?\d+(?:\.\d+)?|0x[0-9a-f]{1,8}|[vs]\d+)"):
