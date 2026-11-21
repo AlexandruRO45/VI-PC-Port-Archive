@@ -1,6 +1,6 @@
 # Contributing to Xbox2Windows
 
-You can contribute a hardware result, a source-built failing case, a documentation fix or a patch from an x64 Windows PC. Our GTA VI / Xbox Series X case study supplies research questions. The shared regression suite runs with public tools and fixtures built from this repository.
+You can contribute a hardware result, a source-built failing case, a documentation fix or a patch from an x64 Windows PC. Our Xbox Series X case study supplies research questions. The shared regression suite runs with public tools and fixtures built from this repository.
 
 ## Find and claim a task
 
@@ -29,7 +29,7 @@ The Windows job builds the C++ and HLSL, runs the CPU, Python and WARP tests, an
 
 Use original source, synthetic inputs or a public sample with its revision and license. Store local inputs in `game-files/` and generated output in `out/`. Keep game files, distribution links, SDK redistributables and dumps out of issues, PRs and Git. Remove personal paths and credentials from logs.
 
-State what the test measured and which behavior remains a hypothesis. For example, a BVH report can identify the first differing ray and give the CPU, shader and DXR hit distances. If several primitives coincide, describe which IDs are valid. Claims about the GTA VI build should identify their source. A passing fixture supports the behavior under test; full-game startup requires its own execution evidence.
+State what the test measured and which behavior remains a hypothesis. For example, a BVH report can identify the first differing ray and give the CPU, shader and DXR hit distances. If several primitives coincide, describe which IDs are valid. Claims about the inspected build should identify their source. A passing fixture supports the behavior under test; full-game startup requires its own execution evidence.
 
 For findings from a local installation, share a limited observation such as a count or a comparison of two verified values. Describe how the values were checked. For a replay, identify who supplied the input event. For a decoder, say whether it verified a prefix, a full block or rendered pixels. Provide a source-built fixture where possible so other contributors can reproduce the check.
 
