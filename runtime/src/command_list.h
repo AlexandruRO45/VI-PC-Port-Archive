@@ -296,9 +296,30 @@ struct ClearDepthStencil {
     std::vector<Rect> rects;
 };
 
+// Descriptor binding state (docs/d3d12_vulkan.md section 3.4). A heap is identified by its COM object pointer, a
+// table by the GPU descriptor handle D3D12 handed out; the IR stays free of Windows and Vulkan types. The replay
+// resolves the handles to heaps and descriptors; until draws exist the commands are recorded and validated only.
+inline constexpr std::uint32_t max_descriptor_heaps = 2;  // D3D12 allows one CBV/SRV/UAV and one sampler heap
+inline constexpr std::uint32_t max_root_parameters = 64;
+
+struct SetDescriptorHeaps {
+    std::vector<std::uintptr_t> heaps;
+};
+
+struct SetGraphicsRootDescriptorTable {
+    std::uint32_t root_parameter;
+    std::uint64_t base_descriptor;
+};
+
+struct SetComputeRootDescriptorTable {
+    std::uint32_t root_parameter;
+    std::uint64_t base_descriptor;
+};
+
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
-                             CopyResource, ResolveSubresource>;
+                             CopyResource, ResolveSubresource, SetDescriptorHeaps, SetGraphicsRootDescriptorTable,
+                             SetComputeRootDescriptorTable>;
 
 class CommandList {
 public:
@@ -382,6 +403,28 @@ public:
         return append(ClearDepthStencil{target, flags, depth, stencil, {rects.begin(), rects.end()}});
     }
 
+    // Sets the bound descriptor heaps (one or two, no null or duplicate entries). D3D12 allows at most one
+    // CBV/SRV/UAV heap and one sampler heap at a time.
+    bool set_descriptor_heaps(std::span<const std::uintptr_t> heaps) {
+        if (closed_ || heaps.empty() || heaps.size() > max_descriptor_heaps) return false;
+        for (std::size_t i = 0; i < heaps.size(); ++i) {
+            if (!heaps[i]) return false;
+            for (std::size_t j = 0; j < i; ++j)
+                if (heaps[j] == heaps[i]) return false;  // the same heap twice is not a second heap
+        }
+        return append(SetDescriptorHeaps{{heaps.begin(), heaps.end()}});
+    }
+
+    // A root descriptor table: the root parameter index must fit D3D12's 64 and the GPU handle must be non-zero.
+    bool set_graphics_root_descriptor_table(std::uint32_t root_parameter, std::uint64_t base_descriptor) {
+        if (closed_ || root_parameter >= max_root_parameters || !base_descriptor) return false;
+        return append(SetGraphicsRootDescriptorTable{root_parameter, base_descriptor});
+    }
+
+    bool set_compute_root_descriptor_table(std::uint32_t root_parameter, std::uint64_t base_descriptor) {
+        if (closed_ || root_parameter >= max_root_parameters || !base_descriptor) return false;
+        return append(SetComputeRootDescriptorTable{root_parameter, base_descriptor});
+    }
     bool close() {
         if (closed_) return false;
         closed_ = true;

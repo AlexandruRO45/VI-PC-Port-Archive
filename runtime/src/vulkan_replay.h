@@ -480,6 +480,7 @@ enum class ReplayResult {
     invalid_subresource,
     invalid_clear,
     invalid_copy,
+    invalid_binding,
     unsupported
 };
 
@@ -905,6 +906,21 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             p.source = *source;
             if (const auto result = detail::prepare_resolve(*resolve_command, p); result != ReplayResult::success)
                 return result;
+        } else if (const auto* heaps = std::get_if<SetDescriptorHeaps>(&command)) {
+            // Binding state only: no Vulkan call until draws and the descriptor-table scan exist. The handles are
+            // still validated here, so a bad binding fails the replay instead of being silently dropped.
+            if (heaps->heaps.empty() || heaps->heaps.size() > max_descriptor_heaps) return ReplayResult::invalid_binding;
+            for (std::size_t i = 0; i < heaps->heaps.size(); ++i) {
+                if (!heaps->heaps[i]) return ReplayResult::invalid_binding;
+                for (std::size_t j = 0; j < i; ++j)
+                    if (heaps->heaps[j] == heaps->heaps[i]) return ReplayResult::invalid_binding;
+            }
+        } else if (const auto* table = std::get_if<SetGraphicsRootDescriptorTable>(&command)) {
+            if (table->root_parameter >= max_root_parameters || !table->base_descriptor)
+                return ReplayResult::invalid_binding;
+        } else if (const auto* table = std::get_if<SetComputeRootDescriptorTable>(&command)) {
+            if (table->root_parameter >= max_root_parameters || !table->base_descriptor)
+                return ReplayResult::invalid_binding;
         }
     }
     return ReplayResult::success;
