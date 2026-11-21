@@ -45,6 +45,7 @@ jobs:
         run: |
           python -B tests/script_state_check.py
           python -B tests/bcpack_check.py
+          python -B tests/bc7_blocks_check.py
           python -B tests/form_coverage_check.py
           python -B tests/resource_ranges_check.py
           python -B tests/sgd5_effects_check.py
