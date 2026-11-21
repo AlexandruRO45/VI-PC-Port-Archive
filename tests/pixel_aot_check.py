@@ -62,6 +62,12 @@ def assembly(swap):
     ]
 
 
+def lod_zero_sample() -> list[str]:
+    mask_ops = ("s_mov_b64", "s_wqm_b64", "s_and_b64")
+    return [line.replace("image_sample ", "image_sample_lz ") for line in assembly(False)
+            if not line.startswith(mask_ops)]
+
+
 DUAL_CASES = ("forward", "reverse", "reuse")
 
 
@@ -632,6 +638,14 @@ def check_scalar_constant_reads() -> None:
 def check_controls(directory):
     check_constant_descriptor_bounds()
     check_scalar_constant_reads()
+    lod_zero = lod_zero_sample()
+    assert ".SampleLevel(samp, float2(uv.x, uv.y), 0.0f)" in translate(lod_zero)
+    must_reject(translate, [line.replace("image_sample_lz ", "image_sample ") for line in lod_zero])
+    mixed_masks = [line.replace("image_sample ", "image_sample_lz ") for line in assembly(False)]
+    restore = mixed_masks.pop(mixed_masks.index("s_and_b64 exec, exec, s[50:51]"))
+    phase_two = next(i for i, line in enumerate(mixed_masks) if line.startswith("v_interp_p2"))
+    mixed_masks.insert(phase_two, restore)
+    must_reject(translate, mixed_masks)
     archive = directory / "input.bin"
     code = bytes.fromhex("000080bf 000081bf")  # s_nop 0 followed by s_endpgm
     check_container_selector(directory, code)
@@ -775,6 +789,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((with_constants(CUBE_BODY), translate))
     fixtures.extend((dual_program(case), translate_dual) for case in DUAL_CASES)
     fixtures.append((dual_program(swap_weights=True), translate_dual))
+    fixtures.append((lod_zero_sample(), translate))
     for index, (instructions, lower_fixture) in enumerate(fixtures):
         source = directory / "fixture.s"
         obj = directory / "fixture.o"

@@ -5,7 +5,7 @@ import subprocess
 import sys
 import tempfile
 
-from pixel_aot_check import assembly, translate
+from pixel_aot_check import assembly, lod_zero_sample, translate
 from bc7_tiles import linearize_4k_s
 
 
@@ -84,6 +84,37 @@ def write_patterned_mip(work: Path, width: int, height: int) -> Path:
     return case
 
 
+def solid_mip(size: int, stored: bytes, expected: bytes) -> bytes:
+    # Mode 6, identical endpoints and zero p bits give the same color at all indices.
+    assert size in (4, 8) and len(stored) == len(expected) == 4 and all(value % 2 == 0 for value in stored)
+    bits = 1 << 6
+    for channel, value in enumerate(stored):
+        endpoint = value >> 1
+        bits |= (endpoint | (endpoint << 7)) << (7 + 14 * channel)
+    return (struct.pack("<4sII", b"BC7C", size, size) + bits.to_bytes(16, "little") * (size // 4) ** 2
+            + expected * size ** 2)
+
+
+def check_lod_zero(work: Path, compiler: str, renderer: str, backend: str, implicit: Path) -> None:
+    source = work / "lod-zero.hlsl"
+    explicit = work / "lod-zero.cso"
+    source.write_text(translate(lod_zero_sample()), encoding="ascii")
+    subprocess.run([compiler, "-T", "ps_6_0", "-E", "main", "-Fo", explicit, source], check=True)
+    base = work / "lod-zero-base.case"
+    lower = work / "lod-zero-lower.case"
+    red, green = bytes((254, 0, 0, 254)), bytes((0, 254, 0, 254))
+    base.write_bytes(solid_mip(8, red, red))
+    # A 4x4 viewport selects mip 1 implicitly for this 8x8 texture.
+    lower.write_bytes(solid_mip(4, green, green))
+    draw = [renderer, backend, "--check-bc7-mip1"]
+    subprocess.run([*draw, implicit, base, lower], check=True)
+    lower.write_bytes(solid_mip(4, green, red))
+    subprocess.run([*draw, explicit, base, lower], check=True)
+    wrong = subprocess.run([*draw, implicit, base, lower], capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch x=0 y=0" not in wrong.stderr.splitlines():
+        raise AssertionError("The implicit sample did not distinguish mip 1 from explicit mip 0")
+
+
 def main():
     compiler, renderer, backend = sys.argv[1:]
     with tempfile.TemporaryDirectory() as directory:
@@ -99,6 +130,7 @@ def main():
         if result.returncode:
             return result.returncode
         assert output.read_bytes() == expected
+        check_lod_zero(work, compiler, renderer, backend, shader)
         check_all_modes(work, renderer, backend, shader)
         lower = work / "mip1.case"
         header, rows, expected = fixture(10, 9)
