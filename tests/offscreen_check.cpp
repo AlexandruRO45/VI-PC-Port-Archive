@@ -445,6 +445,8 @@ int main(int argc, char** argv)
             if (!check_dxr_update(device.Get())) return 77;
         } else if (argc == 3 && operation == "--dxr-facing") {
             if (!check_dxr_facing(device.Get())) return 77;
+        } else if (argc == 3 && operation == "--dxr-opacity") {
+            if (!check_dxr_opacity(device.Get())) return 77;
         } else if (argc == 3 && operation == "--bvh-packed") {
             check_bvh_packed(device.Get());
         } else if (argc == 3 && operation == "--bvh-numeric") {

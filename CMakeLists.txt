@@ -170,7 +170,12 @@ add_custom_command(OUTPUT "${ray_header}"
     COMMAND "${DXC_EXECUTABLE}" -T cs_6_5 -E CSMain -Vn ray_query -Fh "${ray_header}"
             -Fo "${CMAKE_CURRENT_BINARY_DIR}/ray_query.cso" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ray_query.hlsl"
     BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/ray_query.cso" DEPENDS tests/ray_query.hlsl VERBATIM)
-target_sources(offscreen_check PRIVATE "${ray_header}" tests/dxr_facing.cpp)
+set(candidates_header "${CMAKE_CURRENT_BINARY_DIR}/ray_candidates.h")
+add_custom_command(OUTPUT "${candidates_header}"
+    COMMAND "${DXC_EXECUTABLE}" -T cs_6_5 -E CSMain -Vn ray_candidates -Fh "${candidates_header}"
+            -Fo "${CMAKE_CURRENT_BINARY_DIR}/ray_candidates.cso" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ray_candidates.hlsl"
+    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/ray_candidates.cso" DEPENDS tests/ray_candidates.hlsl VERBATIM)
+target_sources(offscreen_check PRIVATE "${ray_header}" "${candidates_header}" tests/dxr_facing.cpp tests/dxr_opacity.cpp)
 foreach(layout IN ITEMS root tables)
     set(header "${CMAKE_CURRENT_BINARY_DIR}/compute_${layout}.h")
     set(binary "${CMAKE_CURRENT_BINARY_DIR}/compute_${layout}.cso")
@@ -202,6 +207,8 @@ foreach(adapter IN ITEMS hardware warp)
     set_tests_properties(dxr_update_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     add_test(NAME dxr_facing_${adapter} COMMAND offscreen_check ${adapter} --dxr-facing)
     set_tests_properties(dxr_facing_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    add_test(NAME dxr_opacity_${adapter} COMMAND offscreen_check ${adapter} --dxr-opacity)
+    set_tests_properties(dxr_opacity_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     add_test(NAME bvh_buffer_ops_${adapter} COMMAND offscreen_check ${adapter} --buffer-ops)
     add_test(NAME bvh_root_roundtrip_${adapter} COMMAND offscreen_check ${adapter} --bvh-root-roundtrip)
     set_tests_properties(bvh_root_roundtrip_${adapter} PROPERTIES TIMEOUT 45)

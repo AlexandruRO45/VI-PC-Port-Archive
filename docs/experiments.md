@@ -998,6 +998,18 @@ The CPU reference in `tests/dxr_facing_reference.h` moves each ray into object s
 ctest --preset dev --no-tests=error -R '^dxr_facing_' -V
 ```
 
+### Opacity and candidate handling in inline queries
+
+The other DXR fixtures build one opaque geometry and trace with a `RAY_FLAG_FORCE_OPAQUE` query, so no non-opaque candidate ever reaches a shader. `dxr_opacity` builds a BLAS of four single-triangle geometries stacked along z at depths 1 to 4. Geometries 1 and 3 carry `D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE`. Three instances use no flags, `D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE` and `D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_NON_OPAQUE`. Each instance receives 42 rays: both directions along z, seven ray flag sets (`RAY_FLAG_NONE`, `FORCE_OPAQUE`, `FORCE_NON_OPAQUE`, `CULL_OPAQUE`, `CULL_NON_OPAQUE`, `ACCEPT_FIRST_HIT_AND_END_SEARCH` alone and with `FORCE_NON_OPAQUE`) and three accept masks. `tests/ray_candidates.hlsl` declares `RayQuery<RAY_FLAG_NONE>` and commits a non-opaque candidate when its geometry index is set in the accept mask, a fixture convention carried in bits 16 to 19 of the flags word. [Ray flags](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#ray-flags) · [TraceRayInline control flow](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#tracerayinline-control-flow)
+
+The CPU reference in `tests/dxr_opacity_reference.h` intersects every triangle in double precision and applies the specification's order: ray flags override instance flags, which override geometry flags, and the cull flags then remove primitives by the resulting opacity. Before any GPU work the test compares it with a hand-derived table of opacity letters per instance and flag set. Swapping the ray and instance precedence in the reference breaks that table at ray 48. The reference expects 94 hits, 42 of them committed by the shader, and 32 misses. Ignoring instance flags would change the closest hit on 26 rays.
+
+Without the first-hit flag, status, instance, geometry and primitive must match the closest committable hit exactly. With it, the query may end on any committable hit, but must present no candidate after a commit. Every presented candidate must be a non-opaque triangle inside the ray extents and in front of the current committed hit. Each non-opaque triangle in front of the closest hit, and each committed one, must have been presented. A miss under the first-hit flag requires every non-opaque triangle. Hit distances of 1 to 4 may differ by 1e-5 relative. Rays cross triangle interiors well inside the distance interval, so edge and endpoint rules stay out of scope. Candidate counts and visit order are implementation-defined and are not compared. The fixture skips below DXR tier 1.1 or Shader Model 6.5.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^dxr_opacity_' -V
+```
+
 ### Desktop checks for the query tail and root flags
 
 On x64 Windows, `desktop_memory_query` observed a 48-byte write from `VirtualQueryEx`. State and protection occupy offsets `0x20` and `0x24`. All 16 trailing sentinel bytes survived. With the caller's zero initialization, even a committed read/write page fails the tail check. The test supplies seven tail bytes after the query and compares the four callers' two predicate shapes on reserved, committed read/write, read-only and no-access pages. It also checks the zero-return path.
