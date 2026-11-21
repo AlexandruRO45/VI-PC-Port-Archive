@@ -106,7 +106,7 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceMeshShaderFeaturesEXT meshf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
     if (mesh) {
         if (!has(VK_EXT_MESH_SHADER_EXTENSION_NAME)) {
-            std::fprintf(stderr, "unsupported: no VK_EXT_mesh_shader\\n");
+            std::fprintf(stderr, "unsupported: no VK_EXT_mesh_shader\n");
             return 77;
         }
         VkPhysicalDeviceMeshShaderFeaturesEXT meshq{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
@@ -114,7 +114,7 @@ int main(int argc, char** argv) {
         meshFeatures.pNext = &meshq;
         vkGetPhysicalDeviceFeatures2(pd, &meshFeatures);
         if (!meshq.meshShader) {
-            std::fprintf(stderr, "unsupported: meshShader feature unavailable\\n");
+            std::fprintf(stderr, "unsupported: meshShader feature unavailable\n");
             return 77;
         }
         enable.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
@@ -145,7 +145,7 @@ int main(int argc, char** argv) {
     // VKH_GS=<geometry.spv>: insert a geometry stage between the vertex and fragment shaders.
     const char* gs_path = std::getenv("VKH_GS");
     if (gs_path && !f2q.features.geometryShader) {
-        std::fprintf(stderr, "unsupported: geometryShader feature unavailable\\n");
+        std::fprintf(stderr, "unsupported: geometryShader feature unavailable\n");
         return 77;
     }
     VkPhysicalDeviceFeatures feats{};
