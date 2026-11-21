@@ -271,7 +271,8 @@ inline BlockFormat block_format(VkFormat format, VkImageAspectFlags aspect) {
     case VK_FORMAT_R32G32B32A32_UINT: return {16, 1};
     case VK_FORMAT_R16G16B16A16_SFLOAT:
     case VK_FORMAT_R16G16B16A16_UNORM:
-    case VK_FORMAT_R32G32_SFLOAT: return {8, 1};
+    case VK_FORMAT_R32G32_SFLOAT:
+    case VK_FORMAT_R32G32_UINT: return {8, 1};
     case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
     case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
     case VK_FORMAT_R8G8B8A8_UNORM:

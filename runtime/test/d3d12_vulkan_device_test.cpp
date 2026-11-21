@@ -124,6 +124,7 @@ int compare_footprints(ID3D12Device* ours) {
                               : nullptr;
     Ref<ID3D12Device> host;
     if (!create || FAILED(create(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) return -1;
+
     struct Case {
         D3D12_RESOURCE_DESC desc;
         UINT subresources;
@@ -177,6 +178,167 @@ int compare_footprints(ID3D12Device* ours) {
                              (unsigned long long)base, (unsigned long long)total_a, (unsigned long long)total_b);
         }
     }
+    return mismatches;
+}
+
+int compare_allocation_info(ID3D12Device* ours) {
+    const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const auto create = d3d12 ? reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
+                                    reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
+                              : nullptr;
+    Ref<ID3D12Device> host;
+    if (!create || FAILED(create(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) return -1;
+
+    std::vector<D3D12_RESOURCE_DESC> test_descs = {
+        buffer_desc(100),
+        buffer_desc(65536),
+        buffer_desc(65537),
+        buffer_desc(1000000),
+        volume_desc(5),
+        texture_desc(16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 1),
+        texture_desc(64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 1),
+        texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 0),
+        texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 1, 6),
+        texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 0, 6),
+        texture_desc(128, 64, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_NONE, 4),
+        texture_desc(256, 256, DXGI_FORMAT_BC1_UNORM, D3D12_RESOURCE_FLAG_NONE, 1),
+        texture_desc(256, 256, DXGI_FORMAT_BC1_UNORM, D3D12_RESOURCE_FLAG_NONE, 0),
+        texture_desc(256, 256, DXGI_FORMAT_BC7_UNORM, D3D12_RESOURCE_FLAG_NONE, 1),
+        texture_desc(256, 256, DXGI_FORMAT_D24_UNORM_S8_UINT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, 1),
+        texture_desc(256, 256, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, 2),
+    };
+
+    // Small alignment test cases
+    auto small_tex = texture_desc(32, 32, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 1);
+    small_tex.Alignment = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT; // 4KB
+    test_descs.push_back(small_tex);
+
+    auto small_tex_2mips = texture_desc(32, 32, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 2);
+    small_tex_2mips.Alignment = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
+    test_descs.push_back(small_tex_2mips);
+
+    auto small_r8 = texture_desc(64, 64, DXGI_FORMAT_R8_UNORM, D3D12_RESOURCE_FLAG_NONE, 1);
+    small_r8.Alignment = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
+    test_descs.push_back(small_r8);
+
+    auto large_small_tex = texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 1);
+    large_small_tex.Alignment = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT; // invalid: exceeds 64KB
+    test_descs.push_back(large_small_tex);
+
+    // MSAA test case
+    auto msaa_tex = texture_desc(64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, 1);
+    msaa_tex.SampleDesc.Count = 4;
+    test_descs.push_back(msaa_tex);
+
+    // 1D texture test case
+    D3D12_RESOURCE_DESC t1d{};
+    t1d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE1D;
+    t1d.Width = 256;
+    t1d.Height = 1;
+    t1d.DepthOrArraySize = 1;
+    t1d.MipLevels = 1;
+    t1d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    t1d.SampleDesc.Count = 1;
+    test_descs.push_back(t1d);
+
+    // Invalid test cases
+    D3D12_RESOURCE_DESC invalid_desc = buffer_desc(0);
+    test_descs.push_back(invalid_desc);
+
+    int mismatches = 0;
+    // Empty queries
+    const D3D12_RESOURCE_ALLOCATION_INFO empty_ours = ours->GetResourceAllocationInfo(0, 0, nullptr);
+    const D3D12_RESOURCE_ALLOCATION_INFO empty_host = host->GetResourceAllocationInfo(0, 0, nullptr);
+    if (empty_ours.SizeInBytes != empty_host.SizeInBytes || empty_ours.Alignment != empty_host.Alignment) {
+        if (mismatches++ < 8) {
+            std::fprintf(stderr, "GetResourceAllocationInfo empty: ours Size=%llu Align=%llu; host Size=%llu Align=%llu\n",
+                         (unsigned long long)empty_ours.SizeInBytes, (unsigned long long)empty_ours.Alignment,
+                         (unsigned long long)empty_host.SizeInBytes, (unsigned long long)empty_host.Alignment);
+        }
+    }
+
+    // Individual descriptors
+    for (size_t i = 0; i < test_descs.size(); ++i) {
+        const D3D12_RESOURCE_ALLOCATION_INFO a = ours->GetResourceAllocationInfo(0, 1, &test_descs[i]);
+        const D3D12_RESOURCE_ALLOCATION_INFO b = host->GetResourceAllocationInfo(0, 1, &test_descs[i]);
+        if (a.SizeInBytes != b.SizeInBytes || a.Alignment != b.Alignment) {
+            if (mismatches++ < 8) {
+                std::fprintf(stderr,
+                             "GetResourceAllocationInfo item %zu (dim %d fmt %d %llux%ux%u): ours Size=%llu Align=%llu; host Size=%llu Align=%llu\n",
+                             i, test_descs[i].Dimension, int(test_descs[i].Format),
+                             (unsigned long long)test_descs[i].Width, test_descs[i].Height, test_descs[i].DepthOrArraySize,
+                             (unsigned long long)a.SizeInBytes, (unsigned long long)a.Alignment,
+                             (unsigned long long)b.SizeInBytes, (unsigned long long)b.Alignment);
+            }
+        }
+    }
+
+    // Multi-desc GetResourceAllocationInfo and GetResourceAllocationInfo1 on ID3D12Device4
+    Ref<ID3D12Device4> ours4, host4;
+    if (SUCCEEDED(ours->QueryInterface(IID_PPV_ARGS(&ours4.p))) &&
+        SUCCEEDED(host->QueryInterface(IID_PPV_ARGS(&host4.p)))) {
+        std::vector<D3D12_RESOURCE_DESC> multi = {
+            test_descs[0],
+            test_descs[5],
+            small_tex,
+            msaa_tex,
+        };
+        std::vector<D3D12_RESOURCE_ALLOCATION_INFO1> a1(multi.size()), b1(multi.size());
+        const D3D12_RESOURCE_ALLOCATION_INFO a =
+            ours4->GetResourceAllocationInfo1(0, UINT(multi.size()), multi.data(), a1.data());
+        const D3D12_RESOURCE_ALLOCATION_INFO b =
+            host4->GetResourceAllocationInfo1(0, UINT(multi.size()), multi.data(), b1.data());
+        if (a.SizeInBytes != b.SizeInBytes || a.Alignment != b.Alignment) {
+            if (mismatches++ < 8) {
+                std::fprintf(stderr, "GetResourceAllocationInfo1 multi total: ours Size=%llu Align=%llu; host Size=%llu Align=%llu\n",
+                             (unsigned long long)a.SizeInBytes, (unsigned long long)a.Alignment,
+                             (unsigned long long)b.SizeInBytes, (unsigned long long)b.Alignment);
+            }
+        }
+        for (size_t i = 0; i < multi.size(); ++i) {
+            if (a1[i].Offset != b1[i].Offset || a1[i].Alignment != b1[i].Alignment || a1[i].SizeInBytes != b1[i].SizeInBytes) {
+                if (mismatches++ < 8) {
+                    std::fprintf(stderr, "GetResourceAllocationInfo1 item %zu: ours Offset=%llu Align=%llu Size=%llu; host Offset=%llu Align=%llu Size=%llu\n",
+                                 i, (unsigned long long)a1[i].Offset, (unsigned long long)a1[i].Alignment, (unsigned long long)a1[i].SizeInBytes,
+                                 (unsigned long long)b1[i].Offset, (unsigned long long)b1[i].Alignment, (unsigned long long)b1[i].SizeInBytes);
+                }
+            }
+        }
+
+        // Multi with invalid entry
+        std::vector<D3D12_RESOURCE_DESC> bad_multi = multi;
+        bad_multi[1].Width = 0;
+        const D3D12_RESOURCE_ALLOCATION_INFO a_bad =
+            ours4->GetResourceAllocationInfo1(0, UINT(bad_multi.size()), bad_multi.data(), a1.data());
+        const D3D12_RESOURCE_ALLOCATION_INFO b_bad =
+            host4->GetResourceAllocationInfo1(0, UINT(bad_multi.size()), bad_multi.data(), b1.data());
+        if (a_bad.SizeInBytes != b_bad.SizeInBytes || a_bad.Alignment != b_bad.Alignment) {
+            if (mismatches++ < 8) {
+                std::fprintf(stderr, "GetResourceAllocationInfo1 bad multi: ours Size=%llu Align=%llu; host Size=%llu Align=%llu\n",
+                             (unsigned long long)a_bad.SizeInBytes, (unsigned long long)a_bad.Alignment,
+                             (unsigned long long)b_bad.SizeInBytes, (unsigned long long)b_bad.Alignment);
+            }
+        }
+    }
+
+    // GetResourceAllocationInfo2 on ID3D12Device8
+    Ref<ID3D12Device8> ours8;
+    if (SUCCEEDED(ours->QueryInterface(IID_PPV_ARGS(&ours8.p)))) {
+        D3D12_RESOURCE_DESC1 d1{};
+        d1.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        d1.Width = 1000;
+        d1.Height = 1;
+        d1.DepthOrArraySize = 1;
+        d1.MipLevels = 1;
+        d1.SampleDesc.Count = 1;
+        d1.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_RESOURCE_ALLOCATION_INFO1 info1{};
+        D3D12_RESOURCE_ALLOCATION_INFO ret2 = ours8->GetResourceAllocationInfo2(0, 1, &d1, &info1);
+        if (ret2.SizeInBytes != 65536 || ret2.Alignment != 65536 || info1.Offset != 0 || info1.SizeInBytes != 65536) {
+            mismatches++;
+        }
+    }
+
     return mismatches;
 }
 
@@ -274,6 +436,11 @@ int main() {
         if (footprint_mismatches < 0)
             std::printf("GetCopyableFootprints: no host D3D12 device to compare with, skipped\n");
         EXPECT(footprint_mismatches <= 0);
+
+        const int alloc_info_mismatches = compare_allocation_info(device.p);
+        if (alloc_info_mismatches < 0)
+            std::printf("GetResourceAllocationInfo: no host D3D12 device to compare with, skipped\n");
+        EXPECT(alloc_info_mismatches <= 0);
 
         // Command objects; their GetDevice is the proxy, never the inner device.
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
@@ -689,6 +856,6 @@ int main() {
         return 1;
     }
     std::printf("Vulkan device behind the Xbox-ABI proxy: clears, zero-filled first use, uploads, texture, buffer and "
-                "BC copies, a resolve, and GetCopyableFootprints all matched\n");
+                "BC copies, a resolve, GetCopyableFootprints, and GetResourceAllocationInfo all matched\n");
     return 0;
 }

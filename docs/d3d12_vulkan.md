@@ -600,9 +600,11 @@ The trace will enumerate them.
 - `D3D12_FEATURE_FORMAT_SUPPORT`: map to `vkGetPhysicalDeviceFormatProperties`.
 - `D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT` (`D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT`): report the
   arena's limits, not the console's.
-- `GetResourceAllocationInfo` and `GetCopyableFootprints`: implement D3D12's rules locally; the game uses them to
-  suballocate and to lay out uploads. They are deterministic and public. Validate against a host D3D12 device in
-  tests if one is available; do not require one at runtime.
+- `GetResourceAllocationInfo` and `GetCopyableFootprints` (D3D-22): implemented locally matching D3D12's placement
+  rules (buffers, standard textures with 64 KB and 4 KB small alignment, MSAA textures with 4 MB alignment, 1D/2D/3D
+  subresource footprint summation, and multi-resource sequential suballocation offsets in GetResourceAllocationInfo1/2);
+  tested and validated against the host PC runtime. Validate against a host D3D12 device in tests if one is available;
+  do not require one at runtime.
 
 ### 4.2 Resources, heaps, placed and reserved
 

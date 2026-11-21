@@ -563,32 +563,25 @@ public:
     // Footprints for copies through a buffer: rows padded to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT (512 for planar
     // depth-stencil), subresources placed at D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, block-compressed sizes rounded up to whole blocks, depth-stencil
     // formats as two planes. d3d12_vulkan_device_test compares every output with the PC runtime's.
-    void STDMETHODCALLTYPE GetCopyableFootprints(const D3D12_RESOURCE_DESC* desc, UINT first, UINT count, UINT64 base,
-                                                 D3D12_PLACED_SUBRESOURCE_FOOTPRINT* layouts, UINT* rows,
-                                                 UINT64* row_sizes, UINT64* total) override {
-        const auto fail = [&] {
-            for (UINT i = 0; i < count; ++i) {
-                if (layouts) std::memset(&layouts[i], 0xff, sizeof(layouts[i]));
-                if (rows) rows[i] = ~0u;
-                if (row_sizes) row_sizes[i] = ~0ull;
-            }
-            if (total) *total = ~0ull;
-        };
-        if (!desc) return fail();
+    bool calculate_footprints(const D3D12_RESOURCE_DESC* desc, UINT first, UINT count, UINT64 base,
+                              D3D12_PLACED_SUBRESOURCE_FOOTPRINT* layouts, UINT* rows,
+                              UINT64* row_sizes, UINT64* total) const {
+        if (!desc) return false;
         const auto align = [](UINT64 value, UINT64 to) { return (value + to - 1) / to * to; };
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-            if (first != 0 || count != 1) return fail();
+            if (first != 0 || count != 1) return false;
             if (layouts) layouts[0] = {base, {DXGI_FORMAT_UNKNOWN, UINT(desc->Width), 1, 1,
                                               UINT(align(desc->Width, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT))}};
             if (rows) rows[0] = 1;
             if (row_sizes) row_sizes[0] = desc->Width;
             if (total) *total = desc->Width;
-            return;
+            return true;
         }
         const bool volume = desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-        if (!volume && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+        if (!volume && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D) {
             log_once("GetCopyableFootprints dimension not supported:", desc->Dimension);
-            return fail();
+            return false;
         }
         const Format format = vulkan_format(desc->Format, true);  // typeless depth families are planar either way
         UINT mips = desc->MipLevels;
@@ -597,7 +590,7 @@ public:
             for (UINT64 size = std::max<UINT64>({desc->Width, desc->Height, depth}); size; size >>= 1) ++mips;
         const UINT planes = (format.aspects & VK_IMAGE_ASPECT_STENCIL_BIT) ? 2 : 1;
         const UINT per_plane = mips * (volume ? 1 : desc->DepthOrArraySize);
-        if (!format.format || UINT64(first) + count > UINT64(per_plane) * planes) return fail();
+        if (!format.format || UINT64(first) + count > UINT64(per_plane) * planes) return false;
 
         UINT64 offset = base, end = base;
         for (UINT i = 0; i < count; ++i) {
@@ -605,7 +598,7 @@ public:
             const VkImageAspectFlags aspect =
                 planes == 2 ? (plane ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT) : format.aspects;
             const leonida::BlockFormat block = leonida::block_format(format.format, aspect);
-            if (!block.bytes) return fail();
+            if (!block.bytes) return false;
             const UINT width = std::max<UINT>(1, UINT(desc->Width >> mip)), height = std::max<UINT>(1, desc->Height >> mip);
             const UINT blocks_wide = (width + block.block - 1) / block.block;
             const UINT blocks_high = (height + block.block - 1) / block.block;
@@ -627,7 +620,356 @@ public:
             offset += total_rows * pitch;
         }
         if (total) *total = end - base;
+        return true;
     }
+
+    void STDMETHODCALLTYPE GetCopyableFootprints(const D3D12_RESOURCE_DESC* desc, UINT first, UINT count, UINT64 base,
+                                                 D3D12_PLACED_SUBRESOURCE_FOOTPRINT* layouts, UINT* rows,
+                                                 UINT64* row_sizes, UINT64* total) override {
+        if (!calculate_footprints(desc, first, count, base, layouts, rows, row_sizes, total)) {
+            for (UINT i = 0; i < count; ++i) {
+                if (layouts) std::memset(&layouts[i], 0xff, sizeof(layouts[i]));
+                if (rows) rows[i] = ~0u;
+                if (row_sizes) row_sizes[i] = ~0ull;
+            }
+            if (total) *total = ~0ull;
+        }
+    }
+
+struct FormatBlockInfo {
+    UINT bytes = 0;
+    UINT block = 1;
+};
+
+    static FormatBlockInfo format_block_info(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+    case DXGI_FORMAT_R32G32B32A32_FLOAT:
+    case DXGI_FORMAT_R32G32B32A32_UINT:
+    case DXGI_FORMAT_R32G32B32A32_SINT:
+        return {16, 1};
+
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_UNORM:
+    case DXGI_FORMAT_R16G16B16A16_UINT:
+    case DXGI_FORMAT_R16G16B16A16_SNORM:
+    case DXGI_FORMAT_R16G16B16A16_SINT:
+    case DXGI_FORMAT_R32G32_TYPELESS:
+    case DXGI_FORMAT_R32G32_FLOAT:
+    case DXGI_FORMAT_R32G32_UINT:
+    case DXGI_FORMAT_R32G32_SINT:
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+    case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+        return {8, 1};
+
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_UINT:
+    case DXGI_FORMAT_R11G11B10_FLOAT:
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R8G8B8A8_UINT:
+    case DXGI_FORMAT_R8G8B8A8_SNORM:
+    case DXGI_FORMAT_R8G8B8A8_SINT:
+    case DXGI_FORMAT_R16G16_TYPELESS:
+    case DXGI_FORMAT_R16G16_FLOAT:
+    case DXGI_FORMAT_R16G16_UNORM:
+    case DXGI_FORMAT_R16G16_UINT:
+    case DXGI_FORMAT_R16G16_SNORM:
+    case DXGI_FORMAT_R16G16_SINT:
+    case DXGI_FORMAT_R32_TYPELESS:
+    case DXGI_FORMAT_D32_FLOAT:
+    case DXGI_FORMAT_R32_FLOAT:
+    case DXGI_FORMAT_R32_UINT:
+    case DXGI_FORMAT_R32_SINT:
+    case DXGI_FORMAT_R24G8_TYPELESS:
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+    case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+        return {4, 1};
+
+    case DXGI_FORMAT_R8G8_TYPELESS:
+    case DXGI_FORMAT_R8G8_UNORM:
+    case DXGI_FORMAT_R8G8_UINT:
+    case DXGI_FORMAT_R8G8_SNORM:
+    case DXGI_FORMAT_R8G8_SINT:
+    case DXGI_FORMAT_R16_TYPELESS:
+    case DXGI_FORMAT_R16_FLOAT:
+    case DXGI_FORMAT_D16_UNORM:
+    case DXGI_FORMAT_R16_UNORM:
+    case DXGI_FORMAT_R16_UINT:
+    case DXGI_FORMAT_R16_SNORM:
+    case DXGI_FORMAT_R16_SINT:
+    case DXGI_FORMAT_B5G6R5_UNORM:
+    case DXGI_FORMAT_B5G5R5A1_UNORM:
+        return {2, 1};
+
+    case DXGI_FORMAT_R8_TYPELESS:
+    case DXGI_FORMAT_R8_UNORM:
+    case DXGI_FORMAT_R8_UINT:
+    case DXGI_FORMAT_R8_SNORM:
+    case DXGI_FORMAT_R8_SINT:
+    case DXGI_FORMAT_A8_UNORM:
+        return {1, 1};
+
+    case DXGI_FORMAT_BC1_TYPELESS:
+    case DXGI_FORMAT_BC1_UNORM:
+    case DXGI_FORMAT_BC1_UNORM_SRGB:
+    case DXGI_FORMAT_BC4_TYPELESS:
+    case DXGI_FORMAT_BC4_UNORM:
+    case DXGI_FORMAT_BC4_SNORM:
+        return {8, 4};
+
+    case DXGI_FORMAT_BC2_TYPELESS:
+    case DXGI_FORMAT_BC2_UNORM:
+    case DXGI_FORMAT_BC2_UNORM_SRGB:
+    case DXGI_FORMAT_BC3_TYPELESS:
+    case DXGI_FORMAT_BC3_UNORM:
+    case DXGI_FORMAT_BC3_UNORM_SRGB:
+    case DXGI_FORMAT_BC5_TYPELESS:
+    case DXGI_FORMAT_BC5_UNORM:
+    case DXGI_FORMAT_BC5_SNORM:
+    case DXGI_FORMAT_BC6H_TYPELESS:
+    case DXGI_FORMAT_BC6H_UF16:
+    case DXGI_FORMAT_BC6H_SF16:
+    case DXGI_FORMAT_BC7_TYPELESS:
+    case DXGI_FORMAT_BC7_UNORM:
+    case DXGI_FORMAT_BC7_UNORM_SRGB:
+        return {16, 4};
+
+    default:
+        return {0, 0};
+    }
+}
+
+    D3D12_RESOURCE_ALLOCATION_INFO single_resource_allocation_info(const D3D12_RESOURCE_DESC& desc) const {
+        constexpr UINT64 kInvalid = ~0ull;
+        const auto align = [](UINT64 value, UINT64 to) { return (value + to - 1) / to * to; };
+
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_UNKNOWN) {
+            return {kInvalid, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};
+        }
+
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            if (!desc.Width || desc.Height != 1 || desc.DepthOrArraySize != 1 || desc.MipLevels != 1 ||
+                desc.SampleDesc.Count != 1) {
+                return {kInvalid, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};
+            }
+            if (desc.Alignment != 0 && desc.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {
+                return {kInvalid, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};
+            }
+            return {align(desc.Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT),
+                    D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};
+        }
+
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
+            desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+            return {kInvalid, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};
+        }
+
+        if (!desc.Width || !desc.Height || !desc.DepthOrArraySize) {
+            return {kInvalid, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};
+        }
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && desc.Height != 1) {
+            return {kInvalid, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};
+        }
+
+        const bool msaa = desc.SampleDesc.Count > 1;
+        if (msaa) {
+            if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.MipLevels > 1 ||
+                !(desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))) {
+                return {kInvalid, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};
+            }
+        }
+
+        const Format format = vulkan_format(desc.Format, true);
+        if (!format.format) {
+            return {kInvalid, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};
+        }
+        const FormatBlockInfo block_info = format_block_info(desc.Format);
+        if (!block_info.bytes) {
+            return {kInvalid, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};
+        }
+
+        const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        const UINT depth = volume ? desc.DepthOrArraySize : 1;
+        const UINT64 max_dim = std::max<UINT64>({desc.Width, desc.Height, depth});
+        UINT max_mips = 0;
+        for (UINT64 s = max_dim; s; s >>= 1) ++max_mips;
+
+        UINT mips = desc.MipLevels;
+        if (!mips) {
+            mips = max_mips;
+        } else if (mips > max_mips) {
+            return {kInvalid, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};
+        }
+
+        // 4KB small resource placement alignment:
+        if (desc.Alignment == D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT) {
+            if (msaa) return {kInvalid, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};
+
+            UINT64 slice_bytes = 0;
+            for (UINT m = 0; m < mips; ++m) {
+                const UINT w = std::max<UINT>(1, UINT(desc.Width >> m));
+                const UINT h = (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) ? 1 : std::max<UINT>(1, desc.Height >> m);
+                const UINT d = volume ? std::max<UINT>(1, desc.DepthOrArraySize >> m) : 1;
+
+                UINT64 mip_bytes = 0;
+                if (block_info.block > 1) {
+                    const UINT blocks_w = (w + block_info.block - 1) / block_info.block;
+                    const UINT blocks_h = (h + block_info.block - 1) / block_info.block;
+                    mip_bytes = UINT64(blocks_w) * blocks_h * d * block_info.bytes;
+                } else {
+                    mip_bytes = UINT64(w) * h * d * block_info.bytes;
+                }
+                slice_bytes += align(mip_bytes, D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT);
+            }
+
+            const UINT64 total_bytes = slice_bytes * (volume ? 1 : desc.DepthOrArraySize);
+            if (total_bytes <= D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {
+                return {total_bytes, D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT};
+            }
+            return {kInvalid, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};
+        }
+
+        // Standard 64KB or MSAA 4MB placement alignment:
+        UINT64 req_align = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        if (msaa) {
+            if (desc.Alignment == D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {
+                req_align = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+            } else if (desc.Alignment == 0 || desc.Alignment == D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT) {
+                req_align = D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT;
+            } else {
+                return {kInvalid, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};
+            }
+        } else if (desc.Alignment != 0 && desc.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {
+            return {kInvalid, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};
+        }
+
+        // For layout sizing, depth-stencil formats are stored unified on GPU (not split into
+        // 2 separate copy planes with staging padding): D24S8 is 32-bit, D32S8X24 is 64-bit.
+        D3D12_RESOURCE_DESC desc_copy = desc;
+        desc_copy.MipLevels = static_cast<UINT16>(mips);
+        if (desc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT) {
+            desc_copy.Format = DXGI_FORMAT_R32_UINT;
+        } else if (desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT) {
+            desc_copy.Format = DXGI_FORMAT_R32G32_FLOAT;
+        }
+
+        const UINT slices = volume ? 1 : desc.DepthOrArraySize;
+        const UINT subresources = mips * slices;
+        UINT64 total_footprint = 0;
+        if (!calculate_footprints(&desc_copy, 0, subresources, 0, nullptr, nullptr, nullptr, &total_footprint)) {
+            return {kInvalid, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};
+        }
+        if (msaa) total_footprint *= desc.SampleDesc.Count;
+
+        return {align(total_footprint, req_align), req_align};
+    }
+
+    D3D12_RESOURCE_ALLOCATION_INFO get_resource_allocation_info(
+        UINT, UINT numResourceDescs, const D3D12_RESOURCE_DESC* pResourceDescs,
+        D3D12_RESOURCE_ALLOCATION_INFO1* pResourceAllocationInfo1) const {
+        if (!numResourceDescs || !pResourceDescs) {
+            return {0, 1};
+        }
+        const auto align = [](UINT64 value, UINT64 to) { return (value + to - 1) / to * to; };
+
+        UINT64 max_align = 1;
+        bool has_invalid = false;
+        std::vector<D3D12_RESOURCE_ALLOCATION_INFO> individual(numResourceDescs);
+
+        for (UINT i = 0; i < numResourceDescs; ++i) {
+            individual[i] = single_resource_allocation_info(pResourceDescs[i]);
+            if (individual[i].SizeInBytes == ~0ull) {
+                has_invalid = true;
+            }
+            max_align = std::max(max_align, individual[i].Alignment);
+        }
+
+        if (has_invalid) {
+            if (pResourceAllocationInfo1) {
+                std::memset(pResourceAllocationInfo1, 0, numResourceDescs * sizeof(D3D12_RESOURCE_ALLOCATION_INFO1));
+            }
+            return {~0ull, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};
+        }
+
+        UINT64 offset = 0;
+        for (UINT i = 0; i < numResourceDescs; ++i) {
+            offset = align(offset, individual[i].Alignment);
+            if (pResourceAllocationInfo1) {
+                pResourceAllocationInfo1[i] = {offset, individual[i].Alignment, individual[i].SizeInBytes};
+            }
+            offset += individual[i].SizeInBytes;
+        }
+
+        return {align(offset, max_align), max_align};
+    }
+
+    D3D12_RESOURCE_ALLOCATION_INFO get_resource_allocation_info2(
+        UINT visibleMask, UINT numResourceDescs, const D3D12_RESOURCE_DESC1* pResourceDescs,
+        D3D12_RESOURCE_ALLOCATION_INFO1* pResourceAllocationInfo1) const {
+        if (!numResourceDescs || !pResourceDescs) {
+            return {0, 1};
+        }
+        std::vector<D3D12_RESOURCE_DESC> descs(numResourceDescs);
+        for (UINT i = 0; i < numResourceDescs; ++i) {
+            descs[i] = {pResourceDescs[i].Dimension, pResourceDescs[i].Alignment, pResourceDescs[i].Width,
+                        pResourceDescs[i].Height, pResourceDescs[i].DepthOrArraySize, pResourceDescs[i].MipLevels,
+                        pResourceDescs[i].Format, pResourceDescs[i].SampleDesc, pResourceDescs[i].Layout,
+                        pResourceDescs[i].Flags};
+        }
+        return get_resource_allocation_info(visibleMask, numResourceDescs, descs.data(), pResourceAllocationInfo1);
+    }
+
+#if defined(_MSC_VER) || !defined(_WIN32)
+    D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE GetResourceAllocationInfo(
+        UINT visibleMask, UINT numResourceDescs, const D3D12_RESOURCE_DESC* pResourceDescs) override {
+        return get_resource_allocation_info(visibleMask, numResourceDescs, pResourceDescs, nullptr);
+    }
+    D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE GetResourceAllocationInfo1(
+        UINT visibleMask, UINT numResourceDescs, const D3D12_RESOURCE_DESC* pResourceDescs,
+        D3D12_RESOURCE_ALLOCATION_INFO1* pResourceAllocationInfo1) override {
+        return get_resource_allocation_info(visibleMask, numResourceDescs, pResourceDescs, pResourceAllocationInfo1);
+    }
+    D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE GetResourceAllocationInfo2(
+        UINT visibleMask, UINT numResourceDescs, const D3D12_RESOURCE_DESC1* pResourceDescs,
+        D3D12_RESOURCE_ALLOCATION_INFO1* pResourceAllocationInfo1) override {
+        return get_resource_allocation_info2(visibleMask, numResourceDescs, pResourceDescs, pResourceAllocationInfo1);
+    }
+#else
+    D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE GetResourceAllocationInfo(
+        D3D12_RESOURCE_ALLOCATION_INFO* RetVal, UINT visibleMask, UINT numResourceDescs,
+        const D3D12_RESOURCE_DESC* pResourceDescs) override {
+        *RetVal = get_resource_allocation_info(visibleMask, numResourceDescs, pResourceDescs, nullptr);
+        return RetVal;
+    }
+    D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE GetResourceAllocationInfo1(
+        D3D12_RESOURCE_ALLOCATION_INFO* RetVal, UINT visibleMask, UINT numResourceDescs,
+        const D3D12_RESOURCE_DESC* pResourceDescs,
+        D3D12_RESOURCE_ALLOCATION_INFO1* pResourceAllocationInfo1) override {
+        *RetVal = get_resource_allocation_info(visibleMask, numResourceDescs, pResourceDescs, pResourceAllocationInfo1);
+        return RetVal;
+    }
+    D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE GetResourceAllocationInfo2(
+        D3D12_RESOURCE_ALLOCATION_INFO* RetVal, UINT visibleMask, UINT numResourceDescs,
+        const D3D12_RESOURCE_DESC1* pResourceDescs,
+        D3D12_RESOURCE_ALLOCATION_INFO1* pResourceAllocationInfo1) override {
+        *RetVal = get_resource_allocation_info2(visibleMask, numResourceDescs, pResourceDescs, pResourceAllocationInfo1);
+        return RetVal;
+    }
+#endif
 
     HRESULT STDMETHODCALLTYPE CheckFeatureSupport(D3D12_FEATURE feature, void* data, UINT size) override {
         log_once("CheckFeatureSupport feature", feature);
