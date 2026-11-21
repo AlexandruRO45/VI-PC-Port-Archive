@@ -220,6 +220,8 @@ if(BUILD_TESTING)
   add_test(NAME command_list COMMAND command_list_test)
   add_executable(descriptor_table_test test/descriptor_table_test.cpp)
   add_test(NAME descriptor_table COMMAND descriptor_table_test)
+  add_executable(shader_library_test test/shader_library_test.cpp)
+  add_test(NAME shader_library COMMAND shader_library_test)
   if(WIN32)
     # Optional: skips unless LEONIDA_GAME_DIR and LEONIDA_MOVIE are set.
     add_executable(bink_decode_test

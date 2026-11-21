@@ -254,6 +254,18 @@ Two pieces of milestone M2 that the device does not use yet, built and tested on
     a table that has grown gets a new buffer behind binding 2: `flush_needs_idle()` says when a flush would do
     either, so the owner can wait until no command buffer that uses the set is still running.
 
+Started for the compute path (no pipelines yet):
+- `runtime/src/shader_library.h` finds the translated SPIR-V for a shader the game hands to D3D12 (section 3.6).
+  It extracts the FSSM program from the DXBC container (DXIL → XDAT entry 0x0D → XBCH → zlib) and looks up its
+  SHA-256 as `fssm_sha256` in `spirv/index.json`. Its own inflate, SHA-256 and JSON reader keep it free of
+  dependencies (`shader_library_test`).
+- Root signatures use the model already on `main` (`runtime/src/root_signature.h`, `rt::rootsig`): `parse_rts0`
+  reads the serialized blob and `pack()` lays out the 32 user-data dwords by the section 3.5 default mapping,
+  refusing anything that would spill.
+- The IR records `Dispatch` with its user data captured at record time. Replay binds the pipeline, pushes the
+  144-byte block (s0..s31, heap base, code base) and dispatches. Not wired up yet: the GPU address arena,
+  `CreateRootSignature`, compute PSOs and the command list's root-argument setters.
+
 Known gaps: the game's present entry point (DXGI factory/swapchain or `PresentX`; the presenter above is what
 either calls), HDR and fullscreen; shader-resource, UAV and constant-buffer views, samplers, root signatures, PSOs,
 draws, volume attachment views, placed and reserved resources, `GetGPUVirtualAddress` (the shared buffer arena),
