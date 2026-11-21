@@ -3,6 +3,8 @@
 //
 // The harness EXE is built next to this test by CMake (custom entry, no CRT, one import). No game data.
 
+#include <windows.h>
+
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -45,6 +47,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "pe_hello_test: harness not found: %s\n", harness.string().c_str());
         return 1;
     }
+    // Loading the shim DLL registers its table in this process; the loader then binds the harness imports to it.
+    HMODULE shim_dll = LoadLibraryA("leonida_shims.dll");
+    EXPECT(shim_dll != nullptr);
     std::error_code ec;
     std::filesystem::remove("hello_triangle.bmp", ec);  // stale output must not pass the test
 

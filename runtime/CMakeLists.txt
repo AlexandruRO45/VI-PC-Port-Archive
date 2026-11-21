@@ -453,15 +453,26 @@ if(Vulkan_FOUND)
     add_dependencies(leonida_test_harness leonida_d3d12_import_lib)
     set_target_properties(leonida_test_harness PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
+    # The shims live in their own DLL: it exports the entry points and registers the same table the loader resolves.
+    set(LEONIDA_SHIMS_DEF ${CMAKE_CURRENT_BINARY_DIR}/leonida_shims.def)
+    file(WRITE ${LEONIDA_SHIMS_DEF} "LIBRARY leonida_shims.dll\nEXPORTS\n  LeonidaRenderTriangle\n  LeonidaPresentWindow\n")
+    add_library(leonida_shims SHARED test/pe_hello_shims.cpp shims/registry.cpp)
+    target_include_directories(leonida_shims PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                                                     ${CMAKE_CURRENT_SOURCE_DIR}/shims
+                                                     ${CMAKE_CURRENT_SOURCE_DIR}/test)
+    target_link_libraries(leonida_shims PRIVATE gta6rt_d3d12_com Vulkan::Headers ${CMAKE_DL_LIBS})
+    target_link_options(leonida_shims PRIVATE "/DEF:${LEONIDA_SHIMS_DEF}")
+    set_target_properties(leonida_shims PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+
     add_executable(pe_hello_test
       test/pe_hello_test.cpp
-      test/pe_hello_shims.cpp
       src/pe_loader.cpp
       shims/registry.cpp)
     target_include_directories(pe_hello_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
                                                      ${CMAKE_CURRENT_SOURCE_DIR}/shims
                                                      ${CMAKE_CURRENT_SOURCE_DIR}/test)
-    target_link_libraries(pe_hello_test PRIVATE gta6rt_d3d12_com Vulkan::Headers ${CMAKE_DL_LIBS})
+    target_link_libraries(pe_hello_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+    add_dependencies(pe_hello_test leonida_shims)
     target_compile_definitions(pe_hello_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(pe_hello_test PRIVATE /W4 /permissive- /utf-8)
     add_dependencies(pe_hello_test leonida_test_harness)

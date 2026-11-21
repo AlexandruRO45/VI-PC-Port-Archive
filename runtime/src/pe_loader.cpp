@@ -371,6 +371,14 @@ void* Loader::resolve(Module& m, const std::string& dll, const std::string& name
         m.imports.push_back({dll, sym, Binding::Shim});
         return p;
     }
+    // The shim DLL is a real module with exports: when it is loaded, its export wins over a host namesake. This is
+    // what lets a game EXE import d3d12.dll!D3D12CreateDevice and land in leonida_shims.dll.
+    if (HMODULE shim = GetModuleHandleA("leonida_shims.dll")) {
+        if (FARPROC p = GetProcAddress(shim, by_ordinal ? MAKEINTRESOURCEA(ordinal) : name.c_str())) {
+            m.imports.push_back({dll, sym, Binding::Shim});
+            return reinterpret_cast<void*>(p);
+        }
+    }
     // Bundled game module (an Xbox build that ships beside the game)?
     auto bundled = game_dir_ / dll;
     if (!prefer_host_copy(key) && std::filesystem::exists(bundled)) {
