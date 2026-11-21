@@ -53,6 +53,7 @@ CPU_FIXTURES = {
     "working_set_delta": "cpu_working_set_delta",
     "exe_entry": "cpu_aot_exe_entry",
     "address_size": "cpu_aot_address_size",
+    "avx2_regs": "cpu_aot_avx2_regs",
     "call_pair": "cpu_aot_call_pair",
     "register_probe": None,  # measurement harness
     "two_imports": None,     # mapped and run unchanged by pe_map
