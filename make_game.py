@@ -22,6 +22,7 @@ Stages, in order (each skips work that is already done, so a stopped build conti
               the driver rejects, and save the pipeline cache next to the port so the first boot doesn't compile
 """
 import argparse
+import glob
 import json
 import os
 import shutil
@@ -268,19 +269,69 @@ def shaders(game: str, work: str, jobs: int) -> None:
     if not os.path.isdir(os.path.join(dxbc, "fssm")):
         log("shaders: unpacking native code")
         py("fssm_unpack.py", dxbc)
-    disasm = os.path.join(sh, "disasm")
+    # rdna2spirv.py finds the carve index and each shader's .dxbc as siblings of the .s files, so the
+    # disassembly belongs inside dxbc/. Beside it, every shader loses its stage and is rejected as unsupported.
+    disasm = os.path.join(dxbc, "disasm")
     if not os.path.isdir(disasm) or len(os.listdir(disasm)) < 1000:
         need(os.environ.get("LLVM_MC", "llvm-mc"),
              "Install LLVM 21 or newer with the AMDGPU target, or set LLVM_MC to llvm-mc's full path.")
         log("shaders: disassembling (gfx1013)")
         py("shader_disasm.py", os.path.join(dxbc, "fssm"), "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs)
     spirv = os.path.join(sh, "spirv")
-    if not os.path.isdir(spirv) or len(os.listdir(spirv)) < 1000:
+    # index.json is written only when a translation run finishes, so its presence marks the step complete. A
+    # directory holding a few thousand outputs is not a completion mark: an interrupted run leaves those too.
+    if not os.path.isfile(os.path.join(spirv, "index.json")):
         need("spirv-as", "Install the Vulkan SDK (it includes spirv-as and spirv-val) and reopen the terminal.")
         need("spirv-val", "Install the Vulkan SDK and reopen the terminal.")
-        log("shaders: translating RDNA2 to SPIR-V (the longest step)")
-        py("rdna2spirv.py", disasm, "--out", spirv)
+        translate(disasm, spirv, jobs)
     log("shaders: done")
+
+
+def translate(disasm: str, spirv: str, jobs: int) -> None:
+    """Translate the whole disassembled corpus, one process per shard, then merge the shard indexes.
+
+    Every shader is independent, and each one also costs two child processes (spirv-as, then spirv-val), so
+    this step is the build's worst serial bottleneck: on one core it is the several hours the README warns
+    about. Sharding splits the sorted corpus into `jobs` interleaved runs whose indexes merge back into
+    index.json. A shard that dies is named instead of being papered over, and the merged index is measured
+    against the corpus so a short run cannot pass for a complete one.
+    """
+    corpus = sorted(f for f in os.listdir(disasm) if f.endswith(".s"))
+    shards = max(1, min(jobs, len(corpus)))
+    os.makedirs(spirv, exist_ok=True)
+    # Per-run scratch: a part left by an older sharding (or an older corpus) must not reach this merge.
+    for stale in glob.glob(os.path.join(spirv, "index.part*.json")):
+        os.remove(stale)
+    if shards == 1:
+        log(f"shaders: translating {len(corpus):,} shaders to SPIR-V (the longest step)")
+        py("rdna2spirv.py", disasm, "--out", spirv)
+    else:
+        log(f"shaders: translating {len(corpus):,} shaders to SPIR-V on {shards} cores (the longest step)")
+        log(f"  rdna2spirv.py <disasm> --out <spirv> --shard i/{shards}  (x{shards})")
+        procs = []
+        for i in range(shards):
+            cmd = [sys.executable, "-I", os.path.join(TOOLS, "rdna2spirv.py"), disasm,
+                   "--out", spirv, "--shard", f"{i}/{shards}"]
+            procs.append((i, subprocess.Popen([str(a) for a in cmd])))
+        failed = []
+        for i, p in procs:
+            code = p.wait()
+            if code != 0:
+                failed.append((i, code))
+        if failed:
+            fail("shader translation failed in shard(s) "
+                 + ", ".join(f"{i} (exit {code})" for i, code in failed)
+                 + f" of {shards}. Run the shaders stage again to redo them.")
+        py("rdna2spirv.py", disasm, "--out", spirv, "--merge")
+    got = 0
+    index = os.path.join(spirv, "index.json")
+    if os.path.isfile(index):
+        with open(index, encoding="utf-8") as f:
+            got = len(json.load(f))
+    log(f"shaders: {got:,} of {len(corpus):,} shaders in the pipeline index")
+    if got < len(corpus):
+        log(f"shaders: {len(corpus) - got:,} shader(s) did not reach the index (Unsupported or failing spirv-val); "
+            "the shard output above names them")
 
 
 # ---------------------------------------------------------------- assets
@@ -384,7 +435,8 @@ def main() -> int:
     ap.add_argument("--stages", default=",".join(STAGES), help="comma list from: " + ",".join(STAGES))
     ap.add_argument("--check", action="store_true", help="only check the game files")
     ap.add_argument("--full-check", action="store_true", help="also compare SHA-256 of every file (slow)")
-    ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
+    ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2),
+                    help="processes for disassembly and shader translation (default: half the cores)")
     ap.add_argument("--find", action="store_true", help="only list the game copies found on this PC")
     a = ap.parse_args()
     below_normal()

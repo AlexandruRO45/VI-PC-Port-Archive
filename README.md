@@ -92,7 +92,7 @@ python -I make_game.py --stages shaders,assets         # only some stages
 
 Stages run in order: `check`, `shaders`, `assets`, `runtime`, `pipelines` (creates every translated shader on your
 GPU driver and saves a pipeline cache, so the first boot doesn't compile them). The shader translation is the longest step: several
-hours on one core for now.
+hours, split across cores by `--jobs` (the translator shards the corpus and merges the per-shard indexes).
 
 ## How it works
 
