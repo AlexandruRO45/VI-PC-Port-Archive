@@ -7,9 +7,19 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from ffx_dispatch_aot import disassemble, translate
+from ffx_scratch_reference import network
 
 
 def main(assembler, objcopy, library):
+    # A signed i8 dot product, replicated low half, clamp and byte insert
+    # have independent integer answers on these source-owned test operands.
+    fixture = ["buffer_load_dwordx4 v[0:3], v4, s[8:11], 0 offen",
+               "v_dot4_i32_i8 v0, v0, 0x01010101, 7",
+               "v_dot4_i32_i8 v1, v1, -6, 0 op_sel_hi:[1,0,1]",
+               "v_cvt_pk_u8_f32 v2, v2, 2, v3",
+               "buffer_store_dwordx4 v[0:3], v4, s[8:11], 0 offen"]
+    operands = [[0x7f0080ff, 0x01020304, 0x43960000, 0x12345678]]
+    assert network(list(enumerate(fixture)), operands, b"", 24) == [5, (-40)&0xffffffff, 0x12ff5678, 0x12345678]
     # Literal low half decrements x; its zero high half must leave y unchanged.
     # LLVM 15 prints this literal as -1 when disassembling a packed add.
     with tempfile.TemporaryDirectory() as tmp:

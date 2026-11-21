@@ -1,6 +1,7 @@
 #include "../src/rgb9e5.hlsli"
 
-#define PRODUCER_ROOT "DescriptorTable(UAV(u2), UAV(u1), UAV(u6)), SRV(t3), SRV(t9)"
+#define SCRATCH_ROOT "UAV(u11)"
+#define PRODUCER_ROOT "DescriptorTable(UAV(u2), UAV(u1), UAV(u6)), SRV(t3), SRV(t9), UAV(u11), UAV(u12)"
 #define CONSUMER_ROOT "DescriptorTable(SRV(t18), UAV(u11))"
 
 // The two read-only producer fixtures use RGB DWORD triples at integer coordinates.
@@ -9,6 +10,17 @@ ByteAddressBuffer historyInput : register(t9);
 RWTexture2D<float4> historyOutput : register(u1);
 RWTexture2D<float4> recurrent : register(u6);
 RWTexture2D<float4> finalOutput : register(u11);
+RWByteAddressBuffer work : register(u11);
+RWByteAddressBuffer loadTrace : register(u12);
+void audit_load(uint2 cell, uint tap, uint address, uint4 value) {
+    uint slot = ((cell.y*4 + cell.x)*9 + tap)*20;
+    loadTrace.Store(slot,address);
+    loadTrace.Store4(slot+4,value);
+}
+uint mul_high(uint a, uint b) {
+    uint middle = (a>>16)*(b&65535u) + (((a&65535u)*(b&65535u))>>16);
+    return (a>>16)*(b>>16) + (middle>>16) + (((middle&65535u)+(a&65535u)*(b>>16))>>16);
+}
 #if STORAGE_Packed
 RWTexture2D<uint> target16 : register(u2);
 Texture2D<uint> source16 : register(t18);

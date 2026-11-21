@@ -222,7 +222,7 @@ With sharpening enabled, the default i8 graph first touches the physical ID 16 t
 | `0xe244`, `0xe2b9`, `0xe363`, `0xe3cd` | The scheduler resolves SRVs through the primary resource array and UAVs through the mirror, sets the job type to compute (2), then calls the enqueue callback. |
 | `0x137b2`, `0x13898`, `0x138ac` | The sharpening flag gates the extra RCAS job. The separate pipeline at provider offset `0x248` selects the RCAS container at `0x701b0`. The provider then calls the execute callback. |
 
-The package build translates the x64 alias updates and the two grid calculations. At 1920×1080 they produce 60×34×1 and 120×68×1 groups. The GPU replay uses an 8×4 logical image, one group per job, on the actual provider intermediate at index 4. Pass 26 has 256 threads per group and RCAS has 64. The host binds source-owned scene and history inputs as RGB buffers, supplies zero scratch and unit exposure, and uses the provider's history and recurrent UAVs. Eight active lanes take the producer's direct texture path. The full-wave LDS optimization and the preceding 26 graph jobs remain open.
+The package build translates the x64 alias updates and the two grid calculations. At 1920×1080 they produce 60×34×1 and 120×68×1 groups. The GPU replay uses an 8×4 logical image, one group per job, on the actual provider intermediate at index 4. Pass 26 has 256 threads per group and RCAS has 64. The host binds source-owned scene and history inputs as RGB buffers, uses unit exposure, and uses the provider's history and recurrent UAVs. Eight active lanes take the producer's direct texture path. The next experiment connects the two immediately preceding graph jobs through scratch.
 
 Both desktop shaders come from offline decoding of the pinned native streams (3,482 producer instructions before specialization and 437 RCAS instructions). LLVM 15's gfx1030 decoder covers the producer's i8 dot instructions and its gfx1013 decoder covers RCAS. The translator keeps the original packed literal DWORDs, including the zero high half of the packed offset that decrements x. [AMD RDNA 2 instruction set](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
 
@@ -239,6 +239,30 @@ ctest --test-dir out/build/ffx-device -R '^ffx_provider_loop_' --no-tests=error 
 ```
 
 The local log reports `dispatch=package-aot`. Public Windows CI runs source-built descriptor and dispatch controls on WARP (`dispatch=desktop-control`). Linux CI assembles an independent integer-coordinate regression for the translator.
+
+### Last writers of the pass 26 scratch reads
+
+The default FSR4-i8 graph with tier zero, unit render/output ratio and sharpening enabled schedules passes 24 and 25 immediately before pass 26. At provider RVA `0x136a7` the inclusion mask has bit 25 set. Other scheduling modes can skip the padding job. In the 8×4 case the host rounds both dimensions up to multiples of eight at `0x11f94`. Tensor 13 uses half that aligned size (4×4). The dispatch builder at `0x7e1c` and its padding helper at `0x7730` yield grids of 1×4×1 and 2×1×1 groups respectively.
+
+Both kernels bind the provider's raw scratch UAV at `u11` (resource ID 22, index 12). Pass 24 performs its i8 convolution and stores 16 bytes at shader PC `0x218c`. With plane base `0x7f4bc0`, row stride `0x3c20` and 16 bytes per column, its output starts at column 1, row 1. The launched 64-wide groups also write beyond the four active columns. Pass 25's store at shader PC `0x200` writes four zero DWORDs. Its 44 active lanes cover the top and bottom rows, the left column and five columns of right padding around the 4×4 interior.
+
+Pass 26 has eight active lanes with cell coordinates `(x,y)` in `[0,4) × [0,2)`. Its nine loads read at `base + (y+dy)*stride + 16*(x+dx)`. For a given address, interior columns 1–4 on rows 1–3 of the read window have pass 24 as last writer. All other addresses in that window have pass 25 as last writer.
+
+| Pass 26 shader PC | (dx, dy) | Lanes reading pass 24 | Lanes reading pass 25 |
+|---|---|---:|---:|
+| `0x14c` | (0, 0) | 3 | 5 |
+| `0x154` | (1, 0) | 4 | 4 |
+| `0x15c` | (2, 0) | 3 | 5 |
+| `0x164` | (0, 1) | 6 | 2 |
+| `0x16c` | (1, 1) | 8 | 0 |
+| `0x174` | (2, 1) | 6 | 2 |
+| `0x17c` | (0, 2) | 6 | 2 |
+| `0x184` | (1, 2) | 8 | 0 |
+| `0x18c` | (2, 2) | 6 | 2 |
+
+The reproduction commands above also translate the two upstream shaders and use four 64-byte constant ranges from the pinned model initializer. The test seeds the pass 24 input with either zero or a deterministic pattern, fills the output region with a sentinel, and uses the same GPU buffer across all three passes. It copies the 6×4 read window after each writer and records the address and all four DWORDs at each of the 72 pass 26 loads. A third control bypasses both writers and supplies zero scratch directly to pass 26. Model biases can produce nonzero activations even from a zero upstream input.
+
+A separate Python evaluator checks the scratch words and the four history-blend logits per lane using signed-byte dot products. Spatially constant, distinct scene and history colors give a per-pixel blend reference for resource 16. The existing five-tap FP32 reference checks all 256 final RCAS pixels, including the surrounding pattern. Switching the upstream input changed all 32 active pixels at both stages on RTX 4060 Laptop, native RGB9E5 WARP and forced R32_UINT WARP. Both adapters reported zero debug warnings and errors. The tensor feeding pass 24 remains a fixture; the full-wave LDS branch of pass 26 is a separate open path.
 
 ### FidelityFX context creation and ownership
 

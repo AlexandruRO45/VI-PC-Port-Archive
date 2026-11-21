@@ -1,5 +1,6 @@
 #define NOMINMAX
 #include "ffx_provider_loop.h"
+#include "ffx_dispatch_scratch.h"
 #include "bvh_fixture.h"
 #include "producerNative.h"
 #include "producerPacked.h"
@@ -108,7 +109,7 @@ RGB sharpen(const std::vector<uint32_t>& words, int x, int y, const RGB& center)
 #endif
 }
 
-void check_ffx_dispatch(LoopContext& ctx, const void* records)
+static std::vector<uint32_t> run_dispatch(LoopContext& ctx, const void* records, ScratchInput input)
 {
     auto* device = ctx.probe.device;
     if (producer_grid(1920,1080) != DispatchGrid{60,34,1} ||
@@ -157,7 +158,7 @@ void check_ffx_dispatch(LoopContext& ctx, const void* records)
     const RGB log_color{0.125f,0.25f,0.375f};
     RGB linear;
     for (UINT c=0; c<3; ++c)
-        linear[c] = (std::exp2(log_scale * log_color[c])-1)/150;
+        linear[c] = (std::exp2(log_scale * log_color[c]*0.5f)-1)/150;
     auto scene = bvh_fixture::upload(device, std::vector<RGB>(32, linear));
     auto history = bvh_fixture::upload(device, std::vector<RGB>(32, log_color));
 
@@ -175,6 +176,7 @@ void check_ffx_dispatch(LoopContext& ctx, const void* records)
     const D3D12_SHADER_BYTECODE r = packed ? D3D12_SHADER_BYTECODE{rcasPacked,sizeof(rcasPacked)}
                                           : D3D12_SHADER_BYTECODE{rcasNative,sizeof(rcasNative)};
     bvh_fixture::Kernel writer(device,p), reader(device,r);
+    DispatchScratch scratch(device,ctx.objects.at(provider.resources.at(22)).Get(),input);
     ComputeCommands cmd(device, writer.pipeline.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
     auto* list = cmd.list.Get();
     auto tex = texture_location(intermediate), out = texture_location(output.Get());
@@ -190,12 +192,16 @@ void check_ffx_dispatch(LoopContext& ctx, const void* records)
     auto* visible = heap.Get();
     list->SetDescriptorHeaps(1,&visible);
     auto gpu = heap->GetGPUDescriptorHandleForHeapStart();
+    scratch.produce(list);
+    list->SetPipelineState(writer.pipeline.Get());
     list->SetComputeRootSignature(writer.root.Get());
     list->SetComputeRootDescriptorTable(0,gpu);
     list->SetComputeRootShaderResourceView(1,scene->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(2,history->GetGPUVirtualAddress());
+    scratch.bind_consumer(list);
     auto groups = producer_grid(8,4);
     list->Dispatch(groups[0],groups[1],groups[2]);
+    scratch.finish(list);
     transition(list,intermediate,uav,sample);
     list->SetPipelineState(reader.pipeline.Get());
     list->SetComputeRootSignature(reader.root.Get());
@@ -211,14 +217,30 @@ void check_ffx_dispatch(LoopContext& ctx, const void* records)
     list->CopyTextureRegion(&dst,0,0,0,&out,nullptr);
     transition(list,intermediate,D3D12_RESOURCE_STATE_COPY_SOURCE,uav);
     cmd.submit_and_wait(device);
+    scratch.verify();
     const auto words = bvh_fixture::read(back.Get(),seed.size());
     for (UINT y=0; y<17; ++y)
         for (UINT x=0; x<17; ++x) {
             const bool active = x<8 && y<4;
             const auto raw = words[y*64+x];
             const auto color = decoded(raw);
-            if (active ? color != log_color : raw != guard_word(x,y))
-                throw std::runtime_error("Pass 26 intermediate or guard texel mismatch");
+            if (active) {
+                const float history_weight=scratch.expected_history_fraction(x,y);
+                const float gain=0.5f+0.5f*history_weight;
+                int exponent;
+                std::frexp(log_color[2]*gain,&exponent);
+                const float unit=std::ldexp(1.f,exponent-9);
+                for (UINT c=0; c<3; ++c) {
+                    const float expected=log_color[c]*gain;
+                    if (std::abs(color[c]-expected)>0.501f*unit+0.000001f) {
+                        std::fprintf(stderr,"scratch mode=%u pixel=(%u,%u) channel=%u got=%g expected=%g\n",
+                                     unsigned(input),x,y,c,color[c],expected);
+                        throw std::runtime_error("Pass 26 blend mismatch");
+                    }
+                }
+            } else if (raw!=guard_word(x,y)) {
+                throw std::runtime_error("Pass 26 guard texel mismatch");
+            }
             if (x>=16 || y>=16) continue;
 #ifdef FFX_DISPATCH_AOT
             const auto filtered = sharpen(words,x,y,color);
@@ -242,6 +264,26 @@ void check_ffx_dispatch(LoopContext& ctx, const void* records)
 #else
     const char* source = "desktop-control";
 #endif
-    std::printf("dispatch=%s pass=26 u2_index=%u rcas_t18_index=%u format=%u tile=8x4 final_pixels=256 mismatches=0\n",
-                source,index,provider.resources[16],unsigned(format));
+    const char* mode = input==ScratchInput::bypass ? "bypass" : (input==ScratchInput::zero ? "zero" : "pattern");
+    std::printf("dispatch=%s pass=26 u2_index=%u rcas_t18_index=%u format=%u tile=8x4 scratch=%s reads=72 final_pixels=256 mismatches=0\n",
+                source,index,provider.resources[16],unsigned(format),mode);
+    return words;
+}
+
+void check_ffx_dispatch(LoopContext& ctx, const void* records)
+{
+    run_dispatch(ctx,records,ScratchInput::bypass);
+    auto zero=run_dispatch(ctx,records,ScratchInput::zero);
+    auto pattern=run_dispatch(ctx,records,ScratchInput::pattern);
+    unsigned intermediate_changes=0, final_changes=0;
+    for (unsigned y=0; y<4; ++y)
+        for (unsigned x=0; x<8; ++x) {
+            intermediate_changes += zero[y*64+x]!=pattern[y*64+x];
+            const unsigned offset=4608/4+64*y+4*x;
+            final_changes += std::memcmp(&zero[offset],&pattern[offset],16)!=0;
+        }
+    if (!intermediate_changes || !final_changes)
+        throw std::runtime_error("Upstream input did not reach both downstream stages");
+    std::printf("scratch_zero_vs_pattern intermediate_changed=%u final_active_changed=%u\n",
+                intermediate_changes,final_changes);
 }

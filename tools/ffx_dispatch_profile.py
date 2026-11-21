@@ -48,10 +48,17 @@ def inspect(pe):
         raise ValueError(f"Unknown binding {name}")
 
     writers = []
+    predecessors = []
     for index in range(27):
         case = pe.get_dword_at_rva(0x260c0 + 4*index)
         load, = region(pe, case, case + 7)
         record = load.ip_rel_memory_address - 8
+        if index in (24, 25):
+            if bindings(record, 0xb8) != {"ScratchBuffer": 11}:
+                raise ValueError(f"Unexpected pass {index} scratch binding")
+            if index == 24 and bindings(record, 0x90) != {"InitializerBuffer": 18}:
+                raise ValueError("Unexpected pass 24 model binding")
+            predecessors.append((f"pass{index}", record, 64 if index == 24 else 32))
         srvs = bindings(record, 0x40)
         uavs = bindings(record, 0x68)
         if any(resource_id(name, 0x6fb60, 12) == 16 for name in srvs):
@@ -69,7 +76,7 @@ def inspect(pe):
             bindings(reader, 0x68) != {"rw_rcas_output": 11} or bindings(reader, 0xe0)):
         raise ValueError("Unexpected RCAS shader bindings")
 
-    for name, record, threads in [("producer", writers[0][3], 256), ("rcas", reader, 64)]:
+    for name, record, threads in [*predecessors, ("producer", writers[0][3], 256), ("rcas", reader, 64)]:
         blob = pointer(record + 8)
         chunks = parts(pe.get_data(blob, pe.get_dword_at_rva(record)))
         if struct.unpack_from("<3I", chunks[b"PSV0"], 40) != (threads, 1, 1):
@@ -84,6 +91,12 @@ def inspect(pe):
         end, = [i+4 for i in range(0, len(code)-3, 4) if code[i:i+4] == b"\0\0\x81\xbf"]
         print(f"{name} container={blob:#x} threads={threads} code_bytes={end}")
         yield name, code[:end]
+
+    # The model initializer selector returns the RVA and byte count as a pair.
+    init_size, init_base = region(pe, 0x78e5, 0x78f1)
+    if init_size.immediate(1) != 0x20000 or init_base.ip_rel_memory_address != 0x4eee0:
+        raise ValueError("Unexpected i8 initializer")
+    yield "initializer", pe.get_data(init_base.ip_rel_memory_address, init_size.immediate(1))
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Lower the two pinned compute programs for the bounded 8x4 dispatch experiment."""
+"""Lower the four pinned compute programs for the bounded 8x4 dispatch experiment."""
 import argparse
 import hashlib
 from pathlib import Path
@@ -6,16 +6,19 @@ import re
 import struct
 
 from pixel_aot import disassemble
+from ffx_scratch_reference import make_reference
 
 
 DIGEST = {
+    "pass24": "e158269f335449abd33ffccebf7a4652a4e08bd8a4d3e39ce6d765807c049669",
+    "pass25": "97c5afa22f8d10d2b602118067161026f618e5a63b4d0a9ee490620db0846cbf",
     "producer": "407c213a5cb6c92c08509f7a8783550d775fe5518399eab3eecf4c736a78e4ed",
     "rcas": "35f9cb0f301653b64a28fd3a0f2a6509abc4a95b565f10d2251711c0ff0c349a",
 }
 
 
 def word(token, packed=False):
-    if re.fullmatch(r"[sv]\d+", token):
+    if re.fullmatch(r"[sv]\d+|exec_lo|vcc_lo", token):
         return token
     if token == "src_scc":
         return "scc"
@@ -43,6 +46,9 @@ def assign(names, values):
 
 # Operands remain raw DWORDs across integer, IEEE float and packed-half instructions.
 OPS = {
+    "mulk_i32": "{d}*{0}", "sub_nc_u32": "{0}-{1}", "min_u32": "min({0},{1})",
+    "mul_hi_u32": "mul_high({0},{1})",
+    "add_lshl_u32": "({0}+{1})<<{2}", "cndmask_b32": "{2}?{1}:{0}",
     "mov_b32": "{0}", "movk_i32": "{0}", "add_u32": "{0}+{1}", "add_nc_u32": "{0}+{1}",
     "addk_i32": "{d}+{0}", "sub_i32": "{0}-{1}", "subrev_nc_u32": "{1}-{0}",
     "mul_i32": "{0}*{1}", "mul_lo_u32": "{0}*{1}", "mul_u32_u24": "({0}&0xffffff)*({1}&0xffffff)",
@@ -123,14 +129,17 @@ def alu(mn, tokens, mods):
     if op in ("mov_b64", "lshrrev_b64"):
         if op == "lshrrev_b64" and inputs[0] != "0":
             raise ValueError("Unsupported 64-bit shift")
-        a, b = registers(inputs[-1])
+        a, b = ["0", "0"] if inputs[-1] == "0" else registers(inputs[-1])
         x, y = registers(dest)
         return f"{{ uint2 t=uint2({a},{b}); {x}=t.x; {y}=t.y; }}"
     args = list(map(word, inputs))
     if op == "dot4_i32_i8" and mods:
-        if mods != "op_sel:[0,1,0] op_sel_hi:[1,0,1]":
+        if mods == "op_sel_hi:[1,0,1]":
+            args[1] = f"(({args[1]}&65535u)*65537u)"
+        elif mods == "op_sel:[0,1,0] op_sel_hi:[1,0,1]":
+            args[1] = f"(({args[1]}<<16)|({args[1]}>>16))"
+        else:
             raise ValueError(mods)
-        args[1] = f"(({args[1]}<<16)|({args[1]}>>16))"
     if mn == "s_bfe_u32":
         args = [args[0], str(int(inputs[1], 0) & 31), str(int(inputs[1], 0) >> 16)]
     if op in FLOAT:
@@ -141,9 +150,9 @@ def alu(mn, tokens, mods):
     return f"{dest} = {OPS[op].format(*args, d=dest)};"
 
 
-# Constants for a single active 8x4 tile. Earlier graph jobs supply zero scratch,
-# two input surfaces and unit exposure. The sharpen flag at b1+0x5c is one.
-PARAMS = {0x10: [8,4,8,8], 0x28: [8,4], 0x1fc0: [1.0], 0x1fc8: [4,1.0,1.0,1],
+# An 8x4 active tile uses an aligned 8x8 output tensor. Exposure is one
+# and the sharpen flag at b1+0x5c is set.
+PARAMS = {0x10: [8,4,8,8], 0x28: [8,8], 0x1fc0: [1.0], 0x1fc8: [4,1.0,1.0,1],
           0x1ff8: [1.0,1.0,0,0], 0x26f0: [1.0,1.0],
           0x178: [0x38003800], 0x180: [1.0], 0x188: [1.0]}
 
@@ -180,6 +189,67 @@ def literal_operands(code, pc, tokens):
             tokens[i] = hex(literal)
 
 
+def load_scratch(tokens, trace=None):
+    dst, addr, _, _ = tokens
+    audit = "" if trace is None else f"audit_load(uint2(v1,v2),{trace},{addr},t); "
+    return "{ uint4 t = work.Load4(" + addr + "); " + audit + assign(registers(dst), ["t.x","t.y","t.z","t.w"]) + " }"
+
+
+def predecessor(name, instructions, initializer):
+    padding = name == "pass25"
+    threads = 32 if padding else 64
+    lines = ['#include "ffx_dispatch_io.hlsli"', '[RootSignature(SCRATCH_ROOT)]',
+             f'[numthreads({threads},1,1)] void main(uint3 group:SV_GroupID,uint lane:SV_GroupIndex) {{',
+             "uint " + ",".join(f"s{i}=0" for i in range(64)) + ";",
+             "uint " + ",".join(f"v{i}=0" for i in range(64)) + ";",
+             "uint vcc_lo=0,exec_lo=1; v0=lane; s14=group.x; s15=group.y;"]
+    for pc, instruction in instructions:
+        mn, _, rest = instruction.partition(" ")
+        pieces = re.split(r" (?=\w+:)", rest, maxsplit=1)
+        args = pieces[0].split(", ")
+        mods = pieces[1] if len(pieces) == 2 else ""
+        if mn in ("s_endpgm", "s_inst_prefetch", "s_clause", "s_waitcnt") or mn.startswith("s_load_dword"):
+            continue
+        if not padding and 0xc <= pc <= 0x20:
+            if pc == 0xc:
+                lines.append("if (s15>539 || v0>959) return;")
+            continue
+        if mn == "s_buffer_load_dwordx16":
+            values = struct.unpack_from("<16I", initializer, int(args[2],0))
+            stmt = assign(registers(args[0]), [hex(v)+"u" for v in values])
+        elif mn == "s_buffer_load_dwordx2":
+            if not padding or args[2] != "0xd0":
+                raise ValueError("Unexpected tensor size read")
+            stmt = "s8=4; s9=4;"  # 8x4 aligned up to 8x8, then scaled by 1/2.
+        elif mn == "buffer_load_dwordx4":
+            stmt = load_scratch(args)
+        elif mn == "buffer_store_dwordx4":
+            stmt = f"work.Store4({args[1]},uint4({','.join(registers(args[0]))}));"
+        elif mn.startswith("v_cmp"):
+            cond = {"gt": ">", "le": "<=", "ge": ">="}[mn.split("_")[2]]
+            cast = "asint" if "_i32_" in mn else "uint"
+            a, b = map(word,args[-2:])
+            comp = f"{cast}({a}) {cond} {cast}({b})"
+            stmt = f"exec_lo = exec_lo && ({comp});" if "cmpx" in mn else f"{args[0]} = {comp};"
+        elif mn == "s_cbranch_execz":
+            # The inner branch rejoins at the saved mask. Per-lane predication
+            # below also handles waves spanning two different border regions.
+            if pc == 0x6c:
+                continue
+            stmt = "if (!exec_lo) return;"
+        elif mn == "s_andn2_b32" and args[0] == "exec_lo":
+            stmt = f"exec_lo = ({word(args[1])} != 0) && !{word(args[2])};"
+        elif mn.startswith("v_add_co_ci"):
+            # Both carry outputs are dead before their next use.
+            stmt = f"{args[0]} = {word(args[2])}+{word(args[3])}+{word(args[4])};"
+        else:
+            stmt = alu(mn, args, mods)
+        if padding and (mn.startswith("v_") and not mn.startswith("v_cmpx") or mn.startswith("buffer_store")):
+            stmt = "if (exec_lo) { " + stmt + " }"
+        lines.append("    " + stmt)
+    return "\n".join([*lines, "}", ""])
+
+
 def translate(name, instructions, machine_code):
     producer = name == "producer"
     signature = "PRODUCER" if producer else "CONSUMER"
@@ -206,7 +276,9 @@ def translate(name, instructions, machine_code):
         if mn.startswith("s_buffer_load"):
             code = assign(registers(tokens[0]), [word(str(x)) for x in PARAMS[pc]])
         elif mn == "buffer_load_dwordx4":
-            code = assign(registers(tokens[0]), ["0"]*4)
+            if pc not in range(0x14c,0x194,8):
+                raise ValueError("Unexpected pass 26 scratch read")
+            code = load_scratch(tokens,(pc-0x14c)//8)
         elif mn.startswith("image_"):
             code = image_op(name, mn, tokens, mods)
         elif producer and pc == 0xa4:
@@ -237,15 +309,21 @@ if __name__ == "__main__":
     parser.add_argument("directory", type=Path)
     parser.add_argument("--llvm", required=True)
     args = parser.parse_args()
+    initializer = (args.directory / "initializer.bin").read_bytes()
+    if hashlib.sha256(initializer).hexdigest() != "a54e552ff69a3f7199861417f7ae461d1f67f636ab532c6ec9d8ea5d2963735a":
+        raise ValueError("Unknown model initializer")
+    programs = {}
     for name, digest in DIGEST.items():
         code = (args.directory / (name + ".bin")).read_bytes()
         if hashlib.sha256(code).hexdigest() != digest:
             raise ValueError(f"Unknown {name} machine code")
-        ins = disassemble(code, args.llvm, cpu=b"gfx1030" if name == "producer" else b"gfx1013", offsets=True)
+        ins = disassemble(code, args.llvm, cpu=b"gfx1013" if name == "rcas" else b"gfx1030", offsets=True)
+        programs[name] = ins
         if name == "rcas":
             accesses = [line.split()[0] for _, line in ins if line.startswith("image_")]
             if accesses.count("image_load") != 20 or accesses.count("image_store") != 4 or len(accesses) != 24:
                 raise ValueError("Expected twenty integer texture loads and four output stores")
-        shader = translate(name, ins, code)
+        shader = predecessor(name, ins, initializer) if name.startswith("pass") else translate(name, ins, code)
         (args.directory / (name + ".hlsl")).write_text(shader, encoding="ascii")
         print(f"{name} instructions={len(ins)}")
+    (args.directory / "scratch_reference.h").write_text(make_reference(programs, initializer), encoding="ascii")
