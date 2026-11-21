@@ -11,7 +11,8 @@ from cpu_ranges import function_ranges
 from ffx_version_query import INTEGER_HEADER, lower, region
 
 U64 = ctypes.c_uint64
-EXPORTS = ("adcx32_op", "adcx64_op", "adox32_op", "adox64_op", "adx_dual64")
+EXPORTS = ("adcx32_op", "adcx64_op", "adox32_op", "adox64_op", "adx_dual64",
+           "shl1_adox32", "imul_seto32", "andn_clears_of32")
 
 
 def emit(image, output):
@@ -105,7 +106,30 @@ def check(native_path, lifted_path):
                         )
                 cases += 1
 
-    print(f"{cases} ADX cases (ADCX, ADOX, and interleaved dual-carry chains) matched native and translated DLLs")
+    for a in (0x00000000, 0x40000000, 0x80000000, 0xc0000000):
+        shl_of = 1 if (((a >> 31) ^ ((a >> 30) & 1)) != 0) else 0
+        want_sum = (10 + 20 + shl_of) & 0xffffffff
+        for lib, label in ((native, "native"), (lifted, "lifted")):
+            slot.value = 0xdeadbeef
+            got = lib.shl1_adox32(a, 10, 20, ctypes.byref(slot))
+            if (got, slot.value) != (want_sum, 0):
+                raise AssertionError(f"{label} shl1_adox32({a:#x}) = ({got:#x}, {slot.value}), expected ({want_sum:#x}, 0)")
+        cases += 1
+
+    for a, b, want_of in ((100, 200, 0), (0x10000, 0x10000, 1), (-0x10000 & 0xffffffff, 0x10000, 1), (0x7fffffff, 1, 0)):
+        for lib, label in ((native, "native"), (lifted, "lifted")):
+            got = lib.imul_seto32(a, b, 0, ctypes.byref(slot))
+            if got != want_of:
+                raise AssertionError(f"{label} imul_seto32({a:#x}, {b:#x}) = {got}, expected {want_of}")
+        cases += 1
+
+    for lib, label in ((native, "native"), (lifted, "lifted")):
+        got = lib.andn_clears_of32(0x1234, 0x5678, 0, ctypes.byref(slot))
+        if got != 0:
+            raise AssertionError(f"{label} andn_clears_of32 = {got}, expected 0")
+    cases += 1
+
+    print(f"{cases} ADX cases (ADCX, ADOX, dual-carry chains, and OF producer compositions) matched native and translated DLLs")
 
 
 if __name__ == "__main__":

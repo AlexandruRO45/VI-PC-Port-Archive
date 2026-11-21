@@ -144,7 +144,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
         elif op == M.IMUL and i.op_count in (2, 3) and RegisterExt.size(i.op0_register) == 4:
             lhs, rhs = operand(i.op_count - 2), operand(i.op_count - 1)
             stmt = (f"{{ const int64_t product = int64_t(int32_t({lhs})) * int32_t({rhs}); "
-                    f"carry = product != int32_t(product); {write('product')} }}")
+                    f"carry = product != int32_t(product); overflow = carry; {write('product')} }}")
         elif op == M.CDQ:
             stmt = "rdx = uint32_t(int32_t(rax) >> 31);"
         elif op in (M.SHL, M.SHR, M.SAR) and i.op1_kind == K.IMMEDIATE8 and RegisterExt.size(i.op0_register) in (4, 8):
@@ -153,8 +153,16 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             count = i.immediate(1) & (bits - 1)
             shift, last = ("<<", bits-count) if op == M.SHL else (">>", count-1)
             lhs = f"int{bits}_t(a)" if op == M.SAR else "a"
+            of_update = ""
+            if count == 1:
+                if op == M.SHL:
+                    of_update = f" overflow = (((v >> {bits - 1}) & 1) != 0) != carry;"
+                elif op == M.SHR:
+                    of_update = f" overflow = ((a >> {bits - 1}) & 1) != 0;"
+                else:
+                    of_update = " overflow = false;"
             stmt = (f"{{ const {UINT[size]} a = {operand(0)}, v = {lhs} {shift} {count}; "
-                    f"carry = ((a >> {last}) & 1) != 0; zero = v == 0; {write('v')} }}") if count else \
+                    f"carry = ((a >> {last}) & 1) != 0;{of_update} zero = v == 0; {write('v')} }}") if count else \
                 write(operand(0))  # A masked zero count keeps the flags but still zero-extends a 32-bit destination.
         elif op in (M.ADD, M.AND, M.OR, M.XOR, M.INC, M.DEC, M.SUB, M.SBB):
             operator = {M.ADD: "+", M.INC: "+", M.DEC: "-", M.AND: "&", M.OR: "|", M.XOR: "^", M.SUB: "-", M.SBB: "-"}[op]
@@ -186,7 +194,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             width, bits = UINT[size], 8 * size
             if op == M.ANDN:
                 stmt = (f"{{ const {width} v = static_cast<{width}>(~static_cast<{width}>({operand(1)}) "
-                        f"& static_cast<{width}>({operand(2)})); carry = false; zero = v == 0; {write('v')} }}")
+                        f"& static_cast<{width}>({operand(2)})); carry = false; overflow = false; zero = v == 0; {write('v')} }}")
             elif op == M.BEXTR:
                 stmt = (f"{{ const {width} a = {operand(1)}, ctrl = {operand(2)}; "
                         f"const unsigned start = static_cast<unsigned>(ctrl & 0xffu), "
@@ -194,16 +202,16 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
                         f"{width} v = 0; if (start < {bits}u && len > 0u) {{ "
                         f"const {width} s = a >> start; "
                         f"v = len >= {bits}u ? s : static_cast<{width}>(s & ((static_cast<{width}>(1) << len) - 1)); }} "
-                        f"carry = false; zero = v == 0; {write('v')} }}")
+                        f"carry = false; overflow = false; zero = v == 0; {write('v')} }}")
             elif op == M.BLSI:
                 stmt = (f"{{ const {width} a = {operand(1)}, v = static_cast<{width}>(a & (static_cast<{width}>(0) - a)); "
-                        f"carry = a != 0; zero = v == 0; {write('v')} }}")
+                        f"carry = a != 0; overflow = false; zero = v == 0; {write('v')} }}")
             elif op == M.BLSMSK:
                 stmt = (f"{{ const {width} a = {operand(1)}, v = static_cast<{width}>(a ^ (a - 1)); "
-                        f"carry = a == 0; zero = false; {write('v')} }}")
+                        f"carry = a == 0; overflow = false; zero = false; {write('v')} }}")
             elif op == M.BLSR:
                 stmt = (f"{{ const {width} a = {operand(1)}, v = static_cast<{width}>(a & (a - 1)); "
-                        f"carry = a == 0; zero = v == 0; {write('v')} }}")
+                        f"carry = a == 0; overflow = false; zero = v == 0; {write('v')} }}")
             else:  # M.TZCNT
                 stmt = (f"{{ const {width} a = {operand(1)}; {width} v = 0; "
                         f"if (a == 0) {{ v = {bits}; }} else {{ while (((a >> v) & 1) == 0) ++v; }} "

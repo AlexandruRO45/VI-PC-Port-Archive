@@ -4,3 +4,6 @@ EXPORTS
     adox32_op
     adox64_op
     adx_dual64
+    shl1_adox32
+    imul_seto32
+    andn_clears_of32

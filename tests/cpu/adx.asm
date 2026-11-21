@@ -94,4 +94,34 @@ adx_dual64 PROC FRAME
     ret
 adx_dual64 ENDP
 
+; OF producer compositions: shl-by-1 -> adox, imul -> seto, andn clears OF -> seto.
+shl1_adox32 PROC FRAME
+    .endprolog
+    shl ecx, 1          ; sets OF = MSB(result) ^ CF
+    mov eax, edx
+    adox eax, r8d       ; consumes OF from shl-by-1
+    mov r10d, 0
+    seto r10b
+    mov qword ptr [r9], r10
+    ret
+shl1_adox32 ENDP
+
+imul_seto32 PROC FRAME
+    .endprolog
+    imul ecx, edx       ; sets OF = CF = (product != int32(product))
+    mov eax, 0
+    seto al
+    ret
+imul_seto32 ENDP
+
+andn_clears_of32 PROC FRAME
+    .endprolog
+    mov r10d, 07fffffffh
+    add r10d, 1         ; seed OF = 1
+    andn r10d, ecx, edx ; BMI1 clears OF = 0
+    mov eax, 0
+    seto al
+    ret
+andn_clears_of32 ENDP
+
 END
