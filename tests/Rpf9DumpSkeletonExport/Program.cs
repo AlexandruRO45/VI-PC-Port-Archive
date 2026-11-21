@@ -3,6 +3,7 @@ using System.Numerics;
 using System.Text.Json;
 using RpfPreview.Core;
 
+int checks = 0;
 // Synthetic three-joint resource: forward parent reference, reordered palette,
 // and nonidentity inverse bind translation. No game data.
 byte[] Fixture(bool duplicate = false)
@@ -33,6 +34,15 @@ var model = Model(mesh);
 string objBefore = RageModelDecoder.CreateObj(model);
 using var doc = JsonDocument.Parse(JsonSerializer.Serialize(exporter.CreateMetadata(model)));
 var root = doc.RootElement;
+string serialized = doc.RootElement.GetRawText();
+Check(Enumerable.Range(0, 5).All(_ => JsonSerializer.Serialize(exporter.CreateMetadata(model)) == serialized), "repeated metadata serialization is byte-stable");
+var originalCulture = System.Globalization.CultureInfo.CurrentCulture;
+try
+{
+    System.Globalization.CultureInfo.CurrentCulture = System.Globalization.CultureInfo.GetCultureInfo("fr-FR");
+    Check(JsonSerializer.Serialize(exporter.CreateMetadata(model)) == serialized, "metadata serialization is culture-independent");
+}
+finally { System.Globalization.CultureInfo.CurrentCulture = originalCulture; }
 Check(!root.GetProperty("HasVertexSkinning").GetBoolean() && !root.GetProperty("HasAnimation").GetBoolean(), "no false skinning/animation claims");
 var joints = root.GetProperty("Joints");
 Check(joints[0].GetProperty("Parent").ValueKind == JsonValueKind.Null && joints[1].GetProperty("Parent").GetInt32() == 2, "hierarchy survives serialization");
@@ -46,9 +56,17 @@ Reject(() => exporter.CreateMetadata(Model(mesh with { BonePaletteHashes = null 
 Reject(() => exporter.CreateMetadata(Model(mesh with { BonePaletteHashes = new uint[] { 999 } })), "unknown joint hash");
 Reject(() => SkeletonExport.Read(Fixture(true), 0).CreateMetadata(model), "ambiguous hash");
 Reject(() => SkeletonExport.Read(new byte[8], 0), "truncated skeleton");
+var nonFinite = Fixture();
+BinaryPrimitives.WriteSingleLittleEndian(nonFinite.AsSpan(0x200), float.NaN);
+Reject(() => SkeletonExport.Read(nonFinite, 0), "nonfinite inverse bind rejected before output");
+var cyclic = Fixture();
+BinaryPrimitives.WriteUInt16LittleEndian(cyclic.AsSpan(0x100 + 0x46), 1);
+BinaryPrimitives.WriteUInt16LittleEndian(cyclic.AsSpan(0x2c0), 1);
+Reject(() => SkeletonExport.Read(cyclic, 0), "cyclic skeleton rejected before output");
+Reject(() => exporter.CreateMetadata(new RageModel("empty", [], Vector3.Zero, Vector3.One)), "empty model");
 Check(SkeletonExport.FromArguments(["models", "input", "output"]) is null, "default CLI remains opt-out");
 try { SkeletonExport.FromArguments(["textures", "a", "b", "--unexpected"]); throw new Exception("unknown CLI accepted"); }
-catch (ArgumentException) { }
+catch (ArgumentException) { checks++; }
 foreach (string badOffset in new[] { "-1", "2147483648", "0x10" })
 {
     try
@@ -56,7 +74,7 @@ foreach (string badOffset in new[] { "-1", "2147483648", "0x10" })
         SkeletonExport.FromArguments(["models", "a", "b", "--skeleton-system", "unused", "--skeleton-drawable-offset", badOffset]);
         throw new Exception("invalid offset accepted");
     }
-    catch (ArgumentException) { }
+    catch (ArgumentException) { checks++; }
 }
 string temp = Path.Combine(Path.GetTempPath(), "leonida-synthetic-" + Guid.NewGuid().ToString("N"));
 try
@@ -69,10 +87,10 @@ try
     Reject(() => exporter.CreateMetadata(mixed), "partially resolvable model rejected as a whole");
 }
 finally { if (File.Exists(temp)) File.Delete(temp); }
-Console.WriteLine("Skeleton metadata export: 18 checks passed (synthetic, CPU only).");
-static void Check(bool ok, string why) { if (!ok) throw new Exception(why); }
-static void Reject(Action action, string why)
+Console.WriteLine($"Skeleton metadata export: {checks} checks passed (synthetic, CPU only).");
+void Check(bool ok, string why) { if (!ok) throw new Exception(why); checks++; }
+void Reject(Action action, string why)
 {
-    try { action(); } catch (InvalidDataException) { return; }
+    try { action(); } catch (InvalidDataException) { checks++; return; }
     throw new Exception("Expected rejection: " + why);
 }
