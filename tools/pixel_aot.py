@@ -250,6 +250,51 @@ SALU_HELPERS = {
         "    return asuint(asint(src) >> off);\n"
         "}"
     ),
+    "pack16_rne": (
+        "// IEEE binary32 to binary16, round to nearest even, independent of driver f32tof16 rounding.\n"
+        "uint pack16_rne(float value) {\n"
+        "    uint bits = asuint(value);\n"
+        "    uint sign = (bits >> 16) & 0x8000u;\n"
+        "    uint abs_bits = bits & 0x7fffffffu;\n"
+        "    if (abs_bits > 0x7f800000u) return 0x7e00u;\n"
+        "    if (abs_bits >= 0x477ff000u) return sign | 0x7c00u;\n"
+        "    if (abs_bits >= 0x38800000u) {\n"
+        "        uint shifted = abs_bits - 0x38000000u;\n"
+        "        uint round_bit = 0x00000fffu + ((shifted >> 13) & 1u);\n"
+        "        return sign | ((shifted + round_bit) >> 13);\n"
+        "    }\n"
+        "    if (abs_bits < 0x33000000u) return sign;\n"
+        "    uint sig = 0x00800000u | (abs_bits & 0x007fffffu);\n"
+        "    uint shift = 126u - (abs_bits >> 23);\n"
+        "    uint half_m = sig >> shift;\n"
+        "    uint rem = sig & ((1u << shift) - 1u);\n"
+        "    uint mid = 1u << (shift - 1u);\n"
+        "    if (rem > mid || (rem == mid && (half_m & 1u) != 0u)) half_m += 1u;\n"
+        "    return sign | half_m;\n"
+        "}"
+    ),
+    "min16_num": (
+        "float min16_num(float a, float b) {\n"
+        "    return isnan(a) ? b : (isnan(b) ? a : min(a, b));\n"
+        "}"
+    ),
+    "max16_num": (
+        "float max16_num(float a, float b) {\n"
+        "    return isnan(a) ? b : (isnan(b) ? a : max(a, b));\n"
+        "}"
+    ),
+}
+VOP3P_F16 = {
+    "add": (2, "({0} + {1})"),
+    "mul": (2, "({0} * {1})"),
+    "min": (2, "min16_num({0}, {1})"),
+    "max": (2, "max16_num({0}, {1})"),
+    "fma": (3, "mad({0}, {1}, {2})"),
+}
+INLINE_F16 = {
+    "0.5": 0x3800, "-0.5": 0xb800, "1.0": 0x3c00, "-1.0": 0xbc00,
+    "2.0": 0x4000, "-2.0": 0xc000, "4.0": 0x4400, "-4.0": 0xc400,
+    "0.15915494": 0x3118,
 }
 
 
@@ -348,6 +393,63 @@ def fp_operand(token, scalar, vector, pending, sample_pending):
     if re.fullmatch(r"\d+\.\d+", token):
         return token + "f"
     raise ValueError(f"Unsupported arithmetic operand {token}")
+
+
+def vop3p_f16_word(token, scalar, vector, pending, sample_pending):
+    """Return a 32-bit uint HLSL expression for one packed binary16 VOP3P source operand.
+
+    On gfx1013 (RDNA 2), inline f16 float constants occupy bits [15:0] with bits [31:16] zeroed.
+    """
+    if token in INLINE_F16:
+        return f"{INLINE_F16[token]}u"
+    if m := re.fullmatch(r"([vs])(\d+)", token):
+        limit = 255 if m.group(1) == "v" else 105
+        if not 0 <= int(m.group(2)) <= limit:
+            raise ValueError(f"Register out of range: {token}")
+        if token in pending:
+            raise ValueError("Constant read before load completion")
+        value = (vector if m.group(1) == "v" else scalar)[token]
+        if isinstance(value, int):
+            return f"{value}u"
+        if isinstance(value, tuple) and len(value) == 2 and value[0] == "uint":
+            return value[1]
+        if not isinstance(value, str) or not value.startswith(("sample", "alu", "params[")):
+            raise ValueError("Expected a numeric register")
+        if sample_pending and value.startswith("sample"):
+            raise ValueError("Sample used before vmcnt wait")
+        return f"asuint({value})"
+    if re.fullmatch(r"0x[0-9a-f]{1,8}", token):
+        return f"{int(token, 16)}u"
+    if re.fullmatch(r"-?\d+", token):
+        value = int(token)
+        if not -16 <= value <= 64:
+            raise ValueError(f"Unsupported packed integer inline constant {token}")
+        return f"{value & 0xffffffff}u"
+    raise ValueError(f"Unsupported packed operand {token}")
+
+
+def parse_vop3p_f16(rest, arity):
+    parts_ = rest.split(", ")
+    if len(parts_) != arity:
+        raise ValueError("Invalid packed operand count")
+    last_op, _, mod_text = parts_[-1].partition(" ")
+    operands = [*parts_[:-1], last_op]
+    opts = {}
+    clamp = False
+    for mod in mod_text.split():
+        if mod == "clamp":
+            if clamp:
+                raise ValueError("Duplicate clamp modifier")
+            clamp = True
+        elif m := re.fullmatch(r"(op_sel|op_sel_hi|neg_lo|neg_hi):\[([01](?:,[01])*)\]", mod):
+            name = m.group(1)
+            bits = [int(b) for b in m.group(2).split(",")]
+            if name in opts or len(bits) != arity:
+                raise ValueError(f"Invalid packed modifier {mod}")
+            opts[name] = bits
+        else:
+            raise ValueError(f"Unsupported packed modifier {mod}")
+    return operands, opts, clamp
 
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *, second_texture_offset=None):
@@ -639,6 +741,39 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(r"v_pk_(add|mul|min|max|fma)_f16 (v\d+), (.+)"):
+            op, dst, rest = m.groups()
+            arity, template = VOP3P_F16[op]
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid packed operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            tokens, opts, clamp = parse_vop3p_f16(rest, arity)
+            words = [vop3p_f16_word(t, scalar, vector, pending, sample_pending) for t in tokens]
+            word_vars = []
+            for k, expr in enumerate(words):
+                wvar = f"pk{i}_{k}"
+                lines.append(f"    uint {wvar} = {expr};")
+                word_vars.append(wvar)
+            packed_lanes = []
+            for lane, sel_key, neg_key, default_sel in ((0, "op_sel", "neg_lo", 0), (1, "op_sel_hi", "neg_hi", 1)):
+                sel = opts.get(sel_key, [default_sel] * arity)
+                neg = opts.get(neg_key, [0] * arity)
+                lane_args = []
+                for wvar, high, negate in zip(word_vars, sel, neg):
+                    val = f"widen16({wvar} >> 16)" if high else f"widen16({wvar})"
+                    lane_args.append(f"(-{val})" if negate else val)
+                expr = template.format(*lane_args)
+                if clamp:
+                    expr = f"saturate({expr})"
+                lvar = f"pk{i}_l{lane}"
+                lines.append(f"    precise float {lvar} = {expr};")
+                packed_lanes.append(f"pack16_rne({lvar})")
+            helpers.add("pack16_rne")
+            if op in ("min", "max"):
+                helpers.add(f"{op}16_num")
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat({packed_lanes[0]} | ({packed_lanes[1]} << 16));")
         elif m := match(r"v_cvt_pkrtz_f16_f32_e32 (v\d+), (v\d+), (v\d+)"):
             dst, lo, hi = m.groups()
             pair = (vector[lo], vector[hi])

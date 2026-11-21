@@ -485,6 +485,120 @@ def check_half_draw(directory, compiler, renderer, backend):
             raise AssertionError(f"A wrong half conversion escaped detection in channel {k}")
 
 
+def pack_f16_pair(lo, hi):
+    lo_bits = lo if isinstance(lo, int) else struct.unpack("<H", struct.pack("<e", lo))[0]
+    hi_bits = hi if isinstance(hi, int) else struct.unpack("<H", struct.pack("<e", hi))[0]
+    return lo_bits | (hi_bits << 16)
+
+
+def rne_f16(value):
+    if math.isnan(value):
+        return math.nan
+    try:
+        return struct.unpack("<e", struct.pack("<e", value))[0]
+    except OverflowError:
+        return math.copysign(math.inf, value)
+
+
+# Packed binary16 VOP3P arithmetic: exercises all five v_pk_*_f16 instructions, op_sel/op_sel_hi,
+# neg_lo/neg_hi, clamp, NaN minNum semantics, RNE tie-to-even rounding, and gfx1013 zero-extension
+# of inline f16 constants (0.5 -> lo=0.5, hi=0.0).
+VOP3P_BODY = [
+    "v_mov_b32_e32 v19, s45",
+    "v_mov_b32_e32 v20, s46",
+    "v_mov_b32_e32 v21, s47",
+    "v_pk_add_f16 v22, s44, v19 op_sel:[1,0] op_sel_hi:[0,1] neg_lo:[0,1]",
+    "v_pk_mul_f16 v23, v22, v20 neg_hi:[1,0]",
+    "v_pk_fma_f16 v24, v23, v21, s47 op_sel:[0,1,0] op_sel_hi:[1,0,1]",
+    "v_pk_min_f16 v25, v24, 0x40007e00",
+    "v_pk_max_f16 v26, v24, 0.5 clamp",
+    "v_cvt_f32_f16_e32 v12, v25",
+    "v_pk_add_f16 v27, v25, 0 op_sel:[1,0]",
+    "v_cvt_f32_f16_e32 v13, v27",
+    "v_cvt_f32_f16_e32 v14, v26",
+    "v_pk_add_f16 v28, v26, 0 op_sel:[1,0]",
+    "v_cvt_f32_f16_e32 v15, v28",
+]
+VOP3P_SETS = (
+    # Set 1: v24=(0.875, 0.25); channel 0 tests minNum(0.875, qNaN)=0.875, channel 3=0.25 proves inline 0.5 hi=0.0.
+    (pack_f16_pair(1.5, 2.0), pack_f16_pair(0.5, -1.0), pack_f16_pair(0.5, 1.0), pack_f16_pair(0.5, 0.5)),
+    # Set 2: v24=(2.5, -1.0); channel 2 clamps 2.5 -> 1.0 and channel 3 clamps -1.0 -> 0.0.
+    (pack_f16_pair(2.0, 3.0), pack_f16_pair(1.0, 0.0), pack_f16_pair(1.0, 2.0), pack_f16_pair(0.5, 1.0)),
+    # Set 3: exact halfway ties at 1.0 + 2^-11 (-> even 1.0) and -(1.0 + 2^-10) - 2^-11 (-> even -(1.0 + 2^-9),
+    # distinguishing RNE from RTZ f32tof16 in channel 1).
+    (pack_f16_pair(0xbc01, 0x3c00), pack_f16_pair(0x9000, 0x9000), pack_f16_pair(4.0, 4.0), pack_f16_pair(0.25, 0.25)),
+)
+
+
+def vop3p_reference(words):
+    def split16(w):
+        return half_value(w), half_value(w >> 16)
+
+    def min_num(a, b):
+        return b if math.isnan(a) else (a if math.isnan(b) else min(a, b))
+
+    def max_num(a, b):
+        return b if math.isnan(a) else (a if math.isnan(b) else max(a, b))
+
+    def sat(x):
+        return 0.0 if math.isnan(x) or x <= 0.0 else (1.0 if x >= 1.0 else x)
+
+    s44, s45, s46, s47 = (split16(w) for w in words)
+    v22 = (rne_f16(s44[1] + (-s45[0])), rne_f16(s44[0] + s45[1]))
+    v23 = (rne_f16(v22[0] * s46[0]), rne_f16((-v22[1]) * s46[1]))
+    v24 = (rne_f16(v23[0] * s47[1] + s47[0]), rne_f16(v23[1] * s47[0] + s47[1]))
+    v25 = (rne_f16(min_num(v24[0], math.nan)), rne_f16(min_num(v24[1], 2.0)))
+    v26 = (rne_f16(sat(max_num(v24[0], 0.5))), rne_f16(sat(max_num(v24[1], 0.0))))
+    return [v25[0], v25[1], v26[0], v26[1]]
+
+
+def check_vop3p_draw(directory, compiler, renderer, backend):
+    source = directory / "vop3p.hlsl"
+    shader = directory / "vop3p.cso"
+    case = directory / "vop3p.case"
+    program = with_constants(VOP3P_BODY)
+    source.write_text(translate(program), encoding="ascii")
+    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+    subprocess.run(compile_shader, check=True)
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    for words in VOP3P_SETS:
+        expected = vop3p_reference(words)
+        assert all(not math.isnan(x) and half_rtz(x) == x for x in expected), expected
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+
+    # Negative mutations against Set 1 and Set 2 must produce pixel_mismatch.
+    for words, old, new, label in (
+        (VOP3P_SETS[0],
+         "v_pk_add_f16 v22, s44, v19 op_sel:[1,0] op_sel_hi:[0,1] neg_lo:[0,1]",
+         "v_pk_add_f16 v22, s44, v19 op_sel:[1,0] op_sel_hi:[0,1]", "neg_lo"),
+        (VOP3P_SETS[0],
+         "v_pk_mul_f16 v23, v22, v20 neg_hi:[1,0]",
+         "v_pk_mul_f16 v23, v22, v20", "neg_hi"),
+        (VOP3P_SETS[0],
+         "v_pk_min_f16 v25, v24, 0x40007e00",
+         "v_pk_max_f16 v25, v24, 0x40007e00", "min vs max"),
+        (VOP3P_SETS[0],
+         "v_pk_max_f16 v26, v24, 0.5 clamp",
+         "v_pk_max_f16 v26, v24, 0.5 op_sel_hi:[1,0] clamp", "inline hi zero-extension"),
+        (VOP3P_SETS[1],
+         "v_pk_max_f16 v26, v24, 0.5 clamp",
+         "v_pk_max_f16 v26, v24, 0.5", "clamp"),
+    ):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        case.write_bytes(constants + struct.pack("<4f", *vop3p_reference(words)) * 64)
+        mutated = [line.replace(old, new) for line in program]
+        assert mutated != program, label
+        source.write_text(translate(mutated), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Mutation of {label} escaped detection")
+
+
 def arithmetic():
     """Add, multiply, reversed subtraction and moves on the sample and constant words 8 to 11."""
     program = assembly(False)
@@ -1272,6 +1386,45 @@ def check_controls(directory):
     cnd_pos = sel.index("v_cndmask_b32_e64 v13, v13, s46, s[52:53]")
     must_reject(translate, sel[:cnd_pos] + ["s_not_b64 s[52:53], 0"] + sel[cnd_pos:])
 
+    # Packed binary16 VOP3P controls: lowering shape, modifier defaults, and negative controls.
+    vop3p = with_constants(VOP3P_BODY)
+    vop3p_hlsl = translate(vop3p)
+    for expected in ("uint pack16_rne(", "float min16_num(", "float max16_num(", "widen16(", "saturate("):
+        assert expected in vop3p_hlsl, expected
+    assert "uint pack16_rne(" not in translate(assembly(False))
+    # Explicit default modifiers must lower identically to omitted defaults.
+    explicit_defaults = [line.replace("v_pk_min_f16 v25, v24, 0x40007e00",
+                                      "v_pk_min_f16 v25, v24, 0x40007e00 op_sel:[0,0] op_sel_hi:[1,1] neg_lo:[0,0] neg_hi:[0,0]")
+                         for line in vop3p]
+    assert translate(explicit_defaults) == vop3p_hlsl
+    # Negative controls: unsupported VOP3P neighbors, bad modifiers, bad operand encodings, WQM, pending hazards.
+    for bad in (
+        "v_pk_add_u16 v22, s44, v19",
+        "v_fma_mix_f32 v22, s44, v19, v20",
+        "v_dot2_f32_f16 v22, s44, v19, v20",
+        "v_pk_add_f16 v22, s44, v19, v20",
+        "v_pk_fma_f16 v22, s44, v19",
+        "v_pk_add_f16 v22, -s44, v19",
+        "v_pk_add_f16 v22, |v19|, v20",
+        "v_pk_add_f16 v22, v19, 1.5",
+        "v_pk_add_f16 v22, v19, 65",
+        "v_pk_add_f16 v22, v19, v20 op_sel:[0,1,0]",
+        "v_pk_add_f16 v22, v19, v20 op_sel:[2,0]",
+        "v_pk_add_f16 v22, v19, v20 op_sel:[0,0] op_sel:[1,0]",
+        "v_pk_add_f16 v22, v19, v20 clamp clamp",
+        "v_pk_add_f16 v22, v19, v20 mul:2",
+        "v_pk_add_f16 v256, v19, v20",
+        "v_pk_add_f16 v22, s28, v19",
+    ):
+        must_reject(translate, with_constants(["v_mov_b32_e32 v19, s45", "v_mov_b32_e32 v20, s46", bad]))
+    wait_vm = vop3p.index("s_waitcnt vmcnt(0)")
+    must_reject(translate, vop3p[:wait_vm] + ["v_pk_add_f16 v12, s44, 0.5"] + vop3p[wait_vm:])
+    must_reject(translate, vop3p[:wait_vm] + ["v_pk_add_f16 v22, v12, 0.5"] + vop3p[wait_vm:])
+    wqm_idx = vop3p.index("s_wqm_b64 exec, exec") + 1
+    must_reject(translate, vop3p[:wqm_idx] + ["v_pk_add_f16 v22, 0.5, 1.0"] + vop3p[wqm_idx:])
+    lgkm_idx = vop3p.index("s_waitcnt lgkmcnt(0)", vop3p.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc"))
+    must_reject(translate, vop3p[:lgkm_idx] + ["v_pk_add_f16 v22, s44, 0.5"] + vop3p[lgkm_idx:])
+
 
 def check_binary(directory, assembler, objcopy, library):
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
@@ -1282,6 +1435,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((dual_program(case), translate_dual) for case in DUAL_CASES)
     fixtures.append((with_constants(MOVK_BODY), translate))
     fixtures.append((with_constants(HALF_BODY), translate))
+    fixtures.append((with_constants(VOP3P_BODY), translate))
     fixtures.append((dual_program(swap_weights=True), translate_dual))
     fixtures.append((with_constants(LITERAL_FMA_BODY), translate))
     for index, (instructions, lower_fixture) in enumerate(fixtures):
@@ -1332,6 +1486,7 @@ def check_ceiling_draws(directory, compiler, renderer, backend):
 def check_render(directory, compiler, renderer, backend):
     check_movk_draw(directory, compiler, renderer, backend)
     check_half_draw(directory, compiler, renderer, backend)
+    check_vop3p_draw(directory, compiler, renderer, backend)
     for swap in (False, True):
         source = directory / "fixture.hlsl"
         shader = directory / "fixture.cso"
