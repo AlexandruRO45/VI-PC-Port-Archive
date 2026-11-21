@@ -355,7 +355,7 @@ if(Vulkan_FOUND)
       OUTPUT ${LEONIDA_STUBS}
       COMMAND Python3::Interpreter -I ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py --out ${LEONIDA_STUBS}
               ID3D12GraphicsCommandList8 ID3D12CommandQueue ID3D12CommandAllocator ID3D12Fence1
-              ID3D12Device11 ID3D12DescriptorHeap ID3D12Resource
+              ID3D12Device11 ID3D12DescriptorHeap ID3D12Resource ID3D12PipelineState
       DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py
       COMMENT "Generating D3D12 COM stubs"
       VERBATIM)
@@ -412,6 +412,14 @@ if(Vulkan_FOUND)
     target_link_libraries(gfx10_descriptors_test PRIVATE Vulkan::Headers)
     add_test(NAME gfx10_descriptors COMMAND gfx10_descriptors_test)
   endif()
+  # CreatePipelineState (PR C): a D3D12 stream becomes a real VkPipeline.
+  add_executable(pipeline_state_test test/pipeline_state_test.cpp)
+  target_include_directories(pipeline_state_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                                                       ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_link_libraries(pipeline_state_test PRIVATE gta6rt_d3d12_com)
+  target_compile_definitions(pipeline_state_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(pipeline_state_test PRIVATE /W4 /permissive- /utf-8)
+  add_test(NAME pipeline_state COMMAND pipeline_state_test)
   # First draw (milestone M1): a real triangle through the bindless set, a pipeline and an offscreen render pass.
   add_executable(first_draw_test test/first_draw_test.cpp)
   target_include_directories(first_draw_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

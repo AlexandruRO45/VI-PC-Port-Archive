@@ -55,6 +55,9 @@ void set_device_outer(ID3D12Device* device, IUnknown* outer);
 // The VkImage behind a texture created by such a device, or VK_NULL_HANDLE. For tests and the swapchain.
 VkImage vulkan_image(ID3D12Resource* resource);
 
+// The VkPipeline behind an ID3D12PipelineState created by the device (VK_NULL_HANDLE for anything else).
+VkPipeline vulkan_pipeline(ID3D12PipelineState* state);
+
 // The maxPushConstantsSize in bytes of the Vulkan physical device behind `device`, or 0 if not a Vulkan device.
 std::uint32_t device_max_push_constants_size(ID3D12Device* device);
 

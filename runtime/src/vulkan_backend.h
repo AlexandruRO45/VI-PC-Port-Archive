@@ -26,7 +26,7 @@ struct VulkanDeviceFunctions {
     X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkResetCommandBuffer)         \
     X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkQueueSubmit) X(vkQueueWaitIdle) X(vkCreateSemaphore)     \
     X(vkDestroySemaphore) X(vkGetSemaphoreCounterValue) X(vkWaitSemaphores) X(vkSignalSemaphore)               \
-    X(vkCreateImageView) X(vkDestroyImageView) X(vkCmdPipelineBarrier) X(vkCmdPipelineBarrier2)                \
+    X(vkCreateImageView) X(vkDestroyImageView) X(vkCreateSampler) X(vkDestroySampler) X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) X(vkCmdPipelineBarrier) X(vkCmdPipelineBarrier2)                \
     X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkCmdBeginRendering) X(vkCmdEndRendering)         \
     X(vkCmdClearAttachments) X(vkDeviceWaitIdle) X(vkCreateImage) X(vkDestroyImage)                         \
     X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateBuffer) X(vkDestroyBuffer)                  \
@@ -137,12 +137,19 @@ private:
 
     // Called with mutex_ held (from prepare). Views live until their image is removed.
     VkImageView view(const ResourceBinding& r, const VkImageSubresourceRange& range) {
+        return image_view(r, range, VK_IMAGE_VIEW_TYPE_2D_ARRAY);
+    }
+
+public:
+    // A view of a chosen type (2D, 2D array, 3D, 1D) over a mip/layer range. The bindless set needs the type to match
+    // the descriptor array it is written into, so the type is part of the cache key.
+    VkImageView image_view(const ResourceBinding& r, const VkImageSubresourceRange& range, VkImageViewType type) {
         const auto key = std::make_tuple(r.image, range.aspectMask, range.baseMipLevel, range.baseArrayLayer,
-                                         range.layerCount);
+                                         range.layerCount, std::uint32_t(type));
         if (const auto it = views_.find(key); it != views_.end()) return it->second;
         VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         info.image = r.image;
-        info.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        info.viewType = type;
         info.format = r.format;
         info.subresourceRange = range;
         VkImageView view = VK_NULL_HANDLE;
@@ -157,7 +164,7 @@ private:
     std::mutex submit_mutex_;
     std::unordered_map<ResourceId, ResourceBinding> resources_;
     LayoutTracker tracker_;
-    std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> views_;
+    std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> views_;
     ReplayFunctions replay_;
 };
 

@@ -9,6 +9,7 @@
 #include "../src/bindless_registry.h"   // key -> bindless index
 #include "../src/retirement.h"          // fence-value deferred release
 #include "../src/vulkan_bindless.h"     // set 0: images, samplers, descriptor table
+#include "../src/pipeline_stream.h"     // D3D12 pipeline-state stream (PR C)
 #include "../src/descriptor_sizes.h"    // per-type slot sizes
 #include "d3d12_stubs.h"  // generated
 #include "d3d12_com_object.h"
@@ -161,6 +162,7 @@ struct DeviceState {
     // The console GPU VA space: one linear arena for now, so a resource can hand a valid address to a descriptor.
     // Reserving a real range and growing it at a frame boundary is docs/d3d12_vulkan.md section 3.3's plan.
     // Set 0 for every pipeline: images, samplers and the descriptor hash table. Created once the device exists.
+    std::map<std::uint64_t, void*> va_resources;  // console VA -> Resource*, filled by Resource's constructor
     std::unique_ptr<leonida::BindlessSet> bindless;
     leonida::BindlessRegistry bindless_registry;
     leonida::RetirementQueue retirement;
@@ -282,9 +284,12 @@ public:
              D3D12_HEAP_FLAGS heap_flags)
         : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags),
           console_va_(device.allocate_va(std::max<std::uint64_t>(desc.Width * std::max<UINT>(desc.Height, 1),
-                                                                0x10000))) {}
+                                                                0x10000))) {
+        device_.va_resources[console_va_] = this;
+    }
 
     ~Resource() override {
+        device_.va_resources.erase(console_va_);
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
         device_.context->remove_resource(id());
@@ -298,7 +303,18 @@ public:
     std::uint64_t console_va() const { return console_va_; }
     UINT64 STDMETHODCALLTYPE GetGPUVirtualAddress() override { return console_va_; }
 
+    // What a descriptor view needs from the resource (PR A): the image format and range the view may name.
+    VkFormat format() const { return format_; }
+    VkImageAspectFlags aspects() const { return aspects_; }
+    std::uint32_t mip_levels() const { return mip_levels_; }
+    std::uint32_t array_layers() const { return array_layers_; }
+    std::uint32_t depth() const { return depth_; }
+    std::uint32_t samples() const { return samples_; }
+    std::uint64_t size_bytes() const { return desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? desc_.Width : 0; }
+
     HRESULT create_buffer() {
+        format_ = VK_FORMAT_UNDEFINED;
+        aspects_ = 0;
         auto& vk = device_.context->vk;
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = desc_.Width;
@@ -379,6 +395,12 @@ public:
         binding.array_layers = info.arrayLayers;
         binding.depth = depth;
         binding.volume = volume;
+        format_ = binding.format;
+        aspects_ = binding.aspects;
+        mip_levels_ = binding.mip_levels;
+        array_layers_ = binding.array_layers;
+        depth_ = depth;
+        samples_ = samples;
         binding.samples = samples;
         binding.simultaneous_access = (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) != 0;
         binding.not_zeroed = (heap_flags_ & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED) != 0;
@@ -416,12 +438,379 @@ private:
     D3D12_HEAP_PROPERTIES heap_;
     D3D12_HEAP_FLAGS heap_flags_;
     std::uint64_t console_va_ = 0;
+    VkFormat format_ = VK_FORMAT_UNDEFINED;
+    VkImageAspectFlags aspects_ = 0;
+    std::uint32_t mip_levels_ = 1;
+    std::uint32_t array_layers_ = 1;
+    std::uint32_t depth_ = 1;
+    std::uint32_t samples_ = 1;
     VkImage image_ = VK_NULL_HANDLE;
     VkBuffer buffer_ = VK_NULL_HANDLE;
     VkDeviceMemory memory_ = VK_NULL_HANDLE;
     void* mapped_ = nullptr;
 };
 
+// The buffer a console VA points into, or nullptr. Only buffers have a size a descriptor can name; a texture VA is
+// resolved through its ID3D12Resource instead.
+inline Resource* resource_for_va(DeviceState& state, std::uint64_t va) {
+    auto it = state.va_resources.upper_bound(va);
+    if (it == state.va_resources.begin()) return nullptr;
+    --it;
+    auto* resource = static_cast<Resource*>(it->second);
+    const std::uint64_t size = resource->size_bytes();
+    return size && va - it->first < size ? resource : nullptr;
+}
+namespace sampler_detail {
+
+inline leonida::gfx10::Filter point_or_bilinear(bool linear, bool anisotropic) {
+    if (anisotropic) return leonida::gfx10::Filter::aniso_bilinear;
+    return linear ? leonida::gfx10::Filter::bilinear : leonida::gfx10::Filter::point;
+}
+
+inline leonida::gfx10::AddressMode address(D3D12_TEXTURE_ADDRESS_MODE mode) {
+    switch (mode) {
+        case D3D12_TEXTURE_ADDRESS_MODE_MIRROR: return leonida::gfx10::AddressMode::mirror;
+        case D3D12_TEXTURE_ADDRESS_MODE_CLAMP: return leonida::gfx10::AddressMode::clamp_last_texel;
+        case D3D12_TEXTURE_ADDRESS_MODE_BORDER: return leonida::gfx10::AddressMode::clamp_border;
+        case D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE: return leonida::gfx10::AddressMode::mirror_once_border;
+        default: return leonida::gfx10::AddressMode::wrap;
+    }
+}
+
+inline leonida::gfx10::CompareFunction compare(D3D12_COMPARISON_FUNC func) {
+    const unsigned value = static_cast<unsigned>(func);
+    if (value >= 1 && value <= 8) return static_cast<leonida::gfx10::CompareFunction>(value - 1);
+    return leonida::gfx10::CompareFunction::never;
+}
+
+inline leonida::gfx10::Sampler from_d3d12(const D3D12_SAMPLER_DESC& desc) {
+    leonida::gfx10::Sampler sampler{};
+    const bool anisotropic = desc.Filter == D3D12_FILTER_ANISOTROPIC ||
+                             desc.Filter == D3D12_FILTER_COMPARISON_ANISOTROPIC;
+    const bool point = desc.Filter == D3D12_FILTER_MIN_MAG_MIP_POINT ||
+                       desc.Filter == D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT;
+    sampler.mag_filter = sampler.min_filter = anisotropic ? leonida::gfx10::Filter::aniso_bilinear
+                                             : point      ? leonida::gfx10::Filter::point
+                                                          : leonida::gfx10::Filter::bilinear;
+    sampler.mip_filter = point ? leonida::gfx10::MipFilter::none : leonida::gfx10::MipFilter::linear;
+    sampler.address_u = address(desc.AddressU);
+    sampler.address_v = address(desc.AddressV);
+    sampler.address_w = address(desc.AddressW);
+    sampler.max_anisotropy = std::clamp<UINT>(desc.MaxAnisotropy, 1, 16);
+    sampler.compare = compare(desc.ComparisonFunc);
+    sampler.min_lod = desc.MinLOD;
+    sampler.max_lod = desc.MaxLOD;
+    sampler.lod_bias = desc.MipLODBias;
+    switch (desc.BorderColor[0] == 0.0f && desc.BorderColor[1] == 0.0f && desc.BorderColor[2] == 0.0f
+                ? 0u
+                : (desc.BorderColor[0] == 1.0f ? 2u : 1u)) {
+        case 2: sampler.border_color = leonida::gfx10::BorderColor::opaque_white; break;
+        case 1: sampler.border_color = leonida::gfx10::BorderColor::opaque_black; break;
+        default: sampler.border_color = leonida::gfx10::BorderColor::transparent_black; break;
+    }
+    sampler.filter_mode = (desc.Filter & D3D12_FILTER_MINIMUM_MIN_MAG_MIP_POINT) == D3D12_FILTER_MINIMUM_MIN_MAG_MIP_POINT
+                              ? leonida::gfx10::FilterMode::minimum
+                          : (desc.Filter & D3D12_FILTER_MAXIMUM_MIN_MAG_MIP_POINT) ==
+                                    D3D12_FILTER_MAXIMUM_MIN_MAG_MIP_POINT
+                              ? leonida::gfx10::FilterMode::maximum
+                              : leonida::gfx10::FilterMode::blend;
+    return sampler;
+}
+
+}  // namespace sampler_detail
+// --- PR C: D3D12 pipeline state -> VkPipeline ---------------------------------------------------------------
+
+inline VkFormat dxgi_format(DXGI_FORMAT format) {
+    switch (format) {
+        case DXGI_FORMAT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return VK_FORMAT_R8G8B8A8_SRGB;
+        case DXGI_FORMAT_B8G8R8A8_UNORM: return VK_FORMAT_B8G8R8A8_UNORM;
+        case DXGI_FORMAT_R16G16B16A16_FLOAT: return VK_FORMAT_R16G16B16A16_SFLOAT;
+        case DXGI_FORMAT_R32G32B32A32_FLOAT: return VK_FORMAT_R32G32B32A32_SFLOAT;
+        case DXGI_FORMAT_R32G32B32_FLOAT: return VK_FORMAT_R32G32B32_SFLOAT;
+        case DXGI_FORMAT_R32G32_FLOAT: return VK_FORMAT_R32G32_SFLOAT;
+        case DXGI_FORMAT_R32_FLOAT: return VK_FORMAT_R32_SFLOAT;
+        case DXGI_FORMAT_R16G16_FLOAT: return VK_FORMAT_R16G16_SFLOAT;
+        case DXGI_FORMAT_R10G10B10A2_UNORM: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+        case DXGI_FORMAT_D32_FLOAT: return VK_FORMAT_D32_SFLOAT;
+        case DXGI_FORMAT_D24_UNORM_S8_UINT: return VK_FORMAT_D24_UNORM_S8_UINT;
+        case DXGI_FORMAT_UNKNOWN: return VK_FORMAT_UNDEFINED;
+        default: return VK_FORMAT_UNDEFINED;  // the caller logs and falls back
+    }
+}
+
+inline VkFormat element_format(DXGI_FORMAT format) {
+    const VkFormat converted = dxgi_format(format);
+    if (converted != VK_FORMAT_UNDEFINED) return converted;
+    log_once("input element format not mapped, using R32G32B32A32_SFLOAT; DXGI format", int(format));
+    return VK_FORMAT_R32G32B32A32_SFLOAT;
+}
+
+inline UINT element_size(DXGI_FORMAT format) {
+    switch (format) {
+        case DXGI_FORMAT_R32G32B32A32_FLOAT: return 16;
+        case DXGI_FORMAT_R32G32B32_FLOAT: return 12;
+        case DXGI_FORMAT_R32G32_FLOAT: return 8;
+        case DXGI_FORMAT_R32_FLOAT: return 4;
+        case DXGI_FORMAT_R16G16B16A16_FLOAT: return 8;
+        case DXGI_FORMAT_R16G16_FLOAT: return 4;
+        case DXGI_FORMAT_R8G8B8A8_UNORM: return 4;
+        default: return 4;
+    }
+}
+
+inline VkBlendFactor blend_factor(D3D12_BLEND blend) {
+    switch (blend) {
+        case D3D12_BLEND_ZERO: return VK_BLEND_FACTOR_ZERO;
+        case D3D12_BLEND_ONE: return VK_BLEND_FACTOR_ONE;
+        case D3D12_BLEND_SRC_COLOR: return VK_BLEND_FACTOR_SRC_COLOR;
+        case D3D12_BLEND_INV_SRC_COLOR: return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+        case D3D12_BLEND_SRC_ALPHA: return VK_BLEND_FACTOR_SRC_ALPHA;
+        case D3D12_BLEND_INV_SRC_ALPHA: return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        case D3D12_BLEND_DEST_ALPHA: return VK_BLEND_FACTOR_DST_ALPHA;
+        case D3D12_BLEND_INV_DEST_ALPHA: return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
+        case D3D12_BLEND_DEST_COLOR: return VK_BLEND_FACTOR_DST_COLOR;
+        case D3D12_BLEND_INV_DEST_COLOR: return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+        default: return VK_BLEND_FACTOR_ONE;
+    }
+}
+
+inline VkBlendOp blend_op(D3D12_BLEND_OP op) {
+    switch (op) {
+        case D3D12_BLEND_OP_SUBTRACT: return VK_BLEND_OP_SUBTRACT;
+        case D3D12_BLEND_OP_REV_SUBTRACT: return VK_BLEND_OP_REVERSE_SUBTRACT;
+        case D3D12_BLEND_OP_MIN: return VK_BLEND_OP_MIN;
+        case D3D12_BLEND_OP_MAX: return VK_BLEND_OP_MAX;
+        default: return VK_BLEND_OP_ADD;
+    }
+}
+
+inline VkCompareOp compare_op(D3D12_COMPARISON_FUNC func) {
+    const unsigned value = static_cast<unsigned>(func);
+    return value >= 1 && value <= 8 ? static_cast<VkCompareOp>(value - 1) : VK_COMPARE_OP_ALWAYS;
+}
+
+class PipelineState final
+    : public Child<PipelineState, ID3D12PipelineStateStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
+                   ID3D12PipelineState> {
+public:
+    // {2a6f5b1c-3f8e-4b2a-9c1d-7e4b8a6f2d10}
+    static constexpr GUID kTag{0x2a6f5b1c, 0x3f8e, 0x4b2a, {0x9c, 0x1d, 0x7e, 0x4b, 0x8a, 0x6f, 0x2d, 0x10}};
+
+    PipelineState(DeviceState& device, VkPipeline pipeline, VkPipelineLayout layout)
+        : device_(device), pipeline_(pipeline), layout_(layout) {}
+
+    ~PipelineState() override {
+        auto& vk = device_.context->vk;
+        if (pipeline_) vk.vkDestroyPipeline(device_.info.device, pipeline_, nullptr);
+        if (layout_) vk.vkDestroyPipelineLayout(device_.info.device, layout_, nullptr);
+    }
+
+    VkPipeline pipeline() const { return pipeline_; }
+
+private:
+    DeviceState& device_;
+    VkPipeline pipeline_ = VK_NULL_HANDLE;
+    VkPipelineLayout layout_ = VK_NULL_HANDLE;
+};
+
+// Builds a VkPipeline from a parsed D3D12 stream. Returns E_INVALIDARG with a log line on a stream this layer cannot
+// express yet; the caller (CreatePipelineState) reports it instead of crashing.
+inline HRESULT build_pipeline(DeviceState& state, const D3D12_PIPELINE_STATE_STREAM_DESC& desc,
+                              VkPipeline* pipeline_out, VkPipelineLayout* layout_out) {
+    rt::d3d12::PipelineStream stream{};
+    std::string error;
+    if (!rt::d3d12::parse_pipeline_stream(desc.pPipelineStateSubobjectStream, desc.SizeInBytes, stream, &error)) {
+        std::fprintf(stderr, "[rt] d3d12: pipeline stream rejected: %s\n", error.c_str());
+        return E_INVALIDARG;
+    }
+    if (!stream.vs || !stream.ps || !stream.vs->pShaderBytecode || !stream.ps->pShaderBytecode) return E_INVALIDARG;
+    if (!state.bindless) {
+        std::fprintf(stderr, "[rt] d3d12: no bindless set for a pipeline\n");
+        return E_FAIL;
+    }
+
+    auto& vk = state.context->vk;
+    const VkDevice device = state.info.device;
+    VkShaderModule vs = VK_NULL_HANDLE, ps = VK_NULL_HANDLE;
+    VkShaderModuleCreateInfo module{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    module.codeSize = stream.vs->BytecodeLength;
+    module.pCode = static_cast<const std::uint32_t*>(stream.vs->pShaderBytecode);
+    if (vk.vkCreateShaderModule(device, &module, nullptr, &vs) != VK_SUCCESS) return E_FAIL;
+    module.codeSize = stream.ps->BytecodeLength;
+    module.pCode = static_cast<const std::uint32_t*>(stream.ps->pShaderBytecode);
+    if (vk.vkCreateShaderModule(device, &module, nullptr, &ps) != VK_SUCCESS) {
+        vk.vkDestroyShaderModule(device, vs, nullptr);
+        return E_FAIL;
+    }
+
+    VkPushConstantRange push{};
+    push.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    push.offset = 0;
+    push.size = 144;  // the translator's contract: s0..s31, heap base, code base
+    const VkDescriptorSetLayout set_layout = state.bindless->layout();
+    VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layout_info.setLayoutCount = 1;
+    layout_info.pSetLayouts = &set_layout;
+    layout_info.pushConstantRangeCount = 1;
+    layout_info.pPushConstantRanges = &push;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    if (vk.vkCreatePipelineLayout(device, &layout_info, nullptr, &layout) != VK_SUCCESS) {
+        vk.vkDestroyShaderModule(device, vs, nullptr);
+        vk.vkDestroyShaderModule(device, ps, nullptr);
+        return E_FAIL;
+    }
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vs;
+    stages[0].pName = "main";
+    stages[1] = stages[0];
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = ps;
+
+    std::vector<VkVertexInputBindingDescription> bindings;
+    std::vector<VkVertexInputAttributeDescription> attributes;
+    if (stream.input_layout) {
+        for (UINT i = 0; i < stream.input_layout->NumElements; ++i) {
+            const D3D12_INPUT_ELEMENT_DESC& e = stream.input_layout->pInputElementDescs[i];
+            VkVertexInputAttributeDescription a{};
+            a.location = e.SemanticIndex;
+            a.binding = e.InputSlot;
+            a.format = element_format(e.Format);
+            a.offset = e.AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT ? 0 : e.AlignedByteOffset;
+            attributes.push_back(a);
+        }
+        std::uint32_t slots = 0;
+        for (const auto& a : attributes) slots = std::max(slots, a.binding + 1);
+        bindings.resize(slots);
+        for (std::uint32_t slot = 0; slot < slots; ++slot) {
+            std::uint32_t stride = 0;
+            for (std::size_t i = 0; i < attributes.size(); ++i)
+                if (attributes[i].binding == slot)
+                    stride = std::max(stride, attributes[i].offset +
+                                                  element_size(stream.input_layout->pInputElementDescs[i].Format));
+            bindings[slot] = {slot, stride, VK_VERTEX_INPUT_RATE_VERTEX};
+        }
+    }
+    VkPipelineVertexInputStateCreateInfo vertex_input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vertex_input.vertexBindingDescriptionCount = std::uint32_t(bindings.size());
+    vertex_input.pVertexBindingDescriptions = bindings.data();
+    vertex_input.vertexAttributeDescriptionCount = std::uint32_t(attributes.size());
+    vertex_input.pVertexAttributeDescriptions = attributes.data();
+
+    VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    switch (stream.topology) {
+        case D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT: assembly.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
+        case D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE: assembly.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
+        case D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE: assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
+        default: assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
+    }
+    VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    viewport.viewportCount = 1;
+    viewport.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    raster.lineWidth = 1.0f;
+    raster.cullMode = VK_CULL_MODE_NONE;
+    if (stream.rasterizer) {
+        raster.depthClampEnable = VK_FALSE;  // the depthClamp feature is not enabled: depth clipping stays on
+        raster.polygonMode = stream.rasterizer->FillMode == D3D12_FILL_MODE_WIREFRAME ? VK_POLYGON_MODE_LINE
+                                                                                     : VK_POLYGON_MODE_FILL;
+        raster.cullMode = stream.rasterizer->CullMode == D3D12_CULL_MODE_FRONT ? VK_CULL_MODE_FRONT_BIT
+                          : stream.rasterizer->CullMode == D3D12_CULL_MODE_BACK ? VK_CULL_MODE_BACK_BIT
+                                                                                : VK_CULL_MODE_NONE;
+        raster.frontFace = stream.rasterizer->FrontCounterClockwise ? VK_FRONT_FACE_COUNTER_CLOCKWISE
+                                                                    : VK_FRONT_FACE_CLOCKWISE;
+        raster.depthBiasEnable = stream.rasterizer->DepthBias != 0 ? VK_TRUE : VK_FALSE;
+        raster.depthBiasConstantFactor = float(stream.rasterizer->DepthBias);
+        raster.depthBiasSlopeFactor = stream.rasterizer->SlopeScaledDepthBias;
+        raster.depthBiasClamp = stream.rasterizer->DepthBiasClamp;
+    }
+    VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    std::vector<VkPipelineColorBlendAttachmentState> attachments(std::max<std::uint32_t>(stream.rtv_count, 1));
+    for (std::uint32_t i = 0; i < attachments.size(); ++i) {
+        auto& a = attachments[i];
+        if (stream.blend && i < 8) {
+            const D3D12_RENDER_TARGET_BLEND_DESC& b = stream.blend->RenderTarget[i];
+            a.blendEnable = b.BlendEnable;
+            a.srcColorBlendFactor = blend_factor(b.SrcBlend);
+            a.dstColorBlendFactor = blend_factor(b.DestBlend);
+            a.colorBlendOp = blend_op(b.BlendOp);
+            a.srcAlphaBlendFactor = blend_factor(b.SrcBlendAlpha);
+            a.dstAlphaBlendFactor = blend_factor(b.DestBlendAlpha);
+            a.alphaBlendOp = blend_op(b.BlendOpAlpha);
+            a.colorWriteMask = (b.RenderTargetWriteMask & D3D12_COLOR_WRITE_ENABLE_RED ? VK_COLOR_COMPONENT_R_BIT : 0) |
+                               (b.RenderTargetWriteMask & D3D12_COLOR_WRITE_ENABLE_GREEN ? VK_COLOR_COMPONENT_G_BIT : 0) |
+                               (b.RenderTargetWriteMask & D3D12_COLOR_WRITE_ENABLE_BLUE ? VK_COLOR_COMPONENT_B_BIT : 0) |
+                               (b.RenderTargetWriteMask & D3D12_COLOR_WRITE_ENABLE_ALPHA ? VK_COLOR_COMPONENT_A_BIT : 0);
+        } else {
+            a.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+                               VK_COLOR_COMPONENT_A_BIT;
+        }
+    }
+    VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    blend.attachmentCount = std::uint32_t(attachments.size());
+    blend.pAttachments = attachments.data();
+    VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    bool has_depth = false;
+    VkFormat depth_format = VK_FORMAT_UNDEFINED;
+    if (stream.depth_stencil) {
+        depth.depthTestEnable = stream.depth_stencil->DepthEnable;
+        depth.depthWriteEnable = stream.depth_stencil->DepthWriteMask != D3D12_DEPTH_WRITE_MASK_ZERO;
+        depth.depthCompareOp = compare_op(stream.depth_stencil->DepthFunc);
+        depth.stencilTestEnable = stream.depth_stencil->StencilEnable;
+        has_depth = depth.depthTestEnable || depth.stencilTestEnable;
+        depth_format = dxgi_format(stream.dsv_format);
+        if (depth_format == VK_FORMAT_UNDEFINED) has_depth = false;
+    }
+    const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dynamic.dynamicStateCount = 2;
+    dynamic.pDynamicStates = dynamic_states;
+
+    VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    VkFormat color_format = stream.rtv_count ? dxgi_format(stream.rtv_formats[0]) : VK_FORMAT_UNDEFINED;
+    if (color_format == VK_FORMAT_UNDEFINED) {
+        log_once("pipeline color format not mapped, using R8G8B8A8_UNORM; DXGI format",
+                 int(stream.rtv_count ? stream.rtv_formats[0] : DXGI_FORMAT_UNKNOWN));
+        color_format = VK_FORMAT_R8G8B8A8_UNORM;
+    }
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachmentFormats = &color_format;
+    if (has_depth) {
+        rendering.depthAttachmentFormat = depth_format;
+        rendering.stencilAttachmentFormat =
+            depth_format == VK_FORMAT_D24_UNORM_S8_UINT ? depth_format : VK_FORMAT_UNDEFINED;
+    }
+
+    VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    info.pNext = &rendering;
+    info.stageCount = 2;
+    info.pStages = stages;
+    info.pVertexInputState = &vertex_input;
+    info.pInputAssemblyState = &assembly;
+    info.pViewportState = &viewport;
+    info.pRasterizationState = &raster;
+    info.pMultisampleState = &multisample;
+    info.pDepthStencilState = has_depth ? &depth : nullptr;
+    info.pColorBlendState = &blend;
+    info.pDynamicState = &dynamic;
+    info.layout = layout;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    const VkResult result = vk.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline);
+    vk.vkDestroyShaderModule(device, vs, nullptr);
+    vk.vkDestroyShaderModule(device, ps, nullptr);
+    if (result != VK_SUCCESS) {
+        std::fprintf(stderr, "[rt] d3d12: vkCreateGraphicsPipelines returned %d\n", int(result));
+        vk.vkDestroyPipelineLayout(device, layout, nullptr);
+        return E_FAIL;
+    }
+    *pipeline_out = pipeline;
+    *layout_out = layout;
+    return S_OK;
+}
 // The Vulkan objects create_vulkan_device_standalone made, destroyed with the device.
 struct OwnedRuntime {
     PFN_vkDestroyDevice destroy_device = nullptr;
@@ -467,6 +856,7 @@ public:
     }
 
     ~Device() override {
+        state_.bindless.reset();  // views/samplers must go before the Vulkan device they belong to
         if (state_.context) {
             std::lock_guard lock(state_.context->submit_mutex());
             state_.context->vk.vkDeviceWaitIdle(state_.info.device);
@@ -643,12 +1033,129 @@ public:
         texture.mip_levels = rd.MipLevels;
         texture.array_layers = rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : rd.DepthOrArraySize;
         texture.samples = std::max(rd.SampleDesc.Count, 1u);
-        if (rt::d3d12::views::encode_texture_srv(*desc, texture, view_format, words))
-            write_view(destination, words.data(), sizeof(words));
-        else
+        if (!rt::d3d12::views::encode_texture_srv(*desc, texture, view_format, words)) {
             log_once("texture SRV not encoded, dimension", int(desc->ViewDimension));
+            return;
+        }
+        if (!write_view(destination, words.data(), sizeof(words))) return;
+
+        // PR B: the shader reaches this texture through the bindless set, not through the console VA. Create the
+        // image view the descriptor array needs, register it and insert the T# -> index mapping, then flush.
+        if (!state_.bindless) return;
+        VkImageSubresourceRange range{};
+        range.aspectMask = r->aspects() ? r->aspects() : VK_IMAGE_ASPECT_COLOR_BIT;
+        range.baseMipLevel = 0;
+        range.levelCount = VK_REMAINING_MIP_LEVELS;
+        range.baseArrayLayer = 0;
+        range.layerCount = VK_REMAINING_ARRAY_LAYERS;
+        VkImageViewType view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        leonida::ImageDimension dimension = leonida::ImageDimension::dim_2d_array;
+        switch (desc->ViewDimension) {
+            case D3D12_SRV_DIMENSION_TEXTURE1D:
+                view_type = VK_IMAGE_VIEW_TYPE_1D;
+                dimension = leonida::ImageDimension::dim_1d;
+                range.baseMipLevel = desc->Texture1D.MostDetailedMip;
+                range.levelCount = desc->Texture1D.MipLevels ? desc->Texture1D.MipLevels : VK_REMAINING_MIP_LEVELS;
+                range.layerCount = 1;
+                break;
+            case D3D12_SRV_DIMENSION_TEXTURE2D:
+                view_type = VK_IMAGE_VIEW_TYPE_2D;
+                dimension = leonida::ImageDimension::dim_2d;
+                range.baseMipLevel = desc->Texture2D.MostDetailedMip;
+                range.levelCount = desc->Texture2D.MipLevels ? desc->Texture2D.MipLevels : VK_REMAINING_MIP_LEVELS;
+                range.layerCount = 1;
+                break;
+            case D3D12_SRV_DIMENSION_TEXTURE3D:
+                view_type = VK_IMAGE_VIEW_TYPE_3D;
+                dimension = leonida::ImageDimension::dim_3d;
+                range.baseMipLevel = desc->Texture3D.MostDetailedMip;
+                range.levelCount = desc->Texture3D.MipLevels ? desc->Texture3D.MipLevels : VK_REMAINING_MIP_LEVELS;
+                range.layerCount = 1;
+                break;
+            case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
+            case D3D12_SRV_DIMENSION_TEXTURECUBE:
+            case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
+                view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+                dimension = leonida::ImageDimension::dim_2d_array;
+                range.baseMipLevel = desc->Texture2DArray.MostDetailedMip;
+                range.levelCount = desc->Texture2DArray.MipLevels ? desc->Texture2DArray.MipLevels
+                                                                  : VK_REMAINING_MIP_LEVELS;
+                range.baseArrayLayer = desc->Texture2DArray.FirstArraySlice;
+                range.layerCount = desc->Texture2DArray.ArraySize;
+                break;
+            default:
+                range.levelCount = 1;
+                range.layerCount = 1;
+                break;
+        }
+        leonida::ResourceBinding viewer{};
+        viewer.image = r->image();
+        viewer.format = r->format();
+        viewer.aspects = r->aspects();
+        viewer.width = static_cast<std::uint32_t>(rd.Width);
+        viewer.height = rd.Height;
+        viewer.mip_levels = r->mip_levels();
+        viewer.array_layers = r->array_layers();
+        viewer.depth = r->depth();
+        const VkImageView image_view = state_.context->image_view(viewer, range, view_type);
+        if (!image_view) {
+            log_once("image view creation failed for an SRV", int(desc->ViewDimension));
+            return;
+        }
+        const std::uint32_t index = state_.bindless->add_image(dimension, image_view, VK_IMAGE_LAYOUT_GENERAL);
+        if (!index) {
+            log_once("bindless image array is full, dimension", int(dimension));
+            return;
+        }
+        state_.bindless->insert_key(leonida::make_tsharp_key(words.data()), index);
+        if (state_.bindless->flush_needs_idle()) state_.context->vk.vkDeviceWaitIdle(state_.info.device);
+        state_.bindless->flush();
     }
 
+    HRESULT STDMETHODCALLTYPE CreatePipelineState(const D3D12_PIPELINE_STATE_STREAM_DESC* desc, REFIID riid,
+                                                  void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!desc || !desc->pPipelineStateSubobjectStream || !desc->SizeInBytes) return E_INVALIDARG;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        const HRESULT hr = build_pipeline(state_, *desc, &pipeline, &layout);
+        if (FAILED(hr)) return hr;
+        auto* object = new PipelineState(state_, pipeline, layout);
+        object->attach_device(identity());
+        return hand_out(object, riid, out);
+    }
+    void STDMETHODCALLTYPE CreateSampler(const D3D12_SAMPLER_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
+        if (!desc || !destination.ptr) return;
+        DescriptorHeap* heap = heap_of(state_, reinterpret_cast<const void*>(destination.ptr));
+        std::uint32_t slot = 0;
+        if (!heap || heap->type() != D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ||
+            !heap->slot_of(reinterpret_cast<const void*>(destination.ptr), &slot)) {
+            log_once("sampler write outside a sampler heap", 0);
+            return;
+        }
+        const leonida::gfx10::Sampler sampler = sampler_detail::from_d3d12(*desc);
+        const leonida::gfx10::SamplerWords words = leonida::gfx10::encode(sampler);
+        std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(),
+                    std::min<std::size_t>(sizeof(words), heap->stride()));
+        heap->mark_dirty(slot, 1);
+        if (!state_.bindless) return;  // no set 0: the descriptor is written, the shader just cannot look it up
+        const VkSamplerCreateInfo info = leonida::gfx10::vulkan_sampler(sampler);
+        VkSampler vk_sampler = VK_NULL_HANDLE;
+        if (state_.context->vk.vkCreateSampler(state_.info.device, &info, nullptr, &vk_sampler) != VK_SUCCESS) {
+            log_once("vkCreateSampler failed", 0);
+            return;
+        }
+        const std::uint32_t index = state_.bindless->add_sampler(vk_sampler);
+        if (!index) {
+            log_once("bindless sampler array is full", 0);
+            return;
+        }
+        const leonida::DescriptorKey key = leonida::make_ssharp_key(words.data());
+        state_.bindless->insert_key(key, index);
+        if (state_.bindless->flush_needs_idle()) state_.context->vk.vkDeviceWaitIdle(state_.info.device);
+        state_.bindless->flush();
+    }
     void STDMETHODCALLTYPE CreateUnorderedAccessView(ID3D12Resource* resource,
                                                      ID3D12Resource* counter_resource,
                                                      const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc,
@@ -1025,6 +1532,10 @@ public:
         return state_.bindless ? state_.bindless->layout() : VK_NULL_HANDLE;
     }
     leonida::BindlessSet* bindless() const { return state_.bindless.get(); }
+    std::uintptr_t resource_id_for_va(std::uint64_t va) {
+        Resource* resource = resource_for_va(state_, va);
+        return resource ? resource->id() : 0;
+    }
     leonida::RetirementQueue& retirement() { return state_.retirement; }
 
     void create_bindless(PFN_vkGetDeviceProcAddr get_device_proc) {
@@ -1047,9 +1558,18 @@ HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** o
         device->Release();
         return E_FAIL;
     }
-    const auto get_device_proc =
-        reinterpret_cast<PFN_vkGetDeviceProcAddr>(info.get_instance_proc(info.instance, "vkGetDeviceProcAddr"));
+    PFN_vkGetInstanceProcAddr get_instance = info.get_instance_proc;
+    if (!get_instance && info.instance) {
+        static const HMODULE loader = LoadLibraryA("vulkan-1.dll");
+        if (loader) get_instance = reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(loader, "vkGetInstanceProcAddr"));
+    }
+    const auto get_device_proc = get_instance
+                                     ? reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+                                           get_instance(info.instance, "vkGetDeviceProcAddr"))
+                                     : nullptr;
     device->create_bindless(get_device_proc);
+    if (!device->bindless_set()) std::fprintf(stderr, "[rt] bindless: set 0 missing (instance=%p, get_device=%p)\n",
+                                               static_cast<void*>(info.instance), reinterpret_cast<void*>(get_device_proc));
     return hand_out(device, riid, out);
 }
 
@@ -1060,6 +1580,11 @@ void set_device_outer(ID3D12Device* device, IUnknown* outer) {
 VkImage vulkan_image(ID3D12Resource* resource) {
     const Resource* r = Resource::from<Resource>(resource);
     return r ? r->image() : VK_NULL_HANDLE;
+}
+
+VkPipeline vulkan_pipeline(ID3D12PipelineState* state) {
+    const PipelineState* p = PipelineState::from<PipelineState>(state);
+    return p ? p->pipeline() : VK_NULL_HANDLE;
 }
 
 std::uint32_t device_max_push_constants_size(ID3D12Device* device) {
@@ -1205,6 +1730,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         device->Release();
         return E_FAIL;
     }
+    const auto get_device_proc = reinterpret_cast<PFN_vkGetDeviceProcAddr>(get(info.instance, "vkGetDeviceProcAddr"));
+    device->create_bindless(get_device_proc);
     return hand_out(device, riid, out);
 }
 
