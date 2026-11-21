@@ -14,6 +14,10 @@
 #include <windows.h>
 
 #include "shims.h"
+#include "d3d12_com.h"
+#include "../test/animated_shaders.h"
+
+extern "C" int __cdecl leonida_run_animation(void* hwnd);
 
 namespace {
 
@@ -256,7 +260,7 @@ int present_window() {
     wc.style = CS_OWNDC;
     wc.lpfnWndProc = DefWindowProcA;
     wc.hInstance = GetModuleHandleA(nullptr);
-    wc.hCursor = LoadCursorA(nullptr, IDC_ARROW);
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.lpszClassName = "LeonidaHelloClass";
     if (!RegisterClassExA(&wc)) return 3;
     HWND hwnd = CreateWindowExA(0, wc.lpszClassName, "Leonida - Hello Triangle (PE loader)", WS_OVERLAPPEDWINDOW,
@@ -317,5 +321,41 @@ int present_window() {
 extern "C" int __cdecl LeonidaRenderTriangle(void) { return render_triangle(); }
 extern "C" int __cdecl LeonidaPresentWindow(void) { return present_window(); }
 
-SHIM_TABLE(d3d12, {"d3d12.dll", "LeonidaRenderTriangle", reinterpret_cast<void*>(&LeonidaRenderTriangle)},
-                    {"d3d12.dll", "LeonidaPresentWindow", reinterpret_cast<void*>(&LeonidaPresentWindow)});
+extern "C" void* __stdcall shim_virtual_alloc(void*, std::size_t size, unsigned long, unsigned long) {
+    return ::VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+}
+extern "C" void __stdcall shim_sleep(unsigned long milliseconds) { ::Sleep(milliseconds); }
+extern "C" void* __stdcall shim_create_file_w(const wchar_t* name, unsigned long access, unsigned long share,
+                                              void* security, unsigned long creation, unsigned long flags, void* file) {
+    return ::CreateFileW(name, access, share, static_cast<LPSECURITY_ATTRIBUTES>(security), creation, flags,
+                         static_cast<HANDLE>(file));
+}
+extern "C" void* __stdcall shim_create_window_ex_w(unsigned long ex_style, const wchar_t* class_name,
+                                                   const wchar_t* title, unsigned long style, int x, int y, int w,
+                                                   int h, void* parent, void* menu, void* instance, void* param) {
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.style = CS_OWNDC;
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = L"LeonidaGameClass";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+    return ::CreateWindowExW(ex_style, class_name, title, style, x, y, w, h, static_cast<HWND>(parent),
+                             static_cast<HMENU>(menu), static_cast<HINSTANCE>(instance), param);
+}
+extern "C" long __stdcall shim_d3d12_create_device(void*, int, const GUID&, void** out) {
+    return rt::d3d12::create_vulkan_device_standalone(__uuidof(ID3D12Device), out);
+}
+extern "C" int __cdecl LeonidaRunAnimation(void* hwnd) { return leonida_run_animation(hwnd); }
+SHIM_TABLE(d3d12, {"d3d12.dll", "LeonidaRunAnimation", reinterpret_cast<void*>(&LeonidaRunAnimation)},
+                    {"kernel32.dll", "VirtualAlloc", reinterpret_cast<void*>(&shim_virtual_alloc)},
+                    {"kernel32.dll", "Sleep", reinterpret_cast<void*>(&shim_sleep)},
+                    {"kernel32.dll", "CreateFileW", reinterpret_cast<void*>(&shim_create_file_w)},
+                    {"user32.dll", "CreateWindowExW", reinterpret_cast<void*>(&shim_create_window_ex_w)},
+                    {"d3d12.dll", "LeonidaPresentWindow", reinterpret_cast<void*>(&LeonidaPresentWindow)},
+                    {"d3d12.dll", "LeonidaRenderTriangle", reinterpret_cast<void*>(&LeonidaRenderTriangle)});

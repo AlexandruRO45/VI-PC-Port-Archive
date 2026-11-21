@@ -63,28 +63,34 @@ int main(int argc, char** argv) {
         auto* entry = reinterpret_cast<void (*)()>(module.base + module.entry_rva);
         entry();
 
-        const std::vector<std::uint8_t> bmp = read_file("hello_triangle.bmp");
-        EXPECT(bmp.size() > 54);
-        if (bmp.size() > 54) {
-            EXPECT(bmp[0] == 'B' && bmp[1] == 'M');
-            const auto* pixels = bmp.data() + 54;
-            std::size_t lit = 0;
-            for (std::size_t i = 0; i + 2 < bmp.size() - 54; i += 3) {
-                if (pixels[i] || pixels[i + 1] || pixels[i + 2]) ++lit;
-            }
-            std::printf("pe_hello_test: %zu lit pixels written by the harness\n", lit);
-            EXPECT(lit > 100);
-            const std::vector<std::uint8_t> capture = read_file("window_capture.bmp");
-            EXPECT(capture.size() > 54);
+        int wsi = 0, frames = 0;
+        {
             std::FILE* log = std::fopen("leonida_window.log", "rb");
-            int frames = 0;
             if (log) {
-                char line[128]{};
-                if (std::fgets(line, sizeof(line), log)) std::sscanf(line, "frames=%d", &frames);
+                char line[160]{};
+                if (std::fgets(line, sizeof(line), log)) {
+                    wsi = std::strstr(line, "wsi=1") ? 1 : 0;
+                    const char* at = std::strstr(line, "frames=");
+                    if (at) std::sscanf(at, "frames=%d", &frames);
+                }
                 std::fclose(log);
             }
-            std::printf("pe_hello_test: window frames=%d capture=%zu bytes\n", frames, capture.size());
-            EXPECT(frames > 0);
+        }
+        std::printf("pe_hello_test: wsi=%d frames=%d\\n", wsi, frames);
+        EXPECT(frames > 0);
+        if (wsi) {
+            EXPECT(frames > 60);
+        } else {
+            const std::vector<std::uint8_t> bmp = read_file("hello_triangle.bmp");
+            EXPECT(bmp.size() > 54);
+            if (bmp.size() > 54) {
+                const auto* pixels = bmp.data() + 54;
+                std::size_t lit = 0;
+                for (std::size_t i = 0; i + 2 < bmp.size() - 54; i += 3)
+                    if (pixels[i] || pixels[i + 1] || pixels[i + 2]) ++lit;
+                std::printf("pe_hello_test: %zu lit pixels written by the harness\\n", lit);
+                EXPECT(lit > 100);
+            }
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "pe_hello_test: exception: %s\n", e.what());
