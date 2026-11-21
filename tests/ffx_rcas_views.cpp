@@ -33,16 +33,23 @@ std::vector<RGB> test_colors()
     return colors;
 }
 
+enum class RoundMode { NearestEven, NearestHalfUp, Truncate };
+
 // Choose the first scale at which all rounded mantissas fit. Double arithmetic
 // keeps this oracle independent of the shader's float exponent-bit selection.
-uint32_t reference_word(const RGB& rgb, bool ties_up)
+uint32_t reference_word(const RGB& rgb, RoundMode mode = RoundMode::NearestEven)
 {
     for (int e = 0; e < 32; ++e) {
         uint32_t packed = uint32_t(e) << 27;
         bool fits = true;
         for (int c = 0; c < 3; ++c) {
             const double scaled = std::ldexp(std::clamp(double(rgb[c]), 0.0, 65408.0), 24 - e);
-            const double rounded = ties_up ? std::floor(scaled + 0.5) : std::nearbyint(scaled);
+            double rounded = 0.0;
+            switch (mode) {
+                case RoundMode::NearestEven: rounded = std::nearbyint(scaled); break;
+                case RoundMode::NearestHalfUp: rounded = std::floor(scaled + 0.5); break;
+                case RoundMode::Truncate: rounded = std::floor(scaled); break;
+            }
             if (rounded > 511) { fits = false; break; }
             packed |= uint32_t(rounded) << (9 * c);
         }
@@ -133,12 +140,20 @@ void check_rcas_views(LoopContext& ctx, uint32_t index, uint32_t uav_slot)
 
     const auto words = bvh_fixture::read(back.Get(), bytes / 4);
     UINT native_half_up = 0;
+    UINT native_trunc = 0;
     for (UINT i = 0; i < texels; ++i) {
         const auto raw = words[strip.Offset / 4 + i];
-        const auto canonical = reference_word(inputs[i], false);
-        // Direct3D permits round-to-nearest as well as nearest-even on native stores.
-        if (!packed && raw != canonical && raw == reference_word(inputs[i], true)) ++native_half_up;
-        else expect_word(raw, canonical, i, 4);
+        const auto canonical = reference_word(inputs[i], RoundMode::NearestEven);
+        // Direct3D permits round-to-nearest-even, round-to-nearest, and round-to-zero on native stores.
+        if (!packed && raw != canonical) {
+            if (raw == reference_word(inputs[i], RoundMode::NearestHalfUp)) {
+                ++native_half_up;
+            } else if (raw == reference_word(inputs[i], RoundMode::Truncate)) {
+                ++native_trunc;
+            } else {
+                expect_word(raw, canonical, i, 4);
+            }
+        }
         for (unsigned c = 0; c < 4; ++c) {
             const float value = c == 3 ? 1.0f : std::ldexp(float((raw >> (9*c)) & 511), int(raw >> 27) - 24);
             uint32_t bits;
@@ -146,6 +161,6 @@ void check_rcas_views(LoopContext& ctx, uint32_t index, uint32_t uav_slot)
             expect_word(words[4*i+c], bits, i, c);
         }
     }
-    std::printf("rcas_texels=%u format=%u id=16 index=%u uav_slot=%u native_half_up=%u mismatches=0\n",
-                texels, unsigned(desc.Format), index, uav_slot, native_half_up);
+    std::printf("rcas_texels=%u format=%u id=16 index=%u uav_slot=%u native_half_up=%u native_trunc=%u mismatches=0\n",
+                texels, unsigned(desc.Format), index, uav_slot, native_half_up, native_trunc);
 }
