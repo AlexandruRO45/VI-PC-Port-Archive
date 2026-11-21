@@ -45,27 +45,38 @@ bool check_dxr_opacity(ID3D12Device* device, bool warp) {
         rays.push_back({probe.origin[0], probe.origin[1], probe.origin[2], probe.nearT,
                         probe.direction[0], probe.direction[1], probe.direction[2], probe.farT, 255, probe.flags});
     const auto words = dxr_fixture::trace(device, vertices, instances, rays, nullptr, &geometries);
-    UINT hits = 0, shaderCommits = 0, firstHitRays = 0, mismatches = 0, warpAfterCommit = 0;
+    UINT hits = 0, shaderCommits = 0, firstHitRays = 0, mismatches = 0, warpAfterCommit = 0, plusTMin = 0;
     UINT counts[CategoryCount]{};
     for (UINT i = 0; i < rays.size(); ++i) {
         const auto expected = dxr_opacity::evaluate(mesh, flags, scene, probes[i]);
         const bool firstHit = (probes[i].flags & dxr_opacity::acceptFirst) != 0;
         const UINT* value = words.data() + 4 * i;
         const bool hit = value[0] & 1;
-        const UINT seen = value[0] >> 8, geometry = value[2] & 0xffff, primitive = value[2] >> 16;
-        float distance;
+        const UINT seen = value[0] >> 8 & 0xf, geometry = value[0] >> 12 & 0xf, primitive = value[0] >> 16 & 0xff;
+        const bool shaderCommitted = value[0] >> 4 & 1;
+        float distance, commitT;
         std::memcpy(&distance, value + 3, sizeof(distance));
-        bool failed[CategoryCount]{};
-        failed[Status] = (value[0] & 0xfffff0f0u) != 0 || hit != expected.closest.hit;
+        std::memcpy(&commitT, value + 2, sizeof(commitT));
+        const auto matches = [](double actual, double wanted) { return std::abs(actual - wanted) <= 1e-5 * wanted; };
+        bool failed[CategoryCount]{}, tPlusTMin = false;
+        failed[Status] = (value[0] & 0xff0000e0u) != 0 || hit != expected.closest.hit;
         // A closest-hit search has one answer. A first-hit search may end on any committable hit.
-        if (hit) {
+        if (hit && geometry < dxr_opacity::geometryCount) {
+            const double wanted = expected.distance[geometry];
             const bool allowed = firstHit ? (expected.committable >> geometry & 1) != 0
                                           : geometry == expected.closest.geometry;
-            failed[Committed] = !allowed || geometry >= dxr_opacity::geometryCount || primitive != 0 ||
-                value[1] != expected.closest.instance ||
-                !(std::abs(distance - expected.distance[geometry]) <= 1e-5 * expected.distance[geometry]);
+            const bool identity = allowed && primitive == 0 && value[1] == expected.closest.instance;
+            // Only the shader commits a non-opaque hit. It records the
+            // candidate distance at that commit, which must be the true one.
+            const bool shaderHit = (expected.nonOpaque >> geometry & 1) != 0;
+            const bool commitTMatches = !shaderHit || (shaderCommitted && matches(commitT, wanted));
+            // Known driver deviation: CommittedRayT of a shader-committed hit
+            // equals the candidate distance plus TMin.
+            tPlusTMin = shaderHit && identity && commitTMatches && !matches(distance, wanted) &&
+                        matches(distance, wanted + probes[i].nearT);
+            failed[Committed] = !identity || !commitTMatches || (!matches(distance, wanted) && !tPlusTMin);
         } else {
-            failed[Committed] = value[1] != 0 || value[2] != 0 || value[3] != 0;
+            failed[Committed] = hit || value[1] != 0 || value[3] != 0 || shaderCommitted || value[0] >> 12 != 0;
         }
         failed[Anomaly] = (value[0] >> 2 & 1) != 0;
         UINT required = expected.required;
@@ -81,8 +92,9 @@ bool check_dxr_opacity(ID3D12Device* device, bool warp) {
         // Known WARP deviation: WARP does not end a first-hit search at a
         // committed hit, automatic or shader. It is reported, not failed, only
         // when the final hit is committable and every other check passes.
-        if (warp && afterCommit && !other) {
-            ++warpAfterCommit;
+        if (!other && (!afterCommit || warp)) {
+            warpAfterCommit += afterCommit;
+            plusTMin += tPlusTMin;
             continue;
         }
         if (other || afterCommit) {
@@ -92,10 +104,10 @@ bool check_dxr_opacity(ID3D12Device* device, bool warp) {
             if (mismatches < 16)
                 std::fprintf(stderr, "ray=%u flags=0x%x [%s] expected hit=%u instance=%u geometry=%u distance=%g "
                              "committable=0x%x candidates required=0x%x allowed=0x%x actual word0=0x%x instance=%u "
-                             "geometry=%u primitive=%u distance=%g\n", i, probes[i].flags, names.c_str(),
+                             "geometry=%u primitive=%u distance=%g shader_commit_t=%g\n", i, probes[i].flags, names.c_str(),
                              expected.closest.hit, expected.closest.instance, expected.closest.geometry,
                              expected.closest.distance, expected.committable, required, expected.nonOpaque,
-                             value[0], value[1], geometry, primitive, distance);
+                             value[0], value[1], geometry, primitive, distance, commitT);
             ++mismatches;
         }
     }
@@ -110,6 +122,7 @@ bool check_dxr_opacity(ID3D12Device* device, bool warp) {
     for (int c = 0; c < CategoryCount; ++c)
         if (counts[c]) std::printf(" %s=%u", categoryNames[c], counts[c]);
     if (warp) std::printf(" warp_after_commit=%u", warpAfterCommit);
+    std::printf(" committed_t_plus_tmin=%u", plusTMin);
     std::printf("\n");
     if (mismatches) throw std::runtime_error("DXR opacity or candidate handling disagrees with the CPU reference");
     if (hits != 94 || shaderCommits != 42 || firstHitRays != 36)

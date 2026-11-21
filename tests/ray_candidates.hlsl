@@ -22,6 +22,7 @@ void CSMain(uint3 thread : SV_DispatchThreadID)
     RayQuery<RAY_FLAG_NONE> q;
     q.TraceRayInline(scene, query.flags & 0x3ff, query.mask, ray);
     uint seen = 0, afterCommit = 0, afterShaderCommit = 0, anomaly = 0, shaderCommitted = 0;
+    float shaderCommitT = 0; // CandidateTriangleRayT of the latest candidate this shader committed.
     while (q.Proceed()) {
         // Legal while searching for the closest hit, but a first-hit search
         // must end at its first commit. Bit 3 marks a candidate after this
@@ -29,17 +30,24 @@ void CSMain(uint3 thread : SV_DispatchThreadID)
         if (shaderCommitted) afterShaderCommit = 1;
         else if (q.CommittedStatus() != COMMITTED_NOTHING) afterCommit = 1;
         if (q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE) { anomaly = 1; continue; }
-        // A candidate must lie inside the ray extents and in front of any committed hit.
+        // A candidate must lie inside the ray extents and not behind any
+        // committed hit. An implementation may present the committed triangle
+        // or one at the same distance again, so equality is allowed.
         float t = q.CandidateTriangleRayT();
         float limit = q.CommittedStatus() == COMMITTED_NOTHING ? ray.TMax : q.CommittedRayT();
         uint geometry = q.CandidateGeometryIndex();
-        if (!(t > ray.TMin && t < limit) || q.CandidatePrimitiveIndex() != 0 || geometry >= 4) { anomaly = 1; continue; }
+        if (!(t > ray.TMin && t <= limit) || q.CandidatePrimitiveIndex() != 0 || geometry >= 4) { anomaly = 1; continue; }
         seen |= 1u << geometry;
-        if ((accept >> geometry) & 1) { q.CommitNonOpaqueTriangleHit(); shaderCommitted = 1; }
+        if ((accept >> geometry) & 1) { q.CommitNonOpaqueTriangleHit(); shaderCommitted = 1; shaderCommitT = t; }
     }
-    uint4 value = uint4((afterCommit << 1) | (anomaly << 2) | (afterShaderCommit << 3) | (seen << 8), 0, 0, 0);
+    // Word 0: bit 0 hit, 1 candidate after an automatic commit, 2 anomaly,
+    // 3 candidate after a shader commit, 4 shader committed, 8-11 presented
+    // geometries, 12-15 committed geometry, 16-23 committed primitive.
+    // Word 2 holds the candidate distance of the latest shader commit.
+    uint4 value = uint4((afterCommit << 1) | (anomaly << 2) | (afterShaderCommit << 3) | (shaderCommitted << 4) |
+                        (seen << 8), 0, asuint(shaderCommitT), 0);
     if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
-        value = uint4(value.x | 1, q.CommittedInstanceID(),
-                      q.CommittedGeometryIndex() | (q.CommittedPrimitiveIndex() << 16), asuint(q.CommittedRayT()));
+        value = uint4(value.x | 1 | (min(q.CommittedGeometryIndex(), 15u) << 12) | (min(q.CommittedPrimitiveIndex(), 255u) << 16),
+                      q.CommittedInstanceID(), value.z, asuint(q.CommittedRayT()));
     results[i] = value;
 }
