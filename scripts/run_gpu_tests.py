@@ -208,6 +208,12 @@ def run_cmd(cmd: list[str], env: dict | None = None) -> tuple[int, str]:
     return p.returncode, (p.stdout + "\n" + p.stderr).strip()
 
 
+def unsupported_skip(msg: str) -> str:
+    """The reason a test tool gave with its UNSUPPORTED (77) exit, in the shape check.py reports skips."""
+    m = re.search(r"unsupported: .*", msg)
+    return f"SKIP ({m.group(0) if m else 'device lacks a feature the test needs'})"
+
+
 def check_pixel_const(raw_path: str, want: tuple[int, int, int, int]) -> tuple[bool, str]:
     px = read_raw_u32(raw_path)
     if len(px) != 64 * 64:
@@ -435,7 +441,7 @@ def run_suite(a, work: str) -> int:
     vk_store = os.path.join(a.build, "vk_store_test" + ext)
     vk_harness = os.path.join(a.build, "vk_harness" + ext)
 
-    results: list[tuple[str, bool, str]] = []
+    results: list[tuple[str, bool | None, str]] = []
     for fname in asm_files:
         name = os.path.splitext(fname)[0]
         if name in INTERPRETER_ONLY:
@@ -530,6 +536,9 @@ def run_suite(a, work: str) -> int:
             raw = os.path.join(raw_dir, f"{name}.raw")
             vs = os.path.join(spirv_dir, "vs_ids.spv") if name == "ps_flat" else vs_tri   # check.py draws ps_flat with vs_ids
             rc, msg = run_cmd([vk_harness, vs, spv, raw], env=gfx_env)
+            if rc == 77:   # vk_harness: the device lacks a feature the shader needs (issue #203)
+                results.append((name, None, unsupported_skip(msg)))
+                continue
             if rc != 0:
                 results.append((name, False, msg))
                 continue
@@ -544,6 +553,12 @@ def run_suite(a, work: str) -> int:
                 "ps_ops5": (0x12340010, 0xBEEF0800, 0xAAAAFFFF, 0xDEADBC00),   # from the .asm headers
                 "ps_ops6": (0xF800FFFF, 0x01000010, 0x00800800, 0x8000FFF0),
             }
+            if name == "ps_bitmask_perm":
+                m = re.search(r"\(subgroup (\d+)\.\.(\d+)\)", msg)
+                if m and int(m.group(2)) < 32:
+                    # the checker judges lanes 0-31: a device with narrower subgroups has no such lanes
+                    results.append((name, None, f"SKIP (subgroup {m.group(2)} < 32: the check judges lanes 0-31)"))
+                    continue
             if name in const_wants:
                 ok, detail = check_pixel_const(raw, const_wants[name])
             elif name == "ps_bary":

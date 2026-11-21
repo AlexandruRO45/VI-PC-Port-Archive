@@ -31,6 +31,19 @@ static std::vector<uint32_t> read_spv(const char* path) {
     return w;
 }
 
+// True when the module declares OpCapability FragmentBarycentricKHR (token 5284). SPIR-V is five header
+// words followed by instructions headed by (wordCount << 16 | opcode); OpCapability is 17 with the token
+// as its only operand.
+static bool declares_barycentric(const std::vector<uint32_t>& code) {
+    for (size_t i = 5; i + 1 < code.size(); ) {
+        const uint32_t op = code[i] & 0xFFFFu, words = code[i] >> 16;
+        if (words < 1) return false;   // malformed: vkCreateShaderModule will report the real cause
+        if (op == 17u && code[i + 1] == 5284u) return true;
+        i += words;
+    }
+    return false;
+}
+
 int main(int argc, char** argv) {
     if (argc < 4) {
         std::fprintf(stderr, "usage: vk_harness vs.spv fs.spv out.raw [w h]\n");
@@ -93,7 +106,8 @@ int main(int argc, char** argv) {
 #if defined(VK_KHR_MAINTENANCE_8_EXTENSION_NAME) && defined(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR)
     VkPhysicalDeviceMaintenance8FeaturesKHR m8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
 #endif
-    if (has(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
+    const bool has_bary = has(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
+    if (has_bary) {
         enable.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
         bary.fragmentShaderBarycentric = VK_TRUE; bary.pNext = chain; chain = &bary;
     }
@@ -184,14 +198,22 @@ int main(int argc, char** argv) {
     VkFramebufferCreateInfo fbi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
     fbi.renderPass = rp; fbi.attachmentCount = 1; fbi.pAttachments = &view; fbi.width = W; fbi.height = H; fbi.layers = 1;
     VkFramebuffer fb; CHECK(vkCreateFramebuffer(dev, &fbi, nullptr, &fb));
-    auto module = [&](const char* p, VkShaderModule* m) {
-        auto code = read_spv(p);
+    auto module = [&](const std::vector<uint32_t>& code, VkShaderModule* m) {
         VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         smi.codeSize = code.size() * 4; smi.pCode = code.data();
         return vkCreateShaderModule(dev, &smi, nullptr, m);
     };
     VkShaderModule vs, fs;
-    CHECK(module(argv[1], &vs)); CHECK(module(argv[2], &fs));
+    const std::vector<uint32_t> fs_code = read_spv(argv[2]);
+    CHECK(module(read_spv(argv[1]), &vs)); CHECK(module(fs_code, &fs));
+    // A fragment module reading BaryCoordKHR on a device without the extension aborts inside the driver
+    // (llvmpipe: "Unsupported intrinsic ... @load_barycentric_coord_pixel"), so ask for UNSUPPORTED (77)
+    // before creating the pipeline. Modules without the capability are unaffected.
+    if (!has_bary && declares_barycentric(fs_code)) {
+        std::fprintf(stderr, "unsupported: %s reads BaryCoordKHR and the device has no "
+                             "VK_KHR_fragment_shader_barycentric\n", argv[2]);
+        return 77;
+    }
     VkPipelineShaderStageCreateInfo stages[3]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
                                               {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
                                               {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
@@ -201,7 +223,7 @@ int main(int argc, char** argv) {
     uint32_t nstages = 2;
     if (gs_path) {
         VkShaderModule gsm;
-        CHECK(module(gs_path, &gsm));
+        CHECK(module(read_spv(gs_path), &gsm));
         stages[2].stage = VK_SHADER_STAGE_GEOMETRY_BIT; stages[2].module = gsm; stages[2].pName = "main";
         nstages = 3;
     }

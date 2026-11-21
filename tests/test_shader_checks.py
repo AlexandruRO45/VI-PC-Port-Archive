@@ -2,6 +2,7 @@
 import contextlib
 import io
 from pathlib import Path
+import struct
 import sys
 import tempfile
 import unittest
@@ -126,6 +127,56 @@ class Wave64Checks(unittest.TestCase):
         status, out = self.run_checks(unsupported, unsupported, missing_ballot=True)
         self.assertEqual(status, 1, out)
         self.assertIn("missing cs_wave64_ballot.spv", out)
+
+
+class PixelHarnessChecks(unittest.TestCase):
+    """The pixel path of check.py against a fake vk_harness: the UNSUPPORTED exit (#203) skips, and
+    ps_bitmask_perm is only judged where the device has the 32 lanes the check reads."""
+
+    @staticmethod
+    def device_line(width: int) -> str:
+        return f"device: fake (subgroup {width}..{width})\n"
+
+    @staticmethod
+    def lane_ids_raw() -> bytes:
+        # 64x64 pixels carrying lane ids cycling 0-31 without the permuted bitmasks: judged, they report
+        # mismatches, so a skip and a verdict are tellingly different
+        return b"".join(struct.pack("<4I", i % 32, i % 32, 0, 0) for i in range(64 * 64))
+
+    def run_pixel(self, name: str, code: int, out: str, raw: bytes = b""):
+        def harness(_tool, _vs, _fs, raw_path, env=None):
+            Path(raw_path).write_bytes(raw)
+            return code, out
+
+        with tempfile.TemporaryDirectory() as tmp:
+            spirv = Path(tmp) / "spirv"
+            spirv.mkdir()
+            (spirv / f"{name}.spv").touch()
+            (spirv / "vs_ids.spv").touch()
+            with patch.object(check, "run", side_effect=harness):
+                return check.pixel_test(tmp, spirv, name)
+
+    def test_unsupported_harness_exit_is_a_skip(self):
+        out = self.device_line(8) + ("unsupported: ps_bary.spv reads BaryCoordKHR and the device has no "
+                                     "VK_KHR_fragment_shader_barycentric\n")
+        problem = self.run_pixel("ps_bary", 77, out)
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("SKIP (unsupported:", problem)
+
+    def test_other_harness_errors_stay_failures(self):
+        problem = self.run_pixel("ps_bary", 1, self.device_line(8) + "VkResult -9\n")
+        self.assertNotIsInstance(problem, check.Skip)
+        self.assertTrue(problem, "a failing harness must not read as ok")
+
+    def test_bitmask_perm_skips_on_narrow_subgroups(self):
+        problem = self.run_pixel("ps_bitmask_perm", 0, self.device_line(8), self.lane_ids_raw())
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("subgroup 8 < 32", problem)
+
+    def test_bitmask_perm_is_judged_on_32_lane_subgroups(self):
+        problem = self.run_pixel("ps_bitmask_perm", 0, self.device_line(32), self.lane_ids_raw())
+        self.assertNotIsInstance(problem, check.Skip)
+        self.assertIn("wrong", problem)   # the fake lanes do not carry the wanted bitmasks
 
 
 if __name__ == "__main__":
