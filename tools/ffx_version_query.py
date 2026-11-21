@@ -4,7 +4,7 @@ import hashlib
 from pathlib import Path
 
 import pefile
-from iced_x86 import Decoder, MemorySizeExt, Mnemonic as M, OpKind as K, Register as R, RegisterExt
+from iced_x86 import Decoder, EncodingKind, MemorySizeExt, Mnemonic as M, OpKind as K, Register as R, RegisterExt
 
 from cpu_leaf_aot import export_rva
 from cpu_ranges import function_ranges, image_bytes
@@ -17,6 +17,7 @@ HIGH_BYTE = {R.AH, R.BH, R.CH, R.DH}
 UINT = {1: "uint8_t", 2: "uint16_t", 4: "uint32_t", 8: "uint64_t"}
 
 INTEGER_HEADER = """#include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <emmintrin.h>
@@ -58,7 +59,12 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
     # Unaligned YMM copies and VEX zeroing in the descriptor builder need
     # only byte storage on the desktop host.
     wide = {R.YMM0: "wide0", R.YMM1: "wide1", R.YMM2: "wide2"}
-    has_wide = any(i.mnemonic == M.VMOVUPS for i in body)
+    wide_any = {**wide, R.XMM0: "wide0", R.XMM1: "wide1", R.XMM2: "wide2"}
+    fma_scalar = {
+        getattr(M, f"VF{k.upper()}{o}{s.upper()}"): (k, o, s == "sd")
+        for k in ("madd", "msub", "nmadd", "nmsub") for o in ("132", "213", "231") for s in ("ss", "sd")
+    }
+    has_wide = any(i.mnemonic == M.VMOVUPS or i.mnemonic in fma_scalar for i in body)
     if has_wide:
         if has_xmm_math:
             raise ValueError("mixed vector arithmetic and wide descriptor copies are unsupported")
@@ -210,6 +216,19 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             stmt = (f"{{ auto input = {src}; {dst} = {{}}; for (size_t n=0; n<16; n+=4) {{ "
                     f"auto v = load<uint32_t>(reinterpret_cast<word>(input.data()+n)) {operation}; "
                     f"memcpy({dst}.data()+n, &v, 4); }} }}")
+        elif has_wide and i.encoding == EncodingKind.VEX and op in fma_scalar:
+            kind, order, is_f64 = fma_scalar[op]
+            ftype, fn, sz = ("double", "std::fma", 8) if is_f64 else ("float", "std::fmaf", 4)
+            dst, src1 = wide_any[i.op0_register], wide_any[i.op1_register]
+            s0 = f"load<{ftype}>(reinterpret_cast<word>({dst}.data()))"
+            s1 = f"load<{ftype}>(reinterpret_cast<word>({src1}.data()))"
+            s2 = (f"load<{ftype}>({address()})" if i.op2_kind == K.MEMORY
+                  else f"load<{ftype}>(reinterpret_cast<word>({wide_any[i.op2_register]}.data()))")
+            a, b, c = (s0, s2, s1) if order == "132" else (s1, s0, s2) if order == "213" else (s1, s2, s0)
+            neg_a = "-" if kind in ("nmadd", "nmsub") else ""
+            neg_c = "-" if kind in ("msub", "nmsub") else ""
+            stmt = (f"{{ const {ftype} r = {fn}({neg_a}({a}), ({b}), {neg_c}({c})); "
+                    f"auto keep = {dst}; {dst} = {{}}; memcpy({dst}.data(), keep.data(), 16); memcpy({dst}.data(), &r, {sz}); }}")
         elif op == M.VMOVUPS and i.op1_kind == K.MEMORY:
             stmt = f"{wide[i.op0_register]} = load<std::array<uint8_t,32>>({address()});"
         elif op == M.VMOVUPS and i.op0_kind == K.MEMORY:
