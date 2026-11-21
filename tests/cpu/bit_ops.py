@@ -19,7 +19,19 @@ BINARY_OUT_EXPORTS = ("bt32", "bt64", "bts32", "bts64", "btr32", "btr64", "btc32
 
 
 def emit(image, output):
-    parts = [INTEGER_HEADER]
+    parts = [
+        "#include <intrin.h>\n",
+        INTEGER_HEADER,
+        'extern "C" __declspec(dllexport) int host_has_popcnt_lzcnt() {\n'
+        "    int regs[4]{};\n"
+        "    __cpuid(regs, 1);\n"
+        "    if ((regs[2] & (1 << 23)) == 0) return 0;\n"
+        "    __cpuid(regs, static_cast<int>(0x80000000u));\n"
+        "    if (static_cast<unsigned>(regs[0]) < 0x80000001u) return 0;\n"
+        "    __cpuid(regs, static_cast<int>(0x80000001u));\n"
+        "    return (regs[2] & (1 << 5)) != 0;\n"
+        "}\n",
+    ]
     with pefile.PE(str(image), fast_load=True) as pe:
         for name in UNARY_OUT_EXPORTS:
             (bounds,) = function_ranges(pe, export_rva(pe, name))
@@ -88,7 +100,12 @@ def ref_bt_op(op, a, bit, bits):
 
 
 def check(native_path, lifted_path):
-    native, lifted = load_lib(native_path), load_lib(lifted_path)
+    lifted = load_lib(lifted_path)
+    lifted.host_has_popcnt_lzcnt.argtypes, lifted.host_has_popcnt_lzcnt.restype = [], ctypes.c_int
+    if not lifted.host_has_popcnt_lzcnt():
+        print("Host CPU lacks POPCNT or LZCNT (CPUID leaf 1 ECX bit 23 / 80000001h ECX bit 5); skipping native differential check.")
+        sys.exit(77)
+    native = load_lib(native_path)
     slot = U64(0)
     values = (
         0, 1, 2, 0x80, 0x01020304, 0x55aa55aa, 0x7fffffff, 0x80000000, 0xffffffff,
