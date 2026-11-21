@@ -664,22 +664,19 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
-        elif m := match(r"v_cvt_f16_f32(?:_e32|_e64)? (v\d+), (-?)(?:\|([vs]\d+|0x[0-9a-f]{1,8}|\d+)\||abs\(([vs]\d+|0x[0-9a-f]{1,8}|\d+)\)|([vs]\d+|0x[0-9a-f]{1,8}|\d+\.\d+|\d+))"):
+        elif m := match(r"v_cvt_f16_f32(?:_e32|_e64)? (v\d+), ([^,\s]+)"):
             # GFX10 16-bit results replace only the low half; the high half of the destination is kept
             # (LLVM GCNSubtarget::zeroesHigh16BitsOfDest). A destination with no tracked value contributes zero.
-            dst, negate, bars, call, plain = m.groups()
+            dst, src = m.groups()
             if mask != "entry":
                 raise ValueError("Invalid conversion")
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
             old = vector.get(dst)
-            if old is not None and not isinstance(old, str):
+            if old is not None and not (isinstance(old, str) and old.startswith(("sample", "alu", "params["))):
                 raise ValueError("Unsupported conversion destination")
-            value = fp_operand(bars or call or plain, scalar, vector, pending, sample_pending)
-            if bars or call:
-                value = f"abs({value})"
-            if negate:
-                value = f"(-{value})"
+            # fp_operand reads modifiers and inline constants, so -1 stays the bit pattern 0xffffffff.
+            value = fp_operand(src, scalar, vector, pending, sample_pending)
             high = f"(asuint({old}) & 0xffff0000u)" if old is not None else "0u"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({high} | narrow16({value}));")

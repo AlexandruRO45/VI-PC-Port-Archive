@@ -1083,6 +1083,11 @@ def check_controls(directory):
     assert "narrow16((-abs(" in body, body
     must_reject(translate, with_constants(["v_cvt_f16_f32_e64 v12, s44 clamp"]))
     must_reject(translate, with_constants(["v_cvt_f16_f32_sdwa v12, s44 dst_sel:WORD_1"]))
+    # An inline integer keeps its bit pattern, and a destination holding interpolation state is refused.
+    body = translate(with_constants(["v_cvt_f16_f32_e32 v12, -1", "v_cvt_f16_f32_e64 v13, -|0.5|"])).split("float4 main", 1)[1]
+    assert "narrow16(asfloat(4294967295u))" in body and "narrow16((-abs(0.5f)))" in body, body
+    for register in ("v0", "v1", "v8", "v9"):
+        must_reject(translate, with_constants([f"v_cvt_f16_f32_e32 {register}, s44"]))
     archive = directory / "input.bin"
     code = bytes.fromhex("000080bf 000081bf")  # s_nop 0 followed by s_endpgm
     check_container_selector(directory, code)
