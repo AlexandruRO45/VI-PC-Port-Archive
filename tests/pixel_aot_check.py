@@ -484,6 +484,29 @@ def check_half_draw(directory, compiler, renderer, backend):
         if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
             raise AssertionError(f"A wrong half conversion escaped detection in channel {k}")
 
+    # A separate export observes the literal and two scalar results as half encodings.
+    body = [
+        "v_cvt_f32_f16_e32 v12, 0x3c00",
+        "s_ashr_i64 s[72:73], 0xf000, 2",
+        "v_cvt_f32_f16_e32 v13, s72",
+        "s_bfm_b64 s[72:73], 16, 0",
+        "s_and_b64 s[72:73], s[72:73], 0x3c00",
+        "v_cvt_f32_f16_e32 v14, s72",
+        *HALF_BODY[3:],
+    ]
+    source.write_text(translate(with_constants(body)), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    scalars = [half_value(0x3c00), half_value(0xf000 // 4), half_value((2**16 - 1) & 0x3c00), fourth * 2.0 ** 24]
+    assert scalars == [1.0, 1.0, 1.0, 1.0]
+    case.write_bytes(constants + struct.pack("<4f", *scalars) * 64)
+    subprocess.run(draw, check=True)
+    # A shift by zero leaves 0xf000 (-8192.0) in green.
+    wrong_values = [scalars[0], half_value(0xf000), *scalars[2:]]
+    case.write_bytes(constants + struct.pack("<4f", *wrong_values) * 64)
+    result = subprocess.run(draw, capture_output=True, text=True)
+    if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
+        raise AssertionError("A wrong s_ashr_i64 count escaped detection in channel 1")
+
 
 def arithmetic():
     """Add, multiply, reversed subtraction and moves on the sample and constant words 8 to 11."""
@@ -1502,6 +1525,14 @@ def check_render(directory, compiler, renderer, backend):
         case = scalar64_case(directory, values)
         draw = [renderer, backend, "--check-pixel-case", shader, case]
         subprocess.run(draw, check=True)
+    # Keep the original two sets for the SCC toggle checks and add a draw-only case.
+    _, _, *middle, _, alt = SCALAR64_SETS[0]
+    a = 0x11234567 << 32 | 0xffffffff
+    b = middle[1] << 32 | middle[0]
+    # s_not_b64 of a | b sets only bit 63, so its SCC depends on the high word alone.
+    assert ~(a | b) & (2**64 - 1) == 1 << 63
+    case = scalar64_case(directory, (0xffffffff, 0x11234567, *middle, 0x00400018, alt))
+    subprocess.run([renderer, backend, "--check-pixel-case", shader, case], check=True)
     # Mutations verified against Set 1 (where negative signed values and SCC=1 paths are active).
     set1_case = scalar64_case(directory, SCALAR64_SETS[0])
     draw = [renderer, backend, "--check-pixel-case", shader, set1_case]
