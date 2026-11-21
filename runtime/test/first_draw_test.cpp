@@ -94,7 +94,20 @@ int main() {
     stages[1].module = frag;
     stages[1].pName = "main";
 
+    VkVertexInputBindingDescription vertex_binding{};
+    vertex_binding.binding = 0;
+    vertex_binding.stride = 2 * sizeof(float);
+    vertex_binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    VkVertexInputAttributeDescription vertex_attribute{};
+    vertex_attribute.location = 0;
+    vertex_attribute.binding = 0;
+    vertex_attribute.format = VK_FORMAT_R32G32_SFLOAT;
+    vertex_attribute.offset = 0;
     VkPipelineVertexInputStateCreateInfo vertex_input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vertex_input.vertexBindingDescriptionCount = 1;
+    vertex_input.pVertexBindingDescriptions = &vertex_binding;
+    vertex_input.vertexAttributeDescriptionCount = 1;
+    vertex_input.pVertexAttributeDescriptions = &vertex_attribute;
     VkPipelineInputAssemblyStateCreateInfo input_assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkPipelineViewportStateCreateInfo viewport_state{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
@@ -143,6 +156,13 @@ int main() {
     const VkBuffer readback = device.buffer(VkDeviceSize(kSize) * kSize * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &mapped);
     if (!readback) return fail("readback buffer creation failed");
 
+    // The triangle's three vertices come from a vertex buffer now, not from gl_VertexIndex.
+    const float vertices[6] = {-0.8f, -0.8f, 0.8f, -0.8f, 0.0f, 0.8f};
+    void* vertex_data = nullptr;
+    const VkBuffer vertex_buffer = device.buffer(sizeof(vertices), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &vertex_data);
+    if (!vertex_buffer) return fail("vertex buffer creation failed");
+    std::memcpy(vertex_data, vertices, sizeof(vertices));
+
     const bool recorded = device.run([&](VkCommandBuffer command_buffer) {
         bindless.record_fallback_init(command_buffer);
         device.initial_layout(command_buffer, image, VK_IMAGE_ASPECT_COLOR_BIT, 1,
@@ -166,6 +186,9 @@ int main() {
         VkRect2D scissor{{0, 0}, {kSize, kSize}};
         device.fn<PFN_vkCmdSetViewport>("vkCmdSetViewport")(command_buffer, 0, 1, &viewport);
         device.fn<PFN_vkCmdSetScissor>("vkCmdSetScissor")(command_buffer, 0, 1, &scissor);
+        const VkDeviceSize vertex_offset = 0;
+        device.fn<PFN_vkCmdBindVertexBuffers>("vkCmdBindVertexBuffers")(command_buffer, 0, 1, &vertex_buffer,
+                                                                       &vertex_offset);
         const VkDescriptorSet set = bindless.set();
         device.fn<PFN_vkCmdBindDescriptorSets>("vkCmdBindDescriptorSets")(
             command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 1, &set, 0, nullptr);
