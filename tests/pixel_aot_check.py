@@ -62,6 +62,14 @@ def assembly(swap):
     ]
 
 
+def rgb_sample() -> list[str]:
+    program = assembly(False)
+    sample = next(i for i, line in enumerate(program) if line.startswith("image_sample"))
+    program[sample] = program[sample].replace("v[12:15]", "v[12:14]").replace("dmask:0xf", "dmask:0x7")
+    program.insert(sample, "v_mov_b32_e32 v15, 0.5")
+    return program
+
+
 DUAL_CASES = ("forward", "reverse", "reuse")
 
 
@@ -632,6 +640,14 @@ def check_scalar_constant_reads() -> None:
 def check_controls(directory):
     check_constant_descriptor_bounds()
     check_scalar_constant_reads()
+    rgb = rgb_sample()
+    translate(rgb)
+    for old, new in (("v[12:14]", "v[12:15]"), ("dmask:0x7", "dmask:0xb")):
+        must_reject(translate, [line.replace(old, new) for line in rgb])
+    wait = rgb.index("s_waitcnt vmcnt(0)")
+    must_reject(translate, rgb[:wait] + rgb[wait+1:])
+    must_reject(translate, rgb[:wait] + ["v_mov_b32_e32 v14, 1.0"] + rgb[wait:])
+    translate(rgb[:wait] + ["v_mov_b32_e32 v15, 1.0"] + rgb[wait:])
     archive = directory / "input.bin"
     code = bytes.fromhex("000080bf 000081bf")  # s_nop 0 followed by s_endpgm
     check_container_selector(directory, code)
@@ -770,7 +786,7 @@ def check_controls(directory):
 def check_binary(directory, assembler, objcopy, library):
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
                 (arithmetic(), translate), (with_scalar_constant_reads(), translate), (truncate_values(), translate),
-                (ceiling(), translate)]
+                (ceiling(), translate), (rgb_sample(), translate)]
     fixtures.extend((predicate_group(first), translate) for first in range(0, 16, 4))
     fixtures.append((with_constants(CUBE_BODY), translate))
     fixtures.extend((dual_program(case), translate_dual) for case in DUAL_CASES)
@@ -820,7 +836,27 @@ def check_ceiling_draws(directory, compiler, renderer, backend):
         raise AssertionError("Replacing ceiling with floor escaped detection")
 
 
+def check_rgb_sample_draw(directory: Path, compiler: str, renderer: str, backend: str) -> None:
+    hlsl = directory / "rgb-sample.hlsl"
+    shader = directory / "rgb-sample.cso"
+    case = directory / "rgb-sample.case"
+    hlsl.write_text(translate(rgb_sample()), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, hlsl], check=True)
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    for alpha in (0.5, 1.0):
+        colors = (struct.pack("<4f", half_rtz(red / 255), half_rtz(green / 255), half_rtz(128 / 255), alpha)
+                  for green in RAMP for red in RAMP)
+        case.write_bytes(bytes(256) + b"".join(colors))
+        if alpha == 0.5:
+            subprocess.run(draw, check=True)
+        else:
+            wrong = subprocess.run(draw, capture_output=True, text=True)
+            if wrong.returncode != 1 or "pixel_mismatch x=0 y=0" not in wrong.stderr:
+                raise AssertionError("RGB sample with an overwritten alpha register escaped detection")
+
+
 def check_render(directory, compiler, renderer, backend):
+    check_rgb_sample_draw(directory, compiler, renderer, backend)
     for swap in (False, True):
         source = directory / "fixture.hlsl"
         shader = directory / "fixture.cso"

@@ -345,10 +345,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 vector[dst] = f"uv.{component}"
             else:
                 raise ValueError("Unpaired interpolation")
-        elif m := match(r"image_sample v\[(\d+):(\d+)\], v\[(\d+):(\d+)\], s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0xf dim:SQ_RSRC_IMG_2D"):
-            operands = m.groups()
+        elif m := match(r"image_sample v\[(\d+):(\d+)\], v\[(\d+):(\d+)\], s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:(0x[7f]) dim:SQ_RSRC_IMG_2D"):
+            *operands, dmask = m.groups()
+            channel_count = 3 if dmask == "0x7" else 4
             dest, coords, image, state = [registers(*operands[k:k+2], width)
-                                          for k, width in zip((0,2,4,6), (4,2,8,4))]
+                                          for k, width in zip((0,2,4,6), (channel_count,2,8,4))]
             descriptor = [scalar.get(f"s{n}") for n in image]
             texture = next((name for name in bindings.values() if descriptor == [(name, j) for j in range(8)]), None)
             if (mask != "entry" or any(f"s{n}" in pending for n in (*image, *state))
