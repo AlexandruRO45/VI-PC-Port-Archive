@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <fstream>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -404,6 +405,11 @@ void* Loader::resolve(Module& m, const std::string& dll, const std::string& name
         }
     }
     m.imports.push_back({dll, sym, Binding::Unimplemented});
+    {
+        // Missing API log: the game keeps running on the stub, and the name is recorded for the next shim.
+        std::ofstream log("missing_imports.log", std::ios::app);
+        if (log) log << dll << "!" << sym << "\n";
+    }
     return shims::make_unimplemented_thunk(dll, sym);
 }
 

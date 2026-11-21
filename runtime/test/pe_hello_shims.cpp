@@ -15,6 +15,7 @@
 
 #include "shims.h"
 #include "d3d12_com.h"
+#include <d3d12.h>
 #include "../test/animated_shaders.h"
 
 extern "C" int __cdecl leonida_run_animation(void* hwnd);
@@ -352,10 +353,84 @@ extern "C" long __stdcall shim_d3d12_create_device(void*, int, const GUID&, void
     return rt::d3d12::create_vulkan_device_standalone(__uuidof(ID3D12Device), out);
 }
 extern "C" int __cdecl LeonidaRunAnimation(void* hwnd) { return leonida_run_animation(hwnd); }
+// --- engine-facing system shims (threads, clocks, file I/O, D3D12 helpers) --------------------------------
+extern "C" HANDLE __stdcall shim_create_thread(void* attributes, std::size_t stack, DWORD(WINAPI* start)(void*),
+                                                void* parameter, DWORD flags, DWORD* id) {
+    return ::CreateThread(static_cast<LPSECURITY_ATTRIBUTES>(attributes), stack, start, parameter, flags, id);
+}
+extern "C" DWORD __stdcall shim_wait_for_single_object(HANDLE handle, DWORD milliseconds) {
+    return ::WaitForSingleObject(handle, milliseconds);
+}
+extern "C" BOOL __stdcall shim_query_performance_counter(LARGE_INTEGER* counter) {
+    return ::QueryPerformanceCounter(counter);
+}
+extern "C" BOOL __stdcall shim_query_performance_frequency(LARGE_INTEGER* frequency) {
+    return ::QueryPerformanceFrequency(frequency);
+}
+extern "C" ULONGLONG __stdcall shim_get_tick_count64() { return ::GetTickCount64(); }
+extern "C" void* __stdcall shim_create_file_a(const char* name, unsigned long access, unsigned long share,
+                                              void* security, unsigned long creation, unsigned long flags, void* file) {
+    return ::CreateFileA(name, access, share, static_cast<LPSECURITY_ATTRIBUTES>(security), creation, flags,
+                         static_cast<HANDLE>(file));
+}
+extern "C" BOOL __stdcall shim_read_file(HANDLE file, void* buffer, DWORD bytes, DWORD* read, void* overlapped) {
+    return ::ReadFile(file, buffer, bytes, read, static_cast<LPOVERLAPPED>(overlapped));
+}
+extern "C" BOOL __stdcall shim_write_file(HANDLE file, const void* buffer, DWORD bytes, DWORD* written,
+                                          void* overlapped) {
+    return ::WriteFile(file, buffer, bytes, written, static_cast<LPOVERLAPPED>(overlapped));
+}
+extern "C" BOOL __stdcall shim_set_file_pointer_ex(HANDLE file, LARGE_INTEGER distance, LARGE_INTEGER* new_position,
+                                                   DWORD method) {
+    return ::SetFilePointerEx(file, distance, new_position, method);
+}
+extern "C" BOOL __stdcall shim_get_file_size_ex(HANDLE file, LARGE_INTEGER* size) {
+    return ::GetFileSizeEx(file, size);
+}
+extern "C" BOOL __stdcall shim_close_handle(HANDLE handle) { return ::CloseHandle(handle); }
+
+extern "C" HRESULT __stdcall shim_d3d12_create_root_signature_deserializer(const void*, SIZE_T, const GUID&, void** out) {
+    if (out) *out = nullptr;
+    return E_NOTIMPL;  // root signatures are not modelled as objects yet
+}
+extern "C" HRESULT __stdcall shim_map(void* resource, UINT subresource, const D3D12_RANGE* read_range, void** data) {
+    return static_cast<ID3D12Resource*>(resource)->Map(subresource, read_range, data);
+}
+extern "C" void __stdcall shim_unmap(void* resource, UINT subresource, const D3D12_RANGE* written_range) {
+    static_cast<ID3D12Resource*>(resource)->Unmap(subresource, written_range);
+}
+extern "C" void __stdcall shim_execute_command_lists(void* queue, UINT count, void* const* lists) {
+    static_cast<ID3D12CommandQueue*>(queue)->ExecuteCommandLists(
+        count, reinterpret_cast<ID3D12CommandList* const*>(lists));
+}
+extern "C" HRESULT __stdcall shim_create_committed_resource(void* device, const void* heap_properties,
+                                                            D3D12_HEAP_FLAGS flags, const void* desc,
+                                                            D3D12_RESOURCE_STATES state, const void* clear,
+                                                            const GUID& riid, void** out) {
+    return static_cast<ID3D12Device*>(device)->CreateCommittedResource(
+        static_cast<const D3D12_HEAP_PROPERTIES*>(heap_properties), flags,
+        static_cast<const D3D12_RESOURCE_DESC*>(desc), state, static_cast<const D3D12_CLEAR_VALUE*>(clear), riid, out);
+}
 SHIM_TABLE(d3d12, {"d3d12.dll", "LeonidaRunAnimation", reinterpret_cast<void*>(&LeonidaRunAnimation)},
                     {"kernel32.dll", "VirtualAlloc", reinterpret_cast<void*>(&shim_virtual_alloc)},
                     {"kernel32.dll", "Sleep", reinterpret_cast<void*>(&shim_sleep)},
                     {"kernel32.dll", "CreateFileW", reinterpret_cast<void*>(&shim_create_file_w)},
+                    {"kernel32.dll", "CreateFileA", reinterpret_cast<void*>(&shim_create_file_a)},
+                    {"kernel32.dll", "ReadFile", reinterpret_cast<void*>(&shim_read_file)},
+                    {"kernel32.dll", "WriteFile", reinterpret_cast<void*>(&shim_write_file)},
+                    {"kernel32.dll", "SetFilePointerEx", reinterpret_cast<void*>(&shim_set_file_pointer_ex)},
+                    {"kernel32.dll", "GetFileSizeEx", reinterpret_cast<void*>(&shim_get_file_size_ex)},
+                    {"kernel32.dll", "CloseHandle", reinterpret_cast<void*>(&shim_close_handle)},
+                    {"kernel32.dll", "CreateThread", reinterpret_cast<void*>(&shim_create_thread)},
+                    {"kernel32.dll", "WaitForSingleObject", reinterpret_cast<void*>(&shim_wait_for_single_object)},
+                    {"kernel32.dll", "QueryPerformanceCounter", reinterpret_cast<void*>(&shim_query_performance_counter)},
+                    {"kernel32.dll", "QueryPerformanceFrequency", reinterpret_cast<void*>(&shim_query_performance_frequency)},
+                    {"kernel32.dll", "GetTickCount64", reinterpret_cast<void*>(&shim_get_tick_count64)},
+                    {"d3d12.dll", "D3D12CreateRootSignatureDeserializer", reinterpret_cast<void*>(&shim_d3d12_create_root_signature_deserializer)},
+                    {"d3d12.dll", "Map", reinterpret_cast<void*>(&shim_map)},
+                    {"d3d12.dll", "Unmap", reinterpret_cast<void*>(&shim_unmap)},
+                    {"d3d12.dll", "ExecuteCommandLists", reinterpret_cast<void*>(&shim_execute_command_lists)},
+                    {"d3d12.dll", "CreateCommittedResource", reinterpret_cast<void*>(&shim_create_committed_resource)},
                     {"user32.dll", "CreateWindowExW", reinterpret_cast<void*>(&shim_create_window_ex_w)},
                     {"d3d12.dll", "LeonidaPresentWindow", reinterpret_cast<void*>(&LeonidaPresentWindow)},
                     {"d3d12.dll", "LeonidaRenderTriangle", reinterpret_cast<void*>(&LeonidaRenderTriangle)});

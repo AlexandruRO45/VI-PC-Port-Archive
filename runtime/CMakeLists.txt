@@ -440,7 +440,7 @@ if(Vulkan_FOUND)
   find_library(LEONIDA_VULKAN_LIB NAMES vulkan-1 HINTS "$ENV{VULKAN_SDK}/Lib")
   if(LEONIDA_LIB_EXE)
     set(LEONIDA_SHIMS_DEF ${CMAKE_CURRENT_BINARY_DIR}/leonida_shims.def)
-    file(WRITE ${LEONIDA_SHIMS_DEF} "LIBRARY leonida_shims.dll\nEXPORTS\n  VirtualAlloc=shim_virtual_alloc\n  Sleep=shim_sleep\n  CreateFileW=shim_create_file_w\n  CreateWindowExW=shim_create_window_ex_w\n  D3D12CreateDevice=shim_d3d12_create_device\n  LeonidaRunAnimation\n  LeonidaRenderTriangle\n  LeonidaPresentWindow\n")
+    file(WRITE ${LEONIDA_SHIMS_DEF} "LIBRARY leonida_shims.dll\nEXPORTS\n  VirtualAlloc=shim_virtual_alloc\n  Sleep=shim_sleep\n  CreateFileW=shim_create_file_w\n  CreateFileA=shim_create_file_a\n  ReadFile=shim_read_file\n  WriteFile=shim_write_file\n  SetFilePointerEx=shim_set_file_pointer_ex\n  GetFileSizeEx=shim_get_file_size_ex\n  CloseHandle=shim_close_handle\n  CreateThread=shim_create_thread\n  WaitForSingleObject=shim_wait_for_single_object\n  QueryPerformanceCounter=shim_query_performance_counter\n  QueryPerformanceFrequency=shim_query_performance_frequency\n  GetTickCount64=shim_get_tick_count64\n  CreateWindowExW=shim_create_window_ex_w\n  D3D12CreateDevice=shim_d3d12_create_device\n  D3D12CreateRootSignatureDeserializer=shim_d3d12_create_root_signature_deserializer\n  Map=shim_map\n  Unmap=shim_unmap\n  ExecuteCommandLists=shim_execute_command_lists\n  CreateCommittedResource=shim_create_committed_resource\n  LeonidaRunAnimation\n  LeonidaRenderTriangle\n  LeonidaPresentWindow\n")
     add_library(leonida_shims SHARED test/pe_hello_shims.cpp test/wsi_presenter.cpp shims/registry.cpp)
     target_include_directories(leonida_shims PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
                                                      ${CMAKE_CURRENT_SOURCE_DIR}/shims
@@ -455,14 +455,19 @@ if(Vulkan_FOUND)
 
     # Import libraries the harness links against (loader binds the imports to the shim DLL).
     file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/leonida_d3d12.def "LIBRARY d3d12.dll\nEXPORTS\n  LeonidaRunAnimation\n  D3D12CreateDevice\n")
-    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/leonida_kernel32.def "LIBRARY kernel32.dll\nEXPORTS\n  VirtualAlloc\n")
-    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/leonida_user32.def "LIBRARY user32.dll\nEXPORTS\n  CreateWindowExW\n")
+    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/leonida_kernel32.def "LIBRARY kernel32.dll\nEXPORTS\n  VirtualAlloc\n  CreateThread\n  WaitForSingleObject\n  QueryPerformanceCounter\n  QueryPerformanceFrequency\n  GetTickCount64\n  CreateFileW\n  ReadFile\n  WriteFile\n  CloseHandle\n")
+    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/leonida_user32.def "LIBRARY user32.dll\nEXPORTS\n  CreateWindowExW\n  wsprintfA\n")
     add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/leonida_d3d12.lib
       COMMAND ${LEONIDA_LIB_EXE} /def:${CMAKE_CURRENT_BINARY_DIR}/leonida_d3d12.def /machine:x64 /out:${CMAKE_CURRENT_BINARY_DIR}/leonida_d3d12.lib
       DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/leonida_d3d12.def VERBATIM)
     add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/leonida_kernel32.lib
       COMMAND ${LEONIDA_LIB_EXE} /def:${CMAKE_CURRENT_BINARY_DIR}/leonida_kernel32.def /machine:x64 /out:${CMAKE_CURRENT_BINARY_DIR}/leonida_kernel32.lib
       DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/leonida_kernel32.def VERBATIM)
+    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/leonida_xinput1_4.def "LIBRARY xinput1_4.dll\nEXPORTS\n  XInputGetStateForTests\n")
+    add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/leonida_xinput1_4.lib
+      COMMAND ${LEONIDA_LIB_EXE} /def:${CMAKE_CURRENT_BINARY_DIR}/leonida_xinput1_4.def /machine:x64 /out:${CMAKE_CURRENT_BINARY_DIR}/leonida_xinput1_4.lib
+      DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/leonida_xinput1_4.def VERBATIM)
+
     add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/leonida_user32.lib
       COMMAND ${LEONIDA_LIB_EXE} /def:${CMAKE_CURRENT_BINARY_DIR}/leonida_user32.def /machine:x64 /out:${CMAKE_CURRENT_BINARY_DIR}/leonida_user32.lib
       DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/leonida_user32.def VERBATIM)
@@ -470,6 +475,7 @@ if(Vulkan_FOUND)
     add_custom_target(leonida_d3d12_lib DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/leonida_d3d12.lib)
     add_custom_target(leonida_kernel32_lib DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/leonida_kernel32.lib)
     add_custom_target(leonida_user32_lib DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/leonida_user32.lib)
+    add_custom_target(leonida_xinput1_4_lib DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/leonida_xinput1_4.lib)
 
     add_executable(leonida_test_harness test/harness_exe.cpp)
     target_compile_options(leonida_test_harness PRIVATE /GS- /guard:cf-)
@@ -480,6 +486,23 @@ if(Vulkan_FOUND)
     add_dependencies(leonida_test_harness leonida_shims leonida_d3d12_lib leonida_kernel32_lib leonida_user32_lib)
     set_target_properties(leonida_test_harness PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
+    add_executable(test_engine_simulation test/engine_sim_harness.cpp)
+    target_compile_options(test_engine_simulation PRIVATE /GS- /guard:cf-)
+    target_link_options(test_engine_simulation PRIVATE /ENTRY:HarnessEntry /NODEFAULTLIB /SUBSYSTEM:CONSOLE /GS-)
+    target_link_libraries(test_engine_simulation PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/leonida_d3d12.lib
+                                                         ${CMAKE_CURRENT_BINARY_DIR}/leonida_kernel32.lib
+                                                         ${CMAKE_CURRENT_BINARY_DIR}/leonida_user32.lib
+                                                         ${CMAKE_CURRENT_BINARY_DIR}/leonida_xinput1_4.lib)
+    add_dependencies(test_engine_simulation leonida_d3d12_lib leonida_kernel32_lib leonida_user32_lib leonida_xinput1_4_lib)
+    set_target_properties(test_engine_simulation PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+
+    add_executable(engine_sim_test test/engine_sim_test.cpp src/pe_loader.cpp shims/registry.cpp)
+    target_include_directories(engine_sim_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                                                       ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+    target_compile_definitions(engine_sim_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(engine_sim_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+    add_dependencies(engine_sim_test leonida_shims test_engine_simulation)
+    add_test(NAME engine_sim COMMAND engine_sim_test "${CMAKE_CURRENT_BINARY_DIR}/test_engine_simulation.exe")
     add_executable(pe_hello_test test/pe_hello_test.cpp src/pe_loader.cpp shims/registry.cpp)
     target_include_directories(pe_hello_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
                                                      ${CMAKE_CURRENT_SOURCE_DIR}/shims
