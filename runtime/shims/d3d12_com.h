@@ -14,6 +14,12 @@
 
 #include "../src/vulkan_backend.h"
 
+#include <memory>
+
+namespace leonida {
+class VulkanPresenter;
+}
+
 namespace rt::d3d12 {
 
 // `device` (optional) is what the object's GetDevice returns; the object holds a reference to it.
@@ -38,6 +44,7 @@ struct VulkanDeviceInfo {
     bool separate_depth_stencil_layouts = true;
     std::uint32_t max_push_constants_size = 0;
     bool push_constants_need_fallback = false;
+    bool presentation = false;  // VK_KHR_surface + VK_KHR_win32_surface on the instance, VK_KHR_swapchain on the device
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive
@@ -61,6 +68,29 @@ std::uint32_t device_max_push_constants_size(ID3D12Device* device);
 // True when `device`'s Vulkan physical device has maxPushConstantsSize < 144 bytes, requiring
 // the uniform-buffer fallback for the 16-byte tail (heap/code base).
 bool device_push_constants_need_fallback(ID3D12Device* device);
+
+// Puts back buffers of a device from create_vulkan_device* into a window (leonida::VulkanPresenter), for the
+// presentation front end the game uses (DXGI or PresentX, still open). Holds a reference to the device.
+class WindowPresenter {
+public:
+    WindowPresenter(IUnknown* device, std::unique_ptr<leonida::VulkanPresenter> presenter);
+    ~WindowPresenter();
+    WindowPresenter(const WindowPresenter&) = delete;
+    WindowPresenter& operator=(const WindowPresenter&) = delete;
+
+    // `back_buffer` is a colour texture in D3D12's PRESENT state. sync_interval 0 presents without vsync.
+    // S_OK also covers a skipped present while the window is minimised.
+    HRESULT present(ID3D12Resource* back_buffer, UINT sync_interval);
+    VkExtent2D extent() const;
+    std::uint64_t presented() const;
+
+private:
+    IUnknown* device_;
+    std::unique_ptr<leonida::VulkanPresenter> presenter_;
+};
+
+// Null when `device` is not a Vulkan device created with presentation, or the window cannot be presented to.
+std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window);
 
 // ExecuteCommandLists returns void; this is what the last call on the queue did.
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue);
