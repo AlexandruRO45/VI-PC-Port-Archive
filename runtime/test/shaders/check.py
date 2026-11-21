@@ -126,7 +126,7 @@ def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expe
             return ""
     elif mode == "bounds":
         want = [0x12345678, 0x12345678, 0, 0xEEEEEEEE, 0xEEEEEEEE]
-        m = re.search(r"^out\\[0\\.\\.7\\] = ((?:[0-9]+ ){7}[0-9]+)$", out, re.MULTILINE)
+        m = re.search(r"^out\[0\.\.7\] = ((?:[0-9]+ ){7}[0-9]+)$", out, re.MULTILINE)
         if m and [int(x) for x in m.group(1).split()][:len(want)] == want:
             return ""
     elif expected_words is not None:
