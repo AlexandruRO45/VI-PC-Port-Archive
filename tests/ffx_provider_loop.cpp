@@ -178,7 +178,7 @@ uint32_t LoopContext::create(uintptr_t backend, const LoopDesc& d, uint32_t cont
             D3D12_FEATURE_DATA_FORMAT_SUPPORT support{desc.Format};
             check(probe.device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof support),
                   "Query packed RCAS UAV");
-            if (!(support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) ||
+            if (force_packed_rcas || !(support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) ||
                 !(support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE))
                 desc.Format = DXGI_FORMAT_R32_UINT;
             std::printf("rcas_resource_format=%u package_format=67\n", unsigned(desc.Format));
@@ -318,14 +318,19 @@ void check_ffx_provider_loop(ID3D12Device* device)
 #else
     std::puts("provider_loop=desktop-control");
 #endif
-    for (unsigned scenario = 0; scenario < 3; ++scenario) {
+    // Also exercise the software packing route on adapters with native RGB9E5 stores.
+    bool supports_native_rcas = false;
+    for (unsigned scenario = 0; scenario < 4; ++scenario) {
+        if (scenario == 3 && !supports_native_rcas)
+            break;
         RecurrentConfig config{};
         config.render_width = 1280;
         config.render_height = 720;
         config.output_width = 1920;
         config.output_height = 1080;
-        config.flags = scenario == 0 ? 0 : 0x200;
+        config.flags = (scenario == 1 || scenario == 2) ? 0x200 : 0;
         LoopContext ctx(device);
+        ctx.force_packed_rcas = scenario == 3;
         if (scenario == 2)
             ctx.fail_id = 20;
         void* output = device;
@@ -367,5 +372,14 @@ void check_ffx_provider_loop(ID3D12Device* device)
         for (const auto& e : expected)
             std::printf(" %u=%u", e.id, ctx.state.resources[e.id]);
         std::puts("");
+        if (scenario == 0 || scenario == 3) {
+            const auto index = ctx.state.resources.at(16);
+            const auto format = ctx.objects.at(index)->GetDesc().Format;
+            if (scenario == 3 && format != DXGI_FORMAT_R32_UINT)
+                throw std::runtime_error("Packed RCAS control selected the wrong format");
+            if (scenario == 0)
+                supports_native_rcas = format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+            check_rcas_views(ctx, index, read<uint32_t>(records, 64 * index + 0x34));
+        }
     }
 }

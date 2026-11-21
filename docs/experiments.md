@@ -194,7 +194,7 @@ The uploads for IDs 5, 17 and 6 occupy slots 6, 8 and 10 respectively. ID 21 is 
 
 On success, the translated loop copies all 25 indices to the mirror at +0x1ac and writes the provider pointer through the output argument at RVA `0xd263`. The loader returns a separate 16-byte wrapper containing the callback table and that same provider pointer. With flags 0 and 0x200 both adapters returned 0, with next resource indices 15 and 16 respectively. Injecting a callback return of 7 at ID 20 returned 3 through the provider and loader, left both output handles null, preserved the previous resource indices, and left the mirror untouched. The test checks every live backend record against its D3D12 object, both index tables, and the loader wrapper fields. All three cases completed with zero debug errors or warnings on the RTX 4060 Laptop and WARP.
 
-The first desktop format difference occurs at ID 16. WARP exposed typed RGB9E5 UAV stores. The RTX driver (32.0.16.1656) lacked that capability, so the binding created an R32_UINT texture and views for the packed bits. Shader packing, filtering and complete upscaling output remain unverified.
+The first desktop format difference occurs at ID 16. WARP exposed typed RGB9E5 UAV stores. The RTX driver (32.0.16.1656) lacked that capability, so the binding created an R32_UINT texture and views for the packed bits. The texel test below checks the two storage formats.
 
 The local build translates the descriptor builder, debug flag, loop and writeback, resource-slot reservation, upload-descriptor construction, and selected create-export branches. Registry selection and the backend device callbacks are bound on the host. When the pinned loader DLL is beside the upscaler DLL, the probe also executes the recompiled loader create path against that provider. Public CI runs the source-owned provider control on WARP. Configure the local package build as in the recurrent texture test above and run:
 
@@ -202,6 +202,14 @@ The local build translates the descriptor builder, debug flag, loop and writebac
 cmake --build out/build/ffx-device --target offscreen_check
 ctest --test-dir out/build/ffx-device -R '^ffx_provider_loop_' --no-tests=error -V
 ```
+
+### RCAS intermediate texel access
+
+The provider-loop CTests above also exercise resource ID 16 after successful context creation. The test uses the provider's UAV and SRV for the intermediate at resource index 4. A source-built compute shader writes a strip of 1,024 HDR colors into the 1920×1080 texture. Another shader loads the texels through the SRV. A separate texture copy returns the underlying 32-bit words.
+
+On the RTX 4060 Laptop the writer packs RGB into an R32_UINT UAV and the reader unpacks it to floats. The shared HLSL helpers clamp finite inputs to [0, 65408], choose a shared exponent and round the three 9-bit mantissas to nearest even. On WARP the typed RGB9E5 views perform the conversion. A second WARP context forces the packed path to exercise the fallback in public CI. A double-precision CPU reference checks the stored bits and all four decoded components, including the implied alpha of 1. The inputs cover all 32 exponents, channel permutations, half steps, exponent carry, underflow, negative values and saturation. The native reference also accepts the documented nearest rounding alternative at ties. [Direct3D RGB9E5 conversion](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#19.3.2)
+
+On both local adapters the storage words and decoded channels matched nearest-even on every input. Both debug layers reported zero warnings and errors. The package supplies the local resource-creation path. These shaders test integer-coordinate texel loads. The package shader's access to the intermediate, filtering and a full upscaling dispatch remain open.
 
 ### FidelityFX context creation and ownership
 

@@ -21,6 +21,7 @@ struct LoopContext {
     std::array<uint32_t, 12> visited{};
     unsigned calls = 0;
     uint32_t fail_id = 0;
+    bool force_packed_rcas = false;
     uint32_t create(uintptr_t backend, const LoopDesc& desc, uint32_t context, uint32_t* index);
     uint32_t make_upload(const LoopDesc& parent, const LoopDesc& upload);
 };
@@ -28,6 +29,7 @@ void reserve_resource(uint8_t* slot, uint8_t* scratch, const LoopDesc& desc, uin
 uint32_t schedule_upload(LoopContext& ctx, const LoopDesc& desc);
 uint32_t create_loop_context(LoopContext& ctx, void** output, const RecurrentConfig& config);
 void check_ffx_provider_loop(ID3D12Device* device);
+void check_rcas_views(LoopContext& ctx, uint32_t index, uint32_t uav_slot);
 #ifdef FFX_LOOP_LOADER
 uint32_t check_loop_loader(LoopContext& ctx, void** inner, const RecurrentConfig& config);
 #endif

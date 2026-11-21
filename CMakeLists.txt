@@ -63,6 +63,19 @@ add_custom_command(OUTPUT "${pixel_vs}" COMMAND "${DXC_EXECUTABLE}" -T vs_6_0 -E
     DEPENDS tests/pixel_aot_vs.hlsl VERBATIM)
 target_sources(offscreen_check PRIVATE tests/pixel_aot_render.cpp "${pixel_vs}")
 target_sources(offscreen_check PRIVATE tests/binding_mips.cpp tests/ffx_recurrent_views.cpp)
+target_sources(offscreen_check PRIVATE tests/ffx_rcas_views.cpp)
+foreach(storage IN ITEMS Native Packed)
+    foreach(op IN ITEMS Read Write)
+        set(symbol "Rcas${op}${storage}")
+        set(header "${CMAKE_CURRENT_BINARY_DIR}/${symbol}.h")
+        add_custom_command(OUTPUT "${header}"
+            COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E "Rcas${op}" -D "STORAGE_${storage}=1"
+                -Vn "${symbol}" -Fh "${header}" -Fo "${CMAKE_CURRENT_BINARY_DIR}/${symbol}.cso"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/ffx_rcas.hlsl"
+            DEPENDS tests/ffx_rcas.hlsl src/rgb9e5.hlsli BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/${symbol}.cso" VERBATIM)
+        target_sources(offscreen_check PRIVATE "${header}")
+    endforeach()
+endforeach()
 foreach(entry IN ITEMS DualUav SampleMip WriteRecurrent)
     set(header "${CMAKE_CURRENT_BINARY_DIR}/${entry}.h")
     add_custom_command(OUTPUT "${header}" COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E ${entry}
