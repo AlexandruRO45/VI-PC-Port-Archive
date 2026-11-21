@@ -46,6 +46,17 @@ cmake --build --preset dev --target cpu_exe_original_lifted cpu_exe_inverted_lif
 ctest --preset dev --no-tests=error -R '^cpu_aot_exe_entry$' -V
 ```
 
+### Running the same EXE under pe_map
+
+`cpu_native_exe_chain` gives the original EXE and its AOT build the same selector byte as above. A third child maps that exact original EXE, binds its ordinary imports to the two source-built Windows DLLs and calls `pe_map_run`. The child passes the guest's returned DWORD back as its process exit code. All three paths produce the same 16 argument bytes, eight output bytes and exit codes in the table.
+
+The first host dependency appears during IAT binding, before any guest instruction runs. On the tested MSVC build, an empty binding table stops at `cpu_exe_io.dll!emit_trace`; supplying just the I/O DLL stops at `cpu_import_provider.dll!mix_args`. The first import invoked at runtime is `read_selector`. With both DLLs bound, the entry and its internal caller execute unchanged. This measures the source-built Windows fixture and its providers.
+
+```powershell
+cmake --build --preset dev --target pe_map cpu_exe_original_lifted
+ctest --preset dev --no-tests=error -R '^cpu_native_exe_chain$' -V
+```
+
 ## Offline CPU leaf recompilation
 
 With the Python-enabled Windows dev preset configured, run:
