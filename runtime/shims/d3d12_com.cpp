@@ -99,6 +99,28 @@ public:
         check(list_.set_descriptor_heaps(ids));
     }
 
+    void STDMETHODCALLTYPE SetPipelineState(ID3D12PipelineState* pipeline_state) override {
+        if (pipeline_state) check(list_.set_pipeline_state(reinterpret_cast<std::uintptr_t>(pipeline_state)));
+    }
+
+    void STDMETHODCALLTYPE SetGraphicsRootSignature(ID3D12RootSignature* root_signature) override {
+        if (root_signature) check(list_.set_graphics_root_signature(reinterpret_cast<std::uintptr_t>(root_signature)));
+    }
+
+    void STDMETHODCALLTYPE SetComputeRootSignature(ID3D12RootSignature* root_signature) override {
+        if (root_signature) check(list_.set_compute_root_signature(reinterpret_cast<std::uintptr_t>(root_signature)));
+    }
+
+    void STDMETHODCALLTYPE DrawInstanced(UINT vertex_count_per_instance, UINT instance_count, UINT start_vertex,
+                                         UINT start_instance) override {
+        check(list_.draw_instanced(vertex_count_per_instance, instance_count, start_vertex, start_instance));
+    }
+
+    void STDMETHODCALLTYPE DrawIndexedInstanced(UINT index_count_per_instance, UINT instance_count, UINT start_index,
+                                                INT base_vertex, UINT start_instance) override {
+        check(list_.draw_indexed_instanced(index_count_per_instance, instance_count, start_index, base_vertex,
+                                           start_instance));
+    }
     void STDMETHODCALLTYPE SetGraphicsRootDescriptorTable(UINT root_parameter,
                                                           D3D12_GPU_DESCRIPTOR_HANDLE base) override {
         check(list_.set_graphics_root_descriptor_table(root_parameter, base.ptr));

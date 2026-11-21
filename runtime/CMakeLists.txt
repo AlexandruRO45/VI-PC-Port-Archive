@@ -157,6 +157,21 @@ if(WIN32)
   target_compile_definitions(command_bindings_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(command_bindings_test PRIVATE /W4 /permissive- /utf-8)
 
+  add_executable(bindless_registry_test test/bindless_registry_test.cpp)
+  target_include_directories(bindless_registry_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_definitions(bindless_registry_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(bindless_registry_test PRIVATE /W4 /permissive- /utf-8)
+
+  add_executable(retirement_test test/retirement_test.cpp)
+  target_include_directories(retirement_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_definitions(retirement_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(retirement_test PRIVATE /W4 /permissive- /utf-8)
+
+  add_executable(command_draw_test test/command_draw_test.cpp)
+  target_include_directories(command_draw_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_definitions(command_draw_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(command_draw_test PRIVATE /W4 /permissive- /utf-8)
+
   # Offline GDK runtime shim (XGameRuntime, XSystem, XTaskQueue, XAsync), driven through the shim registry the way
   # a title calls it at boot. Like xmem_test it compiles its own registry.cpp.
   add_executable(xgameruntime_test
@@ -280,6 +295,9 @@ if(BUILD_TESTING)
     add_test(NAME descriptor_handles COMMAND descriptor_handles_test)
     add_test(NAME bindless_allocator COMMAND bindless_allocator_test)
     add_test(NAME command_bindings COMMAND command_bindings_test)
+    add_test(NAME bindless_registry COMMAND bindless_registry_test)
+    add_test(NAME retirement COMMAND retirement_test)
+    add_test(NAME command_draw COMMAND command_draw_test)
   endif()
   if(WIN32 AND TARGET xgameruntime_test)
     add_test(NAME xgameruntime COMMAND xgameruntime_test)
@@ -390,6 +408,13 @@ if(Vulkan_FOUND)
   endif()
   # D3D12 view -> GFX10 descriptor encoders (P2 of docs/d3d12_vulkan_analysis.md). Needs the Vulkan headers for
   # VkFormat, no GPU and no game data.
+  add_executable(descriptor_scan_test test/descriptor_scan_test.cpp)
+  target_include_directories(descriptor_scan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(descriptor_scan_test PRIVATE Vulkan::Headers)
+  target_compile_definitions(descriptor_scan_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(descriptor_scan_test PRIVATE /W4 /permissive- /utf-8)
+  add_test(NAME descriptor_scan COMMAND descriptor_scan_test)
+
   add_executable(descriptor_views_test test/descriptor_views_test.cpp)
   target_include_directories(descriptor_views_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(descriptor_views_test PRIVATE Vulkan::Headers)

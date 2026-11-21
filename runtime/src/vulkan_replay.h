@@ -921,6 +921,16 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         } else if (const auto* table = std::get_if<SetComputeRootDescriptorTable>(&command)) {
             if (table->root_parameter >= max_root_parameters || !table->base_descriptor)
                 return ReplayResult::invalid_binding;
+        } else if (const auto* pso = std::get_if<SetPipelineState>(&command)) {
+            if (!pso->pipeline_state) return ReplayResult::invalid_binding;
+        } else if (const auto* signature = std::get_if<SetGraphicsRootSignature>(&command)) {
+            if (!signature->root_signature) return ReplayResult::invalid_binding;
+        } else if (const auto* signature = std::get_if<SetComputeRootSignature>(&command)) {
+            if (!signature->root_signature) return ReplayResult::invalid_binding;
+        } else if (const auto* draw = std::get_if<DrawInstanced>(&command)) {
+            if (!draw->vertex_count_per_instance || !draw->instance_count) return ReplayResult::invalid_binding;
+        } else if (const auto* draw = std::get_if<DrawIndexedInstanced>(&command)) {
+            if (!draw->index_count_per_instance || !draw->instance_count) return ReplayResult::invalid_binding;
         }
     }
     return ReplayResult::success;
