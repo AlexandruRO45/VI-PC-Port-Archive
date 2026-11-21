@@ -1,0 +1,11 @@
+EXPORTS
+    rep_movsb
+    rep_movsw
+    rep_movsd
+    rep_movsq
+    rep_stosb
+    rep_stosw
+    rep_stosd
+    rep_stosq
+    movsq_once
+    stosd_once

@@ -15,6 +15,9 @@ UPSCALER = "faff02f294a7e9149ce079dffe3dedbcabe99b1f180ab14222aa8689e00a75fa"
 REGS = {getattr(R, n.upper()): n for n in "rax rbx rcx rdx rsi rdi rbp rsp r8 r9 r10 r11 r12 r13 r14 r15".split()}
 HIGH_BYTE = {R.AH, R.BH, R.CH, R.DH}
 UINT = {1: "uint8_t", 2: "uint16_t", 4: "uint32_t", 8: "uint64_t"}
+# Element size of each string move and store. Backward strings (STD) are not lowered.
+STRING_SIZES = {M.MOVSB: 1, M.MOVSW: 2, M.MOVSD: 4, M.MOVSQ: 8, M.STOSB: 1, M.STOSW: 2, M.STOSD: 4, M.STOSQ: 8}
+STRING_MOVES = {M.MOVSB, M.MOVSW, M.MOVSD, M.MOVSQ}
 
 INTEGER_HEADER = """#include <array>
 #include <cstdint>
@@ -230,6 +233,23 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             stmt = f"{xmm[i.op0_register]} = _mm_add_epi32({xmm[i.op1_register]}, {xmm[i.op2_register]});"
         elif op == M.VMOVD and i.op1_register in xmm:
             stmt = write(f"_mm_cvtsi128_si32({xmm[i.op1_register]})")
+        elif op in STRING_SIZES and i.op0_kind in (K.MEMORY_ESRDI, K.MEMORY_ESEDI):
+            # One element per step, forward, as the hardware does: overlapping copies repeat
+            # earlier elements rather than behaving like memmove. Flags are unchanged.
+            if i.op0_kind != K.MEMORY_ESRDI or (op in STRING_MOVES and i.op1_kind != K.MEMORY_SEG_RSI):
+                raise ValueError(f"unsupported 32-bit string addressing at {i.ip:#x}: {i}")
+            if i.has_repne_prefix:
+                raise ValueError(f"unsupported REPNE string move at {i.ip:#x}: {i}")
+            size = STRING_SIZES[op]
+            width = UINT[size]
+            if op in STRING_MOVES:
+                step = f"store<{width}>(rdi, load<{width}>(rsi)); rsi += {size}; rdi += {size};"
+            else:
+                step = f"store<{width}>(rdi, static_cast<{width}>(rax)); rdi += {size};"
+            stmt = f"while (rcx != 0) {{ {step} --rcx; }}" if i.has_rep_prefix else f"{{ {step} }}"
+        elif op == M.CLD:
+            # The Windows x64 ABI enters with DF clear, and only forward strings are lowered.
+            stmt = ";"
         elif op == M.NOP or (op == M.XCHG and i.op0_register == i.op1_register == R.AX):
             stmt = ";"
         elif op == M.SETE:
