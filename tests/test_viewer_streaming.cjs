@@ -197,3 +197,45 @@ test('generated test terrain loads without network requests', () => {
     assert(f.state.live.get('chunk_0').obj);
     assert.equal(f.state.live.get('chunk_0').loading, false);
 });
+
+test('the demonstration camera orbits while looking at the same point', async () => {
+    const { tourPose } = await import('../viewer/tour.mjs');
+    const first = tourPose(0);
+    assert.deepEqual(tourPose(48), first);
+    for (let second = 0; second < 48; second++) {
+        const { x, y, z, yaw, pitch } = tourPose(second);
+        const distance = Math.hypot(x, z);
+        assert(Math.abs(distance - 620) < 1e-10);
+        assert(Math.abs(y + Math.tan(pitch) * distance - 25) < 1e-10);
+        assert(Math.abs(x - Math.sin(yaw) * distance) < 1e-10);
+        assert(Math.abs(z - Math.cos(yaw) * distance) < 1e-10);
+    }
+    assert.notEqual(tourPose(12).z, first.z);
+});
+
+test('the tour button and Escape return control to manual flight', () => {
+    const listeners = new Map();
+    const tour = { setAttribute(name, value) { this[name] = value; } };
+    const start = { classList: { toggle(name, hidden) { this[name] = hidden; } } };
+    const context = vm.createContext({
+        addEventListener: (name, fn) => listeners.set(name, fn),
+        document: {
+            getElementById: id => ({ start, tour })[id],
+            addEventListener() {},
+        },
+        renderer: { domElement: { addEventListener() {} } },
+    });
+    const freecam = html.indexOf('// ---------- freecam ----------');
+    assert(freecam >= 0 && freecam < begin, 'viewer camera controls must exist');
+    vm.runInContext(html.slice(freecam, begin), context);
+
+    tour.onclick();
+    assert.equal(tour['aria-pressed'], 'true');
+    assert.equal(start.classList.hidden, true);
+    listeners.get('keydown')({ code: 'Escape' });
+    assert.equal(tour['aria-pressed'], 'false');
+    assert.equal(start.classList.hidden, false);
+    tour.onclick();
+    tour.onclick();
+    assert.equal(tour['aria-pressed'], 'false');
+});
