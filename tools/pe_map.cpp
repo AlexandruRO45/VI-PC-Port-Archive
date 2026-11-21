@@ -230,24 +230,31 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
     };
 
     std::memcpy(base, raw.data(), opt.SizeOfHeaders);
-    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+    const WORD section_count = nt->FileHeader.NumberOfSections;
+    for (WORD i = 0; i < section_count; ++i) {
         const auto& s = sections[i];
         const DWORD span = s.Misc.VirtualSize ? s.Misc.VirtualSize : s.SizeOfRawData;
-        // Like the Windows loader, a section without a file offset stays zero-filled even when
-        // SizeOfRawData is set; it does not take the headers at file offset 0.
-        const DWORD copy = !s.PointerToRawData ? 0 : s.SizeOfRawData < span ? s.SizeOfRawData : span;
-        if (s.VirtualAddress < opt.SizeOfHeaders || !inside(s.VirtualAddress, span, opt.SizeOfImage)
-            || !inside(s.PointerToRawData, copy, raw.size()))
-            return release(fail(MAP_FORMAT, "section %.8s outside image", reinterpret_cast<const char*>(s.Name)));
-        if (copy) {
-            // Like the Windows loader, read whole 0x200-byte file sectors: round the start of the raw
-            // data down and its end up. Sector bytes past the end of the file stay zero.
-            const std::uint64_t first = s.PointerToRawData & ~std::uint64_t{0x1ff};
-            std::uint64_t end = (std::uint64_t{s.PointerToRawData} + s.SizeOfRawData + 0x1ff) & ~std::uint64_t{0x1ff};
-            if (end > raw.size()) end = raw.size();
-            const std::uint64_t length = end - first < span ? end - first : span;
-            std::memcpy(base + s.VirtualAddress, raw.data() + first, static_cast<std::size_t>(length));
-        }
+        const char* name = reinterpret_cast<const char*>(s.Name);
+        if (s.VirtualAddress < opt.SizeOfHeaders || !inside(s.VirtualAddress, span, opt.SizeOfImage))
+            return release(fail(MAP_FORMAT, "section %.8s outside image", name));
+        // Like the Windows loader, check raw data against the file by two rules only: no raw range
+        // may reach 4 GiB, and the last section's raw data must end inside the file. Raw data of an
+        // earlier section may lie past the end of the file; the missing bytes stay zero.
+        const std::uint64_t raw_end = std::uint64_t{s.PointerToRawData} + s.SizeOfRawData;
+        if (s.SizeOfRawData && raw_end > 0xffffffffull)
+            return release(fail(MAP_FORMAT, "section %.8s raw data reaches 4 GiB", name));
+        if (s.SizeOfRawData && i + 1 == section_count && raw_end > raw.size())
+            return release(fail(MAP_FORMAT, "last section %.8s raw data runs past the file", name));
+        // A section without a file offset stays zero-filled even when SizeOfRawData is set; it does
+        // not take the headers at file offset 0.
+        if (!s.PointerToRawData || !s.SizeOfRawData) continue;
+        // Read whole 0x200-byte file sectors: round the start of the raw data down and its end up.
+        const std::uint64_t first = s.PointerToRawData & ~std::uint64_t{0x1ff};
+        std::uint64_t end = (raw_end + 0x1ff) & ~std::uint64_t{0x1ff};
+        if (end > raw.size()) end = raw.size();
+        if (first >= end) continue;
+        const std::uint64_t length = end - first < span ? end - first : span;
+        std::memcpy(base + s.VirtualAddress, raw.data() + first, static_cast<std::size_t>(length));
     }
 
     // TLS data needs a slot in each thread's ThreadLocalStoragePointer array, which ntdll owns.
