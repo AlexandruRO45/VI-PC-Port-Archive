@@ -337,6 +337,15 @@ def absolute_value():
     return program
 
 
+def legacy_multiply_add():
+    return with_constants([
+        "v_mad_legacy_f32 v12, s44, s45, s46",
+        "v_mad_legacy_f32 v13, s45, s44, -s47",
+        "v_mad_legacy_f32 v14, |s46|, s47, s44",
+        "v_mad_legacy_f32 v15, s44, s47, s46 clamp",
+    ])
+
+
 def ceiling():
     return with_constants([
         "v_ceil_f32_e32 v12, s44",
@@ -1329,6 +1338,46 @@ def check_ceiling_draws(directory, compiler, renderer, backend):
         raise AssertionError("Replacing ceiling with floor escaped detection")
 
 
+def check_legacy_multiply_add_draws(directory, compiler, renderer, backend):
+    instructions = legacy_multiply_add()
+    source = directory / "mad_legacy.hlsl"
+    shader = directory / "mad_legacy.cso"
+    case = directory / "mad_legacy.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+    source.write_text(translate(instructions), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+
+    def legacy(x, y, z):
+        return (0.0 if x == 0 or y == 0 else x * y) + z
+
+    inf, nan = math.inf, math.nan
+    # A zero factor must hide an infinite or NaN partner. Every product and sum is exact in
+    # binary32, so fusion and rounding cannot change a result.
+    sets = ((0.0, inf, 1.5, -2.0), (2.0, 3.0, 0.5, 0.25), (0.0, nan, -0.75, 4.0), (-1.5, 0.0, 2.0, 0.5))
+    for a, b, c, d in sets:
+        constants = bytearray(256)
+        struct.pack_into("<4f", constants, 12, a, b, c, d)
+        expected = (legacy(a, b, c), legacy(b, a, -d), legacy(abs(c), d, a),
+                    min(1.0, max(0.0, legacy(a, d, c))))
+        assert not any(math.isnan(v) for v in expected), expected
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+
+    # An ordinary multiply-add gives NaN for 0 * inf on the first set.
+    wrong = [line.replace("v_mad_legacy_f32", "v_fma_f32") for line in instructions]
+    source.write_text(translate(wrong), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    a, b, c, d = sets[0]
+    constants = bytearray(256)
+    struct.pack_into("<4f", constants, 12, a, b, c, d)
+    expected = (legacy(a, b, c), legacy(b, a, -d), legacy(abs(c), d, a), min(1.0, max(0.0, legacy(a, d, c))))
+    case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+    result = subprocess.run(draw, capture_output=True, text=True)
+    if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
+        raise AssertionError("Replacing the legacy multiply-add with a fused multiply-add escaped detection")
+
+
 def check_render(directory, compiler, renderer, backend):
     check_movk_draw(directory, compiler, renderer, backend)
     check_half_draw(directory, compiler, renderer, backend)
@@ -1418,6 +1467,7 @@ def check_render(directory, compiler, renderer, backend):
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("The renderer failed to detect the missing absolute value")
     check_ceiling_draws(directory, compiler, renderer, backend)
+    check_legacy_multiply_add_draws(directory, compiler, renderer, backend)
     source.write_text(translate(select()), encoding="ascii")
     subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
     for constants in ((.5, .75, .375, .25), (.125, .5, 1.0, 0.0)):
