@@ -373,8 +373,11 @@ def sdwa_dest(result, sel, unused, old):
     if unused == "UNUSED_SEXT":
         raise ValueError("UNUSED_SEXT is not lowered")
     field = f"(({result} & {(1 << width) - 1:#x}u) << {offset}u)"
-    if unused == "UNUSED_PAD" or old is None:
+    if unused == "UNUSED_PAD":
         return field
+    # The kept bits must come from a tracked numeric value; hardware would keep whatever an untracked register holds.
+    if not (isinstance(old, str) and old.startswith(("sample", "alu", "params["))):
+        raise ValueError("UNUSED_PRESERVE needs a tracked numeric destination")
     keep = ~(((1 << width) - 1) << offset) & 0xffffffff
     return f"((asuint({old}) & {keep:#x}u) | {field})"
 
@@ -602,17 +605,14 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             values = [fp_operand(t, scalar, vector, pending, sample_pending) for t in tokens]
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {ALU['fma'][1].format(*values)};")
-        elif m := match(r"v_mov_b32_sdwa (v\d+), (sext\()?([vs]\d+|-?\d+|\d+\.\d+)(\))? dst_sel:(BYTE_[0-3]|WORD_[01]|DWORD) dst_unused:(UNUSED_PAD|UNUSED_SEXT|UNUSED_PRESERVE) src0_sel:(BYTE_[0-3]|WORD_[01]|DWORD)"):
+        elif m := match(r"v_mov_b32_sdwa (v\d+), (sext\()?([vs]\d+|-?\d+(?:\.\d+)?)(\))? dst_sel:(BYTE_[0-3]|WORD_[01]|DWORD) dst_unused:(UNUSED_PAD|UNUSED_SEXT|UNUSED_PRESERVE) src0_sel:(BYTE_[0-3]|WORD_[01]|DWORD)"):
             dst, sext, src, close, dst_sel, unused, src_sel = m.groups()
             if mask != "entry" or bool(sext) != bool(close):
                 raise ValueError("Invalid register move")
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
-            old = vector.get(dst)
-            if old is not None and not isinstance(old, str):
-                raise ValueError("Unsupported move destination")
             word = f"asuint({fp_operand(src, scalar, vector, pending, sample_pending)})"
-            result = sdwa_dest(sdwa_source(word, src_sel, bool(sext)), dst_sel, unused, old)
+            result = sdwa_dest(sdwa_source(word, src_sel, bool(sext)), dst_sel, unused, vector.get(dst))
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({result});")
         elif m := match(r"v_cvt_f32_f16_sdwa (v\d+), (-?)(?:\|([vs]\d+)\||([vs]\d+))( clamp)? dst_sel:DWORD dst_unused:UNUSED_(?:PAD|PRESERVE) src0_sel:(WORD_[01])"):
