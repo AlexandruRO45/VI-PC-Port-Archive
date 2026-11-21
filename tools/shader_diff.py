@@ -311,12 +311,23 @@ def self_test():
     return True
 
 
+def positive_int(value):
+    """argparse type for run counts; zero and negatives would skip work or crash."""
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}") from None
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return number
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Differential oracle: cpu_ref vs translated SPIR-V.")
-    ap.add_argument("--programs", type=int, default=200)
+    ap.add_argument("--programs", type=positive_int, default=200)
     ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--max-ops", type=int, default=8)
-    ap.add_argument("--limit", type=int, default=None, help="run only the first N programs")
+    ap.add_argument("--max-ops", type=positive_int, default=8)
+    ap.add_argument("--limit", type=positive_int, default=None, help="run only the first N programs")
     ap.add_argument("--list-ops", action="store_true", help="print the op table and exit")
     ap.add_argument("--self-test", action="store_true", help="run harness canaries and exit")
     a = ap.parse_args(argv)
