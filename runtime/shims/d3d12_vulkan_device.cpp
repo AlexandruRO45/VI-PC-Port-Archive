@@ -377,6 +377,22 @@ public:
     UINT STDMETHODCALLTYPE GetNodeCount() override { return 1; }
     HRESULT STDMETHODCALLTYPE GetDeviceRemovedReason() override { return S_OK; }
 
+    // Residency and power controls. Vulkan owns actual residency; these are the documented no-op answers.
+    // EnqueueMakeResident has no queue work in this backend, so it does not signal the caller's fence.
+    HRESULT STDMETHODCALLTYPE MakeResident(UINT, ID3D12Pageable* const*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE Evict(UINT, ID3D12Pageable* const*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE SetResidencyPriority(UINT, ID3D12Pageable* const*,
+                                                   const D3D12_RESIDENCY_PRIORITY*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE EnqueueMakeResident(D3D12_RESIDENCY_FLAGS, UINT, ID3D12Pageable* const*,
+                                                  ID3D12Fence*, UINT64) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE SetStablePowerState(BOOL) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE SetBackgroundProcessingMode(D3D12_BACKGROUND_PROCESSING_MODE,
+                                                          D3D12_MEASUREMENTS_ACTION, HANDLE,
+                                                          BOOL* further) override {
+        if (further) *further = FALSE;
+        return S_OK;
+    }
+
     HRESULT STDMETHODCALLTYPE CreateCommandQueue(const D3D12_COMMAND_QUEUE_DESC* desc, REFIID riid,
                                                  void** out) override {
         if (!desc) return E_INVALIDARG;

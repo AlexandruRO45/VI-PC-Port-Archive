@@ -224,6 +224,22 @@ int main() {
                    E_NOINTERFACE);
         }
         EXPECT(device->GetNodeCount() == 1);
+        {
+            Ref<ID3D12Device3> device3;
+            Ref<ID3D12Device6> device6;
+            EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device3.p))));
+            EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device6.p))));
+            EXPECT(SUCCEEDED(device->MakeResident(0, nullptr)));
+            EXPECT(SUCCEEDED(device->Evict(0, nullptr)));
+            EXPECT(SUCCEEDED(device3->SetResidencyPriority(0, nullptr, nullptr)));
+            EXPECT(SUCCEEDED(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 0, nullptr, nullptr, 0)));
+            EXPECT(SUCCEEDED(device->SetStablePowerState(FALSE)));
+            BOOL further = TRUE;
+            EXPECT(SUCCEEDED(device6->SetBackgroundProcessingMode(D3D12_BACKGROUND_PROCESSING_MODE_ALLOWED,
+                                                                  D3D12_MEASUREMENTS_ACTION_KEEP_ALL, nullptr,
+                                                                  &further)));
+            EXPECT(!further);
+        }
         const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_2};
         D3D12_FEATURE_DATA_FEATURE_LEVELS feature_levels{3, levels, D3D_FEATURE_LEVEL(0)};
         EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &feature_levels,
