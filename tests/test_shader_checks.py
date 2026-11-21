@@ -25,7 +25,7 @@ TOTAL = (len(check.COMPUTE) + 1 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
 
 
 class Wave64Checks(unittest.TestCase):
-    def run_checks(self, wavemask, ballot, *, missing_ballot=False, emulated=False):
+    def run_checks(self, wavemask, ballot, *, missing_ballot=False, emulated=False, bounds_words=None):
         def harness(_tool, shader, *args):
             name = Path(shader).stem
             if name in PARTIAL:
@@ -61,6 +61,9 @@ class Wave64Checks(unittest.TestCase):
                 return 0, "out[0..7] = " + " ".join(map(str, check.CS_SMEM)) + "\n"
             if name == "cs_workgroup_yz":     # #186: vk_compute_test's 2x3x4 Y/Z histogram line
                 return 0, "2x3x4 workgroup Y/Z: 0 mismatches\n"
+            if name == "cs_bounds":
+                words = bounds_words or [0x12345678, 0x12345678, 0, 0xEEEEEEEE, 0xEEEEEEEE, 0, 0, 0]
+                return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
             if name in ("cs_imgstore", "cs_imgload"):
                 return 0, "0 bad\n0 bad\n0 bad\n"
             return 0, "0 mismatches\n"
@@ -127,6 +130,31 @@ class Wave64Checks(unittest.TestCase):
         self.assertEqual(status, 1, out)
         self.assertIn("missing cs_wave64_ballot.spv", out)
 
+
+    def test_bounds_checks_oob_store_and_load(self):
+        unsupported = 77, "full 64-wide compute subgroups unavailable\n"
+        status, out = self.run_checks(unsupported, unsupported)
+        self.assertEqual(status, 0, out)
+        self.assertRegex(out, r"cs_bounds +ok")
+
+        # A broken implementation lets the OOB store at byte 16 corrupt out[4].
+        bad = [0x12345678, 0x12345678, 0, 0xEEEEEEEE, 0xDEADBEEF, 0, 0, 0]
+        status, out = self.run_checks(unsupported, unsupported, bounds_words=bad)
+        self.assertEqual(status, 1, out)
+        self.assertRegex(out, r"cs_bounds +exit 0")
+
+    def test_mesh_test_reports_skip_when_mesh_feature_is_unsupported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            spirv = Path(tmp)
+            (spirv / "ms_w64x_ballot.spv").touch()
+            (spirv / "fs_passthru.spv").touch()
+            unsupported = type("Result", (), {
+                "returncode": 77, "stdout": "", "stderr": "unsupported: meshShader feature unavailable\n"
+            })()
+            with patch("check.subprocess.run", return_value=unsupported):
+                result = check.mesh_w64x_test("unused", tmp, "ms_w64x_ballot")
+        self.assertIsInstance(result, check.Skip)
+        self.assertIn("SKIP", result)
 
 if __name__ == "__main__":
     unittest.main()
