@@ -86,7 +86,7 @@ bool query_capability(ID3D12Device* device, Word forced) {
     std::printf("native_lane_range=%u..%u shader_model_capped_at_6_6=0x%x forced_width=%u\n",
                 caps.WaveLaneCountMin, caps.WaveLaneCountMax, model.HighestShaderModel, forced);
     if (!caps.WaveOps) return false;
-    if (!forced) return model.HighestShaderModel >= D3D_SHADER_MODEL_6_0;
+    if (!forced) return model.HighestShaderModel >= D3D_SHADER_MODEL_6_5;
     return model.HighestShaderModel >= D3D_SHADER_MODEL_6_6 &&
            caps.WaveLaneCountMin <= forced && caps.WaveLaneCountMax >= forced;
 }

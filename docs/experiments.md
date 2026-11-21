@@ -504,8 +504,10 @@ self-inverse, so **only widths 16, 32 or 64 can identify this inversion**.
 The GPU test must fail on a mismatch, rather than silently changing its
 expected values. Synthetic-only; no title shaders or binaries are used.
 
-The default fixture targets shader model 6.0; explicit sizes require shader
-model 6.6 and a reported wave-lane range containing the requested width.
+The default fixture targets shader model 6.5 because the Windows 10 in-box
+WARP may remove the device when a dynamic lane index is compiled under 6.0
+(see #145); explicit sizes require shader model 6.6 and a reported wave-lane
+range containing the requested width.
 Unsupported forced sizes return capability **SKIP (77)**. The checks below
 are newly added; no device result is claimed until independently run:
 

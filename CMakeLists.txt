@@ -75,7 +75,9 @@ target_sources(offscreen_check PRIVATE tests/bvh_reads_waves.cpp tests/bvh_hits.
 foreach(size IN ITEMS Default 16 32 64)
     set(header "${CMAKE_CURRENT_BINARY_DIR}/Shuffle${size}.h")
     set(defines)
-    set(model cs_6_0)
+    # The in-box Windows 10 WARP can lose the device for a nonliteral lane
+    # index when the shader is compiled below SM 6.5 (see issue #145).
+    set(model cs_6_5)
     if(NOT size STREQUAL "Default")
         set(defines -D "FORCE_WAVE_SIZE=${size}")
         set(model cs_6_6)
