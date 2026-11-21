@@ -435,6 +435,38 @@ if(Vulkan_FOUND)
   target_compile_definitions(first_texture_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(first_texture_test PRIVATE /W4 /permissive- /utf-8)
   add_test(NAME first_texture COMMAND first_texture_test)
+  # PE loader hello triangle: harness EXE -> import shim (d3d12.dll!LeonidaRenderTriangle) -> Vulkan -> BMP.
+  find_program(LEONIDA_LIB_EXE NAMES lib)
+  if(LEONIDA_LIB_EXE)
+    set(LEONIDA_HARNESS_DEF ${CMAKE_CURRENT_BINARY_DIR}/d3d12.def)
+    file(WRITE ${LEONIDA_HARNESS_DEF} "LIBRARY d3d12.dll\nEXPORTS\n  LeonidaRenderTriangle\n")
+    add_custom_command(
+      OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/d3d12.lib
+      COMMAND ${LEONIDA_LIB_EXE} /def:${LEONIDA_HARNESS_DEF} /machine:x64 /out:${CMAKE_CURRENT_BINARY_DIR}/d3d12.lib
+      DEPENDS ${LEONIDA_HARNESS_DEF}
+      VERBATIM)
+    add_custom_target(leonida_d3d12_import_lib DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/d3d12.lib)
+
+    add_executable(leonida_test_harness test/harness_exe.cpp)
+    target_link_options(leonida_test_harness PRIVATE /ENTRY:HarnessEntry /NODEFAULTLIB /SUBSYSTEM:CONSOLE /GS-)
+    target_link_libraries(leonida_test_harness PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/d3d12.lib)
+    add_dependencies(leonida_test_harness leonida_d3d12_import_lib)
+    set_target_properties(leonida_test_harness PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+
+    add_executable(pe_hello_test
+      test/pe_hello_test.cpp
+      test/pe_hello_shims.cpp
+      src/pe_loader.cpp
+      shims/registry.cpp)
+    target_include_directories(pe_hello_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                                                     ${CMAKE_CURRENT_SOURCE_DIR}/shims
+                                                     ${CMAKE_CURRENT_SOURCE_DIR}/test)
+    target_link_libraries(pe_hello_test PRIVATE gta6rt_d3d12_com Vulkan::Headers ${CMAKE_DL_LIBS})
+    target_compile_definitions(pe_hello_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(pe_hello_test PRIVATE /W4 /permissive- /utf-8)
+    add_dependencies(pe_hello_test leonida_test_harness)
+    add_test(NAME pe_hello COMMAND pe_hello_test "${CMAKE_CURRENT_BINARY_DIR}/leonida_test_harness.exe")
+  endif()
   # D3D12 view -> GFX10 descriptor encoders (P2 of docs/d3d12_vulkan_analysis.md). Needs the Vulkan headers for
   # VkFormat, no GPU and no game data.
   add_executable(descriptor_scan_test test/descriptor_scan_test.cpp)
