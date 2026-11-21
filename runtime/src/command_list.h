@@ -288,6 +288,20 @@ struct Dispatch {
     std::uint32_t z;
 };
 
+// ExecuteIndirect with a dispatch-only signature and a CPU-specified command count.
+struct DispatchIndirect {
+    std::uintptr_t pipeline;
+    std::array<std::uint32_t, 32> user_data;
+    ResourceId arguments;
+    std::uint64_t offset;
+    std::uint32_t count;
+    std::uint32_t stride;
+};
+
+constexpr bool valid_dispatch_stride(std::uint32_t stride) {
+    return stride >= 3 * sizeof(std::uint32_t) && stride % sizeof(std::uint32_t) == 0;
+}
+
 // D3D12_VIEWPORT.
 struct Viewport {
     float x;
@@ -355,7 +369,7 @@ struct ClearDepthStencil {
 
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
-                             CopyResource, ResolveSubresource, Dispatch, Draw>;
+                             CopyResource, ResolveSubresource, Dispatch, DispatchIndirect, Draw>;
 
 class CommandList {
 public:
@@ -427,6 +441,14 @@ public:
     bool dispatch(const Dispatch& dispatch) {
         if (!dispatch.pipeline) return false;
         if (!dispatch.x || !dispatch.y || !dispatch.z) return !closed_;
+        return append(dispatch);
+    }
+
+    bool dispatch_indirect(const DispatchIndirect& dispatch) {
+        if (!dispatch.pipeline || !dispatch.arguments || dispatch.offset % sizeof(std::uint32_t) ||
+            !valid_dispatch_stride(dispatch.stride))
+            return false;
+        if (!dispatch.count) return !closed_;
         return append(dispatch);
     }
 

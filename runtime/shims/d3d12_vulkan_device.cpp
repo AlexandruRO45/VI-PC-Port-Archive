@@ -580,6 +580,19 @@ private:
     RootArgumentLayout layout_;
 };
 
+class CommandSignature final
+    : public Child<CommandSignature, ID3D12CommandSignatureStubs, ID3D12Object, ID3D12DeviceChild,
+                   ID3D12Pageable, ID3D12CommandSignature> {
+public:
+    // {7f3da5c8-d34b-4525-9a63-af2691cbe340}
+    static constexpr GUID kTag{0x7f3da5c8, 0xd34b, 0x4525, {0x9a, 0x63, 0xaf, 0x26, 0x91, 0xcb, 0xe3, 0x40}};
+    explicit CommandSignature(UINT stride) : stride_(stride) {}
+    UINT stride() const { return stride_; }
+
+private:
+    UINT stride_;
+};
+
 // A pipeline state. Compute only for now: the shader is found by the SHA-256 of its FSSM program in the
 // translator's index, and the FSSM blob is copied into the arena as the shader's code base.
 class PipelineState final
@@ -1140,6 +1153,19 @@ public:
         return hand_out(signature, riid, out);
     }
 
+    HRESULT STDMETHODCALLTYPE CreateCommandSignature(const D3D12_COMMAND_SIGNATURE_DESC* desc,
+                                                      ID3D12RootSignature* root, REFIID riid, void** out) override {
+        if (out) *out = nullptr;
+        if (!desc || !desc->NumArgumentDescs || !desc->pArgumentDescs) return E_INVALIDARG;
+        if (desc->NumArgumentDescs != 1 || desc->pArgumentDescs[0].Type != D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH)
+            return E_NOTIMPL;
+        if (root || desc->NodeMask > 1 || !leonida::valid_dispatch_stride(desc->ByteStride)) return E_INVALIDARG;
+        if (!out) return S_FALSE;
+        auto* signature = new CommandSignature(desc->ByteStride);
+        signature->attach_device(identity());
+        return hand_out(signature, riid, out);
+    }
+
     // PC slot 11; the Xbox ABI reaches it through device slot 62 (the proxy forwards).
     HRESULT STDMETHODCALLTYPE CreateComputePipelineState(const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID riid,
                                                          void** out) override {
@@ -1531,6 +1557,11 @@ std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline) {
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline) {
     const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
     return p && p->graphics() ? p->id() : 0;
+}
+
+UINT dispatch_signature_stride(ID3D12CommandSignature* signature) {
+    const CommandSignature* s = CommandSignature::from<CommandSignature>(signature);
+    return s ? s->stride() : 0;
 }
 
 VkImage vulkan_image(ID3D12Resource* resource) {

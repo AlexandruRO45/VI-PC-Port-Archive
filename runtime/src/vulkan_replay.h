@@ -501,6 +501,7 @@ struct ReplayFunctions {
     PFN_vkCmdBindPipeline bind_pipeline = nullptr;              // dispatches
     PFN_vkCmdPushConstants push_constants = nullptr;
     PFN_vkCmdDispatch dispatch = nullptr;
+    PFN_vkCmdDispatchIndirect dispatch_indirect = nullptr;
     std::function<const ComputePipeline*(std::uintptr_t)> compute_pipeline;
     PFN_vkCmdBindVertexBuffers2 bind_vertex_buffers2 = nullptr;  // draws
     PFN_vkCmdBindIndexBuffer bind_index_buffer = nullptr;
@@ -527,6 +528,7 @@ enum class ReplayResult {
     invalid_subresource,
     invalid_clear,
     invalid_copy,
+    invalid_indirect_arguments,
     unsupported
 };
 
@@ -562,6 +564,24 @@ struct Prepared {
     VkIndexType index_type = VK_INDEX_TYPE_UINT16;
     VkExtent2D area{};
 };
+
+inline ReplayResult prepare_compute(std::uintptr_t id, const ReplayFunctions& vk, Prepared& p) {
+    if (!vk.bind_pipeline || !vk.push_constants || !vk.compute_pipeline) return ReplayResult::unsupported;
+    const ComputePipeline* pipeline = vk.compute_pipeline(id);
+    if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
+    p.pipeline = *pipeline;
+    return ReplayResult::success;
+}
+
+inline void bind_compute(VkCommandBuffer cb, const ReplayFunctions& vk, const ComputePipeline& pipeline,
+                         const std::array<std::uint32_t, 32>& user_data) {
+    ShaderUserData data{};
+    std::copy(user_data.begin(), user_data.end(), data.s);
+    data.heap_base = vk.heap_base;
+    data.code_base = pipeline.code_base;
+    vk.bind_pipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
+    vk.push_constants(cb, pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data), &data);
+}
 
 inline bool view_range(const ResourceBinding& resource, const TargetView& view, VkImageAspectFlags aspects,
                        VkImageSubresourceRange& out) {
@@ -1089,11 +1109,17 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (const auto result = detail::prepare_resolve(*resolve_command, p); result != ReplayResult::success)
                 return result;
         } else if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
-            if (!vk.bind_pipeline || !vk.push_constants || !vk.dispatch || !vk.compute_pipeline)
-                return ReplayResult::unsupported;
-            const ComputePipeline* pipeline = vk.compute_pipeline(dispatch->pipeline);
-            if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
-            p.pipeline = *pipeline;
+            if (!vk.dispatch) return ReplayResult::unsupported;
+            if (const auto r = detail::prepare_compute(dispatch->pipeline, vk, p); r != ReplayResult::success) return r;
+        } else if (const auto* indirect = std::get_if<DispatchIndirect>(&command)) {
+            if (!vk.dispatch_indirect) return ReplayResult::unsupported;
+            if (!bind(indirect->arguments)) return ReplayResult::unresolved_resource;
+            const auto bytes = std::uint64_t(indirect->stride) * indirect->count;
+            if (!p.binding.buffer || p.binding.buffer_offset % sizeof(std::uint32_t) ||
+                !detail::within(indirect->offset, bytes, p.binding.size) ||
+                !detail::within(p.binding.buffer_offset, indirect->offset + bytes, UINT64_MAX))
+                return ReplayResult::invalid_indirect_arguments;
+            if (const auto r = detail::prepare_compute(indirect->pipeline, vk, p); r != ReplayResult::success) return r;
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
             if (const auto r = detail::prepare_draw(*draw, resolve, vk, p); r != ReplayResult::success) return r;
         }
@@ -1306,13 +1332,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
             vk.resolve_image(command_buffer, p.source.image, src_layout, p.binding.image, dst_layout, 1, &p.resolve);
         } else if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
-            ShaderUserData data{};
-            std::copy(dispatch->user_data.begin(), dispatch->user_data.end(), data.s);
-            data.heap_base = vk.heap_base;
-            data.code_base = p.pipeline.code_base;
-            vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.pipeline);
-            vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data), &data);
+            detail::bind_compute(command_buffer, vk, p.pipeline, dispatch->user_data);
             vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
+        } else if (const auto* indirect = std::get_if<DispatchIndirect>(&command)) {
+            detail::bind_compute(command_buffer, vk, p.pipeline, indirect->user_data);
+            VkDeviceSize offset = p.binding.buffer_offset + indirect->offset;
+            for (std::uint32_t record = 0; record < indirect->count; ++record, offset += indirect->stride)
+                vk.dispatch_indirect(command_buffer, p.binding.buffer, offset);
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
             auto& prepared_draw = const_cast<detail::Prepared&>(p);
             constexpr VkAccessFlags color_access =

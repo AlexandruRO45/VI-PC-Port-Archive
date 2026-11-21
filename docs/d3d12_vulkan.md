@@ -829,10 +829,11 @@ the first boot, implement the DXGI path and stub PresentX with a clear log.
 
 ### 4.7 Indirect commands and command signatures
 
-- `D3D12_COMMAND_SIGNATURE_DESC` describes the argument stride and a list of argument types. Simple draw,
-  draw-indexed, dispatch and mesh-dispatch signatures map to `vkCmdDraw*Indirect`, `vkCmdDispatchIndirect` and
-  `vkCmdDrawMeshTasksIndirectEXT`; use the `*Count` variants (`VK_KHR_draw_indirect_count`, core 1.2) when the
-  `ExecuteIndirect` call supplies a count buffer.
+- `D3D12_COMMAND_SIGNATURE_DESC` describes the argument stride and a list of argument types. A dispatch-only
+  signature with a CPU-supplied count emits one `vkCmdDispatchIndirect` per record, using the list's recorded
+  compute root arguments and pipeline. Each command reads three group counts from the buffer at execution.
+- Simple draw, draw-indexed and mesh-dispatch signatures can map to `vkCmdDraw*Indirect` and
+  `vkCmdDrawMeshTasksIndirectEXT`, including their count variants. Vulkan has no compute-dispatch count variant.
 - Signatures that change root constants, vertex/index buffers or descriptors per argument cannot be expressed by
   one Vulkan indirect call. Use a compute expansion pass that writes a Vulkan-shaped indirect buffer, or
   `VK_NV_device_generated_commands` on NVIDIA. Start with the simple signatures; the trace will show which

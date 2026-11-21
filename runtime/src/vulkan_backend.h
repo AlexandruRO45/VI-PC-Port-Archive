@@ -54,8 +54,9 @@ struct VulkanDeviceFunctions {
     X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateBuffer) X(vkDestroyBuffer)                  \
     X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory)  \
     X(vkUnmapMemory) X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdCopyImage)  \
-    X(vkCmdResolveImage) X(vkCmdBindPipeline) X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCreateShaderModule)   \
-    X(vkDestroyShaderModule) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) X(vkCreateComputePipelines)  \
+    X(vkCmdResolveImage) X(vkCmdBindPipeline) X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCmdDispatchIndirect) \
+    X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout)    \
+    X(vkCreateComputePipelines)                                                                           \
     X(vkDestroyPipeline) X(vkGetBufferDeviceAddress) X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer)        \
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetPrimitiveTopology) X(vkCmdSetStencilReference)            \
     X(vkCmdSetBlendConstants) X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines)
@@ -77,8 +78,9 @@ struct VulkanDeviceFunctions {
                vkDestroyBuffer && vkGetBufferMemoryRequirements && vkBindBufferMemory && vkAllocateMemory &&
                vkFreeMemory && vkMapMemory && vkUnmapMemory && vkCmdCopyBuffer && vkCmdCopyBufferToImage &&
                vkCmdCopyImageToBuffer && vkCmdCopyImage && vkCmdResolveImage && vkCmdBindPipeline &&
-               vkCmdPushConstants && vkCmdDispatch && vkCreateShaderModule && vkDestroyShaderModule &&
-               vkCreatePipelineLayout && vkDestroyPipelineLayout && vkCreateComputePipelines && vkDestroyPipeline;
+               vkCmdPushConstants && vkCmdDispatch && vkCmdDispatchIndirect && vkCreateShaderModule &&
+               vkDestroyShaderModule && vkCreatePipelineLayout && vkDestroyPipelineLayout && vkCreateComputePipelines &&
+               vkDestroyPipeline;
     }
 };
 
@@ -103,6 +105,7 @@ public:
         replay_.bind_pipeline = vk.vkCmdBindPipeline;
         replay_.push_constants = vk.vkCmdPushConstants;
         replay_.dispatch = vk.vkCmdDispatch;
+        replay_.dispatch_indirect = vk.vkCmdDispatchIndirect;
         replay_.compute_pipeline = [this](std::uintptr_t id) -> const ComputePipeline* {
             const auto it = pipelines_.find(id);
             return it == pipelines_.end() ? nullptr : &it->second;

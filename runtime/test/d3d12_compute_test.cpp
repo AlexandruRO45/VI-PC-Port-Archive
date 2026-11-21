@@ -7,6 +7,7 @@
 //   - root constants, a root UAV and a descriptor table set on the command list, two dispatches that each keep the
 //     arguments they were recorded with, and the results copied to a readback buffer.
 // The shader (test/glsl/cs_user_data.comp) is written to the translator's push-constant and address contract.
+// Indirect records have a nonzero start offset and padding between dispatch dimensions.
 // No game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
@@ -157,9 +158,13 @@ int main() {
                  "\"uses_code_base\": true, \"wave64\": false}}";
     }
 
-    constexpr UINT elements = 64, bytes = elements * 4;
+    constexpr UINT elements = 64, bytes = elements * 4, indirect_elements = 3 * elements;
+    constexpr UINT indirect_bytes = indirect_elements * 4;
     const std::uint32_t table_values[4] = {1000, 2000, 3000, 4000};
-    std::vector<std::uint32_t> first(elements), second(elements);
+    constexpr UINT argument_offset = 16, stride = 20, count = 2;
+    const std::uint32_t argument_words[] = {0, 0, 0, 0, 1, 1, 1, 0, 0, 2, 1, 1, 0, 0};
+    static_assert(sizeof(argument_words) == argument_offset + stride * count);
+    std::vector<std::uint32_t> first(elements), second(indirect_elements);
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
@@ -214,19 +219,24 @@ int main() {
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
         const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
-        Ref<ID3D12Resource> out_a, out_b, constants, readback;
+        Ref<ID3D12Resource> out_a, out_b, constants, arguments, readback;
         const auto uav = buffer_desc(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &uav,
                                                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
                                                          IID_PPV_ARGS(&out_a.p))));
-        EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &uav,
+        const auto indirect_uav = buffer_desc(indirect_bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &indirect_uav,
                                                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
                                                          IID_PPV_ARGS(&out_b.p))));
         const auto constants_desc = buffer_desc(256, D3D12_RESOURCE_FLAG_NONE);
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &constants_desc,
                                                          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                                          IID_PPV_ARGS(&constants.p))));
-        const auto readback_desc = buffer_desc(2 * bytes, D3D12_RESOURCE_FLAG_NONE);
+        const auto arguments_desc = buffer_desc(sizeof(argument_words), D3D12_RESOURCE_FLAG_NONE);
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &arguments_desc,
+                                                         D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                         IID_PPV_ARGS(&arguments.p))));
+        const auto readback_desc = buffer_desc(bytes + indirect_bytes, D3D12_RESOURCE_FLAG_NONE);
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                          IID_PPV_ARGS(&readback.p))));
@@ -237,6 +247,19 @@ int main() {
         void* mapped = nullptr;
         EXPECT(SUCCEEDED(constants->Map(0, nullptr, &mapped)));
         std::memcpy(mapped, table_values, sizeof(table_values));
+        std::memcpy(static_cast<std::uint8_t*>(mapped) + sizeof(table_values), argument_words, sizeof(argument_words));
+
+        const D3D12_INDIRECT_ARGUMENT_DESC argument{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH};
+        D3D12_COMMAND_SIGNATURE_DESC signature_desc{stride, 1, &argument, 0};
+        Ref<ID3D12CommandSignature> signature;
+        signature_desc.ByteStride = 10;
+        EXPECT(device->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature.p)) == E_INVALIDARG);
+        EXPECT(!signature.p);
+        signature_desc.ByteStride = stride;
+        EXPECT(SUCCEEDED(device->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature.p))));
+        Ref<ID3D12Device> signature_device;
+        EXPECT(SUCCEEDED(signature->GetDevice(IID_PPV_ARGS(&signature_device.p))) && signature_device.p == device.p);
+        signature_device.reset();
 
         // A shader-visible heap in the arena; its first slot gets the upload buffer's VA, written as raw bytes.
         const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
@@ -267,8 +290,19 @@ int main() {
         list->SetComputeRootSignature(root.p);
         list->SetComputeRootUnorderedAccessView(0, va_a);
         EXPECT(list->Close() == E_INVALIDARG);
+        EXPECT(SUCCEEDED(list->Reset(allocator.p, pso.p)));
+        list->SetComputeRootSignature(root.p);
+        list->ExecuteIndirect(signature.p, count, arguments.p, argument_offset + 1, nullptr, 0);
+        EXPECT(list->Close() == E_INVALIDARG);
+        EXPECT(SUCCEEDED(list->Reset(allocator.p, pso.p)));
+        list->SetComputeRootSignature(root.p);
+        list->ExecuteIndirect(signature.p, count + 1, arguments.p, argument_offset, nullptr, 0);
+        EXPECT(list->Close() == S_OK);
+        ID3D12CommandList* lists[] = {list.p};
+        queue->ExecuteCommandLists(1, lists);
+        EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::invalid_indirect_arguments);
 
-        // Two dispatches: the second changes s0 and the UAV; each must keep what it was recorded with.
+        // A direct dispatch and two indirect dispatches. Each keeps the root arguments it was recorded with.
         EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
         ID3D12DescriptorHeap* heaps[] = {heap.p};
         list->SetDescriptorHeaps(1, heaps);
@@ -281,15 +315,19 @@ int main() {
         list->Dispatch(1, 1, 1);
         list->SetComputeRoot32BitConstant(0, 100, 0);
         list->SetComputeRootUnorderedAccessView(1, va_b);
-        list->Dispatch(1, 1, 1);
+        list->CopyBufferRegion(arguments.p, 0, constants.p, sizeof(table_values), sizeof(argument_words));
+        const auto to_indirect = transition(arguments.p, D3D12_RESOURCE_STATE_COPY_DEST,
+                                            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+        list->ResourceBarrier(1, &to_indirect);
+        list->ExecuteIndirect(signature.p, count, arguments.p, argument_offset, nullptr, 0);
+        list->SetComputeRoot32BitConstant(0, 999, 0);
         D3D12_RESOURCE_BARRIER barriers[2] = {
             transition(out_a.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
             transition(out_b.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)};
         list->ResourceBarrier(2, barriers);
         list->CopyBufferRegion(readback.p, 0, out_a.p, 0, bytes);
-        list->CopyBufferRegion(readback.p, bytes, out_b.p, 0, bytes);
+        list->CopyBufferRegion(readback.p, bytes, out_b.p, 0, indirect_bytes);
         EXPECT(list->Close() == S_OK);
-        ID3D12CommandList* lists[] = {list.p};
         queue->ExecuteCommandLists(1, lists);
         EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
         EXPECT(SUCCEEDED(queue->Signal(fence.p, 1)));
@@ -298,9 +336,10 @@ int main() {
         void* results = nullptr;
         EXPECT(SUCCEEDED(readback->Map(0, nullptr, &results)));
         std::memcpy(first.data(), results, bytes);
-        std::memcpy(second.data(), static_cast<const std::uint8_t*>(results) + bytes, bytes);
+        std::memcpy(second.data(), static_cast<const std::uint8_t*>(results) + bytes, indirect_bytes);
 
-        for (auto* r : {&out_a, &out_b, &constants, &readback}) r->reset();
+        for (auto* r : {&out_a, &out_b, &constants, &arguments, &readback}) r->reset();
+        signature.reset();
         pso.reset();
         root.reset();
         heap.reset();
@@ -315,16 +354,20 @@ int main() {
     unsigned mismatches = 0;
     for (std::uint32_t i = 0; i < elements; ++i) {
         const std::uint32_t a = 7 + 3 * i + table_values[i % 4] + code_word;
+        if (first[i] != a && mismatches++ < 4)
+            std::fprintf(stderr, "direct element %u: got %u, want %u\n", i, first[i], a);
+    }
+    for (std::uint32_t i = 0; i < indirect_elements; ++i) {
         const std::uint32_t b = 100 + 3 * i + table_values[i % 4] + code_word;
-        if ((first[i] != a || second[i] != b) && mismatches++ < 4)
-            std::fprintf(stderr, "element %u: got %u and %u, want %u and %u\n", i, first[i], second[i], a, b);
+        if (second[i] != b && mismatches++ < 4)
+            std::fprintf(stderr, "indirect element %u: got %u, want %u\n", i, second[i], b);
     }
     EXPECT(!mismatches);
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
     }
-    std::printf("compute: root constants, a root UAV and a descriptor table reached the shader through the GPU "
-                "address arena; %u elements matched in each of two dispatches\n", elements);
+    std::printf("compute: %u direct and %u indirect elements matched with recorded root arguments\n",
+                elements, indirect_elements);
     return 0;
 }

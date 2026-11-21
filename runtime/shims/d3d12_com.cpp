@@ -34,6 +34,7 @@ const char* name(leonida::ReplayResult result) {
     case leonida::ReplayResult::invalid_subresource: return "invalid subresource";
     case leonida::ReplayResult::invalid_clear: return "invalid clear";
     case leonida::ReplayResult::invalid_copy: return "invalid copy or resolve";
+    case leonida::ReplayResult::invalid_indirect_arguments: return "invalid indirect argument buffer range";
     case leonida::ReplayResult::unsupported: return "unsupported";
     }
     return "?";
@@ -140,6 +141,17 @@ public:
     void STDMETHODCALLTYPE Dispatch(UINT x, UINT y, UINT z) override {
         if (!compute_pipeline_ || !compute_.layout) return check(false);
         check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
+    }
+
+    void STDMETHODCALLTYPE ExecuteIndirect(ID3D12CommandSignature* signature, UINT count,
+                                           ID3D12Resource* arguments, UINT64 offset,
+                                           ID3D12Resource* count_buffer, UINT64) override {
+        if (count_buffer || !compute_.layout ||
+            (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT && type_ != D3D12_COMMAND_LIST_TYPE_COMPUTE))
+            return check(false);
+        const UINT stride = dispatch_signature_stride(signature);
+        check(list_.dispatch_indirect({compute_pipeline_, compute_.data, resource_id(arguments), offset,
+                                       count, stride}));
     }
 
     // ClearState returns every piece of list state to its default, as Reset does (stencil references included).
