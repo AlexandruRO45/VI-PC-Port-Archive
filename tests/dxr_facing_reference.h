@@ -92,8 +92,9 @@ inline Hit closest(const std::vector<Vertex>& mesh, const std::vector<Instance>&
             const Vec delta = sub(origin, v[0]), q = cross(delta, direction);
             const double t = -dot(delta, normal) / facing;
             const double u = -dot(e2, q) / facing, w = dot(e1, q) / facing;
-            // Fixture rays stay inside the open distance interval and the triangle interior.
-            if (!(t > ray.nearT && t < ray.farT && u > 0 && w > 0 && u + w < 1)) continue;
+            // Include both geometric candidates at a shared edge. At equal distances
+            // this reference keeps the first primitive; DXR may choose either neighbor.
+            if (!(t > ray.nearT && t < ray.farT && u >= 0 && w >= 0 && u + w <= 1)) continue;
             // Clockwise from the ray origin in a left-handed frame is front facing.
             const bool front = (facing < 0) != instance.counterclockwise;
             if (!instance.cullDisable && (ray.flags & (front ? cullFront : cullBack))) continue;

@@ -8,6 +8,60 @@
 static_assert(dxr_facing::cullBack == D3D12_RAY_FLAG_CULL_BACK_FACING_TRIANGLES);
 static_assert(dxr_facing::cullFront == D3D12_RAY_FLAG_CULL_FRONT_FACING_TRIANGLES);
 
+namespace {
+void check_shared_edge(ID3D12Device* device, bool supported) {
+    const std::vector<dxr_facing::Vertex> mesh{
+        {0,0,1}, {0,1,1}, {1,0,1}, {1,0,1}, {0,1,1}, {1,1,1}};
+    const auto identity = dxr_facing::instances().front();
+    const std::vector<dxr_facing::Instance> scene{identity};
+    // Bit 0 and bit 1 name the incident primitives. On the shared diagonal DXR
+    // may commit either one. Just off it there is exactly one possible owner.
+    struct Probe { float x, y; UINT allowed; };
+    constexpr Probe probes[]{
+        {.25f,.75f,3}, {.5f,.5f,3}, {.75f,.25f,3},
+        {.5f,.4375f,1}, {.5f,.5625f,2}, {1.25f,.5f,0}};
+    std::vector<dxr_fixture::Ray> rays;
+    for (float dz : {1.f, -1.f}) {
+        const float z = 1 - dz;
+        for (const auto& probe : probes) {
+            const dxr_facing::Ray ray{{probe.x, probe.y, z}, {0,0,dz}, 0, 2, 0};
+            const auto hit = dxr_facing::closest(mesh, scene, ray);
+            if (hit.hit != (probe.allowed != 0) ||
+                (hit.hit && (!(probe.allowed & (1u << hit.primitive)) ||
+                             hit.distance != 1 || hit.front != (dz > 0)))) {
+                std::fprintf(stderr, "CPU shared edge x=%g y=%g dz=%g allowed=%u hit=%d primitive=%u\n",
+                             probe.x, probe.y, dz, probe.allowed, hit.hit, hit.primitive);
+                throw std::runtime_error("CPU shared-edge intersection differs");
+            }
+            rays.push_back({probe.x, probe.y, z, 0, 0,0,dz, 2, 255, dxr_fixture::report_facing});
+        }
+    }
+    if (!supported) return;
+    const auto words = dxr_fixture::trace(device, mesh, {dxr_fixture::instance(identity.id, 255)}, rays);
+    UINT edgeOwners[2]{}, interiorHits = 0, misses = 0;
+    for (std::size_t i = 0; i < rays.size(); ++i) {
+        const UINT allowed = probes[i % std::size(probes)].allowed;
+        const UINT* result = words.data() + 4 * i;
+        const UINT status = allowed ? (rays[i].dz > 0 ? 3u : 1u) : 0;
+        const bool primitiveMatches = allowed ? result[2] < 2 && (allowed & (1u << result[2])) : result[2] == 0;
+        float distance;
+        std::memcpy(&distance, result + 3, sizeof(distance));
+        const bool distanceMatches = allowed ? std::abs(distance - 1.f) <= 1e-5f : result[3] == 0;
+        if (result[0] != status || result[1] != (allowed ? identity.id : 0) ||
+            !primitiveMatches || !distanceMatches) {
+            std::fprintf(stderr, "DXR shared edge ray=%zu allowed=%u status=%u instance=%u primitive=%u t=%g\n",
+                         i, allowed, result[0], result[1], result[2], distance);
+            throw std::runtime_error("DXR shared-edge intersection differs");
+        }
+        if (allowed == 3) ++edgeOwners[result[2]];
+        else if (allowed) ++interiorHits;
+        else ++misses;
+    }
+    std::printf("dxr_shared_edge rays=%zu primitive0_edge_hits=%u primitive1_edge_hits=%u interior_hits=%u misses=%u\n",
+                rays.size(), edgeOwners[0], edgeOwners[1], interiorHits, misses);
+}
+}
+
 bool check_dxr_facing(ID3D12Device* device) {
     // The geometric reference must reproduce the hand-derived table on every
     // machine, including those that skip the GPU comparison.
@@ -16,7 +70,9 @@ bool check_dxr_facing(ID3D12Device* device) {
     const auto mesh = dxr_facing::vertices();
     if (dxr_facing::first_reference_mismatch() != probes.size())
         throw std::runtime_error("Facing reference disagrees with its hand-derived table");
-    if (!dxr_fixture::supported(device)) return false;
+    const bool supported = dxr_fixture::supported(device);
+    check_shared_edge(device, supported);
+    if (!supported) return false;
     std::vector<dxr_fixture::Vertex> vertices(mesh.begin(), mesh.end());
     std::vector<D3D12_RAYTRACING_INSTANCE_DESC> instances;
     for (const auto& source : scene) {
