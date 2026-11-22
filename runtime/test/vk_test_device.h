@@ -120,10 +120,10 @@ public:
         app.apiVersion = VK_API_VERSION_1_3;
         VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
         instance_info.pApplicationInfo = &app;
-        std::vector<const char*> extensions;
+        std::vector<const char*> instance_extensions;
         if (presentation) {
-            extensions.push_back("VK_KHR_surface");
-            extensions.push_back("VK_KHR_win32_surface");
+            instance_extensions.push_back("VK_KHR_surface");
+            instance_extensions.push_back("VK_KHR_win32_surface");
         }
         if (validation) {
             std::uint32_t count = 0;
@@ -139,10 +139,10 @@ public:
             instance_info.pNext = &messenger_info;
             instance_info.enabledLayerCount = 1;
             instance_info.ppEnabledLayerNames = &layer;
-            extensions.push_back(debug_utils);
+            instance_extensions.push_back(debug_utils);
         }
-        instance_info.enabledExtensionCount = std::uint32_t(extensions.size());
-        instance_info.ppEnabledExtensionNames = extensions.data();
+        instance_info.enabledExtensionCount = std::uint32_t(instance_extensions.size());
+        instance_info.ppEnabledExtensionNames = instance_extensions.data();
         if (create_instance(&instance_info, nullptr, &instance) != VK_SUCCESS) return false;
         if (validation &&
             instance_fn<PFN_vkCreateDebugUtilsMessengerEXT>("vkCreateDebugUtilsMessengerEXT")(
@@ -183,7 +183,8 @@ public:
         std::printf("device: %s%s\n", chosen.deviceName, validation ? " (validation on)" : "");
 
         VkPhysicalDeviceVulkan13Features features13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-        VkPhysicalDeviceVulkan12Features features12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &features13};
+        VkPhysicalDeviceVulkan11Features features11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &features13};
+        VkPhysicalDeviceVulkan12Features features12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &features11};
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &features12};
         instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &features);
         if (!features13.dynamicRendering || !features13.synchronization2 || !features12.timelineSemaphore ||
@@ -217,7 +218,10 @@ public:
                                                   conditional_rendering ? &enable_conditional : nullptr};
         enable13.dynamicRendering = VK_TRUE;
         enable13.synchronization2 = VK_TRUE;
-        VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable13};
+        // shaderDrawParameters: the translator's zero-based VS ids (PR 436) read BaseVertex and BaseInstance.
+        VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &enable13};
+        enable11.shaderDrawParameters = features11.shaderDrawParameters;
+        VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable11};
         enable12.timelineSemaphore = VK_TRUE;
         enable12.separateDepthStencilLayouts = VK_TRUE;
         enable12.bufferDeviceAddress = VK_TRUE;
@@ -246,6 +250,7 @@ public:
         bc = features.features.textureCompressionBC == VK_TRUE;
         enable.shaderSampledImageArrayDynamicIndexing = bindless;
         enable.shaderStorageImageArrayDynamicIndexing = bindless;
+        enable.shaderInt64 = features.features.shaderInt64;  // translated shaders declare Int64 for their addresses
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
 
         // VK_EXT_host_image_copy where the device has it, for the D3D12 layer's CPU texture copies.

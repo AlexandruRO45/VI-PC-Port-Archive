@@ -3192,6 +3192,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     enable.textureCompressionBC = chosen_bc ? VK_TRUE : VK_FALSE;  // the game's textures are BC1-7
     enable.shaderSampledImageArrayDynamicIndexing = info.bindless;
     enable.shaderStorageImageArrayDynamicIndexing = info.bindless;
+    enable.shaderInt64 = chosen_features.shaderInt64;  // every translated shader's 64-bit addresses (Int64)
     enable.samplerAnisotropy = info.sampler_anisotropy;
     if (!chosen_bc) std::fprintf(stderr, "[rt] d3d12: the GPU has no BC texture support\n");
     const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
