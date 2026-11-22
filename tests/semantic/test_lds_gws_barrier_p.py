@@ -965,5 +965,107 @@ class TestConditionCodesStatusFlagsAndCarryBorrow(unittest.TestCase):
         self.assertFalse(st_inactive["active_wave"])
 
 
+# ==============================================================================
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestIEEE754BoundaryExtremesAndNaNHandling(unittest.TestCase):
+    """Phase 7: Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    F32_POS_ZERO: int = 0x0000_0000
+    F32_NEG_ZERO: int = 0x8000_0000
+    F32_MIN_SUBNORMAL: int = 0x0000_0001
+    F32_MAX_SUBNORMAL: int = 0x007F_FFFF
+    F32_MIN_NORMAL: int = 0x0080_0000
+    F32_ONE: int = 0x3F80_0000
+    F32_MAX_NORMAL: int = 0x7F7F_FFFF
+    F32_POS_INF: int = 0x7F80_0000
+    F32_NEG_INF: int = 0xFF80_0000
+    F32_QNAN_CANONICAL: int = 0x7FC0_0000
+    F32_SNAN: int = 0x7F80_0001
+    F32_CUSTOM_NAN_PAYLOAD: int = 0x7FA5_BEEF
+    F16_PACKED_ONES: int = 0x3C00_3C00
+    F16_PACKED_NANS: int = 0x7E00_7E00
+
+    def test_signed_zeros_target_count(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        # +0.0: target count 0 clamps to minimum 1, satisfies on first arrival
+        state.set_vgpr(0, self.F32_POS_ZERO)
+        instr0 = DSGWSBarrierPInstruction(vdata0=RegisterOperand(0, RegType.VGPR), offset=0)
+        rid0, sat0, arr0, _ = interp.execute(instr0, state, wave_id=1)
+        self.assertTrue(sat0)
+        self.assertEqual(state.get_vgpr(0), self.F32_POS_ZERO)
+
+        # -0.0: bit 31 is set, interpreted as large unsigned integer (2^31)
+        state.set_vgpr(1, self.F32_NEG_ZERO)
+        instr1 = DSGWSBarrierPInstruction(vdata0=RegisterOperand(1, RegType.VGPR), offset=1)
+        rid1, sat1, arr1, _ = interp.execute(instr1, state, wave_id=2)
+        self.assertFalse(sat1)
+        self.assertEqual(arr1, 1)
+        self.assertEqual(state.get_vgpr(1), self.F32_NEG_ZERO)
+
+    def test_subnormals_preservation_no_ftz(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        state.set_vgpr(0, self.F32_MIN_SUBNORMAL)
+        instr = DSGWSBarrierPInstruction(vdata0=RegisterOperand(0, RegType.VGPR), offset=2)
+        rid, sat, arr, _ = interp.execute(instr, state, wave_id=1)
+        self.assertTrue(sat)
+        self.assertEqual(arr, 0)
+        self.assertEqual(state.get_vgpr(0), self.F32_MIN_SUBNORMAL)
+
+    def test_normals_and_infinities_preservation(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        patterns = [
+            (self.F32_MIN_NORMAL, 3),
+            (self.F32_MAX_NORMAL, 4),
+            (self.F32_POS_INF, 5),
+            (self.F32_NEG_INF, 6),
+        ]
+
+        for pattern, rid in patterns:
+            state.set_vgpr(0, pattern)
+            instr = DSGWSBarrierPInstruction(vdata0=RegisterOperand(0, RegType.VGPR), offset=rid)
+            r, sat, arr, _ = interp.execute(instr, state, wave_id=1)
+            self.assertEqual(r, rid)
+            self.assertEqual(state.get_vgpr(0), pattern)
+
+    def test_nans_payload_preservation_no_quieting(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        nan_patterns = [
+            (self.F32_QNAN_CANONICAL, 10),
+            (self.F32_SNAN, 11),
+            (self.F32_CUSTOM_NAN_PAYLOAD, 12),
+        ]
+
+        for pattern, rid in nan_patterns:
+            state.set_vgpr(0, pattern)
+            instr = DSGWSBarrierPInstruction(vdata0=RegisterOperand(0, RegType.VGPR), offset=rid)
+            r, sat, arr, _ = interp.execute(instr, state, wave_id=1)
+            self.assertEqual(r, rid)
+            self.assertEqual(state.get_vgpr(0), pattern)
+            if pattern == self.F32_SNAN:
+                self.assertEqual(state.get_vgpr(0) & 0x0040_0000, 0)
+
+    def test_packed_f16_bit_patterns(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        state.set_vgpr(0, self.F16_PACKED_ONES)
+        interp.execute(DSGWSBarrierPInstruction(vdata0=RegisterOperand(0, RegType.VGPR), offset=20), state, wave_id=1)
+        self.assertEqual(state.get_vgpr(0), self.F16_PACKED_ONES)
+
+        state.set_vgpr(0, self.F16_PACKED_NANS)
+        interp.execute(DSGWSBarrierPInstruction(vdata0=RegisterOperand(0, RegType.VGPR), offset=21), state, wave_id=1)
+        self.assertEqual(state.get_vgpr(0), self.F16_PACKED_NANS)
+
+
 if __name__ == "__main__":
     unittest.main()
