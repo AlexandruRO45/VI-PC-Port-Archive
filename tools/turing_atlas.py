@@ -188,7 +188,7 @@ def validate_cases():
         for name, asm in CASES.items():
             src = os.path.join(d, name + ".spvasm")
             spv = os.path.join(d, name + ".spv")
-            with open(src, "w", encoding="utf-8") as f:
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
                 f.write(asm)
             ra = run(["spirv-as", src, "-o", spv, "--target-env", "vulkan1.4"])
             if ra is None or ra.returncode != 0:
@@ -227,11 +227,15 @@ def main():
         pass
     text = json.dumps(atlas, indent=2, sort_keys=True)
     if a.out:
-        folder = os.path.dirname(a.out)  # --out into a folder that does not exist yet, as awc_manifest.py does
-        if folder:
-            os.makedirs(folder, exist_ok=True)
-        with open(a.out, "w", encoding="utf-8") as f:
-            f.write(text + "\n")
+        try:
+            folder = os.path.dirname(a.out)
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+            with open(a.out, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text + "\n")
+        except OSError as error:
+            print(f"turing_atlas: error: cannot write {a.out}: {error.strerror or error}", file=sys.stderr)
+            return 2
         print(f"atlas -> {a.out}")
     else:
         print(text)

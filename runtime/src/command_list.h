@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <utility>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -288,6 +289,7 @@ struct CopyBuffer {
     ResourceId src;
     std::uint64_t src_offset;
     std::uint64_t size;
+    ResourceId tiled_resource = 0;  // CopyTiles uses the padded size of the sparse side
 };
 
 // D3D12_TEXTURE_COPY_LOCATION: a texture subresource, or a placed footprint in a buffer. The footprint's format is
@@ -565,6 +567,11 @@ struct ExecuteIndirect {
     std::uint64_t argument_offset = 0;
     ResourceId count_buffer = 0;  // 0: fixed max_count; non-zero: vkCmdDraw*IndirectCount
     std::uint64_t count_offset = 0;
+    // kind == dispatch: the compute pipeline and root arguments in effect, as Dispatch records them, so the dispatches
+    // run that pipeline with those arguments whatever the command buffer had bound. A pipeline of 0 leaves the binding
+    // as it is.
+    std::uintptr_t pipeline = 0;
+    std::array<std::uint32_t, 32> user_data{};
 };
 
 // Triangle geometry descriptor for a BLAS build (ID3D12GraphicsCommandList4::BuildRaytracingAccelerationStructure).
@@ -594,11 +601,29 @@ struct BuildAccelerationStructure {
     std::vector<RtTriangleGeometry> triangles;
 };
 
+// CopyRaytracingAccelerationStructure. `mode` is D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE; replay supports
+// CLONE (0) and COMPACT (1) for XDXR structures.
+struct CopyAccelerationStructure {
+    std::uint64_t dst_va = 0;
+    std::uint64_t src_va = 0;
+    std::uint32_t mode = 0;
+};
+
+// EmitRaytracingAccelerationStructurePostbuildInfo, and each postbuild desc of BuildRaytracingAccelerationStructure:
+// one value per source, consecutively from `dest_va`. `type` is D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_TYPE;
+// replay supports COMPACTED_SIZE (0) and CURRENT_SIZE (3), 8 bytes each.
+struct AccelerationStructurePostbuild {
+    std::uint64_t dest_va = 0;
+    std::uint32_t type = 0;
+    std::vector<std::uint64_t> sources;
+};
+
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
                              CopyResource, ResolveSubresource, Predication, ClearUnorderedAccess, DiscardResource,
                              WriteImmediate, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries, DebugMarker,
-                             ExecuteIndirect, BuildAccelerationStructure, Dispatch, Draw>;
+                             ExecuteIndirect, BuildAccelerationStructure, Dispatch, Draw, CopyAccelerationStructure,
+                             AccelerationStructurePostbuild>;
 
 class CommandList {
 public:
@@ -809,6 +834,17 @@ public:
         if (!build.dst_va || !build.scratch_va) return false;
         return append(std::move(build));
     }
+    // D3D12: acceleration structures are 256-byte aligned, postbuild destinations 8-byte aligned.
+    bool copy_acceleration_structure(CopyAccelerationStructure copy) {
+        if (!copy.dst_va || !copy.src_va || copy.dst_va % 256 || copy.src_va % 256) return false;
+        return append(copy);
+    }
+    bool acceleration_structure_postbuild(AccelerationStructurePostbuild info) {
+        if (!info.dest_va || info.dest_va % 8 || info.sources.empty()) return false;
+        for (const auto va : info.sources)
+            if (!va || va % 256) return false;
+        return append(std::move(info));
+    }
     bool close() {
         if (closed_) return false;
         closed_ = true;
@@ -846,6 +882,12 @@ private:
     bool append(const Command& command) {
         if (closed_) return false;
         commands_.push_back(command);
+        return true;
+    }
+    // The recording calls pass a temporary: moved, so a command's rectangles are not copied a second time.
+    bool append(Command&& command) {
+        if (closed_) return false;
+        commands_.push_back(std::move(command));
         return true;
     }
 

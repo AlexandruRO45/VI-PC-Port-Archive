@@ -39,6 +39,7 @@ import mmap
 import os
 import struct
 import sys
+import tempfile
 import zlib
 from concurrent.futures import ProcessPoolExecutor
 
@@ -708,6 +709,33 @@ def summarize(total, entities=None, lights_out=None):
     return summary
 
 
+def same_report_path(first, second):
+    first, second = os.path.realpath(first), os.path.realpath(second)
+    if os.path.normcase(first) == os.path.normcase(second):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return False
+
+    first_dir, first_name = os.path.split(first)
+    second_dir, second_name = os.path.split(second)
+    if first_name.casefold() != second_name.casefold():
+        return False
+    try:
+        if not os.path.samefile(first_dir, second_dir):
+            return False
+        # normcase on POSIX does not tell us whether this volume folds case.
+        # Try the two names in a scratch directory on the destination volume before scanning.
+        with tempfile.TemporaryDirectory(prefix=".world-lights-", dir=first_dir) as probe:
+            with open(os.path.join(probe, first_name), "xb"):
+                return os.path.exists(os.path.join(probe, second_name))
+    except OSError:
+        return False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("archive")
@@ -727,6 +755,8 @@ def main(argv=None):
     if a.entities and not os.path.isfile(a.entities):
         print(f"ERROR: {a.entities}: no such file", file=sys.stderr)
         return 2
+    if a.out and a.lights_out and same_report_path(a.out, a.lights_out):
+        ap.error("--out and --lights-out must use different paths")
     total = scan(a.archive, a.jobs, a.start, a.limit, bool(a.lights_out))
     summary = summarize(total, a.entities, a.lights_out)
     text = json.dumps(summary, indent=1, sort_keys=True)
