@@ -122,6 +122,88 @@ def ref_ds_gws_sema_br(subsystem: GWSSubsystem, m0_val: int, offset: int, releas
     return subsystem.bulk_release_br(rid, release_count=release_count)
 
 
+# Commit 2: Symbolic AST opcode definitions and typed expressions
+
+
+class RegKind(enum.Enum):
+    """Register kinds in RDNA2 architecture."""
+    VGPR = "vgpr"
+    SGPR = "sgpr"
+    M0 = "m0"
+    EXEC = "exec"
+    VCC = "vcc"
+
+
+@dataclass(frozen=True)
+class Register:
+    """Represents an RDNA2 hardware register."""
+    index: int = 0
+    kind: RegKind = RegKind.VGPR
+
+    def __post_init__(self) -> None:
+        if self.kind in (RegKind.VGPR, RegKind.SGPR):
+            if not (0 <= self.index <= 255):
+                raise ValueError(f"Register index out of bounds [0, 255]: {self.index}")
+        elif self.kind in (RegKind.M0, RegKind.EXEC, RegKind.VCC):
+            if self.index != 0:
+                raise ValueError(f"Special register {self.kind.value} index must be 0")
+
+    def __str__(self) -> str:
+        if self.kind == RegKind.VGPR:
+            return f"v{self.index}"
+        elif self.kind == RegKind.SGPR:
+            return f"s{self.index}"
+        return self.kind.value
+
+
+class Opcode(enum.Enum):
+    """Data Share / GWS Opcode definitions."""
+    DS_GWS_SEMA_BR = "ds_gws_sema_br"
+    DS_GWS_SEMA_V = "ds_gws_sema_v"
+    DS_GWS_SEMA_P = "ds_gws_sema_p"
+    DS_GWS_INIT = "ds_gws_init"
+    DS_GWS_BARRIER = "ds_gws_barrier"
+
+
+@dataclass(frozen=True)
+class Instruction:
+    """AST representation of RDNA2 ds_gws_sema_br instruction."""
+    opcode: Opcode = Opcode.DS_GWS_SEMA_BR
+    vdata: Optional[Register] = None
+    offset: int = 0
+    gds: bool = True
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.offset <= 255):
+            raise ValueError(f"GWS immediate offset out of range [0, 255]: {self.offset}")
+        if self.vdata is not None and self.vdata.kind != RegKind.VGPR:
+            raise TypeError(f"vdata must be a VGPR, got: {self.vdata.kind}")
+
+    def disasm(self) -> str:
+        parts = [self.opcode.value]
+        if self.vdata is not None:
+            parts.append(str(self.vdata))
+        if self.offset != 0 or self.vdata is None:
+            parts.append(f"offset:{self.offset}")
+        if self.gds:
+            parts.append("gds")
+        return " ".join(parts)
+
+
+@dataclass(frozen=True)
+class GWSExpression:
+    """Symbolic expression for effective GWS resource identifier."""
+    base_reg: Register = field(default_factory=lambda: Register(0, RegKind.M0))
+    offset: int = 0
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.offset <= 255):
+            raise ValueError(f"Offset out of range [0, 255]: {self.offset}")
+
+    def evaluate(self, m0_val: int) -> int:
+        return ref_gws_resource_id(m0_val, self.offset)
+
+
 class TestGWSSemaBrOracleAndModel(unittest.TestCase):
     """Commit 1: Reference mathematical oracle and architectural model for ds_gws_sema_br."""
 
@@ -192,6 +274,49 @@ class TestGWSSemaBrOracleAndModel(unittest.TestCase):
         self.assertEqual(self.gws.resources[1].value, 5)
         self.assertEqual(self.gws.resources[2].value, 10)
         self.assertEqual(self.gws.resources[0].value, 0)
+
+
+class TestGWSSemaBrAST(unittest.TestCase):
+    """Commit 2: Symbolic AST opcode definitions and typed expressions for ds_gws_sema_br."""
+
+    def test_register_construction_and_formatting(self) -> None:
+        v0 = Register(0, RegKind.VGPR)
+        v255 = Register(255, RegKind.VGPR)
+        s15 = Register(15, RegKind.SGPR)
+        m0 = Register(0, RegKind.M0)
+
+        self.assertEqual(str(v0), "v0")
+        self.assertEqual(str(v255), "v255")
+        self.assertEqual(str(s15), "s15")
+        self.assertEqual(str(m0), "m0")
+
+    def test_register_bounds_rejection(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(-1, RegKind.VGPR)
+        with self.assertRaises(ValueError):
+            Register(256, RegKind.VGPR)
+        with self.assertRaises(ValueError):
+            Register(1, RegKind.M0)
+
+    def test_instruction_disassembly_formatting(self) -> None:
+        # Standard form without vdata
+        i1 = Instruction(opcode=Opcode.DS_GWS_SEMA_BR, offset=0, gds=True)
+        self.assertEqual(i1.disasm(), "ds_gws_sema_br offset:0 gds")
+
+        # Form with vdata and offset
+        i2 = Instruction(opcode=Opcode.DS_GWS_SEMA_BR, vdata=Register(0, RegKind.VGPR), offset=4, gds=True)
+        self.assertEqual(i2.disasm(), "ds_gws_sema_br v0 offset:4 gds")
+
+    def test_instruction_offset_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(offset=-1)
+        with self.assertRaises(ValueError):
+            Instruction(offset=256)
+
+    def test_gws_expression_symbolic_evaluation(self) -> None:
+        expr = GWSExpression(offset=8)
+        self.assertEqual(expr.evaluate(m0_val=0), 8)
+        self.assertEqual(expr.evaluate(m0_val=60), 4)
 
 
 if __name__ == "__main__":
