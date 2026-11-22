@@ -113,8 +113,20 @@ def lane_slot(vgpr, lane):
     return ("lane", vgpr["r"], lane["v"] & 63)
 
 
-def step(state, ins):
-    """Update `state` (register -> MASK | MASK_LO | MASK_HI | EITHER) for one instruction. True if it writes a mask to a VGPR."""
+def mask_sdst(a, wave64):
+    """The SGPRs a VALU lane-mask destination writes. The shaders are disassembled for wave32 (shader_disasm.py,
+    gfx1013 without +wavefrontsize64), so the 64-bit SDST of a wave64 v_cmp_*_e64 or carry-out prints as one
+    register (v_cmp_gt_f32_e64 s0, ...), while the wave writes s[0:1]. Taken as one register, s1 was unknown, so
+    a later s_and_b64 s[4:5], s[0:1], s[2:3] counted as 64-bit data: its SCC was this lane's bit instead of the
+    wave's, and s_bcnt1_i32_b64 of it counted data bits (GPU test cs_w64_sdst_pair)."""
+    if wave64 and a["k"] == "sgpr" and a.get("n", 1) == 1:
+        return dict(a, n=2)
+    return a
+
+
+def step(state, ins, wave64=False):
+    """Update `state` (register -> MASK | MASK_LO | MASK_HI | EITHER) for one instruction. True if it writes a mask to a VGPR.
+    wave64: the shader runs 64-lane waves, so a VALU mask destination is an SGPR pair (mask_sdst)."""
     op, a = base_op(ins["op"]), ins["args"]
     if not a or op.startswith(NO_DESTINATION):
         return
@@ -133,7 +145,7 @@ def step(state, ins):
         return
     if op.startswith("v_cmp"):
         # Handle v_cmp before VGPR clobber (defensive for 2-operand forms with implicit vcc).
-        put(state, {"k": "special", "t": "vcc"} if len(a) == 2 else a[0], MASK)
+        put(state, {"k": "special", "t": "vcc"} if len(a) == 2 else mask_sdst(a[0], wave64), MASK)
         return
     if a[0]["k"] == "vgpr":                             # any other write to a VGPR ends what was parked in it
         # A mask only when every source is one (or a constant 0 / -1) on every path: no EITHER for VGPRs, whose
@@ -170,7 +182,7 @@ def step(state, ins):
     else:
         put(state, a[0], None)
         if ((op.startswith("v_") and "_co_" in op) or op in ("v_mad_u64_u32", "v_mad_i64_i32")) and len(a) > 1:
-            put(state, a[1], MASK)                      # carry/sign lane mask of v_add_co_u32, v_mad_u64_u32, etc.
+            put(state, mask_sdst(a[1], wave64), MASK)   # carry/sign lane mask of v_add_co_u32, v_mad_u64_u32, etc.
 
 
 def parked(blocks, masks):
@@ -186,7 +198,7 @@ def parked(blocks, masks):
     return sorted(found)
 
 
-def analyse(blocks, succ, *, include_either=False):
+def analyse(blocks, succ, wave64=False, *, include_either=False):
     entry = [None] * len(blocks)                        # None: not reached yet
     if blocks:
         entry[0] = {}
@@ -195,7 +207,7 @@ def analyse(blocks, succ, *, include_either=False):
         n = work.pop()
         state = dict(entry[n])
         for ins in blocks[n]:
-            step(state, ins)
+            step(state, ins, wave64)
         for s in succ[n]:
             if entry[s] is None:
                 merged = dict(state)
@@ -221,6 +233,6 @@ def analyse(blocks, succ, *, include_either=False):
             out[id(ins)] = {r: k for r, k in state.items() if k in MASK_KINDS}
             if include_either:
                 either[id(ins)] = {r for r, k in state.items() if k == EITHER}
-            if step(state, ins):
+            if step(state, ins, wave64):
                 writes.add(id(ins))
     return (out, writes, either) if include_either else (out, writes)
