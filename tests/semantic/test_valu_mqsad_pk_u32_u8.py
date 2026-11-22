@@ -347,6 +347,59 @@ class VMqsadPkU32U8Instruction:
 
 
 # ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarRegisterFile:
+    """Architectural register file for a single execution thread."""
+
+    def __init__(self) -> None:
+        self.vgprs: List[int] = [0] * 256
+        self.sgprs: List[int] = [0] * 106
+
+    def read(self, op: Operand) -> int:
+        """Read operand value as unsigned 32-bit, 64-bit, or 128-bit integer."""
+        if op.reg_type == RegType.LITERAL:
+            assert op.literal_value is not None
+            if op.literal_bits == 128:
+                return op.literal_value & MASK128
+            if op.literal_bits == 64:
+                return op.literal_value & MASK64
+            return op.literal_value & MASK32
+
+        bank = self.vgprs if op.reg_type == RegType.VGPR else self.sgprs
+        res = 0
+        for i in range(op.size):
+            res |= (bank[op.index + i] & MASK32) << (32 * i)
+        return res
+
+    def write(self, op: Operand, value: int) -> None:
+        """Write value to register operand across its allocated dwords."""
+        if op.reg_type not in (RegType.VGPR, RegType.SGPR):
+            raise TypeError("Cannot write to literal operand")
+
+        bank = self.vgprs if op.reg_type == RegType.VGPR else self.sgprs
+        for i in range(op.size):
+            bank[op.index + i] = u32(value >> (32 * i))
+
+
+class ScalarVALUInterpreter:
+    """Deterministic instruction interpreter for v_mqsad_pk_u32_u8 on a scalar register file."""
+
+    def __init__(self, regs: ScalarRegisterFile | None = None) -> None:
+        self.regs: ScalarRegisterFile = regs if regs is not None else ScalarRegisterFile()
+
+    def step(self, instr: VMqsadPkU32U8Instruction) -> int:
+        s0 = self.regs.read(instr.src0)
+        s1 = self.regs.read(instr.src1)
+        s2 = self.regs.read(instr.src2)
+
+        result = ref_mqsad_pk_u32_u8(s0, s1, s2, clamp=instr.clamp)
+        self.regs.write(instr.dst, result)
+        return result
+
+
+# ==============================================================================
 # Unit Tests: Model and Reference Oracle
 # ==============================================================================
 
@@ -552,6 +605,98 @@ class TestValuMqsadPkU32U8SymbolicAST(unittest.TestCase):
                 src1=Operand.vgpr(2),
                 src2=Operand.vgpr_pair(8),
             )
+
+
+class TestValuMqsadPkU32U8ScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.regs = ScalarRegisterFile()
+        self.interp = ScalarVALUInterpreter(self.regs)
+
+    def test_register_file_quad_dword_access(self) -> None:
+        val128 = (0x11111111 << 96) | (0x22222222 << 64) | (0x33333333 << 32) | 0x44444444
+        self.regs.write(Operand.vgpr_quad(4), val128)
+        self.assertEqual(self.regs.read(Operand.vgpr_quad(4)), val128)
+        self.assertEqual(self.regs.read(Operand.vgpr(4)), 0x44444444)
+        self.assertEqual(self.regs.read(Operand.vgpr(5)), 0x33333333)
+        self.assertEqual(self.regs.read(Operand.vgpr(6)), 0x22222222)
+        self.assertEqual(self.regs.read(Operand.vgpr(7)), 0x11111111)
+
+        # Truncation check
+        self.regs.write(Operand.vgpr(0), 0x1_FFFF_FFFF)
+        self.assertEqual(self.regs.read(Operand.vgpr(0)), 0xFFFF_FFFF)
+
+        # Cannot write to literal
+        with self.assertRaises(TypeError):
+            self.regs.write(Operand.literal(0), 10)
+
+    def test_scalar_execution_basic(self) -> None:
+        ref = pack_u8x8(10, 20, 30, 40, 50, 60, 70, 80)
+        query = pack_u8x8(10, 20, 30, 40, 0, 0, 0, 0) & MASK32
+        acc = pack_u32x4(0, 0, 0, 0)
+
+        self.regs.write(Operand.vgpr_pair(4), ref)
+        self.regs.write(Operand.vgpr(6), query)
+        self.regs.write(Operand.vgpr_quad(8), acc)
+
+        instr = VMqsadPkU32U8Instruction(
+            dst=Operand.vgpr_quad(0),
+            src0=Operand.vgpr_pair(4),
+            src1=Operand.vgpr(6),
+            src2=Operand.vgpr_quad(8),
+        )
+
+        res = self.interp.step(instr)
+        self.assertEqual(unpack_u32x4(res), (0, 40, 80, 120))
+        self.assertEqual(self.regs.read(Operand.vgpr_quad(0)), res)
+
+    def test_scalar_execution_sgpr_and_literal(self) -> None:
+        ref = pack_u8x8(0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF)
+        self.regs.write(Operand.vgpr_pair(4), ref)
+        self.regs.write(Operand.sgpr(2), 0x01010101)  # nonzero, so not masked
+
+        max_acc = pack_u32x4(0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF)
+        instr = VMqsadPkU32U8Instruction(
+            dst=Operand.vgpr_quad(0),
+            src0=Operand.vgpr_pair(4),
+            src1=Operand.sgpr(2),
+            src2=Operand.literal128(max_acc),
+            clamp=True,
+        )
+
+        res = self.interp.step(instr)
+        self.assertEqual(unpack_u32x4(res), (0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF))
+        self.assertEqual(self.regs.read(Operand.vgpr_quad(0)), res)
+
+    def test_scalar_sequential_pipeline(self) -> None:
+        # Step 1: Compute into v[0:3]
+        ref1 = pack_u8x8(10, 20, 30, 40, 50, 60, 70, 80)
+        query1 = pack_u8x8(10, 20, 30, 40, 0, 0, 0, 0) & MASK32
+        self.regs.write(Operand.vgpr_pair(4), ref1)
+        self.regs.write(Operand.vgpr(6), query1)
+        self.regs.write(Operand.vgpr_quad(8), 0)
+
+        instr1 = VMqsadPkU32U8Instruction(
+            dst=Operand.vgpr_quad(0),
+            src0=Operand.vgpr_pair(4),
+            src1=Operand.vgpr(6),
+            src2=Operand.vgpr_quad(8),
+        )
+        res1 = self.interp.step(instr1)
+        self.assertEqual(unpack_u32x4(res1), (0, 40, 80, 120))
+
+        # Step 2: Use v[0:3] as accumulator in step 2 with query=0 (all masked -> SADs=0)
+        # Result should equal accumulated v[0:3]
+        instr2 = VMqsadPkU32U8Instruction(
+            dst=Operand.vgpr_quad(12),
+            src0=Operand.vgpr_pair(4),
+            src1=Operand.literal(0x00000000),  # fully masked
+            src2=Operand.vgpr_quad(0),         # reads step 1 result
+        )
+        res2 = self.interp.step(instr2)
+        self.assertEqual(unpack_u32x4(res2), (0, 40, 80, 120))
+        self.assertEqual(self.regs.read(Operand.vgpr_quad(12)), res1)
 
 
 if __name__ == "__main__":
