@@ -43,6 +43,7 @@ public:
     std::uint32_t family = 0;
     bool validation = false;
     bool bc = false;  // textureCompressionBC enabled
+    bool logic_op = false;  // logicOp enabled (D3D12 output-merger logic operations)
 
     Device() = default;
     Device(const Device&) = delete;
@@ -203,6 +204,8 @@ public:
         queue_info.pQueuePriorities = &priority;
         VkPhysicalDeviceFeatures enable{};
         enable.textureCompressionBC = features.features.textureCompressionBC;  // BC uploads, where available
+        enable.logicOp = features.features.logicOp;
+        logic_op = features.features.logicOp == VK_TRUE;
         bc = features.features.textureCompressionBC == VK_TRUE;
         VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
         device_info.queueCreateInfoCount = 1;

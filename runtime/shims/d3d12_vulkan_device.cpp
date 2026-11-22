@@ -529,6 +529,29 @@ VkBlendFactor blend_factor(D3D12_BLEND blend) {
     }
 }
 
+// D3D12_LOGIC_OP and VkLogicOp name the same 16 operations (s: source, d: destination) in different orders.
+VkLogicOp logic_op(D3D12_LOGIC_OP op) {
+    switch (op) {
+    case D3D12_LOGIC_OP_CLEAR: return VK_LOGIC_OP_CLEAR;
+    case D3D12_LOGIC_OP_SET: return VK_LOGIC_OP_SET;
+    case D3D12_LOGIC_OP_COPY: return VK_LOGIC_OP_COPY;
+    case D3D12_LOGIC_OP_COPY_INVERTED: return VK_LOGIC_OP_COPY_INVERTED;
+    case D3D12_LOGIC_OP_NOOP: return VK_LOGIC_OP_NO_OP;
+    case D3D12_LOGIC_OP_INVERT: return VK_LOGIC_OP_INVERT;
+    case D3D12_LOGIC_OP_AND: return VK_LOGIC_OP_AND;
+    case D3D12_LOGIC_OP_NAND: return VK_LOGIC_OP_NAND;
+    case D3D12_LOGIC_OP_OR: return VK_LOGIC_OP_OR;
+    case D3D12_LOGIC_OP_NOR: return VK_LOGIC_OP_NOR;
+    case D3D12_LOGIC_OP_XOR: return VK_LOGIC_OP_XOR;
+    case D3D12_LOGIC_OP_EQUIV: return VK_LOGIC_OP_EQUIVALENT;
+    case D3D12_LOGIC_OP_AND_REVERSE: return VK_LOGIC_OP_AND_REVERSE;    // s & ~d
+    case D3D12_LOGIC_OP_AND_INVERTED: return VK_LOGIC_OP_AND_INVERTED;  // ~s & d
+    case D3D12_LOGIC_OP_OR_REVERSE: return VK_LOGIC_OP_OR_REVERSE;      // s | ~d
+    case D3D12_LOGIC_OP_OR_INVERTED: return VK_LOGIC_OP_OR_INVERTED;    // ~s | d
+    default: return VK_LOGIC_OP_NO_OP;
+    }
+}
+
 VkBlendOp blend_op(D3D12_BLEND_OP op) {
     switch (op) {
     case D3D12_BLEND_OP_SUBTRACT: return VK_BLEND_OP_SUBTRACT;
@@ -792,10 +815,25 @@ public:
         depth.back = stencil_face(ds.BackFace, ds.StencilReadMask, ds.StencilWriteMask);
 
         std::vector<VkPipelineColorBlendAttachmentState> blends(desc.NumRenderTargets);
+        // Output-merger logic operations. Vulkan has one logic operation for the whole blend state, D3D12 one per
+        // render target; D3D12 also requires them to match, so the first target that enables one names it. Like
+        // D3D12, Vulkan applies it only to integer (and, in Vulkan, normalized) targets and ignores blending then.
+        bool logic_enable = false;
+        D3D12_LOGIC_OP logic = D3D12_LOGIC_OP_NOOP;
+        for (UINT i = 0; i < desc.NumRenderTargets && !logic_enable; ++i) {
+            const auto& b = desc.BlendState.RenderTarget[desc.BlendState.IndependentBlendEnable ? i : 0];
+            if (b.LogicOpEnable) {
+                logic_enable = true;
+                logic = b.LogicOp;
+            }
+        }
+        if (logic_enable && !device_.info.logic_op) {
+            log_once("logic op asked for without the logicOp feature; op", int(logic));
+            return E_INVALIDARG;
+        }
         for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
             const D3D12_RENDER_TARGET_BLEND_DESC& b =
                 desc.BlendState.RenderTarget[desc.BlendState.IndependentBlendEnable ? i : 0];
-            if (b.LogicOpEnable) log_once("logic ops are not modelled; render target", int(i));
             blends[i].blendEnable = b.BlendEnable;
             blends[i].srcColorBlendFactor = blend_factor(b.SrcBlend);
             blends[i].dstColorBlendFactor = blend_factor(b.DestBlend);
@@ -808,6 +846,8 @@ public:
         VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
         blend.attachmentCount = std::uint32_t(blends.size());
         blend.pAttachments = blends.data();
+        blend.logicOpEnable = logic_enable ? VK_TRUE : VK_FALSE;
+        blend.logicOp = logic_op(logic);
 
         graphics_.color_formats.assign(desc.NumRenderTargets, VK_FORMAT_UNDEFINED);
         for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
@@ -1423,7 +1463,7 @@ public:
             auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS*>(data);
             *opts = {};
             opts->DoublePrecisionFloatShaderOps = TRUE;
-            opts->OutputMergerLogicOp = TRUE;
+            opts->OutputMergerLogicOp = state_.info.logic_op ? TRUE : FALSE;
             opts->MinPrecisionSupport = D3D12_SHADER_MIN_PRECISION_SUPPORT_NONE;
             opts->TiledResourcesTier = D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED;
             opts->ResourceBindingTier = D3D12_RESOURCE_BINDING_TIER_3;  // Bindless descriptor indexing supported
@@ -1691,6 +1731,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     info.separate_depth_stencil_layouts = true;
     VkPhysicalDeviceProperties chosen{};
     bool chosen_bc = false;
+    bool chosen_logic_op = false;
     for (VkPhysicalDevice candidate : physicals) {
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(candidate, &props);
@@ -1714,6 +1755,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
                 info.queue_family = i;
                 chosen = props;
                 chosen_bc = bc;
+                chosen_logic_op = features.features.logicOp == VK_TRUE;
             }
             break;
         }
@@ -1737,6 +1779,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     queue_info.pQueuePriorities = &priority;
     VkPhysicalDeviceFeatures enable{};
     enable.textureCompressionBC = chosen_bc ? VK_TRUE : VK_FALSE;  // the game's textures are BC1-7
+    enable.logicOp = chosen_logic_op ? VK_TRUE : VK_FALSE;          // OutputMergerLogicOp
+    info.logic_op = chosen_logic_op;
     if (!chosen_bc) std::fprintf(stderr, "[rt] d3d12: the GPU has no BC texture support\n");
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
     device_info.queueCreateInfoCount = 1;
