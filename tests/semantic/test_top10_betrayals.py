@@ -47,6 +47,18 @@ def run(lines):
     return (w[0] & 0xFFFF) | (w[1] & 0xFFFF) << 16
 
 
+def run64(lines):
+    return run(lines) | run(list(lines) + ["v_mov_b32 v0, v1"]) << 32
+
+
+def d64(lo_reg, bits):
+    return [f"v_mov_b32 v{lo_reg}, 0x{bits & 0xFFFFFFFF:x}", f"v_mov_b32 v{lo_reg + 1}, 0x{bits >> 32:x}"]
+
+
+def dbits(x):
+    return struct.unpack("<Q", struct.pack("<d", x))[0]
+
+
 def f32(x):
     return struct.unpack("<I", struct.pack("<f", x))[0]
 
@@ -114,6 +126,32 @@ class Top10Betrayals(unittest.TestCase):
                                      norm(h2f(x), True) | norm(h2f(y), True) << 16)
                     self.assertEqual(run(movs + ["v_cvt_pknorm_u16_f16 v0, v1, v2"]),
                                      norm(h2f(x), False) | norm(h2f(y), False) << 16)
+
+    def test_minmax_f64_gfx1036(self):
+        qa, qb, sn, tiny = 0x7FF8000000000001, 0xFFF8000000000002, 0x7FF0000000000001, 1
+        cases = [(dbits(1.0), dbits(2.0), dbits(1.0), dbits(2.0)),
+                 (qa, dbits(3.0), dbits(3.0), dbits(3.0)), (dbits(3.0), qa, dbits(3.0), dbits(3.0)),
+                 (qa, qb, qa, qa), (1 << 63, 0, 1 << 63, 0), (0, 1 << 63, 1 << 63, 0),
+                 (sn, dbits(1.0), dbits(1.0), dbits(1.0)), (dbits(1.0), sn, dbits(1.0), dbits(1.0)),
+                 (sn, qa, sn, sn), (tiny, 0, 0, tiny), (tiny | 1 << 63, 0, tiny | 1 << 63, 0),
+                 (dbits(float("-inf")), dbits(5.0), dbits(float("-inf")), dbits(5.0))]
+        for x, y, lo, hi in cases:
+            movs = d64(2, x) + d64(4, y)
+            with self.subTest(x=hex(x), y=hex(y)):
+                self.assertEqual(run64(movs + ["v_min_f64 v[0:1], v[2:3], v[4:5]"]), lo)
+                self.assertEqual(run64(movs + ["v_max_f64 v[0:1], v[2:3], v[4:5]"]), hi)
+
+    def test_f64_omod_ignored_gfx1036(self):
+        one5, two, m1 = d64(2, dbits(1.5)), d64(4, dbits(2.0)), d64(6, dbits(-1.0))
+        self.assertEqual(run64(d64(2, dbits(1.0)) + two + ["v_max_f64 v[0:1], v[2:3], v[4:5] mul:2"]), dbits(2.0))
+        self.assertEqual(run64(one5 + ["v_mul_f64 v[0:1], v[2:3], v[2:3] mul:2"]), dbits(2.25))
+        self.assertEqual(run64(one5 + m1 + ["v_fma_f64 v[0:1], v[2:3], v[2:3], v[6:7] div:2"]), dbits(1.25))
+        self.assertEqual(run64(one5 + m1 + ["v_fma_f64 v[0:1], v[2:3], v[2:3], v[6:7] clamp mul:2"]), dbits(1.0))
+        self.assertEqual(run64(d64(2, dbits(5.0)) + d64(4, dbits(3.0)) + ["v_min_f64 v[0:1], v[2:3], v[4:5] clamp"]),
+                         dbits(1.0))
+        self.assertEqual(run64(d64(2, dbits(1.0)) + d64(4, dbits(float("-inf")))
+                               + ["v_max_f64 v[0:1], -v[2:3], |v[4:5]|"]), 0x7FF0000000000000)
+
 
     def test_fma_legacy_f32(self):
         vals = [0.0, -0.0, 1.5, -2.25, 3.0, float("inf"), bits_f32(0x3A83126F), 0.5]

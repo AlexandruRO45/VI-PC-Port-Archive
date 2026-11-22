@@ -6192,17 +6192,17 @@ class Gen:
                     lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
                 else:
                     raise Unsupported(op + " operand")
+                if sv.get("abs"):
+                    t = self.tmp()
+                    self.emit(f"{t} = OpBitwiseAnd %uint {hi} {self.cu(0x7FFFFFFF)}")
+                    hi = t
+                if sv.get("neg"):
+                    t = self.tmp()
+                    self.emit(f"{t} = OpBitwiseXor %uint {hi} {self.cu(0x80000000)}")
+                    hi = t
                 v2, d = self.tmp(), self.tmp()
                 self.emit(f"{v2} = OpCompositeConstruct %v2uint_d {lo} {hi}")
                 self.emit(f"{d} = OpBitcast %double {v2}")
-                if sv.get("abs"):
-                    t = self.tmp()
-                    self.emit(f"{t} = OpExtInst %double %glsl FAbs {d}")
-                    d = t
-                if sv.get("neg"):
-                    t = self.tmp()
-                    self.emit(f"{t} = OpFNegate %double {d}")
-                    d = t
                 return d
 
             def wr64(d):
@@ -6241,7 +6241,7 @@ class Gen:
                     self.emit(f"{r} = OpConvertSToF %double {self.as_int(self.src_u(a[1]))}")
                 else:
                     self.emit(f"{r} = OpConvertUToF %double {self.src_u(a[1])}")
-                wr64(self.clamp_mods_f64(r, mods))
+                wr64(self.clamp_mods_f64(r, [m for m in mods if m == "clamp"]))
                 return
             r = self.tmp()
             if op == "v_mul_f64":
@@ -6249,8 +6249,31 @@ class Gen:
             elif op == "v_fma_f64":
                 self.emit(f"{r} = OpExtInst %double %glsl Fma {rd64(a[1])} {rd64(a[2])} {rd64(a[3])}")
             elif op in ("v_min_f64", "v_max_f64"):
-                self.emit(f"{r} = OpExtInst %double %glsl {'NMin' if op == 'v_min_f64' else 'NMax'} {rd64(a[1])} "
-                          f"{rd64(a[2])}")
+                x, y = rd64(a[1]), rd64(a[2])
+                xb, yb = self.tmp(), self.tmp()
+                self.emit(f"{xb} = OpBitcast %v2uint_d {x}")
+                self.emit(f"{yb} = OpBitcast %v2uint_d {y}")
+                nx, ny, nnx, better, keep, both, take_x, eq = (self.tmp() for _ in range(8))
+                self.emit(f"{nx} = OpIsNan %bool {x}")
+                self.emit(f"{ny} = OpIsNan %bool {y}")
+                self.emit(f"{nnx} = OpLogicalNot %bool {nx}")
+                self.emit(f"{better} = {'OpFOrdLessThan' if op == 'v_min_f64' else 'OpFOrdGreaterThan'} %bool {x} {y}")
+                self.emit(f"{keep} = OpLogicalOr %bool {better} {ny}")
+                self.emit(f"{both} = OpLogicalAnd %bool {nx} {ny}")
+                self.emit(f"{take_x} = OpSelect %bool {nnx} {keep} {both}")
+                self.emit(f"{eq} = OpFOrdEqual %bool {x} {y}")
+                words = []
+                for i in (0, 1):
+                    xw, yw, zw, sel, w = (self.tmp() for _ in range(5))
+                    self.emit(f"{xw} = OpCompositeExtract %uint {xb} {i}")
+                    self.emit(f"{yw} = OpCompositeExtract %uint {yb} {i}")
+                    self.emit(f"{zw} = {'OpBitwiseOr' if op == 'v_min_f64' else 'OpBitwiseAnd'} %uint {xw} {yw}")
+                    self.emit(f"{sel} = OpSelect %uint {take_x} {xw} {yw}")
+                    self.emit(f"{w} = OpSelect %uint {eq} {zw} {sel}")
+                    words.append(w)
+                v2 = self.tmp()
+                self.emit(f"{v2} = OpCompositeConstruct %v2uint_d {words[0]} {words[1]}")
+                self.emit(f"{r} = OpBitcast %double {v2}")
             elif op == "v_ldexp_f64":
                 self.emit(f"{r} = OpExtInst %double %glsl Ldexp {rd64(a[1])} {self.as_int(self.src_u(a[2]))}")
             elif op == "v_fract_f64":
@@ -6258,7 +6281,7 @@ class Gen:
                 self.emit(f"{fr} = OpExtInst %double %glsl Fract {rd64(a[1])}")
                 self.emit(f"{one} = OpFOrdEqual %bool {fr} {self.dconst(1.0)}")
                 self.emit(f"{r} = OpSelect %double {one} {self.dconst(struct.unpack('<d', struct.pack('<Q', 0x3FEFFFFFFFFFFFFF))[0])} {fr}")
-            wr64(self.clamp_mods_f64(r, mods))
+            wr64(self.clamp_mods_f64(r, [m for m in mods if m == "clamp"]))
         elif op in ("v_trunc_f64", "v_ceil_f64", "v_rndne_f64", "v_floor_f64"):
             if len(a) != 2 or a[0]["k"] != "vgpr" or a[0].get("n") != 2:
                 raise Unsupported(op + " operands")
