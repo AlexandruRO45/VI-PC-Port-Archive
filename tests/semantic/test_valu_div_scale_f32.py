@@ -1494,5 +1494,85 @@ class TestDivScaleF32StatusFlagsAndConditionCodes(unittest.TestCase):
         self.assertEqual(rf.read_sgpr(105), scc_sentinel)
 
 
+class TestDivScaleF32IEEE754Boundaries(unittest.TestCase):
+    """Test suite for IEEE 754 boundary extremes, subnormals, infinities, and NaNs."""
+
+    def test_subnormal_scale_up(self):
+        # Subnormal float in denominator -> scale up by 2^64
+        sub_min = u32_to_f32(F32_SUB_MIN)
+        res_u32, vcc = ref_div_scale_f32_u32(F32_SUB_MIN, F32_SUB_MIN, F32_ONE)
+        self.assertEqual(vcc, 1)
+        self.assertAlmostEqual(u32_to_f32(res_u32), sub_min * SCALE64_POS)
+
+    def test_threshold_boundaries_exact(self):
+        # Exactly at THRESH_F32_SMALL -> scales up
+        res_at, vcc_at = ref_div_scale_f32(THRESH_F32_SMALL, THRESH_F32_SMALL, 1.0)
+        self.assertEqual(vcc_at, 1)
+        self.assertAlmostEqual(res_at, THRESH_F32_SMALL * SCALE64_POS)
+
+        # Above THRESH_F32_SMALL -> does not scale
+        above_small = THRESH_F32_SMALL * 2.0
+        res_above, vcc_above = ref_div_scale_f32(above_small, above_small, 1.0)
+        self.assertEqual(vcc_above, 0)
+        self.assertEqual(res_above, above_small)
+
+        # Exactly at THRESH_F32_LARGE -> scales down
+        res_large, vcc_large = ref_div_scale_f32(THRESH_F32_LARGE, THRESH_F32_LARGE, 1.0)
+        self.assertEqual(vcc_large, 1)
+        self.assertAlmostEqual(res_large, THRESH_F32_LARGE * SCALE64_NEG)
+
+        # Below THRESH_F32_LARGE -> does not scale
+        below_large = THRESH_F32_LARGE * 0.5
+        res_below, vcc_below = ref_div_scale_f32(below_large, below_large, 1.0)
+        self.assertEqual(vcc_below, 0)
+        self.assertEqual(res_below, below_large)
+
+    def test_signed_zeros(self):
+        # +0.0 and -0.0
+        res_p, vcc_p = ref_div_scale_f32_u32(F32_POS_ZERO, F32_POS_ZERO, F32_ONE)
+        self.assertEqual(res_p, F32_POS_ZERO)
+        self.assertEqual(vcc_p, 0)
+
+        res_n, vcc_n = ref_div_scale_f32_u32(F32_NEG_ZERO, F32_NEG_ZERO, F32_ONE)
+        self.assertEqual(res_n, F32_NEG_ZERO)
+        self.assertEqual(vcc_n, 0)
+
+    def test_signed_infinities(self):
+        # Infinities
+        res_pinf, vcc_p = ref_div_scale_f32_u32(F32_POS_INF, F32_POS_INF, F32_ONE)
+        self.assertEqual(res_pinf, F32_POS_INF)
+        self.assertEqual(vcc_p, 0)
+
+        res_ninf, vcc_n = ref_div_scale_f32_u32(F32_NEG_INF, F32_NEG_INF, F32_ONE)
+        self.assertEqual(res_ninf, F32_NEG_INF)
+        self.assertEqual(vcc_n, 0)
+
+    def test_nan_quietening_and_payload_preservation(self):
+        # QNaN payload preserved
+        qnan_payload = F32_CANONICAL_QNAN | 0x1234
+        res_qnan, vcc_q = ref_div_scale_f32_u32(qnan_payload, F32_ONE, F32_TWO)
+        self.assertEqual(res_qnan, qnan_payload)
+        self.assertEqual(vcc_q, 0)
+
+        # SNaN quieted (bit 22 set)
+        res_snan, vcc_s = ref_div_scale_f32_u32(F32_SNAN, F32_ONE, F32_TWO)
+        self.assertTrue(is_f32_qnan(res_snan))
+        self.assertFalse(is_f32_snan(res_snan))
+        self.assertEqual(vcc_s, 0)
+
+    def test_clamp_boundary_extremes(self):
+        # Negative -> +0.0
+        res_neg, _ = ref_div_scale_f32_u32(F32_NEG_ONE, F32_ONE, F32_ONE, clamp=True)
+        self.assertEqual(res_neg, F32_POS_ZERO)
+
+        # Greater than 1.0 -> 1.0
+        res_gt, _ = ref_div_scale_f32_u32(F32_TWO, F32_ONE, F32_ONE, clamp=True)
+        self.assertEqual(res_gt, F32_ONE)
+
+        # NaN -> +0.0
+        res_nan, _ = ref_div_scale_f32_u32(F32_CANONICAL_QNAN, F32_ONE, F32_ONE, clamp=True)
+        self.assertEqual(res_nan, F32_POS_ZERO)
+
+
 if __name__ == "__main__":
     unittest.main()
