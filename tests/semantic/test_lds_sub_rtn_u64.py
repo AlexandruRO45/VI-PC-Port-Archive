@@ -240,5 +240,243 @@ class TestLdsSubRtnU64ReferenceOracle(unittest.TestCase):
         self.assertEqual(idx_base, idx_wrapped)
 
 
+# ============================================================================
+# Section 2: Symbolic AST Opcode Definitions and Typed Expressions
+# ============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    VGPR_PAIR = auto()
+    SGPR = auto()
+    IMM = auto()
+
+
+@dataclass(frozen=True)
+class VGPR:
+    index: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index < DEFAULT_NUM_VGPRS):
+            raise ValueError(f"VGPR index out of range [0, {DEFAULT_NUM_VGPRS - 1}]: {self.index}")
+
+    def __str__(self) -> str:
+        return f"v{self.index}"
+
+
+@dataclass(frozen=True)
+class VGPRPair:
+    base: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.base < DEFAULT_NUM_VGPRS - 1):
+            raise ValueError(
+                f"VGPRPair base out of range [0, {DEFAULT_NUM_VGPRS - 2}]: {self.base}"
+            )
+
+    @property
+    def lo(self) -> int:
+        return self.base
+
+    @property
+    def hi(self) -> int:
+        return self.base + 1
+
+    def __str__(self) -> str:
+        return f"v[{self.base}:{self.base + 1}]"
+
+
+@dataclass(frozen=True)
+class SGPR:
+    index: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index < DEFAULT_NUM_SGPRS):
+            raise ValueError(f"SGPR index out of range [0, {DEFAULT_NUM_SGPRS - 1}]: {self.index}")
+
+    def __str__(self) -> str:
+        return f"s{self.index}"
+
+
+@dataclass(frozen=True)
+class Immediate64:
+    value: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value", u64(self.value))
+
+    def __str__(self) -> str:
+        return f"0x{self.value:X}"
+
+
+@dataclass(frozen=True)
+class DSSubRtnU64Instruction:
+    dst: VGPRPair
+    addr: VGPR
+    data0: Union[VGPRPair, Immediate64]
+    offset: int = 0
+    gds: bool = False
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.offset <= OFFSET16_MASK):
+            raise ValueError(f"LDS offset out of 16-bit range [0, 65535]: {self.offset}")
+        if not isinstance(self.dst, VGPRPair):
+            raise TypeError(f"dst must be a VGPRPair, got {type(self.dst)}")
+        if not isinstance(self.addr, VGPR):
+            raise TypeError(f"addr must be a VGPR, got {type(self.addr)}")
+        if not isinstance(self.data0, (VGPRPair, Immediate64)):
+            raise TypeError(f"data0 must be VGPRPair or Immediate64, got {type(self.data0)}")
+
+    def disasm(self) -> str:
+        tokens = ["ds_sub_rtn_u64", str(self.dst), str(self.addr), str(self.data0)]
+        extra = []
+        if self.offset != 0:
+            extra.append(f"offset:{self.offset}")
+        if self.gds:
+            extra.append("gds")
+        core = f"{tokens[0]} {tokens[1]}, {tokens[2]}, {tokens[3]}"
+        return f"{core} {' '.join(extra)}".rstrip()
+
+
+class ASTExpr64:
+    """Base class for symbolic typed expressions in RDNA2 64-bit arithmetic."""
+
+    def simplify(self) -> ASTExpr64:
+        raise NotImplementedError
+
+    def evaluate(self, env: Dict[str, int]) -> int:
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class Symbol64(ASTExpr64):
+    name: str
+
+    def simplify(self) -> ASTExpr64:
+        return self
+
+    def evaluate(self, env: Dict[str, int]) -> int:
+        if self.name not in env:
+            raise KeyError(f"Symbol '{self.name}' not found in evaluation environment")
+        return u64(env[self.name])
+
+    def __str__(self) -> str:
+        return self.name
+
+
+@dataclass(frozen=True)
+class Constant64(ASTExpr64):
+    value: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value", u64(self.value))
+
+    def simplify(self) -> ASTExpr64:
+        return self
+
+    def evaluate(self, env: Dict[str, int]) -> int:
+        return self.value
+
+    def __str__(self) -> str:
+        return f"0x{self.value:016X}"
+
+
+@dataclass(frozen=True)
+class Sub64Expr(ASTExpr64):
+    left: ASTExpr64
+    right: ASTExpr64
+
+    def simplify(self) -> ASTExpr64:
+        s_left = self.left.simplify()
+        s_right = self.right.simplify()
+
+        # Constant folding
+        if isinstance(s_left, Constant64) and isinstance(s_right, Constant64):
+            return Constant64(s_left.value - s_right.value)
+
+        # Identity: X - 0 -> X
+        if isinstance(s_right, Constant64) and s_right.value == 0:
+            return s_left
+
+        # Self-annihilation: X - X -> 0
+        if s_left == s_right:
+            return Constant64(0)
+
+        return Sub64Expr(s_left, s_right)
+
+    def evaluate(self, env: Dict[str, int]) -> int:
+        return u64(self.left.evaluate(env) - self.right.evaluate(env))
+
+    def __str__(self) -> str:
+        return f"({self.left} - {self.right})"
+
+
+class TestSymbolicASTAndTypedExpressions(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_instruction_valid_creation_and_disassembly(self) -> None:
+        instr = DSSubRtnU64Instruction(
+            dst=VGPRPair(0),
+            addr=VGPR(4),
+            data0=VGPRPair(2),
+            offset=16,
+        )
+        self.assertEqual(instr.disasm(), "ds_sub_rtn_u64 v[0:1], v4, v[2:3] offset:16")
+
+        instr_imm = DSSubRtnU64Instruction(
+            dst=VGPRPair(10),
+            addr=VGPR(20),
+            data0=Immediate64(0x1234_5678_9ABC_DEF0),
+            offset=0,
+            gds=True,
+        )
+        self.assertEqual(
+            instr_imm.disasm(), "ds_sub_rtn_u64 v[10:11], v20, 0x123456789ABCDEF0 gds"
+        )
+
+    def test_instruction_validation_vgpr_pair_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            VGPRPair(255)  # 255 would require v255 and v256 (out of range!)
+        with self.assertRaises(ValueError):
+            VGPRPair(-1)
+
+    def test_instruction_validation_offset_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            DSSubRtnU64Instruction(
+                dst=VGPRPair(0), addr=VGPR(1), data0=VGPRPair(2), offset=65536
+            )
+        with self.assertRaises(ValueError):
+            DSSubRtnU64Instruction(
+                dst=VGPRPair(0), addr=VGPR(1), data0=VGPRPair(2), offset=-1
+            )
+
+    def test_symbolic_constant_folding(self) -> None:
+        expr = Sub64Expr(
+            Constant64(0x0000_0005_0000_0000), Constant64(0x0000_0002_0000_0000)
+        )
+        simplified = expr.simplify()
+        self.assertIsInstance(simplified, Constant64)
+        self.assertEqual(simplified.evaluate({}), 0x0000_0003_0000_0000)
+
+    def test_symbolic_identity_zero(self) -> None:
+        x = Symbol64("X")
+        expr = Sub64Expr(x, Constant64(0))
+        simplified = expr.simplify()
+        self.assertEqual(simplified, x)
+
+    def test_symbolic_self_annihilation(self) -> None:
+        x = Symbol64("X")
+        expr = Sub64Expr(x, x)
+        simplified = expr.simplify()
+        self.assertEqual(simplified, Constant64(0))
+
+    def test_symbolic_evaluation_env(self) -> None:
+        x = Symbol64("A")
+        y = Symbol64("B")
+        expr = Sub64Expr(x, y)
+        env = {"A": 100, "B": 25}
+        self.assertEqual(expr.evaluate(env), 75)
+
+
+
 if __name__ == "__main__":
     unittest.main()
