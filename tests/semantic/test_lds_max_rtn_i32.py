@@ -847,5 +847,134 @@ class TestDSMaxRtnI32SIMDMultiLane(unittest.TestCase):
         self.assertEqual(detect_lds_bank_conflicts(eff_addrs_no_conflict), {})
 
 
+class TestDSMaxRtnI32RegisterAliasing(unittest.TestCase):
+    """Phase 5: Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(size_dwords=1024)
+        self.state = ScalarThreadState(lds=self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_alias_vdst_equals_vaddr(self) -> None:
+        # ds_max_rtn_i32 v0, v0, v1 (vdst == vaddr)
+        addr = 0x40
+        self.lds.write_dword(addr, u32(-20))
+        self.state.set_vgpr(0, addr)  # v0 is vaddr and vdst
+        self.state.set_vgpr(1, 15)    # v1 is vdata0
+
+        inst = DSMaxRtnI32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(0, RegType.VGPR),
+            vdata0=RegisterOperand(1, RegType.VGPR),
+        )
+
+        ret = self.interp.execute(self.state, inst)
+        # v0 must receive the old memory value (-20)
+        self.assertEqual(ret, u32(-20))
+        self.assertEqual(self.state.get_vgpr(0), u32(-20))
+        # v1 must be preserved
+        self.assertEqual(self.state.get_vgpr(1), 15)
+        # Memory at 0x40 must be updated with max(-20, 15) = 15
+        self.assertEqual(self.lds.read_dword(addr), 15)
+
+    def test_alias_vdst_equals_vdata(self) -> None:
+        # ds_max_rtn_i32 v1, v0, v1 (vdst == vdata0)
+        addr = 0x50
+        self.lds.write_dword(addr, 100)
+        self.state.set_vgpr(0, addr)  # v0 is vaddr
+        self.state.set_vgpr(1, 50)    # v1 is vdata0 and vdst
+
+        inst = DSMaxRtnI32Instruction(
+            vdst=RegisterOperand(1, RegType.VGPR),
+            vaddr=RegisterOperand(0, RegType.VGPR),
+            vdata0=RegisterOperand(1, RegType.VGPR),
+        )
+
+        ret = self.interp.execute(self.state, inst)
+        # v1 must receive the old memory value (100)
+        self.assertEqual(ret, 100)
+        self.assertEqual(self.state.get_vgpr(1), 100)
+        # v0 must be preserved
+        self.assertEqual(self.state.get_vgpr(0), addr)
+        # Memory remains 100 (max(100, 50))
+        self.assertEqual(self.lds.read_dword(addr), 100)
+
+    def test_alias_vdst_equals_vaddr_equals_vdata(self) -> None:
+        # ds_max_rtn_i32 v0, v0, v0 (vdst == vaddr == vdata0)
+        addr = 0x10  # 16
+        self.lds.write_dword(addr, u32(-5))
+        self.state.set_vgpr(0, addr)  # v0 is vdst, vaddr, and vdata0
+
+        inst = DSMaxRtnI32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(0, RegType.VGPR),
+            vdata0=RegisterOperand(0, RegType.VGPR),
+        )
+
+        ret = self.interp.execute(self.state, inst)
+        # Old memory value is -5
+        self.assertEqual(ret, u32(-5))
+        self.assertEqual(self.state.get_vgpr(0), u32(-5))
+        # max(-5, 16) = 16
+        self.assertEqual(self.lds.read_dword(addr), 16)
+
+    def test_unreferenced_registers_preserved(self) -> None:
+        addr = 0x20
+        self.lds.write_dword(addr, 50)
+        self.state.set_vgpr(0, 0)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, 60)
+
+        # Fill background registers with canaries
+        for r in range(3, DEFAULT_NUM_VGPRS):
+            self.state.set_vgpr(r, 0x10000000 + r)
+        for s in range(DEFAULT_NUM_SGPRS):
+            self.state.set_sgpr(s, 0x20000000 + s)
+
+        inst = DSMaxRtnI32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+        )
+        self.interp.execute(self.state, inst)
+
+        # vdst received old value 50
+        self.assertEqual(self.state.get_vgpr(0), 50)
+        # vaddr and vdata0 preserved
+        self.assertEqual(self.state.get_vgpr(1), addr)
+        self.assertEqual(self.state.get_vgpr(2), 60)
+
+        # All other registers untouched
+        for r in range(3, DEFAULT_NUM_VGPRS):
+            self.assertEqual(self.state.get_vgpr(r), 0x10000000 + r)
+        for s in range(DEFAULT_NUM_SGPRS):
+            self.assertEqual(self.state.get_sgpr(s), 0x20000000 + s)
+
+    def test_simd_multi_lane_register_aliasing(self) -> None:
+        wave = SIMDWaveState(wave_size=32, exec_mask=0xFFFFFFFF, lds=self.lds)
+        simd_interp = SIMDDSInterpreter()
+
+        # Each lane has vdst == vaddr: v0 is dst and addr, v1 is vdata0
+        for l in range(32):
+            addr = l * 4
+            self.lds.write_dword(addr, 50 + l)
+            wave.set_lane_vgpr(l, 0, addr)
+            wave.set_lane_vgpr(l, 1, 100)
+
+        inst = DSMaxRtnI32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(0, RegType.VGPR),
+            vdata0=RegisterOperand(1, RegType.VGPR),
+        )
+
+        results = simd_interp.execute(wave, inst)
+
+        for l in range(32):
+            self.assertEqual(results[l], 50 + l)
+            self.assertEqual(wave.get_lane_vgpr(l, 0), 50 + l)  # v0 received old value
+            self.assertEqual(wave.get_lane_vgpr(l, 1), 100)     # v1 preserved
+            self.assertEqual(self.lds.read_dword(l * 4), 100)   # Memory updated with max(50+l, 100) = 100
+
+
 if __name__ == "__main__":
     unittest.main()
