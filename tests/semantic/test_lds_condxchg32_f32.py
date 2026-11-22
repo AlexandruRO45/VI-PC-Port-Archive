@@ -707,6 +707,99 @@ class TestSIMDMultiLaneDivergenceAndExecMasking(unittest.TestCase):
         for lane in range(32):
             self.assertTrue(returns[lane])
 
+class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(65536)
+        self.state = ScalarThreadState(lds=self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_scalar_addr_aliases_data0(self) -> None:
+        val = f32_to_raw_u32(16.0)
+        self.lds.write_dword(4, val)  # byte 16 -> dword 4
+        self.state.set_vgpr(VGPR(1), 16)      # address 16 and cmp_val = 16 (subnormal)
+        self.state.set_vgpr(VGPR(2), TWO_RAW) # new_val
+
+        inst = DSCondXchg32F32Instruction(
+            DSOpcode.DS_CONDXCHG32_F32,
+            vaddr=VGPR(1),
+            vdata0=VGPR(1),
+            vdata1=VGPR(2),
+        )
+        # 16.0f != 16 (subnormal), so no exchange
+        swapped = self.interp.execute(self.state, inst)
+        self.assertFalse(swapped)
+        self.assertEqual(self.state.get_vgpr(VGPR(1)), 16)
+        self.assertEqual(self.lds.read_dword(4), val)
+
+    def test_scalar_data0_aliases_data1(self) -> None:
+        self.lds.write_dword(5, ONE_RAW)
+        self.state.set_vgpr(VGPR(1), 20)
+        self.state.set_vgpr(VGPR(2), ONE_RAW)  # cmp_val == new_val
+
+        inst = DSCondXchg32F32Instruction(
+            DSOpcode.DS_CONDXCHG32_F32,
+            vaddr=VGPR(1),
+            vdata0=VGPR(2),
+            vdata1=VGPR(2),
+        )
+        swapped = self.interp.execute(self.state, inst)
+        self.assertTrue(swapped)
+        self.assertEqual(self.state.get_vgpr(VGPR(2)), ONE_RAW)
+        self.assertEqual(self.lds.read_dword(5), ONE_RAW)
+
+    def test_operand_preservation_non_aliased(self) -> None:
+        self.lds.write_dword(10, ONE_RAW)
+        self.state.set_vgpr(VGPR(1), 40)
+        self.state.set_vgpr(VGPR(2), ONE_RAW)
+        self.state.set_vgpr(VGPR(3), TWO_RAW)
+        self.state.set_vgpr(VGPR(100), 0xCAFEBABE)
+        self.state.set_vgpr(VGPR(255), 0x12344321)
+
+        inst = DSCondXchg32F32Instruction(
+            DSOpcode.DS_CONDXCHG32_F32,
+            vaddr=VGPR(1),
+            vdata0=VGPR(2),
+            vdata1=VGPR(3),
+        )
+        self.interp.execute(self.state, inst)
+
+        self.assertEqual(self.state.get_vgpr(VGPR(1)), 40)
+        self.assertEqual(self.state.get_vgpr(VGPR(2)), ONE_RAW)
+        self.assertEqual(self.state.get_vgpr(VGPR(3)), TWO_RAW)
+        self.assertEqual(self.state.get_vgpr(VGPR(100)), 0xCAFEBABE)
+        self.assertEqual(self.state.get_vgpr(VGPR(255)), 0x12344321)
+
+    def test_simd_aliasing_under_divergence(self) -> None:
+        lds = LDSMemory(65536)
+        wave = SIMDWaveState(wave_size=32, exec_mask=0xAAAAAAAA, lds=lds)
+        interp = SIMDDSInterpreter()
+
+        for i in range(32):
+            lds.write_dword(i, ONE_RAW)
+
+        for lane in range(32):
+            wave.set_vgpr(lane, VGPR(1), lane * 4)
+            wave.set_vgpr(lane, VGPR(2), ONE_RAW)
+            wave.set_vgpr(lane, VGPR(3), TWO_RAW)
+
+        inst = DSCondXchg32F32Instruction(
+            DSOpcode.DS_CONDXCHG32_F32,
+            vaddr=VGPR(1),
+            vdata0=VGPR(2),
+            vdata1=VGPR(3),
+        )
+        returns = interp.execute(wave, inst)
+
+        for lane in range(32):
+            if lane % 2 != 0:
+                self.assertEqual(lds.read_dword(lane), TWO_RAW)
+                self.assertTrue(returns[lane])
+            else:
+                self.assertEqual(lds.read_dword(lane), ONE_RAW)
+                self.assertNotIn(lane, returns)
+
 
 if __name__ == "__main__":
     unittest.main()
