@@ -1118,6 +1118,12 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
         if not merged:
             # A marker left behind would look like a finished translation to the next run; drop it with the failure.
             os.remove(index)
+            # The plan would make the retry reuse the same empty parts even after the disassembly was repaired; without
+            # it translate() removes the parts and runs every shard again.
+            try:
+                os.remove(plan_path)
+            except OSError:
+                pass
             fail("rdna2spirv.py translated 0 shaders, so the empty index is not kept. Run the shaders stage again; "
                  "if it happens again, the disassembly logged above is why.")
 

@@ -136,12 +136,15 @@ class TranslateTest(unittest.TestCase):
         with self.assertRaises(SystemExit) as cm:
             self.translate_with_index("{}")
         self.assertEqual(cm.exception.code, 1)
-        # The empty file must not survive to be read as a finished translation by the next run.
+        # The empty file must not survive to be read as a finished translation by the next run, and neither may the
+        # shard plan: with it, the retry would merge the same empty parts again even after the input was repaired.
         self.assertFalse(os.path.exists(os.path.join(self.spirv, "index.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.spirv, make_game.SHARD_PLAN)))
         with self.assertRaises(SystemExit) as cm:
             self.translate_with_index("{}")
         self.assertEqual(cm.exception.code, 1)
         self.assertFalse(os.path.exists(os.path.join(self.spirv, "index.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.spirv, make_game.SHARD_PLAN)))
 
     def test_an_unreadable_merge_fails(self):
         with self.assertRaises(SystemExit) as cm:
