@@ -1002,5 +1002,150 @@ class TestValuCvtPknormI16F32SIMDDivergence(unittest.TestCase):
             self.assertEqual(state.get_vgpr(lane, 0), expected)
 
 
+# ==============================================================================
+# Commit 5: Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestValuCvtPknormI16F32RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing hazards and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_dst_alias_src0(self) -> None:
+        """Verify dst == src0 reads original src0 before destination overwrite."""
+        state = ScalarMachineState()
+        state.set_vgpr(0, POS_ONE_F32)   # src0 initial: +1.0f
+        state.set_vgpr(1, NEG_ONE_F32)   # src1: -1.0f
+
+        instr = VCvtPknormI16F32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+        )
+
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(res, 0x80017FFF)
+        self.assertEqual(state.get_vgpr(0), 0x80017FFF)
+        self.assertEqual(state.get_vgpr(1), NEG_ONE_F32)  # src1 preserved
+
+    def test_dst_alias_src1(self) -> None:
+        """Verify dst == src1 reads original src1 before destination overwrite."""
+        state = ScalarMachineState()
+        state.set_vgpr(1, POS_ONE_F32)   # src0: +1.0f
+        state.set_vgpr(0, NEG_ONE_F32)   # src1 initial: -1.0f
+
+        instr = VCvtPknormI16F32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(1, RegType.VGPR)),
+            src1=VOP3Operand(Reg(0, RegType.VGPR)),
+        )
+
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(res, 0x80017FFF)
+        self.assertEqual(state.get_vgpr(0), 0x80017FFF)
+        self.assertEqual(state.get_vgpr(1), POS_ONE_F32)  # src0 preserved
+
+    def test_full_self_aliasing(self) -> None:
+        """Verify dst == src0 == src1 correctly converts and duplicates channels."""
+        state = ScalarMachineState()
+        state.set_vgpr(7, POS_HALF_F32)  # +0.5f
+
+        instr = VCvtPknormI16F32Instruction(
+            dst=Reg(7, RegType.VGPR),
+            src0=VOP3Operand(Reg(7, RegType.VGPR)),
+            src1=VOP3Operand(Reg(7, RegType.VGPR)),
+        )
+
+        res = self.scalar_interp.step(instr, state)
+        # Both channels convert +0.5f -> 0x4000
+        self.assertEqual(res, 0x40004000)
+        self.assertEqual(state.get_vgpr(7), 0x40004000)
+
+    def test_src0_alias_src1_distinct_dst(self) -> None:
+        """Verify src0 == src1 with distinct dst preserves source register."""
+        state = ScalarMachineState()
+        state.set_vgpr(1, NEG_ONE_F32)
+
+        instr = VCvtPknormI16F32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(1, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+        )
+
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(res, 0x80018001)
+        self.assertEqual(state.get_vgpr(0), 0x80018001)
+        self.assertEqual(state.get_vgpr(1), NEG_ONE_F32)  # Source untouched
+
+    def test_aliased_operand_with_modifiers(self) -> None:
+        """Verify self-aliased register with asymmetric channel modifiers."""
+        state = ScalarMachineState()
+        state.set_vgpr(2, NEG_HALF_F32)  # -0.5f
+
+        # src0: abs(-0.5) = +0.5 -> 0x4000
+        # src1: neg(-0.5) = +0.5 -> 0x4000
+        instr = VCvtPknormI16F32Instruction(
+            dst=Reg(2, RegType.VGPR),
+            src0=VOP3Operand(Reg(2, RegType.VGPR), abs_mod=True),
+            src1=VOP3Operand(Reg(2, RegType.VGPR), neg_mod=True),
+        )
+
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(res, 0x40004000)
+        self.assertEqual(state.get_vgpr(2), 0x40004000)
+
+    def test_sequential_chained_aliasing(self) -> None:
+        """Verify sequential dependent instructions with aliased registers."""
+        state = ScalarMachineState()
+        state.set_vgpr(0, POS_ONE_F32)
+
+        # Step 1: v0 = pack(v0, 0.0) -> (0x0000, 0x7FFF) = 0x00007FFF
+        instr1 = VCvtPknormI16F32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Literal32.from_float(0.0)),
+        )
+        res1 = self.scalar_interp.step(instr1, state)
+        self.assertEqual(res1, 0x00007FFF)
+        self.assertEqual(state.get_vgpr(0), 0x00007FFF)
+
+        # Step 2: v0 is now a subnormal float in IEEE 754 (bits 0x00007FFF).
+        # v1 = pack(v0, v0). Subnormals underflow to 0.
+        instr2 = VCvtPknormI16F32Instruction(
+            dst=Reg(1, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(0, RegType.VGPR)),
+        )
+        res2 = self.scalar_interp.step(instr2, state)
+        self.assertEqual(res2, 0x00000000)
+        self.assertEqual(state.get_vgpr(1), 0x00000000)
+        self.assertEqual(state.get_vgpr(0), 0x00007FFF)
+
+    def test_simd_aliasing_with_inactive_lanes(self) -> None:
+        """Verify SIMD self-aliasing correctly preserves inactive lanes."""
+        state = SIMDState(num_lanes=32, exec_mask=0x0000FFFF)  # Low 16 lanes active
+        initial_val = POS_ONE_F32
+
+        for lane in range(32):
+            state.set_vgpr(lane, 0, initial_val)
+
+        instr = VCvtPknormI16F32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(0, RegType.VGPR)),
+        )
+
+        results = self.simd_interp.step(instr, state)
+        for lane in range(32):
+            if lane < 16:
+                self.assertEqual(results[lane], 0x7FFF7FFF)
+                self.assertEqual(state.get_vgpr(lane, 0), 0x7FFF7FFF)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.get_vgpr(lane, 0), initial_val)
+
+
 if __name__ == "__main__":
     unittest.main()
