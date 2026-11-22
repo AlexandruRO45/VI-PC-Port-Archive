@@ -1241,5 +1241,199 @@ class TestDivFixupF32RegisterAliasing(unittest.TestCase):
             self.assertEqual(wave.get_lane_vgpr_f32(lane, 0), expected)
 
 
+class StatusFlags:
+    """IEEE 754 exception flags and architectural condition codes for an operation."""
+
+    def __init__(
+        self,
+        *,
+        invalid: bool = False,
+        div_by_zero: bool = False,
+        overflow: bool = False,
+        underflow: bool = False,
+        inexact: bool = False,
+        is_negative: bool = False,
+        is_zero: bool = False,
+        is_inf: bool = False,
+        is_nan: bool = False,
+        is_subnormal: bool = False,
+    ) -> None:
+        self.invalid = invalid
+        self.div_by_zero = div_by_zero
+        self.overflow = overflow
+        self.underflow = underflow
+        self.inexact = inexact
+        self.is_negative = is_negative
+        self.is_zero = is_zero
+        self.is_inf = is_inf
+        self.is_nan = is_nan
+        self.is_subnormal = is_subnormal
+
+    def __repr__(self) -> str:
+        flags = [k for k, v in self.__dict__.items() if v]
+        return f"StatusFlags({', '.join(flags)})"
+
+
+def compute_div_fixup_status_flags(
+    s0_bits: int,
+    s1_bits: int,
+    s2_bits: int,
+    *,
+    src0_neg: bool = False,
+    src0_abs: bool = False,
+    src1_neg: bool = False,
+    src1_abs: bool = False,
+    src2_neg: bool = False,
+    src2_abs: bool = False,
+    clamp: bool = False,
+    omod: int = 0,
+) -> tuple[int, StatusFlags]:
+    """Compute v_div_fixup_f32 result along with IEEE 754 status flags and condition codes."""
+    s0 = apply_src_mods_f32(s0_bits, neg=src0_neg, abs_val=src0_abs)
+    s1 = apply_src_mods_f32(s1_bits, neg=src1_neg, abs_val=src1_abs)
+    s2 = apply_src_mods_f32(s2_bits, neg=src2_neg, abs_val=src2_abs)
+
+    invalid = False
+    div_by_zero = False
+    overflow = False
+    underflow = False
+    inexact = False
+
+    # Invalid operations:
+    if is_f32_snan(s0) or is_f32_snan(s1) or is_f32_snan(s2):
+        invalid = True
+    elif is_f32_zero(s1) and is_f32_zero(s2):
+        invalid = True
+    elif is_f32_inf(s1) and is_f32_inf(s2):
+        invalid = True
+
+    # Division by zero: finite nonzero numerator / zero denominator
+    if is_f32_zero(s1) and not is_f32_zero(s2) and not is_f32_nan(s2) and not is_f32_inf(s2):
+        div_by_zero = True
+
+    # Underflow check
+    if not is_f32_nan(s1) and not is_f32_nan(s2) and not is_f32_zero(s1) and not is_f32_zero(s2):
+        if (f32_unbiased_exponent(s2) - f32_unbiased_exponent(s1)) < -150:
+            underflow = True
+
+    # Compute result
+    res_bits = ref_div_fixup_f32(
+        s0_bits, s1_bits, s2_bits,
+        src0_neg=src0_neg, src0_abs=src0_abs,
+        src1_neg=src1_neg, src1_abs=src1_abs,
+        src2_neg=src2_neg, src2_abs=src2_abs,
+        clamp=clamp, omod=omod,
+    )
+
+    if is_f32_nan(s0) and not is_f32_nan(s1) and not is_f32_nan(s2):
+        overflow = True
+
+    if is_f32_subnormal(res_bits):
+        underflow = True
+
+    is_neg = (res_bits & F32_SIGN_MASK) != 0
+    is_nan = is_f32_nan(res_bits)
+    is_inf = is_f32_inf(res_bits)
+    is_zero = is_f32_zero(res_bits)
+    is_subnormal = is_f32_subnormal(res_bits)
+
+    flags = StatusFlags(
+        invalid=invalid,
+        div_by_zero=div_by_zero,
+        overflow=overflow,
+        underflow=underflow,
+        inexact=inexact,
+        is_negative=is_neg,
+        is_zero=is_zero,
+        is_inf=is_inf,
+        is_nan=is_nan,
+        is_subnormal=is_subnormal,
+    )
+    return res_bits, flags
+
+
+def evaluate_vcc_predicate(wave: SIMDWaveState, reg_idx: int, predicate: str) -> int:
+    """Generate 64-bit VCC mask evaluating condition on reg_idx across all active lanes."""
+    vcc = 0
+    for lane in range(wave.wave_size):
+        if (wave.exec_mask >> lane) & 1:
+            val = wave.get_lane_vgpr_f32(lane, reg_idx)
+            cond = False
+            if predicate == "eq_zero":
+                cond = (val == 0.0)
+            elif predicate == "ge_zero":
+                cond = not math.isnan(val) and val >= 0.0
+            elif predicate == "lt_zero":
+                cond = not math.isnan(val) and val < 0.0
+            elif predicate == "is_nan":
+                cond = math.isnan(val)
+            elif predicate == "is_finite":
+                cond = math.isfinite(val)
+            else:
+                raise ValueError(f"Unknown predicate: {predicate}")
+
+            if cond:
+                vcc |= (1 << lane)
+    return vcc
+
+
+class TestDivFixupF32StatusFlagsAndConditionCodes(unittest.TestCase):
+    """Test suite for IEEE 754 status flags, condition codes, and VCC generation."""
+
+    def test_invalid_operation_flags(self):
+        # 0.0 / 0.0 -> invalid
+        res1, flags1 = compute_div_fixup_status_flags(F32_POS_ZERO, F32_POS_ZERO, F32_POS_ZERO)
+        self.assertTrue(flags1.invalid)
+        self.assertTrue(flags1.is_nan)
+        self.assertEqual(res1, F32_INDEFINITE_QNAN)
+
+        # inf / inf -> invalid
+        res2, flags2 = compute_div_fixup_status_flags(F32_POS_INF, F32_POS_INF, F32_POS_INF)
+        self.assertTrue(flags2.invalid)
+        self.assertTrue(flags2.is_nan)
+        self.assertEqual(res2, F32_INDEFINITE_QNAN)
+
+    def test_div_by_zero_flag(self):
+        # 5.0 / 0.0 -> div_by_zero
+        res, flags = compute_div_fixup_status_flags(f32_to_u32(1.0), F32_POS_ZERO, f32_to_u32(5.0))
+        self.assertTrue(flags.div_by_zero)
+        self.assertTrue(flags.is_inf)
+        self.assertFalse(flags.is_negative)
+        self.assertEqual(res, F32_POS_INF)
+
+    def test_underflow_and_overflow_flags(self):
+        # Exponent underflow
+        s2 = f32_to_u32(2.0 ** -120)
+        s1 = f32_to_u32(2.0 ** 35)
+        res_u, flags_u = compute_div_fixup_status_flags(F32_ONE, s1, s2)
+        self.assertTrue(flags_u.underflow)
+        self.assertTrue(flags_u.is_zero)
+
+        # S0 NaN overflow
+        res_o, flags_o = compute_div_fixup_status_flags(F32_CANONICAL_QNAN, F32_ONE, F32_ONE)
+        self.assertTrue(flags_o.overflow)
+        self.assertTrue(flags_o.is_inf)
+
+    def test_condition_codes_signed_zeros(self):
+        res, flags = compute_div_fixup_status_flags(F32_POS_ZERO, F32_ONE, F32_NEG_ZERO)
+        self.assertTrue(flags.is_zero)
+        self.assertTrue(flags.is_negative)
+
+    def test_vcc_predicate_mask_generation(self):
+        wave = SIMDWaveState(wave_size=64)
+        wave.exec_lo = 0xFFFFFFFF
+        wave.exec_hi = 0x00000000
+
+        for lane in range(64):
+            val = 2.0 if (lane % 2 == 0) else -2.0
+            wave.set_lane_vgpr_f32(lane, 0, val)
+
+        vcc_ge = evaluate_vcc_predicate(wave, 0, "ge_zero")
+        self.assertEqual(vcc_ge, 0x55555555)
+
+        vcc_lt = evaluate_vcc_predicate(wave, 0, "lt_zero")
+        self.assertEqual(vcc_lt, 0xAAAAAAAA)
+
+
 if __name__ == "__main__":
     unittest.main()
