@@ -28,6 +28,9 @@ import sys
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from build import TARGET_CASES  # noqa: E402  (color targets of the typed-SV_Target pixel tests)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXE = ".exe" if os.name == "nt" else ""
 UNSUPPORTED = 77                                       # a test tool exits with this when the device lacks a feature
@@ -333,6 +336,11 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               # v_mad_u32_u16 / v_mad_i32_i16 and v_subrev_f16, which had CPU checks only (derivations in the .asm headers)
               "ps_valu16_mad": (0x00000002, 0x00030002, 0x00008000, 0x00000004),
               "ps_valu16_subrev": (0xaaaabc00, 0xaaaac000, 0xaaaa3c00, 0x42003800),
+              # typed SV_Target and compr decoding (EGEN-PS-MRT-TYPES; color targets in build.TARGET_CASES)
+              "ps_mrt_uint": (0x00007fff, 0x00008001, 0x00003c01, 0x0000c000),
+              "ps_mrt_sint": (0x00007fff, 0xffff8001, 0x00003c01, 0xffffc000),
+              "ps_compr_unorm16": (0x8000ffff, 0x40000000),     # RGBA16_UNORM texel
+              "ps_compr_snorm16": (0x40008001, 0xc0002000),     # RGBA16_SNORM texel
               # v_readlane_b32 across both halves of a wave64 (the .asm header derives the words)
               "ps_w64x_readlane": (0x40000079, 0x40000010, 0x40000064, 0x400000be)}
 # Pixel shaders that are exact only when the pixel stage really ran 64 lanes wide. vk_harness says so when it chained
@@ -939,6 +947,8 @@ def pixels(tools, spirv, name, fmt, vertex="vs_ids"):
     env = dict(os.environ, VKH_SUBGROUP_SIZE=str(sg)) if sg else None
     if name in PIXEL_ENV:
         env = dict(env or os.environ, **PIXEL_ENV[name])
+    if name in TARGET_CASES:   # another color target than RGBA32F (EGEN-PS-MRT-TYPES)
+        env = dict(env or os.environ, VKH_COLOR_FORMAT=TARGET_CASES[name][1])
     gs = os.path.join(spirv, name + ".bary_gs.spv")
     if BARY_FALLBACK and os.path.isfile(gs):
         env = dict(env or os.environ, VKH_GS=gs, VKH_GS_HELPER="1")
@@ -951,7 +961,7 @@ def pixels(tools, spirv, name, fmt, vertex="vs_ids"):
         if code or not raw.is_file():
             return None, out
         data = raw.read_bytes()
-    if len(data) != 64 * 64 * 16:  # default harness viewport, four 32-bit components per pixel
+    if len(data) != 64 * 64 * struct.calcsize(fmt):  # default harness viewport, one texel per pixel
         return None, out
     return list(struct.iter_unpack(fmt, data)), out
 
@@ -1241,6 +1251,8 @@ def pixel_test(tools, spirv, name):
     if name == "ps_interp_f16_high" and BARY_FALLBACK and not F16_HALVES:   # with F16_HALVES it reads decoded halves
         return Skip("SKIP (per-vertex interpolants need VK_KHR_fragment_shader_barycentric)")
     fmt = "<4f" if name == "ps_bary" else "<2I2f" if name in ("ps_flat", "ps_uniform_branch", "ps_scc_mask32") else "<4I"
+    if name in TARGET_CASES:
+        fmt = f"<{int(TARGET_CASES[name][1].split(':')[1]) // 4}I"
     px, out = pixels(tools, spirv, name, fmt, PIXEL_VERTEX.get(name, "vs_ids"))
     if isinstance(px, Skip):   # exit 77: the device cannot run this shader (e.g. no barycentrics)
         m = re.search(r"unsupported: .*", out)

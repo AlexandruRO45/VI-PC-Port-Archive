@@ -24,7 +24,7 @@ TRANSLATOR = os.path.join(ROOT, "tools", "rdna2spirv.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mc_command  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
-from build import CLIP_CASES, clip_container, shader_source
+from build import CLIP_CASES, TARGET_CASES, clip_container, shader_source, target_container
 from check import Skip, clip_test, fmt_1010102_test, fmt_int_narrow_test, fmt_sint32_test, fmt_xy_xyz_test, tbuffer_store_test
 from compute_fixture import compute_header
 from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
@@ -330,8 +330,14 @@ def judge_cs_dump(rc: int, msg: str, want: list[int], *, wave64: bool, partial: 
     return words_match(vals, want), " ".join((hex if hexwords else str)(x) for x in vals)
 
 
-def check_pixel_const(raw_path: str, want: tuple[int, int, int, int]) -> tuple[bool, str]:
-    px = read_raw_u32(raw_path)
+def check_pixel_const(raw_path: str, want: tuple[int, ...]) -> tuple[bool, str]:
+    if len(want) == 4:
+        px = read_raw_u32(raw_path)
+    else:   # a narrower color target (TARGET_CASES): one texel of len(want) dwords per pixel
+        with open(raw_path, "rb") as source:
+            data = source.read()
+        step = 4 * len(want)
+        px = [struct.unpack_from(f"<{len(want)}I", data, i) for i in range(0, len(data) - len(data) % step, step)]
     if len(px) != 64 * 64:
         return False, f"expected 4096 pixels, got {len(px)}"
     bad = [(i, p) for i, p in enumerate(px) if p != want]
@@ -684,6 +690,8 @@ def run_suite(a, work: str) -> int:
             ])
         elif name in ("ms_tri", "ms_w64x_ballot", "ms_wave_info_s3", "ms_f16_pack"):
             dxbc = make_dxbc([(b"PSV0", make_ms_psv0(128, 64, 64, 2))])
+        elif name in TARGET_CASES:
+            dxbc = target_container(TARGET_CASES[name][0])
         elif name == "ms_v5_workgroup":
             dxbc = make_dxbc([(b"PSV0", make_ms_psv0(32, 3, 1, group_shared=128))])
         elif name == "ms_clip":
@@ -1107,6 +1115,8 @@ def run_suite(a, work: str) -> int:
                     continue
                 vs = os.path.join(spirv_dir, PIXEL_VERTEX[name] + ".spv")
             env = dict(gfx_env or os.environ, **PIXEL_ENV[name]) if name in PIXEL_ENV else gfx_env
+            if name in TARGET_CASES:   # another color target than RGBA32F (EGEN-PS-MRT-TYPES)
+                env = dict(env or os.environ, VKH_COLOR_FORMAT=TARGET_CASES[name][1])
             bary_gs = os.path.join(spirv_dir, f"{name}.bary_gs.spv")
             if bary_fallback() and os.path.isfile(bary_gs):   # --bary-fallback PS: barycentrics from this GS
                 env = dict(env or os.environ, VKH_GS=bary_gs, VKH_GS_HELPER="1")
@@ -1165,6 +1175,11 @@ def run_suite(a, work: str) -> int:
                 # v_mad_u32_u16 / v_mad_i32_i16 and v_subrev_f16, which had CPU checks only (.asm headers)
                 "ps_valu16_mad": (0x00000002, 0x00030002, 0x00008000, 0x00000004),
                 "ps_valu16_subrev": (0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800),
+                # typed SV_Target and compr decoding (EGEN-PS-MRT-TYPES; color targets in build.TARGET_CASES)
+                "ps_mrt_uint": (0x00007FFF, 0x00008001, 0x00003C01, 0x0000C000),
+                "ps_mrt_sint": (0x00007FFF, 0xFFFF8001, 0x00003C01, 0xFFFFC000),
+                "ps_compr_unorm16": (0x8000FFFF, 0x40000000),   # RGBA16_UNORM texel
+                "ps_compr_snorm16": (0x40008001, 0xC0002000),   # RGBA16_SNORM texel
                 "ps_w64x_readlane": (0x40000079, 0x40000010, 0x40000064, 0x400000BE),   # same expectation as check.py
             }
             if skip := wide_pixel_skip(name, msg):   # a 64-wide pixel stage the device could not give: nothing to judge
@@ -1216,6 +1231,8 @@ def run_suite(a, work: str) -> int:
             else:
                 ok, detail = check_grad(raw, 0.0, 0.0)
                 results.append((name, ok, detail))
+        elif name in TARGET_CASES:
+            dxbc = target_container(TARGET_CASES[name][0])
         elif name == "ms_v5_workgroup":
             rc, msg = run_cmd(["spirv-val", "--target-env", "vulkan1.2", spv])
             if rc:

@@ -108,6 +108,21 @@ def clip_container():
             + b"OSG1" + struct.pack("<I", len(payload)) + payload)
 
 
+# Pixel shaders whose SV_Target0 has an OSG1 component type (1 uint, 2 sint, 3 float) and the color target vk_harness
+# draws them into (VKH_COLOR_FORMAT "<VkFormat>:<bytes per texel>"): EGEN-PS-MRT-TYPES.
+TARGET_CASES = {"ps_mrt_uint": (1, "107:16"),         # RGBA32_UINT
+                "ps_mrt_sint": (2, "108:16"),         # RGBA32_SINT
+                "ps_compr_unorm16": (3, "91:8"),      # RGBA16_UNORM
+                "ps_compr_snorm16": (3, "92:8")}      # RGBA16_SNORM
+
+
+def target_container(ctype):
+    # One OSG1 element: SV_Target0 (system value 64), component type ctype, register 0, xyzw, no name.
+    sig = struct.pack("<II", 1, 8) + struct.pack("<6I2B6x", 0, 0, 0, 64, ctype, 0, 0xF, 0)
+    return (b"DXBC" + bytes(16) + struct.pack("<4I", 1, 44 + len(sig), 1, 36)
+            + b"OSG1" + struct.pack("<I", len(sig)) + sig)
+
+
 def gs_container():
     # ISG1 and OSG1 of the gs_* fixtures, as scripts/run_gpu_tests.py makes them for gs_tri: SV_Position (system value
     # 1) in register 0 and TEXCOORD0 in register 1, float4 (component type 3), no names.
@@ -152,6 +167,8 @@ def translate_tests(work, names):
             (work / (n + ".dxbc")).write_bytes(clip_container())
         elif n.startswith("gs_"):
             (work / (n + ".dxbc")).write_bytes(gs_container())
+        elif n in TARGET_CASES:
+            (work / (n + ".dxbc")).write_bytes(target_container(TARGET_CASES[n][0]))
         else:
             (work / (n + ".dxbc")).write_bytes(bytes(32))  # chunk count 0
     cmd = [sys.executable, "-I", TRANSLATOR, disasm, "--out", spirv]

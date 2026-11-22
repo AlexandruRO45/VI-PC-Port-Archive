@@ -162,6 +162,8 @@ class Gen:
         self.consts = {}
         self.n = 0
         self.outputs = {}
+        self.output_types = {}     # output name -> 1 (uint) / 2 (sint) for an integer SV_Target; float otherwise
+        self.mrt_types = {}        # PS: mrt index -> OSG1 component type of its SV_Target (EGEN-PS-MRT-TYPES)
         self.inputs = {}
         self.interpolated = set()   # inputs read through v_interp_p1/p2; the rest are flat (v_interp_mov only)
         self.per_vertex = set()     # PS: attribute numbers read by a *_f16 interp: PerVertexKHR, decoded per half
@@ -9821,10 +9823,68 @@ class Gen:
             self.emit(f"OpStore %out_depth {sel}")
             return
         comps = []
+        # An SV_Target the OSG1 declares uint (1) or sint (2) is an integer output: the export's bits as they are
+        # (EGEN-PS-MRT-TYPES, measured with tools/ps_oracle.py on gfx1036: an integer target gets the exported
+        # dwords, or a compr export's 16-bit halves, bit for bit).
+        itype = (self.mrt_types.get(int(tgt[3:])) if tgt.startswith("mrt") and tgt != "mrtz" and self.stage == "ps"
+                 else None)
+        itype = itype if itype in (1, 2) else None
+        if itype:
+            ucomps = []
+            if "compr" in ins["mods"]:
+                srcs = a[1:5]
+                regs = [srcs[0], srcs[2]] if len(srcs) >= 3 else srcs[:1]
+                ext = "OpBitFieldSExtract %int" if itype == 2 else "OpBitFieldUExtract %uint"
+                for x in regs:
+                    if x["k"] == "special" and x["t"] == "off":
+                        ucomps += [self.cu(0), self.cu(0)]
+                        continue
+                    u = self.src_u(x)
+                    for off in (0, 16):
+                        h = self.tmp()
+                        src = u if itype == 1 else self.as_int(u)
+                        self.emit(f"{h} = {ext} {src} {self.cu(off)} {self.cu(16)}")
+                        if itype == 2:
+                            hu = self.tmp()
+                            self.emit(f"{hu} = OpBitcast %uint {h}")
+                            h = hu
+                        ucomps.append(h)
+            else:
+                for x in a[1:5]:
+                    ucomps.append(self.cu(0) if x["k"] == "special" and x["t"] == "off" else self.src_u(x))
+            while len(ucomps) < 4:
+                ucomps.append(self.cu(0))
+            name = f"%out_mrt{int(tgt[3:])}"
+            self.outputs[name] = tgt
+            self.output_types[name] = itype
+            vec, vt = self.tmp(), ("%v4uint_out" if itype == 1 else "%v4int_out")
+            if itype == 2:
+                icomps = []
+                for c in ucomps[:4]:
+                    ic = self.tmp()
+                    self.emit(f"{ic} = OpBitcast %int {c}")
+                    icomps.append(ic)
+                self.emit(f"{vec} = OpCompositeConstruct %v4int_out {' '.join(icomps)}")
+            else:
+                self.emit(f"{vec} = OpCompositeConstruct %v4uint_out {' '.join(ucomps[:4])}")
+            old, sel = self.tmp(), self.tmp()
+            self.emit(f"{old} = OpLoad {vt} {name}")
+            self.emit(f"{sel} = OpSelect {vt} {self.active_b()} {vec} {old}")
+            self.emit(f"OpStore {name} {sel}")
+            return
         if "compr" in ins["mods"]:
-            # Compressed export: two registers, each holding two f16 values (x,y) and (z,w). LLVM lists each register
-            # twice (one slot per half): 'exp mrt0 v4, v4, v5, v5 compr', so the pair is slots 1 and 3.
+            # Compressed export: two registers, each holding two 16-bit values (x,y) and (z,w). LLVM lists each
+            # register twice (one slot per half): 'exp mrt0 v4, v4, v5, v5 compr', so the pair is slots 1 and 3.
             # (Found by the GPU texture test: taking the first two operands exported (r,g,r,g).)
+            # The halves are f16 for an FP16_ABGR export format and unorm16 / snorm16 for UNORM16 / SNORM16 ones,
+            # which reach the render target bit for bit (measured with tools/ps_oracle.py on gfx1036). The
+            # export format follows the render target, which the shader doesn't name, so the producers of the
+            # exported registers decide (compr_kinds): v_cvt_pknorm_u16_f32 -> unorm16, v_cvt_pknorm_i16_f32 ->
+            # snorm16, anything else -> f16; the decoded value is one a UNORM16 / SNORM16 target converts back
+            # to the same bits (EGEN-PS-MRT-TYPES).
+            kind = ins.get("compr_kind", "f16")
+            if kind not in ("f16", "unorm16", "snorm16"):
+                raise Unsupported(f"compressed export of {kind} halves to a float target")
             srcs = a[1:5]
             regs = [srcs[0], srcs[2]] if len(srcs) >= 3 else srcs[:1]
             for x in regs:
@@ -9832,12 +9892,27 @@ class Gen:
                     comps += ["%f0", "%f0"]
                     continue
                 u = self.src_u(x)
-                v2 = self.tmp()
-                self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
-                for c in (0, 1):
-                    f = self.tmp()
-                    self.emit(f"{f} = OpCompositeExtract %float {v2} {c}")
-                    comps.append(f)
+                if kind == "f16":
+                    v2 = self.tmp()
+                    self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
+                    for c in (0, 1):
+                        f = self.tmp()
+                        self.emit(f"{f} = OpCompositeExtract %float {v2} {c}")
+                        comps.append(f)
+                    continue
+                for off in (0, 16):
+                    h, f, q = self.tmp(), self.tmp(), self.tmp()
+                    if kind == "unorm16":
+                        self.emit(f"{h} = OpBitFieldUExtract %uint {u} {self.cu(off)} {self.cu(16)}")
+                        self.emit(f"{f} = OpConvertUToF %float {h}")
+                        self.emit(f"{q} = OpFDiv %float {f} {self.fconst(65535.0)}")
+                    else:
+                        r = self.tmp()
+                        self.emit(f"{h} = OpBitFieldSExtract %int {self.as_int(u)} {self.cu(off)} {self.cu(16)}")
+                        self.emit(f"{f} = OpConvertSToF %float {h}")
+                        self.emit(f"{r} = OpFDiv %float {f} {self.fconst(32767.0)}")
+                        self.emit(f"{q} = OpExtInst %float %glsl FMax {r} {self.fconst(-1.0)}")
+                    comps.append(q)
         else:
             for x in a[1:5]:
                 if x["k"] == "special" and x["t"] == "off":
@@ -10355,7 +10430,12 @@ def assemble(gen):
         types.append("%v4uint_bal = OpTypeVector %uint 4")       # dedupe_types merges it with any other uvec4
     if gen.uses_bvh and not any(t.startswith("%v3float = ") for t in types):
         types.append("%v3float = OpTypeVector %float 3")
-    gvars = [f"{n} = OpVariable %_ptr_Output_v4 Output" for n in gen.outputs]
+    gvars = [f"{n} = OpVariable " + {1: "%_ptr_Output_v4u", 2: "%_ptr_Output_v4i"}.get(gen.output_types.get(n),
+                                                                                   "%_ptr_Output_v4") + " Output"
+             for n in gen.outputs]
+    if gen.output_types:
+        types += ["%v4uint_out = OpTypeVector %uint 4", "%v4int_out = OpTypeVector %int 4",
+                  "%_ptr_Output_v4u = OpTypePointer Output %v4uint_out", "%_ptr_Output_v4i = OpTypePointer Output %v4int_out"]
     # Push constants: s0..s31 user data, then the 64-bit host address of the Xbox GPU VA window (heap base).
     types += [f"%n_ud = OpConstant %uint {USER_SGPRS}", "%arr_ud = OpTypeArray %uint %n_ud",
               "%UserData = OpTypeStruct %arr_ud %uint %uint %uint %uint" + (" %uint %uint" if msc else ""),
@@ -11419,6 +11499,80 @@ def output_signature(path, name):
     return []
 
 
+def output_target_types(path, name):
+    """{render target (SV_Target semantic index = mrt n): OSG1 component type} for the PS's SV_Target elements
+    (system value 64, D3D_NAME_TARGET): 1 uint, 2 sint, 3 float."""
+    return {sem: ctype for reg, sem, sv, ctype in _osg1_elements(path, name) if sv == 64}
+
+
+def _osg1_elements(path, name):
+    """OSG1 elements as (register, semantic_index, system_value, component_type); [] without a DXBC or OSG1."""
+    dxbc = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), name + ".dxbc")
+    if not os.path.isfile(dxbc):
+        return []
+    with open(dxbc, "rb") as f:
+        d = f.read()
+    for k in range(struct.unpack_from("<I", d, 28)[0]):
+        off = struct.unpack_from("<I", d, 32 + 4 * k)[0]
+        if d[off:off + 4] == b"OSG1":
+            p = d[off + 8:off + 8 + struct.unpack_from("<I", d, off + 4)[0]]
+            cnt, eo = struct.unpack_from("<II", p, 0)
+            out = []
+            for i in range(cnt):
+                _, _, sem_idx, sysv, ctype, reg = struct.unpack_from("<6I", p, eo + 32 * i)
+                out.append((reg, sem_idx, sysv, ctype))
+            return out
+    return []
+
+
+# Producers of a compressed export's register and what they pack (compr_kinds).
+COMPR_PRODUCERS = {"v_cvt_pknorm_u16_f32": "unorm16", "v_cvt_pknorm_i16_f32": "snorm16",
+                   "v_cvt_pk_u16_u32": "uint16", "v_cvt_pk_i16_i32": "sint16"}
+
+
+def compr_kinds(insns):
+    """Annotate each `exp ... compr` with compr_kind: what its two registers hold, from every instruction in the
+    shader that writes them (plain v_mov_b32 copies followed): "unorm16" / "snorm16" when every write is a
+    v_cvt_pknorm_u16_f32 / v_cvt_pknorm_i16_f32, "uint16" / "sint16" for v_cvt_pk_u16_u32 / v_cvt_pk_i16_i32,
+    "f16" when none is one of those (v_cvt_pkrtz_f16_f32, v_pack_b32_f16, other ALU), and "mixed" otherwise
+    (export() refuses it rather than guess)."""
+    writes = {}
+    for ins in insns:
+        a = ins["args"]
+        if not (a and a[0].get("k") == "vgpr") or base_op(ins["op"]) == "exp" or base_op(ins["op"]).startswith(
+                ("buffer_store", "tbuffer_store", "scratch_store", "global_store", "image_store", "ds_write")):
+            continue
+        op = base_op(ins["op"])
+        s = a[1] if len(a) > 1 else None
+        if (op == "v_mov_b32" and not ins["mods"] and s is not None and s.get("k") == "vgpr" and s.get("n", 1) == 1
+                and not s.get("neg") and not s.get("abs") and not s.get("sdwa_sel") and not a[0].get("sdwa_dst")):
+            what = ("copy", s["r"])
+        else:
+            what = COMPR_PRODUCERS.get(op, "f16")
+        for r in range(a[0]["r"], a[0]["r"] + a[0].get("n", 1)):
+            writes.setdefault(r, []).append(what)
+
+    def kinds(r, seen=()):
+        out = set()
+        for w in writes.get(r, ()):
+            if isinstance(w, tuple):
+                out |= {"f16"} if w[1] in seen else kinds(w[1], seen + (r,))
+            else:
+                out.add(w)
+        return out
+
+    for ins in insns:
+        if base_op(ins["op"]) != "exp" or "compr" not in ins["mods"]:
+            continue
+        srcs = ins["args"][1:5]
+        regs = [srcs[0], srcs[2]] if len(srcs) >= 3 else srcs[:1]
+        ks = set()
+        for x in regs:
+            if x.get("k") == "vgpr":
+                ks |= kinds(x["r"]) or {"f16"}
+        ins["compr_kind"] = ks.pop() if len(ks) == 1 else ("f16" if not ks else "mixed")
+
+
 def output_signature_full(path, name):
     """OSG1 elements as (register, semantic_index, system_value, mask, rw_mask)."""
     dxbc = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), name + ".dxbc")
@@ -11839,6 +11993,8 @@ def translate(path):
     insns = fold_far_branches(insns)
     if stage == "ps":
         g.v_interp_copy = interp_copy_sources(insns)   # before v_interp runs: I/J guards (SHADER-177)
+        g.mrt_types = output_target_types(path, info["name"])
+        compr_kinds(insns)
         # SHADER-177: annotate v_interp sites whose I/J operand is a computed pair, and let those
         # attributes be read per-vertex (attribute() weights them with the operand values).
         g.per_vertex |= interp_ij_analysis(insns, g)
