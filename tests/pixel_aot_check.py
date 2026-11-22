@@ -3635,6 +3635,9 @@ def check_nc_integer_lowering():
     sub_source = translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", "v_sub_nc_u32_e64 v12, s44, v18"]))
     rev_source = translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", "v_subrev_nc_u32_e64 v12, s44, v18"]))
     assert sub_source != rev_source
+    # A float-written inline constant on an integer form is taken as its binary32 bits, as for the #495 forms.
+    float_source = translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", "v_add_nc_u32_e64 v12, 1.0, v18"]))
+    assert "1065353216u" in float_source, float_source
     # Each refused spelling is paired with its nearest accepted one, so a refusal for another reason shows up.
     for bad, good in (
         ("v_add_nc_u32_e64 v12, s44, v18 clamp", "v_add_nc_u32_e64 v12, s44, v18"),
@@ -3644,7 +3647,7 @@ def check_nc_integer_lowering():
         ("v_add_nc_i32_e64 v12, s44, v18", "v_add_nc_i32 v12, s44, v18"),
         ("v_sub_nc_u32_e64 v12, abs(v18), v18", "v_sub_nc_u32_e64 v12, v18, v18"),
         ("v_add_nc_u32_e64 v12, s44, -v18", "v_add_nc_u32_e64 v12, s44, v18"),
-        ("v_subrev_nc_u32_dpp v12, v18, v18 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+        ("v_subrev_nc_u32_dpp v12, v18, v18 row_shl:1 row_mask:0xf bank_mask:0xf",
          "v_subrev_nc_u32_e32 v12, v18, v18"),
         ("v_subrev_nc_u32_sdwa v12, v18, v18 src0_sel:DWORD src1_sel:DWORD",
          "v_subrev_nc_u32_e32 v12, v18, v18"),
