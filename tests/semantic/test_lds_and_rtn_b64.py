@@ -100,6 +100,26 @@ def compute_and_popcount_u64(a: int, b: int) -> int:
     return bin(u64(a) & u64(b)).count("1")
 
 
+def bits_to_f64(bits: int) -> float:
+    """Interpret 64-bit unsigned integer as IEEE 754 double-precision float."""
+    return struct.unpack("<d", struct.pack("<Q", bits & MASK64))[0]
+
+
+def f64_to_bits(val: float) -> int:
+    """Pack IEEE 754 double-precision float into 64-bit unsigned integer."""
+    return struct.unpack("<Q", struct.pack("<d", val))[0]
+
+
+def is_f64_nan(bits: int) -> bool:
+    """Test if 64-bit bit pattern represents an IEEE 754 double NaN."""
+    return (bits & 0x7FF0000000000000) == 0x7FF0000000000000 and (bits & 0x000FFFFFFFFFFFFF) != 0
+
+
+def is_f64_subnormal(bits: int) -> bool:
+    """Test if 64-bit bit pattern represents an IEEE 754 double subnormal float."""
+    return (bits & 0x7FF0000000000000) == 0 and (bits & 0x000FFFFFFFFFFFFF) != 0
+
+
 def ref_ds_and_rtn_b64(
     mem: LDSMemory,
     vaddr: int,
@@ -722,6 +742,73 @@ class TestConditionCodesAndFlags(unittest.TestCase):
 
         self.assertEqual(compute_and_popcount_u64(0x0F, 0x07), 3)
         self.assertEqual(compute_and_popcount_u64(ALL_ONES_F64, ALL_ONES_F64), 64)
+
+
+class TestIEEE754BitPatternHandling(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+
+    def test_float_helper_utilities(self) -> None:
+        self.assertTrue(is_f64_nan(QNAN_F64))
+        self.assertTrue(is_f64_nan(SNAN_F64))
+        self.assertFalse(is_f64_nan(POS_INF_F64))
+        self.assertFalse(is_f64_nan(POS_ZERO_F64))
+
+        self.assertTrue(is_f64_subnormal(MIN_SUBNORMAL_F64))
+        self.assertTrue(is_f64_subnormal(MAX_SUBNORMAL_F64))
+        self.assertFalse(is_f64_subnormal(MIN_NORMAL_F64))
+        self.assertFalse(is_f64_subnormal(POS_ZERO_F64))
+
+    def test_signed_zeros_handling(self) -> None:
+        state = ScalarMachineState(lds_bytes=1024)
+        state.lds.write_qword(16, NEG_ZERO_F64)
+        state.set_vgpr(2, 16)
+        state.set_vgpr64(RegPair(4), ALL_ONES_F64)
+
+        instr = DSAndRtnB64Instruction(
+            dst=RegPair(0),
+            addr=RegSingle(2),
+            data=RegPair(4),
+        )
+        old_val = self.interp.execute(instr, state)
+
+        self.assertEqual(old_val, NEG_ZERO_F64)
+        self.assertEqual(state.get_vgpr64(RegPair(0)), NEG_ZERO_F64)
+        self.assertEqual(state.lds.read_qword(16), NEG_ZERO_F64)
+
+    def test_infinities_and_nans_without_quietening(self) -> None:
+        state = ScalarMachineState(lds_bytes=1024)
+        state.lds.write_qword(24, SNAN_F64)
+        state.set_vgpr(2, 24)
+        state.set_vgpr64(RegPair(4), 0x7FFFFFFFFFFFFFFF)  # Clear sign bit
+
+        instr = DSAndRtnB64Instruction(
+            dst=RegPair(0),
+            addr=RegSingle(2),
+            data=RegPair(4),
+        )
+        old_val = self.interp.execute(instr, state)
+
+        self.assertEqual(old_val, SNAN_F64)
+        self.assertEqual(state.lds.read_qword(24), SNAN_F64 & 0x7FFFFFFFFFFFFFFF)
+
+    def test_subnormals_without_flushing_to_zero(self) -> None:
+        state = ScalarMachineState(lds_bytes=1024)
+        state.lds.write_qword(32, MIN_SUBNORMAL_F64)
+        state.set_vgpr(2, 32)
+        state.set_vgpr64(RegPair(4), ALL_ONES_F64)
+
+        instr = DSAndRtnB64Instruction(
+            dst=RegPair(0),
+            addr=RegSingle(2),
+            data=RegPair(4),
+        )
+        old_val = self.interp.execute(instr, state)
+
+        self.assertEqual(old_val, MIN_SUBNORMAL_F64)
+        self.assertEqual(state.lds.read_qword(32), MIN_SUBNORMAL_F64)
 
 
 if __name__ == '__main__':
