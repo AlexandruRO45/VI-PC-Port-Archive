@@ -724,5 +724,32 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
 
 
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Phase 7: Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormal_float_matching(self) -> None:
+        self.assertTrue(is_f32_subnormal(MIN_SUBNORMAL_F32))
+        self.assertTrue(is_f32_subnormal(MAX_SUBNORMAL_F32))
+
+        old, mem, swapped = ref_ds_cmpst_f32(MIN_SUBNORMAL_F32, MIN_SUBNORMAL_F32, MAX_SUBNORMAL_F32)
+        self.assertTrue(swapped)
+        self.assertEqual(old, MIN_SUBNORMAL_F32)
+        self.assertEqual(mem, MAX_SUBNORMAL_F32)
+
+    def test_snan_preserved_no_quietening(self) -> None:
+        self.assertTrue(is_f32_nan(SNAN_F32))
+        old, mem, swapped = ref_ds_cmpst_f32(SNAN_F32, SNAN_F32, 0x1234)
+        # NaNs compare unordered, so exchange fails; SNAN is preserved in memory
+        self.assertFalse(swapped)
+        self.assertEqual(mem, SNAN_F32)
+        self.assertNotEqual(mem, QNAN_F32)
+
+    def test_infinities_distinct(self) -> None:
+        old, mem, swapped = ref_ds_cmpst_f32(POS_INF_F32, NEG_INF_F32, 0)
+        self.assertFalse(swapped)
+        self.assertEqual(mem, POS_INF_F32)
+
+
+
 if __name__ == "__main__":
     unittest.main()
