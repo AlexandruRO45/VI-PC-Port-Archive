@@ -243,7 +243,7 @@ async function freecamFixture(requestPointerLock = async () => { throw new Error
         down: button => canvasEvents.get('mousedown')({ button }),
         up: button => windowEvents.get('mouseup')({ button }),
         move: buttons => windowEvents.get('mousemove')({ buttons, movementX: 10, movementY: 0 }),
-        wheel: (deltaX, deltaY) => windowEvents.get('wheel')({ deltaX, deltaY }),
+        wheel: event => windowEvents.get('wheel')(event),
         key: (code, modifiers) => windowEvents.get('keydown')({ code, ...modifiers }),
         blur: () => windowEvents.get('blur')(),
     };
@@ -269,13 +269,22 @@ test('a rejection and a pointerlockerror show the drag hint only once', async ()
 test('only vertical wheel movement changes camera speed', async () => {
     const cam = await freecamFixture();
     const initialSpeed = cam.speed();
-    cam.wheel(10, 0);
+    cam.wheel({ deltaX: 10, deltaY: 0 });
     assert.equal(cam.speed(), initialSpeed);
-    cam.wheel(0, -10);
+    cam.wheel({ deltaX: 0, deltaY: -10 });
     assert.ok(cam.speed() > initialSpeed);
     const fasterSpeed = cam.speed();
-    cam.wheel(0, 10);
+    cam.wheel({ deltaX: 0, deltaY: 10 });
     assert.ok(cam.speed() < fasterSpeed);
+});
+
+test('Ctrl-wheel browser zoom leaves camera speed alone', async () => {
+    const cam = await freecamFixture();
+    const initialSpeed = cam.speed();
+    cam.wheel({ deltaY: -10, ctrlKey: true });
+    assert.equal(cam.speed(), initialSpeed);
+    cam.wheel({ deltaY: 10, ctrlKey: true });
+    assert.equal(cam.speed(), initialSpeed);
 });
 
 test('drag-to-look requires a primary press and ignores a secondary release', async () => {
