@@ -348,6 +348,76 @@ def instruction_to_ast(inst: Instruction) -> PackI16Expr:
     return PackI16Expr(lo=F32ToI16Expr(s0_expr), hi=F32ToI16Expr(s1_expr))
 
 
+# ---------------------------------------------------------------------------
+# Deterministic Scalar Instruction Interpreter
+# ---------------------------------------------------------------------------
+
+class ScalarVALUInterpreter:
+    """Deterministic scalar architectural interpreter for RDNA2 VALU operations."""
+
+    def __init__(self) -> None:
+        self.vgprs: list[int] = [0] * 256
+        self.sgprs: list[int] = [0] * 106
+        self.trace: list[str] = []
+
+    def read_reg_u32(self, kind: RegKind, idx: int) -> int:
+        if kind == RegKind.VGPR:
+            if not (0 <= idx < 256):
+                raise IndexError(f"VGPR index out of bounds [0, 255]: {idx}")
+            return self.vgprs[idx]
+        elif kind == RegKind.SGPR:
+            if not (0 <= idx < 106):
+                raise IndexError(f"SGPR index out of bounds [0, 105]: {idx}")
+            return self.sgprs[idx]
+        raise TypeError(f"Unknown register kind: {kind}")
+
+    def write_reg_u32(self, kind: RegKind, idx: int, val: int) -> None:
+        val_norm = u32(val)
+        if kind == RegKind.VGPR:
+            if not (0 <= idx < 256):
+                raise IndexError(f"VGPR index out of bounds [0, 255]: {idx}")
+            self.vgprs[idx] = val_norm
+        elif kind == RegKind.SGPR:
+            if not (0 <= idx < 106):
+                raise IndexError(f"SGPR index out of bounds [0, 105]: {idx}")
+            self.sgprs[idx] = val_norm
+        else:
+            raise TypeError(f"Unknown register kind: {kind}")
+
+    def read_operand(self, op: Operand) -> int:
+        if isinstance(op, Register):
+            return self.read_reg_u32(op.kind, op.index)
+        elif isinstance(op, Immediate):
+            return u32(op.value)
+        raise TypeError(f"Unsupported operand type: {type(op).__name__}")
+
+    def step(self, inst: Instruction) -> int:
+        if inst.opcode == Opcode.S_MOV_B32:
+            val = self.read_operand(inst.src0)
+            self.write_reg_u32(inst.dst.kind, inst.dst.index, val)
+            self.trace.append(f"{inst.to_assembly()} => {val:#010x}")
+            return val
+        elif inst.opcode == Opcode.V_MOV_B32:
+            val = self.read_operand(inst.src0)
+            self.write_reg_u32(inst.dst.kind, inst.dst.index, val)
+            self.trace.append(f"{inst.to_assembly()} => {val:#010x}")
+            return val
+        elif inst.opcode == Opcode.V_CVT_PK_I16_F32:
+            assert inst.src1 is not None
+            s0 = self.read_operand(inst.src0)
+            s1 = self.read_operand(inst.src1)
+            res = ref_cvt_pk_i16_f32(s0, s1)
+            self.write_reg_u32(inst.dst.kind, inst.dst.index, res)
+            self.trace.append(f"{inst.to_assembly()} => {res:#010x}")
+            return res
+        else:
+            raise NotImplementedError(f"Unsupported opcode in scalar interpreter: {inst.opcode}")
+
+    def run(self, prog: Program) -> None:
+        for inst in prog.instructions:
+            self.step(inst)
+
+
 class TestValuCvtPkI16F32Oracle(unittest.TestCase):
     """Unit tests for the reference mathematical oracle and architectural model."""
 
@@ -480,6 +550,83 @@ class TestValuCvtPkI16F32AST(unittest.TestCase):
         imm = Immediate(42)
         with self.assertRaises(dataclasses.FrozenInstanceError):
             imm.value = 43  # type: ignore[misc]
+
+
+class TestValuCvtPkI16F32ScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction interpreter."""
+
+    def test_register_bounds_and_masking(self) -> None:
+        interp = ScalarVALUInterpreter()
+        with self.assertRaises(IndexError):
+            interp.read_reg_u32(RegKind.VGPR, 256)
+        with self.assertRaises(IndexError):
+            interp.read_reg_u32(RegKind.SGPR, 106)
+
+        interp.write_reg_u32(RegKind.VGPR, 0, 0x1_FFFF_FFFF)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), 0xFFFFFFFF)
+
+    def test_step_cvt_pk_i16_f32_vgpr_sources(self) -> None:
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u32(RegKind.VGPR, 1, f32_to_bits(1000.0))
+        interp.write_reg_u32(RegKind.VGPR, 2, f32_to_bits(-1000.0))
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_I16_F32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+            src1=Register(RegKind.VGPR, 2),
+        )
+        res = interp.step(inst)
+        expected = ((s32(-1000) & 0xFFFF) << 16) | (1000 & 0xFFFF)
+        self.assertEqual(res, expected)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), expected)
+
+    def test_step_cvt_pk_i16_f32_sgpr_and_inline_operands(self) -> None:
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u32(RegKind.SGPR, 2, f32_to_bits(40000.0))  # > 32767 -> 0x7FFF
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_I16_F32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.SGPR, 2),
+            src1=Immediate(f32_to_bits(-50000.0)),  # < -32768 -> 0x8000
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, 0x80007FFF)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), 0x80007FFF)
+
+    def test_run_complete_program(self) -> None:
+        interp = ScalarVALUInterpreter()
+        prog = Program()
+        prog.emit(Instruction(Opcode.S_MOV_B32, Register(RegKind.SGPR, 0), Immediate(POS_ONE_F32)))
+        prog.emit(Instruction(Opcode.V_MOV_B32, Register(RegKind.VGPR, 1), Immediate(NEG_ONE_F32)))
+        prog.emit(Instruction(
+            Opcode.V_CVT_PK_I16_F32,
+            Register(RegKind.VGPR, 2),
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.SGPR, 0),
+        ))
+        interp.run(prog)
+        # S0 = -1.0f -> 0xFFFF, S1 = 1.0f -> 0x0001
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 2), 0x0001FFFF)
+        self.assertEqual(len(interp.trace), 3)
+
+    def test_scalar_interpreter_determinism(self) -> None:
+        runs = []
+        for _ in range(5):
+            interp = ScalarVALUInterpreter()
+            interp.write_reg_u32(RegKind.VGPR, 1, f32_to_bits(123.45))
+            interp.write_reg_u32(RegKind.VGPR, 2, f32_to_bits(-678.9))
+            inst = Instruction(
+                opcode=Opcode.V_CVT_PK_I16_F32,
+                dst=Register(RegKind.VGPR, 0),
+                src0=Register(RegKind.VGPR, 1),
+                src1=Register(RegKind.VGPR, 2),
+            )
+            interp.step(inst)
+            runs.append((interp.vgprs[:], interp.sgprs[:]))
+        for r in runs[1:]:
+            self.assertEqual(r, runs[0])
 
 
 if __name__ == "__main__":
