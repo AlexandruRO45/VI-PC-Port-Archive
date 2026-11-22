@@ -676,5 +676,93 @@ class TestValuDot2I32I16RegisterAliasing(unittest.TestCase):
         self.assertEqual(self.state.vgprs[0], expected)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Overflow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class IntegerStatusFlags:
+    """Architectural status flags for signed 32-bit integer arithmetic."""
+    is_zero: bool
+    is_negative: bool
+    overflow: bool
+    carry: bool
+
+
+def compute_integer_status_flags(
+    s0_packed: int,
+    s1_packed: int,
+    s2_i32: int,
+    *,
+    clamp: bool = False,
+) -> IntegerStatusFlags:
+    """Compute architectural integer condition flags for v_dot2_i32_i16."""
+    a0, a1 = unpack_i16x2(s0_packed)
+    b0, b1 = unpack_i16x2(s1_packed)
+    c = s32(s2_i32)
+
+    full = (a0 * b0) + (a1 * b1) + c
+    overflow = (full > INT32_MAX) or (full < INT32_MIN)
+
+    if clamp:
+        if full > INT32_MAX:
+            res = UINT32_INT_MAX
+        elif full < INT32_MIN:
+            res = UINT32_INT_MIN
+        else:
+            res = u32(full)
+    else:
+        res = u32(full)
+
+    is_zero = (res == 0)
+    is_negative = bool(res & 0x8000_0000)
+    carry = bool((full >> 32) & 1)
+
+    return IntegerStatusFlags(
+        is_zero=is_zero,
+        is_negative=is_negative,
+        overflow=overflow,
+        carry=carry,
+    )
+
+
+class TestValuDot2I32I16ConditionCodesAndFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and overflow generation."""
+
+    def test_zero_flag(self) -> None:
+        flags = compute_integer_status_flags(0, 0, 0)
+        self.assertTrue(flags.is_zero)
+        self.assertFalse(flags.is_negative)
+        self.assertFalse(flags.overflow)
+
+    def test_negative_flag(self) -> None:
+        s0 = pack_i16x2(5, 0)
+        s1 = pack_i16x2(-10, 0)
+        s2 = 0
+        flags = compute_integer_status_flags(s0, s1, s2)
+        self.assertTrue(flags.is_negative)
+        self.assertFalse(flags.is_zero)
+
+    def test_signed_overflow_detection(self) -> None:
+        s0 = pack_i16x2(-32768, -32768)
+        s1 = pack_i16x2(-32768, -32768)
+        s2 = 0
+        flags = compute_integer_status_flags(s0, s1, s2)
+        self.assertTrue(flags.overflow)
+
+    def test_clamped_clears_negative_flag_on_positive_overflow(self) -> None:
+        s0 = pack_i16x2(-32768, -32768)
+        s1 = pack_i16x2(-32768, -32768)
+        s2 = 0
+        # Unclamped: wraps to 0x80000000 (negative)
+        flags_unclamped = compute_integer_status_flags(s0, s1, s2, clamp=False)
+        self.assertTrue(flags_unclamped.is_negative)
+
+        # Clamped: saturates to 0x7FFFFFFF (positive)
+        flags_clamped = compute_integer_status_flags(s0, s1, s2, clamp=True)
+        self.assertFalse(flags_clamped.is_negative)
+        self.assertTrue(flags_clamped.overflow)
+
+
 if __name__ == "__main__":
     unittest.main()
