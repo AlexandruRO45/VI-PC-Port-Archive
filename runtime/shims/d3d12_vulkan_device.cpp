@@ -4647,8 +4647,11 @@ leonida::gfx10::Sampler sampler_descriptor(const D3D12_SAMPLER_DESC& desc, Devic
 // A query heap: one VkQueryPool, registered with the context so that lists can resolve it by ID
 // (docs/d3d12_vulkan.md section 4.6). Occlusion heaps hold both OCCLUSION and BINARY_OCCLUSION queries; timestamp
 // and copy-queue timestamp heaps are timestamp pools; pipeline-statistics heaps count all eleven Vulkan
-// statistics, whose result order is the field order of D3D12_QUERY_DATA_PIPELINE_STATISTICS. Stream-output
-// statistics heaps have no pool: without stream output every such query is zero.
+// statistics, whose result order is the field order of D3D12_QUERY_DATA_PIPELINE_STATISTICS. PIPELINE_STATISTICS1
+// heaps (D3D-132) count those and task and mesh shader invocations (ASInvocations, MSInvocations). A query that holds
+// a mesh draw is always split (D3D-291) and its MSPrimitives counted in the submission's segment pools; an unsplit
+// one ran no mesh draw, so its MSPrimitives is 0. Stream-output statistics heaps have no pool: without stream
+// output every such query is zero.
 class QueryHeap final
     : public Child<QueryHeap, ID3D12QueryHeapStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
                    ID3D12QueryHeap> {
@@ -4694,10 +4697,20 @@ public:
                 return E_NOTIMPL;
             }
             info.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS;
-            info.pipelineStatistics = kPipelineStatistics;
+            info.pipelineStatistics = leonida::pipeline_statistics_flags;
+            break;
+        case h::pipeline_statistics1:
+            // Every host D3D12 adapter measured so far (WARP, NVIDIA) supports these heaps, so the host's refusal
+            // is unmeasured; E_NOTIMPL is the layer's answer for a heap type this device cannot back.
+            if (!device_.info.mesh_shader_queries) {
+                log_once("PIPELINE_STATISTICS1 query heap: meshShaderQueries not enabled; type", desc.Type);
+                return E_NOTIMPL;
+            }
+            info.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS;
+            info.pipelineStatistics = leonida::pipeline_statistics1_flags;
             break;
         default:
-            // Video decode and mesh-shader statistics (PIPELINE_STATISTICS1) have no path yet.
+            // Video decode statistics have no path yet.
             log_once("query heap type not supported:", desc.Type);
             return E_NOTIMPL;
         }
@@ -4721,11 +4734,18 @@ private:
         return S_OK;
     }
 
-    // VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT through COMPUTE_SHADER_INVOCATIONS_BIT (0x1-0x400):
-    // IAVertices, IAPrimitives, VSInvocations, GSInvocations, GSPrimitives, CInvocations, CPrimitives,
-    // PSInvocations, HSInvocations (patches), DSInvocations, CSInvocations.
-    static constexpr VkQueryPipelineStatisticFlags kPipelineStatistics = 0x7ff;
-    static_assert(sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS) == 11 * sizeof(UINT64));
+    // leonida::pipeline_statistics_flags, VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT through
+    // COMPUTE_SHADER_INVOCATIONS_BIT (0x1-0x400): IAVertices, IAPrimitives, VSInvocations, GSInvocations,
+    // GSPrimitives, CInvocations, CPrimitives, PSInvocations, HSInvocations (patches), DSInvocations, CSInvocations.
+    // pipeline_statistics1_flags then TASK (0x800, ASInvocations) and MESH (0x1000, MSInvocations); MSPrimitives
+    // comes from the mesh segments' queries (vulkan_replay.h, OcclusionSegmentPool::primitives_pool).
+    static_assert(sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS) ==
+                  leonida::pipeline_statistics_counters * sizeof(UINT64));
+    static_assert(sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS1) ==
+                  leonida::pipeline_statistics1_counters * sizeof(UINT64));
+    static_assert(offsetof(D3D12_QUERY_DATA_PIPELINE_STATISTICS1, ASInvocations) == 11 * sizeof(UINT64) &&
+                  offsetof(D3D12_QUERY_DATA_PIPELINE_STATISTICS1, MSInvocations) == 12 * sizeof(UINT64) &&
+                  offsetof(D3D12_QUERY_DATA_PIPELINE_STATISTICS1, MSPrimitives) == 13 * sizeof(UINT64));
 
     DeviceState& device_;
     VkQueryPool pool_ = VK_NULL_HANDLE;  // null for a stream-output heap (no Vulkan query behind it)
@@ -7176,8 +7196,8 @@ public:
             auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS7*>(data);
             *opts = {};
             // Tier 1 is mesh PSOs and DispatchMesh, on VK_EXT_mesh_shader. Amplification shaders are part of the tier
-            // but refused at PSO creation (the game has none); OPTIONS9's mesh statistics and full-range render
-            // target array index stay FALSE.
+            // but refused at PSO creation (the game has none). OPTIONS9 reports the mesh statistics with
+            // meshShaderQueries; its full-range render target array index stays FALSE.
             opts->MeshShaderTier =
                 state_.info.mesh_shader ? D3D12_MESH_SHADER_TIER_1 : D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
             opts->SamplerFeedbackTier = D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED;
@@ -7187,7 +7207,7 @@ public:
             if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS9)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS9*>(data);
             *opts = {};
-            opts->MeshShaderPipelineStatsSupported = FALSE;
+            opts->MeshShaderPipelineStatsSupported = state_.info.mesh_shader_queries ? TRUE : FALSE;
             opts->MeshShaderSupportsFullRangeRenderTargetArrayIndex = FALSE;
             opts->AtomicInt64OnTypedResourceSupported = FALSE;
             opts->AtomicInt64OnGroupSharedSupported = FALSE;
@@ -8938,6 +8958,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                 VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &mesh_features};
                 vkGetPhysicalDeviceFeatures2(info.physical, &features);
                 info.mesh_shader = mesh_features.meshShader == VK_TRUE;
+                info.mesh_shader_queries = info.mesh_shader && mesh_features.meshShaderQueries == VK_TRUE;
             }
         }
         if (!info.mesh_shader)
@@ -8970,10 +8991,12 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
     enable_as.accelerationStructure = VK_TRUE;
 
-    // Only meshShader: the game has no amplification (task) shaders, and multiview and shading-rate mesh features
-    // are not used.
+    // meshShader, and meshShaderQueries where the GPU has it (PIPELINE_STATISTICS1 query heaps, D3D-132): the game
+    // has no amplification (task) shaders, and multiview and shading-rate mesh features are not used.
     VkPhysicalDeviceMeshShaderFeaturesEXT enable_mesh{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
     enable_mesh.meshShader = VK_TRUE;
+    info.mesh_shader_queries = info.mesh_shader_queries && chosen_features.pipelineStatisticsQuery == VK_TRUE;
+    enable_mesh.meshShaderQueries = info.mesh_shader_queries ? VK_TRUE : VK_FALSE;
 
     void* ext_chain = nullptr;
     if (info.mesh_shader) {

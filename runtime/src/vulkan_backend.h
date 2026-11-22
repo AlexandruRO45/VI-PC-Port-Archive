@@ -212,8 +212,8 @@ public:
         write.pBufferInfo = &storage;
         vk_.vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
 
-        // The count, and for statistics_sum.comp whether the segments are mesh-pool results.
-        const VkPushConstantRange count{VK_SHADER_STAGE_COMPUTE_BIT, 0, 2 * sizeof(std::uint32_t)};
+        // The count, and for statistics_sum.comp whether the segments are mesh-pool results and the result's width.
+        const VkPushConstantRange count{VK_SHADER_STAGE_COMPUTE_BIT, 0, 3 * sizeof(std::uint32_t)};
         VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout.setLayoutCount = 1;
         layout.pSetLayouts = &set_layout_;
@@ -233,14 +233,18 @@ public:
                 create_pipeline(statistics_sum_spirv, statistics_pipeline_));
     }
 
-    // Adds `count` pipeline-statistics results into one D3D12_QUERY_DATA_PIPELINE_STATISTICS at dst + offset: the
+    // Adds `count` pipeline-statistics results into one result of `counters` UINT64s at dst + offset: 11 for
+    // D3D12_QUERY_DATA_PIPELINE_STATISTICS, 14 for D3D12_QUERY_DATA_PIPELINE_STATISTICS1 (D3D-132). They are the
     // segments of a statistics query that was split around helper dispatches (D3D-162) or mesh draws (D3D-291).
-    // Segment i is in `mesh_queries` when mesh[i] is set (four counters: clipping, fragment and compute; see
-    // statistics_sum.comp), otherwise in `queries` (all eleven).
-    void sum_statistics(VkCommandBuffer cb, VkQueryPool queries, VkQueryPool mesh_queries, const std::uint8_t* mesh,
-                        std::uint32_t first, std::uint32_t count, VkBuffer dst, VkDeviceSize offset) const {
-        constexpr VkDeviceSize result = statistics_counters * word_size;
-        constexpr VkDeviceSize mesh_slot = 5 * word_size;  // CInvocations, where the mesh pool's first counter goes
+    // Segment i is in `mesh_queries` when mesh[i] is set (clipping, fragment and compute invocations, then task and
+    // mesh invocations for PIPELINE_STATISTICS1; see statistics_sum.comp), otherwise in `queries` (the eleven). With
+    // 14 counters a mesh segment's MSPrimitives is the query of the same index in `primitives`.
+    void sum_statistics(VkCommandBuffer cb, VkQueryPool queries, VkQueryPool mesh_queries, VkQueryPool primitives,
+                        const std::uint8_t* mesh, std::uint32_t first, std::uint32_t count, std::uint32_t counters,
+                        VkBuffer dst, VkDeviceSize offset) const {
+        const VkDeviceSize result = VkDeviceSize(counters) * word_size;
+        constexpr VkDeviceSize mesh_slot = 5 * word_size;         // CInvocations, the mesh pool's first counter
+        constexpr VkDeviceSize primitives_slot = 13 * word_size;  // MSPrimitives
         begin_scratch_write(cb);
         vk_.vkCmdFillBuffer(cb, scratch_, 0, result, 0);
         bind(cb, statistics_pipeline_);
@@ -252,9 +256,12 @@ public:
             vk_.vkCmdCopyQueryPoolResults(cb, in_mesh ? mesh_queries : queries, first, chunk, scratch_,
                                           result + (in_mesh ? mesh_slot : 0), result,
                                           VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            if (in_mesh && counters > 13)
+                vk_.vkCmdCopyQueryPoolResults(cb, primitives, first, chunk, scratch_, result + primitives_slot, result,
+                                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
             barrier(cb, transfer | compute, compute, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                     shader_access);
-            dispatch(cb, chunk, 1, in_mesh);
+            dispatch(cb, chunk, 1, in_mesh, counters);
             first += chunk;
             count -= chunk;
             if (count) barrier(cb, compute, transfer, shader_access, VK_ACCESS_TRANSFER_WRITE_BIT);
@@ -348,8 +355,9 @@ private:
         vk_.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 0, 1, &set_, 0, nullptr);
     }
 
-    void dispatch(VkCommandBuffer cb, std::uint32_t chunk, std::uint32_t groups, bool mesh = false) const {
-        const std::uint32_t range[2] = {chunk, mesh ? 1u : 0u};
+    void dispatch(VkCommandBuffer cb, std::uint32_t chunk, std::uint32_t groups, bool mesh = false,
+                  std::uint32_t counters = 11) const {
+        const std::uint32_t range[3] = {chunk, mesh ? 1u : 0u, counters};
         vk_.vkCmdPushConstants(cb, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(range), range);
         vk_.vkCmdDispatch(cb, groups, 1, 1);
     }
@@ -384,8 +392,8 @@ private:
     static constexpr std::uint32_t sum_capacity = 256;  // one more word holds the running sum
     static constexpr std::uint32_t binary_capacity = 1024;
     static constexpr std::uint32_t binary_group_size = 64;  // local_size_x in binary_occlusion.comp
-    static constexpr std::uint32_t statistics_counters = 11;  // local_size_x in statistics_sum.comp
-    static constexpr std::uint32_t statistics_capacity = 64;  // segments per pass; 11 more words hold the sums
+    static constexpr std::uint32_t statistics_counters = 14;  // at most; local_size_x in statistics_sum.comp
+    static constexpr std::uint32_t statistics_capacity = 64;  // segments per pass; 14 more words hold the sums
     static constexpr VkDeviceSize word_size = sizeof(std::uint64_t);
     static constexpr VkDeviceSize scratch_size =
         std::max({sum_capacity + 1, binary_capacity, (statistics_capacity + 1) * statistics_counters}) * word_size;
@@ -2288,9 +2296,11 @@ private:
                 occlusion_resolve_->normalize(cb, pool, first, count, dst, offset);
             };
             replay.sum_statistics = [this](VkCommandBuffer cb, VkQueryPool pool, VkQueryPool mesh_pool,
-                                           const std::uint8_t* mesh, std::uint32_t first, std::uint32_t count,
-                                           VkBuffer dst, VkDeviceSize offset) {
-                occlusion_resolve_->sum_statistics(cb, pool, mesh_pool, mesh, first, count, dst, offset);
+                                           VkQueryPool primitives_pool, const std::uint8_t* mesh, std::uint32_t first,
+                                           std::uint32_t count, std::uint32_t counters, VkBuffer dst,
+                                           VkDeviceSize offset) {
+                occlusion_resolve_->sum_statistics(cb, pool, mesh_pool, primitives_pool, mesh, first, count, counters,
+                                                   dst, offset);
             };
             replay.sum_binary_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
                                                  std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
@@ -2299,7 +2309,7 @@ private:
         }
         const auto resolve = [this](ResourceId id) { return context_.resolve(id); };
         std::uint32_t segments = 0, statistics_segments = 0;
-        bool has_queries = false;
+        bool has_queries = false, statistics1_segments = false;
         for (std::size_t i = 0; i < lists.size(); ++i) {
             const auto result = prepare(*lists[i], resolve, replay, prepared[i], can_resolve_occlusion);
             if (result != ReplayResult::success) return result;
@@ -2308,6 +2318,7 @@ private:
                 return ReplayResult::unsupported;
             segments += prepared[i].segment_count;
             statistics_segments += prepared[i].statistics_segment_count;
+            statistics1_segments = statistics1_segments || prepared[i].statistics1_segments;
             has_queries = has_queries || !prepared[i].queries.empty();
         }
         const auto segment_pool = [this](VkQueryType type, std::uint32_t count,
@@ -2338,17 +2349,25 @@ private:
                 statistics->mesh.clear();
             } else {
                 // The counters a mesh draw allows (VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076): clipping
-                // invocations and primitives, fragment and compute invocations (D3D-291).
+                // invocations and primitives, fragment and compute invocations (D3D-291); with a split
+                // PIPELINE_STATISTICS1 query, task and mesh invocations too, and a mesh-primitives query per segment
+                // (D3D-132; such a heap exists only with meshShaderQueries, VUID-VkQueryPoolCreateInfo-07068/07069).
                 VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
                 info.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS;
                 info.queryCount = statistics_segments;
-                info.pipelineStatistics = VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT |
-                                          VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT |
-                                          VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT |
-                                          VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT;
+                info.pipelineStatistics = statistics1_segments ? mesh_statistics1_flags : mesh_statistics_flags;
+                statistics->mesh_counters = statistics1_segments ? 6 : 4;
                 if (context_.vk.vkCreateQueryPool(statistics->device, &info, nullptr, &statistics->mesh_pool) !=
                     VK_SUCCESS)
                     return ReplayResult::unsupported;
+                if (statistics1_segments) {
+                    VkQueryPoolCreateInfo primitives{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+                    primitives.queryType = VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT;
+                    primitives.queryCount = statistics_segments;
+                    if (context_.vk.vkCreateQueryPool(statistics->device, &primitives, nullptr,
+                                                      &statistics->primitives_pool) != VK_SUCCESS)
+                        return ReplayResult::unsupported;
+                }
             }
         }
         // QueryReplay::plan() reads QueryPool::ended / occlusion and QueryReplay::commit() writes them after

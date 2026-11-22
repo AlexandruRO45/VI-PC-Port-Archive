@@ -3946,8 +3946,8 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         {"command queue: compute", [](ID3D12Device* d) { return command_queue(d, {D3D12_COMMAND_LIST_TYPE_COMPUTE}); }},
         {"command queue: copy", [](ID3D12Device* d) { return command_queue(d, {D3D12_COMMAND_LIST_TYPE_COPY}); }},
         // CreateQueryHeap: the description is checked first (types past PIPELINE_STATISTICS1 are refused), then a
-        // null output is E_UNEXPECTED. Known types this layer has no path for (stream output, video decode, mesh
-        // statistics) are E_NOTIMPL here and not compared.
+        // null output is E_UNEXPECTED. Video decode statistics, which this layer has no path for, are E_NOTIMPL and
+        // not compared; PIPELINE_STATISTICS1 heaps are compared in d3d12_query_rules_test (D3D-132).
         {"query heap: occlusion", [](ID3D12Device* d) { return query_heap(d, D3D12_QUERY_HEAP_TYPE_OCCLUSION, 4); }},
         {"query heap: timestamps", [](ID3D12Device* d) { return query_heap(d, D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 4); }},
         {"query heap: no queries", [](ID3D12Device* d) { return query_heap(d, D3D12_QUERY_HEAP_TYPE_OCCLUSION, 0); }},

@@ -2105,7 +2105,7 @@ The trace will enumerate them.
 | Resource barriers (legacy) | `vkCmdPipelineBarrier` | Per-subresource state tracking; `BEGIN_ONLY`/`END_ONLY` become conservative full barriers at the begin point. |
 | Enhanced barriers (`ID3D12GraphicsCommandList7::Barrier`) | `vkCmdPipelineBarrier2` | Direct mapping of sync/access/layout; prefer it when the game uses it. |
 | `IDXGISwapChain` / `IDXGIFactory` | Factory/adapter/output: fake objects. `Swapchain` over `VkSwapchainKHR` + Win32 surface: only for the PC-style path | Shim DXGI; do not bind host DXGI. A GDKX title likely creates no swapchain (§4.5); it needs `IDXGIDevice1`→`GetAdapter`→`EnumOutputs` and a `PresentX` + frame-event presenter instead. |
-| `ID3D12QueryHeap` | `VkQueryPool` | Occlusion, binary occlusion, pipeline statistics, timestamps. Binary results clamped to 0/1. |
+| `ID3D12QueryHeap` | `VkQueryPool` | Occlusion, binary occlusion, pipeline statistics (and `PIPELINE_STATISTICS1`, whose mesh primitives are counted per mesh segment), timestamps. Binary results clamped to 0/1. |
 | `ID3D12CommandSignature` | `IndirectLayout` | Simple draw/dispatch signatures map to indirect calls; root-constant/vertex/index/descriptor changes need expansion. |
 | `ID3D12PipelineLibrary` | map + `VkPipelineCache` | D3D12 cached blobs are ignored. |
 | `ID3D12StateObject` (ray tracing) | likely unused | RT work includes compute traversal (`image_bvh*`) plus `XboxBvhBuilder`; a DXR state-object path is stubbed until the trace shows it. |
@@ -3155,8 +3155,23 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   `PIPELINE_STATISTICS` heaps count all eleven Vulkan statistics (`0x7ff`), whose result order is the field order
   of `D3D12_QUERY_DATA_PIPELINE_STATISTICS` (IA vertices, IA primitives, VS, GS invocations, GS primitives,
   clipper invocations and primitives, PS, HS, DS, CS), so one 88-byte result per query is copied as is. They need
-  `pipelineStatisticsQuery`. `VIDEO_DECODE_STATISTICS` and `PIPELINE_STATISTICS1` (mesh and amplification counts)
-  are logged and refused with `E_NOTIMPL`. Invalid descriptions are answered as the host runtime answers them
+  `pipelineStatisticsQuery`. `PIPELINE_STATISTICS1` heaps (D3D-132) need `VK_EXT_mesh_shader`'s
+  `meshShaderQueries` as well (enabled with `meshShader` where the GPU has it; `OPTIONS9.MeshShaderPipelineStatsSupported`
+  reports it) and are refused with `E_NOTIMPL` without it; no host adapter measured so far refuses them, so the host's
+  refusal code is not known. Each holds a statistics pool counting the eleven plus `TASK_SHADER_INVOCATIONS` (0x800)
+  and `MESH_SHADER_INVOCATIONS` (0x1000), which Vulkan writes after `CSInvocations` in bit order, the order of
+  `ASInvocations` and `MSInvocations` (neither bit is forbidden around vertex draws; only
+  `vkCmdDrawClusterHUAWEI` excludes them, VUID-07819). A query that holds a mesh draw is always split (D3D-291,
+  below), so a query resolved from the heap's pool ran no mesh draw: its 13 statistics are copied with a 112-byte
+  stride and `MSPrimitives` is written as 0. A split query is resolved through the sum, which writes all 14 fields.
+  Its mesh segments run in the submission's mesh pool, which then also counts task and mesh invocations, and each
+  runs a `VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT` query of the same index beside it; full segments run none. No
+  VUID ties a mesh-primitives query to the kind of draw (07068, 07070 and 07071 are the only ones on such queries),
+  but NVIDIA's Vulkan driver counts a VS draw's triangles there and D3D12 does not, so `MSPrimitives` must only be
+  counted around mesh draws. Measured on an RTX 3070 Ti (driver 610.88) against its D3D12 driver
+  (`d3d12_mesh_statistics_test`): all 14 fields of a VS draw, two mesh draws, a query never ended and a query split
+  around a resolve match, with `MSInvocations` 32 per 32-thread group. `VIDEO_DECODE_STATISTICS` is
+  logged and refused with `E_NOTIMPL`. Invalid descriptions are answered as the host runtime answers them
   (`compare_invalid_arguments`, "query heap:", RTX 5070 / 621.14): `E_INVALIDARG` for no queries, a node other than
   node 0, or a type past `PIPELINE_STATISTICS1` (7), checked before the output; a valid description with a null
   output is then `E_UNEXPECTED`, not `S_FALSE`.
@@ -3212,7 +3227,9 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   Its counters go to physical `PIPELINE_STATISTICS` segments in a pool of the submission's own; a segment ends
   before each helper and a new one begins after it. Non-query helpers and resolves share the segment numbering.
   Its result is the sum of its segments, added per counter by a compute dispatch (`statistics_sum.comp`) on the
-  same scratch buffer, which is itself kept out of any statistics query still running.
+  same scratch buffer, which is itself kept out of any statistics query still running. A `PIPELINE_STATISTICS1`
+  result (14 fields) is always summed, even from one segment; full segments add nothing past `CSInvocations`, as
+  they ran no mesh draw.
   Whether a resolve dispatches is only known once the list is planned against the heaps, so every such resolve
   splits the query. `vk_binary_occlusion` checks that a binary resolve and a statistics sum inside statistics queries
   leave every counter at 0. `vk_overlapping_occlusion` puts a native draw in each segment and checks the split sums
@@ -3230,7 +3247,10 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   the segment and begins one of its own kind; dispatches and segments without draws use the full pool, and
   `ExecuteIndirect` draws count as vertex draws. The sum copies a mesh segment's four counters into fields 5 to 8 of
   its record, and `statistics_sum.comp` adds them as `CInvocations`, `CPrimitives`, `PSInvocations` and
-  `CSInvocations`, so the other fields get nothing from it. A query that holds only mesh draws is one mesh segment,
+  `CSInvocations`, so the other fields get nothing from it. With a split `PIPELINE_STATISTICS1` query in the
+  submission (D3D-132) the mesh pool counts task and mesh invocations after those four, copied to fields 9 and 10 and
+  added as `ASInvocations` and `MSInvocations`, and the segment's mesh-primitives query goes to field 13
+  (`MSPrimitives`). A query that holds only mesh draws is one mesh segment,
   resolved through the same sum. Without the compute helper there is no segment pool and such a list is refused
   (`unsupported`) rather than run unsplit; so is one on the single-list `replay()` (D3D-399), whose
   `create_segment_pool` gives no mesh pool. Overlapping statistics queries (D3D-252) split the same way inside their

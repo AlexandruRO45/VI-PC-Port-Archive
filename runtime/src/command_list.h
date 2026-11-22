@@ -202,15 +202,19 @@ constexpr bool query_fits_heap(std::uint32_t heap_type, std::uint32_t query_type
 }
 
 // Bytes one resolved query takes: a UINT64 for occlusion and timestamps, D3D12_QUERY_DATA_PIPELINE_STATISTICS
-// (11 UINT64s) for pipeline statistics, D3D12_QUERY_DATA_SO_STATISTICS (2 UINT64s) for stream output. 0 for the
-// types this layer does not resolve.
+// (11 UINT64s) for pipeline statistics, D3D12_QUERY_DATA_PIPELINE_STATISTICS1 (the same 11, then ASInvocations,
+// MSInvocations and MSPrimitives) for PIPELINE_STATISTICS1, D3D12_QUERY_DATA_SO_STATISTICS (2 UINT64s) for stream
+// output. 0 for the types this layer does not resolve.
+inline constexpr std::uint32_t pipeline_statistics_counters = 11;
+inline constexpr std::uint32_t pipeline_statistics1_counters = 14;
 constexpr std::uint32_t query_result_size(std::uint32_t query_type) {
     namespace q = d3d12_query;
     switch (query_type) {
     case q::occlusion:
     case q::binary_occlusion:
     case q::timestamp: return 8;
-    case q::pipeline_statistics: return 11 * 8;
+    case q::pipeline_statistics: return pipeline_statistics_counters * 8;
+    case q::pipeline_statistics1: return pipeline_statistics1_counters * 8;
     // D3D12_QUERY_DATA_SO_STATISTICS: NumPrimitivesWritten, PrimitivesStorageNeeded.
     case q::so_statistics_stream0:
     case q::so_statistics_stream0 + 1:
@@ -218,6 +222,21 @@ constexpr std::uint32_t query_result_size(std::uint32_t query_type) {
     case q::so_statistics_stream3: return 2 * 8;
     default: return 0;
     }
+}
+
+// Both pipeline-statistics query types run as one VK_QUERY_TYPE_PIPELINE_STATISTICS query (Vulkan allows one at a
+// time); PIPELINE_STATISTICS1 adds a VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT query beside it.
+constexpr bool is_pipeline_statistics(std::uint32_t query_type) {
+    return query_type == d3d12_query::pipeline_statistics || query_type == d3d12_query::pipeline_statistics1;
+}
+
+// The counters the Vulkan statistics query of a D3D12 query type writes, in VkQueryPipelineStatisticFlagBits order:
+// the 11 classic ones, plus task and mesh shader invocations (ASInvocations, MSInvocations) for PIPELINE_STATISTICS1,
+// whose last field (MSPrimitives) comes from the primitives query. 0 for the other types.
+constexpr std::uint32_t vulkan_statistics_counters(std::uint32_t query_type) {
+    if (query_type == d3d12_query::pipeline_statistics) return pipeline_statistics_counters;
+    if (query_type == d3d12_query::pipeline_statistics1) return pipeline_statistics1_counters - 1;
+    return 0;
 }
 
 // A view captured by value while recording: the CPU descriptor slot may be rewritten after the call.

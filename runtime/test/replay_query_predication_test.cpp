@@ -30,6 +30,7 @@ struct Trace {
     unsigned binary_resolves = 0;
     unsigned binary_while_cond = 0;
     std::vector<std::string> events;
+    std::vector<std::string> fill_ranges;  // "offset+size" of each fill
 };
 
 Trace* g_trace = nullptr;
@@ -51,22 +52,27 @@ VKAPI_ATTR void VKAPI_CALL mock_end_cond(VkCommandBuffer) {
     g_trace->events.push_back("end_cond");
 }
 
-VKAPI_ATTR void VKAPI_CALL mock_fill_buffer(VkCommandBuffer, VkBuffer, VkDeviceSize, VkDeviceSize, std::uint32_t) {
+VKAPI_ATTR void VKAPI_CALL mock_fill_buffer(VkCommandBuffer, VkBuffer, VkDeviceSize offset, VkDeviceSize size,
+                                            std::uint32_t) {
+    g_trace->fill_ranges.push_back(std::to_string(offset) + "+" + std::to_string(size));
     ++g_trace->fills;
     if (g_trace->cond_active) ++g_trace->fills_while_cond;
     g_trace->events.push_back("fill");
 }
 
-VKAPI_ATTR void VKAPI_CALL mock_copy_query(VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t, VkBuffer,
-                                           VkDeviceSize, VkDeviceSize, VkQueryResultFlags) {
-    ++g_trace->copies;
-    if (g_trace->cond_active) ++g_trace->copies_while_cond;
-    g_trace->events.push_back("copy_query");
-}
-
 std::string query_event(const char* name, VkQueryPool pool, std::uint32_t index) {
     return std::string(name) + " " + std::to_string(reinterpret_cast<std::uintptr_t>(pool)) + ":" +
            std::to_string(index);
+}
+
+// "copy_query pool:first+count @offset/stride"
+VKAPI_ATTR void VKAPI_CALL mock_copy_query(VkCommandBuffer, VkQueryPool pool, std::uint32_t first,
+                                           std::uint32_t count, VkBuffer, VkDeviceSize offset, VkDeviceSize stride,
+                                           VkQueryResultFlags) {
+    ++g_trace->copies;
+    if (g_trace->cond_active) ++g_trace->copies_while_cond;
+    g_trace->events.push_back(query_event("copy_query", pool, first) + "+" + std::to_string(count) + " @" +
+                              std::to_string(offset) + "/" + std::to_string(stride));
 }
 
 VKAPI_ATTR void VKAPI_CALL mock_reset_query(VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t) {}
@@ -103,10 +109,17 @@ int main() {
     QueryPool heap{handle<VkQueryPool>(3), d3d12_query_heap::occlusion, 4, false, {false, true, false, true}, {}};
     QueryPool statistics_heap{handle<VkQueryPool>(7), d3d12_query_heap::pipeline_statistics, 2, false,
                               {false, false}, {}};
+    // PIPELINE_STATISTICS1 (D3D-132): heap ID 12, pool 13, resolved into buffer 3 (512 bytes).
+    QueryPool statistics1_heap{handle<VkQueryPool>(13), d3d12_query_heap::pipeline_statistics1, 2, false,
+                               {false, false}, {}};
+    ResourceBinding big{};
+    big.buffer = handle<VkBuffer>(15);
+    big.size = 512;
 
     const auto resolve = [&](ResourceId id) -> const ResourceBinding* {
         if (id == 1) return &dst;
         if (id == 2) return &pred;
+        if (id == 3) return &big;
         return nullptr;
     };
 
@@ -125,11 +138,17 @@ int main() {
     vk.copy_query_pool_results = mock_copy_query;
     vk.fill_buffer = mock_fill_buffer;
     vk.query_pool = [&](QueryHeapId id) -> QueryPool* {
-        return id == 1 ? &heap : id == 6 ? &statistics_heap : nullptr;
+        return id == 1 ? &heap : id == 6 ? &statistics_heap : id == 12 ? &statistics1_heap : nullptr;
     };
-    vk.sum_statistics = [](VkCommandBuffer, VkQueryPool pool, VkQueryPool, const std::uint8_t*, std::uint32_t first,
-                           std::uint32_t count, VkBuffer, VkDeviceSize) {
-        g_trace->events.push_back(query_event("sum_statistics", pool, first) + "+" + std::to_string(count));
+    // "sum_statistics pool:first+count", then for a 14-counter (PIPELINE_STATISTICS1) sum " x14 primitives P @offset".
+    vk.sum_statistics = [](VkCommandBuffer, VkQueryPool pool, VkQueryPool, VkQueryPool primitives,
+                           const std::uint8_t*, std::uint32_t first, std::uint32_t count, std::uint32_t counters,
+                           VkBuffer, VkDeviceSize offset) {
+        std::string event = query_event("sum_statistics", pool, first) + "+" + std::to_string(count);
+        if (counters != 11)
+            event += " x" + std::to_string(counters) + " primitives " +
+                     std::to_string(reinterpret_cast<std::uintptr_t>(primitives)) + " @" + std::to_string(offset);
+        g_trace->events.push_back(event);
     };
     vk.resolve_binary_occlusion = [](VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t, VkBuffer,
                                      VkDeviceSize) {
@@ -753,6 +772,114 @@ int main() {
         // queries[] follows the commands: Begin 0, Begin 1, End 0, End 1.
         expect(q[2].statistics_first == 0 && q[2].statistics_count == 2, "overlap-mesh: query 0 sums segments 0-1");
         expect(q[3].statistics_first == 1 && q[3].statistics_count == 3, "overlap-mesh: query 1 sums segments 1-3");
+    }
+
+    // 17. D3D-132: a PIPELINE_STATISTICS1 query with no mesh draw is not split. It runs in the heap's pool; the
+    //     resolve copies its 13 statistics 112 bytes apart and writes MSPrimitives (word 13) as 0, and a query never
+    //     ended reads 112 zero bytes.
+    {
+        Trace trace;
+        g_trace = &trace;
+        CommandList list;
+        expect(list.begin_query({12, d3d12_query::pipeline_statistics1, 0}), "record statistics1 begin");
+        expect(list.end_query({12, d3d12_query::pipeline_statistics1, 0}), "record statistics1 end");
+        expect(list.resolve_queries({12, d3d12_query::pipeline_statistics1, 0, 2, 3, 16}), "record statistics1 resolve");
+        expect(list.close(), "close statistics1 list");
+        expect(replay(list, VK_NULL_HANDLE, resolve, vk) == ReplayResult::success, "replay statistics1");
+        const std::vector<std::string> want{"begin_query 13:0", "end_query 13:0", "copy_query 13:0+1 @16/112",
+                                            "fill", "fill"};
+        expect(trace.events == want, "statistics1: one query, 13 statistics copied");
+        expect(trace.fill_ranges == std::vector<std::string>({"120+8", "128+112"}),
+               "statistics1: MSPrimitives of the ended query and the whole never-ended query are zero");
+    }
+
+    // 18. D3D-132 with D3D-291's split: a PIPELINE_STATISTICS1 query around a vertex and a mesh draw has a full segment
+    //     and a mesh segment. The mesh segment runs in the 6-counter mesh pool (10) with a mesh-primitives query of
+    //     the same index (pool 11) beside it; the full one has none. The resolve is a 14-counter sum.
+    {
+        Trace trace;
+        g_trace = &trace;
+        const auto draw = [](bool mesh) {
+            Draw d{};
+            d.pipeline = 1;
+            d.count = d.instances = d.first = 1;
+            d.mesh = mesh;
+            return d;
+        };
+        CommandList list;
+        expect(list.begin_query({12, d3d12_query::pipeline_statistics1, 1}), "record statistics1 mixed begin");  // 0
+        expect(list.draw(draw(false)), "record statistics1 vertex draw");                                        // 1
+        expect(list.draw(draw(true)), "record statistics1 mesh draw");                                           // 2
+        expect(list.end_query({12, d3d12_query::pipeline_statistics1, 1}), "record statistics1 mixed end");      // 3
+        expect(list.resolve_queries({12, d3d12_query::pipeline_statistics1, 1, 1, 3, 16}), "record mixed resolve");
+        expect(list.close(), "close statistics1 mixed list");
+        PreparedList prepared;
+        prepared.list = &list;
+        prepared.commands.assign(list.commands().size(), {});
+        for (std::size_t i : {0, 3, 4})
+            prepared.queries.push_back({i, &statistics1_heap, std::holds_alternative<BeginQuery>(list.commands()[i])});
+        plan_statistics_segments(prepared);
+        expect(prepared.statistics_segment_count == 2 && prepared.statistics1_segments &&
+                   prepared.statistics_mesh == std::vector<std::uint8_t>({0, 1}),
+               "statistics1 mixed: a full and a mesh segment, flagged as PIPELINE_STATISTICS1");
+
+        const auto pool = [&](std::uint32_t mesh_counters, bool primitives) {
+            auto segments = std::make_shared<OcclusionSegmentPool>();
+            segments->pool = handle<VkQueryPool>(9);
+            segments->mesh_pool = handle<VkQueryPool>(10);
+            segments->primitives_pool = primitives ? handle<VkQueryPool>(11) : VK_NULL_HANDLE;
+            segments->mesh_counters = mesh_counters;
+            segments->mesh = prepared.statistics_mesh;
+            segments->destroy = mock_destroy_pool;
+            return segments;
+        };
+        for (const auto& [counters, primitives] : {std::pair{4u, true}, std::pair{6u, false}}) {
+            PreparedList again = prepared;
+            QueryReplay refused;
+            expect(refused.plan(again, {}, 0, true, pool(counters, primitives), 0) == ReplayResult::unsupported,
+                   "statistics1 mixed: refused without task/mesh counters or primitives queries in the mesh segments");
+        }
+        QueryReplay queries;
+        expect(queries.plan(prepared, {}, 0, true, pool(6, true), 0) == ReplayResult::success, "plan statistics1 mixed");
+        expect(prepared.statistics_primitives_pool == handle<VkQueryPool>(11), "statistics1 mixed: the primitives pool");
+        const auto& q = prepared.queries;
+        expect(q[2].resolves.size() == 1 && q[2].resolves[0].sum && q[2].resolves[0].count == 2 &&
+                   q[2].resolves[0].primitives_pool == handle<VkQueryPool>(11),
+               "statistics1 mixed: the resolve sums both segments with the primitives queries");
+        const VkConditionalRenderingBeginInfoEXT no_predicate{};
+        emit_query(prepared, q[0], VK_NULL_HANDLE, vk, no_predicate);
+        detail::end_statistics_segment(prepared, prepared.commands[2].statistics_end, VK_NULL_HANDLE, vk);
+        detail::begin_statistics_segment(prepared, prepared.commands[2].statistics_begin, VK_NULL_HANDLE, vk);
+        emit_query(prepared, q[1], VK_NULL_HANDLE, vk, no_predicate);
+        emit_query(prepared, q[2], VK_NULL_HANDLE, vk, no_predicate);
+        const std::vector<std::string> want{"begin_query 9:0",  "end_query 9:0",  "begin_query 10:1",
+                                            "begin_query 11:1", "end_query 10:1", "end_query 11:1",
+                                            "sum_statistics 9:0+2 x14 primitives 11 @16"};
+        expect(trace.events == want, "statistics1 mixed: primitives counted only beside the mesh segment");
+    }
+
+    // 19. A PIPELINE_STATISTICS1 query split only by a helper (no mesh draw) still resolves through the 14-counter
+    //     sum, even with a single segment, so ASInvocations, MSInvocations and MSPrimitives are written (as 0).
+    {
+        Trace trace;
+        g_trace = &trace;
+        CommandList list;
+        expect(list.begin_query({12, d3d12_query::pipeline_statistics1, 0}), "record helper-split begin");
+        expect(list.resolve_queries({1, d3d12_query::binary_occlusion, 1, 1, 1, 0}), "record helper-split inner");
+        expect(list.end_query({12, d3d12_query::pipeline_statistics1, 0}), "record helper-split end");
+        expect(list.resolve_queries({12, d3d12_query::pipeline_statistics1, 0, 1, 3, 0}), "record helper-split resolve");
+        expect(list.close(), "close helper-split list");
+        PreparedList prepared;
+        expect(prepare(list, resolve, vk, prepared) == ReplayResult::success, "prepare helper-split list");
+        expect(prepared.statistics_segment_count == 2 && prepared.statistics1_segments, "helper split: two segments");
+        auto segments = std::make_shared<OcclusionSegmentPool>();
+        segments->pool = handle<VkQueryPool>(9);
+        segments->destroy = mock_destroy_pool;
+        QueryReplay queries;
+        expect(queries.plan(prepared, {}, 0, true, segments, 4) == ReplayResult::success, "plan helper-split list");
+        emit(prepared, VK_NULL_HANDLE, vk);
+        expect(!trace.events.empty() && trace.events.back() == "sum_statistics 9:4+2 x14 primitives 0 @0",
+               "helper split: a 14-counter sum");
     }
 
     if (failures) return 1;
