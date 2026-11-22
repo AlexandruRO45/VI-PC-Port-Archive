@@ -879,8 +879,149 @@ class TestPermB16SIMDDivergence(unittest.TestCase):
             self.assertEqual(wave.get_lane_vgpr(0, lane) & MASK16, expected)
 
 
+# ==============================================================================
+# Unit Tests: Commit 5 (Register Aliasing & In-Place Operand Preservation)
+# ==============================================================================
+
+class TestPermB16RegisterAliasing(unittest.TestCase):
+    """Test suite for register aliasing hazards and in-place operand preservation."""
+
+    def setUp(self):
+        self.rf = ScalarRegisterFile()
+        self.interp = ScalarInterpreter(self.rf)
+
+    def test_dst_aliases_src0(self):
+        # D == src0: v0 = perm(v0, v1, sel)
+        self.rf.set_vgpr(0, 0x1122)
+        self.rf.set_vgpr(1, 0x3344)
+        sel = make_selector_16(SEL_SRC1_B0, SEL_SRC0_B1)
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(1),
+            src2=ASTOperand.literal(sel),
+        )
+        self.interp.execute(instr)
+        # S1[7:0] is 0x44, S0[15:8] is 0x11 -> 0x1144
+        self.assertEqual(self.rf.get_vgpr(0) & MASK16, 0x1144)
+
+    def test_dst_aliases_src1(self):
+        # D == src1: v0 = perm(v1, v0, sel)
+        self.rf.set_vgpr(1, 0xAABB)
+        self.rf.set_vgpr(0, 0xCCDD)
+        sel = make_selector_16(SEL_SRC1_B1, SEL_SRC0_B0)
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(0),
+            src2=ASTOperand.literal(sel),
+        )
+        self.interp.execute(instr)
+        # S1[15:8] is 0xCC, S0[7:0] is 0xBB -> 0xBBCC
+        self.assertEqual(self.rf.get_vgpr(0) & MASK16, 0xBBCC)
+
+    def test_dst_aliases_src2_selector(self):
+        # D == src2: selector is in v0 and destination is v0
+        sel = make_selector_16(SEL_SRC1_B0, SEL_SRC0_B1)
+        self.rf.set_vgpr(1, 0x1234)
+        self.rf.set_vgpr(2, 0x5678)
+        self.rf.set_vgpr(0, sel)
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(0),
+        )
+        self.interp.execute(instr)
+        # S1[7:0] is 0x78, S0[15:8] is 0x12 -> 0x1278
+        self.assertEqual(self.rf.get_vgpr(0) & MASK16, 0x1278)
+
+    def test_dst_aliases_src0_and_src1(self):
+        # D == src0 == src1: in-place byte swap
+        self.rf.set_vgpr(0, 0x1234)
+        sel = PermSelectorB16Word.bswap_src1().raw
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(0),
+            src2=ASTOperand.literal(sel),
+        )
+        self.interp.execute(instr)
+        self.assertEqual(self.rf.get_vgpr(0) & MASK16, 0x3412)
+
+    def test_dst_aliases_all_sources(self):
+        # D == src0 == src1 == src2: single register v0
+        self.rf.set_vgpr(0, 0x0000)
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(0),
+            src2=ASTOperand.vgpr(0),
+        )
+        self.interp.execute(instr)
+        self.assertEqual(self.rf.get_vgpr(0) & MASK16, 0x0000)
+
+    def test_inplace_bswap(self):
+        self.rf.set_vgpr(3, 0xCAFE)
+        sel = PermSelectorB16Word.bswap_src1().raw
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B16,
+            dst=ASTOperand.vgpr(3),
+            src0=ASTOperand.vgpr(3),
+            src1=ASTOperand.vgpr(3),
+            src2=ASTOperand.literal(sel),
+        )
+        self.interp.execute(instr)
+        self.assertEqual(self.rf.get_vgpr(3) & MASK16, 0xFECA)
+
+    def test_inplace_broadcast_and_sign_ext(self):
+        self.rf.set_vgpr(7, 0x807F)  # bit 15 is 1, bit 7 is 0
+        sel = make_selector_16(SEL_SIGN_EXT_SRC0_B1, SEL_SRC0_B0)
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B16,
+            dst=ASTOperand.vgpr(7),
+            src0=ASTOperand.vgpr(7),
+            src1=ASTOperand.vgpr(7),
+            src2=ASTOperand.literal(sel),
+        )
+        self.interp.execute(instr)
+        # Byte 0 gets sign-ext of bit 15 (0xFF), Byte 1 gets S0[7:0] (0x7F) -> 0x7FFF
+        self.assertEqual(self.rf.get_vgpr(7) & MASK16, 0x7FFF)
+
+    def test_simd_multi_lane_aliasing(self):
+        wave = SIMDWaveState(num_lanes=32)
+        wave.set_wave_vgpr(0, [((i & 0xFF) << 8) | (i & 0xFF) for i in range(32)])
+        sel = PermSelectorB16Word.bswap_src1().raw
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(0),
+            src2=ASTOperand.literal(sel),
+        )
+        wave.execute_instruction(instr)
+
+        for lane in range(32):
+            expected = ((lane & 0xFF) << 8) | (lane & 0xFF)
+            self.assertEqual(wave.get_lane_vgpr(0, lane) & MASK16, expected)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
