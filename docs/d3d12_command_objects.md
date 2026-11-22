@@ -363,7 +363,8 @@ section 3.4 measured in the BVH builder's helper without a meaning (`+0x18`, `+0
 **With the cursor at the limit, every command goes through the vtable**: that is how `fsr_dispatch_test` records
 them, and it is the simplest contract for a layer that does not want to decode these packets. Whether the game's
 executable makes the same check before writing is unknown until it is available; it is compiled against the same
-console headers.
+console headers. The runtime's list proxy (device slots 12/51, [d3d12_vulkan.md §3.1](d3d12_vulkan.md)) uses this map
+and the same cursor rule.
 
 ### 3.5 What the package does not measure
 

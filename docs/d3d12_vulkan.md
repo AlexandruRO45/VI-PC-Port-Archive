@@ -94,6 +94,24 @@ enough for the bundled middleware's `d3d12_xs` calls, not for the game. The laye
   command-list recording and queue submission. Records contain fixed API names and outcomes only. See
   [the runtime guide](../runtime/README.md#first-boot-d3d12-trace) for collecting a trace.
 
+**Command lists.** Device slots 12 `CreateCommandList` and 51 `CreateCommandList1` (the public slots; not measured
+on the console) wrap the PC list in a list proxy (`d3d12_xs_device.h`) whose vtable is the console list order
+measured with the FSR DLL ([d3d12_command_objects.md §3.5a](d3d12_command_objects.md)):
+
+| Console slot | PC slot | Notes |
+|---|---|---|
+| 0–26 | 0–26 | 14, 15, 25 and 26 are measured at their PC index, so nothing is inserted before 26; 7 `GetDevice` returns the device proxy |
+| 32 | 28 `SetDescriptorHeaps` | heap proxies are replaced by their PC heaps |
+| 33, 35, 41, 53, 61 | 29, 31, 37, 49, 59 | 33 and 41 are inferred from the argument shape |
+| any other, up to 160 | — | counted, logged once, `E_NOTIMPL` without a PC call |
+
+The object keeps `0x600` bytes of console fields after the vtable, with the write cursor (`+0x18`) equal to both
+limits (`+0x28`, `+0x30`), so a console-compiled caller has no room to write packets itself and calls the vtable
+for every command. `QueryInterface` answers every list interface the PC list implements with the same proxy. The
+proxy holds a reference to the PC list and to the device proxy. A queue must be given the PC lists:
+`list_proxy_real_list` returns the PC list behind a proxy (borrowed), and the Xbox-ABI queue proxy replaces each
+proxy with it in `ExecuteCommandLists`.
+
 **Measured, not assumed:** the Xbox device ABI is not uniformly the desktop order. Slots 1/15/18/19/27/38 matched
 in the prior art, while slots 62 and 76 and the heap start-handle return convention did not. Treat every slot as
 unverified until traced; the public interface names and IIDs may still be usable, but the slot mapping is not
@@ -270,7 +288,9 @@ What is implemented (all of it testable without the game):
   consumes the dynamic state can, and this layer has no pipeline or draw path.
 - **Device** (`runtime/shims/d3d12_vulkan_device.cpp`): an `ID3D12Device11` (PC ABI, 80 slots) that the Xbox-ABI
   proxy (`d3d12_xs_device.cpp`) forwards to, so slot 14's heap-handle conversion and slot 76's resource creation
-  work unchanged. It creates the objects above, plus:
+  work unchanged. Command lists from the proxy's slots 12 and 51 come back as console-order list proxies (below),
+  so a C++ test that records through the PC header uses `list_proxy_real_list` (`runtime/test/xs_pc_list.h`).
+  It creates the objects above, plus:
   - descriptor heaps whose slots are 32 bytes (`GetDescriptorHandleIncrementSize`; the console's increments are
     question 4). RTV/DSV slots hold a `TargetView`; shader-visible heaps return a GPU handle, but nothing reads it
     yet;
