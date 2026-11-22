@@ -69,6 +69,27 @@ class Rgba16Tests(unittest.TestCase):
                                           dxgi=11, pitch=pitch))
 
 
+class NarrowUnormTests(unittest.TestCase):
+    def test_channel_defaults_and_padded_rows(self):
+        cases = (
+            (61, bytes([0, 255]), bytes([0, 0, 0, 255, 255, 0, 0, 255])),
+            (49, bytes([1, 2, 3, 4]), bytes([1, 2, 0, 255, 3, 4, 0, 255])),
+            (56, struct.pack("<2H", 128, 129), bytes([0, 0, 0, 255, 1, 0, 0, 255])),
+            (35, struct.pack("<4H", 32767, 32768, 65535, 0), bytes([127, 128, 0, 255, 255, 0, 0, 255])),
+        )
+        for fmt, row, expected in cases:
+            with self.subTest(fmt=fmt):
+                image = dds_buffer(2, 2, row + b"pad!" + row, flags=DDPF_FOURCC,
+                                   fourcc=b"DX10", dxgi=fmt, pitch=len(row) + 4)
+                self.assertEqual(dds.decode_dds(image), (2, 2, expected * 2))
+                with self.assertRaisesRegex(dds.DdsError, "Truncated"):
+                    dds.decode_dds(image[:-1])
+                bad_pitch = bytearray(image)
+                struct.pack_into("<I", bad_pitch, 20, len(row) - 1)
+                with self.assertRaisesRegex(dds.DdsError, "row pitch"):
+                    dds.decode_dds(bad_pitch)
+
+
 def bc1_block(c0, c1, rows):
     """One BC1 block; rows holds the four per-row index bytes."""
     return struct.pack("<HHI", c0, c1, int.from_bytes(bytes(rows), "little"))

@@ -1,6 +1,6 @@
 """Pure standard-library DDS to PNG decoder and 2x box-filter downscaler.
 
-Supports DX10 RGBA16_UNORM and legacy and DX10 DDS headers across uncompressed 32-bit formats
+Supports DX10 R8, RG8, R16, RG16 and RGBA16 UNORM and legacy and DX10 DDS headers across uncompressed 32-bit formats
 (BGRA8, RGBA8, BGRX8, RGBX8, and arbitrary 32-bit RGB/RGBA bitmasks) and
 block-compressed formats (BC1, BC2, BC3, BC4, BC5, BC7).
 
@@ -52,6 +52,10 @@ _FOURCC_MAP: dict[bytes, str] = {
 
 _DXGI_MAP: dict[int, str] = {
     11: "RGBA16_UNORM",
+    35: "RG16_UNORM",
+    49: "RG8_UNORM",
+    56: "R16_UNORM",
+    61: "R8_UNORM",
     28: "RGBA8",
     29: "RGBA8",
     87: "BGRA8",
@@ -243,7 +247,8 @@ def _decode_uncompressed(
     pitch: int,
 ) -> bytes:
     pixel_count = width * height
-    row_bytes = width * (8 if fmt == "RGBA16_UNORM" else 4)
+    row_bytes = width * {"RGBA16_UNORM": 8, "RG16_UNORM": 4, "RG8_UNORM": 2,
+                         "R16_UNORM": 2, "R8_UNORM": 1}.get(fmt, 4)
     pitch = pitch or row_bytes
     if pitch < row_bytes:
         raise DdsError(f"Invalid {fmt} row pitch: {pitch} bytes (need at least {row_bytes})")
@@ -259,6 +264,19 @@ def _decode_uncompressed(
             out[y * width * 4 : (y + 1) * width * 4] = bytes(
                 (value + 128) // 257 for (value,) in struct.iter_unpack("<H", row)
             )
+        return bytes(out)
+
+    if fmt in ("R8_UNORM", "RG8_UNORM", "R16_UNORM", "RG16_UNORM"):
+        channels = 2 if fmt.startswith("RG") else 1
+        out = bytearray(pixel_count * 4)
+        for y in range(height):
+            row = payload[y * pitch : y * pitch + row_bytes]
+            values = bytes((value + 128) // 257 for (value,) in struct.iter_unpack("<H", row)) if "16" in fmt else bytes(row)
+            start, end = y * width * 4, (y + 1) * width * 4
+            out[start:end:4] = values[::channels]
+            if channels == 2:
+                out[start + 1:end:4] = values[1::2]
+            out[start + 3:end:4] = b"\xff" * width
         return bytes(out)
 
     if pitch == row_bytes:
@@ -900,7 +918,7 @@ def decode_dds(data: bytes) -> tuple[int, int, bytes]:
     fmt = str(info["format"])
     offset = int(info["data_offset"])  # type: ignore[arg-type]
 
-    if fmt in ("RGBA8", "BGRA8", "BGRX8", "RGBX8", "RGBA16_UNORM"):
+    if fmt in ("RGBA8", "BGRA8", "BGRX8", "RGBX8", "RGBA16_UNORM", "R8_UNORM", "RG8_UNORM", "R16_UNORM", "RG16_UNORM"):
         flags = struct.unpack_from("<I", data, 8)[0]
         pitch = struct.unpack_from("<I", data, 20)[0] if flags & DDSD_PITCH else 0
         rgba = _decode_uncompressed(memoryview(data)[offset:], width, height, fmt, masks, pitch)
