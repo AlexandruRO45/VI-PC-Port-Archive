@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "command_list.h"
+#include "indirect_count_spv.h"
 #include "indirect_patch_spv.h"
 #include "vulkan_scratch.h"
 
@@ -46,7 +47,10 @@ struct IndirectPlan {
     VkDeviceSize sequences_size = 0;
     VkDeviceAddress preprocess = 0;
     VkDeviceSize preprocess_size = 0;
-    VkDeviceAddress count_address = 0;  // 0: max_count sequences
+    // The count buffer (0: max_count sequences): `count_source` is the application's word, `count_address` a scratch word
+    // the prepass fills with min(that, max_count), which is what the generated commands read.
+    VkDeviceAddress count_source = 0;
+    VkDeviceAddress count_address = 0;
     std::uint32_t max_count = 0;
     // The pass that rebases buffer views (patch_count == 0: none).
     VkDeviceAddress patch_source = 0;
@@ -138,6 +142,7 @@ public:
         for (auto& entry : layouts_)
             if (entry.second.layout) fn_.vkDestroyIndirectCommandsLayoutEXT(device_, entry.second.layout, nullptr);
         if (patch_pipeline_) fn_.vkDestroyPipeline(device_, patch_pipeline_, nullptr);
+        if (count_pipeline_) fn_.vkDestroyPipeline(device_, count_pipeline_, nullptr);
         if (patch_layout_) fn_.vkDestroyPipelineLayout(device_, patch_layout_, nullptr);
     }
     IndirectExpander(const IndirectExpander&) = delete;
@@ -179,7 +184,15 @@ public:
         out.sequences_size = span;
         const VkDeviceAddress arguments = address(r.argument_buffer) + r.argument_offset;
         if (!arguments) return false;
-        if (r.count_buffer) out.count_address = address(r.count_buffer) + r.count_offset;
+        if (r.count_buffer) {
+            // D3D12 runs min(count, MaxCommandCount); the extension wants the value it reads to be at most
+            // maxSequenceCount (VUID-VkGeneratedCommandsInfoEXT-sequenceCountAddress-11068), so bound it on the GPU.
+            VkBuffer bounded = VK_NULL_HANDLE;
+            VkDeviceSize at = 0;
+            if (!copies_->get(4, bounded, at) || !patch_ready()) return false;
+            out.count_source = address(r.count_buffer) + r.count_offset;
+            out.count_address = copies_->address(bounded, at);
+        }
         out.layout = layout_for(*r.signature, r.pipeline_layout, stages, compute);
         if (!out.layout) return false;
         // Buffer views: rebase them in a scratch copy.
@@ -244,12 +257,28 @@ public:
     // Outside rendering: the pass that rebases buffer views (a no-op for a plan without any), ordered after whatever
     // wrote the records and before the commands that read the copy.
     void emit_prepass(VkCommandBuffer cb, const IndirectPlan& plan) const {
-        if (!plan.patch_count) return;
+        if (!plan.patch_count && !plan.count_source) return;
         VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         before.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
         before.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         fn_.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
                                  &before, 0, nullptr, 0, nullptr);
+        if (plan.count_source) {
+            const struct { std::uint64_t source, destination, unused; std::uint32_t maximum; } count{
+                plan.count_source, plan.count_address, 0, plan.max_count};
+            fn_.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, count_pipeline_);
+            fn_.vkCmdPushConstants(cb, patch_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(count), &count);
+            fn_.vkCmdDispatch(cb, 1, 1, 1);
+        }
+        if (plan.patch_count) emit_patch(cb, plan);
+        VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        after.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        after.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        fn_.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1,
+                                 &after, 0, nullptr, 0, nullptr);
+    }
+
+    void emit_patch(VkCommandBuffer cb, const IndirectPlan& plan) const {
         struct Push {
             std::uint64_t source, destination, heap_base;
             std::uint32_t dwords, stride_dwords, patch_count, offsets[IndirectPlan::max_patches];
@@ -262,11 +291,6 @@ public:
         // invocations row by row, so any record count fits.
         const std::uint32_t groups = (plan.patch_dwords + 63) / 64, columns = std::min(groups, 65535u);
         fn_.vkCmdDispatch(cb, columns, (groups + columns - 1) / columns, 1);
-        VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        after.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        after.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-        fn_.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1,
-                                 &after, 0, nullptr, 0, nullptr);
     }
 
     // Inside rendering for a draw layout, outside it for a dispatch layout, with the pipeline and push constants bound.
@@ -446,31 +470,41 @@ private:
     bool patch_ready() {
         if (patch_pipeline_) return true;
         VkPipelineLayout layout = VK_NULL_HANDLE;
-        VkShaderModule shader = VK_NULL_HANDLE;
         VkPipeline pipeline = VK_NULL_HANDLE;
         const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 8 * 3 + 4 * 3 + 4 * IndirectPlan::max_patches};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
         layout_info.pPushConstantRanges = &push;
         bool ok = fn_.vkCreatePipelineLayout(device_, &layout_info, nullptr, &layout) == VK_SUCCESS;
-        VkShaderModuleCreateInfo module{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        module.codeSize = sizeof(indirect_patch_spirv);
-        module.pCode = indirect_patch_spirv;
-        ok = ok && fn_.vkCreateShaderModule(device_, &module, nullptr, &shader) == VK_SUCCESS;
-        VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-        info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        info.stage.module = shader;
-        info.stage.pName = "main";
-        info.layout = layout;
-        ok = ok && fn_.vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline) == VK_SUCCESS;
-        if (shader) fn_.vkDestroyShaderModule(device_, shader, nullptr);
+        // The rebase pass and the count pass share a layout (one push-constant range).
+        const auto make = [&](const std::uint32_t* code, std::size_t bytes, VkPipeline& out) {
+            VkShaderModule shader = VK_NULL_HANDLE;
+            VkShaderModuleCreateInfo module{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            module.codeSize = bytes;
+            module.pCode = code;
+            bool made = ok && fn_.vkCreateShaderModule(device_, &module, nullptr, &shader) == VK_SUCCESS;
+            VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            info.stage.module = shader;
+            info.stage.pName = "main";
+            info.layout = layout;
+            made = made && fn_.vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &out) == VK_SUCCESS;
+            if (shader) fn_.vkDestroyShaderModule(device_, shader, nullptr);
+            return made;
+        };
+        VkPipeline counter = VK_NULL_HANDLE;
+        ok = make(indirect_patch_spirv, sizeof(indirect_patch_spirv), pipeline) &&
+             make(indirect_count_spirv, sizeof(indirect_count_spirv), counter);
         if (!ok) {
+            if (pipeline) fn_.vkDestroyPipeline(device_, pipeline, nullptr);
+            if (counter) fn_.vkDestroyPipeline(device_, counter, nullptr);
             if (layout) fn_.vkDestroyPipelineLayout(device_, layout, nullptr);
             return false;
         }
         patch_layout_ = layout;
         patch_pipeline_ = pipeline;
+        count_pipeline_ = counter;
         return true;
     }
 
@@ -487,7 +521,7 @@ private:
     std::unique_ptr<ScratchBuffers> copies_;
     std::map<std::uint32_t, std::unique_ptr<ScratchBuffers>> preprocess_;  // by allowed memory types
     VkPipelineLayout patch_layout_ = VK_NULL_HANDLE;
-    VkPipeline patch_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline patch_pipeline_ = VK_NULL_HANDLE, count_pipeline_ = VK_NULL_HANDLE;
 };
 
 }  // namespace leonida

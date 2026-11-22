@@ -394,7 +394,7 @@ int main() {
             list->ExecuteIndirect(signature.p, 8, arguments_buffer.p, at, nullptr, 0);                          // records 0..7
             list->ExecuteIndirect(signature.p, 8, arguments_buffer.p, at + 8 * draw_stride, count_buffer.p, 0);  // 5 of 8
             list->ExecuteIndirect(signature.p, 3, arguments_buffer.p, at + 13 * draw_stride, count_buffer.p, 4);  // count 0
-            list->ExecuteIndirect(signature.p, 2, arguments_buffer.p, at + 14 * draw_stride, count_buffer.p, 8);  // 100 of 2
+            list->ExecuteIndirect(signature.p, 2, arguments_buffer.p, at + 13 * draw_stride, count_buffer.p, 8);  // 100 of 2: cells 13, 14
             list->ExecuteIndirect(signature.p, 8, exact_buffer.p, 0, nullptr, 0);                               // records 0..7 again
             const auto to_copy = transition(image.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
             list->ResourceBarrier(1, &to_copy);
@@ -412,7 +412,7 @@ int main() {
             Image want;
             for (unsigned r = 0; r < 8; ++r) paint(want, draw_record(r));        // records 0..7
             for (unsigned r = 8; r < 13; ++r) paint(want, draw_record(r));       // 5 of 8
-            for (unsigned r = 14; r < 16; ++r) paint(want, draw_record(r));      // count 100 of MaxCommandCount 2
+            for (unsigned r = 13; r < 15; ++r) paint(want, draw_record(r));      // count 100 of MaxCommandCount 2: not cell 15
             cells_drawn = 8 + 5 + 2;
             void* data = nullptr;
             EXPECT(SUCCEEDED(readback->Map(0, nullptr, &data)));

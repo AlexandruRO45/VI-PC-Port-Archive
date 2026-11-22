@@ -3220,6 +3220,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                    VK_PIPELINE_STAGE_TRANSFER_BIT);
             vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, 1, p.buffer_copies.data());
         } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command); ind && !ind->state) {
+            if (ind->signature) vk.indirect_prepass(command_buffer, p.indirect);  // before the dispatch pipeline is bound
             if (ind->kind == IndirectKind::dispatch && ind->pipeline) {  // the pipeline and root arguments recorded
                 ShaderUserData data{};
                 std::copy(ind->user_data.begin(), ind->user_data.end(), data.s);
