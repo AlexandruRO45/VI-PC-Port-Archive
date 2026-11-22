@@ -73,6 +73,28 @@ cmake --build --preset dev --target cpu_crc_line_lifted cpu_crc_castagnoli_lifte
 ctest --preset dev --no-tests=error -R '^cpu_native_crc_line$' -V
 ```
 
+## EXE startup through the desktop runtime shims
+
+The source-built `cpu_shim_startup` EXE calls a companion DLL that links
+against the desktop `xmem.dll` and `d3d12_xs.dll`. The DLL checks that its
+process attach ran once before the call. It allocates, writes, queries and frees
+a page-backed XMem block, then checks that the freed range is no longer committed
+or registered as graphics memory under the desktop policy. It also checks the
+unsupported working-set reply and round-trips a tagged root signature. The
+resulting descriptor retains its root constants and the desktop flag.
+
+`cpu_native_shim_startup` runs the same EXE and companion under Windows and
+under `pe_map`. The mapped host loads both desktop shims from the build and
+maps the companion before resolving its entry export for the EXE. The test
+checks all six shim requests, the ordered output, exit status 42 and the
+mapped host's return marker. Withholding either provider identifies the first
+unbound import from that DLL before guest entry.
+
+```powershell
+cmake --build --preset dev --target cpu_shim_startup pe_map
+ctest --preset dev --no-tests=error -R '^cpu_native_shim_startup$' -V
+```
+
 ## Source-built EXE entry to a DLL import
 
 MSVC assembles a small CRT-free [EXE entry body](../tests/cpu/exe_entry.asm) and links it with the existing `call_mix` fixture. The [translator](../tools/cpu_exe_aot.py) takes the fixture's `native_entry` export through `--entry-export`, reads its unwind-bounded instruction range, follows the relative call to `call_mix`, and resolves its IAT slot against `cpu_import_provider.dll!mix_args`. It emits both functions as C++. The translated EXE uses ordinary Windows C++ startup to enter the generated `main`. Both versions use the same native provider and the same I/O DLL.
@@ -557,6 +579,8 @@ The shared lowering also handles 32-bit and 64-bit BMI2 forms (`bzhi`, `mulx`, `
 All seven SHA-NI forms (`sha1msg1`, `sha1msg2`, `sha1nexte`, `sha1rnds4`, `sha256msg1`, `sha256msg2`, `sha256rnds2`) are also lowered for legacy XMM encodings. `cpu_aot_crypto_sha` probes CPUID leaf 7 subleaf 0 EBX bit 29 (`SHA`) before invoking the native fixture and exits 77 on hosts without SHA-NI; on SHA-NI-capable hosts it builds all 10 exports from MASM source (`tests/cpu/crypto_sha.asm`, covering all four `sha1rnds4` round-function selectors), translates them, compares exact 16-byte outputs against the native DLL, and checks that unmodeled registers are rejected. Run `cmake --build --preset dev --target cpu_crypto_sha_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_crypto_sha$' -V`.
 
 The shared lowering also handles 32-bit and 64-bit `mul`, `div`, `idiv`, `xadd`, and `cmpxchg` (with `LOCK` still rejected by the prefix guard), using portable 128-bit arithmetic for 64-bit widening multiply/divide. `cpu_aot_mul_div` builds all 10 exports from MASM source (`tests/cpu/mul_div.asm`), translates them, and compares results and ZF/CF flags against the native DLL and a reference model. Run `cmake --build --preset dev --target cpu_mul_div_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_mul_div$' -V`.
+
+The shared lowering also handles all six unsigned/equality `cmovcc` (`cmove`, `cmovne`, `cmova`, `cmovae`, `cmovb`, `cmovbe`) and `setcc` (`sete`, `setne`, `seta`, `setae`, `setb`, `setbe`) forms, unconditionally zero-extending 32-bit `cmovcc` destinations and preserving upper bytes on `setcc`. `cpu_aot_cmov_setcc` builds 13 exports from MASM source (`tests/cpu/cmov_setcc.asm`), translates them, and compares results against the native DLL and a reference model. Run `cmake --build --preset dev --target cpu_cmov_setcc_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_cmov_setcc$' -V`.
 
 ## Recompiling a direct x64 call
 
@@ -1381,6 +1405,8 @@ The same binary and draw checks cover `v_trunc_f32` in e32 and e64 forms. The lo
 The `v_ceil_f32` fixture checks rounding toward positive infinity in e32 and e64 encodings. It compares finite integral and fractional inputs of both signs, including signed zero, and exercises e64 absolute value, negation and clamp. Replacing the e32 ceiling with a floor must produce a pixel mismatch. The translator rejects a ceiling write into a pending texture sample destination before `vmcnt(0)`. [AMD RDNA 2 ISA reference](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
 
 The `v_cvt_f32_ubyte0` to `v_cvt_f32_ubyte3` fixture converts byte 0 to 3 of a source word to binary32, as an unsigned integer. The source is read as bits through `asuint`, so float modifiers do not apply and the translator does not accept them. Each output reads a different byte of a constant word in e32 and e64 encodings, and the last uses clamp. The words are normal binary32 values with four distinct bytes, so the bits survive the constant buffer and reading the wrong byte changes the result. Replacing `ubyte1` with `ubyte0` must produce a pixel mismatch.
+
+The `v_rcp_iflag_f32` fixture lowers the reciprocal that compilers emit in integer-division sequences as an ordinary `1.0f / x`. The flag it raises for the integer divide has no desktop equivalent, and nothing in the fixture reads it. Power-of-two inputs of both signs keep every reciprocal exact. Zero and negative zero give signed infinities, and clamp turns +inf into 1, through e32 and e64 encodings with absolute value and negation. Replacing the reciprocal with a square root must produce a pixel mismatch.
 
 The translator accepts the gfx10 scheduling hints `s_clause`, `s_setprio` and `s_sleep`, which affect timing only, and lowers each exactly like `s_nop 0` at the same position. Each operand must fit its RDNA 2 field: 6 bits of clause length minus one, a 2-bit wave priority and a 7-bit sleep duration. A larger value is rejected. `s_code_end` stays rejected: the native program ends at `s_endpgm`, so padding after it never reaches the translator. Any instruction after `s_endpgm` and any hint between the color export and `s_endpgm` is rejected. The hinted program is part of the LLVM assemble and disassemble round trip.
 The same binary and draw checks cover two SOPK forms, `s_addk_i32` and `s_mulk_i32`, on 32-bit scalar values. LLVM prints a negative `simm16` as an unsigned 16-bit word such as `0xfffe`; the lowerer sign-extends it to 32 bits before adding or multiplying modulo 2**32. Each SOPK instruction has one SGPR operand: the destination is also the source. It can hold an inline scalar bit pattern or one constant word from the tracked descriptor, and the result is read by a vector move through `asfloat`. The fixture copies two constant words into scratch SGPRs, multiplies the first by 3, adds -2 to the second and exports both bit patterns. Out-of-range immediates, descriptor-register sources, vector destinations and writes that overlap an outstanding constant load are rejected. `s_addk_i32` writes SCC with signed 32-bit overflow, which the lowerer tracks so a following `s_cmov_b64` can consume it; `s_mulk_i32` leaves SCC unchanged. Changing the multiply immediate from 3 to 5 must report a `pixel_mismatch`. [AMD RDNA 2 instruction set](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
