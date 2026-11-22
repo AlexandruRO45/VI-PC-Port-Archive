@@ -596,10 +596,6 @@ public:
         if (!command_signature_info(signature, kind, stride, &full) || !argument_buffer) return check(false);
         leonida::ExecuteIndirect cmd{};
         cmd.signature = full;
-        // A dispatch takes the list's compute state, as Dispatch does.
-        if (kind == leonida::IndirectKind::dispatch && max_command_count && compute_pipeline_ && compute_.layout)
-            cmd.compute = std::make_shared<const leonida::Dispatch>(
-                leonida::Dispatch{compute_pipeline_, compute_.data, 0, 0, 0});
         // A draw takes the list's graphics state, as DrawInstanced does; with nothing to rasterize it is dropped. A
         // list with no pipeline, root signature or topology yet records the bare call (it closes, as on the PC
         // runtime; it is not a call replay can run).
@@ -1413,11 +1409,12 @@ HRESULT build_indirect_signature(const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D1
         a.offset = offset;
         // The user-data dwords [first, first + count) of root parameter `index`, which must be of `type`.
         const auto root_dwords = [&](UINT index, rt::rootsig::ParamType type, UINT dest, UINT count,
-                                     UINT limit) -> HRESULT {
+                                     UINT limit, UINT descriptor_type = 0) -> HRESULT {
             root_arguments = true;
             if (!layout || index >= layout->parameters.size() || layout->parameters[index].type != type)
                 return E_INVALIDARG;
             const RootArgumentLayout::Parameter& p = layout->parameters[index];
+            if (descriptor_type && p.descriptor_type != descriptor_type) return E_INVALIDARG;
             if (!count || std::uint64_t(dest) + count > limit) return E_INVALIDARG;
             a.user_dword = p.user_offset + dest;
             a.dwords = count;
@@ -1465,7 +1462,9 @@ HRESULT build_indirect_signature(const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D1
                                : arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW
                                    ? arg.ShaderResourceView.RootParameterIndex
                                    : arg.UnorderedAccessView.RootParameterIndex;
-            hr = root_dwords(index, rt::rootsig::ParamType::Descriptor, 0, 2, 2);
+            hr = root_dwords(index, rt::rootsig::ParamType::Descriptor, 0, 2, 2,
+                             arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW ? 2u
+                             : arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW ? 3u : 4u);
             a.type = IndirectArgumentType::root_view;
             a.size = sizeof(D3D12_GPU_VIRTUAL_ADDRESS);
             break;

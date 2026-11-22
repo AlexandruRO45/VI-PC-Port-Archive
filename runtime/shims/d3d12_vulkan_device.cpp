@@ -3173,6 +3173,13 @@ public:
                                                                       info.buffer_device_address);
         state_.context->set_indirect_features(info.multi_draw_indirect, info.draw_indirect_count,
                                               info.max_draw_indirect_count ? info.max_draw_indirect_count : UINT32_MAX);
+        if (info.indirect_commands && info.buffer_device_address)
+            state_.context->enable_indirect_commands(get_device, info.indirect_properties,
+                                                     [this](const VkMemoryRequirements& requirements) {
+                                                         return state_.allocate(requirements, 0,
+                                                                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                                                                nullptr, true);
+                                                     });
         if (!info.draw_indirect_first_instance)
             std::fprintf(stderr, "[rt] d3d12: drawIndirectFirstInstance is not enabled: ExecuteIndirect records with "
                                  "a StartInstanceLocation other than 0 are invalid\n");
@@ -3840,7 +3847,8 @@ public:
                     first = d;
                     break;
                 }
-            layout.parameters.push_back({parsed.sig.params[i].type, first, parsed.sig.params[i].num_values});
+            layout.parameters.push_back({parsed.sig.params[i].type, first, parsed.sig.params[i].num_values,
+                                     parsed.sig.params[i].descriptor_type});
         }
         auto* signature = new RootSignature(std::move(layout));
         signature->attach_device(identity());
@@ -6398,6 +6406,19 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &host_copy};
         vkGetPhysicalDeviceFeatures2(info.physical, &query);
     }
+    // ExecuteIndirect with multi-argument command signatures (vulkan_indirect.h).
+    leonida::IndirectExpander::Support indirect_support;
+    if (chosen12.bufferDeviceAddress &&
+        indirect_support.query(vkGetPhysicalDeviceFeatures2, vkGetPhysicalDeviceProperties2, info.physical, extensions)) {
+        const void* head = *v13.next();
+        indirect_support.chain(head);
+        *v13.next() = const_cast<void*>(head);
+        info.indirect_commands = true;
+        info.indirect_properties = indirect_support.properties;
+    } else {
+        std::fprintf(stderr, "[rt] d3d12: no VK_EXT_device_generated_commands: ExecuteIndirect with more than a draw or "
+                             "dispatch argument per command is unsupported\n");
+    }
     const char* host_image_copy_name = VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME;
     info.host_image_copy = has_host_image_copy && host_copy.hostImageCopy;
     if (info.host_image_copy) {
@@ -6491,6 +6512,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (info.image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);
     if (info.host_image_copy) device_extensions.push_back(host_image_copy_name);
+    if (info.indirect_commands) leonida::IndirectExpander::Support::add_extensions(device_extensions);
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
     if (info.shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 #endif

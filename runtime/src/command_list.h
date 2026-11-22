@@ -591,13 +591,6 @@ struct IndirectSignature {
 };
 
 struct ExecuteIndirect {
-    // Set for a signature with more than the draw or dispatch argument (null for the simple ones, and for the raw
-    // calls of the unit tests): `kind` and `stride` then repeat its values.
-    std::shared_ptr<const IndirectSignature> signature;
-    // The list's compute state at the call, for the dispatch kind: replay binds the pipeline and pushes the user
-    // data before the dispatches (its x, y, z are unused: the argument buffer holds them). Null: the caller has
-    // done that (a raw call).
-    std::shared_ptr<const Dispatch> compute;
     IndirectKind kind = IndirectKind::draw;
     std::uint32_t stride = 0;
     std::uint32_t max_count = 0;
@@ -619,6 +612,10 @@ struct ExecuteIndirect {
     // as it is.
     std::uintptr_t pipeline = 0;
     std::array<std::uint32_t, 32> user_data{};
+    // Set for a signature with more than the draw or dispatch argument (null for the simple ones, and for the raw
+    // calls of the unit tests): `kind` and `stride` then repeat its values. Last, so the unit tests that fill the
+    // struct in order are unaffected.
+    std::shared_ptr<const IndirectSignature> signature;
 };
 
 // Triangle geometry descriptor for a BLAS build (ID3D12GraphicsCommandList4::BuildRaytracingAccelerationStructure).
@@ -874,9 +871,6 @@ public:
     bool execute_indirect(const ExecuteIndirect& indirect) {
         if (!indirect.argument_buffer || !indirect.stride) return false;
         if (indirect.state && (!indirect.state->pipeline || indirect.kind == IndirectKind::dispatch)) return false;
-        if (indirect.compute && (!indirect.compute->pipeline || indirect.kind != IndirectKind::dispatch ||
-                                 indirect.state))
-            return false;
         if (indirect.signature && (indirect.signature->stride != indirect.stride ||
                                    indirect.signature->arguments.empty() || indirect.signature->kind != indirect.kind))
             return false;

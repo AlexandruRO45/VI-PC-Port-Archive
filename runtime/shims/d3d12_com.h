@@ -109,6 +109,10 @@ struct VulkanDeviceInfo {
     // drawIndirectFirstInstance is enabled: indirect records may have a StartInstanceLocation other than 0. Without
     // it such a record is invalid Vulkan (the layer cannot see inside the GPU buffer, so it only says so once).
     bool draw_indirect_first_instance = false;
+    // VK_EXT_device_generated_commands and VK_KHR_maintenance5 are enabled (IndirectExpander::Support): ExecuteIndirect
+    // with a command signature of more than one argument. Without them such a call is unsupported.
+    bool indirect_commands = false;
+    leonida::IndirectExpander::Properties indirect_properties;
     // VkPhysicalDeviceLimits::maxDrawIndirectCount (a call takes at most this many records); 0 means unknown, no cap.
     std::uint32_t max_draw_indirect_count = 0;
     bool sampler_mirror_clamp_to_edge = false;
@@ -287,6 +291,7 @@ struct RootArgumentLayout {
         rt::rootsig::ParamType type;
         std::uint32_t user_offset;     // first dword; unused for a parameter with no dwords
         std::uint32_t constant_count;  // constants only
+        std::uint32_t descriptor_type = 0;  // root descriptors: 2 CBV, 3 SRV, 4 UAV
     };
     std::vector<Parameter> parameters;
 };

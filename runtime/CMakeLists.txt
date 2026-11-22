@@ -1255,6 +1255,36 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_m5_world_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_m5_world COMMAND d3d12_m5_world_test)
       set_tests_properties(d3d12_m5_world PROPERTIES SKIP_RETURN_CODE 77)
+
+      # ExecuteIndirect with multi-argument command signatures (VK_EXT_device_generated_commands): root constants, vertex
+      # and index buffer views and root descriptors per record, drawn and dispatched, with a count buffer, and
+      # CreateCommandSignature compared with the host runtime. vs_ma (with a vertex-fetch input signature), ps_ma, cs_ma.
+      set(LEONIDA_MA_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/ma_shaders)
+      set(LEONIDA_MA_FILES ${LEONIDA_MA_DIR}/spirv/index.json ${LEONIDA_MA_DIR}/fssm/vs_ma.fssm
+                           ${LEONIDA_MA_DIR}/fssm/ps_ma.fssm ${LEONIDA_MA_DIR}/fssm/cs_ma.fssm)
+      add_custom_command(
+        OUTPUT ${LEONIDA_MA_FILES}
+        COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_MA_DIR}
+        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
+                $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${LEONIDA_MA_DIR} vs_ma ps_ma cs_ma
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_ma.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_ma.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_ma.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
+        COMMENT "Translating vs_ma, ps_ma and cs_ma for the multi-argument ExecuteIndirect test"
+        VERBATIM)
+      add_executable(d3d12_indirect_multiarg_test test/d3d12_indirect_multiarg_test.cpp shims/d3d12_xs_device.cpp
+                     ${LEONIDA_MA_FILES})
+      target_link_libraries(d3d12_indirect_multiarg_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+      target_compile_definitions(d3d12_indirect_multiarg_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_MA_DIR="${LEONIDA_MA_DIR}")
+      target_compile_options(d3d12_indirect_multiarg_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_indirect_multiarg COMMAND d3d12_indirect_multiarg_test)
+      set_tests_properties(d3d12_indirect_multiarg PROPERTIES SKIP_RETURN_CODE 77)
+
       # M4 (synthetic part): compute PSOs, a UAV table (structured and raw buffers, an R32_UINT storage image), an indirect
       # dispatch from arguments a first dispatch wrote, and a copy queue that streams the input in and reads the results
       # back across queue fences. cs_m4_fill.asm and cs_m4_indirect.asm go through the same build; build.py publishes

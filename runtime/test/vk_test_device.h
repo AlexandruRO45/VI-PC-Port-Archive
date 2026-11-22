@@ -9,6 +9,7 @@
 #include "../src/vulkan13_features.h"
 #include "vk_device_pick.h"
 #include "../src/subgroup_size.h"
+#include "../src/vulkan_indirect.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -106,6 +107,8 @@ public:
     bool multi_draw_indirect = false;  // multiDrawIndirect enabled, where the device has it
     bool draw_indirect_count = false;  // drawIndirectCount (Vulkan 1.2) enabled, where the device has it
     std::uint32_t max_draw_indirect_count = 0;  // VkPhysicalDeviceLimits::maxDrawIndirectCount
+    bool indirect_commands = false;  // VK_EXT_device_generated_commands (+ maintenance5) enabled: multi-argument signatures
+    leonida::IndirectExpander::Properties indirect_properties;
     bool draw_indirect_first_instance = false;  // drawIndirectFirstInstance enabled: indirect records may start at an instance
     bool shader_fma = false;       // VK_KHR_shader_fma and shaderFmaFloat32 enabled (OpFmaKHR, rdna2spirv.py --fma khr)
     bool occlusion_query_precise = false;    // occlusionQueryPrecise enabled
@@ -437,6 +440,17 @@ public:
             instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
             host_image_copy = host_copy.hostImageCopy == VK_TRUE;
         }
+        leonida::IndirectExpander::Support indirect_support;
+        if (buffer_device_address &&
+            indirect_support.query(instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2"),
+                                   instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2"),
+                                   physical, extensions)) {
+            const void* head = *v13_.next();
+            indirect_support.chain(head);
+            *v13_.next() = const_cast<void*>(head);
+            indirect_commands = true;
+            indirect_properties = indirect_support.properties;
+        }
         const char* host_image_copy_name = VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME;
         if (host_image_copy) {
             host_copy.pNext = *v13_.next();  // after the conditional rendering features, if any
@@ -472,6 +486,7 @@ public:
         if (image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
         if (conditional_rendering) device_extensions.push_back(conditional_extension);
         if (host_image_copy) device_extensions.push_back(host_image_copy_name);
+        if (indirect_commands) leonida::IndirectExpander::Support::add_extensions(device_extensions);
         const char* swapchain = "VK_KHR_swapchain";
         if (presentation) device_extensions.push_back(swapchain);
 #if defined(VK_KHR_swapchain_maintenance1)

@@ -33,6 +33,7 @@
 #include "uav_clear.h"
 
 #include <vulkan/vulkan.h>
+#include "vulkan_indirect.h"
 #include "vulkan_predicate.h"
 #include "vulkan_predicated_copy.h"
 
@@ -786,6 +787,13 @@ struct ReplayFunctions {
     bool multi_draw_indirect = false;
     // VkPhysicalDeviceLimits::maxDrawIndirectCount: a call takes at most this many records.
     std::uint32_t max_draw_indirect_count = UINT32_MAX;
+    // ExecuteIndirect with a multi-argument command signature (vulkan_indirect.h, VK_EXT_device_generated_commands):
+    // `indirect_prepare` makes the plan while the list is checked, `indirect_prepass` records the pass that rebases
+    // buffer views (outside rendering), `indirect_execute` the generated commands. Without them such a call is
+    // unsupported.
+    std::function<bool(const IndirectExpander::Request&, IndirectPlan&)> indirect_prepare;
+    std::function<void(VkCommandBuffer, const IndirectPlan&)> indirect_prepass;
+    std::function<void(VkCommandBuffer, const IndirectPlan&)> indirect_execute;
     // Optional VK_KHR_acceleration_structure: BuildRaytracingAccelerationStructure.
     PFN_vkCmdBuildAccelerationStructuresKHR build_acceleration_structures = nullptr;
     // XDXR BVH4 builds (xdxr_build.h), used instead of the KHR ones when set: `xdxr_check` refuses inputs the builder
@@ -893,6 +901,7 @@ struct Prepared {
     std::vector<std::array<VkDeviceSize, 2>> fills;  // ... buffer byte ranges, offset and size
     QueryPool* queries = nullptr;  // query commands: the heap
     ComputePipeline pipeline;  // dispatches
+    IndirectPlan indirect;     // ExecuteIndirect with a multi-argument signature
     // Draws.
     struct Attachment {
         ResourceBinding binding;
@@ -2425,7 +2434,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             out.queries.push_back({i, heap, statistics_active});
         } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command)) {
             if (!bind(ind->argument_buffer) || !p.binding.buffer) return ReplayResult::unresolved_resource;
-            const VkDeviceSize record_size = detail::indirect_record_size(ind->kind);
+            const bool generated = ind->signature != nullptr;  // several arguments per record
+            const VkDeviceSize record_size =
+                generated ? VkDeviceSize(ind->signature->arguments_size) : detail::indirect_record_size(ind->kind);
             if (!record_size || ind->stride < record_size || ind->stride % sizeof(std::uint32_t))
                 return ReplayResult::invalid_indirect_arguments;
             const VkDeviceSize bytes = VkDeviceSize(ind->max_count - 1) * ind->stride + record_size;
@@ -2437,11 +2448,13 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!detail::indirect_range(*cnt, ind->count_offset, sizeof(std::uint32_t)))
                     return ReplayResult::invalid_indirect_arguments;
                 p.source = *cnt;
-                if ((ind->kind == IndirectKind::draw && !vk.draw_indirect_count) ||
+                if (generated) {
+                    // the count is the sequence count address; nothing else is needed
+                } else if ((ind->kind == IndirectKind::draw && !vk.draw_indirect_count) ||
                     (ind->kind == IndirectKind::draw_indexed && !vk.draw_indexed_indirect_count) ||
                     ind->kind == IndirectKind::dispatch)
                     return ReplayResult::unsupported;
-            } else {
+            } else if (!generated) {
                 if ((ind->kind == IndirectKind::draw && !vk.draw_indirect) ||
                     (ind->kind == IndirectKind::draw_indexed && !vk.draw_indexed_indirect) ||
                     (ind->kind == IndirectKind::dispatch && !vk.dispatch_indirect))
@@ -2458,6 +2471,26 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
                 if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
                 p.pipeline = *pipeline;
+            }
+            if (generated) {
+                // The state each record changes is replayed from the generated commands, on the pipeline in effect.
+                const bool compute = ind->kind == IndirectKind::dispatch;
+                if (!vk.indirect_prepare || !vk.indirect_execute || (compute ? !ind->pipeline : !ind->state))
+                    return ReplayResult::unsupported;
+                IndirectExpander::Request request;
+                request.signature = &ind->signature;
+                request.pipeline_layout = compute ? p.pipeline.layout : p.graphics.layout;
+                request.push_stages = compute ? VK_SHADER_STAGE_COMPUTE_BIT : p.graphics.push_stages;
+                request.pipeline = compute ? p.pipeline.pipeline : p.graphics.pipeline;
+                request.argument_buffer = p.binding.buffer;
+                request.argument_offset = p.binding.buffer_offset + ind->argument_offset;
+                if (ind->count_buffer) {
+                    request.count_buffer = p.source.buffer;
+                    request.count_offset = p.source.buffer_offset + ind->count_offset;
+                }
+                request.max_count = ind->max_count;
+                request.heap_base = vk.heap_base;
+                if (!vk.indirect_prepare(request, p.indirect)) return ReplayResult::unsupported;
             }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             if (vk.xdxr_check) {
@@ -3198,7 +3231,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                             &p.pipeline.bindless_set, 0, nullptr);
                 vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data), &data);
             }
-            detail::emit_indirect(vk, command_buffer, p, *ind);
+            if (ind->signature)
+                vk.indirect_execute(command_buffer, p.indirect);
+            else
+                detail::emit_indirect(vk, command_buffer, p, *ind);
         } else if (const auto* xdxr_build = std::get_if<BuildAccelerationStructure>(&command);
                    xdxr_build && vk.xdxr_record) {
             vk.xdxr_record(command_buffer, *xdxr_build);
@@ -3273,6 +3309,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
         } else if (const Draw* draw = detail::draw_of(command)) {
             auto& prepared_draw = const_cast<detail::Prepared&>(p);
+            const auto* generated = std::get_if<ExecuteIndirect>(&command);
+            if (generated && generated->signature) vk.indirect_prepass(command_buffer, p.indirect);  // not in rendering
             constexpr VkAccessFlags color_access =
                 VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
             constexpr VkAccessFlags depth_access =
@@ -3345,7 +3383,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             }
             if (draw->indexed) vk.bind_index_buffer(command_buffer, p.index_buffer, p.index_offset, p.index_type);
             if (const auto* indirect = std::get_if<ExecuteIndirect>(&command)) {
-                detail::emit_indirect(vk, command_buffer, p, *indirect);  // the arguments hold the counts
+                if (indirect->signature)
+                    vk.indirect_execute(command_buffer, p.indirect);  // per-record state, then the draw
+                else
+                    detail::emit_indirect(vk, command_buffer, p, *indirect);  // the arguments hold the counts
             } else if (draw->indexed) {
                 vk.draw_indexed(command_buffer, draw->count, draw->instances, draw->first, draw->base_vertex,
                                 draw->first_instance);
