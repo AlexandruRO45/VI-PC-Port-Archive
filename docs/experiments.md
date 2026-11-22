@@ -186,6 +186,50 @@ Add `--llvm <AMDGPU LLVM library>` to disassemble referenced native pixel code a
 
 The WARP control compiles the source-built compute shader with its root signature stripped. D3D12 rejects creation without a root signature. The same shader creates a PSO when given the matching signature from the embedded build. The control measures PSO creation on the source-built fixture.
 
+### Fixed-profile archive rescan
+
+The Windows readback run at `1aafb0f` revisited all 26,503 records using the preceding PS, CS and MS binding profiles. Reclassification at `f94c254` returned the same record identities and the same generated sources for both affected PS profiles. Compared with the previous per-profile runs, one additional PS compiled, built a graphics pipeline and produced the expected pixels on both adapters. No previously passing record dropped out.
+
+| Stage | Records | Desktop DXIL | D3D12 pipeline | Output matched on both adapters | Change in each verified column |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| PS | 12,101 | 848 | 848 | 848 | +1 |
+| MS | 9,282 | 2 | 2 | 2 | 0 |
+| CS | 2,689 | 12 | 12 | 12 | 0 |
+| VS | 2,236 | 0 | 0 | 0 | 0 |
+| GS | 195 | 0 | 0 | 0 | 0 |
+| Total | 26,503 | 862 | 862 | 862 | +1 |
+
+Each archive record counts once across profiles, inputs and adapters. Generated variants and repeated copies of the same native program can serve multiple records. The graphics checks use controlled partner stages, descriptors and draw inputs. The compute checks use a fixed raw UAV with an independent expected word array.
+
+- **PS.** The accepted sets were disjoint in this input: 335 general color, 35 interpolated attribute, 354 two-table depth and 124 sampled coverage. Of the remaining records, 837 stopped at the native program boundary or its control-flow checks and 10,416 reached lowering without matching a binding profile. For those 10,416 records, the first general configuration alone (table s8, interpolation s9, fixed sampler, no CB) first rejected 2,927 for an unresolved constant buffer and 2,007 at `s_setreg_imm32_b32`. A different binding can expose a different next instruction.
+- **CS.** The first rejection was unsupported thread-group dimensions for 1,054 records, an unverified multi-exit program for 1,002 and the fixed store lowering for 621. The 12 successes were tested with 320-word readbacks in 14 dispatches on each adapter.
+- **MS.** All 9,282 programs supplied a bounded span. As in the preceding survey, the point profile targeted the shortest program (832 bytes) and the indexed profile examined the 531 programs at most 1,200 bytes long. The 8,751 longer programs were outside the indexed survey. Within the 531, 427 records (24 native streams) first read entry register `s23` without an established binding. One indexed record reached a visible triangle. The shortest, degenerate case was checked using exported positions and indices as well as raster pixels.
+- **VS and GS.** Neither stage has a package translator in these profiles. Their first stop is stage dispatch.
+
+Windows 11 build 26200.9974, D3D12 debug layer enabled, NVIDIA GeForce RTX 4060 Laptop GPU 32.0.16.1656 and WARP 10.0.26100.9818. Both adapters completed every accepted record. The sampled coverage group used two separate selector bindings. The mesh and depth checks retained their indexed-export and swapped-table controls.
+
+To repeat the inventory with a local archive and an LLVM 15 library built with AMDGPU support, run the following from the repository root. Use a fresh output directory for each revision. The optional source directory contains local HLSL indexed by profile and decoded container hash. The JSON counts HLSL acceptance; DXC, pipeline construction and readback are separate measurements.
+
+```sh
+python3 -B tools/shader_profile_audit.py "$ARCHIVE" --llvm libLLVM-15.so.1 --source-dir out/profile-sources > out/profile-counts.json
+```
+
+The additional PS reads a packed word from the first constant buffer. Its low three bytes select RGB and each byte goes through the piecewise sRGB-to-linear conversion before a round-toward-zero binary16 export. The new readback reference evaluates the scalar transfer function independently. Inputs include byte values 10 and 11 on opposite sides of the threshold, distinct channel values and a change to the unused high byte. All six positive draws across the two adapters matched. All six rotated-channel references failed at pixel comparison.
+
+With the archive scan complete, run the following in Developer PowerShell. The source selector identifies the three-byte conversion in this measured corpus and rejects a missing or ambiguous match. The other profiles use the draw and dispatch fixtures documented in their experiment sections.
+
+```powershell
+$packed = @(Get-ChildItem out/profile-sources/general/*.hlsl | Where-Object {
+    (Get-Content -Raw $_.FullName).Contains('(asuint(params[0].x) >> 16u) & 0xffu')
+})
+if ($packed.Count -ne 1) { throw "Expected one packed-color PS for this input" }
+dxc -Gis -T ps_6_0 -E main -Fo out/packed-rgb.dxil $packed[0].FullName
+if ($LASTEXITCODE -ne 0) { throw "DXC failed" }
+cmake --build --preset dev --target offscreen_check
+python -B tests/packed_rgb_case.py out/build/dev/offscreen_check.exe out/packed-rgb.dxil hardware
+python -B tests/packed_rgb_case.py out/build/dev/offscreen_check.exe out/packed-rgb.dxil warp
+```
+
 ## Offline CPU leaf recompilation
 
 With the Python-enabled Windows dev preset configured, run:
