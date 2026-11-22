@@ -691,5 +691,58 @@ class TestPermB32F16SIMDDivergence(unittest.TestCase):
             else:
                 self.assertEqual(wave.get_lane_vgpr(0, lane), 0xCAFE_BABE)
 
+# ==============================================================================
+# Register Aliasing & In-Place Operand Preservation
+# ==============================================================================
+
+class TestPermB32F16RegisterAliasing(unittest.TestCase):
+    def setUp(self):
+        self.rf = ScalarRegisterFile()
+        self.interp = ScalarInterpreter(self.rf)
+
+    def test_dst_aliases_src0(self):
+        self.rf.set_vgpr(0, pack_halves(0x1111, 0x2222))
+        self.rf.set_vgpr(1, pack_halves(0x3333, 0x4444))
+        sel = make_selector(SEL_SRC1_LO, SEL_SRC0_HI)
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B32_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(1),
+            src2=ASTOperand.literal(sel),
+        )
+        self.interp.execute(instr)
+        self.assertEqual(self.rf.get_vgpr(0), pack_halves(0x3333, 0x2222))
+
+    def test_dst_aliases_src1(self):
+        self.rf.set_vgpr(1, pack_halves(0xAAAA, 0xBBBB))
+        self.rf.set_vgpr(0, pack_halves(0xCCCC, 0xDDDD))
+        sel = make_selector(SEL_SRC1_HI, SEL_SRC0_LO)
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B32_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(0),
+            src2=ASTOperand.literal(sel),
+        )
+        self.interp.execute(instr)
+        self.assertEqual(self.rf.get_vgpr(0), pack_halves(0xDDDD, 0xAAAA))
+
+    def test_dst_aliases_src0_and_src1(self):
+        self.rf.set_vgpr(0, pack_halves(POS_ONE, POS_TWO))
+        sel = PermSelectorWord.swap_halves_src1().raw
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B32_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(0),
+            src2=ASTOperand.literal(sel),
+        )
+        self.interp.execute(instr)
+        self.assertEqual(self.rf.get_vgpr(0), pack_halves(POS_TWO, POS_ONE))
+
 if __name__ == "__main__":
     unittest.main()
