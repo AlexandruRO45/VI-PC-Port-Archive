@@ -466,5 +466,113 @@ class TestPermB32F16SymbolicAST(unittest.TestCase):
         with self.assertRaises(ValueError):
             instr.validate()
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarRegisterFile:
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+    scc: int = 0
+    vcc: int = 0
+    exec_mask: int = MASK32
+    status: int = 0
+    mode: int = 0
+
+    def get_vgpr(self, idx: int) -> int:
+        if not 0 <= idx <= 255:
+            raise IndexError(f"VGPR index out of range: {idx}")
+        return self.vgprs[idx] & MASK32
+
+    def set_vgpr(self, idx: int, val: int) -> None:
+        if not 0 <= idx <= 255:
+            raise IndexError(f"VGPR index out of range: {idx}")
+        self.vgprs[idx] = val & MASK32
+
+    def get_sgpr(self, idx: int) -> int:
+        if not 0 <= idx <= 105:
+            raise IndexError(f"SGPR index out of range: {idx}")
+        return self.sgprs[idx] & MASK32
+
+    def set_sgpr(self, idx: int, val: int) -> None:
+        if not 0 <= idx <= 105:
+            raise IndexError(f"SGPR index out of range: {idx}")
+        self.sgprs[idx] = val & MASK32
+
+    def read_operand(self, op: ASTOperand) -> Tuple[int, bool, bool]:
+        if op.kind == OperandKind.VGPR:
+            val = self.get_vgpr(op.reg_num)
+        elif op.kind == OperandKind.SGPR:
+            val = self.get_sgpr(op.reg_num)
+        elif op.kind in (OperandKind.LITERAL_CONST, OperandKind.INLINE_CONST):
+            val = op.constant_val & MASK32
+        else:
+            raise ValueError(f"Unknown operand kind: {op.kind}")
+        return val, op.abs_mod, op.neg_mod
+
+
+class ScalarInterpreter:
+    def __init__(self, reg_file: Optional[ScalarRegisterFile] = None):
+        self.rf = reg_file if reg_file is not None else ScalarRegisterFile()
+
+    def execute(self, instr: ASTInstruction) -> None:
+        instr.validate()
+        if instr.opcode == Opcode.V_PERM_B32_F16:
+            s0_val, abs0, neg0 = self.rf.read_operand(instr.src0)
+            s1_val, abs1, neg1 = self.rf.read_operand(instr.src1)
+            sel_val, _, _ = self.rf.read_operand(instr.src2)
+
+            res = oracle_v_perm_b32_f16(
+                src0=s0_val,
+                src1=s1_val,
+                selector=sel_val,
+                abs0=abs0,
+                neg0=neg0,
+                abs1=abs1,
+                neg1=neg1,
+                clamp=instr.clamp,
+            )
+            self.rf.set_vgpr(instr.dst.reg_num, res)
+        elif instr.opcode == Opcode.V_NOP:
+            pass
+
+
+class TestPermB32F16ScalarInterpreter(unittest.TestCase):
+    def setUp(self):
+        self.rf = ScalarRegisterFile()
+        self.interp = ScalarInterpreter(self.rf)
+
+    def test_scalar_execute_basic_perm(self):
+        self.rf.set_vgpr(1, pack_halves(0x1111, 0x2222))
+        self.rf.set_vgpr(2, pack_halves(0x3333, 0x4444))
+        self.rf.set_vgpr(3, make_selector(SEL_SRC1_LO, SEL_SRC0_HI))
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B32_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(3),
+        )
+        self.interp.execute(instr)
+        self.assertEqual(self.rf.get_vgpr(0), pack_halves(0x3333, 0x2222))
+
+    def test_scalar_execute_with_clamp(self):
+        self.rf.set_vgpr(1, pack_halves(POS_TWO, NEG_ONE))
+        self.rf.set_vgpr(2, pack_halves(POS_HALF, POS_ONE))
+        self.rf.set_vgpr(3, make_selector(SEL_SRC0_LO, SEL_SRC0_HI))
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B32_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(3),
+            clamp=True,
+        )
+        self.interp.execute(instr)
+        self.assertEqual(self.rf.get_vgpr(0), pack_halves(POS_ONE, POS_ZERO))
+
 if __name__ == "__main__":
     unittest.main()
