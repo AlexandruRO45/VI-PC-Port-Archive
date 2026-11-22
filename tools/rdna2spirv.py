@@ -6981,6 +6981,42 @@ class Gen:
             self.emit(f"{sel} = OpSelect %float {either} %f0 {self.flush_f32(m)}")
             self.emit(f"{r} = OpFAdd %float {sel} {z}")
             self.dst(a[0], self.tou(self.flush_f32(self.clamp_mods(r, mods))))
+        elif op == "v_mullit_f32":
+            # VOP3 0x150: D = (S2 > 0.0 && S1 > -FLT_MAX) ? mul_legacy(S0, S1) : -FLT_MAX,
+            # with f32 denormal flush in the default game MODE (IEEE=0, DX10_CLAMP=1, denorm32=0),
+            # input abs/neg before the range/zero checks, and VOP3 omod before DX10 clamp.
+            # Measured natively on RDNA2 gfx1036 (wave32 and wave64).
+            x, y, z = (self.flush_f32(self.src_f(t)) for t in a[1:4])
+            m, zx, zy, either_z, leg = (self.tmp() for _ in range(5))
+            self.emit(f"{m} = OpFMul %float {x} {y}")
+            self.emit(f"{zx} = OpFOrdEqual %bool {x} %f0")
+            self.emit(f"{zy} = OpFOrdEqual %bool {y} %f0")
+            self.emit(f"{either_z} = OpLogicalOr %bool {zx} {zy}")
+            self.emit(f"{leg} = OpSelect %float {either_z} %f0 {self.flush_f32(m)}")
+            neg_flt_max = self.tmp()
+            self.emit(f"{neg_flt_max} = OpBitcast %float {self.cu(0xFF7FFFFF)}")
+            z_pos, y_gt, ok, r = (self.tmp() for _ in range(4))
+            self.emit(f"{z_pos} = OpFOrdGreaterThan %bool {z} %f0")
+            self.emit(f"{y_gt} = OpFOrdGreaterThan %bool {y} {neg_flt_max}")
+            self.emit(f"{ok} = OpLogicalAnd %bool {z_pos} {y_gt}")
+            self.emit(f"{r} = OpSelect %float {ok} {leg} {neg_flt_max}")
+            for mod in mods:
+                if mod in ("mul:2", "mul:4", "div:2"):
+                    is_z, r_canon, scaled = self.tmp(), self.tmp(), self.tmp()
+                    self.emit(f"{is_z} = OpFOrdEqual %bool {r} %f0")
+                    self.emit(f"{r_canon} = OpSelect %float {is_z} %f0 {r}")
+                    k = {"mul:2": 2.0, "mul:4": 4.0, "div:2": 0.5}[mod]
+                    self.emit(f"{scaled} = OpFMul %float {r_canon} {self.fconst(k)}")
+                    r = self.flush_f32(scaled)
+            if "clamp" in mods:
+                is_nan, r_no_nan, cl, is_z, r_pos_z = (self.tmp() for _ in range(5))
+                self.emit(f"{is_nan} = OpIsNan %bool {r}")
+                self.emit(f"{r_no_nan} = OpSelect %float {is_nan} %f0 {r}")
+                self.emit(f"{cl} = OpExtInst %float %glsl FClamp {r_no_nan} %f0 %f1")
+                self.emit(f"{is_z} = OpFOrdEqual %bool {cl} %f0")
+                self.emit(f"{r_pos_z} = OpSelect %float {is_z} %f0 {cl}")
+                r = r_pos_z
+            self.dst(a[0], self.tou(r))
         elif op in ("v_min3_i32", "v_min3_u32", "v_max3_i32", "v_max3_u32"):
             x, y, z = (self.src_u(t) for t in a[1:4])
             f = ("S" if op.endswith("i32") else "U") + ("Min" if "min" in op else "Max")
