@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -208,6 +209,44 @@ class RunStdlibTestsTest(unittest.TestCase):
 
     def test_decode_bytes_uses_explicit_child_encoding_and_normalizes_crlf(self):
         self.assertEqual(self.runner._decode_bytes(b"caf\xe9\r\n", encoding="cp1252"), "caf\u00e9\n")
+
+    def test_timeout_kills_helper_process_tree_and_does_not_wait_for_inherited_pipe(self):
+        # Covers both helper modes: inheriting stdout/stderr (which would otherwise block communicate()
+        # until the helper exits) and redirecting to DEVNULL (which would otherwise leave an orphan
+        # helper running after the parent is killed).
+        helper_code = (
+            "import os, sys, time; "
+            "open(sys.argv[1], 'w', encoding='utf-8', newline='\\n').write('started'); "
+            "time.sleep(3.5); "
+            "open(sys.argv[2], 'w', encoding='utf-8', newline='\\n').write('late')"
+        )
+        for mode in ("inherited", "devnull"):
+            with self.subTest(mode=mode):
+                redirect = ", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL" if mode == "devnull" else ""
+                with tempfile.TemporaryDirectory() as tmp:
+                    started = os.path.join(tmp, "started.txt")
+                    late = os.path.join(tmp, "late.txt")
+                    write_file(
+                        tmp,
+                        "tests/test_spawns_helper.py",
+                        "import subprocess, sys\n"
+                        'if __name__ == "__main__":\n'
+                        f"    subprocess.run([sys.executable, '-I', '-c', {helper_code!r}, "
+                        f"{started!r}, {late!r}]{redirect})\n",
+                    )
+                    t0 = time.monotonic()
+                    res = self.runner.run_one(tmp, "tests/test_spawns_helper.py", timeout=1.5)
+                    wall = time.monotonic() - t0
+
+                    self.assertTrue(res.timed_out, res.output)
+                    self.assertEqual(res.returncode, 124, res.output)
+                    self.assertTrue(os.path.exists(started), "helper process did not start before timeout")
+                    self.assertLess(wall, 3.2, f"runner waited past timeout ({wall:.2f}s) for {mode} helper")
+                    # Wait past the helper's 3.5s sleep to verify it was killed, not left running.
+                    remaining = 4.0 - (time.monotonic() - t0)
+                    if remaining > 0:
+                        time.sleep(remaining)
+                    self.assertFalse(os.path.exists(late), f"{mode} helper survived timeout and wrote late marker")
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ import fnmatch
 import locale
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -115,30 +116,83 @@ def _decode_bytes(data, encoding=None):
     return text.replace("\r\n", "\n")
 
 
+def _terminate_process_tree(proc):
+    """Terminate ``proc`` and any descendants so helpers cannot outlive a timeout or hold pipes open."""
+    if os.name == "nt":
+        # Kill the tree while the parent PID is still alive so `taskkill /T` can walk its children.
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
 def run_one(root, rel, python_exe=None, timeout=DEFAULT_TIMEOUT):
     """Run one test file in an isolated `python -I` subprocess and return its TestResult."""
     exe = python_exe or sys.executable
     script_arg = os.path.normpath(rel)
     effective_timeout = timeout if (timeout is not None and timeout > 0) else None
+    popen_kwargs = {
+        "cwd": root,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        popen_kwargs["start_new_session"] = True
+
     t0 = time.monotonic()
     try:
-        proc = subprocess.run(
-            [exe, "-I", script_arg],
-            cwd=root,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=effective_timeout,
+        proc = subprocess.Popen([exe, "-I", script_arg], **popen_kwargs)
+    except OSError as exc:
+        elapsed = time.monotonic() - t0
+        return TestResult(
+            path=rel,
+            returncode=127,
+            elapsed=elapsed,
+            output=f"[run_stdlib_tests] failed to start {rel}: {exc}\n",
         )
+
+    try:
+        stdout_bytes, _ = proc.communicate(timeout=effective_timeout)
         elapsed = time.monotonic() - t0
         return TestResult(
             path=rel,
             returncode=proc.returncode,
             elapsed=elapsed,
-            output=_decode_bytes(proc.stdout),
+            output=_decode_bytes(stdout_bytes),
         )
-    except subprocess.TimeoutExpired as exc:
+    except subprocess.TimeoutExpired:
+        _terminate_process_tree(proc)
+        partial_bytes = b""
+        try:
+            partial_bytes, _ = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            if proc.stdout is not None:
+                try:
+                    proc.stdout.close()
+                except OSError:
+                    pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
         elapsed = time.monotonic() - t0
-        partial = _decode_bytes(exc.stdout) + _decode_bytes(exc.stderr)
+        partial = _decode_bytes(partial_bytes)
         if partial and not partial.endswith("\n"):
             partial += "\n"
         partial += f"[run_stdlib_tests] timed out after {effective_timeout}s\n"
@@ -149,14 +203,18 @@ def run_one(root, rel, python_exe=None, timeout=DEFAULT_TIMEOUT):
             output=partial,
             timed_out=True,
         )
-    except OSError as exc:
-        elapsed = time.monotonic() - t0
-        return TestResult(
-            path=rel,
-            returncode=127,
-            elapsed=elapsed,
-            output=f"[run_stdlib_tests] failed to start {rel}: {exc}\n",
-        )
+    except BaseException:
+        _terminate_process_tree(proc)
+        if proc.stdout is not None:
+            try:
+                proc.stdout.close()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        raise
 
 
 def run_suite(
@@ -178,6 +236,7 @@ def run_suite(
     wall_start = time.monotonic()
     failed = []
 
+    interrupted = False
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
     try:
         futures = [
@@ -193,11 +252,11 @@ def run_suite(
                 failed.append(res)
             out.write("".join(block))
             out.flush()
-    except KeyboardInterrupt:
-        executor.shutdown(wait=False, cancel_futures=True)
+    except BaseException:
+        interrupted = True
         raise
-    else:
-        executor.shutdown(wait=True)
+    finally:
+        executor.shutdown(wait=not interrupted, cancel_futures=interrupted)
 
     wall = time.monotonic() - wall_start
     failed.sort(key=lambda r: r.path)
