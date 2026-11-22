@@ -1,3 +1,4 @@
+; coverage: source cpu_aot_fma_packed
 ; Source-owned differential fixture for all 36 packed FMA3 instructions (ps/pd).
 .code
 
