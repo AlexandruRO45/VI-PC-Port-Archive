@@ -514,5 +514,102 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
         self.assertEqual(state.lds.read_dword(target_dword), 40)
 
 
+class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+
+    def test_dst_aliases_addr(self) -> None:
+        state = ScalarMachineState(lds_dwords=256)
+        state.lds.write_dword(5, 777)
+        state.set_vgpr(0, 20)
+        state.set_vgpr(1, 77)
+
+        instr = DSSubRtnInstruction(
+            dst=RegisterOperand(0),
+            addr=RegisterOperand(0),
+            data=RegisterOperand(1),
+        )
+        old_val = self.interp.execute(instr, state)
+
+        self.assertEqual(old_val, 777)
+        self.assertEqual(state.get_vgpr(0), 777)
+        self.assertEqual(state.lds.read_dword(5), 700)
+
+    def test_dst_aliases_data(self) -> None:
+        state = ScalarMachineState(lds_dwords=256)
+        state.lds.write_dword(8, 250)
+        state.set_vgpr(0, 32)
+        state.set_vgpr(1, 50)
+
+        instr = DSSubRtnInstruction(
+            dst=RegisterOperand(1),
+            addr=RegisterOperand(0),
+            data=RegisterOperand(1),
+        )
+        old_val = self.interp.execute(instr, state)
+
+        self.assertEqual(old_val, 250)
+        self.assertEqual(state.get_vgpr(1), 250)
+        self.assertEqual(state.lds.read_dword(8), 200)
+
+    def test_addr_aliases_data(self) -> None:
+        state = ScalarMachineState(lds_dwords=256)
+        state.lds.write_dword(12, 100)
+        state.set_vgpr(0, 48)
+        state.set_vgpr(2, 0)
+
+        instr = DSSubRtnInstruction(
+            dst=RegisterOperand(2),
+            addr=RegisterOperand(0),
+            data=RegisterOperand(0),
+        )
+        old_val = self.interp.execute(instr, state)
+
+        self.assertEqual(old_val, 100)
+        self.assertEqual(state.get_vgpr(2), 100)
+        self.assertEqual(state.get_vgpr(0), 48)
+        self.assertEqual(state.lds.read_dword(12), 100 - 48)
+
+    def test_dst_aliases_addr_and_data(self) -> None:
+        state = ScalarMachineState(lds_dwords=256)
+        state.lds.write_dword(4, 50)
+        state.set_vgpr(0, 16)
+
+        instr = DSSubRtnInstruction(
+            dst=RegisterOperand(0),
+            addr=RegisterOperand(0),
+            data=RegisterOperand(0),
+        )
+        old_val = self.interp.execute(instr, state)
+
+        self.assertEqual(old_val, 50)
+        self.assertEqual(state.get_vgpr(0), 50)
+        self.assertEqual(state.lds.read_dword(4), 34)
+
+    def test_unmodified_registers_preserved(self) -> None:
+        state = ScalarMachineState(lds_dwords=256)
+        state.lds.write_dword(2, 123)
+        state.set_vgpr(1, 8)
+        state.set_vgpr(2, 23)
+        for r in range(3, 10):
+            state.set_vgpr(r, 0xA000 + r)
+        for s in range(5):
+            state.set_sgpr(s, 0xB000 + s)
+
+        instr = DSSubRtnInstruction(
+            dst=RegisterOperand(0),
+            addr=RegisterOperand(1),
+            data=RegisterOperand(2),
+        )
+        self.interp.execute(instr, state)
+
+        for r in range(3, 10):
+            self.assertEqual(state.get_vgpr(r), 0xA000 + r)
+        for s in range(5):
+            self.assertEqual(state.get_sgpr(s), 0xB000 + s)
+
+
 if __name__ == '__main__':
     unittest.main()
