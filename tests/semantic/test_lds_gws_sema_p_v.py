@@ -357,6 +357,98 @@ class ScalarInterpreter:
             return rid, cnt, woken
 
 
+# ==============================================================================
+# SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# ==============================================================================
+
+class SIMDState:
+    """SIMD wavefront execution state supporting Wave32 and Wave64 execution modes."""
+
+    def __init__(
+        self,
+        num_lanes: int = 64,
+        exec_mask: Optional[int] = None,
+        num_gws_resources: int = GWS_NUM_RESOURCES,
+    ) -> None:
+        if num_lanes not in (32, 64):
+            raise ValueError(f"num_lanes must be 32 or 64, got {num_lanes}")
+        self.num_lanes = num_lanes
+        self.full_mask = (1 << num_lanes) - 1
+        self.exec_mask = self.full_mask if exec_mask is None else (exec_mask & self.full_mask)
+        self.vgprs: list[list[int]] = [[0] * DEFAULT_NUM_VGPRS for _ in range(num_lanes)]
+        self.sgprs: list[int] = [0] * DEFAULT_NUM_SGPRS
+        self.m0: int = 0
+        self.vcc: int = 0
+        self.scc: int = 0
+        self.gws: GWSMemory = GWSMemory(num_resources=num_gws_resources)
+
+    def is_lane_active(self, lane: int) -> bool:
+        return bool(self.exec_mask & (1 << lane))
+
+    def get_lane_vgpr(self, lane: int, index: int) -> int:
+        return self.vgprs[lane][index]
+
+    def set_lane_vgpr(self, lane: int, index: int, val: int) -> None:
+        self.vgprs[lane][index] = u32(val)
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index]
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        self.sgprs[index] = u32(val)
+
+    def get_m0(self) -> int:
+        return self.m0
+
+    def set_m0(self, val: int) -> None:
+        self.m0 = u32(val)
+
+    def find_first_active_lane(self) -> Optional[int]:
+        """Find the index of the first active lane according to the EXEC mask (ctz)."""
+        if self.exec_mask == 0:
+            return None
+        return (self.exec_mask & -self.exec_mask).bit_length() - 1
+
+
+class SIMDInterpreter:
+    """SIMD multi-lane instruction interpreter for ds_gws_sema_p and ds_gws_sema_v."""
+
+    def execute(
+        self,
+        instr: DSGWSSemaphoreInstruction,
+        state: SIMDState,
+        wave_id: int = 0,
+    ) -> Optional[Tuple[int, int, Union[bool, int], Union[int, Optional[int]]]]:
+        """Execute a semaphore instruction across SIMD lanes with EXEC masking.
+
+        In RDNA2 hardware, GWS semaphore instructions execute using the first active lane:
+        first_lane = find_first_valid(EXEC mask).
+
+        Returns:
+            Optional[Tuple[int, int, ...]]: (first_lane, resource_id, outcome, state_detail)
+            or None if the wave is inactive (EXEC == 0).
+        """
+        first_lane = state.find_first_active_lane()
+        if first_lane is None:
+            return None
+
+        m0 = state.get_m0()
+
+        if instr.opcode == DSOpcode.DS_GWS_SEMA_P:
+            rid, acquired, cnt = state.gws.sema_p(
+                offset=instr.offset,
+                m0=m0,
+                wave_id=wave_id,
+            )
+            return first_lane, rid, acquired, cnt
+        else:
+            rid, cnt, woken = state.gws.sema_v(
+                offset=instr.offset,
+                m0=m0,
+            )
+            return first_lane, rid, cnt, woken
+
+
 class TestGWSSemaphoreReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Phase 1: Unit tests for reference mathematical oracle and architectural model."""
 
@@ -565,6 +657,92 @@ class TestScalarInterpreter(unittest.TestCase):
 
         self.assertEqual(self.state.gws.read_counter(0), 2)
         self.assertEqual(self.state.gws.read_counter(1), 1)
+
+
+class TestSIMDMultiLaneDivergence(unittest.TestCase):
+    """Phase 4: Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_all_lanes_active_lane0_elected(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFFFFFF)
+        interp = SIMDInterpreter()
+
+        instr_v = DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_V, offset=0)
+        res = interp.execute(instr_v, state)
+
+        self.assertIsNotNone(res)
+        first_lane, rid, cnt, woken = res  # type: ignore
+        self.assertEqual(first_lane, 0)
+        self.assertEqual(rid, 0)
+        self.assertEqual(cnt, 1)
+        self.assertEqual(state.gws.read_counter(0), 1)
+
+    def test_wave64_all_lanes_active_lane0_elected(self) -> None:
+        state = SIMDState(num_lanes=64, exec_mask=0xFFFFFFFFFFFFFFFF)
+        interp = SIMDInterpreter()
+
+        instr_v = DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_V, offset=7)
+        res = interp.execute(instr_v, state)
+
+        self.assertIsNotNone(res)
+        first_lane, rid, cnt, woken = res  # type: ignore
+        self.assertEqual(first_lane, 0)
+        self.assertEqual(rid, 7)
+        self.assertEqual(cnt, 1)
+
+    def test_wave32_divergent_mask_skips_inactive_lanes(self) -> None:
+        # Lanes 0..5 inactive, lane 6 active
+        mask = 0xFFFFFFC0
+        state = SIMDState(num_lanes=32, exec_mask=mask)
+        interp = SIMDInterpreter()
+
+        instr_v = DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_V, offset=11)
+        res = interp.execute(instr_v, state)
+
+        self.assertIsNotNone(res)
+        first_lane, rid, cnt, woken = res  # type: ignore
+        self.assertEqual(first_lane, 6)
+        self.assertEqual(rid, 11)
+
+    def test_wave64_divergent_mask_high_lanes_only(self) -> None:
+        mask = 1 << 45
+        state = SIMDState(num_lanes=64, exec_mask=mask)
+        interp = SIMDInterpreter()
+
+        instr_v = DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_V, offset=22)
+        res = interp.execute(instr_v, state)
+
+        self.assertIsNotNone(res)
+        first_lane, rid, cnt, woken = res  # type: ignore
+        self.assertEqual(first_lane, 45)
+        self.assertEqual(rid, 22)
+
+    def test_zero_exec_mask_no_operation(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0)
+        interp = SIMDInterpreter()
+
+        instr_v = DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_V, offset=3)
+        res = interp.execute(instr_v, state)
+
+        self.assertIsNone(res)
+        # Counter must not be incremented
+        self.assertEqual(state.gws.read_counter(3), 0)
+
+    def test_registers_preserved_across_all_lanes(self) -> None:
+        even_mask = 0x5555555555555555
+        state = SIMDState(num_lanes=64, exec_mask=even_mask)
+        interp = SIMDInterpreter()
+
+        for lane in range(64):
+            for r in range(10):
+                state.set_lane_vgpr(lane, r, (lane << 16) | r)
+
+        instr = DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_V, offset=4)
+        interp.execute(instr, state)
+
+        for lane in range(64):
+            for r in range(10):
+                expected = (lane << 16) | r
+                self.assertEqual(state.get_lane_vgpr(lane, r), expected)
 
 
 if __name__ == "__main__":
