@@ -1045,5 +1045,161 @@ class TestSIMDInterpreter(unittest.TestCase):
         self.assertEqual(conflicts[0], [0, 1])
 
 
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasing(unittest.TestCase):
+    """Phase 5: Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(65536)
+        self.interp = ScalarDSInterpreter()
+
+    def test_aliasing_vdst_equals_vaddr(self) -> None:
+        # vdst = v0, vaddr = v0, vdata0 = v1
+        # v0 starts with address 0x40. LDS[0x40] contains TEN_F32.
+        # v1 contains TWO_F32.
+        state = ScalarThreadState(lds=self.lds)
+        state.set_vgpr(0, 0x40)
+        state.set_vgpr(1, TWO_F32)
+        self.lds.write_dword(0x40, TEN_F32)
+
+        inst = DSMinRtnF32Instruction(
+            vdst=RegisterOperand(0),
+            vaddr=RegisterOperand(0),
+            vdata0=RegisterOperand(1),
+        )
+
+        old_val, new_mem = self.interp.execute(state, inst)
+
+        # Returned old_val is TEN_F32, which overwrites v0
+        self.assertEqual(old_val, TEN_F32)
+        self.assertEqual(new_mem, TWO_F32)
+        self.assertEqual(state.get_vgpr(0), TEN_F32)
+        # v1 (vdata0) must be preserved
+        self.assertEqual(state.get_vgpr(1), TWO_F32)
+        # LDS memory updated correctly
+        self.assertEqual(self.lds.read_dword(0x40), TWO_F32)
+
+    def test_aliasing_vdst_equals_vdata0(self) -> None:
+        # vdst = v1, vaddr = v0, vdata0 = v1
+        # Address is in v0 (0x60). LDS[0x60] has THREE_F32.
+        # v1 has ONE_F32.
+        state = ScalarThreadState(lds=self.lds)
+        state.set_vgpr(0, 0x60)
+        state.set_vgpr(1, ONE_F32)
+        self.lds.write_dword(0x60, THREE_F32)
+
+        inst = DSMinRtnF32Instruction(
+            vdst=RegisterOperand(1),
+            vaddr=RegisterOperand(0),
+            vdata0=RegisterOperand(1),
+        )
+
+        old_val, new_mem = self.interp.execute(state, inst)
+
+        # min(3.0, 1.0) = 1.0; vdst (v1) receives old_val (THREE_F32)
+        self.assertEqual(old_val, THREE_F32)
+        self.assertEqual(new_mem, ONE_F32)
+        self.assertEqual(state.get_vgpr(1), THREE_F32)
+        # v0 (vaddr) remains preserved
+        self.assertEqual(state.get_vgpr(0), 0x60)
+        self.assertEqual(self.lds.read_dword(0x60), ONE_F32)
+
+    def test_aliasing_vdst_equals_vaddr_equals_vdata0(self) -> None:
+        # Full 3-way alias: vdst = vaddr = vdata0 = v0
+        # Let v0 be 0x00 (address 0x00, which also represents POS_ZERO float).
+        # LDS[0x00] has TEN_F32.
+        state = ScalarThreadState(lds=self.lds)
+        state.set_vgpr(0, POS_ZERO)
+        self.lds.write_dword(0x00, TEN_F32)
+
+        inst = DSMinRtnF32Instruction(
+            vdst=RegisterOperand(0),
+            vaddr=RegisterOperand(0),
+            vdata0=RegisterOperand(0),
+        )
+
+        # min(10.0, 0.0) = 0.0
+        old_val, new_mem = self.interp.execute(state, inst)
+
+        self.assertEqual(old_val, TEN_F32)
+        self.assertEqual(new_mem, POS_ZERO)
+        # v0 gets old_val
+        self.assertEqual(state.get_vgpr(0), TEN_F32)
+        self.assertEqual(self.lds.read_dword(0x00), POS_ZERO)
+
+    def test_aliasing_vaddr_equals_vdata0_distinct_vdst(self) -> None:
+        # vaddr = v1, vdata0 = v1, vdst = v0
+        state = ScalarThreadState(lds=self.lds)
+        state.set_vgpr(1, 0x40)  # address 0x40
+        state.set_vgpr(0, 0xCAFE)
+        self.lds.write_dword(0x40, TEN_F32)
+
+        inst = DSMinRtnF32Instruction(
+            vdst=RegisterOperand(0),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(1),
+        )
+
+        old_val, new_mem = self.interp.execute(state, inst)
+
+        self.assertEqual(old_val, TEN_F32)
+        self.assertEqual(state.get_vgpr(0), TEN_F32)
+        # v1 must remain strictly unaltered
+        self.assertEqual(state.get_vgpr(1), 0x40)
+
+    def test_operand_preservation_distinct_registers(self) -> None:
+        # All distinct: vdst=v0, vaddr=v1, vdata0=v2
+        state = ScalarThreadState(lds=self.lds)
+        state.set_vgpr(0, 0xAAAAAAAA)
+        state.set_vgpr(1, 0x80)
+        state.set_vgpr(2, NEG_TWO_F32)
+        self.lds.write_dword(0x80, ONE_F32)
+
+        inst = DSMinRtnF32Instruction(
+            vdst=RegisterOperand(0),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+        )
+
+        self.interp.execute(state, inst)
+
+        self.assertEqual(state.get_vgpr(0), ONE_F32)
+        # Input registers must remain unchanged
+        self.assertEqual(state.get_vgpr(1), 0x80)
+        self.assertEqual(state.get_vgpr(2), NEG_TWO_F32)
+
+    def test_vgpr_isolation_no_spurious_clobber(self) -> None:
+        state = ScalarThreadState(lds=self.lds)
+        for i in range(256):
+            state.set_vgpr(i, 0x1000 + i)
+
+        addr = 0x20
+        self.lds.write_dword(addr, TWO_F32)
+        state.set_vgpr(10, addr)
+        state.set_vgpr(11, ONE_F32)
+
+        inst = DSMinRtnF32Instruction(
+            vdst=RegisterOperand(12),
+            vaddr=RegisterOperand(10),
+            vdata0=RegisterOperand(11),
+        )
+
+        self.interp.execute(state, inst)
+
+        self.assertEqual(state.get_vgpr(12), TWO_F32)
+        for i in range(256):
+            if i == 12:
+                continue
+            elif i == 10:
+                self.assertEqual(state.get_vgpr(i), addr)
+            elif i == 11:
+                self.assertEqual(state.get_vgpr(i), ONE_F32)
+            else:
+                self.assertEqual(state.get_vgpr(i), 0x1000 + i)
+
+
 if __name__ == "__main__":
     unittest.main()
