@@ -168,7 +168,9 @@ What is implemented (all of it testable without the game):
   `ResolveSubresource` becomes `vkCmdResolveImage` in the same layouts as a copy: a multisampled colour
   subresource into a single-sampled one of the same size and format. Depth-stencil resolves, and resolves between
   two formats of one typeless family, are refused as unsupported. A multisampled texture copies only to one with
-  the same sample count and has no footprint. Draws bind the pipeline the list selected and the bindless set;
+  the same sample count and has no footprint. Draws bind the pipeline the list selected and the bindless set, and set
+  the viewport and scissor from the area the attachments share (D3D12 sizes its output from `OMSetRenderTargets`
+  until `RSSetViewports` is in the IR; a list without attachments uses the values the caller supplied).
   `OMSetRenderTargets` gives `emit` the rendering scope. The attachment set stays bound across state and barrier
   commands, but the instance only lives while draws need it: it opens before the first draw that uses the
   attachments and closes before any command that cannot run inside one (a barrier, clear, copy or the next
@@ -181,10 +183,16 @@ What is implemented (all of it testable without the game):
   promoted state still starts from `GENERAL`, and decay changes no layout. Buffers have no layout, and
   simultaneous-access textures stay in `GENERAL` for life. With `separateDepthStencilLayouts` the depth and stencil
   planes are tracked apart, so a depth-only clear or a one-plane transition leaves the other plane where it is.
-- **Execution** (`runtime/src/vulkan_backend.h`): `VulkanContext` (registered resources, the tracker, a view cache),
-  `VulkanQueue` (`ExecuteCommandLists` prepares every list before writing any, so a bad list submits nothing and
-  leaves the tracker as it was; `Signal`; `Wait`, which is attached to the next submission because a Vulkan wait
-  only holds back its own batch) and `VulkanFence` (a timeline semaphore).
+- **Execution** (`runtime/src/vulkan_backend.h`): `VulkanContext` (registered resources, the tracker, a view cache,
+  the pipeline registry and the draw resources), `VulkanQueue` (`ExecuteCommandLists` prepares every list before
+  writing any, so a bad list submits nothing and leaves the tracker as it was; `Signal`; `Wait`, which is attached to
+  the next submission because a Vulkan wait only holds back its own batch) and `VulkanFence` (a timeline semaphore).
+  The pipeline registry is keyed by the `ID3D12PipelineState` address and holds the `VkPipeline` with the
+  `VkPipelineLayout` it was created with, because `vkCmdBindDescriptorSets` must be given that layout; a draw whose
+  state is not registered is skipped instead of being bound half-way. `set_draw_resources` installs set 0, the
+  console VA → `VkBuffer` lookup that `IASetVertexBuffers` / `IASetIndexBuffer` resolve their addresses through, and
+  a hook recorded at the start of every submission (the bindless set's fallback initialisation, which has to run
+  once before anything samples an unwritten slot).
 - **COM** (`runtime/shims/d3d12_com.cpp`): `ID3D12GraphicsCommandList8` (the GCL7 chain plus
   `OMSetFrontAndBackStencilRef`), `ID3D12CommandQueue`, `ID3D12CommandAllocator` and `ID3D12Fence1` (with
   `SetEventOnCompletion` events). Every method they do not implement is a stub generated at build time from the
@@ -195,8 +203,9 @@ What is implemented (all of it testable without the game):
   them yet: Vulkan can set the faces with `vkCmdSetStencilReference` and a face mask, but only a pipeline that
   consumes the dynamic state can, and `emit` does not set a stencil reference. `OMSetRenderTargets` records the
   captured views: the CPU handles are read from the device's RTV/DSV heaps, including a single-handle descriptor
-  range, whose stride is the fixed RTV slot size. The queue side of the draw path (pipeline registry, bindless set,
-  viewport) is still to be wired into `VulkanQueue`.
+  range, whose stride is the fixed RTV slot size. The queue side of the draw path is wired: the device installs set 0
+  and the VA → buffer lookup once its bindless set exists, and every `CreatePipelineState` object registers its
+  `VkPipeline` and layout for the life of the object, so a draw recorded through COM really draws.
 - **Device** (`runtime/shims/d3d12_vulkan_device.cpp`): an `ID3D12Device11` (PC ABI, 80 slots) that the Xbox-ABI
   proxy (`d3d12_xs_device.cpp`) forwards to, so slot 14's heap-handle conversion and slot 76's resource creation
   work unchanged. It creates the objects above, plus:
@@ -214,6 +223,9 @@ What is implemented (all of it testable without the game):
     targets or depth-stencils, in the sample counts the GPU has for the format);
   - `CheckFeatureSupport` for feature levels (up to 12_1) and architecture. Every other query is logged and
     refused until the trace shows what the game asks (question 11);
+  - `CreatePipelineState`: a D3D12 subobject stream becomes a real `VkPipeline` (`build_pipeline`), and the object
+    registers the pipeline and its layout in the device's registry for as long as it lives, which is how a recorded
+    `SetPipelineState` resolves at execute time (PR C, step 3);
   - `GetCopyableFootprints` for buffers, 2D textures and volumes, including BC1–7 and the two-plane depth-stencil formats.
     The test compares every output with the PC runtime's; that comparison found that planar
     depth-stencil rows are padded to 512 bytes, not 256.
@@ -229,7 +241,7 @@ What is implemented (all of it testable without the game):
   the inner device, so `GetDevice` always returns the Xbox-ABI object. All D3D12 queues share one graphics
   `VkQueue` behind a submit lock (question 12).
 
-Two pieces of milestone M2 that the device does not use yet, built and tested on their own:
+Two pieces of milestone M2 that the replay only partly uses yet, built and tested on their own:
 - **`runtime/src/gfx10_descriptors.h`**: the T#, S# and V# structures (section 5.3), encoded and decoded, with
   their mapping to Vulkan formats, view types, component mappings and samplers. Field positions are Mesa's
   (`src/amd/registers/gfx10-rsrc.json`) and agree with what the translator and the GPU tests already use. Bits

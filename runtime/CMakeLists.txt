@@ -458,6 +458,14 @@ if(Vulkan_FOUND)
   target_compile_definitions(render_targets_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(render_targets_test PRIVATE /W4 /permissive- /utf-8)
   add_test(NAME render_targets COMMAND render_targets_test)
+  # A draw through VulkanQueue::execute (PR C, step 3): the device entry points, the pipeline registry, set 0 and the
+  # console VA -> VkBuffer lookup, with the readback going through the IR as well.
+  add_executable(queue_draw_test test/queue_draw_test.cpp)
+  target_include_directories(queue_draw_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(queue_draw_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  target_compile_definitions(queue_draw_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(queue_draw_test PRIVATE /W4 /permissive- /utf-8)
+  add_test(NAME queue_draw COMMAND queue_draw_test)
   # PE loader hello triangle: harness EXE -> shim DLL exports -> Vulkan WSI swapchain window.
   find_program(LEONIDA_LIB_EXE NAMES lib)
   find_library(LEONIDA_VULKAN_LIB NAMES vulkan-1 HINTS "$ENV{VULKAN_SDK}/Lib")

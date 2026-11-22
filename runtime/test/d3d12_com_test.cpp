@@ -130,8 +130,9 @@ int main() {
         group.NumBarriers = 1;
         group.pTextureBarriers = &texture;
         list->Barrier(1, &group);
-        // Recorded into the IR. The replay skips it: no pipeline state is bound, and this queue has no pipeline
-        // registry yet (PR C, step 3), so there is nothing to draw with.
+        // Recorded into the IR and replayed as state only: the list binds no pipeline state, so there is nothing to
+        // draw with and the draw is skipped rather than emitted half-bound (PR C, step 3; the registry itself is
+        // exercised in queue_draw_test).
         list->DrawInstanced(3, 1, 0, 0);
         EXPECT(list->Close() == S_OK);
         EXPECT(list->Close() == E_FAIL);  // already closed

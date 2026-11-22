@@ -28,6 +28,8 @@ struct VulkanDeviceFunctions {
     X(vkDestroySemaphore) X(vkGetSemaphoreCounterValue) X(vkWaitSemaphores) X(vkSignalSemaphore)               \
     X(vkCreateImageView) X(vkDestroyImageView) X(vkCreateSampler) X(vkDestroySampler) X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) X(vkCmdPipelineBarrier) X(vkCmdPipelineBarrier2)                \
     X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkCmdBeginRendering) X(vkCmdEndRendering)         \
+    X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCmdSetViewport)       \
+    X(vkCmdSetScissor) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer)                                       \
     X(vkCmdClearAttachments) X(vkDeviceWaitIdle) X(vkCreateImage) X(vkDestroyImage)                         \
     X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateBuffer) X(vkDestroyBuffer)                  \
     X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory)  \
@@ -46,7 +48,9 @@ struct VulkanDeviceFunctions {
                vkBeginCommandBuffer && vkEndCommandBuffer && vkQueueSubmit && vkQueueWaitIdle && vkCreateSemaphore &&
                vkDestroySemaphore && vkGetSemaphoreCounterValue && vkWaitSemaphores && vkSignalSemaphore &&
                vkCreateImageView && vkDestroyImageView && vkCmdPipelineBarrier && vkCmdClearColorImage &&
-               vkCmdClearDepthStencilImage && vkCmdClearAttachments && vkDeviceWaitIdle && vkCreateImage &&
+               vkCmdClearDepthStencilImage && vkCmdClearAttachments && vkCmdBindPipeline && vkCmdBindDescriptorSets &&
+               vkCmdDraw && vkCmdDrawIndexed && vkCmdSetViewport && vkCmdSetScissor && vkCmdBindVertexBuffers &&
+               vkCmdBindIndexBuffer && vkDeviceWaitIdle && vkCreateImage &&
                vkDestroyImage && vkGetImageMemoryRequirements && vkBindImageMemory && vkCreateBuffer &&
                vkDestroyBuffer && vkGetBufferMemoryRequirements && vkBindBufferMemory && vkAllocateMemory &&
                vkFreeMemory && vkMapMemory && vkUnmapMemory && vkCmdCopyBuffer && vkCmdCopyBufferToImage &&
@@ -72,6 +76,18 @@ public:
         replay_.copy_image_to_buffer = vk.vkCmdCopyImageToBuffer;
         replay_.copy_image = vk.vkCmdCopyImage;
         replay_.resolve_image = vk.vkCmdResolveImage;
+        replay_.bind_pipeline = vk.vkCmdBindPipeline;
+        replay_.bind_descriptor_sets = vk.vkCmdBindDescriptorSets;
+        replay_.draw = vk.vkCmdDraw;
+        replay_.draw_indexed = vk.vkCmdDrawIndexed;
+        replay_.set_viewport = vk.vkCmdSetViewport;
+        replay_.set_scissor = vk.vkCmdSetScissor;
+        replay_.bind_vertex_buffers = vk.vkCmdBindVertexBuffers;
+        replay_.bind_index_buffer = vk.vkCmdBindIndexBuffer;
+        // The registry is ours, so every draw resolves its pipeline here; the COM device only supplies set 0 and the
+        // console VA -> VkBuffer lookup (set_draw_resources).
+        replay_.pipeline_lookup = &VulkanContext::lookup_pipeline;
+        replay_.pipeline_user = this;
         replay_.image_view = [this](const ResourceBinding& r, const VkImageSubresourceRange& range) {
             return view(r, range);
         };
@@ -122,6 +138,50 @@ public:
         return tracker_.layout(id, subresource);
     }
 
+    // Draws. A D3D12 pipeline state is registered under its address by the PipelineState object's constructor and
+    // removed by its destructor; a draw whose state is not registered is skipped rather than bound half-way. The
+    // layout travels with the pipeline because vkCmdBindDescriptorSets requires the layout the pipeline was created
+    // with. The registry has its own lock because emit() looks pipelines up while a queue holds mutex_.
+    struct RegisteredPipeline {
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+    };
+
+    void add_pipeline(std::uintptr_t id, VkPipeline pipeline, VkPipelineLayout layout) {
+        std::lock_guard lock(pipelines_mutex_);
+        pipelines_[id] = {pipeline, layout};
+    }
+
+    void remove_pipeline(std::uintptr_t id) {
+        std::lock_guard lock(pipelines_mutex_);
+        pipelines_.erase(id);
+    }
+
+    RegisteredPipeline pipeline(std::uintptr_t id) const {
+        std::lock_guard lock(pipelines_mutex_);
+        const auto it = pipelines_.find(id);
+        return it == pipelines_.end() ? RegisteredPipeline{} : it->second;
+    }
+
+    // Empties the registry without destroying anything: the device calls it after vkDeviceWaitIdle and before the
+    // Vulkan device goes away, because the PipelineState destructors own the VkPipelines.
+    void clear_pipelines() {
+        std::lock_guard lock(pipelines_mutex_);
+        pipelines_.clear();
+    }
+
+    // What the COM device adds once its bindless set exists: set 0 for its pipelines, the console VA -> VkBuffer
+    // lookup for vertex and index buffers, and `begin`, recorded at the start of every submission before any command
+    // (the bindless set's fallback initialisation).
+    void set_draw_resources(VkDescriptorSet bindless_set, VkBuffer (*buffer_lookup)(std::uint64_t, std::uint64_t*, void*),
+                            void* buffer_user, std::function<void(VkCommandBuffer)> begin = {}) {
+        std::lock_guard lock(mutex_);
+        replay_.bindless_set = bindless_set;
+        replay_.buffer_lookup = buffer_lookup;
+        replay_.buffer_user = buffer_user;
+        begin_commands_ = std::move(begin);
+    }
+
     VulkanDeviceFunctions vk;
 
     // Vulkan requires external synchronisation of a VkQueue; every D3D12 queue of the device may share one.
@@ -138,6 +198,13 @@ private:
     // Called with mutex_ held (from prepare). Views live until their image is removed.
     VkImageView view(const ResourceBinding& r, const VkImageSubresourceRange& range) {
         return image_view(r, range, VK_IMAGE_VIEW_TYPE_2D_ARRAY);
+    }
+
+    // The lookup ReplayFunctions can hold: a plain function pointer plus the context as `user`.
+    static VkPipeline lookup_pipeline(std::uintptr_t id, VkPipelineLayout* layout, void* user) {
+        const RegisteredPipeline found = static_cast<const VulkanContext*>(user)->pipeline(id);
+        if (layout) *layout = found.layout;
+        return found.pipeline;
     }
 
 public:
@@ -163,6 +230,9 @@ public:
     std::mutex mutex_;  // resources, tracker and views; held while a queue prepares and emits
     std::mutex submit_mutex_;
     std::unordered_map<ResourceId, ResourceBinding> resources_;
+    mutable std::mutex pipelines_mutex_;
+    std::unordered_map<std::uintptr_t, RegisteredPipeline> pipelines_;
+    std::function<void(VkCommandBuffer)> begin_commands_;  // recorded first in every submission
     LayoutTracker tracker_;
     std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> views_;
     ReplayFunctions replay_;
@@ -263,6 +333,7 @@ public:
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         context_.vk.vkBeginCommandBuffer(command_buffer, &begin);
+        if (context_.begin_commands_) context_.begin_commands_(command_buffer);
         for (const auto& list : prepared) emit(list, command_buffer, context_.replay_, &context_.tracker_);
         // A fence wait on the CPU makes GPU writes visible to the host only after a barrier to the host domain:
         // readback buffers are read through Map once the application has waited.

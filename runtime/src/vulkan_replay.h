@@ -472,11 +472,13 @@ struct ReplayFunctions {
     // Returns a 2D-array view of the range (caller-owned, alive until execution completes); rectangle clears.
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
     // Draws (milestone M1). The device supplies the bindless set, the pipeline lookup and the commands; a draw
-    // without them is skipped rather than emitted half-bound. The viewport/scissor are the harness's, until the IR
-    // carries its own.
+    // without them is skipped rather than emitted half-bound. The lookup also returns the pipeline layout set 0 is
+    // bound with, because Vulkan requires the layout the pipeline was created with; bindless_layout is the fallback
+    // for callers whose lookup does not fill it in. A draw that renders into attachments gets its viewport and scissor
+    // from them; otherwise these values are used, until RSSetViewports is in the IR.
     VkPipelineLayout bindless_layout = VK_NULL_HANDLE;
     VkDescriptorSet bindless_set = VK_NULL_HANDLE;
-    VkPipeline (*pipeline_lookup)(std::uintptr_t id, void* user) = nullptr;
+    VkPipeline (*pipeline_lookup)(std::uintptr_t id, VkPipelineLayout* layout, void* user) = nullptr;
     void* pipeline_user = nullptr;
     PFN_vkCmdBindPipeline bind_pipeline = nullptr;
     PFN_vkCmdBindDescriptorSets bind_descriptor_sets = nullptr;
@@ -1044,6 +1046,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
     const bool separate = vk.separate_depth_stencil_layouts;
     const VulkanAccess transfer_dst = vulkan_access(d3d12_state::copy_dest, false);
     VkPipeline bound_pipeline = VK_NULL_HANDLE;
+    VkPipelineLayout bound_layout = VK_NULL_HANDLE;  // the layout bound_pipeline was created with
 
     // Dynamic rendering for OMSetRenderTargets. The attachment set stays bound across state and barrier commands, but
     // a rendering instance only lives while draws need one: it opens before the first draw that uses the attachments
@@ -1083,6 +1086,18 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         vk.begin_rendering(command_buffer, &rendering_info);
         rendering_open = true;
     };
+    // The viewport and scissor a draw uses: the area the attachments share when the list bound any (D3D12 sizes its
+    // output from OMSetRenderTargets until RSSetViewports is in the IR), otherwise the ones the caller supplied.
+    const auto set_viewport_and_scissor = [&](const detail::PreparedTargets* targets) {
+        VkViewport viewport = vk.viewport;
+        VkRect2D scissor = vk.scissor;
+        if (targets) {
+            viewport = {0.0f, 0.0f, float(targets->extent.width), float(targets->extent.height), 0.0f, 1.0f};
+            scissor = {{0, 0}, targets->extent};
+        }
+        if (vk.set_viewport) vk.set_viewport(command_buffer, 0, 1, &viewport);
+        if (vk.set_scissor) vk.set_scissor(command_buffer, 0, 1, &scissor);
+    };
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
@@ -1090,8 +1105,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
 
         // Pipeline state and draws: the state is tracked here, so the draw binds the pipeline the list selected.
         if (const auto* pso = std::get_if<SetPipelineState>(&command)) {
-            bound_pipeline = vk.pipeline_lookup ? vk.pipeline_lookup(pso->pipeline_state, vk.pipeline_user)
-                                                : VK_NULL_HANDLE;
+            bound_layout = VK_NULL_HANDLE;
+            bound_pipeline = vk.pipeline_lookup
+                                 ? vk.pipeline_lookup(pso->pipeline_state, &bound_layout, vk.pipeline_user)
+                                 : VK_NULL_HANDLE;
             continue;
         }
         if (const auto* ia = std::get_if<IASetVertexBuffers>(&command)) {
@@ -1127,11 +1144,11 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             if (attachments_declared && !active) continue;
             if (active) open_targets(*active);
             if (vk.bind_pipeline) vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, bound_pipeline);
-            if (vk.bindless_set && vk.bind_descriptor_sets)
-                vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.bindless_layout, 0, 1,
-                                        &vk.bindless_set, 0, nullptr);
-            if (vk.set_viewport) vk.set_viewport(command_buffer, 0, 1, &vk.viewport);
-            if (vk.set_scissor) vk.set_scissor(command_buffer, 0, 1, &vk.scissor);
+            const VkPipelineLayout layout = bound_layout ? bound_layout : vk.bindless_layout;
+            if (vk.bindless_set && vk.bind_descriptor_sets && layout)
+                vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &vk.bindless_set, 0,
+                                        nullptr);
+            set_viewport_and_scissor(active);
             vk.draw(command_buffer, draw->vertex_count_per_instance, draw->instance_count, draw->start_vertex,
                     draw->start_instance);
             continue;
@@ -1141,11 +1158,11 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             if (attachments_declared && !active) continue;
             if (active) open_targets(*active);
             if (vk.bind_pipeline) vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, bound_pipeline);
-            if (vk.bindless_set && vk.bind_descriptor_sets)
-                vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.bindless_layout, 0, 1,
-                                        &vk.bindless_set, 0, nullptr);
-            if (vk.set_viewport) vk.set_viewport(command_buffer, 0, 1, &vk.viewport);
-            if (vk.set_scissor) vk.set_scissor(command_buffer, 0, 1, &vk.scissor);
+            const VkPipelineLayout layout = bound_layout ? bound_layout : vk.bindless_layout;
+            if (vk.bindless_set && vk.bind_descriptor_sets && layout)
+                vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &vk.bindless_set, 0,
+                                        nullptr);
+            set_viewport_and_scissor(active);
             vk.draw_indexed(command_buffer, draw->index_count_per_instance, draw->instance_count, draw->start_index,
                             draw->base_vertex, draw->start_instance);
             continue;

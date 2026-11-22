@@ -42,7 +42,7 @@ VkBuffer lookup_buffer(std::uint64_t va, std::uint64_t* base, void* user) {
     return VK_NULL_HANDLE;
 }
 
-VkPipeline lookup_pipeline(std::uintptr_t, void* user) { return *static_cast<VkPipeline*>(user); }
+VkPipeline lookup_pipeline(std::uintptr_t, VkPipelineLayout*, void* user) { return *static_cast<VkPipeline*>(user); }
 
 int fail(const char* what) {
     std::fprintf(stderr, "first_texture_test: %s\n", what);

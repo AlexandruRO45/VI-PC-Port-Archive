@@ -466,6 +466,14 @@ inline Resource* resource_for_va(DeviceState& state, std::uint64_t va) {
     const std::uint64_t size = resource->size_bytes();
     return size && va - it->first < size ? resource : nullptr;
 }
+
+// ReplayFunctions' console VA -> VkBuffer lookup for vertex and index buffers; `user` is the owning DeviceState.
+inline VkBuffer lookup_buffer(std::uint64_t va, std::uint64_t* base_va, void* user) {
+    Resource* resource = resource_for_va(*static_cast<DeviceState*>(user), va);
+    if (!resource) return VK_NULL_HANDLE;
+    if (base_va) *base_va = resource->console_va();
+    return resource->buffer();
+}
 namespace sampler_detail {
 
 inline leonida::gfx10::Filter point_or_bilinear(bool linear, bool anisotropic) {
@@ -604,9 +612,14 @@ public:
     static constexpr GUID kTag{0x2a6f5b1c, 0x3f8e, 0x4b2a, {0x9c, 0x1d, 0x7e, 0x4b, 0x8a, 0x6f, 0x2d, 0x10}};
 
     PipelineState(DeviceState& device, VkPipeline pipeline, VkPipelineLayout layout)
-        : device_(device), pipeline_(pipeline), layout_(layout) {}
+        : device_(device), pipeline_(pipeline), layout_(layout) {
+        // A recorded draw names the state by this object's address; the device finds the VkPipeline through
+        // VulkanContext's registry, which is why the object registers itself here.
+        if (pipeline_) device_.context->add_pipeline(reinterpret_cast<std::uintptr_t>(this), pipeline_, layout_);
+    }
 
     ~PipelineState() override {
+        if (pipeline_) device_.context->remove_pipeline(reinterpret_cast<std::uintptr_t>(this));
         auto& vk = device_.context->vk;
         if (pipeline_) vk.vkDestroyPipeline(device_.info.device, pipeline_, nullptr);
         if (layout_) vk.vkDestroyPipelineLayout(device_.info.device, layout_, nullptr);
@@ -977,8 +990,13 @@ public:
             state_.samplers.clear();
         }
         if (state_.context) {
-            std::lock_guard lock(state_.context->submit_mutex());
-            state_.context->vk.vkDeviceWaitIdle(state_.info.device);
+            {
+                std::lock_guard lock(state_.context->submit_mutex());
+                state_.context->vk.vkDeviceWaitIdle(state_.info.device);
+            }
+            // Nothing can be submitted any more. The VkPipelines belong to the PipelineState objects (which may be
+            // destroyed after this device), so the registry is only emptied, never destroyed from here.
+            state_.context->clear_pipelines();
         }
         state_.context.reset();
         if (owned_.device) owned_.destroy_device(owned_.device, nullptr);
@@ -1720,6 +1738,14 @@ public:
     void create_bindless(PFN_vkGetDeviceProcAddr get_device_proc) {
         if (state_.bindless || !get_device_proc) return;
         state_.bindless = std::make_unique<leonida::BindlessSet>(get_device_proc, state_.info.device, state_.memory);
+        if (!state_.context || !state_.bindless->ok()) return;
+        // Draws need set 0 and the console VA -> VkBuffer lookup. The fallback images of the set have undefined
+        // contents, so the first submission that uses a pipeline also initialises them.
+        state_.context->set_draw_resources(
+            state_.bindless->set(), &lookup_buffer, &state_,
+            [bindless = state_.bindless.get()](VkCommandBuffer command_buffer) {
+                if (!bindless->fallbacks_ready()) bindless->record_fallback_init(command_buffer);
+            });
     }
 
     DeviceState state_;

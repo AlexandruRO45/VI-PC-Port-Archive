@@ -63,7 +63,8 @@ struct Views {
     }
 };
 
-VkPipeline lookup_pipeline(std::uintptr_t id, void* user) {
+// The layout is the one the caller passes as bindless_layout; the lookup only resolves the pipeline.
+VkPipeline lookup_pipeline(std::uintptr_t id, VkPipelineLayout*, void* user) {
     return id == kPso ? *static_cast<VkPipeline*>(user) : VK_NULL_HANDLE;
 }
 
