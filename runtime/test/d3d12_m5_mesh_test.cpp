@@ -17,7 +17,9 @@
 //       I4  a count of 7 against MaxCommandCount 2: the first two records only;
 //       I5  20 records of one group each, without a count buffer: one call of 20 (or 20 calls without
 //           multiDrawIndirect).
-//     Without drawIndirectCount, I2..I4 are left out.
+//     Without drawIndirectCount, I2..I4 are left out, and a count-buffer call must fail as unsupported.
+//     --single-calls and --no-count-buffers turn multiDrawIndirect and drawIndirectCount off on the layer's device
+//     (registered as d3d12_m5_mesh_fallbacks), so those paths run on any GPU.
 // (c) Refusals: a DISPATCH_MESH signature whose stride is below 12 is E_INVALIDARG; one on a device without
 //     VK_EXT_mesh_shader is E_NOTIMPL; a DISPATCH_MESH signature run with a VS PSO, and a DRAW signature with the mesh
 //     PSO, fail at execution (ReplayResult::invalid_draw).
@@ -121,7 +123,16 @@ Constants constants(UINT first, unsigned r, unsigned g) { return {first, float(r
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    bool single_calls = false, no_count_buffers = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--single-calls") == 0) single_calls = true;
+        else if (std::strcmp(argv[i], "--no-count-buffers") == 0) no_count_buffers = true;
+        else {
+            std::fprintf(stderr, "usage: d3d12_m5_mesh_test [--single-calls] [--no-count-buffers]\n");
+            return 2;
+        }
+    }
     vktest::Device d;
     d.request_mesh_shader = true;
     const auto device_status = d.initialize();
@@ -151,10 +162,11 @@ int main() {
         info.queue = d.queue;
         info.queue_family = d.family;
         info.buffer_device_address = true;
-        info.multi_draw_indirect = d.multi_draw_indirect;
-        info.draw_indirect_count = d.draw_indirect_count;
+        info.multi_draw_indirect = d.multi_draw_indirect && !single_calls;
+        info.draw_indirect_count = d.draw_indirect_count && !no_count_buffers;
         info.max_draw_indirect_count = d.max_draw_indirect_count;
         info.mesh_shader = mesh;
+        info.subgroup = d.subgroup;  // so the wave64 mesh stage asks for 64 where the device can require it
         info.shader_dir = (root_dir / "spirv").string();
         return info;
     };
@@ -186,14 +198,20 @@ int main() {
         std::printf("no VK_EXT_mesh_shader on this device: only the refusal without it was checked\n");
         return 77;
     }
-    const bool counts = d.draw_indirect_count;
-    if (!d.multi_draw_indirect) std::printf("note: no multiDrawIndirect: the layer issues one call per record\n");
+    const bool counts = d.draw_indirect_count && !no_count_buffers;
+    if (!d.multi_draw_indirect || single_calls) std::printf("note: no multiDrawIndirect: the layer issues one call per record\n");
     if (!counts) std::printf("note: no drawIndirectCount: the count-buffer calls (I2, I3, I4) are not run\n");
 
     unsigned direct_mismatches = 0, indirect_mismatches = 0, records_drawn = 0;
+    const char* subgroup = "?";
     {
         Ref<ID3D12Device> device;
         EXPECT(make_device(true, device));
+        if (rt::d3d12::device_push_constants_need_fallback(device.p)) {
+            std::printf("SKIP: the PSOs need 144 push-constant bytes and this GPU has %u\n",
+                        rt::d3d12::device_max_push_constants_size(device.p));
+            return 77;
+        }
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
         const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
@@ -267,6 +285,23 @@ int main() {
             s.add(BlendSubobject{.inner = opaque});
             a.add(BlendSubobject{.inner = additive});
             EXPECT(stream_pso(s, mesh_opaque) && stream_pso(a, mesh_additive));
+            // ms_m5 is wave64 (not built with --wave64-emulate): it needs 64-wide subgroups in the mesh stage.
+            const auto* requests = rt::d3d12::pipeline_subgroup_requests(mesh_opaque.p);
+            EXPECT(requests);
+            for (const auto& request : *requests) {
+                if (request.stage != VK_SHADER_STAGE_MESH_BIT_EXT) continue;
+                switch (request.outcome) {
+                case leonida::SubgroupOutcome::required: subgroup = "required subgroup size 64"; break;
+                case leonida::SubgroupOutcome::device_fixed: subgroup = "the device's only subgroup size, 64"; break;
+                case leonida::SubgroupOutcome::device_default: subgroup = "the default subgroup size, 64"; break;
+                case leonida::SubgroupOutcome::emulated: subgroup = "wave64 emulation"; break;
+                default:
+                    std::printf("SKIP: the wave64 mesh shader cannot run 64-wide here (subgroup sizes %u..%u, default "
+                                "%u, requirable stages 0x%x)\n", d.subgroup.min_size, d.subgroup.max_size,
+                                d.subgroup.default_size, unsigned(d.subgroup.required_stages));
+                    return 77;
+                }
+            }
             Stream v;
             v.add(RootSubobject{.inner = root.p}).add(VsSubobject{.inner = {vs_rect.data(), vs_rect.size()}});
             v.add(PsSubobject{.inner = {ps_flat.data(), ps_flat.size()}});
@@ -451,6 +486,14 @@ int main() {
             EXPECT(result == leonida::ReplayResult::success);
             indirect_mismatches = check("ExecuteIndirect DISPATCH_MESH", want);
 
+            // Without drawIndirectCount, a count-buffer call cannot be replayed.
+            if (!counts) {
+                EXPECT(begin(mesh_opaque.p, black));
+                list->ExecuteIndirect(sig12.p, 2, args_cpu.p, 256, count_gpu.p, 24);
+                EXPECT(end());
+                EXPECT(run(list.p) == leonida::ReplayResult::unsupported);
+            }
+
             // ===== (c) a draw of the wrong kind fails at execution =====
             Ref<ID3D12CommandSignature> sig_draw;
             {
@@ -474,10 +517,10 @@ int main() {
         }
     }
 
-    std::printf("mesh tier 1, translated wave64 mesh shader (128 threads): DispatchMesh 4x2x2, 3x1x1, 1x1x1 and an empty "
+    std::printf("mesh tier 1, translated wave64 mesh shader (128 threads, %s): DispatchMesh 4x2x2, 3x1x1, 1x1x1 and an empty "
                 "grid, %u mismatched pixels; ExecuteIndirect DISPATCH_MESH, %u records drawn%s, %u mismatched pixels; "
                 "wrong-kind indirect draws fail at execution\n",
-                direct_mismatches, records_drawn, counts ? " (count buffers included)" : " (no count buffers)",
+                subgroup, direct_mismatches, records_drawn, counts ? " (count buffers included)" : " (no count buffers)",
                 indirect_mismatches);
     return direct_mismatches == 0 && indirect_mismatches == 0 ? 0 : 1;
 }
