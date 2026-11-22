@@ -627,6 +627,70 @@ class TestDSMaxSrc2U32SIMDMultiLane(unittest.TestCase):
         addr_pairs_clean = [(0 * 4, 1 * 4), (2 * 4, 3 * 4)]
         self.assertEqual(detect_lds_src2_bank_conflicts(addr_pairs_clean), {})
 
+class TestDSMaxSrc2U32RegisterAliasing(unittest.TestCase):
+    """Phase 5: Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(size_dwords=1024)
+        self.state = ScalarThreadState(lds=self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_all_registers_preserved_non_returning(self) -> None:
+        base = 0x20
+        self.lds.write_dword(base, 10)
+        self.lds.write_dword(base + 4, 50)
+
+        # Put canaries across all VGPRs and SGPRs
+        for r in range(DEFAULT_NUM_VGPRS):
+            self.state.set_vgpr(r, 0x1000 + r)
+        for s in range(DEFAULT_NUM_SGPRS):
+            self.state.sgprs[s] = 0x2000 + s
+
+        self.state.set_vgpr(5, base)  # base address in v5
+
+        inst = DSMaxSrc2U32Instruction.parse("ds_max_src2_u32 v5 offset0:0 offset1:1")
+        res = self.interp.execute(self.state, inst)
+        self.assertEqual(res, 50)
+
+        # Every single VGPR must remain completely identical
+        for r in range(DEFAULT_NUM_VGPRS):
+            expected = base if r == 5 else (0x1000 + r)
+            self.assertEqual(self.state.get_vgpr(r), expected)
+
+        # Every SGPR untouched
+        for s in range(DEFAULT_NUM_SGPRS):
+            self.assertEqual(self.state.sgprs[s], 0x2000 + s)
+
+    def test_same_offset_aliasing(self) -> None:
+        # offset0 == offset1 -> Loc A == Loc B
+        base = 0x40
+        self.lds.write_dword(base + 8, 999)
+        self.state.set_vgpr(3, base)
+
+        inst = DSMaxSrc2U32Instruction.parse("ds_max_src2_u32 v3 offset0:2 offset1:2")
+        res = self.interp.execute(self.state, inst)
+        self.assertEqual(res, 999)
+        self.assertEqual(self.lds.read_dword(base + 8), 999)
+
+    def test_interlocking_offset_pairs(self) -> None:
+        # Loc A = base + 4, Loc B = base + 8
+        base = 0x50
+        self.lds.write_dword(base + 4, 15)
+        self.lds.write_dword(base + 8, 30)
+        self.state.set_vgpr(0, base)
+
+        # Op 1: max(LDS[A], LDS[B]) where A=1, B=2 -> LDS[A] becomes 30
+        inst1 = DSMaxSrc2U32Instruction.parse("ds_max_src2_u32 v0 offset0:1 offset1:2")
+        self.interp.execute(self.state, inst1)
+        self.assertEqual(self.lds.read_dword(base + 4), 30)
+        self.assertEqual(self.lds.read_dword(base + 8), 30)
+
+        # Op 2: reverse roles where A=2, B=1 -> LDS[B] was 30, LDS[A] becomes 30
+        inst2 = DSMaxSrc2U32Instruction.parse("ds_max_src2_u32 v0 offset0:2 offset1:1")
+        self.interp.execute(self.state, inst2)
+        self.assertEqual(self.lds.read_dword(base + 4), 30)
+        self.assertEqual(self.lds.read_dword(base + 8), 30)
+
 
 if __name__ == "__main__":
     unittest.main()
