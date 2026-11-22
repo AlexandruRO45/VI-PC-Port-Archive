@@ -954,5 +954,25 @@ class WholeQuadModeTests(CfRefTestCase):
         self.assertEqual([lane for lane in range(32) if ex[lane][1] == 1], [8, 9, 10, 11])
 
 
+class LaneSelectTests(CfRefTestCase):
+    def test_readlane_and_writelane_ignore_exec_and_wrap(self):
+        items = lane_id_prologue(32) + [
+            "v_add_nc_u32 v1, 100, v0",
+            "s_mov_b32 s5, 77",
+            "v_cmp_gt_u32_e32 vcc_lo, 4, v0",       # lanes 0..3
+            "s_and_saveexec_b32 s6, vcc_lo",
+            "v_readlane_b32 s0, v1, 20",            # lane 20 is off: still read
+            "v_writelane_b32 v1, s5, 20",           # and still written
+            "v_readlane_b32 s1, v1, 52",            # wave32: lane 52 & 31 = 20
+            "s_or_b32 exec_lo, exec_lo, s6",
+            "exp mrt0 v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        res = self.run_items(items, wave=32)
+        self.assertEqual((res["sgpr"][0], res["sgpr"][1]), (120, 77))
+        self.assertEqual(res["exports"][20][0], 77)
+        self.assertEqual(res["exports"][21][0], 121)
+
+
 if __name__ == "__main__":
     unittest.main()

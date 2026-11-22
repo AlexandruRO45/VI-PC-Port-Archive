@@ -246,6 +246,16 @@ class WaveMachine(cpu_ref.Machine):
                 self._write_scalar_dst(a[0], r)
             self.scc = 1 if r else 0
             return None
+        if base in ("v_readlane_b32", "v_writelane_b32"):
+            # VOP3, EXEC ignored: readlane sD = vS[lane]; writelane vD[lane] = sS, every other lane kept. The lane
+            # is S1[4:0] in wave32 and S1[5:0] in wave64.
+            self._expect(ins, 3)
+            lane = self._int_src(a[2], 0, scalar=True) & (self.wave - 1)
+            if base == "v_readlane_b32":
+                self._write_scalar_dst(a[0], self._int_src(a[1], lane))
+            else:
+                self._write_vgpr(a[0], lane, self._int_src(a[1], 0, scalar=True))
+            return None
         if base == "v_readfirstlane_b32":
             # sD = vS of the lowest lane on in EXEC, or of lane 0 when none is.
             self._expect(ins, 2)

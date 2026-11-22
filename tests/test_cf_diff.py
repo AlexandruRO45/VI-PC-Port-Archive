@@ -79,6 +79,24 @@ WQM_CASES = {
         ("wqm", ("eq", "u32", 9, 0), "vcc", "b32", "lo", None, [("probe", 5)])])],
 }
 
+# v_readlane / v_writelane ignore EXEC: a lane an enclosing if turned off is still read and written.
+OFF_LANE = ("gt", "u32", 4, 0)      # lanes 0..3 only
+LANE_CASES = {
+    "v_writelane of an inactive lane": [("if", OFF_LANE, False, [("lanes", "write", 20, 8, 11), ("probe", 3)])],
+    "v_readlane of an inactive lane": [("if", OFF_LANE, False, [("lanes", "read", 20, 2, 10), ("probe", 3)])],
+    "lane select past the wave wraps": [("if", OFF_LANE, True, [("lanes", "write", 84, 9, 12)])],
+    "SGPR lane select in a loop": [("vloop", (0, 3, False), None, [("lanes", "read", "s11", 1, 10),
+                                                                   ("lanes", "write", "s10", 9, 13), ("probe", 4)])],
+}
+
+
+@pytest.mark.parametrize("case", sorted(LANE_CASES))
+@pytest.mark.parametrize("wave", (32, 64))
+@pytest.mark.parametrize("structured", (True, False), ids=("structured", "dispatch-loop"))
+def test_lane_select_ignores_exec(case, wave, structured):
+    status, detail = cf_diff.run_case("ps_lanes", LANE_CASES[case], wave, structured)
+    assert status == "match", detail
+
 
 @pytest.mark.parametrize("case", sorted(WQM_CASES))
 @pytest.mark.parametrize("wave", (32, 64))
@@ -254,7 +272,7 @@ def test_generator_covers_every_shape():
     for i in range(200):
         walk(cf_diff.generate(random.Random(i), 32))
     assert {"if", "ifelse", "cmpx", "saveexec", "vccz", "sif", "sloop", "vloop", "irr", "sccmask", "csel", "probe",
-            "ifs", "cexec", "halfexec", "halfscc", "scmpmask", "cselmask", "vccloop", "cmpxloop", "mread", "waterfall", "wqm"} <= kinds
+            "ifs", "cexec", "halfexec", "halfscc", "scmpmask", "cselmask", "vccloop", "cmpxloop", "mread", "waterfall", "wqm", "lanes"} <= kinds
 
 
 @pytest.mark.parametrize("op_name", ("andn2", "orn2", "xor", "nand", "nor", "xnor"))

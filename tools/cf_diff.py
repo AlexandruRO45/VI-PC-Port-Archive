@@ -30,6 +30,9 @@ Shapes (each nests, up to --depth):
             uniform SGPR, added to every active lane [-> s_cmp on it -> s_cbranch_scc0/1 over a body]
   waterfall v_readfirstlane of a lane value -> v_cmp_eq -> s_and_saveexec -> body -> s_xor exec, back edge
             s_cbranch_execnz: one round per distinct value (the descriptor-per-group-of-lanes loop)
+  lanes     v_readlane (added to every active lane) / v_writelane (into a data VGPR) of a constant lane (also one
+            past the wave, which wraps) or an SGPR lane, at any depth: EXEC is ignored, so an inactive lane is read
+            or written too
   wqm       s_wqm of EXEC (after narrowing it to a compare) or of VCC into EXEC: every lane of a quad with an active
             lane runs the body, even one an enclosing if had turned off [-> s_cbranch_execz]; EXEC restored with
             s_mov; or s_wqm of a compare into an SGPR -> s_cbranch_scc0/1 (SCC = any quad on)
@@ -78,7 +81,7 @@ STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 DATA = (1, 2, 3, 8, 9)            # VGPRs the bodies compute on (v0 = lane id is kept intact)
 SREGS = (10, 11, 12, 13)          # uniform SGPRs the bodies compute on
 CCS = ("eq", "ne", "lt", "le", "gt", "ge")
-VOP3 = ("v_mul_lo_u32", "v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32")
+VOP3 = ("v_mul_lo_u32", "v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32", "v_readlane_b32", "v_writelane_b32")
 
 
 # ---- program tree --------------------------------------------------------------------------------------------
@@ -148,7 +151,13 @@ class Gen:
         kind = r.choice(("if", "if", "ifelse", "ifelse", "cmpx", "saveexec", "vccz", "sif", "sloop", "vloop",
                          "vloop", "irr", "sccmask", "csel", "ifs", "ifs", "cexec", "halfexec", "halfscc", "scmpmask",
                          "cselmask", "vccloop", "cmpxloop", "mread", "mread", "waterfall",
-                         "waterfall", "wqm", "wqm"))
+                         "waterfall", "wqm", "wqm", "lanes", "lanes"))
+        if kind == "lanes":
+            lane = f"s{r.choice(SREGS)}" if r.random() < 0.3 else r.randrange(0, 2 * self.wave)
+            # Writes favour v8/v9, which go straight to the export, so a lost write to an inactive lane shows.
+            rw = r.choice(("read", "write"))
+            v = r.choice((8, 9, 8, 9, 1, 2, 3)) if rw == "write" else r.choice(DATA)
+            return ("lanes", rw, lane, v, r.choice(SREGS))
         if kind == "wqm":
             width = r.choice(("b64", "b32")) if self.wave == 64 else "b32"
             return ("wqm", self.cmp(), r.choice(("exec", "vcc", "scc")), width,
@@ -419,6 +428,15 @@ class Emitter:
                 self.nodes(body)
                 self.depth -= 1
                 self.place(end)
+        elif kind == "lanes":
+            _, rw, lane, v, sr = n
+            sel = lane if isinstance(lane, str) else str(lane)
+            if rw == "read":
+                dst = f"s{100 + self.depth}"
+                self.ins(f"v_readlane_b32 {dst}, v{v}, {sel}")
+                self.ins(f"v_add_nc_u32 v11, {dst}, v11")
+            else:
+                self.ins(f"v_writelane_b32 v{v}, s{sr}, {sel}")
         elif kind == "wqm":
             _, c, src, width, half, mnemonic, body = n
             save, end = self.sreg(80), self.label()
