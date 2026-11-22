@@ -241,7 +241,12 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_fmac_f16_mods": (0xaaaa3c00, 0xaaaa3e00, 0xaaaa0000, 0xaaaa4000),
               "ps_vop3_const_mods": (0xc0000000, 0xbf800000, 0x3f800000, 0xaaaabc00),
               "ps_interp_f32_mods": (0x3f800000, 0x00000000, 0x3f400000, 0x3f800000),
-              "ps_interp_mov_mods": (0x3f800000, 0x3fc00000, 0x40000000, 0x3f400000)}
+              "ps_interp_mov_mods": (0x3f800000, 0x3fc00000, 0x40000000, 0x3f400000),
+              # sum-of-absolute-differences family and v_lerp_u8 (derivations in the .asm headers)
+              "ps_sad": (0x4000010d, 0x00fdabcd, 0x40000004, 0x2dcba989),
+              "ps_msad_lerp": (0x4000000e, 0x3f80004d, 0xff7f0380, 0x00fe3be9),
+              "ps_qsad": (0x01d500fb, 0x01fe0119, 0x01d0000b, 0x00ff0099),
+              "ps_mqsad_u32": (0x4000000b, 0x010001ce, 0xc0000099, 0x123457d7)}
 # Pixel shaders that read memory: vk_harness puts this V# in s[0:3] and seeds the heap it points at, as
 # tests/semantic/test_value_semantics.py does for the interpreter.
 PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x11223344,0x1004=0x55667788"},
