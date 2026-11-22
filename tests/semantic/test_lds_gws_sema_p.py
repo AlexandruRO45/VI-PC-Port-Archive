@@ -151,6 +151,138 @@ def ref_ds_gws_sema_p(subsystem: GWSSubsystem, m0_val: int, offset: int, wave_id
     return subsystem.wait_p(rid, wave_id)
 
 
+# ============================================================================
+# Commit 2: Symbolic AST opcode definitions and typed expressions
+# ============================================================================
+
+
+class RegKind(enum.Enum):
+    """Register kinds in RDNA2 architecture."""
+    VGPR = "vgpr"
+    SGPR = "sgpr"
+    M0 = "m0"
+    EXEC = "exec"
+    VCC = "vcc"
+    SCC = "scc"
+    STATUS = "status"
+
+
+@dataclass(frozen=True)
+class Register:
+    """Represents an RDNA2 hardware register."""
+    index: int = 0
+    kind: RegKind = RegKind.VGPR
+
+    def __post_init__(self) -> None:
+        if self.kind in (RegKind.VGPR, RegKind.SGPR):
+            if not (0 <= self.index <= 255):
+                raise ValueError(f"Register index out of bounds [0, 255]: {self.index}")
+        elif self.kind in (RegKind.M0, RegKind.EXEC, RegKind.VCC, RegKind.SCC, RegKind.STATUS):
+            if self.index != 0:
+                raise ValueError(f"Special register {self.kind.value} index must be 0")
+
+    def __str__(self) -> str:
+        if self.kind == RegKind.VGPR:
+            return f"v{self.index}"
+        elif self.kind == RegKind.SGPR:
+            return f"s{self.index}"
+        return self.kind.value
+
+
+class Opcode(enum.Enum):
+    """Data Share / GWS Opcode definitions."""
+    DS_GWS_SEMA_P = "ds_gws_sema_p"
+    DS_GWS_SEMA_V = "ds_gws_sema_v"
+    DS_GWS_INIT = "ds_gws_init"
+    DS_GWS_BARRIER = "ds_gws_barrier"
+
+
+@dataclass(frozen=True)
+class Instruction:
+    """AST representation of RDNA2 ds_gws_sema_p instruction."""
+    opcode: Opcode = Opcode.DS_GWS_SEMA_P
+    offset: int = 0
+    gds: bool = True
+    vdata: Optional[Register] = None
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.offset <= OFFSET16_MASK):
+            raise ValueError(f"GWS immediate offset out of range [0, 65535]: {self.offset}")
+        if not self.gds:
+            raise ValueError("GWS instructions strictly require the gds keyword modifier")
+        if self.vdata is not None and self.vdata.kind != RegKind.VGPR:
+            raise TypeError(f"vdata must be a VGPR, got: {self.vdata.kind}")
+
+    def disasm(self) -> str:
+        parts = [self.opcode.value]
+        if self.vdata is not None:
+            parts.append(str(self.vdata))
+        parts.append(f"offset:{self.offset}")
+        if self.gds:
+            parts.append("gds")
+        return " ".join(parts)
+
+    @classmethod
+    def parse(cls, asm: str) -> Instruction:
+        """Parse assembly text into Instruction AST."""
+        tokens = asm.strip().split()
+        if not tokens:
+            raise ValueError("Empty assembly string")
+
+        op_str = tokens[0]
+        try:
+            opcode = Opcode(op_str)
+        except ValueError:
+            raise ValueError(f"Unrecognized opcode: {op_str}")
+
+        offset = 0
+        gds = False
+        vdata = None
+
+        for tok in tokens[1:]:
+            if tok == "gds":
+                gds = True
+            elif tok.startswith("offset:"):
+                raw_off = tok.split(":", 1)[1]
+                offset = int(raw_off, 0)
+            elif tok.startswith("v") and tok[1:].isdigit():
+                vdata = Register(int(tok[1:]), RegKind.VGPR)
+            else:
+                raise ValueError(f"Unexpected token in instruction: {tok}")
+
+        if not gds:
+            raise ValueError("Instruction missing required 'gds' modifier")
+
+        return cls(opcode=opcode, offset=offset, gds=gds, vdata=vdata)
+
+
+@dataclass(frozen=True)
+class GWSResourceExpr:
+    """Symbolic expression for effective GWS resource identifier."""
+    base_reg: Register = field(default_factory=lambda: Register(0, RegKind.M0))
+    offset: int = 0
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.offset <= OFFSET16_MASK):
+            raise ValueError(f"Offset out of range [0, 65535]: {self.offset}")
+
+    def evaluate(self, m0_val: int) -> int:
+        return ref_gws_resource_id(m0_val, self.offset)
+
+
+@dataclass(frozen=True)
+class SemaphoreAcquireExpr:
+    """Symbolic typed expression for semaphore acquire condition."""
+    resource_id: int
+
+    def can_acquire(self, counter: int) -> bool:
+        return (counter & MASK32) > 0
+
+    def next_counter(self, counter: int) -> int:
+        c = counter & MASK32
+        return (c - 1) & MASK32 if c > 0 else 0
+
+
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Commit 1: Reference mathematical oracle and architectural model for ds_gws_sema_p."""
 
@@ -251,6 +383,89 @@ class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
         self.gws.init_resource(rid, init_val=0, res_type=GWSResourceType.BARRIER)
         with self.assertRaises(TypeError):
             ref_ds_gws_sema_p(self.gws, m0_val=rid, offset=0, wave_id=1)
+
+
+class TestSymbolicASTAndTypedExpressions(unittest.TestCase):
+    """Commit 2: Symbolic AST opcode definitions and typed expressions for ds_gws_sema_p."""
+
+    def test_register_construction_and_formatting(self) -> None:
+        v0 = Register(0, RegKind.VGPR)
+        v255 = Register(255, RegKind.VGPR)
+        s15 = Register(15, RegKind.SGPR)
+        m0 = Register(0, RegKind.M0)
+        exec_reg = Register(0, RegKind.EXEC)
+        vcc_reg = Register(0, RegKind.VCC)
+        scc_reg = Register(0, RegKind.SCC)
+        status_reg = Register(0, RegKind.STATUS)
+
+        self.assertEqual(str(v0), "v0")
+        self.assertEqual(str(v255), "v255")
+        self.assertEqual(str(s15), "s15")
+        self.assertEqual(str(m0), "m0")
+        self.assertEqual(str(exec_reg), "exec")
+        self.assertEqual(str(vcc_reg), "vcc")
+        self.assertEqual(str(scc_reg), "scc")
+        self.assertEqual(str(status_reg), "status")
+
+    def test_register_bounds_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(-1, RegKind.VGPR)
+        with self.assertRaises(ValueError):
+            Register(256, RegKind.VGPR)
+        with self.assertRaises(ValueError):
+            Register(1, RegKind.M0)
+        with self.assertRaises(ValueError):
+            Register(2, RegKind.EXEC)
+
+    def test_instruction_disassembly(self) -> None:
+        inst1 = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=0, gds=True)
+        self.assertEqual(inst1.disasm(), "ds_gws_sema_p offset:0 gds")
+
+        inst2 = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=15, gds=True)
+        self.assertEqual(inst2.disasm(), "ds_gws_sema_p offset:15 gds")
+
+        inst3 = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=4, gds=True, vdata=Register(2, RegKind.VGPR))
+        self.assertEqual(inst3.disasm(), "ds_gws_sema_p v2 offset:4 gds")
+
+    def test_instruction_assembly_parser(self) -> None:
+        inst1 = Instruction.parse("ds_gws_sema_p offset:0 gds")
+        self.assertEqual(inst1.opcode, Opcode.DS_GWS_SEMA_P)
+        self.assertEqual(inst1.offset, 0)
+        self.assertTrue(inst1.gds)
+        self.assertIsNone(inst1.vdata)
+
+        inst2 = Instruction.parse("ds_gws_sema_p offset:42 gds")
+        self.assertEqual(inst2.offset, 42)
+
+        inst3 = Instruction.parse("ds_gws_sema_p v1 offset:8 gds")
+        self.assertIsNotNone(inst3.vdata)
+        self.assertEqual(inst3.vdata.index, 1)
+        self.assertEqual(inst3.offset, 8)
+
+    def test_instruction_parser_rejections(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction.parse("ds_gws_sema_p offset:0")  # missing gds
+        with self.assertRaises(ValueError):
+            Instruction.parse("v_add_f32 v0, v1, v2")  # wrong opcode
+        with self.assertRaises(ValueError):
+            Instruction.parse("ds_gws_sema_p offset:70000 gds")  # out of bounds offset
+
+    def test_gws_resource_expr_evaluation(self) -> None:
+        expr = GWSResourceExpr(offset=10)
+        self.assertEqual(expr.evaluate(m0_val=2), 12)
+        self.assertEqual(expr.evaluate(m0_val=60), 6)  # (60 + 10) % 64 = 6
+        self.assertEqual(expr.evaluate(m0_val=0), 10)
+
+    def test_semaphore_acquire_expr(self) -> None:
+        expr = SemaphoreAcquireExpr(resource_id=3)
+        self.assertTrue(expr.can_acquire(5))
+        self.assertEqual(expr.next_counter(5), 4)
+
+        self.assertTrue(expr.can_acquire(1))
+        self.assertEqual(expr.next_counter(1), 0)
+
+        self.assertFalse(expr.can_acquire(0))
+        self.assertEqual(expr.next_counter(0), 0)
 
 
 if __name__ == "__main__":
