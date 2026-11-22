@@ -859,6 +859,136 @@ class TestDSMaxSrc2U32IEEE754EdgeCases(unittest.TestCase):
         res = self.interp.execute(self.state, inst)
         self.assertEqual(res, 42)
 
+class TestDSMaxSrc2U32NegativeControlsAndMutations(unittest.TestCase):
+    """Phase 8: Unit tests for negative rejection, syntax validation, and mutation detection."""
+
+    def test_syntax_rejection_invalid_strings(self) -> None:
+        invalid_assemblies = [
+            "",
+            "   ",
+            "ds_max_u32 v0",
+            "ds_max_rtn_u32 v0, v1, v2",
+            "ds_min_src2_u32 v0",
+            "v_max_u32 v0, v1",
+            "ds_max_src2_u32",
+            "ds_max_src2_u32 s0",
+            "ds_max_src2_u32 r0",
+            "ds_max_src2_u32 v256",
+            "ds_max_src2_u32 v0 offset0:-1",
+            "ds_max_src2_u32 v0 offset0:256",
+            "ds_max_src2_u32 v0 offset1:300",
+            "ds_max_src2_u32 v0 offset0:xyz",
+            "ds_max_src2_u32 v0 bad_token",
+        ]
+        for asm in invalid_assemblies:
+            with self.subTest(asm=asm):
+                with self.assertRaises((ValueError, TypeError)):
+                    DSMaxSrc2U32Instruction.parse(asm)
+
+    def test_architectural_model_negative_controls(self) -> None:
+        with self.assertRaises(ValueError):
+            LDSMemory(size_dwords=1000)
+        with self.assertRaises(ValueError):
+            LDSMemory(size_dwords=-64)
+        with self.assertRaises(ValueError):
+            LDSMemory(size_dwords=0)
+
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=128)
+
+    def test_mutation_detection_signed_comparison(self) -> None:
+        # Mutant: treats 32-bit values as signed integers instead of unsigned
+        def mutant_max_signed(val_a: int, val_b: int) -> int:
+            sa = s32(val_a)
+            sb = s32(val_b)
+            return u32(max(sa, sb))
+
+        # In unsigned: 0xFFFFFFFF > 0.
+        # In signed: -1 (0xFFFFFFFF) < 0, so mutant returns 0!
+        mutant_res = mutant_max_signed(0, 0xFFFFFFFF)
+        oracle_res = ref_ds_max_src2_u32(0, 0xFFFFFFFF)
+        self.assertNotEqual(mutant_res, oracle_res)
+        self.assertEqual(oracle_res, 0xFFFFFFFF)
+        self.assertEqual(mutant_res, 0)
+
+    def test_mutation_detection_inverted_min(self) -> None:
+        def mutant_min_u32(val_a: int, val_b: int) -> int:
+            return min(u32(val_a), u32(val_b))
+
+        mutant_res = mutant_min_u32(10, 20)
+        oracle_res = ref_ds_max_src2_u32(10, 20)
+        self.assertNotEqual(mutant_res, oracle_res)
+        self.assertEqual(oracle_res, 20)
+        self.assertEqual(mutant_res, 10)
+
+    def test_mutation_detection_reversed_target(self) -> None:
+        # Mutant: writes max result into Location B instead of Location A
+        class ReversedTargetMutant(LDSMemory):
+            def atomic_max_src2_u32(self, vaddr: int, offset0: int = 0, offset1: int = 0) -> int:
+                _, _, idx_a, idx_b = calc_lds_src2_addresses(vaddr, offset0, offset1, self.size_dwords)
+                res = ref_ds_max_src2_u32(self.memory[idx_a], self.memory[idx_b])
+                self.memory[idx_b] = res  # Wrong target!
+                return res
+
+        lds = ReversedTargetMutant(size_dwords=1024)
+        lds.write_dword(0x20, 10)
+        lds.write_dword(0x24, 50)
+        lds.atomic_max_src2_u32(0x20, offset0=0, offset1=1)
+
+        # In standard instruction, Loc A (0x20) becomes 50 and Loc B remains 50.
+        # In mutant, Loc A remains 10!
+        self.assertNotEqual(lds.read_dword(0x20), 50)
+
+    def test_mutation_detection_ignore_exec_mask(self) -> None:
+        class MutantSIMD(SIMDDSInterpreter):
+            def execute(self, state: SIMDWaveState, inst: DSMaxSrc2U32Instruction) -> Dict[int, int]:
+                saved = state.exec_mask
+                state.exec_mask = state.full_mask
+                try:
+                    return super().execute(state, inst)
+                finally:
+                    state.exec_mask = saved
+
+        lds = LDSMemory(size_dwords=1024)
+        lds.write_dword(0x40, 10)
+        lds.write_dword(0x44, 999)
+        wave = SIMDWaveState(wave_size=32, exec_mask=0, lds=lds)
+        for l in range(32):
+            wave.set_lane_vgpr(l, 1, 0x40)
+
+        inst = DSMaxSrc2U32Instruction.parse("ds_max_src2_u32 v1 offset0:0 offset1:1")
+        mutant = MutantSIMD()
+        mutant.execute(wave, inst)
+        # Mutant modified LDS despite exec_mask=0
+        self.assertEqual(lds.read_dword(0x40), 999)
+
+        # Standard interpreter does not modify LDS
+        lds.write_dword(0x40, 10)
+        SIMDDSInterpreter().execute(wave, inst)
+        self.assertEqual(lds.read_dword(0x40), 10)
+
+    def test_mutation_detection_dropped_offset(self) -> None:
+        class DroppedOffsetInterpreter(ScalarDSInterpreter):
+            def execute(self, state: ScalarThreadState, inst: DSMaxSrc2U32Instruction) -> int:
+                no_off = DSMaxSrc2U32Instruction(
+                    addr=LDSAddressExpression(base_reg=inst.addr.base_reg, offset0=0, offset1=0)
+                )
+                return super().execute(state, no_off)
+
+        lds = LDSMemory(size_dwords=1024)
+        lds.write_dword(0x10, 10)
+        lds.write_dword(0x20, 20)
+        state = ScalarThreadState(lds=lds)
+        state.set_vgpr(1, 0x10)
+
+        inst = DSMaxSrc2U32Instruction.parse("ds_max_src2_u32 v1 offset0:0 offset1:4")
+        mutant = DroppedOffsetInterpreter()
+        mutant.execute(state, inst)
+        # Mutant compared 0x10 with 0x10 instead of 0x10 with 0x20
+        self.assertEqual(lds.read_dword(0x10), 10)
+
 
 if __name__ == "__main__":
     unittest.main()
