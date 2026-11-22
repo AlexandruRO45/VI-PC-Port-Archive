@@ -29,6 +29,12 @@ The Windows job builds the C++ and HLSL, runs the CPU, Python and WARP tests, an
 
 ## Share a reproducible finding
 
+To register a new translated CPU fixture for the coverage dashboard, put
+`; coverage: source cpu_your_test` on the first line of its MASM file. Name the
+CTest that actually compares the translation. For macro-generated instructions,
+use `; coverage: record cpu_your_test` and have the test emit the decoded forms
+through `FORM_COVERAGE_RECORD`. Existing registrations still work.
+
 Use original source, synthetic inputs or a public sample with its revision and license. Store local inputs in `game-files/` and generated output in `out/`. Keep game files, distribution links, SDK redistributables and dumps out of issues, PRs and Git. Remove personal paths and credentials from logs.
 
 State what the test measured and which behavior remains a hypothesis. For example, a BVH report can identify the first differing ray and give the CPU, shader and DXR hit distances. If several primitives coincide, describe which IDs are valid. Claims about the inspected build should identify their source. A passing fixture supports the behavior under test; full-game startup requires its own execution evidence.

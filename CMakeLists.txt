@@ -17,7 +17,7 @@ add_test(NAME desktop_bvh_root_flags COMMAND d3d12_sdk_check bvh-flags)
 add_executable(era_heap_check tests/era_heap_check.cpp src/era_heap.cpp)
 target_include_directories(era_heap_check PRIVATE src)
 target_compile_features(era_heap_check PRIVATE cxx_std_20)
-foreach(scenario IN ITEMS allocation failure concurrency caller_layout reuse observed_words)
+foreach(scenario IN ITEMS allocation failure concurrency caller_layout reuse observed_words large_alignment graphics_types)
     add_test(NAME era_heap_${scenario} COMMAND era_heap_check ${scenario})
 endforeach()
 
@@ -31,6 +31,14 @@ target_include_directories(era_query_check PRIVATE src)
 target_compile_features(era_query_check PRIVATE cxx_std_17)
 foreach(scenario IN ITEMS fields tail registry short)
     add_test(NAME era_query_${scenario} COMMAND era_query_check ${scenario})
+endforeach()
+
+# Title GPU address to desktop GPU virtual address table (no GPU needed).
+add_executable(era_title_va_check tests/era_title_va_check.cpp src/era_title_va.cpp)
+target_include_directories(era_title_va_check PRIVATE src)
+target_compile_features(era_title_va_check PRIVATE cxx_std_17)
+foreach(scenario IN ITEMS translate bounds registry shader)
+    add_test(NAME era_title_va_${scenario} COMMAND era_title_va_check ${scenario})
 endforeach()
 
 # Desktop xmem.dll for the package DLLs' four named xmem imports.
@@ -118,6 +126,34 @@ foreach(entry IN ITEMS DualUav SampleMip WriteRecurrent)
 endforeach()
 target_sources(offscreen_check PRIVATE tests/bvh_reads_waves.cpp tests/bvh_hits.cpp)
 target_sources(offscreen_check PRIVATE tests/bvh_atomics.cpp tests/bvh_numeric.cpp)
+# A title graphics allocation opened as a D3D12 heap and addressed through translated GPU addresses.
+target_sources(offscreen_check PRIVATE tests/gpu_alias.cpp src/era_gpu_alias.cpp src/era_title_va.cpp src/era_heap.cpp)
+# The same allocations read by a shader through 64-bit title addresses (src/title_va_lookup.hlsli).
+target_sources(offscreen_check PRIVATE tests/gpu_alias_lookup.cpp)
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/LookupTitleAddresses.h" COMMAND "${DXC_EXECUTABLE}" -T cs_6_0
+    -E LookupTitleAddresses -Vn LookupTitleAddresses -I "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    -Fh "${CMAKE_CURRENT_BINARY_DIR}/LookupTitleAddresses.h" -Fo "${CMAKE_CURRENT_BINARY_DIR}/LookupTitleAddresses.cso"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_alias_lookup.hlsl" DEPENDS tests/gpu_alias_lookup.hlsl src/title_va_lookup.hlsli
+    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/LookupTitleAddresses.cso" VERBATIM)
+target_sources(offscreen_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/LookupTitleAddresses.h")
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/WriteTitleAddresses.h" COMMAND "${DXC_EXECUTABLE}" -T cs_6_0
+    -E WriteTitleAddresses -Vn WriteTitleAddresses -I "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    -Fh "${CMAKE_CURRENT_BINARY_DIR}/WriteTitleAddresses.h" -Fo "${CMAKE_CURRENT_BINARY_DIR}/WriteTitleAddresses.cso"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_alias_writes.hlsl" DEPENDS tests/gpu_alias_writes.hlsl src/title_va_lookup.hlsli
+    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/WriteTitleAddresses.cso" VERBATIM)
+target_sources(offscreen_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/WriteTitleAddresses.h")
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomics.h" COMMAND "${DXC_EXECUTABLE}" -T cs_6_0
+    -E ProbeArrayAtomics -Vn ProbeArrayAtomics -I "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    -Fh "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomics.h" -Fo "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomics.cso"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_alias_writes.hlsl" DEPENDS tests/gpu_alias_writes.hlsl src/title_va_lookup.hlsli
+    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomics.cso" VERBATIM)
+target_sources(offscreen_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomics.h")
+target_include_directories(offscreen_check PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/AliasTransform.h" COMMAND "${DXC_EXECUTABLE}" -T cs_6_0
+    -E AliasTransform -Vn AliasTransform -Fh "${CMAKE_CURRENT_BINARY_DIR}/AliasTransform.h"
+    -Fo "${CMAKE_CURRENT_BINARY_DIR}/AliasTransform.cso" "${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_alias.hlsl"
+    DEPENDS tests/gpu_alias.hlsl BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/AliasTransform.cso" VERBATIM)
+target_sources(offscreen_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/AliasTransform.h")
 foreach(entry IN ITEMS InitBounds AtomicBounds QueryBounds NumericBounds)
     set(bounds_source tests/bvh_atomics.hlsl)
     if(entry STREQUAL "NumericBounds")
@@ -189,6 +225,29 @@ foreach(layout IN ITEMS root tables)
     endforeach()
     set_tests_properties(compute_${layout}_hardware PROPERTIES SKIP_RETURN_CODE 77)
 endforeach()
+# XBOX2WINDOWS_ADAPTER selects a hardware adapter by part of its name. A name no adapter has must fail.
+add_test(NAME adapter_selection_unmatched COMMAND offscreen_check hardware --dual-uav)
+set_tests_properties(adapter_selection_unmatched PROPERTIES TIMEOUT 45
+    ENVIRONMENT "XBOX2WINDOWS_ADAPTER=no adapter has this name"
+    PASS_REGULAR_EXPRESSION "No D3D12 hardware adapter matches XBOX2WINDOWS_ADAPTER=no adapter has this name")
+add_executable(pso_root_check tests/pso_root_check.cpp)
+target_compile_features(pso_root_check PRIVATE cxx_std_17)
+target_include_directories(pso_root_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_link_libraries(pso_root_check PRIVATE d3d12 dxgi)
+foreach(mode IN ITEMS embedded stripped)
+    set(symbol pso_compute_${mode})
+    set(header "${CMAKE_CURRENT_BINARY_DIR}/${symbol}.h")
+    set(strip_root)
+    if(mode STREQUAL "stripped")
+        set(strip_root -Qstrip_rootsignature)
+    endif()
+    add_custom_command(OUTPUT "${header}"
+        COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E CSMain ${strip_root} -Vn ${symbol}
+                -Fh "${header}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/compute.hlsl"
+        DEPENDS tests/compute.hlsl VERBATIM)
+    target_sources(pso_root_check PRIVATE "${header}")
+endforeach()
+add_test(NAME pso_root_signature_warp COMMAND pso_root_check)
 foreach(adapter IN ITEMS hardware warp)
     add_test(NAME offscreen_${adapter} COMMAND offscreen_check ${adapter} triangle_${adapter}.bmp)
     add_test(NAME ffx_provider_loop_${adapter} COMMAND offscreen_check ${adapter} --ffx-provider-loop)
@@ -203,6 +262,11 @@ foreach(adapter IN ITEMS hardware warp)
     add_test(NAME dxr_facing_${adapter} COMMAND offscreen_check ${adapter} --dxr-facing)
     set_tests_properties(dxr_facing_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     add_test(NAME bvh_buffer_ops_${adapter} COMMAND offscreen_check ${adapter} --buffer-ops)
+    add_test(NAME gpu_alias_${adapter} COMMAND offscreen_check ${adapter} --gpu-alias)
+    add_test(NAME gpu_alias_lookup_${adapter} COMMAND offscreen_check ${adapter} --gpu-alias-lookup)
+    add_test(NAME gpu_alias_lookup_writes_${adapter} COMMAND offscreen_check ${adapter} --gpu-alias-lookup-writes)
+    set_tests_properties(gpu_alias_${adapter} gpu_alias_lookup_${adapter} gpu_alias_lookup_writes_${adapter}
+        PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     add_test(NAME bvh_root_roundtrip_${adapter} COMMAND offscreen_check ${adapter} --bvh-root-roundtrip)
     set_tests_properties(bvh_root_roundtrip_${adapter} PROPERTIES TIMEOUT 45)
     foreach(work IN ITEMS reads waves wave64 hits differential atomics numeric packed)
@@ -322,10 +386,13 @@ if(EXISTS "${INTAKE_PYTHON}")
         target_link_options(${image} PRIVATE /NOENTRY /NODEFAULTLIB /INCREMENTAL:NO)
     endfunction()
     function(cpu_translation image translator entry)
-        cmake_parse_arguments(BIND "FFX_DESTROY" "PROVIDER;SYMBOL;LINK_NAME;CALLBACK_OFFSET" "" ${ARGN})
+        cmake_parse_arguments(BIND "FFX_DESTROY" "PROVIDER;SYMBOL;LINK_NAME;CALLBACK_OFFSET;RANGES" "" ${ARGN})
         set(binding)
         if(BIND_FFX_DESTROY)
             list(APPEND binding --ffx-destroy)
+        endif()
+        if(BIND_RANGES)
+            list(APPEND binding --bind-ranges "${BIND_RANGES}")
         endif()
         if(DEFINED BIND_CALLBACK_OFFSET)
             list(APPEND binding --callback-offset "${BIND_CALLBACK_OFFSET}")
@@ -340,7 +407,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_custom_command(OUTPUT "${lifted}"
             COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/${translator}.py"
                 "$<TARGET_FILE:${image}>" ${entry} "${lifted}" ${binding}
-            DEPENDS ${image} ${BIND_PROVIDER} tools/${translator}.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+            DEPENDS ${image} ${BIND_PROVIDER} ${BIND_RANGES} tools/${translator}.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
         add_library(${image}_lifted SHARED "${lifted}")
         if(BIND_PROVIDER)
             target_link_libraries(${image}_lifted PRIVATE ${BIND_PROVIDER})
@@ -381,13 +448,81 @@ if(EXISTS "${INTAKE_PYTHON}")
     cpu_asm_fixture(cpu_register_probe register_probe)
     foreach(variant IN ITEMS original swapped)
         cpu_asm_fixture(cpu_switch_${variant} switch)
-        cpu_translation(cpu_switch_${variant} cpu_switch_aot select_rva,select_rel,run_ops,shift_narrow)
+        cpu_translation(cpu_switch_${variant} cpu_switch_aot select_rva,select_rel,run_ops,shift_narrow,flag_select,cmov_read)
     endforeach()
     target_compile_definitions(cpu_switch_swapped PRIVATE SWAP_TABLE)
     add_test(NAME cpu_aot_jump_tables COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/switch_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_switch_original>" "$<TARGET_FILE:cpu_switch_original_lifted>"
         "$<TARGET_FILE:cpu_switch_swapped_lifted>")
+    cpu_asm_fixture(cpu_flag_conditions flag_conditions)
+    set(flag_conditions_lifted "${CMAKE_CURRENT_BINARY_DIR}/cpu_flag_conditions_lifted.cpp")
+    add_custom_command(OUTPUT "${flag_conditions_lifted}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/flag_conditions_check.py"
+            emit "$<TARGET_FILE:cpu_flag_conditions>" "${flag_conditions_lifted}"
+        DEPENDS cpu_flag_conditions tests/cpu/flag_conditions_check.py tools/cpu_switch_aot.py
+            tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+    add_library(cpu_flag_conditions_lifted SHARED "${flag_conditions_lifted}")
+    add_test(NAME cpu_aot_flag_conditions COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/flag_conditions_check.py" check
+        "$<TARGET_FILE:cpu_flag_conditions>" "$<TARGET_FILE:cpu_flag_conditions_lifted>")
+    set_tests_properties(cpu_aot_flag_conditions PROPERTIES
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_flag_conditions.txt")
+    cpu_asm_fixture(cpu_switch_addr32 switch_addr32)
+    cpu_translation(cpu_switch_addr32 cpu_switch_aot lea_wrap,lea_back,load_back,store_ahead)
+    add_test(NAME cpu_aot_switch_addr32 COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/switch_addr32_check.py" "$<TARGET_FILE:cpu_switch_addr32>"
+        "$<TARGET_FILE:cpu_switch_addr32_lifted>")
+    cpu_asm_fixture(cpu_entry_order entry_order)
+    cpu_translation(cpu_entry_order cpu_switch_aot square_tail,inc_square,pick_tail,branch_next)
+    add_test(NAME cpu_aot_entry_order COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/entry_order_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_entry_order>" "$<TARGET_FILE:cpu_entry_order_lifted>")
+    cpu_asm_fixture(cpu_narrow narrow)
+    cpu_translation(cpu_narrow cpu_switch_aot
+        byte_merge,word_ops,byte_shift,byte_unary,al_less,mixed_width,ax_copy,zx_byte,set_less,set_zx,store_only,store_ret0,self_loop,qword_ops,flag_results,imul3_fresh)
+    add_test(NAME cpu_aot_narrow_returns COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/narrow_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_narrow>" "$<TARGET_FILE:cpu_narrow_lifted>")
+    cpu_asm_fixture(cpu_fourth_arg fourth_arg)
+    # ":4" gives an entry a fourth integer argument in R9; r9_scratch keeps the three-argument default.
+    cpu_translation(cpu_fourth_arg cpu_switch_aot r9_mix:4,r9_loop:4,no_r9:4,r9_scratch)
+    add_test(NAME cpu_aot_fourth_argument COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/fourth_arg_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_fourth_arg>" "$<TARGET_FILE:cpu_fourth_arg_lifted>"
+        "${CMAKE_CURRENT_BINARY_DIR}/cpu_fourth_arg_lifted.cpp"
+        "$<TARGET_FILE:cpu_narrow>" "$<TARGET_FILE:cpu_narrow_lifted>")
+    cpu_asm_fixture(cpu_frame frame)
+    # frame_bound is translated and compiled but never called.
+    cpu_translation(cpu_frame cpu_switch_aot
+        push_loop,spill_widths,home_save,home_args,two_paths,home_spill,loop_counter,realloc_slot,frame_bound)
+    add_test(NAME cpu_aot_stack_frames COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/frame_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_frame>" "$<TARGET_FILE:cpu_frame_lifted>"
+        "${CMAKE_CURRENT_BINARY_DIR}/cpu_frame_lifted.cpp")
+    cpu_asm_fixture(cpu_calls calls)
+    cpu_translation(cpu_calls cpu_switch_aot call_leaf,chain3,narrow_call,narrow_tail,tail_call,tail_after_frame,home_save_call)
+    add_test(NAME cpu_aot_direct_calls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/calls_check.py" check "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_calls>" "$<TARGET_FILE:cpu_calls_lifted>")
+    cpu_asm_fixture(cpu_call_entries call_entries)
+    cpu_translation(cpu_call_entries cpu_switch_aot entry_caller,entry_tail)
+    add_test(NAME cpu_aot_call_entries COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/call_entries_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_call_entries>" "$<TARGET_FILE:cpu_call_entries_lifted>")
+    # Callees without unwind data, bound by a [start, end) manifest from the source labels in the linker map.
+    cpu_asm_fixture(cpu_bare_calls bare_calls)
+    target_link_options(cpu_bare_calls PRIVATE "/MAP:${CMAKE_CURRENT_BINARY_DIR}/cpu_bare_calls.map")
+    set(bare_ranges "${CMAKE_CURRENT_BINARY_DIR}/cpu_bare_calls_ranges.json")
+    add_custom_command(OUTPUT "${bare_ranges}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/range_manifest.py" "$<TARGET_FILE:cpu_bare_calls>"
+            "${CMAKE_CURRENT_BINARY_DIR}/cpu_bare_calls.map" "${bare_ranges}" bare_mix bare_low
+        DEPENDS cpu_bare_calls tools/range_manifest.py VERBATIM)
+    cpu_translation(cpu_bare_calls cpu_switch_aot call_bare,twice_bare,tail_bare RANGES "${bare_ranges}")
+    add_test(NAME cpu_aot_bound_callees COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/bare_calls_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_bare_calls>" "$<TARGET_FILE:cpu_bare_calls_lifted>" "${bare_ranges}"
+        "${CMAKE_CURRENT_BINARY_DIR}/cpu_bare_calls.map")
     cpu_asm_fixture(cpu_chained chained)
     cpu_translation(cpu_chained cpu_chained_aot choose_value)
     cpu_asm_fixture(cpu_chained_jne chained)
@@ -399,9 +534,21 @@ if(EXISTS "${INTAKE_PYTHON}")
     cpu_asm_fixture(cpu_chained_imm chained)
     target_compile_definitions(cpu_chained_imm PRIVATE USE_IMM_REG)
     cpu_translation(cpu_chained_imm cpu_chained_aot choose_value)
+    cpu_asm_fixture(cpu_chained_frame chained)
+    target_compile_definitions(cpu_chained_frame PRIVATE USE_LARGE_FRAME)
+    cpu_translation(cpu_chained_frame cpu_chained_aot choose_value)
     cpu_asm_fixture(cpu_callback callback)
     cpu_asm_fixture(cpu_version_query version_query)
     cpu_asm_fixture(cpu_heap_layout heap_layout)
+    # Attribute words at xmem call sites, read from a source-built image (tools/xmem_attribute_scan.py).
+    cpu_asm_fixture(cpu_xmem_attributes xmem_attributes)
+    target_link_libraries(cpu_xmem_attributes PRIVATE xmem_shim)
+    cpu_asm_fixture(cpu_xmem_delay xmem_delay)
+    target_link_libraries(cpu_xmem_delay PRIVATE xmem_shim)
+    target_link_options(cpu_xmem_delay PRIVATE /DELAYLOAD:xmem.dll)
+    add_test(NAME xmem_attribute_scan COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/xmem_attribute_scan_check.py" "$<TARGET_FILE:cpu_xmem_attributes>"
+        "$<TARGET_FILE:cpu_xmem_delay>")
     cpu_asm_fixture(cpu_bink_heap bink_heap)
     add_library(cpu_bink_heap_provider SHARED tests/cpu/bink_heap_provider.cpp src/era_heap.cpp)
     target_include_directories(cpu_bink_heap_provider PRIVATE src)
@@ -522,6 +669,46 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_library(cpu_heap_layout_lifted SHARED "${heap_fixture}")
     add_test(NAME cpu_aot_heap_layout COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/heap_layout.py"
         check "$<TARGET_FILE:cpu_heap_layout>" "$<TARGET_FILE:cpu_heap_layout_lifted>")
+    cpu_asm_fixture(cpu_rcx_branches rcx_branches)
+    # The lifted DLL and three mutated controls that the check requires to mismatch.
+    foreach(variant IN ITEMS lifted noecx nozf jrcxz)
+        set(rcx_branches_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_rcx_branches_${variant}.cpp")
+        add_custom_command(OUTPUT "${rcx_branches_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/rcx_branches.py"
+                emit "$<TARGET_FILE:cpu_rcx_branches>" "${rcx_branches_fixture}" ${variant}
+            DEPENDS cpu_rcx_branches tests/cpu/rcx_branches.py tools/ffx_version_query.py
+                tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_rcx_branches_${variant} SHARED "${rcx_branches_fixture}")
+    endforeach()
+    add_test(NAME cpu_aot_rcx_branches COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/rcx_branches.py"
+        check "$<TARGET_FILE:cpu_rcx_branches>" "$<TARGET_FILE:cpu_rcx_branches_lifted>"
+        "$<TARGET_FILE:cpu_rcx_branches_noecx>" "$<TARGET_FILE:cpu_rcx_branches_nozf>"
+        "$<TARGET_FILE:cpu_rcx_branches_jrcxz>")
+    cpu_asm_fixture(cpu_shift_count shift_count)
+    set(shift_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_shift_count_lifted.cpp")
+    add_custom_command(OUTPUT "${shift_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/shift_count.py"
+            emit "$<TARGET_FILE:cpu_shift_count>" "${shift_fixture}"
+        DEPENDS cpu_shift_count tests/cpu/shift_count.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_shift_count_lifted SHARED "${shift_fixture}")
+    add_test(NAME cpu_aot_shift_count COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/shift_count.py"
+        check "$<TARGET_FILE:cpu_shift_count>" "$<TARGET_FILE:cpu_shift_count_lifted>")
+    cpu_asm_fixture(cpu_carry_rotates carry_rotates)
+    # The lifted DLL and three mutated controls that the check requires to mismatch.
+    foreach(variant IN ITEMS lifted nomask nocarry stc)
+        set(carry_rotates_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_carry_rotates_${variant}.cpp")
+        add_custom_command(OUTPUT "${carry_rotates_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/carry_rotates.py"
+                emit "$<TARGET_FILE:cpu_carry_rotates>" "${carry_rotates_fixture}" ${variant}
+            DEPENDS cpu_carry_rotates tests/cpu/carry_rotates.py tools/ffx_version_query.py
+                tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_carry_rotates_${variant} SHARED "${carry_rotates_fixture}")
+    endforeach()
+    add_test(NAME cpu_aot_carry_rotates COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/carry_rotates.py"
+        check "$<TARGET_FILE:cpu_carry_rotates>" "$<TARGET_FILE:cpu_carry_rotates_lifted>"
+        "$<TARGET_FILE:cpu_carry_rotates_nomask>" "$<TARGET_FILE:cpu_carry_rotates_nocarry>"
+        "$<TARGET_FILE:cpu_carry_rotates_stc>")
     set(query_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_version_query_lifted.cpp")
     add_custom_command(OUTPUT "${query_fixture}"
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/version_query_fixture.py"
@@ -534,6 +721,20 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_version_query_lifted>")
     add_test(NAME cpu_lower_prefixes COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/lower_prefixes_check.py")
+    cpu_asm_fixture(cpu_xchg xchg)
+    # The lifted DLL and two mutated controls that the check requires to mismatch.
+    foreach(variant IN ITEMS lifted plain oneway)
+        set(xchg_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_xchg_${variant}.cpp")
+        add_custom_command(OUTPUT "${xchg_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/xchg.py"
+                emit "$<TARGET_FILE:cpu_xchg>" "${xchg_fixture}" ${variant}
+            DEPENDS cpu_xchg tests/cpu/xchg.py tools/ffx_version_query.py
+                tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_xchg_${variant} SHARED "${xchg_fixture}")
+    endforeach()
+    add_test(NAME cpu_aot_xchg COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/xchg.py"
+        check "$<TARGET_FILE:cpu_xchg>" "$<TARGET_FILE:cpu_xchg_lifted>"
+        "$<TARGET_FILE:cpu_xchg_plain>" "$<TARGET_FILE:cpu_xchg_oneway>")
     cpu_asm_fixture(cpu_address_size address_size)
     set(address_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_address_size_lifted.cpp")
     add_custom_command(OUTPUT "${address_fixture}"
@@ -544,11 +745,152 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_library(cpu_address_size_lifted SHARED "${address_fixture}")
     add_test(NAME cpu_aot_address_size COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/address_size.py"
         check "$<TARGET_FILE:cpu_address_size>" "$<TARGET_FILE:cpu_address_size_lifted>")
+    cpu_asm_fixture(cpu_movbe movbe)
+    # The lifted DLL and three mutated controls that the check requires to mismatch.
+    foreach(variant IN ITEMS lifted noswap clear16 flags)
+        set(movbe_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_movbe_${variant}.cpp")
+        add_custom_command(OUTPUT "${movbe_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/movbe.py"
+                emit "$<TARGET_FILE:cpu_movbe>" "${movbe_fixture}" ${variant}
+            DEPENDS cpu_movbe tests/cpu/movbe.py tools/ffx_version_query.py
+                tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_movbe_${variant} SHARED "${movbe_fixture}")
+    endforeach()
+    add_test(NAME cpu_aot_movbe COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/movbe.py"
+        check "$<TARGET_FILE:cpu_movbe>" "$<TARGET_FILE:cpu_movbe_lifted>"
+        "$<TARGET_FILE:cpu_movbe_noswap>" "$<TARGET_FILE:cpu_movbe_clear16>" "$<TARGET_FILE:cpu_movbe_flags>")
+    set_tests_properties(cpu_aot_movbe PROPERTIES SKIP_RETURN_CODE 77)
+    cpu_asm_fixture(cpu_bmi1 bmi1)
+    set(bmi1_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_bmi1_lifted.cpp")
+    add_custom_command(OUTPUT "${bmi1_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/bmi1.py"
+            emit "$<TARGET_FILE:cpu_bmi1>" "${bmi1_fixture}"
+        DEPENDS cpu_bmi1 tests/cpu/bmi1.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_bmi1_lifted SHARED "${bmi1_fixture}")
+    add_test(NAME cpu_aot_bmi1 COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/bmi1.py"
+        check "$<TARGET_FILE:cpu_bmi1>" "$<TARGET_FILE:cpu_bmi1_lifted>")
+    set_tests_properties(cpu_aot_bmi1 PROPERTIES SKIP_RETURN_CODE 77)
+    cpu_asm_fixture(cpu_rotates_shifts rotates_shifts)
+    set(rotates_shifts_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_rotates_shifts_lifted.cpp")
+    add_custom_command(OUTPUT "${rotates_shifts_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/rotates_shifts.py"
+            emit "$<TARGET_FILE:cpu_rotates_shifts>" "${rotates_shifts_fixture}"
+        DEPENDS cpu_rotates_shifts tests/cpu/rotates_shifts.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_rotates_shifts_lifted SHARED "${rotates_shifts_fixture}")
+    add_test(NAME cpu_aot_rotates_shifts COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/rotates_shifts.py"
+        check "$<TARGET_FILE:cpu_rotates_shifts>" "$<TARGET_FILE:cpu_rotates_shifts_lifted>")
+    cpu_asm_fixture(cpu_string_ops string_ops)
+    # The lifted DLL and three mutated controls that the check requires to mismatch.
+    foreach(variant IN ITEMS lifted memmove swapped forward)
+        set(string_ops_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_string_ops_${variant}.cpp")
+        add_custom_command(OUTPUT "${string_ops_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/string_ops.py"
+                emit "$<TARGET_FILE:cpu_string_ops>" "${string_ops_fixture}" ${variant}
+            DEPENDS cpu_string_ops tests/cpu/string_ops.py tools/ffx_version_query.py
+                tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_string_ops_${variant} SHARED "${string_ops_fixture}")
+    endforeach()
+    add_test(NAME cpu_aot_string_ops COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/string_ops.py"
+        check "$<TARGET_FILE:cpu_string_ops>" "$<TARGET_FILE:cpu_string_ops_lifted>"
+        "$<TARGET_FILE:cpu_string_ops_memmove>" "$<TARGET_FILE:cpu_string_ops_swapped>"
+        "$<TARGET_FILE:cpu_string_ops_forward>")
     cpu_translation(cpu_callback cpu_chained_aot call_context CALLBACK_OFFSET 8)
+    cpu_asm_fixture(cpu_xlatb xlatb)
+    # The lifted DLL and three mutated controls that the check requires to mismatch.
+    foreach(variant IN ITEMS lifted signed noaddr32 clear)
+        set(xlatb_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_xlatb_${variant}.cpp")
+        add_custom_command(OUTPUT "${xlatb_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/xlatb.py"
+                emit "$<TARGET_FILE:cpu_xlatb>" "${xlatb_fixture}" ${variant}
+            DEPENDS cpu_xlatb tests/cpu/xlatb.py tools/ffx_version_query.py
+                tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_xlatb_${variant} SHARED "${xlatb_fixture}")
+    endforeach()
+    add_test(NAME cpu_aot_xlatb COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/xlatb.py"
+        check "$<TARGET_FILE:cpu_xlatb>" "$<TARGET_FILE:cpu_xlatb_lifted>"
+        "$<TARGET_FILE:cpu_xlatb_signed>" "$<TARGET_FILE:cpu_xlatb_noaddr32>" "$<TARGET_FILE:cpu_xlatb_clear>")
     cpu_asm_fixture(cpu_destroy destroy)
     target_link_libraries(cpu_destroy PRIVATE ucrt.lib)
     cpu_translation(cpu_destroy cpu_chained_aot release_context FFX_DESTROY)
     add_library(cpu_destroy_provider SHARED tests/cpu/destroy_provider.cpp)
+    cpu_asm_fixture(cpu_x87_harness x87_harness)
+    cpu_asm_fixture(cpu_x87_add x87_add)
+    # The lifted DLL and six mutated controls that the check requires to mismatch.
+    set(x87_add_controls pc64 double m80double nosticky nanorder signedzero)
+    set(x87_add_control_files "")
+    foreach(variant IN ITEMS lifted ${x87_add_controls})
+        set(x87_add_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_x87_add_${variant}.cpp")
+        add_custom_command(OUTPUT "${x87_add_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_add.py"
+                emit "$<TARGET_FILE:cpu_x87_add>" "${x87_add_fixture}" ${variant}
+            DEPENDS cpu_x87_add tests/cpu/x87_add.py tools/ffx_version_query.py tools/x87_lower.py
+                tools/x87_soft.h tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_x87_add_${variant} SHARED "${x87_add_fixture}")
+        if(NOT variant STREQUAL "lifted")
+            list(APPEND x87_add_control_files "$<TARGET_FILE:cpu_x87_add_${variant}>")
+        endif()
+    endforeach()
+    add_test(NAME cpu_aot_x87_add COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_add.py"
+        check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_add>"
+        "$<TARGET_FILE:cpu_x87_add_lifted>" ${x87_add_control_files})
+    cpu_asm_fixture(cpu_x87_mul x87_mul)
+    # The lifted DLL and six mutated controls that the check requires to mismatch.
+    set(x87_mul_control_files "")
+    foreach(variant IN ITEMS lifted pc64 double nolow sign infzero memquiet)
+        set(x87_mul_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_x87_mul_${variant}.cpp")
+        add_custom_command(OUTPUT "${x87_mul_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_mul.py"
+                emit "$<TARGET_FILE:cpu_x87_mul>" "${x87_mul_fixture}" ${variant}
+            DEPENDS cpu_x87_mul tests/cpu/x87_mul.py tests/cpu/x87_add.py tools/ffx_version_query.py
+                tools/x87_lower.py tools/x87_soft.h tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_x87_mul_${variant} SHARED "${x87_mul_fixture}")
+        if(NOT variant STREQUAL "lifted")
+            list(APPEND x87_mul_control_files "$<TARGET_FILE:cpu_x87_mul_${variant}>")
+        endif()
+    endforeach()
+    add_test(NAME cpu_aot_x87_mul COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_mul.py"
+        check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_mul>"
+        "$<TARGET_FILE:cpu_x87_mul_lifted>" ${x87_mul_control_files})
+    cpu_asm_fixture(cpu_x87_div x87_div)
+    # The lifted DLL and seven mutated controls that the check requires to mismatch.
+    set(x87_div_control_files "")
+    foreach(variant IN ITEMS lifted pc64 double nosticky divzero reverse zerosign memquiet)
+        set(x87_div_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_x87_div_${variant}.cpp")
+        add_custom_command(OUTPUT "${x87_div_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_div.py"
+                emit "$<TARGET_FILE:cpu_x87_div>" "${x87_div_fixture}" ${variant}
+            DEPENDS cpu_x87_div tests/cpu/x87_div.py tests/cpu/x87_mul.py tests/cpu/x87_add.py
+                tools/ffx_version_query.py tools/x87_lower.py tools/x87_soft.h tools/cpu_ranges.py
+                tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_x87_div_${variant} SHARED "${x87_div_fixture}")
+        if(NOT variant STREQUAL "lifted")
+            list(APPEND x87_div_control_files "$<TARGET_FILE:cpu_x87_div_${variant}>")
+        endif()
+    endforeach()
+    add_test(NAME cpu_aot_x87_div COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_div.py"
+        check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_div>"
+        "$<TARGET_FILE:cpu_x87_div_lifted>" ${x87_div_control_files})
+    cpu_asm_fixture(cpu_x87_sub x87_sub)
+    # The lifted DLL and seven mutated controls that the check requires to mismatch.
+    set(x87_sub_control_files "")
+    foreach(variant IN ITEMS lifted pc64 double nansign reverse cancel nosticky memquiet)
+        set(x87_sub_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_x87_sub_${variant}.cpp")
+        add_custom_command(OUTPUT "${x87_sub_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_sub.py"
+                emit "$<TARGET_FILE:cpu_x87_sub>" "${x87_sub_fixture}" ${variant}
+            DEPENDS cpu_x87_sub tests/cpu/x87_sub.py tests/cpu/x87_div.py tests/cpu/x87_mul.py
+                tests/cpu/x87_add.py tools/ffx_version_query.py tools/x87_lower.py tools/x87_soft.h
+                tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_x87_sub_${variant} SHARED "${x87_sub_fixture}")
+        if(NOT variant STREQUAL "lifted")
+            list(APPEND x87_sub_control_files "$<TARGET_FILE:cpu_x87_sub_${variant}>")
+        endif()
+    endforeach()
+    add_test(NAME cpu_aot_x87_sub COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_sub.py"
+        check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_sub>"
+        "$<TARGET_FILE:cpu_x87_sub_lifted>" ${x87_sub_control_files})
     cpu_asm_fixture(cpu_create create_context)
     set(create_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_create_lifted.cpp")
     add_custom_command(OUTPUT "${create_fixture}"
@@ -571,7 +913,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_chained_lifted>" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_chained_jne>" "$<TARGET_FILE:cpu_chained_jne_lifted>"
         "$<TARGET_FILE:cpu_chained_zero>" "$<TARGET_FILE:cpu_chained_zero_lifted>"
-        "$<TARGET_FILE:cpu_chained_imm>" "$<TARGET_FILE:cpu_chained_imm_lifted>")
+        "$<TARGET_FILE:cpu_chained_imm>" "$<TARGET_FILE:cpu_chained_imm_lifted>"
+        "$<TARGET_FILE:cpu_chained_frame>" "$<TARGET_FILE:cpu_chained_frame_lifted>")
     add_test(NAME cpu_aot_direct_call COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/direct_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_call_original>" "$<TARGET_FILE:cpu_call_original_lifted>"
@@ -614,25 +957,52 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_import_original_lifted>" "$<TARGET_FILE:cpu_import_provider>"
         "$<TARGET_FILE:cpu_import_altered>" "$<TARGET_FILE:cpu_register_probe>")
     add_library(cpu_exe_io SHARED tests/cpu/exe_io.cpp)
-    foreach(variant IN ITEMS original inverted)
+    foreach(variant IN ITEMS original inverted pair swapped framed)
         set(native cpu_exe_${variant})
         set(lifted ${native}_lifted)
         add_executable(${native} tests/cpu/exe_entry.asm tests/cpu/direct.asm)
+        set(entry_options)
+        if(variant STREQUAL "framed")
+            target_sources(${native} PRIVATE tests/cpu/bare_calls.asm)
+            target_compile_definitions(${native} PRIVATE FRAME_SELECTOR)
+            target_link_options(${native} PRIVATE /EXPORT:call_bare "/MAP:${CMAKE_CURRENT_BINARY_DIR}/${native}.map")
+            list(APPEND entry_options --frame-selector)
+        endif()
+        if(variant STREQUAL "pair" OR variant STREQUAL "swapped")
+            target_sources(${native} PRIVATE tests/cpu/alt.asm)
+            target_compile_definitions(${native} PRIVATE TWO_TARGETS)
+        endif()
+        if(variant STREQUAL "swapped")
+            target_compile_definitions(${native} PRIVATE SWAP_TARGETS)
+        endif()
         set_target_properties(${native} PROPERTIES LINKER_LANGUAGE CXX)
         target_compile_definitions(${native} PRIVATE IMPORT_MIX)
         if(variant STREQUAL "inverted")
             target_compile_definitions(${native} PRIVATE FLIP_SELECTOR)
         endif()
-        target_link_options(${native} PRIVATE /ENTRY:native_entry /NODEFAULTLIB /INCREMENTAL:NO)
+        target_sources(${native} PRIVATE tests/cpu/exe_startup.asm)
+        target_link_options(${native} PRIVATE /ENTRY:native_startup /EXPORT:native_entry /NODEFAULTLIB /INCREMENTAL:NO)
         set(source "${CMAKE_CURRENT_BINARY_DIR}/${lifted}.cpp")
         add_custom_command(OUTPUT "${source}"
             COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_exe_aot.py"
                 "$<TARGET_FILE:${native}>" "$<TARGET_FILE:cpu_exe_io>"
-                "$<TARGET_FILE:cpu_import_provider>" "${source}"
+                "$<TARGET_FILE:cpu_import_provider>" "${source}" --entry-export native_entry ${entry_options}
             DEPENDS ${native} cpu_exe_io cpu_import_provider tools/cpu_exe_aot.py
                 tools/cpu_call_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py tools/ffx_version_query.py
             VERBATIM)
         add_executable(${lifted} "${source}")
+        if(variant STREQUAL "framed")
+            set(ranges "${CMAKE_CURRENT_BINARY_DIR}/${native}_ranges.json")
+            set(selector "${CMAKE_CURRENT_BINARY_DIR}/${native}_selector.cpp")
+            add_custom_command(OUTPUT "${selector}" BYPRODUCTS "${ranges}"
+                COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/range_manifest.py"
+                    "$<TARGET_FILE:${native}>" "${CMAKE_CURRENT_BINARY_DIR}/${native}.map" "${ranges}" bare_mix
+                COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_switch_aot.py"
+                    "$<TARGET_FILE:${native}>" call_bare "${selector}" --bind-ranges "${ranges}"
+                DEPENDS ${native} tools/range_manifest.py tools/cpu_switch_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py
+                VERBATIM)
+            target_sources(${lifted} PRIVATE "${selector}")
+        endif()
         target_link_options(${lifted} PRIVATE /INCREMENTAL:NO)
         foreach(program IN ITEMS ${native} ${lifted})
             target_link_libraries(${program} PRIVATE cpu_exe_io cpu_import_provider)
@@ -643,6 +1013,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_exe_original>" "$<TARGET_FILE:cpu_exe_original_lifted>"
         "$<TARGET_FILE:cpu_exe_inverted>" "$<TARGET_FILE:cpu_exe_inverted_lifted>"
         "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:cpu_import_provider>")
+    add_test(NAME cpu_aot_exe_call_targets COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/exe_entry_check.py" --targets
+        "$<TARGET_FILE:cpu_exe_pair>" "$<TARGET_FILE:cpu_exe_pair_lifted>"
+        "$<TARGET_FILE:cpu_exe_swapped>" "$<TARGET_FILE:cpu_exe_swapped_lifted>")
     add_test(NAME cpu_aot_ordinal_import COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/import_check.py" "$<TARGET_FILE:cpu_ordinal_original>"
         "$<TARGET_FILE:cpu_ordinal_original_lifted>" "$<TARGET_FILE:cpu_ordinal_provider>"
@@ -657,7 +1031,15 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/mapped_exe_chain_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_exe_original>" "$<TARGET_FILE:cpu_exe_original_lifted>"
         "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:cpu_import_provider>")
+    add_test(NAME cpu_native_exe_frame_chain COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/mapped_exe_chain_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_exe_framed>" "$<TARGET_FILE:cpu_exe_framed_lifted>"
+        "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:cpu_import_provider>" "$<TARGET_FILE:cpu_exe_original>")
     target_compile_features(pe_map PRIVATE cxx_std_17)
+    add_test(NAME cpu_native_exe_termination COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/exe_termination_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_exe_original>" "$<TARGET_FILE:cpu_exe_original_lifted>"
+        "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:cpu_import_provider>")
     add_test(NAME cpu_native_map COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_map_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_register_probe>"
@@ -707,6 +1089,57 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_exe_start_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_exe_start_original>" "$<TARGET_FILE:cpu_exe_start_no_tls>"
         "$<TARGET_FILE:cpu_import_provider>" "$<TARGET_FILE:cpu_import_altered>")
+    # Two CRT-free DLLs and an EXE: A has no imports, B imports A, the EXE imports both.
+    foreach(dll IN ITEMS a a_alt b b_noinit)
+        string(REGEX REPLACE "_(noinit|alt)$" "" source "${dll}")
+        add_library(cpu_startup_${dll} SHARED tests/cpu/startup_${source}.cpp)
+        target_compile_options(cpu_startup_${dll} PRIVATE /GS- /Zl)
+        target_link_options(cpu_startup_${dll} PRIVATE /ENTRY:${source}_main /NODEFAULTLIB /INCREMENTAL:NO)
+        target_link_libraries(cpu_startup_${dll} PRIVATE kernel32)
+    endforeach()
+    target_compile_definitions(cpu_startup_b_noinit PRIVATE NO_INIT)
+    target_compile_definitions(cpu_startup_a_alt PRIVATE ALTER)
+    target_link_libraries(cpu_startup_b PRIVATE cpu_startup_a)
+    target_link_libraries(cpu_startup_b_noinit PRIVATE cpu_startup_a)
+    add_executable(cpu_startup_exe tests/cpu/startup_exe.cpp)
+    target_compile_options(cpu_startup_exe PRIVATE /GS- /Zl)
+    target_link_options(cpu_startup_exe PRIVATE /ENTRY:exe_entry /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE
+        /INCREMENTAL:NO)
+    target_link_libraries(cpu_startup_exe PRIVATE kernel32 cpu_startup_a cpu_startup_b)
+    foreach(control IN ITEMS timeout create)  # controls: a worker that outlives the wait, and one that cannot start
+        add_executable(cpu_startup_exe_${control} tests/cpu/startup_exe.cpp)
+        string(TOUPPER "${control}" definition)
+        target_compile_definitions(cpu_startup_exe_${control} PRIVATE ${definition}_CONTROL)
+        target_compile_options(cpu_startup_exe_${control} PRIVATE /GS- /Zl)
+        target_link_options(cpu_startup_exe_${control} PRIVATE /ENTRY:exe_entry /NODEFAULTLIB /SUBSYSTEM:CONSOLE
+            /DYNAMICBASE /INCREMENTAL:NO)
+        target_link_libraries(cpu_startup_exe_${control} PRIVATE kernel32 cpu_startup_a cpu_startup_b)
+    endforeach()
+    add_test(NAME cpu_native_startup COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/native_startup_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_startup_exe>" "$<TARGET_FILE:cpu_startup_a>" "$<TARGET_FILE:cpu_startup_b>"
+        "$<TARGET_FILE:cpu_startup_b_noinit>" "$<TARGET_FILE:cpu_startup_a_alt>"
+        "$<TARGET_FILE:cpu_startup_exe_timeout>" "$<TARGET_FILE:cpu_startup_exe_create>")
+    # Lifecycle fixtures: two DLLs with the static MSVC runtime (B imports A) and a CRT-free event sink.
+    add_library(cpu_life_sink SHARED tests/cpu/life_sink.cpp)
+    target_compile_options(cpu_life_sink PRIVATE /GS- /Zl)
+    target_link_options(cpu_life_sink PRIVATE /ENTRY:sink_main /NODEFAULTLIB /INCREMENTAL:NO)
+    target_link_libraries(cpu_life_sink PRIVATE kernel32)
+    foreach(dll IN ITEMS a a_noctor b b_nodtor)
+        string(REGEX REPLACE "_(noctor|nodtor)$" "" source "${dll}")
+        add_library(cpu_life_${dll} SHARED tests/cpu/life_${source}.cpp)
+        set_target_properties(cpu_life_${dll} PROPERTIES MSVC_RUNTIME_LIBRARY MultiThreaded)
+        target_link_options(cpu_life_${dll} PRIVATE /INCREMENTAL:NO)  # no incremental thunk in front of the entry point
+        target_link_libraries(cpu_life_${dll} PRIVATE cpu_life_sink)
+    endforeach()
+    target_compile_definitions(cpu_life_a_noctor PRIVATE NO_CTOR)
+    target_compile_definitions(cpu_life_b_nodtor PRIVATE NO_DTOR)
+    target_link_libraries(cpu_life_b PRIVATE cpu_life_a)
+    target_link_libraries(cpu_life_b_nodtor PRIVATE cpu_life_a)
+    add_test(NAME cpu_native_crt_lifecycle COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/native_crt_lifecycle_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_life_sink>" "$<TARGET_FILE:cpu_life_a>" "$<TARGET_FILE:cpu_life_b>"
+        "$<TARGET_FILE:cpu_life_a_noctor>" "$<TARGET_FILE:cpu_life_b_nodtor>")
     add_library(cpu_frame_host SHARED tests/cpu/frame_host.cpp)
     add_library(cpu_frame_guest SHARED tests/cpu/tls_route.asm tests/cpu/frame_route.def)
     set_target_properties(cpu_frame_guest PROPERTIES LINKER_LANGUAGE CXX)
@@ -725,6 +1158,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_delay_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_delay_route>" "$<TARGET_FILE:cpu_delay_provider>"
         "$<TARGET_FILE:cpu_delay_provider_altered>")
+    add_test(NAME cpu_native_lifetime COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/native_lifetime_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_tls_original>" "$<TARGET_FILE:cpu_tls_sink>")
     add_library(script_path_host SHARED tools/script_path_host.cpp)
     target_compile_features(script_path_host PRIVATE cxx_std_17)
     add_test(NAME script_path_links COMMAND "${INTAKE_PYTHON}" -B
@@ -737,6 +1173,8 @@ if(EXISTS "${INTAKE_PYTHON}")
 
     add_test(NAME script_state_literals COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/script_state_check.py")
+    add_test(NAME resource_relocated_root COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/resource_root_check.py")
     add_test(NAME script_dispatch_pairs COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/script_dispatch_check.py" "$<TARGET_FILE:script_path_host>")
     add_test(NAME bcpack_prefix_and_mip_tail COMMAND "${INTAKE_PYTHON}" -B
@@ -745,8 +1183,14 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/bc7_blocks_check.py")
     add_test(NAME resource_range_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/resource_ranges_check.py")
+    add_test(NAME audio_awc_metadata COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/awc_metadata_check.py")
+    add_test(NAME sgd5_effect_candidates COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/sgd5_effects_check.py")
     add_test(NAME rdna2_tools_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/rdna2_tools_check.py")
+    add_test(NAME pso_readiness_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/pso_readiness_check.py")
     add_test(NAME dxcontainer_part_offsets COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/dxcontainer_part_offsets_check.py")
     foreach(adapter IN ITEMS hardware warp)
@@ -781,6 +1225,12 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_BINARY_DIR}/triangle_vs.cso" "${DXC_BIN_DIR}/dxil.dll")
     set_tests_properties(shader_metadata_probe PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME shader_metadata_controls COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/shader_probe_check.py")
+    add_test(NAME dxil_retarget_probe COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/dxil_retarget_check.py" "$<TARGET_FILE:root_probe>"
+        "${CMAKE_CURRENT_BINARY_DIR}/compute_root.cso" "${CMAKE_CURRENT_BINARY_DIR}/CopyBlocks.cso"
+        "${DXC_BIN_DIR}/dxil.dll" "$<TARGET_FILE:root_device_probe>" "$<TARGET_FILE:offscreen_check>")
+    set_tests_properties(dxil_retarget_probe PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME dxil_retarget_controls COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/dxil_retarget_check.py")
     add_test(NAME conditional_import_paths COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/intake/paths_check.py")
     add_library(intake_provider SHARED tests/intake/provider.cpp tests/intake/provider.def)
     add_library(intake_delay SHARED tests/intake/provider.cpp tests/intake/delay.def)

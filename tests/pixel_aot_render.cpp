@@ -51,11 +51,19 @@ struct MipDraw {
     UINT sampledLevel;
     UINT scale;
     UINT requestedMip = 0;
-    bool reportMip = false;
+    bool isTailDraw = false;
+    bool partialQuad = false;
+};
+
+struct Extent {
+    UINT width, height;
+    Extent mip(UINT level) const {
+        return {std::max<UINT>(1, width >> level), std::max<UINT>(1, height >> level)};
+    }
 };
 
 void draw_verified(ID3D12Device* device, const char* path, const std::vector<PixelInput>& levels,
-                   UINT firstResident, const std::vector<MipDraw>& draws, const char* capture)
+                   Extent base, UINT firstResident, const std::vector<MipDraw>& draws, const char* capture)
 {
     const auto& input = levels.front();
     auto cb = upload(device, input.constants);
@@ -84,8 +92,7 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
     ComPtr<ID3D12PipelineState> pso;
     check(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso)), "Translated pixel pipeline");
 
-    auto srcDesc = texture_desc(input.width << firstResident, input.height << firstResident,
-                                input.format, D3D12_RESOURCE_FLAG_NONE);
+    auto srcDesc = texture_desc(base.width, base.height, input.format, D3D12_RESOURCE_FLAG_NONE);
     if (input.format == DXGI_FORMAT_BC7_UNORM && (srcDesc.Width % 4 || srcDesc.Height % 4))
         throw std::runtime_error("Expected block-aligned BC7 base dimensions");
     const UINT residentCount = static_cast<UINT>(levels.size());
@@ -140,10 +147,14 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
 
     bool textureUploaded = false;
     for (const auto& req : draws) {
-        if (req.reportMip)
+        if (req.isTailDraw)
             std::printf("requested_mip=%u sampled_mip=%u ", req.requestedMip, req.sampledLevel + firstResident);
         const auto& sampled = levels.at(req.sampledLevel);
-        const UINT width = sampled.width * req.scale, height = sampled.height * req.scale;
+        ComPtr<ID3D12Resource> partialTriangle;
+        if (req.partialQuad)
+            partialTriangle = upload(device, std::vector<Word>{3, 4, 5});
+        const auto [width, height] = req.isTailDraw ? base.mip(req.requestedMip)
+                                                   : Extent{sampled.width * req.scale, sampled.height * req.scale};
         auto dstDesc = texture_desc(width, height, desc.RTVFormats[0], D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
         auto target = resource(device, dstDesc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RENDER_TARGET, &clear);
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT resultLayout{};
@@ -178,12 +189,16 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
         list->SetGraphicsRootSignature(root.Get());
         list->SetGraphicsRootDescriptorTable(0, srvs->GetGPUDescriptorHandleForHeapStart());
         list->SetGraphicsRootConstantBufferView(1, cb->GetGPUVirtualAddress());
-        // Keep the implicit derivatives at the requested mip even when its
-        // logical dimensions round down. Center the fractional viewport so
-        // each visible pixel still point-samples its corresponding texel.
-        const float mipScale = std::ldexp(float(req.scale), -static_cast<int>(req.sampledLevel));
-        const float viewportWidth = (std::max)(float(width), input.width * mipScale);
-        const float viewportHeight = (std::max)(float(height), input.height * mipScale);
+        // WARP and hardware can use either the rounded SRV extent or the
+        // unrounded base extent for implicit LOD. Their geometric mean is
+        // within half a mip of both, since rounding discards less than one texel.
+        const auto viewportAxis = [&](UINT target, UINT resident, UINT baseAxis) {
+            const float unrounded = std::ldexp(float(baseAxis), -static_cast<int>(firstResident));
+            const float span = std::sqrt(resident * (std::max)(1.0f, unrounded));
+            return (std::max)(float(target), std::ldexp(span, -static_cast<int>(req.sampledLevel)));
+        };
+        const float viewportWidth = viewportAxis(width, input.width, base.width);
+        const float viewportHeight = viewportAxis(height, input.height, base.height);
         const D3D12_VIEWPORT viewport{(width - viewportWidth) * 0.5f, (height - viewportHeight) * 0.5f,
                                       viewportWidth, viewportHeight, 0, 1};
         const D3D12_RECT scissor{0,0,LONG(width),LONG(height)};
@@ -192,7 +207,14 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
         list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
         list->ClearRenderTargetView(rtv, clear.Color, 0, nullptr);
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        list->DrawInstanced(3,1,0,0);
+        if (partialTriangle) {
+            const D3D12_INDEX_BUFFER_VIEW indices{partialTriangle->GetGPUVirtualAddress(),
+                                                   3 * sizeof(Word), DXGI_FORMAT_R32_UINT};
+            list->IASetIndexBuffer(&indices);
+            list->DrawIndexedInstanced(3, 1, 0, 0, 0);
+        } else {
+            list->DrawInstanced(3,1,0,0);
+        }
         transition(list, target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
         src.pResource = target.Get();
         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -206,12 +228,43 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
         std::vector<BYTE> image;
         if (capture) image.reserve(size_t(width) * height * 4);
         for (UINT y = 0; y < height; ++y) {
+            const UINT numeratorY = (2 * y + 1) * sampled.height;
+            const UINT sampleY = numeratorY / (2 * height);
             for (UINT x = 0; x < width; ++x) {
-                const auto& expected = sampled.expected[(y / req.scale) * sampled.width + x / req.scale];
+                const UINT numeratorX = (2 * x + 1) * sampled.width;
+                const UINT sampleX = numeratorX / (2 * width);
+                const auto& expected = sampled.expected[sampleY * sampled.width + sampleX];
                 const auto offset = y * resultLayout.Footprint.RowPitch / 4 + x * 4;
                 Color actual;
                 std::memcpy(actual.data(), words.data() + offset, sizeof(actual));
-                if (std::memcmp(actual.data(), expected.data(), sizeof(actual)) != 0) {
+                const auto matches = [&](const Color& ref) {
+                    return std::memcmp(actual.data(), ref.data(), sizeof(actual)) == 0;
+                };
+                bool matched = matches(expected);
+                // The exact texel is always tried first. Neighbors are admitted only
+                // for magnified tail draws, which sample through the root signature's
+                // single static sampler (MIN_MAG_MIP_POINT, clamp addressing).
+                if (!matched && req.isTailDraw && req.scale > 1) {
+                    // Per axis, at most one immediate neighbor in the same mip:
+                    // the previous texel for a center exactly on a boundary, or
+                    // the next texel for a center up to 1/512 texel below a
+                    // boundary (tie included), where rounding the scaled
+                    // coordinate to 8 fractional bits crosses it. The last texel
+                    // has no boundary above it under clamp addressing.
+                    const auto neighbor = [](UINT numerator, UINT denominator, UINT sample, UINT extent) {
+                        const UINT remainder = numerator % denominator;
+                        if (!remainder) return sample - 1;
+                        const bool roundsUp = UINT64(remainder) * 512 >= UINT64(denominator) * 511;
+                        return roundsUp && sample + 1 < extent ? sample + 1 : sample;
+                    };
+                    const UINT nearX = neighbor(numeratorX, 2 * width, sampleX, sampled.width);
+                    const UINT nearY = neighbor(numeratorY, 2 * height, sampleY, sampled.height);
+                    // Each candidate must match as a whole RGBA texel.
+                    matched = matches(sampled.expected[sampleY * sampled.width + nearX]) ||
+                              matches(sampled.expected[nearY * sampled.width + sampleX]) ||
+                              matches(sampled.expected[nearY * sampled.width + nearX]);
+                }
+                if (!matched) {
                     std::fprintf(stderr, "pixel_mismatch x=%u y=%u\n", x, y);
                     for (size_t c = 0; c < actual.size(); ++c)
                         std::fprintf(stderr, "channel=%zu expected=%g actual=%g\n", c, expected[c], actual[c]);
@@ -235,7 +288,9 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
 void draw_verified(ID3D12Device* device, const char* path, const std::vector<PixelInput>& levels,
                    UINT firstResident, UINT sampledLevel, const char* capture)
 {
-    draw_verified(device, path, levels, firstResident, {{sampledLevel, levels.at(sampledLevel).scale}}, capture);
+    const auto& top = levels.front();
+    draw_verified(device, path, levels, {top.width << firstResident, top.height << firstResident},
+                  firstResident, {{sampledLevel, levels.at(sampledLevel).scale}}, capture);
 }
 }
 
@@ -260,6 +315,26 @@ void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB,
     std::vector<PixelInput> levels;
     levels.push_back(std::move(input));
     draw_verified(device, path, levels, 0, 0, nullptr);
+}
+
+void check_pixel_quad_lod(ID3D12Device* device, const char* shader)
+{
+    PixelInput top{8, 8, 1, DXGI_FORMAT_R8G8B8A8_UNORM};
+    PixelInput next{4, 4, 1, DXGI_FORMAT_R8G8B8A8_UNORM};
+    const float scale = 4.0f;
+    std::memcpy(&top.constants[2], &scale, sizeof(scale));
+    for (UINT y = 0; y < top.height; ++y) {
+        for (UINT x = 0; x < top.width; ++x) {
+            top.rows.insert(top.rows.end(), {255, 0, 0, 255});
+            // Pixel centers have x + y + 1 below the triangle's 7.75-pixel edge.
+            top.expected.push_back(x + y <= 6 ? Color{0, 1, 0, 1} : Color{-1, -1, -1, -1});
+        }
+    }
+    for (UINT texel = 0; texel < next.width * next.height; ++texel)
+        next.rows.insert(next.rows.end(), {0, 255, 0, 255});
+    MipDraw draw{0, 1};
+    draw.partialQuad = true;
+    draw_verified(device, shader, {std::move(top), std::move(next)}, {8, 8}, 0, {draw}, nullptr);
 }
 
 void check_dual_pixel(ID3D12Device* device, const char* shader, const char* capture, bool swap)
@@ -334,13 +409,32 @@ void check_bc7_tail(ID3D12Device* device, const char* shader, const char* firstM
     const auto parsed = std::from_chars(arg.data(), arg.data() + arg.size(), first);
     if (parsed.ec != std::errc{} || parsed.ptr != arg.data() + arg.size() || first > 12)
         throw std::runtime_error("Invalid first resident mip");
+    Extent base{};
+    const bool explicitBase = count > 0 && std::string_view(paths[0]) == "--base-size";
+    if (explicitBase) {
+        if (count < 4) throw std::runtime_error("Expected --base-size WIDTH HEIGHT followed by BC7 cases");
+        const auto dimension = [](std::string_view text) -> UINT {
+            UINT value = 0;
+            const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
+            if (result.ec != std::errc{} || result.ptr != text.data() + text.size() || !value)
+                throw std::runtime_error("Invalid BC7 base dimension");
+            return value;
+        };
+        base = {dimension(paths[1]), dimension(paths[2])};
+        paths += 3;
+        count -= 3;
+    }
     std::vector<PixelInput> levels;
     for (int i = 0; i < count; ++i) {
         auto level = read_bc7_case(paths[i]);
         if (levels.empty()) {
-            const UINT width = level.width << first, height = level.height << first;
-            if (width > 4096 || height > 4096 || UINT64(width) * height > 4 * 1024 * 1024)
+            if (!explicitBase) base = {level.width << first, level.height << first};
+            if (base.width > 4096 || base.height > 4096 || UINT64(base.width) * base.height > 4 * 1024 * 1024)
                 throw std::runtime_error("Logical BC7 texture exceeds fixture bounds");
+            const auto resident = base.mip(first);
+            if (!(std::max<UINT>(base.width, base.height) >> first) ||
+                resident.width != level.width || resident.height != level.height)
+                throw std::runtime_error("BC7 base size is incompatible with the first resident mip");
         } else if (!is_next_mip(levels.back(), level)) {
             throw std::runtime_error("Expected consecutive BC7 mip sizes");
         }
@@ -353,5 +447,5 @@ void check_bc7_tail(ID3D12Device* device, const char* shader, const char* firstM
         const UINT selected = mip < first ? 0 : mip - first;
         draws.push_back({selected, scale, mip, true});
     }
-    draw_verified(device, shader, levels, first, draws, nullptr);
+    draw_verified(device, shader, levels, base, first, draws, nullptr);
 }

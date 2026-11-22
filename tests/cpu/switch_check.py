@@ -88,6 +88,59 @@ def check_narrow(probe, libraries, label):
         if (rax, words) != (want, (GUARDS[0], stored, GUARDS[1])) or registers != SENTINELS:
             raise AssertionError(f"{label} shift_narrow({x:#x}, {y:#x}): {rax:#x} {words} {registers}")
 
+MASK64 = (1 << 64) - 1
+FLAG_VALUES = (0, 1, 2, 0xef, 0xf0, 0x7fff, 0x8000, 0xffff, 0x10000, 0x7fffffff, 0x80000000,
+               0x80000001, 0xfffeffff, 0xfffffffe, MASK32)
+
+
+def flag_reference(selector, operand, swapped=False):
+    """flag_select: SETcc and CMOVcc on A = operand bits 0..31 and B = bits 32..63."""
+    selector, operand = selector & MASK32, operand & MASK64
+    a, b = operand & MASK32, operand >> 32
+    signed = lambda v: v - (1 << 32) if v >> 31 else v
+    case = {0: 3, 3: 0}.get(selector, selector) if swapped else selector
+    if case == 0:
+        rax = int(signed(a) < signed(b))
+    elif case == 1:
+        rax = int(a <= b)
+    elif case == 2:
+        rax = (a & ~0xff) | int(signed(a) > signed(b))  # byte store into the DWORD holding A
+    elif case == 3:
+        rax = b if a > b else MASK32  # the 32-bit CMOVA clears bits 32..63 of the -1 either way
+    elif case == 4:
+        rax = operand if operand >> 63 else b
+    elif case == 5:
+        rax = b if signed(a) >= signed(b) else a
+    elif case == 6:
+        rax = (operand & ~0xff) | int((a ^ b) & 0xffff != 0)  # bits 8..63 of RAX survive
+    elif case == 7:
+        rax = a if a & 0xf0 else b
+    else:
+        rax = a
+    return rax, rax & MASK32
+
+
+def flag_inputs():
+    """Every case and the default on pairs at the signed, unsigned and 16-bit boundaries."""
+    rng = random.Random(53)
+    values = [*FLAG_VALUES, *(rng.getrandbits(32) for _ in range(5))]
+    selectors = [*range(9), 0x80000000 | 1 << 32]
+    return [(s, b << 32 | a) for s in selectors for a in values for b in values]
+
+
+def check_flags(probe, libraries, label, swapped=False):
+    invoke = windows_invoker(probe, libraries)
+    from direct_check import SENTINELS
+    rows = []
+    for x, y in flag_inputs():
+        rax, words, registers = invoke("flag_select", x, y)
+        want, stored = flag_reference(x, y, swapped)
+        if (rax, words) != (want, (GUARDS[0], stored, GUARDS[1])) or registers != SENTINELS:
+            raise AssertionError(f"{label} flag_select({x:#x}, {y:#x}): {rax:#x} {words} {registers}")
+        rows.append(rax)
+    return rows
+
+
 def select_inputs():
     selectors = [*range(11), 0x7fffffff, 0x80000000, *range(MASK32 - 6, MASK32 + 1)]
     operands = [0, 1, 2, 0x5a5a, 0x7fffffff, 0x80000000, MASK32]
@@ -150,10 +203,31 @@ def windows_invoker(probe, libraries):
     return invoke
 
 
+def check_cmov_read(libraries):
+    """cmov_read: CMOVNE after CMP ECX, ECX never moves, but its memory source is read either way."""
+    word = ctypes.c_uint32(0x5a5a1234)
+    for label, library in libraries:
+        function = library
+        function.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_void_p]
+        function.restype = ctypes.c_uint64
+        # A 32-bit CMOVcc clears bits 32-63 of the destination even when it does not move.
+        result = function(7, 0xdeadbeef00000001, ctypes.addressof(word))
+        if result != 1:
+            raise AssertionError(f"{label} cmov_read: {result:#x} != 0x1")
+        try:
+            function(7, 1, None)
+        except OSError as error:
+            if "access violation" not in str(error):
+                raise AssertionError(f"{label} cmov_read with a null source: {error}") from error
+        else:
+            raise AssertionError(f"{label} cmov_read with a null source did not fault")
+
 def check(probe_path, original_path, lifted_path, swapped_path):
     from direct_check import SENTINELS, register_probe
     probe = register_probe(probe_path)
     native, lifted, swapped = map(ctypes.CDLL, (original_path, lifted_path, swapped_path))
+    check_cmov_read([("source fixture", native.cmov_read), ("translation", lifted.lifted_cmov_read),
+                     ("swapped-table build", swapped.lifted_cmov_read)])
     names = (*SELECTORS, "run_ops")
     original = outcomes(windows_invoker(probe, lambda n: getattr(native, n)), SELECTORS, "run_ops")
     verify(original, expected(SELECTORS, "run_ops"), SENTINELS, "source fixture")
@@ -167,9 +241,17 @@ def check(probe_path, original_path, lifted_path, swapped_path):
     check_narrow(probe, lambda n: getattr(native, n), "source fixture")
     check_narrow(probe, lambda n: getattr(lifted, "lifted_" + n), "translation")
     check_narrow(probe, lambda n: getattr(swapped, "lifted_" + n), "swapped-table build")
+    flags = check_flags(probe, lambda n: getattr(native, n), "source fixture")
+    if check_flags(probe, lambda n: getattr(lifted, "lifted_" + n), "translation") != flags:
+        raise AssertionError("flag_select translation differs from the original")
+    flag_changes = sum(a != b for a, b in zip(flags, check_flags(
+        probe, lambda n: getattr(swapped, "lifted_" + n), "swapped-table control", swapped=True)))
+    if not flag_changes:
+        raise AssertionError("swapped flag_select table matched the original")
     print(f"{len(select_inputs())} selector pairs per table layout and {len(programs())} programs match on "
           f"return, guarded store, RBX and RSI; swapped tables changed {changed}; {len(narrow_inputs())} byte and "
-          f"word memory shifts match x86 count masking")
+          f"word memory shifts match x86 count masking; {len(flag_inputs())} SETcc/CMOVcc inputs match "
+          f"and the swapped table changed {flag_changes}")
 
 
 def instructions(pe, name):
@@ -254,9 +336,51 @@ def check_rejections(original_path):
     print(f"{len(controls)} rejection controls and the leaf-without-unwind translation passed")
 
 
+def check_flag_rejections(original_path):
+    """Damaged flag consumers in flag_select must be rejected, not translated."""
+    data = Path(original_path).read_bytes()
+    with pefile.PE(data=data, fast_load=True) as pe:
+        entry = export_rva(pe, "flag_select")
+        code = list(Decoder(64, pe.get_data(entry, 0xa0), ip=entry))
+        offset = pe.get_offset_from_rva
+    first = lambda mnemonic: next(i for i in code if i.mnemonic == mnemonic)
+    setl, setbe, cmovge = first(Mnemonic.SETL), first(Mnemonic.SETBE), first(Mnemonic.CMOVGE)
+    between = code[code.index(cmovge) - 1]  # the MOV between CMP and CMOVGE
+    jump = code[code.index(setl) + 1]
+    if setl.len != 3 or between.mnemonic != Mnemonic.MOV or between.len != 2 or jump.len != 2:
+        raise AssertionError("unexpected flag_select encoding")
+    controls = [
+        (setl.ip, bytes.fromhex("0f 9c c4"), "unsupported register"),  # SETL AH
+        # NEG writes the flags, so CMOVGE may no longer read those of the CMP.
+        (between.ip, bytes.fromhex("f7 d8"), "unsupported flag producer"),
+        # A second entry at SETBE would reach it with the flags of another path.
+        (jump.ip + 1, struct.pack("b", setbe.ip - jump.next_ip), "flags cross a join"),
+    ]
+    with TemporaryDirectory() as folder:
+        path = Path(folder) / "control.dll"
+        supported = bytearray(data)
+        supported[offset(setl.ip):offset(setl.ip) + 3] = bytes.fromhex("0f 90 c0")
+        path.write_bytes(supported)
+        translate(path, ["flag_select"])  # SETO is supported; hardware differential checks live separately.
+        for rva, patch, reason in controls:
+            damaged = bytearray(data)
+            damaged[offset(rva):offset(rva) + len(patch)] = patch
+            path.write_bytes(damaged)
+            try:
+                translate(path, ["flag_select"])
+            except ValueError as exc:
+                if reason not in str(exc):
+                    raise AssertionError(f"{reason}: {exc}") from exc
+            else:
+                raise AssertionError(f"accepted control: {reason}")
+    print(f"{len(controls)} flag-consumer rejection controls passed")
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "rejections":
         check_rejections(sys.argv[2])
+        check_flag_rejections(sys.argv[2])
     else:
         check(*sys.argv[1:])
         check_rejections(sys.argv[2])
+        check_flag_rejections(sys.argv[2])

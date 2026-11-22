@@ -100,6 +100,8 @@ def extract_shaders(
     target_stages: set[str] | None = None,
     limit: int | None = None,
     extract_format: str = "native",
+    *,
+    length_prefixed_names: bool = False,
 ):
     """
     Scan shaders.rpf and extract shaders into organized folders.
@@ -131,6 +133,7 @@ def extract_shaders(
             cursor = 0
 
             while match := names_pattern.search(data, cursor):
+                scan_start = cursor
                 cursor = match.end()
                 if cursor + 18 > data_len or data[cursor] != 0:
                     continue
@@ -163,7 +166,13 @@ def extract_shaders(
                 if len(program) < 24:
                     continue
 
-                record_name = match.group().decode("ascii", "replace")
+                name = match.group()
+                # The length includes the terminator. A printable length byte can join the name's run.
+                if length_prefixed_names and name[0] == len(name):
+                    name_start = match.start()
+                    if name_start == scan_start or data[name_start - 1] != len(name) + 1:
+                        name = name[1:]
+                record_name = name.decode("ascii", "replace")
                 cursor = start_payload + (stored - len(stream.unused_data))
                 total_found += 1
 
@@ -286,6 +295,11 @@ def main():
         default="native",
         help="Extraction format: 'native' (raw AMD RDNA 2 .bin, default), 'dxbc' (DXBC container), or 'both'",
     )
+    parser.add_argument(
+        "--length-prefixed-names",
+        action="store_true",
+        help="Interpret a matching printable byte as a record name's length prefix",
+    )
 
     args = parser.parse_args()
 
@@ -300,6 +314,7 @@ def main():
         target_stages=target_stages,
         limit=args.limit,
         extract_format=args.format,
+        length_prefixed_names=args.length_prefixed_names,
     )
     return 0
 

@@ -1,5 +1,9 @@
 #include "era_heap.h"
 
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -9,6 +13,7 @@
 #include <memory>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <vector>
 #ifdef _DEBUG
 #include <crtdbg.h>
@@ -254,6 +259,122 @@ bool reuse_checks()
     return true;
 }
 
+bool large_alignment_checks()
+{
+    using Byte = unsigned char;
+    SYSTEM_INFO system{};
+    GetSystemInfo(&system);
+    const std::size_t page = system.dwPageSize;
+    // Alignments above one page. Each block must own its allocation and commit only the
+    // pages that hold the payload, not the alignment padding.
+    unsigned cases = 0;
+    std::size_t committed_total = 0, alignment_total = 0;
+    for (unsigned exponent : {13u, 16u, 17u, 20u, 31u}) {
+        const auto alignment = std::size_t{1} << exponent;
+        for (std::size_t bytes : {std::size_t{1}, std::size_t{257}, page, page + 1, 3 * page - 1}) {
+            auto* p = static_cast<Byte*>(era_heap::allocate(bytes, std::uint64_t{exponent} << 24));
+            if (!p) return false;
+            const auto committed = (bytes + page - 1) & ~(page - 1);
+            MEMORY_BASIC_INFORMATION info{};
+            const bool shaped =
+                reinterpret_cast<std::uintptr_t>(p) % alignment == 0 &&
+                std::all_of(p, p + bytes, [](Byte b) { return b == 0; }) &&
+                VirtualQuery(p, &info, sizeof(info)) == sizeof(info) &&
+                info.AllocationBase == p && info.BaseAddress == p && info.State == MEM_COMMIT &&
+                info.Protect == PAGE_READWRITE && info.Type == MEM_PRIVATE &&
+                info.RegionSize == committed;
+            if (!shaped) {
+                std::printf("exponent=%u bytes=%zu base_matches=%d state=%lx region=%zu\n", exponent,
+                            bytes, info.AllocationBase == p, static_cast<unsigned long>(info.State),
+                            static_cast<std::size_t>(info.RegionSize));
+                era_heap::release(p);
+                return false;
+            }
+            std::fill_n(p, bytes, 0xa5);
+            era_heap::release(p);
+            if (VirtualQuery(p, &info, sizeof(info)) != sizeof(info) || info.State != MEM_FREE) {
+                std::printf("exponent=%u bytes=%zu not released (state=%lx)\n", exponent, bytes,
+                            static_cast<unsigned long>(info.State));
+                return false;
+            }
+            committed_total += committed;
+            alignment_total += alignment;
+            ++cases;
+        }
+    }
+    std::printf("large_alignment_cases=%u committed_bytes=%zu alignment_bytes=%zu\n", cases,
+                committed_total, alignment_total);
+    return true;
+}
+
+bool graphics_type_checks()
+{
+    using Byte = unsigned char;
+    SYSTEM_INFO system{};
+    GetSystemInfo(&system);
+    const std::size_t page = system.dwPageSize;
+    const std::size_t granularity = system.dwAllocationGranularity;
+    const auto word = [](std::uint64_t type, std::uint64_t page_size, std::uint64_t exponent) {
+        return (type << 29) | (exponent << 24) | (page_size << 14);
+    };
+    // Every graphics memory type is served from its own virtual allocation when the page size
+    // and alignment fit the allocation granularity. Exponent 16 is the 64 KiB boundary itself.
+    unsigned served = 0, rejected = 0;
+    for (std::uint64_t type = 1; type <= 6; ++type) {
+        for (std::uint64_t page_size : {0u, 1u}) {
+            for (std::uint64_t exponent : {0u, 4u, 8u, 16u}) {
+                if ((std::size_t{1} << exponent) > granularity) continue;
+                const auto attributes = word(type, page_size, exponent);
+                for (std::size_t bytes : {std::size_t{1}, granularity + 1}) {
+                    auto* p = static_cast<Byte*>(era_heap::allocate(bytes, attributes));
+                    if (!p) {
+                        std::printf("type=%llu page_size=%llu exponent=%llu bytes=%zu refused\n",
+                                    type, page_size, exponent, bytes);
+                        return false;
+                    }
+                    const auto committed = (bytes + page - 1) & ~(page - 1);
+                    MEMORY_BASIC_INFORMATION info{};
+                    bool ok = reinterpret_cast<std::uintptr_t>(p) % granularity == 0 &&
+                              VirtualQuery(p, &info, sizeof(info)) == sizeof(info) &&
+                              info.AllocationBase == p && info.State == MEM_COMMIT &&
+                              info.Protect == PAGE_READWRITE && info.Type == MEM_PRIVATE &&
+                              info.RegionSize >= committed &&
+                              std::all_of(p, p + bytes, [](Byte b) { return b == 0; });
+                    if (ok) {
+                        std::fill_n(p, bytes, Byte{0x5a});
+                        ok = std::all_of(p, p + bytes, [](Byte b) { return b == 0x5a; });
+                    }
+                    era_heap::release_with_attributes(p, attributes);
+                    MEMORY_BASIC_INFORMATION after{};
+                    if (!ok || VirtualQuery(p, &after, sizeof(after)) != sizeof(after) ||
+                        after.State != MEM_FREE) {
+                        std::printf("type=%llu page_size=%llu exponent=%llu bytes=%zu ok=%d state=%lx\n",
+                                    type, page_size, exponent, bytes, ok,
+                                    static_cast<unsigned long>(after.State));
+                        return false;
+                    }
+                    ++served;
+                }
+            }
+        }
+        // Negative controls for the same type: 4 MB pages and alignments one step above the
+        // granularity exceed what the desktop honors, and page size 3 is undefined.
+        for (const auto& [page_size, exponent, applies] :
+             {std::tuple{std::uint64_t{2}, std::uint64_t{0}, granularity < (std::size_t{4} << 20)},
+              std::tuple{std::uint64_t{0}, std::uint64_t{17}, granularity < (std::size_t{1} << 17)},
+              std::tuple{std::uint64_t{3}, std::uint64_t{0}, true}}) {
+            if (!applies) continue;
+            if (!rejects(512, word(type, page_size, exponent))) {
+                std::printf("type=%llu page_size=%llu exponent=%llu accepted\n", type, page_size, exponent);
+                return false;
+            }
+            ++rejected;
+        }
+    }
+    std::printf("graphics_served=%u graphics_rejected=%u granularity=%zu\n", served, rejected, granularity);
+    return true;
+}
+
 bool concurrency_checks()
 {
     constexpr std::size_t bytes = 511;
@@ -300,6 +421,10 @@ int main(int argc, char** argv)
         passed = reuse_checks();
     } else if (scenario == "observed_words"sv) {
         passed = observed_word_checks();
+    } else if (scenario == "large_alignment"sv) {
+        passed = large_alignment_checks();
+    } else if (scenario == "graphics_types"sv) {
+        passed = graphics_type_checks();
     } else if (scenario == "concurrency"sv) {
         passed = concurrency_checks();
     } else {
