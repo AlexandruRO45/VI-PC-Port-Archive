@@ -537,5 +537,164 @@ class TestScalarInterpreter(unittest.TestCase):
         self.assertAlmostEqual(u32_to_f32(self.interp.mem.read_dword(0x42)), 8.0, places=5)
 
 
+# ==============================================================================
+# SIMD Wavefront Multi-Lane Divergence & 32/64-Bit EXEC Masking
+# ==============================================================================
+
+class SIMDLDSWavefrontInterpreter:
+    """Multi-lane SIMD architectural interpreter modeling Wave32 and Wave64 execution."""
+
+    def __init__(self, wave_size: int = 64, lds_size_dwords: int = LDS_SIZE_DWORDS) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Invalid wave_size: {wave_size} (must be 32 or 64)")
+        self.wave_size: int = wave_size
+        self.exec_mask: int = (1 << wave_size) - 1
+        self.vgprs: List[List[int]] = [[0] * DEFAULT_NUM_VGPRS for _ in range(wave_size)]
+        self.sgprs: List[int] = [0] * DEFAULT_NUM_SGPRS
+        self.mem: LDSMemory = LDSMemory(size_dwords=lds_size_dwords)
+
+    def set_exec_mask(self, mask: int) -> None:
+        valid_mask = (1 << self.wave_size) - 1
+        self.exec_mask = mask & valid_mask
+
+    def read_lane_reg(self, lane: int, op: RegisterOperand) -> int:
+        if op.reg_type == RegType.VGPR:
+            return self.vgprs[lane][op.index]
+        return self.sgprs[op.index]
+
+    def write_lane_reg(self, lane: int, op: RegisterOperand, val: int) -> None:
+        val32 = u32(val)
+        if op.reg_type == RegType.VGPR:
+            self.vgprs[lane][op.index] = val32
+        else:
+            self.sgprs[op.index] = val32
+
+    def step(self, instr: DSRsubRtnInstruction) -> List[Optional[Tuple[int, int]]]:
+        """Execute instruction across all lanes with EXEC masking."""
+        lane_inputs: List[Tuple[int, int]] = []
+        for lane in range(self.wave_size):
+            va = self.read_lane_reg(lane, instr.vaddr)
+            vd = self.read_lane_reg(lane, instr.vdata0)
+            lane_inputs.append((va, vd))
+
+        results: List[Optional[Tuple[int, int]]] = []
+        for lane in range(self.wave_size):
+            is_active = (self.exec_mask & (1 << lane)) != 0
+            if not is_active:
+                results.append(None)
+                continue
+
+            va_val, vd_val = lane_inputs[lane]
+            old_val, new_val = self.mem.atomic_rsub_rtn_f32(
+                vaddr=va_val,
+                vdata0=vd_val,
+                offset=instr.offset,
+            )
+            self.write_lane_reg(lane, instr.vdst, old_val)
+            results.append((old_val, new_val))
+
+        return results
+
+
+class TestSIMDWavefrontDivergence(unittest.TestCase):
+    """Unit tests for SIMD wavefront multi-lane divergence and EXEC masking."""
+
+    def test_wave32_divergent_addresses(self) -> None:
+        sim = SIMDLDSWavefrontInterpreter(wave_size=32, lds_size_dwords=1024)
+        # Pre-seed each lane's dword with 1.0f
+        for i in range(32):
+            sim.mem.write_dword(i, ONE_F32)
+            sim.write_lane_reg(i, RegisterOperand(1), i * 4)     # vaddr = i * 4
+            sim.write_lane_reg(i, RegisterOperand(2), FIVE_F32)   # vdata0 = 5.0f
+
+        instr = DSRsubRtnInstruction(
+            vdst=RegisterOperand(0),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+        )
+        res = sim.step(instr)
+
+        for i in range(32):
+            self.assertIsNotNone(res[i])
+            old_val, new_val = res[i]  # type: ignore
+            # 5.0f - 1.0f = 4.0f
+            self.assertEqual(old_val, ONE_F32)
+            self.assertAlmostEqual(u32_to_f32(new_val), 4.0, places=5)
+            self.assertEqual(sim.read_lane_reg(i, RegisterOperand(0)), ONE_F32)
+            self.assertAlmostEqual(u32_to_f32(sim.mem.read_dword(i)), 4.0, places=5)
+
+    def test_wave64_exec_masking(self) -> None:
+        sim = SIMDLDSWavefrontInterpreter(wave_size=64, lds_size_dwords=1024)
+        # Active only on odd lanes
+        odd_mask = 0xAAAA_AAAA_AAAA_AAAA
+        sim.set_exec_mask(odd_mask)
+
+        for i in range(64):
+            sim.mem.write_dword(i, TWO_F32)
+            sim.write_lane_reg(i, RegisterOperand(1), i * 4)
+            sim.write_lane_reg(i, RegisterOperand(2), TEN_F32)
+            sim.write_lane_reg(i, RegisterOperand(0), 0xDEAD_BEEF)
+
+        instr = DSRsubRtnInstruction(
+            vdst=RegisterOperand(0),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+        )
+        res = sim.step(instr)
+
+        for i in range(64):
+            if i % 2 == 1:
+                # Active lane: 10.0f - 2.0f = 8.0f
+                self.assertIsNotNone(res[i])
+                old_val, new_val = res[i]  # type: ignore
+                self.assertEqual(old_val, TWO_F32)
+                self.assertAlmostEqual(u32_to_f32(new_val), 8.0, places=5)
+                self.assertEqual(sim.read_lane_reg(i, RegisterOperand(0)), TWO_F32)
+                self.assertAlmostEqual(u32_to_f32(sim.mem.read_dword(i)), 8.0, places=5)
+            else:
+                # Inactive lane: untouched memory and register
+                self.assertIsNone(res[i])
+                self.assertEqual(sim.read_lane_reg(i, RegisterOperand(0)), 0xDEAD_BEEF)
+                self.assertEqual(sim.mem.read_dword(i), TWO_F32)
+
+    def test_atomic_serialization_same_address(self) -> None:
+        # Multiple lanes targeting the exact same LDS dword (index 5)
+        sim = SIMDLDSWavefrontInterpreter(wave_size=32, lds_size_dwords=1024)
+        sim.set_exec_mask(0b111)  # only lanes 0, 1, 2 active
+        sim.mem.write_dword(5, ONE_F32)  # initial 1.0f
+
+        # Lane 0: vdata0 = 10.0f -> new = 10.0 - 1.0 = 9.0f, returns 1.0f
+        # Lane 1: vdata0 = 20.0f -> new = 20.0 - 9.0 = 11.0f, returns 9.0f
+        # Lane 2: vdata0 = 15.0f -> new = 15.0 - 11.0 = 4.0f, returns 11.0f
+        sim.write_lane_reg(0, RegisterOperand(1), 20)  # byte address 20 -> dword index 5
+        sim.write_lane_reg(0, RegisterOperand(2), TEN_F32)
+
+        sim.write_lane_reg(1, RegisterOperand(1), 20)
+        sim.write_lane_reg(1, RegisterOperand(2), f32_to_u32(20.0))
+
+        sim.write_lane_reg(2, RegisterOperand(1), 20)
+        sim.write_lane_reg(2, RegisterOperand(2), f32_to_u32(15.0))
+
+        instr = DSRsubRtnInstruction(
+            vdst=RegisterOperand(0),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+        )
+        res = sim.step(instr)
+
+        # Lane 0
+        self.assertAlmostEqual(u32_to_f32(res[0][0]), 1.0, places=5)  # type: ignore
+        self.assertAlmostEqual(u32_to_f32(res[0][1]), 9.0, places=5)  # type: ignore
+        # Lane 1
+        self.assertAlmostEqual(u32_to_f32(res[1][0]), 9.0, places=5)  # type: ignore
+        self.assertAlmostEqual(u32_to_f32(res[1][1]), 11.0, places=5)  # type: ignore
+        # Lane 2
+        self.assertAlmostEqual(u32_to_f32(res[2][0]), 11.0, places=5)  # type: ignore
+        self.assertAlmostEqual(u32_to_f32(res[2][1]), 4.0, places=5)  # type: ignore
+
+        # Final memory state is 4.0f
+        self.assertAlmostEqual(u32_to_f32(sim.mem.read_dword(5)), 4.0, places=5)
+
+
 if __name__ == "__main__":
     unittest.main()
