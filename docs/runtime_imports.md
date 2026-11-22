@@ -86,14 +86,20 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
 
 - A `GAME:` path (any case, `\` or `/`) maps under `--game-dir`. A path without the prefix is a host path and is
   passed to the host unchanged.
+- `G:\` is the package too, and `T:\` a writable scratch folder, `<overlay>\.gta6rt-temp`, that holds no package
+  files and that `GAME:\` does not list (RT-218). Five other Xbox Series layers map `G:\` to the package and four map
+  `T:\` to scratch (@kotorvr's comparison in #3232); the 16 DLLs of the package name neither, so which form GTA VI
+  uses is still open until the executable is read. A `G:`/`T:` path that is the host's own game or overlay folder
+  (a `--game-dir` on drive G:) stays a host path, as both drives do before the game folder is set; the drive-relative
+  `G:x` is always a host path. A move between `T:\` and `G:\`/`GAME:\` fails with `ERROR_NOT_SAME_DEVICE`.
 - An open that can write, and `DeleteFile`, use the overlay: `--overlay DIR`, default `<game-dir>\overlay`. A
   write-open of a package file copies it into the overlay first, so `OPEN_EXISTING` keeps its bytes; a delete of a
   package file leaves an empty marker under `<overlay>\.gta6rt-deleted`, which reads and listings treat as gone. The
   package is never written.
 - Reads prefer the overlay copy and then the package. `FindFirstFile` merges the two folders, the overlay winning on a
   name, and hides deleted names and the marker folder.
-- A path that climbs above `GAME:` with `..`, or names another drive, fails with `ERROR_INVALID_NAME`, so a title
-  cannot reach outside the package and the overlay.
+- A path that climbs above `GAME:` (or `G:\`, `T:\`) with `..`, or names another drive, fails with
+  `ERROR_INVALID_NAME`, so a title cannot reach outside the package and the overlay.
 
 - `CreateDirectory*` makes the folder in the overlay. A name the title can already see, including a folder only the
   package has, fails with `ERROR_ALREADY_EXISTS`; a missing parent with `ERROR_PATH_NOT_FOUND`.

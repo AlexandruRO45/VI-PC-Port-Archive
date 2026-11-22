@@ -607,6 +607,71 @@ int main() {
         if (hfa != INVALID_HANDLE_VALUE) find_close(hfa);
     }
 
+    // RT-218: G:\ is the package (like GAME:), T:\ a writable scratch folder inside the overlay with no package files.
+    {
+        auto write_new = [&](const wchar_t* path, const std::string& text) {
+            const HANDLE h = create_w(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h == INVALID_HANDLE_VALUE) return false;
+            DWORD written = 0;
+            ::WriteFile(h, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
+            ::CloseHandle(h);
+            return true;
+        };
+        auto read_console = [&](const wchar_t* path) {
+            const HANDLE h = create_w(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (h == INVALID_HANDLE_VALUE) return std::string("<missing>");
+            std::string text = read_handle(h);
+            ::CloseHandle(h);
+            return text;
+        };
+
+        write_path(package / "rt218" / "pkg.txt", "pkg");   // a package file the earlier sections never touched
+        check(read_console(L"G:\\rt218\\pkg.txt") == "pkg" && read_console(L"GAME:\\rt218\\pkg.txt") == "pkg",
+              "G:\\ reads a package file, like GAME:");
+        check(read_console(L"g:/rt218/pkg.txt") == "pkg", "g:/ with forward slashes reads it too");
+        check(write_new(L"G:\\data\\from_g.txt", "g") && read_path(overlay / "data" / "from_g.txt") == "g" &&
+                  !std::filesystem::exists(package / "data" / "from_g.txt"),
+              "a G:\\ write lands in the overlay and the package is unchanged");
+
+        const std::filesystem::path scratch = overlay / ".gta6rt-temp";
+        check(write_new(L"T:\\cache\\a.bin", "t") && read_path(scratch / "cache" / "a.bin") == "t",
+              "a T:\\ write lands in <overlay>\\.gta6rt-temp");
+        check(read_console(L"T:\\cache\\a.bin") == "t", "T:\\ reads back what it wrote");
+        check(attributes_w(L"T:\\rt218\\pkg.txt") == INVALID_FILE_ATTRIBUTES, "T:\\ holds no package files");
+        check(contains(list(first_w, next_w, find_close, L"T:\\cache\\*"), L"a.bin"), "T:\\ lists its own files");
+        check(!contains(list(first_w, next_w, find_close, L"GAME:\\*"), L".gta6rt-temp"),
+              "GAME:\\ does not list the scratch folder");
+        check(move_ex_w(L"T:\\cache\\a.bin", L"G:\\data\\a.bin", 0) == FALSE && ::GetLastError() == ERROR_NOT_SAME_DEVICE,
+              "a move from T:\\ to G:\\ is refused as a cross-volume move");
+        check(delete_w(L"T:\\cache\\a.bin") && !std::filesystem::exists(scratch / "cache" / "a.bin") &&
+                  !std::filesystem::exists(scratch / ".gta6rt-deleted"),
+              "a T:\\ delete removes the file and leaves no deletion marker");
+
+        SetLastError(0);
+        check(create_w(L"T:\\..\\escape.txt", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr) ==
+                      INVALID_HANDLE_VALUE &&
+                  ::GetLastError() == ERROR_INVALID_NAME,
+              "T:\\.. cannot climb out of the scratch folder");
+        SetLastError(0);
+        check(create_w(L"G:\\..\\escape.txt", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr) ==
+                      INVALID_HANDLE_VALUE &&
+                  ::GetLastError() == ERROR_INVALID_NAME,
+              "G:\\.. cannot climb out of the package");
+
+        // A game folder that itself sits on drive G: is a host path, not G:\ inside the package: a write to it goes
+        // to the host (and fails here, where that folder does not exist) instead of landing in the overlay.
+        rt::fs::configure(L"G:\\leonida_rt218_pkg", overlay);
+        check(!write_new(L"G:\\leonida_rt218_pkg\\host.txt", "h") &&
+                  !std::filesystem::exists(overlay / "leonida_rt218_pkg" / "host.txt"),
+              "a path inside a game folder on drive G: stays a host path");
+        // The host parent folder never exists, so the host write fails without touching a real T: drive.
+        rt::fs::configure({}, {});
+        check(!write_new(L"T:\\leonida_rt218_none\\u.txt", "u") &&
+                  !std::filesystem::exists(scratch / "leonida_rt218_none"),
+              "before configure() T:\\ is a host path, not the scratch folder");
+        rt::fs::configure(package, overlay);
+    }
+
     std::filesystem::remove_all(root);
     std::printf("%d check(s), %d failure(s)\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

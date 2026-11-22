@@ -5,7 +5,10 @@
 // DeleteFile*, CreateDirectory*/RemoveDirectory*, MoveFile*, CopyFile*/CopyFile2 and SetFileAttributes* are answered
 // here (docs/runtime_imports.md, "Console paths and the write overlay"; the prefixes come from ivall/xcl,
 // GPL-2.0-only, as facts). The rules:
-//   - "GAME:" (any case, "\\" or "/") maps under --game-dir; any other path is a host path and goes to the host;
+//   - "GAME:" (any case, "\\" or "/") maps under --game-dir, and so does "G:\\", the drive letter other layers give
+//     the package; "T:\\" is a writable scratch folder, <overlay>\\.gta6rt-temp, that holds no package files (RT-218).
+//     A G:/T: path that names the host's own game or overlay folder (a --game-dir on drive G:) stays a host path, as
+//     do both drives before configure(). Any other path is a host path and goes to the host;
 //   - an open that can write, and DeleteFile, go to the overlay (--overlay, default <game-dir>\\overlay), so the
 //     package stays exactly as installed. A write-open of a package file copies it into the overlay first, so
 //     OPEN_EXISTING keeps its bytes; a delete of a package file leaves an empty marker under
@@ -42,6 +45,7 @@ namespace {
 constexpr wchar_t kGamePrefix[] = L"game:";
 constexpr size_t kGamePrefixLength = 5;
 constexpr wchar_t kDeletedDir[] = L".gta6rt-deleted";
+constexpr wchar_t kScratchDir[] = L".gta6rt-temp";  // T:\, inside the overlay and hidden from GAME: listings
 // A removed package folder is marked by this file inside its marker folder: the marker folder itself can already
 // exist because files below it were deleted, and that alone does not hide the folder.
 constexpr wchar_t kRemovedDirMarker[] = L".gta6rt-dir";
@@ -57,6 +61,20 @@ struct Roots {
 Roots roots() {
     std::lock_guard lock(g_mutex);
     return {g_game_dir, g_overlay_dir};
+}
+
+// Whether a host path is the game or overlay folder or lies inside one (case-insensitive, either separator).
+bool inside_host_folder(const std::wstring& path, const Roots& r) {
+    std::wstring p = path;
+    for (auto& c : p) c = c == L'/' ? L'\\' : static_cast<wchar_t>(std::towlower(c));
+    for (const auto& folder : {r.game, r.overlay}) {
+        if (folder.empty()) continue;
+        std::wstring f = folder.wstring();
+        for (auto& c : f) c = c == L'/' ? L'\\' : static_cast<wchar_t>(std::towlower(c));
+        while (!f.empty() && f.back() == L'\\') f.pop_back();
+        if (p.compare(0, f.size(), f) == 0 && (p.size() == f.size() || p[f.size()] == L'\\')) return true;
+    }
+    return false;
 }
 
 std::wstring lower(std::wstring s) {
@@ -87,12 +105,35 @@ void narrow_ansi(const std::wstring& wide, char* out, size_t capacity) {
     WideCharToMultiByte(CP_ACP, 0, wide.c_str(), -1, out, static_cast<int>(capacity), nullptr, nullptr);
 }
 
-enum class Parsed { Host, Console, Refused };
+enum class Parsed { Host, Console, Scratch, Refused };  // Console: GAME:\ or G:\; Scratch: T:\
+
+// The folders a parsed path lives in. The scratch drive is one folder that is both its "package" and its overlay, so
+// it has no package files to copy up or hide with markers (has_package).
+Roots roots(Parsed kind) {
+    Roots r = roots();
+    if (kind != Parsed::Scratch) return r;
+    const std::filesystem::path scratch = r.overlay.empty() ? std::filesystem::path() : r.overlay / kScratchDir;
+    return {scratch, scratch};
+}
+
+bool has_package(const Roots& r) { return !r.game.empty() && r.game != r.overlay; }
 
 // Splits a console path into the components below the root. A component that names a drive or a stream ("C:", "x:y")
 // and a ".." that would leave the root are refused: the package and the overlay are the only folders a title may name.
 Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts) {
-    if (path.size() < kGamePrefixLength || lower(path.substr(0, kGamePrefixLength)) != kGamePrefix) return Parsed::Host;
+    Parsed kind = Parsed::Console;
+    size_t start = kGamePrefixLength;
+    if (path.size() < kGamePrefixLength || lower(path.substr(0, kGamePrefixLength)) != kGamePrefix) {
+        // "G:\" and "T:\" (not the drive-relative "G:x"), once a game folder is configured, unless the path is the
+        // host's own game or overlay folder.
+        if (path.size() < 3 || path[1] != L':' || (path[2] != L'\\' && path[2] != L'/')) return Parsed::Host;
+        const wchar_t drive = static_cast<wchar_t>(std::towlower(path[0]));
+        if (drive != L'g' && drive != L't') return Parsed::Host;
+        const Roots r = roots();
+        if (r.game.empty() || inside_host_folder(path, r)) return Parsed::Host;
+        kind = drive == L't' ? Parsed::Scratch : Parsed::Console;
+        start = 3;
+    }
     parts.clear();
     std::wstring part;
     auto flush = [&]() -> bool {
@@ -111,7 +152,7 @@ Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts)
         part.clear();
         return true;
     };
-    for (size_t i = kGamePrefixLength; i < path.size(); ++i) {
+    for (size_t i = start; i < path.size(); ++i) {
         const wchar_t c = path[i];
         if (c == L'\\' || c == L'/') {
             if (!flush()) return Parsed::Refused;
@@ -119,7 +160,7 @@ Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts)
             part.push_back(c);
         }
     }
-    return flush() ? Parsed::Console : Parsed::Refused;
+    return flush() ? kind : Parsed::Refused;
 }
 
 std::filesystem::path join(const std::filesystem::path& root, const std::vector<std::wstring>& parts) {
@@ -211,7 +252,7 @@ View view(const Roots& r, const std::vector<std::wstring>& parts) {
             v.kind = std::filesystem::is_directory(p, ec) ? Kind::Directory : Kind::File;
         }
     }
-    if (!r.game.empty() && !deleted(r.overlay, parts)) {
+    if (has_package(r) && !deleted(r.overlay, parts)) {
         const std::filesystem::path p = join(r.game, parts);
         if (std::filesystem::exists(p, ec)) {
             v.in_package = true;
@@ -239,7 +280,7 @@ bool empty_in_view(const Roots& r, const std::vector<std::wstring>& parts) {
         }
     }
     ec.clear();
-    if (!r.game.empty()) {
+    if (has_package(r)) {
         const std::filesystem::path p = join(r.game, parts);
         for (auto it = std::filesystem::directory_iterator(p, ec); !ec && it != std::filesystem::directory_iterator();
              it.increment(ec)) {
@@ -266,7 +307,7 @@ Target read_target(const std::wstring& path) {
     }
     if (parsed == Parsed::Refused) return fail(ERROR_INVALID_NAME);
 
-    const Roots r = roots();
+    const Roots r = roots(parsed);
     if (r.game.empty()) return fail(ERROR_PATH_NOT_FOUND);
 
     std::error_code ec;
@@ -296,7 +337,7 @@ Target write_target(const std::wstring& path, bool copy_up) {
     }
     if (parsed == Parsed::Refused) return fail(ERROR_INVALID_NAME);
 
-    const Roots r = roots();
+    const Roots r = roots(parsed);
     if (r.overlay.empty()) return fail(ERROR_PATH_NOT_FOUND);
     if (parts.empty()) return fail(ERROR_INVALID_NAME);  // "GAME:" is a folder, not a file
 
@@ -367,8 +408,8 @@ bool unregister_enumeration(HANDLE h) {
     return g_enumerations.erase(h) != 0;
 }
 
-bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts, std::vector<WIN32_FIND_DATAW>& out,
-             DWORD& error) {
+bool collect(const std::wstring& pattern, Parsed kind, const std::vector<std::wstring>& parts,
+             std::vector<WIN32_FIND_DATAW>& out, DWORD& error) {
     // "GAME:" and "GAME:\\dir\\" name the folder itself: list everything in it.
     std::vector<std::wstring> dirs;
     std::wstring leaf;
@@ -381,7 +422,7 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
         leaf = parts.back();
     }
 
-    const Roots r = roots();
+    const Roots r = roots(kind);
     if (r.game.empty()) {
         error = ERROR_PATH_NOT_FOUND;
         return false;
@@ -396,6 +437,9 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
         if (h == INVALID_HANDLE_VALUE) return;
         do {
             if (overlay_root && same_name(found.cFileName, kDeletedDir)) continue;
+            // T:\ lives in the overlay's root folder; GAME:\ does not show it.
+            if (overlay_root && kind == Parsed::Console && dirs.empty() && same_name(found.cFileName, kScratchDir))
+                continue;
             const bool dot = same_name(found.cFileName, L".") || same_name(found.cFileName, L"..");
             if (!overlay_root && !dot) {
                 std::vector<std::wstring> entry_parts = dirs;
@@ -413,7 +457,7 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
         ::FindClose(h);
     };
     add_root(r.overlay, true);
-    add_root(r.game, false);
+    if (has_package(r)) add_root(r.game, false);
 
     if (out.empty()) {
         error = ERROR_FILE_NOT_FOUND;
@@ -551,7 +595,7 @@ HANDLE WINAPI find_first_file_w(LPCWSTR pattern, LPWIN32_FIND_DATAW data) {
 
     std::vector<WIN32_FIND_DATAW> entries;
     DWORD error = 0;
-    if (!collect(pattern, parts, entries, error)) {
+    if (!collect(pattern, parsed, parts, entries, error)) {
         SetLastError(error);
         return INVALID_HANDLE_VALUE;
     }
@@ -587,7 +631,7 @@ HANDLE WINAPI find_first_file_ex_w(LPCWSTR pattern, FINDEX_INFO_LEVELS info_leve
 
     std::vector<WIN32_FIND_DATAW> entries;
     DWORD error = 0;
-    if (!collect(pattern, parts, entries, error)) {
+    if (!collect(pattern, parsed, parts, entries, error)) {
         SetLastError(error);
         return INVALID_HANDLE_VALUE;
     }
@@ -695,7 +739,7 @@ BOOL WINAPI delete_file_w(LPCWSTR name) {
         return FALSE;
     }
 
-    const Roots r = roots();
+    const Roots r = roots(parsed);
     if (r.overlay.empty() || parts.empty()) {
         SetLastError(ERROR_INVALID_NAME);
         return FALSE;
@@ -708,7 +752,7 @@ BOOL WINAPI delete_file_w(LPCWSTR name) {
         if (!::DeleteFileW(overlay_path.c_str())) return FALSE;
         removed = true;
     }
-    if (!r.game.empty() && !deleted(r.overlay, parts)) {
+    if (has_package(r) && !deleted(r.overlay, parts)) {
         const std::filesystem::path package_path = join(r.game, parts);
         if (std::filesystem::exists(package_path, ec)) {
             if (std::filesystem::is_directory(package_path, ec)) {
@@ -756,7 +800,7 @@ BOOL create_directory(LPCWSTR template_name, LPCWSTR name, LPSECURITY_ATTRIBUTES
                              : ::CreateDirectoryW(name, security);
     if (parsed == Parsed::Refused) return fail_bool(ERROR_INVALID_NAME);
 
-    const Roots r = roots();
+    const Roots r = roots(parsed);
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (view(r, parts).kind != Kind::None) return fail_bool(ERROR_ALREADY_EXISTS);  // "GAME:" included
     if (!is_folder(r, parent_of(parts))) return fail_bool(ERROR_PATH_NOT_FOUND);
@@ -799,7 +843,7 @@ BOOL WINAPI remove_directory_w(LPCWSTR name) {
     if (parsed == Parsed::Host) return ::RemoveDirectoryW(name);
     if (parsed == Parsed::Refused) return fail_bool(ERROR_INVALID_NAME);
 
-    const Roots r = roots();
+    const Roots r = roots(parsed);
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (parts.empty()) return fail_bool(ERROR_ACCESS_DENIED);  // "GAME:" itself stays
     const View v = view(r, parts);
@@ -836,7 +880,7 @@ BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
     // GAME: is its own volume: a move between it and a host path is refused the way a cross-volume move is.
     if (from_kind != to_kind) return fail_bool(ERROR_NOT_SAME_DEVICE);
 
-    const Roots r = roots();
+    const Roots r = roots(from_kind);
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (src.empty() || dst.empty()) return fail_bool(ERROR_ACCESS_DENIED);
     const View from_view = view(r, src);
@@ -907,7 +951,7 @@ bool copy_destination(LPCWSTR to, bool fail_if_exists, std::filesystem::path& ou
     }
     error = ERROR_INVALID_NAME;
     if (parsed == Parsed::Refused || parts.empty()) return false;
-    const Roots r = roots();
+    const Roots r = roots(parsed);
     error = ERROR_PATH_NOT_FOUND;
     if (r.game.empty() || r.overlay.empty()) return false;
     const View v = view(r, parts);
@@ -990,7 +1034,7 @@ BOOL WINAPI set_file_attributes_w(LPCWSTR name, DWORD attributes) {
     if (parsed == Parsed::Host) return ::SetFileAttributesW(name, attributes);
     if (parsed == Parsed::Refused) return fail_bool(ERROR_INVALID_NAME);
 
-    const Roots r = roots();
+    const Roots r = roots(parsed);
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (parts.empty()) return fail_bool(ERROR_ACCESS_DENIED);
     const View v = view(r, parts);
