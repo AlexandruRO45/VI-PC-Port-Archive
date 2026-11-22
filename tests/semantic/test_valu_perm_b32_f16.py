@@ -330,5 +330,141 @@ class TestPermB32F16ReferenceOracle(unittest.TestCase):
         res_clamped = oracle_v_perm_b32_f16(0, s1, sel, clamp=True)
         self.assertEqual(res_clamped, pack_halves(POS_ONE, POS_ZERO))
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class Opcode(Enum):
+    V_PERM_B32_F16 = auto()
+    V_NOP = auto()
+
+
+class OperandKind(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    LITERAL_CONST = auto()
+    INLINE_CONST = auto()
+
+
+class DataType(Enum):
+    F16 = auto()
+    V2F16 = auto()
+    U32 = auto()
+
+
+@dataclass
+class ASTOperand:
+    kind: OperandKind
+    reg_num: int = 0
+    constant_val: int = 0
+    data_type: DataType = DataType.V2F16
+    abs_mod: bool = False
+    neg_mod: bool = False
+
+    @classmethod
+    def vgpr(cls, num: int, abs_mod: bool = False, neg_mod: bool = False, dtype: DataType = DataType.V2F16) -> ASTOperand:
+        if not 0 <= num <= 255:
+            raise IndexError(f"VGPR index out of range [0, 255]: {num}")
+        return cls(kind=OperandKind.VGPR, reg_num=num, abs_mod=abs_mod, neg_mod=neg_mod, data_type=dtype)
+
+    @classmethod
+    def sgpr(cls, num: int, abs_mod: bool = False, neg_mod: bool = False, dtype: DataType = DataType.V2F16) -> ASTOperand:
+        if not 0 <= num <= 105:
+            raise IndexError(f"SGPR index out of range [0, 105]: {num}")
+        return cls(kind=OperandKind.SGPR, reg_num=num, abs_mod=abs_mod, neg_mod=neg_mod, data_type=dtype)
+
+    @classmethod
+    def literal(cls, val: int, dtype: DataType = DataType.U32) -> ASTOperand:
+        return cls(kind=OperandKind.LITERAL_CONST, constant_val=val & MASK32, data_type=dtype)
+
+    @classmethod
+    def inline_const(cls, val: int, dtype: DataType = DataType.U32) -> ASTOperand:
+        return cls(kind=OperandKind.INLINE_CONST, constant_val=val & MASK32, data_type=dtype)
+
+    def validate(self) -> None:
+        if self.kind == OperandKind.VGPR and not (0 <= self.reg_num <= 255):
+            raise IndexError(f"VGPR out of bounds: {self.reg_num}")
+        if self.kind == OperandKind.SGPR and not (0 <= self.reg_num <= 105):
+            raise IndexError(f"SGPR out of bounds: {self.reg_num}")
+
+
+@dataclass
+class ASTInstruction:
+    opcode: Opcode
+    dst: ASTOperand
+    src0: ASTOperand
+    src1: ASTOperand
+    src2: ASTOperand
+    clamp: bool = False
+
+    def validate(self) -> None:
+        if self.dst.kind != OperandKind.VGPR:
+            raise ValueError(f"VALU instruction destination must be a VGPR, got {self.dst.kind}")
+        self.dst.validate()
+        self.src0.validate()
+        self.src1.validate()
+        self.src2.validate()
+
+        literals = sum(1 for src in (self.src0, self.src1, self.src2) if src.kind == OperandKind.LITERAL_CONST)
+        if literals > 1:
+            raise ValueError(f"Hardware encoding permits at most one literal constant, got {literals}")
+
+
+@dataclass
+class ASTExpression:
+    opcode: Opcode
+    operands: List[Union[ASTOperand, ASTExpression]]
+    clamp: bool = False
+
+    def to_symbolic_string(self) -> str:
+        ops_str = ", ".join(
+            op.to_symbolic_string() if isinstance(op, ASTExpression)
+            else f"{op.kind.name}{op.reg_num if op.kind in (OperandKind.VGPR, OperandKind.SGPR) else f'({hex(op.constant_val)})'}"
+            for op in self.operands
+        )
+        clamp_str = " [clamp]" if self.clamp else ""
+        return f"{self.opcode.name}({ops_str}){clamp_str}"
+
+
+class TestPermB32F16SymbolicAST(unittest.TestCase):
+    def test_ast_instruction_creation(self):
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B32_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.sgpr(0),
+            clamp=True,
+        )
+        self.assertEqual(instr.opcode, Opcode.V_PERM_B32_F16)
+        self.assertTrue(instr.clamp)
+
+    def test_ast_operand_factories(self):
+        v = ASTOperand.vgpr(42, abs_mod=True)
+        self.assertEqual(v.kind, OperandKind.VGPR)
+        self.assertTrue(v.abs_mod)
+
+    def test_ast_instruction_validation_rejects_sgpr_dst(self):
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B32_F16,
+            dst=ASTOperand.sgpr(5),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.literal(0x0100),
+        )
+        with self.assertRaises(ValueError):
+            instr.validate()
+
+    def test_ast_instruction_validation_rejects_multiple_literals(self):
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B32_F16,
+            dst=ASTOperand.vgpr(5),
+            src0=ASTOperand.literal(0x1111_1111),
+            src1=ASTOperand.literal(0x2222_2222),
+            src2=ASTOperand.vgpr(0),
+        )
+        with self.assertRaises(ValueError):
+            instr.validate()
+
 if __name__ == "__main__":
     unittest.main()
