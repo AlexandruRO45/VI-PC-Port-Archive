@@ -711,3 +711,22 @@ def test_mesh_s3_wave_id_emits_local_index_shift_and_bfe(make_shader):
     assert "%mwi = OpShiftLeftLogical %uint %wave %c18" in asm
     assert "OpStore %s3p %mwi" in asm
     assert "OpBitFieldUExtract %uint" in asm
+
+
+def test_cs_ds_read_8bit_d16(make_shader):
+    """LDS 8-bit d16 reads (ds_read_u8_d16[_hi] and ds_read_i8_d16[_hi]) translate with BFE/BFI."""
+    body = (
+        "v_mov_b32 v0, 0x12345678\n"
+        "ds_read_u8_d16 v0, v1\n"
+        "ds_read_u8_d16_hi v0, v1\n"
+        "ds_read_i8_d16 v0, v1\n"
+        "ds_read_i8_d16_hi v0, v1\n"
+        "s_endpgm\n"
+    )
+    shader = make_shader(body, name="cs_ds_read_8bit_d16")
+    asm = shader.translate()
+    shader.validate(asm)
+    assert "OpBitFieldUExtract %uint" in asm
+    assert "OpBitFieldSExtract %uint" in asm
+    assert "OpBitFieldInsert %uint" in asm
+

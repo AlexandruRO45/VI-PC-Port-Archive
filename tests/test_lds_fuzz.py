@@ -1,8 +1,11 @@
 """tools/lds_fuzz.py without a GPU: the reference model's instruction semantics and the generator's guarantees
 (every access in bounds, no two lanes racing on the same bytes)."""
 from pathlib import Path
+import os
+import re
 import struct
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
@@ -112,6 +115,77 @@ class Model(unittest.TestCase):
         old = before.model()[0][0][20]
         regs, lds = p.model()
         self.assertEqual(regs[0][20], (old & 0xFFFF) | (struct.unpack_from("<H", lds, 0)[0] << 16))
+
+    def test_u8_d16_read_zero_extends_into_low_half(self):
+        p = f.Program(1, 0, 64)
+        p.ops = [{"kind": "read", "name": "ds_read_u8_d16", "addr": (0, 0, 0), "dst": 20, "exec": None}]
+        before = f.Program(1, 0, 64)
+        before.ops = []
+        old = before.model()[0][0][20]
+        regs, lds = p.model()
+        self.assertEqual(regs[0][20], (old & 0xFFFF0000) | lds[0])
+
+    def test_u8_d16_hi_read_zero_extends_into_high_half(self):
+        p = f.Program(1, 0, 64)
+        p.ops = [{"kind": "read", "name": "ds_read_u8_d16_hi", "addr": (0, 0, 0), "dst": 20, "exec": None}]
+        before = f.Program(1, 0, 64)
+        before.ops = []
+        old = before.model()[0][0][20]
+        regs, lds = p.model()
+        self.assertEqual(regs[0][20], (old & 0xFFFF) | (lds[0] << 16))
+
+    def test_i8_d16_read_sign_extends_into_low_half(self):
+        p = f.Program(1, 0, 64)
+        p.ops = [{"kind": "read", "name": "ds_read_i8_d16", "addr": (0, 0, 0), "dst": 20, "exec": None}]
+        before = f.Program(1, 0, 64)
+        before.ops = []
+        old = before.model()[0][0][20]
+        regs, lds = p.model()
+        byte = lds[0]
+        sext = byte - 256 if byte & 0x80 else byte
+        self.assertEqual(regs[0][20], (old & 0xFFFF0000) | (sext & 0xFFFF))
+
+    def test_i8_d16_hi_read_sign_extends_into_high_half(self):
+        p = f.Program(1, 0, 64)
+        p.ops = [{"kind": "read", "name": "ds_read_i8_d16_hi", "addr": (0, 0, 0), "dst": 20, "exec": None}]
+        before = f.Program(1, 0, 64)
+        before.ops = []
+        old = before.model()[0][0][20]
+        regs, lds = p.model()
+        byte = lds[0]
+        sext = byte - 256 if byte & 0x80 else byte
+        self.assertEqual(regs[0][20], (old & 0xFFFF) | ((sext & 0xFFFF) << 16))
+
+    def test_synthetic_translation_8bit_d16_reads(self):
+        import rdna2spirv
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm = os.path.join(tmp, "disasm")
+            fssm_dir = os.path.join(tmp, "fssm")
+            os.makedirs(disasm)
+            os.makedirs(fssm_dir)
+            fssm = bytearray(0x148)
+            struct.pack_into("<4I", fssm, 0x138, 0x8088, 64, 1, 1)
+            with open(os.path.join(fssm_dir, "cs_test.fssm"), "wb") as fp:
+                fp.write(fssm)
+            with open(os.path.join(tmp, "cs_test.dxbc"), "wb") as fp:
+                fp.write(b"DXBC" + bytes(16) + struct.pack("<III", 1, 32, 0))
+            s_text = (
+                "; cs_test\n"
+                "\tds_read_u8_d16 v0, v1\n"
+                "\tds_read_u8_d16_hi v0, v1\n"
+                "\tds_read_i8_d16 v0, v1\n"
+                "\tds_read_i8_d16_hi v0, v1\n"
+                "\ts_endpgm\n"
+            )
+            s_path = os.path.join(disasm, "cs_test.s")
+            with open(s_path, "w") as fp:
+                fp.write(s_text)
+            spv = rdna2spirv.translate(s_path)
+            self.assertEqual(spv.count("OpBitFieldUExtract %uint"), 2)
+            self.assertEqual(spv.count("OpBitFieldSExtract %uint"), 2)
+            self.assertEqual(spv.count("OpBitFieldInsert %uint"), 4)
+            self.assertEqual(len(re.findall(r"OpBitFieldInsert %uint %\w+ %\w+ %c0 %c10", spv)), 2)
+            self.assertEqual(len(re.findall(r"OpBitFieldInsert %uint %\w+ %\w+ %c10 %c10", spv)), 2)
 
     def test_cmpst_stores_data2_when_data_matches(self):
         p = f.Program(1, 0, 64)

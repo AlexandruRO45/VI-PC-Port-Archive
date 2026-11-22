@@ -224,8 +224,7 @@ First results on an RX 6700 XT (RADV, Mesa 26.3.1), native wave64/wave32 and wit
   under a masked wave32 `ds_bpermute`, and with #253's translator all 480 programs (seeds 1 to 3,
   native and emulated) match.
 - **Everything else matches.** With `--no-exec bpermute`, 1,040 programs match (seeds 1 to 8).
-- **Not covered.** The translator rejects `ds_permute_b32` and the 8-bit d16 reads
-  (`ds_read_u8_d16[_hi]`, `ds_read_i8_d16[_hi]`), so the fuzzer leaves them out.
+- **Not covered.** The translator rejects `ds_permute_b32`, so the fuzzer leaves it out (`ds_read_u8_d16[_hi]` and `ds_read_i8_d16[_hi]` are supported and covered).
 ### Memory instructions (`tools/mem_diff.py`, FUZZ-5)
 
 `cpu_ref.py` has no memory model, so memory instructions get their own runner. `tools/mem_diff.py`
