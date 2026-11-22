@@ -173,6 +173,170 @@ class TestLDSMaxSrc2U32OracleAndModel(unittest.TestCase):
         res = lds.atomic_max_src2_u32(base, offset0=1, offset1=1)
         self.assertEqual(res, 0)  # Memory at base + 4 was 0, max(0, 0) = 0
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class DSOpcode(Enum):
+    """Data Share (DS) src2 opcodes."""
+    DS_MAX_SRC2_U32 = "ds_max_src2_u32"
+
+
+class RegType(Enum):
+    """Register file classes."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclass(frozen=True)
+class RegisterOperand:
+    """Typed symbolic register operand representation."""
+    index: int
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        max_limit = DEFAULT_NUM_VGPRS if self.reg_type == RegType.VGPR else DEFAULT_NUM_SGPRS
+        if not (0 <= self.index < max_limit):
+            raise ValueError(f"Register index out of range for {self.reg_type.name}: {self.index}")
+
+    def __str__(self) -> str:
+        return f"{self.reg_type.value}{self.index}"
+
+
+@dataclass(frozen=True)
+class LDSAddressExpression:
+    """Symbolic representation of dual-offset LDS addressing."""
+    base_reg: RegisterOperand
+    offset0: int = 0
+    offset1: int = 0
+    gds: bool = False
+
+    def __post_init__(self) -> None:
+        if self.base_reg.reg_type != RegType.VGPR:
+            raise TypeError("LDS base address register must be a VGPR")
+        if not (0 <= self.offset0 <= 255):
+            raise ValueError(f"offset0 out of 8-bit range [0, 255]: {self.offset0}")
+        if not (0 <= self.offset1 <= 255):
+            raise ValueError(f"offset1 out of 8-bit range [0, 255]: {self.offset1}")
+
+
+@dataclass(frozen=True)
+class DSMaxSrc2U32Instruction:
+    """Symbolic AST node for ds_max_src2_u32 instruction.
+
+    Format:
+        ds_max_src2_u32 vaddr [offset0:offset8] [offset1:offset8]
+    """
+    addr: LDSAddressExpression
+    opcode: DSOpcode = DSOpcode.DS_MAX_SRC2_U32
+
+    def to_assembly(self) -> str:
+        """Serialize AST node to assembly string."""
+        s = f"{self.opcode.value} {self.addr.base_reg}"
+        if self.addr.offset0 != 0:
+            s += f" offset0:{self.addr.offset0}"
+        if self.addr.offset1 != 0:
+            s += f" offset1:{self.addr.offset1}"
+        return s
+
+    @classmethod
+    def parse(cls, asm: str) -> DSMaxSrc2U32Instruction:
+        """Parse assembly string into a DSMaxSrc2U32Instruction AST node."""
+        cleaned = re.sub(r"[;#].*$", "", asm).strip()
+        if not cleaned:
+            raise ValueError("Empty assembly string")
+
+        tokens = cleaned.split()
+        if not tokens:
+            raise ValueError("Empty instruction")
+
+        op_str = tokens[0].lower()
+        if op_str != DSOpcode.DS_MAX_SRC2_U32.value:
+            raise ValueError(f"Unsupported opcode '{tokens[0]}', expected '{DSOpcode.DS_MAX_SRC2_U32.value}'")
+
+        if len(tokens) < 2:
+            raise ValueError(f"Missing base address operand for {op_str}")
+
+        # First operand: base address register
+        base_str = tokens[1].rstrip(",")
+        if not (base_str.startswith("v") or base_str.startswith("V")):
+            raise ValueError(f"Expected base register starting with 'v', got '{base_str}'")
+        try:
+            reg_idx = int(base_str[1:])
+        except ValueError:
+            raise ValueError(f"Invalid VGPR index: '{base_str}'")
+
+        base_reg = RegisterOperand(reg_idx, RegType.VGPR)
+
+        offset0 = 0
+        offset1 = 0
+
+        # Remaining tokens are optional modifiers: offset0:N, offset1:M
+        for mod in tokens[2:]:
+            mod = mod.rstrip(",").strip()
+            mod_lower = mod.lower()
+            if mod_lower.startswith("offset0:"):
+                raw = mod[len("offset0:"):]
+                try:
+                    offset0 = int(raw, 0)
+                except ValueError:
+                    raise ValueError(f"Invalid integer for offset0: '{raw}'")
+            elif mod_lower.startswith("offset1:"):
+                raw = mod[len("offset1:"):]
+                try:
+                    offset1 = int(raw, 0)
+                except ValueError:
+                    raise ValueError(f"Invalid integer for offset1: '{raw}'")
+            else:
+                raise ValueError(f"Unknown modifier or token: '{mod}'")
+
+        addr_expr = LDSAddressExpression(base_reg=base_reg, offset0=offset0, offset1=offset1)
+        return cls(addr=addr_expr)
+
+
+class TestDSMaxSrc2U32AST(unittest.TestCase):
+    """Phase 2: Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_register_operand_valid(self) -> None:
+        v0 = RegisterOperand(0, RegType.VGPR)
+        self.assertEqual(str(v0), "v0")
+        v255 = RegisterOperand(255, RegType.VGPR)
+        self.assertEqual(str(v255), "v255")
+
+    def test_register_operand_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(256, RegType.VGPR)
+
+    def test_instruction_formatting(self) -> None:
+        vaddr = RegisterOperand(2, RegType.VGPR)
+        expr1 = LDSAddressExpression(base_reg=vaddr, offset0=0, offset1=0)
+        inst1 = DSMaxSrc2U32Instruction(addr=expr1)
+        self.assertEqual(inst1.to_assembly(), "ds_max_src2_u32 v2")
+
+        expr2 = LDSAddressExpression(base_reg=vaddr, offset0=10, offset1=20)
+        inst2 = DSMaxSrc2U32Instruction(addr=expr2)
+        self.assertEqual(inst2.to_assembly(), "ds_max_src2_u32 v2 offset0:10 offset1:20")
+
+    def test_instruction_parsing(self) -> None:
+        inst1 = DSMaxSrc2U32Instruction.parse("ds_max_src2_u32 v5")
+        self.assertEqual(inst1.addr.base_reg.index, 5)
+        self.assertEqual(inst1.addr.offset0, 0)
+        self.assertEqual(inst1.addr.offset1, 0)
+
+        inst2 = DSMaxSrc2U32Instruction.parse("ds_max_src2_u32 v10 offset0:4 offset1:8")
+        self.assertEqual(inst2.addr.base_reg.index, 10)
+        self.assertEqual(inst2.addr.offset0, 4)
+        self.assertEqual(inst2.addr.offset1, 8)
+
+    def test_instruction_roundtrip(self) -> None:
+        vaddr = RegisterOperand(15, RegType.VGPR)
+        expr = LDSAddressExpression(base_reg=vaddr, offset0=32, offset1=64)
+        inst = DSMaxSrc2U32Instruction(addr=expr)
+        parsed = DSMaxSrc2U32Instruction.parse(inst.to_assembly())
+        self.assertEqual(inst, parsed)
+
 
 if __name__ == "__main__":
     unittest.main()
