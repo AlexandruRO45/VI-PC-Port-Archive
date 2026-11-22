@@ -10981,6 +10981,8 @@ def main():
     ap.add_argument("--no-asm", action="store_true",
                     help="delete each .spvasm once its .spv is written (the text is ~2.7x the binary: 35 GB for the corpus)")
     ap.add_argument("--merge", action="store_true", help="merge index.part*.json in --out into index.json and exit")
+    ap.add_argument("--shards", type=int, default=None,
+                    help="expected total number of shards for --merge (defaults to 'jobs' in shards.json or highest part number)")
     ap.add_argument("--fssm-dir", default=None,
                     help="optional dir with <name>.fssm sidecars: records fssm_sha256 per shader in the index")
     ap.add_argument("--dispatch-loop", action="store_true",
@@ -11023,16 +11025,44 @@ def main():
     MESH_COMPUTE = a.mesh_compute
     F16_HALVES = a.f16_interp_fallback
     if a.merge:
-        import glob as _gl, json as _js
+        if not os.path.isdir(a.out):
+            sys.exit(f"rdna2spirv: output folder does not exist: {a.out}")
+        import json as _js, re as _re
+        part_pattern = _re.compile(r"^index\.part(\d+)\.json$")
+        parts = {}
+        for entry in os.listdir(a.out):
+            m = part_pattern.match(entry)
+            if m:
+                parts[int(m.group(1))] = os.path.join(a.out, entry)
+        if not parts:
+            sys.exit(f"rdna2spirv: no index.part*.json found in {a.out}")
+        plan_path = os.path.join(a.out, "shards.json")
+        expected_total = a.shards
+        if expected_total is None and os.path.isfile(plan_path):
+            try:
+                with open(plan_path, encoding="utf-8") as f:
+                    plan = _js.load(f)
+                expected_total = plan.get("jobs") or plan.get("shards")
+            except (OSError, ValueError):
+                pass
+        if expected_total is not None:
+            missing = [i for i in range(expected_total) if i not in parts]
+            if missing:
+                sys.exit(f"rdna2spirv: incomplete shards (missing {len(missing)} of {expected_total}: parts {missing[:10]}{'...' if len(missing) > 10 else ''})")
+        else:
+            max_idx = max(parts)
+            missing = [i for i in range(max_idx + 1) if i not in parts]
+            if missing:
+                sys.exit(f"rdna2spirv: incomplete shards (gaps in part numbers: missing {missing[:10]})")
         merged = {}
-        for part in sorted(_gl.glob(os.path.join(a.out, "index.part*.json"))):
-            with open(part, encoding="utf-8") as f:
+        for idx in sorted(parts):
+            with open(parts[idx], encoding="utf-8") as f:
                 merged.update(_js.load(f))
         # The stubs go first: index.json is what tells make_game.py the translation finished.
         import spirv_stubs
         spirv_stubs.generate_for_index(a.out, merged)
         write_index(os.path.join(a.out, "index.json"), merged)
-        print(f"merged {len(merged)} entries")
+        print(f"merged {len(merged)} entries from {len(parts)} shards")
         return 0
     if os.path.isfile(a.src) and a.src.endswith(".s"):
         files = [a.src]
@@ -11047,6 +11077,16 @@ def main():
         si, sn = a.shard
         files = files[si::sn]
         shard = si
+        plan_path = os.path.join(a.out, "shards.json")
+        if not os.path.exists(plan_path):
+            try:
+                os.makedirs(a.out, exist_ok=True)
+                tmp_plan = plan_path + f".tmp.{si}"
+                with open(tmp_plan, "w", encoding="utf-8") as f:
+                    _json.dump({"jobs": sn}, f)
+                os.replace(tmp_plan, plan_path)
+            except OSError:
+                pass
     os.makedirs(a.out, exist_ok=True)
     why, ok, valid = Counter(), 0, 0
     meta = {}

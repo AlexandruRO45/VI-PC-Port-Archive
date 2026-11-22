@@ -221,5 +221,98 @@ class ValidatedOutput(unittest.TestCase):
         self.assertIn("ps_fixture", json.loads(self.index.read_text(encoding="utf-8")))
 
 
+class MergeShards(unittest.TestCase):
+    """rdna2spirv.py --merge shard completeness validation and index generation (BUILD-501)."""
+
+    def merge(self, out, *extra_args):
+        return subprocess.run([sys.executable, "-I", TOOL, out, "--out", out, "--merge", *extra_args],
+                              capture_output=True, text=True)
+
+    def test_merge_with_no_part_files_fails(self):
+        with tempfile.TemporaryDirectory() as out:
+            p = self.merge(out)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("no index.part*.json found", p.stderr)
+            self.assertFalse(os.path.exists(os.path.join(out, "index.json")))
+
+    def test_merge_incomplete_shards_json_fails(self):
+        with tempfile.TemporaryDirectory() as out:
+            # Plan says 4 jobs, but only part 0 is present.
+            with open(os.path.join(out, "shards.json"), "w", encoding="utf-8") as f:
+                json.dump({"jobs": 4}, f)
+            with open(os.path.join(out, "index.part0.json"), "w", encoding="utf-8") as f:
+                json.dump({"s0": {"stage": "ps", "inputs": [0]}}, f)
+            p = self.merge(out)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("incomplete shards", p.stderr)
+            self.assertIn("missing 3 of 4", p.stderr)
+            self.assertFalse(os.path.exists(os.path.join(out, "index.json")))
+
+    def test_merge_gaps_in_part_numbers_without_plan_fails(self):
+        with tempfile.TemporaryDirectory() as out:
+            # Parts 0 and 2 exist, part 1 is missing.
+            with open(os.path.join(out, "index.part0.json"), "w", encoding="utf-8") as f:
+                json.dump({"s0": {"stage": "ps", "inputs": [0]}}, f)
+            with open(os.path.join(out, "index.part2.json"), "w", encoding="utf-8") as f:
+                json.dump({"s2": {"stage": "ps", "inputs": [2]}}, f)
+            p = self.merge(out)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("incomplete shards (gaps in part numbers: missing [1])", p.stderr)
+            self.assertFalse(os.path.exists(os.path.join(out, "index.json")))
+
+    def test_merge_explicit_shards_flag_enforces_count(self):
+        with tempfile.TemporaryDirectory() as out:
+            with open(os.path.join(out, "index.part0.json"), "w", encoding="utf-8") as f:
+                json.dump({"s0": {"stage": "ps", "inputs": [0]}}, f)
+            with open(os.path.join(out, "index.part1.json"), "w", encoding="utf-8") as f:
+                json.dump({"s1": {"stage": "ps", "inputs": [1]}}, f)
+            # 2 parts present, but --shards requires 3
+            p = self.merge(out, "--shards", "3")
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("missing 1 of 3", p.stderr)
+            self.assertFalse(os.path.exists(os.path.join(out, "index.json")))
+
+    def test_merge_complete_set_succeeds(self):
+        with tempfile.TemporaryDirectory() as out:
+            with open(os.path.join(out, "shards.json"), "w", encoding="utf-8") as f:
+                json.dump({"jobs": 3}, f)
+            for i in range(3):
+                with open(os.path.join(out, f"index.part{i}.json"), "w", encoding="utf-8") as f:
+                    json.dump({f"s{i}": {"stage": "ps", "inputs": [i]}}, f)
+            p = self.merge(out)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertIn("merged 3 entries from 3 shards", p.stdout)
+            index = json.loads(Path(out, "index.json").read_text(encoding="utf-8"))
+            self.assertEqual(set(index.keys()), {"s0", "s1", "s2"})
+
+    def test_shard_arg_records_shards_json_if_missing(self):
+        def spirv_tool(cmd, **kwargs):
+            if cmd[0] == "spirv-as":
+                Path(cmd[3]).write_bytes(b"new module")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "disasm")
+            os.mkdir(src)
+            with open(os.path.join(src, "ps_s.s"), "w", encoding="utf-8") as f:
+                f.write("\ts_endpgm\n")
+            with open(os.path.join(tmp, "ps_s.dxbc"), "wb") as f:
+                f.write(b"DXBC" + bytes(28))
+            out = os.path.join(tmp, "spirv")
+            # Run shard 0/4 in-process with mocked spirv tools
+            with mock.patch.object(sys, "argv", [TOOL, src, "--out", out, "--shard", "0/4"]), \
+                    mock.patch.object(rdna2spirv.subprocess, "run", side_effect=spirv_tool), \
+                    redirect_stdout(io.StringIO()):
+                rc = rdna2spirv.main()
+            self.assertIn(rc, (0, None))
+            self.assertTrue(os.path.isfile(os.path.join(out, "shards.json")))
+            plan = json.loads(Path(out, "shards.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan.get("jobs"), 4)
+            # Now attempting --merge before remaining shards finish must fail
+            m = self.merge(out)
+            self.assertNotEqual(m.returncode, 0)
+            self.assertIn("missing 3 of 4", m.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
