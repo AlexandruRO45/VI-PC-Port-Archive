@@ -1198,5 +1198,74 @@ class TestValuCvtPknormI16F64StatusFlags(unittest.TestCase):
         self.assertTrue(flags_snan.invalid_op)
 
 
+# ==============================================================================
+# Commit 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestValuCvtPknormI16F64IEEE754Boundaries(unittest.TestCase):
+    """Unit tests for IEEE 754 double-precision boundary extremes, subnormals, and NaNs."""
+
+    def test_signed_zeros(self) -> None:
+        """Verify +0.0 and -0.0 both convert to 0x0000."""
+        self.assertEqual(f64_to_snorm16(POS_ZERO_F64), 0)
+        self.assertEqual(f64_to_snorm16(NEG_ZERO_F64), 0)
+
+        res_abs = oracle_v_cvt_pknorm_i16_f64(NEG_ZERO_F64, NEG_ZERO_F64, abs0=True, abs1=True)
+        self.assertEqual(res_abs, 0x00000000)
+
+    def test_subnormal_numbers(self) -> None:
+        """Verify positive and negative subnormal floats underflow to 0x0000."""
+        self.assertEqual(f64_to_snorm16(MIN_SUBNORMAL_F64), 0)
+        self.assertEqual(f64_to_snorm16(MAX_SUBNORMAL_F64), 0)
+
+        min_sub_neg = MIN_SUBNORMAL_F64 | SIGN_MASK_F64
+        max_sub_neg = MAX_SUBNORMAL_F64 | SIGN_MASK_F64
+        self.assertEqual(f64_to_snorm16(min_sub_neg), 0)
+        self.assertEqual(f64_to_snorm16(max_sub_neg), 0)
+
+    def test_smallest_normal_float(self) -> None:
+        """Verify smallest positive normal float 2^-1022 underflows to 0."""
+        self.assertEqual(f64_to_snorm16(MIN_NORMAL_F64), 0)
+
+    def test_infinities(self) -> None:
+        """Verify +inf and -inf clamp to +32767 (0x7FFF) and -32767 (0x8001)."""
+        self.assertEqual(f64_to_snorm16(POS_INF_F64), 0x7FFF)
+        self.assertEqual(f64_to_snorm16(NEG_INF_F64), 0x8001)
+
+    def test_nan_payload_variations(self) -> None:
+        """Verify all varieties of Quiet and Signaling NaNs convert to 0x0000."""
+        qnan_payloads = [
+            0x7FF8000000000001,
+            0x7FFFFFFFFFFFFFFF,
+            0xFFF8000000000000,
+            0xFFFFFFFFFFFFFFFF,
+        ]
+        snan_payloads = [
+            0x7FF0000000000001,
+            0x7FF7FFFFFFFFFFFF,
+            0xFFF0000000000001,
+            0xFFF7FFFFFFFFFFFF,
+        ]
+
+        for payload in qnan_payloads + snan_payloads:
+            self.assertTrue(is_nan_f64(payload))
+            self.assertEqual(f64_to_snorm16(payload), 0)
+
+    def test_max_finite_floats(self) -> None:
+        """Verify maximum finite double-precision floats clamp to boundaries."""
+        self.assertEqual(f64_to_snorm16(MAX_NORMAL_F64), 0x7FFF)
+        min_float_neg = MAX_NORMAL_F64 | SIGN_MASK_F64
+        self.assertEqual(f64_to_snorm16(min_float_neg), 0x8001)
+
+    def test_snorm16_quantum_steps(self) -> None:
+        """Verify smallest non-zero quantizations (1 / 32767.0)."""
+        step = 1.0 / 32767.0
+        step_pos = f64_to_bits(step)
+        step_neg = f64_to_bits(-step)
+
+        self.assertEqual(f64_to_snorm16(step_pos), 0x0001)
+        self.assertEqual(f64_to_snorm16(step_neg), 0xFFFF)
+
+
 if __name__ == "__main__":
     unittest.main()
