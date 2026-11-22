@@ -196,6 +196,14 @@ connectivity (level None), the port and URL security-information queries fail wi
 certificate check fails the same way, change registrations return tokens that never fire, and the three
 `IXNetworkingImpl2` additions are `E_NOTIMPL`.
 
+`XPersistentLocalStorageImpl` is served for `IXPersistentLocalStorageImpl` (v1, slots 3-7) only, in
+xgameruntime-docs' order; no thunk in the package's DLLs calls it, so the layout is unmeasured. `QueryApiImpl` still
+logs and refuses `IXPersistentLocalStorageImpl2` and `3`, whose slot changes are unknown (`libHttpClient.GDK.dll`
+references `IXPersistentLocalStorageImpl3`'s id, only in its id table). The folder is
+`<overlay>\PersistentLocalStorage`, created on the first `GetPath` or `GetSpaceInfo`; `GetPathSize` and `pathUsed`
+count the terminating NUL; the quota is a fixed 2048 MB, the size the package declares, because the runtime does not
+read `MicrosoftGame.config`. The two `PromptUserForSpace*` calls are `E_NOTIMPL`, as Microsoft documents for PC.
+
 Which classes the package's GDK modules reference, from a byte search for the class and interface GUIDs that
 xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; counts only, nothing else read):
 

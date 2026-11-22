@@ -239,6 +239,9 @@ void test_classification() {
     check(cls("xgameruntime.dll", "XTaskQueueDispatch") == ReturnClass::Other, "XTaskQueueDispatch returns bool");
     check(cls("xgameruntime.dll", "XUserCloseHandle") == ReturnClass::Other, "XUserCloseHandle returns void");
     check(cls("xgameruntime.dll", "XStoreIsLicenseValid") == ReturnClass::Other, "XStoreIsLicenseValid returns bool");
+    check(cls("xgameruntime.dll", "XPersistentLocalStorageGetPath") == ReturnClass::HResult &&
+              cls("xgameruntime.dll", "XPersistentLocalStoragePromptUserForSpaceResult") == ReturnClass::HResult,
+          "XPersistentLocalStorage* is hresult");
     check(cls("xgameruntime.dll", "XSystemGetDeviceType") == ReturnClass::Other, "XSystem* is not listed");
     check(cls("xgameruntime.dll", "XGameRuntimeUninitialize") == ReturnClass::Other, "XGameRuntimeUninitialize");
     check(cls("kernel32.dll", "XUserAddAsync") == ReturnClass::Other, "the DLL matters");

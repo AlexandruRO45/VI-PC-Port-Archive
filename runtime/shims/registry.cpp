@@ -70,7 +70,8 @@ std::vector<Lookup> g_lookups;
 //                            dxgi1_3 and dxgi1_6 pages). Not the whole DXGI* prefix: only these names were verified.
 //  xgameruntime.dll          GDK reference, gaming/gdk/docs/reference/system/<family>/functions/<name>. These families
 //                            return HRESULT except the functions in kNotHResult, which the same pages show as
-//                            void/bool/int: XAsync*, XTaskQueue*, XUser*, XStore*, XGameSave*, XPackage*, XGameUi*.
+//                            void/bool/int: XAsync*, XTaskQueue*, XUser*, XStore*, XGameSave*, XPackage*, XGameUi*,
+//                            XPersistentLocalStorage* (all five of its functions return HRESULT).
 //                            XGameRuntimeInitialize and XGameEventWrite: HRESULT.
 //                            Mixed families (XSystem*, XGameStreaming*, XThread*, XDisplay*, XGameRuntimeFeature*) are
 //                            left out on purpose.
@@ -95,7 +96,8 @@ const char* const kNotHResult[] = {
     "XPackageIsPackagedProcess", "XPackageUninstallPackage", "XPackageUnregisterInstallationProgressChanged",
     "XPackageUnregisterPackageInstalled", "XPackageUpdateInstallationMonitor",
 };
-const char* const kXFamilies[] = {"XAsync", "XTaskQueue", "XUser", "XStore", "XGameSave", "XPackage", "XGameUi"};
+const char* const kXFamilies[] = {"XAsync",    "XTaskQueue", "XUser",  "XStore",
+                                   "XGameSave", "XPackage",   "XGameUi", "XPersistentLocalStorage"};
 
 ReturnClass classify(const std::string& dll, const std::string& name) {
     if (dll == "d3d12.dll" || dll == "d3d12_xs.dll") {

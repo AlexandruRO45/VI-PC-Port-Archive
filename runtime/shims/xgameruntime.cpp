@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iterator>
 #include <mutex>
 #include <string>
@@ -25,6 +26,7 @@
 #include <XAsyncProvider.h>
 #include <XTaskQueue.h>
 
+#include "file_system.h"
 #include "shims.h"
 
 namespace {
@@ -40,9 +42,9 @@ std::atomic<int> g_runtime_refs{0};
 // XCurl.dll, docs/runtime_imports.md). Signatures, the options struct and the error for an unknown class follow
 // xodus-gaming/xgameruntime-docs (GPL-3.0; facts only, nothing copied): InitializeApiImplEx2 is the one
 // XGameRuntimeInitialize[WithOptions] calls, and QueryApiImpl hands out the runtime's COM classes. XThreadingImpl,
-// XErrorImpl and XNetworkingImpl are served (their layouts are measured, below); for any other class QueryApiImpl
-// logs the class and interface id and refuses it, so the first boot with the executable lists the interfaces to
-// implement next.
+// XErrorImpl and XNetworkingImpl are served (their layouts are measured, below), and XSystemImpl and
+// XPersistentLocalStorageImpl (v1 only) from the documented order; for any other class QueryApiImpl logs the class
+// and interface id and refuses it, so the first boot with the executable lists the interfaces to implement next.
 
 struct ApiImplOptions {    // InitializeApiImplEx2's fourth argument
     uint32_t unknown;      // documented as always 1
@@ -340,12 +342,17 @@ RuntimeObject g_error{kErrorVtable, &kErrorClass, nullptr};
 RuntimeObject g_networking{kNetworkingVtable, &kNetworkingClass, kNetworkingIids};
 
 RuntimeObject& system_object();  // XSystemImpl, defined after the XSystem functions it serves
+RuntimeObject& persistent_local_storage_object();  // XPersistentLocalStorageImpl (v1 only), defined after XPackage
 
 HRESULT WINAPI QueryApiImpl(const GUID* class_id, REFIID interface_id, void** out) {
     if (out) *out = nullptr;
     if (class_id && out) {
         for (RuntimeObject* o : {&g_threading, &g_error, &g_networking, &system_object()})
             if (*class_id == *o->class_id) return object_query_interface(o, interface_id, out);
+        // Served for IXPersistentLocalStorageImpl only: a request for v2 or v3 falls through to the log and refusal
+        // below, exactly as before the class was served (see persistent_local_storage_object).
+        RuntimeObject& pls = persistent_local_storage_object();
+        if (*class_id == *pls.class_id && object_query_interface(&pls, interface_id, out) == S_OK) return S_OK;
     }
     char cls[40], iid[40];
     print_guid(cls, class_id);
@@ -694,6 +701,165 @@ bool __stdcall XPackageIsPackagedProcess() {
         if (std::atoi(s) == 0) return false;
     }
     return true;
+}
+
+// ---- XPersistentLocalStorageImpl (IXPersistentLocalStorageImpl, v1 only), offline ----
+//
+// The class id is IXPersistentLocalStorageImpl's interface id, and after IUnknown its layout is GetPathSize (3),
+// GetPath (4), GetSpaceInfo (5), PromptUserForSpaceAsync (6), PromptUserForSpaceResult (7) (xgameruntime-docs,
+// GPL-3.0; facts only, nothing copied). Signatures follow Microsoft's public XPersistentLocalStorage reference, with
+// `this` first. Unmeasured: no thunk in the package's DLLs calls this class (docs/runtime_imports.md).
+//
+// Only v1 is served. xgameruntime-docs names IXPersistentLocalStorageImpl2 (layout changes unknown) and
+// IXPersistentLocalStorageImpl3 (adds MountForPackage at an unknown slot); handing this vtable out for either would
+// guess their slots and could send a call to the wrong method, where today the title gets a clean refusal. So
+// QueryInterface answers only IUnknown and v1, and QueryApiImpl logs and refuses v2 and v3 as it did before.
+//
+// The folder is <overlay dir>\PersistentLocalStorage: the overlay (--overlay, default <game-dir>\overlay,
+// shims/file_system.h) is where everything a run writes already goes, so the package stays untouched. It is created
+// on the first GetPath or GetSpaceInfo. Before the overlay is configured (no --overlay/--game-dir, as in --dry-run)
+// the calls fail with ERROR_PATH_NOT_FOUND rather than writing somewhere unexpected.
+//
+// The path is narrow in the ANSI code page, the one file_system.cpp's *A shims widen with, so it round-trips through
+// CreateFileA. Size convention: XPersistentLocalStorageGetPathSize reports the characters GetPath needs including
+// the terminating NUL, and GetPath's pathUsed is the same count (Microsoft's example sizes the buffer with pathSize
+// and copies *pathUsed characters as a string), as XPackageGetMountPathSize above does.
+//
+// Quota: the package's MicrosoftGame.config declares the size, but the runtime does not parse that config
+// (InitializeApiImplEx2's game_config is only logged), so the size this package declares, 2048 MB (reported in the
+// coordination issue), is the default.
+constexpr GUID kPersistentLocalStorageClass = {0xf4faf4d4, 0x2d04, 0x4fce,
+                                               {0xb3, 0xe0, 0x47, 0x4a, 0x71, 0x3a, 0x3e, 0x84}};
+constexpr wchar_t kPersistentLocalStorageFolder[] = L"PersistentLocalStorage";
+constexpr uint64_t kPersistentLocalStorageQuotaBytes = 2048ull * 1024 * 1024;
+
+struct XPersistentLocalStorageSpaceInfo {
+    uint64_t availableFreeBytes;
+    uint64_t totalFreeBytes;
+    uint64_t usedBytes;
+    uint64_t totalBytes;
+};
+static_assert(sizeof(XPersistentLocalStorageSpaceInfo) == 32, "four uint64_t, as Microsoft documents it");
+
+// The folder, absolute; empty when the overlay isn't configured.
+std::filesystem::path pls_folder() {
+    const std::filesystem::path overlay = rt::fs::overlay_dir();
+    if (overlay.empty()) return {};
+    std::error_code ec;
+    std::filesystem::path abs = std::filesystem::absolute(overlay, ec);
+    return ec ? std::filesystem::path{} : (abs / kPersistentLocalStorageFolder).lexically_normal();
+}
+
+// The folder as a narrow path, including its NUL in `narrow.size()`; fails on a name the code page can't hold.
+HRESULT pls_narrow_path(const std::filesystem::path& folder, std::string& narrow) {
+    if (folder.empty()) return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
+    const std::wstring& wide = folder.native();
+    BOOL lossy = FALSE;
+    const int n = WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, wide.c_str(), -1, nullptr, 0, nullptr, &lossy);
+    if (n <= 0) return HRESULT_FROM_WIN32(GetLastError());
+    if (lossy) return HRESULT_FROM_WIN32(ERROR_NO_UNICODE_TRANSLATION);
+    narrow.assign(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, wide.c_str(), -1, narrow.data(), n, nullptr, nullptr);
+    return S_OK;
+}
+
+HRESULT pls_ensure_folder(const std::filesystem::path& folder) {
+    if (folder.empty()) return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
+    std::error_code ec;
+    std::filesystem::create_directories(folder, ec);
+    if (ec || !std::filesystem::is_directory(folder, ec)) return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: persistent local storage at %ls, quota %llu MB (default)\n",
+                     folder.c_str(), static_cast<unsigned long long>(kPersistentLocalStorageQuotaBytes >> 20));
+    return S_OK;
+}
+
+// HRESULT XPersistentLocalStorageGetPathSize(size_t* pathSize)
+HRESULT STDMETHODCALLTYPE pls_get_path_size(void*, size_t* path_size) {
+    if (!path_size) return E_INVALIDARG;
+    std::string narrow;
+    const HRESULT hr = pls_narrow_path(pls_folder(), narrow);
+    if (FAILED(hr)) return hr;
+    *path_size = narrow.size();
+    return S_OK;
+}
+
+// HRESULT XPersistentLocalStorageGetPath(size_t pathSize, char* path, size_t* pathUsed); pathUsed is optional.
+HRESULT STDMETHODCALLTYPE pls_get_path(void*, size_t path_size, char* path, size_t* path_used) {
+    if (!path) return E_INVALIDARG;
+    const std::filesystem::path folder = pls_folder();
+    std::string narrow;
+    HRESULT hr = pls_narrow_path(folder, narrow);
+    if (FAILED(hr)) return hr;
+    if (path_size < narrow.size()) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    if (FAILED(hr = pls_ensure_folder(folder))) return hr;
+    std::memcpy(path, narrow.data(), narrow.size());
+    if (path_used) *path_used = narrow.size();
+    return S_OK;
+}
+
+// The bytes of the regular files below the folder; unreadable entries are skipped.
+uint64_t pls_used_bytes(const std::filesystem::path& folder) {
+    uint64_t used = 0;
+    std::error_code ec;
+    for (std::filesystem::recursive_directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec)) {
+        std::error_code fec;
+        if (it->is_regular_file(fec)) {
+            const uintmax_t size = it->file_size(fec);
+            if (!fec) used += size;
+        }
+    }
+    return used;
+}
+
+// HRESULT XPersistentLocalStorageGetSpaceInfo(XPersistentLocalStorageSpaceInfo* info). totalBytes is the quota,
+// usedBytes what the folder holds, totalFreeBytes the free space on its volume (Microsoft: what is left outside the
+// storage's allocation), and availableFreeBytes the smaller of the free quota and that free space.
+HRESULT STDMETHODCALLTYPE pls_get_space_info(void*, XPersistentLocalStorageSpaceInfo* info) {
+    if (!info) return E_INVALIDARG;
+    const std::filesystem::path folder = pls_folder();
+    if (const HRESULT hr = pls_ensure_folder(folder); FAILED(hr)) return hr;
+    ULARGE_INTEGER disk_free{};
+    if (!GetDiskFreeSpaceExW(folder.c_str(), &disk_free, nullptr, nullptr)) return HRESULT_FROM_WIN32(GetLastError());
+    const uint64_t used = pls_used_bytes(folder);
+    const uint64_t quota_free = used < kPersistentLocalStorageQuotaBytes ? kPersistentLocalStorageQuotaBytes - used : 0;
+    *info = {quota_free < disk_free.QuadPart ? quota_free : disk_free.QuadPart, disk_free.QuadPart, used,
+             kPersistentLocalStorageQuotaBytes};
+    return S_OK;
+}
+
+// PromptUserForSpaceAsync(uint64_t requestedBytes, XAsyncBlock*) and PromptUserForSpaceResult(XAsyncBlock*):
+// Microsoft documents both as not implemented on PC and not to be used there, and an offline run has no shell UI to
+// prompt with, so both answer E_NOTIMPL synchronously (nothing is scheduled on the async block).
+HRESULT pls_prompt_not_implemented(const char* which) {
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: %s is not implemented on PC; answering E_NOTIMPL\n", which);
+    return E_NOTIMPL;
+}
+HRESULT STDMETHODCALLTYPE pls_prompt_async(void*, uint64_t, XAsyncBlock*) {
+    return pls_prompt_not_implemented("XPersistentLocalStoragePromptUserForSpaceAsync");
+}
+HRESULT STDMETHODCALLTYPE pls_prompt_result(void*, XAsyncBlock*) {
+    return pls_prompt_not_implemented("XPersistentLocalStoragePromptUserForSpaceResult");
+}
+
+const void* const kPersistentLocalStorageVtable[] = {
+    reinterpret_cast<const void*>(&object_query_interface), reinterpret_cast<const void*>(&object_add_ref),
+    reinterpret_cast<const void*>(&object_release),
+    reinterpret_cast<const void*>(&pls_get_path_size),   // 3 XPersistentLocalStorageGetPathSize
+    reinterpret_cast<const void*>(&pls_get_path),        // 4 XPersistentLocalStorageGetPath
+    reinterpret_cast<const void*>(&pls_get_space_info),  // 5 XPersistentLocalStorageGetSpaceInfo
+    reinterpret_cast<const void*>(&pls_prompt_async),    // 6 XPersistentLocalStoragePromptUserForSpaceAsync
+    reinterpret_cast<const void*>(&pls_prompt_result),   // 7 XPersistentLocalStoragePromptUserForSpaceResult
+};
+static_assert(std::size(kPersistentLocalStorageVtable) == 8, "IUnknown + IXPersistentLocalStorageImpl's 5 methods");
+
+RuntimeObject& persistent_local_storage_object() {
+    // No derived interface ids: v1 only (above).
+    static RuntimeObject object{kPersistentLocalStorageVtable, &kPersistentLocalStorageClass, nullptr};
+    return object;
 }
 
 #define XGR(name) {"xgameruntime.dll", #name, reinterpret_cast<void*>(&name)}

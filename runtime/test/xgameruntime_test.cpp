@@ -12,11 +12,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <system_error>
 
 #include <XAsync.h>
 #include <XAsyncProvider.h>
 #include <XTaskQueue.h>
 
+#include "file_system.h"
 #include "shims.h"
 
 namespace {
@@ -128,6 +133,88 @@ HRESULT CALLBACK provider(XAsyncOp op, const XAsyncProviderData* data) {
         default:
             return S_OK;
     }
+}
+
+// XPersistentLocalStorageImpl, asked for the way a thunk would: the class id (IXPersistentLocalStorageImpl's id) as
+// both ids. The folder lands in a temporary overlay that the test removes afterwards.
+using QueryApiFn = HRESULT(WINAPI*)(const GUID*, REFIID, void**);
+void check_persistent_local_storage(QueryApiFn query) {
+    const GUID pls_cls = {0xf4faf4d4, 0x2d04, 0x4fce, {0xb3, 0xe0, 0x47, 0x4a, 0x71, 0x3a, 0x3e, 0x84}};
+    const GUID pls2 = {0xd29411df, 0x0794, 0x4553, {0x8b, 0x27, 0x95, 0xfc, 0x02, 0xd0, 0xf7, 0x5d}};
+    const GUID pls3 = {0x41a4e10c, 0x5a7e, 0x41d9, {0x8c, 0x37, 0x37, 0xbd, 0xe6, 0x2a, 0x07, 0xd6}};
+    void* refused = reinterpret_cast<void*>(1);
+    check(query(&pls_cls, pls2, &refused) == static_cast<HRESULT>(0x80070032) && refused == nullptr,
+          "XPersistentLocalStorageImpl for IXPersistentLocalStorageImpl2 is still refused (slots unknown)");
+    refused = reinterpret_cast<void*>(1);
+    check(query(&pls_cls, pls3, &refused) == static_cast<HRESULT>(0x80070032) && refused == nullptr,
+          "XPersistentLocalStorageImpl for IXPersistentLocalStorageImpl3 is still refused (slots unknown)");
+    void* p = nullptr;
+    check(query(&pls_cls, pls_cls, &p) == S_OK && p,
+          "QueryApiImpl hands out XPersistentLocalStorageImpl for IXPersistentLocalStorageImpl (v1)");
+    if (!p) return;
+    using Fn = void*;
+    auto slot = [&](int index) { return (*static_cast<Fn* const*>(p))[index]; };
+    using QI = HRESULT(STDMETHODCALLTYPE*)(void*, REFIID, void**);
+    using Release = ULONG(STDMETHODCALLTYPE*)(void*);
+    void* other = reinterpret_cast<void*>(1);
+    check(reinterpret_cast<QI>(slot(0))(p, pls3, &other) == E_NOINTERFACE && other == nullptr,
+          "its QueryInterface refuses IXPersistentLocalStorageImpl3");
+
+    using PathSize = HRESULT(STDMETHODCALLTYPE*)(void*, size_t*);
+    using Path = HRESULT(STDMETHODCALLTYPE*)(void*, size_t, char*, size_t*);
+    using SpaceInfo = HRESULT(STDMETHODCALLTYPE*)(void*, uint64_t*);  // four uint64_t, as documented
+    using PromptAsync = HRESULT(STDMETHODCALLTYPE*)(void*, uint64_t, XAsyncBlock*);
+    using PromptResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*);
+    auto path_size = reinterpret_cast<PathSize>(slot(3));
+    auto get_path = reinterpret_cast<Path>(slot(4));
+    auto space_info = reinterpret_cast<SpaceInfo>(slot(5));
+
+    char path[MAX_PATH * 2] = {};
+    size_t size = 0, used = 0;
+    rt::fs::configure({}, {});
+    check(path_size(p, &size) == HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND) &&
+              get_path(p, sizeof(path), path, &used) == HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND),
+          "without a configured overlay there is no folder to answer with");
+
+    wchar_t temp[MAX_PATH] = {};
+    GetTempPathW(MAX_PATH, temp);
+    const std::filesystem::path overlay =
+        std::filesystem::path(temp) / (L"gta6rt_pls_test_" + std::to_wstring(GetCurrentProcessId()));
+    std::error_code ec;
+    std::filesystem::remove_all(overlay, ec);
+    rt::fs::configure(overlay.parent_path(), overlay);
+
+    check(path_size(p, &size) == S_OK && size > 1, "slot 3 (GetPathSize) answers a size");
+    check(get_path(p, size - 1, path, &used) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+          "slot 4 (GetPath) refuses a buffer one short with ERROR_INSUFFICIENT_BUFFER");
+    check(get_path(p, size, path, &used) == S_OK && used == size && std::strlen(path) + 1 == size,
+          "GetPath fills exactly GetPathSize characters, the NUL included, and pathUsed says so");
+    check(std::filesystem::is_directory(std::filesystem::path(path)) &&
+              std::filesystem::equivalent(std::filesystem::path(path), overlay / L"PersistentLocalStorage", ec),
+          "the folder exists after GetPath, in the overlay's PersistentLocalStorage subfolder");
+    check(get_path(p, sizeof(path), path, nullptr) == S_OK, "pathUsed may be null");
+
+    {
+        const std::string bytes(1000, '\0');
+        std::ofstream(overlay / L"PersistentLocalStorage" / L"probe.bin", std::ios::binary) << bytes;
+    }
+    uint64_t info[4] = {};  // availableFreeBytes, totalFreeBytes, usedBytes, totalBytes
+    check(space_info(p, info) == S_OK, "slot 5 (GetSpaceInfo) succeeds");
+    check(info[3] == 2048ull * 1024 * 1024 && info[2] == 1000 && info[2] <= info[3] &&
+              info[0] <= info[3] - info[2] && info[0] <= info[1],
+          "GetSpaceInfo: 2048 MB quota, used counts the folder's files, available <= min(total - used, free)");
+
+    check(path_size(p, nullptr) == E_INVALIDARG && get_path(p, size, nullptr, &used) == E_INVALIDARG &&
+              space_info(p, nullptr) == E_INVALIDARG,
+          "null out pointers are refused with E_INVALIDARG");
+    XAsyncBlock block{};
+    check(reinterpret_cast<PromptAsync>(slot(6))(p, 1024, &block) == E_NOTIMPL &&
+              reinterpret_cast<PromptResult>(slot(7))(p, &block) == E_NOTIMPL,
+          "slots 6-7 (PromptUserForSpace*) are E_NOTIMPL, as on PC");
+
+    reinterpret_cast<Release>(slot(2))(p);
+    rt::fs::configure({}, {});
+    std::filesystem::remove_all(overlay, ec);
 }
 
 HMODULE g_teardown_rt_mod = nullptr;
@@ -420,6 +507,7 @@ void check_run_time_load() {
               "slots 6-8 (handle tracking, handle check, download bandwidth) answer offline");
         release(sy);
     }
+    check_persistent_local_storage(query);
     check(uninit_api() == S_OK, "UninitializeApiImpl succeeds");
 
     HMODULE k32 = load_w(L"kernel32.dll");
