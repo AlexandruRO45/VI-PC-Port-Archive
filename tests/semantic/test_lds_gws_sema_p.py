@@ -1064,5 +1064,144 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(state.scc, 0)
 
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Commit 7: IEEE 754 boundary extremes, subnormals, and NaN handling for ds_gws_sema_p."""
+
+    def setUp(self) -> None:
+        self.gws = GWSSubsystem()
+        self.interp = ScalarGWSInterpreter()
+
+    def test_positive_zero_float_representation_blocks(self) -> None:
+        # Float +0.0 is bitwise 0x0000_0000: counter is 0 -> blocks
+        pos_zero_bits = struct.unpack(">I", struct.pack(">f", 0.0))[0]
+        self.assertEqual(pos_zero_bits, 0x0000_0000)
+
+        rid = 1
+        self.gws.init_resource(rid, init_val=pos_zero_bits)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=0, gds=True)
+
+        acquired, val, blocked = self.interp.execute(state, inst)
+        self.assertFalse(acquired)
+        self.assertTrue(blocked)
+        self.assertEqual(val, 0)
+
+    def test_negative_zero_float_representation_does_not_block(self) -> None:
+        # Float -0.0 is bitwise 0x8000_0000: as unsigned integer it is 2^31 > 0 -> acquires!
+        neg_zero_bits = struct.unpack(">I", struct.pack(">f", -0.0))[0]
+        self.assertEqual(neg_zero_bits, 0x8000_0000)
+
+        rid = 2
+        self.gws.init_resource(rid, init_val=neg_zero_bits)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=0, gds=True)
+
+        acquired, val, blocked = self.interp.execute(state, inst)
+        self.assertTrue(acquired)
+        self.assertFalse(blocked)
+        self.assertEqual(val, 0x7FFF_FFFF)
+
+    def test_min_subnormal_float_decrements_to_zero(self) -> None:
+        # 0x0000_0001: smallest positive subnormal float (approx 1.4e-45)
+        min_subnormal = 0x0000_0001
+        rid = 3
+        self.gws.init_resource(rid, init_val=min_subnormal)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=0, gds=True)
+
+        acquired, val, blocked = self.interp.execute(state, inst)
+        self.assertTrue(acquired)
+        self.assertEqual(val, 0x0000_0000)
+        self.assertEqual(state.scc, 0)
+
+    def test_max_subnormal_float_preserved_without_ftz_flush(self) -> None:
+        # 0x007F_FFFF: largest positive subnormal float
+        max_subnormal = 0x007F_FFFF
+        rid = 4
+        self.gws.init_resource(rid, init_val=max_subnormal)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=0, gds=True)
+
+        acquired, val, blocked = self.interp.execute(state, inst)
+        self.assertTrue(acquired)
+        # Decrements by 1 without flush-to-zero (FTZ)
+        self.assertEqual(val, 0x007F_FFFE)
+
+    def test_positive_infinity_decrements_to_max_finite_float(self) -> None:
+        # Float +inf is bitwise 0x7F80_0000. Decrementing by 1 yields 0x7F7F_FFFF (FLT_MAX)
+        pos_inf_bits = struct.unpack(">I", struct.pack(">f", float("inf")))[0]
+        self.assertEqual(pos_inf_bits, 0x7F80_0000)
+
+        rid = 5
+        self.gws.init_resource(rid, init_val=pos_inf_bits)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=0, gds=True)
+
+        acquired, val, blocked = self.interp.execute(state, inst)
+        self.assertTrue(acquired)
+        self.assertEqual(val, 0x7F7F_FFFF)
+
+        # Confirm 0x7F7F_FFFF unpacks to a finite float
+        unpacked_float = struct.unpack(">f", struct.pack(">I", val))[0]
+        self.assertTrue(math.isfinite(unpacked_float))
+        self.assertGreater(unpacked_float, 3.4e38)
+
+    def test_negative_infinity_decrements_integer_representation(self) -> None:
+        neg_inf_bits = struct.unpack(">I", struct.pack(">f", float("-inf")))[0]
+        self.assertEqual(neg_inf_bits, 0xFF80_0000)
+
+        rid = 6
+        self.gws.init_resource(rid, init_val=neg_inf_bits)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=0, gds=True)
+
+        acquired, val, blocked = self.interp.execute(state, inst)
+        self.assertTrue(acquired)
+        self.assertEqual(val, 0xFF7F_FFFF)
+
+    def test_quiet_nan_preserved_without_canonicalization(self) -> None:
+        # Float qNaN: 0x7FC0_0000
+        qnan_bits = 0x7FC0_0000
+        rid = 7
+        self.gws.init_resource(rid, init_val=qnan_bits)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=0, gds=True)
+
+        acquired, val, blocked = self.interp.execute(state, inst)
+        self.assertTrue(acquired)
+        # Strict bit-exact arithmetic without NaN canonicalization
+        self.assertEqual(val, 0x7FBF_FFFF)
+
+    def test_signaling_nan_decrements_to_infinity(self) -> None:
+        # Float sNaN: 0x7F80_0001
+        snan_bits = 0x7F80_0001
+        rid = 8
+        self.gws.init_resource(rid, init_val=snan_bits)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=0, gds=True)
+
+        acquired, val, blocked = self.interp.execute(state, inst)
+        self.assertTrue(acquired)
+        self.assertEqual(val, 0x7F80_0000)  # exactly bit pattern of +inf
+
+    def test_m0_populated_with_float_bit_patterns(self) -> None:
+        # If M0 holds a float bit pattern, only low 6 bits are used for resource ID
+        float_patterns = [
+            0x7FC0_0005,  # NaN with low 6 bits = 5
+            0x7F80_000A,  # Inf with low 6 bits = 10
+            0x8000_0010,  # -0.0 with low 6 bits = 16
+        ]
+        for pattern in float_patterns:
+            expected_rid = pattern & GWS_RESOURCE_ID_MASK
+            self.gws.init_resource(expected_rid, init_val=3)
+            state = ScalarThreadState(wave_id=1, m0=pattern, gws=self.gws)
+            inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=0, gds=True)
+
+            acquired, val, blocked = self.interp.execute(state, inst)
+            self.assertTrue(acquired)
+            self.assertEqual(val, 2)
+            self.assertEqual(self.gws.resources[expected_rid].value, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
