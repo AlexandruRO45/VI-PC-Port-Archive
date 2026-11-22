@@ -37,6 +37,7 @@ import lane_masks  # noqa: E402
 import shader_meta as _shader_meta  # noqa: E402
 import wave64_emulate_opt  # noqa: E402
 import wave64_halves  # noqa: E402
+import soft_f64  # noqa: E402
 
 STRUCTURED = True     # False (--dispatch-loop): every shader with branches as one loop around a switch
 # Deeper structured trees are emitted in the flat dispatch-loop form instead. `spirv-val`'s selection/loop
@@ -81,6 +82,13 @@ MESH_COMPUTE = False
 # "push_constant_bytes" is 128. Set 1 is unused otherwise, so set 0's update-after-bind table is unchanged.
 PC_TAIL_UBO = False
 PC_TAIL_SET, PC_TAIL_BINDING = 1, 0
+# --f64-soft: binary64 without shaderFloat64 (MoltenVK: Metal has no double; Intel Arc). The f64 ops keep their values
+# as the two 32-bit words of the register pair and compute with 32-bit integer instructions (tools/soft_f64.py): the
+# lowering adds neither Float64 nor Int64 (Int64 still comes with what needs it without the flag, such as the 64-bit
+# physical buffer addresses of scalar loads). Exact: IEEE-754 binary64 with RDNA2's rounding (MODE.FP_ROUND), f64
+# denormals kept, -0, NaN and the VOP3 modifiers, the words the native double path gives wherever SPIR-V defines them
+# (a clamped NaN is +0 here, where FClamp leaves it undefined; docs/design.md).
+F64_SOFT = False
 # --f16-interp-fallback: *_f16 interps without PerVertexKHR, for devices that have VK_KHR_fragment_shader_barycentric
 # but can't use its per-vertex inputs (MoltenVK: SPIRV-Cross has no MSL form of PerVertexKHR). Every VS and mesh
 # `exp paramN` also exports the channel's two f16 halves decoded to f32, low halves at f16_half_location(N, 0) and high
@@ -254,6 +262,7 @@ class Gen:
         self.round_mode = False     # the program writes MODE.FP_ROUND[3:2] (f16/f64 rounding): kept in %mode_r16
         self.uses_fhalf = False        # %fhalf_g (0.5) constant
         self.uses_f64 = False
+        self.soft64 = None          # --f64-soft: the soft_f64.SoftF64 that emits this module's binary64 helpers
         self.uses_fma_khr = False      # an OpFmaKHR was emitted: capability FMAKHR + extension SPV_KHR_fma
         self.uses_clock = set()
         self.uses_bvh = False
@@ -4949,6 +4958,70 @@ class Gen:
         if any(m == "clamp" or m.startswith(("mul:", "div:")) for m in mods):
             v = self.flush_f32(self.clamp_mods(v, mods))
         return v
+    def f64_words(self, op, sv):
+        """A binary64 source as (lo, hi) word ids, with abs then neg applied to the sign bit (VOP3 input modifiers
+        are sign-bit operations on the hardware, as for f32): the --f64-soft ops and the integer v_frexp_*_f64."""
+        if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
+            lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
+        elif sv.get("f64_literal"):     # a 32-bit literal is the upper word (as the native path reads it)
+            lo, hi = self.cu(0), self.cu(sv["v"] & 0xFFFFFFFF)
+        elif sv["k"] in ("imm", "fimm"):
+            bits = (struct.unpack("<Q", struct.pack("<d", sv["v"]))[0]
+                    if sv["k"] == "fimm" else sv["v"] & 0xFFFFFFFFFFFFFFFF)
+            lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
+        else:
+            raise Unsupported(op + " operand")
+        if sv.get("abs"):
+            t = self.tmp()
+            self.emit(f"{t} = OpBitwiseAnd %uint {hi} {self.cu(0x7FFFFFFF)}")
+            hi = t
+        if sv.get("neg"):
+            t = self.tmp()
+            self.emit(f"{t} = OpBitwiseXor %uint {hi} {self.cu(0x80000000)}")
+            hi = t
+        return lo, hi
+
+    def f64_soft_op(self, op, a, mods):
+        """--f64-soft forms of the f64 ops (the native forms are in Gen.op): the same order of rounding, output
+        modifiers and clamp, on (lo, hi) word pairs through tools/soft_f64.py."""
+        if self.soft64 is None:
+            self.soft64 = soft_f64.SoftF64(self)
+        sf = self.soft64
+        if op == "v_add_f64":
+            x, y = self.f64_words(op, a[1]), self.f64_words(op, a[2])
+            mode = self.cu(0)
+            if self.round_mode:
+                mode = self.tmp()
+                self.emit(f"{mode} = OpLoad %uint %mode_r16")
+            r = self.f64_soft_mods(sf.add_f64(x, y, mode), mods)
+            d = a[0]
+            if d["k"] != "vgpr":
+                raise Unsupported(op + " destination")
+            self.dst({"k": "vgpr", "r": d["r"], "n": 1}, r[0])
+            self.dst({"k": "vgpr", "r": d["r"] + 1, "n": 1}, r[1])
+        else:
+            # v_cvt_f32_f64: the f32 output modifiers in integer code too (omod rounded to nearest even with f32
+            # denormals kept, then clamp with +0 for NaN and -0), not OpFMul and GLSL FClamp, whose NaN result is
+            # undefined and whose denormal handling is the driver's.
+            bits = sf.to_f32(self.f64_words(op, a[1]))
+            for m in mods:
+                if m in ("mul:2", "mul:4", "div:2"):
+                    bits = sf.scale_f32(bits, {"mul:2": 1, "mul:4": 2, "div:2": -1}[m])
+            if "clamp" in mods:
+                bits = sf.clamp01_f32(bits)
+            self.dst(a[0], bits)
+
+    def f64_soft_mods(self, r, mods):
+        """--f64-soft clamp_mods_f64 on a (lo, hi) pair: omod scales first (rounded to nearest even, as the native
+        OpFMul), then the clamp bit."""
+        sf = self.soft64 or soft_f64.SoftF64(self)
+        self.soft64 = sf
+        for m in mods:
+            if m in ("mul:2", "mul:4", "div:2"):
+                r = sf.scale_f64(r, {"mul:2": 1, "mul:4": 2, "div:2": -1}[m])
+        if "clamp" in mods:
+            r = sf.clamp01(r)
+        return r
 
     def clamp_mods_f64(self, v, mods):
         """clamp_mods for a %double result (VOP3 f64 arithmetic): omod scales first, then clamp to [0, 1]. As
@@ -6218,6 +6291,10 @@ class Gen:
                 word = self.tmp()
                 self.emit(f"{word} = OpCompositeExtract %uint {words} {index}")
                 self.dst({"k": "vgpr", "r": dst["r"] + index, "n": 1}, word)
+        elif op in ("v_add_f64", "v_cvt_f32_f64") and F64_SOFT:
+            self.f64_soft_op(op, a, mods)
+        elif op in ("v_rcp_f64", "v_rsq_f64", "v_sqrt_f64") and F64_SOFT:
+            raise Unsupported(f"--f64-soft: {op} has no soft form yet (it needs Float64)")
         elif op in ("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64"):
             # f64: register pairs as doubles (shaderFloat64). neg/abs modifiers apply to the double.
             def f64(sv):
@@ -8976,23 +9053,9 @@ class Gen:
             # - Non-zero subnormals (e == 0, frac != 0): normalized to mant in [0.5, 1) with sign, exp = msb - 1073
             #   (-1073..-1022), matching v_frexp_mant_f16 / v_frexp_exp_i16_f16.
             # - Signed zero: +-0 / exp 0. Infinities and NaNs: unchanged / exp 0.
-            sv = a[1]
-            if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
-                lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
-            elif sv["k"] in ("imm", "fimm"):
-                bits = (struct.unpack("<Q", struct.pack("<d", float(sv["v"])))[0]
-                        if sv["k"] == "fimm" else sv["v"] & 0xFFFFFFFFFFFFFFFF)
-                lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
-            else:
-                raise Unsupported(op + " operand")
-            if sv.get("abs"):
-                t = self.tmp()
-                self.emit(f"{t} = OpBitwiseAnd %uint {hi} {self.cu(0x7FFFFFFF)}")
-                hi = t
-            if sv.get("neg"):
-                t = self.tmp()
-                self.emit(f"{t} = OpBitwiseXor %uint {hi} {self.cu(0x80000000)}")
-                hi = t
+            # The source words as v_add_f64 reads them: a 32-bit literal is bits 63:32 with bits 31:0 zero (in
+            # `v_frexp_mant_f64_e64 v[0:1], 0x3ff80000` the source is 1.5), an inline constant its binary64 value.
+            lo, hi = self.f64_words(op, a[1])
             e, em1, isnorm, is_e0, sgn = (self.tmp() for _ in range(5))
             self.emit(f"{e} = OpBitFieldUExtract %uint {hi} {self.cu(20)} {self.cu(11)}")
             self.emit(f"{em1} = OpISub %uint {e} {self.cu(1)}")
@@ -9069,7 +9132,9 @@ class Gen:
                 self.emit(f"{other_lo} = OpSelect %uint {is_sub} {sub_lo} {lo}")
                 self.emit(f"{r_hi} = OpSelect %uint {isnorm} {m_hi} {other_hi}")
                 self.emit(f"{r_lo} = OpSelect %uint {isnorm} {lo} {other_lo}")
-                if any(m in ("clamp", "mul:2", "mul:4", "div:2") for m in mods):
+                if any(m in ("clamp", "mul:2", "mul:4", "div:2") for m in mods) and F64_SOFT:
+                    r_lo, r_hi = self.f64_soft_mods((r_lo, r_hi), mods)
+                elif any(m in ("clamp", "mul:2", "mul:4", "div:2") for m in mods):
                     self.uses_f64 = True
                     v2, dv, mv2 = self.tmp(), self.tmp(), self.tmp()
                     self.emit(f"{v2} = OpCompositeConstruct %v2uint_d {r_lo} {r_hi}")
@@ -11963,6 +12028,8 @@ def assemble(gen):
     if gen.uses_quad:
         caps += [c for c in ("GroupNonUniform", "GroupNonUniformQuad") if c not in caps]
     if gen.uses_f64:
+        if F64_SOFT:   # an f64 op without a soft form (tools/soft_f64.py) would still need shaderFloat64
+            raise Unsupported("--f64-soft: an f64 op here has no soft form yet (it needs Float64)")
         caps.append("Float64")
     if gen.uses_fma_khr:
         caps.append("FMAKHR")
@@ -12221,8 +12288,10 @@ def assemble(gen):
         types += ["%fhalf_g = OpConstant %float 0.5"]
     if gen.uses_f64:
         types += ["%double = OpTypeFloat 64"]
-    if gen.uses_f64 or gen.uses_clock:
+    if gen.uses_f64 or gen.uses_clock or gen.soft64 is not None:
         types += ["%v2uint_d = OpTypeVector %uint 2"]
+    if gen.soft64 is not None:
+        types += gen.soft64.helpers()[0]
     if gen.uses_ballot:
         types += ["%v4uint_bal = OpTypeVector %uint 4"]
     if gen.uses_fmt_size:
@@ -12548,6 +12617,8 @@ def assemble(gen):
         helpers.extend(function)
     for function in gen.x_round_fns.values():
         helpers.extend(function)
+    if gen.soft64 is not None:
+        helpers.extend(gen.soft64.helpers()[1])
     tree = (cfg_structure.structure(gen.succ) if gen.blocks and STRUCTURED and not gen.emulate and not gen.bar_rounds
             else None)
     if tree is not None:
@@ -14949,6 +15020,10 @@ def main():
                     help="16-bit interpolation without PerVertexKHR inputs, for devices that can't compile them "
                          "(MoltenVK): VS and mesh params also export their f16 halves decoded to f32, which the PS "
                          "reads as ordinary interpolated inputs (metadata: f16_halves)")
+    ap.add_argument("--f64-soft", action="store_true",
+                    help="binary64 ops as 32-bit integer arithmetic on register pairs (tools/soft_f64.py), exact, for "
+                         "devices without shaderFloat64 (MoltenVK, Intel Arc): adds neither Float64 nor Int64 to the "
+                         "output")
     ap.add_argument("--max-shared-memory", type=int, default=MAX_SHARED_BYTES, metavar="BYTES",
                     help="cap on a compute shader's workgroup memory, its LDS plus what --wave64-emulate adds "
                          "(default %(default)s, the 64 KiB hard cap): over it the LDS array shrinks to the program's "
@@ -14975,7 +15050,7 @@ def main():
     if ancestor and not os.path.isdir(ancestor):
         ap.error(f"cannot create {a.out}: {ancestor} is a file, not a folder")
     MAX_SHARED_BYTES = a.max_shared_memory
-    global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES
+    global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES, F64_SOFT
     global PC_TAIL_UBO
     PC_TAIL_UBO = a.pc_tail_ubo
     FMA_KHR = a.fma == "khr"
@@ -14988,6 +15063,7 @@ def main():
     TEXEL_OFFSET_FALLBACK = a.texel_offset_fallback
     MESH_COMPUTE = a.mesh_compute
     F16_HALVES = a.f16_interp_fallback
+    F64_SOFT = a.f64_soft
     if a.merge:
         try:
             merged = merge_shard_parts(a.out)

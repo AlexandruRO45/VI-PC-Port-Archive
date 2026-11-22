@@ -335,6 +335,18 @@ MoltenVK can't convert to Metal ("PerVertexKHR decoration is not supported in MS
 on or off; `build.py` (for `check.py`) translates with the flag only when that variable is `1`. `ms_f16_pack` also runs
 on a Mac with `LEONIDA_MESH_COMPUTE=1 LEONIDA_W64_EMULATE=1`.
 
+## GPUs without shaderFloat64 (Macs, Intel Arc)
+
+`ps_f64_mods`, `ps_f64_round`, `ps_f64_ties`, `ps_f64_cvt`, `ps_f64_cvt_mods` and `ps_f64_frexp_lit` use binary64 (`v_add_f64`,
+`v_cvt_f32_f64`, the output modifiers of `v_frexp_mant_f64`). Metal has no double type, so MoltenVK (and KosmicKrisp)
+report no `shaderFloat64`, and a module that declares `Float64` can't run there. Where
+`tools/vk_subgroup_info.py --harness` reports `float64` false for the GPU the test programs pick, `run_gpu_tests.py`
+and `build.py` (for `check.py`) translate with `--f64-soft` by themselves: the f64 ops become exact 32-bit integer
+arithmetic on the register pairs (`docs/design.md`, "binary64 without `shaderFloat64`"), and the tests run instead of
+skipping. `LEONIDA_F64_SOFT=1` or `0` forces it on or off (`1` on a GPU with doubles checks the soft path against the
+same expected words). `make_game.py` makes the same choice for the GPU the runtime would use (`--harness` left out:
+the runtime's rule also asks for Vulkan 1.3 and its features, so on a machine with two GPUs the two can differ).
+
 ## GPUs without VK_KHR_maintenance8 (NVIDIA Pascal and older)
 
 `ps_texoff` and `ps_texoff_implicit` sample with a run-time texel offset, which needs `VK_KHR_maintenance8`;

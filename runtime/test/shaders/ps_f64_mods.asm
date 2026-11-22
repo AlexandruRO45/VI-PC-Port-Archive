@@ -2,7 +2,7 @@
 ; a = 0.75, b = 0.5 as doubles (low word first); each export is the high word of one double result (low words are 0).
 ; mul:2 (a+b)*2 = 2.5, clamp min(a+b, 1) = 1.0, div:2 clamp (a+b)/2 = 0.625 (clamp before scaling would give 0.5),
 ; mul:4 (a-b)*4 = 1.0. Without the modifiers every word would be 0x3ff40000 (1.25) or 0x3fd00000 (0.25).
-; Needs shaderFloat64; vk_harness exits 77 (SKIP) on a device without it.
+; Needs shaderFloat64, or the translator's --f64-soft (integer binary64, chosen where the device lacks it, LEONIDA_F64_SOFT).
 ; Expected mrt0 bits: 0x40040000, 0x3ff00000, 0x3fe40000, 0x3ff00000
 v_mov_b32 v0, 0
 v_mov_b32 v1, 0x3fe80000

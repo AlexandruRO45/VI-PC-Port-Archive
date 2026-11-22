@@ -158,7 +158,7 @@ class RecordedFlagsTest(unittest.TestCase):
 class MainWiringTest(unittest.TestCase):
     """main() parses the fallback flags and hands the same tuple to preflight() and shaders()."""
 
-    def run_main(self, *extra_argv, per_vertex=None, max_push_constants=None):
+    def run_main(self, *extra_argv, per_vertex=None, max_push_constants=None, gpu_info=None, env=None):
         argv = ["make_game.py", "--stages", "shaders", *extra_argv]
         with mock.patch.object(sys, "argv", argv), \
                 mock.patch("make_game.below_normal"), \
@@ -167,6 +167,8 @@ class MainWiringTest(unittest.TestCase):
                 mock.patch("make_game.wave64_settings", return_value=(False, True)), \
                 mock.patch("make_game.runtime_gpu_per_vertex", return_value=per_vertex), \
                 mock.patch("make_game.runtime_gpu_max_push_constants", return_value=max_push_constants), \
+                mock.patch("make_game.runtime_gpu_info", return_value=gpu_info or {}), \
+                mock.patch.dict(os.environ, env or {}), \
                 mock.patch("make_game.preflight") as preflight, \
                 mock.patch("make_game.shaders") as shaders, \
                 mock.patch("make_game.log"):
@@ -212,6 +214,20 @@ class MainWiringTest(unittest.TestCase):
                           ({"max_push_constants_size": "128"}, None)):
             with self.subTest(raw=raw), mock.patch("make_game.runtime_gpu_info", return_value=raw):
                 self.assertEqual(make_game.runtime_gpu_max_push_constants(), want)
+
+    def test_f64_soft_follows_the_device(self):
+        """On by itself where vk_subgroup_info reports no shaderFloat64 (MoltenVK), not where the GPU has it or
+        the answer is unknown; LEONIDA_F64_SOFT=1/0 overrides the device, and the flag asks for it everywhere."""
+        no_env = {"LEONIDA_F64_SOFT": ""}
+        self.assertEqual(self.run_main(gpu_info={"float64": False}, env=no_env), (("--f64-soft",),) * 2)
+        self.assertEqual(self.run_main(gpu_info={"float64": True}, env=no_env), ((), ()))
+        self.assertEqual(self.run_main(gpu_info={}, env=no_env), ((), ()))
+        self.assertEqual(self.run_main(gpu_info={"float64": False}, env={"LEONIDA_F64_SOFT": "0"}), ((), ()))
+        self.assertEqual(self.run_main(gpu_info={"float64": True}, env={"LEONIDA_F64_SOFT": "1"}), (("--f64-soft",),) * 2)
+        self.assertEqual(self.run_main("--f64-soft", gpu_info={"float64": True}, env=no_env), (("--f64-soft",),) * 2)
+        # the command-line flag wins over LEONIDA_F64_SOFT=0
+        self.assertEqual(self.run_main("--f64-soft", gpu_info={"float64": True}, env={"LEONIDA_F64_SOFT": "0"}),
+                         (("--f64-soft",),) * 2)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,10 @@ inputs, and check.py reports it as SKIP.
 With LEONIDA_PC_TAIL_UBO=1, every shader is translated with --pc-tail-ubo (s0..s31 in 128 push-constant bytes, the
 heap base and code base in a uniform block at set 1), for devices whose maxPushConstantsSize is 128; set it for
 check.py too, whose test programs then bind that block (runtime/test/vk_pc_tail.h).
+With LEONIDA_F64_SOFT=1, the f64 ops are translated with --f64-soft (32-bit integer arithmetic, no Float64), so
+the ps_f64_* tests run on a device without shaderFloat64; LEONIDA_F64_SOFT=0 keeps native doubles. Unset, it is on
+where the device the test programs pick has no shaderFloat64 (tools/vk_subgroup_info.py --harness reports float64
+false: MoltenVK, KosmicKrisp, Intel Arc), as in scripts/run_gpu_tests.py and make_game.py.
 """
 import json
 import os
@@ -173,7 +177,21 @@ def translate_tests(work, names):
     # 128-byte push constants: the tail in a set-1 uniform block. The values the test programs accept (vk_pc_tail.h).
     if (os.environ.get("LEONIDA_PC_TAIL_UBO") or "").strip().lower() in ("1", "true", "yes", "on"):
         cmd.append("--pc-tail-ubo")
+    if f64_soft():   # binary64 as 32-bit integer arithmetic, no shaderFloat64 (MoltenVK)
+        cmd.append("--f64-soft")
     return subprocess.run(cmd).returncode
+
+
+def f64_soft() -> bool:
+    """LEONIDA_F64_SOFT=1 (or 0) decides; unset, --f64-soft is on where tools/vk_subgroup_info.py --harness reports
+    float64 false for the device the test programs pick (off when it can't tell)."""
+    v = (os.environ.get("LEONIDA_F64_SOFT") or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    import vk_subgroup_info
+    return vk_subgroup_info.harness_info().get("float64") is False
 
 
 def main():

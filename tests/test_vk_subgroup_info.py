@@ -70,6 +70,7 @@ class FakeDevice:
     )
     fragment_shader_barycentric: bool = True
     max_push_constants_size: int = 256
+    shader_float64: bool = True
     driver_id: int = 1      # VK_DRIVER_ID_AMD_PROPRIETARY
     vendor_id: int = 0
     device_id: int = 0
@@ -250,6 +251,8 @@ class FakeVulkan:
                 ctypes.c_uint32.from_address(node_addr + 16).value = int(dev.synchronization2)
             elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR:
                 ctypes.c_uint32.from_address(node_addr + 16).value = int(dev.fragment_shader_barycentric)
+            elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2:
+                ctypes.c_uint32.from_address(node_addr + vk_info.F2_SHADER_FLOAT64).value = int(dev.shader_float64)
         expected = {
             vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
             vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
@@ -798,6 +801,7 @@ class QueryTest(unittest.TestCase):
                     "native64": want_native64,
                     "per_vertex_inputs": True,
                     "max_push_constants_size": 256,
+                    "float64": True,
                     "vendor_id": 0,
                     "device_id": 0,
                     "driver_id": 1,
@@ -819,6 +823,63 @@ class QueryTest(unittest.TestCase):
             with self.subTest(case=label):
                 res, _vk = self._run_query(FakeDevice(fragment_shader_barycentric=bary, driver_id=driver))
                 self.assertIs(res["per_vertex_inputs"], want)
+
+    def test_float64(self):
+        """shaderFloat64 from VkPhysicalDeviceFeatures (member 39); false selects --f64-soft (MoltenVK, Intel Arc)."""
+        self.assertEqual(vk_info.F2_SHADER_FLOAT64, 16 + 4 * 39)
+        for want in (True, False):
+            with self.subTest(float64=want):
+                res, _vk = self._run_query(FakeDevice(shader_float64=want))
+                self.assertIs(res["float64"], want)
+
+    def test_harness_mode_picks_as_vk_device_pick(self):
+        """require_runtime_features=False (--harness) is vk_device_pick.h's rule: every enumerated device, the
+        LEONIDA_VK_DEVICE filter and the rank, nothing else. On a two-GPU machine whose discrete GPU lacks a feature
+        the runtime needs, the runtime takes the iGPU while the test programs draw on the discrete GPU, and the
+        translator flags for the tests must follow the latter (shaderFloat64 here)."""
+        igpu = FakeDevice(name="iGPU", device_type=1, shader_float64=False)
+        no_bda = FakeDevice(name="dGPU without BDA", buffer_device_address=False)
+        old_api = FakeDevice(name="dGPU 1.2", api_version=(1 << 22) | (2 << 12))
+        compute_only = FakeDevice(name="dGPU compute only", queue_flags=(0x2,))
+        dozen = FakeDevice(name="Microsoft Direct3D12 (iGPU)", vendor_id=vk_info.MICROSOFT_VENDOR_ID)
+        cpu = FakeDevice(name="llvmpipe", device_type=4)
+        cases = [((igpu, no_bda), "iGPU", "dGPU without BDA"),
+                 ((old_api, igpu), "iGPU", "dGPU 1.2"),
+                 ((igpu, compute_only), "iGPU", "dGPU compute only"),
+                 ((dozen, igpu), "iGPU", "iGPU"),
+                 ((cpu, igpu), "iGPU", "iGPU"),
+                 ((no_bda, old_api), None, "dGPU without BDA")]       # ties keep the first, as pick_device does
+        for devs, runtime_pick, harness_pick in cases:
+            with self.subTest(devices=[d.name for d in devs]):
+                vk = FakeVulkan(devices=devs)
+                with mock.patch.object(vk_info, "load_vulkan", return_value=vk):
+                    res = vk_info.query(require_runtime_features=False)
+                    self.assertEqual(res["device"], harness_pick)
+                    self.assertEqual(vk.destroyed_instances, [FakeVulkan.INSTANCE_HANDLE])
+                    if runtime_pick is None:
+                        with self.assertRaises(RuntimeError):
+                            vk_info.query()
+                    else:
+                        self.assertEqual(vk_info.query()["device"], runtime_pick)
+        res, _ = self._run_query(igpu, no_bda)
+        self.assertIs(res["float64"], False)                     # make_game.py's answer: the runtime's iGPU
+        vk = FakeVulkan(devices=(igpu, no_bda))
+        with mock.patch.object(vk_info, "load_vulkan", return_value=vk):
+            self.assertIs(vk_info.query(require_runtime_features=False)["float64"], True)
+
+    def test_harness_mode_device_filter(self):
+        devs = (FakeDevice(name="AMD Radeon 780M", device_type=1),
+                FakeDevice(name="NVIDIA RTX", dynamic_rendering=False))
+        for filt, want in (("radeon", "AMD Radeon 780M"), ("rtx", "NVIDIA RTX")):
+            with self.subTest(filter=filt), mock.patch.dict(vk_info.os.environ, {"LEONIDA_VK_DEVICE": filt}):
+                vk = FakeVulkan(devices=devs)
+                with mock.patch.object(vk_info, "load_vulkan", return_value=vk):
+                    self.assertEqual(vk_info.query(require_runtime_features=False)["device"], want)
+        with mock.patch.dict(vk_info.os.environ, {"LEONIDA_VK_DEVICE": "intel"}):
+            vk = FakeVulkan(devices=devs)
+            with mock.patch.object(vk_info, "load_vulkan", return_value=vk), \
+                    self.assertRaisesRegex(RuntimeError, "LEONIDA_VK_DEVICE=intel: no Vulkan physical device matches"):
+                vk_info.query(require_runtime_features=False)
 
     def test_rdna2_amd_windows(self):
         """#857: RDNA2 by PCI device ID, and only under AMD's proprietary driver (RADV takes the same modules)."""
@@ -959,6 +1020,40 @@ class MainCliTest(unittest.TestCase):
         self.assertEqual(code2, 1)
         self.assertEqual(err2.getvalue(), "")
         self.assertEqual(json.loads(out2.getvalue().strip()), {"error": "OSError: loader broken"})
+
+
+    def test_main_harness_flag(self):
+        devs = (FakeDevice(name="iGPU", device_type=1), FakeDevice(name="dGPU", synchronization2=False))
+        for argv, want in (([], "iGPU"), (["--harness"], "dGPU")):
+            with self.subTest(argv=argv):
+                out = io.StringIO()
+                with mock.patch.object(vk_info, "load_vulkan", return_value=FakeVulkan(devices=devs)), \
+                        contextlib.redirect_stdout(out):
+                    self.assertEqual(vk_info.main(argv), 0)
+                self.assertEqual(json.loads(out.getvalue())["device"], want)
+
+
+class HarnessInfoTest(unittest.TestCase):
+    """harness_info(): the --harness answer from a child process, {} when it can't tell."""
+
+    def run_with(self, **kw):
+        with mock.patch.object(vk_info.subprocess, "run", **kw) as run:
+            return vk_info.harness_info(), run
+
+    def test_answer(self):
+        done = mock.Mock(stdout='noise\n{"device": "dGPU", "float64": false}\n')
+        info, run = self.run_with(return_value=done)
+        self.assertEqual(info, {"device": "dGPU", "float64": False})
+        cmd = run.call_args[0][0]
+        self.assertEqual(cmd[1:2] + cmd[-1:], ["-I", "--harness"])
+        self.assertEqual(os.path.basename(cmd[2]), "vk_subgroup_info.py")
+
+    def test_unknown(self):
+        for kw in ({"return_value": mock.Mock(stdout='{"error": "RuntimeError: no Vulkan device"}\n')},
+                   {"return_value": mock.Mock(stdout="")}, {"return_value": mock.Mock(stdout="not json\n")},
+                   {"side_effect": vk_info.subprocess.TimeoutExpired("x", 60)}, {"side_effect": OSError("no python")}):
+            with self.subTest(kw=kw):
+                self.assertEqual(self.run_with(**kw)[0], {})
 
 
 if __name__ == "__main__":

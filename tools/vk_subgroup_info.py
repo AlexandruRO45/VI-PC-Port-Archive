@@ -1,6 +1,7 @@
 """Ask the Vulkan driver whether this PC's GPU can run 64-wide compute and mesh subgroups.
 
     python -I tools/vk_subgroup_info.py          # prints one JSON line, exit 0 if a device answered, 1 if not
+    python -I tools/vk_subgroup_info.py --harness   # the same, for the device the test harnesses pick
 
 make_game.py uses it to choose between native wave64 translation and --wave64-emulate. It talks to the system's
 Vulkan implementation through ctypes (standard library only), so it works before the runtime stage has built anything.
@@ -34,10 +35,20 @@ false, the shaders are translated with --f16-interp-fallback.
 max_push_constants_size is VkPhysicalDeviceProperties.limits.maxPushConstantsSize in bytes. The default shader
 contract uses 144 bytes (152 with --mesh-compute); where a device reports less (e.g. 128 on AMD's Windows driver for
 RDNA2 iGPUs and some Intel Arc drivers), make_game.py translates with --pc-tail-ubo.
+
+--harness answers for the device the GPU test programs draw on instead (runtime/test/vk_device_pick.h): every
+enumerated device, LEONIDA_VK_DEVICE's filter, then the same rank, with no Vulkan 1.3, feature or queue requirement.
+On a machine with two GPUs the runtime's rule can skip the one the harnesses take (one without bufferDeviceAddress,
+say), so scripts/run_gpu_tests.py and runtime/test/shaders/build.py choose their translator flags with --harness
+(harness_info()), while make_game.py keeps the runtime's rule.
+
+float64 is the device's shaderFloat64 feature. Where it is false (MoltenVK: Metal has no double type; Intel Arc), the
+shaders are translated with --f64-soft, which computes binary64 with 32-bit integer instructions.
 """
 import ctypes
 import json
 import os
+import subprocess
 import sys
 
 VK_STRUCTURE_TYPE_APPLICATION_INFO = 0
@@ -85,6 +96,7 @@ F12_BUFFER_DEVICE_ADDRESS = 16 + 4 * 38
 F13_SUBGROUP_SIZE_CONTROL = 16 + 4 * 7
 F13_SYNCHRONIZATION2 = 16 + 4 * 9
 F13_DYNAMIC_RENDERING = 16 + 4 * 12
+F2_SHADER_FLOAT64 = 16 + 4 * 39   # VkPhysicalDeviceFeatures::shaderFloat64, after sType/pNext of the Features2 block
 PROPS_DEVICE_TYPE = 16      # offsets in VkPhysicalDeviceProperties
 PROPS_VENDOR_ID = 8
 PROPS_DEVICE_ID = 12
@@ -204,8 +216,10 @@ def device_rank(device_type: int, vendor_id: int) -> int:
     return (0 if vendor_id == MICROSOFT_VENDOR_ID else 10) + type_rank
 
 
-def query() -> dict:
-    """The answer for the device the runtime would pick; raises RuntimeError with the reason when there is none."""
+def query(require_runtime_features: bool = True) -> dict:
+    """The answer for the device the runtime would pick; raises RuntimeError with the reason when there is none.
+    With require_runtime_features=False, for the device vk_device_pick.h picks (--harness): no Vulkan 1.3, feature
+    or graphics-queue filter, only LEONIDA_VK_DEVICE and the rank."""
     if sys.maxsize <= 2**32:
         # the struct sizes below are the 64-bit ones, and 32-bit Windows Vulkan is stdcall, not CDLL's cdecl
         raise RuntimeError("needs a 64-bit Python")
@@ -246,10 +260,13 @@ def query() -> dict:
             raw = bytes(props)[16:]
             dev_name = raw[PROPS_DEVICE_NAME:PROPS_DEVICE_NAME + 256].split(b"\0")[0].decode("utf-8", "replace")
             version = int.from_bytes(raw[PROPS_API_VERSION:PROPS_API_VERSION + 4], "little")
-            if version < VK_API_VERSION_1_2 or (wanted and wanted not in dev_name.lower()):
+            if wanted and wanted not in dev_name.lower():
+                continue
+            if require_runtime_features and version < VK_API_VERSION_1_2:
                 continue
             core13 = version >= VK_API_VERSION_1_3
-            if not core13 and not VULKAN_12_REQUIRED_EXTENSIONS.issubset(device_extensions(vk, d)):
+            if (require_runtime_features and not core13
+                    and not VULKAN_12_REQUIRED_EXTENSIONS.issubset(device_extensions(vk, d))):
                 continue
             f13 = block(F13_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES)
             f12 = block(F12_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)
@@ -268,7 +285,7 @@ def query() -> dict:
             vk.vkGetPhysicalDeviceFeatures2(d, f2)
             dynamic_rendering = u32(f13, F13_DYNAMIC_RENDERING) if core13 else u32(rendering, 16)
             synchronization2 = u32(f13, F13_SYNCHRONIZATION2) if core13 else u32(sync2, 16)
-            if not (dynamic_rendering and synchronization2
+            if require_runtime_features and not (dynamic_rendering and synchronization2
                     and u32(f12, F12_TIMELINE_SEMAPHORE) and u32(f12, F12_SEPARATE_DEPTH_STENCIL_LAYOUTS)
                     and u32(f12, F12_BUFFER_DEVICE_ADDRESS)):
                 continue
@@ -276,7 +293,8 @@ def query() -> dict:
             vk.vkGetPhysicalDeviceQueueFamilyProperties(d, ctypes.byref(fam), None)
             fams = ctypes.create_string_buffer(QUEUE_FAMILY_SIZE * max(fam.value, 1))
             vk.vkGetPhysicalDeviceQueueFamilyProperties(d, ctypes.byref(fam), fams)
-            if not any(u32(fams, QUEUE_FAMILY_SIZE * i) & VK_QUEUE_GRAPHICS_BIT for i in range(fam.value)):
+            if require_runtime_features and not any(
+                    u32(fams, QUEUE_FAMILY_SIZE * i) & VK_QUEUE_GRAPHICS_BIT for i in range(fam.value)):
                 continue
             dtype = int.from_bytes(raw[PROPS_DEVICE_TYPE:PROPS_DEVICE_TYPE + 4], "little")
             vendor_id = int.from_bytes(raw[PROPS_VENDOR_ID:PROPS_VENDOR_ID + 4], "little")
@@ -290,8 +308,12 @@ def query() -> dict:
                           bool(u32(bary, 16)) and u32(drv, 16) != VK_DRIVER_ID_MOLTENVK,
                           int.from_bytes(raw[PROPS_MAX_PUSH_CONSTANTS_SIZE:PROPS_MAX_PUSH_CONSTANTS_SIZE + 4], "little"),
                           int.from_bytes(raw[PROPS_VENDOR_ID:PROPS_VENDOR_ID + 4], "little"),
-                          int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16))
+                          int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16),
+                          bool(u32(f2, F2_SHADER_FLOAT64)))
         if chosen is None:
+            if not require_runtime_features:
+                raise RuntimeError(f"LEONIDA_VK_DEVICE={device_filter}: no Vulkan physical device matches"
+                                   if device_filter else "no Vulkan physical device found")
             if device_filter:
                 raise RuntimeError(
                     f"LEONIDA_VK_DEVICE={device_filter}: no Vulkan 1.3 GPU with the features and graphics queue "
@@ -299,7 +321,7 @@ def query() -> dict:
                 )
             raise RuntimeError("no Vulkan 1.3 GPU with the features and graphics queue the runtime needs")
         (name, subgroup_size, supported_stages, lo, hi, required_stages, sgc, per_vertex,
-         max_push_constants_size, vendor, device, driver) = chosen
+         max_push_constants_size, vendor, device, driver, float64) = chosen
         compute_required = bool(required_stages & VK_SHADER_STAGE_COMPUTE_BIT)
         mesh_required = bool(required_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
         compute_supported = bool(supported_stages & VK_SHADER_STAGE_COMPUTE_BIT)
@@ -322,6 +344,7 @@ def query() -> dict:
             "native64": compute64 and mesh64,
             "per_vertex_inputs": per_vertex,
             "max_push_constants_size": max_push_constants_size,
+            "float64": float64,
             "vendor_id": vendor,
             "device_id": device,
             "driver_id": driver,
@@ -333,9 +356,22 @@ def query() -> dict:
         vk.vkDestroyInstance(inst, None)
 
 
-def main() -> int:
+def harness_info(timeout: float = 60) -> dict:
+    """query(require_runtime_features=False) in a child process (a driver that crashes or hangs takes only the
+    child), for the device the test harnesses draw on; {} when it can't tell."""
     try:
-        print(json.dumps(query()))
+        r = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "--harness"],
+                           capture_output=True, text=True, timeout=timeout)
+        answer = json.loads(r.stdout.strip().splitlines()[-1])
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return {}
+    return answer if isinstance(answer, dict) and "error" not in answer else {}
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    try:
+        print(json.dumps(query(require_runtime_features="--harness" not in argv)))
         return 0
     except Exception as e:      # any failure means "unknown": the caller falls back to emulation
         print(json.dumps({"error": f"{type(e).__name__}: {e}"}))

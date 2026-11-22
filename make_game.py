@@ -1127,7 +1127,8 @@ WAVE64_MODES = ("auto", "on", "off")
 # The translator's fallback flags make_game.py can forward, and the argparse attribute each one reads.
 FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--bary-fallback", "bary_fallback"),
                   ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"),
-                  ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"))
+                  ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"),
+                  ("--f64-soft", "f64_soft"))
 
 
 def fallback_flags(a) -> tuple[str, ...]:
@@ -1220,6 +1221,17 @@ def runtime_gpu_info() -> dict:
         return {}
 
 
+def f64_soft_wanted() -> bool:
+    """Whether a new translation should use --f64-soft: LEONIDA_F64_SOFT=1 (or 0) decides; unset, it is on where
+    tools/vk_subgroup_info.py reports no shaderFloat64 for the GPU the runtime would use (off when it can't tell)."""
+    v = (os.environ.get("LEONIDA_F64_SOFT") or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return runtime_gpu_info().get("float64") is False
+
+
 def runtime_gpu_per_vertex():
     """per_vertex_inputs as tools/vk_subgroup_info.py answers for the GPU the runtime would use: False where the
     driver can't compile PerVertexKHR (MoltenVK) or lacks fragmentShaderBarycentric, None when it can't tell."""
@@ -1241,7 +1253,7 @@ def runtime_gpu_max_push_constants():
 # Source and data files that produce the translated modules, metadata and partner stubs.
 TRANSLATION_SOURCES = ("rdna2spirv.py", "shader_ir.py", "cfg_structure.py", "fssm_header.py", "lane_masks.py", "wave64_halves.py",
                        "wave64_emulate_opt.py", "shader_meta.py", "spirv_stubs.py", "spirv_asm.py", "spirv_asm_tables.py",
-                       "gfx10_formats.json")
+                       "gfx10_formats.json", "soft_f64.py")
 
 
 def sources_digest(folder: str, names, lead: str = "") -> str:
@@ -1843,6 +1855,9 @@ def main() -> int:
                     help="keep s0..s31 in 128 push-constant bytes and move heap/code base to a set-1 uniform "
                          "block; on by itself when the runtime's GPU reports maxPushConstantsSize below what "
                          "the shaders need (144, or 152 with --mesh-compute)")
+    ap.add_argument("--f64-soft", action="store_true",
+                    help="binary64 ops as exact 32-bit integer arithmetic, for GPUs without shaderFloat64; on by "
+                         "itself when the runtime's GPU lacks it (MoltenVK); LEONIDA_F64_SOFT=0 keeps native doubles")
     a = ap.parse_args()
     stages = STAGES
     if a.stages is not None:
@@ -1922,6 +1937,10 @@ def main() -> int:
             log(f"shaders: the GPU the runtime would use reports maxPushConstantsSize = {max_pc} (< {need_pc}): "
                 "translating with --pc-tail-ubo")
             a.pc_tail_ubo = True
+    if "shaders" in stages and not a.f64_soft and f64_soft_wanted():
+        log("shaders: the GPU the runtime would use has no shaderFloat64 (MoltenVK: Metal has no double type): "
+            "translating with --f64-soft")
+        a.f64_soft = True
     fallbacks = fallback_flags(a) if "shaders" in stages else ()
     preflight(stages, work, a.wav, runtime_build, emulate=emulate, keep_emulated=keep_emulated,
               fallbacks=fallbacks, jobs=a.jobs)

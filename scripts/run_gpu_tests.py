@@ -23,6 +23,7 @@ SHADER_DIR = os.path.join(ROOT, "runtime", "test", "shaders")
 TRANSLATOR = os.path.join(ROOT, "tools", "rdna2spirv.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mc_command  # noqa: E402
+import vk_subgroup_info  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container, shader_source
 from check import (Skip, clip_test, fmt_1010102_test, fmt_d16_xyz_test, fmt_int_narrow_test, fmt_sint32_test,
@@ -276,21 +277,32 @@ def f16_interp_fallback() -> bool:
     return _device_per_vertex() is False
 
 
-_PER_VERTEX = []
+def f64_soft() -> bool:
+    """LEONIDA_F64_SOFT=1 (or 0): translate with --f64-soft, so f64 ops are 32-bit integer arithmetic and no module
+    declares Float64. Unset, it is on where the device has no shaderFloat64: tools/vk_subgroup_info.py reports
+    float64 false (MoltenVK, KosmicKrisp, Intel Arc)."""
+    v = (os.environ.get("LEONIDA_F64_SOFT") or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return _device_info().get("float64") is False
+
+
+_DEVICE_INFO = []
+
+
+def _device_info() -> dict:
+    """tools/vk_subgroup_info.py --harness for the device the tests run on (vk_device_pick.h's choice, which on a
+    machine with two GPUs can differ from the runtime's), cached; {} when it can't tell."""
+    if not _DEVICE_INFO:
+        _DEVICE_INFO.append(vk_subgroup_info.harness_info())
+    return _DEVICE_INFO[0]
 
 
 def _device_per_vertex():
     """per_vertex_inputs from tools/vk_subgroup_info.py for the device the tests run on (cached), or None."""
-    if not _PER_VERTEX:
-        answer = None
-        try:
-            r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "vk_subgroup_info.py")],
-                               capture_output=True, text=True, timeout=60)
-            answer = json.loads(r.stdout.strip().splitlines()[-1]).get("per_vertex_inputs")
-        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
-            pass
-        _PER_VERTEX.append(answer)
-    return _PER_VERTEX[0]
+    return _device_info().get("per_vertex_inputs")
 
 
 def w64_emulated() -> bool:
@@ -741,6 +753,8 @@ def run_suite(a, work: str) -> int:
             cmd.append("--bary-fallback")
         if f16_interp_fallback():   # *_f16 interps from decoded-half inputs, no PerVertexKHR (MoltenVK)
             cmd.append("--f16-interp-fallback")
+        if f64_soft():   # binary64 as 32-bit integer arithmetic, no Float64 (MoltenVK: no shaderFloat64)
+            cmd.append("--f64-soft")
         if TEXOFF_FALLBACK:   # image_sample*_o: offset folded into the coordinate, no VK_KHR_maintenance8
             cmd.append("--texel-offset-fallback")
         if MESH_COMPUTE:   # mesh shaders as compute writing to a buffer, drawn by tools/mesh_compute_vs.py
@@ -1211,8 +1225,12 @@ def run_suite(a, work: str) -> int:
                 "ps_scc_logic32": (0x0fff0fff, 0x000f000f, 0xf00ff00f, 0x36),
                 "ps_scc_logic64": (0x0fff0fff, 0xff000000, 0xff0000ff, 0x16),
                 "ps_fma_literal": (0x41B80000, 0x41800000, 0x40E00000, 0x41A40000),
-                "ps_f64_mods": (0x40040000, 0x3FF00000, 0x3FE40000, 0x3FF00000),   # needs shaderFloat64
-                "ps_f64_round": (0xC12AF665, 0x3FE7FFFF, 0xBFFFFFFF, 0xC12AF666),  # needs shaderFloat64
+                "ps_f64_mods": (0x40040000, 0x3FF00000, 0x3FE40000, 0x3FF00000),   # shaderFloat64, or --f64-soft
+                "ps_f64_round": (0xC12AF665, 0x3FE7FFFF, 0xBFFFFFFF, 0xC12AF666),  # shaderFloat64, or --f64-soft
+                "ps_f64_ties": (0x00000002, 0x80000000, 0x00000002, 0x007FEFFF),   # from the .asm headers
+                "ps_f64_cvt": (0x3F800000, 0x3F800001, 0xFF800000, 0xBF400000),
+                "ps_f64_cvt_mods": (0x3FC00000, 0x3F800000, 0x00000000, 0x7F800000),
+                "ps_f64_frexp_lit": (0x00000000, 0x3FF80000, 0x00000001, 0x00000002),
                 "ps_outmods_f16": (0xAAAA3C00, 0xAAAA3E00, 0x7C000000, 0x3C000000),
                 # f16 op_sel / partial writes / inline constants: RDNA2 hardware words (see the .asm headers)
                 "ps_f16_med3_opsel": (0xAAAA4100, 0xAAAA4200, 0xAAAA3E00, 0x40005555),
