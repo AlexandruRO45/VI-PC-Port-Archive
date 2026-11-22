@@ -43,7 +43,8 @@ code from the mapped images runs. TLS reserves its module index through the runt
 `gta6rt_tls_host.dll`, and host imports load system DLLs, as they did before.
 
 `gta6rt --init <image>` runs the same mapping and then `Loader::initialise()`: each module's TLS
-callbacks and each DLL's `DllMain(DLL_PROCESS_ATTACH)`, dependencies first. An EXE's entry point is not
+callbacks and each DLL's `DllMain(DLL_PROCESS_ATTACH)`, dependencies first. As with `--run`, callbacks see the
+image filename as `argv[0]` and any game arguments passed after `--`. An EXE's entry point is not
 run. When the loader is destroyed, initialised modules receive TLS callbacks and DLL entry-point calls with
 `DLL_PROCESS_DETACH`, in reverse initialisation order. All mapped images, unwind tables and static TLS stay
 available until these notifications finish, so DLLs can release resources such as FLS callbacks safely. The reserved

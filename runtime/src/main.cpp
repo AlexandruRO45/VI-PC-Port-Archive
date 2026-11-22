@@ -6,7 +6,7 @@
 //       runs. TLS needs the runtime's own gta6rt_tls_host.dll, which reserves the module TLS index; system DLLs are
 //       loaded to resolve host imports, as before.
 //
-//   gta6rt --init <image> [--game-dir DIR] [--overlay DIR]
+//   gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [-- game arguments...]
 //       The same mapping, then each loaded DLL's TLS callbacks and DllMain(DLL_PROCESS_ATTACH) are run.
 //
 //   gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--trace-d3d12] [--trace FILE] [-- game arguments...]
@@ -50,7 +50,7 @@ const char* binding_name(rt::Binding b) {
 int usage() {
     std::fprintf(stderr,
                  "usage: gta6rt --dry-run <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace FILE]\n"
-                 "       gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE]\n"
+                 "       gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE] [-- game arguments...]\n"
                  "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE] [-- game arguments...]\n");
     return 2;
 }
@@ -178,8 +178,8 @@ int wmain(int argc, wchar_t** argv) {
                 std::fprintf(stderr, "[rt] mods: archetype lookup at RVA 0x%X not hooked: %s\n", archetype_lookup_rva,
                              r.error);
         }
-        if (run) rt::process::set_command_line(image.filename().wstring(), game_args);
         if (init || run) {
+            rt::process::set_command_line(image.filename().wstring(), game_args);
             loader.initialise();  // TLS callbacks, then DllMain(DLL_PROCESS_ATTACH) for DLLs
             std::printf("%zu module(s) initialised\n", loader.modules().size());
         }

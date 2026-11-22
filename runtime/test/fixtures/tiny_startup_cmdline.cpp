@@ -57,7 +57,7 @@ extern "C" __declspec(dllexport) bool __cdecl startup_cmdline_matches(const Snap
 BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_captured = capture(g_startup);
-        if (std::strstr(GetCommandLineA(), "fail-init")) return FALSE;
+        if (!g_captured || std::strstr(g_startup.line, "fail-init")) return FALSE;
     }
     return TRUE;
 }
