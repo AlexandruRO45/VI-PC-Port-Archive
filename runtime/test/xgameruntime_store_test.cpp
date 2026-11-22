@@ -90,53 +90,49 @@ int main() {
     void* ctx = nullptr;
     check(at<Create>(store, 3)(store, nullptr, &ctx) == S_OK && ctx, "XStoreCreateContext hands out a context");
 
-    // ---- XStoreQueryGameLicenseAsync / Result (28, 29) ----
+    // ---- licenses: never claimed offline (20-23, 28, 29, 68, 71, 72) ----
+    // Nothing can establish ownership offline, so every license query fails before starting and no license handle
+    // exists: an unconditional "licensed" would be a license-check workaround.
     using CtxAsync = HRESULT(STDMETHODCALLTYPE*)(void*, void*, XAsyncBlock*);
-    using BufResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, void*);
-    XAsyncBlock lic{};
-    unsigned char license[104];
-    std::memset(license, 0xcc, sizeof(license));
-    check(at<CtxAsync>(store, 28)(store, ctx, &lic) == S_OK && finished(&lic) &&
-              at<BufResult>(store, 29)(store, &lic, license) == S_OK,
-          "XStoreQueryGameLicenseAsync completes and XStoreQueryGameLicenseResult fills the license");
-    int64_t expiration = -1;
-    uint32_t trial_left = 1;
-    std::memcpy(&expiration, license + 96, 8);
-    std::memcpy(&trial_left, license + 24, 4);
-    check(license[18] == 1 && license[19] == 0 && license[20] == 0 && license[21] == 0,
-          "isActive (byte 18) is true; isTrialOwnedByThisUser, isDiscLicense, isTrial (19-21) are false");
-    check(license[0] == 0 && license[28] == 0 && trial_left == 0 && expiration == 0,
-          "empty SKU and trial ids, no trial time, expirationDate 0 (a license that doesn't expire)");
-    XAsyncBlock bad_ctx{};
-    check(at<CtxAsync>(store, 28)(store, license, &bad_ctx) == E_INVALIDARG, "a pointer that isn't a context is E_INVALIDARG");
-
-    // ---- XStoreAcquireLicenseForPackageAsync / Result, IsLicenseValid, license lost (20-23, 68, 69) ----
     using PkgAsync = HRESULT(STDMETHODCALLTYPE*)(void*, void*, const char*, XAsyncBlock*);
-    using HandleResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, void**);
+    using BufResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, void*);
     using IsValid = bool(STDMETHODCALLTYPE*)(void*, void*);
+    using HandleResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, void**);
     using RegisterFn = HRESULT(STDMETHODCALLTYPE*)(void*, void*, XTaskQueueHandle, void*, void(CALLBACK*)(void*),
                                                    XTaskQueueRegistrationToken*);
     using UnregisterFn = bool(STDMETHODCALLTYPE*)(void*, void*, XTaskQueueRegistrationToken, bool);
     auto on_event = [](void*) {};
-    XAsyncBlock acquire{};
-    void* package_license = nullptr;
-    check(at<PkgAsync>(store, 20)(store, ctx, "PackageId", &acquire) == S_OK && finished(&acquire) &&
-              at<HandleResult>(store, 21)(store, &acquire, &package_license) == S_OK && package_license,
-          "XStoreAcquireLicenseForPackageAsync hands out a license");
-    check(at<IsValid>(store, 22)(store, package_license), "XStoreIsLicenseValid: true");
-    check(!at<IsValid>(store, 22)(store, ctx), "a context is not a license: false");
+    XAsyncBlock game{};
+    unsigned char license[128];
+    std::memset(license, 0xcc, sizeof(license));
+    check(at<CtxAsync>(store, 28)(store, ctx, &game) == kStoreUnreachable,
+          "XStoreQueryGameLicenseAsync fails before starting: no license is claimed without the store");
+    check(at<BufResult>(store, 29)(store, &game, license) == kStoreUnreachable && license[0] == 0xcc,
+          "XStoreQueryGameLicenseResult: the same failure, and the title's buffer is left untouched");
+    const char* const package_ids[] = {"PackageId", "", "00000000-0000-0000-0000-000000000000"};
+    bool all_fail = true;
+    for (const char* id : package_ids) {
+        XAsyncBlock acquire{};
+        void* out = nullptr;
+        all_fail = all_fail && at<PkgAsync>(store, 20)(store, ctx, id, &acquire) == kStoreUnreachable &&
+                   at<BufResult>(store, 21)(store, &acquire, &out) == kStoreUnreachable && out == nullptr;
+    }
+    check(all_fail, "XStoreAcquireLicenseForPackageAsync fails for a known-looking, an empty and an unknown id");
+    const char* const store_ids[] = {"9NBLGGH4R315", "", "UNKNOWN"};
+    all_fail = true;
+    for (const char* id : store_ids) {
+        XAsyncBlock acquire{};
+        all_fail = all_fail && at<PkgAsync>(store, 71)(store, ctx, id, &acquire) == kStoreUnreachable;
+    }
+    check(all_fail, "XStoreAcquireLicenseForDurablesAsync (IXStoreImpl3) fails for those ids too");
+    check(!at<IsValid>(store, 22)(store, nullptr) && !at<IsValid>(store, 22)(store, ctx) &&
+              !at<IsValid>(store, 22)(store, license),
+          "XStoreIsLicenseValid is false for anything: no license handle exists offline");
     XTaskQueueRegistrationToken lost{};
-    check(at<RegisterFn>(store, 68)(store, package_license, nullptr, nullptr, on_event, &lost) == S_OK && lost.token != 0 &&
-              at<UnregisterFn>(store, 69)(store, package_license, lost, false),
-          "XStoreRegisterPackageLicenseLost gives a token; unregistering is never pending (true)");
-    XAsyncBlock acquire_null{};
-    check(at<PkgAsync>(store, 20)(store, ctx, nullptr, &acquire_null) == E_INVALIDARG, "a null package identifier is E_INVALIDARG");
-    XAsyncBlock durables{};
-    void* durable_license = nullptr;
-    check(at<PkgAsync>(store, 71)(store, ctx, "9NBLGGH4R315", &durables) == S_OK && finished(&durables) &&
-              at<HandleResult>(store, 72)(store, &durables, &durable_license) == S_OK &&
-              at<IsValid>(store, 22)(store, durable_license),
-          "XStoreAcquireLicenseForDurablesAsync (IXStoreImpl3): a valid license");
+    check(at<RegisterFn>(store, 68)(store, ctx, nullptr, nullptr, on_event, &lost) == E_INVALIDARG,
+          "XStoreRegisterPackageLicenseLost: a context is not a license, E_INVALIDARG");
+    XAsyncBlock bad_ctx{};
+    check(at<CtxAsync>(store, 30)(store, license, &bad_ctx) == E_INVALIDARG, "a pointer that isn't a context is E_INVALIDARG");
 
     // ---- add-on licenses: none (30-32) ----
     using Count = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, uint32_t*);
@@ -207,17 +203,14 @@ int main() {
     check(at<CtxAsync>(store, 82)(store, ctx, &purchase) == kStoreUnreachable, "XStoreShowGiftingUIAsync (IXStoreImpl6) as well");
 
     // ---- handles: all accounted for ----
-    check(rt::shims::xgameruntime_store_open_handles() == 5,
-          "five handles are open: a context, two licenses, two product queries");
-    at<CloseH>(store, 23)(store, package_license);
-    at<CloseH>(store, 23)(store, durable_license);
+    check(rt::shims::xgameruntime_store_open_handles() == 3, "three handles are open: a context and two product queries");
     at<CloseH>(store, 19)(store, products);
     at<CloseH>(store, 19)(store, associated_products);
     at<CloseH>(store, 4)(store, ctx);
     check(rt::shims::xgameruntime_store_open_handles() == 0, "the Close functions close each of them");
-    at<CloseH>(store, 23)(store, package_license);   // a double close: looked up, not read, so a no-op
-    check(rt::shims::xgameruntime_store_open_handles() == 0 && !at<IsValid>(store, 22)(store, package_license),
-          "a closed license is not valid and closing it again does nothing");
+    at<CloseH>(store, 4)(store, ctx);   // a double close: looked up, not read, so a no-op
+    check(rt::shims::xgameruntime_store_open_handles() == 0 && at<CtxAsync>(store, 30)(store, ctx, &bad_ctx) == E_INVALIDARG,
+          "a closed context is refused and closing it again does nothing");
     using Unknown = HRESULT(STDMETHODCALLTYPE*)(void*, void*, size_t, char*);
     char probe[8] = "x";
     check(at<Unknown>(store, 46)(store, nullptr, sizeof(probe), probe) == E_NOTIMPL,

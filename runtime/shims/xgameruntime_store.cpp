@@ -3,21 +3,22 @@
 // Each XStore* thunk asks QueryApiImpl for XStoreImpl and calls one slot with the function's own arguments after
 // `this` (docs/runtime_imports.md, "Class layouts, measured"). The class and interface ids and the slot order are
 // xodus-gaming/xgameruntime-docs' "Layout" lists (GPL-3.0; facts only, nothing copied). Signatures, enum values and
-// error codes follow Microsoft's public GDK reference (learn.microsoft.com/gaming/gdk, the XStore pages). That
-// reference names but doesn't give STORE_SKU_ID_SIZE and TRIAL_UNIQUE_ID_MAX_SIZE; their values (18 and 64) are from
-// minecraft-linux/xgameruntime-rs (MIT, src/xstore.rs at c523673a9e), whose XStoreGameLicense has the same field
-// order as the reference. No GDK header or library code is used.
+// error codes follow Microsoft's public GDK reference (learn.microsoft.com/gaming/gdk, the XStore pages). No GDK
+// header or library code is used.
 //
-// Offline, the store answers what a console with the game installed and no network would answer:
-//   - the game has a full license: active, not a trial, not a disc license;
-//   - the installed package's content can be licensed (XStoreAcquireLicenseForPackageAsync, ...ForDurablesAsync)
-//     and the license stays valid, so a registered license-lost callback is never called;
+// Offline, nothing can establish that the player owns the game or any of its content, so this shim never claims
+// they do: answering "licensed" without entitlement evidence would be a license-check workaround, which the project
+// rules out (CONTRIBUTING.md). What it answers instead:
+//   - a store context can be created and closed, so a title's store setup succeeds;
+//   - the license queries fail as they would without the store service: XStoreQueryGameLicenseAsync,
+//     XStoreAcquireLicenseForPackageAsync and XStoreAcquireLicenseForDurablesAsync fail before starting, and no
+//     license handle is ever handed out, so XStoreIsLicenseValid is false for anything;
 //   - there are no add-on licenses, no product listings and no package updates (each query completes with an empty
-//     result);
-//   - everything that needs the store service or a store UI fails synchronously before starting, so no XAsyncBlock
-//     is left waiting: purchases, consumables, user collection and purchase ids, license tokens, rate-and-review,
-//     redeem, gifting, product pages, downloads. XStoreCanAcquireLicenseFor*Async fails the same way: its result
-//     struct's sku field is sized by SKU_ID_SIZE, which no public source gives, so nothing writes into it.
+//     result, which grants nothing);
+//   - everything else that needs the store service or a store UI fails synchronously before starting, so no
+//     XAsyncBlock is left waiting: purchases, consumables, user collection and purchase ids, license tokens,
+//     CanAcquireLicense, rate-and-review, redeem, gifting, product pages, downloads.
+// All failures are HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE), what a console without a network reports.
 //
 // ASSUMPTION: the console executable is not available, so which of these slots it calls is unknown until its first
 // boot. The docs' unknown slots and the undocumented IXStoreImpl2 one log once when called, so that boot lists them;
@@ -29,7 +30,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <ctime>
 #include <iterator>
 #include <mutex>
 #include <set>
@@ -42,24 +42,6 @@
 namespace {
 
 // ---- Public GDK types (XStore.h, as the GDK reference documents them) ----
-
-constexpr size_t kStoreSkuIdSize = 18;        // STORE_SKU_ID_SIZE (see the header comment)
-constexpr size_t kTrialUniqueIdMaxSize = 64;  // TRIAL_UNIQUE_ID_MAX_SIZE
-
-struct XStoreGameLicense {
-    char skuStoreId[kStoreSkuIdSize];
-    bool isActive;
-    bool isTrialOwnedByThisUser;
-    bool isDiscLicense;
-    bool isTrial;
-    uint32_t trialTimeRemainingInSeconds;
-    char trialUniqueId[kTrialUniqueIdMaxSize];
-    time_t expirationDate;
-};
-static_assert(offsetof(XStoreGameLicense, isActive) == 18 && offsetof(XStoreGameLicense, trialTimeRemainingInSeconds) == 24 &&
-                  offsetof(XStoreGameLicense, trialUniqueId) == 28 && offsetof(XStoreGameLicense, expirationDate) == 96 &&
-                  sizeof(XStoreGameLicense) == 104,
-              "XStoreGameLicense, x64 natural alignment");
 
 using XStoreGameLicenseChangedCallback = void(CALLBACK*)(void* context);
 using XStorePackageLicenseLostCallback = void(CALLBACK*)(void* context);
@@ -108,11 +90,11 @@ void close_handle(void* h, Kind kind) {
 // ---- XAsync providers ----
 //
 // An operation's identity is the address of its Async function's tag, so a Result call with another operation's
-// XAsyncBlock fails as XAsyncGetResult documents. A handle result is created when the title collects it, so a result
+// XAsyncBlock fails as XAsyncGetResult documents. A product-query handle is created when the title collects it, so a result
 // never collected leaks nothing. An empty result completes with no payload; xtaskqueue then lets XAsyncGetResult be
 // called any number of times, which the ResultCount/Result pairs rely on.
 
-enum class Payload { None, GameLicense, License, ProductQuery };
+enum class Payload { None, ProductQuery };
 struct Operation {
     const char* name;
     Payload payload;
@@ -120,8 +102,6 @@ struct Operation {
 
 size_t payload_size(Payload p) {
     switch (p) {
-    case Payload::GameLicense: return sizeof(XStoreGameLicense);
-    case Payload::License:
     case Payload::ProductQuery: return sizeof(void*);
     default: return 0;
     }
@@ -138,17 +118,6 @@ HRESULT CALLBACK store_provider(XAsyncOp op, const XAsyncProviderData* data) {
     case XAsyncOp::GetResult:
         if (!data->buffer || data->bufferSize < payload_size(operation->payload)) return E_INVALIDARG;
         switch (operation->payload) {
-        case Payload::GameLicense: {
-            // A full license for the installed game. The SKU and trial ids are empty (offline there is no catalog to
-            // name them) and expirationDate is 0, as for a license that doesn't expire.
-            auto* license = static_cast<XStoreGameLicense*>(data->buffer);
-            std::memset(license, 0, sizeof(*license));
-            license->isActive = true;
-            return S_OK;
-        }
-        case Payload::License:
-            *static_cast<void**>(data->buffer) = new_handle(Kind::License);
-            return S_OK;
         case Payload::ProductQuery:
             *static_cast<void**>(data->buffer) = new_handle(Kind::ProductQuery);
             return S_OK;
@@ -189,9 +158,6 @@ const Operation kEntitledProducts{"XStoreQueryEntitledProductsAsync", Payload::P
 const Operation kProductForCurrentGame{"XStoreQueryProductForCurrentGameAsync", Payload::ProductQuery};
 const Operation kProductForPackage{"XStoreQueryProductForPackageAsync", Payload::ProductQuery};
 const Operation kAssociatedProductsForStoreId{"XStoreQueryAssociatedProductsForStoreIdAsync", Payload::ProductQuery};
-const Operation kLicenseForPackage{"XStoreAcquireLicenseForPackageAsync", Payload::License};
-const Operation kLicenseForDurables{"XStoreAcquireLicenseForDurablesAsync", Payload::License};
-const Operation kGameLicense{"XStoreQueryGameLicenseAsync", Payload::GameLicense};
 const Operation kAddOnLicenses{"XStoreQueryAddOnLicensesAsync", Payload::None};
 const Operation kGameAndDlcUpdates{"XStoreQueryGameAndDlcPackageUpdatesAsync", Payload::None};
 const Operation kPackageUpdates{"XStoreQueryPackageUpdatesAsync", Payload::None};
@@ -248,28 +214,11 @@ bool STDMETHODCALLTYPE store_has_more_pages(void*, void*) { return false; }
 // 19: void XStoreCloseProductsQueryHandle(XStoreProductQueryHandle)
 void STDMETHODCALLTYPE store_close_query(void*, void* query) { close_handle(query, Kind::ProductQuery); }
 
-// 20: XStoreAcquireLicenseForPackageAsync(ctx, const char* packageIdentifier, async)
-HRESULT STDMETHODCALLTYPE store_license_for_package_async(void*, void* ctx, const char* package, XAsyncBlock* async) {
-    if (!valid(ctx, Kind::Context) || !package) return E_INVALIDARG;
-    return begin(async, kLicenseForPackage);
-}
-// 21, 72: XStoreAcquireLicenseFor*Result(XAsyncBlock* async, XStoreLicenseHandle* storeLicenseHandle)
-template <const Operation& Op> HRESULT STDMETHODCALLTYPE store_license_result(void*, XAsyncBlock* async, void** license) {
-    return handle_result(async, Op, license);
-}
-// 22: bool XStoreIsLicenseValid(const XStoreLicenseHandle)
+// 22: bool XStoreIsLicenseValid(const XStoreLicenseHandle): no license handle is ever handed out offline, so false.
 bool STDMETHODCALLTYPE store_is_license_valid(void*, void* license) { return valid(license, Kind::License); }
 // 23: void XStoreCloseLicenseHandle(XStoreLicenseHandle)
 void STDMETHODCALLTYPE store_close_license(void*, void* license) { close_handle(license, Kind::License); }
 
-// 28: XStoreQueryGameLicenseAsync(ctx, async); 29: XStoreQueryGameLicenseResult(async, XStoreGameLicense* license)
-HRESULT STDMETHODCALLTYPE store_game_license_async(void*, void* ctx, XAsyncBlock* async) {
-    return valid(ctx, Kind::Context) ? begin(async, kGameLicense) : E_INVALIDARG;
-}
-HRESULT STDMETHODCALLTYPE store_game_license_result(void*, XAsyncBlock* async, XStoreGameLicense* license) {
-    if (!license) return E_POINTER;
-    return XAsyncGetResult(async, &kGameLicense, sizeof(*license), license, nullptr);
-}
 
 // 30: XStoreQueryAddOnLicensesAsync(ctx, async); 31: ...ResultCount(async, uint32_t* count);
 // 32: ...Result(async, uint32_t count, XStoreAddonLicense* addOnLicenses). No add-ons offline.
@@ -332,13 +281,6 @@ bool STDMETHODCALLTYPE store_unregister_license_lost(void*, void*, XTaskQueueReg
     return unregister_token(token);
 }
 
-// ---- IXStoreImpl3 (71-72) ----
-
-// 71: XStoreAcquireLicenseForDurablesAsync(ctx, const char* storeId, async)
-HRESULT STDMETHODCALLTYPE store_license_for_durables_async(void*, void* ctx, const char* store_id, XAsyncBlock* async) {
-    if (!valid(ctx, Kind::Context) || !store_id) return E_INVALIDARG;
-    return begin(async, kLicenseForDurables);
-}
 
 // ---- IXStoreImpl5 (77-81) ----
 
@@ -372,7 +314,7 @@ template <int Slot> uint64_t STDMETHODCALLTYPE private_slot(void*) {
     return 0;
 }
 
-// An operation that needs the store service or a store UI. The *Async function fails before starting, so the
+// An operation that needs the store service or a store UI (or an entitlement check, which needs the service). The *Async function fails before starting, so the
 // XAsyncBlock is never used and no callback runs; its Result/ResultSize/ResultCount partners return the same error.
 // Their arguments don't matter, so the functions take none (x64: the caller owns the argument area).
 template <int Slot> HRESULT STDMETHODCALLTYPE offline_failure(void*) {
@@ -437,16 +379,16 @@ const void* const kStoreVtable[] = {
     FN(offline_failure<17>),                                                    // 17 XStoreProductsQueryNextPageAsync
     FN(offline_failure<18>),                                                    // 18 ...NextPageResult
     FN(store_close_query),                                                      // 19 XStoreCloseProductsQueryHandle
-    FN(store_license_for_package_async),                                        // 20 XStoreAcquireLicenseForPackageAsync
-    FN(store_license_result<kLicenseForPackage>),                               // 21 ...Result
+    FN(offline_failure<20>),                                                    // 20 XStoreAcquireLicenseForPackageAsync
+    FN(offline_failure<21>),                                                    // 21 ...Result
     FN(store_is_license_valid),                                                 // 22 XStoreIsLicenseValid
     FN(store_close_license),                                                    // 23 XStoreCloseLicenseHandle
     FN(offline_failure<24>),                                                    // 24 XStoreCanAcquireLicenseForStoreIdAsync
     FN(offline_failure<25>),                                                    // 25 ...Result
     FN(offline_failure<26>),                                                    // 26 XStoreCanAcquireLicenseForPackageAsync
     FN(offline_failure<27>),                                                    // 27 ...Result
-    FN(store_game_license_async),                                               // 28 XStoreQueryGameLicenseAsync
-    FN(store_game_license_result),                                              // 29 XStoreQueryGameLicenseResult
+    FN(offline_failure<28>),                                                    // 28 XStoreQueryGameLicenseAsync
+    FN(offline_failure<29>),                                                    // 29 XStoreQueryGameLicenseResult
     FN(store_empty_list_async<kAddOnLicenses>),                                 // 30 XStoreQueryAddOnLicensesAsync
     FN(store_empty_count<kAddOnLicenses>),                                      // 31 ...ResultCount
     FN(store_empty_list<kAddOnLicenses>),                                       // 32 ...Result
@@ -488,8 +430,8 @@ const void* const kStoreVtable[] = {
     FN(store_register_license_lost),                                            // 68 XStoreRegisterPackageLicenseLost
     FN(store_unregister_license_lost),                                          // 69 XStoreUnregisterPackageLicenseLost
     FN(private_slot<70>),                                                       // 70 XStoreIsAvailabilityPurchasable (2)
-    FN(store_license_for_durables_async),                                       // 71 XStoreAcquireLicenseForDurablesAsync (3)
-    FN(store_license_result<kLicenseForDurables>),                              // 72 ...Result (3)
+    FN(offline_failure<71>),                                                    // 71 XStoreAcquireLicenseForDurablesAsync (3)
+    FN(offline_failure<72>),                                                    // 72 ...Result (3)
     FN(offline_failure<73>),                                                    // 73 XStoreShowAssociatedProductsUIAsync (4)
     FN(offline_failure<74>),                                                    // 74 ...Result (4)
     FN(offline_failure<75>),                                                    // 75 XStoreShowProductPageUIAsync (4)

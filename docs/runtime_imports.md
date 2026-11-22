@@ -201,26 +201,26 @@ certificate check fails the same way, change registrations return tokens that ne
 calls an `XStore*` slot (`libHttpClient.GDK.dll` only holds the GUID table), so its slots are **not measured** yet.
 The executable's first boot confirms them, or names the slots that differ.
 - **Interfaces:** the class id doubles as `IXStoreImpl`'s; `IXStoreImpl2`-`6` answer with the same 84-slot vtable.
-- **Licenses:** `XStoreQueryGameLicenseAsync` gives a full license (active, not a trial, not a disc license,
-  `expirationDate` 0, empty SKU and trial ids). `XStoreAcquireLicenseForPackageAsync` and `...ForDurablesAsync` give
-  a license that stays valid, so license-changed and license-lost callbacks are only tracked as tokens.
+- **Licenses: never claimed.** Offline, nothing can establish that the player owns the game or its content, and
+  answering "licensed" without entitlement evidence would be a license-check workaround (CONTRIBUTING.md). So
+  `XStoreQueryGameLicenseAsync`, `XStoreAcquireLicenseForPackageAsync` and `XStoreAcquireLicenseForDurablesAsync`
+  fail before starting, like the other store-service calls below. No license handle is ever handed out, so
+  `XStoreIsLicenseValid` is false for anything, and license-lost registration refuses anything that isn't a license.
 - **Empty answers:** there are no add-on licenses, no product listings (a product query enumerates nothing and has no
-  further page) and no package updates. `XStoreQueryPackageIdentifier` is `E_GAMEPACKAGE_NO_PACKAGE_IDENTIFIER`.
+  further page) and no package updates. Each grants nothing. `XStoreQueryPackageIdentifier` is
+  `E_GAMEPACKAGE_NO_PACKAGE_IDENTIFIER`. A store context can be created and closed, and license-changed registration
+  hands out tokens.
 - **Not available offline:** everything that needs the store service or a store UI fails synchronously before
-  starting, with `HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE)`, so no `XAsyncBlock` waits. That covers purchases,
-  consumables, collection and purchase ids, license tokens, rate-and-review, redeem, gifting, product pages and
-  downloads. `XStoreCanAcquireLicenseFor*Async` fails the same way: its result's SKU field is sized by
-  `SKU_ID_SIZE`, which no public source gives, so nothing writes into it.
-- **Struct sizes:** the reference names but doesn't give `STORE_SKU_ID_SIZE` and `TRIAL_UNIQUE_ID_MAX_SIZE`. Their
-  values (18 and 64) come from `minecraft-linux/xgameruntime-rs` (MIT), whose `XStoreGameLicense` has the
-  reference's field order. That makes the license 104 bytes, with `isActive` at 18 and `expirationDate` at 96.
+  starting, with `HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE)`, so no `XAsyncBlock` waits. That covers the license
+  queries above, `XStoreCanAcquireLicenseFor*`, purchases, consumables, collection and purchase ids, license tokens,
+  rate-and-review, redeem, gifting, product pages and downloads.
 - **Logged on first use:** the docs' three unknown slots (46-48), which answer `E_NOTIMPL` so nothing reads outputs
   they didn't write, and `IXStoreImpl2`'s undocumented `XStoreIsAvailabilityPurchasable` (70, a bool: false).
 - **Validity:** context, license and product-query handles are looked up by kind in a live set, never read, so a
   closed, foreign or wrong-kind pointer is refused without touching its memory, and a double close does nothing.
 
-`xgameruntime_store_test` calls the served slots with the documented arguments and checks the license bytes at those
-offsets.
+`xgameruntime_store_test` calls the served slots with the documented arguments, including empty and unknown ids for
+the license queries.
 
 
 Which classes the package's GDK modules reference, from a byte search for the class and interface GUIDs that
