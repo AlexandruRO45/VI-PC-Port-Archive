@@ -89,6 +89,16 @@ class MeshComputeEntries(unittest.TestCase):
         r = self.run_tool(index, "--graphics-only")
         self.assertIn("checking 0 shaders", r.stdout + r.stderr)
 
+    def test_workgroup_memory_is_checked_like_a_compute_shader(self):
+        # BUILD-546's check of lds_bytes against maxComputeSharedMemorySize applies: the module is a compute pipeline.
+        huge = 1 << 30
+        r = self.run_tool({"mc": {"stage": "ms", "mesh_compute": LAYOUT, "subgroup_size": None, "lds_bytes": huge}})
+        self.assertIn("MODULE FAIL mc (workgroup memory", r.stdout)
+        self.assertIn("ms-compute: 0 modules ok, 1 failed", r.stdout)
+        # A real mesh entry isn't held to the compute limit (it never reaches a compute pipeline).
+        r = self.run_tool({"m": {"stage": "ms", "lds_bytes": huge}})
+        self.assertNotIn("workgroup memory", r.stdout)
+
     def test_bool_and_null_forms(self):
         r = self.run_tool({"mc": {"stage": "ms", "mesh_compute": True, "subgroup_size": None}})
         self.assertIn("ms-compute pipelines: 1 ok", r.stdout)

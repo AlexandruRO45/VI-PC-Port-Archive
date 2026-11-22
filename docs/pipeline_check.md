@@ -15,9 +15,10 @@ It also exits 2, before loading Vulkan, if `index.json` is missing, unreadable, 
 directory can't pass as an empty corpus. A valid `{}` is an intentionally empty index.
 
 For an index entry with `lds_bytes`, the checker compares the reported workgroup memory with the selected GPU's
-`maxComputeSharedMemorySize` for compute or `maxMeshSharedMemorySize` for supported mesh shaders. An entry above its
-limit counts as a module failure before Vulkan receives the shader. Older indexes without this field still use the
-normal driver check. Mesh pipelines on devices without mesh shader support still use the existing feature skip.
+`maxComputeSharedMemorySize` for compute and `ms-compute` entries (below) or `maxMeshSharedMemorySize` for
+supported mesh shaders. An entry above its limit counts as a module failure before Vulkan receives the shader.
+Older indexes without this field still use the normal driver check. Mesh pipelines on devices without mesh shader
+support still use the existing feature skip.
 
 A corpus translated with `--mesh-compute` (the GPUs without `VK_EXT_mesh_shader`, such as MoltenVK) has its mesh
 shaders as GLCompute modules, and their entries carry the buffer layout under `mesh_compute`. Those are created as

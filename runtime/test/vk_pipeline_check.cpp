@@ -1428,11 +1428,13 @@ int main(int argc, char** argv) {
                 ++done;
                 continue;
             }
+            // An ms-compute entry is a compute pipeline, so the compute limit applies to it, not the mesh one.
             uint32_t shared_memory_limit = 0;
-            if (stage == "cs") shared_memory_limit = props.limits.maxComputeSharedMemorySize;
-            else if (stage == "ms") shared_memory_limit = mesh_props.maxMeshSharedMemorySize;
+            if (built_as_compute(meta)) shared_memory_limit = props.limits.maxComputeSharedMemorySize;
+            else if (meta.stage == "ms") shared_memory_limit = mesh_props.maxMeshSharedMemorySize;
             if (shared_memory_limit && meta.lds_bytes > shared_memory_limit) {
-                const char* limit_name = stage == "cs" ? "maxComputeSharedMemorySize" : "maxMeshSharedMemorySize";
+                const char* limit_name =
+                    built_as_compute(meta) ? "maxComputeSharedMemorySize" : "maxMeshSharedMemorySize";
                 std::lock_guard<std::mutex> g(mu);
                 modules_bad[stage]++;
                 std::printf("MODULE FAIL %s (workgroup memory %u bytes exceeds %s %u)\n",
