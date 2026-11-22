@@ -36,7 +36,7 @@ from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, PK_MUL_
 from check import SIGNED_MIP_TEST, UINT_MIP_TEST
 from check import HEAP_INIT_EXPECTED, heap_init_env   # cs_heap_init: vk_compute_test's VKC_HEAP_INIT
 from check import judged_words, words_match   # dump words not judged on some devices (cs_signed_zero_nan)
-from check import check_d16_texture   # ps_texture_sample_d16, judged as in check.py
+from check import D16_SAMPLER, check_d16_texture   # ps_texture_sample_d16, drawn and judged as in check.py
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
 from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
@@ -1273,7 +1273,7 @@ def run_suite(a, work: str) -> int:
             tool = os.path.join(a.build, "vk_texture_test" + ext)
             raw = os.path.join(raw_dir, f"{name}.raw")
             if name == "ps_texture_sample_d16":
-                cmd = [tool, os.path.join(spirv_dir, "vs_ids.spv"), spv, raw, "0", "0", "0", "0", "0"]
+                cmd = [tool, os.path.join(spirv_dir, "vs_ids.spv"), spv, raw, "0", *D16_SAMPLER]
             else:
                 mode = {"ps_cube_sample": ["cube"], "ps_sample_c_lz": ["dref"],
                         "ps_sample_c_lz_a16": ["dref_a16"], "ps_sample_c": ["dref_c"],
