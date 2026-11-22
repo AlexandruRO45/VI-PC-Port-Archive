@@ -992,5 +992,124 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
                 self.assertEqual(state.lds.read_qword(addr), 0x1234_5678)
 
 
+# ==============================================================================
+# Phase 5: Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasingAndPreservation(unittest.TestCase):
+    """Phase 5: Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_alias_dst_overlaps_addr(self) -> None:
+        """Destination VGPR pair v[0:1] overlaps Address VGPR v[0].
+        
+        Address must be latched in the operand stage before v[0:1] is overwritten with old_val.
+        """
+        state = ScalarMachineState()
+        addr = 0x500
+        state.set_vgpr(0, addr)        # v[0] holds address
+        state.set_vgpr(1, 0x1234)      # v[1] holds dummy high word
+        state.set_vgpr_pair(2, MASK_64) # v[2:3] holds data
+        state.lds.write_qword(addr, 0xAAAA_AAAA_5555_5555)
+
+        instr = DSNand64Instruction(
+            opcode=DSOpcode64.DS_NAND_RTN_B64,
+            dst=VGPRPair(0),
+            addr=VGPR(0),
+            data=VGPRPair(2),
+        )
+        old, mem = self.scalar_interp.step(instr, state)
+        self.assertEqual(old, 0xAAAA_AAAA_5555_5555)
+        self.assertEqual(mem, 0x5555_5555_AAAA_AAAA)
+        # v[0:1] now contains the returned old_val
+        self.assertEqual(state.get_vgpr_pair(0), 0xAAAA_AAAA_5555_5555)
+        # Memory at original addr was properly updated
+        self.assertEqual(state.lds.read_qword(addr), 0x5555_5555_AAAA_AAAA)
+
+    def test_alias_dst_equals_data(self) -> None:
+        """Destination VGPR pair aliases Data VGPR pair: v[2:3] = ds_nand_rtn_b64 v[2:3], v[0], v[2:3].
+        
+        Data must be latched before v[2:3] is overwritten with old_val.
+        """
+        state = ScalarMachineState()
+        addr = 0x600
+        state.set_vgpr(0, addr)
+        state.set_vgpr_pair(2, 0x0F0F0F0F_0F0F0F0F)  # v[2:3] is data AND destination
+        state.lds.write_qword(addr, 0xF0F0F0F0_F0F0F0F0)
+
+        instr = DSNand64Instruction(
+            opcode=DSOpcode64.DS_NAND_RTN_B64,
+            dst=VGPRPair(2),
+            addr=VGPR(0),
+            data=VGPRPair(2),
+        )
+        # 0xF0F0F0F0_F0F0F0F0 & 0x0F0F0F0F_0F0F0F0F = 0 -> ~0 = MASK_64
+        old, mem = self.scalar_interp.step(instr, state)
+        self.assertEqual(old, 0xF0F0F0F0_F0F0F0F0)
+        self.assertEqual(mem, MASK_64)
+        self.assertEqual(state.get_vgpr_pair(2), 0xF0F0F0F0_F0F0F0F0)
+        self.assertEqual(state.lds.read_qword(addr), MASK_64)
+
+    def test_unrelated_vgprs_unmodified(self) -> None:
+        """Canary test: ensure all 256 VGPRs outside destination pair remain untouched."""
+        state = ScalarMachineState()
+        canary_base = 0xDEAD0000
+        for r in range(256):
+            state.set_vgpr(r, canary_base | r)
+
+        addr = 0x100
+        state.set_vgpr(10, addr)
+        state.set_vgpr_pair(12, 0x55)
+        state.lds.write_qword(addr, 0xAA)
+
+        instr = DSNand64Instruction(
+            opcode=DSOpcode64.DS_NAND_RTN_B64,
+            dst=VGPRPair(8),
+            addr=VGPR(10),
+            data=VGPRPair(12),
+        )
+        self.scalar_interp.step(instr, state)
+
+        # Destination v[8] and v[9] were updated
+        self.assertEqual(state.get_vgpr(8), 0xAA)
+        self.assertEqual(state.get_vgpr(9), 0)
+
+        # Operands unchanged
+        self.assertEqual(state.get_vgpr(10), addr)
+        self.assertEqual(state.get_vgpr(12), 0x55)
+        self.assertEqual(state.get_vgpr(13), 0)
+
+        # Check all other 252 registers
+        for r in range(256):
+            if r not in (8, 9, 10, 12, 13):
+                self.assertEqual(state.get_vgpr(r), canary_base | r)
+
+    def test_simd_multi_lane_aliasing(self) -> None:
+        """All 32 lanes alias destination base with address: v[0:1] = ds_nand_rtn_b64 v[0:1], v[0], v[2:3]."""
+        state = SIMDState(num_lanes=32)
+        for lane in range(32):
+            addr = 0x300 + lane * 8
+            state.set_vgpr(lane, 0, addr)
+            state.set_vgpr(lane, 1, 0)
+            state.set_vgpr_pair(lane, 2, 0)
+            state.lds.write_qword(addr, 0x1000 + lane)
+
+        instr = DSNand64Instruction(
+            opcode=DSOpcode64.DS_NAND_RTN_B64,
+            dst=VGPRPair(0),
+            addr=VGPR(0),
+            data=VGPRPair(2),
+        )
+        self.simd_interp.step(instr, state)
+
+        for lane in range(32):
+            addr = 0x300 + lane * 8
+            self.assertEqual(state.get_vgpr_pair(lane, 0), 0x1000 + lane)
+            self.assertEqual(state.lds.read_qword(addr), MASK_64)
+
+
 if __name__ == "__main__":
     unittest.main()
