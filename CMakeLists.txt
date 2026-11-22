@@ -768,6 +768,42 @@ if(EXISTS "${INTAKE_PYTHON}")
     target_compile_definitions(cpu_tail_altered_provider PRIVATE ALTER_RETURN)
     add_test(NAME cpu_aot_import_tail_jump COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/tail_import_check.py" "$<TARGET_FILE:cpu_register_probe>" ${tail_files})
+    # Ordinary import calls, linked against the named and the altered provider above. Each caller is translated
+    # three times: call_keep,call_twice,outer_call,pass_result,read_then_call,call_then_read bound to mix3 with
+    # three arguments and 8 guaranteed bytes, low_result to mix3 with 1, and thunk_call,thunk_tail,outer_tail to
+    # mix4 with four arguments and 8.
+    set(icall_files)
+    foreach(variant IN ITEMS named altered)
+        set(provider cpu_tail_${variant}_provider)
+        cpu_asm_fixture(cpu_icall_${variant} import_calls)
+        target_link_libraries(cpu_icall_${variant} PRIVATE ${provider})
+        cpu_translation(cpu_icall_${variant} cpu_switch_aot
+            call_keep,call_twice,outer_call,pass_result,read_then_call,call_then_read
+            NAME cpu_icall_${variant}_mix3 PROVIDER ${provider} SYMBOL mix3 IMPORT_ARGUMENTS 3 RETURN_BYTES 8)
+        cpu_translation(cpu_icall_${variant} cpu_switch_aot low_result
+            NAME cpu_icall_${variant}_low PROVIDER ${provider} SYMBOL mix3 IMPORT_ARGUMENTS 3 RETURN_BYTES 1)
+        cpu_translation(cpu_icall_${variant} cpu_switch_aot thunk_call,thunk_tail,outer_tail
+            NAME cpu_icall_${variant}_mix4 PROVIDER ${provider} SYMBOL mix4 IMPORT_ARGUMENTS 4 RETURN_BYTES 8)
+        list(APPEND icall_files "$<TARGET_FILE:cpu_icall_${variant}>"
+            "$<TARGET_FILE:cpu_icall_${variant}_mix3>" "${CMAKE_CURRENT_BINARY_DIR}/cpu_icall_${variant}_mix3.cpp"
+            "$<TARGET_FILE:cpu_icall_${variant}_low>" "${CMAKE_CURRENT_BINARY_DIR}/cpu_icall_${variant}_low.cpp"
+            "$<TARGET_FILE:cpu_icall_${variant}_mix4>" "${CMAKE_CURRENT_BINARY_DIR}/cpu_icall_${variant}_mix4.cpp"
+            "$<TARGET_FILE:${provider}>")
+    endforeach()
+    # The named caller's three translations built again with a separate cl /O2 command, as for cpu_aot_dead_reads.
+    foreach(binding IN ITEMS mix3 low mix4)
+        set(icall_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_icall_named_${binding}_o2.dll")
+        add_custom_command(OUTPUT "${icall_o2}"
+            COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /LD "${CMAKE_CURRENT_BINARY_DIR}/cpu_icall_named_${binding}.cpp"
+                "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_icall_named_${binding}_o2.obj" "/Fe${icall_o2}"
+                /link "$<TARGET_LINKER_FILE:cpu_tail_named_provider>"
+            DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/cpu_icall_named_${binding}.cpp" cpu_tail_named_provider VERBATIM)
+        add_custom_target(cpu_icall_named_${binding}_o2 ALL DEPENDS "${icall_o2}")
+        list(APPEND icall_files "${icall_o2}")
+    endforeach()
+    add_test(NAME cpu_aot_import_calls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/import_calls_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_guarded_call>" ${icall_files})
 
     foreach(variant IN ITEMS original swapped)
         cpu_asm_fixture(cpu_float_${variant} scalar_float)
