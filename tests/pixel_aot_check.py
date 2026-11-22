@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import pixel_aot
-from pixel_aot import disassemble, native_program
+from pixel_aot import ALU, disassemble, native_program
 
 # First word of each line of every program lower() accepted in this run. tools/form_coverage.py counts
 # these when this test passes; a program a check expects to be rejected raises before it is recorded.
@@ -63,7 +63,7 @@ def assembly(swap):
     ]
 
 
-DUAL_CASES = ("forward", "reverse", "reuse")
+DUAL_CASES = ("forward", "reverse", "reuse", "partial")
 
 
 def dual_program(case="forward", *, swap_weights=False):
@@ -77,8 +77,8 @@ def dual_program(case="forward", *, swap_weights=False):
         program[first:first+1] = [sample_a, "s_waitcnt vmcnt(0)",
                                   load_b.replace("56:63", "28:35"), "s_waitcnt lgkmcnt(0)",
                                   sample_b.replace("56:63", "28:35")]
-    elif case in ("forward", "reverse"):
-        program[first:first+1] = [sample_a, sample_b] if case == "forward" else [sample_b, sample_a]
+    elif case in ("forward", "reverse", "partial"):
+        program[first:first+1] = [sample_a, sample_b] if case != "reverse" else [sample_b, sample_a]
         program.insert(program.index("s_mov_b32 s40, 1"), load_b)
     else:
         raise ValueError(f"Unknown dual-texture case: {case}")
@@ -88,6 +88,12 @@ def dual_program(case="forward", *, swap_weights=False):
     for i in range(4):
         ops.extend([f"v_mul_legacy_f32_e32 v{12+i}, {a}, v{12+i}",
                     f"v_fma_f32 v{12+i}, {b}, v{20+i}, v{12+i}"])
+    if case == "partial":
+        # Scale A's red channel while B is still outstanding.
+        wait = program.index("s_waitcnt vmcnt(0)")
+        first_mul = ops.pop(0).replace(", v12", ", v24")
+        program[wait:wait] = ["s_waitcnt vmcnt(1)", "v_mov_b32_e32 v24, v12", first_mul]
+        pos += 3
     program[pos:pos] = ops
     return program
 
@@ -103,15 +109,29 @@ def shader_record(blob: bytes, name: bytes) -> bytes:
             + struct.pack("<4I", len(payload), 0, len(payload), len(blob)) + payload)
 
 
-def envelope(code: bytes, name: bytes = b"fixture", *, private_data: bytes | None = None) -> bytes:
-    program_start = 256
+def envelope(code: bytes, name: bytes = b"fixture", *, private_data: bytes | None = None, directory_end=None,
+             compute_width=None) -> bytes:
+    program_start = 288 if directory_end is not None else 256
     image = bytearray(program_start) + code
     image[:4] = b"FSSM"
     struct.pack_into("<I", image, 192, program_start - 40)
+    if directory_end is not None:
+        extent, end_field = directory_end
+        struct.pack_into("<I", image, 4, 0x101)
+        struct.pack_into("<Q", image, 200, extent)
+        struct.pack_into("<Q", image, 232, end_field)
     native = b"XBCH" + bytes(12) + struct.pack("<II", len(image), 0) + zlib.compress(image)
     program = (bytes(24) + b"XDAT" + struct.pack("<II", 1, 0)
                + struct.pack("<III", 13, 48, len(native)) + native)
+    if compute_width is not None:
+        program = program[:2] + struct.pack("<H", 5) + program[4:]
     sections = [b"DXIL" + struct.pack("<I", len(program)) + program]
+    if compute_width is not None:
+        psv = bytearray(52)
+        struct.pack_into("<I", psv, 0, 48)
+        psv[28] = 5
+        struct.pack_into("<3I", psv, 40, compute_width, 1, 1)
+        sections.append(b"PSV0" + struct.pack("<I", len(psv)) + psv)
     if private_data is not None:
         sections.append(b"PRIV" + struct.pack("<I", len(private_data)) + private_data)
     offset = 32 + 4 * len(sections)
@@ -385,6 +405,16 @@ def select(wave64=False):
     ])
 
 
+def three_way():
+    """Median, minimum and maximum of three operands, each result one of its inputs."""
+    return with_constants([
+        "v_med3_f32 v15, s47, v13, v12",
+        "v_max3_f32 v14, v12, v14, v13",
+        "v_med3_f32 v12, v12, s44, s45",
+        "v_min3_f32 v13, |s46|, v13, v12",
+    ])
+
+
 def absolute_value():
     program = assembly(False)
     pos = program.index("v_cvt_pkrtz_f16_f32_e32 v16, v12, v13")
@@ -520,16 +550,56 @@ FRACT_INPUTS = (-2.0 ** -30, -0.25, 2.75, -2.0 ** -23)
 FRACT_CLAMP = struct.unpack("<f", struct.pack("<I", 0x3f7fffff))[0]
 
 
+def fract_values():
+    return with_constants([
+        "v_fract_f32_e32 v12, s44",
+        "v_fract_f32_e64 v13, |s45|",
+        "v_fract_f32_e64 v14, -|s46|",
+        "v_fract_f32_e32 v15, s47",
+    ])
+
+
+RECIPROCAL_BODY = [
+    "v_rcp_f32_e64 v12, |s44|",
+    "v_rcp_f32_e64 v13, -|s45|",
+    "v_rsq_f32_e64 v14, |s46|",
+    "v_rsq_f32_e64 v15, |s47| clamp",
+]
+
+
+def check_reciprocal_draw(directory, compiler, renderer, backend):
+    source = directory / "reciprocal.hlsl"
+    shader = directory / "reciprocal.cso"
+    case = directory / "reciprocal.case"
+    constants = bytearray(256)
+    struct.pack_into("<4f", constants, 12, -4.0, 8.0, -16.0, -0.25)
+    case.write_bytes(constants + struct.pack("<4f", 0.25, -0.125, 0.25, 1.0) * 64)
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    for mutation in (False, True):
+        body = RECIPROCAL_BODY.copy()
+        if mutation:
+            # 1 / abs(-16) is 1/16, while its reciprocal square root is 1/4.
+            body[2] = body[2].replace("v_rsq", "v_rcp")
+        source.write_text(translate(with_constants(body)), encoding="ascii")
+        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        if mutation:
+            wrong = subprocess.run(draw, capture_output=True, text=True)
+            if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+                raise AssertionError("Substituting reciprocal for reciprocal square root escaped detection")
+        else:
+            subprocess.run(draw, check=True)
+
+
 def check_fract_draw(directory, compiler, renderer, backend):
     source = directory / "fract.hlsl"
     shader = directory / "fract.cso"
     case = directory / "fract.case"
-    program = with_constants([f"v_fract_f32_e32 v{12 + i}, s{44 + i}" for i in range(4)])
-    source.write_text(translate(program), encoding="ascii")
+    source.write_text(translate(fract_values()), encoding="ascii")
     subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
     constants = bytearray(256)
     struct.pack_into("<4f", constants, 12, *FRACT_INPUTS)
-    expected = [min(single(x - math.floor(x)), FRACT_CLAMP) for x in FRACT_INPUTS]
+    a, b, c, d = FRACT_INPUTS
+    expected = [min(single(x - math.floor(x)), FRACT_CLAMP) for x in (a, abs(b), -abs(c), d)]
     assert expected[0] == FRACT_CLAMP and single(FRACT_INPUTS[0] - math.floor(FRACT_INPUTS[0])) == 1.0
     draw = [renderer, backend, "--check-pixel-case", shader, case]
     case.write_bytes(constants + struct.pack("<4f", *map(half_rtz, expected)) * 64)
@@ -1464,7 +1534,76 @@ def check_adapter_skip(directory: Path) -> None:
         assert check_render(work, compiler, renderer, "hardware") == 77
 
 
+def attribute_color(rg):
+    code = ["s_mov_b32 s30, s14", "s_mov_b32 m0, s30"]
+    for phase in (1, 2):
+        for i, channel in enumerate("wzxy"):
+            code.append(f"v_interp_p{phase}_f32_e32 v{8+i}, v{phase-1}, attr0.{channel}")
+    code.extend(["v_cvt_pkrtz_f16_f32_e32 v12, v8, v9", "v_cvt_pkrtz_f16_f32_e32 v13, v10, v11"])
+    tail = "off, off" if rg else "v13, v13"
+    return code + [f"exp mrt0 v12, v12, {tail} done compr vm", "s_endpgm"]
+
+
+def translate_attribute(code):
+    return lower(code, 8, 14, None)
+
+
+def buffer_color(rg):
+    # Use a copied low table address and an explicit zero high word.
+    tail = "off, off" if rg else "v26, v26"
+    return [
+        "s_mov_b32 s30, s9", "s_mov_b32 s31, 0",
+        "s_load_dwordx4 s[12:15], s[30:31], null", "s_waitcnt lgkmcnt(0)",
+        "s_buffer_load_dwordx4 s[4:7], s[12:15], 0x10", "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v20, s7", "v_mov_b32_e32 v21, s4",
+        "v_cvt_pkrtz_f16_f32_e32 v25, v20, v21",
+        "v_cvt_pkrtz_f16_f32_e32 v26, v21, v20",
+        f"exp mrt0 v25, v25, {tail} done compr vm", "s_endpgm",
+    ]
+
+
+def translate_buffer_color(instructions):
+    return lower(instructions, 9, 24, None, 0)
+
+
+def three_way_case(directory, low, high, cap, middle):
+    """Expected colors for three_way(); no rounding occurs before the half export."""
+    case = bytearray(256)
+    struct.pack_into("<4f", case, 12, low, high, cap, middle)
+    for y in RAMP:
+        for x in RAMP:
+            r, g, b = single(x / 255), single(y / 255), single(128 / 255)
+            clamped = sorted((r, low, high))[1]
+            color = (clamped, min(abs(cap), g, clamped), max(r, b, g), sorted((middle, g, r))[1])
+            case.extend(struct.pack("<4f", *map(half_rtz, color)))
+    path = directory / "three_way.case"
+    path.write_bytes(case)
+    return path
+
+
+def check_three_way_templates():
+    """The HLSL forms must pick the expected operand for every operand order."""
+    values = (-1.5, 0.0, 0.25, 0.25, 3.0)
+    for a in values:
+        for b in values:
+            for c in values:
+                pick = {name: eval(ALU[name][1].format("a", "b", "c"), {"min": min, "max": max},
+                                   {"a": a, "b": b, "c": c}) for name in ("min3", "max3", "med3")}
+                assert pick == {"min3": min(a, b, c), "max3": max(a, b, c),
+                                "med3": sorted((a, b, c))[1]}, (a, b, c)
+
+
 def check_controls(directory):
+    program = buffer_color(True)
+    assert "float2 main(" in translate_buffer_color(program)
+    assert "SamplerState" not in translate_buffer_color(program)
+    must_reject(lambda p: lower(p, 8, 24, None, 0), program)
+    must_reject(lambda p: lower(p, 9, 24, None, 32), program)
+    must_reject(lambda p: lower(p, 9, 24, None, 0, second_texture_offset=32), program)
+    must_reject(lambda p: lower(p, 9, 24, [0] * 4, 0), program)
+    must_reject(lambda p: lower(p, 20, 24, None), assembly(False))
+    must_reject(translate_buffer_color, [s for s in program if s != "s_waitcnt lgkmcnt(0)"])
+    must_reject(translate_buffer_color, [s.replace("off, off", "off, v26") for s in program])
     check_scheduling_hints()
     check_constant_descriptor_bounds()
     check_scalar_constant_reads()
@@ -1490,8 +1629,37 @@ def check_controls(directory):
         archive.write_bytes(invalid)
         must_reject(native_program, archive, "fixture")
 
+    partial = dual_program("partial")
+    wait = partial.index("s_waitcnt vmcnt(1)")
+    # Keep the early read of A but issue B first. Now A is still pending.
+    reversed_samples = partial.copy()
+    reversed_samples[wait - 2:wait] = reversed(reversed_samples[wait - 2:wait])
+    must_reject(translate_dual, reversed_samples)
+    for count in (2, 63):
+        changed = partial.copy()
+        changed[wait] = f"s_waitcnt vmcnt({count})"
+        must_reject(translate_dual, changed)
+    for early_use in ("v_mov_b32_e32 v24, v20", "v_mov_b32_e32 v20, v12",
+                      "v_mul_legacy_f32_e32 v12, 1.0, v20",
+                      "v_cvt_pkrtz_f16_f32_e32 v24, v12, v20"):
+        changed = partial.copy()
+        changed.insert(wait + 1, early_use)
+        must_reject(translate_dual, changed)
+    # Each of B's four destinations remains protected from a constant write.
+    for reg in range(20, 24):
+        changed = partial.copy()
+        changed.insert(wait + 1, f"v_mov_b32_e32 v{reg}, 0")
+        must_reject(translate_dual, changed)
+    # Packing A is legal here even though B is outstanding.
+    translate_dual(partial[:wait + 1] + ["v_cvt_pkrtz_f16_f32_e32 v24, v12, v13"] + partial[wait + 1:])
+    # A larger legal wait after draining does not invalidate completed samples.
+    end_wait = partial.index("s_waitcnt vmcnt(0)")
+    drained = partial[:end_wait + 1] + ["s_waitcnt vmcnt(63)"] + partial[end_wait + 1:]
+    translate_dual(drained)
+    must_reject(translate_dual, [op.replace("vmcnt(63)", "vmcnt(64)") for op in drained])
+
     # LLVM 15 prints "exp mrt0 v16, ..."; newer LLVM prints "exp mrt0, v16, ...".
-    for program in (assembly(False), assembly(True), curve(), shaping(), arithmetic()):
+    for program in (assembly(False), assembly(True), curve(), shaping(), arithmetic(), three_way()):
         modern = [line.replace("exp mrt0 ", "exp mrt0, ") for line in program]
         assert modern != program
         assert translate(modern) == translate(program)
@@ -1506,6 +1674,20 @@ def check_controls(directory):
     for old, new in (("v_sqrt_f32_e32 v18, v18", "v_sqrt_f32_e32 v18, v18, v18"),
                      ("v_add_f32_e32 v19, s44, v13", "v_add_f32_e32 v19, v13")):
         must_reject(translate, [line.replace(old, new) for line in shaping()])
+    check_three_way_templates()
+    source = translate(three_way())
+    for expected in ("max(min(params[1].z, sample16.y), min(max(params[1].z, sample16.y), sample16.x))",
+                     "max(max(sample16.x, sample16.z), sample16.y)",
+                     "max(min(sample16.x, params[0].w), min(max(sample16.x, params[0].w), params[1].x))",
+                     "min(min(abs(params[1].y), sample16.y), alu"):
+        assert expected in source, expected
+    for old, new in (("v_med3_f32 v12, v12, s44, s45", "v_med3_f32 v12, v12, s44"),
+                     ("v_med3_f32 v15, s47", "v_med3_i32 v15, |s47|"),
+                     ("v_max3_f32 v14, v12", "v_max3_u32 v14, |v12|"),
+                     ("v_min3_f32 v13, |s46|", "v_min3_f16 v13, |s46|")):
+        changed = [line.replace(old, new) for line in three_way()]
+        assert changed != three_way()
+        must_reject(translate, changed)
 
     program = truncate_values()
     source = translate(program)
@@ -1816,13 +1998,51 @@ def check_controls(directory):
     must_reject(translate, base_ld[:wqm] + ["v_ldexp_f32 v20, 1.0, 2"] + base_ld[wqm:])
 
 
+def check_program_extent(directory, library):
+    # A conditional jumps over the early exit. The alternate block starts
+    # with a two-dword instruction (s_mov_b32 with a literal operand).
+    branch = bytes.fromhex("010084bf")
+    end = bytes.fromhex("000081bf")
+    mov = bytes.fromhex("ff0380be 01000000")
+    pad = bytes.fromhex("00009fbf")
+    code = branch + end + mov + end
+    padding = pad * 5
+    base = 288 - 40
+    extent = 40 + len(code) + len(padding)
+    archive = directory / "bounded.rpf"
+
+    def extract(body, size=extent, limit=base + extent):
+        archive.write_bytes(envelope(body, directory_end=(size, limit)))
+        return native_program(archive, "fixture", llvm=library)[1]
+
+    jump_over_nop = bytes.fromhex("010082bf 000080bf")
+    assert extract(jump_over_nop + code + padding[8:]) == jump_over_nop + code
+    must_reject(extract, bytes.fromhex("010082bf 810380be") + code + padding[8:])
+    assert extract(code + padding + end) == code  # marker in metadata
+    # A terminator in metadata cannot stand in for one missing inside the section.
+    must_reject(extract, bytes(len(code)) + padding + end)
+    assert extract(code + padding + pad * 4, limit=0xdeadbeefdeadbeef) == code
+    must_reject(extract, code + padding, extent, base + extent + 4)
+    must_reject(extract, code + padding[:-4])
+    must_reject(extract, code + padding, extent, 0xdeadbeefdeadbeef)
+    must_reject(extract, code + padding[:4] + bytes(16) + end)
+    must_reject(extract, bytes.fromhex("020084bf") + code[4:] + padding)  # target inside literal
+    must_reject(extract, bytes.fromhex("000080bf") + code[4:] + padding)  # disconnected block
+    must_reject(extract, bytes.fromhex("040084bf") + code[4:] + padding)  # target in padding
+    must_reject(extract, branch + bytes.fromhex("ff0380be") + end + bytes.fromhex("000080bf") + end + padding)
+
+
 def check_binary(directory, assembler, objcopy, library):
+    check_program_extent(directory, library)
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
                 (arithmetic(), translate), (with_scalar_constant_reads(), translate), (with_scalar_pair_reads(), translate),
                 (truncate_values(), translate), (affine_coordinates(), translate), (ceiling(), translate),
                 (scalar64(), translate)]
     fixtures.append((with_constants(CLASS_BODY), translate))
+    fixtures.append((with_constants(RECIPROCAL_BODY), translate))
+    fixtures.append((fract_values(), translate))
     fixtures.extend([(frexp_mant_values(), translate), (ldexp_values(), translate)])
+    fixtures.append((three_way(), translate))
     fixtures.extend((predicate_group(first), translate) for first in range(0, 16, 4))
     fixtures.extend((int_predicate_group(kind, encoding, first), translate)
                     for kind in ("i32", "u32") for encoding in ("e32", "e64") for first in (0, 4))
@@ -1837,6 +2057,8 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((dual_program(swap_weights=True), translate_dual))
     fixtures.append((with_constants(LITERAL_FMA_BODY), translate))
     fixtures.append((scheduling_hints(), translate))
+    fixtures.extend((buffer_color(rg), translate_buffer_color) for rg in (False, True))
+    fixtures.extend((attribute_color(rg), translate_attribute) for rg in (False, True))
     for index, (instructions, lower_fixture) in enumerate(fixtures):
         source = directory / "fixture.s"
         obj = directory / "fixture.o"
@@ -2023,6 +2245,54 @@ def check_frexp_ldexp_draws(directory, compiler, renderer, backend):
         raise AssertionError("Inverting the v_ldexp_f32 exponent sign escaped detection")
 
 
+def check_three_way_draw(directory, compiler, renderer, backend):
+    source = directory / "three_way.hlsl"
+    shader = directory / "three_way.cso"
+    source.write_text(translate(three_way()), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    for constants in ((.25, .75, .375, .5), (.625, .125, -.3125, .5)):
+        case = three_way_case(directory, *constants)
+        draw = [renderer, backend, "--check-pixel-case", shader, case]
+        result = subprocess.run(draw)
+        if result.returncode:
+            return result.returncode
+    without_abs = [line.replace("|s46|", "s46") for line in three_way()]
+    source.write_text(translate(without_abs), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("The renderer failed to detect the missing min3 absolute value")
+    source.write_text(translate([line.replace("v_med3_f32 v12", "v_min3_f32 v12") for line in three_way()]),
+                      encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("A minimum replaced the median without a mismatch")
+    return 0
+
+
+def check_buffer_color_draw(directory, compiler, renderer, backend):
+    source, shader, case = (directory / name for name in ("buffer.hlsl", "buffer.cso", "buffer.case"))
+    for rg in (False, True):
+        source.write_text(translate_buffer_color(buffer_color(rg)), encoding="ascii")
+        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        draw = [renderer, backend, "--check-pixel-case-rg" if rg else "--check-pixel-case", shader, case]
+        for red, green in ((0.25, 0.75), (-0.5, 0.125)):
+            constants = bytearray(256)
+            struct.pack_into("<4f", constants, 16, green, 2, 3, red)
+            blue, alpha = (-1, -1) if rg else (green, red)
+            expected = struct.pack("<4f", red, green, blue, alpha) * 64
+            case.write_bytes(constants + expected)
+            result = subprocess.run(draw)
+            if result.returncode:
+                return result.returncode
+        struct.pack_into("<f", constants, 28, green)
+        case.write_bytes(constants + expected)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError("Wrong buffer color escaped detection")
+
+
 def check_render(directory, compiler, renderer, backend):
     for swap in (False, True):
         source = directory / "fixture.hlsl"
@@ -2179,6 +2449,7 @@ def check_render(directory, compiler, renderer, backend):
         raise AssertionError("Swapped blend weights escaped detection")
     check_cube_draw(directory, compiler, renderer, backend)
     check_fract_draw(directory, compiler, renderer, backend)
+    check_reciprocal_draw(directory, compiler, renderer, backend)
     check_int_minmax_draws(directory, compiler, renderer, backend)
 
     check_frexp_ldexp_draws(directory, compiler, renderer, backend)
@@ -2231,8 +2502,12 @@ def main():
             check_binary(directory, *args)
         elif mode == "draw":
             return check_render(directory, *args)
+        elif mode == "three-way":
+            return check_three_way_draw(directory, *args)
+        elif mode == "buffer-color":
+            return check_buffer_color_draw(directory, *args)
         else:
-            raise ValueError("Expected binary or draw mode")
+            raise ValueError("Expected binary, draw, three-way or buffer-color mode")
 
 
 if __name__ == "__main__":

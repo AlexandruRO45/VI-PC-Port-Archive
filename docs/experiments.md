@@ -28,6 +28,51 @@ dumpbin /imports .\out\build\dev\d3d12_sdk_check.exe
 
 Build outputs and downloaded tool sources live under `out/`. [Microsoft xbdepends documentation](https://learn.microsoft.com/en-us/samples/microsoft/xbox-gdk-samples/xbdepends/)
 
+## Two-record archive reader from standard startup
+
+The [archive reader](../tests/cpu/archive/reader.zig) uses Zig 0.13.0's standard single-threaded Windows console startup. From the linked entry the translator follows the call into the record loop and the final call to RtlExitUserProcess. It recognizes six-byte linker jump thunks for explicitly bound IAT slots, models termination without fallthrough and propagates a narrow return value through a wider register copy. A control changes the startup to consume EAX instead of AL and must fail translation.
+
+Each record contains a one-byte compressed length and a PKWare DCL stream. The [native codec DLL](../tests/cpu/archive/codec.cpp) builds the unmodified blast.c and blast.h from [Mark Adler's blast 1.3 in zlib v1.3.1](https://github.com/madler/zlib/tree/v1.3.1/contrib/blast), retaining their license notices. The callback stages up to 6144 decoded bytes per record. The translated reader drives allocation, decode, publication, cleanup and the completed count. All three processes share the native codec.
+
+Two distinct eight-byte streams produced 26 identical bytes, two completed records, two allocations and frees, and exit 0 across Windows, pe_map and AOT. With only four bytes of the second payload the decoder requested more input, then delivered one tentative output byte. Only the first record's 13 bytes reached stdout. All three completed one record, freed both allocations and exited 2. The [comparison](../tests/cpu/archive_check.py) checks the full event trace against fixed expectations.
+
+Install requirements-dev.txt before building. On x64 Windows this includes the pinned Zig compiler (about 80 MB download).
+
+```powershell
+cmake --build --preset dev --target archive_reader_lifted pe_map
+ctest --preset dev --no-tests=error -R '^cpu_native_archive_reader$' -V
+```
+
+### Recompiling the blast decoder
+
+The `cpu_native_archive_blast` test starts from the same archive reader and builds the unmodified blast 1.3 C file into a separate scalar x64 DLL with MSVC /Od. The [fixture translator](../tests/cpu/archive/translate_blast.py) follows direct calls from its PE export through the bit reader, Huffman table construction, symbol decoder and decompression loop. It reuses the x64 instruction lifter and frame analysis. Only generated C++ is compiled into the translated decoder. Its initialized data, including relocated table pointers, is separate from the native module. This profile uses per-thread tables, a bounded invocation stack, the six-argument blast ABI and two typed callback targets. The host supplies setjmp/longjmp semantics for a single active recovery point. The file I/O and allocation callbacks remain native.
+
+On the MSVC 19.51 build, tracing the generated callback sites for the two streams reached the input call at RVA `0x11e0` and the final output call at `0x115d`. With the second stream truncated, the input calls returned 4 then 0 bytes, the call at `0x1206` took the longjmp path, and the final output callback received one tentative byte. This byte remained unpublished. The two short streams exercise the final partial-window callback.
+
+The window cases retain a 13-byte first record and use explicit DCL length/distance pairs in the second. Eight 512-byte overlapping copies at distance three span the 4096-byte decoder window. The decoder then reads a distinct final literal. On Windows x64, the native, mapped and recompiled programs all delivered callbacks of 4096 and 4 bytes for this record, published all 4113 archive bytes in order, completed two records and exited 0.
+
+With sixteen copies, the adapter stages the first 4096 bytes and refuses the next 4096 because they exceed its 6144-byte per-record limit. The second record publishes zero bytes, including the previously staged window. All three runners retained the first record's 13 bytes, completed one record, and exited 2. Both cases check the full callback trace and one allocation and release per record.
+
+Windows loads the original decoder for the native run. The mapped child separately maps the original decoder, codec adapter and reader, binding each import to the preceding mapping's export. The AOT reader imports an adapter linked to the translated decoder; PE import checks guard against falling back to the original. Both archive outcomes match the byte and event traces above. A direct callback control on both decoder DLLs refuses output and checks both context pointers, the delivered bytes, and blast's error return of 1.
+
+```powershell
+cmake --build --preset dev --target archive_all_lifted pe_map
+ctest --preset dev --no-tests=error -R '^cpu_native_archive_blast$' -V
+```
+
+## CRC-32 console program from the PE entry
+
+`cpu_crc_line` reads the first text line from stdin and writes eight uppercase hexadecimal digits and a newline. Its [MASM entry](../tests/cpu/crc_line/entry.asm) handles input, formatting and exit status. MSVC compiles the [CRC update](../tests/cpu/crc_line/crc_step.cpp) as a separate optimized object. The linker imports the real Windows Universal CRT stdio functions through `ucrt.lib`. The source PE has a return-based entry and uses no CRT startup stub.
+
+The [console translator](../tools/cpu_stdio_exe_aot.py) starts at `AddressOfEntryPoint` with no defined argument registers. On MSVC 19.51 the first refusal before enabling imports was at RVA `0x103d`, the call through the IAT to `getchar`. The translator binds near RIP-relative calls by their IAT slots, DLL and symbol, with the argument widths and defined return bytes of `getchar`, `putchar` and `fflush`. It follows the direct call to the compiled CRC routine and emits both functions from the linked instructions. Only the generated C++ is compiled into the AOT executable. The host supplies the UCRT calls. The test rejects a copy that names a different provider.
+
+The [Windows comparison](../tests/cpu/crc_line_check.py) launches the native EXE, a child running the same PE with `pe_map_run`, and the AOT EXE. The mapped child restores normal UCRT text-mode pipes before entry. All three produced `CBF43926\r\n` for `123456789` and exited 0. They also agreed on CRLF, a final line without a newline, an empty line and a 13,000-byte line. EOF before any input produced no output and exit 1. A read-only stdout handle left the sink unchanged and produced exit 2. A separately linked and retranslated Castagnoli polynomial control produced `E3069283\r\n` on the same standard vector.
+
+```powershell
+cmake --build --preset dev --target cpu_crc_line_lifted cpu_crc_castagnoli_lifted pe_map
+ctest --preset dev --no-tests=error -R '^cpu_native_crc_line$' -V
+```
+
 ## Source-built EXE entry to a DLL import
 
 MSVC assembles a small CRT-free [EXE entry body](../tests/cpu/exe_entry.asm) and links it with the existing `call_mix` fixture. The [translator](../tools/cpu_exe_aot.py) takes the fixture's `native_entry` export through `--entry-export`, reads its unwind-bounded instruction range, follows the relative call to `call_mix`, and resolves its IAT slot against `cpu_import_provider.dll!mix_args`. It emits both functions as C++. The translated EXE uses ordinary Windows C++ startup to enter the generated `main`. Both versions use the same native provider and the same I/O DLL.
@@ -498,6 +543,8 @@ The string instructions `movs`, `stos`, `lods`, `scas` and `cmps` lower in byte,
 
 The shared lowering also handles baseline x64 sign-extension (`cbw`, `cwde`, `cdqe`, `cqo`, `movsx`) and add-with-carry (`adc`) forms, preserving upper bits on 16-bit writes, zero-extending 32-bit writes, and propagating carry-in/carry-out and ZF on `adc`. `cpu_aot_sign_ext_adc` builds all 11 exports from MASM source (`tests/cpu/sign_ext_adc.asm`), translates them, and compares values and flags against the native DLL and a reference model. Run `cmake --build --preset dev --target cpu_sign_ext_adc_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_sign_ext_adc$' -V`.
 
+The shared lowering also handles 32-bit and 64-bit BMI2 forms (`bzhi`, `mulx`, `pdep`, `pext`, `rorx`, `sarx`, `shlx`, `shrx`), preserving flags on the flag-free forms, updating ZF/CF on `bzhi`, and resolving same-destination `mulx` to the high half. `cpu_aot_bmi2` probes CPUID leaf 7 EBX bit 8 (`BMI2`) before invoking the native fixture and exits 77 (capability skip) on hosts without BMI2; on BMI2-capable hosts it builds all 17 exports from MASM source (`tests/cpu/bmi2.asm`), translates them, and compares values and flags against the native DLL and a reference model. Run `cmake --build --preset dev --target cpu_bmi2_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_bmi2$' -V`.
+
 ## Recompiling a direct x64 call
 
 The [caller and callee](../tests/cpu/direct.asm) each accept two unsigned 64-bit integers and an output pointer. The [translator](../tools/cpu_call_aot.py) starts at the caller export, follows the signed displacement in its E8 call and reads the target's runtime-function interval. It generates two C++ functions from the linked machine code. MSVC emits a separate x64 DLL with a non-inlined call. The Windows test checks the relative call against the two export addresses in both the input and output DLLs.
@@ -765,7 +812,7 @@ cmake --build --preset dev --target cpu_switch_original_lifted cpu_switch_swappe
 ctest --preset dev --no-tests=error -R '^cpu_aot_jump_tables$' -V
 ```
 
-The decoder starts at the export and follows branches, fallthrough and table entries, so it never decodes the table bytes that MSVC places after a function's code. An indirect jump is accepted only in the sequence `load entry; add base; jmp`, reached by the fallthrough of an unsigned `JA` or `JAE` against an immediate. The table length comes from that bound. A must-agree constant pass over the control-flow graph gives the base register's RIP-relative value, which also covers a base loaded once outside a loop. Value numbering over the single-entry block that contains the bound shows that the index register holds the compared value, zero- or sign-extended from 32 bits. Every table entry must be the first byte of a decoded instruction inside the function, and the table must not overlap any decoded instruction. Flags are modelled only between a producer (`CMP`, `TEST`, `ADD`, `SUB`, `AND`, `OR`, `XOR`, `INC` or `DEC`) and its consumers: a conditional jump, `SETcc` or `CMOVcc`. Producer and consumer must sit in one straight-line run that no edge enters; only instructions that leave the flags unchanged (moves, `LEA`, `NOT`, `SETcc`, `CMOVcc`) may lie between them. Overflow and parity conditions are supported for these producers, using their operand width and the low result byte respectively. A forward pass records how many low bytes of each register (0, 1, 2 or 8) every path defines, and rejects a read of more bytes than that. Writes to AH, BH, CH and DH, 16-bit `CMOVcc` and indirect calls are rejected; direct calls are described below. Stack operations and nonvolatile registers are accepted only under the frame rules described below.
+The decoder starts at the export and follows branches, fallthrough and table entries, so it never decodes the table bytes that MSVC places after a function's code. An indirect jump is accepted only in the sequence `load entry; add base; jmp`, reached by the fallthrough of an unsigned `JA` or `JAE` against an immediate. The table length comes from that bound. A must-agree constant pass over the control-flow graph gives the base register's RIP-relative value, which also covers a base loaded once outside a loop. Value numbering over the single-entry block that contains the bound shows that the index register holds the compared value, zero- or sign-extended from 32 bits. Every table entry must be the first byte of a decoded instruction inside the function, and the table must not overlap any decoded instruction. Flags are modelled only between a producer (`CMP`, `TEST`, `ADD`, `SUB`, `AND`, `OR`, `XOR`, `INC` or `DEC`) and its consumers: a conditional jump, `SETcc` or `CMOVcc`. Producer and consumer must sit in one straight-line run that no edge enters; only instructions that leave the flags unchanged (moves, `LEA`, `NOT`, `SETcc`, `CMOVcc` and the sign extensions `CBW`, `CWDE`, `CDQE`, `CDQ` and `CQO`) may lie between them. Overflow and parity conditions are supported for these producers, using their operand width and the low result byte respectively. A forward pass records how many low bytes of each register (0, 1, 2 or 8) every path defines, and rejects a read of more bytes than that. Writes to AH, BH, CH and DH, 16-bit `CMOVcc` and indirect calls are rejected; direct calls are described below. Stack operations and nonvolatile registers are accepted only under the frame rules described below.
 
 The translator also lowers `JO/JNO/JP/JNP`, `SETO/SETNO/SETP/SETNP` and
 `CMOVO/CMOVNO/CMOVP/CMOVNP`. `ADD`, `SUB` and `CMP` overflow is computed from
@@ -866,6 +913,10 @@ Skipping the hash check, treating any address in a range as its start, walking a
 
 The corpus walk above passes no manifest, so its counts are unchanged: 97 of 2,346 unique functions translate, before and after this option, and none is lost or gained. Unbound targets are counted only as candidates for a binding. Without one, 872 functions are refused first at a target that needs a binding (808 calls and 64 tail jumps); counting a refused callee's innermost reason, 974. They reach 421 distinct target RVAs, 129 of them shaped like an import thunk, which a binding would not admit.
 
+One-operand `MUL` and `IMUL`, `DIV` and `IDIV` and the sign extensions `CBW`, `CWDE`, `CDQE`, `CDQ` and `CQO` read and write RAX and RDX without naming them. MSVC emits them for 64-bit multiply-high, division and modulo. Operand 0 of such a multiply or divide is a source. The translation copies every input into a `const` temporary before it writes RAX or RDX, because `mul rdx`, or a source addressed through RDX, reads a register that is also an output. A sign extension is computed in `std::uint64_t` as `(x ^ s) - s`, where `s` is the top bit of the source, and `CDQ` and `CQO` as `0 - (x >> (bits - 1))`. Unsigned arithmetic wraps by definition, so these forms involve no signed conversion and no shift of a negative value. Factors of up to 32 bits are widened to `std::uint64_t`, sign-extended for `IMUL`. Their product needs at most 64 bits, so the wrapped product is exact. An 8-bit multiply writes AX, and a 16-bit multiply merges into AX and DX; the byte-wise definedness pass counts these as 16-bit writes. 64-bit products use `_umul128` and `_mul128` from `<intrin.h>`, which the generated source now includes. Quotients use `_udiv64`, `_div64`, `_udiv128` and `_div128`. These execute the hardware `DIV` or `IDIV`, so a zero divisor or a quotient that does not fit raises the same divide error as in the original, and the translation emits no C++ `/` or `%`. The signed intrinsics take signed parameters. Converting a register value of 2^63 or more to them is implementation-defined in C++14 and C++17, which MSVC defines as wrapping, and defined as wrapping in C++20; the translator already relies on this conversion for `MOVSX`, `SAR` and the signed conditions. With MSVC 14.52 `cl /O2 /FAs`, each divide of the fixture compiles to one `div` or `idiv` and each 64-bit multiply to one `mul` or `imul`, with no call and no added check. The Debug build that CTest uses also keeps them inline. Reaching a divide raises its error even when both results are unused: the translation stores the quotient to a `volatile` local, so the compiler must perform the divide when the function overwrites RAX and RDX without reading them. Without that store, an `/O2` build removed such a divide, and a divide by zero returned in the translation and faulted in the original. `cpu_aot_dead_divides` checks this on [`dead_div.asm`](../tests/cpu/dead_div.asm), whose exports store 1 to the trace before the divide and 2 after it, then overwrite both result registers: 32-bit `DIV` and `IDIV`, a 64-bit `DIV` of RDX:RAX, a 64-bit `IDIV` after `CQO`, and `div_skip`, which branches around its divide when the divisor is zero. The translation is built twice, by the project's Debug build and by a separate `cl /O2` command, and a small C++ helper calls each function inside `__try` and returns the structured exception code. For zero divisors, quotients that do not fit, valid divides and the skipped divide, both builds must give the code, the return value and the trace that the original gives. The original is the oracle; the test itself only requires that an input expected to fault yields one of the two integer divide codes and leaves the second trace word unwritten. Inputs that do not fault are also compared through the register probe. 8-bit divides, which write AH, and 16-bit divides, which no intrinsic executes, are rejected. `MUL`, `IMUL`, `DIV` and `IDIV` set flags that the flag model does not describe, so a flag consumer after one of them is rejected. The Intel SDM lists "Flags Affected: None" for the sign extensions, so they may lie between a producer and its consumer. The constant pass for table bases and the value numbering for table indices treat these instructions as writes of RAX and RDX.
+
+`cpu_aot_wide_arithmetic` builds [`wide_arith.asm`](../tests/cpu/wide_arith.asm) and translates thirteen exports: `div32` (EDX:EAX built from RCX, divided by EDX moved to R9D), `idiv32` (`CDQ`, then `IDIV`), `div64` (`XOR EDX`, then `DIV`), `udiv128` (RCX:RDX divided by a fixed divisor), `idiv64` (`CQO`, then `IDIV` of a memory operand), `mul64` (`mul rdx`), `imul64_1` (one-operand `IMUL` of a memory operand addressed through RDX, which it overwrites), `mul32` and `imul32`, `mul8` and `mul16` (8- and 16-bit `MUL` and `IMUL`), `widen` (`CBW`, `CWDE` and `CDQE`, alone and chained) and `sign_dx` (`CDQ` and `CQO` between a `CMP` and its `SETL`). Through the register probe, each original and translated export is compared with a Python reference over the direct-call input pairs that do not fault, plus the largest quotients that fit, the minimum dividends and inputs across the sign boundaries. The reference rounds signed quotients toward zero itself, since Python's `//` rounds toward minus infinity. RAX, the guarded trace and RBX/RSI must match. Eight faulting inputs, zero divisors, unsigned quotients that do not fit, -2^31 / -1 and -2^63 / -1, must raise the same `OSError` through ctypes in the original and in the translation, and leave the same trace. The test accepts `exception: integer divide by zero` or `exception: integer overflow`, provided both sides report the same. Eleven controls must be rejected: `div r9d` patched to `div r9b` and to `div cx`, a `JE` right after `DIV`, `CDQ` patched to `CLC` between `CMP` and `SETL`, a `MUL` and a `CDQ` whose RAX is no longer written (rejected at the `MUL` and at the `CDQ`), `JC` after `MUL`, two jump tables whose base or index register a `MUL` or `CQO` overwrites before the dispatch, a store of RDX after an 8-bit `MUL`, which leaves RDX holding a guest address from a RIP-relative `LEA`, and the same function with `div ecx`, which reads that EDX. With MSVC 14.52 `cl`, `link` and `ml64` run under Wine on Linux, 2,929 inputs matched, all eleven controls were rejected, and all eight faulting inputs raised `exception: integer divide by zero` on both sides; Wine reports every divide error this way. Whether Windows reports the overflow cases as `integer overflow` was not observed here. The Windows job runs the same test. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_wide_arithmetic$' -V`.
+
 ### Delay imports
 
 `delay_route` imports `delayed_value` from `cpu_delay_provider.dll` by name and `delayed_ordinal` by ordinal 2 with `/DELAYLOAD`, and exports one caller for each. `cpu_native_delay` compares two paths: `LoadLibrary` plus the image's own delay helper, and `pe_map` with a resolver bound to the same provider. The mapped calls return the provider values, and IAT slot checks confirm both hold the `GetProcAddress` results before the calls. Binding the altered provider returns its values instead.
@@ -891,13 +942,56 @@ The report follows the effect's stored list order. Each entry gives its stored g
 
 Two independently located local effects yielded 5 and 81 candidates across all groups. Their pixel lists contained 2 and 41 candidates respectively, and every pixel-container digest matched an independent decode. Identifying which candidate a draw uses still requires evidence of pass selection.
 
+## Compute UAV stores from a native container
+
+`tools/compute_store_aot.py` accepts a local extracted DXBC compute container. It checks the stage in both the DXIL and PSV0 parts, the group dimensions, the FSSM v0x101 extent and termination, then decodes the gfx1013 instructions with LLVM. The first profile translates one raw UAV store of one to four immediate words per invocation. A test binding maps one four-word descriptor to u0. Its table pointer has a known low register and a zero high word. Scalar loads must complete before use. For an indexed store the caller also supplies the group-X register and byte stride, v0 carries local X, and the decoded shift and add must produce the dispatch-thread index. The tests bind in-range raw buffers with no swizzle, format conversion or out-of-range accesses. The original descriptor contents and dispatch configuration require separate evidence.
+
+```sh
+python3 -B tools/compute_store_aot.py local.dxbc --llvm libLLVM-15.so.1 --table-reg 5 --descriptor-offset 64 --group-reg 6 --stride 4 --output out/store.hlsl
+python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
+Build the emitted source with `dxc -T cs_6_0 -E main`. The Windows fixture reads back all 320 words, including gaps between records and the untouched tail, after one and three indexed groups. A wrong stored word and a wrong guard word must both fail. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_'`.
+
+A local scan of 2,689 compute records accepted 12 records (10 distinct instruction streams). Ten use one-thread groups and fixed addresses. Two use 32- and 64-thread groups and indexed addresses. Tested table bindings used s4 or s5 with descriptor offsets of 0, 32 or 64. The indexed bindings used strides of 4, 8, 12 or 16 bytes, selecting the first compatible profile. On RTX 4060 Laptop (32.0.16.1656) and WARP (10.0.26100.9818), each record compiled to desktop DXIL and dispatched. Each adapter completed 14 full-buffer comparisons with zero mismatches, including two different group counts for both indexed records.
+
 ## Offline pixel shader recompilation
+
+### Pixel color without a texture sample
+
+For an unsampled pixel program, a matched P1/P2 interpolation in the entry mask can supply attr0.x/y/z/w from a four-component TEXCOORD0. The profile binds entry v0/v1 to the barycentric pair and the observed m0 source to the interpolation base. Each completed P2 produces a distinct value, including when the destination overwrites v0. The test vertex shader varies all four channels across a full-screen triangle. CPU references check all four output words at 1,024 pixel centers; an incorrect channel at an interior pixel must fail. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_attribute_'`.
+
+A local scan found 35 additional single-exit unsampled pixel records (12 different native instruction streams). All 35 compiled to DXIL and passed readback on RTX 4060 Laptop 32.0.16.1656 and WARP 10.0.26100.9818. The two constant-buffer records used two buffer inputs, giving 37 draws per adapter. This is a controlled TEXCOORD0 binding with linear screen-space test values.
+
+In a separate two-exit population, 2,151 records read four words at byte offset zero through a zero-extended s9 address. Tracking that register range to its first direct use found 912 single-word, five two-word, 1,222 four-word and one eight-word scalar buffer reads. Eleven first uses remained unresolved. These counts identify consumers of a descriptor in the native program; they do not establish its original bound contents or the output of those programs.
+
+Use `--no-texture` in place of `--sampler-words` for a program that writes MRT0 without sampling. For a constant-buffer program, `--texture-sgpr` identifies the entry register holding the low descriptor-table address and `--constant-descriptor` gives the byte offset of the four-word descriptor in that table. Offset zero is valid with this profile. At a tested call site the program copies entry s9 to the low address register, sets the high word to zero, fetches the descriptor and loads color words. Bind the test buffer at b0. Other programs can copy s9 to m0 for interpolation. Select the binding from the program's use of the register.
+
+An RG-only compressed MRT0 export produces a two-component output. Match it with a red/green render-target write mask. The Windows fixture clears all four channels to -1, draws with two different constant buffers and compares every channel, including preserved blue and alpha. A stale reference must fail. A second draw profile checks the four-component export with all channels enabled. To reproduce:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^pixel_aot_buffer_color_' -V
+```
+
+A local audit against the 3310cb8 baseline retained the four sampled profiles and added six zero-sample profiles (entry table register 8 or 9, interpolation register 24, and no constant descriptor or a descriptor at byte 0 or 32). Of 26,503 records, 334 pixel records compiled with DXC `-Gis -T ps_6_0` and created D3D12 pipelines, up from 2. These represent 333 distinct containers and 21 distinct native instruction streams. Of the 332 additional records, 315 exported immediate values and 17 read the constant buffer; 298 wrote RG and 34 wrote RGBA. Each was drawn on an RTX 4060 Laptop (32.0.16.1656) and WARP (10.0.26100.9818). Reference colors for the new records were computed from the decoded operands, test buffer words and truncation to binary16. Two buffer inputs per constant-buffer record plus the original copy and day/night cases gave 352 draws per adapter. Each draw matched all 4,096 float4 pixels. These results use controlled buffers and render-target masks.
+
+### Pixel programs with two exits
+
+For FSSM version 0x101 the pixel extractor reads the 64-bit code offset, byte count and section end at 0xC0, 0xC8 and 0xE8. Instructions start 40 bytes after the code offset. The end must agree with offset plus count. For the unset end sentinel the extractor also checks for four padding words at the computed end. It strips aligned trailing `s_code_end` words inside that extent and requires a terminal `s_endpgm`. A marker in the following metadata cannot extend or terminate the code. The field interpretation agrees with the [independent FSSM cross-check](https://github.com/ItsNotRexed/Leonida/blob/dcd8ecf10b138566d567020562b7afd853a89024/docs/fssm_crosscheck.md).
+
+Among 6,189 pixel records previously rejected by the unique-marker rule, 5,465 had two aligned end markers, 682 had three, 38 had four and four had five. The largest layout had two markers 20 bytes apart (3,561 records). In the supported two-exit layout, a direct branch targets the block immediately after the early exit. The extractor uses LLVM instruction boundaries to follow both conditional successors, preserves both exits and permits skipped alignment NOPs. Unresolved transfers, jumps into instruction operands or padding, and disconnected executable blocks are rejected. This verifies a code span; lowering branch or resource semantics is a separate step.
+
+The source-built binary checks include a literal word resembling a terminator, a metadata terminator, conflicting extents, a branch into a literal and a disconnected exit. Run with LLVM 15:
+
+```bash
+python3 -B tests/pixel_aot_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
 
 `tools/pixel_aot.py` extracts one named pixel program from a local archive, decodes gfx1013 instructions with LLVM and emits HLSL. DXC compiles the result to desktop DXIL before the draw. The lowerer tracks register writes across whole-quad interpolation of attribute 0, a scalar texture-descriptor load, a 2D RGBA sample, packed round-toward-zero binary16 conversions and one compressed color export. Unknown instructions, mismatched bindings and reads before the required wait cause translation to fail. [LLVM disassembler API](https://llvm.org/docs/doxygen/group__LLVMCDisassembler.html) · [Leonida public format reference](https://github.com/ItsNotRexed/Leonida/blob/56f023a10a726da20702d4e121656ceda2391d93/tools/fssm_unpack.py)
 
 The caller identifies the entry registers for the texture address and interpolation base, and supplies the four sampler descriptor words to match. The generated pixel shader uses `TEXCOORD0`, texture `t0` and sampler `s0`. The test binds a point-clamp sampler, one mip and a full-screen triangle. These bindings are an explicit specialization. The test measures finite UNORM inputs under full pixel coverage. Execution with a title's original pipeline state, helper-lane behavior at triangle edges and other texture formats require separate validation.
 
-For a shader that reads constants, pass `--constant-descriptor OFFSET` to identify its four-word descriptor in the same table as the texture descriptor. The desktop test binds 256 bytes at `b0`. A four-word read may span two HLSL constant vectors. Arithmetic support includes log2, exp2, reciprocal, min/max, addition, multiplication, subtraction in either operand order, legacy zero-preserving multiplication, multiply-add, destination accumulation and saturation. `v_mov_b32` copies a sample component, a loaded constant, an earlier result or an inline or literal constant, and rejects interpolation state, packed values and source modifiers. The lowerer rejects moves and floating-point arithmetic writes to the destination registers of an outstanding sample until `s_waitcnt vmcnt(0)`. As in the other operands, an integer inline constant is a bit pattern, not a converted value. Ordered and unordered `v_cmp_*_f32` comparisons, including the always-false and always-true predicates, but excluding class and exec-writing forms, become HLSL booleans, and `v_cndmask_b32` selects between two numeric operands with one. The lowerer accepts a mask in `vcc` or a scalar register under either wavefront-width spelling and rejects a select whose mask it did not see a comparison write. For `nlg`, equality or an explicit NaN check on either operand preserves the unordered case in DXIL. The earlier ordered comparisons produced a mismatch on the [reported RX 9070 XT driver](https://github.com/R0Y00/Xbox2Windows/issues/179). The pixel draw checks cover all 16 truth tables with less-than, signed-zero equality, greater-than and a quiet NaN on either side. Replacing a NaN with an equal finite operand must fail against the saved unordered reference. Compile arithmetic shaders with DXC `-Gis`. Transcendental precision and multiply-add rounding may vary by device. [AMD RDNA instruction reference](https://gpuopen.com/wp-content/uploads/2019/08/RDNA_Shader_ISA_5August2019.pdf) · [HLSL mad precision](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/mad)
+For a shader that reads constants, pass `--constant-descriptor OFFSET` to identify its four-word descriptor in the same table as the texture descriptor. The desktop test binds 256 bytes at `b0`. A four-word read may span two HLSL constant vectors. Arithmetic support includes log2, exp2, reciprocal, two-operand min/max, three-operand minimum, maximum and median (`v_min3_f32`, `v_max3_f32`, `v_med3_f32`), addition, multiplication, subtraction in either operand order, legacy zero-preserving multiplication, multiply-add, destination accumulation and saturation. The three-operand forms are emitted as nested HLSL `min` and `max`, with the median as `max(min(a, b), min(max(a, b), c))`. Each result is one of its operands, so finite inputs involve no rounding; NaN operands are not measured and may differ from the hardware's NaN rules. `v_mov_b32` copies a sample component, a loaded constant, an earlier result or an inline or literal constant, and rejects interpolation state, packed values and source modifiers. The lowerer rejects moves and floating-point arithmetic writes to the destination registers of an outstanding sample until its result is ready. With two samples in flight, `vmcnt(1)` permits moving the older result while all four destination registers of the newer sample remain protected. The dual-texture fixture uses that move in the rendered blend. As in the other operands, an integer inline constant is a bit pattern, not a converted value. Ordered and unordered `v_cmp_*_f32` comparisons, including the always-false and always-true predicates, but excluding class and exec-writing forms, become HLSL booleans, and `v_cndmask_b32` selects between two numeric operands with one. The lowerer accepts a mask in `vcc` or a scalar register under either wavefront-width spelling and rejects a select whose mask it did not see a comparison write. For `nlg`, equality or an explicit NaN check on either operand preserves the unordered case in DXIL. The earlier ordered comparisons produced a mismatch on the [reported RX 9070 XT driver](https://github.com/R0Y00/Xbox2Windows/issues/179). The pixel draw checks cover all 16 truth tables with less-than, signed-zero equality, greater-than and a quiet NaN on either side. Replacing a NaN with an equal finite operand must fail against the saved unordered reference. Compile arithmetic shaders with DXC `-Gis`. Transcendental precision and multiply-add rounding may vary by device. [AMD RDNA instruction reference](https://gpuopen.com/wp-content/uploads/2019/08/RDNA_Shader_ISA_5August2019.pdf) · [HLSL mad precision](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/mad)
 
 `s_movk_i32` sign-extends its 16-bit immediate, and the translator folds the result. One draw checks the rule end to end on the GPU. It moves 0x8000 and 0x7fff, extracts bytes 1 and 3 of each with `s_bfe_u32`, and widens each byte as a binary16 subnormal scaled by 2^24 to the exact integer, so the draw exports 255, 128, 127 and 0. A reference for zero extension (byte 3 of 0x8000 as 0), and one for treating 0x7fff as negative (byte 3 as 255), must each report a mismatch.
 
@@ -929,7 +1023,7 @@ To supply a reference for another arithmetic program, run `offscreen_check.exe h
 
 `v_fmaak_f32` computes S0 × S1 + K and `v_fmamk_f32` computes S0 × K + S1, where K is the 32-bit literal that LLVM prints in that position. Both use the `v_fma_f32` lowering; the translator refuses a register where the literal belongs. The draw computes each instruction twice with inputs 1.5, 2.5, -3.0 and 0.75 and the literals 0.25, 3.0, -0.5 and 0.5. Every product and sum is exact in binary32, so the reference does not depend on fusion. A reference that swaps the literal with S1 must report a mismatch in each channel.
 
-`v_fract_f32` returns x - floor(x) clamped to `0x3f7fffff`, so its result stays below 1.0. The lowering uses an explicit clamp, not a bare D3D `frac`, which has no clamp and differs between adapters. For an input of -2^-30 the unclamped difference rounds to 1.0. An RTX 4070 Ti (driver 32.0.16.1088) exported 1.0 for that input, while WARP 10.0.26100.9818 already exported the clamped value. The draw also checks -0.25, 2.75 and -2^-23, which stay below the clamp. A reference that expects 1.0 for the first input must report a mismatch. NaN still propagates: it fails the clamp comparison.
+`v_fract_f32` returns x - floor(x) clamped to `0x3f7fffff`, so its result stays below 1.0. The lowering uses an explicit clamp, not a bare D3D `frac`, which has no clamp and differs between adapters. For an input of -2^-30 the unclamped difference rounds to 1.0. An RTX 4070 Ti (driver 32.0.16.1088) exported 1.0 for that input, while WARP 10.0.26100.9818 already exported the clamped value. The e64 lanes take the absolute value of -0.25 and the negated absolute value of 2.75 before computing the fraction. Each exports 0.25. Ignoring either source modifier would give 0.75 in that lane. An e32 lane checks -2^-23. A reference that expects 1.0 for the first input must report a mismatch. NaN still propagates: it fails the clamp comparison.
 
 `v_mad_f32` and `v_mac_f32` round the product to binary32 before the add; they are not fused. LLVM 15's AMDGPU backend selects them for an unfused multiply-add only when binary32 denormals are flushed: `SITargetLowering::isFMADLegal` notes that they do not support denormals. Both go through a helper that flushes each operand, the product and the sum to signed zero and keeps the two roundings with `precise`; `v_mac_f32` accumulates into its destination. The draw checks 4097 × 4097 − 16785408 for both instructions, which is 0 unfused and 1.0 fused, and 2^-127 × 2^126 + 0.5, which is 0.5 with the denormal input flushed and 1.0 without. References that expect the fused or the denormal-preserving result must report a mismatch. At commit d311159 the draw matched on an RTX 4070 Ti (driver 32.0.16.1088) and on WARP 10.0.26100.9818, and all three wrong references were detected. Whether Scarlett also flushes a denormal product or sum, as the helper does, is not measured.
 
@@ -1061,8 +1155,8 @@ With registration, the callers' predicates accept GPU-intended memory and reject
 
 | Export | Observed call shape | Desktop handling |
 |---|---|---|
-| `XMemAlloc` | Size and attribute word (Bink and AMD callers). | `era_heap::allocate`. Graphics memory types are also registered with `era_query`, so they count as GPU-intended. |
-| `XMemFree` | Allocation and the same attribute word. | Unregisters graphics allocations, then `era_heap::release_with_attributes`. |
+| `XMemAlloc` | Size and attribute word (Bink and AMD callers). | `era_heap::allocate`. Graphics memory types are also tracked by `era_title_gpu`, which registers them with `era_query` so they count as GPU-intended, and gives them desktop GPU addresses once a D3D12 device is attached (see below). |
+| `XMemFree` | Allocation and the same attribute word. | Untracks graphics allocations, dropping any alias and the `era_query` registration, then `era_heap::release_with_attributes`. |
 | `XMemVirtualQuery` | The four BVH callers pass the process in `rcx`, the address in `rdx` and a 64-byte buffer in `r8`; `r9` is not set, so there is no length argument. They test the 32-bit result in `eax`. | `era_query::query` on the 64-byte buffer; returns `TRUE` when it succeeds. |
 | `XMemGetWorkingSetStatistics` | The seven AMD callers pass `0x20000001` in `ecx` and an output address in `rdx` and test the 32-bit result. On failure each uses zero instead of the 64-bit value at `+8`. | Returns `FALSE` with `ERROR_NOT_SUPPORTED` and leaves the output untouched. |
 
@@ -1181,6 +1275,59 @@ Measured at commit `55cea41` on Windows 11 build 26300, with the debug layer una
 `offscreen_hardware` selects a high-performance adapter. `offscreen_warp` selects Microsoft's software rasterizer. Both draw the same DXC-compiled triangle to a 64×64 RGBA8 texture. After GPU completion the test reads the texture using its row pitch and compares colors and coverage pixel by pixel. Outputs are `triangle_hardware.bmp` and `triangle_warp.bmp` in the build directory. `ctest --preset dev -V` reports the adapter, driver, debug layer and pixel differences. Error or corruption messages from an available debug layer fail the test.
 
 The original test machine had Windows Graphics Tools installed. A second build in `out/build/agility` used Microsoft Agility SDK 1.620.2. Set `-DOFFSCREEN_AGILITY_620_DIR=<directory containing the x64 SDK DLLs>` to reproduce it. This configuration verifies debug interface activation. [Agility SDK package](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12/1.620.2)
+
+### Desktop GPU addresses for xmem graphics allocations
+
+`era_title_gpu` (`src/era_title_gpu.cpp`) is a process-wide registry that connects `xmem.dll` to the GPU address pieces above.
+
+How it works:
+- `xmem.dll` tracks every graphics allocation through it. Without a device this only registers the region with `era_query`, as before.
+- `attach(device)` opens every tracked allocation as an `era_gpu_alias` heap and adds its range to an `era_title_va::Table`. Allocations tracked later are aliased at once.
+- `translate` gives the desktop GPU address of a title span, and `locate` gives the buffer and offset behind it, for descriptors.
+- `shader_view` returns the packed ranges and the buffers in slot order for `TitleLookup`.
+
+Failures and lifecycle:
+- An allocation that cannot be aliased stays tracked without a translation. `attach` reports the first such failure after trying every allocation.
+- `detach` drops every alias and keeps tracking. Attaching a different device re-aliases everything.
+- The registry does not wait for GPU work before an alias is released: releasing memory the GPU still uses is a title error on the console as well.
+- The first `track` or `attach` creates the registry, and it is never destroyed, so unloading the module releases no D3D12 object. The other functions never create it; without it they behave as for an empty registry.
+- These functions are `noexcept`, and `track` runs while `XMemAlloc` is being serviced. An allocation failure, including while creating the registry, returns `false` from `track` (`E_OUTOFMEMORY` from `attach`) instead of ending the process. It registers nothing, and the call can be retried.
+
+The registry is private to the module that links it. `xmem.dll` keeps its four exports and its imports, and loading it does not load D3D12. The direct-linked tests cover attach and lookup within that module. A D3D12 client in another DLL cannot reach the registry: a shared registry, with a fixture that loads both DLLs and shows the client sees the real provider's allocations, is left for the first such client.
+
+| CTest case | Inputs and checks |
+|---|---|
+| `gpu_alias_registry_warp`, `gpu_alias_registry_hardware` | Two memory-type-1 allocations and an interior block of a region placed below the first one (not an allocation base, so it cannot be aliased) are tracked before attach. `era_query` must report them GPU-intended, with nothing translated. `attach` must report the interior block's `E_INVALIDARG` and still alias both allocations. `locate` and `translate` must agree. A span past the end and the interior block must not be translated or located. A third allocation tracked after attach is aliased at once, and an unaliasable block tracked after attach stays tracked without a translation. Re-attaching the same device keeps existing aliases. The registry's shader view then drives `TitleLookup` on the GPU: 15 addresses, 12 hits, matching CPU reads through the title pointers. `untrack`, `detach` and a full re-attach are checked against the same translations. Duplicate, overlapping, null and empty input are rejected. |
+| `xmem_shim_exports` | Now also requires that loading `xmem.dll` has not loaded `d3d12.dll`. |
+| `era_title_gpu_alloc` | No GPU. The program replaces the global `operator new` so that one chosen allocation fails. Before the first `track`, `counts`, `translate`, `locate`, `shader_view`, `untrack` and `detach` must make no allocation. Then every allocation of a first `track` (registry creation included) and of a later one is failed in turn. Each failure must return `false`, leave nothing tracked, registered with `era_query` or translated, and the call is retried. The first `track` must have more allocations that can fail than the later one. An `abort()` is reported on stderr instead of the debug CRT's dialog, and the test has a 30 s timeout. |
+
+Eight mutants of the registry each fail the test:
+- never aliasing on `track`;
+- stopping `attach` at the first failure;
+- keeping the `era_query` registration after `untrack`;
+- keeping aliases on `detach`;
+- no bounds in `locate`;
+- untracking on an alias failure;
+- reversing the shader view's buffers;
+- skipping the `era_query` registration.
+
+Measured at commit `f847956`, Windows 11 build 26300, debug layer enabled:
+- `gpu_alias_registry_warp` passed on WARP 10.0.26100.9818, with attach reporting `0x80070057` for the interior block, mismatches 0 and `debug_errors=0`. It passed 100 of 100 repeated runs.
+- `gpu_alias_registry_hardware` passed on an NVIDIA GeForce RTX 3070 Laptop GPU (driver 32.0.16.1088), with the same results. It passed 200 of 200 repeated runs.
+- The full suite passed: 148 tests, with 3 capability skips (`bvh_wave64_hardware`, `bvh_wave64_warp`, `wave_shuffle_warp`).
+- The stop-at-first-failure mutant failed 20 of 20 runs on each adapter ("two of three aliased"). All eight mutants were first measured at `d52905d`, on the RTX 3070 with the debug layer unavailable.
+
+Before `f847956`, the interior block's search tried only the 256 MB directly below the first allocation. That search found no free block in about 1 of 40 hardware runs, and the test failed in setup ("region below the first allocation").
+
+Measured at commit `21a65e5`, Windows 11 build 26300, debug layer enabled:
+- The full suite passed: 149 tests, with the same 3 capability skips.
+- `era_title_gpu_alloc` handled 6 failing allocations in a first `track` and 2 in a later one. It passed 50 of 50 repeated runs.
+- `gpu_alias_registry_hardware` passed 100 of 100 repeated runs on the RTX 3070, and `gpu_alias_registry_warp` passed 50 of 50.
+- Four mutants fail `era_title_gpu_alloc`:
+  - creating the registry with a throwing `new`: `abort()`, exit 3;
+  - building `shader_view`'s empty result by construction, which allocates under the debug STL: `abort()`, exit 3;
+  - a `counts` that creates the registry: exit 1;
+  - a `track` that keeps the `era_query` registration after a failed insertion: exit 1.
 
 ### Windows 10 with the app-local Agility SDK and WARP
 
@@ -1541,7 +1688,7 @@ The tool reads the candidate as a file and uses the manifest slot as its graph n
 
 Run `python -B tools/resource_root.py <archive> --offset <byte-offset> --stored <compressed-bytes> --decoded <decoded-bytes>` for one known zlib member. Both sizes must be exact and at most 2 MiB. The output contains the selected root's numeric type hash and byte size. The source-built control runs with `ctest --preset dev --no-tests=error -R '^resource_relocated_root$' -V`.
 
-The measured little-endian PRD0 v0x7a header stores a one-based root block index at byte 32, schema and instance directory pointers at bytes 40 and 56, and their counts at bytes 72 and 76. The reader resolves pointers relative to virtual address `0x50000000` within the decoded member. Each 16-byte instance entry gives a type, length and pointer. Exactly one 32-byte schema entry must have the root type, and its declared structure size must equal the root length. The root and both directories must fit in disjoint spans. This is a profile of the observed relocated records. The section-based script walker below uses separate LSCH and PSIN tables. [Related metadata row layouts and root selection](https://github.com/dexyfex/CodeWalker/blob/485d56bec00262ed7fa472261cce7bbc6202b96e/CodeWalker.Core/GameFiles/MetaTypes/Meta.cs) · [Observed-version header reference](https://github.com/rpatty-dev/PercyStar/blob/1b710c5349ef1911d94092f19173e9813dfb300c/src/anim.rs#L180-L219)
+The measured little-endian PRD0 v0x7a header stores a one-based root block index at byte 32, schema and instance directory pointers at bytes 40 and 56, and their counts at bytes 72 and 76. The reader resolves pointers relative to virtual address `0x50000000` within the decoded member. Each 16-byte instance entry gives a type, length and pointer. Exactly one 32-byte schema entry must have the root type, and its declared structure size must equal the root length. The root and both directories must fit in disjoint spans, and the block-map pointer must not fall within any of these extents. This is a profile of the observed relocated records. The section-based script walker below uses separate LSCH and PSIN tables. [Related metadata row layouts and root selection](https://github.com/dexyfex/CodeWalker/blob/485d56bec00262ed7fa472261cce7bbc6202b96e/CodeWalker.Core/GameFiles/MetaTypes/Meta.cs) · [Observed-version header reference](https://github.com/rpatty-dev/PercyStar/blob/1b710c5349ef1911d94092f19173e9813dfb300c/src/anim.rs#L180-L219)
 
 Three 8 MiB windows per archive (start, middle, end) yielded 556 verified roots of 352 bytes in an animation archive, 189 of 304 bytes in a navigation archive and 43 of 192 bytes in a pack archive. Each archive had a distinct root type across these samples. A further 102 marked members lacked a required in-range extent. The marker alone cannot identify an animation class or establish clip counts or playback behavior.
 
@@ -1564,6 +1711,63 @@ Bare paths begin at the record's `states` container. A leading `./` starts at th
 The [fixture supplied in #442](https://github.com/R0Y00/Xbox2Windows/issues/442) pins 104 packed bytes and the expected 16-byte BC7 block in `tests/bcpack_mode6_vector.py`. The optional [Leonida reference decoder](https://github.com/timelery/Leonida/tree/03d1e118a676d73aba66b1793cf033f6ad23b2b2/tools) reproduces all 16 bytes in strict mode with an empty provisional set. To repeat the packed-byte comparison, point `BCPACK_REFERENCE_TOOLS` at that revision's local tools directory and run `python -B tests/bc7_blocks_check.py -v`. The normal suite requires no external decoder.
 
 The CPU block test and the D3D12 BC7 draw tests check all 16 RGBA texels against fixed expected bytes. Changing the last selector from 15 to 0 selects the opposite endpoint only for the final texel. This covers a single zero-history synthetic vector. The local BCPack probe does not decode arbitrary BC7 streams.
+
+### Exporting two TTPF entries to DDS
+
+These measurements use Leonida's Python exporter on Windows with Python 3.14.2. Both indices are zero-based and refer to the same local `ttdb_ui.ttpf` pool, 845,115,648 bytes, SHA-256 `dc983ed7f6b78d1693fa5757f17c03bafb790e851594fdf4d412579b61d867f6`. The SHA-256 values in the table cover each complete DDS, including its header. Original pixel colours and coverage across the full set remain unverified. [Measurement request](https://github.com/R0Y00/Xbox2Windows/issues/458#issuecomment-7074603775)
+
+| Pool index | BCPack codec / DXGI format | Dimensions / mips | Export mode | Observed result |
+|---:|---|---|---|---|
+| 0 | 1 / BC1_UNORM (71) | 512 × 512 / 1 | Strict | Exit 0, 131,220 bytes, SHA-256 `cd39c88921eb395ad633b1bd9ee05a160f693bea8b1e85ad8543bc9cd272022a` |
+| 8253 | 7 / BC7_UNORM (98) | 512 × 256 / 1 | Strict | Exit 2, `BC7 signature rank 149 is inferred-only (unconfirmed)`, no DDS written |
+| 8253 | 7 / BC7_UNORM (98) | 512 × 256 / 1 | Fitted, history revision `3c997c411666b31372b0d2b82afd5ea669b4d774` | Exit 0, 131,220 bytes, SHA-256 `84e7abf023a568056178f6353d8e86e5d848e536e2aa92f1a028266231b1e15f` |
+
+Run the following PowerShell commands from the Xbox2Windows repository root with a fresh output directory. Set `$pool` to the matching local pool. The layout commands report the dimensions, mip count and the codecs used by each mip. [Pinned exporter](https://github.com/ItsNotRexed/Leonida/blob/b0befb4b88d6640354940117448ea19d52507584/tools/ttpf_mips.py) · [Pinned decoder](https://github.com/ItsNotRexed/Leonida/blob/b0befb4b88d6640354940117448ea19d52507584/tools/bcpack.py)
+
+```powershell
+$pool = (Resolve-Path 'game-files/ttdb_ui.ttpf').Path
+(Get-Item -LiteralPath $pool).Length
+Get-FileHash -LiteralPath $pool -Algorithm SHA256
+$out = New-Item -ItemType Directory -Path out/ttpf-dds-measurements
+git init --quiet "$out/Leonida"
+git -C "$out/Leonida" fetch --depth 1 https://github.com/ItsNotRexed/Leonida.git b0befb4b88d6640354940117448ea19d52507584
+git -C "$out/Leonida" checkout --detach b0befb4b88d6640354940117448ea19d52507584
+$exporter = "$out/Leonida/tools/ttpf_mips.py"
+python -I $exporter layout $pool 0
+python -I $exporter export $pool 0 "$out/strict-0.dds"
+Get-FileHash "$out/strict-0.dds" -Algorithm SHA256
+python -I $exporter layout $pool 8253
+python -I $exporter export $pool 8253 "$out/strict-8253.dds"
+$LASTEXITCODE
+Test-Path "$out/strict-8253.dds"
+```
+
+For the fitted run, use the same PowerShell session. The pinned calibration module exposes the BC7 endpoint and index history, including which bits were confirmed and which endpoint slots used a last-resort estimate. The commands serialize these fields to the JSON format accepted by the exporter. [Calibration source](https://github.com/timelery/Leonida/blob/3c997c411666b31372b0d2b82afd5ea669b4d774/tools/bcpack_tables_bptc.py)
+
+```powershell
+Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/timelery/Leonida/3c997c411666b31372b0d2b82afd5ea669b4d774/tools/bcpack_tables_bptc.py' -OutFile "$out/history_snapshot.py"
+@'
+import json
+import runpy
+import sys
+from pathlib import Path
+
+out = Path(sys.argv[1])
+table = runpy.run_path(str(out / "history_snapshot.py"))["load_bc7"]()
+bc7 = {
+    "historyEndpoints": table["history_endpoints"],
+    "historyEndpointBits": table["history_endpoint_bits"],
+    "historyEndpointConfirmedBits": table["history_endpoint_confirmed_bits"],
+    "historyIndices": table["history_indices"],
+    "historyIndexBits": table["history_index_bits"],
+    "historyIndexConfirmedBits": table["history_index_confirmed_bits"],
+    "historyEndpointLastResort": sorted(table["last_resort"]),
+}
+(out / "history.json").write_text(json.dumps({"bc7": bc7}), encoding="utf-8")
+'@ | python -I - "$out"
+python -I $exporter export $pool 8253 "$out/fitted-8253.dds" --allow-provisional --history "$out/history.json"
+Get-FileHash "$out/fitted-8253.dds" -Algorithm SHA256
+```
 
 ### Drawing BC7 textures with a recompiled pixel shader
 
@@ -1610,6 +1814,8 @@ Add `--raw-page-map INDEX` to report the logical and file offsets of a zero-base
 Use `--zlib-segment INDEX` for a descriptor in a codec-8 interval. This mode reads and decompresses the selected interval, limiting both stored and decoded sizes to 1 MiB. It verifies the zlib checksum and end of stream, checks the decoded length against the declared extent, and requires any trailing bytes to be zero. The report contains the fields for a `Segment`, its logical start, and the descriptor page's offset within it. Decoded bytes are not included in the report.
 
 Run `python -B tools/texture_descriptors.py --lookup-key 0x0123456789abcdef first.ttpf second.ttpf` to search the parallel little-endian 64-bit key tables in ETPF version 0x27a. Each match lists the archive path and zero-based descriptor index, in input order and then index order. Repeated keys produce separate matches. An absent key produces an empty list. The reader scans at most 512 KiB of keys per archive in batches of up to 4 KiB and leaves descriptor bodies and texture payloads unread. [Key table layout](https://github.com/holdmysocks/SixNG/blob/2f672555819f96993adeed3273653ad53eeb1d81/crates/sixng-core/src/ttpf.rs#L112-L123)
+
+Use `python -B tools/texture_descriptors.py --descriptor INDEX archive.ttpf` to inspect an individual entry, for example after `--lookup-key`. The JSON gives the zero-based index, width, height, numeric DXGI format, mip-marker byte and logical offset of the first 4 KiB page. The command reads the bounded headers and the selected 16-byte record. It leaves other descriptors, key tables and texture payloads unread.
 
 `tools/section_probe.py` samples up to 8 MiB at the start, middle and end of each input. It looks for 16-byte-aligned zlib streams, with stored and decoded sizes capped at 256 KiB. A section record must start and end with the requested tags, and its big-endian section sizes must exactly cover the decoded buffer. Streams cut off by a window or size cap are omitted. Counts establish record boundaries within sampled regions. Interpreting payload fields or validating a checksum inside a section requires its format.
 

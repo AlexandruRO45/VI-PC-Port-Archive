@@ -116,6 +116,16 @@ LLVM_LIB=libLLVM-15.so.1 LLVM_MC=llvm-mc-15 LLVM_OBJCOPY=llvm-objcopy-15 \
   ./out/pe-env/bin/python -B tests/rdna2_tools_check.py
 ```
 
+## Optional Vulkan arithmetic check
+
+With the Linux build of DXC, a Vulkan device, and [VkRunner](https://gitlab.freedesktop.org/mesa/vkrunner), run the generated FP32 exponent helpers against a Python reference.
+
+```bash
+python3 -B tests/pixel_fp32_vulkan_check.py /path/to/dxc /path/to/vkrunner
+```
+
+The probe checks finite output bits, signed zero, infinities, and NaN class through a compute buffer. A second dispatch uses an intentionally incorrect underflow rounding rule and must fail the same comparison. Repeat `--device <index>` to test specific one-based VkRunner device indices. The fixture exercises the desktop helpers through SPIR-V. Pixel shader lowering and D3D12 readback have their own tests.
+
 ## Expected CMake failure and no-stub policy
 
 `CMakePresets.json` sets `CMAKE_CXX_COMPILER` to `cl` for the `dev` preset. Running `cmake --preset dev` on macOS or Linux is expected to fail:

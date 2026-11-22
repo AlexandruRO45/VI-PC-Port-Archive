@@ -41,8 +41,18 @@ foreach(scenario IN ITEMS translate bounds registry shader)
     add_test(NAME era_title_va_${scenario} COMMAND era_title_va_check ${scenario})
 endforeach()
 
+# era_title_gpu under allocation failure (no GPU needed). The program replaces operator new to fail
+# one chosen allocation at a time.
+add_executable(era_title_gpu_alloc_check tests/era_title_gpu_alloc_check.cpp src/era_title_gpu.cpp
+    src/era_gpu_alias.cpp src/era_title_va.cpp src/era_query.cpp)
+target_include_directories(era_title_gpu_alloc_check PRIVATE src)
+target_compile_features(era_title_gpu_alloc_check PRIVATE cxx_std_20)
+add_test(NAME era_title_gpu_alloc COMMAND era_title_gpu_alloc_check)
+set_tests_properties(era_title_gpu_alloc PROPERTIES TIMEOUT 30)
+
 # Desktop xmem.dll for the package DLLs' four named xmem imports.
-add_library(xmem_shim SHARED src/xmem_shim.cpp src/xmem_shim.def src/era_heap.cpp src/era_query.cpp)
+add_library(xmem_shim SHARED src/xmem_shim.cpp src/xmem_shim.def src/era_heap.cpp src/era_query.cpp
+    src/era_title_gpu.cpp src/era_gpu_alias.cpp src/era_title_va.cpp)
 set_target_properties(xmem_shim PROPERTIES OUTPUT_NAME xmem)
 target_include_directories(xmem_shim PRIVATE src)
 target_compile_features(xmem_shim PRIVATE cxx_std_20)
@@ -136,6 +146,8 @@ target_sources(offscreen_check PRIVATE tests/bvh_atomics.cpp tests/bvh_numeric.c
 target_sources(offscreen_check PRIVATE tests/gpu_alias.cpp src/era_gpu_alias.cpp src/era_title_va.cpp src/era_heap.cpp)
 # The same allocations read by a shader through 64-bit title addresses (src/title_va_lookup.hlsli).
 target_sources(offscreen_check PRIVATE tests/gpu_alias_lookup.cpp)
+# Graphics allocations given desktop GPU addresses when a device is attached (src/era_title_gpu.cpp).
+target_sources(offscreen_check PRIVATE tests/gpu_alias_registry.cpp src/era_title_gpu.cpp src/era_query.cpp)
 add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/LookupTitleAddresses.h" COMMAND "${DXC_EXECUTABLE}" -T cs_6_0
     -E LookupTitleAddresses -Vn LookupTitleAddresses -I "${CMAKE_CURRENT_SOURCE_DIR}/src"
     -Fh "${CMAKE_CURRENT_BINARY_DIR}/LookupTitleAddresses.h" -Fo "${CMAKE_CURRENT_BINARY_DIR}/LookupTitleAddresses.cso"
@@ -282,8 +294,9 @@ foreach(adapter IN ITEMS hardware warp)
     add_test(NAME gpu_alias_${adapter} COMMAND offscreen_check ${adapter} --gpu-alias)
     add_test(NAME gpu_alias_lookup_${adapter} COMMAND offscreen_check ${adapter} --gpu-alias-lookup)
     add_test(NAME gpu_alias_lookup_writes_${adapter} COMMAND offscreen_check ${adapter} --gpu-alias-lookup-writes)
+    add_test(NAME gpu_alias_registry_${adapter} COMMAND offscreen_check ${adapter} --gpu-alias-registry)
     set_tests_properties(gpu_alias_${adapter} gpu_alias_lookup_${adapter} gpu_alias_lookup_writes_${adapter}
-        PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+        gpu_alias_registry_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     add_test(NAME bvh_root_roundtrip_${adapter} COMMAND offscreen_check ${adapter} --bvh-root-roundtrip)
     set_tests_properties(bvh_root_roundtrip_${adapter} PROPERTIES TIMEOUT 45)
     foreach(work IN ITEMS reads waves wave64 hits differential atomics numeric packed)
@@ -552,6 +565,27 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/bare_calls_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_bare_calls>" "$<TARGET_FILE:cpu_bare_calls_lifted>" "${bare_ranges}"
         "${CMAKE_CURRENT_BINARY_DIR}/cpu_bare_calls.map")
+    cpu_asm_fixture(cpu_wide_arith wide_arith)
+    cpu_translation(cpu_wide_arith cpu_switch_aot
+        div32,idiv32,div64,udiv128,idiv64,mul64,imul64_1,mul32,imul32,mul8,mul16,widen,sign_dx)
+    add_test(NAME cpu_aot_wide_arithmetic COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/wide_arith_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_wide_arith>" "$<TARGET_FILE:cpu_wide_arith_lifted>")
+    # Divides whose results are unused: the translation is also built with /O2, where the compiler would remove a
+    # divide that the generated C++ let it remove, and both builds are compared with the original's exception codes.
+    cpu_asm_fixture(cpu_dead_div dead_div)
+    cpu_translation(cpu_dead_div cpu_switch_aot div32_dead,idiv32_dead,udiv128_dead,idiv64_dead,div_skip)
+    add_library(cpu_guarded_call SHARED tests/cpu/guarded_call.cpp)
+    set(dead_div_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_dead_div_lifted_o2.dll")
+    add_custom_command(OUTPUT "${dead_div_o2}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /LD "${CMAKE_CURRENT_BINARY_DIR}/cpu_dead_div_lifted.cpp"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_dead_div_lifted_o2.obj" "/Fe${dead_div_o2}"
+        DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/cpu_dead_div_lifted.cpp" VERBATIM)
+    add_custom_target(cpu_dead_div_lifted_o2 ALL DEPENDS "${dead_div_o2}")
+    add_test(NAME cpu_aot_dead_divides COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/dead_div_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_guarded_call>" "$<TARGET_FILE:cpu_dead_div>" "$<TARGET_FILE:cpu_dead_div_lifted>"
+        "${dead_div_o2}")
     cpu_asm_fixture(cpu_chained chained)
     cpu_translation(cpu_chained cpu_chained_aot choose_value)
     cpu_asm_fixture(cpu_chained_jne chained)
@@ -835,6 +869,18 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_library(cpu_sign_ext_adc_lifted SHARED "${sign_ext_adc_fixture}")
     add_test(NAME cpu_aot_sign_ext_adc COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/sign_ext_adc.py"
         check "$<TARGET_FILE:cpu_sign_ext_adc>" "$<TARGET_FILE:cpu_sign_ext_adc_lifted>")
+
+    cpu_asm_fixture(cpu_bmi2 bmi2)
+    set(bmi2_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_bmi2_lifted.cpp")
+    add_custom_command(OUTPUT "${bmi2_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/bmi2.py"
+            emit "$<TARGET_FILE:cpu_bmi2>" "${bmi2_fixture}"
+        DEPENDS cpu_bmi2 tests/cpu/bmi2.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_bmi2_lifted SHARED "${bmi2_fixture}")
+    add_test(NAME cpu_aot_bmi2 COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/bmi2.py"
+        check "$<TARGET_FILE:cpu_bmi2>" "$<TARGET_FILE:cpu_bmi2_lifted>")
+    set_tests_properties(cpu_aot_bmi2 PROPERTIES SKIP_RETURN_CODE 77)
     cpu_translation(cpu_callback cpu_chained_aot call_context CALLBACK_OFFSET 8)
     cpu_asm_fixture(cpu_xlatb xlatb)
     # The lifted DLL and three mutated controls that the check requires to mismatch.
@@ -1167,6 +1213,85 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_import_original_lifted>" "$<TARGET_FILE:cpu_import_provider>"
         "$<TARGET_FILE:cpu_import_altered>" "$<TARGET_FILE:cpu_register_probe>")
     add_library(cpu_exe_io SHARED tests/cpu/exe_io.cpp)
+    # Use Zig's normal single-threaded console startup, including RtlExitUserProcess.
+    enable_language(C)
+    set(archive_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/archive")
+    # Keep the scalar reference PE identical across the Debug and /O2 host builds.
+    set(blast_obj "${CMAKE_CURRENT_BINARY_DIR}/blast_scalar.obj")
+    add_custom_command(OUTPUT "${blast_obj}"
+        COMMAND "${CMAKE_C_COMPILER}" /nologo /c /MD /Od /GS- /Gs65536 /Zl "/Fo${blast_obj}" "${archive_src}/blast/blast.c"
+        DEPENDS "${archive_src}/blast/blast.c" "${archive_src}/blast/blast.h" VERBATIM)
+    add_library(blast_source SHARED "${blast_obj}" "${archive_src}/blast.def")
+    set_target_properties(blast_source PROPERTIES LINKER_LANGUAGE C)
+    target_link_options(blast_source PRIVATE /NOENTRY /NODEFAULTLIB /INCREMENTAL:NO)
+    target_link_libraries(blast_source PRIVATE msvcrt ucrt vcruntime)
+
+    set(blast_cpp "${CMAKE_CURRENT_BINARY_DIR}/blast_lifted.cpp")
+    add_custom_command(OUTPUT "${blast_cpp}"
+        COMMAND "${CMAKE_COMMAND}" -E env "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/tools"
+            "${INTAKE_PYTHON}" -B "${archive_src}/translate_blast.py" "$<TARGET_FILE:blast_source>" "${blast_cpp}"
+        DEPENDS blast_source "${archive_src}/translate_blast.py" "${archive_src}/blast_runtime.hpp"
+            tools/cpu_switch_aot.py tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(blast_lifted SHARED "${blast_cpp}" "${archive_src}/blast.def")
+    target_include_directories(blast_lifted PRIVATE "${archive_src}")
+
+    add_library(archive_codec_lifted SHARED "${archive_src}/codec.cpp")
+    target_link_libraries(archive_codec_lifted PRIVATE blast_lifted)
+    set_target_properties(archive_codec_lifted PROPERTIES MSVC_RUNTIME_LIBRARY MultiThreadedDLL)
+    add_library(archive_codec SHARED "${archive_src}/codec.cpp")
+    target_link_libraries(archive_codec PRIVATE blast_source)
+    set_target_properties(archive_codec PROPERTIES MSVC_RUNTIME_LIBRARY MultiThreadedDLL)
+    set(archive_exe "${CMAKE_CURRENT_BINARY_DIR}/archive_reader.exe")
+    add_custom_command(OUTPUT "${archive_exe}"
+        COMMAND "${INTAKE_PYTHON}" -m ziglang build-exe "${archive_src}/reader.zig"
+            "-L$<TARGET_LINKER_FILE_DIR:archive_codec>" -target x86_64-windows-gnu
+            -O ReleaseSmall -fsingle-threaded -funwind-tables "-femit-bin=${archive_exe}"
+        DEPENDS archive_codec "${archive_src}/reader.zig" VERBATIM)
+    set(archive_cpp "${CMAKE_CURRENT_BINARY_DIR}/archive_reader_lifted.cpp")
+    add_custom_command(OUTPUT "${archive_cpp}"
+        COMMAND "${CMAKE_COMMAND}" -E env "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/tools"
+            "${INTAKE_PYTHON}" -B "${archive_src}/translate_reader.py" "${archive_exe}" "${archive_cpp}"
+        DEPENDS "${archive_exe}" "${archive_src}/translate_reader.py" tools/cpu_stdio_exe_aot.py
+            tools/cpu_switch_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+    add_executable(archive_reader_lifted "${archive_cpp}")
+    target_link_libraries(archive_reader_lifted PRIVATE archive_codec ntdll)
+    add_test(NAME cpu_native_archive_reader COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/archive_check.py" "$<TARGET_FILE:pe_map>"
+        "${archive_exe}" "$<TARGET_FILE:archive_reader_lifted>" "$<TARGET_FILE:archive_codec>")
+
+    add_executable(archive_all_lifted "${archive_cpp}")
+    target_link_libraries(archive_all_lifted PRIVATE archive_codec_lifted ntdll)
+    add_test(NAME cpu_native_archive_blast COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/archive_check.py" "$<TARGET_FILE:pe_map>"
+        "${archive_exe}" "$<TARGET_FILE:archive_all_lifted>" "$<TARGET_FILE:archive_codec>"
+        "$<TARGET_FILE:blast_source>" "$<TARGET_FILE:blast_lifted>" "$<TARGET_FILE:archive_codec_lifted>")
+
+    function(crc_line_program target polynomial)
+        # Use the same optimized source PE as input to both Debug and Release AOT builds.
+        set(crc_object "${CMAKE_CURRENT_BINARY_DIR}/${target}_step.obj")
+        add_custom_command(OUTPUT "${crc_object}"
+            COMMAND "${CMAKE_CXX_COMPILER}" /nologo /c /O1 /GS- /Zl "/DCRC_POLYNOMIAL=${polynomial}" "/Fo${crc_object}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/crc_line/crc_step.cpp"
+            DEPENDS tests/cpu/crc_line/crc_step.cpp VERBATIM)
+        add_executable(${target} tests/cpu/crc_line/entry.asm "${crc_object}")
+        set_target_properties(${target} PROPERTIES LINKER_LANGUAGE CXX)
+        target_link_options(${target} PRIVATE /ENTRY:program_entry /EXPORT:crc_step /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+        target_link_libraries(${target} PRIVATE ucrt)
+        set(crc_source "${CMAKE_CURRENT_BINARY_DIR}/${target}_lifted.cpp")
+        add_custom_command(OUTPUT "${crc_source}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tools/cpu_stdio_exe_aot.py"
+                "$<TARGET_FILE:${target}>" "${crc_source}"
+            DEPENDS ${target} tools/cpu_stdio_exe_aot.py tools/cpu_switch_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py
+            VERBATIM)
+        add_executable(${target}_lifted "${crc_source}")
+        set_target_properties(${target}_lifted PROPERTIES MSVC_RUNTIME_LIBRARY MultiThreadedDLL)
+    endfunction()
+    crc_line_program(cpu_crc_line 0xedb88320u)
+    crc_line_program(cpu_crc_castagnoli 0x82f63b78u)
+    add_test(NAME cpu_native_crc_line COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/crc_line_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_crc_line>" "$<TARGET_FILE:cpu_crc_line_lifted>"
+        "$<TARGET_FILE:cpu_crc_castagnoli>" "$<TARGET_FILE:cpu_crc_castagnoli_lifted>")
     foreach(variant IN ITEMS original inverted pair swapped framed image)
         set(native cpu_exe_${variant})
         set(lifted ${native}_lifted)
@@ -1441,7 +1566,16 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/pso_readiness_check.py")
     add_test(NAME dxcontainer_part_offsets COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/dxcontainer_part_offsets_check.py")
+    # #369: the built cs_6_0 array-atomics probe keeps nonUniformIndex on its atomic's handle.
+    add_test(NAME array_atomics_dxil COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/array_atomics_dxil_check.py" "${DXC_EXECUTABLE}"
+        "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomics.cso" "${CMAKE_SOURCE_DIR}/tests/gpu_alias_writes.hlsl"
+        "${CMAKE_SOURCE_DIR}/src")
     foreach(adapter IN ITEMS hardware warp)
+        add_test(NAME compute_store_aot_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(compute_store_aot_${adapter} PROPERTIES TIMEOUT 45)
         add_test(NAME cpu_native_frame_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/cpu/native_frame_check.py" "$<TARGET_FILE:cpu_frame_guest>"
             "$<TARGET_FILE:cpu_tls_sink>" "$<TARGET_FILE:cpu_frame_host>" "$<TARGET_FILE:pe_map>"
@@ -1451,17 +1585,32 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_${adapter} PROPERTIES TIMEOUT 60)
+        add_test(NAME pixel_aot_buffer_color_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" buffer-color "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_buffer_color_${adapter} PROPERTIES TIMEOUT 60)
+        add_test(NAME pixel_aot_attribute_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_attribute_check.py" "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_attribute_${adapter} PROPERTIES TIMEOUT 45)
+        add_test(NAME pixel_aot_three_way_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" three-way "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_three_way_${adapter} PROPERTIES TIMEOUT 60)
         add_test(NAME bc7_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/bc7_draw_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(bc7_draw_${adapter} PROPERTIES TIMEOUT 60)
     endforeach()
-    set_tests_properties(cpu_native_frame_hardware pixel_aot_hardware bc7_draw_hardware PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(cpu_native_frame_hardware pixel_aot_hardware pixel_aot_buffer_color_hardware
+        pixel_aot_three_way_hardware bc7_draw_hardware PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(compute_store_aot_hardware PROPERTIES SKIP_RETURN_CODE 77)
     foreach(adapter IN ITEMS hardware warp)
         # The gfx programs this test translated, for tools/form_coverage.py.
         set_tests_properties(pixel_aot_${adapter} PROPERTIES
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_${adapter}.txt")
     endforeach()
+    set_tests_properties(pixel_aot_attribute_hardware PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME compressed_scene_metadata COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/scene_records_check.py" "${CMAKE_CURRENT_BINARY_DIR}/DualUav.cso"
         "${CMAKE_CURRENT_BINARY_DIR}/triangle_ps.cso" "$<TARGET_FILE:root_probe>")

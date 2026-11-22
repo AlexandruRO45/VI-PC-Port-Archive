@@ -24,7 +24,18 @@ fifth and later) and floating-point arguments are not supported.
 Flags are modeled only between a producer and its consumers (Jcc, SETcc,
 CMOVcc) in one straight-line run that no edge enters. Overflow and low-byte
 parity conditions use the producer operand width, including narrow arithmetic.
-Instructions that leave the flags unchanged (moves, LEA, NOT, SETcc, CMOVcc) may sit between them.
+Instructions that leave the flags unchanged (moves, LEA, NOT, SETcc, CMOVcc, and
+CBW, CWDE, CDQE, CDQ and CQO) may sit between them.
+
+One-operand MUL, IMUL, DIV and IDIV and the sign extensions read and write RAX
+and RDX without naming them. Products of up to 32-bit factors are computed in
+std::uint64_t; 64-bit products and all quotients use the MSVC intrinsics
+_umul128, _mul128, _udiv64, _div64, _udiv128 and _div128. The divide
+intrinsics execute DIV or IDIV, so a zero divisor or a quotient that does not
+fit raises the same divide error. The quotient is also stored to a volatile
+local, so the divide is performed, and its error raised, when the function
+overwrites RAX and RDX without reading them. 8- and 16-bit divides are rejected, and so is a flag
+consumer after a multiply or divide.
 
 A forward pass records how many low bytes (0, 1, 2 or 8) of each register every
 path defines. A read needs as many defined bytes as it uses, and an 8- or 16-bit
@@ -102,9 +113,10 @@ import hashlib
 import json
 from pathlib import Path
 import struct
+from typing import NamedTuple
 
 import pefile
-from iced_x86 import (ConditionCode as CC, Decoder, FlowControl, InstructionInfoFactory, MemorySizeExt,
+from iced_x86 import (Code, ConditionCode as CC, Decoder, FlowControl, InstructionInfoFactory, MemorySizeExt,
                       Mnemonic as M, OpAccess, OpKind, Register as R, RegisterExt)
 
 from cpu_leaf_aot import export_rva
@@ -129,16 +141,22 @@ MAX_FRAME = 4096
 HOME_SIZE = 32
 HIGH_BYTES = {R.AH, R.BH, R.CH, R.DH}
 # Flow that continues at the next instruction (a direct call does once its callee returns).
-STRAIGHT = (FlowControl.NEXT, FlowControl.CONDITIONAL_BRANCH, FlowControl.CALL)
+STRAIGHT = (FlowControl.NEXT, FlowControl.CONDITIONAL_BRANCH, FlowControl.CALL, FlowControl.INDIRECT_CALL)
 MAX_CALLEES = 256
 ALU = {M.ADD: "+", M.SUB: "-", M.AND: "&", M.OR: "|", M.XOR: "^"}
 SHIFTS = {M.SHL: "<<", M.SHR: ">>", M.SAR: ">>"}
 _CODES = "O NO B AE E NE BE A S NS P NP L GE LE G".split()
 SETCC = {getattr(M, "SET" + code) for code in _CODES}
 CMOVCC = {getattr(M, "CMOV" + code) for code in _CODES}
+# Sign extensions inside RDX:RAX, as (source, destination). The Intel SDM lists "Flags Affected: None".
+SIGN_EXTENSIONS = {M.CBW: (R.AL, R.AX), M.CWDE: (R.AX, R.EAX), M.CDQE: (R.EAX, R.RAX),
+                   M.CDQ: (R.EAX, R.EDX), M.CQO: (R.RAX, R.RDX)}
+# Implicit operands of one-operand MUL, IMUL, DIV and IDIV, by operand width.
+ACCUMULATOR = {1: R.AL, 2: R.AX, 4: R.EAX, 8: R.RAX}
+DATA = {2: R.DX, 4: R.EDX, 8: R.RDX}
 # Instructions that neither read nor write the arithmetic flags, besides SETcc and CMOVcc,
 # which only read them.
-FLAG_NEUTRAL = {M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC}
+FLAG_NEUTRAL = {M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC, *SIGN_EXTENSIONS}
 FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC}
 MAX_FLAG_DISTANCE = 16
 CONDITIONS = {CC.O: "o", CC.NO: "no", CC.P: "p", CC.NP: "np",
@@ -165,6 +183,26 @@ def full(register):
     if full_register not in NAMES:
         raise ValueError(f"unsupported register {register}")
     return full_register
+
+
+def implicit_writes(ins):
+    """Full registers that an instruction writes without naming them as operand 0. RDX counts for
+    every one-operand multiply or divide, although an 8-bit multiply leaves it unchanged."""
+    if ins.mnemonic in SIGN_EXTENSIONS:
+        return {full(SIGN_EXTENSIONS[ins.mnemonic][1])}
+    if ins.mnemonic in (M.MUL, M.IMUL, M.DIV, M.IDIV) and ins.op_count == 1:
+        return {R.RAX, R.RDX}
+    return set()
+
+
+def extend(value, width, sign):
+    """value (width bytes) widened to std::uint64_t. (x ^ s) - s sign-extends x from its top bit s;
+    unsigned arithmetic wraps by definition, so no signed conversion or shift is involved."""
+    value = f"static_cast<std::uint64_t>({value})"
+    if not sign:
+        return value
+    top = 1 << width * 8 - 1
+    return f"(({value} ^ {top:#x}ull) - {top:#x}ull)"
 
 
 def runtime_functions(pe):
@@ -356,6 +394,7 @@ class Function:
         # Direct calls and tail jumps to other functions, by the RVA of the CALL or JMP.
         self.calls = {}
         self.tails = {}
+        self.host_calls = {}
 
     def leaves_for(self, ins):
         """Whether a JMP out of this function is a tail jump. A target the image names as a function
@@ -421,7 +460,20 @@ class Function:
         for address in range(begin, end):
             self.owner[address] = owner
 
-    def explore(self):
+    def thunk_slot(self, ins, imports):
+        """Recognize the complete x64 FF 25 disp32 linker thunk in executable bytes."""
+        target = ins.near_branch_target
+        if not imports or not executable(self.pe, target):
+            return None
+        if self.pe.get_data(target, 2) != b"\xff\x25":
+            return None
+        if any(self.entries.owner(rva) is not None or self.entries.bound_holder(rva) is not None
+               for rva in range(target, target + 6)):
+            return None
+        code = image_bytes(self.pe, target, 6, executable=True)
+        return target + 6 + int.from_bytes(code[2:], "little", signed=True)
+
+    def explore(self, imports=None, *, callback_calls=False):
         pending = [self.entry]
         indirect = []
         while pending or indirect:
@@ -453,7 +505,22 @@ class Function:
             elif flow == FlowControl.UNCONDITIONAL_BRANCH and ins.is_jmp_short_or_near:
                 targets = [ins.near_branch_target]
             elif flow == FlowControl.CALL and ins.is_call_near:
-                self.calls[ip] = self.callee(ins)
+                slot = self.thunk_slot(ins, imports)
+                if slot is not None and slot in imports:
+                    self.host_calls[ip] = imports[slot]
+                    self.calls[ip] = slot
+                else:
+                    self.calls[ip] = self.callee(ins)
+                targets = [ins.next_ip]
+            elif (ins.code == Code.CALL_RM64 and imports and ins.memory_base == R.RIP
+                  and not ins.has_segment_prefix and ins.ip_rel_memory_address in imports):
+                self.host_calls[ip] = imports[ins.ip_rel_memory_address]
+                self.calls[ip] = ins.ip_rel_memory_address
+                targets = [ins.next_ip]
+            elif (callback_calls and ins.code == Code.CALL_RM64 and not ins.has_segment_prefix
+                  and ins.op0_kind == OpKind.MEMORY and ins.memory_base != R.RIP):
+                # The callback-aware emitter must check the loaded pointer against its typed bindings.
+                self.calls[ip] = None
                 targets = [ins.next_ip]
             elif flow == FlowControl.RETURN and ins.mnemonic == M.RET and (ins.op_count == 0 or ins.immediate(0) == 0):
                 targets = []
@@ -462,6 +529,8 @@ class Function:
                 indirect.append(ip)
             else:
                 raise ValueError(f"unsupported control flow at RVA {ip:#x}: {ins}")
+            if ip in self.host_calls and self.host_calls[ip].noreturn:
+                targets = []
             self.successors[ip] = targets
             pending.extend(reversed(targets))
         edges = {target for ip, targets in self.successors.items() for target in targets
@@ -499,6 +568,8 @@ class Function:
                 known[ins.op0_register] = ins.ip_rel_memory_address
             elif ins.op_count and ins.op0_kind == OpKind.REGISTER and ins.mnemonic not in (M.CMP, M.TEST):
                 known.pop(full(ins.op0_register), None)
+            for register in implicit_writes(ins):
+                known.pop(register, None)
             for successor in self.successors.get(ip, ()):
                 if successor not in self.instructions:
                     continue
@@ -598,6 +669,8 @@ class Function:
             return values[reg]
 
         def step(ins):
+            for register in implicit_writes(ins):
+                values[register] = (next(counter), "full")
             if ins.op_count == 0 or ins.op0_kind != OpKind.REGISTER:
                 return
             dst = ins.op0_register
@@ -714,10 +787,12 @@ class Lifter:
             return f"static_cast<{unsigned(width)}>({ins.immediate(number) & ((1 << width * 8) - 1):#x}ull)"
         raise ValueError(f"unsupported operand at RVA {ins.ip:#x}")
 
-    def write(self, ins, width, expression):
-        if ins.op0_kind == OpKind.MEMORY:
-            return f"store<{unsigned(width)}>({self.address(ins)}, static_cast<{unsigned(width)}>({expression}));"
-        register = ins.op0_register
+    def write(self, ins, width, expression, register=None):
+        """C++ that writes expression to operand 0, or to register when one is given."""
+        if register is None:
+            if ins.op0_kind == OpKind.MEMORY:
+                return f"store<{unsigned(width)}>({self.address(ins)}, static_cast<{unsigned(width)}>({expression}));"
+            register = ins.op0_register
         if register in HIGH_BYTES:
             raise ValueError(f"unsupported register {register}")
         if width not in (1, 2, 4, 8) or RegisterExt.size(register) != width:
@@ -903,6 +978,66 @@ class Lifter:
                 # Two uint16_t factors would be promoted to int, where 0xffff * 0xffff overflows.
                 a, b = f"static_cast<std::uint32_t>({a})", f"static_cast<std::uint32_t>({b})"
             return self.write(ins, width, f"{a} * {b}"), reads, writes
+        if mnemonic in SIGN_EXTENSIONS:
+            source, destination = SIGN_EXTENSIONS[mnemonic]
+            size = RegisterExt.size(destination)
+            read(source)
+            writes[full(destination)] = size
+            if full(destination) == R.RAX:
+                value = extend(self.reg(source), RegisterExt.size(source), True)
+            else:
+                # Every bit of EDX or RDX becomes the sign bit of the source: 0 - 0 or 0 - 1, wrapped.
+                value = f"0ull - (static_cast<std::uint64_t>({self.reg(source)}) >> {RegisterExt.size(source) * 8 - 1})"
+            return self.write(ins, size, value, destination), reads, writes
+        if mnemonic in (M.MUL, M.IMUL, M.DIV, M.IDIV) and ins.op_count == 1:
+            # Operand 0 is a source, not the destination. Every input is copied into a const temporary
+            # before RAX or RDX is written, since operand 0 may be one of them or address memory through them.
+            writes.clear()
+            note(0)
+            read(ACCUMULATOR[width])
+            accumulator, source = self.reg(ACCUMULATOR[width]), self.operand(ins, 0, width)
+            sign = mnemonic in (M.IMUL, M.IDIV)
+            if mnemonic in (M.DIV, M.IDIV):
+                # An 8-bit divide writes AH, which is not modelled; no intrinsic executes a 16-bit divide.
+                if width not in (4, 8):
+                    raise ValueError(f"unsupported divide width at RVA {ins.ip:#x}")
+                read(DATA[width])
+                # The intrinsics execute DIV or IDIV: a zero divisor or a quotient that does not fit raises
+                # the same divide error as the original, and no C++ division is involved.
+                kind, call = (signed if sign else unsigned)(width), "_div" if sign else "_udiv"
+                if width == 8:
+                    lines = [f"const {kind} high = static_cast<{kind}>({self.reg(DATA[8])}), "
+                             f"low = static_cast<{kind}>({accumulator}), divisor = static_cast<{kind}>({source});",
+                             f"{kind} remainder;", f"const {kind} quotient = {call}128(high, low, divisor, &remainder);"]
+                else:
+                    wide = signed(8) if sign else unsigned(8)
+                    lines = [f"const {wide} dividend = static_cast<{wide}>((static_cast<std::uint64_t>("
+                             f"{self.reg(DATA[4])}) << 32) | {accumulator});",
+                             f"const {kind} divisor = static_cast<{kind}>({source});",
+                             f"{kind} remainder;", f"const {kind} quotient = {call}64(dividend, divisor, &remainder);"]
+                # Reaching the divide raises its error even when RAX and RDX are overwritten unread: the store
+                # to a volatile local makes the compiler compute the quotient, which only the divide can do.
+                lines.append(f"volatile {kind} performed = quotient; static_cast<void>(performed);")
+                low, high = "quotient", "remainder"
+            elif width == 8:
+                kind = signed(8) if sign else unsigned(8)
+                lines = [f"const {kind} a = static_cast<{kind}>({accumulator}), b = static_cast<{kind}>({source});",
+                         f"{kind} high;", f"const {kind} low = {'_mul128' if sign else '_umul128'}(a, b, &high);"]
+                low, high = "low", "high"
+            else:
+                # Factors of up to 32 bits, sign- or zero-extended: their product fits in 64 bits, so the
+                # wrapped std::uint64_t product is exact (in two's complement for IMUL).
+                lines = [f"const std::uint64_t a = {extend(accumulator, width, sign)}, "
+                         f"b = {extend(source, width, sign)};", "const std::uint64_t product = a * b;"]
+                low, high = "product", f"product >> {width * 8}"
+            if width == 1:
+                # MUL and IMUL r/m8 write the whole 16-bit product to AX and leave RDX alone.
+                lines.append(self.write(ins, 2, low, R.AX))
+                writes[R.RAX] = 2
+            else:
+                lines += [self.write(ins, width, low, ACCUMULATOR[width]), self.write(ins, width, high, DATA[width])]
+                writes.update({R.RAX: width, R.RDX: width})
+            return "{ " + " ".join(lines) + " }", reads, writes
         if mnemonic in SETCC:
             condition = self.condition(producer, ins)
             if ins.op0_kind == OpKind.MEMORY:
@@ -950,6 +1085,9 @@ class Frame:
     8 mod 16: with RSP + 8 a multiple of 16 at entry, as the ABI requires, every array byte then has the address
     residue mod 16 of the stack byte it stands for. It ends with the home space at entry RSP + 40."""
 
+    frame_limit = MAX_FRAME
+    incoming_end = HOME_END
+
     def __init__(self, function):
         self.offsets, self.accesses, self.adjustments, self.released = {function.entry: 0}, {}, set(), {}
         work = [function.entry]
@@ -975,15 +1113,15 @@ class Frame:
         low = min(self.offsets.values())
         self.start = low - (low + 8) % 16
         self.size = HOME_END - self.start
-        if self.size > MAX_FRAME:
-            raise ValueError(f"frame of {self.size} bytes exceeds the {MAX_FRAME}-byte bound")
+        if self.size > self.frame_limit:
+            raise ValueError(f"frame of {self.size} bytes exceeds the {self.frame_limit}-byte bound")
 
     def access(self, ins, rsp, offset, width, reads, writes):
         if offset < rsp:
             raise ValueError(f"stack access below RSP at RVA {ins.ip:#x}")
         if offset < 8 and offset + width > 0:
             raise ValueError(f"return address slot accessed at RVA {ins.ip:#x}")
-        if offset + width > HOME_END:
+        if offset + width > self.incoming_end:
             raise ValueError(f"unsupported stack argument at RVA {ins.ip:#x}: entry RSP{offset:+#x}")
         self.accesses[ins.ip] = (offset, width, reads, writes)
 
@@ -1152,13 +1290,25 @@ def lift(pe, name, arguments=DEFAULT_ARGUMENTS, program=None, *, image_data=Fals
     return program.lift(entry, f"lifted_{name}", ARGUMENT_REGISTERS[:arguments])
 
 
+class HostImport(NamedTuple):
+    symbol: str
+    widths: tuple
+    return_width: int
+    noreturn: bool = False
+
+    @property
+    def demands(self):
+        return dict(zip(ARGUMENT_REGISTERS, self.widths))
+
+
 class Program:
     """The functions of one image reached from the requested exports through direct calls and tail
     jumps. Each callee is translated once, in internal mode, and its source precedes its callers'."""
 
-    def __init__(self, pe, bindings=None, *, image_data=False):
+    def __init__(self, pe, bindings=None, *, image_data=False, imports=None):
         self.pe = pe
         self.image_data = image_data
+        self.imports = imports or {}
         self.entries = Entries(pe, bindings)
         self.active = []
         self.callees = {}
@@ -1236,7 +1386,7 @@ def lift_function(program, entry, symbol, arguments, internal):
         if first.flow_control == FlowControl.INDIRECT_BRANCH and first.op0_kind == OpKind.MEMORY:
             raise ValueError(f"bound function {function.bound[2]} at RVA {entry:#x} is an import thunk "
                              "(an indirect jump through memory)")
-    edges = function.explore()
+    edges = function.explore(program.imports)
     image_data = program.image_data
     lifter = Lifter(pe if image_data else None)
     # A RIP-relative LEA that loads a recognised table base stays a guest address, with or without image data.
@@ -1257,7 +1407,9 @@ def lift_function(program, entry, symbol, arguments, internal):
                  if ins.flow_control == FlowControl.CONDITIONAL_BRANCH or ins.mnemonic in SETCC | CMOVCC}
     sets_flags = {producer.ip for producer in producers.values()}
     # Callees are translated first: the caller's definedness pass needs their return widths and demands.
-    callees = {ip: program.callee(target, ip) for ip, target in sorted({**function.calls, **function.tails}.items())}
+    callees = {ip: (function.host_calls[ip] if ip in function.host_calls
+                    else program.callee(target, ip))
+               for ip, target in sorted({**function.calls, **function.tails}.items())}
     loads = {sequence[0]: index for index, _, sequence, _, _, _ in function.dispatches.values()}
     skipped = {ip for _, _, sequence, _, _, _ in function.dispatches.values() for ip in sequence}
     body = {}
@@ -1269,7 +1421,10 @@ def lift_function(program, entry, symbol, arguments, internal):
         body[ip] = ""
         if ip in callees:
             callee = callees[ip]
-            call = f"fn_{callee.entry:x}({', '.join(lifter.reg(r) for r in ARGUMENT_REGISTERS)})"
+            if isinstance(callee, HostImport):
+                call = f"{callee.symbol}({', '.join(lifter.reg(r) for r in callee.demands)})"
+            else:
+                call = f"fn_{callee.entry:x}({', '.join(lifter.reg(r) for r in ARGUMENT_REGISTERS)})"
             lifter.used.add(R.RAX)
             # A tail jump returns the callee's RAX; a call leaves it in RAX.
             body[ip] = f"return {call};" if ip in function.tails else f"rax = {call};"
@@ -1307,6 +1462,12 @@ def lift_function(program, entry, symbol, arguments, internal):
         if R.RSP in set().union(*effects[ip]):
             # Frame rejects every use of RSP whose offset it does not know, so RSP is never a C++ variable.
             raise ValueError(f"unsupported use of rsp at RVA {ip:#x}")
+    # Compilers may copy a byte-sized return through a wider register move. Carry
+    # the defined low width forward and validate the eventual consumer separately.
+    copies = {ip: (full(ins.op0_register), full(ins.op1_register), RegisterExt.size(ins.op0_register))
+              for ip, ins in instructions.items()
+              if ins.mnemonic == M.MOV and ins.op0_kind == ins.op1_kind == OpKind.REGISTER
+              and RegisterExt.size(ins.op0_register) >= 4 and full(ins.op0_register) in effects[ip][1]}
     prove_frame(function, order, effects, frame)
 
     # Per register: (low bytes defined on every path: 0, 1, 2 or 8; may hold a guest address that
@@ -1322,6 +1483,10 @@ def lift_function(program, entry, symbol, arguments, internal):
             for r, width in writes.items():
                 # A 32- or 64-bit write defines all eight bytes; an 8- or 16-bit write keeps the rest.
                 out[r] = (8, False) if width >= 4 else (max(out[r][0], width), out[r][1])
+            if ip in copies:
+                dst, src, width = copies[ip]
+                defined, guest = state[ip][src]
+                out[dst] = (8 if defined >= width else defined, guest)
             for r in kills:
                 out[r] = (0, True)
             if ip in function.calls:
@@ -1339,6 +1504,10 @@ def lift_function(program, entry, symbol, arguments, internal):
     widths = []
     for ip in order:
         missing = [r for r, width in effects[ip][0].items() if state[ip][r][0] < width]
+        if ip in copies:
+            _, src, _ = copies[ip]
+            if state[ip][src][0] and not state[ip][src][1]:
+                missing = [r for r in missing if r != src]
         if missing:
             if ip in callees:
                 raise ValueError(f"callee argument {NAMES[min(missing)]} is undefined at RVA {ip:#x}")
@@ -1363,7 +1532,7 @@ def lift_function(program, entry, symbol, arguments, internal):
     for position, ip in enumerate(order):
         ins = instructions[ip]
         following = order[position + 1] if position + 1 < len(order) else None
-        if ins.flow_control in STRAIGHT and following != ins.next_ip:
+        if ins.flow_control in STRAIGHT and function.successors[ip] and following != ins.next_ip:
             labels.add(ins.next_ip)
     locals_ = sorted((lifter.used | {R.RAX}) - set(function.arguments), key=lambda r: NAMES[r])
     declarations = [f"word {NAMES[r]} = 0;" for r in locals_]
@@ -1384,7 +1553,7 @@ def lift_function(program, entry, symbol, arguments, internal):
             text.append("    " + body[ip])
         ins = instructions[ip]
         following = order[position + 1] if position + 1 < len(order) else None
-        if ins.flow_control in STRAIGHT and following != ins.next_ip:
+        if ins.flow_control in STRAIGHT and function.successors[ip] and following != ins.next_ip:
             text.append(f"    goto loc_{ins.next_ip:x};")
     linkage = "static" if internal else 'extern "C" __declspec(dllexport)'
     signature = f'{linkage} word {symbol}({", ".join(f"word {NAMES[r]}" for r in function.arguments)})'
@@ -1400,6 +1569,7 @@ def lift_function(program, entry, symbol, arguments, internal):
 PRELUDE = """#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <intrin.h>
 using word = std::uint64_t;
 static inline bool even_parity(word value) {
     // Fold the low byte into a nibble; bit n of 0x6996 is its odd parity.
