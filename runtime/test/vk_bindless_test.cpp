@@ -178,25 +178,26 @@ int main(int argc, char** argv) {
     vkEnumeratePhysicalDevices(inst, &n, nullptr);
     std::vector<VkPhysicalDevice> pds(n);
     vkEnumeratePhysicalDevices(inst, &n, pds.data());
-    VkPhysicalDevice pd = VK_NULL_HANDLE;
-    int best_rank = -1;
+    // The same choice as the other tools (vk_device_pick.h): the best-ranked Vulkan 1.2 device that LEONIDA_VK_DEVICE
+    // allows. It used to rank every device and ignore the filter, so a run meant for one GPU took another (TEST-469).
+    // A filter that matches nothing fails, as in vk_compute_test and vk_test_device.h (as #2657 does it).
+    std::vector<VkPhysicalDeviceProperties> candidates;
+    std::vector<VkPhysicalDevice> eligible;
     for (auto d : pds) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(d, &p);
         if (p.apiVersion < VK_API_VERSION_1_2) continue;
-        // LEONIDA_VK_DEVICE, as pick_device applies it: without this a run meant for one GPU took the best-ranked
-        // one instead (TEST-469).
-        if (!leonida::vulkan_device_wanted(p.deviceName)) continue;
-        if (const int rank = leonida::vk_test::device_rank(p.deviceType, p.vendorID); rank > best_rank) {
-            pd = d;
-            best_rank = rank;
-        }
+        candidates.push_back(p);
+        eligible.push_back(d);
     }
+    const std::size_t chosen = leonida::vk_test::pick_device(candidates);
+    VkPhysicalDevice pd = chosen < eligible.size() ? eligible[chosen] : VK_NULL_HANDLE;
     if (!pd) {
-        if (const std::string filter = leonida::vulkan_device_filter(); !filter.empty())
-            std::printf("unsupported: LEONIDA_VK_DEVICE=%s matches no Vulkan 1.2 device\n", filter.c_str());
-        else
-            std::printf("unsupported: no Vulkan 1.2 device\n");
+        if (!leonida::vulkan_device_filter().empty()) {
+            leonida::vk_test::report_no_device();
+            return 1;
+        }
+        std::printf("unsupported: no Vulkan 1.2 device\n");
         return unsupported;
     }
     VkPhysicalDeviceVulkan12Properties props12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
