@@ -101,6 +101,12 @@ BC7_CONFIG_INFERRED = frozenset((149, 151, 152, 153, 246, 248, 251, 252, 253, 25
 _EMPTY_BC6H_EH = tuple(((0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)) for _ in range(256))
 _EMPTY_BC6H_IH = tuple((0,) * 16 for _ in range(256))
 _EMPTY_BC6H_CLS = (0,) * 256
+# Confirmed endpoint bit counts per entry, channel and field (w, x, y, z), left-aligned to the
+# field widths (16, 10, 6, 6). Without a `endpointHistoryConfirmedBits` section a class-3 entry
+# keeps its pre-confirmed-bits meaning: every field fully confirmed.
+_BC6H_FIELD_WIDTHS = (16, 10, 6, 6)
+_FULL_BC6H_EP_CB = tuple(((_BC6H_FIELD_WIDTHS),) * 3 for _ in range(256))
+_EMPTY_BC6H_EP_CB = tuple(((0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)) for _ in range(256))
 
 _EMPTY_BC7_EP = tuple((0,) * 24 for _ in range(256))
 _EMPTY_BC7_IX = tuple((0,) * 32 for _ in range(256))
@@ -207,8 +213,14 @@ def _flatten_bc7_entry(val, expected_len):
     return tuple(out)
 
 
-def load_bc6h(history=None):
+def load_bc6h(history=None, with_confirmed=False):
     """Return `(endpoint_history, index_history, endpoint_class, index_class)`.
+
+    With `with_confirmed=True`, also return a fifth table: the confirmed bit
+    count per entry, channel and field (w, x, y, z), left-aligned to the field
+    widths (16, 10, 6, 6). Entries without a `endpointHistoryConfirmedBits`
+    row count as fully confirmed (the meaning of a class-3 entry before that
+    section existed).
 
     With `history=None`, returns empty/unknown tables (class `0` for all 256
     entries) so self-contained BC6H chunks still decode strictly without any
@@ -217,15 +229,26 @@ def load_bc6h(history=None):
     """
     sec = _read_history_section(history, "bc6h", "endpointHistory")
     if sec is None:
-        return _EMPTY_BC6H_EH, _EMPTY_BC6H_IH, _EMPTY_BC6H_CLS, _EMPTY_BC6H_CLS
+        empty = (_EMPTY_BC6H_EH, _EMPTY_BC6H_IH, _EMPTY_BC6H_CLS, _EMPTY_BC6H_CLS)
+        return empty + (_EMPTY_BC6H_EP_CB,) if with_confirmed else empty
     eh = list(_EMPTY_BC6H_EH)
     ih = list(_EMPTY_BC6H_IH)
     ec = list(_EMPTY_BC6H_CLS)
     ic = list(_EMPTY_BC6H_CLS)
+    ep_cb = list(_FULL_BC6H_EP_CB)
     for i, channels in _iter_entries(sec.get("endpointHistory")):
         if len(channels) != 3 or any(len(ch) != 4 for ch in channels):
             raise ValueError(f"BC6H endpointHistory[{i}] must be 3x4 integers")
         eh[i] = tuple(tuple(int(v) for v in ch) for ch in channels)
+    for i, channels in _iter_entries(sec.get("endpointHistoryConfirmedBits")):
+        if len(channels) != 3 or any(len(ch) != 4 for ch in channels):
+            raise ValueError(f"BC6H endpointHistoryConfirmedBits[{i}] must be 3x4 integers")
+        for c, ch in enumerate(channels):
+            for q, v in enumerate(ch):
+                if not 0 <= int(v) <= _BC6H_FIELD_WIDTHS[q]:
+                    raise ValueError(f"BC6H endpointHistoryConfirmedBits[{i}][{c}][{q}] must be "
+                                     f"0..{_BC6H_FIELD_WIDTHS[q]}")
+            ep_cb[i] = tuple(tuple(int(v) for v in ch) for ch in channels)
     for i, pixels in _iter_entries(sec.get("indexHistory")):
         if len(pixels) != 16:
             raise ValueError(f"BC6H indexHistory[{i}] must have 16 integers")
@@ -234,7 +257,8 @@ def load_bc6h(history=None):
         ec[i] = int(cls)
     for i, cls in _iter_entries(sec.get("indexClass")):
         ic[i] = int(cls)
-    return tuple(eh), tuple(ih), tuple(ec), tuple(ic)
+    tables = (tuple(eh), tuple(ih), tuple(ec), tuple(ic))
+    return tables + (tuple(ep_cb),) if with_confirmed else tables
 
 
 def load_bc7(history=None):

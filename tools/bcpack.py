@@ -754,7 +754,7 @@ def _bc6h_blocks(lanes, nblocks, provisional, *, history=None):
     """
     if len(lanes[0]) != 2 * nblocks:
         raise BcpackError("BC6H lane length does not match the block count")
-    eh_table, ih_table, eclass, iclass = _bptc.load_bc6h(history)
+    eh_table, ih_table, eclass, iclass, ep_cb = _bptc.load_bc6h(history, with_confirmed=True)
     anchor2 = _bptc.BC7_ANCHOR2
     out = bytearray(nblocks * 16)
     st_e = [None] * nblocks
@@ -763,6 +763,9 @@ def _bc6h_blocks(lanes, nblocks, provisional, *, history=None):
     iroot = [-1] * nblocks
     ends = {}
     idxs = {}
+    # Endpoint history bits each referencing mode consumes: per entry, per channel [w, x, y, z];
+    # y/z only in the two reg==2 modes, where their deltas reach into the 6-bit fields.
+    cons = {}
     violations = 0
     l0, l1, l15 = lanes[0], lanes[1], lanes[15]
     deint0, deint1 = _DEINT
@@ -791,6 +794,13 @@ def _bc6h_blocks(lanes, nblocks, provisional, *, history=None):
         if eroot[i] >= 0:
             r = eroot[i]
             ends[r] = ends.get(r, 0) + 1
+            rec = cons.setdefault(r, [[0, 0, 0, 0] for _ in range(3)])
+            for c in range(3):
+                rec[c][0] = max(rec[c][0], base)
+                rec[c][1] = max(rec[c][1], deltas[c])
+                if reg == 2:
+                    rec[c][2] = max(rec[c][2], min(deltas[c], 6))
+                    rec[c][3] = max(rec[c][3], min(deltas[c], 6))
 
         if di == 0:
             iref = _BC6H_NONE_I
@@ -878,13 +888,31 @@ def _bc6h_blocks(lanes, nblocks, provisional, *, history=None):
 
     if provisional is None:
         unconf_e = [k for k in ends if eclass[k] != 3]
+        # A class-3 entry is only fully confirmed if the referencing modes stay within the
+        # bits the calibration actually observed; anything else decodes on default-filled guesses.
+        short_e = []
+        for k in ends:
+            if eclass[k] == 3:
+                for c in range(3):
+                    if any(ep_cb[k][c][q] < cons[k][c][q] for q in range(4)):
+                        short_e.append((k, c))
+                        break
         unconf_i = [k for k in idxs if iclass[k] != 3]
-        if unconf_e or unconf_i:
+        if unconf_e or short_e or unconf_i:
+            hint = " (pass --history <path>)" if history is None else ""
+            if short_e:
+                k, c = short_e[0]
+                q = next(q for q in range(4) if ep_cb[k][c][q] < cons[k][c][q])
+                field = ("w", "x", "y", "z")[q]
+                raise BcpackProvisionalError(
+                    f"BC6H chunk references built-in endpoint history entry {k} with "
+                    f"{cons[k][c][q]} consumed {field} bits on channel {c} but only "
+                    f"{ep_cb[k][c][q]} confirmed{hint}"
+                )
             k = unconf_e[0] if unconf_e else unconf_i[0]
             kind = "endpoint" if unconf_e else "index"
             cls = eclass[k] if unconf_e else iclass[k]
             state = "unknown" if cls == 0 else "unconfirmed"
-            hint = " (pass --history <path>)" if history is None else ""
             raise BcpackProvisionalError(
                 f"BC6H chunk references {state} built-in {kind} history entry {k}{hint}"
             )

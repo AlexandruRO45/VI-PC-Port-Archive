@@ -1448,6 +1448,9 @@ class Bc6hCalibrator:
 
     def build_document(self):
         eh = [[[0, 0, 0, 0] for _ in range(3)] for _ in range(256)]
+        # Confirmed bit count per entry, channel and field (w, x, y, z), left-aligned to the
+        # field widths (16, 10, 6, 6). 0 = the field is a default-filled guess.
+        ecb = [[[0, 0, 0, 0] for _ in range(3)] for _ in range(256)]
         ih = [[0] * 16 for _ in range(256)]
         ec = [0] * 256
         ic = [0] * 256
@@ -1460,6 +1463,7 @@ class Bc6hCalibrator:
                     for q in range(4):
                         rb, rv = self.ref_ep[k][c][q]
                         eh[k][c][q] = rv if rb > 0 else defaults[q]
+                        ecb[k][c][q] = rb
                 ec[k] = 3
             elif self.ep_seen[k]:
                 has_w = 0
@@ -1521,6 +1525,7 @@ class Bc6hCalibrator:
 
         doc = {
             "endpointHistory": eh,
+            "endpointHistoryConfirmedBits": ecb,
             "indexHistory": ih,
             "endpointClass": ec,
             "indexClass": ic,

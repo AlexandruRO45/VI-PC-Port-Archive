@@ -755,6 +755,80 @@ class ReferenceInversionTest(unittest.TestCase):
             self.assertEqual(exp_mips, mip_linear)
 
 
+class Bc6hPartialReferenceConfirmationTest(unittest.TestCase):
+    """A reference-observed BC6H endpoint entry keeps per-field confirmed bits.
+
+    Found by @Pierre-Kookis: an entry observed through mode 14 (w 16, x 4, y 0, z 0 confirmed
+    bits) was exported as class 3 with default-filled y/z, so a mode-1 chunk referencing it
+    decoded 'strictly' to wrong values. Strict decoding now requires every consumed bit to be
+    confirmed; the observing chunk itself stays strict.
+    """
+
+    @staticmethod
+    def _lanes_for(mode):
+        """A one-block chunk that pulls endpoint entry 255 from history through `mode`."""
+        lanes = [[0, 0] for _ in range(16)]
+        lanes[0] = list(_deint4(_zig(1)))          # di=0, de=1 -> endpoint entry 255
+        lanes[15] = [mode - 1, 0]
+        reg = bcpack._BC6H_INFO[bcpack._BC6H_CODE[mode]][3]
+        delta = _zig(-4 if reg == 2 else -8)       # default index -> zero
+        for y in range(4):
+            lanes[11 + y] = [_pack_ix_pair(delta, delta, y)] * 2
+        return lanes
+
+    def test_partial_observation_exports_confirmed_bits_and_gates_strict(self):
+        k = 255
+        truth = {"endpointHistory": {str(k): [[32768, 544, 0, 0] for _ in range(3)]},
+                 "endpointClass": {str(k): 3}}
+        observed = self._lanes_for(14)
+        reference = bcpack.decode(encode_lanes(observed, 6), 6, 16, history=truth)
+        c = calib.Bc6hCalibrator()
+        c.add_reference_chunk(observed, reference, 1)
+        self.assertEqual((c.conflicts, c.ref_blocks), (0, 1))
+        self.assertEqual([p[0] for p in c.ref_ep[k][0]], [16, 4, 0, 0])
+        doc, stats = c.build_document()
+        self.assertEqual(doc["endpointClass"][k], 3)
+        self.assertEqual([list(row) for row in doc["endpointHistoryConfirmedBits"][k]],
+                         [[16, 4, 0, 0], [16, 4, 0, 0], [16, 4, 0, 0]])
+        # Entries without a reference observation export zero confirmed bits.
+        self.assertEqual([list(row) for row in doc["endpointHistoryConfirmedBits"][0]],
+                         [[0, 0, 0, 0]] * 3)
+
+        # The observing chunk stays within its confirmed bits and still decodes strictly.
+        dec, prov = bcpack.decode_with_info(encode_lanes(observed, 6), 6, 16, history=doc)
+        self.assertEqual(dec, reference)
+        self.assertEqual(prov, set())
+
+        # A chunk whose mode consumes more x bits than the entry confirms is provisional,
+        # not strict: the default-filled low bits would silently corrupt the endpoint.
+        consumer = encode_lanes(self._lanes_for(1), 6)
+        with self.assertRaises(bcpack.BcpackProvisionalError) as cm:
+            bcpack.decode(consumer, 6, 16, history=doc)
+        self.assertIn("entry 255", str(cm.exception))
+        self.assertIn("only 4 confirmed", str(cm.exception))
+        # Provisional decoding still runs, as it did before the confirmed bits existed.
+        bcpack.decode(consumer, 6, 16, allow_provisional=True, history=doc)
+
+    def test_sectionless_class3_document_counts_as_fully_confirmed(self):
+        # Older history documents without the confirmed-bits section keep their meaning:
+        # class 3 = fully confirmed, so previously strict chunks stay strict.
+        k = 255
+        truth = {"endpointHistory": {str(k): [[32768, 544, 0, 0] for _ in range(3)]},
+                 "endpointClass": {str(k): 3}}
+        observed = self._lanes_for(14)
+        reference = bcpack.decode(encode_lanes(observed, 6), 6, 16, history=truth)
+        dec, prov = bcpack.decode_with_info(encode_lanes(observed, 6), 6, 16, history=truth)
+        self.assertEqual((dec, prov), (reference, set()))
+        dec1, prov1 = bcpack.decode_with_info(encode_lanes(self._lanes_for(1), 6), 6, 16,
+                                              history=truth)
+        self.assertEqual(prov1, set())
+        # A downgraded class still gates strict decoding (pre-existing control).
+        down = {"endpointHistory": {str(k): [[32768, 544, 0, 0] for _ in range(3)]},
+                "endpointClass": {str(k): 2}}
+        with self.assertRaises(bcpack.BcpackProvisionalError):
+            bcpack.decode(encode_lanes(observed, 6), 6, 16, history=down)
+
+
 class PoolSelfCalibrationTest(unittest.TestCase):
     def test_mixed_bc7_and_bc6h_pool_self_calibration_unlocks_provisional_check_and_export(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -396,6 +396,30 @@ class TestLoadBc6h(unittest.TestCase):
             self.assertEqual(bptc.load_bc6h(hist_dir), (eh_d, ih_d, ec_d, ic_d))
             self.assertEqual(bptc.load_bc6h(Path(hist_dir)), (eh_d, ih_d, ec_d, ic_d))
 
+    def test_confirmed_bits_default_full_and_section_restricts(self) -> None:
+        # Without the section a class-3 entry keeps its pre-confirmed-bits meaning:
+        # every field confirmed at full width.
+        sec = _make_bc6h_section()
+        _, _, _, _, cb = bptc.load_bc6h({"bc6h": sec}, with_confirmed=True)
+        self.assertEqual(cb[0], ((16, 10, 6, 6), (16, 10, 6, 6), (16, 10, 6, 6)))
+        self.assertEqual(cb[255], ((16, 10, 6, 6), (16, 10, 6, 6), (16, 10, 6, 6)))
+        # with_confirmed=False keeps the four-table contract for existing callers.
+        self.assertEqual(len(bptc.load_bc6h({"bc6h": sec}), ), 4)
+
+        # The section restricts per entry, channel and field (w, x, y, z).
+        sec["endpointHistoryConfirmedBits"] = {"255": [[16, 4, 0, 0], [16, 4, 0, 0], [16, 4, 0, 0]]}
+        _, _, _, _, cb = bptc.load_bc6h({"bc6h": sec}, with_confirmed=True)
+        self.assertEqual(cb[255], ((16, 4, 0, 0), (16, 4, 0, 0), (16, 4, 0, 0)))
+        self.assertEqual(cb[0], ((16, 10, 6, 6), (16, 10, 6, 6), (16, 10, 6, 6)))
+
+        # A bit count outside the field width is a shape error.
+        sec["endpointHistoryConfirmedBits"] = {"0": [[17, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]}
+        with self.assertRaises(ValueError):
+            bptc.load_bc6h({"bc6h": sec}, with_confirmed=True)
+        sec["endpointHistoryConfirmedBits"] = {"0": [[16, 10, 6]]}
+        with self.assertRaises(ValueError):
+            bptc.load_bc6h({"bc6h": sec}, with_confirmed=True)
+
     def test_validation_errors(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(FileNotFoundError):
