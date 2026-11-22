@@ -606,5 +606,185 @@ class TestDSMinRtnF64AST(unittest.TestCase):
             RegisterOperand(255, count=2, reg_type=RegType.VGPR)
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarThreadState64:
+    """Architectural state for a single execution thread with scalar register file and 64-bit LDS."""
+
+    def __init__(
+        self,
+        lds: Optional[LDSMemory64] = None,
+        num_vgprs: int = DEFAULT_NUM_VGPRS,
+        num_sgprs: int = DEFAULT_NUM_SGPRS,
+    ) -> None:
+        self.lds: LDSMemory64 = lds if lds is not None else LDSMemory64()
+        self.vgprs: List[int] = [0] * num_vgprs
+        self.sgprs: List[int] = [0] * num_sgprs
+
+    def get_vgpr32(self, idx: int) -> int:
+        return self.vgprs[idx]
+
+    def set_vgpr32(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = u32(val)
+
+    def get_vgpr64(self, idx: int) -> int:
+        low = self.vgprs[idx]
+        high = self.vgprs[idx + 1]
+        return u64(low | (high << 32))
+
+    def set_vgpr64(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = u32(val)
+        self.vgprs[idx + 1] = u32(val >> 32)
+
+
+class ScalarDSInterpreter64:
+    """Deterministic scalar interpreter executing 64-bit DS instructions."""
+
+    def execute(self, state: ScalarThreadState64, inst: DSMinRtnF64Instruction) -> Tuple[int, int]:
+        # 1. Latch input operands before any register update
+        base_addr = state.get_vgpr32(inst.vaddr.index)
+        if isinstance(inst.vdata0, RegisterOperand):
+            vdata_val = state.get_vgpr64(inst.vdata0.index)
+        else:
+            vdata_val = inst.vdata0.value
+
+        # 2. Atomic memory transaction on LDS
+        old_val, new_mem = state.lds.atomic_min_rtn_f64(
+            vaddr=base_addr,
+            vdata0=vdata_val,
+            offset=inst.offset,
+        )
+
+        # 3. Write return value to destination VGPR pair
+        state.set_vgpr64(inst.vdst.index, old_val)
+
+        return old_val, new_mem
+
+
+class TestScalarInterpreter64(unittest.TestCase):
+    """Phase 3: Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory64(DEFAULT_LDS_SIZE_BYTES)
+        self.state = ScalarThreadState64(lds=self.lds)
+        self.interp = ScalarDSInterpreter64()
+
+    def test_scalar_execution_basic(self) -> None:
+        addr = 0x40
+        self.lds.write_qword(addr, TEN_F64)
+
+        self.state.set_vgpr32(2, addr)
+        self.state.set_vgpr64(4, TWO_F64)
+        self.state.set_vgpr64(0, 0xCAFEBABEDEADBEEF)
+
+        inst = DSMinRtnF64Instruction(
+            vdst=RegisterOperand(0, count=2),
+            vaddr=RegisterOperand(2, count=1),
+            vdata0=RegisterOperand(4, count=2),
+        )
+
+        old_val, new_mem = self.interp.execute(self.state, inst)
+
+        self.assertEqual(old_val, TEN_F64)
+        self.assertEqual(new_mem, TWO_F64)
+        self.assertEqual(self.state.get_vgpr64(0), TEN_F64)
+        self.assertEqual(self.lds.read_qword(addr), TWO_F64)
+
+    def test_scalar_execution_with_offset(self) -> None:
+        base_addr = 0x100
+        offset = 0x18
+        eff_addr = base_addr + offset
+
+        self.lds.write_qword(eff_addr, ONE_F64)
+        self.state.set_vgpr32(2, base_addr)
+        self.state.set_vgpr64(4, NEG_TWO_F64)
+
+        inst = DSMinRtnF64Instruction(
+            vdst=RegisterOperand(0, count=2),
+            vaddr=RegisterOperand(2, count=1),
+            vdata0=RegisterOperand(4, count=2),
+            offset=offset,
+        )
+
+        old_val, new_mem = self.interp.execute(self.state, inst)
+
+        self.assertEqual(old_val, ONE_F64)
+        self.assertEqual(new_mem, NEG_TWO_F64)
+        self.assertEqual(self.state.get_vgpr64(0), ONE_F64)
+        self.assertEqual(self.lds.read_qword(eff_addr), NEG_TWO_F64)
+
+    def test_scalar_execution_with_immediate(self) -> None:
+        addr = 0x200
+        self.lds.write_qword(addr, TWO_F64)
+        self.state.set_vgpr32(2, addr)
+
+        inst = DSMinRtnF64Instruction(
+            vdst=RegisterOperand(0, count=2),
+            vaddr=RegisterOperand(2, count=1),
+            vdata0=Immediate64(HALF_F64),
+        )
+
+        old_val, new_mem = self.interp.execute(self.state, inst)
+
+        self.assertEqual(old_val, TWO_F64)
+        self.assertEqual(new_mem, HALF_F64)
+        self.assertEqual(self.state.get_vgpr64(0), TWO_F64)
+        self.assertEqual(self.lds.read_qword(addr), HALF_F64)
+
+    def test_scalar_unaligned_byte_address(self) -> None:
+        self.lds.write_qword(0x300, THREE_F64)
+        self.state.set_vgpr32(2, 0x307)
+        self.state.set_vgpr64(4, ONE_F64)
+
+        inst = DSMinRtnF64Instruction(
+            vdst=RegisterOperand(0, count=2),
+            vaddr=RegisterOperand(2, count=1),
+            vdata0=RegisterOperand(4, count=2),
+        )
+
+        old_val, new_mem = self.interp.execute(self.state, inst)
+        self.assertEqual(old_val, THREE_F64)
+        self.assertEqual(new_mem, ONE_F64)
+        self.assertEqual(self.lds.read_qword(0x300), ONE_F64)
+
+    def test_scalar_signed_zero_ordering(self) -> None:
+        addr = 0x80
+        self.lds.write_qword(addr, POS_ZERO64)
+        self.state.set_vgpr32(2, addr)
+        self.state.set_vgpr64(4, NEG_ZERO64)
+
+        inst = DSMinRtnF64Instruction(
+            vdst=RegisterOperand(0, count=2),
+            vaddr=RegisterOperand(2, count=1),
+            vdata0=RegisterOperand(4, count=2),
+        )
+
+        old_val, new_mem = self.interp.execute(self.state, inst)
+        self.assertEqual(old_val, POS_ZERO64)
+        self.assertEqual(new_mem, NEG_ZERO64)
+        self.assertEqual(self.state.get_vgpr64(0), POS_ZERO64)
+        self.assertEqual(self.lds.read_qword(addr), NEG_ZERO64)
+
+    def test_scalar_nan_suppression(self) -> None:
+        addr = 0x90
+        self.lds.write_qword(addr, QNAN_PAYLOAD_A64)
+        self.state.set_vgpr32(2, addr)
+        self.state.set_vgpr64(4, ONE_F64)
+
+        inst = DSMinRtnF64Instruction(
+            vdst=RegisterOperand(0, count=2),
+            vaddr=RegisterOperand(2, count=1),
+            vdata0=RegisterOperand(4, count=2),
+        )
+
+        old_val, new_mem = self.interp.execute(self.state, inst)
+        self.assertEqual(old_val, QNAN_PAYLOAD_A64)
+        self.assertEqual(new_mem, ONE_F64)
+        self.assertEqual(self.state.get_vgpr64(0), QNAN_PAYLOAD_A64)
+        self.assertEqual(self.lds.read_qword(addr), ONE_F64)
+
+
 if __name__ == "__main__":
     unittest.main()
