@@ -83,5 +83,109 @@ class TestValuLshlAddU32ModelAndOracle(unittest.TestCase):
         self.assertEqual(res, 0x3F)
 
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+
+
+@dataclass(frozen=True)
+class Reg:
+    """Represents an architectural 32-bit register (VGPR or SGPR)."""
+    index: int
+    reg_type: RegType
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"Register index {self.index} out of range [0, 255]")
+
+    @property
+    def name(self) -> str:
+        prefix = "v" if self.reg_type == RegType.VGPR else "s"
+        return f"{prefix}{self.index}"
+
+
+@dataclass(frozen=True)
+class Literal32:
+    """Represents a 32-bit literal integer constant."""
+    bits: int
+
+    @property
+    def name(self) -> str:
+        return f"0x{self.bits & MASK32:08X}"
+
+
+@dataclass(frozen=True)
+class VOP3Operand:
+    """Typed expression operand (Register or Literal32)."""
+    source: Union[Reg, Literal32]
+
+    def disassemble(self) -> str:
+        return self.source.name
+
+
+class Opcode(Enum):
+    V_LSHL_ADD_U32 = "v_lshl_add_u32"
+
+
+@dataclass(frozen=True)
+class VLshlAddU32Instruction:
+    """Symbolic AST node representing a RDNA2 v_lshl_add_u32 instruction."""
+    dst: Reg
+    src0: VOP3Operand
+    src1: VOP3Operand
+    src2: VOP3Operand
+    opcode: Opcode = Opcode.V_LSHL_ADD_U32
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination of VALU instruction must be VGPR, got {self.dst.reg_type}")
+
+    def disassemble(self) -> str:
+        return (
+            f"{self.opcode.value} {self.dst.name}, "
+            f"{self.src0.disassemble()}, {self.src1.disassemble()}, {self.src2.disassemble()}"
+        )
+
+
+class TestValuLshlAddU32SymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_register_creation_and_disassembly(self) -> None:
+        v0 = Reg(0, RegType.VGPR)
+        s5 = Reg(5, RegType.SGPR)
+        self.assertEqual(v0.name, "v0")
+        self.assertEqual(s5.name, "s5")
+
+    def test_register_bounds_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            Reg(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(256, RegType.VGPR)
+
+    def test_literal_operand(self) -> None:
+        lit = Literal32(0x12345678)
+        self.assertEqual(lit.name, "0x12345678")
+
+    def test_instruction_disassembly(self) -> None:
+        dst = Reg(0, RegType.VGPR)
+        src0 = VOP3Operand(Reg(1, RegType.VGPR))
+        src1 = VOP3Operand(Literal32(3))
+        src2 = VOP3Operand(Reg(2, RegType.SGPR))
+
+        inst = VLshlAddU32Instruction(dst=dst, src0=src0, src1=src1, src2=src2)
+        self.assertEqual(inst.disassemble(), "v_lshl_add_u32 v0, v1, 0x00000003, s2")
+
+    def test_instruction_validation(self) -> None:
+        dst_sgpr = Reg(0, RegType.SGPR)
+        src = VOP3Operand(Reg(1, RegType.VGPR))
+        with self.assertRaises(TypeError):
+            VLshlAddU32Instruction(dst=dst_sgpr, src0=src, src1=src, src2=src)
+
+
+
 if __name__ == "__main__":
     unittest.main()
