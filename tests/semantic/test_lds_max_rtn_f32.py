@@ -979,5 +979,147 @@ class TestDSMaxRtnF32SIMD(unittest.TestCase):
         self.assertEqual(self.lds.read_by_byte_addr(0x100), f32_to_bits(10.0))
 
 
+class TestDSMaxRtnF32RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(65536)
+        self.state = ScalarThreadState(lds=self.lds)
+        self.interp = ScalarDSInterpreter(state=self.state)
+
+    def test_alias_vdst_equals_vaddr(self) -> None:
+        # v0 serves as both vaddr and vdst
+        self.state.set_vgpr(0, 0x40)          # Address = 0x40
+        self.state.set_vgpr(1, TWO_F32)       # Candidate = 2.0f
+        self.lds.write_by_byte_addr(0x40, ONE_F32)  # Memory = 1.0f
+
+        inst = DSMaxRtnF32Instruction(
+            opcode=DSOpcode.DS_MAX_RTN_F32,
+            vdst=vgpr(0),
+            vaddr=vgpr(0),
+            vdata0=vgpr(1),
+        )
+        old_val = self.interp.execute_instruction(inst)
+
+        # Address must be sampled before v0 is overwritten with return value (1.0f)
+        self.assertEqual(old_val, ONE_F32)
+        self.assertEqual(self.state.get_vgpr(0), ONE_F32)
+        self.assertEqual(self.lds.read_by_byte_addr(0x40), TWO_F32)
+        # v1 (data) must be preserved
+        self.assertEqual(self.state.get_vgpr(1), TWO_F32)
+
+    def test_alias_vdst_equals_vdata0(self) -> None:
+        # v1 serves as both vdata0 and vdst
+        self.state.set_vgpr(0, 0x40)          # Address = 0x40
+        self.state.set_vgpr(1, TWO_F32)       # Candidate = 2.0f
+        self.lds.write_by_byte_addr(0x40, ONE_F32)
+
+        inst = DSMaxRtnF32Instruction(
+            opcode=DSOpcode.DS_MAX_RTN_F32,
+            vdst=vgpr(1),
+            vaddr=vgpr(0),
+            vdata0=vgpr(1),
+        )
+        old_val = self.interp.execute_instruction(inst)
+
+        # Candidate must be sampled before v1 is overwritten with return value (1.0f)
+        self.assertEqual(old_val, ONE_F32)
+        self.assertEqual(self.state.get_vgpr(1), ONE_F32)
+        self.assertEqual(self.lds.read_by_byte_addr(0x40), TWO_F32)
+        # v0 (addr) must be preserved
+        self.assertEqual(self.state.get_vgpr(0), 0x40)
+
+    def test_alias_vaddr_equals_vdata0(self) -> None:
+        # v1 serves as both vaddr and vdata0
+        addr_and_cand = 0x40  # In float, bits 0x00000040 is subnormal 64 * 2^-149
+        self.state.set_vgpr(1, addr_and_cand)
+        self.lds.write_by_byte_addr(addr_and_cand, ONE_F32)  # 1.0f
+
+        inst = DSMaxRtnF32Instruction(
+            opcode=DSOpcode.DS_MAX_RTN_F32,
+            vdst=vgpr(0),
+            vaddr=vgpr(1),
+            vdata0=vgpr(1),
+        )
+        old_val = self.interp.execute_instruction(inst)
+
+        # max(1.0f, subnormal) = 1.0f
+        self.assertEqual(old_val, ONE_F32)
+        self.assertEqual(self.state.get_vgpr(0), ONE_F32)
+        self.assertEqual(self.lds.read_by_byte_addr(addr_and_cand), ONE_F32)
+        # v1 must remain untouched
+        self.assertEqual(self.state.get_vgpr(1), addr_and_cand)
+
+    def test_alias_all_operands_same(self) -> None:
+        # v0 is vdst, vaddr, and vdata0 simultaneously
+        val = 0x20
+        self.state.set_vgpr(0, val)
+        self.lds.write_by_byte_addr(val, TWO_F32)
+
+        inst = DSMaxRtnF32Instruction(
+            opcode=DSOpcode.DS_MAX_RTN_F32,
+            vdst=vgpr(0),
+            vaddr=vgpr(0),
+            vdata0=vgpr(0),
+        )
+        old_val = self.interp.execute_instruction(inst)
+
+        # Memory was 2.0f, candidate was subnormal (0x20) -> new memory is 2.0f, v0 receives 2.0f
+        self.assertEqual(old_val, TWO_F32)
+        self.assertEqual(self.state.get_vgpr(0), TWO_F32)
+        self.assertEqual(self.lds.read_by_byte_addr(val), TWO_F32)
+
+    def test_operand_preservation_and_canary_isolation(self) -> None:
+        # Fill all VGPRs with distinct canary pattern
+        for reg in range(256):
+            self.state.set_vgpr(reg, 0x55000000 | reg)
+
+        self.state.set_vgpr(10, 0x80)         # vaddr
+        self.state.set_vgpr(20, TEN_F32)      # vdata0
+        self.lds.write_by_byte_addr(0x80, ONE_F32)
+
+        inst = DSMaxRtnF32Instruction(
+            opcode=DSOpcode.DS_MAX_RTN_F32,
+            vdst=vgpr(5),
+            vaddr=vgpr(10),
+            vdata0=vgpr(20),
+        )
+        self.interp.execute_instruction(inst)
+
+        # Only vdst (v5) should have changed to old LDS value (1.0f)
+        self.assertEqual(self.state.get_vgpr(5), ONE_F32)
+        self.assertEqual(self.state.get_vgpr(10), 0x80)
+        self.assertEqual(self.state.get_vgpr(20), TEN_F32)
+
+        # All other 253 registers must have preserved their canary exactly
+        for reg in range(256):
+            if reg not in (5, 10, 20):
+                self.assertEqual(self.state.get_vgpr(reg), 0x55000000 | reg)
+
+    def test_simd_aliasing(self) -> None:
+        state = SIMDWaveState(wave_size=32, lds=self.lds)
+        interp = SIMDDSInterpreter(state=state)
+
+        for lane in range(32):
+            addr = lane * 4
+            self.lds.write_by_byte_addr(addr, ONE_F32)
+            state.set_vgpr(lane, 0, addr)   # v0 is vaddr and vdst
+            state.set_vgpr(lane, 1, TWO_F32)
+
+        inst = DSMaxRtnF32Instruction(
+            opcode=DSOpcode.DS_MAX_RTN_F32,
+            vdst=vgpr(0),
+            vaddr=vgpr(0),
+            vdata0=vgpr(1),
+        )
+        res = interp.execute_instruction(inst)
+
+        for lane in range(32):
+            addr = lane * 4
+            self.assertEqual(res[lane], ONE_F32)
+            self.assertEqual(state.get_vgpr(lane, 0), ONE_F32)
+            self.assertEqual(self.lds.read_by_byte_addr(addr), TWO_F32)
+
+
 if __name__ == "__main__":
     unittest.main()
