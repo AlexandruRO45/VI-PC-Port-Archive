@@ -217,6 +217,86 @@ class VMqsadU32U8Instruction:
 
 
 # ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarRegisterFile:
+    """Architectural register file for a single execution thread."""
+
+    def __init__(self) -> None:
+        self.vgprs: List[int] = [0] * 256
+        self.sgprs: List[int] = [0] * 106
+
+    def read_operand(self, op: Operand) -> Union[int, List[int]]:
+        """Read operand value as unsigned 32-bit, 64-bit integer, or quad dwords."""
+        if op.reg_type == RegType.LITERAL:
+            assert op.literal_value is not None
+            return op.literal_value
+
+        if op.count == 1:
+            if op.reg_type == RegType.VGPR:
+                return self.vgprs[op.index] & MASK32
+            if op.reg_type == RegType.SGPR:
+                return self.sgprs[op.index] & MASK32
+        elif op.count == 2:
+            if op.reg_type == RegType.VGPR:
+                lo = self.vgprs[op.index] & MASK32
+                hi = self.vgprs[op.index + 1] & MASK32
+                return (hi << 32) | lo
+            if op.reg_type == RegType.SGPR:
+                lo = self.sgprs[op.index] & MASK32
+                hi = self.sgprs[op.index + 1] & MASK32
+                return (hi << 32) | lo
+        elif op.count == 4:
+            if op.reg_type == RegType.VGPR:
+                return [self.vgprs[op.index + k] & MASK32 for k in range(4)]
+            if op.reg_type == RegType.SGPR:
+                return [self.sgprs[op.index + k] & MASK32 for k in range(4)]
+
+        raise ValueError(f"Unsupported operand: {op}")
+
+    def write_operand(self, op: Operand, values: Union[int, Sequence[int]]) -> None:
+        """Write 32-bit dword(s) to destination register operand."""
+        if op.reg_type == RegType.LITERAL:
+            raise TypeError("Cannot write to literal operand")
+
+        val_list: Sequence[int] = [values] if isinstance(values, int) else values
+        if len(val_list) != op.count:
+            raise ValueError(f"Value count {len(val_list)} does not match operand count {op.count}")
+
+        if op.reg_type == RegType.VGPR:
+            for k in range(op.count):
+                self.vgprs[op.index + k] = u32(val_list[k])
+        elif op.reg_type == RegType.SGPR:
+            for k in range(op.count):
+                self.sgprs[op.index + k] = u32(val_list[k])
+
+
+class ScalarVALUInterpreter:
+    """Deterministic instruction interpreter for v_mqsad_u32_u8 on a scalar register file."""
+
+    def __init__(self, regs: ScalarRegisterFile | None = None) -> None:
+        self.regs: ScalarRegisterFile = regs if regs is not None else ScalarRegisterFile()
+
+    def step(self, instr: VMqsadU32U8Instruction) -> List[int]:
+        # Atomic read phase
+        s0_val = self.regs.read_operand(instr.src0)
+        s1_val = self.regs.read_operand(instr.src1)
+        s2_vals = self.regs.read_operand(instr.src2)
+
+        assert isinstance(s0_val, int)
+        assert isinstance(s1_val, int)
+        assert isinstance(s2_vals, list)
+
+        # Computation phase
+        result = ref_mqsad_u32_u8(s0_val, s1_val, s2_vals)
+
+        # Write-back phase
+        self.regs.write_operand(instr.dst, result)
+        return result
+
+
+# ==============================================================================
 # Unit Tests: Model and Reference Oracle
 # ==============================================================================
 
@@ -425,6 +505,92 @@ class TestValuMqsadU32U8SymbolicAST(unittest.TestCase):
                 src1=Operand.vgpr(1),
                 src2=Operand.vgpr(4, count=2),
             )
+
+
+class TestValuMqsadU32U8ScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.regs = ScalarRegisterFile()
+        self.interp = ScalarVALUInterpreter(self.regs)
+
+    def test_scalar_register_file_read_write(self) -> None:
+        # Single 32-bit dword
+        self.regs.write_operand(Operand.vgpr(5), 0x12345678)
+        self.assertEqual(self.regs.read_operand(Operand.vgpr(5)), 0x12345678)
+
+        # 64-bit pair
+        self.regs.write_operand(Operand.vgpr(2, count=2), [0x04030201, 0x08070605])
+        self.assertEqual(self.regs.read_operand(Operand.vgpr(2, count=2)), 0x0807060504030201)
+
+        # 128-bit quad
+        self.regs.write_operand(Operand.vgpr(4, count=4), [10, 20, 30, 40])
+        self.assertEqual(self.regs.read_operand(Operand.vgpr(4, count=4)), [10, 20, 30, 40])
+
+        # SGPR 64-bit pair
+        self.regs.write_operand(Operand.sgpr(0, count=2), [0xAAAAAAAA, 0x55555555])
+        self.assertEqual(self.regs.read_operand(Operand.sgpr(0, count=2)), 0x55555555AAAAAAAA)
+
+    def test_scalar_execution_all_vgprs(self) -> None:
+        # Load src0 (v[2:3]) = 0x0807060504030201
+        self.regs.write_operand(Operand.vgpr(2, count=2), [0x04030201, 0x08070605])
+        # Load src1 (v1) = 0x04030201
+        self.regs.write_operand(Operand.vgpr(1), 0x04030201)
+        # Load src2 (v[4:7]) = [0, 0, 0, 0]
+        self.regs.write_operand(Operand.vgpr(4, count=4), [0, 0, 0, 0])
+
+        instr = VMqsadU32U8Instruction(
+            dst=Operand.vgpr(8, count=4),
+            src0=Operand.vgpr(2, count=2),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(4, count=4),
+        )
+
+        res = self.interp.step(instr)
+        self.assertEqual(res, [0, 4, 8, 12])
+        self.assertEqual(self.regs.read_operand(Operand.vgpr(8, count=4)), [0, 4, 8, 12])
+
+    def test_scalar_execution_sgpr_and_literal(self) -> None:
+        # src0 from s[2:3], src1 as literal constant
+        self.regs.write_operand(Operand.sgpr(2, count=2), [0x04030201, 0x08070605])
+        self.regs.write_operand(Operand.vgpr(4, count=4), [100, 200, 300, 400])
+
+        instr = VMqsadU32U8Instruction(
+            dst=Operand.vgpr(8, count=4),
+            src0=Operand.sgpr(2, count=2),
+            src1=Operand.literal(0x04030201),
+            src2=Operand.vgpr(4, count=4),
+        )
+
+        res = self.interp.step(instr)
+        self.assertEqual(res, [100, 204, 308, 412])
+        self.assertEqual(self.regs.read_operand(Operand.vgpr(8, count=4)), [100, 204, 308, 412])
+
+    def test_scalar_sequential_program(self) -> None:
+        # Step 1: compute initial SADs into v[8:11]
+        self.regs.write_operand(Operand.vgpr(2, count=2), [0x04030201, 0x08070605])
+        self.regs.write_operand(Operand.vgpr(1), 0x04030201)
+        self.regs.write_operand(Operand.vgpr(4, count=4), [0, 0, 0, 0])
+
+        instr1 = VMqsadU32U8Instruction(
+            dst=Operand.vgpr(8, count=4),
+            src0=Operand.vgpr(2, count=2),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(4, count=4),
+        )
+        self.interp.step(instr1)
+        self.assertEqual(self.regs.read_operand(Operand.vgpr(8, count=4)), [0, 4, 8, 12])
+
+        # Step 2: feed v[8:11] as src2 accumulator for next step
+        instr2 = VMqsadU32U8Instruction(
+            dst=Operand.vgpr(12, count=4),
+            src0=Operand.vgpr(2, count=2),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(8, count=4),
+        )
+        self.interp.step(instr2)
+        # Should double the SADs: [0, 8, 16, 24]
+        self.assertEqual(self.regs.read_operand(Operand.vgpr(12, count=4)), [0, 8, 16, 24])
 
 
 if __name__ == "__main__":
