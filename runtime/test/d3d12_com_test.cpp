@@ -130,7 +130,9 @@ int main() {
         group.NumBarriers = 1;
         group.pTextureBarriers = &texture;
         list->Barrier(1, &group);
-        list->DrawInstanced(3, 1, 0, 0);  // not implemented: reported once by its generated stub, recording continues
+        // Recorded into the IR. The replay skips it: no pipeline state is bound, and this queue has no pipeline
+        // registry yet (PR C, step 3), so there is nothing to draw with.
+        list->DrawInstanced(3, 1, 0, 0);
         EXPECT(list->Close() == S_OK);
         EXPECT(list->Close() == E_FAIL);  // already closed
 

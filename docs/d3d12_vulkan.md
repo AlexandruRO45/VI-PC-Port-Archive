@@ -150,7 +150,10 @@ What is implemented (all of it testable without the game):
 - **IR** (`runtime/src/command_list.h`): legacy barriers (transition, UAV, aliasing; split barriers record their end
   half), enhanced barriers (global, buffer, texture; the half with `SyncAfter = SPLIT` is dropped and the other is
   replayed as a full barrier), `ClearRenderTargetView` / `ClearDepthStencilView`, whole view or rectangles,
-  `CopyBufferRegion` / `CopyTextureRegion` / `CopyResource`, and `ResolveSubresource`.
+  `CopyBufferRegion` / `CopyTextureRegion` / `CopyResource`, `ResolveSubresource`, `SetPipelineState` /
+  `SetGraphicsRootSignature` / `SetComputeRootSignature` / root descriptor tables, `IASetVertexBuffers` /
+  `IASetIndexBuffer`, the draws (`DrawInstanced`, `DrawIndexedInstanced`) and `OMSetRenderTargets` (up to eight
+  colour views plus an optional depth-stencil view).
   Views and rectangles are copied while recording, so the CPU descriptor slot can be rewritten afterwards.
 - **Replay** (`runtime/src/vulkan_replay.h`): `prepare` resolves and checks a list without writing anything, `emit`
   writes it. Legacy states map through the section 4.3 table (`vulkan_access`), enhanced barriers through
@@ -165,7 +168,13 @@ What is implemented (all of it testable without the game):
   `ResolveSubresource` becomes `vkCmdResolveImage` in the same layouts as a copy: a multisampled colour
   subresource into a single-sampled one of the same size and format. Depth-stencil resolves, and resolves between
   two formats of one typeless family, are refused as unsupported. A multisampled texture copies only to one with
-  the same sample count and has no footprint.
+  the same sample count and has no footprint. Draws bind the pipeline the list selected and the bindless set;
+  `OMSetRenderTargets` gives `emit` the rendering scope. The attachment set stays bound across state and barrier
+  commands, but the instance only lives while draws need it: it opens before the first draw that uses the
+  attachments and closes before any command that cannot run inside one (a barrier, clear, copy or the next
+  `OMSetRenderTargets`) and at the end of the list. Each opening moves the attachments from their tracked layout to
+  the attachment layout, and a resource first used there is zero-filled first, as a D3D12 committed resource would
+  be. A list without `OMSetRenderTargets` leaves rendering to its caller, which is what the harness tests do.
 - **Layout tracking** (`LayoutTracker`): the current Vulkan layout of every image subresource, so barriers start
   from the real layout instead of the application's `before`. This is how implicit promotion and decay work: a
   texture in `COMMON` sits in `GENERAL`, which every promotable access can use, so a later barrier naming the
@@ -184,7 +193,10 @@ What is implemented (all of it testable without the game):
   are identified by their `ID3D12Resource` pointer, and RTV/DSV CPU handles point at a `TargetView`.
   `OMSetFrontAndBackStencilRef` records its two `UINT`s on the list (and `Reset` clears them), but nothing applies
   them yet: Vulkan can set the faces with `vkCmdSetStencilReference` and a face mask, but only a pipeline that
-  consumes the dynamic state can, and this layer has no pipeline or draw path.
+  consumes the dynamic state can, and `emit` does not set a stencil reference. `OMSetRenderTargets` records the
+  captured views: the CPU handles are read from the device's RTV/DSV heaps, including a single-handle descriptor
+  range, whose stride is the fixed RTV slot size. The queue side of the draw path (pipeline registry, bindless set,
+  viewport) is still to be wired into `VulkanQueue`.
 - **Device** (`runtime/shims/d3d12_vulkan_device.cpp`): an `ID3D12Device11` (PC ABI, 80 slots) that the Xbox-ABI
   proxy (`d3d12_xs_device.cpp`) forwards to, so slot 14's heap-handle conversion and slot 76's resource creation
   work unchanged. It creates the objects above, plus:
@@ -193,7 +205,6 @@ What is implemented (all of it testable without the game):
     yet;
   - `CreateRenderTargetView` / `CreateDepthStencilView` for whole resources, `TEXTURE2D`, `TEXTURE2DMS` and
     `TEXTURE2DARRAY`;
-  - `CreateRenderTargetView` / `CreateDepthStencilView` for whole resources, `TEXTURE2D` and `TEXTURE2DARRAY`;
   - `CopyDescriptors` / `CopyDescriptorsSimple`. A descriptor is the bytes of its slot, so a copy is a byte copy:
     the destination and source range lists are walked together, one descriptor at a time, and null size arrays
     mean one descriptor per range;
