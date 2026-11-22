@@ -66,18 +66,32 @@ MUTATIONS = [
     ("v_sin_f16 omits turns-to-radians 2*pi factor", TRANSLATOR,
      '        elif op in ("v_sin_f16", "v_cos_f16"):\n'
      '            u = self.src_h(a[1])\n'
-     '            v2, f, t, r, w2, pk, lo = (self.tmp() for _ in range(7))\n'
+     '            v2, f, fl, fr, big, one, c, t, r, w2, pk, lo = (self.tmp() for _ in range(12))\n'
      '            self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")\n'
      '            self.emit(f"{f} = OpCompositeExtract %float {v2} 0")\n'
      '            f = self.modify_f(f, a[1])\n'
-     '            self.emit(f"{t} = OpFMul %float {f} {self.fconst(6.283185307179586)}")',
+     '            # Reduce the turn fraction before scaling (see v_sin_f32 below); f16 is promoted to f32 first, so the\n'
+     '            # reduction is as exact as the f32 path.\n'
+     '            self.emit(f"{fl} = OpExtInst %float %glsl Floor {f}")\n'
+     '            self.emit(f"{fr} = OpFSub %float {f} {fl}")\n'
+     '            self.emit(f"{big} = OpFOrdGreaterThanEqual %bool {fr} {self.fconst(0.5)}")\n'
+     '            self.emit(f"{one} = OpSelect %float {big} {self.fconst(1.0)} {self.fconst(0.0)}")\n'
+     '            self.emit(f"{c} = OpFSub %float {fr} {one}")\n'
+     '            self.emit(f"{t} = OpFMul %float {c} {self.fconst(6.283185307179586)}")',
      '        elif op in ("v_sin_f16", "v_cos_f16"):\n'
      '            u = self.src_h(a[1])\n'
-     '            v2, f, t, r, w2, pk, lo = (self.tmp() for _ in range(7))\n'
+     '            v2, f, fl, fr, big, one, c, t, r, w2, pk, lo = (self.tmp() for _ in range(12))\n'
      '            self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")\n'
      '            self.emit(f"{f} = OpCompositeExtract %float {v2} 0")\n'
      '            f = self.modify_f(f, a[1])\n'
-     '            self.emit(f"{t} = OpFMul %float {f} {self.fconst(1.0)}")',
+     '            # Reduce the turn fraction before scaling (see v_sin_f32 below); f16 is promoted to f32 first, so the\n'
+     '            # reduction is as exact as the f32 path.\n'
+     '            self.emit(f"{fl} = OpExtInst %float %glsl Floor {f}")\n'
+     '            self.emit(f"{fr} = OpFSub %float {f} {fl}")\n'
+     '            self.emit(f"{big} = OpFOrdGreaterThanEqual %bool {fr} {self.fconst(0.5)}")\n'
+     '            self.emit(f"{one} = OpSelect %float {big} {self.fconst(1.0)} {self.fconst(0.0)}")\n'
+     '            self.emit(f"{c} = OpFSub %float {fr} {one}")\n'
+     '            self.emit(f"{t} = OpFMul %float {c} {self.fconst(1.0)}")',
      "test_ps_ops4"),
     ("v_mul_legacy_f32 drops zero-times-anything guard", TRANSLATOR,
      '        elif op == "v_mul_legacy_f32":\n'

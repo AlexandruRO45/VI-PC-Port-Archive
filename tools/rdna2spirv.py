@@ -2533,11 +2533,18 @@ class Gen:
             self.image_op(op, a, mods)
         elif op in ("v_sin_f16", "v_cos_f16"):
             u = self.src_h(a[1])
-            v2, f, t, r, w2, pk, lo = (self.tmp() for _ in range(7))
+            v2, f, fl, fr, big, one, c, t, r, w2, pk, lo = (self.tmp() for _ in range(12))
             self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
             self.emit(f"{f} = OpCompositeExtract %float {v2} 0")
             f = self.modify_f(f, a[1])
-            self.emit(f"{t} = OpFMul %float {f} {self.fconst(6.283185307179586)}")
+            # Reduce the turn fraction before scaling (see v_sin_f32 below); f16 is promoted to f32 first, so the
+            # reduction is as exact as the f32 path.
+            self.emit(f"{fl} = OpExtInst %float %glsl Floor {f}")
+            self.emit(f"{fr} = OpFSub %float {f} {fl}")
+            self.emit(f"{big} = OpFOrdGreaterThanEqual %bool {fr} {self.fconst(0.5)}")
+            self.emit(f"{one} = OpSelect %float {big} {self.fconst(1.0)} {self.fconst(0.0)}")
+            self.emit(f"{c} = OpFSub %float {fr} {one}")
+            self.emit(f"{t} = OpFMul %float {c} {self.fconst(6.283185307179586)}")
             self.emit(f"{r} = OpExtInst %float %glsl {'Sin' if 'sin' in op else 'Cos'} {t}")
             r = self.clamp_mods(r, mods)
             self.write_lo16(a[0], self.f16_bits(r))
@@ -2564,10 +2571,19 @@ class Gen:
             self.emit(f"{r} = OpBitwiseOr %uint {halves[0]} {hi}")
             self.dst(a[0], r)
         elif op in ("v_sin_f32", "v_cos_f32"):
-            # RDNA takes the angle in turns: sin(x * 2*pi).
+            # RDNA takes the angle in turns and range-reduces there. Reduce the turn fraction first: x - floor(x) is
+            # exact in binary32, and wrapping it into [-0.5, 0.5) gives Sin/Cos an argument in [-pi, pi), the only
+            # range where SPIR-V guarantees 2^-11 absolute precision. Scaling the unreduced angle by 2*pi first loses
+            # the fractional turn for large x and lands outside that range (#594). The wrap subtracts a whole turn
+            # rather than half of one, which would change the sign of Cos.
             x = self.src_f(a[1])
-            t, r = self.tmp(), self.tmp()
-            self.emit(f"{t} = OpFMul %float {x} {self.fconst(6.283185307179586)}")
+            fl, fr, big, one, c, t, r = (self.tmp() for _ in range(7))
+            self.emit(f"{fl} = OpExtInst %float %glsl Floor {x}")
+            self.emit(f"{fr} = OpFSub %float {x} {fl}")
+            self.emit(f"{big} = OpFOrdGreaterThanEqual %bool {fr} {self.fconst(0.5)}")
+            self.emit(f"{one} = OpSelect %float {big} {self.fconst(1.0)} {self.fconst(0.0)}")
+            self.emit(f"{c} = OpFSub %float {fr} {one}")
+            self.emit(f"{t} = OpFMul %float {c} {self.fconst(6.283185307179586)}")
             self.emit(f"{r} = OpExtInst %float %glsl {'Sin' if 'sin' in op else 'Cos'} {t}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op == "v_rndne_f32":
