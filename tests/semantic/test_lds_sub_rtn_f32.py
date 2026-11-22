@@ -323,6 +323,74 @@ class DSSubRtnF32Instruction:
         return cls(vdst=vdst, vaddr=vaddr, vdata0=vdata0, offset=offset, gds=gds)
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarState:
+    """Scalar machine state comprising register files and LDS memory."""
+
+    def __init__(self, lds_size_dwords: int = DEFAULT_LDS_DWORDS) -> None:
+        self.vgprs: list[int] = [0] * DEFAULT_NUM_VGPRS
+        self.sgprs: list[int] = [0] * DEFAULT_NUM_SGPRS
+        self.lds: LDSMemory = LDSMemory(size_dwords=lds_size_dwords)
+        self.vcc: int = 0
+
+    def get_vgpr(self, index: int) -> int:
+        return self.vgprs[index]
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        self.vgprs[index] = u32(val)
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index]
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        self.sgprs[index] = u32(val)
+
+    def get_reg(self, reg: RegisterOperand) -> int:
+        if reg.reg_type == RegType.VGPR:
+            return self.get_vgpr(reg.index)
+        return self.get_sgpr(reg.index)
+
+    def set_reg(self, reg: RegisterOperand, val: int) -> None:
+        if reg.reg_type == RegType.VGPR:
+            self.set_vgpr(reg.index, val)
+        else:
+            self.set_sgpr(reg.index, val)
+
+    def resolve_operand(self, op: Operand) -> int:
+        if isinstance(op, Immediate):
+            return op.val
+        return self.get_reg(op)
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for ds_sub_rtn_f32."""
+
+    def execute(self, instr: DSSubRtnF32Instruction, state: ScalarState) -> Tuple[int, int]:
+        """Execute a single ds_sub_rtn_f32 instruction on scalar state.
+
+        Returns:
+            Tuple[int, int]: (old_val_bits, new_mem_bits)
+        """
+        # 1. Latch inputs prior to any register writeback
+        vaddr = state.get_reg(instr.vaddr)
+        sub_val = state.resolve_operand(instr.vdata0)
+
+        # 2. Perform atomic LDS float subtraction
+        effective_byte = u32(vaddr + instr.offset)
+        idx = (effective_byte >> 2) & (state.lds.size_dwords - 1)
+        old_val = state.lds.read_dword(idx)
+        new_mem = oracle_sub_f32(old_val, sub_val)
+        state.lds.write_dword(idx, new_mem)
+
+        # 3. Write pre-subtraction value back to destination register
+        state.set_reg(instr.vdst, old_val)
+
+        return old_val, new_mem
+
+
 class TestLdsSubRtnF32Oracle(unittest.TestCase):
     """Phase 1: Unit tests for reference mathematical oracle and architectural model."""
 
@@ -432,6 +500,123 @@ class TestSymbolicAST(unittest.TestCase):
         # Offset exceeding 16 bits
         with self.assertRaises(ValueError):
             DSSubRtnF32Instruction(vdst=v0, vaddr=v0, vdata0=v0, offset=65536)
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Phase 3: Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.state = ScalarState(lds_size_dwords=1024)
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_atomic_sub_execution(self) -> None:
+        addr = 0x40
+        idx = addr >> 2
+        self.state.lds.write_dword(idx, TEN_F32)
+
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, THREE_F32)
+        self.state.set_vgpr(0, 0xCAFEBABE)  # Initial sentinel in vdst
+
+        instr = DSSubRtnF32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+            offset=0,
+        )
+
+        old_val, new_mem = self.interp.execute(instr, self.state)
+
+        seven_f32 = f32_to_bits(7.0)
+        self.assertEqual(old_val, TEN_F32)
+        self.assertEqual(new_mem, seven_f32)
+        self.assertEqual(self.state.get_vgpr(0), TEN_F32)  # vdst received old_val
+        self.assertEqual(self.state.lds.read_dword(idx), seven_f32)
+
+    def test_scalar_execution_with_offset(self) -> None:
+        base_addr = 0x100
+        offset = 0x14
+        eff_addr = base_addr + offset
+        idx = eff_addr >> 2
+
+        self.state.lds.write_dword(idx, FIVE_F32)
+        self.state.set_vgpr(1, base_addr)
+        self.state.set_vgpr(2, TWO_F32)
+
+        instr = DSSubRtnF32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+            offset=offset,
+        )
+
+        old_val, new_mem = self.interp.execute(instr, self.state)
+
+        self.assertEqual(old_val, FIVE_F32)
+        self.assertEqual(new_mem, THREE_F32)
+        self.assertEqual(self.state.get_vgpr(0), FIVE_F32)
+        self.assertEqual(self.state.lds.read_dword(idx), THREE_F32)
+
+    def test_scalar_execution_with_immediate_operand(self) -> None:
+        addr = 0x200
+        idx = addr >> 2
+        self.state.lds.write_dword(idx, THREE_F32)
+        self.state.set_vgpr(1, addr)
+
+        instr = DSSubRtnF32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=Immediate(TWO_F32),
+            offset=0,
+        )
+
+        old_val, new_mem = self.interp.execute(instr, self.state)
+
+        self.assertEqual(old_val, THREE_F32)
+        self.assertEqual(new_mem, ONE_F32)
+        self.assertEqual(self.state.get_vgpr(0), THREE_F32)
+        self.assertEqual(self.state.lds.read_dword(idx), ONE_F32)
+
+    def test_scalar_unaligned_byte_address(self) -> None:
+        idx = 0x300 >> 2
+        self.state.lds.write_dword(idx, FIVE_F32)
+        self.state.set_vgpr(1, 0x303)  # Unaligned byte address
+
+        instr = DSSubRtnF32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=Immediate(ONE_F32),
+            offset=0,
+        )
+
+        old_val, new_mem = self.interp.execute(instr, self.state)
+        self.assertEqual(old_val, FIVE_F32)
+        four_f32 = f32_to_bits(4.0)
+        self.assertEqual(new_mem, four_f32)
+        self.assertEqual(self.state.lds.read_dword(idx), four_f32)
+
+    def test_scalar_sequential_subtraction(self) -> None:
+        addr = 0x50
+        idx = addr >> 2
+        self.state.lds.write_dword(idx, TEN_F32)
+        self.state.set_vgpr(1, addr)
+
+        steps = [ONE_F32, TWO_F32, THREE_F32]
+        expected_olds = [TEN_F32, f32_to_bits(9.0), f32_to_bits(7.0)]
+        expected_news = [f32_to_bits(9.0), f32_to_bits(7.0), f32_to_bits(4.0)]
+
+        for s, exp_old, exp_new in zip(steps, expected_olds, expected_news):
+            instr = DSSubRtnF32Instruction(
+                vdst=RegisterOperand(0, RegType.VGPR),
+                vaddr=RegisterOperand(1, RegType.VGPR),
+                vdata0=Immediate(s),
+            )
+            old_val, new_mem = self.interp.execute(instr, self.state)
+            self.assertEqual(old_val, exp_old)
+            self.assertEqual(new_mem, exp_new)
+            self.assertEqual(self.state.get_vgpr(0), exp_old)
+
+        self.assertEqual(self.state.lds.read_dword(idx), f32_to_bits(4.0))
 
 
 if __name__ == "__main__":
