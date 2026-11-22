@@ -30,6 +30,8 @@ import re
 import struct
 from fractions import Fraction
 
+from spirv_inline import inline_pure_functions
+
 MASK = 0xFFFFFFFF
 
 
@@ -344,7 +346,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 raise UnsupportedConstruct(f"OpAccessChain into {k[0]}")
         return off, cur
 
-    for raw in text.splitlines():
+    for raw in inline_pure_functions(text).splitlines():
         line = raw.strip()
         if not line:
             continue

@@ -22,7 +22,9 @@ sys.path.insert(0, TOOLS_DIR)
 sys.path.insert(0, HERE)
 
 import rdna2spirv  # noqa: E402
-import spirv_mini_interp as si  # noqa: E402
+from shader_ir import operand  # noqa: E402
+import spirv_mini_interp as si
+from spirv_wave_interp import run_wave  # noqa: E402
 from test_buffer_load_format import BASE, load_format  # noqa: E402
 
 
@@ -48,8 +50,8 @@ def f32_rne(x: Fraction) -> int:
     return sign | (e + 127) << 23 | (q - (1 << 23))
 
 
-def norm_bits_on_interp(m: int, n: int) -> int:
-    """Run the SPIR-V that Gen.norm_bits emits for the constant m in the mini interpreter."""
+def norm_module(m: int, n: int) -> str:
+    """Build a single-output fragment that calls the translated normalization function."""
     gen = rdna2spirv.Gen("ps")
     res = gen.norm_bits(gen.cu(m), n)
     consts = "".join(f"{name} = OpConstant %uint {v}\n" for v, name in gen.consts.items())
@@ -59,10 +61,11 @@ def norm_bits_on_interp(m: int, n: int) -> int:
             "%void = OpTypeVoid\n%fn = OpTypeFunction %void\n%bool = OpTypeBool\n%uint = OpTypeInt 32 0\n"
             "%int = OpTypeInt 32 1\n%ulong = OpTypeInt 64 0\n%_ptr_Output_uint = OpTypePointer Output %uint\n"
             "%out = OpVariable %_ptr_Output_uint Output\n" + consts
-            + "%main = OpFunction %void None %fn\n%entry = OpLabel\n"
+            + "%fn_norm = OpTypeFunction %uint %uint %ulong %uint\n"
+            + "\n".join(gen.norm_fn) + "\n%main = OpFunction %void None %fn\n%entry = OpLabel\n"
             + "".join(line.strip() + "\n" for line in gen.body)
             + f"OpStore %out {res}\nOpReturn\nOpFunctionEnd\n")
-    return si.run_fragment(text)["%out"][0]
+    return text
 
 
 def recip_mul(m: int, n: int) -> int:
@@ -81,7 +84,21 @@ class NormBitsExact(unittest.TestCase):
         d = (1 << n) - 1
         for m in values:
             with self.subTest(n=n, m=m):
-                self.assertEqual(norm_bits_on_interp(m, n), f32_rne(Fraction(m, d)))
+                self.assertEqual(si.run_fragment(norm_module(m, n))["%out"][0], f32_rne(Fraction(m, d)))
+
+    def test_repeated_dynamic_loads_share_normalization(self):
+        gen = rdna2spirv.Gen("ps")
+        args = [operand(s) for s in ("v[4:7]", "v0", "s[0:3]", "0")]
+        for _ in range(16):
+            gen.buffer_load_format("buffer_load_format_xyzw", args, {"offen"})
+        text = rdna2spirv.assemble(gen)
+        self.assertEqual(text.count(" FindUMsb "), 1)
+        self.assertGreater(text.count("OpFunctionCall %uint"), 16)
+
+    def test_wave_interpreter_runs_normalization(self):
+        expected = f32_rne(Fraction(3, 255))
+        lanes = run_wave(norm_module(3, 8), wave=32)["outputs"]
+        self.assertEqual([lane["%out"][0] for lane in lanes], [expected] * 32)
 
     def test_every_value_up_to_8_bits(self):
         for n in range(1, 9):

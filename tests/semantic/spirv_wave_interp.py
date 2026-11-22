@@ -28,6 +28,8 @@ wave size; other Input variables read zero. PushConstant words can be seeded (de
 """
 import re
 
+from spirv_inline import inline_pure_functions
+
 MASK = 0xFFFFFFFF
 SUBGROUP = 3        # Scope Subgroup
 
@@ -118,7 +120,7 @@ class _Module:
         self.id_type = {}
         cur = None
         in_body = False
-        for raw in text.splitlines():
+        for raw in inline_pure_functions(text).splitlines():
             line = raw.strip()
             if not line:
                 continue
