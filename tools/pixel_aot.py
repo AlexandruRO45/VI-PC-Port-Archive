@@ -473,14 +473,14 @@ def lane_mask(token):
     return [token]
 
 
-def fp_operand(token, scalar, vector, pending, sample_pending, *, quad_values: dict[str, bool] | None = None):
+def fp_operand(token, scalar, vector, pending, sample_dest, *, quad_values: dict[str, bool] | None = None):
     if re.fullmatch(r"-\d+", token):
         return f"asfloat({int(token) & 0xffffffff}u)"
     if token.startswith("-"):
-        return "(-" + fp_operand(token[1:], scalar, vector, pending, sample_pending, quad_values=quad_values) + ")"
+        return "(-" + fp_operand(token[1:], scalar, vector, pending, sample_dest, quad_values=quad_values) + ")"
     if absolute := re.fullmatch(r"abs\(([^()|]+)\)|\|([^()|]+)\|", token):
         inner = absolute.group(1) or absolute.group(2)
-        return f"abs({fp_operand(inner, scalar, vector, pending, sample_pending, quad_values=quad_values)})"
+        return f"abs({fp_operand(inner, scalar, vector, pending, sample_dest, quad_values=quad_values)})"
     if re.fullmatch(r"[vs]\d+", token):
         if token in pending:
             raise ValueError("Constant read before load completion")
@@ -494,7 +494,7 @@ def fp_operand(token, scalar, vector, pending, sample_pending, *, quad_values: d
         if not isinstance(value, str) or not (value.startswith(("sample", "alu", "params["))
                 or (quad_values is not None and value in quad_values)):
             raise ValueError("Expected a numeric register")
-        if sample_pending and value.startswith("sample"):
+        if token in sample_dest:
             raise ValueError("Sample used before vmcnt wait")
         return value
     if re.fullmatch(r"0x[0-9a-f]{1,8}|\d+", token):
@@ -504,12 +504,12 @@ def fp_operand(token, scalar, vector, pending, sample_pending, *, quad_values: d
     raise ValueError(f"Unsupported arithmetic operand {token}")
 
 
-def int_operand(token, scalar, vector, pending, sample_pending, *, signed):
+def int_operand(token, scalar, vector, pending, sample_dest, *, signed):
     if re.fullmatch(r"v\d+", token):
         value = vector[token]
         if not isinstance(value, str) or not value.startswith(("sample", "alu", "params[")):
             raise ValueError("Expected a numeric register")
-        if sample_pending and value.startswith("sample"):
+        if token in sample_dest:
             raise ValueError("Sample used before vmcnt wait")
         return f"asint({value})" if signed else f"asuint({value})"
     bits = scalar_u32(token, scalar, pending)
@@ -550,8 +550,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     helpers = set()
     mask = "entry"
     samples = 0
-    sample_pending = False
-    sample_dest = set()
+    sample_dest = {}  # VGPR -> issue number of its outstanding image_sample
     exported = False
     ended = False
     entry_line = len(lines)
@@ -575,9 +574,13 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             continue
         if line == "s_waitcnt lgkmcnt(0)":
             pending.clear()
-        elif line == "s_waitcnt vmcnt(0)":
-            sample_pending = False
-            sample_dest.clear()
+        elif m := match(r"s_waitcnt vmcnt\((\d+)\)"):
+            limit = int(m[1])
+            if limit > 63:
+                raise ValueError("VM wait count exceeds the gfx10 six-bit field")
+            # Only the newest limit samples can remain outstanding. Filtering
+            # the current set also preserves guarantees made by earlier waits.
+            sample_dest = {reg: issue for reg, issue in sample_dest.items() if issue > samples - limit}
         elif m := match(r"s_mov_b64 s\[(\d+):(\d+)\], exec"):
             regs = registers(*m.groups(), 2)
             for n in regs:
@@ -706,7 +709,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Invalid cube operation")
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
-            x, y, z = [fp_operand(t, scalar, vector, pending, sample_pending) for t in tokens]
+            x, y, z = [fp_operand(t, scalar, vector, pending, sample_dest) for t in tokens]
             lines.append(f"    precise float3 cube{i} = float3({x}, {y}, {z});")
             c, a = f"cube{i}", f"abs(cube{i})"
             zmajor = f"({a}.z >= {a}.x && {a}.z >= {a}.y)"
@@ -727,6 +730,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if ((not entry_interp and (mask != "quad" or component not in "xy"))
                     or scalar.get("m0") != "interp_base"):
                 raise ValueError("Unknown interpolation context")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
             if phase == "1" and vector.get(src) == "bary_i":
                 vector[dst] = ("partial", component, mask)
             elif phase == "2" and vector.get(src) == "bary_j" and vector.get(dst) == ("partial", component, mask):
@@ -742,6 +747,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             operands = m.groups()
             dest, coords, image, state = [registers(*operands[k:k+2], width)
                                           for k, width in zip((0,2,4,6), (4,2,8,4))]
+            if any(f"v{n}" in sample_dest for n in dest):
+                raise ValueError("Write overlaps an outstanding sample")
             descriptor = [scalar.get(f"s{n}") for n in image]
             texture = next((name for name in bindings.values() if descriptor == [(name, j) for j in range(8)]), None)
             if (mask != "entry" or any(f"s{n}" in pending for n in (*image, *state))
@@ -753,10 +760,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Unsupported texture coordinate")
             lines.append(f"    float4 sample{i} = {texture}.Sample(samp, float2({', '.join(uv)}));")
             samples += 1
-            sample_pending = True
             for j, n in enumerate(dest):
                 vector[f"v{n}"] = f"sample{i}.{'xyzw'[j]}"
-                sample_dest.add(f"v{n}")
+                sample_dest[f"v{n}"] = samples
         elif m := match(r"v_(fmaak|fmamk)_f32 (v\d+), ([^,]+), ([^,]+), ([^,]+)"):
             op, dst, *tokens = m.groups()
             literal = tokens[2] if op == "fmaak" else tokens[1]
@@ -764,7 +770,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Invalid literal multiply-add")
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
-            values = [fp_operand(t, scalar, vector, pending, sample_pending) for t in tokens]
+            values = [fp_operand(t, scalar, vector, pending, sample_dest) for t in tokens]
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {ALU['fma'][1].format(*values)};")
         elif m := match(r"v_mov_b32(?:_e32|_e64)? (v\d+), (-?\d+(?:\.\d+)?|0x[0-9a-f]{1,8}|[vs]\d+)"):
@@ -774,7 +780,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Invalid register move")
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
-            value = fp_operand(src, scalar, vector, pending, sample_pending)
+            value = fp_operand(src, scalar, vector, pending, sample_dest)
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {value};")
         elif m := match(r"v_(log|exp|rcp|sqrt|rsq|floor|ceil|fract|trunc|frexp_mant|add|mul|max|min|sub|subrev|mul_legacy|fma|fmac|mad|mac|min3|max3|med3)_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
@@ -793,7 +799,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if quad and (clamp or any("|" in t or "abs(" in t for t in tokens)):
                 raise ValueError("Whole-quad coordinate arithmetic must be affine")
             provenance = quad_values if quad else None
-            values = [fp_operand(t, scalar, vector, pending, sample_pending, quad_values=provenance) for t in tokens]
+            values = [fp_operand(t, scalar, vector, pending, sample_dest, quad_values=provenance) for t in tokens]
             if quad:
                 varying = [quad_values.get(vector.get(t.lstrip("-"), ""), False) for t in tokens]
                 if op != "add" and all(varying[:2]):
@@ -812,10 +818,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if re.fullmatch(r"-?\d+|0x[0-9a-f]{1,8}", classes):
                 bits = f"{int(classes, 0) & 0xffffffff}u"
             elif re.fullmatch(r"[vs]\d+", classes):
-                bits = f"asuint({fp_operand(classes, scalar, vector, pending, sample_pending)})"
+                bits = f"asuint({fp_operand(classes, scalar, vector, pending, sample_dest)})"
             else:
                 raise ValueError("Unsupported class mask")
-            operand = fp_operand(value, scalar, vector, pending, sample_pending)
+            operand = fp_operand(value, scalar, vector, pending, sample_dest)
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             lines.append(f"    bool cmp{i} = (class32({operand}) & {bits}) != 0u;")
@@ -826,7 +832,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Invalid integer arithmetic operation")
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
-            values = [int_operand(t, scalar, vector, pending, sample_pending, signed=kind == "i32")
+            values = [int_operand(t, scalar, vector, pending, sample_dest, signed=kind == "i32")
                       for t in tokens]
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({op}({values[0]}, {values[1]}));")
@@ -836,7 +842,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Invalid integer arithmetic operation")
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
-            values = [int_operand(t, scalar, vector, pending, sample_pending, signed=kind == "i32")
+            values = [int_operand(t, scalar, vector, pending, sample_dest, signed=kind == "i32")
                       for t in tokens]
             if op == "med3":
                 vec_type = "int3" if kind == "i32" else "uint3"
@@ -854,8 +860,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Invalid arithmetic operation")
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
-            value = fp_operand(src0, scalar, vector, pending, sample_pending)
-            exponent = int_operand(src1, scalar, vector, pending, sample_pending, signed=True)
+            value = fp_operand(src0, scalar, vector, pending, sample_dest)
+            exponent = int_operand(src1, scalar, vector, pending, sample_dest, signed=True)
             expression = f"ldexp32({value}, {exponent})"
             if clamp:
                 expression = f"saturate({expression})"
@@ -866,7 +872,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             regs = lane_mask(dst)
             if mask != "entry" or pending.intersection(regs):
                 raise ValueError("Invalid comparison")
-            values = [fp_operand(t, scalar, vector, pending, sample_pending) for t in tokens]
+            values = [fp_operand(t, scalar, vector, pending, sample_dest) for t in tokens]
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             lines.append(f"    bool cmp{i} = {COMPARE[op].format(*values)};")
@@ -875,7 +881,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             regs = lane_mask(dst)
             if mask != "entry" or pending.intersection(regs):
                 raise ValueError("Invalid comparison")
-            values = [int_operand(t, scalar, vector, pending, sample_pending, signed=kind == "i32")
+            values = [int_operand(t, scalar, vector, pending, sample_dest, signed=kind == "i32")
                       for t in tokens]
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
@@ -888,7 +894,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     or condition[0] != "condition"
                     or [scalar.get(r) for r in regs] != [(*condition[:2], j, len(regs)) for j in range(len(regs))]):
                 raise ValueError("Select mask is not a tracked comparison")
-            values = [fp_operand(t, scalar, vector, pending, sample_pending) for t in (chosen, unset)]
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            values = [fp_operand(t, scalar, vector, pending, sample_dest) for t in (chosen, unset)]
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {condition[1]} ? {values[0]} : {values[1]};")
         elif m := match(r"v_cvt_f32_f16(?:_e32|_e64)? (v\d+), (-?)(?:\|([vs]\d+|0x[0-9a-f]{1,8}|\d+)\||abs\(([vs]\d+|0x[0-9a-f]{1,8}|\d+)\)|([vs]\d+|0x[0-9a-f]{1,8}|\d+))( clamp)?"):
@@ -901,7 +909,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if re.fullmatch(r"0x[0-9a-f]{1,8}|\d+", source):
                 word = f"{int(source, 0) & 0xffffffff}u"
             else:
-                word = f"asuint({fp_operand(source, scalar, vector, pending, sample_pending)})"
+                word = f"asuint({fp_operand(source, scalar, vector, pending, sample_dest)})"
             expression = f"widen16({word})"
             if bars or call:
                 expression = f"abs({expression})"
@@ -913,8 +921,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    precise float alu{i} = {expression};")
         elif m := match(r"v_cvt_pkrtz_f16_f32_e32 (v\d+), (v\d+), (v\d+)"):
             dst, lo, hi = m.groups()
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
             pair = (vector[lo], vector[hi])
-            if mask != "entry" or sample_pending or not all(isinstance(v, str) and v.startswith(("sample", "alu")) for v in pair):
+            if mask != "entry" or lo in sample_dest or hi in sample_dest or not all(isinstance(v, str) and v.startswith(("sample", "alu")) for v in pair):
                 raise ValueError("Unsupported pack operand")
             vector[dst] = pair
         elif m := match(r"exp mrt0,? (v\d+), \1, (v\d+|off), \2 done compr vm"):
