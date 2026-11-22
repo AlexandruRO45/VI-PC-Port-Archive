@@ -88,7 +88,7 @@ def convert_single(
     dropped: list[tuple[str, str]] = []
     dropped_seen: set[str] = set()
     try:
-        primitives = glb_writer.parse_obj(in_path, is_path=True, up_axis=up_axis)
+        primitives = glb_writer.parse_obj(in_path, is_path=True, up_axis=up_axis, flip_v=False)
         materials: dict[str, dict] = {}
 
         if tex_index:

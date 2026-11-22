@@ -829,6 +829,26 @@ class TestObjParserAndBounds(unittest.TestCase):
                 normals = list(struct.iter_unpack("<3f", data[start:start + view["byteLength"]]))
                 self.assertEqual(normals, [(0.0, 0.0, 1.0)] * 3 + [(0.0, 1.0, 0.0)] * 3)
 
+    def test_parse_obj_uv_no_flip(self):
+        # DirectX/rpf9dump OBJ exports already use top-left UV origin; flip_v=False preserves V.
+        obj_text = "\n".join([
+            "v 0 0 0",
+            "v 1 0 0",
+            "v 0 1 0",
+            "vt 0.25 0.75",
+            "vt 0.5 0.2",
+            "vt 0.0 1.0",
+            "f 1/1 2/2 3/3",
+        ])
+        prims = glb_writer.parse_obj(obj_text, is_path=False, up_axis="y", flip_v=False)
+        uvs = prims[0]["uvs"]
+        self.assertAlmostEqual(uvs[0][0], 0.25)
+        self.assertAlmostEqual(uvs[0][1], 0.75)
+        self.assertAlmostEqual(uvs[1][0], 0.5)
+        self.assertAlmostEqual(uvs[1][1], 0.2)
+        self.assertAlmostEqual(uvs[2][0], 0.0)
+        self.assertAlmostEqual(uvs[2][1], 1.0)
+
     def test_glb_preserves_finite_obj_normal_directions(self) -> None:
         obj = """\
 v 0 0 0

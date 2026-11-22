@@ -435,7 +435,7 @@ def _pack_model_job(job: tuple) -> tuple[int, dict | None]:
     model_id, obj_path, mesh_shaders, tex_map, textures, cache_path = job
     glb_mod = _get_glb_writer()
     try:
-        prims = glb_mod.parse_obj(obj_path, is_path=True, up_axis="z")
+        prims = glb_mod.parse_obj(obj_path, is_path=True, up_axis="z", flip_v=False)
     except (OSError, glb_mod.GlbError, ValueError):
         return model_id, None
     mat_to_dds = _assign_materials(prims, mesh_shaders, tex_map, textures)
@@ -1523,7 +1523,7 @@ def build_world(
         if not os.path.isfile(obj_path):
             return None
         try:
-            prims = glb_mod.parse_obj(obj_path, is_path=True, up_axis=axis)
+            prims = glb_mod.parse_obj(obj_path, is_path=True, up_axis=axis, flip_v=False)
         except (OSError, glb_mod.GlbError, ValueError):
             return None
         if not prims:

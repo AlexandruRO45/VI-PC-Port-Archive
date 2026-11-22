@@ -224,11 +224,12 @@ def parse_obj(
     up_axis: str = "z",
     offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
     scale: float = 1.0,
+    flip_v: bool = True,
 ) -> list[dict]:
     """Parse Wavefront OBJ geometry into glTF-ready primitives.
 
     Groups primitives in order of appearance by (group_index, material_name),
-    converts coordinates to glTF Y-up, flips V for top-left UV origin,
+    converts coordinates to glTF Y-up, optionally flips V (``flip_v=True``) for top-left UV origin,
     deduplicates vertices per primitive, and synthesizes smooth area-weighted
     normals within the primitive and OBJ smoothing group when explicit normals are missing.
     """
@@ -316,7 +317,7 @@ def parse_obj(
             except ValueError:
                 raw_vt_append((0.0, 0.0))
                 continue
-            v_gltf = 1.0 - v
+            v_gltf = (1.0 - v) if flip_v else v
             if not math.isfinite(u):
                 u = 0.0
             if not math.isfinite(v_gltf):
