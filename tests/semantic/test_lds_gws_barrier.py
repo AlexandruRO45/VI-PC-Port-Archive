@@ -317,6 +317,97 @@ class ScalarInterpreter:
         return rid, satisfied, arrived
 
 
+# ==============================================================================
+# SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# ==============================================================================
+
+class SIMDState:
+    """SIMD wavefront execution state supporting Wave32 and Wave64 execution modes."""
+
+    def __init__(
+        self,
+        num_lanes: int = 64,
+        exec_mask: Optional[int] = None,
+        num_gws_resources: int = GWS_NUM_RESOURCES,
+    ) -> None:
+        if num_lanes not in (32, 64):
+            raise ValueError(f"num_lanes must be 32 or 64, got {num_lanes}")
+        self.num_lanes = num_lanes
+        self.full_mask = (1 << num_lanes) - 1
+        self.exec_mask = self.full_mask if exec_mask is None else (exec_mask & self.full_mask)
+        self.vgprs: list[list[int]] = [[0] * DEFAULT_NUM_VGPRS for _ in range(num_lanes)]
+        self.sgprs: list[int] = [0] * DEFAULT_NUM_SGPRS
+        self.m0: int = 0
+        self.vcc: int = 0
+        self.scc: int = 0
+        self.gws: GWSMemory = GWSMemory(num_resources=num_gws_resources)
+
+    def is_lane_active(self, lane: int) -> bool:
+        return bool(self.exec_mask & (1 << lane))
+
+    def get_lane_vgpr(self, lane: int, index: int) -> int:
+        return self.vgprs[lane][index]
+
+    def set_lane_vgpr(self, lane: int, index: int, val: int) -> None:
+        self.vgprs[lane][index] = u32(val)
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index]
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        self.sgprs[index] = u32(val)
+
+    def get_m0(self) -> int:
+        return self.m0
+
+    def set_m0(self, val: int) -> None:
+        self.m0 = u32(val)
+
+    def find_first_active_lane(self) -> Optional[int]:
+        """Find the index of the first active lane according to the EXEC mask (ctz)."""
+        if self.exec_mask == 0:
+            return None
+        return (self.exec_mask & -self.exec_mask).bit_length() - 1
+
+
+class SIMDInterpreter:
+    """SIMD multi-lane instruction interpreter for ds_gws_barrier."""
+
+    def execute(
+        self,
+        instr: DSGWSBarrierInstruction,
+        state: SIMDState,
+        wave_id: int = 0,
+    ) -> Optional[Tuple[int, int, bool, int]]:
+        """Execute ds_gws_barrier across SIMD lanes with EXEC masking.
+
+        In RDNA2 hardware, ds_gws_barrier operates on the first active thread in the wavefront:
+        first_lane = find_first_valid(EXEC mask).
+        Target count is read from vdata0 in that lane.
+
+        Returns:
+            Optional[Tuple[int, int, bool, int]]: (first_lane, resource_id, satisfied, arrived_count),
+            or None if the wave is inactive (EXEC == 0).
+        """
+        first_lane = state.find_first_active_lane()
+        if first_lane is None:
+            return None
+
+        # Latch vdata0 from the first active lane and m0 from scalar state
+        target_count = state.get_lane_vgpr(first_lane, instr.vdata0.index)
+        m0 = state.get_m0()
+
+        # Execute barrier arrival
+        rid, satisfied, arrived = state.gws.barrier_sync(
+            offset=instr.offset,
+            m0=m0,
+            target_count=target_count,
+            wave_id=wave_id,
+        )
+
+        return first_lane, rid, satisfied, arrived
+
+
 class TestGWSBarrierReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Phase 1: Unit tests for reference mathematical oracle and architectural model."""
 
@@ -537,6 +628,113 @@ class TestScalarInterpreter(unittest.TestCase):
         self.assertFalse(sat2)
         self.assertEqual(self.state.gws.read_arrived(1), 1)
         self.assertEqual(self.state.gws.read_arrived(2), 1)
+
+
+class TestSIMDMultiLaneDivergence(unittest.TestCase):
+    """Phase 4: Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_all_lanes_active_lane0_elected(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFFFFFF)
+        interp = SIMDInterpreter()
+
+        # Lane 0 specifies target count 1, other lanes specify target count 10
+        state.set_lane_vgpr(0, 3, 1)
+        for lane in range(1, 32):
+            state.set_lane_vgpr(lane, 3, 10)
+
+        instr = DSGWSBarrierInstruction(vdata0=RegisterOperand(3, RegType.VGPR), offset=0)
+        res = interp.execute(instr, state, wave_id=1)
+
+        self.assertIsNotNone(res)
+        first_lane, rid, sat, arr = res  # type: ignore
+        self.assertEqual(first_lane, 0)
+        self.assertEqual(rid, 0)
+        # Because lane 0 specified target count 1, barrier resolves immediately!
+        self.assertTrue(sat)
+        self.assertEqual(arr, 0)
+
+    def test_wave64_all_lanes_active_lane0_elected(self) -> None:
+        state = SIMDState(num_lanes=64, exec_mask=0xFFFFFFFFFFFFFFFF)
+        interp = SIMDInterpreter()
+
+        state.set_lane_vgpr(0, 4, 2)
+        for lane in range(1, 64):
+            state.set_lane_vgpr(lane, 4, 99)
+
+        instr = DSGWSBarrierInstruction(vdata0=RegisterOperand(4, RegType.VGPR), offset=10)
+        res = interp.execute(instr, state, wave_id=5)
+
+        self.assertIsNotNone(res)
+        first_lane, rid, sat, arr = res  # type: ignore
+        self.assertEqual(first_lane, 0)
+        self.assertEqual(rid, 10)
+        self.assertFalse(sat)
+        self.assertEqual(arr, 1)
+
+    def test_wave32_divergent_mask_skips_inactive_lanes(self) -> None:
+        # Lanes 0..3 inactive, lane 4 active (mask: 0xFFFFFFF0)
+        mask = 0xFFFFFFF0
+        state = SIMDState(num_lanes=32, exec_mask=mask)
+        interp = SIMDInterpreter()
+
+        # Inactive lane 0 specifies target 100, active lane 4 specifies target 1
+        state.set_lane_vgpr(0, 1, 100)
+        state.set_lane_vgpr(4, 1, 1)
+
+        instr = DSGWSBarrierInstruction(vdata0=RegisterOperand(1, RegType.VGPR), offset=7)
+        res = interp.execute(instr, state, wave_id=7)
+
+        self.assertIsNotNone(res)
+        first_lane, rid, sat, arr = res  # type: ignore
+        self.assertEqual(first_lane, 4)
+        self.assertEqual(rid, 7)
+        self.assertTrue(sat)
+        self.assertEqual(arr, 0)
+
+    def test_wave64_divergent_mask_high_lanes_only(self) -> None:
+        mask = 1 << 60  # Only lane 60 active
+        state = SIMDState(num_lanes=64, exec_mask=mask)
+        interp = SIMDInterpreter()
+
+        state.set_lane_vgpr(60, 2, 1)
+        instr = DSGWSBarrierInstruction(vdata0=RegisterOperand(2, RegType.VGPR), offset=20)
+
+        res = interp.execute(instr, state, wave_id=60)
+        self.assertIsNotNone(res)
+        first_lane, rid, sat, arr = res  # type: ignore
+        self.assertEqual(first_lane, 60)
+        self.assertEqual(rid, 20)
+        self.assertTrue(sat)
+
+    def test_zero_exec_mask_no_operation(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0)
+        interp = SIMDInterpreter()
+
+        state.set_lane_vgpr(0, 1, 1)
+        instr = DSGWSBarrierInstruction(vdata0=RegisterOperand(1, RegType.VGPR), offset=2)
+
+        res = interp.execute(instr, state, wave_id=99)
+        self.assertIsNone(res)
+        # Barrier resource 2 must be completely untouched
+        self.assertEqual(state.gws.read_arrived(2), 0)
+        self.assertEqual(state.gws.read_releases(2), 0)
+
+    def test_registers_preserved_across_all_lanes(self) -> None:
+        even_mask = 0x5555555555555555
+        state = SIMDState(num_lanes=64, exec_mask=even_mask)
+        interp = SIMDInterpreter()
+
+        for lane in range(64):
+            for r in range(10):
+                state.set_lane_vgpr(lane, r, (lane << 16) | r)
+
+        instr = DSGWSBarrierInstruction(vdata0=RegisterOperand(0, RegType.VGPR), offset=3)
+        interp.execute(instr, state, wave_id=1)
+
+        for lane in range(64):
+            for r in range(10):
+                expected = (lane << 16) | r
+                self.assertEqual(state.get_lane_vgpr(lane, r), expected)
 
 
 if __name__ == "__main__":
