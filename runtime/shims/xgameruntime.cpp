@@ -220,8 +220,15 @@ static_assert(std::size(kThreadingVtable) == 31, "IUnknown + IXThreadingImpl's 2
 // and a string), XErrorSetCallback(XErrorCallback*, void*) and XErrorSetOptions(options, options). Offline, a report
 // is logged and handed to the callback the title set, if any.
 using XErrorCallback = bool(CALLBACK*)(HRESULT hr, const char* message, void* context);
-std::atomic<XErrorCallback> g_error_callback{nullptr};
-std::atomic<void*> g_error_context{nullptr};
+// The callback and its context are one registration: set and read together under g_error_mutex, so a report never
+// pairs one registration's callback with another's context (RT-258). The callback runs after the lock is released,
+// so it may report or re-register itself.
+struct ErrorHandler {
+    XErrorCallback callback = nullptr;
+    void* context = nullptr;
+};
+std::mutex g_error_mutex;
+ErrorHandler g_error_handler;
 
 // HRESULT XErrorReport(HRESULT, const char*) (xgameruntime-docs' XErrorReport.md): S_OK once reported.
 HRESULT STDMETHODCALLTYPE error_report(void*, HRESULT hr, const char* message) {
@@ -229,12 +236,17 @@ HRESULT STDMETHODCALLTYPE error_report(void*, HRESULT hr, const char* message) {
     if (s_logged.fetch_add(1) < 64)
         std::fprintf(stderr, "[rt] xgameruntime: XErrorReport(0x%08lx, %s)\n", static_cast<unsigned long>(hr),
                      message ? message : "(null)");
-    if (XErrorCallback cb = g_error_callback.load()) cb(hr, message, g_error_context.load());
+    ErrorHandler handler;
+    {
+        std::lock_guard lock(g_error_mutex);
+        handler = g_error_handler;
+    }
+    if (handler.callback) handler.callback(hr, message, handler.context);
     return S_OK;
 }
 void STDMETHODCALLTYPE error_set_callback(void*, XErrorCallback callback, void* context) {
-    g_error_context = context;
-    g_error_callback = callback;
+    std::lock_guard lock(g_error_mutex);
+    g_error_handler = {callback, context};
 }
 // void XErrorSetOptions(XErrorOptions, XErrorOptions), as Microsoft documents it: nothing to configure offline.
 void STDMETHODCALLTYPE error_set_options(void*, uint32_t, uint32_t) {}

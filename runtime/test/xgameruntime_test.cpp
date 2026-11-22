@@ -16,6 +16,7 @@
 #include <fstream>
 #include <string>
 #include <system_error>
+#include <thread>
 
 #include <XAsync.h>
 #include <XAsyncProvider.h>
@@ -327,6 +328,42 @@ void check_run_time_load() {
         const HRESULT reported = reinterpret_cast<Report>(slot(e, 3))(e, E_FAIL, "offline test");
         check(reported == S_OK && seen.hr == E_FAIL && std::strcmp(seen.msg, "offline test") == 0,
               "slot 3 is XErrorReport and reaches the callback slot 4 (XErrorSetCallback) set");
+        // RT-258: one thread switches the registration between two (callback, context) pairs while another reports.
+        // Each callback checks that it got its own context; on main they were two atomics read one after the other,
+        // so a report could land between the two stores and call one pair's callback with the other's context.
+        {
+            static std::atomic<unsigned> s_mixed{0}, s_calls{0};
+            static int ctx_a = 0, ctx_b = 0;
+            s_mixed = 0;
+            s_calls = 0;
+            Callback cb_a = [](HRESULT, const char*, void* ctx) {
+                ++s_calls;
+                if (ctx != &ctx_a) ++s_mixed;
+                return true;
+            };
+            Callback cb_b = [](HRESULT, const char*, void* ctx) {
+                ++s_calls;
+                if (ctx != &ctx_b) ++s_mixed;
+                return true;
+            };
+            const auto register_callback = reinterpret_cast<SetCallback>(slot(e, 4));
+            const auto report = reinterpret_cast<Report>(slot(e, 3));
+            register_callback(e, cb_a, &ctx_a);
+            std::atomic<bool> done{false};
+            std::thread switcher([&] {
+                for (int i = 0; i < 200000; ++i) {
+                    if (i & 1) register_callback(e, cb_a, &ctx_a);
+                    else register_callback(e, cb_b, &ctx_b);
+                }
+                done = true;
+            });
+            while (!done) report(e, E_FAIL, nullptr);
+            switcher.join();
+            check(s_calls.load() > 0 && s_mixed.load() == 0,
+                  "XErrorReport never calls one registration's callback with another's context");
+            if (s_mixed.load()) std::fprintf(stderr, "  %u of %u reports paired a callback with the other context\n",
+                                             s_mixed.load(), s_calls.load());
+        }
         reinterpret_cast<SetCallback>(slot(e, 4))(e, nullptr, nullptr);
         using SetOptions = void(STDMETHODCALLTYPE*)(void*, uint32_t, uint32_t);  // void, per Microsoft's page
         reinterpret_cast<SetOptions>(slot(e, 5))(e, 0x01, 0x00);  // OutputDebugStringOnError / None
