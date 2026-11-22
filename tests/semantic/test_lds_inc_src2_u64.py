@@ -416,5 +416,152 @@ class TestSymbolicASTAndInstruction(unittest.TestCase):
             DSIncSrc2U64Instruction.parse("ds_inc_src2_u64 v0 bad_token")
 
 
+# ==============================================================================
+# Phase 3: Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarMachineState64:
+    """Architectural state representation for single-thread scalar execution."""
+
+    def __init__(
+        self,
+        lds_capacity_qwords: int = DEFAULT_LDS_QWORDS,
+        num_vgprs: int = DEFAULT_NUM_VGPRS,
+        num_sgprs: int = DEFAULT_NUM_SGPRS,
+    ) -> None:
+        self.lds = LDSModel64(capacity_qwords=lds_capacity_qwords)
+        self.num_vgprs = num_vgprs
+        self.num_sgprs = num_sgprs
+        self.vgprs: list[int] = [0] * num_vgprs
+        self.sgprs: list[int] = [0] * num_sgprs
+        self.m0: int = 0
+
+    def get_vgpr(self, index: int) -> int:
+        if not (0 <= index < self.num_vgprs):
+            raise IndexError(f"VGPR index out of range [0..{self.num_vgprs - 1}]: {index}")
+        return self.vgprs[index]
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        if not (0 <= index < self.num_vgprs):
+            raise IndexError(f"VGPR index out of range [0..{self.num_vgprs - 1}]: {index}")
+        self.vgprs[index] = u32(val)
+
+    def get_sgpr(self, index: int) -> int:
+        if not (0 <= index < self.num_sgprs):
+            raise IndexError(f"SGPR index out of range [0..{self.num_sgprs - 1}]: {index}")
+        return self.sgprs[index]
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        if not (0 <= index < self.num_sgprs):
+            raise IndexError(f"SGPR index out of range [0..{self.num_sgprs - 1}]: {index}")
+        self.sgprs[index] = u32(val)
+
+
+class ScalarInterpreter64:
+    """Deterministic scalar instruction interpreter executing ds_inc_src2_u64."""
+
+    def step(
+        self,
+        instr: DSIncSrc2U64Instruction,
+        state: ScalarMachineState64,
+    ) -> int:
+        """Execute one ds_inc_src2_u64 instruction sequentially.
+
+        Returns:
+            int: The new 64-bit value in LDS location A.
+        """
+        vaddr = state.get_vgpr(instr.addr.base_reg.index)
+        new_val = state.lds.atomic_inc_src2_u64(
+            vaddr=vaddr,
+            offset0=instr.addr.offset0,
+            offset1=instr.addr.offset1,
+        )
+        # Note: ds_inc_src2_u64 is non-returning; registers are untouched.
+        return new_val
+
+    def parse_and_step(
+        self,
+        asm_line: str,
+        state: ScalarMachineState64,
+    ) -> int:
+        """Parse assembly text and execute one step."""
+        instr = DSIncSrc2U64Instruction.parse(asm_line)
+        return self.step(instr, state)
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Phase 3: Unit tests for deterministic scalar instruction interpreter."""
+
+    def test_single_step_execution(self) -> None:
+        state = ScalarMachineState64(lds_capacity_qwords=512)
+        interp = ScalarInterpreter64()
+
+        # Location A at qword 4 (offset0=4, 32 bytes), Location B at qword 8 (offset1=8, 64 bytes)
+        state.lds.write_qword(4, 10)
+        state.lds.write_qword(8, 20)
+        state.set_vgpr(1, 0) # vaddr = 0
+
+        instr = DSIncSrc2U64Instruction.parse("ds_inc_src2_u64 v1 offset0:4 offset1:8")
+        new_a = interp.step(instr, state)
+
+        self.assertEqual(new_a, 11)
+        self.assertEqual(state.lds.read_qword(4), 11)
+        self.assertEqual(state.lds.read_qword(8), 20)
+        # Verify v1 is unmodified
+        self.assertEqual(state.get_vgpr(1), 0)
+
+    def test_scalar_wrapping_cycle(self) -> None:
+        state = ScalarMachineState64(lds_capacity_qwords=512)
+        interp = ScalarInterpreter64()
+
+        idx_a = 2
+        idx_b = 3
+        state.lds.write_qword(idx_a, 0)
+        state.lds.write_qword(idx_b, 3) # wrap limit = 3
+        state.set_vgpr(0, 0)
+
+        instr = DSIncSrc2U64Instruction.parse(f"ds_inc_src2_u64 v0 offset0:{idx_a} offset1:{idx_b}")
+
+        # Step 1: 0 -> 1
+        self.assertEqual(interp.step(instr, state), 1)
+        # Step 2: 1 -> 2
+        self.assertEqual(interp.step(instr, state), 2)
+        # Step 3: 2 -> 3
+        self.assertEqual(interp.step(instr, state), 3)
+        # Step 4: 3 -> 0 (wrap!)
+        self.assertEqual(interp.step(instr, state), 0)
+        # Step 5: 0 -> 1
+        self.assertEqual(interp.step(instr, state), 1)
+
+    def test_base_address_offset_addition(self) -> None:
+        state = ScalarMachineState64(lds_capacity_qwords=512)
+        interp = ScalarInterpreter64()
+
+        # Base byte address = 64 (qword 8)
+        state.set_vgpr(2, 64)
+        # offset0 = 2 -> 64 + 16 = 80 (qword 10)
+        # offset1 = 4 -> 64 + 32 = 96 (qword 12)
+        state.lds.write_qword(10, 100)
+        state.lds.write_qword(12, 200)
+
+        interp.parse_and_step("ds_inc_src2_u64 v2 offset0:2 offset1:4", state)
+        self.assertEqual(state.lds.read_qword(10), 101)
+        self.assertEqual(state.lds.read_qword(12), 200)
+        self.assertEqual(state.get_vgpr(2), 64)
+
+    def test_non_returning_registers_preserved(self) -> None:
+        state = ScalarMachineState64(lds_capacity_qwords=512)
+        interp = ScalarInterpreter64()
+
+        state.set_vgpr(0, 128)
+        state.set_vgpr(5, 0xCAFEBABE)
+        state.set_vgpr(6, 0xDEADBEEF)
+
+        interp.parse_and_step("ds_inc_src2_u64 v0", state)
+        self.assertEqual(state.get_vgpr(0), 128)
+        self.assertEqual(state.get_vgpr(5), 0xCAFEBABE)
+        self.assertEqual(state.get_vgpr(6), 0xDEADBEEF)
+
+
 if __name__ == "__main__":
     unittest.main()
