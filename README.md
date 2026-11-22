@@ -200,8 +200,8 @@ The biggest open pieces:
 See [CONTRIBUTING.md](CONTRIBUTING.md). Never attach game files, extracted assets or generated shaders to issues or
 pull requests.
 
-To see what is open, claimed, waiting for CI or ready to merge, open the live dashboard in `dashboard/`
-([what it shows](dashboard/README.md)).
+To see what is open, claimed, waiting for CI or ready to merge, open the
+[live dashboard](https://itsnotrexed.github.io/Leonida/dashboard/) ([what it shows](dashboard/README.md)).
 
 ## Credits
 

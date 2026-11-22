@@ -26,7 +26,11 @@ browser. An example running from a fork's GitHub Pages: https://clhelper.github.
 
 - Locally: open `dashboard/index.html`, or serve the repository with any static server (for example
   `python -I -m http.server` in the repository root) and open `/dashboard/`.
-- GitHub Pages: publish a branch that has this folder and open `/dashboard/`. The icon is `../assets/logo.png`.
+- GitHub Pages: https://itsnotrexed.github.io/Leonida/dashboard/, which the main README links. Pages is a repository
+  setting, not something a merge turns on: a maintainer enables it once under Settings → Pages → Build and deployment
+  → Deploy from a branch, `main`, `/ (root)`. The empty `.nojekyll` in the repository root makes Pages serve the files
+  as they are, without running every Markdown file through Jekyll. A fork works the same way at
+  `<owner>.github.io/Leonida/dashboard/`. The icon is `../assets/logo.png`.
 - `?repo=owner/name&branch=name` points it at a fork.
 
 ## Where the data comes from
