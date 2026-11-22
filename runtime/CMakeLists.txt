@@ -409,6 +409,13 @@ if(BUILD_TESTING)
     target_link_options(unimplemented_policy_test PRIVATE /OPT:NOREF)
     add_dependencies(unimplemented_policy_test gta6rt_tls_host)
     add_test(NAME unimplemented_policy COMMAND unimplemented_policy_test)
+
+    # Exactly one CLI mode: combining --dry-run with --run (or --init) is refused with the usage exit code before
+    # any image is mapped, so --dry-run cannot run image code by accident. No image or fixture is needed.
+    add_test(NAME cli_modes
+      COMMAND ${CMAKE_COMMAND} -DGTA6RT=$<TARGET_FILE:gta6rt>
+              -P ${CMAKE_CURRENT_SOURCE_DIR}/test/cli_modes_test.cmake
+    )
   endif()
 
   if(WIN32 AND TARGET root_sig_test)

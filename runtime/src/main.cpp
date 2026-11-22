@@ -64,8 +64,10 @@ int wmain(int argc, wchar_t** argv) {
         else if (image.empty()) image = a;
         else return usage();
     }
-    if (image.empty()) return usage();
-    if (!dry_run && !init && !run) return usage();
+    // Exactly one mode: --dry-run promises that no image code runs, so pairing it with --run (or --init) must be
+    // refused before anything is mapped, not silently resolved in favour of the one that runs code.
+    const int modes = int(dry_run) + int(init) + int(run);
+    if (image.empty() || modes != 1) return usage();
     if (game_dir.empty()) game_dir = image.parent_path();
     rt::d3d12_trace::set_enabled(trace_d3d12);
 
