@@ -32,6 +32,7 @@ class PipelinesJobsTest(unittest.TestCase):
 
     def checker_args(self, call):
         with mock.patch.object(make_game, "pipeline_check_exe", return_value="vk_pipeline_check.exe"), \
+                mock.patch.object(make_game, "checker_supports", side_effect=lambda exe, *flags: flags == ("--max-commit-mib",)), \
                 mock.patch.object(make_game, "run", return_value=0) as run, \
                 mock.patch.object(make_game, "log", lambda *a: None):
             call()
@@ -142,7 +143,7 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         self.skip = os.path.join(self.out, "pipeline_crashes.txt")
         self.calls = []
 
-    def stage(self, script, supports=True):
+    def stage(self, script, supports=True, max_commit_mib=None):
         """script(args, call_number) -> exit code; it may write the in-flight file first."""
         def fake_run(args, hint="", check=True, **kw):
             args = [str(a) for a in args]
@@ -161,7 +162,7 @@ class PipelinesCrashRetryTest(unittest.TestCase):
                 mock.patch.object(make_game, "run", side_effect=fake_run), \
                 mock.patch.object(make_game, "log", logs.append):
             try:
-                make_game.pipelines(self.work, self.out)
+                make_game.pipelines(self.work, self.out, max_commit_mib=max_commit_mib)
                 return None, logs
             except SystemExit:
                 return sys.stderr, logs
@@ -220,6 +221,33 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         self.assertIsNotNone(failed)
         starts = [c[c.index("--start") + 1] for c in self.calls if self.is_probe(c)]
         self.assertEqual(starts, ["0", "2"])
+
+    def test_commit_cap_is_preserved_on_restarts_and_single_module_checks(self):
+        def script(args, n):
+            self.assertEqual(args[args.index("--max-commit-mib") + 1], "8192")
+            if n == 1:
+                self.inflight_is("a_mod", "c_mod")
+                return ABORT
+            if self.is_probe(args):
+                if args[args.index("--start") + 1] == "2":
+                    self.inflight_is("c_mod")
+                    return ABORT
+                return 0
+            return 1
+
+        with mock.patch.object(make_game.os, "name", "nt"), mock.patch("sys.stderr", io.StringIO()):
+            failed, _ = self.stage(script, max_commit_mib="8192")
+        self.assertIsNotNone(failed)
+        self.assertEqual(len(self.calls), 4)
+        self.assertIn("--skip-file", self.calls[-1])
+
+    def test_requested_commit_cap_requires_checker_support(self):
+        with (mock.patch.object(make_game.os, "name", "nt"),
+              mock.patch("sys.stderr", io.StringIO()) as err):
+            failed, _ = self.stage(lambda args, n: 0, supports=False, max_commit_mib="auto")
+        self.assertIsNotNone(failed)
+        self.assertFalse(self.calls)
+        self.assertIn("does not support --max-commit-mib", err.getvalue())
 
     def test_a_crash_with_nothing_in_flight_stops_after_reaching_one_entry(self):
         err = io.StringIO()

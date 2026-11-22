@@ -1953,6 +1953,8 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     drop(inflight, skip)   # every module gets a fresh chance on each run (a new translator may have fixed it)
     # --jobs: make_game.py's own; without it vk_pipeline_check uses half the hardware threads whatever was asked
     base = [exe, spirv, cache, *(["--jobs", str(jobs)] if jobs else [])]
+    if max_commit_mib is not None and not checker_supports(exe, "--max-commit-mib"):
+        fail("This vk_pipeline_check does not support --max-commit-mib: rebuild the runtime stage first.")
     commit_args = ["--max-commit-mib", max_commit_mib] if max_commit_mib is not None else []
     base += commit_args
     if not checker_supports(exe, "--inflight-file", "--skip-file"):
