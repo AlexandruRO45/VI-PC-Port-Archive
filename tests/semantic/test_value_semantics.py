@@ -38,6 +38,8 @@ ISA semantics used (AMD RDNA2 ISA reference, VALU/VOP3/VOP3P chapters):
   v_mad_u32_u16 /       D = S0.lo * S1.lo + S2 mod 2^32, the halves zero- (u16) or sign-extended (i16); op_sel bit
   v_mad_i32_i16           0/1 reads the high half of S0/S1. D is a whole dword (nothing of the old value is kept).
   v_subrev_f16          D.lo = S1.lo - S0.lo; the high half of D is kept in the VOP2 and the VOP3 form.
+  clamp on v_mad_u64_u32 D saturates to [0, 2^64 - 1] / [INT64_MIN, INT64_MAX] when the exact 65-bit sum does not fit;
+    / v_mad_i64_i32       sdst still gets bit 64 of the exact sum. Measured on gfx1036 (EGEN-HW-MAD64-CLAMP).
   s_*_saveexec_b32/b64, a constant used as a lane mask gives lane L its bit L: of the 32-bit value for a b32 op,
   s_andn2_wrexec_*,       of the 64-bit value for a b64 op (inline constants sign-extended, literals with a zero
   s_mov/s_not/s_and_b64   high word). cs_w32_mask_imm / cs_w64_mask_imm run every lane of a wave (LaneMaskConstants).
@@ -79,6 +81,7 @@ EXPECTED_FMT_1010102 = {0x00: 0x00000000, 0x04: 0x3F800000, 0x08: 0x00000000, 0x
 EXPECTED_SFF_IMM = [0x00000002, 0x00000001, 0x00000014, 0x00000010]
 EXPECTED_VALU16_MAD = [0x00000002, 0x00030002, 0x00008000, 0x00000004]
 EXPECTED_VALU16_SUBREV = [0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800]
+EXPECTED_MAD64_CLAMP = [0xFFFFFFFF, 0x80000000, 0x7FFFFFFF, 0x00000003]           # hardware-measured
 
 
 def _f32_bits(x):
@@ -314,6 +317,28 @@ def reference_valu16_subrev():
             0x42000000 | _half(a - d)]
 
 
+def reference_mad64(signed, s0, s1, s2, clamp):
+    """v_mad_u64_u32 / v_mad_i64_i32 -> (D as 64 bits, sdst bit) as measured on gfx1036 (EGEN-HW-MAD64-CLAMP)."""
+    if signed:
+        sx = lambda v, n: v - (1 << n) if v >> (n - 1) & 1 else v                      # noqa: E731
+        exact = sx(s0, 32) * sx(s1, 32) + sx(s2, 64)
+        if clamp:
+            exact_d = min(max(exact, -(1 << 63)), (1 << 63) - 1)
+        else:
+            exact_d = exact
+        return exact_d & (1 << 64) - 1, int(exact < 0)
+    exact = s0 * s1 + s2
+    d = min(exact, (1 << 64) - 1) if clamp else exact & (1 << 64) - 1
+    return d, exact >> 64
+
+
+def reference_mad64_clamp():
+    a, ca = reference_mad64(False, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF_FFFFFFFF, True)
+    b, cb = reference_mad64(True, 0x80000000, 0x7FFFFFFF, 0x80000000_00000000, True)
+    c, cc = reference_mad64(True, 0x80000000, 0x80000000, 0x7FFFFFFF_FFFFFFFF, True)
+    lo = (a ^ b ^ c) & 0xFFFFFFF0
+    return [a >> 32, b >> 32, c >> 32, lo | ca | cb << 1 | cc << 2]
+
 def _isg1_dxbc(elements):
     """A DXBC container with one ISG1 input signature. elements: (register, mask, system value, component type)."""
     payload = bytearray(struct.pack("<II", len(elements), 8))
@@ -364,6 +389,7 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_sff_imm(), EXPECTED_SFF_IMM)
         self.assertEqual(reference_valu16_mad(), EXPECTED_VALU16_MAD)
         self.assertEqual(reference_valu16_subrev(), EXPECTED_VALU16_SUBREV)
+        self.assertEqual(reference_mad64_clamp(), EXPECTED_MAD64_CLAMP)
 
 
 class TranslatorValueSemantics(unittest.TestCase):
@@ -430,6 +456,27 @@ class TranslatorValueSemantics(unittest.TestCase):
         # when the destination is a source.
         self.check("ps_valu16_subrev", EXPECTED_VALU16_SUBREV)
 
+    def test_mad64_clamp_saturates_d_and_keeps_the_carry(self):
+        # EGEN-HW-MAD64-CLAMP: wrapping instead gives 0xfffffffe, 0x40000000, 0xbfffffff, 0x7ffffff3.
+        self.check("ps_mad64_clamp", EXPECTED_MAD64_CLAMP)
+
+    def test_mad64_against_the_reference(self):
+        # The cases measured on gfx1036, with and without clamp: D's two words and the sdst bit (null sdst too).
+        cases = [(False, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF_FFFFFFFF), (False, 0xFFFFFFFF, 0x7FFFFFFF, 1 << 63),
+                 (False, 0xFFFFFFFF, 0xFFFFFFFF, 0x7FFFFFFF_FFFFFFFF), (True, 0x80000000, 0x80000000, 1 << 63),
+                 (True, 0x80000000, 0x7FFFFFFF, 1 << 63), (True, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF_FFFFFFFF),
+                 (True, 0x80000000, 0x80000000, 0x7FFFFFFF_FFFFFFFF), (True, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF_FFFFFFFF)]
+        for signed, s0, s1, s2 in cases:
+            for clamp in (False, True):
+                with self.subTest(signed=signed, s0=s0, s1=s1, s2=s2, clamp=clamp):
+                    op = "v_mad_i64_i32" if signed else "v_mad_u64_u32"
+                    spv = support.translate_lines("ps_mad64", [
+                        f"v_mov_b32 v0, {hex(s0)}", f"v_mov_b32 v1, {hex(s1)}",
+                        f"v_mov_b32 v2, {hex(s2 & 0xFFFFFFFF)}", f"v_mov_b32 v3, {hex(s2 >> 32)}",
+                        f"{op} v[4:5], s10, v0, v1, v[2:3]{' clamp' if clamp else ''}",
+                        "v_cndmask_b32_e64 v6, 0, 1, s10", "exp mrt0 v4, v5, v6, v6 done vm", "s_endpgm"])
+                    d, c = reference_mad64(signed, s0, s1, s2, clamp)
+                    self.assertEqual(support.mrt0_words(spv)[:3], [d & 0xFFFFFFFF, d >> 32, c])
     def test_s_buffer_load_dwordx2_into_vcc(self):
         # The V# in s[0:3] points at 0x1000; the two dwords must come back in vcc_lo and vcc_hi, not be lost.
         push = [0x1000, 0, 16, 0] + [0] * 28

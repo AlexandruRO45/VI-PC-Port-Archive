@@ -7287,8 +7287,11 @@ class Gen:
         elif op in ("v_mad_u64_u32", "v_mad_i64_i32"):
             # {sdst, v[d:d+1]} = S0 * S1 + S2 as a 65-bit result (RDNA ISA pseudocode): 32 x 32 -> 64-bit product,
             # unsigned or signed, plus the 64-bit S2. sdst (a lane mask) gets bit 64: the carry out for u64; for i64
-            # the sign of the exact sum, which a 65-bit two's-complement value always holds.
-            if a[0].get("n") != 2 or "clamp" in mods:
+            # the sign of the exact sum, which a 65-bit two's-complement value always holds. clamp saturates the 64-bit
+            # D when the exact sum does not fit: to 0xffffffff_ffffffff (u64), to INT64_MIN / INT64_MAX by the exact
+            # sign (i64); sdst still gets bit 64 of the exact sum. Measured on gfx1036, wave32 and wave64
+            # (EGEN-HW-MAD64-CLAMP): u64 0xffffffff * 0xffffffff + (2^64 - 1) clamp gives D = 2^64 - 1, sdst 1.
+            if a[0].get("n") != 2:
                 raise Unsupported(op + " operands")
             vd, sd, s0, s1, s2 = a[0], a[1], a[2], a[3], a[4]
             signed = op == "v_mad_i64_i32"
@@ -7336,6 +7339,23 @@ class Gen:
             else:
                 bit64 = self.tmp()
                 self.emit(f"{bit64} = OpBitwiseOr %uint {c1} {c2}")
+            if "clamp" in mods:
+                ovf, sat_hi, sat_lo, n_lo, n_hi = (self.tmp() for _ in range(5))
+                if signed:
+                    # overflow: the exact sign (bit 64) differs from the wrapped sum's bit 63
+                    top = self.tmp()
+                    self.emit(f"{top} = OpShiftRightLogical %uint {r_hi} {self.cu(31)}")
+                    self.emit(f"{ovf} = OpINotEqual %bool {top} {bit64}")
+                    neg = self.tmp_bool_nz(bit64)
+                    self.emit(f"{sat_hi} = OpSelect %uint {neg} {self.cu(0x80000000)} {self.cu(0x7FFFFFFF)}")
+                    self.emit(f"{sat_lo} = OpSelect %uint {neg} {self.cu(0)} {self.cu(0xFFFFFFFF)}")
+                else:
+                    self.emit(f"{ovf} = OpINotEqual %bool {bit64} {self.cu(0)}")
+                    self.emit(f"{sat_hi} = OpCopyObject %uint {self.cu(0xFFFFFFFF)}")
+                    self.emit(f"{sat_lo} = OpCopyObject %uint {self.cu(0xFFFFFFFF)}")
+                self.emit(f"{n_lo} = OpSelect %uint {ovf} {sat_lo} {r_lo}")
+                self.emit(f"{n_hi} = OpSelect %uint {ovf} {sat_hi} {r_hi}")
+                r_lo, r_hi = n_lo, n_hi
             self.dst({"k": "vgpr", "r": vd["r"], "n": 1}, r_lo)
             self.dst({"k": "vgpr", "r": vd["r"] + 1, "n": 1}, r_hi)
             if not (sd["k"] == "special" and sd["t"] == "null"):
