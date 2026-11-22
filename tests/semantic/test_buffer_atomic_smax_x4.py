@@ -926,5 +926,140 @@ class TestBufferAtomicSmaxX4Oracle(unittest.TestCase):
         unpacked = unpack_u128(packed)
         self.assertEqual(unpacked, (d0, d1, d2, d3))
 
+class TestBufferAtomicSmaxX4RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarBufferInterpreter(mem_size=4096)
+        self.desc = BufferResourceDescriptor(
+            base_address=0,
+            stride=0,
+            num_records=1024,
+        )
+        self.interp.set_buffer_descriptor(4, self.desc)
+
+    def test_vdata_equals_vaddr_aliasing(self) -> None:
+        # vdata occupies v[0:3]; vaddr aliases to v0 (which holds low 32-bits of vdata)
+        addr = 128
+        self.interp.mem.write_u128(addr, 50)
+        # v0 = addr (128), v1 = 0, v2 = 0, v3 = 0 -> 128-bit value is 128
+        self.interp.write_reg_u32(RegKind.VGPR, 0, addr)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 0)
+        self.interp.write_reg_u32(RegKind.VGPR, 3, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX_X4,
+            vdata=Register(RegKind.VGPR, 0, count=4),
+            vaddr=Register(RegKind.VGPR, 0, count=1),  # Aliased to v0
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 50)
+        self.assertEqual(self.interp.mem.read_u128(addr), 128)
+        self.assertEqual(self.interp.read_reg_u128(0), 50)
+
+    def test_vaddr_aliased_to_vdata_highest_dword(self) -> None:
+        # vaddr aliases to v3 (bits 96..127 of vdata)
+        addr = 64
+        self.interp.mem.write_u128(addr, 200)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 100)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 0)
+        self.interp.write_reg_u32(RegKind.VGPR, 3, addr)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX_X4,
+            vdata=Register(RegKind.VGPR, 0, count=4),
+            vaddr=Register(RegKind.VGPR, 3, count=1),  # Aliased to v3
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 200)
+        # Expected new memory: max(200, (64 << 96) | 100)
+        expected_smax = pack_u128(100, 0, 0, addr)
+        self.assertEqual(self.interp.mem.read_u128(addr), expected_smax)
+        self.assertEqual(self.interp.read_reg_u128(0), 200)
+
+    def test_adjacent_register_blocks_isolation(self) -> None:
+        # Pre-seed registers around v[4:7]
+        for idx in range(16):
+            self.interp.write_reg_u32(RegKind.VGPR, idx, 0xAA000000 + idx)
+
+        self.interp.write_reg_u128(4, pack_u128(10, 20, 30, 40))
+        self.interp.write_reg_u32(RegKind.VGPR, 8, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX_X4,
+            vdata=Register(RegKind.VGPR, 4, count=4),
+            vaddr=Register(RegKind.VGPR, 8, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=False),
+        )
+        self.interp.step(inst)
+
+        for idx in range(0, 4):
+            self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, idx), 0xAA000000 + idx)
+        for idx in range(9, 16):
+            self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, idx), 0xAA000000 + idx)
+
+    def test_sgpr_descriptor_and_offset_preserved(self) -> None:
+        d0, d1, d2, d3 = self.desc.to_dwords()
+        self.interp.write_reg_u32(RegKind.SGPR, 8, 32)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX_X4,
+            vdata=Register(RegKind.VGPR, 0, count=4),
+            vaddr=Register(RegKind.VGPR, 4, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=Register(RegKind.SGPR, 8, count=1),
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        self.interp.step(inst)
+
+        self.assertEqual(self.interp.read_reg_u32(RegKind.SGPR, 4), d0)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.SGPR, 5), d1)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.SGPR, 6), d2)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.SGPR, 7), d3)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.SGPR, 8), 32)
+
+    def test_simd_aliasing_divergent_lanes(self) -> None:
+        simd = SIMDBufferWavefrontInterpreter(wave_size=32, mem_size=4096)
+        simd.set_buffer_descriptor(4, self.desc)
+        exec_mask = 0x0000000F  # Lanes 0..3 active
+        simd.set_exec_mask(exec_mask)
+
+        for lane in range(32):
+            addr = lane * 16
+            simd.mem.write_u128(addr, 500)
+            simd.write_lane_reg_u128(lane, 0, addr)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX_X4,
+            vdata=Register(RegKind.VGPR, 0, count=4),
+            vaddr=Register(RegKind.VGPR, 0, count=1),  # Aliased
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        simd.step(inst)
+
+        for lane in range(4):
+            addr = lane * 16
+            self.assertEqual(simd.mem.read_u128(addr), 500)
+            self.assertEqual(simd.read_lane_reg_u128(lane, 0), 500)
+
+        for lane in range(4, 32):
+            addr = lane * 16
+            self.assertEqual(simd.mem.read_u128(addr), 500)
+            self.assertEqual(simd.read_lane_reg_u128(lane, 0), addr)
+
 if __name__ == "__main__":
     unittest.main()
