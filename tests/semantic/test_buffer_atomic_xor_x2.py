@@ -262,6 +262,46 @@ class Program:
 
 
 # ---------------------------------------------------------------------------
+# Condition Codes, Status Flags, and Carry/Borrow Isolation
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class BufferAtomicXorX2ConditionCodes:
+    """Architectural integer condition codes for 64-bit buffer atomic operations."""
+    zero: bool
+    negative: bool
+    positive: bool
+    all_ones: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class BufferStatusFlags:
+    """Buffer memory status flags."""
+    in_bounds: bool
+    oob_fault: bool
+
+
+def compute_buffer_xor_x2_condition_codes(val: int) -> BufferAtomicXorX2ConditionCodes:
+    """Computes condition codes evaluating 64-bit result and bitwise boundary."""
+    val64 = val & MASK64
+    signed_val = s64(val64)
+    return BufferAtomicXorX2ConditionCodes(
+        zero=(val64 == 0),
+        negative=(signed_val < 0),
+        positive=(signed_val > 0),
+        all_ones=(val64 == MASK64),
+    )
+
+
+def compute_buffer_status_flags(in_bounds: bool) -> BufferStatusFlags:
+    """Computes buffer memory bounds flags."""
+    return BufferStatusFlags(
+        in_bounds=in_bounds,
+        oob_fault=not in_bounds,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Deterministic Scalar Instruction Interpreter
 # ---------------------------------------------------------------------------
 
@@ -273,6 +313,8 @@ class ScalarBufferInterpreter:
         self.sgprs: list[int] = [0] * 106
         self.mem: BufferMemory = BufferMemory(mem_size)
         self.vcc: int = 0
+        self.last_condition_codes: BufferAtomicXorX2ConditionCodes | None = None
+        self.last_status_flags: BufferStatusFlags | None = None
         self.trace: list[str] = []
 
     def read_reg_u32(self, kind: RegKind, idx: int) -> int:
@@ -337,6 +379,12 @@ class ScalarBufferInterpreter:
 
         if inst.mods.glc:
             self.write_reg_u64(inst.vdata.index, ret_val)
+
+        self.last_condition_codes = compute_buffer_xor_x2_condition_codes(
+            ret_val if inst.mods.glc else (vdata ^ ret_val)
+        )
+        self.last_status_flags = compute_buffer_status_flags(in_bounds)
+        # Note: buffer atomic instructions never modify VCC; carry/borrow register remains untouched.
 
         self.trace.append(f"{inst.to_assembly()} => ret={ret_val:#018x}, in_bounds={in_bounds}")
         return ret_val, in_bounds
@@ -679,6 +727,113 @@ class TestBufferAtomicXorX2RegisterAliasing(unittest.TestCase):
         # Inactive lanes: v[0:1] untouched (16)
         for lane in range(4, 32):
             self.assertEqual(simd.read_lane_reg_u64(lane, 0), 16)
+
+
+class TestBufferAtomicXorX2ConditionCodes(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow isolation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarBufferInterpreter(mem_size=4096)
+        self.desc = BufferResourceDescriptor(
+            base_address=0,
+            stride=0,
+            num_records=1024,
+        )
+        self.interp.set_buffer_descriptor(4, self.desc)
+
+    def test_condition_codes_zero_pos_neg_all_ones(self) -> None:
+        # Pre-seed memory at 0 with 0
+        self.interp.mem.write_u64(0, 0)
+        self.interp.write_reg_u64(0, 0xFFFFFFFFFFFFFFFF)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_XOR_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        # Pre-op return value is 0
+        self.interp.step(inst)
+        cc = self.interp.last_condition_codes
+        self.assertIsNotNone(cc)
+        assert cc is not None
+        self.assertTrue(cc.zero)
+        self.assertFalse(cc.negative)
+        self.assertFalse(cc.positive)
+        self.assertFalse(cc.all_ones)
+
+        # Pre-seed memory with 0xFFFFFFFFFFFFFFFF, test all_ones & negative (bit 63 set)
+        self.interp.mem.write_u64(0, 0xFFFFFFFFFFFFFFFF)
+        self.interp.write_reg_u64(0, 0xFFFFFFFFFFFFFFFF)
+        self.interp.step(inst)
+        cc_all = self.interp.last_condition_codes
+        self.assertIsNotNone(cc_all)
+        assert cc_all is not None
+        self.assertFalse(cc_all.zero)
+        self.assertTrue(cc_all.negative)
+        self.assertTrue(cc_all.all_ones)
+
+        # Pre-seed memory with positive value (0x7F00000000000000)
+        self.interp.mem.write_u64(0, 0x7F00000000000000)
+        self.interp.write_reg_u64(0, 0x7F00000000000000)
+        self.interp.step(inst)
+        cc_pos = self.interp.last_condition_codes
+        self.assertIsNotNone(cc_pos)
+        assert cc_pos is not None
+        self.assertFalse(cc_pos.zero)
+        self.assertFalse(cc_pos.negative)
+        self.assertTrue(cc_pos.positive)
+        self.assertFalse(cc_pos.all_ones)
+
+    def test_status_flags_in_bounds_and_oob(self) -> None:
+        self.interp.write_reg_u64(0, 0xFFFFFFFFFFFFFFFF)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 100)  # in bounds (< 1024)
+
+        inst_in = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_XOR_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        self.interp.step(inst_in)
+        flags_in = self.interp.last_status_flags
+        self.assertIsNotNone(flags_in)
+        assert flags_in is not None
+        self.assertTrue(flags_in.in_bounds)
+        self.assertFalse(flags_in.oob_fault)
+
+        # OOB access
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 2000)
+        self.interp.step(inst_in)
+        flags_oob = self.interp.last_status_flags
+        self.assertIsNotNone(flags_oob)
+        assert flags_oob is not None
+        self.assertFalse(flags_oob.in_bounds)
+        self.assertTrue(flags_oob.oob_fault)
+
+    def test_carry_borrow_vcc_isolation(self) -> None:
+        canary = 0x1234567887654321
+        self.interp.vcc = canary
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_XOR_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=False),
+        )
+        self.interp.write_reg_u64(0, 0xFFFFFFFFFFFFFFFF)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 0)
+        self.interp.step(inst)
+
+        # VCC must not be modified by atomic operations
+        self.assertEqual(self.interp.vcc, canary)
 
 
 class TestBufferAtomicXorX2ScalarInterpreter(unittest.TestCase):
