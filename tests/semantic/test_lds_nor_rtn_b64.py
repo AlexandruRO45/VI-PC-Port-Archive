@@ -1036,5 +1036,107 @@ class TestConditionCodesAndFlags(unittest.TestCase):
         self.assertEqual(vcc_after, vcc_sentinel)
 
 
+# ==============================================================================
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestIEEE754BitPatternHandling(unittest.TestCase):
+    """Exhaustive unit tests for 64-bit boundary extremes and IEEE 754 float64 bit-patterns."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(DEFAULT_LDS_SIZE_BYTES)
+        self.state = ScalarMachineState(lds=self.lds)
+        self.interp = ScalarInterpreter()
+
+    def test_signed_zero_float64_bit_patterns(self) -> None:
+        # nor(+0.0, -0.0) = ~(0 | 0x8000000000000000) = 0x7FFFFFFFFFFFFFFF
+        self.assertEqual(oracle_nor_b64(POS_ZERO_F64, NEG_ZERO_F64), 0x7FFFFFFFFFFFFFFF)
+        self.assertEqual(oracle_nor_b64(NEG_ZERO_F64, POS_ZERO_F64), 0x7FFFFFFFFFFFFFFF)
+
+        self.lds.write_qword(0, POS_ZERO_F64)
+        self.state.set_vgpr(RegSingle(2), 0)
+        self.state.set_vgpr_pair(RegPair(4), NEG_ZERO_F64)
+        inst = DSNorRtnB64Instruction(
+            opcode=DSOpcode.DS_NOR_RTN_B64,
+            vdst=RegPair(0),
+            vaddr=RegSingle(2),
+            vdata=RegPair(4),
+        )
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, POS_ZERO_F64)
+        self.assertEqual(self.lds.read_qword(0), 0x7FFFFFFFFFFFFFFF)
+
+    def test_infinities_float64_bit_patterns(self) -> None:
+        # nor(+inf, -inf) = ~(0x7FF0000000000000 | 0xFFF0000000000000) = ~0xFFF0000000000000 = 0x000FFFFFFFFFFFFF
+        self.assertEqual(oracle_nor_b64(POS_INF_F64, NEG_INF_F64), MAX_SUBNORMAL_F64)
+
+        self.lds.write_qword(8, POS_INF_F64)
+        self.state.set_vgpr(RegSingle(2), 8)
+        self.state.set_vgpr_pair(RegPair(4), NEG_INF_F64)
+        inst = DSNorRtnB64Instruction(
+            opcode=DSOpcode.DS_NOR_RTN_B64,
+            vdst=RegPair(0),
+            vaddr=RegSingle(2),
+            vdata=RegPair(4),
+        )
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, POS_INF_F64)
+        self.assertEqual(self.lds.read_qword(8), MAX_SUBNORMAL_F64)
+
+    def test_nan_float64_bit_patterns_unaltered_and_no_traps(self) -> None:
+        # qNaN NOR 0 = ~QNAN_F64
+        self.assertEqual(oracle_nor_b64(QNAN_F64, 0), (~QNAN_F64) & MASK64)
+
+        # sNaN NOR MASK64 = 0
+        self.assertEqual(oracle_nor_b64(SNAN_F64, MASK64), 0)
+
+    def test_subnormal_float64_bit_patterns(self) -> None:
+        # MIN_SUBNORMAL_F64 (1) NOR 0 = ~1 = 0xFFFFFFFFFFFFFFFE
+        self.assertEqual(oracle_nor_b64(MIN_SUBNORMAL_F64, 0), (~MIN_SUBNORMAL_F64) & MASK64)
+
+        # MAX_SUBNORMAL_F64 NOR 0 = ~MAX_SUBNORMAL_F64 = NEG_INF_F64
+        self.assertEqual(oracle_nor_b64(MAX_SUBNORMAL_F64, 0), NEG_INF_F64)
+
+    def test_boundary_permutations_64bit(self) -> None:
+        extremes = [
+            0x0000000000000000,
+            0x0000000000000001,
+            0x8000000000000000,
+            0x7FFFFFFFFFFFFFFF,
+            MASK64,
+        ]
+        for a in extremes:
+            for b in extremes:
+                exp = (~(a | b)) & MASK64
+                self.assertEqual(oracle_nor_b64(a, b), exp)
+
+                self.lds.write_qword(0, a)
+                self.state.set_vgpr(RegSingle(2), 0)
+                self.state.set_vgpr_pair(RegPair(4), b)
+                inst = DSNorRtnB64Instruction(
+                    opcode=DSOpcode.DS_NOR_RTN_B64,
+                    vdst=RegPair(0),
+                    vaddr=RegSingle(2),
+                    vdata=RegPair(4),
+                )
+                ret = self.interp.execute(self.state, inst)
+                self.assertEqual(ret, a)
+                self.assertEqual(self.lds.read_qword(0), exp)
+
+    def test_single_bit_walks_64bit(self) -> None:
+        for k in range(64):
+            bit = 1 << k
+            self.assertEqual(oracle_nor_b64(bit, 0), (~bit) & MASK64)
+            self.assertEqual(oracle_nor_b64(bit, bit), (~bit) & MASK64)
+            self.assertEqual(oracle_nor_b64(bit, (~bit) & MASK64), 0)
+
+    def test_alternating_bit_patterns_64bit(self) -> None:
+        pat_a = 0x5555555555555555
+        pat_b = 0xAAAAAAAAAAAAAAAA
+        self.assertEqual(oracle_nor_b64(pat_a, pat_b), 0)
+        self.assertEqual(oracle_nor_b64(pat_a, pat_a), pat_b)
+        self.assertEqual(oracle_nor_b64(pat_b, pat_b), pat_a)
+
+
 if __name__ == "__main__":
     unittest.main()
