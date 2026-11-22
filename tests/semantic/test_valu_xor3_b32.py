@@ -824,5 +824,75 @@ class TestValuXor3B32IEEE754Boundaries(unittest.TestCase):
         self.assertEqual(neg_inf, NEG_INF_F32)
 
 
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestValuXor3B32NegativeControls(unittest.TestCase):
+    """Negative controls, syntax rejection, and mutation detection for v_xor3_b32."""
+
+    def test_syntax_rejection_valu_destination_must_be_vgpr(self) -> None:
+        dst_sgpr = Reg(0, RegType.SGPR)
+        src = VOP3Operand(Reg(1, RegType.VGPR))
+        with self.assertRaises(TypeError):
+            VXor3B32Instruction(dst=dst_sgpr, src0=src, src1=src, src2=src)
+
+    def test_syntax_rejection_invalid_lane_count(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_negative_control_or_vs_xor_discrepancy(self) -> None:
+        # Overlapping bits behave differently under OR vs XOR
+        s0, s1, s2 = 0x01, 0x01, 0x00
+        or_res = (s0 | s1 | s2) & MASK32        # 1 | 1 | 0 = 1
+        xor_res = oracle_v_xor3_b32(s0, s1, s2) # 1 ^ 1 ^ 0 = 0
+        self.assertNotEqual(or_res, xor_res)
+
+    def test_negative_control_and_vs_xor_discrepancy(self) -> None:
+        # Disjoint bits produce 0 in AND but non-zero in XOR
+        s0, s1, s2 = 0x01, 0x02, 0x04
+        and_res = (s0 & s1 & s2) & MASK32       # 0
+        xor_res = oracle_v_xor3_b32(s0, s1, s2) # 7
+        self.assertNotEqual(and_res, xor_res)
+
+    def test_mutation_bitwise_or_instead_of_xor(self) -> None:
+        """Mutant: Replace XOR with OR."""
+        def mutant_or3(s0: int, s1: int, s2: int) -> int:
+            return (s0 | s1 | s2) & MASK32
+
+        s0, s1, s2 = 0xFF, 0xFF, 0x00
+        correct = oracle_v_xor3_b32(s0, s1, s2)
+        mutant = mutant_or3(s0, s1, s2)
+        self.assertEqual(correct, 0x00)
+        self.assertEqual(mutant, 0xFF)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_bitwise_and_instead_of_xor(self) -> None:
+        """Mutant: Replace XOR with AND."""
+        def mutant_and3(s0: int, s1: int, s2: int) -> int:
+            return (s0 & s1 & s2) & MASK32
+
+        s0, s1, s2 = 0x0F, 0xF0, 0x00
+        correct = oracle_v_xor3_b32(s0, s1, s2)
+        mutant = mutant_and3(s0, s1, s2)
+        self.assertEqual(correct, 0xFF)
+        self.assertEqual(mutant, 0x00)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_omitted_operand(self) -> None:
+        """Mutant: Omit src2 and only perform 2-way XOR."""
+        def mutant_xor2(s0: int, s1: int, s2: int) -> int:
+            return (s0 ^ s1) & MASK32
+
+        s0, s1, s2 = 0x01, 0x02, 0x04
+        correct = oracle_v_xor3_b32(s0, s1, s2)
+        mutant = mutant_xor2(s0, s1, s2)
+        self.assertEqual(correct, 0x07)
+        self.assertEqual(mutant, 0x03)
+        self.assertNotEqual(correct, mutant)
+
+
 if __name__ == "__main__":
     unittest.main()
