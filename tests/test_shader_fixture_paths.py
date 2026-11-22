@@ -21,13 +21,32 @@ SPV_MACRO_RE = re.compile(r"\b(LEONIDA_[A-Z0-9_]*_SPV)\b")
 INCLUDE_HELPER_RE = re.compile(r'#\s*include\s*"shader_fixture_path\.h"')
 WRAPPED_MACRO_RE = re.compile(r"\b(?:vktest::)?shader_fixture_path\s*\(\s*(LEONIDA_[A-Z0-9_]*_SPV)\s*\)")
 HELPER_VAR_CALL_RE = re.compile(r"\b(?:vktest::)?shader_fixture_path\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)")
-DIRECT_OPEN_RE = re.compile(
+DIRECT_OPEN_START_RE = re.compile(
     r"(?:\b(?:copy_file|fopen|CreateFile[AW])\s*\("
     r"|\b(?:ifstream|fstream)(?:\s+[A-Za-z_][A-Za-z0-9_]*)?\s*[({]"
     r"|\.\s*open\s*\()"
-    r"[^;{}]*\b(LEONIDA_[A-Z0-9_]*_SPV)\b"
 )
 PREPROCESSOR_LINE_RE = re.compile(r"^\s*#")
+
+
+def direct_open_spans(text: str):
+    """Yield (start, end) slices of argument lists for direct file-open calls, spanning multiple lines."""
+    n = len(text)
+    for m in DIRECT_OPEN_START_RE.finditer(text):
+        opener = text[m.end() - 1]
+        closer = ")" if opener == "(" else "}"
+        depth = 1
+        i = m.end()
+        while i < n and depth > 0:
+            ch = text[i]
+            if ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+            elif ch == ";":
+                break
+            i += 1
+        yield m.end(), i
 
 
 def strip_comments_and_strings(source: str) -> str:
@@ -73,20 +92,22 @@ def check_source(source: str) -> list[str]:
     cleaned = strip_comments_and_strings(source)
     non_pp_lines = []
     continuation = False
-    for lineno, line in enumerate(cleaned.splitlines(), 1):
+    for line in cleaned.splitlines():
         if continuation:
             continuation = line.rstrip().endswith("\\")
+            non_pp_lines.append("")
             continue
         if PREPROCESSOR_LINE_RE.match(line):
             continuation = line.rstrip().endswith("\\")
+            non_pp_lines.append("")
             continue
-        non_pp_lines.append((lineno, line))
+        non_pp_lines.append(line)
 
-    code_only = "\n".join(line for _, line in non_pp_lines)
-    macro_uses = []
-    for lineno, line in non_pp_lines:
-        for m in SPV_MACRO_RE.finditer(line):
-            macro_uses.append((lineno, m.group(1), line, m.start(), m.end()))
+    code_only = "\n".join(non_pp_lines)
+    macro_uses = [
+        (code_only.count("\n", 0, m.start(1)) + 1, m.group(1))
+        for m in SPV_MACRO_RE.finditer(code_only)
+    ]
 
     if not macro_uses:
         return []
@@ -102,14 +123,18 @@ def check_source(source: str) -> list[str]:
     wraps_direct_macro = bool(WRAPPED_MACRO_RE.search(code_only))
 
     if not wraps_indirect_var and not wraps_direct_macro:
-        for lineno, macro, *_ in macro_uses:
+        for lineno, macro in macro_uses:
             violations.append(f"line {lineno}: {macro} is used without vktest::shader_fixture_path(...)")
         return violations
 
-    # Even in a file with a helper function, never allow a direct file-open call on a bare `LEONIDA_*_SPV`.
-    for lineno, line in non_pp_lines:
-        masked = WRAPPED_MACRO_RE.sub(" ", line)
-        for m in DIRECT_OPEN_RE.finditer(masked):
+    # Mask wrapped calls while preserving newlines so reported line numbers stay exact.
+    masked = WRAPPED_MACRO_RE.sub(lambda m: "\n" * m.group(0).count("\n"), code_only)
+
+    # Even in a file with a helper function, never allow a direct file-open call on a bare `LEONIDA_*_SPV`
+    # (including multi-line calls).
+    for start, end in direct_open_spans(masked):
+        for m in SPV_MACRO_RE.finditer(masked, start, end):
+            lineno = masked.count("\n", 0, m.start(1)) + 1
             violations.append(
                 f"line {lineno}: direct file open on {m.group(1)} without vktest::shader_fixture_path(...)"
             )
@@ -117,10 +142,9 @@ def check_source(source: str) -> list[str]:
     # In files that wrap macros directly at call sites (no indirect helper wrapping a variable), every single
     # non-preprocessor reference to `LEONIDA_*_SPV` must be wrapped.
     if wraps_direct_macro and not wraps_indirect_var:
-        for lineno, line in non_pp_lines:
-            masked = WRAPPED_MACRO_RE.sub(" ", line)
-            for m in SPV_MACRO_RE.finditer(masked):
-                violations.append(f"line {lineno}: bare {m.group(1)} without vktest::shader_fixture_path(...)")
+        for m in SPV_MACRO_RE.finditer(masked):
+            lineno = masked.count("\n", 0, m.start(1)) + 1
+            violations.append(f"line {lineno}: bare {m.group(1)} without vktest::shader_fixture_path(...)")
 
     return violations
 
@@ -172,6 +196,36 @@ class ShaderFixturePathsTest(unittest.TestCase):
             'void f() { load(LEONIDA_TEST_CS_SAMPLE_SPV); std::ifstream bad(LEONIDA_TEST_CS_SAMPLE_SPV); }\n'
         )
         self.assertTrue(any("direct file open" in v for v in check_source(helper_with_direct_bypass)))
+
+        helper_with_multiline_bypass = (
+            '#include "shader_fixture_path.h"\n'
+            'void load(const char* path) { std::ifstream f(vktest::shader_fixture_path(path)); }\n'
+            'void f() {\n'
+            '    std::ifstream bad(\n'
+            '        LEONIDA_TEST_CS_SAMPLE_SPV,\n'
+            '        std::ios::binary);\n'
+            '}\n'
+        )
+        multiline_issues = check_source(helper_with_multiline_bypass)
+        self.assertTrue(any("line 5: direct file open" in v for v in multiline_issues), multiline_issues)
+
+        helper_with_adjacent_open_and_load = (
+            '#include "shader_fixture_path.h"\n'
+            'bool load(const char* path) { std::ifstream f(vktest::shader_fixture_path(path)); return bool(f); }\n'
+            'bool f() { return std::filesystem::copy_file(a, b) && load(LEONIDA_TEST_CS_SAMPLE_SPV); }\n'
+        )
+        self.assertEqual(check_source(helper_with_adjacent_open_and_load), [])
+
+        good_multiline_wrap = (
+            '#include "shader_fixture_path.h"\n'
+            'void f() {\n'
+            '    std::ifstream in(\n'
+            '        vktest::shader_fixture_path(\n'
+            '            LEONIDA_TEST_CS_SPV),\n'
+            '        std::ios::binary);\n'
+            '}\n'
+        )
+        self.assertEqual(check_source(good_multiline_wrap), [])
 
     def test_every_runtime_test_uses_shader_fixture_path(self):
         checked = 0
