@@ -34,6 +34,20 @@ inline bool spirv_needs_fma(const void* data, std::size_t bytes) {
     return false;
 }
 
+// Whether a SPIR-V module declares capability `cap` (the OpCapability instructions come first, after the 5-word
+// header). The feature a test enables follows the module: since tools/rdna2spirv.py lower_addr64, most translated
+// shaders build their 64-bit addresses from 32-bit pairs and declare no Int64, so a device without shaderInt64
+// (Intel) runs them; one that still declares it (64-bit data ops) is unsupported there (77), not a device-creation
+// failure.
+inline bool declares_capability(const void* code, std::size_t bytes, std::uint32_t cap) {
+    const auto* w = static_cast<const std::uint32_t*>(code);
+    const std::size_t n = bytes / 4;
+    for (std::size_t i = 5; i + 1 < n && w[i] == (2u << 16 | 17u); i += 2)
+        if (w[i + 1] == cap) return true;
+    return false;
+}
+inline constexpr std::uint32_t capability_int64 = 11;   // spirv/unified1/spirv.h: CapabilityInt64
+
 struct ShaderFma {
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
     VkPhysicalDeviceShaderFmaFeaturesKHR features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FMA_FEATURES_KHR};

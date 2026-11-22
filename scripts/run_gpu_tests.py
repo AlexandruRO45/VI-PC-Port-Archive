@@ -310,6 +310,15 @@ def dump_words(msg: str) -> list[int] | None:
     return [int(x) for x in m.group(1).split()] if m else None
 
 
+def store_result(rc: int, msg: str) -> tuple[bool | None, str]:
+    """vk_store_test's verdict: 77 is "this device cannot run it" (a SKIP, with the helper's unsupported line), as
+    the other helpers report it; any other non-zero exit is a failure, with the last line."""
+    lines = msg.splitlines() if msg else []
+    if rc == 77:
+        return None, next((l for l in lines if "unsupported" in l), lines[-1] if lines else "unsupported")
+    return rc == 0, (lines[-1] if lines else "")
+
+
 def judge_cs_dump(rc: int, msg: str, want: list[int], *, wave64: bool, partial: bool, emulated: bool,
                   hexwords: bool = False) -> tuple[bool | None, str]:
     """Judge one vk_compute_test "dump" run: (True, words), (False, why), or (None, why) when the device can't run it.
@@ -997,11 +1006,9 @@ def run_suite(a, work: str) -> int:
                                                              "cs_lds_b64_cmpst"))
             results.append((name, ok, detail))
         elif name == "cs_imgstore":
-            rc, msg = run_cmd([vk_store, spv])
-            results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+            results.append((name,) + store_result(*run_cmd([vk_store, spv])))
         elif name in ("cs_imgload", "cs_imgload_d16", "cs_sample_lz_int_d16"):
-            rc, msg = run_cmd([vk_store, spv, "load" if name == "cs_imgload" else "load-d16"])
-            results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+            results.append((name,) + store_result(*run_cmd([vk_store, spv, "load" if name == "cs_imgload" else "load-d16"])))
         elif name in MIP_TEST_PASSES:
             problem = texture_mip_test(a.build, spirv_dir, name)
             ok = None if isinstance(problem, Skip) else not problem

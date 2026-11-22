@@ -174,7 +174,11 @@ Without `VK_EXT_mesh_shader`, the `ms_*` tests are skipped; that's expected, not
 runs them anyway, set `LEONIDA_MESH_COMPUTE=1` for `run_gpu_tests.py`, together with `LEONIDA_W64_EMULATE=1` on a
 32-wide GPU (every mesh shader is wave64). The mesh shaders are then translated with `--mesh-compute`, dispatched as
 compute and drawn by a generated vertex shader (`docs/design.md`, "Mesh shaders as compute"), so the device needs
-`bufferDeviceAddress` and `shaderInt64` instead.
+`bufferDeviceAddress` instead (and `shaderInt64` only for a module that still declares `Int64`: since `lower_addr64`,
+most build their addresses from 32-bit pairs and don't).
+
+Every helper enables `shaderInt64` only when the module it runs declares `Int64`, and reports 77 (SKIP) when a
+module needs it and the device has none, so a GPU without `shaderInt64` (Intel) runs the rest of the suite.
 
 ## Without a GPU: Mesa llvmpipe
 

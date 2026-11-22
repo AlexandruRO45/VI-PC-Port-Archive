@@ -175,7 +175,6 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     f12.bufferDeviceAddress = VK_TRUE; f12.runtimeDescriptorArray = VK_TRUE; f12.descriptorIndexing = VK_TRUE;
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2}; f2.pNext = &f12;
-    f2.features.shaderInt64 = VK_TRUE;
     // Texel offsets: the limits the shader's Offset operands must stay inside, and the two optional features.
     LI(vkEnumerateDeviceExtensionProperties); LI(vkGetPhysicalDeviceFeatures);
     VkPhysicalDeviceProperties pdp; vkGetPhysicalDeviceProperties(pd, &pdp);
@@ -189,6 +188,14 @@ int main(int argc, char** argv) {
         std::printf("unsupported: shaderResourceMinLod (the shader clamps its LOD with MinLod)\n");
         return 77;
     }
+    // Int64 only when a shader declares it (vk_shader_fma.h, declares_capability): most don't since lower_addr64.
+    const bool needs_int64 = declares_capability(read_spv(vs_path.c_str()), 11) ||
+                             declares_capability(read_spv(fs_path.c_str()), 11);   // 11 = Int64
+    if (needs_int64 && !have.shaderInt64) {
+        std::printf("unsupported: shaderInt64 (a shader declares Int64)\n");
+        return 77;
+    }
+    f2.features.shaderInt64 = needs_int64 ? VK_TRUE : VK_FALSE;
     std::vector<const char*> enable;
     leonida::vk_test::ShaderFma fma;      // OpFmaKHR (rdna2spirv.py --fma khr), when the device has it
     fma.query(gipa, inst, pd);

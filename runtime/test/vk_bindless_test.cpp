@@ -170,18 +170,22 @@ int main(int argc, char** argv) {
     vkEnumeratePhysicalDevices(inst, &n, nullptr);
     std::vector<VkPhysicalDevice> pds(n);
     vkEnumeratePhysicalDevices(inst, &n, pds.data());
-    VkPhysicalDevice pd = VK_NULL_HANDLE;
-    int best_rank = -1;
+    // The same choice as the other tools (vk_device_pick.h): the best-ranked Vulkan 1.2 device that
+    // LEONIDA_VK_DEVICE allows. A filter that matches nothing fails the test, as in vk_test_device.h.
+    std::vector<VkPhysicalDeviceProperties> candidates;
+    std::vector<VkPhysicalDevice> eligible;
     for (auto d : pds) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(d, &p);
         if (p.apiVersion < VK_API_VERSION_1_2) continue;
-        if (const int rank = leonida::vk_test::device_rank(p.deviceType, p.vendorID); rank > best_rank) {
-            pd = d;
-            best_rank = rank;
-        }
+        candidates.push_back(p);
+        eligible.push_back(d);
     }
+    const std::size_t chosen = leonida::vk_test::pick_device(candidates);
+    VkPhysicalDevice pd = chosen < eligible.size() ? eligible[chosen] : VK_NULL_HANDLE;
     if (!pd) {
+        leonida::vk_test::report_no_device();
+        if (!leonida::vulkan_device_filter().empty()) return 1;
         std::printf("unsupported: no Vulkan 1.2 device\n");
         return unsupported;
     }
@@ -204,10 +208,21 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceFeatures2 have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &have12};
     vkGetPhysicalDeviceFeatures2(pd, &have);
-    if (!have12.bufferDeviceAddress || !have12.runtimeDescriptorArray || !have.features.shaderInt64 ||
+    if (!have12.bufferDeviceAddress || !have12.runtimeDescriptorArray ||
         !have.features.shaderSampledImageArrayDynamicIndexing) {
-        std::printf("unsupported: the device lacks bufferDeviceAddress, runtimeDescriptorArray, shaderInt64 or "
+        std::printf("unsupported: the device lacks bufferDeviceAddress, runtimeDescriptorArray or "
                     "shaderSampledImageArrayDynamicIndexing\n");
+        return unsupported;
+    }
+    // Int64 only when a module declares it (vk_shader_fma.h, declares_capability): most don't since lower_addr64.
+    bool needs_int64 = false;
+    for (int stage = 0; stage < 2; ++stage) {
+        const auto code = read_spv(argv[1 + stage]);
+        needs_int64 = needs_int64 || leonida::vk_test::declares_capability(code.data(), code.size() * 4,
+                                                                            leonida::vk_test::capability_int64);
+    }
+    if (needs_int64 && !have.features.shaderInt64) {
+        std::printf("unsupported: a module declares Int64 and the device has no shaderInt64\n");
         return unsupported;
     }
     BindlessFeatures device_flags;
@@ -224,7 +239,7 @@ int main(int argc, char** argv) {
     enable12.descriptorBindingStorageBufferUpdateAfterBind = device_flags.update_after_bind;
     enable12.descriptorBindingPartiallyBound = device_flags.partially_bound;
     VkPhysicalDeviceFeatures2 enable{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &enable12};
-    enable.features.shaderInt64 = VK_TRUE;
+    enable.features.shaderInt64 = needs_int64 ? VK_TRUE : VK_FALSE;
     enable.features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
     // ps_imgatomic: image atomics in a pixel shader need fragment stores and atomics.
     const bool atomic_mode = std::strstr(argv[2], "imgatomic") != nullptr;

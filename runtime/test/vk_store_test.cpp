@@ -98,9 +98,8 @@ int main(int argc, char** argv) {
     // as vk_compute_test does) instead of failing vkCreateDevice. Typed loads need no storage image feature.
     VkPhysicalDeviceFeatures have{};
     vkGetPhysicalDeviceFeatures(pd, &have);
-    if (!have.shaderStorageImageWriteWithoutFormat || !have.shaderInt64) {
-        std::printf("unsupported: shaderStorageImageWriteWithoutFormat=%u shaderInt64=%u\n",
-                    have.shaderStorageImageWriteWithoutFormat, have.shaderInt64);
+    if (!have.shaderStorageImageWriteWithoutFormat) {
+        std::printf("unsupported: shaderStorageImageWriteWithoutFormat=%u\n", have.shaderStorageImageWriteWithoutFormat);
         return 77;
     }
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
@@ -133,7 +132,14 @@ int main(int argc, char** argv) {
             i += count;
         }
     }
-    f2.features.shaderInt64 = VK_TRUE;
+    // Int64 only when the module declares it (vk_shader_fma.h, declares_capability).
+    const bool needs_int64 = leonida::vk_test::declares_capability(code.data(), code.size(),
+                                                                   leonida::vk_test::capability_int64);
+    if (needs_int64 && !have.shaderInt64) {
+        std::printf("unsupported: shaderInt64=0 and %s declares Int64\n", argv[1]);
+        return 77;
+    }
+    f2.features.shaderInt64 = needs_int64 ? VK_TRUE : VK_FALSE;
     f2.pNext = &f12;
     leonida::vk_test::ShaderFma fma;      // OpFmaKHR (rdna2spirv.py --fma khr)
     fma.query(gipa, inst, pd);

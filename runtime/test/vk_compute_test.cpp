@@ -159,8 +159,18 @@ int main(int argc, char** argv) {
         f13.computeFullSubgroups = require_wave64 ? VK_TRUE : VK_FALSE;
         f12.pNext = &f13;
     }
+    // The module is read before the device so that its capabilities decide the features (vk_shader_fma.h,
+    // declares_capability): Int64 only when it declares it, and unsupported (77) when it does and the device can't.
+    std::ifstream f(argv[1], std::ios::binary);
+    std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
+    const bool needs_int64 = leonida::vk_test::declares_capability(code.data(), code.size(),
+                                                                   leonida::vk_test::capability_int64);
+    if (needs_int64 && !f2q.features.shaderInt64) {
+        std::fprintf(stderr, "unsupported: %s declares Int64 and the device has no shaderInt64\n", argv[1]);
+        return 77;
+    }
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-    f2.features.shaderInt64 = VK_TRUE;
+    f2.features.shaderInt64 = needs_int64 ? VK_TRUE : VK_FALSE;
     f2.pNext = &f12;
     // OpFmaKHR (rdna2spirv.py --fma khr): VK_KHR_shader_fma, when the device has it.
     leonida::vk_test::ShaderFma fma;
@@ -227,8 +237,6 @@ int main(int argc, char** argv) {
     bai.buffer = buf;
     const uint64_t heap = vkGetBufferDeviceAddress(dev, &bai);
 
-    std::ifstream f(argv[1], std::ios::binary);
-    std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
     if (!fma.accepts(code.data(), code.size(), argv[1])) return 77;
     VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     smi.codeSize = code.size(); smi.pCode = reinterpret_cast<const uint32_t*>(code.data());
