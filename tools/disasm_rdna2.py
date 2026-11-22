@@ -473,6 +473,8 @@ VOP2_OPS = {
     0x1b: ("v_and_b32_e32", "Vector bitwise AND"),
     0x1c: ("v_or_b32_e32", "Vector bitwise OR"),
     0x1d: ("v_xor_b32_e32", "Vector bitwise XOR"),
+    0x20: ("v_madmk_f32", "Vector multiply-add (non-fused) with literal multiplier"),
+    0x21: ("v_madak_f32", "Vector multiply-add (non-fused) with literal addend"),
     0x25: ("v_add_nc_u32_e32", "Vector add uint32 without carry"),
     0x26: ("v_sub_nc_u32_e32", "Vector sub uint32 without carry"),
     0x27: ("v_subrev_nc_u32_e32", "Vector reverse sub uint32 without carry"),
@@ -1111,7 +1113,7 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         src0 = w0 & 0x1ff
         op_info = VOP2_OPS.get(op, (f"v_vop2_{op:02x}", "Unknown VOP2"))
         op_name, comment = op_info
-        has_literal = src0 == 255 or op in (0x2c, 0x2d)
+        has_literal = src0 == 255 or op in (0x20, 0x21, 0x2c, 0x2d)
         length = 4
         literal = None
         if has_literal:
@@ -1122,9 +1124,9 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         src0_str = f"0x{literal:x}" if src0 == 255 and literal is not None else decode_v_reg(src0)
         if op_name == "v_cndmask_b32_e32":
             asm = f"{op_name} v{vdst}, {src0_str}, v{vsrc1}, vcc_lo"
-        elif op == 0x2c:
+        elif op in (0x20, 0x2c):
             asm = f"{op_name} v{vdst}, {src0_str}, 0x{literal:x}, v{vsrc1}"
-        elif op == 0x2d:
+        elif op in (0x21, 0x2d):
             asm = f"{op_name} v{vdst}, {src0_str}, v{vsrc1}, 0x{literal:x}"
         else:
             asm = f"{op_name} v{vdst}, {src0_str}, v{vsrc1}"
