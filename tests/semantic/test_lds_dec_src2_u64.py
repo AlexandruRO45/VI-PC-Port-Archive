@@ -980,5 +980,150 @@ class TestDsDecSrc2U64ConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertFalse(flags_aligned.unaligned_addr)
 
 
+# ==============================================================================
+# Phase 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+# IEEE 754 Double-Precision Boundary Constants
+POS_ZERO_F64 = 0x0000_0000_0000_0000
+NEG_ZERO_F64 = 0x8000_0000_0000_0000
+POS_INF_F64 = 0x7FF0_0000_0000_0000
+NEG_INF_F64 = 0xFFF0_0000_0000_0000
+QNAN_F64 = 0x7FF8_0000_0000_0000
+SNAN_F64 = 0x7FF0_0000_0000_0001
+MIN_NORMAL_F64 = 0x0010_0000_0000_0000
+MIN_SUBNORMAL_F64 = 0x0000_0000_0000_0001
+MAX_SUBNORMAL_F64 = 0x000F_FFFF_FFFF_FFFF
+MAX_NORMAL_F64 = 0x7FEF_FFFF_FFFF_FFFF
+
+
+def bits_to_f64(bits: int) -> float:
+    """Interpret 64-bit unsigned integer as IEEE 754 double-precision float."""
+    return struct.unpack("<d", struct.pack("<Q", bits & MASK64))[0]
+
+
+def f64_to_bits(val: float) -> int:
+    """Pack IEEE 754 double-precision float into 64-bit unsigned integer."""
+    return struct.unpack("<Q", struct.pack("<d", val))[0]
+
+
+def is_f64_nan(bits: int) -> bool:
+    """Test if 64-bit bit pattern is an IEEE 754 double-precision NaN."""
+    return (bits & 0x7FF0_0000_0000_0000) == 0x7FF0_0000_0000_0000 and (bits & 0x000F_FFFF_FFFF_FFFF) != 0
+
+
+def is_f64_subnormal(bits: int) -> bool:
+    """Test if 64-bit bit pattern is an IEEE 754 double-precision subnormal float."""
+    return (bits & 0x7FF0_0000_0000_0000) == 0 and (bits & 0x000F_FFFF_FFFF_FFFF) != 0
+
+
+class TestDsDecSrc2U64IEEE754EdgeCases(unittest.TestCase):
+    """Phase 7: Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormal_decrement_down_to_zero(self) -> None:
+        lds = LDSModel64(capacity_qwords=512)
+        vaddr = 0x100
+        idx_a = 0x100 >> 3
+        idx_b = (0x100 + 8) >> 3
+
+        lds.write_qword(idx_a, MIN_SUBNORMAL_F64)
+        lds.write_qword(idx_b, 1000)
+
+        self.assertTrue(is_f64_subnormal(MIN_SUBNORMAL_F64))
+
+        new_val = lds.atomic_dec_src2_u64(vaddr, offset0=0, offset1=1)
+        self.assertEqual(new_val, 0)
+        self.assertEqual(lds.read_qword(idx_a), 0)
+
+    def test_normal_to_subnormal_boundary_crossing(self) -> None:
+        lds = LDSModel64(capacity_qwords=512)
+        vaddr = 0x120
+        idx_a = 0x120 >> 3
+        idx_b = (0x120 + 8) >> 3
+
+        lds.write_qword(idx_a, MIN_NORMAL_F64)
+        lds.write_qword(idx_b, MASK64)
+
+        self.assertFalse(is_f64_subnormal(MIN_NORMAL_F64))
+
+        new_val = lds.atomic_dec_src2_u64(vaddr, offset0=0, offset1=1)
+        self.assertEqual(new_val, MAX_SUBNORMAL_F64)
+        self.assertTrue(is_f64_subnormal(new_val))
+        self.assertEqual(lds.read_qword(idx_a), MAX_SUBNORMAL_F64)
+
+    def test_signaling_nan_preserved_without_quietening(self) -> None:
+        lds = LDSModel64(capacity_qwords=512)
+        vaddr = 0x140
+        idx_a = 0x140 >> 3
+        idx_b = (0x140 + 8) >> 3
+
+        snan_val = 0x7FF0_0000_0000_0005
+        lds.write_qword(idx_a, snan_val)
+        lds.write_qword(idx_b, MASK64)
+
+        new_val = lds.atomic_dec_src2_u64(vaddr, offset0=0, offset1=1)
+        self.assertEqual(new_val, snan_val - 1)
+        # Verify quiet bit 51 is not forced high
+        self.assertEqual(new_val & 0x0008_0000_0000_0000, 0)
+        self.assertTrue(is_f64_nan(new_val))
+
+    def test_quiet_nan_wrap_boundary(self) -> None:
+        lds = LDSModel64(capacity_qwords=512)
+        vaddr = 0x160
+        idx_a = 0x160 >> 3
+        idx_b = (0x160 + 8) >> 3
+
+        # val_a is 0 -> wraps to threshold QNAN_F64
+        lds.write_qword(idx_a, 0)
+        lds.write_qword(idx_b, QNAN_F64)
+
+        new_val = lds.atomic_dec_src2_u64(vaddr, offset0=0, offset1=1)
+        self.assertEqual(new_val, QNAN_F64)
+        self.assertEqual(lds.read_qword(idx_a), QNAN_F64)
+
+    def test_positive_and_negative_zero_asymmetry(self) -> None:
+        # +0.0 is integer 0
+        self.assertEqual(ref_ds_dec_src2_u64(POS_ZERO_F64, 100), 100)
+
+        # -0.0 is integer 0x8000_0000_0000_0000
+        # If threshold is 0x9000_... -> normal decrement
+        self.assertEqual(
+            ref_ds_dec_src2_u64(NEG_ZERO_F64, 0x9000_0000_0000_0000),
+            0x7FFF_FFFF_FFFF_FFFF,
+        )
+        # If threshold is 100 -> resets to 100
+        self.assertEqual(ref_ds_dec_src2_u64(NEG_ZERO_F64, 100), 100)
+
+    def test_infinities_bit_patterns(self) -> None:
+        # Decrementing +Inf
+        self.assertEqual(ref_ds_dec_src2_u64(POS_INF_F64, MASK64), POS_INF_F64 - 1)
+        # Zero wrapping to -Inf
+        self.assertEqual(ref_ds_dec_src2_u64(0, NEG_INF_F64), NEG_INF_F64)
+
+    def test_uint64_boundary_extremes(self) -> None:
+        u_max = MASK64
+        u_mid = 0x8000_0000_0000_0000
+
+        # Decrement at MASK64 with MASK64 threshold
+        self.assertEqual(ref_ds_dec_src2_u64(u_max, u_max), u_max - 1)
+        # 0 wraps to MASK64
+        self.assertEqual(ref_ds_dec_src2_u64(0, u_max), u_max)
+        # Step across signed transition 0x8000000000000000 -> 0x7FFFFFFFFFFFFFFF
+        self.assertEqual(ref_ds_dec_src2_u64(u_mid, u_max), 0x7FFF_FFFF_FFFF_FFFF)
+
+    def test_counter_cyclic_trajectory(self) -> None:
+        # Full countdown from limit down to 0, then wrapping back to limit
+        limit = 6
+        curr = limit
+        for expected in range(limit, 0, -1):
+            curr = ref_ds_dec_src2_u64(curr, limit)
+            self.assertEqual(curr, expected - 1)
+
+        # At 0, wraps back to limit
+        self.assertEqual(curr, 0)
+        curr = ref_ds_dec_src2_u64(curr, limit)
+        self.assertEqual(curr, limit)
+
+
 if __name__ == "__main__":
     unittest.main()
