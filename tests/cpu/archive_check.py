@@ -63,4 +63,3 @@ if __name__ == "__main__":
         run_mapped(mapper, native, {codec.name.lower(): ctypes.CDLL(str(codec)), "ntdll.dll": ctypes.WinDLL("ntdll")})
         raise AssertionError("the mapped Zig startup returned from process termination")
     compare(*map(Path, sys.argv[1:]))
-

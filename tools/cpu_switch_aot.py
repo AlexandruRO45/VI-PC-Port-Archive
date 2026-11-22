@@ -426,9 +426,12 @@ class Function:
     def thunk_slot(self, ins, imports):
         """Recognize the complete x64 FF 25 disp32 linker thunk in executable bytes."""
         target = ins.near_branch_target
-        if not imports or self.entries.owner(target) is not None or not executable(self.pe, target):
+        if not imports or not executable(self.pe, target):
             return None
         if self.pe.get_data(target, 2) != b"\xff\x25":
+            return None
+        if any(self.entries.owner(rva) is not None or self.entries.bound_holder(rva) is not None
+               for rva in range(target, target + 6)):
             return None
         code = image_bytes(self.pe, target, 6, executable=True)
         return target + 6 + int.from_bytes(code[2:], "little", signed=True)

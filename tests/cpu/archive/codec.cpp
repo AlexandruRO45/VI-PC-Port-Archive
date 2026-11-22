@@ -72,4 +72,3 @@ API void completed(unsigned count) {
     std::fflush(stdout);
     std::fflush(stderr);
 }
-

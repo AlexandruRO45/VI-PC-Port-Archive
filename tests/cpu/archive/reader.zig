@@ -29,4 +29,3 @@ pub fn main() u8 {
     completed(count);
     return status;
 }
-

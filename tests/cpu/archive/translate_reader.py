@@ -41,4 +41,3 @@ if __name__ == "__main__":
     parser.add_argument("output", type=Path)
     args = parser.parse_args()
     args.output.write_text(translate(args.image, BINDINGS, HOST, allow_process_exit=True), encoding="ascii")
-
