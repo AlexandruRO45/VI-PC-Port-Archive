@@ -1148,48 +1148,55 @@ public:
     }
 
     void remove_resource(ResourceId id) {
-        VkImage img = VK_NULL_HANDLE;
+        // Lock hierarchy: resource_mutex_ -> tracker_mutex_ -> submit_mutex_.
+        // Hold resource_mutex_ and tracker_mutex_ together so:
+        //   1. No concurrent add_resource(id) on a reused ResourceId can slip between erasing resources_[id] and
+        //      forgetting tracker_[id] (ABA loss of LayoutTracker state).
+        //   2. Any in-flight VulkanQueue::execute() that already unlocked resource_mutex_ finishes submit() and
+        //      record_submit_locked() before cached VkImageViews / framebuffers are stamped for deferred destruction.
+        std::unique_lock rlock(resource_mutex_);
+        std::lock_guard tlock(tracker_mutex_);
+        const auto it = resources_.find(id);
+        if (it == resources_.end()) return;
+        const VkImage img = it->second.image;
+        unindex_buffer(id, it->second);
+        resources_.erase(it);
         std::shared_ptr<SparseResource> sparse_resource;
-        {
-            std::unique_lock rlock(resource_mutex_);
-            const auto it = resources_.find(id);
-            if (it == resources_.end()) return;
-            img = it->second.image;
-            unindex_buffer(id, it->second);
-            resources_.erase(it);
-            if (auto sparse = sparse_resources_.find(id); sparse != sparse_resources_.end()) {
-                sparse_resource = std::move(sparse->second);
-                sparse_resources_.erase(sparse);
-            }
+        if (auto sparse = sparse_resources_.find(id); sparse != sparse_resources_.end()) {
+            sparse_resource = std::move(sparse->second);
+            sparse_resources_.erase(sparse);
         }
+        tracker_.forget(id);
         {
             std::lock_guard lock(storage_mutex_);  // a buffer destroyed before any submission is not filled
             std::erase_if(zero_pending_, [id](const PendingZero& zero) { return zero.id == id; });
         }
+        std::vector<VkFramebuffer> framebuffers_to_retire;
+        std::vector<VkImageView> views_to_retire;
         if (img) {
             std::lock_guard vlock(views_mutex_);
             for (auto f = resolve_framebuffers_.begin(); f != resolve_framebuffers_.end();) {
                 if (std::get<0>(f->first) == img || std::get<1>(f->first) == img) {
-                    defer_destroy(DeferredDeletionQueue::Kind::framebuffer, f->second);
+                    framebuffers_to_retire.push_back(f->second);
                     f = resolve_framebuffers_.erase(f);
                 } else {
                     ++f;
                 }
             }
-            for (auto v = views_.begin(); v != views_.end();) {
-                if (std::get<0>(v->first) == img) {
-                    defer_destroy(DeferredDeletionQueue::Kind::image_view, v->second);
-                    v = views_.erase(v);
-                } else {
-                    ++v;
-                }
+            const auto first = std::make_tuple(img, VkImageAspectFlags{0}, std::uint32_t{0}, std::uint32_t{0},
+                                               std::uint32_t{0}, VK_FORMAT_UNDEFINED);
+            for (auto v = views_.lower_bound(first); v != views_.end() && std::get<0>(v->first) == img;) {
+                views_to_retire.push_back(v->second);
+                v = views_.erase(v);
             }
         }
+        for (const VkFramebuffer framebuffer : framebuffers_to_retire)
+            defer_destroy(DeferredDeletionQueue::Kind::framebuffer, framebuffer);
+        for (const VkImageView view : views_to_retire)
+            defer_destroy(DeferredDeletionQueue::Kind::image_view, view);
         if (sparse_resource)
             defer_destroy(DeferredDeletionQueue::Kind::sparse_resource,
                           new std::shared_ptr<SparseResource>(std::move(sparse_resource)));
-        std::lock_guard tlock(tracker_mutex_);
-        tracker_.forget(id);
     }
 
     // A query heap, by its stable ID (the COM query heap pointer). The pool stays the caller's to destroy, after
