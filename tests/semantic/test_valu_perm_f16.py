@@ -1221,8 +1221,178 @@ class TestPermF16RegisterAliasing(unittest.TestCase):
             self.assertEqual(wave.get_lane_vgpr(0, lane), pack_halves(lane * 10, lane))
 
 
+# ==============================================================================
+# Condition Codes, Architectural Status Flags, and FP Classifications
+# ==============================================================================
+
+@dataclass
+class FPStatusFlags:
+    """Architectural floating-point status flags produced by VALU execution."""
+    zero: bool = False
+    nan: bool = False
+    subnormal: bool = False
+    negative: bool = False
+    infinity: bool = False
+
+
+def is_nan16(bits: int) -> bool:
+    """Return True if 16-bit word represents an IEEE 754 binary16 NaN."""
+    return ((bits & EXP_MASK16) == EXP_MASK16) and ((bits & FRAC_MASK16) != 0)
+
+
+def is_inf16(bits: int) -> bool:
+    """Return True if 16-bit word represents positive or negative infinity."""
+    return ((bits & EXP_MASK16) == EXP_MASK16) and ((bits & FRAC_MASK16) == 0)
+
+
+def is_subnormal16(bits: int) -> bool:
+    """Return True if 16-bit word represents a subnormal (denormal) half float."""
+    return ((bits & EXP_MASK16) == 0) and ((bits & FRAC_MASK16) != 0)
+
+
+def is_zero16(bits: int) -> bool:
+    """Return True if 16-bit word represents +0.0 or -0.0."""
+    return (bits & ~SIGN16) == 0
+
+
+def eval_fp_status(val32: int) -> FPStatusFlags:
+    """Evaluate floating-point condition flags for a packed pair of f16 values."""
+    h0 = val32 & MASK16
+    h1 = (val32 >> 16) & MASK16
+
+    both_zero = is_zero16(h0) and is_zero16(h1)
+    has_nan = is_nan16(h0) or is_nan16(h1)
+    has_subnormal = is_subnormal16(h0) or is_subnormal16(h1)
+    has_inf = is_inf16(h0) or is_inf16(h1)
+    is_neg = bool(h0 & SIGN16) or bool(h1 & SIGN16)
+
+    return FPStatusFlags(
+        zero=both_zero,
+        nan=has_nan,
+        subnormal=has_subnormal,
+        negative=is_neg,
+        infinity=has_inf,
+    )
+
+
+# ==============================================================================
+# Unit Tests: Commit 6 (Condition Codes & Status Flags)
+# ==============================================================================
+
+class TestPermF16ConditionCodesAndStatus(unittest.TestCase):
+    """Test suite for condition codes, status flags, and carry/borrow generation."""
+
+    def setUp(self):
+        self.rf = ScalarRegisterFile()
+        self.interp = ScalarInterpreter(self.rf)
+
+    def test_status_flags_zero_result(self):
+        # Permute resulting in [+0.0, -0.0]
+        sel = make_selector(SEL_POS_ZERO, SEL_NEG_ZERO)
+        res = oracle_v_perm_f16(0, 0, sel)
+        flags = eval_fp_status(res)
+        self.assertTrue(flags.zero)
+        self.assertTrue(flags.negative)  # -0.0 has sign bit set
+        self.assertFalse(flags.nan)
+        self.assertFalse(flags.subnormal)
+        self.assertFalse(flags.infinity)
+
+    def test_status_flags_nan_detection(self):
+        # Permute injecting canonical Quiet NaN into high half
+        sel = make_selector(SEL_POS_ONE, SEL_CANONICAL_QNAN)
+        res = oracle_v_perm_f16(0, 0, sel)
+        flags = eval_fp_status(res)
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.nan)
+        self.assertFalse(flags.infinity)
+
+    def test_status_flags_subnormal_detection(self):
+        # S1 has subnormal in low half
+        s1 = pack_halves(MIN_SUBNORMAL, POS_ONE)
+        sel = PermSelectorF16Word.identity_src1().raw
+        res = oracle_v_perm_f16(0, s1, sel)
+        flags = eval_fp_status(res)
+        self.assertTrue(flags.subnormal)
+        self.assertFalse(flags.nan)
+        self.assertFalse(flags.zero)
+
+    def test_status_flags_negative_sign(self):
+        s1 = pack_halves(NEG_ONE, POS_ONE)
+        sel = PermSelectorF16Word.identity_src1().raw
+        res = oracle_v_perm_f16(0, s1, sel)
+        flags = eval_fp_status(res)
+        self.assertTrue(flags.negative)
+
+    def test_status_flags_infinity_detection(self):
+        s1 = pack_halves(POS_INF, NEG_INF)
+        sel = PermSelectorF16Word.identity_src1().raw
+        res = oracle_v_perm_f16(0, s1, sel)
+        flags = eval_fp_status(res)
+        self.assertTrue(flags.infinity)
+        self.assertFalse(flags.nan)
+
+    def test_scc_preserved_by_valu_perm(self):
+        # In RDNA2 VALU semantics, v_perm_f16 never touches SCC (Scalar Condition Code)
+        self.rf.scc = 1  # Set SCC
+        self.rf.set_vgpr(1, pack_halves(POS_ONE, POS_ONE))
+        self.rf.set_vgpr(2, pack_halves(POS_TWO, POS_TWO))
+        sel = PermSelectorF16Word.identity_src1().raw
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.literal(sel),
+        )
+        self.interp.execute(instr)
+        # SCC must remain 1
+        self.assertEqual(self.rf.scc, 1)
+
+    def test_vcc_condition_code_comparison_after_perm(self):
+        # Simulate downstream v_cmp_gt_f16 testing if high half > low half
+        s1 = pack_halves(POS_ONE, POS_TWO)
+        sel_swap = PermSelectorF16Word.swap_halves_src1().raw
+        res = oracle_v_perm_f16(0, s1, sel_swap)
+
+        h0 = bits_to_f16(extract_half(res, 0))  # 2.0
+        h1 = bits_to_f16(extract_half(res, 1))  # 1.0
+
+        vcc_bit = 1 if h1 > h0 else 0
+        self.assertEqual(vcc_bit, 0)
+
+    def test_simd_lane_divergent_vcc_generation(self):
+        # Generate wave VCC mask from permuted lane results
+        wave = SIMDWaveState(num_lanes=32)
+        wave.set_wave_vgpr(1, [pack_halves(i, i * 2) for i in range(32)])
+        sel = PermSelectorF16Word.identity_src0().raw
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.inline_const(0),
+            src2=ASTOperand.literal(sel),
+        )
+        wave.execute_instruction(instr)
+
+        # Compute VCC mask: lane is 1 if hi half > lo half (which is true for i > 0)
+        vcc_mask = 0
+        for lane in range(32):
+            val = wave.get_lane_vgpr(0, lane)
+            lo = extract_half(val, 0)
+            hi = extract_half(val, 1)
+            if hi > lo:
+                vcc_mask |= (1 << lane)
+
+        # For i=0: 0 > 0 is False. For i in 1..31: 2*i > i is True.
+        expected_vcc = 0xFFFF_FFFE
+        self.assertEqual(vcc_mask, expected_vcc)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
