@@ -236,5 +236,185 @@ class TestReferenceOracleAndLDSModel64(unittest.TestCase):
         self.assertEqual(lds.read_qword(addr), 0)
 
 
+# ==============================================================================
+# Phase 2: Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+import dataclasses
+import enum
+
+
+class RegKind(enum.Enum):
+    """Register file domain."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclasses.dataclass(frozen=True)
+class Register:
+    """Symbolic register operand."""
+    kind: RegKind
+    index: int
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        if self.index < 0 or self.index >= DEFAULT_NUM_VGPRS:
+            raise ValueError(f"Register index out of range [0, 255]: {self.index}")
+        if self.count not in (1, 2, 4):
+            raise ValueError(f"Unsupported register count: {self.count}")
+        if self.index + self.count > DEFAULT_NUM_VGPRS:
+            raise ValueError(f"Register range exceeds register file boundary: {self.index}")
+
+    @property
+    def is_vgpr(self) -> bool:
+        return self.kind == RegKind.VGPR
+
+    @property
+    def is_sgpr(self) -> bool:
+        return self.kind == RegKind.SGPR
+
+    def format_asm(self) -> str:
+        if self.count > 1:
+            return f"{self.kind.value}[{self.index}:{self.index + self.count - 1}]"
+        return f"{self.kind.value}{self.index}"
+
+
+class Ds64Opcode(enum.Enum):
+    """LDS 64-bit instruction opcodes."""
+    DS_INC_RTN_U64 = "ds_inc_rtn_u64"
+    DS_INC_U64 = "ds_inc_u64"
+
+
+@dataclasses.dataclass(frozen=True)
+class Ds64Instruction:
+    """Symbolic AST node representing a 64-bit DS atomic increment instruction."""
+    opcode: Ds64Opcode
+    vaddr: Register
+    vdata0: Register
+    vdst: Register | None = None
+    offset: int = 0
+    gds: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.vaddr.is_vgpr or self.vaddr.count != 1:
+            raise ValueError(f"vaddr must be a single 32-bit VGPR: {self.vaddr}")
+        if not self.vdata0.is_vgpr or self.vdata0.count != 2:
+            raise ValueError(f"vdata0 must be a 64-bit VGPR pair (count=2): {self.vdata0}")
+        if self.opcode == Ds64Opcode.DS_INC_RTN_U64:
+            if self.vdst is None or not self.vdst.is_vgpr or self.vdst.count != 2:
+                raise ValueError(f"ds_inc_rtn_u64 requires a 64-bit destination VGPR pair vdst (count=2): {self.vdst}")
+        elif self.opcode == Ds64Opcode.DS_INC_U64:
+            if self.vdst is not None:
+                raise ValueError(f"ds_inc_u64 does not accept a destination register: {self.vdst}")
+        if self.offset < 0 or self.offset > 65535:
+            raise ValueError(f"LDS offset must be 16-bit unsigned [0, 65535], got {self.offset}")
+
+    def to_assembly(self) -> str:
+        parts: list[str] = [self.opcode.value]
+        if self.vdst is not None:
+            parts.append(f"{self.vdst.format_asm()},")
+        parts.append(f"{self.vaddr.format_asm()},")
+        parts.append(self.vdata0.format_asm())
+        if self.offset != 0:
+            parts.append(f"offset:{self.offset}")
+        if self.gds:
+            parts.append("gds")
+
+        first_arg = parts[1]
+        rest = " ".join(parts[2:])
+        return f"{self.opcode.value} {first_arg} {rest}" if rest else f"{self.opcode.value} {first_arg}"
+
+
+class Ds64IncExpr:
+    """Typed symbolic expression for ds_inc_rtn_u64."""
+
+    def __init__(self, vaddr: int, wrap_limit: int, offset: int = 0) -> None:
+        self.vaddr = vaddr & MASK_32
+        self.wrap_limit = wrap_limit & MASK_64
+        self.offset = offset & OFFSET16_MASK
+
+    def evaluate(self, lds: LDSModel64) -> Tuple[int, int]:
+        return lds.atomic_inc_rtn_u64(self.vaddr, self.wrap_limit, self.offset)
+
+
+class TestDsIncRtnU64AST(unittest.TestCase):
+    """Phase 2: Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_opcode_values(self) -> None:
+        self.assertEqual(Ds64Opcode.DS_INC_RTN_U64.value, "ds_inc_rtn_u64")
+        self.assertEqual(Ds64Opcode.DS_INC_U64.value, "ds_inc_u64")
+
+    def test_register_operand_formatting(self) -> None:
+        v1 = Register(RegKind.VGPR, 1, count=1)
+        self.assertEqual(v1.format_asm(), "v1")
+        v_pair = Register(RegKind.VGPR, 4, count=2)
+        self.assertEqual(v_pair.format_asm(), "v[4:5]")
+
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 255, count=2)
+
+    def test_instruction_ast_returning(self) -> None:
+        vdst = Register(RegKind.VGPR, 0, count=2)
+        vaddr = Register(RegKind.VGPR, 2, count=1)
+        vdata = Register(RegKind.VGPR, 4, count=2)
+
+        instr = Ds64Instruction(
+            opcode=Ds64Opcode.DS_INC_RTN_U64,
+            vdst=vdst,
+            vaddr=vaddr,
+            vdata0=vdata,
+            offset=16,
+        )
+        self.assertEqual(instr.to_assembly(), "ds_inc_rtn_u64 v[0:1], v2, v[4:5] offset:16")
+
+    def test_instruction_ast_non_returning(self) -> None:
+        vaddr = Register(RegKind.VGPR, 2, count=1)
+        vdata = Register(RegKind.VGPR, 4, count=2)
+
+        instr = Ds64Instruction(
+            opcode=Ds64Opcode.DS_INC_U64,
+            vaddr=vaddr,
+            vdata0=vdata,
+            offset=0,
+        )
+        self.assertEqual(instr.to_assembly(), "ds_inc_u64 v2, v[4:5]")
+
+    def test_instruction_validation_errors(self) -> None:
+        v1 = Register(RegKind.VGPR, 1, count=1)
+        v2 = Register(RegKind.VGPR, 2, count=2)
+        s1 = Register(RegKind.SGPR, 1, count=1)
+
+        # vaddr must be VGPR
+        with self.assertRaises(ValueError):
+            Ds64Instruction(opcode=Ds64Opcode.DS_INC_U64, vaddr=s1, vdata0=v2)
+        # vdata0 must be count=2
+        with self.assertRaises(ValueError):
+            Ds64Instruction(opcode=Ds64Opcode.DS_INC_U64, vaddr=v1, vdata0=v1)
+        # returning requires vdst count=2
+        with self.assertRaises(ValueError):
+            Ds64Instruction(opcode=Ds64Opcode.DS_INC_RTN_U64, vaddr=v1, vdata0=v2, vdst=v1)
+        # non-returning must not have vdst
+        with self.assertRaises(ValueError):
+            Ds64Instruction(opcode=Ds64Opcode.DS_INC_U64, vaddr=v1, vdata0=v2, vdst=v2)
+        # offset out of range
+        with self.assertRaises(ValueError):
+            Ds64Instruction(opcode=Ds64Opcode.DS_INC_U64, vaddr=v1, vdata0=v2, offset=70000)
+
+    def test_typed_expression_evaluation(self) -> None:
+        lds = LDSModel64(capacity_qwords=512)
+        addr = 0x100
+        lds.write_qword(addr, 10)
+
+        expr = Ds64IncExpr(vaddr=addr, wrap_limit=15, offset=0)
+        old, new_mem = expr.evaluate(lds)
+        self.assertEqual(old, 10)
+        self.assertEqual(new_mem, 11)
+        self.assertEqual(lds.read_qword(addr), 11)
+
+
 if __name__ == "__main__":
     unittest.main()
