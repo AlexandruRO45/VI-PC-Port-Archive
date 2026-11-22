@@ -1128,12 +1128,19 @@ if(TARGET Vulkan::Headers)
       set(LEONIDA_M15_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/m15_shaders)
       get_filename_component(LEONIDA_SPIRV_TOOLS_DIR ${LEONIDA_SPIRV_AS} DIRECTORY)
       file(TO_NATIVE_PATH "${LEONIDA_SPIRV_TOOLS_DIR}" LEONIDA_SPIRV_TOOLS_NATIVE)
+      # PATH for the translation steps, with its separators escaped: a bare ";" splits the cmake -E env argument in
+      # two under the Visual Studio generator (MSB8066), while Ninja happened to keep it whole.
+      if(WIN32)
+        string(REPLACE ";" "$<SEMICOLON>" LEONIDA_TOOLS_PATH "${LEONIDA_SPIRV_TOOLS_NATIVE};$ENV{PATH}")
+      else()
+        set(LEONIDA_TOOLS_PATH "${LEONIDA_SPIRV_TOOLS_NATIVE}:$ENV{PATH}")
+      endif()
       set(LEONIDA_M15_FILES ${LEONIDA_M15_DIR}/spirv/index.json ${LEONIDA_M15_DIR}/fssm/vs_m15.fssm
                             ${LEONIDA_M15_DIR}/fssm/ps_m15.fssm)
       add_custom_command(
         OUTPUT ${LEONIDA_M15_FILES}
         COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_M15_DIR}
-        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "PATH=${LEONIDA_SPIRV_TOOLS_NATIVE};$ENV{PATH}"
+        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "PATH=${LEONIDA_TOOLS_PATH}"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_M15_DIR} vs_m15 ps_m15
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
