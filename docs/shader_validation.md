@@ -1421,6 +1421,43 @@ Hardware validation was executed via `tools/hw_oracle` and `tools/salu_diff.py` 
 - **24-bit products and 64-bit shifts (`v_mul_hi_*24`, `v_lshrrev_b64`, `v_ashrrev_i64`)**:
   - Verified across signed/unsigned products, edge signs, and 0..63 shift counts: **0 mismatches**.
 
+### `v_fract_f16` with an output modifier on RDNA2 (SHADER-338, `tools/fract_f16_probe.py`)
+
+*Measured on an RDNA2 iGPU (gfx1036), AMD Windows driver 32.0.21044.64, HIP backend, `main` 4eb6155d.* One raw kernel
+per block of 1,024 inputs: lane i runs `v_fract_f16_e64 v8, v1 <mod>` on x = base + i, with `0x5a5a` in the high half
+of the destination. All 65,536 f16 inputs, the eight forms no modifier, `mul:2`, `mul:4`, `div:2` and each with
+`clamp`, in the four MODEs IEEE 0/1 × `denorm_mode_16_64` 0/3 (DX10_CLAMP 1, `denorm_mode_32` 0): 2,097,152 words in
+wave32, plus one block per MODE and form in wave64, which gives the same words. The high half is kept in every word.
+`rule()` in the tool reproduces all of them:
+
+- **Rounded fract first, then the modifier.** The fract is rounded to f16, with the 0x3c00 → 0x3bff fix-up, and the
+  modifier scales that f16 value: -2^-14 (`0x8400`) gives `0x3bff`, and with `mul:2`, `mul:4`, `div:2` it gives
+  `0x3fff`, `0x43ff`, `0x37ff`. Scaling the exact 1 - 2^-15 and rounding once would give `0x4000`, `0x4400`, `0x3800`
+  (2,049 inputs tell the two orders apart).
+- **The modifier acts only under IEEE 0 with f16 denormals flushed**, as for the other f16 results (SHADER-135). In the
+  other three MODEs all eight forms give the words of no modifier, and of `clamp`.
+- **Where it acts the product is exact except below 2^-14**, which is flushed to +0 before rounding: `0x07ff` with
+  `div:2` gives +0, not the smallest normal `0x0400`.
+- **`clamp` comes last** ([0, 1]; `0x3b00` with `clamp mul:4` gives `0x3c00`) and gives +0 for a NaN.
+- **Special inputs, whatever the modifier:** fract(±inf) is `0xfe00`; a NaN passes through, a signalling one quieted
+  under IEEE 1 with its payload (`0x7c01` → `0x7e01`) and kept under IEEE 0; -0 gives +0; with f16 denormals flushed a
+  denormal input reads as zero (fract(-2^-24) is +0 there, `0x3bff` with them kept).
+
+**The translator against these words**, in the MODE it assumes (IEEE 0, f16 denormals kept): with #1970 (SHADER-297),
+which drops the f16 modifier, all 65,536 inputs of the four forms without `clamp` give the hardware word except the NaN
+bits (2,047 NaN results per form, a canonical quiet NaN where the hardware keeps the input or gives `0xfe00`; SPIR-V
+doesn't fix them, see difference 5 in the section above). The `clamp` forms match on every input that is not a NaN or
+an infinity; those the interpreter refuses (difference 2). Before #1970 the translator scaled the f32 fract and
+narrowed it, which differs from the hardware on 51,199 inputs per modifier in this MODE, and on 4,095 (`mul:2`,
+`mul:4`) or 5,118 (`div:2`) non-NaN inputs even against the MODE where the modifier acts.
+
+```powershell
+python -I tools/fract_f16_probe.py                  # the rule and the translator, on the CPU
+python -I tools/fract_f16_probe.py --oracle hw      # also all 2,097,152 words on an AMD GPU (hardware oracle)
+```
+
+`tests/test_fract_f16_probe.py` checks the rule against hand-worked words and the translator on the negative
+denormals, whose fract rounds to 1.0.
 
 ## Coverage plan and cost
 
