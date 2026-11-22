@@ -360,8 +360,12 @@ int main(int argc, char** argv)
 {
     if (argc < 3) return 2;
     const std::string_view operation = argv[2];
-    if (operation == "--check-bc7-tail") {
+    if (operation == "--check-pixel-quad-lod") {
+        if (argc != 4) return 2;
+    } else if (operation == "--check-bc7-tail") {
         if (argc < 6) return 2;
+    } else if ((operation == "--compute-root-file" || operation == "--ffx-immediate-conversion")) {
+        if (argc != 4) return 2;
     } else {
         if (argc != 3 && argc != 5 && argc != 6) return 2;
         if (argc == 6 && operation != "--check-bc7" && operation != "--check-bc7-mip1") return 2;
@@ -411,6 +415,10 @@ int main(int argc, char** argv)
         if (argc == 3 && needs_cs_6_5(operation) && !supports_cs_6_5(device.Get())) return 77;
         if (argc == 3 && (operation == "--compute-root" || operation == "--compute-tables")) {
             check_compute(device.Get(), operation == "--compute-tables");
+        } else if (argc == 4 && (operation == "--compute-root-file" || operation == "--ffx-immediate-conversion")) {
+            check_compute_file(device.Get(), argv[3], operation == "--ffx-immediate-conversion");
+        } else if (argc == 5 && operation == "--compute-store-case") {
+            check_compute_file(device.Get(), argv[3], false, argv[4]);
         } else if (argc == 3 && operation == "--ffx-device-init") {
             check_ffx_device_init(device.Get());
         } else if (argc == 3 && operation == "--ffx-provider-loop") {
@@ -427,6 +435,13 @@ int main(int argc, char** argv)
             check_dual_pixel(device.Get(), argv[3], argv[4], operation == "--dual-pixel-swapped");
         } else if (argc == 5 && operation == "--check-pixel-case") {
             check_translated_pixel(device.Get(), argv[3], false, argv[4]);
+        } else if (argc == 5 && (operation == "--check-pixel-attribute" || operation == "--check-pixel-attribute-rg")) {
+            check_attribute_pixel(device.Get(), argv[3], argv[4], operation == "--check-pixel-attribute-rg");
+        } else if (argc == 5 && operation == "--check-pixel-case-rg") {
+            check_translated_pixel(device.Get(), argv[3], false, argv[4],
+                                   D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN);
+        } else if (operation == "--check-pixel-quad-lod") {
+            check_pixel_quad_lod(device.Get(), argv[3]);
         } else if (operation == "--check-pixel") {
             if (argc != 5 || (std::string_view(argv[4]) != "rgba" && std::string_view(argv[4]) != "bgra"))
                 throw std::runtime_error("Expected --check-pixel <pixel.cso> rgba|bgra");
@@ -461,6 +476,8 @@ int main(int argc, char** argv)
             if (!check_gpu_alias_lookup(device.Get())) return 77;
         } else if (argc == 3 && operation == "--gpu-alias-lookup-writes") {
             if (!check_gpu_alias_lookup_writes(device.Get())) return 77;
+        } else if (argc == 3 && operation == "--gpu-alias-registry") {
+            if (!check_gpu_alias_registry(device.Get())) return 77;
         } else if (argc == 3 && operation == "--buffer-ops") {
             check_buffer_ops(device.Get());
         } else if (argc == 3 && operation == "--ray-query") {
