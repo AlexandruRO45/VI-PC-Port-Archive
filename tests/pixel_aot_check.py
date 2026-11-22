@@ -25,6 +25,9 @@ SOPC_OPS = (
     "s_bitcmp0_b32", "s_bitcmp1_b32",
     "s_bitcmp0_b64", "s_bitcmp1_b64",
 )
+SOP2_LSHL_ADD_OPS = (
+    "s_lshl1_add_u32", "s_lshl2_add_u32", "s_lshl3_add_u32", "s_lshl4_add_u32",
+)
 VOP2_INT_OPS = (
     "v_lshrrev_b32_e32", "v_ashrrev_i32_e32", "v_lshlrev_b32_e32",
     "v_and_b32_e32", "v_or_b32_e32", "v_xor_b32_e32",
@@ -2382,7 +2385,7 @@ def check_scalar_controls():
     for new in ("s_addc_u32 s62, s44, s45", "s_subb_u32 s62, s44, s45", "s_mul_hi_u32 s62, s44, s45",
                 "s_absdiff_i32 s62, s44, s45",
                 "s_nand_b32 s62, v12, s45", "s_nor_b32 v62, s44, s45", "s_xnor_b32 s62, s44",
-                "s_bfe_u32 s62, v12, s45", "s_lshl1_add_u32 s62, s44, s45",
+                "s_bfe_u32 s62, v12, s45", "s_lshl5_add_u32 s62, s44, s45",
                 "s_quadmask_b32 s62, s44", "s_bitset0_b64 s[62:63], s44",
                 "s_brev_b32 s62, s44", "s_and_b64 s[62:63], s[44:46], s[46:47]",
                 "s_add_u32 s62, s[44:45], s45", "s_add_u32 s62, s44", "s_add_u32 s62, s44, s45, s46",
@@ -3355,6 +3358,23 @@ def nc_integer_group(group):
     return ["v_mov_b32_e32 v18, s45", *NC_INT_BODIES[group]]
 
 
+def sop2_lshl_add_group() -> list[str]:
+    return with_constants([
+        "s_lshl1_add_u32 s60, s44, s45",
+        "s_cselect_b32 s71, 1, 0",
+        "s_lshl2_add_u32 s61, s44, s45",
+        "s_cselect_b32 s72, 2, 0",
+        "s_lshl3_add_u32 s62, s44, s45",
+        "s_cselect_b32 s73, 4, 0",
+        "s_lshl4_add_u32 s63, s44, s45",
+        "s_cselect_b32 s74, 8, 0",
+        "v_mov_b32_e32 v12, s60",
+        "v_mov_b32_e32 v13, s61",
+        "v_mov_b32_e32 v14, s62",
+        "v_mov_b32_e32 v15, s63",
+    ])
+
+
 def pack_f16_pair(lo, hi):
     lo_b = struct.unpack("<H", struct.pack("<e", lo))[0]
     hi_b = struct.unpack("<H", struct.pack("<e", hi))[0]
@@ -3747,6 +3767,29 @@ def check_controls(directory):
     ):
         must_reject(translate, with_constants(["v_mov_b32_e32 v18, s45", bad_vop2]))
     check_nc_integer_lowering()
+    lshl_add_source = translate(sop2_lshl_add_group())
+    assert set(SOP2_LSHL_ADD_OPS) <= ACCEPTED
+    for expected in (
+        "(asuint(params[0].w) << 1u) + asuint(params[1].x)",
+        "(asuint(params[0].w) << 2u) + asuint(params[1].x)",
+        "(asuint(params[0].w) << 3u) + asuint(params[1].x)",
+        "(asuint(params[0].w) << 4u) + asuint(params[1].x)",
+        "asuint(params[0].w) >> 31u != 0u",
+        "asuint(params[0].w) >> 30u != 0u",
+        "asuint(params[0].w) >> 29u != 0u",
+        "asuint(params[0].w) >> 28u != 0u",
+    ):
+        assert expected in lshl_add_source, expected
+    for bad_lshl_add in (
+        "s_lshl0_add_u32 s62, s44, s45",
+        "s_lshl5_add_u32 s62, s44, s45",
+        "s_lshl1_add_u32 s62, s44",
+        "s_lshl2_add_u32 s62, s44, s45, s46",
+        "s_lshl3_add_u32 s62, v12, s45",
+        "s_lshl4_add_u32 s62, s44, v13",
+        "s_lshl1_add_u32 v12, s44, s45",
+    ):
+        must_reject(translate, with_constants([bad_lshl_add]))
     rgb = rgb_sample()
     translate(rgb)
     for old, new in (("v[12:14]", "v[12:15]"), ("dmask:0x7", "dmask:0xb")):
@@ -4940,6 +4983,75 @@ def check_integer_nc_draws(directory, compiler, renderer, backend):
             if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
                 raise AssertionError("Swapped sub and subrev words escaped the integer readback")
     return 0
+
+
+def check_lshl_add_u32_draw(directory, compiler, renderer, backend):
+    source = directory / "lshl_add_u32.hlsl"
+    shader = directory / "lshl_add_u32.cso"
+    program = uncompressed_export([
+        "s_lshl1_add_u32 s60, s44, s45",
+        "s_lshl2_add_u32 s61, s44, s45",
+        "s_lshl3_add_u32 s62, s44, s45",
+        "s_lshl4_add_u32 s63, s44, s45",
+        "v_mov_b32_e32 v12, s60",
+        "v_mov_b32_e32 v13, s61",
+        "v_mov_b32_e32 v14, s62",
+        "v_mov_b32_e32 v15, s63",
+    ])
+    source.write_text(lower(program, 20, 24, [1, 2, 3, 4], constant_descriptor=64,
+                            integer_export=True), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    cases = []
+    # Check normal shifted addition, shift-overflow wrap, and add-overflow wrap.
+    for name, inputs, words, status in (
+        ("oracle-mismatch", (3, 5), (11, 17, 29, 999), "mismatch"),
+        ("normal", (3, 5), (11, 17, 29, 53), "pass"),
+        ("shift-wrap", (0x80000001, 10), (12, 14, 18, 26), "pass"),
+        ("add-wrap", (1, 0xffffffff), (1, 3, 7, 15), "pass"),
+    ):
+        constants = bytearray(256)
+        struct.pack_into("<2I", constants, 12, *inputs)
+        case = directory / f"lshl-add-u32-{name}.case"
+        case.write_bytes(constants + struct.pack("<4I", *words) * 64 + b"\x01")
+        cases.append((case, status))
+    run_pixel_batch(renderer, backend, shader, cases)
+
+    # Check SCC carry-out across selective shift-overflow and add-overflow conditions.
+    scc_source = directory / "lshl_add_scc.hlsl"
+    scc_shader = directory / "lshl_add_scc.cso"
+    scc_program = uncompressed_export([
+        "s_lshl1_add_u32 s60, s44, s45",
+        "s_cselect_b32 s71, 1, 0",
+        "s_lshl2_add_u32 s61, s44, s45",
+        "s_cselect_b32 s72, 1, 0",
+        "s_lshl3_add_u32 s62, s44, s45",
+        "s_cselect_b32 s73, 1, 0",
+        "s_lshl4_add_u32 s63, s44, s45",
+        "s_cselect_b32 s74, 1, 0",
+        "v_mov_b32_e32 v12, s71",
+        "v_mov_b32_e32 v13, s72",
+        "v_mov_b32_e32 v14, s73",
+        "v_mov_b32_e32 v15, s74",
+    ])
+    scc_source.write_text(lower(scc_program, 20, 24, [1, 2, 3, 4], constant_descriptor=64,
+                                integer_export=True), encoding="ascii")
+    compile_shader(compiler, scc_source, scc_shader)
+    scc_cases = []
+    for name, inputs, words, status in (
+        ("oracle-mismatch", (1, 1), (1, 0, 0, 0), "mismatch"),
+        ("none", (1, 1), (0, 0, 0, 0), "pass"),
+        ("carry-4", (0x10000000, 0), (0, 0, 0, 1), "pass"),
+        ("carry-3-4", (0x20000000, 0), (0, 0, 1, 1), "pass"),
+        ("carry-2-3-4", (0x40000000, 0), (0, 1, 1, 1), "pass"),
+        ("carry-all-shift", (0x80000000, 0), (1, 1, 1, 1), "pass"),
+        ("carry-all-add", (1, 0xfffffffe), (1, 1, 1, 1), "pass"),
+    ):
+        constants = bytearray(256)
+        struct.pack_into("<2I", constants, 12, *inputs)
+        case = directory / f"lshl-add-scc-{name}.case"
+        case.write_bytes(constants + struct.pack("<4I", *words) * 64 + b"\x01")
+        scc_cases.append((case, status))
+    run_pixel_batch(renderer, backend, scc_shader, scc_cases)
 
 
 # v_cvt_f32_u32_e32 and v_cvt_f32_i32_e32 convert one 32-bit word to binary32, reading it unsigned
@@ -6151,6 +6263,7 @@ def check_e64_render(directory, compiler, renderer, backend):
     check_nan_class_draw(directory, compiler, renderer, backend)
     check_integer_readback_draw(directory, compiler, renderer, backend)
     check_subrev_u32_draw(directory, compiler, renderer, backend)
+    check_lshl_add_u32_draw(directory, compiler, renderer, backend)
     check_cvt_int_f32_draw(directory, compiler, renderer, backend)
     check_cvt_int_f32_e64_draw(directory, compiler, renderer, backend)
     check_cvt_float_int_draw(directory, compiler, renderer, backend)

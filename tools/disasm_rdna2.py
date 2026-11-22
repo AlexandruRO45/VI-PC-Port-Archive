@@ -135,6 +135,10 @@ SOP2_OPS = {
     0x21: ("s_lshr_b64", "Scalar logical shift right 64-bit"),
     0x22: ("s_ashr_i32", "Scalar arithmetic shift right 32-bit"),
     0x26: ("s_mul_i32", "Scalar multiply signed 32-bit"),
+    0x2e: ("s_lshl1_add_u32", "Scalar shift left 1 and add 32-bit"),
+    0x2f: ("s_lshl2_add_u32", "Scalar shift left 2 and add 32-bit"),
+    0x30: ("s_lshl3_add_u32", "Scalar shift left 3 and add 32-bit"),
+    0x31: ("s_lshl4_add_u32", "Scalar shift left 4 and add 32-bit"),
 }
 
 SOPK_OPS = {

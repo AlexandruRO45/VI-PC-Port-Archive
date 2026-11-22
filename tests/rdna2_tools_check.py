@@ -350,6 +350,18 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertEqual(classify_isa_category("v_cmp_lt_f32_e32"), "VOPC (Vector Compare)")
         self.assertEqual(classify_isa_category("v_cmpx_gt_i32_e32"), "VOPC (Vector Compare)")
 
+    def test_sop2_lshl_add_opcode_table_synthetic_forms(self):
+        from disasm_rdna2 import SOP2_OPS
+        target_ops = {0x2e, 0x2f, 0x30, 0x31}
+        for op in target_ops:
+            expected_name, _ = SOP2_OPS[op]
+            w0 = 0x80000000 | (op << 23) | (2 << 16) | (1 << 8) | 0
+            raw = struct.pack("<I", w0)
+            insns = disasm_rdna2(raw)
+            self.assertEqual(len(insns), 1, f"Failed decoding SOP2 op 0x{op:02x}")
+            self.assertEqual(insns[0]["opcode"], expected_name)
+            self.assertEqual(insns[0]["length"], 4)
+
     def test_vop2_integer_opcode_table_synthetic_forms(self):
         from disasm_rdna2 import VOP2_OPS
         target_ops = {0x16, 0x18, 0x1a, 0x1b, 0x1c, 0x1d, 0x25, 0x26, 0x27}
@@ -1351,6 +1363,10 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertTrue(is_instruction_supported("s_nand_b32 s1, s2, s3"))
         self.assertTrue(is_instruction_supported("s_nor_b32 s1, s2, s3"))
         self.assertTrue(is_instruction_supported("s_xnor_b32 s1, s2, s3"))
+        self.assertTrue(is_instruction_supported("s_lshl1_add_u32 s1, s2, s3"))
+        self.assertTrue(is_instruction_supported("s_lshl2_add_u32 s1, s2, s3"))
+        self.assertTrue(is_instruction_supported("s_lshl3_add_u32 s1, s2, s3"))
+        self.assertTrue(is_instruction_supported("s_lshl4_add_u32 s1, s2, s3"))
         for unsupported in ("v_cvt_f32_i32 v1, v2",
                             "v_cvt_f32_i32_e32 v1, v2 clamp",
                             "v_cvt_f32_u32_e64 v1, -v2",
