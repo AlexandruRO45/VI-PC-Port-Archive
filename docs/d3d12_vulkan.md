@@ -1507,6 +1507,10 @@ The trace will enumerate them.
 - `CreateCommittedResource`: allocate an aligned range in the arena for a buffer, or a separate `VkDeviceMemory`
   for an image; record the initial state. Map `D3D12_HEAP_TYPE_DEFAULT` to device-local memory, `UPLOAD`/`READBACK`
   to separate host-visible buffers. This remains the path for buffers and for any PC-style committed resource.
+- **Vulkan heap-budget diagnostics (D3D-253):** when `VK_EXT_memory_budget` is enabled, the layer logs each
+  heap's estimated usage, budget and size at device start, at power-of-two successful `VkDeviceMemory` allocation
+  counts, and after an allocation failure. These driver estimates can change with other GPU activity; the report
+  is diagnostic only and does not evict or stream resources.
 - `ID3D12Resource::GetDesc` returns the description with its defaults filled in, as the PC runtime does: `MipLevels`
   0 becomes the full chain, and `Alignment` 0 becomes the placement alignment, 64 KiB, or 4 MiB for a multisampled
   texture (an alignment the description asked for is kept). **Implemented** and compared field by field with the

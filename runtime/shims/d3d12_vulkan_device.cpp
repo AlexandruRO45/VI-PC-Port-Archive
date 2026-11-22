@@ -29,6 +29,7 @@
 #include <atomic>
 #include <cctype>
 #include <climits>
+#include <cstdint>
 #include <cstdlib>
 #include <iterator>
 #include <map>
@@ -359,6 +360,9 @@ struct DeviceState {
     VulkanDeviceInfo info;
     std::unique_ptr<leonida::VulkanContext> context;
     VkPhysicalDeviceMemoryProperties memory{};
+    PFN_vkGetPhysicalDeviceMemoryProperties2 memory_properties2 = nullptr;
+    mutable std::atomic<std::uint64_t> memory_allocation_count{0};
+    mutable std::mutex memory_budget_mutex;
     // D3D-96: upload-heap buffers prefer DEVICE_LOCAL | HOST_VISIBLE memory, so the GPU reads them from VRAM. Only
     // with Resizable BAR (leonida::resizable_bar); LEONIDA_UPLOAD_SYSMEM=1 keeps them in system memory to compare.
     bool upload_in_vram = false;
@@ -918,6 +922,35 @@ struct DeviceState {
         return properties3.optimalTilingFeatures & VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
     }
 
+    void report_memory_budget(const char* reason, VkDeviceSize request = 0,
+                              std::uint64_t allocations = 0) const {
+        if (!info.memory_budget || !memory_properties2) return;
+        std::lock_guard lock(memory_budget_mutex);
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &budget};
+        memory_properties2(info.physical, &properties);
+        if (allocations)
+            std::fprintf(stderr,
+                         "[rt] d3d12: Vulkan memory budget (%s; after %llu successful VkDeviceMemory allocations)\n",
+                         reason, static_cast<unsigned long long>(allocations));
+        else if (request)
+            std::fprintf(stderr, "[rt] d3d12: Vulkan memory budget (%s; request %llu bytes)\n", reason,
+                         static_cast<unsigned long long>(request));
+        else
+            std::fprintf(stderr, "[rt] d3d12: Vulkan memory budget (%s)\n", reason);
+        constexpr VkDeviceSize mib = 1024 * 1024;
+        for (std::uint32_t i = 0; i < properties.memoryProperties.memoryHeapCount; ++i) {
+            const VkMemoryHeap& heap = properties.memoryProperties.memoryHeaps[i];
+            const char* kind = (heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) ? "device-local" : "non-local";
+            std::fprintf(stderr,
+                         "[rt] d3d12:   heap %u (%s): usage %llu MiB / budget %llu MiB (size %llu MiB)\n", i, kind,
+                         static_cast<unsigned long long>(budget.heapUsage[i] / mib),
+                         static_cast<unsigned long long>(budget.heapBudget[i] / mib),
+                         static_cast<unsigned long long>(heap.size / mib));
+        }
+    }
+
     // A memory type with `required`, preferring one that also has `preferred`, in a heap large enough for the
     // allocation (leonida::memory_type_order). `chosen`, when given, receives the property flags of the type the
     // memory came from.
@@ -935,9 +968,13 @@ struct DeviceState {
             VkDeviceMemory out = VK_NULL_HANDLE;
             if (context->vk.vkAllocateMemory(info.device, &allocate, nullptr, &out) == VK_SUCCESS) {
                 if (chosen) *chosen = memory.memoryTypes[i].propertyFlags;
+                const std::uint64_t allocations = memory_allocation_count.fetch_add(1, std::memory_order_relaxed) + 1;
+                if ((allocations & (allocations - 1)) == 0)
+                    report_memory_budget("allocation milestone", 0, allocations);
                 return out;
             }
         }
+        report_memory_budget("allocation failed", requirements.size);
         return VK_NULL_HANDLE;
     }
 };
@@ -2921,6 +2958,8 @@ public:
         }
         const auto memory_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
             info.get_instance_proc(info.instance, "vkGetPhysicalDeviceMemoryProperties"));
+        state_.memory_properties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(
+            info.get_instance_proc(info.instance, "vkGetPhysicalDeviceMemoryProperties2"));
         const auto device_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
             info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"));
         const auto queue_families = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
@@ -2930,6 +2969,12 @@ public:
             return;
         state_.r9g9b9e5_uav_emulated = state_.probe_r9g9b9e5_uav_emulation();
         memory_properties(info.physical, &state_.memory);
+        if (!info.memory_budget)
+            std::fprintf(stderr, "[rt] d3d12: VK_EXT_memory_budget is not enabled; heap usage telemetry is off\n");
+        else if (!state_.memory_properties2)
+            std::fprintf(stderr,\n                         "[rt] d3d12: vkGetPhysicalDeviceMemoryProperties2 is unavailable; heap usage telemetry is off\n");
+        else
+            state_.report_memory_budget("device start");
         {
             char text[4] = {};
             size_t length = 0;
@@ -5882,6 +5927,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     VkPhysicalDeviceConditionalRenderingFeaturesEXT conditional{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
     bool has_swapchain = false;
+    bool has_memory_budget = false;
     VkPhysicalDeviceAccelerationStructureFeaturesKHR as_features{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
     VkPhysicalDeviceRayQueryFeaturesKHR rq_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
@@ -5896,6 +5942,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
                 VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &conditional};
                 vkGetPhysicalDeviceFeatures2(info.physical, &features);
                 info.conditional_rendering = conditional.conditionalRendering == VK_TRUE;
+            } else if (!std::strcmp(e.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
+                has_memory_budget = true;
             } else if (!std::strcmp(e.extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) {
                 has_swapchain = true;
             } else if (!std::strcmp(e.extensionName, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
@@ -5906,6 +5954,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
                 has_rq = true;
             }
         }
+        info.memory_budget = has_memory_budget;
         if (has_as && has_dho && has_rq && chosen12.bufferDeviceAddress) {
             as_features.pNext = &rq_features;
             VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &as_features};
@@ -6127,6 +6176,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (info.image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);
     if (info.host_image_copy) device_extensions.push_back(host_image_copy_name);
+    if (info.memory_budget) device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
     if (info.shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 #endif
