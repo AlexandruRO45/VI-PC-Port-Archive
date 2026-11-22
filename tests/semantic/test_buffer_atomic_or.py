@@ -249,6 +249,45 @@ class Program:
 
 
 # ---------------------------------------------------------------------------
+# Condition Codes, Status Flags, and Carry/Borrow Isolation
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class BufferConditionCodes:
+    """Condition codes reflecting operation result values."""
+    zero: bool
+    negative: bool
+    positive: bool
+    all_ones: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class BufferStatusFlags:
+    """Status flags reflecting memory bounds and addressing validity."""
+    in_bounds: bool
+    oob_fault: bool
+
+
+def compute_buffer_condition_codes(val: int) -> BufferConditionCodes:
+    """Computes arithmetic/logical condition codes from a 32-bit dword value."""
+    val32 = val & MASK32
+    return BufferConditionCodes(
+        zero=(val32 == 0),
+        negative=bool(val32 & SIGN_BIT32),
+        positive=(val32 > 0 and not bool(val32 & SIGN_BIT32)),
+        all_ones=(val32 == MASK32),
+    )
+
+
+def compute_buffer_status_flags(in_bounds: bool) -> BufferStatusFlags:
+    """Computes buffer status flags reflecting memory bounds validation."""
+    return BufferStatusFlags(
+        in_bounds=in_bounds,
+        oob_fault=not in_bounds,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Deterministic Scalar Instruction Interpreter
 # ---------------------------------------------------------------------------
 
@@ -258,8 +297,11 @@ class ScalarBufferInterpreter:
     def __init__(self, mem_size: int = 65536) -> None:
         self.vgprs: list[int] = [0] * 256
         self.sgprs: list[int] = [0] * 106
+        self.vcc: int = 0
         self.mem: BufferMemory = BufferMemory(mem_size)
         self.trace: list[str] = []
+        self.last_condition_codes: BufferConditionCodes | None = None
+        self.last_status_flags: BufferStatusFlags | None = None
 
     def read_reg_u32(self, kind: RegKind, idx: int) -> int:
         if idx < 0 or (kind == RegKind.VGPR and idx >= 256) or (kind == RegKind.SGPR and idx >= 106):
@@ -314,6 +356,13 @@ class ScalarBufferInterpreter:
 
         if inst.mods.glc:
             self.write_reg_u32(RegKind.VGPR, inst.vdata.index, ret_val)
+
+        # Buffer atomic operations compute condition codes on return value / operand
+        self.last_condition_codes = compute_buffer_condition_codes(
+            ret_val if inst.mods.glc else vdata
+        )
+        self.last_status_flags = compute_buffer_status_flags(in_bounds)
+        # Note: buffer atomic instructions never modify VCC; carry/borrow register remains untouched.
 
         self.trace.append(f"{inst.to_assembly()} => ret={ret_val:#010x}, in_bounds={in_bounds}")
         return ret_val, in_bounds
@@ -923,6 +972,114 @@ class TestBufferAtomicOrRegisterAliasing(unittest.TestCase):
         # Inactive lanes (4..31) preserve their initial v0 (16)
         for lane in range(4, 32):
             self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), 16)
+
+
+class TestBufferAtomicOrConditionCodes(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow isolation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarBufferInterpreter(mem_size=4096)
+        self.desc = BufferResourceDescriptor(
+            base_address=0,
+            stride=0,
+            num_records=1024,
+        )
+        self.interp.set_buffer_descriptor(4, self.desc)
+
+    def test_condition_codes_zero_pos_neg_all_ones(self) -> None:
+        # Pre-seed memory at 0 with 0
+        self.interp.mem.write_u32(0, 0)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 0x10)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_OR,
+            vdata=Register(RegKind.VGPR, 0, count=1),
+            vaddr=Register(RegKind.VGPR, 1, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        # Pre-op return value is 0 => zero=True
+        self.interp.step(inst)
+        cc_zero = self.interp.last_condition_codes
+        self.assertIsNotNone(cc_zero)
+        assert cc_zero is not None
+        self.assertTrue(cc_zero.zero)
+        self.assertFalse(cc_zero.negative)
+        self.assertFalse(cc_zero.positive)
+        self.assertFalse(cc_zero.all_ones)
+
+        # Next OR: pre-op is 0x10 (positive)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 0x80000000)
+        self.interp.step(inst)
+        cc_pos = self.interp.last_condition_codes
+        self.assertIsNotNone(cc_pos)
+        assert cc_pos is not None
+        self.assertFalse(cc_pos.zero)
+        self.assertFalse(cc_pos.negative)
+        self.assertTrue(cc_pos.positive)
+
+        # Next OR: pre-op now has bit 31 set (0x80000010) => negative=True
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 0x7FFFFFEF)
+        self.interp.step(inst)
+        cc_neg = self.interp.last_condition_codes
+        self.assertIsNotNone(cc_neg)
+        assert cc_neg is not None
+        self.assertTrue(cc_neg.negative)
+        self.assertFalse(cc_neg.positive)
+
+        # Next OR: pre-op is 0xFFFFFFFF => all_ones=True
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 0)
+        self.interp.step(inst)
+        cc_all = self.interp.last_condition_codes
+        self.assertIsNotNone(cc_all)
+        assert cc_all is not None
+        self.assertTrue(cc_all.all_ones)
+
+    def test_status_flags_in_bounds_and_oob(self) -> None:
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 1)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 100)  # in bounds (< 1024)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_OR,
+            vdata=Register(RegKind.VGPR, 0, count=1),
+            vaddr=Register(RegKind.VGPR, 1, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        self.interp.step(inst)
+        flags_in = self.interp.last_status_flags
+        self.assertIsNotNone(flags_in)
+        assert flags_in is not None
+        self.assertTrue(flags_in.in_bounds)
+        self.assertFalse(flags_in.oob_fault)
+
+        # OOB access
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 2000)
+        self.interp.step(inst)
+        flags_oob = self.interp.last_status_flags
+        self.assertIsNotNone(flags_oob)
+        assert flags_oob is not None
+        self.assertFalse(flags_oob.in_bounds)
+        self.assertTrue(flags_oob.oob_fault)
+
+    def test_carry_borrow_vcc_isolation(self) -> None:
+        canary = 0xFEEDFACECAFEBEEF
+        self.interp.vcc = canary
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_OR,
+            vdata=Register(RegKind.VGPR, 0, count=1),
+            vaddr=Register(RegKind.VGPR, 1, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        self.interp.step(inst)
+        # VCC carry/borrow register must be strictly untouched
+        self.assertEqual(self.interp.vcc, canary)
 
 
 if __name__ == "__main__":
