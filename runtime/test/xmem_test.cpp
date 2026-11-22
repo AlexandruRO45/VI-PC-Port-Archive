@@ -232,6 +232,15 @@ void test_console_virtual_alloc(XMemVirtualAllocFn xmem_alloc) {
     const auto alloc = reinterpret_cast<VirtualAllocFn>(rt::shims::find("kernel32.dll", "VirtualAlloc"));
     const auto base_alloc = reinterpret_cast<VirtualAllocFn>(rt::shims::find("kernelbase.dll", "VirtualAlloc"));
     check(alloc && base_alloc == alloc, "kernel32 and kernelbase bind to the same VirtualAlloc shim");
+    for (const char* dll : {"api-ms-win-core-memory-l1-1-0.dll", "api-ms-win-core-memory-l1-1-1.dll",
+                            "api-ms-win-core-memory-l1-1-2.dll", "api-ms-win-core-memory-l1-1-3.dll"}) {
+        const auto api_alloc = reinterpret_cast<VirtualAllocFn>(rt::shims::find(dll, "VirtualAlloc"));
+        check(api_alloc && api_alloc == alloc, "memory API-set import binds to the VirtualAlloc shim");
+        if (api_alloc) {
+            check_console_allocation(api_alloc(nullptr, 0x1000, type | graphics, PAGE_READWRITE), 0x1000,
+                                     "tagged allocation through the memory API-set import");
+        }
+    }
 
     if (alloc) {
         check_console_allocation(alloc(nullptr, 0x1000, type | graphics, PAGE_READWRITE), 0x1000,
@@ -243,6 +252,12 @@ void test_console_virtual_alloc(XMemVirtualAllocFn xmem_alloc) {
         check_console_allocation(alloc(nullptr, 1, type | graphics | console_64k, PAGE_READWRITE), 0x10000,
                                  "a tagged 64 KiB reservation uses the guest page size");
 
+        SetLastError(0);
+        void* const no_operation = alloc(nullptr, 1, graphics | console_64k, PAGE_READWRITE);
+        check(!no_operation && GetLastError() == ERROR_INVALID_PARAMETER,
+              "tagged Win32 VirtualAlloc still requires an allocation operation");
+        if (no_operation) VirtualFree(no_operation, 0, MEM_RELEASE);
+
         void* const host = VirtualAlloc(nullptr, 0x1000, type, 0);
         const DWORD host_error = GetLastError();
         void* const plain = alloc(nullptr, 0x1000, type, 0);
@@ -253,6 +268,8 @@ void test_console_virtual_alloc(XMemVirtualAllocFn xmem_alloc) {
     }
 
     if (xmem_alloc) {
+        check_console_allocation(xmem_alloc(nullptr, 1, console_64k, 0, PAGE_READWRITE), 0x10000,
+                                 "XMemVirtualAlloc retains its default reserve and commit");
         check_console_allocation(xmem_alloc(nullptr, 1, type | graphics | title | console_64k, 0,
                                             PAGE_READWRITE | console_protect),
                                  0x10000, "XMemVirtualAlloc also accepts the console allocation and protection tags");

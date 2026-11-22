@@ -90,8 +90,9 @@ constexpr DWORD kXmemLargePages = 0x20000000;
 constexpr DWORD kXmem64kPages = 0x20400000;
 constexpr DWORD kXmemPageModeMask = kXmem64kPages;
 constexpr SIZE_T kXmemPageSize64k = 0x10000;
+constexpr DWORD kVirtualAllocOperations = MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_RESET_UNDO;
 constexpr DWORD kXmemHostAllocationTypeMask =
-    MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN | MEM_WRITE_WATCH | 0x01000000;
+    kVirtualAllocOperations | MEM_TOP_DOWN | MEM_WRITE_WATCH;
 // Console-only allocation annotations. Preserve the caller's ordinary Win32 protection bits.
 constexpr DWORD kConsoleAllocationTags = 0x10000000 | 0x40000000;  // MEM_GRAPHICS | MEM_TITLE
 constexpr DWORD kConsoleProtectionTag = 0x04000000;
@@ -177,6 +178,11 @@ void* WINAPI title_virtual_alloc(void* address, SIZE_T size, DWORD allocation_ty
     // An explicit console tag distinguishes guest page modes from overlapping Win32 flags such as MEM_PHYSICAL.
     const bool console = (allocation_type & kConsoleAllocationTags) || (protect & kConsoleProtectionTag);
     if (console && (allocation_type & kXmemPageModeMask)) {
+        // VirtualAlloc requires an explicit operation. Only the XMem API defaults to reserve and commit.
+        if (!(allocation_type & kVirtualAllocOperations)) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return nullptr;
+        }
         return XMemVirtualAlloc(address, size, allocation_type, 0, protect);
     }
     return VirtualAlloc(address, size, allocation_type & ~kConsoleAllocationTags, protect & ~kConsoleProtectionTag);
@@ -196,6 +202,10 @@ UINT WINAPI XMemResetWriteWatch(void* base_address, SIZE_T region_size) {
 SHIM_TABLE(xmem,
     {"kernel32.dll", "VirtualAlloc", reinterpret_cast<void*>(&title_virtual_alloc)},
     {"kernelbase.dll", "VirtualAlloc", reinterpret_cast<void*>(&title_virtual_alloc)},
+    {"api-ms-win-core-memory-l1-1-0.dll", "VirtualAlloc", reinterpret_cast<void*>(&title_virtual_alloc)},
+    {"api-ms-win-core-memory-l1-1-1.dll", "VirtualAlloc", reinterpret_cast<void*>(&title_virtual_alloc)},
+    {"api-ms-win-core-memory-l1-1-2.dll", "VirtualAlloc", reinterpret_cast<void*>(&title_virtual_alloc)},
+    {"api-ms-win-core-memory-l1-1-3.dll", "VirtualAlloc", reinterpret_cast<void*>(&title_virtual_alloc)},
     {"xmem.dll", "XMemAlloc", reinterpret_cast<void*>(&XMemAlloc)},
     {"xmem.dll", "XMemFree", reinterpret_cast<void*>(&XMemFree)},
     {"xmem.dll", "XMemVirtualQuery", reinterpret_cast<void*>(&XMemVirtualQuery)},
