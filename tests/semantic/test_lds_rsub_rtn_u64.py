@@ -989,5 +989,60 @@ class TestLDSMemoryAndOracle64(unittest.TestCase):
         self.assertEqual(mem.read_qword(0x50), 60)
 
 
+class TestLdsRsubRtnU64BoundaryExtremes(unittest.TestCase):
+    """Unit tests for boundary extremes, address wrapping, and IEEE 754 float64 bit pattern handling."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory64(DEFAULT_LDS_SIZE_BYTES)
+
+    def test_integer_extremes_and_overflow(self) -> None:
+        # 0 - 0 = 0
+        self.assertEqual(ref_ds_rsub_rtn_u64(0, 0), (0, 0))
+        # 0 - 1 = 0xFFFFFFFFFFFFFFFF
+        self.assertEqual(ref_ds_rsub_rtn_u64(1, 0), (1, 0xFFFFFFFFFFFFFFFF))
+        # 0 - 0xFFFFFFFFFFFFFFFF = 1
+        self.assertEqual(ref_ds_rsub_rtn_u64(0xFFFFFFFFFFFFFFFF, 0), (0xFFFFFFFFFFFFFFFF, 1))
+        # 0x7FFFFFFFFFFFFFFF - 0x8000000000000000 = 0xFFFFFFFFFFFFFFFF
+        self.assertEqual(ref_ds_rsub_rtn_u64(0x8000000000000000, 0x7FFFFFFFFFFFFFFF), (0x8000000000000000, 0xFFFFFFFFFFFFFFFF))
+        # 0x8000000000000000 - 0x7FFFFFFFFFFFFFFF = 1
+        self.assertEqual(ref_ds_rsub_rtn_u64(0x7FFFFFFFFFFFFFFF, 0x8000000000000000), (0x7FFFFFFFFFFFFFFF, 1))
+        # 0xFFFFFFFFFFFFFFFF - 0xFFFFFFFFFFFFFFFF = 0
+        self.assertEqual(ref_ds_rsub_rtn_u64(0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF), (0xFFFFFFFFFFFFFFFF, 0))
+
+    def test_float64_and_nan_bit_patterns_preserve_integer_arithmetic(self) -> None:
+        # ds_rsub_rtn_u64 operates purely bitwise, preserving double/NaN bit patterns
+        patterns = [
+            0x7FF8000000000000,  # Double-precision quiet NaN
+            0x7FF0000000000001,  # Double-precision signaling NaN
+            0x7FF0000000000000,  # Double-precision +Infinity
+            0xFFF0000000000000,  # Double-precision -Infinity
+            0x0000000000000001,  # Subnormal / Denormal double
+            0x8000000000000000,  # Negative zero (-0.0)
+        ]
+        addr = 0
+        vdata0 = 0x0123456789ABCDEF
+        for pat in patterns:
+            self.lds.write_qword(addr, pat)
+            old_val, new_mem = self.lds.atomic_rsub_rtn_u64(vaddr=addr, vdata0=vdata0)
+            self.assertEqual(old_val, pat)
+            expected_new = (vdata0 - pat) & MASK64
+            self.assertEqual(new_mem, expected_new)
+            self.assertEqual(self.lds.read_qword(addr), expected_new)
+            addr += 8
+
+    def test_address_boundary_extremes(self) -> None:
+        # Max 16-bit offset (0xFFFF = 65535)
+        eff_addr = calc_lds_effective_address(vaddr=0x1000, offset=0xFFFF)
+        self.assertEqual(eff_addr, 0x1000 + 65535)
+
+        # 32-bit address wrapping
+        eff_wrap = calc_lds_effective_address(vaddr=0xFFFFFFFF, offset=1)
+        self.assertEqual(eff_wrap, 0)
+
+        # Max qword index wraps within LDS capacity
+        idx = calc_lds_qword_index(eff_addr=0xFFFFFFF8, capacity_qwords=8192)
+        self.assertEqual(idx, 8191)
+
+
 if __name__ == "__main__":
     unittest.main()
