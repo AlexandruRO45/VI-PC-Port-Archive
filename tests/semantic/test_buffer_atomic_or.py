@@ -323,6 +323,91 @@ class ScalarBufferInterpreter:
         return [self.step(inst) for inst in prog.instructions]
 
 
+# ---------------------------------------------------------------------------
+# SIMD Multi-Lane Wavefront Interpreter (Wave32 and Wave64)
+# ---------------------------------------------------------------------------
+
+class SIMDBufferWavefrontInterpreter:
+    """SIMD wavefront interpreter supporting Wave32 and Wave64 execution modes."""
+
+    def __init__(self, wave_size: int = 32, mem_size: int = 65536) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Wave size must be 32 or 64, got: {wave_size}")
+        self.wave_size: int = wave_size
+        self.vgprs: list[list[int]] = [[0] * 256 for _ in range(wave_size)]
+        self.sgprs: list[int] = [0] * 106
+        self.exec_mask: int = (1 << wave_size) - 1
+        self.mem: BufferMemory = BufferMemory(mem_size)
+
+    def read_lane_reg_u32(self, lane: int, kind: RegKind, idx: int) -> int:
+        if kind == RegKind.VGPR:
+            return self.vgprs[lane][idx] & MASK32
+        return self.sgprs[idx] & MASK32
+
+    def write_lane_reg_u32(self, lane: int, kind: RegKind, idx: int, val: int) -> None:
+        val32 = val & MASK32
+        if kind == RegKind.VGPR:
+            self.vgprs[lane][idx] = val32
+        else:
+            self.sgprs[idx] = val32
+
+    def set_exec_mask(self, mask: int) -> None:
+        limit = (1 << self.wave_size) - 1
+        self.exec_mask = mask & limit
+
+    def set_buffer_descriptor(self, idx: int, desc: BufferResourceDescriptor) -> None:
+        d0, d1, d2, d3 = desc.to_dwords()
+        self.sgprs[idx] = d0
+        self.sgprs[idx + 1] = d1
+        self.sgprs[idx + 2] = d2
+        self.sgprs[idx + 3] = d3
+
+    def get_buffer_descriptor(self, idx: int) -> BufferResourceDescriptor:
+        return BufferResourceDescriptor.from_dwords(
+            self.sgprs[idx],
+            self.sgprs[idx + 1],
+            self.sgprs[idx + 2],
+            self.sgprs[idx + 3],
+        )
+
+    def step(self, inst: Instruction) -> list[tuple[int | None, bool]]:
+        """Executes the instruction across all active lanes of the wavefront."""
+        desc = self.get_buffer_descriptor(inst.srsrc.index)
+        soffset = (
+            self.sgprs[inst.soffset.index]
+            if isinstance(inst.soffset, Register)
+            else inst.soffset
+        )
+
+        results: list[tuple[int | None, bool]] = []
+        for lane in range(self.wave_size):
+            lane_active = bool(self.exec_mask & (1 << lane))
+            if not lane_active:
+                results.append((None, False))
+                continue
+
+            vdata = self.vgprs[lane][inst.vdata.index]
+            vaddr = self.vgprs[lane][inst.vaddr.index]
+
+            ret_val, in_bounds = ref_buffer_atomic_or(
+                self.mem,
+                desc,
+                soffset=soffset,
+                vaddr=vaddr,
+                or_val=vdata,
+                inst_offset=inst.mods.offset,
+                glc=inst.mods.glc,
+                offen=inst.mods.offen,
+            )
+
+            if inst.mods.glc:
+                self.vgprs[lane][inst.vdata.index] = ret_val
+
+            results.append((ret_val, in_bounds))
+
+        return results
+
+
 class TestBufferAtomicOrOracle(unittest.TestCase):
     """Unit tests for the reference mathematical oracle and architectural model."""
 
@@ -604,6 +689,123 @@ class TestBufferAtomicOrScalarInterpreter(unittest.TestCase):
         self.assertTrue(in_bounds)
         self.assertEqual(ret, 0xF0)
         self.assertEqual(self.interp.mem.read_u32(48), 0xFF)
+
+
+class TestBufferAtomicOrSIMD(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def setUp(self) -> None:
+        self.desc = BufferResourceDescriptor(
+            base_address=0,
+            stride=0,
+            num_records=4096,
+        )
+
+    def test_wave32_divergent_addresses(self) -> None:
+        simd = SIMDBufferWavefrontInterpreter(wave_size=32, mem_size=4096)
+        simd.set_buffer_descriptor(4, self.desc)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_OR,
+            vdata=Register(RegKind.VGPR, 0, count=1),
+            vaddr=Register(RegKind.VGPR, 1, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=False),
+        )
+        for lane in range(32):
+            val = 1 << lane
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 0, val)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 1, lane * 4)
+
+        results = simd.step(inst)
+        self.assertEqual(len(results), 32)
+        for lane in range(32):
+            self.assertTrue(results[lane][1])
+            self.assertEqual(simd.mem.read_u32(lane * 4), 1 << lane)
+
+    def test_wave64_convergent_atomic_accumulation(self) -> None:
+        # All 64 lanes atomically OR into address 0:
+        # Lanes 0..31 set bit (1 << lane); lanes 32..63 set bit (1 << (lane - 32))
+        simd = SIMDBufferWavefrontInterpreter(wave_size=64, mem_size=4096)
+        simd.set_buffer_descriptor(4, self.desc)
+        simd.mem.write_u32(0, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_OR,
+            vdata=Register(RegKind.VGPR, 0, count=1),
+            vaddr=Register(RegKind.VGPR, 1, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        for lane in range(64):
+            bit_val = 1 << (lane % 32)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 0, bit_val)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 1, 0)
+
+        results = simd.step(inst)
+        # All 32 bits must have been set in memory => 0xFFFFFFFF
+        self.assertEqual(simd.mem.read_u32(0), 0xFFFFFFFF)
+        # First lane to execute must have received pre-op initial value (0)
+        self.assertEqual(results[0][0], 0)
+
+    def test_wave32_exec_masking_partial_lanes(self) -> None:
+        simd = SIMDBufferWavefrontInterpreter(wave_size=32, mem_size=4096)
+        simd.set_buffer_descriptor(4, self.desc)
+        exec_mask = 0x000000FF  # Only lanes 0..7 active
+        simd.set_exec_mask(exec_mask)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_OR,
+            vdata=Register(RegKind.VGPR, 0, count=1),
+            vaddr=Register(RegKind.VGPR, 1, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        initial_val = 0x10000000
+        for lane in range(32):
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 0, 0x01)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 1, lane * 4)
+            simd.mem.write_u32(lane * 4, initial_val)
+
+        results = simd.step(inst)
+        for lane in range(32):
+            if lane < 8:
+                self.assertEqual(results[lane][0], initial_val)
+                self.assertEqual(simd.mem.read_u32(lane * 4), initial_val | 0x01)
+                self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), initial_val)
+            else:
+                self.assertIsNone(results[lane][0])
+                # Memory untouched for inactive lanes
+                self.assertEqual(simd.mem.read_u32(lane * 4), initial_val)
+                # Register vdata untouched for inactive lanes
+                self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), 0x01)
+
+    def test_wave64_exec_masking_all_inactive(self) -> None:
+        simd = SIMDBufferWavefrontInterpreter(wave_size=64, mem_size=4096)
+        simd.set_buffer_descriptor(4, self.desc)
+        simd.set_exec_mask(0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_OR,
+            vdata=Register(RegKind.VGPR, 0, count=1),
+            vaddr=Register(RegKind.VGPR, 1, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        simd.mem.write_u32(0, 0x55555555)
+        for lane in range(64):
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 0, 0xAAAAAAAA)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 1, 0)
+
+        results = simd.step(inst)
+        self.assertEqual(results, [(None, False)] * 64)
+        self.assertEqual(simd.mem.read_u32(0), 0x55555555)
+        for lane in range(64):
+            self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), 0xAAAAAAAA)
 
 
 if __name__ == "__main__":
