@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 
+import bcpack_mode6_vector as mode6
 from pixel_aot_check import assembly, translate
 from bc7_tiles import linearize_4k_s
 
@@ -84,6 +85,51 @@ def write_patterned_mip(work: Path, width: int, height: int) -> Path:
     return case
 
 
+def check_band_limits(work: Path, compiler: str, renderer: str, backend: str, copy_source: str) -> None:
+    # Replace chosen pixels of a magnified two-texel mip with a texel fetched
+    # at its center, so every adapter returns the same readback. A center is
+    # within 1/512 texel below the boundary from pixel 2044 of 4096 (2048x)
+    # and exactly on that limit at pixel 255 of 512 (256x).
+    first, second = "first", "second"
+    mixed = "float4(first.r, second.g, first.b, second.a)"
+    controls = (
+        # name, vertical, replaced pixels, returned color, expected first mismatch
+        ("inside", False, "(size.x == 4096 && pixel.x == 2044) || (size.x == 512 && pixel.x == 255)", second, None),
+        ("outside", False, "size.x == 4096 && pixel.x == 2043", second, "pixel_mismatch x=2043 y=0"),
+        ("outside-tie", False, "size.x == 512 && pixel.x == 254", second, "pixel_mismatch x=254 y=0"),
+        ("mixed", False, "size.x == 4096 && pixel.x == 2044", mixed, "pixel_mismatch x=2044 y=0"),
+        ("previous", False, "size.x == 4096 && pixel.x == 2048", first, "pixel_mismatch x=2048 y=0"),
+        ("edge", False, "size.x == 4096 && pixel.x == 4095", first, "pixel_mismatch x=4095 y=0"),
+        ("inside-y", True, "size.y == 4096 && pixel.y == 2044", second, None),
+        ("outside-y", True, "size.y == 4096 && pixel.y == 2043", second, "pixel_mismatch x=0 y=2043"),
+    )
+    for name, vertical, condition, color, mismatch in controls:
+        centers = ("0.5, 0.25", "0.5, 0.75") if vertical else ("0.25, 0.5", "0.75, 0.5")
+        text, shader = work / f"band-{name}.hlsl", work / f"band-{name}.cso"
+        text.write_text("#define main copy_pixel\n" + copy_source + f"""
+#undef main
+float4 main(float2 uv : TEXCOORD0, float4 position : SV_Position) : SV_Target0 {{
+    float4 original = copy_pixel(uv);
+    float4 first = copy_pixel(float2({centers[0]}));
+    float4 second = copy_pixel(float2({centers[1]}));
+    uint2 size = uint2(round(1.0 / float2(ddx(uv.x), ddy(uv.y))));
+    uint2 pixel = uint2(position.xy);
+    if ({condition}) return {color};
+    return original;
+}}
+""", encoding="ascii")
+        subprocess.run([compiler, "-T", "ps_6_0", "-E", "main", "-Fo", shader, text], check=True)
+        width, height = (4, 4096) if vertical else (4096, 4)
+        levels = [write_patterned_mip(work, max(1, width >> level), max(1, height >> level)) for level in (11, 12)]
+        result = subprocess.run([renderer, backend, "--check-bc7-tail", shader, "11",
+                                 "--base-size", str(width), str(height), *levels], capture_output=True, text=True)
+        if mismatch is None:
+            if result.returncode:
+                raise AssertionError(f"Band control {name}: the next texel must be accepted:\n{result.stderr}")
+        elif result.returncode != 1 or mismatch not in result.stderr.splitlines():
+            raise AssertionError(f"Band control {name}: expected {mismatch}:\n{result.stderr}")
+
+
 def main():
     compiler, renderer, backend = sys.argv[1:]
     with tempfile.TemporaryDirectory() as directory:
@@ -100,6 +146,9 @@ def main():
             return result.returncode
         assert output.read_bytes() == expected
         check_all_modes(work, renderer, backend, shader)
+        vector = work / "bcpack-mode6.case"
+        vector.write_bytes(struct.pack("<4sII", b"BC7C", 4, 4) + mode6.BLOCK + mode6.RGBA)
+        subprocess.run([renderer, backend, "--check-bc7", shader, vector], check=True)
         lower = work / "mip1.case"
         header, rows, expected = fixture(10, 9)
         lower.write_bytes(header + rows + expected)
@@ -163,6 +212,26 @@ def main():
                 expected_draw = f"requested_mip={mip} sampled_mip={max(first, mip)} pixels={pixels} "
                 if expected_draw not in result.stdout:
                     raise AssertionError(f"Missing verified draw for {width}x{height}: {expected_draw}")
+        # Drawing the 2x1 mip of 4096x4 at 4096x4 puts pixels 2044-2047 within
+        # 1/512 texel of the texel boundary, where 8-bit fixed-point addressing
+        # may select the second texel. A 1/64-texel shift moves the first changed
+        # pixel to 2016 (2012 with 8-bit snapping), which must still be rejected.
+        strip = [write_patterned_mip(work, 4096 >> level, 1) for level in (11, 12)]
+        strip_args = ["11", "--base-size", "4096", "4", *strip]
+        shifted_source, shifted = work / "shifted.hlsl", work / "shifted.cso"
+        shifted_source.write_text("#define main copy_pixel\n" + source.read_text(encoding="ascii") + """
+#undef main
+float4 main(float2 uv : TEXCOORD0) : SV_Target0 {
+    return copy_pixel(uv + float2(1.0 / 128, 0));
+}
+""", encoding="ascii")
+        subprocess.run([compiler, "-T", "ps_6_0", "-E", "main", "-Fo", shifted, shifted_source], check=True)
+        wrong = subprocess.run([renderer, backend, "--check-bc7-tail", shifted, *strip_args],
+                               capture_output=True, text=True)
+        allowed = [f"pixel_mismatch x={x} y=0" for x in range(2012, 2017)]
+        if wrong.returncode != 1 or not any(line in allowed for line in wrong.stderr.splitlines()):
+            raise AssertionError(f"A texel shift beyond the snapping band must fail near x=2016:\n{wrong.stderr}")
+        check_band_limits(work, compiler, renderer, backend, source.read_text(encoding="ascii"))
         # The 29x19 fallback has an exact point-sample tie at (14, 0).
         # Combine channels from the two texels on either side only at that pixel.
         boundary_levels = [write_patterned_mip(work, max(1, 116 >> level), max(1, 76 >> level))
