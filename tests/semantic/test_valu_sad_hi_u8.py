@@ -40,6 +40,8 @@ Mathematical Properties and Bounds:
     packing two independent 4-element 8-bit SAD evaluations into one 32-bit register.
 """
 
+from dataclasses import dataclass
+from enum import Enum, auto
 from typing import List, Optional, Tuple, Union
 import unittest
 
@@ -129,6 +131,79 @@ def ref_sad_hi_u8_full(s0: int, s1: int, s2: int) -> Tuple[int, int, int]:
     dst = full & MASK32
     carry = (full >> 32) & 1
     return dst, carry, full
+
+
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    """Register and operand architectural types."""
+    VGPR = auto()
+    SGPR = auto()
+    LITERAL = auto()
+
+
+@dataclass(frozen=True)
+class Operand:
+    """Architectural register operand or inline constant expression."""
+    reg_type: RegType
+    index: int = 0
+    literal_value: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.reg_type == RegType.VGPR:
+            if not (0 <= self.index <= 255):
+                raise ValueError(f"VGPR index {self.index} out of range [0, 255]")
+        elif self.reg_type == RegType.SGPR:
+            if not (0 <= self.index <= 105):
+                raise ValueError(f"SGPR index {self.index} out of range [0, 105]")
+        elif self.reg_type == RegType.LITERAL:
+            if self.literal_value is None:
+                raise ValueError("Literal operand requires literal_value")
+            if not (0 <= self.literal_value <= MASK32):
+                raise ValueError(f"Literal value {self.literal_value:#x} out of range [0, 0xFFFFFFFF]")
+
+    @classmethod
+    def vgpr(cls, index: int) -> Operand:
+        return cls(RegType.VGPR, index=index)
+
+    @classmethod
+    def sgpr(cls, index: int) -> Operand:
+        return cls(RegType.SGPR, index=index)
+
+    @classmethod
+    def literal(cls, value: int) -> Operand:
+        if not (0 <= value <= MASK32):
+            raise ValueError(f"Literal value {value} out of range [0, 0xFFFFFFFF]")
+        return cls(RegType.LITERAL, literal_value=value)
+
+    def disassemble(self) -> str:
+        if self.reg_type == RegType.VGPR:
+            return f"v{self.index}"
+        if self.reg_type == RegType.SGPR:
+            return f"s{self.index}"
+        assert self.literal_value is not None
+        return f"0x{self.literal_value:08X}"
+
+
+@dataclass(frozen=True)
+class VSadHiU8Instruction:
+    """Symbolic AST node for AMD RDNA2 v_sad_hi_u8 VALU instruction."""
+    dst: Operand
+    src0: Operand
+    src1: Operand
+    src2: Operand
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination must be a VGPR, got {self.dst.reg_type}")
+
+    def disassemble(self) -> str:
+        return (
+            f"v_sad_hi_u8 {self.dst.disassemble()}, "
+            f"{self.src0.disassemble()}, {self.src1.disassemble()}, {self.src2.disassemble()}"
+        )
 
 
 # ==============================================================================
@@ -233,13 +308,13 @@ class TestVSadHiU8Oracle(unittest.TestCase):
 
     def test_oracle_complementary_packing_with_v_sad_u8(self) -> None:
         """v_sad_hi_u8 pairs with v_sad_u8 to pack two 16-bit SAD results into one 32-bit word."""
-        # First SAD: 4 differences summing to 15 (0x000F)
+        # First SAD: 4 differences summing to 10
         s0_lo = pack_bytes_u32(1, 2, 3, 4)
         s1_lo = pack_bytes_u32(0, 0, 0, 0)
         sad_lo = ref_sad_u8_sum(s0_lo, s1_lo)  # 10
         self.assertEqual(sad_lo, 10)
 
-        # Second SAD: 4 differences summing to 25 (0x0019)
+        # Second SAD: 4 differences summing to 25
         s0_hi = pack_bytes_u32(5, 6, 7, 7)
         s1_hi = pack_bytes_u32(0, 0, 0, 0)
         sad_hi = ref_sad_u8_sum(s0_hi, s1_hi)  # 25
@@ -250,6 +325,93 @@ class TestVSadHiU8Oracle(unittest.TestCase):
         self.assertEqual(packed & 0xFFFF, sad_lo)
         self.assertEqual((packed >> 16) & 0xFFFF, sad_hi)
         self.assertEqual(packed, (sad_hi << 16) | sad_lo)
+
+
+# ==============================================================================
+# Unit Tests: Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class TestVSadHiU8SymbolicAST(unittest.TestCase):
+    """Test suite verifying symbolic AST construction, validation, and disassembly."""
+
+    def test_ast_creation_valid_operands(self) -> None:
+        """Construct AST nodes with valid VGPR, SGPR, and Literal operands."""
+        instr = VSadHiU8Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.sgpr(2),
+            src2=Operand.literal(0x1234),
+        )
+        self.assertEqual(instr.dst.reg_type, RegType.VGPR)
+        self.assertEqual(instr.dst.index, 0)
+        self.assertEqual(instr.src0.reg_type, RegType.VGPR)
+        self.assertEqual(instr.src0.index, 1)
+        self.assertEqual(instr.src1.reg_type, RegType.SGPR)
+        self.assertEqual(instr.src1.index, 2)
+        self.assertEqual(instr.src2.reg_type, RegType.LITERAL)
+        self.assertEqual(instr.src2.literal_value, 0x1234)
+
+    def test_ast_disassembly(self) -> None:
+        """Disassembly formatting matches AMD RDNA ISA assembly conventions."""
+        instr = VSadHiU8Instruction(
+            dst=Operand.vgpr(5),
+            src0=Operand.vgpr(10),
+            src1=Operand.sgpr(4),
+            src2=Operand.literal(0x00FF00FF),
+        )
+        self.assertEqual(instr.disassemble(), "v_sad_hi_u8 v5, v10, s4, 0x00FF00FF")
+
+    def test_ast_dst_must_be_vgpr(self) -> None:
+        """VALU instruction destination must be a VGPR; SGPR/Literal raises TypeError."""
+        with self.assertRaises(TypeError):
+            VSadHiU8Instruction(
+                dst=Operand.sgpr(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.vgpr(3),
+            )
+        with self.assertRaises(TypeError):
+            VSadHiU8Instruction(
+                dst=Operand.literal(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.vgpr(3),
+            )
+
+    def test_ast_operand_bounds(self) -> None:
+        """Operand indices and literals must be strictly bounded."""
+        # Valid bounds
+        Operand.vgpr(0)
+        Operand.vgpr(255)
+        Operand.sgpr(0)
+        Operand.sgpr(105)
+        Operand.literal(0)
+        Operand.literal(MASK32)
+
+        # Out-of-bounds VGPR
+        with self.assertRaises(ValueError):
+            Operand.vgpr(-1)
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+
+        # Out-of-bounds SGPR
+        with self.assertRaises(ValueError):
+            Operand.sgpr(-1)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106)
+
+        # Out-of-bounds Literal
+        with self.assertRaises(ValueError):
+            Operand.literal(-1)
+        with self.assertRaises(ValueError):
+            Operand.literal(0x1_0000_0000)
+
+    def test_ast_equality_and_hashing(self) -> None:
+        """AST nodes are frozen and hashable."""
+        instr1 = VSadHiU8Instruction(Operand.vgpr(1), Operand.vgpr(2), Operand.vgpr(3), Operand.vgpr(4))
+        instr2 = VSadHiU8Instruction(Operand.vgpr(1), Operand.vgpr(2), Operand.vgpr(3), Operand.vgpr(4))
+        self.assertEqual(instr1, instr2)
+        self.assertEqual(hash(instr1), hash(instr2))
 
 
 if __name__ == "__main__":
