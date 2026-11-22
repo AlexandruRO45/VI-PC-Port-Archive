@@ -577,5 +577,105 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
         self.assertEqual(state.lds.read_qword(target_addr), final_mem)
 
 
+class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+
+    def test_dst_aliases_data(self) -> None:
+        # vdst == vdata: v[0:1] is both destination and data operand
+        state = ScalarMachineState(lds_bytes=1024)
+        state.lds.write_qword(16, 0x123456789ABCDEF0)
+        state.set_vgpr(2, 16)  # vaddr = 16
+        state.set_vgpr64(RegPair(0), 0x0000FFFF0000FFFF)  # vdata in v[0:1]
+
+        instr = DSAndRtnB64Instruction(
+            dst=RegPair(0),
+            addr=RegSingle(2),
+            data=RegPair(0),
+        )
+        old_val = self.interp.execute(instr, state)
+
+        self.assertEqual(old_val, 0x123456789ABCDEF0)
+        self.assertEqual(state.get_vgpr64(RegPair(0)), 0x123456789ABCDEF0)
+        self.assertEqual(state.lds.read_qword(16), 0x123456789ABCDEF0 & 0x0000FFFF0000FFFF)
+
+    def test_dst_aliases_addr(self) -> None:
+        # vdst low register aliases vaddr (e.g. vaddr is v0, vdst is v[0:1])
+        state = ScalarMachineState(lds_bytes=1024)
+        state.lds.write_qword(32, 0xFEDCBA9876543210)
+        state.set_vgpr(0, 32)  # vaddr = 32
+        state.set_vgpr64(RegPair(2), 0x0F0F0F0F0F0F0F0F)
+
+        instr = DSAndRtnB64Instruction(
+            dst=RegPair(0),
+            addr=RegSingle(0),
+            data=RegPair(2),
+        )
+        old_val = self.interp.execute(instr, state)
+
+        self.assertEqual(old_val, 0xFEDCBA9876543210)
+        self.assertEqual(state.get_vgpr64(RegPair(0)), 0xFEDCBA9876543210)
+        self.assertEqual(state.lds.read_qword(32), 0xFEDCBA9876543210 & 0x0F0F0F0F0F0F0F0F)
+
+    def test_dst_aliases_addr_high(self) -> None:
+        # vaddr is v1, vdst is v[0:1]
+        state = ScalarMachineState(lds_bytes=1024)
+        state.lds.write_qword(40, 0x777788889999AAAA)
+        state.set_vgpr(1, 40)
+        state.set_vgpr64(RegPair(2), 0x1111111111111111)
+
+        instr = DSAndRtnB64Instruction(
+            dst=RegPair(0),
+            addr=RegSingle(1),
+            data=RegPair(2),
+        )
+        old_val = self.interp.execute(instr, state)
+
+        self.assertEqual(old_val, 0x777788889999AAAA)
+        self.assertEqual(state.get_vgpr64(RegPair(0)), 0x777788889999AAAA)
+        self.assertEqual(state.lds.read_qword(40), 0x1111000011110000)
+
+    def test_all_operands_overlapping(self) -> None:
+        # vdst is v[0:1], vdata is v[0:1], vaddr is v0
+        state = ScalarMachineState(lds_bytes=1024)
+        state.lds.write_qword(0, 0x5555AAAA5555AAAA)
+        state.set_vgpr64(RegPair(0), 0)  # address 0, mask 0
+
+        instr = DSAndRtnB64Instruction(
+            dst=RegPair(0),
+            addr=RegSingle(0),
+            data=RegPair(0),
+        )
+        old_val = self.interp.execute(instr, state)
+
+        self.assertEqual(old_val, 0x5555AAAA5555AAAA)
+        self.assertEqual(state.get_vgpr64(RegPair(0)), 0x5555AAAA5555AAAA)
+        self.assertEqual(state.lds.read_qword(0), 0)
+
+    def test_unmodified_registers_preserved(self) -> None:
+        state = ScalarMachineState(lds_bytes=1024)
+        state.lds.write_qword(16, 0x1111)
+        state.set_vgpr(2, 16)
+        state.set_vgpr64(RegPair(4), 0x2222)
+        for r in range(6, 16):
+            state.set_vgpr(r, 0xE000 + r)
+        for s in range(5):
+            state.set_sgpr(s, 0xF000 + s)
+
+        instr = DSAndRtnB64Instruction(
+            dst=RegPair(0),
+            addr=RegSingle(2),
+            data=RegPair(4),
+        )
+        self.interp.execute(instr, state)
+
+        for r in range(6, 16):
+            self.assertEqual(state.get_vgpr(r), 0xE000 + r)
+        for s in range(5):
+            self.assertEqual(state.get_sgpr(s), 0xF000 + s)
+
+
 if __name__ == '__main__':
     unittest.main()
