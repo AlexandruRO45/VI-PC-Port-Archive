@@ -631,17 +631,31 @@ int main() {
             struct Call { VkDeviceSize offset; std::uint32_t count; };
             static std::vector<Call> calls;
             ReplayFunctions huge{};
-            huge.multi_draw_indirect = true;
-            huge.max_draw_indirect_count = 0x80000000u;
-            huge.draw_indirect = [](VkCommandBuffer, VkBuffer, VkDeviceSize offset, std::uint32_t count,
-                                    std::uint32_t) { calls.push_back({offset, count}); };
-            huge.draw_indexed_indirect = huge.draw_indirect;
             detail::Prepared prepared{};
             prepared.binding.buffer_offset = 256;
+            huge.multi_draw_indirect = true;
+            huge.max_draw_indirect_count = 0x80000000u;
+            // More calls than any correct chunking needs end the loop by throwing, so a cursor that wraps again
+            // fails the test instead of running until memory is exhausted (@Vonsek's review of #1865).
+            struct TooManyCalls {};
+            huge.draw_indirect = [](VkCommandBuffer, VkBuffer, VkDeviceSize offset, std::uint32_t count,
+                                    std::uint32_t) {
+                if (calls.size() >= 8) throw TooManyCalls{};
+                calls.push_back({offset, count});
+            };
+            const auto emit_bounded = [&](const ExecuteIndirect& command) {
+                try {
+                    detail::emit_indirect(huge, VK_NULL_HANDLE, prepared, command);
+                    return true;
+                } catch (const TooManyCalls&) {
+                    return false;
+                }
+            };
+            huge.draw_indexed_indirect = huge.draw_indirect;
             for (const IndirectKind kind : {IndirectKind::draw, IndirectKind::draw_indexed}) {
                 calls.clear();
                 ExecuteIndirect command{kind, 20, UINT32_MAX, 1, 4, 0, 0, nullptr, true};
-                detail::emit_indirect(huge, VK_NULL_HANDLE, prepared, command);
+                CHECK(emit_bounded(command));
                 CHECK(calls.size() == 2);
                 CHECK(calls[0].offset == 260 && calls[0].count == 0x80000000u);
                 CHECK(calls[1].offset == 260 + 0x80000000ull * 20 && calls[1].count == 0x7fffffffu);
@@ -649,7 +663,7 @@ int main() {
             calls.clear();
             huge.max_draw_indirect_count = 1000;
             ExecuteIndirect uneven{IndirectKind::draw, 16, 2500, 1, 0, 0, 0, nullptr, true};
-            detail::emit_indirect(huge, VK_NULL_HANDLE, prepared, uneven);
+            CHECK(emit_bounded(uneven));
             CHECK(calls.size() == 3 && calls[0].count == 1000 && calls[1].count == 1000 && calls[2].count == 500);
             CHECK(calls[2].offset == 256 + 2000ull * 16);
         }
