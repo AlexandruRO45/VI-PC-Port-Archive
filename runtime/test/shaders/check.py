@@ -368,6 +368,9 @@ CVT_F32_SAT_CASES = (
 CVT_PK_U8_WORDS = [0x1122330C, 0x11220E44, 0x11003344, 0xFE223344, 0x1122330D, 0x11220044, 0x11FF3344, 0x00223344]
 # v_pk_mul_lo_u16 with a constant operand (cs_pk_mul_lo_const.asm), measured natively on RDNA2 (gfx1036); lanes 0 and 1.
 PK_MUL_LO_WORDS = [0x00009E88, 0x03675433, 0x00230000, 0x00077F6C] * 2
+# v_floor/ceil/fract_f32 and v_cvt_flr_i32_f32 (cs_round_f32_denorm.asm), measured natively on RDNA2 (gfx1036): a
+# denormal operand is a zero of its sign, fract(+-inf) is 0xffc00000, a signalling NaN passes through.
+ROUND_F32_DENORM_WORDS = [0x80000000, 0x00000000, 0x00000000, 0x00000000, 0xFFC00000, 0xFFC00000, 0x00000000, 0x7FA00000]
 # Wave64-only dump tests (mostly the x = cross-half checks): exact results need 64 lanes, or an emulation of them
 # on narrower subgroups. cs_dpp_w64 is not cross-half, but its lane id needs both halves.
 W64_EMULATED = os.environ.get("LEONIDA_W64_EMULATE") == "1"
@@ -1802,6 +1805,8 @@ def main():
                                                  expected_words=CVT_PK_U8_WORDS)))
     results.append(("cs_pk_mul_lo_const", compute_test(tools, spirv, "cs_pk_mul_lo_const", "1", "dump",
                                                        expected_words=PK_MUL_LO_WORDS)))
+    results.append(("cs_round_f32_denorm", compute_test(tools, spirv, "cs_round_f32_denorm", "1", "dump",
+                                                        expected_words=ROUND_F32_DENORM_WORDS)))
     for name, want in W64X_DUMPS:   # without --require-wave64 when LEONIDA_W64_EMULATE=1
         results.append((name, compute_test(tools, spirv, name, "1", "dump", require_wave64=not W64_EMULATED,
                                            expected_words=want)))
