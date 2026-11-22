@@ -19,15 +19,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def find_binary():
+def find_binary(root=ROOT):
+    """LEONIDA_VK_PIPELINE_CHECK, else the newest vk_pipeline_check under runtime/build: a single-config build in
+    runtime/build or one folder below it (linux/, Ninja on Windows with .exe), or a multi-config one in a
+    configuration folder (Release/, RelWithDebInfo/, ...)."""
     env = os.environ.get("LEONIDA_VK_PIPELINE_CHECK")
     if env:
         return Path(env) if Path(env).is_file() else None
-    build = ROOT / "runtime" / "build"
-    for p in (build / "linux" / "vk_pipeline_check", build / "vk_pipeline_check", build / "Release" / "vk_pipeline_check.exe"):
-        if p.is_file():
-            return p
-    return None
+    build = Path(root) / "runtime" / "build"
+    found = [p for name in ("vk_pipeline_check", "vk_pipeline_check.exe")
+             for p in (build / name, *build.glob(f"*/{name}")) if p.is_file()]
+    return max(found, key=lambda p: p.stat().st_mtime) if found else None
 
 
 def empty_compute_module(local_x=128):
@@ -49,6 +51,33 @@ def empty_compute_module(local_x=128):
 # What rdna2spirv.py writes for a --mesh-compute mesh shader: the buffer layout, not a bool.
 LAYOUT = {"slot_bytes": 12304, "vertex_stride": 80, "primitive_stride": 16, "max_vertices": 128,
           "max_primitives": 128}
+
+
+class BinaryLookup(unittest.TestCase):
+    """find_binary() on a hand-made build folder; no Vulkan needed."""
+
+    def test_single_and_multi_config_layouts(self):
+        saved = os.environ.pop("LEONIDA_VK_PIPELINE_CHECK", None)
+        self.addCleanup(lambda: saved is None or os.environ.__setitem__("LEONIDA_VK_PIPELINE_CHECK", saved))
+        for rel in ("runtime/build/vk_pipeline_check.exe", "runtime/build/RelWithDebInfo/vk_pipeline_check.exe",
+                    "runtime/build/linux/vk_pipeline_check", "runtime/build/vk_pipeline_check"):
+            with self.subTest(rel=rel), tempfile.TemporaryDirectory() as tmp:
+                self.assertIsNone(find_binary(tmp))
+                path = Path(tmp) / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"")
+                self.assertEqual(find_binary(tmp), path)
+
+    def test_newest_build_wins(self):
+        saved = os.environ.pop("LEONIDA_VK_PIPELINE_CHECK", None)
+        self.addCleanup(lambda: saved is None or os.environ.__setitem__("LEONIDA_VK_PIPELINE_CHECK", saved))
+        with tempfile.TemporaryDirectory() as tmp:
+            old, new = (Path(tmp) / "runtime" / "build" / d / "vk_pipeline_check.exe" for d in ("Release", "RelWithDebInfo"))
+            for i, path in enumerate((old, new)):
+                path.parent.mkdir(parents=True)
+                path.write_bytes(b"")
+                os.utime(path, (1_000_000 + i, 1_000_000 + i))
+            self.assertEqual(find_binary(tmp), new)
 
 
 class MeshComputeEntries(unittest.TestCase):
@@ -95,9 +124,14 @@ class MeshComputeEntries(unittest.TestCase):
         r = self.run_tool({"mc": {"stage": "ms", "mesh_compute": LAYOUT, "subgroup_size": None, "lds_bytes": huge}})
         self.assertIn("MODULE FAIL mc (workgroup memory", r.stdout)
         self.assertIn("ms-compute: 0 modules ok, 1 failed", r.stdout)
-        # A real mesh entry isn't held to the compute limit (it never reaches a compute pipeline).
+        # A real mesh entry isn't held to the compute limit. With VK_EXT_mesh_shader it meets maxMeshSharedMemorySize
+        # instead; without it the limit is 0 and the entry is skipped for the missing extension.
         r = self.run_tool({"m": {"stage": "ms", "lds_bytes": huge}})
-        self.assertNotIn("workgroup memory", r.stdout)
+        self.assertNotIn("maxComputeSharedMemorySize", r.stdout)
+        if "workgroup memory" in r.stdout:
+            self.assertIn("MODULE FAIL m (workgroup memory 1073741824 bytes exceeds maxMeshSharedMemorySize", r.stdout)
+        else:
+            self.assertIn("no VK_EXT_mesh_shader", r.stdout)
 
     def test_push_constant_layout_covers_the_index_size(self):
         # rdna2spirv.py records 152 bytes for a --mesh-compute module (the buffer address after the 144-byte user
