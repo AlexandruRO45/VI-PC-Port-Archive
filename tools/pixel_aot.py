@@ -457,6 +457,46 @@ SALU_HELPERS = {
         "    return asuint(asint(src) >> off);\n"
         "}"
     ),
+    "dpp_ffbh_u32": (
+        "uint dpp_ffbh_u32(uint x) {\n"
+        "    return x == 0u ? 0xffffffffu : (31u - firstbithigh(x));\n"
+        "}"
+    ),
+    "dpp_ffbh_i32": (
+        "uint dpp_ffbh_i32(uint x) {\n"
+        "    uint m = asint(x) < 0 ? ~x : x;\n"
+        "    return m == 0u ? 0xffffffffu : (31u - firstbithigh(m));\n"
+        "}"
+    ),
+    "dpp_mul_hi_u24": (
+        "uint dpp_mul_hi_u24(uint a, uint b) {\n"
+        "    a &= 0xffffffu;\n"
+        "    b &= 0xffffffu;\n"
+        "    uint a0 = a & 0xfffu, a1 = a >> 12;\n"
+        "    uint b0 = b & 0xfffu, b1 = b >> 12;\n"
+        "    uint p0 = a0 * b0;\n"
+        "    uint mid = a0 * b1 + a1 * b0 + (p0 >> 12);\n"
+        "    uint p2 = a1 * b1 + (mid >> 12);\n"
+        "    return p2 >> 8;\n"
+        "}"
+    ),
+    "dpp_mul_hi_i24": (
+        "uint dpp_mul_hi_i24(uint a, uint b) {\n"
+        "    int sa = asint(a << 8) >> 8;\n"
+        "    int sb = asint(b << 8) >> 8;\n"
+        "    uint ma = asuint(sa < 0 ? -sa : sa);\n"
+        "    uint mb = asuint(sb < 0 ? -sb : sb);\n"
+        "    uint a0 = ma & 0xfffu, a1 = ma >> 12;\n"
+        "    uint b0 = mb & 0xfffu, b1 = mb >> 12;\n"
+        "    uint p0 = a0 * b0;\n"
+        "    uint mid = a0 * b1 + a1 * b0 + (p0 >> 12);\n"
+        "    uint p2 = a1 * b1 + (mid >> 12);\n"
+        "    uint mag_lo = (p0 & 0xfffu) | ((mid & 0xfffu) << 12) | ((p2 & 0xffu) << 24);\n"
+        "    uint mag_hi = p2 >> 8;\n"
+        "    if ((sa < 0) != (sb < 0)) return ~mag_hi + (mag_lo == 0u ? 1u : 0u);\n"
+        "    return mag_hi;\n"
+        "}"
+    ),
     "pack16_rne": (
         "// IEEE binary32 to binary16, round to nearest even, independent of driver f32tof16 rounding.\n"
         "uint pack16_rne(float value) {\n"
@@ -576,6 +616,31 @@ SALU_HELPERS = {
         "    return sat ? dot_u64_sat(s) : s.x;\n"
         "}"
     ),
+}
+DPP_INT32 = {
+    "not_b32": (1, "(~{0})", None),
+    "bfrev_b32": (1, "reversebits({0})", None),
+    "ffbl_b32": (1, "firstbitlow({0})", None),
+    "ffbh_u32": (1, "dpp_ffbh_u32({0})", "dpp_ffbh_u32"),
+    "ffbh_i32": (1, "dpp_ffbh_i32({0})", "dpp_ffbh_i32"),
+    "add_nc_u32": (2, "({0} + {1})", None),
+    "sub_nc_u32": (2, "({0} - {1})", None),
+    "subrev_nc_u32": (2, "({1} - {0})", None),
+    "min_i32": (2, "asuint(min(asint({0}), asint({1})))", None),
+    "max_i32": (2, "asuint(max(asint({0}), asint({1})))", None),
+    "min_u32": (2, "min({0}, {1})", None),
+    "max_u32": (2, "max({0}, {1})", None),
+    "mul_u32_u24": (2, "(({0} & 0xffffffu) * ({1} & 0xffffffu))", None),
+    "mul_hi_u32_u24": (2, "dpp_mul_hi_u24({0}, {1})", "dpp_mul_hi_u24"),
+    "mul_i32_i24": (2, "(asuint(asint({0} << 8) >> 8) * asuint(asint({1} << 8) >> 8))", None),
+    "mul_hi_i32_i24": (2, "dpp_mul_hi_i24({0}, {1})", "dpp_mul_hi_i24"),
+    "and_b32": (2, "({0} & {1})", None),
+    "or_b32": (2, "({0} | {1})", None),
+    "xor_b32": (2, "({0} ^ {1})", None),
+    "xnor_b32": (2, "(~({0} ^ {1}))", None),
+    "lshlrev_b32": (2, "({1} << ({0} & 31u))", None),
+    "lshrrev_b32": (2, "({1} >> ({0} & 31u))", None),
+    "ashrrev_i32": (2, "asuint(asint({1}) >> ({0} & 31u))", None),
 }
 
 VOP3P_F16 = {
@@ -1770,6 +1835,24 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(rf"v_({'|'.join(DPP_INT32)})_dpp (v\d+), (.+)"):
+            op, dst, rest = m.groups()
+            arity, template, helper = DPP_INT32[op]
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid integer DPP operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            tokens, perm, _ = parse_dpp(rest, arity)
+            src0_val, _, _ = dpp_vgpr(tokens[0], vector, sample_dest, allow_mods=False)
+            s0_u32 = emit_quad_swizzle_u32(lines, i, src0_val, perm)
+            args = [s0_u32]
+            if arity == 2:
+                src1_val, _, _ = dpp_vgpr(tokens[1], vector, sample_dest, allow_mods=False)
+                args.append(f"asuint({src1_val})")
+            if helper is not None:
+                helpers.add(helper)
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat({template.format(*args)});")
         elif m := match(rf"v_(mov_b32|cvt_f32_f16|cndmask_b32|(?:{'|'.join(DPP_ALU)})_f32)_dpp (v\d+), (.+)"):
             op, dst, rest = m.groups()
             if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
