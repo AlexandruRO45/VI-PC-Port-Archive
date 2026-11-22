@@ -585,7 +585,9 @@ and any validation error fails them.
 - `d3d12_depth_resolve_test`: depth and stencil `ResolveSubresourceRegion` of a 4x D32 or D24S8 target cleared with
   three overlapping values, whole and by rectangle, compared with the PC runtime on the default adapter and WARP;
   the refused calls must fail `Close` and leave the destination as cleared.
-- `d3d12_vulkan_device_test`: the Vulkan device behind the Xbox-ABI proxy, called the way the game will call it.
+- `d3d12_vulkan_device_test`: the Vulkan device behind the Xbox-ABI proxy, called the way the game will call it
+  (its command lists record on the PC list behind the console-order list proxy, apart from one copy through the
+  console slots).
   It creates heaps through slot 14 and reads their start handles in RAX, creates a render target through slot 76
   with the Xbox layout word, then creates views, records clears and barriers, executes and waits on a fence.
   Results come back through D3D12 itself (`CopyTextureRegion` into a readback heap, then `Map`): the render

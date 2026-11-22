@@ -2192,6 +2192,49 @@ int main() {
             Ref<ID3D12Device> parent;
             EXPECT(SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&parent.p))) && parent.p == device.p);
         }
+        // A list from slot 12 is a console-order proxy: a copy (console 15) and Close (9) called by index, then
+        // its PC list executed (the Xbox-ABI queue proxy makes that replacement for the game).
+        {
+            Ref<ID3D12CommandAllocator> console_allocator;
+            Ref<ID3D12GraphicsCommandList> console_list;
+            EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                            IID_PPV_ARGS(&console_allocator.p))));
+            EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, console_allocator.p,
+                                                       nullptr, IID_PPV_ARGS(&console_list.p))));
+            EXPECT(rt::d3d12_xs::is_list_proxy(console_list.p));
+            const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
+            const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
+            const D3D12_RESOURCE_DESC bytes_256 = buffer_desc(256);
+            Ref<ID3D12Resource> src;
+            Ref<ID3D12Resource> dst;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &bytes_256,
+                                                             D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                             IID_PPV_ARGS(&src.p))));
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &bytes_256,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                             IID_PPV_ARGS(&dst.p))));
+            ID3D12CommandList* pc_list = rt::d3d12_xs::list_proxy_real_list(console_list.p);
+            void* mapped = nullptr;
+            if (pc_list && src.p && dst.p && SUCCEEDED(src->Map(0, nullptr, &mapped))) {
+                for (unsigned i = 0; i < 256; ++i)
+                    static_cast<std::uint8_t*>(mapped)[i] = static_cast<std::uint8_t>(i ^ 0x5a);
+                src->Unmap(0, nullptr);
+                void** vtbl = *reinterpret_cast<void***>(console_list.p);
+                using CopyFn = void(WINAPI*)(void*, ID3D12Resource*, UINT64, ID3D12Resource*, UINT64, UINT64);
+                using CloseFn = HRESULT(WINAPI*)(void*);
+                reinterpret_cast<CopyFn>(vtbl[15])(console_list.p, dst.p, 0, src.p, 0, 256);
+                EXPECT(SUCCEEDED(reinterpret_cast<CloseFn>(vtbl[9])(console_list.p)));
+                queue->ExecuteCommandLists(1, &pc_list);
+                EXPECT(submit_and_wait());
+                bool same = SUCCEEDED(dst->Map(0, nullptr, &mapped));
+                for (unsigned i = 0; same && i < 256; ++i)
+                    same = static_cast<const std::uint8_t*>(mapped)[i] == static_cast<std::uint8_t>(i ^ 0x5a);
+                if (mapped) dst->Unmap(0, nullptr);
+                EXPECT(same);
+            } else {
+                EXPECT(false);
+            }
+        }
         // Residency and power (D3D-33): no-ops on Vulkan that still check their arguments, through the proxy's
         // forwarded slots. EnqueueMakeResident must signal its fence, or a queue waiting on it would hang.
         {

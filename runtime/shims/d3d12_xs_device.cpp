@@ -479,6 +479,7 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
         return list_release(self);
     } else if constexpr (Slot == 7) {  // GetDevice: the Xbox-ABI device, as on the heap proxy
         note_list_slot(7);
+        if (a2) *reinterpret_cast<void**>(a2) = nullptr;
         if (!a1 || !a2) return hr_to_u64(E_POINTER);
         return hr_to_u64(proxy_query_interface(self->device, reinterpret_cast<const IID*>(a1),
                                                reinterpret_cast<void**>(a2)));
@@ -556,8 +557,8 @@ HRESULT proxy_create_command_list(DeviceProxy* self, UINT mask, D3D12_COMMAND_LI
                                   ID3D12CommandAllocator* allocator, ID3D12PipelineState* pipeline,
                                   const IID* riid, void** out) {
     note_slot(12);
+    if (out) *out = nullptr;
     if (!riid || !out) return E_POINTER;
-    *out = nullptr;
     void* created = nullptr;
     const HRESULT hr = self->real->CreateCommandList(mask, type, allocator, pipeline,
                                                      __uuidof(ID3D12GraphicsCommandList), &created);
@@ -569,8 +570,8 @@ HRESULT proxy_create_command_list(DeviceProxy* self, UINT mask, D3D12_COMMAND_LI
 HRESULT proxy_create_command_list1(DeviceProxy* self, UINT mask, D3D12_COMMAND_LIST_TYPE type,
                                    D3D12_COMMAND_LIST_FLAGS flags, const IID* riid, void** out) {
     note_slot(51);
+    if (out) *out = nullptr;
     if (!riid || !out) return E_POINTER;
-    *out = nullptr;
     ID3D12Device4* device4 = nullptr;
     HRESULT hr = self->real->QueryInterface(IID_PPV_ARGS(&device4));
     if (FAILED(hr) || !device4) return E_NOTIMPL;

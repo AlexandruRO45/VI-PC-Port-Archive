@@ -468,8 +468,10 @@ A runtime can create the four objects and hand them out at the **public** device
 today. That is an assumption, not a measurement: the Xbox device was measured at
 1/14/15/16/18/19/27/38/62/76, and slots 8/9/12/36 are exactly the ones this page needs. If the
 Xbox slots differ, a generic forward-to-PC thunk calls the wrong method. The current proxy
-(`runtime/shims/d3d12_xs_device.h:1-18`) forwards every unshadowed slot in PC order and logs
-first calls; a wrong slot would therefore be visible as a misnamed call, not a silent success.
+(`runtime/shims/d3d12_xs_device.h:1-18`) forwards every unshadowed device slot in PC order and logs
+first calls; a wrong slot would therefore be visible as a misnamed call, not a silent success. Command lists
+are the exception: they come back as list proxies in the console order of section 3.5a, which refuse the
+slots that map is silent on.
 
 The same caveat applies to **return conventions**: the public AMD64 COM convention (HRESULT in
 EAX, `void` methods, out-parameters through pointers, `GetDesc` returning a 16-byte struct by
