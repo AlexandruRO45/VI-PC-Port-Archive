@@ -716,6 +716,10 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             # A (low, high) pair of 32-bit words bitcast to a PhysicalStorageBuffer pointer (rdna2spirv.lower_addr64,
             # as GL_EXT_buffer_reference_uvec2): the same address OpConvertUToPtr of the 64-bit value would give.
             v = val(a[1])
+            vt = types.t.get(id_type.get(a[1]))
+            if not (vt and vt[0] == "vec" and vt[2] == 2 and types.t.get(vt[1], ())[:2] == ("int", 32)):
+                raise UnsupportedConstruct("OpBitcast to a pointer from a type other than a 2-component 32-bit "
+                                           "integer vector")
             if not (isinstance(v, tuple) and len(v) == 2 and all(isinstance(x, int) and not isinstance(x, bool)
                                                                  for x in v)):
                 raise UnsupportedConstruct("OpBitcast to a pointer from something other than two 32-bit words")
