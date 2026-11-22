@@ -145,6 +145,7 @@ target_sources(offscreen_check PRIVATE tests/bvh_atomics.cpp tests/bvh_numeric.c
 # A title graphics allocation opened as a D3D12 heap and addressed through translated GPU addresses.
 target_sources(offscreen_check PRIVATE tests/gpu_alias.cpp src/era_gpu_alias.cpp src/era_title_va.cpp src/era_heap.cpp)
 # The same allocations read by a shader through 64-bit title addresses (src/title_va_lookup.hlsli).
+target_sources(offscreen_check PRIVATE tests/depth_mask_draw.cpp)
 target_sources(offscreen_check PRIVATE tests/gpu_alias_lookup.cpp)
 # Graphics allocations given desktop GPU addresses when a device is attached (src/era_title_gpu.cpp).
 target_sources(offscreen_check PRIVATE tests/gpu_alias_registry.cpp src/era_title_gpu.cpp src/era_query.cpp)
@@ -1570,6 +1571,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" buffer-color "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_buffer_color_${adapter} PROPERTIES TIMEOUT 60)
+        add_test(NAME depth_mask_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/depth_mask_check.py" "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(depth_mask_draw_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME pixel_aot_attribute_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_attribute_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})

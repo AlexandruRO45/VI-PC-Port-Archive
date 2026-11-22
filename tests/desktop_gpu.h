@@ -14,6 +14,7 @@ void check_ffx_device_init(ID3D12Device* device);
 void check_ffx_recurrent(ID3D12Device* device);
 void check_dual_uav(ID3D12Device* device);
 void check_texture_mips(ID3D12Device* device);
+void check_depth_mask_draw(ID3D12Device*, const char*, const char*, const char*, bool);
 void check_dual_pixel(ID3D12Device*, const char*, const char*, bool);
 void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference = nullptr,
                             UINT8 writeMask = D3D12_COLOR_WRITE_ENABLE_ALL);

@@ -945,6 +945,38 @@ Build the emitted source with `dxc -T cs_6_0 -E main`. The Windows fixture reads
 
 A local scan of 2,689 compute records accepted 12 records (10 distinct instruction streams). Ten use one-thread groups and fixed addresses. Two use 32- and 64-thread groups and indexed addresses. Tested table bindings used s4 or s5 with descriptor offsets of 0, 32 or 64. The indexed bindings used strides of 4, 8, 12 or 16 bytes, selecting the first compatible profile. On RTX 4060 Laptop (32.0.16.1656) and WARP (10.0.26100.9818), each record compiled to desktop DXIL and dispatched. Each adapter completed 14 full-buffer comparisons with zero mismatches, including two different group counts for both indexed records.
 
+## Two-table depth-only pixel shaders
+
+`tools/depth_mask_aot.py` follows the two entry table pointers through scalar
+moves, four-word descriptor loads and completed constant-buffer reads. Supply the
+two `--table SGPR BYTE_OFFSET` pairs in desktop b0, b1 order. The destination
+buffers each contain 2 KiB. The input convention supplies window x, y and depth
+in v2, v3 and v4. The supported exits export depth for surviving lanes or discard
+them. Unknown table addresses, outstanding reads, changed EXEC provenance and
+unrecognized exit sequences reject translation.
+
+The Windows fixture binds distinct seeds and thresholds, changes each separately,
+then exchanges the two root CBV addresses. It checks all 1,024 D32_FLOAT
+pixels and requires comparison against the old reference to fail after the
+exchange. LLVM CI assembles an original gfx1013 program and translates it from a
+synthetic container through the CLI.
+
+```text
+python3 -B tests/depth_mask_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+ctest --preset dev --no-tests=error -R "^depth_mask_draw_" -V
+```
+
+In a local inventory based on main `933cbad`, 354 of 12,101 PS records
+shared one additional native program. With the explicit bindings, the first
+read followed entry s8 at byte offset 0x480 and consumed an integer at byte
+offset 0x5f0 of the resulting buffer. The second followed the saved entry s9
+at offset zero and consumed a float at byte zero. Physically exchanging the
+buffers changed 897 of 1,024 depth samples against the old reference on both a
+GeForce RTX 4060 Laptop (32.0.16.1656) and WARP (10.0.26100.9818), Windows
+build 26200.9974, debug layer enabled. Matching results use controlled inputs
+and the specified binding convention. Target application resource identity and
+original render state remain unverified.
+
 ## Offline pixel shader recompilation
 
 ### Pixel color without a texture sample
