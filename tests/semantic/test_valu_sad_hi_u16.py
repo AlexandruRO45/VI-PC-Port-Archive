@@ -1118,5 +1118,123 @@ class TestValuSadHiU16IEEE754Boundaries(unittest.TestCase):
         self.assertEqual(ref_msad_hi_u16(s0, s1, 0), 0x81FF_0000)
 
 
+class TestValuSadHiU16NegativeRejection(unittest.TestCase):
+    """Unit tests for negative rejection, syntax validation, and mutation detection."""
+
+    def test_negative_control_sgpr_as_destination(self) -> None:
+        with self.assertRaises(TypeError):
+            VSadHiU16Instruction(
+                dst=Operand.sgpr(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.vgpr(3),
+            )
+        with self.assertRaises(TypeError):
+            VMsadHiU16Instruction(
+                dst=Operand.sgpr(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.vgpr(3),
+            )
+
+    def test_negative_control_literal_as_destination(self) -> None:
+        with self.assertRaises(TypeError):
+            VSadHiU16Instruction(
+                dst=Operand.literal(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.vgpr(3),
+            )
+
+    def test_negative_control_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+        with self.assertRaises(ValueError):
+            Operand.vgpr(-1)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(-1)
+
+    def test_negative_control_wave_state_boundaries(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=16)
+        wave = SIMDWaveState(wave_size=32)
+        with self.assertRaises(IndexError):
+            wave.is_lane_active(32)
+        with self.assertRaises(IndexError):
+            wave.is_lane_active(-1)
+
+    def test_mutation_detection_signed_vs_unsigned_halfword_diff(self) -> None:
+        def mutant_signed_halfword_sad(s0: int, s1: int) -> int:
+            h0_0, h0_1 = unpack_halfwords_u32(s0)
+            h1_0, h1_1 = unpack_halfwords_u32(s1)
+            # Faulty: interpreted as signed 16-bit where 0xFFFF is -1
+            s16_0_0 = h0_0 - 65536 if (h0_0 & 0x8000) else h0_0
+            s16_1_0 = h1_0 - 65536 if (h1_0 & 0x8000) else h1_0
+            s16_0_1 = h0_1 - 65536 if (h0_1 & 0x8000) else h0_1
+            s16_1_1 = h1_1 - 65536 if (h1_1 & 0x8000) else h1_1
+            return abs(s16_0_0 - s16_1_0) + abs(s16_0_1 - s16_1_1)
+
+        s0 = pack_halfwords_u32(0, 0)
+        s1 = pack_halfwords_u32(0xFFFF, 0xFFFF)
+        # In correct unsigned: 2 * 65535 = 131070
+        # In mutant signed: |0 - (-1)| * 2 = 2
+        correct = ref_sad_u16_sum(s0, s1)
+        mutant = mutant_signed_halfword_sad(s0, s1)
+        self.assertNotEqual(correct, mutant)
+        self.assertEqual(correct, 131070)
+        self.assertEqual(mutant, 2)
+
+    def test_mutation_detection_sad_hi_shift(self) -> None:
+        def mutant_sad_hi_u16(s0: int, s1: int, s2: int) -> int:
+            # Faulty: forgets << 16 shift
+            sad = ref_sad_u16_sum(s0, s1)
+            return (s2 + sad) & MASK32
+
+        s0 = pack_halfwords_u32(1, 1)
+        s1 = pack_halfwords_u32(0, 0)
+        s2 = 0x0001_0000
+        # Correct: sad=2 -> shifted = 2 << 16 = 0x0002_0000 -> result = 0x0003_0000
+        # Mutant: 0x0001_0000 + 2 = 0x0001_0002
+        correct = ref_sad_hi_u16(s0, s1, s2)
+        mutant = mutant_sad_hi_u16(s0, s1, s2)
+        self.assertNotEqual(correct, mutant)
+        self.assertEqual(correct, 0x0003_0000)
+        self.assertEqual(mutant, 0x0001_0002)
+
+    def test_mutation_detection_msad_mask_check(self) -> None:
+        def mutant_msad_hi_u16_sum(s0: int, s1: int) -> int:
+            # Faulty: fails to mask out when s1 halfword is 0
+            return ref_sad_u16_sum(s0, s1)
+
+        s0 = pack_halfwords_u32(100, 100)
+        s1 = pack_halfwords_u32(0, 100)
+        # Correct msad: low lane skipped; high diff = 0 -> sum = 0
+        # Mutant: low diff = 100, high diff = 0 -> sum = 100
+        correct = ref_msad_u16_sum(s0, s1)
+        mutant = mutant_msad_hi_u16_sum(s0, s1)
+        self.assertNotEqual(correct, mutant)
+        self.assertEqual(correct, 0)
+        self.assertEqual(mutant, 100)
+
+    def test_mutation_detection_clamping_wrap(self) -> None:
+        def mutant_clamped_sad_hi_u16(s0: int, s1: int, s2: int) -> int:
+            # Faulty: wraps modulo 2^32 instead of saturating
+            sad = ref_sad_u16_sum(s0, s1)
+            return ((sad << 16) + (s2 & MASK32)) & MASK32
+
+        s0 = pack_halfwords_u32(1, 0)
+        s1 = pack_halfwords_u32(0, 0)
+        s2 = MASK32
+        # Correct: clamped to MASK32 (0xFFFFFFFF)
+        # Mutant: wraps
+        correct = ref_sad_hi_u16(s0, s1, s2, clamp=True)
+        mutant = mutant_clamped_sad_hi_u16(s0, s1, s2)
+        self.assertNotEqual(correct, mutant)
+        self.assertEqual(correct, MASK32)
+        self.assertNotEqual(mutant, MASK32)
+
+
 if __name__ == "__main__":
     unittest.main()
