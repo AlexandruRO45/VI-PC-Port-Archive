@@ -196,6 +196,51 @@ class GWSExpression:
         return ref_gws_resource_id(m0_val, self.offset)
 
 
+# Commit 3: Deterministic scalar instruction interpreter
+
+
+class ScalarRegisterFile:
+    """Models a single wavefront's scalar and vector register view."""
+
+    def __init__(self) -> None:
+        self.vgprs: List[int] = [0] * 256
+        self.sgprs: List[int] = [0] * 104
+        self.m0: int = 0
+        self.exec: int = MASK32
+        self.vcc: int = 0
+
+    def get_vgpr(self, idx: int) -> int:
+        return self.vgprs[idx] & MASK32
+
+    def set_vgpr(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = val & MASK32
+
+    def get_sgpr(self, idx: int) -> int:
+        return self.sgprs[idx] & MASK32
+
+    def set_sgpr(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = val & MASK32
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for ds_gws_sema_v."""
+
+    def __init__(self, gws: Optional[GWSSubsystem] = None) -> None:
+        self.gws: GWSSubsystem = gws if gws is not None else GWSSubsystem()
+        self.rf: ScalarRegisterFile = ScalarRegisterFile()
+        self.trace: List[Tuple[str, int, Optional[int]]] = []
+
+    def step(self, instr: Instruction, wave_id: int = 0) -> Tuple[int, Optional[int]]:
+        """Execute a single ds_gws_sema_v instruction deterministically."""
+        if instr.opcode != Opcode.DS_GWS_SEMA_V:
+            raise NotImplementedError(f"Unsupported opcode in scalar interpreter: {instr.opcode}")
+
+        rid = ref_gws_resource_id(self.rf.m0, instr.offset)
+        new_val, awakened = self.gws.signal_v(rid)
+        self.trace.append((instr.disasm(), new_val, awakened))
+        return new_val, awakened
+
+
 class TestGWSSemaVOracleAndModel(unittest.TestCase):
     """Commit 1: Reference mathematical oracle and architectural model for ds_gws_sema_v."""
 
@@ -325,6 +370,49 @@ class TestGWSSemaVAST(unittest.TestCase):
         self.assertEqual(expr.evaluate(m0_val=2), 12)
         self.assertEqual(expr.evaluate(m0_val=60), 6)  # (60 + 10) % 64 = 6
         self.assertEqual(expr.evaluate(m0_val=0), 10)
+
+
+class TestGWSSemaVScalarInterpreter(unittest.TestCase):
+    """Commit 3: Deterministic scalar instruction interpreter for ds_gws_sema_v."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_step_single_signal(self) -> None:
+        self.interp.rf.m0 = 4
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_V, offset=2)
+        val, awakened = self.interp.step(instr)
+        self.assertEqual(val, 1)
+        self.assertIsNone(awakened)
+        self.assertEqual(self.interp.gws.resources[6].value, 1)
+        self.assertEqual(len(self.interp.trace), 1)
+
+    def test_scalar_step_with_vdata_operand(self) -> None:
+        self.interp.rf.m0 = 0
+        self.interp.rf.set_vgpr(1, 0x12345678)
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_V, vdata=Register(1, RegKind.VGPR), offset=0)
+        val, _ = self.interp.step(instr)
+        self.assertEqual(val, 1)
+        # vdata register content must not be modified by signal
+        self.assertEqual(self.interp.rf.get_vgpr(1), 0x12345678)
+
+    def test_scalar_step_releases_waiting_wavefront(self) -> None:
+        rid = 15
+        self.interp.gws.wait_p(rid, wave_id=77)
+        self.interp.rf.m0 = 10
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_V, offset=5)
+        val, awakened = self.interp.step(instr)
+        self.assertEqual(awakened, 77)
+        self.assertEqual(val, 0)
+
+    def test_scalar_interpreter_trace_and_determinism(self) -> None:
+        self.interp.rf.m0 = 1
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_V, offset=1)
+        for i in range(1, 6):
+            val, _ = self.interp.step(instr)
+            self.assertEqual(val, i)
+        self.assertEqual(len(self.interp.trace), 5)
+        self.assertEqual(self.interp.trace[-1], ("ds_gws_sema_v offset:1 gds", 5, None))
 
 
 if __name__ == "__main__":
