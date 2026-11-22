@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -2230,6 +2231,36 @@ def sop1_scalar_ops_reference(words):
     return (abs44, cmov_reg, bitset & 0xffffffff, cmov_lit)
 
 
+# s_bfm_b32/s_bfm_b64: count words s44 (S0) and s45 (S1 offset) feed both widths; s46/s47 give a second 32-bit mask.
+BFM_WORDS = (
+    (0, 0, 1, 31),
+    (31, 1, 32, 32),
+    (32, 31, 33, 0xffffffff),
+    (63, 33, 64, 63),
+    (64, 5, 0xffffffe1, 0xffffffc3),
+)
+
+
+def bfm_scalar_ops() -> list[str]:
+    return uncompressed_export([
+        "s_bfm_b32 s50, s44, s45",
+        "s_bfm_b32 s51, s46, s47",
+        "s_bfm_b64 s[52:53], s44, s45",
+        "v_mov_b32_e32 v12, s50",
+        "v_mov_b32_e32 v13, s51",
+        "v_mov_b32_e32 v14, s52",
+        "v_mov_b32_e32 v15, s53",
+    ])
+
+
+def bfm_scalar_ops_reference(words):
+    """Counts are masked to 5 (b32) or 6 (b64) bits; the mask is (1 << count) - 1, shifted left by the offset."""
+    s44, s45, s46, s47 = words
+    b32 = lambda count, offset: (((1 << (count & 31)) - 1) << (offset & 31)) & 0xffffffff
+    b64 = (((1 << (s44 & 63)) - 1) << (s45 & 63)) & 0xffffffffffffffff
+    return (b32(s44, s45), b32(s46, s47), b64 & 0xffffffff, b64 >> 32)
+
+
 def scalar():
     return with_constants(scalar_body())
 
@@ -2429,6 +2460,42 @@ def check_scalar_controls():
                      ("s_bitset0_b32 s52, s47", "s_bitset0_b32 s52, v12")):
         changed = [line.replace(old, new) for line in sop1_program]
         assert changed != sop1_program, new
+        must_reject(translate_int, changed)
+
+    # s_bfm_b32: the lowering masks both counts to five bits and leaves SCC untouched.
+    bfm_program = bfm_scalar_ops()
+    bfm_source = translate_int(bfm_program)
+    assert ("= ((1u << (asuint(params[0].w) & 31u)) - 1u) << (asuint(params[1].x) & 31u);" in bfm_source), bfm_source
+    assert "s_bfm_b64(" in bfm_source
+    refs = [bfm_scalar_ops_reference(words) for words in BFM_WORDS]
+    # Counts 0, 1, 31, 32 and 33 for b32 and 63 and 64 for b64 are all covered with distinct results.
+    assert [r[0] for r in refs] == [0, 0xfffffffe, 0, 0xfffffffe, 0]
+    assert [r[1] for r in refs] == [0x80000000, 0, 0x80000000, 0, 8]
+    assert refs[1][2:] == (0xfffffffe, 0) and refs[0][2:] == (0, 0)
+    assert refs[2][2:] == (0x80000000, 0x7fffffff) and refs[3][2:] == (0, 0xfffffffe) and refs[4][2:] == (0, 0)
+    with_scc = ["s_cmp_eq_u32 s44, s44"]
+    scc_program = bfm_program[:]
+    at = scc_program.index("v_mov_b32_e32 v12, s50")
+    scc_program[at:at] = with_scc + ["s_bfm_b32 s54, 4, 8", "s_cselect_b32 s55, s44, s45"]
+    scc_source = translate_int(scc_program)
+    assert re.search(r"= scc\d+ \? asuint\(params\[0\]\.w\) : asuint\(params\[1\]\.x\);", scc_source), scc_source
+    # Without a tracked SCC the select is rejected even after s_bfm_b32 (it does not create one).
+    at = bfm_program.index("v_mov_b32_e32 v12, s50")
+    must_reject(translate_int, bfm_program[:at] + ["s_bfm_b32 s54, 4, 8", "s_cselect_b32 s55, s44, s45"] + bfm_program[at:])
+    wait = bfm_program.index("s_waitcnt lgkmcnt(0)", bfm_program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc"))
+    for bad in ("s_bfm_b32 s50, s44, 1", "s_bfm_b32 s44, 1, 1", "s_bfm_b32 s50, 1, s47"):
+        must_reject(translate_int, bfm_program[:wait] + [bad] + bfm_program[wait:])
+    for old, new in (("s_bfm_b32 s50, s44, s45", "s_bfm_b32 v12, s44, s45"),
+                     ("s_bfm_b32 s50, s44, s45", "s_bfm_b32 s50, v12, s45"),
+                     ("s_bfm_b32 s50, s44, s45", "s_bfm_b32 s50, s44, v12"),
+                     ("s_bfm_b32 s50, s44, s45", "s_bfm_b32 s50, s44"),
+                     ("s_bfm_b32 s50, s44, s45", "s_bfm_b32 s50, s44, s45, s46"),
+                     ("s_bfm_b32 s50, s44, s45", "s_bfm_b32 s106, s44, s45"),
+                     ("s_bfm_b32 s50, s44, s45", "s_bfm_b32 s[50:51], s44, s45"),
+                     ("s_bfm_b32 s50, s44, s45", "s_bfm_b32 s50, s[44:45], s45"),
+                     ("s_bfm_b32 s50, s44, s45", "s_bfm_b32 s50, s90, s45")):
+        changed = [line.replace(old, new) for line in bfm_program]
+        assert changed != bfm_program, new
         must_reject(translate_int, changed)
 
 
@@ -4184,7 +4251,11 @@ def check_controls(directory):
         "s_cselect_b64 s[70:71], s[52:53], s[54:55]",
         "s_bfe_u64 s[70:71], s[52:53], s61",
         "s_bfe_i64 s[70:71], s[52:53], s61",
-        "s_bfm_b32 s70, 4, 8",
+        "s_bfm_b32 s70, v12, 8",  # VGPR source
+        "s_bfm_b32 s106, 4, 8",  # out-of-range SGPR
+        "s_bfm_b32 s[70:71], 4, 8",  # pair destination
+        "s_bfm_b32 s70, 4",  # missing operand
+        "s_bfm_b32 s70, s90, 8",  # unset source
         "s_cselect_b32 s70, s56, s57",
     ):
         must_reject(translate, program[:body_start] + [bad] + program[body_start:])
@@ -4192,6 +4263,7 @@ def check_controls(directory):
         "s_add_u32 s70, s56, s57",
         "s_and_b32 s70, s56, s57",
         "s_not_b32 s70, s56",
+        "s_bfm_b32 s70, 4, 8",
         "s_cmp_eq_i32 s56, s57",
     ):
         translate(program[:body_start] + [supported] + program[body_start:])
@@ -4492,6 +4564,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((with_constants(CLASS_BODY), translate))
     fixtures.append((sext_values(), translate))
     fixtures.append((sop1_scalar_ops(), translate_int))
+    fixtures.append((bfm_scalar_ops(), translate_int))
     fixtures.extend((scalar_pack_values(halves), translate) for halves in PACK_HALVES)
     fixtures.append((with_constants(RECIPROCAL_BODY), translate))
     fixtures.append((bitwise_program(), translate))
@@ -5964,6 +6037,7 @@ def check_blend_and_scalar_draws(directory, compiler, renderer, backend):
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError(f"Replacing {old} with {new} escaped detection")
     check_sop1_scalar_ops_draw(directory, compiler, renderer, backend)
+    check_bfm_draw(directory, compiler, renderer, backend)
     return 0
 
 
@@ -5999,6 +6073,43 @@ def check_sop1_scalar_ops_draw(directory, compiler, renderer, backend):
         compile_shader(compiler, source, shader)
         wrong = subprocess.run(draw, capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Mutating {label} escaped detection")
+
+
+def check_bfm_draw(directory, compiler, renderer, backend):
+    """s_bfm_b32 and s_bfm_b64 against the Python reference, then controls that must mismatch."""
+    source = directory / "bfm.hlsl"
+    shader = directory / "bfm.cso"
+    case = directory / "bfm.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    program = bfm_scalar_ops()
+    lowered = translate_int(program)
+
+    def write_words(words):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        expected = bfm_scalar_ops_reference(words)
+        write_case(case, bytes(constants), tuple(as_float(word) for word in expected), integer_rt=True)
+
+    source.write_text(lowered, encoding="ascii")
+    compile_shader(compiler, source, shader)
+    for words in BFM_WORDS:
+        write_words(words)
+        subprocess.run(draw, check=True)
+    # Controls on the generated HLSL: a narrower count mask and swapped count/offset. Words 1 and 4 distinguish both.
+    for old, new, label in (("& 31u", "& 15u", "b32 count mask"),
+                            ("((1u << (asuint(params[0].w) & 31u)) - 1u) << (asuint(params[1].x) & 31u)",
+                             "((1u << (asuint(params[1].x) & 31u)) - 1u) << (asuint(params[0].w) & 31u)", "b32 operand order")):
+        mutated = lowered.replace(old, new)
+        assert mutated != lowered, label
+        source.write_text(mutated, encoding="ascii")
+        compile_shader(compiler, source, shader)
+        mismatches = 0
+        for words in BFM_WORDS:
+            write_words(words)
+            wrong = subprocess.run(draw, capture_output=True, text=True)
+            mismatches += wrong.returncode == 1 and "pixel_mismatch" in wrong.stderr
+        if not mismatches:
             raise AssertionError(f"Mutating {label} escaped detection")
 
 

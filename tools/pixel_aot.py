@@ -821,6 +821,8 @@ SCALAR = {
     "orn2_b32": (2, "{0} | ~{1}", NONZERO), "not_b32": (1, "~{0}", NONZERO),
     "nand_b32": (2, "~({0} & {1})", NONZERO), "nor_b32": (2, "~({0} | {1})", NONZERO),
     "xnor_b32": (2, "~({0} ^ {1})", NONZERO),
+    # SCC is not written. Both counts are masked to five bits, so every shift stays below 32.
+    "bfm_b32": (2, "((1u << ({0} & 31u)) - 1u) << ({1} & 31u)", None),
     "lshl_b32": (2, "{0} << ({1} & 31u)", NONZERO), "lshr_b32": (2, "{0} >> ({1} & 31u)", NONZERO),
     "ashr_i32": (2, "asuint(asint({0}) >> ({1} & 31u))", NONZERO),
 }

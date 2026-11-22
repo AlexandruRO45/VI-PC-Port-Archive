@@ -272,7 +272,7 @@ def check_shader_records():
         ("SOP2", "s_andn2_b64"), ("SOP2", "s_orn2_b64"),
         ("SOP2", "s_nand_b64"), ("SOP2", "s_nor_b64"), ("SOP2", "s_xnor_b64"),
         ("SOP2", "s_lshl_b64"), ("SOP2", "s_lshr_b64"), ("SOP2", "s_ashr_i64"),
-        ("SOP2", "s_bfm_b64"), ("SOP2", "s_bfe_u32"), ("SOP2", "s_bfe_i32"),
+        ("SOP2", "s_bfm_b32"), ("SOP2", "s_bfm_b64"), ("SOP2", "s_bfe_u32"), ("SOP2", "s_bfe_i32"),
     }
     sopc_forms = {
         ("SOPC", "s_cmp_eq_i32"), ("SOPC", "s_cmp_lg_i32"),
@@ -298,7 +298,7 @@ def check_shader_records():
     }
     rejected_forms = {
         "s_and_saveexec_b64", "s_or_saveexec_b64", "s_andn2_saveexec_b64",
-        "s_cselect_b64", "s_bfe_u64", "s_bfe_i64", "s_bfm_b32",
+        "s_cselect_b64", "s_bfe_u64", "s_bfe_i64",
         "v_mul_i32_i24_sdwa",
     }
     assert not (pixel.ACCEPTED & rejected_forms), pixel.ACCEPTED & rejected_forms
