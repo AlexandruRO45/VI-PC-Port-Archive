@@ -69,9 +69,9 @@ def read_head(path):
         head = f.read(HEAD)
         if head.startswith(b"MZ") and len(head) >= 0x40:
             offset = int.from_bytes(head[0x3C:0x40], "little")
-            if HEAD <= offset < 1 << 20:  # the PE signature sits past the first bytes read
+            if len(head) < offset + 4 and offset < 1 << 20:  # the PE signature ends past the bytes read
                 f.seek(offset)
-                head += b"\0" * (offset - len(head)) + f.read(4)
+                head = head[:offset].ljust(offset, b"\0") + f.read(4)
         return head
 
 

@@ -45,6 +45,7 @@ CAUGHT = [
     ("model.json", b"glTF" + (2).to_bytes(4, "little") + bytes(8), "glTF binary"),
     ("game.txt", pe_header(), "PE executable"),
     ("far_pe.txt", pe_header(0x400), "PE executable"),
+    ("edge_pe.txt", pe_header(0x206), "PE executable"),  # the signature straddles the first 0x208 bytes
     ("image.bin", bytes(0x200) + b"msft-xvd" + bytes(8), "XVD image"),
 ]
 
