@@ -405,5 +405,115 @@ class TestValuCvtNormU32F32AST(unittest.TestCase):
             )
 
 
+# ---------------------------------------------------------------------------
+# Deterministic Scalar VALU Interpreter
+# ---------------------------------------------------------------------------
+
+class ScalarVALUInterpreter:
+    """Architectural scalar register file and execution engine for VALU conversion instructions."""
+
+    def __init__(self) -> None:
+        self.vgprs: List[int] = [0] * 256
+        self.sgprs: List[int] = [0] * 106
+        self.vcc: int = 0
+        self.exec_mask: int = MASK64
+        self.m0: int = 0
+        self.status: int = 0
+
+    def read_reg32(self, kind: RegKind, index: int) -> int:
+        if kind == RegKind.VGPR:
+            return self.vgprs[index] & MASK32
+        return self.sgprs[index] & MASK32
+
+    def write_reg32(self, kind: RegKind, index: int, val32: int) -> None:
+        val32 &= MASK32
+        if kind == RegKind.VGPR:
+            self.vgprs[index] = val32
+        else:
+            self.sgprs[index] = val32
+
+    def read_operand32(self, op: Union[Register, Immediate]) -> int:
+        if isinstance(op, Immediate):
+            return op.bits32()
+        return self.read_reg32(op.kind, op.index)
+
+    def step(self, inst: Instruction) -> int:
+        if inst.opcode != Opcode.V_CVT_NORM_U32_F32:
+            raise ValueError(f"Unsupported opcode in VALU interpreter: {inst.opcode}")
+
+        src_bits = self.read_operand32(inst.src0)
+        res_unorm32 = ref_cvt_norm_u32_f32(
+            src_bits,
+            clamp=inst.clamp,
+            neg=inst.neg_src0,
+            abs_val=inst.abs_src0,
+        )
+        self.write_reg32(inst.dst.kind, inst.dst.index, res_unorm32)
+        return res_unorm32
+
+
+class TestValuCvtNormU32F32ScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar VALU instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarVALUInterpreter()
+
+    def test_basic_vgpr_to_vgpr_execution(self) -> None:
+        # v1 = 1.0f (0x3F800000)
+        self.interp.write_reg32(RegKind.VGPR, 1, ONE_F32)
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_U32_F32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+        )
+        res = self.interp.step(inst)
+        self.assertEqual(res, UNORM32_MAX)
+        self.assertEqual(self.interp.read_reg32(RegKind.VGPR, 0), UNORM32_MAX)
+
+    def test_sgpr_source_execution(self) -> None:
+        # s2 = 0.5f (0x3F000000)
+        self.interp.write_reg32(RegKind.SGPR, 2, HALF_F32)
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_U32_F32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.SGPR, 2),
+        )
+        res = self.interp.step(inst)
+        self.assertEqual(res, UNORM32_HALF)
+
+    def test_immediate_source_execution(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_U32_F32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Immediate(0.25),
+        )
+        res = self.interp.step(inst)
+        self.assertEqual(res, UNORM32_QUARTER)
+
+    def test_vop3_modifiers_execution(self) -> None:
+        # v1 = -1.0f
+        self.interp.write_reg32(RegKind.VGPR, 1, NEG_ONE_F32)
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_U32_F32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+            abs_src0=True,
+            encoding=Encoding.VOP3,
+        )
+        res = self.interp.step(inst)
+        self.assertEqual(res, UNORM32_MAX)
+
+    def test_vcc_unmodified_during_step(self) -> None:
+        canary = 0xDEADBEEFCAFE1234
+        self.interp.vcc = canary
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_U32_F32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Immediate(1.0),
+        )
+        self.interp.step(inst)
+        self.assertEqual(self.interp.vcc, canary)
+
+
 if __name__ == "__main__":
     unittest.main()
