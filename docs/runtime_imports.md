@@ -154,7 +154,8 @@ pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name 
 with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
 
 `runtime/shims/xgameruntime.cpp` serves the five entry points. The initializers succeed offline and log the GDK
-version and mode once. `QueryApiImpl` serves `XThreadingImpl` and `XErrorImpl` (below); for any other class it logs
+version and mode once. `QueryApiImpl` serves `XThreadingImpl` and `XErrorImpl` (below), and `XStoreImpl` from xgameruntime-docs' layout
+(below); for any other class it logs
 the class and interface id and returns `0x80070032`, the documented error for a class the runtime doesn't provide, so
 the first boot with the executable lists the classes to implement next. `xgameruntime_test` drives this path through
 the api-set binding `XCurl.dll` uses, and calls the two classes slot by slot.
@@ -195,6 +196,30 @@ connectivity (level None), the port and URL security-information queries fail wi
 `HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE)` (the `*Async` ones complete with it through XAsync), the
 certificate check fails the same way, change registrations return tokens that never fire, and the three
 `IXNetworkingImpl2` additions are `E_NOTIMPL`.
+
+`XStoreImpl` (`runtime/shims/xgameruntime_store.cpp`) is served from xgameruntime-docs' layout alone. No package DLL
+calls an `XStore*` slot (`libHttpClient.GDK.dll` only holds the GUID table), so its slots are **not measured** yet.
+The executable's first boot confirms them, or names the slots that differ.
+- **Interfaces:** the class id doubles as `IXStoreImpl`'s; `IXStoreImpl2`-`6` answer with the same 84-slot vtable.
+- **Licenses:** `XStoreQueryGameLicenseAsync` gives a full license (active, not a trial, not a disc license,
+  `expirationDate` 0, empty SKU and trial ids). `XStoreAcquireLicenseForPackageAsync` and `...ForDurablesAsync` give
+  a license that stays valid, so license-changed and license-lost callbacks are only tracked as tokens.
+- **Empty answers:** there are no add-on licenses, no product listings (a product query enumerates nothing and has no
+  further page) and no package updates. `XStoreQueryPackageIdentifier` is `E_GAMEPACKAGE_NO_PACKAGE_IDENTIFIER`.
+- **Not available offline:** everything that needs the store service or a store UI fails synchronously before
+  starting, with `HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE)`, so no `XAsyncBlock` waits. That covers purchases,
+  consumables, collection and purchase ids, license tokens, rate-and-review, redeem, gifting, product pages and
+  downloads. `XStoreCanAcquireLicenseFor*Async` fails the same way: its result's SKU field is sized by
+  `SKU_ID_SIZE`, which no public source gives, so nothing writes into it.
+- **Struct sizes:** the reference names but doesn't give `STORE_SKU_ID_SIZE` and `TRIAL_UNIQUE_ID_MAX_SIZE`. Their
+  values (18 and 64) come from `minecraft-linux/xgameruntime-rs` (MIT), whose `XStoreGameLicense` has the
+  reference's field order. That makes the license 104 bytes, with `isActive` at 18 and `expirationDate` at 96.
+- **Logged on first use:** the docs' three unknown slots (46-48) and `IXStoreImpl2`'s undocumented
+  `XStoreIsAvailabilityPurchasable` (70).
+
+`xgameruntime_store_test` calls the served slots with the documented arguments and checks the license bytes at those
+offsets.
+
 
 Which classes the package's GDK modules reference, from a byte search for the class and interface GUIDs that
 xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; counts only, nothing else read):
