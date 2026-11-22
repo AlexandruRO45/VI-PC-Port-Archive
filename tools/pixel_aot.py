@@ -447,41 +447,100 @@ SALU_HELPERS = {
         "    return isnan(a) ? b : (isnan(b) ? a : max(a, b));\n"
         "}"
     ),
+    "dot_u64_add": (
+        "uint2 dot_u64_add(uint2 acc, uint v) {\n"
+        "    uint lo = acc.x + v;\n"
+        "    return uint2(lo, acc.y + (lo < acc.x ? 1u : 0u));\n"
+        "}"
+    ),
+    "dot_u64_sat": (
+        "uint dot_u64_sat(uint2 s) {\n"
+        "    return s.y != 0u ? 0xffffffffu : s.x;\n"
+        "}"
+    ),
+    "dot_i64_add": (
+        "uint2 dot_i64_add(uint2 acc, int v) {\n"
+        "    uint uv = asuint(v);\n"
+        "    uint lo = acc.x + uv;\n"
+        "    uint hi = acc.y + (v < 0 ? 0xffffffffu : 0u) + (lo < acc.x ? 1u : 0u);\n"
+        "    return uint2(lo, hi);\n"
+        "}"
+    ),
+    "dot_i64_sat": (
+        "uint dot_i64_sat(uint2 s) {\n"
+        "    if (asint(s.y) > 0 || (s.y == 0u && s.x > 0x7fffffffu)) return 0x7fffffffu;\n"
+        "    if (asint(s.y) < -1 || (s.y == 0xffffffffu && s.x < 0x80000000u)) return 0x80000000u;\n"
+        "    return s.x;\n"
+        "}"
+    ),
+    "v_dot2_i32_i16": (
+        "uint v_dot2_i32_i16(uint a0, uint a1, uint b0, uint b1, uint c, bool sat) {\n"
+        "    int p0 = (asint(a0 << 16) >> 16) * (asint(b0 << 16) >> 16);\n"
+        "    int p1 = (asint(a1 << 16) >> 16) * (asint(b1 << 16) >> 16);\n"
+        "    uint2 s = dot_i64_add(dot_i64_add(dot_i64_add(uint2(0u, 0u), asint(c)), p0), p1);\n"
+        "    return sat ? dot_i64_sat(s) : s.x;\n"
+        "}"
+    ),
+    "v_dot2_u32_u16": (
+        "uint v_dot2_u32_u16(uint a0, uint a1, uint b0, uint b1, uint c, bool sat) {\n"
+        "    uint p0 = (a0 & 0xffffu) * (b0 & 0xffffu);\n"
+        "    uint p1 = (a1 & 0xffffu) * (b1 & 0xffffu);\n"
+        "    uint2 s = dot_u64_add(dot_u64_add(uint2(c, 0u), p0), p1);\n"
+        "    return sat ? dot_u64_sat(s) : s.x;\n"
+        "}"
+    ),
+    "v_dot4_i32_i8": (
+        "uint v_dot4_i32_i8(uint a, uint b, uint c, bool sat) {\n"
+        "    int sum = 0;\n"
+        "    for (uint k = 0u; k < 4u; ++k) {\n"
+        "        int x = asint(((a >> (k * 8u)) & 0xffu) << 24) >> 24;\n"
+        "        int y = asint(((b >> (k * 8u)) & 0xffu) << 24) >> 24;\n"
+        "        sum += x * y;\n"
+        "    }\n"
+        "    uint2 s = dot_i64_add(dot_i64_add(uint2(0u, 0u), asint(c)), sum);\n"
+        "    return sat ? dot_i64_sat(s) : s.x;\n"
+        "}"
+    ),
+    "v_dot4_u32_u8": (
+        "uint v_dot4_u32_u8(uint a, uint b, uint c, bool sat) {\n"
+        "    uint sum = 0u;\n"
+        "    for (uint k = 0u; k < 4u; ++k) {\n"
+        "        sum += ((a >> (k * 8u)) & 0xffu) * ((b >> (k * 8u)) & 0xffu);\n"
+        "    }\n"
+        "    uint2 s = dot_u64_add(uint2(c, 0u), sum);\n"
+        "    return sat ? dot_u64_sat(s) : s.x;\n"
+        "}"
+    ),
+    "v_dot8_i32_i4": (
+        "uint v_dot8_i32_i4(uint a, uint b, uint c, bool sat) {\n"
+        "    int sum = 0;\n"
+        "    for (uint k = 0u; k < 8u; ++k) {\n"
+        "        int x = asint(((a >> (k * 4u)) & 0xfu) << 28) >> 28;\n"
+        "        int y = asint(((b >> (k * 4u)) & 0xfu) << 28) >> 28;\n"
+        "        sum += x * y;\n"
+        "    }\n"
+        "    uint2 s = dot_i64_add(dot_i64_add(uint2(0u, 0u), asint(c)), sum);\n"
+        "    return sat ? dot_i64_sat(s) : s.x;\n"
+        "}"
+    ),
+    "v_dot8_u32_u4": (
+        "uint v_dot8_u32_u4(uint a, uint b, uint c, bool sat) {\n"
+        "    uint sum = 0u;\n"
+        "    for (uint k = 0u; k < 8u; ++k) {\n"
+        "        sum += ((a >> (k * 4u)) & 0xfu) * ((b >> (k * 4u)) & 0xfu);\n"
+        "    }\n"
+        "    uint2 s = dot_u64_add(uint2(c, 0u), sum);\n"
+        "    return sat ? dot_u64_sat(s) : s.x;\n"
+        "}"
+    ),
 }
+
 VOP3P_F16 = {
     "add": (2, "({0} + {1})"),
     "mul": (2, "({0} * {1})"),
     "min": (2, "min16_num({0}, {1})"),
     "max": (2, "max16_num({0}, {1})"),
     "fma": (3, "mad({0}, {1}, {2})"),
-}
-INLINE_F16 = {
-    "0.5": 0x3800, "-0.5": 0xb800, "1.0": 0x3c00, "-1.0": 0xbc00,
-    "2.0": 0x4000, "-2.0": 0xc000, "4.0": 0x4400, "-4.0": 0xc400,
-    "0.15915494": 0x3118,
-    "pack16_rne": (
-        "// IEEE binary32 to binary16, round to nearest even, independent of driver f32tof16 rounding.\n"
-        "uint pack16_rne(float value) {\n"
-        "    uint bits = asuint(value);\n"
-        "    uint sign = (bits >> 16) & 0x8000u;\n"
-        "    uint abs_bits = bits & 0x7fffffffu;\n"
-        "    if (abs_bits > 0x7f800000u) return 0x7e00u;\n"
-        "    if (abs_bits >= 0x477ff000u) return sign | 0x7c00u;\n"
-        "    if (abs_bits >= 0x38800000u) {\n"
-        "        uint shifted = abs_bits - 0x38000000u;\n"
-        "        uint round_bit = 0x00000fffu + ((shifted >> 13) & 1u);\n"
-        "        return sign | ((shifted + round_bit) >> 13);\n"
-        "    }\n"
-        "    if (abs_bits < 0x33000000u) return sign;\n"
-        "    uint sig = 0x00800000u | (abs_bits & 0x007fffffu);\n"
-        "    uint shift = 126u - (abs_bits >> 23);\n"
-        "    uint half_m = sig >> shift;\n"
-        "    uint rem = sig & ((1u << shift) - 1u);\n"
-        "    uint mid = 1u << (shift - 1u);\n"
-        "    if (rem > mid || (rem == mid && (half_m & 1u) != 0u)) half_m += 1u;\n"
-        "    return sign | half_m;\n"
-        "}"
-    ),
 }
 INLINE_F16 = {
     "0.5": 0x3800, "-0.5": 0xb800, "1.0": 0x3c00, "-1.0": 0xbc00,
@@ -592,6 +651,8 @@ def fp_operand(token, scalar, vector, pending, sample_dest, *, quad_values: dict
         value = (vector if token.startswith("v") else scalar)[token]
         if quad_values is not None and token.startswith("v") and value not in quad_values:
             raise ValueError("Operand lacks a helper-lane definition")
+        if isinstance(value, tuple) and value[0] == "uint":
+            return f"asfloat({value[1]})"
         if isinstance(value, int):
             return f"asfloat({value}u)"
         if isinstance(value, tuple) and len(value) == 2 and value[0] == "uint":
@@ -773,6 +834,73 @@ def parse_fma_mix(rest):
     if any(hi and not f16 for f16, hi in zip(op_sel, op_sel_hi)):
         raise ValueError("High-half selection requires an f16 operand")
     return operands, op_sel, op_sel_hi, clamp
+def dot_word(token, scalar, vector, pending, sample_dest, *, allow_f16=False):
+    """Return a 32-bit uint HLSL expression for one VOP3P dot-product source operand."""
+    if allow_f16 and token in INLINE_F16:
+        return f"{INLINE_F16[token]}u"
+    if m := re.fullmatch(r"([vs])(\d+)", token):
+        limit = 255 if m.group(1) == "v" else 105
+        if not 0 <= int(m.group(2)) <= limit:
+            raise ValueError(f"Register out of range: {token}")
+        if token in pending:
+            raise ValueError("Constant read before load completion")
+        value = (vector if m.group(1) == "v" else scalar)[token]
+        if isinstance(value, int):
+            return f"{value}u"
+        if isinstance(value, tuple) and len(value) == 2 and value[0] == "uint":
+            return value[1]
+        if not isinstance(value, str) or not value.startswith(("sample", "alu", "params[")):
+            raise ValueError("Expected a numeric register")
+        if token in sample_dest:
+            raise ValueError("Sample used before vmcnt wait")
+        return f"asuint({value})"
+    if re.fullmatch(r"0x[0-9a-f]{1,8}", token):
+        return f"{int(token, 16)}u"
+    if re.fullmatch(r"-?\d+", token):
+        val = int(token)
+        if not -16 <= val <= 64:
+            raise ValueError(f"Unsupported dot-product inline constant {token}")
+        return f"{val & 0xffffffff}u"
+    raise ValueError(f"Unsupported dot-product operand {token}")
+
+
+def dot_f32_accum(token, scalar, vector, pending, sample_dest):
+    if token in INLINE_F16:
+        return f"({token}f)"
+    return f"asfloat({dot_word(token, scalar, vector, pending, sample_dest)})"
+
+
+def parse_dot(rest, *, allow_opsel, allow_neg):
+    parts_ = rest.split(", ")
+    if len(parts_) != 3:
+        raise ValueError("Invalid dot-product operand count")
+    last_op, _, mod_text = parts_[-1].partition(" ")
+    operands = [*parts_[:-1], last_op]
+    opts = {}
+    clamp = False
+    for mod in mod_text.split():
+        if mod == "clamp":
+            if clamp:
+                raise ValueError("Duplicate clamp modifier")
+            clamp = True
+        elif m := re.fullmatch(r"(op_sel|op_sel_hi|neg_lo|neg_hi):\[([01],[01],[01])\]", mod):
+            name = m.group(1)
+            if name in opts:
+                raise ValueError(f"Duplicate modifier {mod}")
+            if name in ("op_sel", "op_sel_hi") and not allow_opsel:
+                raise ValueError(f"Unsupported dot-product modifier {mod}")
+            if name in ("neg_lo", "neg_hi") and not allow_neg:
+                raise ValueError(f"Unsupported dot-product modifier {mod}")
+            opts[name] = [int(b) for b in m.group(2).split(",")]
+        else:
+            raise ValueError(f"Unsupported dot-product modifier {mod}")
+    op_sel = opts.get("op_sel", [0, 0, 0])
+    op_sel_hi = opts.get("op_sel_hi", [1, 1, 1])
+    neg_lo = opts.get("neg_lo", [0, 0, 0])
+    neg_hi = opts.get("neg_hi", [0, 0, 0])
+    if op_sel[2] != 0 or op_sel_hi[2] != 1 or neg_hi[2] != 0:
+        raise ValueError("Unsupported accumulator lane modifier on dot product")
+    return operands, op_sel, op_sel_hi, neg_lo, neg_hi, clamp
 
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *, second_texture_offset=None):
@@ -982,6 +1110,20 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             values = [scalar_u32(t, scalar, pending) for t in tokens]
             lines.append(f"    uint salu{i} = {scc} ? {values[0]} : {values[1]};")
             scalar[dst] = ("uint", f"salu{i}")
+        elif m := match(r"(s_addk_i32|s_mulk_i32) (s\d+), (-?\d+|0x[0-9a-f]+)"):
+            op, dst, imm = m.groups()
+            operand = scalar_u32(dst, scalar, pending)
+            word = int(imm, 16) if imm.startswith("0x") else int(imm)
+            if not -0x8000 <= word <= 0xffff:
+                raise ValueError("Invalid sopk immediate")
+            signed = word - 0x10000 if word >= 0 and word & 0x8000 else word
+            addend = signed & 0xffffffff
+            operation = "+" if op == "s_addk_i32" else "*"
+            scalar[dst] = ("uint", f"alu{i}")
+            lines.append(f"    uint alu{i} = ({operand} {operation} {addend}u);")
+
+            if op == "s_addk_i32":
+                scc = f"((({operand} ^ alu{i}) & ({addend}u ^ alu{i}) & 0x80000000u) != 0u)"
         elif m := match(r"s_load_dwordx8 s\[(\d+):(\d+)\], s\[(\d+):(\d+)\], (null|0x[0-9a-f]+)"):
             dst = registers(*m.groups()[:2], 8)
             addr = registers(*m.groups()[2:4], 2)
@@ -1343,6 +1485,56 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     packed = f"(mix{i}_p & 0x0000ffffu) | (pack16_rne(mix{i}) << 16)"
                 vector[dst] = f"alu{i}"
                 lines.append(f"    precise float alu{i} = asfloat({packed});")
+        elif m := match(r"(v_dot2_f32_f16|v_dot2_i32_i16|v_dot2_u32_u16|v_dot4_i32_i8|v_dot4_u32_u8|v_dot8_i32_i4|v_dot8_u32_u4) (v\d+), (.+)"):
+            op, dst, rest = m.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid dot-product operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            is_f16 = op == "v_dot2_f32_f16"
+            is_dot2 = op.startswith("v_dot2_")
+            tokens, op_sel, op_sel_hi, neg_lo, neg_hi, clamp = parse_dot(
+                rest, allow_opsel=is_dot2, allow_neg=is_f16,
+            )
+            if is_f16:
+                w0 = dot_word(tokens[0], scalar, vector, pending, sample_dest, allow_f16=True)
+                w1 = dot_word(tokens[1], scalar, vector, pending, sample_dest, allow_f16=True)
+                c_expr = dot_f32_accum(tokens[2], scalar, vector, pending, sample_dest)
+                lines.append(f"    uint dot{i}_0 = {w0};")
+                lines.append(f"    uint dot{i}_1 = {w1};")
+                a0 = f"widen16(dot{i}_0 >> 16)" if op_sel[0] else f"widen16(dot{i}_0)"
+                b0 = f"widen16(dot{i}_1 >> 16)" if op_sel[1] else f"widen16(dot{i}_1)"
+                a1 = f"widen16(dot{i}_0 >> 16)" if op_sel_hi[0] else f"widen16(dot{i}_0)"
+                b1 = f"widen16(dot{i}_1 >> 16)" if op_sel_hi[1] else f"widen16(dot{i}_1)"
+                if neg_lo[0]: a0 = f"(-{a0})"
+                if neg_lo[1]: b0 = f"(-{b0})"
+                if neg_hi[0]: a1 = f"(-{a1})"
+                if neg_hi[1]: b1 = f"(-{b1})"
+                if neg_lo[2]: c_expr = f"(-{c_expr})"
+                expr = f"(({a0} * {b0}) + ({a1} * {b1}) + {c_expr})"
+                if clamp:
+                    expr = f"saturate({expr})"
+                vector[dst] = f"alu{i}"
+                lines.append(f"    precise float alu{i} = {expr};")
+            else:
+                w0 = dot_word(tokens[0], scalar, vector, pending, sample_dest)
+                w1 = dot_word(tokens[1], scalar, vector, pending, sample_dest)
+                w2 = dot_word(tokens[2], scalar, vector, pending, sample_dest)
+                signed = "_i32_" in op
+                helpers.update(("dot_i64_add", "dot_i64_sat", op) if signed else ("dot_u64_add", "dot_u64_sat", op))
+                sat = "true" if clamp else "false"
+                if is_dot2:
+                    lines.append(f"    uint dot{i}_0 = {w0};")
+                    lines.append(f"    uint dot{i}_1 = {w1};")
+                    a0 = f"(dot{i}_0 >> 16)" if op_sel[0] else f"dot{i}_0"
+                    a1 = f"(dot{i}_0 >> 16)" if op_sel_hi[0] else f"dot{i}_0"
+                    b0 = f"(dot{i}_1 >> 16)" if op_sel[1] else f"dot{i}_1"
+                    b1 = f"(dot{i}_1 >> 16)" if op_sel_hi[1] else f"dot{i}_1"
+                    call = f"{op}({a0}, {a1}, {b0}, {b1}, {w2}, {sat})"
+                else:
+                    call = f"{op}({w0}, {w1}, {w2}, {sat})"
+                vector[dst] = f"alu{i}"
+                lines.append(f"    precise float alu{i} = asfloat({call});")
         elif m := match(r"v_cvt_pkrtz_f16_f32_e32 (v\d+), (v\d+), (v\d+)"):
             dst, lo, hi = m.groups()
             if dst in sample_dest:
