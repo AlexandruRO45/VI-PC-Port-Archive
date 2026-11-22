@@ -38,6 +38,9 @@ ISA semantics used (AMD RDNA2 ISA reference, VALU/VOP3/VOP3P chapters):
   v_mad_u32_u16 /       D = S0.lo * S1.lo + S2 mod 2^32, the halves zero- (u16) or sign-extended (i16); op_sel bit
   v_mad_i32_i16           0/1 reads the high half of S0/S1. D is a whole dword (nothing of the old value is kept).
   v_subrev_f16          D.lo = S1.lo - S0.lo; the high half of D is kept in the VOP2 and the VOP3 form.
+  clamp on v_mul_lo_u16, changes nothing: the result wraps to 16 bits as without it. Measured on gfx1036
+    16-bit shifts,        (EGEN-HW-CLAMP16-NOSAT, ps_valu16_clamp_nosat.asm).
+    16-bit min/max
   s_*_saveexec_b32/b64, a constant used as a lane mask gives lane L its bit L: of the 32-bit value for a b32 op,
   s_andn2_wrexec_*,       of the 64-bit value for a b64 op (inline constants sign-extended, literals with a zero
   s_mov/s_not/s_and_b64   high word). cs_w32_mask_imm / cs_w64_mask_imm run every lane of a wave (LaneMaskConstants).
@@ -79,6 +82,7 @@ EXPECTED_FMT_1010102 = {0x00: 0x00000000, 0x04: 0x3F800000, 0x08: 0x00000000, 0x
 EXPECTED_SFF_IMM = [0x00000002, 0x00000001, 0x00000014, 0x00000010]
 EXPECTED_VALU16_MAD = [0x00000002, 0x00030002, 0x00008000, 0x00000004]
 EXPECTED_VALU16_SUBREV = [0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800]
+EXPECTED_VALU16_CLAMP_NOSAT = [0x1111FFF6, 0xFFFE4444, 0x55550000, 0x7777D555]  # hardware-measured
 
 
 def _f32_bits(x):
@@ -314,6 +318,24 @@ def reference_valu16_subrev():
             0x42000000 | _half(a - d)]
 
 
+def reference_valu16_nosat(op, s0, s1):
+    """v_mul_lo_u16 / v_lshlrev_b16 / v_lshrrev_b16 / v_ashrrev_i16 / v_max|min_u16|i16 on two 16-bit values; clamp
+    changes nothing on these (EGEN-HW-CLAMP16-NOSAT), so this is the plain wrapped result."""
+    sx = lambda v: v - 0x10000 if v & 0x8000 else v                        # noqa: E731
+    r = {"v_mul_lo_u16": s0 * s1, "v_lshlrev_b16": s1 << (s0 & 15), "v_lshrrev_b16": s1 >> (s0 & 15),
+         "v_ashrrev_i16": sx(s1) >> (s0 & 15), "v_max_u16": max(s0, s1), "v_min_u16": min(s0, s1),
+         "v_max_i16": max(sx(s0), sx(s1)), "v_min_i16": min(sx(s0), sx(s1))}[op]
+    return r & 0xFFFF
+
+
+def reference_valu16_clamp_nosat():
+    v0, v1, v5, v6 = 0x8003FFFE, 0x7FFF0005, 0xAAAA8001, 0x5555000F
+    lo, hi = (lambda v: v & 0xFFFF), (lambda v: v >> 16)                   # noqa: E731
+    return [0x11110000 | reference_valu16_nosat("v_mul_lo_u16", lo(v0), lo(v1)),
+            reference_valu16_nosat("v_mul_lo_u16", hi(v5), hi(v0)) << 16 | 0x4444,     # op_sel:[1,1,1]
+            0x55550000 | reference_valu16_nosat("v_lshlrev_b16", lo(v6), lo(v0)),
+            0x77770000 | reference_valu16_nosat("v_ashrrev_i16", 1, hi(v5))]           # op_sel:[0,1,0]
+
 def _isg1_dxbc(elements):
     """A DXBC container with one ISG1 input signature. elements: (register, mask, system value, component type)."""
     payload = bytearray(struct.pack("<II", len(elements), 8))
@@ -364,6 +386,7 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_sff_imm(), EXPECTED_SFF_IMM)
         self.assertEqual(reference_valu16_mad(), EXPECTED_VALU16_MAD)
         self.assertEqual(reference_valu16_subrev(), EXPECTED_VALU16_SUBREV)
+        self.assertEqual(reference_valu16_clamp_nosat(), EXPECTED_VALU16_CLAMP_NOSAT)
 
 
 class TranslatorValueSemantics(unittest.TestCase):
@@ -430,6 +453,22 @@ class TranslatorValueSemantics(unittest.TestCase):
         # when the destination is a source.
         self.check("ps_valu16_subrev", EXPECTED_VALU16_SUBREV)
 
+    def test_clamp_changes_nothing_on_16_bit_mul_shift_minmax(self):
+        # EGEN-HW-CLAMP16-NOSAT: saturating instead would give 0x1111ffff, 0xffff4444, 0x5555ffff, 0x7777d555.
+        self.check("ps_valu16_clamp_nosat", EXPECTED_VALU16_CLAMP_NOSAT)
+
+    def test_clamp_nosat_ops_against_the_reference(self):
+        # Each op with and without clamp, VOP3 form (the other half kept), operands that overflow 16 bits.
+        pairs = [(0xFFFE, 0x0005), (0x8001, 0x8001), (0x000F, 0xFFFE), (0x0011, 0x8000), (0x7FFF, 0xFFFF)]
+        for op in ("v_mul_lo_u16", "v_lshlrev_b16", "v_lshrrev_b16", "v_ashrrev_i16", "v_max_u16", "v_min_u16",
+                   "v_max_i16", "v_min_i16"):
+            for s0, s1 in pairs:
+                for mod in ("", " clamp"):
+                    with self.subTest(op=op, s0=s0, s1=s1, mod=mod):
+                        spv = support.translate_lines("ps_c16", [
+                            f"v_mov_b32 v0, {hex(s0)}", f"v_mov_b32 v1, {hex(s1)}", "v_mov_b32 v2, 0x12340000",
+                            f"{op}_e64 v2, v0, v1{mod}", "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"])
+                        self.assertEqual(support.mrt0_words(spv)[0], 0x12340000 | reference_valu16_nosat(op, s0, s1))
     def test_s_buffer_load_dwordx2_into_vcc(self):
         # The V# in s[0:3] points at 0x1000; the two dwords must come back in vcc_lo and vcc_hi, not be lost.
         push = [0x1000, 0, 16, 0] + [0] * 28

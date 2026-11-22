@@ -5493,12 +5493,15 @@ class Gen:
             if "clamp" in mods:
                 # VOP3 clamp saturates the unsigned add/sub to [0, 0xFFFF], as for the 32-bit ops (docs/design.md,
                 # "Integer clamp"). The operands are zero-extended, so a result past 0xFFFF is an overflow (add) or a
-                # borrow (sub). Other 16-bit ops: rejected rather than guessed.
+                # borrow (sub). On v_mul_lo_u16, the 16-bit shifts and min/max the bit changes nothing: the result
+                # wraps to 16 bits as without it (measured on gfx1036, EGEN-HW-CLAMP16-NOSAT: 0xfffe * 5 gives
+                # 0xfff6, 0xfffe << 15 gives 0). Other 16-bit ops: rejected rather than guessed.
                 if op in ("v_add_i16", "v_sub_i16"):
                     sat = self.tmp()
                     self.emit(f"{sat} = OpExtInst %uint %glsl SClamp {r} {self.cu(0xFFFF8000)} {self.cu(0x7FFF)}")
                     r = sat
-                elif op not in ("v_add_u16", "v_sub_u16", "v_subrev_u16"):
+                elif op not in ("v_add_u16", "v_sub_u16", "v_subrev_u16", "v_mul_lo_u16", "v_lshlrev_b16",
+                                "v_lshrrev_b16", "v_ashrrev_i16", "v_max_u16", "v_min_u16", "v_max_i16", "v_min_i16"):
                     raise Unsupported(op + " clamp")
                 if op in ("v_add_u16", "v_sub_u16", "v_subrev_u16"):
                     ov, sat = self.tmp(), self.tmp()
