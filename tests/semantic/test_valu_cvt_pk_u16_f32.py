@@ -337,6 +337,59 @@ def instruction_to_ast(inst: Instruction) -> PackU16Expr:
 
 
 # ---------------------------------------------------------------------------
+# Condition Codes, Status Flags, and Carry/Borrow Isolation
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class ConditionCodes:
+    """Architectural condition codes for 32-bit packed VALU operations."""
+    zero: bool
+    sign: bool
+    lo_zero: bool
+    hi_zero: bool
+    lo_saturated: bool
+    hi_saturated: bool
+    parity: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class VALUStatusFlags:
+    """Status flags and carry/borrow tracking for VALU instructions."""
+    vcc_modified: bool = False
+    overflow: bool = False
+    carry: bool = False
+
+
+def compute_cvt_pk_condition_codes(result: int, src0: int, src1: int) -> ConditionCodes:
+    """Computes condition codes evaluating attributes of the 32-bit packed result."""
+    res = result & MASK32
+    lo = res & 0xFFFF
+    hi = (res >> 16) & 0xFFFF
+    b0 = res & 0xFF
+    parity = (bin(b0).count("1") % 2) == 0
+
+    f0 = bits_to_f32(src0) if not is_nan_f32(src0) else 0.0
+    f1 = bits_to_f32(src1) if not is_nan_f32(src1) else 0.0
+    lo_sat = (f0 >= 65535.0) or (f0 <= 0.0)
+    hi_sat = (f1 >= 65535.0) or (f1 <= 0.0)
+
+    return ConditionCodes(
+        zero=(res == 0),
+        sign=bool(res & SIGN_BIT32),
+        lo_zero=(lo == 0),
+        hi_zero=(hi == 0),
+        lo_saturated=lo_sat,
+        hi_saturated=hi_sat,
+        parity=parity,
+    )
+
+
+def compute_cvt_pk_status_flags() -> VALUStatusFlags:
+    """In RDNA2 ISA, VALU v_cvt_pk_u16_f32 never modifies VCC or sets carry/borrow."""
+    return VALUStatusFlags(vcc_modified=False, overflow=False, carry=False)
+
+
+# ---------------------------------------------------------------------------
 # Deterministic Scalar Instruction Interpreter
 # ---------------------------------------------------------------------------
 
@@ -346,6 +399,9 @@ class ScalarVALUInterpreter:
     def __init__(self) -> None:
         self.vgprs: list[int] = [0] * 256
         self.sgprs: list[int] = [0] * 106
+        self.vcc: int = 0
+        self.last_condition_codes: ConditionCodes | None = None
+        self.last_status_flags: VALUStatusFlags | None = None
         self.trace: list[str] = []
 
     def read_reg_u32(self, kind: RegKind, idx: int) -> int:
@@ -396,6 +452,8 @@ class ScalarVALUInterpreter:
             s1 = self.read_operand(inst.src1)
             res = ref_cvt_pk_u16_f32(s0, s1)
             self.write_reg_u32(inst.dst.kind, inst.dst.index, res)
+            self.last_condition_codes = compute_cvt_pk_condition_codes(res, s0, s1)
+            self.last_status_flags = compute_cvt_pk_status_flags()
             self.trace.append(f"{inst.to_assembly()} => {res:#010x}")
             return res
         else:
@@ -419,6 +477,7 @@ class SIMDWavefrontInterpreter:
         self.wave_size: int = wave_size
         self.lanes_vgpr: list[list[int]] = [[0] * 256 for _ in range(wave_size)]
         self.sgprs: list[int] = [0] * 106
+        self.vcc: int = 0
         self.exec_mask: int = (1 << wave_size) - 1
 
     def set_exec_mask(self, mask: int) -> None:
@@ -935,6 +994,98 @@ class TestValuCvtPkU16F32RegisterAliasing(unittest.TestCase):
                 self.assertEqual(actual, expected)
             else:
                 self.assertEqual(actual, f32_to_bits(float(lane * 10)))
+
+
+class TestValuCvtPkU16F32ConditionCodes(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow generation isolation."""
+
+    def test_condition_codes_zero_flag(self) -> None:
+        interp = ScalarVALUInterpreter()
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_U16_F32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Immediate(POS_ZERO_F32),
+            src1=Immediate(NEG_ZERO_F32),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, 0)
+        cc = interp.last_condition_codes
+        self.assertIsNotNone(cc)
+        assert cc is not None
+        self.assertTrue(cc.zero)
+        self.assertFalse(cc.sign)
+        self.assertTrue(cc.lo_zero)
+        self.assertTrue(cc.hi_zero)
+        self.assertTrue(cc.lo_saturated)  # 0.0 clamps/saturates to min
+        self.assertTrue(cc.hi_saturated)
+        self.assertTrue(cc.parity)
+
+    def test_condition_codes_sign_flag(self) -> None:
+        interp = ScalarVALUInterpreter()
+        # S0 = 1.0f -> 0x0001, S1 = 40000.0f -> 0x9C40 (bit 31 is 1 since 0x9C400001 has bit 31 set)
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_U16_F32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Immediate(POS_ONE_F32),
+            src1=Immediate(f32_to_bits(40000.0)),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, (40000 << 16) | 1)
+        cc = interp.last_condition_codes
+        self.assertIsNotNone(cc)
+        assert cc is not None
+        self.assertFalse(cc.zero)
+        self.assertTrue(cc.sign)
+        self.assertFalse(cc.lo_zero)
+        self.assertFalse(cc.hi_zero)
+
+    def test_condition_codes_saturation_detection(self) -> None:
+        interp = ScalarVALUInterpreter()
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_U16_F32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Immediate(f32_to_bits(70000.0)),
+            src1=Immediate(f32_to_bits(-10.0)),
+        )
+        interp.step(inst)
+        cc = interp.last_condition_codes
+        self.assertIsNotNone(cc)
+        assert cc is not None
+        self.assertTrue(cc.lo_saturated)
+        self.assertTrue(cc.hi_saturated)
+
+    def test_condition_codes_parity(self) -> None:
+        cc_odd = compute_cvt_pk_condition_codes(0x0001, POS_ONE_F32, POS_ZERO_F32)
+        self.assertFalse(cc_odd.parity)
+
+        cc_even = compute_cvt_pk_condition_codes(0x0003, POS_ONE_F32, POS_ZERO_F32)
+        self.assertTrue(cc_even.parity)
+
+    def test_vcc_and_carry_borrow_isolation(self) -> None:
+        interp = ScalarVALUInterpreter()
+        canary_vcc = 0xFEEDFACECAFEBEEF
+        interp.vcc = canary_vcc
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_U16_F32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Immediate(POS_INF_F32),
+            src1=Immediate(NEG_INF_F32),
+        )
+        interp.step(inst)
+        self.assertEqual(interp.vcc, canary_vcc)
+
+        flags = interp.last_status_flags
+        self.assertIsNotNone(flags)
+        assert flags is not None
+        self.assertFalse(flags.vcc_modified)
+        self.assertFalse(flags.overflow)
+        self.assertFalse(flags.carry)
+
+        simd = SIMDWavefrontInterpreter(wave_size=64)
+        simd.vcc = canary_vcc
+        simd.step(inst)
+        self.assertEqual(simd.vcc, canary_vcc)
 
 
 if __name__ == "__main__":
