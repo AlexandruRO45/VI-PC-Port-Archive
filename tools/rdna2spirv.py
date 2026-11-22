@@ -59,6 +59,9 @@ W64G_COUNTS = Counter()   # tiers of the wave64 VS/PS/GS translated so far, for 
 # (1,0,0), (0,1,0), (0,0,1) at the triangle's three vertices; interpolating those gives the perspective-correct
 # barycentrics, so .y/.z are AMD's i/j as with BaryCoordKHR.
 BARY_FALLBACK = False
+# --int64-addresses: keep 64-bit integer address arithmetic (Int64) instead of lowering it to 32-bit pairs; see
+# lower_addr64.
+ADDR_PAIR = True
 FMA_KHR = False          # --fma khr: fused multiply-adds are OpFmaKHR (SPV_KHR_fma, VK_KHR_shader_fma), not GLSL Fma
 # --texel-offset-fallback: image_sample*_o without VK_KHR_maintenance8. The run-time texel offset is folded into the
 # coordinate (coordinate + offset / size of the sampled mip level) instead of the SPIR-V Offset operand, which needs
@@ -10484,9 +10487,142 @@ def assemble(gen):
                 "%live = OpLabel\n         OpReturn\n         OpFunctionEnd\n")
     else:
         tail = end_lock + "         OpReturn\n         OpFunctionEnd\n"
-    return split_big_switch(no_contraction(dedupe_types(
-        "\n".join("         " + l if not l.startswith("%") or " = " not in l else l for l in out) +
-        "\n" + "\n".join(gen.body) + "\n" + tail)))
+    text = "\n".join("         " + l if not l.startswith("%") or " = " not in l else l for l in out) + \
+        "\n" + "\n".join(gen.body) + "\n" + tail
+    if ADDR_PAIR:
+        text = lower_addr64(text)
+    return split_big_switch(no_contraction(dedupe_types(text)))
+
+
+# ---- 64-bit addresses without Int64 ----
+# Every PhysicalStorageBuffer address the generator builds is one idiom: widen a 32-bit word (OpUConvert), shift a
+# high word left by 32, OR, add or subtract (64-bit constants included), AND a mask, take a word back (narrow to
+# 32 bits, or shift right by 32), compare two such values (the NUM_RECORDS bound), convert to a pointer. A shader
+# whose only 64-bit integers are that idiom doesn't need the Int64 capability (Vulkan shaderInt64, which Intel's
+# drivers lack, #313): lower_addr64 rewrites it to (low, high) pairs of 32-bit words, OpIAddCarry / OpISubBorrow
+# carrying into the high word, compares high word first, and bitcasts the pair (a uvec2) to the pointer, as
+# GL_EXT_buffer_reference_uvec2 does. A shader with any other 64-bit integer use (64-bit multiplies, arithmetic
+# shifts, signed widening, bitcasts, other shift amounts, a 64-bit OpPhi or variable) is left exactly as it was and
+# keeps Int64. --int64-addresses turns the lowering off.
+_A64_PRODUCERS = ("OpUConvert", "OpShiftLeftLogical", "OpShiftRightLogical", "OpBitwiseOr", "OpBitwiseAnd", "OpIAdd",
+                  "OpISub")
+# 64-bit compares of two addresses: high words first, then the low words.
+_A64_CMP = {"OpULessThan": ("OpULessThan", False), "OpULessThanEqual": ("OpULessThanEqual", False),
+            "OpUGreaterThan": ("OpULessThan", True), "OpUGreaterThanEqual": ("OpULessThanEqual", True),
+            "OpIEqual": None, "OpINotEqual": None}
+_A64_ID = re.compile(r"%[\w.]+")
+
+
+def lower_addr64(text):
+    lines = text.split("\n")
+    t64, c64, prod, conv, cmp, narrow = set(), {}, {}, {}, {}, {}
+    for line in lines:
+        w = line.split()
+        if len(w) < 3 or w[1] != "=":
+            continue
+        res, op, args = w[0], w[2], w[3:]
+        if op == "OpTypeInt" and args[:1] == ["64"]:
+            t64.add(res)
+        elif op == "OpConstant" and args and args[0] in t64:
+            c64[res] = int(args[1]) & 0xFFFFFFFFFFFFFFFF
+        elif op in _A64_PRODUCERS and args and args[0] in t64:
+            prod[res] = (op, args[1:])
+        elif op == "OpUConvert" and args[:1] == ["%uint"] and len(args) == 2:
+            narrow[res] = args[1]                       # a 64-bit value's low word (kept only if it is one)
+        elif op == "OpConvertUToPtr":
+            conv[res] = args
+        elif op in _A64_CMP and args[:1] == ["%bool"] and len(args) == 3:
+            cmp[res] = (op, args[1:])
+    if not t64:
+        return text
+    v64 = set(c64) | set(prod)
+    narrow = {r: v for r, v in narrow.items() if v in v64}
+    for res, (op, a) in list(cmp.items()):       # a compare of two 64-bit values; any other compare is left alone
+        if a[0] not in v64 and a[1] not in v64:
+            del cmp[res]
+        elif a[0] not in v64 or a[1] not in v64:
+            return text
+    for res, (op, a) in prod.items():            # the idiom, exactly
+        ok = (op == "OpUConvert" and len(a) == 1 and a[0] not in v64) or \
+             (op in ("OpShiftLeftLogical", "OpShiftRightLogical") and len(a) == 2 and a[0] in v64 and
+              c64.get(a[1]) == 32) or \
+             (op in ("OpBitwiseOr", "OpBitwiseAnd", "OpIAdd", "OpISub") and len(a) == 2 and a[0] in v64 and
+              a[1] in v64)
+        if not ok:
+            return text
+    for line in lines:                           # any other mention of a 64-bit type or value: keep Int64
+        w = line.split()
+        res = w[0] if len(w) >= 3 and w[1] == "=" else None
+        if res in t64 or res in c64 or res in prod or res in conv or res in cmp or res in narrow:
+            continue
+        if any(tok in t64 or tok in v64 for tok in _A64_ID.findall(line)):
+            return text
+    uc, pair, out, n = {}, {}, [], 0
+
+    def const(v):
+        if v not in uc:
+            uc[v] = f"%a64c_{v:x}"
+        return uc[v]
+    for cid, v in c64.items():
+        pair[cid] = (const(v & 0xFFFFFFFF), const(v >> 32))
+    for line in lines:
+        w = line.split()
+        res = w[0] if len(w) >= 3 and w[1] == "=" else None
+        if res in t64 or res in c64 or line.strip() == "OpCapability Int64":
+            continue
+        if res in prod:
+            op, a = prod[res]
+            if op == "OpUConvert":
+                pair[res] = (a[0], const(0))
+            elif op == "OpShiftLeftLogical":
+                pair[res] = (const(0), pair[a[0]][0])
+            elif op == "OpShiftRightLogical":
+                pair[res] = (pair[a[0]][1], const(0))
+            else:
+                n += 1
+                (xl, xh), (yl, yh), p = pair[a[0]], pair[a[1]], f"%a64_{n}"
+                if op in ("OpBitwiseOr", "OpBitwiseAnd"):
+                    out += [f"         {p}l = {op} %uint {xl} {yl}", f"         {p}h = {op} %uint {xh} {yh}"]
+                else:       # the low words with the carry / borrow out, then the high words with it
+                    wide, high = ("OpIAddCarry", "OpIAdd") if op == "OpIAdd" else ("OpISubBorrow", "OpISub")
+                    out += [f"         {p}s = {wide} %umul {xl} {yl}",
+                            f"         {p}l = OpCompositeExtract %uint {p}s 0",
+                            f"         {p}c = OpCompositeExtract %uint {p}s 1",
+                            f"         {p}g = {high} %uint {xh} {yh}",
+                            f"         {p}h = {high} %uint {p}g {p}c"]
+                pair[res] = (p + "l", p + "h")
+            continue
+        if res in narrow:
+            out.append(f"         {res} = OpCopyObject %uint {pair[narrow[res]][0]}")
+            continue
+        if res in cmp:
+            n += 1
+            op, a = cmp[res]
+            (xl, xh), (yl, yh), p = pair[a[0]], pair[a[1]], f"%a64_{n}"
+            if _A64_CMP[op] is None:
+                out += [f"         {p}h = OpIEqual %bool {xh} {yh}", f"         {p}l = OpIEqual %bool {xl} {yl}",
+                        f"         {p}e = OpLogicalAnd %bool {p}h {p}l"]
+                out.append(f"         {res} = OpLogicalNot %bool {p}e" if op == "OpINotEqual" else
+                           f"         {res} = OpCopyObject %bool {p}e")
+            else:
+                lo_op, swap = _A64_CMP[op]
+                if swap:
+                    (xl, xh), (yl, yh) = (yl, yh), (xl, xh)
+                out += [f"         {p}h = OpULessThan %bool {xh} {yh}", f"         {p}e = OpIEqual %bool {xh} {yh}",
+                        f"         {p}l = {lo_op} %bool {xl} {yl}", f"         {p}a = OpLogicalAnd %bool {p}e {p}l",
+                        f"         {res} = OpLogicalOr %bool {p}h {p}a"]
+            continue
+        if res in conv and conv[res][1] in pair:
+            n += 1
+            (xl, xh), p = pair[conv[res][1]], f"%a64_{n}"
+            out += [f"         {p}v = OpCompositeConstruct %v2uint_a {xl} {xh}",
+                    f"         {res} = OpBitcast {conv[res][0]} {p}v"]
+            continue
+        out.append(line)
+        if line.strip() == "%uint = OpTypeInt 32 0":
+            out.append("%v2uint_a = OpTypeVector %uint 2")
+            out += [f"{name} = OpConstant %uint {v}" for v, name in sorted(uc.items())]
+    return "\n".join(out)
 
 
 # SPIR-V caps an instruction at 65,535 words. The dispatch loop's OpSwitch has one (literal, label) pair per block,
@@ -12246,6 +12382,8 @@ def main():
                     help="wave64 vertex, pixel and geometry shaders that are not exact on 32-wide subgroups (tier C of "
                          "tools/wave64_halves.py): warn = count them in the summary and mark them in the index, "
                          "error = refuse them (Unsupported), off = skip the analysis")
+    ap.add_argument("--int64-addresses", action="store_true",
+                    help="keep 64-bit integer address arithmetic (Int64 / shaderInt64) instead of lowering it to 32-bit pairs")
     ap.add_argument("--bary-fallback", action="store_true",
                     help="pixel shaders that read raw barycentrics take them from an ordinary interpolated input "
                          "(metadata: bary_fallback_input) instead of BaryCoordKHR, for devices without "
@@ -12273,12 +12411,13 @@ def main():
                          "(32768 on some drivers) is checked by the runtime against lds_bytes in index.json")
     a = ap.parse_args()
     MAX_SHARED_BYTES = a.max_shared_memory
-    global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES
+    global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES, ADDR_PAIR
     FMA_KHR = a.fma == "khr"
     STRUCTURED = not a.dispatch_loop
     WAVE64_EMULATE = a.wave64_emulate
     WAVE64_GRAPHICS = a.wave64_graphics
     BARY_FALLBACK = a.bary_fallback
+    ADDR_PAIR = not a.int64_addresses
     TEXEL_OFFSET_FALLBACK = a.texel_offset_fallback
     MESH_COMPUTE = a.mesh_compute
     F16_HALVES = a.f16_interp_fallback
