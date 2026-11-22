@@ -231,6 +231,22 @@ Add `--llvm <AMDGPU LLVM library>` to disassemble referenced native pixel code a
 
 The WARP control compiles the source-built compute shader with its root signature stripped. D3D12 rejects creation without a root signature. The same shader creates a PSO when given the matching signature from the embedded build. The control measures PSO creation on the source-built fixture.
 
+### Shader census tiers and what each percentage divides by
+
+Three counts describe different populations, so each one is named here with its source and its key. A percentage is only comparable with another that divides by the same one.
+
+| Count | Population | Source | Key |
+| --- | --- | --- | --- |
+| 26,503 accepted archive records | Named records in the plaintext archive, before the PSO cache | A candidate start at every byte of the archive, kept when its payload inflates to a `DXBC` container whose u32 at +24 equals the record's uncompressed length (`tools/shader_profile_audit.py`) | End offset plus the 16-byte DXBC digest at container bytes 4..20 |
+| 25,889 distinct DXBC header digests | The same 26,503 records, counted by container header | Same enumeration | Container bytes 4..20 alone |
+| 21,522 cache index entries | Programs in the console PSO cache, a separate population behind the archive | The 8-byte entries that follow the 0x80 header and the 25,471 × 0x70, 2,693 × 0x18 and 54,576 × 8 tables on cache page 0 | The entry itself: a 4-byte offset from a code-area base followed by a 4-byte allocation span |
+
+The profile tables in this document divide by the 26,503 accepted archive records, and each per-stage row divides by that stage's own count (PS 12,101, CS 2,689, MS 9,282, VS 2,236, GS 195). `tools/shader_profile_audit.py` counts those records and caches classification by the full-container SHA-256. Enumerating a start at every byte yields 26,721 accepted candidates; 218 of them are re-detections, leaving 26,503 records and 25,889 digests. Dividing 26,503 records by 25,889 digests would move a denominator by 614 without measuring anything new, so the two keys stay apart: one selects records, the other selects container bytes.
+
+The 21,522 cache entries sit on the other side of the archive. The last named record ends 170,812 B before the cache begins, and the two disk ranges do not overlap. 21,044 was the earlier extractor result. It was revised because that scan ended every program at a fixed 40-byte `S_CODE_END` tail and so missed 478 entries: 419 carry the standard 8-byte gate and a normal `S_ENDPGM` — 407 end with a 20-byte `S_CODE_END` tail and 12 carry no `S_CODE_END` fill at all — 58 begin directly with the program body without the gate, and one has no terminator. A further 4,485 entries were bounded wrongly at both ends, because their start falls in the gap between two old records and their tail extends into the next one. Boundaries now come from the index, which gives 21,522 programs. 26,091 is the number of `S_ENDPGM` instructions in the code area and is not a count of records.
+
+The 218 re-detections are suffix aliases. Each one starts inside the name of the previous record, at a byte whose value equals its distance to the name's terminating NUL, and shares that record's terminator, header and payload. An earlier note placed these starts inside the compressed payload instead; the count does not change, because de-duplication keeps the earlier start whenever the end offset and the digest match.
+
 ### Fixed-profile archive rescan
 
 The fixed profiles previously verified 861 records. The Windows readback run at `1aafb0f` revisited all 26,503 records and added a packed RGB PS. Reclassification at `f94c254` reproduced the same 862 passes. A final full scan at `26544c6` reproduced every previous accepted source byte for byte and added one texture-sampling PS. The table incorporates its separate Windows readback.
