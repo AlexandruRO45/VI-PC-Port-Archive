@@ -1179,6 +1179,47 @@ Sixteen mutations of the translator each fail the test:
 
 Only the alias checks catch the last two.
 
+## Repeated memory copies in the control-flow CPU lifter
+
+`tools/cpu_switch_aot.py` now lowers rep movsb/movsw/movsd/movsq copy 1-, 2-, 4- and 8-byte elements. These instructions
+can occur inside branches, loops and translated callees; they use the existing
+register-definedness and nonvolatile-save proofs. A zero REP count touches no memory
+and leaves the pointers unchanged. The loop updates RSI/RDI and RCX at their architectural widths.
+
+Each element is read before it is written. Forward overlapping copies deliberately
+observe bytes written by preceding iterations, unlike `memmove`. Volatile guest
+reads and writes preserve access faults and iteration order under `/O2`.
+Arithmetic flags survive a transfer and remain available to the existing bounded
+flag-consumer proof. DF is assumed clear at entry under the Windows x64 ABI. CLD is accepted; STD is rejected. Non-repeated string instructions remain rejected. STOS remains rejected.
+Address-size overrides, segment prefixes, REPNE, LODS, CMPS and SCAS remain rejected
+in this control-flow profile. The shared straight-line translator has its separate
+string-instruction coverage. Guest exception resumption, native REP register values
+at a fault, concurrent memory observation and throughput equivalence are not modeled.
+
+The fixtures, reference and implementation are original MIT source. They use
+source-built buffers, not title code. An assembly harness checks physical RSI/RDI
+preservation and DF on return. The independent byte-array model checks complete
+buffers and their surrounding bytes, pointer updates, counts, results and carry
+from a compare before the transfer. Macro-generated instruction forms are recorded
+from the decoded functions only after all comparisons and controls succeed.
+
+```powershell
+cmake --build out/native --target cpu_switch_strings_lifted cpu_switch_strings_lifted_o2 cpu_switch_strings_mutants cpu_string_probe cpu_guarded_call --parallel 4
+ctest --test-dir out/native --no-tests=error -R '^cpu_aot_switch_strings$' -V
+```
+
+Windows 11 build 26300.9974, MSVC/ML64 19.44.35230 and Python 3.12.8:
+6 exports, 2,280 native/AOT/reference comparisons and 39 access-violation
+comparisons passed, including the `/O2` translation. Compiled incorrect
+implementations must fail the comparison: a bulk `memmove` on destructive overlap
+and a truncated repeat count.
+The comparison includes inaccessible addresses with a zero count, and a read that
+copies three bytes before faulting at a protected page; no later trace store executes.
+No title startup result is claimed.
+
+The Windows ABI boundary follows [Microsoft's direction-flag convention](https://learn.microsoft.com/en-us/cpp/build/x64-software-conventions).
+MOVS/STOS semantics follow the [Intel SDM](https://cdrdv2-public.intel.com/868137/325462-089-sdm-vol-1-2abcd-3abcd-4.pdf).
+
 ## Switch dispatch through jump tables
 
 Compilers lower a dense `switch` to a bounds check and an indirect `JMP` through a table of 32-bit entries. The [jump-table translator](../tools/cpu_switch_aot.py) recognizes the two x64 layouts in common use. MSVC stores image-relative entries and loads them through a register holding `__ImageBase`. LLVM stores signed offsets from the table and adds the table address. The translator reads the table from the PE, then emits a C++ `switch` whose cases jump to labels at the decoded targets. The host compiler builds its own dispatch from that switch.

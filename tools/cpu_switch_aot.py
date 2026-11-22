@@ -181,9 +181,15 @@ SIGN_EXTENSIONS = {M.CBW: (R.AL, R.AX), M.CWDE: (R.AX, R.EAX), M.CDQE: (R.EAX, R
 # Implicit operands of one-operand MUL, IMUL, DIV and IDIV, by operand width.
 ACCUMULATOR = {1: R.AL, 2: R.AX, 4: R.EAX, 8: R.RAX}
 DATA = {2: R.DX, 4: R.EDX, 8: R.RDX}
+# Key by decoded Code, not Mnemonic: MOVSD also names an unrelated SSE instruction.
+STRING_TRANSFERS = {
+    Code.MOVSB_M8_M8: ("movs", 1), Code.MOVSW_M16_M16: ("movs", 2),
+    Code.MOVSD_M32_M32: ("movs", 4), Code.MOVSQ_M64_M64: ("movs", 8),
+}
 # Instructions that neither read nor write the arithmetic flags, besides SETcc and CMOVcc,
 # which only read them.
-FLAG_NEUTRAL = {M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC, *SIGN_EXTENSIONS}
+FLAG_NEUTRAL = {M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC, *SIGN_EXTENSIONS,
+                M.MOVSB, M.MOVSW, M.MOVSD, M.MOVSQ, M.CLD}
 FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC}
 MAX_FLAG_DISTANCE = 16
 CONDITIONS = {CC.O: "o", CC.NO: "no", CC.P: "p", CC.NP: "np",
@@ -215,6 +221,9 @@ def full(register):
 def implicit_writes(ins):
     """Full registers that an instruction writes without naming them as operand 0. RDX counts for
     every one-operand multiply or divide, although an 8-bit multiply leaves it unchanged."""
+    if ins.code in STRING_TRANSFERS:
+        kind, _ = STRING_TRANSFERS[ins.code]
+        return {R.RDI} | ({R.RSI} if kind == "movs" else set()) | ({R.RCX} if ins.has_rep_prefix else set())
     if ins.mnemonic in SIGN_EXTENSIONS:
         return {full(SIGN_EXTENSIONS[ins.mnemonic][1])}
     if ins.mnemonic in (M.MUL, M.IMUL, M.DIV, M.IDIV) and ins.op_count == 1:
@@ -958,6 +967,28 @@ class Lifter:
         sets_flags records the flag inputs for a later consumer; producer is the
         instruction whose flags a SETcc or CMOVcc reads."""
         mnemonic = ins.mnemonic
+        if ins.code in STRING_TRANSFERS:
+            kind, width = STRING_TRANSFERS[ins.code]
+            if (not ins.has_rep_prefix or ins.has_segment_prefix or ins.has_repne_prefix or ins.has_lock_prefix
+                    or any(ins.op_kind(n) not in (OpKind.REGISTER, OpKind.MEMORY_ESRDI, OpKind.MEMORY_SEG_RSI)
+                           for n in range(ins.op_count))):
+                raise ValueError(f"unsupported string addressing or prefix at RVA {ins.ip:#x}")
+            registers = {R.RDI} | ({R.RSI} if kind == "movs" else set())
+            self.used.update(registers)
+            reads = dict.fromkeys(registers, 8)
+            writes = dict.fromkeys(registers, 8)
+            value = f"load_always<{unsigned(width)}>(rsi)"
+            # One element at a time: neither memcpy nor memmove reproduces a forward
+            # overlapping MOVS that reads the bytes just written by earlier iterations.
+            step = (f"*reinterpret_cast<volatile {unsigned(width)}*>(rdi) = {value}; "
+                    + ("rsi += step; " if kind == "movs" else "") + "rdi += step;")
+            if ins.has_rep_prefix:
+                self.used.add(R.RCX)
+                reads[R.RCX] = writes[R.RCX] = 8
+                step = f"while (rcx != 0) {{ {step} --rcx; }}"
+            return f"{{ const word step = {width}ull; {step} }}", reads, writes
+        if mnemonic == M.CLD:
+            return "", {}, {}  # DF stays clear throughout this profile.
         width = self.width(ins)
         reads, writes = {}, {}
 
@@ -1508,7 +1539,7 @@ def lift_function(program, entry, symbol, arguments, internal):
     effects = {}
     for ip in order:
         ins = instructions[ip]
-        if ins.has_lock_prefix or ins.has_rep_prefix or ins.has_repne_prefix:
+        if ins.has_lock_prefix or ins.has_repne_prefix or (ins.has_rep_prefix and ins.code not in STRING_TRANSFERS):
             raise ValueError(f"unsupported prefix at RVA {ip:#x}")
         body[ip] = ""
         if ip in callees:

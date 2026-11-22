@@ -531,6 +531,40 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(cpu_aot_flag_conditions PROPERTIES
         ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_flag_conditions.txt")
     cpu_asm_fixture(cpu_switch_addr32 switch_addr32)
+    cpu_asm_fixture(cpu_switch_strings switch_strings)
+    cpu_asm_fixture(cpu_string_probe string_probe)
+    set(switch_strings_source "${CMAKE_CURRENT_BINARY_DIR}/cpu_switch_strings_lifted.cpp")
+    add_custom_command(OUTPUT "${switch_strings_source}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/switch_strings_check.py"
+            emit "$<TARGET_FILE:cpu_switch_strings>" "${switch_strings_source}"
+        DEPENDS cpu_switch_strings tests/cpu/switch_strings_check.py tools/cpu_switch_aot.py
+            tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+    add_library(cpu_switch_strings_lifted SHARED "${switch_strings_source}")
+    set(switch_strings_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_switch_strings_lifted_o2.dll")
+    add_custom_command(OUTPUT "${switch_strings_o2}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /LD "${switch_strings_source}"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_switch_strings_lifted_o2.obj" "/Fe${switch_strings_o2}"
+        DEPENDS "${switch_strings_source}" VERBATIM)
+    add_custom_target(cpu_switch_strings_lifted_o2 ALL DEPENDS "${switch_strings_o2}")
+    set(switch_strings_mutants "${CMAKE_CURRENT_BINARY_DIR}/cpu_switch_strings_mutants.cpp")
+    add_custom_command(OUTPUT "${switch_strings_mutants}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/switch_strings_check.py"
+            mutants "$<TARGET_FILE:cpu_switch_strings>" "${switch_strings_mutants}"
+        DEPENDS cpu_switch_strings tests/cpu/switch_strings_check.py tools/cpu_switch_aot.py
+            tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+    set(switch_strings_mutants_dll "${CMAKE_CURRENT_BINARY_DIR}/cpu_switch_strings_mutants.dll")
+    add_custom_command(OUTPUT "${switch_strings_mutants_dll}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /LD "${switch_strings_mutants}"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_switch_strings_mutants.obj" "/Fe${switch_strings_mutants_dll}"
+        DEPENDS "${switch_strings_mutants}" VERBATIM)
+    add_custom_target(cpu_switch_strings_mutants ALL DEPENDS "${switch_strings_mutants_dll}")
+    add_test(NAME cpu_aot_switch_strings COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/switch_strings_check.py" check "$<TARGET_FILE:cpu_string_probe>"
+        "$<TARGET_FILE:cpu_guarded_call>" "$<TARGET_FILE:cpu_switch_strings>"
+        "$<TARGET_FILE:cpu_switch_strings_lifted>" "${switch_strings_o2}"
+        "${switch_strings_mutants_dll}")
+    set_tests_properties(cpu_aot_switch_strings PROPERTIES TIMEOUT 60
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_switch_strings.txt")
     cpu_translation(cpu_switch_addr32 cpu_switch_aot lea_wrap,lea_back,load_back,store_ahead)
     add_test(NAME cpu_aot_switch_addr32 COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/switch_addr32_check.py" "$<TARGET_FILE:cpu_switch_addr32>"
