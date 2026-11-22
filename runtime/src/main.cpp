@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include "cli.h"
 #include "pe_loader.h"
 #include "../shims/d3d12_trace.h"
 #include "../shims/process_shim.h"
@@ -47,27 +48,14 @@ int usage() {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
-    std::filesystem::path image, game_dir;
-    bool dry_run = false, init = false, run = false, trace_d3d12 = false;
-    std::vector<std::string> game_args;
-    for (int i = 1; i < argc; ++i) {
-        std::wstring a = argv[i];
-        if (a == L"--") {
-            for (++i; i < argc; ++i) game_args.push_back(std::filesystem::path(argv[i]).string());
-            break;
-        }
-        if (a == L"--dry-run") dry_run = true;
-        else if (a == L"--init") init = true;
-        else if (a == L"--run") run = true;
-        else if (a == L"--trace-d3d12") trace_d3d12 = true;
-        else if (a == L"--game-dir" && i + 1 < argc) game_dir = argv[++i];
-        else if (image.empty()) image = a;
-        else return usage();
-    }
-    if (image.empty()) return usage();
-    if (!dry_run && !init && !run) return usage();
-    if (game_dir.empty()) game_dir = image.parent_path();
-    rt::d3d12_trace::set_enabled(trace_d3d12);
+    rt::CliOptions opts;
+    if (!rt::parse_cli_args(argc, argv, opts)) return usage();
+    const bool init = opts.mode == rt::RunMode::Init;
+    const bool run = opts.mode == rt::RunMode::Run;
+    const auto& image = opts.image;
+    const auto& game_dir = opts.game_dir;
+    const auto& game_args = opts.game_args;
+    rt::d3d12_trace::set_enabled(opts.trace_d3d12);
 
     try {
         rt::Loader loader(game_dir);
