@@ -48,6 +48,7 @@ def main():
     check_layout_destination_paths()
     check_decode_torrent()
     check_manifest_selection()
+    check_inventory_layout_selection()
     print("layout chunk summary ok")
 
 
@@ -73,6 +74,25 @@ def check_manifest_selection() -> None:
             assert run.returncode == 2, run.stderr
             assert pattern in run.stderr and f"found {count}" in run.stderr, run.stderr
             assert "Traceback" not in run.stderr and not report.exists(), run.stderr
+
+
+def check_inventory_layout_selection() -> None:
+    for files, count in (
+        ([], 0),
+        (["layout_a.xml", "layout_b.xml"], 2),
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory)
+            (package / "layout_directory.xml").mkdir()
+            for name in files:
+                (package / name).touch()
+            run = subprocess.run(
+                [sys.executable, "-B", str(PROJECT / "tools/resource_inventory.py"), str(package)],
+                capture_output=True, text=True,
+            )
+            assert run.returncode == 2, run.stderr
+            assert "layout*.xml" in run.stderr and f"found {count}" in run.stderr, run.stderr
+            assert "Traceback" not in run.stderr, run.stderr
 
 
 def check_layout_destination_paths() -> None:
