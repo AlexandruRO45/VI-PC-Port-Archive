@@ -157,6 +157,96 @@ class LDSMemory:
         return old_val, new_mem, swapped
 
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class DSOpcode(Enum):
+    """Data Share (DS) 64-bit compare-and-swap atomic opcodes."""
+    DS_CMPST_RTN_B64 = "ds_cmpst_rtn_b64"
+
+
+class RegType(Enum):
+    """Register file classes."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclass(frozen=True)
+class RegSingle:
+    """32-bit single register representation."""
+    index: int
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        max_limit = DEFAULT_NUM_VGPRS if self.reg_type == RegType.VGPR else DEFAULT_NUM_SGPRS
+        if not (0 <= self.index < max_limit):
+            raise ValueError(f"Register index out of bounds: {self.reg_type.value}[{self.index}]")
+
+    def __str__(self) -> str:
+        return f"{self.reg_type.value}[{self.index}]"
+
+
+@dataclass(frozen=True)
+class RegPair:
+    """64-bit consecutive register pair representation."""
+    index: int
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        max_limit = (DEFAULT_NUM_VGPRS - 1) if self.reg_type == RegType.VGPR else (DEFAULT_NUM_SGPRS - 1)
+        if not (0 <= self.index < max_limit):
+            raise ValueError(f"Register pair base index out of bounds: {self.reg_type.value}[{self.index}:{self.index + 1}]")
+
+    def __str__(self) -> str:
+        return f"{self.reg_type.value}[{self.index}:{self.index + 1}]"
+
+
+@dataclass(frozen=True)
+class Immediate64:
+    """64-bit immediate constant operand."""
+    val: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "val", u64(self.val))
+
+    def __str__(self) -> str:
+        return f"0x{self.val:X}"
+
+
+Operand64 = Union[RegPair, Immediate64]
+
+
+@dataclass(frozen=True)
+class DSCmpstRtnB64Instruction:
+    """Symbolic AST node for ds_cmpst_rtn_b64 instruction."""
+    vdst: RegPair
+    vaddr: RegSingle
+    vdata0: Operand64  # 64-bit compare value
+    vdata1: Operand64  # 64-bit new value
+    offset: int = 0
+    gds: bool = False
+    opcode: DSOpcode = DSOpcode.DS_CMPST_RTN_B64
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.vdst, RegPair) or self.vdst.reg_type != RegType.VGPR:
+            raise ValueError(f"vdst must be a VGPR RegPair, got {self.vdst}")
+        if not isinstance(self.vaddr, RegSingle) or self.vaddr.reg_type != RegType.VGPR:
+            raise ValueError(f"vaddr must be a VGPR RegSingle, got {self.vaddr}")
+        if not (0 <= self.offset <= OFFSET16_MASK):
+            raise ValueError(f"offset out of bounds: {self.offset}")
+
+    def disassemble(self) -> str:
+        """Emit canonical AMD assembly string."""
+        parts = [self.opcode.value, str(self.vdst), str(self.vaddr), str(self.vdata0), str(self.vdata1)]
+        if self.offset != 0:
+            parts.append(f"offset:{self.offset}")
+        if self.gds:
+            parts.append("gds")
+        return f"{parts[0]} {', '.join(parts[1:])}"
+
+
+
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Phase 1: Unit tests for reference mathematical oracle and architectural model."""
 
@@ -244,5 +334,73 @@ class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
         self.assertEqual(lds.read_qword(addr), new_val)
 
 
+class TestSymbolicAST(unittest.TestCase):
+    """Phase 2: Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_valid_ast_construction(self) -> None:
+        vdst = RegPair(0, RegType.VGPR)
+        vaddr = RegSingle(2, RegType.VGPR)
+        vdata0 = RegPair(4, RegType.VGPR)
+        vdata1 = RegPair(6, RegType.VGPR)
+
+        instr = DSCmpstRtnB64Instruction(vdst=vdst, vaddr=vaddr, vdata0=vdata0, vdata1=vdata1, offset=16)
+
+        self.assertEqual(instr.opcode, DSOpcode.DS_CMPST_RTN_B64)
+        self.assertEqual(instr.vdst.index, 0)
+        self.assertEqual(instr.vaddr.index, 2)
+        self.assertEqual(instr.offset, 16)
+        self.assertFalse(instr.gds)
+
+    def test_ast_with_immediate_operands(self) -> None:
+        vdst = RegPair(10, RegType.VGPR)
+        vaddr = RegSingle(12, RegType.VGPR)
+        cmp_imm = Immediate64(0x1122_3344_5566_7788)
+        new_imm = Immediate64(0x99AA_BBCC_DDEE_FF00)
+
+        instr = DSCmpstRtnB64Instruction(vdst=vdst, vaddr=vaddr, vdata0=cmp_imm, vdata1=new_imm, offset=0)
+        self.assertEqual(instr.vdata0, cmp_imm)
+        self.assertEqual(instr.vdata1, new_imm)
+
+    def test_disassembly_formatting(self) -> None:
+        vdst = RegPair(0, RegType.VGPR)
+        vaddr = RegSingle(2, RegType.VGPR)
+        vdata0 = RegPair(4, RegType.VGPR)
+        vdata1 = RegPair(6, RegType.VGPR)
+
+        instr_no_off = DSCmpstRtnB64Instruction(vdst=vdst, vaddr=vaddr, vdata0=vdata0, vdata1=vdata1)
+        self.assertEqual(instr_no_off.disassemble(), "ds_cmpst_rtn_b64 v[0:1], v[2], v[4:5], v[6:7]")
+
+        instr_off = DSCmpstRtnB64Instruction(vdst=vdst, vaddr=vaddr, vdata0=vdata0, vdata1=vdata1, offset=32)
+        self.assertEqual(instr_off.disassemble(), "ds_cmpst_rtn_b64 v[0:1], v[2], v[4:5], v[6:7], offset:32")
+
+        instr_gds = DSCmpstRtnB64Instruction(vdst=vdst, vaddr=vaddr, vdata0=vdata0, vdata1=vdata1, offset=8, gds=True)
+        self.assertEqual(instr_gds.disassemble(), "ds_cmpst_rtn_b64 v[0:1], v[2], v[4:5], v[6:7], offset:8, gds")
+
+    def test_ast_validation_errors(self) -> None:
+        v0 = RegPair(0, RegType.VGPR)
+        v1 = RegSingle(1, RegType.VGPR)
+        s0_pair = RegPair(0, RegType.SGPR)
+        s0_single = RegSingle(0, RegType.SGPR)
+
+        # vdst cannot be SGPR or RegSingle
+        with self.assertRaises(ValueError):
+            DSCmpstRtnB64Instruction(vdst=s0_pair, vaddr=v1, vdata0=v0, vdata1=v0)
+        with self.assertRaises(ValueError):
+            DSCmpstRtnB64Instruction(vdst=v1, vaddr=v1, vdata0=v0, vdata1=v0)  # type: ignore
+
+        # vaddr cannot be SGPR or RegPair
+        with self.assertRaises(ValueError):
+            DSCmpstRtnB64Instruction(vdst=v0, vaddr=s0_single, vdata0=v0, vdata1=v0)
+        with self.assertRaises(ValueError):
+            DSCmpstRtnB64Instruction(vdst=v0, vaddr=v0, vdata0=v0, vdata1=v0)  # type: ignore
+
+        # Offset validation
+        with self.assertRaises(ValueError):
+            DSCmpstRtnB64Instruction(vdst=v0, vaddr=v1, vdata0=v0, vdata1=v0, offset=-1)
+        with self.assertRaises(ValueError):
+            DSCmpstRtnB64Instruction(vdst=v0, vaddr=v1, vdata0=v0, vdata1=v0, offset=65536)
+
+
 if __name__ == "__main__":
     unittest.main()
+
