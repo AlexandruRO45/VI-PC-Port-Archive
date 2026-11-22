@@ -1136,4 +1136,10 @@ SHIM_TABLE(file_system,
     FILE_API("api-ms-win-core-file-l1-1-0.dll"),
     FILE_API("api-ms-win-core-file-l1-2-0.dll"),
     FILE_API("api-ms-win-core-file-l2-1-0.dll"),
+    // The other three sets the SDK's umbrella libraries bind file calls to (OneCore_apiset.lib and WindowsApp.lib,
+    // Windows SDK 10.0.26100, x64): CopyFileW; CopyFileExA and CreateDirectoryExA; MoveFileA/W, MoveFileExA and
+    // CopyFileA. The loader matches the DLL name exactly, so without these rows those seven went to the host.
+    FILE_API("api-ms-win-core-file-l2-1-2.dll"),
+    FILE_API("api-ms-win-core-file-ansi-l2-1-0.dll"),
+    FILE_API("api-ms-win-core-kernel32-legacy-l1-1-0.dll"),
 );

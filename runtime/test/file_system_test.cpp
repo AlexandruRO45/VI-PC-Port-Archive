@@ -698,6 +698,41 @@ int main() {
         rt::fs::configure(package, overlay);
     }
 
+    // The loader matches an import by the exact DLL name in the title's import table, and a title linked against the
+    // SDK's API-set umbrella libraries does not import these seven from kernel32: OneCore_apiset.lib and
+    // WindowsApp.lib (Windows SDK 10.0.26100, x64 import members) bind them to the three sets below. Each has to
+    // reach the same shim as its kernel32 name, or the call goes to the host with a GAME: path.
+    {
+        struct Pair {
+            const char* dll;
+            const char* name;
+        };
+        const Pair pairs[] = {
+            {"api-ms-win-core-kernel32-legacy-l1-1-0.dll", "MoveFileA"},
+            {"api-ms-win-core-kernel32-legacy-l1-1-0.dll", "MoveFileW"},
+            {"api-ms-win-core-kernel32-legacy-l1-1-0.dll", "MoveFileExA"},
+            {"api-ms-win-core-kernel32-legacy-l1-1-0.dll", "CopyFileA"},
+            {"api-ms-win-core-file-l2-1-2.dll", "CopyFileW"},
+            {"api-ms-win-core-file-ansi-l2-1-0.dll", "CopyFileExA"},
+            {"api-ms-win-core-file-ansi-l2-1-0.dll", "CreateDirectoryExA"},
+        };
+        for (const Pair& pair : pairs) {
+            void* const by_set = rt::shims::find(pair.dll, pair.name);
+            void* const by_kernel32 = rt::shims::find("kernel32.dll", pair.name);
+            const std::string what =
+                std::string(pair.dll) + "!" + pair.name + " is the shim kernel32.dll!" + pair.name + " is";
+            check(by_set != nullptr && by_set == by_kernel32, what.c_str());
+        }
+
+        // One of them end to end: a move imported through the legacy set lands in the overlay, not on the host.
+        write_path(package / "apiset" / "a.txt", "apiset");
+        const auto move_by_set = resolve<MoveFileWFn>("api-ms-win-core-kernel32-legacy-l1-1-0.dll", "MoveFileW");
+        check(move_by_set && move_by_set(L"GAME:\\apiset\\a.txt", L"GAME:\\apiset\\b.txt") != FALSE &&
+                  read_path(overlay / "apiset" / "b.txt") == "apiset" &&
+                  read_path(package / "apiset" / "a.txt") == "apiset",
+              "MoveFileW through the legacy set moves a GAME: file into the overlay and leaves the package alone");
+    }
+
     std::filesystem::remove_all(root);
     std::printf("%d check(s), %d failure(s)\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
