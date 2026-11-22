@@ -181,7 +181,7 @@ KNOWN_RDNA2_BASE_OPCODES = {
     # VOP1
     "v_nop", "v_mov_b32", "v_readfirstlane_b32", "v_not_b32", "v_cls_i32",
     "v_log_f32", "v_exp_f32", "v_rcp_f32", "v_rsq_f32", "v_sqrt_f32",
-    "v_sin_f32", "v_cos_f32", "v_bfrev_b32", "v_ffbh_u32", "v_ffbl_b32",
+    "v_sin_f32", "v_cos_f32", "v_bfrev_b32", "v_ffbh_u32", "v_ffbh_i32", "v_ffbl_b32",
     "v_cvt_f32_i32", "v_cvt_f32_u32", "v_cvt_i32_f32", "v_cvt_u32_f32",
     "v_cvt_f16_f32", "v_cvt_f32_f16", "v_cvt_rpi_i32_f32", "v_cvt_flr_i32_f32",
     "v_cvt_pkrtz_f16_f32", "v_ceil_f32", "v_floor_f32", "v_rndne_f32",

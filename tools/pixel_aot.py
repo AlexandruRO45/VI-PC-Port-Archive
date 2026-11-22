@@ -411,6 +411,10 @@ INTEGER = {
     "mul_i32_i24": (2, "mul24_i32({0}, {1})"),
     "mul_hi_u32_u24": (2, "mul24_hi_u32({0}, {1})"),
     "mul_hi_i32_i24": (2, "mul24_hi_i32({0}, {1})"),
+    "bfrev_b32": (1, "reversebits({0})"),
+    "ffbl_b32": (1, "firstbitlow({0})"),
+    "ffbh_u32": (1, "ffbh_u32({0})"),
+    "ffbh_i32": (1, "ffbh_i32({0})"),
 }
 MUL24_HELPERS = {
     "mul_u32_u24": ("mul24_u32",),
@@ -702,6 +706,17 @@ uint mul_hi_i32(uint a, uint b) {
         "    uint hi = mul24_hi_u32(ua, ub);\n"
         "    if (neg && (lo != 0u || hi != 0u)) return ~hi + (lo == 0u ? 1u : 0u);\n"
         "    return hi;\n"
+        "}"
+    ),
+    "ffbh_u32": (
+        "uint ffbh_u32(uint value) {\n"
+        "    return value == 0u ? 0xffffffffu : (31u - firstbithigh(value));\n"
+        "}"
+    ),
+    "ffbh_i32": (
+        "uint ffbh_i32(uint value) {\n"
+        "    uint mask = (value & 0x80000000u) != 0u ? ~value : value;\n"
+        "    return mask == 0u ? 0xffffffffu : (31u - firstbithigh(mask));\n"
         "}"
     ),
 }
@@ -1945,6 +1960,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             args = [int_operand(t, scalar, vector, pending, sample_dest, signed=False) for t in tokens]
             if op in MUL24_HELPERS:
                 helpers.update(MUL24_HELPERS[op])
+            elif op in ("ffbh_u32", "ffbh_i32"):
+                helpers.add(op)
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({template.format(*args)});")
         elif m := match(rf"v_cmp_class_f32(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):

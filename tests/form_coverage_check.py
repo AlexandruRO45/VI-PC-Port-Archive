@@ -304,10 +304,17 @@ def check_shader_records():
         ("SOP2", "s_lshl1_add_u32"), ("SOP2", "s_lshl2_add_u32"),
         ("SOP2", "s_lshl3_add_u32"), ("SOP2", "s_lshl4_add_u32"),
     }
+    bit_scan_forms = {
+        ("VOP1", "v_bfrev_b32"), ("VOP3", "v_bfrev_b32_e64"),
+        ("VOP1", "v_ffbl_b32"), ("VOP3", "v_ffbl_b32_e64"),
+        ("VOP1", "v_ffbh_u32"), ("VOP3", "v_ffbh_u32_e64"),
+        ("VOP1", "v_ffbh_i32"), ("VOP3", "v_ffbh_i32_e64"),
+    }
     rejected_forms = {
         "s_and_saveexec_b64", "s_or_saveexec_b64", "s_andn2_saveexec_b64",
         "v_mul_i32_i24_sdwa",
         "s_lshl0_add_u32", "s_lshl5_add_u32",
+        "v_bfrev_b32_sdwa",
     }
     assert not (pixel.ACCEPTED & rejected_forms), pixel.ACCEPTED & rejected_forms
     for name in ("gfx1013.tsv", "rdna2.tsv"):
@@ -317,6 +324,7 @@ def check_shader_records():
         assert vop2_forms <= covered, (name, vop2_forms - covered)
         assert mul24_forms <= covered, (name, mul24_forms - covered)
         assert sop2_lshl_add_forms <= covered, (name, sop2_lshl_add_forms - covered)
+        assert bit_scan_forms <= covered, (name, bit_scan_forms - covered)
     # Integer comparisons: e32 counts as VOPC and e64 as VOP3, for every 16- and 32-bit predicate the
     # translator lowers; the rejected exec-writing, 64-bit and f16 class neighbours stay out.
     int_compares = {f"v_cmp_{op}_{kind}" for op in ("eq", "ne", "lt", "le", "gt", "ge")

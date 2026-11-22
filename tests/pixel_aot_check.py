@@ -5152,6 +5152,56 @@ def check_controls(directory):
     wqm = base_m24.index("s_wqm_b64 exec, exec") + 1
     must_reject(translate, base_m24[:wqm] + ["v_mul_hi_i32_i24_e64 v20, 1, 2"] + base_m24[wqm:])
 
+    # v_bfrev_b32, v_ffbl_b32, v_ffbh_u32, v_ffbh_i32 controls and rejections.
+    bit_scan_hlsl = translate(bit_scan_values())
+    assert "uint ffbh_u32(uint value)" in bit_scan_hlsl, bit_scan_hlsl
+    assert "uint ffbh_i32(uint value)" in bit_scan_hlsl, bit_scan_hlsl
+    bit_scan_main = bit_scan_hlsl.split("float4 main", 1)[1]
+    for snippet in (
+        "asfloat(reversebits(asuint(params[0].w)))",
+        "asfloat(reversebits(asuint(alu",
+        "asfloat(firstbitlow(asuint(params[1].x)))",
+        "asfloat(firstbitlow(asuint(alu",
+        "asfloat(ffbh_u32(asuint(params[1].y)))",
+        "asfloat(ffbh_u32(asuint(alu",
+        "asfloat(ffbh_i32(asuint(params[1].z)))",
+        "asfloat(ffbh_i32(asuint(alu",
+    ):
+        assert snippet in bit_scan_main, snippet
+    # Existing programs that do not use ffbh helpers must not emit them.
+    assert "ffbh_u32" not in base_hlsl and "ffbh_i32" not in base_hlsl
+    # Verify reference and wrong-mode sensitivity across all 5 constant sets.
+    for words in BIT_SCAN_SETS:
+        expected = bit_scan_reference(words)
+        for ch in expected:
+            assert half_rtz(ch) == ch, (words, expected)
+    for mode in ("ffbh_u32_lsb", "ffbh_i32_unsigned", "ffbh_i32_lsb", "ffbh_zero_32", "ffbl_as_ffbh", "bfrev_identity"):
+        assert any(bit_scan_reference(w, mode=mode) != bit_scan_reference(w) for w in BIT_SCAN_SETS), mode
+    base_bs = bit_scan_values()
+    for bad in (
+        "v_bfrev_b32_e64 v21, -v28",
+        "v_bfrev_b32_e64 v21, |v28|",
+        "v_bfrev_b32_e64 v21, abs(v28)",
+        "v_bfrev_b32_e64 v21, v28 clamp",
+        "v_bfrev_b32_sdwa v21, v28 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_ffbl_b32_e64 v23, v29, 0",
+        "v_ffbh_u32_e64 v25, -v30",
+        "v_ffbh_i32_e64 v27, |v31|",
+        "v_ffbh_u32_e32 v256, s46",
+        "v_ffbh_i32_e32 v26, 0x100000000",
+    ):
+        changed = [line.replace("v_bfrev_b32_e64 v21, v28", bad) for line in base_bs]
+        assert changed != base_bs, bad
+        must_reject(translate, changed)
+    wait = base_bs.index("s_waitcnt vmcnt(0)")
+    must_reject(translate, base_bs[:wait] + ["v_bfrev_b32_e32 v12, 1"] + base_bs[wait:])
+    must_reject(translate, base_bs[:wait] + ["v_ffbh_i32_e64 v13, v12"] + base_bs[wait:])
+    load = next(i for i, line in enumerate(base_bs) if line.startswith("s_buffer_load_dwordx4"))
+    lgkm = base_bs.index("s_waitcnt lgkmcnt(0)", load)
+    must_reject(translate, base_bs[:lgkm] + ["v_ffbh_u32_e32 v20, s46"] + base_bs[lgkm:])
+    wqm = base_bs.index("s_wqm_b64 exec, exec") + 1
+    must_reject(translate, base_bs[:wqm] + ["v_ffbl_b32_e32 v20, 1"] + base_bs[wqm:])
+
 
 def check_program_extent(directory, library):
     # A conditional jumps over the early exit. The alternate block starts
@@ -5214,6 +5264,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((fract_values(), translate))
     fixtures.extend([(frexp_mant_values(), translate), (ldexp_values(), translate)])
     fixtures.append((mul24_values(), translate))
+    fixtures.append((bit_scan_values(), translate))
     fixtures.append((three_way(), translate))
     fixtures.extend((predicate_group(first), translate) for first in range(0, 16, 4))
     fixtures.extend((int_predicate_group(kind, encoding, first), translate)
@@ -6270,6 +6321,144 @@ def check_mul24_draws(directory, compiler, renderer, backend):
         raise AssertionError("Replacing v_mul_hi_i32_i24_e32 with v_mul_hi_u32_u24_e32 escaped detection")
 
 
+BIT_SCAN_BODY = [
+    "v_mov_b32_e32 v28, s45",
+    "v_mov_b32_e32 v29, s46",
+    "v_mov_b32_e32 v30, s47",
+    "v_mov_b32_e32 v31, s44",
+    "v_bfrev_b32_e32 v20, s44",
+    "v_bfrev_b32_e64 v21, v28",
+    "v_ffbl_b32_e32 v22, s45",
+    "v_ffbl_b32_e64 v23, v29",
+    "v_ffbh_u32_e32 v24, s46",
+    "v_ffbh_u32_e64 v25, v30",
+    "v_ffbh_i32_e32 v26, s47",
+    "v_ffbh_i32_e64 v27, v31",
+    "v_mov_b32_e32 v16, 0x13579bdf",
+    *[
+        line
+        for reg in ("v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27")
+        for line in (
+            "v_lshlrev_b32_e32 v17, 5, v16",
+            "v_lshrrev_b32_e32 v18, 27, v16",
+            "v_or_b32_e32 v16, v17, v18",
+            f"v_xor_b32_e32 v16, {reg}, v16",
+            "v_add_nc_u32_e32 v16, 0x9e3779b9, v16",
+        )
+    ],
+    "v_cvt_f32_ubyte0_e32 v12, v16",
+    "v_cvt_f32_ubyte1_e32 v13, v16",
+    "v_cvt_f32_ubyte2_e32 v14, v16",
+    "v_cvt_f32_ubyte3_e32 v15, v16",
+]
+
+BIT_SCAN_SETS = (
+    (0x00000000, 0x00000001, 0x80000000, 0xffffffff),
+    (0x7fffffff, 0x00000000, 0x00000001, 0x80000000),
+    (0xfffffffe, 0x7fffffff, 0x00000000, 0x00000001),
+    (0x12345678, 0xf00d0040, 0x007f0080, 0x00000000),
+    (0xfff80000, 0x80000001, 0x00010000, 0xf00d0040),
+)
+
+
+def bit_scan_values():
+    return with_constants(BIT_SCAN_BODY)
+
+
+def bit_scan_reference(words, *, mode="exact"):
+    """Independent reference for v_bfrev_b32, v_ffbl_b32, v_ffbh_u32 and v_ffbh_i32."""
+    mask32 = 0xffffffff
+
+    def bfrev(x):
+        if mode == "bfrev_identity":
+            return x & mask32
+        r = 0
+        for bit in range(32):
+            if (x >> bit) & 1:
+                r |= 1 << (31 - bit)
+        return r
+
+    def ffbl(x):
+        if mode == "ffbl_as_ffbh":
+            return ffbh_u(x)
+        x &= mask32
+        if x == 0:
+            return mask32
+        return (x & -x).bit_length() - 1
+
+    def ffbh_u(x):
+        x &= mask32
+        if x == 0:
+            return 32 if mode == "ffbh_zero_32" else mask32
+        lsb_pos = x.bit_length() - 1
+        if mode == "ffbh_u32_lsb":
+            return lsb_pos
+        return 31 - lsb_pos
+
+    def ffbh_i(x):
+        x &= mask32
+        if mode == "ffbh_i32_unsigned":
+            return ffbh_u(x)
+        m = (~x & mask32) if (x & 0x80000000) else x
+        if m == 0:
+            return 32 if mode == "ffbh_zero_32" else mask32
+        lsb_pos = m.bit_length() - 1
+        if mode == "ffbh_i32_lsb":
+            return lsb_pos
+        return 31 - lsb_pos
+
+    s44, s45, s46, s47 = words
+    results = (
+        bfrev(s44), bfrev(s45),
+        ffbl(s45), ffbl(s46),
+        ffbh_u(s46), ffbh_u(s47),
+        ffbh_i(s47), ffbh_i(s44),
+    )
+    acc = 0x13579bdf
+    for r in results:
+        acc = (((acc << 5) | (acc >> 27)) & mask32) ^ (r & mask32)
+        acc = (acc + 0x9e3779b9) & mask32
+    return [float((acc >> (8 * k)) & 0xff) for k in range(4)]
+
+
+def check_bit_scan_draws(directory, compiler, renderer, backend):
+    source = directory / "bit_scan.hlsl"
+    shader = directory / "bit_scan.cso"
+    source.write_text(translate(bit_scan_values()), encoding="ascii")
+    compile_shader(compiler, source, shader)
+
+    cases = []
+
+    def add_case(words, expected, status):
+        path = directory / f"bit_scan-{len(cases)}.case"
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        path.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        cases.append((path, status))
+
+    for words in BIT_SCAN_SETS:
+        add_case(words, bit_scan_reference(words), "pass")
+    for mode in ("ffbh_u32_lsb", "ffbh_i32_unsigned", "ffbh_i32_lsb", "ffbh_zero_32", "ffbl_as_ffbh", "bfrev_identity"):
+        words = next(w for w in BIT_SCAN_SETS if bit_scan_reference(w, mode=mode) != bit_scan_reference(w))
+        add_case(words, bit_scan_reference(words, mode=mode), "mismatch")
+    # End batch with a passing reference after negative controls.
+    add_case(BIT_SCAN_SETS[0], bit_scan_reference(BIT_SCAN_SETS[0]), "pass")
+
+    run_pixel_batch(renderer, backend, shader, cases)
+
+    # Mutated shader control: replacing v_ffbh_i32_e32 with v_ffbh_u32_e32 must mismatch.
+    wrong_prog = [line.replace("v_ffbh_i32_e32 v26, s47", "v_ffbh_u32_e32 v26, s47") for line in bit_scan_values()]
+    source.write_text(translate(wrong_prog), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    mut_case = directory / "bit_scan-mut.case"
+    constants = bytearray(256)
+    struct.pack_into("<4I", constants, 12, *BIT_SCAN_SETS[0])
+    mut_case.write_bytes(constants + struct.pack("<4f", *bit_scan_reference(BIT_SCAN_SETS[0])) * 64)
+    wrong = subprocess.run([renderer, backend, "--check-pixel-case", shader, mut_case], capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Replacing v_ffbh_i32_e32 with v_ffbh_u32_e32 escaped detection")
+
+
 def check_three_way_draw(directory, compiler, renderer, backend):
     source = directory / "three_way.hlsl"
     shader = directory / "three_way.cso"
@@ -6815,6 +7004,7 @@ def check_blend_and_scalar_draws(directory, compiler, renderer, backend):
     check_mul24_draws(directory, compiler, renderer, backend)
     check_scalar_select64_draw(directory, compiler, renderer, backend)
     check_scalar_bfe64_draw(directory, compiler, renderer, backend)
+    check_bit_scan_draws(directory, compiler, renderer, backend)
 
     program = scalar64()
     source.write_text(translate(program), encoding="ascii")
