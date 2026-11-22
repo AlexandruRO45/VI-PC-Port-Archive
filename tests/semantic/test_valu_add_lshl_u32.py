@@ -672,8 +672,107 @@ class TestRegisterAliasing(unittest.TestCase):
             self.assertEqual(state.get_vgpr(lane, 0), expected)
 
 
+
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class AddLshlStatusFlags:
+    """Architectural condition codes and status flags for v_add_lshl_u32."""
+    result_zero: bool
+    result_negative: bool
+    add_carry_out: bool
+    add_zero: bool
+    shift_truncated_bits: bool
+    odd_parity: bool
+
+
+def evaluate_add_lshl_flags(s0: int, s1: int, s2: int, res32: int) -> AddLshlStatusFlags:
+    """Evaluate condition codes, addition carry-out, and shift truncation flags."""
+    u0 = s0 & MASK32
+    u1 = s1 & MASK32
+    sum_full = u0 + u1
+    add_carry = (sum_full > MASK32)
+    sum32 = sum_full & MASK32
+    shift = s2 & SHIFT_MASK
+    shifted_full = sum32 << shift
+    shift_truncated = ((shifted_full >> 32) != 0)
+
+    return AddLshlStatusFlags(
+        result_zero=(res32 == 0),
+        result_negative=bool(res32 & SIGN32),
+        add_carry_out=add_carry,
+        add_zero=(sum32 == 0),
+        shift_truncated_bits=shift_truncated,
+        odd_parity=bool(res32 & 1),
+    )
+
+
+def compute_add_carry_generation(s0: int, s1: int) -> Tuple[int, int]:
+    """Compute 32-bit addition sum and unsigned carry-out bit."""
+    u0 = s0 & MASK32
+    u1 = s1 & MASK32
+    total = u0 + u1
+    return total & MASK32, 1 if total > MASK32 else 0
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def test_zero_flags(self) -> None:
+        # Addition itself is zero
+        s0, s1, s2 = 0x8000_0000, 0x8000_0000, 4
+        res = oracle_v_add_lshl_u32(s0, s1, s2)
+        flags = evaluate_add_lshl_flags(s0, s1, s2, res)
+        self.assertTrue(flags.result_zero)
+        self.assertTrue(flags.add_zero)
+        self.assertTrue(flags.add_carry_out)
+
+        # Addition non-zero but shifted to zero
+        s0, s1, s2 = 0x0001_0000, 0, 16
+        res2 = oracle_v_add_lshl_u32(s0, s1, s2)
+        flags2 = evaluate_add_lshl_flags(s0, s1, s2, res2)
+        self.assertTrue(flags2.result_zero)
+        self.assertFalse(flags2.add_zero)
+        self.assertTrue(flags2.shift_truncated_bits)
+
+    def test_negative_sign_flag(self) -> None:
+        # Result has bit 31 set: (1 + 0) << 31 = 0x80000000
+        res = oracle_v_add_lshl_u32(1, 0, 31)
+        flags = evaluate_add_lshl_flags(1, 0, 31, res)
+        self.assertTrue(flags.result_negative)
+        self.assertFalse(flags.result_zero)
+
+        # Positive result: (1 + 1) << 1 = 4
+        res_pos = oracle_v_add_lshl_u32(1, 1, 1)
+        flags_pos = evaluate_add_lshl_flags(1, 1, 1, res_pos)
+        self.assertFalse(flags_pos.result_negative)
+
+    def test_add_carry_out_generation(self) -> None:
+        sum32, carry = compute_add_carry_generation(0xFFFF_FFFF, 1)
+        self.assertEqual(sum32, 0)
+        self.assertEqual(carry, 1)
+
+        sum32_nc, carry_nc = compute_add_carry_generation(0x1000, 0x2000)
+        self.assertEqual(sum32_nc, 0x3000)
+        self.assertEqual(carry_nc, 0)
+
+    def test_odd_parity_flag(self) -> None:
+        # Shift == 0 preserves sum parity
+        res_odd = oracle_v_add_lshl_u32(2, 3, 0)  # 5 (odd)
+        flags_odd = evaluate_add_lshl_flags(2, 3, 0, res_odd)
+        self.assertTrue(flags_odd.odd_parity)
+
+        # Shift > 0 always forces bit 0 to 0 (even)
+        res_even = oracle_v_add_lshl_u32(2, 3, 1)  # 10 (even)
+        flags_even = evaluate_add_lshl_flags(2, 3, 1, res_even)
+        self.assertFalse(flags_even.odd_parity)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
