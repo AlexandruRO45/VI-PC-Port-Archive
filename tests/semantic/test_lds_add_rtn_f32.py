@@ -901,6 +901,153 @@ class TestSIMDMultiLaneDivergenceAndExecMasking(unittest.TestCase):
         self.assertEqual(state.lds.read_dword(target_addr), f32_to_u32(20.0))
 
 
+# ============================================================================
+# Section 5: Register Aliasing and In-Place Operand Preservation
+# ============================================================================
+
+class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
+    """Unit tests for operand aliasing: vdst == vaddr, vdst == vdata, vdst == vaddr == vdata."""
+
+    def test_dst_aliases_addr_scalar(self) -> None:
+        """vdst == vaddr: Destination overwrites address register after address is latched."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        addr = 0x300
+        initial_mem = f32_to_u32(100.0)
+        add_float = f32_to_u32(25.0)
+
+        state.lds.write_dword(addr, initial_mem)
+        state.set_vgpr(5, addr)       # v5 = address
+        state.set_vgpr(6, add_float)  # v6 = data
+
+        # ds_add_rtn_f32 v5, v5, v6
+        instr = DSAddRtnF32Instruction(dst=VGPR(5), addr=VGPR(5), data0=VGPR(6))
+        old_val, new_val = interp.step(instr, state)
+
+        self.assertEqual(old_val, initial_mem)
+        self.assertEqual(u32_to_f32(new_val), 125.0)
+        # v5 now contains the returned old memory value
+        self.assertEqual(state.get_vgpr(5), initial_mem)
+        # Memory at 0x300 was updated correctly
+        self.assertEqual(state.lds.read_dword(addr), f32_to_u32(125.0))
+        # v6 was preserved
+        self.assertEqual(state.get_vgpr(6), add_float)
+
+    def test_dst_aliases_data_scalar(self) -> None:
+        """vdst == vdata0: Destination overwrites data register after data is latched."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        addr = 0x400
+        initial_mem = f32_to_u32(50.0)
+        add_float = f32_to_u32(15.0)
+
+        state.lds.write_dword(addr, initial_mem)
+        state.set_vgpr(6, addr)       # v6 = address
+        state.set_vgpr(5, add_float)  # v5 = data
+
+        # ds_add_rtn_f32 v5, v6, v5
+        instr = DSAddRtnF32Instruction(dst=VGPR(5), addr=VGPR(6), data0=VGPR(5))
+        old_val, new_val = interp.step(instr, state)
+
+        self.assertEqual(old_val, initial_mem)
+        self.assertEqual(u32_to_f32(new_val), 65.0)
+        # v5 now contains returned old memory value
+        self.assertEqual(state.get_vgpr(5), initial_mem)
+        # Address register v6 is preserved
+        self.assertEqual(state.get_vgpr(6), addr)
+        # Memory updated correctly
+        self.assertEqual(state.lds.read_dword(addr), f32_to_u32(65.0))
+
+    def test_all_three_operands_aliased_scalar(self) -> None:
+        """vdst == vaddr == vdata0: Single register acts as address, data, and destination."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        # Choose a register value that is both a valid byte address and valid float
+        # 0x400 = 1024 bytes -> float value u32_to_f32(0x400)
+        addr_and_data_bits = 0x400
+        data_float = u32_to_f32(addr_and_data_bits)
+        initial_mem = f32_to_u32(10.0)
+
+        state.lds.write_dword(addr_and_data_bits, initial_mem)
+        state.set_vgpr(7, addr_and_data_bits)
+
+        # ds_add_rtn_f32 v7, v7, v7
+        instr = DSAddRtnF32Instruction(dst=VGPR(7), addr=VGPR(7), data0=VGPR(7))
+        old_val, new_val = interp.step(instr, state)
+
+        self.assertEqual(old_val, initial_mem)
+        expected_new_mem = f32_to_u32(10.0 + data_float)
+        self.assertEqual(new_val, expected_new_mem)
+        # v7 now holds original memory value
+        self.assertEqual(state.get_vgpr(7), initial_mem)
+        self.assertEqual(state.lds.read_dword(addr_and_data_bits), expected_new_mem)
+
+    def test_addr_aliases_data_dst_independent_scalar(self) -> None:
+        """vaddr == vdata0 != vdst: Address and data share register; register is preserved."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        addr_and_data = 0x240
+        initial_mem = f32_to_u32(20.0)
+
+        state.lds.write_dword(addr_and_data, initial_mem)
+        state.set_vgpr(1, addr_and_data)
+        state.set_vgpr(0, 0xCAFE_CAFE)  # dst initial
+
+        # ds_add_rtn_f32 v0, v1, v1
+        instr = DSAddRtnF32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(1))
+        old_val, new_val = interp.step(instr, state)
+
+        self.assertEqual(old_val, initial_mem)
+        expected_new_mem = f32_to_u32(20.0 + u32_to_f32(addr_and_data))
+        self.assertEqual(new_val, expected_new_mem)
+        self.assertEqual(state.get_vgpr(0), initial_mem)
+        self.assertEqual(state.get_vgpr(1), addr_and_data)
+
+    def test_dst_aliases_addr_simd(self) -> None:
+        """SIMD wavefront where each lane has vdst == vaddr."""
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        interp = SIMDInterpreter()
+
+        for lane in range(32):
+            addr = 0x600 + lane * 4
+            state.lds.write_dword(addr, f32_to_u32(50.0 + lane))
+            state.set_vgpr(lane, 0, addr)                   # v0 = addr (also dst)
+            state.set_vgpr(lane, 1, f32_to_u32(10.0))       # v1 = data
+
+        instr = DSAddRtnF32Instruction(dst=VGPR(0), addr=VGPR(0), data0=VGPR(1))
+        results = interp.step(instr, state)
+
+        for lane in range(32):
+            addr = 0x600 + lane * 4
+            expected_old = f32_to_u32(50.0 + lane)
+            expected_new = f32_to_u32(60.0 + lane)
+            self.assertEqual(results[lane], (expected_old, expected_new))
+            self.assertEqual(state.get_vgpr(lane, 0), expected_old)
+            self.assertEqual(state.lds.read_dword(addr), expected_new)
+
+    def test_inplace_operand_preservation_when_not_dst(self) -> None:
+        """All source registers not aliased with vdst remain completely unchanged."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        state.set_vgpr(10, 0x400)
+        state.set_vgpr(11, f32_to_u32(3.14))
+        state.set_vgpr(12, 0)
+        state.lds.write_dword(0x400, f32_to_u32(100.0))
+
+        instr = DSAddRtnF32Instruction(dst=VGPR(12), addr=VGPR(10), data0=VGPR(11))
+        interp.step(instr, state)
+
+        self.assertEqual(state.get_vgpr(10), 0x400)
+        self.assertEqual(state.get_vgpr(11), f32_to_u32(3.14))
+        self.assertEqual(state.get_vgpr(12), f32_to_u32(100.0))
+
+
+
 
 
 
