@@ -177,6 +177,10 @@ def control(targets, launches, timeout, eof_timeout):
         for index in range(launches):
             result = launch(target, bytes([index % 2]), timeout, eof_timeout)
             outcomes.append(result["outcome"])
+            marker = b"worker-alive control\r\n"
+            if result["bytes"]["stdout"] != len(marker) or result["head"]["stdout"] != marker[:16].hex(" "):
+                print("  missing ready marker before exit or timeout")
+                failures += 1
             if result["outcome"] == "timeout" and not shown:
                 print(describe(index, index % 2, result))
                 shown = True

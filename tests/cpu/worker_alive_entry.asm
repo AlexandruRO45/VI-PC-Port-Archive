@@ -1,6 +1,6 @@
 ; A CRT-free PE that isolates the process-exit path, the deterministic control for #281.
 ;
-; The entry point writes one line, starts a worker thread that never returns, and then either
+; The entry point starts a worker thread that never returns, writes a ready marker, and then either
 ; returns (the loader's thread start calls ExitProcess with the return value) or exits the
 ; entry thread only (ExitThread), leaving the worker alone in the process.
 ;
@@ -34,11 +34,15 @@ started     DQ 0
 
 .code
 ; SetEvent first: the entry cannot leave until this thread is running.
-worker PROC
+worker PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
     mov rcx, QWORD PTR [started]
     call QWORD PTR [__imp_SetEvent]
     mov ecx, -1                         ; Sleep(INFINITE): the worker never returns
     call QWORD PTR [__imp_Sleep]
+    add rsp, 28h
     ret
 worker ENDP
 
@@ -46,14 +50,6 @@ worker_alive_entry PROC FRAME
     sub rsp, 38h                        ; 20h shadow space, 18h for a 6th argument and alignment
     .allocstack 38h
     .endprolog
-    mov ecx, -11                        ; STD_OUTPUT_HANDLE
-    call QWORD PTR [__imp_GetStdHandle]
-    mov rcx, rax
-    lea rdx, message
-    mov r8d, message_len
-    lea r9, written
-    mov QWORD PTR [rsp+20h], 0
-    call QWORD PTR [__imp_WriteFile]
 IFNDEF NO_WORKER
     xor ecx, ecx                        ; lpEventAttributes
     mov edx, 1                          ; bManualReset: SetEvent stays signaled
@@ -77,7 +73,17 @@ IFNDEF NO_WORKER
     mov rcx, QWORD PTR [started]        ; wait until the worker has run at least once
     mov edx, -1                         ; INFINITE
     call QWORD PTR [__imp_WaitForSingleObject]
+    test eax, eax                       ; WAIT_OBJECT_0
+    jnz failed
 ENDIF
+    mov ecx, -11                        ; STD_OUTPUT_HANDLE
+    call QWORD PTR [__imp_GetStdHandle]
+    mov rcx, rax
+    lea rdx, message
+    mov r8d, message_len
+    lea r9, written
+    mov QWORD PTR [rsp+20h], 0
+    call QWORD PTR [__imp_WriteFile]
 IFDEF RETURN_FROM_ENTRY
     xor eax, eax
     jmp finished
