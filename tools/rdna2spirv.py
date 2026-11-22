@@ -2918,6 +2918,32 @@ class Gen:
                     olds.append(old)
             for k, old in enumerate(olds):           # every exchange before the first write (vdst may alias)
                 self.dst({"k": "vgpr", "r": d["r"] + k, "n": 1}, old)
+        elif name in ("ds_add_u64", "ds_sub_u64"):
+            # M = M +/- DATA on a 64-bit LDS element (the dwords at ADDR and ADDR + 4, low first); the _rtn_ form returns
+            # the old 64 bits. Two 32-bit atomics, no Int64 atomics on Workgroup memory (optional in Vulkan): the low
+            # dword takes DATA.lo and the carry (add) or borrow (sub) it made, found from the old low dword the atomic
+            # returns, goes into the high dword's DATA.hi. The sum of the carries over any order of the ops is the same,
+            # so the memory ends exactly as with 64-bit atomics. **Approximation:** the returned high dword is read by
+            # its own atomic, so another lane's op on the same element between the two can show up half done.
+            d, ad, dat = (a[0], a[1], a[2]) if rtn else (None, a[0], a[1])
+            if dat["k"] != "vgpr" or dat.get("n") != 2 or (d is not None and (d["k"] != "vgpr" or d.get("n") != 2)):
+                raise Unsupported(op + " operands")
+            add = name == "ds_add_u64"
+            addr = self.src_u(ad)
+            dl, dh = (self.load_reg("vgpr", dat["r"] + w) for w in range(2))
+            old_lo, flag, bit, adj, old_hi, new_lo = (self.tmp() for _ in range(6))
+            self.emit(f"{old_lo} = {'OpAtomicIAdd' if add else 'OpAtomicISub'} %uint {self.lds_ptr(addr, off)} {sc} {sem} {dl}")
+            if add:
+                self.emit(f"{new_lo} = OpIAdd %uint {old_lo} {dl}")
+                self.emit(f"{flag} = OpULessThan %bool {new_lo} {dl}")          # carry out of the low dword
+            else:
+                self.emit(f"{flag} = OpULessThan %bool {old_lo} {dl}")          # borrow from the high dword
+            self.emit(f"{bit} = OpSelect %uint {flag} {self.cu(1)} {self.cu(0)}")
+            self.emit(f"{adj} = OpIAdd %uint {dh} {bit}")                        # DATA.hi + 1 wraps to 0 for DATA.hi = ~0: right mod 2^64
+            self.emit(f"{old_hi} = {'OpAtomicIAdd' if add else 'OpAtomicISub'} %uint {self.lds_ptr(addr, off + 4)} {sc} {sem} {adj}")
+            if d is not None:
+                self.dst({"k": "vgpr", "r": d["r"], "n": 1}, old_lo)
+                self.dst({"k": "vgpr", "r": d["r"] + 1, "n": 1}, old_hi)
         elif name in ("ds_and_b64", "ds_or_b64", "ds_xor_b64"):
             # M = M op D on a 64-bit LDS element (the dwords at ADDR and ADDR + 4, low first); the _rtn_ form returns
             # the old 64 bits in a VGPR pair. A bitwise op works on each bit alone, so one 32-bit atomic per dword
