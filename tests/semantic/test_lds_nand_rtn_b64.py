@@ -19,7 +19,9 @@ Semantics:
 from __future__ import annotations
 
 import unittest
-from typing import Tuple
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import Optional, Tuple, Union
 
 # RDNA2 Local Data Share (LDS) Architectural Constants
 LDS_SIZE_BYTES: int = 65536         # 64 KiB default capacity
@@ -180,6 +182,263 @@ class TestLdsNandRtnB64ReferenceOracle(unittest.TestCase):
         self.assertEqual(old_val, 0x00FF00FF_00FF00FF)
         self.assertEqual(new_val, 0xFFFFFF00_FFFFFF00)
         self.assertEqual(lds.read_qword(addr), 0xFFFFFF00_FFFFFF00)
+
+
+# ==============================================================================
+# Phase 2: Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+@dataclass(frozen=True)
+class VGPR:
+    """32-bit Vector General Purpose Register (e.g. v[0] .. v[255])."""
+    index: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"VGPR index {self.index} out of architectural range [0, 255]")
+
+    @property
+    def name(self) -> str:
+        return f"v[{self.index}]"
+
+
+@dataclass(frozen=True)
+class VGPRPair:
+    """64-bit aligned VGPR pair operand (e.g. v[0:1] .. v[254:255])."""
+    base_index: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.base_index <= 254):
+            raise ValueError(f"VGPRPair base_index {self.base_index} out of range [0, 254]")
+
+    @property
+    def name(self) -> str:
+        return f"v[{self.base_index}:{self.base_index + 1}]"
+
+
+@dataclass(frozen=True)
+class SGPRPair:
+    """64-bit aligned SGPR pair operand (e.g. s[0:1] .. s[104:105])."""
+    base_index: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.base_index <= 104):
+            raise ValueError(f"SGPRPair base_index {self.base_index} out of range [0, 104]")
+
+    @property
+    def name(self) -> str:
+        return f"s[{self.base_index}:{self.base_index + 1}]"
+
+
+@dataclass(frozen=True)
+class Immediate64:
+    """64-bit integer immediate constant."""
+    value: int
+
+    @property
+    def name(self) -> str:
+        return f"0x{self.value & MASK_64:X}"
+
+
+Operand64 = Union[VGPRPair, SGPRPair, Immediate64]
+
+
+class DSOpcode64(Enum):
+    """LDS 64-bit Bitwise NAND opcodes (returning and non-returning variants)."""
+    DS_NAND_RTN_B64 = auto()
+    DS_NAND_B64 = auto()
+
+    @property
+    def is_return(self) -> bool:
+        return self == DSOpcode64.DS_NAND_RTN_B64
+
+    @property
+    def op_name(self) -> str:
+        return "ds_nand_rtn_b64" if self.is_return else "ds_nand_b64"
+
+
+@dataclass(frozen=True)
+class DSNand64Instruction:
+    """Symbolic AST node for ds_nand_rtn_b64 / ds_nand_b64 instruction."""
+    opcode: DSOpcode64
+    dst: Optional[VGPRPair]
+    addr: VGPR
+    data: Operand64
+    offset: int = 0
+
+    def __post_init__(self) -> None:
+        if self.opcode.is_return:
+            if not isinstance(self.dst, VGPRPair):
+                raise TypeError(f"Destination must be a VGPRPair for returning opcode, got {type(self.dst).__name__}")
+        else:
+            if self.dst is not None:
+                raise ValueError("Destination must be None for non-returning ds_nand_b64 opcode")
+        if not isinstance(self.addr, VGPR):
+            raise TypeError(f"Address operand must be a 32-bit VGPR, got {type(self.addr).__name__}")
+        if not isinstance(self.data, (VGPRPair, SGPRPair, Immediate64)):
+            raise TypeError(f"Data operand must be VGPRPair, SGPRPair, or Immediate64, got {type(self.data).__name__}")
+        if not (0 <= self.offset <= 65535):
+            raise ValueError(f"Offset {self.offset} out of 16-bit range [0, 65535]")
+
+    def disassemble(self) -> str:
+        offset_part = f" offset:{self.offset}" if self.offset != 0 else ""
+        if self.opcode.is_return:
+            assert self.dst is not None
+            return f"ds_nand_rtn_b64 {self.dst.name}, {self.addr.name}, {self.data.name}{offset_part}"
+        return f"ds_nand_b64 {self.addr.name}, {self.data.name}{offset_part}"
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Phase 2: Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_instruction_ast_construction_returning(self) -> None:
+        instr = DSNand64Instruction(
+            opcode=DSOpcode64.DS_NAND_RTN_B64,
+            dst=VGPRPair(0),
+            addr=VGPR(2),
+            data=VGPRPair(4),
+            offset=16,
+        )
+        self.assertEqual(instr.opcode, DSOpcode64.DS_NAND_RTN_B64)
+        self.assertTrue(instr.opcode.is_return)
+        self.assertIsNotNone(instr.dst)
+        assert instr.dst is not None
+        self.assertEqual(instr.dst.base_index, 0)
+        self.assertEqual(instr.addr.index, 2)
+        self.assertEqual(instr.offset, 16)
+
+    def test_instruction_ast_construction_non_returning(self) -> None:
+        instr = DSNand64Instruction(
+            opcode=DSOpcode64.DS_NAND_B64,
+            dst=None,
+            addr=VGPR(10),
+            data=Immediate64(0x1234_5678_9ABC_DEF0),
+        )
+        self.assertEqual(instr.opcode, DSOpcode64.DS_NAND_B64)
+        self.assertFalse(instr.opcode.is_return)
+        self.assertIsNone(instr.dst)
+        self.assertEqual(instr.addr.index, 10)
+        self.assertEqual(instr.offset, 0)
+
+    def test_disassembly_returning_with_and_without_offset(self) -> None:
+        instr_no_off = DSNand64Instruction(
+            opcode=DSOpcode64.DS_NAND_RTN_B64,
+            dst=VGPRPair(6),
+            addr=VGPR(5),
+            data=Immediate64(0x1234),
+        )
+        self.assertEqual(
+            instr_no_off.disassemble(),
+            "ds_nand_rtn_b64 v[6:7], v[5], 0x1234",
+        )
+
+        instr_off = DSNand64Instruction(
+            opcode=DSOpcode64.DS_NAND_RTN_B64,
+            dst=VGPRPair(12),
+            addr=VGPR(14),
+            data=SGPRPair(10),
+            offset=64,
+        )
+        self.assertEqual(
+            instr_off.disassemble(),
+            "ds_nand_rtn_b64 v[12:13], v[14], s[10:11] offset:64",
+        )
+
+    def test_disassembly_non_returning_with_and_without_offset(self) -> None:
+        instr_no_off = DSNand64Instruction(
+            opcode=DSOpcode64.DS_NAND_B64,
+            dst=None,
+            addr=VGPR(2),
+            data=VGPRPair(4),
+        )
+        self.assertEqual(
+            instr_no_off.disassemble(),
+            "ds_nand_b64 v[2], v[4:5]",
+        )
+
+        instr_off = DSNand64Instruction(
+            opcode=DSOpcode64.DS_NAND_B64,
+            dst=None,
+            addr=VGPR(2),
+            data=VGPRPair(4),
+            offset=128,
+        )
+        self.assertEqual(
+            instr_off.disassemble(),
+            "ds_nand_b64 v[2], v[4:5] offset:128",
+        )
+
+    def test_dst_type_enforcement_rejects_single_vgpr_and_sgpr(self) -> None:
+        with self.assertRaises(TypeError):
+            DSNand64Instruction(
+                opcode=DSOpcode64.DS_NAND_RTN_B64,
+                dst=SGPRPair(0),  # type: ignore[arg-type]
+                addr=VGPR(1),
+                data=Immediate64(0),
+            )
+        with self.assertRaises(TypeError):
+            DSNand64Instruction(
+                opcode=DSOpcode64.DS_NAND_RTN_B64,
+                dst=None,
+                addr=VGPR(1),
+                data=Immediate64(0),
+            )
+
+    def test_addr_type_enforcement_rejects_sgpr(self) -> None:
+        with self.assertRaises(TypeError):
+            DSNand64Instruction(
+                opcode=DSOpcode64.DS_NAND_RTN_B64,
+                dst=VGPRPair(0),
+                addr=SGPRPair(0),  # type: ignore[arg-type]
+                data=Immediate64(0),
+            )
+
+    def test_non_returning_rejects_non_none_dst(self) -> None:
+        with self.assertRaises(ValueError):
+            DSNand64Instruction(
+                opcode=DSOpcode64.DS_NAND_B64,
+                dst=VGPRPair(0),
+                addr=VGPR(1),
+                data=Immediate64(0),
+            )
+
+    def test_register_index_out_of_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            VGPRPair(255)  # 255:256 exceeds 255
+        with self.assertRaises(ValueError):
+            VGPRPair(-1)
+        with self.assertRaises(ValueError):
+            SGPRPair(105)  # 105:106 exceeds 105
+        with self.assertRaises(ValueError):
+            SGPRPair(-1)
+
+    def test_offset_out_of_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            DSNand64Instruction(
+                opcode=DSOpcode64.DS_NAND_RTN_B64,
+                dst=VGPRPair(0),
+                addr=VGPR(1),
+                data=Immediate64(0),
+                offset=65536,
+            )
+        with self.assertRaises(ValueError):
+            DSNand64Instruction(
+                opcode=DSOpcode64.DS_NAND_RTN_B64,
+                dst=VGPRPair(0),
+                addr=VGPR(1),
+                data=Immediate64(0),
+                offset=-1,
+            )
+
+    def test_operand_equality_and_hashing(self) -> None:
+        v0_a = VGPRPair(0)
+        v0_b = VGPRPair(0)
+        v2 = VGPRPair(2)
+        self.assertEqual(v0_a, v0_b)
+        self.assertNotEqual(v0_a, v2)
+        imm1 = Immediate64(0x1234_5678)
+        imm2 = Immediate64(0x1234_5678)
+        self.assertEqual(imm1, imm2)
 
 
 if __name__ == "__main__":
