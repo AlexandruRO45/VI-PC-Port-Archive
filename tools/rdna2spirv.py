@@ -4149,7 +4149,21 @@ class Gen:
         self.emit(f"{k1} = OpSelect %uint {n1} {self.cu(0xFFFFFDA8)} {scale}")
         self.emit(f"{k2} = OpISub %uint {scale} {k1}")
         self.emit(f"{r1} = OpExtInst %double %glsl Ldexp {t53} {k1}")
-        self.emit(f"{r2} = OpExtInst %double %glsl Ldexp {r1} {k2}")
+        # magic code
+        def pow2(n):
+            e_, u_, h, v, d = (self.tmp() for _ in range(5))
+            self.emit(f"{e_} = OpIAdd %int {n} {self.as_int(self.cu(1023))}")
+            self.emit(f"{u_} = OpBitcast %uint {e_}")
+            self.emit(f"{h} = OpShiftLeftLogical %uint {u_} {self.cu(20)}")
+            self.emit(f"{v} = OpCompositeConstruct %v2uint_d {self.cu(0)} {h}")
+            self.emit(f"{d} = OpBitcast %double {v}")
+            return d
+        ka, kb, lt1, lt2, rm = (self.tmp() for _ in range(5))
+        self.emit(f"{ka} = OpExtInst %int %glsl SMax {self.as_int(k2)} {self.as_int(self.cu(0xFFFFFED4))}")
+        self.emit(f"{lt1} = OpISub %int {self.as_int(k2)} {ka}")
+        self.emit(f"{kb} = OpExtInst %int %glsl SMax {lt1} {self.as_int(self.cu(0xFFFFFC02))}")
+        self.emit(f"{rm} = OpFMul %double {r1} {pow2(ka)}")
+        self.emit(f"{r2} = OpFMul %double {rm} {pow2(kb)}")
         zd, isnan, q, qv, qd, r3, r4 = (self.tmp() for _ in range(7))
         self.emit(f"{zd} = OpSelect %double {valid} {r2} {self.dconst(0.0)}")
         xv, xd = self.tmp(), self.tmp()
