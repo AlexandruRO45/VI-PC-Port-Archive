@@ -295,5 +295,131 @@ class TestValuDot2I32I16SymbolicAST(unittest.TestCase):
             Operand.vgpr(-1)
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarRegisterState:
+    """Architectural register state for a single scalar thread."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+
+    def read_operand_32(self, op: Operand) -> int:
+        if op.reg_type == RegType.VGPR:
+            return self.vgprs[op.index] & MASK32
+        if op.reg_type == RegType.SGPR:
+            return self.sgprs[op.index] & MASK32
+        assert op.literal_value is not None
+        return op.literal_value & MASK32
+
+    def write_vgpr_32(self, index: int, val: int) -> None:
+        self.vgprs[index] = val & MASK32
+
+
+class ScalarInterpreter:
+    """Deterministic scalar interpreter executing v_dot2_i32_i16 instructions."""
+
+    def step(self, instr: VDot2I32I16Instruction, state: ScalarRegisterState) -> int:
+        s0 = state.read_operand_32(instr.src0)
+        s1 = state.read_operand_32(instr.src1)
+        s2 = state.read_operand_32(instr.src2)
+        res = ref_dot2_i32_i16(s0, s1, s2, clamp=instr.clamp)
+        state.write_vgpr_32(instr.dst.index, res)
+        return res
+
+
+class TestValuDot2I32I16ScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction execution."""
+
+    def setUp(self) -> None:
+        self.state = ScalarRegisterState()
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_execution_from_vgprs(self) -> None:
+        # s0 in v1: (10, -20)
+        self.state.vgprs[1] = pack_i16x2(10, -20)
+        # s1 in v2: (30, 40)
+        self.state.vgprs[2] = pack_i16x2(30, 40)
+        # s2 in v3: 500
+        self.state.vgprs[3] = 500
+
+        instr = VDot2I32I16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+
+        res = self.interp.step(instr, self.state)
+        # 10*30 + (-20)*40 + 500 = 300 - 800 + 500 = 0
+        self.assertEqual(res, 0)
+        self.assertEqual(self.state.vgprs[0], 0)
+
+    def test_scalar_execution_with_sgpr_and_literal(self) -> None:
+        self.state.vgprs[0] = pack_i16x2(-100, 200)
+        self.state.sgprs[4] = pack_i16x2(5, -2)
+
+        instr = VDot2I32I16Instruction(
+            dst=Operand.vgpr(1),
+            src0=Operand.vgpr(0),
+            src1=Operand.sgpr(4),
+            src2=Operand.literal(1000),
+        )
+
+        res = self.interp.step(instr, self.state)
+        # (-100)*5 + 200*(-2) + 1000 = -500 - 400 + 1000 = 100
+        self.assertEqual(res, 100)
+        self.assertEqual(self.state.vgprs[1], 100)
+
+    def test_multi_step_chained_accumulation(self) -> None:
+        self.state.vgprs[1] = pack_i16x2(3, 4)
+        self.state.vgprs[2] = pack_i16x2(5, 6)
+        self.state.vgprs[3] = 0
+
+        # Step 1: v0 = (3,4).(5,6) + 0 = 15 + 24 = 39
+        instr1 = VDot2I32I16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+        self.interp.step(instr1, self.state)
+        self.assertEqual(self.state.vgprs[0], 39)
+
+        # Step 2: v0 = (10,10).(2,2) + v0 = 20 + 20 + 39 = 79
+        self.state.vgprs[4] = pack_i16x2(10, 10)
+        self.state.vgprs[5] = pack_i16x2(2, 2)
+        instr2 = VDot2I32I16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(4),
+            src1=Operand.vgpr(5),
+            src2=Operand.vgpr(0),
+        )
+        self.interp.step(instr2, self.state)
+        self.assertEqual(self.state.vgprs[0], 79)
+
+    def test_scalar_determinism(self) -> None:
+        state_a = ScalarRegisterState()
+        state_b = ScalarRegisterState()
+        val_s0 = pack_i16x2(-1234, 5678)
+        val_s1 = pack_i16x2(987, -654)
+        state_a.vgprs[1] = val_s0
+        state_b.vgprs[1] = val_s0
+        state_a.sgprs[0] = val_s1
+        state_b.sgprs[0] = val_s1
+
+        instr = VDot2I32I16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.sgpr(0),
+            src2=Operand.literal(42),
+        )
+        res_a = self.interp.step(instr, state_a)
+        res_b = self.interp.step(instr, state_b)
+        self.assertEqual(res_a, res_b)
+        self.assertEqual(state_a.vgprs, state_b.vgprs)
+
+
 if __name__ == "__main__":
     unittest.main()
