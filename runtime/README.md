@@ -160,6 +160,10 @@ when the Vulkan SDK is found:
   `VK_LOADER_LAYERS_DISABLE=<layer name pattern>`.
 - `d3d12_draw_test` — milestone M1: a VS+PS pipeline found by FSSM hash, the input layout matched by semantic,
   and two indexed draws plus a culled triangle, compared pixel by pixel.
+- `d3d12_translated_draw_test` — milestone M1.5: the same with translator output. `test/shaders/vs_m15.asm` (vertex
+  fetch through a V#) and `ps_m15.asm` (constants read through the code base) are built by `test/shaders/build.py`
+  and found by FSSM hash; three draws into a float target, compared bit for bit. Needs `llvm-mc` (`LLVM_MC`) and the
+  Vulkan SDK's `spirv-as` and `spirv-val` at build time.
 - `d3d12_compute_test` — the compute path: root signature, a compute PSO found by its FSSM hash in a
   translator-style index, root arguments through the GPU address arena, and two dispatches.
 - `d3d12_present_test` — milestone M0: opens a window and presents 60 cleared frames through the proxy on
