@@ -930,6 +930,18 @@ Two independently located local effects yielded 5 and 81 candidates across all g
 
 ## Offline pixel shader recompilation
 
+### Pixel programs with two exits
+
+For FSSM version 0x101 the pixel extractor reads the 64-bit code offset, byte count and section end at 0xC0, 0xC8 and 0xE8. Instructions start 40 bytes after the code offset. The end must agree with offset plus count. For the unset end sentinel the extractor also checks for four padding words at the computed end. It strips aligned trailing `s_code_end` words inside that extent and requires a terminal `s_endpgm`. A marker in the following metadata cannot extend or terminate the code. The field interpretation agrees with the [independent FSSM cross-check](https://github.com/ItsNotRexed/Leonida/blob/dcd8ecf10b138566d567020562b7afd853a89024/docs/fssm_crosscheck.md).
+
+Among 6,189 pixel records previously rejected by the unique-marker rule, 5,465 had two aligned end markers, 682 had three, 38 had four and four had five. The largest layout had two markers 20 bytes apart (3,561 records). In the supported two-exit layout, a direct branch targets the block immediately after the early exit. The extractor uses LLVM instruction boundaries to follow both conditional successors, preserves both exits and permits skipped alignment NOPs. Unresolved transfers, jumps into instruction operands or padding, and disconnected executable blocks are rejected. This verifies a code span; lowering branch or resource semantics is a separate step.
+
+The source-built binary checks include a literal word resembling a terminator, a metadata terminator, conflicting extents, a branch into a literal and a disconnected exit. Run with LLVM 15:
+
+```bash
+python3 -B tests/pixel_aot_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
 `tools/pixel_aot.py` extracts one named pixel program from a local archive, decodes gfx1013 instructions with LLVM and emits HLSL. DXC compiles the result to desktop DXIL before the draw. The lowerer tracks register writes across whole-quad interpolation of attribute 0, a scalar texture-descriptor load, a 2D RGBA sample, packed round-toward-zero binary16 conversions and one compressed color export. Unknown instructions, mismatched bindings and reads before the required wait cause translation to fail. [LLVM disassembler API](https://llvm.org/docs/doxygen/group__LLVMCDisassembler.html) · [Leonida public format reference](https://github.com/ItsNotRexed/Leonida/blob/56f023a10a726da20702d4e121656ceda2391d93/tools/fssm_unpack.py)
 
 The caller identifies the entry registers for the texture address and interpolation base, and supplies the four sampler descriptor words to match. The generated pixel shader uses `TEXCOORD0`, texture `t0` and sampler `s0`. The test binds a point-clamp sampler, one mip and a full-screen triangle. These bindings are an explicit specialization. The test measures finite UNORM inputs under full pixel coverage. Execution with a title's original pipeline state, helper-lane behavior at triangle edges and other texture formats require separate validation.

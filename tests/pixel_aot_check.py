@@ -103,11 +103,16 @@ def shader_record(blob: bytes, name: bytes) -> bytes:
             + struct.pack("<4I", len(payload), 0, len(payload), len(blob)) + payload)
 
 
-def envelope(code: bytes, name: bytes = b"fixture", *, private_data: bytes | None = None) -> bytes:
-    program_start = 256
+def envelope(code: bytes, name: bytes = b"fixture", *, private_data: bytes | None = None, directory_end=None) -> bytes:
+    program_start = 288 if directory_end is not None else 256
     image = bytearray(program_start) + code
     image[:4] = b"FSSM"
     struct.pack_into("<I", image, 192, program_start - 40)
+    if directory_end is not None:
+        extent, end_field = directory_end
+        struct.pack_into("<I", image, 4, 0x101)
+        struct.pack_into("<Q", image, 200, extent)
+        struct.pack_into("<Q", image, 232, end_field)
     native = b"XBCH" + bytes(12) + struct.pack("<II", len(image), 0) + zlib.compress(image)
     program = (bytes(24) + b"XDAT" + struct.pack("<II", 1, 0)
                + struct.pack("<III", 13, 48, len(native)) + native)
@@ -1825,7 +1830,42 @@ def check_controls(directory):
     must_reject(translate, base_ld[:wqm] + ["v_ldexp_f32 v20, 1.0, 2"] + base_ld[wqm:])
 
 
+def check_program_extent(directory, library):
+    # A conditional jumps over the early exit. The alternate block starts
+    # with a two-dword instruction (s_mov_b32 with a literal operand).
+    branch = bytes.fromhex("010084bf")
+    end = bytes.fromhex("000081bf")
+    mov = bytes.fromhex("ff0380be 01000000")
+    pad = bytes.fromhex("00009fbf")
+    code = branch + end + mov + end
+    padding = pad * 5
+    base = 288 - 40
+    extent = 40 + len(code) + len(padding)
+    archive = directory / "bounded.rpf"
+
+    def extract(body, size=extent, limit=base + extent):
+        archive.write_bytes(envelope(body, directory_end=(size, limit)))
+        return native_program(archive, "fixture", llvm=library)[1]
+
+    jump_over_nop = bytes.fromhex("010082bf 000080bf")
+    assert extract(jump_over_nop + code + padding[8:]) == jump_over_nop + code
+    must_reject(extract, bytes.fromhex("010082bf 810380be") + code + padding[8:])
+    assert extract(code + padding + end) == code  # marker in metadata
+    # A terminator in metadata cannot stand in for one missing inside the section.
+    must_reject(extract, bytes(len(code)) + padding + end)
+    assert extract(code + padding + pad * 4, limit=0xdeadbeefdeadbeef) == code
+    must_reject(extract, code + padding, extent, base + extent + 4)
+    must_reject(extract, code + padding[:-4])
+    must_reject(extract, code + padding, extent, 0xdeadbeefdeadbeef)
+    must_reject(extract, code + padding[:4] + bytes(16) + end)
+    must_reject(extract, bytes.fromhex("020084bf") + code[4:] + padding)  # target inside literal
+    must_reject(extract, bytes.fromhex("000080bf") + code[4:] + padding)  # disconnected block
+    must_reject(extract, bytes.fromhex("040084bf") + code[4:] + padding)  # target in padding
+    must_reject(extract, branch + bytes.fromhex("ff0380be") + end + bytes.fromhex("000080bf") + end + padding)
+
+
 def check_binary(directory, assembler, objcopy, library):
+    check_program_extent(directory, library)
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
                 (arithmetic(), translate), (with_scalar_constant_reads(), translate), (with_scalar_pair_reads(), translate),
                 (truncate_values(), translate), (affine_coordinates(), translate), (ceiling(), translate),
