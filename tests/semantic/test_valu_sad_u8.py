@@ -1217,5 +1217,72 @@ class TestValuSadU8StatusFlags(unittest.TestCase):
         self.assertFalse(flags.carry)
 
 
+class TestValuSadU8IEEE754Boundaries(unittest.TestCase):
+    """Unit tests for IEEE 754 bit-pattern extremes, subnormals, and NaN handling."""
+
+    POS_ZERO_F32: int = 0x0000_0000
+    NEG_ZERO_F32: int = 0x8000_0000
+    POS_INF_F32: int = 0x7F80_0000
+    NEG_INF_F32: int = 0xFF80_0000
+    QNAN_F32: int = 0x7FC0_0000
+    SNAN_F32: int = 0x7F80_0001
+    MIN_NORMAL_F32: int = 0x0080_0000
+    MAX_SUBNORMAL_F32: int = 0x007F_FFFF
+    MIN_SUBNORMAL_F32: int = 0x0000_0001
+
+    @staticmethod
+    def f32_to_bits(val: float) -> int:
+        return struct.unpack("<I", struct.pack("<f", val))[0]
+
+    def test_signed_zero_byte_distance(self) -> None:
+        # Distance between +0.0 (0x00000000) and -0.0 (0x80000000)
+        # Differ only in MSB of byte 3 (|0x00 - 0x80| = 128)
+        dist = ref_sad_u8_sum(self.POS_ZERO_F32, self.NEG_ZERO_F32)
+        self.assertEqual(dist, 128)
+        self.assertEqual(ref_sad_u8(self.POS_ZERO_F32, self.NEG_ZERO_F32, 100), 228)
+
+    def test_nan_payload_byte_isolation(self) -> None:
+        # Distance between +infinity (0x7F800000) and quiet NaN (0x7FC00000)
+        # Bytes: [0, 0, 0x80, 0x7F] vs [0, 0, 0xC0, 0x7F] -> diff is |0x80 - 0xC0| = 64
+        dist_qnan = ref_sad_u8_sum(self.POS_INF_F32, self.QNAN_F32)
+        self.assertEqual(dist_qnan, 64)
+
+        # Distance between +infinity (0x7F800000) and signaling NaN (0x7F800001)
+        # Differ only in byte 0: |0 - 1| = 1
+        dist_snan = ref_sad_u8_sum(self.POS_INF_F32, self.SNAN_F32)
+        self.assertEqual(dist_snan, 1)
+
+    def test_subnormal_to_normal_boundary_step(self) -> None:
+        # Between min normal (0x00800000) and max subnormal (0x007FFFFF)
+        # Bytes of 0x00800000: [0, 0, 0x80, 0]
+        # Bytes of 0x007FFFFF: [0xFF, 0xFF, 0x7F, 0]
+        # Diffs: 255 + 255 + 1 + 0 = 511
+        dist = ref_sad_u8_sum(self.MIN_NORMAL_F32, self.MAX_SUBNORMAL_F32)
+        self.assertEqual(dist, 511)
+        self.assertEqual(ref_sad_u8(self.MIN_NORMAL_F32, self.MAX_SUBNORMAL_F32, 0), 511)
+
+    def test_inf_to_neg_inf_byte_distance(self) -> None:
+        # +Inf (0x7F800000) vs -Inf (0xFF800000)
+        # Differ only in MSB sign byte 3: |0x7F - 0xFF| = 128
+        dist = ref_sad_u8_sum(self.POS_INF_F32, self.NEG_INF_F32)
+        self.assertEqual(dist, 128)
+
+    def test_nan_quiet_bit_msad(self) -> None:
+        # Using QNaN as template in msad_u8:
+        # Bytes of QNAN (0x7FC00000): byte 0=0, byte 1=0, byte 2=0xC0, byte 3=0x7F
+        # Bytes 0 and 1 are masked out because they are zero!
+        s0 = 0xFFFF_FFFF
+        # byte 2 diff: |0xFF - 0xC0| = 63
+        # byte 3 diff: |0xFF - 0x7F| = 128
+        # total msad = 63 + 128 = 191
+        self.assertEqual(ref_msad_u8_sum(s0, self.QNAN_F32), 191)
+
+    def test_float_adjacent_ulp_distance(self) -> None:
+        # Bit pattern for 1.0f is 0x3F800000; next adjacent float is 0x3F800001
+        b_one = self.f32_to_bits(1.0)
+        b_next = b_one + 1
+        self.assertEqual(ref_sad_u8_sum(b_one, b_next), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
