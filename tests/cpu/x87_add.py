@@ -57,7 +57,7 @@ CONTROLS = {
     "double": (ARITH, "x87_arith{53, 1023, 0x7fe}"),
     # m80 loads go through binary64, as a register model of host doubles would.
     "m80double": (re.compile(r"(x87_from_m80\(uint64_t sig, uint16_t se\) \{ )return \{sig, se\};"),
-                  r"\1return x87_from_f64(x87_to_f64({sig, se}));"),
+                  r"\1return x87_from_f64(x87_to_f64({sig, se}, 0x027f));"),
     # Bits shifted out when aligning the smaller addend are dropped instead of kept as a sticky bit.
     "nosticky": (re.compile(r"lo \|= sticky;|lo = \(hi \| lo\) != 0;"),
                  lambda m: ";" if m.group(0).startswith("lo |=") else "lo = 0;"),
@@ -65,7 +65,7 @@ CONTROLS = {
     "nanorder": (re.compile(r"\*out = b\.sig > a\.sig \|\| \(b\.sig == a\.sig && !x87_sign\(b\)\) \? b : a;"),
                  "*out = a;"),
     # An exact zero sum of nonzero addends is -0.
-    "signedzero": (re.compile(r"return \{0, 0\};  // x \+ \(-x\)"), "return {0, 0x8000};  // x + (-x)"),
+    "signedzero": (re.compile(r"return \{0, zero_sign\};  // x \+ \(-x\)"), "return {0, 0x8000};  // x + (-x)"),
 }
 
 

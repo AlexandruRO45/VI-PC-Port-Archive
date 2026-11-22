@@ -45,7 +45,8 @@ X87_OPS = frozenset({M.FLD, M.FST, M.FSTP, M.FXCH, M.FCHS, M.FABS, M.FSQRT, M.FR
                      M.FLDLG2, M.FLDLN2, M.FILD, M.FIST, M.FISTP, M.FISTTP, M.FXTRACT, M.FSCALE, *FCMOV, M.FCOMI,
                      M.FCOMIP, M.FUCOMI, M.FUCOMIP, M.FADD, M.FADDP, M.FSUB, M.FSUBP, M.FSUBR, M.FSUBRP, M.FMUL, M.FMULP,
                      M.FDIV, M.FDIVP, M.FDIVR, M.FDIVRP, *IARITHMETIC, M.FNSTCW, M.WAIT})
-DECLARATION = "X87Value x87_slot[8]{};"
+# The slots and the control word, which the fixed profile keeps at 0x027F.
+DECLARATION = "X87Value x87_slot[8]{}; const uint16_t x87_cw = 0x027f; (void)x87_cw;"
 
 LOADS = {S.FLOAT32: "x87_from_f32(load<uint32_t>(a))", S.FLOAT64: "x87_from_f64(load<uint64_t>(a))",
          S.FLOAT80: "x87_from_m80(load<uint64_t>(a), load<uint16_t>(a + 8))"}
@@ -324,14 +325,14 @@ def statement(i, depth, address):
                     f"x87_slot[{depth}] = x87_from_integer(static_cast<{signed}>(load<{unsigned}>(a))); }}")
         chop = "true" if op == M.FISTTP else "false"
         return (f"{{ const word a = {address()}; "
-                f"store<{unsigned}>(a, static_cast<{unsigned}>(x87_to_integer(x87_slot[{top}], {bits}, {chop}))); }}")
+                f"store<{unsigned}>(a, static_cast<{unsigned}>(x87_to_integer(x87_slot[{top}], {bits}, {chop}, x87_cw))); }}")
     if op in IARITHMETIC:  # ST(0) = ST(0) op integer, the integer converted exactly as for FILD
         signed, unsigned, bits = INTEGERS[i.memory_size]
         name = next(n for n, v in vars(M).items() if v == op).lower()
         return (f"{{ const word a = {address()}; x87_slot[{top}] = {IARITHMETIC[op]}(x87_slot[{top}], "
-                f"x87_from_integer(static_cast<{signed}>(load<{unsigned}>(a)))); }}  // {name} m{bits}")
+                f"x87_from_integer(static_cast<{signed}>(load<{unsigned}>(a))), x87_cw); }}  // {name} m{bits}")
     if op == M.FSCALE:
-        return f"x87_slot[{top}] = x87_scale(x87_slot[{top}], x87_slot[{top - 1}]);"
+        return f"x87_slot[{top}] = x87_scale(x87_slot[{top}], x87_slot[{top - 1}], x87_cw);"
     if op == M.FXTRACT:  # ST(1) becomes the exponent and the pushed ST(0) the significand
         return (f"{{ X87Value e; const X87Value s = x87_xtract(x87_slot[{top}], e); "
                 f"x87_slot[{top}] = e; x87_slot[{depth}] = s; }}  // fxtract")
@@ -340,19 +341,20 @@ def statement(i, depth, address):
         name = next(n for n, v in vars(M).items() if v == op).lower()
         return f"x87_slot[{depth}] = X87Value{{{sig:#018x}ull, {se:#06x}}};  // {name}"
     if op in (M.FSQRT, M.FRNDINT):
-        return f"x87_slot[{top}] = {'x87_sqrt' if op == M.FSQRT else 'x87_rndint'}(x87_slot[{top}]);"
+        return f"x87_slot[{top}] = {'x87_sqrt' if op == M.FSQRT else 'x87_rndint'}(x87_slot[{top}], x87_cw);"
     if op in (M.FCHS, M.FABS):
         return f"x87_slot[{top}] = {'x87_chs' if op == M.FCHS else 'x87_abs'}(x87_slot[{top}]);"
     if op == M.FLD:
         return f"{{ const word a = {address()}; x87_slot[{depth}] = {LOADS[i.memory_size]}; }}"
     if op in (M.FST, M.FSTP):  # FST m32/m64 stores without popping
         v = f"x87_slot[{top}]"
-        store = {S.FLOAT32: f"store<uint32_t>(a, x87_to_f32({v}));", S.FLOAT64: f"store<uint64_t>(a, x87_to_f64({v}));",
+        store = {S.FLOAT32: f"store<uint32_t>(a, x87_to_f32({v}, x87_cw));",
+                 S.FLOAT64: f"store<uint64_t>(a, x87_to_f64({v}, x87_cw));",
                  S.FLOAT80: f"store<uint64_t>(a, {v}.sig); store<uint16_t>(a + 8, {v}.se);"}[i.memory_size]
         return f"{{ const word a = {address()}; {store} }}" + ("  // fst m" if op == M.FST else "")
     if i.op_count == 1:  # arithmetic with an m32/m64 operand: ST(0) = ST(0) op operand
         return (f"{{ const word a = {address()}; "
-                f"x87_slot[{top}] = {ARITHMETIC[op]}(x87_slot[{top}], {OPERANDS[i.memory_size]}); }}")
+                f"x87_slot[{top}] = {ARITHMETIC[op]}(x87_slot[{top}], {OPERANDS[i.memory_size]}, x87_cw); }}")
     # The destination is the first operand: ST(i) for FMUL ST(i), ST(0) and the P forms, ST(0) otherwise.
     destination, source = (top - (i.op0_register - R.ST0), top - (i.op1_register - R.ST0))
-    return f"x87_slot[{destination}] = {ARITHMETIC[op]}(x87_slot[{destination}], x87_slot[{source}]);"
+    return f"x87_slot[{destination}] = {ARITHMETIC[op]}(x87_slot[{destination}], x87_slot[{source}], x87_cw);"
