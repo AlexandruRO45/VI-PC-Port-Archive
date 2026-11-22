@@ -433,13 +433,17 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.self_test:
         return self_test()
-    ops = [o for o in a.ops.split(",") if o]
-    modes = [m for m in a.modes.split(",") if m]
-    waves = [int(w) for w in a.waves.split(",") if w]
-    bad = [o for o in ops if o not in OPS] + [m for m in modes if m not in MODES] + [str(w) for w in waves
-                                                                                    if w not in (32, 64)]
+    ops = [o.strip() for o in a.ops.split(",") if o.strip()]
+    modes = [m.strip() for m in a.modes.split(",") if m.strip()]
+    waves = [w.strip() for w in a.waves.split(",") if w.strip()]
+    empty = [name for name, items in (("--ops", ops), ("--modes", modes), ("--waves", waves)) if not items]
+    if empty:
+        ap.error("nothing to run: " + " and ".join(empty) + (" is" if len(empty) == 1 else " are") + " empty")
+    bad = [o for o in ops if o not in OPS] + [m for m in modes if m not in MODES] + [w for w in waves
+                                                                                    if w not in ("32", "64")]
     if bad:
         ap.error("unknown: " + ", ".join(bad))
+    waves = [int(w) for w in waves]
     if a.json is not None:
         err = validate_json_path(a.json)
         if err:

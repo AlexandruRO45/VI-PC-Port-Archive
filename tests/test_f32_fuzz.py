@@ -188,6 +188,15 @@ class HardwareOracle(unittest.TestCase):
         self.assertEqual(r.returncode, 77, r.stdout + r.stderr)
         self.assertIn("unavailable", r.stdout)
 
+    def test_an_empty_op_list_is_a_usage_error(self):
+        # "," left an empty tuple that gen_cases handed to rng.choice: an IndexError traceback.
+        for ops in (",", "", " , "):
+            r = subprocess.run([sys.executable, "-I", self.TOOL, "--ops", ops, "--programs", "1"],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertIn("--ops names no op", r.stderr)
+
     def test_unknown_oracle_is_a_usage_error(self):
         r = subprocess.run([sys.executable, "-I", self.TOOL, "--oracle", "gpu"], capture_output=True, text=True)
         self.assertEqual(r.returncode, 2)

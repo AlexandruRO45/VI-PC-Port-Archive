@@ -245,6 +245,16 @@ def test_self_test_runs():
     assert "self-test: ok" in r.stdout
 
 
+@pytest.mark.parametrize("formats", ["", ",", " , "])
+def test_an_empty_format_list_is_a_usage_error(formats):
+    # It reached make_cases and stopped with a ZeroDivisionError traceback (formats[i % len(formats)]).
+    r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "image_fuzz.py"), "--formats", formats,
+                        "--programs", "1"], capture_output=True, text=True)
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "Traceback" not in r.stderr
+    assert "--formats names no format" in r.stderr
+
+
 def build_dir_main_uses(monkeypatch, argv):
     """The build folder main() hands run_case for `argv`, with run_case stubbed to a pass."""
     seen = []

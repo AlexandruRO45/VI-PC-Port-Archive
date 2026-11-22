@@ -1674,8 +1674,10 @@ def main(argv=None):
     if (a.perturb or a.negative_control or a.keep) and "hw" not in backends:
         ap.error("--perturb, --negative-control and --keep need --oracle hw")
     ops = tuple(ALL_OPS if "hw" in backends else OPS)
-    if a.ops:
+    if a.ops is not None:
         ops = tuple(o.strip() for o in a.ops.split(",") if o.strip())
+        if not ops:
+            ap.error("--ops names no op (see --list-ops)")
         unknown = [o for o in ops if o not in ALL_OPS]
         if unknown:
             ap.error(f"unknown ops: {', '.join(unknown)} (see --list-ops)")

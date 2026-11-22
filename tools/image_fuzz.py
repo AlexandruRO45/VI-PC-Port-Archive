@@ -577,6 +577,9 @@ def main() -> int:
         ap.error("--negative-control needs --oracle hw")
     formats = [f.strip() for f in a.formats.split(",") if f.strip()]
     unknown = [f for f in formats if f not in FORMATS]
+    if not formats:
+        print(f"--formats names no format; known: {', '.join(FORMATS)}", file=sys.stderr)
+        return 2
     if unknown:
         print(f"unknown format(s): {', '.join(unknown)}; known: {', '.join(FORMATS)}", file=sys.stderr)
         return 2

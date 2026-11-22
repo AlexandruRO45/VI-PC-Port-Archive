@@ -225,6 +225,16 @@ class Cli(unittest.TestCase):
             self.assertIn("error:", err.getvalue())
             self.assertIn("No space left on device", err.getvalue())
 
+    def test_bad_or_empty_lists_are_a_usage_error_before_the_oracle(self):
+        # --waves x raised a ValueError traceback; an empty list passed the check and swept nothing.
+        for args, want in ((["--waves", "x"], "x"), (["--waves", "32,48"], "48"), (["--ops", ","], "--ops"),
+                           (["--modes", ""], "--modes"), (["--waves", " , "], "--waves")):
+            r = subprocess.run([sys.executable, "-I", str(TOOLS / "f16_trans_sweep.py")] + args,
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, args)
+            self.assertNotIn("Traceback", r.stderr, args)
+            self.assertIn(want, r.stderr, args)
+
 
 class OnHardware(unittest.TestCase):
     @classmethod
