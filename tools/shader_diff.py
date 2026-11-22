@@ -38,7 +38,7 @@ if SEM_DIR not in sys.path:
 
 import cpu_ref  # noqa: E402
 import rdna2spirv  # noqa: E402
-from spirv_mini_interp import run_fragment  # noqa: E402
+from spirv_mini_interp import UnsupportedConstruct, run_fragment  # noqa: E402
 
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 
@@ -116,7 +116,7 @@ def _op_templates():
 # adds to OpIAddCarry, which tests/semantic/spirv_mini_interp.py does not
 # model yet, so every such program would skip with a reason instead of
 # proving anything. Scalar reads are still covered: seeds are moved through
-# s_regs and observed via the v_mov_b32/sgpr copy into v15. Extending the
+# s_regs and observed via the v_mov_b32/sgpr copy into an exported VGPR. Extending the
 # mini-interp (not this runner) re-enables scalar ALU coverage.
 _VEC_OPS = ("v_mov_b32", "v_add_f32", "v_sub_f32", "v_mul_f32", "v_fma_f32",
             "v_and_b32", "v_or_b32", "v_xor_b32", "v_lshlrev_b32",
@@ -170,14 +170,15 @@ def generate_program(rng, n_ops):
             tainted.add(dst)
         else:
             tainted.discard(dst)
-    # Observe one scalar through a VGPR so scalar ops are covered too.
-    lines.append(f"v_mov_b32 v15, s{rng.choice(s_regs)}")
-    writers[15] = ("v_mov_b32/sgpr-copy", len(lines))
+    # Reuse the oldest export: an untouched seed if possible, else an ALU result.
+    dst = min(EXPORT_REGS, key=lambda reg: writers[reg][1])
+    lines.append(f"v_mov_b32 v{dst}, s{rng.choice(s_regs)}")
+    writers[dst] = ("v_mov_b32/sgpr-copy", len(lines))
     return lines, writers
 
 
 def _write_listing(path, lines, with_export):
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write("; shader_diff case  code 0x0..0x1000\n")
         for line in lines:
             f.write("\t" + line + "\n")
@@ -209,7 +210,7 @@ def compare_pair(cpu_words, spv_words, *, writers=None):
             if c_nan or s_nan:
                 mismatch = f"lane word {i}: only one side is NaN (cpu=0x{c:08x} spv=0x{s:08x})"
         if writer:
-            mismatch += f" (last writer {writer[0]} at body line {writer[1]})"
+            mismatch += f" (last writer {writer[0]} at body line {writer[1]} for v{EXPORT_REGS[i]})"
         return mismatch
     return None
 
@@ -243,7 +244,7 @@ def run_one(name, lines, writers):
             return ("skip", f"translator error {type(e).__name__}: {e}")
         try:
             out = run_fragment(spvasm)
-        except Exception as e:  # noqa: BLE001 - the interpreter is part of the comparison
+        except UnsupportedConstruct as e:
             return ("skip", f"mini_interp unsupported: {type(e).__name__}: {e}")
         if list(out) != ["%out_mrt0"]:
             return ("skip", f"mini_interp gave outputs {sorted(out)}, want [%out_mrt0]")
@@ -309,12 +310,29 @@ def self_test():
     return True
 
 
+def _at_least_one(value):
+    """An integer option that must be at least 1.
+
+    0 and negative values used to run nothing (--programs, --limit) or raise
+    `empty range in randrange(1, 1)` (--max-ops) instead of being refused.
+    """
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected an integer, got {value!r}") from None
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1 (got {n})")
+    return n
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Differential oracle: cpu_ref vs translated SPIR-V.")
-    ap.add_argument("--programs", type=int, default=200)
+    ap.add_argument("--programs", type=_at_least_one, default=200, help="number of programs to run (default: 200)")
     ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--max-ops", type=int, default=8)
-    ap.add_argument("--limit", type=int, default=None, help="run only the first N programs")
+    ap.add_argument("--max-ops", type=_at_least_one, default=8,
+                    help="maximum ops per generated program (default: 8)")
+    ap.add_argument("--limit", type=_at_least_one, default=None,
+                    help="run only the first N programs (N >= 1)")
     ap.add_argument("--list-ops", action="store_true", help="print the op table and exit")
     ap.add_argument("--self-test", action="store_true", help="run harness canaries and exit")
     a = ap.parse_args(argv)
@@ -340,4 +358,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

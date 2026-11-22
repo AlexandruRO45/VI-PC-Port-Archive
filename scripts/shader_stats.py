@@ -38,18 +38,40 @@ COLUMNS = [("orig", "orig", 5, ""), ("aco", "aco", 5, ""), ("growth", "growth", 
            ("spill_detail", "spills", 6, ""), ("waves", "waves", 5, "")]
 
 
-def original(path):
+def original(path: str) -> tuple[int, int]:
     """(instruction count, VGPRs used) of an original RDNA listing."""
     insns = shader_ir.parse_file(path)["insns"]
-    top = max((a["r"] + a.get("n", 1) for i in insns for a in i["args"] if a.get("k") == "vgpr"), default=0)
+    top = 0
+    for insn in insns:
+        for operand in insn["args"]:
+            kind = operand.get("k")
+            if kind == "vgpr":
+                top = max(top, operand["r"] + operand.get("n", 1))
+            elif kind == "vlist":
+                top = max(top, max(operand["r"]) + 1)
     return len(insns), top
 
 
+REQUIRED = ("name", "stage", "statistic", "value")
+
+
 def load_stats(path):
-    """Counter names and raw values by (shader, stage), as written by vk_pipeline_check --stats."""
+    """Read counters keyed by (shader, stage) from vk_pipeline_check --stats."""
     out = defaultdict(dict)
     with open(path, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
+        reader = csv.DictReader(f)
+        header = reader.fieldnames or []
+        missing = [c for c in REQUIRED if c not in header]
+        if missing:
+            raise ValueError(f"line 1: missing required header column(s): {', '.join(missing)}")
+        duplicates = [c for c in REQUIRED if header.count(c) > 1]
+        if duplicates:
+            raise ValueError(f"line 1: duplicated required header column(s): {', '.join(duplicates)}")
+        for row in reader:
+            line = reader.line_num
+            absent = [c for c in REQUIRED if row[c] is None]
+            if absent:
+                raise ValueError(f"line {line}: row missing required column(s): {', '.join(absent)}")
             out[row["name"], row["stage"]][row["statistic"]] = row["value"]
     return out
 
@@ -116,16 +138,37 @@ def median_clause(rs, key, label):
     return f"{label} median {statistics.median(r[key] for r in known):g}{coverage(len(known), len(rs))}"
 
 
+USAGE = "usage: shader_stats.py <stats.csv> <disasm dir> [--details]"
+
+
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    argv = sys.argv[1:]
+    if "-h" in argv or "--help" in argv:
+        print(__doc__)
+        return 0
+    # A misspelt option (--detail) used to be dropped, and the summary printed as if it had been asked for.
+    unknown = [a for a in argv if a.startswith("--") and a != "--details"]
+    if unknown:
+        print(f"unknown option {unknown[0]}\n{USAGE}", file=sys.stderr)
+        return 2
+    args = [a for a in argv if not a.startswith("--")]
     if len(args) != 2:
-        sys.exit(__doc__)
-    stats, disasm = load_stats(args[0]), args[1]
+        print(USAGE, file=sys.stderr)
+        return 2
+    path = args[0]
+    try:
+        stats = load_stats(path)
+    except (OSError, ValueError, csv.Error) as e:
+        sys.exit(f"{path}: {e}")
+    disasm = args[1]
     rows = []
     for (name, stage), st in sorted(stats.items()):
         src = os.path.join(disasm, name + ".s")
         if os.path.isfile(src):
-            rows.append(shader_row(name, stage, st, src))
+            try:
+                rows.append(shader_row(name, stage, st, src))
+            except OSError as e:
+                sys.exit(f"{src}: {e.strerror or e}")
     if not rows:
         sys.exit("no shader is in both the statistics and the disasm folder")
     if "--details" in sys.argv:
@@ -159,4 +202,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

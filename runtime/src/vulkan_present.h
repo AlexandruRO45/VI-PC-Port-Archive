@@ -14,16 +14,34 @@
 // of the back buffer is scaled to the window), a blank present (the window cleared to black), a swapchain format
 // that follows the source (an sRGB source gets an sRGB swapchain, so the blit's decode and encode cancel; every
 // other source gets a UNORM one), and an optional capture that copies each presented frame to host memory.
+//
+// Plane composition (PresentX with placement, a filter, HDR10 or a second plane): present_planes() runs a compute pass
+// (present_compose.comp, vulkan_present_compose.h) over up to two textures into an RGBA16F image and copies that to the
+// swapchain; with an HDR10 plane and a surface that lists an ST.2084 format the swapchain is created in it. The plain
+// blit above is unchanged.
+//
+// Tearing on request (PresentX's ImmediateThresholdPercent): with VK_KHR_swapchain_maintenance1 (or the EXT original)
+// the vsync swapchain is created with FIFO plus IMMEDIATE (FIFO_RELAXED when the surface cannot switch to IMMEDIATE),
+// and a present that asks for it is queued in that mode alone. Without the extension, or without either mode, a
+// request is ignored and the frame waits for the vblank.
 
 #include "vulkan_backend.h"
+#include "vulkan_present_compose.h"
+
+// Use the original EXT spellings. They are aliases of the promoted KHR types and are available in older headers.
+#if defined(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) && defined(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME)
+#define LEONIDA_SWAPCHAIN_MAINTENANCE1 1
+#endif
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <functional>
 #include <map>
+#include <memory>
 #include <vector>
 
 namespace leonida {
@@ -31,6 +49,28 @@ namespace leonida {
 // A sub-rectangle of a back buffer in texels; left/top inclusive, right/bottom exclusive (D3D12_RECT's convention).
 struct PresentRect {
     std::int32_t left, top, right, bottom;
+};
+
+// One plane of present_planes(): a colour texture, the part of it shown, and where in the output it goes.
+struct PresentPlane {
+    ResourceId source{};
+    PresentRect source_rect{};   // texels; used when has_source_rect
+    bool has_source_rect = false;
+    float dest[4] = {0, 0, 1, 1};  // left, top, right, bottom as fractions of the output (0..1)
+    bool point_filter = false;     // nearest texel; otherwise bilinear inside the source rectangle
+    bool hdr10 = false;            // the texture holds ST.2084 (PQ) Rec.2020 values; otherwise sRGB or G2.2 (PresentPlanes::sdr_eotf) Rec.709 ones
+    bool straight_alpha = false;   // plane 1 only: alpha is not premultiplied into the colour
+};
+struct PresentPlanes {
+    PresentPlane plane[2];
+    std::uint32_t count = 1;
+    // What SDR white maps to in an HDR10 output, and what HDR10 is divided by for an SDR one (the white of the SDR output).
+    float sdr_white_nits = 203.0f;
+    // How SDR planes (and an SDR output) are encoded: piecewise sRGB (default; what Windows applies to SDR content in HDR
+    // mode, community-sourced, docs section 4.5) or a pure power of 2.2.
+    enum class SdrEotf : std::uint32_t { srgb = 0, gamma22 = 1 };
+    SdrEotf sdr_eotf = SdrEotf::srgb;
+    float hdr_peak_nits = 1000.0f;  // peak of the HDR10 content: the white point of the tone map on an SDR output
 };
 
 namespace detail {
@@ -62,13 +102,17 @@ inline bool blit_unsupported_format(VkFormat format) {
 class VulkanPresenter {
 public:
     VulkanPresenter(VulkanContext& context, PFN_vkGetInstanceProcAddr get_instance, VkInstance instance,
-                    VkPhysicalDevice physical, VkQueue queue, std::uint32_t family, VkSurfaceKHR surface)
-        : context_(context), instance_(instance), physical_(physical), queue_(queue), surface_(surface) {
+                    VkPhysicalDevice physical, VkQueue queue, std::uint32_t family, VkSurfaceKHR surface,
+                    bool swapchain_maintenance1 = false,
+                    std::function<VkExtent2D()> extent_fn = nullptr)
+        : context_(context), instance_(instance), physical_(physical), queue_(queue), surface_(surface),
+          maintenance1_(swapchain_maintenance1), extent_fn_(std::move(extent_fn)) {
 #define LEONIDA_INSTANCE_FN(name) name##_ = reinterpret_cast<PFN_##name>(get_instance(instance, #name));
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceSurfaceSupportKHR)
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceSurfaceFormatsKHR)
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceSurfacePresentModesKHR)
+        LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceSurfaceCapabilities2KHR)
         LEONIDA_INSTANCE_FN(vkDestroySurfaceKHR)
         LEONIDA_INSTANCE_FN(vkGetDeviceProcAddr)
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceMemoryProperties)
@@ -126,7 +170,9 @@ public:
         release(swapchain_);
         swapchain_ = VK_NULL_HANDLE;
         release_capture();
+        composer_.reset();
         for (Frame& frame : frames_) {
+            drop_views(frame);
             if (frame.done) vkDestroyFence_(device, frame.done, nullptr);
             if (frame.acquired) vk.vkDestroySemaphore(device, frame.acquired, nullptr);
         }
@@ -141,6 +187,13 @@ public:
     VkExtent2D extent() const { return extent_; }
     VkFormat format() const { return format_; }
     std::uint64_t presented() const { return presented_; }
+    // The present mode a tearing present uses (IMMEDIATE, else FIFO_RELAXED) while the current swapchain was created
+    // for it, else VK_PRESENT_MODE_MAX_ENUM_KHR: ImmediateThresholdPercent cannot be honoured then.
+    VkPresentModeKHR tear_mode() const { return tear_mode_; }
+    bool tear_supported() const { return tear_mode_ != VK_PRESENT_MODE_MAX_ENUM_KHR; }
+    // Whether the last present was queued in the tearing mode, and how many were.
+    bool last_present_tore() const { return last_tore_; }
+    std::uint64_t tear_presents() const { return tear_presents_; }
 
     // Blits the colour texture `source` (mip 0, layer 0, in D3D12's PRESENT state) to the window and presents it.
     // `source_rect`, when given, limits the blit to that part of the texture (stretched to the whole window); it
@@ -155,7 +208,10 @@ public:
     // wait on a fence nothing will signal: an empty batch takes the acquire semaphore and signals the frame's fence,
     // and the swapchain is recreated next time, which gives back the image that was never presented. If even that
     // batch fails, the presenter stops (ok() is false) and its owner has to make a new one.
-    VkResult present(ResourceId source, bool vsync, const PresentRect* source_rect = nullptr) {
+    //
+    // `tear` (only with vsync): queue the present in tear_mode() instead of FIFO when the swapchain can, so a frame
+    // that missed its vblank is shown at once; last_present_tore() says whether it was.
+    VkResult present(ResourceId source, bool vsync, const PresentRect* source_rect = nullptr, bool tear = false) {
         ResourceBinding binding;
         {
             std::shared_lock lock(context_.resource_mutex_);  // the resource table (vulkan_backend.h)
@@ -173,15 +229,60 @@ public:
                             std::uint32_t(source_rect->right) > binding.width ||
                             std::uint32_t(source_rect->bottom) > binding.height))
             return VK_ERROR_UNKNOWN;
-        return submit(&binding, source, vsync, source_rect, detail::is_srgb_format(binding.format));
+        return submit(&binding, source, vsync, source_rect, detail::is_srgb_format(binding.format), tear);
     }
+
+    // PresentX with planes (docs section 4.5): one or two textures, each scaled from its source rectangle to its
+    // destination rectangle of the window, plane 1 blended over plane 0, composed by a compute pass into an RGBA16F image
+    // that is then copied to the swapchain image. Colour spaces are converted to the swapchain's: when a plane is HDR10 and
+    // the surface lists an HDR10 (ST.2084) format the swapchain uses it (hdr_active()), else the HDR10 planes are
+    // tone mapped to SDR (shoulder above 0.8 of SDR white, then clipped). Planes are filtered and blended in linear light. The swapchain
+    // is always UNORM here; sRGB-format sources are
+    // encoded again by the pass. Sources must be single-sample, sampled (no DENY_SHADER_RESOURCE) float/UNORM/sRGB
+    // colour textures; others are refused (VK_ERROR_FORMAT_NOT_SUPPORTED). Rectangles outside their range give
+    // VK_ERROR_UNKNOWN. vsync and `tear` as for present().
+    VkResult present_planes(const PresentPlanes& planes, bool vsync, bool tear = false) {
+        if (planes.count < 1 || planes.count > 2) return VK_ERROR_UNKNOWN;
+        if (!(planes.sdr_white_nits > 0.0f) || !std::isfinite(planes.sdr_white_nits)) return VK_ERROR_UNKNOWN;
+        if (!(planes.hdr_peak_nits > 0.0f) || !std::isfinite(planes.hdr_peak_nits)) return VK_ERROR_UNKNOWN;
+        for (std::uint32_t i = 0; i < planes.count; ++i) {
+            const PresentPlane& plane = planes.plane[i];
+            ResourceBinding binding;
+            {
+                std::shared_lock lock(context_.resource_mutex_);
+                const ResourceBinding* found = context_.resolve(plane.source);
+                if (!found || !found->image) return VK_ERROR_UNKNOWN;
+                binding = *found;
+            }
+            if (binding.aspects != VK_IMAGE_ASPECT_COLOR_BIT || binding.samples > 1 || !binding.sampled || detail::blit_unsupported_format(binding.format) ||
+                !(format_features(binding.format) & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT))
+                return VK_ERROR_FORMAT_NOT_SUPPORTED;
+            const PresentRect& r = plane.source_rect;
+            if (plane.has_source_rect && (r.left < 0 || r.top < 0 || r.left >= r.right || r.top >= r.bottom ||
+                                          std::uint32_t(r.right) > binding.width || std::uint32_t(r.bottom) > binding.height))
+                return VK_ERROR_UNKNOWN;
+            const float* d = plane.dest;
+            if (!(d[0] >= 0.0f && d[0] < d[2] && d[2] <= 1.0f && d[1] >= 0.0f && d[1] < d[3] && d[3] <= 1.0f))
+                return VK_ERROR_UNKNOWN;  // (also false for NaN)
+        }
+        return submit(nullptr, ResourceId{}, vsync, nullptr, false, tear, &planes);
+    }
+    // The swapchain holds HDR10 (ST.2084) values: a plane asked for it and the surface has the format.
+    bool hdr_active() const { return hdr_active_; }
+    // Presents that went through the compose pass (present_planes); plain blits and blank frames are not counted.
+    std::uint64_t composed_presents() const { return composed_; }
+    // Tests, on surfaces without HDR10: compose as if the output were HDR10 but write the PQ values into the (8-bit,
+    // UNORM) swapchain, so the encoder can be checked on any GPU. Takes effect with the next present_planes().
+    void force_hdr_encoding(bool on) { force_hdr_encoding_ = on; }
 
     // Polled while a present waits for a swapchain image (every 50 ms): when it returns true the present gives up with
     // VK_NOT_READY, so a caller that is being suspended is never held by a window that stopped taking frames.
     void set_abort(std::function<bool()> abort) { abort_ = std::move(abort); }
 
     // Presents a black frame: the swapchain image cleared, nothing read. PresentX with no planes.
-    VkResult present_blank(bool vsync) { return submit(nullptr, ResourceId{}, vsync, nullptr, swapchain_srgb_); }
+    VkResult present_blank(bool vsync, bool tear = false) {
+        return submit(nullptr, ResourceId{}, vsync, nullptr, swapchain_srgb_, tear);
+    }
 
     // From now on every presented frame is also copied to host memory (the swapchain gets TRANSFER_SRC usage), for
     // read_back(). False when the surface cannot do it or its format is not 8 bits per channel with 4 channels.
@@ -190,7 +291,7 @@ public:
         if (!ok_) return false;
         capture_ = true;
         stale_ = true;
-        if (!recreate(vsync_, swapchain_srgb_) || (swapchain_ && !capture_buffer_)) {
+        if (!recreate(vsync_, swapchain_srgb_, swapchain_hdr_req_) || (swapchain_ && !capture_buffer_)) {
             capture_ = false;
             return false;
         }
@@ -198,32 +299,44 @@ public:
     }
 
     // The last presented frame as the swapchain stores it (4 bytes a texel, rows tightly packed, format() order).
-    // Waits for the frame to finish. False when nothing was presented since enable_capture().
+    // Waits for the frame to finish. False if no captured frame is available or the wait fails.
     bool read_back(std::vector<std::uint8_t>& pixels, VkExtent2D* extent, VkFormat* format) {
         if (!capture_ || !capture_ptr_ || !captured_) return false;
         const Frame& frame = frames_[(frame_index_ + frames_.size() - 1) % frames_.size()];
-        vkWaitForFences_(context_.device(), 1, &frame.done, VK_TRUE, UINT64_MAX);
+        if (vkWaitForFences_(context_.device(), 1, &frame.done, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+            return false;
         pixels.assign(capture_ptr_, capture_ptr_ + std::size_t(captured_extent_.width) * captured_extent_.height * 4);
         if (extent) *extent = captured_extent_;
         if (format) *format = captured_format_;
         return true;
     }
 
-    // Shared by present() and present_blank(). `binding` null: clear instead of blit.
+    // Shared by present(), present_blank() and present_planes(). `binding` null and `planes` null: clear instead of blit;
+    // `planes`: compose them (`binding`, `source`, `source_rect` unused).
     VkResult submit(const ResourceBinding* binding, ResourceId source, bool vsync, const PresentRect* source_rect,
-                    bool srgb) {
+                    bool srgb, bool tear = false, const PresentPlanes* planes = nullptr) {
+        last_tore_ = false;
         if (!ok_) return VK_ERROR_INITIALIZATION_FAILED;
-        if (vsync != vsync_ || stale_ || srgb != swapchain_srgb_) {
+        // The swapchain's HDR10 format is only for composed planes that ask for it; a blit of an SDR source or a blank
+        // frame keeps whatever the swapchain has (black is black), except that a blit needs the SDR one.
+        bool want_hdr = swapchain_hdr_req_;
+        if (planes)
+            want_hdr = (planes->plane[0].hdr10) || (planes->count > 1 && planes->plane[1].hdr10);
+        else if (binding)
+            want_hdr = false;
+        if (vsync != vsync_ || stale_ || srgb != swapchain_srgb_ || want_hdr != swapchain_hdr_req_) {
             // The swapchain's colour encoding is only recorded once the new swapchain exists, so a failed
             // recreate is tried again at the next present.
-            if (!recreate(vsync, srgb)) return VK_ERROR_OUT_OF_DATE_KHR;
+            if (!recreate(vsync, srgb, want_hdr)) return VK_ERROR_OUT_OF_DATE_KHR;
         }
         if (!swapchain_) {  // minimised: try again next frame
             stale_ = true;
             return VK_SUCCESS;
         }
         if (binding && !presentable(source)) return VK_ERROR_UNKNOWN;  // checked before an image is acquired for it
-        if (binding && !(format_features(format_) & VK_FORMAT_FEATURE_BLIT_DST_BIT)) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+        if ((binding || planes) && !(format_features(format_) & VK_FORMAT_FEATURE_BLIT_DST_BIT))
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+        if (planes && !prepare_compose()) return VK_ERROR_FORMAT_NOT_SUPPORTED;
         auto& vk = context_.vk;
         const VkDevice device = context_.device();
         Frame& frame = frames_[frame_index_ % frames_.size()];
@@ -233,19 +346,52 @@ public:
         std::uint32_t image = 0;
         VkResult acquired = acquire(frame.acquired, &image);
         if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
-            if (!recreate(vsync, swapchain_srgb_)) return acquired;
+            if (!recreate(vsync, swapchain_srgb_, swapchain_hdr_req_)) return acquired;
             if (!swapchain_) return VK_SUCCESS;
             acquired = acquire(frame.acquired, &image);
         }
         if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) return acquired;  // nothing was acquired
         if (acquired == VK_SUBOPTIMAL_KHR) stale_ = true;
+        // An out-of-date retry above may have given the swapchain another extent: the compose target follows it.
+        if (planes && !prepare_compose()) return give_back(frame, VK_ERROR_FORMAT_NOT_SUPPORTED);
 
         bool recorded = false;
-        if (binding) {
-            // The back buffer's layout is tracked like any other texture; this holds the context while it is read.
-            std::shared_lock lock(context_.resource_mutex_);  // the resource table (vulkan_backend.h)
+        std::unique_lock tracker_lock(context_.tracker_mutex_, std::defer_lock);
+        bool rollback_source = false;
+        VkImageLayout prev_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        std::array<RollbackPlane, 2> plane_rollbacks{};  // present_planes(): the same, per plane
+        if (planes) {
+            std::array<ResourceBinding, 2> current{};
+            bool found_all = true;
+            {
+                std::shared_lock resource_lock(context_.resource_mutex_);
+                for (std::uint32_t i = 0; i < planes->count; ++i) {
+                    const ResourceBinding* found = context_.resolve(planes->plane[i].source);
+                    if (found && found->image && found->aspects == VK_IMAGE_ASPECT_COLOR_BIT && found->sampled)
+                        current[i] = *found;
+                    else
+                        found_all = false;
+                }
+                if (found_all) {
+                    tracker_lock.lock();
+                    for (std::uint32_t i = 0; i < planes->count; ++i) {
+                        plane_rollbacks[i].id = planes->plane[i].source;
+                        plane_rollbacks[i].tracked = context_.tracker_.tracked(plane_rollbacks[i].id);
+                        if (plane_rollbacks[i].tracked) plane_rollbacks[i].layout = context_.tracker_.layout(plane_rollbacks[i].id, 0);
+                    }
+                    recorded = record_planes(frame, std::uint32_t(frame_index_ % frames_.size()), current, *planes, image);
+                }
+            }
+        } else if (binding) {
+            // Lock hierarchy: resource_mutex_ -> tracker_mutex_ -> submit_mutex_ (vulkan_backend.h).
+            // record() only touches subresource 0 (mip 0, layer 0, color) of `source`, so saving that one layout
+            // rolls back a failed submit in O(1) without copying the entire LayoutTracker map.
+            std::shared_lock resource_lock(context_.resource_mutex_);
             const ResourceBinding* current = context_.resolve(source);
             if (current && current->image && current->aspects == VK_IMAGE_ASPECT_COLOR_BIT) {
+                tracker_lock.lock();
+                rollback_source = context_.tracker_.tracked(source);
+                if (rollback_source) prev_layout = context_.tracker_.layout(source, 0);
                 record(frame.commands, *current, source, image, source_rect);
                 recorded = true;
             }
@@ -253,8 +399,20 @@ public:
             record_blank(frame.commands, image);
             recorded = true;
         }
+        const auto rollback = [&] {
+            if (rollback_source)
+                context_.tracker_.set(source, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}, prev_layout);
+            if (planes)
+                for (std::uint32_t i = 0; i < planes->count; ++i)
+                    if (plane_rollbacks[i].tracked)
+                        context_.tracker_.set(plane_rollbacks[i].id, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+                                              plane_rollbacks[i].layout);
+        };
         if (!recorded) return give_back(frame, VK_ERROR_UNKNOWN);  // released by another thread since presentable()
-        if (const VkResult reset = vkResetFences_(device, 1, &frame.done); reset != VK_SUCCESS) return stop(reset);
+        if (const VkResult reset = vkResetFences_(device, 1, &frame.done); reset != VK_SUCCESS) {
+            rollback();
+            return stop(reset);
+        }
         const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
         VkSubmitInfo submit_info{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submit_info.waitSemaphoreCount = 1;
@@ -270,17 +428,41 @@ public:
         present.swapchainCount = 1;
         present.pSwapchains = &swapchain_;
         present.pImageIndices = &image;
+#ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
+        // The swapchain was created with FIFO and tear_mode_ (both come from the same recreate).
+        VkSwapchainPresentModeInfoEXT present_mode{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT};
+        const bool tearing = tear && vsync_ && tear_supported();
+        if (tearing) {
+            present_mode.swapchainCount = 1;
+            present_mode.pPresentModes = &tear_mode_;
+            present.pNext = &present_mode;
+        }
+#else
+        const bool tearing = false;
+        (void)tear;
+#endif
         VkResult submitted, result = VK_SUCCESS;
         {
             std::lock_guard lock(context_.submit_mutex());
             submitted = vk.vkQueueSubmit(queue_, 1, &submit_info, frame.done);
+            if (submitted != VK_SUCCESS) rollback();
+            // Commit/rollback happened before releasing tracker_mutex_ inside submit_mutex(), preserving submission
+            // order without holding tracker_mutex_ across vkQueuePresentKHR.
+            if (tracker_lock.owns_lock()) tracker_lock.unlock();
             if (submitted == VK_SUCCESS) result = vkQueuePresentKHR_(queue_, &present);
         }
         if (submitted != VK_SUCCESS) return give_back(frame, submitted);
         ++frame_index_;
         // Only a present the engine took counts (SUBOPTIMAL is shown too). OUT_OF_DATE was not shown: the swapchain
         // is recreated next time, and the caller sees VK_SUCCESS, since its work was submitted.
-        if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) ++presented_;
+        if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
+            ++presented_;
+            if (planes) ++composed_;
+            if (tearing) {
+                last_tore_ = true;
+                ++tear_presents_;
+            }
+        }
         if (capture_ && capture_ptr_) {
             captured_ = true;
             captured_extent_ = extent_;
@@ -298,6 +480,7 @@ private:
         VkCommandBuffer commands = VK_NULL_HANDLE;
         VkFence done = VK_NULL_HANDLE;
         VkSemaphore acquired = VK_NULL_HANDLE;
+        std::array<VkImageView, 2> views{};  // the plane views of the last composed present, until the frame is reused
     };
 
     // Whether `source` is a colour texture the device knows, so present() can refuse it before acquiring an image.
@@ -396,6 +579,141 @@ private:
         vk.vkEndCommandBuffer(commands);
     }
 
+    struct RollbackPlane {
+        ResourceId id{};
+        bool tracked = false;
+        VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    };
+
+    void drop_views(Frame& frame) {
+        for (VkImageView& view : frame.views)
+            if (view) context_.vk.vkDestroyImageView(context_.device(), view, nullptr);
+        frame.views = {};
+    }
+
+    // The compose pass and its target image, for the swapchain's current size.
+    bool prepare_compose() {
+        if (!composer_) {
+            VkPhysicalDeviceMemoryProperties memory{};
+            if (!vkGetPhysicalDeviceMemoryProperties_) return false;
+            vkGetPhysicalDeviceMemoryProperties_(physical_, &memory);
+            composer_ = std::make_unique<PresentComposer>(context_, memory);
+        }
+        if (!composer_->ready()) return false;
+        if (composer_->target() && composer_->extent().width == extent_.width &&
+            composer_->extent().height == extent_.height)
+            return true;
+        {
+            std::lock_guard lock(context_.submit_mutex());
+            context_.vk.vkQueueWaitIdle(queue_);  // the old target may still be in use
+        }
+        bool changed = false;
+        return composer_->ensure_target(extent_, changed);
+    }
+
+    // Records the composition of `planes` and its copy to swapchain image `image`. False, with nothing recorded and the
+    // tracker untouched, when a view cannot be made. The caller holds the resource and tracker locks.
+    bool record_planes(Frame& frame, std::uint32_t slot, const std::array<ResourceBinding, 2>& current,
+                       const PresentPlanes& planes, std::uint32_t image) {
+        auto& vk = context_.vk;
+        const ReplayFunctions& fn = context_.replay_;
+        if (composer_->target() == VK_NULL_HANDLE || composer_->extent().width != extent_.width ||
+            composer_->extent().height != extent_.height)
+            return false;  // the target does not match the swapchain: nothing recorded
+        drop_views(frame);
+        for (std::uint32_t i = 0; i < planes.count; ++i) {
+            VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            view_info.image = current[i].image;
+            view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            view_info.format = current[i].format;
+            view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            if (vk.vkCreateImageView(context_.device(), &view_info, nullptr, &frame.views[i]) != VK_SUCCESS) {
+                drop_views(frame);
+                return false;
+            }
+        }
+        if (planes.count == 1) frame.views[1] = VK_NULL_HANDLE;  // the shader never reads it; plane 0's view is bound twice
+
+        VkCommandBuffer commands = frame.commands;
+        vk.vkResetCommandBuffer(commands, 0);
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vk.vkBeginCommandBuffer(commands, &begin);
+
+        constexpr VkAccessFlags any = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        const bool same = planes.count > 1 && planes.plane[1].source == planes.plane[0].source;
+        std::array<LayoutPieces, 2> pieces;
+        std::array<VkImageLayout, 2> read_layout{};
+        // Each distinct source: its PRESENT (common) layout, then readable by the compute pass. A never-written back buffer
+        // is zero-filled first, as any committed resource is.
+        for (std::uint32_t i = 0; i < planes.count; ++i) {
+            read_layout[i] = image_layout(current[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            if (i == 1 && same) continue;
+            const VkImageLayout common = image_layout(current[i], VK_IMAGE_LAYOUT_GENERAL);
+            pieces[i] = detail::current(&context_.tracker_, planes.plane[i].source, range, common);
+            detail::initialize(fn, commands, current[i], planes.plane[i].source, pieces[i], common, &context_.tracker_);
+            for (const auto& piece : pieces[i])
+                detail::image_barrier(fn, commands, current[i], piece.range, piece.layout, read_layout[i],
+                                      VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                      VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        }
+
+        // The pass: destinations in output pixels, sources in texels.
+        PresentComposePush push{};
+        const float out_w = float(extent_.width), out_h = float(extent_.height);
+        std::uint32_t* flags[2] = {&push.flags0, &push.flags1};
+        float* dest[2] = {push.dest0, push.dest1};
+        float* src[2] = {push.src0, push.src1};
+        for (std::uint32_t i = 0; i < planes.count; ++i) {
+            const PresentPlane& plane = planes.plane[i];
+            dest[i][0] = plane.dest[0] * out_w;
+            dest[i][1] = plane.dest[1] * out_h;
+            dest[i][2] = plane.dest[2] * out_w;
+            dest[i][3] = plane.dest[3] * out_h;
+            const PresentRect whole{0, 0, std::int32_t(current[i].width), std::int32_t(current[i].height)};
+            const PresentRect& r = plane.has_source_rect ? plane.source_rect : whole;
+            src[i][0] = float(r.left);
+            src[i][1] = float(r.top);
+            src[i][2] = float(r.right);
+            src[i][3] = float(r.bottom);
+            *flags[i] = (plane.point_filter ? compose_flag::point : 0u) |
+                        (detail::is_srgb_format(current[i].format) ? compose_flag::srgb_source : 0u) |
+                        (plane.hdr10 ? compose_flag::hdr10 : 0u) | (plane.straight_alpha ? compose_flag::straight_alpha : 0u);
+        }
+        push.plane_count = planes.count;
+        push.out_hdr = (hdr_active_ || force_hdr_encoding_) ? 1u : 0u;
+        push.sdr_white = planes.sdr_white_nits;
+        push.sdr_eotf = std::uint32_t(planes.sdr_eotf);
+        push.hdr_peak = planes.hdr_peak_nits;
+        push.width = extent_.width;
+        push.height = extent_.height;
+        composer_->record(commands, slot, frame.views[0], read_layout[0], frame.views[1] ? frame.views[1] : frame.views[0],
+                          read_layout[1] ? read_layout[1] : read_layout[0], push);
+
+        // The swapchain image, written by a copy of the composed image (same size: no scaling).
+        ResourceBinding target = target_of(image);
+        detail::image_barrier(fn, commands, target, range, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                              VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        VkImageBlit blit{};
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.srcOffsets[1] = {std::int32_t(extent_.width), std::int32_t(extent_.height), 1};
+        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.dstOffsets[1] = {std::int32_t(extent_.width), std::int32_t(extent_.height), 1};
+        vkCmdBlitImage_(commands, composer_->target(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, images_[image],
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+        finish_image(commands, image);
+        for (std::uint32_t i = 0; i < planes.count; ++i) {
+            if (i == 1 && same) continue;
+            for (const auto& piece : pieces[i])
+                detail::image_barrier(fn, commands, current[i], piece.range, read_layout[i], piece.layout,
+                                      VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, any,
+                                      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+        }
+        vk.vkEndCommandBuffer(commands);
+        return true;
+    }
+
     // vkGetPhysicalDeviceFormatProperties, optimal tiling, cached per format.
     VkFormatFeatureFlags format_features(VkFormat format) {
         const auto it = features_.find(format);
@@ -445,9 +763,27 @@ private:
         VkImageLayout layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         VkAccessFlags access = VK_ACCESS_TRANSFER_WRITE_BIT;
         if (capture_ && capture_buffer_) {
-            detail::image_barrier(fn, commands, target_of(image), range, layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                  access, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                                  VK_PIPELINE_STAGE_TRANSFER_BIT);
+            // Two frames may be in flight and share `capture_buffer_`: serialize the prior frame's capture copy
+            // before overwriting it, while moving this frame's swapchain image to TRANSFER_SRC.
+            VkBufferMemoryBarrier capture_waw{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+            capture_waw.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            capture_waw.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            capture_waw.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            capture_waw.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            capture_waw.buffer = capture_buffer_;
+            capture_waw.offset = 0;
+            capture_waw.size = VK_WHOLE_SIZE;
+            VkImageMemoryBarrier to_src{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            to_src.srcAccessMask = access;
+            to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            to_src.oldLayout = layout;
+            to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            to_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_src.image = images_[image];
+            to_src.subresourceRange = range;
+            fn.pipeline_barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                                nullptr, 1, &capture_waw, 1, &to_src);
             VkBufferImageCopy copy{};
             copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             copy.imageExtent = {extent_.width, extent_.height, 1};
@@ -509,10 +845,9 @@ private:
     }
 
     // (Re)creates the swapchain for the surface's current size. A zero-sized surface (minimised) leaves no
-    // swapchain and is retried on the next present. Nothing is published until every piece exists: on any failure
-    // the presenter is left with no swapchain and stale_ set, so the next present tries again, and no image is ever
-    // acquired without its per-image semaphore.
-    bool recreate(bool vsync, bool srgb) {
+    // swapchain and is retried on the next present. Keep the old swapchain until the surface queries succeed and
+    // the replacement can be attempted. An incomplete replacement stays stale so the next present tries again.
+    bool recreate(bool vsync, bool srgb, bool hdr = false) {
         auto& vk = context_.vk;
         const VkDevice device = context_.device();
         {
@@ -520,33 +855,70 @@ private:
             vk.vkQueueWaitIdle(queue_);  // the old swapchain's images and semaphores may still be in use
         }
         stale_ = true;  // until this succeeds
+        tear_mode_ = VK_PRESENT_MODE_MAX_ENUM_KHR;
         VkSurfaceCapabilitiesKHR caps{};
         if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR_(physical_, surface_, &caps) != VK_SUCCESS) return false;
-        VkSwapchainKHR old = swapchain_;
-        swapchain_ = VK_NULL_HANDLE;
-        if (caps.currentExtent.width == 0 || caps.currentExtent.height == 0) {
-            release(old);
+        VkExtent2D extent = caps.currentExtent;
+        // When the platform leaves the swapchain extent to the application (0xFFFFFFFF, as on Intel UHD / Win32 WSI),
+        // query the window client area or fall back to the last known extent, and clamp to the surface bounds (D3D-165).
+        if (extent.width == 0xFFFFFFFF || extent.height == 0xFFFFFFFF) {
+            if (extent_fn_) extent = extent_fn_();
+            // ponytail: if no window extent function was supplied, fall back to last extent_ or minImageExtent
+            if (extent.width == 0xFFFFFFFF || extent.height == 0xFFFFFFFF || (extent.width == 0 && extent.height == 0)) {
+                extent = extent_.width && extent_.height ? extent_ : caps.minImageExtent;
+            }
+            if (extent.width && extent.height) {
+                extent.width = std::clamp(extent.width, caps.minImageExtent.width, caps.maxImageExtent.width);
+                extent.height = std::clamp(extent.height, caps.minImageExtent.height, caps.maxImageExtent.height);
+            }
+        }
+        if (extent.width == 0 || extent.height == 0) {
+            release(swapchain_);
+            swapchain_ = VK_NULL_HANDLE;
             vsync_ = vsync;
             swapchain_srgb_ = srgb;
+            swapchain_hdr_req_ = hdr;
+            hdr_active_ = false;
             stale_ = false;
             return true;
         }
-        if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
-            release(old);
-            return false;
-        }
+        VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if (capture_) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        if ((caps.supportedUsageFlags & usage) != usage) return false;
 
         std::uint32_t count = 0;
-        vkGetPhysicalDeviceSurfaceFormatsKHR_(physical_, surface_, &count, nullptr);
+        if (vkGetPhysicalDeviceSurfaceFormatsKHR_(physical_, surface_, &count, nullptr) != VK_SUCCESS || !count)
+            return false;
         std::vector<VkSurfaceFormatKHR> formats(count);
-        vkGetPhysicalDeviceSurfaceFormatsKHR_(physical_, surface_, &count, formats.data());
-        if (formats.empty()) return false;
+        if (vkGetPhysicalDeviceSurfaceFormatsKHR_(physical_, surface_, &count, formats.data()) != VK_SUCCESS || !count)
+            return false;
+        formats.resize(count);
         // An sRGB source wants an sRGB swapchain (the blit decodes and encodes, which cancel); any other source
         // wants UNORM (the bytes go through as they are). BGRA before RGBA, as the surface lists them.
         VkSurfaceFormatKHR chosen = formats[0];
         bool found = false;
+        bool chose_hdr = false;
+        if (hdr) {
+            // A plane in HDR10 (PQ, Rec.2020): the surface's ST.2084 format, which needs VK_EXT_swapchain_colorspace on
+            // the instance. Without it the composition converts to SDR.
+            for (const VkFormat wanted : {VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_A2R10G10B10_UNORM_PACK32}) {
+                for (const auto& f : formats)
+                    if (f.format == wanted && f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
+                        chosen = f;
+                        found = chose_hdr = true;
+                        break;
+                    }
+                if (found) break;
+            }
+            if (!found && !warned_hdr_) {
+                warned_hdr_ = true;
+                std::fprintf(stderr, "[rt] present: the surface has no HDR10 (ST.2084) format; HDR10 planes are converted to "
+                                     "SDR by tone mapping\n");
+            }
+        }
         for (const VkFormat wanted : srgb ? std::array<VkFormat, 2>{VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_SRGB}
                                                 : std::array<VkFormat, 2>{VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM}) {
+            if (chose_hdr) break;
             for (const auto& f : formats)
                 if (f.format == wanted && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
                     chosen = f;
@@ -565,9 +937,12 @@ private:
                     break;
                 }
         }
-        vkGetPhysicalDeviceSurfacePresentModesKHR_(physical_, surface_, &count, nullptr);
+        if (vkGetPhysicalDeviceSurfacePresentModesKHR_(physical_, surface_, &count, nullptr) != VK_SUCCESS || !count)
+            return false;
         std::vector<VkPresentModeKHR> modes(count);
-        vkGetPhysicalDeviceSurfacePresentModesKHR_(physical_, surface_, &count, modes.data());
+        if (vkGetPhysicalDeviceSurfacePresentModesKHR_(physical_, surface_, &count, modes.data()) != VK_SUCCESS || !count)
+            return false;
+        modes.resize(count);
         VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;  // always available
         if (!vsync) {
             for (const VkPresentModeKHR wanted : {VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR})
@@ -583,19 +958,30 @@ private:
         if (caps.maxImageCount) info.minImageCount = std::min(info.minImageCount, caps.maxImageCount);
         info.imageFormat = chosen.format;
         info.imageColorSpace = chosen.colorSpace;
-        info.imageExtent = caps.currentExtent;
+        info.imageExtent = extent;
         info.imageArrayLayers = 1;
-        info.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        if (capture_) {
-            if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) return false;
-            info.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-        }
+        info.imageUsage = usage;
         info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         info.preTransform = caps.currentTransform;
         info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
         if (!(caps.supportedCompositeAlpha & info.compositeAlpha)) info.compositeAlpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
         info.presentMode = mode;
+#ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
+        // A vsync swapchain that can also be presented in IMMEDIATE (or FIFO_RELAXED), switched per present.
+        VkSwapchainPresentModesCreateInfoEXT switchable{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT};
+        std::array<VkPresentModeKHR, 2> switchable_modes{VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_MAX_ENUM_KHR};
+        VkPresentModeKHR tear = VK_PRESENT_MODE_MAX_ENUM_KHR;
+        if (vsync && mode == VK_PRESENT_MODE_FIFO_KHR) tear = find_tear_mode(modes, info.minImageCount, info.imageUsage, info.imageExtent);
+        if (tear != VK_PRESENT_MODE_MAX_ENUM_KHR) {
+            switchable_modes[1] = tear;
+            switchable.presentModeCount = 2;
+            switchable.pPresentModes = switchable_modes.data();
+            info.pNext = &switchable;
+        }
+#endif
         info.clipped = VK_TRUE;
+        const VkSwapchainKHR old = swapchain_;
+        swapchain_ = VK_NULL_HANDLE;
         info.oldSwapchain = old;
         VkSwapchainKHR fresh = VK_NULL_HANDLE;
         const VkResult created = vkCreateSwapchainKHR_(device, &info, nullptr, &fresh);
@@ -620,21 +1006,81 @@ private:
             ready.push_back(semaphore);
         }
         swapchain_ = fresh;
+#ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
+        tear_mode_ = tear;
+#endif
         images_ = std::move(images);
         ready_ = std::move(ready);
         format_ = chosen.format;
-        extent_ = caps.currentExtent;
+        extent_ = extent;
+        hdr_active_ = chose_hdr;
         if (capture_) {
             // A capture that cannot be made fails the recreation with the swapchain in place and stale_ still set.
             const bool four_bytes = format_ == VK_FORMAT_B8G8R8A8_UNORM || format_ == VK_FORMAT_R8G8B8A8_UNORM ||
-                                    format_ == VK_FORMAT_B8G8R8A8_SRGB || format_ == VK_FORMAT_R8G8B8A8_SRGB;
+                                    format_ == VK_FORMAT_B8G8R8A8_SRGB || format_ == VK_FORMAT_R8G8B8A8_SRGB ||
+                                    format_ == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
+                                    format_ == VK_FORMAT_A2R10G10B10_UNORM_PACK32;
             if (!four_bytes || !make_capture_buffer()) return false;
         }
         vsync_ = vsync;
         swapchain_srgb_ = srgb;
+        swapchain_hdr_req_ = hdr;
         stale_ = false;
         return true;
     }
+
+#ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
+    // The mode a FIFO swapchain can also present in, so that a late frame can be shown at once: IMMEDIATE, else
+    // FIFO_RELAXED, each only if the surface lists it and reports it compatible with FIFO (VK_KHR_surface_maintenance1).
+    // `min_images` is raised to what that mode needs too. The mode must also accept the swapchain's image usage and
+    // extent (its capabilities can differ from FIFO's). MAX_ENUM when there is none or the extension is not in use.
+    VkPresentModeKHR find_tear_mode(const std::vector<VkPresentModeKHR>& modes, std::uint32_t& min_images,
+                                    VkImageUsageFlags usage, VkExtent2D extent) {
+        if (!maintenance1_ || !vkGetPhysicalDeviceSurfaceCapabilities2KHR_) return VK_PRESENT_MODE_MAX_ENUM_KHR;
+        // The capabilities of the surface for one present mode, and the modes it can switch to from there.
+        const auto ask = [&](VkPresentModeKHR asked, VkSurfaceCapabilitiesKHR& caps,
+                             std::array<VkPresentModeKHR, 16>* compatible, std::uint32_t* compatible_count) {
+            VkSurfacePresentModeEXT for_mode{VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_EXT};
+            for_mode.presentMode = asked;
+            VkPhysicalDeviceSurfaceInfo2KHR surface_info{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR, &for_mode};
+            surface_info.surface = surface_;
+            VkSurfacePresentModeCompatibilityEXT compat{VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_EXT};
+            if (compatible) {
+                compat.presentModeCount = std::uint32_t(compatible->size());
+                compat.pPresentModes = compatible->data();
+            }
+            VkSurfaceCapabilities2KHR out{VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR, compatible ? &compat : nullptr};
+            if (vkGetPhysicalDeviceSurfaceCapabilities2KHR_(physical_, &surface_info, &out) != VK_SUCCESS) return false;
+            caps = out.surfaceCapabilities;
+            if (compatible_count) *compatible_count = std::min<std::uint32_t>(compat.presentModeCount, 16);
+            return true;
+        };
+        VkSurfaceCapabilitiesKHR fifo_caps{};
+        std::array<VkPresentModeKHR, 16> compatible{};
+        std::uint32_t compatible_count = 0;
+        if (!ask(VK_PRESENT_MODE_FIFO_KHR, fifo_caps, &compatible, &compatible_count)) return VK_PRESENT_MODE_MAX_ENUM_KHR;
+        for (const VkPresentModeKHR wanted : {VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_FIFO_RELAXED_KHR}) {
+            if (std::find(modes.begin(), modes.end(), wanted) == modes.end() ||
+                std::find(compatible.begin(), compatible.begin() + compatible_count, wanted) ==
+                    compatible.begin() + compatible_count)
+                continue;
+            VkSurfaceCapabilitiesKHR mode_caps{};
+            if (!ask(wanted, mode_caps, nullptr, nullptr)) continue;
+            if ((mode_caps.supportedUsageFlags & usage) != usage) continue;
+            if (extent.width < mode_caps.minImageExtent.width || extent.height < mode_caps.minImageExtent.height ||
+                extent.width > mode_caps.maxImageExtent.width || extent.height > mode_caps.maxImageExtent.height)
+                continue;
+            // One image count that every mode of the swapchain accepts.
+            std::uint32_t count = std::max({min_images, fifo_caps.minImageCount, mode_caps.minImageCount});
+            const std::uint32_t most = std::min(fifo_caps.maxImageCount ? fifo_caps.maxImageCount : UINT32_MAX,
+                                                mode_caps.maxImageCount ? mode_caps.maxImageCount : UINT32_MAX);
+            if (count > most) continue;
+            min_images = count;
+            return wanted;
+        }
+        return VK_PRESENT_MODE_MAX_ENUM_KHR;
+    }
+#endif
 
     // Destroys a swapchain that is being replaced (or the last one), with the per-image semaphores that went with it.
     void release(VkSwapchainKHR swapchain) {
@@ -651,6 +1097,10 @@ private:
     VkPhysicalDevice physical_;
     VkQueue queue_;
     VkSurfaceKHR surface_;
+    bool maintenance1_ = false;  // VK_KHR/EXT_swapchain_maintenance1 (and the surface extension) are enabled
+    VkPresentModeKHR tear_mode_ = VK_PRESENT_MODE_MAX_ENUM_KHR;  // set with the swapchain, see tear_mode()
+    bool last_tore_ = false;
+    std::uint64_t tear_presents_ = 0;
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     VkExtent2D extent_{};
@@ -664,7 +1114,14 @@ private:
     bool stale_ = false;
     bool ok_ = false;
     bool swapchain_srgb_ = false;  // the swapchain format follows the source being presented (set once it exists)
+    bool swapchain_hdr_req_ = false;  // the swapchain was built for an HDR10 request (it has the format only if hdr_active_)
+    bool hdr_active_ = false;
+    std::uint64_t composed_ = 0;
+    bool force_hdr_encoding_ = false;
+    bool warned_hdr_ = false;
+    std::unique_ptr<PresentComposer> composer_;
     std::function<bool()> abort_;
+    std::function<VkExtent2D()> extent_fn_;
     std::map<VkFormat, VkFormatFeatureFlags> features_;
     bool warned_srgb_ = false;
     bool capture_ = false;
@@ -680,6 +1137,7 @@ private:
     PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR vkGetPhysicalDeviceSurfaceCapabilitiesKHR_ = nullptr;
     PFN_vkGetPhysicalDeviceSurfaceFormatsKHR vkGetPhysicalDeviceSurfaceFormatsKHR_ = nullptr;
     PFN_vkGetPhysicalDeviceSurfacePresentModesKHR vkGetPhysicalDeviceSurfacePresentModesKHR_ = nullptr;
+    PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR vkGetPhysicalDeviceSurfaceCapabilities2KHR_ = nullptr;
     PFN_vkDestroySurfaceKHR vkDestroySurfaceKHR_ = nullptr;
     PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr_ = nullptr;
     PFN_vkCreateSwapchainKHR vkCreateSwapchainKHR_ = nullptr;

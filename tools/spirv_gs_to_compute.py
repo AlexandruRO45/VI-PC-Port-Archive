@@ -27,6 +27,8 @@ import os
 import re
 import subprocess
 import sys
+from itertools import combinations
+from pathlib import Path
 
 LOCAL_SIZE = 64
 IN_VERTS = {"InputPoints": 1, "InputLines": 2, "InputLinesAdjacency": 4, "Triangles": 3,
@@ -174,6 +176,7 @@ def rewrite(text):
         return f"%gsc_t{count}"
 
     out = []
+    entry_label = None
     state = "header"        # header -> body (in main, entry block) -> after the entry check
     for ln in text.splitlines():
         s = ln.strip()
@@ -208,6 +211,7 @@ def rewrite(text):
             state = "other"
         if state == "main_entry" and re.match(r"%\w+ = OpLabel$", s):
             state = "main_vars"
+            entry_label = s.split()[0]
             out.append(ln)
             continue
         if state == "main_vars" and not re.match(r"%\w+ = OpVariable ", s):
@@ -225,7 +229,15 @@ def rewrite(text):
             out.append(ln)
             continue
         # ---- the body of main ----
-        m = re.match(r"(%\w+) = OpAccessChain (%\w+) (%\w+) (.*)$", s)
+        # The primitive-count check splits the entry block: what followed its variables now sits in %gsc_body, so
+        # an OpPhi naming the entry label as a predecessor names %gsc_body instead.
+        m = re.match(r"(%\w+ = OpPhi %\w+) (.*)$", s)
+        if m:
+            ops = m.group(2).split()
+            ops[1::2] = ["%gsc_body" if lbl == entry_label else lbl for lbl in ops[1::2]]
+            s = f"{m.group(1)} {' '.join(ops)}"
+            ln = s
+        m = re.match(r"(%\w+) = Op(?:InBounds)?AccessChain (%\w+) (%\w+) (.*)$", s)
         if m and m.group(3) in in_slot:
             idx = m.group(4).split()
             vtx = idx[0]
@@ -242,15 +254,15 @@ def rewrite(text):
             ptr = "%gsc_ptr_pv_f" if m.group(2) in float_ptrs else "%gsc_ptr_pv_v4"
             out.append(f"{m.group(1)} = OpAccessChain {ptr} {out_vars[m.group(3)]} {m.group(4)}")
             continue
-        m = re.match(r"(%\w+) = OpLoad (%\w+) (%\w+)$", s)
+        m = re.match(r"(%\w+) = OpLoad (%\w+) (%\w+)(?:\s+.*)?$", s)
         if m and builtins.get(m.group(3)) in ("PrimitiveId", "InvocationId"):
             val = "%gsc_prim" if builtins[m.group(3)] == "PrimitiveId" else k(0)
             out.append(f"{m.group(1)} = OpBitcast {m.group(2)} {val}" if m.group(2) != uint
                        else f"{m.group(1)} = OpCopyObject {uint} {val}")
             continue
-        for v in list(in_slot) + list(out_vars):
+        for v in list(in_slot) + list(out_vars) + sorted(gone - set(in_slot) - set(out_vars)):
             if re.search(rf"{re.escape(v)}\b", s):
-                m2 = re.match(rf"OpStore {re.escape(v)} (%\w+)$", s)
+                m2 = re.match(rf"OpStore {re.escape(v)} (%\w+)(?:\s+.*)?$", s)
                 if v in out_vars and m2:
                     s = f"OpStore {out_vars[v]} {m2.group(1)}"
                     break
@@ -287,15 +299,33 @@ def rewrite(text):
     return "\n".join(out) + "\n", public
 
 
+USAGE = "\n".join(__doc__.strip().splitlines()[-2:])
+
+
 def main(argv):
     args = argv[1:]
+    if args and args[0] in ("-h", "--help"):
+        print(USAGE)
+        return 0
     lay_path = None
     if "--layout" in args:
         i = args.index("--layout")
         lay_path = args[i + 1]
         del args[i:i + 2]
     if len(args) != 2:
-        print("usage: spirv_gs_to_compute.py in.spv out.spv [--layout out.json]", file=sys.stderr)
+        print(USAGE, file=sys.stderr)
+        return 2
+    paths = [("input", args[0]), ("SPIR-V output", args[1])]
+    if lay_path:
+        paths.append(("--layout output", lay_path))
+    try:
+        resolved = [(name, Path(path).resolve()) for name, path in paths]
+        for (left_name, left), (right_name, right) in combinations(resolved, 2):
+            if left == right or (left.exists() and right.exists() and left.samefile(right)):
+                print(f"{left_name} and {right_name} refer to the same file: {left}", file=sys.stderr)
+                return 2
+    except (OSError, RuntimeError, ValueError) as e:
+        print(f"cannot check input/output paths: {e}", file=sys.stderr)
         return 2
     dis = os.environ.get("SPIRV_DIS", "spirv-dis")
     asm = os.environ.get("SPIRV_AS", "spirv-as")
@@ -309,11 +339,15 @@ def main(argv):
     target = f"spv{ver.group(1)}.{ver.group(2)}" if ver else "vulkan1.2"
     subprocess.run([asm, "--target-env", target, "-", "-o", args[1]], input=new, check=True, text=True)
     if lay_path:
-        with open(lay_path, "w") as f:
+        with open(lay_path, "w", encoding="utf-8", newline="\n") as f:
             json.dump(lay, f, indent=1)
     print(json.dumps(lay))
     return 0
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main(sys.argv))

@@ -151,6 +151,51 @@ ENUMS = [
 ]
 
 
+def make_lsns(blocks):
+    """An LSNS payload: block count, (kind, bytes) table, then the blocks (filler records)."""
+    table = struct.pack("<I", len(blocks)) + b"".join(struct.pack("<II", k, len(d)) for k, d in blocks)
+    return table + b"".join(d for _k, d in blocks)
+
+
+class TestLsns(unittest.TestCase):
+    def test_blocks_fill_the_section(self):
+        payload = make_lsns([(0x101, bytes(range(32))), (0x207, b"\xab" * 48)])
+        self.assertEqual(P.decode_lsns(payload), [(0x101, 32), (0x207, 48)])
+        record = P.parse(make_psin([("LSCH", b""), ("LSNS", payload), ("LGID", b"")]))
+        self.assertTrue(record["complete"])
+        self.assertEqual((record["lsns_blocks"], record["lsns_records"], record["lsns_error"]), (2, 5, ""))
+        section = [s for s in record["sections"] if s["tag"] == "LSNS"][0]
+        self.assertEqual(section["blocks"], [{"kind": "0x101", "bytes": 32}, {"kind": "0x207", "bytes": 48}])
+
+    def test_empty_section(self):
+        record = P.parse(make_psin([("LSNS", struct.pack("<I", 0)), ("LGID", b"")]))
+        self.assertEqual((record["lsns_blocks"], record["lsns_records"]), (0, 0))
+        self.assertEqual(P.summarize([record])["lsns_empty"], 1)
+
+    def test_errors(self):
+        cases = {
+            "shorter than its block count": b"\x01",
+            "runs past the section": struct.pack("<I", 3) + bytes(8),
+            "not a multiple of 16": make_lsns([(0x101, bytes(20))]),
+            "do not fill the section": make_lsns([(0x101, bytes(16))]) + bytes(16),
+        }
+        for message, payload in cases.items():
+            with self.subTest(message):
+                with self.assertRaisesRegex(ValueError, message):
+                    P.decode_lsns(payload)
+                record = P.parse(make_psin([("LSNS", payload)]))
+                self.assertIn(message, record["lsns_error"])
+                self.assertIsNone(record["lsns_blocks"])
+                self.assertTrue(record["complete"])        # a bad LSNS does not break the section walk
+
+    def test_summary_kinds(self):
+        records = [P.parse(make_psin([("LSNS", make_lsns([(0x101, bytes(16)), (0x11c, bytes(32))]))])),
+                   P.parse(make_psin([("LSNS", make_lsns([(0x101, bytes(16))]))]))]
+        summary = P.summarize(records)
+        self.assertEqual(summary["lsns_kinds"], {"0x101": 2, "0x11c": 1})
+        self.assertEqual((summary["lsns_decoded"], summary["lsns_records"], summary["lsns_errors"]), (2, 4, 0))
+
+
 class TestSchema(unittest.TestCase):
     def test_lsch_layout(self):
         got = P.decode_lsch(make_lsch(SCHEMA))
@@ -209,6 +254,46 @@ class TestSchema(unittest.TestCase):
         self.assertIsNone(got["structs"])
         self.assertIn("LSCH", got["schema_error"])
         self.assertEqual(got["enums"], 0)
+
+    def test_lenm_error_before_valid_lsch_is_preserved(self):
+        got = P.parse(make_psin([("LENM", b"\x01\x02\x03"), ("LSCH", make_lsch(SCHEMA))]), schema=True)
+        self.assertTrue(got["complete"])
+        self.assertEqual(got["structs"], 2)
+        self.assertIsNone(got["enums"])
+        self.assertIn("LENM: no enum count", got["schema_error"])
+        self.assertEqual(P.summarize([got])["schema_errors"], 1)
+        self.assertTrue(got["schema"]["lsch"])
+        self.assertFalse(got["schema"]["lenm"])
+        self.assertIn("LENM: no enum count", got["schema"]["reason"])
+
+    def test_both_lsch_and_lenm_errors_are_preserved(self):
+        for sections in (
+            [("LSCH", b"\x01\x02\x03"), ("LENM", b"\x01\x02\x03")],
+            [("LENM", b"\x01\x02\x03"), ("LSCH", b"\x01\x02\x03")],
+        ):
+            with self.subTest(order=[t for t, _ in sections]):
+                got = P.parse(make_psin(sections), schema=True)
+                self.assertIn("LSCH: no struct count", got["schema_error"])
+                self.assertIn("LENM: no enum count", got["schema_error"])
+                self.assertIn("LSCH: no struct count", got["schema"]["reason"])
+                self.assertIn("LENM: no enum count", got["schema"]["reason"])
+
+    def test_lsch_check_schema_error_does_not_mask_lenm_decode_error(self):
+        bad_lsch = make_lsch([(joaat("Bad"), 0, 0x8, 2, [(joaat("x"), 8, 0x21, 0, 0, 0)])])
+        got = P.parse(make_psin([("LSCH", bad_lsch), ("LENM", b"\x01\x02\x03")]), schema=True)
+        self.assertIn("past size", got["schema_error"])
+        self.assertIn("LENM: no enum count", got["schema_error"])
+        self.assertTrue(got["schema"]["lsch"])
+        self.assertFalse(got["schema"]["lenm"])
+        self.assertEqual(got["schema"]["reason"], "LENM: no enum count fills 3 bytes")
+
+    def test_first_lsch_or_lenm_error_is_not_overwritten_by_duplicate_section(self):
+        got = P.parse(make_psin([("LSCH", b"\x01\x02\x03"), ("LSCH", make_lsch(SCHEMA)), ("LENM", b"")]), schema=True)
+        self.assertIsNone(got["structs"])
+        self.assertIn("LSCH: no struct count", got["schema_error"])
+        self.assertFalse(got["schema"]["lsch"])
+        self.assertIn("LSCH: no struct count", got["schema"]["reason"])
+
 
 
 class TestCli(unittest.TestCase):

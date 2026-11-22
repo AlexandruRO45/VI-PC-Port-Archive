@@ -389,13 +389,18 @@ def find_sdk_include():
             root = os.environ.get(var)
             if root:
                 candidates += glob.glob(os.path.join(root, "Windows Kits", "10", "Include", "*"))
+
     best = None
     for path in candidates:
         path = os.path.normpath(path)                 # "...\um\" has an empty basename
         um = path if os.path.basename(path).lower() == "um" else os.path.join(path, "um")
         shared = os.path.join(os.path.dirname(um), "shared")
         if os.path.isdir(um):
-            key = os.path.basename(os.path.dirname(um))
+            name = os.path.basename(os.path.dirname(um))
+            try:
+                key = (1, tuple(map(int, name.split("."))))
+            except ValueError:
+                key = (0, name)
             if best is None or key > best[0]:
                 best = (key, um, shared)
     if not best:
@@ -590,4 +595,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

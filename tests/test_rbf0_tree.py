@@ -336,6 +336,19 @@ class OutputTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_xml_preserves_carriage_returns_in_text(self) -> None:
+        source = os.path.join(self.root, "text.bin")
+        expected = "first\rsecond\r\n<last & final>"
+        with open(source, "wb") as f:
+            f.write(WIDE + _open(0, b"TestRoot") + _text(expected.encode("utf-8")) + CLOSE)
+        out = os.path.join(self.root, "tree.json")
+        xml_dir = os.path.join(self.root, "xml")
+
+        self.assertEqual(rbf0_tree.main([source, out, "--xml", xml_dir, "--quiet"]), 0)
+
+        tree = ET.parse(os.path.join(xml_dir, "00000000.xml"))
+        self.assertEqual(tree.findtext(".//text"), expected)
+
     def test_json_and_xml(self):
         blob = bytearray(WIDE)
         blob += _open(0, b"TestRoot", attrs=1)
@@ -419,6 +432,36 @@ class OutputTest(unittest.TestCase):
         finally:
             os.umask(old)
 
+    def _run_cli(self, *argv):
+        tool = os.path.join(ROOT, "tools", "rbf0_tree.py")
+        return subprocess.run([sys.executable, "-I", tool, *argv, "--quiet"], capture_output=True, text=True)
+
+    def test_out_or_csv_over_the_source_file_is_refused(self):
+        source = os.path.join(self.root, "resource.bin")
+        blob = wide_blob()
+        with open(source, "wb") as f:
+            f.write(blob)
+        other = os.path.join(self.root, "tree.json")
+        for argv in ((source, os.path.join(self.root, ".", "resource.bin")),
+                     (source, other, "--csv", source)):
+            with self.subTest(argv=argv):
+                result = self._run_cli(*argv)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("would overwrite the source", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                with open(source, "rb") as f:
+                    self.assertEqual(f.read(), blob)
+        self.assertFalse(os.path.exists(other))
+
+    def test_out_and_csv_on_the_same_file_are_refused(self):
+        with open(os.path.join(self.root, "00000000.bin"), "wb") as f:
+            f.write(wide_blob())
+        out = os.path.join(self.root, "reports", "tree.json")
+        result = self._run_cli(self.root, out, "--csv", out)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("must be different files", result.stderr)
+        self.assertFalse(os.path.exists(out))
+
     def test_root_filter_and_limit(self):
         with open(os.path.join(self.root, "00000000.bin"), "wb") as f:
             f.write(wide_blob())
@@ -501,6 +544,30 @@ class OutputTest(unittest.TestCase):
         self.assertEqual((text["value"], text["nul"], text["utf8"]), ("body", "1", "1"))
         empty = next(r for r in rows if r["name"] == "Empty")
         self.assertEqual((empty["children"], empty["content_count"]), ("0", "0"))
+
+    def test_directory_skips_json_csv_reports_and_oversized_continuation(self):
+        b = bytearray(b"RBF0" + rbf0_tree.PROLOGUE)
+        b += bytes([0, 0x00]) + struct.pack("<H", 4) + b"Root" + struct.pack("<HHH", 0, 0, 0)
+        filler = b"x" * 4000
+        first = True
+        while len(b) < 70000:
+            b += bytes([1, 0x60]) + ((struct.pack("<H", 6) + b"filler") if first else b"")
+            b += struct.pack("<H", len(filler)) + filler
+            first = False
+        first_chunk = bytes(b[:rbf0_tree.MAX_CHUNK])
+        with open(os.path.join(self.root, "00000000.bin"), "wb") as f:
+            f.write(first_chunk)
+        for report in ("index.json", "nodes.CSV"):
+            with open(os.path.join(self.root, report), "w", encoding="utf-8", newline="\n") as f:
+                f.write("{\"files\": []}\n")
+        docs, _ = rbf0_tree.decode_source(self.root)
+        self.assertEqual((docs[0]["chunks"], docs[0]["size"], docs[0]["status"]),
+                         (1, rbf0_tree.MAX_CHUNK, "truncated"))
+        # A stream larger than 64 KiB is not a split continuation chunk, matching rbf0_index.join_resource.
+        with open(os.path.join(self.root, "00010000.bin"), "wb") as f:
+            f.write(b"\x00" * (rbf0_tree.MAX_CHUNK + 1))
+        docs, _ = rbf0_tree.decode_source(self.root)
+        self.assertEqual((docs[0]["chunks"], docs[0]["size"]), (1, rbf0_tree.MAX_CHUNK))
 
 
 if __name__ == "__main__":

@@ -38,6 +38,20 @@ class BadFeatureScanIndexTest(unittest.TestCase):
     def assert_clean(self, result):
         self.assertNotIn("Traceback", result.stderr, result.stderr)
 
+    def test_report_write_failure_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as td:
+            shaders = make_work(td, [])
+            blocker = Path(td) / "blocker"
+            blocker.write_bytes(b"keep")
+            for out in (Path(td), blocker / "report.json"):
+                with self.subTest(out=out):
+                    result = self.run_scan(shaders, out)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(f"ERROR: cannot write {out}", result.stderr)
+                    self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+                    self.assert_clean(result)
+            self.assertEqual(blocker.read_bytes(), b"keep")
+
     def test_non_object_spirv_indexes_are_empty_counts(self):
         for value in (None, 42, True, "x"):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as td:
@@ -64,6 +78,25 @@ class BadFeatureScanIndexTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assert_clean(result)
             self.assertIn("could not be read", result.stdout)
+
+    def test_bad_fields_do_not_stop_the_scan(self):
+        with tempfile.TemporaryDirectory() as td:
+            rows = [
+                {"file": ["bad.dxbc"], "stage": "vs"},
+                {"file": "missing.dxbc", "stage": {"invalid": True}},
+                {"file": "missing.dxbc", "stage": 1},
+            ]
+            spirv = [{"stage": ["bad"], "uses_code_base": True}, {"stage": "ps"}]
+            shaders = make_work(td, rows, spirv=spirv)
+            out = Path(td) / "report.json"
+            result = self.run_scan(shaders, out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(report["dxbc"]["unreadable"], 3)
+            self.assertEqual(report["dxbc"]["stages"]["vs"], 1)
+            self.assertEqual(report["dxbc"]["stages"]["?"], 2)
+            self.assertEqual(report["spirv"]["translated"], {"?": 1, "ps": 1})
+            self.assertEqual(report["spirv"]["uses_code_base"], {"?": 1})
 
     def test_valid_indexes_are_still_counted(self):
         with tempfile.TemporaryDirectory() as td:

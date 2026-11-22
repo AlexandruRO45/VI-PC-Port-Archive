@@ -139,6 +139,21 @@ int main() {
     const auto& resolved = std::get<ResolveSubresource>(list.commands()[5]);
     CHECK(resolved.dst == 7 && resolved.dst_subresource == 1 && resolved.src == 8 && resolved.src_subresource == 0);
 
+    // Dispatches keep the user data they were recorded with; no pipeline is refused, no groups records nothing.
+    CHECK(list.reset());
+    Dispatch dispatch{0x1234, {}, 2, 1, 1};
+    dispatch.user_data[0] = 7;
+    dispatch.user_data[31] = 9;
+    CHECK(list.dispatch(dispatch));
+    dispatch.user_data[0] = 8;  // the caller's block changes after recording
+    CHECK(!list.dispatch({0, {}, 1, 1, 1}));
+    CHECK(list.dispatch({0x1234, {}, 0, 1, 1}));
+    CHECK(list.close());
+    CHECK(!list.dispatch(dispatch));
+    CHECK(list.commands().size() == 1);
+    const auto& recorded = std::get<Dispatch>(list.commands()[0]);
+    CHECK(recorded.pipeline == 0x1234 && recorded.user_data[0] == 7 && recorded.user_data[31] == 9 && recorded.x == 2);
+
     CHECK(list.reset());
     CHECK(!list.closed() && list.commands().empty());
     CHECK(!list.reset());
@@ -207,6 +222,24 @@ int main() {
     CHECK(parent.commands().size() == 6);
     CHECK(std::get<CopyResource>(parent.commands()[1]).src == 4);
     CHECK(!parent.execute_bundle(bundle));  // parent is closed
+
+    // The range form: [first, last) of the bundle, with last clamped to its size.
+    {
+        CommandList source, target, other;
+        CHECK(source.copy_resource({1, 2}) && source.copy_resource({3, 4}) && source.copy_resource({5, 6}));
+        CHECK(source.close());
+        CHECK(target.execute_bundle(source, 1, 2));  // the middle command only
+        CHECK(target.commands().size() == 1 && std::get<CopyResource>(target.commands()[0]).src == 4);
+        CHECK(target.execute_bundle(source, 2, 100));  // last beyond the size is clamped
+        CHECK(target.commands().size() == 2 && std::get<CopyResource>(target.commands()[1]).src == 6);
+        CHECK(target.execute_bundle(source, 1, 1) && target.commands().size() == 2);  // first == last: nothing
+        CHECK(target.execute_bundle(source, 3, 3) && target.execute_bundle(source, 7, 9));  // first beyond the size
+        CHECK(target.execute_bundle(source, 2, 1) && target.commands().size() == 2);  // first after last: nothing
+        CHECK(target.commands().size() == 2);
+        CHECK(other.execute_bundle(source));  // the default arguments copy all of it, as before
+        CHECK(other.commands().size() == 3 && std::get<CopyResource>(other.commands()[0]).src == 2 &&
+              std::get<CopyResource>(other.commands()[2]).src == 6);
+    }
 
     CommandList open_parent, open_bundle;
     CHECK(!open_parent.execute_bundle(open_bundle));  // bundle must be closed

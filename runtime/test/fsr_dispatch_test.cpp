@@ -6,7 +6,7 @@
 //   LEONIDA_FSR_WARP=1                (optional: use the WARP adapter instead of the default hardware adapter)
 //   LEONIDA_FSR_DEVICE=vulkan         (optional: use the Vulkan-backed ID3D12Device instead of a PC device)
 //
-// Without LEONIDA_GAME_DIR it prints "SKIP (no package)" and exits 0. Nothing from the DLL is written to disk.
+// Without LEONIDA_GAME_DIR it prints "SKIP (no package)" and exits 77 (CTest skip). Nothing from the DLL is written to disk.
 //
 // Steps, each one only if the previous worked:
 //   1. map: the console imports bind to the shims and nothing is unimplemented
@@ -28,7 +28,7 @@
 // driver refuses one of its textures (DXGI_FORMAT_R9G9B9E5_SHAREDEXP with ALLOW_UNORDERED_ACCESS); on WARP the
 // context is created as is. The other backend ids are controls: they end in FFX_API_RETURN_ERROR before the device
 // is touched. In step 7 the dispatch is recorded up to the DLL's compute pipeline, which a PC device cannot create
-// (slot 67 is console-only and refused; slot 62's code is not a PC shader). The INFO lines are the measurement; the
+// (slot 67 and 62 codes are not PC shaders). The INFO lines are the measurement; the
 // PASS/FAIL checks only cover what is known to work.
 #include <windows.h>
 
@@ -161,6 +161,9 @@ int capture_fault(const EXCEPTION_POINTERS* ep, Call& c) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+// Each guard returns a copy of `c`, not `c` itself: with `return c;` the local becomes the named return value, and
+// clang-cl 19 and 20 crash (exit 139, in recoverAddrOfEscapedLocal) generating the __except filter that writes it,
+// which stops the Linux cross-build (runtime/cmake/clang-cl-xwin.cmake). MSVC is fine either way.
 Call guarded_configure(ffx::PfnConfigure fn, ffx::Context* ctx, const ffx::Header* desc) {
     Call c;
     __try {
@@ -168,7 +171,7 @@ Call guarded_configure(ffx::PfnConfigure fn, ffx::Context* ctx, const ffx::Heade
     } __except (capture_fault(GetExceptionInformation(), c)) {
         c.faulted = true;
     }
-    return c;
+    return Call(c);
 }
 
 Call guarded_query(ffx::PfnQuery fn, ffx::Context* ctx, ffx::Header* desc) {
@@ -178,7 +181,7 @@ Call guarded_query(ffx::PfnQuery fn, ffx::Context* ctx, ffx::Header* desc) {
     } __except (capture_fault(GetExceptionInformation(), c)) {
         c.faulted = true;
     }
-    return c;
+    return Call(c);
 }
 
 Call guarded_create(ffx::PfnCreateContext fn, ffx::Context* ctx, ffx::Header* desc) {
@@ -188,7 +191,7 @@ Call guarded_create(ffx::PfnCreateContext fn, ffx::Context* ctx, ffx::Header* de
     } __except (capture_fault(GetExceptionInformation(), c)) {
         c.faulted = true;
     }
-    return c;
+    return Call(c);
 }
 
 Call guarded_destroy(ffx::PfnDestroyContext fn, ffx::Context* ctx) {
@@ -198,7 +201,7 @@ Call guarded_destroy(ffx::PfnDestroyContext fn, ffx::Context* ctx) {
     } __except (capture_fault(GetExceptionInformation(), c)) {
         c.faulted = true;
     }
-    return c;
+    return Call(c);
 }
 
 Call guarded_dispatch(ffx::PfnDispatch fn, ffx::Context* ctx, const ffx::Header* desc) {
@@ -208,7 +211,7 @@ Call guarded_dispatch(ffx::PfnDispatch fn, ffx::Context* ctx, const ffx::Header*
     } __except (capture_fault(GetExceptionInformation(), c)) {
         c.faulted = true;
     }
-    return c;
+    return Call(c);
 }
 
 // PC stand-in for one console capability. The console build creates a DXGI_FORMAT_R9G9B9E5_SHAREDEXP texture with
@@ -624,7 +627,7 @@ int main() {
     const std::string game_dir_arg = env("LEONIDA_GAME_DIR");
     if (game_dir_arg.empty()) {
         std::printf("SKIP (no package)\n");
-        return 0;
+        return 77;
     }
     const std::filesystem::path game_dir = game_dir_arg;
     const std::filesystem::path dll = game_dir / "amd_fidelityfx_upscaler_xbox.dll";
@@ -958,7 +961,7 @@ int main() {
                     note("  device slot 62 (compute pipeline from a D3D12_COMPUTE_PIPELINE_STATE_DESC) called " +
                          std::to_string(g_slot62_calls) + "x, last HRESULT " + hex(static_cast<uint32_t>(g_slot62_hr)));
                     if (g_formatted) note("  the DLL formatted HRESULT " + hex(g_first_formatted));
-                    // On a PC device both pipeline paths fail (67 is refused, 62's code is not a PC shader); on the
+                    // On a PC device both pipeline paths fail (neither slot 67's nor 62's code is a PC shader); on the
                     // Vulkan device CreateRootSignature (slot 16) is not implemented yet. Either way the dispatch goes
                     // on with a null pipeline and faults when it records it (RVA 0x65ff reads the pipeline's +0x10,
                     // the same pointer it passes to SetPipelineState): a documented stop, not a test failure.

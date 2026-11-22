@@ -4,14 +4,17 @@
 """
 import contextlib
 import csv
+import errno
 import importlib.util
 import io
 import json
 import os
 import struct
+import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -162,6 +165,10 @@ class WorldIndexTest(unittest.TestCase):
     def test_split_resource_needs_continuation(self):
         self.assertFalse(WI._needs_continuation(make_resource()))
         self.assertTrue(WI._needs_continuation(make_resource()[:0x150]))
+        # CMapData starts at 0x500 with size 0x120: a split mid-block at 0x540 still needs continuation.
+        self.assertTrue(WI._needs_continuation(make_resource()[:0x540]))
+        # Non-map resource has a single block at 0x400..0x490: a split mid-block at 0x448 still needs continuation.
+        self.assertTrue(WI._needs_continuation(make_resource(map_file=False)[:0x448]))
 
     def test_rpf_scan_joins_a_split_stream(self):
         blob = make_resource()
@@ -173,6 +180,87 @@ class WorldIndexTest(unittest.TestCase):
         self.assertEqual(stats["streams"], 2)
         self.assertEqual(rows[0]["kind"], "map")
         self.assertEqual(rows[0]["entities"], 1)
+
+    def test_rpf_and_carve_join_block_split_across_streams(self):
+        # Splitting mid-CMapData (last block at 0x500..0x620) or mid-CEntityDef (moved after
+        # CMapData to 0x620..0x6B0 so no block starts past the cut) must join the continuation
+        # stream in both scan_rpf and carve-folder scan_path instead of reading zeroed fields.
+        blob_map = make_resource()
+        blob_ent = bytearray(make_resource())
+        blob_ent[0x620:0x6B0] = blob_ent[0x400:0x490]
+        struct.pack_into("<IIQ", blob_ent, 0x200, WI.ENTITY, 0x90, ptr(0x620))
+        cases = (
+            ("mid_mapdata", blob_map, 0x540),
+            ("mid_entity", bytes(blob_ent), 0x650),
+        )
+        for label, blob, cut in cases:
+            with self.subTest(case=label, cut=hex(cut)):
+                path = os.path.join(self.dir, f"{label}.rpf")
+                with open(path, "wb") as f:
+                    f.write(make_rpf_streams([blob[:cut], blob[cut:]]))
+                entities = []
+                rows, stats = WI.scan_rpf(path, collect=entities)
+                self.assertEqual(stats["streams"], 2)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["size"], len(blob))
+                self.assertEqual(rows[0]["parent"], 0xAABBCCDD)
+                self.assertEqual(rows[0]["extent_min"], [-10.0, -20.0, -30.0])
+                self.assertEqual(rows[0]["extent_max"], [10.0, 20.0, 30.0])
+                self.assertEqual(rows[0]["map_flags"], 2)
+                self.assertEqual(rows[0]["content_flags"], 65)
+                self.assertEqual(len(entities), 1)
+                self.assertTrue(entities[0]["complete"])
+                self.assertEqual(entities[0]["archetype"], 0xDEADBEEF)
+
+                carve_dir = os.path.join(self.dir, f"carve_{label}")
+                os.makedirs(carve_dir)
+                files, off = [], 0x1000
+                for part in (blob[:cut], blob[cut:]):
+                    stored = len(zlib.compress(part))
+                    with open(os.path.join(carve_dir, f"{off:012x}.bin"), "wb") as f:
+                        f.write(part)
+                    files.append({"off": off, "stored": stored, "size": len(part)})
+                    off = (off + stored + 15) & ~15
+                with open(os.path.join(carve_dir, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                    json.dump({"summary": {}, "files": files}, f)
+                c_entities = []
+                c_rows, _ = WI.scan_path(carve_dir, collect=c_entities)
+                self.assertEqual(len(c_rows), 1)
+                self.assertEqual(c_rows[0]["size"], len(blob))
+                self.assertEqual(c_rows[0]["parent"], 0xAABBCCDD)
+                self.assertTrue(c_entities[0]["complete"])
+
+    def test_truncated_resource_does_not_swallow_following_0drp_resource(self):
+        # A truncated 0x7a map followed immediately by another 0DRPz resource must not consume
+        # the second resource as a continuation stream (both RPF and carve folder).
+        blob = make_resource()
+        for cut, expect_count in ((0x150, 1), (0x540, 2)):
+            with self.subTest(cut=hex(cut)):
+                truncated = blob[:cut]
+                path = os.path.join(self.dir, f"trunc_{cut:x}_then_valid.rpf")
+                with open(path, "wb") as f:
+                    f.write(make_rpf_streams([truncated, blob]))
+                rows, stats = WI.scan_rpf(path)
+                self.assertEqual(stats["streams"], 2)
+                self.assertEqual(len(rows), expect_count)
+                self.assertEqual(rows[-1]["size"], len(blob))
+                self.assertEqual(rows[-1]["parent"], 0xAABBCCDD)
+
+                carve_dir = os.path.join(self.dir, f"carve_trunc_{cut:x}")
+                os.makedirs(carve_dir)
+                files, off = [], 0x1000
+                for part in (truncated, blob):
+                    stored = len(zlib.compress(part))
+                    with open(os.path.join(carve_dir, f"{off:012x}.bin"), "wb") as f:
+                        f.write(part)
+                    files.append({"off": off, "stored": stored, "size": len(part)})
+                    off = (off + stored + 15) & ~15
+                with open(os.path.join(carve_dir, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                    json.dump({"summary": {}, "files": files}, f)
+                c_rows, _ = WI.scan_path(carve_dir)
+                self.assertEqual(len(c_rows), expect_count)
+                self.assertEqual(c_rows[-1]["size"], len(blob))
+                self.assertEqual(c_rows[-1]["parent"], 0xAABBCCDD)
 
     def test_scan_window_options(self):
         blob = make_resource()
@@ -312,6 +400,89 @@ class WorldIndexTest(unittest.TestCase):
         self.assertFalse(os.path.exists(out))
         self.assertFalse(os.path.exists(os.path.dirname(entities)))
 
+    @unittest.skipUnless(os.name == "nt", "requires Windows path aliases")
+    def test_windows_aliases_for_new_report_paths(self):
+        source = os.path.join(self.dir, "resource.bin")
+        with open(source, "wb") as f:
+            f.write(make_resource())
+        for i, alias in enumerate((lambda p: p + ".", lambda p: p + " ", lambda p: "\\\\?\\" + p)):
+            with self.subTest(alias=i, case="report"):
+                report = os.path.join(self.dir, f"report-{i}.json")
+                self.assert_report_collision(
+                    [source, "--out", report, "--csv", alias(report)],
+                    "--out and --csv must use different paths")
+                self.assertFalse(os.path.exists(report))
+            with self.subTest(alias=i, case="input"):
+                missing = os.path.join(self.dir, f"missing-{i}.bin")
+                summary = os.path.join(self.dir, f"summary-{i}.json")
+                self.assert_report_collision(
+                    [missing, "--out", summary, "--entities-out", alias(missing)],
+                    "--entities-out would overwrite the input")
+                self.assertFalse(os.path.exists(missing))
+                self.assertFalse(os.path.exists(summary))
+
+    def test_new_report_paths_that_differ_only_in_case(self):
+        # On a case-insensitive volume (macOS's default APFS, Windows) out/R.json and out/r.json are one file, so
+        # the CSV used to replace the JSON summary; on a case-sensitive one they are two reports.
+        source = os.path.join(self.dir, "resource.bin")
+        with open(source, "wb") as f:
+            f.write(make_resource())
+        folder = os.path.join(self.dir, "out")
+        upper, lower = os.path.join(folder, "R.json"), os.path.join(folder, "r.json")
+        os.makedirs(folder)
+        with open(upper, "wb"):
+            pass
+        insensitive = os.path.exists(lower)
+        os.unlink(upper)
+        if insensitive:
+            self.assert_report_collision([source, "--out", upper, "--csv", lower],
+                                         "--out and --csv must use different paths")
+            self.assertEqual(os.listdir(folder), [])
+            # Case folding and Unicode normalization are separate filesystem behaviors.
+            composed = os.path.join(folder, "caf\u00e9.json")
+            decomposed = os.path.join(folder, "cafe\u0301.json")
+            with open(composed, "wb"):
+                pass
+            aliases = os.path.exists(decomposed)
+            os.unlink(composed)
+            reports = [source, "--out", composed, "--csv", decomposed]
+            if aliases:
+                self.assert_report_collision(reports, "--out and --csv must use different paths")
+                self.assertEqual(os.listdir(folder), [])
+            else:
+                self.assertEqual(WI.main(reports), 0)
+                self.assertFalse(os.path.samefile(composed, decomposed))
+        else:
+            self.assertEqual(WI.main([source, "--out", upper, "--csv", lower]), 0)
+            with open(upper, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["summary"]["resources"], 1)
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS volume case query")
+    def test_macos_case_query_follows_the_volume(self):
+        missing = os.path.join(self.dir, "new", "deeper", "report.json")
+        probe = os.path.join(self.dir, "Probe")
+        with open(probe, "wb"):
+            pass
+        self.assertEqual(WI._case_insensitive_volume(missing), os.path.exists(probe.lower()))
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows verbatim paths")
+    def test_windows_verbatim_path_can_name_a_distinct_report(self):
+        source = os.path.join(self.dir, "resource.bin")
+        with open(source, "wb") as f:
+            f.write(make_resource())
+        report = os.path.join(self.dir, "report.json")
+        verbatim = "\\\\?\\" + report + "."
+        try:
+            self.assertEqual(WI.main([source, "--out", report, "--csv", verbatim]), 0)
+            self.assertFalse(os.path.samefile(report, verbatim))
+            with open(report, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["summary"]["resources"], 1)
+            with open(verbatim, encoding="utf-8", newline="") as f:
+                self.assertEqual(len(list(csv.DictReader(f))), 1)
+        finally:
+            if os.path.exists(verbatim):
+                os.unlink(verbatim)
+
     def test_reports_cannot_alias_through_hard_links(self):
         path = os.path.join(self.dir, "resource.bin")
         with open(path, "wb") as f:
@@ -363,6 +534,34 @@ class WorldIndexTest(unittest.TestCase):
                 with open(entities, "rb") as f:
                     self.assertEqual(f.read(), previous)
 
+    def test_failed_directory_walk_keeps_existing_reports(self):
+        carve = os.path.join(self.dir, "carve")
+        blocked = os.path.join(carve, "unreadable")
+        os.makedirs(blocked)
+        with open(os.path.join(carve, "resource.bin"), "wb") as f:
+            f.write(make_resource())
+        summary = os.path.join(self.dir, "summary.json")
+        entities = os.path.join(self.dir, "entities.jsonl")
+        previous = b'{"previous":true}\n'
+        for report in (summary, entities):
+            with open(report, "wb") as f:
+                f.write(previous)
+
+        scandir = os.scandir
+
+        def scan(path):
+            if path == blocked:
+                raise PermissionError(errno.EACCES, "permission denied", blocked)
+            return scandir(path)
+
+        err = io.StringIO()
+        with mock.patch.object(WI.os, "scandir", side_effect=scan), contextlib.redirect_stderr(err):
+            self.assertEqual(WI.main([carve, "--out", summary, "--entities-out", entities]), 2)
+        self.assertIn("unreadable", err.getvalue())
+        for report in (summary, entities):
+            with open(report, "rb") as f:
+                self.assertEqual(f.read(), previous)
+
     def test_summary_write_failure_keeps_existing_placement_report(self):
         source = os.path.join(self.dir, "resource.bin")
         with open(source, "wb") as f:
@@ -400,6 +599,43 @@ class WorldIndexTest(unittest.TestCase):
             rows = [json.loads(line) for line in f]
         self.assertEqual([row["archetype"] for row in rows], ["deadbeef"])
 
+    @unittest.skipUnless(os.name == "nt", "requires Windows verbatim paths")
+    def test_verbatim_placement_report_stays_distinct_from_summary(self):
+        source = os.path.join(self.dir, "resource.bin")
+        with open(source, "wb") as f:
+            f.write(make_resource())
+        summary = os.path.join(self.dir, "report.json")
+        entities = "\\\\?\\" + summary + "."
+        try:
+            self.assertEqual(WI.main([source, "--out", summary, "--entities-out", entities]), 0)
+            with open(summary, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["summary"]["resources"], 1)
+            with open(entities, encoding="utf-8") as f:
+                self.assertEqual(json.loads(f.readline())["archetype"], "deadbeef")
+            self.assertFalse(os.path.samefile(summary, entities))
+        finally:
+            if os.path.exists(entities):
+                os.unlink(entities)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows verbatim paths")
+    def test_creates_a_verbatim_placement_report_directory(self):
+        source = os.path.join(self.dir, "resource.bin")
+        with open(source, "wb") as f:
+            f.write(make_resource())
+        summary = os.path.join(self.dir, "summary.json")
+        directory = "\\\\?\\" + os.path.join(self.dir, "reports.")
+        entities = os.path.join(directory, "entities.jsonl")
+        try:
+            self.assertEqual(WI.main([source, "--out", summary, "--entities-out", entities]), 0)
+            self.assertFalse(os.path.exists(os.path.join(self.dir, "reports")))
+            with open(entities, encoding="utf-8") as f:
+                self.assertEqual(json.loads(f.readline())["archetype"], "deadbeef")
+        finally:
+            if os.path.exists(entities):
+                os.unlink(entities)
+            if os.path.isdir(directory):
+                os.rmdir(directory)
+
     def test_directory_scan_and_outputs(self):
         with open(os.path.join(self.dir, "map.bin"), "wb") as f:
             f.write(make_resource())
@@ -428,6 +664,51 @@ class WorldIndexTest(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["signature"], "0DRPz")
         self.assertEqual(rows[0]["version"], "122")
+
+    def carve(self, parts, gap=0):
+        """A carve folder as rpf9_carve.py writes it: <offset>.bin per stream plus index.json (off, stored)."""
+        folder = os.path.join(self.dir, "carve")
+        os.makedirs(folder)
+        files, off = [], 0x1000
+        for part in parts:
+            stored = len(zlib.compress(part))
+            with open(os.path.join(folder, f"{off:012x}.bin"), "wb") as f:
+                f.write(part)
+            files.append({"off": off, "stored": stored, "size": len(part)})
+            off = ((off + stored + 15) & ~15) + gap
+        with open(os.path.join(folder, "index.json"), "w", encoding="utf-8") as f:
+            json.dump({"summary": {}, "files": files}, f)
+        return folder
+
+    def test_carve_folder_joins_a_resource_split_over_two_files(self):
+        """scan_rpf appends the next contiguous stream while a 0DRPz resource needs a continuation; a carve
+        folder holds the same streams as files, and index.json says which ones were contiguous."""
+        blob = make_resource()
+        rows, stats = WI.scan_path(self.carve([blob[:0x150], blob[0x150:], make_resource(map_file=False)]))
+        maps = [r for r in rows if r["kind"] == "map"]
+        self.assertEqual([(r["file"], r["size"]) for r in maps], [("000000001000.bin", len(blob))])
+        self.assertEqual(len(rows), 2)
+
+    def test_carve_folder_does_not_join_streams_that_were_not_contiguous(self):
+        blob = make_resource()
+        rows, _ = WI.scan_path(self.carve([blob[:0x150], blob[0x150:]], gap=0x10))
+        self.assertEqual(rows, [])
+
+    def test_carved_file_inflate_cap_matches_directory_scan(self):
+        resource = make_resource()
+        path = os.path.join(self.dir, "sample.bin")
+        with open(path, "wb") as f:
+            f.write(resource)
+
+        for source in (path, self.dir):
+            for cap, expected in ((len(resource) - 1, 0), (len(resource), 1)):
+                with self.subTest(source=source, cap=cap):
+                    entities = []
+                    rows, stats = WI.scan_path(source, max_inflate=cap, collect=entities)
+                    self.assertEqual(len(rows), expected)
+                    self.assertEqual(len(entities), expected)
+                    self.assertEqual(stats["files"], expected)
+                    self.assertEqual(stats["scanned_bytes"], expected * len(resource))
 
     def test_directory_inflate_cap_does_not_exclude_large_archives(self):
         resource = make_resource()

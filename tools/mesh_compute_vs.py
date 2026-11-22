@@ -12,7 +12,9 @@ workgroups dispatched. Vertex v belongs to workgroup v / (3 * max_primitives), p
 corner v % 3. A primitive past the workgroup's count, or one marked culled, gets the same position outside the
 clip volume at all three corners, so it is clipped away. Otherwise the corner's vertex index (clamped to
 max_vertices - 1) selects the vertex whose position, clip and cull distances and params this shader outputs. The
-params go out at the locations the mesh shader used, so the pixel shader is unchanged.
+params go out at the locations the mesh shader used, so the pixel shader is unchanged. With rdna2spirv.py
+--f16-interp-fallback the layout also has "f16_halves" ({param: [low location, high location]}), and each of those
+params' f16 halves goes out decoded to f32 at those locations too, as a translated VS exports them.
 
     python -I tools/mesh_compute_vs.py <spirv dir>    # <name>.mesh_vs.spv per --mesh-compute MS in index.json
 
@@ -23,14 +25,51 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 
 SUFFIX = ".mesh_vs"   # <ms name>.mesh_vs.spvasm / .spv next to the mesh shader
 USER_SGPRS = 32       # push constants: s0..s31, heap base, code base, then the output address (rdna2spirv.py)
 
 
-def vs_spvasm(layout):
-    """SPIR-V assembly of the vertex shader for one --mesh-compute layout (index.json "mesh_compute")."""
+F16_HALF_TOP = 29
+
+
+def pair_f16_halves(layout, ps_f16_halves, ps_raw_inputs=(), top=F16_HALF_TOP):
+    """Choose non-colliding `f16_halves` ({str(param): [lo, hi]}) for a (--mesh-compute, PS) pair (SHADER-378).
+
+    Keeps the PS's own `[lo, hi]` locations whenever every requested param is exported by `layout["params"]` and no
+    half location collides with any producer param or exceeds `top`. Otherwise packs all requested pairs downward
+    from `top` into locations disjoint from `producer_params | ps_raw_inputs`.
+    """
+    producer_params = {int(k) for k in layout.get("params", {})}
+    ps_pairs = {int(k): [int(v[0]), int(v[1])] for k, v in ps_f16_halves.items()}
+    if not ps_pairs:
+        return {}
+    missing = sorted(p for p in ps_pairs if p not in producer_params)
+    if missing:
+        raise ValueError(f"mesh_compute_vs: producer does not export f16_halves param(s) {missing}")
+    if all(0 <= lo <= top and 0 <= hi <= top and lo != hi and lo not in producer_params and hi not in producer_params
+           for lo, hi in ps_pairs.values()):
+        used_halves = [loc for pair in ps_pairs.values() for loc in pair]
+        if len(set(used_halves)) == len(used_halves):
+            return {str(k): list(v) for k, v in sorted(ps_pairs.items())}
+    reserved = producer_params | {int(x) for x in ps_raw_inputs}
+    free = [loc for loc in range(top, -1, -1) if loc not in reserved]
+    need = 2 * len(ps_pairs)
+    if len(free) < need:
+        raise ValueError(f"mesh_compute_vs: need {need} decoded-half locations, only {len(free)} free in 0..{top}")
+    return {str(p): [free[2 * k + 1], free[2 * k]] for k, p in enumerate(sorted(ps_pairs))}
+
+
+def vs_spvasm(layout, f16_halves=None):
+    """SPIR-V assembly of the vertex shader for one --mesh-compute layout (index.json "mesh_compute").
+
+    Optional `f16_halves` ({param: [low_loc, high_loc]}) overrides `layout["f16_halves"]` for per-pipeline pairing
+    (SHADER-378), so a producer with many params only exports the decoded halves its paired PS actually reads.
+    """
     lay = dict(layout)
+    if f16_halves is not None:
+        lay["f16_halves"] = f16_halves
     params = sorted((int(k), int(v)) for k, v in lay["params"].items())
     maxv, maxp = int(lay["max_vertices"]), int(lay["max_primitives"])
     clip, cull = int(lay["clip_count"]), int(lay["cull_count"])
@@ -110,10 +149,35 @@ def vs_spvasm(layout):
     for loc, off in params:
         vals = load_floats("%vbase", off, 4)
         body += [f"%par{loc} = OpCompositeConstruct %v4float {' '.join(vals)}", f"OpStore %out{loc} %par{loc}"]
+    halves = sorted((int(k), [int(x) for x in v]) for k, v in lay.get("f16_halves", {}).items())
+    offsets = dict(params)
+    used_locs = set(offsets)
+    for loc, hlocs in halves:
+        if loc not in offsets:
+            raise ValueError(f"mesh_compute_vs: f16_halves param {loc} is not in layout params")
+        if len(hlocs) != 2 or hlocs[0] == hlocs[1] or hlocs[0] < 0 or hlocs[1] < 0:
+            raise ValueError(f"mesh_compute_vs: invalid f16_halves locations {hlocs} for param {loc}")
+        for hloc in hlocs:
+            if hloc in used_locs:
+                raise ValueError(f"mesh_compute_vs: f16_halves location {hloc} collides with another output")
+            used_locs.add(hloc)
+    for loc, hlocs in halves:      # --f16-interp-fallback: each channel's two f16 halves decoded to f32
+        parts = ([], [])
+        for i in range(4):
+            w, h2 = load_word("%vbase", offsets[loc] + 4 * i), tmp("h")
+            body.append(f"{h2} = OpExtInst %v2float %glsl UnpackHalf2x16 {w}")
+            for half in (0, 1):
+                e = tmp("e")
+                body.append(f"{e} = OpCompositeExtract %float {h2} {half}")
+                parts[half].append(e)
+        for half, hloc in enumerate(hlocs):
+            body += [f"%hv{hloc} = OpCompositeConstruct %v4float {' '.join(parts[half])}",
+                     f"OpStore %out{hloc} %hv{hloc}"]
+    hout = [hloc for _, hlocs in halves for hloc in hlocs]
     body += ["OpReturn", "OpFunctionEnd"]
 
     outs = ["%out_pos"] + (["%out_clip"] if clip else []) + (["%out_cull"] if cull else []) + \
-        [f"%out{loc}" for loc, _ in params]
+        [f"%out{loc}" for loc, _ in params] + [f"%out{h}" for h in hout]
     caps = ["Shader", "Int64", "PhysicalStorageBufferAddresses"] + (["ClipDistance"] if clip else []) + \
         (["CullDistance"] if cull else [])
     head = [f"OpCapability {x}" for x in caps] + [
@@ -127,13 +191,13 @@ def vs_spvasm(layout):
         head.append("OpDecorate %out_clip BuiltIn ClipDistance")
     if cull:
         head.append("OpDecorate %out_cull BuiltIn CullDistance")
-    head += [f"OpDecorate %out{loc} Location {loc}" for loc, _ in params]
+    head += [f"OpDecorate %out{loc} Location {loc}" for loc in [p for p, _ in params] + hout]
     head += ["OpDecorate %arr_ud ArrayStride 4", "OpDecorate %PC Block", "OpMemberDecorate %PC 0 Offset 0"]
     head += [f"OpMemberDecorate %PC {k} Offset {4 * USER_SGPRS + 4 * (k - 1)}" for k in range(1, 7)]
     head += ["OpDecorate %rt_uint ArrayStride 4"]
     types = ["%void = OpTypeVoid", "%fn = OpTypeFunction %void", "%bool = OpTypeBool",
              "%uint = OpTypeInt 32 0", "%int = OpTypeInt 32 1", "%ulong = OpTypeInt 64 0",
-             "%float = OpTypeFloat 32", "%v4float = OpTypeVector %float 4"]
+             "%float = OpTypeFloat 32", "%v4float = OpTypeVector %float 4", "%v2float = OpTypeVector %float 2"]
     types += [f"{name} = OpConstant %uint {v}" for v, name in sorted(consts.items())]
     types += [f"{name} = OpConstant %ulong {v}" for v, name in sorted(ulongs.items())]
     types += [f"%n_ud = OpConstant %uint {USER_SGPRS}", "%arr_ud = OpTypeArray %uint %n_ud",
@@ -154,7 +218,7 @@ def vs_spvasm(layout):
         gvars.append("%out_clip = OpVariable %_ptr_Out_clip Output")
     if cull:
         gvars.append("%out_cull = OpVariable %_ptr_Out_cull Output")
-    gvars += [f"%out{loc} = OpVariable %_ptr_Out_v4 Output" for loc, _ in params]
+    gvars += [f"%out{loc} = OpVariable %_ptr_Out_v4 Output" for loc in [p for p, _ in params] + hout]
     fn = ["%main = OpFunction %void None %fn", "%entry = OpLabel"]
     return "\n".join(head + types + gvars + fn + body) + "\n"
 
@@ -194,20 +258,29 @@ def build_for_index(spirv_dir):
     built = []
     for asm in write_for_index(spirv_dir):
         spv = asm[: -len(".spvasm")] + ".spv"
-        for name, tool in steps:
-            args = [asm, "-o", spv] if name == "spirv-as" else [spv]
-            cmd = [tool, "--target-env", "vulkan1.2"] + args
-            r = subprocess.run(cmd, capture_output=True, text=True)
-            if r.returncode:
-                raise RuntimeError(f"{name} failed for {asm}:\n{r.stdout}{r.stderr}")
+        with tempfile.TemporaryDirectory(prefix=".mesh-vs-", dir=os.path.dirname(spv)) as staging:
+            staged_spv = os.path.join(staging, os.path.basename(spv))
+            for name, tool in steps:
+                args = [asm, "-o", staged_spv] if name == "spirv-as" else [staged_spv]
+                cmd = [tool, "--target-env", "vulkan1.2"] + args
+                r = subprocess.run(cmd, capture_output=True, text=True)
+                if r.returncode:
+                    raise RuntimeError(f"{name} failed for {asm}:\n{r.stdout}{r.stderr}")
+            os.replace(staged_spv, spv)
         built.append(spv)
     return built
 
 
 def main(argv):
+    if argv[1:] in (["-h"], ["--help"]):
+        print(__doc__)
+        return 0
     if len(argv) != 2:
         print(__doc__, file=sys.stderr)
         return 2
+    if not os.path.isdir(argv[1]):
+        print(f"ERROR: {argv[1]}: not a directory", file=sys.stderr)
+        return 1
     try:
         built = build_for_index(argv[1])
     except RuntimeError as e:
@@ -222,4 +295,8 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main(sys.argv))

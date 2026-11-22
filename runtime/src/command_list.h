@@ -3,11 +3,12 @@
 // The command-list IR (docs/d3d12_vulkan.md section 3.2): what a D3D12 command list records, kept until
 // ExecuteCommandLists replays it on Vulkan (vulkan_replay.h). This slice covers legacy and enhanced barriers and
 // render-target, depth-stencil and unordered-access clears (whole views or rectangles), copies, resolves,
-// predication, discards, immediate buffer writes, atomic copies, queries and debug markers. It has no Windows or
-// Vulkan dependency.
+// predication, discards, immediate buffer writes, atomic copies, queries, debug markers and dispatches. It has
+// no Windows or Vulkan dependency.
 
 #include <algorithm>
 #include <array>
+#include <utility>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -150,8 +151,11 @@ inline constexpr std::uint32_t clear_depth = 0x1;
 inline constexpr std::uint32_t clear_stencil = 0x2;
 inline constexpr std::uint32_t texture_barrier_discard = 0x1;
 
-// Portable color-view interpretation. Other views inherit their resource format as before.
-enum class ColorViewFormat : std::uint32_t { resource, rgba8_unorm, rgba8_srgb, rgba8_uint };
+// The format a color view names, as a VkFormat number (0, `resource`, is the resource's own). The named values are
+// the RGBA8 family's; a typeless resource of any other family stores its view's VkFormat the same way (D3D-275).
+enum class ColorViewFormat : std::uint32_t {
+    resource = 0, rgba8_unorm = 37, rgba8_snorm = 38, rgba8_uint = 41, rgba8_sint = 42, rgba8_srgb = 43
+};
 
 // D3D12_QUERY_HEAP_TYPE and D3D12_QUERY_TYPE.
 namespace d3d12_query_heap {
@@ -288,6 +292,7 @@ struct CopyBuffer {
     ResourceId src;
     std::uint64_t src_offset;
     std::uint64_t size;
+    ResourceId tiled_resource = 0;  // CopyTiles uses the padded size of the sparse side
 };
 
 // D3D12_TEXTURE_COPY_LOCATION: a texture subresource, or a placed footprint in a buffer. The footprint's format is
@@ -352,6 +357,66 @@ struct ResolveSubresource {
     ResourceId src;
     std::uint32_t src_subresource;
     std::optional<ResolveRegion> region = std::nullopt;
+};
+
+// Dispatch, with what it uses captured when it is recorded: the pipeline (an opaque id the replay resolves) and
+// the 32 user-data dwords the root arguments produced (s0..s31 of the translated shader, section 3.5).
+struct Dispatch {
+    std::uintptr_t pipeline;
+    std::array<std::uint32_t, 32> user_data;
+    std::uint32_t x;
+    std::uint32_t y;
+    std::uint32_t z;
+};
+
+// D3D12_VIEWPORT.
+struct Viewport {
+    float x;
+    float y;
+    float width;
+    float height;
+    float min_depth;
+    float max_depth;
+};
+
+// D3D12_VERTEX_BUFFER_VIEW / D3D12_INDEX_BUFFER_VIEW: console VAs, resolved to buffers at replay.
+struct VertexBufferView {
+    std::uint64_t va;
+    std::uint32_t size;
+    std::uint32_t stride;
+};
+
+struct IndexBufferView {
+    std::uint64_t va;
+    std::uint32_t size;
+    std::uint32_t format;  // DXGI_FORMAT_R16_UINT (57) or DXGI_FORMAT_R32_UINT (42)
+};
+
+// DrawInstanced / DrawIndexedInstanced, with everything they use captured when they are recorded: D3D12 reads
+// render-target and depth descriptors at OMSetRenderTargets, and every other piece of state is the list's state at
+// the draw. resource 0 marks an unbound render-target slot or no depth buffer.
+// Render targets and vertex buffer views are inlined (8 simultaneous targets, 32 input slots), eliminating heap allocations
+// during command list recording (D3D-289).
+struct Draw {
+    std::uintptr_t pipeline = 0;
+    std::array<std::uint32_t, 32> user_data{};
+    std::array<TargetView, 8> render_targets{};
+    TargetView depth{};
+    std::array<VertexBufferView, 32> vertex_buffers{};  // by input slot
+    IndexBufferView index{};
+    std::uint32_t topology = 0;  // D3D_PRIMITIVE_TOPOLOGY
+    Viewport viewport{};       // the first; more viewports are not modelled yet
+    Rect scissor{};            // the first; D3D12 always scissors
+    std::array<float, 4> blend_factor{1, 1, 1, 1};
+    std::uint32_t stencil_front = 0;
+    std::uint32_t stencil_back = 0;
+    bool indexed = false;
+    std::uint32_t count = 0;  // vertices or indices per instance
+    std::uint32_t instances = 0;
+    std::uint32_t first = 0;  // first vertex or first index
+    std::int32_t base_vertex = 0;
+    std::uint32_t first_instance = 0;
+    std::uint32_t render_target_count = 8;
 };
 
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
@@ -508,6 +573,11 @@ struct ExecuteIndirect {
     std::uint64_t argument_offset = 0;
     ResourceId count_buffer = 0;  // 0: fixed max_count; non-zero: vkCmdDraw*IndirectCount
     std::uint64_t count_offset = 0;
+    // kind == dispatch: the compute pipeline and root arguments in effect, as Dispatch records them, so the dispatches
+    // run that pipeline with those arguments whatever the command buffer had bound. A pipeline of 0 leaves the binding
+    // as it is.
+    std::uintptr_t pipeline = 0;
+    std::array<std::uint32_t, 32> user_data{};
 };
 
 // Triangle geometry descriptor for a BLAS build (ID3D12GraphicsCommandList4::BuildRaytracingAccelerationStructure).
@@ -521,6 +591,7 @@ struct RtTriangleGeometry {
     std::uint32_t index_type = 0;     // 0=NONE, 1=UINT16, 2=UINT32
     std::uint64_t transform_va = 0;
     bool opaque = true;
+    std::uint32_t flags = 0;          // D3D12_RAYTRACING_GEOMETRY_FLAGS (bit 0 opaque, bit 1 no duplicate any-hit)
 };
 
 // BLAS or TLAS build command (VK_KHR_acceleration_structure).
@@ -536,11 +607,29 @@ struct BuildAccelerationStructure {
     std::vector<RtTriangleGeometry> triangles;
 };
 
+// CopyRaytracingAccelerationStructure. `mode` is D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE; replay supports
+// CLONE (0) and COMPACT (1) for XDXR structures.
+struct CopyAccelerationStructure {
+    std::uint64_t dst_va = 0;
+    std::uint64_t src_va = 0;
+    std::uint32_t mode = 0;
+};
+
+// EmitRaytracingAccelerationStructurePostbuildInfo, and each postbuild desc of BuildRaytracingAccelerationStructure:
+// one value per source, consecutively from `dest_va`. `type` is D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_TYPE;
+// replay supports COMPACTED_SIZE (0) and CURRENT_SIZE (3), 8 bytes each.
+struct AccelerationStructurePostbuild {
+    std::uint64_t dest_va = 0;
+    std::uint32_t type = 0;
+    std::vector<std::uint64_t> sources;
+};
+
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
                              CopyResource, ResolveSubresource, Predication, ClearUnorderedAccess, DiscardResource,
                              WriteImmediate, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries, DebugMarker,
-                             ExecuteIndirect, BuildAccelerationStructure>;
+                             ExecuteIndirect, BuildAccelerationStructure, Dispatch, Draw, CopyAccelerationStructure,
+                             AccelerationStructurePostbuild>;
 
 class CommandList {
 public:
@@ -616,6 +705,25 @@ public:
         return append(resolve);
     }
 
+    // A dispatch with no groups does nothing in D3D12, and is not recorded.
+    bool dispatch(const Dispatch& dispatch) {
+        if (!dispatch.pipeline) return false;
+        if (!dispatch.x || !dispatch.y || !dispatch.z) return !closed_;
+        return append(dispatch);
+    }
+
+    // A draw with no vertices or instances does nothing in D3D12, and is not recorded.
+    bool draw(const Draw& draw) {
+        if (!draw.pipeline) return false;
+        if (!draw.count || !draw.instances) return !closed_;
+        return append(draw);
+    }
+    bool draw(Draw&& draw) {
+        if (!draw.pipeline) return false;
+        if (!draw.count || !draw.instances) return !closed_;
+        return append(std::move(draw));
+    }
+
     // ClearRenderTargetView; the resource must be in render_target state at execution. No rects: the whole view.
     bool clear_render_target(const TargetView& target, const ClearColor& color, std::span<const Rect> rects = {}) {
         if (!valid(target)) return false;
@@ -672,11 +780,15 @@ public:
         return append(ClearUnorderedAccess{view, is_float, values, {rects.begin(), rects.end()}});
     }
 
-    // ExecuteBundle copies the closed bundle's commands at the call site. The COM layer validates D3D12 list
-    // types and bundle-only restrictions before calling this method.
-    bool execute_bundle(const CommandList& bundle) {
+    // ExecuteBundle copies the closed bundle's commands [first, last) at the call site. The COM layer validates D3D12
+    // list types and bundle-only restrictions before calling this method, and calls it once per stretch between the
+    // bundle's deferred state calls and draws (d3d12_com.cpp, GraphicsCommandList::ExecuteBundle).
+    bool execute_bundle(const CommandList& bundle, std::size_t first = 0, std::size_t last = std::size_t(-1)) {
         if (this == &bundle || closed_ || !bundle.closed_) return false;
-        commands_.insert(commands_.end(), bundle.commands_.begin(), bundle.commands_.end());
+        last = std::min(last, bundle.commands_.size());
+        if (first < last)
+            commands_.insert(commands_.end(), bundle.commands_.begin() + std::ptrdiff_t(first),
+                             bundle.commands_.begin() + std::ptrdiff_t(last));
         return true;
     }
 
@@ -728,13 +840,25 @@ public:
     }
 
     bool execute_indirect(const ExecuteIndirect& indirect) {
-        if (!indirect.argument_buffer || !indirect.stride || !indirect.max_count) return false;
+        if (!indirect.argument_buffer || !indirect.stride) return false;
+        if (!indirect.max_count) return !closed_;  // the PC runtime takes MaxCommandCount 0 as a no-op
         return append(indirect);
     }
 
     bool build_acceleration_structure(BuildAccelerationStructure build) {
         if (!build.dst_va || !build.scratch_va) return false;
         return append(std::move(build));
+    }
+    // D3D12: acceleration structures are 256-byte aligned, postbuild destinations 8-byte aligned.
+    bool copy_acceleration_structure(CopyAccelerationStructure copy) {
+        if (!copy.dst_va || !copy.src_va || copy.dst_va % 256 || copy.src_va % 256) return false;
+        return append(copy);
+    }
+    bool acceleration_structure_postbuild(AccelerationStructurePostbuild info) {
+        if (!info.dest_va || info.dest_va % 8 || info.sources.empty()) return false;
+        for (const auto va : info.sources)
+            if (!va || va % 256) return false;
+        return append(std::move(info));
     }
     bool close() {
         if (closed_) return false;
@@ -773,6 +897,12 @@ private:
     bool append(const Command& command) {
         if (closed_) return false;
         commands_.push_back(command);
+        return true;
+    }
+    // The recording calls pass a temporary: moved, so a command's rectangles are not copied a second time.
+    bool append(Command&& command) {
+        if (closed_) return false;
+        commands_.push_back(std::move(command));
         return true;
     }
 

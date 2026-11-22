@@ -7,7 +7,9 @@ Every byte here is built by the test. No game file, value or name is used.
 import contextlib
 import io
 import json
+import math
 import os
+import pathlib
 import random
 import struct
 import subprocess
@@ -56,14 +58,14 @@ def group_for(tris, n):
     return struct.pack("<3I", 0x80000000 | len(chunks), tbase, vbase) + bytes(recs + words + refs)
 
 
-def block(uv_offset=-5, colour=(10, 20, 30, 255), grid=GRID, with_group=True):
+def block(uv_offset=-5, colour=(10, 20, 30, 255), grid=GRID, with_group=True, normal=bytes((0, 0, 127, 0))):
     """A 42 40 00 00 block on a flat grid: slots 0 (0x42 position), 1 (0x26), 2 (0x21 = snorm8 +z), 3 (0x28),
     followed by its meshlet group unless with_group is false."""
     n = grid * grid
     streams = [
         (0, 0x42, b"".join(struct.pack("<Q", pack_position(100 * (v % grid), 100 * (v // grid), 0)) for v in range(n))),
         (1, 0x26, bytes(colour) * n),
-        (2, 0x21, bytes((0, 0, 127, 0)) * n),
+        (2, 0x21, normal * n),
         (3, 0x28, b"".join(struct.pack("<2h", 1000 * (v % grid + uv_offset), 1000 * (v // grid + uv_offset))
                            for v in range(n))),
     ]
@@ -137,6 +139,25 @@ class BlockTests(unittest.TestCase):
         _, out = measure(block())
         self.assertEqual(out["mapping_spread"]["s16"]["median"], 0.0)
 
+    def test_packed_snorm10_normal_clamps_both_negative_endpoint_codes(self) -> None:
+        decode = vt.NORMAL_CANDIDATES["snorm10_xyz"]
+        values = struct.pack("<2I", 512 | (511 << 10), 513 | (511 << 10))
+        diagonal = 1.0 / math.sqrt(2.0)
+        expected = (-diagonal, diagonal, 0.0)
+        self.assertEqual(decode(values, 0), expected)
+        self.assertEqual(decode(values, 1), expected)
+
+    def test_normal_probe_uses_clamped_snorm10_direction_for_face_agreement(self) -> None:
+        mesh = bytearray(block(grid=2))
+        slots, _, _ = vt.parse_slots(mesh)
+        struct.pack_into("<4Q", mesh, slots[0][1], pack_position(0, 0, 0), pack_position(31, 218, 0),
+                         pack_position(0, 0, 100), pack_position(31, 218, 100))
+        struct.pack_into("<4I", mesh, slots[2][1], *([512 | (511 << 10)] * 4))
+        _, report = measure(bytes(mesh))
+        # Without the clamp, the packed normal's absolute dot product
+        # crosses the 0.8 face-agreement threshold.
+        self.assertEqual(report["tags"]["slot2:21"]["facenormal_snorm10_xyz_median"], 0.0)
+
     def test_constant_colour_and_known_normal(self):
         _, out = measure(block())
         col = out["tags"]["slot1:26"]
@@ -147,10 +168,105 @@ class BlockTests(unittest.TestCase):
         self.assertEqual(nrm["facenormal_snorm8_xyz_median"], 1.0)
         self.assertEqual(nrm["unit_snorm8"], GRID * GRID)
 
+    def test_0x21_octahedral_normal_in_either_width(self):
+        # +z in the 10-bit form (bit 31 set, x = y = 512) and in the 8-bit form (bit 31 clear, bytes 0-1 = 128);
+        # each scores 1.0 only under its own branch of the decode
+        for word in (0x80000000 | 512 | 512 << 10, 128 | 128 << 8):
+            _, out = measure(block(normal=struct.pack("<I", word)))
+            nrm = out["tags"]["slot2:21"]
+            self.assertEqual(nrm["facenormal_oct_bit31_10_or_8_median"], 1.0)
+
+    def test_0x21_tangent_follows_u_and_bit30_is_the_bitangent_sign(self):
+        # flat grid: dP/du = +x, dP/dv = +y, normal +z. 10-bit: angle field 0 (-pi) turns b1 = -x into +x;
+        # 8-bit: octahedral tangent (127, 64) = +x. cross(+z, +x) = +y runs along +v, so bit 30 set agrees.
+        for form, word in (("10", 0x80000000 | 512 | 512 << 10), ("8", 128 | 128 << 8 | 127 << 16 | 64 << 23)):
+            for bit30, agree in ((1 << 30, True), (0, False)):
+                _, out = measure(block(normal=struct.pack("<I", word | bit30)))
+                nrm = out["tags"]["slot2:21"]
+                checked = nrm[f"tangent{form}_checked"]
+                self.assertGreater(checked, 0)
+                self.assertEqual(nrm[f"tangent{form}_along_u"], checked)
+                self.assertEqual(nrm[f"tangent{form}_sign_agree"], checked if agree else 0)
+                self.assertLess(nrm[f"tangent{form}_rotated_along_u"], checked)
+
     def test_positions_follow_the_surface(self):
         _, out = measure(block())
         self.assertLess(out["pos_edge_vs_random_median"], 0.5)
         self.assertEqual(out["pos_header_finite"], 1)
+
+
+class Normal0x21Tests(unittest.TestCase):
+    @staticmethod
+    def encode(n, bits):
+        """Octahedral encode of unit vector n into the 10-bit (bit 31 set) or 8-bit form."""
+        x, y, z = n
+        s = abs(x) + abs(y) + abs(z)
+        x, y = x / s, y / s
+        if z < 0:
+            x, y = (1 - abs(y)) * (1 if x >= 0 else -1), (1 - abs(x)) * (1 if y >= 0 else -1)
+        if bits == 10:
+            q = [round((c + 1) * 1023 / 2) for c in (x, y)]
+            return 0x80000000 | q[0] | q[1] << 10 | 0x2AA << 20
+        q = [round((c + 1) * 127.5) for c in (x, y)]
+        return q[0] | q[1] << 8 | 0x55 << 16
+
+    def test_round_trip_both_widths_and_hemispheres(self):
+        rng = random.Random(7)
+        for _ in range(500):
+            v = [rng.gauss(0, 1) for _ in range(3)]
+            l = sum(c * c for c in v) ** 0.5
+            n = [c / l for c in v]
+            for bits, tol in ((10, 0.005), (8, 0.03)):
+                d = vt.normal_0x21(self.encode(n, bits))
+                self.assertAlmostEqual(sum(a * a for a in d), 1.0, places=9)
+                self.assertGreater(sum(a * b for a, b in zip(d, n)), 1 - tol)
+
+    def test_bit31_selects_the_width(self):
+        # the same low 20 bits: with bit 31 they are 10-bit x = 1023, y = 512, i.e. +x; without it bytes 0-1 are
+        # 0xFF, 0x03, an 8-bit pair near (+1, -1) that folds to a vector close to -z
+        w = 1023 | 512 << 10
+        hi = vt.normal_0x21(0x80000000 | w)
+        lo = vt.normal_0x21(w)
+        self.assertGreater(hi[0], 0.999)
+        self.assertLess(lo[0], 0.1)
+        self.assertLess(lo[2], -0.9)
+
+
+class Tangent0x21Tests(unittest.TestCase):
+    def test_10bit_tangent_is_unit_and_perpendicular_to_the_normal(self):
+        rng = random.Random(3)
+        for _ in range(2000):
+            w = 0x80000000 | rng.getrandbits(31)
+            n = vt.normal_0x21(w)
+            t, sign = vt.tangent_0x21(w)
+            self.assertAlmostEqual(sum(a * a for a in t), 1.0, places=9)
+            self.assertLess(abs(sum(a * b for a, b in zip(n, t))), 1e-9)
+            self.assertEqual(sign, 1 if (w >> 30) & 1 else -1)
+
+    def test_10bit_angle_turns_the_tangent_about_the_normal(self):
+        # normal +z: b1 = -x, b2 = -y, tangent = (-cos, sin, 0) for angle = v * 2pi / 1023 - pi
+        base = 0x80000000 | 512 | 512 << 10
+        for v in (0, 256, 511, 767, 1023):
+            ang = v * 2 * math.pi / 1023 - math.pi
+            t, _ = vt.tangent_0x21(base | v << 20)
+            self.assertAlmostEqual(t[0], -math.cos(ang), delta=2e-3)
+            self.assertAlmostEqual(t[1], math.sin(ang), delta=2e-3)
+
+    def test_negative_z_normal_uses_the_other_basis_sign(self):
+        # x = y = 0 folds to -z with the octahedral corner (1023, 1023); the basis stays perpendicular there
+        w = 0x80000000 | 1023 | 1023 << 10 | 300 << 20
+        n = vt.normal_0x21(w)
+        t, _ = vt.tangent_0x21(w)
+        self.assertLess(n[2], -0.99)
+        self.assertLess(abs(sum(a * b for a, b in zip(n, t))), 1e-9)
+
+    def test_8bit_tangent_is_octahedral_in_bits_16_to_29(self):
+        t, sign = vt.tangent_0x21(127 << 16 | 64 << 23)
+        self.assertGreater(t[0], 0.999)
+        self.assertEqual(sign, -1)
+        t, sign = vt.tangent_0x21(64 << 16 | 127 << 23 | 1 << 30)
+        self.assertGreater(t[1], 0.999)
+        self.assertEqual(sign, 1)
 
 
 class BlockRunTests(unittest.TestCase):
@@ -228,6 +344,114 @@ class ArchiveTests(unittest.TestCase):
     def test_negative_limit_is_an_error(self):
         r = subprocess.run([sys.executable, "-I", TOOL, TOOL, "--limit", "-1"], capture_output=True, text=True)
         self.assertEqual(r.returncode, 2)
+
+    @staticmethod
+    def _archive(folder):
+        path = os.path.join(folder, "fake.rpf")
+        data = b"RPF9" + struct.pack("<I", 16) + b"\0" * 8 + zlib.compress(block())
+        with open(path, "wb") as fh:
+            fh.write(data)
+        return path, data
+
+    def test_json_over_an_input_archive_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, data = self._archive(tmp)
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", path], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertEqual(r.stdout, "")
+            with open(path, "rb") as fh:
+                self.assertEqual(fh.read(), data)
+
+    def test_json_over_an_archive_found_in_an_input_folder_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sub = os.path.join(tmp, "pack")
+            os.mkdir(sub)
+            path, data = self._archive(sub)
+            r = subprocess.run([sys.executable, "-I", TOOL, tmp, "--json", path], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            with open(path, "rb") as fh:
+                self.assertEqual(fh.read(), data)
+
+    def test_json_that_is_a_directory_is_refused_before_the_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _ = self._archive(tmp)
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", tmp], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("is a directory", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertEqual(r.stdout, "")
+
+    def test_json_in_a_missing_folder_is_created(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _ = self._archive(tmp)
+            out = os.path.join(tmp, "reports", "vertex", "out.json")
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            with open(out, encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh)["blocks"], 1)
+
+    def test_json_that_cannot_be_written_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _ = self._archive(tmp)
+            blocker = os.path.join(tmp, "blocker")
+            with open(blocker, "w", encoding="utf-8") as fh:
+                fh.write("a file, not a folder")
+            out = os.path.join(blocker, "out.json")
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", out], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("cannot write", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertIn('"blocks"', r.stdout)
+
+
+class Rpf9ValidationTests(unittest.TestCase):
+    """RPF9 archive header validation in iter_blocks (contract shared with rpf9_names.scan_archive)."""
+
+    @staticmethod
+    def _run(args):
+        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True)
+
+    def test_invalid_headers_are_errors(self):
+        cases = [
+            ("empty", b""),
+            ("short header", b"RPF9"),
+            ("wrong magic", b"XRP9" + struct.pack("<I", 16) + b"\0" * 8),
+            ("data start before the header", b"RPF9" + struct.pack("<I", 0) + b"\0" * 8),
+            ("data start inside the header", b"RPF9" + struct.pack("<I", 4) + b"\0" * 8),
+            ("data start past the end", b"RPF9" + struct.pack("<I", 0x7FFFFFFF) + b"\0" * 8),
+        ]
+        for name, data in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = pathlib.Path(tmp)
+                    path = root / "bad.rpf"
+                    path.write_bytes(data)
+                    out = root / "out.json"
+                    out.write_text('{"sentinel": true}', encoding="utf-8")
+                    r = self._run([str(path), "--json", str(out)])
+                    self.assertEqual(r.returncode, 2, r.stderr)
+                    self.assertEqual(r.stdout, "")
+                    self.assertIn(path.name, r.stderr)
+                    self.assertIn("RPF9", r.stderr)
+                    self.assertNotIn("Traceback", r.stderr)
+                    self.assertEqual(out.read_text(encoding="utf-8"), '{"sentinel": true}')
+
+    def test_valid_header_only_and_reversed_magic(self):
+        cases = [
+            ("header only", b"RPF9" + struct.pack("<I", 8), 0),
+            ("reversed magic", b"9FPR" + struct.pack("<I", 16) + b"\0" * 8 + zlib.compress(block()), 1),
+        ]
+        for name, data, streams in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = pathlib.Path(tmp) / "ok.rpf"
+                    path.write_bytes(data)
+                    r = self._run([str(path)])
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    self.assertEqual(json.loads(r.stdout)["streams"], streams)
 
 
 if __name__ == "__main__":

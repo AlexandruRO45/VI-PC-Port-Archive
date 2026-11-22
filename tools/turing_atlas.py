@@ -188,7 +188,7 @@ def validate_cases():
         for name, asm in CASES.items():
             src = os.path.join(d, name + ".spvasm")
             spv = os.path.join(d, name + ".spv")
-            with open(src, "w", encoding="utf-8") as f:
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
                 f.write(asm)
             ra = run(["spirv-as", src, "-o", spv, "--target-env", "vulkan1.4"])
             if ra is None or ra.returncode != 0:
@@ -198,6 +198,12 @@ def validate_cases():
             out[name] = {"assemble": True,
                          "valid": bool(rv and rv.returncode == 0),
                          "stderr": ((rv.stderr if rv else "") or "")[:300]}
+    # A broken toolchain can reject everything and still reject the malformed control.
+    compute = out["compute32"]
+    compute["control_ok"] = compute.get("valid") is True
+    if not compute["control_ok"]:
+        compute["error"] = ("compute32 did not assemble and validate: the spirv-as/spirv-val gate did not accept "
+                            "the known-good module, so the other case results are not trustworthy")
     # The control must be rejected: if spirv-as or spirv-val accepts a malformed module, none of the
     # other results say anything about the toolchain gate and the atlas must not be read as a pass.
     control = out.get("broken_negative")
@@ -214,6 +220,9 @@ def main():
     ap = argparse.ArgumentParser(description="Turing bring-up atlas (no game data).")
     ap.add_argument("--out", default=None, help="write JSON atlas to FILE (default: stdout)")
     a = ap.parse_args()
+    if a.out and os.path.isdir(a.out):
+        print(f"turing_atlas: error: --out is a folder, not a file: {a.out}", file=sys.stderr)
+        return 2
     cases = validate_cases()
     atlas = {"tool": "turing_atlas", "gpu": None, "features": vulkan_matrix(),
              "cases": cases}
@@ -224,20 +233,29 @@ def main():
         pass
     text = json.dumps(atlas, indent=2, sort_keys=True)
     if a.out:
-        folder = os.path.dirname(a.out)  # --out into a folder that does not exist yet, as awc_manifest.py does
-        if folder:
-            os.makedirs(folder, exist_ok=True)
-        with open(a.out, "w", encoding="utf-8") as f:
-            f.write(text + "\n")
+        try:
+            folder = os.path.dirname(a.out)
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+            with open(a.out, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text + "\n")
+        except OSError as error:
+            print(f"turing_atlas: error: cannot write {a.out}: {error.strerror or error}", file=sys.stderr)
+            return 2
         print(f"atlas -> {a.out}")
     else:
         print(text)
-    control = cases.get("broken_negative") if isinstance(cases, dict) else None
-    if isinstance(control, dict) and control.get("error"):
-        print(f"turing_atlas: error: {control['error']}", file=sys.stderr)
-        return 2
+    for name in ("compute32", "broken_negative"):
+        error = cases.get(name, {}).get("error")
+        if error:
+            print(f"turing_atlas: error: {error}", file=sys.stderr)
+            return 2
     return 0
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

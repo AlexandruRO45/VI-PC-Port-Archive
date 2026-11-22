@@ -126,7 +126,10 @@ def psv0_inputs(data):
     if off + 8 + size > len(data):
         raise ValueError("PSV0 past end of container")
     p = data[off + 8:off + 8 + size]
-    pos = 4 + struct.unpack_from("<I", p, 0)[0]          # runtime-info size
+    if len(p) < 4:
+        raise ValueError("truncated before runtime-info size")
+    rt_size = struct.unpack_from("<I", p, 0)[0]
+    pos = 4 + rt_size                                    # runtime-info size
     if pos + 4 > len(p):
         raise ValueError("truncated before resource count")
     resources = struct.unpack_from("<I", p, pos)[0]
@@ -152,7 +155,7 @@ def psv0_inputs(data):
     if esz < 16:
         raise ValueError("element size below 16")
     r1 = 4 + 24                                          # PSVRuntimeInfo1 follows the 24-byte v0 part
-    if r1 + 8 > len(p):
+    if rt_size < 32 or r1 + 8 > len(p):
         raise ValueError("runtime info too short for element counts")
     count = p[r1 + 4]
     if pos + esz * count > len(p):
@@ -167,6 +170,7 @@ def psv0_inputs(data):
             if end > noff:
                 name = heap[noff:end].decode("latin-1")
         out.append({
+            "rows": b[8],
             "row": b[9],
             "cols": b[10] & 0xF,
             "start_col": (b[10] >> 4) & 0x3,
@@ -184,10 +188,14 @@ def isg1_elements(data):
     if b"ISG1" not in chunks:
         return []
     off, size = chunks[b"ISG1"]
+    if off + 8 + size > len(data):
+        return []
     p = data[off + 8:off + 8 + size]
     if len(p) < 8:
         return []
     count, first = struct.unpack_from("<II", p, 0)
+    if first < 8:
+        return []
     out = []
     for i in range(count):
         base = first + 32 * i
@@ -291,13 +299,21 @@ def shader_row(dxbc_path, fssm_path, disasm_path):
     except ValueError:
         return None
     isg = isg1_elements(data)
-    rw = {e["register"]: e["rw"] for e in isg}
-    named = {e["register"]: e for e in isg}
     for r in rows:
-        r["rw"] = rw.get(r["row"], 0)
-        e = named.get(r["row"])
-        if e and not r["name"] and e["name"]:
-            r["name"] = e["name"]
+        rmask = (((1 << r["cols"]) - 1) << r["start_col"]) & 0xF
+        span = range(r["row"], r["row"] + max(r.get("rows", 1), 1))
+        reg_matches = [e for e in isg if e["register"] in span]
+        col_matches = [e for e in reg_matches if not rmask or not e["mask"] or (e["mask"] & rmask)]
+        matches = col_matches or reg_matches
+        rw_val = 0
+        for e in matches:
+            rw_val |= (e["rw"] & rmask) if (rmask and e["mask"]) else e["rw"]
+        r["rw"] = rw_val
+        if not r["name"]:
+            for e in matches:
+                if e["name"]:
+                    r["name"] = e["name"]
+                    break
         r["class"], r["ena_bit"] = interp_class(r["kind"], r["mode"])
     table = []
     if fssm_path and os.path.isfile(fssm_path):
@@ -373,14 +389,32 @@ def tally(rows):
 def files_of(path):
     if os.path.isfile(path):
         return [path]
-    return [os.path.join(path, n) for n in sorted(os.listdir(path)) if n.endswith(".dxbc")]
+    out = []
+    for n in sorted(os.listdir(path)):
+        if not n.endswith(".dxbc"):
+            continue
+        candidate = os.path.join(path, n)
+        if os.path.isfile(candidate):
+            out.append(candidate)
+    return out
+
+
+def _at_least_one(value):
+    """An integer option that must be at least 1: 0 and negatives used to export one shader."""
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected an integer, got {value!r}") from None
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1 (got {n})")
+    return n
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Decode PS interpolation modes (PSV0 + FSSM + disasm).")
     ap.add_argument("path", help="a .dxbc file or a directory of them")
     ap.add_argument("--json", action="store_true", help="print one JSON document")
-    ap.add_argument("--limit", type=int, default=None, help="stop after this many pixel shaders")
+    ap.add_argument("--limit", type=_at_least_one, default=None, help="stop after this many pixel shaders")
     args = ap.parse_args(argv)
 
     if not os.path.exists(args.path):
@@ -388,15 +422,24 @@ def main(argv=None):
         return 2
     base = args.path if os.path.isdir(args.path) else os.path.dirname(args.path)
     stages = fssm_header.stage_index(base)
+    try:
+        paths = files_of(args.path)
+    except OSError as e:
+        print(f"ERROR: cannot list {args.path}: {e.strerror or e}", file=sys.stderr)
+        return 2
     rows = []
     skipped = Counter()
-    for path in files_of(args.path):
+    for path in paths:
         stem = os.path.splitext(os.path.basename(path))[0]
         if stages and stages.get(stem) != "ps":
             continue
         fssm = os.path.join(base, "fssm", stem + ".fssm")
         disasm = os.path.join(base, "disasm", stem + ".s")
-        row = shader_row(path, fssm, disasm)
+        try:
+            row = shader_row(path, fssm, disasm)
+        except OSError as e:
+            print(f"ERROR: cannot read {e.filename or path}: {e.strerror or e}", file=sys.stderr)
+            return 2
         if row is None:
             skipped["no psv0"] += 1
             continue
@@ -432,4 +475,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

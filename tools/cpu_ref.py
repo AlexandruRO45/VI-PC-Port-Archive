@@ -392,9 +392,9 @@ class Machine:
         else:
             raise Unsupported(arg.get("t", kind), self.pc, "operand kind is not modelled")
         if arg.get("abs"):
-            value = abs(value - (1 << 32)) if value & SIGN32 else value
+            value &= 0x7FFFFFFF
         if arg.get("neg"):
-            value = (-value) & MASK32
+            value ^= SIGN32
         return value & MASK32
 
     def _float_src(self, arg, lane):
@@ -826,4 +826,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

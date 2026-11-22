@@ -136,8 +136,10 @@ def build_command(kind, cc, src, out, workdir):
     installer = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
                              "Microsoft Visual Studio", "Installer")
     script = os.path.join(workdir, "build_hw_oracle.cmd")
-    with open(script, "w", encoding="ascii") as f:
-        f.write(f'@echo off\r\nset "PATH={installer};%PATH%"\r\ncall "{cc}" >nul || exit /b 1\r\n'
+    # Written as UTF-8, with chcp 65001 so cmd.exe reads it as UTF-8 on any console code page: the checkout, %TEMP%
+    # and Visual Studio paths in here reach cl intact when one has a character outside ASCII (a user name, say).
+    with open(script, "w", encoding="utf-8", newline="\n") as f:
+        f.write(f'@echo off\r\nchcp 65001 >nul\r\nset "PATH={installer};%PATH%"\r\ncall "{cc}" >nul || exit /b 1\r\n'
                 + subprocess.list2cmdline(cl) + "\r\n")
     return ["cmd.exe", "/d", "/c", script]
 
@@ -151,7 +153,7 @@ def detect_arch(clang):
         try:
             out = subprocess.run([tool], capture_output=True, text=True, timeout=60).stdout.split()
             if out:
-                return out[0]
+                return out[0].split(":")[0]   # amdgpu-arch prints 'gfx1010:xnack-': the kernels want the bare name
         except (OSError, subprocess.SubprocessError):
             pass
     return "gfx1150"
@@ -170,6 +172,9 @@ def _find_lld(clang):
 class Oracle:
     """Assembles batches of scalar programs for one architecture and runs them on device 0."""
 
+    code_object = None   # None: the assembler's default version; 5 after an older HIP runtime refused that
+    true16 = False       # True: this assembler wants v8.l for a 16-bit operand
+
     def __init__(self, arch=None, workdir=None, chunk=500):
         if not os.path.isfile(os.path.join(HERE, "hw_oracle.c")):
             raise Unavailable("hw_oracle.c is missing")
@@ -185,6 +190,7 @@ class Oracle:
         self.workdir = workdir or tempfile.mkdtemp(prefix="leonida-hw-oracle-")
         self.exe = self._build_launcher()
         self.device = self._probe()
+        self.true16 = self._needs_true16()
         self._probe_waves()
 
     def _build_launcher(self):
@@ -196,8 +202,9 @@ class Oracle:
             # cl appends .exe to an /Fe name without one, so the temporary name keeps the extension last
             tmp = exe[:-4] + f".{os.getpid()}.exe" if os.name == "nt" else exe + f".{os.getpid()}"
             kind, cc = find_cc()
+            # The compiler's messages are only quoted in the error below; one in another code page must not raise.
             r = subprocess.run(build_command(kind, cc, src, tmp, self.workdir), capture_output=True, text=True,
-                               cwd=self.workdir)
+                               encoding="utf-8", errors="replace", cwd=self.workdir)
             if r.returncode:
                 # cl reports compile errors on stdout
                 raise Unavailable("hw_oracle.c did not build: " + (r.stderr.strip() or r.stdout.strip())[:300])
@@ -212,6 +219,14 @@ class Oracle:
         if co is None:
             raise Unavailable("probe kernel did not assemble: " + err[:300])
         rc, out, err = self._launch(co, names)
+        if rc == 3 and "hip error 209" in err and self.code_object is None:
+            # LLVM 23 writes code object v6, which HIP runtimes from 2024 (amdhip64_6.dll) refuse as "no binary for
+            # this GPU". Ask for v5; a 209 that stays has another cause and is reported below.
+            self.code_object = 5
+            co, why = self._assemble(text)
+            if co is None:
+                raise Unavailable("the HIP runtime refused the code object (209) and v5 did not assemble: " + why[:300])
+            rc, out, err = self._launch(co, names)
         if rc == 77:
             raise Unavailable(err.strip() or "no AMD device")
         if rc:
@@ -220,6 +235,15 @@ class Oracle:
         if "arch=" in head and self.arch not in head:
             raise Unavailable(f"device reports {head!r} but assembling for {self.arch} (set LEONIDA_HW_ARCH)")
         return head.lstrip("# ")
+
+    def _needs_true16(self):
+        """Whether this assembler rejects `v_cvt_f16_f32 v8, v1` and takes `v8.l` (LLVM 23 on GFX11)."""
+        if asm.family(self.arch) == "gfx10":
+            return False
+        bare = "v_cvt_f16_f32 v8, v1\n"
+        if self._assemble(bare)[0] is not None:
+            return False
+        return self._assemble(asm.true16_spelling(bare))[0] is not None
 
     def _probe_waves(self):
         """Each wave size really runs as that size: a 64-thread group stores v_mbcnt lane ids. In a wave64 kernel
@@ -242,7 +266,10 @@ class Oracle:
         co = os.path.join(self.workdir, "k.co")
         with open(s, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
-        r = subprocess.run([self.clang, f"--target=amdgcn-amd-amdhsa", f"-mcpu={self.arch}", *(["-mwavefrontsize64"] if wave == 64 else []), "-c", s, "-o", o],
+        flags = ["-mwavefrontsize64"] if wave == 64 else []
+        if self.code_object:
+            flags.append(f"-mcode-object-version={self.code_object}")
+        r = subprocess.run([self.clang, "--target=amdgcn-amd-amdhsa", f"-mcpu={self.arch}", *flags, "-c", s, "-o", o],
                            capture_output=True, text=True)
         if r.returncode:
             return None, r.stderr
@@ -257,18 +284,28 @@ class Oracle:
 
     def run(self, programs, words=4):
         """Run each program (a list of lines). Returns one entry per program: a list of `words` ints, or a str
-        explaining why it could not run (assembler rejection)."""
+        explaining why it could not run (assembler rejection, or a MODE field this architecture cannot set)."""
         results = [None] * len(programs)
+        for i, p in enumerate(programs):
+            why = asm.mode_skip_reason(p.mode, self.arch) if isinstance(p, asm.Kernel) else None
+            if why:
+                results[i] = why            # never assembled: the directive would fail its whole chunk
         for wave in (32, 64):
-            todo = [i for i, p in enumerate(programs) if (p.wave if isinstance(p, asm.Kernel) else 32) == wave]
+            todo = [i for i, p in enumerate(programs) if results[i] is None and
+                    (p.wave if isinstance(p, asm.Kernel) else 32) == wave]
             for lo in range(0, len(todo), self.chunk):
-                self._run_chunk(programs, todo[lo:lo + self.chunk], results, words, wave)
+                try:
+                    self._run_chunk(programs, todo[lo:lo + self.chunk], results, words, wave)
+                except asm.ModeUnavailable as e:
+                    raise Unavailable(str(e)) from None
         return results
 
     def _run_chunk(self, programs, idx, results, words, wave=32):
         live = list(idx)
         while live:
             text, names, starts = asm.module_text([programs[i] for i in live], self.arch, wave=wave)
+            if self.true16:
+                text = asm.true16_spelling(text)
             co, err = self._assemble(text, wave)
             if co is not None:
                 break

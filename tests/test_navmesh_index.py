@@ -118,6 +118,24 @@ class NavmeshIndexTest(unittest.TestCase):
         self.assertIsNone(row["stored"])
         self.assertEqual(row["size"], 0x80)
 
+    def test_directory_with_glob_metacharacters_in_its_name(self):
+        # Before: os.path.join(root, "**", pattern) fed a root like "carve[1]" straight to glob, which read
+        # the "[1]" as a character class and matched nothing -- the index came back empty.
+        folder = os.path.join(self.root, "carve[1]")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "page.bin"), "wb") as f:
+            f.write(page(pages=6))
+        with open(os.path.join(folder, "other.bin"), "wb") as f:
+            f.write(b"plain" * 100)
+        out = os.path.join(self.root, "dir_bracket.json")
+        self.run_tool(folder, "--out", out, "--pattern", "*.bin")
+        with open(out, encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual(doc["summary"]["streams"], 2)
+        self.assertEqual(doc["summary"]["matched"], 1)
+        self.assertEqual(doc["summary"]["page_counts"], {"6": 1})
+        self.assertEqual(doc["pages"][0]["source"], "page.bin")
+
     def test_out_and_csv_in_missing_folders_are_created(self):
         # Before: write_outputs opened both paths directly, so a missing folder ended a finished scan in a
         # FileNotFoundError traceback and lost the index.
@@ -190,6 +208,79 @@ class NavmeshIndexTest(unittest.TestCase):
             self.assertNotIn("Traceback", r.stderr)
             with open(path, "rb") as f:
                 self.assertEqual(f.read(), originals[path], f"{args} touched the input")
+
+    def test_differently_cased_report_path_cannot_be_scanned_input(self):
+        # Before: on a case-insensitive filesystem, --out/--csv spelling the input folder in another case
+        # passed the containment check and replaced the carved file with the report, exit 0.
+        folder = os.path.join(self.root, "carve")
+        os.makedirs(os.path.join(folder, "sub"))
+        carved = os.path.join(folder, "page.bin")
+        nested = os.path.join(folder, "sub", "deep.bin")
+        for path in (carved, nested):
+            with open(path, "wb") as f:
+                f.write(page(pages=4))
+        cased = os.path.join(self.root, "CARVE")
+        if not os.path.isdir(cased):
+            self.skipTest("the temporary folder is on a case-sensitive filesystem")
+        module = load_tool_module()
+        for spelled in (os.path.join(cased, "page.bin"), os.path.join(cased, "PAGE.BIN"),
+                        os.path.join(cased, "sub", "deep.bin")):
+            self.assertTrue(module.is_scanned_input(spelled, folder, None), spelled)
+            self.assertTrue(module.is_scanned_input(spelled, cased, None), spelled)
+        for flag in ("--out", "--csv"):
+            r = subprocess.run([sys.executable, "-I", TOOL, folder, flag, os.path.join(cased, "page.bin")],
+                               cwd=ROOT, capture_output=True, text=True, check=False)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            with open(carved, "rb") as f:
+                self.assertEqual(f.read(), page(pages=4), f"{flag} touched the input")
+
+    def test_report_path_linked_to_a_scanned_file_is_scanned_input(self):
+        # Before: a report path the pattern doesn't match was let through even when it is the same file as one the
+        # scan reads. A hard link does that on any filesystem, and so does PAGE.BIN for page.bin on a
+        # case-insensitive macOS or Linux volume, where fnmatch doesn't fold case: the report truncated the input.
+        folder = os.path.join(self.root, "carve")
+        os.makedirs(folder)
+        carved = os.path.join(folder, "page.bin")
+        with open(carved, "wb") as f:
+            f.write(page(pages=4))
+        linked = os.path.join(self.root, "report.json")
+        try:
+            os.link(carved, linked)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"no hard links here: {e}")
+        module = load_tool_module()
+        self.assertTrue(module.is_scanned_input(linked, folder, None))
+        for flag in ("--out", "--csv"):
+            r = subprocess.run([sys.executable, "-I", TOOL, folder, flag, linked],
+                               cwd=ROOT, capture_output=True, text=True, check=False)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("would overwrite the input", r.stderr)
+            with open(carved, "rb") as f:
+                self.assertEqual(f.read(), page(pages=4), f"{flag} touched the input")
+
+    def test_unscanned_file_in_input_folder_is_not_scanned_input(self):
+        folder = os.path.join(self.root, "carve")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "page.bin"), "wb") as f:
+            f.write(page(pages=4))
+        report = os.path.join(folder, "report.json")
+        with open(report, "wb") as f:
+            f.write(b"previous report")
+        module = load_tool_module()
+        self.assertFalse(module.is_scanned_input(report, folder, None))
+
+    def test_sibling_folder_with_shared_prefix_is_not_scanned_input(self):
+        folder = os.path.join(self.root, "carve")
+        sibling = os.path.join(self.root, "carve2")
+        os.makedirs(folder)
+        os.makedirs(sibling)
+        report = os.path.join(sibling, "page.bin")
+        with open(report, "wb") as f:
+            f.write(b"previous report")
+        module = load_tool_module()
+        self.assertFalse(module.is_scanned_input(report, folder, None))
+        self.assertFalse(module.is_scanned_input(os.path.join(folder, "missing.bin"), folder, None))
 
     def test_not_an_rpf(self):
         path = os.path.join(self.root, "not.rpf")
@@ -336,6 +427,90 @@ class LimitWindowTest(unittest.TestCase):
         summary = self.summary(1)
         self.assertEqual(summary["streams"], 0)
         self.assertEqual(summary["span"], 1)
+
+
+class _Unprintable:
+    """A cell whose str() fails part-way through the CSV, standing in for a write that dies mid-report."""
+
+    def __str__(self):
+        raise OSError("simulated write failure")
+
+
+class PublishTest(unittest.TestCase):
+    """write_outputs stages each report next to its destination and swaps it in: a run that fails while writing
+    keeps the previous report instead of leaving it truncated (before: open(dest, "w") emptied it first)."""
+
+    OLD_JSON = '{"summary": {"previous": true}, "pages": []}'
+    OLD_CSV = "source,offset\nprevious.rpf,0\n"
+
+    def setUp(self):
+        self.tool = load_tool_module()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        self.out = os.path.join(self.dir, "index.json")
+        self.csv = os.path.join(self.dir, "index.csv")
+        with open(self.out, "w", encoding="utf-8", newline="\n") as f:
+            f.write(self.OLD_JSON)
+        with open(self.csv, "w", encoding="utf-8", newline="") as f:
+            f.write(self.OLD_CSV)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def read(self, path):
+        with open(path, encoding="utf-8", newline="") as f:
+            return f.read()
+
+    def assert_previous_reports_kept(self):
+        self.assertEqual(self.read(self.out), self.OLD_JSON)
+        self.assertEqual(self.read(self.csv), self.OLD_CSV)
+        self.assertEqual(sorted(os.listdir(self.dir)), ["index.csv", "index.json"])
+
+    def test_json_serialization_failure_keeps_previous_reports(self):
+        rows = [{"source": "a.rpf", "offset": 0, "bad": object()}]
+        with self.assertRaises(TypeError):
+            self.tool.write_outputs(rows, {"streams": 1}, self.out, self.csv)
+        self.assert_previous_reports_kept()
+
+    def test_csv_write_failure_keeps_previous_csv(self):
+        good = os.path.join(self.dir, "new.json")
+        rows = [{"source": _Unprintable(), "offset": 0}]
+        with mock.patch.object(self.tool.json, "dump"):
+            with self.assertRaises(OSError):
+                self.tool.write_outputs(rows, {"streams": 1}, good, self.csv)
+        self.assertEqual(self.read(self.csv), self.OLD_CSV)
+        self.assertEqual(sorted(os.listdir(self.dir)), ["index.csv", "index.json", "new.json"])
+
+    def test_interrupted_write_keeps_previous_report(self):
+        with mock.patch.object(self.tool.json, "dump", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.tool.write_outputs([], {"streams": 0}, self.out, self.csv)
+        self.assert_previous_reports_kept()
+
+    def test_reports_replaced_with_published_mode(self):
+        rows = [{"source": "a.rpf", "offset": 16, "signature": "0DRP@16"}]
+        with mock.patch.object(self.tool, "published_mode", wraps=self.tool.published_mode) as published, \
+                mock.patch.object(self.tool.os, "chmod", wraps=os.chmod) as chmod:
+            written = self.tool.write_outputs(rows, {"streams": 1}, self.out, self.csv)
+        self.assertEqual(written, [self.csv])
+        self.assertEqual([c.args for c in published.call_args_list], [(self.out,), (self.csv,)])
+        self.assertEqual(len(chmod.call_args_list), 2)
+        for call, dest in zip(chmod.call_args_list, (self.out, self.csv)):
+            staged, mode = call.args
+            self.assertEqual(os.path.dirname(staged), self.dir)
+            self.assertTrue(os.path.basename(staged).startswith(".navmesh_index-"))
+            self.assertTrue(staged.endswith(".tmp"))
+            self.assertEqual(mode, self.tool.published_mode(dest))
+        with open(self.out, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["pages"][0]["offset"], 16)
+        self.assertEqual(self.read(self.csv).splitlines()[1].split(",")[:2], ["a.rpf", "16"])
+        self.assertEqual(sorted(os.listdir(self.dir)), ["index.csv", "index.json"])
+
+    @unittest.skipUnless(os.name == "posix", "permission bits are POSIX")
+    def test_replaced_report_keeps_its_permission_bits(self):
+        os.chmod(self.out, 0o640)
+        self.tool.write_outputs([], {"streams": 0}, self.out, None)
+        self.assertEqual(os.stat(self.out).st_mode & 0o777, 0o640)
 
 
 if __name__ == "__main__":

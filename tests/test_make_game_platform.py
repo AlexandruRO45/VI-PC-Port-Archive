@@ -5,7 +5,10 @@
 No game data: stage selection uses mocks, and the packaging and discovery tests create synthetic files.
 """
 import io
+import json
 import os
+import shlex
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -215,6 +218,30 @@ class RuntimePackagingTest(unittest.TestCase):
         with open(os.path.join(self.build, name), "wb") as f:
             f.write(contents)
 
+    def test_first_load_hint(self):
+        self.write_artifact("gta6rt_tls_host.dll", b"TLS host")
+        image = "Player's Test.exe"
+        out = os.path.join(self.root, "Port Files")
+        for platform in ("nt", "posix"):
+            with self.subTest(platform=platform), mock.patch.object(make_game.os, "name", platform), \
+                    mock.patch.object(make_game, "log") as log:
+                path = os.path.join(self.game, image)
+                with open(path, "wb"):
+                    pass
+                make_game.runtime(self.game, out, {"expected_exe": image}, self.build)
+                command = log.call_args.args[0].splitlines()[-1].strip()
+                if platform == "nt":
+                    self.assertIn("--dry-run", command)
+                    self.assertIn("gta6rt.exe'", command)
+                    self.assertIn("Player''s Test.exe'", command)
+                else:
+                    self.assertEqual(shlex.split(command.removeprefix("(").removesuffix(")")),
+                                     ["cd", self.game, "&&", os.path.join(out, "gta6rt.sh"), "--dry-run", "./" + image])
+                os.remove(path)
+                make_game.runtime(self.game, out, {"expected_exe": image}, self.build)
+                self.assertIn("is missing", log.call_args.args[0])
+                self.assertNotIn("--dry-run", log.call_args.args[0])
+
     def package(self):
         with mock.patch.object(make_game.os, "name", "nt"), \
                 mock.patch.object(make_game, "ROOT", self.root), \
@@ -341,6 +368,20 @@ class CrossBuildTest(unittest.TestCase):
 
 
 class RuntimeBuildPackagingTest(unittest.TestCase):
+    def test_windows_native_build_receives_the_requested_jobs(self):
+        with tempfile.TemporaryDirectory() as root:
+            build = os.path.join(root, "runtime", "build")
+            os.makedirs(build)
+            for name in make_game.RUNTIME_FILES:
+                open(os.path.join(build, name), "wb").close()
+            with mock.patch.object(make_game.os, "name", "nt"), \
+                    mock.patch.object(make_game, "ROOT", root), \
+                    mock.patch.object(make_game, "run") as run, mock.patch.object(make_game, "log"):
+                make_game.runtime(root, os.path.join(root, "out"), {"expected_exe": "game.exe"}, jobs=1)
+            command = run.call_args.args[0]
+            self.assertEqual(command[command.index("-File") + 1:],
+                             [os.path.join(root, "scripts", "build_runtime.ps1"), "-Jobs", "1"])
+
     def test_off_windows_copies_the_build_and_writes_a_wine_launcher(self):
         with tempfile.TemporaryDirectory() as root:
             build, game, out = (os.path.join(root, n) for n in ("build", "game", "out"))
@@ -383,9 +424,9 @@ class PipelineCheckExeTest(unittest.TestCase):
         open(p, "w").close()
         return p
 
-    def exe(self, os_name):
+    def exe(self, os_name, runtime_build=None):
         with mock.patch.object(make_game.os, "name", os_name):
-            return make_game.pipeline_check_exe()
+            return make_game.pipeline_check_exe(runtime_build)
 
     def test_linux_prefers_the_readme_build_folder(self):
         self.assertIsNone(self.exe("posix"))
@@ -400,16 +441,26 @@ class PipelineCheckExeTest(unittest.TestCase):
         exe = self.touch("vk_pipeline_check.exe")
         self.assertEqual(self.exe("nt"), exe)
 
+    def test_windows_prefers_supplied_checker_and_falls_back_to_local_build(self):
+        local = self.touch("vk_pipeline_check.exe")
+        with tempfile.TemporaryDirectory() as supplied:
+            self.assertEqual(self.exe("nt", supplied), local)
+            bundled = os.path.join(supplied, "vk_pipeline_check.exe")
+            with open(bundled, "wb"):
+                pass
+            self.assertEqual(self.exe("nt", supplied), bundled)
+
     def test_pipelines_off_windows_runs_the_linux_build(self):
         exe = self.touch("linux", "vk_pipeline_check")
+        self.touch("vk_pipeline_check.exe")
         work = os.path.join(self.tmp.name, "work")
         os.makedirs(os.path.join(work, "shaders", "spirv"))
         open(os.path.join(work, "shaders", "spirv", "index.json"), "w").close()
         out = os.path.join(self.tmp.name, "out")
         with mock.patch.object(make_game.os, "name", "posix"), \
                 mock.patch.object(make_game, "log"), \
-                mock.patch.object(make_game, "run") as run:
-            make_game.pipelines(work, out)
+                mock.patch.object(make_game, "run", return_value=0) as run:
+            make_game.pipelines(work, out, runtime_build=self.build)
         self.assertEqual(run.call_args.args[0][0], exe)
 
     def test_pipelines_off_windows_without_the_build_says_how_to_build_it(self):
@@ -454,6 +505,40 @@ class RuntimeStageCopyTest(unittest.TestCase):
             self.run_stage(build, out)
             with open(os.path.join(out, make_game.RUNTIME_FILES[0]), "rb") as f:
                 self.assertEqual(f.read(), make_game.RUNTIME_FILES[0].encode())
+
+
+class RedirectedConsoleEncodingTest(unittest.TestCase):
+    """`--find` must survive a dump path no single-byte code page can write.
+
+    Windows encodes a redirected stdout (make_game.py > build.log) with the console's ANSI code page, and
+    `python -I` ignores PYTHONUTF8, so a path with a character outside that code page -- a Cyrillic, Greek or
+    CJK user name in the profile a dump sits under -- reached print() as UnicodeEncodeError and ended the
+    listing with a traceback (stderr escapes such characters; stdout was strict). The dump below sits under a
+    private-use character that no ANSI code page maps, so before the fix the child dies the same way on every
+    Windows locale; on UTF-8 systems the character prints and this passes either way.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_find_lists_a_dump_whose_path_the_console_code_page_cannot_write(self):
+        home = os.path.join(self.tmp.name, "home")
+        dump = os.path.join(home, "Downloads", "GTA6-\ue9c3")
+        os.makedirs(dump)
+        with open(os.path.join(ROOT, "game", "xbox-1.0.2.1.json"), encoding="utf-8") as f:
+            sizes = json.load(f)["files"]
+        for name in make_game.PROBES:      # match_version() reads only names and sizes
+            with open(os.path.join(dump, name), "wb") as f:
+                f.truncate(sizes[name]["size"])
+        env = dict(os.environ, USERPROFILE=home, HOME=home)
+        r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "make_game.py"), "--find"],
+                           capture_output=True, env=env, cwd=ROOT, encoding="utf-8", errors="replace")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertNotIn("UnicodeEncodeError", r.stderr)
+        self.assertTrue(any(f"GTA6-{c}" in r.stdout for c in ("\ue9c3", "?")),
+                        f"the synthetic dump was not listed: {r.stdout!r}")
 
 
 if __name__ == "__main__":

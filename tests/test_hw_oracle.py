@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 import unittest.mock
+from unittest import mock
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
 sys.path.insert(0, str(TOOLS))
@@ -52,6 +53,35 @@ class Text(unittest.TestCase):
         self.assertEqual(asm.gfx10_spelling("global_load_b128 v[4:7], v0, s[2:3]"), "global_load_dwordx4 v[4:7], v0, s[2:3]")
         self.assertEqual(asm.gfx10_spelling("v_mov_b32 v20, 7"), "v_mov_b32 v20, 7")
 
+    def test_gfx1170_and_later_reject_the_ieee_and_dx10_clamp_mode_fields(self):
+        body = ["s_endpgm"]
+        for arch in ("gfx1170", "gfx1200", "gfx1201"):
+            for field in ("ieee", "dx10_clamp"):
+                with self.assertRaisesRegex(asm.ModeUnavailable, field, msg=f"{arch} {field}"):
+                    asm.raw_kernel_text("k0", body, arch, mode={field: 0})
+
+    def test_denormal_and_rounding_mode_fields_still_work_on_gfx12(self):
+        text = asm.raw_kernel_text("k0", ["s_endpgm"], "gfx1201",
+                                   mode={"denorm32": 0, "denorm16_64": 3, "round16_64": 3})
+        self.assertIn(".amdhsa_float_denorm_mode_32 0", text)
+        self.assertIn(".amdhsa_float_denorm_mode_16_64 3", text)
+        self.assertIn(".amdhsa_float_round_mode_16_64 3", text)
+        self.assertNotIn(".amdhsa_ieee_mode", text)
+        self.assertNotIn(".amdhsa_dx10_clamp", text)
+
+    def test_gfx1150_still_emits_the_ieee_and_dx10_clamp_mode_fields(self):
+        text = asm.raw_kernel_text("k0", ["s_endpgm"], "gfx1150", mode={"ieee": 0, "dx10_clamp": 1})
+        self.assertIn(".amdhsa_ieee_mode 0", text)
+        self.assertIn(".amdhsa_dx10_clamp 1", text)
+
+    def test_the_runner_reports_an_unavailable_mode_as_a_skip(self):
+        o = object.__new__(runner.Oracle)      # no tools, no GPU
+        o.arch, o.chunk = "gfx1201", 500
+        # The kernel is not assembled; it comes back as the reason (#1620), and the rest of the run goes on.
+        result, = o.run([asm.Kernel(["s_endpgm"], raw=True, mode={"ieee": 0})])
+        self.assertIsInstance(result, str)
+        self.assertIn("ieee", result)
+
     def test_metadata_is_required_and_lists_every_kernel(self):
         text, names, starts = asm.module_text([PROG, PROG, PROG], "gfx1150")
         self.assertEqual(names, ["k0", "k1", "k2"])
@@ -71,6 +101,167 @@ class Text(unittest.TestCase):
         self.assertEqual(asm.failing_kernels(err2, starts), {1, 2})
 
 
+class DetectArch(unittest.TestCase):
+    def test_amdgpu_arch_target_features_are_dropped(self):
+        for printed, want in (("gfx1010:xnack-\n", "gfx1010"), ("gfx1150\n", "gfx1150"),
+                              ("gfx1030:sramecc+:xnack-\ngfx1150\n", "gfx1030")):
+            with self.subTest(printed=printed):
+                done = subprocess.CompletedProcess([], 0, stdout=printed)
+                with mock.patch.dict(os.environ, {}, clear=False), \
+                        mock.patch.object(os.path, "isfile", return_value=True), \
+                        mock.patch.object(subprocess, "run", return_value=done):
+                    os.environ.pop("LEONIDA_HW_ARCH", None)
+                    arch = runner.detect_arch(os.path.join("opt", "clang"))
+                self.assertEqual(arch, want)
+                asm.family(arch)   # what Oracle() does next must accept it
+
+
+class True16(unittest.TestCase):
+    def test_the_low_half_is_named_only_on_the_f16_operand(self):
+        for old, new in (
+                ("v_cvt_f16_f32_e32 v8, v4", "v_cvt_f16_f32_e32 v8.l, v4"),
+                ("  v_cvt_f16_f32_e64 v8, -|v4|", "  v_cvt_f16_f32_e64 v8.l, -|v4|"),
+                ("v_cvt_f16_f32 v8, 0x3f800000", "v_cvt_f16_f32 v8.l, 0x3f800000"),
+                ("v_cvt_f32_f16_e32 v8, v4", "v_cvt_f32_f16_e32 v8, v4.l"),
+                ("v_cvt_f32_f16_e64 v8, -|v14| clamp mul:2", "v_cvt_f32_f16_e64 v8, -|v14.l| clamp mul:2"),
+                ("v_cvt_f32_f16 v8, abs(v4)", "v_cvt_f32_f16 v8, abs(v4.l)"),
+                ("v_exp_f16 v12, v2", "v_exp_f16 v12.l, v2.l"),              # both operands are f16
+                ("v_sqrt_f16_e64 v12, -|v2|", "v_sqrt_f16_e64 v12.l, -|v2.l|"),
+                ("v_rcp_f16 v12, 0x3c00", "v_rcp_f16 v12.l, 0x3c00")):
+            self.assertEqual(asm.true16_spelling(old), new)
+            self.assertEqual(asm.true16_spelling(new), new)        # already spelled that way
+        for same in ("v_cvt_pkrtz_f16_f32 v8, v4, v5", "v_cvt_f32_f16 v8, s4", "v_cvt_f32_f16 v8, 0x3c00",
+                     "v_cvt_f32_f16 v8, v4.h", "v_mov_b32 v8, v4"):
+            self.assertEqual(asm.true16_spelling(same), same)
+
+    def test_the_non_returning_compare_and_store_is_respelled_and_swapped_on_gfx11(self):
+        """GFX11 has no ds_cmpst_b32, and ds_cmpstore_b32 takes the store value before the compare value."""
+        self.assertEqual(asm.ds_line("ds_cmpst_b32 v0, v1, v2", "gfx1150"),
+                         "ds_cmpstore_b32 v0, v2, v1")
+        self.assertEqual(asm.ds_line("ds_cmpst_b32 v0, v1, v2 offset:8", "gfx1100"),
+                         "ds_cmpstore_b32 v0, v2, v1 offset:8")
+        self.assertEqual(asm.ds_line("ds_cmpst_b32 v0, v1, v2", "gfx1030"),
+                         "ds_cmpst_b32 v0, v1, v2")
+        # Both changes are needed together: the rename alone would compare v2 and store v1.
+        with self.assertRaises(ValueError):
+            asm.ds_line("ds_cmpst_b32 v0, v1", "gfx1150")
+
+    def test_error_lines_still_map_back(self):
+        text = "v_mov_b32 v1, 0\nv_cvt_f32_f16 v8, 0x3c00\nv_cvt_f16_f32 v8, v1\nv_mov_b32 v9, 0\n"
+        out = asm.true16_spelling(text)
+        self.assertEqual(out, text.replace("v_cvt_f16_f32 v8,", "v_cvt_f16_f32 v8.l,"))
+
+
+class ToolchainFallbacks(unittest.TestCase):
+    """The two probes, with a stand-in for the assembler and the launcher."""
+
+    def oracle(self, arch="gfx1103"):
+        o = object.__new__(runner.Oracle)      # no tools, no GPU
+        o.arch, o.chunk = arch, 500
+        return o
+
+    def probe(self, loads, error="hipModuleLoadData(&mod, img) -> hip error 209"):
+        o = self.oracle()
+        seen = []
+
+        def launch(co, names, words=4):
+            seen.append(o.code_object)
+            if o.code_object in loads:
+                return 0, "# device=test arch=gfx1103\n", ""
+            return 3, "", error
+        o._assemble = lambda text, wave=32: ("k.co", "")
+        o._launch = launch
+        return o, seen
+
+    def test_a_runtime_that_takes_the_default_keeps_it(self):
+        o, seen = self.probe(loads={None, 5})
+        o._probe()
+        self.assertEqual(seen, [None])
+        self.assertIsNone(o.code_object)
+
+    def test_error_209_retries_as_v5_and_keeps_it(self):
+        o, seen = self.probe(loads={5})
+        self.assertEqual(o._probe(), "device=test arch=gfx1103")
+        self.assertEqual((seen, o.code_object), ([None, 5], 5))
+
+    def test_a_209_that_stays_and_other_errors_are_unavailable(self):
+        o, seen = self.probe(loads=set())
+        with self.assertRaisesRegex(runner.Unavailable, "209"):
+            o._probe()
+        self.assertEqual(seen, [None, 5])
+        o, seen = self.probe(loads={5}, error="hipMalloc -> hip error 2")
+        with self.assertRaisesRegex(runner.Unavailable, "error 2"):
+            o._probe()
+        self.assertEqual(seen, [None])
+
+    def test_v5_that_does_not_assemble_is_unavailable(self):
+        o, _ = self.probe(loads={5})
+        o._assemble = lambda text, wave=32: (None, "unknown argument") if o.code_object else ("k.co", "")
+        with self.assertRaisesRegex(runner.Unavailable, "unknown argument"):
+            o._probe()
+
+    def test_the_chosen_version_reaches_the_assembler(self):
+        o = self.oracle()
+        o.clang, o.lld = "clang", "ld.lld"
+        ok = subprocess.CompletedProcess([], 0, "", "")
+        with tempfile.TemporaryDirectory() as tmp, \
+                unittest.mock.patch.object(runner.subprocess, "run", return_value=ok) as run:
+            o.workdir = tmp
+            o._assemble("", 64)
+            self.assertFalse([a for a in run.call_args_list[0].args[0] if "code-object" in a])
+            o.code_object = 5
+            o._assemble("", 64)
+            args = run.call_args_list[2].args[0]
+        self.assertIn("-mcode-object-version=5", args)
+        self.assertIn("-mwavefrontsize64", args)
+
+    def test_true16_is_used_only_where_the_assembler_needs_it(self):
+        bare_only = lambda text, wave=32: (None, "error") if ".l" in text else ("k.co", "")
+        half_only = lambda text, wave=32: ("k.co", "") if ".l" in text else (None, "error")
+        neither = lambda text, wave=32: (None, "error")
+        for arch, assemble, want in (("gfx1150", bare_only, False), ("gfx1103", half_only, True),
+                                     ("gfx1103", neither, False), ("gfx1036", half_only, False)):
+            o = self.oracle(arch)
+            o._assemble = assemble
+            self.assertEqual(o._needs_true16(), want, arch)
+
+    def test_a_chunk_is_assembled_with_that_spelling(self):
+        for true16 in (False, True):
+            o = self.oracle()
+            o.true16, texts = true16, []
+            o._assemble = lambda text, wave=32: (texts.append(text) or "k.co", "")
+            o._launch = lambda co, names, words=4: (0, "k0 00003c00\n", "")
+            kernel = asm.Kernel(["v_cvt_f16_f32 v8, v1", "s_endpgm"], words=1, raw=True)
+            self.assertEqual(o.run([kernel], words=1), [[0x3C00]])
+            self.assertEqual("v8.l" in texts[0], true16)
+
+    def test_a_mode_the_architecture_cannot_set_is_never_assembled(self):
+        # FUZZ-43: gfx1170+ rejects .amdhsa_ieee_mode / .amdhsa_dx10_clamp. Those kernels come back as a reason; the
+        # others in the same run are still assembled and launched.
+        o = self.oracle("gfx1201")
+        o.true16, texts = False, []
+        o._assemble = lambda text, wave=32: (texts.append(text) or "k.co", "")
+        o._launch = lambda co, names, words=4: (0, "".join(f"{n.split(':')[0]} 0000002a\n" for n in names), "")
+        body = ["s_endpgm"]
+        kernels = [asm.Kernel(body, words=1, raw=True, mode={"ieee": 0}),
+                   asm.Kernel(body, words=1, raw=True, mode={"denorm32": 3}),
+                   asm.Kernel(body, words=1, raw=True, mode={"dx10_clamp": 1, "round32": 1})]
+        got = o.run(kernels, words=1)
+        self.assertIn("MODE ieee cannot be set on gfx1201", got[0])
+        self.assertEqual(got[1], [0x2A])
+        self.assertIn("MODE dx10_clamp cannot be set on gfx1201", got[2])
+        self.assertEqual(len(texts), 1)
+        self.assertNotIn(".amdhsa_ieee_mode", texts[0])
+        self.assertNotIn(".amdhsa_dx10_clamp", texts[0])
+
+    def test_every_kernel_skipped_is_not_a_broken_chunk(self):
+        o = self.oracle("gfx1201")
+        o.true16 = False
+        o._assemble = lambda text, wave=32: self.fail("nothing should be assembled")
+        got = o.run([asm.Kernel(["s_endpgm"], words=1, raw=True, mode={"ieee": 1}) for _ in range(3)], words=1)
+        self.assertTrue(all(isinstance(g, str) and "unsupported on gfx1170+" in g for g in got))
+
+
 class Filters(unittest.TestCase):
     def test_literals(self):
         self.assertEqual(asm.literals("s_add_u32 s4, 0x100, s5"), {0x100})
@@ -80,6 +271,17 @@ class Filters(unittest.TestCase):
         self.assertEqual(asm.literals("s_and_b32 s4, -1000, 0xfffffc18"), {0xFFFFFC18})   # one 32-bit value
         self.assertEqual(asm.literals("s_cmpk_lt_u32 s4, 0x8000"), set())     # SIMM16, not a literal
         self.assertEqual(asm.literals("s_movk_i32 s4, 0xffff"), set())
+
+    def test_mode_skip_reasons(self):
+        for arch in ("gfx1013", "gfx1030", "gfx1100", "gfx1150", "gfx1151"):
+            self.assertIsNone(asm.mode_skip_reason({"ieee": 0, "dx10_clamp": 0}, arch), arch)
+        for arch in ("gfx1170", "gfx1200", "gfx1201"):
+            self.assertIn("ieee", asm.mode_skip_reason({"ieee": 0}, arch))
+            self.assertIn(".amdhsa_dx10_clamp", asm.mode_skip_reason({"dx10_clamp": 1, "denorm32": 3}, arch))
+            # the denormal and rounding fields still assemble there
+            self.assertIsNone(asm.mode_skip_reason({"denorm32": 3, "denorm16_64": 0, "round32": 1,
+                                                    "round16_64": 2}, arch), arch)
+            self.assertIsNone(asm.mode_skip_reason(None, arch))
 
     def test_skip_reasons(self):
         self.assertIsNone(asm.skip_reason(PROG, "gfx1150"))
@@ -93,6 +295,61 @@ class Filters(unittest.TestCase):
         self.assertIn("GFX12", asm.skip_reason(cmpk, "gfx1201"))
         self.assertIn("s_ff0", asm.skip_reason(PROG + ["s_ff0_i32_b64 s[4:5], s[6:7]"], "gfx1201"))
         self.assertEqual(len([op for op in asm.GFX12_REMOVED if op.startswith("s_cmpk_")]), 12)
+
+
+class VcvarsScript(unittest.TestCase):
+    """The .cmd that calls vcvars64.bat and cl holds the checkout, %TEMP% and Visual Studio paths. A character
+    outside ASCII in any of them (a user name, the Turkish default folder name) used to end in UnicodeEncodeError,
+    which is not the Unavailable that callers turn into a skip."""
+    NAME = "Ayşe Ğİı klasör"      # Turkish letters: none of them is ASCII
+
+    def build(self, tmp):
+        work = os.path.join(tmp, self.NAME)
+        os.makedirs(work)
+        src = os.path.join(work, "hw_oracle.c")
+        out = os.path.join(work, "hw_oracle.exe")
+        vcvars = os.path.join(work, "vcvars64.bat")
+        argv = runner.build_command("vcvars", vcvars, src, out, work)
+        with open(argv[-1], "rb") as f:
+            return argv, f.read(), (src, out, vcvars)
+
+    def test_paths_outside_ascii_are_written_as_utf8(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            argv, raw, paths = self.build(tmp)
+        self.assertEqual(argv[:3], ["cmd.exe", "/d", "/c"])
+        text = raw.decode("utf-8")                       # strict: every byte is UTF-8
+        for path in paths:
+            self.assertIn(path, text)
+        self.assertFalse(raw.startswith(b"\xef\xbb\xbf"))   # cmd.exe would read a BOM as part of the first command
+
+    def test_the_code_page_is_set_before_any_path_is_used(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _argv, raw, _paths = self.build(tmp)
+        lines = raw.decode("utf-8").split("\r\n")
+        self.assertEqual(lines[0], "@echo off")
+        self.assertEqual(lines[1], "chcp 65001 >nul")
+        self.assertTrue(all(line.isascii() for line in lines[:2]))
+        self.assertTrue(lines[2].startswith('set "PATH='))
+        self.assertTrue(lines[3].startswith('call "'))
+
+    def test_ascii_paths_give_the_same_commands_as_before(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = os.path.join(tmp, "work")
+            os.makedirs(work)
+            argv = runner.build_command("vcvars", "vcvars64.bat", "hw_oracle.c", "hw_oracle.exe", work)
+            with open(argv[-1], "rb") as f:
+                lines = f.read().decode("ascii").split("\r\n")
+        self.assertEqual(lines[3], 'call "vcvars64.bat" >nul || exit /b 1')
+        self.assertTrue(lines[4].startswith("cl /nologo /O1 hw_oracle.c /Fehw_oracle.exe /Fo"))
+
+    def test_the_direct_compilers_write_no_script(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = os.path.join(tmp, self.NAME)
+            os.makedirs(work)
+            self.assertEqual(runner.build_command("gcc", "gcc", "a.c", "a.exe", work),
+                             ["gcc", "-O1", "a.c", "-o", "a.exe"])
+            self.assertEqual(runner.build_command("msvc", "cl.exe", "a.c", "a.exe", work)[0], "cl.exe")
+            self.assertEqual(os.listdir(work), [])
 
 
 class Unavailable(unittest.TestCase):
@@ -340,6 +597,12 @@ class OnHardware(unittest.TestCase):
             got.append(int(out.splitlines()[-1].split()[1], 16))
         self.assertEqual(got, [0x3F800001, 0x3F800001, 0x3F800000, 0x3F800000])
 
+    def test_f16_conversions_run_with_either_assembler_spelling(self):
+        # 1.0 to f16 keeps the high half of the register; the low half back to f32 ignores it.
+        program = ["v_mov_b32 v1, 0x3f800000", "v_mov_b32 v8, 0xabcd0000", "v_cvt_f16_f32 v8, v1",
+                   "v_cvt_f32_f16 v9, v8", "v_mov_b32 v10, 0", "v_mov_b32 v11, 0"]
+        self.assertEqual(self.oracle.run([program]), [[0xABCD3C00, 0x3F800000, 0, 0]])
+
     def test_runs_a_program_and_reports_a_rejected_one(self):
         bad = ["s_add_u32 s4, 0x100, 0x200"] + PROG[-4:]     # two literals: the assembler refuses it
         good, rejected = self.oracle.run([PROG, bad])
@@ -348,5 +611,76 @@ class OnHardware(unittest.TestCase):
         self.assertIn("rejected", rejected)
 
 
+class KernelResources(unittest.TestCase):
+    """Kernel(vgprs=, sgprs=): the register counts reach the descriptor and the metadata; no hardware needed."""
+
+    def test_requested_registers_are_in_the_text(self):
+        k = asm.Kernel(["s_endpgm"], wave=32, threads=64, words=8, raw=True, vgprs=40, sgprs=72)
+        text, names, _ = asm.module_text([k, asm.Kernel(["s_endpgm"], raw=True)], "gfx1150")
+        self.assertIn(".amdhsa_next_free_vgpr 40", text)
+        self.assertIn(".amdhsa_next_free_sgpr 72", text)
+        self.assertIn(".sgpr_count: 72", text)
+        self.assertIn(".vgpr_count: 40", text)
+        self.assertEqual(text.count(".amdhsa_next_free_vgpr"), 2)
+        self.assertIn(".amdhsa_next_free_vgpr 32", text)      # the second kernel keeps the defaults
+        self.assertIn(".amdhsa_next_free_sgpr 40", text)
+        self.assertEqual(names, ["k0", "k1"])
+
+    def test_registers_the_lines_name_are_allocated(self):
+        self.assertEqual(asm.regs_used(["v_mov_b32 v200, s7", "s_mov_b64 s[40:41], -1", "v_mad_u64_u32 v[8:9], "
+                                        "s20, v1, v1, v[2:3] ; v250 in a comment", "v_add_co_u32 v3, vcc_lo, v4, s0"]),
+                         (201, 42))
+        self.assertEqual(asm.regs_used(["s_endpgm"]), (0, 0))
+        self.assertEqual(asm.register_counts(["v_mov_b32 v1, 0"], 16, 32), (16, 32))     # never lowered
+        self.assertEqual(asm.register_counts(["v_mov_b32 v255, s103"], 16, 32), (256, 104))
+        k = asm.raw_kernel_text("k0", ["v_mov_b32 v40, 0", "s_endpgm"], "gfx1036", vgprs=8, sgprs=16)
+        self.assertIn(".amdhsa_next_free_vgpr 41", k)
+        self.assertIn(".amdhsa_next_free_sgpr 16", k)
+
+    def test_wrapped_kernels_take_the_wave_and_registers_of_the_kernel(self):
+        # The wrapped kernel's descriptor was fixed at wave32, 16 VGPRs and 32 SGPRs: on gfx1036 v16 and up read
+        # back 0 and Kernel(wave=64) ran as wave32.
+        lines = ["v_mov_b32 v40, 1", "s_mov_b32 s60, 2"] + PROG[-4:]
+        text, _, _ = asm.module_text([asm.Kernel(lines, wave=64)], "gfx1036", wave=64)
+        self.assertIn(".amdhsa_wavefront_size32 0", text)
+        self.assertIn(".amdhsa_next_free_vgpr 41", text)
+        self.assertIn(".amdhsa_next_free_sgpr 61", text)
+        self.assertIn(".vgpr_count: 41", text)          # the metadata says what the descriptor says
+        self.assertIn(".sgpr_count: 61", text)
+        text, _, _ = asm.module_text([asm.Kernel(PROG)], "gfx1036")
+        self.assertIn(".amdhsa_wavefront_size32 1", text)
+        self.assertIn(".amdhsa_next_free_vgpr 32", text)                # Kernel's default counts
+        text, _, _ = asm.module_text([PROG], "gfx1036")
+        self.assertIn(".amdhsa_next_free_vgpr 16", text)                # a plain program keeps the old ones
+        self.assertIn(".amdhsa_next_free_sgpr 32", text)
+
+
+class WrappedKernelsOnHardware(unittest.TestCase):
+    """A wrapped kernel runs at the wave size it asks for and keeps every register it names."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            cls.oracle = runner.open_oracle()
+        except runner.Unavailable as e:
+            raise unittest.SkipTest(f"hardware oracle unavailable: {e}") from None
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.oracle.close()
+
+    def test_wave_size_and_high_registers(self):
+        # Lane 40 of the lane ids of a full EXEC is 40 in a wave64 and lane 8 (40 mod 32) in a wave32.
+        ids = ["s_mov_b64 exec, -1", "v_mbcnt_lo_u32_b32 v1, -1, 0", "v_mbcnt_hi_u32_b32 v1, -1, v1",
+               "v_readlane_b32 s4, v1, 40", "s_mov_b64 exec, 1"]
+        regs = ["s_mov_b32 s90, 0x5a", "v_mov_b32 v16, 0x16", "v_mov_b32 v200, 0x200", "v_mov_b32 v9, s90",
+                "v_mov_b32 v10, v16", "v_mov_b32 v11, v200", "v_mov_b32 v8, s4"]
+        for wave, lane in ((32, 8), (64, 40)):
+            with self.subTest(wave=wave):
+                got = self.oracle.run([asm.Kernel(ids + regs, wave=wave)])
+                self.assertEqual(got, [[lane, 0x5A, 0x16, 0x200]])
+
+
 if __name__ == "__main__":
     unittest.main()
+

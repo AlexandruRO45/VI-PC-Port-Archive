@@ -60,9 +60,15 @@ JOIN_BLOCK_BYTES = 1 << 20   # --join read size; a typical carved part is one re
 
 
 def joaat(text):
-    """Jenkins one-at-a-time over the lowercased UTF-8 bytes, as used for the name hash."""
+    """Jenkins one-at-a-time over the lowercased latin-1 bytes, as the name hash is defined.
+
+    The same rule as ``tools/hashdict.py`` (the pinned name dictionary) and ``tools/awc_names.py``, which
+    recovers stream names: a name has to hash alike in every tool or the id never matches. Lowercased
+    UTF-8 gave a different hash for any non-ASCII character (``é`` is one byte 0xE9, not 0xC3 0xA9), so a
+    title with an accent produced a stream id no bank stores.
+    """
     h = 0
-    for c in text.lower().encode("utf-8", "ignore"):
+    for c in text.lower().encode("latin-1", "replace"):
         h = (h + c) & 0xFFFFFFFF
         h = (h + (h << 10)) & 0xFFFFFFFF
         h ^= h >> 6
@@ -289,4 +295,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

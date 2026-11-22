@@ -116,12 +116,13 @@ def resource_kind(b):
     """Drawable / drawable dictionary / fragment signature on the system page prefix, or None."""
     if len(b) < 192 or u64(b, 0) != 0:
         return None
-    if sys_ptr(u64(b, 32)) and sys_ptr(u64(b, 48)) and 0 < u16(b, 56) <= 4096 \
+    if sys_ptr(u64(b, 8)) and sys_ptr(u64(b, 32)) and sys_ptr(u64(b, 48)) and 0 < u16(b, 56) <= 4096 \
             and u16(b, 56) == u16(b, 58) == u16(b, 40) == u16(b, 42):
         return "dictionary"
-    if all(sys_ptr(u64(b, at)) for at in (8, 16, 24, 32, 40)) \
-            and 0 < u16(b, 48) <= 4096 and u16(b, 48) == u16(b, 50) \
-            and 0 < u16(b, 52) <= 4096 and u16(b, 52) == u16(b, 54):
+    if all(sys_ptr(u64(b, at)) for at in (8, 24, 168)) \
+            and all(p == 0 or sys_ptr(p) for p in (u64(b, 16), u64(b, 32), u64(b, 40))) \
+            and 0 < u16(b, 48) <= 4096 and u16(b, 50) <= 4096 \
+            and u16(b, 52) <= u16(b, 54) <= 4096:
         return "fragment"
     if (sys_ptr(u64(b, 8)) or u64(b, 8) == 0) and sys_ptr(u64(b, 16)) and sys_ptr(u64(b, 80)) \
             and (sys_ptr(u64(b, 168)) or u64(b, 168) == 0):
@@ -205,6 +206,7 @@ def walk_resource(sys, kind):
                     for size, _fmt, offset in slots.values():
                         check(offset <= gfx_len and size * vertices <= gfx_len - offset)
                     gfx_at = u64(sys, vb + 24) - 0x60000000
+                    check(0 <= gfx_at <= MAX_GFX - gfx_len)
                     if any(i in slots for i in WEIGHT_SLOTS + INDEX_SLOTS):
                         meshes.append(Mesh(vertices, bones, slots, gfx_at, gfx_len))
                     check(len(meshes) <= 4096)
@@ -267,9 +269,9 @@ def descriptor_offsets(data, limit):
 
 def validate(mesh, gfx, layout):
     """Check the decoded skin bytes against the model's own bone count; returns a tally dict."""
-    data = gfx[mesh.gfx_at:mesh.gfx_at + mesh.gfx_len]
-    if len(data) < mesh.gfx_len:
+    if mesh.gfx_at < 0 or mesh.gfx_at + mesh.gfx_len > len(gfx):
         return {"buffer-short": 1, "vertices": mesh.vertices}
+    data = gfx[mesh.gfx_at:mesh.gfx_at + mesh.gfx_len]
     n = mesh.vertices
     t = {"vertices": n, "meshes": 1, "weighted-components": 0, "components-out-of-range": 0,
          "weight-sum-255": 0, "weight-sum-247-254": 0, "weight-sum-other": 0,
@@ -289,10 +291,11 @@ def validate(mesh, gfx, layout):
             if offset not in desc:
                 t["descriptor-mismatch"] += 1
     if weight_rows:
-        low = high = 255
+        low = high = None
         for v in range(n):
             total = sum(sum(row[4 * v:4 * v + 4]) for row in weight_rows)
-            low, high = min(low, total), max(high, total)
+            low = total if low is None else min(low, total)
+            high = total if high is None else max(high, total)
             if total == 255:
                 t["weight-sum-255"] += 1
             elif 247 <= total <= 254:
@@ -325,12 +328,15 @@ def validate(mesh, gfx, layout):
                     t["weighted-components"] += 1
                     if idx >= mesh.bones:
                         t["components-out-of-range"] += 1
-            else:  # 4-byte index rows, masked by the matching weight row
+            else:  # four 8-bit or 16-bit indices per vertex, masked by the matching weights
+                wide = len(row) == 8 * n
                 for v in range(n):
-                    for c in range(4):
-                        if weights is None or weights[4 * v + c]:
+                    base = 4 * v
+                    joints = struct.unpack_from("<4H", row, 2 * base) if wide else row[base:base + 4]
+                    for c, joint in enumerate(joints):
+                        if weights is None or weights[base + c]:
                             t["weighted-components"] += 1
-                            if row[4 * v + c] >= mesh.bones:
+                            if joint >= mesh.bones:
                                 t["components-out-of-range"] += 1
     return t
 
@@ -372,6 +378,8 @@ def scan_archive(path, sample, log):
     stats = {"candidates": 0, "resources": 0, "skipped": 0, "meshes": 0, "vertices": 0,
              "unclassified": 0, "layouts": {}, "signatures": {}, "validated": {}}
     size = os.path.getsize(path)
+    if size == 0:
+        return stats    # mmap refuses an empty file; an empty archive has no resources to count
     t0 = time.time()
     with open(path, "rb") as fh:
         m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
@@ -423,7 +431,7 @@ def scan_archive(path, sample, log):
                     stats["unclassified"] += 1
                     continue
                 acc = stats["validated"].setdefault(layout, {"_meshes": 0})
-                if acc["_meshes"] < sample and mesh.gfx_at + mesh.gfx_len <= len(resource_gfx):
+                if acc["_meshes"] < sample and 0 <= mesh.gfx_at and mesh.gfx_at + mesh.gfx_len <= len(resource_gfx):
                     acc["_meshes"] += 1
                     for key, value in validate(mesh, resource_gfx, layout).items():
                         if key.endswith(("-min", "-max")):
@@ -438,6 +446,16 @@ def scan_archive(path, sample, log):
     return stats
 
 
+def same_output_path(first, second):
+    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("inputs", nargs="+", help="RPF9 archives to scan")
@@ -445,11 +463,28 @@ def main(argv=None):
                     help="meshes validated per layout per archive (the census covers every mesh)")
     ap.add_argument("--json", help="write the full tallies to this file")
     a = ap.parse_args(argv)
-    report, t0 = {}, time.time()
+    if a.sample < 1:
+        print("error: --sample must be at least 1", file=sys.stderr)
+        return 2
     for path in a.inputs:
         if not os.path.isfile(path):
-            sys.exit(f"{path}: not a file")
-        stats = scan_archive(path, a.sample, lambda text: print(text, flush=True))
+            print(f"error: {path} is not a file", file=sys.stderr)
+            return 2
+    if a.json:
+        if os.path.isdir(a.json):
+            print(f"error: --json {a.json} is a directory", file=sys.stderr)
+            return 2
+        for path in a.inputs:
+            if same_output_path(a.json, path):
+                print(f"error: --json would overwrite the input {path}", file=sys.stderr)
+                return 2
+    report, t0 = {}, time.time()
+    for path in a.inputs:
+        try:
+            stats = scan_archive(path, a.sample, lambda text: print(text, flush=True))
+        except OSError as error:
+            print(f"error: cannot read {path}: {error.strerror or error}", file=sys.stderr)
+            return 2
         report[path] = stats
         print(f"{os.path.basename(path)}: {stats['resources']} resources, {stats['meshes']} skin meshes, "
               f"{stats['vertices']} vertices ({time.time() - t0:.0f}s)")
@@ -457,10 +492,21 @@ def main(argv=None):
             row = stats["layouts"][layout]
             print(f"  {layout:26s} {row['meshes']:8d} meshes {row['vertices']:12d} vertices")
     if a.json:
-        with open(a.json, "w", encoding="utf-8") as fh:
-            json.dump(report, fh, indent=1)
+        try:
+            parent = os.path.dirname(os.path.abspath(a.json))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(a.json, "w", encoding="utf-8", newline="\n") as fh:
+                json.dump(report, fh, indent=1)
+        except OSError as exc:
+            print(f"error: cannot write {a.json}: {exc.strerror or exc}", file=sys.stderr)
+            return 2
     return 0
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

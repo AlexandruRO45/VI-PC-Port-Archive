@@ -63,21 +63,30 @@ def skip_reason(lines, arch):
     return None
 
 
+class ModeUnavailable(Exception):
+    """A requested float MODE field cannot be encoded on this architecture."""
+
+
 class Kernel:
     """One program to run. lines: the instructions. raw=False wraps them (output pointer load, v[8:11] store);
     raw=True means the lines already end with their own stores and s_endpgm and only get the output pointer in
     s[2:3]. threads: workgroup size; words: dwords read back; wave: 32 or 64. mode: the float MODE the kernel
     starts with (raw kernels only), a dict of MODE_FIELDS names to values; None keeps the assembler's defaults.
+    On gfx1170+ the assembler rejects the ieee and dx10_clamp directives, so requesting those fields raises
+    ModeUnavailable while the denormal and rounding fields still work.
     lds: bytes of LDS the kernel allocates (.amdhsa_group_segment_fixed_size and the metadata's
-    .group_segment_fixed_size; without it the hardware gives the group no LDS); vgprs: registers the kernel uses."""
+    .group_segment_fixed_size; without it the hardware gives the group no LDS); vgprs, sgprs: registers the kernel uses
+    (default 32 and 40)."""
 
-    def __init__(self, lines, wave=32, threads=1, words=4, raw=False, mode=None, lds=0, vgprs=32):
+    def __init__(self, lines, wave=32, threads=1, words=4, raw=False, mode=None, lds=0, vgprs=32, sgprs=40):
         self.lines, self.wave, self.threads, self.words, self.raw = list(lines), wave, threads, words, raw
-        self.lds, self.vgprs = lds, vgprs
+        self.lds, self.vgprs, self.sgprs = lds, vgprs, sgprs
         if not 0 <= lds <= 65536 or lds % 4:
             raise ValueError(f"LDS size {lds} is not a multiple of 4 in 0..65536")
         if not 1 <= vgprs <= 256:
             raise ValueError(f"vgprs {vgprs} is not in 1..256")
+        if not 1 <= sgprs <= 104:
+            raise ValueError(f"sgprs {sgprs} is not in 1..104")
         self.mode = dict(mode or {})
         unknown = set(self.mode) - set(MODE_FIELDS)
         if unknown:
@@ -95,6 +104,29 @@ MODE_FIELDS = {
     "round32": ".amdhsa_float_round_mode_32",
     "round16_64": ".amdhsa_float_round_mode_16_64",
 }
+# AMD clang (rocm-sdk-core 10.0.0) rejects these two directives on gfx1170 and later; the hardware keeps its
+# fixed IEEE/DX10_CLAMP behaviour there, so a run that asks for either field is a skip, not an assembler failure.
+_MODE_FIELDS_GONE_ON_GFX1170 = ("ieee", "dx10_clamp")
+
+
+# MODE fields a kernel descriptor can no longer set: GFX11.7 and GFX12 have fixed IEEE / DX10_CLAMP behaviour, and AMD
+# clang (rocm-sdk-core 10.0.0) rejects .amdhsa_ieee_mode and .amdhsa_dx10_clamp for gfx1201 with "directive
+# unsupported on gfx1170+" (FUZZ-43, found by @Dom-in in #1548). The four denormal and rounding fields still assemble.
+_MODE_FIXED = ("ieee", "dx10_clamp")
+
+
+def mode_skip_reason(mode, arch):
+    """Why a kernel's starting MODE cannot be set on this architecture, or None. A kernel that asks for one of
+    _MODE_FIXED on gfx1170+ (GFX11.7 and GFX12) is reported as not runnable there, rather than reaching the assembler,
+    which rejects the directive and, when every kernel of a chunk sets it, the whole chunk."""
+    fam = family(arch)
+    if not (fam == "gfx12" or (fam == "gfx11" and int(arch[5], 16) >= 7)):
+        return None
+    fixed = sorted(k for k in (mode or {}) if k in _MODE_FIXED)
+    if not fixed:
+        return None
+    return (f"MODE {', '.join(fixed)} cannot be set on {arch}: {', '.join(MODE_FIELDS[k] for k in fixed)} "
+            "is unsupported on gfx1170+ (the behaviour is fixed there)")
 
 
 # The global memory instructions GFX11 renamed, under their GFX10 names. A raw kernel body is written with the
@@ -109,9 +141,39 @@ def gfx10_spelling(line):
     return _GFX10_NAMES.get(op, op) + sep + rest
 
 
-def raw_kernel_text(name, lines, arch, wave=32, mode=None, lds=0, vgprs=32):
+_REG = re.compile(r"(?<![\w.])([vs])(?:(\d+)|\[\d+:(\d+)\])(?![\w.])")
+
+
+def regs_used(lines):
+    """(VGPRs, SGPRs) the lines name: one past the highest v<N> / v[a:b] and s<N> / s[a:b], 0 when there are none."""
+    top = {"v": 0, "s": 0}
+    for line in lines:
+        for kind, single, last in _REG.findall(line.split(";", 1)[0]):
+            top[kind] = max(top[kind], int(last or single) + 1)
+    return top["v"], top["s"]
+
+
+def register_counts(lines, vgprs, sgprs):
+    """The .amdhsa_next_free_vgpr / _sgpr a kernel gets: what was asked for, raised to cover every register the lines
+    name (at most 256 VGPRs and 104 SGPRs; a program past that is the assembler's to reject). A descriptor that
+    allocates fewer leaves the program registers that read back 0: measured on gfx1036, v16 and up under the wrapped
+    kernels' old fixed `.amdhsa_next_free_vgpr 16`."""
+    v, s = regs_used(lines)
+    return min(max(vgprs, v), 256), min(max(sgprs, s), 104)
+
+
+def raw_kernel_text(name, lines, arch, wave=32, mode=None, lds=0, vgprs=32, sgprs=40):
     """A kernel whose body does its own stores. s[0:1] is the kernarg pointer, s[2:3] gets the output pointer."""
     fam = family(arch)
+    vgprs, sgprs = register_counts(lines, vgprs, sgprs)
+    if int(arch[3:], 16) >= 0x1170:
+        unsupported = sorted(set(mode or {}) & set(_MODE_FIELDS_GONE_ON_GFX1170))
+        if unsupported:
+            fields = ", ".join(unsupported)
+            raise ModeUnavailable(
+                f"{fields} cannot be set on {arch}: AMD clang rejects .amdhsa_ieee_mode and .amdhsa_dx10_clamp "
+                "on gfx1170+, and the hardware keeps its fixed behaviour there; only denormal and rounding "
+                "mode fields are available")
     modes = "".join(f"\n  {MODE_FIELDS[k]} {int(v)}" for k, v in sorted((mode or {}).items()))
     load = "s_load_b64" if fam == "gfx11" else "s_load_dwordx2"
     if fam == "gfx10":
@@ -129,7 +191,7 @@ def raw_kernel_text(name, lines, arch, wave=32, mode=None, lds=0, vgprs=32):
 .amdhsa_kernel {name}
   .amdhsa_user_sgpr_kernarg_segment_ptr 1
   .amdhsa_next_free_vgpr {vgprs}
-  .amdhsa_next_free_sgpr 40
+  .amdhsa_next_free_sgpr {sgprs}
   .amdhsa_group_segment_fixed_size {lds}
   .amdhsa_wavefront_size32 {1 if wave == 32 else 0}
   .amdhsa_system_vgpr_workitem_id 0{modes}
@@ -138,9 +200,12 @@ def raw_kernel_text(name, lines, arch, wave=32, mode=None, lds=0, vgprs=32):
 """
 
 
-def kernel_text(name, lines, arch):
-    """Assembly for one kernel."""
+def kernel_text(name, lines, arch, wave=32, vgprs=16, sgprs=32):
+    """Assembly for one kernel. The descriptor takes the wave size and the register counts (raised to the registers
+    the lines name, register_counts). It used to be fixed at wave32, 16 VGPRs and 32 SGPRs: on gfx1036 v16 and up
+    read back 0 and a Kernel(wave=64) ran as wave32 (the lane ids of a full EXEC had 32 lanes)."""
     fam = family(arch)
+    vgprs, sgprs = register_counts(lines, vgprs, sgprs)
     load = "s_load_dwordx2" if fam == "gfx10" else "s_load_b64"
     store = "global_store_dwordx4" if fam == "gfx10" else "global_store_b128"
     body = "\n".join("  " + line for line in lines)
@@ -159,25 +224,25 @@ def kernel_text(name, lines, arch):
 .p2align 6
 .amdhsa_kernel {name}
   .amdhsa_user_sgpr_kernarg_segment_ptr 1
-  .amdhsa_next_free_vgpr 16
-  .amdhsa_next_free_sgpr 32
-  .amdhsa_wavefront_size32 1
+  .amdhsa_next_free_vgpr {vgprs}
+  .amdhsa_next_free_sgpr {sgprs}
+  .amdhsa_wavefront_size32 {1 if wave == 32 else 0}
   .amdhsa_system_vgpr_workitem_id 0
 .end_amdhsa_kernel
 .text
 """
 
 
-def metadata(names, wave=32, lds=None, vgprs=None):
+def metadata(names, wave=32, lds=None, vgprs=None, sgprs=None):
     """The HSA metadata block. Without it the HIP runtime fails the load with hipErrorNoBinaryForGpu (209).
-    lds / vgprs: per kernel (lists as long as names); default 0 bytes of LDS and 32 registers."""
+    lds / vgprs / sgprs: per kernel (lists as long as names); default 0 bytes of LDS, 32 VGPRs and 40 SGPRs."""
     out = [".amdgpu_metadata", "---", "amdhsa.version: [1, 2]", "amdhsa.kernels:"]
     for i, n in enumerate(names):
         out += [f"  - .name: {n}", f"    .symbol: {n}.kd", "    .args:",
                 "      - {.offset: 0, .size: 8, .value_kind: global_buffer, .address_space: global}",
                 f"    .group_segment_fixed_size: {lds[i] if lds else 0}", "    .private_segment_fixed_size: 0",
                 "    .kernarg_segment_align: 8", "    .kernarg_segment_size: 8", "    .max_flat_workgroup_size: 1024",
-                f"    .sgpr_count: 40", f"    .vgpr_count: {vgprs[i] if vgprs else 32}", f"    .wavefront_size: {wave}"]
+                f"    .sgpr_count: {sgprs[i] if sgprs else 40}", f"    .vgpr_count: {vgprs[i] if vgprs else 32}", f"    .wavefront_size: {wave}"]
     out.append(".end_amdgpu_metadata")
     return "\n".join(out) + "\n"
 
@@ -186,21 +251,24 @@ def module_text(programs, arch, prefix="k", wave=32):
     """(assembly text, kernel names, first source line of each kernel) for a list of programs. A program is a list
     of lines (wrapped as a scalar test) or a Kernel."""
     parts = [f'.amdgcn_target "amdgcn-amd-amdhsa--{arch}"', ".text"]
-    names, starts, line_no, lds, vgprs = [], [], 2, [], []
+    names, starts, line_no, lds, vgprs, sgprs = [], [], 2, [], [], []
     for i, prog in enumerate(programs):
         name = f"{prefix}{i}"
         lds.append(prog.lds if isinstance(prog, Kernel) else 0)
-        vgprs.append(prog.vgprs if isinstance(prog, Kernel) else 32)
         if isinstance(prog, Kernel):
-            text = (raw_kernel_text(name, prog.lines, arch, prog.wave, prog.mode, prog.lds, prog.vgprs) if prog.raw
-                    else kernel_text(name, prog.lines, arch))
+            vg, sg = register_counts(prog.lines, prog.vgprs, prog.sgprs)
+            text = (raw_kernel_text(name, prog.lines, arch, prog.wave, prog.mode, prog.lds, vg, sg) if prog.raw
+                    else kernel_text(name, prog.lines, arch, prog.wave, vg, sg))
         else:
-            text = kernel_text(name, prog, arch)
+            vg, sg = register_counts(prog, 16, 32)
+            text = kernel_text(name, prog, arch, wave, vg, sg)
+        vgprs.append(vg)
+        sgprs.append(sg)
         names.append(name)
         starts.append(line_no + 1)
         parts.append(text.rstrip("\n"))
         line_no += text.count("\n") + 0
-    parts.append(metadata(names, wave, lds, vgprs).rstrip("\n"))
+    parts.append(metadata(names, wave, lds, vgprs, sgprs).rstrip("\n"))
     return "\n".join(parts) + "\n", names, starts
 
 
@@ -264,6 +332,17 @@ def ds_line(line, arch):
             raise ValueError(f"cannot swap the operands of {line!r}")
         dst, addr, cmp_, store, tail = m.groups()
         rest = f"{dst}, {addr}, {store}, {cmp_}{tail}"
+    elif op == "ds_cmpst_b32" and family(arch) == "gfx11":
+        # The non-returning form is renamed as well, and its two data operands swap the same way: GFX10's
+        # ds_cmpst_b32 vaddr, cmp, store is GFX11's ds_cmpstore_b32 vaddr, store, cmp (measured on gfx1100: with
+        # M = 7, vaddr = 0 and data v1 = 9, v2 = 7 the dword becomes 9, so the store operand is v1). The rename is
+        # done here rather than in DS_RENAMED_GFX11 because the swap is only measured on GFX11, and renaming
+        # without swapping on GFX12 would silently compare and store the wrong way round.
+        m = re.fullmatch(r"(v\d+),\s*(v\d+),\s*(v\d+)(.*)", rest)
+        if not m:
+            raise ValueError(f"cannot swap the operands of {line!r}")
+        addr, cmp_, store, tail = m.groups()
+        return f"ds_cmpstore_b32 {addr}, {store}, {cmp_}{tail}"
     return ds_mnemonic(op, arch) + sep + rest
 
 
@@ -272,6 +351,20 @@ def valu_skip_reason(op, arch):
     if op in VALU_REMOVED and arch not in ("gfx1010", "gfx1011", "gfx1012", "gfx1013"):
         return f"{op}: {VALU_REMOVED[op]}"
     return None
+
+
+# ---- true16: LLVM 23 makes GFX11's 16-bit operands half registers (v8.l) and rejects a bare v8 there ----
+# The one-source f16 ops the fuzzers and sweeps run here: the two conversions and f16_trans_sweep's seven.
+_F16_UNARY = "|".join(f"v_{op}_f16" for op in ("exp", "log", "rcp", "rsq", "sqrt", "sin", "cos"))
+_F16_DST = re.compile(rf"^([ \t]*(?:v_cvt_f16_f32|{_F16_UNARY})(?:_e32|_e64)?[ \t]+v\d+)(?=[ \t]*,)", re.M)
+_F16_SRC = re.compile(rf"^([ \t]*(?:v_cvt_f32_f16|{_F16_UNARY})(?:_e32|_e64)?[ \t]+v\d+(?:\.[lh])?[ \t]*,"
+                      r"[-| \ta-z(]*\bv\d+)\b(?!\.[lh])", re.M)
+
+
+def true16_spelling(text):
+    """The f16 operands of those ops written as the low half, which is what a bare register means there on GFX10
+    and to older assemblers. Line numbers don't change, so error lines still map to kernels."""
+    return _F16_SRC.sub(r"\1.l", _F16_DST.sub(r"\1.l", text))
 
 
 def failing_kernels(stderr, starts):

@@ -131,6 +131,49 @@ class PageIndexTest(unittest.TestCase):
             self.assertEqual((rec["target"], rec["size"], rec["target_stream"]), (0x100, 0x80, 1))
             self.assertEqual(page_doc["span"], 0x180)
 
+    def test_resource_grouping_reports_streams_and_declared_pages(self):
+        # The resource group is the directory plus the streams needed to reach the q38 table and its
+        # last record. The +0x20 count is reported next to the 64 KiB units, never used as a boundary.
+        page = header(0x100, q38=0xC0, counts=(0, 0, 1, 0), page_count=1)
+        put_q38(page, 0xC0, [(0x1234, 0x40, 0x60)])
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "single.rpf")
+            out = os.path.join(tmp, "single.json")
+            offsets = make_rpf(arc, [page])
+            run_tool(arc, out)
+            with open(out, encoding="utf-8") as f:
+                doc = json.load(f)
+            resource = doc["pages"][0]["resource"]
+            self.assertEqual([s["offset"] for s in resource["streams"]], offsets)
+            self.assertEqual(resource["bytes"], 0x100)
+            self.assertEqual(resource["page_units"], 1)
+            self.assertEqual(resource["declared_pages"], 1)
+            self.assertTrue(resource["declared_matches_units"])
+            self.assertEqual(doc["summary"]["declared_matches_units"], 1)
+            self.assertEqual(doc["summary"]["declared_differs_from_units"], 0)
+
+        # A continuation is part of the same resource; a declared count of 2 over 0x200 bytes is two
+        # 64 KiB units short, so the mismatch is reported instead of being trusted as a boundary.
+        page = header(0x100, q38=0xC0, counts=(0, 0, 1, 0), page_count=2)
+        put_q38(page, 0xC0, [(0x5678, 0x80, 0x100)])
+        cont = b"\xbb" * 0x100
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "pair.rpf")
+            out = os.path.join(tmp, "pair.json")
+            offsets = make_rpf(arc, [page, cont])
+            run_tool(arc, out)
+            with open(out, encoding="utf-8") as f:
+                doc = json.load(f)
+            resource = doc["pages"][0]["resource"]
+            self.assertEqual([s["offset"] for s in resource["streams"]], offsets)
+            self.assertEqual([s["inflated"] for s in resource["streams"]], [0x100, 0x100])
+            self.assertEqual(resource["bytes"], 0x200)
+            self.assertEqual(resource["page_units"], 1)
+            self.assertEqual(resource["declared_pages"], 2)
+            self.assertFalse(resource["declared_matches_units"])
+            self.assertEqual(doc["summary"]["declared_differs_from_units"], 1)
+            self.assertEqual(doc["summary"]["resource_streams"], {"2": 1})
+
     def test_q38_table_straddles_stream(self):
         page = header(0x100, q38=0xF8, counts=(0, 0, 2, 0))
         entries = [(0x1111, 0x10, 0x60), (0x2222, 0x20, 0x120)]
@@ -272,6 +315,68 @@ class PageIndexTest(unittest.TestCase):
                 self.assertIn("single archive", proc.stderr)
                 self.assertEqual(proc.stdout, "")
                 self.assertFalse(os.path.exists(out))
+
+    def test_output_cannot_overwrite_source_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "archive.json")
+            make_rpf(arc, [header(0x100)])
+            with open(arc, "rb") as f:
+                original = f.read()
+
+            # Same path
+            proc = subprocess.run([sys.executable, "-I", TOOL, arc, arc, "--quiet"],
+                                  capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("output must not overwrite the source", proc.stderr)
+            with open(arc, "rb") as f:
+                self.assertEqual(f.read(), original)
+
+            # Hard-link alias
+            if hasattr(os, "link"):
+                alias = os.path.join(tmp, "alias.json")
+                try:
+                    os.link(arc, alias)
+                except OSError:
+                    alias = None
+                if alias:
+                    proc2 = subprocess.run([sys.executable, "-I", TOOL, arc, alias, "--quiet"],
+                                           capture_output=True, text=True)
+                    self.assertEqual(proc2.returncode, 2)
+                    self.assertIn("output must not overwrite the source", proc2.stderr)
+                    with open(arc, "rb") as f:
+                        self.assertEqual(f.read(), original)
+
+    def test_output_cannot_overwrite_carve_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = os.path.join(tmp, "index.json")
+            with open(manifest, "w", encoding="utf-8") as f:
+                f.write('{"carve_manifest": true}')
+            with open(os.path.join(tmp, "00000001.bin"), "wb") as f:
+                f.write(header(0x100))
+
+            proc = subprocess.run([sys.executable, "-I", TOOL, tmp, manifest, "--quiet"],
+                                  capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("output would overwrite the carve manifest", proc.stderr)
+            with open(manifest, "r", encoding="utf-8") as f:
+                self.assertEqual(f.read(), '{"carve_manifest": true}')
+
+    def test_output_cannot_overwrite_carved_input(self):
+        if not hasattr(os, "link"):
+            return
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_path = os.path.join(tmp, "00000001.bin")
+            with open(bin_path, "wb") as f:
+                f.write(header(0x100))
+            linked_json = os.path.join(tmp, "linked.json")
+            try:
+                os.link(bin_path, linked_json)
+            except OSError:
+                return
+            proc = subprocess.run([sys.executable, "-I", TOOL, tmp, linked_json, "--quiet"],
+                                  capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("output would overwrite an input file", proc.stderr)
 
 
 if __name__ == "__main__":
