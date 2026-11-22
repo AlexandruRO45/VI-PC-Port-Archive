@@ -12529,7 +12529,7 @@ class Gen:
             w_bias = 1 if extras in ("_b", "_c_b") else 0
             w_grad = 2 * grad_width if extras in (
                 "_d", "_d_cl", "_cd", "_cd_cl", "_c_d", "_c_d_cl", "_c_cd", "_c_cd_cl") else 0
-            whole = w_off + w_bias + (1 if extras.startswith("_c") else 0) + w_grad
+            whole = w_off + w_bias + (1 if (extras == "_c" or extras.startswith("_c_")) else 0) + w_grad
             unpacked = []
             for i, c in enumerate(coords):
                 if i < whole and not w_off <= i < w_off + w_bias:

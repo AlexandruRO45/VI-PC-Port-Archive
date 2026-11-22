@@ -108,6 +108,22 @@ class ImageSampleCdAndCompareGradTests(unittest.TestCase):
         unpacks_cd = re.findall(r"%\w+ = OpExtInst %v2float %glsl UnpackHalf2x16 %\w+", spv_cd)
         self.assertEqual(len(unpacks_cd), 1, spv_cd)
 
+        # image_sample_cd ... a16 (coarse derivatives, NO z-compare):
+        #   v10..v13=grads (4 words), v14=(u,v) f16 pair -> 5 address VGPRs, 1 UnpackHalf2x16
+        spv_coarse = translate_and_assemble([
+            f"image_sample_cd v[4:7], v[10:14], {DESC} dmask:0xf dim:SQ_RSRC_IMG_2D a16",
+        ])
+        self.assertEqual(len(re.findall(r"%\w+ = OpExtInst %v2float %glsl UnpackHalf2x16 %\w+", spv_coarse)), 1, spv_coarse)
+        self.assertRegex(spv_coarse, r"(?m)OpImageSampleExplicitLod %v4float %\w+ %\w+ Grad %\w+ %\w+$")
+
+        # image_sample_cd_cl ... a16:
+        #   v10..v13=grads (4 words), v14=(u,v) f16 pair, v15=minlod f16 pair -> 6 address VGPRs, 2 UnpackHalf2x16
+        spv_coarse_cl = translate_and_assemble([
+            f"image_sample_cd_cl v[4:7], v[10:15], {DESC} dmask:0xf dim:SQ_RSRC_IMG_2D a16",
+        ])
+        self.assertEqual(len(re.findall(r"%\w+ = OpExtInst %v2float %glsl UnpackHalf2x16 %\w+", spv_coarse_cl)), 2, spv_coarse_cl)
+        self.assertRegex(spv_coarse_cl, r"(?m)OpImageSampleExplicitLod %v4float %\w+ %\w+ Grad\|MinLod %\w+ %\w+ %\w+$")
+
     def test_d16_packing(self):
         # Depth-compare d16 packs 1 f16 result into low half (uses f16_bits bit math, not raw OpBitcast %uint)
         spv_c = translate_and_assemble([f"image_sample_c_d v4, v[10:16], {DESC} dmask:0x1 dim:SQ_RSRC_IMG_2D d16"])
