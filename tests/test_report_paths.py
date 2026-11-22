@@ -8,6 +8,7 @@ case-insensitive-volume branch is exercised with patches, so it runs on every pl
 import ast
 import os
 import pathlib
+import posixpath
 import sys
 import tempfile
 import unittest
@@ -88,9 +89,12 @@ class MacVolumeTests(unittest.TestCase):
     """The macOS branch: pathconf says whether the volume folds case. Patched, so it runs anywhere."""
 
     def darwin(self, case_sensitive_result):
+        # On POSIX (including macOS), os.path.normcase does not fold letter case, unlike Windows' ntpath.normcase.
+        # Patch normcase with posixpath.normcase so simulated Darwin behaves identically on Windows hosts.
         return mock.patch.multiple(
             report_paths, sys=mock.Mock(platform="darwin"),
-            os=mock.Mock(wraps=os, pathconf=mock.Mock(return_value=case_sensitive_result)))
+            os=mock.Mock(wraps=os, pathconf=mock.Mock(return_value=case_sensitive_result),
+                         path=mock.Mock(wraps=os.path, normcase=posixpath.normcase)))
 
     def test_not_macos_is_never_case_insensitive(self):
         with mock.patch.object(report_paths, "sys", mock.Mock(platform="linux")):
