@@ -1070,8 +1070,160 @@ class TestPermF16SIMDDivergence(unittest.TestCase):
             self.assertEqual(wave.get_lane_vgpr(0, lane), expected)
 
 
+# ==============================================================================
+# Unit Tests: Commit 5 (Register Aliasing & In-Place Operand Preservation)
+# ==============================================================================
+
+class TestPermF16RegisterAliasing(unittest.TestCase):
+    """Test suite for register aliasing hazards and in-place operand preservation."""
+
+    def setUp(self):
+        self.rf = ScalarRegisterFile()
+        self.interp = ScalarInterpreter(self.rf)
+
+    def test_dst_aliases_src0(self):
+        # D == src0: v0 = perm(v0, v1, sel)
+        # v0 = [0x1111, 0x2222], v1 = [0x3333, 0x4444]
+        # sel picks S1.lo (v1.lo = 0x3333) and S0.hi (v0.hi = 0x2222) -> [0x3333, 0x2222]
+        self.rf.set_vgpr(0, pack_halves(0x1111, 0x2222))
+        self.rf.set_vgpr(1, pack_halves(0x3333, 0x4444))
+        sel = make_selector(SEL_SRC1_LO, SEL_SRC0_HI)
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(1),
+            src2=ASTOperand.literal(sel),
+        )
+        self.interp.execute(instr)
+        self.assertEqual(self.rf.get_vgpr(0), pack_halves(0x3333, 0x2222))
+
+    def test_dst_aliases_src1(self):
+        # D == src1: v0 = perm(v1, v0, sel)
+        # v1 = [0xAAAA, 0xBBBB], v0 = [0xCCCC, 0xDDDD]
+        # sel picks S1.hi (v0.hi = 0xDDDD) and S0.lo (v1.lo = 0xAAAA) -> [0xDDDD, 0xAAAA]
+        self.rf.set_vgpr(1, pack_halves(0xAAAA, 0xBBBB))
+        self.rf.set_vgpr(0, pack_halves(0xCCCC, 0xDDDD))
+        sel = make_selector(SEL_SRC1_HI, SEL_SRC0_LO)
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(0),
+            src2=ASTOperand.literal(sel),
+        )
+        self.interp.execute(instr)
+        self.assertEqual(self.rf.get_vgpr(0), pack_halves(0xDDDD, 0xAAAA))
+
+    def test_dst_aliases_src2_selector(self):
+        # D == src2: selector is in v0 and destination is v0
+        # v1 = [0x1234, 0x5678], v2 = [0x9ABC, 0xDEF0]
+        # v0 contains selector: pick S1.lo (v2.lo = 0x9ABC) and S0.hi (v1.hi = 0x5678)
+        sel = make_selector(SEL_SRC1_LO, SEL_SRC0_HI)
+        self.rf.set_vgpr(1, pack_halves(0x1234, 0x5678))
+        self.rf.set_vgpr(2, pack_halves(0x9ABC, 0xDEF0))
+        self.rf.set_vgpr(0, sel)
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(0),
+        )
+        self.interp.execute(instr)
+        self.assertEqual(self.rf.get_vgpr(0), pack_halves(0x9ABC, 0x5678))
+
+    def test_dst_aliases_src0_and_src1(self):
+        # D == src0 == src1: in-place half-swap
+        # v0 = [POS_ONE, POS_TWO]
+        # selector swaps halves of S1 -> [POS_TWO, POS_ONE]
+        self.rf.set_vgpr(0, pack_halves(POS_ONE, POS_TWO))
+        sel = PermSelectorF16Word.swap_halves_src1().raw
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(0),
+            src2=ASTOperand.literal(sel),
+        )
+        self.interp.execute(instr)
+        self.assertEqual(self.rf.get_vgpr(0), pack_halves(POS_TWO, POS_ONE))
+
+    def test_dst_aliases_all_sources(self):
+        # D == src0 == src1 == src2: single register v0 for all operands
+        # To be valid, v0's bytes must decode into a valid selector.
+        # Let v0 = make_selector(SEL_SRC1_LO, SEL_SRC1_LO) = 0x0000 -> broadcast Half 0!
+        # Half 0 of 0x0000_0000 is 0x0000 (+0.0)
+        self.rf.set_vgpr(0, 0x0000_0000)
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(0),
+            src2=ASTOperand.vgpr(0),
+        )
+        self.interp.execute(instr)
+        self.assertEqual(self.rf.get_vgpr(0), 0x0000_0000)
+
+    def test_inplace_swizzle_half_words(self):
+        # Swapping high and low halves in-place within v3
+        self.rf.set_vgpr(3, pack_halves(0xCAFE, 0xBABE))
+        sel = PermSelectorF16Word.swap_halves_src0().raw
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_F16,
+            dst=ASTOperand.vgpr(3),
+            src0=ASTOperand.vgpr(3),
+            src1=ASTOperand.vgpr(3),
+            src2=ASTOperand.literal(sel),
+        )
+        self.interp.execute(instr)
+        self.assertEqual(self.rf.get_vgpr(3), pack_halves(0xBABE, 0xCAFE))
+
+    def test_inplace_broadcast_and_sign_ext(self):
+        # S0 = [0x7FFF, 0x8000] (bit 31 is 1, bit 15 is 0)
+        # S2 picks S0 bit 31 sign-ext and S0.lo broadcast
+        self.rf.set_vgpr(7, 0x8000_7FFF)
+        sel = make_selector(SEL_SIGN_EXT_SRC0_HI, SEL_SRC0_LO)
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_F16,
+            dst=ASTOperand.vgpr(7),
+            src0=ASTOperand.vgpr(7),
+            src1=ASTOperand.vgpr(7),
+            src2=ASTOperand.literal(sel),
+        )
+        self.interp.execute(instr)
+        # Low half gets sign-ext of bit 31 (0xFFFF), high half gets S0.lo (0x7FFF)
+        self.assertEqual(self.rf.get_vgpr(7), pack_halves(0xFFFF, 0x7FFF))
+
+    def test_simd_multi_lane_aliasing(self):
+        wave = SIMDWaveState(num_lanes=32)
+        # In-place half reverse on v0 across all 32 lanes
+        wave.set_wave_vgpr(0, [pack_halves(i, i * 10) for i in range(32)])
+        sel = PermSelectorF16Word.swap_halves_src1().raw
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(0),
+            src2=ASTOperand.literal(sel),
+        )
+        wave.execute_instruction(instr)
+
+        for lane in range(32):
+            self.assertEqual(wave.get_lane_vgpr(0, lane), pack_halves(lane * 10, lane))
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
