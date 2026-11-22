@@ -4414,6 +4414,37 @@ def check_controls(directory):
     translate_dual(drained)
     must_reject(translate_dual, [op.replace("vmcnt(63)", "vmcnt(64)") for op in drained])
 
+    # Composite waitcnt forms with multiple counters, single counters, or raw 0.
+    for legal_wait in (
+        "s_waitcnt vmcnt(7) lgkmcnt(0)",
+        "s_waitcnt vmcnt(7) lgkmcnt(63)",
+        "s_waitcnt lgkmcnt(0) vmcnt(0)",
+        "s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)",
+        "s_waitcnt 0",
+        "s_waitcnt 0x0",
+    ):
+        translate_dual(partial[:end_wait + 1] + [legal_wait] + partial[end_wait + 1:])
+    for illegal_wait in (
+        "s_waitcnt lgkmcnt(64)",
+        "s_waitcnt expcnt(8)",
+        "s_waitcnt vmcnt(0) vmcnt(1)",
+        "s_waitcnt lgkmcnt(0) lgkmcnt(1)",
+        "s_waitcnt expcnt(0) expcnt(1)",
+        "s_waitcnt invalid",
+    ):
+        must_reject(translate_dual, partial[:end_wait + 1] + [illegal_wait] + partial[end_wait + 1:])
+
+    # Verify that composite waitcnt with lgkmcnt(0) satisfies constant read requirements,
+    # while lgkmcnt(63) keeps pending scalar loads outstanding.
+    cbuf_program = with_constants(["v_mov_b32_e32 v8, s44"])
+    cbuf_wait = cbuf_program.index("s_waitcnt lgkmcnt(0)")
+    cbuf_composite_ok = cbuf_program.copy()
+    cbuf_composite_ok[cbuf_wait] = "s_waitcnt vmcnt(7) lgkmcnt(0)"
+    translate(cbuf_composite_ok)
+    cbuf_composite_pending = cbuf_program.copy()
+    cbuf_composite_pending[cbuf_wait] = "s_waitcnt vmcnt(7) lgkmcnt(63)"
+    must_reject(translate, cbuf_composite_pending)
+
     # LLVM 15 prints "exp mrt0 v16, ..."; newer LLVM prints "exp mrt0, v16, ...".
     for program in (assembly(False), assembly(True), curve(), shaping(), arithmetic(), three_way(), rounding()):
         modern = [line.replace("exp mrt0 ", "exp mrt0, ") for line in program]

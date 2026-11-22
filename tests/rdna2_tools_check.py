@@ -1687,7 +1687,12 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertFalse(is_instruction_supported("s_waitcnt_expcnt null, invalid"))
         self.assertFalse(is_instruction_supported("s_waitcnt expcnt(8)"))
         self.assertFalse(is_instruction_supported("s_waitcnt vmcnt(64)"))
-        self.assertFalse(is_instruction_supported("s_waitcnt vmcnt(7) lgkmcnt(0)"))
+        self.assertFalse(is_instruction_supported("s_waitcnt lgkmcnt(64)"))
+        self.assertTrue(is_instruction_supported("s_waitcnt vmcnt(7) lgkmcnt(0)"))
+        self.assertTrue(is_instruction_supported("s_waitcnt vmcnt(7) lgkmcnt(63)"))
+        self.assertTrue(is_instruction_supported("s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)"))
+        self.assertTrue(is_instruction_supported("s_waitcnt 0"))
+        self.assertTrue(is_instruction_supported("s_waitcnt 0x0"))
         self.assertFalse(is_instruction_supported("s_waitcnt foo"))
 
     def test_gfx1013_waitcnt_expcnt_decode_and_lower(self):

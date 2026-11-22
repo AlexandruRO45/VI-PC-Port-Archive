@@ -1457,18 +1457,47 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         if (half_rounding != HALF_ROUNDING["0"] and re.match(r"v_\w*_f(?:16|64)", line)
                 and not line.startswith(HALF_ROUNDING_EXEMPT)):
             raise ValueError(f"Unsupported binary16 or binary64 operation under round {half_rounding}: {line.split()[0]}")
-        if line == "s_waitcnt lgkmcnt(0)":
-            pending.clear()
-        elif m := match(r"s_waitcnt vmcnt\((\d+)\)"):
-            limit = int(m[1])
-            if limit > 63:
-                raise ValueError("VM wait count exceeds the gfx10 six-bit field")
-            # Only the newest limit samples can remain outstanding. Filtering
-            # the current set also preserves guarantees made by earlier waits.
-            sample_dest = {reg: issue for reg, issue in sample_dest.items() if issue > samples - limit}
-        elif match(r"s_waitcnt (?:vmcnt\(0\) lgkmcnt\(0\)|lgkmcnt\(0\) vmcnt\(0\))"):
-            pending.clear()
-            sample_dest.clear()
+        if m := match(r"s_waitcnt\s+(.*)"):
+            payload = m[1].strip()
+            if payload in ("0", "0x0"):
+                pending.clear()
+                sample_dest.clear()
+            else:
+                has_vm, has_lgkm, has_exp = False, False, False
+                for token in payload.split():
+                    if vm_match := re.fullmatch(r"vmcnt\((\d+)\)", token):
+                        if has_vm:
+                            raise ValueError(f"Duplicate vmcnt in waitcnt: {line}")
+                        has_vm = True
+                        limit = int(vm_match[1])
+                        if limit > 63:
+                            raise ValueError("VM wait count exceeds the gfx10 six-bit field")
+                        if limit == 0:
+                            sample_dest.clear()
+                        else:
+                            # Only the newest limit samples can remain outstanding. Filtering
+                            # the current set also preserves guarantees made by earlier waits.
+                            sample_dest = {reg: issue for reg, issue in sample_dest.items() if issue > samples - limit}
+                    elif lgkm_match := re.fullmatch(r"lgkmcnt\((\d+)\)", token):
+                        if has_lgkm:
+                            raise ValueError(f"Duplicate lgkmcnt in waitcnt: {line}")
+                        has_lgkm = True
+                        limit = int(lgkm_match[1])
+                        if limit > 63:
+                            raise ValueError("LGKM wait count exceeds the gfx10 six-bit field")
+                        if limit == 0:
+                            pending.clear()
+                    elif exp_match := re.fullmatch(r"expcnt\((\d+)\)", token):
+                        if has_exp:
+                            raise ValueError(f"Duplicate expcnt in waitcnt: {line}")
+                        has_exp = True
+                        limit = int(exp_match[1])
+                        if limit > 7:
+                            raise ValueError("Export wait count exceeds the gfx10 three-bit field")
+                    else:
+                        raise ValueError(f"Unsupported s_waitcnt token: {token}")
+                if not (has_vm or has_lgkm or has_exp):
+                    raise ValueError(f"Empty or unsupported s_waitcnt: {line}")
         elif m := match(r"s_mov_b64 s\[(\d+):(\d+)\], exec"):
             regs = registers(*m.groups(), 2)
             for n in regs:
