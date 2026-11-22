@@ -193,6 +193,7 @@ class Gen:
         self.round_mode = False     # the program writes MODE.FP_ROUND[3:2] (f16/f64 rounding): kept in %mode_r16
         self.uses_fhalf = False        # %fhalf_g (0.5) constant
         self.uses_f64 = False
+        self.uses_two_by_pi = False
         self.uses_fma_khr = False      # an OpFmaKHR was emitted: capability FMAKHR + extension SPV_KHR_fma
         self.uses_bvh = False
         self.lconsts = {}              # 64-bit constants: value -> id
@@ -3819,6 +3820,142 @@ class Gen:
         bits = struct.unpack("<I", struct.pack("<f", x))[0]
         return self.tof(self.cu(bits))
 
+    TWO_BY_PI = (0xa2f9836e, 0x4e441529, 0xfc2757d1, 0xf534ddc0, 0xdb629599, 0x3c439041, 0xfe5163ab, 0xdebbc561,
+                 0xb7246e3a, 0x424dd2e0, 0x06492eea, 0x09d1921c, 0xfe1deb1c, 0xb129a73e, 0xe88235f5, 0x2ebb4484,
+                 0xe99c7026, 0xb45f7e41, 0x3991d639, 0x835339f4, 0x9c845f8b, 0xbdf9283b, 0x1ff897ff, 0xde05980f,
+                 0xef2f118b, 0x5a0a6d1f, 0x6d367ecf, 0x27cb09b7, 0x4f463f66, 0x9e5fea2d, 0x7527bac7, 0xebe5f17b,
+                 0x3d0739f7, 0x8a5292ea, 0x6bfb5fb1, 0x1f8d5d08, 0x56033046)
+
+    def trig_preop(self, a, mods):
+        x, s1 = a[1], a[2]
+        if a[0]["k"] != "vgpr" or x["k"] not in ("vgpr", "sgpr") or x.get("n") != 2:
+            raise Unsupported("v_trig_preop_f64 operands")
+        self.uses_f64 = True
+        self.uses_two_by_pi = True
+        for w in self.TWO_BY_PI + (len(self.TWO_BY_PI),):
+            self.cu(w)
+        lo, hi = self.load_reg(x["k"], x["r"]), self.load_reg(x["k"], x["r"] + 1)
+        if x.get("abs"):
+            t = self.tmp()
+            self.emit(f"{t} = OpBitwiseAnd %uint {hi} {self.cu(0x7FFFFFFF)}")
+            hi = t
+        if x.get("neg"):
+            t = self.tmp()
+            self.emit(f"{t} = OpBitwiseXor %uint {hi} {self.cu(0x80000000)}")
+            hi = t
+        seg = self.src_u(s1)
+        e, sg, base, big, extra, add, shift, idx, valid, ic, b, bz, nb = (self.tmp() for _ in range(13))
+        self.emit(f"{e} = OpBitFieldUExtract %uint {hi} {self.cu(20)} {self.cu(11)}")
+        self.emit(f"{sg} = OpBitwiseAnd %uint {seg} {self.cu(31)}")
+        self.emit(f"{base} = OpIMul %uint {sg} {self.cu(53)}")
+        self.emit(f"{big} = OpUGreaterThan %bool {e} {self.cu(1077)}")
+        self.emit(f"{extra} = OpISub %uint {e} {self.cu(1077)}")
+        self.emit(f"{add} = OpSelect %uint {big} {extra} {self.cu(0)}")
+        self.emit(f"{shift} = OpIAdd %uint {base} {add}")
+        self.emit(f"{idx} = OpShiftRightLogical %uint {shift} {self.cu(5)}")
+        n = len(self.TWO_BY_PI)
+        self.emit(f"{valid} = OpULessThan %bool {idx} {self.cu(n - 2)}")
+        self.emit(f"{ic} = OpSelect %uint {valid} {idx} {self.cu(0)}")
+        self.emit(f"{b} = OpBitwiseAnd %uint {shift} {self.cu(31)}")
+        self.emit(f"{bz} = OpIEqual %bool {b} {self.cu(0)}")
+        self.emit(f"{nb} = OpISub %uint {self.cu(32)} {b}")
+        w = []
+        for k in range(3):
+            i, ptr, v = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{i} = OpIAdd %uint {ic} {self.cu(k)}")
+            self.emit(f"{ptr} = OpAccessChain %_ptr_Private_uint %two_by_pi {i}")
+            self.emit(f"{v} = OpLoad %uint {ptr}")
+            w.append(v)
+
+        def funnel(x_, y_):
+            l, r, o, sel = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{l} = OpShiftLeftLogical %uint {x_} {b}")
+            self.emit(f"{r} = OpShiftRightLogical %uint {y_} {nb}")
+            self.emit(f"{o} = OpBitwiseOr %uint {l} {r}")
+            self.emit(f"{sel} = OpSelect %uint {bz} {x_} {o}")
+            return sel
+        th, tl = funnel(w[0], w[1]), funnel(w[1], w[2])
+        h, l1, l2, lw, hd, ld, hs, m, t53, sc, sc2, huge, scale, n1, k1, k2, r1, r2 = (self.tmp() for _ in range(18))
+        self.emit(f"{h} = OpShiftRightLogical %uint {th} {self.cu(11)}")
+        self.emit(f"{l1} = OpShiftRightLogical %uint {tl} {self.cu(11)}")
+        self.emit(f"{l2} = OpShiftLeftLogical %uint {th} {self.cu(21)}")
+        self.emit(f"{lw} = OpBitwiseOr %uint {l1} {l2}")
+        self.emit(f"{hd} = OpConvertUToF %double {h}")
+        self.emit(f"{ld} = OpConvertUToF %double {lw}")
+        self.emit(f"{hs} = OpFMul %double {hd} {self.dconst(4294967296.0)}")
+        self.emit(f"{m} = OpFAdd %double {hs} {ld}")
+        self.emit(f"{t53} = OpExtInst %double %glsl Ldexp {m} {self.cu(0xFFFFFFCB)}")
+        self.emit(f"{huge} = OpUGreaterThanEqual %bool {e} {self.cu(1968)}")
+        self.emit(f"{sc} = OpISub %uint {self.cu(0)} {shift}")
+        self.emit(f"{sc2} = OpIAdd %uint {sc} {self.cu(128)}")
+        self.emit(f"{scale} = OpSelect %uint {huge} {sc2} {sc}")
+        self.emit(f"{n1} = OpSLessThan %bool {scale} {self.cu(0xFFFFFDA8)}")
+        self.emit(f"{k1} = OpSelect %uint {n1} {self.cu(0xFFFFFDA8)} {scale}")
+        self.emit(f"{k2} = OpISub %uint {scale} {k1}")
+        self.emit(f"{r1} = OpExtInst %double %glsl Ldexp {t53} {k1}")
+        self.emit(f"{r2} = OpExtInst %double %glsl Ldexp {r1} {k2}")
+        zd, isnan, q, qv, qd, r3, r4 = (self.tmp() for _ in range(7))
+        self.emit(f"{zd} = OpSelect %double {valid} {r2} {self.dconst(0.0)}")
+        xv, xd = self.tmp(), self.tmp()
+        self.emit(f"{xv} = OpCompositeConstruct %v2uint_d {lo} {hi}")
+        self.emit(f"{xd} = OpBitcast %double {xv}")
+        self.emit(f"{isnan} = OpIsNan %bool {xd}")
+        self.emit(f"{q} = OpBitwiseOr %uint {hi} {self.cu(0x00080000)}")
+        self.emit(f"{qv} = OpCompositeConstruct %v2uint_d {lo} {q}")
+        self.emit(f"{qd} = OpBitcast %double {qv}")
+        self.emit(f"{r3} = OpSelect %double {isnan} {qd} {zd}")
+        r4 = self.clamp_mods_f64(r3, mods)
+        v2, olo, ohi = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{v2} = OpBitcast %v2uint_d {r4}")
+        self.emit(f"{olo} = OpCompositeExtract %uint {v2} 0")
+        self.emit(f"{ohi} = OpCompositeExtract %uint {v2} 1")
+        self.dst({"k": "vgpr", "r": a[0]["r"], "n": 1}, olo)
+        self.dst({"k": "vgpr", "r": a[0]["r"] + 1, "n": 1}, ohi)
+
+    def dot2_f32_f16(self, op, a, mods, ins):
+        def bits(name, default):
+            m = next((m for m in mods if m.startswith(name + ":")), None)
+            return [int(v) for v in m.split("[")[1].rstrip("]").split(",")] if m else default
+        if ins["op"].endswith(("_dpp", "_sdwa")) or any(s.get("abs") for s in a[1:]):
+            raise Unsupported(op + " modifiers")
+        if op == "v_dot2c_f32_f16":
+            if mods or any(s.get("neg") for s in a[1:]):
+                raise Unsupported(op + " modifiers")
+            srcs, acc = a[1:3], a[0]
+            sel, selhi, nlo, nhi = [0, 0], [1, 1], [0, 0], [0, 0]
+        else:
+            other = [m for m in mods if m != "clamp" and not m.startswith(("op_sel:", "op_sel_hi:", "neg_lo:", "neg_hi:"))]
+            if other or any(s.get("neg") for s in a[1:]):
+                raise Unsupported(op + " modifiers")
+            srcs, acc = a[1:3], a[3]
+            sel, selhi = bits("op_sel", [0, 0, 0]), bits("op_sel_hi", [1, 1, 1])
+            nlo, nhi = bits("neg_lo", [0, 0, 0]), bits("neg_hi", [0, 0, 0])
+            if sel[2] or not selhi[2] or nhi[2]:
+                raise Unsupported(op + " modifiers")
+        halves = []
+        for i, sv in enumerate(srcs):
+            v2 = self.tmp()
+            self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {self.src_h(sv)}")
+            hs = []
+            for half, neg in ((sel[i], nlo[i]), (selhi[i], nhi[i])):
+                c = self.tmp()
+                self.emit(f"{c} = OpCompositeExtract %float {v2} {half}")
+                if neg:
+                    t = self.tmp()
+                    self.emit(f"{t} = OpFNegate %float {c}")
+                    c = t
+                hs.append(c)
+            halves.append(hs)
+        z = self.src_f(acc)
+        if op != "v_dot2c_f32_f16" and nlo[2]:
+            t = self.tmp()
+            self.emit(f"{t} = OpFNegate %float {z}")
+            z = t
+        r0, r1 = self.tmp(), self.tmp()
+        self.emit_fma(r0, halves[0][0], halves[1][0], z)
+        self.emit_fma(r1, halves[0][1], halves[1][1], r0)
+        self.dst(a[0], self.tou(self.clamp_mods(r1, mods)))
+
     def dconst(self, x):
         """A %double value (needs uses_f64): the two words of x, bitcast."""
         bits = struct.unpack("<Q", struct.pack("<d", x))[0]
@@ -4978,6 +5115,10 @@ class Gen:
                 r = self.tmp()
                 self.emit(f"{r} = OpFConvert %float {x}")
                 self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
+        elif op == "v_trig_preop_f64":
+            self.trig_preop(a, mods)
+        elif op in ("v_dot2_f32_f16", "v_dot2c_f32_f16"):
+            self.dot2_f32_f16(op, a, mods, ins)
         elif op in ("image_bvh_intersect_ray", "image_bvh64_intersect_ray"):
             self.image_bvh(op, a, mods)
         elif op == "s_bfm_b64":
@@ -9706,6 +9847,7 @@ def assemble(gen):
         ["%x_buf"] if gen.emulate or gen.bar_rounds else []) + (
         ([("%gs_in_pos" if sv == 1 else f"%gs_in{r}") for r, sv in gen.gs["in"]] +
          [("%gs_out_pos" if sv == 1 else f"%gs_out{r}") for r, sv in gen.gs["out"]]) if gsx else []) +         (["%fmt_uint_mask", "%fmt_sint_mask"] if gen.uses_store_views or gen.uses_int_fetch else []) + \
+        (["%two_by_pi"] if gen.uses_two_by_pi else []) + \
         [f"%stv{c}_{d}" for d in sorted(gen.uses_store_views) for c in range(3)] + \
         [f"%itx{c}_{d}" for d in sorted(gen.uses_int_fetch) for c in (1, 2)]
     psb = gen.uses_psb
@@ -9996,6 +10138,14 @@ def assemble(gen):
         types += ["%double = OpTypeFloat 64", "%v2uint_d = OpTypeVector %uint 2"]
     if gen.uses_ballot:
         types += ["%v4uint_bal = OpTypeVector %uint 4"]
+    if gen.uses_two_by_pi:
+        ids = " ".join(gen.cu(w) for w in Gen.TWO_BY_PI)
+        types += [f"%two_by_pi_arr = OpTypeArray %uint {gen.cu(len(Gen.TWO_BY_PI))}",
+                  "%_ptr_Private_two_by_pi = OpTypePointer Private %two_by_pi_arr",
+                  f"%two_by_pi_init = OpConstantComposite %two_by_pi_arr {ids}"]
+        if not (gen.uses_store_views or gen.uses_int_fetch):
+            types += ["%_ptr_Private_uint = OpTypePointer Private %uint"]
+        gvars += ["%two_by_pi = OpVariable %_ptr_Private_two_by_pi Private %two_by_pi_init"]
     if gen.uses_store_views or gen.uses_int_fetch:
         u, si = Gen.int_format_masks()
         types += ["%v4uint_st = OpTypeVector %uint 4", "%v4int_st = OpTypeVector %int 4",
@@ -10723,7 +10873,7 @@ def read_before_write_vgprs(insns):
                 regs += range(x["r"], x["r"] + x.get("n", 1))
             elif x["k"] == "vlist":
                 regs += x["r"]
-        if (base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8", "v_pk_fmac_f16") or
+        if (base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8", "v_dot2c_f32_f16", "v_pk_fmac_f16") or
                 (op.startswith("global_load_") and "_d16" in op)) and a[0]["k"] == "vgpr":   # d16 keeps a half
             regs.append(a[0]["r"])
         for r in regs:
@@ -10953,7 +11103,7 @@ def reg_reads_writes(insns):
                 regs += range(x["r"], x["r"] + x.get("n", 1))
             elif x["k"] == "vlist":
                 regs += x["r"]
-        if base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8", "v_pk_fmac_f16") and a[0]["k"] == "vgpr":
+        if base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8", "v_dot2c_f32_f16", "v_pk_fmac_f16") and a[0]["k"] == "vgpr":
             regs.append(a[0]["r"])
         rr.update(regs)
         if not reads_all and a[0]["k"] == "vgpr":
