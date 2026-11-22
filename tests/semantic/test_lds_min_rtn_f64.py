@@ -1067,5 +1067,136 @@ class TestSIMDInterpreter64(unittest.TestCase):
         self.assertEqual(conflicts[0], [0, 1])
 
 
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasing64(unittest.TestCase):
+    """Phase 5: Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory64(65536)
+        self.interp = ScalarDSInterpreter64()
+
+    def test_aliasing_vdst_overlaps_vaddr(self) -> None:
+        # vdst = v[0:1], vaddr = v0, vdata0 = v[2:3]
+        state = ScalarThreadState64(lds=self.lds)
+        state.set_vgpr32(0, 0x40)  # Address in v0
+        state.set_vgpr64(2, TWO_F64)
+        self.lds.write_qword(0x40, TEN_F64)
+
+        inst = DSMinRtnF64Instruction(
+            vdst=RegisterOperand(0, count=2),
+            vaddr=RegisterOperand(0, count=1),
+            vdata0=RegisterOperand(2, count=2),
+        )
+
+        old_val, new_mem = self.interp.execute(state, inst)
+
+        self.assertEqual(old_val, TEN_F64)
+        self.assertEqual(new_mem, TWO_F64)
+        # v[0:1] received TEN_F64
+        self.assertEqual(state.get_vgpr64(0), TEN_F64)
+        # v[2:3] remained preserved
+        self.assertEqual(state.get_vgpr64(2), TWO_F64)
+        # LDS memory updated
+        self.assertEqual(self.lds.read_qword(0x40), TWO_F64)
+
+    def test_aliasing_vdst_equals_vdata0(self) -> None:
+        # vdst = v[2:3], vaddr = v0, vdata0 = v[2:3]
+        state = ScalarThreadState64(lds=self.lds)
+        state.set_vgpr32(0, 0x60)
+        state.set_vgpr64(2, ONE_F64)
+        self.lds.write_qword(0x60, THREE_F64)
+
+        inst = DSMinRtnF64Instruction(
+            vdst=RegisterOperand(2, count=2),
+            vaddr=RegisterOperand(0, count=1),
+            vdata0=RegisterOperand(2, count=2),
+        )
+
+        old_val, new_mem = self.interp.execute(state, inst)
+
+        self.assertEqual(old_val, THREE_F64)
+        self.assertEqual(new_mem, ONE_F64)
+        # v[2:3] receives old_val (THREE_F64)
+        self.assertEqual(state.get_vgpr64(2), THREE_F64)
+        # v0 remains preserved
+        self.assertEqual(state.get_vgpr32(0), 0x60)
+        self.assertEqual(self.lds.read_qword(0x60), ONE_F64)
+
+    def test_aliasing_vdst_partially_overlaps_vdata0(self) -> None:
+        # vdst = v[2:3], vaddr = v0, vdata0 = v[3:4] (overlaps on v3)
+        state = ScalarThreadState64(lds=self.lds)
+        state.set_vgpr32(0, 0x80)
+        state.set_vgpr64(3, TWO_F64)
+        self.lds.write_qword(0x80, TEN_F64)
+
+        inst = DSMinRtnF64Instruction(
+            vdst=RegisterOperand(2, count=2),
+            vaddr=RegisterOperand(0, count=1),
+            vdata0=RegisterOperand(3, count=2),
+        )
+
+        old_val, new_mem = self.interp.execute(state, inst)
+
+        self.assertEqual(old_val, TEN_F64)
+        self.assertEqual(new_mem, TWO_F64)
+        # v[2:3] received TEN_F64
+        self.assertEqual(state.get_vgpr64(2), TEN_F64)
+        self.assertEqual(self.lds.read_qword(0x80), TWO_F64)
+
+    def test_operand_preservation_distinct_registers(self) -> None:
+        state = ScalarThreadState64(lds=self.lds)
+        state.set_vgpr64(0, 0xAAAAAAAAAAAAAAAA)
+        state.set_vgpr32(2, 0xA0)
+        state.set_vgpr64(4, NEG_TWO_F64)
+        self.lds.write_qword(0xA0, ONE_F64)
+
+        inst = DSMinRtnF64Instruction(
+            vdst=RegisterOperand(0, count=2),
+            vaddr=RegisterOperand(2, count=1),
+            vdata0=RegisterOperand(4, count=2),
+        )
+
+        self.interp.execute(state, inst)
+
+        self.assertEqual(state.get_vgpr64(0), ONE_F64)
+        # Input registers must remain unchanged
+        self.assertEqual(state.get_vgpr32(2), 0xA0)
+        self.assertEqual(state.get_vgpr64(4), NEG_TWO_F64)
+
+    def test_vgpr_isolation_no_spurious_clobber(self) -> None:
+        state = ScalarThreadState64(lds=self.lds)
+        for i in range(256):
+            state.set_vgpr32(i, 0x1000 + i)
+
+        addr = 0x20
+        self.lds.write_qword(addr, TWO_F64)
+        state.set_vgpr32(10, addr)
+        state.set_vgpr64(12, ONE_F64)
+
+        inst = DSMinRtnF64Instruction(
+            vdst=RegisterOperand(14, count=2),
+            vaddr=RegisterOperand(10, count=1),
+            vdata0=RegisterOperand(12, count=2),
+        )
+
+        self.interp.execute(state, inst)
+
+        self.assertEqual(state.get_vgpr64(14), TWO_F64)
+        for i in range(256):
+            if i in (14, 15):
+                continue
+            elif i == 10:
+                self.assertEqual(state.get_vgpr32(i), addr)
+            elif i == 12:
+                self.assertEqual(state.get_vgpr32(i), ONE_F64 & MASK32)
+            elif i == 13:
+                self.assertEqual(state.get_vgpr32(i), (ONE_F64 >> 32) & MASK32)
+            else:
+                self.assertEqual(state.get_vgpr32(i), 0x1000 + i)
+
+
 if __name__ == "__main__":
     unittest.main()
