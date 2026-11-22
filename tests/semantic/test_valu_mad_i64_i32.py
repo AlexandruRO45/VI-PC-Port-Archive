@@ -350,6 +350,77 @@ class RegisterFile:
 
 
 # ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarState:
+    """Scalar processor execution state."""
+    rf: RegisterFile = field(default_factory=RegisterFile)
+
+    def read_operand_32(self, op: Operand) -> int:
+        if op.reg_type == RegType.VGPR:
+            return self.rf.read_vgpr(op.index)
+        if op.reg_type == RegType.SGPR:
+            return self.rf.read_sgpr(op.index)
+        if op.reg_type in (RegType.LITERAL, RegType.INLINE_CONST):
+            assert op.literal_val is not None
+            return to_u32(op.literal_val)
+        raise ValueError(f"Unsupported operand type for 32-bit read: {op.reg_type}")
+
+    def read_operand_64(self, op: Operand) -> int:
+        if op.reg_type == RegType.VGPR:
+            return self.rf.read_vgpr_64(op.index)
+        if op.reg_type == RegType.SGPR:
+            return self.rf.read_sgpr_64(op.index)
+        if op.reg_type == RegType.LITERAL:
+            assert op.literal_val is not None
+            return to_u64(op.literal_val)
+        if op.reg_type == RegType.INLINE_CONST:
+            assert op.literal_val is not None
+            return to_u64(to_i32(op.literal_val))
+        raise ValueError(f"Unsupported operand type for 64-bit read: {op.reg_type}")
+
+    def write_operand_64(self, op: Operand, val: int) -> None:
+        if op.reg_type == RegType.VGPR:
+            self.rf.write_vgpr_64(op.index, val)
+        elif op.reg_type == RegType.SGPR:
+            self.rf.write_sgpr_64(op.index, val)
+        else:
+            raise TypeError(f"Cannot write 64-bit value to {op.reg_type}")
+
+    def write_operand_32(self, op: Operand, val: int) -> None:
+        if op.reg_type == RegType.VGPR:
+            self.rf.write_vgpr(op.index, val)
+        elif op.reg_type == RegType.SGPR:
+            self.rf.write_sgpr(op.index, val)
+        else:
+            raise TypeError(f"Cannot write 32-bit value to {op.reg_type}")
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for v_mad_i64_i32."""
+
+    def step(self, instr: VMadI64I32Instruction, state: ScalarState) -> tuple[int, int]:
+        s0 = state.read_operand_32(instr.src0)
+        s1 = state.read_operand_32(instr.src1)
+        s2 = state.read_operand_64(instr.src2)
+
+        dst_u64, carry = ref_mad_i64_i32(s0, s1, s2)
+
+        # Write 64-bit destination vector register pair
+        state.write_operand_64(instr.dst, dst_u64)
+
+        # Write scalar carry output to sdst
+        if instr.sdst.is_64bit:
+            state.write_operand_64(instr.sdst, carry)
+        else:
+            state.write_operand_32(instr.sdst, carry)
+
+        return dst_u64, carry
+
+
+# ==============================================================================
 # Unit Tests: Reference Mathematical Oracle & Architectural Model
 # ==============================================================================
 
@@ -567,6 +638,93 @@ class TestSymbolicAST(unittest.TestCase):
         self.assertEqual(instr_lit.dst.index, 10)
         self.assertEqual(instr_lit.src0.literal_val, 42)
         self.assertEqual(instr_lit.src1.literal_val, -5)
+
+
+# ==============================================================================
+# Unit Tests: Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class TestDeterministicScalarInterpreter(unittest.TestCase):
+    """Execution tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+        self.state = ScalarState()
+
+    def test_scalar_interpreter_basic_registers(self) -> None:
+        self.state.rf.write_vgpr(4, 100)
+        self.state.rf.write_sgpr(6, 200)
+        self.state.rf.write_vgpr_64(8, 50)
+
+        instr = VMadI64I32Instruction(
+            dst=Operand.vgpr(0, is_64bit=True),
+            sdst=Operand.sgpr(2, is_64bit=True),
+            src0=Operand.vgpr(4),
+            src1=Operand.sgpr(6),
+            src2=Operand.vgpr(8, is_64bit=True),
+        )
+
+        dst, carry = self.interp.step(instr, self.state)
+        self.assertEqual(dst, 20050)
+        self.assertEqual(carry, 0)
+        self.assertEqual(self.state.rf.read_vgpr_64(0), 20050)
+        self.assertEqual(self.state.rf.read_sgpr_64(2), 0)
+
+    def test_scalar_interpreter_signed_negatives_and_literals(self) -> None:
+        self.state.rf.write_vgpr(10, to_u32(-300))
+
+        instr = VMadI64I32Instruction(
+            dst=Operand.vgpr(20, is_64bit=True),
+            sdst=Operand.sgpr(10, is_64bit=False),
+            src0=Operand.vgpr(10),
+            src1=Operand.literal(400),
+            src2=Operand.literal(200000, is_64bit=True),
+        )
+
+        dst, carry = self.interp.step(instr, self.state)
+        self.assertEqual(dst, 80000)
+        self.assertEqual(carry, 1)
+        self.assertEqual(self.state.rf.read_vgpr_64(20), 80000)
+        self.assertEqual(self.state.rf.read_sgpr(10), 1)
+
+    def test_scalar_interpreter_carry_generation(self) -> None:
+        self.state.rf.write_vgpr(0, to_u32(-1))
+        self.state.rf.write_vgpr(1, 1)
+        self.state.rf.write_vgpr_64(2, 1)
+
+        instr = VMadI64I32Instruction(
+            dst=Operand.vgpr(4, is_64bit=True),
+            sdst=Operand.sgpr(0, is_64bit=True),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2, is_64bit=True),
+        )
+
+        dst, carry = self.interp.step(instr, self.state)
+        self.assertEqual(dst, 0)
+        self.assertEqual(carry, 1)
+        self.assertEqual(self.state.rf.read_vgpr_64(4), 0)
+        self.assertEqual(self.state.rf.read_sgpr_64(0), 1)
+
+    def test_scalar_interpreter_sequential_chaining(self) -> None:
+        self.state.rf.write_vgpr(2, 10)
+        self.state.rf.write_vgpr(3, 20)
+        self.state.rf.write_vgpr_64(0, 0)
+
+        instr1 = VMadI64I32Instruction(
+            dst=Operand.vgpr(0, is_64bit=True),
+            sdst=Operand.sgpr(2, is_64bit=True),
+            src0=Operand.vgpr(2),
+            src1=Operand.vgpr(3),
+            src2=Operand.vgpr(0, is_64bit=True),
+        )
+        self.interp.step(instr1, self.state)
+        self.assertEqual(self.state.rf.read_vgpr_64(0), 200)
+
+        self.state.rf.write_vgpr(2, 30)
+        self.state.rf.write_vgpr(3, 40)
+        self.interp.step(instr1, self.state)
+        self.assertEqual(self.state.rf.read_vgpr_64(0), 1400)
 
 
 if __name__ == "__main__":
