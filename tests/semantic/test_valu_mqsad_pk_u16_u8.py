@@ -39,7 +39,9 @@ Sliding Window Byte Layout in S0:
   Note: S0 byte 7 (bits [63:56]) is not consumed by the 4-window quad-SAD, but S0 is aligned to a 64-bit register pair.
 """
 
-from typing import Tuple
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import Tuple, Union
 import unittest
 
 MASK8: int = 0xFF
@@ -224,6 +226,149 @@ class TestValuMqsadPkU16U8ReferenceOracle(unittest.TestCase):
         self.assertEqual(w1, 1018)
         self.assertEqual(w2, 1020)
         self.assertEqual(w3, (0x8000 + 1020) & 0xFFFF)
+
+
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    LITERAL = auto()
+
+
+@dataclass(frozen=True)
+class Operand:
+    """Represents a register operand or inline literal constant."""
+    reg_type: RegType
+    index: int = 0
+    count: int = 1
+    literal_value: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.count <= 0:
+            raise ValueError(f"Operand register count must be >= 1, got {self.count}")
+        if self.reg_type == RegType.VGPR:
+            if not (0 <= self.index <= 255):
+                raise ValueError(f"VGPR index {self.index} out of range [0, 255]")
+            if self.index + self.count > 256:
+                raise ValueError(f"VGPR range [v{self.index}:v{self.index + self.count - 1}] exceeds 255")
+        elif self.reg_type == RegType.SGPR:
+            if not (0 <= self.index <= 105):
+                raise ValueError(f"SGPR index {self.index} out of range [0, 105]")
+            if self.index + self.count > 106:
+                raise ValueError(f"SGPR range [s{self.index}:s{self.index + self.count - 1}] exceeds 105")
+        elif self.reg_type == RegType.LITERAL:
+            if self.literal_value is None:
+                raise ValueError("Literal operand requires literal_value")
+            if not (0 <= self.literal_value <= MASK64):
+                raise ValueError(f"Literal value {self.literal_value:#x} out of range [0, 0xFFFFFFFFFFFFFFFF]")
+
+    @classmethod
+    def vgpr(cls, index: int, count: int = 1) -> Operand:
+        return cls(RegType.VGPR, index=index, count=count)
+
+    @classmethod
+    def sgpr(cls, index: int, count: int = 1) -> Operand:
+        return cls(RegType.SGPR, index=index, count=count)
+
+    @classmethod
+    def literal(cls, value: int) -> Operand:
+        return cls(RegType.LITERAL, literal_value=u64(value))
+
+    def disassemble(self) -> str:
+        if self.reg_type == RegType.VGPR:
+            if self.count == 1:
+                return f"v{self.index}"
+            return f"v[{self.index}:{self.index + self.count - 1}]"
+        if self.reg_type == RegType.SGPR:
+            if self.count == 1:
+                return f"s{self.index}"
+            return f"s[{self.index}:{self.index + self.count - 1}]"
+        assert self.literal_value is not None
+        if self.literal_value > MASK32:
+            return f"0x{self.literal_value:016X}"
+        return f"0x{self.literal_value:08X}"
+
+
+@dataclass(frozen=True)
+class VMqsadPkU16U8Instruction:
+    """Symbolic AST node for AMD RDNA2 v_mqsad_pk_u16_u8 instruction."""
+    dst: Operand
+    src0: Operand
+    src1: Operand
+    src2: Operand
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination must be a VGPR, got {self.dst.reg_type}")
+        if self.dst.count != 2:
+            raise ValueError(f"Destination must be a 64-bit VGPR pair (count=2), got {self.dst.count}")
+        if self.src0.count != 2:
+            raise ValueError(f"src0 must be a 64-bit operand (count=2), got {self.src0.count}")
+        if self.src1.count != 1:
+            raise ValueError(f"src1 must be a 32-bit operand (count=1), got {self.src1.count}")
+        if self.src2.count != 2:
+            raise ValueError(f"src2 must be a 64-bit operand (count=2), got {self.src2.count}")
+
+    def disassemble(self) -> str:
+        return (
+            f"v_mqsad_pk_u16_u8 {self.dst.disassemble()}, "
+            f"{self.src0.disassemble()}, {self.src1.disassemble()}, "
+            f"{self.src2.disassemble()}"
+        )
+
+
+class TestValuMqsadPkU16U8SymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_instruction_creation(self) -> None:
+        instr = VMqsadPkU16U8Instruction(
+            dst=Operand.vgpr(0, count=2),
+            src0=Operand.vgpr(2, count=2),
+            src1=Operand.sgpr(4, count=1),
+            src2=Operand.vgpr(6, count=2),
+        )
+        self.assertEqual(instr.dst.index, 0)
+        self.assertEqual(instr.dst.count, 2)
+        self.assertEqual(instr.src0.index, 2)
+        self.assertEqual(instr.src1.index, 4)
+        self.assertEqual(instr.src2.index, 6)
+        self.assertEqual(
+            instr.disassemble(),
+            "v_mqsad_pk_u16_u8 v[0:1], v[2:3], s4, v[6:7]",
+        )
+
+    def test_ast_disassembly_with_literal(self) -> None:
+        instr = VMqsadPkU16U8Instruction(
+            dst=Operand.vgpr(10, count=2),
+            src0=Operand.vgpr(12, count=2),
+            src1=Operand.literal(0x11223344),
+            src2=Operand.vgpr(14, count=2),
+        )
+        self.assertEqual(
+            instr.disassemble(),
+            "v_mqsad_pk_u16_u8 v[10:11], v[12:13], 0x11223344, v[14:15]",
+        )
+
+    def test_ast_immutability(self) -> None:
+        instr = VMqsadPkU16U8Instruction(
+            dst=Operand.vgpr(0, count=2),
+            src0=Operand.vgpr(2, count=2),
+            src1=Operand.vgpr(4, count=1),
+            src2=Operand.vgpr(6, count=2),
+        )
+        with self.assertRaises(Exception):
+            instr.dst = Operand.vgpr(8, count=2)  # type: ignore[misc]
+
+    def test_ast_operand_range_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            Operand.vgpr(255, count=2)  # 255 + 2 = 257 > 256
+        with self.assertRaises(ValueError):
+            Operand.sgpr(105, count=2)  # 105 + 2 = 107 > 106
+        with self.assertRaises(ValueError):
+            Operand.vgpr(-1)
 
 
 if __name__ == "__main__":
