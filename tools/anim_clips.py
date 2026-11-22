@@ -229,14 +229,31 @@ def hash_table(s, field, slot):
     return full
 
 
-def table_placed_by_key(s, field, slot):
-    """True when every full slot of the `hash_table` at `field` sits where its own first u32 h puts it: control
-    byte h & 0x7F, in group (h >> 7) & (groups - 1)."""
+def fmix64(k):
+    """MurmurHash3's 64-bit finaliser."""
+    k = (k ^ k >> 33) * 0xFF51AFD7ED558CCD & 0xFFFFFFFFFFFFFFFF
+    k = (k ^ k >> 33) * 0xC4CEB9FE1A85EC53 & 0xFFFFFFFFFFFFFFFF
+    return k ^ k >> 33
+
+
+def clip_slot_hash(s, o):
+    """The clip table's hash of a slot: `fmix64` of its first two u32 as one u64 (clip hash low, second word high)."""
+    return fmix64(s.u32(o) | s.u32(o + 4) << 32)
+
+
+def table_placed_by_key(s, field, slot, key=None):
+    """True when every full slot of the `hash_table` at `field` sits where its hash h puts it: control byte
+    h & 0x7F, in group (h >> 7) & (groups - 1) or, when that group is full, in a later one with every group
+    between full (linear probing, wrapping). h is `key(s, slot offset)`, by default the slot's first u32."""
     groups, p = s.u32(field), s.ptr(field + 8)
+    size = 16 + 16 * slot
+    full = lambda g: all(b < 0x80 for b in s.d[p + g * size:p + g * size + 16])  # noqa: E731
     for o in hash_table(s, field, slot):
-        g, i = divmod(o - p, 16 + 16 * slot)
-        h = s.u32(o)
-        if s.d[p + g * (16 + 16 * slot) + (i - 16) // slot] != h & 0x7F or g != (h >> 7) & (groups - 1):
+        g, i = divmod(o - p, size)
+        h = key(s, o) if key else s.u32(o)
+        home = (h >> 7) & (groups - 1)
+        if s.d[p + g * size + (i - 16) // slot] != h & 0x7F or not all(
+                full((home + d) % groups) for d in range((g - home) % groups)):
             return False
     return True
 
@@ -257,19 +274,20 @@ def parse_matcher(s, at):
             raise DecodeError("motionmatcher clip reference does not start with 8 zero bytes")
         refs.append((s.u32(refs_at + 16 * i + 8), s.u32(refs_at + 16 * i + 12)))
     return {
-        "records": records,                                              # {f32; f32; f32; u32 index; u64 0}
+        "records": records,                                              # {f32; f32; f32; u32 clip; u64 0}
         "offsets": [s.u32(off + 4 * i) for i in range(no)],              # +0x68: u32, one more than the records
-        "refs": refs,                                                    # +0x98: {u64 0; clip hash; dictionary hash}
-        "clips": [(s.u32(o), s.u32(o + 4), s.u32(o + 8)) for o in hash_table(s, at + 0xA0, 16)],  # (clip, ?, record)
+        "refs": refs,                                                    # +0x98: per clip {u64 0; clip; dictionary}
+        "clips": [(s.u32(o), s.u32(o + 4), s.u32(o + 8)) for o in hash_table(s, at + 0xA0, 16)],  # (clip, ?, index)
         "keys": [(s.u32(o), s.u32(o + 4)) for o in hash_table(s, at + 0x170, 8)],                 # (hash, index)
         "self": (s.u32(at + 0x188), s.u32(at + 0x18C)),                  # own clip hash, joaat32(dictionary)
-        "u16_78": [s.u16(a78 + 2 * i) for i in range(ng)],            # +0x78: from 0 up to the record count
-        "u8_b8": list(struct.unpack_from(f"<{nf}B", s.d, ab8)) if nf else [],  # +0xB8: 0 or 1, one per record
+        "u16_78": [s.u16(a78 + 2 * i) for i in range(ng)],            # +0x78: first record of each clip, then n
+        "u8_b8": list(struct.unpack_from(f"<{nf}B", s.d, ab8)) if nf else [],  # +0xB8: 0 or 1, one per clip
         "items_48": matcher_values(s, at + 0x48, "10I"),                 # 40-byte items
         "u32_118": matcher_values(s, at + 0x118, "I"),                   # the pose sample count
         "u16_128": matcher_values(s, at + 0x128, "H"),
         **matcher_features(s, at),                                       # first: it refuses a null +0x20
-        "tables_placed_by_key": (table_placed_by_key(s, at + 0xA0, 16), table_placed_by_key(s, at + 0x170, 8),
+        "tables_placed_by_key": (table_placed_by_key(s, at + 0xA0, 16, clip_slot_hash),
+                                 table_placed_by_key(s, at + 0x170, 8),
                                  table_placed_by_key(s, s.ptr(at + 0x20) + 0x48, 8)),  # clips, keys, feature names
     }
 
@@ -279,8 +297,9 @@ def matcher_features(s, at):
     0x30-byte features {u32 column at +0x08; u16 width at +0x0C; u16 at +0x0E; u32 name hash at +0x18; u32 kind
     bits at +0x1C}, and `+0x48` a hash table of (name hash, feature index) with 8-byte slots, hashed differently
     from `+0x18`. With `+0x0E` = 1 the name hash is joaat32 of a skeleton bone's name and the width is 3 columns
-    for kind bit 0, 3 for bit 1 and 6 for bit 3. `+0x28` is the skeleton (`matcher_skeleton`); with the `+0x30`
-    object, `+0x98` holds one u32 per sample."""
+    for kind bit 0, 3 for bit 1 and 6 for bit 3. `+0x28` is the skeleton (`matcher_skeleton`); `+0x98` holds one
+    u32 per sample, a bit mask over the matcher's key table indices; `+0xB8` one f32 weight per pose column, in
+    chunks of 8 (count at `+0xB4`), zero after the last column."""
     obj = s.ptr(at + 0x20)
     if obj is None:
         raise DecodeError("motionmatcher without a feature object")
@@ -299,39 +318,46 @@ def matcher_features(s, at):
     second = s.ptr(obj + 0x30) is not None
     columns = features[-1][0] + features[-1][1] if features else 0
     poses = matcher_poses(s, obj, columns, second)
-    sample_u32 = []
-    if second:                                                              # not read in the blocks layout
-        tags, nt = matcher_array(s, obj + 0x98)
-        if nt and tags + 4 * nt > len(s.d):
-            raise DecodeError("motionmatcher per-sample words run past the pages")
-        sample_u32 = list(struct.unpack_from(f"<{nt}I", s.d, tags)) if nt else []
+    tags, nt = matcher_array(s, obj + 0x98)
+    if nt and tags + 4 * nt > len(s.d):
+        raise DecodeError("motionmatcher per-sample words run past the pages")
+    sample_u32 = list(struct.unpack_from(f"<{nt}I", s.d, tags)) if nt else []
+    wp, nw = matcher_array(s, obj + 0xB8)
+    if nw and wp + 32 * nw > len(s.d):
+        raise DecodeError("motionmatcher column weights run past the pages")
+    weights = list(struct.unpack_from(f"<{8 * nw}f", s.d, wp)) if nw else []
     return {"features": features, "feature_names": names,                  # (column, width, name hash); (hash, index)
             "feature_kinds": kinds,                                         # (u16 +0x0E, u32 +0x1C) per feature
             "feature_second": second,                                       # +0x30 object present
             "feature_b": matcher_object_b(s, s.ptr(obj + 0x30)) if second else None,
-            "group_values": matcher_values(s, obj + 0xB8, "f"),           # +0xB8: one f32 per 8 columns
+            "column_weights": weights,                                      # +0xB8: chunks of 8 f32, one per column
             "c0": struct.unpack_from("<ffI", s.d, obj + 0xC0),               # f32; f32 1.0; u32 1 rows / 3 blocks
             "skeleton": matcher_skeleton(s, skel), "sample_u32": sample_u32, **poses}
 
 
 def matcher_object_b(s, at):
-    """The feature object's `+0x30` object (112 bytes), in two forms told apart by its u32 at `+0x08`. Form 2: a
-    feature kind at `+0x4C`, its width at `+0x68`, and two f32 weights at `+0x18`/`+0x1C`. Form 1: two arrays of
-    {u32 count; u32 capacity; pointer} at `+0x40` and `+0x50`, n f32 values and n f32 weights. -> dict"""
+    """The feature object's `+0x30` object (112 bytes): the weighted bones a pose's reference frame is built from,
+    in two forms told apart by its u32 at `+0x08`. Form 2: two bones (u32 joaat32 of their names at `+0x10` and
+    `+0x14`) with f32 weights at `+0x18`/`+0x1C`, a copy of a 0x30-byte feature at `+0x30` (its u16 `+0x0E`, name
+    hash `+0x18` and kind `+0x1C` at `+0x3E`, `+0x48` and `+0x4C`), its width at `+0x68` and a u16 flag at
+    `+0x6C`. Form 1: a unit quaternion at `+0x10`, two arrays of {u32 count; u32 capacity; pointer} at `+0x40`
+    and `+0x50` (n u32 bone name hashes, n f32 weights) and a u32 flag at `+0x60`. -> dict"""
     if at + 0x70 > len(s.d):
         raise DecodeError("motionmatcher +0x30 object runs past the pages")
     form = s.u32(at + 8)
     if form == 2:
-        return {"form": 2, "kind": s.u32(at + 0x4C), "width": s.u32(at + 0x68),
-                "weights": list(struct.unpack_from("<2f", s.d, at + 0x18))}
+        return {"form": 2, "bones": [s.u32(at + 0x10), s.u32(at + 0x14)],
+                "weights": list(struct.unpack_from("<2f", s.d, at + 0x18)),
+                "feature": (s.u16(at + 0x3E), s.u32(at + 0x48)), "kind": s.u32(at + 0x4C),
+                "width": s.u32(at + 0x68), "flag": s.u16(at + 0x6C)}
     if form != 1:
         return {"form": form}
-    out = {"form": 1}
-    for name, field in (("values", at + 0x40), ("weights", at + 0x50)):
+    out = {"form": 1, "rotation": struct.unpack_from("<4f", s.d, at + 0x10), "flag": s.u32(at + 0x60)}
+    for name, field, fmt in (("bones", at + 0x40, "I"), ("weights", at + 0x50, "f")):
         n, p = s.u32(field), s.ptr(field + 8)
         if n and (p is None or p + 4 * n > len(s.d)):
             raise DecodeError("motionmatcher +0x30 object array runs past the pages")
-        out[name] = list(struct.unpack_from(f"<{n}f", s.d, p)) if n else []
+        out[name] = list(struct.unpack_from(f"<{n}{fmt}", s.d, p)) if n else []
     return out
 
 
@@ -515,10 +541,11 @@ def count_matcher(c, dictionary_hash, stats):
     stats["matcher_clip_table_entries"] += len(m["clips"])
     stats["matcher_clip_table_indices_0_to_n"] += sorted(i for _c, _k, i in m["clips"]) == list(range(len(m["clips"])))
     stats["matcher_clip_table_one_per_record"] += sorted(i for _c, _k, i in m["clips"]) == list(range(n))
+    nc = len(m["clips"])
     stats["matcher_with_refs"] += bool(m["refs"])
     stats["matcher_refs"] += len(m["refs"])
     if m["refs"]:
-        stats["matcher_refs_one_per_record"] += len(m["refs"]) == n
+        stats["matcher_refs_one_per_clip"] += len(m["refs"]) == nc
         stats["matcher_refs_name_the_table_clip"] += all(
             i < len(m["refs"]) and m["refs"][i][0] == ch for ch, _k, i in m["clips"])
     stats["matcher_key_table_entries"] += len(m["keys"])
@@ -527,7 +554,10 @@ def count_matcher(c, dictionary_hash, stats):
     g = m["u16_78"]
     stats["matcher_u16_78_from_0_to_records"] += bool(g) and g[0] == 0 and g[-1] == n and all(
         a <= b for a, b in zip(g, g[1:]))
-    stats["matcher_u8_b8_one_per_record"] += len(m["u8_b8"]) == n
+    stats["matcher_u16_78_one_more_than_clips"] += len(g) == nc + 1
+    stats["matcher_record_clip_in_its_u16_78_range"] += len(g) == nc + 1 and all(
+        r[3] < nc and g[r[3]] <= i < g[r[3] + 1] for i, r in enumerate(m["records"]))
+    stats["matcher_u8_b8_one_per_clip"] += len(m["u8_b8"]) == nc
     stats["matcher_u8_b8_set"] += sum(m["u8_b8"])
     stats["matcher_u8_b8_0_or_1"] += bool(m["u8_b8"]) and all(f in (0, 1) for f in m["u8_b8"])
     f = m["features"]
@@ -544,8 +574,14 @@ def count_matcher(c, dictionary_hash, stats):
         0,) * 8 + (1, 0)
     stats["matcher_u32_118_is_the_sample_count"] += m["u32_118"] == [m["poses"]["samples"]]
     stats["matcher_u16_128_is_one_0"] += m["u16_128"] == [0]
-    stats["matcher_group_values_one_per_8_columns"] += len(m["group_values"]) == -(-m["poses"]["columns"] // 8)
+    cols, w = m["poses"]["columns"], m["column_weights"]
+    stats["matcher_column_weights_chunks_of_8"] += len(w) == 8 * -(-cols // 8)
+    stats["matcher_column_weights_positive_sum_1_then_0"] += len(w) >= cols and all(x > 0 for x in w[:cols]) and abs(
+        sum(w[:cols]) - 1) < 1e-4 and not any(w[cols:])
+    stats["matcher_column_weights_same_within_each_vec3"] += len(w) >= cols and all(
+        abs(w[i] - w[i + 1]) <= 1e-6 * w[i] and abs(w[i] - w[i + 2]) <= 1e-6 * w[i] for i in range(0, cols - 2, 3))
     stats["matcher_c8_1_with_rows_3_with_blocks"] += m["c0"][1:] == (1.0, 1 if m["poses"]["layout"] == "rows" else 3)
+    names = {anim_index.joaat32(x[0]) for x in m["skeleton"]["bones"]}
     b = m["feature_b"]
     if b is not None:
         stats[f"matcher_object_b_form_{b['form']}"] += 1
@@ -554,11 +590,21 @@ def count_matcher(c, dictionary_hash, stats):
             stats["matcher_object_b_form_2_width_from_kind_bits"] += b["width"] == 3 * (k & 1) + 3 * (
                 k >> 1 & 1) + 6 * (k >> 3 & 1)
             stats["matcher_object_b_form_2_kind_is_a_feature_kind"] += k in {kk for _e, kk in m["feature_kinds"]}
+            stats["matcher_object_b_form_2_copies_the_first_feature"] += bool(f) and b["feature"] == (
+                m["feature_kinds"][0][0], f[0][2]) and k == m["feature_kinds"][0][1]
+            stats["matcher_object_b_form_2_two_distinct_bones"] += len(set(b["bones"])) == 2 and set(
+                b["bones"]) <= names
+        if b["form"] == 1:
+            q = b["rotation"]
+            stats["matcher_object_b_form_1_rotation_unit"] += abs(sum(x * x for x in q) - 1) < 1e-4
+            stats["matcher_object_b_form_1_bones_one_per_weight"] += len(b["bones"]) == len(b["weights"])
+            stats["matcher_object_b_form_1_bones_name_skeleton_bones"] += bool(b["bones"]) and set(
+                b["bones"]) <= names
         if b["form"] in (1, 2):
-            w = b["weights"]
-            stats["matcher_object_b_weights_positive_sum_1"] += bool(w) and all(x > 0 for x in w) and abs(
-                sum(w) - 1) < 1e-4
-            stats["matcher_object_b_form_1_values_one_per_weight"] += b["form"] == 1 and len(b["values"]) == len(w)
+            wb = b["weights"]
+            stats["matcher_object_b_weights_positive_sum_1"] += bool(wb) and all(x > 0 for x in wb) and abs(
+                sum(wb) - 1) < 1e-4
+            stats[f"matcher_object_b_form_{b['form']}_flag_{b['flag']}"] += 1
     for name, placed in zip(("clip", "key", "feature_name"), m["tables_placed_by_key"]):
         stats[f"matcher_{name}_table_placed_by_key"] += placed
     sk = m["skeleton"]
@@ -576,17 +622,26 @@ def count_matcher(c, dictionary_hash, stats):
     local_ok, inverse_ok = skeleton_checks(sk)
     stats["matcher_skeleton_local_is_bone_transform"] += bool(bones) and local_ok
     stats["matcher_skeleton_inverse_bind_undoes_chain"] += bool(bones) and inverse_ok
-    names = {anim_index.joaat32(b[0]) for b in bones}
-    simple = [(w, k, h) for (_c, w, h), (e, k) in zip(f, m["feature_kinds"]) if e == 1]
+    simple = [(fw, k, h) for (_c, fw, h), (e, k) in zip(f, m["feature_kinds"]) if e == 1]
     stats["matcher_features_with_0e_1"] += len(simple)
     stats["matcher_features_0e_1_name_a_bone"] += sum(h in names for _w, _k, h in simple)
     stats["matcher_features_0e_1_width_from_kind_bits"] += sum(
-        w == 3 * (k & 1) + 3 * (k >> 1 & 1) + 6 * (k >> 3 & 1) for w, k, _h in simple)
+        fw == 3 * (k & 1) + 3 * (k >> 1 & 1) + 6 * (k >> 3 & 1) for fw, k, _h in simple)
+    for (_c, fw, h), (e, k) in zip(f, m["feature_kinds"]):
+        if e == 5:                                  # not a bone: +0x18 or +0x1C is 0 on all but one
+            stats["matcher_features_0e_5"] += 1
+            stats["matcher_features_0e_5_name_a_bone"] += h in names
+            stats["matcher_features_0e_5_with_1c_0" if k == 0 else "matcher_features_0e_5_with_18_0" if h == 0 else
+                  "matcher_features_0e_5_with_neither_0"] += 1
     u = m["sample_u32"]
     if u:
         stats["matcher_sample_u32_one_per_sample"] += len(u) == m["poses"]["samples"]
         stats["matcher_sample_u32_same_within_a_record"] += all(
             len(set(u[a:b])) <= 1 for a, b in zip(m["offsets"], m["offsets"][1:]))
+        used = 0
+        for x in u:
+            used |= x
+        stats["matcher_sample_u32_bits_are_key_indices"] += used == (1 << len(m["keys"])) - 1
     p = m["poses"]
     stats["matcher_pose_layout_rows" if p["layout"] == "rows" else "matcher_pose_layout_blocks_of_8"] += 1
     stats["matcher_pose_samples"] += p["samples"]

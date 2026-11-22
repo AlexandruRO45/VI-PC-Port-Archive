@@ -273,6 +273,9 @@ def skeleton(p):
     return a
 
 
+COLUMN_WEIGHTS = list(struct.unpack("<16f", struct.pack("<16f", *[0.2] * 3 + [0.4 / 6] * 6 + [0.0] * 7)))  # sum 1
+
+
 def features(p, rows=True):
     """A `.motionmatcher` feature object: a vec3 feature at column 0 and a two-vec3 one at column 3, a name table
     that maps another hash of each name to its index, and a 9-sample x 9-column pose matrix, row-major when the
@@ -282,18 +285,18 @@ def features(p, rows=True):
     p.ptr(obj + 0x28, skeleton(p))
     samples, cols = 9, 9
     if rows:
-        b = p.alloc(bytes(0x70))                      # form 2: one feature kind, its width, two weights
+        b = p.alloc(bytes(0x70))                      # form 2: two weighted bones, a copy of the first feature
         struct.pack_into("<I", p.b, b + 8, 2)
-        struct.pack_into("<ff", p.b, b + 0x18, 0.25, 0.75)
-        struct.pack_into("<I", p.b, b + 0x4C, 3)
-        struct.pack_into("<I", p.b, b + 0x68, 6)
+        struct.pack_into("<IIff", p.b, b + 0x10, joaat32("spine"), joaat32("head"), 0.25, 0.75)
+        struct.pack_into("<H", p.b, b + 0x3E, 1)
+        struct.pack_into("<II", p.b, b + 0x48, joaat32("spine"), 1)
+        struct.pack_into("<IH", p.b, b + 0x68, 3, 6)
         p.ptr(obj + 0x30, b)
         stride = 16
         h = [pose_value(r, c) if c < cols else 0.0 for r in range(samples) for c in range(stride)]
         struct.pack_into("<IIII", p.b, obj + 0xF8, samples, cols, 1, 1)
         transforms = b"".join(struct.pack("<12f", 0, 0, 0, 1, r, 0, 0, 0, 1, 1, 1, 0) for r in range(samples))
         matcher_array(p, obj + 0xA8, transforms, samples)
-        matcher_array(p, obj + 0x98, struct.pack("<9I", *([1] * 4 + [2] * 5)), samples)  # one per sample
     else:
         stride = cols + 1
         h = [0.0] * (2 * 8 * stride)
@@ -303,7 +306,8 @@ def features(p, rows=True):
         struct.pack_into("<II", p.b, obj + 0xF8, cols, cols)
         struct.pack_into("<I", p.b, obj + 0x128, samples)
     matcher_array(p, obj + 0xF0, struct.pack(f"<{len(h)}e", *h), len(h) // 16)
-    matcher_array(p, obj + 0xB8, struct.pack("<2f", 0.5, 2.0), 2)              # one per 8 columns
+    matcher_array(p, obj + 0x98, struct.pack("<9I", *([1] * 4 + [6] * 5)), samples)  # key bits, one per sample
+    matcher_array(p, obj + 0xB8, struct.pack("<16f", *COLUMN_WEIGHTS), 2)       # one per column, chunks of 8
     struct.pack_into("<ffI", p.b, obj + 0xC0, 25.0, 1.0, 1 if rows else 3)
     items = []
     for column, width, name, kind in ((0, 3, joaat32("spine"), 1), (3, 6, joaat32("head"), 3)):
@@ -333,7 +337,8 @@ def motion_matcher(p, name, refs=True, pose_rows=True):
     if refs:
         matcher_array(p, m + 0x98, b"".join(struct.pack("<QII", 0, ch, dh) for ch, dh in clips), 2)
     table(p, m + 0xA0, 1, 16, [(0, 3, struct.pack("<IIII", clips[0][0], 0x77, 0, 0)),
-                               (0, 9, struct.pack("<IIII", clips[1][0], 0x78, 1, 0))])
+                               (0, 9, struct.pack("<IIII", clips[1][0], 0x78, 1, 0))],
+          lambda data: anim_clips.fmix64(int.from_bytes(data[:8], "little")) & 0x7F)  # one group: control only
     table(p, m + 0x170, 2, 8, [(0, 0, struct.pack("<II", 0x5A, 2)), (1, 5, struct.pack("<II", 1, 0)),
                                (1, 6, struct.pack("<II", 0x5B, 1))])
     struct.pack_into("<II", p.b, m + 0x188, 3, joaat32(name))
@@ -509,12 +514,14 @@ class DecodeTest(unittest.TestCase):
         self.assertEqual(sk["name_tree"], [("head", 2), ("root", 0), ("spine", 1)])
         self.assertEqual(anim_clips.bone_id("a"), 0x41 + 0x170)                      # upper-cased: "A"
         self.assertEqual(anim_clips.bone_id("ABCDEFGHI"), 0xDC6D)            # ELF 0x0789EEA9: the top nibble folds
-        self.assertEqual(m["sample_u32"], [1] * 4 + [2] * 5)
+        self.assertEqual(m["sample_u32"], [1] * 4 + [6] * 5)
         self.assertEqual(m["feature_names"], [(0x21, 1), (0xA2, 0)])
-        self.assertEqual(m["tables_placed_by_key"], (False, False, True))
+        self.assertEqual(m["tables_placed_by_key"], (True, False, True))
         self.assertTrue(m["feature_second"])
-        self.assertEqual(m["feature_b"], {"form": 2, "kind": 3, "width": 6, "weights": [0.25, 0.75]})
-        self.assertEqual((m["group_values"], m["c0"]), ([0.5, 2.0], (25.0, 1.0, 1)))
+        self.assertEqual(m["feature_b"], {"form": 2, "bones": [joaat32("spine"), joaat32("head")],
+                                          "weights": [0.25, 0.75], "feature": (1, joaat32("spine")), "kind": 1,
+                                          "width": 3, "flag": 6})
+        self.assertEqual((m["column_weights"], m["c0"]), (COLUMN_WEIGHTS, (25.0, 1.0, 1)))
         self.assertEqual((m["items_48"], m["u32_118"], m["u16_128"]), ([(0,) * 8 + (1, 0)], [9], [0]))
         self.assertEqual((m["poses"]["layout"], m["poses"]["samples"], m["poses"]["columns"]), ("rows", 9, 9))
         for r in range(9):
@@ -527,9 +534,14 @@ class DecodeTest(unittest.TestCase):
         for k in ("matcher_record_index_is_position", "matcher_clip_table_indices_0_to_n",
                   "matcher_record_third_is_minus_one",
                   "matcher_offsets_one_more_than_records", "matcher_offsets_from_0_nondecreasing",
-                  "matcher_clip_table_one_per_record", "matcher_refs_one_per_record",
+                  "matcher_clip_table_one_per_record", "matcher_refs_one_per_clip",
                   "matcher_refs_name_the_table_clip", "matcher_key_table_indices_0_to_n", "matcher_self_is_own_key",
-                  "matcher_u16_78_from_0_to_records", "matcher_u8_b8_one_per_record", "matcher_u8_b8_0_or_1",
+                  "matcher_u16_78_from_0_to_records", "matcher_u16_78_one_more_than_clips",
+                  "matcher_record_clip_in_its_u16_78_range", "matcher_clip_table_placed_by_key",
+                  "matcher_sample_u32_bits_are_key_indices", "matcher_column_weights_chunks_of_8",
+                  "matcher_column_weights_positive_sum_1_then_0", "matcher_column_weights_same_within_each_vec3",
+                  "matcher_object_b_form_2_copies_the_first_feature", "matcher_object_b_form_2_two_distinct_bones",
+                  "matcher_object_b_form_2_flag_6", "matcher_u8_b8_one_per_clip", "matcher_u8_b8_0_or_1",
                   "matcher_u8_b8_set", "matcher_feature_columns_chain_from_0", "matcher_feature_widths_multiple_of_3",
                   "matcher_feature_names_distinct", "matcher_feature_name_table_indices_0_to_f",
                   "matcher_feature_object_second_pointer", "matcher_pose_layout_rows",
@@ -542,7 +554,7 @@ class DecodeTest(unittest.TestCase):
                   "matcher_skeleton_inverse_bind_undoes_chain", "matcher_sample_u32_one_per_sample",
                   "matcher_sample_u32_same_within_a_record", "matcher_feature_name_table_placed_by_key",
                   "matcher_item_48_one_zero_item_with_u32_1_at_0x20", "matcher_u32_118_is_the_sample_count",
-                  "matcher_u16_128_is_one_0", "matcher_group_values_one_per_8_columns",
+                  "matcher_u16_128_is_one_0",
                   "matcher_c8_1_with_rows_3_with_blocks", "matcher_object_b_form_2",
                   "matcher_object_b_form_2_width_from_kind_bits", "matcher_object_b_form_2_kind_is_a_feature_kind",
                   "matcher_object_b_weights_positive_sum_1"):
@@ -628,20 +640,29 @@ class DecodeTest(unittest.TestCase):
         at = [v for k, v in s.atmap(0x48) if k & 0xFFFFFFFF == 3][0]
         obj = s.ptr(at + 0x20)
         b = s.ptr(obj + 0x30)
-        values = s.ptr(at + 0x48)                     # 40 spare bytes: 2 values, then 2 weights
-        struct.pack_into("<2f2f", s.d, values, 3.0, 4.0, 0.5, 0.5)
+        values = s.ptr(at + 0x48)                     # 40 spare bytes: 2 bone hashes, then 2 weights
+        struct.pack_into("<2I2f", s.d, values, joaat32("root"), joaat32("head"), 0.5, 0.5)
         struct.pack_into("<I", s.d, b + 8, 1)
+        struct.pack_into("<4f", s.d, b + 0x10, 0.0, 0.0, 0.6, 0.8)                   # the reference rotation
+        struct.pack_into("<I", s.d, b + 0x60, 7)
         for field in (b + 0x40, b + 0x50):
             struct.pack_into("<II", s.d, field, 2, 2)
         struct.pack_into("<Q", s.d, b + 0x48, 0x50000000 + values)
         struct.pack_into("<Q", s.d, b + 0x58, 0x50000000 + values + 8)
         self.assertEqual(anim_clips.matcher_object_b(s, b),
-                         {"form": 1, "values": [3.0, 4.0], "weights": [0.5, 0.5]})
+                         {"form": 1, "rotation": (0.0, 0.0, struct.unpack("<f", struct.pack("<f", 0.6))[0],
+                                                  struct.unpack("<f", struct.pack("<f", 0.8))[0]), "flag": 7,
+                          "bones": [joaat32("root"), joaat32("head")], "weights": [0.5, 0.5]})
         stats = anim_clips.new_stats()
         anim_clips.count_matcher({"matcher": anim_clips.parse_matcher(s, at), "hash": 0}, 0, stats)
         for k in ("matcher_object_b_form_1", "matcher_object_b_weights_positive_sum_1",
-                  "matcher_object_b_form_1_values_one_per_weight"):
+                  "matcher_object_b_form_1_bones_one_per_weight", "matcher_object_b_form_1_bones_name_skeleton_bones",
+                  "matcher_object_b_form_1_rotation_unit", "matcher_object_b_form_1_flag_7"):
             self.assertEqual(stats[k], 1, k)
+        struct.pack_into("<I", s.d, values + 4, 0x1234)                              # not a skeleton bone
+        stats = anim_clips.new_stats()
+        anim_clips.count_matcher({"matcher": anim_clips.parse_matcher(s, at), "hash": 0}, 0, stats)
+        self.assertEqual(stats["matcher_object_b_form_1_bones_name_skeleton_bones"], 0)
         struct.pack_into("<I", s.d, b + 8, 7)                                         # another form: not read
         self.assertEqual(anim_clips.matcher_object_b(s, b), {"form": 7})
         struct.pack_into("<I", s.d, b + 8, 1)
@@ -682,6 +703,32 @@ class DecodeTest(unittest.TestCase):
             for f, fmt, v in kept:
                 struct.pack_into(fmt, s.d, f, v)
         anim_clips.parse_matcher(s, at)
+
+    def test_table_placement_with_linear_probing(self):
+        """An entry whose home group is full sits in the next one; with room at home, the same layout is not
+        placed by the key. The clip table is placed by `clip_slot_hash`, not by its first u32."""
+        s = anim_clips.System(bytearray(two_sequence_dictionary()))
+        at = [v for k, v in s.atmap(0x48) if k & 0xFFFFFFFF == 3][0]
+        size = 16 + 16 * 8
+
+        def build(home_full):
+            block = bytearray(bytes([0x80]) * 16 + bytes(16 * 8)) * 2
+            keys = list(range(16 if home_full else 15)) + [16]                   # all home 0; 16 lands in group 1
+            for n, h in enumerate(keys):
+                g, i = (0, n) if n < len(keys) - 1 else (1, 0)
+                block[g * size + i] = h & 0x7F
+                struct.pack_into("<II", block, g * size + 16 + 8 * i, h, n)
+            s.d += bytes((-len(s.d)) % 16)
+            struct.pack_into("<IIQ", s.d, at + 0x170, 2, len(keys), 0x50000000 + len(s.d))
+            s.d += block
+        build(True)
+        self.assertTrue(anim_clips.table_placed_by_key(s, at + 0x170, 8))
+        build(False)
+        self.assertFalse(anim_clips.table_placed_by_key(s, at + 0x170, 8))
+        self.assertTrue(anim_clips.table_placed_by_key(s, at + 0xA0, 16, anim_clips.clip_slot_hash))
+        self.assertFalse(anim_clips.table_placed_by_key(s, at + 0xA0, 16))
+        self.assertEqual(anim_clips.fmix64(0), 0)
+        self.assertEqual(anim_clips.fmix64(1), 0xB456BCFC34C2CB2C)                  # MurmurHash3 fmix64(1)
 
     def test_motionmatcher_without_refs_and_with_a_bad_table(self):
         d = anim_clips.parse_dictionary(anim_clips.System(two_sequence_dictionary(matcher_refs=False)))
