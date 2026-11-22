@@ -16,7 +16,7 @@ function load({ token = 'ghp_test', fetch = async () => { throw new Error('no ne
   const saved = new Map();
   const ctx = {
     console: { warn() {}, error() {}, log() {} },
-    REPO: 'owner/repo', BRANCH: 'main', CATS, PIPE_STAGES: [], STAGE_INDEX: {},
+    REPO: 'owner/repo', BRANCH: 'main', CATS, PIPE_STAGES: [], STAGE_INDEX: {}, $: () => null,
     rate: {}, blockedUntil: {}, apiCalls: 0, tokenRefused: false,
     activeToken: () => token,
     noteLimit() {},
@@ -146,7 +146,10 @@ test('the sweep pages through every open PR and reads a body only when its PR ch
   assert.equal(await t.loadGraph(Date.now()), 'done');
   assert.equal(calls.pages, 3);
   assert.equal(calls.bodies, 5, '230 bodies in batches of 50');
-  const items = ctx.applied[0];
+  assert.equal(ctx.applied.length, 2, 'the PR list is shown before the descriptions, then again with them');
+  assert.equal(ctx.applied[0].length, 230);
+  assert.deepEqual([...ctx.applied[0][3].lids], [], 'the first showing has no descriptions yet');
+  const items = ctx.applied[1];
   assert.equal(items.length, 230);
   const [one, two, three, four] = items;
   assert.equal(one.conflict, true);
@@ -155,7 +158,8 @@ test('the sweep pages through every open PR and reads a body only when its PR ch
   assert.equal(two.ci, '');
   assert.equal(two.filesCut, true);
   assert.equal(three.user, 'ghost');
-  assert.equal(three.ciPending, true);
+  assert.equal(three.ci, 'pending', 'pending stays out of "CI running": it is mostly a run waiting for approval');
+  assert.equal('ciPending' in three, false);
   assert.equal(four.ci, 'ok');
   assert.deepEqual([...four.lids], ['TEST-4']);
   assert.deepEqual([...four.deps], [1004]);
@@ -173,8 +177,20 @@ test('the sweep pages through every open PR and reads a body only when its PR ch
   calls.bodyPrs.length = 0;
   assert.equal(await t.loadGraph(Date.now()), 'done');
   assert.deepEqual(calls.bodyPrs, [10]);
-  assert.deepEqual([...ctx.applied[1][9].lids], ['BUILD-1']);
+  assert.deepEqual([...ctx.applied[ctx.applied.length - 1][9].lids], ['BUILD-1']);
   assert.equal(t.bodies[230], undefined);
+});
+
+test('the PR list is shown even when its descriptions fail to load', async () => {
+  const nodes = [node(1), node(2)];
+  const working = fakeGraphql(nodes, { pages: 0, bodies: 0, bodyPrs: [] });
+  const ctx = load({ fetch: async (url, init) => (JSON.parse(init.body).query.includes('pullRequests(')
+    ? working(url, init) : { ok: false, status: 502, headers: { get: () => null }, json: async () => ({}) }) });
+  assert.equal(await ctx.t.loadGraph(Date.now()), 'done');
+  assert.equal(ctx.applied.length, 1);
+  assert.equal(ctx.applied[0].length, 2);
+  assert.ok(ctx.t.graphCovers());
+  assert.equal(ctx.t.graph.busy, null, 'no progress left on screen');
 });
 
 test('a failed sweep hands back to the search path and waits before trying again', async () => {

@@ -22,6 +22,7 @@ const GRAPH_MAX_PAGES = 30;               // up to 3,000 open PRs
 const GRAPH_FILES = 100;                  // files per PR; a PR with more can't be placed in a round
 const BODY_BATCH = 50;                    // bodies per GraphQL call
 const BODY_MAX_BATCHES = 25;              // per sweep: the first one fetches every body (about 21 calls)
+const BODY_PARALLEL = 4;                  // body calls in flight at once
 const GRAPH_KEY = 'graph:v1';
 const BODIES_KEY = 'graph:bodies:v1';
 const BODY_LEAD_LINES = 3;
@@ -33,7 +34,7 @@ const ITEM_RE = /\b([A-Z][A-Z0-9]{1,7})-(\d{1,5})\b/g;
 const DEPENDS_RE = /depends on:?([^\n]*)/gi;
 const STAGE_RANK = { ready: 0, green: 1, running: 2, waiting: 3, failing: 4, rebase: 5, draft: 6 };
 
-const graph = { at: 0, failAt: 0, ok: false, pages: 0, bodyCalls: 0 };
+const graph = { at: 0, failAt: 0, ok: false, pages: 0, bodyCalls: 0, busy: null };   // busy: { what, done, total } while sweeping
 let bodies = {};                          // n → { u: updatedAt, lids, deps }
 let triageHtml = '';
 
@@ -196,26 +197,49 @@ function pickGraphPr(node) {
     n: node.number, title: node.title, user: node.author ? node.author.login : 'ghost', avatar: node.author ? node.author.avatarUrl : '',
     url: node.url, created: node.createdAt, updated: node.updatedAt, draft: !!node.isDraft, comments: node.comments ? node.comments.totalCount : 0,
     conflict: node.mergeable === 'CONFLICTING' ? true : node.mergeable === 'MERGEABLE' ? false : null,
-    ci, ciPending: ci === 'pending', files, filesCut: node.changedFiles > files.length,
+    ci, files, filesCut: node.changedFiles > files.length,
     tids: refIds(node.title), lids: b ? b.lids : [], deps: b ? b.deps : [],
   };
 }
 
-/** Bodies of PRs that changed since their body was read; the rest keep what was read before. */
+/** Show how far a sweep is: the status bar and the triage cards. */
+function graphProgress(what, done, total) {
+  graph.busy = what ? { what, done, total } : null;
+  // Only the first sweep says "loading": later ones run behind the data already shown.
+  if (typeof setPart === 'function' && what && !graph.ok) setPart('pipeline', { state: 'loading' });
+  if (typeof renderParts === 'function') renderParts();
+  renderTriage();
+}
+
+/** Bodies of PRs that changed since their body was read, BODY_PARALLEL calls at a time. Returns how many were read. */
 async function loadBodies(nodes) {
   const due = nodes.filter(n => !bodies[n.number] || bodies[n.number].u !== n.updatedAt).map(n => n.number);
-  for (let i = 0, calls = 0; i < due.length && calls < BODY_MAX_BATCHES; i += BODY_BATCH, calls++) {
-    const batch = due.slice(i, i + BODY_BATCH);
-    const fields = batch.map(n => `p${n}: pullRequest(number:${n}){ number updatedAt body }`).join(' ');
-    const data = await graphql(`query($owner:String!,$name:String!){ repository(owner:$owner,name:$name){ ${fields} } }`, { owner: GQL_OWNER, name: GQL_NAME });
-    graph.bodyCalls++;
-    for (const pr of Object.values(data.repository || {})) {
-      if (pr && pr.number) bodies[pr.number] = { u: pr.updatedAt, ...bodyRefs(pr.body) };
+  const batches = [];
+  for (let i = 0; i < due.length && batches.length < BODY_MAX_BATCHES; i += BODY_BATCH) batches.push(due.slice(i, i + BODY_BATCH));
+  let next = 0;
+  let read = 0;
+  const worker = async () => {
+    while (next < batches.length) {
+      const batch = batches[next++];
+      const fields = batch.map(n => `p${n}: pullRequest(number:${n}){ number updatedAt body }`).join(' ');
+      const data = await graphql(`query($owner:String!,$name:String!){ repository(owner:$owner,name:$name){ ${fields} } }`, { owner: GQL_OWNER, name: GQL_NAME });
+      graph.bodyCalls++;
+      for (const pr of Object.values(data.repository || {})) {
+        if (pr && pr.number) { bodies[pr.number] = { u: pr.updatedAt, ...bodyRefs(pr.body) }; read++; }
+      }
+      graphProgress('descriptions', graph.bodyCalls - startCalls, batches.length);
     }
+  };
+  const startCalls = graph.bodyCalls;
+  if (batches.length) graphProgress('descriptions', 0, batches.length);
+  try {
+    await Promise.all(Array.from({ length: Math.min(BODY_PARALLEL, batches.length) }, worker));
+  } finally {
+    const open = new Set(nodes.map(n => String(n.number)));
+    bodies = Object.fromEntries(Object.entries(bodies).filter(([n]) => open.has(n)));
+    store.set(BODIES_KEY, bodies);
   }
-  const open = new Set(nodes.map(n => String(n.number)));
-  bodies = Object.fromEntries(Object.entries(bodies).filter(([n]) => open.has(n)));
-  store.set(BODIES_KEY, bodies);
+  return read;
 }
 
 const graphDue = now => !!activeToken() && now - graph.at >= GRAPH_MS && now - graph.failAt >= GRAPH_RETRY_MS;
@@ -237,18 +261,27 @@ async function loadGraph(now) {
       graph.pages = page + 1;
       if (!prs.pageInfo.hasNextPage) break;
       cursor = prs.pageInfo.endCursor;
+      graphProgress('open PRs', page + 1, Math.ceil(prs.totalCount / GRAPH_PAGE));
     }
-    await loadBodies(nodes);
   } catch (e) {
     console.error('[dashboard] GraphQL sweep failed; the search path takes over for now', e);
     graph.failAt = Date.now();
     graph.ok = false;
+    graphProgress(null);
     return 'error';
   }
+  // The PR list is complete: show it now; descriptions (item IDs, dependencies) follow and refine it.
   graph.at = Date.now();
   graph.ok = true;
   store.set(GRAPH_KEY, { at: graph.at });
   applyGraph(nodes.map(pickGraphPr));
+  try {
+    if (await loadBodies(nodes)) applyGraph(nodes.map(pickGraphPr));
+  } catch (e) {
+    console.error('[dashboard] GraphQL descriptions failed; item IDs from titles only until the next sweep', e);
+  } finally {
+    graphProgress(null);
+  }
   return 'done';
 }
 
@@ -293,8 +326,10 @@ function hotCard(m) {
 }
 
 function tokenCard(title) {
+  const busy = graph.busy;
   const text = activeToken()
-    ? (graph.failAt && Date.now() - graph.failAt < GRAPH_RETRY_MS
+    ? busy ? `Loading every open PR with its files through GraphQL: ${busy.what}, ${busy.done} of ${busy.total} calls done…`
+    : (graph.failAt && Date.now() - graph.failAt < GRAPH_RETRY_MS
       ? 'The last GraphQL sweep failed (see the browser console); it is tried again within a few minutes.'
       : 'Waiting for the first GraphQL sweep with your token: every open PR with its changed files, about a dozen calls.')
     : "Needs every open PR's changed files: about a dozen GraphQL calls, which GitHub only answers with a token. A read-only token for public repositories is enough; it stays in this browser.";
@@ -318,7 +353,7 @@ function renderTriage() {
     ['wait', m ? m.maxShare : null, m && m.hot.length ? `PRs change ${m.hot[0].path.split('/').pop()}` : 'PRs on the hottest file'],
   ].map(([cls, n, label]) => `<div class="stat ${cls}"><b>${fmt(n)}</b><span>${esc(label)}</span></div>`).join('');
   const html = `<div class="tiles">${tiles}</div>
-    <div class="queue-grid">${roundCard(m)}${duplicatesCard(d)}${hotCard(m)}</div>
+    <div class="queue-grid"><div class="tcol">${roundCard(m)}${hotCard(m)}</div>${duplicatesCard(d)}</div>
     <p class="footnote">${m ? `From your token's sweep ${esc(ago(graph.at))}; it runs every ${Math.round(GRAPH_MS / 60000)} minutes while this tab is in use.` : 'Duplicates come from the same load as the pipeline. The merge round and the hot files need a token.'}</p>`;
   if (html === triageHtml) return;   // nothing changed: leave the DOM alone
   triageHtml = html;

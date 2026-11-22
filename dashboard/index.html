@@ -372,7 +372,8 @@ body.card-mode .card-url { display: block; }
 .chain { font: 500 13px var(--mono); margin: 4px 0; }
 
 /* ---------- triage (triage.js) ---------- */
-#triageBody .queue-grid > .card { contain: content; }
+#triageBody .card { contain: content; }
+.tcol { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
 .sdot { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 7px; vertical-align: 0; }
 .tag { font: 700 10.5px var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--research); border: 1px solid currentColor; border-radius: 6px; padding: 0 5px; margin-left: 4px; }
 .dup { padding: 8px 0; border-top: 1px solid var(--line); }

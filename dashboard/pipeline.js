@@ -90,6 +90,7 @@ function stageOf(pr, ok, bad, rebase) {
 
 /** Calls a load still needs, for the progress line: null when nothing is due. */
 function pipelineNeeds() {
+  if (graph.busy) return { done: graph.busy.done, total: graph.busy.total, full: true };
   const job = pipe.job;
   if (!job) return null;
   const pages = job.full ? (job.total === null ? 5 : Math.min(PIPE_MAX_PAGES, Math.ceil(job.total / PIPE_PAGE))) : 0;
@@ -159,7 +160,7 @@ function coordSets() {
 
 function withCoord(item, review) {
   const r = review[item.n] || {};
-  return { ...item, checked: r.checked || 0, ciRunning: !!r.ciRunning || !!item.ciPending, group: r.group || '', item: r.item || '' };
+  return { ...item, checked: r.checked || 0, ciRunning: !!r.ciRunning, group: r.group || '', item: r.item || '' };
 }
 
 /** A token's GraphQL sweep (triage.js): every open PR with its CI result and merge state, in place of the searches. */
