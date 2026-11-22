@@ -1249,24 +1249,25 @@ def test_fma_mix_f16_rte_edge_cases_and_half_preservation(
 
 
 @pytest.mark.parametrize("suffix,fmt_code,expected_word", [
-    ("xy", 29, 0x3C023C00),  # format 29 = (4, "f16", (16, 16)): lo=0x3c00, hi=0x3c02
+    ("xy", 29, 0x3C013C00),  # format 29 = (4, "f16", (16, 16)): lo=0x3c00, hi=0x3c01
     ("x", 13, 0x00003C00),   # format 13 = (2, "f16", (16,)): lo=0x3c00
 ])
-def test_encode_format_f16_uses_f16_bits_rte(suffix, fmt_code, expected_word, make_shader):
-    """buffer_store_format_{x,xy} with f16 V# formats uses f16_bits RTE (no PackHalf2x16),
-    validates with spirv-val, and stores exact tie-to-even f16 bits."""
+def test_encode_format_f16_uses_f16_bits_rtz(suffix, fmt_code, expected_word, make_shader):
+    """buffer_store_format_{x,xy} with f16 V# formats narrow toward zero with integer ops (no PackHalf2x16),
+    validate with spirv-val, and store the measured bits (SHADER-395): 0x3f801000 is a tie both rules give
+    0x3c00, 0x3f803000 wrote 0x3c01 on gfx1036 where nearest even gives 0x3c02."""
     si = _load_mini_interp()
     base = 0x1000
     vdata = "v2" if suffix == "x" else "v[2:3]"
     ps = (
-        "; buffer_store_format_f16_rte\n"
+        "; buffer_store_format_f16_rtz\n"
         f"s_mov_b32 s0, {base:#x}\n"
         "s_mov_b32 s1, 0\n"
         "s_mov_b32 s2, 0x100\n"
         f"s_mov_b32 s3, {fmt_code << 12 | 0x30000000:#x}\n"
         "v_mov_b32 v1, 0\n"
-        "v_mov_b32 v2, 0x3f801000\n"  # 1.0 + 2^-11 -> 0x3c00 (tie to even)
-        "v_mov_b32 v3, 0x3f803000\n"  # 1.0 + 3*2^-11 -> 0x3c02 (tie to even)
+        "v_mov_b32 v2, 0x3f801000\n"  # 1.0 + 2^-11 -> 0x3c00 (a tie; toward zero and even agree)
+        "v_mov_b32 v3, 0x3f803000\n"  # 1.0 + 3*2^-11 -> 0x3c01 (toward zero, measured on gfx1036)
         f"buffer_store_format_{suffix} {vdata}, v1, s[0:3], 0 offen\n"
         "s_waitcnt vmcnt(0)\n"
         "exp mrt0 v2, v3, v2, v3 done vm\n"

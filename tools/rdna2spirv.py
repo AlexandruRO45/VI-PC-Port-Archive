@@ -1301,7 +1301,10 @@ class Gen:
         bit = 0
         for c, w in enumerate(widths):
             if kind == "f16":
-                field = self.f16_bits(self.tof(fcomps[c]))
+                # Typed buffer stores narrow toward zero (measured: the exact f16 tie 0x3f803000 wrote 0x3c01 on
+                # gfx1036, and gfx1150 saturates out-of-range values at 65504; SHADER-395). The d16 memory results
+                # the loads produce keep nearest even.
+                field = self.f16_bits(self.tof(fcomps[c]), rtz=True)
             elif kind == "unorm":
                 cl, sc, rd, u = self.tmp(), self.tmp(), self.tmp(), self.tmp()
                 self.emit(f"{cl} = OpExtInst %float %glsl FClamp {self.tof(fcomps[c])} %f0 %f1")
