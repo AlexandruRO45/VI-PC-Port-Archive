@@ -307,6 +307,88 @@ class ScalarInterpreter:
 
 
 
+# ==============================================================================
+# SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# ==============================================================================
+
+class SIMDState:
+    def __init__(
+        self,
+        num_lanes: int = 64,
+        exec_mask: Optional[int] = None,
+        lds_size_dwords: int = LDS_SIZE_DWORDS,
+    ) -> None:
+        if num_lanes not in (32, 64):
+            raise ValueError(f"num_lanes must be 32 or 64, got {num_lanes}")
+        self.num_lanes = num_lanes
+        self.exec_mask = ((1 << num_lanes) - 1) if exec_mask is None else (exec_mask & ((1 << num_lanes) - 1))
+        self.vgprs: list[list[int]] = [[0] * DEFAULT_NUM_VGPRS for _ in range(num_lanes)]
+        self.sgprs: list[int] = [0] * DEFAULT_NUM_SGPRS
+        self.lds: LDSMemory = LDSMemory(size_dwords=lds_size_dwords)
+
+    def is_lane_active(self, lane: int) -> bool:
+        return bool(self.exec_mask & (1 << lane))
+
+    def get_lane_vgpr(self, lane: int, index: int) -> int:
+        return self.vgprs[lane][index]
+
+    def set_lane_vgpr(self, lane: int, index: int, val: int) -> None:
+        self.vgprs[lane][index] = u32(val)
+
+    def get_lane_u64_vgpr(self, lane: int, base_index: int) -> int:
+        return combine_u32s_to_u64(self.get_lane_vgpr(lane, base_index), self.get_lane_vgpr(lane, base_index + 1))
+
+    def set_lane_u64_vgpr(self, lane: int, base_index: int, val64: int) -> None:
+        lo, hi = split_u64_to_u32s(val64)
+        self.set_lane_vgpr(lane, base_index, lo)
+        self.set_lane_vgpr(lane, base_index + 1, hi)
+
+    def resolve_lane_operand64(self, op: Operand64, lane: int) -> int:
+        if isinstance(op, ImmediateF64):
+            return op.val
+        if op.reg_type == RegType.SGPR:
+            return combine_u32s_to_u64(self.sgprs[op.index], self.sgprs[op.index + 1])
+        return self.get_lane_u64_vgpr(lane, op.index)
+
+
+class SIMDInterpreter:
+    def execute(
+        self,
+        instr: DSCmpstF64Instruction,
+        state: SIMDState,
+    ) -> List[Optional[int]]:
+        results: List[Optional[int]] = [None] * state.num_lanes
+
+        lane_inputs = [None] * state.num_lanes
+        for lane in range(state.num_lanes):
+            if not state.is_lane_active(lane):
+                continue
+            vaddr = state.get_lane_vgpr(lane, instr.vaddr.index)
+            cmp_val = state.resolve_lane_operand64(instr.vdata0, lane)
+            new_val = state.resolve_lane_operand64(instr.vdata1, lane)
+            eff_addr = calc_lds_effective_address(vaddr, instr.offset)
+            lane_inputs[lane] = (eff_addr, cmp_val, new_val)
+
+        for lane in range(state.num_lanes):
+            entry = lane_inputs[lane]
+            if entry is None:
+                continue
+            eff_addr, cmp_val, new_val = entry
+            curr_val = state.lds.read_qword(eff_addr)
+            old_val, updated_mem, swapped = ref_ds_cmpst_f64(curr_val, cmp_val, new_val)
+            if swapped:
+                state.lds.write_qword(eff_addr, updated_mem)
+            results[lane] = old_val
+
+        if instr.vdst is not None:
+            for lane in range(state.num_lanes):
+                if results[lane] is not None:
+                    state.set_lane_u64_vgpr(lane, instr.vdst.index, results[lane])
+
+        return results
+
+
+
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Phase 1: Unit tests for reference mathematical oracle and architectural model."""
 
@@ -441,6 +523,64 @@ class TestScalarInterpreter(unittest.TestCase):
         self.assertEqual(old_val, val)
         self.assertEqual(self.state.get_u64_vgpr(0), val)
         self.assertEqual(self.state.lds.read_qword(addr), new_val)
+
+
+
+class TestSIMDMultiLaneDivergence(unittest.TestCase):
+    """Phase 4: Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_independent_addresses(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFFFFFF, lds_size_dwords=1024)
+        interp = SIMDInterpreter()
+
+        for lane in range(32):
+            addr = lane * 8
+            val = f64_to_bits(10.0 + lane)
+            state.lds.write_qword(addr, val)
+            state.set_lane_vgpr(lane, 2, addr)
+            cmp_val = val if (lane % 2 == 0) else f64_to_bits(999.0)
+            state.set_lane_u64_vgpr(lane, 4, cmp_val)
+            state.set_lane_u64_vgpr(lane, 6, f64_to_bits(500.0 + lane))
+            state.set_lane_u64_vgpr(lane, 0, 0xDEAD)
+
+        instr = DSCmpstF64Instruction(
+            vdst=RegPair(0),
+            vaddr=RegSingle(2),
+            vdata0=RegPair(4),
+            vdata1=RegPair(6),
+        )
+
+        results = interp.execute(instr, state)
+
+        for lane in range(32):
+            val = f64_to_bits(10.0 + lane)
+            self.assertEqual(results[lane], val)
+            self.assertEqual(state.get_lane_u64_vgpr(lane, 0), val)
+            if lane % 2 == 0:
+                self.assertEqual(state.lds.read_qword(lane * 8), f64_to_bits(500.0 + lane))
+            else:
+                self.assertEqual(state.lds.read_qword(lane * 8), val)
+
+    def test_multi_lane_chained_float_cas(self) -> None:
+        common_addr = 0x80
+        state = SIMDState(num_lanes=32, exec_mask=0x7, lds_size_dwords=1024)
+        interp = SIMDInterpreter()
+
+        state.lds.write_qword(common_addr, f64_to_bits(1.0))
+        chain = [(1.0, 2.0), (2.0, 3.0), (3.0, 4.0)]
+        for lane, (cmp_f, new_f) in enumerate(chain):
+            state.set_lane_vgpr(lane, 1, common_addr)
+            state.set_lane_u64_vgpr(lane, 2, f64_to_bits(cmp_f))
+            state.set_lane_u64_vgpr(lane, 4, f64_to_bits(new_f))
+
+        instr = DSCmpstF64Instruction(
+            vaddr=RegSingle(1),
+            vdata0=RegPair(2),
+            vdata1=RegPair(4),
+        )
+
+        interp.execute(instr, state)
+        self.assertEqual(state.lds.read_qword(common_addr), f64_to_bits(4.0))
 
 
 
