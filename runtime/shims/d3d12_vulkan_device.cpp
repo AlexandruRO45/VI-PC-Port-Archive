@@ -403,6 +403,7 @@ struct DeviceState {
         create.pQueueFamilyIndices = families.data();
     }
     std::unique_ptr<leonida::VulkanContext> context;
+    bool unrestricted_copy_footprints = false;
     VkPhysicalDeviceMemoryProperties memory{};
     // D3D-96: upload-heap buffers prefer DEVICE_LOCAL | HOST_VISIBLE memory, so the GPU reads them from VRAM. Only
     // with Resizable BAR (leonida::resizable_bar); LEONIDA_UPLOAD_SYSMEM=1 keeps them in system memory to compare.
@@ -4118,10 +4119,11 @@ public:
             }
         }
         if (info.host_image_copy) load_host_image_copy(get_device);
-        // Depth <-> colour copies are staged through scratch buffers (vulkan_scratch.h), on every GPU.
-        state_.context->enable_copy_scratch(get_device, [this](const VkMemoryRequirements& requirements) {
-            return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        });
+        // Stage depth/colour and compact footprint copies that Vulkan cannot express directly.
+        state_.unrestricted_copy_footprints =
+            state_.context->enable_copy_scratch(get_device, [this](const VkMemoryRequirements& requirements) {
+                return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            });
         // The copies of a D24 texture stored as D32 convert on the GPU (vulkan_depth24.h), and so do the copies of
         // a 96-bit texture, which every GPU stores as RGBA32 (D3D-62): the converter is there whether or not the
         // GPU has a native D24_UNORM_S8_UINT. It costs nothing until a copy needs it (its pipeline is made on the
@@ -4626,7 +4628,8 @@ public:
                                                 ID3D12PipelineState* state, REFIID riid, void** out) override {
         constexpr auto method = "ID3D12Device::CreateCommandList";
         // The initial pipeline state is set as SetPipelineState would set it (a bundle's is its first deferred call).
-        HRESULT hr = create_command_list(type, allocator, riid, out, identity(), state);
+        HRESULT hr = create_command_list(type, allocator, riid, out, identity(), state,
+                                         state_.unrestricted_copy_footprints);
         return d3d12_trace::result(method, hr);
     }
 
@@ -4640,7 +4643,8 @@ public:
         HRESULT hr = create_command_allocator(type, IID_PPV_ARGS(&allocator), identity());
         if (FAILED(hr)) return d3d12_trace::result(method, hr);
         ID3D12GraphicsCommandList* list = nullptr;
-        hr = create_command_list(type, allocator, IID_PPV_ARGS(&list), identity());
+        hr = create_command_list(type, allocator, IID_PPV_ARGS(&list), identity(), nullptr,
+                                 state_.unrestricted_copy_footprints);
         allocator->Release();
         if (FAILED(hr)) return d3d12_trace::result(method, hr);
         list->Close();
@@ -6200,7 +6204,7 @@ public:
             if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS13)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS13*>(data);
             *opts = {};
-            opts->UnrestrictedBufferTextureCopyPitchSupported = FALSE;
+            opts->UnrestrictedBufferTextureCopyPitchSupported = state_.unrestricted_copy_footprints;
             opts->UnrestrictedVertexElementAlignmentSupported = FALSE;
             opts->InvertedViewportHeightFlipsYSupported = FALSE;
             opts->InvertedViewportDepthFlipsZSupported = FALSE;
@@ -7239,6 +7243,35 @@ VkAccelerationStructureKHR vulkan_acceleration_structure(ID3D12Device* device, D
     if (auto* d = Device::from<Device>(real ? real : device))
         return d->context().resolve_acceleration_structure(va);
     return VK_NULL_HANDLE;
+}
+
+bool unrestricted_copy_footprint_valid(const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& placed) {
+    const auto& footprint = placed.Footprint;
+    if (placed.Offset % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT == 0 &&
+        footprint.RowPitch % D3D12_TEXTURE_DATA_PITCH_ALIGNMENT == 0)
+        return true;  // Includes the word-aligned legacy footprint of a 96-bit texture.
+
+    DXGI_FORMAT format = footprint.Format;
+    VkImageAspectFlags aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+    switch (format) {
+    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS: format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT; break;
+    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS: format = DXGI_FORMAT_D24_UNORM_S8_UINT; break;
+    case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+        format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+        aspect = VK_IMAGE_ASPECT_STENCIL_BIT;
+        break;
+    case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+        format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        aspect = VK_IMAGE_ASPECT_STENCIL_BIT;
+        break;
+    default: break;
+    }
+    const Format storage = texture_storage_format(format, false);
+    if (storage.aspects & VK_IMAGE_ASPECT_COLOR_BIT) aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    const leonida::BlockFormat block = footprint_block(storage, aspect);
+    if (!block.bytes || placed.Offset % block.bytes || footprint.RowPitch % block.bytes) return false;
+    const auto columns = (UINT64(footprint.Width) + block.block - 1) / block.block;
+    return columns * block.bytes <= footprint.RowPitch;
 }
 
 bool color_resolve_format_is_integer(DXGI_FORMAT format) {

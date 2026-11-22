@@ -1993,6 +1993,14 @@ The trace will enumerate them.
   row pitch and height; `CopyResource` → a whole-subresource copy; colour resolves → `vkCmdResolveImage`;
   depth and stencil resolves → a `vkCmdBeginRendering` scope with a resolve attachment (section 3.2).
   Partial resolve regions to another offset need a shader or a region copy.
+  `OPTIONS13.UnrestrictedBufferTextureCopyPitchSupported` allows a buffer footprint's offset and pitch to be
+  multiples of one texel or BC block and still requires the pitch to contain a full row. This follows
+  [D3D12's unrestricted copy rules](https://microsoft.github.io/DirectX-Specs/d3d/VulkanOn12.html#unrestricted-buffer-texture-copy-row-pitch-and-offset).
+  `GetCopyableFootprints` still returns the standard padded layout. Replay uses a direct Vulkan copy where
+  possible and otherwise packs or unpacks only the copied rows through aligned transfer scratch, preserving
+  bytes outside the copy. The existing compute conversion for RGB96 and emulated D24 still needs a queue
+  that can dispatch. `d3d12_unrestricted_footprint_test` compares synthetic uploads and readbacks with native
+  D3D12, and `replay_copy_offset_test` checks the transfer scratch regions without a GPU.
 - `WriteBufferImmediate` (D3D-26) → `vkCmdUpdateBuffer` of 4 bytes. The address is resolved when the list is
   executed, through `ReplayFunctions::buffer_at`: the buffer whose `ResourceBinding::va` range holds it, at
   `buffer_offset + (address - va)`. `VulkanContext` finds it by binary search over the buffers' VA ranges

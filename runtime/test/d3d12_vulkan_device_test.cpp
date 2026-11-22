@@ -2322,7 +2322,7 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
         o9.WaveMMATier != D3D12_WAVE_MMA_TIER_NOT_SUPPORTED)
         fail("OPTIONS9 unexpected support");
     if (o11.AtomicInt64OnDescriptorHeapResourceSupported) fail("OPTIONS11 unexpected support");
-    if (o13.UnrestrictedBufferTextureCopyPitchSupported || o13.UnrestrictedVertexElementAlignmentSupported ||
+    if (!o13.UnrestrictedBufferTextureCopyPitchSupported || o13.UnrestrictedVertexElementAlignmentSupported ||
         o13.InvertedViewportHeightFlipsYSupported || o13.InvertedViewportDepthFlipsZSupported ||
         o13.TextureCopyBetweenDimensionsSupported || o13.AlphaBlendFactorSupported)
         fail("OPTIONS13 unexpected support");
@@ -2553,9 +2553,7 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
                  });
     compare_host("OPTIONS13", D3D12_FEATURE_D3D12_OPTIONS13, o13,
                  [&](const char* n, const auto& a, const auto& b) {
-                     check_bool(n, "UnrestrictedBufferTextureCopyPitchSupported",
-                                a.UnrestrictedBufferTextureCopyPitchSupported,
-                                b.UnrestrictedBufferTextureCopyPitchSupported);
+                     // The layer implements compact footprints even on hosts whose native driver lacks OPTIONS13.
                      check_bool(n, "UnrestrictedVertexElementAlignmentSupported",
                                 a.UnrestrictedVertexElementAlignmentSupported,
                                 b.UnrestrictedVertexElementAlignmentSupported);

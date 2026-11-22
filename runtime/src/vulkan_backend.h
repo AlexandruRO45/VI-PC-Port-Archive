@@ -1186,12 +1186,12 @@ public:
         };
     }
 
-    // Copies the replay stages through a buffer (depth <-> colour, vulkan_replay.h) take device-local scratch from
-    // `allocate`. Without this such a copy is refused as unsupported.
-    void enable_copy_scratch(PFN_vkGetDeviceProcAddr get, ScratchBuffers::Allocate allocate) {
+    // Copies the replay stages through a buffer take device-local scratch from `allocate`.
+    bool enable_copy_scratch(PFN_vkGetDeviceProcAddr get, ScratchBuffers::Allocate allocate) {
         std::unique_lock lock(resource_mutex_);
         scratch_ = std::make_unique<ScratchBuffers>(get, device_, std::move(allocate));
         if (!scratch_->loaded()) scratch_.reset();
+        return scratch_ != nullptr;
     }
 
     // Called after that command buffer's submit: true when it was accepted, false when vkQueueSubmit failed. The

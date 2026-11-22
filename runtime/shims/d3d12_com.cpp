@@ -164,7 +164,8 @@ class GraphicsCommandList final
 public:
     // {2f8a7c33-91d4-4b6e-8e05-6d3f1a9b2c47}
     static constexpr GUID kTag{0x2f8a7c33, 0x91d4, 0x4b6e, {0x8e, 0x05, 0x6d, 0x3f, 0x1a, 0x9b, 0x2c, 0x47}};
-    explicit GraphicsCommandList(D3D12_COMMAND_LIST_TYPE type) : type_(type) {}
+    GraphicsCommandList(D3D12_COMMAND_LIST_TYPE type, bool unrestricted_copy_footprints)
+        : type_(type), unrestricted_copy_footprints_(unrestricted_copy_footprints) {}
     ~GraphicsCommandList() override {
         stop_recording();
         release_held();
@@ -497,7 +498,15 @@ public:
         d3d12_trace::record("ID3D12GraphicsCommandList::CopyTextureRegion");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!dst || !src) return check(false);
-        leonida::CopyTexture copy{location(*dst), x, y, z, location(*src), box != nullptr, {}};
+        if (unrestricted_copy_footprints_) {
+            const auto valid_footprint = [](const D3D12_TEXTURE_COPY_LOCATION& location) {
+                return location.Type != D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT ||
+                       unrestricted_copy_footprint_valid(location.PlacedFootprint);
+            };
+            if (!valid_footprint(*dst) || !valid_footprint(*src)) return check(false);
+        }
+        leonida::CopyTexture copy{location(*dst), x, y, z, location(*src), box != nullptr, {},
+                                  unrestricted_copy_footprints_};
         if (box) copy.box = {box->left, box->top, box->front, box->right, box->bottom, box->back};
         check(list_.copy_texture(copy));
     }
@@ -973,6 +982,7 @@ private:
     }
 
     D3D12_COMMAND_LIST_TYPE type_;
+    bool unrestricted_copy_footprints_;
     CommandAllocator* allocator_ = nullptr;  // referenced while the list is open
     leonida::CommandList list_;
     bool invalid_ = false;
@@ -1550,7 +1560,8 @@ HRESULT create_command_allocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void
 }
 
 HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator, REFIID riid,
-                            void** out, IUnknown* device, ID3D12PipelineState* initial_state) {
+                            void** out, IUnknown* device, ID3D12PipelineState* initial_state,
+                            bool unrestricted_copy_footprints) {
     if (!out) return E_POINTER;
     *out = nullptr;
     CommandAllocator* command_allocator = CommandAllocator::from(allocator);
@@ -1560,7 +1571,7 @@ HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator
     if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_BUNDLE &&
         type != D3D12_COMMAND_LIST_TYPE_COMPUTE && type != D3D12_COMMAND_LIST_TYPE_COPY)
         stub("create_command_list(non-direct type)");
-    auto* object = new GraphicsCommandList(type);  // created open, as D3D12 does
+    auto* object = new GraphicsCommandList(type, unrestricted_copy_footprints);  // created open, as D3D12 does
     object->record_into(command_allocator);
     object->attach_device(device);
     const HRESULT hr = hand_out(object, riid, out);  // releases the creation reference, so a failure frees the list

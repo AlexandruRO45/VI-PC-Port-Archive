@@ -51,7 +51,8 @@ HRESULT create_command_queue(leonida::VulkanContext& context, VkQueue queue, std
                              std::shared_ptr<void> queue_lease = {});
 HRESULT create_command_allocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out, IUnknown* device = nullptr);
 HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator, REFIID riid,
-                            void** out, IUnknown* device = nullptr, ID3D12PipelineState* initial_state = nullptr);
+                            void** out, IUnknown* device = nullptr, ID3D12PipelineState* initial_state = nullptr,
+                            bool unrestricted_copy_footprints = false);
 HRESULT create_fence(leonida::VulkanContext& context, UINT64 initial_value, D3D12_FENCE_FLAGS flags, REFIID riid,
                      void** out, IUnknown* device = nullptr);
 HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride, REFIID riid, void** out,
@@ -201,6 +202,9 @@ VkAccelerationStructureKHR vulkan_acceleration_structure(ID3D12Device* device, D
 
 // The property flags of the Vulkan memory type behind a resource created by such a device, or 0. For tests.
 VkMemoryPropertyFlags vulkan_memory_flags(ID3D12Resource* resource);
+
+// The original D3D12 alignment, or the OPTIONS13 format-unit alignment for a compact footprint.
+bool unrestricted_copy_footprint_valid(const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint);
 
 // Whether the requested colour format has an integer numeric class.
 bool color_resolve_format_is_integer(DXGI_FORMAT format);

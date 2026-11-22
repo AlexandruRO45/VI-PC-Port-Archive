@@ -310,6 +310,59 @@ int main() {
         dst_buf = saved_dst;
     }
 
+    // 6. A copy queue needs a four-byte Vulkan offset even for byte-sized texels.
+    {
+        const auto saved_image = rgba_img;
+        rgba_img.format = VK_FORMAT_R8_UNORM;
+        const CopyLocation texture{3, false, 0, 0, 0, 0, 0, 0};
+        const CopyLocation src{1, true, 0, 3, 5, 3, 1, 7};
+        const CopyLocation dst{2, true, 0, 5, 5, 3, 1, 9};
+        constexpr VkDeviceSize scratch_offset = 768;
+        VkDeviceSize scratch_bytes = 0;
+        vk.copy_scratch = [&](VkDeviceSize bytes, VkBuffer& scratch, VkDeviceSize& offset) {
+            scratch_bytes = bytes;
+            scratch = handle<VkBuffer>(0x8000);
+            offset = scratch_offset;
+            return true;
+        };
+        CommandList upload, download;
+        expect(upload.copy_texture({texture, 0, 0, 0, src, false, {}, true}) && upload.close(),
+               "record compact R8 upload");
+        expect(download.copy_texture({dst, 0, 0, 0, texture, true, {0, 0, 0, 5, 3, 1}, true}) &&
+                   download.close(), "record compact R8 download");
+
+        expect(run(upload) == ReplayResult::success && scratch_bytes == 0 && buffer_copies.empty() &&
+                   b2i_copies.size() == 1 && b2i_copies[0].bufferOffset == src_buf.buffer_offset + src.offset,
+               "direct queue uploads compact R8 without scratch");
+        vk.queue_stages = detail::queue_stages_copy;
+        const auto tight_image_region = [&](const std::vector<VkBufferImageCopy>& regions) {
+            return regions.size() == 1 && regions[0].bufferOffset == scratch_offset &&
+                   !regions[0].bufferRowLength && !regions[0].bufferImageHeight;
+        };
+        const auto exact_rows = [&](const CopyLocation& footprint, VkDeviceSize base, bool pack) {
+            if (buffer_copies.size() != 3) return false;
+            for (VkDeviceSize i = 0; i < buffer_copies.size(); ++i) {
+                const auto& row = buffer_copies[i];
+                const auto app = base + footprint.offset + i * footprint.row_pitch;
+                const auto scratch = scratch_offset + 5 * i;
+                if (row.size != 5 || row.srcOffset != (pack ? app : scratch) ||
+                    row.dstOffset != (pack ? scratch : app))
+                    return false;
+            }
+            return true;
+        };
+        expect(run(upload) == ReplayResult::success && scratch_bytes == 15 && tight_image_region(b2i_copies) &&
+                   exact_rows(src, src_buf.buffer_offset, true), "copy queue packs precisely the uploaded pixels");
+        expect(run(download) == ReplayResult::success && scratch_bytes == 15 && tight_image_region(i2b_copies) &&
+                   exact_rows(dst, dst_buf.buffer_offset, false), "copy queue preserves application row padding");
+
+        vk.copy_scratch = {};
+        expect(run(download) == ReplayResult::unsupported && buffer_copies.empty() && i2b_copies.empty(),
+               "missing transfer scratch refuses the list before emitting any copy");
+        vk.queue_stages = 0;
+        rgba_img = saved_image;
+    }
+
     if (failures) return 1;
     std::printf("replay_copy_offset: CopyResource and CopyTexture apply ResourceBinding::buffer_offset\n");
     return 0;

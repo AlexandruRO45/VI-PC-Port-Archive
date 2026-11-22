@@ -327,6 +327,7 @@ struct CopyTexture {
     CopyLocation src;
     bool has_box;
     CopyBox box;
+    bool unrestricted_footprint = false;
 };
 
 // CopyResource: every subresource, or the whole buffer.
@@ -680,7 +681,8 @@ public:
     }
 
     bool copy_texture(const CopyTexture& copy) {
-        if (!valid(copy.dst) || !valid(copy.src) || (copy.dst.footprint && copy.src.footprint)) return false;
+        if (!valid(copy.dst, copy.unrestricted_footprint) || !valid(copy.src, copy.unrestricted_footprint) ||
+            (copy.dst.footprint && copy.src.footprint)) return false;
         if (copy.has_box && (copy.box.right <= copy.box.left || copy.box.bottom <= copy.box.top ||
                              copy.box.back <= copy.box.front))
             return false;
@@ -880,13 +882,13 @@ public:
 private:
     static bool valid(const TargetView& target) { return target.resource && target.layer_count; }
 
-    // A placed footprint needs aligned offsets and pitches and a non-empty size.
-    static bool valid(const CopyLocation& location) {
+    // The D3D12 shim checks the format-unit alignment for unrestricted footprints before it drops the DXGI format.
+    static bool valid(const CopyLocation& location, bool unrestricted) {
         if (!location.resource) return false;
         if (!location.footprint) return true;
         return location.width && location.height && location.depth && location.row_pitch &&
-               location.offset % texture_data_placement_alignment == 0 &&
-               location.row_pitch % texture_data_pitch_alignment == 0;
+               (unrestricted || (location.offset % texture_data_placement_alignment == 0 &&
+                                 location.row_pitch % texture_data_pitch_alignment == 0));
     }
 
     // A split begin and end cannot be the same barrier.

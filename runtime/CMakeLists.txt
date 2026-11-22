@@ -1302,6 +1302,14 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_predicated_copy COMMAND d3d12_predicated_copy_test)
     set_tests_properties(d3d12_predicated_copy PROPERTIES SKIP_RETURN_CODE 77)
 
+    add_executable(d3d12_unrestricted_footprint_test test/d3d12_unrestricted_footprint_test.cpp)
+    target_link_libraries(d3d12_unrestricted_footprint_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_unrestricted_footprint_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_unrestricted_footprint_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_unrestricted_footprint COMMAND d3d12_unrestricted_footprint_test)
+    set_tests_properties(d3d12_unrestricted_footprint PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+
     # Differential regression: run explicitly (requires Vulkan hardware and Windows WARP).
     add_executable(d3d12_clear_test test/d3d12_clear_test.cpp)
     target_link_libraries(d3d12_clear_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)

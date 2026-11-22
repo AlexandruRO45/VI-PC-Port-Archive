@@ -871,8 +871,8 @@ struct ReplayFunctions {
     // for a job while the list is checked, `depth24_run` records its dispatch. Without them such a copy is unsupported.
     std::function<bool(Depth24Job&, std::vector<Depth24Job>&)> depth24_prepare;  // whole copy in, dispatches out
     std::function<void(VkCommandBuffer, const Depth24Job&)> depth24_run;
-    // `bytes` of transfer scratch that stays alive until the submission completes (vulkan_scratch.h): depth <-> colour
-    // copies go through it, image to buffer to image. Without it such a copy is unsupported.
+    // `bytes` of 256-byte-aligned transfer scratch that stays alive until the submission completes (vulkan_scratch.h).
+    // Copies go through it when Vulkan cannot directly express their image extents or footprint alignment.
     std::function<bool(VkDeviceSize bytes, VkBuffer&, VkDeviceSize&)> copy_scratch;
     // Returns the query heap with that ID, or nullptr; it stays valid while the lists that use it run.
     std::function<QueryPool*(QueryHeapId)> query_pool;
@@ -934,7 +934,7 @@ struct Prepared {
     bool skip = false;                // every rectangle was empty
     ResourceBinding source;                   // copies: the source resource
     VkImageSubresourceRange source_range{};   // copies: the source subresources (range: the destination's)
-    std::vector<VkBufferCopy> buffer_copies;
+    std::vector<VkBufferCopy> buffer_copies;  // direct buffer copy, or footprint rows to/from `staged`
     std::vector<VkBufferImageCopy> buffer_image_copies;  // one direction, given by which side is an image
     std::vector<VkImageCopy> image_copies;
     VkImageResolve resolve{};  // resolves
@@ -947,7 +947,8 @@ struct Prepared {
     std::uint32_t rgb96_slice_words = 0;
     Depth24Job depth24;                    // the whole copy: where its scratch floats are
     std::vector<Depth24Job> depth24_parts;  // the dispatches that convert it
-    // A depth <-> colour copy: the source into `staged` (image to buffer), then `staged` into the destination.
+    // A copy's source into `staged`, then `staged` into the destination. A footprint names its buffer rows;
+    // image-to-image copies instead have buffer-image regions on both sides.
     VkBuffer staged = VK_NULL_HANDLE;
     std::vector<VkBufferImageCopy> staged_reads, staged_writes;
     std::vector<VkImageSubresourceRange> discards;  // DiscardResource: the subresources to discard
@@ -1534,7 +1535,49 @@ inline bool copy_subresource(const ResourceBinding& resource, std::uint32_t subr
 
 // CopyTextureRegion: texture to texture, footprint to texture (upload) or texture to footprint (readback).
 // Block-compressed footprints are padded to whole blocks; the Vulkan extent stops at the mip edge.
-inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
+inline ReplayResult stage_texture_footprint(const ReplayFunctions* vk, Prepared& p, VkBufferImageCopy& region,
+                                             bool upload, VkDeviceSize rows, VkDeviceSize row_bytes,
+                                             VkDeviceSize row_pitch, VkDeviceSize slice_pitch,
+                                             std::uint32_t alignment) {
+    // `vkCmdCopyBuffer` can address individual bytes, even on a transfer-only queue. Pack only the requested
+    // rows, so image copies never see an unaligned buffer offset and readbacks preserve all application padding.
+    const auto slices = region.imageExtent.depth;
+    const auto slice_bytes = rows * row_bytes;
+    const bool tight_rows = row_pitch == row_bytes;
+    const bool contiguous = tight_rows && (slices == 1 || slice_pitch == slice_bytes);
+    const auto region_count = contiguous ? 1 : tight_rows ? VkDeviceSize(slices) : rows * slices;
+    if (region_count > UINT32_MAX || slice_bytes > UINT64_MAX / slices) return ReplayResult::invalid_copy;
+    const auto bytes = slice_bytes * slices;
+    VkDeviceSize base = 0;
+    if (!vk || !vk->copy_scratch || !vk->copy_scratch(bytes, p.staged, base) || !p.staged ||
+        base % alignment || !within(base, bytes, UINT64_MAX))
+        return ReplayResult::unsupported;
+
+    p.buffer_copies.reserve(static_cast<std::size_t>(region_count));
+    const auto add_row = [&](VkDeviceSize app, VkDeviceSize scratch, VkDeviceSize size) {
+        p.buffer_copies.push_back(upload ? VkBufferCopy{app, scratch, size} : VkBufferCopy{scratch, app, size});
+    };
+    if (contiguous) {
+        add_row(region.bufferOffset, base, bytes);
+    } else {
+        for (VkDeviceSize slice = 0; slice < slices; ++slice) {
+            const auto app = region.bufferOffset + slice * slice_pitch;
+            const auto scratch = base + slice * slice_bytes;
+            if (tight_rows) {
+                add_row(app, scratch, slice_bytes);
+            } else {
+                for (VkDeviceSize row = 0; row < rows; ++row)
+                    add_row(app + row * row_pitch, scratch + row * row_bytes, row_bytes);
+            }
+        }
+    }
+    region.bufferOffset = base;
+    region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
+    return ReplayResult::success;
+}
+
+inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p, const ReplayFunctions* vk = nullptr) {
     if (!copy.dst.footprint && !copy.src.footprint) {
         VkImageSubresourceRange dst{}, src{};
         if (!copy_subresource(p.binding, copy.dst.subresource, dst) ||
@@ -1649,9 +1692,13 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
     if (!copy_subresource(image, texture.subresource, range)) return ReplayResult::invalid_subresource;
     if (image.samples != 1) return ReplayResult::invalid_copy;  // multisampled textures have no footprint
     const BlockFormat format = copy_block_format(image, range.aspectMask);
-    // A 12-byte texel does not divide D3D12's 256-byte pitches; an rgb96 copy hands Vulkan the scratch buffer of
-    // the repack, never this pitch, and the pass reads the footprint in words.
-    if (!format.bytes || placed.row_pitch % (image.rgb96 ? 4 : format.bytes)) return ReplayResult::unsupported;
+    // The RGB96 helper reads whole words. Traditional D3D12 footprints may have a 256-byte pitch or 512-byte
+    // placement that is not a multiple of twelve; a relaxed footprint must use whole format units.
+    const bool legacy_placement = placed.offset % texture_data_placement_alignment == 0 &&
+                                  placed.row_pitch % texture_data_pitch_alignment == 0;
+    const auto unit = image.rgb96 && (!copy.unrestricted_footprint || legacy_placement) ? 4u : format.bytes;
+    if (!format.bytes || placed.row_pitch % unit || (copy.unrestricted_footprint && placed.offset % unit))
+        return ReplayResult::unsupported;
     const VkExtent2D mip = mip_extent(image, range.baseMipLevel);
     const auto mip_depth = std::max(1u, image.depth >> range.baseMipLevel);
     // The box is in the source's coordinates: the footprint for an upload, the texture for a readback.
@@ -1672,32 +1719,38 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
     }
     if (!within(texture_x, w, mip.width) || !within(texture_y, h, mip.height)) return ReplayResult::invalid_copy;
     if ((placed_x | placed_y | texture_x | texture_y) % format.block) return ReplayResult::invalid_copy;
+    const std::uint64_t rows = (std::uint64_t(h) + format.block - 1) / format.block;
+    const std::uint64_t row_bytes = (std::uint64_t(w) + format.block - 1) / format.block * format.bytes;
+    const auto x_bytes = std::uint64_t(placed_x / format.block) * format.bytes;
+    if (!rows || !row_bytes || !within(x_bytes, row_bytes, placed.row_pitch)) return ReplayResult::invalid_copy;
     const auto slice_rows = (std::uint64_t(placed.height) + format.block - 1) / format.block;
     const std::uint64_t slice_pitch = slice_rows * placed.row_pitch;
     if (!slice_pitch || placed.offset > buffer.size || placed_z > (buffer.size - placed.offset) / slice_pitch)
         return ReplayResult::invalid_copy;
     const auto slice_start = placed.offset + placed_z * slice_pitch;
-    const auto in_slice = std::uint64_t(placed_y / format.block) * placed.row_pitch +
-                          std::uint64_t(placed_x / format.block) * format.bytes;
+    const auto in_slice = std::uint64_t(placed_y / format.block) * placed.row_pitch + x_bytes;
     if (!within(slice_start, in_slice, buffer.size)) return ReplayResult::invalid_copy;
     const auto offset = slice_start + in_slice;
-    // Vulkan wants a buffer offset that is a multiple of the texel size (VUID-vkCmdCopyBufferToImage-dstImage-07975),
-    // which D3D12's 512-byte placement does not give a 12-byte texel: one more reason an rgb96 copy is repacked.
-    const std::uint32_t alignment = (range.aspectMask & depth_stencil_aspects) || image.rgb96 ? 4 : format.bytes;
-    if (offset % alignment) return ReplayResult::unsupported;
-    const std::uint64_t rows = (std::uint64_t(h) + format.block - 1) / format.block;
-    const std::uint64_t row_bytes = (std::uint64_t(w) + format.block - 1) / format.block * format.bytes;
-    if (!rows || !row_bytes || !within(std::uint64_t(placed_x / format.block) * format.bytes, row_bytes, placed.row_pitch) ||
-        depth - 1 > (buffer.size - offset) / slice_pitch ||
+    const bool depth_stencil = (range.aspectMask & depth_stencil_aspects) != 0;
+    const std::uint32_t alignment = depth_stencil || image.rgb96 ? 4u : format.bytes;
+    if (!copy.unrestricted_footprint && offset % alignment) return ReplayResult::unsupported;
+    if (depth - 1 > (buffer.size - offset) / slice_pitch ||
         !within(offset + (depth - 1) * slice_pitch, (rows - 1) * placed.row_pitch + row_bytes, buffer.size))
         return ReplayResult::invalid_copy;
     if (buffer.size > UINT64_MAX - buffer.buffer_offset) return ReplayResult::invalid_copy;
     const VkDeviceSize backing_offset = buffer.buffer_offset + offset;
-    if (backing_offset % alignment) return ReplayResult::unsupported;
+    const bool converts = image.rgb96 || (image.depth24_as_float && range.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT);
+    if ((!copy.unrestricted_footprint || converts) && backing_offset % alignment) return ReplayResult::unsupported;
+    const bool oversized_pitch = placed.row_pitch > INT32_MAX ||
+                                 (depth > 1 && slice_rows > UINT32_MAX / format.block);
+    if (!copy.unrestricted_footprint && !converts && oversized_pitch) return ReplayResult::invalid_copy;
     VkBufferImageCopy region{};
     region.bufferOffset = backing_offset;
-    region.bufferRowLength = placed.row_pitch / format.bytes * format.block;
-    region.bufferImageHeight = depth > 1 ? std::uint32_t(slice_rows * format.block) : 0;
+    if (!oversized_pitch || converts) {
+        if (depth > 1 && slice_rows > UINT32_MAX / format.block) return ReplayResult::invalid_copy;
+        region.bufferRowLength = placed.row_pitch / format.bytes * format.block;
+        region.bufferImageHeight = depth > 1 ? std::uint32_t(slice_rows * format.block) : 0;
+    }
     region.imageSubresource = {range.aspectMask, range.baseMipLevel, range.baseArrayLayer, 1};
     region.imageOffset = {std::int32_t(texture_x), std::int32_t(texture_y), std::int32_t(texture_z)};
     region.imageExtent = {w, h, depth};
@@ -1707,6 +1760,17 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
         p.rgb96_slice_words = std::uint32_t(slice_pitch / 4);
         region.bufferRowLength = 0;
         region.bufferImageHeight = 0;
+    } else if (!converts && copy.unrestricted_footprint) {
+        // Vulkan normally aligns the buffer offset to one texel block, with four bytes for depth/stencil and
+        // transfer-only families without maintenance11. Copy lists use the conservative transfer alignment even
+        // if they are running on a general queue.
+        const auto required_alignment = vk && vk->queue_stages == queue_stages_copy ? std::max(4u, alignment) : alignment;
+        if (backing_offset % required_alignment || oversized_pitch) {
+            if (const auto result = stage_texture_footprint(vk, p, region, upload, rows, row_bytes,
+                                                            placed.row_pitch, slice_pitch, required_alignment);
+                result != ReplayResult::success)
+                return result;
+        }
     }
     p.buffer_image_copies.push_back(region);
     (upload ? p.range : p.source_range) = range;
@@ -2509,7 +2573,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                         return ReplayResult::unsupported;
                 } else p.buffer_copies.push_back({src, dst, buffer_copy->size});
             } else if (const auto* texture_copy = std::get_if<CopyTexture>(&command)) {
-                result = detail::prepare_texture_copy(*texture_copy, p);
+                result = detail::prepare_texture_copy(*texture_copy, p, &vk);
                 if (result == ReplayResult::success && !p.staged_reads.empty()) {
                     // A block-compressed copy staged through transfer scratch (prepare_texture_copy): whole blocks of
                     // the read's row length and height, one region a copy.
@@ -2546,7 +2610,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     job.height = region.imageExtent.height;
                     job.slices = region.imageExtent.depth;
                     job.app_row_words = region.bufferRowLength ? region.bufferRowLength : job.width;
-                    job.app_slice_words = job.app_row_words * (region.bufferImageHeight ? region.bufferImageHeight : job.height);
+                    const auto app_slice_words = std::uint64_t(job.app_row_words) *
+                                                 (region.bufferImageHeight ? region.bufferImageHeight : job.height);
+                    if (app_slice_words > UINT32_MAX) return ReplayResult::unsupported;
+                    job.app_slice_words = std::uint32_t(app_slice_words);
                     if (!vk.depth24_prepare || !vk.depth24_run || !vk.depth24_prepare(job, p.depth24_parts)) return ReplayResult::unsupported;
                     p.has_depth24 = true;
                 } else if (rgb96_footprint) {
@@ -3325,10 +3392,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 end_statistics();
                 vk.emit_predicated_copy(command_buffer, p.predicated_copy);
                 begin_statistics();
-            } else if (!p.buffer_copies.empty()) {
+            } else if (!p.buffer_copies.empty() && !p.staged) {
                 vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, std::uint32_t(p.buffer_copies.size()),
                                p.buffer_copies.data());
-            } else if (p.staged) {
+            } else if (!p.staged_reads.empty()) {
                 // Depth <-> colour, or a block-compressed copy no one extent fits: the source into the scratch, then
                 // the scratch into the destination. The destination's copy_layout comes after the scratch write, so
                 // its barrier orders every earlier transfer write before the destination's (#860, Vonsek's
@@ -3377,7 +3444,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 VkBuffer source = p.source.buffer;
                 std::vector<VkBufferImageCopy> converted;
                 const std::vector<VkBufferImageCopy>* regions = &p.buffer_image_copies;
-                if (p.has_depth24) {
+                if (p.staged) {
+                    vk.copy_buffer(command_buffer, source, p.staged, std::uint32_t(p.buffer_copies.size()),
+                                   p.buffer_copies.data());
+                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                           VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                    source = p.staged;
+                } else if (p.has_depth24) {
                     // The words become floats in the scratch buffer, which the copy then reads (tightly packed).
                     detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
@@ -3404,8 +3477,16 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),
                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
                 if (!p.has_depth24) {
-                    vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, p.binding.buffer,
+                    const VkBuffer destination = p.staged ? p.staged : p.binding.buffer;
+                    vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, destination,
                                             std::uint32_t(p.buffer_image_copies.size()), p.buffer_image_copies.data());
+                    if (p.staged) {
+                        detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                               VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                               VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                        vk.copy_buffer(command_buffer, destination, p.binding.buffer, std::uint32_t(p.buffer_copies.size()),
+                                       p.buffer_copies.data());
+                    }
                 } else {
                     // The floats land tightly packed in the scratch buffer; the pass turns them into the footprint's words.
                     VkBufferImageCopy region = p.buffer_image_copies[0];
