@@ -1930,6 +1930,31 @@ int main() {
         EXPECT(format_support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET);
         EXPECT(format_support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE);
 
+        // The typed and typeless D24S8 formats share the same native or emulated depth/stencil backing.
+        const VkFormat d24_backing = d.depth_format_usable(VK_FORMAT_D24_UNORM_S8_UINT)
+            ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_D32_SFLOAT_S8_UINT;
+        const auto image_format_properties = d.instance_fn<PFN_vkGetPhysicalDeviceImageFormatProperties>(
+            "vkGetPhysicalDeviceImageFormatProperties");
+        constexpr VkImageUsageFlags depth_usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        for (DXGI_FORMAT dxgi : {DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_R24G8_TYPELESS}) {
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT depth_support{dxgi};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &depth_support,
+                                                         sizeof(depth_support))));
+            EXPECT(depth_support.Support1 & D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL);
+            const VkImageCreateFlags flags = dxgi == DXGI_FORMAT_R24G8_TYPELESS ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+            VkImageFormatProperties properties{};
+            const VkResult result = image_format_properties(d.physical, d24_backing, VK_IMAGE_TYPE_2D,
+                VK_IMAGE_TILING_OPTIMAL, depth_usage, flags, &properties);
+            for (UINT samples : {1u, 2u, 4u, 8u}) {
+                D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality{dxgi, samples};
+                EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &quality,
+                                                             sizeof(quality))));
+                const UINT expected = result == VK_SUCCESS && (properties.sampleCounts & samples) ? 1 : 0;
+                EXPECT(quality.NumQualityLevels == expected);
+            }
+        }
+
         D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS invalid_sample_count{};
         invalid_sample_count.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         invalid_sample_count.SampleCount = D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT * 2;
