@@ -46,6 +46,9 @@ STRUCTURED = True     # False (--dispatch-loop): every shader with branches as o
 # (SHADER-299, docs/design.md "Control flow"). Both forms are equivalent; only the routing differs.
 MAX_STRUCTURED_DEPTH = 16
 WAVE64_EMULATE = False   # --wave64-emulate: wave64 compute/mesh shaders exact on any subgroup size (Gen.x_round)
+# Wave32 vertex shaders keep each wave in its own 32-lane part of the subgroup (Gen.halves; --no-wave32-halves turns
+# it off): exact on vertex subgroups of 32, 64 or any multiple of 32 (the AMD driver runs the VS stage 64-wide).
+WAVE32_HALVES = True
 # --max-shared-memory: a cap on a compute shader's Workgroup variables, LDS plus %x_buf (SHADER-309, #1721). The
 # default is the hard cap: 64 KiB, RDNA2's LDS per workgroup and the largest maxComputeSharedMemorySize drivers
 # report (RADV, NVIDIA). It is not the device limit: the AMD Windows (RDNA4) and Intel drivers report 32768, the
@@ -297,6 +300,7 @@ class Gen:
         self.emulate_plan = None   # emulate: structured plan from wave64_emulate_opt.plan_structured_emulation
         self.mini_segs = defaultdict(list)  # emulate_plan: mini_idx -> continuation segment ids
         self.tail_segs = []        # emulate_plan: continuation segment ids belonging to tail_scheduler
+        self.halves = False        # wave32 VS: every 32 subgroup lanes are one wave (see wave_lane, half_base)
         self.x_seg = 0             # emulate: number of the next continuation segment (past the block numbers)
         self.x_marks = []          # emulate: (index into body, segment) where a segment of the current block ends
         self.x_segs = {}           # emulate: continuation segment -> its SPIR-V lines
@@ -3910,6 +3914,9 @@ class Gen:
         lane = self.tmp()
         if self.stage in ("cs", "ms"):
             self.emit(f"{lane} = OpBitwiseAnd %uint {self.local_index()} {self.cu(63 if self.wave64 else 31)}")
+        elif self.halves:
+            sg = self.subgroup_lane()
+            self.emit(f"{lane} = OpBitwiseAnd %uint {sg} {self.cu(31)}")
         else:
             self.uses_subgroup = True
             self.emit(f"{lane} = OpLoad %uint %sg_lane")
@@ -3937,6 +3944,35 @@ class Gen:
                 self.emit(f"{nz} = OpINotEqual %bool {w} {self.cu(0)}")
                 self.emit(f"{pick} = OpSelect %uint {nz} {lsb} {r}")
                 r = pick
+        return r
+
+    # ---- wave32 halves (Gen.halves, wave32 vertex shaders) ----
+    # Vulkan cannot require a subgroup size for the vertex stage (no driver lists VERTEX in requiredSubgroupSizeStages),
+    # and the AMD Windows driver runs it 64-wide: a wave32 VS then shares one subgroup with a second wave's worth of
+    # vertices. With `halves`, subgroup lanes 32k..32k+31 are one wave: the wave lane is the subgroup lane mod 32, a
+    # ballot is read through this wave's word, a vote is that word, and a shuffle's source lane stays in this wave's
+    # 32 lanes. On a 32-wide subgroup that is what the plain translation does (word 0, base 0); on 64 it is two exact
+    # wave32s. Below 32 lanes nothing changes. Quad, DPP row, swizzle and permlane sources already stay inside 32 lanes.
+    def half_base(self):
+        """halves: the subgroup lane of this wave's lane 0 (the subgroup lane with its low 5 bits cleared)."""
+        sg, r = self.subgroup_lane(), self.tmp()
+        self.emit(f"{r} = OpBitwiseAnd %uint {sg} {self.cu(0xFFFFFFE0)}")
+        return r
+
+    def half_ballot(self, b):
+        """halves: the 32 bits of a ballot of bool `b` that are this wave's lanes (ballot word subgroup lane / 32)."""
+        self.uses_subgroup = self.uses_ballot = True
+        bal, sg, i, r = self.tmp(), self.subgroup_lane(), self.tmp(), self.tmp()
+        self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} {b}")
+        self.emit(f"{i} = OpShiftRightLogical %uint {sg} {self.cu(5)}")
+        self.emit(f"{r} = OpVectorExtractDynamic %uint {bal} {i}")
+        return r
+
+    def half_lane(self, src):
+        """halves: subgroup lane of lane `src` (0..31, or a subgroup lane) of this invocation's wave."""
+        low, r = self.tmp(), self.tmp()
+        self.emit(f"{low} = OpBitwiseAnd %uint {src} {self.cu(31)}")
+        self.emit(f"{r} = OpBitwiseOr %uint {low} {self.half_base()}")
         return r
 
     # ---- wave64 emulation (--wave64-emulate) ----
@@ -4260,6 +4296,14 @@ class Gen:
 
     def g_vote(self, r, kind, b):
         """r = OpGroupNonUniform{Any,All} of bool b over the wave."""
+        if self.halves:
+            # This wave's word of the ballot: Any = some bit, All = every running invocation of the wave voted yes.
+            w = self.half_ballot(b)
+            if kind == "Any":
+                self.emit(f"{r} = OpINotEqual %bool {w} {self.cu(0)}")
+            else:
+                self.emit(f"{r} = OpIEqual %bool {w} {self.half_ballot('%true')}")
+            return
         if not self.emulate:
             self.emit(f"{r} = OpGroupNonUniform{kind} %bool {self.cu(3)} {b}")
             return
@@ -4274,6 +4318,8 @@ class Gen:
 
     def g_shuffle(self, r, v, src):
         """r = v of lane src of this wave (OpGroupNonUniformShuffle, or any emulated lane 0-63)."""
+        if self.halves:
+            src = self.half_lane(src)
         if not self.emulate:
             self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {v} {src}")
             return
@@ -4358,12 +4404,14 @@ class Gen:
             sgl = self.tmp()
             self.emit(f"{sgl} = OpLoad %uint %sg_lane")
             self.emit(f"{half} = OpBitwiseAnd %uint {sgl} {self.cu(32)}")
+        elif self.halves:
+            self.emit(f"{half} = OpCopyObject %uint {self.half_base()}")
         bal = self.tmp()
         self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
         acc = self.cu(0)
         for j in range(32):
             src = self.cu(j)
-            if self.wave64:
+            if self.wave64 or self.halves:
                 src = self.tmp()
                 self.emit(f"{src} = OpBitwiseOr %uint {half} {self.cu(j)}")
             ex, shv, v, shd, hit, nxt = (self.tmp() for _ in range(6))
@@ -4616,6 +4664,9 @@ class Gen:
             if key is not None:
                 self.x_mcache[key] = res
             return res
+        if self.halves:
+            # This wave's 32 bits; a wave32 mask has no high word (lanes 32..63 of the subgroup are another wave).
+            return self.half_ballot(mine), self.cu(0)
         lane = self.wave_lane()
         low, sh, bit, b, lo_in, hi_in, lo, hi = (self.tmp() for _ in range(8))
         self.emit(f"{low} = OpULessThan %bool {lane} {self.cu(32)}")
@@ -5626,6 +5677,17 @@ class Gen:
                 self.emit(f"{first} = OpSelect %uint {lz} {l} {fh}")
                 self.dst(a[0], read(first))
                 return
+            if self.halves:
+                # The lowest set bit of this wave's ballot word, as a subgroup lane; lane 0 of the wave if none.
+                v, w = self.src_u(a[1]), self.half_ballot(self.active_b())
+                lsb, any_, rel, first, r = (self.tmp() for _ in range(5))
+                self.emit(f"{lsb} = OpExtInst %uint %glsl FindILsb {w}")
+                self.emit(f"{any_} = OpINotEqual %bool {w} {self.cu(0)}")
+                self.emit(f"{rel} = OpSelect %uint {any_} {lsb} {self.cu(0)}")
+                self.emit(f"{first} = OpBitwiseOr %uint {rel} {self.half_base()}")
+                self.emit(f"{r} = OpGroupNonUniformShuffle %uint {self.cu(3)} {v} {first}")
+                self.dst(a[0], r)
+                return
             self.uses_subgroup = self.uses_ballot = self.uses_vote = True
             v, act = self.src_u(a[1]), self.active_b()
             bal, lsb, any_, first, r = (self.tmp() for _ in range(5))
@@ -6043,6 +6105,7 @@ class Gen:
             if op.endswith("b64") or "bcnt1" in op:
                 # s_bcnt1_i32_b32 counts the high word too: for a lane mask of a wave32 shader running in a 64-lane
                 # subgroup (graphics stages can't request 32) the other lanes' bits are there; otherwise hi is 0.
+                # A wave32 VS with `halves` has hi = 0 (wave_mask gives its own wave's word), so it counts its wave.
                 # s_bcnt0_i32_b32 counts zeros of the low word only (~0 in the high word would add 32).
                 self.emit(f"{c2} = OpBitCount %uint {hi}")
                 self.emit(f"{r} = OpIAdd %uint {c1} {c2}")
@@ -6361,6 +6424,8 @@ class Gen:
                 self.emit(f"{half} = OpBitwiseAnd %uint {lane} {self.cu(32)}")
                 self.emit(f"{full_src} = OpBitwiseOr %uint {half} {src}")
                 src = full_src
+            elif self.halves:
+                src = self.half_lane(src)
             self.ds_lane_read(d, dat, src, lane)
         elif op == "ds_permute_b32":
             self.ds_permute(a, mods)
@@ -6413,8 +6478,9 @@ class Gen:
             if slot and slot[1:] in self.parked:        # somewhere a mask is fetched back from this lane: keep ours
                 self.store_reg("sgpr", self.parked[slot[1:]], val)
             me, m, eq, old, r = (self.tmp() for _ in range(5))
-            if self.stage in ("cs", "ms"):
-                # The hardware lane: lanes 32-63 of a wave64 are lanes 0-31 of a second 32-wide subgroup.
+            if self.stage in ("cs", "ms") or self.halves:
+                # The hardware lane: lanes 32-63 of a wave64 are lanes 0-31 of a second 32-wide subgroup (halves: of
+                # a 64-wide subgroup, a second wave32).
                 self.emit(f"{me} = OpCopyObject %uint {self.wave_lane()}")
             else:
                 self.emit(f"{me} = OpLoad %uint %sg_lane")
@@ -13815,6 +13881,8 @@ def translate(path):
         insns = [i for i in insns if base_op(i["op"]) != "s_swappc_b64"]
     user_limit = g.cs["user"] if g.cs else USER_SGPRS
     sys_sgprs = (3,) if stage in ("ms", "gs") else ()
+    if WAVE32_HALVES and not g.wave64 and stage == "vs":
+        g.halves = True
     if WAVE64_EMULATE and g.wave64 and stage in ("cs", "ms"):
         g.emulate = True
         size = (g.cs or g.ms)["size"]
@@ -14621,6 +14689,9 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
             m["wave64_graphics_reasons"] = g.w64g["reasons"]
         if g.w64g["idioms"]:
             m["wave64_graphics_idioms"] = g.w64g["idioms"]
+    if g.halves:
+        # Exact on any vertex subgroup size that is a multiple of 32 (runtime/src/subgroup_size.h: `halves`).
+        m["wave32_halves"] = True
     if g.emulate:
         # Exact on any subgroup size: no subgroup operation, cross-lane data in %x_buf (workgroup memory).
         m["wave64_exchange"] = "workgroup"
@@ -14925,6 +14996,9 @@ def main():
     ap.add_argument("--wave64-emulate", action="store_true",
                     help="wave64 compute and mesh shaders exact on any subgroup size (32-wide NVIDIA, Intel): "
                          "cross-lane operations go through workgroup memory instead of subgroup operations")
+    ap.add_argument("--no-wave32-halves", action="store_true",
+                    help="translate wave32 vertex shaders as one wave per subgroup (exact only on 32-wide vertex "
+                         "subgroups) instead of one wave per 32 subgroup lanes (exact on 32, 64 or any multiple)")
     ap.add_argument("--wave64-graphics", choices=("warn", "error", "off"), default="warn",
                     help="wave64 vertex, pixel and geometry shaders that are not exact on 32-wide subgroups (tier C of "
                          "tools/wave64_halves.py): warn = count them in the summary and mark them in the index, "
@@ -14975,7 +15049,7 @@ def main():
     if ancestor and not os.path.isdir(ancestor):
         ap.error(f"cannot create {a.out}: {ancestor} is a file, not a folder")
     MAX_SHARED_BYTES = a.max_shared_memory
-    global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES
+    global STRUCTURED, WAVE64_EMULATE, WAVE32_HALVES, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES
     global PC_TAIL_UBO
     PC_TAIL_UBO = a.pc_tail_ubo
     FMA_KHR = a.fma == "khr"
@@ -14983,6 +15057,7 @@ def main():
     global FLOAT_CONTROLS
     FLOAT_CONTROLS = not a.no_float_controls
     WAVE64_EMULATE = a.wave64_emulate
+    WAVE32_HALVES = not a.no_wave32_halves
     WAVE64_GRAPHICS = a.wave64_graphics
     BARY_FALLBACK = a.bary_fallback
     TEXEL_OFFSET_FALLBACK = a.texel_offset_fallback

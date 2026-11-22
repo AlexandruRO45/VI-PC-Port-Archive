@@ -5,6 +5,7 @@
 //     stages FRAGMENT | COMPUTE | TASK | MESH can be required;
 //   - NVIDIA: every stage can be required, but the only size is 32;
 //   - an old RADV: sizes 32..64, COMPUTE only.
+// Plus a wave32 vertex shader translated with wave32_halves on each, and a device with sizes below 32.
 // No game data.
 #include "../src/subgroup_size.h"
 
@@ -110,6 +111,17 @@ int main() {
         // A wave32 VS on a 64-wide default is wrong too.
         r = decide_subgroup_size(entry("vs", false), caps);
         CHECK(r.outcome == SubgroupOutcome::unavailable && r.wanted == 32);
+        // Unless it keeps each wave in its own 32 lanes (wave32_halves): exact at 64, nothing to chain or report.
+        ShaderEntry halves = entry("vs", false);
+        halves.wave32_halves = true;
+        r = decide_subgroup_size(halves, caps);
+        CHECK(r.outcome == SubgroupOutcome::halves && r.size == 0 && r.flags == 0 && r.wanted == 32 &&
+              r.stage == VK_SHADER_STAGE_VERTEX_BIT);
+        // A stage that can be required still is: a halves pixel shader (not emitted today) would get 32.
+        ShaderEntry halves_ps = entry("ps", false);
+        halves_ps.wave32_halves = true;
+        r = decide_subgroup_size(halves_ps, caps);
+        CHECK(r.outcome == SubgroupOutcome::required && r.size == 32);
         // Emulated shaders ask for nothing, whatever the stage.
         r = decide_subgroup_size(entry("cs", true, {64, 1, 1}, true), caps);
         CHECK(r.outcome == SubgroupOutcome::emulated && r.size == 0 && r.flags == 0);
@@ -125,6 +137,10 @@ int main() {
             const auto r = decide_subgroup_size(entry(stage, false), caps);
             CHECK(r.outcome == SubgroupOutcome::device_fixed && r.size == 0 && r.flags == 0);
         }
+        // A halves VS is the same there: the device's one size is 32.
+        ShaderEntry halves = entry("vs", false);
+        halves.wave32_halves = true;
+        CHECK(decide_subgroup_size(halves, caps).outcome == SubgroupOutcome::device_fixed);
         // Wave64 cannot be had (64 > max): native wave64 is reported in every stage, emulated is fine.
         for (const char* stage : {"cs", "ps", "vs", "gs", "ms"}) {
             const auto r = decide_subgroup_size(entry(stage, true), caps);
@@ -148,6 +164,29 @@ int main() {
         CHECK(r.outcome == SubgroupOutcome::device_default && r.size == 0);
         r = decide_subgroup_size(entry("ms", true, {128, 1, 1}), caps);
         CHECK(r.outcome == SubgroupOutcome::device_default);
+        // A halves VS on a 64-wide default: exact.
+        ShaderEntry halves = entry("vs", false);
+        halves.wave32_halves = true;
+        CHECK(decide_subgroup_size(halves, caps).outcome == SubgroupOutcome::halves);
+    }
+
+    // --- Smaller sizes than 32 (sizes 8..32, default 16): halves cannot help a wave cut below 32 lanes ---------------
+    {
+        SubgroupSizeCaps caps = amd();
+        caps.min_size = 8;
+        caps.max_size = 32;
+        caps.default_size = 16;
+        caps.required_stages = VK_SHADER_STAGE_COMPUTE_BIT;
+        ShaderEntry halves = entry("vs", false);
+        halves.wave32_halves = true;
+        CHECK(decide_subgroup_size(halves, caps).outcome == SubgroupOutcome::unavailable);
+        // Default 32 there: works as it is, as for any wave32 shader.
+        caps.default_size = 32;
+        CHECK(decide_subgroup_size(halves, caps).outcome == SubgroupOutcome::device_default);
+        // A wave64 entry never takes the halves outcome, even if the field were set.
+        ShaderEntry w64 = entry("vs", true);
+        w64.wave32_halves = true;
+        CHECK(decide_subgroup_size(w64, amd()).outcome == SubgroupOutcome::device_default);
     }
 
     // --- Feature, limit and index edge cases -------------------------------------------------------------------------

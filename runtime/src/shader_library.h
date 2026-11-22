@@ -637,6 +637,10 @@ struct ShaderEntry {
     // subgroup size. Empty for a native translation.
     std::string wave64_exchange;
     bool emulated() const { return !wave64_exchange.empty(); }
+    // A wave32 vertex shader translated with one wave per 32 subgroup lanes (rdna2spirv.py Gen.halves): exact on any
+    // subgroup size that is a multiple of 32, so a 64-wide vertex stage (the AMD Windows driver) runs it as two
+    // wave32s. False for one translated with --no-wave32-halves or before the field existed.
+    bool wave32_halves = false;
     std::vector<SignatureElement> input_signature;  // vertex shaders: what the input layout must feed
     std::vector<std::uint32_t> inputs;              // pixel shaders: input locations declared
     std::vector<std::uint32_t> outputs;             // pixel/vertex shaders: output locations written
@@ -788,6 +792,8 @@ private:
                 e.subgroup_size = u32(g);
             if (const Json* x = meta.find("wave64_exchange"); x && x->kind == Json::Kind::string)
                 e.wave64_exchange = x->string;
+            if (const Json* h = meta.find("wave32_halves"); h && h->kind == Json::Kind::boolean)
+                e.wave32_halves = h->boolean;
             if (const Json* s = meta.find("input_signature"); s && s->kind == Json::Kind::array) {
                 for (const Json& item : s->array) {
                     SignatureElement element;

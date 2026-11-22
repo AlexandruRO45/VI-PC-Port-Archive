@@ -46,6 +46,7 @@ from check import barycentric_problem
 from check import GET_LOD_TESTS, STORE_WORDS, get_lod_test, store_words_problem   # TEST-184: image atomics and queries
 from check import wide_pixel_skip   # ps_w64x_readlane: judged only where the fragment stage was required 64-wide
 from check import FMA_FUSED_ENV, judge_fma_fused   # cs_fma_fused: strict under LEONIDA_FMA=khr, fused/split under glsl
+import w32_vs_halves  # noqa: E402  (vs_w32_*: wave32 invariants on wide vertex subgroups, as in check.py)
 
 
 def make_dxbc(chunks: list[tuple[bytes, bytes]]) -> bytes:
@@ -581,7 +582,8 @@ DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_textur
               "ps_interp_f16_high": "vs_f16_pack.asm", "ms_f16_pack": "ps_interp_f16_high.asm",
               "ps_interp_f32_mods": "vs_interp_consts.asm", "ps_interp_mov_mods": "vs_interp_consts.asm",
               SIGNED_MIP_TEST: "vs_ids.asm",
-              "vs_base_ids": "ps_flat.asm"}
+              "vs_base_ids": "ps_flat.asm",
+              **{name: "ps_clip_color.asm" for name in w32_vs_halves.FIXTURES}}
 DRAWN_WITH.update({name: "vs_ids.asm" for name in GET_LOD_TESTS})
 
 
@@ -1348,6 +1350,12 @@ def run_suite(a, work: str) -> int:
             else:
                 ok, detail = check_clip_half(raw, 0.5, 1.0)
                 results.append((name, ok, detail))
+        elif name in w32_vs_halves.FIXTURES:
+            # Wave32 VS on wide vertex subgroups (runtime/test/shaders/w32_vs_halves.py): every wave32 invariant,
+            # whatever packing the driver chose, as check.py checks.
+            problem = w32_vs_halves.check(os.path.dirname(vk_harness), spirv_dir, name)
+            results.append((name, None if problem.startswith("SKIP") else not problem,
+                            problem or "960 vertices: every wave32 invariant holds"))
         elif name == "vs_base_ids":
             # Zero-based v0 / v3 (the hardware's VS input VGPRs): drawn with firstVertex 16 and firstInstance 7,
             # ps_flat must still see vertex 0 of instance 0 (0x101), as check.py checks.

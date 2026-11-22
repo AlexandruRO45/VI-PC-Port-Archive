@@ -22,6 +22,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import support  # noqa: E402,F401  (sets the tools path)
 from support import translate_listing  # noqa: E402
+import rdna2spirv  # noqa: E402  (support put tools/ on the path)
 import spirv_wave_interp as wi  # noqa: E402
 
 LITERAL_OPS = ("exp", "buffer_", "global_", "ds_", "image_")
@@ -84,11 +85,26 @@ class VertexReadFirstLane(unittest.TestCase):
                 self.check(64, first)
 
     def test_all_four_ballot_words_are_read(self):
-        # Vulkan allows subgroups of up to 128 invocations (the interpreter runs 32 and 64), so all four words count.
+        # Vulkan allows subgroups of up to 128 invocations (the interpreter runs 32 and 64), so all four words count:
+        # a wave64 VS, and a wave32 VS translated as one wave per subgroup (--no-wave32-halves), read all four.
+        saved = rdna2spirv.WAVE32_HALVES
+        try:
+            rdna2spirv.WAVE32_HALVES = False
+            for asm in (self.check(64, 40), self.check(32, 6)):
+                bal = re.search(r"(%\w+) = OpGroupNonUniformBallot ", asm).group(1)
+                words = set(re.findall(rf"= OpCompositeExtract %uint {re.escape(bal)} (\d)\b", asm))
+                self.assertEqual(words, {"0", "1", "2", "3"})
+        finally:
+            rdna2spirv.WAVE32_HALVES = saved
+
+    def test_a_wave32_vs_reads_its_own_waves_ballot_word(self):
+        # With halves (the default for wave32 VS, tests/semantic/test_wave32_vs_halves.py) the wave is 32 subgroup
+        # lanes: its word of the ballot is word SubgroupLocalInvocationId / 32, which reaches each of the four.
         asm = self.check(32, 6)
         bal = re.search(r"(%\w+) = OpGroupNonUniformBallot ", asm).group(1)
-        words = set(re.findall(rf"= OpCompositeExtract %uint {re.escape(bal)} (\d)\b", asm))
-        self.assertEqual(words, {"0", "1", "2", "3"})
+        m = re.search(rf"= OpVectorExtractDynamic %uint {re.escape(bal)} (%\w+)", asm)
+        self.assertIsNotNone(m)
+        self.assertRegex(asm, rf"{re.escape(m.group(1))} = OpShiftRightLogical %uint %\w+ %c5\b")
 
     def test_no_ballot_find_lsb_or_subgroup_size_in_a_vertex_shader(self):
         asm = self.check(32, 6)

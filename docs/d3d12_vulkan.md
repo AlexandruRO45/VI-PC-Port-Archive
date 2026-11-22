@@ -793,13 +793,21 @@ the game's present entry point (`PresentX`; the DXGI factory/swapchain and the p
     152b9cde, `src/amd/vulkan/radv_physical_device.c`, `requiredSubgroupSizeStages`; older Mesa reported compute only).
     NVIDIA lists every stage but only size 32, so a native wave64 shader cannot get 64 there. Vertex and geometry
     stages are in neither list.
+  - **Wave32 vertex shaders** (`wave32_halves` in the index): the AMD Windows driver runs the vertex stage
+    64-wide (measured on an RX 7600, 26.11.2: 62 to 64 vertices per subgroup, sizes 32..64, VERTEX not requirable),
+    so a wave32 VS shared one subgroup with a second wave's worth of vertices: lanes 32..63 reported lane 32,
+    `v_readfirstlane`, ballots, votes and `s_bcnt1` covered 64 vertices, `ds_bpermute` read the other half and a
+    write to `exec_lo` did not reach lanes 32..63. The translator now keeps each wave in its own 32 subgroup lanes
+    (docs/design.md, "Wave32 vertex shaders on wider subgroups"), which is exact on any subgroup of 32k lanes, and the
+    decision is `halves` there: nothing is required and nothing is logged. A device that can run the stage below
+    32 lanes still gets `unavailable` (or `device_default` when its default is 32).
   - **A size the device cannot give** is logged once per stage with the first shader's name (and again at 10, 100,
     1000 shaders of that stage): `[rt] d3d12: <name> (<stage>) is a 64-wide shader but this device cannot require that
     subgroup size ...`. For compute and mesh the fix is the build, `--wave64-emulate` (`make_game.py
     --wave64-emulate auto` picks it for this GPU); a wave64 vertex, geometry or pixel shader has no emulation yet
     (the ~10,000 wave64 pixel shaders are the open case on NVIDIA, SHADER-10).
   - **Test:** `subgroup_size_test` (CPU) checks the decision against AMD-like, NVIDIA-like and old-RADV
-    properties and the resulting create-info chain; `d3d12_subgroup_test` (GPU) runs `cs_w64x_readlane` natively
+    properties (and a halves VS on each, and on a device with sizes below 32) and the resulting create-info chain; `d3d12_subgroup_test` (GPU) runs `cs_w64x_readlane` natively
     and with `--wave64-emulate`, and `cs_wqm_w32`, through D3D12 PSOs and compares the read-back words.
 
 Known gaps: set 0 in pipelines (the device keeps the bindless set, but no pipeline declares or binds it yet) and

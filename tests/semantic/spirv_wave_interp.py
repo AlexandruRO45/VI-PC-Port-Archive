@@ -706,6 +706,15 @@ class _Wave:
             for k in a[2:]:
                 v = v[int(k)]
             return v
+        if op == "OpVectorExtractDynamic":
+            # SPIR-V 3.32.12: the component at Index; an Index outside the vector gives an undefined value.
+            v, i = self.val(lane, a[1]), self.int_of(lane, a[2])
+            if not isinstance(v, tuple):
+                raise UnsupportedConstruct("OpVectorExtractDynamic of a non-vector")
+            if not 0 <= i < len(v):
+                raise UnsupportedConstruct(f"OpVectorExtractDynamic index {i} of a {len(v)}-component vector "
+                                           "(undefined)")
+            return v[i]
         if op == "OpCompositeInsert":
             v = list(self.val(lane, a[2]))
             if len(a) != 4:

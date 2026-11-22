@@ -29,6 +29,9 @@ import tempfile
 from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)  # this script is run with python -I too
+import w32_vs_halves  # noqa: E402  (the wave32 VS fixtures' invariant checks)
+W32_VS_FIXTURES = w32_vs_halves.FIXTURES   # vs_w32_*: judged against wave32 invariants, not fixed words
 EXE = ".exe" if os.name == "nt" else ""
 UNSUPPORTED = 77                                       # a test tool exits with this when the device lacks a feature
 
@@ -1310,6 +1313,13 @@ def interp_f16_high_problem(px):
     return "" if err < 2e-3 else f"f16 halves off by {err:.3g}"
 
 
+def w32_vs_halves_test(tools, spirv, name):
+    """A vs_w32_* fixture: a wave32 VS on a vertex subgroup that may be wider than 32 lanes, drawn with 960 vertices
+    and checked against what every wave32 satisfies, whatever packing the driver chose (w32_vs_halves.py)."""
+    problem = w32_vs_halves.check(tools, spirv, name)
+    return Skip(problem) if problem.startswith("SKIP") else problem
+
+
 def base_ids_test(tools, spirv):
     """vs_base_ids with ps_flat, drawn with firstVertex 16 and firstInstance 7: the VS input VGPRs are zero-based on
     the hardware, so every pixel must still see vertex 0 of instance 0 (0x101, 0x102), not 0x7111."""
@@ -1560,6 +1570,8 @@ def main():
     for name in TEXTURE_CONSTANTS:
         results.append((name, texture_constant_test(tools, spirv, name)))
     results.append(("vs_base_ids", base_ids_test(tools, spirv)))
+    for name in W32_VS_FIXTURES:
+        results.append((name, w32_vs_halves_test(tools, spirv, name)))
     results.append(("ps_tex", bindless_test(tools, spirv)))
     results.append(("ps_ssharp", sampler_test(tools, spirv)))
     results.append(("ps_imgatomic", bindless_test(tools, spirv, "ps_imgatomic")))

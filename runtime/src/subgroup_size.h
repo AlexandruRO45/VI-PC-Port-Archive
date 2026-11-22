@@ -67,6 +67,8 @@ enum class SubgroupOutcome {
     device_fixed,     // the device has one size and it is the wanted one: nothing to ask for
     device_default,   // cannot be required, but the default size is the wanted one: works, not guaranteed stable
     unavailable,      // the wanted size cannot be had: the shader runs at another size and may be inexact
+    halves,           // wave32 with `wave32_halves`: the size cannot be had, but every size the device runs is a
+                      // multiple of 32 and the shader keeps each wave in its own 32 lanes, so it is exact
     unknown_stage,    // no Vulkan stage for this entry
     unknown_device,   // the device sizes were not queried (all zero): nothing is asked for
 };
@@ -103,6 +105,10 @@ inline bool subgroup_workgroup_fits(const std::array<std::uint32_t, 3>& local_si
 //   - A device whose one and only subgroup size (min == max) is the wanted one needs nothing (`device_fixed`).
 //   - Where the size cannot be required (stage not listed, feature off) but the device default is the wanted size,
 //     the shader works as it is (`device_default`): nothing guarantees it, a driver may change its default.
+//   - A wave32 entry with `wave32_halves` (a vertex shader) is exact on any subgroup of 32k lanes, so where neither
+//     holds but the device's smallest size (minSubgroupSize, else the default) is at least 32 the outcome is
+//     `halves`: nothing to ask for, nothing inexact. The AMD Windows driver (vertex stage 64-wide, VERTEX not
+//     requirable) is that case.
 //     Otherwise the outcome is `unavailable`.
 inline SubgroupRequest decide_subgroup_size(const ShaderEntry& entry, const SubgroupSizeCaps& caps) {
     SubgroupRequest r;
@@ -136,6 +142,9 @@ inline SubgroupRequest decide_subgroup_size(const ShaderEntry& entry, const Subg
             r.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
     } else if (caps.default_size == r.wanted) {
         r.outcome = SubgroupOutcome::device_default;
+    } else if (entry.wave32_halves && !entry.wave64 && r.wanted == 32 &&
+               (caps.min_size ? caps.min_size : caps.default_size) >= 32) {
+        r.outcome = SubgroupOutcome::halves;
     } else {
         r.outcome = SubgroupOutcome::unavailable;
     }
