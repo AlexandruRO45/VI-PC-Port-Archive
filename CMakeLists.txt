@@ -1976,18 +1976,26 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_native_tls_value COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_tls_value_check.py" "$<TARGET_FILE:cpu_tls_value>"
         "$<TARGET_FILE:cpu_tls_original>" "$<TARGET_FILE:cpu_tls_sink>" "$<TARGET_FILE:pe_map>")
+    # Provider variant that starts a ready worker inside mix_args; the control installs it as cpu_import_provider.dll.
+    add_library(cpu_import_live SHARED tests/cpu/import_provider.cpp tests/cpu/named_provider.def)
+    target_compile_definitions(cpu_import_live PRIVATE LIVE_WORKER)
+    target_link_libraries(cpu_import_live PRIVATE cpu_exe_io)
+    # Simulation control: finish_exe never terminates; the control installs it as cpu_exe_io.dll.
+    add_library(cpu_exe_io_hang SHARED tests/cpu/exe_io.cpp)
+    target_compile_definitions(cpu_exe_io_hang PRIVATE FINISH_HANG)
     foreach(variant IN ITEMS original no_tls)
-        add_executable(cpu_exe_start_${variant} tests/cpu/exe_start.asm)
+        add_executable(cpu_exe_start_${variant} tests/cpu/exe_start.asm tests/cpu/exe_startup.asm)
         set_target_properties(cpu_exe_start_${variant} PROPERTIES LINKER_LANGUAGE CXX)
-        target_link_options(cpu_exe_start_${variant} PRIVATE /ENTRY:exe_entry /NODEFAULTLIB /SUBSYSTEM:CONSOLE
-            /DYNAMICBASE /INCREMENTAL:NO)
-        target_link_libraries(cpu_exe_start_${variant} PRIVATE cpu_import_provider)
+        target_link_options(cpu_exe_start_${variant} PRIVATE /ENTRY:native_startup /EXPORT:native_entry
+            /EXPORT:body_status,DATA /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE /INCREMENTAL:NO)
+        target_link_libraries(cpu_exe_start_${variant} PRIVATE cpu_import_provider cpu_exe_io)
     endforeach()
     target_compile_definitions(cpu_exe_start_no_tls PRIVATE NO_TLS)
     add_test(NAME cpu_native_exe_start COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_exe_start_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_exe_start_original>" "$<TARGET_FILE:cpu_exe_start_no_tls>"
-        "$<TARGET_FILE:cpu_import_provider>" "$<TARGET_FILE:cpu_import_altered>")
+        "$<TARGET_FILE:cpu_import_provider>" "$<TARGET_FILE:cpu_import_altered>"
+        "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:cpu_import_live>" "$<TARGET_FILE:cpu_exe_io_hang>")
     foreach(variant IN ITEMS original returning no_worker)
         add_executable(cpu_exe_worker_alive_${variant} tests/cpu/worker_alive_entry.asm)
         set_target_properties(cpu_exe_worker_alive_${variant} PROPERTIES LINKER_LANGUAGE CXX)
