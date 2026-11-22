@@ -972,6 +972,18 @@ The compute path, end to end:
     would now read zero or be discarded instead of touching the arena). On the RTX 4060 Ti (Vulkan 1.4 driver) vertex
     reads past a sized vertex binding were already zero before `robustBufferAccess2` was enabled, so `d3d12_ia_bounds`
     cannot tell the two apart there; the index reads were not (A16, A32 and C drew the extra triangle).
+
+    On a Ryzen 5 7600 iGPU (RDNA2, AMD Windows driver 24.10.24) the bounded and the unbounded layer device draw case
+    E alike, so that driver does not zero a vertex attribute that lies outside its view even with `robustBufferAccess2`
+    enabled; it does zero a vertex whose first byte is past the end (B1, B2), so its bound holds per vertex, not per
+    element. `d3d12_ia_bounds` makes that case information only where the bounded and unbounded passes agree and the
+    host disagrees, and still fails A16, A32 and C there if the sized index bind regresses.
+
+    `d3d12_ia_bounds` runs its nine cases with the 144-byte fixtures and, where the device has room for both, again
+    with `--pc-tail-ubo` twins (`vs_ia_bounds.vert` and `ps_ia_bounds.frag` compiled with `-DPC_TAIL`: 128
+    push-constant bytes per stage, no set 1, since neither stage reads heap base or code base), and the two must draw
+    the same probes. A device whose `maxPushConstantsSize` is the 128-byte minimum cannot build the first pair and
+    runs the twin alone; that is where the cases above were measured on RDNA2 hardware (TEST-544).
   - **Attachments:** they move to attachment layouts through the tracker, and the draw runs in a
     dynamic-rendering scope. Its layer count is the smallest layer count of the bound views.
   - **Viewport:** it is flipped (negative height), because translated vertex shaders write D3D clip coordinates;

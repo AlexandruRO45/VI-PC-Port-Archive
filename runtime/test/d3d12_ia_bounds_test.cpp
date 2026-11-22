@@ -15,7 +15,9 @@
 //              buffer is placed right behind the page, the arena's first allocation).
 //   D1 / D2    in-range controls, indexed and not.
 //   E          the vertex view ends 8 bytes into vertex 3 (position inside, colour outside): D3D12 keeps the position
-//              and zeroes the colour; robustBufferAccess2 may zero more, so another driver may differ.
+//              and zeroes the colour; robustBufferAccess2 may zero more, so another driver may differ. Measured: AMD's
+//              Windows driver reads the colour from memory there even with the bounds on, so where the bounded and
+//              unbounded passes agree the case is information only.
 // A second layer device with LEONIDA_NO_IA_BOUNDS=1 (no sized index bind, no robustness) must still draw the in-range
 // cases (D1, D2) as the host does; what it draws for the cases that read past a view is printed, not asserted.
 // The measured outcomes are in `expected` (docs/d3d12_vulkan.md). A case counts only where the default adapter and WARP
@@ -23,6 +25,10 @@
 // layer is checked against `expected` alone. The layer device is the standalone one (create_vulkan_device_standalone).
 // The shaders are GLSL written to the translator's contract (test/glsl/vs_ia_bounds.vert, ps_ia_bounds.frag), and
 // HLSL with the same behaviour for the host. No game data.
+// The layer runs them twice where the device has room for both: the 144-byte push-constant pair, and a --pc-tail-ubo
+// twin (the same GLSL compiled with -DPC_TAIL, whose stages declare 128 push-constant bytes and no set 1), which the
+// two must draw identically. A device whose maxPushConstantsSize is below 144, the Vulkan minimum of 128, cannot build
+// the first pair and runs the twin alone (TEST-544).
 #include "d3d12_test_shaders.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
@@ -41,8 +47,9 @@
 #include <string>
 #include <vector>
 
-#if !defined(LEONIDA_TEST_VS_SPV) || !defined(LEONIDA_TEST_PS_SPV)
-#error "LEONIDA_TEST_VS_SPV and LEONIDA_TEST_PS_SPV must name the compiled test shaders"
+#if !defined(LEONIDA_TEST_VS_SPV) || !defined(LEONIDA_TEST_PS_SPV) || !defined(LEONIDA_TEST_VS_TAIL_SPV) || \
+    !defined(LEONIDA_TEST_PS_TAIL_SPV)
+#error "LEONIDA_TEST_{VS,PS}_SPV and LEONIDA_TEST_{VS,PS}_TAIL_SPV must name the compiled test shaders"
 #endif
 
 #define EXPECT(condition) do { \
@@ -389,16 +396,35 @@ bool make_decoy(ID3D12Device* device, Ref<ID3D12Resource>& decoy, std::uint64_t&
     return std::strcmp(why, "") == 0;
 }
 
+// One push-constant layout's fixtures: the folder its modules live in, and the two program containers that find them
+// by their FSSM hash. The set-1 tail block is not part of this pair: neither stage reads heap base or code base.
+struct Fixture {
+    const char* name;  // for the printed table
+    std::filesystem::path dir;
+    std::vector<std::uint8_t> vs, ps;
+};
+
 enum class layer_status { done, skip, failed };
 
-// Runs every case on a fresh standalone layer device. With `need_exact` the device must bound input-assembler reads
-// (else skip); `decoy_behind_page` tells whether case C's decoy landed right behind the zero page.
-layer_status run_layer(bool need_exact, const std::vector<std::uint8_t>& vs, const std::vector<std::uint8_t>& ps,
-                       std::vector<Probes>& out, bool& decoy_behind_page) {
+// Runs every case on a fresh standalone layer device whose shaders come from `fixture`. With `need_exact` the device
+// must bound input-assembler reads (else skip); `decoy_behind_page` tells whether case C's decoy landed right behind
+// the zero page. `short_device`, when given, reports whether the device has fewer than 144 push-constant bytes: the
+// 144-byte fixture cannot be built there, and the --pc-tail-ubo one is used instead (TEST-544).
+layer_status run_layer(bool need_exact, const Fixture& fixture, std::vector<Probes>& out, bool& decoy_behind_page,
+                       bool* short_device = nullptr) {
+    _putenv_s("LEONIDA_SHADERS", fixture.dir.string().c_str());
     Context layer;
     if (FAILED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&layer.device.p)))) {
         std::puts("SKIP: no Vulkan device the layer can use");
         return layer_status::skip;
+    }
+    if (short_device) {
+        *short_device = rt::d3d12::device_push_constants_need_fallback(layer.device.p);
+        if (*short_device) {
+            std::printf("this device's maxPushConstantsSize is %u, below the 144 bytes the full fixture declares\n",
+                        rt::d3d12::device_max_push_constants_size(layer.device.p));
+            return layer_status::skip;  // the caller reruns with the --pc-tail-ubo fixture
+        }
     }
     const bool exact = rt::d3d12::device_index_bounds_exact(layer.device.p);
     if (need_exact && !exact) {
@@ -417,7 +443,7 @@ layer_status run_layer(bool need_exact, const std::vector<std::uint8_t>& vs, con
     if (!decoy_behind_page)
         std::printf("the decoy is at 0x%llx, not right behind the zero page: case C is information only\n",
                     static_cast<unsigned long long>(decoy_va));
-    if (!make_context(layer, vs, ps)) return layer_status::failed;
+    if (!make_context(layer, fixture.vs, fixture.ps)) return layer_status::failed;
     out.assign(cases().size(), {});
     for (std::size_t i = 0; i < cases().size(); ++i) {
         const char* why = "";
@@ -462,18 +488,71 @@ int main() {
             return 1;
         }
     }
-    _putenv_s("LEONIDA_SHADERS", library.path.string().c_str());
+
+    // The --pc-tail-ubo twin (TEST-544), the same GLSL compiled with -DPC_TAIL: each stage declares 128 push-constant
+    // bytes and no set-1 tail, since neither reads the heap base or the code base. A device with fewer than 144
+    // push-constant bytes cannot build the 144-byte fixture; it builds this one instead.
+    TempFolder tail_library;
+    tail_library.path = std::filesystem::temp_directory_path() /
+                        ("leonida_ia_bounds_tail_" + std::to_string(GetCurrentProcessId()));
+    std::filesystem::create_directories(tail_library.path);
+    std::filesystem::copy_file(LEONIDA_TEST_VS_TAIL_SPV, tail_library.path / "vs_ia_bounds_tail.spv",
+                               std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(LEONIDA_TEST_PS_TAIL_SPV, tail_library.path / "ps_ia_bounds_tail.spv",
+                               std::filesystem::copy_options::overwrite_existing);
+    {
+        std::ofstream index(tail_library.path / "index.json", std::ios::binary);
+        index << "{\"vs_ia_bounds_tail\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 128, \"input_signature\": ["
+                 "{\"semantic\": \"COLOR\", \"semantic_index\": 0, \"register\": 0, \"mask\": 15, \"rw_mask\": 15, "
+                 "\"system_value\": 0, \"component_type\": \"float\"}, "
+                 "{\"semantic\": \"POSITION\", \"semantic_index\": 0, \"register\": 1, \"mask\": 3, \"rw_mask\": 3, "
+                 "\"system_value\": 0, \"component_type\": \"float\"}]},\n"
+                 " \"ps_ia_bounds_tail\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 128, \"outputs\": [0]}}";
+        if (!index) {
+            std::fprintf(stderr, "cannot write the shader index\n");
+            return 1;
+        }
+    }
+    const Fixture full_fixture{"144-byte push constants", library.path, vs_container, ps_container};
+    const Fixture tail_fixture{"--pc-tail-ubo", tail_library.path, vs_container, ps_container};
 
     // The layer, on the standalone device. No Vulkan device, or one without what the layer needs: skip.
-    std::vector<Probes> layer_result, fallback_result;
-    bool decoy_behind_page = false;
-    switch (run_layer(true, vs_container, ps_container, layer_result, decoy_behind_page)) {
+    std::vector<Probes> layer_result, tail_result, fallback_result;
+    bool decoy_behind_page = false, decoy_behind_page_tail = false, short_device = false, ignored_short = false;
+    const Fixture* fixture = &full_fixture;
+    layer_status status = run_layer(true, full_fixture, layer_result, decoy_behind_page, &short_device);
+    if (short_device) {
+        layer_result.clear();
+        status = run_layer(true, tail_fixture, layer_result, decoy_behind_page);
+        fixture = &tail_fixture;
+    }
+    switch (status) {
     case layer_status::skip: return 77;
     case layer_status::failed: return 1;
     case layer_status::done: break;
     }
+
+    // Where the device has room for both layouts, the --pc-tail-ubo pair runs too and must draw the same probes.
+    bool have_tail = false;
+    if (!short_device) {
+        const auto tail_status = run_layer(true, tail_fixture, tail_result, decoy_behind_page_tail, &ignored_short);
+        if (tail_status == layer_status::failed) return 1;
+        have_tail = tail_status == layer_status::done;
+        if (!have_tail) std::fprintf(stderr, "the --pc-tail-ubo pair did not run on this device\n");
+    }
     const auto& all = cases();
     unsigned failures = 0;
+    if (have_tail) {
+        for (std::size_t i = 0; i < all.size(); ++i) {
+            if (!same(tail_result[i], layer_result[i], all[i].tolerance)) {
+                std::fprintf(stderr, "%s: the --pc-tail-ubo pair drew %sbut the 144-byte pair drew %s\n", all[i].name,
+                             text(tail_result[i]).c_str(), text(layer_result[i]).c_str());
+                ++failures;
+            }
+        }
+    }
 
     // A second layer device with the guarantees forced off (LEONIDA_NO_IA_BOUNDS=1): the old behaviour, which the cases
     // that read past a view do not assert. Cases that stay inside their views must still draw as the host does.
@@ -481,10 +560,10 @@ int main() {
     {
         _putenv_s("LEONIDA_NO_IA_BOUNDS", "1");
         bool ignored = false;
-        const auto status = run_layer(false, vs_container, ps_container, fallback_result, ignored);
+        const auto fallback_status = run_layer(false, *fixture, fallback_result, ignored);
         _putenv_s("LEONIDA_NO_IA_BOUNDS", "");
-        if (status == layer_status::failed) return 1;
-        have_fallback = status == layer_status::done;
+        if (fallback_status == layer_status::failed) return 1;
+        have_fallback = fallback_status == layer_status::done;
     }
 
     // The host: Windows D3D12 on the default adapter and on WARP.
@@ -531,7 +610,10 @@ int main() {
             if (h.ran)
                 std::printf("%-46s %-18s %s\n", all[i].name, h.name,
                             h.failure[i] ? h.failure[i] : text(h.result[i]).c_str());
-        std::printf("%-46s %-18s %s\n", all[i].name, "layer", text(layer_result[i]).c_str());
+        std::printf("%-46s %-18s %s\n", all[i].name, short_device ? "layer (pc-tail)" : "layer (144 B)",
+                    text(layer_result[i]).c_str());
+        if (have_tail)
+            std::printf("%-46s %-18s %s\n", all[i].name, "layer (pc-tail)", text(tail_result[i]).c_str());
         if (have_fallback)
             std::printf("%-46s %-18s %s\n", all[i].name, "layer, no bounds", text(fallback_result[i]).c_str());
     }
@@ -547,7 +629,15 @@ int main() {
             else if (!same(*reference, h.result[i], cs.tolerance)) hosts_agree = false;
             have_host = true;
         }
-        const bool defined = cs.defined && !(cs.decoy && !decoy_behind_page);
+        // A vertex attribute outside its view reads zero under robustBufferAccess2, as D3D12 reads it. A driver that
+        // does not implement that promise element by element reads memory there instead; AMD's Windows driver does
+        // (a Ryzen 5 7600 iGPU, 24.10.24: case E's bounded and unbounded passes draw the same pixels). Limited to
+        // partial-vertex cases (vertex_extra_bytes != 0, i.e. case E) so that a regression in the sized index bind
+        // (A16, A32, C) or whole-vertex bounds (B1..B3) still fails instead of turning informational.
+        const bool driver_reads_past = cs.vertex_extra_bytes != 0 && have_fallback && have_host && hosts_agree &&
+                                       same(layer_result[i], fallback_result[i], cs.tolerance) &&
+                                       !same(layer_result[i], *reference, cs.tolerance);
+        const bool defined = cs.defined && !(cs.decoy && !decoy_behind_page) && !driver_reads_past;
         if (have_fallback && cs.in_range && !same(fallback_result[i], cs.expected, cs.tolerance)) {
             std::fprintf(stderr, "%s: without the bounds the layer drew %sbut the in-range outcome is %s\n", cs.name,
                          text(fallback_result[i]).c_str(), text(cs.expected).c_str());
@@ -561,8 +651,11 @@ int main() {
                 ++failures;
             } else if (!defined) {
                 std::printf("info: %s: no pass/fail condition (%s; outcomes are above)\n", cs.name,
-                            cs.defined ? "the decoy is not right behind the zero page, so the read is not placed"
-                                       : "the host's per-element outcome is not claimed");
+                            !cs.defined ? "the host's per-element outcome is not claimed"
+                                        : driver_reads_past ? "this GPU reads past the view itself, so the bounds do "
+                                                              "not decide the case"
+                                                            : "the decoy is not right behind the zero page, so the "
+                                                              "read is not placed");
                 ++informational;
             } else {
                 ++compared;
@@ -594,7 +687,9 @@ int main() {
         std::fprintf(stderr, "d3d12_ia_bounds_test: %u case(s) differ\n", failures);
         return 1;
     }
-    std::printf("input-assembler bounds: %u cases match%s, %u informational\n", compared,
-                wine ? " the recorded host outcomes" : " the host", informational);
+    std::printf("input-assembler bounds: %u cases match%s, %u informational (%s)\n", compared,
+                wine ? " the recorded host outcomes" : " the host", informational, fixture->name);
+    if (have_tail)
+        std::printf("input-assembler bounds: the --pc-tail-ubo pair drew the same probes as the 144-byte one\n");
     return 0;
 }
