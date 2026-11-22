@@ -12182,22 +12182,24 @@ def interp_ij_analysis(insns, g):
 
     def reaching_write(reg, s):
         """A write of reg the site can see: earlier in its own block, or in any block a path runs
-        through first (loops included). A write at the site itself -- an interp whose destination is
-        its own I/J register -- happens after the operand is read and does not count."""
+        through first (loops included: a write at or after the site in block b reaches via a back-edge).
+        A write at the site itself -- an interp whose destination is its own I/J register -- happens after
+        the operand is read in that iteration and does not count without a path back to b."""
         ws = writes.get(reg)
         if not ws:
             return False
         b = blk[s["n"]]
         if any(w < s["n"] and blk[w] == b for w in ws):
             return True
-        seen, work = {b}, [b]
+        seen, work = set(), [b]
         while work:
             for p in preds[work.pop()]:
                 if p not in seen:
                     seen.add(p)
-                    if any(w for w in ws if blk[w] == p):
+                    if any(blk[w] == p for w in ws):
                         return True
-                    work.append(p)
+                    if p != b:
+                        work.append(p)
         return False
 
     for s in sites:

@@ -166,6 +166,61 @@ class ComputedIJ(unittest.TestCase):
         self.assertEqual(floats(w_untaken[:2]), (2 * I, 2 * J))
         self.assertEqual(floats(w_taken[:2]), (0.0, 2 * J))
 
+    def test_write_at_insn_zero_before_branch_is_computed(self):
+        """A write to v0 at instruction index 0 before a branch still reaches the interp site."""
+        spv = support.translate_lines("ps_ij_insn0_v0", [
+            "v_mov_b32_e32 v0, 0    ; encoding: [0,0,0,0]",
+            "s_branch 0    ; encoding: [0,0,0,0]",
+            "v_interp_p1_f32_e32 v2, v0, attr0.x    ; encoding: [0,0,0,0]",
+            "v_interp_p2_f32_e32 v2, v1, attr0.x    ; encoding: [0,0,0,0]",
+            "exp mrt0 v2, v2, v2, v2 done vm    ; encoding: [0,0,0,0]",
+            "s_endpgm    ; encoding: [0,0,0,0]",
+        ])
+        self.assertIn("PerVertexKHR", spv)
+        self.assertIn("OpFSub %float", spv)
+        w = support.mrt0_words(spv, inputs=support.varyings(spv, {0: ATTR0}, BARY))
+        self.assertEqual(floats(w[:1]), (0.0,))
+
+    def test_non_v0_write_at_insn_zero_before_branch_is_computed(self):
+        """A write to a non-v0 VGPR at instruction index 0 before a branch reaches the interp site."""
+        spv = support.translate_lines("ps_ij_insn0_v5", [
+            "v_mov_b32_e32 v5, 0.5    ; encoding: [0,0,0,0]",
+            "s_branch 0    ; encoding: [0,0,0,0]",
+            "v_interp_p1_f32_e32 v2, v5, attr0.x    ; encoding: [0,0,0,0]",
+            "v_interp_p2_f32_e32 v2, v1, attr0.x    ; encoding: [0,0,0,0]",
+            "exp mrt0 v2, v2, v2, v2 done vm    ; encoding: [0,0,0,0]",
+            "s_endpgm    ; encoding: [0,0,0,0]",
+        ])
+        self.assertIn("PerVertexKHR", spv)
+        self.assertIn("OpFSub %float", spv)
+        w = support.mrt0_words(spv, inputs=support.varyings(spv, {0: ATTR0}, BARY))
+        self.assertEqual(floats(w[:1]), (1.0,))
+
+    def test_loop_backedge_write_after_interp_in_same_block_is_computed(self):
+        """Across a loop back-edge into block b, a write later in b reaches the site on the next iteration."""
+        spv = support.translate_lines("ps_ij_loop_backedge", [
+            "v_interp_p1_f32_e32 v2, v0, attr0.x    ; encoding: [0,0,0,0]",
+            "v_interp_p2_f32_e32 v2, v1, attr0.x    ; encoding: [0,0,0,0]",
+            "v_mov_b32_e32 v0, 0    ; encoding: [0,0,0,0]",
+            "s_cbranch_scc1 -4    ; encoding: [0,0,0,0]",
+            "exp mrt0 v2, v2, v2, v2 done vm    ; encoding: [0,0,0,0]",
+            "s_endpgm    ; encoding: [0,0,0,0]",
+        ])
+        self.assertIn("PerVertexKHR", spv)
+        self.assertIn("OpFSub %float", spv)
+
+    def test_straight_line_self_dest_write_stays_pristine(self):
+        """A straight-line interp writing its own I/J register still does not count as reaching itself."""
+        spv, w = run([
+            "v_interp_p1_f32_e32 v0, v0, attr0.x",
+            "v_interp_p2_f32_e32 v0, v1, attr0.x",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ])
+        self.assertEqual(floats(w[:1]), (2 * I,))
+        self.assertNotIn("PerVertexKHR", spv)
+        self.assertNotIn("%bary", spv)
+
 
 class ComputedIJRefusals(unittest.TestCase):
     def refuse(self, asm, message):
