@@ -237,6 +237,86 @@ class DSGWSBarrierInstruction:
         return f"{parts[0]} {', '.join(parts[1:])}"
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarState:
+    """Scalar machine state comprising register files, m0, and GWS memory."""
+
+    def __init__(self, num_gws_resources: int = GWS_NUM_RESOURCES) -> None:
+        self.vgprs: list[int] = [0] * DEFAULT_NUM_VGPRS
+        self.sgprs: list[int] = [0] * DEFAULT_NUM_SGPRS
+        self.m0: int = 0
+        self.vcc: int = 0
+        self.scc: int = 0
+        self.gws: GWSMemory = GWSMemory(num_resources=num_gws_resources)
+
+    def get_vgpr(self, index: int) -> int:
+        return self.vgprs[index]
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        self.vgprs[index] = u32(val)
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index]
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        self.sgprs[index] = u32(val)
+
+    def get_m0(self) -> int:
+        return self.m0
+
+    def set_m0(self, val: int) -> None:
+        self.m0 = u32(val)
+
+    def get_reg(self, reg: RegisterOperand) -> int:
+        if reg.reg_type == RegType.VGPR:
+            return self.get_vgpr(reg.index)
+        return self.get_sgpr(reg.index)
+
+    def set_reg(self, reg: RegisterOperand, val: int) -> None:
+        if reg.reg_type == RegType.VGPR:
+            self.set_vgpr(reg.index, val)
+        else:
+            self.set_sgpr(reg.index, val)
+
+    def resolve_operand(self, op: Operand) -> int:
+        if isinstance(op, Immediate):
+            return op.val
+        return self.get_reg(op)
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for ds_gws_barrier."""
+
+    def execute(
+        self,
+        instr: DSGWSBarrierInstruction,
+        state: ScalarState,
+        wave_id: int = 0,
+    ) -> Tuple[int, bool, int]:
+        """Execute a single ds_gws_barrier instruction on scalar state.
+
+        Returns:
+            Tuple[int, bool, int]: (resource_id, satisfied, next_arrived_count)
+        """
+        # 1. Latch inputs prior to execution
+        target_count = state.get_reg(instr.vdata0)
+        m0 = state.get_m0()
+
+        # 2. Perform GWS barrier sync
+        rid, satisfied, arrived = state.gws.barrier_sync(
+            offset=instr.offset,
+            m0=m0,
+            target_count=target_count,
+            wave_id=wave_id,
+        )
+
+        # ds_gws_barrier produces no register writeback; registers are preserved
+        return rid, satisfied, arrived
+
+
 class TestGWSBarrierReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Phase 1: Unit tests for reference mathematical oracle and architectural model."""
 
@@ -370,6 +450,93 @@ class TestSymbolicAST(unittest.TestCase):
             RegisterOperand(256, RegType.VGPR)
         with self.assertRaises(ValueError):
             RegisterOperand(106, RegType.SGPR)
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Phase 3: Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.state = ScalarState()
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_single_wave_barrier(self) -> None:
+        # Target count 1: barrier resolves immediately on arrival
+        self.state.set_vgpr(0, 1)
+        instr = DSGWSBarrierInstruction(vdata0=RegisterOperand(0, RegType.VGPR), offset=0)
+
+        rid, satisfied, arrived = self.interp.execute(instr, self.state, wave_id=1)
+        self.assertEqual(rid, 0)
+        self.assertTrue(satisfied)
+        self.assertEqual(arrived, 0)
+        self.assertEqual(self.state.gws.read_arrived(0), 0)
+        self.assertEqual(self.state.gws.read_releases(0), 1)
+
+    def test_scalar_multi_wave_barrier(self) -> None:
+        # Target count 2
+        self.state.set_vgpr(1, 2)
+        instr = DSGWSBarrierInstruction(vdata0=RegisterOperand(1, RegType.VGPR), offset=5)
+
+        # First wave arrives
+        rid1, sat1, arr1 = self.interp.execute(instr, self.state, wave_id=10)
+        self.assertEqual(rid1, 5)
+        self.assertFalse(sat1)
+        self.assertEqual(arr1, 1)
+        self.assertEqual(self.state.gws.read_arrived(5), 1)
+        self.assertEqual(self.state.gws.read_releases(5), 0)
+
+        # Second wave arrives -> satisfied!
+        rid2, sat2, arr2 = self.interp.execute(instr, self.state, wave_id=11)
+        self.assertEqual(rid2, 5)
+        self.assertTrue(sat2)
+        self.assertEqual(arr2, 0)
+        self.assertEqual(self.state.gws.read_arrived(5), 0)
+        self.assertEqual(self.state.gws.read_releases(5), 1)
+
+    def test_scalar_with_offset_and_m0(self) -> None:
+        self.state.set_m0(8)
+        self.state.set_vgpr(2, 1)
+        instr = DSGWSBarrierInstruction(vdata0=RegisterOperand(2, RegType.VGPR), offset=4)
+
+        rid, sat, arr = self.interp.execute(instr, self.state, wave_id=20)
+        self.assertEqual(rid, 12)
+        self.assertTrue(sat)
+        self.assertEqual(self.state.get_m0(), 8)
+
+    def test_scalar_registers_unmodified(self) -> None:
+        for i in range(DEFAULT_NUM_VGPRS):
+            self.state.set_vgpr(i, 0x1100 + i)
+        for i in range(DEFAULT_NUM_SGPRS):
+            self.state.set_sgpr(i, 0x2200 + i)
+        self.state.set_m0(15)
+
+        instr = DSGWSBarrierInstruction(vdata0=RegisterOperand(50, RegType.VGPR), offset=3)
+        self.interp.execute(instr, self.state, wave_id=1)
+
+        for i in range(DEFAULT_NUM_VGPRS):
+            self.assertEqual(self.state.get_vgpr(i), 0x1100 + i)
+        for i in range(DEFAULT_NUM_SGPRS):
+            self.assertEqual(self.state.get_sgpr(i), 0x2200 + i)
+        self.assertEqual(self.state.get_m0(), 15)
+
+    def test_scalar_independent_barriers(self) -> None:
+        # Resource 1 target 2, Resource 2 target 3
+        self.state.set_vgpr(1, 2)
+        self.state.set_vgpr(2, 3)
+
+        instr1 = DSGWSBarrierInstruction(vdata0=RegisterOperand(1, RegType.VGPR), offset=1)
+        instr2 = DSGWSBarrierInstruction(vdata0=RegisterOperand(2, RegType.VGPR), offset=2)
+
+        # Wave arrives at res 1
+        _, sat1, _ = self.interp.execute(instr1, self.state, wave_id=1)
+        self.assertFalse(sat1)
+        self.assertEqual(self.state.gws.read_arrived(1), 1)
+        self.assertEqual(self.state.gws.read_arrived(2), 0)
+
+        # Wave arrives at res 2
+        _, sat2, _ = self.interp.execute(instr2, self.state, wave_id=2)
+        self.assertFalse(sat2)
+        self.assertEqual(self.state.gws.read_arrived(1), 1)
+        self.assertEqual(self.state.gws.read_arrived(2), 1)
 
 
 if __name__ == "__main__":
