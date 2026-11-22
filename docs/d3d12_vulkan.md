@@ -365,7 +365,9 @@ What is implemented (all of it testable without the game):
     levels, shader model, root signature version, predication (`VK_EXT_conditional_rendering`), command-queue
     priority support, protected-resource session queries, shader cache, existing heaps, serialization, cross-node
     sharing, displayable resources, meta-command queries (`E_INVALIDARG`), application-specific driver state, and
-    bytecode bypass hash support. `D3D12_OPTIONS8` reports unaligned block textures when the Vulkan logical device
+    bytecode bypass hash support. A `D3D12_OPTIONS` request with more bytes than the PC structure has (the console's is
+    0x40, the PC's 0x3C) gets the PC fields and zeros after them, here and in the proxy over a PC runtime
+    (`d3d12_console_feature.h`). `D3D12_OPTIONS8` reports unaligned block textures when the Vulkan logical device
     enables BC texture compression, and `D3D12_OPTIONS12` reports `RelaxedFormatCastingSupported = TRUE`, so a
     committed or placed texture accepts a castable-format list. Other queries (including `OPTIONS6` and `OPTIONS10`)
     are logged and refused until the trace shows what the game asks (question 11);
@@ -1707,6 +1709,15 @@ The trace will enumerate them.
   against the host PC runtime (616.86) on an RTX 5070: `S_OK` with `WaveOps` 1, lanes 32..32 and a total of 6144,
   and `E_INVALIDARG` for a `DataSize` one field too short or too long. The host crashed the process on a null
   buffer, so the layer refuses one without asking the host (as with root signatures).
+- `D3D12_FEATURE_D3D12_OPTIONS` with the console's larger structure: a retail console title (measured by the XCL
+  project; GTA VI is not measured) asks with 0x40 bytes where the PC structure is 0x3C and stops on `E_INVALIDARG`.
+  A size above the PC's gets the PC fields, every byte after them zeroed and `S_OK`, in the Vulkan device and in the
+  proxy's device slot 13 over a PC runtime (WARP refuses 0x40, as `device_proxy_test` prints). The size is logged: by the
+  Vulkan device once per distinct size (`[rt] d3d12: CheckFeatureSupport(D3D12_OPTIONS) asked for more bytes ...`),
+  by the proxy for the first such call (`[rt] d3d12_xs: CheckFeatureSupport(D3D12_OPTIONS) asked for N bytes ...`).
+  A smaller size is still `E_INVALIDARG`. No other feature
+  has the rule, because no other console size is measured and a console structure may carry input fields that zeros
+  would answer wrongly; add one when a trace shows the size.
 - `D3D12_OPTIONS` families: report the tier the Vulkan feature set can honour (resource binding tier 3 when
   descriptor indexing and update-after-bind are available), plus wave ops, 16-bit, barycentrics, render passes,
   VRS, mesh shader tier, and RT tier 1.1 only if the layer can honour them. The game may branch on these; a false

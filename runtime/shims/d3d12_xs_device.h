@@ -7,6 +7,9 @@
 //             (+0x00 root signature, +0x28 code, +0x30 size) to D3D12_COMPUTE_PIPELINE_STATE_DESC and forwards
 //             to PC CreateComputePipelineState (slot 11). The PC slot 67 is CreateProtectedResourceSession1.
 //   slot 76   resource creation -> PC CreateCommittedResource (PC slot 27), with the Xbox layout word ignored.
+//   slot 13   CheckFeatureSupport keeps the PC signature, but a D3D12_OPTIONS request with a structure larger than
+//             the PC's (0x40 against 0x3C, measured on a retail console title) is answered from the PC runtime's
+//             structure with the extra bytes zeroed; the PC runtime refuses that size. See d3d12_console_feature.h.
 // The measured slots 9/10 (GetCPU/GPUDescriptorHandleForHeapStart) are ID3D12DescriptorHeap methods, not device
 // methods: the PC device's 9/10 are CreateCommandAllocator/CreateGraphicsPipelineState and are forwarded unchanged.
 // On the PC heap those getters use the hidden return pointer in RDX; the Xbox ABI returns the 8-byte handle in
@@ -60,9 +63,9 @@ unsigned device_proxy_slot_count(const void* device);
 ID3D12Device* device_proxy_real_device(const void* device);
 
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
-// proxies), 9 (allocator proxies), 14, 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 62, 67
-// and 76. Slot 10 is intentionally false: the measured 9/10 handle conversion is on the heap proxy, and device
-// slot 9 is CreateCommandAllocator, which the proxy handles for the allocator proxy.
+// proxies), 9 (allocator proxies), 13 (console-sized D3D12_OPTIONS), 14, 31/34/35/45/46/50 (proxies unwrapped),
+// 32 and 36 (fence proxies), 62, 67 and 76. Slot 10 is intentionally false: the measured 9/10 handle conversion is on
+// the heap proxy, and device slot 9 is CreateCommandAllocator, which the proxy handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);
 
 // Queue and fence proxies created by device slots 8/75 and 36. The real_* accessors return the wrapped object

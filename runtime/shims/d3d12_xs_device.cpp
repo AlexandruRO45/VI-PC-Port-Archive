@@ -17,6 +17,7 @@
 // values it read from those slots. A helper that moved a word to another stack position would overwrite the title's
 // frame. xs_proxy_mock_test's mock hit this in an optimized build, and its thunks now pass their words by pointer.
 #include "d3d12_xs_device.h"
+#include "d3d12_console_feature.h"
 #include "d3d12_trace.h"
 
 #include <windows.h>
@@ -81,6 +82,7 @@ const char* slot_name(unsigned slot) {
         case 9: return "CreateCommandAllocator (PC slot 9)";
         case 10: return "CreateGraphicsPipelineState (PC slot 10)";
         case 11: return "CreateComputePipelineState (PC slot 11)";
+        case 13: return "CheckFeatureSupport (a console-sized D3D12_OPTIONS is answered here)";
         case 14: return "CreateDescriptorHeap";
         case 16: return "CreateRootSignature";
         case 25: return "GetResourceAllocationInfo";
@@ -1005,6 +1007,35 @@ HRESULT proxy_unwrapping_call(DeviceProxy* self, std::uint64_t a1, std::uint64_t
     return static_cast<HRESULT>(static_cast<std::uint32_t>(forward_device<Slot>(self, r1, r2, r3, r4, a5)));
 }
 
+// Device slot 13: CheckFeatureSupport(feature, data, size). The console asks for D3D12_OPTIONS with a structure larger
+// than the PC's (0x40 against 0x3C, measured on a retail console title) and the PC runtime refuses any other size, so
+// that call is answered here: the PC runtime fills its own structure, the console's extra bytes are zeroed, S_OK
+// (d3d12_console_feature.h). The PC runtime's own failure is returned as it is and leaves the caller's buffer
+// untouched, and no buffer is E_INVALIDARG. Every other call (other features, the PC size, a smaller size) goes to
+// the PC device unchanged and gets its HRESULT. feature and size are 32-bit values in 64-bit words whose upper
+// halves the caller leaves undefined.
+HRESULT proxy_check_feature_support(DeviceProxy* self, std::uint64_t feature, std::uint64_t data, std::uint64_t size,
+                                    std::uint64_t a4, std::uint64_t a5) {
+    note_slot(13);
+    const auto requested = static_cast<D3D12_FEATURE>(static_cast<std::uint32_t>(feature));
+    const auto bytes = static_cast<UINT>(static_cast<std::uint32_t>(size));
+    if (rt::d3d12::is_console_sized_feature_request(requested, bytes)) {
+        if (!data) return E_INVALIDARG;  // as the PC size with no buffer; not sent on: a PC runtime can fault on it
+        D3D12_FEATURE_DATA_D3D12_OPTIONS pc{};
+        const HRESULT hr = self->real->CheckFeatureSupport(requested, &pc, sizeof(pc));
+        if (FAILED(hr)) return hr;
+        rt::d3d12::store_with_console_tail(reinterpret_cast<void*>(data), bytes, &pc, sizeof(pc));
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: CheckFeatureSupport(D3D12_OPTIONS) asked for %u bytes, the PC structure has "
+                         "%u: PC answer, extra bytes zeroed\n",
+                         bytes, static_cast<unsigned>(sizeof(pc)));
+        return hr;
+    }
+    return static_cast<HRESULT>(static_cast<std::uint32_t>(forward_device<13>(self, feature, data, size, a4, a5)));
+}
+
 HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_HEAP_DESC* desc, const IID* riid,
                                      void** out) {
     note_slot(14);
@@ -1150,6 +1181,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                                   reinterpret_cast<void**>(a3)));
     } else if constexpr (Slot == 31 || Slot == 34 || Slot == 35 || Slot == 45 || Slot == 46 || Slot == 50) {
         return hr_to_u64(proxy_unwrapping_call<Slot>(self, a1, a2, a3, a4, a5));
+    } else if constexpr (Slot == 13) {
+        return hr_to_u64(proxy_check_feature_support(self, a1, a2, a3, a4, a5));
     } else if constexpr (Slot == 75) {
         return hr_to_u64(proxy_create_command_queue1(self, a1, a2, reinterpret_cast<const IID*>(a3),
                                                      reinterpret_cast<void**>(a4)));
@@ -1295,8 +1328,8 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 }
 
 bool device_slot_overridden(unsigned slot) {
-    return slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
-           slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
+    return slot <= 2 || slot == 8 || slot == 9 || slot == 13 || slot == 14 || slot == 31 || slot == 32 || slot == 34 ||
+           slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
            slot == 75 || slot == 76;
 }
 

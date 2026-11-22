@@ -8,6 +8,8 @@
 //   slot 62  CreateComputePipelineState
 //   slot 76  resource creation with an Xbox layout word (0x101)
 //   slot 8/36 CreateCommandQueue/CreateFence (return queue and fence proxies that run GPU work)
+//   slot 13   CheckFeatureSupport: a D3D12_OPTIONS request with the console's 0x40 bytes (the PC runtime refuses
+//             anything but its own 0x3C) is answered from the PC structure with the extra bytes zeroed
 // Slot 9 on the device is CreateCommandAllocator on the PC vtable and must still forward, which proves the handle
 // getters were not wedged into the device slots. Console output also shows the proxy's first-call slot log.
 #include <windows.h>
@@ -21,6 +23,8 @@
 
 #include <wrl/client.h>
 
+#include "d3d12_console_feature.h"
+#include "d3d12_options_size_check.h"
 #include "d3d12_xs_device.h"
 #include "shims.h"
 
@@ -272,6 +276,52 @@ int main() {
         check(rt::d3d12_xs::heap_slot_hits(9) >= 1, "heap slot 9 hit counter moves");
         check(rt::d3d12_xs::heap_slot_hits(10) >= 1, "heap slot 10 hit counter moves");
         check(rt::d3d12_xs::heap_slot_first_call_seen(9), "heap slot 9 first-call flag is set");
+    }
+
+    // Slot 13: CheckFeatureSupport. The console asks for D3D12_OPTIONS with 0x40 bytes where the PC structure has
+    // 0x3C. The PC runtime refuses that (printed below, not asserted: the proxy answers the call itself either way),
+    // so the proxy asks it for the PC structure and zeroes the console's extra bytes. Every other call is forwarded.
+    check(rt::d3d12_xs::device_slot_overridden(13), "device slot 13 is the CheckFeatureSupport override");
+    check(!rt::d3d12::is_console_sized_feature_request(D3D12_FEATURE_D3D12_OPTIONS, optsize::kPcSize) &&
+              !rt::d3d12::is_console_sized_feature_request(D3D12_FEATURE_D3D12_OPTIONS, optsize::kPcSize - 1) &&
+              !rt::d3d12::is_console_sized_feature_request(D3D12_FEATURE_D3D12_OPTIONS, 0) &&
+              rt::d3d12::is_console_sized_feature_request(D3D12_FEATURE_D3D12_OPTIONS, optsize::kPcSize + 1) &&
+              rt::d3d12::is_console_sized_feature_request(D3D12_FEATURE_D3D12_OPTIONS, 0x40) &&
+              rt::d3d12::is_console_sized_feature_request(D3D12_FEATURE_D3D12_OPTIONS, 0x10000) &&
+              !rt::d3d12::is_console_sized_feature_request(D3D12_FEATURE_D3D12_OPTIONS1, 0x1000) &&
+              !rt::d3d12::is_console_sized_feature_request(D3D12_FEATURE_FORMAT_SUPPORT, 0x1000),
+          "only a D3D12_OPTIONS request above the PC structure is console-sized");
+    if (real) {
+        std::uint8_t console_buffer[0x40] = {};
+        const HRESULT pc_hr =
+            real->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, console_buffer, sizeof(console_buffer));
+        std::printf("the PC runtime (WARP) answers D3D12_OPTIONS with 0x40 bytes: 0x%08lX (%s)\n",
+                    static_cast<unsigned long>(pc_hr),
+                    pc_hr == E_INVALIDARG ? "E_INVALIDARG, as the premise says" : "not refused");
+    }
+    const std::uint64_t slot13_before = rt::d3d12_xs::device_slot_hits(13);
+    check(optsize::check(device.Get(), "proxy over WARP") == 0,
+          "slot 13 answers D3D12_OPTIONS at 0x3C, 0x40 and larger sizes (extra bytes zero), refuses smaller ones");
+    check(rt::d3d12_xs::device_slot_hits(13) > slot13_before, "slot 13 hit counter moves");
+    check(rt::d3d12_xs::device_slot_first_call_seen(13), "slot 13 first-call flag is set");
+    {
+        // The Xbox call shape: feature and size are 32-bit values in 64-bit words, the upper halves undefined.
+        using CheckFeatureFn = HRESULT(WINAPI*)(void*, std::uint64_t, void*, std::uint64_t);
+        D3D12_FEATURE_DATA_D3D12_OPTIONS pc_answer{};
+        check(SUCCEEDED(real->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &pc_answer, sizeof(pc_answer))),
+              "the PC runtime answers D3D12_OPTIONS at its own size");
+        std::uint8_t buffer[0x40 + 8];
+        std::memset(buffer, 0xCD, sizeof(buffer));
+        const HRESULT raw_hr = reinterpret_cast<CheckFeatureFn>(proxy_vtbl[13])(
+            device.Get(), 0xDEADBEEF00000000ull | D3D12_FEATURE_D3D12_OPTIONS, buffer, 0xDEADBEEF00000000ull | 0x40);
+        bool tail_zero = true, guard_intact = true;
+        for (size_t i = 0x3C; i < 0x40; ++i) tail_zero = tail_zero && buffer[i] == 0;
+        for (size_t i = 0x40; i < sizeof(buffer); ++i) guard_intact = guard_intact && buffer[i] == 0xCD;
+        check(raw_hr == S_OK && std::memcmp(buffer, &pc_answer, 0x3C) == 0 && tail_zero && guard_intact,
+              "slot 13 reads feature and size as 32-bit values (garbage in the upper halves)");
+        D3D12_FEATURE_DATA_D3D12_OPTIONS1 options1{};
+        check(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &options1, sizeof(options1))),
+              "slot 13 forwards another feature at its PC size");
     }
 
     // Slot 9 on the device must remain CreateCommandAllocator, not a handle getter.
