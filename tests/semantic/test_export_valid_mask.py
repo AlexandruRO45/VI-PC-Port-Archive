@@ -2,9 +2,11 @@
 lane that was off at the last export to the color target is not written either.
 
 RDNA2 ISA reference guide (30-November-2020), 11.1 and 11.2.1: with VM set EXEC is the valid mask, the final one
-sent is used, and an export to NULL may carry only the mask. Measured on RDNA2 (gfx1036, ps_oracle.py of #3061, 18
-programs; docs/design.md, EXEC): that rule holds, and the color export has its own mask, EXEC at that export, which
-is also what decides on a path with no `vm` export (class ColorExportMask). Hand-written programs, no tools needed.
+sent is used, and an export to NULL may carry only the mask. Measured on RDNA2 (gfx1036, ps_oracle.py of #3061,
+18 programs; docs/design.md, EXEC): that rule holds, and the color export has its own mask, EXEC at that export,
+which is also what decides on a path with no `vm` export (class ColorExportMask). The same rule on a GPU
+fragment stage through a translated shader: runtime/test/shaders/ps_vm_mask_{late,null,end}.asm (SHADER-482).
+Hand-written programs, no tools needed.
 """
 from pathlib import Path
 import unittest

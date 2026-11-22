@@ -482,6 +482,30 @@ def check_wqm(raw_path: str) -> tuple[bool, str]:
     return wrong == 0, "whole-quad mask exact on every pixel" if not wrong else f"{wrong} of {len(px)} pixels differ"
 
 
+# SHADER-482: the valid mask a `vm` export sends (docs/design.md EXEC row, ISA guide 11.1/11.2.1). The value is the
+# parity of the columns that survive; every other column must be the clear value, as in check.py.
+VM_MASK_CLEAR = (0xBF800000,) * 4     # -1.0 in all four components: what vk_harness clears the target to
+VM_MASK_KEPT = (0x3F800000,) * 4      # the 1.0 the fixtures export
+VM_MASK_TESTS = {"ps_vm_mask_late": "odd",     # on at the vm export, off at the end: these survive
+                 "ps_vm_mask_null": "even",    # the NULL export's mask is the last one: the even ones survive
+                 "ps_vm_mask_end": "even"}     # no vm export at all: EXEC at the end keeps the even ones
+
+
+def check_vm_mask(raw_path: str, kept: str) -> tuple[bool, str]:
+    """ps_vm_mask_*.asm: `kept` is the column parity that survives; the other columns must be the clear value."""
+    px = read_raw_u32(raw_path)
+    if problem := frame_problem(px):
+        return False, problem
+    w = int(len(px) ** 0.5)
+    want = [VM_MASK_KEPT if (((x & 1) == 1) == (kept == "odd")) else VM_MASK_CLEAR for x in range(w)]
+    bad = [(i, p) for i, p in enumerate(px) if p != want[i % w]]
+    if not bad:
+        return True, f"{len(px)}/{len(px)} pixels: the {kept} columns survive, the rest are the clear value"
+    i, p = bad[0]
+    return False, (f"{len(bad)}/{len(px)} mismatches; first at ({i % w},{i // w}): "
+                   f"got {[hex(x) for x in p]}, want {[hex(x) for x in want[i % w]]}")
+
+
 def check_uniform_branch(raw_path: str) -> tuple[bool, str]:
     px = read_raw_rgba32f(raw_path)
     u32 = read_raw_u32(raw_path)
@@ -1383,6 +1407,8 @@ def run_suite(a, work: str) -> int:
                 ok, detail = check_uniform_branch(raw)
             elif name == "ps_wqm":
                 ok, detail = check_wqm(raw)
+            elif name in VM_MASK_TESTS:                    # SHADER-482: the mask a `vm` export sends
+                ok, detail = check_vm_mask(raw, VM_MASK_TESTS[name])
             elif name == "ps_flat":
                 ok, detail = check_flat(raw)
             elif name == "ps_interp_f16_high":

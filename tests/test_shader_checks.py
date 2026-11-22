@@ -1107,10 +1107,24 @@ class TexelOffsetFormsChecks(unittest.TestCase):
 class PixelTestRegistry(unittest.TestCase):
     def test_pixel_tests_include_every_pixel_fixture(self):
         # A repeated PIXEL_TESTS assignment silently dropped ps_texoff once; keep the registry explicit.
-        for name in ("ps_texoff", "ps_texoff_forms", "ps_wqm", "ps_scc_mask32"):
+        for name in ("ps_texoff", "ps_texoff_forms", "ps_wqm", "ps_scc_mask32", "ps_vm_mask_late",
+                     "ps_vm_mask_null", "ps_vm_mask_end"):
             with self.subTest(name=name):
                 self.assertIn(name, check.PIXEL_TESTS)
         self.assertEqual(len(check.PIXEL_TESTS), len(set(check.PIXEL_TESTS)))
+
+    def test_vm_mask_judges_column_parity(self):
+        # SHADER-482: these frames are per-column parity, so the inverted frame a translator that used EXEC at the
+        # end instead of the latched valid mask would produce has to be rejected, not just a uniform one.
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "ps_vm_mask_late.spv").touch()
+            odd, clear = (0x3F800000,) * 4, (0xBF800000,) * 4
+            good = [odd if x % 2 else clear for _ in range(64) for x in range(64)]
+            inverted = [clear if x % 2 else odd for _ in range(64) for x in range(64)]
+            with patch.object(check, "pixels", return_value=(good, "")):
+                self.assertEqual(check.pixel_test("tools", tmp, "ps_vm_mask_late"), "")
+            with patch.object(check, "pixels", return_value=(inverted, "")):
+                self.assertTrue(check.pixel_test("tools", tmp, "ps_vm_mask_late").startswith("4096 of 4096 pixels"))
 
     def test_pixel_test_runs_the_harness_once(self):
         # A duplicated pixels() line ran the whole shader twice and could hide a first-call failure behind a

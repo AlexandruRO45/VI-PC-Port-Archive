@@ -454,6 +454,15 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_vint_minmax3": (0xf0f0f0f0, 0xab800000, 0xf0f0f0f0, 0xab800000),
               # v_readlane_b32 across both halves of a wave64 (the .asm header derives the words)
               "ps_w64x_readlane": (0x40000079, 0x40000010, 0x40000064, 0x400000be)}
+# SHADER-482: the valid mask a `vm` export sends (docs/design.md EXEC row, ISA guide 11.1/11.2.1). Every pixel is
+# either kept or discarded by a rule the .asm header derives, so the frame is per-column parity rather than one
+# word: the value is the parity of the columns that survive, and the rest must be the clear value vk_harness uses
+# for "nothing wrote this pixel" (-1.0 in all four components).
+VM_MASK_CLEAR = (0xbf800000,) * 4
+VM_MASK_KEPT = (0x3f800000,) * 4
+VM_MASK_TESTS = {"ps_vm_mask_late": "odd",     # on at the vm export, off at the end: these survive
+                 "ps_vm_mask_null": "even",    # the NULL export's mask is the last one: the even ones survive
+                 "ps_vm_mask_end": "even"}     # no vm export at all: EXEC at the end keeps the even ones
 # Pixel shaders that are exact only when the pixel stage really ran 64 lanes wide. vk_harness says so when it chained
 # a required subgroup size onto the fragment stage ("fragment subgroup size: N", the whole line; a device that could
 # not take the size gets "fragment subgroup size: N not available" or no line). A device that cannot
@@ -515,7 +524,7 @@ NAN_PAYLOAD_TEST = "ps_nan_payload"
 PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_persp_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff",
                       "ps_texoff_implicit", "ps_texoff_forms",
                       "ps_uniform_branch", "ps_wqm", "ps_scc_mask32", "ps_interp_f16_high", "ps_ij_computed",
-                      "ps_mandelbrot", NAN_PAYLOAD_TEST))
+                      "ps_mandelbrot", NAN_PAYLOAD_TEST, *VM_MASK_TESTS))
 # Pixel fixtures drawn with another vertex shader than vs_ids.
 PIXEL_VERTEX = {"ps_interp_f16_high": "vs_f16_pack", "ps_persp_bary": "vs_persp",
                 "ps_interp_f32_mods": "vs_interp_consts", "ps_interp_mov_mods": "vs_interp_consts"}
@@ -1649,6 +1658,23 @@ def pixel_test(tools, spirv, name):
         return barycentric_problem(px, 1e-6)
     if name == "ps_persp_bary":
         return bary_persp_problem(px)
+    if name in VM_MASK_TESTS:
+        # The column's parity decides: half the frame is discarded by the valid mask the .asm header derives.
+        w = int(n ** 0.5)
+        kept_odd = VM_MASK_TESTS[name] == "odd"
+        wrong = [(i, p) for i, p in enumerate(px)
+                 if p != (VM_MASK_KEPT if (((i % w) & 1) == 1) == kept_odd else VM_MASK_CLEAR)]
+        if not wrong:
+            return ""
+        i, got = wrong[0]
+        want = VM_MASK_KEPT if (((i % w) & 1) == 1) == kept_odd else VM_MASK_CLEAR
+        return (f"{len(wrong)} of {n} pixels differ, e.g. pixel ({i % w}, {i // w}) "
+                f"{[hex(x) for x in got]} instead of {[hex(x) for x in want]}")
+    if name == "ps_bary":                              # raw i, j against the interpolated attr0.xy / 2
+        if any(not math.isfinite(v) for p in px for v in p):
+            return "barycentrics contain non-finite values"
+        err = max(max(abs(a / 2 - i), abs(b / 2 - j)) for a, b, i, j in px)
+        return "" if err < 1e-6 else f"barycentrics off by {err:.3g}"
     if name == "ps_flat":
         if any(not math.isfinite(v) for p in px for v in p[2:]):
             return "UVs contain non-finite values"
