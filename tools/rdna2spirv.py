@@ -3797,6 +3797,89 @@ class Gen:
             return g
         return v
 
+    def div_scale_f32(self, a, mods):
+        """v_div_scale_f32 D, sdst, S0, S1, S2 (S1 the denominator, S2 the numerator, S0 one of them): pre-scales
+        an operand of a float division by 2**+-64 and sets the sdst lane bit when the later v_div_fmas_f32 must
+        undo a scaling. Measured natively on RDNA2 gfx1036 (tools/hw_oracle, 3,074 operand triples) in the game's
+        MODE (f32 denormals flushed), which differs from the ISA pseudocode. A denormal operand (S0 too) reads as
+        a zero of its sign. With e1, e2 the exponent fields of S1, S2 after that (0 for zero, 255 for inf and NaN;
+        the mantissas play no part), the first rule that matches wins:
+          e2 - e1 >= 96              sdst=1, D = S0 == S1 ? S0 * 2**64 : S0
+          e1 == 0                    D = S0 * 2**64
+          e1 >= 253, e1 - e2 >= 96   sdst=1, D = S0 == S1 ? S0 * 2**-64 : S0
+          e1 >= 253                  D = S0 * 2**-64
+          e1 - e2 >= 96              sdst=1, D = S0 == S1 ? S0 : S0 * 2**64
+          e2 <= 24                   D = S0 * 2**64
+          otherwise                  D = S0
+        S0 == S1 compares the values after neg (a copy of S1 in another register counts). A zero S1 or S2 makes
+        D the NaN 0xffc00000 and leaves sdst as above. The scaling keeps a NaN (payload included), an inf and a
+        zero; x 2**64 overflows to inf from exponent field 191; x 2**-64 gives a zero of S0's sign at exponent
+        field 64 (the denormal result is flushed) and inf of S0's sign at 63 or less. clamp gives +0 for NaN,
+        zero and negatives and 1.0 from 1.0 up; omod is ignored. Inactive lanes write 0 to sdst. Integer ops."""
+        u = self.cu
+
+        def op(opc, *xs, ty="%uint"):
+            r = self.tmp()
+            self.emit(f"{r} = {opc} {ty} {' '.join(xs)}")
+            return r
+
+        def cmp(opc, x, y):
+            return op(opc, x, y, ty="%bool")
+
+        def sel(c, x, y, ty="%uint"):
+            return op("OpSelect", c, x, y, ty=ty)
+
+        def word(sv):
+            if sv.get("abs"):
+                raise Unsupported("v_div_scale_f32 abs")    # VOP3b has no abs field (the assembler rejects it)
+            w = self.src_u({**sv, "neg": False})    # src_u would negate as a float; flip the sign bit instead
+            if sv.get("neg"):
+                w = op("OpBitwiseXor", w, u(0x80000000))
+            # flushed denormal: a zero of its sign
+            e = op("OpBitFieldUExtract", w, u(23), u(8))
+            return sel(cmp("OpIEqual", e, u(0)), op("OpBitwiseAnd", w, u(0x80000000)), w)
+
+        w0, w1, w2 = (word(s) for s in a[2:5])
+        e0, e1, e2 = (op("OpBitFieldUExtract", w, u(23), u(8)) for w in (w0, w1, w2))
+        big_q = cmp("OpUGreaterThanEqual", e2, op("OpIAdd", e1, u(96)))       # e2 - e1 >= 96
+        small_q = cmp("OpUGreaterThanEqual", e1, op("OpIAdd", e2, u(96)))     # e1 - e2 >= 96
+        den_tiny = cmp("OpIEqual", e1, u(0))
+        den_huge = cmp("OpUGreaterThanEqual", e1, u(253))
+        num_tiny = cmp("OpULessThanEqual", e2, u(24))
+        eq01 = cmp("OpIEqual", w0, w1)
+        ne01 = op("OpLogicalNot", eq01, ty="%bool")
+        # Each rule as (up: x 2**64, down: x 2**-64), lowest priority first so that a later one overrides.
+        up, down = "%false", "%false"
+        for cond, scale_up, scale_down in ((num_tiny, "%true", "%false"),
+                                           (small_q, ne01, "%false"),
+                                           (den_huge, "%false", "%true"),
+                                           (op("OpLogicalAnd", den_huge, small_q, ty="%bool"), "%false", eq01),
+                                           (den_tiny, "%true", "%false"),
+                                           (big_q, eq01, "%false")):
+            up, down = sel(cond, scale_up, up, "%bool"), sel(cond, scale_down, down, "%bool")
+        vcc = op("OpLogicalOr", big_q, small_q, ty="%bool")
+        sign = op("OpBitwiseAnd", w0, u(0x80000000))
+        inf = op("OpBitwiseOr", sign, u(0x7F800000))
+        keep = op("OpLogicalOr", cmp("OpIEqual", e0, u(255)), cmp("OpIEqual", e0, u(0)), ty="%bool")  # NaN, inf, 0
+        up_w = sel(cmp("OpUGreaterThanEqual", e0, u(191)), inf, op("OpIAdd", w0, u(64 << 23)))
+        down_w = sel(cmp("OpUGreaterThanEqual", e0, u(65)), op("OpISub", w0, u(64 << 23)),
+                     sel(cmp("OpIEqual", e0, u(64)), sign, inf))
+        up = op("OpLogicalAnd", up, op("OpLogicalNot", keep, ty="%bool"), ty="%bool")
+        down = op("OpLogicalAnd", down, op("OpLogicalNot", keep, ty="%bool"), ty="%bool")
+        d = sel(up, up_w, sel(down, down_w, w0))
+        zero = op("OpLogicalOr", cmp("OpIEqual", e1, u(0)), cmp("OpIEqual", e2, u(0)), ty="%bool")
+        d = sel(zero, u(0xFFC00000), d)
+        if "clamp" in mods:
+            # measured: NaN, zeros and negatives give +0, 1.0 and up (+inf too) give 1.0
+            pos = op("OpLogicalAnd", cmp("OpULessThanEqual", d, u(0x7F800000)), cmp("OpINotEqual", d, u(0)),
+                     ty="%bool")
+            d = sel(pos, sel(cmp("OpUGreaterThanEqual", d, u(0x3F800000)), u(0x3F800000), d), u(0))
+        self.dst(a[0], d)
+        cd = a[1]
+        if not (cd["k"] == "special" and cd["t"] == "null"):
+            cm = op("OpLogicalAnd", vcc, self.active_b(), ty="%bool")       # inactive lanes write 0
+            self.mask_dst(cd, sel(cm, u(0xFFFFFFFF), u(0)))
+
     def turn_angle(self, x):
         """Reduce a turn count to [-0.5, 0.5] before scaling by 2*pi (SHADER-88).
 
@@ -4978,6 +5061,8 @@ class Gen:
                 r = self.tmp()
                 self.emit(f"{r} = OpFConvert %float {x}")
                 self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
+        elif op == "v_div_scale_f32":
+            self.div_scale_f32(a, mods)
         elif op in ("image_bvh_intersect_ray", "image_bvh64_intersect_ray"):
             self.image_bvh(op, a, mods)
         elif op == "s_bfm_b64":

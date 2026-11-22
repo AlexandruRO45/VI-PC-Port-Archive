@@ -34,7 +34,7 @@ TOTAL = (len(check.COMPUTE) + 5 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 11)  # three mesh fixtures, ps_tex, ps_imgatomic, five compute fixtures and
+         + len(check.TEXTURE_CONSTANTS) + 12)  # three mesh fixtures, ps_tex, ps_imgatomic, six compute fixtures and
          # ps_ssharp
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
@@ -70,6 +70,10 @@ class Wave64Checks(unittest.TestCase):
             if name == "cs_fmt_sint32":
                 self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "64"))
                 Path(env["VKC_DUMP"]).write_bytes(struct.pack("<64I", *check.FMT_SINT32_WORDS))
+                return 0, ""
+            if name == "cs_div_scale_f32":
+                self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "64"))
+                Path(env["VKC_DUMP"]).write_bytes(struct.pack("<64I", *check.DIV_SCALE_F32_WORDS))
                 return 0, ""
             if name in ("cs_fmt_xy_xyz", "cs_tbuffer_store"):
                 self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "192"))

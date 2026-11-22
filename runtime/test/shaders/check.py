@@ -158,6 +158,11 @@ BOUNDS = [("cs_bounds", [0x12345678, 0x12345678, 0x00000000, 0xEEEEEEEE]),
           # swizzled MUBUF addressing (RDNA2 ISA 8.1.5) and ADD_TID_ENABLE on lanes 0 and 1, derived in the .asm header
           ("cs_buf_swizzle", [0x5eed0024, 0x5eed0044, 0x5eed004c, 0x5eed0008, 0x5eed0028, 0, 0xbeef0000, 0xbeef0001])]
 CMPX_CLASS_WORDS = [0xEEEEEEEE] * 3 + [0x22] + [0x11] * 4
+# cs_div_scale_f32.asm: D, vcc for 16 v_div_scale_f32 cases (derived in the .asm header, measured on RDNA2 gfx1036),
+# then untouched words.
+DIV_SCALE_F32_WORDS = [0x5F800005, 1, 0x71800000, 1, 0x2D800003, 1, 0x3F800005, 1, 0x5F000000, 1, 0x5D000009, 0,
+                       0xFFC00000, 1, 0x2A000001, 0, 0x20800000, 0, 0xFFC00000, 1, 0x7F800001, 1, 0xBF800005, 1,
+                       0x00000000, 1, 0x3E800000, 0, 0x00000000, 0, 0x7F800000, 0] + [0xEEEEEEEE] * 32
 # cs_fmt_1010102.asm: descriptor loads, immediate-format load, raw input words and the two packed stores.
 FMT_1010102_WORDS = [0, 0x3F800000, 0, 0x3F800000, 0x3F800000, 0, 0x3F800000, 0,
                      0, 0x3F800000, 0, 0x3F800000, 0xC00FFC00, 0x003FF003, 0xE00003FF, 0xFFE00003]
@@ -468,6 +473,10 @@ def dump_test(tools, spirv, name, want, words, env=None):
         if got != expected:
             return f"word {i}: expected {expected:#010x}, got {got:#010x}"
     return ""
+
+
+def div_scale_f32_test(tools, spirv, env=None):
+    return dump_test(tools, spirv, "cs_div_scale_f32", DIV_SCALE_F32_WORDS, len(DIV_SCALE_F32_WORDS), env)
 
 
 def fmt_1010102_test(tools, spirv, env=None):
@@ -1289,6 +1298,7 @@ def main():
     results.append(("cs_cmpx_class_f32", compute_test(tools, spirv, "cs_cmpx_class_f32", "1", "dump",
                                                       expected_words=CMPX_CLASS_WORDS)))
     results.append(("cs_fmt_1010102", fmt_1010102_test(tools, spirv)))
+    results.append(("cs_div_scale_f32", div_scale_f32_test(tools, spirv)))
     results.append(("cs_fmt_sint32", fmt_sint32_test(tools, spirv)))
     results.append(("cs_fmt_xy_xyz", fmt_xy_xyz_test(tools, spirv)))
     results.append(("cs_tbuffer_store", tbuffer_store_test(tools, spirv)))

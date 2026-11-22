@@ -649,6 +649,78 @@ class MeasuredBoundsShaders(unittest.TestCase):
                 self.assertEqual(set(memory), set(range(0, 0x100, 4)), "nothing written outside the heap")
 
 
+def div_scale_f32_reference(s0, s1, s2, clamp=False):
+    """(D, vcc) of v_div_scale_f32 as measured on RDNA2 gfx1036 with f32 denormals flushed (docs/design.md), on
+    32-bit patterns after neg."""
+    def ex(b):
+        return (b >> 23) & 0xFF
+
+    def scale(b, n):
+        if ex(b) in (0, 0xFF):
+            return b                                   # NaN (payload kept), inf, zero
+        if n < 0 and ex(b) <= 64:
+            return b & 0x80000000 if ex(b) == 64 else (b & 0x80000000) | 0x7F800000   # measured
+        x = math.ldexp(struct.unpack("<f", struct.pack("<I", b))[0], n)
+        try:
+            return struct.unpack("<I", struct.pack("<f", x))[0]
+        except OverflowError:
+            return (b & 0x80000000) | 0x7F800000
+    s0, s1, s2 = (b & 0x80000000 if ex(b) == 0 else b for b in (s0, s1, s2))   # denormals read as zero
+    e1, e2 = ex(s1), ex(s2)
+    vcc, d = 0, s0
+    if e2 - e1 >= 96:
+        vcc, d = 1, scale(s0, 64) if s0 == s1 else s0
+    elif e1 == 0:
+        d = scale(s0, 64)
+    elif e1 >= 253 and e1 - e2 >= 96:
+        vcc, d = 1, scale(s0, -64) if s0 == s1 else s0
+    elif e1 >= 253:
+        d = scale(s0, -64)
+    elif e1 - e2 >= 96:
+        vcc, d = 1, s0 if s0 == s1 else scale(s0, 64)
+    elif e2 <= 24:
+        d = scale(s0, 64)
+    if e1 == 0 or e2 == 0:
+        d = 0xFFC00000
+    if clamp:
+        x = struct.unpack("<f", struct.pack("<I", d))[0]
+        d = struct.unpack("<I", struct.pack("<f", min(x, 1.0)))[0] if x > 0 else 0
+    return d, vcc
+
+
+class DivScaleF32(unittest.TestCase):
+    """v_div_scale_f32 (cs_div_scale_f32.asm): the 32 words the GPU check expects, measured on RDNA2 gfx1036."""
+
+    # (S0, S1, S2, clamp) of the 16 cases, neg applied; S0 is S1 or S2 except in cases 11 (-S1), 14 and 15
+    CASES = [(0x3F800005, 0x3F800005, 0x71800000, False), (0x71800000, 0x3F800005, 0x71800000, False),
+             (0x0D800003, 0x3F800005, 0x0D800003, False), (0x3F800005, 0x3F800005, 0x0D800003, False),
+             (0x7F000000, 0x7F000000, 0x3F800000, False), (0x7D000009, 0x7F000000, 0x7D000009, False),
+             (0x00000003, 0x3F800000, 0x00000003, False), (0x0A000001, 0x00800000, 0x0A000001, False),
+             (0x00800000, 0x00800000, 0x0A000001, False), (0, 0, 0x3F800000, False),
+             (0x7F800001, 0x3F800000, 0x7F800001, False), (0xBF800005, 0x3F800005, 0x71800000, False),
+             (0, 0, 0x3F800000, True), (0x3E800000, 0x3E800000, 0x3F000000, False),
+             (0x20000000, 0x7F000000, 0x7D000000, False), (0x1F800000, 0x7F000000, 0x7D000000, False)]
+    WANT = [0x5F800005, 1, 0x71800000, 1, 0x2D800003, 1, 0x3F800005, 1, 0x5F000000, 1, 0x5D000009, 0,
+            0xFFC00000, 1, 0x2A000001, 0, 0x20800000, 0, 0xFFC00000, 1, 0x7F800001, 1, 0xBF800005, 1,
+            0x00000000, 1, 0x3E800000, 0, 0x00000000, 0, 0x7F800000, 0]
+
+    def test_reference_gives_the_words(self):
+        got = [w for c in self.CASES for w in div_scale_f32_reference(*c)]
+        self.assertEqual([f"{w:#010x}" for w in got], [f"{w:#010x}" for w in self.WANT])
+
+    def test_translated_fixture(self):
+        sys.path.insert(0, os.path.join(support.ROOT, "runtime", "test", "shaders"))
+        from compute_fixture import compute_header
+        header = compute_header(os.path.join(support.ROOT, "runtime", "test", "shaders", "cs_div_scale_f32.asm"))
+        spv = support.translate_fixture("cs_div_scale_f32", fssm=bytes(header))
+        memory = {a: 0xEEEEEEEE for a in range(0, 0x100, 4)}
+        support.run_fragment(spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+                             push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28, memory=memory)
+        got = [memory[4 * i] for i in range(len(self.WANT))]
+        self.assertEqual([f"{w:#010x}" for w in got], [f"{w:#010x}" for w in self.WANT])
+        self.assertEqual({memory[a] for a in range(4 * len(self.WANT), 0x100, 4)}, {0xEEEEEEEE})
+
+
 class LaneMaskConstants(unittest.TestCase):
     """runtime/test/shaders/cs_w32_mask_imm.asm and cs_w64_mask_imm.asm: a constant read as a lane mask (saveexec,
     wrexec, s_and_b64 / s_not_b64 / s_mov_b64 into EXEC or VCC) gives lane L its bit L, not bit 0 for every lane.
