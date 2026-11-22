@@ -439,6 +439,67 @@ function range(def, p) {
   const d = cellDist(def, p);
   return { d, load: d >= band[0] && d < band[1], keep: d >= band[0] - LOD_SLACK && d < band[1] + LOD_SLACK };
 }
+
+// A static XZ tree for the manifest. Each node has bounds for both the visible geometry and the
+// area from which its chunks could load. Exact load distances and visibility are still checked below.
+function buildChunkIndex(chunks, bands) {
+  const entries = chunks.map((def, order) => {
+    const [minX, , minZ, maxX, , maxZ] = def.bounds;
+    const surface = [minX, minZ, maxX, maxZ];
+    const band = def.lod !== undefined ? bands?.[def.lod] : null;
+    const rect = band ? def.cell : surface;
+    const radius = band ? band[1] : LOAD_R;
+    const load = [rect[0] - radius, rect[1] - radius, rect[2] + radius, rect[3] + radius];
+    const center = [rect[0] / 2 + rect[2] / 2, rect[1] / 2 + rect[3] / 2];
+    return { def, order, load, surface, center };
+  });
+
+  function cover(items, kind) {
+    const extent = items[0][kind].slice();
+    for (let i = 1; i < items.length; i++) {
+      const r = items[i][kind];
+      extent[0] = Math.min(extent[0], r[0]);
+      extent[1] = Math.min(extent[1], r[1]);
+      extent[2] = Math.max(extent[2], r[2]);
+      extent[3] = Math.max(extent[3], r[3]);
+    }
+    return extent;
+  }
+  function split(items) {
+    const load = cover(items, "load"), surface = cover(items, "surface");
+    if (items.length <= 8) return { load, surface, items };
+    const axis = surface[2] - surface[0] >= surface[3] - surface[1] ? 0 : 1;
+    items.sort((a, b) => a.center[axis] - b.center[axis]);
+    const mid = Math.floor(items.length / 2);
+    return { load, surface, left: split(items.slice(0, mid)), right: split(items.slice(mid)) };
+  }
+  return entries.length ? split(entries) : null;
+}
+
+function queryChunkIndex(root, x, z, kind) {
+  const matches = [];
+  const contains = r => x >= r[0] && x <= r[2] && z >= r[1] && z <= r[3];
+  function visit(node) {
+    if (!node || !contains(node[kind])) return;
+    if (node.items) {
+      for (const entry of node.items) if (contains(entry[kind])) matches.push(entry);
+    } else {
+      visit(node.left);
+      visit(node.right);
+    }
+  }
+  visit(root);
+  return matches;
+}
+let indexedWorld, chunkIndex;
+function nearbyChunks(x, z, kind) {
+  if (indexedWorld !== world) {
+    chunkIndex = buildChunkIndex(world.chunks, world.lod_bands);
+    indexedWorld = world;
+  }
+  return queryChunkIndex(chunkIndex, x, z, kind);
+}
+
 function drop(id) {
   const c = live.get(id); if (!c) return;
   live.delete(id);
@@ -490,13 +551,13 @@ function stream(now = performance.now()) {
   if (inflight >= MAX_INFLIGHT) return;
 
   const want = [];
-  for (const def of world.chunks) {
+  for (const { def, order } of nearbyChunks(p.x, p.z, "load")) {
     const entry = live.get(def.id);
     if (entry && (entry.obj || entry.loading || entry.attempts >= MAX_LOAD_ATTEMPTS || now < entry.retryAt)) continue;
     const { d: distance, load } = range(def, p);
-    if (load) want.push({ def, distance });
+    if (load) want.push({ def, distance, order });
   }
-  want.sort((a, b) => a.distance - b.distance);
+  want.sort((a, b) => a.distance - b.distance || a.order - b.order);
   for (const { def } of want) {
     if (inflight >= MAX_INFLIGHT) break;
     const previous = live.get(def.id);
@@ -517,10 +578,11 @@ function sampleGround(x, z, bottom, top) {
   groundRay.ray.origin.set(x, top, z);
   let highest = null;
   // Only the local, visible streamed geometry can support the camera. Shorten the ray after each hit.
-  for (const { def, obj } of live.values()) {
+  for (const { def } of nearbyChunks(x, z, "surface")) {
+    const obj = live.get(def.id)?.obj;
     if (!obj || obj.visible === false) continue;
-    const [minX, minY, minZ, maxX, maxY, maxZ] = def.bounds;
-    if (x < minX || x > maxX || z < minZ || z > maxZ || top < minY || maxY < (highest ?? bottom)) continue;
+    const [, minY, , , maxY] = def.bounds;
+    if (top < minY || maxY < (highest ?? bottom)) continue;
     groundRay.far = top - (highest ?? bottom);
     const [hit] = groundRay.intersectObject(obj, true);
     if (hit) highest = hit.point.y;

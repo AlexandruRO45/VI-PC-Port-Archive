@@ -385,7 +385,10 @@ test('ground sampling considers the highest local visible surface in reach', () 
         }
     }
     const source = viewerModule.split('let groundRay;')[1].split('// ---------- main loop ----------')[0];
-    const sample = vm.runInNewContext('let groundRay;' + source + '\nsampleGround', { live, THREE: { Raycaster } });
+    const indexSource = viewerModule.split('function buildChunkIndex')[1].split('function drop')[0];
+    const chunks = Array.from(live, ([id, { def }]) => Object.assign(def, { id }));
+    const sample = vm.runInNewContext('function buildChunkIndex' + indexSource + '\nlet groundRay;' + source +
+        '\nsampleGround', { live, world: { chunks }, THREE: { Raycaster }, LOAD_R: 1400 });
     assert.equal(sample(0, 0, 0, 5), 3);
     assert.deepEqual(tested, [1, 3]);
     assert.equal(sample(5, 0, 0, 5), null);
@@ -547,8 +550,8 @@ test('a full load queue skips looking up unloaded chunk bounds until a slot open
 });
 
 test('candidate distances are computed once and nearest chunks load first', () => {
-    const f = fixture(7);
-    const distances = [100, 5, 20, 20, 10, 1400, 4];
+    const distances = [100, 5, 20, -21, 10, 1400, 4, -71, 51, 267];
+    const f = fixture(distances.length);
     const reads = Array(distances.length).fill(0);
     f.context.world.chunks.forEach((chunk, i) => {
         const x = distances[i];
@@ -556,9 +559,70 @@ test('candidate distances are computed once and nearest chunks load first', () =
         Object.defineProperty(chunk, 'bounds', { get() { reads[i]++; return bounds; } });
     });
 
+    f.context.camera.position.x = 10000;
+    f.frame(); // Build the index, then count the exact range checks alone.
+    reads.fill(0);
+    f.context.camera.position.x = 0;
     f.frame();
     assert.deepEqual(f.requests.map(r => r.url), ['6.glb', '1.glb', '4.glb', '2.glb']);
     assert.deepEqual(reads, Array(distances.length).fill(1));
+});
+
+test('the chunk index agrees with exhaustive loading and surface lookups for mixed LODs', () => {
+    const f = fixture(0);
+    const { range, nearbyChunks } = vm.runInContext('({ range, nearbyChunks })', f.context);
+    const bands = { hd: [0, 256], lod: [256, 1100], slod: [1100, 2700] };
+    const chunks = [];
+    for (let i = 0; i < 512; i++) {
+        const x = (i % 32) * 256 - 4096, z = Math.floor(i / 32) * 256 - 2048;
+        const bounds = [x - 50, i % 13, z - 20, x + 350, 90, z + 256];
+        const lod = ['hd', 'lod', 'slod', undefined][i % 4];
+        chunks.push({ id: String(i), bounds, lod, cell: [x, z, x + 256, z + 256] });
+    }
+    // A very wide mesh overlaps many entries. Its LOD cell is far away from the geometry.
+    chunks.push({ id: 'wide', bounds: [-30000, -5, -600, 30000, 15, 600], lod: 'slod',
+        cell: [7000, 0, 7256, 256] });
+    f.context.world = { lod_bands: bands, chunks };
+    const order = results => Array.from(results, ({ def }) => def.id).sort();
+    const points = [
+        { x: -4096, y: 12, z: -2048 },
+        { x: -4146, y: 900, z: -2068 }, // exact lower surface corner
+        { x: 4096, y: 900, z: 1600 },
+        { x: 8000, y: 5, z: 0 }, // only the wide surface reaches here
+        { x: 6000, y: 5, z: 0 }, // inside the LOD outer radius and outside its inner radius
+        { x: 40000, y: 100, z: 40000 },
+    ];
+    for (let i = 0; i < 128; i++) points.push({
+        x: (i * 1297) % 15000 - 7500, y: i * 23 % 3100, z: (i * 2293) % 11000 - 5500,
+    });
+    for (const p of points) {
+        const loading = nearbyChunks(p.x, p.z, 'load').filter(({ def }) => range(def, p).load);
+        const surfaces = nearbyChunks(p.x, p.z, 'surface');
+        assert.deepEqual(order(loading), chunks.filter(def => range(def, p).load).map(def => def.id).sort());
+        assert.deepEqual(order(surfaces), chunks.filter(({ bounds: b }) =>
+            p.x >= b[0] && p.x <= b[3] && p.z >= b[2] && p.z <= b[5]).map(def => def.id).sort());
+    }
+});
+
+test('a warm streaming lookup avoids visiting distant chunks in a large manifest', () => {
+    const f = fixture(8192);
+    let reads = 0;
+    f.context.world.chunks.forEach((chunk, i) => {
+        const x = (i % 128) * 600 - 38400;
+        const z = Math.floor(i / 128) * 600 - 19200;
+        const bounds = [x, 0, z, x + 256, 1, z + 256];
+        Object.defineProperty(chunk, 'bounds', { get() { reads++; return bounds; } });
+    });
+    f.context.camera.position.x = 100000;
+    f.frame(); // Build the index without queuing any chunks.
+    assert.equal(f.requests.length, 0);
+
+    reads = 0;
+    f.context.camera.position.x = 0;
+    f.frame();
+    assert.equal(f.requests.length, 4);
+    assert.equal(f.requests[0].url, '4160.glb');
+    assert.ok(reads > 0 && reads <= 36, `exact bounds reads: ${reads}`);
 });
 
 test('pending requests are not duplicated and retries obey the inflight limit', async () => {
