@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -167,12 +168,22 @@ int __cdecl game_wgetmainargs(int* argc, wchar_t*** argv, wchar_t*** env, int, v
 
 struct EntryCall {
     void* entry;
+    void (*startup)(void*);
+    void* startup_context;
 };
 
 DWORD WINAPI game_thread(void* p) {
-    auto* call = static_cast<EntryCall*>(p);
+    const EntryCall call = *static_cast<const EntryCall*>(p);
+    bool startup_ok = true;
+    try {
+        if (call.startup) call.startup(call.startup_context);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "error: %s\n", error.what());
+        startup_ok = false;
+    }
+    if (!startup_ok) end_run(1);
     // An EXE entry point (mainCRTStartup and friends) takes the PEB pointer and returns the process exit code.
-    auto entry = reinterpret_cast<DWORD(WINAPI*)(void*)>(call->entry);
+    auto entry = reinterpret_cast<DWORD(WINAPI*)(void*)>(call.entry);
     const DWORD code = entry(nullptr);
     end_run(static_cast<int>(code));  // returning from the entry point is an exit too
 }
@@ -202,12 +213,12 @@ void set_command_line(const std::wstring& program, const std::vector<std::wstrin
     g_wargv_ptr = g_wargv.data();
 }
 
-int run_entry(void* entry, size_t stack_bytes) {
+int run_entry(void* entry, size_t stack_bytes, void (*startup)(void*), void* startup_context) {
     g_exited = false;
     g_exit_code = 0;
     g_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_running = true;
-    EntryCall call{entry};
+    EntryCall call{entry, startup, startup_context};
     HANDLE thread = CreateThread(nullptr, stack_bytes, game_thread, &call, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
     if (!thread) {
         g_running = false;

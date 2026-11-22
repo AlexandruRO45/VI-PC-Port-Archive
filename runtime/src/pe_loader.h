@@ -5,6 +5,7 @@
 // ~Loader() delivers process detach before unmapping initialised modules. The TLS slot and template are set up by load().
 // gta6rt_tls_host.dll must sit next to the executable; the loader reuses the module TLS index the OS assigns it.
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -88,6 +89,11 @@ public:
     // TLS was already installed by load(), so this is safe to call on the loading thread without a second install.
     void initialise();
 
+    // Delivers process detach in reverse initialization order, once, while all mappings and TLS remain live.
+    // Call on the initialization thread to roll back failed startup. Terminal: further load/initialise is refused.
+    // Standard exceptions from cleanup callbacks are reported, and remaining dependencies are still detached.
+    void detach_initialised_modules();
+
     // Calls the image's IMAGE_TLS_DIRECTORY64 callbacks in order with (base, reason, nullptr). This is opt-in:
     // load() never runs image code; initialise() and ~Loader() use it for process attach/detach. No-op for
     // images without TLS callbacks. Once initialise() has run a module, the loader delivers DLL_THREAD_ATTACH and
@@ -123,6 +129,8 @@ private:
     void register_unwind(Module& m);
 
     mutable std::recursive_mutex mutex_;
+    // Terminal once rollback/destruction starts. Never run process attach or map new images after this point.
+    std::atomic<bool> detaching_{false};
     std::filesystem::path game_dir_;
     std::map<std::string, Module*> by_name_;  // lower-case file name
     std::vector<Module*> order_;       // mapping order; owns the modules

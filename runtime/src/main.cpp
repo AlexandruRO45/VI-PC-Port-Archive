@@ -42,6 +42,26 @@ const char* binding_name(rt::Binding b) {
     }
 }
 
+struct RunStartup {
+    rt::Loader& loader;
+    rt::Module& image;
+};
+
+void initialise_for_run(void* context) {
+    auto& startup = *static_cast<RunStartup*>(context);
+    // The helper has installed this thread's TLS. Process attach and entry share that block.
+    try {
+        startup.loader.initialise();
+    } catch (const std::exception& error) {
+        rt::startup_trace::event("error", "\"what\":" + rt::startup_trace::quote(error.what()));
+        startup.loader.detach_initialised_modules();
+        throw;
+    }
+    std::printf("%zu module(s) initialised\n", startup.loader.modules().size());
+    std::printf("running %s\n", startup.image.name.c_str());
+    std::fflush(stdout);
+}
+
 int usage() {
     std::fprintf(stderr,
                  "usage: gta6rt --dry-run <image> [--game-dir DIR] [--overlay DIR] [--trace FILE]\n"
@@ -95,7 +115,7 @@ int wmain(int argc, wchar_t** argv) {
         rt::Loader loader(game_dir);
         rt::Module& main_module = loader.load(image);  // maps, binds and installs TLS; runs no image code
         if (run) rt::process::set_command_line(image.filename().wstring(), game_args);
-        if (init || run) {
+        if (init) {
             loader.initialise();  // TLS callbacks, then DllMain(DLL_PROCESS_ATTACH) for DLLs
             std::printf("%zu module(s) initialised\n", loader.modules().size());
         }
@@ -130,9 +150,10 @@ int wmain(int argc, wchar_t** argv) {
             return 1;
         }
         std::printf("console paths: GAME: -> %ls, writes -> %ls\n", game_dir.c_str(), overlay_dir.c_str());
-        std::printf("running %s\n", main_module.name.c_str());
         std::fflush(stdout);
-        const int code = rt::process::run_entry(main_module.base + main_module.entry_rva);
+        RunStartup startup{loader, main_module};
+        const int code = rt::process::run_entry(main_module.base + main_module.entry_rva,
+                                                8u << 20, initialise_for_run, &startup);
         std::fflush(stdout);
         std::printf("game exited with code %d\n", code);
         rt::shims::report_called_unimplemented();

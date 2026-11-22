@@ -14,6 +14,8 @@ void set_command_line(const std::wstring& program, const std::vector<std::wstrin
 // Runs a mapped EXE's entry point on a new thread with `stack_bytes` of reserved stack and returns the game's
 // exit code: the entry point's return value, or what it passed to exit/ExitProcess (3 for abort). Returns when
 // the first of those happens; other game threads are left running (the host process ends them when it exits).
-int run_entry(void* entry, std::size_t stack_bytes = 8u << 20);
+// Optional startup runs on the entry thread before entry; exceptions are reported as run failure (code 1).
+int run_entry(void* entry, std::size_t stack_bytes = 8u << 20,
+              void (*startup)(void*) = nullptr, void* startup_context = nullptr);
 
 }  // namespace rt::process

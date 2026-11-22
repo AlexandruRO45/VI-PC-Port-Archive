@@ -495,26 +495,7 @@ Loader::Loader(std::filesystem::path game_dir) : game_dir_(std::move(game_dir)) 
 }
 
 Loader::~Loader() {
-    // Importers must release their resources before their dependencies. Keep every mapping, unwind table and TLS
-    // block alive throughout the notifications: a detach handler can still call an imported function or free an
-    // FLS slot whose destructor lives in another mapped image.
-    for (auto it = init_order_.rbegin(); it != init_order_.rend(); ++it) {
-        Module& m = **it;
-        if (!m.initialised) continue;  // a map-only load never opts in to running image code
-        set_initialised(m, false);  // under the TLS lock: thread events stop running its callbacks
-        try {
-            run_tls_callbacks(m, DLL_PROCESS_DETACH);
-        } catch (const std::exception& e) {
-            // A module may have changed its callback table since attach. A destructor cannot propagate the validation
-            // error; report it and still let DllMain release resources before the image is freed.
-            std::fprintf(stderr, "[rt] TLS process detach failed for %s: %s\n", m.name.c_str(), e.what());
-        }
-        auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
-        if ((nt->FileHeader.Characteristics & IMAGE_FILE_DLL) && m.entry_rva) {
-            auto entry = reinterpret_cast<BOOL(NTAPI*)(void*, DWORD, void*)>(m.base + m.entry_rva);
-            entry(m.base, DLL_PROCESS_DETACH, nullptr);  // explicit unload; the return value is ignored
-        }
-    }
+    detach_initialised_modules();
     shims::remove_bundled_loader(this);
     shims::remove_module_lookup(this);
     for (auto* m : order_) {
@@ -537,7 +518,39 @@ Loader::~Loader() {
     }
 }
 
+void Loader::detach_initialised_modules() {
+    // Publish before invoking guest code: LoadLibrary/forwarders can reenter this loader during detach.
+    // This is terminal, including after a failed startup. Repeated or recursive rollback is a no-op.
+    if (detaching_.exchange(true)) return;
+    // Importers must release their resources before their dependencies. Keep every mapping, unwind table and TLS
+    // block alive throughout the notifications: a detach handler can still call an imported function or free an
+    // FLS slot whose destructor lives in another mapped image.
+    for (auto it = init_order_.rbegin(); it != init_order_.rend(); ++it) {
+        Module& m = **it;
+        if (!m.initialised) continue;  // a map-only load never opts in to running image code
+        set_initialised(m, false);  // under the TLS lock: thread events stop running its callbacks
+        try {
+            run_tls_callbacks(m, DLL_PROCESS_DETACH);
+        } catch (const std::exception& e) {
+            // A module may have changed its callback table since attach. A destructor cannot propagate the validation
+            // error; report it and still let DllMain release resources before the image is freed.
+            std::fprintf(stderr, "[rt] TLS process detach failed for %s: %s\n", m.name.c_str(), e.what());
+        }
+        auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
+        if ((nt->FileHeader.Characteristics & IMAGE_FILE_DLL) && m.entry_rva) {
+            auto entry = reinterpret_cast<BOOL(NTAPI*)(void*, DWORD, void*)>(m.base + m.entry_rva);
+            try {
+                entry(m.base, DLL_PROCESS_DETACH, nullptr);  // explicit unload; the return value is ignored
+            } catch (const std::exception& error) {
+                // Continue releasing dependencies, and retain a diagnostic for the cleanup failure.
+                std::fprintf(stderr, "[rt] DllMain process detach failed for %s: %s\n", m.name.c_str(), error.what());
+            }
+        }
+    }
+}
+
 Module& Loader::load(const std::filesystem::path& image) {
+    if (detaching_) throw std::runtime_error("loader is detaching");
     std::lock_guard lock(mutex_);
     std::string key = lower(image.filename().string());
     if (auto it = by_name_.find(key); it != by_name_.end()) return *it->second;
@@ -572,6 +585,10 @@ void* Loader::load_runtime_module(const std::string& dll_lower, uint32_t flags, 
     if (!is_bundled) return nullptr;
 
     handled = true;
+    if (detaching_) {
+        SetLastError(ERROR_DLL_INIT_FAILED);
+        return nullptr;  // handled: never fall back to loading a second host copy during teardown
+    }
     // Win32 DONT_RESOLVE_DLL_REFERENCES (0x1) forbids resolving dependencies or running TLS/DllMain; refuse it
     // explicitly instead of silently performing a normal resolving + initialising load.
     if ((flags & DONT_RESOLVE_DLL_REFERENCES) != 0) {
@@ -623,6 +640,10 @@ void* Loader::resolve_module_export(void* module_handle, const std::string& sym,
     owns_handle = true;
     if (auto it = target->exports.find(sym); it != target->exports.end()) return it->second;
     if (auto it = target->forwarders.find(sym); it != target->forwarders.end()) {
+        if (detaching_) {
+            SetLastError(ERROR_DLL_INIT_FAILED);
+            return nullptr;  // resolving a forwarder may map and initialize another dependency
+        }
         try {
             Binding binding = Binding::Unimplemented;
             void* fn = resolve_forwarder(it->second, binding, 0);
@@ -683,12 +704,14 @@ void Loader::register_unwind(Module& m) {
 }
 
 void Loader::initialise() {
+    if (detaching_) throw std::runtime_error("loader is detaching");
     // Not order_: map_image pushes a module there before bind_imports maps its dependencies, so order_ lists an
     // importer ahead of the DLLs it imports. init_order_ is filled once a module's imports are all loaded.
     for (auto* m : init_order_) initialise(*m);
 }
 
 void Loader::initialise(Module& m) {
+    if (detaching_) throw std::runtime_error("loader is detaching");
     if (m.initialised) return;
 
     // TLS was installed by load(); initialise() only delivers the events, so no slot is allocated or written twice.

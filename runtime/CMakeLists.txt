@@ -429,6 +429,30 @@ if(BUILD_TESTING)
     set_target_properties(tiny_bundled_load PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
     )
+    add_library(startup_rollback_a SHARED test/fixtures/startup_rollback_dll.cpp)
+    target_compile_definitions(startup_rollback_a PRIVATE ROLLBACK_DEPENDENCY_A)
+    add_library(startup_rollback_b SHARED test/fixtures/startup_rollback_dll.cpp)
+    target_link_libraries(startup_rollback_b PRIVATE startup_rollback_a)
+    add_executable(startup_rollback_exe test/fixtures/startup_rollback_exe.cpp)
+    target_link_libraries(startup_rollback_exe PRIVATE startup_rollback_b)
+    add_executable(startup_rollback_native test/fixtures/startup_rollback_exe.cpp)
+    target_compile_definitions(startup_rollback_native PRIVATE ROLLBACK_NATIVE_DRIVER)
+    foreach(target startup_rollback_a startup_rollback_b startup_rollback_exe startup_rollback_native)
+      target_compile_definitions(${target} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8 /GS-)
+    endforeach()
+
+    add_executable(startup_rollback_test test/startup_rollback_test.cpp src/pe_loader.cpp shims/registry.cpp shims/library_loader.cpp)
+    target_compile_definitions(startup_rollback_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(startup_rollback_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    add_dependencies(startup_rollback_test startup_rollback_a startup_rollback_b gta6rt_tls_host)
+
+    add_executable(tls_startup_probe test/fixtures/tls_startup_probe.cpp)
+    target_compile_definitions(tls_startup_probe PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(tls_startup_probe PRIVATE /W4 /permissive- /utf-8 /GS-)
+    # The custom PE entry deliberately bypasses CRT startup; only TLS callbacks use .CRT.
+    target_link_options(tls_startup_probe PRIVATE /ENTRY:tls_startup_probe_entry /IGNORE:4210)
+
     add_library(tiny_startup_cmdline_dll SHARED test/fixtures/tiny_startup_cmdline.cpp)
     target_compile_definitions(tiny_startup_cmdline_dll PRIVATE STARTUP_CMDLINE_DLL)
     add_executable(tiny_startup_cmdline test/fixtures/tiny_startup_cmdline.cpp)
@@ -723,6 +747,13 @@ if(BUILD_TESTING)
     set_tests_properties(gameinput PROPERTIES DISABLED TRUE)
   endif()
   if(WIN32 AND TARGET gta6rt AND TARGET tiny_game)
+    add_test(NAME startup_rollback COMMAND ${CMAKE_COMMAND}
+      "-DRUNTIME=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:startup_rollback_exe>"
+      "-DNATIVE=$<TARGET_FILE:startup_rollback_native>" "-DDLL=$<TARGET_FILE:startup_rollback_b>"
+      "-DHOST=$<TARGET_FILE:startup_rollback_test>" "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_startup_rollback.cmake")
+    add_test(NAME tls_startup_native COMMAND tls_startup_probe)
+    add_test(NAME tls_startup_mapped COMMAND gta6rt --run $<TARGET_FILE:tls_startup_probe>)
     add_test(NAME run_startup_cmdline COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_startup_cmdline>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_startup_cmdline.cmake")
