@@ -1700,8 +1700,10 @@ public:
         }
         if (FAILED(support)) return support;
         device_.share(info);
-        const VkResult created = vk.vkCreateImage(device_.info.device, &info, nullptr, &image_);
-        if (created != VK_SUCCESS) {
+        const auto create_image = [&]() -> HRESULT {
+            const VkResult created = vk.vkCreateImage(device_.info.device, &info, nullptr, &image_);
+            if (created == VK_SUCCESS) return S_OK;
+            image_ = VK_NULL_HANDLE;  // undefined after a failed create; ~Resource destroys any non-null image_
             if (created == VK_ERROR_OUT_OF_HOST_MEMORY || created == VK_ERROR_OUT_OF_DEVICE_MEMORY)
                 return E_OUTOFMEMORY;
             if (!view_formats_.empty()) {
@@ -1709,9 +1711,29 @@ public:
                 return E_INVALIDARG;
             }
             return E_OUTOFMEMORY;
-        }
+        };
+        if (HRESULT hr = create_image(); FAILED(hr)) return hr;
         VkMemoryRequirements requirements{};
         vk.vkGetImageMemoryRequirements(device_.info.device, image_, &requirements);
+        if (host_transfer_ && (requirements.memoryTypeBits == 0 || device_.info.force_host_transfer_retry)) {
+            // NVIDIA's Pascal driver (582.78 on a GTX 1050 Ti) reports HOST_IMAGE_TRANSFER for the format and creates
+            // the image, but then allows it no memory type at all. The image has not been bound or used, so it is
+            // made again without host-transfer usage and the CPU copies take the staging path. The test forces this
+            // branch on any GPU with force_host_transfer_retry.
+            log_once("host-transfer image has no memory type; using staging copies, format", int(info.format));
+            vk.vkDestroyImage(device_.info.device, image_, nullptr);
+            image_ = VK_NULL_HANDLE;
+            host_transfer_ = false;
+            info.usage &= ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
+            if (HRESULT hr = device_.check_image_support(info); FAILED(hr)) return hr;
+            if (HRESULT hr = create_image(); FAILED(hr)) {
+                log_once("image refused after dropping host-transfer usage; format", int(info.format));
+                return hr;
+            }
+            vk.vkGetImageMemoryRequirements(device_.info.device, image_, &requirements);
+            if (requirements.memoryTypeBits == 0)
+                log_once("image has no memory type even without host-transfer usage; format", int(info.format));
+        }
         memory_ = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_);
         if (!memory_ || vk.vkBindImageMemory(device_.info.device, image_, memory_, 0) != VK_SUCCESS)
             return E_OUTOFMEMORY;

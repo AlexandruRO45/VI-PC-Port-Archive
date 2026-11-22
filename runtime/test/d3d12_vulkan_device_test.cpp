@@ -141,7 +141,8 @@ D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource, D3D12_RESOURCE_STATE
 std::uint8_t texel_byte(UINT x, UINT y, UINT z, UINT i) { return std::uint8_t(x * 31 + y * 7 + z * 61 + i * 3 + 1); }
 
 // WriteToSubresource/ReadFromSubresource on `device`. Textures in a CPU-visible custom heap copy on the host when the
-// device has VK_EXT_host_image_copy, through a staging submit when it doesn't; main runs this once per path. Covers
+// device has VK_EXT_host_image_copy, through a staging submit when it doesn't or when the driver gave the
+// host-transfer image no memory type; main runs this once per path, three paths. Covers
 // zero-filled first reads, boxes with pitches unlike the texture's, a mip, a volume, BC1 blocks, a default-heap
 // texture (always staged), the rejected calls, and both directions between the CPU copies and GPU copies.
 int cpu_copies(ID3D12Device* device, bool bc, const char* path) {
@@ -2977,6 +2978,42 @@ bool host_ray_tracing(ID3D12Device* host) {
            o5.RaytracingTier != D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
 }
 
+// heap_create under the same guard as call_guarded, for cases built from a description at run time.
+HRESULT heap_create_guarded(ID3D12Device* device, D3D12_HEAP_DESC desc) {
+    __try {
+        return heap_create(device, desc);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return kFaulted;
+    }
+}
+
+// D3D12_OPTIONS' ResourceHeapTier, or 0 when the device does not answer. A tier 1 device refuses heaps without DENY
+// flags (a GTX 1050 Ti, NVIDIA 582.78).
+D3D12_RESOURCE_HEAP_TIER resource_heap_tier(ID3D12Device* device) {
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+    if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))))
+        return D3D12_RESOURCE_HEAP_TIER(0);
+    return options.ResourceHeapTier;
+}
+
+// The host runtime's WARP device, for a comparison the hardware host cannot make (a resource heap tier 1 GPU refuses
+// heaps without DENY flags). LEONIDA_HOST_ADAPTER is saved and restored: it belongs to whoever runs the test.
+bool create_warp_host(Ref<ID3D12Device>& host, std::string& name) {
+    // Sized from the variable, so a long value comes back whole. Unset stays unset; an empty value is the same to
+    // host_adapter.h.
+    std::string previous(GetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", nullptr, 0), '\0');
+    const bool had = !previous.empty() &&
+                     GetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", previous.data(), DWORD(previous.size())) > 0;
+    SetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", "warp");
+    copycmp::Ptr<ID3D12Device> warp;
+    const bool created = copycmp::try_create_host(warp, name);
+    SetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", had ? previous.c_str() : nullptr);
+    if (!created) return false;
+    host.p = warp.p;
+    warp.p = nullptr;
+    return true;
+}
+
 int compare_invalid_arguments(ID3D12Device* ours) {
     Ref<ID3D12Device> host;
     if (!create_host_device(host)) return -1;
@@ -4073,45 +4110,49 @@ int compare_heap_neighbours(ID3D12Device* ours) {
     if (!create_host_device(host)) return -1;
     struct Case {
         const char* name;
-        InvalidCase call;
+        D3D12_HEAP_DESC desc;
     };
     static const Case cases[] = {
-        {"heap: alignment 0", [](ID3D12Device* d) { return heap_create(d, heap_desc_of(0)); }},
-        {"heap: alignment 64 KiB", [](ID3D12Device* d) {
-             return heap_create(d, heap_desc_of(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT));
-         }},
-        {"heap: alignment 4 MiB", [](ID3D12Device* d) {
-             return heap_create(d, heap_desc_of(D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT,
-                                                {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_NONE,
-                                                D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT));
-         }},
-        {"heap: size 1000", [](ID3D12Device* d) {
-             return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_NONE, 1000));
-         }},
-        {"heap: upload", [](ID3D12Device* d) { return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_UPLOAD})); }},
-        {"heap: readback", [](ID3D12Device* d) {
-             return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_READBACK}));
-         }},
-        {"heap: custom write-combine L0", [](ID3D12Device* d) {
-             return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE,
-                                                    D3D12_MEMORY_POOL_L0}));
-         }},
-        {"heap: ALLOW_ONLY_BUFFERS (two DENY flags)", [](ID3D12Device* d) {
-             return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS));
-         }},
+        {"heap: alignment 0", heap_desc_of(0)},
+        {"heap: alignment 64 KiB", heap_desc_of(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)},
+        {"heap: alignment 4 MiB",
+         heap_desc_of(D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_NONE,
+                      D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT)},
+        {"heap: size 1000", heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_NONE, 1000)},
+        {"heap: upload", heap_desc_of(0, {D3D12_HEAP_TYPE_UPLOAD})},
+        {"heap: readback", heap_desc_of(0, {D3D12_HEAP_TYPE_READBACK})},
+        {"heap: custom write-combine L0",
+         heap_desc_of(0, {D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE, D3D12_MEMORY_POOL_L0})},
+        {"heap: ALLOW_ONLY_BUFFERS (two DENY flags)",
+         heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS)},
         // The D3D12_HEAP_FLAGS documentation calls it unsupported, but the host accepts it (RTX 4070 SUPER and
         // UHD 770, @CowBoYdu76).
-        {"heap: HARDWARE_PROTECTED", [](ID3D12Device* d) {
-             return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_HARDWARE_PROTECTED));
-         }},
+        {"heap: HARDWARE_PROTECTED", heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_HARDWARE_PROTECTED)},
     };
-    int mismatches = 0;
+    // A resource heap tier 1 host refuses every heap that may mix buffers and textures (E_INVALIDARG on a
+    // GTX 1050 Ti, NVIDIA 582.78); the layer takes them as the console does. On such a host a mixed case is compared
+    // as a buffers-only heap, so its alignment, size and heap properties are still checked.
+    const bool host_tier1 = resource_heap_tier(host.p) == D3D12_RESOURCE_HEAP_TIER_1;
+    constexpr UINT deny_flags = D3D12_HEAP_FLAG_DENY_BUFFERS | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES |
+                                D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES;
+    int mismatches = 0, restricted = 0;
     for (const Case& c : cases) {
-        const HRESULT a = call_guarded(c.call, ours), b = call_guarded(c.call, host.p);
+        D3D12_HEAP_DESC desc = c.desc;
+        const bool mixed = (UINT(desc.Flags) & deny_flags) == 0;
+        if (host_tier1 && mixed) {
+            desc.Flags |= D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+            ++restricted;
+        }
+        const HRESULT a = heap_create_guarded(ours, desc), b = heap_create_guarded(host.p, desc);
         if (a == b) continue;
         ++mismatches;
-        std::fprintf(stderr, "invalid arguments %s: ours 0x%08lx, host 0x%08lx\n", c.name, a, b);
+        std::fprintf(stderr, "invalid arguments %s%s: ours 0x%08lx, host 0x%08lx\n", c.name,
+                     host_tier1 && mixed ? " (buffers only, tier 1 host)" : "", a, b);
     }
+    if (restricted)
+        std::printf("CreateHeap valid neighbours: host is resource heap tier 1, %d mixed-heap cases compared as "
+                    "buffers-only heaps\n",
+                    restricted);
     return mismatches;
 }
 
@@ -4122,6 +4163,22 @@ int compare_heap_neighbours(ID3D12Device* ours) {
 int compare_placed_reserved(ID3D12Device* ours) {
     Ref<ID3D12Device> host;
     if (!create_host_device(host)) return -1;
+    // The placed cases put their resources in a heap without DENY flags, which a resource heap tier 1 host refuses
+    // (a GTX 1050 Ti, NVIDIA 582.78), so every one of them would answer E_UNEXPECTED there. On such a host the placed
+    // cases are compared with WARP, which is tier 2, and the reserved and committed ones, which need no heap, still
+    // with the host's own adapter. Without WARP the placed cases are skipped.
+    Ref<ID3D12Device> warp;
+    bool skip_placed = false;
+    if (resource_heap_tier(host.p) == D3D12_RESOURCE_HEAP_TIER_1) {
+        std::string warp_name;
+        skip_placed = !create_warp_host(warp, warp_name);
+        if (skip_placed)
+            std::printf("CreatePlacedResource arguments: host is resource heap tier 1 and there is no WARP device, "
+                        "skipped\n");
+        else
+            std::printf("CreatePlacedResource arguments: host is resource heap tier 1, compared with %s\n",
+                        warp_name.c_str());
+    }
     struct Case {
         const char* name;
         InvalidCase call;
@@ -4537,14 +4594,17 @@ int compare_placed_reserved(ID3D12Device* ours) {
     const bool verbose = GetEnvironmentVariableA("LEONIDA_D3D49_VERBOSE", nullptr, 0) > 0;
     int mismatches = 0;
     for (const Case& c : cases) {
+        const bool in_heap = std::strncmp(c.name, "placed:", 7) == 0;
+        if (in_heap && skip_placed) continue;
+        ID3D12Device* reference = in_heap && warp.p ? warp.p : host.p;
         if (verbose) {
             std::printf("invalid arguments %s:", c.name);
             std::fflush(stdout);
         }
-        const HRESULT a = call_guarded(c.call, ours), b = call_guarded(c.call, host.p);
+        const HRESULT a = call_guarded(c.call, ours), b = call_guarded(c.call, reference);
         if (verbose) std::printf(" ours 0x%08lx host 0x%08lx\n", a, b);
         if (a == b) continue;
-        if (c.comparable && !c.comparable(host.p)) {
+        if (c.comparable && !c.comparable(reference)) {
             std::printf("invalid arguments %s: not comparable on this host (ours 0x%08lx, host 0x%08lx)\n", c.name,
                         a, b);
             continue;
@@ -6508,11 +6568,20 @@ int main() {
     EXPECT(!mismatches);
 
     // CPU texture copies, once per path. A second D3D12 device on the same Vulkan device, told the extension is
-    // off, takes the staging path even on a GPU that has host image copy.
-    for (const bool host : {true, false}) {
+    // off, takes the staging path even on a GPU that has host image copy. The third path has the extension but
+    // treats every host-transfer image as one the driver gave no memory type (a GTX 1050 Ti, NVIDIA 582.78): the
+    // image is made again without host-transfer usage and copies on the staging path.
+    struct CopyPath {
+        const char* name;
+        bool host;
+        bool force_retry;
+    };
+    for (const CopyPath path : {CopyPath{"host image copy", true, false}, CopyPath{"staging copy", false, false},
+                                CopyPath{"host image copy refused by the driver", true, true}}) {
+        const bool host = path.host;
         if (host && !d.host_image_copy) {
-            std::printf("WriteToSubresource/ReadFromSubresource (host image copy): no VK_EXT_host_image_copy, "
-                        "skipped\n");
+            std::printf("WriteToSubresource/ReadFromSubresource (%s): no VK_EXT_host_image_copy, skipped\n",
+                        path.name);
             continue;
         }
         rt::d3d12::VulkanDeviceInfo info{};
@@ -6523,9 +6592,10 @@ int main() {
         info.queue = d.queue;
         info.queue_family = d.family;
         info.host_image_copy = host;
+        info.force_host_transfer_retry = path.force_retry;
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))));
-        EXPECT(cpu_copies(device.p, d.bc, host ? "host image copy" : "staging copy") == 0);
+        EXPECT(cpu_copies(device.p, d.bc, path.name) == 0);
     }
 
     {
@@ -7522,8 +7592,16 @@ int main() {
                 }
             return differences == 0;
         };
+        // The scenarios place a buffer and textures in one heap without DENY flags, which a resource heap tier 1
+        // host refuses (a GTX 1050 Ti, NVIDIA 582.78); such a host is passed over for WARP like one that cannot cast.
         const auto can_cast = [&](ID3D12Device* device, Ref<ID3D12Device10>& out10) {
             D3D12_FEATURE_DATA_D3D12_OPTIONS12 options12{};
+            const D3D12_RESOURCE_HEAP_TIER tier = resource_heap_tier(device);
+            if (tier < D3D12_RESOURCE_HEAP_TIER_2) {
+                if (tier == D3D12_RESOURCE_HEAP_TIER_1)
+                    std::printf("placed castable formats (D3D-90): host is resource heap tier 1, passed over\n");
+                return false;
+            }
             return SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&out10.p))) &&
                    SUCCEEDED(out10->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS12, &options12,
                                                         sizeof(options12))) &&
@@ -7555,20 +7633,14 @@ int main() {
         }
         std::string warp_name;
         if (!compared) {
-            // WARP, the host path that casts when the default adapter cannot. LEONIDA_HOST_ADAPTER is saved
-            // and restored: it belongs to whoever runs the test.
-            char previous[128] = {};
-            const BOOL had = GetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", previous, sizeof(previous));
-            SetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", "warp");
-            copycmp::Ptr<ID3D12Device> warp;
-
+            // WARP, the host path that casts when the default adapter cannot.
+            Ref<ID3D12Device> warp;
             Ref<ID3D12Device10> warp10;
-            if (copycmp::try_create_host(warp, warp_name) && can_cast(warp.p, warp10)) {
+            if (create_warp_host(warp, warp_name) && can_cast(warp.p, warp10)) {
                 EXPECT(host_side(warp10.p, false));
                 compared = true;
                 source = warp_name.c_str();
             }
-            SetEnvironmentVariableA("LEONIDA_HOST_ADAPTER", had && previous[0] ? previous : nullptr);
         }
         std::printf("placed castable formats (D3D-90): SRGB-cast and plain clears read back and compared with %s; "
                     "refusals %s\n",
