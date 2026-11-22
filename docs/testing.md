@@ -440,7 +440,9 @@ llvmpipe and some other drivers. Where the device lacks it those four are skippe
 To test the fallback that runs them anyway, set `LEONIDA_BARY_FALLBACK=1`, **for both `build.py` and `check.py`**
 (or for `run_gpu_tests.py`; CI does this on llvmpipe). The shaders are then translated with `--bary-fallback` and
 drawn through a pass-through geometry shader that supplies the barycentrics (`docs/design.md`, "Barycentric
-fallback"), so the device needs geometry shaders instead.
+fallback"), so the device needs geometry shaders instead. `ps_ij_computed` (a computed I/J pair) also
+runs that way: the geometry shader passes it the three vertices' values of the attribute, with or without
+`LEONIDA_F16_INTERP_FALLBACK`; only that fallback on its own (Macs) skips it.
 
 `ps_interp_f16_high` and `ms_f16_pack` read 16-bit interpolants as `PerVertexKHR` inputs, which need the extension
 too and which `--bary-fallback` can't express. With `LEONIDA_F16_INTERP_FALLBACK=1` they read halves the producer
