@@ -183,7 +183,7 @@ def test_generator_covers_every_shape():
     for i in range(200):
         walk(cf_diff.generate(random.Random(i), 32))
     assert {"if", "ifelse", "cmpx", "saveexec", "vccz", "sif", "sloop", "vloop", "irr", "sccmask", "csel", "probe",
-            "ifs", "cexec", "halfexec", "halfscc", "scmpmask", "cselmask"} <= kinds
+            "ifs", "cexec", "halfexec", "halfscc", "scmpmask", "cselmask", "vccloop", "cmpxloop"} <= kinds
 
 
 @pytest.mark.parametrize("op_name", ("andn2", "orn2", "xor", "nand", "nor", "xnor"))

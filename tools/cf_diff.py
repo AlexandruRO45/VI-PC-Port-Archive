@@ -24,6 +24,8 @@ Shapes (each nests, up to --depth):
   halfscc   SCC of s_and/andn2/or/xor_b32 on one half of VCC and EXEC -> s_cbranch_scc0/1
   scmpmask  s_cmp_eq/lg of a mask against 0 (u32 on an SGPR mask in wave32, u64 on VCC in wave64)
   cselmask  s_cselect_b32/b64 between a compare mask and EXEC -> s_and_saveexec
+  vccloop   per-lane trip counts, back edge s_cbranch_vccnz (the wave loops while any lane wants to)
+  cmpxloop  per-lane trip counts, v_cmpx drops finished lanes, back edge s_cbranch_execnz
 (vloop also closes some loops with s_cbranch_scc1 on the SCC of its s_andn2 exec.)
 Bodies mix integer VALU and SALU ops with "probes": v11 = v11 * 33 + K at each site, so v11 records which sites
 each lane ran, in which order and how often. v8/v9 carry data, v10 the uniform SGPRs. Immediates stay in the
@@ -138,10 +140,12 @@ class Gen:
         r = self.r
         kind = r.choice(("if", "if", "ifelse", "ifelse", "cmpx", "saveexec", "vccz", "sif", "sloop", "vloop",
                          "vloop", "irr", "sccmask", "csel", "ifs", "ifs", "cexec", "halfexec", "halfscc", "scmpmask",
-                         "cselmask"))
+                         "cselmask", "vccloop", "cmpxloop"))
         if kind == "saveexec":
             return ("saveexec", self.cmp(), r.choice(("andn2", "orn2", "xor", "nand", "nor", "xnor")),
                     r.choice((None, "s_cbranch_execz", "s_cbranch_scc0")), [self.probe()] + self.block(depth))
+        if kind in ("vccloop", "cmpxloop"):
+            return (kind, (r.choice((0, 1, 2, 3)), r.choice((1, 3))), [self.probe()] + self.block(depth))
         if kind == "ifs":
             return ("ifs", self.cmp(), r.random() < 0.7, r.random() < 0.5, [self.probe()] + self.block(depth))
         if kind == "cexec":
@@ -364,6 +368,35 @@ class Emitter:
             self.ins(f"s_add_u32 s{ctr}, s{ctr}, 1")
             self.ins(f"s_cmp_lt_u32 s{ctr}, {trips}")
             self.br("s_cbranch_scc1", head)
+        elif kind == "vccloop":
+            # A loop whose back edge is a VCC vote: the wave goes round again while any lane's own trip count is
+            # not reached, and every active lane runs every round (EXEC is not changed).
+            _, (src, mask), body = n
+            it, lim, head = 4 + self.depth, 30 + self.depth, self.label()
+            self.ins(f"v_and_b32 v{lim}, {mask}, v{src}")
+            self.ins(f"v_mov_b32 v{it}, 0")
+            self.place(head)
+            self.depth += 1
+            self.nodes(body)
+            self.depth -= 1
+            self.ins(f"v_add_nc_u32 v{it}, 1, v{it}")
+            self.ins(f"v_cmp_le_u32_e32 {self.vcc()}, v{it}, v{lim}")
+            self.br("s_cbranch_vccnz", head)
+        elif kind == "cmpxloop":
+            # A loop that drops lanes with v_cmpx as their trip count is reached and closes on EXECNZ.
+            _, (src, mask), body = n
+            it, lim, save, head = 4 + self.depth, 30 + self.depth, self.sreg(40), self.label()
+            self.ins(f"v_and_b32 v{lim}, {mask}, v{src}")
+            self.ins(f"v_mov_b32 v{it}, 0")
+            self.ins(f"s_mov_{w} {save}, {ex}")
+            self.place(head)
+            self.depth += 1
+            self.nodes(body)
+            self.depth -= 1
+            self.ins(f"v_add_nc_u32 v{it}, 1, v{it}")
+            self.ins(f"v_cmpx_le_u32_e32 v{it}, v{lim}")
+            self.br("s_cbranch_execnz", head)
+            self.ins(f"s_mov_{w} {ex}, {save}")
         elif kind == "ifs":
             # The compare writes an SGPR mask (VOP3), which feeds the saveexec; some bodies also v_cndmask on it.
             _, c, skip, use_cnd, body = n

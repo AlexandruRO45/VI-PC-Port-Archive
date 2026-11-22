@@ -256,6 +256,16 @@ class WaveMachine(cpu_ref.Machine):
             self.exec = new if self.wave == 64 else (self.exec & ~MASK32) | new
             self.scc = 1 if new else 0
             return None
+        if base in ("s_andn1_wrexec_b32", "s_andn1_wrexec_b64", "s_andn2_wrexec_b32", "s_andn2_wrexec_b64"):
+            # SOP1 (ISA 6.4): EXEC = ~S0 & EXEC (andn1) or S0 & ~EXEC (andn2); D = the new EXEC; SCC = EXEC != 0.
+            self._check_width(base, op)
+            self._expect(ins, 2)
+            s0, old = self._read_mask(a[1]), self.exec & self.wmask
+            new = (~s0 & old if "andn1" in base else s0 & ~old) & self.wmask
+            self.exec = new if self.wave == 64 else (self.exec & ~MASK32) | new
+            self._write_mask(a[0], new)
+            self.scc = 1 if new else 0
+            return None
         parts = base.split("_")
         if len(parts) == 3 and parts[0] == "s" and parts[1] in _SOP2_LOGIC and parts[2] in ("b32", "b64"):
             self._expect(ins, 3)
