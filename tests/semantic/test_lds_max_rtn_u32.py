@@ -252,6 +252,59 @@ class DSMaxRtnU32Instruction:
         return s
 
 
+# ---------------------------------------------------------------------------
+# Phase 3: Deterministic Scalar Instruction Interpreter
+# ---------------------------------------------------------------------------
+
+class ScalarMachineState:
+    """Architectural register and memory state for a single scalar lane."""
+
+    def __init__(self, lds: Optional[LDSModel] = None) -> None:
+        self.lds: LDSModel = lds if lds is not None else LDSModel()
+        self.vgprs: Dict[int, int] = {i: 0 for i in range(256)}
+        self.sgprs: Dict[int, int] = {i: 0 for i in range(106)}
+
+    def get_vgpr(self, index: int) -> int:
+        return self.vgprs.get(index, 0) & MASK32
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        self.vgprs[index] = val & MASK32
+
+
+class ScalarInterpreter:
+    """Deterministic instruction interpreter for scalar ds_max_rtn_u32 execution."""
+
+    def resolve_operand(self, op: Operand, state: ScalarMachineState) -> int:
+        if isinstance(op, Register):
+            return state.get_vgpr(op.index)
+        elif isinstance(op, Immediate):
+            return op.val
+        raise TypeError(f"Unsupported operand type: {type(op)}")
+
+    def step(
+        self,
+        instr: DSMaxRtnU32Instruction,
+        state: ScalarMachineState,
+    ) -> Tuple[int, int, bool]:
+        """Execute a single ds_max_rtn_u32 instruction in the scalar machine state.
+
+        Returns:
+            (old_mem_val, new_mem_val, modified)
+        """
+        vaddr = state.get_vgpr(instr.addr.index)
+        vdata = self.resolve_operand(instr.data, state)
+
+        eff_addr = calc_lds_effective_address(vaddr, instr.offset)
+        idx = calc_lds_dword_index(eff_addr, state.lds.capacity_dwords)
+        curr_mem = state.lds.memory[idx]
+
+        old_val, new_mem, modified = oracle_ds_max_rtn_u32(curr_mem, vdata)
+        state.lds.memory[idx] = new_mem
+        state.set_vgpr(instr.dst.index, old_val)
+
+        return old_val, new_mem, modified
+
+
 class TestLdsMaxRtnU32ReferenceOracle(unittest.TestCase):
     """Phase 1: Unit tests for reference mathematical oracle and architectural model."""
 
@@ -429,6 +482,119 @@ class TestLdsMaxRtnU32AST(unittest.TestCase):
                 data=VGPR(2),
                 offset=70000,
             )
+
+
+class TestLdsMaxRtnU32ScalarInterpreter(unittest.TestCase):
+    """Phase 3: Unit tests for deterministic scalar instruction interpreter."""
+
+    def test_scalar_interpreter_basic_vgpr_operand(self) -> None:
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        addr = 0x100  # dword index 0x40
+        state.lds.write_dword(addr, 50)
+        state.set_vgpr(1, addr)
+        state.set_vgpr(2, 200)
+
+        inst = DSMaxRtnU32Instruction(
+            opcode=Opcode.DS_MAX_RTN_U32,
+            dst=VGPR(0),
+            addr=VGPR(1),
+            data=VGPR(2),
+        )
+
+        old_val, new_val, mod = interp.step(inst, state)
+        self.assertEqual(old_val, 50)
+        self.assertEqual(new_val, 200)
+        self.assertTrue(mod)
+        # Check destination register received old value
+        self.assertEqual(state.get_vgpr(0), 50)
+        # Check memory updated to new max
+        self.assertEqual(state.lds.read_dword(addr), 200)
+
+    def test_scalar_interpreter_immediate_operand(self) -> None:
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        addr = 0x240
+        state.lds.write_dword(addr, 500)
+        state.set_vgpr(5, addr)
+
+        inst = DSMaxRtnU32Instruction(
+            opcode=Opcode.DS_MAX_RTN_U32,
+            dst=VGPR(10),
+            addr=VGPR(5),
+            data=Immediate(300),
+        )
+
+        old_val, new_val, mod = interp.step(inst, state)
+        self.assertEqual(old_val, 500)
+        self.assertEqual(new_val, 500)
+        self.assertFalse(mod)
+        self.assertEqual(state.get_vgpr(10), 500)
+        self.assertEqual(state.lds.read_dword(addr), 500)
+
+    def test_scalar_interpreter_sequential_updates(self) -> None:
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        addr = 0x40
+        state.lds.write_dword(addr, 100)
+        state.set_vgpr(1, addr)
+
+        # Step 1: max(100, 50) -> memory 100, dst receives 100
+        inst1 = DSMaxRtnU32Instruction(Opcode.DS_MAX_RTN_U32, VGPR(0), VGPR(1), Immediate(50))
+        old, new, mod = interp.step(inst1, state)
+        self.assertEqual(old, 100)
+        self.assertEqual(new, 100)
+        self.assertFalse(mod)
+        self.assertEqual(state.get_vgpr(0), 100)
+        self.assertEqual(state.lds.read_dword(addr), 100)
+
+        # Step 2: max(100, 300) -> memory 300, dst receives 100
+        inst2 = DSMaxRtnU32Instruction(Opcode.DS_MAX_RTN_U32, VGPR(0), VGPR(1), Immediate(300))
+        old, new, mod = interp.step(inst2, state)
+        self.assertEqual(old, 100)
+        self.assertEqual(new, 300)
+        self.assertTrue(mod)
+        self.assertEqual(state.get_vgpr(0), 100)
+        self.assertEqual(state.lds.read_dword(addr), 300)
+
+        # Step 3: max(300, 0xFFFFFFFF) -> memory 0xFFFFFFFF, dst receives 300
+        inst3 = DSMaxRtnU32Instruction(Opcode.DS_MAX_RTN_U32, VGPR(0), VGPR(1), Immediate(0xFFFFFFFF))
+        old, new, mod = interp.step(inst3, state)
+        self.assertEqual(old, 300)
+        self.assertEqual(new, 0xFFFFFFFF)
+        self.assertTrue(mod)
+        self.assertEqual(state.get_vgpr(0), 300)
+        self.assertEqual(state.lds.read_dword(addr), 0xFFFFFFFF)
+
+    def test_scalar_interpreter_with_offset(self) -> None:
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        base_addr = 0x80
+        offset = 0x14  # effective byte address 0x94 (dword index 0x25)
+        state.lds.write_dword(0x94, 777)
+        state.set_vgpr(1, base_addr)
+        state.set_vgpr(2, 999)
+
+        inst = DSMaxRtnU32Instruction(
+            opcode=Opcode.DS_MAX_RTN_U32,
+            dst=VGPR(3),
+            addr=VGPR(1),
+            data=VGPR(2),
+            offset=offset,
+        )
+
+        old, new, mod = interp.step(inst, state)
+        self.assertEqual(old, 777)
+        self.assertEqual(new, 999)
+        self.assertTrue(mod)
+        self.assertEqual(state.get_vgpr(3), 777)
+        self.assertEqual(state.lds.read_dword(0x94), 999)
+        # Base dword remains untouched
+        self.assertEqual(state.lds.read_dword(base_addr), 0)
 
 
 if __name__ == "__main__":
