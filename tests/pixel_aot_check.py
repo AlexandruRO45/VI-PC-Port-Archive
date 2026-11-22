@@ -1909,6 +1909,10 @@ def check_scalar_bfe64_draw(directory, compiler, renderer, backend):
         (word, 0xff7fffc0),  # ignored control bits, width 127, offset 0
         (word, 0x01003f),
         (0x7f800001, 0x200000),  # preserve raw bits of a signaling NaN
+        (1, 0x800000),  # reserved bit 23 alone leaves width and offset zero
+        # Width 60 at offset 1 includes source bit 60 as the sign bit.
+        # The signed result has nonzero halves whose sum wraps to zero.
+        (0x10000000_10000000, 0x3c0001),
     )
     cases = {}
     for op in SCALAR_BFE64_OPS:
