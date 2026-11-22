@@ -18,6 +18,7 @@ fails the test.
 """
 
 import argparse
+from collections import Counter
 import ctypes
 import json
 from pathlib import Path
@@ -113,6 +114,11 @@ def run(target, image, sink_path, mapper_path):
     worker_value = ctypes.c_uint32(0xDEAD)
     ok = waited == 0 and bool(kernel.GetExitCodeThread(handle, ctypes.byref(worker_value)))
     kernel.CloseHandle(handle)
+    if not ok:
+        # The worker may still be executing code from this module.
+        print(json.dumps({"failure": "worker-wait", "events": [], "main": main_value,
+                          "worker": None}))
+        return
     buffer = (Call * 64)()
     count = sink.sink_read(buffer, len(buffer))
     events = translate(buffer[:count], module, main_id, worker_id.value)
@@ -122,9 +128,9 @@ def run(target, image, sink_path, mapper_path):
     buffer = (Call * 64)()
     count = sink.sink_read(buffer, len(buffer))
     detach = translate(buffer[:count], module, main_id, worker_id.value)
-    print(json.dumps({"failure": None if ok else "worker-wait",
+    print(json.dumps({"failure": None,
                       "events": events, "detach": detach,
-                      "main": main_value, "worker": worker_value.value if ok else None}))
+                      "main": main_value, "worker": worker_value.value}))
 
 
 def run_control(target, image, sink_path, mapper_path):
@@ -204,13 +210,17 @@ def check(value_image, control_image, sink, mapper):
         for caller, reason, who, value in seen:
             if value != TLS_VALUE:
                 raise AssertionError(f"native {label}: value {value} != {TLS_VALUE}: {native}")
-    main_reasons = {(c, r) for c, r, w, v in native["events"] if w == "main"}
-    worker_reasons = {(c, r) for c, r, w, v in native["events"] if w == "worker"}
-    for want in ((TLS, ATTACH), (ENTRY, ATTACH), (TLS, THREAD_ATTACH), (ENTRY, THREAD_ATTACH)):
-        if want not in main_reasons | worker_reasons:
-            raise AssertionError(f"native: missing callback {want}: {native['events']}")
-    if not any(w == "worker" for _, _, w, _ in native["events"]):
-        raise AssertionError(f"native: no worker-thread callback observed: {native}")
+    expected_events = Counter(
+        (caller, reason, thread, TLS_VALUE)
+        for caller in (TLS, ENTRY)
+        for reason, thread in ((ATTACH, "main"), (THREAD_ATTACH, "worker"),
+                               (THREAD_DETACH, "worker"))
+    )
+    expected_detach = Counter((caller, DETACH, "main", TLS_VALUE) for caller in (TLS, ENTRY))
+    for observed, expected in ((native["events"], expected_events),
+                               (native["detach"], expected_detach)):
+        if Counter(map(tuple, observed)) != expected:
+            raise AssertionError(f"native: expected {expected}, got {observed}")
 
     # pe_map must reject the non-empty TLS template before any notification.
     if mapped["failure"] != [STATUS["unsupported"], "TLS data"]:
