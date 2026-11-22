@@ -107,6 +107,21 @@ class CarveEdgeTest(unittest.TestCase):
                 self.assertNotIn("Traceback", p.stderr)
                 self.assertFalse(os.path.exists(out))
 
+    def test_folder_archive_and_bad_out_are_one_error_line(self):
+        # Before: a folder as the archive raised IsADirectoryError, and an --out under a regular file (or equal to
+        # the archive) raised FileExistsError/NotADirectoryError out of os.makedirs.
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "tiny.rpf")
+            make_archive(arc)
+            for what, args in (("folder as archive", [tmp, os.path.join(tmp, "o1")]),
+                               ("out under a file", [arc, os.path.join(arc, "sub")]),
+                               ("out is the archive", [arc, arc])):
+                p = subprocess.run([sys.executable, "-I", TOOL, *args, "--index-only"], capture_output=True, text=True)
+                self.assertEqual(p.returncode, 1, (what, p.stderr))
+                self.assertNotIn("Traceback", p.stderr, what)
+                self.assertEqual(len(p.stderr.strip().splitlines()), 1, (what, p.stderr))
+            self.assertFalse(os.path.exists(os.path.join(tmp, "o1")))
+
     def test_non_rpf9_file_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             arc = os.path.join(tmp, "x.rpf")

@@ -30,6 +30,7 @@ import time
 import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
 from rsc8_audio import parse_adat_header_bytes  # noqa: E402
 
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter, then u32 size-8).
@@ -122,6 +123,8 @@ def main() -> int:
         size = os.path.getsize(a.archive)
     except OSError as e:
         sys.exit(f"{a.archive}: {e.strerror or e}")
+    if os.path.isdir(a.archive):
+        sys.exit(f"{a.archive}: is a folder, not an RPF9 archive")
     if size == 0:
         sys.exit(f"{a.archive}: empty file")
     if size < 8:
@@ -138,7 +141,12 @@ def main() -> int:
             sys.exit(f"{a.archive}: header data offset {base} is past the end of the file ({size} bytes)")
     else:
         base = a.start
-    os.makedirs(a.out, exist_ok=True)
+    if same_report_path(a.out, a.archive):
+        sys.exit(f"{a.out}: the output folder is the input archive")
+    try:
+        os.makedirs(a.out, exist_ok=True)
+    except OSError as e:  # a regular file where the folder should be
+        sys.exit(f"{a.out}: cannot create the output folder: {e.strerror or e}")
     with open(a.archive, "rb") as fh:
         m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
         pos = base
