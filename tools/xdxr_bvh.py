@@ -10,7 +10,8 @@ module is the CPU reference for that builder:
 * ``intersect_node`` is one traversal step with the semantics of the hardware instruction
   (``image_bvh_intersect_ray``) as the public XDXR software path describes it;
 * ``trace`` walks a TLAS or BLAS with ``intersect_node`` and returns the closest hit;
-* ``validate`` checks a buffer's header, pointers, bounds and parent table.
+* ``validate`` checks a buffer's header, pointers, bounds and parent table;
+* ``compare-build`` reports traversal visits on the same rays for two synthetic GPU-build captures.
 
 The record layouts, flag values and step semantics come from docs/bvh.md section 3.1 and the public
 ``XDXRStandaloneTraverseShortStackCPU.hlsli`` (DagorEngine commit 9639942, quoted there): header (L2531), Node16
@@ -551,13 +552,15 @@ def _inverse_dir(d):
     return [1.0 / c if c != 0.0 else math.copysign(FLT_MAX, c) for c in d]
 
 
-def _trace_blas(mem, bvh_va, org, d, tmax, hit, inst):
+def _trace_blas(mem, bvh_va, org, d, tmax, hit, inst, visits):
     inv = _inverse_dir(d)
     stack = [mem.u32(bvh_va + 48)[0]]
     while stack:
         p = stack.pop()
         if p == INVALID:
             continue
+        if visits is not None:
+            visits[0] += 1
         r = intersect_node(mem, bvh_va, p, org, d, inv, hit["t"] if hit else tmax)
         if r is None:
             continue
@@ -577,13 +580,14 @@ def _trace_blas(mem, bvh_va, org, d, tmax, hit, inst):
     return hit
 
 
-def trace(mem, bvh_va, org, d, tmax=INF, mask=0xFF, bias=0):
+def trace(mem, bvh_va, org, d, tmax=INF, mask=0xFF, bias=0, *, visits=None):
     """Closest hit of a ray in a TLAS or BLAS at ``bvh_va``: a dict with t, instance (None for a BLAS), geometry,
     primitive, bary and front, or None. ``bias`` is added to the BLAS addresses instance records hold (application
-    address to the address in ``mem``)."""
+    address to the address in ``mem``). The optional one-element counter ``visits`` accumulates non-INVALID nodes
+    popped from the traversal stack, including TLAS instance records and nodes inside their BLASes."""
     flags = mem.u32(bvh_va)[0]
     if flags & FLAG_BOTTOM_LEVEL:
-        return _trace_blas(mem, bvh_va, org, d, tmax, None, None)
+        return _trace_blas(mem, bvh_va, org, d, tmax, None, None, visits)
     hit = None
     inv = _inverse_dir(d)
     stack = [mem.u32(bvh_va + 48)[0]]
@@ -591,6 +595,8 @@ def trace(mem, bvh_va, org, d, tmax=INF, mask=0xFF, bias=0):
         p = stack.pop()
         if p == INVALID:
             continue
+        if visits is not None:
+            visits[0] += 1
         if ptr_type(p) == INSTANCE:
             rec = bvh_va + ptr_offset(p)
             id_mask, _, internal, blas = mem.u32(rec + 48, 4)
@@ -605,7 +611,7 @@ def trace(mem, bvh_va, org, d, tmax=INF, mask=0xFF, bias=0):
                 raise ValueError(f"instance root {root:#x} is not the BLAS header's root")
             index = mem.u32(rec + 112)[0]
             # the object-space ray keeps the world t: the direction is transformed, not normalised
-            hit = _trace_blas(mem, blas_va, lo, ld, tmax, hit, index)
+            hit = _trace_blas(mem, blas_va, lo, ld, tmax, hit, index, visits)
             continue
         r = intersect_node(mem, bvh_va, p, org, d, inv, hit["t"] if hit else tmax)
         if r:
@@ -613,9 +619,12 @@ def trace(mem, bvh_va, org, d, tmax=INF, mask=0xFF, bias=0):
     return hit
 
 
-def brute_force(scene, org, d, tmax=INF, mask=0xFF):
+def brute_force(scene, org, d, tmax=INF, mask=0xFF, *, ties=None):
     """Closest hit over every triangle of every instance, with the same triangle test: what a BVH must reproduce.
-    ``scene`` is a list of (transform or None, mask, triangles); the result names the scene index as instance."""
+    ``scene`` is a list of (transform or None, mask, triangles); the result names the scene index as instance.
+    The optional list ``ties`` receives all (instance, triangle index) pairs at the closest distance."""
+    if ties is not None:
+        ties.clear()
     best = None
     for idx, (m, imask, tris) in enumerate(scene):
         if m is not None and not imask & mask:
@@ -632,7 +641,12 @@ def brute_force(scene, org, d, tmax=INF, mask=0xFF):
                 continue
             tt = t_num / t_den
             if tt <= (best["t"] if best else tmax):
-                best = {"t": tt, "instance": None if m is None else idx, "primitive": prim,
+                instance = None if m is None else idx
+                if ties is not None:
+                    if best is not None and tt < best["t"]:
+                        ties.clear()
+                    ties.append((instance, prim))
+                best = {"t": tt, "instance": instance, "primitive": prim,
                         "bary": (i_num / t_den, j_num / t_den)}
     return best
 
@@ -749,6 +763,54 @@ def _load_case(directory, name):
     return desc, data
 
 
+def _case_memory(cases, name, references=None):
+    desc, data = cases[name]
+    # An in-place update may reuse an address. Place the case being checked first.
+    mem = Memory()
+    mem.place(desc["address"], data)
+    for other in cases if references is None else references:
+        if other != name:
+            odesc, odata = cases[other]
+            mem.place(odesc["address"], odata)
+    return mem
+
+
+def _case_scene(desc, cases):
+    if desc["kind"] == "blas":
+        inputs = [(None, 0xFF, desc["triangles"])]
+    else:
+        blas = [cases[name][0] for name in desc["blas"]]
+        inputs = []
+        for inst in desc["instances"]:
+            m = inst["transform"]
+            rows = [m[0:4], m[4:8], m[8:12]]
+            src = blas[inst["blas"]]["triangles"] if inst["blas"] >= 0 else []
+            inputs.append((rows, inst["mask"], src))
+    scene = [(m, mask, [t[:3] for t in tris]) for m, mask, tris in inputs]
+    ids = [[(t[3], t[4]) for t in tris] for _, _, tris in inputs]
+    return scene, ids
+
+
+def _case_ray(rng):
+    origin = [rng.uniform(-12, 12) for _ in range(3)]
+    target = [rng.uniform(-6, 6) for _ in range(3)]
+    return origin, [target[c] - origin[c] for c in range(3)]
+
+
+def _hit_matches(got, want, identities, bottom):
+    if got is None or want is None:
+        return got is want
+    if (got["instance"], got["geometry"], got["primitive"]) not in identities:
+        return False
+    # A TLAS uses a float32 world-to-object inverse; allow that rounding in t.
+    return math.isclose(got["t"], want["t"], rel_tol=1e-6 if bottom else 1e-4,
+                        abs_tol=1e-9 if bottom else 0.0)
+
+
+def _hit_identity(ids, instance, primitive):
+    return (instance, *ids[0 if instance is None else instance][primitive])
+
+
 def check_build(directory, rays=300, seed=1):
     """Validate every <case>.bin of a GPU build and trace rays against brute force. Returns a list of problems."""
     names = _case_names(directory)
@@ -758,57 +820,117 @@ def check_build(directory, rays=300, seed=1):
     cases = {n: _load_case(directory, n) for n in names}
     rng = random.Random(seed)
     for n, (desc, data) in cases.items():
-        # An in-place update leaves two dumps at one address (before and after): the case being checked comes first,
-        # so its own bytes answer reads there.
-        mem = Memory()
-        mem.place(desc["address"], data)
-        for other, (odesc, odata) in cases.items():
-            if other != n:
-                mem.place(odesc["address"], odata)
-        errs = validate(data, expect_bottom=desc["kind"] == "blas")
+        bottom = desc["kind"] == "blas"
+        mem = _case_memory(cases, n)
+        errs = validate(data, expect_bottom=bottom)
         problems += [f"{n}: {e}" for e in errs]
-        if desc["kind"] == "blas":
-            tris = desc["triangles"]
-            scene = [(None, 0xFF, [t[:3] for t in tris])]
-            ids = [(t[3], t[4]) for t in tris]
-        else:
-            blas = [cases[b][0] for b in desc["blas"]]
-            scene, ids, inst_ids = [], None, []
-            for inst in desc["instances"]:
-                m = inst["transform"]
-                rows = [m[0:4], m[4:8], m[8:12]]
-                src = blas[inst["blas"]]["triangles"] if inst["blas"] >= 0 else []
-                scene.append((rows, inst["mask"], [t[:3] for t in src]))
-                inst_ids.append([(t[3], t[4]) for t in src])      # list position -> (geometry, primitive)
+        scene, ids = _case_scene(desc, cases)
         bad = hits = 0
         case_rays = min(rays, desc.get("rays", rays))      # a large case may ask for fewer (brute force is slow)
         for _ in range(case_rays):
-            o = [rng.uniform(-12, 12) for _ in range(3)]
-            target = [rng.uniform(-6, 6) for _ in range(3)]
-            d = [target[c] - o[c] for c in range(3)]
+            o, d = _case_ray(rng)
             got = trace(mem, desc["address"], o, d, bias=desc.get("bias", 0))
             want = brute_force(scene, o, d)
             hits += got is not None
-            if (got is None) != (want is None):
-                bad += 1
-                continue
-            if got is None:
-                continue
-            if ids is not None:
-                same = (got["geometry"], got["primitive"]) == ids[want["primitive"]]
-                same = same and math.isclose(got["t"], want["t"], rel_tol=1e-6, abs_tol=1e-9)
-            else:
-                # the instance's world-to-object matrix is a float32 inverse; allow for its rounding in t
-                want_id = inst_ids[want["instance"]][want["primitive"]]
-                same = (got["instance"], (got["geometry"], got["primitive"])) == (want["instance"], want_id)
-                same = same and math.isclose(got["t"], want["t"], rel_tol=1e-4)
-            bad += not same
+            identities = () if want is None else (_hit_identity(ids, want["instance"], want["primitive"]),)
+            bad += not _hit_matches(got, want, identities, bottom)
         print(f"{n}: {len(data)} bytes, {len(errs)} validation errors, {bad}/{case_rays} rays differ ({hits} hits)")
         if bad:
             problems.append(f"{n}: {bad} of {case_rays} rays differ from brute force")
         if desc["kind"] == "blas" and len(desc["triangles"]) > 4 and hits == 0:
             problems.append(f"{n}: no ray hit anything; the check proves nothing")
     return problems
+
+
+def _load_capture(directory, names, label):
+    cases = {}
+    for name in names:
+        try:
+            desc, data = _load_case(directory, name)
+            if desc["kind"] not in ("blas", "tlas"):
+                raise ValueError("kind must be blas or tlas")
+            for field, value, minimum in (("address", desc["address"], 0),
+                                          ("bias", desc.get("bias", 0), 0),
+                                          ("rays", desc.get("rays", 1), 1)):
+                if type(value) is not int or value < minimum:
+                    raise ValueError(f"{field} must be an integer >= {minimum}")
+            errors = validate(data, expect_bottom=desc["kind"] == "blas")
+        except (OSError, ValueError, TypeError, KeyError, IndexError, AttributeError, struct.error) as error:
+            raise ValueError(f"{label} {name}: malformed capture: {error}") from error
+        if errors:
+            raise ValueError(f"{label} {name}: {'; '.join(errors)}")
+        cases[name] = desc, data
+    return cases
+
+
+def _visit_summary(visits):
+    ordered = sorted(visits)
+    p95 = ordered[(95 * len(ordered) + 99) // 100 - 1]
+    return f"mean {sum(visits) / len(visits):.2f}, p95 {p95}"
+
+
+def compare_build(baseline, candidate, rays=300, seed=1):
+    """Compare paired synthetic captures. Print traversal work; return a list of validation problems."""
+    base_names, candidate_names = set(_case_names(baseline)), set(_case_names(candidate))
+    if not base_names or not candidate_names:
+        return [f"no cases in {'baseline' if not base_names else 'candidate'} capture"]
+    if base_names != candidate_names:
+        problems = []
+        for label, missing in (("baseline", candidate_names - base_names),
+                               ("candidate", base_names - candidate_names)):
+            if missing:
+                problems.append(f"{label}: missing cases: {', '.join(sorted(missing))}")
+        return problems
+
+    names = sorted(base_names)
+    try:
+        base = _load_capture(baseline, names, "baseline")
+        other = _load_capture(candidate, names, "candidate")
+    except ValueError as error:
+        return [str(error)]
+
+    rng = random.Random(seed)
+    problems = []
+    for name in names:
+        try:
+            problems.extend(_compare_case(name, base, other, rng, rays))
+        except (ValueError, TypeError, KeyError, IndexError, AttributeError, OverflowError, struct.error) as error:
+            problems.append(f"{name}: malformed capture: {error}")
+    return problems
+
+
+def _compare_case(name, base, candidate, rng, rays):
+    desc0, _ = base[name]
+    desc1, _ = candidate[name]
+    scene, ids = _case_scene(desc0, base)
+    if desc0["kind"] != desc1["kind"] or (scene, ids) != _case_scene(desc1, candidate):
+        return [f"{name}: baseline and candidate scenes differ"]
+
+    bottom = desc0["kind"] == "blas"
+    case_rays = min(rays, desc0.get("rays", rays), desc1.get("rays", rays))
+    # A TLAS declares the particular BLAS snapshots it refers to. Other snapshots
+    # may share their GPU addresses after an in-place refit.
+    sides = ((_case_memory(base, name, desc0["blas"] if not bottom else ()), desc0),
+             (_case_memory(candidate, name, desc1["blas"] if not bottom else ()), desc1))
+    visits = [[], []]
+    mismatches = [0, 0]
+    hits = 0
+    for _ in range(case_rays):
+        o, d = _case_ray(rng)
+        ties = []
+        want = brute_force(scene, o, d, ties=ties)
+        hits += want is not None
+        identities = {_hit_identity(ids, instance, primitive) for instance, primitive in ties}
+        for index, (mem, desc) in enumerate(sides):
+            count = [0]
+            got = trace(mem, desc["address"], o, d, bias=desc.get("bias", 0), visits=count)
+            visits[index].append(count[0])
+            mismatches[index] += not _hit_matches(got, want, identities, bottom)
+
+    print(f"{name}: {case_rays} rays; baseline {_visit_summary(visits[0])}; "
+          f"candidate {_visit_summary(visits[1])} (node visits per ray); {hits} oracle hits")
+    return [f"{name}: {label} has {bad} of {case_rays} rays differing from brute force"
+            for label, bad in zip(("baseline", "candidate"), mismatches) if bad]
 
 
 # ---- self test and CLI ----
@@ -874,7 +996,20 @@ def main(argv=None):
     c = sub.add_parser("check-build", help="check the cases vk_xdxr_build_test wrote to a directory")
     c.add_argument("dir")
     c.add_argument("--rays", type=int, default=300)
+    cmp = sub.add_parser("compare-build", help="compare node visits in matching synthetic GPU build captures")
+    cmp.add_argument("baseline")
+    cmp.add_argument("candidate")
+    cmp.add_argument("--rays", type=int, default=300)
+    cmp.add_argument("--seed", type=int, default=1)
     a = ap.parse_args(argv)
+    if a.cmd == "compare-build":
+        if a.rays < 1:
+            ap.error("--rays must be at least 1")
+        problems = compare_build(a.baseline, a.candidate, a.rays, a.seed)
+        for e in problems:
+            print(e, file=sys.stderr)
+        print("all cases match" if not problems else f"{len(problems)} problems")
+        return 1 if problems else 0
     if a.cmd == "check-build":
         if a.rays < 1:
             ap.error("--rays must be at least 1")

@@ -517,9 +517,15 @@ The Vulkan layer uses it for `BuildRaytracingAccelerationStructure` unless `LEON
 (`docs/d3d12_vulkan.md` §4.8); `d3d12_xdxr_rt_test <dir>` builds a BLAS and a TLAS through the D3D12 API and writes
 them the same way.
 
-`vk_xdxr_build_test <dir>` builds nine synthetic cases on the GPU and writes each structure with a description of its
+`vk_xdxr_build_test <dir>` builds synthetic cases on the GPU and writes each structure with a description of its
 scene. `xdxr_bvh.py check-build <dir>` validates them and traces rays against brute force. `ctest` runs both as
 `xdxr_build` and `xdxr_build_check`.
+
+For a before-and-after comparison, save each build's captures in a separate directory and run
+`python -I tools/xdxr_bvh.py compare-build <baseline> <candidate> --rays 1000 --seed 1`.
+The directories must contain matching synthetic scenes. The tool traces the same rays through both trees,
+checks the closest hits against the brute-force reference, and reports mean and 95th-percentile node visits
+per ray for each case. A node visit is a stack entry processed by the CPU reference traversal.
 
 **Updates** (D3D12 `PERFORM_UPDATE`) refit: the source structure is copied to the destination unless it is the
 destination, the elements are rewritten at their slots, and each node's boxes are recomputed bottom-up from the

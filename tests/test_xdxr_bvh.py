@@ -5,13 +5,16 @@ No game data is read.
 """
 import contextlib
 import io
+import json
 import math
 import os
 import random
+import re
 import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -378,28 +381,28 @@ class ConsoleParentTable(unittest.TestCase):
 class CheckBuild(unittest.TestCase):
     """check-build on cases written the way vk_xdxr_build_test writes them, built here by the reference."""
 
-    def write_cases(self, d, corrupt=False):
-        import json
+    def write_capture(self, directory, name, desc, data):
+        with open(os.path.join(directory, name + ".bin"), "wb") as f:
+            f.write(data)
+        with open(os.path.join(directory, name + ".json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump(desc, f)
+
+    def write_cases(self, d, corrupt=False, *, va=0x12345600, bias=0x7F0000000000,
+                    tlas_va=0x40000000, x_translation=2):
         tris = X.grid_mesh(4, 3.0)
         blas, info = X.build_blas(tris)
-        if corrupt:                                    # move one leaf's first vertex: traces must disagree
+        if corrupt:  # Collapse the triangles inside their existing boxes so only ray validation detects the error.
             b = bytearray(blas)
             for leaf in range(info["triangles"]):
-                struct.pack_into("<f", b, info["elements"] + 64 * leaf, 50.0)
+                start = info["elements"] + X.LEAF_SIZE * leaf
+                b[start:start + 12] = b[start + 12:start + 24]
             blas = bytes(b)
-        va, bias = 0x12345600, 0x7F0000000000
-        with open(os.path.join(d, "blas_grid.bin"), "wb") as f:
-            f.write(blas)
-        with open(os.path.join(d, "blas_grid.json"), "w") as f:
-            json.dump({"kind": "blas", "address": va + bias,
-                       "triangles": [t + [0, i] for i, t in enumerate(tris)]}, f)
-        m = [[1, 0, 0, 2], [0, 1, 0, -1], [0, 0, 1, 0.5]]
+        self.write_capture(d, "blas_grid", {"kind": "blas", "address": va + bias,
+                                           "triangles": [t + [0, i] for i, t in enumerate(tris)]}, blas)
+        m = [[1, 0, 0, x_translation], [0, 1, 0, -1], [0, 0, 1, 0.5]]
         tlas, _ = X.build_tlas([X.Instance(m, va, info["root"], info["bounds"])])
-        with open(os.path.join(d, "tlas.bin"), "wb") as f:
-            f.write(tlas)
-        with open(os.path.join(d, "tlas.json"), "w") as f:
-            json.dump({"kind": "tlas", "address": 0x40000000, "bias": bias, "blas": ["blas_grid"],
-                       "instances": [{"transform": sum(m, []), "mask": 255, "blas": 0}]}, f)
+        self.write_capture(d, "tlas", {"kind": "tlas", "address": tlas_va, "bias": bias, "blas": ["blas_grid"],
+                                      "instances": [{"transform": sum(m, []), "mask": 255, "blas": 0}]}, tlas)
 
     def run_check(self, corrupt):
         with tempfile.TemporaryDirectory() as d:
@@ -429,6 +432,123 @@ class CheckBuild(unittest.TestCase):
     def test_empty_directory(self):
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(X.check_build(d), [f"no cases in {d}"])
+
+    def comparison_dirs(self):
+        root = self.enterContext(tempfile.TemporaryDirectory())
+        before, after = os.path.join(root, "build[1]"), os.path.join(root, "build[2]")
+        os.mkdir(before)
+        os.mkdir(after)
+        self.write_cases(before)
+        return before, after
+
+    def run_comparison(self, before, after):
+        report = io.StringIO()
+        with contextlib.redirect_stdout(report), contextlib.redirect_stderr(report):
+            code = X.main(["compare-build", before, after, "--rays", "150", "--seed", "1234"])
+        return code, report.getvalue()
+
+    def visits(self, report, name):
+        columns = (rf"^{name}: 150 rays; baseline mean ([\d.]+), p95 ([\d.]+); "
+                   r"candidate mean ([\d.]+), p95 ([\d.]+)")
+        values = re.search(columns, report, re.MULTILINE)
+        self.assertIsNotNone(values, report)
+        return tuple(float(x) for x in values.groups())
+
+    def test_compare_build_relocated_captures_are_deterministic(self):
+        before, after = self.comparison_dirs()
+        self.write_cases(after, va=0x22222200, bias=0x6E0000000000, tlas_va=0x80000000)
+
+        code, report = self.run_comparison(before, after)
+        self.assertEqual(code, 0, report)
+        self.assertEqual(self.run_comparison(before, after), (code, report))
+        for name in ("blas_grid", "tlas"):
+            baseline_mean, baseline_p95, candidate_mean, candidate_p95 = self.visits(report, name)
+            self.assertGreater(baseline_mean, 1)
+            self.assertGreater(baseline_p95, baseline_mean)
+            self.assertEqual((baseline_mean, baseline_p95), (candidate_mean, candidate_p95))
+
+    def test_compare_build_reports_a_cost_change_for_the_same_geometry(self):
+        before, after = self.comparison_dirs()
+        # Use a deeper tree with two groups in primitive order instead of four spatial groups.
+        # Primitive IDs, geometry and ray results remain the same across both builds.
+        def split_in_two(items, _centre):
+            mid = len(items) // 2
+            return [items[:mid], items[mid:]]
+
+        with mock.patch.object(X, "_split4", split_in_two):
+            self.write_cases(after)
+        code, report = self.run_comparison(before, after)
+        self.assertEqual(code, 0, report)
+        baseline_mean, _, candidate_mean, _ = self.visits(report, "blas_grid")
+        self.assertGreater(candidate_mean, baseline_mean, report)
+
+    def test_compare_build_accepts_nearest_hit_ties(self):
+        triangle = [[-32.0, -32.0, 0.0], [32.0, -32.0, 0.0], [0.0, 48.0, 0.0]]
+        blas, info = X.build_blas([triangle, triangle])
+        reversed_children = bytearray(blas)
+        root_offset = X.ptr_offset(info["root"])
+        first, second = struct.unpack_from("<2I", blas, root_offset)
+        struct.pack_into("<2I", reversed_children, root_offset, second, first)
+
+        def hit_id(data):
+            mem = X.Memory()
+            mem.place(0x10000, data)
+            return X.trace(mem, 0x10000, [0, 0, 1], [0, 0, -1])["primitive"]
+
+        self.assertNotEqual(hit_id(blas), hit_id(reversed_children))
+        desc = {"kind": "blas", "address": 0x10000, "triangles": [triangle + [0, i] for i in range(2)]}
+        with tempfile.TemporaryDirectory() as before, tempfile.TemporaryDirectory() as after:
+            self.write_capture(before, "ties", desc, blas)
+            self.write_capture(after, "ties", desc, reversed_children)
+            code, report = self.run_comparison(before, after)
+        self.assertEqual(code, 0, report)
+
+    def test_compare_build_uses_the_named_blas_snapshot(self):
+        before, after = self.comparison_dirs()
+        self.write_cases(after)
+        older_triangles = [[[x, y, z + 4.0] for x, y, z in tri] for tri in X.grid_mesh(4, 3.0)]
+        older, _ = X.build_blas(older_triangles)
+        for directory in (before, after):
+            with open(os.path.join(directory, "blas_grid.json"), encoding="utf-8") as f:
+                address = json.load(f)["address"]
+            # The older snapshot sorts first and reuses the BLAS address, but the TLAS names blas_grid.
+            self.write_capture(directory, "blas_before_refit", {
+                "kind": "blas", "address": address,
+                "triangles": [tri + [0, i] for i, tri in enumerate(older_triangles)],
+            }, older)
+
+        code, report = self.run_comparison(before, after)
+        self.assertEqual(code, 0, report)
+        self.assertRegex(report, r"(?m)^tlas: .*; [1-9]\d* oracle hits$")
+
+    def test_compare_build_rejects_a_different_tlas_scene(self):
+        before, after = self.comparison_dirs()
+        self.write_cases(after, x_translation=3)
+        code, report = self.run_comparison(before, after)
+        self.assertNotEqual(code, 0, report)
+        self.assertIn("tlas", report.lower())
+        self.assertRegex(report.lower(), r"scene|transform|metadata")
+
+    def test_compare_build_rejects_invalid_json(self):
+        before, after = self.comparison_dirs()
+        self.write_cases(after)
+        with open(os.path.join(after, "blas_grid.json"), "w", encoding="utf-8", newline="\n") as f:
+            f.write("{")
+        code, report = self.run_comparison(before, after)
+        self.assertNotEqual(code, 0, report)
+        self.assertIn("blas_grid", report.lower())
+        self.assertNotIn("Traceback", report)
+
+    def test_compare_build_rejects_wrong_hits_in_a_valid_structure(self):
+        before, after = self.comparison_dirs()
+        self.write_cases(after, corrupt=True)
+        with open(os.path.join(after, "blas_grid.bin"), "rb") as f:
+            self.assertEqual(X.validate(f.read(), expect_bottom=True), [])
+
+        code, report = self.run_comparison(before, after)
+        self.assertNotEqual(code, 0, report)
+        self.assertIn("blas_grid", report)
+        self.assertRegex(report.lower(), r"hit|rays? differ")
 
 
 class Cli(unittest.TestCase):
