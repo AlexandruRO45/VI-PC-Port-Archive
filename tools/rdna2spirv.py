@@ -7478,10 +7478,12 @@ class Gen:
             self.emit(f"{m} = OpFMul %float {x} {y}")
             self.emit(f"{r} = OpFAdd %float {self.flush_f32(m)} {z}")
             self.dst(a[0], self.tou(self.flush_f32(self.clamp_mods(r, mods))))
-        elif op in ("v_mul_lo_u32", "v_min_u32", "v_max_u32", "v_min_i32", "v_max_i32"):
+        elif op in ("v_mul_lo_u32", "v_mul_lo_i32", "v_min_u32", "v_max_u32", "v_min_i32", "v_max_i32"):
             x, y = self.src_u(a[1]), self.src_u(a[2])
             r = self.tmp()
-            if op == "v_mul_lo_u32":
+            if op in ("v_mul_lo_u32", "v_mul_lo_i32"):
+                # The low 32 bits of the product are the same for signed and unsigned operands. v_mul_lo_i32 (VOP3
+                # 0x16b) exists on GFX10.1 (gfx1010-gfx1013, the console) only: LLVM's gfx103x tables drop it.
                 self.emit(f"{r} = OpIMul %uint {x} {y}")
             else:
                 f = {"v_min_u32": "UMin", "v_max_u32": "UMax", "v_min_i32": "SMin", "v_max_i32": "SMax"}[op]

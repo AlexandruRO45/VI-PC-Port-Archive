@@ -749,5 +749,23 @@ class LaneMaskConstants(unittest.TestCase):
         self.assertEqual(w64, self.WANT["cs_w64_mask_imm"][1])
 
 
+
+class MulLoI32(LaneMaskConstants):
+    """runtime/test/shaders/cs_w32_mul_lo_i32.asm: v_mul_lo_i32 (VOP3 0x16b, GFX10.1 / gfx1013 only), the low 32 bits
+    of the signed product, with VGPR, SGPR, literal and inline-constant operands. Before, it raised Unsupported."""
+
+    WANT = {"cs_w32_mul_lo_i32": (32, [0xFFFFFFF1, 0x80000000, 1, 63, 0x242D2080, 0xFFFF0001, 0xA5A5A5A6, 0])}
+    OLD = {"cs_w32_mul_lo_i32": None}
+
+    def test_words_follow_from_the_masks(self):
+        # Plain-Python reference: Python's signed product, low 32 bits.
+        def s32(x):
+            x &= 0xFFFFFFFF
+            return x - (1 << 32) if x >> 31 else x
+        pairs = [(3, -5), (0x80000000, -1), (0x7FFFFFFF, 0x7FFFFFFF), (-7, -9), (0x12345678, 0x9ABCDEF0),
+                 (0xFFFE0001, 0x10001), (-1, 0x5A5A5A5A), (0x40000000, 4)]
+        self.assertEqual([(s32(a) * s32(b)) & 0xFFFFFFFF for a, b in pairs], self.WANT["cs_w32_mul_lo_i32"][1])
+
+
 if __name__ == "__main__":
     unittest.main()
