@@ -860,5 +860,163 @@ class TestSIMDMultiLaneDivergenceAndExecMasking(unittest.TestCase):
             self.assertEqual(returns[lane], lane)
 
 
+class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(65536)
+        self.state = ScalarThreadState(lds=self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_scalar_dst_aliases_vaddr(self) -> None:
+        val_init = 0x11112222_33334444
+        val_new = 0x55556666_77778888
+        self.lds.write_qword(32, val_init)
+
+        # v2 holds address 32. vdst is v[2:3].
+        self.state.rf.set_u32(VGPR(2), 32)
+        self.state.rf.set_u64(VGPRPair(4), val_init)
+        self.state.rf.set_u64(VGPRPair(6), val_new)
+
+        inst = DSCondXchg32B64Instruction(
+            DSOpcode.DS_CONDXCHG32_RTN_B64,
+            vaddr=VGPR(2),
+            vdata0=VGPRPair(4),
+            vdata1=VGPRPair(6),
+            vdst=VGPRPair(2),
+        )
+        ret = self.interp.execute(self.state, inst)
+
+        self.assertEqual(ret, val_init)
+        self.assertEqual(self.state.rf.get_u64(VGPRPair(2)), val_init)
+        self.assertEqual(self.lds.read_qword(32), val_new)
+
+    def test_scalar_dst_aliases_data0(self) -> None:
+        val_init = 0xAAAA0000_BBBB0000
+        val_new = 0xCCCC0000_DDDD0000
+        self.lds.write_qword(40, val_init)
+
+        self.state.rf.set_u32(VGPR(1), 40)
+        self.state.rf.set_u64(VGPRPair(4), val_init)
+        self.state.rf.set_u64(VGPRPair(6), val_new)
+
+        # vdst aliases vdata0 (both v[4:5])
+        inst = DSCondXchg32B64Instruction(
+            DSOpcode.DS_CONDXCHG32_RTN_B64,
+            vaddr=VGPR(1),
+            vdata0=VGPRPair(4),
+            vdata1=VGPRPair(6),
+            vdst=VGPRPair(4),
+        )
+        ret = self.interp.execute(self.state, inst)
+
+        self.assertEqual(ret, val_init)
+        self.assertEqual(self.state.rf.get_u64(VGPRPair(4)), val_init)
+        self.assertEqual(self.lds.read_qword(40), val_new)
+
+    def test_scalar_dst_aliases_data1(self) -> None:
+        val_init = 0x12340000_56780000
+        val_new = 0x9ABC0000_DEF00000
+        self.lds.write_qword(48, val_init)
+
+        self.state.rf.set_u32(VGPR(1), 48)
+        self.state.rf.set_u64(VGPRPair(4), val_init)
+        self.state.rf.set_u64(VGPRPair(6), val_new)
+
+        # vdst aliases vdata1 (both v[6:7])
+        inst = DSCondXchg32B64Instruction(
+            DSOpcode.DS_CONDXCHG32_RTN_B64,
+            vaddr=VGPR(1),
+            vdata0=VGPRPair(4),
+            vdata1=VGPRPair(6),
+            vdst=VGPRPair(6),
+        )
+        ret = self.interp.execute(self.state, inst)
+
+        self.assertEqual(ret, val_init)
+        self.assertEqual(self.state.rf.get_u64(VGPRPair(6)), val_init)
+        self.assertEqual(self.lds.read_qword(48), val_new)
+
+    def test_scalar_data0_aliases_data1(self) -> None:
+        val_init = 0xFEEDFACE_CAFEBABE
+        self.lds.write_qword(56, val_init)
+
+        self.state.rf.set_u32(VGPR(1), 56)
+        self.state.rf.set_u64(VGPRPair(4), val_init)
+
+        inst = DSCondXchg32B64Instruction(
+            DSOpcode.DS_CONDXCHG32_RTN_B64,
+            vaddr=VGPR(1),
+            vdata0=VGPRPair(4),
+            vdata1=VGPRPair(4),
+            vdst=VGPRPair(2),
+        )
+        ret = self.interp.execute(self.state, inst)
+
+        self.assertEqual(ret, val_init)
+        self.assertEqual(self.state.rf.get_u64(VGPRPair(2)), val_init)
+        self.assertEqual(self.lds.read_qword(56), val_init)
+
+    def test_operand_preservation_non_aliased(self) -> None:
+        val_init = 0x11111111_11111111
+        val_new = 0x22222222_22222222
+        self.lds.write_qword(64, val_init)
+
+        self.state.rf.set_u32(VGPR(1), 64)
+        self.state.rf.set_u64(VGPRPair(4), val_init)
+        self.state.rf.set_u64(VGPRPair(6), val_new)
+        self.state.rf.set_u32(VGPR(100), 0xCAFEBABE)
+        self.state.rf.set_u32(VGPR(255), 0x12345678)
+
+        inst = DSCondXchg32B64Instruction(
+            DSOpcode.DS_CONDXCHG32_RTN_B64,
+            vaddr=VGPR(1),
+            vdata0=VGPRPair(4),
+            vdata1=VGPRPair(6),
+            vdst=VGPRPair(8),
+        )
+        self.interp.execute(self.state, inst)
+
+        self.assertEqual(self.state.rf.get_u32(VGPR(1)), 64)
+        self.assertEqual(self.state.rf.get_u64(VGPRPair(4)), val_init)
+        self.assertEqual(self.state.rf.get_u64(VGPRPair(6)), val_new)
+        self.assertEqual(self.state.rf.get_u32(VGPR(100)), 0xCAFEBABE)
+        self.assertEqual(self.state.rf.get_u32(VGPR(255)), 0x12345678)
+
+    def test_simd_aliasing_under_divergence(self) -> None:
+        lds = LDSMemory(65536)
+        wave = SIMDWaveState(wave_size=32, exec_mask=0xAAAAAAAA, lds=lds)
+        interp = SIMDDSInterpreter()
+
+        val_init = 0x55555555_55555555
+        val_new = 0x77777777_77777777
+        for i in range(32):
+            lds.write_qword(i * 8, val_init)
+
+        for lane in range(32):
+            wave.set_u32(lane, VGPR(1), lane * 8)
+            wave.set_u64(lane, VGPRPair(4), val_init)
+            wave.set_u64(lane, VGPRPair(6), val_new)
+
+        inst = DSCondXchg32B64Instruction(
+            DSOpcode.DS_CONDXCHG32_RTN_B64,
+            vaddr=VGPR(1),
+            vdata0=VGPRPair(4),
+            vdata1=VGPRPair(6),
+            vdst=VGPRPair(4),
+        )
+        returns = interp.execute(wave, inst)
+
+        for lane in range(32):
+            if lane % 2 != 0:
+                self.assertEqual(wave.get_u64(lane, VGPRPair(4)), val_init)
+                self.assertEqual(lds.read_qword(lane * 8), val_new)
+                self.assertEqual(returns[lane], val_init)
+            else:
+                self.assertEqual(wave.get_u64(lane, VGPRPair(4)), val_init)
+                self.assertEqual(lds.read_qword(lane * 8), val_init)
+                self.assertNotIn(lane, returns)
+
+
 if __name__ == "__main__":
     unittest.main()
