@@ -82,7 +82,7 @@ CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed001
 SIGNED_ZERO_NAN = [0x80000000, 0x80000000, 0x80008000, 0x00008000, 1, 1, 1, 0x00007c00]
 WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute",
                 "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop", "cs_w32_lds_u8_d16", "cs_bpermute32",
-                "cs_w32_partial_scmp", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext", "cs_w32_scalar_store",
+                "cs_w32_partial_scmp", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext", "cs_w32_scalar_store", "cs_w32_scalar_atomic",
                 "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst",
                 "cs_mask_vgpr_exec")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
@@ -113,6 +113,9 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             ("cs_w32_int_ext", [1, 27, 1, 0x33332222, 0xC0000000, 0x4000, 18, 0x20304050]),
             # GFX10.1 scalar stores (derivations in cs_w32_scalar_store.asm)
             ("cs_w32_scalar_store", [0x11111111, 0x22222222, 0x33333333, 0x44444444, 0x55555555, 0x66666666, 0x77777777, 0x88888888]),
+            # GFX10.1 scalar atomics, once per wave (derivations in cs_w32/w64_scalar_atomic.asm)
+            ("cs_w32_scalar_atomic", [100, 7, 0xF0, 5, 103, 5, 0x0F, 6]),
+            ("cs_w64_scalar_atomic", [100, 100, 0xF0, 5, 103, 0x0F, 0xFF, 0x105]),
             # 64-bit scalar data ops and v_mad_u64_u32 (derivations in cs_w32_salu64.asm)
             # more ops with CPU-only checks until now (derivations in cs_w32_misc_ext.asm)
             # ops merged on 2026-11-22 with CPU-only checks (derivations in cs_w32_new_ops.asm)

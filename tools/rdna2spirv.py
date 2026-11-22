@@ -3747,7 +3747,8 @@ class Gen:
         if op.startswith("ds_"):
             kind = "lds"
         elif op.startswith(("buffer_", "tbuffer_", "global_", "flat_", "image_load", "image_store", "image_atomic",
-                            "s_load_", "s_buffer_load_", "s_store_", "s_buffer_store_")):
+                            "s_load_", "s_buffer_load_", "s_store_", "s_buffer_store_", "s_atomic_",
+                            "s_buffer_atomic_")):
             kind = "mem"
         else:
             return
@@ -7170,6 +7171,8 @@ class Gen:
             self.scalar_load(op, a, ins["mods"])
         elif op in self.SCALAR_STORES:
             self.scalar_load(op, a, ins["mods"], store=True)
+        elif op.startswith(("s_atomic_", "s_buffer_atomic_")):
+            self.scalar_load(op, a, ins["mods"], store=True, atomic=op.split("atomic_", 1)[1])
         elif op in ("s_lshl_b64", "s_lshr_b64", "s_ashr_i64"):
             # 64-bit shift of an SGPR pair by (src1 & 63); SCC = result != 0.
             d, x = a[0], a[1]
@@ -8683,7 +8686,11 @@ class Gen:
     SCALAR_STORES = ("s_store_dword", "s_store_dwordx2", "s_store_dwordx4",
                      "s_buffer_store_dword", "s_buffer_store_dwordx2", "s_buffer_store_dwordx4")
 
-    def scalar_load(self, op, a, mods, store=False):
+    # Scalar atomics translated (GFX10.1 only): the 32-bit buffer atomics, and the _x2 bitwise/swap forms as one 32-bit
+    # atomic per dword (as buffer_atomic_x2). The other _x2 forms carry or compare across the dwords.
+    SCALAR_ATOMICS_X2 = ("and_x2", "or_x2", "xor_x2", "swap_x2")
+
+    def scalar_load(self, op, a, mods, store=False, atomic=None):
         """s_load_dwordxN sD, s[p:p+1], off   -> N dwords from a 64-bit pointer, no bound
         s_buffer_load_dwordxN sD, s[v:v+3], off -> N dwords from a V#, each checked against NUM_RECORDS
         Both become PhysicalStorageBuffer loads (Vulkan buffer device address). V# base = dword0 | (dword1 & 0xFFFF) << 32
@@ -8705,8 +8712,27 @@ class Gen:
         lane-mask source (one bit per invocation here) is refused. Not measured: the gfx1036 oracle has no scalar
         stores; the address and bound rules are the measured s_load / s_buffer_load ones, assumed shared.
         Not measured, and inferred: s_load with sOFF + IMM < 0 (the 64-bit signed sum is used), x16 (same rule as
-        x8), an s_buffer_load immediate with bit 20 set or a negative one (kept as the 32-bit value, as before)."""
-        n = 1 if op.endswith("dword") else int(op.rsplit("x", 1)[1])
+        x8), an s_buffer_load immediate with bit 20 set or a negative one (kept as the 32-bit value, as before).
+        atomic=kind: s_atomic_<kind> / s_buffer_atomic_<kind> sD, base, off [glc] (GFX10.1 only) at the same address.
+        The wave does it once, as the hardware does: the invocation in hardware lane 0 (scalar instructions ignore
+        EXEC), so compute and mesh shaders only, where that lane is exact (LocalInvocationIndex mod the wave size:
+        one invocation, also under --wave64-emulate and for a wave64 on 32-wide subgroups). With glc the old value
+        goes to sD in every lane: from that lane by a subgroup shuffle, or by an exchange round under
+        --wave64-emulate. A wave64 on 32-wide subgroups without --wave64-emulate gets the returned value right in
+        lanes 0-31 only (the known cross-half approximation). s_buffer_atomic past the V# limit (the whole element)
+        does nothing and returns 0, as the load reads 0 there (inferred, not measured)."""
+        x2 = atomic is not None and atomic.endswith("_x2")
+        kind = None
+        if atomic is not None:
+            kind = atomic[:-3] if x2 else atomic
+            if (x2 and atomic not in self.SCALAR_ATOMICS_X2) or \
+                    (not x2 and kind not in self.BUF_ATOMICS and kind not in ("inc", "dec")):
+                raise Unsupported(op)
+            if self.stage not in ("cs", "ms"):
+                raise Unsupported(op + " outside compute (no exact hardware lane to perform it once per wave)")
+            n = 2 if (x2 or kind == "cmpswap") else 1
+        else:
+            n = 1 if op.endswith("dword") else int(op.rsplit("x", 1)[1])
         d, base = a[0], a[1]
         # A single dword may also land in vcc_lo / m0 / vcc_hi (seen: s_buffer_load_dword vcc_lo, ...), and a wide
         # load may target an LLVM VCCTuple list ending in vcc_lo,vcc_hi (seen in 6 FSPX shaders: s[100..105]+vcc).
@@ -8826,6 +8852,10 @@ class Gen:
                 self.emit(f"{prod} = OpIMul %ulong {nr64} {st64}")
                 self.emit(f"{raw} = OpIEqual %bool {stride} {self.cu(0)}")
                 self.emit(f"{lim} = OpSelect %ulong {raw} {nr64} {prod}")
+        if atomic is not None:
+            self.scalar_atomic(kind, x2, data, ptr, lim, lim_val, reg, imm, o64, d, single_special, slist_dst,
+                               "glc" in mods, store_slot)
+            return
         for i in range(n if store else 0):
             p = self.tmp()
             if lim is None or (lim_val is not None and reg is None and lim_val >= imm + 4 * i + 4):
@@ -8887,6 +8917,71 @@ class Gen:
                 store_slot(d["r"][i], v)
             else:
                 self.store_reg("sgpr", d["r"] + i, v)
+
+    def scalar_atomic(self, kind, x2, data, ptr, lim, lim_val, reg, imm, o64, d, single_special, slist_dst, glc,
+                      store_slot):
+        """The atomic part of scalar_load(atomic=...): done by the invocation in hardware lane 0 of the wave."""
+        nd = 2 if x2 else 1                        # dwords of the memory element
+        lane, first = self.wave_lane(), self.tmp()
+        self.emit(f"{first} = OpIEqual %bool {lane} {self.cu(0)}")
+        if lim is None:
+            cond = first
+        elif lim_val is not None and reg is None:
+            cond = first if lim_val >= imm + 4 * nd else None
+        else:
+            end, inb, cond = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{end} = OpIAdd %ulong {o64} {self.cl(4 * nd)}")
+            self.emit(f"{inb} = OpUGreaterThanEqual %bool {lim} {end}")
+            self.emit(f"{cond} = OpLogicalAnd %bool {first} {inb}")
+        olds = [self.cu(0)] * nd
+        if cond is not None:
+            lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
+            pre = self.current_label_placeholder()
+            self.emit(f"OpSelectionMerge {lbl_end} None")
+            self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
+            self.emit(f"{lbl_do} = OpLabel")
+            res, done_lbl = [], lbl_do
+            for w in range(nd):
+                p = self.tmp()
+                self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(w)}")
+                if kind in ("inc", "dec"):
+                    r, done_lbl = self.atomic_inc_dec_cas(p, data[0], kind, done_lbl)
+                elif kind == "cmpswap":
+                    r = self.tmp()
+                    self.emit(f"{r} = OpAtomicCompareExchange %uint {p} {self.cu(1)} {self.cu(0)} {self.cu(0)} "
+                              f"{data[0]} {data[1]}")
+                else:
+                    r = self.tmp()
+                    self.emit(f"{r} = {self.BUF_ATOMICS[kind][0]} %uint {p} {self.cu(1)} {self.cu(0)} {data[w]}")
+                res.append(r)
+            self.emit(f"OpBranch {lbl_end}")
+            self.emit(f"{lbl_end} = OpLabel")
+            olds = []
+            for w in range(nd):
+                o = self.tmp()
+                self.emit(f"{o} = OpPhi %uint {res[w]} {done_lbl} {self.cu(0)} {pre}")
+                olds.append(o)
+        if not glc:
+            return
+        outs = []
+        for w in range(nd):          # every lane takes the value lane 0 got
+            if self.emulate:
+                read, _ = self.x_round(data=olds[w])
+                outs.append(read(self.cu(0)))
+            else:
+                self.uses_subgroup = self.uses_ballot = True
+                b = self.tmp()
+                self.emit(f"{b} = OpGroupNonUniformShuffle %uint {self.cu(3)} {olds[w]} {self.cu(0)}")
+                outs.append(b)
+        for w, v in enumerate(outs):
+            if single_special and nd == 1:
+                self.dst(d, v)
+            elif single_special:
+                self.emit(f"OpStore {'%vcc' if w == 0 else '%vcc_hi'} {v}")
+            elif slist_dst:
+                store_slot(d["r"][w], v)
+            else:
+                self.store_reg("sgpr", d["r"] + w, v)
 
     # ---- images: T#/S# -> bindless index through a runtime-filled hash table ----
     # Table layout (storage buffer, set 0 binding 2): uint mask; then entries of 10 uints:

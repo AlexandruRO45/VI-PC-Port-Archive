@@ -791,5 +791,37 @@ class ScalarStores(LaneMaskConstants):
         return compute_header(os.path.join(support.ROOT, "runtime", "test", "shaders", "cs_w32_scalar_store.asm"))
 
 
+
+class ScalarAtomics(LaneMaskConstants):
+    """runtime/test/shaders/cs_w32_scalar_atomic.asm and cs_w64_scalar_atomic.asm: GFX10.1 scalar atomics, done once
+    per wave (by the invocation in hardware lane 0), the glc value before the op in every lane: add, sub, cmpswap, inc
+    and or_x2, s_buffer_atomic and s_atomic. Run on all lanes of one wave (wave64 on a 64-wide subgroup). The memory
+    starts as 0xee bytes; lane 0 writes the targets first. Before, they raised Unsupported."""
+
+    WANT = {"cs_w32_scalar_atomic": (32, [100, 7, 0xF0, 5, 103, 5, 0x0F, 6]), "cs_w64_scalar_atomic": (64, [100, 100, 0xF0, 5, 103, 0x0F, 0xFF, 0x105])}
+    OLD = {"cs_w32_scalar_atomic": None, "cs_w64_scalar_atomic": None}
+
+    def test_words_follow_from_the_masks(self):
+        # Plain-Python reference: each atomic applied once to the target lane 0 wrote; the returns are the old values.
+        add_old, sub_old, cas_old, inc_old = 100, 7, 0xF0, 5
+        inc_new = 0 if inc_old >= 6 else inc_old + 1
+        cas_new = 0x0F if cas_old == 0xF0 else cas_old
+        w32 = [add_old, sub_old, cas_old, inc_old, add_old + 3, sub_old - 2, cas_new, inc_new]
+        or_old = (0xF0, 5)
+        w64 = [add_old, add_old, 0xF0, or_old[1], add_old + 3, cas_new, or_old[0] | 0xFF, or_old[1] | 0x100]
+        self.assertEqual(w32, self.WANT["cs_w32_scalar_atomic"][1])
+        self.assertEqual(w64, self.WANT["cs_w64_scalar_atomic"][1])
+
+    def test_outside_compute_and_unsupported_forms_are_refused(self):
+        import rdna2spirv
+        for lines, msg in ((["s_atomic_add s4, s[0:1], 0x0", "exp mrt0 v0, v0, v0, v0 done vm", "s_endpgm"],
+                            "outside compute"),
+                           (["s_atomic_add_x2 s[4:5], s[0:1], 0x0", "exp mrt0 v0, v0, v0, v0 done vm", "s_endpgm"],
+                            "s_atomic_add_x2")):
+            with self.subTest(lines=lines):
+                with self.assertRaisesRegex(rdna2spirv.Unsupported, msg):
+                    support.translate_lines("ps_satomic", lines)
+
+
 if __name__ == "__main__":
     unittest.main()
