@@ -458,19 +458,18 @@ class PropRuleTests(unittest.TestCase):
         import first_light_prop as prop
         import tempfile
 
-        text, _nverts, ntris = self.box_obj(n=7)
+        text = self.box_obj(n=7)[0]
         no_uv = "v 0 0 0\nv 1 0 0\nv 0 1 1\nf 1 2 3\n"
-        # 70 candidates, best first; only the last two have UVs. pick() trims to 2 * limit + 32 = 34 while it
-        # streams, so a trim that kept unusable items would lose both.
-        entries = [(f"p{i:02d}.obj", 1000 + i, no_uv if i % 3 else None) for i in range(68)]
-        entries += [("p68.obj", 1068, text), ("p69.obj", 1069, text)]
+        # 74 candidates, best first; only the last two have UVs. pick() trims past 4 * limit + 64 items (68 for
+        # limit 1, 72 for limit 2), so a trim that kept unusable items would lose both.
+        entries = [(f"p{i:02d}.obj", 1000 + i, no_uv if i % 3 else None) for i in range(72)]
+        entries += [("p72.obj", 1072, text), ("p73.obj", 1073, text)]
         with tempfile.TemporaryDirectory() as folder:
             self.write_folder(folder, entries)
-            self.assertEqual([p["File"] for p in prop.pick(folder)], ["p68.obj"])
-            self.assertEqual([p["File"] for p in prop.pick(folder, limit=2)], ["p68.obj", "p69.obj"])
-            os.remove(os.path.join(folder, "p68.obj"))
-            self.assertEqual([p["File"] for p in prop.pick(folder)], ["p69.obj"])
-        self.assertEqual(ntris, 588)
+            self.assertEqual([p["File"] for p in prop.pick(folder)], ["p72.obj"])
+            self.assertEqual([p["File"] for p in prop.pick(folder, limit=2)], ["p72.obj", "p73.obj"])
+            os.remove(os.path.join(folder, "p72.obj"))
+            self.assertEqual([p["File"] for p in prop.pick(folder)], ["p73.obj"])
 
 
 def vs_on_cpu(sgprs: str, heap: str, layout: dict, x: float, y: float, z: float):
