@@ -38,7 +38,8 @@ exit /b %RC%
 
 rem ---- Helpers (only reached by "call"; the script exits above) ----
 
-rem Per-user Python under %LOCALAPPDATA%\Programs\Python, newest first. Needs no PATH refresh.
+rem Each per-user install under %LOCALAPPDATA%\Programs\Python, highest folder name first; each one is
+rem version-checked, so the name order does not matter. Needs no PATH refresh.
 :find_user_python
 for /f "delims=" %%D in ('dir /b /ad /o-n "%LOCALAPPDATA%\Programs\Python\Python3*" 2^>nul') do call :try_python "%LOCALAPPDATA%\Programs\Python\%%D\python.exe"
 exit /b 0
@@ -50,7 +51,7 @@ if not exist %1 exit /b 0
 exit /b 0
 
 rem Ask first, then install Python 3.12 for this user only (no admin): winget if present, else the pinned
-rem python.org installer checked against its SHA-256. LEONIDA_PY_INSTALL_DRYRUN=1 prints the command and skips it.
+rem python.org installer checked against its SHA-256 (also used if winget runs but installs nothing). LEONIDA_PY_INSTALL_DRYRUN=1 prints the command and skips it.
 rem On "No" or any failure PY stays unset and the caller prints the manual instructions.
 :offer_python
 echo Python 3.12 or newer was not found, and the build needs it.
@@ -58,6 +59,7 @@ choice /c YN /n /t 60 /d N /m "Download and install Python 3.12 for your user ac
 if errorlevel 2 exit /b 0
 if not errorlevel 1 exit /b 0
 where winget >nul 2>nul && goto :py_winget
+:py_download
 set "PYURL=https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe"
 set "PYSHA=67B5635E80EA51072B87941312D00EC8927C4DB9BA18938F7AD2D27B328B95FB"
 set "PYEXE=%TEMP%\leonida-python-3.12.10-amd64.exe"
@@ -86,11 +88,14 @@ set "PYWG=winget install --id Python.Python.3.12 -e --scope user --silent --acce
 if defined LEONIDA_PY_INSTALL_DRYRUN goto :py_dry_winget
 echo Installing Python 3.12 with winget ...
 call %PYWG%
-goto :py_installed
+call :find_user_python
+if defined PY exit /b 0
+echo winget did not install Python; trying the python.org installer instead.
+goto :py_download
 
 :py_dry_winget
 echo [dry run] would run %PYWG%
-exit /b 0
+goto :py_download
 
 :py_installed
 call :find_user_python
