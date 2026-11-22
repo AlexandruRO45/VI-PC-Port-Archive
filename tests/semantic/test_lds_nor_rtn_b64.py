@@ -734,5 +734,125 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
         self.assertEqual(lds.read_qword(0), 0x1122334455667788)
 
 
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
+    """Unit tests for 64-bit register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(DEFAULT_LDS_SIZE_BYTES)
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_alias_vdst_and_vaddr(self) -> None:
+        # ds_nor_rtn_b64 v[0:1], v0, v[2:3]: vdst pair starts at v0, vaddr is single v0
+        state = ScalarMachineState(lds=self.lds)
+        initial = 0x1111222233334444
+        self.lds.write_qword(16, initial)
+        state.set_vgpr(RegSingle(0), 16)  # v0 holds address
+        state.set_vgpr_pair(RegPair(2), 0)
+
+        inst = DSNorRtnB64Instruction(
+            opcode=DSOpcode.DS_NOR_RTN_B64,
+            vdst=RegPair(0),
+            vaddr=RegSingle(0),
+            vdata=RegPair(2),
+        )
+        ret = self.scalar_interp.execute(state, inst)
+
+        # Must return old memory value into v[0:1]
+        self.assertEqual(ret, initial)
+        self.assertEqual(state.get_vgpr_pair(RegPair(0)), initial)
+        self.assertEqual(self.lds.read_qword(16), (~initial) & MASK64)
+
+    def test_alias_vdst_and_vdata(self) -> None:
+        # ds_nor_rtn_b64 v[0:1], v2, v[0:1]: vdst pair aliases vdata pair
+        state = ScalarMachineState(lds=self.lds)
+        initial = 0x5555555555555555
+        self.lds.write_qword(24, initial)
+        state.set_vgpr(RegSingle(2), 24)
+        state.set_vgpr_pair(RegPair(0), 0xAAAAAAAAAAAAAAAA)
+
+        inst = DSNorRtnB64Instruction(
+            opcode=DSOpcode.DS_NOR_RTN_B64,
+            vdst=RegPair(0),
+            vaddr=RegSingle(2),
+            vdata=RegPair(0),
+        )
+        ret = self.scalar_interp.execute(state, inst)
+
+        # Must return old memory value into v[0:1]
+        self.assertEqual(ret, initial)
+        self.assertEqual(state.get_vgpr_pair(RegPair(0)), initial)
+        self.assertEqual(self.lds.read_qword(24), 0)
+
+    def test_partial_overlap_aliasing(self) -> None:
+        # vdst is v[1:2], vaddr is v0, vdata is v[2:3] (v2 overlaps between vdst and vdata)
+        state = ScalarMachineState(lds=self.lds)
+        initial = 0xAAAAAAAAAAAAAAAA
+        self.lds.write_qword(32, initial)
+        state.set_vgpr(RegSingle(0), 32)
+        state.set_vgpr_pair(RegPair(2), 0)
+
+        inst = DSNorRtnB64Instruction(
+            opcode=DSOpcode.DS_NOR_RTN_B64,
+            vdst=RegPair(1),
+            vaddr=RegSingle(0),
+            vdata=RegPair(2),
+        )
+        ret = self.scalar_interp.execute(state, inst)
+
+        self.assertEqual(ret, initial)
+        self.assertEqual(state.get_vgpr_pair(RegPair(1)), initial)
+        self.assertEqual(self.lds.read_qword(32), 0x5555555555555555)
+
+    def test_simd_wave32_aliasing(self) -> None:
+        wave = SIMDState(num_lanes=32, exec_mask=0xFFFFFFFF, lds=self.lds)
+        for lane in range(32):
+            addr = lane * 8
+            self.lds.write_qword(addr, 0)
+            wave.set_lane_vgpr(lane, RegSingle(0), addr)
+            wave.set_lane_vgpr_pair(lane, RegPair(2), 0)
+
+        inst = DSNorRtnB64Instruction(
+            opcode=DSOpcode.DS_NOR_RTN_B64,
+            vdst=RegPair(0),
+            vaddr=RegSingle(0),
+            vdata=RegPair(2),
+        )
+        results = self.simd_interp.execute(wave, inst)
+
+        for lane in range(32):
+            self.assertEqual(results[lane], 0)
+            self.assertEqual(wave.get_lane_vgpr_pair(lane, RegPair(0)), 0)
+            self.assertEqual(self.lds.read_qword(lane * 8), MASK64)
+
+    def test_toggling_oscillation_in_place(self) -> None:
+        state = ScalarMachineState(lds=self.lds)
+        initial = 0x0123456789ABCDEF
+        self.lds.write_qword(0, initial)
+        state.set_vgpr(RegSingle(2), 0)
+        state.set_vgpr_pair(RegPair(4), 0)
+
+        inst = DSNorRtnB64Instruction(
+            opcode=DSOpcode.DS_NOR_RTN_B64,
+            vdst=RegPair(0),
+            vaddr=RegSingle(2),
+            vdata=RegPair(4),
+        )
+
+        # Pass 1: initial -> ~initial
+        ret1 = self.scalar_interp.execute(state, inst)
+        self.assertEqual(ret1, initial)
+        self.assertEqual(self.lds.read_qword(0), (~initial) & MASK64)
+
+        # Pass 2: ~initial -> initial
+        ret2 = self.scalar_interp.execute(state, inst)
+        self.assertEqual(ret2, (~initial) & MASK64)
+        self.assertEqual(self.lds.read_qword(0), initial)
+
+
 if __name__ == "__main__":
     unittest.main()
