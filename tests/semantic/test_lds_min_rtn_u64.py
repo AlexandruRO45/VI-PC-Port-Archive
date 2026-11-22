@@ -138,6 +138,147 @@ class LDSModel64:
         return old_val, new_val, modified
 
 
+# ---------------------------------------------------------------------------
+# Phase 2: Symbolic AST Opcode Definitions and Typed Expressions
+# ---------------------------------------------------------------------------
+
+class Opcode(str, enum.Enum):
+    DS_MIN_RTN_U64 = "ds_min_rtn_u64"
+
+
+class RegKind(str, enum.Enum):
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclasses.dataclass(frozen=True)
+class Register:
+    """Typed AST representation of a GPU hardware register or consecutive register span."""
+    kind: RegKind
+    index: int
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"Register index out of range [0, 255]: {self.index}")
+        if self.count < 1 or (self.index + self.count > 256):
+            raise ValueError(f"Register span [{self.index}:{self.index + self.count}] exceeds limit 256")
+
+    def __str__(self) -> str:
+        if self.count > 1:
+            return f"{self.kind.value}[{self.index}:{self.index + self.count - 1}]"
+        return f"{self.kind.value}{self.index}"
+
+
+def VGPR(index: int, count: int = 1) -> Register:
+    return Register(RegKind.VGPR, index, count=count)
+
+
+def VGPR64(index: int) -> Register:
+    return Register(RegKind.VGPR, index, count=2)
+
+
+def SGPR(index: int, count: int = 1) -> Register:
+    return Register(RegKind.SGPR, index, count=count)
+
+
+@dataclasses.dataclass(frozen=True)
+class Immediate64:
+    """Typed AST representation of a 64-bit immediate literal."""
+    val: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "val", self.val & MASK64)
+
+    def __str__(self) -> str:
+        return f"0x{self.val:X}" if self.val > 9 else str(self.val)
+
+
+Operand64 = Union[Register, Immediate64]
+
+
+@dataclasses.dataclass
+class DSMinRtnU64Instruction:
+    """AST node for ds_min_rtn_u64 instruction:
+
+    ds_min_rtn_u64 v[dst_lo:dst_hi], vaddr, v[data_lo:data_hi] [offset:offset16]
+    """
+    opcode: Opcode
+    dst: Register
+    addr: Register
+    data: Operand64
+    offset: int = 0
+
+    def __post_init__(self) -> None:
+        if self.opcode != Opcode.DS_MIN_RTN_U64:
+            raise ValueError(f"Unsupported opcode: {self.opcode}")
+        if self.dst.kind != RegKind.VGPR or self.dst.count != 2:
+            raise ValueError(f"Destination must be a 64-bit VGPR pair (count=2), got {self.dst}")
+        if self.addr.kind != RegKind.VGPR or self.addr.count != 1:
+            raise ValueError(f"Address must be a 32-bit VGPR (count=1), got {self.addr}")
+        if isinstance(self.data, Register):
+            if self.data.kind != RegKind.VGPR or self.data.count != 2:
+                raise ValueError(f"Register data operand must be a 64-bit VGPR pair (count=2), got {self.data}")
+        if not (0 <= self.offset <= 65535):
+            raise ValueError(f"Offset out of range [0, 65535]: {self.offset}")
+
+    @classmethod
+    def parse(cls, asm: str) -> DSMinRtnU64Instruction:
+        """Parse an assembly statement into a typed DSMinRtnU64Instruction AST node."""
+        tokens = asm.strip().replace(",", " ").split()
+        if not tokens:
+            raise ValueError("Empty assembly string")
+        if tokens[0] != Opcode.DS_MIN_RTN_U64.value:
+            raise ValueError(f"Expected opcode '{Opcode.DS_MIN_RTN_U64.value}', got '{tokens[0]}'")
+
+        if len(tokens) < 4:
+            raise ValueError(f"Too few operands for ds_min_rtn_u64: {asm}")
+
+        def parse_reg(tok: str, default_count: int = 1) -> Register:
+            # Handles v[0:1] or v0
+            if tok.startswith("v[") and tok.endswith("]"):
+                span = tok[2:-1].split(":")
+                lo, hi = int(span[0]), int(span[1])
+                return VGPR(lo, count=hi - lo + 1)
+            elif tok.startswith("v"):
+                return VGPR(int(tok[1:]), count=default_count)
+            elif tok.startswith("s"):
+                return SGPR(int(tok[1:]), count=default_count)
+            raise ValueError(f"Invalid register operand: {tok}")
+
+        dst = parse_reg(tokens[1], default_count=2)
+        addr = parse_reg(tokens[2], default_count=1)
+
+        # Parse data operand: either 64-bit VGPR pair or 64-bit immediate
+        data_tok = tokens[3]
+        if data_tok.startswith("v[") or data_tok.startswith("v") or data_tok.startswith("s"):
+            data: Operand64 = parse_reg(data_tok, default_count=2)
+        else:
+            data = Immediate64(int(data_tok, 0))
+
+        offset = 0
+        for tok in tokens[4:]:
+            if tok.startswith("offset:"):
+                val_str = tok[len("offset:"):]
+                offset = int(val_str, 0)
+            else:
+                raise ValueError(f"Unknown modifier or trailing token: {tok}")
+
+        return cls(
+            opcode=Opcode.DS_MIN_RTN_U64,
+            dst=dst,
+            addr=addr,
+            data=data,
+            offset=offset,
+        )
+
+    def __str__(self) -> str:
+        s = f"{self.opcode.value} {self.dst}, {self.addr}, {self.data}"
+        if self.offset != 0:
+            s += f" offset:{self.offset}"
+        return s
+
+
 class TestLdsMinRtnU64ReferenceOracle(unittest.TestCase):
     """Phase 1: Unit tests for reference mathematical oracle and architectural model."""
 
@@ -235,6 +376,83 @@ class TestLdsMinRtnU64ReferenceOracle(unittest.TestCase):
         self.assertEqual(new_val3, 0)
         self.assertFalse(mod3)
         self.assertEqual(lds.read_qword(0x208), 0)
+
+
+class TestLdsMinRtnU64AST(unittest.TestCase):
+    """Phase 2: Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_construction_and_formatting(self) -> None:
+        inst = DSMinRtnU64Instruction(
+            opcode=Opcode.DS_MIN_RTN_U64,
+            dst=VGPR64(0),
+            addr=VGPR(2),
+            data=VGPR64(4),
+            offset=16,
+        )
+        self.assertEqual(inst.opcode, Opcode.DS_MIN_RTN_U64)
+        self.assertEqual(inst.dst, VGPR(0, count=2))
+        self.assertEqual(inst.addr, VGPR(2, count=1))
+        self.assertEqual(inst.data, VGPR(4, count=2))
+        self.assertEqual(inst.offset, 16)
+        self.assertEqual(str(inst), "ds_min_rtn_u64 v[0:1], v2, v[4:5] offset:16")
+
+    def test_ast_parse_bracketed_registers(self) -> None:
+        inst = DSMinRtnU64Instruction.parse("ds_min_rtn_u64 v[10:11], v5, v[12:13]")
+        self.assertEqual(inst.dst, VGPR(10, count=2))
+        self.assertEqual(inst.addr, VGPR(5, count=1))
+        self.assertEqual(inst.data, VGPR(12, count=2))
+        self.assertEqual(inst.offset, 0)
+
+    def test_ast_parse_unbracketed_registers(self) -> None:
+        inst = DSMinRtnU64Instruction.parse("ds_min_rtn_u64 v10, v5, v12")
+        self.assertEqual(inst.dst, VGPR(10, count=2))
+        self.assertEqual(inst.addr, VGPR(5, count=1))
+        self.assertEqual(inst.data, VGPR(12, count=2))
+
+    def test_ast_parse_with_offset(self) -> None:
+        inst = DSMinRtnU64Instruction.parse("ds_min_rtn_u64 v[0:1], v2, v[4:5] offset:64")
+        self.assertEqual(inst.offset, 64)
+        inst_hex = DSMinRtnU64Instruction.parse("ds_min_rtn_u64 v[0:1], v2, v[4:5] offset:0x20")
+        self.assertEqual(inst_hex.offset, 32)
+
+    def test_ast_parse_immediate64(self) -> None:
+        inst = DSMinRtnU64Instruction.parse("ds_min_rtn_u64 v[0:1], v2, 0x123456789ABCDEF0")
+        self.assertEqual(inst.data, Immediate64(0x123456789ABCDEF0))
+
+    def test_ast_validation_rejections(self) -> None:
+        # Destination must be 2 VGPRs
+        with self.assertRaises(ValueError):
+            DSMinRtnU64Instruction(
+                opcode=Opcode.DS_MIN_RTN_U64,
+                dst=VGPR(0, count=1),
+                addr=VGPR(2),
+                data=VGPR64(4),
+            )
+        # Address must be 1 VGPR
+        with self.assertRaises(ValueError):
+            DSMinRtnU64Instruction(
+                opcode=Opcode.DS_MIN_RTN_U64,
+                dst=VGPR64(0),
+                addr=VGPR(2, count=2),
+                data=VGPR64(4),
+            )
+        # Register data must be 2 VGPRs
+        with self.assertRaises(ValueError):
+            DSMinRtnU64Instruction(
+                opcode=Opcode.DS_MIN_RTN_U64,
+                dst=VGPR64(0),
+                addr=VGPR(2),
+                data=VGPR(4, count=1),
+            )
+        # Offset out of range
+        with self.assertRaises(ValueError):
+            DSMinRtnU64Instruction(
+                opcode=Opcode.DS_MIN_RTN_U64,
+                dst=VGPR64(0),
+                addr=VGPR(2),
+                data=VGPR64(4),
+                offset=70000,
+            )
 
 
 if __name__ == "__main__":
