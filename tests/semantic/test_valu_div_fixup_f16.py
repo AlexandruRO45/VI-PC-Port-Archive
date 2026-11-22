@@ -1369,5 +1369,64 @@ class TestDivFixupF16StatusFlagsAndConditionCodes(unittest.TestCase):
         self.assertEqual(vcc_lt, 0xAAAAAAAA)
 
 
+class TestDivFixupF16IEEE754Boundaries(unittest.TestCase):
+    """Test suite for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormal_inputs(self):
+        s0 = F16_MIN_SUBNORMAL
+        res = ref_div_fixup_f16(s0, F16_ONE, F16_MIN_SUBNORMAL)
+        self.assertEqual(res, F16_MIN_SUBNORMAL)
+
+        neg_sub = F16_MIN_SUBNORMAL | F16_SIGN_MASK
+        res_neg = ref_div_fixup_f16(s0, F16_ONE, neg_sub)
+        self.assertEqual(res_neg, neg_sub)
+
+    def test_signed_zeros_bitwise_representation(self):
+        res1 = ref_div_fixup_f16(F16_POS_ZERO, F16_NEG_ONE, F16_POS_ZERO)
+        self.assertEqual(res1, F16_NEG_ZERO)
+
+        res2 = ref_div_fixup_f16(F16_POS_ZERO, F16_NEG_ONE, F16_NEG_ZERO)
+        self.assertEqual(res2, F16_POS_ZERO)
+
+        res3 = ref_div_fixup_f16(F16_ONE, F16_NEG_ZERO, F16_ONE)
+        self.assertEqual(res3, F16_NEG_INF)
+
+        res4 = ref_div_fixup_f16(F16_ONE, F16_NEG_ZERO, F16_NEG_ONE)
+        self.assertEqual(res4, F16_POS_INF)
+
+    def test_infinities_propagation_and_invalids(self):
+        s5 = f16_to_u16(5.0)
+        res1 = ref_div_fixup_f16(F16_ONE, f16_to_u16(-5.0), F16_POS_INF)
+        self.assertEqual(res1, F16_NEG_INF)
+
+        res2 = ref_div_fixup_f16(F16_ONE, f16_to_u16(-5.0), F16_NEG_INF)
+        self.assertEqual(res2, F16_POS_INF)
+
+        res3 = ref_div_fixup_f16(F16_ONE, F16_NEG_INF, s5)
+        self.assertEqual(res3, F16_NEG_ZERO)
+
+        res4 = ref_div_fixup_f16(F16_ONE, F16_NEG_INF, f16_to_u16(-5.0))
+        self.assertEqual(res4, F16_POS_ZERO)
+
+    def test_nan_handling_and_clamp_mapping(self):
+        snan = 0x7C01
+        res_q = ref_div_fixup_f16(F16_ONE, F16_ONE, snan)
+        self.assertEqual(res_q, quiet_f16(snan))
+        self.assertTrue(is_f16_qnan(res_q))
+
+        res_clamped = ref_div_fixup_f16(F16_ONE, F16_ONE, snan, clamp=True)
+        self.assertEqual(res_clamped, F16_POS_ZERO)
+
+        res_00_clamped = ref_div_fixup_f16(F16_POS_ZERO, F16_POS_ZERO, F16_POS_ZERO, clamp=True)
+        self.assertEqual(res_00_clamped, F16_POS_ZERO)
+
+    def test_boundary_max_normal_extremes(self):
+        res = ref_div_fixup_f16(F16_MAX_NORMAL, F16_ONE, F16_MAX_NORMAL)
+        self.assertEqual(res, F16_MAX_NORMAL)
+
+        res_neg = ref_div_fixup_f16(F16_MAX_NORMAL, F16_NEG_ONE, F16_MAX_NORMAL)
+        self.assertEqual(res_neg, F16_MAX_NORMAL | F16_SIGN_MASK)
+
+
 if __name__ == "__main__":
     unittest.main()
