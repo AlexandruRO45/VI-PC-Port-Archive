@@ -186,6 +186,9 @@ DWORD WINAPI game_thread(void* p) {
 // installs, which is what turns an uncaught C++ exception into std::terminate. So the title's filter is kept here,
 // and the host gets one filter of the runtime's own, in gta6rt.exe, that calls it. With no title filter set, that
 // one passes the exception to whatever filter the host had before (the runtime's own CRT filter).
+// The host filter is installed once. If something in the host process calls the real SetUnhandledExceptionFilter
+// after that (a driver's DLL, SDL, a CRT initialised later), it replaces this one and the title's filter is lost
+// without a sign: nothing here installs it again.
 std::atomic<LPTOP_LEVEL_EXCEPTION_FILTER> g_game_filter{nullptr};
 std::atomic<LPTOP_LEVEL_EXCEPTION_FILTER> g_host_filter_before{nullptr};
 std::atomic<bool> g_host_filter_installed{false};
