@@ -27,7 +27,6 @@ Stages, in order (each skips work that is already done, so a stopped build conti
               the driver rejects, and save the pipeline cache next to the port so the first boot doesn't compile
 """
 import argparse
-import errno
 import functools
 import glob
 import hashlib
@@ -42,6 +41,11 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
+
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(ROOT, "tools")
@@ -57,6 +61,7 @@ CROSS_VARS = {"C_COMPILER": "clang-cl", "CXX_COMPILER": "clang-cl", "LINKER": "l
               "RC_COMPILER": "llvm-rc", "MT": "llvm-mt"}   # the toolchain's CMAKE_<var> defaults
 XWIN_DEFAULT = os.path.join("~", ".local", "share", "xwin-sdk")
 RUNTIME_FILES = ("gta6rt.exe", "gta6rt_tls_host.dll")
+BUILD_LOCKS = ContextVar("build_locks", default=())
 # Archives scanned for models and texture dictionaries, small to large.
 MODEL_ARCHIVES = [
     "common.rpf", "textures.rpf", "data.rpf",
@@ -92,7 +97,7 @@ def below_normal() -> None:
 def run(args: list, hint: str = "", check: bool = True, **kw) -> int:
     """Run a command, logging it. A non-zero exit stops the build unless check is False; returns the exit code."""
     log("  " + " ".join(os.path.basename(str(a)) if i == 0 else str(a) for i, a in enumerate(args)))
-    r = subprocess.run([str(a) for a in args], **kw)
+    r = subprocess.run([str(a) for a in args], **build_child_options(), **kw)
     if check and r.returncode != 0:
         fail(f"{os.path.basename(str(args[0]))} exited with {r.returncode}" + (f". {hint}" if hint else ""))
     return r.returncode
@@ -399,34 +404,67 @@ def pipeline_check_prerequisite(runtime_selected: bool = False) -> str:
 
 
 @contextmanager
+def windows_build_lock(path):
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    # An exclusive open survives inheritance. Windows byte-range locks belong to the locking process.
+    handle = k32.CreateFileW(path, 0x40000000, 0, None, 4, 0x80, None)  # GENERIC_WRITE, OPEN_ALWAYS, NORMAL
+    if handle == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        os.set_handle_inheritable(handle, True)
+        yield handle
+    finally:
+        k32.CloseHandle(handle)
+
+
+def build_child_options(locks=None):
+    """Keep the directory leases alive while a direct build worker can still write."""
+    locks = BUILD_LOCKS.get() if locks is None else locks
+    if not locks:
+        return {}
+    handles = [handle for _, handle in locks]
+    if sys.platform == "win32":
+        return {"startupinfo": subprocess.STARTUPINFO(lpAttributeList={"handle_list": handles}), "close_fds": True}
+    return {"pass_fds": handles}
+
+
+@contextmanager
 def lock_build_directories(directories: list[str]):
-    """Reserve shared build folders for one writer until its stage calls finish."""
+    """Reserve shared build folders for the builder and its active workers."""
     canonical = {}
     for directory in directories:
         path = os.path.realpath(directory)
         canonical.setdefault(os.path.normcase(path), path)
-    with ExitStack() as handles:
-        for _, directory in sorted(canonical.items()):
+    active = dict(BUILD_LOCKS.get())
+    with ExitStack() as leases:
+        for key, directory in sorted(canonical.items()):
+            if key in active:
+                fail(f"This Leonida build already holds the lock for {directory}.")
             lock_path = os.path.join(directory, ".leonida-build.lock")
             try:
                 os.makedirs(directory, exist_ok=True)
-                handle = handles.enter_context(open(lock_path, "ab"))
-            except OSError as e:
-                fail(f"Cannot open the build lock in {directory}: {e.strerror or e}")
-            try:
                 if sys.platform == "win32":
-                    import msvcrt
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    active[key] = leases.enter_context(windows_build_lock(lock_path))
                 else:
                     import fcntl
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fd = leases.enter_context(open(lock_path, "ab")).fileno()
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    active[key] = fd
             except OSError as e:
-                if e.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
-                    fail(f"Another Leonida build is using {directory}. Use a different folder or wait for it to finish.")
+                if getattr(e, "winerror", None) == 32 or isinstance(e, BlockingIOError):
+                    fail(f"Another Leonida build is using {directory}. "
+                         "Use a different folder or wait for its workers to finish.")
                 fail(f"Cannot lock the build folder {directory}: {e.strerror or e}")
-        # Closing the handles releases the OS locks. Keep the empty files so every process locks the same file.
-        yield
+        token = BUILD_LOCKS.set(tuple(active.items()))
+        try:
+            yield
+        finally:
+            BUILD_LOCKS.reset(token)
+        # Keep the empty lock files so every process opens the same file.
 
 
 def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | None = None, *,
@@ -617,7 +655,7 @@ def ensure_submodule() -> None:
     if git and subprocess.run([git, "-C", ROOT, "rev-parse", "--resolve-git-dir", ".git"],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
         log("fetching third_party/rpf9-explorer")
-        r = subprocess.run([git, "-C", ROOT, "submodule", "update", "--init", "--recursive"])
+        r = subprocess.run([git, "-C", ROOT, "submodule", "update", "--init", "--recursive"], **build_child_options())
         if r.returncode == 0 and os.path.isdir(core):
             return
     fail("third_party/rpf9-explorer is missing. Download the project with: "
@@ -1191,7 +1229,7 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
     try:
         for i in todo:
             procs.append(subprocess.Popen([sys.executable, "-I", tool, disasm, "--out", spirv,
-                                           "--shard", f"{i}/{jobs}", "--no-asm", *extra]))
+                                           "--shard", f"{i}/{jobs}", "--no-asm", *extra], **build_child_options()))
         codes = [p.wait() for p in procs]
     except BaseException:
         _stop_procs(procs)
@@ -1351,13 +1389,14 @@ def decode_xma(ff: str, xma_dir: str, jobs: int = 1) -> None:
     if not todo:
         return
     log(f"assets: XMA2 -> PCM WAV (ffmpeg), {len(todo)} stream(s)")
+    locks = BUILD_LOCKS.get()
 
     def one(src: str) -> bool:
         dst = src[:-8] + ".wav"
         tmp = dst + ".part"
         # No stdin: ffmpeg reads it for key commands, which stops a build started in the background of a terminal.
         r = subprocess.run([ff, "-v", "error", "-y", "-i", src, "-c:a", "pcm_s16le", "-f", "wav", tmp],
-                           stdin=subprocess.DEVNULL)
+                           stdin=subprocess.DEVNULL, **build_child_options(locks))
         if r.returncode == 0 and os.path.isfile(tmp):
             os.replace(tmp, dst)
             return True

@@ -149,7 +149,8 @@ on `--jobs` processes (half the CPU threads by default).
 
 `make_game.py` locks the work and output folders used by its selected stages. If another build is using one of
 those folders, wait for it to finish or choose a different `--work` or `--out`. Builds that compile runtime tools
-in this checkout also share a lock in `runtime/build`. The OS releases the locks when the build process exits.
+in this checkout also share a lock in `runtime/build`. Starting another build in the same folders requires the
+builder and its active stage workers to finish, even if the builder was interrupted.
 The empty `.leonida-build.lock` files stay in place so future builds can reuse them.
 
 `--wav` is off by default because 16-bit PCM WAV is several times larger than Ogg Opus. It decodes the repackaged Ogg
