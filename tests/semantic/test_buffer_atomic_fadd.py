@@ -1297,5 +1297,136 @@ class TestBufferAtomicFaddBoundaryExtremes(unittest.TestCase):
         self.assertEqual(self.mem.read_u32(4), QNAN_DEFAULT)
 
 
+class TestBufferAtomicFaddNegativeControls(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and invalid AST inputs."""
+
+    def test_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1, count=1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256, count=1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 254, count=4)
+
+    def test_invalid_destination_kind(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_FADD,
+                vdata=Register(RegKind.SGPR, 0, count=1),
+                vaddr=Register(RegKind.VGPR, 1, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=0,
+            )
+
+    def test_invalid_descriptor_size(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_FADD,
+                vdata=Register(RegKind.VGPR, 0, count=1),
+                vaddr=Register(RegKind.VGPR, 1, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=2),
+                soffset=0,
+            )
+
+    def test_invalid_soffset_kind(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_FADD,
+                vdata=Register(RegKind.VGPR, 0, count=1),
+                vaddr=Register(RegKind.VGPR, 1, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=Register(RegKind.VGPR, 8, count=1),
+            )
+
+    def test_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDBufferWavefrontInterpreter(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDBufferWavefrontInterpreter(wave_size=128)
+
+
+class TestBufferAtomicFaddMutationDetection(unittest.TestCase):
+    """Mutation tests: verifies that intentional sabotages/mutations of the oracle are caught."""
+
+    def test_mutation_oob_check_omission(self) -> None:
+        # Sabotage: ignoring NUM_RECORDS bounds check
+        mem = BufferMemory(256)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=32)
+
+        def mutated_atomic_fadd_no_bounds(m: BufferMemory, d: BufferResourceDescriptor, off: int, val: int) -> int:
+            old = m.read_u32(off)
+            m.write_u32(off, ieee754_add_f32(old, val))
+            return old
+
+        # An access at offset 64 should be rejected by the oracle
+        _, in_bounds = ref_buffer_atomic_fadd(mem, desc, soffset=0, vaddr=64, add_val=f32_to_u32(1.0), glc=True)
+        self.assertFalse(in_bounds)
+
+        with self.assertRaises(AssertionError):
+            self.assertEqual(in_bounds, True)
+
+    def test_mutation_glc_returns_post_op_value(self) -> None:
+        # Sabotage: returning new value instead of old value
+        mem = BufferMemory(256)
+        c_10 = f32_to_u32(10.0)
+        c_5 = f32_to_u32(5.0)
+        mem.write_u32(0, c_10)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+
+        def mutated_atomic_fadd_post_op(m: BufferMemory, d: BufferResourceDescriptor, off: int, val: int) -> int:
+            old = m.read_u32(off)
+            new_val = ieee754_add_f32(old, val)
+            m.write_u32(off, new_val)
+            return new_val  # BUG: returns post-op instead of pre-op
+
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_atomic_fadd_post_op(mem, desc, 0, c_5), c_10)
+
+    def test_mutation_integer_add_instead_of_float(self) -> None:
+        # Sabotage: integer addition instead of IEEE 754 float addition
+        mem = BufferMemory(256)
+        c_1 = f32_to_u32(1.0)
+        c_2 = f32_to_u32(2.0)
+        mem.write_u32(0, c_1)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+
+        def mutated_integer_add(m: BufferMemory, d: BufferResourceDescriptor, off: int, val: int) -> int:
+            old = m.read_u32(off)
+            new_val = (old + val) & MASK32  # BUG: integer addition
+            m.write_u32(off, new_val)
+            return old
+
+        mutated_integer_add(mem, desc, 0, c_1)
+        with self.assertRaises(AssertionError):
+            # 1.0 + 1.0 should be 2.0 (0x40000000), but integer add yields 0x7F000000
+            self.assertEqual(mem.read_u32(0), c_2)
+
+    def test_mutation_simd_exec_leak(self) -> None:
+        simd = SIMDBufferWavefrontInterpreter(wave_size=32, mem_size=256)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        simd.set_buffer_descriptor(4, desc)
+        simd.set_exec_mask(0)  # all lanes disabled
+
+        canary = f32_to_u32(999.0)
+        simd.mem.write_u32(0, canary)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_FADD,
+            vdata=Register(RegKind.VGPR, 0, count=1),
+            vaddr=Register(RegKind.VGPR, 1, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=False),
+        )
+        simd.step(inst)
+        # Memory must remain canary
+        self.assertEqual(simd.mem.read_u32(0), canary)
+
+        # Mutated unconditional write would corrupt memory
+        simd.mem.write_u32(0, f32_to_u32(1.0))
+        with self.assertRaises(AssertionError):
+            self.assertEqual(simd.mem.read_u32(0), canary)
+
+
 if __name__ == "__main__":
     unittest.main()
