@@ -14,6 +14,7 @@
 #include "retire_tickets.h"
 #include "statistics_sum_spirv.h"
 #include "vulkan13_features.h"
+#include "vulkan_breadcrumbs.h"
 #include "vulkan_depth24.h"
 #include "vulkan_scratch.h"
 #include "vulkan_replay.h"
@@ -34,6 +35,7 @@
 #include <unordered_set>
 #include <shared_mutex>
 #include <span>
+#include <string>
 #include <thread>
 #include <tuple>
 #include <unordered_map>
@@ -80,7 +82,8 @@ struct VulkanDeviceFunctions {
     X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor)                  \
     X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetStencilReference)                          \
     X(vkCmdSetBlendConstants) X(vkCmdDraw)                                                                              \
-    X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkQueueBindSparse)
+    X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkQueueBindSparse)                                            \
+    X(vkCmdWriteBufferMarkerAMD) X(vkGetDeviceFaultInfoEXT) /* optional: device-lost diagnostics (LEONIDA_DRED) */
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -1047,6 +1050,58 @@ public:
         occlusion_resolve_memory_ = memory;
     }
 
+    // Device-lost diagnostics (vulkan_breadcrumbs.h): per-list breadcrumbs from now on; call before any queue uses
+    // the context. The caller decides (LEONIDA_DRED) and says which extensions are enabled: a device function of an
+    // extension that is not enabled must not be called, even when the loader returned one. True with GPU
+    // breadcrumbs (VK_AMD_buffer_marker); false when the ring keeps only what the CPU knows, because the marker
+    // extension is not enabled or no host-visible memory fits.
+    bool configure_breadcrumbs(const VkPhysicalDeviceMemoryProperties& memory, bool buffer_marker_enabled,
+                               bool device_fault_enabled) {
+        device_fault_enabled_ = device_fault_enabled;
+        BreadcrumbFunctions fn;
+        fn.create_buffer = vk.vkCreateBuffer;
+        fn.destroy_buffer = vk.vkDestroyBuffer;
+        fn.requirements = vk.vkGetBufferMemoryRequirements;
+        fn.allocate = vk.vkAllocateMemory;
+        fn.free = vk.vkFreeMemory;
+        fn.bind = vk.vkBindBufferMemory;
+        fn.map = vk.vkMapMemory;
+        fn.unmap = vk.vkUnmapMemory;
+        fn.write_marker = buffer_marker_enabled ? vk.vkCmdWriteBufferMarkerAMD : nullptr;
+        auto ring = std::make_unique<BreadcrumbRing>();
+        const bool gpu = fn.write_marker && ring->initialize(device_, memory, fn);
+        if (!gpu) {
+            ring = std::make_unique<BreadcrumbRing>();  // frees whatever a failed initialize() made
+            ring->initialize_cpu_only();
+        }
+        breadcrumbs_ = std::move(ring);
+        return gpu;
+    }
+    // Where the device-lost report goes (stderr); for tests.
+    void set_report_output(std::FILE* out) { report_out_ = out ? out : stderr; }
+    BreadcrumbRing* breadcrumbs() const { return breadcrumbs_.get(); }
+
+    // VK_EXT_device_fault after a loss: the faulting addresses and the vendor's description. False when the
+    // extension is not enabled, a query fails, or the driver has nothing to say. Vendor binary data is not asked for.
+    bool device_fault(std::vector<VkDeviceFaultAddressInfoEXT>& addresses, std::string& description) const {
+        addresses.clear();
+        description.clear();
+        if (!device_fault_enabled_ || !vk.vkGetDeviceFaultInfoEXT) return false;
+        VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+        if (vk.vkGetDeviceFaultInfoEXT(device_, &counts, nullptr) != VK_SUCCESS) return false;
+        addresses.resize(counts.addressInfoCount);
+        std::vector<VkDeviceFaultVendorInfoEXT> vendor(counts.vendorInfoCount);
+        counts.vendorBinarySize = 0;  // no vendor dump
+        VkDeviceFaultInfoEXT info{VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+        info.pAddressInfos = addresses.empty() ? nullptr : addresses.data();
+        info.pVendorInfos = vendor.empty() ? nullptr : vendor.data();
+        const VkResult result = vk.vkGetDeviceFaultInfoEXT(device_, &counts, &info);
+        if (result != VK_SUCCESS && result != VK_INCOMPLETE) return false;
+        addresses.resize(counts.addressInfoCount);
+        description.assign(info.description, strnlen(info.description, VK_MAX_DESCRIPTION_SIZE));
+        return !addresses.empty() || !description.empty();  // else the driver has nothing to say
+    }
+
     // For tests and traces.
     VkImageLayout layout(ResourceId id, std::uint32_t subresource) {
         std::lock_guard lock(tracker_mutex_);
@@ -1207,8 +1262,36 @@ public:
             } catch (...) {
             }
         }
+        report_device_lost();
     }
-    bool is_device_lost() const noexcept { return device_lost_.load(std::memory_order_acquire); }
+    // The fence waiter sets device_lost_ itself, so the first caller that sees the loss prints the report.
+    bool is_device_lost() const noexcept {
+        if (!device_lost_.load(std::memory_order_acquire)) return false;
+        report_device_lost();
+        return true;
+    }
+
+    // Once, when the diagnostics are configured (LEONIDA_DRED): the breadcrumbs and VK_EXT_device_fault.
+    void report_device_lost() const noexcept {
+        if (!breadcrumbs_ || lost_reported_.exchange(true, std::memory_order_acq_rel)) return;
+        std::FILE* const out = report_out_;
+        try {
+            breadcrumbs_->report(out);
+            std::vector<VkDeviceFaultAddressInfoEXT> addresses;
+            std::string description;
+            if (!device_fault(addresses, description)) {
+                std::fprintf(out, "[rt] d3d12 DRED: no device fault information (VK_EXT_device_fault)\n");
+                return;
+            }
+            std::fprintf(out, "[rt] d3d12 DRED: device fault: %s\n", description.c_str());
+            for (const auto& a : addresses)
+                std::fprintf(out, "[rt] d3d12 DRED:   address %#llx (precision %#llx, type %d)\n",
+                             static_cast<unsigned long long>(a.reportedAddress),
+                             static_cast<unsigned long long>(a.addressPrecision), static_cast<int>(a.addressType));
+        } catch (...) {
+            std::fprintf(out, "[rt] d3d12 DRED: the report failed (out of memory)\n");
+        }
+    }
 
     void set_signal_event_fn(FenceWaitDispatcher::SignalEventFn fn) {
         if (fence_dispatcher_) fence_dispatcher_->set_signal_event_fn(fn);
@@ -1260,6 +1343,10 @@ private:
     bool ray_tracing_ = false;
     std::unique_ptr<XdxrBuilder> xdxr_;   // set: acceleration structures are XDXR BVH4 records
     std::atomic<bool> device_lost_{false};
+    std::unique_ptr<BreadcrumbRing> breadcrumbs_;  // device-lost diagnostics, when configured
+    mutable std::atomic<bool> lost_reported_{false};
+    bool device_fault_enabled_ = false;
+    std::FILE* report_out_ = stderr;
     alignas(64) std::shared_mutex resource_mutex_;  // shared for prepare lookups, unique for add/remove
     alignas(64) std::mutex tracker_mutex_;
     alignas(64) std::mutex views_mutex_;
@@ -1692,8 +1779,16 @@ public:
         bool wrote_readback = false;
         VkPipelineStageFlags2 readback_stages = 0;
         std::uint32_t open_labels = 0;  // events may span the lists of one ExecuteCommandLists
-        for (const auto& list : prepared) {
+        BreadcrumbRing* const breadcrumbs = context_.breadcrumbs_.get();  // LEONIDA_DRED only
+        std::vector<BreadcrumbRing::Mark> marks;
+        for (std::size_t i = 0; i < prepared.size(); ++i) {
+            const auto& list = prepared[i];
+            if (breadcrumbs) {
+                marks.push_back(breadcrumbs->mark(*lists[i], this));
+                breadcrumbs->record_begin(command_buffer, marks.back());
+            }
             emit(list, command_buffer, replay, &next_tracker, &open_labels);
+            if (breadcrumbs) breadcrumbs->record_end(command_buffer, marks.back());
             wrote_readback |= list.wrote_readback;
             readback_stages |= list.readback_src_stages;
         }
@@ -1742,6 +1837,7 @@ public:
             ++context_.storage_init_version_;
             storage_init_seen_ = context_.storage_init_version_;
         }
+        if (breadcrumbs) breadcrumbs->submitted(std::move(marks), submitted);  // "submitted" is CPU knowledge only
         if (submitted) {
             context_.tracker_ = std::move(next_tracker);
             slot->predicate = std::move(batch);

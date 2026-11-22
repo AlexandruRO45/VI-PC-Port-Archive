@@ -1,0 +1,429 @@
+#pragma once
+
+// Device-lost diagnostics for the D3D12 layer: auto-breadcrumbs per command list (DRED-style), off unless
+// LEONIDA_DRED=1. With VK_AMD_buffer_marker the GPU records its progress; without it the ring keeps only what the
+// CPU knows (which lists each queue submitted) and every state is `unknown`.
+//
+// Each command list of an ExecuteCommandLists gets a slot of two 32-bit words in a host-visible, coherent buffer
+// owned by this ring (nothing the replay uses). Around the list's commands the backend records
+//   vkCmdWriteBufferMarkerAMD(TOP_OF_PIPE,    slot.begin, tag)   the GPU reached the list's first command
+//   vkCmdWriteBufferMarkerAMD(BOTTOM_OF_PIPE, slot.end,   tag)   every command of the list completed
+// `tag` is unique per submitted list (never 0) and is what the GPU writes, so a slot needs no CPU clearing: a word
+// counts only when it holds this list's own tag, and a late write from an older list that used the slot before can
+// never pass for progress of the current one.
+//
+// States, from what is known and nothing more:
+//   recorded   the markers are in a command buffer, which was not (yet) submitted: such entries are not kept
+//   submitted  vkQueueSubmit succeeded (CPU knowledge); the GPU has written neither word
+//   started    the begin word holds the tag: the GPU front end reached the list
+//   completed  the end word holds the tag: all of the list's commands finished
+// After a device loss no memory dependency can make the GPU's writes visible any more; what the mapped words hold
+// then is the best information there is (as with DRED on D3D12), and the report says so.
+#ifndef VK_NO_PROTOTYPES
+#define VK_NO_PROTOTYPES
+#endif
+#include <vulkan/vulkan.h>
+
+#include "command_list.h"
+#include "vulkan_memory.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <deque>
+#include <mutex>
+#include <string>
+#include <type_traits>
+#include <unordered_map>
+#include <variant>
+#include <vector>
+
+namespace leonida {
+
+// The D3D12_AUTO_BREADCRUMB_OP values (d3d12.h, Windows SDK 10.0.26100) of the operations the layer records.
+namespace breadcrumb_op {
+inline constexpr std::uint32_t set_marker = 0, begin_event = 1, end_event = 2, draw_instanced = 3,
+                               draw_indexed_instanced = 4, execute_indirect = 5, dispatch = 6,
+                               copy_buffer_region = 7, copy_texture_region = 8, copy_resource = 9,
+                               resolve_subresource = 11, clear_render_target_view = 12,
+                               clear_unordered_access_view = 13, clear_depth_stencil_view = 14,
+                               resource_barrier = 15, resolve_query_data = 18, atomic_copy_buffer_uint = 23,
+                               resolve_subresource_region = 25, write_buffer_immediate = 26,
+                               build_raytracing_acceleration_structure = 31, barrier = 45;
+}  // namespace breadcrumb_op
+
+// The D3D12 breadcrumb operation a recorded command stands for, or false for a command that is not a D3D12
+// operation of its own (a predication change, a query begin or end, which DRED does not list either).
+inline bool breadcrumb_op_of(const Command& command, std::uint32_t& op) {
+    namespace o = breadcrumb_op;
+    return std::visit(
+        [&](const auto& c) {
+            using T = std::decay_t<decltype(c)>;
+            bool known = true;
+            if constexpr (std::is_same_v<T, TransitionBarrier> || std::is_same_v<T, UavBarrier> ||
+                          std::is_same_v<T, AliasingBarrier>) {
+                op = o::resource_barrier;
+            } else if constexpr (std::is_same_v<T, GlobalBarrier> || std::is_same_v<T, BufferBarrier> ||
+                                 std::is_same_v<T, TextureBarrier>) {
+                op = o::barrier;  // ID3D12GraphicsCommandList7::Barrier
+            } else if constexpr (std::is_same_v<T, ClearRenderTarget>) {
+                op = o::clear_render_target_view;
+            } else if constexpr (std::is_same_v<T, ClearDepthStencil>) {
+                op = o::clear_depth_stencil_view;
+            } else if constexpr (std::is_same_v<T, ClearUnorderedAccess>) {
+                op = o::clear_unordered_access_view;
+            } else if constexpr (std::is_same_v<T, CopyBuffer>) {
+                op = o::copy_buffer_region;
+            } else if constexpr (std::is_same_v<T, CopyTexture>) {
+                op = o::copy_texture_region;
+            } else if constexpr (std::is_same_v<T, CopyResource>) {
+                op = o::copy_resource;
+            } else if constexpr (std::is_same_v<T, ResolveSubresource>) {
+                op = c.region ? o::resolve_subresource_region : o::resolve_subresource;
+            } else if constexpr (std::is_same_v<T, WriteImmediate>) {
+                op = o::write_buffer_immediate;
+            } else if constexpr (std::is_same_v<T, AtomicCopyBuffer>) {
+                op = o::atomic_copy_buffer_uint;
+            } else if constexpr (std::is_same_v<T, ResolveQueries>) {
+                op = o::resolve_query_data;
+            } else if constexpr (std::is_same_v<T, DebugMarker>) {
+                op = c.kind == DebugMarker::Kind::begin ? o::begin_event
+                     : c.kind == DebugMarker::Kind::end ? o::end_event
+                                                        : o::set_marker;
+            } else if constexpr (std::is_same_v<T, ExecuteIndirect>) {
+                op = o::execute_indirect;
+            } else if constexpr (std::is_same_v<T, BuildAccelerationStructure>) {
+                op = o::build_raytracing_acceleration_structure;
+            } else if constexpr (std::is_same_v<T, Dispatch>) {
+                op = o::dispatch;
+            } else if constexpr (std::is_same_v<T, Draw>) {
+                op = c.indexed ? o::draw_indexed_instanced : o::draw_instanced;
+            } else {
+                known = false;  // Predication, BeginQuery, EndQuery, DiscardResource: no breadcrumb of their own
+            }
+            return known;
+        },
+        command);
+}
+
+inline const char* breadcrumb_op_name(std::uint32_t op) {
+    namespace o = breadcrumb_op;
+    switch (op) {
+        case o::set_marker: return "SetMarker";
+        case o::begin_event: return "BeginEvent";
+        case o::end_event: return "EndEvent";
+        case o::draw_instanced: return "DrawInstanced";
+        case o::draw_indexed_instanced: return "DrawIndexedInstanced";
+        case o::execute_indirect: return "ExecuteIndirect";
+        case o::dispatch: return "Dispatch";
+        case o::copy_buffer_region: return "CopyBufferRegion";
+        case o::copy_texture_region: return "CopyTextureRegion";
+        case o::copy_resource: return "CopyResource";
+        case o::resolve_subresource: return "ResolveSubresource";
+        case o::resolve_subresource_region: return "ResolveSubresourceRegion";
+        case o::clear_render_target_view: return "ClearRenderTargetView";
+        case o::clear_unordered_access_view: return "ClearUnorderedAccessView";
+        case o::clear_depth_stencil_view: return "ClearDepthStencilView";
+        case o::resource_barrier: return "ResourceBarrier";
+        case o::resolve_query_data: return "ResolveQueryData";
+        case o::atomic_copy_buffer_uint: return "AtomicCopyBufferUINT";
+        case o::write_buffer_immediate: return "WriteBufferImmediate";
+        case o::build_raytracing_acceleration_structure: return "BuildRaytracingAccelerationStructure";
+        case o::barrier: return "Barrier";
+        default: return "?";
+    }
+}
+
+// `unknown`: the ring runs without VK_AMD_buffer_marker (CPU only) and knows the list was submitted, nothing about
+// the GPU's progress.
+enum class BreadcrumbState : std::uint8_t { submitted, started, completed, unknown };
+
+// What the two words of a slot say about the list tagged `tag` (see the top of this file).
+inline BreadcrumbState breadcrumb_state(std::uint32_t begin_word, std::uint32_t end_word, std::uint32_t tag) {
+    if (end_word == tag) return BreadcrumbState::completed;
+    if (begin_word == tag) return BreadcrumbState::started;
+    return BreadcrumbState::submitted;
+}
+
+inline const char* breadcrumb_state_name(BreadcrumbState state) {
+    switch (state) {
+        case BreadcrumbState::completed: return "completed";
+        case BreadcrumbState::started: return "started (not completed)";
+        case BreadcrumbState::submitted: return "submitted (not started)";
+        case BreadcrumbState::unknown: break;
+    }
+    return "submitted, GPU progress UNKNOWN";
+}
+
+// A debug name (UTF-16 on Windows, UTF-32 elsewhere) as UTF-8 for the report; unpaired surrogates become U+FFFD.
+inline std::string breadcrumb_utf8(const std::wstring& name) {
+    std::string out;
+    for (std::size_t i = 0; i < name.size(); ++i) {
+        std::uint32_t c = static_cast<std::uint32_t>(name[i]);
+        if constexpr (sizeof(wchar_t) == 2) {
+            if (c >= 0xd800 && c < 0xdc00 && i + 1 < name.size()) {
+                const std::uint32_t low = static_cast<std::uint32_t>(name[i + 1]);
+                if (low >= 0xdc00 && low < 0xe000) {
+                    c = 0x10000 + ((c - 0xd800) << 10) + (low - 0xdc00);
+                    ++i;
+                }
+            }
+        }
+        if ((c >= 0xd800 && c < 0xe000) || c > 0x10ffff) c = 0xfffd;
+        if (c < 0x80) {
+            out += static_cast<char>(c);
+        } else if (c < 0x800) {
+            out += static_cast<char>(0xc0 | (c >> 6));
+            out += static_cast<char>(0x80 | (c & 0x3f));
+        } else if (c < 0x10000) {
+            out += static_cast<char>(0xe0 | (c >> 12));
+            out += static_cast<char>(0x80 | ((c >> 6) & 0x3f));
+            out += static_cast<char>(0x80 | (c & 0x3f));
+        } else {
+            out += static_cast<char>(0xf0 | (c >> 18));
+            out += static_cast<char>(0x80 | ((c >> 12) & 0x3f));
+            out += static_cast<char>(0x80 | ((c >> 6) & 0x3f));
+            out += static_cast<char>(0x80 | (c & 0x3f));
+        }
+    }
+    return out;
+}
+
+struct BreadcrumbFunctions {
+    PFN_vkCreateBuffer create_buffer = nullptr;
+    PFN_vkDestroyBuffer destroy_buffer = nullptr;
+    PFN_vkGetBufferMemoryRequirements requirements = nullptr;
+    PFN_vkAllocateMemory allocate = nullptr;
+    PFN_vkFreeMemory free = nullptr;
+    PFN_vkBindBufferMemory bind = nullptr;
+    PFN_vkMapMemory map = nullptr;
+    PFN_vkUnmapMemory unmap = nullptr;
+    PFN_vkCmdWriteBufferMarkerAMD write_marker = nullptr;
+};
+
+class BreadcrumbRing {
+public:
+    // A list's place in the ring between recording its markers and submitting them.
+    struct Mark {
+        std::uint32_t slot = 0;
+        std::uint32_t tag = 0;
+        std::uint64_t list_id = 0;
+        std::uint64_t queue_id = 0;  // the backend queue that submitted it, as an opaque number
+        std::vector<std::uint32_t> ops;
+        std::uint64_t sequence = 0;  // the order mark() handed it out in; does not wrap
+        std::wstring list_name, queue_name;  // copies of the D3D12 debug names at submission, when given
+    };
+    // A submitted list as the breadcrumbs see it now.
+    struct Entry {
+        std::uint32_t tag = 0;
+        std::uint64_t list_id = 0;  // the CommandList the ops were recorded into, as an opaque number
+        std::vector<std::uint32_t> ops;
+        BreadcrumbState state = BreadcrumbState::submitted;
+        std::uint64_t queue_id = 0;
+        std::wstring list_name, queue_name;
+    };
+
+    static constexpr std::uint32_t kSlots = 1024;  // lists kept: the newest 1024 submitted
+    static constexpr std::size_t kUnknownShown = 16;  // lists the report shows when GPU progress is unknown
+
+    BreadcrumbRing() = default;
+    BreadcrumbRing(const BreadcrumbRing&) = delete;
+    BreadcrumbRing& operator=(const BreadcrumbRing&) = delete;
+    ~BreadcrumbRing() {
+        if (mapped_) fn_.unmap(device_, memory_);
+        if (buffer_) fn_.destroy_buffer(device_, buffer_, nullptr);
+        if (memory_) fn_.free(device_, memory_, nullptr);
+    }
+
+    // GPU breadcrumbs. False (whatever was made is freed with the ring) when the marker command is missing or no
+    // host-visible coherent memory fits; the caller may fall back to initialize_cpu_only().
+    bool initialize(VkDevice device, const VkPhysicalDeviceMemoryProperties& memory, const BreadcrumbFunctions& fn) {
+        if (!fn.write_marker || !fn.create_buffer || !fn.map) return false;
+        device_ = device;
+        fn_ = fn;
+        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        info.size = VkDeviceSize(kSlots) * 2 * sizeof(std::uint32_t);
+        info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;  // the usage buffer markers need
+        info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (fn_.create_buffer(device_, &info, nullptr, &buffer_) != VK_SUCCESS) return false;
+        VkMemoryRequirements requirements{};
+        fn_.requirements(device_, buffer_, &requirements);
+        constexpr VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        for (const std::uint32_t type :
+             memory_type_order(memory, requirements.memoryTypeBits, host, 0, requirements.size)) {
+            VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            allocation.allocationSize = requirements.size;
+            allocation.memoryTypeIndex = type;
+            if (fn_.allocate(device_, &allocation, nullptr, &memory_) == VK_SUCCESS) break;
+            memory_ = VK_NULL_HANDLE;
+        }
+        if (!memory_ || fn_.bind(device_, buffer_, memory_, 0) != VK_SUCCESS ||
+            fn_.map(device_, memory_, 0, VK_WHOLE_SIZE, 0, reinterpret_cast<void**>(&mapped_)) != VK_SUCCESS) {
+            mapped_ = nullptr;
+            return false;
+        }
+        for (std::uint32_t i = 0; i < kSlots * 2; ++i) mapped_[i] = 0;  // no tag is 0
+        gpu_ = true;
+        return true;
+    }
+
+    // No GPU writes and no Vulkan objects: the ring keeps what the CPU knows (which lists each queue submitted),
+    // and every entry's GPU progress is unknown. For a device without VK_AMD_buffer_marker.
+    void initialize_cpu_only() { gpu_ = false; }
+
+    bool gpu() const { return gpu_; }
+
+    // The D3D12 debug names the next mark() of `list` (or of a list on `queue`) carries; an empty name forgets it.
+    // Called before every submission with the names as they are then, so an address a destroyed object left behind
+    // never lends its old name to a new one. Names are copies; no D3D12 object is referenced.
+    void label_list(const CommandList* list, std::wstring name) { label(list_names_, list, std::move(name)); }
+    void label_queue(const void* queue, std::wstring name) { label(queue_names_, queue, std::move(name)); }
+
+    // Takes the next slot and tag for `list`, submitted by `queue`, and notes its D3D12 operations.
+    Mark mark(const CommandList& list, const void* queue = nullptr) {
+        Mark m;
+        {
+            std::lock_guard lock(mutex_);
+            if (++next_tag_ == 0) ++next_tag_;  // 0 means "never written"
+            m.tag = next_tag_;
+            m.sequence = ++next_sequence_;
+            m.slot = next_slot_;
+            next_slot_ = (next_slot_ + 1) % kSlots;
+            // The slot is about to carry this list's tag: the list that used it before can no longer be read.
+            // Queues submit in their own order, so the history is not sorted by slot; snapshot() skips any
+            // entry whose slot has a newer owner.
+            owner_[m.slot] = m.tag;
+            if (const auto it = list_names_.find(&list); it != list_names_.end()) m.list_name = it->second;
+            if (const auto it = queue_names_.find(queue); it != queue_names_.end()) m.queue_name = it->second;
+        }
+        m.list_id = reinterpret_cast<std::uintptr_t>(&list);
+        m.queue_id = reinterpret_cast<std::uintptr_t>(queue);
+        std::uint32_t op = 0;
+        for (const auto& command : list.commands())
+            if (breadcrumb_op_of(command, op)) m.ops.push_back(op);
+        return m;
+    }
+
+    // Nothing is recorded without GPU breadcrumbs.
+    void record_begin(VkCommandBuffer command_buffer, const Mark& m) const {
+        if (gpu_) fn_.write_marker(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, buffer_, offset(m.slot, 0), m.tag);
+    }
+    void record_end(VkCommandBuffer command_buffer, const Mark& m) const {
+        if (gpu_)
+            fn_.write_marker(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, buffer_, offset(m.slot, 1), m.tag);
+    }
+
+    // After vkQueueSubmit: keeps the marks when the submission succeeded, forgets them when it did not.
+    void submitted(std::vector<Mark>&& marks, bool ok) {
+        if (!ok) return;
+        std::lock_guard lock(mutex_);
+        for (auto& m : marks) {
+            history_.push_back(std::move(m));
+            if (history_.size() > kSlots) history_.pop_front();  // its slot is reused from now on
+        }
+    }
+
+    // The submitted lists, oldest first, with what their slots say now (unknown without GPU breadcrumbs). Queues
+    // call submitted() in their own order, so the history is sorted by when each list was marked.
+    std::vector<Entry> snapshot() const {
+        std::lock_guard lock(mutex_);
+        std::vector<const Mark*> kept;
+        kept.reserve(history_.size());
+        for (const auto& m : history_)
+            if (owner_[m.slot] == m.tag) kept.push_back(&m);  // else the slot was handed to a later list
+        std::sort(kept.begin(), kept.end(), [](const Mark* a, const Mark* b) { return a->sequence < b->sequence; });
+        std::vector<Entry> out;
+        out.reserve(kept.size());
+        for (const Mark* m : kept) {
+            const BreadcrumbState state =
+                gpu_ ? breadcrumb_state(read(m->slot, 0), read(m->slot, 1), m->tag) : BreadcrumbState::unknown;
+            out.push_back(Entry{m->tag, m->list_id, m->ops, state, m->queue_id, m->list_name, m->queue_name});
+        }
+        return out;
+    }
+
+    // For a device-lost message: with GPU breadcrumbs the lists that did not complete and the last one that did;
+    // without them the last kUnknownShown lists submitted, their progress unknown.
+    void report(std::FILE* out) const { write_report(out, snapshot()); }
+
+    static void write_report(std::FILE* out, const std::vector<Entry>& entries) {
+        if (entries.empty()) {
+            std::fprintf(out, "[rt] d3d12 DRED: no command list was submitted since the diagnostics started\n");
+            return;
+        }
+        std::size_t first = entries.size();
+        if (entries.back().state == BreadcrumbState::unknown) {
+            first = entries.size() > kUnknownShown ? entries.size() - kUnknownShown : 0;
+            std::fprintf(out, "[rt] d3d12 DRED: GPU progress UNKNOWN (no VK_AMD_buffer_marker); the last %zu of the "
+                              "%zu lists submitted, oldest first (CPU knowledge only):\n",
+                         entries.size() - first, entries.size());
+            for (std::size_t i = first; i < entries.size(); ++i) write_entry(out, entries[i]);
+            return;
+        }
+        for (std::size_t i = 0; i < entries.size(); ++i)
+            if (entries[i].state != BreadcrumbState::completed) {
+                first = i;
+                break;
+            }
+        if (first == entries.size()) {
+            std::fprintf(out, "[rt] d3d12 DRED: every one of the %zu lists kept completed\n", entries.size());
+            return;
+        }
+        if (first > 0) first -= 1;  // the last completed list before the first that did not, for context
+        std::fprintf(out, "[rt] d3d12 DRED: %zu of the last %zu lists did not complete (GPU writes after a device "
+                          "loss may be incomplete):\n", count_incomplete(entries), entries.size());
+        for (std::size_t i = first; i < entries.size(); ++i) write_entry(out, entries[i]);
+    }
+
+private:
+    template<class Map, class Key>
+    void label(Map& names, Key key, std::wstring name) {
+        std::lock_guard lock(mutex_);
+        if (name.empty()) {
+            names.erase(key);
+            return;
+        }
+        if (names.size() >= 4096 && !names.count(key)) names.clear();  // bounded; refreshed before each submission
+        names[key] = std::move(name);
+    }
+
+    static void write_entry(std::FILE* out, const Entry& e) {
+        std::fprintf(out, "[rt] d3d12 DRED:   list %#llx", static_cast<unsigned long long>(e.list_id));
+        if (!e.list_name.empty()) std::fprintf(out, " \"%s\"", breadcrumb_utf8(e.list_name).c_str());
+        std::fprintf(out, " on queue %#llx", static_cast<unsigned long long>(e.queue_id));
+        if (!e.queue_name.empty()) std::fprintf(out, " \"%s\"", breadcrumb_utf8(e.queue_name).c_str());
+        std::fprintf(out, ", tag %u: %s, %zu operations", e.tag, breadcrumb_state_name(e.state), e.ops.size());
+        const std::size_t shown = e.ops.size() < 8 ? e.ops.size() : 8;
+        for (std::size_t k = 0; k < shown; ++k)
+            std::fprintf(out, "%s%s", k ? ", " : ": ", breadcrumb_op_name(e.ops[k]));
+        std::fprintf(out, "%s\n", e.ops.size() > shown ? ", ..." : "");
+    }
+    static std::size_t count_incomplete(const std::vector<Entry>& entries) {
+        std::size_t n = 0;
+        for (const auto& e : entries) n += e.state != BreadcrumbState::completed;
+        return n;
+    }
+    VkDeviceSize offset(std::uint32_t slot, std::uint32_t word) const {
+        return (VkDeviceSize(slot) * 2 + word) * sizeof(std::uint32_t);
+    }
+    std::uint32_t read(std::uint32_t slot, std::uint32_t word) const {
+        return static_cast<const volatile std::uint32_t*>(mapped_)[slot * 2 + word];
+    }
+
+    VkDevice device_ = VK_NULL_HANDLE;
+    BreadcrumbFunctions fn_;
+    VkBuffer buffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory memory_ = VK_NULL_HANDLE;
+    std::uint32_t* mapped_ = nullptr;
+    bool gpu_ = false;
+    mutable std::mutex mutex_;
+    std::uint32_t next_tag_ = 0;
+    std::uint32_t next_slot_ = 0;
+    std::uint64_t next_sequence_ = 0;
+    std::deque<Mark> history_;
+    std::uint32_t owner_[kSlots] = {};  // the tag each slot was last handed out with
+    std::unordered_map<const CommandList*, std::wstring> list_names_;
+    std::unordered_map<const void*, std::wstring> queue_names_;
+};
+
+}  // namespace leonida

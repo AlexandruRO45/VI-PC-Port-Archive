@@ -11,6 +11,7 @@
 
 #include "d3d12_stubs.h"  // generated
 #include "d3d12_com_object.h"
+#include "d3d12_dred.h"
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
 #include "dxgi_com.h"
@@ -3780,6 +3781,8 @@ public:
                     return (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
                 });
         }
+        dred_.attach(static_cast<ID3D12Device*>(this), state_.context.get(), &removed_, &state_.arena.address,
+                     dred_requested());
         if (info.buffer_device_address && state_.context->loaded() && !create_arena())
             std::fprintf(stderr, "[rt] d3d12: the GPU address arena could not be created\n");
         if (info.conditional_rendering) {
@@ -3841,6 +3844,11 @@ public:
             if (family.queueFlags & VK_QUEUE_COMPUTE_BIT)
                 state_.context->set_occlusion_resolve_memory(state_.memory);
         }
+        if ((dred_requested() || info.buffer_marker) &&
+            !state_.context->configure_breadcrumbs(state_.memory, info.buffer_marker, info.device_fault))
+            std::fprintf(stderr, "[rt] d3d12 DRED: no GPU breadcrumbs (%s); a device-lost report lists the submitted "
+                                 "command lists with their GPU progress UNKNOWN\n",
+                         info.buffer_marker ? "no host-visible memory for them" : "no VK_AMD_buffer_marker");
 
         if (info.debug_utils) {
             leonida::DebugLabelFunctions labels;
@@ -4188,6 +4196,16 @@ public:
 
     // STUB
     void STDMETHODCALLTYPE RemoveDevice() override { removed_.store(true, std::memory_order_release); }
+
+    // ID3D12DeviceRemovedExtendedData/1/2 are a tear-off with the device's identity (d3d12_dred.h).
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (out && dred_.attached() && DeviceRemovedData::answers(riid)) {
+            *out = static_cast<ID3D12DeviceRemovedExtendedData2*>(&dred_);
+            AddRef();
+            return S_OK;
+        }
+        return Object::QueryInterface(riid, out);
+    }
 
     HRESULT STDMETHODCALLTYPE CreateCommandQueue(const D3D12_COMMAND_QUEUE_DESC* desc, REFIID riid,
                                                  void** out) override {
@@ -6630,6 +6648,7 @@ private:
     std::vector<bool> queue_busy_;
     DeviceState state_;
     std::atomic<bool> removed_{false};
+    DeviceRemovedData dred_;
     OwnedRuntime owned_;
     IUnknown* outer_ = nullptr;  // the Xbox-ABI proxy, which owns a reference to this device
 };
@@ -7436,6 +7455,33 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
                      "[rt] d3d12: no VK_EXT_custom_border_color; custom sampler border colours fall back to transparent black\n");
     }
 
+    // LEONIDA_DRED=1: device-lost diagnostics (vulkan_breadcrumbs.h), off by default.
+#if defined(VK_EXT_device_fault)
+    VkPhysicalDeviceFaultFeaturesEXT fault_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+#endif
+    if (dred_requested()) {
+        const auto device_has = [&](const char* name) {
+            return std::any_of(extensions.begin(), extensions.end(),
+                               [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; });
+        };
+        info.buffer_marker = device_has(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+#if defined(VK_EXT_device_fault)
+        if (device_has(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fault_features};
+            vkGetPhysicalDeviceFeatures2(info.physical, &query);
+            info.device_fault = fault_features.deviceFault == VK_TRUE;
+            if (info.device_fault) {
+                fault_features.deviceFaultVendorBinary = VK_FALSE;  // the report reads no vendor dump
+                fault_features.pNext = *v13.next();  // since #1706
+                *v13.next() = &fault_features;
+            }
+        }
+#endif
+        std::fprintf(stderr, "[rt] d3d12 DRED: breadcrumbs %s, device fault %s\n",
+                     info.buffer_marker ? "on" : "off (no VK_AMD_buffer_marker)",
+                     info.device_fault ? "on" : "off (no VK_EXT_device_fault)");
+    }
+
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
@@ -7458,6 +7504,10 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     // VK_KHR_swapchain requires VK_KHR_surface on the instance (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
     if (has_swapchain && instance_has_surface) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     if (swapchain_m1_name) device_extensions.push_back(swapchain_m1_name);
+    if (info.buffer_marker) device_extensions.push_back(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+#if defined(VK_EXT_device_fault)
+    if (info.device_fault) device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+#endif
     if (info.ray_tracing) {
         device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
         device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);

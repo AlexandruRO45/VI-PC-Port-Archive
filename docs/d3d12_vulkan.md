@@ -1501,7 +1501,8 @@ The trace will enumerate them.
 | `ID3D12PipelineLibrary` | map + `VkPipelineCache` | D3D12 cached blobs are ignored. |
 | `ID3D12StateObject` (ray tracing) | likely unused | RT work includes compute traversal (`image_bvh*`) plus `XboxBvhBuilder`; a DXR state-object path is stubbed until the trace shows it. |
 | `ID3D12ShaderCacheSession` | `VkPipelineCache` | Stub with logging. |
-| DRED, protected sessions, meta commands, shared handles | stubs | Not needed for single-player boot; return a clean failure and log. |
+| DRED | `ID3D12DeviceRemovedExtendedData`/`1`/`2` from the layer's breadcrumbs | Section 4.11; off unless `LEONIDA_DRED=1`, outputs as on the host runtime. |
+| Protected sessions, meta commands, shared handles | stubs | Not needed for single-player boot; return a clean failure and log. |
 
 ### 4.1 Device and feature queries
 
@@ -2394,6 +2395,86 @@ Games and middleware call these every frame (PIX events), so they must be cheap 
   vkd3d-proton's private store does). `SetName` stores the name as `WKPDID_D3DDebugObjectNameW`
   (terminator included), which is where D3D12 keeps it. Names are not forwarded to `vkSetDebugUtilsObjectNameEXT`
   yet: one D3D12 object may own several Vulkan objects.
+
+### 4.11 Device-lost diagnostics (DRED)
+
+When the GPU faults or hangs the layer sees only `VK_ERROR_DEVICE_LOST`. With `LEONIDA_DRED=1` (off by default) it
+also records which command lists the GPU had started and finished, and reads the fault address where the driver
+reports one (D3D-264). Implemented in `runtime/src/vulkan_breadcrumbs.h`, `runtime/src/vulkan_backend.h`
+(`execute()`, `mark_device_lost()`, `is_device_lost()`), `runtime/shims/d3d12_dred.h` and the names hook in
+`ExecuteCommandLists` (`runtime/shims/d3d12_com.cpp`); tested by `runtime/test/vk_breadcrumbs_test.cpp`,
+`runtime/test/vk_device_lost_test.cpp` and `runtime/test/d3d12_dred_test.cpp`.
+
+- **Extensions.** `create_vulkan_device_standalone` enables `VK_AMD_buffer_marker` (breadcrumbs) and
+  `VK_EXT_device_fault` with its `deviceFault` feature (fault addresses), each only where the GPU lists it, and
+  prints which ones are on. A caller-made device says so in `VulkanDeviceInfo::buffer_marker`/`device_fault`.
+  Without the marker extension (or without host-visible memory for it) the ring runs CPU only, below; without the
+  fault extension there are no addresses. Nothing else changes either way, and with `LEONIDA_DRED` unset neither
+  extension is enabled and no ring exists.
+- **Breadcrumbs are per list.** `execute()` writes two markers around each list's commands in the submission's
+  command buffer: a unique non-zero tag into the list's begin word at `TOP_OF_PIPE`, the same tag into its end
+  word at `BOTTOM_OF_PIPE`. The words live in a host-visible, coherent ring of 1024 slots (two `uint32` each).
+  Replay and `emit()` are not changed.
+- **States, never inferred from the CPU.** *Submitted*: `vkQueueSubmit` succeeded, nothing more; a failed
+  submission forgets its lists. *Started*: the GPU wrote the tag into the begin word. *Completed*: it wrote the
+  end word. *Unknown*: the ring runs CPU only (no `VK_AMD_buffer_marker`), records no markers and knows only that
+  the list was submitted, on which queue; such a list is never reported as started or completed. Because every list gets a new tag, a slot needs no clearing: an older tag still in the word reads as
+  "not yet". Queues share the ring; a slot handed to a later list drops the earlier one from the history, which is
+  sorted by when each list was marked.
+- **Names and queues.** Each kept list carries the queue that submitted it (an opaque id) and, when they have one,
+  the list's and the queue's D3D12 debug name. `ExecuteCommandLists` copies them (`SetName` stores them as
+  `WKPDID_D3DDebugObjectNameW`, read under the object's own lock) before every submission, and only when the
+  diagnostics run; the ring holds strings, never a COM object, so a list or queue released later leaves nothing
+  dangling.
+- **On the loss.** The first call that sees the loss (from `mark_device_lost()`, after `notify_device_lost()`
+  wakes the fence waits, or `is_device_lost()` after the fence waiter thread set the flag) prints once to stderr:
+  with GPU breadcrumbs the lists that did not complete and the last one that did, CPU only the last 16 lists
+  submitted with their progress UNKNOWN; each with its queue, names and up to eight operations. Then the
+  `VK_EXT_device_fault` description and addresses, or "no device fault information" when the extension is off,
+  a query fails or the driver reports nothing (vendor binary data is never asked for). Writes after a loss cannot
+  be made visible to the host with a memory dependency, so the report says the states are best effort.
+- **`ID3D12DeviceRemovedExtendedData`, `...1`, `...2`.** A tear-off of the device (its identity and reference
+  count) that follows what the host runtime does on WARP and an RTX 4060 Ti (driver 621.01), where both behave
+  the same:
+
+  | | DRED off (`LEONIDA_DRED` unset) | DRED on |
+  |---|---|---|
+  | `QueryInterface` for the three | succeeds | succeeds |
+  | outputs, device not removed | `DXGI_ERROR_UNSUPPORTED` | `DXGI_ERROR_NOT_CURRENTLY_AVAILABLE` (a null argument too) |
+  | outputs after `RemoveDevice` | `DXGI_ERROR_UNSUPPORTED` | `S_OK`, no node, `PageFaultVA` 0 |
+  | `GetDeviceState` | `UNKNOWN` | `UNKNOWN` |
+
+  On the host the settings interface (`ID3D12DeviceRemovedExtendedDataSettings`, `FORCED_ON`) turns DRED on; it
+  is a debug interface, not one of the device, and the layer refuses it like the host does. After a removal the
+  host runtime dereferences a null output argument; the layer returns `E_INVALIDARG`.
+- **After a real loss** the outputs hold what the layer knows, taken once at the first call so the pointers stay
+  valid as long as the device:
+  - one `D3D12_AUTO_BREADCRUMB_NODE`/`NODE1` per kept list the GPU did not complete, oldest first, with its
+    operations as `D3D12_AUTO_BREADCRUMB_OP` values (the IR command → op table in `breadcrumb_op_of`; queries,
+    predication and discards have no op of their own). `*pLastBreadcrumbValue` is 0: at list granularity no
+    operation is known to have completed in a list that started. CPU only there is no node: a node cannot say
+    "progress unknown", and listing every submitted list as in flight would be a guess (the stderr report has them);
+  - the list and queue debug names (W, and A in the process code page) are the copies taken at submission;
+    `pCommandList` and `pCommandQueue` stay null, since nothing keeps those objects alive after
+    `ExecuteCommandLists`, and there are no breadcrumb contexts;
+  - `PageFaultVA` is the first address `VK_EXT_device_fault` reports as an invalid read, write or execute, minus
+    the arena's device address (section 3.3; `GetGPUVirtualAddress` computes VAs the same way), or 0 when there
+    is none or it lies below the arena. There are no allocation nodes (the layer keeps no allocation history)
+    and `PageFaultFlags` is 0;
+  - `GetDeviceState` stays `UNKNOWN`: a Vulkan loss does not say whether the GPU hung or faulted.
+- **Not behind the Xbox-ABI device proxy.** The proxy answers only the Xbox device chain it models; DRED is not in
+  it and its Xbox layout is not measured, so the game's device refuses the three interfaces (as before). The
+  stderr report does not depend on them.
+- **Not tested on a real GPU loss.** A loss cannot be caused safely. The tests cover the states (a list held
+  behind an unsignalled fence reads *submitted* while the one before it *completed*), the CPU-only mode, ring
+  recycling with two queues on two threads, the report format and the D3D12 conversion on synthetic data, the host
+  runtime's contract above, and the loss path with a controlled loss: `vkQueueSubmit` returns
+  `VK_ERROR_DEVICE_LOST` without reaching the driver and `vkGetDeviceFaultInfoEXT` is a mock (fault data, none, or
+  a failing first or second query). There the report is printed once, also with eight threads seeing the loss at
+  once, nothing is submitted, recorded or queried after it, and through D3D12 the named list comes back as a node
+  with its queue's name and the fault as the buffer's D3D12 VA. All of it runs under validation and
+  synchronization validation. What a real driver writes into the marker words and the fault info after a hang or
+  fault is not covered.
 
 ## 5. Producing the shader contract
 
