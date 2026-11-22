@@ -42,10 +42,12 @@ Standard library Python only; zero third-party dependencies; zero game data.
 Python 3.9+ compatible (from __future__ import annotations).
 """
 
+from dataclasses import dataclass, field
+from enum import Enum, auto
 import math
 import struct
 import unittest
-from typing import Tuple
+from typing import List, Optional, Tuple, Union
 
 # Bitwise Masks & Constants
 MASK32: int = 0xFFFFFFFF
@@ -348,6 +350,185 @@ class TestValuCvtPknormI16F32ModelAndOracle(unittest.TestCase):
             self.assertEqual(ch0, ch1)
             reconstructed = snorm16_to_f32(ch0)
             self.assertAlmostEqual(val, reconstructed, delta=1.0 / 32767.0)
+
+
+# ==============================================================================
+# Commit 2: Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+
+
+@dataclass(frozen=True)
+class Reg:
+    """Represents an architectural 32-bit register (VGPR or SGPR)."""
+    index: int
+    reg_type: RegType
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"Register index {self.index} out of range [0, 255]")
+
+    @property
+    def name(self) -> str:
+        prefix = "v" if self.reg_type == RegType.VGPR else "s"
+        return f"{prefix}{self.index}"
+
+
+@dataclass(frozen=True)
+class Literal32:
+    """Represents a 32-bit literal or inline float constant."""
+    bits: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.bits <= 0xFFFFFFFF):
+            raise ValueError(f"Literal32 bits 0x{self.bits:X} out of range [0, 0xFFFFFFFF]")
+
+    @classmethod
+    def from_float(cls, val: float) -> Literal32:
+        return cls(f32_to_bits(val))
+
+    @property
+    def name(self) -> str:
+        return f"0x{self.bits & MASK32:08X}"
+
+
+@dataclass(frozen=True)
+class VOP3Operand:
+    """Typed expression operand with optional input modifiers (abs, neg)."""
+    source: Union[Reg, Literal32]
+    abs_mod: bool = False
+    neg_mod: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source, (Reg, Literal32)):
+            raise TypeError(f"Operand source must be Reg or Literal32, got {type(self.source).__name__}")
+
+    def disassemble(self) -> str:
+        s = self.source.name
+        if self.abs_mod and self.neg_mod:
+            return f"-|{s}|"
+        elif self.abs_mod:
+            return f"|{s}|"
+        elif self.neg_mod:
+            return f"-{s}"
+        return s
+
+
+class Opcode(Enum):
+    V_CVT_PKNORM_I16_F32 = "v_cvt_pknorm_i16_f32"
+
+
+@dataclass(frozen=True)
+class VCvtPknormI16F32Instruction:
+    """Symbolic AST node representing a RDNA2 v_cvt_pknorm_i16_f32 instruction."""
+    dst: Reg
+    src0: VOP3Operand
+    src1: VOP3Operand
+    clamp: bool = False
+    opcode: Opcode = Opcode.V_CVT_PKNORM_I16_F32
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination of VALU instruction must be VGPR, got {self.dst.reg_type}")
+        if not isinstance(self.src0, VOP3Operand):
+            raise TypeError(f"src0 must be VOP3Operand, got {type(self.src0).__name__}")
+        if not isinstance(self.src1, VOP3Operand):
+            raise TypeError(f"src1 must be VOP3Operand, got {type(self.src1).__name__}")
+
+    def disassemble(self) -> str:
+        s = f"{self.opcode.value} {self.dst.name}, {self.src0.disassemble()}, {self.src1.disassemble()}"
+        if self.clamp:
+            s += " clamp"
+        return s
+
+
+class TestValuCvtPknormI16F32SymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_reg_types_and_bounds(self) -> None:
+        """Verify register boundary indices and naming conventions."""
+        v0 = Reg(0, RegType.VGPR)
+        v255 = Reg(255, RegType.VGPR)
+        s0 = Reg(0, RegType.SGPR)
+        s255 = Reg(255, RegType.SGPR)
+
+        self.assertEqual(v0.name, "v0")
+        self.assertEqual(v255.name, "v255")
+        self.assertEqual(s0.name, "s0")
+        self.assertEqual(s255.name, "s255")
+
+        with self.assertRaises(ValueError):
+            Reg(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(256, RegType.VGPR)
+
+    def test_literal_operand_creation(self) -> None:
+        """Verify 32-bit literal constants creation from integers and floats."""
+        lit_hex = Literal32(0x3F800000)
+        lit_f = Literal32.from_float(1.0)
+        self.assertEqual(lit_hex.bits, 0x3F800000)
+        self.assertEqual(lit_f.bits, 0x3F800000)
+        self.assertEqual(lit_f.name, "0x3F800000")
+
+        with self.assertRaises(ValueError):
+            Literal32(-1)
+        with self.assertRaises(ValueError):
+            Literal32(0x1_0000_0000)
+
+    def test_operand_modifiers_disassembly(self) -> None:
+        """Verify operand formatting with abs, neg, and abs+neg modifiers."""
+        v1 = Reg(1, RegType.VGPR)
+        op_plain = VOP3Operand(v1)
+        op_abs = VOP3Operand(v1, abs_mod=True)
+        op_neg = VOP3Operand(v1, neg_mod=True)
+        op_absneg = VOP3Operand(v1, abs_mod=True, neg_mod=True)
+
+        self.assertEqual(op_plain.disassemble(), "v1")
+        self.assertEqual(op_abs.disassemble(), "|v1|")
+        self.assertEqual(op_neg.disassemble(), "-v1")
+        self.assertEqual(op_absneg.disassemble(), "-|v1|")
+
+    def test_instruction_disassembly(self) -> None:
+        """Verify complete instruction disassembly for standard and modified forms."""
+        dst = Reg(5, RegType.VGPR)
+        s0 = VOP3Operand(Reg(1, RegType.VGPR))
+        s1 = VOP3Operand(Reg(2, RegType.SGPR), neg_mod=True)
+
+        instr = VCvtPknormI16F32Instruction(dst=dst, src0=s0, src1=s1)
+        self.assertEqual(instr.disassemble(), "v_cvt_pknorm_i16_f32 v5, v1, -s2")
+
+        instr_clamped = VCvtPknormI16F32Instruction(dst=dst, src0=s0, src1=s1, clamp=True)
+        self.assertEqual(instr_clamped.disassemble(), "v_cvt_pknorm_i16_f32 v5, v1, -s2 clamp")
+
+    def test_ast_immutability_and_equality(self) -> None:
+        """Verify frozen AST dataclasses ensure immutability and valid hashing."""
+        import dataclasses
+        v0 = Reg(0, RegType.VGPR)
+        v1 = Reg(1, RegType.VGPR)
+        instr1 = VCvtPknormI16F32Instruction(v0, VOP3Operand(v1), VOP3Operand(v1))
+        instr2 = VCvtPknormI16F32Instruction(v0, VOP3Operand(v1), VOP3Operand(v1))
+
+        self.assertEqual(instr1, instr2)
+        self.assertEqual(hash(instr1), hash(instr2))
+        with self.assertRaises((dataclasses.FrozenInstanceError, TypeError)):
+            instr1.clamp = True  # type: ignore
+
+    def test_ast_rejection_sgpr_destination(self) -> None:
+        """Verify VALU instructions reject SGPR destinations."""
+        s0 = Reg(0, RegType.SGPR)
+        v1 = Reg(1, RegType.VGPR)
+        with self.assertRaises(TypeError):
+            VCvtPknormI16F32Instruction(dst=s0, src0=VOP3Operand(v1), src1=VOP3Operand(v1))
+
+    def test_operand_type_rejection(self) -> None:
+        """Verify invalid operand types raise TypeError."""
+        with self.assertRaises(TypeError):
+            VOP3Operand("v1")  # type: ignore
+        with self.assertRaises(TypeError):
+            VCvtPknormI16F32Instruction(Reg(0, RegType.VGPR), "bad", VOP3Operand(Reg(1, RegType.VGPR)))  # type: ignore
 
 
 if __name__ == "__main__":
