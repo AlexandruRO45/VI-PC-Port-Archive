@@ -147,6 +147,42 @@ class AssetsDecoderVersionTest(unittest.TestCase):
             with open(ver_file, "r", encoding="utf-8") as f:
                 self.assertEqual(f.read().strip(), sig)
 
+    def test_changed_decoder_clears_stale_files(self):
+        old_sig = "f" * 64
+        new_sig = "g" * 64
+        dest_dir = os.path.join(self.out, "test", "models")
+        self.stub(os.path.join(dest_dir, "manifest.json"))
+        self.stub(os.path.join(dest_dir, "decoder.sha256"), old_sig + "\n")
+        stray = self.stub(os.path.join(dest_dir, "stale_model.obj"), "old content")
+        self.assertTrue(os.path.isfile(stray))
+
+        self.run_assets(test_archive="test.rpf", current_digest=new_sig)
+
+        # Stale file should be gone after re-export
+        self.assertFalse(os.path.isfile(stray))
+
+    def test_prerequisite_failure_preserves_existing_export(self):
+        old_sig = "h" * 64
+        new_sig = "i" * 64
+        dest_dir = os.path.join(self.out, "test", "models")
+        self.stub(os.path.join(dest_dir, "manifest.json"))
+        self.stub(os.path.join(dest_dir, "decoder.sha256"), old_sig + "\n")
+        kept = self.stub(os.path.join(dest_dir, "good_model.obj"), "must survive")
+
+        def failing_rpf9dump(work):
+            raise RuntimeError("dotnet not found or build failed")
+
+        with mock.patch.object(make_game, "MODEL_ARCHIVES", ["test.rpf"]), \
+             mock.patch.object(make_game, "rpf9dump_digest", lambda: new_sig), \
+             mock.patch.object(make_game, "rpf9dump", failing_rpf9dump):
+            with self.assertRaises(RuntimeError):
+                make_game.assets(self.game, self.work, False, 1)
+
+        # Existing files must still be preserved since prerequisite failed
+        self.assertTrue(os.path.isfile(kept))
+        with open(kept, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "must survive")
+
 
 if __name__ == "__main__":
     unittest.main()

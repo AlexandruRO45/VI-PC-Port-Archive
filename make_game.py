@@ -1211,8 +1211,12 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
                     log(f"assets: decoder updated for {name} {mode}: exporting again")
                 else:
                     log(f"assets: no decoder fingerprint for {name} {mode}: exporting again")
+                exporter = get_exporter(work)
+                shutil.rmtree(dest_dir, ignore_errors=True)
+            else:
+                exporter = get_exporter(work)
             log(f"assets: {mode} from {rel}")
-            run([get_exporter(work), mode, src, out])
+            run([exporter, mode, src, out])
             if os.path.isfile(manifest):
                 with open(ver_file, "w", encoding="utf-8", newline="\n") as f:
                     f.write(decoder_ver + "\n")
