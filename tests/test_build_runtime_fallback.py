@@ -46,6 +46,16 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
         self.assertIn("chcp 65001 >nul", text)
         self.assertLess(text.index("chcp 65001 >nul"), text.index('call `"$vcvars`"'))
 
+    def test_launcher_source_list_includes_file_system_shim(self):
+        text = SCRIPT.read_text(encoding="utf-8")
+        match = re.search(r'\$files\s*=\s*(.+?)\s*\|\s*ForEach-Object', text)
+        self.assertIsNotNone(match, "$files list definition not found in build_runtime.ps1")
+        file_defs = re.findall(r'"([^"]+)"', match.group(1))
+        self.assertIn(r"shims\file_system.cpp", file_defs)
+        for rel in file_defs:
+            with self.subTest(file=rel):
+                self.assertTrue((ROOT / "runtime" / rel).is_file())
+
 
 if __name__ == "__main__":
     unittest.main()
