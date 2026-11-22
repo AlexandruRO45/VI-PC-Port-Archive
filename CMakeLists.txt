@@ -1407,7 +1407,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_custom_command(OUTPUT "${x87_compare_fixture}"
             COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_compare.py"
                 emit "$<TARGET_FILE:cpu_x87_compare>" "${x87_compare_fixture}" ${variant}
-            DEPENDS cpu_x87_compare tests/cpu/x87_compare.py tests/cpu/x87_moves.py tests/cpu/x87_sub.py
+            DEPENDS cpu_x87_compare tests/cpu/x87_compare.py tests/cpu/x87_moves.py tests/cpu/x87_sub.py tests/cpu/adx.py
                 tests/cpu/x87_div.py tests/cpu/x87_mul.py tests/cpu/x87_add.py tools/ffx_version_query.py
                 tools/x87_lower.py tools/x87_soft.h tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
         add_library(cpu_x87_compare_${variant} SHARED "${x87_compare_fixture}")
@@ -1418,6 +1418,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_x87_compare COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_compare.py"
         check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_compare>"
         "$<TARGET_FILE:cpu_x87_compare_lifted>" ${x87_compare_control_files})
+    # Skips (77) after every other check when the host lacks ADX for the native ADOX export.
+    set_tests_properties(cpu_aot_x87_compare PROPERTIES SKIP_RETURN_CODE 77)
     cpu_asm_fixture(cpu_x87_sqrt x87_sqrt)
     # The lifted DLL and six mutated controls that the check requires to mismatch.
     set(x87_sqrt_control_files "")
@@ -2107,6 +2109,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/mesh_cbv_order_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(mesh_cbv_order_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME mesh_descriptor_swap_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/mesh_descriptor_swap_check.py" "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(mesh_descriptor_swap_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME mesh_indexed_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/mesh_indexed_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
