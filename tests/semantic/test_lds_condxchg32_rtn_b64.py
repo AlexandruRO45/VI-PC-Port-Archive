@@ -1335,5 +1335,197 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(self.lds.read_qword(48), subnorm_max)
 
 
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_syntax(self) -> None:
+        invalid_assemblies = [
+            "",
+            "   ",
+            "v_condxchg_b64 v[0:1], v1, v[2:3], v[4:5]",
+            "ds_condxchg32_rtn_b128 v[0:3], v1, v[4:7], v[8:11]",
+            "ds_condxchg32_rtn_b64 v[0:1], v1, v[2:3]",  # Missing 4th operand
+            "ds_condxchg32_rtn_b64 v[0:1], v1, v[2:3], v[4:5], v[6:7]",  # Too many operands
+            "ds_condxchg32_rtn_b64 v[0:2], v1, v[2:3], v[4:5]",  # 3-reg range instead of pair
+            "ds_condxchg32_rtn_b64 r[0:1], v1, v[2:3], v[4:5]",
+            "ds_condxchg32_rtn_b64 v[0:1], s1, v[2:3], v[4:5]",
+            "ds_condxchg32_rtn_b64 v[255:256], v1, v[2:3], v[4:5]",
+            "ds_condxchg32_rtn_b64 v[0:1], v1, v[2:3], v[4:5] offset:70000",
+            "ds_condxchg32_rtn_b64 v[0:1], v1, v[2:3], v[4:5] offset:-1",
+            "ds_condxchg32_rtn_b64 v[0:1], v1, v[2:3], v[4:5] offset:",
+        ]
+        for asm in invalid_assemblies:
+            with self.subTest(asm=asm):
+                with self.assertRaises((ValueError, IndexError)):
+                    DSCondXchg32B64Instruction.parse(asm)
+
+    def test_ast_and_model_negative_controls(self) -> None:
+        with self.assertRaises(ValueError):
+            LDSMemory(1000)
+        with self.assertRaises(ValueError):
+            LDSMemory(-64)
+        with self.assertRaises(ValueError):
+            LDSMemory(0)
+
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=128)
+
+        with self.assertRaises(ValueError):
+            DSCondXchg32B64Instruction(
+                opcode=DSOpcode.DS_CONDXCHG32_RTN_B64,
+                vaddr=VGPR(0),
+                vdata0=VGPRPair(2),
+                vdata1=VGPRPair(4),
+                vdst=None,
+            )
+
+    def test_mutation_detection_low_32bit_only_comparison(self) -> None:
+        # Mutant: compares only low 32 bits
+        def mutant_condxchg_lo(mem: int, cmp_val: int, new_val: int) -> Tuple[int, int, bool]:
+            if (mem & MASK32) == (cmp_val & MASK32):
+                return mem & MASK64, new_val & MASK64, True
+            return mem & MASK64, mem & MASK64, False
+
+        mem_val = 0xAAAAAAAA_12345678
+        cmp_val = 0xBBBBBBBB_12345678
+        new_val = 0x11111111_11111111
+
+        _, _, correct_swap = oracle_condxchg64(mem_val, cmp_val, new_val)
+        _, _, mutant_swap = mutant_condxchg_lo(mem_val, cmp_val, new_val)
+
+        self.assertFalse(correct_swap)
+        self.assertTrue(mutant_swap)
+        self.assertNotEqual(correct_swap, mutant_swap)
+
+    def test_mutation_detection_high_32bit_only_comparison(self) -> None:
+        # Mutant: compares only high 32 bits
+        def mutant_condxchg_hi(mem: int, cmp_val: int, new_val: int) -> Tuple[int, int, bool]:
+            if ((mem >> 32) & MASK32) == ((cmp_val >> 32) & MASK32):
+                return mem & MASK64, new_val & MASK64, True
+            return mem & MASK64, mem & MASK64, False
+
+        mem_val = 0x12345678_AAAAAAAA
+        cmp_val = 0x12345678_BBBBBBBB
+        new_val = 0x22222222_22222222
+
+        _, _, correct_swap = oracle_condxchg64(mem_val, cmp_val, new_val)
+        _, _, mutant_swap = mutant_condxchg_hi(mem_val, cmp_val, new_val)
+
+        self.assertFalse(correct_swap)
+        self.assertTrue(mutant_swap)
+        self.assertNotEqual(correct_swap, mutant_swap)
+
+    def test_mutation_detection_destructive_aliasing(self) -> None:
+        class DestructiveMutantInterpreter(ScalarDSInterpreter):
+            def execute(self, state: ScalarThreadState, inst: DSCondXchg32B64Instruction) -> int:
+                # Clobber destination register pair before memory read
+                state.rf.set_u64(inst.vdst, 0xBAD00000_BAD00000)
+                return super().execute(state, inst)
+
+        lds = LDSMemory(65536)
+        val_init = 0x11112222_33334444
+        val_new = 0x55556666_77778888
+        lds.write_qword(32, val_init)
+
+        state = ScalarThreadState(lds=lds)
+        state.rf.set_u32(VGPR(2), 32)  # v2 is address
+        state.rf.set_u64(VGPRPair(4), val_init)
+        state.rf.set_u64(VGPRPair(6), val_new)
+
+        # vdst aliases vaddr (v[2:3])
+        inst = DSCondXchg32B64Instruction(
+            DSOpcode.DS_CONDXCHG32_RTN_B64,
+            vaddr=VGPR(2),
+            vdata0=VGPRPair(4),
+            vdata1=VGPRPair(6),
+            vdst=VGPRPair(2),
+        )
+        mutant = DestructiveMutantInterpreter()
+        mutant.execute(state, inst)
+
+        # Destructive mutant clobbered v2 before address calculation in super().execute
+        self.assertNotEqual(lds.read_qword(32), val_new)
+
+    def test_mutation_detection_ignore_exec_mask(self) -> None:
+        class MutantSIMDInterpreter(SIMDDSInterpreter):
+            def execute(self, state: SIMDWaveState, inst: DSCondXchg32B64Instruction) -> Dict[int, int]:
+                saved = state.exec_mask
+                state.exec_mask = (1 << state.wave_size) - 1
+                try:
+                    return super().execute(state, inst)
+                finally:
+                    state.exec_mask = saved
+
+        lds = LDSMemory(65536)
+        val_init = 0x11111111_11111111
+        val_new = 0x22222222_22222222
+        lds.write_qword(40, val_init)
+
+        wave = SIMDWaveState(wave_size=32, exec_mask=0x0, lds=lds)
+        for l in range(32):
+            wave.set_u32(l, VGPR(1), 40)
+            wave.set_u64(l, VGPRPair(4), val_init)
+            wave.set_u64(l, VGPRPair(6), val_new)
+
+        inst = DSCondXchg32B64Instruction(
+            DSOpcode.DS_CONDXCHG32_RTN_B64,
+            vaddr=VGPR(1),
+            vdata0=VGPRPair(4),
+            vdata1=VGPRPair(6),
+            vdst=VGPRPair(2),
+        )
+        mutant = MutantSIMDInterpreter()
+        mutant.execute(wave, inst)
+
+        # Inactive lanes were modified by mutant
+        self.assertEqual(lds.read_qword(40), val_new)
+
+        # Reference interpreter preserves memory
+        lds.write_qword(40, val_init)
+        SIMDDSInterpreter().execute(wave, inst)
+        self.assertEqual(lds.read_qword(40), val_init)
+
+    def test_mutation_detection_dropped_offset(self) -> None:
+        class DroppedOffsetInterpreter(ScalarDSInterpreter):
+            def execute(self, state: ScalarThreadState, inst: DSCondXchg32B64Instruction) -> int:
+                no_off = DSCondXchg32B64Instruction(
+                    opcode=inst.opcode,
+                    vaddr=inst.vaddr,
+                    vdata0=inst.vdata0,
+                    vdata1=inst.vdata1,
+                    vdst=inst.vdst,
+                    offset=OffsetImmediate(0),
+                )
+                return super().execute(state, no_off)
+
+        lds = LDSMemory(65536)
+        val_init = 0x11111111_11111111
+        val_new = 0x99999999_99999999
+        lds.write_qword(0x10, val_init)
+        lds.write_qword(0x20, val_init)
+
+        state = ScalarThreadState(lds=lds)
+        state.rf.set_u32(VGPR(1), 0x10)
+        state.rf.set_u64(VGPRPair(4), val_init)
+        state.rf.set_u64(VGPRPair(6), val_new)
+
+        inst = DSCondXchg32B64Instruction(
+            DSOpcode.DS_CONDXCHG32_RTN_B64,
+            vaddr=VGPR(1),
+            vdata0=VGPRPair(4),
+            vdata1=VGPRPair(6),
+            vdst=VGPRPair(2),
+            offset=OffsetImmediate(0x10),  # 0x10 + 0x10 = 0x20
+        )
+        mutant = DroppedOffsetInterpreter()
+        mutant.execute(state, inst)
+
+        # Mutant targeted 0x10 instead of 0x20
+        self.assertEqual(lds.read_qword(0x10), val_new)
+        self.assertEqual(lds.read_qword(0x20), val_init)
+
+
 if __name__ == "__main__":
     unittest.main()
