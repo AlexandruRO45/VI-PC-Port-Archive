@@ -635,6 +635,258 @@ class SpirvWaveInterpTests(unittest.TestCase):
             self.assertEqual(list(outputs[lane]["%out_mrt0"]), [140] * 4)
 
 
+class SignExtensionBoundaryTests(unittest.TestCase):
+    """Detailed boundary checks for signed 8-bit integers and sign propagation."""
+
+    def test_byte_sign_bit_boundary_transitions(self) -> None:
+        """Transition between positive max 0x7F (+127) and negative min 0x80 (-128)."""
+        # Testing transition across sign bit for each byte lane with multiplier 1
+        for lane in range(4):
+            # +127 * 1 = 127
+            s0_pos = 0x7F << (8 * lane)
+            s1 = 0x01 << (8 * lane)
+            self.assertEqual(ref_dot4_i32_i8(s0_pos, s1, 0), 127)
+
+            # -128 * 1 = -128 (0xFFFFFF80 in 32-bit two's complement)
+            s0_neg = 0x80 << (8 * lane)
+            self.assertEqual(ref_dot4_i32_i8(s0_neg, s1, 0), 0xFFFFFF80)
+
+            # -1 * 1 = -1 (0xFFFFFFFF)
+            s0_minus1 = 0xFF << (8 * lane)
+            self.assertEqual(ref_dot4_i32_i8(s0_minus1, s1, 0), 0xFFFFFFFF)
+
+            # 0 * 1 = 0
+            s0_zero = 0x00 << (8 * lane)
+            self.assertEqual(ref_dot4_i32_i8(s0_zero, s1, 0), 0)
+
+    def test_individual_byte_sign_propagation(self) -> None:
+        """Sign-extension of negative bytes must propagate through 32-bit addition."""
+        # When multiplying by -1 (0xFF), sign flips:
+        # (-128) * (-1) = +128
+        for lane in range(4):
+            s0 = 0x80 << (8 * lane)
+            s1 = 0xFF << (8 * lane)
+            self.assertEqual(ref_dot4_i32_i8(s0, s1, 0), 128)
+
+        # When multiplying by +2:
+        # (-128) * 2 = -256 = 0xFFFFFF00
+        for lane in range(4):
+            s0 = 0x80 << (8 * lane)
+            s1 = 0x02 << (8 * lane)
+            self.assertEqual(ref_dot4_i32_i8(s0, s1, 0), 0xFFFFFF00)
+
+    def test_mixed_signs_cancellation(self) -> None:
+        """Positive and negative byte products cancel each other out to zero."""
+        # lane 0: 50 * 2 = +100
+        # lane 1: (-50) * 2 = -100
+        # lane 2: 25 * 4 = +100
+        # lane 3: (-25) * 4 = -100
+        # Total = 100 - 100 + 100 - 100 = 0
+        s0 = pack_i8(50, -50, 25, -25)
+        s1 = pack_i8(2, 2, 4, 4)
+        self.assertEqual(ref_dot4_i32_i8(s0, s1, 0), 0)
+        self.assertEqual(ref_dot4_i32_i8(s0, s1, 12345), 12345)
+
+    def test_negative_times_negative_is_positive(self) -> None:
+        """Product of two negative bytes produces a strictly positive product."""
+        # 4 * (-128 * -128) = 4 * 16384 = 65536
+        s0 = pack_i8(-128, -128, -128, -128)
+        s1 = pack_i8(-128, -128, -128, -128)
+        self.assertEqual(ref_dot4_i32_i8(s0, s1, 0), 65536)
+
+        # (-1)*(-5) + (-2)*(-6) + (-3)*(-7) + (-4)*(-8) = 5 + 12 + 21 + 32 = 70
+        s0 = pack_i8(-1, -2, -3, -4)
+        s1 = pack_i8(-5, -6, -7, -8)
+        self.assertEqual(ref_dot4_i32_i8(s0, s1, 0), 70)
+
+    def test_negative_times_positive_is_negative(self) -> None:
+        """Product of negative and positive bytes produces a negative sum."""
+        # (-1)*5 + (-2)*6 + (-3)*7 + (-4)*8 = -5 - 12 - 21 - 32 = -70 = 0xFFFFFFBA
+        s0 = pack_i8(-1, -2, -3, -4)
+        s1 = pack_i8(5, 6, 7, 8)
+        self.assertEqual(ref_dot4_i32_i8(s0, s1, 0), 0xFFFFFFBA)
+
+        # 4 * (-128 * 1) = -512 = 0xFFFFFE00
+        s0 = pack_i8(-128, -128, -128, -128)
+        s1 = pack_i8(1, 1, 1, 1)
+        self.assertEqual(ref_dot4_i32_i8(s0, s1, 0), 0xFFFFFE00)
+
+
+class AccumulatorSaturationTests(unittest.TestCase):
+    """Accumulator wrapping without clamp and saturation with clamp."""
+
+    def test_unclamped_modulo32_upward_overflow(self) -> None:
+        """Without clamp, positive dot product overflows past 2^32 and wraps cleanly."""
+        # s0 = 0x7F7F7F7F, s1 = 0x7F7F7F7F -> dot product is +64516
+        s0, s1 = 0x7F7F7F7F, 0x7F7F7F7F
+        # 64516 + 0xFFFFFFFF = 64515 (mod 2^32)
+        self.assertEqual(ref_dot4_i32_i8(s0, s1, 0xFFFFFFFF), 64515)
+        # 64516 + 0x7FFFFFFF = 0x8000FC03 (as measured on gfx1036)
+        self.assertEqual(ref_dot4_i32_i8(s0, s1, 0x7FFFFFFF), 0x8000FC03)
+        # 64516 + (0xFFFFFFFF - 64516 + 1) = 0 (exact wrap to 0)
+        acc_exact_wrap = (MASK32 - 64516 + 1) & MASK32
+        self.assertEqual(ref_dot4_i32_i8(s0, s1, acc_exact_wrap), 0)
+
+    def test_unclamped_modulo32_downward_underflow(self) -> None:
+        """Without clamp, negative dot product underflows below 0 and wraps cleanly."""
+        # s0 = 0x80808080, s1 = 0x7F7F7F7F -> dot product is -65024
+        s0, s1 = 0x80808080, 0x7F7F7F7F
+        # 5 + (-65024) = -65019 = 0xFFFF0205 (as measured on gfx1036)
+        self.assertEqual(ref_dot4_i32_i8(s0, s1, 0x00000005), 0xFFFF0205)
+        # 0x80000000 + (-65024) = 0x7FFF0200 (as measured on gfx1036)
+        self.assertEqual(ref_dot4_i32_i8(s0, s1, 0x80000000), 0x7FFF0200)
+        # 0 + (-65024) = 0xFFFF0200
+        self.assertEqual(ref_dot4_i32_i8(s0, s1, 0), 0xFFFF0200)
+
+    def test_clamping_saturation_model_upward(self) -> None:
+        """With clamp, overflowing positive totals saturate at INT32_MAX (0x7FFFFFFF)."""
+        # 64516 + 0x7FFFFFFF saturates to 0x7FFFFFFF
+        s0, s1 = 0x7F7F7F7F, 0x7F7F7F7F
+        self.assertEqual(ref_dot4_clamp_i32_i8(s0, s1, 0x7FFFFFFF), 0x7FFFFFFF)
+        # 70 + 0x7FFFFFFF saturates to 0x7FFFFFFF
+        self.assertEqual(ref_dot4_clamp_i32_i8(0x01020304, 0x05060708, 0x7FFFFFFF), 0x7FFFFFFF)
+
+    def test_clamping_saturation_model_downward(self) -> None:
+        """With clamp, underflowing negative totals saturate at INT32_MIN (0x80000000)."""
+        # -65024 + 0x80000000 saturates to 0x80000000
+        s0, s1 = 0x80808080, 0x7F7F7F7F
+        self.assertEqual(ref_dot4_clamp_i32_i8(s0, s1, 0x80000000), 0x80000000)
+        # -16638 + 0x80000000 saturates to 0x80000000
+        self.assertEqual(ref_dot4_clamp_i32_i8(0xFF80017F, 0x7F7F80FF, 0x80000000), 0x80000000)
+
+    def test_clamping_saturation_within_bounds(self) -> None:
+        """Within [-2^31, 2^31 - 1], clamp does not modify the result."""
+        cases = [
+            (0x01020304, 0x05060708, 0, 70),
+            (0x01020304, 0x05060708, 1000, 1070),
+            (0xFF80017F, 0x7F7F80FF, 0, 0xFFFFBF02),
+            (0x80808080, 0x80808080, 0, 65536),
+            (0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 3),
+        ]
+        for s0, s1, acc, expected in cases:
+            with self.subTest(s0=hex(s0), s1=hex(s1), acc=hex(acc)):
+                self.assertEqual(ref_dot4_clamp_i32_i8(s0, s1, acc), expected)
+                self.assertEqual(ref_dot4_clamp_i32_i8(s0, s1, acc), ref_dot4_i32_i8(s0, s1, acc))
+
+
+class NegativeControlTests(unittest.TestCase):
+    """Negative controls, unsupported modifier rejection, and fault injection."""
+
+    def test_clamp_modifier_rejected_v_dot4(self) -> None:
+        """The translator refuses clamp modifier on v_dot4_i32_i8."""
+        lines = [
+            "v_mov_b32_e32 v1, 1",
+            "v_mov_b32_e32 v2, 1",
+            "v_mov_b32_e32 v3, 0",
+            "v_dot4_i32_i8 v8, v1, v2, v3 clamp",
+            "exp mrt0 v8, v8, v8, v8 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as refused:
+            support.translate_lines("ps_dot4_clamp_neg", lines)
+        self.assertEqual(str(refused.exception), "v_dot4_i32_i8 clamp")
+
+    def test_clamp_modifier_rejected_v_dot4c(self) -> None:
+        """The translator refuses clamp modifier on v_dot4c_i32_i8."""
+        lines = [
+            "v_mov_b32_e32 v1, 1",
+            "v_mov_b32_e32 v2, 1",
+            "v_dot4c_i32_i8 v9, v1, v2 clamp",
+            "exp mrt0 v9, v9, v9, v9 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as refused:
+            support.translate_lines("ps_dot4c_clamp_neg", lines)
+        self.assertEqual(str(refused.exception), "v_dot4c_i32_i8 clamp")
+
+    def test_op_sel_modifier_rejected_v_dot4(self) -> None:
+        """The translator refuses op_sel modifier on v_dot4_i32_i8."""
+        lines = [
+            "v_mov_b32_e32 v1, 1",
+            "v_mov_b32_e32 v2, 1",
+            "v_mov_b32_e32 v3, 0",
+            "v_dot4_i32_i8 v8, v1, v2, v3 op_sel:[0,1,0] op_sel_hi:[1,0,1]",
+            "exp mrt0 v8, v8, v8, v8 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as refused:
+            support.translate_lines("ps_dot4_op_sel_neg", lines)
+        self.assertEqual(str(refused.exception), "v_dot4_i32_i8 op_sel")
+
+    def test_op_sel_modifier_rejected_v_dot4c(self) -> None:
+        """The translator refuses op_sel modifier on v_dot4c_i32_i8."""
+        lines = [
+            "v_mov_b32_e32 v1, 1",
+            "v_mov_b32_e32 v2, 1",
+            "v_dot4c_i32_i8 v9, v1, v2 op_sel:[0,1,0] op_sel_hi:[1,0,1]",
+            "exp mrt0 v9, v9, v9, v9 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as refused:
+            support.translate_lines("ps_dot4c_op_sel_neg", lines)
+        self.assertEqual(str(refused.exception), "v_dot4c_i32_i8 op_sel")
+
+    def test_interpreter_invalid_destination(self) -> None:
+        """VALU instructions cannot write to SGPRs as destinations."""
+        interp = WavefrontDot4Interpreter(wave_size=32)
+        with self.assertRaises(ValueError):
+            interp.execute_line("v_dot4_i32_i8 s0, v1, v2, v3")
+        with self.assertRaises(ValueError):
+            interp.execute_line("v_dot4c_i32_i8 s0, v1, v2")
+        with self.assertRaises(ValueError):
+            interp.execute_line("s_mov_b32 v0, 1")
+
+    def test_interpreter_out_of_bounds_registers(self) -> None:
+        """VGPR index >= 256 or SGPR index >= 106 raises IndexError."""
+        interp = WavefrontDot4Interpreter(wave_size=32)
+        with self.assertRaises(IndexError):
+            interp.execute_line("v_dot4_i32_i8 v0, v256, v1, v2")
+        with self.assertRaises(IndexError):
+            interp.execute_line("v_dot4_i32_i8 v0, v1, s110, v2")
+        with self.assertRaises(IndexError):
+            interp.set_vgpr(256, 0, 1)
+        with self.assertRaises(IndexError):
+            interp.get_vgpr(256, 0)
+        with self.assertRaises(IndexError):
+            interp.set_sgpr(106, 1)
+        with self.assertRaises(IndexError):
+            interp.get_sgpr(106)
+
+    def test_interpreter_unsupported_opcode(self) -> None:
+        """Unknown opcodes raise NotImplementedError."""
+        interp = WavefrontDot4Interpreter(wave_size=32)
+        with self.assertRaises(NotImplementedError):
+            interp.execute_line("v_nonexistent_op v0, v1, v2")
+
+    def test_interpreter_invalid_wave_size(self) -> None:
+        """Wave sizes other than 32 or 64 are rejected."""
+        with self.assertRaises(ValueError):
+            WavefrontDot4Interpreter(wave_size=16)
+        with self.assertRaises(ValueError):
+            WavefrontDot4Interpreter(wave_size=128)
+
+    def test_bit_corruption_sensitivity(self) -> None:
+        """Flipping any bit in multiplier operands must perturb dot product result."""
+        s0 = 0x01020304
+        s1 = 0x05060708
+        acc = 1000
+        golden = ref_dot4_i32_i8(s0, s1, acc)
+
+        for bit in range(32):
+            corrupted_s0 = s0 ^ (1 << bit)
+            corrupted_s1 = s1 ^ (1 << bit)
+            self.assertNotEqual(
+                ref_dot4_i32_i8(corrupted_s0, s1, acc),
+                golden,
+                f"Flipping bit {bit} in S0 produced no change",
+            )
+            self.assertNotEqual(
+                ref_dot4_i32_i8(s0, corrupted_s1, acc),
+                golden,
+                f"Flipping bit {bit} in S1 produced no change",
+            )
+
+
 class Dot4I8(unittest.TestCase):
     """End-to-end SPIR-V translator tests for v_dot4_i32_i8 and v_dot4c_i32_i8."""
 
