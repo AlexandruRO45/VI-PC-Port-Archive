@@ -91,8 +91,11 @@ Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` arc
   (no WSL; needs git and the Visual Studio C++ tools below) and sets `LLVM_MC`. Or install `llvm-21` in WSL and set
   `LLVM_MC` to the whole command, `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"` (see
   [docs/design.md](docs/design.md#disassembling-shaders)). On Linux, `llvm-mc` on PATH is enough.
-- Visual Studio 2022 with **Desktop development with C++** and the **Windows SDK 10.0.26100 or newer**, for the
-  runtime stage (the runtime uses version 1.2 root signatures, which older SDKs don't declare).
+- Visual Studio 2022 with **Desktop development with C++** and a **Windows SDK that declares version 1.2 root
+  signatures** in its `d3d12.h`, for the runtime stage. The 10.0.26100.0 release
+  (`winget install Microsoft.WindowsSDK.10.0.26100`, `D3D12_SDK_VERSION` 616) does. The 26100 build number alone is not
+  the requirement: some 26100 revisions ship an older `d3d12.h` (e.g. 10.0.26100.6584, `D3D12_SDK_VERSION` 612) that the
+  configure check rejects.
 - [ffmpeg](https://ffmpeg.org/download.html) on PATH (optional: decodes the XMA2 streams, and required for `--wav`).
 
 **Low disk space:** the ~350 GB figure is for the full build. To *run* the port, `--stages check,shaders,runtime`
