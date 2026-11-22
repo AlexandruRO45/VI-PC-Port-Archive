@@ -811,8 +811,178 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
         self.assertEqual(state.lds.read_qword(addr), val)
 
 
+class TestRegisterAliasing(unittest.TestCase):
+    """Phase 5: Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+
+    def test_aliasing_vdst_equals_vdata0(self) -> None:
+        # ds_cmpst_rtn_b64 v[0:1], v2, v[0:1], v[4:5]
+        state = ScalarState(lds_size_dwords=1024)
+        addr = 0x60
+        initial_val = 0x1111_2222_3333_4444
+        new_val = 0x5555_6666_7777_8888
+
+        state.lds.write_qword(addr, initial_val)
+        state.set_reg_single(RegSingle(2), addr)
+        state.set_reg_pair(RegPair(0), initial_val)  # v[0:1] is cmp_val and vdst
+        state.set_reg_pair(RegPair(4), new_val)      # v[4:5] is new_val
+
+        instr = DSCmpstRtnB64Instruction(
+            vdst=RegPair(0),
+            vaddr=RegSingle(2),
+            vdata0=RegPair(0),
+            vdata1=RegPair(4),
+        )
+
+        old_val, new_mem, swapped = self.interp.execute(instr, state)
+
+        self.assertTrue(swapped)
+        self.assertEqual(old_val, initial_val)
+        self.assertEqual(new_mem, new_val)
+        self.assertEqual(state.get_reg_pair(RegPair(0)), initial_val) # Received old_val
+        self.assertEqual(state.get_reg_pair(RegPair(4)), new_val)     # Preserved
+        self.assertEqual(state.get_reg_single(RegSingle(2)), addr)    # Preserved
+        self.assertEqual(state.lds.read_qword(addr), new_val)
+
+    def test_aliasing_vdst_equals_vdata1(self) -> None:
+        # ds_cmpst_rtn_b64 v[0:1], v2, v[4:5], v[0:1]
+        state = ScalarState(lds_size_dwords=1024)
+        addr = 0x80
+        initial_val = 0xAAAA_BBBB_CCCC_DDDD
+        new_val = 0x1234_5678_9ABC_DEF0
+
+        state.lds.write_qword(addr, initial_val)
+        state.set_reg_single(RegSingle(2), addr)
+        state.set_reg_pair(RegPair(4), initial_val)  # v[4:5] is cmp_val
+        state.set_reg_pair(RegPair(0), new_val)      # v[0:1] is new_val and vdst
+
+        instr = DSCmpstRtnB64Instruction(
+            vdst=RegPair(0),
+            vaddr=RegSingle(2),
+            vdata0=RegPair(4),
+            vdata1=RegPair(0),
+        )
+
+        old_val, new_mem, swapped = self.interp.execute(instr, state)
+
+        self.assertTrue(swapped)
+        self.assertEqual(old_val, initial_val)
+        self.assertEqual(new_mem, new_val)
+        self.assertEqual(state.get_reg_pair(RegPair(0)), initial_val)
+        self.assertEqual(state.get_reg_pair(RegPair(4)), initial_val)
+        self.assertEqual(state.lds.read_qword(addr), new_val)
+
+    def test_aliasing_vaddr_overlapping_vdst(self) -> None:
+        # vaddr is v0 (single), vdst is v[0:1] (pair)
+        state = ScalarState(lds_size_dwords=1024)
+        addr = 0x100
+        initial_val = 0x7777_8888_9999_0000
+        new_val = 0x3333_4444_5555_6666
+
+        state.lds.write_qword(addr, initial_val)
+        state.set_reg_single(RegSingle(0), addr)    # v0 has addr
+        state.set_reg_single(RegSingle(1), 0x9999)  # v1 garbage
+        state.set_reg_pair(RegPair(2), initial_val) # cmp_val
+        state.set_reg_pair(RegPair(4), new_val)     # new_val
+
+        instr = DSCmpstRtnB64Instruction(
+            vdst=RegPair(0),
+            vaddr=RegSingle(0),
+            vdata0=RegPair(2),
+            vdata1=RegPair(4),
+        )
+
+        old_val, new_mem, swapped = self.interp.execute(instr, state)
+
+        self.assertTrue(swapped)
+        self.assertEqual(old_val, initial_val)
+        self.assertEqual(new_mem, new_val)
+        # v[0:1] now holds old_val
+        self.assertEqual(state.get_reg_pair(RegPair(0)), initial_val)
+        self.assertEqual(state.lds.read_qword(addr), new_val)
+
+    def test_aliasing_vdata0_equals_vdata1(self) -> None:
+        # vdata0 == vdata1: v[2:3] is both cmp_val and new_val
+        state = ScalarState(lds_size_dwords=1024)
+        addr = 0xC0
+        initial_val = 0xFEED_FACE_CAFE_BEEF
+
+        state.lds.write_qword(addr, initial_val)
+        state.set_reg_single(RegSingle(1), addr)
+        state.set_reg_pair(RegPair(2), initial_val) # cmp_val and new_val
+
+        instr = DSCmpstRtnB64Instruction(
+            vdst=RegPair(4),
+            vaddr=RegSingle(1),
+            vdata0=RegPair(2),
+            vdata1=RegPair(2),
+        )
+
+        old_val, new_mem, swapped = self.interp.execute(instr, state)
+        self.assertTrue(swapped)
+        self.assertEqual(old_val, initial_val)
+        self.assertEqual(new_mem, initial_val)
+        self.assertEqual(state.get_reg_pair(RegPair(4)), initial_val)
+        self.assertEqual(state.get_reg_pair(RegPair(2)), initial_val)
+
+    def test_unreferenced_registers_preservation(self) -> None:
+        state = ScalarState(lds_size_dwords=1024)
+        state.set_reg_single(RegSingle(1), 0x100)
+        state.set_reg_pair(RegPair(2), 0x1111)
+        state.set_reg_pair(RegPair(4), 0x2222)
+
+        for r in range(6, 25):
+            state.set_vgpr(r, 0x8000 + r)
+        for s in range(10):
+            state.set_sgpr(s, 0x9000 + s)
+
+        instr = DSCmpstRtnB64Instruction(
+            vdst=RegPair(0),
+            vaddr=RegSingle(1),
+            vdata0=RegPair(2),
+            vdata1=RegPair(4),
+        )
+        self.interp.execute(instr, state)
+
+        for r in range(6, 25):
+            self.assertEqual(state.get_vgpr(r), 0x8000 + r)
+        for s in range(10):
+            self.assertEqual(state.get_sgpr(s), 0x9000 + s)
+
+    def test_simd_multi_lane_aliasing(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFFFFFF, lds_size_dwords=1024)
+        simd_interp = SIMDInterpreter()
+
+        # Each lane has vdst == vdata0: v[0:1] is both vdst and cmp_val
+        for lane in range(32):
+            addr = lane * 8
+            val = 0x4000_0000_0000_0000 + lane
+            state.lds.write_qword(addr, val)
+            state.set_lane_vgpr(lane, 2, addr)
+            state.set_lane_u64_vgpr(lane, 0, val) # cmp_val in v[0:1]
+            state.set_lane_u64_vgpr(lane, 4, 0x9000_0000_0000_0000 + lane)
+
+        instr = DSCmpstRtnB64Instruction(
+            vdst=RegPair(0),
+            vaddr=RegSingle(2),
+            vdata0=RegPair(0),
+            vdata1=RegPair(4),
+        )
+
+        results = simd_interp.execute(instr, state)
+
+        for lane in range(32):
+            val = 0x4000_0000_0000_0000 + lane
+            self.assertEqual(results[lane], val)
+            self.assertEqual(state.get_lane_u64_vgpr(lane, 0), val)
+            self.assertEqual(state.lds.read_qword(lane * 8), 0x9000_0000_0000_0000 + lane)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
