@@ -67,6 +67,78 @@ def zlib_page_archive() -> tuple[bytearray, bytes, bytes]:
 
 
 class ResourceChecks(unittest.TestCase):
+    def test_texture_key_matches(self) -> None:
+        tool = Path(__file__).resolve().parents[1] / "tools" / "texture_descriptors.py"
+        key = 0xFEDCBA9876543210
+        with TemporaryDirectory() as directory:
+            first = Path(directory) / "assets.ttpf"
+            second = Path(directory) / "pack" / "assets.ttpf"
+            second.parent.mkdir()
+            for path, keys in ((first, [key - (1 << 32), key, key + 1]),
+                               (second, [key, key, (1 << 64) - 1])):
+                archive = raw_page_archive()
+                struct.pack_into("<4sIII", archive, 256, b"ETPF", 0x27a, len(keys), 0)
+                struct.pack_into("<3Q", archive, 272 + len(keys) * 16, *keys)
+                path.write_bytes(archive)
+
+            def lookup(value: str, *paths: Path) -> subprocess.CompletedProcess[str]:
+                return subprocess.run([sys.executable, "-B", tool, "--lookup-key", value, *paths],
+                                      text=True, capture_output=True)
+
+            for value, expected in (
+                (hex(key), [(second, 0), (second, 1), (first, 1)]),
+                (str(key - (1 << 32)), [(first, 0)]), (hex(key + 1), [(first, 2)]),
+                (str((1 << 64) - 1), [(second, 2)]), ("0", []),
+            ):
+                with self.subTest(value=value):
+                    result = lookup(value, second, first)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads(result.stdout), {"matches": [
+                        {"archive": str(path), "descriptor_index": index} for path, index in expected]})
+            alias = Path(directory) / "alias.ttpf"
+            alias.hardlink_to(first)
+            for value, paths in ((hex(key), [first, first]), (hex(key), [first, alias]),
+                                 ("-1", [first]), (str(1 << 64), [first])):
+                with self.subTest(value=value, paths=len(paths)):
+                    failed = lookup(value, *paths)
+                    self.assertNotEqual(failed.returncode, 0)
+                    self.assertEqual(failed.stdout, "")
+
+    def test_texture_key_table_bounds(self) -> None:
+        from texture_descriptors import descriptor_indices
+
+        # The largest supported descriptor array occupies exactly 1 MiB.
+        count = 65536
+        extent = ((16 + count * 24 + 4095) // 4096) * 4096
+        archive = bytearray(256 + extent)
+        struct.pack_into("<4sIQ4I", archive, 0, b"RDS5", 2, extent, 1, 0,
+                         ((extent // 4096 % 4) << 30) | (len(archive) // 256), extent // 16384)
+        struct.pack_into("<4sIII", archive, 256, b"ETPF", 0x27a, count, 0)
+        keys_start = 272 + count * 16
+        struct.pack_into("<Q", archive, keys_start + (count - 1) * 8, (1 << 64) - 1)
+
+        class KeyTableOnly(io.BytesIO):
+            def read(self, size: int = -1, /) -> bytes:
+                pos = self.tell()
+                if not 0 <= size <= 4096 or not any(
+                    left <= pos <= pos + size <= right for left, right in
+                    ((0, 32), (256, 272), (keys_start, keys_start + count * 8))
+                ):
+                    raise AssertionError("Lookup read outside bounded metadata or key array")
+                return super().read(size)
+
+        self.assertEqual(descriptor_indices(KeyTableOnly(archive), (1 << 64) - 1), [count - 1])
+        for field, value, reason in ((260, 0, "version"), (264, count + 1, "budget")):
+            changed = archive.copy()
+            struct.pack_into("<I", changed, field, value)
+            with self.assertRaisesRegex(ValueError, reason):
+                descriptor_indices(KeyTableOnly(changed), 19)
+        # Descriptor array fits in the first range but its key array ends beyond it.
+        changed = raw_page_archive()
+        struct.pack_into("<II", changed, 260, 0x27a, 171)
+        with self.assertRaisesRegex(ValueError, "key table"):
+            descriptor_indices(io.BytesIO(changed), 19)
+
     def test_verified_zlib_segment(self) -> None:
         tool = Path(__file__).resolve().parents[1] / "tools" / "texture_descriptors.py"
         archive, packed, plain = zlib_page_archive()
@@ -195,6 +267,54 @@ class ResourceChecks(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "mapping budget"):
             raw_page_map(io.BytesIO(changed), 0)
 
+    def test_raw_page_declared_padding(self) -> None:
+        archive = raw_page_archive()
+        padding = 1280
+        archive[12800:12800] = bytes(padding)
+        struct.pack_into("<I", archive, 36, padding << 20)
+        # The following range's field is different. Keep its virtual position.
+        struct.pack_into("<II", archive, 40, (7 << 26) | 55, (20 << 20) | 1)
+        struct.pack_into("<I", archive, 48, (1 << 30) | 69)
+
+        class PaddingOnly(io.BytesIO):
+            readable_padding = padding
+
+            def read(self, size: int = -1, /) -> bytes:
+                pos = self.tell()
+                if not (0 <= size and (pos + size <= 56 or 256 <= pos <= pos + size <= 288 or
+                                       12800 <= pos <= pos + size <= 12800 + self.readable_padding)):
+                    raise AssertionError("Raw page mapping read outside metadata and declared padding")
+                return super().read(min(size, 7))
+
+        self.assertEqual(raw_page_map(PaddingOnly(archive), 0).file_offset, 8704)
+
+        class TruncatedPadding(PaddingOnly):
+            def read(self, size: int = -1, /) -> bytes:
+                if self.tell() >= 12800:
+                    size = min(size, 12800 + padding - 1 - self.tell())
+                return super().read(size)
+
+        with self.assertRaisesRegex(ValueError, "Truncated segment"):
+            raw_page_map(TruncatedPadding(archive), 0)
+        for label, offset, value in (
+            ("nonzero first padding byte", 12800, b"x"),
+            ("nonzero last padding byte", 12800 + padding - 1, b"y"),
+            ("wrong boundary's count", 36, struct.pack("<I", 20 << 20)),
+            ("truncated count", 36, bytes(4)),
+        ):
+            with self.subTest(label=label):
+                changed = archive.copy()
+                changed[offset:offset + len(value)] = value
+                with self.assertRaises(ValueError):
+                    raw_page_map(PaddingOnly(changed), 0)
+
+        # The preexisting equal-size mapping uses the range lengths alone.
+        unchanged_size = raw_page_archive()
+        struct.pack_into("<I", unchanged_size, 36, 0xe00 << 20)
+        equal_range = PaddingOnly(unchanged_size)
+        equal_range.readable_padding = 0
+        self.assertEqual(raw_page_map(equal_range, 0).file_offset, 8704)
+
     def test_raw_page_map_across_boundary_batches(self) -> None:
         # Boundary 511 ends the first 4 KiB batch; boundary 512 ends its interval.
         count = 513
@@ -232,6 +352,48 @@ class ResourceChecks(unittest.TestCase):
                 {"width": 44, "height": 12, "dxgi_format": 99, "mip_marker": 2, "count": 257},
             ],
         })
+
+    def test_texture_descriptor_detail_command(self) -> None:
+        tool = Path(__file__).resolve().parents[1] / "tools" / "texture_descriptors.py"
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "synthetic.ttpf"
+            path.write_bytes(descriptor_archive())
+            command = [sys.executable, "-B", tool, path, "--descriptor"]
+            result = subprocess.run([*command, "257"], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), {
+                "descriptor_index": 257, "width": 12, "height": 44,
+                "dxgi_format": 71, "mip_marker": 0, "logical_offset": 8192,
+            })
+            for index in ("-1", "258"):
+                with self.subTest(index=index):
+                    result = subprocess.run([*command, index], capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn("Descriptor index outside the ETPF table", result.stderr)
+                    self.assertEqual(result.stdout, "")
+
+    def test_texture_descriptor_detail_read_scope(self) -> None:
+        from texture_descriptors import describe_descriptor
+
+        index = 12
+        record = 272 + 16 * index
+
+        class SelectedRecordOnly(ShortReadStream):
+            def read(self, size: int = -1, /) -> bytes:
+                start = self.tell()
+                if not any(left <= start <= start + size <= right for left, right in
+                           ((0, 40), (256, 272), (record, record + 16))):
+                    raise AssertionError(f"Unexpected read of {size} bytes at {start}")
+                return super().read(size)
+
+        archive = descriptor_archive()
+        self.assertEqual(describe_descriptor(SelectedRecordOnly(archive), index), {
+            "descriptor_index": index, "width": 44, "height": 12,
+            "dxgi_format": 99, "mip_marker": 2, "logical_offset": 12288,
+        })
+        struct.pack_into("<I", archive, record + 8, 4)
+        with self.assertRaisesRegex(ValueError, "outside the declared logical archive"):
+            describe_descriptor(SelectedRecordOnly(archive), index)
 
     def test_texture_descriptor_bounds(self) -> None:
         for label, offset, replacement in (
@@ -306,9 +468,11 @@ class ResourceChecks(unittest.TestCase):
 
     def test_invalid_segments(self):
         packet = zlib.compress(b"page")
-        for payload, count in ((packet[:-1], 4), (packet + b"extra", 4), (packet, 2), (packet, 8)):
+        intact_reader = PagedResource(io.BytesIO(packet), [Segment(0, len(packet), 4, "zlib")])
+        self.assertEqual(intact_reader.read(0, 4), b"page")
+        for payload, count in ((packet[:-1], 4), (packet + b"extra", 4), (packet, 2), (packet, 8), (b"not zlib", 4)):
             reader = PagedResource(io.BytesIO(payload), [Segment(0, len(payload), count, "zlib")])
-            with self.assertRaises(ValueError):
+            with self.assertRaisesRegex(ValueError, "Invalid compressed segment or decoded extent"):
                 reader.read(0, 1)
         for seg in (Segment(0, 1, 2, "raw"), Segment(2, 1, 1, "raw"), Segment(-1, 1, 1, "raw")):
             with self.assertRaises(ValueError):
