@@ -668,6 +668,84 @@ void test_query_state() {
     }
 }
 
+// D3D-399: the single-list replay() takes a list whose occlusion or statistics queries overlap when
+// ReplayFunctions::segment_pool is set, planning it as the batched path does, and still refuses it without one.
+void test_single_list_overlap() {
+    constexpr VkDeviceSize arena_offset = 40;
+    constexpr VkDeviceSize resource_bytes = 1024;
+    constexpr VkDeviceSize occlusion_offset = 0;
+    constexpr VkDeviceSize statistics_offset = 64;
+    MockReplay c;
+    auto vk = c.replay_functions();
+    ResourceBinding dst{};
+    dst.buffer = handle<VkBuffer>(1);
+    dst.buffer_offset = arena_offset;
+    dst.size = resource_bytes;
+    dst.host_readable = true;
+    c.buffers[dst.buffer].assign(arena_offset + resource_bytes, guard_byte);
+    auto resource = [&](ResourceId id) -> const ResourceBinding* {
+        return id == 1 ? &dst : nullptr;
+    };
+    QueryPool heap{handle<VkQueryPool>(2), d3d12_query_heap::occlusion, 2, true, std::vector<bool>(2), {}};
+    QueryPool stat{handle<VkQueryPool>(3), d3d12_query_heap::pipeline_statistics, 2, false, std::vector<bool>(2), {}};
+    c.values[heap.pool].resize(2);
+    c.values[stat.pool].resize(2);
+    c.statistics_pools.insert(stat.pool);
+    vk.query_pool = [&](QueryHeapId id) -> QueryPool* {
+        return id == 1 ? &heap : id == 2 ? &stat : nullptr;
+    };
+    // Query 0 begins, query 1 begins, query 0 ends, query 1 ends, then both are resolved in the same list.
+    auto overlapping = [](CommandList& list, QueryHeapId id, std::uint32_t type, VkDeviceSize offset) {
+        return list.begin_query({id, type, 0}) && list.begin_query({id, type, 1}) && list.end_query({id, type, 0})
+               && list.end_query({id, type, 1}) && list.resolve_queries({id, type, 0, 2, 1, offset}) && list.close();
+    };
+    CommandList occlusion, statistics;
+    expect(overlapping(occlusion, 1, d3d12_query::occlusion, occlusion_offset), "record overlapping occlusion");
+    expect(overlapping(statistics, 2, d3d12_query::pipeline_statistics, statistics_offset),
+           "record overlapping statistics");
+
+    // Without the callback, both lists are refused before anything is recorded, as before D3D-399.
+    const auto untouched = c.events.size();
+    expect(replay(occlusion, {}, resource, vk) == ReplayResult::unsupported
+           && replay(statistics, {}, resource, vk) == ReplayResult::unsupported && c.events.size() == untouched,
+           "no segment_pool: overlapping queries refused, nothing emitted");
+
+    // A callback that can't make a pool refuses the list too.
+    vk.segment_pool = [](VkQueryType, std::uint32_t) { return std::shared_ptr<OcclusionSegmentPool>(); };
+    expect(replay(occlusion, {}, resource, vk) == ReplayResult::unsupported && c.events.size() == untouched,
+           "null segment pool refused");
+
+    std::vector<std::pair<VkQueryType, std::uint32_t>> made;
+    std::vector<std::shared_ptr<OcclusionSegmentPool>> kept;   // the caller keeps them until the GPU is done
+    vk.segment_pool = [&](VkQueryType type, std::uint32_t count) {
+        auto pool = make_segment_pool(30 + static_cast<unsigned>(made.size()));
+        c.values[pool->pool].resize(count);
+        if (type == VK_QUERY_TYPE_PIPELINE_STATISTICS) c.statistics_pools.insert(pool->pool);
+        made.emplace_back(type, count);
+        kept.push_back(pool);
+        return pool;
+    };
+    // MockReplay::begin_query fails on two active queries in one pool, so success also means the overlap was split.
+    expect(replay(occlusion, {}, resource, vk) == ReplayResult::success, "replay overlapping occlusion");
+    expect(made.size() == 1 && made[0].first == VK_QUERY_TYPE_OCCLUSION && made[0].second == 3,
+           "three physical occlusion segments");
+    const auto& o = c.values.at(kept[0]->pool);
+    expect(c.word(dst.buffer, arena_offset + occlusion_offset) == o[0][0] + o[1][0]
+           && c.word(dst.buffer, arena_offset + occlusion_offset + word_size) == o[1][0] + o[2][0],
+           "each occlusion result is the sum of its segments");
+
+    expect(replay(statistics, {}, resource, vk) == ReplayResult::success, "replay overlapping statistics");
+    expect(made.size() == 2 && made[1].first == VK_QUERY_TYPE_PIPELINE_STATISTICS && made[1].second == 3,
+           "three physical statistics segments");
+    const auto& s = c.values.at(kept[1]->pool);
+    for (unsigned j = 0; j < statistics_counters; ++j) {
+        expect(c.word(dst.buffer, arena_offset + statistics_offset + word_size * j) == s[0][j] + s[1][j]
+               && c.word(dst.buffer, arena_offset + statistics_offset + statistics_size + word_size * j)
+                      == s[1][j] + s[2][j],
+               "each statistics counter is the sum of its segments");
+    }
+}
+
 void test_predicated_copies() {
     constexpr VkDeviceSize source_arena = 32;
     constexpr VkDeviceSize destination_arena = 40;
@@ -1022,6 +1100,7 @@ int main() {
     const TestCase cases[] = {
         {"helper chunk boundaries", test_helper_chunks},
         {"query boundaries and persistent state", test_query_state},
+        {"single-list replay of overlapping queries", test_single_list_overlap},
         {"predication and recording checks", test_predicated_copies},
         {"queue segment allocation and failed submit", test_queue_segments},
     };

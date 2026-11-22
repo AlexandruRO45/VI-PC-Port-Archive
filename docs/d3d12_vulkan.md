@@ -2369,12 +2369,19 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   after a host `vkResetEvent` once the submission completes. `d3d12_vulkan_device` checks the same list (timestamp,
   clear, copy, timestamp, resolve) and a resolve in the next execution with no wait between them. Under Wine
   (CrossOver 26.3, MoltenVK 1.4.3) the first case failed every run before this change (`t1` read 0).
+- **Overlapping queries in the single-list `replay()` helper (D3D-399).** It has no queue to own query pools, so it
+  asks the caller: `ReplayFunctions::segment_pool(type, count)` returns a pool of `count` physical segments
+  (`VK_QUERY_TYPE_OCCLUSION`, or `VK_QUERY_TYPE_PIPELINE_STATISTICS` with the 11 D3D12 counters). With it, a list
+  whose occlusion kinds or statistics queries overlap is planned as the batched path plans it, and statistics
+  segments are used when `sum_statistics` is set too. `replay()` doesn't keep the pools past its return: the caller
+  keeps the pointer its callback returned until the command buffer completes. A split result whose summation helper
+  (`sum_occlusion`, `sum_statistics`, `sum_binary_occlusion`) is unset makes `replay()` refuse the list. Without
+  the callback, or when it returns null, such a list is still refused with `ReplayResult::unsupported`, before
+  anything is recorded. `replay_query_edges_test` checks overlapping occlusion and overlapping statistics through
+  `replay()`: refused without the callback, three physical segments each with it, and every result equal to the
+  sum of its segments.
 
 Not implemented yet:
-
-- **Overlapping queries in the single-list `replay()` helper.** It has no segment pool, so a list whose occlusion
-  kinds or statistics queries overlap each other is refused there with `ReplayResult::unsupported`; the batched
-  path above replays them.
 - Stream-output and mesh-shader statistics. (`GetClockCalibration` is implemented: see section 4.4, "Fences,
   queues and frames in flight".)
 - Xbox-specific query heap types (if any) are **Open**; unknown types are logged.

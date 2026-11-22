@@ -835,6 +835,12 @@ struct ReplayFunctions {
     // rendering: a binary query split over physical segments because it overlaps other occlusion queries (D3D-252).
     std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t first, std::uint32_t count,
                        VkBuffer dst, VkDeviceSize offset)> sum_binary_occlusion;
+    // Optional, for the single-list replay(): creates a query pool of `count` physical segments, of type
+    // VK_QUERY_TYPE_OCCLUSION or VK_QUERY_TYPE_PIPELINE_STATISTICS (the 11 D3D12 counters, pipelineStatistics 0x7ff),
+    // for a list whose occlusion or statistics queries overlap (D3D-252, D3D-399). The batched path makes its own.
+    // replay() does not keep the pool past its return: the caller keeps the returned pointer until the command
+    // buffer has completed. Without it, or when it returns null, replay() refuses such a list as unsupported.
+    std::function<std::shared_ptr<OcclusionSegmentPool>(VkQueryType type, std::uint32_t count)> segment_pool;
     // VK_EXT_debug_utils, set only when the instance enabled it; debug markers are skipped without them.
     PFN_vkCmdInsertDebugUtilsLabelEXT insert_label = nullptr;
     PFN_vkCmdBeginDebugUtilsLabelEXT begin_label = nullptr;
@@ -2147,8 +2153,8 @@ inline void plan_statistics_segments(PreparedList& out) {
 }
 
 // Overlapping pipeline-statistics queries (D3D-252): the same physical-segment layout the occlusion planner
-// builds, in the statistics pool. Each Begin and End of a statistics query — and every non-timestamp resolve
-// while one runs, because its helper dispatch would be counted — closes the one open physical query and opens
+// builds, in the statistics pool. Each Begin and End of a statistics query â€” and every non-timestamp resolve
+// while one runs, because its helper dispatch would be counted â€” closes the one open physical query and opens
 // a new one, so each logical query keeps a contiguous slot range and its result is the sum of that range
 // (statistics_sum.comp). A Begin or End of another query kind leaves the segments alone.
 inline ReplayResult plan_overlapping_statistics_segments(PreparedList& out) {
@@ -3699,11 +3705,28 @@ ReplayResult replay(const CommandList& list, VkCommandBuffer command_buffer, Res
                     const ReplayFunctions& vk, LayoutTracker* tracker = nullptr) {
     if (tracker && tracker->separate_depth_stencil_layouts() != vk.separate_depth_stencil_layouts)
         return ReplayResult::unsupported;
+    // Overlapping queries need physical segment pools, which only `vk.segment_pool` can make here (D3D-399). With it,
+    // the list is planned as the batched path plans it; statistics segments also need the summation helper.
+    const bool pools = static_cast<bool>(vk.segment_pool);
+    const bool statistics_helpers = pools && static_cast<bool>(vk.sum_statistics);
     PreparedList prepared;
-    if (const auto result = prepare(list, resolve, vk, prepared); result != ReplayResult::success) return result;
+    if (const auto result = prepare(list, resolve, vk, prepared, statistics_helpers); result != ReplayResult::success)
+        return result;
     if (tracker && zero_clear_unavailable(prepared, vk, *tracker)) return ReplayResult::unsupported;
+    std::shared_ptr<OcclusionSegmentPool> segments, statistics;
+    if (pools && prepared.segment_count &&
+        !(segments = vk.segment_pool(VK_QUERY_TYPE_OCCLUSION, prepared.segment_count)))
+        return ReplayResult::unsupported;
+    if (statistics_helpers && prepared.statistics_segment_count &&
+        !(statistics = vk.segment_pool(VK_QUERY_TYPE_PIPELINE_STATISTICS, prepared.statistics_segment_count)))
+        return ReplayResult::unsupported;
     QueryReplay queries;
-    if (const auto result = queries.plan(prepared); result != ReplayResult::success) return result;
+    if (const auto result = queries.plan(prepared, segments, 0, pools, statistics, 0); result != ReplayResult::success)
+        return result;
+    // A split result is summed by a helper; refuse the list if the one it needs is missing.
+    if ((queries.needs_sum && !vk.sum_occlusion) || (queries.needs_statistics_sum && !vk.sum_statistics) ||
+        (queries.needs_sum_binary && !vk.sum_binary_occlusion))
+        return ReplayResult::unsupported;
     emit(prepared, command_buffer, vk, tracker);
     queries.commit();  // the caller owns submission of the legacy command buffer
     return ReplayResult::success;
