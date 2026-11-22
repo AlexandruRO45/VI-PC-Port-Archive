@@ -376,11 +376,23 @@ def files_of(path):
     return [os.path.join(path, n) for n in sorted(os.listdir(path)) if n.endswith(".dxbc")]
 
 
+def positive_int(text: str) -> int:
+    """--limit: at least 1. The loop tests the count after the row it just appended, so a 0 or negative limit used to
+    report one shader instead of refusing a count that cannot mean what it says."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Decode PS interpolation modes (PSV0 + FSSM + disasm).")
     ap.add_argument("path", help="a .dxbc file or a directory of them")
     ap.add_argument("--json", action="store_true", help="print one JSON document")
-    ap.add_argument("--limit", type=int, default=None, help="stop after this many pixel shaders")
+    ap.add_argument("--limit", type=positive_int, default=None, help="stop after this many pixel shaders")
     args = ap.parse_args(argv)
 
     if not os.path.exists(args.path):

@@ -280,5 +280,31 @@ class CliTest(unittest.TestCase):
         self.assertIn("does not exist", out.stderr)
 
 
+class LimitTest(unittest.TestCase):
+    def test_a_limit_below_one_is_refused(self):
+        # --limit 0 and --limit -1 kept exactly one shader: the limit was tested after the row was appended, so a
+        # count that cannot mean what its help says reported one shader and exited 0.
+        container = dxbc_container({b"PSV0": psv0([(0, 4, 0, 3, 2)])})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "a.dxbc")
+            with open(path, "wb") as f:
+                f.write(container)
+
+            def run(*extra):
+                return subprocess.run([sys.executable, "-I", TOOL, path, "--json", *extra],
+                                      capture_output=True, text=True)
+
+            one = run("--limit", "1")
+            self.assertEqual(one.returncode, 0, one.stderr)
+            self.assertEqual(len(json.loads(one.stdout)["files"]), 1)
+            self.assertEqual(len(json.loads(run().stdout)["files"]), 1, "no --limit still scans every shader")
+            for bad in ("0", "-1", "-5"):
+                with self.subTest(limit=bad):
+                    r = run("--limit", bad)
+                    self.assertEqual(r.returncode, 2, f"--limit {bad}: {r.returncode} {r.stdout!r} {r.stderr!r}")
+                    self.assertIn("must be at least 1", r.stderr)
+                    self.assertEqual(r.stdout, "")
+
+
 if __name__ == "__main__":
     unittest.main()
