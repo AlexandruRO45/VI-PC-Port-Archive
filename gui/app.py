@@ -9,7 +9,7 @@ import time
 import webbrowser
 
 from PySide6.QtCore import QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QFont, QFontDatabase, QIcon, QPixmap
+from PySide6.QtGui import QFont, QFontDatabase, QIcon, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QStackedWidget,
     QVBoxLayout,
@@ -358,6 +359,12 @@ class LeonidaWindow(QMainWindow):
             sb_layout.addWidget(btn)
 
         sb_layout.addStretch()
+        fs_btn = QPushButton("F11 · Fullscreen")
+        fs_btn.setProperty("secondary", True)
+        fs_btn.setCursor(Qt.PointingHandCursor)
+        fs_btn.clicked.connect(self.toggle_fullscreen)
+        sb_layout.addWidget(fs_btn)
+
         legal = QLabel(tr(self.lang, "legal_notice"))
         legal.setWordWrap(True)
         legal.setStyleSheet("font-size: 11px; color: #6f7c9b; padding: 8px; background: #0a0d16; border-radius: 8px;")
@@ -375,7 +382,19 @@ class LeonidaWindow(QMainWindow):
         main_layout.addWidget(self.pages, 1)
 
         self._refresh_disk_label()
+        QShortcut(QKeySequence("F11"), self, activated=self.toggle_fullscreen)
+        QShortcut(QKeySequence("Escape"), self, activated=self._exit_fullscreen)
         QTimer.singleShot(250, self.open_setup_wizard)
+
+    def toggle_fullscreen(self) -> None:
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
+
+    def _exit_fullscreen(self) -> None:
+        if self.isFullScreen():
+            self.showNormal()
 
     def open_setup_wizard(self) -> None:
         dlg = SetupDialog(
@@ -455,6 +474,7 @@ class LeonidaWindow(QMainWindow):
         grid.addWidget(QLabel(tr(self.lang, "work_folder")), 2, 0)
         grid.addWidget(self.work_edit, 2, 1, 1, 2)
         grid.addWidget(btn_work, 2, 3)
+        grid.setColumnStretch(1, 1)
 
         pc.addLayout(grid)
         self.disk_label = QLabel("")
@@ -512,8 +532,9 @@ class LeonidaWindow(QMainWindow):
 
         self.mini_log = QPlainTextEdit()
         self.mini_log.setReadOnly(True)
-        self.mini_log.setMaximumHeight(165)
-        ac.addWidget(self.mini_log)
+        self.mini_log.setMinimumHeight(140)
+        self.mini_log.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        ac.addWidget(self.mini_log, 1)
         lay.addWidget(act_card, 1)
         return page
 
@@ -624,6 +645,7 @@ class LeonidaWindow(QMainWindow):
 
         grid.addWidget(QLabel(tr(self.lang, "lang_label")), 3, 0)
         grid.addWidget(self.lang_combo, 3, 1, 1, 2)
+        grid.setColumnStretch(1, 1)
         c.addLayout(grid)
 
         self.cb_full_check = QCheckBox("--full-check (SHA-256)")

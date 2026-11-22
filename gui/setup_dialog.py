@@ -101,7 +101,14 @@ class SetupDialog(QDialog):
         self.last_report: dict | None = None
 
         self.setWindowTitle(f"{APP_NAME} — {tr(lang, 'setup_title')}")
-        self.resize(780, 620)
+        self.setWindowFlags(
+            Qt.Window
+            | Qt.WindowTitleHint
+            | Qt.WindowSystemMenuHint
+            | Qt.WindowMinMaxButtonsHint
+            | Qt.WindowCloseButtonHint
+        )
+        self.resize(820, 640)
         self.setMinimumSize(640, 500)
 
         lay = QVBoxLayout(self)
@@ -136,9 +143,9 @@ class SetupDialog(QDialog):
 
         self.log_box = QPlainTextEdit()
         self.log_box.setReadOnly(True)
-        self.log_box.setMaximumHeight(130)
+        self.log_box.setMinimumHeight(110)
         self.log_box.setVisible(False)
-        lay.addWidget(self.log_box)
+        lay.addWidget(self.log_box, 1)
 
         btn_row = QHBoxLayout()
         self.btn_install = QPushButton(tr(lang, "setup_install_btn"))
