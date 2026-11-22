@@ -15,6 +15,7 @@
 #include "../shims/d3d12_xs_device.h"
 #include "d3d12_copy_compare.h"  // D3D-46: copies compared with the host runtime
 #include "d3d12_depth24_compare.h"  // D24 clears compared with the host runtime
+#include "d3d12_options_size_check.h"  // CheckFeatureSupport(D3D12_OPTIONS) with the console's larger structure
 #include "../src/vulkan_memory.h"  // D3D-96: resizable_bar
 
 #include <dxgi1_4.h>
@@ -5539,6 +5540,10 @@ int main() {
         if (fence_mismatches < 0)
             std::printf("Fences: no host D3D12 device to compare with, skipped\n");
         EXPECT(fence_mismatches <= 0);
+        // The console asks for D3D12_OPTIONS with 0x40 bytes where the PC structure has 0x3C: the Vulkan device and
+        // the proxy over it answer with the PC fields and zeros after them, and keep refusing a smaller size.
+        EXPECT(optsize::check(inner, "Vulkan device") == 0);
+        EXPECT(optsize::check(device.p, "proxy over the Vulkan device") == 0);
 
         // D3D-236: CreateCommandQueue with D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME requires
         // SeIncreaseBasePriorityPrivilege enabled in the token, matching the Windows D3D12 runtime.
@@ -7035,6 +7040,7 @@ int main() {
     {
         Ref<ID3D12Device> standalone;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&standalone.p))));
+        EXPECT(optsize::check(standalone.p, "standalone Vulkan device") == 0);
         // What translated shaders can declare beyond Int64/Float64 (the index's `features`) is enabled wherever the GPU
         // has it: image stores and loads without a format, gather offsets, LOD clamps, a vertex shader's layer and
         // viewport. Creating a module that declares one without it breaks VUID-VkShaderModuleCreateInfo-pCode-08740.
