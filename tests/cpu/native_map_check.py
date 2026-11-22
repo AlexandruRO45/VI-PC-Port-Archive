@@ -276,23 +276,23 @@ kernel.VirtualAlloc.restype = ctypes.c_void_p
 kernel.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD]
 
 
-def check_reloc_address_zero(mapper, image, provider):
-    """A relocation directory at address 0 is absent whatever its Size, under Windows and pe_map.
-
-    The copy keeps the linked Size. Both loaders must place it away from its reserved preferred base
-    without applying the DIR64 entry: pe_map must not parse the headers at RVA 0 as relocation blocks.
-    """
+def check_reloc_address_zero(mapper, image, provider, *, oversized):
+    """Compare a zero directory RVA with the linked size or a size larger than the image."""
     preferred, _, stored, _ = describe(image)
     (rva, value), = stored.items()
     with pefile.PE(str(image)) as pe:
         relocs = pe.OPTIONAL_HEADER.DATA_DIRECTORY[5]
         address = relocs.get_field_absolute_offset("VirtualAddress")
+        size_field = relocs.get_field_absolute_offset("Size")
         built = relocs.Size
         size = pe.OPTIONAL_HEADER.SizeOfImage
     if not built:
         raise AssertionError(f"{image.name}: fixture must have a relocation directory")
     data = bytearray(image.read_bytes())
     struct.pack_into("<I", data, address, 0)
+    if oversized:
+        built = size + 1
+        struct.pack_into("<I", data, size_field, built)
     bindings = {provider.name.casefold(): ctypes.CDLL(str(provider))}
     with TemporaryDirectory() as temp:
         copy = Path(temp) / image.name
@@ -368,7 +368,8 @@ def main():
     probe = register_probe(str(args.probe))
     check_empty_export_slot(mapper, args.probe)
     check_delay_directory(mapper, args.named[0], args.named[2])
-    check_reloc_address_zero(mapper, args.reloc[0], args.reloc[1])
+    for oversized in (False, True):
+        check_reloc_address_zero(mapper, args.reloc[0], args.reloc[1], oversized=oversized)
     for case, paths, symbol in (("named", args.named, "mix_args"), ("ordinal", args.ordinal, 77)):
         original, lifted, provider, altered = paths
         natives = [("native LoadLibrary", ctypes.CDLL(str(original)).call_mix),
