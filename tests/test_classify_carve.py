@@ -287,9 +287,12 @@ class MainTests(unittest.TestCase):
             handle.write("{")
             raise OSError("synthetic write failure")
 
-        with mock.patch.object(carve.json, "dump", side_effect=fail_dump):
-            with self.assertRaisesRegex(OSError, "write failure"):
-                self.run_main()
+        with mock.patch.object(carve.json, "dump", side_effect=fail_dump), \
+                mock.patch("sys.argv", ["classify_carve.py", self.root]), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(carve.main(), 2)
+        self.assertIn(os.path.join(self.root, "types.json"), err.getvalue())
+        self.assertIn("write failure", err.getvalue())
         self.assertEqual(self.types(), before)
         self.assertEqual(sorted(os.listdir(self.root)), files)
 

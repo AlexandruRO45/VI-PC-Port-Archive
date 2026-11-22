@@ -100,20 +100,26 @@ def main():
         per[name] = {k: entry(v) for k, v in sorted(c.items(), key=lambda kv: -kv[1][1])}
     top = sorted(total.items(), key=lambda kv: -kv[1][1])
     out = {"overall": {k: entry(v) for k, v in top}, "per_archive": per}
-    fd, temp = tempfile.mkstemp(dir=root, prefix=".types-", suffix=".tmp")
+    path = os.path.join(root, "types.json")
+    temp = None
     try:
+        fd, temp = tempfile.mkstemp(dir=root, prefix=".types-", suffix=".tmp")
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
             json.dump(out, f, indent=1)
             f.flush()
             os.fsync(f.fileno())
-        os.chmod(temp, published_mode(os.path.join(root, "types.json")))   # mkstemp creates 0600
-        os.replace(temp, os.path.join(root, "types.json"))
-    except BaseException:
-        try:
-            os.unlink(temp)
-        except OSError:
-            pass
-        raise
+        os.chmod(temp, published_mode(path))   # mkstemp creates 0600
+        os.replace(temp, path)
+        temp = None
+    except OSError as error:
+        print(f"{path}: cannot write: {error.strerror or error}", file=sys.stderr)
+        return 2
+    finally:
+        if temp is not None:
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
     print(f"{'class':24} {'files':>10} {'GiB':>8}")
     for k, v in top[:25]:
         print(f"{k:24} {v[0]:>10} {v[1] / 2**30:8.2f}")
