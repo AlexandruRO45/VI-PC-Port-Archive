@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <utility>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -289,6 +290,7 @@ struct CopyBuffer {
     ResourceId src;
     std::uint64_t src_offset;
     std::uint64_t size;
+    ResourceId tiled_resource = 0;  // CopyTiles uses the padded size of the sparse side
 };
 
 // D3D12_TEXTURE_COPY_LOCATION: a texture subresource, or a placed footprint in a buffer. The footprint's format is
@@ -930,6 +932,12 @@ private:
     bool append(const Command& command) {
         if (closed_) return false;
         commands_.push_back(command);
+        return true;
+    }
+    // The recording calls pass a temporary: moved, so a command's rectangles are not copied a second time.
+    bool append(Command&& command) {
+        if (closed_) return false;
+        commands_.push_back(std::move(command));
         return true;
     }
 
