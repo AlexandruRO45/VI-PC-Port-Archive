@@ -41,6 +41,22 @@ RAMP = (0, 16, 37, 64, 101, 153, 219, 254)
 # about the console; binary16 and binary64 denormal behavior is established separately, not here.
 F32_DENORM_MODE = "preserve"
 
+# Integer-to-binary32 references convert through Python's binary64 float, which holds every 32-bit
+# integer exactly, then pack to binary32, rounding ties to even. The Scarlett pipeline's MODE.FP_ROUND
+# is unmeasured, so this records the harness's assumption the same way F32_DENORM_MODE records its
+# denormal assumption: an adapter disagreeing on a row would be recorded as a mismatch, not chosen.
+F32_ROUND_ASSUMPTION = "nearest-even"
+
+
+def u32f(word):
+    """Reference for v_cvt_f32_u32_e32: read the word as unsigned and round to binary32."""
+    return struct.unpack("<f", struct.pack("<f", float(word)))[0]
+
+
+def i32f(word):
+    """Reference for v_cvt_f32_i32_e32: sign-extend the word, then convert as u32f does."""
+    return u32f(word - 2**32 if word & 0x80000000 else word)
+
 
 def assembly(swap):
     red, blue = ("v14", "v12") if swap else ("v12", "v14")
@@ -1320,6 +1336,20 @@ def check_controls(directory):
     assert body.count("widen16(asuint(") == 4 and "(-abs(widen16(" in body, body
     must_reject(translate, with_constants(["v_cvt_f32_f16_e32 v12, 1.0"]))
     must_reject(translate, with_constants(["v_cvt_f32_f16_sdwa v12, s44 src0_sel:WORD_1"]))
+    # v_cvt_f32_u32_e32/v_cvt_f32_i32_e32 lower only the plain e32 encoding of the word conversions.
+    program = uncompressed_export(cvt_int_body(0xFFFFFFFF, 0x80000000))
+    body = translate(program).split("float4 main", 1)[1]
+    assert body.count("float(asuint(") == 2 and body.count("float(asint(") == 2, body
+    modern = [line.replace("exp mrt0 ", "exp mrt0, ") for line in program]
+    assert modern != program and translate(modern) == translate(program)
+    wait = program.index("s_waitcnt lgkmcnt(0)", program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc"))
+    must_reject(translate, program[:wait] + ["v_cvt_f32_u32_e32 v19, s45"] + program[wait:])
+    for bad in ("v_cvt_f32_u32_e64 v12, s44", "v_cvt_f32_i32_e64 v12, s44",
+                "v_cvt_f32_u32_e64 v12, |s44|", "v_cvt_f32_i32_e64 v12, -s44",
+                "v_cvt_f32_u32_e64 v12, s44 clamp", "v_cvt_f32_i32_e64 v12, s44 omod:2",
+                "v_cvt_f32_u32_dpp v12, v13 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+                "v_cvt_f32_i32_sdwa v12, v13 dst_sel:DWORD src0_sel:DWORD"):
+        must_reject(translate, with_constants([bad]))
     archive = directory / "input.bin"
     code = bytes.fromhex("000080bf 000081bf")  # s_nop 0 followed by s_endpgm
     check_container_selector(directory, code)
@@ -1619,6 +1649,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((dual_program(swap_weights=True), translate_dual))
     fixtures.append((with_constants(LITERAL_FMA_BODY), translate))
     fixtures.append((scheduling_hints(), translate))
+    fixtures.append((uncompressed_export(cvt_int_body(0xFFFFFFFF, 0x80000000)), translate))
     for index, (instructions, lower_fixture) in enumerate(fixtures):
         source = directory / "fixture.s"
         obj = directory / "fixture.o"
@@ -1785,6 +1816,56 @@ def check_integer_readback_draw(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("A corrupted expected word escaped the integer readback")
+
+
+# v_cvt_f32_u32_e32 and v_cvt_f32_i32_e32 convert one 32-bit word to binary32, reading it unsigned
+# or two's-complement. The inputs are shader literals moved through v_mov_b32 bit copies, not
+# constant-buffer words (#360): the pairs cover zero and one, the last exactly representable integer
+# 2**24, the ties 2**24+1 and 2**25+2, the non-tie neighbors 2**25+1 and 2**25+3 of a midpoint, and
+# the extreme words 0xFFFFFFFF, 0x80000000 and 0x7FFFFFFF.
+CVT_INT_WORDS = (
+    (0, 1),
+    (2**24, 2**24 + 1),
+    (2**25 + 1, 2**25 + 3),
+    (2**25 + 2, 0x7FFFFFFF),
+    (0xFFFFFFFF, 0x80000000),
+)
+
+
+def cvt_int_body(w0, w1, *, swap=False):
+    """Convert each literal word twice: unsigned into the lower channel of its pair, signed into the
+    upper. Swapping the conversions changes every channel whose word has the sign bit set."""
+    unsigned, signed = ("i32", "u32") if swap else ("u32", "i32")
+    body = []
+    for dst, word in ((12, w0), (13, w0), (14, w1), (15, w1)):
+        op = unsigned if dst % 2 == 0 else signed
+        body += [f"v_mov_b32_e32 v{dst}, {word:#x}", f"v_cvt_f32_{op}_e32 v{dst}, v{dst}"]
+    return body
+
+
+def check_cvt_int_f32_draw(directory, compiler, renderer, backend):
+    source = directory / "cvt_int_f32.hlsl"
+    shader = directory / "cvt_int_f32.cso"
+    case = directory / "cvt_int_f32.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    constants = bytes(256)
+    # The tie words sit exactly between two representable values and must round to the even one;
+    # a half-up or half-away rule would export a different word, so the rows discriminate rounding.
+    assert (u32f(2**24 + 1), u32f(2**25 + 2)) == (2.0**24, 2.0**25)
+    for w0, w1 in CVT_INT_WORDS:
+        program = uncompressed_export(cvt_int_body(w0, w1))
+        source.write_text(translate(program), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        write_case(case, constants, (u32f(w0), i32f(w0), u32f(w1), i32f(w1)))
+        subprocess.run(draw, check=True)
+    # The last pair's words all have the sign bit set, so swapping the two conversions must be caught.
+    w0, w1 = CVT_INT_WORDS[-1]
+    assert u32f(w0) != i32f(w0) and u32f(w1) != i32f(w1)
+    source.write_text(translate(uncompressed_export(cvt_int_body(w0, w1, swap=True))), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Swapping the unsigned and signed conversions escaped detection")
 
 
 def check_render(directory, compiler, renderer, backend):
@@ -1955,6 +2036,7 @@ def check_render(directory, compiler, renderer, backend):
     check_denorm_mode_draw(directory, compiler, renderer, backend)
     check_nan_class_draw(directory, compiler, renderer, backend)
     check_integer_readback_draw(directory, compiler, renderer, backend)
+    check_cvt_int_f32_draw(directory, compiler, renderer, backend)
     return 0
 
 
