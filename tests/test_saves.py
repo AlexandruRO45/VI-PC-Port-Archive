@@ -359,7 +359,8 @@ class AtomicPackTest(unittest.TestCase):
                     self.symlink(spelling, link)
                     quiet(saves.pack, self.extracted, link)
                     self.assertTrue(os.path.islink(link))
-                    self.assertEqual(os.readlink(link), spelling)
+                    # Windows reads an absolute link back as \\?\C:\...; the spelling is the same link.
+                    self.assertEqual(os.readlink(link).removeprefix("\\\\?\\"), spelling)
                     self.assertEqual(rd(target), self.new)
                     self.assertEqual(os.listdir(target_dir), ["save.jsav"])
 
