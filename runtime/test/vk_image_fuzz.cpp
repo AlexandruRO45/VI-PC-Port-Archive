@@ -203,6 +203,12 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &props12};
     vkGetPhysicalDeviceProperties2(pd, &props);
     std::printf("device: %s%s\n", props.properties.deviceName, validation ? " (validation on)" : "");
+    constexpr uint32_t push_bytes = 36 * sizeof(uint32_t);
+    if (props.properties.limits.maxPushConstantsSize < push_bytes) {
+        std::printf("unsupported: need %u push constant bytes, device has %u\n",
+                    push_bytes, props.properties.limits.maxPushConstantsSize);
+        return unsupported;   // a device limit, not a wrong result: the pipeline layout wants 144 bytes (D3D-14)
+    }
     const bool integer = spec.format == VK_FORMAT_R8G8B8A8_UINT || spec.format == VK_FORMAT_R8G8B8A8_SINT;
     VkFormatProperties format_props{};
     vkGetPhysicalDeviceFormatProperties(pd, spec.format, &format_props);
