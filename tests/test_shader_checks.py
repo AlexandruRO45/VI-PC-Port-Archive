@@ -29,11 +29,11 @@ WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n
 
 
 # All check.py cases, including the four vk_store_test shaders and the three mesh fixtures, and TEST-184's
-# vk_store_test "words" fixtures and image_get_lod draws.
+# vk_store_test "words" fixtures, image_get_lod draws and the MIMG sample, gather and load frames (+ ps_sample_c_lz_o).
 TOTAL = (len(check.COMPUTE) + 5 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 4
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
-         + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
+         + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS) + len(check.MIMG_TESTS) + 1
          + len(check.TEXTURE_CONSTANTS) + 10)  # three mesh fixtures, ps_tex, ps_imgatomic, four compute fixtures and
          # ps_ssharp
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
@@ -156,6 +156,7 @@ class Wave64Checks(unittest.TestCase):
                   patch.object(check, "texture_gradient_a16_test", return_value=""),
                   patch.object(check, "texture_constant_test", return_value=""),
                   patch.object(check, "get_lod_test", return_value=""),
+                  patch.object(check, "mimg_test", return_value=""),
                   patch.object(check, "sampler_test", return_value=""),
                   contextlib.redirect_stdout(output)):
                 status = check.main()
@@ -560,6 +561,38 @@ class StoreWordsChecks(unittest.TestCase):
             self.assertNotIsInstance(failure, check.Skip)
             self.assertIn("exit 1", failure)
             self.assertEqual(check.store_words_test("tools", tmp, "cs_resinfo"), "missing cs_resinfo.spv")
+
+
+class MimgChecks(unittest.TestCase):
+    """image_sample_l, image_sample_b_o, image_load_mip, image_gather4_lz: the words each pixel must hold."""
+
+    @staticmethod
+    def frame(words):
+        return b"".join(struct.pack("<4I", *words(i % 64, i // 64)) for i in range(64 * 64))
+
+    def test_derived_frames_pass_and_other_frames_fail(self):
+        for name, (_args, words, _m8) in check.MIMG_TESTS.items():
+            with self.subTest(name=name):
+                self.assertEqual(check.mimg_problem(self.frame(words), name), "")
+                self.assertIn("got 65520 bytes", check.mimg_problem(self.frame(words)[:-16], name))
+                for other in check.MIMG_TESTS:
+                    if other != name:
+                        self.assertIn("pixels differ", check.mimg_problem(self.frame(check.MIMG_TESTS[other][1]), name))
+
+    def test_a_few_pixels_by_hand(self):
+        one, cyan = 0x3F800000, (0, 0x3F800000, 0x3F800000, 0x3F800000)
+        self.assertEqual(check.sample_l_words(5, 5), (one, 0, 0, one))             # LOD 0.25, red
+        self.assertEqual(check.sample_l_words(5, 40), (0, 0, one, one))            # LOD 0.25, blue
+        self.assertEqual(check.sample_l_words(32, 0), cyan)                        # LOD 0.75, mip 1
+        self.assertEqual(check.sample_b_o_words(28, 33), (one, 0, 0, one))         # texel (63, 63): still red
+        self.assertEqual(check.sample_b_o_words(29, 33), (0, one, 0, one))         # texel (65, 63): green
+        self.assertEqual(check.sample_b_o_words(28, 34), (0, 0, one, one))         # texel (63, 65): blue
+        self.assertEqual(check.sample_b_o_words(29, 34), (one, one, 0, 0))         # texel (65, 65): yellow, alpha 0
+        self.assertEqual(check.sample_b_o_words(48, 0), cyan)
+        self.assertEqual(check.load_mip_words(40, 40), (one, one, 0, one))
+        self.assertEqual(check.gather4_lz_words(0, 0), (0x0110, 0x0011, 0x88884444, 0x66772332))
+        self.assertEqual(check.gather4_lz_words(63, 63), (0x7777, 0x7777, 0x88884444, 0x66772332))
+        self.assertEqual(check.gather4_lz_words(20, 50), (0x2332, 0x6677, 0x88884444, 0x66772332))
 
 
 class GetLodChecks(unittest.TestCase):

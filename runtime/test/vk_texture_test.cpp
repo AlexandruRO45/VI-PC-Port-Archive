@@ -13,6 +13,8 @@
 //   (x + 0.5) / 8) and a LESS_OR_EQUAL compare sampler at index 1; both of its results, f32 and d16, must be the
 //   1.0 or 0.0 the reference 0.5 gives against the texel each pixel reads.
 //   vk_texture_test dref_a16 [out.raw]: the same with ps_sample_c_lz_a16 (16-bit coordinates).
+//   vk_texture_test dref_o [out.raw]: ps_sample_c_lz_o against an 8x8 D32 texture whose texel (x, y) holds depth
+//   (8y + x + 0.5) / 64 and the same compare sampler; every pixel must read (1, 1, 0, 1) (see the shader's header).
 //   VKT_HEAP_MB=<n>: size of the heap in MiB (default 64 KiB)
 //   VKT_NEED_MAINTENANCE8=1: the shader has a non-constant texel Offset outside gather (image_sample*_o, see
 //   ps_texoff.asm); print "unsupported: ..." and exit 77 when VK_KHR_maintenance8 cannot be enabled.
@@ -72,7 +74,8 @@ int main(int argc, char** argv) {
     int ptr_sgpr = 0;
     const bool cube = argc >= 2 && !std::strcmp(argv[1], "cube");
     const bool dref_a16 = argc >= 2 && !std::strcmp(argv[1], "dref_a16");
-    const bool dref = dref_a16 || (argc >= 2 && !std::strcmp(argv[1], "dref"));
+    const bool dref_o = argc >= 2 && !std::strcmp(argv[1], "dref_o");
+    const bool dref = dref_a16 || dref_o || (argc >= 2 && !std::strcmp(argv[1], "dref"));
     bool autonomous = false;
     uint32_t ssharp[8] = {0x92, 0xc00000, 0x14500000, 0,
                           0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
@@ -102,14 +105,14 @@ int main(int argc, char** argv) {
         };
         vs_path = find_spv("vs_ids.spv");
         fs_path = find_spv(cube ? "ps_cube_sample.spv" : dref_a16 ? "ps_sample_c_lz_a16.spv"
-                           : dref ? "ps_sample_c_lz.spv" : "ps_texture_sample.spv");
+                           : dref_o ? "ps_sample_c_lz_o.spv" : dref ? "ps_sample_c_lz.spv" : "ps_texture_sample.spv");
         const int out_arg = cube || dref ? 2 : 1;
         out_path = argc > out_arg ? argv[out_arg] : "runtime/build/vk_texture_test_out.raw";
         ptr_sgpr = 0;
         if (dref)
             ssharp[0] |= 3u << 12;              // the shader's S#: DEPTH_COMPARE_FUNC = LESSEQUAL
     } else {
-        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint]\n");
+        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16|dref_o] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint]\n");
         return 2;
     }
     // Word 1 also selects the numeric type when the shader fetches through this key.
@@ -142,18 +145,16 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "unsupported: no Vulkan physical device\n");
         return 77;  // a missing device is a skip in every texture-test mode
     }
-    VkPhysicalDevice pd = VK_NULL_HANDLE;
-    VkPhysicalDeviceProperties properties{};
-    int best_rank = -1;
-    for (uint32_t i = 0; i < n; ++i) {
-        VkPhysicalDeviceProperties p;
-        vkGetPhysicalDeviceProperties(pds[i], &p);
-        if (const int rank = leonida::vk_test::device_rank(p.deviceType, p.vendorID); rank > best_rank) {
-            pd = pds[i];
-            properties = p;
-            best_rank = rank;
-        }
+    // LEONIDA_VK_DEVICE picks one GPU on a machine with several, as in the other test programs.
+    std::vector<VkPhysicalDeviceProperties> candidates(n);
+    for (uint32_t i = 0; i < n; ++i) vkGetPhysicalDeviceProperties(pds[i], &candidates[i]);
+    const size_t chosen = leonida::vk_test::pick_device(candidates);
+    if (chosen >= n) {
+        leonida::vk_test::report_no_device();
+        return 1;
     }
+    VkPhysicalDevice pd = pds[chosen];
+    VkPhysicalDeviceProperties properties = candidates[chosen];
     constexpr uint32_t push_words = 36;
     constexpr uint32_t push_bytes = push_words * sizeof(uint32_t);
     if (properties.limits.maxPushConstantsSize < push_bytes) {
@@ -311,7 +312,7 @@ int main(int argc, char** argv) {
     if (dref) {   // same size as the 8x8 gradient: one 32-bit word a texel
         for (uint32_t y = 0; y < TW; y++)
             for (uint32_t x = 0; x < TW; x++) {
-                const float depth = (x + 0.5f) / TW;
+                const float depth = dref_o ? float(y * TW + x + 0.5f) / 64.0f : (x + 0.5f) / TW;
                 std::memcpy(&texels[y * TW + x], &depth, sizeof(depth));
             }
     }
@@ -528,7 +529,25 @@ int main(int argc, char** argv) {
         std::printf("vk_texture_test cube: PASSED (%d pixels, each the texel a cube sample of its direction reads)\n",
                     checked);
     }
-    if (autonomous && dref) {
+    if (autonomous && dref_o) {
+        // Expected: every pixel (1, 1, 0, 1), as derived in ps_sample_c_lz_o.asm.
+        const float* pixels = static_cast<const float*>(rbp);
+        int wrong = 0;
+        for (uint32_t i = 0; i < W * H; i++) {
+            const float* p = pixels + i * 4;
+            wrong += !(p[0] == 1.0f && p[1] == 1.0f && p[2] == 0.0f && p[3] == 1.0f);
+        }
+        if (wrong) {
+            const float* p = pixels;
+            for (uint32_t i = 0; i < W * H; i++, p += 4)
+                if (!(p[0] == 1.0f && p[1] == 1.0f && p[2] == 0.0f && p[3] == 1.0f)) break;
+            std::fprintf(stderr, "vk_texture_test dref_o: FAILED, %d of %u pixels wrong; first got (%g, %g, %g, %g), "
+                         "expected (1, 1, 0, 1)\n", wrong, W * H, p[0], p[1], p[2], p[3]);
+            return 1;
+        }
+        std::printf("vk_texture_test dref_o: PASSED (%u pixels, image_sample_c_lz_o compares exact)\n", W * H);
+    }
+    if (autonomous && dref && !dref_o) {
         // Expected: pixel column px reads texel x = floor(8u) at u = (px + 0.5) / 64 (never on a texel edge), whose
         // depth (x + 0.5) / 8 passes the reference 0.5 under LESS_OR_EQUAL from x = 4 on. Both results, the f32 one
         // and the d16 one widened back to f32, are exactly that 1.0 or 0.0.

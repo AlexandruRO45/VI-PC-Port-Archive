@@ -40,6 +40,7 @@ from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip,
                    vcmpx_forms_narrow_skip, wave32_lane_skip)   # as in check.py
 from check import PIXEL_VERTEX, interp_f16_high_problem, ij_computed_problem, mandelbrot_problem   # pixel producers and checks
 from check import GET_LOD_TESTS, STORE_WORDS, get_lod_test, store_words_problem   # TEST-184: image atomics and queries
+from check import DREF_O_TEST, MIMG_TESTS, mimg_test   # sample, gather and load frames on vk_texture_test
 from check import wide_pixel_skip   # ps_w64x_readlane: judged only where the fragment stage was required 64-wide
 
 
@@ -556,6 +557,7 @@ DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_textur
               "ps_interp_f32_mods": "vs_interp_consts.asm", "ps_interp_mov_mods": "vs_interp_consts.asm",
               SIGNED_MIP_TEST: "vs_ids.asm"}
 DRAWN_WITH.update({name: "vs_ids.asm" for name in GET_LOD_TESTS})
+DRAWN_WITH.update({name: "vs_ids.asm" for name in (*MIMG_TESTS, DREF_O_TEST)})
 
 
 def with_draw_shaders(asm_files: list[str]) -> list[str]:
@@ -798,6 +800,12 @@ def run_suite(a, work: str) -> int:
                 problem = store_words_problem(msg, name)
                 results.append((name, not problem, problem or "all 64 words of the uint image, the sint image and "
                                 "the volume exact"))
+        elif name in MIMG_TESTS or name == DREF_O_TEST:
+            # image_sample_l, image_sample_b_o, image_sample_c_lz_o, image_load_mip, image_gather4_lz: one draw each on
+            # vk_texture_test's textures, every pixel compared with the words derived in the .asm header.
+            problem = mimg_test(a.build, spirv_dir, name)
+            ok = None if isinstance(problem, Skip) else not problem
+            results.append((name, ok, problem or "4096/4096 pixels exact"))
         elif name in GET_LOD_TESTS:
             # TEST-184: image_get_lod on vk_texture_test's two-mip texture (two sampler LOD ranges) and on its 2D array.
             problem = get_lod_test(a.build, spirv_dir, name)

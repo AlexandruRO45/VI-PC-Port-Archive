@@ -423,10 +423,10 @@ def timed_out(name, limit):
             "LEONIDA_GPU_TEST_TIMEOUT sets the limit")
 
 
-def run(*cmd, env=None):
+def run(*cmd, env=None, cwd=None):
     limit = gpu_test_timeout()
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=limit)
+        r = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=cwd, timeout=limit)
     except subprocess.TimeoutExpired:
         return 1, timed_out(cmd[0], limit)
     except OSError as e:
@@ -1036,6 +1036,97 @@ def get_lod_test(tools, spirv, name):
     return ""
 
 
+# Texture samples that only the CPU tests covered: image_sample_l, image_sample_b_o, image_load_mip, image_gather4_lz
+# (frames from vk_texture_test's textures, each pixel's four words as derived in the .asm header) and
+# image_sample_c_lz_o (vk_texture_test dref_o, which judges its own frame). Each is a draw of 64x64 pixels.
+_F32_ONE = 0x3F800000
+_QUAD_COLORS = ((1, 0, 0, 1), (0, 1, 0, 1), (0, 0, 1, 1), (1, 1, 0, 0))   # --two-mip's base level, top left first
+_CYAN = (0, 1, 1, 1)                                                       # --two-mip's mip 1
+
+
+def _f32_words(*values):
+    return tuple(_F32_ONE if v == 1 else 0 for v in values)
+
+
+def sample_l_words(x, y):
+    """ps_sample_l: LOD 0.25 left of x = 32 (mip 0: red above y = 32, blue below), LOD 0.75 right of it (mip 1: cyan)."""
+    return _f32_words(*(_CYAN if x >= 32 else _QUAD_COLORS[2 * (y >= 32)]))
+
+
+def sample_b_o_words(x, y):
+    """ps_sample_b_o: bias 0 from x = 48 (mip 1), else bias -1 (mip 0) at texel (2x + 7, 2y - 3): edges at x 29, y 34."""
+    return _f32_words(*(_CYAN if x >= 48 else _QUAD_COLORS[2 * (y >= 34) + (x >= 29)]))
+
+
+def load_mip_words(x, y):
+    """ps_load_mip: the mip 0 texel's r, g, b (quadrants split at 32), then the g of mip 1's cyan."""
+    r, g, b, _ = _QUAD_COLORS[2 * (y >= 32) + (x >= 32)]
+    return _f32_words(r, g, b, 1)
+
+
+def gather4_lz_words(x, y):
+    """ps_gather4_lz: red and green taps (a nibble each) of the footprint at the corner of the pixel's 8x8 block,
+    blue (4) and alpha (8) taps, and the footprint at texel coordinate (2.75, 6.75)."""
+    bx, by = x >> 3, y >> 3
+    x0, x1, y0, y1 = bx, min(bx + 1, 7), by, min(by + 1, 7)
+    return (x0 | x1 << 4 | x1 << 8 | x0 << 12, y1 | y1 << 4 | y0 << 8 | y0 << 12, 0x88884444, 0x66772332)
+
+
+# name -> (arguments of the draw after the S# words, expected words at pixel (x, y), VKT_NEED_MAINTENANCE8)
+MIMG_TESTS = {
+    "ps_sample_l": (("--two-mip",), sample_l_words, False),
+    "ps_sample_b_o": (("--two-mip",), sample_b_o_words, True),          # non-constant texel Offset
+    "ps_load_mip": (("--two-mip",), load_mip_words, False),
+    "ps_gather4_lz": ((), gather4_lz_words, False),
+}
+DREF_O_TEST = "ps_sample_c_lz_o"   # vk_texture_test dref_o: every pixel (1, 1, 0, 1), a non-constant texel Offset
+
+
+def mimg_problem(data, name):
+    """Judge one MIMG_TESTS frame (4096 RGBA32 pixels as raw words): "" when every pixel is the derived one."""
+    if len(data) != 64 * 64 * 16:
+        return f"expected 4096 RGBA32 pixels, got {len(data)} bytes"
+    want = MIMG_TESTS[name][1]
+    bad = [(i, got) for i, got in enumerate(struct.iter_unpack("<4I", data)) if got != want(i % 64, i // 64)]
+    if not bad:
+        return ""
+    i, got = bad[0]
+    return (f"{len(bad)} of 4096 pixels differ; first at ({i % 64},{i // 64}): got {[hex(w) for w in got]}, "
+            f"want {[hex(w) for w in want(i % 64, i // 64)]}")
+
+
+def mimg_env(name):
+    """vk_texture_test environment: image_sample_b_o and image_sample_c_lz_o need texoff_env()'s extension."""
+    return texoff_env() if name == DREF_O_TEST or MIMG_TESTS[name][2] else None
+
+
+def mimg_test(tools, spirv, name):
+    """A MIMG_TESTS shader on vk_texture_test (it binds the textures and the sampler), drawn with vs_ids."""
+    tool = os.path.join(tools, "vk_texture_test" + EXE)
+    with tempfile.TemporaryDirectory(prefix="leonida-mimg-") as tmp:
+        raw = Path(tmp) / "pixels.raw"
+        if name == DREF_O_TEST:
+            path = os.path.join(spirv, name + ".spv")
+            if not os.path.isfile(path):
+                return f"missing {name}.spv"
+            code, out = run(tool, "dref_o", raw, env=mimg_env(name), cwd=spirv)
+        else:
+            shaders = [os.path.join(spirv, shader + ".spv") for shader in ("vs_ids", name)]
+            for path in (tool, *shaders):
+                if not os.path.isfile(path):
+                    return f"missing {os.path.basename(path)}"
+            code, out = run(tool, *shaders, raw, "0", "92", "c00000", "14500000", "0", *MIMG_TESTS[name][0],
+                            env=mimg_env(name))
+        if code == UNSUPPORTED:   # no VK_KHR_maintenance8 for a non-constant Offset, or too few push constants
+            m = re.search(r"unsupported: .*", out)
+            return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
+        if code or not raw.is_file():
+            return failure(code, out, 3)
+        if name == DREF_O_TEST:
+            return "" if "PASSED" in out else failure(code, out, 3)
+        return mimg_problem(raw.read_bytes(), name)
+
+
 def texture_mip_mismatch(data: bytes, mip: int, *, transpose_uv: bool = False) -> str:
     width = 64
     if len(data) != width**2 * 16:
@@ -1317,6 +1408,8 @@ def main():
         results.append((name, store_words_test(tools, spirv, name)))
     for name in GET_LOD_TESTS:   # TEST-184: image_get_lod, 2D and 2D array
         results.append((name, get_lod_test(tools, spirv, name)))
+    for name in (*MIMG_TESTS, DREF_O_TEST):   # image_sample_l, _b_o, _c_lz_o, image_load_mip, image_gather4_lz
+        results.append((name, mimg_test(tools, spirv, name)))
     for name in CLIP_TESTS:
         results.append((name, clip_test(tools, spirv, name)))
     for name in PIXEL_TESTS:
