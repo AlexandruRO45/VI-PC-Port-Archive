@@ -1359,13 +1359,16 @@ public:
         if (graphics_.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT) rendering.depthAttachmentFormat = graphics_.depth_format;
         if (graphics_.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT) rendering.stencilAttachmentFormat = graphics_.depth_format;
 
-        static constexpr VkDynamicState dynamic_states[] = {
-            VK_DYNAMIC_STATE_VIEWPORT,          VK_DYNAMIC_STATE_SCISSOR,
-            VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE,
+        // The binding stride is dynamic only when the input layout feeds a binding: a vertex shader that fetches
+        // its data itself (through a V#) has no vertex buffer, and a draw with a dynamic stride that was never set
+        // breaks VUID-vkCmdDraw-pStrides-04913.
+        std::vector<VkDynamicState> dynamic_states = {
+            VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
             VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+        if (!bindings.empty()) dynamic_states.push_back(VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE);
         VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-        dynamic.dynamicStateCount = std::uint32_t(std::size(dynamic_states));
-        dynamic.pDynamicStates = dynamic_states;
+        dynamic.dynamicStateCount = std::uint32_t(dynamic_states.size());
+        dynamic.pDynamicStates = dynamic_states.data();
 
         // Every stage this path accepts reads the user SGPRs, so the range covers the whole stage table, not only the
         // stages present. A stage added to the table (geometry, mesh) is covered without touching this.
