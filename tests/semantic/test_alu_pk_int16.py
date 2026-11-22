@@ -2,8 +2,8 @@
 
 v_pk_add/sub_u16/i16, v_pk_mul_lo_u16, v_pk_mad_u16/i16 and v_pk_max/min_u16/i16. Result half 0 takes each source's
 half from op_sel[i], result half 1 from op_sel_hi[i] (defaults [0,..], [1,..]); each half wraps to 16 bits, and clamp
-(add, sub, mad) saturates it to the type's range. A constant reads as its low 16 bits; a constant whose high half
-op_sel would read is rejected. Each case translates a synthetic pixel shader with tools/rdna2spirv.py and runs it in
+(add, sub, mad) saturates it to the type's range. A constant is its 32-bit value split into halves (an integer
+inline constant sign-extended, a float inline constant as f32 bits; measured on gfx1036). Each case translates a synthetic pixel shader with tools/rdna2spirv.py and runs it in
 tests/semantic/spirv_mini_interp.py; D leaves through exp as 16-bit halves ORed into 0x40000000. Standard library
 only; no GPU, no game files.
 """
@@ -141,9 +141,16 @@ class PkInt16Tests(unittest.TestCase):
         self.assertEqual(run("v_pk_add_u16 v0, v1, 5 op_sel_hi:[1,0]", [0x00100020]), 0x00150025)
         self.assertEqual(run("v_pk_sub_i16 v0, v1, -1 op_sel_hi:[1,0]", [0x00100020]), 0x00110021)
 
+    def test_constants_read_as_32_bits(self):
+        # default op_sel_hi: the high result half reads the constant's high 16 bits (gfx1036, docs/design.md)
+        self.assertEqual(run("v_pk_add_u16 v0, v1, 5", [0x00100020]), 0x00100025)
+        self.assertEqual(run("v_pk_sub_i16 v0, v1, -1", [0x00100020]), 0x00110021)
+        self.assertEqual(run("v_pk_add_u16 v0, v1, 1.0", [0x00100020]), 0x3F900020)
+        self.assertEqual(run("v_pk_add_u16 v0, v1, 0x12345678 op_sel:[0,1] op_sel_hi:[0,0]", [0x00100020]),
+                         0x56981254)
+
     def test_rejected_forms(self):
-        for line in ("v_pk_add_u16 v0, v1, 5",                        # default op_sel_hi reads the high half
-                     "v_pk_add_u16 v0, v1, v2 neg_lo:[1,0]",
+        for line in ("v_pk_add_u16 v0, v1, v2 neg_lo:[1,0]",
                      "v_pk_max_u16 v0, v1, v2 clamp", "v_pk_mul_lo_u16 v0, v1, v2 clamp"):
             with self.subTest(line=line):
                 with self.assertRaises(rdna2spirv.Unsupported):
