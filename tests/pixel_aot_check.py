@@ -1122,8 +1122,15 @@ def check_pkrtz_draws(directory, compiler, renderer, backend):
         # The same program with the helper swapped for round-to-nearest-even must disagree on a tie.
         lo, hi = PKRTZ_SETS[0]
         pkrtz_case(case, (f32_word(lo), f32_word(hi)), pkrtz_word(lo, hi, encoding))
-        swapped = translated.replace("pack16_rtz(", "pack16_rne(")
-        source.write_text(pixel_aot.SALU_HELPERS["pack16_rne"] + "\n" + swapped, encoding="ascii")
+        # Rename the call sites only: the pack16_rtz definition keeps its name, and the real
+        # round-to-nearest-even helper is added unless the program already defines it.
+        definition = "uint pack16_rtz(float value)"
+        swapped = (translated.replace(definition, "uint pack16_rtz_definition(float value)")
+                   .replace("pack16_rtz(", "pack16_rne(")
+                   .replace("uint pack16_rtz_definition(float value)", definition))
+        if "uint pack16_rne(float value)" not in swapped:
+            swapped = pixel_aot.SALU_HELPERS["pack16_rne"] + "\n" + swapped
+        source.write_text(swapped, encoding="ascii")
         subprocess.run(compile_shader, check=True)
         if not mismatches():
             raise AssertionError(f"Rounding the {encoding} pack to nearest even escaped detection")
