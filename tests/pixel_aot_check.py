@@ -2088,14 +2088,18 @@ def check_scalar_pack_draw(directory, compiler, renderer, backend):
     for halves in PACK_HALVES:
         source.write_text(translate(scalar_pack_values(halves)), encoding="ascii")
         compile_shader(compiler, source, shader, ieee=False)
-        for flag, words in enumerate(((0x1234abcd, 0x5678ef90), (0xffff0000, 0x0000ffff))):
+        # The third pair sets every bit of each half LL and LH select, so a mask that drops any one bit
+        # of a selected half (0xfffd for the low half, 0xfffe0000 for the high half) breaks the equality.
+        for index, words in enumerate(((0x1234abcd, 0x5678ef90), (0xffff0000, 0x0000ffff),
+                                       (0x0000ffff, 0xffffffff))):
+            flag = index % 2
             selected = [struct.unpack("<HH", struct.pack("<I", word))[half == "h"]
                         for word, half in zip(words, halves)]
             constants = bytearray(256)
             struct.pack_into("<IIHHI", constants, 12, *words, *selected, flag)
             case.write_bytes(constants + struct.pack("<4f", 1, flag, 0, 0) * 64)
             subprocess.run(draw, check=True)
-            if halves == "lh" and flag == 0:
+            if halves == "lh" and index == 0:
                 # Compile LL against the unchanged LH reference; only the selected high half differs.
                 source.write_text(translate(scalar_pack_values("ll")), encoding="ascii")
                 mutant = directory / "wrong-pack.cso"
@@ -2971,6 +2975,10 @@ DPP_BODY = [
     "v_add_f32_e32 v12, v21, v22",
     "v_add_f32_e32 v12, v12, v23",
     "v_add_f32_e32 v12, v12, v27",
+    # DPP16 neg on src1: v23 is 3 in every lane, so v45 = 3 + -3 = 0 and leaves channel 0 unchanged;
+    # a dropped src1 neg gives 6.
+    "v_add_f32_dpp v45, v23, -v23 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf",
+    "v_add_f32_e32 v12, v12, v45",
     "v_add_f32_e32 v12, s44, v12",
     "v_mov_b32_e32 v28, s45",
     "v_mov_b32_e32 v29, s46",
@@ -3048,6 +3056,7 @@ def check_dpp_draw(directory, compiler, renderer, backend):
         (0, "v_mul_f32_dpp v31, v20, v28 quad_perm:[3,3,3,3]",
          "v_mul_f32_dpp v31, v20, v28 quad_perm:[1,1,1,1]", "lane broadcast"),
         (0, "v_min_f32_dpp v33, -v31, v30", "v_min_f32_dpp v33, v31, v30", "DPP16 neg modifier"),
+        (0, "v_add_f32_dpp v45, v23, -v23", "v_add_f32_dpp v45, v23, v23", "DPP16 src1 neg modifier"),
         (1, "v_floor_f32_dpp v36, v35", "v_ceil_f32_dpp v36, v35", "floor vs ceil DPP"),
     ):
         a, b, h_bits, c = DPP_SETS[set_idx]
