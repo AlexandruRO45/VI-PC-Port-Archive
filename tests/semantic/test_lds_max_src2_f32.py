@@ -897,5 +897,58 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertGreater(len(pairs), 0)
 
 
+# ==============================================================================
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(DEFAULT_LDS_DWORDS)
+        self.state = ScalarMachineState(lds=self.lds)
+        self.interp = ScalarInterpreter()
+
+    def test_signed_zeros_ordering(self) -> None:
+        self.assertEqual(oracle_max_f32(POS_ZERO_F32, NEG_ZERO_F32), POS_ZERO_F32)
+        self.assertEqual(oracle_max_f32(NEG_ZERO_F32, POS_ZERO_F32), POS_ZERO_F32)
+        self.assertEqual(oracle_max_f32(NEG_ZERO_F32, NEG_ZERO_F32), NEG_ZERO_F32)
+        self.assertEqual(oracle_max_f32(POS_ZERO_F32, POS_ZERO_F32), POS_ZERO_F32)
+
+    def test_infinities(self) -> None:
+        self.assertEqual(oracle_max_f32(MAX_NORMAL_F32, POS_INF_F32), POS_INF_F32)
+        self.assertEqual(oracle_max_f32(NEG_INF_F32, NEG_MAX_NORMAL_F32), NEG_MAX_NORMAL_F32)
+        self.assertEqual(oracle_max_f32(POS_INF_F32, NEG_INF_F32), POS_INF_F32)
+
+    def test_subnormals_no_flush_to_zero(self) -> None:
+        self.assertEqual(oracle_max_f32(POS_ZERO_F32, MIN_SUBNORMAL_F32), MIN_SUBNORMAL_F32)
+        self.assertEqual(oracle_max_f32(MIN_SUBNORMAL_F32, POS_ZERO_F32), MIN_SUBNORMAL_F32)
+        self.assertEqual(oracle_max_f32(NEG_ZERO_F32, MIN_SUBNORMAL_F32), MIN_SUBNORMAL_F32)
+        self.assertEqual(oracle_max_f32(NEG_ZERO_F32, NEG_MIN_SUBNORMAL_F32), NEG_ZERO_F32)
+
+    def test_nan_suppression(self) -> None:
+        self.assertEqual(oracle_max_f32(ONE_F32, QNAN_F32), ONE_F32)
+        self.assertEqual(oracle_max_f32(QNAN_F32, ONE_F32), ONE_F32)
+        self.assertEqual(oracle_max_f32(TWO_F32, SNAN_F32), TWO_F32)
+        self.assertEqual(oracle_max_f32(SNAN_F32, TWO_F32), TWO_F32)
+        both_nan = oracle_max_f32(SNAN_F32, QNAN_F32)
+        self.assertTrue(is_f32_qnan(both_nan))
+
+    def test_finite_boundary_extremes(self) -> None:
+        self.assertEqual(oracle_max_f32(MAX_NORMAL_F32, MIN_NORMAL_F32), MAX_NORMAL_F32)
+        self.assertEqual(oracle_max_f32(NEG_MIN_NORMAL_F32, NEG_MAX_NORMAL_F32), NEG_MIN_NORMAL_F32)
+
+    def test_address_wrapping_and_capacity(self) -> None:
+        # Wrapping across 64 KiB capacity
+        last_idx = DEFAULT_LDS_DWORDS - 1
+        self.lds.write_dword(last_idx, ONE_F32)
+        self.lds.write_dword(0, TWO_F32)
+
+        # base = last_idx * 4, offset0 = 0 -> last_idx; offset1 = 1 -> wraps to 0
+        new_a = self.lds.atomic_max_src2_f32(last_idx * 4, offset0=0, offset1=1)
+        self.assertEqual(new_a, TWO_F32)
+        self.assertEqual(self.lds.read_dword(last_idx), TWO_F32)
+
+
 if __name__ == "__main__":
     unittest.main()
