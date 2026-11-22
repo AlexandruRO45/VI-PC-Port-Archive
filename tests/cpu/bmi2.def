@@ -1,18 +1,32 @@
 EXPORTS
     bzhi32
     bzhi64
-    rorx32
-    rorx64
-    shlx32
-    shlx64
-    shrx32
-    shrx64
-    sarx32
-    sarx64
+    mulx32
+    mulx64
+    mulx32_same
+    mulx64_same
     pdep32
     pdep64
     pext32
     pext64
-    mulx32
-    mulx64
-    mulx64_same
+    rorx32_0
+    rorx32_1
+    rorx32_7
+    rorx32_15
+    rorx32_31
+    rorx32_32
+    rorx32_33
+    rorx32_255
+    rorx64_0
+    rorx64_1
+    rorx64_7
+    rorx64_31
+    rorx64_63
+    rorx64_64
+    rorx64_255
+    sarx32
+    sarx64
+    shlx32
+    shlx64
+    shrx32
+    shrx64

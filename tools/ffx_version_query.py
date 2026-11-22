@@ -335,7 +335,76 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                 stmt = (f"{{ const {width} a = {operand(0)}; const unsigned b = {bit_expr}; "
                         f"const {width} m = static_cast<{width}>(1) << b; carry = (a & m) != 0; "
                         f"const {width} v = static_cast<{width}>({mut}); {write('v')} }}")
-
+        elif op == M.BZHI and RegisterExt.size(i.op0_register) in (4, 8):
+            size = RegisterExt.size(i.op0_register)
+            width, bits = UINT[size], 8 * size
+            stmt = (f"{{ const {width} src1 = {operand(1)}; "
+                    f"const unsigned idx = static_cast<unsigned>({operand(2)}) & 0xffu; "
+                    f"const {width} mask = idx < {bits}u ? (idx == 0u ? static_cast<{width}>(0) : "
+                    f"static_cast<{width}>((static_cast<{width}>(1) << idx) - 1u)) : "
+                    f"static_cast<{width}>(~static_cast<{width}>(0)); "
+                    f"const {width} v = static_cast<{width}>(src1 & mask); "
+                    f"carry = idx >= {bits}u; zero = v == 0; {write('v')} }}")
+        elif op == M.MULX and RegisterExt.size(i.op0_register) in (4, 8) and RegisterExt.size(i.op1_register) == RegisterExt.size(i.op0_register):
+            size = RegisterExt.size(i.op0_register)
+            if size == 4:
+                stmt = (f"{{ const uint32_t src2 = static_cast<uint32_t>({operand(2)}); "
+                        f"const uint64_t prod = static_cast<uint64_t>(static_cast<uint32_t>(rdx)) * static_cast<uint64_t>(src2); "
+                        f"const uint32_t lo = static_cast<uint32_t>(prod); "
+                        f"const uint32_t hi = static_cast<uint32_t>(prod >> 32); "
+                        f"{write_register(i.op1_register, 'lo')} "
+                        f"{write_register(i.op0_register, 'hi')} }}")
+            else:  # size == 8
+                stmt = (f"{{ const uint64_t src2 = {operand(2)}; uint64_t hi = 0; "
+                        f"#if defined(_MSC_VER) && defined(_M_X64)\n"
+                        f"const uint64_t lo = _umul128(rdx, src2, &hi);\n"
+                        f"#else\n"
+                        f"const __uint128_t prod = static_cast<__uint128_t>(rdx) * static_cast<__uint128_t>(src2);\n"
+                        f"const uint64_t lo = static_cast<uint64_t>(prod); hi = static_cast<uint64_t>(prod >> 64);\n"
+                        f"#endif\n"
+                        f"{write_register(i.op1_register, 'lo')} "
+                        f"{write_register(i.op0_register, 'hi')} }}")
+        elif op in (M.PDEP, M.PEXT) and RegisterExt.size(i.op0_register) in (4, 8):
+            size = RegisterExt.size(i.op0_register)
+            width, bits = UINT[size], 8 * size
+            if op == M.PDEP:
+                stmt = (f"{{ const {width} a = {operand(1)}, m = {operand(2)}; "
+                        f"{width} v = 0, temp = a; "
+                        f"for (unsigned k = 0; k < {bits}u; ++k) {{ "
+                        f"if (((m >> k) & 1u) != 0u) {{ "
+                        f"v |= static_cast<{width}>((temp & 1u)) << k; "
+                        f"temp >>= 1; }} }} "
+                        f"{write('v')} }}")
+            else:  # M.PEXT
+                stmt = (f"{{ const {width} a = {operand(1)}, m = {operand(2)}; "
+                        f"{width} v = 0; unsigned k = 0; "
+                        f"for (unsigned m_idx = 0; m_idx < {bits}u; ++m_idx) {{ "
+                        f"if (((m >> m_idx) & 1u) != 0u) {{ "
+                        f"v |= static_cast<{width}>((a >> m_idx) & 1u) << k; "
+                        f"++k; }} }} "
+                        f"{write('v')} }}")
+        elif op == M.RORX and RegisterExt.size(i.op0_register) in (4, 8) and i.op2_kind == K.IMMEDIATE8:
+            size = RegisterExt.size(i.op0_register)
+            width, bits = UINT[size], 8 * size
+            count = i.immediate(2) & (bits - 1)
+            stmt = (f"{{ const {width} a = {operand(1)}; "
+                    f"const unsigned c = {count}u; "
+                    f"const {width} v = c == 0u ? a : static_cast<{width}>((a >> c) | (a << ({bits}u - c))); "
+                    f"{write('v')} }}")
+        elif op in (M.SARX, M.SHLX, M.SHRX) and RegisterExt.size(i.op0_register) in (4, 8):
+            size = RegisterExt.size(i.op0_register)
+            width, bits = UINT[size], 8 * size
+            signed_type = f"int{bits}_t"
+            if op == M.SHLX:
+                shift_expr = f"a << c"
+            elif op == M.SHRX:
+                shift_expr = f"a >> c"
+            else:  # M.SARX
+                shift_expr = f"static_cast<{signed_type}>(a) >> c"
+            stmt = (f"{{ const {width} a = {operand(1)}; "
+                    f"const unsigned c = static_cast<unsigned>({operand(2)}) & {bits - 1}u; "
+                    f"const {width} v = static_cast<{width}>({shift_expr}); "
+                    f"{write('v')} }}")
         elif (op in (M.ROL, M.ROR) and i.op0_kind == K.REGISTER and RegisterExt.size(i.op0_register) in (4, 8)
               and (i.op1_kind == K.IMMEDIATE8 or i.op1_register == R.CL)):
             size = RegisterExt.size(i.op0_register)

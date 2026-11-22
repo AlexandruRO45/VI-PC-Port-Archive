@@ -855,6 +855,17 @@ if(EXISTS "${INTAKE_PYTHON}")
         check "$<TARGET_FILE:cpu_bit_ops>" "$<TARGET_FILE:cpu_bit_ops_lifted>")
     set_tests_properties(cpu_aot_bit_ops PROPERTIES SKIP_RETURN_CODE 77)
 
+    cpu_asm_fixture(cpu_bmi2 bmi2)
+    set(bmi2_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_bmi2_lifted.cpp")
+    add_custom_command(OUTPUT "${bmi2_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/bmi2.py"
+            emit "$<TARGET_FILE:cpu_bmi2>" "${bmi2_fixture}"
+        DEPENDS cpu_bmi2 tests/cpu/bmi2.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_bmi2_lifted SHARED "${bmi2_fixture}")
+    add_test(NAME cpu_aot_bmi2 COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/bmi2.py"
+        check "$<TARGET_FILE:cpu_bmi2>" "$<TARGET_FILE:cpu_bmi2_lifted>")
+    set_tests_properties(cpu_aot_bmi2 PROPERTIES SKIP_RETURN_CODE 77)
     cpu_asm_fixture(cpu_rotates_shifts rotates_shifts)
     set(rotates_shifts_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_rotates_shifts_lifted.cpp")
     add_custom_command(OUTPUT "${rotates_shifts_fixture}"
