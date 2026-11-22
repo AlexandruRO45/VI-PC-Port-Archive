@@ -1438,6 +1438,36 @@ void run_checks(const std::filesystem::path& root) {
         if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
         check(!std::filesystem::exists(host_once), "a host file is deleted on close, as the host does");
 
+        // The marker is written after the host's open, whose last error the title may read: OPEN_ALWAYS on a name
+        // that exists succeeds with ERROR_ALREADY_EXISTS.
+        write_path(package / "data" / "once3.txt", "package");
+        SetLastError(0);
+        h = create_w(L"GAME:\\data\\once3.txt", GENERIC_READ, kShareAll, nullptr, OPEN_ALWAYS,
+                     FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        DWORD open_error = GetLastError();
+        check(h != INVALID_HANDLE_VALUE && open_error == ERROR_ALREADY_EXISTS,
+              "OPEN_ALWAYS with delete-on-close on a package file reports ERROR_ALREADY_EXISTS");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(read_path(package / "data" / "once3.txt") == "package" &&
+                  attributes_w(L"GAME:\\data\\once3.txt") == INVALID_FILE_ATTRIBUTES,
+              "and the name is gone after the close while the package keeps the file");
+        ext.dwFileFlags = FILE_FLAG_DELETE_ON_CLOSE;
+        write_path(package / "data" / "once4.txt", "package");
+        SetLastError(0);
+        h = create2 ? create2(L"GAME:\\data\\once4.txt", GENERIC_READ, kShareAll, OPEN_ALWAYS, &ext)
+                    : INVALID_HANDLE_VALUE;
+        open_error = GetLastError();
+        check(h != INVALID_HANDLE_VALUE && open_error == ERROR_ALREADY_EXISTS,
+              "CreateFile2 OPEN_ALWAYS with delete-on-close on a package file reports ERROR_ALREADY_EXISTS");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        SetLastError(ERROR_ALREADY_EXISTS);
+        h = create_w(L"GAME:\\save\\temp2.bin", GENERIC_READ, kShareAll, nullptr, OPEN_ALWAYS,
+                     FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        open_error = GetLastError();
+        check(h != INVALID_HANDLE_VALUE && open_error == ERROR_SUCCESS,
+              "OPEN_ALWAYS with delete-on-close on a new name reports no error");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+
         // An open that fails deletes nothing.
         h = create_w(L"GAME:\\data\\absent.txt", GENERIC_READ, kShareAll, nullptr, OPEN_EXISTING,
                      FILE_FLAG_DELETE_ON_CLOSE, nullptr);

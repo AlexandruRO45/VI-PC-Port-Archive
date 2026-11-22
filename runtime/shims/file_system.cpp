@@ -469,9 +469,15 @@ void mark_deleted_on_close(const std::wstring& path) {
     if (r.game.empty() || r.overlay.empty() || deleted(r.overlay, parts)) return;
     std::error_code ec;
     if (!std::filesystem::is_regular_file(join(r.game, parts), ec)) return;
-    const DWORD last_error = GetLastError();  // CreateFile's ERROR_ALREADY_EXISTS or 0, which the title may read
     DWORD error = 0;
     write_marker(marker(r.overlay, parts), error);
+}
+
+// The marker for a delete-on-close open the host has just granted. The title may read the open's last error
+// (ERROR_ALREADY_EXISTS or 0), which the file queries behind the marker would replace, so it is put back.
+void opened_delete_on_close(const std::wstring& path) {
+    const DWORD last_error = GetLastError();
+    mark_deleted_on_close(path);
     SetLastError(last_error);
 }
 
@@ -692,7 +698,7 @@ HANDLE WINAPI create_file_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_
         note_open_failure("CreateFileW", name, error, _ReturnAddress());
         SetLastError(error);
     }
-    if (h != INVALID_HANDLE_VALUE && (flags & FILE_FLAG_DELETE_ON_CLOSE) != 0) mark_deleted_on_close(name);
+    if (h != INVALID_HANDLE_VALUE && (flags & FILE_FLAG_DELETE_ON_CLOSE) != 0) opened_delete_on_close(name);
     return h;
 }
 
@@ -725,7 +731,7 @@ HANDLE WINAPI create_file2(LPCWSTR name, DWORD access, DWORD share, DWORD dispos
         note_open_failure("CreateFile2", name, error, _ReturnAddress());
         SetLastError(error);
     }
-    if (h != INVALID_HANDLE_VALUE && (flags & FILE_FLAG_DELETE_ON_CLOSE) != 0) mark_deleted_on_close(name);
+    if (h != INVALID_HANDLE_VALUE && (flags & FILE_FLAG_DELETE_ON_CLOSE) != 0) opened_delete_on_close(name);
     return h;
 }
 
