@@ -429,6 +429,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             add_test(NAME spirv_address_window_${adapter} COMMAND "${INTAKE_PYTHON}" -B
                 "${CMAKE_SOURCE_DIR}/tests/spirv_window/draw.py" "${SPIRV_WINDOW_AS}" "${SPIRV_WINDOW_VAL}"
                 "${SPIRV_WINDOW_CROSS}" "${DXC_EXECUTABLE}" "$<TARGET_FILE:offscreen_check>" ${adapter})
+            add_test(NAME spirv_ballot_extract_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_SOURCE_DIR}/tests/spirv_window/ballot.py" "${SPIRV_WINDOW_AS}" "${SPIRV_WINDOW_VAL}"
+                "${SPIRV_WINDOW_CROSS}" "${DXC_EXECUTABLE}" "$<TARGET_FILE:offscreen_check>" ${adapter})
+            set_tests_properties(spirv_ballot_extract_${adapter} PROPERTIES SKIP_RETURN_CODE 77)
             set_tests_properties(spirv_address_window_${adapter} PROPERTIES SKIP_RETURN_CODE 77)
         endforeach()
     endif()

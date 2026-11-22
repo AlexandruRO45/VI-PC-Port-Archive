@@ -2853,3 +2853,15 @@ python -B tools/resource_inventory.py "game-files/<build-directory>" --shader-co
 ```
 
 `out/resources/<build-directory>.json` records install chunks, flags, byte counts and missing layout destinations. It records file-header signatures for the build and scans all raw bytes in `appdata0.rpf`, `common.rpf` and `shaders.rpf` for format markers. Candidate DXBC containers are checked for length, section boundaries and DXIL program headers. The synthetic `dxcontainer_part_offsets` regression verifies that part-table entries can be enumerated independently of the physical layout, while rejecting overlapping, out-of-bounds, or duplicate-FourCC part ranges. Both the part map and DXIL scanner reject repeated FourCC tags even when those parts are physically separate; the regression includes a valid framed DXIL control to distinguish duplicate tags from missing shader payloads. It checks structural framing, not shader execution. `sample_streams` covers at most eight qualifying zlib streams per file within the first 4 MiB. Plaintext stays in memory. The sample cannot characterize the rest of the archive. Installation order and runtime I/O need independent checks. [DXIL container format](https://github.com/microsoft/DirectXShaderCompiler/blob/main/docs/DXIL.rst) · [RPF9 observation source](https://gtamodx.com/columns/eXk_fiBUaYta)
+
+### Ballot bit extraction in the named SPIR-V bridge
+
+The HLSL bridge lowers a subgroup ballot read to a dynamic DWORD selection and a bit
+test in that word. The source-built fixture supplies four distinguishable words and
+reads all 128 positions in the resulting logical vector. This checks the mask layout
+independently of the desktop device's wave size. On RTX 4060 Laptop and WARP, both
+readbacks matched 128 output words and 192 guards. Exchanging expected positions
+31 and 32 produced exactly two mismatches on each adapter.
+
+With SPIRV-Tools and SPIRV-Cross available at configure time, run
+`ctest --preset dev --no-tests=error -R spirv_ballot_extract -V`.
