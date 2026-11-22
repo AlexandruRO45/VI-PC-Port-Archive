@@ -662,7 +662,7 @@ class RawBufferTailBounds(unittest.TestCase):
 
 
 def div_fixup_f32_reference(s0, s1, s2):
-    """v_div_fixup_f32 as measured on RDNA2 gfx1036 with f32 denormals flushed (docs/design.md); words after
+    """v_div_fixup_f32 as measured on RDNA2 gfx1036 with IEEE off and f32 denormals flushed (docs/design.md); words after
     abs/neg. A denormal S1 or S2 reads as a zero of its sign; S0 is not flushed."""
     def ex(b):
         return (b >> 23) & 0xFF
@@ -674,9 +674,9 @@ def div_fixup_f32_reference(s0, s1, s2):
     zero1, zero2 = ex(s1) == 0, ex(s2) == 0
     inf1, inf2 = s1 & 0x7FFFFFFF == 0x7F800000, s2 & 0x7FFFFFFF == 0x7F800000
     if nan(s2):
-        return s2 | 0x400000
+        return s2                                  # IEEE off: a signalling NaN is not quieted
     if nan(s1):
-        return s1 | 0x400000
+        return s1
     if (zero1 and zero2) or (inf1 and inf2):
         return 0xFFC00000
     if zero1 or inf2:
@@ -703,14 +703,16 @@ class DivFixupF32(unittest.TestCase):
              (0x3FC00000, 0xBF800000, 0x40000000), (0x3F000000, 0xBF800000, 0x3F800000),
              (0x3FC00000, 0x3F800000, 0x3F800000), (0x3FC00000, 0x3F800000, 0x3F800000)]
     CLAMP = {17, 18}
-    WANT = [0xBFC00000, 0x3FC00000, 0x7FE00000, 0xFFC00001, 0xFFC00000, 0xFFC00000, 0xFF800000, 0x7F800000,
+    WANT = [0xBFC00000, 0x3FC00000, 0x7FA00000, 0xFF800001, 0xFFC00000, 0xFFC00000, 0xFF800000, 0x7F800000,
             0x80000000, 0x00000000, 0x80000000, 0x80000000, 0x00800003, 0xFF800000, 0x00000005, 0x3FC00000,
-            0xBFC00000, 0x00000000, 0x3F800000, 0x3FC00000]
+            0xBFC00000, 0x00000000, 0x3F800000, 0x40400000]
 
     def test_reference_gives_the_words(self):
         got = []
         for i, c in enumerate(self.CASES):
             d = div_fixup_f32_reference(*c)
+            if i == 19:              # mul:2
+                d = struct.unpack("<I", struct.pack("<f", struct.unpack("<f", struct.pack("<I", d))[0] * 2))[0]
             if i in self.CLAMP:      # clamp: NaN and negatives give +0, 1.0 and up give 1.0
                 d = 0 if d >= 0x7F800001 or d == 0x80000000 or d & 0x80000000 else min(d, 0x3F800000)
             got.append(d)

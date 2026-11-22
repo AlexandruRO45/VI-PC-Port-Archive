@@ -4034,18 +4034,18 @@ class Gen:
     def div_fixup_f32(self, a, mods):
         """v_div_fixup_f32 D, S0, S1, S2 (S0 the quotient, S1 the denominator, S2 the numerator): the last step of
         a float division, which puts the special cases back. Measured natively on RDNA2 gfx1036 (tools/hw_oracle,
-        4,940 operand triples) in the game's MODE (f32 denormals flushed). abs/neg act on the sign bit first. A
-        denormal S1 or S2 reads as a zero of its sign; S0 is not flushed. With s = sign(S1) ^ sign(S2), the first
+        5,072 operand triples) in the game's MODE (IEEE off, DX10_CLAMP on, f32 denormals flushed). abs/neg act
+        on the sign bits first. A denormal S1 or S2 reads as a zero of its sign; S0 is not flushed. With s = sign(S1) ^ sign(S2), the first
         match wins:
-          S2 NaN                        S2 quieted (bit 22 set)
-          S1 NaN                        S1 quieted
+          S2 NaN                        S2 unchanged (a signalling NaN too: IEEE mode off)
+          S1 NaN                        S1 unchanged
           S1, S2 both zero or both inf  0xffc00000
           S1 zero or S2 inf             inf with sign s
           S1 inf or S2 zero             zero with sign s
           exp(S2) - exp(S1) < -150      zero with sign s
           S0 NaN                        inf with sign s
           otherwise                     |S0| with sign s (a denormal S0 too)
-        clamp gives +0 for NaN, zeros and negatives and 1.0 from 1.0 up; omod is ignored. Integer ops only."""
+        clamp gives +0 for NaN, zeros and negatives and 1.0 from 1.0 up; omod scales the result first (a zero or denormal result becomes +0, a NaN is kept). Integer ops only."""
         u = self.cu
 
         def op(opc, *xs, ty="%uint"):
@@ -4094,9 +4094,19 @@ class Gen:
                           (lor(i1, z2), sign),
                           (lor(z1, i2), signed_inf),
                           (lor(land(z1, z2), land(i1, i2)), u(0xFFC00000)),
-                          (nan1, op("OpBitwiseOr", w1, u(0x400000))),
-                          (nan2, op("OpBitwiseOr", w2, u(0x400000)))):
+                          (nan1, w1),
+                          (nan2, w2)):
             d = sel(cond, val, d)
+        # omod (game MODE, IEEE off): scale a non-NaN result; a zero or denormal result becomes +0, a NaN is kept
+        k = {"mul:2": 2.0, "mul:4": 4.0, "div:2": 0.5}
+        om = [x for x in mods if x in k]
+        if om:
+            e = op("OpBitFieldUExtract", d, u(23), u(8))
+            sc = self.tou(op("OpFMul", self.tof(d), self.fconst(k[om[0]]), ty="%float"))
+            se = op("OpBitFieldUExtract", sc, u(23), u(8))
+            sc = sel(cmp("OpIEqual", se, u(0)), u(0), sc)
+            sc = sel(cmp("OpIEqual", e, u(0)), u(0), sc)
+            d = sel(cmp("OpUGreaterThan", op("OpBitwiseAnd", d, u(0x7FFFFFFF)), u(0x7F800000)), d, sc)
         if "clamp" in mods:
             # measured: NaN, zeros and negatives give +0, 1.0 and up (+inf too) give 1.0; a positive denormal stays
             pos = land(cmp("OpULessThanEqual", d, inf), cmp("OpINotEqual", d, u(0)))

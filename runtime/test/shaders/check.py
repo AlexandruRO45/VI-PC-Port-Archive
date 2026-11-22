@@ -253,9 +253,9 @@ CVT_F32_SAT_CASES = (
     (0x7F800001, 0, 0), (0xFFC00000, 0, 0))
 # cs_div_fixup_f32.asm: D for 20 v_div_fixup_f32 cases (derived in the .asm header, measured on RDNA2 gfx1036), then
 # untouched words.
-DIV_FIXUP_F32_WORDS = [0xBFC00000, 0x3FC00000, 0x7FE00000, 0xFFC00001, 0xFFC00000, 0xFFC00000, 0xFF800000,
+DIV_FIXUP_F32_WORDS = [0xBFC00000, 0x3FC00000, 0x7FA00000, 0xFF800001, 0xFFC00000, 0xFFC00000, 0xFF800000,
                        0x7F800000, 0x80000000, 0x00000000, 0x80000000, 0x80000000, 0x00800003, 0xFF800000,
-                       0x00000005, 0x3FC00000, 0xBFC00000, 0x00000000, 0x3F800000, 0x3FC00000] + [0xEEEEEEEE] * 44
+                       0x00000005, 0x3FC00000, 0xBFC00000, 0x00000000, 0x3F800000, 0x40400000] + [0xEEEEEEEE] * 44
 # v_cvt_pk_u8_f32 (cs_cvt_pk_u8.asm), measured natively on RDNA2 (gfx1036): halves round to even, NaN gives 0.
 CVT_PK_U8_WORDS = [0x1122330C, 0x11220E44, 0x11003344, 0xFE223344, 0x1122330D, 0x11220044, 0x11FF3344, 0x00223344]
 # Wave64-only dump tests (mostly the x = cross-half checks): exact results need 64 lanes, or an emulation of them
