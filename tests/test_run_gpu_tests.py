@@ -645,5 +645,43 @@ class FmaFusedSuite(unittest.TestCase):
         self.assertIn("SKIP (unsupported: no VK_KHR_shader_fma)", out)
 
 
+class VerbatimListingLines(unittest.TestCase):
+    """An .asm line with `; encoding: [...]` reaches the translator as written (forms llvm-mc 21 cannot assemble,
+    such as FSPX's scalar lists ending in vcc_lo,vcc_hi); the other lines are assembled (TEST-593)."""
+
+    VCC = "s_buffer_load_dword s10, [s104,s105,vcc_lo,vcc_hi], 0x0 ; encoding: [0xb4,0x02,0x20,0xf4,0x00,0x00,0x00,0xfa]"
+    SOURCE = f"; header\ns_mov_b32 s4, 0x40\n{VCC}\n\ns_endpgm\n"
+    ASSEMBLED = ("\t.text\n\ts_mov_b32 s4, 0x40 ; encoding: [0xff,0x03,0x84,0xbe,0x40,0x00,0x00,0x00]\n"
+                 "\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]\n")
+
+    def test_split_keeps_comments_and_marks_the_verbatim_line(self):
+        text, order = rgt.split_verbatim(self.SOURCE)
+        self.assertNotIn("vcc_lo", text)
+        self.assertIn("; header", text)
+        self.assertEqual(order, [None, "\t" + self.VCC, None])
+
+    def test_plain_source_has_no_verbatim_lines(self):
+        self.assertEqual(rgt.split_verbatim("s_mov_b32 s4, 1 ; a comment\ns_endpgm\n")[1], [None, None])
+
+    def run_assemble(self, stdout):
+        with tempfile.TemporaryDirectory() as tmp:
+            asm, out = Path(tmp) / "cs_x.asm", Path(tmp) / "cs_x.s"
+            asm.write_text(self.SOURCE, encoding="utf-8")
+            done = SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+            with patch.object(rgt.mc_command, "run", return_value=done) as run:
+                rgt.assemble_to_s("llvm-mc", str(asm), str(out), "cs_x")
+            return out.read_text(encoding="utf-8").splitlines(), run.call_args.kwargs["input"]
+
+    def test_assembled_and_verbatim_lines_keep_the_source_order(self):
+        lines, fed = self.run_assemble(self.ASSEMBLED)
+        self.assertNotIn("vcc_lo", fed)
+        self.assertEqual(lines[1:], ["\ts_mov_b32 s4, 0x40 ; encoding: [0xff,0x03,0x84,0xbe,0x40,0x00,0x00,0x00]",
+                                     "\t" + self.VCC, "\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]"])
+
+    def test_a_line_count_mismatch_is_an_error(self):
+        with self.assertRaises(RuntimeError):
+            self.run_assemble("\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]\n")
+
+
 if __name__ == "__main__":
     unittest.main()

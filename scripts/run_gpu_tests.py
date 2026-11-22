@@ -91,10 +91,30 @@ def make_ms_psv0(threads_x: int, maxv: int, maxp: int, topology: int = 2, group_
     return struct.pack("<I", len(r)) + bytes(r)
 
 
+def split_verbatim(raw: str) -> tuple[str, list]:
+    """The .asm text for llvm-mc, and the listing lines to keep as written: an instruction line that already has
+    `; encoding: [...]` is taken verbatim (for forms llvm-mc cannot assemble, such as FSPX's scalar lists ending in
+    vcc_lo,vcc_hi, which only LLVM 23 prints, for gfx1030-class targets), every other instruction line is
+    assembled. The list holds, per instruction line in order, the verbatim text or None (take the next assembled
+    line)."""
+    kept, order = [], []
+    for ln in raw.splitlines():
+        s = ln.strip()
+        if not s or s.startswith(";"):
+            kept.append(ln)
+            continue
+        if re.search(r";\s*encoding:\s*\[(0x[0-9a-fA-F]{2},?)+\]\s*$", s):
+            order.append("\t" + s)
+        else:
+            kept.append(ln)
+            order.append(None)
+    return "\n".join(kept) + "\n", order
+
+
 def assemble_to_s(llvm_mc: str, asm_path: str, s_path: str, name: str) -> None:
     """Assemble raw RDNA2 .asm with llvm-mc -show-encoding into .s format for rdna2spirv.py."""
     with open(asm_path, encoding="utf-8") as source:
-        raw = source.read()
+        raw, order = split_verbatim(source.read())
     cmd = mc_command.mc_command(llvm_mc) + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
     for ln in raw.splitlines():
         s = ln.strip()
@@ -118,12 +138,15 @@ def assemble_to_s(llvm_mc: str, asm_path: str, s_path: str, name: str) -> None:
     )
     if p.returncode != 0:
         raise RuntimeError(f"llvm-mc failed on {name}:\n{p.stderr}")
+    assembled = [ln for ln in p.stdout.splitlines()
+                 if ln.startswith("\t") and not ln.startswith("\t.") and not ln.strip().startswith(".")]
+    if any(v is not None for v in order) and len(assembled) != order.count(None):
+        raise RuntimeError(f"{name}: llvm-mc gave {len(assembled)} instructions for {order.count(None)} lines; "
+                           "a fixture with verbatim `; encoding:` lines needs one instruction per other line")
     lines = [f"; {name}  code 0x0..0x0 (synthetic), gfx1013, 0 invalid words"]
-    for ln in p.stdout.splitlines():
-        if ln.startswith("\t.") or ln.strip().startswith("."):
-            continue
-        if ln.startswith("\t"):
-            lines.append(ln)
+    queue = iter(assembled)
+    for verbatim in order if any(v is not None for v in order) else [None] * len(assembled):
+        lines.append(verbatim if verbatim is not None else next(queue))
     with open(s_path, "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -905,7 +928,8 @@ def run_suite(a, work: str) -> int:
             results.append((name, ok, problem or f"4096 pixels in each of {len(GET_LOD_TESTS[name])} draw(s): the "
                             "clamped and the calculated LOD within 1/16"))
         elif name in ("cs_bounds", "cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_smem_sconst_off", "cs_buf_tail", "cs_oob_select", "cs_oob_tail",
-                      "cs_buf_swizzle", "cs_cmpx_class_f32", "cs_cvt_pk_u8", "cs_buf_load_sub", "cs_buf_fmt8"):
+                      "cs_buf_swizzle", "cs_cmpx_class_f32", "cs_cvt_pk_u8", "cs_buf_load_sub", "cs_buf_fmt8",
+                      "cs_fspx_slist", "cs_fspx_src_scc"):
             # num_records bounds check (cs_bounds.asm): the out-of-bounds store is dropped and the out-of-bounds
             # load reads 0, so thread 0's four output words are fixed. One thread, no wave64 requirement.
             # cs_cmpx_class_f32 and cs_cvt_pk_u8 are per-lane and need no particular subgroup width either.
@@ -932,6 +956,10 @@ def run_suite(a, work: str) -> int:
                 # TEST-510: sub-dword MUBUF loads (RAW end check by element size) and GFX10_FORMAT_8_UINT
                 "cs_buf_load_sub": [0x80, 0xFFFFFF80, 0x1FF, 0xFFFF807F, 0xAB01, 0xCD, 0, 0],
                 "cs_buf_fmt8": [0x7F, 0x80, 0xFF, 0x01, 0, 0, 0xFF, 1],
+                # TEST-593: FSPX scalar lists ending in vcc_lo,vcc_hi, and src_scc (derivations in each .asm)
+                "cs_fspx_slist": [0xF5F00000, 0xF5F00005, 0xF5F00006, 0xF5F00007, 0xF5F00000, 0xF5F0000F,
+                                  0xCAFE1234, 0xBEEF5678],
+                "cs_fspx_src_scc": [21, 20, 1, 11],
             }[name]
             words = dump_words(msg)
             vals = words[:len(want)] if words else []
