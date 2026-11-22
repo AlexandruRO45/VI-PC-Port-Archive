@@ -1284,5 +1284,133 @@ class TestValuSadU8IEEE754Boundaries(unittest.TestCase):
         self.assertEqual(ref_sad_u8_sum(b_one, b_next), 1)
 
 
+class TestValuSadU8NegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_negative_control_sgpr_as_destination(self) -> None:
+        with self.assertRaises(TypeError):
+            VSadU8Instruction(
+                dst=Operand.sgpr(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.vgpr(3),
+            )
+        with self.assertRaises(TypeError):
+            VSadHiU8Instruction(
+                dst=Operand.sgpr(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.vgpr(3),
+            )
+        with self.assertRaises(TypeError):
+            VMsadU8Instruction(
+                dst=Operand.sgpr(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.vgpr(3),
+            )
+
+    def test_negative_control_literal_as_destination(self) -> None:
+        with self.assertRaises(TypeError):
+            VSadU8Instruction(
+                dst=Operand.literal(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.vgpr(3),
+            )
+
+    def test_negative_control_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+        with self.assertRaises(ValueError):
+            Operand.vgpr(-1)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(-1)
+
+    def test_negative_control_wave_state_boundaries(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=16)
+        wave = SIMDWaveState(wave_size=32)
+        with self.assertRaises(IndexError):
+            wave.is_lane_active(32)
+        with self.assertRaises(IndexError):
+            wave.is_lane_active(-1)
+
+    def test_mutation_detection_signed_vs_unsigned_byte_diff(self) -> None:
+        def mutant_signed_byte_sad(s0: int, s1: int) -> int:
+            total = 0
+            for i in range(4):
+                b0 = extract_byte(s0, i)
+                b1 = extract_byte(s1, i)
+                # Faulty signed interpretation: 0xFF is -1
+                s8_0 = b0 - 256 if (b0 & 0x80) else b0
+                s8_1 = b1 - 256 if (b1 & 0x80) else b1
+                total += abs(s8_0 - s8_1)
+            return total
+
+        s0 = pack_bytes(0, 0, 0, 0)
+        s1 = pack_bytes(255, 255, 255, 255)
+        # In correct unsigned SAD: |0 - 255| * 4 = 1020
+        # In mutant signed SAD: |0 - (-1)| * 4 = 4
+        correct = ref_sad_u8_sum(s0, s1)
+        mutant = mutant_signed_byte_sad(s0, s1)
+        self.assertNotEqual(correct, mutant)
+        self.assertEqual(correct, 1020)
+        self.assertEqual(mutant, 4)
+
+    def test_mutation_detection_sad_hi_shift(self) -> None:
+        def mutant_sad_hi_u8(s0: int, s1: int, s2: int) -> int:
+            # Faulty: forgets << 16 shift
+            sad = ref_sad_u8_sum(s0, s1)
+            return (s2 + sad) & MASK32
+
+        s0 = pack_bytes(1, 1, 1, 1)
+        s1 = pack_bytes(0, 0, 0, 0)
+        s2 = 0x0001_0000
+        # Correct: sad=4, shifted = 4 << 16 = 0x0004_0000 -> result = 0x0005_0000
+        # Mutant: 0x0001_0000 + 4 = 0x0001_0004
+        correct = ref_sad_hi_u8(s0, s1, s2)
+        mutant = mutant_sad_hi_u8(s0, s1, s2)
+        self.assertNotEqual(correct, mutant)
+        self.assertEqual(correct, 0x0005_0000)
+        self.assertEqual(mutant, 0x0001_0004)
+
+    def test_mutation_detection_msad_mask_check(self) -> None:
+        def mutant_msad_u8_sum(s0: int, s1: int) -> int:
+            # Faulty: fails to mask out when s1 byte is zero
+            total = 0
+            for i in range(4):
+                total += ref_byte_abs_diff(extract_byte(s0, i), extract_byte(s1, i))
+            return total
+
+        s0 = pack_bytes(100, 100, 100, 100)
+        s1 = pack_bytes(0, 100, 0, 100)
+        # Correct msad: bytes 0 and 2 skipped; bytes 1 and 3 have diff 0 -> sum = 0
+        # Mutant: bytes 0 and 2 have diff 100 each -> sum = 200
+        correct = ref_msad_u8_sum(s0, s1)
+        mutant = mutant_msad_u8_sum(s0, s1)
+        self.assertNotEqual(correct, mutant)
+        self.assertEqual(correct, 0)
+        self.assertEqual(mutant, 200)
+
+    def test_mutation_detection_clamping_wrap(self) -> None:
+        def mutant_clamped_sad_u8(s0: int, s1: int, s2: int) -> int:
+            # Faulty: wraps modulo 2^32 instead of saturating
+            return (ref_sad_u8_sum(s0, s1) + (s2 & MASK32)) & MASK32
+
+        s0 = pack_bytes(1, 0, 0, 0)
+        s1 = pack_bytes(0, 0, 0, 0)
+        s2 = MASK32
+        # Correct: saturated to MASK32 (0xFFFFFFFF)
+        # Mutant: wraps to 0
+        correct = ref_sad_u8(s0, s1, s2, clamp=True)
+        mutant = mutant_clamped_sad_u8(s0, s1, s2)
+        self.assertNotEqual(correct, mutant)
+        self.assertEqual(correct, MASK32)
+        self.assertEqual(mutant, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
