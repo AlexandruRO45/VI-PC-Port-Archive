@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iterator>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 using Microsoft::WRL::ComPtr;
 
@@ -53,7 +54,7 @@ bool check_mesh_entry_draw(ID3D12Device* device, const char* first, const char* 
     auto pixel = read_bytes(second);
     D3D12_ROOT_PARAMETER params[4]{};
     D3D12_DESCRIPTOR_RANGE cbv_range{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 2, 0, 0, 0};
-    const bool uses_table = binding != MeshConstantBinding::root;
+    const bool uses_table = binding == MeshConstantBinding::table || binding == MeshConstantBinding::swapped_table;
     if (uses_table) {
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[0].DescriptorTable = {1, &cbv_range};
@@ -124,6 +125,7 @@ bool check_mesh_entry_draw(ID3D12Device* device, const char* first, const char* 
     const auto base = upload->GetGPUVirtualAddress();
     std::array<ComPtr<ID3D12Resource>, 2> constants;
     ComPtr<ID3D12DescriptorHeap> cbv_heap;
+    ComPtr<ID3D12Resource> buffer_b;
     if (uses_table) {
         D3D12_DESCRIPTOR_HEAP_DESC cbv_heap_desc{};
         cbv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -145,8 +147,18 @@ bool check_mesh_entry_draw(ID3D12Device* device, const char* first, const char* 
         list->SetDescriptorHeaps(1, heaps);
         list->SetGraphicsRootDescriptorTable(0, cbv_heap->GetGPUDescriptorHandleForHeapStart());
     } else {
-        list->SetGraphicsRootConstantBufferView(0, base);
-        list->SetGraphicsRootConstantBufferView(1, base + cb_bytes);
+        D3D12_GPU_VIRTUAL_ADDRESS cbv[2]{base, base + cb_bytes};
+        if (binding != MeshConstantBinding::root) {
+            // Keep A and B in distinct resources with identical contents across binding orders.
+            buffer_b = make_buffer(device, cb_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+            check(buffer_b->Map(0, &empty, &mapped), "Map constant buffer B");
+            std::memcpy(mapped, input.data() + cb_bytes, cb_bytes);
+            buffer_b->Unmap(0, nullptr);
+            cbv[1] = buffer_b->GetGPUVirtualAddress();
+            if (binding == MeshConstantBinding::swapped_root_pair) std::swap(cbv[0], cbv[1]);
+        }
+        list->SetGraphicsRootConstantBufferView(0, cbv[0]);
+        list->SetGraphicsRootConstantBufferView(1, cbv[1]);
     }
     if (vertices) list->SetGraphicsRootShaderResourceView(vertex_slot, base + 2 * cb_bytes);
     const D3D12_VIEWPORT viewport{0, 0, side, side, 0, 1};

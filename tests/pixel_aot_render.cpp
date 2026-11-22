@@ -6,6 +6,7 @@
 #include <cmath>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <string_view>
 
 using namespace bvh_fixture;
@@ -50,6 +51,7 @@ struct PixelInput {
     std::vector<BYTE> coverage;
     bool integerRT = false;      // bit 0 of the optional case-trailer flags byte
     std::vector<BYTE> nanMask;   // 64 per-texel NaN-class mask bytes, empty without a trailer
+    std::optional<D3D12_VIEWPORT> viewport;
 };
 
 struct MipDraw {
@@ -205,8 +207,9 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
         };
         const float viewportWidth = viewportAxis(width, input.width, base.width);
         const float viewportHeight = viewportAxis(height, input.height, base.height);
-        const D3D12_VIEWPORT viewport{(width - viewportWidth) * 0.5f, (height - viewportHeight) * 0.5f,
-                                      viewportWidth, viewportHeight, 0, 1};
+        const D3D12_VIEWPORT viewport = input.viewport.value_or(
+            D3D12_VIEWPORT{(width - viewportWidth) * 0.5f, (height - viewportHeight) * 0.5f,
+                           viewportWidth, viewportHeight, 0, 1});
         const D3D12_RECT scissor{0,0,LONG(width),LONG(height)};
         list->RSSetViewports(1, &viewport);
         list->RSSetScissorRects(1, &scissor);
@@ -384,9 +387,20 @@ void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB,
         if (file.peek() != std::char_traits<char>::eof()) {
             BYTE flags = 0;
             file.read(reinterpret_cast<char*>(&flags), 1);
-            if (flags & 0xfeu)
+            if (flags & 0xfcu)
                 throw std::runtime_error("Unknown case trailer flag bits");
             input.integerRT = (flags & 1u) != 0;
+            if (flags & 2u) {
+                std::array<UINT, 4> rect{};
+                file.read(reinterpret_cast<char*>(rect.data()), sizeof(rect));
+                const auto [left, top, width, height] = rect;
+                if (!file || !width || !height || left >= input.width || top >= input.height ||
+                    width > input.width - left || height > input.height - top)
+                    throw std::runtime_error("Invalid pixel case viewport");
+                // Explicit viewport cases provide one reference color per target pixel.
+                input.scale = 1;
+                input.viewport = D3D12_VIEWPORT{float(left), float(top), float(width), float(height), 0, 1};
+            }
             if (file.peek() != std::char_traits<char>::eof()) {
                 if (input.integerRT)
                     throw std::runtime_error("NaN-class masks require a floating-point render target");
@@ -394,7 +408,7 @@ void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB,
                 file.read(reinterpret_cast<char*>(input.nanMask.data()),
                           static_cast<std::streamsize>(input.nanMask.size()));
                 if (!file || file.peek() != std::char_traits<char>::eof())
-                    throw std::runtime_error("Case trailer must hold one flags byte and 64 mask bytes");
+                    throw std::runtime_error("Expected exactly 64 NaN mask bytes after the case trailer fields");
             }
         }
     }

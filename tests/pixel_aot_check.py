@@ -52,6 +52,13 @@ RAMP = (0, 16, 37, 64, 101, 153, 219, 254)
 # pipeline's FLOAT_MODE is unmeasured, so this records the harness's assumption rather than a claim
 # about the console; binary16 and binary64 denormal behavior is established separately, not here.
 F32_DENORM_MODE = "preserve"
+# Binary16 subnormals are preserved by construction, whatever -denorm says. Packed f16 operations
+# widen each half from its encoding (widen16), compute in binary32 and narrow in integer arithmetic
+# (pack16_rne). Every binary16 subnormal and every product or sum of two of them is a binary32
+# normal, so a binary32 flush never reaches them, and DXIL records no f16 denormal mode to request.
+# The Python references keep binary16 subnormals too. Like the f32 mode, this is the harness's
+# recorded assumption, not a claim about the Scarlett FLOAT_MODE f16 bits.
+F16_DENORM_MODE = "preserve"
 
 # Integer-to-binary32 references convert through Python's binary64 float, which holds every 32-bit
 # integer exactly, then pack to binary32, rounding ties to even. The Scarlett pipeline's MODE.FP_ROUND
@@ -890,6 +897,17 @@ def predicate_group_e64(first):
     return with_constants(body)
 
 
+def run_pixel_batch(renderer, backend, shader, cases):
+    command = [renderer, backend, "--check-pixel-batch", shader, *(path for path, _ in cases)]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode == 77:
+        result.check_returncode()
+    expected = [f"case={i} status={status}" for i, (_, status) in enumerate(cases)]
+    actual = [line for line in result.stdout.splitlines() if line.startswith("case=")]
+    if actual != expected or result.returncode != int(any(status != "pass" for _, status in cases)):
+        raise AssertionError(f"Expected {expected}\n{result.stdout}\n{result.stderr}")
+
+
 def check_e64_draws(directory, compiler, renderer, backend):
     source = directory / "e64.hlsl"
     shader = directory / "e64.cso"
@@ -897,16 +915,6 @@ def check_e64_draws(directory, compiler, renderer, backend):
         path = directory / f"e64-{len(cases)}.case"
         path.write_bytes(constants + struct.pack("<4f", *expected) * 64)
         cases.append((path, status))
-
-    def run_cases(cases):
-        command = [renderer, backend, "--check-pixel-batch", shader, *(path for path, _ in cases)]
-        result = subprocess.run(command, capture_output=True, text=True)
-        if result.returncode == 77:
-            result.check_returncode()
-        expected = [f"case={i} status={status}" for i, (_, status) in enumerate(cases)]
-        actual = [line for line in result.stdout.splitlines() if line.startswith("case=")]
-        if actual != expected or result.returncode != int(any(status != "pass" for _, status in cases)):
-            raise AssertionError(f"Expected {expected}\n{result.stdout}\n{result.stderr}")
 
     x, y, z, w = E64_ARITH_INPUTS
     assert [math.floor(-abs(x)), -y - math.floor(-y), max(-z, abs(w)), min(z, -abs(w))] == E64_ARITH[0][1]
@@ -923,7 +931,7 @@ def check_e64_draws(directory, compiler, renderer, backend):
             wrong_values[channel] = value
             add_case(cases, constants, wrong_values, "mismatch")
         add_case(cases, constants, expected, "pass")
-        run_cases(cases)
+        run_pixel_batch(renderer, backend, shader, cases)
     inputs = ((-1, 1, 0), (-0.0, 0.0, 1), (1, -1, 2), (math.nan, 1, 3), (1, math.nan, 3))
     negated = {0: 2, 1: 1, 2: 0, 3: 3}
     for first in range(0, 16, 4):
@@ -939,7 +947,7 @@ def check_e64_draws(directory, compiler, renderer, backend):
             unnegated = [float((op >> relation) & 1) for op in range(first, first + 4)]
             if unnegated != expected:
                 add_case(cases, constants, unnegated, "mismatch")
-        run_cases(cases)
+        run_pixel_batch(renderer, backend, shader, cases)
 
 
 def bitwise_program():
@@ -1049,8 +1057,6 @@ def check_mad_draw(directory, compiler, renderer, backend):
 def check_predicate_draws(directory, compiler, renderer, backend):
     source = directory / "predicates.hlsl"
     shader = directory / "predicates.cso"
-    case = directory / "predicates.case"
-    draw = [renderer, backend, "--check-pixel-case", shader, case]
     # Isolate each negated relation so another predicate cannot supply the unordered test. An
     # unordered relational fcmp alone is not enough: the Windows 10 in-box WARP 10.0.19041
     # evaluates fcmp ult, ule, ugt and uge as their ordered forms.
@@ -1064,32 +1070,31 @@ def check_predicate_draws(directory, compiler, renderer, backend):
         dxil = listing.read_text(encoding="utf-8")
         if not any(text in dxil for text in ("@dx.op.isSpecialFloat.f32(i32 8,", "fcmp uno ", "fcmp ueq ")):
             raise AssertionError(f"{op.upper()} lacks an explicit unordered comparison in DXIL")
-    inputs = ((-1, 1, 0), (-0.0, 0.0, 1), (1, -1, 2),
-              (math.nan, 1, 3), (1, math.nan, 3))
+    inputs = (("lt", -1, 1, 0), ("signed-zero", -0.0, 0.0, 1), ("gt", 1, -1, 2),
+              ("left-nan", math.nan, 1, 3), ("right-nan", 1, math.nan, 3))
     for first in range(0, 16, 4):
         source.write_text(translate(predicate_group(first)), encoding="ascii")
         compile_shader(compiler, source, shader)
-        for left, right, relation in inputs:
+        cases = []
+        for label, left, right, relation in inputs:
             constants = bytearray(256)
             struct.pack_into("<4f", constants, 12, left, right, 0, 1)
             pixel = tuple((op >> relation) & 1 for op in range(first, first + 4))
+            case = directory / f"predicates-{first}-{label}.case"
             write_case(case, constants, pixel)
-            try:
-                subprocess.run(draw, check=True)
-            except subprocess.CalledProcessError as error:
-                channels = ", ".join(
-                    f"{channel}={op}" for channel, op in enumerate(PREDICATES[first:first + 4])
-                )
-                error.add_note(
-                    f"Predicate draw on {backend}, first={first}, left={left!r}, right={right!r}, channels {channels}"
-                )
-                raise
-    # Keep the unordered oracle and change only the NaN operand to equal.
-    struct.pack_into("<f", constants, 16, 1.0)
-    write_case(case, constants, pixel)
-    wrong = subprocess.run(draw, capture_output=True, text=True)
-    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
-        raise AssertionError("Replacing NaN with a finite equal operand escaped detection")
+            cases.append((case, "pass"))
+        if first == 12:
+            # Keep the unordered oracle and replace the final NaN operand with an equal value.
+            struct.pack_into("<f", constants, 16, 1.0)
+            wrong = directory / f"predicates-{first}-finite-instead-of-nan.case"
+            write_case(wrong, constants, pixel)
+            cases.insert(-1, (wrong, "mismatch"))
+        try:
+            run_pixel_batch(renderer, backend, shader, cases)
+        except AssertionError as error:
+            channels = ", ".join(f"{channel}={op}" for channel, op in enumerate(PREDICATES[first:first + 4]))
+            error.add_note(f"Predicate draw on {backend}, first={first}, channels {channels}")
+            raise
 
 
 def check_int_predicate_draws(directory, compiler, renderer, backend):
@@ -2728,6 +2733,195 @@ def check_three_way_templates():
                                    {"a": a, "b": b, "c": c}) for name in ("min3", "max3", "med3")}
                 assert pick == {"min3": min(a, b, c), "max3": max(a, b, c),
                                 "med3": sorted((a, b, c))[1]}, (a, b, c)
+# Quad-local DPP16 and DPP8 integer/bitwise/shift/bit-scan fixture covering 23 VOP1/VOP2 DPP forms.
+# Derives integer quad lane ID {0, 1, 2, 3} from interpolated uv.x/uv.y (v8/v9), verifies quad
+# swizzles across lanes, folds all 23 ops into a 32-bit accumulator, and exports all 4 bytes as
+# exact [0, 255] integers.
+DPP_INT32_BODY = [
+    "v_mov_b32_e32 v17, 0",
+    "v_or_b32_dpp v18, v8, v17 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf",
+    "v_or_b32_dpp v19, v9, v17 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf",
+    "v_or_b32_dpp v20, v8, v17 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_or_b32_dpp v21, v9, v17 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_sub_f32_e32 v18, v20, v18",
+    "v_sub_f32_e32 v19, v21, v19",
+    "v_mul_f32_e32 v18, 0x42800000, v18",
+    "v_mul_f32_e32 v19, 0x43000000, v19",
+    "v_add_f32_e32 v20, v18, v19",
+    "v_add_f32_e32 v20, 0x4b000000, v20",
+    "v_mov_b32_e32 v17, 3",
+    "v_and_b32_dpp v20, v20, v17 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_sub_nc_u32_dpp v21, v20, v20 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_mul_i32_i24_dpp v21, v21, v21 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_subrev_nc_u32_dpp v22, v20, v20 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_mul_i32_i24_dpp v22, v22, v22 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_add_nc_u32_dpp v23, v20, v20 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf",
+    "v_sub_nc_u32_dpp v24, v20, v20 dpp8:[1,2,3,0,5,6,7,4]",
+    "v_and_b32_dpp v24, v24, v17 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_mov_b32_e32 v25, s44",
+    "v_mov_b32_e32 v26, s45",
+    "v_mov_b32_e32 v27, s46",
+    "v_mov_b32_e32 v28, s47",
+    "v_min_i32_dpp v29, v25, v26 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_max_i32_dpp v30, v25, v26 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_min_u32_dpp v31, v25, v26 dpp8:[3,2,1,0,7,6,5,4]",
+    "v_max_u32_dpp v32, v25, v26 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf",
+    "v_mul_u32_u24_dpp v33, v25, v26 dpp8:[1,0,3,2,5,4,7,6]",
+    "v_mul_hi_u32_u24_dpp v34, v25, v26 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_mul_hi_i32_i24_dpp v35, v25, v26 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_xor_b32_dpp v36, v29, v30 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_xnor_b32_dpp v37, v31, v32 dpp8:[2,3,0,1,6,7,4,5]",
+    "v_not_b32_dpp v38, v27 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf",
+    "v_lshlrev_b32_dpp v39, v28, v25 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_lshrrev_b32_dpp v40, v28, v26 dpp8:[1,0,3,2,5,4,7,6]",
+    "v_ashrrev_i32_dpp v41, v28, v25 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_bfrev_b32_dpp v42, v27 dpp8:[3,2,1,0,7,6,5,4]",
+    "v_ffbl_b32_dpp v43, v27 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_ffbh_u32_dpp v44, v27 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_ffbh_i32_dpp v45, v25 dpp8:[2,3,0,1,6,7,4,5]",
+    "v_add_nc_u32_dpp v30, v21, v22 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_add_nc_u32_dpp v30, v30, v23 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_add_nc_u32_dpp v30, v30, v24 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_xor_b32_dpp v30, v30, v33 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_add_nc_u32_dpp v30, v30, v34 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_xor_b32_dpp v30, v30, v35 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_add_nc_u32_dpp v30, v30, v36 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_xor_b32_dpp v30, v30, v37 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_add_nc_u32_dpp v30, v30, v38 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_xor_b32_dpp v30, v30, v39 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_add_nc_u32_dpp v30, v30, v40 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_xor_b32_dpp v30, v30, v41 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_add_nc_u32_dpp v30, v30, v42 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_xor_b32_dpp v30, v30, v43 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_add_nc_u32_dpp v30, v30, v44 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_xor_b32_dpp v30, v30, v45 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_mov_b32_e32 v46, 0xff",
+    "v_mov_b32_e32 v47, 8",
+    "v_mov_b32_e32 v48, 16",
+    "v_mov_b32_e32 v49, 24",
+    "v_and_b32_dpp v50, v30, v46 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_lshrrev_b32_dpp v51, v47, v30 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_and_b32_dpp v51, v51, v46 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_lshrrev_b32_dpp v52, v48, v30 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_and_b32_dpp v52, v52, v46 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_lshrrev_b32_dpp v53, v49, v30 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_cvt_f32_f16_e32 v12, v50",
+    "v_mul_f32_e32 v12, 0x4b800000, v12",
+    "v_cvt_f32_f16_e32 v13, v51",
+    "v_mul_f32_e32 v13, 0x4b800000, v13",
+    "v_cvt_f32_f16_e32 v14, v52",
+    "v_mul_f32_e32 v14, 0x4b800000, v14",
+    "v_cvt_f32_f16_e32 v15, v53",
+    "v_mul_f32_e32 v15, 0x4b800000, v15",
+]
+
+DPP_INT32_SETS = (
+    # Set 1: negative i24/i32 in s44, positive in s45, mixed bits in s46, shift >= 32 (37 -> 5).
+    (0xff801234, 0x007f5678, 0x00108040, 37),
+    # Set 2: extreme i24 (-2^23 * 2^23-1), zero input for ffbl/ffbh (-1), all-ones sign for ffbh_i32.
+    (0xffffffff, 0x007fffff, 0x00000000, 13),
+    # Set 3: negative * negative i24 (-2^23 * -2^23 -> +0x4000 high), MSB=1 for ffbh_u32=0.
+    (0x00800000, 0x00800000, 0x80000001, 31),
+)
+
+
+def dpp_int32_reference(a, b, c, shift):
+    m32 = 0xffffffff
+
+    def i32(x):
+        x &= m32
+        return x - 0x100000000 if x & 0x80000000 else x
+
+    def i24(x):
+        x &= 0xffffff
+        return x - 0x1000000 if x & 0x800000 else x
+
+    def ffbl(x):
+        x &= m32
+        return m32 if x == 0 else (x & -x).bit_length() - 1
+
+    def ffbh_u(x):
+        x &= m32
+        return m32 if x == 0 else 32 - x.bit_length()
+
+    def ffbh_i(x):
+        x &= m32
+        m = (~x & m32) if (x & 0x80000000) else x
+        return m32 if m == 0 else 32 - m.bit_length()
+
+    s = shift & 31
+    v21, v22, v23, v24 = 1, 4, 3, 1
+    v29 = min(i32(a), i32(b)) & m32
+    v30_max = max(i32(a), i32(b)) & m32
+    v31 = min(a & m32, b & m32)
+    v32 = max(a & m32, b & m32)
+    v33 = ((a & 0xffffff) * (b & 0xffffff)) & m32
+    v34 = (((a & 0xffffff) * (b & 0xffffff)) >> 32) & m32
+    v35 = ((i24(a) * i24(b)) >> 32) & m32
+    v36 = (v29 ^ v30_max) & m32
+    v37 = (~(v31 ^ v32)) & m32
+    v38 = (~c) & m32
+    v39 = ((a & m32) << s) & m32
+    v40 = (b & m32) >> s
+    v41 = (i32(a) >> s) & m32
+    v42 = int(f"{c & m32:032b}"[::-1], 2)
+    v43 = ffbl(c)
+    v44 = ffbh_u(c)
+    v45 = ffbh_i(a)
+
+    acc = (v21 + v22 + v23 + v24) & m32
+    acc = (acc ^ v33) & m32
+    acc = (acc + v34) & m32
+    acc = (acc ^ v35) & m32
+    acc = (acc + v36) & m32
+    acc = (acc ^ v37) & m32
+    acc = (acc + v38) & m32
+    acc = (acc ^ v39) & m32
+    acc = (acc + v40) & m32
+    acc = (acc ^ v41) & m32
+    acc = (acc + v42) & m32
+    acc = (acc ^ v43) & m32
+    acc = (acc + v44) & m32
+    acc = (acc ^ v45) & m32
+    return tuple(float((acc >> (8 * k)) & 0xff) for k in range(4))
+
+
+def check_dpp_int32_draw(directory, compiler, renderer, backend):
+    program = with_constants(DPP_INT32_BODY)
+    source = directory / "dpp_int32.hlsl"
+    shader = directory / "dpp_int32.cso"
+    case = directory / "dpp_int32.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    source.write_text(translate(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    for values in DPP_INT32_SETS:
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *values)
+        expected = dpp_int32_reference(*values)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+    for set_idx, old, new, label in (
+        (0, "v_sub_nc_u32_dpp v21, v20, v20 quad_perm:[1,0,3,2]",
+         "v_sub_nc_u32_dpp v21, v20, v20 quad_perm:[2,3,0,1]", "AcrossX vs AcrossY"),
+        (0, "dpp8:[1,2,3,0,5,6,7,4]", "dpp8:[3,0,1,2,7,4,5,6]", "cyclic dpp8 rotation"),
+        (0, "v_ashrrev_i32_dpp v41, v28, v25", "v_lshrrev_b32_dpp v41, v28, v25", "ashrrev vs lshrrev"),
+        (0, "v_mul_hi_i32_i24_dpp v35", "v_mul_hi_u32_u24_dpp v35", "mul_hi signed vs unsigned"),
+        (0, "v_ffbh_i32_dpp v45, v25", "v_ffbh_u32_dpp v45, v25", "ffbh signed vs unsigned"),
+    ):
+        values = DPP_INT32_SETS[set_idx]
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *values)
+        expected = dpp_int32_reference(*values)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        mutated = [line.replace(old, new) for line in program]
+        assert mutated != program, label
+        source.write_text(translate(mutated), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Mutation of {label} escaped detection")
+
+
 # Quad-local DPP16 (quad_perm) and DPP8 (dpp8) fixture covering all 20 supported VOP1/VOP2 DPP forms.
 # Derives per-quad lane ID {0, 1, 2, 3} from interpolated uv.x (v8) and uv.y (v9) so every 2x2 quad
 # carries 4 distinct values across all 4,096 pixels while exporting uniform exact binary16 results.
@@ -3201,11 +3395,26 @@ def check_pk_int16_draw(directory, compiler, renderer, backend):
             raise AssertionError(f"Mutation of {label} escaped detection")
 
 
+def check_f16_denorm_controls():
+    """CPU-side checks behind F16_DENORM_MODE: references and the lowering it relies on."""
+    assert F16_DENORM_MODE == "preserve"
+    assert f16_denorm_words(flush=False) == (0x84018001, 0x03ff0001, 0x80000200, 0x05fe0002)
+    assert f16_denorm_words(flush=True) == (0x84018000, 0x00000000, 0x80000000, 0x00000000)
+    body = translate(uncompressed_export(F16_DENORM_BODY)).split("main(", 1)[1]
+    # The mode argument holds only while binary16 values are built and narrowed from their encodings;
+    # a driver conversion or a native half type would make the result depend on the device's f16 mode.
+    for token in ("f32tof16", "f16tof32", "half", "min16float", "float16_t"):
+        assert token not in body, token
+    # Presence only: the guarantee is that halves go through these helpers, not how many calls appear.
+    assert "widen16(" in body and "pack16_rne(" in body, body
+
+
 def check_controls(directory):
     # A syntactically valid DPP VGPR must already have a tracked numeric value.
     must_reject(translate, with_constants([
         "v_mov_b32_dpp v12, v255 dpp8:[1,2,3,0,5,6,7,4]",
     ]))
+    check_f16_denorm_controls()
     program = bitwise_program()
     for before, after in (("s44, v18", "s44, |v18|"), ("20, v19", "20, v19 clamp"),
                           ("0x00700000, v18, v19", "0x00700000, v18")):
@@ -4046,6 +4255,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((buffer_color(rg), translate_buffer_color) for rg in (False, True))
     fixtures.extend((unsigned_conversion(quad), translate_buffer_color) for quad in (False, True))
     fixtures.extend((attribute_color(rg), translate_attribute) for rg in (False, True))
+    fixtures.append((with_constants(DPP_INT32_BODY), translate))
     fixtures.append((with_constants(DPP_BODY), translate))
     fixtures.extend((with_constants(body), translate) for body, *_ in SDWA_ARITH)
     fixtures.append((with_constants(PK_INT16_BODY), translate))
@@ -4160,6 +4370,73 @@ def check_denorm_mode_draw(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("A preserve-mode export matched the ftz reference")
+
+
+# Packed binary16 operations on subnormal halves. s44 holds the least (0x0001) and largest (0x03ff)
+# binary16 subnormals, s45 the least normal 0x0400 and -0, s46 0.5 in both halves and s47 -0x0401 in
+# both. The required row is the add: two normal inputs whose sum is the subnormal 0x8001, the case
+# DXIL's fadd FTZ text requires to flush. max keeps a subnormal input and the multiply makes the
+# subnormal 0x0200 from normal inputs (supplementary rows), and the fma rounds a subnormal and a normal
+# result to nearest even. v14 exports 0x80000200, a binary32 subnormal as a word, so the draw reads
+# back through the integer target, where no float path can flush the packed bits.
+F16_DENORM_BODY = [
+    "v_pk_add_f16 v12, s45, s47",
+    "v_pk_max_f16 v13, s44, s47",
+    "v_pk_mul_f16 v14, s45, s46",
+    "v_pk_fma_f16 v15, s44, s46, s44",
+]
+F16_DENORM_WORDS = (0x03ff0001, 0x80000400, 0x38003800, 0x84018401)
+
+
+def f16_denorm_words(flush):
+    """Reference words for F16_DENORM_BODY, optionally flushing binary16 subnormal inputs and results."""
+    def half(word):
+        if flush and word & 0x7c00 == 0:
+            word &= 0x8000
+        return struct.unpack("<e", struct.pack("<H", word))[0]
+
+    def pack(value):
+        word, = struct.unpack("<H", struct.pack("<e", value))
+        return word & 0x8000 if flush and word & 0x7c00 == 0 else word
+
+    a, b, c, d = F16_DENORM_WORDS
+    ops = (lambda x, y, z: x + y, lambda x, y, z: max(x, y), lambda x, y, z: x * y, lambda x, y, z: x * y + z)
+    sources = ((b, d, 0), (a, d, 0), (b, c, 0), (a, c, a))
+    words = []
+    for op, (x, y, z) in zip(ops, sources):
+        # Python doubles hold these products and sums exactly, so one rounding to binary16 matches the shader.
+        lanes = [pack(op(half(x >> s & 0xffff), half(y >> s & 0xffff), half(z >> s & 0xffff))) for s in (0, 16)]
+        words.append(lanes[0] | lanes[1] << 16)
+    return tuple(words)
+
+
+def check_f16_denorm_draw(directory, compiler, renderer, backend):
+    """Draw packed binary16 subnormals under both -denorm modes; the f32 flag must not change them."""
+    source = directory / "f16_denorm.hlsl"
+    shader = directory / "f16_denorm.cso"
+    case = directory / "f16_denorm.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    constants = bytearray(256)
+    struct.pack_into("<4I", constants, 12, *F16_DENORM_WORDS)
+    source.write_text(lower(uncompressed_export(F16_DENORM_BODY), 20, 24, [1, 2, 3, 4],
+                            constant_descriptor=64, integer_export=True), encoding="ascii")
+
+    def as_floats(words):
+        return tuple(struct.unpack("<f", struct.pack("<I", word))[0] for word in words)
+
+    preserve = f16_denorm_words(flush=False)
+    write_case(case, constants, as_floats(preserve), integer_rt=True)
+    for mode in ("preserve", "ftz"):
+        compile_shader(compiler, source, shader, mode=mode)
+        subprocess.run(draw, check=True)
+    # A reference that flushes binary16 subnormals differs from the preserve one in every channel,
+    # so the ftz build still on disk must fail it.
+    flushed = f16_denorm_words(flush=True)
+    assert all(p != f for p, f in zip(preserve, flushed)), (preserve, flushed)
+    write_case(case, constants, as_floats(flushed), integer_rt=True)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("A binary16 export matched the flushed f16 reference")
 
 
 def check_nan_class_draw(directory, compiler, renderer, backend):
@@ -4852,6 +5129,7 @@ def check_render(directory, compiler, renderer, backend, *, core_only=False):
             wrong = subprocess.run([*draw, "rgba"], capture_output=True, text=True)
             if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
                 raise AssertionError("The renderer failed to detect the changed channel order")
+    check_dpp_int32_draw(directory, compiler, renderer, backend)
     check_dpp_draw(directory, compiler, renderer, backend)
     check_vop3p_draw(directory, compiler, renderer, backend)
     check_bitwise_draw(directory, compiler, renderer, backend)
@@ -5144,6 +5422,7 @@ def check_e64_render(directory, compiler, renderer, backend):
             return 77
         raise
     check_denorm_mode_draw(directory, compiler, renderer, backend)
+    check_f16_denorm_draw(directory, compiler, renderer, backend)
     check_nan_class_draw(directory, compiler, renderer, backend)
     check_integer_readback_draw(directory, compiler, renderer, backend)
     check_cvt_int_f32_draw(directory, compiler, renderer, backend)
