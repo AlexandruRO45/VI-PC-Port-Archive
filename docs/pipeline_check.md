@@ -149,6 +149,14 @@ tool, not a pass: a skipped module has not been validated.
 
 ## Crash isolation (`--isolate`)
 
+The `make_game.py --stages pipelines` stage also recovers on Windows. It confirms any modules named in the
+last in-flight snapshot in their own processes. If the snapshot gives no confirmed name or five full runs
+have been retried, it uses one worker and splits any range that crashes in two. Finished ranges reuse the
+same pipeline cache. A module that crashes on its own is added to `pipeline_crashes.txt` and to the
+`pipeline_crashes` array in the output folder's `gpu.json`, with its FSSM SHA-256 (or its SPIR-V SHA-256
+when the index has no FSSM hash). The stage reports failure after processing the remaining ranges so a
+skipped pipeline is visible. Crashes during setup and crashes that disappear when split don't name a module.
+
 A driver that dies while compiling one module (for example the RADV `SIGFPE` in
 [#1721](https://github.com/ItsNotRexed/Leonida/issues/1721)) ends the whole process, so the rest of the corpus
 used to need that module excluded by hand with `--start/--count`. With `--isolate` (POSIX only; on Windows it

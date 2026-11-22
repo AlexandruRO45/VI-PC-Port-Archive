@@ -41,6 +41,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -1720,40 +1721,110 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         run(base)
         log("pipelines: done")
         return
-    base += ["--inflight-file", inflight]
-    crashed: "list[str]" = []
-    code = 0
+    report_path = os.path.join(out, "gpu.json")
+    try:
+        with open(report_path, encoding="utf-8") as f:
+            report = json.load(f)
+        if not isinstance(report, dict):
+            fail(f"{report_path} must contain a JSON object")
+    except FileNotFoundError:
+        report = {}
+    except (OSError, ValueError) as exc:
+        fail(f"could not read {report_path}: {exc}")
+    if "pipeline_crashes" in report:
+        del report["pipeline_crashes"]
+        write_pipeline_crash_report(report_path, report)
+
+    crashed: list[str] = []
+    index = {}
+    names = []
+    positions = {}
+
+    def record_crash(name: str, code: int) -> None:
+        meta = index[name]
+        entry = {"name": name, "exit_code": code}
+        if meta.get("fssm_sha256"):
+            entry["fssm_sha256"] = meta["fssm_sha256"]
+        else:
+            with open(os.path.join(spirv, name + ".spv"), "rb") as f:
+                entry["spirv_sha256"] = hashlib.file_digest(f, "sha256").hexdigest()
+        report.setdefault("pipeline_crashes", []).append(entry)
+        write_pipeline_crash_report(report_path, report)
+        crashed.append(name)
+        with open(skip, "a", encoding="utf-8", newline="\n") as f:
+            f.write(name + "\n")
+        log(f"pipelines: {name} took vk_pipeline_check down ({exit_label(code)}); checking the rest without it")
+
+    def skip_args() -> list[str]:
+        return ["--skip-file", skip] if crashed else []
+
+    probes = 0
+
+    def check_range(start: int, count: int) -> int | None:
+        nonlocal probes
+        if probes == PIPELINE_CRASH_PROBES:
+            fail(f"pipeline crash isolation reached {PIPELINE_CRASH_PROBES} probes; see {report_path} for any confirmed crashes")
+        probes += 1
+        return pipeline_range_check([exe, spirv, cache, *skip_args()], start, count)
+
+    def bisect_range(start: int, count: int) -> bool:
+        code = check_range(start, count)
+        if code is None:
+            return False
+        if count == 1:
+            name = names[start]
+            if name in crashed:
+                fail(f"vk_pipeline_check crashed in a range containing only an already skipped module: {name}")
+            record_crash(name, code)
+            return True
+        log(f"pipelines: range [{start}, {start + count}) crashed; checking each half")
+        half = count // 2
+        left_crashed = bisect_range(start, half)
+        right_crashed = bisect_range(start + half, count - half)
+        if not left_crashed and not right_crashed:
+            log(f"pipelines: the crash in [{start}, {start + count}) did not recur after splitting")
+        return True
+
     for _ in range(PIPELINE_CRASH_RETRIES + 1):
-        code = run(base + (["--skip-file", skip] if crashed else []), check=False)
+        drop(inflight)
+        code = run(base + ["--inflight-file", inflight, *skip_args()], check=False)
         if code in (0, 1, 2) or interrupted(code):
+            drop(inflight)
+            if crashed:
+                why = f"; {len(crashed)} module(s) took the driver down and were counted as failed: " + ", ".join(crashed)
+                fail(f"vk_pipeline_check exited with {exit_label(code)}{why}")
+            if code != 0:
+                fail(f"vk_pipeline_check exited with {exit_label(code)}")
+            log("pipelines: done")
+            return
+        if not names:
+            with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
+                index = json.load(f)
+            names = sorted(index, key=lambda name: name.encode("utf-8"))  # same byte order as the checker
+            positions = {name: i for i, name in enumerate(names)}
+        before = len(crashed)
+        # The watchdog's last snapshot may be stale. Confirm each reported module on its own.
+        for name in dict.fromkeys(read_names(inflight)):
+            if name in positions and name not in crashed:
+                observed = check_range(positions[name], 1)
+                if observed is not None:
+                    record_crash(name, observed)
+        if len(crashed) == before:
             break
-        # The driver took vk_pipeline_check down. Name the module it was compiling and check the rest without it:
-        # what was already compiled comes back from pipeline_cache.bin, saved every 10 minutes.
-        suspects = [n for n in read_names(inflight) if n not in crashed]
-        if len(suspects) > 1:   # several were compiling: keep the ones that also kill it on their own
-            suspects = [n for n in suspects if crashes_alone(exe, spirv, cache, n)]
-        if not suspects:
-            fail(f"vk_pipeline_check exited with {exit_label(code)} while no module could be named as the cause; "
-                 "run the pipelines stage again, and report it if it keeps happening")
-        for n in suspects:
-            log(f"pipelines: {n} took vk_pipeline_check down ({exit_label(code)}); checking the rest without it")
-        crashed += suspects
-        with open(skip, "w", encoding="utf-8", newline="\n") as f:
-            f.write("".join(n + "\n" for n in crashed))
-    else:
-        fail(f"vk_pipeline_check still crashed after {PIPELINE_CRASH_RETRIES} retries; modules that took it down: "
-             + ", ".join(crashed))
+    if not names:
+        fail(f"vk_pipeline_check exited with {exit_label(code)} without any indexed pipelines")
+    log(f"pipelines: checking ranges after vk_pipeline_check exited with {exit_label(code)}")
+    bisect_range(0, len(names))
     drop(inflight)
-    if code != 0:
-        why = f"; {len(crashed)} module(s) took the driver down and were counted as failed: " + ", ".join(crashed) \
-            if crashed else ""
-        fail(f"vk_pipeline_check exited with {exit_label(code)}{why}")
-    log("pipelines: done")
+    if crashed:
+        fail(f"pipeline ranges checked; {len(crashed)} module(s) took the driver down. See {report_path}")
+    fail("pipeline ranges checked, but the original crash could not be attributed to any module")
 
 
 # How many times the pipelines stage restarts vk_pipeline_check after a module takes it down (each costs at most the
 # 10 minutes since the last cache checkpoint, plus loading the cache).
 PIPELINE_CRASH_RETRIES = 5
+PIPELINE_CRASH_PROBES = 256
 
 
 def interrupted(code: int) -> bool:
@@ -1789,15 +1860,46 @@ def read_names(path: str) -> "list[str]":
         return []
 
 
-def crashes_alone(exe: str, spirv: str, cache: str, name: str) -> bool:
-    """Whether one module takes vk_pipeline_check down on its own: --start/--count select it in the checker's
-    name-sorted index (byte order, as its std::map)."""
-    with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
-        names = sorted(json.load(f), key=lambda n: n.encode("utf-8"))
-    if name not in names:
-        return False
-    code = run([exe, spirv, cache, "--jobs", "1", "--start", str(names.index(name)), "--count", "1"], check=False)
-    return code not in (0, 1, 2) and not interrupted(code)
+def pipeline_range_check(base: list[str], start: int, count: int) -> int | None:
+    """Return the crash status, or None for a completed range. Setup and interruption stop isolation."""
+    args = [*base, "--isolate-child", "--jobs", "1", "--start", str(start), "--count", str(count)]
+    # The existing isolate-child protocol flushes READY before any worker starts. Keep the child's stdout in
+    # a file so a large run doesn't buffer every diagnostic in memory, and leave stderr visible during the run.
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace", newline="\n") as output:
+        code = run(args, check=False, stdout=output)
+        output.seek(0)
+        ready = results = done = False
+        for line in output:
+            ready |= line.rstrip() == "ISO-READY"
+            results |= line.startswith("ISO-RESULT ")
+            done |= line.startswith("ISO-DONE ")
+        if not ready or results or done or code in (0, 1, 2) or interrupted(code):
+            output.seek(0)
+            for line in output:
+                if done and line.startswith("ISO-RESULT "):
+                    _, stage, _, _, ok, failed, skipped, *_ = line.split()
+                    log(f"pipelines: [{start}, {start + count}) {stage}: {ok} ok, {failed} failed, {skipped} skipped")
+                elif not line.startswith("ISO-"):
+                    print(line, end="")
+            if ready and done and code == 0:
+                return None
+            fail(f"vk_pipeline_check stopped during range checking [{start}, {start + count}) "
+                 f"with {exit_label(code)}")
+        return code
+
+
+def write_pipeline_crash_report(path: str, report: dict) -> None:
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n", dir=os.path.dirname(path),
+                                     delete=False) as f:
+        tmp = f.name
+        try:
+            json.dump(report, f, indent=2)
+            f.write("\n")
+            f.close()
+            os.replace(tmp, path)
+        finally:
+            f.close()
+            drop(tmp)
 
 
 def main() -> int:

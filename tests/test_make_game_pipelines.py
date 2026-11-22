@@ -2,7 +2,9 @@
 
 Standard library only; no GPU, no Vulkan SDK, no game data: the checker is mocked.
 """
+import hashlib
 import io
+import json
 import os
 import sys
 import tempfile
@@ -108,18 +110,31 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         self.out = os.path.join(tmp.name, "out")
         self.spirv = os.path.join(self.work, "shaders", "spirv")
         os.makedirs(self.spirv)
-        with open(os.path.join(self.spirv, "index.json"), "w", encoding="utf-8") as f:
-            f.write('{"b_mod": {}, "a_mod": {}, "c_mod": {}}')
+        self.b_hash = "ab" * 32
+        self.c_spirv = b"synthetic c_mod"
+        with open(os.path.join(self.spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"b_mod": {"fssm_sha256": self.b_hash}, "a_mod": {}, "c_mod": {}}, f)
+        for name, data in (("a_mod", b"synthetic a_mod"), ("c_mod", self.c_spirv)):
+            with open(os.path.join(self.spirv, name + ".spv"), "wb") as f:
+                f.write(data)
         self.inflight = os.path.join(self.out, "pipeline_inflight.txt")
         self.skip = os.path.join(self.out, "pipeline_crashes.txt")
+        self.report = os.path.join(self.out, "gpu.json")
         self.calls = []
 
     def stage(self, script, supports=True):
-        """script(args, call_number) -> exit code; it may write the in-flight file first."""
+        """Return an exit code or (code, stdout) to override the range protocol."""
         def fake_run(args, hint="", check=True, **kw):
             args = [str(a) for a in args]
             self.calls.append(args)
             code = script(args, len(self.calls))
+            if isinstance(code, tuple):
+                code, text = code
+                kw["stdout"].write(text)
+            elif "--isolate-child" in args:
+                kw["stdout"].write("ISO-READY\n")
+                if code == 0:
+                    kw["stdout"].write("ISO-DONE cache_ok=1\n")
             if check and code != 0:   # as run() does
                 raise SystemExit(1)
             return code
@@ -142,10 +157,22 @@ class PipelinesCrashRetryTest(unittest.TestCase):
     def skipped(self, args):
         return args[args.index("--skip-file") + 1] if "--skip-file" in args else None
 
+    def selected_range(self, args):
+        start = int(args[args.index("--start") + 1])
+        count = int(args[args.index("--count") + 1])
+        return range(start, start + count)
+
+    def crash_report(self):
+        with open(self.report, encoding="utf-8") as f:
+            return json.load(f)["pipeline_crashes"]
+
     def test_a_named_module_is_skipped_and_the_rest_checked(self):
         def script(args, n):
             if n == 1:
                 self.inflight_is("b_mod")
+                return ABORT
+            if "--isolate-child" in args:
+                self.assertEqual(self.selected_range(args), range(1, 2))
                 return ABORT
             self.assertEqual(self.skipped(args), self.skip)
             with open(self.skip, encoding="utf-8") as f:
@@ -155,17 +182,18 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         with mock.patch("sys.stderr", err):
             failed, logs = self.stage(script)
         self.assertIsNotNone(failed)
-        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(len(self.calls), 3)
         self.assertIn("--inflight-file", self.calls[0])
         self.assertIsNone(self.skipped(self.calls[0]))
         self.assertTrue(any("b_mod took vk_pipeline_check down" in m and "0x80000003" in m for m in logs), logs)
         self.assertIn("1 module(s) took the driver down", err.getvalue())
         self.assertIn("b_mod", err.getvalue())
+        self.assertEqual(self.crash_report(), [{"name": "b_mod", "exit_code": ABORT, "fssm_sha256": self.b_hash}])
         self.assertFalse(os.path.exists(self.inflight))
 
     def test_several_in_flight_are_tried_alone_and_only_the_crasher_is_skipped(self):
         def script(args, n):
-            if "--start" in args:   # crashes_alone: the index is name-sorted, so a_mod=0, b_mod=1, c_mod=2
+            if "--start" in args:   # the index is name-sorted, so a_mod=0, b_mod=1, c_mod=2
                 self.assertEqual(args[args.index("--count") + 1], "1")
                 return ABORT if args[args.index("--start") + 1] == "2" else 0
             if n == 1:
@@ -180,13 +208,49 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         starts = [c[c.index("--start") + 1] for c in self.calls if "--start" in c]
         self.assertEqual(starts, ["0", "2"])
 
-    def test_a_crash_with_nothing_in_flight_is_not_retried(self):
+    def test_a_crash_without_a_snapshot_bisects_and_checks_both_sides(self):
+        def script(args, n):
+            if "--isolate-child" not in args:
+                return ABORT
+            return ABORT if 2 in self.selected_range(args) else 0
         err = io.StringIO()
         with mock.patch("sys.stderr", err):
-            failed, _ = self.stage(lambda args, n: ABORT)
+            failed, _ = self.stage(script)
         self.assertIsNotNone(failed)
-        self.assertEqual(len(self.calls), 1)
-        self.assertIn("no module could be named", err.getvalue())
+        self.assertEqual([self.selected_range(args) for args in self.calls[1:]],
+                         [range(0, 3), range(0, 1), range(1, 3), range(1, 2), range(2, 3)])
+        self.assertEqual(self.crash_report(), [
+            {"name": "c_mod", "exit_code": ABORT, "spirv_sha256": hashlib.sha256(self.c_spirv).hexdigest()}])
+        self.assertIn("pipeline ranges checked", err.getvalue())
+
+    def test_a_stale_snapshot_or_an_unreproduced_crash_does_not_name_a_module(self):
+        def script(args, n):
+            if n == 1:
+                self.inflight_is("a_mod")
+                return ABORT
+            return ABORT if self.selected_range(args) == range(0, 3) else 0
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            failed, logs = self.stage(script)
+        self.assertIsNotNone(failed)
+        self.assertFalse(os.path.exists(self.skip))
+        self.assertFalse(os.path.exists(self.report))
+        self.assertIn("could not be attributed", err.getvalue())
+        self.assertTrue(any("did not recur after splitting" in m for m in logs), logs)
+
+    def test_setup_shutdown_and_interruption_do_not_blame_a_module(self):
+        for result in ((ABORT, ""), (0xC000013A, "ISO-READY\n"),
+                       (ABORT, "ISO-READY\nISO-RESULT cs 1 0 1 0 0 0 0 0 0\n"),
+                       (1, "ISO-READY\nISO-DONE cache_ok=0\n")):
+            with self.subTest(result=result):
+                self.calls.clear()
+                err = io.StringIO()
+                with mock.patch("sys.stderr", err):
+                    failed, _ = self.stage(lambda args, n: ABORT if n == 1 else result)
+                self.assertIsNotNone(failed)
+                self.assertEqual(len(self.calls), 2)
+                self.assertFalse(os.path.exists(self.report))
+                self.assertIn("stopped during range checking", err.getvalue())
 
     def test_ctrl_c_is_not_retried(self):
         def script(args, n):
@@ -197,27 +261,47 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         self.assertIsNotNone(failed)
         self.assertEqual(len(self.calls), 1)
 
-    def test_the_retries_stop(self):
-        names = iter([f"m{i}" for i in range(20)])
+    def test_exhausting_full_restarts_switches_to_ranges_with_the_skip_list(self):
+        initial = iter(["a_mod", "b_mod"])
         def script(args, n):
-            self.inflight_is(next(names))
-            return ABORT
+            if "--isolate-child" not in args:
+                self.inflight_is(next(initial))
+                return ABORT
+            if n <= 4:
+                return ABORT
+            self.assertEqual(self.skipped(args), self.skip)
+            with open(self.skip, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "a_mod\nb_mod\n")
+            return 0
         err = io.StringIO()
-        with mock.patch("sys.stderr", err):
+        with mock.patch("sys.stderr", err), mock.patch.object(make_game, "PIPELINE_CRASH_RETRIES", 1):
             failed, _ = self.stage(script)
         self.assertIsNotNone(failed)
-        self.assertEqual(len(self.calls), make_game.PIPELINE_CRASH_RETRIES + 1)
-        self.assertIn("still crashed after", err.getvalue())
+        self.assertEqual(len(self.calls), 5)
+        self.assertIn("2 module(s) took the driver down", err.getvalue())
+
+    def test_isolation_probes_have_a_budget(self):
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err), mock.patch.object(make_game, "PIPELINE_CRASH_PROBES", 2):
+            failed, _ = self.stage(lambda args, n: ABORT)
+        self.assertIsNotNone(failed)
+        self.assertEqual(len(self.calls), 3)
+        self.assertEqual([item["name"] for item in self.crash_report()], ["a_mod"])
+        self.assertIn("reached 2 probes", err.getvalue())
 
     def test_a_clean_run_is_one_call_and_an_old_skip_list_is_dropped(self):
         os.makedirs(self.out)
         with open(self.skip, "w", encoding="utf-8") as f:
             f.write("b_mod\n")   # from an earlier build: every module gets a fresh chance
+        with open(self.report, "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"device": "external data", "pipeline_crashes": [{"name": "b_mod"}]}, f)
         failed, logs = self.stage(lambda args, n: 0)
         self.assertIsNone(failed)
         self.assertEqual(len(self.calls), 1)
         self.assertIsNone(self.skipped(self.calls[0]))
         self.assertFalse(os.path.exists(self.skip))
+        with open(self.report, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"device": "external data"})
         self.assertIn("pipelines: done", logs)
 
 
