@@ -28,6 +28,21 @@ dumpbin /imports .\out\build\dev\d3d12_sdk_check.exe
 
 Build outputs and downloaded tool sources live under `out/`. [Microsoft xbdepends documentation](https://learn.microsoft.com/en-us/samples/microsoft/xbox-gdk-samples/xbdepends/)
 
+## Two-record archive reader from standard startup
+
+The [archive reader](../tests/cpu/archive/reader.zig) uses Zig 0.13.0's standard single-threaded Windows console startup. From the linked entry the translator follows the call into the record loop and the final call to RtlExitUserProcess. It recognizes six-byte linker jump thunks for explicitly bound IAT slots, models termination without fallthrough and propagates a narrow return value through a wider register copy. A control changes the startup to consume EAX instead of AL and must fail translation.
+
+Each record contains a one-byte compressed length and a PKWare DCL stream. The [native codec DLL](../tests/cpu/archive/codec.cpp) builds the unmodified blast.c and blast.h from [Mark Adler's blast 1.3 in zlib v1.3.1](https://github.com/madler/zlib/tree/v1.3.1/contrib/blast), retaining their license notices. The callback buffers up to 4096 decoded bytes per record. The translated reader drives allocation, decode, publication, cleanup and the completed count. All three processes share the native codec.
+
+Two distinct eight-byte streams produced 26 identical bytes, two completed records, two allocations and frees, and exit 0 across Windows, pe_map and AOT. With only four bytes of the second payload the decoder requested more input, then delivered one tentative output byte. Only the first record's 13 bytes reached stdout. All three completed one record, freed both allocations and exited 2. The [comparison](../tests/cpu/archive_check.py) checks the full event trace against fixed expectations.
+
+Install requirements-dev.txt before building. On x64 Windows this includes the pinned Zig compiler (about 80 MB download).
+
+```powershell
+cmake --build --preset dev --target archive_reader_lifted pe_map
+ctest --preset dev --no-tests=error -R '^cpu_native_archive_reader$' -V
+```
+
 ## CRC-32 console program from the PE entry
 
 `cpu_crc_line` reads the first text line from stdin and writes eight uppercase hexadecimal digits and a newline. Its [MASM entry](../tests/cpu/crc_line/entry.asm) handles input, formatting and exit status. MSVC compiles the [CRC update](../tests/cpu/crc_line/crc_step.cpp) as a separate optimized object. The linker imports the real Windows Universal CRT stdio functions through `ucrt.lib`. The source PE has a return-based entry and uses no CRT startup stub.

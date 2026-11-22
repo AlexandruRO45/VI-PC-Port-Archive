@@ -23,7 +23,7 @@ static word host_fflush(word stream) {
 """
 
 
-def translate(image):
+def translate(image, bindings=IMPORTS, host=HOST, *, allow_process_exit=False):
     with pefile.PE(str(image), fast_load=True) as pe:
         opt = pe.OPTIONAL_HEADER
         if (pe.FILE_HEADER.Machine != 0x8664 or opt.Magic != 0x20b or opt.Subsystem != 3
@@ -37,7 +37,7 @@ def translate(image):
         for module in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []):
             dll = module.dll.decode("ascii").lower()
             for imp in module.imports:
-                binding = IMPORTS.get((dll, imp.name))
+                binding = bindings.get((dll, imp.name))
                 if binding is None:
                     symbol = imp.name.decode("ascii") if imp.name else f"#{imp.ordinal}"
                     raise ValueError(f"unbound console import {dll}!{symbol}")
@@ -50,9 +50,11 @@ def translate(image):
         if entry not in program.entries:
             raise ValueError(f"unverified process entry at RVA {entry:#x}")
         source, function = program.lift(entry, "process_entry", ())
-        if function.return_width is None or function.return_width < 4:
+        reaches_exit = allow_process_exit and any(call.noreturn for call in function.host_calls.values())
+        if (function.return_width is None and not reaches_exit
+                or function.return_width is not None and function.return_width < 4):
             raise ValueError("process entry must define its 32-bit exit code")
-        return "\n".join([PRELUDE, HOST, *program.sources, source,
+        return "\n".join([PRELUDE, host, *program.sources, source,
                           "int main() { return static_cast<int>(process_entry()); }", ""])
 
 

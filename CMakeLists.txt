@@ -1053,6 +1053,29 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_import_original_lifted>" "$<TARGET_FILE:cpu_import_provider>"
         "$<TARGET_FILE:cpu_import_altered>" "$<TARGET_FILE:cpu_register_probe>")
     add_library(cpu_exe_io SHARED tests/cpu/exe_io.cpp)
+    # Use Zig's normal single-threaded console startup, including RtlExitUserProcess.
+    enable_language(C)
+    set(archive_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/archive")
+    add_library(archive_codec SHARED "${archive_src}/codec.cpp" "${archive_src}/blast/blast.c")
+    set_target_properties(archive_codec PROPERTIES MSVC_RUNTIME_LIBRARY MultiThreadedDLL)
+    set(archive_exe "${CMAKE_CURRENT_BINARY_DIR}/archive_reader.exe")
+    add_custom_command(OUTPUT "${archive_exe}"
+        COMMAND "${INTAKE_PYTHON}" -m ziglang build-exe "${archive_src}/reader.zig"
+            "-L$<TARGET_LINKER_FILE_DIR:archive_codec>" -target x86_64-windows-gnu
+            -O ReleaseSmall -fsingle-threaded -funwind-tables "-femit-bin=${archive_exe}"
+        DEPENDS archive_codec "${archive_src}/reader.zig" VERBATIM)
+    set(archive_cpp "${CMAKE_CURRENT_BINARY_DIR}/archive_reader_lifted.cpp")
+    add_custom_command(OUTPUT "${archive_cpp}"
+        COMMAND "${CMAKE_COMMAND}" -E env "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/tools"
+            "${INTAKE_PYTHON}" -B "${archive_src}/translate_reader.py" "${archive_exe}" "${archive_cpp}"
+        DEPENDS "${archive_exe}" "${archive_src}/translate_reader.py" tools/cpu_stdio_exe_aot.py
+            tools/cpu_switch_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+    add_executable(archive_reader_lifted "${archive_cpp}")
+    target_link_libraries(archive_reader_lifted PRIVATE archive_codec ntdll)
+    add_test(NAME cpu_native_archive_reader COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/archive_check.py" "$<TARGET_FILE:pe_map>"
+        "${archive_exe}" "$<TARGET_FILE:archive_reader_lifted>" "$<TARGET_FILE:archive_codec>")
+
     function(crc_line_program target polynomial)
         # Use the same optimized source PE as input to both Debug and Release AOT builds.
         set(crc_object "${CMAKE_CURRENT_BINARY_DIR}/${target}_step.obj")

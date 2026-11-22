@@ -357,6 +357,7 @@ class Function:
         # Direct calls and tail jumps to other functions, by the RVA of the CALL or JMP.
         self.calls = {}
         self.tails = {}
+        self.host_calls = {}
 
     def leaves_for(self, ins):
         """Whether a JMP out of this function is a tail jump. A target the image names as a function
@@ -422,6 +423,16 @@ class Function:
         for address in range(begin, end):
             self.owner[address] = owner
 
+    def thunk_slot(self, ins, imports):
+        """Recognize the complete x64 FF 25 disp32 linker thunk in executable bytes."""
+        target = ins.near_branch_target
+        if not imports or self.entries.owner(target) is not None or not executable(self.pe, target):
+            return None
+        if self.pe.get_data(target, 2) != b"\xff\x25":
+            return None
+        code = image_bytes(self.pe, target, 6, executable=True)
+        return target + 6 + int.from_bytes(code[2:], "little", signed=True)
+
     def explore(self, imports=None):
         pending = [self.entry]
         indirect = []
@@ -454,10 +465,16 @@ class Function:
             elif flow == FlowControl.UNCONDITIONAL_BRANCH and ins.is_jmp_short_or_near:
                 targets = [ins.near_branch_target]
             elif flow == FlowControl.CALL and ins.is_call_near:
-                self.calls[ip] = self.callee(ins)
+                slot = self.thunk_slot(ins, imports)
+                if slot is not None and slot in imports:
+                    self.host_calls[ip] = imports[slot]
+                    self.calls[ip] = slot
+                else:
+                    self.calls[ip] = self.callee(ins)
                 targets = [ins.next_ip]
             elif (ins.code == Code.CALL_RM64 and imports and ins.memory_base == R.RIP
                   and not ins.has_segment_prefix and ins.ip_rel_memory_address in imports):
+                self.host_calls[ip] = imports[ins.ip_rel_memory_address]
                 self.calls[ip] = ins.ip_rel_memory_address
                 targets = [ins.next_ip]
             elif flow == FlowControl.RETURN and ins.mnemonic == M.RET and (ins.op_count == 0 or ins.immediate(0) == 0):
@@ -467,6 +484,8 @@ class Function:
                 indirect.append(ip)
             else:
                 raise ValueError(f"unsupported control flow at RVA {ip:#x}: {ins}")
+            if ip in self.host_calls and self.host_calls[ip].noreturn:
+                targets = []
             self.successors[ip] = targets
             pending.extend(reversed(targets))
         edges = {target for ip, targets in self.successors.items() for target in targets
@@ -1161,6 +1180,7 @@ class HostImport(NamedTuple):
     symbol: str
     widths: tuple
     return_width: int
+    noreturn: bool = False
 
     @property
     def demands(self):
@@ -1273,7 +1293,7 @@ def lift_function(program, entry, symbol, arguments, internal):
                  if ins.flow_control == FlowControl.CONDITIONAL_BRANCH or ins.mnemonic in SETCC | CMOVCC}
     sets_flags = {producer.ip for producer in producers.values()}
     # Callees are translated first: the caller's definedness pass needs their return widths and demands.
-    callees = {ip: (program.imports[target] if instructions[ip].flow_control == FlowControl.INDIRECT_CALL
+    callees = {ip: (function.host_calls[ip] if ip in function.host_calls
                     else program.callee(target, ip))
                for ip, target in sorted({**function.calls, **function.tails}.items())}
     loads = {sequence[0]: index for index, _, sequence, _, _, _ in function.dispatches.values()}
@@ -1328,6 +1348,12 @@ def lift_function(program, entry, symbol, arguments, internal):
         if R.RSP in set().union(*effects[ip]):
             # Frame rejects every use of RSP whose offset it does not know, so RSP is never a C++ variable.
             raise ValueError(f"unsupported use of rsp at RVA {ip:#x}")
+    # Compilers may copy a byte-sized return through a wider register move. Carry
+    # the defined low width forward and validate the eventual consumer separately.
+    copies = {ip: (full(ins.op0_register), full(ins.op1_register), RegisterExt.size(ins.op0_register))
+              for ip, ins in instructions.items()
+              if ins.mnemonic == M.MOV and ins.op0_kind == ins.op1_kind == OpKind.REGISTER
+              and RegisterExt.size(ins.op0_register) >= 4 and full(ins.op0_register) in effects[ip][1]}
     prove_frame(function, order, effects, frame)
 
     # Per register: (low bytes defined on every path: 0, 1, 2 or 8; may hold a guest address that
@@ -1343,6 +1369,10 @@ def lift_function(program, entry, symbol, arguments, internal):
             for r, width in writes.items():
                 # A 32- or 64-bit write defines all eight bytes; an 8- or 16-bit write keeps the rest.
                 out[r] = (8, False) if width >= 4 else (max(out[r][0], width), out[r][1])
+            if ip in copies:
+                dst, src, width = copies[ip]
+                defined, guest = state[ip][src]
+                out[dst] = (8 if defined >= width else defined, guest)
             for r in kills:
                 out[r] = (0, True)
             if ip in function.calls:
@@ -1360,6 +1390,10 @@ def lift_function(program, entry, symbol, arguments, internal):
     widths = []
     for ip in order:
         missing = [r for r, width in effects[ip][0].items() if state[ip][r][0] < width]
+        if ip in copies:
+            _, src, _ = copies[ip]
+            if state[ip][src][0] and not state[ip][src][1]:
+                missing = [r for r in missing if r != src]
         if missing:
             if ip in callees:
                 raise ValueError(f"callee argument {NAMES[min(missing)]} is undefined at RVA {ip:#x}")
@@ -1384,7 +1418,7 @@ def lift_function(program, entry, symbol, arguments, internal):
     for position, ip in enumerate(order):
         ins = instructions[ip]
         following = order[position + 1] if position + 1 < len(order) else None
-        if ins.flow_control in STRAIGHT and following != ins.next_ip:
+        if ins.flow_control in STRAIGHT and function.successors[ip] and following != ins.next_ip:
             labels.add(ins.next_ip)
     locals_ = sorted((lifter.used | {R.RAX}) - set(function.arguments), key=lambda r: NAMES[r])
     declarations = [f"word {NAMES[r]} = 0;" for r in locals_]
@@ -1405,7 +1439,7 @@ def lift_function(program, entry, symbol, arguments, internal):
             text.append("    " + body[ip])
         ins = instructions[ip]
         following = order[position + 1] if position + 1 < len(order) else None
-        if ins.flow_control in STRAIGHT and following != ins.next_ip:
+        if ins.flow_control in STRAIGHT and function.successors[ip] and following != ins.next_ip:
             text.append(f"    goto loc_{ins.next_ip:x};")
     linkage = "static" if internal else 'extern "C" __declspec(dllexport)'
     signature = f'{linkage} word {symbol}({", ".join(f"word {NAMES[r]}" for r in function.arguments)})'
