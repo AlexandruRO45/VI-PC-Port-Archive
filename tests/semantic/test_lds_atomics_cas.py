@@ -143,6 +143,40 @@ class LdsCasAtomics(unittest.TestCase):
                 self.assertEqual(run_single(stem, m, d, rtn=True), (m, expected))
                 self.assertEqual(run_single(stem, m, d, rtn=False), (0xDEAD, expected))
 
+    def test_float_min_max_measured_nan_and_denormal_words(self):
+        # (M, DATA, stored word), measured by @Vonsek on native gfx1036 in the game's MODE (IEEE 0, f32 denormals
+        # flushed), one lane (SHADER-682). min and max store the same word in every NaN row.
+        nan_rows = [
+            (0x7F800001, 0x3F800000, 0x7FC00001),   # sNaN, 1.0: the sNaN quieted
+            (0x3F800000, 0xFF800003, 0xFFC00003),   # 1.0, sNaN: the sNaN quieted, sign and payload kept
+            (0x7F800001, 0x7FC00000, 0x7FC00001),   # sNaN, qNaN: the sNaN quieted
+            (0x7FC00000, 0x7F800001, 0x7FC00001),   # qNaN, sNaN: the sNaN quieted
+            (0x7F800001, 0x7F800002, 0x7FC00002),   # two sNaNs: DATA's, quieted
+            (0x7FC00003, 0x7FC00005, 0x7FC00005),   # two qNaNs: DATA
+            (0x7F800001, 0xFF800000, 0x7FC00001),   # sNaN, -inf: the sNaN quieted
+        ]
+        rows = [(stem, m, d, w) for stem in ("min_f32", "max_f32") for m, d, w in nan_rows] + [
+            ("max_f32", 0x00000001, 0x00000000, 0x00000000),   # a denormal M reads as +0
+            ("max_f32", 0x00000001, 0x80000000, 0x00000000),   # max(+0, -0) = +0
+            ("min_f32", 0x80000001, 0x00000000, 0x80000000),   # a negative denormal M reads as -0; -0 < +0
+        ]
+        for stem, m, d, expected in rows:
+            with self.subTest(op=stem, m=hex(m), d=hex(d)):
+                self.assertEqual(run_single(stem, m, d, rtn=True), (m, expected))   # _rtn returns M unflushed
+                self.assertEqual(run_single(stem, m, d, rtn=False), (0xDEAD, expected))
+
+    def test_float_min_max_uses_no_float_instruction(self):
+        # The stored word must not depend on the driver's NaN, denormal or zero-sign handling.
+        for op in ("ds_min_rtn_f32 v5, v1, v3", "ds_max_f32 v1, v3"):
+            with self.subTest(op=op):
+                base = translate(["v_mov_b32_e32 v1, 0", "v_mov_b32_e32 v3, 0x3f800000"])
+                spv = translate(["v_mov_b32_e32 v1, 0", "v_mov_b32_e32 v3, 0x3f800000", op])
+                added = [ln for ln in spv.splitlines() if ln not in set(base.splitlines())]
+                self.assertTrue(any("OpAtomicCompareExchange" in ln for ln in added))
+                for ln in added:
+                    self.assertNotIn("%float", ln)
+                    self.assertNotIn("OpExtInst", ln)
+
     def test_inactive_lane_leaves_lds_and_vdst_alone(self):
         # Under exec_lo = 0, every op must skip the atomic and leave both LDS and vdst intact.
         for op, rtn in (
@@ -200,7 +234,7 @@ class LdsCasAtomics(unittest.TestCase):
         loads = [line.split("OpAtomicLoad ")[1].split() for line in spv.splitlines() if "OpAtomicLoad " in line]
         self.assertEqual(loads, [exchange[:4]])  # type, pointer, scope, memory semantics
         self.assertIn("OpLoopMerge", spv)
-        self.assertIn("OpExtInst %float %glsl NMin", spv)
+        self.assertNotIn("NMin", spv)   # the float min/max is selected on the raw words (SHADER-682)
         self.assertNotIn("AtomicFloat", spv)
 
     def test_rejected_forms_and_outside_compute(self):

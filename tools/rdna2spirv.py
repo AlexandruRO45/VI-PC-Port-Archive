@@ -3813,7 +3813,12 @@ class Gen:
             #   ds_inc_u32:  M = (M >= DATA) ? 0 : M + 1          (unsigned compare)
             #   ds_dec_u32:  M = (M == 0 || M > DATA) ? DATA : M - 1  (unsigned compare)
             #   ds_rsub_u32: M = DATA - M                         (32-bit wrapping)
-            #   ds_min_f32 / ds_max_f32: GLSL.std.450 NMin / NMax (no shader float atomic extension needed)
+            #   ds_min_f32 / ds_max_f32: on the raw words (no shader float atomic extension needed), as measured on
+            #     gfx1036 in the game's MODE (IEEE 0, f32 denormals flushed; SHADER-682): a denormal M or DATA reads as
+            #     a zero of its sign; any signalling NaN gives that NaN quieted (DATA's when both are); otherwise a NaN
+            #     M gives DATA and a NaN DATA gives M, so two quiet NaNs give DATA; otherwise the smaller / larger,
+            #     with -0 < +0. No float instruction is used, so the driver's NaN, denormal and zero-sign handling
+            #     cannot change the stored word.
             if len(a) != (3 if rtn else 2):
                 raise Unsupported(op + " operands")
             d, ad, dat = (a[0], a[1], a[2]) if rtn else (None, a[0], a[1])
@@ -3822,10 +3827,29 @@ class Gen:
                 raise Unsupported(op + " operands")
             p = self.lds_ptr(self.src_u(ad), off)
             val = self.src_u(dat)
-            val_f = None
-            if name in ("ds_min_f32", "ds_max_f32"):
-                val_f = self.tmp()
-                self.emit(f"{val_f} = OpBitcast %float {val}")
+            def b(expr):
+                r = self.tmp()
+                self.emit(f"{r} = {expr}")
+                return r
+
+            def f32_class(w):
+                """(word with a denormal flushed to a zero of its sign, is NaN, is signalling NaN, quieted word,
+                key) for the f32 word w; key orders every non-NaN word as an unsigned integer, -0 below +0."""
+                mag = b(f"OpBitwiseAnd %uint {w} {self.cu(0x7FFFFFFF)}")
+                sign = b(f"OpBitwiseAnd %uint {w} {self.cu(0x80000000)}")
+                tiny = b(f"OpULessThan %bool {mag} {self.cu(0x00800000)}")
+                fl = b(f"OpSelect %uint {tiny} {sign} {w}")
+                nan = b(f"OpUGreaterThan %bool {mag} {self.cu(0x7F800000)}")
+                quiet_bit = b(f"OpBitwiseAnd %uint {w} {self.cu(0x00400000)}")
+                not_quiet = b(f"OpIEqual %bool {quiet_bit} {self.cu(0)}")
+                snan = b(f"OpLogicalAnd %bool {nan} {not_quiet}")
+                quieted = b(f"OpBitwiseOr %uint {w} {self.cu(0x00400000)}")
+                neg = b(f"OpINotEqual %bool {sign} {self.cu(0)}")
+                inv = b(f"OpNot %uint {fl}")
+                pos_key = b(f"OpBitwiseOr %uint {fl} {self.cu(0x80000000)}")
+                key = b(f"OpSelect %uint {neg} {inv} {pos_key}")
+                return fl, nan, snan, quieted, key
+            val_c = f32_class(val) if name in ("ds_min_f32", "ds_max_f32") else None
             lbl_hdr, lbl_cont, lbl_exit = (self.tmp() + s for s in ("_hdr", "_cont", "_exit"))
             init = self.tmp()
             self.emit(f"{init} = OpAtomicLoad %uint {p} {sc} {sem}")
@@ -3849,11 +3873,15 @@ class Gen:
                 new_u = self.tmp()
                 self.emit(f"{new_u} = OpISub %uint {val} {cur}")
             else:
-                cur_f, new_f, new_u = self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{cur_f} = OpBitcast %float {cur}")
-                glsl_op = "NMin" if name == "ds_min_f32" else "NMax"
-                self.emit(f"{new_f} = OpExtInst %float %glsl {glsl_op} {cur_f} {val_f}")
-                self.emit(f"{new_u} = OpBitcast %uint {new_f}")
+                m_fl, m_nan, m_snan, m_quiet, m_key = f32_class(cur)
+                d_fl, d_nan, d_snan, d_quiet, d_key = val_c
+                cmp_op = "OpULessThanEqual" if name == "ds_min_f32" else "OpUGreaterThanEqual"
+                keep_m = b(f"{cmp_op} %bool {m_key} {d_key}")
+                new_u = b(f"OpSelect %uint {keep_m} {m_fl} {d_fl}")       # neither is a NaN
+                new_u = b(f"OpSelect %uint {d_nan} {m_fl} {new_u}")       # a quiet NaN DATA gives M
+                new_u = b(f"OpSelect %uint {m_nan} {d_fl} {new_u}")       # a quiet NaN M gives DATA, a NaN DATA too
+                new_u = b(f"OpSelect %uint {m_snan} {m_quiet} {new_u}")   # a signalling NaN is quieted and wins
+                new_u = b(f"OpSelect %uint {d_snan} {d_quiet} {new_u}")   # DATA's when both are signalling
             done = self.tmp()
             self.emit(f"{got} = OpAtomicCompareExchange %uint {p} {sc} {sem} {sem} {new_u} {cur}")
             self.emit(f"{done} = OpIEqual %bool {got} {cur}")
