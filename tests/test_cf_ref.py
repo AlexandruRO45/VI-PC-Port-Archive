@@ -888,5 +888,42 @@ class ExportHaltStepAndErrorTests(CfRefTestCase):
             ])
 
 
+class MaskReadTests(CfRefTestCase):
+    """s_bcnt1 / s_ff1 of a whole mask and v_readfirstlane: one value for the wave (FUZZ-8 mask reads)."""
+
+    def test_wave32_bcnt1_ff1_and_readfirstlane(self):
+        items = lane_id_prologue(32) + [
+            "v_cmp_lt_u32_e32 vcc_lo, 4, v0",       # lanes 5..31
+            "s_bcnt1_i32_b32 s0, vcc_lo",
+            "s_ff1_i32_b32 s1, vcc_lo",
+            "s_ff1_i32_b32 s2, 0",
+            "v_add_nc_u32 v1, 100, v0",
+            "s_and_saveexec_b32 s3, vcc_lo",
+            "v_readfirstlane_b32 s4, v1",           # the first active lane is 5
+            "s_mov_b32 exec_lo, 0",
+            "v_readfirstlane_b32 s5, v1",           # no lane on: lane 0
+            "s_mov_b32 exec_lo, s3",
+            "s_bcnt1_i32_b32 s6, 0",
+            "s_cselect_b32 s7, 1, 2",               # SCC = count != 0
+            "s_endpgm",
+        ]
+        sg = self.run_items(items, wave=32)["sgpr"]
+        self.assertEqual((sg[0], sg[1], sg[2], sg[4], sg[5], sg[6], sg[7]), (27, 5, MASK32, 105, 100, 0, 2))
+
+    def test_wave64_whole_mask_and_one_half(self):
+        items = lane_id_prologue(64) + [
+            "v_cmp_lt_u32_e32 vcc, 40, v0",         # lanes 41..63
+            "s_bcnt1_i32_b64 s0, vcc",
+            "s_ff1_i32_b64 s1, vcc",
+            "s_bcnt1_i32_b32 s2, vcc_lo",
+            "s_ff1_i32_b32 s3, vcc_lo",
+            "s_bcnt1_i32_b32 s4, vcc_hi",
+            "s_ff1_i32_b32 s5, vcc_hi",
+            "s_endpgm",
+        ]
+        sg = self.run_items(items, wave=64)["sgpr"]
+        self.assertEqual([sg[i] for i in range(6)], [23, 41, 0, MASK32, 23, 9])
+
+
 if __name__ == "__main__":
     unittest.main()

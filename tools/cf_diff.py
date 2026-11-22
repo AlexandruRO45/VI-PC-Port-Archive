@@ -26,6 +26,10 @@ Shapes (each nests, up to --depth):
   cselmask  s_cselect_b32/b64 between a compare mask and EXEC -> s_and_saveexec
   vccloop   per-lane trip counts, back edge s_cbranch_vccnz (the wave loops while any lane wants to)
   cmpxloop  per-lane trip counts, v_cmpx drops finished lanes, back edge s_cbranch_execnz
+  mread     s_bcnt1 / s_ff1 of EXEC, VCC or an SGPR compare mask (wave64: _b64, or _b32 on one half) into a
+            uniform SGPR, added to every active lane [-> s_cmp on it -> s_cbranch_scc0/1 over a body]
+  waterfall v_readfirstlane of a lane value -> v_cmp_eq -> s_and_saveexec -> body -> s_xor exec, back edge
+            s_cbranch_execnz: one round per distinct value (the descriptor-per-group-of-lanes loop)
 (vloop also closes some loops with s_cbranch_scc1 on the SCC of its s_andn2 exec.)
 Bodies mix integer VALU and SALU ops with "probes": v11 = v11 * 33 + K at each site, so v11 records which sites
 each lane ran, in which order and how often. v8/v9 carry data, v10 the uniform SGPRs. Immediates stay in the
@@ -140,7 +144,19 @@ class Gen:
         r = self.r
         kind = r.choice(("if", "if", "ifelse", "ifelse", "cmpx", "saveexec", "vccz", "sif", "sloop", "vloop",
                          "vloop", "irr", "sccmask", "csel", "ifs", "ifs", "cexec", "halfexec", "halfscc", "scmpmask",
-                         "cselmask", "vccloop", "cmpxloop"))
+                         "cselmask", "vccloop", "cmpxloop", "mread", "mread", "waterfall",
+                         "waterfall"))
+        if kind == "mread":
+            width = r.choice(("b64", "b32")) if self.wave == 64 else "b32"
+            branch = (r.choice(CCS), r.randrange(0, 66), r.choice(("s_cbranch_scc0", "s_cbranch_scc1"))) \
+                if r.random() < 0.5 else None
+            return ("mread", self.cmp(), r.choice(("bcnt1", "ff1")), r.choice(("exec", "vcc", "sgpr")), width,
+                    self.half() if width == "b32" else "lo", branch,
+                    [self.probe()] + self.block(depth) if branch else [])
+        if kind == "waterfall":
+            # v1 / v2 / v3 hold 8 or 16 distinct values; a source with one value per lane (v8) costs 64 rounds and,
+            # nested, runs past the wave interpreter's step limit.
+            return ("waterfall", r.choice((1, 2, 3)), r.random() < 0.5, [self.probe()] + self.block(depth))
         if kind == "saveexec":
             return ("saveexec", self.cmp(), r.choice(("andn2", "orn2", "xor", "nand", "nor", "xnor")),
                     r.choice((None, "s_cbranch_execz", "s_cbranch_scc0")), [self.probe()] + self.block(depth))
@@ -368,6 +384,49 @@ class Emitter:
             self.ins(f"s_add_u32 s{ctr}, s{ctr}, 1")
             self.ins(f"s_cmp_lt_u32 s{ctr}, {trips}")
             self.br("s_cbranch_scc1", head)
+        elif kind == "mread":
+            # A scalar read of a whole mask: one value for the wave (a ballot's bit count or lowest bit).
+            _, c, what, src, width, half, branch, body = n
+            dst = f"s{100 + self.depth}"
+            if src == "exec":
+                m = ex if width == "b64" or self.wave == 32 else f"exec_{half}"
+            elif src == "vcc":
+                self.vcmp(c)
+                m = self.vcc() if width == "b64" or self.wave == 32 else f"vcc_{half}"
+            else:
+                cc, ty, k, v = c
+                pair = self.sreg(60)
+                self.ins(f"v_cmp_{cc}_{ty}_e64 {pair}, {k}, v{v}")
+                n0 = 60 + 2 * self.depth
+                m = pair if width == "b64" or self.wave == 32 else f"s{n0 + (half == 'hi')}"
+            self.ins(f"s_{what}_i32_{width} {dst}, {m}")
+            self.ins(f"v_add_nc_u32 v11, {dst}, v11")
+            if branch:
+                cc, k, mnemonic = branch
+                end = self.label()
+                self.ins(f"s_cmp_{cc}_u32 {dst}, {k}")
+                self.br(mnemonic, end)
+                self.depth += 1
+                self.nodes(body)
+                self.depth -= 1
+                self.place(end)
+        elif kind == "waterfall":
+            # Each round takes the first active lane's value, runs the body for every lane holding it and drops
+            # those lanes; the loop ends when EXEC is empty, then EXEC is restored.
+            _, src, scc_exit, body = n
+            val, save, t, head = f"s{100 + self.depth}", self.sreg(80), self.sreg(90), self.label()
+            self.ins(f"s_mov_{w} {save}, {ex}")
+            self.place(head)
+            self.ins(f"v_readfirstlane_b32 {val}, v{src}")
+            self.ins(f"v_cmp_eq_u32_e32 {self.vcc()}, {val}, v{src}")
+            self.ins(f"s_and_saveexec_{w} {t}, {self.vcc()}")
+            self.ins(f"v_add_nc_u32 v11, {val}, v11")
+            self.depth += 1
+            self.nodes(body)
+            self.depth -= 1
+            self.ins(f"s_xor_{w} {ex}, {ex}, {t}")
+            self.br("s_cbranch_scc1" if scc_exit else "s_cbranch_execnz", head)
+            self.ins(f"s_mov_{w} {ex}, {save}")
         elif kind == "vccloop":
             # A loop whose back edge is a VCC vote: the wave goes round again while any lane's own trip count is
             # not reached, and every active lane runs every round (EXEC is not changed).

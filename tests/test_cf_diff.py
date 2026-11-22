@@ -48,6 +48,42 @@ HALF_CASES = {
                                             [("probe", 7)])],
 }
 
+# Scalar reads of a whole lane mask: the count or first lane of EXEC / VCC / an SGPR compare mask, and the
+# v_readfirstlane waterfall loop. Each value is the same for every lane of the wave.
+MASK_READ_CASES = {
+    "s_bcnt1 of exec -> s_cmp -> branch": [("if", FEW_LANES, False, [
+        ("mread", FEW_LANES, "bcnt1", "exec", "b32", "lo", ("gt", 1, "s_cbranch_scc0"), [("probe", 5)])])],
+    "s_ff1 of vcc": [("mread", HALF, "ff1", "vcc", "b32", "lo", None, [])],
+    "s_ff1 of an SGPR mask -> branch": [("mread", HALF, "ff1", "sgpr", "b32", "lo", ("lt", 64, "s_cbranch_scc1"),
+                                         [("probe", 5)])],
+    "waterfall, exit on EXECNZ": [("waterfall", 1, False, [("probe", 5)])],
+    "waterfall, exit on SCC of s_xor exec": [("waterfall", 2, True, [("probe", 5)])],
+    "nested waterfalls": [("waterfall", 3, False, [("probe", 3), ("waterfall", 1, True, [("probe", 5)])])],
+}
+MASK_READ_W64 = {
+    "s_bcnt1_i32_b64 of vcc": [("mread", HALF, "bcnt1", "vcc", "b64", "lo", ("gt", 20, "s_cbranch_scc0"),
+                                [("probe", 5)])],
+    "s_bcnt1_i32_b32 of vcc_hi": [("mread", HALF, "bcnt1", "vcc", "b32", "hi", None, [])],
+    "s_ff1_i32_b32 of exec_hi inside an if": [("if", HALF, False, [
+        ("mread", HALF, "ff1", "exec", "b32", "hi", None, [])])],
+    "s_ff1_i32_b32 of an SGPR mask's high word": [("mread", HALF, "ff1", "sgpr", "b32", "hi", None, [])],
+}
+
+
+@pytest.mark.parametrize("case", sorted(MASK_READ_CASES))
+@pytest.mark.parametrize("wave", (32, 64))
+@pytest.mark.parametrize("structured", (True, False), ids=("structured", "dispatch-loop"))
+def test_mask_reads(case, wave, structured):
+    status, detail = cf_diff.run_case("ps_mask_read", MASK_READ_CASES[case], wave, structured)
+    assert status == "match", detail
+
+
+@pytest.mark.parametrize("case", sorted(MASK_READ_W64))
+@pytest.mark.parametrize("structured", (True, False), ids=("structured", "dispatch-loop"))
+def test_wave64_mask_reads(case, structured):
+    status, detail = cf_diff.run_case("ps_mask_read", MASK_READ_W64[case], 64, structured)
+    assert status == "match", detail
+
 
 @pytest.mark.parametrize("count", ["0", "-1"])
 def test_empty_program_batch_is_a_usage_error(count, capsys, monkeypatch):
@@ -183,7 +219,7 @@ def test_generator_covers_every_shape():
     for i in range(200):
         walk(cf_diff.generate(random.Random(i), 32))
     assert {"if", "ifelse", "cmpx", "saveexec", "vccz", "sif", "sloop", "vloop", "irr", "sccmask", "csel", "probe",
-            "ifs", "cexec", "halfexec", "halfscc", "scmpmask", "cselmask", "vccloop", "cmpxloop"} <= kinds
+            "ifs", "cexec", "halfexec", "halfscc", "scmpmask", "cselmask", "vccloop", "cmpxloop", "mread", "waterfall"} <= kinds
 
 
 @pytest.mark.parametrize("op_name", ("andn2", "orn2", "xor", "nand", "nor", "xnor"))

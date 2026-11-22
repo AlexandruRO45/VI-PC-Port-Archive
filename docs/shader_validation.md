@@ -2275,7 +2275,8 @@ covers the operations most shaders use. Then add, in order:
    The existing control-flow unit tests check graph structure; differential tests check the values.
    `tools/cf_diff.py` (FUZZ-8) does this for whole waves: seeded programs built from the shapes
    compilers emit (saveexec if/else, `v_cmpx`, VCC- and SCC-voted branches, uniform and per-lane
-   loops, two-entry cycles), run by `tools/cf_ref.py` (cpu_ref plus branches, compares and saveexec)
+   loops, two-entry cycles, scalar reads of a whole mask (`s_bcnt1`/`s_ff1` of EXEC/VCC, the
+   `v_readfirstlane` waterfall loop)), run by `tools/cf_ref.py` (cpu_ref plus branches, compares and saveexec)
    and by `tests/semantic/spirv_wave_interp.py` (every invocation of a subgroup, with structured
    reconvergence), compared lane by lane in both the structured and the dispatch-loop form.
    The corpus-side counterpart is `tools/ab_control_flow.py`: it renders branchy pixel shaders

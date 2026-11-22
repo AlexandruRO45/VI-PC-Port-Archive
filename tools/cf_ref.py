@@ -227,6 +227,28 @@ class WaveMachine(cpu_ref.Machine):
             return None
         if base.startswith(("v_cmp_", "v_cmpx_")):
             return self._vcmp(ins, base)
+        if base == "v_readfirstlane_b32":
+            # sD = vS of the lowest lane on in EXEC, or of lane 0 when none is.
+            self._expect(ins, 2)
+            lanes = self._active_lanes()
+            self._write_scalar_dst(a[0], self._int_src(a[1], lanes[0] if lanes else 0) & MASK32)
+            return None
+        if base in ("s_bcnt1_i32_b32", "s_bcnt1_i32_b64", "s_ff1_i32_b32", "s_ff1_i32_b64"):
+            # SOP1 on a whole mask: the number of set bits (SCC = count != 0), or the lowest set bit (-1 if
+            # none; SCC unchanged). A _b32 op reads one 32-bit word, a half of the mask in wave64.
+            self._expect(ins, 2)
+            if base.endswith("_b64"):
+                self._check_width(base, op)
+                x = self._read_mask(a[1])
+            else:
+                x = self._int_src(a[1], 0, scalar=True) & MASK32
+            if base.startswith("s_bcnt1"):
+                r = x.bit_count()
+                self.scc = 1 if r else 0
+            else:
+                r = (x & -x).bit_length() - 1 if x else MASK32
+            self._write_scalar_dst(a[0], r)
+            return None
         if base in ("s_cmp_eq_u64", "s_cmp_lg_u64"):
             self._check_width("x_b64", op)
             self._expect(ins, 2)
