@@ -6,6 +6,7 @@
 #include <windows.h>
 #include <shellapi.h>
 
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
@@ -17,6 +18,45 @@
 
 namespace {
 int failures = 0;
+
+void check_program_paths() {
+    using Get = int(__cdecl*)(char**);
+    using GetWide = int(__cdecl*)(wchar_t**);
+    using Pointer = char**(__cdecl*)();
+    using WidePointer = wchar_t**(__cdecl*)();
+    bool initial = true;
+    for (const char* dll : {"api-ms-win-crt-runtime-l1-1-0.dll", "ucrtbase.dll", "ucrtbased.dll", "msvcrt.dll"}) {
+        const auto get = reinterpret_cast<Get>(rt::shims::find(dll, "_get_pgmptr"));
+        const auto get_wide = reinterpret_cast<GetWide>(rt::shims::find(dll, "_get_wpgmptr"));
+        const auto pointer = reinterpret_cast<Pointer>(rt::shims::find(dll, "__p__pgmptr"));
+        const auto wide_pointer = reinterpret_cast<WidePointer>(rt::shims::find(dll, "__p__wpgmptr"));
+        auto* data = static_cast<char**>(rt::shims::find(dll, "_pgmptr"));
+        auto* wide_data = static_cast<wchar_t**>(rt::shims::find(dll, "_wpgmptr"));
+        char* path = nullptr;
+        wchar_t* wide_path = nullptr;
+        if (!get || !get_wide || !pointer || !wide_pointer || !data || !wide_data ||
+            get(&path) != 0 || get_wide(&wide_path) != 0 || !path || !wide_path ||
+            (initial && (*path || *wide_path)) ||
+            get(nullptr) != EINVAL || get_wide(nullptr) != EINVAL) {
+            std::fprintf(stderr, "FAIL %s: initial program paths or invalid output pointers\n", dll);
+            ++failures;
+            continue;
+        }
+        initial = false;
+        rt::process::set_command_line(L"title.exe", {}, L"C:\\fixtures\\title.exe");
+        if (get(&path) != 0 || get_wide(&wide_path) != 0 ||
+            std::strcmp(path, "C:\\fixtures\\title.exe") || std::wcscmp(wide_path, L"C:\\fixtures\\title.exe") ||
+            pointer() != data || wide_pointer() != wide_data || *data != path || *wide_data != wide_path) {
+            std::fprintf(stderr, "FAIL %s: program path getters, accessors and data disagree\n", dll);
+            ++failures;
+        }
+        rt::process::set_command_line(L"next.exe", {}, L"C:\\fixtures\\next.exe");
+        if (std::strcmp(path, "C:\\fixtures\\title.exe") || std::wcscmp(wide_path, L"C:\\fixtures\\title.exe")) {
+            std::fprintf(stderr, "FAIL %s: retained program path changed\n", dll);
+            ++failures;
+        }
+    }
+}
 
 wchar_t** wargv() {
     using Fn = wchar_t*** (__cdecl*)();
@@ -175,6 +215,7 @@ void check_getmainargs_environment() {
 }  // namespace
 
 int main() {
+    check_program_paths();
     round_trip({L"plain", L"with space"}, "plain and spaced arguments");
     round_trip({L"C:\\My Games\\", L"next"}, "a quoted argument ending in a backslash");
     round_trip({L"a\\\"b"}, "a backslash before a quote");

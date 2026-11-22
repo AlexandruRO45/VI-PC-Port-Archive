@@ -16,9 +16,12 @@
 #include <windows.h>
 
 #include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <filesystem>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -38,6 +41,10 @@ std::wstring g_wcmdline;
 int g_argc = 0;
 char** g_argv_ptr = nullptr;
 wchar_t** g_wargv_ptr = nullptr;
+char g_empty_program[] = "";
+wchar_t g_empty_wprogram[] = L"";
+char* g_program = g_empty_program;
+wchar_t* g_wprogram = g_empty_wprogram;
 
 std::atomic<bool> g_running{false};
 std::atomic<bool> g_exited{false};
@@ -96,6 +103,18 @@ void __cdecl game_abort() {
 int* __cdecl game_p_argc() { return &g_argc; }
 char*** __cdecl game_p_argv() { return &g_argv_ptr; }
 wchar_t*** __cdecl game_p_wargv() { return &g_wargv_ptr; }
+char** __cdecl game_p_pgmptr() { return &g_program; }
+wchar_t** __cdecl game_p_wpgmptr() { return &g_wprogram; }
+int __cdecl game_get_pgmptr(char** out) {
+    if (!out) return errno = EINVAL;
+    *out = g_program;
+    return 0;
+}
+int __cdecl game_get_wpgmptr(wchar_t** out) {
+    if (!out) return errno = EINVAL;
+    *out = g_wprogram;
+    return 0;
+}
 int __cdecl game_configure_argv(int) { return 0; }  // already parsed: run_entry set them
 LPSTR __stdcall game_get_command_line_a() { return g_cmdline.data(); }
 LPWSTR __stdcall game_get_command_line_w() { return g_wcmdline.data(); }
@@ -179,7 +198,18 @@ DWORD WINAPI game_thread(void* p) {
 
 }  // namespace
 
-void set_command_line(const std::wstring& program, const std::vector<std::wstring>& args) {
+void set_command_line(const std::wstring& program, const std::vector<std::wstring>& args,
+                      const std::wstring& image_path) {
+    struct ProgramPath {
+        std::string narrow;
+        std::wstring wide;
+    };
+    // Immortal: callers may retain a path across another setup call or during process teardown.
+    static auto* paths = new std::deque<ProgramPath>;
+    const auto full_path = std::filesystem::absolute(image_path.empty() ? program : image_path).wstring();
+    paths->push_back({narrow(full_path), full_path});
+    g_program = paths->back().narrow.data();
+    g_wprogram = paths->back().wide.data();
     g_wargs.clear();
     g_wargs.push_back(program);
     g_wargs.insert(g_wargs.end(), args.begin(), args.end());
@@ -230,7 +260,15 @@ int run_entry(void* entry, size_t stack_bytes) {
 
 namespace {
 using namespace rt::process;
+#define PROGRAM_PATH(dll) \
+    {dll, "_get_pgmptr", reinterpret_cast<void*>(&game_get_pgmptr)}, \
+    {dll, "_get_wpgmptr", reinterpret_cast<void*>(&game_get_wpgmptr)}, \
+    {dll, "__p__pgmptr", reinterpret_cast<void*>(&game_p_pgmptr)}, \
+    {dll, "__p__wpgmptr", reinterpret_cast<void*>(&game_p_wpgmptr)}, \
+    {dll, "_pgmptr", reinterpret_cast<void*>(&g_program)}, \
+    {dll, "_wpgmptr", reinterpret_cast<void*>(&g_wprogram)}
 #define UCRT(dll) \
+    PROGRAM_PATH(dll), \
     {dll, "exit", reinterpret_cast<void*>(&game_exit)}, {dll, "_exit", reinterpret_cast<void*>(&game_exit)}, \
     {dll, "_Exit", reinterpret_cast<void*>(&game_exit)}, {dll, "quick_exit", reinterpret_cast<void*>(&game_exit)}, \
     {dll, "abort", reinterpret_cast<void*>(&game_abort)}, {dll, "__p___argc", reinterpret_cast<void*>(&game_p_argc)}, \
@@ -252,6 +290,7 @@ SHIM_TABLE(process,
     UCRT("api-ms-win-crt-runtime-l1-1-0.dll"),
     UCRT("ucrtbase.dll"),
     UCRT("ucrtbased.dll"),  // the Debug UCRT: a Debug build of the stand-in game (run_tiny_game) links it
+    PROGRAM_PATH("msvcrt.dll"),
     {"msvcrt.dll", "exit", reinterpret_cast<void*>(&game_exit)},
     {"msvcrt.dll", "_exit", reinterpret_cast<void*>(&game_exit)},
     {"msvcrt.dll", "abort", reinterpret_cast<void*>(&game_abort)},
