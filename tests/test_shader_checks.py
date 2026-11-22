@@ -35,8 +35,10 @@ TOTAL = (len(check.COMPUTE) + 7 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + len(check.TEXTURE_MODES) + 16)  # three mesh fixtures, ps_tex, ps_imgatomic, six compute fixtures,
-         # ps_ssharp, vs_base_ids, main's standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case) and cs_fmt_all, ps_texture_sample_d16
+         + len(check.TEXTURE_CONSTANTS) + len(check.TEXTURE_MODES)
+         + 16)  # three mesh fixtures, ps_tex, ps_imgatomic, six compute fixtures, ps_ssharp, vs_base_ids,
+         # main's standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case), cs_fmt_all and
+         # ps_texture_sample_d16
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
 
@@ -59,7 +61,7 @@ def cvt_answer(env, wrong_for=None):
 
 class Wave64Checks(unittest.TestCase):
     def run_checks(self, wavemask, ballot, *, missing_ballot=False, emulated=False, fmt=(0, GOOD_FMT)):
-        def harness(_tool, shader, *args, env=None):
+        def harness(_tool, shader, *args, env=None, cwd=None):
             name = Path(shader).stem
             if name == "cs_fmt_1010102":
                 self.assertEqual(args, ("1", "dump"))
@@ -798,13 +800,18 @@ class TextureModeChecks(unittest.TestCase):
                 (Path(tmp) / f"{shader}.spv").touch()
             with patch.object(check, "run", return_value=answer) as run:
                 problem = check.texture_mode_test("tools", tmp, name)
-            self.assertEqual(run.call_args.args[1], check.TEXTURE_MODES[name])
+            mode = check.TEXTURE_MODES[name]
+            self.assertEqual(run.call_args.args[1:-1], (mode,) if mode else ())    # then the dump path
             self.assertEqual(run.call_args.kwargs["cwd"], tmp)
             self.assertTrue(Path(run.call_args.args[0]).is_absolute())
         return problem
 
     def test_passed_is_ok(self):
         self.assertEqual(self.run_mode((0, "ok -> pixels.raw\nvk_texture_test dref: PASSED (4096 pixels)\n")), "")
+
+    def test_the_default_mode_takes_no_mode_argument(self):
+        # vk_texture_test [out] draws ps_texture_sample; a mode word there would be read as the dump path
+        self.assertEqual(self.run_mode((0, "vk_texture_test: PASSED\n"), name="ps_texture_sample"), "")
 
     def test_failure_and_missing_passed_fail(self):
         problem = self.run_mode((1, "vk_texture_test dref: FAILED, 0 pixels wrong in the f32 result and 2048 in the d16"))
