@@ -763,7 +763,8 @@ def pipeline_check_prerequisite(runtime_selected: bool = False) -> str:
 
 def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | None = None, *,
               emulate: bool = False, keep_emulated: bool = False,
-              fallbacks: tuple[str, ...] = (), jobs: int = 1) -> None:
+              fallbacks: tuple[str, ...] = (), jobs: int = 1,
+              disasm_backend: str = "llvm-mc") -> None:
     """Find every missing prerequisite before a long build starts, and list them all at once."""
     if "runtime" in stages and runtime_build:
         absent = [n for n in RUNTIME_FILES if not os.path.isfile(os.path.join(runtime_build, n))]
@@ -775,13 +776,14 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
     if sys.version_info < (3, 12):
         missing.append("Python 3.12 or newer: https://www.python.org/downloads/")
     if "shaders" in stages:
-        mc = mc_command()[0]
-        if not (os.path.isfile(mc) or shutil.which(mc)):
-            missing.append(
-                "llvm-mc (LLVM 21+ with the AMDGPU target). The official Windows LLVM build has no AMDGPU "
-                "target: build a native one with scripts\\build_llvm_mc.ps1, or install llvm-21 in WSL and set "
-                "LLVM_MC to the whole command, e.g. "
-                "LLVM_MC=\"wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc\" (docs/design.md)." + appdata_hint(mc))
+        if disasm_backend == "llvm-mc":
+            mc = mc_command()[0]
+            if not (os.path.isfile(mc) or shutil.which(mc)):
+                missing.append(
+                    "llvm-mc (LLVM 21+ with the AMDGPU target). The official Windows LLVM build has no AMDGPU "
+                    "target: build a native one with scripts\\build_llvm_mc.ps1, or install llvm-21 in WSL and set "
+                    "LLVM_MC to the whole command, e.g. "
+                    "LLVM_MC=\"wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc\" (docs/design.md)." + appdata_hint(mc))
         for t in ("spirv-as", "spirv-val"):
             if not shutil.which(t):
                 missing.append(f"{t}: install the Vulkan SDK, https://vulkan.lunarg.com/ (then reopen the terminal)")
@@ -817,7 +819,8 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
     os.makedirs(work, exist_ok=True)
     free_gb = shutil.disk_usage(work).free / 2**30
     need_gb = sum(need.values())
-    if free_gb < need_gb and need.get("shaders") and shader_outputs_reusable(work, emulate, keep_emulated, fallbacks):
+    if free_gb < need_gb and need.get("shaders") and shader_outputs_reusable(work, emulate, keep_emulated, fallbacks,
+                                                                             disasm_backend=disasm_backend):
         log(f"preflight: the shaders in {work} can be reused; not counting their {need['shaders']} GB")
         need_gb -= need["shaders"]
     # An export stopped part-way (no xma.done yet) has already put some of the 370 GB on the drive, and the rerun
@@ -1061,6 +1064,22 @@ def unpacked_shader_stems(dxbc: str) -> set[str] | None:
     return unpacked if unpacked and unpacked <= carved else None
 
 
+def python_disasm_signature() -> str:
+    h = hashlib.sha256()
+    for fname in ("rdna2_decode.py", "rdna2_isa_tables.py"):
+        p = os.path.join(TOOLS, fname)
+        with open(p, "rb") as f:
+            h.update(fname.encode("utf-8"))
+            h.update(b"\0")
+            h.update(f.read())
+            h.update(b"\0")
+    return json.dumps(["python", h.hexdigest()])
+
+
+def disasm_signature(backend: str = "llvm-mc") -> str:
+    return python_disasm_signature() if backend == "python" else llvm_mc_signature()
+
+
 def disassembly_listings(dxbc: str) -> set[str] | None:
     try:
         with os.scandir(os.path.join(dxbc, "disasm")) as entries:
@@ -1107,7 +1126,8 @@ def disassembly_status(dxbc: str, signature: str) -> tuple[bool, bool, set[str]]
 
 
 def shader_outputs_reusable(work: str, emulate: bool, keep_emulated: bool,
-                            fallbacks: tuple[str, ...] = ()) -> bool:
+                            fallbacks: tuple[str, ...] = (),
+                            disasm_backend: str = "llvm-mc") -> bool:
     """Check whether the shader stage can resume without carving, unpacking or translating again."""
     sh = os.path.join(work, "shaders")
     dxbc = os.path.join(sh, "dxbc")
@@ -1121,7 +1141,7 @@ def shader_outputs_reusable(work: str, emulate: bool, keep_emulated: bool,
             and read_shader_setting(os.path.join(spirv, "translator_flags.txt")) == translator_flags_setting(fallbacks)
             and read_shader_setting(os.path.join(spirv, "translation_sources.sha256")) == translation_sources_digest()
             and os.path.isfile(os.path.join(dxbc, "disasm.done"))
-            and disassembly_status(dxbc, llvm_mc_signature())[0])
+            and disassembly_status(dxbc, disasm_signature(disasm_backend))[0])
 
 
 def prepare_shader_disassembly(work: str, disasm: str, resume: bool) -> None:
@@ -1148,7 +1168,7 @@ def translated_index_is_empty(index: str) -> bool:
 
 
 def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulated: bool = False,
-            fallbacks: tuple[str, ...] = ()) -> None:
+            fallbacks: tuple[str, ...] = (), disasm_backend: str = "llvm-mc") -> None:
     src = os.path.join(game, "shaders.rpf")
     sh = os.path.join(work, "shaders")
     dxbc = os.path.join(sh, "dxbc")
@@ -1158,10 +1178,10 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     carved = os.path.join(dxbc, "index.json")             # shader_carve.py, renamed into place at the end
     unpacked = os.path.join(dxbc, "fssm_index.json")      # fssm_unpack.py, the same
     disassembly_started = os.path.join(dxbc, "disasm.started")
-    disassembled = os.path.join(dxbc, "disasm.done")      # records LLVM and the listings produced
+    disassembled = os.path.join(dxbc, "disasm.done")      # records the disassembler and the listings produced
     translated = os.path.join(spirv, "index.json")        # rdna2spirv.py --merge, renamed into place
     shard_plan = os.path.join(spirv, SHARD_PLAN)          # lets translate() keep finished shards; see there
-    signature = llvm_mc_signature()
+    signature = disasm_signature(disasm_backend)
     if not os.path.isfile(carved):
         log("shaders: carving shaders.rpf")
         drop(translated, shard_plan, disassembled, disassembly_started, unpacked)
@@ -1176,8 +1196,9 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     complete, resume, expected = disassembly_status(dxbc, signature)
     if not complete:
         if os.path.isfile(disassembled) or os.path.isfile(translated):
-            log("shaders: llvm-mc changed or the saved disassembly could not be verified")
-        log("shaders: resuming disassembly (gfx1013)" if resume else "shaders: disassembling (gfx1013)")
+            log("shaders: disassembler changed or the saved disassembly could not be verified")
+        log(f"shaders: resuming disassembly (gfx1013, {disasm_backend})" if resume
+            else f"shaders: disassembling (gfx1013, {disasm_backend})")
         drop(translated, shard_plan)
         if not resume:
             drop(disassembly_started, disassembled)
@@ -1189,9 +1210,13 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
                 f.write(start + "\n")
             os.replace(marker, disassembly_started)
         drop(disassembled)
-        resume_args = ("--skip-existing",) if resume else ()
-        py("shader_disasm.py", os.path.join(dxbc, "fssm"), "--unpack-index", unpacked,
-           "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs, *resume_args)
+        disasm_args = [os.path.join(dxbc, "fssm"), "--unpack-index", unpacked,
+                       "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs]
+        if disasm_backend != "llvm-mc":
+            disasm_args.extend(["--backend", disasm_backend])
+        if resume:
+            disasm_args.append("--skip-existing")
+        py("shader_disasm.py", *disasm_args)
         listings = disassembly_listings(dxbc)
         if not listings or not expected <= listings:
             fail("Shader disassembly did not restore all expected listings")
@@ -2330,7 +2355,8 @@ def _invoke_stage(name: str, fn) -> None:
 
 def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, wav: bool, jobs: int,
                      runtime_build: str | None, emulate: bool, keep_emulated: bool,
-                     fallbacks: tuple[str, ...], overlap: bool = True) -> None:
+                     fallbacks: tuple[str, ...], overlap: bool = True,
+                     disasm_backend: str = "llvm-mc") -> None:
     """Run build stages after check. With overlap=True (default), shaders/assets/runtime share the machine and
     pipelines starts once shaders (and a selected runtime rebuild) are ready. With overlap=False, stages run in order."""
     cpu_heavy = [s for s in ("shaders", "assets") if s in stages]
@@ -2340,7 +2366,8 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
     progress = StageBoard([s for s in ("shaders", "assets", "runtime", "pipelines") if s in stages])
 
     def fn_shaders():
-        shaders(game, work, shader_jobs, emulate=emulate, keep_emulated=keep_emulated, fallbacks=fallbacks)
+        shaders(game, work, shader_jobs, emulate=emulate, keep_emulated=keep_emulated, fallbacks=fallbacks,
+                disasm_backend=disasm_backend)
 
     def fn_assets():
         assets(game, work, wav, jobs, dump_jobs=dump_jobs)
@@ -2479,6 +2506,9 @@ def main() -> int:
     ap.add_argument("--no-tui", action="store_true",
                     help="plain console logs (default when stdout is not a TTY); skip the LEONIDA setup screen "
                          "and per-stage log view")
+    ap.add_argument("--disasm-backend", choices=("llvm-mc", "python"), default="llvm-mc",
+                    help="RDNA2 disassembler backend for the shaders stage: llvm-mc (default) or python "
+                         "(pure-Python tools/rdna2_decode.py, needs no llvm-mc installation)")
     a = ap.parse_args()
     stages = STAGES
     if a.stages is not None:
@@ -2569,7 +2599,7 @@ def main() -> int:
         a.jobs = leonida_tui.clamp_jobs(cfg.jobs)
         overlap = cfg.overlap
     preflight(stages, work, a.wav, runtime_build, emulate=emulate, keep_emulated=keep_emulated,
-              fallbacks=fallbacks, jobs=a.jobs)
+              fallbacks=fallbacks, jobs=a.jobs, disasm_backend=a.disasm_backend)
     if not a.out and icloud_documents():
         for note in icloud_default_notes():
             log(note)
@@ -2582,12 +2612,12 @@ def main() -> int:
             tui_board.set_summary(f"build 0% · {', '.join(build_stages)}")
             run_build_stages(stages, game=game, work=work, out=out, v=v, wav=a.wav, jobs=a.jobs,
                              runtime_build=runtime_build, emulate=emulate, keep_emulated=keep_emulated,
-                             fallbacks=fallbacks, overlap=overlap)
+                             fallbacks=fallbacks, overlap=overlap, disasm_backend=a.disasm_backend)
             tui_board.set_summary(f"finished in {(time.time() - t0) / 60:.0f} min")
     else:
         run_build_stages(stages, game=game, work=work, out=out, v=v, wav=a.wav, jobs=a.jobs,
                          runtime_build=runtime_build, emulate=emulate, keep_emulated=keep_emulated,
-                         fallbacks=fallbacks, overlap=overlap)
+                         fallbacks=fallbacks, overlap=overlap, disasm_backend=a.disasm_backend)
     log(f"finished in {(time.time() - t0) / 60:.0f} min")
     return 0
 

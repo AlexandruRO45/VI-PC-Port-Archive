@@ -16120,9 +16120,50 @@ def fspx_wave_size(path, name):
         return None
     return None if not isinstance(wave32, bool) else (32 if wave32 else 64)
 
+def decode_binary_file(path):
+    """Decode a native .fssm or fspx/*.code binary directly via tools/rdna2_decode.py (no llvm-mc or .s text)."""
+    import json as _json
+    import rdna2_decode
+    name = os.path.splitext(os.path.basename(path))[0]
+    with open(path, "rb") as f:
+        blob = f.read()
+    wave32 = True
+    if path.endswith(".code"):
+        meta_path = os.path.splitext(path)[0] + ".json"
+        start = end = None
+        if os.path.isfile(meta_path):
+            with open(meta_path, encoding="utf-8") as f:
+                meta = _json.load(f)
+            wave32 = bool(meta.get("wave32", True))
+            c = meta.get("code") or {}
+            start, end = c.get("start"), c.get("end")
+        if start is None or end is None:
+            import fspx_unpack
+            start, end = fspx_unpack.code_range(blob)
+        if end is None:
+            raise Unsupported("no s_endpgm in .code binary")
+        code = blob[start:end]
+    else:
+        import shader_disasm
+        start, end, _ = shader_disasm.code_range(blob)
+        if end is None:
+            raise Unsupported("no s_endpgm in .fssm binary")
+        if start is None:
+            best = None
+            for s in range(end - 4, max(0x100, end - 0x4000) - 1, -4):
+                cand = rdna2_decode.decode_bytes(blob[s:end], code_start=s, name=name)
+                if cand["invalid"] == 0:
+                    best = s
+            if best is None:
+                raise Unsupported("could not locate code start in .fssm binary")
+            start = best
+        code = blob[start:end]
+    info = rdna2_decode.decode_bytes(code, code_start=start, name=name, wave32=wave32)
+    info["direct"] = True
+    return info
 
 def translate(path):
-    info = parse_file(path)
+    info = decode_binary_file(path) if path.endswith((".fssm", ".code")) else parse_file(path)
     stage = stage_of(info["name"], path)
     if stage not in ("vs", "ps", "cs", "ms", "gs"):
         raise Unsupported(f"stage {stage}")
@@ -16132,41 +16173,46 @@ def translate(path):
         # and used to translate to a module that passes spirv-val and does no work at all. Refuse it instead.
         raise Unsupported("no instructions (nothing tab-indented?)")
     if info["invalid"]:
-        # Undecodable words are constant tables embedded in the code range (147/155 such VS/PS use s_getpc_b64 to
-        # read them). LLVM skips them, so re-anchor every instruction to its true offset in the FSSM blob, then
-        # translate only code reachable from entry; a branch into data is rejected below.
-        blob = native_blob(path, info["name"])
-        pos = info["code_start"]
-        for ins in insns:
-            enc = bytes.fromhex(ins["enc"])
-            op, operand_count = ins["op"], len(ins["args"])
-            skipped, at = 0, pos
-            while not same_encoding(blob[at:at + len(enc)], enc, op, operand_count):
-                literal = mix_literal(blob[at:at + len(enc)], enc, base_op(op))
-                if literal is not None:
-                    restore_mix_literal(ins, blob[at:at + len(enc)], literal)
-                    break
-                at += 4
-                skipped += 4
-                if skipped > 4096 or at >= len(blob):
-                    at = None
-                    break
-            if at is None:
-                # LLVM prints the encoding of the instruction it decoded, not the bytes it read: data words that
-                # decode with ignored fields set (e.g. 0xbe8d2242 -> s_rfe_b64, printed 0xbe802242) never match.
-                # The decoder consumed the same number of bytes, so the instruction sits at the current position.
-                # Such words are data in every case seen; reachable_code drops them unless a branch lands there.
-                if pos + len(enc) > len(blob):
-                    raise Unsupported("undecodable words (cannot re-anchor)")
-                at = pos
-                ins["normalized"] = True
-            ins["pc"] = at
-            pos = at + len(enc)
-        insns = fold_far_branches(insns)
-        insns = reachable_code(insns, info.get("code_end"))
-        if any(i.get("normalized") for i in insns):
-            raise Unsupported("reachable instruction with normalized encoding")
-    else:
+        if info.get("direct"):
+            # Direct binary decode already assigned exact byte PCs across undecodable data words.
+            insns = fold_far_branches(insns)
+            insns = reachable_code(insns, info.get("code_end"))
+        else:
+            # Undecodable words are constant tables embedded in the code range (147/155 such VS/PS use s_getpc_b64 to
+            # read them). LLVM skips them, so re-anchor every instruction to its true offset in the FSSM blob, then
+            # translate only code reachable from entry; a branch into data is rejected below.
+            blob = native_blob(path, info["name"])
+            pos = info["code_start"]
+            for ins in insns:
+                enc = bytes.fromhex(ins["enc"])
+                op, operand_count = ins["op"], len(ins["args"])
+                skipped, at = 0, pos
+                while not same_encoding(blob[at:at + len(enc)], enc, op, operand_count):
+                    literal = mix_literal(blob[at:at + len(enc)], enc, base_op(op))
+                    if literal is not None:
+                        restore_mix_literal(ins, blob[at:at + len(enc)], literal)
+                        break
+                    at += 4
+                    skipped += 4
+                    if skipped > 4096 or at >= len(blob):
+                        at = None
+                        break
+                if at is None:
+                    # LLVM prints the encoding of the instruction it decoded, not the bytes it read: data words that
+                    # decode with ignored fields set (e.g. 0xbe8d2242 -> s_rfe_b64, printed 0xbe802242) never match.
+                    # The decoder consumed the same number of bytes, so the instruction sits at the current position.
+                    # Such words are data in every case seen; reachable_code drops them unless a branch lands there.
+                    if pos + len(enc) > len(blob):
+                        raise Unsupported("undecodable words (cannot re-anchor)")
+                    at = pos
+                    ins["normalized"] = True
+                ins["pc"] = at
+                pos = at + len(enc)
+            insns = fold_far_branches(insns)
+            insns = reachable_code(insns, info.get("code_end"))
+            if any(i.get("normalized") for i in insns):
+                raise Unsupported("reachable instruction with normalized encoding")
+    elif not info.get("direct"):
         check_printed_encodings(path, info)
     g = Gen(stage, hoist_reg_ptrs=True, cache_active=True)
     g.exec_static_true = not any(writes_exec(i) for i in insns)
@@ -17761,9 +17807,9 @@ def main():
         write_index(os.path.join(a.out, "index.json"), merged)
         print(f"merged {len(merged)} entries")
         return 0
-    single_file = os.path.isfile(a.src) and a.src.endswith(".s")
+    single_file = os.path.isfile(a.src) and a.src.endswith((".s", ".fssm", ".code"))
     if not single_file and not os.path.isdir(a.src):
-        ap.error(f"{a.src} is not a .s file or a folder of .s files")
+        ap.error(f"{a.src} is not a .s/.fssm/.code file or a folder of them")
     # Writing translations into the input folder mixes them with the .s inputs (and a rerun then scans its
     # own output); refuse it before mkdir, the index or any module is written. --merge above is exempt: its
     # src is not read, and merging parts in place is how a shard run finishes.
@@ -17790,7 +17836,12 @@ def main():
         files = [a.src]
     else:
         with os.scandir(a.src) as entries:
-            files = sorted(e.path for e in entries if e.name.endswith(".s") and e.is_file())
+            all_files = sorted(e.path for e in entries if e.is_file())
+        files = [p for p in all_files if p.endswith(".s")]
+        if not files:
+            files = [p for p in all_files if p.endswith(".fssm")]
+        if not files:
+            files = [p for p in all_files if p.endswith(".code")]
     if a.limit is not None:
         files = files[:a.limit]
     if shard is not None:
