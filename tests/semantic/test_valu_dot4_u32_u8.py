@@ -44,7 +44,9 @@ Standard library Python only: unittest, dataclasses, enum, math, struct.
 Single module scope, zero game data.
 """
 
-from typing import List, Sequence, Tuple
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import List, Sequence, Tuple, Union
 import unittest
 
 # Architectural bitmasks
@@ -103,6 +105,76 @@ def ref_dot4_u32_u8_full(s0: int, s1: int, s2: int = 0) -> Tuple[int, int]:
     acc = s2 & MASK32
     full_sum = acc + dot
     return full_sum & MASK32, (full_sum >> 32) & 1
+
+
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    LITERAL = auto()
+
+
+@dataclass(frozen=True)
+class Operand:
+    """Represents a register operand or inline/literal constant."""
+    reg_type: RegType
+    index: int = 0
+    literal_value: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.reg_type == RegType.VGPR:
+            if not (0 <= self.index <= 255):
+                raise ValueError(f"VGPR index {self.index} out of range [0, 255]")
+        elif self.reg_type == RegType.SGPR:
+            if not (0 <= self.index <= 105):
+                raise ValueError(f"SGPR index {self.index} out of range [0, 105]")
+        elif self.reg_type == RegType.LITERAL:
+            if self.literal_value is None:
+                raise ValueError("Literal operand requires literal_value")
+            if not (0 <= self.literal_value <= MASK32):
+                raise ValueError(f"Literal value {self.literal_value:#x} out of range [0, 0xFFFFFFFF]")
+
+    @classmethod
+    def vgpr(cls, index: int) -> Operand:
+        return cls(RegType.VGPR, index=index)
+
+    @classmethod
+    def sgpr(cls, index: int) -> Operand:
+        return cls(RegType.SGPR, index=index)
+
+    @classmethod
+    def literal(cls, value: int) -> Operand:
+        return cls(RegType.LITERAL, literal_value=value & MASK32)
+
+    def disassemble(self) -> str:
+        if self.reg_type == RegType.VGPR:
+            return f"v{self.index}"
+        if self.reg_type == RegType.SGPR:
+            return f"s{self.index}"
+        assert self.literal_value is not None
+        return f"0x{self.literal_value:08X}"
+
+
+@dataclass(frozen=True)
+class VDot4U32U8Instruction:
+    """Symbolic AST node for AMD RDNA2 v_dot4_u32_u8 instruction."""
+    dst: Operand
+    src0: Operand
+    src1: Operand
+    src2: Operand
+    clamp: bool = False
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination must be a VGPR, got {self.dst}")
+        if self.clamp:
+            raise ValueError("clamp modifier is unsupported on v_dot4_u32_u8")
+
+    def disassemble(self) -> str:
+        return f"v_dot4_u32_u8 {self.dst.disassemble()}, {self.src0.disassemble()}, {self.src1.disassemble()}, {self.src2.disassemble()}"
 
 
 # ==============================================================================
@@ -194,6 +266,66 @@ class TestValuDot4U32U8Oracle(unittest.TestCase):
         self.assertEqual(ref_dot4_u32_u8(0x000000FF, 0x00000001, 0), 255)
         # 0x000000FF * 0x000000FF: unsigned is 65025, signed would be (-1)*(-1) = 1
         self.assertEqual(ref_dot4_u32_u8(0x000000FF, 0x000000FF, 0), 65025)
+
+
+class TestValuDot4U32U8SymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_operand_creation_and_disassembly(self) -> None:
+        v0 = Operand.vgpr(0)
+        v255 = Operand.vgpr(255)
+        s10 = Operand.sgpr(10)
+        lit = Operand.literal(0x12345678)
+
+        self.assertEqual(v0.disassemble(), "v0")
+        self.assertEqual(v255.disassemble(), "v255")
+        self.assertEqual(s10.disassemble(), "s10")
+        self.assertEqual(lit.disassemble(), "0x12345678")
+
+    def test_operand_bounds_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            Operand.vgpr(-1)
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(-1)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106)
+
+    def test_instruction_construction_and_disassembly(self) -> None:
+        instr = VDot4U32U8Instruction(
+            dst=Operand.vgpr(5),
+            src0=Operand.vgpr(1),
+            src1=Operand.sgpr(2),
+            src2=Operand.literal(100),
+        )
+        self.assertEqual(instr.disassemble(), "v_dot4_u32_u8 v5, v1, s2, 0x00000064")
+
+    def test_instruction_validation_rejections(self) -> None:
+        # dst cannot be SGPR or literal
+        with self.assertRaises(TypeError):
+            VDot4U32U8Instruction(
+                dst=Operand.sgpr(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.literal(0),
+            )
+        with self.assertRaises(TypeError):
+            VDot4U32U8Instruction(
+                dst=Operand.literal(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.literal(0),
+            )
+        # clamp is unsupported
+        with self.assertRaises(ValueError):
+            VDot4U32U8Instruction(
+                dst=Operand.vgpr(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.literal(0),
+                clamp=True,
+            )
 
 
 if __name__ == "__main__":
