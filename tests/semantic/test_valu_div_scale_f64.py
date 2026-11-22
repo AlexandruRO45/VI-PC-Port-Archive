@@ -1585,5 +1585,109 @@ class TestDivScaleF64StatusFlagsAndConditionCodes(unittest.TestCase):
         self.assertEqual(rf.read_sgpr(105), scc_sentinel)
 
 
+class TestDivScaleF64IEEE754Boundaries(unittest.TestCase):
+    """Test suite for IEEE 754 boundary extremes, subnormals, infinities, and NaNs."""
+
+    def test_subnormal_scale_up(self):
+        # Denormal in S1: e1 == 0 -> scales S0 by 2^128
+        sub_min = F64_SUB_MIN
+        normal_s0 = F64_ONE
+
+        d_res, vcc_res = ref_div_scale_f64_u64(normal_s0, sub_min, normal_s0)
+        # e2 (1023) - e1 (0) = 1023 >= 768, so rule 1 matches:
+        # vcc = 1, D = S0 * 2^128 if S0 == S1 else S0
+        # Since S0 != S1 (F64_ONE != F64_SUB_MIN), D = S0
+        self.assertEqual(vcc_res, 1)
+        self.assertEqual(d_res, normal_s0)
+
+        # When S0 == S1 (both subnormals):
+        d_sub, vcc_sub = ref_div_scale_f64_u64(sub_min, sub_min, normal_s0)
+        self.assertEqual(vcc_sub, 1)
+        # sub_min * 2^128
+        self.assertEqual(d_sub, scale_f64_bits(sub_min, 128))
+
+    def test_threshold_boundaries_exact(self):
+        # Rule 1 exact threshold: e2 - e1 >= 768
+        # Let e1 = 1000, then e2 = 1768 (diff = 768 -> matches), e2 = 1767 (diff = 767 -> does not match rule 1)
+        s1 = 1000 << 52
+        s2_match = 1768 << 52
+        s2_nomatch = 1767 << 52
+
+        d_m, vcc_m = ref_div_scale_f64_u64(s1, s1, s2_match)
+        self.assertEqual(vcc_m, 1)
+        self.assertEqual(d_m, scale_f64_bits(s1, 128))
+
+        d_nm, vcc_nm = ref_div_scale_f64_u64(s1, s1, s2_nomatch)
+        # diff 767 does not match rule 1, does not match e1==0, does not match e1>=2045, etc.
+        self.assertEqual(vcc_nm, 0)
+        self.assertEqual(d_nm, s1)
+
+        # Rule 6 threshold: e2 <= 53 (with e1 - e2 < 768 to avoid rule 5)
+        s1_mid = 500 << 52
+        s2_53 = 53 << 52
+        s2_54 = 54 << 52
+        d_53, vcc_53 = ref_div_scale_f64_u64(s1_mid, s1_mid, s2_53)
+        self.assertEqual(vcc_53, 0)
+        self.assertEqual(d_53, scale_f64_bits(s1_mid, 128))
+
+        d_54, vcc_54 = ref_div_scale_f64_u64(s1_mid, s1_mid, s2_54)
+        self.assertEqual(vcc_54, 0)
+        self.assertEqual(d_54, s1_mid)
+
+    def test_zero_denominator_or_numerator_produces_nan(self):
+        # Measured RDNA2 behavior: A zero S1 or S2 makes D = 0xFFF8000000000000 (NaN)
+        # +0.0 denominator
+        d_z1, _ = ref_div_scale_f64_u64(F64_ONE, F64_POS_ZERO, F64_ONE)
+        self.assertEqual(d_z1, 0xFFF8000000000000)
+
+        # -0.0 denominator
+        d_zn1, _ = ref_div_scale_f64_u64(F64_ONE, F64_NEG_ZERO, F64_ONE)
+        self.assertEqual(d_zn1, 0xFFF8000000000000)
+
+        # +0.0 numerator
+        d_z2, _ = ref_div_scale_f64_u64(F64_ONE, F64_ONE, F64_POS_ZERO)
+        self.assertEqual(d_z2, 0xFFF8000000000000)
+
+        # -0.0 numerator
+        d_zn2, _ = ref_div_scale_f64_u64(F64_ONE, F64_ONE, F64_NEG_ZERO)
+        self.assertEqual(d_zn2, 0xFFF8000000000000)
+
+    def test_nan_and_infinity_preservation(self):
+        # Scaling keeps NaN (payload preserved) and infinities
+        qnan_payload = F64_CANONICAL_QNAN | 0x12345
+        d_qnan, vcc_q = ref_div_scale_f64_u64(qnan_payload, F64_ONE, 50 << 52)
+        self.assertEqual(d_qnan, qnan_payload)
+
+        # Infinity
+        d_inf, _ = ref_div_scale_f64_u64(F64_POS_INF, F64_ONE, 50 << 52)
+        self.assertEqual(d_inf, F64_POS_INF)
+
+        d_ninf, _ = ref_div_scale_f64_u64(F64_NEG_INF, F64_ONE, 50 << 52)
+        self.assertEqual(d_ninf, F64_NEG_INF)
+
+    def test_scale_down_extreme_to_infinity(self):
+        # Measured: 2^-128 scaling with ex(b) <= 116 gives infinity of S0's sign
+        small_val = 110 << 52
+        d_inf_pos = scale_f64_bits(small_val, -128)
+        self.assertEqual(d_inf_pos, F64_POS_INF)
+
+        small_neg = (110 << 52) | (1 << 63)
+        d_inf_neg = scale_f64_bits(small_neg, -128)
+        self.assertEqual(d_inf_neg, F64_NEG_INF)
+
+    def test_clamp_boundary_extremes(self):
+        # Negative value -> +0.0
+        d_neg, _ = ref_div_scale_f64_u64(F64_NEG_ONE, F64_ONE, F64_ONE, clamp=True)
+        self.assertEqual(d_neg, F64_POS_ZERO)
+
+        # Greater than 1.0 -> 1.0
+        d_gt, _ = ref_div_scale_f64_u64(F64_TWO, F64_ONE, F64_ONE, clamp=True)
+        self.assertEqual(d_gt, F64_ONE)
+
+        # NaN -> +0.0
+        d_nan, _ = ref_div_scale_f64_u64(F64_CANONICAL_QNAN, F64_ONE, F64_ONE, clamp=True)
+        self.assertEqual(d_nan, F64_POS_ZERO)
+
+
 if __name__ == "__main__":
     unittest.main()
