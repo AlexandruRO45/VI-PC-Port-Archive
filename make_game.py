@@ -1118,7 +1118,8 @@ def rpf9dump_digest() -> str:
     # Source files in third_party/rpf9-explorer/Core
     core = os.path.join(ROOT, "third_party", "rpf9-explorer", "Core")
     if os.path.isdir(core):
-        for dirpath, _, filenames in os.walk(core):
+        for dirpath, dirnames, filenames in os.walk(core):
+            dirnames[:] = [d for d in dirnames if d not in ("bin", "obj", ".git")]
             for f in sorted(filenames):
                 if f.endswith((".cs", ".csproj")):
                     p = os.path.join(dirpath, f)
@@ -1133,16 +1134,19 @@ def rpf9dump_digest() -> str:
     # Source files in tools/rpf9dump
     tools_dir = os.path.join(TOOLS, "rpf9dump")
     if os.path.isdir(tools_dir):
-        for f in sorted(os.listdir(tools_dir)):
-            p = os.path.join(tools_dir, f)
-            if os.path.isfile(p) and not f.startswith("."):
-                try:
-                    with open(p, "rb") as fp:
-                        data = fp.read()
-                    h.update(f"{f}\0{len(data)}\0".encode("utf-8"))
-                    h.update(data)
-                except OSError:
-                    pass
+        for dirpath, dirnames, filenames in os.walk(tools_dir):
+            dirnames[:] = [d for d in dirnames if d not in ("bin", "obj", ".git")]
+            for f in sorted(filenames):
+                p = os.path.join(dirpath, f)
+                if os.path.isfile(p) and not f.startswith("."):
+                    rel = os.path.relpath(p, tools_dir)
+                    try:
+                        with open(p, "rb") as fp:
+                            data = fp.read()
+                        h.update(f"{rel}\0{len(data)}\0".encode("utf-8"))
+                        h.update(data)
+                    except OSError:
+                        pass
     return h.hexdigest()
 
 

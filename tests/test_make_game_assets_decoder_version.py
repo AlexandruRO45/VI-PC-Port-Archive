@@ -76,6 +76,47 @@ class AssetsDecoderVersionTest(unittest.TestCase):
         # Verify valid hex
         int(sig1, 16)
 
+    def test_digest_ignores_build_artifacts_in_bin_and_obj(self):
+        with tempfile.TemporaryDirectory() as root:
+            core_dir = os.path.join(root, "third_party", "rpf9-explorer", "Core")
+            tools_dir = os.path.join(root, "tools", "rpf9dump")
+            os.makedirs(core_dir, exist_ok=True)
+            os.makedirs(tools_dir, exist_ok=True)
+
+            with open(os.path.join(core_dir, "Decoder.cs"), "w", encoding="utf-8") as f:
+                f.write("// core decoder")
+            with open(os.path.join(tools_dir, "Program.cs"), "w", encoding="utf-8") as f:
+                f.write("// tool entrypoint")
+
+            with mock.patch.object(make_game, "ROOT", root), \
+                 mock.patch.object(make_game, "TOOLS", os.path.join(root, "tools")):
+                base_digest = make_game.rpf9dump_digest()
+
+                # Add generated build artifacts in bin/ and obj/
+                obj_core = os.path.join(core_dir, "obj", "Release", "net8.0")
+                bin_core = os.path.join(core_dir, "bin", "Release", "net8.0")
+                obj_tool = os.path.join(tools_dir, "obj", "Release", "net8.0")
+                os.makedirs(obj_core, exist_ok=True)
+                os.makedirs(bin_core, exist_ok=True)
+                os.makedirs(obj_tool, exist_ok=True)
+
+                with open(os.path.join(obj_core, "AssemblyInfo.cs"), "w", encoding="utf-8") as f:
+                    f.write("// generated")
+                with open(os.path.join(bin_core, "Core.dll"), "w", encoding="utf-8") as f:
+                    f.write("binary dll")
+                with open(os.path.join(obj_tool, "rpf9dump.AssemblyInfo.cs"), "w", encoding="utf-8") as f:
+                    f.write("// generated tool")
+
+                after_build_digest = make_game.rpf9dump_digest()
+                self.assertEqual(base_digest, after_build_digest)
+
+                # Modifying real source must change the digest
+                with open(os.path.join(core_dir, "Decoder.cs"), "a", encoding="utf-8") as f:
+                    f.write("\n// edit")
+
+                modified_digest = make_game.rpf9dump_digest()
+                self.assertNotEqual(base_digest, modified_digest)
+
     def test_initial_export_writes_decoder_version(self):
         sig = "a" * 64
         calls, logs = self.run_assets(test_archive="test.rpf", current_digest=sig)
