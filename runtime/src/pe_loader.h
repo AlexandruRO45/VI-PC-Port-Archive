@@ -35,6 +35,7 @@ struct Module {
     uint32_t entry_rva = 0;
     bool relocated = false;
     bool initialised = false;
+    bool init_failed = false;
 
     // The image's exception directory (.pdata), registered with RtlAddFunctionTable by load() so that exception
     // dispatch and stack walks can unwind through its frames. Removed when the loader is destroyed.
@@ -121,6 +122,7 @@ public:
 
 private:
     void initialise(Module& m);
+    void rollback_failed_init(size_t init_before, const std::string& dll_lower, Module* requested);
     static void set_initialised(Module& m, bool value);
     Module& map_image(const std::filesystem::path& path);
     void initialize_tls(Module& m);

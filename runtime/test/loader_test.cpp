@@ -913,6 +913,177 @@ void test_failed_dependency_not_registered() {
     pass(what);
 }
 
+// Run-time loads (load_runtime_module, and forwarded exports in resolve_module_export) map and initialise bundled
+// DLLs on demand. When initialise() fails — because a dependency's DllMain returns FALSE, or a TLS callback is
+// invalid before DllMain — neither the failing dependency nor its uninitialised importer may stay findable by name,
+// and uninitialised modules from the failed load must leave init_order_ so a later unrelated LoadLibrary neither
+// executes them nor keeps failing on them.
+void test_failed_runtime_init_rollback() {
+    auto add_dllmain = [](std::vector<uint8_t>& img, uint32_t entry_rva) {
+        nt_of(img)->FileHeader.Characteristics |= IMAGE_FILE_DLL;
+        nt_of(img)->OptionalHeader.AddressOfEntryPoint = entry_rva;
+        emit_jump_stub(img, 0x200 + (entry_rva - 0x1000), reinterpret_cast<uint64_t>(&observe_dllmain));
+    };
+
+    // 1. Dependency DllMain returns FALSE during load_runtime_module("rt_bad_plugin.dll").
+    {
+        const char* what = "failed runtime dependency DllMain rolls back names and uninitialised importer";
+        reset_notifications();
+        auto bad_dep = make_forwarder_image("KERNEL32.GetCurrentProcessId", 0x181000000);
+        add_dllmain(bad_dep, 0x11C0);
+        auto plugin = make_import_image("rt_bad_dep.dll", "fwd");
+        nt_of(plugin)->OptionalHeader.ImageBase = leonida_test::free_image_base(0x182000000);
+        add_dllmain(plugin, 0x11C0);
+        auto other = make_image();
+        nt_of(other)->OptionalHeader.ImageBase = leonida_test::free_image_base(0x183000000);
+        add_dllmain(other, 0x1000);
+        write_image_as(bad_dep, "rt_bad_dep.dll");
+        write_image_as(plugin, "rt_bad_plugin.dll");
+        write_image_as(other, "rt_good_other.dll");
+
+        void* bad_dep_base = nullptr;
+        void* other_base = nullptr;
+        bool ok = true;
+        {
+            rt::Loader loader(g_dir);
+            g_fail_attach = true;
+            bool handled = false;
+            SetLastError(0);
+            void* h = loader.load_runtime_module("rt_bad_plugin.dll", 0, handled);
+            const DWORD err = GetLastError();
+            if (!handled || h != nullptr || err != ERROR_DLL_INIT_FAILED) {
+                failed(what, "load_runtime_module did not fail with ERROR_DLL_INIT_FAILED");
+                ok = false;
+            }
+            if (ok && (loader.find_loaded_module("rt_bad_dep.dll") || loader.find_loaded_module("rt_bad_plugin.dll"))) {
+                failed(what, "failed dependency or importer stayed findable by name");
+                ok = false;
+            }
+            if (ok && g_notifications.size() == 1) bad_dep_base = g_notifications[0].base;
+
+            // A later unrelated LoadLibrary must succeed and must not run rt_bad_plugin.dll's DllMain.
+            g_fail_attach = false;
+            g_notifications.clear();
+            handled = false;
+            other_base = loader.load_runtime_module("rt_good_other.dll", 0, handled);
+            if (ok && (!handled || !other_base)) {
+                failed(what, "unrelated LoadLibrary failed after failed dependency init");
+                ok = false;
+            }
+            if (ok && g_notifications != std::vector<Notification>{{other_base, DLL_PROCESS_ATTACH, false}}) {
+                failed(what, "unrelated LoadLibrary ran DllMain for the failed importer");
+                ok = false;
+            }
+            g_notifications.clear();
+        }
+        // Destruction detaches other and the failed dependency once, and never detaches the unattached importer.
+        if (ok && g_notifications != std::vector<Notification>{{other_base, DLL_PROCESS_DETACH, false},
+                                                               {bad_dep_base, DLL_PROCESS_DETACH, false}}) {
+            failed(what, "unexpected detach notifications after failed runtime dependency init");
+            ok = false;
+        }
+        if (ok) pass(what);
+    }
+
+    // 2. Dependency fails TLS callback validation before DllMain (initialised remains false).
+    {
+        const char* what = "failed runtime TLS validation does not poison later unrelated loads";
+        reset_notifications();
+        auto bad_tls = make_forwarder_image("KERNEL32.GetCurrentProcessId", 0x184000000);
+        add_dllmain(bad_tls, 0x11C0);
+        const uint64_t base = nt_of(bad_tls)->OptionalHeader.ImageBase;
+        auto* callbacks = reinterpret_cast<uint64_t*>(bad_tls.data() + 0x240);  // RVA 0x1040
+        callbacks[0] = base + 0x9000;                                           // past SizeOfImage
+        callbacks[1] = 0;
+        auto* tls = reinterpret_cast<IMAGE_TLS_DIRECTORY64*>(bad_tls.data() + 0x260);  // RVA 0x1060
+        tls->AddressOfCallBacks = base + 0x1040;
+        auto& tls_dir = nt_of(bad_tls)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+        tls_dir.VirtualAddress = 0x1060;
+        tls_dir.Size = sizeof(IMAGE_TLS_DIRECTORY64);
+
+        auto plugin = make_import_image("rt_bad_tls_dep.dll", "fwd");
+        nt_of(plugin)->OptionalHeader.ImageBase = leonida_test::free_image_base(0x185000000);
+        add_dllmain(plugin, 0x11C0);
+        auto other = make_image();
+        nt_of(other)->OptionalHeader.ImageBase = leonida_test::free_image_base(0x186000000);
+        add_dllmain(other, 0x1000);
+        write_image_as(bad_tls, "rt_bad_tls_dep.dll");
+        write_image_as(plugin, "rt_bad_tls_plugin.dll");
+        write_image_as(other, "rt_good_after_tls.dll");
+
+        bool ok = true;
+        {
+            rt::Loader loader(g_dir);
+            bool handled = false;
+            void* h = loader.load_runtime_module("rt_bad_tls_plugin.dll", 0, handled);
+            if (!handled || h != nullptr || GetLastError() != ERROR_DLL_INIT_FAILED) {
+                failed(what, "invalid TLS dependency did not fail with ERROR_DLL_INIT_FAILED");
+                ok = false;
+            }
+            if (ok && (loader.find_loaded_module("rt_bad_tls_dep.dll") ||
+                       loader.find_loaded_module("rt_bad_tls_plugin.dll"))) {
+                failed(what, "invalid TLS dependency or importer stayed findable by name");
+                ok = false;
+            }
+            handled = false;
+            void* other_base = loader.load_runtime_module("rt_good_after_tls.dll", 0, handled);
+            if (ok && (!handled || !other_base)) {
+                failed(what, "later unrelated LoadLibrary failed because invalid TLS module stayed in init_order_");
+                ok = false;
+            }
+        }
+        if (ok) pass(what);
+    }
+
+    // 3. Map-only preloaded DLL whose DllMain returns FALSE when first initialised through load_runtime_module.
+    {
+        const char* what = "preloaded DLL that fails runtime initialise is not left findable by name";
+        reset_notifications();
+        auto preloaded = make_image();
+        nt_of(preloaded)->OptionalHeader.ImageBase = leonida_test::free_image_base(0x187000000);
+        add_dllmain(preloaded, 0x1000);
+        const auto path = write_image_as(preloaded, "rt_preloaded_fail.dll");
+
+        rt::Loader loader(g_dir);
+        loader.load(path);  // map-only
+        g_fail_attach = true;
+        bool handled = false;
+        void* h = loader.load_runtime_module("rt_preloaded_fail.dll", 0, handled);
+        if (!handled || h != nullptr || GetLastError() != ERROR_DLL_INIT_FAILED)
+            failed(what, "preloaded module did not fail with ERROR_DLL_INIT_FAILED");
+        else if (loader.find_loaded_module("rt_preloaded_fail.dll"))
+            failed(what, "failed preloaded module stayed findable by name");
+        else
+            pass(what);
+    }
+
+    // 4. Forwarded export targeting a bundled DLL whose DllMain returns FALSE.
+    {
+        const char* what = "forwarded export whose target fails DllMain does not leave the target findable";
+        reset_notifications();
+        auto target = make_forwarder_image("KERNEL32.GetCurrentProcessId", 0x188000000);
+        add_dllmain(target, 0x11C0);
+        auto proxy = make_forwarder_image("rt_fwd_bad.fwd", 0x189000000);
+        add_dllmain(proxy, 0x11C0);
+        write_image_as(target, "rt_fwd_bad.dll");
+        const auto proxy_path = write_image_as(proxy, "rt_fwd_proxy.dll");
+
+        rt::Loader loader(g_dir);
+        void* proxy_base = loader.load(proxy_path).base;
+        loader.initialise();
+        g_fail_attach = true;
+        bool owns = false;
+        void* fn = loader.resolve_module_export(proxy_base, "fwd", owns);
+        if (!owns || fn != nullptr)
+            failed(what, "forwarded export succeeded despite failing target DllMain");
+        else if (loader.find_loaded_module("rt_fwd_bad.dll"))
+            failed(what, "failed forwarder target stayed findable by name");
+        else
+            pass(what);
+    }
+    reset_notifications();
+}
+
 void test_forwarded_exports() {
     {
         const char* what = "a forwarded export binds to its target instead of into the string";
@@ -1305,6 +1476,7 @@ int main() {
         test_process_detach_without_entry();
         test_process_detach_dependencies();
         test_failed_dependency_not_registered();
+        test_failed_runtime_init_rollback();
         test_delay_descriptor_fields();
         test_forwarded_exports();
         test_export_bounds();
