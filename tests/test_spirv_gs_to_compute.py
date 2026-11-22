@@ -50,8 +50,9 @@ def test_compute_module(gs_tri):
     inputs = re.findall(r"(%\w+) = OpVariable %\w+ Input\b", out)
     builtins = {v: re.search(rf"OpDecorate {v} BuiltIn (\w+)", out).group(1) for v in inputs}
     assert sorted(builtins.values()) == ["GlobalInvocationId", "SubgroupLocalInvocationId"]
-    # three emits, two outputs each, go to the record buffer
-    assert len(re.findall(r"OpAccessChain %gsc_ptr_sb_v4 %gsc_rec ", out)) == 6
+    # three emits go through the bounds-checked helper, which writes both outputs to the record buffer
+    assert len(re.findall(r"OpFunctionCall %\w+ %gsc_emit %gsc_recbase %gsc_metabase\b", out)) == 3
+    assert len(re.findall(r"OpAccessChain %gsc_ptr_sb_v4 %gsc_rec ", out)) == 2
     for b in (0, 1, 2):
         assert f"Binding {b}" in out
     shader.validate(out)    # spirv-as + spirv-val, as for the translator's own output
@@ -228,3 +229,152 @@ def test_help_is_a_clean_exit_zero(capsys):
         out = capsys.readouterr().out
         assert "spirv_gs_to_compute.py in.spv out.spv" in out
         assert "SPIRV-Tools" in out
+
+
+def _validate_spvasm(tmp_path: Path, name: str, assembly: str) -> None:
+    if not HAVE_SPIRV:
+        return
+    spv = tmp_path / f"{name}.spv"
+    subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-", "-o", str(spv)],
+                   input=assembly, text=True, check=True)
+    result = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(spv)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+def _gsc_emit_lines(spvasm: str) -> list[str]:
+    lines = spvasm.splitlines()
+    start = next((i for i, ln in enumerate(lines) if ln.strip().startswith("%gsc_emit = OpFunction ")), None)
+    assert start is not None, "missing bounded %gsc_emit helper"
+    end = next(i for i in range(start + 1, len(lines)) if lines[i].strip() == "OpFunctionEnd")
+    return lines[start:end + 1]
+
+
+def test_emit_vertex_is_bounded_by_output_vertices(tmp_path: Path) -> None:
+    gs = """\
+OpCapability Shader
+OpCapability Geometry
+OpMemoryModel Logical GLSL450
+OpEntryPoint Geometry %main "main" %out_pos
+OpExecutionMode %main Triangles
+OpExecutionMode %main Invocations 1
+OpExecutionMode %main OutputTriangleStrip
+OpExecutionMode %main OutputVertices 2
+OpDecorate %out_pos BuiltIn Position
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%float = OpTypeFloat 32
+%v4float = OpTypeVector %float 4
+%ptr_out = OpTypePointer Output %v4float
+%out_pos = OpVariable %ptr_out Output
+%f0 = OpConstant %float 0
+%zero = OpConstantComposite %v4float %f0 %f0 %f0 %f0
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpStore %out_pos %zero
+OpEmitVertex
+OpEmitVertex
+OpEmitVertex
+OpEmitVertex
+OpEndPrimitive
+OpReturn
+OpFunctionEnd
+"""
+    _validate_spvasm(tmp_path, "emit_overflow_gs", gs)
+    out, lay = gsc.rewrite(gs)
+    assert lay["max_verts"] == 2
+    assert "OpEmitVertex" not in out
+    assert len(re.findall(r"OpFunctionCall %\w+ %gsc_emit %gsc_recbase %gsc_metabase\b", out)) == 4
+    body = _gsc_emit_lines(out)
+    text = "\n".join(body)
+    assert re.search(r"%gsc_emit_ok = OpULessThan %\w+ %gsc_emit_n %gsc_k2\b", text)
+    assert "OpSelectionMerge %gsc_emit_done None" in text
+    assert "OpBranchConditional %gsc_emit_ok %gsc_emit_do %gsc_emit_done" in text
+    do_i = body.index("%gsc_emit_do = OpLabel")
+    done_i = body.index("%gsc_emit_done = OpLabel")
+    stores = [i for i, ln in enumerate(body) if ln.strip().startswith("OpStore ")]
+    assert stores and all(do_i < i < done_i for i in stores)
+    _validate_spvasm(tmp_path, "emit_overflow_cs", out)
+
+
+def test_emit_vertex_in_loop_header_stays_valid_spirv(tmp_path: Path) -> None:
+    gs = """\
+OpCapability Shader
+OpCapability Geometry
+OpMemoryModel Logical GLSL450
+OpEntryPoint Geometry %main "main" %out_pos
+OpExecutionMode %main Triangles
+OpExecutionMode %main Invocations 1
+OpExecutionMode %main OutputTriangleStrip
+OpExecutionMode %main OutputVertices 2
+OpDecorate %out_pos BuiltIn Position
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%bool = OpTypeBool
+%uint = OpTypeInt 32 0
+%float = OpTypeFloat 32
+%v4float = OpTypeVector %float 4
+%ptr_out = OpTypePointer Output %v4float
+%out_pos = OpVariable %ptr_out Output
+%u0 = OpConstant %uint 0
+%u1 = OpConstant %uint 1
+%u4 = OpConstant %uint 4
+%f0 = OpConstant %float 0
+%zero = OpConstantComposite %v4float %f0 %f0 %f0 %f0
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpBranch %loop
+%loop = OpLabel
+%i = OpPhi %uint %u0 %entry %i_next %loop
+OpStore %out_pos %zero
+OpEmitVertex
+%i_next = OpIAdd %uint %i %u1
+%cond = OpULessThan %bool %i_next %u4
+OpLoopMerge %after %loop None
+OpBranchConditional %cond %loop %after
+%after = OpLabel
+OpReturn
+OpFunctionEnd
+"""
+    _validate_spvasm(tmp_path, "emit_loop_gs", gs)
+    out, _ = gsc.rewrite(gs)
+    body = "\n".join(_gsc_emit_lines(out))
+    assert re.search(r"%gsc_emit_ok = OpULessThan %\w+ %gsc_emit_n %gsc_k2\b", body)
+    assert "OpLoopMerge %after %loop None" in out
+    assert re.search(r"OpFunctionCall %\w+ %gsc_emit %gsc_recbase %gsc_metabase\b", out)
+    _validate_spvasm(tmp_path, "emit_loop_cs", out)
+
+
+def test_zero_output_gs_emit_is_bounded(tmp_path: Path) -> None:
+    gs = """\
+OpCapability Shader
+OpCapability Geometry
+OpMemoryModel Logical GLSL450
+OpEntryPoint Geometry %main "main"
+OpExecutionMode %main Triangles
+OpExecutionMode %main Invocations 1
+OpExecutionMode %main OutputTriangleStrip
+OpExecutionMode %main OutputVertices 2
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%float = OpTypeFloat 32
+%v4float = OpTypeVector %float 4
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpEmitVertex
+OpEmitVertex
+OpEmitVertex
+OpReturn
+OpFunctionEnd
+"""
+    _validate_spvasm(tmp_path, "emit_zero_out_gs", gs)
+    out, lay = gsc.rewrite(gs)
+    assert lay["outputs"] == []
+    body = "\n".join(_gsc_emit_lines(out))
+    assert re.search(r"%gsc_emit_ok = OpULessThan %\w+ %gsc_emit_n %gsc_k2\b", body)
+    assert "%gsc_meta" in body
+    assert "%gsc_n" in body
+    assert "%gsc_rec" not in body
+    _validate_spvasm(tmp_path, "emit_zero_out_cs", out)

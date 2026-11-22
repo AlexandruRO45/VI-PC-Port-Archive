@@ -117,13 +117,16 @@ def rewrite(text):
     lay = layout_of(text)
     defs, _ = parse(text)
     main, ins, outs, builtins = lay["main"], lay["input_vars"], lay["output_vars"], lay["builtins"]
+    void = find_type(defs, "OpTypeVoid", [])
     uint = find_type(defs, "OpTypeInt", ["32", "0"])
     f32 = find_type(defs, "OpTypeFloat", ["32"])
     v4 = find_type(defs, "OpTypeVector", [f32, "4"])
-    if not (uint and v4):
-        raise Unsupported("module has no uint or vec4 type")
+    if not (void and uint and v4):
+        raise Unsupported("module has no void, uint or vec4 type")
     v3u = find_type(defs, "OpTypeVector", [uint, "3"]) or "%gsc_v3u"
     boolt = find_type(defs, "OpTypeBool", []) or "%gsc_bool"
+    has_emit = any(ln.strip() == "OpEmitVertex" for ln in text.splitlines())
+    emit_fn = (find_type(defs, "OpTypeFunction", [void, uint, uint]) or "%gsc_emit_fn") if has_emit else None
     float_ptrs = {r for r, (op, ops) in defs.items() if op == "OpTypePointer" and ops[1] == f32}
     nin, nout, mv, vin = len(ins), len(outs), lay["max_verts"], lay["verts_in"]
 
@@ -141,7 +144,8 @@ def rewrite(text):
              "OpDecorate %gsc_rec DescriptorSet 1", "OpDecorate %gsc_rec Binding 1",
              "OpDecorate %gsc_meta DescriptorSet 1", "OpDecorate %gsc_meta Binding 2"]
     types = ([f"{v3u} = OpTypeVector {uint} 3"] if v3u == "%gsc_v3u" else []) + \
-            ([f"{boolt} = OpTypeBool"] if boolt == "%gsc_bool" else [])
+            ([f"{boolt} = OpTypeBool"] if boolt == "%gsc_bool" else []) + \
+            ([f"%gsc_emit_fn = OpTypeFunction {void} {uint} {uint}"] if emit_fn == "%gsc_emit_fn" else [])
     types += [f"{k(v)} = OpConstant {uint} {v}" for v in sorted({0, 1, 2, 3, vin, nin, nout, mv, mv + 1}
                                                               | set(range(max(nin, nout))))]
     types += [f"%gsc_ptr_in_v3u = OpTypePointer Input {v3u}",
@@ -175,6 +179,45 @@ def rewrite(text):
         count += 1
         return f"%gsc_t{count}"
 
+    emit_helper = []
+    if has_emit:
+        # Helper function keeps OpEmitVertex valid inside loop headers / selection blocks and drops writes past max_verts.
+        emit_helper = [
+            f"%gsc_emit = OpFunction {void} None {emit_fn}",
+            f"%gsc_emit_rb = OpFunctionParameter {uint}",
+            f"%gsc_emit_mb = OpFunctionParameter {uint}",
+            "%gsc_emit_entry = OpLabel",
+            f"%gsc_emit_n = OpLoad {uint} %gsc_n",
+            f"%gsc_emit_ok = OpULessThan {boolt} %gsc_emit_n {k(mv)}",
+            "OpSelectionMerge %gsc_emit_done None",
+            "OpBranchConditional %gsc_emit_ok %gsc_emit_do %gsc_emit_done",
+            "%gsc_emit_do = OpLabel",
+        ]
+        if out_vars:
+            emit_helper.append(f"%gsc_emit_a = OpIAdd {uint} %gsc_emit_rb %gsc_emit_n")
+            for i, nv in enumerate(out_vars.values()):
+                b, c, val, p = tmp(), tmp(), tmp(), tmp()
+                emit_helper += [
+                    f"{b} = OpIMul {uint} %gsc_emit_a {k(nout)}",
+                    f"{c} = OpIAdd {uint} {b} {k(i)}",
+                    f"{val} = OpLoad {v4} {nv}",
+                    f"{p} = OpAccessChain %gsc_ptr_sb_v4 %gsc_rec {k(0)} {c}",
+                    f"OpStore {p} {val}",
+                ]
+        d, e, q, n1 = tmp(), tmp(), tmp(), tmp()
+        emit_helper += [
+            f"{d} = OpIAdd {uint} %gsc_emit_mb %gsc_emit_n",
+            f"{e} = OpIAdd {uint} {d} {k(1)}",
+            f"{q} = OpAccessChain %gsc_ptr_sb_u %gsc_meta {k(0)} {e}",
+            f"OpStore {q} {k(0)}",
+            f"{n1} = OpIAdd {uint} %gsc_emit_n {k(1)}",
+            f"OpStore %gsc_n {n1}",
+            "OpBranch %gsc_emit_done",
+            "%gsc_emit_done = OpLabel",
+            "OpReturn",
+            "OpFunctionEnd",
+        ]
+
     out = []
     entry_label = None
     state = "header"        # header -> body (in main, entry block) -> after the entry check
@@ -201,8 +244,9 @@ def rewrite(text):
             continue
         if m and m.group(2) == "OpFunction":
             if types:
-                out += types
+                out += types + emit_helper
                 types = []
+                emit_helper = []
             if m.group(1) == main:
                 state = "main_entry"
             out.append(ln)
@@ -268,21 +312,11 @@ def rewrite(text):
                     break
                 raise Unsupported(f"unhandled use of {v}: {s}")
         if s == "OpEmitVertex":
-            n, a = tmp(), tmp()
-            out += [f"{n} = OpLoad {uint} %gsc_n", f"{a} = OpIAdd {uint} %gsc_recbase {n}"]
-            for i, nv in enumerate(out_vars.values()):
-                b, c, val, p = tmp(), tmp(), tmp(), tmp()
-                out += [f"{b} = OpIMul {uint} {a} {k(nout)}", f"{c} = OpIAdd {uint} {b} {k(i)}",
-                        f"{val} = OpLoad {v4} {nv}", f"{p} = OpAccessChain %gsc_ptr_sb_v4 %gsc_rec {k(0)} {c}",
-                        f"OpStore {p} {val}"]
-            d, e, q, n1 = tmp(), tmp(), tmp(), tmp()
-            out += [f"{d} = OpIAdd {uint} %gsc_metabase {n}", f"{e} = OpIAdd {uint} {d} {k(1)}",
-                    f"{q} = OpAccessChain %gsc_ptr_sb_u %gsc_meta {k(0)} {e}", f"OpStore {q} {k(0)}",
-                    f"{n1} = OpIAdd {uint} {n} {k(1)}", f"OpStore %gsc_n {n1}"]
+            out.append(f"{tmp()} = OpFunctionCall {void} %gsc_emit %gsc_recbase %gsc_metabase")
             continue
         if s == "OpEndPrimitive":
-            # flag the last emitted vertex: meta[base + 1 + (n - 1)]; with none emitted this writes the count slot,
-            # which the final store overwrites
+            # flag the last emitted vertex: meta[base + 1 + (n - 1)], where %gsc_emit keeps n <= max_verts; with
+            # none emitted this writes the count slot, which the final store overwrites
             n, d, q = tmp(), tmp(), tmp()
             out += [f"{n} = OpLoad {uint} %gsc_n", f"{d} = OpIAdd {uint} %gsc_metabase {n}",
                     f"{q} = OpAccessChain %gsc_ptr_sb_u %gsc_meta {k(0)} {d}", f"OpStore {q} {k(1)}"]
