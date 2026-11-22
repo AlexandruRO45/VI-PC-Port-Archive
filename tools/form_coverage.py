@@ -40,6 +40,9 @@ CPU_FIXTURES = {
     "direct": "cpu_aot_direct_call",
     "chained": "cpu_aot_chained_ranges",
     "callback": "cpu_aot_object_callback",
+    "x87_add": "cpu_aot_x87_add",
+    "x87_mul": "cpu_aot_x87_mul",
+    "x87_harness": None,  # native x87 entry and exit state for x87_add
     "destroy": "cpu_aot_destroy_contract",
     "create_context": "cpu_aot_context_lifecycle",
     "bink_heap": "cpu_aot_bink_heap",
@@ -52,10 +55,12 @@ CPU_FIXTURES = {
     "fourth_arg": "cpu_aot_fourth_argument",
     "repeat_call": "cpu_aot_repeated_call",
     "working_set_delta": "cpu_working_set_delta",
+    "xlatb": "cpu_aot_xlatb",
     "exe_entry": "cpu_aot_exe_entry",
     "address_size": "cpu_aot_address_size",
     "call_pair": "cpu_aot_call_pair",
     "bmi1": "cpu_aot_bmi1",
+    "rotates_shifts": "cpu_aot_rotates_shifts",
     "register_probe": None,  # measurement harness
     "two_imports": None,     # mapped and run unchanged by pe_map
     "exe_start": None,       # mapped and run unchanged by pe_map

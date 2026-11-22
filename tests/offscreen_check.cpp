@@ -360,7 +360,9 @@ int main(int argc, char** argv)
 {
     if (argc < 3) return 2;
     const std::string_view operation = argv[2];
-    if (operation == "--check-bc7-tail") {
+    if (operation == "--check-pixel-quad-lod") {
+        if (argc != 4) return 2;
+    } else if (operation == "--check-bc7-tail") {
         if (argc < 6) return 2;
     } else {
         if (argc != 3 && argc != 5 && argc != 6) return 2;
@@ -427,6 +429,8 @@ int main(int argc, char** argv)
             check_dual_pixel(device.Get(), argv[3], argv[4], operation == "--dual-pixel-swapped");
         } else if (argc == 5 && operation == "--check-pixel-case") {
             check_translated_pixel(device.Get(), argv[3], false, argv[4]);
+        } else if (operation == "--check-pixel-quad-lod") {
+            check_pixel_quad_lod(device.Get(), argv[3]);
         } else if (operation == "--check-pixel") {
             if (argc != 5 || (std::string_view(argv[4]) != "rgba" && std::string_view(argv[4]) != "bgra"))
                 throw std::runtime_error("Expected --check-pixel <pixel.cso> rgba|bgra");
