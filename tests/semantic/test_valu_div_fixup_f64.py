@@ -617,6 +617,7 @@ class ScalarInterpreter:
 
     def execute_ast(self, inst: ASTInstruction) -> int:
         inst.validate()
+        # Source reads must occur prior to destination write
         s0 = self.resolve_operand(inst.src0)
         s1 = self.resolve_operand(inst.src1)
         s2 = self.resolve_operand(inst.src2)
@@ -740,6 +741,101 @@ class SIMDWavefront:
                 )
                 self.lanes[lane].set_vgpr_pair(dst_reg, res)
         return self.load_vgpr_pair_wave(dst_reg)
+
+
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasing(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def test_inplace_dst_equals_src0(self) -> None:
+        interp = ScalarInterpreter()
+        interp.vgpr.set_vgpr_pair(2, f64_to_u64(5.0))   # s0 (quotient)
+        interp.vgpr.set_vgpr_pair(4, f64_to_u64(2.0))   # s1 (denom)
+        interp.vgpr.set_vgpr_pair(6, f64_to_u64(10.0))  # s2 (numer)
+
+        # v[2:3] = fixup(v[2:3], v[4:5], v[6:7])
+        res = interp.execute_asm("v_div_fixup_f64 v[2:3], v[2:3], v[4:5], v[6:7]")
+        self.assertEqual(u64_to_f64(res), 5.0)
+        self.assertEqual(interp.vgpr.get_vgpr_pair(2), res)
+        # Denominator and numerator undisturbed
+        self.assertEqual(interp.vgpr.get_vgpr_pair(4), f64_to_u64(2.0))
+        self.assertEqual(interp.vgpr.get_vgpr_pair(6), f64_to_u64(10.0))
+
+    def test_inplace_dst_equals_src1(self) -> None:
+        interp = ScalarInterpreter()
+        interp.vgpr.set_vgpr_pair(2, f64_to_u64(5.0))
+        interp.vgpr.set_vgpr_pair(4, f64_to_u64(2.0))
+        interp.vgpr.set_vgpr_pair(6, f64_to_u64(10.0))
+
+        # v[4:5] = fixup(v[2:3], v[4:5], v[6:7]) -> overwriting denominator
+        res = interp.execute_asm("v_div_fixup_f64 v[4:5], v[2:3], v[4:5], v[6:7]")
+        self.assertEqual(u64_to_f64(res), 5.0)
+        self.assertEqual(interp.vgpr.get_vgpr_pair(4), res)
+
+    def test_inplace_dst_equals_src2(self) -> None:
+        interp = ScalarInterpreter()
+        interp.vgpr.set_vgpr_pair(2, f64_to_u64(5.0))
+        interp.vgpr.set_vgpr_pair(4, f64_to_u64(2.0))
+        interp.vgpr.set_vgpr_pair(6, f64_to_u64(10.0))
+
+        # v[6:7] = fixup(v[2:3], v[4:5], v[6:7]) -> overwriting numerator
+        res = interp.execute_asm("v_div_fixup_f64 v[6:7], v[2:3], v[4:5], v[6:7]")
+        self.assertEqual(u64_to_f64(res), 5.0)
+        self.assertEqual(interp.vgpr.get_vgpr_pair(6), res)
+
+    def test_all_operands_aliased(self) -> None:
+        interp = ScalarInterpreter()
+        initial = f64_to_u64(3.0)
+        interp.vgpr.set_vgpr_pair(0, initial)
+
+        # v[0:1] = fixup(v[0:1], v[0:1], v[0:1]) -> s0=3, s1=3, s2=3 -> +3.0
+        res = interp.execute_asm("v_div_fixup_f64 v[0:1], v[0:1], v[0:1], v[0:1]")
+        self.assertEqual(u64_to_f64(res), 3.0)
+        self.assertEqual(interp.vgpr.get_vgpr_pair(0), res)
+
+    def test_partially_overlapping_register_pairs(self) -> None:
+        interp = ScalarInterpreter()
+        s0_val = f64_to_u64(6.0)
+        s1_val = f64_to_u64(2.0)
+        s2_val = f64_to_u64(12.0)
+
+        interp.vgpr.set_vgpr_pair(0, s0_val)   # v[0:1]
+        interp.vgpr.set_vgpr_pair(4, s1_val)   # v[4:5]
+        interp.vgpr.set_vgpr_pair(6, s2_val)   # v[6:7]
+        interp.vgpr.set_vgpr(2, 0x11223344)
+
+        v0_before = interp.vgpr.get_vgpr(0)
+
+        # Destination is misaligned pair v[1:2], overlapping s0 at v1
+        dst = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=1)
+        src0 = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=0)
+        src1 = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=4)
+        src2 = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=6)
+
+        inst = ASTInstruction(opcode="v_div_fixup_f64", dst=dst, src0=src0, src1=src1, src2=src2)
+        res = interp.execute_ast(inst)
+
+        self.assertEqual(u64_to_f64(res), 6.0)
+        self.assertEqual(interp.vgpr.get_vgpr_pair(1), f64_to_u64(6.0))
+        # Non-overlapping dword v0 must remain intact
+        self.assertEqual(interp.vgpr.get_vgpr(0), v0_before)
+
+    def test_neighboring_registers_preserved(self) -> None:
+        interp = ScalarInterpreter()
+        interp.vgpr.set_vgpr(1, 0xAAAA1111)
+        interp.vgpr.set_vgpr(4, 0xBBBB2222)
+        interp.vgpr.set_vgpr_pair(2, f64_to_u64(1.0))
+        interp.vgpr.set_vgpr_pair(6, f64_to_u64(2.0))
+        interp.vgpr.set_vgpr_pair(8, f64_to_u64(2.0))
+
+        # Write to v[2:3]
+        interp.execute_asm("v_div_fixup_f64 v[2:3], v[2:3], v[6:7], v[8:9]")
+
+        self.assertEqual(interp.vgpr.get_vgpr(1), 0xAAAA1111)
+        self.assertEqual(interp.vgpr.get_vgpr(4), 0xBBBB2222)
 
 
 class TestSIMDMultiLaneDivergence(unittest.TestCase):
