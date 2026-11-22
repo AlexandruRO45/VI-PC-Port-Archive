@@ -1117,6 +1117,8 @@ if(BUILD_TESTING)
         set_tests_properties(run_argv_modes PROPERTIES TIMEOUT 90)
       endif()
     endif()
+  endif()
+  if(WIN32 AND TARGET gta6rt AND TARGET tiny_game AND TARGET stack_reserve_fixture)
     add_test(NAME run_startup_cmdline COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_startup_cmdline>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_startup_cmdline.cmake")
