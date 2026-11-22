@@ -305,7 +305,8 @@ class Gen:
         self.uses_codebase = False
         self.uses_pc_tail = False       # --pc-tail-ubo and the shader reads the tail (set in assemble)
         self.uses_long = False
-        self.vertex_inputs = []    # (D3D input register, component type 1=uint 2=sint 3=float) for fetch-calling VS
+        self.vertex_inputs = []    # (Vulkan location, component type 1=uint 2=sint 3=float) for fetch-calling VS
+        self.vertex_routes = {}    # packed Vulkan location -> (ISG1 register, destination component mask)
         self.vertex_signature = []   # full ISG1: (register, mask, system value, component type) for PSO lookup
         self.dynamic_format = False  # True when a buffer_load used a runtime V# FORMAT (unknown codes -> 0 at runtime)
         self.fixed_format_codes = set()  # static tbuffer/fixed format codes seen (validated against FORMATS)
@@ -11044,7 +11045,7 @@ def assemble(gen):
             iface += ["%out_layer"]
         if gen.uses_viewport:
             iface += ["%out_viewport"]
-    iface += [f"%vin{reg}" for reg, _ in gen.vertex_inputs] + ["%user_data"] + (["%pc_tail"] if gen.uses_pc_tail else [])
+    iface += [f"%vin{loc}" for loc, _ in gen.vertex_inputs] + ["%user_data"] + (["%pc_tail"] if gen.uses_pc_tail else [])
     bary = any(str(c).startswith("bary") for c in gen.frag_inputs.values()) or bool(gen.per_vertex)
     # --bary-fallback: %bary is a plain input at the lowest location no attribute uses, so no capability or
     # extension. Lowest free, not one past the highest: a PS whose only input is attr30 would otherwise put it at 31,
@@ -11474,8 +11475,8 @@ def assemble(gen):
     if gen.vertex_inputs:
         types += ["%v4uint_in = OpTypeVector %uint 4", "%v4int_in = OpTypeVector %int 4",
                   "%_ptr_Input_v4u = OpTypePointer Input %v4uint_in", "%_ptr_Input_v4i = OpTypePointer Input %v4int_in"]
-        for reg, ctype in gen.vertex_inputs:
-            dec.append(f"OpDecorate %vin{reg} Location {reg}")
+        for loc, _ in gen.vertex_inputs:
+            dec.append(f"OpDecorate %vin{loc} Location {loc}")
     if gen.writes_depth:
         types += ["%_ptr_Output_float = OpTypePointer Output %float"]
         dec += ["OpDecorate %out_depth BuiltIn FragDepth"]
@@ -11522,9 +11523,9 @@ def assemble(gen):
         gvars.append("%instance_index = OpVariable %_ptr_Input_int Input")
         gvars.append("%base_vertex = OpVariable %_ptr_Input_int Input")
         gvars.append("%base_instance = OpVariable %_ptr_Input_int Input")
-    for reg, ctype in gen.vertex_inputs:
+    for loc, ctype in gen.vertex_inputs:
         ptr = {1: "%_ptr_Input_v4u", 2: "%_ptr_Input_v4i"}.get(ctype, "%_ptr_Input_v4")
-        gvars.append(f"%vin{reg} = OpVariable {ptr} Input")
+        gvars.append(f"%vin{loc} = OpVariable {ptr} Input")
     fn = ["%main = OpFunction %void None %fn", "%entry = OpLabel",
           # Registers start at zero (deterministic); real inputs are written explicitly at entry.
           "%vgpr = OpVariable %_ptr_Function_arr_v Function %null_v",
@@ -11631,17 +11632,18 @@ def assemble(gen):
                 continue
             fn += [f"%fc{c} = OpCompositeExtract %float %fc {c}", f"%fcu{c} = OpBitcast %uint %fc{c}",
                    f"%fcp{c} = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(r)}", f"OpStore %fcp{c} %fcu{c}"]
-    for reg, ctype in gen.vertex_inputs:
+    for loc, ctype in gen.vertex_inputs:
         vt = {1: "%v4uint_in", 2: "%v4int_in"}.get(ctype, "%v4float")
         st = {1: "%uint", 2: "%int"}.get(ctype, "%float")
-        fn.append(f"%vinv{reg} = OpLoad {vt} %vin{reg}")
-        for c in range(4):
-            vg = 4 + 4 * reg + c
-            fn += [f"%vinc{reg}_{c} = OpCompositeExtract {st} %vinv{reg} {c}",
-                   f"%vinb{reg}_{c} = OpBitcast %uint %vinc{reg}_{c}" if ctype != 1 else
-                   f"%vinb{reg}_{c} = OpCopyObject %uint %vinc{reg}_{c}",
-                   f"%vinp{reg}_{c} = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(vg)}",
-                   f"OpStore %vinp{reg}_{c} %vinb{reg}_{c}"]
+        reg, mask = gen.vertex_routes.get(loc, (loc, 0xF))
+        fn.append(f"%vinv{loc} = OpLoad {vt} %vin{loc}")
+        for src, dst in enumerate(c for c in range(4) if mask & (1 << c)):
+            vg = 4 + 4 * reg + dst
+            fn += [f"%vinc{loc}_{src} = OpCompositeExtract {st} %vinv{loc} {src}",
+                   f"%vinb{loc}_{src} = OpBitcast %uint %vinc{loc}_{src}" if ctype != 1 else
+                   f"%vinb{loc}_{src} = OpCopyObject %uint %vinc{loc}_{src}",
+                   f"%vinp{loc}_{src} = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(vg)}",
+                   f"OpStore %vinp{loc}_{src} %vinb{loc}_{src}"]
     # Spill pointers last: a spilled value's type may be declared anywhere above.
     types += [f"{ptr} = OpTypePointer Function {t}" for t, ptr in gen.x_ptr_types.items()]
     helpers = (gen.desc_fn or []) + (gen.fmt_fn or [])
@@ -12344,6 +12346,41 @@ def input_signature(path, name):
     return []
 
 
+def map_vertex_inputs(g, sig):
+    """Assign physical locations and return the VGPRs supplied by vertex fetch."""
+    by_register = {}
+    for reg, mask, _, ctype in sig:
+        by_register.setdefault(reg, []).append((mask, ctype))
+    occupied = set(by_register)
+    extra_location = 0
+    predicted = set()
+    registers = sorted(by_register) if any(len(elements) > 1 for elements in by_register.values()) else by_register
+    for reg in registers:
+        elements = by_register[reg]
+        # Preserve the full vec4 (including Vulkan format defaults) for a standalone semantic.
+        if len(elements) == 1:
+            g.vertex_inputs.append((reg, elements[0][1]))
+            predicted.update(4 + 4 * reg + c for c in range(4))
+            continue
+        covered = 0
+        # Keep the lowest column at the register's location and use free locations for the other semantics.
+        # Ordering by the first set bit makes the assignment independent of ISG1 row order within a register.
+        for i, (mask, ctype) in enumerate(sorted(elements, key=lambda element: element[0] & -element[0])):
+            if not 0 < mask <= 0xF or covered & mask:
+                raise Unsupported(f"vertex input register {reg} has invalid or overlapping packed masks")
+            covered |= mask
+            loc = reg
+            if i:
+                while extra_location in occupied:
+                    extra_location += 1
+                loc = extra_location
+                occupied.add(loc)
+            g.vertex_inputs.append((loc, ctype))
+            g.vertex_routes[loc] = (reg, mask)
+        predicted.update(4 + 4 * reg + c for c in range(4) if covered & (1 << c))
+    return predicted
+
+
 def same_encoding(raw, printed, op):
     """True if the bytes in the blob are the instruction LLVM printed. Exact match, except for fields the
     hardware ignores that LLVM re-encodes with its default: VOP3P op_sel_hi[2] (bit 14) on two-source packed
@@ -12812,30 +12849,16 @@ def translate(path):
     if stage == "vs" and any(base_op(i["op"]) == "s_swappc_b64" for i in insns):
         # The call goes to a driver-generated fetch program (not in the blob). Verified rule over 788 shaders:
         # input-signature register r, component c is fetched into v(4 + 4r + c). Replace the call with Vulkan
-        # vertex inputs (location = register) written into those VGPRs at entry.
+        # vertex inputs written into those VGPRs at entry.
         sig = [s for s in input_signature(path, info["name"]) if s[2] == 0]
-        # Any component of a declared register may be read: components the vertex format lacks come back as the
-        # format defaults (0, 0, 1 for y, z, w) from the hardware fetch, and Vulkan fills a vec4 input from a
-        # narrower format the same way. Seen: .w of an xyz position.
-        predicted = {4 + 4 * reg + c for reg, mask, _, _ in sig for c in range(4)}
+        predicted = map_vertex_inputs(g, sig)
         reads = {r for r in read_before_write_vgprs(insns) if r >= 4}
         if not reads <= predicted:
             raise Unsupported("fetch mapping")
-        # SHADER-644: ISG1 can pack several elements into one register (xy and zw). They all become one vec4
-        # Vulkan input; emitting one %vin{reg} per element redefines the same Id and fails spirv-val. Keep the
-        # first component type for the register, and reject a genuinely conflicting type instead of guessing.
-        input_types = {}
-        for reg, _, _, ctype in sig:
-            kind = ctype if ctype in (1, 2) else 3
-            if reg in input_types and input_types[reg] != kind:
-                raise Unsupported(f"vertex input register {reg} has conflicting component types")
-            input_types[reg] = kind
-        g.vertex_inputs = list(input_types.items())
         g.vertex_signature = [{"register": reg, "mask": mask, "system_value": sv, "component_type": ctype}
                               for reg, mask, sv, ctype in sig]
-        for reg, _ in g.vertex_inputs:          # register the VGPR index constants before assembly
-            for c in range(4):
-                g.cu(4 + 4 * reg + c)
+        for vgpr in sorted(predicted):         # register the VGPR index constants before assembly
+            g.cu(vgpr)
         insns = [i for i in insns if base_op(i["op"]) != "s_swappc_b64"]
     user_limit = g.cs["user"] if g.cs else USER_SGPRS
     sys_sgprs = (3,) if stage in ("ms", "gs") else ()
@@ -13419,7 +13442,8 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
     if lds:
         m["lds_bytes"] = lds
     if g.vertex_inputs:
-        m["vertex_inputs"] = [{"location": r, "type": {1: "uint", 2: "sint"}.get(t, "float")} for r, t in g.vertex_inputs]
+        m["vertex_inputs"] = [{"location": loc, "type": {1: "uint", 2: "sint"}.get(t, "float")}
+                              for loc, t in g.vertex_inputs]
     if getattr(g, "vertex_signature", None):
         m["vertex_input_signature"] = list(g.vertex_signature)
     if getattr(g, "dynamic_format", False):
@@ -13475,6 +13499,14 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
                 m["mesh_compute"] = dict(m["mesh_compute"], f16_halves=m["f16_halves"])
     if g.build_meta:
         m.update(g.build_meta)
+    if g.vertex_routes:
+        # The declared masks within each packed register are disjoint, so (register, mask) identifies its semantic.
+        locations = {route: loc for loc, route in g.vertex_routes.items()}
+        m["input_signature"] = [
+            dict(e, location=locations[e["register"], e["mask"]])
+            if e["system_value"] == 0 and (e["register"], e["mask"]) in locations else e
+            for e in m["input_signature"]
+        ]
     return m
 
 

@@ -1013,6 +1013,12 @@ if(TARGET Vulkan::Headers)
     target_compile_definitions(gta6rt_d3d12_com PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(gta6rt_d3d12_com PRIVATE /W4 /permissive- /utf-8)
 
+    add_executable(d3d12_vertex_layout_test test/d3d12_vertex_layout_test.cpp)
+    target_link_libraries(d3d12_vertex_layout_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_vertex_layout_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_vertex_layout_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_vertex_layout COMMAND d3d12_vertex_layout_test)
+
     add_executable(d3d12_com_test test/d3d12_com_test.cpp)
     target_link_libraries(d3d12_com_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_com_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)

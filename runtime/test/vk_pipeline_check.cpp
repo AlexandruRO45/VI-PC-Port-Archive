@@ -1384,7 +1384,12 @@ int main(int argc, char** argv) {
                     } else if (stage == "vs") {
                         std::string ps_fn = stub_filename("ps", meta.outputs);
                         VkShaderModule ps_mod = load_stub(ps_fn);
-                        if (!ps_mod) {
+                        if (meta.vertex_inputs.size() > props.limits.maxVertexInputAttributes ||
+                            std::any_of(meta.vertex_inputs.begin(), meta.vertex_inputs.end(), [&](const auto& vi) {
+                                return vi.location >= props.limits.maxVertexInputAttributes;
+                            })) {
+                            skip_reason = "exceeds maxVertexInputAttributes";
+                        } else if (!ps_mod) {
                             skip_reason = "missing stub " + ps_fn;
                         } else {
                             color_formats.push_back(VK_FORMAT_R32G32B32A32_SFLOAT);

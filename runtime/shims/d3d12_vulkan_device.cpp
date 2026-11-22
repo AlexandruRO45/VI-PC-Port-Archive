@@ -13,6 +13,7 @@
 #include "d3d12_stubs.h"  // generated
 #include "d3d12_com_object.h"
 #include "d3d12_trace.h"
+#include "d3d12_vertex_layout.h"
 #include "d3d12_xs_device.h"
 #include "dxgi_com.h"
 #include "../src/gfx10_descriptors.h"
@@ -402,6 +403,7 @@ struct DeviceState {
     }
     std::unique_ptr<leonida::VulkanContext> context;
     VkPhysicalDeviceMemoryProperties memory{};
+    VkPhysicalDeviceLimits vertex_input_limits{};
     // D3D-96: upload-heap buffers prefer DEVICE_LOCAL | HOST_VISIBLE memory, so the GPU reads them from VRAM. Only
     // with Resizable BAR (leonida::resizable_bar); LEONIDA_UPLOAD_SYSMEM=1 keeps them in system memory to compare.
     bool upload_in_vram = false;
@@ -2164,6 +2166,11 @@ bool equal_semantic(const std::string& a, const char* b) {
         if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i]))) return false;
     return true;
 }
+
+bool matches_input(const leonida::SignatureElement& input, const D3D12_INPUT_ELEMENT_DESC& element) {
+    return input.system_value == 0 && input.semantic_index == element.SemanticIndex &&
+           equal_semantic(input.semantic, element.SemanticName);
+}
 // A heap (section 3.3): a range of the GPU address arena, as large as the game asked for, so a placed buffer can
 // name any 64 KiB-aligned offset in it. Textures placed in it still get their own VkDeviceMemory; the offset is only
 // their key, which keeps optimal-tiling images out of the arena's memory type.
@@ -2257,12 +2264,12 @@ const leonida::ShaderEntry* pick_entry(const std::vector<const leonida::ShaderEn
 
 // Whether the input layout has an element for every ordinary (non-system-value) input of the vertex shader.
 bool layout_feeds(const leonida::ShaderEntry& vs, const D3D12_INPUT_LAYOUT_DESC& layout) {
+    if (layout.NumElements && !layout.pInputElementDescs) return false;
     for (const auto& input : vs.input_signature) {
         if (input.system_value) continue;
         bool fed = false;
         for (UINT i = 0; i < layout.NumElements && !fed; ++i)
-            fed = layout.pInputElementDescs[i].SemanticIndex == input.semantic_index &&
-                  equal_semantic(input.semantic, layout.pInputElementDescs[i].SemanticName);
+            fed = matches_input(input, layout.pInputElementDescs[i]);
         if (!fed) return false;
     }
     return true;
@@ -2582,13 +2589,19 @@ public:
             stage.words = library->spirv(*stage.entry);
             if (stage.words.empty()) return E_FAIL;
         }
+        Stage& vs_stage = stages[0];
+        Stage& gs_stage = stages[1];
+        Stage& ps_stage = stages[2];
+        VertexLayout vertex_layout;
+        if (const HRESULT hr = build_vertex_layout(desc.InputLayout, *vs_stage.entry,
+                                                   device_.vertex_input_limits, vertex_layout);
+            FAILED(hr)) return hr;
+        graphics_.vertex_slots = vertex_layout.slots;
+        graphics_.zero_step_slots = vertex_layout.zero_step_slots;
         // --f16-interp-fallback (SHADER-378): align/synthesize VS decoded f16 halves for this (VS, PS) pair before
         // creating the shader modules so colliding PS and high-param producers link within MoltenVK's 30 locations.
         // stages[] is {vs, gs, ps} since geometry shaders joined graphics PSOs (#2109): the PS is stages[2], and with a
         // GS the PS reads the GS's outputs, not the VS's, so the VS/PS halves link only applies without one.
-        Stage& vs_stage = stages[0];
-        Stage& gs_stage = stages[1];
-        Stage& ps_stage = stages[2];
         if (vs_stage.entry && ps_stage.entry && !ps_stage.entry->f16_halves.empty() && gs_stage.entry) {
             log_once("--f16-interp-fallback halves are linked VS->PS only; this PSO has a geometry shader", 0);
         }
@@ -2616,52 +2629,6 @@ public:
             stage_infos.push_back(info);
         }
 
-        // Input layout -> vertex input, by semantic.
-        std::vector<VkVertexInputAttributeDescription> attributes;
-        std::vector<VkVertexInputBindingDescription> bindings;
-        UINT slot_end[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] = {};
-        for (UINT i = 0; i < desc.InputLayout.NumElements; ++i) {
-            const D3D12_INPUT_ELEMENT_DESC& element = desc.InputLayout.pInputElementDescs[i];
-            if (element.InputSlot >= D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) return E_INVALIDARG;
-            VkFormat format;
-            UINT bytes;
-            if (!vertex_format(element.Format, format, bytes)) {
-                log_once("vertex attribute format not supported yet:", element.Format);
-                return E_INVALIDARG;
-            }
-            const UINT alignment = std::min(bytes, 4u);
-            const UINT offset = element.AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT
-                                    ? (slot_end[element.InputSlot] + alignment - 1) / alignment * alignment
-                                    : element.AlignedByteOffset;
-            slot_end[element.InputSlot] = offset + bytes;
-            const leonida::SignatureElement* input = nullptr;
-            for (const auto& e : stages[0].entry->input_signature)
-                if (e.system_value == 0 && e.semantic_index == element.SemanticIndex &&
-                    equal_semantic(e.semantic, element.SemanticName))
-                    input = &e;
-            if (!input) continue;  // the shader does not read this element
-            attributes.push_back({input->register_index, element.InputSlot, format, offset});
-            const bool instance = element.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA;
-            // Step rate 0: every instance reads element 0, which a stride of 0 gives (set at each draw).
-            if (instance && element.InstanceDataStepRate == 0) graphics_.zero_step_slots |= 1u << element.InputSlot;
-            if (instance && element.InstanceDataStepRate > 1)
-                log_once("instance step rates above 1 are not modelled; rate", int(element.InstanceDataStepRate));
-            if (!(graphics_.vertex_slots & (1u << element.InputSlot))) {
-                graphics_.vertex_slots |= 1u << element.InputSlot;
-                bindings.push_back({element.InputSlot, 0,  // stride: dynamic, from IASetVertexBuffers
-                                    instance ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX});
-            }
-        }
-        for (const auto& e : stages[0].entry->input_signature) {
-            if (e.system_value) continue;
-            const bool fed = std::any_of(attributes.begin(), attributes.end(),
-                                         [&](const auto& a) { return a.location == e.register_index; });
-            if (!fed) {  // D3D12 rejects an input layout that leaves a shader input unfed
-                std::fprintf(stderr, "[rt] d3d12: the input layout does not feed %s%u (register %u)\n",
-                             e.semantic.c_str(), e.semantic_index, e.register_index);
-                return E_INVALIDARG;
-            }
-        }
         VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
         switch (desc.PrimitiveTopologyType) {
         case D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT: assembly.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
@@ -2867,8 +2834,8 @@ public:
 
         // Kept for variants: a draw that leaves a slot unbound needs this pipeline with that format undefined.
         recipe_.stages = std::move(stage_infos);
-        recipe_.attributes = std::move(attributes);
-        recipe_.bindings = std::move(bindings);
+        recipe_.attributes = std::move(vertex_layout.attributes);
+        recipe_.bindings = std::move(vertex_layout.bindings);
         recipe_.assembly = assembly;
         recipe_.raster = raster;
         recipe_.multisample = multisample;
@@ -3959,6 +3926,7 @@ public:
         // Timestamps: what the one VkQueue every D3D12 queue submits to can write.
         VkPhysicalDeviceProperties properties{};
         device_properties(info.physical, &properties);
+        state_.vertex_input_limits = properties.limits;
         state_.max_sampler_lod_bias = properties.limits.maxSamplerLodBias;
         std::uint32_t family_count = 0;
         queue_families(info.physical, &family_count, nullptr);
@@ -6887,6 +6855,65 @@ private:
 };
 
 }  // namespace
+
+HRESULT build_vertex_layout(const D3D12_INPUT_LAYOUT_DESC& layout, const leonida::ShaderEntry& vs,
+                            const VkPhysicalDeviceLimits& limits, VertexLayout& out) {
+    if (layout.NumElements && !layout.pInputElementDescs) return E_INVALIDARG;
+    VertexLayout result;
+    std::vector<bool> fed(vs.input_signature.size());
+    UINT slot_end[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] = {};
+    for (UINT i = 0; i < layout.NumElements; ++i) {
+        const auto& element = layout.pInputElementDescs[i];
+        const UINT slot = element.InputSlot;
+        if (slot >= D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) return E_INVALIDARG;
+        VkFormat format;
+        UINT bytes;
+        if (!vertex_format(element.Format, format, bytes)) {
+            log_once("vertex attribute format not supported yet:", element.Format);
+            return E_INVALIDARG;
+        }
+        const UINT alignment = std::min(bytes, 4u);
+        const UINT offset = element.AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT
+                                ? (slot_end[slot] + alignment - 1) / alignment * alignment
+                                : element.AlignedByteOffset;
+        slot_end[slot] = offset + bytes;
+        const auto input = std::find_if(vs.input_signature.begin(), vs.input_signature.end(),
+                                       [&](const auto& e) { return matches_input(e, element); });
+        if (input == vs.input_signature.end()) continue;
+        const UINT location = input->vertex_location();
+        if (location >= limits.maxVertexInputAttributes || slot >= limits.maxVertexInputBindings ||
+            offset > limits.maxVertexInputAttributeOffset ||
+            std::any_of(result.attributes.begin(), result.attributes.end(),
+                        [&](const auto& attr) { return attr.location == location; })) {
+            std::fprintf(stderr, "[rt] d3d12: invalid or duplicate vertex attribute for %s%u "
+                                 "(register %u, location %u, slot %u, offset %u)\n",
+                         input->semantic.c_str(), input->semantic_index, input->register_index, location, slot, offset);
+            return E_INVALIDARG;
+        }
+        fed[input - vs.input_signature.begin()] = true;
+        result.attributes.push_back({location, slot, format, offset});
+        const bool instance = element.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA;
+        // Step rate 0: every instance reads element 0, which a stride of 0 gives (set at each draw).
+        if (instance && element.InstanceDataStepRate == 0) result.zero_step_slots |= 1u << slot;
+        if (instance && element.InstanceDataStepRate > 1)
+            log_once("instance step rates above 1 are not modelled; rate", int(element.InstanceDataStepRate));
+        if (!(result.slots & (1u << slot))) {
+            result.slots |= 1u << slot;
+            result.bindings.push_back({slot, 0,  // stride: dynamic, from IASetVertexBuffers
+                                       instance ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX});
+        }
+    }
+    for (std::size_t i = 0; i < fed.size(); ++i) {
+        const auto& input = vs.input_signature[i];
+        if (!fed[i] && input.system_value == 0) {
+            std::fprintf(stderr, "[rt] d3d12: the input layout does not feed %s%u (register %u)\n",
+                         input.semantic.c_str(), input.semantic_index, input.register_index);
+            return E_INVALIDARG;
+        }
+    }
+    out = std::move(result);
+    return S_OK;
+}
 
 HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** out) {
     if (!out) return E_POINTER;

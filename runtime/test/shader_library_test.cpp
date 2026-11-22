@@ -358,7 +358,7 @@ int main() {
                  "{\"semantic\": \"SV_VertexID\", \"semantic_index\": 0, \"register\": 2, \"mask\": 1, \"rw_mask\": 1, "
                  "\"system_value\": 6, \"component_type\": \"uint\"}]},\n"
                  " \"vs_same_program\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << hash << "\", \"input_signature\": ["
-                 "{\"semantic\": \"TEXCOORD\", \"semantic_index\": 3, \"register\": -1, \"system_value\": 0, "
+                 "{\"semantic\": \"TEXCOORD\", \"semantic_index\": 3, \"register\": -1, \"location\": 5, \"system_value\": 0, "
                  "\"component_type\": \"float\"}]},\n"
                  " \"ps_out\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash << "\", \"inputs\": [0, 1, 28, 29], "
                  "\"outputs\": [0, 2], \"f16_halves\": {\"0\": [28, 29], \"bad\": [1], \"7\": [20, 21]}},\n"
@@ -378,12 +378,13 @@ int main() {
     CHECK(vs && vs->input_signature.size() == 2 && vs->input_signature[0].semantic == "COLOR");
     CHECK(vs->input_signature[1].register_index == 2 && vs->input_signature[1].system_value == 6 &&
           vs->input_signature[1].component_type == "uint");
+    CHECK(!vs->input_signature[1].location && vs->input_signature[1].vertex_location() == 2);
     // Two containers with the same program and different input signatures: both are kept, in index order, and an
     // out-of-range number (register -1) reads as 0 instead of wrapping.
     const auto vs_all = library.candidates("vs", hash);
     CHECK(vs_all.size() == 2 && vs_all[0] == vs && vs_all[1]->name == "vs_same_program");
     CHECK(vs_all[1]->input_signature.size() == 1 && vs_all[1]->input_signature[0].semantic_index == 3 &&
-          vs_all[1]->input_signature[0].register_index == 0);
+          vs_all[1]->input_signature[0].register_index == 0 && vs_all[1]->input_signature[0].vertex_location() == 5);
     const ShaderEntry* ps = library.find("ps", hash);
     CHECK(ps && ps->outputs.size() == 2 && ps->outputs[1] == 2);
     CHECK(ps->inputs.size() == 4 && ps->inputs[0] == 0 && ps->inputs[3] == 29);

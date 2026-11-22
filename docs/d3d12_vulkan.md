@@ -651,8 +651,8 @@ The compute path, end to end:
   and the code base, and dispatches.
 - **Graphics pipelines and draws (M1).** `CreateGraphicsPipelineState` (PC slot 10) finds the VS and PS by FSSM hash.
   - **Vertex input:** each input-layout element is matched to the VS input signature by semantic name and index,
-    and its location is the element's register (the translator's vertex-fetch rule). An input the layout leaves
-    unfed is refused, as D3D12 refuses it.
+    and uses the signature element's Vulkan location, with the logical register as the fallback for standalone
+    semantics and older index entries. Every ordinary semantic must be fed.
   - **Fixed-function state:** rasterizer, blend and depth-stencil state map one to one. Viewport, scissor,
     topology, stencil references and the blend factor are dynamic, and so are vertex strides when the pipeline has
     vertex bindings. A pipeline without them (a full-screen pass from `SV_VertexID`) does not declare the stride
@@ -1476,7 +1476,8 @@ rendering silently wrong.
 `tools/shader_meta.py` (invoked by `tools/rdna2spirv.py` and verified by `tests/test_shader_meta.py`) now emits these
 fields into `spirv/index.json`: `user_sgpr_reads` (`const32`, `ptr64_lo`/`ptr64_hi`, `ptr32_lo`, `vsharp`, `tsharp`,
 `ssharp`), `descriptor_strides`, `uses_code_base`, `literal_samplers`, `input_signature` (ISG1 semantic name/index,
-register, masks, system value, component type), `fssm_sha256`, and `descriptor_access` (DXBC `SFI0` direct-indexing
+register, masks, system value, component type, and the translator's optional Vulkan location for packed vertex
+semantics), `fssm_sha256`, and `descriptor_access` (DXBC `SFI0` direct-indexing
 bits 25/26 plus table-load and high-dword-truncation flags).
 
 ### 3.6 Shader identity, PSOs and feature selection
@@ -1498,11 +1499,10 @@ Pipeline creation:
   per-pipeline mesh output limit: check them against
   `VkPhysicalDeviceMeshShaderPropertiesEXT::maxMeshOutputVertices`/`maxMeshOutputPrimitives` and fail at pipeline
   creation if the device is smaller.
-- Vertex input comes from the PSO input layout plus the shader's ISG1 signature. The translator's rule is
-  **location = D3D input register**, not the semantic's HLSL slot. Match the layout element's semantic name/index
-  to the ISG1 element to get the register, then create a `VkVertexInputAttributeDescription` with that location
-  and the DXGI format. Resolve `D3D12_APPEND_ALIGNED_ELEMENT` against the preceding element and honour
-  `InputSlotClass`/`InstanceDataStepRate`. The index entry needs the semantic map (section 3.5).
+- Vertex input comes from the PSO input layout plus the shader's ISG1 signature. Match the layout element's
+  semantic name/index to the ISG1 element, then create a `VkVertexInputAttributeDescription` with its physical
+  location and DXGI format. Packed semantics carry distinct locations in the index (section 3.5). Resolve
+  `D3D12_APPEND_ALIGNED_ELEMENT` per input slot and apply the layout's input rate.
 - Enable the features the index entry lists: barycentrics, fragment interlock, mesh, geometry, Float64, Int64,
   buffer device address, storage image without format, maintenance8.
 - Request the subgroup size each shader was translated for (`requiredSubgroupSize` 64 or 32) where the device lists the stage
@@ -2591,7 +2591,7 @@ store, load, mesh, geometry and BVH tests; this layer is the other half.
 | Samplers (binding 1) | One `VkSampler` per distinct S#; literal S# values from shader constants are pre-registered. |
 | Storage images (bindings 4, 7, 8–19) | r32ui/float/sint views by dimension and numeric class; the layer binds each storage image into the float/uint/sint arrays of its dimension (the translator picks by the T# format at run time), with all three arrays as the safe default. |
 | Buffer/image binding | Descriptors contain console VAs, never host BDAs. Buffers are in the arena at their VA; images are keyed by T# through the hash table. |
-| Vertex fetch | PSO input layout + ISG1 signature; location = D3D input register; format from `DXGI_FORMAT`; instance step rate from the layout. The fetch subroutine is already replaced by Vulkan inputs. |
+| Vertex fetch | PSO input layout + ISG1 signature. Use the signature element's optional Vulkan location, falling back to its logical register. The layout supplies the `DXGI_FORMAT` and instance step rate. |
 | PS system inputs | `FragCoord` (xy/z/w), `FrontFacing`, barycentrics; enable `fragmentShaderBarycentric` and `fragmentShaderPixelInterlock` when the index entry asks. |
 | Mesh/geometry stages | `VK_EXT_mesh_shader`; the index's max vertices/primitives size the SPIR-V output arrays and are checked against the device's mesh properties; geometry stage for the 195 voxelize shaders; `DispatchMesh` → `vkCmdDrawMeshTasksEXT`. |
 | POPS collision | The runtime puts 0 (no collision, bit 31 clear) in the POPS collision SGPR; the translator uses fragment-shader interlock for ordering. **Open:** the exact SGPR location is a translator/driver detail not named in the current contract. |

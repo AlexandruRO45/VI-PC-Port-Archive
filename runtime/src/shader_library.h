@@ -19,6 +19,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -607,13 +608,15 @@ inline ComputeProgram compute_program(std::span<const std::uint8_t> bytecode) {
 // The translator's spirv/index.json
 
 // One element of a shader's DXBC input signature (ISG1), as tools/shader_meta.py records it. For a vertex shader
-// the register is the Vulkan input location the translator gave it (docs/design.md, "Vertex fetch").
+// location can differ from the logical register when several vertex semantics share that register.
 struct SignatureElement {
     std::string semantic;
     std::uint32_t semantic_index = 0;
     std::uint32_t register_index = 0;
     std::uint32_t system_value = 0;  // 0: an ordinary input fed by the input layout
     std::string component_type;      // "float", "uint", "sint"
+    std::optional<std::uint32_t> location;
+    std::uint32_t vertex_location() const { return location.value_or(register_index); }
 };
 
 struct ShaderEntry {
@@ -790,6 +793,8 @@ private:
                     if (const Json* v = item.find("semantic"); v && v->kind == Json::Kind::string) element.semantic = v->string;
                     element.semantic_index = u32(item.find("semantic_index"));
                     element.register_index = u32(item.find("register"));
+                    if (const Json* v = item.find("location"); v && v->kind == Json::Kind::number)
+                        element.location = u32(v);
                     element.system_value = u32(item.find("system_value"));
                     if (const Json* v = item.find("component_type"); v && v->kind == Json::Kind::string)
                         element.component_type = v->string;
