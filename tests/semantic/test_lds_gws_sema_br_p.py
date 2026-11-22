@@ -312,6 +312,102 @@ class SemaphoreBranchProbeExpr:
         return self.can_probe(counter, required_permits)
 
 
+# ============================================================================
+# Commit 3: Deterministic scalar instruction interpreter
+# ============================================================================
+
+
+class ThreadExecutionStatus(enum.Enum):
+    """Thread / Wavefront execution lifecycle status."""
+    RUNNING = "running"
+    BLOCKED = "blocked"
+    COMPLETED = "completed"
+
+
+@dataclass
+class ScalarThreadState:
+    """Models the execution state of an individual scalar thread in RDNA2."""
+    wave_id: int = 0
+    m0: int = 0
+    sgprs: Dict[int, int] = field(default_factory=dict)
+    vgprs: Dict[int, int] = field(default_factory=dict)
+    exec_mask: int = 1
+    status: ThreadExecutionStatus = ThreadExecutionStatus.RUNNING
+    scc: int = 0
+    branch_target: Optional[int] = None
+    gws: GWSSubsystem = field(default_factory=GWSSubsystem)
+
+    def get_sgpr(self, idx: int) -> int:
+        if not (0 <= idx <= 255):
+            raise ValueError(f"SGPR index out of bounds: {idx}")
+        return self.sgprs.get(idx, 0)
+
+    def set_sgpr(self, idx: int, val: int) -> None:
+        if not (0 <= idx <= 255):
+            raise ValueError(f"SGPR index out of bounds: {idx}")
+        self.sgprs[idx] = val & MASK32
+
+    def get_vgpr(self, idx: int) -> int:
+        if not (0 <= idx <= 255):
+            raise ValueError(f"VGPR index out of bounds: {idx}")
+        return self.vgprs.get(idx, 0)
+
+    def set_vgpr(self, idx: int, val: int) -> None:
+        if not (0 <= idx <= 255):
+            raise ValueError(f"VGPR index out of bounds: {idx}")
+        self.vgprs[idx] = val & MASK32
+
+    def set_m0(self, val: int) -> None:
+        self.m0 = val & MASK32
+
+
+class ScalarGWSInterpreter:
+    """Deterministic scalar instruction interpreter for GWS branch probe instructions."""
+
+    def execute(
+        self,
+        state: ScalarThreadState,
+        inst: Instruction,
+        branch_pc: Optional[int] = None,
+    ) -> Tuple[bool, int, bool]:
+        """Execute a single GWS branch probe instruction deterministically.
+
+        Returns:
+            Tuple[bool, int, bool]: (probe_success, new_counter_val, branch_taken)
+        """
+        if state.status == ThreadExecutionStatus.BLOCKED:
+            raise RuntimeError(f"Cannot execute instruction on suspended wavefront {state.wave_id}")
+
+        if inst.opcode != Opcode.DS_GWS_SEMA_BR_P:
+            raise ValueError(f"Unsupported opcode in ScalarGWSInterpreter: {inst.opcode}")
+
+        # Inactive lane in EXEC mask: no-op
+        if (state.exec_mask & 1) == 0:
+            rid = ref_gws_resource_id(state.m0, inst.offset)
+            current_val = state.gws.resources[rid].value
+            return False, current_val, False
+
+        rid = ref_gws_resource_id(state.m0, inst.offset)
+
+        # Determine requested permits from vdata or default to 1
+        permits = 1
+        if inst.vdata is not None:
+            permits = max(1, state.get_vgpr(inst.vdata.index))
+
+        success, val, branch_taken = state.gws.probe_p(rid, permits=permits)
+
+        if success:
+            state.scc = 1
+            state.branch_target = branch_pc
+            state.status = ThreadExecutionStatus.RUNNING
+            return True, val, True
+        else:
+            state.scc = 0
+            state.branch_target = None
+            state.status = ThreadExecutionStatus.RUNNING
+            return False, val, False
+
+
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Commit 1: Reference mathematical oracle and architectural model for ds_gws_sema_br_p."""
 
@@ -524,6 +620,78 @@ class TestSymbolicASTAndTypedExpressions(unittest.TestCase):
         # Zero counter
         self.assertFalse(expr.can_probe(0, required_permits=1))
         self.assertEqual(expr.next_counter(0, required_permits=1), 0)
+
+
+class TestDeterministicScalarInterpreter(unittest.TestCase):
+    """Commit 3: Deterministic scalar instruction interpreter for ds_gws_sema_br_p."""
+
+    def setUp(self) -> None:
+        self.gws = GWSSubsystem()
+        self.interp = ScalarGWSInterpreter()
+
+    def test_scalar_probe_success(self) -> None:
+        rid = 6
+        self.gws.init_resource(rid, init_val=2)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_P, offset=0, gds=True)
+
+        success, val, branch = self.interp.execute(state, inst, branch_pc=0x1000)
+        self.assertTrue(success)
+        self.assertEqual(val, 1)
+        self.assertTrue(branch)
+        self.assertEqual(state.scc, 1)
+        self.assertEqual(state.branch_target, 0x1000)
+        self.assertEqual(state.status, ThreadExecutionStatus.RUNNING)
+
+    def test_scalar_probe_fail_when_zero_never_blocks(self) -> None:
+        rid = 7
+        self.gws.init_resource(rid, init_val=0)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_P, offset=0, gds=True)
+
+        success, val, branch = self.interp.execute(state, inst, branch_pc=0x2000)
+        self.assertFalse(success)
+        self.assertEqual(val, 0)
+        self.assertFalse(branch)
+        self.assertEqual(state.scc, 0)
+        self.assertIsNone(state.branch_target)
+        self.assertEqual(state.status, ThreadExecutionStatus.RUNNING)
+        self.assertEqual(self.gws.resources[rid].wait_queue, [])
+
+    def test_scalar_probe_with_vdata_permits(self) -> None:
+        rid = 10
+        self.gws.init_resource(rid, init_val=8)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        state.set_vgpr(3, 5)  # request 5 permits
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_P, offset=0, gds=True, vdata=Register(3, RegKind.VGPR))
+
+        success, val, branch = self.interp.execute(state, inst)
+        self.assertTrue(success)
+        self.assertEqual(val, 3)
+        self.assertTrue(branch)
+        self.assertEqual(state.scc, 1)
+
+    def test_scalar_probe_inactive_exec(self) -> None:
+        rid = 11
+        self.gws.init_resource(rid, init_val=5)
+        state = ScalarThreadState(wave_id=1, m0=rid, exec_mask=0, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_P, offset=0, gds=True)
+
+        success, val, branch = self.interp.execute(state, inst)
+        self.assertFalse(success)
+        self.assertEqual(val, 5)
+        self.assertFalse(branch)
+        self.assertEqual(self.gws.resources[rid].value, 5)
+
+    def test_dynamic_m0_offset_resolution(self) -> None:
+        self.gws.init_resource(15, init_val=4)
+        state = ScalarThreadState(wave_id=1, m0=10, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_P, offset=5, gds=True)
+
+        success, val, branch = self.interp.execute(state, inst)
+        self.assertTrue(success)
+        self.assertEqual(val, 3)
+        self.assertEqual(self.gws.resources[15].value, 3)
 
 
 if __name__ == "__main__":
