@@ -279,6 +279,71 @@ class DSMinRtnU64Instruction:
         return s
 
 
+# ---------------------------------------------------------------------------
+# Phase 3: Deterministic Scalar Instruction Interpreter
+# ---------------------------------------------------------------------------
+
+class ScalarMachineState64:
+    """Architectural register and memory state for a single scalar lane with 64-bit pairs."""
+
+    def __init__(self, lds: Optional[LDSModel64] = None) -> None:
+        self.lds: LDSModel64 = lds if lds is not None else LDSModel64()
+        self.vgprs: Dict[int, int] = {i: 0 for i in range(256)}
+        self.sgprs: Dict[int, int] = {i: 0 for i in range(106)}
+
+    def get_vgpr(self, index: int) -> int:
+        return self.vgprs.get(index, 0) & MASK32
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        self.vgprs[index] = val & MASK32
+
+    def get_vgpr64(self, index: int) -> int:
+        """Read a 64-bit value from consecutive VGPR pair v[index:index+1]."""
+        lo = self.get_vgpr(index)
+        hi = self.get_vgpr(index + 1)
+        return (hi << 32) | lo
+
+    def set_vgpr64(self, index: int, val: int) -> None:
+        """Write a 64-bit value into consecutive VGPR pair v[index:index+1]."""
+        self.set_vgpr(index, val & MASK32)
+        self.set_vgpr(index + 1, (val >> 32) & MASK32)
+
+
+class ScalarInterpreter64:
+    """Deterministic instruction interpreter for scalar ds_min_rtn_u64 execution."""
+
+    def resolve_operand64(self, op: Operand64, state: ScalarMachineState64) -> int:
+        if isinstance(op, Register):
+            return state.get_vgpr64(op.index)
+        elif isinstance(op, Immediate64):
+            return op.val
+        raise TypeError(f"Unsupported operand type: {type(op)}")
+
+    def step(
+        self,
+        instr: DSMinRtnU64Instruction,
+        state: ScalarMachineState64,
+    ) -> Tuple[int, int, bool]:
+        """Execute a single ds_min_rtn_u64 instruction in the scalar machine state.
+
+        Returns:
+            (old_mem_val, new_mem_val, modified)
+        """
+        # Hardware latches source operands before writeback
+        vaddr = state.get_vgpr(instr.addr.index)
+        vdata = self.resolve_operand64(instr.data, state)
+
+        eff_addr = calc_lds_effective_address(vaddr, instr.offset)
+        idx = calc_lds_qword_index(eff_addr, state.lds.capacity_qwords)
+        curr_mem = state.lds.memory[idx]
+
+        old_val, new_mem, modified = oracle_ds_min_rtn_u64(curr_mem, vdata)
+        state.lds.memory[idx] = new_mem
+        state.set_vgpr64(instr.dst.index, old_val)
+
+        return old_val, new_mem, modified
+
+
 class TestLdsMinRtnU64ReferenceOracle(unittest.TestCase):
     """Phase 1: Unit tests for reference mathematical oracle and architectural model."""
 
@@ -453,6 +518,129 @@ class TestLdsMinRtnU64AST(unittest.TestCase):
                 data=VGPR64(4),
                 offset=70000,
             )
+
+
+class TestLdsMinRtnU64ScalarInterpreter(unittest.TestCase):
+    """Phase 3: Unit tests for deterministic scalar instruction interpreter."""
+
+    def test_scalar_interpreter_basic_vgpr_pair(self) -> None:
+        state = ScalarMachineState64()
+        interp = ScalarInterpreter64()
+
+        addr = 0x80  # qword index 16
+        initial_val = 0x0000000800000005
+        state.lds.write_qword(addr, initial_val)
+        state.set_vgpr(2, addr)  # v2 = addr
+
+        # v[4:5] = 0x0000000400000001 (smaller than initial_val)
+        smaller_val = 0x0000000400000001
+        state.set_vgpr64(4, smaller_val)
+
+        inst = DSMinRtnU64Instruction(
+            opcode=Opcode.DS_MIN_RTN_U64,
+            dst=VGPR64(0),
+            addr=VGPR(2),
+            data=VGPR64(4),
+        )
+
+        old_val, new_val, mod = interp.step(inst, state)
+        self.assertEqual(old_val, initial_val)
+        self.assertEqual(new_val, smaller_val)
+        self.assertTrue(mod)
+
+        # Destination v[0:1] receives old 64-bit value
+        self.assertEqual(state.get_vgpr64(0), initial_val)
+        self.assertEqual(state.get_vgpr(0), initial_val & MASK32)
+        self.assertEqual(state.get_vgpr(1), (initial_val >> 32) & MASK32)
+
+        # LDS qword updated to smaller_val
+        self.assertEqual(state.lds.read_qword(addr), smaller_val)
+
+    def test_scalar_interpreter_immediate64_operand(self) -> None:
+        state = ScalarMachineState64()
+        interp = ScalarInterpreter64()
+
+        addr = 0x100
+        initial_val = 0x5000000000000000
+        state.lds.write_qword(addr, initial_val)
+        state.set_vgpr(5, addr)
+
+        larger_val = 0x7000000000000000
+        inst = DSMinRtnU64Instruction(
+            opcode=Opcode.DS_MIN_RTN_U64,
+            dst=VGPR64(10),
+            addr=VGPR(5),
+            data=Immediate64(larger_val),
+        )
+
+        old_val, new_val, mod = interp.step(inst, state)
+        self.assertEqual(old_val, initial_val)
+        self.assertEqual(new_val, initial_val)
+        self.assertFalse(mod)
+        self.assertEqual(state.get_vgpr64(10), initial_val)
+        self.assertEqual(state.lds.read_qword(addr), initial_val)
+
+    def test_scalar_interpreter_sequential_updates(self) -> None:
+        state = ScalarMachineState64()
+        interp = ScalarInterpreter64()
+
+        addr = 0x40
+        state.lds.write_qword(addr, 0xFFFFFFFFFFFFFFFF)
+        state.set_vgpr(2, addr)  # v2 = addr (avoiding v[0:1] dst overlap)
+
+        # Step 1: min(0xFFFFFFFFFFFFFFFF, 0x8000000000000000)
+        inst1 = DSMinRtnU64Instruction(Opcode.DS_MIN_RTN_U64, VGPR64(0), VGPR(2), Immediate64(0x8000000000000000))
+        old, new, mod = interp.step(inst1, state)
+        self.assertEqual(old, 0xFFFFFFFFFFFFFFFF)
+        self.assertEqual(new, 0x8000000000000000)
+        self.assertTrue(mod)
+        self.assertEqual(state.get_vgpr64(0), 0xFFFFFFFFFFFFFFFF)
+        self.assertEqual(state.lds.read_qword(addr), 0x8000000000000000)
+
+        # Step 2: min(0x8000000000000000, 0x9000000000000000) -> memory stays 0x8000000000000000
+        inst2 = DSMinRtnU64Instruction(Opcode.DS_MIN_RTN_U64, VGPR64(0), VGPR(2), Immediate64(0x9000000000000000))
+        old, new, mod = interp.step(inst2, state)
+        self.assertEqual(old, 0x8000000000000000)
+        self.assertEqual(new, 0x8000000000000000)
+        self.assertFalse(mod)
+        self.assertEqual(state.get_vgpr64(0), 0x8000000000000000)
+        self.assertEqual(state.lds.read_qword(addr), 0x8000000000000000)
+
+        # Step 3: min(0x8000000000000000, 42) -> memory becomes 42
+        inst3 = DSMinRtnU64Instruction(Opcode.DS_MIN_RTN_U64, VGPR64(0), VGPR(2), Immediate64(42))
+        old, new, mod = interp.step(inst3, state)
+        self.assertEqual(old, 0x8000000000000000)
+        self.assertEqual(new, 42)
+        self.assertTrue(mod)
+        self.assertEqual(state.get_vgpr64(0), 0x8000000000000000)
+        self.assertEqual(state.lds.read_qword(addr), 42)
+
+    def test_scalar_interpreter_with_offset(self) -> None:
+        state = ScalarMachineState64()
+        interp = ScalarInterpreter64()
+
+        base_addr = 0x200
+        offset = 0x18  # effective byte address 0x218 (qword index 0x43)
+        state.lds.write_qword(0x218, 0xAAAA0000BBBB0000)
+        state.set_vgpr(1, base_addr)
+        state.set_vgpr64(4, 0x1111000022220000)
+
+        inst = DSMinRtnU64Instruction(
+            opcode=Opcode.DS_MIN_RTN_U64,
+            dst=VGPR64(8),
+            addr=VGPR(1),
+            data=VGPR64(4),
+            offset=offset,
+        )
+
+        old, new, mod = interp.step(inst, state)
+        self.assertEqual(old, 0xAAAA0000BBBB0000)
+        self.assertEqual(new, 0x1111000022220000)
+        self.assertTrue(mod)
+        self.assertEqual(state.get_vgpr64(8), 0xAAAA0000BBBB0000)
+        self.assertEqual(state.lds.read_qword(0x218), 0x1111000022220000)
+        # Base qword at 0x200 remains 0
+        self.assertEqual(state.lds.read_qword(base_addr), 0)
 
 
 if __name__ == "__main__":
