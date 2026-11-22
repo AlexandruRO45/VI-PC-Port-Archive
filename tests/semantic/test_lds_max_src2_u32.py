@@ -337,6 +337,117 @@ class TestDSMaxSrc2U32AST(unittest.TestCase):
         parsed = DSMaxSrc2U32Instruction.parse(inst.to_assembly())
         self.assertEqual(inst, parsed)
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarThreadState:
+    """Scalar thread architectural execution state (VGPRs, SGPRs, and LDS storage)."""
+
+    def __init__(self, lds: Optional[LDSMemory] = None) -> None:
+        self.vgprs: List[int] = [0] * DEFAULT_NUM_VGPRS
+        self.sgprs: List[int] = [0] * DEFAULT_NUM_SGPRS
+        self.vcc: int = 0
+        self.scc: int = 0
+        self.lds: LDSMemory = lds if lds is not None else LDSMemory()
+
+    def get_vgpr(self, idx: int) -> int:
+        return self.vgprs[idx]
+
+    def set_vgpr(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = u32(val)
+
+
+class ScalarDSInterpreter:
+    """Deterministic scalar execution interpreter for ds_max_src2_u32."""
+
+    def execute(self, state: ScalarThreadState, inst: DSMaxSrc2U32Instruction) -> int:
+        """Execute ds_max_src2_u32 on scalar thread state.
+
+        Reads base address from inst.addr.base_reg.
+        Performs dual-source atomic unsigned maximum on LDS: LDS[A] = max(LDS[A], LDS[B]).
+        VGPRs are NOT written by this instruction.
+        Returns the new value written to LDS[A].
+        """
+        vaddr = state.get_vgpr(inst.addr.base_reg.index)
+        new_val_a = state.lds.atomic_max_src2_u32(vaddr, inst.addr.offset0, inst.addr.offset1)
+        return new_val_a
+
+
+class TestDSMaxSrc2U32ScalarInterpreter(unittest.TestCase):
+    """Phase 3: Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(size_dwords=1024)
+        self.state = ScalarThreadState(lds=self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_scalar_execution_basic(self) -> None:
+        base = 0x20
+        # Location A = base + 0*4 = 0x20
+        # Location B = base + 1*4 = 0x24
+        self.lds.write_dword(base, 100)
+        self.lds.write_dword(base + 4, 300)
+        self.state.set_vgpr(2, base)
+
+        inst = DSMaxSrc2U32Instruction(
+            addr=LDSAddressExpression(
+                base_reg=RegisterOperand(2, RegType.VGPR),
+                offset0=0,
+                offset1=1,
+            )
+        )
+
+        res = self.interp.execute(self.state, inst)
+        self.assertEqual(res, 300)
+        self.assertEqual(self.lds.read_dword(base), 300)
+        self.assertEqual(self.lds.read_dword(base + 4), 300)
+        # Verify VGPRs remain unchanged
+        self.assertEqual(self.state.get_vgpr(2), base)
+
+    def test_scalar_execution_loc_a_already_larger(self) -> None:
+        base = 0x40
+        self.lds.write_dword(base, 500)
+        self.lds.write_dword(base + 8, 200)
+        self.state.set_vgpr(1, base)
+
+        inst = DSMaxSrc2U32Instruction(
+            addr=LDSAddressExpression(
+                base_reg=RegisterOperand(1, RegType.VGPR),
+                offset0=0,
+                offset1=2,
+            )
+        )
+
+        res = self.interp.execute(self.state, inst)
+        self.assertEqual(res, 500)
+        self.assertEqual(self.lds.read_dword(base), 500)
+        self.assertEqual(self.lds.read_dword(base + 8), 200)
+
+    def test_scalar_execution_sequential_chain(self) -> None:
+        base = 0x100
+        # Store values at dwords 0, 1, 2, 3
+        self.lds.write_dword(base, 10)
+        self.lds.write_dword(base + 4, 50)
+        self.lds.write_dword(base + 8, 30)
+        self.lds.write_dword(base + 12, 100)
+        self.state.set_vgpr(0, base)
+
+        # Step 1: Loc 0 = max(Loc 0, Loc 1) -> max(10, 50) = 50
+        inst1 = DSMaxSrc2U32Instruction.parse("ds_max_src2_u32 v0 offset0:0 offset1:1")
+        self.interp.execute(self.state, inst1)
+        self.assertEqual(self.lds.read_dword(base), 50)
+
+        # Step 2: Loc 0 = max(Loc 0, Loc 2) -> max(50, 30) = 50
+        inst2 = DSMaxSrc2U32Instruction.parse("ds_max_src2_u32 v0 offset0:0 offset1:2")
+        self.interp.execute(self.state, inst2)
+        self.assertEqual(self.lds.read_dword(base), 50)
+
+        # Step 3: Loc 0 = max(Loc 0, Loc 3) -> max(50, 100) = 100
+        inst3 = DSMaxSrc2U32Instruction.parse("ds_max_src2_u32 v0 offset0:0 offset1:3")
+        self.interp.execute(self.state, inst3)
+        self.assertEqual(self.lds.read_dword(base), 100)
+
 
 if __name__ == "__main__":
     unittest.main()
