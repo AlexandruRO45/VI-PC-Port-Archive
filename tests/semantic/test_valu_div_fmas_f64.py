@@ -1789,5 +1789,248 @@ class TestDivFmasF64IEEE754Boundaries(unittest.TestCase):
         self.assertTrue(math.isinf(res_scaled_over))
 
 
+def parse_operand_asm(op_str: str) -> ASTOperand:
+    """Parse a single operand string with potential neg/abs modifiers."""
+    op_str = op_str.strip()
+    neg = False
+    abs_ = False
+
+    if op_str.startswith("-"):
+        neg = True
+        op_str = op_str[1:].strip()
+
+    if op_str.startswith("|") and op_str.endswith("|"):
+        abs_ = True
+        op_str = op_str[1:-1].strip()
+
+    if op_str.startswith("v[") and op_str.endswith("]"):
+        inner = op_str[2:-1]
+        parts = inner.split(":")
+        if len(parts) != 2:
+            raise ValueError(f"Malformed VGPR pair: {op_str}")
+        lo = int(parts[0])
+        hi = int(parts[1])
+        if hi != lo + 1:
+            raise ValueError(f"VGPR pair must be consecutive registers [n:n+1], got {op_str}")
+        return ASTOperand.vgpr(lo, neg=neg, abs_=abs_)
+
+    if op_str.startswith("s[") and op_str.endswith("]"):
+        inner = op_str[2:-1]
+        parts = inner.split(":")
+        if len(parts) != 2:
+            raise ValueError(f"Malformed SGPR pair: {op_str}")
+        lo = int(parts[0])
+        hi = int(parts[1])
+        if hi != lo + 1:
+            raise ValueError(f"SGPR pair must be consecutive registers [n:n+1], got {op_str}")
+        return ASTOperand.sgpr(lo, neg=neg, abs_=abs_)
+
+    # Try parsing constant
+    try:
+        val = float(op_str)
+        return ASTOperand.inline_const(val, neg=neg, abs_=abs_)
+    except ValueError:
+        raise ValueError(f"Unrecognized operand syntax: {op_str}")
+
+
+def parse_div_fmas_f64_asm(line: str) -> ASTInstruction:
+    """Parse a complete v_div_fmas_f64 assembly instruction string."""
+    line = line.strip()
+    if not line:
+        raise ValueError("Empty assembly line")
+
+    tokens = line.split(None, 1)
+    if not tokens or tokens[0] != Opcode.V_DIV_FMAS_F64.value:
+        raise ValueError(f"Expected opcode '{Opcode.V_DIV_FMAS_F64.value}', got '{tokens[0] if tokens else ''}'")
+
+    if len(tokens) < 2:
+        raise ValueError("Missing operands in assembly line")
+
+    rest = tokens[1].strip()
+    parts = [p.strip() for p in rest.split(",")]
+    if len(parts) < 4:
+        raise ValueError(f"Expected at least 4 comma-separated fields, got {len(parts)}")
+
+    dst_str = parts[0]
+    src0_str = parts[1]
+    src1_str = parts[2]
+    last_tokens = parts[3].split()
+    if not last_tokens:
+        raise ValueError("Missing third source operand")
+
+    src2_str = last_tokens[0]
+    mod_tokens = last_tokens[1:]
+
+    clamp = False
+    omod = OMod.NONE
+
+    for mod in mod_tokens:
+        if mod == "clamp":
+            clamp = True
+        elif mod == "mul:2":
+            omod = OMod.MUL2
+        elif mod == "mul:4":
+            omod = OMod.MUL4
+        elif mod == "div:2":
+            omod = OMod.DIV2
+        else:
+            raise ValueError(f"Unknown instruction modifier: {mod}")
+
+    dst = parse_operand_asm(dst_str)
+    src0 = parse_operand_asm(src0_str)
+    src1 = parse_operand_asm(src1_str)
+    src2 = parse_operand_asm(src2_str)
+
+    inst = ASTInstruction(
+        opcode=Opcode.V_DIV_FMAS_F64,
+        dst=dst,
+        src0=src0,
+        src1=src1,
+        src2=src2,
+        clamp=clamp,
+        omod=omod,
+    )
+    inst.validate()
+    return inst
+
+
+# Mutant functions for mutation testing
+def mutant_omit_scale(s0: float, s1: float, s2: float, vcc: int = 0, **kwargs) -> float:
+    """Mutant 1: Ignores VCC scaling, always returning unscaled FMA."""
+    return ref_div_fmas_f64(s0, s1, s2, vcc=0, **kwargs)
+
+
+def mutant_invert_scale(s0: float, s1: float, s2: float, vcc: int = 0, **kwargs) -> float:
+    """Mutant 2: Multiplies by 2^-64 instead of 2^64 when VCC=1."""
+    if vcc:
+        res_unscaled = ref_div_fmas_f64(s0, s1, s2, vcc=0, **kwargs)
+        return res_unscaled * (2.0 ** -64)
+    return ref_div_fmas_f64(s0, s1, s2, vcc=0, **kwargs)
+
+
+def mutant_unfused_double_rounding(s0: float, s1: float, s2: float, vcc: int = 0) -> float:
+    """Mutant 3: Sequential unfused multiplication and addition with intermediate rounding."""
+    prod = s0 * s1
+    summed = prod + s2
+    if vcc:
+        return summed * SCALE64
+    return summed
+
+
+def mutant_clamp_nan_to_nan(s0: float, s1: float, s2: float, clamp: bool = False, **kwargs) -> float:
+    """Mutant 4: Leaves NaN unmapped to +0.0 under clamp."""
+    if math.isnan(s0) or math.isnan(s1) or math.isnan(s2):
+        return math.nan
+    return ref_div_fmas_f64(s0, s1, s2, clamp=clamp, **kwargs)
+
+
+class TestDivFmasF64NegativeControlsAndMutations(unittest.TestCase):
+    """Test suite for syntax rejection, negative controls, and mutation detection."""
+
+    def test_syntax_rejection_malformed_instructions(self):
+        # Empty line
+        with self.assertRaises(ValueError):
+            parse_div_fmas_f64_asm("")
+
+        # Wrong opcode
+        with self.assertRaises(ValueError):
+            parse_div_fmas_f64_asm("v_fma_f64 v[0:1], v[2:3], v[4:5], v[6:7]")
+
+        # Missing operands
+        with self.assertRaises(ValueError):
+            parse_div_fmas_f64_asm("v_div_fmas_f64 v[0:1], v[2:3], v[4:5]")
+
+        # Destination is SGPR
+        with self.assertRaises(TypeError):
+            parse_div_fmas_f64_asm("v_div_fmas_f64 s[0:1], v[2:3], v[4:5], v[6:7]")
+
+        # Destination has negative modifier
+        with self.assertRaises(ValueError):
+            parse_div_fmas_f64_asm("v_div_fmas_f64 -v[0:1], v[2:3], v[4:5], v[6:7]")
+
+        # Destination has abs modifier
+        with self.assertRaises(ValueError):
+            parse_div_fmas_f64_asm("v_div_fmas_f64 |v[0:1]|, v[2:3], v[4:5], v[6:7]")
+
+        # Non-consecutive register pair
+        with self.assertRaises(ValueError):
+            parse_div_fmas_f64_asm("v_div_fmas_f64 v[0:2], v[2:3], v[4:5], v[6:7]")
+
+        # Out of bounds register index
+        with self.assertRaises(ValueError):
+            parse_div_fmas_f64_asm("v_div_fmas_f64 v[256:257], v[2:3], v[4:5], v[6:7]")
+
+        # Unknown modifier
+        with self.assertRaises(ValueError):
+            parse_div_fmas_f64_asm("v_div_fmas_f64 v[0:1], v[2:3], v[4:5], v[6:7] clamp_invalid")
+
+    def test_mutation_detection_scale_omitted(self):
+        # Mutant 1: scale omitted
+        correct = ref_div_fmas_f64(2.0, 3.0, 4.0, vcc=1)
+        mutated = mutant_omit_scale(2.0, 3.0, 4.0, vcc=1)
+        self.assertNotEqual(correct, mutated)
+        self.assertEqual(correct, 10.0 * SCALE64)
+        self.assertEqual(mutated, 10.0)
+
+    def test_mutation_detection_invert_scale(self):
+        # Mutant 2: inverted scale (2^-64 instead of 2^64)
+        correct = ref_div_fmas_f64(2.0, 3.0, 4.0, vcc=1)
+        mutated = mutant_invert_scale(2.0, 3.0, 4.0, vcc=1)
+        self.assertNotEqual(correct, mutated)
+        self.assertEqual(correct, 10.0 * SCALE64)
+        self.assertEqual(mutated, 10.0 * (2.0 ** -64))
+
+    def test_mutation_detection_unfused_double_rounding(self):
+        # Mutant 3: unfused double rounding
+        a = 1.0 + (2.0 ** -52)
+        b = 1.0 - (2.0 ** -52)
+        c = -1.0
+
+        correct = ref_div_fmas_f64(a, b, c, vcc=0)
+        mutated = mutant_unfused_double_rounding(a, b, c, vcc=0)
+
+        self.assertNotEqual(correct, mutated)
+        self.assertEqual(mutated, 0.0)
+        self.assertEqual(correct, -(2.0 ** -104))
+
+    def test_mutation_detection_clamp_nan(self):
+        # Mutant 4: clamp fails to map NaN to +0.0
+        correct = ref_div_fmas_f64(float("nan"), 1.0, 2.0, clamp=True)
+        mutated = mutant_clamp_nan_to_nan(float("nan"), 1.0, 2.0, clamp=True)
+        self.assertEqual(correct, 0.0)
+        self.assertTrue(math.isnan(mutated))
+        self.assertNotEqual(correct, mutated)
+
+    def test_mutation_detection_simd_exec_mask_leak(self):
+        # Wave executor ignores EXEC mask and mutates inactive lanes
+        wave = SIMDWaveState(wave_size=64)
+        wave.exec_mask = 0  # all lanes inactive
+        old_val = 0x1122334455667788
+        for lane in range(64):
+            wave.set_lane_vgpr_pair_u64(lane, 0, old_val)
+
+        def buggy_execute(wave: SIMDWaveState, inst: ASTInstruction) -> None:
+            for lane in range(wave.wave_size):
+                # Bug: ignoring exec_mask check
+                wave.set_lane_vgpr_pair_f64(lane, inst.dst.index, 999.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_FMAS_F64,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.inline_const(1.0),
+            src1=ASTOperand.inline_const(1.0),
+            src2=ASTOperand.inline_const(1.0),
+        )
+
+        # Check correct wave behavior: inactive lanes preserved
+        wave.execute(inst)
+        for lane in range(64):
+            self.assertEqual(wave.get_lane_vgpr_pair_u64(lane, 0), old_val)
+
+        # Check that buggy execute modifies lane and is detected
+        buggy_execute(wave, inst)
+        self.assertNotEqual(wave.get_lane_vgpr_pair_u64(0, 0), old_val)
+
+
 if __name__ == "__main__":
     unittest.main()
