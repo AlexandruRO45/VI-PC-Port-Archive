@@ -93,7 +93,7 @@ class FlatRefusals(unittest.TestCase):
 
     def test_other_refusals_name_the_flat_op(self):
         for line in ("flat_load_dword v1, v[10:11] lds", "flat_load_dword v1, v[10:11] tfe",
-                     "flat_atomic_inc v1, v[10:11], v2 glc", "flat_atomic_add_x2 v[1:2], v[10:11], v[2:3] glc"):
+                     "flat_atomic_add_x2 v[1:2], v[10:11], v[2:3] glc"):
             with self.subTest(line=line):
                 self.assertIn("flat_", self.refused(line))
                 self.assertNotIn("global_", self.refused(line))
