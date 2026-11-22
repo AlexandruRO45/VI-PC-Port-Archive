@@ -59,6 +59,27 @@ class _Undef:
 
 UNDEF = _Undef()
 
+
+class _F32:
+    """A 32-bit float kept as its bit pattern, so signalling-NaN patterns survive
+    (a Python float cannot hold them: converting to/from double quiets the NaN).
+    Convert to a Python float with ``float(x)`` only inside arithmetic ops; a
+    bit-exact path (OpBitcast, loads/stores, outputs) reads ``.bits`` directly."""
+
+    __slots__ = ("bits",)
+
+    def __init__(self, bits):
+        self.bits = bits & MASK
+
+    def __float__(self):
+        # This quiets a signalling NaN (sets bit 22), which is exactly what we
+        # want to avoid on bit-exact paths; arithmetic on sNaN is undefined anyway.
+        return struct.unpack("<f", struct.pack("<I", self.bits))[0]
+
+    def __repr__(self):
+        return f"_F32(0x{self.bits:08x})"
+
+
 # Operations whose result is undefined when an operand is (they have no side effect and no control).
 _PURE = frozenset({
     "OpBitwiseAnd", "OpBitwiseOr", "OpBitwiseXor", "OpNot", "OpShiftLeftLogical", "OpShiftRightLogical",
@@ -70,14 +91,18 @@ _PURE = frozenset({
 
 
 def f32(x):
-    """Round a Python float to binary32 (overflow to infinity)."""
+    """Round a Python float to binary32 and return its _F32 pattern (overflow to infinity)."""
     try:
-        return struct.unpack("<f", struct.pack("<f", x))[0]
+        return _F32(struct.unpack("<I", struct.pack("<f", x))[0])
     except OverflowError:
-        return float("inf") if x > 0 else float("-inf")
+        return _F32(0x7F800000 if x > 0 else 0xFF800000)
 
 
 def f32_bits(x):
+    """The 32-bit pattern of an _F32 value (a raw Python float is accepted for callers
+    that predate the wrapper, but cannot carry a signalling NaN)."""
+    if isinstance(x, _F32):
+        return x.bits
     try:
         return struct.unpack("<I", struct.pack("<f", x))[0]
     except OverflowError:
@@ -85,23 +110,36 @@ def f32_bits(x):
 
 
 def bits_f32(b):
-    return struct.unpack("<f", struct.pack("<I", b & MASK))[0]
+    return _F32(b & MASK)
 
 
 def half_to_float(h):
-    return struct.unpack("<e", struct.pack("<H", h & 0xFFFF))[0]
+    # A half is a subset of binary32, so the expansion is exact.
+    return f32(struct.unpack("<e", struct.pack("<H", h & 0xFFFF))[0])
 
 
 def float_to_half(x):
+    fx = float(x)
     try:
-        return struct.unpack("<H", struct.pack("<e", x))[0]   # round to nearest even
+        return struct.unpack("<H", struct.pack("<e", fx))[0]   # round to nearest even
     except OverflowError:
-        return 0x7C00 if x > 0 else 0xFC00
+        return 0x7C00 if fx > 0 else 0xFC00
 
 
 def _s32(x):
     x &= MASK
     return x - (1 << 32) if x >> 31 else x
+
+
+def _coerce_input(value, type_name, types):
+    """Convert a caller-supplied input value to the interpreter's representation:
+    floats become _F32 (preserving their bits), ints/bools stay as-is."""
+    k = types.t[type_name]
+    if k[0] == "float":
+        return value if isinstance(value, _F32) else f32(value)
+    if k[0] == "vec":
+        return tuple(_coerce_input(v, k[1], types) for v in value)
+    return value
 
 
 class _Types:
@@ -113,7 +151,7 @@ class _Types:
         if k[0] == "int":
             return 0
         if k[0] == "float":
-            return 0.0
+            return _F32(0)
         if k[0] == "bool":
             return False
         if k[0] == "vec":
@@ -357,6 +395,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 pc_type[res] = pointee
             elif cls == "Input":
                 init = inputs.get(res, types.zero(pointee))
+                init = _coerce_input(init, pointee, types)
                 var_box[res] = [list(init) if isinstance(init, (list, tuple)) else init]
             elif cls in ("Function", "Output"):
                 if len(a) > 2:
@@ -520,9 +559,9 @@ def _invocation(text, inputs, push_constants, memory, step=False):
         elif op == "OpBitcast":
             k, v = types.t[a[0]], val(a[1])
             if k[0] == "float" and isinstance(v, int):
-                values[res] = bits_f32(v)
-            elif k[0] == "int" and isinstance(v, float):
-                values[res] = f32_bits(v)
+                values[res] = _F32(v)              # preserve the exact bit pattern (incl. sNaN)
+            elif k[0] == "int" and isinstance(v, _F32):
+                values[res] = v.bits
             elif k[0] == "int" and isinstance(v, int):
                 values[res] = v & wmask(a[0])
             else:
@@ -660,16 +699,17 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             values[res] = not val(a[1])
         elif op in ("OpFAdd", "OpFSub", "OpFMul"):
             x, y = val(a[1]), val(a[2])
-            if not (isinstance(x, float) and isinstance(y, float)):
+            if not (isinstance(x, _F32) and isinstance(y, _F32)):
                 raise UnsupportedConstruct(f"{op} on non-float")
+            x, y = float(x), float(y)
             values[res] = f32(x + y if op == "OpFAdd" else x - y if op == "OpFSub" else x * y)
         elif op == "OpFNegate":
-            values[res] = f32(-val(a[1]))
+            values[res] = f32(-float(val(a[1])))
         elif op in ("OpConvertFToU", "OpConvertFToS"):
             x, bits = val(a[1]), types.bits(a[0])
-            if not isinstance(x, float) or not math.isfinite(x):
+            if not isinstance(x, _F32) or not math.isfinite(float(x)):
                 raise UnsupportedConstruct(f"{op} of a non-finite value (undefined in SPIR-V)")
-            n = math.trunc(x)
+            n = math.trunc(float(x))
             lo, hi = (0, 1 << bits) if op == "OpConvertFToU" else (-(1 << (bits - 1)), 1 << (bits - 1))
             if not lo <= n < hi:
                 raise UnsupportedConstruct(f"{op} out of range (undefined in SPIR-V)")
@@ -678,8 +718,9 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                     "OpFOrdGreaterThanEqual", "OpFOrdLessThanEqual", "OpFUnordEqual", "OpFUnordNotEqual",
                     "OpFUnordLessThan", "OpFUnordGreaterThan", "OpFUnordGreaterThanEqual", "OpFUnordLessThanEqual"):
             x, y = val(a[1]), val(a[2])
-            if not (isinstance(x, float) and isinstance(y, float)):
+            if not (isinstance(x, _F32) and isinstance(y, _F32)):
                 raise UnsupportedConstruct(f"{op} on non-float")
+            x, y = float(x), float(y)
             # Ordered: false if either operand is NaN. Unordered: true if either is NaN. Python's own comparisons
             # are already ordered (NaN compares false), and -0.0 == 0.0 as in SPIR-V.
             unordered = math.isnan(x) or math.isnan(y)
@@ -688,9 +729,9 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             values[res] = (rel or unordered) if op.startswith("OpFUnord") else rel
         elif op in ("OpIsNan", "OpIsInf"):
             x = val(a[1])
-            if not isinstance(x, float):
+            if not isinstance(x, _F32):
                 raise UnsupportedConstruct(f"{op} on non-float")
-            values[res] = math.isnan(x) if op == "OpIsNan" else math.isinf(x)
+            values[res] = math.isnan(float(x)) if op == "OpIsNan" else math.isinf(float(x))
         elif op in ("OpBitFieldUExtract", "OpBitFieldSExtract"):
             base, off, cnt = val(a[1]), val(a[2]), val(a[3])
             if off + cnt > 32:
@@ -721,28 +762,28 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 # general, but exact for the f16-derived operands the tests use (see tests/semantic/README.md).
                 x, y, z = args
                 if isinstance(x, tuple):
-                    values[res] = tuple(f32(p * q + s) for p, q, s in zip(x, y, z))
+                    values[res] = tuple(f32(float(p) * float(q) + float(s)) for p, q, s in zip(x, y, z))
                 else:
-                    values[res] = f32(x * y + z)
+                    values[res] = f32(float(x) * float(y) + float(z))
             elif name in ("Sin", "Cos"):
-                values[res] = f32(math.sin(args[0]) if name == "Sin" else math.cos(args[0]))
+                values[res] = f32(math.sin(float(args[0])) if name == "Sin" else math.cos(float(args[0])))
             elif name == "FAbs":
-                values[res] = f32(abs(args[0]))
+                values[res] = f32(abs(float(args[0])))
             elif name == "SAbs":
                 # Two's complement: the most negative value is its own absolute value (as on the hardware).
                 values[res] = abs(_s32(args[0])) & MASK
             elif name in ("FMax", "FClamp"):
-                if any(math.isnan(v) for v in args) or (name == "FClamp" and args[1] > args[2]):
+                if any(math.isnan(float(v)) for v in args) or (name == "FClamp" and float(args[1]) > float(args[2])):
                     raise UnsupportedConstruct(f"GLSL.std.450 {name} with these operands (undefined)")
-                v = max(args[0], args[1])
-                values[res] = f32(v if name == "FMax" else min(v, args[2]))
+                v = max(float(args[0]), float(args[1]))
+                values[res] = f32(v if name == "FMax" else min(v, float(args[2])))
             elif name == "RoundEven":
-                x = args[0]
-                values[res] = f32(float(round(x))) if math.isfinite(x) else x    # round() breaks ties to even
+                x = float(args[0])
+                values[res] = f32(float(round(x))) if math.isfinite(x) else args[0]    # round() breaks ties to even
             elif name == "FMin":
-                if any(math.isnan(x) for x in args):
+                if any(math.isnan(float(x)) for x in args):
                     raise UnsupportedConstruct(f"GLSL.std.450 {name} of NaN (undefined)")
-                values[res] = f32(min(args))
+                values[res] = f32(min(float(x) for x in args))
             elif name == "UMin":
                 values[res] = min(args)
             elif name == "UMax":
@@ -785,5 +826,5 @@ def _invocation(text, inputs, push_constants, memory, step=False):
     for name in outputs:
         v = var_box[name][0]
         flat = v if isinstance(v, tuple) else (v,)
-        result[name] = tuple(f32_bits(x) if isinstance(x, float) else x & MASK for x in flat)
+        result[name] = tuple(f32_bits(x) if isinstance(x, _F32) else x & MASK for x in flat)
     return result
