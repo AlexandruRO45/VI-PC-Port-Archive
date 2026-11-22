@@ -174,6 +174,16 @@ Vulkan instance with, so every Vulkan test fails with `vkCreateInstance failed (
 as CI does: `WINEPREFIX="$HOME/.local/share/leonida-wine" xvfb-run -a ctest --test-dir runtime/build/windows`
 (packages `xvfb` and `xauth`, which `xvfb-run` needs). With Mesa installed, the tests then run on llvmpipe.
 
+To test a Windows CI build, check out its commit and unpack the `runtime-windows` artifact under `runtime/build`.
+Use the artifact's test inventory and the original checkout path to run the suite with Wine:
+
+```sh
+xvfb-run -a python3 -I scripts/run_wine_tests.py --tests runtime/build/ctest.json \
+    --windows-root "$(cat runtime/build/windows-root.txt)"
+```
+
+The loader and pipeline-checker CMake fixtures use your local `cmake` and run their Windows executables through Wine.
+
 The build type defaults to `RelWithDebInfo`: xwin leaves out the debug CRT, so `Debug` needs `--include-debug-libs`.
 `make_game.py`'s `runtime` stage makes this same build on Linux when the tools and the SDK are there (`--runtime-build
 runtime/build/windows` takes a folder made by hand like a Windows build). CMake packages are

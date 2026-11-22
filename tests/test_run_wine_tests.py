@@ -13,6 +13,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import unittest
@@ -299,6 +300,103 @@ class RunTestTest(unittest.TestCase):
         self.assertEqual(seen["argv"][1], "--flag")
         self.assertEqual(os.path.normcase(os.path.realpath(seen["cwd"])),
                          os.path.normcase(os.path.realpath(self.artifact / "sub")))
+
+
+class CMakeFixtureTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="wine fixture ")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.scripts = self.root / "runtime" / "test"
+        self.scripts.mkdir(parents=True)
+        self.build = self.root / "runtime" / "build"
+        self.build.mkdir()
+        self.args = argparse.Namespace(windows_root=WINDOWS_ROOT, root=str(self.root), timeout=10.0)
+
+    def entry(self, name="check_loaded_gdk.cmake"):
+        return ctest_entry("fixture", [
+            "C:/Program Files/CMake/bin/cmake.exe",
+            "-DLOADER=" + WINDOWS_ROOT + "/runtime/build/loader.py",
+            "-DGUEST=" + WINDOWS_ROOT + "/runtime/build/guest file.exe",
+            "-DRUNNER=C:/not/the/local/wine.exe",
+            "-P", WINDOWS_ROOT + "/runtime/test/" + name,
+        ])
+
+    def test_unknown_scripts_and_other_cmake_modes_are_skipped(self):
+        external = self.entry()
+        external["command"][-1] = "C:/another/project/check_loaded_gdk.cmake"
+        other_mode = ctest_entry("other", ["C:/CMake/bin/cmake.exe", "-E", "echo", "unused"])
+        for entry in (self.entry("another.cmake"), external, other_mode):
+            with self.subTest(command=entry["command"]), mock.patch.object(rwt.subprocess, "run") as launch:
+                status, detail = rwt.run_test(entry, self.args, ["wine"])
+                launch.assert_not_called()
+                self.assertEqual(status, "skip", detail)
+
+    def test_missing_script_and_inputs_fail_with_their_names(self):
+        entry = self.entry()
+        status, detail = rwt.run_test(entry, self.args, ["wine"])
+        self.assertEqual(status, "fail")
+        self.assertIn("check_loaded_gdk.cmake", detail)
+        (self.scripts / "check_loaded_gdk.cmake").touch()
+        status, detail = rwt.run_test(entry, self.args, ["wine"])
+        self.assertEqual(status, "fail")
+        self.assertIn("LOADER not found in the artifact", detail)
+
+    def test_unsupported_options_and_outside_artifact_paths_fail_before_launch(self):
+        (self.scripts / "check_loaded_gdk.cmake").touch()
+        for index, option in ((3, "--trace"), (3, "-DLOADER=duplicate"), (1, "-DLOADER=C:/outside.exe")):
+            with self.subTest(option=option), mock.patch.object(rwt.subprocess, "run") as launch:
+                entry = self.entry()
+                entry["command"][index] = option
+                status, detail = rwt.run_test(entry, self.args, ["wine"])
+                launch.assert_not_called()
+                self.assertEqual(status, "fail")
+                self.assertIn("CMake fixture", detail)
+
+    def test_pipeline_cli_maps_its_write_directory_and_honors_ctest_timeout(self):
+        script = self.scripts / "check_vk_pipeline_cli.cmake"
+        script.touch()
+        exe = self.build / "vk_pipeline_check.exe"
+        exe.touch()
+        entry = ctest_entry("pipeline-cli", [
+            "C:/Program Files/CMake/bin/cmake.exe",
+            "-DTOOL=" + WINDOWS_ROOT + "/runtime/build/vk_pipeline_check.exe",
+            "-DTEST_DIR=" + WINDOWS_ROOT + "/runtime/build/pipeline inputs",
+            "-P", WINDOWS_ROOT + "/runtime/test/check_vk_pipeline_cli.cmake",
+        ], {"TIMEOUT": 3})
+        result = rwt.subprocess.CompletedProcess([], 0, stdout=b"ok")
+        with mock.patch.object(rwt.subprocess, "run", return_value=result) as launch:
+            status, detail = rwt.run_test(entry, self.args, ["wine"])
+        self.assertEqual(status, "pass", detail)
+        self.assertEqual(launch.call_args.args[0], [
+            "cmake", f"-DTOOL={exe}", f"-DTEST_DIR={self.build / 'pipeline inputs'}",
+            "-DRUNNER=wine", "-P", str(script),
+        ])
+        self.assertEqual(launch.call_args.kwargs["cwd"], str(self.build))
+        self.assertEqual(launch.call_args.kwargs["timeout"], 3)
+
+    @unittest.skipUnless(shutil.which("cmake"), "native CMake not on PATH")
+    def test_local_cmake_runs_wine_command_with_spaces_and_semicolons(self):
+        (self.scripts / "check_loaded_gdk.cmake").write_text(
+            'execute_process(COMMAND ${RUNNER} "${LOADER}" "${GUEST}" RESULT_VARIABLE code)\n'
+            'if(NOT code STREQUAL "0")\n'
+            '  message(FATAL_ERROR "unexpected child arguments")\n'
+            'endif()\n',
+            encoding="utf-8", newline="\n")
+        (self.build / "loader.py").touch()
+        (self.build / "guest file.exe").touch()
+        fake_wine = self.build / "fake wine.py"
+        fake_wine.write_text(
+            'from pathlib import Path\n'
+            'import sys\n'
+            'assert sys.argv[1] == "arg with a space;and a semicolon", sys.argv\n'
+            'assert [Path(arg).name for arg in sys.argv[2:]] == ["loader.py", "guest file.exe"], sys.argv\n'
+            'print("fixture-reached")\n',
+            encoding="utf-8", newline="\n")
+        command = [sys.executable, "-I", str(fake_wine), "arg with a space;and a semicolon"]
+        status, detail = rwt.run_test(self.entry(), self.args, command)
+        self.assertEqual(status, "pass", detail)
+        self.assertIn("fixture-reached", detail)
 
 
 @unittest.skipIf(os.name == "nt", "the runner and its dosdevices links are for Linux and macOS")

@@ -8,6 +8,9 @@ Usage:
 made in (forward slashes, as `cygpath -m` prints it). Paths under it are mapped to --root, the Linux checkout (default:
 this repository), which must hold the Windows build's runtime/build folder at the same place.
 
+The in-tree CMake loader and pipeline-checker fixtures use the local cmake, which starts their Windows programs
+through the same --wine command. Other commands belonging to the Windows CI host are skipped.
+
 Some tests open files through absolute paths compiled into them (the GLSL test shaders, LEONIDA_TEST_*_SPV under
 runtime/build/generated). For those, the drive of --windows-root is pointed at --root in the Wine prefix for the run
 ($WINEPREFIX, else ~/.wine), unless that drive is already in use there.
@@ -30,6 +33,16 @@ import tempfile
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+CMAKE_FIXTURES = {
+    "check_console_paths.cmake": ("LOADER", "GUEST"),
+    "check_game_dir.cmake": ("LOADER", "GUEST"),
+    "check_loaded_async.cmake": ("LOADER", "GUEST"),
+    "check_loaded_bundled.cmake": ("LOADER", "GUEST"),
+    "check_loaded_gdk.cmake": ("LOADER", "GUEST"),
+    "check_startup_cmdline.cmake": ("LOADER", "GUEST"),
+    "check_vk_pipeline_cli.cmake": ("TOOL", "TEST_DIR"),
+}
 
 
 def _make_parent(path: str) -> None:
@@ -118,6 +131,42 @@ def regex_list(value: str | list[str]) -> list[str]:
     return [value] if isinstance(value, str) else value
 
 
+def cmake_fixture_command(command: list[str], args, wine: list[str]) -> list[str] | None:
+    """Rebuild a known CMake fixture command using the Linux checkout and its Windows artifacts."""
+    if (ntpath.basename(command[0]).lower() not in ("cmake", "cmake.exe") or len(command) < 3
+            or command[-2] != "-P"):
+        return None
+    root = os.path.abspath(args.root)
+    script = map_path(command[-1], args.windows_root, root)
+    if not script or os.path.dirname(script) != os.path.join(root, "runtime", "test"):
+        return None
+    expected = CMAKE_FIXTURES.get(os.path.basename(script))
+    if expected is None:
+        return None
+    if not os.path.isfile(script):
+        raise ValueError(f"CMake fixture script not found in the checkout: {script}")
+
+    definitions = {}
+    for option in command[1:-2]:
+        key, equals, value = option.removeprefix("-D").partition("=")
+        if not option.startswith("-D") or not equals or key not in (*expected, "RUNNER") or key in definitions:
+            raise ValueError(f"invalid CMake fixture argument: {option}")
+        definitions[key] = value
+
+    argv = ["cmake"]
+    for key in expected:
+        path = map_path(definitions.get(key, ""), args.windows_root, root)
+        if path is None:
+            raise ValueError(f"CMake fixture {key} must name a path in the Windows checkout")
+        if key != "TEST_DIR" and not os.path.isfile(path):
+            raise ValueError(f"CMake fixture {key} not found in the artifact: {path}")
+        argv.append(f"-D{key}={path}")
+    # The fixture scripts expand RUNNER as a CMake list before starting the Windows program.
+    runner = ";".join(part.replace(";", "\\;") for part in wine)
+    argv.extend([f"-DRUNNER={runner}", "-P", script])
+    return argv
+
+
 def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
     """Returns (status, detail): status is pass, fail or skip."""
     props = properties(test)
@@ -128,18 +177,25 @@ def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
         return "fail", "no command (target not built?)"
     exe = map_path(command[0], args.windows_root, args.root)
     if exe is None:
-        # A test that runs a tool of the Windows runner (cmake -P, python) rather than one this build made.
-        return "skip", f"runs {command[0]}, not a program from the build"
-    if not os.path.isfile(exe):
-        return "fail", f"executable not in the artifact: {command[0]}"
-    argv = list(wine) + [exe]
-    for a in command[1:]:
-        mapped = map_path(a, args.windows_root, args.root)
-        argv.append(wine_path(mapped) if mapped is not None else a)
+        try:
+            argv = cmake_fixture_command(command, args, wine)
+        except ValueError as e:
+            return "fail", str(e)
+        if argv is None:
+            return "skip", f"runs {command[0]}, not a program from the build"
+        default_cwd = os.path.join(os.path.abspath(args.root), "runtime", "build")
+    else:
+        if not os.path.isfile(exe):
+            return "fail", f"executable not in the artifact: {command[0]}"
+        argv = list(wine) + [exe]
+        for a in command[1:]:
+            mapped = map_path(a, args.windows_root, args.root)
+            argv.append(wine_path(mapped) if mapped is not None else a)
+        default_cwd = os.path.dirname(exe)
     cwd = props.get("WORKING_DIRECTORY")
-    cwd = map_path(cwd, args.windows_root, args.root) if cwd else os.path.dirname(exe)
+    cwd = map_path(cwd, args.windows_root, args.root) if cwd else default_cwd
     if not cwd or not os.path.isdir(cwd):
-        cwd = os.path.dirname(exe)
+        cwd = default_cwd
     assignments = props.get("ENVIRONMENT", [])
     if not isinstance(assignments, list):
         return "fail", "invalid CTest ENVIRONMENT: expected a list of NAME=value entries"
