@@ -59,6 +59,9 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   all 922 words against hand constants and a plain-Python model.
 - `test_w64x_vcmp_fixture.py` does the same for `cs_w64x_vcmp`: v_cmp i32/u32/i64/u64/f32 (NaN, infinity, class) masks in
   SGPR pairs and VCC, the 64-bit SALU logic ops on them, and v_cndmask selections (430 words).
+- `test_w64x_maskbits_fixture.py` does the same for `cs_w64x_maskbits`: s_bcnt0/s_ff0 (and the SCC of s_bcnt0) on 64-bit masks
+  with little or nothing in the low half, as v_cmp masks, s_mov_b32 data pairs and EXEC, and s_flbit_i32_b64/i64 on the
+  data pairs (64 words).
 - `spirv_wave_interp.py` runs every invocation of one subgroup at once through structured control flow
   (split at a selection, rejoin at its merge, loops until no invocation is left) with the subgroup
   operations the translator emits. It is the SPIR-V side of `tools/cf_diff.py` (FUZZ-8);

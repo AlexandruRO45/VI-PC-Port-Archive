@@ -347,8 +347,35 @@ def _w64x_vcmp_words():
 
 
 W64X_VCMP_WORDS = _w64x_vcmp_words()
+
+def _w64x_maskbits_words():
+    """cs_w64x_maskbits.asm's 64 words, from the formulas in its header (the ISA pseudocode, plain integers)."""
+    m32 = 0xFFFFFFFF
+    masks = [0xFFFFFFFF00000000, 1 << 40, 0xC000000000000000, 0xFFFFFFFF, (1 << 64) - 1, 0, 1 << 32, 1 << 55,
+             0xFFFFFFFF00000000, 0x7FFFFFFFFFFFFFFF, 1 << 63, 0x000000FFFFFFFFFF, 1 << 40]
+
+    def scan(x):
+        b = [x >> i & 1 for i in range(64)]
+        bcnt0 = b.count(0)
+        ff0 = next((i for i in range(64) if b[i] == 0), -1)
+        flbit_b = next((i for i in range(64) if b[63 - i] == 1), -1)
+        flbit_i = next((i for i in range(1, 64) if b[63 - i] != b[63]), -1)
+        return bcnt0, ff0 & m32, int(bcnt0 != 0), flbit_b & m32, flbit_i & m32
+
+    words = []
+    for x in masks:                                                  # bcnt0, ff0, SCC of the bcnt0
+        words += scan(x)[:3]
+    for k in (7, 8, 9, 10, 12):                                      # flbit_b64, flbit_i64 of the data pairs
+        words += scan(masks[k])[3:]
+    for k in (0, 2, 6, 11, 3):                                       # EXEC = the lanes of masks 0, 2, 6, 11, 3
+        words += scan(masks[k])[:3]
+    return words
+
+
+W64X_MASKBITS_WORDS = _w64x_maskbits_words()
 # Wave64 dump tests that compare the whole dump (heap of len(words) words), not just out[0..7]: name -> words.
-W64X_FULL = [("cs_w64x_carry", W64X_CARRY_WORDS), ("cs_w64x_vcmp", W64X_VCMP_WORDS)]
+W64X_FULL = [("cs_w64x_carry", W64X_CARRY_WORDS), ("cs_w64x_vcmp", W64X_VCMP_WORDS),
+                ("cs_w64x_maskbits", W64X_MASKBITS_WORDS)]
 # A 40-thread group (one partial wave) cannot use --require-wave64 (full subgroups), so it asks for subgroup size 64.
 W64X_PARTIAL = [("cs_w64x_partial", [40, 40, 528, 0, 0, 532, 539, 524820]),
                 ("cs_w64x_partial_scmp", [0, 1, 0, 1, 1, 1, 1, 0])]

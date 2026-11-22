@@ -35,7 +35,8 @@ SHADERS = ("cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_bu
            "ps_valu16_mad", "ps_valu16_subrev",   # v_mad_u32_u16 / v_mad_i32_i16, v_subrev_f16
            "cs_cvt_pk_u8",   # v_cvt_pk_u8_f32 rounding and NaN (test_cvt_pk_u8.py)
            "cs_w64x_carry",   # carry chains over 64 lanes, SGPR-pair and VCC masks (test_w64x_carry_fixture.py)
-           "cs_w64x_vcmp")   # v_cmp masks, SALU mask logic and v_cndmask over 64 lanes (test_w64x_vcmp_fixture.py)
+           "cs_w64x_vcmp",   # v_cmp masks, SALU mask logic and v_cndmask over 64 lanes (test_w64x_vcmp_fixture.py)
+           "cs_w64x_maskbits")   # s_bcnt0/s_ff0/s_flbit b64 on high-half masks and EXEC (test_w64x_maskbits_fixture.py)
 
 
 def render(name):
