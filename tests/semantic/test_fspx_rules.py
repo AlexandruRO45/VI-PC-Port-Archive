@@ -127,7 +127,8 @@ class VccTupleSmemTests(unittest.TestCase):
 
     def test_slist_as_vsharp_and_tsharp(self):
         # Load a V# into [s104,s105,vcc_lo,vcc_hi], then use it as a V# for both s_buffer_load and buffer_load.
-        vsharp = [BASE + 0x100, 0, 16, 0x30000000]
+        # FORMAT=32_FLOAT (22): a raw MUBUF access is suppressed for an INVALID format (measured, gfx1035, #1218).
+        vsharp = [BASE + 0x100, 0, 16, 0x30016000]
         mem = {BASE + 4 * i: w for i, w in enumerate(vsharp)}
         mem[BASE + 0x100] = 0xCAFE1234
         mem[BASE + 0x104] = 0xBEEF5678
