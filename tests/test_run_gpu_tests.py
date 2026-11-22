@@ -428,10 +428,9 @@ class ComputedIJWithoutPerVertexInputs(unittest.TestCase):
 
 
 class F16InterpUnderBaryFallback(unittest.TestCase):
-    """ps_interp_f16_high and ms_f16_pack under LEONIDA_BARY_FALLBACK=1. --bary-fallback alone has no PerVertexKHR
-    inputs, so the f16 halves can't be interpolated and both are skipped. With --f16-interp-fallback as well (on by
-    itself where the device has no fragmentShaderBarycentric, the usual reason for the bary fallback) the pixel shader
-    reads the decoded halves its producer exports, so both run (llvmpipe, which has neither: both pass)."""
+    """ps_interp_f16_high and ms_f16_pack under LEONIDA_BARY_FALLBACK=1. --bary-fallback has no PerVertexKHR inputs,
+    so the pixel shader reads the decoded halves its producer exports, as under --f16-interp-fallback: both run with
+    the bary fallback alone too (#2086; before, they were skipped there)."""
     SKIP = "SKIP (per-vertex f16 interpolants need barycentrics)"
     DRAWN = "unsupported: drawn by the stub harness"
 
@@ -472,12 +471,13 @@ class F16InterpUnderBaryFallback(unittest.TestCase):
                 self.assertTrue(drawn[0][2].endswith("ps_interp_f16_high.spv"), drawn)
                 self.assertEqual(rc, 0, out)
 
-    def test_run_gpu_tests_skips_them_under_the_bary_fallback_alone(self):
+    def test_run_gpu_tests_draws_them_under_the_bary_fallback_alone(self):
         for name in ("ps_interp_f16_high", "ms_f16_pack"):
             with self.subTest(name=name):
                 rc, out, drawn = self.run_suite(name, bary=True, f16=False)
-                self.assertIn(self.SKIP, out)
-                self.assertEqual(drawn, [], out)
+                self.assertNotIn(self.SKIP, out)
+                self.assertEqual(len(drawn), 1, out)
+                self.assertTrue(drawn[0][2].endswith("ps_interp_f16_high.spv"), drawn)
                 self.assertEqual(rc, 0, out)
 
     def test_check_py_draws_it_with_the_f16_fallback(self):
@@ -487,8 +487,7 @@ class F16InterpUnderBaryFallback(unittest.TestCase):
             Path(tmp, name + ".spv").touch()
             with patch.object(check, "pixels", return_value=(check.Skip("x"), self.DRAWN)):
                 for bary, f16, want in ((True, True, f"SKIP ({self.DRAWN})"),
-                                        (True, False, "SKIP (per-vertex interpolants need "
-                                                      "VK_KHR_fragment_shader_barycentric)"),
+                                        (True, False, f"SKIP ({self.DRAWN})"),
                                         (False, True, f"SKIP ({self.DRAWN})")):
                     with self.subTest(bary=bary, f16=f16), \
                             patch.object(check, "BARY_FALLBACK", bary), patch.object(check, "F16_HALVES", f16):

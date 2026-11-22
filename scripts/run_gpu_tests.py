@@ -1356,9 +1356,6 @@ def run_suite(a, work: str) -> int:
             raw = os.path.join(raw_dir, f"{name}.raw")
             env = mesh_env(spirv_dir, name, gfx_env)   # VKH_MESH=1, or the --mesh-compute pass and its VS
             fs = os.path.join(spirv_dir, "ps_interp_f16_high.spv")
-            if bary_fallback() and not f16_interp_fallback():
-                results.append((name, None, "SKIP (per-vertex f16 interpolants need barycentrics)"))
-                continue
             rc, msg = run_readback(raw, run_cmd, [vk_harness, spv, fs, raw], env=env)
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
