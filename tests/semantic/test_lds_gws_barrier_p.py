@@ -1067,5 +1067,118 @@ class TestIEEE754BoundaryExtremesAndNaNHandling(unittest.TestCase):
         self.assertEqual(state.get_vgpr(0), self.F16_PACKED_NANS)
 
 
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+def parse_ds_gws_barrier_p_asm(asm_str: str) -> DSGWSBarrierPInstruction:
+    """Parse AMD assembly instruction string for ds_gws_barrier_p."""
+    text = asm_str.strip()
+    match = re.match(
+        r"^ds_gws_barrier_p\s+v\[(\d+)\](?:\s*,\s*offset:(\d+))?\s*,\s*gds$",
+        text,
+    )
+    if not match:
+        raise ValueError(f"Malformed ds_gws_barrier_p assembly: {asm_str}")
+    vdata_idx = int(match.group(1))
+    offset = int(match.group(2)) if match.group(2) else 0
+    return DSGWSBarrierPInstruction(
+        vdata0=RegisterOperand(vdata_idx, RegType.VGPR),
+        offset=offset,
+        gds=True,
+    )
+
+
+class TestNegativeControlsSyntaxRejectionAndMutations(unittest.TestCase):
+    """Phase 8: Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_negative_and_out_of_bounds_registers(self) -> None:
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.VGPR)
+
+        with self.assertRaises(ValueError):
+            RegisterOperand(256, RegType.VGPR)
+
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.SGPR)
+
+        with self.assertRaises(ValueError):
+            RegisterOperand(106, RegType.SGPR)
+
+    def test_syntax_rejection_sgpr_as_vdata0(self) -> None:
+        s0 = RegisterOperand(0, RegType.SGPR)
+        with self.assertRaises(ValueError):
+            DSGWSBarrierPInstruction(vdata0=s0, offset=0, gds=True)
+
+    def test_syntax_rejection_invalid_offset_bounds(self) -> None:
+        v0 = RegisterOperand(0, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            DSGWSBarrierPInstruction(vdata0=v0, offset=-1, gds=True)
+
+        with self.assertRaises(ValueError):
+            DSGWSBarrierPInstruction(vdata0=v0, offset=0x10000, gds=True)
+
+    def test_syntax_rejection_missing_mandatory_gds(self) -> None:
+        v0 = RegisterOperand(0, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            DSGWSBarrierPInstruction(vdata0=v0, offset=0, gds=False)
+
+    def test_invalid_simd_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=48)
+
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_invalid_gws_memory_size(self) -> None:
+        with self.assertRaises(ValueError):
+            GWSMemory(num_resources=0)
+
+        with self.assertRaises(ValueError):
+            GWSMemory(num_resources=-1)
+
+        with self.assertRaises(ValueError):
+            GWSMemory(num_resources=48)
+
+    def test_asm_parser_valid(self) -> None:
+        instr1 = parse_ds_gws_barrier_p_asm("ds_gws_barrier_p v[0], gds")
+        self.assertEqual(instr1.vdata0.index, 0)
+        self.assertEqual(instr1.offset, 0)
+        self.assertTrue(instr1.gds)
+
+        instr2 = parse_ds_gws_barrier_p_asm("ds_gws_barrier_p v[12], offset:64, gds")
+        self.assertEqual(instr2.vdata0.index, 12)
+        self.assertEqual(instr2.offset, 64)
+        self.assertTrue(instr2.gds)
+
+    def test_asm_parser_rejections(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_ds_gws_barrier_p_asm("ds_gws_barrier_p s[0], gds")
+
+        with self.assertRaises(ValueError):
+            parse_ds_gws_barrier_p_asm("ds_gws_barrier_p v[0]")
+
+        with self.assertRaises(ValueError):
+            parse_ds_gws_barrier_p_asm("ds_gws_barrier v[0], gds")
+
+    def test_mutation_detection_last_active_lane_elected(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFFFFFF)
+        interp = SIMDInterpreter()
+
+        state.set_lane_vgpr(0, 1, 1)
+        state.set_lane_vgpr(31, 1, 10)
+
+        instr = DSGWSBarrierPInstruction(vdata0=RegisterOperand(1, RegType.VGPR), offset=1)
+        res = interp.execute(instr, state, wave_id=1)
+        self.assertIsNotNone(res)
+        first_lane, _, satisfied, _, _ = res  # type: ignore
+
+        self.assertEqual(first_lane, 0)
+        self.assertTrue(satisfied)
+
+
 if __name__ == "__main__":
     unittest.main()
