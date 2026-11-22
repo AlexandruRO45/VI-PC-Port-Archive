@@ -777,6 +777,103 @@ class TestValuLshlAddU32ConditionCodes(unittest.TestCase):
         self.assertEqual(simd_state.vcc, canary_vcc)
 
 
+# ==============================================================================
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+POS_ZERO_F32: int = 0x00000000
+NEG_ZERO_F32: int = 0x80000000
+POS_INF_F32: int = 0x7F800000
+NEG_INF_F32: int = 0xFF800000
+QNAN_F32: int = 0x7FC00000
+SNAN_F32: int = 0x7F800001
+QNAN_PAYLOAD_F32: int = 0x7FC01234
+SNAN_PAYLOAD_F32: int = 0x7F804321
+SUBNORM_MIN_F32: int = 0x00000001
+SUBNORM_MAX_F32: int = 0x007FFFFF
+
+
+def f32_to_bits(val: float) -> int:
+    """Encode float to IEEE 754 single-precision 32-bit unsigned integer."""
+    return struct.unpack("<I", struct.pack("<f", val))[0]
+
+
+def bits_to_f32(bits: int) -> float:
+    """Decode 32-bit unsigned integer to IEEE 754 single-precision float."""
+    return struct.unpack("<f", struct.pack("<I", bits & MASK32))[0]
+
+
+def is_nan_f32(bits: int) -> bool:
+    """True if 32-bit integer represents an IEEE 754 single-precision NaN."""
+    bits &= MASK32
+    return (bits & 0x7F800000) == 0x7F800000 and (bits & 0x007FFFFF) != 0
+
+
+def is_subnormal_f32(bits: int) -> bool:
+    """True if 32-bit integer represents an IEEE 754 single-precision subnormal."""
+    bits &= MASK32
+    return (bits & 0x7F800000) == 0 and (bits & 0x007FFFFF) != 0
+
+
+class TestValuLshlAddU32IEEE754Boundaries(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_float32_exponent_mantissa_reconstruction(self) -> None:
+        # Reconstruct IEEE 754 float: exponent 127 (1.0), mantissa 0
+        # (127 << 23) + 0 = 0x3F800000 (1.0)
+        res = oracle_v_lshl_add_u32(127, 23, 0)
+        self.assertEqual(res, 0x3F800000)
+        self.assertEqual(bits_to_f32(res), 1.0)
+
+        # Exponent 128 (2.0) with mantissa 0x00400000 => 3.0 (0x40400000)
+        res2 = oracle_v_lshl_add_u32(128, 23, 0x00400000)
+        self.assertEqual(res2, 0x40400000)
+        self.assertEqual(bits_to_f32(res2), 3.0)
+
+    def test_subnormal_mantissa_alignment_no_ftz(self) -> None:
+        # Subnormal float bits shifted left must never be flushed to zero
+        # Shift smallest subnormal by 2 and add offset 4
+        res = oracle_v_lshl_add_u32(SUBNORM_MIN_F32, 2, 4)
+        expected = (1 << 2) + 4  # 8
+        self.assertEqual(res, expected)
+        self.assertTrue(is_subnormal_f32(res))
+
+        # Shift max subnormal by 1 + 1: stays in subnormal or transitions to normal
+        res_sub = oracle_v_lshl_add_u32(0x00100000, 2, 0)
+        self.assertEqual(res_sub, 0x00400000)
+        self.assertTrue(is_subnormal_f32(res_sub))
+
+    def test_nan_payload_bit_preservation(self) -> None:
+        # Signaling NaN payload manipulation: shift payload bits by 1 without quieting
+        s_payload = 0x00000042
+        res = oracle_v_lshl_add_u32(s_payload, 1, 0x7F800000)
+        self.assertEqual(res, 0x7F800084)
+        self.assertTrue(is_nan_f32(res))
+        # Quiet bit (bit 22) must remain 0 (still sNaN)
+        self.assertEqual(res & 0x00400000, 0)
+
+        # Quiet NaN payload assembly
+        q_base = 0x7FC00000
+        res_q = oracle_v_lshl_add_u32(0x12, 4, q_base)
+        self.assertEqual(res_q, 0x7FC00120)
+        self.assertTrue(is_nan_f32(res_q))
+        self.assertNotEqual(res_q & 0x00400000, 0)
+
+    def test_signed_zero_and_infinities(self) -> None:
+        # Shift 1 to bit 31 to assemble negative zero: (1 << 31) + 0 == 0x80000000
+        neg_zero = oracle_v_lshl_add_u32(1, 31, 0)
+        self.assertEqual(neg_zero, NEG_ZERO_F32)
+
+        # Assemble positive infinity: (0xFF << 23) + 0 == 0x7F800000
+        pos_inf = oracle_v_lshl_add_u32(0xFF, 23, 0)
+        self.assertEqual(pos_inf, POS_INF_F32)
+
+        # Assemble negative infinity: (1 << 31) + 0x7F800000 == 0xFF800000
+        neg_inf = oracle_v_lshl_add_u32(1, 31, POS_INF_F32)
+        self.assertEqual(neg_inf, NEG_INF_F32)
+
+
+
 
 
 
