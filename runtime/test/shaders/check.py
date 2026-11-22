@@ -10,9 +10,12 @@ Each line is one shader: ok, or what came back instead. The wave32 test ps_bitma
 0-31, since a GPU with 64-wide subgroups puts half the pixels in lanes it wasn't written for.
 The two whole-wave mask checks are skipped when the device cannot provide a full 64-wide compute subgroup.
 The cs_w64x_* / ms_w64x_* cross-half tests (lanes 32-63 against lanes 0-31, see their .asm headers) are skipped there
-too. With LEONIDA_W64_EMULATE=1 they run without that requirement, on a device whose subgroups are narrower (NVIDIA),
-to check a translator that emulates wave64 on them. scripts/run_gpu_tests.py builds the mesh fixtures and
-fs_passthru.spv; here the mesh checks run when those files are in <out dir>/spirv.
+too, unless build.py translated them with --wave64-emulate: then they run on a device whose subgroups are narrower
+(Apple, NVIDIA, llvmpipe). That emulation, like --f16-interp-fallback, is on by itself where the device lacks the
+native feature, and LEONIDA_W64_EMULATE / LEONIDA_F16_INTERP_FALLBACK = 1 or 0 force it, for build.py and check.py
+alike (fallbacks.py). The line "fallbacks: ..." says which are on.
+scripts/run_gpu_tests.py builds the mesh fixtures and fs_passthru.spv; here the mesh checks run when those files are
+in <out dir>/spirv.
 ps_tex is skipped when the device lacks a feature the bindless set or the shader needs, ps_ssharp when it lacks one
 vk_sampler_test needs.
 ps_texoff (texel offsets, on vk_texture_test's texture) is skipped on a device without VK_KHR_maintenance8.
@@ -29,6 +32,8 @@ import tempfile
 from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)  # this script is also run with python -I
+import fallbacks  # noqa: E402  which exact fallbacks build.py translated with (the device's choice, or the variables)
 EXE = ".exe" if os.name == "nt" else ""
 UNSUPPORTED = 77                                       # a test tool exits with this when the device lacks a feature
 
@@ -255,13 +260,14 @@ CVT_F32_SAT_CASES = (
 CVT_PK_U8_WORDS = [0x1122330C, 0x11220E44, 0x11003344, 0xFE223344, 0x1122330D, 0x11220044, 0x11FF3344, 0x00223344]
 # Wave64-only dump tests (mostly the x = cross-half checks): exact results need 64 lanes, or an emulation of them
 # on narrower subgroups. cs_dpp_w64 is not cross-half, but its lane id needs both halves.
-W64_EMULATED = os.environ.get("LEONIDA_W64_EMULATE") == "1"
+# LEONIDA_W64_EMULATE (fallbacks.py): forced by the variable at import, the device's choice after resolve_fallbacks().
+W64_EMULATED = fallbacks.forced("w64_emulate") is True
 # LEONIDA_BARY_FALLBACK=1 (set for build.py too): a pixel shader that reads raw barycentrics was translated with
 # --bary-fallback and is drawn through its pass-through geometry shader, <name>.bary_gs.spv.
 BARY_FALLBACK = os.environ.get("LEONIDA_BARY_FALLBACK") == "1"
-# LEONIDA_F16_INTERP_FALLBACK=1 (as build.py reads it): *_f16 interps were translated from decoded-half inputs, with no
-# PerVertexKHR inputs at all, so the translator refuses a computed I/J pair (ps_ij_computed) there.
-F16_HALVES = os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1"
+# --f16-interp-fallback (fallbacks.py, as build.py chose it): *_f16 interps were translated from decoded-half inputs,
+# with no PerVertexKHR inputs at all, so the translator refuses a computed I/J pair (ps_ij_computed) there.
+F16_HALVES = fallbacks.forced("f16_interp") is True
 W64X_DUMPS = [("cs_dpp_w64", [1, 0, 3, 2, 5, 4, 7, 6]),
               ("cs_w64x_readlane", [121, 121, 16, 97, 16, 100, 100, 121]),
               ("cs_w64x_writelane", [4660, 77, 99, 2748, 0, 0, 4660, 99]),
@@ -559,14 +565,24 @@ def check_mesh_v5(data):
     return f"{len(errors)}/24 mismatches; first {errors[0]}" if errors else ""
 
 
-# LEONIDA_MESH_COMPUTE=1 (for run_gpu_tests.py, which builds the mesh fixtures): the mesh shaders were translated
+# --mesh-compute (fallbacks.py; for run_gpu_tests.py, which builds the mesh fixtures): the mesh shaders were translated
 # with rdna2spirv.py --mesh-compute, and vk_harness dispatches each as compute and draws its slots with the vertex
 # shader tools/mesh_compute_vs.py wrote (<name>.mesh_vs.spv), so they run without VK_EXT_mesh_shader.
-MESH_COMPUTE = os.environ.get("LEONIDA_MESH_COMPUTE") == "1"
+MESH_COMPUTE = fallbacks.forced("mesh_compute") is True
+
+
+def resolve_fallbacks() -> str:
+    """Set W64_EMULATED, F16_HALVES and MESH_COMPUTE as build.py chose them: each variable when it is set, else on
+    where the device lacks the native feature (fallbacks.py). Returns the line that names them, for the output."""
+    global W64_EMULATED, F16_HALVES, MESH_COMPUTE
+    W64_EMULATED = fallbacks.enabled("w64_emulate")
+    F16_HALVES = fallbacks.enabled("f16_interp")
+    MESH_COMPUTE = fallbacks.enabled("mesh_compute")
+    return fallbacks.describe(("w64_emulate", "mesh_compute", "f16_interp"))
 
 
 def mesh_env(spirv, name, base=None):
-    """vk_harness environment for mesh shader `name`: VKH_MESH=1, or under LEONIDA_MESH_COMPUTE=1 the
+    """vk_harness environment for mesh shader `name`: VKH_MESH=1, or under --mesh-compute (MESH_COMPUTE) the
     --mesh-compute variables (vertex shader, slot bytes and primitive count from index.json's mesh_compute)."""
     env = dict(base if base is not None else os.environ)
     if MESH_COMPUTE:
@@ -602,8 +618,8 @@ def mesh_v5_test(tools, spirv, raw):
 
 def partial_wave_test(tools, spirv, name, expected_words):
     """A group smaller than a wave: run with subgroup size 64 requested (no full subgroups); None if the device
-    has no 64-wide subgroup. With LEONIDA_W64_EMULATE=1 it asks for 32 instead, the width the emulation is for, so
-    a device that defaults to 64 (AMD) runs the emulated path at 32 too (#166)."""
+    has no 64-wide subgroup. Under --wave64-emulate (W64_EMULATED) it asks for 32 instead, the width the emulation is
+    for, so a device that defaults to 64 (AMD) runs the emulated path at 32 too (#166)."""
     shader = os.path.join(spirv, name + ".spv")
     if not os.path.isfile(shader):
         return f"missing {name}.spv"
@@ -1374,6 +1390,9 @@ def main():
     spirv = os.path.join(sys.argv[1], "spirv")
     tools = sys.argv[2] if len(sys.argv) > 2 else os.path.join(HERE, "..", "..", "build")
     tools = pick_build_dir(os.path.abspath(tools), tuple(t + EXE for t in TEST_PROGRAMS))
+    chosen = resolve_fallbacks()   # as build.py translated: the variables, else what the device lacks
+    if chosen:
+        print(chosen)
     results = []
     for name, groups, expect in COMPUTE:
         results.append((name, compute_test(tools, spirv, name, groups, expect)))
@@ -1401,7 +1420,7 @@ def main():
                                                  env=FMA_FUSED_ENV)))
     results.append(("cs_cvt_pk_u8", compute_test(tools, spirv, "cs_cvt_pk_u8", "1", "dump",
                                                  expected_words=CVT_PK_U8_WORDS)))
-    for name, want in W64X_DUMPS:   # without --require-wave64 when LEONIDA_W64_EMULATE=1
+    for name, want in W64X_DUMPS:   # without --require-wave64 under --wave64-emulate
         results.append((name, compute_test(tools, spirv, name, "1", "dump", require_wave64=not W64_EMULATED,
                                            expected_words=want)))
     for name, want in W64X_PARTIAL:

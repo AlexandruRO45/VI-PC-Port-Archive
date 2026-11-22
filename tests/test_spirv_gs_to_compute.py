@@ -228,3 +228,91 @@ def test_help_is_a_clean_exit_zero(capsys):
         out = capsys.readouterr().out
         assert "spirv_gs_to_compute.py in.spv out.spv" in out
         assert "SPIRV-Tools" in out
+
+
+# The vertex shader that feeds gs_tri in scripts/run_gpu_tests.py: Position, Location 0 and Location 1 from VertexIndex.
+sys.path.insert(0, os.path.join(ROOT, "scripts"))
+from run_gpu_tests import VS_TRI_SPVASM  # noqa: E402
+
+GS_TRI_LAYOUT = {"verts_in": 3, "max_verts": 3, "topology": "triangle_strip",
+                 "inputs": ["position", "location 1"], "outputs": ["position", "location 1"]}
+
+
+def _validate(tmp_path, text, name):
+    sa, sv = tmp_path / f"{name}.spvasm", tmp_path / f"{name}.spv"
+    sa.write_text(text)
+    subprocess.run(["spirv-as", str(sa), "-o", str(sv), "--target-env", "vulkan1.2"], check=True)
+    r = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(sv)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
+@pytest.mark.skipif(not HAVE_SPIRV, reason="needs spirv-as and spirv-val on PATH")
+def test_vs_capture_writes_what_the_gs_reads(tmp_path):
+    out = gsc.vs_capture(VS_TRI_SPVASM, GS_TRI_LAYOUT)
+    assert re.search(r'OpEntryPoint GLCompute %main "main" ', out)
+    assert "OpExecutionMode %main LocalSize 64 1 1" in out
+    # VertexIndex is GlobalInvocationId.x; the outputs are private, with no BuiltIn or Location left on them
+    assert "BuiltIn VertexIndex" not in out and not re.search(r"OpVariable %\w+ Output\b", out)
+    assert re.findall(r"(%\w+) = OpVariable %\w+ Input\b", out) == ["%gsc_gid"]
+    assert not re.search(r"OpDecorate %(gl_Position|out0|out1) ", out)
+    assert "%gl_VertexIndex" not in out
+    # vertices past primitive_count * 3 return before the body; each return stores Position, then Location 1
+    assert "%gsc_total = OpIMul %uint %gsc_cnt %gsc_k3" in out
+    stores = re.findall(r"(%gsc_t\d+) = OpLoad %v4float (%\w+)", out)
+    assert [v for _, v in stores] == ["%gl_Position", "%out1"]
+    assert len(re.findall(r"OpAccessChain %gsc_ptr_sb_v4 %gsc_in %gsc_k2 ", out)) == 2
+    assert "OpDecorate %gsc_in DescriptorSet 1" in out and "OpDecorate %gsc_in Binding 0" in out
+    _validate(tmp_path, out, "vs_capture")
+
+
+def test_vs_capture_rejects_vertex_attributes():
+    vs = VS_TRI_SPVASM.replace('OpDecorate %gl_VertexIndex BuiltIn VertexIndex',
+                               'OpDecorate %gl_VertexIndex Location 0')
+    with pytest.raises(gsc.Unsupported, match="vertex attributes"):
+        gsc.vs_capture(vs, GS_TRI_LAYOUT)
+
+
+def test_vs_capture_needs_an_output_for_every_gs_input():
+    with pytest.raises(gsc.Unsupported, match="location 5"):
+        gsc.vs_capture(VS_TRI_SPVASM, {**GS_TRI_LAYOUT, "inputs": ["position", "location 5"]})
+
+
+def test_vs_capture_rejects_a_geometry_shader():
+    with pytest.raises(gsc.Unsupported, match="not a vertex shader"):
+        gsc.vs_capture(PHI_GS, GS_TRI_LAYOUT)
+
+
+@pytest.mark.skipif(not HAVE_SPIRV, reason="needs spirv-as and spirv-val on PATH")
+def test_draw_vs_passes_each_slot_to_its_output(tmp_path):
+    out = gsc.draw_vs({**GS_TRI_LAYOUT, "outputs": ["position", "location 1", "location 4"]})
+    for i, deco in enumerate(("BuiltIn Position", "Location 1", "Location 4")):
+        assert f"OpDecorate %in{i} Location {i}" in out
+        assert f"OpDecorate %out{i} {deco}" in out
+        assert f"OpStore %out{i} %v{i}" in out
+    _validate(tmp_path, out, "draw_vs")
+
+
+@requires_tools
+def test_cli_writes_the_vertex_capture_and_draw_shaders(gs_tri, tmp_path):
+    if not shutil.which("spirv-dis"):
+        pytest.skip("needs spirv-dis")
+    _, spvasm = gs_tri
+    gs, vs = tmp_path / "gs.spv", tmp_path / "vs.spv"
+    for text, path in ((spvasm, gs), (VS_TRI_SPVASM, vs)):
+        subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-", "-o", str(path)], input=text, text=True,
+                       check=True)
+    outs = [tmp_path / n for n in ("gs_cs.spv", "vs_cs.spv", "draw.spv")]
+    r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "spirv_gs_to_compute.py"), str(gs),
+                        str(outs[0]), "--vs", str(vs), str(outs[1]), "--draw-vs", str(outs[2])],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    for path in outs:
+        subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(path)], check=True)
+    # a missing path after an option is a usage error, as is the vertex shader's output overlapping the GS's
+    for extra in (["--vs", str(vs)], ["--draw-vs"]):
+        r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "spirv_gs_to_compute.py"), str(gs),
+                            str(outs[0]), *extra], capture_output=True, text=True)
+        assert r.returncode == 2, (extra, r.stderr)
+    r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "spirv_gs_to_compute.py"), str(gs),
+                        str(outs[0]), "--vs", str(vs), str(outs[0])], capture_output=True, text=True)
+    assert r.returncode == 2 and "same file" in r.stderr

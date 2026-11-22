@@ -18,9 +18,12 @@ doesn't make; geometry shaders (gs_) get gs_tri's signatures (gs_container).
 The comment at the top of each .asm says which test program to run on the result and what it should print.
 With LEONIDA_FMA=khr (or glsl), the fused multiply-adds are translated with --fma khr (OpFmaKHR, which needs
 VK_KHR_shader_fma; the test programs enable it when the device has it, else they exit 77) or --fma glsl.
+--wave64-emulate and --f16-interp-fallback are on by themselves where the device lacks 64-wide compute subgroups or
+PerVertexKHR inputs (fallbacks.py, as check.py decides too); LEONIDA_W64_EMULATE and LEONIDA_F16_INTERP_FALLBACK = 1
+or 0 force them on or off. Set a variable for both scripts or for neither.
 With LEONIDA_BARY_FALLBACK=1, pixel shaders that read raw barycentrics are translated with --bary-fallback, and
 each gets a pass-through geometry shader, <name>.bary_gs.spv, that check.py draws it with (tools/bary_fallback_gs.py).
-Under that or LEONIDA_F16_INTERP_FALLBACK=1, ps_ij_computed isn't built: its computed I/J pair needs PerVertexKHR
+Under that or --f16-interp-fallback, ps_ij_computed isn't built: its computed I/J pair needs PerVertexKHR
 inputs, and check.py reports it as SKIP.
 With LEONIDA_PC_TAIL_UBO=1, every shader is translated with --pc-tail-ubo (s0..s31 in 128 push-constant bytes, the
 heap base and code base in a uniform block at set 1), for devices whose maxPushConstantsSize is 128; set it for
@@ -43,10 +46,11 @@ import mc_command  # noqa: E402
 
 MC = mc_command.mc_command()
 RSRC2, GROUP = 0x8088, (64, 1, 1)
-# Not built under LEONIDA_BARY_FALLBACK=1 or LEONIDA_F16_INTERP_FALLBACK=1 (see main).
+# Not built under LEONIDA_BARY_FALLBACK=1 or --f16-interp-fallback (see main).
 NEEDS_PER_VERTEX_INPUTS = ("ps_ij_computed",)
 sys.path.insert(0, HERE)  # this script is also run with python -I
 from compute_fixture import compute_header  # noqa: E402
+import fallbacks  # noqa: E402  --wave64-emulate and --f16-interp-fallback: the variables, else what the device lacks
 
 
 def asm_mattr(path):
@@ -158,13 +162,13 @@ def translate_tests(work, names):
         else:
             (work / (n + ".dxbc")).write_bytes(bytes(32))  # chunk count 0
     cmd = [sys.executable, "-I", TRANSLATOR, disasm, "--out", spirv]
-    if os.environ.get("LEONIDA_W64_EMULATE") == "1":   # wave64 on 32-wide subgroups (compute shaders only)
+    if fallbacks.enabled("w64_emulate"):   # wave64 on 32-wide subgroups (compute shaders only)
         cmd.append("--wave64-emulate")
     if os.environ.get("LEONIDA_BARY_FALLBACK") == "1":   # raw barycentrics without VK_KHR_fragment_shader_barycentric
         cmd.append("--bary-fallback")
     if os.environ.get("LEONIDA_FMA") in ("glsl", "khr"):   # fused multiply-add as GLSL Fma (default) or OpFmaKHR
         cmd += ["--fma", os.environ["LEONIDA_FMA"]]
-    if os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1":   # f16 interpolation without PerVertexKHR (MoltenVK)
+    if fallbacks.enabled("f16_interp"):   # f16 interpolation without PerVertexKHR (MoltenVK)
         cmd.append("--f16-interp-fallback")
     if os.environ.get("LEONIDA_TEXOFF_FALLBACK") == "1":   # texel offsets without VK_KHR_maintenance8
         cmd.append("--texel-offset-fallback")
@@ -193,7 +197,7 @@ def main():
     names = [n for n in names if n not in skipped]
     # A computed I/J pair needs PerVertexKHR inputs, which both fallbacks take away: the translator refuses it there,
     # and check.py and run_gpu_tests.py report it as SKIP. Leave it out instead of losing the whole batch.
-    if os.environ.get("LEONIDA_BARY_FALLBACK") == "1" or os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1":
+    if os.environ.get("LEONIDA_BARY_FALLBACK") == "1" or fallbacks.enabled("f16_interp"):
         per_vertex = [n for n in names if n in NEEDS_PER_VERTEX_INPUTS]
         if per_vertex:
             print("not built (computed I/J pairs need PerVertexKHR inputs, off under the fallback):",
@@ -201,6 +205,9 @@ def main():
         names = [n for n in names if n not in per_vertex]
     if not names:
         return 0
+    chosen = fallbacks.describe(("w64_emulate", "f16_interp"))
+    if chosen:
+        print(chosen)
     out.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="test-shaders-", dir=out) as tmp:
         work = Path(tmp)

@@ -169,15 +169,31 @@ pass the program's output on, so the tests can't run through it.
 The tests that compare with the host's D3D12 (`root_sig_test`, `root_sig`, `device_proxy`, `d3d12_vulkan_device`)
 check against Wine's vkd3d or vkd3d-proton here, not Microsoft's runtime, so some of them fail for that reason.
 
+## Fallbacks the tests choose by themselves
+
+Where the GPU lacks a feature a test needs, `run_gpu_tests.py`, `build.py` and `check.py` run that test through an
+exact fallback instead of skipping it. `runtime/test/shaders/fallbacks.py` decides, from what
+`tools/vk_subgroup_info.py` reports for the device the tests run on, and the first line of the output names the
+fallbacks that are on and why (`fallbacks: --wave64-emulate (no 64-wide compute subgroup; ...)`). Each has a variable:
+`1` forces it on, `0` forces it off (the tests it serves then skip on such a device), unset leaves it to the device.
+
+| Fallback | On by itself where | Variable | Tests it runs |
+|---|---|---|---|
+| `--wave64-emulate` | the compute stage can't run a 64-wide subgroup (Apple, NVIDIA, Intel, llvmpipe) | `LEONIDA_W64_EMULATE` | `cs_wavemask`, `cs_wave64_ballot`, `cs_wm_*`, `cs_w64x_*`, `ms_w64x_ballot` |
+| `--mesh-compute` | no `VK_EXT_mesh_shader` (MoltenVK, KosmicKrisp, NVIDIA Pascal); llvmpipe under `--wave64-emulate`, which draws nothing for the emulated `ms_tri` and `ms_clip` as mesh shaders (Mesa 26.3.1; exact as compute) | `LEONIDA_MESH_COMPUTE` | `ms_*` |
+| geometry shader as compute | no `geometryShader` (MoltenVK, KosmicKrisp) | `LEONIDA_GS_COMPUTE` | `gs_tri` |
+| `--f16-interp-fallback` | no `PerVertexKHR` inputs (MoltenVK, devices without barycentrics) | `LEONIDA_F16_INTERP_FALLBACK` | `ps_interp_f16_high`, `ms_f16_pack` |
+
+`build.py` and `check.py` decide `--wave64-emulate` and `--f16-interp-fallback` the same way, so a plain
+`build.py` + `check.py` agree. If you set one of these variables, set it **for both `build.py` and `check.py`**: if
+only `check.py` sees it, the shaders are checked against expectations they weren't built for, and every wave64 test
+fails. The same holds for `LEONIDA_VK_DEVICE` and `LEONIDA_VULKAN_LOADER`, which choose the device both ask about.
+
 ## GPUs with 32-wide subgroups (NVIDIA, Intel, Apple)
 
-The game's shaders are mostly wave64. A GPU that can't run 64-wide compute subgroups skips the wave64 tests
-(`cs_wavemask`, `cs_wave64_ballot`, `cs_wm_*`, `cs_w64x_*`, `ms_w64x_ballot`); that's expected, not a failure.
-
-To test the wave64 emulation that makes them exact on these GPUs, set `LEONIDA_W64_EMULATE=1`, **for both
-`build.py` and `check.py`**: `build.py` translates with emulation only when it's set. If you set it only for
-`check.py`, the shaders are checked against the emulated expectations without being emulated, and every wave64 test
-fails.
+The game's shaders are mostly wave64. Where the compute stage can't run a 64-wide subgroup, the wave64 tests run
+under `--wave64-emulate`, which makes them exact on any subgroup size (`docs/design.md`, "Wave64 emulation").
+With `LEONIDA_W64_EMULATE=0` they skip there instead; that's expected, not a failure.
 
 ## Wave64 pixel, vertex and geometry shaders (`w64_graphics.py`)
 
@@ -232,13 +248,19 @@ only for `check.py`, the shaders read the tail from push constants the programs 
 (`LEONIDA_MESH_COMPUTE=1`) isn't combined with it yet: its vertex shader still reads the output address from push
 constants, so those tests skip.
 
-## GPUs without mesh shaders (NVIDIA Pascal and older)
+## GPUs without mesh shaders (MoltenVK, KosmicKrisp, NVIDIA Pascal and older)
 
-Without `VK_EXT_mesh_shader`, the `ms_*` tests are skipped; that's expected, not a failure. To test the path that
-runs them anyway, set `LEONIDA_MESH_COMPUTE=1` for `run_gpu_tests.py`, together with `LEONIDA_W64_EMULATE=1` on a
-32-wide GPU (every mesh shader is wave64). The mesh shaders are then translated with `--mesh-compute`, dispatched as
-compute and drawn by a generated vertex shader (`docs/design.md`, "Mesh shaders as compute"), so the device needs
-`bufferDeviceAddress` and `shaderInt64` instead.
+Without `VK_EXT_mesh_shader`, the mesh shaders are translated with `--mesh-compute`, dispatched as compute and drawn
+by a generated vertex shader (`docs/design.md`, "Mesh shaders as compute"), so the device needs
+`bufferDeviceAddress` and `shaderInt64` instead. Every mesh shader is wave64, so on a 32-wide GPU this goes with
+`--wave64-emulate`, which is on there too. With `LEONIDA_MESH_COMPUTE=0` the `ms_*` tests skip instead.
+
+## GPUs without a geometry stage (MoltenVK, KosmicKrisp)
+
+Metal has no geometry shaders. There `gs_tri` runs its geometry shader as a compute capture pass
+(`tools/spirv_gs_to_compute.py`, SHADER-159; `docs/design.md`, "Geometry shaders as compute in the GPU tests"):
+`vk_harness` (`VKH_GS_COMPUTE`) dispatches the vertex shader as compute to fill the GS input buffer, then the GS,
+which writes the vertices it emits, and draws them as a list. With `LEONIDA_GS_COMPUTE=0` `gs_tri` skips instead.
 
 ## Without a GPU: Mesa llvmpipe
 
@@ -248,10 +270,14 @@ for every pull request (`.github/workflows/runtime.yml`), and you can do the sam
 ```sh
 sudo apt-get install -y libvulkan-dev mesa-vulkan-drivers vulkan-tools spirv-tools llvm-18
 cmake -S runtime -B runtime/build/linux && cmake --build runtime/build/linux --parallel
-python -I scripts/run_gpu_tests.py --build runtime/build/linux --llvm-mc /usr/lib/llvm-18/bin/llvm-mc
+LEONIDA_W64_EMULATE=0 python -I scripts/run_gpu_tests.py --build runtime/build/linux \
+    --llvm-mc /usr/lib/llvm-18/bin/llvm-mc
 LEONIDA_W64_EMULATE=1 python -I scripts/run_gpu_tests.py --build runtime/build/linux \
     --llvm-mc /usr/lib/llvm-18/bin/llvm-mc --filter cs_
 ```
+
+These are CI's two runs. Without the variable, `--wave64-emulate` is on by itself on llvmpipe (its subgroups are
+4 or 8 wide; see "Fallbacks the tests choose by themselves").
 
 With Mesa 25.2 (llvmpipe, LLVM 20) the first run passes 52 of 88 and skips 36, the second passes 37 of 39 and
 skips 2. The skips are expected: llvmpipe has 8-wide subgroups (so every wave64 test skips without emulation, and
@@ -277,12 +303,11 @@ geometry shaders instead.
 ## Macs: 16-bit interpolation without PerVertexKHR
 
 `ps_interp_f16_high` (and `ms_f16_pack`) normally read 16-bit interpolants through `PerVertexKHR` inputs, which
-MoltenVK can't convert to Metal ("PerVertexKHR decoration is not supported in MSL"). `run_gpu_tests.py` asks
-`tools/vk_subgroup_info.py` whether the device can take them and, on MoltenVK, translates with
-`--f16-interp-fallback` by itself: the vertex or mesh shader then also exports the decoded f16 halves
-(`docs/design.md`, "16-bit interpolation without `PerVertexKHR`"). `LEONIDA_F16_INTERP_FALLBACK=1` or `0` forces it
-on or off; `build.py` (for `check.py`) translates with the flag only when that variable is `1`. `ms_f16_pack` also runs
-on a Mac with `LEONIDA_MESH_COMPUTE=1 LEONIDA_W64_EMULATE=1`.
+MoltenVK can't convert to Metal ("PerVertexKHR decoration is not supported in MSL"). There the tests translate with
+`--f16-interp-fallback` by themselves (`run_gpu_tests.py`, and `build.py` with `check.py`; see "Fallbacks the tests
+choose by themselves"): the vertex or mesh shader then also exports the decoded f16 halves (`docs/design.md`,
+"16-bit interpolation without `PerVertexKHR`"). `LEONIDA_F16_INTERP_FALLBACK=1` or `0` forces it on or off.
+`ms_f16_pack` runs on a Mac through `--mesh-compute` and `--wave64-emulate`, also on by themselves there.
 
 ## GPUs without VK_KHR_maintenance8 (NVIDIA Pascal and older)
 
@@ -345,7 +370,7 @@ The GPU tools of `runtime/test/shaders` (`vk_compute_test`, `vk_harness`, ...) r
 | `ps_vcmpx_forms` fails on a Mac: word 1 reads `0xf05e8e16`, want `0xf05e8a12` | MoltenVK's fast-math makes a compare of a NaN with itself true (SHADER-234) | Current `main`'s test programs turn it off (`MVK_CONFIG_FAST_MATH_ENABLED=0`, unless you set the variable yourself); rebuild them |
 | On a Mac, a translated shader's GPU time is 1.5 to 16 times what it would be without the precise-arithmetic overhead | MoltenVK's SPIRV-Cross turns every `NoContraction` float add, subtract and multiply into a call to an `[[clang::optnone]]` helper that Metal does not inline. MoltenVK 1.4.2 and `main` up to at least `5189f8de` are affected (SHADER-234, [design notes](design.md#translator-status-and-runtime-contract)) | Expected with these MoltenVK versions, and the output is still exact. Before you time shaders on a Mac, build MoltenVK with SPIRV-Cross `98cbb7c0` or newer in `ExternalRevisions/SPIRV-Cross_repo_revision` (KhronosGroup/MoltenVK#2917 moves it to `57e4efcc`), and point `LEONIDA_VULKAN_LOADER` at its `libMoltenVK.dylib` |
 | `d3d12_descriptor_test` reports that the set had room for fewer than 5001 2D views and 2100 samplers, and the device logs that the bindless set holds fewer samplers than a full shader-visible sampler heap | The device's descriptor limits, or its `vkGetDescriptorSetLayoutSupport`, allow no bigger bindless set ([d3d12_vulkan.md](d3d12_vulkan.md) section 5). MoltenVK's answer is ignored, since it rejects every layout of `maxPerSetDescriptors` (1212) or more although it runs the full set | Expected where the limits are low. The test still checks the last index of each array and that the next view and sampler are refused |
-| `gs_tri` and `ms_tri` fail on a Mac | MoltenVK has no geometry stage and no `VK_EXT_mesh_shader` | Current `main` reports them as skipped |
+| `gs_tri` and `ms_tri` fail on a Mac | MoltenVK has no geometry stage and no `VK_EXT_mesh_shader` | Current `main` runs them as compute there (see "Fallbacks the tests choose by themselves") |
 | On a Mac, `valu_fuzz.py --family f16` reads `+0` where the model wants `-0`, from a multiply whose exact product is -0 (`v_mul_f16`, `v_pk_mul_f16`) or from an FMA whose product and addend are both -0 (`v_fma_f16`, `v_fmac_f16`, `v_pk_fma_f16`) | MoltenVK computes a `NoContraction` multiply as `fma(l, r, +0)`, which drops the sign. MoltenVK 1.4.2 and `main` up to at least `5189f8de` are affected (SHADER-182, [design notes](design.md#translator-status-and-runtime-contract)) | Expected with these MoltenVK versions. To run the rest of the fuzzer clean, add `--skip-op` for each of the five ops. To see them match, install Homebrew's `mesa` and use its KosmicKrisp driver: `LEONIDA_VULKAN_LOADER=/opt/homebrew/opt/vulkan-loader/lib/libvulkan.1.dylib VK_DRIVER_FILES=/opt/homebrew/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json python3 -I tools/valu_fuzz.py --family f16 --build runtime/build/linux`. Or build MoltenVK with SPIRV-Cross `300681bb` or newer in `ExternalRevisions/SPIRV-Cross_repo_revision`, and point `LEONIDA_VULKAN_LOADER` at its `libMoltenVK.dylib` |
 | CMake stops with "needs the Windows SDK 10.0.26100 or newer", or MSVC reports `'Desc_1_2': is not a member of 'D3D12_VERSIONED_ROOT_SIGNATURE_DESC'` | A Windows SDK older than 10.0.26100 (10.0.22621 is the common one), which has no version 1.2 root signatures | `winget install Microsoft.WindowsSDK.10.0.26100`, or add it in the Visual Studio Installer, then delete `runtime/build` and configure again |
 | `ctest` lists `fsr_dispatch` and `bvh_builder` as failed (`Not Run`) after clang-cl hits an internal compiler error in `fsr_dispatch_test.cpp` and `bvh_builder_test.cpp` | clang-cl 22.1.8 on Fedora (Linux cross-build) and Windows, plus 22.1.7 on Windows | Use clang-cl 23.1.6 (both files compile on Windows) |

@@ -253,6 +253,10 @@ jobs:
           spirv-val --target-env vulkan1.2 runtime/build/predicated_copy.spv
           runtime/build/vk_predicated_copy_test
       - name: GPU tests on llvmpipe
+        # The native run: without the variable, --wave64-emulate would be on by itself (llvmpipe's subgroups are
+        # narrower than 64; runtime/test/shaders/fallbacks.py), and the emulated run is the next step's.
+        env:
+          LEONIDA_W64_EMULATE: "0"
         run: |
           vulkaninfo --summary | grep -E 'deviceName.*llvmpipe'  # fails the step if llvmpipe isn't there
           python3 -I scripts/run_gpu_tests.py --build runtime/build --llvm-mc /usr/lib/llvm-18/bin/llvm-mc --work "$RUNNER_TEMP/gpu-native"

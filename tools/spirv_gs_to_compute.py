@@ -19,7 +19,11 @@ p, `InvocationId` reads 0 (only `Invocations 1` is supported). The workgroup is 
 `primitive_count` return at once. Push constants and set 0 are untouched. The draw afterwards turns each strip into
 triangles (or lines, points) in emission order.
 
-Usage: spirv_gs_to_compute.py in.spv out.spv [--layout out.json]
+--vs writes the vertex shader that feeds the GS as the compute pass that fills the input buffer (vs_capture), and
+--draw-vs the vertex shader that draws the records from vertex attributes (draw_vs). vk_harness runs the three
+passes where the device has no geometry stage (VKH_GS_COMPUTE; scripts/run_gpu_tests.py's gs_tri).
+
+Usage: spirv_gs_to_compute.py in.spv out.spv [--layout out.json] [--vs vs.spv vs_out.spv] [--draw-vs draw.spv]
 Needs spirv-dis and spirv-as (SPIRV-Tools) on PATH, or SPIRV_DIS / SPIRV_AS.
 """
 import json
@@ -299,6 +303,190 @@ def rewrite(text):
     return "\n".join(out) + "\n", public
 
 
+ZERO_VERTEX_BUILTINS = ("InstanceIndex", "BaseVertex", "BaseInstance", "DrawIndex")   # one draw, one instance, base 0
+
+
+def vs_capture(text, lay):
+    """The vertex shader feeding the GS, rewritten into the compute pass that fills the GS's input buffer.
+
+    One invocation per vertex of a non-indexed list draw (workgroup LOCAL_SIZE x 1 x 1): vertex v reads VertexIndex v
+    (InstanceIndex, BaseVertex, BaseInstance and DrawIndex read 0) and returns at once when v >= primitive_count *
+    verts_in. At every return from the entry point, the outputs the GS reads (`lay`, rewrite()'s layout) go to
+    `data[v * NUM_INPUTS + slot]` of the input buffer (set 1, binding 0), which is where the GS pass reads vertex v of
+    primitive v / verts_in. The other outputs are kept as private variables and dropped. A vertex shader with vertex
+    attributes (Input variables other than these builtins) or an output block is not supported.
+    """
+    defs, deco = parse(text)
+    ep = re.search(r"^\s*OpEntryPoint Vertex (%\w+) ", text, re.M)
+    if not ep:
+        raise Unsupported("not a vertex shader")
+    main = ep.group(1)
+    uint = find_type(defs, "OpTypeInt", ["32", "0"])
+    f32 = find_type(defs, "OpTypeFloat", ["32"])
+    v4 = find_type(defs, "OpTypeVector", [f32, "4"])
+    if not v4:
+        raise Unsupported("module has no vec4 type")
+    uint = uint or "%gsc_uint"
+    v3u = find_type(defs, "OpTypeVector", [uint, "3"]) or "%gsc_v3u"
+    boolt = find_type(defs, "OpTypeBool", []) or "%gsc_bool"
+    vertex_vars, outputs, out_vars = {}, {}, set()
+    for v, (op, ops) in defs.items():
+        if op != "OpVariable" or ops[1:2] not in (["Input"], ["Output"]):
+            continue
+        ds = deco.get(v, [])
+        bi = next((d.split()[1] for d in ds if d.startswith("BuiltIn ")), None)
+        pointee = defs[ops[0]][1][1]
+        if ops[1] == "Input":
+            if bi in ("VertexIndex",) + ZERO_VERTEX_BUILTINS:
+                vertex_vars[v] = bi
+            elif bi not in KEEP_BUILTINS:
+                raise Unsupported(f"{v}: vertex input {bi or ds} (vertex attributes are not fed to the capture pass)")
+            continue
+        if "Block" in deco.get(pointee, []):
+            raise Unsupported(f"{v}: output block")
+        out_vars.add(v)
+        loc = next((int(d.split()[1]) for d in ds if d.startswith("Location ")), None)
+        name = "position" if bi == "Position" else f"location {loc}" if loc is not None else None
+        if name and pointee == v4:
+            outputs[name] = v
+    missing = [n for n in lay["inputs"] if n not in outputs]
+    if missing:
+        raise Unsupported(f"the vertex shader writes no vec4 for the GS input(s) {missing}")
+    nin, vin = len(lay["inputs"]), lay["verts_in"]
+
+    def k(v):
+        return f"%gsc_k{v}"
+
+    decos = ["OpDecorate %gsc_gid BuiltIn GlobalInvocationId",
+             "OpDecorate %gsc_rt_v4 ArrayStride 16", "OpDecorate %gsc_pad ArrayStride 4",
+             "OpDecorate %gsc_in_t Block", "OpMemberDecorate %gsc_in_t 0 Offset 0",
+             "OpMemberDecorate %gsc_in_t 1 Offset 4", "OpMemberDecorate %gsc_in_t 2 Offset 16",
+             "OpDecorate %gsc_in DescriptorSet 1", "OpDecorate %gsc_in Binding 0"]
+    types = ([f"{uint} = OpTypeInt 32 0"] if uint == "%gsc_uint" else []) + \
+            ([f"{v3u} = OpTypeVector {uint} 3"] if v3u == "%gsc_v3u" else []) + \
+            ([f"{boolt} = OpTypeBool"] if boolt == "%gsc_bool" else [])
+    types += [f"{k(v)} = OpConstant {uint} {v}" for v in sorted({0, 2, 3, vin, nin} | set(range(nin)))]
+    types += [f"%gsc_ptr_in_v3u = OpTypePointer Input {v3u}",
+              f"%gsc_rt_v4 = OpTypeRuntimeArray {v4}", f"%gsc_pad = OpTypeArray {uint} {k(3)}",
+              f"%gsc_in_t = OpTypeStruct {uint} %gsc_pad %gsc_rt_v4",
+              "%gsc_ptr_in_t = OpTypePointer StorageBuffer %gsc_in_t",
+              f"%gsc_ptr_sb_v4 = OpTypePointer StorageBuffer {v4}",
+              f"%gsc_ptr_sb_u = OpTypePointer StorageBuffer {uint}",
+              "%gsc_gid = OpVariable %gsc_ptr_in_v3u Input", "%gsc_in = OpVariable %gsc_ptr_in_t StorageBuffer"]
+    count = 0
+
+    def tmp():
+        nonlocal count
+        count += 1
+        return f"%gsc_t{count}"
+
+    out = []
+    entry_label = None
+    state = "header"
+    for ln in text.splitlines():
+        s = ln.strip()
+        if s == "OpCapability DrawParameters" or s == 'OpExtension "SPV_KHR_shader_draw_parameters"':
+            continue        # BaseVertex/BaseInstance/DrawIndex are constants now
+        m = re.match(r"OpEntryPoint Vertex (%\w+) (\"[^\"]*\")(.*)$", s)
+        if m:
+            iface = [v for v in m.group(3).split() if v not in vertex_vars] + ["%gsc_gid", "%gsc_in"]
+            out += [f"OpEntryPoint GLCompute {m.group(1)} {m.group(2)} {' '.join(iface)}",
+                    f"OpExecutionMode {m.group(1)} LocalSize {LOCAL_SIZE} 1 1"]
+            continue
+        m = re.match(r"OpDecorate (%\w+)\b", s)
+        if m and (m.group(1) in vertex_vars or m.group(1) in out_vars):
+            continue        # builtins that are gone, and the outputs' BuiltIn/Location/interpolation decorations
+        m = re.match(r"Op(?:MemberDecorate|Name) (%\w+)\b", s)
+        if m and m.group(1) in vertex_vars:
+            continue
+        m = re.match(r"(%\w+) = (Op\w+)", s)
+        if decos and m and m.group(2).startswith("OpType"):
+            out += decos
+            decos = []
+        if m and m.group(2) == "OpVariable" and m.group(1) in vertex_vars:
+            continue
+        if m and m.group(2) == "OpTypePointer" and s.split()[3] == "Output":
+            s = re.sub(r"OpTypePointer Output ", "OpTypePointer Private ", s)
+            out.append(s)
+            continue
+        if m and m.group(2) == "OpVariable" and m.group(1) in out_vars:
+            out.append(re.sub(r" Output\b", " Private", s, count=1))
+            continue
+        if m and m.group(2) == "OpFunction":
+            if types:
+                out += types
+                types = []
+            state = "main_entry" if m.group(1) == main else "other"
+            out.append(ln)
+            continue
+        if s == "OpFunctionEnd":
+            state = "other"
+        if state == "main_entry" and re.match(r"%\w+ = OpLabel$", s):
+            state = "main_vars"
+            entry_label = s.split()[0]
+            out.append(ln)
+            continue
+        if state == "main_vars" and not re.match(r"%\w+ = OpVariable ", s):
+            # after the entry block's variables: v = GlobalInvocationId.x; return when v >= primitive_count * verts_in
+            state = "main"
+            out += [f"%gsc_gidv = OpLoad {v3u} %gsc_gid", f"%gsc_vtx = OpCompositeExtract {uint} %gsc_gidv 0",
+                    f"%gsc_cntp = OpAccessChain %gsc_ptr_sb_u %gsc_in {k(0)}", f"%gsc_cnt = OpLoad {uint} %gsc_cntp",
+                    f"%gsc_total = OpIMul {uint} %gsc_cnt {k(vin)}",
+                    f"%gsc_past = OpUGreaterThanEqual {boolt} %gsc_vtx %gsc_total",
+                    "OpSelectionMerge %gsc_body None", "OpBranchConditional %gsc_past %gsc_ret %gsc_body",
+                    "%gsc_ret = OpLabel", "OpReturn", "%gsc_body = OpLabel",
+                    f"%gsc_inbase = OpIMul {uint} %gsc_vtx {k(nin)}"]
+        if state not in ("main", "main_vars"):
+            if any(re.search(rf"{re.escape(v)}\b", s) for v in vertex_vars) and not s.startswith("OpEntryPoint"):
+                raise Unsupported(f"vertex builtin read outside the entry point: {s}")
+            out.append(ln)
+            continue
+        m = re.match(r"(%\w+ = OpPhi %\w+) (.*)$", s)
+        if m:
+            ops = m.group(2).split()
+            ops[1::2] = ["%gsc_body" if lbl == entry_label else lbl for lbl in ops[1::2]]
+            s = f"{m.group(1)} {' '.join(ops)}"
+        m = re.match(r"(%\w+) = OpLoad (%\w+) (%\w+)$", s)
+        if m and m.group(3) in vertex_vars:
+            val = "%gsc_vtx" if vertex_vars[m.group(3)] == "VertexIndex" else k(0)
+            out.append(f"{m.group(1)} = OpBitcast {m.group(2)} {val}" if m.group(2) != uint
+                       else f"{m.group(1)} = OpCopyObject {uint} {val}")
+            continue
+        if any(re.search(rf"{re.escape(v)}\b", s) for v in vertex_vars):
+            raise Unsupported(f"unhandled use of a vertex builtin: {s}")
+        if s == "OpReturn":
+            for i, name in enumerate(lay["inputs"]):
+                val, a, p = tmp(), tmp(), tmp()
+                out += [f"{val} = OpLoad {v4} {outputs[name]}", f"{a} = OpIAdd {uint} %gsc_inbase {k(i)}",
+                        f"{p} = OpAccessChain %gsc_ptr_sb_v4 %gsc_in {k(2)} {a}", f"OpStore {p} {val}"]
+        if s in ("OpKill", "OpTerminateInvocation", "OpReturnValue"):
+            raise Unsupported(s)
+        out.append(s)
+    return "\n".join(out) + "\n"
+
+
+def draw_vs(lay):
+    """The vertex shader that draws the captured vertices: vertex attribute `location i` (a vec4) is output slot i of
+    the layout, written to the same output (BuiltIn Position or Location N) the geometry shader wrote it to."""
+    outs = lay["outputs"]
+    names = [f"%in{i}" for i in range(len(outs))] + [f"%out{i}" for i in range(len(outs))]
+    text = ["OpCapability Shader", "OpMemoryModel Logical GLSL450",
+            f"OpEntryPoint Vertex %main \"main\" {' '.join(names)}"]
+    for i, slot in enumerate(outs):
+        text.append(f"OpDecorate %in{i} Location {i}")
+        text.append(f"OpDecorate %out{i} BuiltIn Position" if slot == "position"
+                    else f"OpDecorate %out{i} Location {int(slot.split()[1])}")
+    text += ["%void = OpTypeVoid", "%fn = OpTypeFunction %void", "%float = OpTypeFloat 32",
+             "%v4 = OpTypeVector %float 4", "%ptr_in = OpTypePointer Input %v4", "%ptr_out = OpTypePointer Output %v4"]
+    text += [f"%in{i} = OpVariable %ptr_in Input" for i in range(len(outs))]
+    text += [f"%out{i} = OpVariable %ptr_out Output" for i in range(len(outs))]
+    text += ["%main = OpFunction %void None %fn", "%entry = OpLabel"]
+    for i in range(len(outs)):
+        text += [f"%v{i} = OpLoad %v4 %in{i}", f"OpStore %out{i} %v{i}"]
+    text += ["OpReturn", "OpFunctionEnd"]
+    return "\n".join(text) + "\n"
+
+
 USAGE = "\n".join(__doc__.strip().splitlines()[-2:])
 
 
@@ -312,12 +500,26 @@ def main(argv):
         i = args.index("--layout")
         lay_path = args[i + 1]
         del args[i:i + 2]
-    if len(args) != 2:
+    vs_paths = draw_path = None
+    if "--vs" in args:
+        i = args.index("--vs")
+        vs_paths = args[i + 1:i + 3]
+        del args[i:i + 3]
+    if "--draw-vs" in args:
+        i = args.index("--draw-vs")
+        draw_path = args[i + 1:i + 2]
+        del args[i:i + 2]
+        draw_path = draw_path[0] if draw_path else None
+    if len(args) != 2 or (vs_paths is not None and len(vs_paths) != 2) or ("--draw-vs" in argv and not draw_path):
         print(USAGE, file=sys.stderr)
         return 2
     paths = [("input", args[0]), ("SPIR-V output", args[1])]
     if lay_path:
         paths.append(("--layout output", lay_path))
+    if vs_paths:
+        paths += [("--vs input", vs_paths[0]), ("--vs output", vs_paths[1])]
+    if draw_path:
+        paths.append(("--draw-vs output", draw_path))
     try:
         resolved = [(name, Path(path).resolve()) for name, path in paths]
         for (left_name, left), (right_name, right) in combinations(resolved, 2):
@@ -335,9 +537,25 @@ def main(argv):
     except Unsupported as e:
         print(f"{args[0]}: not supported: {e}", file=sys.stderr)
         return 1
-    ver = re.search(r"; Version: (\d+)\.(\d+)", text)
-    target = f"spv{ver.group(1)}.{ver.group(2)}" if ver else "vulkan1.2"
-    subprocess.run([asm, "--target-env", target, "-", "-o", args[1]], input=new, check=True, text=True)
+    vs_text = vs_new = None
+    if vs_paths:
+        vs_text = subprocess.run([dis, "--raw-id", vs_paths[0]], check=True, capture_output=True, text=True).stdout
+        try:
+            vs_new = vs_capture(vs_text, lay)
+        except Unsupported as e:
+            print(f"{vs_paths[0]}: not supported: {e}", file=sys.stderr)
+            return 1
+
+    def assemble(source_text, module_text, path):
+        ver = re.search(r"; Version: (\d+)\.(\d+)", source_text)
+        target = f"spv{ver.group(1)}.{ver.group(2)}" if ver else "vulkan1.2"
+        subprocess.run([asm, "--target-env", target, "-", "-o", path], input=module_text, check=True, text=True)
+
+    assemble(text, new, args[1])
+    if vs_paths:
+        assemble(vs_text, vs_new, vs_paths[1])
+    if draw_path:
+        assemble(text, draw_vs(lay), draw_path)
     if lay_path:
         with open(lay_path, "w", newline="\n") as f:
             json.dump(lay, f, indent=1)

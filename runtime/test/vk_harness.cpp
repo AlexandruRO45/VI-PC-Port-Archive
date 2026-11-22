@@ -15,6 +15,12 @@
 //                                draws an indexed mesh instead of the 3-vertex triangle. The file is u32
 //                                vertex_count, u32 index_count, vertex_count*stride bytes, index_count u32
 //                                indices; the layout lists location:float-components, one item per attribute.
+//   VKH_GS_COMPUTE=<gs.spv> + VKH_GS_DRAW=<draw.spv> + VKH_GS_LAYOUT=verts_in,max_verts,inputs,outputs,topology
+//                                runs a geometry shader without a geometry stage (tools/spirv_gs_to_compute.py):
+//                                vs.spv is then the vertex shader as compute (--vs), dispatched over the draw's
+//                                vertices to fill the GS input buffer; gs.spv, the GS as compute, writes the emitted
+//                                vertices and strip cuts; the strips become a list (topology 0 points, 1 line strip,
+//                                2 triangle strip) drawn by draw.spv (--draw-vs) with the fragment shader.
 //   VKH_SUBGROUP_SIZE=32|64      requires that subgroup size of the fragment shader (or of the compute or geometry
 //                                stage under test); stderr says "fragment subgroup size: N" when it took effect and
 //                                "... not available" when the device cannot require it (exit code stays 0).
@@ -24,6 +30,7 @@
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
 #include "vk_pc_tail.h"
+#include "vk_gs_strips.h"
 
 #include <cctype>
 #include <cstddef>
@@ -165,6 +172,24 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    // VKH_GS_COMPUTE: the geometry shader as a compute capture pass (see the top of this file).
+    const char* gs_compute_path = std::getenv("VKH_GS_COMPUTE");
+    if (gs_compute_path && !*gs_compute_path) gs_compute_path = nullptr;
+    const char* gs_draw_path = std::getenv("VKH_GS_DRAW");
+    uint32_t gs_lay[5] = {};   // verts_in, max_verts, inputs, outputs, topology
+    if (gs_compute_path) {
+        const char* s = std::getenv("VKH_GS_LAYOUT");
+        bool ok = s && gs_draw_path && *gs_draw_path && !draw_mesh_path && !group_readback;
+        for (uint32_t i = 0; ok && i < 5; ++i) ok = parse_u32(s, gs_lay[i]) && next_item(s);
+        ok = ok && !*s && gs_lay[0] >= 1 && gs_lay[0] <= 6 && gs_lay[1] >= 1 && gs_lay[1] <= 1024 && gs_lay[2] >= 1 &&
+             gs_lay[2] <= 32 && gs_lay[3] >= 1 && gs_lay[3] <= 8 && gs_lay[4] <= 2;
+        if (!ok) {
+            std::fprintf(stderr, "VKH_GS_COMPUTE needs VKH_GS_DRAW and VKH_GS_LAYOUT=verts_in,max_verts,inputs,"
+                                 "outputs,topology (0..2), and no VKH_DRAW_MESH or --mesh-group-readback\n");
+            return 2;
+        }
+    }
+    const bool gs_compute = gs_compute_path != nullptr;
     const char* sgprs_env = std::getenv("VKH_SGPRS");
     if (sgprs_env && !parse_sgprs(sgprs_env, pc)) {
         std::fprintf(stderr, "VKH_SGPRS: expected up to 32 comma-separated words, got \"%s\"\n", sgprs_env);
@@ -306,6 +331,10 @@ int main(int argc, char** argv) {
                              "constants, not from the --pc-tail-ubo block\n");
         return 77;
     }
+    if (pc_tail && gs_compute) {   // both put their buffers at set 1
+        std::fprintf(stderr, "unsupported: VKH_GS_COMPUTE's buffers and the --pc-tail-ubo block both use set 1\n");
+        return 77;
+    }
     const uint32_t pc_bytes = pc_tail ? 128u : mesh_compute ? 152u : 144u;
     if (props.limits.maxPushConstantsSize < pc_bytes) {
         std::fprintf(stderr, "unsupported: need %u push constant bytes, device has %u\n", pc_bytes,
@@ -377,6 +406,10 @@ int main(int argc, char** argv) {
     // VKH_GS=<geometry.spv>: insert a geometry stage between the vertex and fragment shaders. VKH_SUBGROUP_SIZE then
     // applies to it, unless VKH_GS_HELPER=1 says the GS only feeds the pixel shader under test.
     const char* gs_path = std::getenv("VKH_GS");
+    if (gs_path && gs_compute) {
+        std::fprintf(stderr, "VKH_GS and VKH_GS_COMPUTE are two ways to run one geometry shader: set one\n");
+        return 2;
+    }
     if (gs_path && !f2q.features.geometryShader) {   // MoltenVK: Metal has no geometry stage
         std::fprintf(stderr, "unsupported: no geometryShader\n");
         return 77;
@@ -492,9 +525,10 @@ int main(int argc, char** argv) {
         smi.codeSize = code.size() * 4; smi.pCode = code.data();
         return vkCreateShaderModule(dev, &smi, nullptr, m);
     };
-    VkShaderModule vs, fs, csm = VK_NULL_HANDLE;
-    CHECK(module(mesh_compute ? mesh_vs_path : argv[1], &vs)); CHECK(module(argv[2], &fs));
-    if (mesh_compute) CHECK(module(argv[1], &csm));
+    VkShaderModule vs, fs, csm = VK_NULL_HANDLE, gs_csm = VK_NULL_HANDLE;
+    CHECK(module(mesh_compute ? mesh_vs_path : gs_compute ? gs_draw_path : argv[1], &vs)); CHECK(module(argv[2], &fs));
+    if (mesh_compute || gs_compute) CHECK(module(argv[1], &csm));   // the mesh shader, or the vertex shader, as compute
+    if (gs_compute) CHECK(module(gs_compute_path, &gs_csm));
     VkPipelineShaderStageCreateInfo stages[3]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
                                               {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
                                               {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
@@ -541,9 +575,18 @@ int main(int argc, char** argv) {
         vin.pVertexBindingDescriptions = &vbind;
         vin.vertexAttributeDescriptionCount = vertex_attr_count;
         vin.pVertexAttributeDescriptions = vattr;
+    } else if (gs_compute) {   // the captured vertices: one vec4 attribute per output slot, location = slot
+        vbind.stride = gs_lay[3] * 16;
+        for (uint32_t i = 0; i < gs_lay[3]; ++i) vattr[i] = {i, 0, VK_FORMAT_R32G32B32A32_SFLOAT, i * 16};
+        vin.vertexBindingDescriptionCount = 1;
+        vin.pVertexBindingDescriptions = &vbind;
+        vin.vertexAttributeDescriptionCount = gs_lay[3];
+        vin.pVertexAttributeDescriptions = vattr;
     }
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    ia.topology = !gs_compute ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+                  : gs_lay[4] == 2 ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+                  : gs_lay[4] == 1 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
     VkViewport vp{0, 0, float(W), float(H), 0, 1}; VkRect2D sc{{0, 0}, {W, H}};
     VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     vps.viewportCount = 1; vps.pViewports = &vp; vps.scissorCount = 1; vps.pScissors = &sc;
@@ -599,6 +642,37 @@ int main(int argc, char** argv) {
         cpi.layout = pl;
         LOADD(vkCreateComputePipelines);
         CHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &cpipe));
+    }
+    // VKH_GS_COMPUTE: set 1 holds the input, record and meta buffers (bindings 0..2) of both compute passes; set 0 is
+    // left empty for the shaders' own resources, which these tests don't bind.
+    VkPipelineLayout gs_pl = VK_NULL_HANDLE;
+    VkPipeline gs_vs_pipe = VK_NULL_HANDLE, gs_pipe = VK_NULL_HANDLE;
+    VkDescriptorSetLayout gs_dsl[2]{};
+    if (gs_compute) {
+        LOADD(vkCreateDescriptorSetLayout); LOADD(vkCreateComputePipelines);
+        VkDescriptorSetLayoutCreateInfo empty{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        CHECK(vkCreateDescriptorSetLayout(dev, &empty, nullptr, &gs_dsl[0]));
+        VkDescriptorSetLayoutBinding b[3]{};
+        for (uint32_t i = 0; i < 3; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT};
+        VkDescriptorSetLayoutCreateInfo set1{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        set1.bindingCount = 3; set1.pBindings = b;
+        CHECK(vkCreateDescriptorSetLayout(dev, &set1, nullptr, &gs_dsl[1]));
+        VkPushConstantRange gs_pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, pc_bytes};
+        VkPipelineLayoutCreateInfo gpli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        gpli.setLayoutCount = 2; gpli.pSetLayouts = gs_dsl;
+        gpli.pushConstantRangeCount = 1; gpli.pPushConstantRanges = &gs_pcr;
+        CHECK(vkCreatePipelineLayout(dev, &gpli, nullptr, &gs_pl));
+        VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; cpi.stage.module = csm; cpi.stage.pName = "main";
+        cpi.layout = gs_pl;
+        CHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &gs_vs_pipe));
+        cpi.stage.module = gs_csm;
+        // VKH_SUBGROUP_SIZE goes to the geometry shader under test, now a compute stage.
+        if (req_sg > 0 && f13q.subgroupSizeControl && req_sg >= sgProps.minSubgroupSize &&
+            req_sg <= sgProps.maxSubgroupSize && (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT))
+            cpi.stage.pNext = &reqSg;
+        CHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &gs_pipe));
     }
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = VkDeviceSize(W) * H * 16; bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -695,6 +769,96 @@ int main(int argc, char** argv) {
     VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     cai.commandPool = pool; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
     VkCommandBuffer cmd; CHECK(vkAllocateCommandBuffers(dev, &cai, &cmd));
+    // VKH_GS_COMPUTE: the vertex shader and the geometry shader as compute, in a submission of their own; then the
+    // emitted strips are read back and become the vertex buffer of a list draw.
+    const char* vertices_env = std::getenv("VKH_VERTICES");
+    std::vector<float> gs_vertices;
+    VkBuffer gs_vbo = VK_NULL_HANDLE;
+    if (gs_compute) {
+        LOADD(vkCreateDescriptorPool); LOADD(vkAllocateDescriptorSets); LOADD(vkUpdateDescriptorSets);
+        LOADD(vkCmdBindDescriptorSets); LOADD(vkCmdDispatch); LOADD(vkCmdPipelineBarrier);
+        const uint32_t draw_vertices = vertices_env ? uint32_t(std::strtoul(vertices_env, nullptr, 10)) : 3;
+        const uint32_t prims = draw_vertices / gs_lay[0];
+        const VkDeviceSize sizes[3] = {16 + VkDeviceSize(prims) * gs_lay[0] * gs_lay[2] * 16,
+                                       VkDeviceSize(prims) * gs_lay[1] * gs_lay[3] * 16 + 16,
+                                       VkDeviceSize(prims) * (gs_lay[1] + 1) * 4 + 16};
+        VkBuffer gbuf[3];
+        void* gmap[3];
+        for (int i = 0; i < 3; ++i) {
+            VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            ci.size = sizes[i]; ci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+            CHECK(vkCreateBuffer(dev, &ci, nullptr, &gbuf[i]));
+            VkMemoryRequirements rq; vkGetBufferMemoryRequirements(dev, gbuf[i], &rq);
+            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            ai.allocationSize = rq.size;
+            ai.memoryTypeIndex = memtype(rq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            VkDeviceMemory m; CHECK(vkAllocateMemory(dev, &ai, nullptr, &m));
+            CHECK(vkBindBufferMemory(dev, gbuf[i], m, 0));
+            CHECK(vkMapMemory(dev, m, 0, sizes[i], 0, &gmap[i]));
+            std::memset(gmap[i], 0, size_t(sizes[i]));
+        }
+        std::memcpy(gmap[0], &prims, 4);   // primitive_count; the vertices follow at byte 16
+        VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
+        VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        dpi.maxSets = 1; dpi.poolSizeCount = 1; dpi.pPoolSizes = &ps;
+        VkDescriptorPool dpool; CHECK(vkCreateDescriptorPool(dev, &dpi, nullptr, &dpool));
+        VkDescriptorSetAllocateInfo dsa{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        dsa.descriptorPool = dpool; dsa.descriptorSetCount = 1; dsa.pSetLayouts = &gs_dsl[1];
+        VkDescriptorSet set1; CHECK(vkAllocateDescriptorSets(dev, &dsa, &set1));
+        VkDescriptorBufferInfo dbi[3];
+        VkWriteDescriptorSet wds[3];
+        for (uint32_t i = 0; i < 3; ++i) {
+            dbi[i] = {gbuf[i], 0, VK_WHOLE_SIZE};
+            wds[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            wds[i].dstSet = set1; wds[i].dstBinding = i; wds[i].descriptorCount = 1;
+            wds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wds[i].pBufferInfo = &dbi[i];
+        }
+        vkUpdateDescriptorSets(dev, 3, wds, 0, nullptr);
+        VkCommandBuffer gcmd; CHECK(vkAllocateCommandBuffers(dev, &cai, &gcmd));
+        VkCommandBufferBeginInfo gbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        CHECK(vkBeginCommandBuffer(gcmd, &gbi));
+        auto gpush = reinterpret_cast<PFN_vkCmdPushConstants>(vkGetDeviceProcAddr(dev, "vkCmdPushConstants"));
+        vkCmdBindDescriptorSets(gcmd, VK_PIPELINE_BIND_POINT_COMPUTE, gs_pl, 1, 1, &set1, 0, nullptr);
+        gpush(gcmd, gs_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, pc_bytes, pc);
+        vkCmdBindPipeline(gcmd, VK_PIPELINE_BIND_POINT_COMPUTE, gs_vs_pipe);
+        vkCmdDispatch(gcmd, (prims * gs_lay[0] + 63) / 64, 1, 1);
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(gcmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                             1, &mb, 0, nullptr, 0, nullptr);
+        vkCmdBindPipeline(gcmd, VK_PIPELINE_BIND_POINT_COMPUTE, gs_pipe);
+        vkCmdDispatch(gcmd, (prims + 63) / 64, 1, 1);
+        mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(gcmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                             1, &mb, 0, nullptr, 0, nullptr);
+        CHECK(vkEndCommandBuffer(gcmd));
+        VkSubmitInfo gsi{VK_STRUCTURE_TYPE_SUBMIT_INFO}; gsi.commandBufferCount = 1; gsi.pCommandBuffers = &gcmd;
+        CHECK(vkQueueSubmit(q, 1, &gsi, VK_NULL_HANDLE));
+        CHECK(vkQueueWaitIdle(q));
+        if (!leonida::vk_test::gs_strips_to_list(static_cast<const uint32_t*>(gmap[2]),
+                                                 static_cast<const float*>(gmap[1]), prims, gs_lay[1], gs_lay[3],
+                                                 gs_lay[4], gs_vertices)) {
+            std::fprintf(stderr, "gs compute: a primitive emitted more than %u vertices\n", gs_lay[1]);
+            return 1;
+        }
+        std::fprintf(stderr, "gs compute: %u primitives in, %zu vertices out\n", prims,
+                     gs_vertices.size() / (gs_lay[3] * 4));
+        if (!gs_vertices.empty()) {
+            VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            ci.size = gs_vertices.size() * 4; ci.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+            CHECK(vkCreateBuffer(dev, &ci, nullptr, &gs_vbo));
+            VkMemoryRequirements rq; vkGetBufferMemoryRequirements(dev, gs_vbo, &rq);
+            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            ai.allocationSize = rq.size;
+            ai.memoryTypeIndex = memtype(rq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            VkDeviceMemory m; CHECK(vkAllocateMemory(dev, &ai, nullptr, &m));
+            CHECK(vkBindBufferMemory(dev, gs_vbo, m, 0));
+            void* vp_map; CHECK(vkMapMemory(dev, m, 0, ci.size, 0, &vp_map));
+            std::memcpy(vp_map, gs_vertices.data(), size_t(ci.size));
+        }
+    }
     VkCommandBufferBeginInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     CHECK(vkBeginCommandBuffer(cmd, &cbi));
     VkClearValue clears[2]{};
@@ -738,8 +902,13 @@ int main(int argc, char** argv) {
                                 1, &offset);
     }
     // VKH_VERTICES=<n>: draw n vertices instead of one triangle, so a vertex shader fills whole waves (TEST-251).
-    const char* vertices_env = std::getenv("VKH_VERTICES");
-    if (draw_mesh_path) {
+    if (gs_compute) {
+        if (gs_vbo) {
+            VkDeviceSize offset = 0;
+            vkCmdBindVertexBuffers(cmd, 0, 1, &gs_vbo, &offset);
+            vkCmdDraw(cmd, uint32_t(gs_vertices.size() / (gs_lay[3] * 4)), 1, 0, 0);
+        }
+    } else if (draw_mesh_path) {
         VkDeviceSize offset = 0;
         vkCmdBindVertexBuffers(cmd, 0, 1, &vbo, &offset);
         vkCmdBindIndexBuffer(cmd, ibo, 0, VK_INDEX_TYPE_UINT32);

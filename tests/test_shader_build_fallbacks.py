@@ -45,11 +45,12 @@ class BuildUnderFallbackTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.out = Path(tmp.name) / "out"
         self.asked = []
+        self.device = {}   # tools/vk_subgroup_info.py's answer: none, so only the variables turn a fallback on
 
     def fake_translate(self, work, names):
         """What rdna2spirv.py leaves in <work>/spirv: a module and an index entry per shader it validated."""
         self.asked.append(list(names))
-        fallback = any(os.environ.get(v) == "1" for v in FALLBACKS)
+        fallback = any(os.environ.get(v) == "1" for v in FALLBACKS) or self.device.get("per_vertex_inputs") is False
         spirv = Path(work) / "spirv"
         spirv.mkdir(parents=True)
         index = {}
@@ -70,6 +71,7 @@ class BuildUnderFallbackTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {**clean, **env}, clear=True), \
                 mock.patch.dict(sys.modules, stubs), \
                 mock.patch.object(self.build, "translate_tests", self.fake_translate), \
+                mock.patch.object(self.build.fallbacks, "device", return_value=self.device), \
                 mock.patch.object(sys, "argv", ["build.py", str(self.out), *names]), \
                 contextlib.redirect_stdout(stdout):
             try:
@@ -104,6 +106,18 @@ class BuildUnderFallbackTest(unittest.TestCase):
         self.assertEqual(status, 0, printed)
         self.assertEqual(self.asked, [["cs_store", "ps_ij_computed"]])
         self.assertTrue((self.out / "spirv" / "ps_ij_computed.spv").is_file())
+
+    def test_a_device_without_per_vertex_inputs_turns_the_f16_fallback_on(self):
+        # MoltenVK: build.py takes --f16-interp-fallback by itself, as check.py and run_gpu_tests.py do
+        self.device = {"per_vertex_inputs": False}
+        status, printed = self.run_build(["cs_store", "ps_ij_computed"], {})
+        self.assertEqual(status, 0, printed)
+        self.assertEqual(self.asked, [["cs_store"]])
+        self.assertIn("--f16-interp-fallback (no PerVertexKHR inputs", printed)
+        self.fresh()
+        self.device = {"per_vertex_inputs": False}
+        status, printed = self.run_build(["cs_store", "ps_ij_computed"], {"LEONIDA_F16_INTERP_FALLBACK": "0"})
+        self.assertEqual(self.asked, [["cs_store", "ps_ij_computed"]])   # =0 keeps it off on that device
 
     def test_a_missing_module_without_a_fallback_still_fails_the_batch(self):
         keep = self.fake_translate

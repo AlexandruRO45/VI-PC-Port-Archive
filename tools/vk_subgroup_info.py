@@ -33,6 +33,11 @@ false, the shaders are translated with --f16-interp-fallback.
 max_push_constants_size is VkPhysicalDeviceProperties.limits.maxPushConstantsSize in bytes. The default shader
 contract uses 144 bytes (152 with --mesh-compute); where a device reports less (e.g. 128 on AMD's Windows driver for
 RDNA2 iGPUs and some Intel Arc drivers), make_game.py translates with --pc-tail-ubo.
+
+mesh_shader and geometry_shader are the meshShader feature of VK_EXT_mesh_shader and VkPhysicalDeviceFeatures'
+geometryShader. Where they are false (MoltenVK and KosmicKrisp have neither), the GPU tests run the mesh shaders as
+compute (--mesh-compute) and the geometry shaders as a compute capture pass (tools/spirv_gs_to_compute.py); see
+runtime/test/shaders/fallbacks.py. A driver that doesn't know the mesh feature struct leaves it zero: false.
 """
 import ctypes
 import json
@@ -49,6 +54,7 @@ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES = 53
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES = 1000225000
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES = 1000196000
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR = 1000203000
+VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT = 1000328000
 VK_DRIVER_ID_MOLTENVK = 14
 VK_DRIVER_ID_AMD_PROPRIETARY = 1
 AMD_VENDOR_ID = 0x1002
@@ -62,6 +68,9 @@ RDNA2_DEVICE_IDS = ((0x73A0, 0x73FF), (0x7420, 0x743F), (0x163F, 0x163F), (0x143
                     (0x1506, 0x1506), (0x164E, 0x164E), (0x13C0, 0x13C0))
 DRIVER_PROPS_SIZE = 536     # sizeof(VkPhysicalDeviceDriverProperties): 16 + driverID + 2 x char[256] + version, padded
 BARY_FEATURES_SIZE = 24     # sizeof(VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR): 16 + one VkBool32
+MESH_FEATURES_SIZE = 40     # sizeof(VkPhysicalDeviceMeshShaderFeaturesEXT): 16 + 5 VkBool32, padded to 8
+MESH_FEATURES_MESH_SHADER = 16 + 4 * 1   # taskShader, then meshShader
+F2_GEOMETRY_SHADER = 16 + 4 * 4   # VkPhysicalDeviceFeatures in VkPhysicalDeviceFeatures2: the fifth VkBool32
 VK_SHADER_STAGE_COMPUTE_BIT = 0x20
 VK_SHADER_STAGE_MESH_BIT_EXT = 0x80
 VK_QUEUE_GRAPHICS_BIT = 1
@@ -228,6 +237,8 @@ def query() -> dict:
             set_next(f12, f13)
             bary = block(BARY_FEATURES_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR)
             set_next(f13, bary)
+            meshf = block(MESH_FEATURES_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT)
+            set_next(bary, meshf)
             f2 = block(FEATURES2_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)
             set_next(f2, f12)
             vk.vkGetPhysicalDeviceFeatures2(d, f2)
@@ -253,7 +264,8 @@ def query() -> dict:
                           bool(u32(bary, 16)) and u32(drv, 16) != VK_DRIVER_ID_MOLTENVK,
                           int.from_bytes(raw[PROPS_MAX_PUSH_CONSTANTS_SIZE:PROPS_MAX_PUSH_CONSTANTS_SIZE + 4], "little"),
                           int.from_bytes(raw[PROPS_VENDOR_ID:PROPS_VENDOR_ID + 4], "little"),
-                          int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16))
+                          int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16),
+                          bool(u32(meshf, MESH_FEATURES_MESH_SHADER)), bool(u32(f2, F2_GEOMETRY_SHADER)))
         if chosen is None:
             if device_filter:
                 raise RuntimeError(
@@ -262,7 +274,8 @@ def query() -> dict:
                 )
             raise RuntimeError("no Vulkan 1.3 GPU with the features and graphics queue the runtime needs")
         (name, subgroup_size, supported_stages, lo, hi, required_stages, sgc, per_vertex,
-         max_push_constants_size, vendor, device, driver) = chosen
+         max_push_constants_size, vendor, device, driver,
+         mesh_shader, geometry_shader) = chosen
         compute_required = bool(required_stages & VK_SHADER_STAGE_COMPUTE_BIT)
         mesh_required = bool(required_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
         compute_supported = bool(supported_stages & VK_SHADER_STAGE_COMPUTE_BIT)
@@ -291,6 +304,8 @@ def query() -> dict:
             "rdna1_amd_windows": (vendor == AMD_VENDOR_ID and driver == VK_DRIVER_ID_AMD_PROPRIETARY
                                   and device in RDNA1_DEVICE_IDS),
             "rdna2_amd_windows": rdna2_amd_windows(vendor, device, driver),
+            "mesh_shader": mesh_shader,
+            "geometry_shader": geometry_shader,
         }
     finally:
         vk.vkDestroyInstance(inst, None)

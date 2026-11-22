@@ -907,6 +907,11 @@ if(TARGET Vulkan::Headers)
   if(BUILD_TESTING)
     add_test(NAME vk_device_pick COMMAND vk_device_pick_test)
   endif()
+  # CPU-only: the list vk_harness draws from a geometry shader's compute capture pass (VKH_GS_COMPUTE). No GPU needed.
+  add_executable(vk_gs_strips_test test/vk_gs_strips_test.cpp)
+  if(BUILD_TESTING)
+    add_test(NAME vk_gs_strips COMMAND vk_gs_strips_test)
+  endif()
   # Committed BC* texture zero-initialization via vk.zero_buffer or vk.copy_scratch (D3D-220).
   add_executable(vk_bc_zero_init_test test/vk_bc_zero_init_test.cpp)
   target_link_libraries(vk_bc_zero_init_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})

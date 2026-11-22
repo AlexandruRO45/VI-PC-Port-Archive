@@ -3,6 +3,7 @@ import ast
 import contextlib
 import io
 import json
+import os
 import re
 import struct
 from pathlib import Path
@@ -159,7 +160,12 @@ class Wave64Checks(unittest.TestCase):
             with (patch.object(sys, "argv", ["check.py", tmp]), patch.object(check, "run", side_effect=harness),
                   patch.object(check, "clip_test", return_value=""),
                   patch.object(check, "pixel_test", return_value=""), patch.object(check, "texture_mip_test", return_value=""),
-                  patch.object(check, "bindless_test", return_value=""), patch.object(check, "W64_EMULATED", emulated),
+                  patch.object(check, "bindless_test", return_value=""),
+                  # check.main() takes LEONIDA_W64_EMULATE as build.py does; the device isn't asked here
+                  patch.dict(os.environ, {"LEONIDA_W64_EMULATE": "1" if emulated else "0"}),
+                  patch.object(check.fallbacks, "device", return_value={}),
+                  patch.object(check, "W64_EMULATED", emulated), patch.object(check, "F16_HALVES", False),
+                  patch.object(check, "MESH_COMPUTE", False),
                   patch.object(check, "texture_gradient_a16_test", return_value=""),
                   patch.object(check, "texture_constant_test", return_value=""),
                   patch.object(check, "base_ids_test", return_value=""),

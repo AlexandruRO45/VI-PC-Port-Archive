@@ -36,7 +36,10 @@ from check import judged_words, words_match   # dump words not judged on some de
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
 from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
-from check import MESH_COMPUTE, mesh_env   # LEONIDA_MESH_COMPUTE=1: mesh shaders as compute + a generated VS
+from check import mesh_env   # VKH_MESH, or the --mesh-compute pass and its generated VS
+import check  # noqa: E402
+import fallbacks  # noqa: E402  which exact fallbacks this device needs (LEONIDA_* = 1/0 force them)
+MESH_COMPUTE = check.MESH_COMPUTE   # --mesh-compute: run_suite sets it, from the device or LEONIDA_MESH_COMPUTE
 from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip, narrow_subgroup_skip,
                    unpinned_subgroup_skip, vcmpx_forms_narrow_skip, wave32_lane_skip)   # as in check.py
 from check import PIXEL_VERTEX, interp_f16_high_problem, ij_computed_problem, mandelbrot_problem   # pixel producers and checks
@@ -261,48 +264,36 @@ def bary_fallback() -> bool:
 
 
 def f16_interp_fallback() -> bool:
-    """LEONIDA_F16_INTERP_FALLBACK=1 (or 0): translate with --f16-interp-fallback, so ps_interp_f16_high reads the f16
-    halves its producer exports decoded instead of PerVertexKHR inputs. Unset, it is on where the device can't
-    compile PerVertexKHR: tools/vk_subgroup_info.py reports per_vertex_inputs false (MoltenVK)."""
-    v = (os.environ.get("LEONIDA_F16_INTERP_FALLBACK") or "").strip().lower()
-    if v in ("1", "true", "yes", "on"):
-        return True
-    if v in ("0", "false", "no", "off"):
-        return False
-    return _device_per_vertex() is False
-
-
-_PER_VERTEX = []
-
-
-def _device_per_vertex():
-    """per_vertex_inputs from tools/vk_subgroup_info.py for the device the tests run on (cached), or None."""
-    if not _PER_VERTEX:
-        answer = None
-        try:
-            r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "vk_subgroup_info.py")],
-                               capture_output=True, text=True, timeout=60)
-            answer = json.loads(r.stdout.strip().splitlines()[-1]).get("per_vertex_inputs")
-        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
-            pass
-        _PER_VERTEX.append(answer)
-    return _PER_VERTEX[0]
+    """--f16-interp-fallback: ps_interp_f16_high reads the f16 halves its producer exports decoded instead of
+    PerVertexKHR inputs. On where the device can't compile PerVertexKHR (tools/vk_subgroup_info.py's per_vertex_inputs:
+    MoltenVK, and devices without barycentrics); LEONIDA_F16_INTERP_FALLBACK=1 or 0 forces it (fallbacks.py)."""
+    return fallbacks.enabled("f16_interp")
 
 
 def w64_emulated() -> bool:
-    # Wave64 emulation on: the suite runs every wave64 check without asking for a 64-wide
-    # subgroup, matching check.py (W64_EMULATED). Accepts "1"/"true"/"yes"/"on" and tolerates
-    # the trailing space cmd.exe's `set VAR=1 &` leaves in the value.
-    return (os.environ.get("LEONIDA_W64_EMULATE") or "").strip().lower() in ("1", "true", "yes", "on")
+    """--wave64-emulate: the suite runs every wave64 check without asking for a 64-wide subgroup, matching check.py
+    (W64_EMULATED). On where the compute stage has no 64-wide subgroup (Apple, NVIDIA, Intel, llvmpipe);
+    LEONIDA_W64_EMULATE=1 or 0 forces it, "1 " (cmd.exe's `set VAR=1 &`) included (fallbacks.py)."""
+    return fallbacks.enabled("w64_emulate")
+
+
+def gs_compute() -> bool:
+    """gs_tri's geometry shader as a compute capture pass (tools/spirv_gs_to_compute.py, vk_harness VKH_GS_COMPUTE)
+    where the device has no geometryShader (MoltenVK, KosmicKrisp); LEONIDA_GS_COMPUTE=1 or 0 forces it."""
+    return fallbacks.enabled("gs_compute")
+
+
 def pc_tail_ubo() -> bool:
     # LEONIDA_PC_TAIL_UBO=1: translate with --pc-tail-ubo (s0..s31 in 128 push-constant bytes, the tail in a uniform
     # block at set 1), for devices whose maxPushConstantsSize is 128. The test programs read the same variable
     # (runtime/test/vk_pc_tail.h) and bind the block; same accepted values as LEONIDA_W64_EMULATE.
     return (os.environ.get("LEONIDA_PC_TAIL_UBO") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def wavemask_check(vk_compute: str, spv: str, env: dict | None, emulated: bool) -> tuple[bool | None, str]:
     """cs_wavemask, as in check.py: (passed, detail), passed None for a skip. The native build needs a 64-wide
-    subgroup and skips where the device has none; with LEONIDA_W64_EMULATE=1 it was translated with
-    --wave64-emulate and runs on any subgroup size, so it asks for none."""
+    subgroup and skips where the device has none; under --wave64-emulate (w64_emulated()) it runs on any subgroup
+    size, so it asks for none."""
     cmd = [vk_compute, spv, "1", "wavemask"] + ([] if emulated else ["--require-wave64"])
     rc, msg = run_cmd(cmd, env=env)
     if not emulated and rc == 77:
@@ -675,6 +666,11 @@ W64_GRAPHICS_ONLY = _w64_graphics_only()
 
 
 def run_suite(a, work: str) -> int:
+    global MESH_COMPUTE
+    # Each fallback is on where the device lacks the native feature, unless its LEONIDA_* variable forces it.
+    MESH_COMPUTE = check.MESH_COMPUTE = fallbacks.enabled("mesh_compute")
+    if chosen := fallbacks.describe():
+        print(chosen)
     asm_files = sorted({f for f in os.listdir(SHADER_DIR) if f.endswith(".asm")} | {n + ".asm" for n in CLIP_CASES})
     # The wave64 pixel fixtures of runtime/test/shaders/w64_graphics.py (tiers A-C, #1541) are checked by that
     # runner, not here: they need a 64-wide fragment subgroup or the halves-aware lowering it drives.
@@ -733,7 +729,7 @@ def run_suite(a, work: str) -> int:
         for path in disasm_files:
             shutil.copyfile(path, os.path.join(selected_disasm, os.path.basename(path)))
         cmd = [sys.executable, "-I", TRANSLATOR, selected_disasm, "--out", spirv_dir]
-        if w64_emulated():   # wave64 compute/mesh exact on any subgroup size
+        if w64_emulated():   # wave64 compute/mesh exact on any subgroup size (no 64-wide compute subgroup)
             cmd.append("--wave64-emulate")
         if bary_fallback():   # raw barycentrics from an interpolated input, fed by a pass-through GS
             cmd.append("--bary-fallback")
@@ -741,7 +737,7 @@ def run_suite(a, work: str) -> int:
             cmd.append("--f16-interp-fallback")
         if TEXOFF_FALLBACK:   # image_sample*_o: offset folded into the coordinate, no VK_KHR_maintenance8
             cmd.append("--texel-offset-fallback")
-        if MESH_COMPUTE:   # mesh shaders as compute writing to a buffer, drawn by tools/mesh_compute_vs.py
+        if MESH_COMPUTE:   # mesh shaders as compute writing to a buffer, drawn by tools/mesh_compute_vs.py (no mesh)
             cmd.append("--mesh-compute")
         if pc_tail_ubo():   # 128 push-constant bytes; heap base and code base from a uniform block at set 1
             cmd.append("--pc-tail-ubo")
@@ -769,6 +765,15 @@ def run_suite(a, work: str) -> int:
     spirv_as(VS_TRI_SPVASM, vs_tri)
     spirv_as(make_fs_passthru(0), fs_passthru)
     spirv_as(make_fs_passthru(1), fs_loc1)
+    gs_lowered = {}
+    if gs_compute() and os.path.isfile(os.path.join(spirv_dir, "gs_tri.spv")):
+        # No geometry stage: gs_tri's GS becomes a compute capture pass, vs_tri the compute pass that feeds it, and a
+        # generated vertex shader draws what it emitted (tools/spirv_gs_to_compute.py; vk_harness VKH_GS_COMPUTE).
+        base = os.path.join(spirv_dir, "gs_tri")
+        rc, out = run_cmd([sys.executable, "-I", os.path.join(ROOT, "tools", "spirv_gs_to_compute.py"),
+                           base + ".spv", base + ".gs_cs.spv", "--layout", base + ".gs_layout.json",
+                           "--vs", vs_tri, base + ".vs_cs.spv", "--draw-vs", base + ".draw_vs.spv"], gpu=False)
+        gs_lowered["gs_tri"] = (rc, out)
 
     index = {}
     idx_path = os.path.join(spirv_dir, "index.json")
@@ -917,7 +922,7 @@ def run_suite(a, work: str) -> int:
                             else f"{len(wrong)}/{n} inputs wrong, first {wrong[0]}"))
         elif name == "cs_wavemask":
             # Whole-wave mask test, as in check.py: needs a 64-wide subgroup, skipped where the device has none.
-            # With LEONIDA_W64_EMULATE=1 it was translated with --wave64-emulate and runs on any subgroup size.
+            # Under --wave64-emulate (on where there is no 64-wide subgroup) it runs on any subgroup size.
             results.append((name,) + wavemask_check(vk_compute, spv, cs_env, w64_emulated()))
         elif name in ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_w32_sincos", "cs_exec_const", "cs_w32_mask_imm", "cs_w64_mask_imm", "cs_w32_lds_u8_d16", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
                       "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8", "cs_dpp_ops", "cs_dpp_bank", "cs_dpp_fi",
@@ -1251,8 +1256,22 @@ def run_suite(a, work: str) -> int:
             results.append((name, ok, detail))
         elif name == "gs_tri":
             raw = os.path.join(raw_dir, f"{name}.raw")
-            env = dict(gfx_env or os.environ, VKH_GS=spv)
-            rc, msg = run_cmd([vk_harness, vs_tri, fs_loc1, raw], env=env)
+            if name in gs_lowered:   # no geometry stage: the vertex and geometry shaders as compute, then a list draw
+                rc, out = gs_lowered[name]
+                if rc != 0:
+                    results.append((name, False, "spirv_gs_to_compute: " + out))
+                    continue
+                with open(os.path.join(spirv_dir, f"{name}.gs_layout.json"), encoding="utf-8") as source:
+                    lay = json.load(source)
+                topology = {"points": 0, "line_strip": 1, "triangle_strip": 2}[lay["topology"]]
+                base = os.path.join(spirv_dir, name)
+                env = dict(gfx_env or os.environ, VKH_GS_COMPUTE=base + ".gs_cs.spv", VKH_GS_DRAW=base + ".draw_vs.spv",
+                           VKH_GS_LAYOUT=f"{lay['verts_in']},{lay['max_verts']},{len(lay['inputs'])},"
+                                         f"{len(lay['outputs'])},{topology}")
+                rc, msg = run_cmd([vk_harness, base + ".vs_cs.spv", fs_loc1, raw], env=env)
+            else:
+                env = dict(gfx_env or os.environ, VKH_GS=spv)
+                rc, msg = run_cmd([vk_harness, vs_tri, fs_loc1, raw], env=env)
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
             elif rc != 0:

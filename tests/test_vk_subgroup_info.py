@@ -69,6 +69,8 @@ class FakeDevice:
     )
     fragment_shader_barycentric: bool = True
     max_push_constants_size: int = 256
+    mesh_shader: bool = True
+    geometry_shader: bool = True
     driver_id: int = 1      # VK_DRIVER_ID_AMD_PROPRIETARY
     vendor_id: int = 0
     device_id: int = 0
@@ -227,6 +229,10 @@ class FakeVulkan:
                 ).value = int(dev.dynamic_rendering)
             elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR:
                 ctypes.c_uint32.from_address(node_addr + 16).value = int(dev.fragment_shader_barycentric)
+            elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT:
+                ctypes.c_uint32.from_address(node_addr + vk_info.MESH_FEATURES_MESH_SHADER).value = int(dev.mesh_shader)
+            elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2:
+                ctypes.c_uint32.from_address(node_addr + vk_info.F2_GEOMETRY_SHADER).value = int(dev.geometry_shader)
         expected = {
             vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
             vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
@@ -328,6 +334,7 @@ class ConstantsAndLayoutTest(unittest.TestCase):
         self.assertEqual(vk_info.F12_SIZE, 208)
         self.assertEqual(vk_info.F13_SIZE, 80)
         self.assertEqual(vk_info.BARY_FEATURES_SIZE, 24)
+        self.assertEqual(vk_info.MESH_FEATURES_SIZE, 40)
         self.assertEqual(vk_info.DRIVER_PROPS_SIZE, 536)
         self.assertEqual(vk_info.QUEUE_FAMILY_SIZE, 24)
 
@@ -755,6 +762,8 @@ class QueryTest(unittest.TestCase):
                     "driver_id": 1,
                     "rdna1_amd_windows": False,
                     "rdna2_amd_windows": False,
+                    "mesh_shader": True,
+                    "geometry_shader": True,
                 })
 
     def test_max_push_constants_size(self):
@@ -771,6 +780,15 @@ class QueryTest(unittest.TestCase):
             with self.subTest(case=label):
                 res, _vk = self._run_query(FakeDevice(fragment_shader_barycentric=bary, driver_id=driver))
                 self.assertIs(res["per_vertex_inputs"], want)
+
+    def test_mesh_and_geometry_shader_features(self):
+        """meshShader (VK_EXT_mesh_shader) and geometryShader, which decide the GPU tests' compute fallbacks."""
+        for mesh in (True, False):
+            for geometry in (True, False):
+                with self.subTest(mesh=mesh, geometry=geometry):
+                    res, _vk = self._run_query(FakeDevice(mesh_shader=mesh, geometry_shader=geometry))
+                    self.assertIs(res["mesh_shader"], mesh)
+                    self.assertIs(res["geometry_shader"], geometry)
 
     def test_rdna2_amd_windows(self):
         """#857: RDNA2 by PCI device ID, and only under AMD's proprietary driver (RADV takes the same modules)."""
