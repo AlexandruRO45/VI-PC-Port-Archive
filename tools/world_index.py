@@ -433,6 +433,9 @@ def main(argv=None):
     except ValueError as e:                 # a --start outside an archive's data area; nothing is written
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
+    except OSError as e:                    # a missing input or an unreadable file; nothing is written
+        print(f"ERROR: cannot read {e.filename or a.path}: {e.strerror or e}", file=sys.stderr)
+        return 2
     summary = dict(stats)
     summary["resources"] = len(rows)
     summary["maps"] = sum(1 for r in rows if r["kind"] == "map")

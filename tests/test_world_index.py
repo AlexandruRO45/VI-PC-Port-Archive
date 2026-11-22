@@ -201,6 +201,19 @@ class WorldIndexTest(unittest.TestCase):
                 self.assertIn("outside the data area", err.getvalue())
         self.assertFalse(os.path.exists(out))
 
+    def test_missing_input_reports_an_error_and_writes_nothing(self):
+        # A missing path is a usage error, not a FileNotFoundError traceback out of scan_path.
+        missing = os.path.join(self.dir, "definitely_missing_path")
+        out = os.path.join(self.dir, "out.json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(WI.main([missing, "--out", out]), 2)
+        message = err.getvalue()
+        self.assertIn("ERROR: cannot read", message)
+        self.assertIn("definitely_missing_path", message)
+        self.assertNotIn("Traceback", message)
+        self.assertFalse(os.path.exists(out), "a rejected input writes no report")
+
     def test_rpf_scan_survives_a_damaged_candidate_continuation(self):
         blob = make_resource()
         partial = blob[:0x150]
