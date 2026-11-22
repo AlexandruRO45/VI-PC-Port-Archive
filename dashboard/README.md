@@ -8,7 +8,9 @@ browser. An example running from a fork's GitHub Pages: https://clhelper.github.
 
 - **PR pipeline**: every open pull request as one dot in the column of its stage (draft, waiting for CI, CI running,
   CI failing, needs a rebase, CI green, ready), then `main` and the PRs merged in the last two hours. A dot moves when
-  its stage changes and flies into `main` when it is merged. Hover a dot for the PR, click to open it.
+  its stage changes and flies into `main` when it is merged. Hover a dot for the PR, click to open it. Too narrow for
+  every column (phones), the stages become rows with `main` as a lane across. `tests/test_dashboard_pipeline.cjs`
+  checks that every stage keeps room for its dots at any width.
 - **Merge queue**: open PRs by CI result, the bottleneck they point at, the oldest green and failing PRs, rebases by
   author and merge chains from the coordination issue.
 - **Triage**: items that open PRs from more than one author work on (possible duplicates), and with a token the next
@@ -44,8 +46,8 @@ shows less until the parser follows. Text from GitHub is shown with the game's t
 ## Rate limits
 
 Without a token GitHub allows 10 searches a minute and 60 other requests an hour per network, shared by everyone on
-it. A first visit fills in over a few minutes; a bar under the menu shows the requests made, each limit and its reset
-time, and what still loads, and sections that wait for a limit say so with a countdown. After that the page keeps
+it. A first visit fills in over a few minutes; a line in the top bar shows what still loads and, in short, the
+requests made and each limit (hover it for the reset times), and sections that wait for a limit say so with a countdown. After that the page keeps
 itself current from one search a minute while someone is looking, every 5 minutes when nobody touches it, and not at
 all in a hidden tab. An optional token with no scopes raises the limits and turns on the GraphQL sweep (about 11 of its 5,000 points an
 hour per sweep); it is kept in the browser's local storage

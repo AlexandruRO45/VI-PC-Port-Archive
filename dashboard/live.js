@@ -620,6 +620,15 @@ function rateLine(res, label, per) {
   return `<span class="${low ? 'low' : ''}">${label}: <b>${used}</b> of ${r.limit} used this ${per}, ${reset}</span>`;
 }
 
+/** "search 3/30": used of the limit; amber when low; the full line (with the reset time) is the bar's tooltip. */
+function rateShort(res, label) {
+  const r = rate[res];
+  if (!r) return `${label} –`;
+  if (r.reset <= Date.now()) return `${label} 0/${fmt(r.limit)}`;
+  const low = r.remaining <= (res === 'search' ? 1 : LOW_CORE);
+  return `<span class="${low ? 'low' : ''}">${label} <b>${fmt(r.limit - r.remaining)}</b>/${fmt(r.limit)}</span>`;
+}
+
 function renderParts() {
   const bar = $('#netbar');
   const keys = Object.keys(parts);
@@ -638,9 +647,12 @@ function renderParts() {
     status = `<span class="wait">⏳ Still loading: ${esc(list)}. GitHub allows ${esc(limitText(res))}, so the rest continues in <b>${mmss(next - Date.now())}</b>, by itself.</span>`;
   } else status = `<span class="busy">↻ Loading: ${esc(list)}…</span>`;
   const offer = !activeToken() && pending.length ? ' <button class="linkbtn" id="offerToken" type="button">Load faster with a free token</button>' : '';
+  // The bar shows a short summary; the full sentence is its tooltip.
+  const full = `GitHub requests ${activeToken() ? 'with your token' : 'without a token'} · this page made <b>${fmt(apiCalls)}</b> · ${rateLine('search', 'search', 'minute')} · ${rateLine('core', 'other', 'hour')}${rate.graphql ? ' · ' + rateLine('graphql', 'GraphQL', 'hour') : ''}${coreSpare() ? '' : ' · <span class="low">saving the hourly allowance: claims and commits wait</span>'} · ${attention() === 'active' ? 'updates every minute' : 'idle: updates every 5 minutes'}`;
+  const short = `${activeToken() ? 'token' : 'no token'} · <b>${fmt(apiCalls)}</b> calls · ${rateShort('search', 'search')} · ${rateShort('core', 'other')}${rate.graphql ? ' · ' + rateShort('graphql', 'GraphQL') : ''}${coreSpare() ? '' : ' · <span class="low">saving</span>'} · ${attention() === 'active' ? '1' : '5'} min`;
   const html = `<div class="wrap">
-      <div class="nb-status">${status}${offer}</div>
-      <div class="nb-rates">GitHub requests ${activeToken() ? 'with your token' : 'without a token'} · this page made <b>${fmt(apiCalls)}</b> · ${rateLine('search', 'search', 'minute')} · ${rateLine('core', 'other', 'hour')}${rate.graphql ? ' · ' + rateLine('graphql', 'GraphQL', 'hour') : ''}${coreSpare() ? '' : ' · <span class="low">saving the hourly allowance: claims and commits wait</span>'} · ${attention() === 'active' ? 'updates every minute' : 'idle: updates every 5 minutes'}</div>
+      <div class="nb-status" title="${esc(status.replace(/<[^>]+>/g, ''))}">${status}${offer}</div>
+      <div class="nb-rates" title="${esc(full.replace(/<[^>]+>/g, ''))}">${short}</div>
     </div>`;
   // This runs every second: writing the same HTML or text again would still make the browser lay out and repaint.
   if (html !== netbarHtml) {

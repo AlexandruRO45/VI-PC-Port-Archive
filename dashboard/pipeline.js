@@ -34,7 +34,6 @@ const PING_MS = 2400;
 const MERGE_STAGGER_MS = 160;
 const ROUND_MIN_SHOW = 5;
 const ROUND_HOLD_MS = 3500;
-const MIN_PIPE_WIDTH = 760;
 const RECENT_MERGED_MS = 2 * 60 * 60 * 1000;   // the Merged column behind main: the last two hours, about two rounds
 const MERGED_COL = { key: 'merged', label: 'Merged', color: '#c084fc', hint: 'last 2 hours' };
 const LAND_RENDER_MS = 250;                    // after a flight lands, redraw once (a round lands many at a time)
@@ -60,6 +59,7 @@ const pipe = {
   els: new Map(),       // n → the dot element
   mels: new Map(),      // n → a dot in the Merged column
   width: 0,
+  target: null,         // () → where a merged dot flies to in the main lane, for the current layout
   mergedRecently: [],   // timestamps of merges flown into main this session
   round: null,
   ready: false,         // drawn once; later changes animate
@@ -314,9 +314,24 @@ function stageCounts() {
 }
 
 /* ================= layout ================= */
-/** Column widths follow the number of dots (with a minimum), so the tallest column stays short. */
+/** Narrower than this, the columns can't all keep their minimum width: the stages become rows instead (phones,
+ *  narrow windows). */
+const COLS_MIN_WIDTH = COL_MIN_W * (PIPE_STAGES.length + 1) + MAIN_W + COL_GAP * (PIPE_STAGES.length + 1) + PAD;
+const ROW_HEAD_H = 24;
+const ROW_GAP = 6;
+const MAIN_H = 40;
+
+/** Where dot i of a column or row goes. */
+const dotAt = (col, i) => ({ x: col.dx + (i % col.perRow) * PITCH, y: col.dy + Math.floor(i / col.perRow) * PITCH });
+
 function pipeLayout(width, mergedCount) {
   const counts = stageCounts();
+  return width < COLS_MIN_WIDTH ? rowsLayout(width, counts, mergedCount) : colsLayout(width, counts, mergedCount);
+}
+
+/** Wide: one column per stage, widths following the number of dots so the tallest column stays short. No column
+ *  gets narrower than COL_MIN_W (taking the overflow from the big ones), so none ends up one dot wide. */
+function colsLayout(width, counts, mergedCount) {
   const total = Object.values(counts).reduce((a, b) => a + b, 0) + mergedCount || 1;
   const avail = width - MAIN_W - COL_GAP * (PIPE_STAGES.length + 1) - PAD;
   let widths = [...PIPE_STAGES.map(s => counts[s.key]), mergedCount].map(n => Math.max(COL_MIN_W, avail * n / total));
@@ -324,28 +339,55 @@ function pipeLayout(width, mergedCount) {
   if (over > 0) {
     const flexible = widths.map(w => w - COL_MIN_W);
     const room = flexible.reduce((a, b) => a + b, 0) || 1;
-    widths = widths.map((w, i) => w - over * flexible[i] / room);
+    widths = widths.map((w, i) => Math.max(COL_MIN_W, w - over * flexible[i] / room));
   }
   let x = PAD;
   const column = (s, i, n) => {
     const perRow = Math.max(1, Math.floor((widths[i] - 8) / PITCH));
-    const col = { ...s, x, w: widths[i], perRow, n, rows: Math.ceil(n / perRow) };
+    const col = { ...s, x, y: 0, w: widths[i], perRow, n, rows: Math.ceil(n / perRow), dx: x + 4, dy: HEAD_H };
     x += widths[i] + COL_GAP;
     return col;
   };
   const cols = PIPE_STAGES.map((s, i) => column(s, i, counts[s.key]));
-  const mainX = x;
-  x += MAIN_W + COL_GAP - COL_GAP;
+  const main = { x, y: 0, w: MAIN_W - 6 };
+  x += MAIN_W;
   const merged = column(MERGED_COL, PIPE_STAGES.length, mergedCount);
   const rows = Math.max(4, ...cols.map(c => c.rows), merged.rows);
-  return { cols, mainX, merged, height: HEAD_H + rows * PITCH + PAD * 2 };
+  const height = HEAD_H + rows * PITCH + PAD * 2;
+  for (const c of [...cols, merged]) c.h = height;
+  main.h = height;
+  // A merged PR flies to a random height in the main lane.
+  const target = () => ({ x: main.x + 24, y: 30 + Math.random() * Math.max(40, height - 60) });
+  return { orient: 'cols', width: Math.max(width, x - COL_GAP + PAD), cols, main, merged, height, target };
+}
+
+/** Narrow: one row per stage, top to bottom, dots wrapping over the full width; main is a lane across, with the
+ *  Merged row under it. */
+function rowsLayout(width, counts, mergedCount) {
+  const inner = width - PAD * 2;
+  const perRow = Math.max(1, Math.floor((inner - 8) / PITCH));
+  let y = PAD;
+  const row = (s, n) => {
+    const rows = Math.ceil(n / perRow);
+    const h = ROW_HEAD_H + Math.max(1, rows) * PITCH + 6;
+    const col = { ...s, x: PAD, y, w: inner, h, perRow, n, rows, dx: PAD + 4, dy: y + ROW_HEAD_H };
+    y += h + ROW_GAP;
+    return col;
+  };
+  const cols = PIPE_STAGES.map(s => row(s, counts[s.key]));
+  const main = { x: PAD, y, w: inner, h: MAIN_H };
+  y += MAIN_H + ROW_GAP;
+  const merged = row(MERGED_COL, mergedCount);
+  const height = y - ROW_GAP + PAD;
+  const target = () => ({ x: PAD + 20 + Math.random() * Math.max(20, inner - 60), y: main.y + MAIN_H - 14 });
+  return { orient: 'rows', width, cols, main, merged, height, target };
 }
 
 function positions(layout) {
   const pos = new Map();
   for (const col of layout.cols) {
     const inCol = [...pipe.prs.values()].filter(p => p.stage === col.key).sort((a, b) => Date.parse(a.created) - Date.parse(b.created));
-    inCol.forEach((p, i) => pos.set(p.n, { x: col.x + 4 + (i % col.perRow) * PITCH, y: HEAD_H + Math.floor(i / col.perRow) * PITCH }));
+    inCol.forEach((p, i) => pos.set(p.n, dotAt(col, i)));
   }
   return pos;
 }
@@ -392,27 +434,31 @@ function renderPipeline(changed = new Set()) {
     box.innerHTML = pendingHtml('pipeline');
     return;
   }
-  const width = Math.max(MIN_PIPE_WIDTH, box.clientWidth);
   const recentList = recentMerged(RECENT_MERGED_MS);
-  const layout = pipeLayout(width, recentList.length);
+  const layout = pipeLayout(box.clientWidth, recentList.length);
   const pos = positions(layout);
   const first = !pipe.ready;
   box.classList.toggle('instant', first);
+  box.classList.toggle('rows', layout.orient === 'rows');
   box.style.height = layout.height + 'px';
-  box.style.minWidth = MIN_PIPE_WIDTH + 'px';
+  box.style.minWidth = layout.orient === 'cols' ? layout.width + 'px' : '';
 
   // Column heads and bands, rebuilt each time (cheap); dots are kept so they can move.
   // The loading placeholder of a first visit goes too, or it stays behind the dots.
   box.querySelectorAll('.pcol, .pmain, .pipe-empty, .pending').forEach(el => el.remove());
+  const rect = r => `left:${r.x}px;top:${r.y}px;width:${r.w}px;height:${r.h}px`;
   const work = layout.cols.filter(c => c.work);
-  const heads = [...layout.cols, layout.merged].map(c => `<div class="pcol${c.work ? ' work' : ''}${c.key === 'merged' ? ' done' : ''}" style="left:${c.x}px;width:${c.w}px;--c:${c.color}">
+  const heads = [...layout.cols, layout.merged].map(c => `<div class="pcol${c.work ? ' work' : ''}${c.key === 'merged' ? ' done' : ''}" style="${rect(c)};--c:${c.color}">
       <b>${fmt(c.n)}</b><span class="nm">${esc(c.label)}</span><span class="hint">${esc(c.hint)}</span></div>`).join('');
-  const workBand = work.length ? `<div class="pcol band" style="left:${work[0].x - 4}px;width:${work[work.length - 1].x + work[work.length - 1].w - work[0].x + 8}px"><span>needs work</span></div>` : '';
+  let workBand = '';
+  if (work.length) {
+    const a = work[0], z = work[work.length - 1];
+    workBand = `<div class="pcol band" style="${rect({ x: a.x - 4, y: a.y - 2, w: z.x + z.w - a.x + 8, h: z.y + z.h - a.y + 4 })}"><span>needs work</span></div>`;
+  }
   const recent = pipe.mergedRecently.filter(t => Date.now() - t < 3600000).length;
-  box.insertAdjacentHTML('afterbegin', workBand + heads + `<div class="pmain" style="left:${layout.mainX}px;width:${MAIN_W - 6}px">
+  box.insertAdjacentHTML('afterbegin', workBand + heads + `<div class="pmain" style="${rect(layout.main)}">
       <b>main</b><span class="hint">${recent ? fmt(recent) + ' merged since you opened the page' : 'merged PRs land here'}</span><i></i></div>`);
-  pipe.mainX = layout.mainX;
-  pipe.height = layout.height;
+  pipe.target = layout.target;
 
   let moved = 0;
   // Passing CI but in another column (needs a rebase, draft): a green corner, so the CI passing count adds up.
@@ -461,7 +507,8 @@ function renderMergedColumn(box, col, list, first) {
     a.style.setProperty('--c', MERGED_COL.color);
     a.style.setProperty('--age', Math.min(1, (now - m.mergedAt) / RECENT_MERGED_MS).toFixed(2));
     a.setAttribute('aria-label', `#${m.n} ${m.title} by @${m.user}. Merged ${ago(m.mergedAt)}.`);
-    a.style.transform = `translate(${col.x + 4 + (i % col.perRow) * PITCH}px, ${HEAD_H + Math.floor(i / col.perRow) * PITCH}px)`;
+    const at = dotAt(col, i);
+    a.style.transform = `translate(${at.x}px, ${at.y}px)`;
   });
 }
 
@@ -479,11 +526,11 @@ function flyToMain(n) {
   pipe.els.delete(n);
   pipe.mergedRecently.push(Date.now());
   if (!a) return;
-  const y = 30 + Math.random() * Math.max(40, (pipe.height || 200) - 60);
+  const to = pipe.target ? pipe.target() : { x: 900, y: 100 };
   a.classList.remove('still');
   a.classList.add('merging');
   a.style.transitionDelay = '0ms';
-  a.style.transform = `translate(${(pipe.mainX || 900) + 24}px, ${y}px) scale(1.6)`;
+  a.style.transform = `translate(${to.x}px, ${to.y}px) scale(1.6)`;
   setTimeout(() => {
     a.remove();
     const main = $('#pipe .pmain');
