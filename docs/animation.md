@@ -641,6 +641,11 @@ A `.motionmatcher` object has fields up to `+0x18F`; they are in the object tabl
 - **Key table (`+0x170`).** The same table with 8-byte slots, 2 groups on all 180: 403 entries of `{u32 hash, u32
   index}`, the indices 0..n−1 on 180 of 180. 38 entries are clip hashes in anim.rpf; there are 23 distinct hashes
   (measured separately).
+- **Where an entry sits.** In the key table and the features' `+0x48` table, every entry is where its own hash h
+  puts it: control byte h & 0x7F, in group (h >> 7) & (groups − 1), on 180 of 180 each
+  (`tables_placed_by_key`). The clip table doesn't place its entries by the stored clip hash (0 of 180), nor by
+  the slot's second word; that word is not a dictionary hash in the archive (18 of 4,381, chance level, measured
+  separately).
 - **Self (`+0x188`).** The clip's own hash and the dictionary's `joaat32(name)` on 180 of 180.
 - **`+0x78` and `+0xB8`.** The u16 array starts at 0, never decreases and ends at the record count on 180 of 180;
   on 175 it has one more item than the records, so it is 0, 1, …, n (measured separately). The u8 array has one
@@ -683,7 +688,7 @@ A `.motionmatcher` object has fields up to `+0x18F`; they are in the object tabl
   hypothesis above. Which part of the clip they cover is not decoded.
 - Not decoded: the feature object's `+0x30` object (on 149; 112 bytes, measured separately), the one 0x28-byte
   item at `+0x48` of the matcher, the one-item arrays at `+0x118` and `+0x128`, the second word of a clip table
-  slot, the features with `+0x0E` = 5, how the table hashes and the bone ids are made, what the pose columns mean
+  slot and what the clip table hashes, the features with `+0x0E` = 5, how the bone ids are made, what the pose columns mean
   beyond their feature (and any normalisation), the skeleton's `+0x48` block (its first u16 is the bone count on
   180 of 180, measured separately), the meaning of the `+0x98` values, and the feature object's `+0xB8` (positive
   f32, a count that doesn't follow the features, measured separately) and `+0xC0`.

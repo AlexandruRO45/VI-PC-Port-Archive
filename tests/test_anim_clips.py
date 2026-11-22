@@ -206,13 +206,13 @@ def animation(page, frames, tracks, sequences):
     return a
 
 
-def table(p, field, groups, slot, entries):
+def table(p, field, groups, slot, entries, control=lambda data: 0x11):
     """An open-addressing table at `field`: {u32 groups; u32 entries; ptr}, each group 16 control bytes (0x80 empty)
     then 16 slots of `slot` bytes. `entries` are (group, slot index, slot bytes)."""
     block = bytearray(bytes([0x80]) * 16 + bytes(16 * slot)) * groups
     for g, i, data in entries:
         base = g * (16 + 16 * slot)
-        block[base + i] = 0x11
+        block[base + i] = control(data)
         block[base + 16 + slot * i:base + 16 + slot * i + len(data)] = data
     struct.pack_into("<II", p.b, field, groups, len(entries))
     p.ptr(field + 8, p.alloc(bytes(block)))
@@ -300,7 +300,8 @@ def features(p, rows=True):
         struct.pack_into("<II", p.b, f + 0x18, name, kind)
         items.append(f)
     matcher_array(p, obj + 0x40, struct.pack("<2Q", *(SYSTEM + f for f in items)), 2)
-    table(p, obj + 0x48, 2, 8, [(0, 4, struct.pack("<II", 0xA1, 1)), (1, 0, struct.pack("<II", 0xA2, 0))])
+    table(p, obj + 0x48, 2, 8, [(0, 4, struct.pack("<II", 0x21, 1)), (1, 0, struct.pack("<II", 0xA2, 0))],
+          lambda data: data[0] & 0x7F)                  # placed by the key: group (h >> 7) & 1, control h & 0x7F
     return obj
 
 
@@ -490,7 +491,8 @@ class DecodeTest(unittest.TestCase):
         self.assertEqual((sk["parents"], len(sk["tags"]), len(sk["local"])), ([-1, 0, 1], 6, 3))
         self.assertEqual(anim_clips.skeleton_checks(sk), (True, True))
         self.assertEqual(m["sample_u32"], [1] * 4 + [2] * 5)
-        self.assertEqual(m["feature_names"], [(0xA1, 1), (0xA2, 0)])
+        self.assertEqual(m["feature_names"], [(0x21, 1), (0xA2, 0)])
+        self.assertEqual(m["tables_placed_by_key"], (False, False, True))
         self.assertTrue(m["feature_second"])
         self.assertEqual((m["poses"]["layout"], m["poses"]["samples"], m["poses"]["columns"]), ("rows", 9, 9))
         for r in range(9):
@@ -514,7 +516,7 @@ class DecodeTest(unittest.TestCase):
                   "matcher_pose_transforms_unit_quaternion_scale_1", "matcher_skeleton_one_root_parents_first",
                   "matcher_skeleton_tags_are_name_hash_and_id", "matcher_skeleton_local_is_bone_transform",
                   "matcher_skeleton_inverse_bind_undoes_chain", "matcher_sample_u32_one_per_sample",
-                  "matcher_sample_u32_same_within_a_record"):
+                  "matcher_sample_u32_same_within_a_record", "matcher_feature_name_table_placed_by_key"):
             self.assertEqual(stats[k], 1, k)
         self.assertEqual((stats["matcher_records"], stats["matcher_clip_table_entries"], stats["matcher_refs"],
                           stats["matcher_key_table_entries"], stats["matcher_features"],

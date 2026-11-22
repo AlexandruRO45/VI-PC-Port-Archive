@@ -218,6 +218,18 @@ def hash_table(s, field, slot):
     return full
 
 
+def table_placed_by_key(s, field, slot):
+    """True when every full slot of the `hash_table` at `field` sits where its own first u32 h puts it: control
+    byte h & 0x7F, in group (h >> 7) & (groups - 1)."""
+    groups, p = s.u32(field), s.ptr(field + 8)
+    for o in hash_table(s, field, slot):
+        g, i = divmod(o - p, 16 + 16 * slot)
+        h = s.u32(o)
+        if s.d[p + g * (16 + 16 * slot) + (i - 16) // slot] != h & 0x7F or g != (h >> 7) & (groups - 1):
+            return False
+    return True
+
+
 def parse_matcher(s, at):
     """The measured part of a `.motionmatcher` after its name (docs/animation.md, "`.motion` and `.motionmatcher`
     clips"). Arrays keep their u32 count just before the pointer. -> dict, values only for local inspection"""
@@ -242,7 +254,9 @@ def parse_matcher(s, at):
         "self": (s.u32(at + 0x188), s.u32(at + 0x18C)),                  # own clip hash, joaat32(dictionary)
         "u16_78": [s.u16(a78 + 2 * i) for i in range(ng)],            # +0x78: from 0 up to the record count
         "u8_b8": list(struct.unpack_from(f"<{nf}B", s.d, ab8)) if nf else [],  # +0xB8: 0 or 1, one per record
-        **matcher_features(s, at),
+        **matcher_features(s, at),                                       # first: it refuses a null +0x20
+        "tables_placed_by_key": (table_placed_by_key(s, at + 0xA0, 16), table_placed_by_key(s, at + 0x170, 8),
+                                 table_placed_by_key(s, s.ptr(at + 0x20) + 0x48, 8)),  # clips, keys, feature names
     }
 
 
@@ -439,6 +453,8 @@ def count_matcher(c, dictionary_hash, stats):
     stats["matcher_feature_name_table_indices_0_to_f"] += bool(f) and sorted(
         i for _h, i in m["feature_names"]) == list(range(len(f)))
     stats["matcher_feature_object_second_pointer"] += m["feature_second"]
+    for name, placed in zip(("clip", "key", "feature_name"), m["tables_placed_by_key"]):
+        stats[f"matcher_{name}_table_placed_by_key"] += placed
     sk = m["skeleton"]
     bones = sk["bones"]
     stats["matcher_skeleton_bones"] += len(bones)
