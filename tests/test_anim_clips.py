@@ -229,6 +229,7 @@ def features(p):
     that maps another hash of each name to its index."""
     obj = p.alloc(bytes(0x60))
     struct.pack_into("<I", p.b, obj + 0x18, 1)
+    p.ptr(obj + 0x28, p.alloc(bytes(0x80)))           # not decoded; +0x30 stays null
     items = []
     for column, width, name in ((0, 3, 0xF1), (3, 6, 0xF2)):
         f = p.alloc(bytes(0x30))
@@ -420,6 +421,7 @@ class DecodeTest(unittest.TestCase):
         self.assertEqual((m["u16_78"], m["u8_b8"]), ([0, 1, 2], [0, 1]))
         self.assertEqual(m["features"], [(0, 3, 0xF1), (3, 6, 0xF2)])
         self.assertEqual(m["feature_names"], [(0xA1, 1), (0xA2, 0)])
+        self.assertFalse(m["feature_second"])
         stats = anim_clips.new_stats()
         anim_clips.count_matcher(c, self.d["hash"], stats)
         for k in ("matcher_record_index_is_position", "matcher_clip_table_indices_0_to_n",
@@ -456,6 +458,22 @@ class DecodeTest(unittest.TestCase):
         with self.assertRaises(anim_clips.DecodeError):
             anim_clips.parse_matcher(s, at)
         struct.pack_into("<Q", s.d, first, kept)
+        for field, value in ((at + 0x20, 0),                                        # no feature object
+                             (s.ptr(at + 0x20) + 0x28, 0),                         # no +0x28 object
+                             (first, 0x50000000 + len(s.d) - 8),                   # a feature past the pages
+                             (s.ptr(at + 0x20) + 0x48, 3)):                        # feature table: 3 groups
+            kept = s.u64(field)
+            struct.pack_into("<Q", s.d, field, value)
+            with self.assertRaises((anim_clips.DecodeError, struct.error), msg=hex(field)):
+                anim_clips.parse_matcher(s, at)
+            struct.pack_into("<Q", s.d, field, kept)
+        for count_at in (at + 0x74, at + 0xB4):                                     # counts past the pages
+            kept = s.u32(count_at)
+            struct.pack_into("<I", s.d, count_at, len(s.d))
+            with self.assertRaises(struct.error, msg=hex(count_at)):
+                anim_clips.parse_matcher(s, at)
+            struct.pack_into("<I", s.d, count_at, kept)
+        anim_clips.parse_matcher(s, at)                                             # all restored
         struct.pack_into("<I", s.d, at + 0xA0, 3)                                   # 3 groups: not a power of two
         with self.assertRaises(anim_clips.DecodeError):
             anim_clips.parse_matcher(s, at)

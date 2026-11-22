@@ -445,7 +445,7 @@ u32; u32 count}` with `Entry {u64 key; T *value; Entry *next}`. Hashes are `joaa
 | | `+0xA0` u32 groups, `+0xA4` u32 entries, `+0xA8` pointer | a hash table of the clips: per group 16 control bytes (0x80 empty, below 0x80 full), then 16 slots `{u32 clip hash; u32 not decoded; u32 record index; u32 0}` |
 | | `+0x170`/`+0x174`/`+0x178` | the same kind of table with 8-byte slots `{u32 hash; u32 index}` |
 | | `+0x188` u32, `+0x18C` u32 | the clip's own hash and the dictionary's `joaat32(name)`, as `.motion` has at `+0x28`/`+0x2C` |
-| matcher feature object | `+0x18` u32 1, `+0x28` pointer, `+0x30` pointer or null | not decoded: two objects of their own, see below |
+| matcher feature object | `+0x18` u32, `+0x28` pointer, `+0x30` pointer or null | 1 (measured separately), then two objects not decoded here, see below |
 | | `+0x40` pointer, count at `+0x3C` | pointers to the features, 0x30 bytes each: `{+0x08 u32 column; +0x0C u16 width; +0x0E u16; +0x18 u32 name hash; +0x1C u32}` |
 | | `+0x48` u32 groups, `+0x4C` u32 entries, `+0x50` pointer | a hash table like the clip table, 8-byte slots `{u32 hash; u32 feature index}` |
 | animation | `+0x24` u16 | frame count |
@@ -641,10 +641,10 @@ A `.motionmatcher` object has fields up to `+0x18F`; they are in the object tabl
   (3, 6, 9 or 12, measured separately), and the columns chain from 0 (each feature starts where the one before
   ends) on 180 of 180, so a clip's features fill 6–126 columns (11,616 in all; the range measured separately); that a pose is a row of these
   columns, in vec3 groups, is a hypothesis. The `+0x48` table has one slot per feature, with the indices 0..F−1 on
-  180 of 180; its hashes are not the `+0x18` name hashes (0 of 180, measured separately). `+0x0E` is 1 or 5, and
-  `+0x1C` is 3 on 1,608 of the 1,873 features (measured separately).
-- Not decoded: the feature object's `+0x28` (on all 180; 128 bytes with six pointers in the examples looked at) and
-  `+0x30` (on 149) objects, the one 0x28-byte item at `+0x48` of the matcher, the one-item arrays at `+0x118` and
+  180 of 180; its hashes are not the `+0x18` name hashes (0 of 180, measured separately). `+0x0E` is 1 or 5
+  (measured separately), and `+0x1C` is 3 on 1,608 of the 1,873 features (measured separately).
+- Not decoded: the feature object's `+0x28` object (`parse_matcher` requires it, and it is there on all 180; 128
+  bytes with six pointers in the examples looked at, measured separately) and its `+0x30` object (on 149), the one 0x28-byte item at `+0x48` of the matcher, the one-item arrays at `+0x118` and
   `+0x128`, the second word of a clip table slot, the features' `+0x0E` and `+0x1C`, how the table hashes are made,
   and where the pose data the offsets point into is.
 
