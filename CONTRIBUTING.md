@@ -25,9 +25,15 @@ Start with the [first build](README.md#first-build). Create the Python environme
 | `tools/` | Build setup and offline metadata tools. The PE fixtures live in `tests/intake/`. |
 | `docs/experiments.md` | Measured results, assumptions and reproduction commands. |
 
-The Windows job builds the C++ and HLSL, runs the CPU, Python and WARP tests, and smoke-tests the standalone GPU package. The Ubuntu job assembles and translates gfx1013 fixtures with LLVM 15. A second Ubuntu job runs the platform-independent Python checks. Contributors supply physical GPU coverage. For a hardware report, record the commit, adapter and driver, Windows version, test names and debug-layer status. Include the reported feature tier or wave width when relevant. Record capability skips separately from passes and failures. [CI workflow](.github/workflows/windows.yml) For macOS and Linux setup and troubleshooting, see the [non-Windows host guide](docs/non-windows-hosts.md).
+The Windows job builds the C++ and HLSL, runs the CPU, Python and WARP tests, and smoke-tests the standalone GPU package. A second Windows job builds and runs the same tests with the `release` preset at /O2, because some translation bugs appear only in optimized code. The Ubuntu job assembles and translates gfx1013 fixtures with LLVM 15. A second Ubuntu job runs the platform-independent Python checks. Contributors supply physical GPU coverage. For a hardware report, record the commit, adapter and driver, Windows version, test names and debug-layer status. Include the reported feature tier or wave width when relevant. Record capability skips separately from passes and failures. [CI workflow](.github/workflows/windows.yml) For macOS and Linux setup and troubleshooting, see the [non-Windows host guide](docs/non-windows-hosts.md).
 
 ## Share a reproducible finding
+
+To register a new translated CPU fixture for the coverage dashboard, put
+`; coverage: source cpu_your_test` on the first line of its MASM file. Name the
+CTest that actually compares the translation. For macro-generated instructions,
+use `; coverage: record cpu_your_test` and have the test emit the decoded forms
+through `FORM_COVERAGE_RECORD`. Existing registrations still work.
 
 Use original source, synthetic inputs or a public sample with its revision and license. Store local inputs in `game-files/` and generated output in `out/`. Keep game files, distribution links, SDK redistributables and dumps out of issues, PRs and Git. Remove personal paths and credentials from logs.
 
@@ -49,8 +55,21 @@ docs: add a contributor guide for non-Windows hosts
 
 Do not rename existing pull requests or issues. Issue titles remain free-form; the issue forms and labels carry the classification. A title check is not enforced by a bot in this change.
 
-Reviewers reproduce the smallest relevant case, check the origin of any new fixtures and compare behavior before and after the change. Maintainers merge through a PR after the Windows check passes and review conversations are resolved. Record remaining questions in a linked issue so the next contributor can pick them up.
-
 When a PR changes a public capability or build requirement, update the relevant README row or first-build step in that PR. Put reproduction details in `docs/experiments.md`. Link an existing issue for unresolved behavior, or open one if another contributor can test it. The release tag identifies the exact standalone package a hardware reporter used.
+
+### Who reviews and merges a PR?
+
+R0Y00 owns the repository and currently serves as Maintainer. Route each PR by the behavior it changes.
+
+| Change | Who reviews it | What to check |
+|---|---|---|
+| CPU translation or PE loading | CPU Reviewer | Instruction semantics, calling conventions, loader behavior, and comparisons with the original fixture. |
+| Shader translation or GPU compatibility | GPU Reviewer | Generated DXIL, D3D12 behavior, and relevant WARP or hardware results. Check that capability skips are reported separately. |
+| A shared CPU/GPU interface | Both reviewers, each on their side of the interface | Verify that the producer and consumer agree. Bring changes to the interface contract, compatibility guarantees, or overall architecture to the owner for a decision. |
+| Documentation, hardware reports, or independent build fixes | A Maintainer familiar with the change | Check the source, original log, or reproduction command as appropriate. |
+
+To accept a review invitation, reply on the PR. Reproduce the smallest relevant case, check the origin of new fixtures, and compare behavior before and after the change. Give your verdict and the commit you reviewed. If you request a change, follow up on the author's next revision and say whether it addresses the finding. While an invitation is pending, the Maintainer can review or find another reviewer. Independent PRs continue in parallel.
+
+The Maintainer uses the reviewer's verdict once it covers the current head and all review conversations are resolved. Merge through the PR when the required `Build and test on Windows` check passes. If review is complete and the check is still running, enable GitHub auto-merge. Record remaining follow-up work in a linked issue.
 
 The [code of conduct](CODE_OF_CONDUCT.md) applies to issues and reviews. Use the [security reporting instructions](SECURITY.md) for a vulnerability in project code or release tooling.

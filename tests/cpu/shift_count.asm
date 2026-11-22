@@ -47,6 +47,28 @@ shl_three PROC FRAME
     ret
 shl_three ENDP
 
+; Nonzero arithmetic shift: the vacated bits take the sign of the 32-bit source.
+sar_three PROC FRAME
+    .endprolog
+    mov rax, rcx
+    sar eax, 3
+    ret
+sar_three ENDP
+
+; RCX, RDX = compared values. Returns the CF that the zero-count shift must keep from the compare.
+carry_zero PROC FRAME
+    .endprolog
+    mov rax, r8
+    cmp ecx, edx
+    shl eax, 0
+    mov r9d, 0
+    jae short @F
+    mov r9d, 1
+@@:
+    mov rax, r9
+    ret
+carry_zero ENDP
+
 ; RCX, RDX = compared values, R8 = initial RAX. SETE observes ZF after the zero-count shift.
 flags_zero PROC FRAME
     .endprolog
