@@ -696,7 +696,12 @@ The compute path, end to end:
     buffer is cut at the buffer's end. An unbound vertex slot, or an indexed draw with no index buffer, reads the
     arena's reserved first 64 KiB, which is kept zero (stride 0), so it gets the zeros D3D12 gives.
   - **Attachments:** they move to attachment layouts through the tracker, and the draw runs in a
-    dynamic-rendering scope. Its layer count is the smallest layer count of the bound views.
+    dynamic-rendering scope. Its layer count is the smallest layer count of the bound views. Consecutive draws with
+    the same attachment views and layouts, render area, layer count and depth/stencil attachments share one scope
+    (D3D-324, `DrawScope` in `vulkan_replay.h`): the attachments move and get their barrier once, when it opens, and
+    rasterization order keeps the draws' attachment writes ordered. Any other command (a barrier, clear, copy, query,
+    predication or marker) ends the scope first. Inside it, pipeline, descriptor set, push constants, dynamic state
+    and vertex and index buffers are only set again when they change (`replay_draw_scope_test`).
   - **Viewport:** it is flipped (negative height), because translated vertex shaders write D3D clip coordinates;
     front-face winding then matches D3D12's.
   - Only the first viewport and scissor are used, and primitive restart is not modelled yet.
@@ -2019,8 +2024,9 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
 - Render passes: `BeginRenderPass`/`EndRenderPass` map to `vkCmdBeginRendering`/`vkCmdEndRendering` (dynamic
   rendering). The `D3D12_RENDER_PASS_BEGINNING_ACCESS`/`ENDING_ACCESS` types give the load/store ops and resolve
   targets. Suspending/resuming passes have no direct Vulkan equivalent; split them into two rendering scopes with
-  the same attachments and `LOAD`/`STORE`. If the game does not use render passes, build a rendering scope per draw
-  from the bound RTVs/DSV and let explicit `Clear*View` calls do the clears.
+  the same attachments and `LOAD`/`STORE`. If the game does not use render passes, build a rendering scope from the
+  bound RTVs/DSV, shared by consecutive draws that keep them (D3D-324), and let explicit `Clear*View` calls do the
+  clears.
 
 ### 4.4 Fences, queues and frames in flight
 

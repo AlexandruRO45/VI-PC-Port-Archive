@@ -41,6 +41,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <map>
@@ -2964,6 +2965,77 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
     }
 }
 
+namespace detail {
+
+// The rendering scope draws share (D3D-324). Consecutive draws whose attachments are the same views in the same layouts,
+// with the same render area, layer count and depth/stencil attachments, are recorded in one vkCmdBeginRendering
+// scope: their attachments are transitioned once, when it opens, and rasterization order keeps their writes ordered
+// without the attachment barrier a new scope needs. Any other command ends the scope first, so barriers, clears,
+// copies, queries, predication and markers all run outside one, as they did with a scope per draw.
+//
+// While it is open, state a draw sets is only set again when it changes. Every translated graphics pipeline declares
+// the same dynamic states (viewport, scissor, topology, primitive restart, stencil reference, blend constants, vertex
+// strides), so binding another pipeline keeps them; the cache is dropped with the scope, so nothing recorded outside
+// one (helper dispatches, clears) is relied on.
+struct DrawScope {
+    struct Attachment {
+        VkImageView view = VK_NULL_HANDLE;  // null: the slot is unbound
+        VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        bool operator==(const Attachment&) const = default;
+    };
+    struct VertexBinding {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceSize offset = 0, size = 0, stride = 0;
+        bool operator==(const VertexBinding&) const = default;
+    };
+
+    bool open = false;
+    std::vector<Attachment> colors;
+    Attachment depth;
+    bool depth_attached = false, stencil_attached = false;
+    VkExtent2D area{};
+    std::uint32_t layers = 0;
+
+    // What the scope's draws have set so far.
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipelineLayout set_layout = VK_NULL_HANDLE;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkPipelineLayout push_layout = VK_NULL_HANDLE;
+    VkShaderStageFlags push_stages = 0;
+    ShaderUserData pushed{};
+    bool viewport_set = false;
+    VkViewport viewport{};
+    bool scissor_set = false;
+    VkRect2D scissor{};
+    bool topology_set = false;
+    VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+    bool restart_set = false;
+    VkBool32 restart = VK_FALSE;
+    bool stencil_set = false;
+    std::uint32_t stencil_front = 0, stencil_back = 0;
+    bool blend_set = false;
+    std::array<float, 4> blend{};
+    std::array<VertexBinding, 32> vertex_buffers{};
+    bool index_set = false;
+    VkBuffer index_buffer = VK_NULL_HANDLE;
+    VkDeviceSize index_offset = 0;
+    VkIndexType index_type = VK_INDEX_TYPE_UINT16;
+
+    // For tests and benchmarks: scopes opened, and draws recorded.
+    std::size_t scopes = 0;
+    std::size_t draws = 0;
+
+    // Forgets the scope and what it set; the counts stay.
+    void reset() {
+        const std::size_t opened = scopes, recorded = draws;
+        *this = DrawScope{};
+        scopes = opened;
+        draws = recorded;
+    }
+};
+
+} // namespace detail
+
 // Ends the debug labels a submission left open, so every command buffer is balanced as Vulkan requires.
 inline void close_labels(VkCommandBuffer command_buffer, const ReplayFunctions& vk, std::uint32_t& open_labels) {
     for (; open_labels && vk.end_label; --open_labels) vk.end_label(command_buffer);
@@ -2975,7 +3047,8 @@ inline void close_labels(VkCommandBuffer command_buffer, const ReplayFunctions& 
 // is dropped (Vulkan requires a matching begin), and the caller ends what is still open before it ends the buffer
 // (close_labels). Without it, the list's own events are balanced at its end.
 inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, const ReplayFunctions& vk,
-                 LayoutTracker* tracker = nullptr, std::uint32_t* open_labels = nullptr) {
+                 LayoutTracker* tracker = nullptr, std::uint32_t* open_labels = nullptr,
+                 detail::DrawScope* draw_scope = nullptr) {
     std::uint32_t own_labels = 0;
     std::uint32_t& labels = open_labels ? *open_labels : own_labels;
     const auto commands = prepared.list->commands();
@@ -2992,10 +3065,19 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         vk.depth24_run(command_buffer, job);
         if (predicate.buffer) vk.begin_conditional_rendering(command_buffer, &predicate);
     };
+    // `draw_scope` lets a caller see the counts; the scope itself never outlives this list.
+    detail::DrawScope local_scope;
+    detail::DrawScope& scope = draw_scope ? *draw_scope : local_scope;
+    const auto close_scope = [&] {
+        if (!scope.open) return;
+        vk.end_rendering(command_buffer);
+        scope.reset();
+    };
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
         const auto& p = prepared.commands[i];
+        if (!std::holds_alternative<Draw>(command)) close_scope();  // only draws share a scope
         if (next_query < prepared.queries.size() && prepared.queries[next_query].command == i) {
             emit_query(prepared, prepared.queries[next_query++], command_buffer, vk, predicate);
             continue;
@@ -3614,80 +3696,166 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
             constexpr VkPipelineStageFlags depth_stages =
                 VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-            std::vector<VkRenderingAttachmentInfo> colors(p.colors.size(), {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO});
-            for (std::size_t slot = 0; slot < p.colors.size(); ++slot) {
-                auto& a = prepared_draw.colors[slot];
-                if (!a.id) continue;  // an unbound slot: no image view, writes are dropped
-                const VkImageLayout layout = image_layout(a.binding, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-                detail::to_attachment(vk, command_buffer, a, layout, color_access,
-                                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, tracker, separate);
-                colors[slot].imageView = a.view;
-                colors[slot].imageLayout = layout;
-                colors[slot].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-                colors[slot].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            // The attachments this draw renders to, as the scope compares them.
+            const auto color_at = [&](std::size_t slot) -> detail::DrawScope::Attachment {
+                const auto& a = p.colors[slot];
+                if (!a.id) return {};  // an unbound slot: no image view, writes are dropped
+                return {a.view, image_layout(a.binding, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)};
+            };
+            detail::DrawScope::Attachment depth_view{};
+            if (p.depth.id)
+                depth_view = {p.depth.view, image_layout(p.depth.binding, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)};
+            const bool depth_attached = p.depth.id && (p.graphics.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT);
+            const bool stencil_attached = p.depth.id && (p.graphics.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT);
+            const auto same_scope = [&] {
+                if (!scope.open || scope.area.width != p.area.width || scope.area.height != p.area.height ||
+                    scope.layers != p.layers || scope.colors.size() != p.colors.size() || scope.depth != depth_view ||
+                    scope.depth_attached != depth_attached || scope.stencil_attached != stencil_attached)
+                    return false;
+                for (std::size_t slot = 0; slot < p.colors.size(); ++slot)
+                    if (scope.colors[slot] != color_at(slot)) return false;
+                return true;
+            };
+            if (!same_scope()) {
+                close_scope();
+                std::vector<VkRenderingAttachmentInfo> colors(p.colors.size(),
+                                                              {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO});
+                scope.colors.resize(p.colors.size());
+                for (std::size_t slot = 0; slot < p.colors.size(); ++slot) {
+                    scope.colors[slot] = color_at(slot);
+                    auto& a = prepared_draw.colors[slot];
+                    if (!a.id) continue;
+                    const VkImageLayout layout = scope.colors[slot].layout;
+                    detail::to_attachment(vk, command_buffer, a, layout, color_access,
+                                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, tracker, separate);
+                    colors[slot].imageView = a.view;
+                    colors[slot].imageLayout = layout;
+                    colors[slot].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                    colors[slot].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                }
+                VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+                if (p.depth.id) {
+                    detail::to_attachment(vk, command_buffer, prepared_draw.depth, depth_view.layout, depth_access,
+                                          depth_stages, tracker, separate);
+                    depth.imageView = p.depth.view;
+                    depth.imageLayout = depth_view.layout;
+                    depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                    depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                }
+                VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+                rendering.renderArea = {{0, 0}, p.area};
+                rendering.layerCount = p.layers;  // array views: SV_RenderTargetArrayIndex picks the layer
+                rendering.colorAttachmentCount = std::uint32_t(colors.size());
+                rendering.pColorAttachments = colors.data();
+                if (depth_attached) rendering.pDepthAttachment = &depth;
+                if (stencil_attached) rendering.pStencilAttachment = &depth;
+                vk.begin_rendering(command_buffer, &rendering);
+                scope.open = true;
+                scope.depth = depth_view;
+                scope.depth_attached = depth_attached;
+                scope.stencil_attached = stencil_attached;
+                scope.area = p.area;
+                scope.layers = p.layers;
+                ++scope.scopes;
             }
-            VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-            if (p.depth.id) {
-                const VkImageLayout layout = image_layout(p.depth.binding, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-                detail::to_attachment(vk, command_buffer, prepared_draw.depth, layout, depth_access, depth_stages,
-                                      tracker, separate);
-                depth.imageView = p.depth.view;
-                depth.imageLayout = layout;
-                depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-                depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-            }
-            VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
-            rendering.renderArea = {{0, 0}, p.area};
-            rendering.layerCount = p.layers;  // array views: SV_RenderTargetArrayIndex picks the layer
-            rendering.colorAttachmentCount = std::uint32_t(colors.size());
-            rendering.pColorAttachments = colors.data();
-            if (p.depth.id && (p.graphics.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) rendering.pDepthAttachment = &depth;
-            if (p.depth.id && (p.graphics.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) rendering.pStencilAttachment = &depth;
-            vk.begin_rendering(command_buffer, &rendering);
+            ++scope.draws;
 
             ShaderUserData data{};
             std::copy(draw->user_data.begin(), draw->user_data.end(), data.s);
             data.heap_base = vk.heap_base;
             data.code_base = p.graphics.code_base;
-            vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, p.graphics.pipeline);
-            if (p.graphics.bindless_set)
+            if (scope.pipeline != p.graphics.pipeline) {
+                vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, p.graphics.pipeline);
+                scope.pipeline = p.graphics.pipeline;
+            }
+            if (p.graphics.bindless_set &&
+                (scope.set != p.graphics.bindless_set || scope.set_layout != p.graphics.layout)) {
                 vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, p.graphics.layout, 0, 1,
                                         &p.graphics.bindless_set, 0, nullptr);
-            vk.push_constants(command_buffer, p.graphics.layout, p.graphics.push_stages, 0, sizeof(data), &data);
+                scope.set = p.graphics.bindless_set;
+                scope.set_layout = p.graphics.layout;
+            }
+            if (scope.push_layout != p.graphics.layout || scope.push_stages != p.graphics.push_stages ||
+                std::memcmp(&scope.pushed, &data, sizeof(data)) != 0) {
+                vk.push_constants(command_buffer, p.graphics.layout, p.graphics.push_stages, 0, sizeof(data), &data);
+                scope.push_layout = p.graphics.layout;
+                scope.push_stages = p.graphics.push_stages;
+                scope.pushed = data;
+            }
             // Translated vertex shaders write D3D clip coordinates (y up); a negative-height viewport keeps the
             // image upright, and winding as D3D12 sees it.
             const Viewport& v = draw->viewport;
             const VkViewport viewport{v.x, v.y + v.height, v.width, -v.height, v.min_depth, v.max_depth};
-            vk.set_viewport(command_buffer, 0, 1, &viewport);
+            if (!scope.viewport_set || std::memcmp(&scope.viewport, &viewport, sizeof(viewport)) != 0) {
+                vk.set_viewport(command_buffer, 0, 1, &viewport);
+                scope.viewport = viewport;
+                scope.viewport_set = true;
+            }
             const Rect& s = draw->scissor;
             const VkRect2D scissor{{std::max(0, s.left), std::max(0, s.top)},
                                    {std::uint32_t(std::max(0, s.right - std::max(0, s.left))),
                                     std::uint32_t(std::max(0, s.bottom - std::max(0, s.top)))}};
-            vk.set_scissor(command_buffer, 0, 1, &scissor);
+            if (!scope.scissor_set || std::memcmp(&scope.scissor, &scissor, sizeof(scissor)) != 0) {
+                vk.set_scissor(command_buffer, 0, 1, &scissor);
+                scope.scissor = scissor;
+                scope.scissor_set = true;
+            }
             const VkPrimitiveTopology topology = detail::vulkan_topology(draw->topology);
-            vk.set_primitive_topology(command_buffer, topology);
-            const bool restart = draw->indexed && detail::strip_topology(topology) &&
-                                 ((p.graphics.strip_cut == 1 && p.index_type == VK_INDEX_TYPE_UINT16) ||
-                                  (p.graphics.strip_cut == 2 && p.index_type == VK_INDEX_TYPE_UINT32));
-            vk.set_primitive_restart_enable(command_buffer, restart ? VK_TRUE : VK_FALSE);
-            vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw->stencil_front);
-            vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);
-            vk.set_blend_constants(command_buffer, draw->blend_factor.data());
+            if (!scope.topology_set || scope.topology != topology) {
+                vk.set_primitive_topology(command_buffer, topology);
+                scope.topology = topology;
+                scope.topology_set = true;
+            }
+            const VkBool32 restart = draw->indexed && detail::strip_topology(topology) &&
+                                             ((p.graphics.strip_cut == 1 && p.index_type == VK_INDEX_TYPE_UINT16) ||
+                                              (p.graphics.strip_cut == 2 && p.index_type == VK_INDEX_TYPE_UINT32))
+                                         ? VK_TRUE
+                                         : VK_FALSE;
+            if (!scope.restart_set || scope.restart != restart) {
+                vk.set_primitive_restart_enable(command_buffer, restart);
+                scope.restart = restart;
+                scope.restart_set = true;
+            }
+            if (!scope.stencil_set || scope.stencil_front != draw->stencil_front ||
+                scope.stencil_back != draw->stencil_back) {
+                vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw->stencil_front);
+                vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);
+                scope.stencil_front = draw->stencil_front;
+                scope.stencil_back = draw->stencil_back;
+                scope.stencil_set = true;
+            }
+            if (!scope.blend_set ||
+                std::memcmp(scope.blend.data(), draw->blend_factor.data(), sizeof(scope.blend)) != 0) {
+                vk.set_blend_constants(command_buffer, draw->blend_factor.data());
+                std::copy(draw->blend_factor.begin(), draw->blend_factor.end(), scope.blend.begin());
+                scope.blend_set = true;
+            }
             for (std::uint32_t slot = 0; slot < p.vertex_buffers.size(); ++slot) {
                 if (!p.vertex_buffers[slot]) continue;
+                const detail::DrawScope::VertexBinding binding{p.vertex_buffers[slot], p.vertex_offsets[slot],
+                                                               p.vertex_sizes[slot], p.vertex_strides[slot]};
+                if (slot < scope.vertex_buffers.size() && scope.vertex_buffers[slot] == binding) continue;
                 vk.bind_vertex_buffers2(command_buffer, slot, 1, &p.vertex_buffers[slot], &p.vertex_offsets[slot],
                                         &p.vertex_sizes[slot], &p.vertex_strides[slot]);
+                if (slot < scope.vertex_buffers.size()) scope.vertex_buffers[slot] = binding;
             }
             if (draw->indexed) {
-                vk.bind_index_buffer(command_buffer, p.index_buffer, p.index_offset, p.index_type);
+                if (!scope.index_set || scope.index_buffer != p.index_buffer || scope.index_offset != p.index_offset ||
+                    scope.index_type != p.index_type) {
+                    vk.bind_index_buffer(command_buffer, p.index_buffer, p.index_offset, p.index_type);
+                    scope.index_buffer = p.index_buffer;
+                    scope.index_offset = p.index_offset;
+                    scope.index_type = p.index_type;
+                    scope.index_set = true;
+                }
                 vk.draw_indexed(command_buffer, draw->count, draw->instances, draw->first, draw->base_vertex,
                                 draw->first_instance);
             } else {
                 vk.draw(command_buffer, draw->count, draw->instances, draw->first, draw->first_instance);
             }
-            vk.end_rendering(command_buffer);
         }
     }
+    close_scope();  // before conditional rendering ends: it began outside the scope
     // Predication does not carry over to the next command list.
     if (predicate.buffer) vk.end_conditional_rendering(command_buffer);
     if (!open_labels) close_labels(command_buffer, vk, own_labels);
