@@ -587,9 +587,10 @@ class ModeInstructionsTests(unittest.TestCase):
             "s_setreg_imm32_b32 hwreg(HW_REG_MODE), 0",
             "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 1",
             "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 2",
-            # s2 holds the constant 0xffffffff here, which s_setreg_b32 now applies (FP_ROUND[3:2] = 3); s4 is a
-            # computed value, neither a constant nor an s_getreg_b32 save, so it stays refused.
-            "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s4",
+            # s2 holds the constant 0xffffffff here, which s_setreg_b32 now applies (FP_ROUND[3:2] = 3), and s4 folds
+            # to a constant too; s9 is a user SGPR the program never writes, neither a constant nor an s_getreg_b32
+            # save, so it stays refused.
+            "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s9",
         ]
         for insn in bad_mode_writes:
             with self.subTest(insn=insn):
