@@ -366,7 +366,7 @@ int main(int argc, char** argv)
         if (argc != 6 && argc != 7) return 2;
     } else if (operation == "--check-pixel-quad-lod") {
         if (argc != 4) return 2;
-    } else if (operation == "--mesh-entry" || operation == "--mesh-indexed") {
+    } else if (operation == "--mesh-entry" || operation == "--mesh-indexed" || operation == "--mesh-textured") {
         if (argc != 6 && !(operation == "--mesh-entry" && argc == 7 &&
             (std::string_view(argv[6]) == "ab" || std::string_view(argv[6]) == "ba"))) return 2;
     } else if (operation == "--mesh-entry-table") {
@@ -522,9 +522,12 @@ int main(int argc, char** argv)
         } else if (operation == "--mesh-entry-table") {
             const auto binding = argc == 7 ? MeshConstantBinding::swapped_table : MeshConstantBinding::table;
             if (!check_mesh_entry_draw(device.Get(), argv[3], argv[4], argv[5], false, binding)) return 77;
+        } else if (operation == "--mesh-textured") {
+            if (!check_mesh_entry_draw(device.Get(), argv[3], argv[4], argv[5],
+                                       true, MeshConstantBinding::root, MeshDrawMode::textured)) return 77;
         } else if (operation == "--mesh-depth-pair") {
             if (!check_mesh_entry_draw(device.Get(), argv[3], argv[4], argv[5],
-                                       true, MeshConstantBinding::root, true)) return 77;
+                                       true, MeshConstantBinding::root, MeshDrawMode::depth_pair)) return 77;
         } else if (argc == 3 && operation == "--dxr-facing") {
             if (!check_dxr_facing(device.Get())) return 77;
         } else if (argc == 3 && operation == "--dxr-opacity") {

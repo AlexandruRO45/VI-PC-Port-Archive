@@ -156,12 +156,13 @@ template<class F, class U> static F quiet_nan(F x) {
     return x;
 }
 template<class F, class U> static F fma_x86(F s0, F s1, F s2, int order, bool neg_p, bool neg_c) {
-    if (std::isnan(s0)) return quiet_nan<F, U>(s0);
-    if (std::isnan(s1)) return quiet_nan<F, U>(s1);
-    if (std::isnan(s2)) return quiet_nan<F, U>(s2);
     const F a = order == 132 ? s0 : s1;
     const F b = order == 213 ? s0 : s2;
     const F c = order == 231 ? s0 : (order == 132 ? s1 : s2);
+    // NaN priority follows the arithmetic operand order, before any sign changes.
+    if (std::isnan(a)) return quiet_nan<F, U>(a);
+    if (std::isnan(b)) return quiet_nan<F, U>(b);
+    if (std::isnan(c)) return quiet_nan<F, U>(c);
     return std::fma(neg_p ? -a : a, b, neg_c ? -c : c);
 }
 """
@@ -281,6 +282,11 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
         M.PSHUFD, M.PSHUFLW, M.PSHUFHW, M.PMOVMSKB,
     }
     has_wide |= any(i.mnemonic in sse2_shift_pack_ops for i in body)
+    fma_packed = {
+        getattr(M, f"VF{k.upper()}{o}{s.upper()}"): (k, o, s == "pd")
+        for k in ("madd", "msub", "nmadd", "nmsub", "maddsub", "msubadd") for o in ("132", "213", "231") for s in ("ps", "pd")
+    }
+    has_wide |= any(i.mnemonic in fma_packed for i in body)
     if any(i.code in STRING_OPS or i.mnemonic in (M.CLD, M.STD) for i in body):
         # The x64 software conventions expect DF clear on function exit and before calls, so it starts clear.
         lines.append("bool direction=false;")
@@ -1279,6 +1285,34 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                     imm = i.immediate(2)
                     copies = " ".join(f"memcpy({dst}.data()+{8+2*k}, rhs.data()+{8+2*((imm >> (2*k)) & 3)}, 2);" for k in range(4))
                     stmt = f"{{ {src_init} memcpy({dst}.data(), rhs.data(), 8); {copies} }}"
+        elif has_wide and i.encoding == EncodingKind.VEX and op in fma_packed:
+            kind, order, is_f64 = fma_packed[op]
+            ftype, utype, sz = ("double", "uint64_t", 8) if is_f64 else ("float", "uint32_t", 4)
+            vec_size = RegisterExt.size(i.op0_register)
+            if any(i.op_kind(n) == K.REGISTER and i.op_register(n) not in wide_any
+                   for n in range(i.op_count)):
+                raise ValueError(f"unsupported packed FMA register at {i.ip:#x}: {i}")
+            dst, src1 = wide_any[i.op0_register], wide_any[i.op1_register]
+            if i.op2_kind == K.MEMORY:
+                s2_init = f"const auto in2 = load_always<std::array<uint8_t,{vec_size}>>({address()});"
+            else:
+                s2_init = f"const auto in2 = {wide_any[i.op2_register]};"
+            s2_expr = f"load<{ftype}>(reinterpret_cast<word>(in2.data() + n))"
+            s0 = f"load<{ftype}>(reinterpret_cast<word>(in0.data() + n))"
+            s1 = f"load<{ftype}>(reinterpret_cast<word>(in1.data() + n))"
+            neg_p = "true" if kind in ("nmadd", "nmsub") else "false"
+            if kind in ("msub", "nmsub"):
+                neg_c = "true"
+            elif kind == "maddsub":
+                neg_c = "(lane & 1u) == 0u"
+            elif kind == "msubadd":
+                neg_c = "(lane & 1u) != 0u"
+            else:
+                neg_c = "false"
+            stmt = (f"{{ const auto in0 = {dst}, in1 = {src1}; {s2_init} {dst} = {{}}; "
+                    f"for (size_t lane = 0; lane < {vec_size // sz}; ++lane) {{ const size_t n = lane * {sz}; "
+                    f"const {ftype} r = fma_x86<{ftype}, {utype}>({s0}, {s1}, {s2_expr}, {order}, {neg_p}, {neg_c}); "
+                    f"memcpy({dst}.data() + n, &r, {sz}); }} }}")
         elif op == M.VMOVUPS and i.op1_kind == K.MEMORY:
             stmt = f"{wide[i.op0_register]} = load<std::array<uint8_t,32>>({address()});"
         elif op == M.VMOVUPS and i.op0_kind == K.MEMORY:
