@@ -282,6 +282,76 @@ class VMadI32I16Instruction:
         return f"{self.opcode} {self.vdst.disasm_str()}, {self.src0.disasm_str()}, {self.src1.disasm_str()}, {self.src2.disasm_str()}{clamp_str}{op_sel_str}"
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarRegisterFile:
+    """Architectural register file for a single execution thread/lane."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+    vcc: int = 0
+    m0: int = 0
+
+    def read_vgpr(self, idx: int) -> int:
+        return self.vgprs[idx] & MASK32
+
+    def write_vgpr(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = val & MASK32
+
+    def read_sgpr(self, idx: int) -> int:
+        return self.sgprs[idx] & MASK32
+
+    def write_sgpr(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = val & MASK32
+
+    def read_operand(self, op: Operand) -> int:
+        if op.reg_type == RegType.VGPR:
+            return self.read_vgpr(op.index)
+        elif op.reg_type == RegType.SGPR:
+            return self.read_sgpr(op.index)
+        elif op.reg_type == RegType.VCC:
+            return self.vcc & MASK32
+        elif op.reg_type in (RegType.LITERAL, RegType.INLINE_INT):
+            val = op.literal_val if op.literal_val is not None else 0
+            return val & MASK32
+        raise ValueError(f"Unsupported operand type for reading: {op}")
+
+    def write_operand(self, op: Operand, val: int) -> None:
+        if op.reg_type == RegType.VGPR:
+            self.write_vgpr(op.index, val)
+        elif op.reg_type == RegType.SGPR:
+            self.write_sgpr(op.index, val)
+        elif op.reg_type == RegType.VCC:
+            self.vcc = val & MASK32
+        else:
+            raise ValueError(f"Cannot write to non-writable operand: {op}")
+
+
+class ScalarVALUInterpreter:
+    """Deterministic scalar interpreter executing VALU instructions on a register file."""
+
+    def __init__(self, reg_file: Optional[ScalarRegisterFile] = None) -> None:
+        self.reg_file = reg_file if reg_file is not None else ScalarRegisterFile()
+
+    def execute(self, inst: Union[VMadU32U16Instruction, VMadI32I16Instruction]) -> None:
+        s0 = self.reg_file.read_operand(inst.src0)
+        s1 = self.reg_file.read_operand(inst.src1)
+        s2 = self.reg_file.read_operand(inst.src2)
+
+        if isinstance(inst, VMadU32U16Instruction):
+            dst, carry = ref_mad_u32_u16(s0, s1, s2, op_sel=inst.op_sel, clamp=inst.clamp)
+            self.reg_file.write_operand(inst.vdst, dst)
+        elif isinstance(inst, VMadI32I16Instruction):
+            dst, overflow = ref_mad_i32_i16(s0, s1, s2, op_sel=inst.op_sel, clamp=inst.clamp)
+            self.reg_file.write_operand(inst.vdst, dst)
+
+    def execute_sequence(self, instructions: Sequence[Union[VMadU32U16Instruction, VMadI32I16Instruction]]) -> None:
+        for inst in instructions:
+            self.execute(inst)
+
+
 class TestValuMadU32U16Oracle(unittest.TestCase):
     """Unit tests for the reference mathematical oracle and architectural model."""
 
@@ -504,6 +574,128 @@ class TestValuMadU32U16SymbolicAST(unittest.TestCase):
             Operand.inline_int(-17)
         with self.assertRaises(ValueError):
             Operand.inline_int(65)
+
+
+class TestValuMadU32U16ScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar VALU instruction interpreter."""
+
+    def test_scalar_execution_simple(self) -> None:
+        rf = ScalarRegisterFile()
+        rf.write_vgpr(1, 100)
+        rf.write_vgpr(2, 200)
+        rf.write_vgpr(3, 50)
+
+        inst = VMadU32U16Instruction(
+            vdst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+        interp = ScalarVALUInterpreter(rf)
+        interp.execute(inst)
+
+        self.assertEqual(rf.read_vgpr(0), 100 * 200 + 50)
+
+    def test_scalar_execution_with_op_sel(self) -> None:
+        rf = ScalarRegisterFile()
+        rf.write_vgpr(1, pack_halfwords(10, 20))  # hi = 20
+        rf.write_vgpr(2, pack_halfwords(30, 40))  # hi = 40
+        rf.write_vgpr(3, 100)
+
+        inst = VMadU32U16Instruction(
+            vdst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+            op_sel=(True, True),
+        )
+        interp = ScalarVALUInterpreter(rf)
+        interp.execute(inst)
+
+        self.assertEqual(rf.read_vgpr(0), 20 * 40 + 100)
+
+    def test_scalar_execution_with_clamp(self) -> None:
+        rf = ScalarRegisterFile()
+        rf.write_vgpr(1, 0x1000)
+        rf.write_vgpr(2, 0x1000)
+        rf.write_vgpr(3, 0xFF00_0005)
+
+        inst = VMadU32U16Instruction(
+            vdst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+            clamp=True,
+        )
+        interp = ScalarVALUInterpreter(rf)
+        interp.execute(inst)
+
+        self.assertEqual(rf.read_vgpr(0), CLAMP_MAX_U32)
+
+    def test_scalar_execution_with_sgpr_and_inline_constants(self) -> None:
+        rf = ScalarRegisterFile()
+        rf.write_sgpr(4, 50)
+        rf.write_vgpr(3, 10)
+
+        inst = VMadU32U16Instruction(
+            vdst=Operand.vgpr(0),
+            src0=Operand.inline_int(2),
+            src1=Operand.sgpr(4),
+            src2=Operand.vgpr(3),
+        )
+        interp = ScalarVALUInterpreter(rf)
+        interp.execute(inst)
+
+        self.assertEqual(rf.read_vgpr(0), 2 * 50 + 10)
+
+    def test_scalar_signed_execution(self) -> None:
+        rf = ScalarRegisterFile()
+        rf.write_vgpr(1, pack_halfwords(s16(-5), 0))
+        rf.write_vgpr(2, pack_halfwords(10, 0))
+        rf.write_vgpr(3, 100)
+
+        inst = VMadI32I16Instruction(
+            vdst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+        interp = ScalarVALUInterpreter(rf)
+        interp.execute(inst)
+
+        self.assertEqual(rf.read_vgpr(0), 50)
+
+    def test_scalar_polynomial_chaining(self) -> None:
+        rf = ScalarRegisterFile()
+        x = 10
+        rf.write_vgpr(10, x)
+
+        instructions = [
+            VMadU32U16Instruction(
+                vdst=Operand.vgpr(0),
+                src0=Operand.vgpr(10),
+                src1=Operand.vgpr(10),
+                src2=Operand.inline_int(0),
+            ),
+            VMadU32U16Instruction(
+                vdst=Operand.vgpr(1),
+                src0=Operand.inline_int(3),
+                src1=Operand.vgpr(0),
+                src2=Operand.inline_int(7),
+            ),
+            VMadU32U16Instruction(
+                vdst=Operand.vgpr(2),
+                src0=Operand.inline_int(5),
+                src1=Operand.vgpr(10),
+                src2=Operand.vgpr(1),
+            ),
+        ]
+        interp = ScalarVALUInterpreter(rf)
+        interp.execute_sequence(instructions)
+
+        self.assertEqual(rf.read_vgpr(0), 100)
+        self.assertEqual(rf.read_vgpr(1), 307)
+        self.assertEqual(rf.read_vgpr(2), 357)
 
 
 if __name__ == "__main__":
