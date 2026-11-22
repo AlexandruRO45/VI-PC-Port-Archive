@@ -108,12 +108,15 @@ a bound range only at its start; the callee is walked within that range alone,
 may not move RSP or call, and may not be an import thunk.
 """
 
+import re
 import argparse
 import hashlib
 import json
 from pathlib import Path
 import struct
 from typing import NamedTuple
+
+from cpu_call_aot import resolve_import
 
 import pefile
 from iced_x86 import (Code, ConditionCode as CC, Decoder, FlowControl, InstructionInfoFactory, MemorySizeExt,
@@ -473,7 +476,7 @@ class Function:
         code = image_bytes(self.pe, target, 6, executable=True)
         return target + 6 + int.from_bytes(code[2:], "little", signed=True)
 
-    def explore(self, imports=None, *, callback_calls=False):
+    def explore(self, imports=None, *, callback_calls=False, tail_resolver=None):
         pending = [self.entry]
         indirect = []
         while pending or indirect:
@@ -504,6 +507,13 @@ class Function:
                 targets = []
             elif flow == FlowControl.UNCONDITIONAL_BRANCH and ins.is_jmp_short_or_near:
                 targets = [ins.near_branch_target]
+            elif (ins.code == Code.JMP_RM64 and ins.memory_base == R.RIP and not ins.has_segment_prefix):
+                slot = ins.ip_rel_memory_address
+                if tail_resolver is None:
+                    raise ValueError(f"no binding for the tail jump through IAT slot RVA {slot:#x} at RVA {ip:#x}")
+                self.host_calls[ip] = tail_resolver(slot)
+                self.tails[ip] = slot
+                targets = []
             elif flow == FlowControl.CALL and ins.is_call_near:
                 slot = self.thunk_slot(ins, imports)
                 if slot is not None and slot in imports:
@@ -739,6 +749,7 @@ class Lifter:
         self.image_used = False
         self.frame = {}  # RVA -> index into the frame array of the stack bytes it accesses (from Frame)
         self.adjustments = set()  # RVAs of SUB or ADD RSP, imm
+        self.captured = {}  # RVA -> declaration of the local that holds the instruction's one guest read
 
     def slot(self, ins):
         if ins.ip not in self.frame:
@@ -776,12 +787,31 @@ class Lifter:
             return f"static_cast<std::uint64_t>(static_cast<std::uint32_t>({' + '.join(parts)}))"
         return "(" + " + ".join(parts) + ")"
 
+    def capture(self, ins, text):
+        """The statement of ins with its guest read, if any, performed first and exactly once."""
+        declaration = self.captured.pop(ins.ip, None)
+        if declaration is None:
+            return text
+        # A read whose value nothing uses (CMP or TEST without a flag consumer) is still performed.
+        parts = [declaration, text] if re.search(r"\bmem\b", text) else [declaration, "static_cast<void>(mem);", text]
+        return "{ " + " ".join(part for part in parts if part) + " }"
+
     def operand(self, ins, number, width):
         kind = ins.op_kind(number)
         if kind == OpKind.REGISTER:
             return self.reg(ins.op_register(number))
         if kind == OpKind.MEMORY:
-            return f"load<{unsigned(width)}>({self.address(ins)})"
+            if ins.memory_base == R.RSP and ins.ip in self.frame:
+                # The function's own frame array: a read of it cannot fault.
+                return f"load<{unsigned(width)}>({self.address(ins)})"
+            # The instruction's memory operand is read once, at its own width, into a local declared before
+            # the rest of the statement (see capture()); every use of the operand names that local. The read
+            # is volatile: the original faults on an inaccessible operand even when the value is never
+            # used, and the host compiler may drop an ordinary load whose value is unused.
+            declaration = f"const {unsigned(width)} mem = load_always<{unsigned(width)}>({self.address(ins)});"
+            if self.captured.setdefault(ins.ip, declaration) != declaration:
+                raise ValueError(f"memory operand read at two widths at RVA {ins.ip:#x}")
+            return "mem"
         if kind in (OpKind.IMMEDIATE8, OpKind.IMMEDIATE8TO16, OpKind.IMMEDIATE8TO32, OpKind.IMMEDIATE8TO64,
                     OpKind.IMMEDIATE16, OpKind.IMMEDIATE32, OpKind.IMMEDIATE32TO64, OpKind.IMMEDIATE64):
             return f"static_cast<{unsigned(width)}>({ins.immediate(number) & ((1 << width * 8) - 1):#x}ull)"
@@ -863,6 +893,11 @@ class Lifter:
         return table[code]
 
     def statement(self, ins, sets_flags=False, producer=None):
+        """lower(), with the instruction's guest memory read performed first and exactly once."""
+        text, reads, writes = self.lower(ins, sets_flags, producer)
+        return self.capture(ins, text), reads, writes
+
+    def lower(self, ins, sets_flags=False, producer=None):
         """Return C++ for one instruction, the low bytes it reads from each full register and the
         width it writes to each full register.
 
@@ -1050,14 +1085,8 @@ class Lifter:
             note(0, 1)
             condition = self.condition(producer, ins)
             source, destination = self.operand(ins, 1, width), self.operand(ins, 0, width)
-            # A 32-bit CMOVcc zero-extends the destination even when the condition is false,
-            # and a memory source is read either way.
-            if ins.op1_kind == OpKind.MEMORY:
-                line = self.write(ins, width, f"({condition}) ? source : {destination}")
-                # A volatile read: when the condition folds to false the compiler may not drop the load,
-                # which faults on hardware for an inaccessible source.
-                source = f"load_always<{unsigned(width)}>({self.address(ins)})"
-                return f"{{ const {unsigned(width)} source = {source}; {line} }}", reads, writes
+            # A 32-bit CMOVcc zero-extends the destination even when the condition is false, and a memory
+            # source is read either way: capture() reads it before the condition is evaluated.
             return self.write(ins, width, f"({condition}) ? {source} : {destination}"), reads, writes
         if mnemonic == M.RET:
             # Which bytes of RAX are a return value is decided by the definedness pass in lift().
@@ -1290,6 +1319,14 @@ def lift(pe, name, arguments=DEFAULT_ARGUMENTS, program=None, *, image_data=Fals
     return program.lift(entry, f"lifted_{name}", ARGUMENT_REGISTERS[:arguments])
 
 
+class Binding(NamedTuple):
+    provider: Path
+    symbol: str
+    link_name: str | None
+    arguments: int
+    return_bytes: int
+
+
 class HostImport(NamedTuple):
     symbol: str
     widths: tuple
@@ -1314,6 +1351,7 @@ class Program:
         self.callees = {}
         self.refused = {}
         self.sources = []
+        self.tail_resolver = None
 
     def lift(self, entry, symbol, arguments, internal=False):
         self.active.append(entry)
@@ -1386,7 +1424,7 @@ def lift_function(program, entry, symbol, arguments, internal):
         if first.flow_control == FlowControl.INDIRECT_BRANCH and first.op0_kind == OpKind.MEMORY:
             raise ValueError(f"bound function {function.bound[2]} at RVA {entry:#x} is an import thunk "
                              "(an indirect jump through memory)")
-    edges = function.explore(program.imports)
+    edges = function.explore(program.imports, tail_resolver=program.tail_resolver)
     image_data = program.image_data
     lifter = Lifter(pe if image_data else None)
     # A RIP-relative LEA that loads a recognised table base stays a guest address, with or without image data.
@@ -1502,6 +1540,7 @@ def lift_function(program, entry, symbol, arguments, internal):
                     state[successor] = merged
                     changed = True
     widths = []
+    ret_widths = []
     for ip in order:
         missing = [r for r, width in effects[ip][0].items() if state[ip][r][0] < width]
         if ip in copies:
@@ -1520,6 +1559,7 @@ def lift_function(program, entry, symbol, arguments, internal):
             if guest:
                 raise ValueError(f"return value may hold a guest address at RVA {ip:#x}")
             widths.append(defined)
+            ret_widths.append(defined)
     # Consecutive low RAX bytes defined at every reachable RET or tail jump; None when there is none.
     function.return_width = min(widths) if widths else None
     function.demands = argument_demands(function, order, effects)
@@ -1562,6 +1602,12 @@ def lift_function(program, entry, symbol, arguments, internal):
         comment = ["// RAX: no reachable normal return"]
     elif function.return_width < 8:
         comment = [f"// RAX: {function.return_width} low byte(s) are defined at every reachable RET"]
+    imported_tails = [function.host_calls[ip] for ip in function.tails if ip in function.host_calls]
+    if imported_tails:
+        target = imported_tails[0]
+        rets = f"{min(ret_widths)} defined at every reachable RET" if ret_widths else "no RET is reachable"
+        comment = [f"// RAX: {function.return_width} low byte(s) at every reachable normal return: {rets}, "
+                   f"{target.return_width} guaranteed after every tail jump to {target.symbol} as the binding states"]
     source = [*comment, signature + " {", *("    " + d for d in declarations), *text, "}"]
     return "\n".join(source), function
 
@@ -1576,12 +1622,14 @@ static inline bool even_parity(word value) {
     const auto folded = static_cast<unsigned>((value ^ (value >> 4)) & 15u);
     return ((0x6996u >> folded) & 1u) == 0;
 }
+// A read of the function's own frame array, which cannot fault.
 template <class T> static T load(word address) {
     T value;
     std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
     return value;
 }
-// A read the compiler must perform even when its value is unused (a CMOVcc memory source).
+// Every guest read, once per instruction: the compiler must perform it even when its value is unused,
+// because the original faults on an inaccessible address either way.
 template <class T> static T load_always(word address) {
     return *reinterpret_cast<const volatile T*>(address);
 }
@@ -1714,21 +1762,40 @@ def load_bindings(source):
     return {"image_sha256": digest, "functions": functions}
 
 
-def translate_pe(pe, names, bindings=None, *, image_data=False):
+def translate_pe(pe, names, bindings=None, *, image_data=False, binding=None):
     if pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20B:
         raise ValueError("expected AMD64 PE32+")
     if image_data and {"bind_image", "unbind_image"} & {parse_entry(name)[0] for name in names}:
         raise ValueError("an export named bind_image or unbind_image collides with the image binding functions")
     program = Program(pe, None if bindings is None else load_bindings(bindings), image_data=image_data)
+    slots = {}
+    if binding is not None:
+        if binding.arguments not in ARGUMENT_COUNTS or binding.return_bytes not in (0, 1, 2, 8):
+            raise ValueError(f"unsupported binding of {binding.symbol}")
+
+        def resolve_tail(slot):
+            if slots and slot not in slots:
+                raise ValueError(f"tail jump through a second IAT slot RVA {slot:#x}")
+            symbol = resolve_import(pe, slot, Path(binding.provider), binding.symbol, binding.link_name)
+            slots[slot] = HostImport(symbol, (8,) * binding.arguments, binding.return_bytes)
+            return slots[slot]
+        program.tail_resolver = resolve_tail
     functions = [lift(pe, *parse_entry(name), program=program) for name in names]
     # Callees precede every caller, so each internal function is defined before its first use.
     sources = program.sources + [source for source, _ in functions]
-    return PRELUDE + (image_block(pe) if image_data else "") + "\n".join(f"\n{source}" for source in sources) + "\n", [f for _, f in functions]
+    declarations = ""
+    if binding is not None:
+        if not slots:
+            raise ValueError(f"binding {Path(binding.provider).name}!{binding.symbol} supplied but no tail jump uses it")
+        symbol = next(iter(slots.values())).symbol
+        params = ", ".join(["word"] * binding.arguments)
+        declarations = f'\nextern "C" __declspec(dllimport) word {symbol}({params});\n'
+    return PRELUDE + declarations + (image_block(pe) if image_data else "") + "\n".join(f"\n{source}" for source in sources) + "\n", [f for _, f in functions]
 
 
-def translate(image, names, bindings=None, *, image_data=False):
+def translate(image, names, bindings=None, *, image_data=False, binding=None):
     with pefile.PE(str(image), fast_load=True) as pe:
-        return translate_pe(pe, names, bindings, image_data=image_data)
+        return translate_pe(pe, names, bindings, image_data=image_data, binding=binding)
 
 
 if __name__ == "__main__":
@@ -1742,14 +1809,30 @@ if __name__ == "__main__":
                              "binds at run time with lifted_bind_image; the generated source states the contract")
     parser.add_argument("--bind-ranges", type=Path, metavar="MANIFEST",
                         help="trusted [start, end) ranges of functions without unwind data, bound to this image's sha256")
+    parser.add_argument("--bind", nargs=2, metavar=("PROVIDER_DLL", "SYMBOL"),
+                        help="provider and export name or #ordinal of the import that a tail jump calls")
+    parser.add_argument("--link-name", help="local import-library symbol for an ordinal binding")
+    parser.add_argument("--import-arguments", type=int, choices=ARGUMENT_COUNTS,
+                        help="integer arguments the bound import takes; stated by the binding, not derived from "
+                             "the provider (required with --bind)")
+    parser.add_argument("--return-bytes", type=int, choices=(0, 1, 2, 8),
+                        help="guaranteed low RAX bytes of the bound import's return, 0 for none; stated by "
+                             "the binding, not derived from the provider (required with --bind)")
     args = parser.parse_args()
+    binding = None
+    if args.bind:
+        if args.import_arguments is None or args.return_bytes is None:
+            parser.error("--bind requires --import-arguments and --return-bytes")
+        binding = Binding(Path(args.bind[0]), args.bind[1], args.link_name, args.import_arguments, args.return_bytes)
+    elif args.link_name is not None or args.import_arguments is not None or args.return_bytes is not None:
+        parser.error("--link-name, --import-arguments and --return-bytes require --bind")
     try:
-        source, functions = translate(args.image, args.exports.split(","), args.bind_ranges, image_data=args.image_data)
+        source, functions = translate(args.image, args.exports.split(","), args.bind_ranges, image_data=args.image_data, binding=binding)
         args.output.write_text(source, encoding="utf-8")
         for function in functions:
             print(f"RVA {function.entry:#x}: {len(function.instructions)} instructions, "
                   f"{sum(len(d[1]) for d in function.dispatches.values())} table entries, "
                   + ("no reachable normal return" if function.return_width is None else
-                     f"{function.return_width} defined RAX byte(s) at every reachable RET"))
+                     f"{function.return_width} defined RAX byte(s) at every reachable normal return"))
     except (ValueError, OSError, pefile.PEFormatError) as error:
         parser.exit(1, f"{error}\n")
