@@ -828,5 +828,65 @@ class TestBufferAtomicAndX2RegisterAliasing(unittest.TestCase):
         self.assertEqual(self.interp.read_reg_u64(RegKind.VGPR, 0), 0xCAFEBABEDEADBEEF)
 
 
+# ---------------------------------------------------------------------------
+# Condition Codes, Status Flags, and Carry/Borrow Isolation Tests
+# ---------------------------------------------------------------------------
+
+class TestBufferAtomicAndX2ConditionCodes(unittest.TestCase):
+    """Unit tests for condition code tracking, status flags, and VCC isolation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarBufferInterpreter(mem_size=4096)
+        self.desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=4096)
+        self.interp.set_buffer_descriptor(0, self.desc)
+
+    def test_condition_codes_zero_result(self) -> None:
+        cc = compute_buffer_condition_codes(0xAAAA, 0x5555, 0)
+        self.assertTrue(cc.zero)
+        self.assertFalse(cc.negative)
+        self.assertFalse(cc.positive)
+
+    def test_condition_codes_negative_result(self) -> None:
+        val = SIGN_BIT64 | 0x1234
+        cc = compute_buffer_condition_codes(val, val, val)
+        self.assertFalse(cc.zero)
+        self.assertTrue(cc.negative)
+        self.assertFalse(cc.positive)
+
+    def test_condition_codes_positive_result(self) -> None:
+        val = 0x0000000012345678
+        cc = compute_buffer_condition_codes(val, val, val)
+        self.assertFalse(cc.zero)
+        self.assertFalse(cc.negative)
+        self.assertTrue(cc.positive)
+
+    def test_status_flags_bounds(self) -> None:
+        flags_in = compute_buffer_status_flags(True)
+        self.assertTrue(flags_in.in_bounds)
+        self.assertFalse(flags_in.oob_fault)
+
+        flags_oob = compute_buffer_status_flags(False)
+        self.assertFalse(flags_oob.in_bounds)
+        self.assertTrue(flags_oob.oob_fault)
+
+    def test_vcc_isolation(self) -> None:
+        canary = 0xDEADBEEFCAFEBABE
+        self.interp.vcc = canary
+        self.interp.mem.write_u64(0, 0xFF)
+        self.interp.write_reg_u64(RegKind.VGPR, 0, 0x0F)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_AND_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2),
+            srsrc=Register(RegKind.SGPR, 0, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        self.interp.step(inst)
+        self.assertEqual(self.interp.vcc, canary)
+
+
 if __name__ == "__main__":
     unittest.main()
