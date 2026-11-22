@@ -7,7 +7,7 @@ Xbox2Windows targets x64 Windows for its C++, HLSL, MASM, D3D12, WARP, and GPU t
 | Work or check | macOS / Linux | x64 Windows | Notes |
 |---|---|---|---|
 | Documentation edits | Yes | Yes | Markdown, diff hygiene, and link checks (`tests/docs_links_check.py`). |
-| 16 pure-Python checks | Yes | Yes | All 15 checks in `python-linux` (`script_state_check.py`, `bcpack_check.py`, `form_coverage_check.py`, `resource_ranges_check.py`, `sgd5_effects_check.py`, `dxcontainer_part_offsets_check.py`, `layout_chunks_check.py`, `dependency_paths_check.py`, `intake/paths_check.py`, `shader_probe_check.py` (no args), `dxil_retarget_check.py` (no args), `rdna2_tools_check.py` (without `LLVM_LIB`), `pso_readiness_check.py`, `docs_links_check.py`, `bidi_controls_check.py`) plus `gpu_report_format_check.py` from `pixel-binary`. |
+| Platform-independent Python checks | Yes | Yes | The commands below cover the [Linux CI workflow](../.github/workflows/windows.yml), the BC7 block reference and the GPU report formatter. |
 | LLVM 15 `gfx1013` translation checks | Yes | No (via CI / separate LLVM) | `tests/pixel_aot_check.py binary`, `tests/ffx_dispatch_aot_check.py`, and `tests/rdna2_tools_check.py` (with `LLVM_LIB`, `LLVM_MC`, `LLVM_OBJCOPY`) verify assembling, disassembling, and lowering only. |
 | `cmake --preset dev` build (MSVC `cl` + Ninja) | No | Yes | `CMakePresets.json` selects `cl`. |
 | MASM fixtures (`tests/cpu/*.asm`) and `cpu_*` tests | No | Yes | Assembled and built by the Windows toolchain. |
@@ -26,16 +26,19 @@ Install Python 3.12 and LLVM 15 with Homebrew (both are needed as explicit paths
 brew install python@3.12 llvm@15
 ```
 
-From the repository root, create a virtual environment under `out/pe-env`, install `pefile` at the version pinned in `requirements-dev.txt`, and run all 16 pure-Python checks:
+From the repository root, create a virtual environment under `out/pe-env`, install `pefile` at the version pinned in `requirements-dev.txt`, and run the platform-independent checks below:
 
 ```bash
 "$(brew --prefix python@3.12)/bin/python3.12" -m venv out/pe-env
 ./out/pe-env/bin/python -m pip install -c requirements-dev.txt pefile
 for t in \
   tests/script_state_check.py \
+  tests/resource_root_check.py \
   tests/bcpack_check.py \
+  tests/bc7_blocks_check.py \
   tests/form_coverage_check.py \
   tests/resource_ranges_check.py \
+  tests/awc_metadata_check.py \
   tests/sgd5_effects_check.py \
   tests/dxcontainer_part_offsets_check.py \
   tests/layout_chunks_check.py \
@@ -70,16 +73,19 @@ LLVM_LIB="$LLVM_PREFIX/lib/libLLVM-15.dylib" \
 
 The [CI workflow](../.github/workflows/windows.yml) runs the platform-independent Python suite on Ubuntu 24.04 with Python 3.12 (`python-linux`) and the `gfx1013` machine-code checks on Ubuntu 22.04 with LLVM 15 (`pixel-binary`).
 
-From the repository root, create `out/pe-env` (Python 3.11 or newer; CI uses 3.12), install dependencies, and run all 16 pure-Python checks:
+From the repository root, create `out/pe-env` (Python 3.11 or newer; CI uses 3.12), install dependencies, and run the platform-independent checks below:
 
 ```bash
 python3 -m venv out/pe-env
 ./out/pe-env/bin/python -m pip install -r requirements-dev.txt
 for t in \
   tests/script_state_check.py \
+  tests/resource_root_check.py \
   tests/bcpack_check.py \
+  tests/bc7_blocks_check.py \
   tests/form_coverage_check.py \
   tests/resource_ranges_check.py \
+  tests/awc_metadata_check.py \
   tests/sgd5_effects_check.py \
   tests/dxcontainer_part_offsets_check.py \
   tests/layout_chunks_check.py \
