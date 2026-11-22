@@ -108,6 +108,7 @@ a bound range only at its start; the callee is walked within that range alone,
 may not move RSP or call, and may not be an import thunk.
 """
 
+import re
 import argparse
 import hashlib
 import json
@@ -739,6 +740,7 @@ class Lifter:
         self.image_used = False
         self.frame = {}  # RVA -> index into the frame array of the stack bytes it accesses (from Frame)
         self.adjustments = set()  # RVAs of SUB or ADD RSP, imm
+        self.captured = {}  # RVA -> declaration of the local that holds the instruction's one guest read
 
     def slot(self, ins):
         if ins.ip not in self.frame:
@@ -776,12 +778,31 @@ class Lifter:
             return f"static_cast<std::uint64_t>(static_cast<std::uint32_t>({' + '.join(parts)}))"
         return "(" + " + ".join(parts) + ")"
 
+    def capture(self, ins, text):
+        """The statement of ins with its guest read, if any, performed first and exactly once."""
+        declaration = self.captured.pop(ins.ip, None)
+        if declaration is None:
+            return text
+        # A read whose value nothing uses (CMP or TEST without a flag consumer) is still performed.
+        parts = [declaration, text] if re.search(r"\bmem\b", text) else [declaration, "static_cast<void>(mem);", text]
+        return "{ " + " ".join(part for part in parts if part) + " }"
+
     def operand(self, ins, number, width):
         kind = ins.op_kind(number)
         if kind == OpKind.REGISTER:
             return self.reg(ins.op_register(number))
         if kind == OpKind.MEMORY:
-            return f"load<{unsigned(width)}>({self.address(ins)})"
+            if ins.memory_base == R.RSP and ins.ip in self.frame:
+                # The function's own frame array: a read of it cannot fault.
+                return f"load<{unsigned(width)}>({self.address(ins)})"
+            # The instruction's memory operand is read once, at its own width, into a local declared before
+            # the rest of the statement (see capture()); every use of the operand names that local. The read
+            # is volatile: the original faults on an inaccessible operand even when the value is never
+            # used, and the host compiler may drop an ordinary load whose value is unused.
+            declaration = f"const {unsigned(width)} mem = load_always<{unsigned(width)}>({self.address(ins)});"
+            if self.captured.setdefault(ins.ip, declaration) != declaration:
+                raise ValueError(f"memory operand read at two widths at RVA {ins.ip:#x}")
+            return "mem"
         if kind in (OpKind.IMMEDIATE8, OpKind.IMMEDIATE8TO16, OpKind.IMMEDIATE8TO32, OpKind.IMMEDIATE8TO64,
                     OpKind.IMMEDIATE16, OpKind.IMMEDIATE32, OpKind.IMMEDIATE32TO64, OpKind.IMMEDIATE64):
             return f"static_cast<{unsigned(width)}>({ins.immediate(number) & ((1 << width * 8) - 1):#x}ull)"
@@ -863,6 +884,11 @@ class Lifter:
         return table[code]
 
     def statement(self, ins, sets_flags=False, producer=None):
+        """lower(), with the instruction's guest memory read performed first and exactly once."""
+        text, reads, writes = self.lower(ins, sets_flags, producer)
+        return self.capture(ins, text), reads, writes
+
+    def lower(self, ins, sets_flags=False, producer=None):
         """Return C++ for one instruction, the low bytes it reads from each full register and the
         width it writes to each full register.
 
@@ -1050,14 +1076,8 @@ class Lifter:
             note(0, 1)
             condition = self.condition(producer, ins)
             source, destination = self.operand(ins, 1, width), self.operand(ins, 0, width)
-            # A 32-bit CMOVcc zero-extends the destination even when the condition is false,
-            # and a memory source is read either way.
-            if ins.op1_kind == OpKind.MEMORY:
-                line = self.write(ins, width, f"({condition}) ? source : {destination}")
-                # A volatile read: when the condition folds to false the compiler may not drop the load,
-                # which faults on hardware for an inaccessible source.
-                source = f"load_always<{unsigned(width)}>({self.address(ins)})"
-                return f"{{ const {unsigned(width)} source = {source}; {line} }}", reads, writes
+            # A 32-bit CMOVcc zero-extends the destination even when the condition is false, and a memory
+            # source is read either way: capture() reads it before the condition is evaluated.
             return self.write(ins, width, f"({condition}) ? {source} : {destination}"), reads, writes
         if mnemonic == M.RET:
             # Which bytes of RAX are a return value is decided by the definedness pass in lift().
@@ -1576,12 +1596,14 @@ static inline bool even_parity(word value) {
     const auto folded = static_cast<unsigned>((value ^ (value >> 4)) & 15u);
     return ((0x6996u >> folded) & 1u) == 0;
 }
+// A read of the function's own frame array, which cannot fault.
 template <class T> static T load(word address) {
     T value;
     std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
     return value;
 }
-// A read the compiler must perform even when its value is unused (a CMOVcc memory source).
+// Every guest read, once per instruction: the compiler must perform it even when its value is unused,
+// because the original faults on an inaccessible address either way.
 template <class T> static T load_always(word address) {
     return *reinterpret_cast<const volatile T*>(address);
 }

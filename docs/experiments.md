@@ -62,11 +62,11 @@ ctest --preset dev --no-tests=error -R '^cpu_native_archive_blast$' -V
 
 ## CRC-32 console program from the PE entry
 
-`cpu_crc_line` reads the first text line from stdin and writes eight uppercase hexadecimal digits and a newline. Its [MASM entry](../tests/cpu/crc_line/entry.asm) handles input, formatting and exit status. MSVC compiles the [CRC update](../tests/cpu/crc_line/crc_step.cpp) as a separate optimized object. The linker imports the real Windows Universal CRT stdio functions through `ucrt.lib`. The source PE has a return-based entry and uses no CRT startup stub.
+`cpu_crc_line` reads the first text line from stdin and writes eight uppercase hexadecimal digits and a newline. Its [MASM entry](../tests/cpu/crc_line/entry.asm) handles input, formatting and exit status. MSVC compiles the [CRC update](../tests/cpu/crc_line/crc_step.cpp) as a separate optimized object. The linker imports the real Windows Universal CRT stdio functions through `ucrt.lib`. The source PE uses the shared [native startup wrapper](../tests/cpu/exe_startup.asm) and exports the returning body as `native_entry`. The wrapper calls `ExitProcess` when Windows launches the EXE and returns the body status when a host maps the image.
 
-The [console translator](../tools/cpu_stdio_exe_aot.py) starts at `AddressOfEntryPoint` with no defined argument registers. On MSVC 19.51 the first refusal before enabling imports was at RVA `0x103d`, the call through the IAT to `getchar`. The translator binds near RIP-relative calls by their IAT slots, DLL and symbol, with the argument widths and defined return bytes of `getchar`, `putchar` and `fflush`. It follows the direct call to the compiled CRC routine and emits both functions from the linked instructions. Only the generated C++ is compiled into the AOT executable. The host supplies the UCRT calls. The test rejects a copy that names a different provider.
+The [console translator](../tools/cpu_stdio_exe_aot.py) lifts `native_entry` with no defined argument registers. Its generated EXE embeds the SHA-256 of the input PE, which the comparison checks against the image it launches and maps. On MSVC 19.51 the first refusal before enabling imports was at RVA `0x103d`, the call through the IAT to `getchar`. The translator binds near RIP-relative calls by their IAT slots, DLL and symbol, with the argument widths and defined return bytes of `getchar`, `putchar` and `fflush`. It follows the direct call to the compiled CRC routine and emits both functions from the linked instructions. Only the generated C++ is compiled into the AOT executable. The host supplies the UCRT calls. The test rejects a copy that names a different provider.
 
-The [Windows comparison](../tests/cpu/crc_line_check.py) launches the native EXE, a child running the same PE with `pe_map_run`, and the AOT EXE. The mapped child restores normal UCRT text-mode pipes before entry. All three produced `CBF43926\r\n` for `123456789` and exited 0. They also agreed on CRLF, a final line without a newline, an empty line and a 13,000-byte line. EOF before any input produced no output and exit 1. A read-only stdout handle left the sink unchanged and produced exit 2. A separately linked and retranslated Castagnoli polynomial control produced `E3069283\r\n` on the same standard vector.
+The [Windows comparison](../tests/cpu/crc_line_check.py) launches the native EXE, a child running the same PE with `pe_map_run`, and the AOT EXE. The mapped child restores normal UCRT text-mode pipes before entry. All three produced `CBF43926\r\n` for `123456789` and exited 0. They also agreed on CRLF, a final line without a newline, an empty line and a 13,000-byte line. EOF before any input produced no output and exit 1. A read-only stdout handle left the sink unchanged and produced exit 2. A separately linked and retranslated Castagnoli polynomial control produced `E3069283\r\n` on the same standard vector. With a worker held on an event at the startup boundary, the piped cases check the native process handle, EOF on both pipes, output bytes and exit code. The read-only stdout case also checks exit 2 with the worker held. A marker emitted after `pe_map_run` returns confirms that the mapped host regains control.
 
 ```powershell
 cmake --build --preset dev --target cpu_crc_line_lifted cpu_crc_castagnoli_lifted pe_map
@@ -521,6 +521,8 @@ Run `ctest --preset dev --no-tests=error -R '^cpu_aot_rcx_branches$' -V`.
 
 An immediate SHL, SHR or SAR whose masked count is zero leaves the flags unchanged, but a 32-bit destination is still written and its upper half clears. This covers `shl eax, 0` and `shl eax, 32`, because the count is masked to five bits. The lowering keeps the flags and emits the zero-extending write. A 64-bit destination keeps every bit. `cpu_aot_shift_count` builds these forms from MASM source, together with a nonzero control. It compares the native and translated images with a reference and checks that `sete` after a zero-count shift still observes the preceding compare. Before this change the translation returned `0xdeadbeef12345678` for `shl_zero(0xdeadbeef12345678)` where the hardware returns `0x12345678`. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_shift_count$' -V`.
 
+The shared lowering also handles 32-bit and 64-bit integer bit-scan, bit-count, byte-swap, and register bit-test forms (`bsf`, `bsr`, `bswap`, `popcnt`, `lzcnt`, `bt`, `bts`, `btr`, `btc`), including zero-extending 32-bit writes, ZF/CF updates, and rejection of memory-operand bit tests. `cpu_aot_bit_ops` probes CPUID for POPCNT and LZCNT before invoking the native fixture and exits 77 (capability skip) on unsupported hosts; on capable hosts it builds all 19 exports from MASM source (`tests/cpu/bit_ops.asm`), translates them, and compares values and flags against the native DLL and a reference model. Run `cmake --build --preset dev --target cpu_bit_ops_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_bit_ops$' -V`.
+
 The shared lowering also handles `clc`, `stc` and `cmc`, and the rotations through the carry flag `rcl` and `rcr` in 8-, 16-, 32- and 64-bit register and memory forms, including `ah`, with a count of 1, an immediate or CL. The rotation steps one bit at a time, as in the Intel SDM pseudocode. The count is masked to five bits, or six for a 64-bit operand. The 8- and 16-bit forms rotate 9 and 17 bits, so reducing their counts modulo 9 and 17 only bounds the loop. A zero step count keeps CF, and ZF is never affected. OF, which the SDM defines only for a count of 1, is not modelled, like the other flags the lowering omits. A 32-bit register destination is written and its upper half cleared even when the masked count is zero, as for the zero-count shifts above. The native fixture confirms this.
 
 `cpu_aot_carry_rotates` builds 102 exports from MASM source (`tests/cpu/carry_rotates.asm`, generated by `tests/cpu/carry_rotates.py asm`):
@@ -727,7 +729,7 @@ ctest --preset dev --no-tests=error -R '^cpu_native_exe_start$' -V
 
 ### Starting an EXE with two DLLs
 
-`cpu_startup_exe` and two DLLs, all built without a C runtime, import each other in a known order. `cpu_startup_a` has no imports and keeps an event log and a value set by its initializer (`7`). `cpu_startup_b` imports `cpu_startup_a`, and its initializer publishes `a_value() * 2`, so it reads zero if it runs first. The EXE imports both. These initializers are the DLLs' `DLL_PROCESS_ATTACH` entry points, called by the loader, not C++ static constructors. The EXE's TLS callback logs `t` and its entry point logs `e`. The entry point then runs two worker threads one after the other and joins each with a 30 s limit. Every thread keeps its own value in a `TlsAlloc` slot (`1` in the main thread, `2` and `3` in the workers). That is explicit TLS through kernel32, not implicit `__declspec(thread)` data. The entry point writes the log to standard output and returns `b_value() | first worker << 8 | second worker << 16 | main << 24` as its exit code.
+`cpu_startup_exe` and two DLLs, all built without a C runtime, import each other in a known order. `cpu_startup_a` has no fixture DLL dependencies and keeps an event log and a value set by its initializer (`7`). `cpu_startup_b` imports `cpu_startup_a`, and its initializer publishes `a_value() * 2`, so it reads zero if it runs first. The EXE imports both. These initializers are the DLLs' `DLL_PROCESS_ATTACH` entry points, called by the loader, not C++ static constructors. The EXE's TLS callback logs `t` and its entry point logs `e`. The entry point then runs two worker threads one after the other and joins each with a 10 s limit. A's TLS callback allocates an explicit kernel32 `TlsAlloc` slot and sets `1` on the main thread. The workers set `2` and `3` in their respective copies of the slot. Both images use empty static TLS data templates. The entry point writes the event log and the callback trace to standard output and returns `b_value() | first worker << 8 | second worker << 16 | main << 24` as its exit code.
 
 `cpu_native_startup` launches the EXE with the Windows loader in a directory holding the two DLLs, and starts it with `pe_map_run` in a child process. The harness reads the import tables, orders the images dependencies first, maps each DLL, serves the imports of the DLLs with `pe_map_export` on the mapped images and the kernel32 imports with the host. `pe_map` does the mapping, relocation, section protection, each DLL's attach notification and the start of the EXE; it does not read import tables to find dependencies. On Windows 11 build 26300:
 
@@ -736,15 +738,15 @@ native: LOG:abtew2w3m1 exit 0x103020e
 mapped: LOG:abtew2w3m1 exit 0x103020e
 ```
 
-- The logs, exit codes, standard output and standard error (empty) are identical. Under both loaders `a` and `b` ran once and in dependency order, the TLS callback ran after the DLL initializers and before the entry point, the entry point ran once, and `b_value()` was `14`. The three threads read their own `TlsAlloc` values.
+- The startup event logs and exit codes match, and both standard error streams are empty. Under both loaders `a` and `b` ran once and in dependency order, the TLS callback ran after the DLL initializers and before the entry point, the entry point ran once, and `b_value()` was `14`. The three threads read their own `TlsAlloc` values.
 - Without B's initializer (`cpu_startup_b_noinit` under B's name) both loaders give `LOG:atew2w3m1` and exit code `0x1030200`. With another A under A's name (`cpu_startup_a_alt`, whose value is 9) both give the original log and `0x1030212`. Both controls differ from the original under both loaders.
 - Mapping the EXE before its DLLs fails with `unresolved import cpu_startup_b.dll!b_value`.
-- Thread notifications are not part of the comparison: the fixture does not count the `DLL_THREAD_ATTACH` events of the workers, because `pe_map` does not forward them to mapped images.
+- On Windows 10 build 19045.6456, A's TLS callback read `1` on process attach using the main thread ID. For each joined worker it read `0` on thread attach, then the worker's value (`2` or `3`) on thread detach. The harness checks the recorded IDs against the actual main and worker IDs in each process. Both loaders produce the same observations by thread role, including with B's initializer disabled and with the alternate A. The test measures callbacks of the dependency DLL. [Thread forwarding](https://github.com/R0Y00/Xbox2Windows/pull/139)
 
 Not covered: `DLL_PROCESS_DETACH` ordering at exit, DLLs built with the C runtime (C++ constructors), implicit TLS and `GetModuleHandle(NULL)`. Measured on Windows 11 build 26300. [Issue #165](https://github.com/R0Y00/Xbox2Windows/issues/165)
 
 ```powershell
-cmake --build --preset dev --target pe_map cpu_startup_exe cpu_startup_a cpu_startup_a_alt cpu_startup_b cpu_startup_b_noinit
+cmake --build --preset dev --target pe_map cpu_startup_exe cpu_startup_a cpu_startup_a_alt cpu_startup_b cpu_startup_b_noinit cpu_startup_exe_timeout cpu_startup_exe_create
 ctest --preset dev --no-tests=error -R '^cpu_native_startup$' -V
 ```
 
@@ -803,6 +805,14 @@ ctest --preset dev --no-tests=error -R '^cpu_native_reloc_free$' -V
 ctest --preset dev --no-tests=error -R '^cpu_native_mutation$' -V
 ```
 
+### Forwarded exports
+
+`cpu_forwarder` exports `local_value` and forwards `mix_args` to `cpu_import_provider.mix_args`; the linker records that string in the export directory. `pe_map_export` keeps returning null for the forwarder. `pe_map_export_resolved` follows the string through the host resolver, and the returned address matched `GetProcAddress` on a `LoadLibrary` copy in `cpu_native_forwarder`. `local_value` resolves to the same RVA under both loaders. An absent name and a resolver that returns null give null. The `Module.#ordinal` form is parsed but has no fixture yet.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_forwarder$' -V
+```
+
 ## Switch dispatch through jump tables
 
 Compilers lower a dense `switch` to a bounds check and an indirect `JMP` through a table of 32-bit entries. The [jump-table translator](../tools/cpu_switch_aot.py) recognizes the two x64 layouts in common use. MSVC stores image-relative entries and loads them through a register holding `__ImageBase`. LLVM stores signed offsets from the table and adds the table address. The translator reads the table from the PE, then emits a C++ `switch` whose cases jump to labels at the decoded targets. The host compiler builds its own dispatch from that switch.
@@ -845,7 +855,7 @@ ctest --preset dev --no-tests=error -R '^cpu_aot_flag_conditions$' -V
 
 The supported functions take three integer words in RCX, RDX and R8 and return RAX, of which only the low bytes described below are compared. An entry can instead be translated with a fourth integer word in R9, as described below. Stack arguments (the fifth and later) and floating-point arguments are not supported. A leaf function without a `.pdata` entry is bounded by its executable section. Its walk may not enter an interval owned by another function's unwind entry.
 
-The [source fixture](../tests/cpu/switch.asm) exports six functions. `select_rva` uses the MSVC layout, and `select_rel` computes the same function through the LLVM layout. Both have seven cases, including two selectors that share a target, a case that falls through into the next, and a default path. `run_ops` runs a byte program in a loop and dispatches every byte through a five-entry table. It stops at the first opcode above 4. Through the register probe, the test compares each original export with the matching lifted function, a reference written in Python, and RBX/RSI sentinels. It runs 600 selector and operand pairs per layout and 138 programs. Half of the pairs carry nonzero upper register halves that must not reach the table index. A control assembles the same source with two entries swapped in each table, and its translation must follow the swapped reference. `shift_narrow` dispatches through a six-entry LLVM-layout table to byte and word `SHL`, `SHR` and `SAR` of a memory destination by `CL`. x86 masks the count to five bits for 8- and 16-bit operands as well, so counts of 8 to 31 still shift (a byte holding 1 shifted left by 8 becomes 0). The translator performs these shifts in 64 bits and truncates the stored result; 4,608 inputs, covering every count from 0 to 31 and count bytes above 31, match the original and the reference. `flag_select` dispatches through an eight-entry LLVM-layout table to `SETL`, `SETBE`, `SETG` into a memory byte, `SETNE` after a 16-bit compare, and `CMOVA`, `CMOVNS` (64-bit, after `TEST`), `CMOVGE` from memory with a `MOV` between compare and consumer, and `CMOVE` after `TEST` with an immediate. It compares EDX with bits 32 to 63 of RDX and returns RAX whole. A 32-bit `CMOVcc` therefore shows that it clears bits 32 to 63 even when the condition is false, and a byte `SETcc` shows that it keeps them. The translation reads a memory source of `CMOVcc` on both outcomes, as the processor does. 4,000 inputs at the signed, unsigned and 16-bit boundaries must match the original and the reference. The swapped-table build exchanges the `SETL` and `CMOVA` entries and must follow the swapped reference. `cmov_read` executes `CMOVNE` after `CMP ECX, ECX`, which never moves but still reads its memory source: called with a null R8 it must fault in the original and in the translation. The translator therefore reads a `CMOVcc` memory source through a `volatile` load; with an ordinary load, an optimized MSVC Release build drops the read and the null call returns.
+The [source fixture](../tests/cpu/switch.asm) exports six functions. `select_rva` uses the MSVC layout, and `select_rel` computes the same function through the LLVM layout. Both have seven cases, including two selectors that share a target, a case that falls through into the next, and a default path. `run_ops` runs a byte program in a loop and dispatches every byte through a five-entry table. It stops at the first opcode above 4. Through the register probe, the test compares each original export with the matching lifted function, a reference written in Python, and RBX/RSI sentinels. It runs 600 selector and operand pairs per layout and 138 programs. Half of the pairs carry nonzero upper register halves that must not reach the table index. A control assembles the same source with two entries swapped in each table, and its translation must follow the swapped reference. `shift_narrow` dispatches through a six-entry LLVM-layout table to byte and word `SHL`, `SHR` and `SAR` of a memory destination by `CL`. x86 masks the count to five bits for 8- and 16-bit operands as well, so counts of 8 to 31 still shift (a byte holding 1 shifted left by 8 becomes 0). The translator performs these shifts in 64 bits and truncates the stored result; 4,608 inputs, covering every count from 0 to 31 and count bytes above 31, match the original and the reference. `flag_select` dispatches through an eight-entry LLVM-layout table to `SETL`, `SETBE`, `SETG` into a memory byte, `SETNE` after a 16-bit compare, and `CMOVA`, `CMOVNS` (64-bit, after `TEST`), `CMOVGE` from memory with a `MOV` between compare and consumer, and `CMOVE` after `TEST` with an immediate. It compares EDX with bits 32 to 63 of RDX and returns RAX whole. A 32-bit `CMOVcc` therefore shows that it clears bits 32 to 63 even when the condition is false, and a byte `SETcc` shows that it keeps them. The translation reads a memory source of `CMOVcc` on both outcomes, as the processor does. 4,000 inputs at the signed, unsigned and 16-bit boundaries must match the original and the reference. The swapped-table build exchanges the `SETL` and `CMOVA` entries and must follow the swapped reference. `cmov_read` executes `CMOVNE` after `CMP ECX, ECX`, which never moves but still reads its memory source: called with a null R8 it must fault in the original and in the translation. The translator therefore performs every read of guest memory through a `volatile` load; with an ordinary load, an optimized MSVC Release build drops a read whose value is unused and the null call returns. Each instruction's memory operand is read once, at its own width, into a local declared before the rest of the statement, and every use of the operand names that local: an `ADD` whose result and flags both come from one operand performs one read. Reads of the function's own frame array, which cannot fault, stay ordinary loads. The [dead-read fixture](../tests/cpu/dead_read.asm) stores 1 to the trace before each read and 2 after it. Its exports read a value that is overwritten, compare memory with flags that are never read, read one byte, read two operands whose sum is cleared, return the value read, skip the read on a branch, and take a sum and its zero flag from one read, into a register and in place. `cpu_aot_dead_reads` builds the translation with the project's build and again with a separate `cl /O2` command, calls the original and each translation inside `__try` with fresh trace words and a fresh page, and compares the structured exception code, the return value, the trace and the page. For a readable operand all three return the reference. For a null operand, and for an operand whose read crosses into an inaccessible page, the original raises an access violation after the first marker and before the second, and both translations must do the same; an operand that ends exactly at the page boundary returns, at each width, and the second read of the pair faults when only the first is readable. On the branch that skips the read, the same inaccessible addresses return normally with the first and third markers written. A source control checks that each memory operand is read once through the `volatile` load and that the shared reads are used twice. An unoptimized build performs an ordinary load as well, so the `/O2` builds are the ones that show the difference. Stores are unchanged.
 
 On a copy of the linked DLL, the test patches the code, the table or `.pdata`, and expects each change below to be rejected:
 
@@ -942,6 +952,65 @@ The report follows the effect's stored list order. Each entry gives its stored g
 
 Two independently located local effects yielded 5 and 81 candidates across all groups. Their pixel lists contained 2 and 41 candidates respectively, and every pixel-container digest matched an independent decode. Identifying which candidate a draw uses still requires evidence of pass selection.
 
+## Single-group mesh entry specialization
+
+The indexed variant, selected with `--vertex-header WORD`, specializes packed
+16-bit geometry indices and the vertex header while leaving the actual float3
+vertices in a 512-byte GPU SRV at t0. Table slots 0, 0x20 and 0x40 select
+geometry, object transform and projection buffers. The profile binds the low/high
+pointer inputs in s18/s19 and verifies the constructed four-word vertex
+descriptor before accepting a read. A changed header or index stream requires
+retranslation. A changed vertex position can use the same DXIL. Undefined
+registers, reads before their waits and out-of-range vertex accesses are rejected.
+
+```text
+python3 -B tests/mesh_indexed_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+ctest --preset dev --no-tests=error -R "^mesh_indexed_draw_" -V
+```
+
+A local 1,028-byte entry (197 instructions) read three distinct vertex
+positions and produced visible geometry with controlled indices, transforms and
+vertex data. The two sets of positions cover 1,024 and 276 of the 1,024 pixel
+centers. Both plain and instrumented mesh DXIL match the CPU raster reference.
+The instrumented draw also checks counts, three float4 positions, the primitive
+indices and guard bytes. Aliasing one vertex to another changes exactly the
+276 covered pixels and fails the export check. Measured with the debug layer
+enabled on Windows 26200.9974, RTX 4060 Laptop 32.0.16.1656 and WARP
+10.0.26100.9818. The source-built fixture also permutes the packed indices.
+
+`tools/mesh_entry_aot.py` takes an extracted mesh container and a JSON array of
+unsigned geometry words. It checks the native extent and the PSV triangle
+topology, group size and output bounds. It decodes the entry with LLVM in
+wave64 mode, follows two waves of forward control flow and specializes the
+geometry reads and lane masks. The resulting desktop mesh shader reads position
+and transform data from b0 and b1, emits three vertices and one primitive, and
+can record its exports to a diagnostic UAV when compiled with `TRACE_EXPORTS`.
+
+The specialization assumes one 128-thread group, wave ID in bits 24–27 of s3,
+a descriptor table token in s17, and zero for s20, s21 and v5. Table offsets
+0x20, 0x60 and 0x80 select static geometry, point data and the transform,
+respectively. Changing geometry requires retranslating the entry. The native
+draw state and application bindings remain unverified. Each public test builds
+its own inputs. The visible triangle control uses an independently authored
+native program, and the CPU checks its 32×32 target, exported vertices,
+primitive index order and guard bytes.
+
+```text
+python3 -B tests/mesh_entry_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+ctest --preset dev --no-tests=error -R "^mesh_entry_draw_" -V
+```
+
+A local scan based on main `933cbad` selected the shortest validated native
+stream among 9,282 MS records (832 bytes, 153 instructions). For the tested
+geometry its three vertices receive the same transformed position. The raster
+target therefore retains its clear color. Two independently calculated
+point/matrix cases matched all three exported positions and the (0,1,2) index
+triple. The uninstrumented shader also completed a draw for both inputs. The
+source-built visible triangle filled all 1,024 pixels, while altering a
+reference index caused the comparison to fail. Tested on Windows build
+26200.9974, RTX 4060 Laptop driver 32.0.16.1656 and WARP 10.0.26100.9818,
+with the debug layer enabled.
+
 ## Compute UAV stores from a native container
 
 `tools/compute_store_aot.py` accepts a local extracted DXBC compute container. It checks the stage in both the DXIL and PSV0 parts, the group dimensions, the FSSM v0x101 extent and termination, then decodes the gfx1013 instructions with LLVM. The first profile translates one raw UAV store of one to four immediate words per invocation. A test binding maps one four-word descriptor to u0. Its table pointer has a known low register and a zero high word. Scalar loads must complete before use. For an indexed store the caller also supplies the group-X register and byte stride, v0 carries local X, and the decoded shift and add must produce the dispatch-thread index. The tests bind in-range raw buffers with no swizzle, format conversion or out-of-range accesses. The original descriptor contents and dispatch configuration require separate evidence.
@@ -954,6 +1023,109 @@ python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLV
 Build the emitted source with `dxc -T cs_6_0 -E main`. The Windows fixture reads back all 320 words, including gaps between records and the untouched tail, after one and three indexed groups. A wrong stored word and a wrong guard word must both fail. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_'`.
 
 A local scan of 2,689 compute records accepted 12 records (10 distinct instruction streams). Ten use one-thread groups and fixed addresses. Two use 32- and 64-thread groups and indexed addresses. Tested table bindings used s4 or s5 with descriptor offsets of 0, 32 or 64. The indexed bindings used strides of 4, 8, 12 or 16 bytes, selecting the first compatible profile. On RTX 4060 Laptop (32.0.16.1656) and WARP (10.0.26100.9818), each record compiled to desktop DXIL and dispatched. Each adapter completed 14 full-buffer comparisons with zero mismatches, including two different group counts for both indexed records.
+## AVX2 leaf recompilation
+
+[The AVX2 leaf translator](../tools/cpu_avx2_aot.py) lifts bounded straight-line Windows x64 leaf functions covering all 28 AVX2 forms in `docs/coverage/x64_zen2.tsv` group `AVX2`:
+
+- 128-bit lane broadcast and permute: `vbroadcasti128` (`m128` source), `vextracti128`, `vinserti128`, `vperm2i128`
+- Element broadcasts: `vpbroadcastb`, `vpbroadcastw`, `vpbroadcastd`, `vpbroadcastq` (XMM and YMM destinations)
+- Cross-lane permutes: `vpermd`, `vpermpd`, `vpermps`, `vpermq`
+- Blend: `vpblendd` (XMM and YMM widths)
+- Variable shifts: `vpsllvd`, `vpsllvq`, `vpsravd`, `vpsrlvd`, `vpsrlvq` (XMM and YMM widths)
+- Indexed gathers (VSIB): `vgatherdps`, `vgatherdpd`, `vgatherqps`, `vgatherqpd`, `vpgatherdd`, `vpgatherdq`, `vpgatherqd`, `vpgatherqq` (all 16 VEX encodings across `vm32x`, `vm32y`, `vm64x`, `vm64y` and XMM/YMM widths)
+- Masked loads and stores: `vpmaskmovd`, `vpmaskmovq` (all 8 VEX encodings across XMM/YMM load and store forms)
+
+Each lifted export takes `(word rcx, word rdx, word r8)` pointing to caller-owned flat buffers and returns `void`. For transport and ABI glue the translator accepts `vmovdqu` (128- and 256-bit flat loads, stores and register copies), `vzeroupper` and terminal `ret`.
+
+### State model, memory semantics and explicit rejections
+
+YMM registers `ymm0`..`ymm5` are represented as a portable C++ value struct (`struct Vec256 { std::uint64_t q[4]; }`) rather than MSVC AVX2 intrinsics, so the generated C++ compiles with default x64 flags without `/arch:AVX2` and avoids C++ shift-width undefined behavior when shift counts are `>= 32` or `>= 64`. Every VEX write to an XMM destination zeroes bits 128..255 of the corresponding YMM register, and `vzeroupper` zeroes bits 128..255 of all defined YMM registers. `vpermd` and `vpermps` mask each 32-bit index to its low 3 bits; floating-point permutes and gathers transfer raw bits without canonicalization or FP exceptions. Per the AVX2 ISA, variable shifts do not wrap counts modulo lane width: unsigned lane counts `>= 32` (32-bit shifts) or `>= 64` (64-bit shifts) zero the lane in `vpsllvd`, `vpsllvq`, `vpsrlvd` and `vpsrlvq`, and fill the lane with the sign bit in `vpsravd`.
+
+Memory-domain AVX2 instructions follow the Intel SDM lane, fault-suppression and register-state rules:
+
+- **Indexed gathers (`vgather*` / `vpgather*`)**: each lane `i` within the instruction's gathered element count checks the MSB of `mask[i]`; when set, it loads 32 or 64 bits from `base + SignExtend(vindex[i]) * scale + disp` inside an `if` guard so masked-off lanes never dereference memory. Masked-off lanes within the gathered element count preserve their prior destination value; upper bits beyond the gathered element count are zeroed (bits `64..255` for `vgatherqps`/`vpgatherqd` with `vm64x`, bits `128..255` for other XMM-destination gathers). After every gather, the entire 256-bit mask register is zeroed.
+- **Masked loads and stores (`vpmaskmovd` / `vpmaskmovq`)**: masked loads read only lanes whose mask MSB is set and zero masked-off lanes (and bits `128..255` for XMM destinations) while preserving the mask register; masked stores write only lanes whose mask MSB is set and never touch masked-off memory locations.
+
+Memory-operand scope remains explicit: `vbroadcasti128` (`m128`), `vmovdqu` and `vpmaskmovd`/`vpmaskmovq` require flat `[base + disp]` addressing rooted in `rcx`, `rdx` or `r8`, and gathers require VSIB `[base + vindex*scale + disp]` with base in `rcx`/`rdx`/`r8`, SIB scale in `{1, 2, 4, 8}`, and pairwise distinct `dest`/`index`/`mask` vector registers. The translator explicitly rejects:
+
+- memory operands on all 17 register-only AVX2 forms;
+- overlapping gather destination/index/mask registers (including XMM/YMM cross-width aliases), illegal VSIB scales, missing/non-argument/32-bit/`rsp` bases, RIP-relative or GPR-indexed `vpmaskmov` operands, and reads of undefined `dest`/`index`/`mask`/`src` vector registers;
+- EVEX encodings (including EVEX gathers), instruction prefixes, nonvolatile vector registers (`xmm6`..`xmm15` / `ymm6`..`ymm15`), branches, out-of-scope instructions, missing terminal `ret` and unreachable instructions after `ret`.
+
+```powershell
+cmake --build --preset dev --target cpu_avx2_regs_original cpu_avx2_regs_original_lifted cpu_avx2_regs_altered_lifted
+ctest --preset dev --no-tests=error -R '^cpu_aot_avx2_regs$' -V
+```
+
+### Measured results and open scope
+
+The [MASM fixture](../tests/cpu/avx2_regs.asm) builds 68 exports covering all 28 AVX2 forms (42 register-domain exports plus 18 gather exports and 8 `vpmaskmov` load/store exports) across XMM and YMM widths, ignored immediate bits, `vperm2i128` lane-zeroing control bits, IEEE-754 special bit patterns (signed zero, subnormals, infinities, sNaN and qNaN), boundary lane indices (`0`..`7` with high-bit noise), boundary shift counts (`0`, `1`, `15`, `31`, `32`, `33`, `63`, `64`, `65`, `128`, `0x100000001`, `0x7fffffff`, `0x80000000`, `0xffffffff`, `0xffffffffffffffff`), `vzeroupper` upper-lane clearing, a chained `op_pipeline` function, full/partial/zero masks (including `0x7fffffff`/`0x7fffffffffffffff` non-MSB checks), negative and boundary signed 32-bit and 64-bit VSIB indices, scales `1`/`2`/`4`/`8`, positive/negative displacements, all four gather dest-width/index-width combinations (including `vm64x` bits `64..255` zeroing and post-gather mask zeroing), and Windows `VirtualAlloc` + `PAGE_NOACCESS` guard-page fault-suppression checks for every gather and `vpmaskmov` export. [The Windows test](../tests/cpu/avx2_regs_check.py) checks 1,120 differential cases (772 register-domain + 348 memory-domain) and 34 guard-page fault-suppression cases across all 68 exports with 16-byte pre/post guards against both the native MASM DLL and an independent Python reference model.
+
+An `ALTER_IMM` variant changes the immediates or memory displacements of `op_perm2i128_mix`, `op_permq`, `op_pblendd_ymm`, `op_gatherdps_ymm` and `op_pmaskmovd_load_ymm`, and must match the altered reference while diverging from the unmodified reference on 14, 14, 16, 12 and 10 cases respectively. An output-mutation negative control flips one bit of `op_pipeline` and confirms the comparator fails. Rejection controls cover 59 unit cases (memory-operand variants of all 17 register-only AVX2 forms, 7 out-of-scope ops, 23 gather/maskmov/EVEX violations including overlapping dest/index/mask registers and unsupported addressing, and 12 ABI/state violations), 4 direct invalid-scale checks (`0`, `3`, `5`, `16`), and 9 end-to-end PE-patched DLL cases. In `tools/form_coverage.py`, `avx2_regs.asm` accounts for all 28 of 28 forms in `x64_zen2.tsv` group `AVX2`.
+
+Not covered by this experiment: memory operands on the 17 register-only AVX2 forms, control flow or calls mixed with AVX2 state, nonvolatile `XMM6`..`XMM15` save/restore prologues, and title CPU code execution.
+
+## Two-table depth-only pixel shaders
+
+### Coverage-only texture sampling
+
+`tools/sampled_coverage_aot.py` translates a two-exit PS which selects a texture
+through a buffer word, samples an interpolated UV and compares the scaled sample
+with a threshold. Both exits export only coverage. The selector, table pointers
+and point-clamp sampler are specialized for a supplied snapshot. The texture
+and two comparison inputs remain GPU resources. Changing the selector requires
+another translation. The tested inputs are finite and the textures have one mip.
+
+The JSON bindings used by the source-built fixture are constructed by
+`bindings(slot)` in `tests/sampled_coverage_check.py`. A descriptor entry lists
+the table's entry SGPR, its byte offset, the descriptor kind and its value.
+For a CB the value is a word offset into desktop b0. For a texture it selects
+t0 or t1. `words` supplies concrete entry SGPR values and `selector_byte`
+identifies the known word in the selector buffer.
+
+```sh
+python3 -B tools/sampled_coverage_aot.py local.dxbc --bindings snapshot.json --llvm libLLVM-15.so.1 --output out/coverage.hlsl
+python3 -B tests/sampled_coverage_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+ctest --preset dev --no-tests=error -R '^sampled_coverage_' -V
+```
+
+The Windows fixture measures a complete triangle with a D3D12 occlusion query,
+then checks all 64 pixel locations with individual scissored draws. The color
+target must retain its clear value. It exercises both bound textures, mixed
+coverage, full survival and full rejection. A reference computed for the
+opposite texture must fail at the sample comparison.
+
+### Buffered depth export
+
+`tools/depth_mask_aot.py` follows the two entry table pointers through scalar
+moves, four-word descriptor loads and completed constant-buffer reads. Supply the
+two `--table SGPR BYTE_OFFSET` pairs in desktop b0, b1 order. The destination
+buffers each contain 2 KiB. The input convention supplies window x, y and depth
+in v2, v3 and v4. The supported exits export depth for surviving lanes or discard
+them. Unknown table addresses, outstanding reads, changed EXEC provenance and
+unrecognized exit sequences reject translation.
+
+The Windows fixture binds distinct seeds and thresholds, changes each separately,
+then exchanges the two root CBV addresses. It checks all 1,024 D32_FLOAT
+pixels and requires comparison against the old reference to fail after the
+exchange. LLVM CI assembles an original gfx1013 program and translates it from a
+synthetic container through the CLI.
+
+```text
+python3 -B tests/depth_mask_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+ctest --preset dev --no-tests=error -R "^depth_mask_draw_" -V
+```
+
+In a local inventory based on main `933cbad`, 354 of 12,101 PS records
+shared one additional native program. With the explicit bindings, the first
+read followed entry s8 at byte offset 0x480 and consumed an integer at byte
+offset 0x5f0 of the resulting buffer. The second followed the saved entry s9
+at offset zero and consumed a float at byte zero. Physically exchanging the
+buffers changed 897 of 1,024 depth samples against the old reference on both a
+GeForce RTX 4060 Laptop (32.0.16.1656) and WARP (10.0.26100.9818), Windows
+build 26200.9974, debug layer enabled. Matching results use controlled inputs
+and the specified binding convention. Target application resource identity and
+original render state remain unverified.
 ## AVX packed-integer leaf recompilation
 
 [The AVX packed-integer leaf translator](../tools/cpu_avx_int_aot.py) lifts bounded straight-line Windows x64 leaf functions covering 90 AVX packed-integer and state forms in `docs/coverage/x64_zen2.tsv` group `AVX` (excluding the 28 packed-integer forms carved out to `cpu_vex_aot.py (PR #325)` so each form has a single translator):
@@ -1048,7 +1220,9 @@ Not covered by this experiment: the 5 move forms carved out to `cpu_vex_aot.py (
 
 ## Offline pixel shader recompilation
 
-### Pixel color without a texture sample
+#The bitwise fixture uses AND, OR, XOR, NOT, BFI and three reversed shifts. Two constant sets exercise counts above 31. Exact mantissa bits distinguish the arithmetic and logical right shifts in GPU readback.
+
+## Pixel color without a texture sample
 
 For an unsampled pixel program, a matched P1/P2 interpolation in the entry mask can supply attr0.x/y/z/w from a four-component TEXCOORD0. The profile binds entry v0/v1 to the barycentric pair and the observed m0 source to the interpolation base. Each completed P2 produces a distinct value, including when the destination overwrites v0. The test vertex shader varies all four channels across a full-screen triangle. CPU references check all four output words at 1,024 pixel centers; an incorrect channel at an interior pixel must fail. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_attribute_'`.
 
@@ -1103,6 +1277,8 @@ Signed and unsigned 32-bit integer comparisons (`v_cmp_{f,lt,eq,le,gt,ne,ge,t}_{
 The same binary and draw checks cover `v_trunc_f32` in e32 and e64 forms. The lowerer emits HLSL `trunc`, which rounds toward zero and returns a floating-point value. With two constant sets, the RTX 5080 and WARP draws matched all four channels of 4,096 pixels per draw against the CPU reference. The fixture covers both signs, signed zero, source negation and absolute value, and both clamp bounds. Replacing truncation with floor changed the first pixel on both adapters. Removing the upper clamp changed alpha from 1 to 2 in the first pixel on WARP. The source-built fixture verifies desktop readback with the bindings above. Execution with a title's own pipeline state remains unverified.
 
 The `v_ceil_f32` fixture checks rounding toward positive infinity in e32 and e64 encodings. It compares finite integral and fractional inputs of both signs, including signed zero, and exercises e64 absolute value, negation and clamp. Replacing the e32 ceiling with a floor must produce a pixel mismatch. The translator rejects a ceiling write into a pending texture sample destination before `vmcnt(0)`. [AMD RDNA 2 ISA reference](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+
+The `v_cvt_f32_ubyte0` to `v_cvt_f32_ubyte3` fixture converts byte 0 to 3 of a source word to binary32, as an unsigned integer. The source is read as bits through `asuint`, so float modifiers do not apply and the translator does not accept them. Each output reads a different byte of a constant word in e32 and e64 encodings, and the last uses clamp. The words are normal binary32 values with four distinct bytes, so the bits survive the constant buffer and reading the wrong byte changes the result. Replacing `ubyte1` with `ubyte0` must produce a pixel mismatch.
 
 The translator accepts the gfx10 scheduling hints `s_clause`, `s_setprio` and `s_sleep`, which affect timing only, and lowers each exactly like `s_nop 0` at the same position. Each operand must fit its RDNA 2 field: 6 bits of clause length minus one, a 2-bit wave priority and a 7-bit sleep duration. A larger value is rejected. `s_code_end` stays rejected: the native program ends at `s_endpgm`, so padding after it never reaches the translator. Any instruction after `s_endpgm` and any hint between the color export and `s_endpgm` is rejected. The hinted program is part of the LLVM assemble and disassemble round trip.
 
@@ -1709,6 +1885,24 @@ The CPU reference in `tests/dxr_facing_reference.h` moves each ray into object s
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^dxr_facing_' -V
+```
+
+### Opacity and candidate handling in inline queries
+
+The other DXR fixtures build one opaque geometry and trace with a `RAY_FLAG_FORCE_OPAQUE` query, so no non-opaque candidate ever reaches a shader. `dxr_opacity` builds a BLAS of four single-triangle geometries stacked along z at depths 1 to 4. Geometries 1 and 3 carry `D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE`. Three instances use no flags, `D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE` and `D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_NON_OPAQUE`. Each instance receives 42 rays: both directions along z, seven ray flag sets (`RAY_FLAG_NONE`, `FORCE_OPAQUE`, `FORCE_NON_OPAQUE`, `CULL_OPAQUE`, `CULL_NON_OPAQUE`, `ACCEPT_FIRST_HIT_AND_END_SEARCH` alone and with `FORCE_NON_OPAQUE`) and three accept masks. `tests/ray_candidates.hlsl` declares `RayQuery<RAY_FLAG_NONE>` and commits a non-opaque candidate when its geometry index is set in the accept mask, a fixture convention carried in bits 16 to 19 of the flags word. [Ray flags](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#ray-flags) · [TraceRayInline control flow](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#tracerayinline-control-flow)
+
+The CPU reference in `tests/dxr_opacity_reference.h` intersects every triangle in double precision and applies the specification's order: ray flags override instance flags, which override geometry flags, and the cull flags then remove primitives by the resulting opacity. Before any GPU work the test compares it with a hand-derived table of opacity letters per instance and flag set. Swapping the ray and instance precedence in the reference breaks that table at ray 48. The reference expects 94 hits, 42 of them committed by the shader, and 32 misses. Ignoring instance flags would change the closest hit on 26 rays.
+
+Without the first-hit flag, status, instance, geometry and primitive must match the closest committable hit exactly. With it, the query may end on any committable hit, but must present no candidate after a commit. Every presented candidate must be a non-opaque triangle inside the ray extents and not behind the current committed hit. A candidate at exactly the committed distance is allowed, because an implementation may present the committed triangle or an equal-distance one again. Each non-opaque triangle in front of the closest hit, and each committed one, must have been presented. A miss under the first-hit flag requires every non-opaque triangle. Hit distances of 1 to 4 may differ by 1e-5 relative. Rays cross triangle interiors well inside the distance interval, so edge and endpoint rules stay out of scope. Candidate counts and visit order are implementation-defined and are not compared. The fixture skips below DXR tier 1.1 or Shader Model 6.5.
+
+The shader separates a candidate presented after its own commit from one presented after an automatic opaque commit only. The test prints up to 16 failing rays with their categories and a count per category. It also records `CandidateTriangleRayT` at each of its own commits.
+
+An RTX 5080 (driver 32.0.16.1692, DXR tier 1.2) matched all 126 rays in both runs. WARP 10.0.26100.9818 (DXR tier 1.1) produced the expected committed hit on every ray, but does not end a first-hit search at a committed hit, automatic or shader. The specification ends traversal after the first committed hit, whether it comes from fixed-function intersection or from the shader. [Ray flags](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#ray-flags) · [TraceRayInline control flow](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#tracerayinline-control-flow) The first WARP run reported 11 mismatching rays and printed only ray 15: with `RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH` and accept mask 0, WARP committed opaque geometry 1 at distance 2, then presented geometry 0 at distance 1. The second run separated the categories over 11 rays. Rays 19, 20, 61, 62, 100, 101, 103 and 104 had candidates presented after a shader commit, and rays 16 and 17 after both kinds of commit. One more ray had candidates presented after an automatic opaque commit only. On WARP alone, the test counts a first-hit ray with candidates after either kind of commit as `warp_after_commit` and does not fail on it, provided the final hit is committable and every other check on the ray passes. A committable hit is opaque or accepted by the shader. Every other category still fails on WARP, and hardware stays fully strict.
+
+On an AMD RDNA 4 GPU, a run reported by denn0x in the review of #216 failed `dxr_opacity_hardware`. Every mismatch was a shader-committed hit with the correct instance and geometry, but its `CommittedRayT()` equalled the true distance plus TMin. The specification makes a committed non-opaque triangle the closest hit at the candidate's distance, and `CandidateTriangleRayT` and `CommittedRayT` both measure the distance from the ray origin, not from TMin. [TraceRayInline control flow](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#tracerayinline-control-flow) · [CommittedRayT](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#rayquery-committedrayt) · [CandidateTriangleRayT](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#rayquery-candidatetrianglerayt) All 126 rays use TMin 0.25, so the offset is visible at every hit distance. On the RX 9070 XT with driver 32.0.32015.7029 the reporter observed 43 affected rays. Each such ray increments both `committed_t_plus_tmin` and the committed-hit mismatch count, and the device test fails. The diagnostic identifies shader-committed hits with the expected identity and candidate distance whose committed distance differs by TMin. The same tolerance applies on every adapter. A synthetic control adds 0.25 to a known hit distance and requires the committed-hit check to reject it.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^dxr_opacity_' -V
 ```
 
 ### Desktop checks for the query tail and root flags
