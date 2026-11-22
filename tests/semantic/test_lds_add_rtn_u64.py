@@ -1174,6 +1174,149 @@ class TestConditionCodesStatusFlagsAndCarryBorrow(unittest.TestCase):
         self.assertFalse(flags.z)
 
 
+# ============================================================================
+# Section 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ============================================================================
+
+def f64_to_u64(val: float) -> int:
+    """Pack Python float to IEEE 754 double-precision 64-bit unsigned integer."""
+    return struct.unpack("<Q", struct.pack("<d", val))[0]
+
+
+def u64_to_f64(val: int) -> float:
+    """Unpack IEEE 754 double-precision 64-bit unsigned integer to Python float."""
+    return struct.unpack("<d", struct.pack("<Q", u64(val)))[0]
+
+
+# IEEE 754 Double-Precision Architectural Bit Patterns
+DOUBLE_POS_ZERO: int = 0x0000_0000_0000_0000
+DOUBLE_NEG_ZERO: int = 0x8000_0000_0000_0000
+DOUBLE_POS_ONE: int = 0x3FF0_0000_0000_0000
+DOUBLE_POS_INF: int = 0x7FF0_0000_0000_0000
+DOUBLE_NEG_INF: int = 0xFFF0_0000_0000_0000
+DOUBLE_QNAN_DEFAULT: int = 0x7FF8_0000_0000_0000
+DOUBLE_SNAN_EXAMPLE: int = 0x7FF0_0000_0000_0001
+DOUBLE_MIN_SUBNORMAL: int = 0x0000_0000_0000_0001
+DOUBLE_MAX_SUBNORMAL: int = 0x000F_FFFF_FFFF_FFFF
+DOUBLE_MIN_NORMAL: int = 0x0010_0000_0000_0000
+DOUBLE_MAX_NORMAL: int = 0x7FEF_FFFF_FFFF_FFFF
+
+
+class TestIEEE754BoundaryExtremesSubnormalsAndNaNs(unittest.TestCase):
+    """Unit tests for IEEE 754 double-precision bit patterns manipulated via ds_add_rtn_u64."""
+
+    def setUp(self) -> None:
+        self.state = ScalarMachineState()
+        self.interp = ScalarInterpreter()
+
+    def test_double_subnormal_preservation_without_ftz(self) -> None:
+        """Subnormal double bit patterns must never be flushed to zero."""
+        addr = 0x100
+        subnormals = [
+            DOUBLE_MIN_SUBNORMAL,
+            DOUBLE_MAX_SUBNORMAL,
+            0x0000_0000_1234_5678,
+        ]
+        for sub in subnormals:
+            self.state.lds.write_qword(addr, sub)
+            self.state.set_vgpr(4, addr)
+            self.state.set_vgpr_qword(2, 0)  # Add 0 (identity read)
+
+            instr = DSAddRtnU64Instruction(
+                dst=VGPRPair(0), addr=VGPR(4), data0=VGPRPair(2)
+            )
+            old_val, new_val = self.interp.step(instr, self.state)
+
+            self.assertEqual(old_val, sub)
+            self.assertEqual(new_val, sub)
+            self.assertNotEqual(new_val, 0, "Subnormal was incorrectly flushed to zero")
+
+    def test_double_snan_preserved_without_quietening(self) -> None:
+        """Signaling NaNs (sNaN) must NOT be quietened (quiet bit 51 must NOT be set)."""
+        addr = 0x110
+        snan = DOUBLE_SNAN_EXAMPLE
+        self.state.lds.write_qword(addr, snan)
+        self.state.set_vgpr(4, addr)
+        self.state.set_vgpr_qword(2, 0)
+
+        instr = DSAddRtnU64Instruction(
+            dst=VGPRPair(0), addr=VGPR(4), data0=VGPRPair(2)
+        )
+        old_val, new_val = self.interp.step(instr, self.state)
+
+        self.assertEqual(old_val, snan)
+        self.assertEqual(new_val, snan)
+        # Check quiet bit (bit 51) is still 0
+        self.assertEqual(new_val & (1 << 51), 0, "Double sNaN was quietened")
+
+    def test_double_nan_payload_preservation(self) -> None:
+        """Arbitrary NaN payload bits are preserved bit-for-bit."""
+        addr = 0x120
+        nan_with_payload = 0x7FF8_0000_CAFE_BABE
+        self.state.lds.write_qword(addr, nan_with_payload)
+        self.state.set_vgpr(4, addr)
+        self.state.set_vgpr_qword(2, 0)
+
+        instr = DSAddRtnU64Instruction(
+            dst=VGPRPair(0), addr=VGPR(4), data0=VGPRPair(2)
+        )
+        old_val, new_val = self.interp.step(instr, self.state)
+
+        self.assertEqual(old_val, nan_with_payload)
+        self.assertEqual(new_val, nan_with_payload)
+
+    def test_double_roundtrip_struct_packing(self) -> None:
+        """Exact IEEE 754 round-trip packing and unpacking."""
+        test_floats = [0.0, -0.0, 1.0, -1.0, 3.141592653589793, 1e100, -1e-100]
+        for f in test_floats:
+            u = f64_to_u64(f)
+            f_back = u64_to_f64(u)
+            if math.isnan(f):
+                self.assertTrue(math.isnan(f_back))
+            else:
+                self.assertEqual(f, f_back)
+
+    def test_simd_wavefront_mixed_ieee754_double_lanes(self) -> None:
+        """SIMD wavefront where different lanes hold distinct IEEE 754 64-bit patterns."""
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        interp = SIMDInterpreter()
+
+        special_values = [
+            DOUBLE_POS_ZERO,
+            DOUBLE_NEG_ZERO,
+            DOUBLE_POS_ONE,
+            DOUBLE_POS_INF,
+            DOUBLE_NEG_INF,
+            DOUBLE_QNAN_DEFAULT,
+            DOUBLE_SNAN_EXAMPLE,
+            DOUBLE_MIN_SUBNORMAL,
+            DOUBLE_MAX_SUBNORMAL,
+            DOUBLE_MIN_NORMAL,
+            DOUBLE_MAX_NORMAL,
+        ]
+
+        for lane in range(32):
+            val = special_values[lane % len(special_values)]
+            addr = 0x300 + lane * 8
+            state.lds.write_qword(addr, val)
+            state.set_vgpr(lane, 4, addr)
+            state.set_vgpr_qword(lane, 2, 0)  # Identity addition
+
+        instr = DSAddRtnU64Instruction(
+            dst=VGPRPair(0), addr=VGPR(4), data0=VGPRPair(2)
+        )
+        results = interp.step(instr, state)
+
+        for lane in range(32):
+            orig_val = special_values[lane % len(special_values)]
+            res = results[lane]
+            self.assertIsNotNone(res)
+            self.assertEqual(res, (orig_val, orig_val))
+            self.assertEqual(state.get_vgpr_qword(lane, 0), orig_val)
+            self.assertEqual(state.lds.read_qword(0x300 + lane * 8), orig_val)
+
+
+
 
 
 
