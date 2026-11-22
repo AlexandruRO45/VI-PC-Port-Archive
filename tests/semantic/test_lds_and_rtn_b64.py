@@ -142,5 +142,168 @@ class TestLdsAndRtnB64Oracle(unittest.TestCase):
         self.assertEqual(self.mem.read_qword(40), 0x0000555500005555)
 
 
-if __name__ == "__main__":
+
+# ---------------------------------------------------------------------------
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ---------------------------------------------------------------------------
+
+class DSOpcode(Enum):
+    """Supported DS family opcodes."""
+    DS_AND_RTN_B64 = "ds_and_rtn_b64"
+
+
+class RegType(Enum):
+    """Register file class."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclass(frozen=True)
+class RegSingle:
+    """Symbolic 32-bit register operand representation."""
+    index: int
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index < DEFAULT_NUM_VGPRS):
+            raise ValueError(
+                f"Register index out of bounds: {self.reg_type.value}{self.index} "
+                f"(expected 0 <= index < {DEFAULT_NUM_VGPRS})"
+            )
+
+    @property
+    def name(self) -> str:
+        return f"{self.reg_type.value}{self.index}"
+
+
+@dataclass(frozen=True)
+class RegPair:
+    """Symbolic 64-bit register pair operand representation v[N:N+1]."""
+    base_index: int
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.base_index < DEFAULT_NUM_VGPRS - 1):
+            raise ValueError(
+                f"Register pair base index out of bounds: {self.reg_type.value}[{self.base_index}:{self.base_index+1}] "
+                f"(expected 0 <= index < {DEFAULT_NUM_VGPRS - 1})"
+            )
+
+    @property
+    def lo(self) -> int:
+        return self.base_index
+
+    @property
+    def hi(self) -> int:
+        return self.base_index + 1
+
+    @property
+    def name(self) -> str:
+        return f"{self.reg_type.value}[{self.lo}:{self.hi}]"
+
+
+@dataclass(frozen=True)
+class DSAndRtnB64Instruction:
+    """Symbolic representation of ds_and_rtn_b64 instruction."""
+    dst: RegPair
+    addr: RegSingle
+    data: RegPair
+    offset: int = 0
+    gds: bool = False
+    opcode: DSOpcode = DSOpcode.DS_AND_RTN_B64
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError("Destination operand must be a VGPR pair")
+        if self.addr.reg_type != RegType.VGPR:
+            raise TypeError("Address operand must be a VGPR")
+        if self.data.reg_type != RegType.VGPR:
+            raise TypeError("Data operand must be a VGPR pair")
+        if not (0 <= self.offset <= 0xFFFF):
+            raise ValueError(f"Offset out of 16-bit range: {self.offset} (expected 0 <= offset <= 65535)")
+
+    def disasm(self) -> str:
+        """Render disassembled assembly syntax."""
+        parts = [f"{self.opcode.value} {self.dst.name}, {self.addr.name}, {self.data.name}"]
+        if self.offset != 0:
+            parts.append(f"offset:{self.offset}")
+        if self.gds:
+            parts.append("gds")
+        return " ".join(parts)
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_opcode_enumeration(self) -> None:
+        self.assertEqual(DSOpcode.DS_AND_RTN_B64.value, "ds_and_rtn_b64")
+
+    def test_register_operand_validation(self) -> None:
+        v0 = RegSingle(index=0, reg_type=RegType.VGPR)
+        self.assertEqual(v0.name, "v0")
+
+        vpair = RegPair(base_index=0, reg_type=RegType.VGPR)
+        self.assertEqual(vpair.name, "v[0:1]")
+        self.assertEqual(vpair.lo, 0)
+        self.assertEqual(vpair.hi, 1)
+
+        with self.assertRaises(ValueError):
+            RegSingle(index=-1)
+        with self.assertRaises(ValueError):
+            RegSingle(index=256)
+        with self.assertRaises(ValueError):
+            RegPair(base_index=255)  # 255 has no valid 256 hi pair
+
+    def test_instruction_validation(self) -> None:
+        dst = RegPair(0)
+        addr = RegSingle(2)
+        data = RegPair(4)
+
+        instr = DSAndRtnB64Instruction(dst=dst, addr=addr, data=data, offset=64)
+        self.assertEqual(instr.offset, 64)
+        self.assertFalse(instr.gds)
+
+        with self.assertRaises(ValueError):
+            DSAndRtnB64Instruction(dst=dst, addr=addr, data=data, offset=-1)
+        with self.assertRaises(ValueError):
+            DSAndRtnB64Instruction(dst=dst, addr=addr, data=data, offset=65536)
+
+        s_single = RegSingle(0, reg_type=RegType.SGPR)
+        s_pair = RegPair(0, reg_type=RegType.SGPR)
+        with self.assertRaises(TypeError):
+            DSAndRtnB64Instruction(dst=s_pair, addr=addr, data=data)
+        with self.assertRaises(TypeError):
+            DSAndRtnB64Instruction(dst=dst, addr=s_single, data=data)
+        with self.assertRaises(TypeError):
+            DSAndRtnB64Instruction(dst=dst, addr=addr, data=s_pair)
+
+    def test_disasm_rendering(self) -> None:
+        dst = RegPair(0)
+        addr = RegSingle(2)
+        data = RegPair(4)
+
+        instr_basic = DSAndRtnB64Instruction(dst=dst, addr=addr, data=data)
+        self.assertEqual(instr_basic.disasm(), "ds_and_rtn_b64 v[0:1], v2, v[4:5]")
+
+        instr_offset = DSAndRtnB64Instruction(dst=dst, addr=addr, data=data, offset=32)
+        self.assertEqual(instr_offset.disasm(), "ds_and_rtn_b64 v[0:1], v2, v[4:5] offset:32")
+
+        instr_gds = DSAndRtnB64Instruction(dst=dst, addr=addr, data=data, offset=64, gds=True)
+        self.assertEqual(instr_gds.disasm(), "ds_and_rtn_b64 v[0:1], v2, v[4:5] offset:64 gds")
+
+    def test_structural_equality_and_immutability(self) -> None:
+        dst = RegPair(0)
+        addr = RegSingle(2)
+        data = RegPair(4)
+
+        i1 = DSAndRtnB64Instruction(dst=dst, addr=addr, data=data, offset=16)
+        i2 = DSAndRtnB64Instruction(dst=dst, addr=addr, data=data, offset=16)
+        self.assertEqual(i1, i2)
+        self.assertEqual(hash(i1), hash(i2))
+
+        with self.assertRaises(Exception):
+            i1.offset = 32  # type: ignore
+
+
+if __name__ == '__main__':
     unittest.main()
