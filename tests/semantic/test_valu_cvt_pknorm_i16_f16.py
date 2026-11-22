@@ -643,5 +643,227 @@ class TestValuCvtPknormI16F16ScalarInterpreter(unittest.TestCase):
         self.assertEqual(results[1], (0x7FFF << 16) | 0x4000)
 
 
+# ==============================================================================
+# SIMD Multi-Lane Execution Engine and EXEC Masking
+# ==============================================================================
+
+@dataclasses.dataclass
+class SIMDState:
+    """Multi-lane SIMD machine state representing Wave32 or Wave64."""
+    num_lanes: int
+    exec_mask: int | None = None
+    vgprs: list[list[int]] = dataclasses.field(default_factory=list)
+    sgprs: list[int] = dataclasses.field(default_factory=lambda: [0] * 256)
+
+    def __post_init__(self) -> None:
+        if self.num_lanes not in (32, 64):
+            raise ValueError(f"num_lanes must be 32 or 64, got {self.num_lanes}")
+        if not self.vgprs:
+            self.vgprs = [[0] * 256 for _ in range(self.num_lanes)]
+        if self.exec_mask is None:
+            self.exec_mask = (1 << self.num_lanes) - 1
+
+    def get_vgpr(self, lane: int, index: int) -> int:
+        return self.vgprs[lane][index] & MASK32
+
+    def set_vgpr(self, lane: int, index: int, val: int) -> None:
+        self.vgprs[lane][index] = val & MASK32
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index] & MASK32
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        self.sgprs[index] = val & MASK32
+
+
+class SIMDInterpreter:
+    """SIMD instruction interpreter handling multi-lane divergence and EXEC masking."""
+
+    def resolve_lane_operand(self, op: VOP3POperand, state: SIMDState, lane: int) -> int:
+        if isinstance(op.source, Reg):
+            if op.source.reg_type == RegType.VGPR:
+                return state.get_vgpr(lane, op.source.index)
+            elif op.source.reg_type == RegType.SGPR:
+                return state.get_sgpr(op.source.index)
+            else:
+                raise ValueError(f"Unknown register type: {op.source.reg_type}")
+        elif isinstance(op.source, Literal16):
+            return op.source.bits & MASK16
+        else:
+            raise TypeError(f"Unsupported operand source type: {type(op.source)}")
+
+    def step(self, instr: VCvtPknormI16F16Instruction, state: SIMDState) -> list[int | None]:
+        results: list[int | None] = [None] * state.num_lanes
+
+        # Atomic read phase across all lanes
+        s0_vals = [
+            self.resolve_lane_operand(instr.src0, state, lane)
+            for lane in range(state.num_lanes)
+        ]
+        s1_vals = [
+            self.resolve_lane_operand(instr.src1, state, lane)
+            for lane in range(state.num_lanes)
+        ]
+
+        # Execution and write-back phase governed by EXEC mask
+        for lane in range(state.num_lanes):
+            if (state.exec_mask & (1 << lane)) != 0:
+                res = oracle_v_cvt_pknorm_i16_f16(
+                    src0_bits=s0_vals[lane],
+                    src1_bits=s1_vals[lane],
+                    op_sel=instr.op_sel,
+                    abs0=instr.src0.abs_mod,
+                    neg0=instr.src0.neg_mod,
+                    abs1=instr.src1.abs_mod,
+                    neg1=instr.src1.neg_mod,
+                )
+                state.set_vgpr(lane, instr.dst.index, res)
+                results[lane] = res
+
+        return results
+
+
+class TestValuCvtPknormI16F16SIMD(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    CANARY_OLD: int = 0xCAFEBABE
+
+    def setUp(self) -> None:
+        self.simd_interp = SIMDInterpreter()
+
+    def test_wave32_full_exec(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        for lane in range(32):
+            state.set_vgpr(lane, 1, POS_ONE_F16)
+            state.set_vgpr(lane, 2, NEG_ONE_F16)
+
+        instr = VCvtPknormI16F16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3POperand(Reg(1, RegType.VGPR)),
+            src1=VOP3POperand(Reg(2, RegType.VGPR)),
+        )
+        results = self.simd_interp.step(instr, state)
+        expected = (0x8001 << 16) | 0x7FFF
+        for lane in range(32):
+            self.assertEqual(results[lane], expected)
+            self.assertEqual(state.get_vgpr(lane, 0), expected)
+
+    def test_wave64_full_exec(self) -> None:
+        state = SIMDState(num_lanes=64, exec_mask=0xFFFF_FFFF_FFFF_FFFF)
+        for lane in range(64):
+            state.set_vgpr(lane, 1, HALF_F16)
+            state.set_vgpr(lane, 2, NEG_HALF_F16)
+
+        instr = VCvtPknormI16F16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3POperand(Reg(1, RegType.VGPR)),
+            src1=VOP3POperand(Reg(2, RegType.VGPR)),
+        )
+        results = self.simd_interp.step(instr, state)
+        expected = (0xC000 << 16) | 0x4000
+        for lane in range(64):
+            self.assertEqual(results[lane], expected)
+            self.assertEqual(state.get_vgpr(lane, 0), expected)
+
+    def test_wave64_divergence_exec_masking(self) -> None:
+        # Alternating active lanes: even lanes in low 32, odd lanes in high 32
+        mask = 0xAAAA_AAAA_5555_5555
+        state = SIMDState(num_lanes=64, exec_mask=mask)
+        for lane in range(64):
+            state.set_vgpr(lane, 0, self.CANARY_OLD)
+            state.set_vgpr(lane, 1, POS_ONE_F16)
+            state.set_vgpr(lane, 2, POS_ONE_F16)
+
+        instr = VCvtPknormI16F16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3POperand(Reg(1, RegType.VGPR)),
+            src1=VOP3POperand(Reg(2, RegType.VGPR)),
+        )
+        results = self.simd_interp.step(instr, state)
+        expected = (0x7FFF << 16) | 0x7FFF
+        for lane in range(64):
+            is_active = bool((mask >> lane) & 1)
+            if is_active:
+                self.assertEqual(results[lane], expected)
+                self.assertEqual(state.get_vgpr(lane, 0), expected)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.get_vgpr(lane, 0), self.CANARY_OLD)
+
+    def test_split_halves_masking(self) -> None:
+        mask = 0x0000_0000_FFFF_FFFF
+        state = SIMDState(num_lanes=64, exec_mask=mask)
+        for lane in range(64):
+            state.set_vgpr(lane, 0, self.CANARY_OLD)
+            state.set_vgpr(lane, 1, HALF_F16)
+            state.set_vgpr(lane, 2, POS_ZERO_F16)
+
+        instr = VCvtPknormI16F16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3POperand(Reg(1, RegType.VGPR)),
+            src1=VOP3POperand(Reg(2, RegType.VGPR)),
+        )
+        self.simd_interp.step(instr, state)
+        expected = (0x0000 << 16) | 0x4000
+        for lane in range(32):
+            self.assertEqual(state.get_vgpr(lane, 0), expected)
+        for lane in range(32, 64):
+            self.assertEqual(state.get_vgpr(lane, 0), self.CANARY_OLD)
+
+    def test_single_active_lane(self) -> None:
+        mask = 1 << 53
+        state = SIMDState(num_lanes=64, exec_mask=mask)
+        for lane in range(64):
+            state.set_vgpr(lane, 0, self.CANARY_OLD)
+            state.set_vgpr(lane, 1, POS_ONE_F16)
+            state.set_vgpr(lane, 2, NEG_HALF_F16)
+
+        instr = VCvtPknormI16F16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3POperand(Reg(1, RegType.VGPR)),
+            src1=VOP3POperand(Reg(2, RegType.VGPR)),
+        )
+        self.simd_interp.step(instr, state)
+        for lane in range(64):
+            if lane == 53:
+                self.assertEqual(state.get_vgpr(lane, 0), (0xC000 << 16) | 0x7FFF)
+            else:
+                self.assertEqual(state.get_vgpr(lane, 0), self.CANARY_OLD)
+
+    def test_zero_exec_mask_preserves_all(self) -> None:
+        state = SIMDState(num_lanes=64, exec_mask=0)
+        for lane in range(64):
+            state.set_vgpr(lane, 0, self.CANARY_OLD)
+
+        instr = VCvtPknormI16F16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3POperand(Literal16.from_f16(1.0)),
+            src1=VOP3POperand(Literal16.from_f16(1.0)),
+        )
+        results = self.simd_interp.step(instr, state)
+        self.assertEqual(results, [None] * 64)
+        for lane in range(64):
+            self.assertEqual(state.get_vgpr(lane, 0), self.CANARY_OLD)
+
+    def test_uniform_scalar_broadcast(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        state.set_sgpr(8, (HALF_F16 << 16) | POS_ONE_F16)
+        for lane in range(32):
+            state.set_vgpr(lane, 1, NEG_ONE_F16)
+
+        # src0 is uniform SGPR 8 with op_sel high half (HALF_F16 -> 0x4000)
+        # src1 is per-lane VGPR 1 low half (NEG_ONE_F16 -> 0x8001)
+        instr = VCvtPknormI16F16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3POperand(Reg(8, RegType.SGPR)),
+            src1=VOP3POperand(Reg(1, RegType.VGPR)),
+            op_sel=(1, 0),
+        )
+        self.simd_interp.step(instr, state)
+        expected = (0x8001 << 16) | 0x4000
+        for lane in range(32):
+            self.assertEqual(state.get_vgpr(lane, 0), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
