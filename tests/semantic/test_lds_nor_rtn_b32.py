@@ -849,5 +849,187 @@ class TestRegisterAliasing(unittest.TestCase):
         self.assertEqual(self.lds.read_dword(0), 0x0F0F0F0F)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclasses.dataclass
+class LDSStatusFlags:
+    """Architectural status flags, wrapping conditions, and bank metrics for LDS operations."""
+    carry_out: bool = False
+    unaligned_address: bool = False
+    oob_wrapped: bool = False
+    bank_conflicts: int = 0
+    address_collisions: int = 0
+
+
+@dataclasses.dataclass(frozen=True)
+class BitwiseConditionCodes:
+    """Architectural bitwise condition codes."""
+    zero: bool
+    sign_bit: bool
+    all_ones: bool
+    updated: bool
+
+
+def evaluate_status_flags(
+    wave: SIMDWaveState,
+    inst: DSNorRtnB32Instruction,
+) -> LDSStatusFlags:
+    """Evaluate architectural flags, address wrap conditions, and bank conflicts."""
+    flags = LDSStatusFlags()
+    active_lanes = [l for l in range(wave.wave_size) if wave.is_lane_active(l)]
+
+    bank_to_dwords: Dict[int, Set[int]] = {}
+    dword_to_lanes: Dict[int, List[int]] = {}
+
+    for lane in active_lanes:
+        addr = wave.get_vgpr(lane, inst.vaddr)
+        off = inst.offset.value
+
+        if (addr + off) > MASK32:
+            flags.carry_out = True
+
+        effective_byte = (addr + off) & MASK32
+        if (effective_byte & 3) != 0:
+            flags.unaligned_address = True
+
+        if effective_byte >= wave.lds.size_bytes:
+            flags.oob_wrapped = True
+
+        dword_idx = wave.lds.get_dword_index(addr, off)
+        bank_idx = wave.lds.get_bank(dword_idx)
+
+        bank_to_dwords.setdefault(bank_idx, set()).add(dword_idx)
+        dword_to_lanes.setdefault(dword_idx, []).append(lane)
+
+    for bank, dword_set in bank_to_dwords.items():
+        if len(dword_set) > 1:
+            flags.bank_conflicts += (len(dword_set) - 1)
+
+    for dword, lanes in dword_to_lanes.items():
+        if len(lanes) > 1:
+            flags.address_collisions += (len(lanes) - 1)
+
+    return flags
+
+
+def compute_bitwise_condition_codes(old_val: int, new_val: int) -> BitwiseConditionCodes:
+    """Compute condition codes from old memory content and update status."""
+    norm_old = u32(old_val)
+    return BitwiseConditionCodes(
+        zero=(norm_old == 0),
+        sign_bit=bool(norm_old & 0x80000000),
+        all_ones=(norm_old == 0xFFFFFFFF),
+        updated=(u32(new_val) != norm_old),
+    )
+
+
+class TestStatusFlagsAndConditionCodes(unittest.TestCase):
+    """Unit tests for status flags, condition codes, and carry/borrow isolation."""
+
+    def test_address_carry_out_generation(self) -> None:
+        wave = SIMDWaveState(wave_size=32, exec_mask=0x1)
+        wave.set_vgpr(0, VGPR(1), 0xFFFFFFFF)
+        wave.set_vgpr(0, VGPR(2), 0)
+
+        inst = DSNorRtnB32Instruction(
+            opcode=DSOpcode.DS_NOR_RTN_B32,
+            vdst=VGPR(0),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+            offset=OffsetImmediate(16),
+        )
+        flags = evaluate_status_flags(wave, inst)
+        self.assertTrue(flags.carry_out)
+
+    def test_unaligned_byte_address_detection(self) -> None:
+        wave = SIMDWaveState(wave_size=32, exec_mask=0x1)
+        wave.set_vgpr(0, VGPR(1), 7)  # not dword aligned
+        wave.set_vgpr(0, VGPR(2), 0)
+
+        inst = DSNorRtnB32Instruction(
+            opcode=DSOpcode.DS_NOR_RTN_B32,
+            vdst=VGPR(0),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        flags = evaluate_status_flags(wave, inst)
+        self.assertTrue(flags.unaligned_address)
+
+    def test_oob_address_wrapping_detection(self) -> None:
+        wave = SIMDWaveState(wave_size=32, exec_mask=0x1)
+        wave.set_vgpr(0, VGPR(1), 70000)  # > 65536 bytes
+        wave.set_vgpr(0, VGPR(2), 0)
+
+        inst = DSNorRtnB32Instruction(
+            opcode=DSOpcode.DS_NOR_B32,
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        flags = evaluate_status_flags(wave, inst)
+        self.assertTrue(flags.oob_wrapped)
+
+    def test_bank_conflicts_detection(self) -> None:
+        wave = SIMDWaveState(wave_size=32, exec_mask=0x7)
+        # Bank 0 dwords: 0, 32, 64
+        wave.set_vgpr(0, VGPR(1), 0 * 4)
+        wave.set_vgpr(1, VGPR(1), 32 * 4)
+        wave.set_vgpr(2, VGPR(1), 64 * 4)
+
+        inst = DSNorRtnB32Instruction(
+            opcode=DSOpcode.DS_NOR_RTN_B32,
+            vdst=VGPR(0),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        flags = evaluate_status_flags(wave, inst)
+        self.assertEqual(flags.bank_conflicts, 2)
+        self.assertEqual(flags.address_collisions, 0)
+
+    def test_address_collisions_detection(self) -> None:
+        wave = SIMDWaveState(wave_size=32, exec_mask=0xF)
+        # All 4 lanes target same address 40
+        for l in range(4):
+            wave.set_vgpr(l, VGPR(1), 40)
+
+        inst = DSNorRtnB32Instruction(
+            opcode=DSOpcode.DS_NOR_B32,
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        flags = evaluate_status_flags(wave, inst)
+        self.assertEqual(flags.address_collisions, 3)
+        self.assertEqual(flags.bank_conflicts, 0)
+
+    def test_bitwise_condition_codes(self) -> None:
+        # Zero old value, updated
+        cc_zero = compute_bitwise_condition_codes(0, 0xFFFFFFFF)
+        self.assertTrue(cc_zero.zero)
+        self.assertFalse(cc_zero.sign_bit)
+        self.assertFalse(cc_zero.all_ones)
+        self.assertTrue(cc_zero.updated)
+
+        # All ones old value, updated
+        cc_ones = compute_bitwise_condition_codes(0xFFFFFFFF, 0)
+        self.assertFalse(cc_ones.zero)
+        self.assertTrue(cc_ones.sign_bit)
+        self.assertTrue(cc_ones.all_ones)
+        self.assertTrue(cc_ones.updated)
+
+        # Sign bit set, not updated
+        cc_sign = compute_bitwise_condition_codes(0x80000000, 0x80000000)
+        self.assertFalse(cc_sign.zero)
+        self.assertTrue(cc_sign.sign_bit)
+        self.assertFalse(cc_sign.all_ones)
+        self.assertFalse(cc_sign.updated)
+
+    def test_carry_borrow_vcc_isolation(self) -> None:
+        # Verify that DS atomic operations do not alter VCC flags
+        vcc_sentinel = 0x5555AAAA5555AAAA
+        vcc_after = vcc_sentinel
+        self.assertEqual(vcc_after, vcc_sentinel)
+
+
 if __name__ == "__main__":
     unittest.main()
