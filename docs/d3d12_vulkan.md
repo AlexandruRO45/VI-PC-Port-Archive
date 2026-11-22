@@ -3194,7 +3194,7 @@ Not implemented yet:
   `VK_NV_device_generated_commands` on NVIDIA. Start with the simple signatures; the trace will show which
   signatures the game creates.
 - `CreateCommandSignature` refuses with `E_INVALIDARG` what the host runtime refuses, with or without a root
-  signature, and a refused call leaves the output as it was. `d3d12_command_signature_root_test` compares 159
+  signature, and a refused call leaves the output as it was. `d3d12_command_signature_root_test` compares 177
   values (RTX 3060, driver 610.88) beyond `compare_invalid_arguments`' signatures without one. The rules it
   measured:
   - A root signature is passed only with at least one root argument (constants, CBV, SRV or UAV); with none it
@@ -3203,8 +3203,12 @@ Not implemented yet:
     descriptor for a view), and constants fit their parameter, at least one value.
   - Root arguments come in increasing parameter order. Constants into one parameter come in increasing ranges
     that don't overlap.
-  - A vertex buffer view uses a slot below 32, each slot once, and not with a dispatch. An index buffer view comes
-    once and not with a plain draw or a dispatch. Both rules hold without a root signature too.
+  - An incrementing constant is one root constant: a root-constants parameter, an offset inside it, and no overlap
+    with the other constants of that parameter.
+  - A vertex buffer view uses a slot below 32, each slot once, and not with a compute dispatch (a mesh dispatch takes
+    one). An index buffer view comes once and only with an indexed draw. Both rules hold without a root signature too.
+  - The host takes mesh-dispatch signatures; the layer still answers `E_NOTIMPL` for them, so the test doesn't compare
+    those (indirect mesh dispatch is #3777).
 - Predication (`SetPredication`) maps to `VK_EXT_conditional_rendering` (D3D-18). Done: `GraphicsCommandList::
   SetPredication` records a `Predication` command (`runtime/src/command_list.h`; offset 8-byte aligned, op
   `EQUAL_ZERO` or `NOT_EQUAL_ZERO`, a null buffer turns it off). The replay (`runtime/src/vulkan_replay.h`) begins

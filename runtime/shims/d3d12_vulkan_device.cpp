@@ -5222,8 +5222,9 @@ public:
         // type (root constants for CONSTANT, the same root CBV/SRV/UAV for a view), constants that fit their
         // parameter (at least one value), and root arguments in increasing parameter order, constants into one
         // parameter in increasing ranges that don't overlap. Vertex buffer views need a slot below 32, each slot
-        // at most once, and no dispatch; an index buffer view comes at most once and not with a plain draw or a
-        // dispatch. The vertex and index buffer rules hold without a root signature too.
+        // at most once, and no compute dispatch; an index buffer view comes at most once and only with an indexed
+        // draw. The vertex and index buffer rules hold without a root signature too. An incrementing constant is one
+        // root constant.
         const RootArgumentLayout* layout = root_signature ? root_signature_layout(root_signature) : nullptr;
         bool any_root_argument = false;
         std::uint64_t root_position = 0;   // where the last root argument ended: parameter << 33 | end of its range
@@ -5268,9 +5269,14 @@ public:
             if (index >= layout->parameters.size()) return E_INVALIDARG;
             const RootArgumentLayout::Parameter& parameter = layout->parameters[index];
             std::uint64_t first = 0, end = 1;  // a view takes its whole parameter
-            if (arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT) {
-                first = arg.Constant.DestOffsetIn32BitValues;
-                end = first + arg.Constant.Num32BitValuesToSet;
+            if (arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT ||
+                arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_INCREMENTING_CONSTANT) {
+                // An incrementing constant is one root constant the runtime counts up, with the same rules.
+                first = arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT
+                            ? arg.Constant.DestOffsetIn32BitValues
+                            : arg.IncrementingConstant.DestOffsetIn32BitValues;
+                end = first + (arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT ? arg.Constant.Num32BitValuesToSet
+                                                                                   : 1);
                 if (parameter.type != rt::rootsig::ParamType::Constants || end == first ||
                     end > parameter.constant_count)
                     return E_INVALIDARG;
@@ -5292,9 +5298,10 @@ public:
         }
         if (root_signature && !any_root_argument) return E_INVALIDARG;
         const D3D12_INDIRECT_ARGUMENT_TYPE last = desc->pArgumentDescs[desc->NumArgumentDescs - 1].Type;
-        // Measured against DISPATCH and DRAW; with DISPATCH_MESH (E_NOTIMPL below) the host's answer is not.
-        if ((vertex_slots || index_buffers) && last == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH) return E_INVALIDARG;
-        if (index_buffers && last == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW) return E_INVALIDARG;
+        // Measured against DRAW, DISPATCH and DISPATCH_MESH: the host takes a vertex buffer view with a mesh dispatch
+        // (E_NOTIMPL below here), an index buffer view only with an indexed draw.
+        if (vertex_slots && last == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH) return E_INVALIDARG;
+        if (index_buffers && last != D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED) return E_INVALIDARG;
         if (desc->ByteStride % 4 || desc->ByteStride < size) return E_INVALIDARG;
         if (!out) return E_UNEXPECTED;  // the host's answer for a valid description and no output
         *out = nullptr;
