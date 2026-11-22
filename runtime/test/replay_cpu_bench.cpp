@@ -276,10 +276,12 @@ bool uav_clear(CommandList& list, std::uint32_t index) {
 bool draw(CommandList& list, std::uint32_t index, bool indexed) {
     Draw d{};
     d.pipeline = Scene::pipeline_id;
-    d.render_targets = {color_view};
+    d.render_targets[0] = color_view;
+    d.render_target_count = 1;
     d.depth = depth_view;
     const std::uint64_t base = Scene::geometry_va + (index % 256) * 65536ull;
-    d.vertex_buffers = {{base, 24576, 12}, {base + 24576, 16384, 8}};
+    d.vertex_buffers[0] = {base, 24576, 12};
+    d.vertex_buffers[1] = {base + 24576, 16384, 8};
     if (indexed) d.index = {base + 40960, 6144, 57};
     d.topology = 4;  // D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
     d.viewport = {0, 0, 1920, 1080, 0, 1};
@@ -576,7 +578,8 @@ int main(int argc, char** argv) {
         CommandList earlier, later;
         Draw plain{};
         plain.pipeline = Scene::bare_id;
-        plain.render_targets = {color_view};
+        plain.render_targets[0] = color_view;
+        plain.render_target_count = 1;
         plain.topology = 4;
         plain.viewport = {0, 0, 1920, 1080, 0, 1};
         plain.scissor = {0, 0, 1920, 1080};
