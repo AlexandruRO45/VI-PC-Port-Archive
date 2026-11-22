@@ -2536,6 +2536,20 @@ def buffer_color(rg):
     ]
 
 
+def unsigned_conversion(quad):
+    prefix = buffer_color(False)[:6]  # word at byte 16 is in s4 after the wait
+    if quad:
+        prefix += ["s_mov_b64 s[40:41], exec", "s_wqm_b64 exec, exec",
+                   "v_cvt_u32_f32_e32 v32, s4", "s_and_b64 exec, exec, s[40:41]"]
+    else:
+        prefix += ["v_mov_b32_e32 v32, s4", "v_cvt_u32_f32_e32 v32, v32"]
+    # Every possible byte is an exact binary16 and binary32 value.
+    return prefix + [f"v_cvt_f32_ubyte{i}_e32 v{20+i}, v32" for i in range(4)] + [
+        "v_cvt_pkrtz_f16_f32_e32 v24, v20, v21", "v_cvt_pkrtz_f16_f32_e32 v25, v22, v23",
+        "exp mrt0 v24, v24, v25, v25 done compr vm", "s_endpgm",
+    ]
+
+
 def translate_buffer_color(instructions):
     return lower(instructions, 9, 24, None, 0)
 
@@ -3643,6 +3657,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((offset_nibbles(), translate))
     fixtures.append((scheduling_hints(), translate))
     fixtures.extend((buffer_color(rg), translate_buffer_color) for rg in (False, True))
+    fixtures.extend((unsigned_conversion(quad), translate_buffer_color) for quad in (False, True))
     fixtures.extend((attribute_color(rg), translate_attribute) for rg in (False, True))
     fixtures.extend((with_constants(body), translate) for body, *_ in SDWA_ARITH)
     fixtures.append((with_constants(PK_INT16_BODY), translate))

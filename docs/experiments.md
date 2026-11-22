@@ -322,6 +322,21 @@ foreach ($adapter in 'hardware','warp') {
 }
 ```
 
+### Unsigned pixel conversion and entry inputs
+
+The plain gfx1013 `v_cvt_u32_f32_e32` path uses the binary32-to-uint helper from the FFX translator. It truncates positive fractions toward zero, maps NaN and negative inputs to zero, and saturates at `0xffffffff` for inputs at or above 2^32. Sources are a defined VGPR, a ready SGPR or a hexadecimal literal word. Whole-quad execution requires a source defined for helper lanes. A varying conversion cannot establish an affine texture coordinate. [AMD RDNA 2 ISA](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf) · [Shared conversion implementation](../src/ffx_float_to_int.hlsli)
+
+On Windows 11 build 26200.9974, RTX 4060 Laptop 32.0.16.1656 and WARP 10.0.26100.9818 each passed 27 input words in both the entry and whole-quad cases. The fixture extracts four bytes from the result and renders one byte per color channel. All 256 byte values are exactly representable even through the compressed color export. The renderer compares the readback bits with four independently expected bytes at all 4,096 pixels. Inputs include signed zero, subnormals, negative fractions, quiet and signaling NaNs, infinities and both sides of the upper limit. The binary32 immediately below 2^32 yielded `0xffffff00`. Replacing truncation with nearest-even rounding made both 1.875 and 3.75 mismatch on both adapters. LLVM 15 also assembles and disassembles both fixtures in the binary regression.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^pixel_aot_u32_from_f32_' -V
+```
+
+With the previous fixed bindings and the `--cb-reads` command above, all 530 records (459 distinct native streams) reached the conversion with an unbound source on the `92e80ed` base plus this change. The first conversion reads v3 in 447 records and v2 in 83. **Zero advanced past that instruction and zero completed.** All 530 input signatures report reads of both X and Y of `SV_Position`. The signature identifies logical inputs; assigning either component to a native VGPR still requires entry-layout evidence. In a separate diagnostic, supplying two distinct quad-defined fixture values let all 530 cross both conversions. Their next missing scalar inputs were s17 (505), s15 (23) and s14 (2).
+
+The fixed-profile full scan covered 26,503 records. Output-verified totals stayed at 851 PS, 12 CS, 2 MS, 0 VS and 0 GS (865 overall). All 988 previous profile/container files, including selector variants, recurred. Of those, 616 had identical generated source; recompiling the remaining 372 old/new pairs with the same DXC produced identical desktop DXIL. The existing pipeline and readback results apply to the same binaries. The new conversion draws are counted as source-built fixtures.
+
 ## Offline CPU leaf recompilation
 
 With the Python-enabled Windows dev preset configured, run:
