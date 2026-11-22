@@ -882,6 +882,32 @@ class Gen:
         self.emit(f"{r} = OpLogicalAnd %bool {a} {b}")
         return r
 
+    def eager_land(self, a, b):
+        """Boolean AND that SPIRV-Cross cannot lower to a short-circuiting `&&` (SHADER-529).
+        Both operands become conditions of constant-arm OpSelects and combine via OpBitwiseAnd so
+        subgroup ops on either side execute uniformly across every lane on MoltenVK/MSL."""
+        ua, ub, both, r = (self.tmp() for _ in range(4))
+        self.emit(f"{ua} = OpSelect %uint {a} {self.cu(1)} {self.cu(0)}")
+        self.emit(f"{ub} = OpSelect %uint {b} {self.cu(1)} {self.cu(0)}")
+        self.emit(f"{both} = OpBitwiseAnd %uint {ua} {ub}")
+        self.emit(f"{r} = OpINotEqual %bool {both} {self.cu(0)}")
+        return r
+
+    def eager_select_u(self, cond, tval, fval=None):
+        """32-bit uint select that SPIRV-Cross cannot lower to a short-circuiting `?:` (SHADER-529).
+        Uses a 0xFFFFFFFF/0 mask and bitwise ops so subgroup ops in tval/fval run unconditionally."""
+        mask = self.tmp()
+        self.emit(f"{mask} = OpSelect %uint {cond} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+        take = self.tmp()
+        self.emit(f"{take} = OpBitwiseAnd %uint {tval} {mask}")
+        if fval is None or fval == self.cu(0):
+            return take
+        keep, preserve, r = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{keep} = OpNot %uint {mask}")
+        self.emit(f"{preserve} = OpBitwiseAnd %uint {fval} {keep}")
+        self.emit(f"{r} = OpBitwiseOr %uint {take} {preserve}")
+        return r
+
     def f16_pack2(self, lo, hi):
         """Two f32 values -> one %uint of two f16 halves (lo | hi << 16), each rounded as f16_res, without PackHalf2x16."""
         a, b, sh, r = self.f16_res(lo), self.f16_res(hi), self.tmp(), self.tmp()
@@ -999,11 +1025,12 @@ class Gen:
             p, old, r = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{p} = OpAccessChain %_ptr_Function_uint %vgpr {self.cu(a['r'])}")
             self.emit(f"{old} = OpLoad %uint {p}")
-            if eager:
+            if eager or (self.dpp_guard is not None and not self.emulate):
                 mask = self.exec_value()
                 if self.dpp_guard is not None:
-                    guarded = self.tmp()
-                    self.emit(f"{guarded} = OpSelect %uint {self.dpp_guard} {mask} {self.cu(0)}")
+                    dpp_m, guarded = self.tmp(), self.tmp()
+                    self.emit(f"{dpp_m} = OpSelect %uint {self.dpp_guard} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+                    self.emit(f"{guarded} = OpBitwiseAnd %uint {mask} {dpp_m}")
                     mask = guarded
                 keep, write, preserve = self.tmp(), self.tmp(), self.tmp()
                 self.emit(f"{keep} = OpNot %uint {mask}")
@@ -1314,8 +1341,12 @@ class Gen:
         else:
             raise Unsupported("ds_swizzle " + kind)
         v, r = self.src_u(a[1]), self.tmp()
+        if not self.emulate:
+            safe_src = self.tmp()
+            self.emit(f"{safe_src} = OpSelect %uint {self.active_b()} {src} {lane}")
+            src = safe_src
         self.g_shuffle(r, v, src)
-        self.dst(a[0], r)
+        self.dst(a[0], r, eager=not self.emulate)
 
     def buffer_load(self, op, a, mods):
         """buffer_load_dword[xN] vD, vaddr, s[V#], soffset [offen|idxen] offset:N  -> buffer-device-address loads.
@@ -3458,16 +3489,16 @@ class Gen:
             if self.wave64:
                 src = self.tmp()
                 self.emit(f"{src} = OpBitwiseOr %uint {half} {self.cu(j)}")
-            ex, shv, v, shd, hit, nxt = (self.tmp() for _ in range(6))
-            # a shuffle from a lane that isn't running (the missing lanes of a partial wave) is undefined
+            ex, shv, shd, hit = (self.tmp() for _ in range(4))
+            # a shuffle from a lane that isn't running (the missing lanes of a partial wave) is undefined;
+            # use bitwise masks rather than OpSelect so SPIRV-Cross cannot move shuffles into divergent ternaries.
             self.emit(f"{ex} = OpGroupNonUniformBallotBitExtract %bool %c3 {bal} {src}")
             self.emit(f"{shv} = OpGroupNonUniformShuffle %uint %c3 {tp} {src}")
-            self.emit(f"{v} = OpSelect %uint {ex} {shv} {self.cu(0)}")
+            v = self.eager_select_u(ex, shv)
             self.emit(f"{shd} = OpGroupNonUniformShuffle %uint %c3 {dat} {src}")
             self.emit(f"{hit} = OpIEqual %bool {v} {mine}")
-            self.emit(f"{nxt} = OpSelect %uint {hit} {shd} {acc}")
-            acc = nxt
-        self.dst(d, acc)
+            acc = self.eager_select_u(hit, shd, acc)
+        self.dst(d, acc, eager=True)
 
     def sub_lane(self, r):
         """r = the lane the subgroup shuffles above index: the subgroup lane, or the wave lane when emulated."""
@@ -3789,11 +3820,15 @@ class Gen:
         """SCC = some lane of the wave (of one 32-lane half of a wave64 when `half`) has `v` non-zero."""
         mine = self.tmp_bool_nz(v)
         if half:
-            lane, inh, both = (self.tmp() for _ in range(3))
+            lane, inh = self.tmp(), self.tmp()
             self.emit(f"{lane} = OpCopyObject %uint {self.wave_lane()}")
             self.emit(f"{inh} = {'OpUGreaterThanEqual' if half == 'hi' else 'OpULessThan'} %bool {lane} {self.cu(32)}")
-            self.emit(f"{both} = OpLogicalAnd %bool {inh} {mine}")
-            mine = both
+            if self.emulate:
+                both = self.tmp()
+                self.emit(f"{both} = OpLogicalAnd %bool {inh} {mine}")
+                mine = both
+            else:
+                mine = self.eager_land(inh, mine)
         any_ = self.tmp()
         self.g_vote(any_, "Any", mine)
         self.uses_vote = True
@@ -4414,9 +4449,8 @@ class Gen:
                 active = self.tmp()
                 self.emit(f"{active} = OpGroupNonUniformBallotBitExtract %bool {self.cu(3)} {ballot} {safe_sg}")
                 if in_bounds is not None:
-                    both = self.tmp()
-                    self.emit(f"{both} = OpLogicalAnd %bool {in_bounds} {active}")
-                    active = both
+                    # Non-short-circuit AND so SPIRV-Cross (MoltenVK) cannot skip ballot on out-of-row lanes (SHADER-529).
+                    active = self.eager_land(in_bounds, active)
                 src_ok = active
             if src.get("k") == "vgpr":
                 self.uses_subgroup = True
@@ -4447,10 +4481,15 @@ class Gen:
         self.emit(f"{enabled} = OpLogicalAnd %bool {row_on} {bank_on}")
 
         zero = self.cu(0)
-        src0 = self.tmp()
-        self.emit(f"{src0} = OpSelect %uint {src_ok} {shuffled} {zero}")
+        if not self.emulate:
+            src0 = self.eager_select_u(src_ok, shuffled)
+        else:
+            src0 = self.tmp()
+            self.emit(f"{src0} = OpSelect %uint {src_ok} {shuffled} {zero}")
         if dpp8 is not None or bound:
             write = enabled
+        elif not self.emulate:
+            write = self.eager_land(enabled, src_ok)
         else:
             write = self.tmp()
             self.emit(f"{write} = OpLogicalAnd %bool {enabled} {src_ok}")
@@ -4669,6 +4708,7 @@ class Gen:
             self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} {act}")
             self.emit(f"{lsb} = OpGroupNonUniformBallotFindLSB %uint {self.cu(3)} {bal}")
             self.emit(f"{any_} = OpGroupNonUniformAny %bool {self.cu(3)} {act}")
+            # any_ is subgroup-uniform, so OpSelect never diverges and avoids UNDEFINED & 0 when bal == 0.
             self.emit(f"{first} = OpSelect %uint {any_} {lsb} {self.cu(0)}")
             self.emit(f"{r} = OpGroupNonUniformShuffle %uint {self.cu(3)} {v} {first}")
             self.dst(a[0], r)
@@ -5034,7 +5074,7 @@ class Gen:
             self.emit(f"{below} = OpBitwiseAnd %uint {mask} {big}")
             self.emit(f"{cnt} = OpBitCount %uint {below}")
             self.emit(f"{r} = OpIAdd %uint {cnt} {acc}")
-            self.dst(a[0], r)
+            self.dst(a[0], r, eager=not self.emulate and self.holds_lane_mask(a[1]))
         elif op == "v_bfrev_b32":
             x = self.src_u(a[1])
             r = self.tmp()
@@ -5441,8 +5481,14 @@ class Gen:
                 self.emit(f"{row} = OpCopyObject %uint {half}")
             self.emit(f"{src} = OpBitwiseOr %uint {row} {nib}")
             r = self.tmp()
+            if not self.emulate:
+                # Redirect inactive lanes to their own running lane so eager bitwise masking never
+                # consumes UNDEFINED from shuffling a missing lane in a partial wave.
+                safe_src = self.tmp()
+                self.emit(f"{safe_src} = OpSelect %uint {self.active_b()} {src} {lane}")
+                src = safe_src
             self.g_shuffle(r, v, src)
-            self.dst(a[0], r)
+            self.dst(a[0], r, eager=not self.emulate)
         elif op.startswith("buffer_load_dword"):
             self.buffer_load(op, a, mods)
         elif op in self.BUFFER_SUB:
@@ -6430,10 +6476,14 @@ class Gen:
                 return m, m
 
             (x0, x1), (y0, y1) = halves(a[0], m0), halves(a[1], m1)
-            e0, e1, eq, r = (self.tmp() for _ in range(4))
+            e0, e1, r = (self.tmp() for _ in range(3))
             self.emit(f"{e0} = OpIEqual %bool {x0} {y0}")
             self.emit(f"{e1} = OpIEqual %bool {x1} {y1}")
-            self.emit(f"{eq} = OpLogicalAnd %bool {e0} {e1}")
+            if not use_vote and (m0 or m1) and not self.emulate:
+                eq = self.eager_land(e0, e1)
+            else:
+                eq = self.tmp()
+                self.emit(f"{eq} = OpLogicalAnd %bool {e0} {e1}")
             if use_vote:
                 eq = self.wave_equal(eq, True)
             if op == "s_cmp_lg_u64":
