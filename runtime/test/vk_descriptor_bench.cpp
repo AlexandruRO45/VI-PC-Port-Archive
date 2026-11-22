@@ -7,7 +7,7 @@
 // dispatch against CPU DescriptorTable::lookup() before timing.
 //
 // Usage:
-//   vk_descriptor_bench [--sizes 1000,10000,100000] [--groups 4096] [--iters 64] [--reps 25] [--warmup 5]
+//   vk_descriptor_bench [--sizes 1000,10000,100000] [--groups 4096] [--iters 64] [--reps 25] [--warmup 200]
 //                       [--memory all|device|host|rebar] [--device N] [--list-devices] [--quick] [--csv]
 //                       [--dump-spv PREFIX] [--self-test]
 //   LEONIDA_VK_VALIDATION=1 enables VK_LAYER_KHRONOS_validation; any validation error fails the run.
@@ -967,7 +967,7 @@ struct Options {
     std::uint32_t groups = 4096u;
     std::uint32_t iters = 64u;
     std::uint32_t reps = 25u;
-    std::uint32_t warmup = 5u;
+    std::uint32_t warmup = 200u;  // Let an idle GPU reach representative clocks before comparing placements.
     double max_dispatch_ms = 120.0;
     std::optional<std::uint32_t> device_index;
     MemoryFilter mem_filter = MemoryFilter::All;
@@ -984,7 +984,7 @@ void print_usage() {
         "  --groups N           workgroups of 64 invocations per dispatch (default: 4096)\n"
         "  --iters N            lookups per invocation per dispatch (default: 64)\n"
         "  --reps N             timed repetitions per scenario (default: 25)\n"
-        "  --warmup N           warmup dispatches before timing (default: 5)\n"
+        "  --warmup N           warmup dispatches before timing (default: 200)\n"
         "  --max-dispatch-ms F  auto-scale slow dispatches to avoid OS TDR, 0=off (default: 120)\n"
         "  --memory MODE        all|device|host|rebar (default: all)\n"
         "  --device N           select physical device index from --list-devices\n"
