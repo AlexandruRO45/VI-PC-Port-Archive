@@ -348,6 +348,27 @@ if(BUILD_TESTING)
       MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
     )
 
+    # A DLL that imports GUID data from d3d12_xs.dll (a title's IIDs), linked against a stub of that name. The stub
+    # DLL goes to its own folder so the loader cannot find it beside the fixture and bind it as a bundled module.
+    add_library(d3d12_xs_iid_stub SHARED test/fixtures/d3d12_xs_iid_stub.cpp)
+    add_library(tiny_iid SHARED test/fixtures/tiny_iid.cpp)
+    target_link_libraries(tiny_iid PRIVATE d3d12_xs_iid_stub)
+    foreach(target d3d12_xs_iid_stub tiny_iid)
+      target_compile_definitions(${target} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8 /GS-)
+      set_target_properties(${target} PROPERTIES PREFIX "" MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endforeach()
+    set_target_properties(d3d12_xs_iid_stub PROPERTIES
+      OUTPUT_NAME d3d12_xs
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/stubs/$<CONFIG>"
+      ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/stubs/$<CONFIG>"
+    )
+    set_target_properties(tiny_iid PROPERTIES
+      OUTPUT_NAME tiny_iid
+      RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+    )
+
     add_executable(tiny_exe test/fixtures/tiny_exe.cpp)
     target_link_libraries(tiny_exe PRIVATE tiny_dll)
     target_compile_definitions(tiny_exe PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -377,7 +398,7 @@ if(BUILD_TESTING)
     target_compile_options(pe_loader_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
     target_link_options(pe_loader_test PRIVATE /OPT:NOREF)
     target_link_libraries(pe_loader_test PRIVATE gta6rt_d3d12_xs_rootsig psapi)
-    add_dependencies(pe_loader_test tiny_dll tiny_exe gta6rt_tls_host)
+    add_dependencies(pe_loader_test tiny_dll tiny_exe tiny_iid gta6rt_tls_host)
 
     # `gta6rt --run` rehearsal: a stand-in game EXE (CRT startup, statics, heap, files, threads) that imports
     # xgameruntime.dll from a link-time stub; under --run the shim registry answers those imports instead.
@@ -462,7 +483,8 @@ if(BUILD_TESTING)
     target_compile_definitions(tiny_game_exit_code_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_game_exit_code_test PRIVATE /W4 /permissive- /utf-8)
     add_dependencies(tiny_game_exit_code_test gta6rt tiny_game tiny_game_fixed)
-    add_test(NAME pe_loader COMMAND pe_loader_test "$<TARGET_FILE:tiny_dll>" "$<TARGET_FILE:tiny_exe>")
+    add_test(NAME pe_loader COMMAND pe_loader_test "$<TARGET_FILE:tiny_dll>" "$<TARGET_FILE:tiny_exe>"
+      "$<TARGET_FILE:tiny_iid>")
 
     # Synthetic, hand-built images through Loader::load: range checks, wrapping RVAs, import-table termination and
     # base relocations (HIGHLOW included). No fixture DLL is needed; the images are written to a temporary folder.

@@ -97,6 +97,13 @@ Ordinals 23–28 and 72–99 are derived in §2.4. Names are SCARAB's; the 10 co
 order within 23–27 is inferred and immaterial: those are debug GUIDs, not interfaces a title QIs
 for.
 
+Leonida serves all 93 by name as data (`runtime/shims/d3d12_xs.cpp`, from
+`runtime/shims/d3d12_xs_guids.inc`, which `tools/d3d12_xs_surface.py --inc` writes): a title linked
+against the console import library imports them, and its import slot then holds the address of the
+GUID. Before that an imported GUID was bound to the unimplemented-import thunk and read back as 16
+bytes of thunk code. They are not served by ordinal, because 34 of the ordinals are derived, not
+read. Whether the executable imports any is not known; the package's own DLLs import none.
+
 | # | GUID export | Std | Evidence |
 |---:|---|---|---|
 | 23 | `DXGI_DEBUG_ALL` | yes | derived (debug block, alphabetical) |
