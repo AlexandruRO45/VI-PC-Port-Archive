@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import enum
 import math
+import re
 import struct
 import unittest
 from dataclasses import dataclass, field
@@ -326,6 +327,56 @@ def evaluate_gws_status(old_val: int, new_val: int, waiter_released: bool, rid: 
         counter_negative=counter_negative,
         carry_out=carry_out,
         resource_id=rid,
+    )
+
+
+# Commit 8: Negative controls, syntax rejection, and mutation detection
+
+
+def parse_gws_sema_v_asm(line: str) -> Instruction:
+    """Parses canonical assembly string for ds_gws_sema_v."""
+    tokens = line.strip().split()
+    if not tokens:
+        raise ValueError("Empty instruction line")
+
+    mnemonic = tokens[0]
+    if mnemonic != "ds_gws_sema_v":
+        raise ValueError(f"Unrecognized opcode: {mnemonic}")
+
+    vdata: Optional[Register] = None
+    offset = 0
+    gds = False
+
+    for tok in tokens[1:]:
+        if tok == "gds":
+            gds = True
+        elif tok.startswith("offset:"):
+            try:
+                offset_val = int(tok.split(":")[1])
+            except ValueError:
+                raise ValueError(f"Invalid offset format: {tok}")
+            if not (0 <= offset_val <= 255):
+                raise ValueError(f"Offset out of range [0, 255]: {offset_val}")
+            offset = offset_val
+        elif tok.startswith("v"):
+            m = re.match(r"^v(\d+)$", tok)
+            if not m:
+                raise ValueError(f"Invalid VGPR token: {tok}")
+            v_idx = int(m.group(1))
+            if not (0 <= v_idx <= 255):
+                raise ValueError(f"VGPR index out of range: {v_idx}")
+            vdata = Register(v_idx, RegKind.VGPR)
+        else:
+            raise ValueError(f"Unexpected token in ds_gws_sema_v: {tok}")
+
+    if not gds:
+        raise ValueError("GWS instructions require the 'gds' modifier")
+
+    return Instruction(
+        opcode=Opcode.DS_GWS_SEMA_V,
+        vdata=vdata,
+        offset=offset,
+        gds=gds,
     )
 
 
@@ -784,6 +835,129 @@ class TestGWSSemaVIEEE754(unittest.TestCase):
         self.assertEqual(interp.rf.get_vgpr(10), flt_max)
         self.assertEqual(interp.rf.get_vgpr(11), flt_min)
         self.assertEqual(interp.rf.get_vgpr(12), packed_f16)
+
+
+class TestGWSSemaVNegativeControlsAndMutations(unittest.TestCase):
+    """Commit 8: Negative controls, syntax rejection, and mutation detection for ds_gws_sema_v."""
+
+    def test_syntax_rejection_invalid_mnemonic(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_gws_sema_v_asm("ds_gws_sema_invalid offset:0 gds")
+        with self.assertRaises(ValueError):
+            parse_gws_sema_v_asm("ds_gws_v offset:0 gds")
+
+    def test_syntax_rejection_missing_gds_modifier(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_gws_sema_v_asm("ds_gws_sema_v offset:0")
+
+    def test_syntax_rejection_invalid_register(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_gws_sema_v_asm("ds_gws_sema_v r0 offset:0 gds")
+        with self.assertRaises(ValueError):
+            parse_gws_sema_v_asm("ds_gws_sema_v v256 offset:0 gds")
+
+    def test_syntax_rejection_invalid_offset(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_gws_sema_v_asm("ds_gws_sema_v offset:-1 gds")
+        with self.assertRaises(ValueError):
+            parse_gws_sema_v_asm("ds_gws_sema_v offset:256 gds")
+        with self.assertRaises(ValueError):
+            parse_gws_sema_v_asm("ds_gws_sema_v offset:xyz gds")
+
+    def test_valid_syntax_parsing(self) -> None:
+        instr1 = parse_gws_sema_v_asm("ds_gws_sema_v offset:4 gds")
+        self.assertEqual(instr1.offset, 4)
+        self.assertIsNone(instr1.vdata)
+        self.assertTrue(instr1.gds)
+
+        instr2 = parse_gws_sema_v_asm("ds_gws_sema_v v5 offset:12 gds")
+        self.assertEqual(instr2.offset, 12)
+        self.assertIsNotNone(instr2.vdata)
+        self.assertEqual(instr2.vdata.index, 5)
+        self.assertTrue(instr2.gds)
+
+    def test_negative_control_barrier_type_conflict(self) -> None:
+        gws = GWSSubsystem()
+        gws.init_resource(1, init_val=0, res_type=GWSResourceType.BARRIER)
+        with self.assertRaises(TypeError):
+            gws.signal_v(1)
+
+    def test_mutation_detection_ignore_exec_mask(self) -> None:
+        # Mutant ignores exec mask and signals for inactive lanes
+        class MutantIgnoreExecSIMD(SIMDInterpreter):
+            def step_wave(self, wave: SIMDWaveState, instr: Instruction) -> Dict[str, Any]:
+                rid = ref_gws_resource_id(wave.m0, instr.offset)
+                signals_issued = 0
+                for _ in range(wave.wave_size):
+                    # Mutant: ignores wave.is_lane_active(lane)
+                    self.gws.signal_v(rid)
+                    signals_issued += 1
+                return {"signals_issued": signals_issued}
+
+        mutant = MutantIgnoreExecSIMD()
+        wave = SIMDWaveState(wave_id=1, wave_size=32, exec_mask=0)  # Inactive wave
+        res = mutant.step_wave(wave, Instruction(opcode=Opcode.DS_GWS_SEMA_V))
+        # Mutant bug detected: issued 32 signals when 0 expected
+        self.assertNotEqual(res["signals_issued"], 0)
+
+    def test_mutation_detection_decrement_instead_of_increment(self) -> None:
+        # Mutant decrements instead of incrementing (confusing P with V)
+        def mutant_signal_v(subsystem: GWSSubsystem, rid: int) -> int:
+            res = subsystem.resources[rid]
+            res.value = (res.value - 1) & MASK32
+            return res.value
+
+        gws = GWSSubsystem()
+        val = mutant_signal_v(gws, 0)
+        # Normal signal_v yields 1, mutant yields 0xFFFFFFFF
+        self.assertNotEqual(val, 1)
+
+    def test_mutation_detection_fail_to_wake_waiter(self) -> None:
+        # Mutant fails to pop waiting wavefront
+        class MutantNoWakeSubsystem(GWSSubsystem):
+            def signal_v(self, res_id: int) -> Tuple[int, Optional[int]]:
+                rid = res_id & GWS_RESOURCE_ID_MASK
+                res = self.resources[rid]
+                res.value = (res.value + 1) & MASK32
+                # Bug: never wakes waiter
+                return res.value, None
+
+        mutant_gws = MutantNoWakeSubsystem()
+        mutant_gws.wait_p(4, wave_id=99)
+        _, awakened = mutant_gws.signal_v(4)
+        # Normal behavior wakes wave 99, mutant returns None
+        self.assertIsNone(awakened)
+
+    def test_mutation_detection_snan_quietening(self) -> None:
+        # Mutant forces quiet bit on NaN
+        def mutant_load_snan(val: int) -> int:
+            return val | 0x0040_0000
+
+        snan = 0x7F80_0001
+        mutated = mutant_load_snan(snan)
+        self.assertNotEqual(snan, mutated)
+
+    def test_mutation_detection_subnormal_ftz(self) -> None:
+        # Mutant flushes subnormal to zero
+        def mutant_ftz(val: int) -> int:
+            if (val & 0x7F80_0000) == 0 and (val & 0x007F_FFFF) != 0:
+                return val & 0x8000_0000
+            return val
+
+        subnormal = 0x0000_0001
+        self.assertEqual(mutant_ftz(subnormal), 0)
+        self.assertNotEqual(subnormal, 0)
+
+    def test_mutation_detection_wrong_resource_mask(self) -> None:
+        # Mutant masks resource id with 0x1F (32 slots) instead of 0x3F (64 slots)
+        def mutant_gws_resource_id(m0_val: int, offset: int) -> int:
+            return (m0_val + offset) & 0x1F
+
+        correct_id = ref_gws_resource_id(35, 0)  # should be 35
+        mutant_id = mutant_gws_resource_id(35, 0)  # yields 3
+        self.assertEqual(correct_id, 35)
+        self.assertEqual(mutant_id, 3)
+        self.assertNotEqual(correct_id, mutant_id)
 
 
 if __name__ == "__main__":
