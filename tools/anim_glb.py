@@ -464,7 +464,10 @@ def _clip_timeline(start, end, rate, step, frames):
     previous = struct.pack("<f", 0.0)
     require(previous != packed_end, "clip window is too short for float32 timestamps")
     timeline = [(0.0, start / step)]
-    for k in range(frames):
+    # Include the two bracketing frames, then check exact times below to tolerate division rounding at an endpoint.
+    first = max(0, min(frames, math.floor(start / step)))
+    stop = max(first, min(frames, math.ceil(end / step) + 1))
+    for k in range(first, stop):
         time = (k * step - start) / rate
         if 0.0 < time < duration:
             packed = struct.pack("<f", time)
@@ -490,14 +493,17 @@ def clip_channels(s, dictionary, clip, joint_by_hash, root_motion, tally):
         step = anim["duration"] / (frames - 1) if frames > 1 and anim["duration"] > 0 else 1.0 / 30
         start = entry["start"] if math.isfinite(entry["start"]) else 0.0
         end = entry["end"] if math.isfinite(entry["end"]) and entry["end"] >= start else anim["duration"]
-        keep = [k for k in range(frames) if start - 1e-4 <= k * step <= end + 1e-4]
-        fallback = not keep
-        if fallback:
-            target_time = 0.5 * (start + end) if end >= start else start
-            keep = [min(range(frames), key=lambda k: abs(k * step - target_time))] if frames else []
-        if not keep:
+        if not frames:
             continue
-        timeline = _clip_timeline(start, end, rate, step, frames) if end > start else None
+        timeline, keep, fallback = None, [], False
+        if end > start:
+            timeline = _clip_timeline(start, end, rate, step, frames)
+        else:
+            keep = [k for k in range(frames) if start - 1e-4 <= k * step <= end + 1e-4]
+            fallback = not keep
+            if fallback:
+                target_time = 0.5 * (start + end) if end >= start else start
+                keep = [min(range(frames), key=lambda k: abs(k * step - target_time))]
         tally["animations"] += 1
         for t, (bone, ttype, fmt) in enumerate(anim["tracks"]):
             path = TRACK_PATHS.get(ttype)

@@ -459,6 +459,33 @@ class ClipBoundaryTest(unittest.TestCase):
         self.assert_keys(channels[(0, "translation")],
                          [(0.0, (0.50001, 0.0, 0.0)), (0.00001, (0.50002, 0.0, 0.0))])
 
+    def test_a_narrow_window_does_not_scan_the_whole_animation(self):
+        for frames in (128, 512, 2048):
+            with self.subTest(frames=frames):
+                samples = [(k / (frames - 1), -2.0 * k / (frames - 1), 0.0) for k in range(frames)]
+                start, end = ((frames // 2 + fraction) / (frames - 1) for fraction in (0.25, 0.3))
+                iterations = [0]
+
+                def counted_range(*args):
+                    # Count the production module's actual range traversal, excluding fixture construction.
+                    for k in range(*args):
+                        iterations[0] += 1
+                        yield k
+
+                with mock.patch.object(anim_glb, "range", side_effect=counted_range, create=True):
+                    channels = self.channels(samples, start=start, end=end)
+                self.assert_keys(channels[(0, "translation")],
+                                 [(0.0, (start, -2.0 * start, 0.0)),
+                                  (end - start, (end, -2.0 * end, 0.0))])
+                self.assertLessEqual(iterations[0], 4, f"visited {iterations[0]} source frames for two keys")
+
+    def test_a_positive_window_that_collapses_to_float32_zero_is_refused(self):
+        # Both the endpoint and playback rate fit the source's float32 metadata,
+        # but the resulting clip duration rounds to the same float32 time as zero.
+        with self.assertRaisesRegex(anim_glb.ExportError, "too short for float32 timestamps"):
+            self.channels([(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
+                          start=0.0, end=math.ldexp(1.0, -149), rate=4.0)
+
 
 class ExportTest(unittest.TestCase):
     def setUp(self):
