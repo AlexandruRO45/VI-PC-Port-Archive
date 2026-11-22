@@ -532,6 +532,117 @@ class TestValuOr3B32SIMDDivergence(unittest.TestCase):
             self.assertEqual(state.get_vgpr(lane, 0), self.CANARY_OLD)
 
 
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestValuOr3B32RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing hazards and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarVALUInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_dst_aliases_src0(self) -> None:
+        # v0 = v0 | v1 | v2
+        self.state.set_vgpr(0, 0x10)
+        self.state.set_vgpr(1, 0x20)
+        self.state.set_vgpr(2, 0x05)
+        instr = VOr3B32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+            src2=VOP3Operand(Reg(2, RegType.VGPR)),
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 0x35)
+        self.assertEqual(self.state.get_vgpr(0), 0x35)
+        self.assertEqual(self.state.get_vgpr(1), 0x20)
+        self.assertEqual(self.state.get_vgpr(2), 0x05)
+
+    def test_dst_aliases_src1(self) -> None:
+        # v1 = v0 | v1 | v2
+        self.state.set_vgpr(0, 0x01)
+        self.state.set_vgpr(1, 0x02)
+        self.state.set_vgpr(2, 0x04)
+        instr = VOr3B32Instruction(
+            dst=Reg(1, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+            src2=VOP3Operand(Reg(2, RegType.VGPR)),
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 0x07)
+        self.assertEqual(self.state.get_vgpr(1), 0x07)
+        self.assertEqual(self.state.get_vgpr(0), 0x01)
+        self.assertEqual(self.state.get_vgpr(2), 0x04)
+
+    def test_dst_aliases_src2(self) -> None:
+        # v2 = v0 | v1 | v2
+        self.state.set_vgpr(0, 0x100)
+        self.state.set_vgpr(1, 0x020)
+        self.state.set_vgpr(2, 0x003)
+        instr = VOr3B32Instruction(
+            dst=Reg(2, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+            src2=VOP3Operand(Reg(2, RegType.VGPR)),
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 0x123)
+        self.assertEqual(self.state.get_vgpr(2), 0x123)
+        self.assertEqual(self.state.get_vgpr(0), 0x100)
+        self.assertEqual(self.state.get_vgpr(1), 0x020)
+
+    def test_dst_aliases_src0_and_src1(self) -> None:
+        # v0 = v0 | v0 | v2
+        self.state.set_vgpr(0, 0xAA00)
+        self.state.set_vgpr(2, 0x0055)
+        instr = VOr3B32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(0, RegType.VGPR)),
+            src2=VOP3Operand(Reg(2, RegType.VGPR)),
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 0xAA55)
+        self.assertEqual(self.state.get_vgpr(0), 0xAA55)
+
+    def test_dst_aliases_all_operands_idempotent(self) -> None:
+        # v0 = v0 | v0 | v0
+        self.state.set_vgpr(0, 0xDEADBEEF)
+        instr = VOr3B32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(0, RegType.VGPR)),
+            src2=VOP3Operand(Reg(0, RegType.VGPR)),
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 0xDEADBEEF)
+        self.assertEqual(self.state.get_vgpr(0), 0xDEADBEEF)
+
+    def test_simd_multi_lane_aliasing(self) -> None:
+        simd = SIMDInterpreter()
+        state = SIMDState(num_lanes=64)
+        for lane in range(64):
+            state.set_vgpr(lane, 0, lane)
+            state.set_vgpr(lane, 1, 0x100)
+
+        # v0 = v0 | 0x200 | v1
+        instr = VOr3B32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Literal32(0x200)),
+            src2=VOP3Operand(Reg(1, RegType.VGPR)),
+        )
+        simd.step(instr, state)
+        for lane in range(64):
+            expected = lane | 0x100 | 0x200
+            self.assertEqual(state.get_vgpr(lane, 0), expected)
+            self.assertEqual(state.get_vgpr(lane, 1), 0x100)
+
+
+
 
 
 
