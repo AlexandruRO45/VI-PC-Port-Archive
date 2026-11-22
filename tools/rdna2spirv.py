@@ -9761,13 +9761,44 @@ class Gen:
             halves.extend((lo, hi))
         return halves
 
+    def d16_store_components(self, base, dmask):
+        """The four texel components of a d16 image_store from the packed VGPRs at ``base``: three lists of four
+        ids, the f32 bits (each f16 widened exactly), the zero-extended and the sign-extended 16 bits. Components
+        outside dmask are 0."""
+        fl, ul, sl = [], [], []
+        words = {}
+        k = 0
+        for c in range(4):
+            if not dmask >> c & 1:
+                fl.append(self.cu(0))
+                ul.append(self.cu(0))
+                sl.append(self.as_int(self.cu(0)))
+                continue
+            r = base + k // 2
+            if r not in words:
+                words[r] = self.load_reg("vgpr", r)
+            half = k % 2
+            k += 1
+            u, v2, f, fb, sx = (self.tmp() for _ in range(5))
+            self.emit(f"{u} = OpBitFieldUExtract %uint {words[r]} {self.cu(16 * half)} {self.cu(16)}")
+            self.emit(f"{sx} = OpBitFieldSExtract %uint {words[r]} {self.cu(16 * half)} {self.cu(16)}")
+            self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
+            self.emit(f"{f} = OpCompositeExtract %float {v2} 0")
+            self.emit(f"{fb} = OpBitcast %uint {f}")
+            fl.append(fb)
+            ul.append(u)
+            sl.append(self.as_int(sx))
+        return fl, ul, sl
+
     def image_store(self, a, mods, dim):
         """image_store vData, vAddr, T#: write the dmask components to a storage image. The view is picked at run
         time from T# word1 FORMAT [28:20]: *_UINT -> uint view, *_SINT -> sint view, anything else -> float view
-        (UNORM/SNORM/FLOAT convert from the float bits the shader wrote). Missing components are 0."""
-        if dim not in self.STORE_DIMS or "d16" in mods:
-            raise Unsupported("image_store " + dim.split("SQ_RSRC_IMG_")[-1] + (" a16" if "a16" in mods else "")
-                              + (" d16" if "d16" in mods else ""))
+        (UNORM/SNORM/FLOAT convert from the float bits the shader wrote). Missing components are 0.
+        With d16 the data is 16 bits per component, two to a VGPR from the low half (the enabled components in
+        order: the first is vD[15:0], the second vD[31:16], the third (vD+1)[15:0]): the float view reads them as
+        f16 (widened exactly to f32), the uint view zero-extends and the sint view sign-extends the 16 bits."""
+        if dim not in self.STORE_DIMS:
+            raise Unsupported("image_store " + dim.split("SQ_RSRC_IMG_")[-1] + (" a16" if "a16" in mods else ""))
         di, _, _, nc = self.STORE_DIMS[dim]
         if "glc" in mods:
             self.coherent_images = True     # a coherent store (glc, device scope): see image_load_coherent
@@ -9781,7 +9812,12 @@ class Gen:
             raise Unsupported("image_store coords")
         # The enabled components come from consecutive VGPRs, in component order (dmask 0x9: R = vD, A = vD+1).
         regs = iter(range(vdata["r"], vdata["r"] + 4))
-        vals = [self.load_reg("vgpr", next(regs)) if dmask >> c & 1 else self.cu(0) for c in range(4)]
+        if "d16" in mods:
+            vals, uvals, svals = self.d16_store_components(vdata["r"], dmask)
+        else:
+            vals = [self.load_reg("vgpr", next(regs)) if dmask >> c & 1 else self.cu(0) for c in range(4)]
+            uvals = vals
+            svals = [self.as_int(v) for v in vals]
         coords = [self.as_int(c) for c in raw[:nc]]
         idx = self.desc_lookup_sgpr(a[2], 8)
         t1 = self.sgpr_word(a[2], 1)
@@ -9795,10 +9831,10 @@ class Gen:
             self.emit(f"{iv} = OpCompositeConstruct {'%v2int' if nc == 2 else '%v3int'} {' '.join(coords)}")
         is_u, is_s = self.fmt_int_flags(t1)
         fv = [self.tof(v) for v in vals]
-        sv = [self.as_int(v) for v in vals]
+        sv = svals
         v4f, v4u, v4s = self.tmp(), self.tmp(), self.tmp()
         self.emit(f"{v4f} = OpCompositeConstruct %v4float {' '.join(fv)}")
-        self.emit(f"{v4u} = OpCompositeConstruct %v4uint_st {' '.join(vals)}")
+        self.emit(f"{v4u} = OpCompositeConstruct %v4uint_st {' '.join(uvals)}")
         self.emit(f"{v4s} = OpCompositeConstruct %v4int_st {' '.join(sv)}")
         act = self.active_b()
         L = {k: self.tmp() + "_" + k for k in ("do", "end", "s", "rest", "e2", "u", "f", "e3")}
