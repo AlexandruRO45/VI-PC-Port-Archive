@@ -18,6 +18,8 @@ Semantics:
 """
 from __future__ import annotations
 
+import math
+import struct
 import unittest
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -1360,6 +1362,214 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
             eff_addr=0x600,
         )
         self.assertFalse(flags_no_borrow.borrow)
+
+
+# ==============================================================================
+# Phase 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+# IEEE 754 Single-Precision (binary32) Architectural Constants
+F32_POS_ZERO: int = 0x0000_0000
+F32_NEG_ZERO: int = 0x8000_0000
+F32_POS_INF: int = 0x7F80_0000
+F32_NEG_INF: int = 0xFF80_0000
+F32_CANONICAL_QNAN: int = 0x7FC0_0000
+F32_SIGNALING_NAN: int = 0x7F80_0001
+F32_MIN_SUBNORMAL: int = 0x0000_0001
+F32_MAX_SUBNORMAL: int = 0x007F_FFFF
+F32_MIN_NORMAL: int = 0x0080_0000
+F32_MAX_NORMAL: int = 0x7F7F_FFFF
+
+
+def f32_to_bits(val: float) -> int:
+    """Convert float to IEEE 754 32-bit unsigned integer representation."""
+    return struct.unpack("<I", struct.pack("<f", val))[0]
+
+
+def bits_to_f32(bits: int) -> float:
+    """Convert IEEE 754 32-bit integer representation to Python float."""
+    return struct.unpack("<f", struct.pack("<I", bits & MASK_32))[0]
+
+
+def is_f32_nan(bits: int) -> bool:
+    """Check if bits represent an IEEE 754 NaN."""
+    return ((bits & 0x7F80_0000) == 0x7F80_0000) and ((bits & 0x007F_FFFF) != 0)
+
+
+def is_f32_subnormal(bits: int) -> bool:
+    """Check if bits represent an IEEE 754 subnormal number."""
+    return ((bits & 0x7F80_0000) == 0) and ((bits & 0x007F_FFFF) != 0)
+
+
+class TestIEEE754BoundaryExtremesAndBitwiseLimits(unittest.TestCase):
+    """Phase 7: Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def setUp(self) -> None:
+        self.lds = LDSModel()
+        self.interp = ScalarInterpreter()
+        self.state = ScalarMachineState(lds=self.lds)
+
+    def test_signed_zeros_bitwise_or(self) -> None:
+        """ORing sign bit 0x80000000 into +0.0 results in -0.0."""
+        addr = 0x100
+        self.lds.write_dword(addr, F32_POS_ZERO)
+        self.state.set_vgpr(0, addr)
+
+        instr = DSOrInstruction(
+            opcode=DSOpcode.DS_OR_RTN_B32,
+            dst=VGPR(1),
+            addr=VGPR(0),
+            data=Immediate(F32_NEG_ZERO),
+        )
+        old, mem = self.interp.step(instr, self.state)
+        self.assertEqual(old, F32_POS_ZERO)
+        self.assertEqual(mem, F32_NEG_ZERO)
+        self.assertEqual(self.state.get_vgpr(1), F32_POS_ZERO)
+        self.assertEqual(self.lds.read_dword(addr), F32_NEG_ZERO)
+
+    def test_subnormals_preservation_no_ftz(self) -> None:
+        """LDS bitwise operations preserve subnormals without flush-to-zero (FTZ)."""
+        self.assertTrue(is_f32_subnormal(F32_MIN_SUBNORMAL))
+        self.assertTrue(is_f32_subnormal(F32_MAX_SUBNORMAL))
+
+        addr = 0x200
+        self.lds.write_dword(addr, F32_MIN_SUBNORMAL)
+        self.state.set_vgpr(0, addr)
+
+        instr = DSOrInstruction(
+            opcode=DSOpcode.DS_OR_RTN_B32,
+            dst=VGPR(2),
+            addr=VGPR(0),
+            data=Immediate(0x0000_0002),
+        )
+        old, mem = self.interp.step(instr, self.state)
+        self.assertEqual(old, F32_MIN_SUBNORMAL)
+        self.assertEqual(mem, 0x0000_0003)
+        self.assertTrue(is_f32_subnormal(mem))
+
+    def test_signaling_nan_preserved_unless_quiet_bit_explicitly_set(self) -> None:
+        """Signaling NaNs are not quietened unless quiet bit (bit 22) is set in mask."""
+        addr = 0x300
+        self.lds.write_dword(addr, F32_SIGNALING_NAN)
+        self.state.set_vgpr(0, addr)
+
+        # OR with payload bits that keep bit 22 clear
+        instr_keep_snan = DSOrInstruction(
+            opcode=DSOpcode.DS_OR_RTN_B32,
+            dst=VGPR(3),
+            addr=VGPR(0),
+            data=Immediate(0x0000_0010),
+        )
+        old, mem = self.interp.step(instr_keep_snan, self.state)
+        self.assertEqual(old, F32_SIGNALING_NAN)
+        self.assertEqual(mem, 0x7F80_0011)
+        self.assertTrue(is_f32_nan(mem))
+        # Bit 22 is quiet bit: must still be 0 for signaling NaN
+        self.assertEqual(mem & 0x0040_0000, 0)
+
+        # Now explicitly set quiet bit
+        instr_quiet = DSOrInstruction(
+            opcode=DSOpcode.DS_OR_RTN_B32,
+            dst=VGPR(3),
+            addr=VGPR(0),
+            data=Immediate(0x0040_0000),
+        )
+        old2, mem2 = self.interp.step(instr_quiet, self.state)
+        self.assertEqual(old2, 0x7F80_0011)
+        self.assertEqual(mem2, 0x7FC0_0011)
+        # Bit 22 is now set (Quiet NaN)
+        self.assertNotEqual(mem2 & 0x0040_0000, 0)
+
+    def test_infinities_sign_bit_and_payload_injection(self) -> None:
+        """ORing sign bit transforms +inf into -inf; ORing payload turns inf into NaN."""
+        addr = 0x400
+        self.lds.write_dword(addr, F32_POS_INF)
+        self.state.set_vgpr(0, addr)
+
+        # OR with sign bit -> negative infinity
+        instr_neg_inf = DSOrInstruction(
+            opcode=DSOpcode.DS_OR_RTN_B32,
+            dst=VGPR(4),
+            addr=VGPR(0),
+            data=Immediate(F32_NEG_ZERO),
+        )
+        old, mem = self.interp.step(instr_neg_inf, self.state)
+        self.assertEqual(old, F32_POS_INF)
+        self.assertEqual(mem, F32_NEG_INF)
+
+        # OR with fraction payload -> NaN
+        instr_nan = DSOrInstruction(
+            opcode=DSOpcode.DS_OR_RTN_B32,
+            dst=VGPR(4),
+            addr=VGPR(0),
+            data=Immediate(0x0000_0001),
+        )
+        old2, mem2 = self.interp.step(instr_nan, self.state)
+        self.assertEqual(old2, F32_NEG_INF)
+        self.assertEqual(mem2, 0xFF80_0001)
+        self.assertTrue(is_f32_nan(mem2))
+
+    def test_walking_ones_boundary_coverage(self) -> None:
+        """Test bitwise OR across all 32 single-bit patterns."""
+        addr = 0x500
+        for bit in range(32):
+            self.lds.write_dword(addr, 0)
+            self.state.set_vgpr(0, addr)
+            mask = 1 << bit
+
+            instr = DSOrInstruction(
+                opcode=DSOpcode.DS_OR_RTN_B32,
+                dst=VGPR(5),
+                addr=VGPR(0),
+                data=Immediate(mask),
+            )
+            old, mem = self.interp.step(instr, self.state)
+            self.assertEqual(old, 0)
+            self.assertEqual(mem, mask)
+            self.assertEqual(self.state.get_vgpr(5), 0)
+            self.assertEqual(self.lds.read_dword(addr), mask)
+
+    def test_walking_zeros_boundary_coverage(self) -> None:
+        """Test bitwise OR when starting from inverted single-bit masks."""
+        addr = 0x600
+        for bit in range(32):
+            inv_mask = (~(1 << bit)) & MASK_32
+            self.lds.write_dword(addr, inv_mask)
+            self.state.set_vgpr(0, addr)
+            fill_bit = 1 << bit
+
+            instr = DSOrInstruction(
+                opcode=DSOpcode.DS_OR_RTN_B32,
+                dst=VGPR(6),
+                addr=VGPR(0),
+                data=Immediate(fill_bit),
+            )
+            old, mem = self.interp.step(instr, self.state)
+            self.assertEqual(old, inv_mask)
+            self.assertEqual(mem, MASK_32)
+            self.assertEqual(self.state.get_vgpr(6), inv_mask)
+            self.assertEqual(self.lds.read_dword(addr), MASK_32)
+
+    def test_integer_boundary_extremes(self) -> None:
+        """Sequential OR across critical 32-bit boundary integers."""
+        extremes = [0x0000_0000, 0x0000_0001, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFE, 0xFFFF_FFFF]
+        addr = 0x700
+        self.state.set_vgpr(0, addr)
+        accum = 0
+        self.lds.write_dword(addr, accum)
+
+        for val in extremes:
+            instr = DSOrInstruction(
+                opcode=DSOpcode.DS_OR_RTN_B32,
+                dst=VGPR(7),
+                addr=VGPR(0),
+                data=Immediate(val),
+            )
+            expected_old = accum
+            accum = accum | val
+            old, mem = self.interp.step(instr, self.state)
+            self.assertEqual(old, expected_old)
+            self.assertEqual(mem, accum)
 
 
 if __name__ == "__main__":
