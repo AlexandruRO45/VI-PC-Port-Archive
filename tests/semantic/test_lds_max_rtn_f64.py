@@ -1368,5 +1368,180 @@ class TestIEEE754BoundaryExtremes64(unittest.TestCase):
         self.assertEqual(oracle_max_f64(NEG_DBL_MIN, DBL_MIN), DBL_MIN)
 
 
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestNegativeControlsAndMutations64(unittest.TestCase):
+    """Phase 8: Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_assembly(self) -> None:
+        invalid_assemblies = [
+            "",
+            "   ",
+            "v_max_f64 v[0:1], v2, v[4:5]",
+            "ds_max_f64 v[0:1], v2, v[4:5]",
+            "ds_min_rtn_f64 v[0:1], v2, v[4:5]",
+            "ds_max_rtn_f32 v[0:1], v2, v[4:5]",
+            "ds_max_rtn_f64",
+            "ds_max_rtn_f64 v[0:1]",
+            "ds_max_rtn_f64 v[0:1], v2",
+            "ds_max_rtn_f64 s[0:1], v2, v[4:5]",
+            "ds_max_rtn_f64 v[0:1], s2, v[4:5]",
+            "ds_max_rtn_f64 v[0:1], v2, s[4:5]",
+            "ds_max_rtn_f64 r0, v2, v[4:5]",
+            "ds_max_rtn_f64 v[255:256], v2, v[4:5]",
+            "ds_max_rtn_f64 v[0:1], v2, v[4:5] offset:70000",
+            "ds_max_rtn_f64 v[0:1], v2, v[4:5] offset:-1",
+            "ds_max_rtn_f64 v[0:1], v2, v[4:5] bad_token",
+        ]
+        for asm in invalid_assemblies:
+            with self.subTest(asm=asm):
+                with self.assertRaises((ValueError, IndexError)):
+                    DSMaxRtnF64Instruction.parse(asm)
+
+    def test_architectural_model_negative_controls(self) -> None:
+        with self.assertRaises(ValueError):
+            LDSMemory64(0)
+        with self.assertRaises(ValueError):
+            LDSMemory64(-1024)
+        with self.assertRaises(ValueError):
+            LDSMemory64(1000)
+
+        with self.assertRaises(ValueError):
+            SIMDWaveState64(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWaveState64(wave_size=128)
+
+    def test_mutation_detection_inverted_min_max(self) -> None:
+        def mutant_max(a: int, b: int) -> int:
+            fa = bits_to_f64(a)
+            fb = bits_to_f64(b)
+            return a if fa < fb else b
+
+        self.assertNotEqual(mutant_max(ONE_F64, TWO_F64), oracle_max_f64(ONE_F64, TWO_F64))
+
+    def test_mutation_detection_integer_comparison(self) -> None:
+        def mutant_max_uint(a: int, b: int) -> int:
+            return a if (a & MASK64) > (b & MASK64) else b
+
+        # In float: 1.0 > -2.0 (correct is ONE_F64).
+        # In unsigned int: 0xC000000000000000 > 0x3FF0000000000000 (mutant returns NEG_TWO_F64).
+        self.assertNotEqual(
+            mutant_max_uint(ONE_F64, NEG_TWO_F64),
+            oracle_max_f64(ONE_F64, NEG_TWO_F64),
+        )
+
+    def test_mutation_detection_flush_subnormals_to_zero(self) -> None:
+        def mutant_max_ftz(a: int, b: int) -> int:
+            a_clean = POS_ZERO64 if is_subnormal64(a) else a
+            b_clean = POS_ZERO64 if is_subnormal64(b) else b
+            return oracle_max_f64(a_clean, b_clean)
+
+        self.assertNotEqual(
+            mutant_max_ftz(SUBNORM_MIN64, NEG_ONE_F64),
+            oracle_max_f64(SUBNORM_MIN64, NEG_ONE_F64),
+        )
+
+    def test_mutation_detection_nan_propagation(self) -> None:
+        def mutant_max_nan_propagate(a: int, b: int) -> int:
+            if is_nan64(a):
+                return a
+            if is_nan64(b):
+                return b
+            return oracle_max_f64(a, b)
+
+        self.assertNotEqual(
+            mutant_max_nan_propagate(QNAN_PAYLOAD_A64, ONE_F64),
+            oracle_max_f64(QNAN_PAYLOAD_A64, ONE_F64),
+        )
+
+    def test_mutation_detection_lost_return_value(self) -> None:
+        class MutantScalarInterpreter64(ScalarDSInterpreter64):
+            def execute(self, state: ScalarThreadState64, inst: DSMaxRtnF64Instruction) -> Tuple[int, int]:
+                old_val, new_mem = super().execute(state, inst)
+                state.set_vgpr64(inst.vdst.index, new_mem)
+                return old_val, new_mem
+
+        lds = LDSMemory64(65536)
+        lds.write_qword(0x40, ONE_F64)
+        state = ScalarThreadState64(lds=lds)
+        state.set_vgpr32(2, 0x40)
+        state.set_vgpr64(4, TEN_F64)
+
+        inst = DSMaxRtnF64Instruction(
+            vdst=RegisterOperand(0, count=2),
+            vaddr=RegisterOperand(2, count=1),
+            vdata0=RegisterOperand(4, count=2),
+        )
+        mutant = MutantScalarInterpreter64()
+        mutant.execute(state, inst)
+
+        self.assertNotEqual(state.get_vgpr64(0), ONE_F64)
+
+    def test_mutation_detection_ignore_exec_mask(self) -> None:
+        class MutantSIMDInterpreter64(SIMDDSInterpreter64):
+            def execute(self, wave: SIMDWaveState64, inst: DSMaxRtnF64Instruction) -> List[Optional[Tuple[int, int]]]:
+                saved_mask = wave.exec_mask
+                wave.exec_mask = wave.mask_limit
+                try:
+                    return super().execute(wave, inst)
+                finally:
+                    wave.exec_mask = saved_mask
+
+        lds = LDSMemory64(65536)
+        lds.write_qword(0, ONE_F64)
+        wave = SIMDWaveState64(wave_size=32, exec_mask=0, lds=lds)
+        for l in range(32):
+            wave.set_vgpr32(l, 2, l * 8)
+            wave.set_vgpr64(l, 4, TEN_F64)
+
+        inst = DSMaxRtnF64Instruction(
+            vdst=RegisterOperand(0, count=2),
+            vaddr=RegisterOperand(2, count=1),
+            vdata0=RegisterOperand(4, count=2),
+        )
+        mutant = MutantSIMDInterpreter64()
+        mutant.execute(wave, inst)
+
+        self.assertEqual(lds.read_qword(0), TEN_F64)
+
+        lds.write_qword(0, ONE_F64)
+        SIMDDSInterpreter64().execute(wave, inst)
+        self.assertEqual(lds.read_qword(0), ONE_F64)
+
+    def test_mutation_detection_dropped_offset(self) -> None:
+        class DroppedOffsetInterpreter64(ScalarDSInterpreter64):
+            def execute(self, state: ScalarThreadState64, inst: DSMaxRtnF64Instruction) -> Tuple[int, int]:
+                no_off = DSMaxRtnF64Instruction(
+                    vdst=inst.vdst,
+                    vaddr=inst.vaddr,
+                    vdata0=inst.vdata0,
+                    offset=0,
+                    gds=inst.gds,
+                )
+                return super().execute(state, no_off)
+
+        lds = LDSMemory64(65536)
+        lds.write_qword(0x20, ONE_F64)
+        lds.write_qword(0x28, ONE_F64)
+        state = ScalarThreadState64(lds=lds)
+        state.set_vgpr32(2, 0x20)
+        state.set_vgpr64(4, TEN_F64)
+
+        inst = DSMaxRtnF64Instruction(
+            vdst=RegisterOperand(0, count=2),
+            vaddr=RegisterOperand(2, count=1),
+            vdata0=RegisterOperand(4, count=2),
+            offset=8,
+        )
+
+        mutant = DroppedOffsetInterpreter64()
+        mutant.execute(state, inst)
+
+        self.assertEqual(lds.read_qword(0x20), TEN_F64)
+        self.assertEqual(lds.read_qword(0x28), ONE_F64)
+
+
 if __name__ == "__main__":
     unittest.main()
