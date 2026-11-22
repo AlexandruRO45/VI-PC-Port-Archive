@@ -52,6 +52,13 @@ RAMP = (0, 16, 37, 64, 101, 153, 219, 254)
 # pipeline's FLOAT_MODE is unmeasured, so this records the harness's assumption rather than a claim
 # about the console; binary16 and binary64 denormal behavior is established separately, not here.
 F32_DENORM_MODE = "preserve"
+# Binary16 subnormals are preserved by construction, whatever -denorm says. Packed f16 operations
+# widen each half from its encoding (widen16), compute in binary32 and narrow in integer arithmetic
+# (pack16_rne). Every binary16 subnormal and every product or sum of two of them is a binary32
+# normal, so a binary32 flush never reaches them, and DXIL records no f16 denormal mode to request.
+# The Python references keep binary16 subnormals too. Like the f32 mode, this is the harness's
+# recorded assumption, not a claim about the Scarlett FLOAT_MODE f16 bits.
+F16_DENORM_MODE = "preserve"
 
 # Integer-to-binary32 references convert through Python's binary64 float, which holds every 32-bit
 # integer exactly, then pack to binary32, rounding ties to even. The Scarlett pipeline's MODE.FP_ROUND
@@ -3388,11 +3395,25 @@ def check_pk_int16_draw(directory, compiler, renderer, backend):
             raise AssertionError(f"Mutation of {label} escaped detection")
 
 
+def check_f16_denorm_controls():
+    """CPU-side checks behind F16_DENORM_MODE: references and the lowering it relies on."""
+    assert F16_DENORM_MODE == "preserve"
+    assert f16_denorm_words(flush=False) == (0x84018001, 0x03ff0001, 0x80000200, 0x05fe0002)
+    assert f16_denorm_words(flush=True) == (0x84018000, 0x00000000, 0x80000000, 0x00000000)
+    body = translate(uncompressed_export(F16_DENORM_BODY)).split("main(", 1)[1]
+    # The mode argument holds only while binary16 values are built and narrowed from their encodings;
+    # a driver conversion or a native half type would make the result depend on the device's f16 mode.
+    for token in ("f32tof16", "f16tof32", "half", "min16float"):
+        assert token not in body, token
+    assert body.count("widen16(") == 18 and body.count("pack16_rne(") == 8, body
+
+
 def check_controls(directory):
     # A syntactically valid DPP VGPR must already have a tracked numeric value.
     must_reject(translate, with_constants([
         "v_mov_b32_dpp v12, v255 dpp8:[1,2,3,0,5,6,7,4]",
     ]))
+    check_f16_denorm_controls()
     program = bitwise_program()
     for before, after in (("s44, v18", "s44, |v18|"), ("20, v19", "20, v19 clamp"),
                           ("0x00700000, v18, v19", "0x00700000, v18")):
@@ -4348,6 +4369,73 @@ def check_denorm_mode_draw(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("A preserve-mode export matched the ftz reference")
+
+
+# Packed binary16 operations on subnormal halves. s44 holds the least (0x0001) and largest (0x03ff)
+# binary16 subnormals, s45 the least normal 0x0400 and -0, s46 0.5 in both halves and s47 -0x0401 in
+# both. The required row is the add: two normal inputs whose sum is the subnormal 0x8001, the case
+# DXIL's fadd FTZ text requires to flush. max keeps a subnormal input and the multiply makes the
+# subnormal 0x0200 from normal inputs (supplementary rows), and the fma rounds a subnormal and a normal
+# result to nearest even. v14 exports 0x80000200, a binary32 subnormal as a word, so the draw reads
+# back through the integer target, where no float path can flush the packed bits.
+F16_DENORM_BODY = [
+    "v_pk_add_f16 v12, s45, s47",
+    "v_pk_max_f16 v13, s44, s47",
+    "v_pk_mul_f16 v14, s45, s46",
+    "v_pk_fma_f16 v15, s44, s46, s44",
+]
+F16_DENORM_WORDS = (0x03ff0001, 0x80000400, 0x38003800, 0x84018401)
+
+
+def f16_denorm_words(flush):
+    """Reference words for F16_DENORM_BODY, optionally flushing binary16 subnormal inputs and results."""
+    def half(word):
+        if flush and word & 0x7c00 == 0:
+            word &= 0x8000
+        return struct.unpack("<e", struct.pack("<H", word))[0]
+
+    def pack(value):
+        word, = struct.unpack("<H", struct.pack("<e", value))
+        return word & 0x8000 if flush and word & 0x7c00 == 0 else word
+
+    a, b, c, d = F16_DENORM_WORDS
+    ops = (lambda x, y, z: x + y, lambda x, y, z: max(x, y), lambda x, y, z: x * y, lambda x, y, z: x * y + z)
+    sources = ((b, d, 0), (a, d, 0), (b, c, 0), (a, c, a))
+    words = []
+    for op, (x, y, z) in zip(ops, sources):
+        # Python doubles hold these products and sums exactly, so one rounding to binary16 matches the shader.
+        lanes = [pack(op(half(x >> s & 0xffff), half(y >> s & 0xffff), half(z >> s & 0xffff))) for s in (0, 16)]
+        words.append(lanes[0] | lanes[1] << 16)
+    return tuple(words)
+
+
+def check_f16_denorm_draw(directory, compiler, renderer, backend):
+    """Draw packed binary16 subnormals under both -denorm modes; the f32 flag must not change them."""
+    source = directory / "f16_denorm.hlsl"
+    shader = directory / "f16_denorm.cso"
+    case = directory / "f16_denorm.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    constants = bytearray(256)
+    struct.pack_into("<4I", constants, 12, *F16_DENORM_WORDS)
+    source.write_text(lower(uncompressed_export(F16_DENORM_BODY), 20, 24, [1, 2, 3, 4],
+                            constant_descriptor=64, integer_export=True), encoding="ascii")
+
+    def as_floats(words):
+        return tuple(struct.unpack("<f", struct.pack("<I", word))[0] for word in words)
+
+    preserve = f16_denorm_words(flush=False)
+    write_case(case, constants, as_floats(preserve), integer_rt=True)
+    for mode in ("preserve", "ftz"):
+        compile_shader(compiler, source, shader, mode=mode)
+        subprocess.run(draw, check=True)
+    # A reference that flushes binary16 subnormals differs from the preserve one in every channel,
+    # so the ftz build still on disk must fail it.
+    flushed = f16_denorm_words(flush=True)
+    assert all(p != f for p, f in zip(preserve, flushed)), (preserve, flushed)
+    write_case(case, constants, as_floats(flushed), integer_rt=True)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("A binary16 export matched the flushed f16 reference")
 
 
 def check_nan_class_draw(directory, compiler, renderer, backend):
@@ -5333,6 +5421,7 @@ def check_e64_render(directory, compiler, renderer, backend):
             return 77
         raise
     check_denorm_mode_draw(directory, compiler, renderer, backend)
+    check_f16_denorm_draw(directory, compiler, renderer, backend)
     check_nan_class_draw(directory, compiler, renderer, backend)
     check_integer_readback_draw(directory, compiler, renderer, backend)
     check_cvt_int_f32_draw(directory, compiler, renderer, backend)
