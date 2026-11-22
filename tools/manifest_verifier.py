@@ -93,13 +93,16 @@ def load_manifest(path: str) -> dict[str, dict]:
     if not isinstance(doc, dict):
         raise ManifestError(f"{path}: root must be a JSON object")
 
-    raw_files = doc.get("files") if "files" in doc and isinstance(doc["files"], dict) else doc
+    # Metadata keys are reserved only in legacy flat manifests; under
+    # "files" they are ordinary relative filenames that must be verified.
+    wrapped = isinstance(doc.get("files"), dict)
+    raw_files = doc["files"] if wrapped else doc
     if not isinstance(raw_files, dict):
         raise ManifestError(f"{path} has no valid files table")
 
     entries: dict[str, dict] = {}
     for raw_rel, info in raw_files.items():
-        if raw_rel in ("created", "title", "version", "note"):
+        if not wrapped and raw_rel in ("created", "title", "version", "note"):
             continue
         rel = str(raw_rel).replace("\\", "/")
         if isinstance(info, dict):
