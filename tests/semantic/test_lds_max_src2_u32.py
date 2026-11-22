@@ -787,6 +787,78 @@ class TestDSMaxSrc2U32ConditionCodesAndFlags(unittest.TestCase):
         self.assertEqual(self.state.vcc, canary_vcc)
         self.assertEqual(self.state.scc, canary_scc)
 
+class TestDSMaxSrc2U32IEEE754EdgeCases(unittest.TestCase):
+    """Phase 7: Unit tests for IEEE 754 float32 bit-patterns and unsigned 32-bit boundary extremes."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(size_dwords=16384)
+        self.state = ScalarThreadState(lds=self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_signed_zeros_as_unsigned(self) -> None:
+        # In float32: +0.0 is 0x00000000, -0.0 is 0x80000000.
+        # In unsigned u32: 0x80000000 > 0x00000000.
+        base = 0x100
+        self.lds.write_dword(base, 0x00000000)
+        self.lds.write_dword(base + 4, 0x80000000)
+        self.state.set_vgpr(0, base)
+
+        inst = DSMaxSrc2U32Instruction.parse("ds_max_src2_u32 v0 offset0:0 offset1:1")
+        res = self.interp.execute(self.state, inst)
+        self.assertEqual(res, 0x80000000)
+        self.assertEqual(self.lds.read_dword(base), 0x80000000)
+
+    def test_signed_infinities_as_unsigned(self) -> None:
+        # +Inf: 0x7F800000, -Inf: 0xFF800000
+        # In unsigned u32: 0xFF800000 > 0x7F800000
+        base = 0x200
+        self.lds.write_dword(base, 0x7F800000)
+        self.lds.write_dword(base + 4, 0xFF800000)
+        self.state.set_vgpr(0, base)
+
+        inst = DSMaxSrc2U32Instruction.parse("ds_max_src2_u32 v0 offset0:0 offset1:1")
+        res = self.interp.execute(self.state, inst)
+        self.assertEqual(res, 0xFF800000)
+        self.assertEqual(self.lds.read_dword(base), 0xFF800000)
+
+    def test_nan_bit_patterns_preserved(self) -> None:
+        # qNaN: 0x7FC00000, sNaN: 0x7F800001, neg_NaN: 0xFFC00000
+        base = 0x300
+        self.lds.write_dword(base, 0x7F800001)       # sNaN
+        self.lds.write_dword(base + 4, 0x7FC00000)   # qNaN
+        self.state.set_vgpr(0, base)
+
+        inst = DSMaxSrc2U32Instruction.parse("ds_max_src2_u32 v0 offset0:0 offset1:1")
+        res = self.interp.execute(self.state, inst)
+        self.assertEqual(res, 0x7FC00000)
+
+        # neg_NaN vs qNaN -> neg_NaN is larger in unsigned u32
+        self.lds.write_dword(base + 4, 0xFFC00000)
+        res2 = self.interp.execute(self.state, inst)
+        self.assertEqual(res2, 0xFFC00000)
+
+    def test_subnormals_as_unsigned(self) -> None:
+        # Smallest positive subnormal: 0x00000001
+        # Largest positive subnormal: 0x007FFFFF
+        base = 0x400
+        self.lds.write_dword(base, 0x00000001)
+        self.lds.write_dword(base + 4, 0x007FFFFF)
+        self.state.set_vgpr(0, base)
+
+        inst = DSMaxSrc2U32Instruction.parse("ds_max_src2_u32 v0 offset0:0 offset1:1")
+        res = self.interp.execute(self.state, inst)
+        self.assertEqual(res, 0x007FFFFF)
+
+    def test_max_offset_boundary(self) -> None:
+        # Maximum 8-bit offset = 255 (255 * 4 = 1020 bytes)
+        base = 100
+        self.lds.write_dword(base + 255 * 4, 42)
+        self.state.set_vgpr(0, base)
+
+        inst = DSMaxSrc2U32Instruction.parse("ds_max_src2_u32 v0 offset0:255 offset1:0")
+        res = self.interp.execute(self.state, inst)
+        self.assertEqual(res, 42)
+
 
 if __name__ == "__main__":
     unittest.main()
