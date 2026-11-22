@@ -853,5 +853,60 @@ class TestValuDot4U32U8StatusFlags(unittest.TestCase):
         self.assertEqual(flags.full_sum, 0x1_0000_0001)
 
 
+class TestValuDot4U32U8IEEE754Boundaries(unittest.TestCase):
+    """Unit tests for IEEE 754 bit pattern boundaries, subnormals, and NaNs as raw integer bytes."""
+
+    def test_float_signed_zeros_distinction(self) -> None:
+        # +0.0 is 0x00000000, -0.0 is 0x80000000 (byte 3 is 0x80 = 128)
+        # Dot with 0x01000000: byte 3 is 1
+        # For +0.0: 0 * 1 = 0
+        # For -0.0: 128 * 1 = 128
+        self.assertEqual(ref_dot4_u32_u8(0x00000000, 0x01000000, 0), 0)
+        self.assertEqual(ref_dot4_u32_u8(0x80000000, 0x01000000, 0), 128)
+
+        # Dot of -0.0 with -0.0: 128 * 128 = 16384 (0x4000)
+        self.assertEqual(ref_dot4_u32_u8(0x80000000, 0x80000000, 0), 16384)
+
+    def test_subnormal_floats_no_flush_to_zero(self) -> None:
+        # Subnormal float 1: 0x00000001 (byte 0 = 1)
+        # Subnormal float 2: 0x00000002 (byte 0 = 2)
+        # If hardware erroneously flushed subnormals to zero (FTZ),
+        # 1 * 2 would evaluate to 0 instead of 2!
+        self.assertEqual(ref_dot4_u32_u8(0x00000001, 0x00000002, 0), 2)
+
+        # Subnormal float with byte 1: 0x00000100 (byte 1 = 1)
+        self.assertEqual(ref_dot4_u32_u8(0x00000100, 0x00000200, 0), 2)
+
+    def test_nan_payloads_as_raw_bytes(self) -> None:
+        # qNaN: 0x7FC00000 -> bytes [0, 0, 0xC0 (192), 0x7F (127)]
+        # sNaN: 0x7F800001 -> bytes [1, 0, 0x80 (128), 0x7F (127)]
+        # Product:
+        # Byte 0: 0 * 1 = 0
+        # Byte 1: 0 * 0 = 0
+        # Byte 2: 192 * 128 = 24576
+        # Byte 3: 127 * 127 = 16129
+        # Sum = 24576 + 16129 = 40705
+        expected = 24576 + 16129
+        self.assertEqual(ref_dot4_u32_u8(0x7FC00000, 0x7F800001, 0), expected)
+
+    def test_float_infinities(self) -> None:
+        # +inf: 0x7F800000 -> bytes [0, 0, 128, 127]
+        # -inf: 0xFF800000 -> bytes [0, 0, 128, 255]
+        # Byte 2: 128 * 128 = 16384
+        # Byte 3: 127 * 255 = 32385
+        # Sum = 16384 + 32385 = 48769
+        expected = 16384 + 32385
+        self.assertEqual(ref_dot4_u32_u8(0x7F800000, 0xFF800000, 0), expected)
+
+    def test_byte_extremes_boundary_matrix(self) -> None:
+        extremes = [0x00, 0x01, 0x7F, 0x80, 0xFE, 0xFF]
+        for b0 in extremes:
+            for b1 in extremes:
+                w0 = pack_u8(b0, b0, b0, b0)
+                w1 = pack_u8(b1, b1, b1, b1)
+                expected = 4 * (b0 * b1)
+                self.assertEqual(ref_dot4_u32_u8(w0, w1, 0), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
