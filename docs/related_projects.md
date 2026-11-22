@@ -113,6 +113,36 @@ and for GFX11 the order of LLVM's `UfmtGFX11::UnifiedFormat`). The GFX11 numbers
 hardware oracle itself (a wrong FORMAT changes the fetched words); the GFX10 numbers and layout are Mesa's and not yet
 run on RDNA2 hardware.
 
+## Other Xbox Series compatibility projects (licences checked 2026-11-22)
+
+Several other efforts target the same console surface, and some have run retail Series titles, which Leonida cannot
+do until it has a game executable. The licence column is what each repository's own `LICENSE` file says (read from a
+shallow clone, not from GitHub's label, which was wrong for one of them). The rule is the one above: **facts first,
+cite the project and file, verify, implement independently.** What "code may be adapted" means for the compatible ones
+is only that the licence allows it with attribution; it is still not the default (see the entries above for SCARAB).
+
+| Project | Licence | Against Leonida's GPL-3.0-or-later | What it is, as far as it matters here |
+|---|---|---|---|
+| [sammwyy/xvalkyrie](https://github.com/sammwyy/xvalkyrie) | GPL-3.0 | compatible | C++20 layer for Xbox One and Series on D3D11/D3D12; reports that retail Series titles create their device and present frames, with shaders translated to HLSL. Its `docs/research/` records measured behaviour (the device's slot order, descriptor handles, rectangle lists, frame pacing); the D3D12.X note covers the Xbox One device, not `d3d12_xs`. |
+| [omonkeyz/xbox-emulator](https://github.com/omonkeyz/xbox-emulator) | GPL-3.0 | compatible | Rust runtime continuing TomBox; reports a retail title reaching its lobby. `docs/BLOCKERS.md` holds per-slot findings for the console device and command list with the console DLL offsets they came from. Those DLLs are console system files that are not in our package, so treat each finding as a hypothesis until a Leonida measurement agrees. |
+| [p-portela/SCARAB](https://github.com/p-portela/SCARAB) | GPL-3.0 | compatible | Listed above. |
+| [LooperSalty/AnyXboxX](https://github.com/LooperSalty/AnyXboxX) | GPL-3.0 | compatible | Python/C++ prototype with a table of the 396 GDK runtime functions. |
+| [holdmysocks/SixNG](https://github.com/holdmysocks/SixNG), [nullbrik/RageForge](https://github.com/nullbrik/RageForge) | GPL-3.0 | compatible | RPF9 asset extractors for the same package. Format facts only come from the archives; check any claim against `docs/rpf.md` and the package. |
+| [californiaAlmonds/OpenScarlett](https://github.com/californiaAlmonds/OpenScarlett), [R0Y00/Xbox2Windows](https://github.com/R0Y00/Xbox2Windows) | MIT | compatible | Translation layer on SDK samples, and static-recompilation research with source-built fixtures. |
+| [jadeowaowa/scarlett-layer](https://github.com/jadeowaowa/scarlett-layer) | Apache-2.0 | compatible | Loader plus an injected hook DLL, tested on self-written programs only. |
+| [ivall/xcl](https://github.com/ivall/xcl) | **GPL-2.0-only** | **incompatible** | Reports retail titles running their menus. Same rule as `americas-recomp`: no code, comments, tables or prose, and no "just one file". |
+| [Freminet/ScarlettX](https://github.com/Freminet/ScarlettX), [brcly/TuxBox](https://github.com/brcly/TuxBox) | none | all rights reserved | No licence file, so nothing may be copied. |
+| [edupode/anyxboxseries](https://github.com/edupode/anyxboxseries) | CPAL-1.0 | not compatible with the GPL | Attribution and network-use terms that the GPL does not allow us to add. Facts only. |
+
+How to use this page when you read one of them:
+
+- Quote a fact in your own words with the project and file, as the entries above do, and say what you checked it
+  against. A console-DLL offset in someone else's notes is a lead, not a measurement of ours.
+- Their notes may describe a different console generation. The `d3d12_x.dll` material is Xbox One; Leonida's package
+  has `d3d12_xs.dll`. State which one a fact was measured on.
+- If you read an incompatible project (the `GPL-2.0-only`, no-licence and CPAL rows) while writing a change, say so
+  in the pull request so the provenance can be checked.
+
 ## The line
 
 | Fine | Not fine |
