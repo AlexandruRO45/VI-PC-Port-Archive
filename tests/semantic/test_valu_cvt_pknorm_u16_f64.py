@@ -867,5 +867,144 @@ class TestValuCvtPknormU16F64SIMD(unittest.TestCase):
             self.assertEqual(state.get_vgpr(lane, 0), expected)
 
 
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestValuCvtPknormU16F64RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_dst_alias_src0_low_dword(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr_pair(0, POS_ONE_F64)  # v[0:1] = 1.0
+        state.set_vgpr_pair(2, HALF_F64)     # v[2:3] = 0.5
+        # v0 = cvt_pknorm(v[0:1], v[2:3]) -> [0xFFFF, 32768]
+        instr = VCvtPknormU16F64Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand64(Reg(0, RegType.VGPR, is_double=True)),
+            src1=VOP3Operand64(Reg(2, RegType.VGPR, is_double=True)),
+        )
+        old_v1 = state.get_vgpr(1)
+        res = self.scalar_interp.step(instr, state)
+        expected = (32768 << 16) | 0xFFFF
+        self.assertEqual(res, expected)
+        self.assertEqual(state.get_vgpr(0), expected)
+        # v1 (high dword of S0) must remain untouched
+        self.assertEqual(state.get_vgpr(1), old_v1)
+        # v[2:3] untouched
+        self.assertEqual(state.get_vgpr_pair(2), HALF_F64)
+
+    def test_dst_alias_src0_high_dword(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr_pair(0, POS_ONE_F64)  # v[0:1] = 1.0
+        state.set_vgpr_pair(2, HALF_F64)     # v[2:3] = 0.5
+        # v1 = cvt_pknorm(v[0:1], v[2:3]) -> [0xFFFF, 32768]
+        instr = VCvtPknormU16F64Instruction(
+            dst=Reg(1, RegType.VGPR),
+            src0=VOP3Operand64(Reg(0, RegType.VGPR, is_double=True)),
+            src1=VOP3Operand64(Reg(2, RegType.VGPR, is_double=True)),
+        )
+        old_v0 = state.get_vgpr(0)
+        res = self.scalar_interp.step(instr, state)
+        expected = (32768 << 16) | 0xFFFF
+        self.assertEqual(res, expected)
+        self.assertEqual(state.get_vgpr(1), expected)
+        # v0 must remain untouched
+        self.assertEqual(state.get_vgpr(0), old_v0)
+
+    def test_dst_alias_src1_low_dword(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr_pair(0, HALF_F64)     # v[0:1] = 0.5
+        state.set_vgpr_pair(2, POS_ONE_F64)  # v[2:3] = 1.0
+        # v2 = cvt_pknorm(v[0:1], v[2:3])
+        instr = VCvtPknormU16F64Instruction(
+            dst=Reg(2, RegType.VGPR),
+            src0=VOP3Operand64(Reg(0, RegType.VGPR, is_double=True)),
+            src1=VOP3Operand64(Reg(2, RegType.VGPR, is_double=True)),
+        )
+        old_v3 = state.get_vgpr(3)
+        res = self.scalar_interp.step(instr, state)
+        expected = (0xFFFF << 16) | 32768
+        self.assertEqual(res, expected)
+        self.assertEqual(state.get_vgpr(2), expected)
+        self.assertEqual(state.get_vgpr(3), old_v3)
+
+    def test_dst_alias_src1_high_dword(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr_pair(0, HALF_F64)     # v[0:1] = 0.5
+        state.set_vgpr_pair(2, POS_ONE_F64)  # v[2:3] = 1.0
+        # v3 = cvt_pknorm(v[0:1], v[2:3])
+        instr = VCvtPknormU16F64Instruction(
+            dst=Reg(3, RegType.VGPR),
+            src0=VOP3Operand64(Reg(0, RegType.VGPR, is_double=True)),
+            src1=VOP3Operand64(Reg(2, RegType.VGPR, is_double=True)),
+        )
+        old_v2 = state.get_vgpr(2)
+        res = self.scalar_interp.step(instr, state)
+        expected = (0xFFFF << 16) | 32768
+        self.assertEqual(res, expected)
+        self.assertEqual(state.get_vgpr(3), expected)
+        self.assertEqual(state.get_vgpr(2), old_v2)
+
+    def test_src0_src1_same_register_pair(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr_pair(4, QUARTER_F64)  # 0.25 -> 16384
+        instr = VCvtPknormU16F64Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand64(Reg(4, RegType.VGPR, is_double=True)),
+            src1=VOP3Operand64(Reg(4, RegType.VGPR, is_double=True)),
+        )
+        res = self.scalar_interp.step(instr, state)
+        expected = (16384 << 16) | 16384
+        self.assertEqual(res, expected)
+        self.assertEqual(state.get_vgpr(0), expected)
+
+    def test_chained_dependency_chain(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr_pair(0, HALF_F64)     # 0.5
+        state.set_vgpr_pair(2, QUARTER_F64)  # 0.25
+        state.set_vgpr_pair(4, POS_ONE_F64)  # 1.0
+
+        # Instr 1: v0 = cvt_pknorm(v[0:1], v[2:3]) -> (16384 << 16) | 32768 = 0x40008000
+        instr1 = VCvtPknormU16F64Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand64(Reg(0, RegType.VGPR, is_double=True)),
+            src1=VOP3Operand64(Reg(2, RegType.VGPR, is_double=True)),
+        )
+        res1 = self.scalar_interp.step(instr1, state)
+        self.assertEqual(res1, 0x40008000)
+
+        # Now v[0:1] has low dword 0x40008000 and high dword of original 0.5 (0x3FE00000)
+        # val64 = join_dwords(0x40008000, 0x3FE00000) = 0x3FE0000040008000 ~= 0.5000001 > 0
+        instr2 = VCvtPknormU16F64Instruction(
+            dst=Reg(6, RegType.VGPR),
+            src0=VOP3Operand64(Reg(0, RegType.VGPR, is_double=True)),
+            src1=VOP3Operand64(Reg(4, RegType.VGPR, is_double=True)),
+        )
+        res2 = self.scalar_interp.step(instr2, state)
+        self.assertEqual(extract_u16(res2, high_half=True), 0xFFFF)
+
+    def test_simd_multi_lane_aliased_inplace(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        for lane in range(32):
+            state.set_vgpr_pair(lane, 0, POS_ONE_F64)
+            state.set_vgpr_pair(lane, 2, HALF_F64)
+
+        # Overwrite v0 in-place across all lanes
+        instr = VCvtPknormU16F64Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand64(Reg(0, RegType.VGPR, is_double=True)),
+            src1=VOP3Operand64(Reg(2, RegType.VGPR, is_double=True)),
+        )
+        self.simd_interp.step(instr, state)
+        expected = (32768 << 16) | 0xFFFF
+        for lane in range(32):
+            self.assertEqual(state.get_vgpr(lane, 0), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
