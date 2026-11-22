@@ -970,5 +970,145 @@ class TestBufferAtomicSminX2SIMD(unittest.TestCase):
         self.assertEqual(simd.mem.read_u64(0), 0x12345678)
 
 
+# ---------------------------------------------------------------------------
+# Register Aliasing and In-Place Operand Preservation
+# ---------------------------------------------------------------------------
+
+class TestBufferAtomicSminX2Aliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarBufferInterpreter(mem_size=4096)
+        self.desc = BufferResourceDescriptor(
+            base_address=0,
+            stride=0,
+            num_records=1024,
+        )
+        self.interp.set_buffer_descriptor(4, self.desc)
+
+    def test_aliasing_vdata0_equals_vaddr_with_glc(self) -> None:
+        addr = 64
+        self.interp.mem.write_u64(addr, 100)
+        # v0 serves as vaddr and low 32 of smin_val (value = 64)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, addr)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 0, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 100)
+        # Memory at 64 was min(100, 64) = 64
+        self.assertEqual(self.interp.mem.read_u64(addr), 64)
+        # v[0:1] receives pre-op value (100)
+        self.assertEqual(self.interp.read_reg_u64(0), 100)
+
+    def test_aliasing_vdata1_equals_vaddr_with_glc(self) -> None:
+        addr = 128
+        val_huge = 0x7FFFFFFFFFFFFFFF
+        self.interp.mem.write_u64(addr, val_huge)
+        # v1 serves as vaddr and high 32 of smin_val
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 0x10)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, addr)
+
+        smin_val = (addr << 32) | 0x10
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 1, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, val_huge)
+        self.assertEqual(self.interp.mem.read_u64(addr), smin_val)
+        self.assertEqual(self.interp.read_reg_u64(0), val_huge)
+
+    def test_unrelated_vgprs_preserved(self) -> None:
+        for idx in range(10, 20):
+            self.interp.write_reg_u32(RegKind.VGPR, idx, 0x77000000 + idx)
+
+        self.interp.write_reg_u64(0, 0x1234)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        self.interp.step(inst)
+
+        for idx in range(10, 20):
+            self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, idx), 0x77000000 + idx)
+
+    def test_sgpr_descriptor_and_offset_preserved(self) -> None:
+        d0, d1, d2, d3 = self.desc.to_dwords()
+        self.interp.write_reg_u32(RegKind.SGPR, 8, 32)  # soffset
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=Register(RegKind.SGPR, 8, count=1),
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        self.interp.step(inst)
+
+        self.assertEqual(self.interp.read_reg_u32(RegKind.SGPR, 4), d0)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.SGPR, 5), d1)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.SGPR, 6), d2)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.SGPR, 7), d3)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.SGPR, 8), 32)
+
+    def test_simd_aliasing_with_divergent_exec_mask(self) -> None:
+        simd = SIMDBufferWavefrontInterpreter(wave_size=32, mem_size=4096)
+        simd.set_buffer_descriptor(4, self.desc)
+        exec_mask = 0x0000000F  # Lanes 0..3 active
+        simd.set_exec_mask(exec_mask)
+
+        for lane in range(32):
+            addr = lane * 8
+            simd.mem.write_u64(addr, 1000)
+            # Aliasing: vaddr = v0 = addr
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 0, addr)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 1, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 0, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        simd.step(inst)
+
+        # Active lanes: memory min(1000, addr) = addr, v[0:1] receives 1000
+        for lane in range(4):
+            addr = lane * 8
+            self.assertEqual(simd.mem.read_u64(addr), addr)
+            self.assertEqual(simd.read_lane_reg_u64(lane, 0), 1000)
+
+        # Inactive lanes: memory untouched (1000), v[0:1] untouched (addr)
+        for lane in range(4, 32):
+            addr = lane * 8
+            self.assertEqual(simd.mem.read_u64(addr), 1000)
+            self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), addr)
+            self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 1), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
