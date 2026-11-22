@@ -1589,6 +1589,29 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_draw_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_draw COMMAND d3d12_draw_test)
       set_tests_properties(d3d12_draw PROPERTIES SKIP_RETURN_CODE 77)
+      # Input-assembler reads past an index or vertex buffer view: the layer against the host D3D12 (default adapter
+      # and WARP), which reads zero there.
+      set(LEONIDA_TEST_VS_IA ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_ia_bounds.spv)
+      set(LEONIDA_TEST_PS_IA ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_ia_bounds.spv)
+      foreach(pair "vs_ia_bounds.vert;${LEONIDA_TEST_VS_IA}" "ps_ia_bounds.frag;${LEONIDA_TEST_PS_IA}")
+        list(GET pair 0 source)
+        list(GET pair 1 output)
+        add_custom_command(
+          OUTPUT ${output}
+          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${output}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          COMMENT "Compiling the input-assembler bounds test shader ${source}"
+          VERBATIM)
+      endforeach()
+      add_executable(d3d12_ia_bounds_test test/d3d12_ia_bounds_test.cpp ${LEONIDA_TEST_VS_IA} ${LEONIDA_TEST_PS_IA})
+      target_link_libraries(d3d12_ia_bounds_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+      target_compile_definitions(d3d12_ia_bounds_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS_IA}"
+                                 LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS_IA}")
+      target_compile_options(d3d12_ia_bounds_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_ia_bounds COMMAND d3d12_ia_bounds_test)
+      set_tests_properties(d3d12_ia_bounds PROPERTIES SKIP_RETURN_CODE 77)
       add_executable(d3d12_msaa_draw_test test/d3d12_msaa_draw_test.cpp shims/d3d12_xs_device.cpp
                      ${LEONIDA_TEST_VS} ${LEONIDA_TEST_PS})
       target_link_libraries(d3d12_msaa_draw_test PRIVATE gta6rt_d3d12_com)

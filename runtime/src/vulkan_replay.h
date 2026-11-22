@@ -801,6 +801,10 @@ struct ReplayFunctions {
     std::function<const ComputePipeline*(std::uintptr_t)> compute_pipeline;
     PFN_vkCmdBindVertexBuffers2 bind_vertex_buffers2 = nullptr;  // draws
     PFN_vkCmdBindIndexBuffer bind_index_buffer = nullptr;
+    // vkCmdBindIndexBuffer2KHR (VK_KHR_maintenance5), set only when the device enabled it together with
+    // robustBufferAccess2: binds the index buffer with its view's size, so an index past the view reads as 0, as in
+    // D3D12.
+    PFN_vkCmdBindIndexBuffer2KHR bind_index_buffer2 = nullptr;
     PFN_vkCmdSetViewport set_viewport = nullptr;
     PFN_vkCmdSetScissor set_scissor = nullptr;
     PFN_vkCmdSetPrimitiveTopology set_primitive_topology = nullptr;
@@ -963,6 +967,7 @@ struct Prepared {
     std::vector<VkDeviceSize> vertex_offsets, vertex_sizes, vertex_strides;
     VkBuffer index_buffer = VK_NULL_HANDLE;
     VkDeviceSize index_offset = 0;
+    VkDeviceSize index_size = VK_WHOLE_SIZE;  // the bytes the view covers (a multiple of the index size)
     VkIndexType index_type = VK_INDEX_TYPE_UINT16;
     VkExtent2D area{};
     std::uint32_t layers = 1;  // the fewest layers any bound attachment view has
@@ -1902,10 +1907,20 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
             if (!vk.zero_buffer) return ReplayResult::unresolved_resource;
             p.index_buffer = vk.zero_buffer;
             p.index_offset = vk.zero_offset;
+            p.index_size = vk.zero_size;  // D3D12 reads 0 past it, as it does for any index the view does not hold
         } else {
-            std::uint64_t size = draw.index.size;
+            std::uint64_t size = draw.index.size;  // buffer_at cuts it at the end of the buffer
             if (!vk.buffer_at(draw.index.va, size, p.index_buffer, p.index_offset))
                 return ReplayResult::unresolved_resource;
+            // A view of a whole number of indices: the rest of its last index is out of bounds too. An empty view
+            // reads the zero page, whose indices are all 0 as D3D12's out-of-view reads are.
+            size -= size % (p.index_type == VK_INDEX_TYPE_UINT32 ? 4 : 2);
+            p.index_size = size;
+            if (!size && vk.zero_buffer) {
+                p.index_buffer = vk.zero_buffer;
+                p.index_offset = vk.zero_offset;
+                p.index_size = vk.zero_size;
+            }
         }
     }
     return ReplayResult::success;
@@ -3508,7 +3523,12 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                         &p.vertex_sizes[slot], &p.vertex_strides[slot]);
             }
             if (draw->indexed) {
-                vk.bind_index_buffer(command_buffer, p.index_buffer, p.index_offset, p.index_type);
+                // Sized only on a device with robustBufferAccess2 (the context sets bind_index_buffer2 only then): a
+                // draw past the bound range is invalid without it. Indexed indirect draws routed here need the same.
+                if (vk.bind_index_buffer2)
+                    vk.bind_index_buffer2(command_buffer, p.index_buffer, p.index_offset, p.index_size, p.index_type);
+                else
+                    vk.bind_index_buffer(command_buffer, p.index_buffer, p.index_offset, p.index_type);
                 vk.draw_indexed(command_buffer, draw->count, draw->instances, draw->first, draw->base_vertex,
                                 draw->first_instance);
             } else {

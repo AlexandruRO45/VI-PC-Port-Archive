@@ -684,6 +684,48 @@ The compute path, end to end:
   - **Buffers:** vertex and index views resolve to buffers by VA (arena or upload). A view that runs past its
     buffer is cut at the buffer's end. An unbound vertex slot, or an indexed draw with no index buffer, reads the
     arena's reserved first 64 KiB, which is kept zero (stride 0), so it gets the zeros D3D12 gives.
+  - **Reads past a view:** D3D12 reads a vertex or an index outside its view as zero, even when the same resource
+    holds data there. Measured by `d3d12_ia_bounds` on Windows D3D12, the default adapter (RTX 4060 Ti) and WARP
+    agreeing in every case:
+    - an `R16` or `R32` index view of 6 indices with 3 more indices behind it in the resource, drawn with a count of 9,
+      draws nothing for the extra three (index 0, a degenerate triangle);
+    - a vertex view of 3 vertices with real vertices behind it draws nothing for vertices 3..5, indexed or not;
+    - a vertex past the view reads as zeros (position (0, 0), colour (0, 0, 0, 0), inferred from the probes), so a
+      triangle that takes one such vertex fades towards transparent black at the target's centre (probes
+      (173, 0, 0, 173) and (208, 0, 0, 208) on both);
+    - a view that ends 8 bytes into a vertex keeps that vertex's position (inside) and zeroes its colour (outside):
+      D3D12 checks per element (probes (229, 0, 0, 229), (149, 0, 0, 149), (53, 0, 0, 53), (181, 0, 0, 181), the same on
+      both hosts and on the layer on the RTX 4060 Ti). Vulkan only promises that the other vertex inputs of the binding
+      may behave as out of range too, so another driver may zero the whole vertex;
+    - a draw with no index buffer bound and more indices than the zero page holds reads index 0 throughout.
+
+    Every resource is a range of the one arena buffer, so Vulkan's own bounds are the arena's. With both
+    `VK_KHR_maintenance5` and `robustBufferAccess2` (with `robustBufferAccess`; `VK_KHR_robustness2`, else
+    `VK_EXT_robustness2`) the layer binds the index buffer with `vkCmdBindIndexBuffer2KHR` and its view's size (an empty
+    view, or none, binds the 64 KiB zero page with its size) and the device bounds fetches: "Reads from an index buffer
+    outside of the checked range will produce zero values" and "Reads from a vertex input outside of the checked range
+    will produce zero values, but input extraction will still be applied, filling missing G, B, or A components with
+    (0,0,1)" (Vulkan specification, Robust Buffer Access 2). The sized bind needs both: "If Robust Buffer Access 2 is
+    not enabled, the index buffer must not be read outside of the checked range"
+    (VUID-vkCmdDrawIndexed-robustBufferAccess2-08798), and a D3D12 draw may read past its view. With either missing,
+    the old behaviour is kept exactly (an unsized bind; reads continue into whatever follows the view in the arena,
+    vertex reads past the binding are undefined) and the standalone device logs which is missing. The layer also keeps
+    that behaviour when `robustBufferAccess` would be enabled with the bindless set's update-after-bind storage buffer
+    binding and `robustBufferAccessUpdateAfterBind` is false (VUID-VkDeviceCreateInfo-robustBufferAccess-10247).
+    `VulkanDeviceInfo::index_buffer_size` and `robust_buffer_access2` are what a caller-created device enabled; set
+    both or neither. `LEONIDA_NO_IA_BOUNDS=1` makes the standalone device behave as without them (the test's fallback
+    pass).
+
+    The robustness is device-wide, and `VK_EXT_pipeline_robustness` does not change that: the index-fetch guarantee
+    rests on the device feature `robustBufferAccess2` (the VUID above), so it is enabled for the device whatever the
+    pipelines ask. Translated shaders read buffers through buffer device addresses, which robustness does not cover.
+    What it now bounds-checks are the layer's descriptor-based storage buffers: the bindless set's hash table, the
+    depth24 windows, the predicate buffer, the predicated-copy buffers and the occlusion-resolve scratch (listed from
+    the `VK_DESCRIPTOR_TYPE_STORAGE_BUFFER` uses in `vulkan_bindless.h`, `vulkan_depth24.h`, `vulkan_predicate.h`,
+    `vulkan_predicated_copy.h` and `vulkan_backend.h`; whether each stays inside its range was not audited, an overrun
+    would now read zero or be discarded instead of touching the arena). On the RTX 4060 Ti (Vulkan 1.4 driver) vertex
+    reads past a sized vertex binding were already zero before `robustBufferAccess2` was enabled, so `d3d12_ia_bounds`
+    cannot tell the two apart there; the index reads were not (A16, A32 and C drew the extra triangle).
   - **Attachments:** they move to attachment layouts through the tracker, and the draw runs in a
     dynamic-rendering scope. Its layer count is the smallest layer count of the bound views.
   - **Viewport:** it is flipped (negative height), because translated vertex shaders write D3D clip coordinates;
@@ -761,8 +803,8 @@ the source rectangle's;
 default-heap buffers are not zero-filled yet; a fence cannot be signalled to a lower value (Vulkan timelines only
 increase; such a signal is reported and dropped); instance step rates above 1 (they need vertex attribute
 divisors); read-only DSVs (the depth image always moves to `DEPTH_STENCIL_ATTACHMENT_OPTIMAL`, which matters once
-depth SRVs are sampled next to a read-only DSV, M2); the index buffer is bound without its view's size
-(`vkCmdBindIndexBuffer2`, Vulkan 1.4, takes one).
+depth SRVs are sampled next to a read-only DSV, M2); indices past an index buffer view are read as zero only on a
+device with both `VK_KHR_maintenance5` and `robustBufferAccess2` (see *Reads past a view* above).
 
 Known gaps found in review, not fixed here:
 - **Queues:** every D3D12 queue submits to one `VkQueue`, which runs batches in order. So a queue that waits on a

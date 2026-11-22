@@ -3771,7 +3771,9 @@ public:
                                                                   info.separate_depth_stencil_layouts,
                                                                   info.conditional_rendering, info.ray_tracing,
                                                                   info.xdxr_acceleration_structures &&
-                                                                      info.buffer_device_address);
+                                                                      info.buffer_device_address,
+                                                                  info.index_buffer_size &&
+                                                                      info.robust_buffer_access2);
         if (info.physical && state_.format_properties) {
             state_.context->set_color_attachment_format(
                 [physical = info.physical, get_props = state_.format_properties](VkFormat format) {
@@ -6799,6 +6801,13 @@ bool device_upload_in_vram(ID3D12Device* device) {
     return false;
 }
 
+bool device_index_bounds_exact(ID3D12Device* device) {
+    if (!device) return false;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    const Device* d = Device::from<Device>(real ? real : device);
+    return d && d->state().info.index_buffer_size && d->state().info.robust_buffer_access2;
+}
+
 bool device_sparse_buffer_tiles(ID3D12Device* device) {
     const Device* d = Device::from<Device>(device);
     return d && d->state().sparse_buffer_memory_types != 0;
@@ -7333,6 +7342,64 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         }
     }
 #endif
+    // Optional: input-assembler reads past a buffer view give zero, as D3D12's do. Every resource lives in the one
+    // arena buffer, so a view's end is not the buffer's end. The index buffer is bound with the view's size
+    // (VK_KHR_maintenance5, vkCmdBindIndexBuffer2), but a draw that reads indices past the bound range is only valid
+    // with the robustBufferAccess2 feature (VUID-vkCmdDrawIndexed-robustBufferAccess2-08798), which then makes index
+    // and vertex fetches outside the bound range read zero. So the two are used together, device-wide (the guarantee
+    // is a device feature, VK_EXT_pipeline_robustness cannot replace it), or neither is and the old unsized bind stays.
+    // robustBufferAccess2 needs robustBufferAccess, and robustBufferAccess forbids update-after-bind buffer
+    // descriptors unless robustBufferAccessUpdateAfterBind is true (VUID-VkDeviceCreateInfo-robustBufferAccess-10247):
+    // the bindless set's storage buffer binding is one.
+    VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
+    if (has_device_extension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &maintenance5};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+    }
+    const char* robustness2_name = nullptr;
+    for (const char* name : {VK_KHR_ROBUSTNESS_2_EXTENSION_NAME, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME})
+        if (!robustness2_name && has_device_extension(name)) robustness2_name = name;
+    VkPhysicalDeviceRobustness2FeaturesKHR robustness2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_KHR};
+    if (robustness2_name) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &robustness2};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+    }
+    VkPhysicalDeviceVulkan12Properties properties12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
+    VkPhysicalDeviceProperties2 properties2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &properties12};
+    vkGetPhysicalDeviceProperties2(info.physical, &properties2);
+    const bool update_after_bind_buffers = enable12.descriptorBindingStorageBufferUpdateAfterBind ||
+                                           enable12.descriptorBindingUniformBufferUpdateAfterBind;
+    const bool have_maintenance5 = maintenance5.maintenance5 == VK_TRUE;
+    const bool have_robustness2 = robustness2_name && robustness2.robustBufferAccess2 == VK_TRUE &&
+                                  chosen_features.robustBufferAccess == VK_TRUE;
+    const bool robust_update_after_bind =
+        properties12.robustBufferAccessUpdateAfterBind == VK_TRUE || !update_after_bind_buffers;
+    // LEONIDA_NO_IA_BOUNDS=1 keeps both off, as on a GPU without them (the test of the fallback uses it).
+    char knob[8] = {};
+    size_t knob_length = 0;
+    const bool knob_off =
+        getenv_s(&knob_length, knob, "LEONIDA_NO_IA_BOUNDS") == 0 && knob_length > 1 && knob[0] == '1';
+    if (have_maintenance5 && have_robustness2 && robust_update_after_bind && !knob_off) {
+        info.index_buffer_size = info.robust_buffer_access2 = true;
+        maintenance5.pNext = *v13.next();
+        *v13.next() = &maintenance5;
+        // Only robustBufferAccess2 is wanted; nullDescriptor and robustImageAccess2 stay off.
+        robustness2.robustImageAccess2 = VK_FALSE;
+        robustness2.nullDescriptor = VK_FALSE;
+        robustness2.pNext = *v13.next();
+        *v13.next() = &robustness2;
+        enable.robustBufferAccess = VK_TRUE;
+    } else {
+        std::fprintf(stderr,
+                     "[rt] d3d12: no bounded input-assembler reads: the sized index bind needs VK_KHR_maintenance5 "
+                     "(%s) and robustBufferAccess2 (%s, robustBufferAccessUpdateAfterBind %s%s); with either "
+                     "missing the old "
+                     "behaviour is kept, so indices past a view read what follows it in the GPU address arena and "
+                     "vertex fetches past a view are undefined\n",
+                     have_maintenance5 ? "present" : "missing", have_robustness2 ? "present" : "missing",
+                     robust_update_after_bind ? "ok" : "false with update-after-bind buffers",
+                     knob_off ? "; LEONIDA_NO_IA_BOUNDS set" : "");
+    }
 
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
     // VK_KHR_shader_fma: OpFmaKHR is a single-rounding multiply-add in SPIR-V (GLSL.std.450 Fma may round twice).
@@ -7455,6 +7522,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (info.shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 #endif
     if (calibrated) device_extensions.push_back(calibrated);
+    if (info.index_buffer_size) device_extensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+    if (info.robust_buffer_access2) device_extensions.push_back(robustness2_name);
     // VK_KHR_swapchain requires VK_KHR_surface on the instance (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
     if (has_swapchain && instance_has_surface) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     if (swapchain_m1_name) device_extensions.push_back(swapchain_m1_name);
