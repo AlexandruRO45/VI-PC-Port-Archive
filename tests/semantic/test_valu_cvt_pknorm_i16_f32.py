@@ -1325,5 +1325,136 @@ class TestValuCvtPknormI16F32StatusFlags(unittest.TestCase):
         self.assertEqual(vcc_neg_mask, 0x55555555)
 
 
+# ==============================================================================
+# Commit 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestValuCvtPknormI16F32IEEE754Boundaries(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, infinities, and NaNs."""
+
+    def test_signed_zeros(self) -> None:
+        """Verify +0.0 and -0.0 both convert to 0x0000 regardless of modifiers."""
+        # Unmodified
+        self.assertEqual(f32_to_snorm16(POS_ZERO_F32), 0)
+        self.assertEqual(f32_to_snorm16(NEG_ZERO_F32), 0)
+
+        # Modifiers on zero
+        res_abs = oracle_v_cvt_pknorm_i16_f32(NEG_ZERO_F32, NEG_ZERO_F32, abs0=True, abs1=True)
+        self.assertEqual(res_abs, 0x00000000)
+
+        res_neg = oracle_v_cvt_pknorm_i16_f32(POS_ZERO_F32, POS_ZERO_F32, neg0=True, neg1=True)
+        self.assertEqual(res_neg, 0x00000000)
+
+    def test_subnormal_numbers(self) -> None:
+        """Verify positive and negative subnormal floats underflow to 0x0000."""
+        # Smallest positive subnormal: 2^-149 (approx 1.4e-45)
+        self.assertEqual(f32_to_snorm16(MIN_SUBNORMAL_F32), 0)
+
+        # Largest positive subnormal: (1 - 2^-23) * 2^-126 (approx 1.17e-38)
+        self.assertEqual(f32_to_snorm16(MAX_SUBNORMAL_F32), 0)
+
+        # Negative subnormals
+        min_sub_neg = MIN_SUBNORMAL_F32 | SIGN_MASK_F32
+        max_sub_neg = MAX_SUBNORMAL_F32 | SIGN_MASK_F32
+        self.assertEqual(f32_to_snorm16(min_sub_neg), 0)
+        self.assertEqual(f32_to_snorm16(max_sub_neg), 0)
+
+        # Packed combination of subnormals
+        res = oracle_v_cvt_pknorm_i16_f32(MIN_SUBNORMAL_F32, max_sub_neg)
+        self.assertEqual(res, 0x00000000)
+
+    def test_smallest_normal_float(self) -> None:
+        """Verify smallest positive normal float 2^-126 underflows to 0."""
+        min_normal_f32 = 0x00800000  # 2^-126
+        min_normal_neg_f32 = 0x80800000
+        self.assertEqual(f32_to_snorm16(min_normal_f32), 0)
+        self.assertEqual(f32_to_snorm16(min_normal_neg_f32), 0)
+
+    def test_infinities(self) -> None:
+        """Verify +inf and -inf clamp to +32767 (0x7FFF) and -32767 (0x8001)."""
+        # +inf -> 0x7FFF
+        self.assertEqual(f32_to_snorm16(POS_INF_F32), 0x7FFF)
+        # -inf -> 0x8001
+        self.assertEqual(f32_to_snorm16(NEG_INF_F32), 0x8001)
+
+        # +inf with neg modifier -> -inf -> 0x8001
+        res_neg = oracle_v_cvt_pknorm_i16_f32(POS_INF_F32, POS_INF_F32, neg0=True, neg1=True)
+        self.assertEqual(res_neg, 0x80018001)
+
+        # -inf with abs modifier -> +inf -> 0x7FFF
+        res_abs = oracle_v_cvt_pknorm_i16_f32(NEG_INF_F32, NEG_INF_F32, abs0=True, abs1=True)
+        self.assertEqual(res_abs, 0x7FFF7FFF)
+
+    def test_nan_payload_variations(self) -> None:
+        """Verify all varieties of Quiet and Signaling NaNs convert to 0x0000."""
+        qnan_payloads = [
+            0x7FC00001,  # Quiet NaN with payload 1
+            0x7FFFFFFF,  # Quiet NaN with all payload bits set
+            0xFFC00000,  # Negative Quiet NaN
+            0xFFFFFFFF,  # Negative Quiet NaN with full payload
+        ]
+        snan_payloads = [
+            0x7F800001,  # Signaling NaN with bit 0
+            0x7FBFFFFF,  # Signaling NaN with highest mantissa bit clear
+            0xFF800001,  # Negative Signaling NaN
+            0xFFBFFFFF,  # Negative Signaling NaN with payload
+        ]
+
+        for payload in qnan_payloads + snan_payloads:
+            self.assertTrue(is_nan_f32(payload))
+            self.assertEqual(f32_to_snorm16(payload), 0)
+
+        # Mixed NaN pairs in oracle
+        res = oracle_v_cvt_pknorm_i16_f32(0x7FC00001, 0xFF800001)
+        self.assertEqual(res, 0x00000000)
+
+    def test_max_finite_floats(self) -> None:
+        """Verify maximum finite single-precision floats clamp to boundaries."""
+        max_float = 0x7F7FFFFF       # Approx +3.4028e+38
+        min_float_neg = 0xFF7FFFFF   # Approx -3.4028e+38
+
+        self.assertEqual(f32_to_snorm16(max_float), 0x7FFF)
+        self.assertEqual(f32_to_snorm16(min_float_neg), 0x8001)
+
+        res = oracle_v_cvt_pknorm_i16_f32(max_float, min_float_neg)
+        self.assertEqual(res, 0x80017FFF)
+
+    def test_epsilon_around_one(self) -> None:
+        """Verify precision right at and near the 1.0 boundary."""
+        # 1.0 - 2^-24 (largest float strictly less than 1.0)
+        near_one_pos = 0x3F7FFFFF
+        # 1.0 + 2^-23 (smallest float strictly greater than 1.0)
+        above_one_pos = 0x3F800001
+
+        # Both round/clamp to 32767
+        self.assertEqual(f32_to_snorm16(near_one_pos), 0x7FFF)
+        self.assertEqual(f32_to_snorm16(above_one_pos), 0x7FFF)
+
+        # -1.0 + 2^-24 (closest float above -1.0)
+        near_one_neg = 0xBF7FFFFF
+        # -1.0 - 2^-23 (closest float below -1.0)
+        below_one_neg = 0xBF800001
+
+        self.assertEqual(f32_to_snorm16(near_one_neg), 0x8001)
+        self.assertEqual(f32_to_snorm16(below_one_neg), 0x8001)
+
+    def test_snorm16_quantum_steps(self) -> None:
+        """Verify smallest non-zero quantizations (1 / 32767.0)."""
+        step = 1.0 / 32767.0
+        step_pos = f32_to_bits(step)
+        step_neg = f32_to_bits(-step)
+
+        # 1.0 / 32767.0 rounds to 1 (0x0001)
+        self.assertEqual(f32_to_snorm16(step_pos), 0x0001)
+        # -1.0 / 32767.0 rounds to -1 (0xFFFF)
+        self.assertEqual(f32_to_snorm16(step_neg), 0xFFFF)
+
+        # Fractional steps: 0.4 ulp rounds to 0, 0.6 ulp rounds to 1
+        sub_step = f32_to_bits(0.4 / 32767.0)
+        sup_step = f32_to_bits(0.6 / 32767.0)
+        self.assertEqual(f32_to_snorm16(sub_step), 0x0000)
+        self.assertEqual(f32_to_snorm16(sup_step), 0x0001)
+
+
 if __name__ == "__main__":
     unittest.main()
