@@ -2132,6 +2132,40 @@ def scalar_body():
 PACK_HALVES = ("ll", "lh", "hh")
 
 
+def scalar_mul_hi_values(signed="i32"):
+    return with_constants([
+        "s_cmp_eq_u32 s44, s45",
+        f"s_mul_hi_{signed} s62, s44, s45",
+        "s_mul_hi_u32 s63, s44, s45",
+        "s_cselect_b32 s64, 0x3f800000, 0",
+        "v_mov_b32_e32 v14, s64",
+        "s_cmp_eq_u32 s62, s46", "s_cselect_b32 s64, 0x3f800000, 0",
+        "v_mov_b32_e32 v12, s64",
+        "s_cmp_eq_u32 s63, s47", "s_cselect_b32 s64, 0x3f800000, 0",
+        "v_mov_b32_e32 v13, s64", "v_mov_b32_e32 v15, 0",
+    ])
+
+
+def check_scalar_mul_hi_draw(directory, compiler, renderer, backend):
+    source, shader, case = (directory / name for name in ("mul-hi.hlsl", "mul-hi.cso", "mul-hi.case"))
+    source.write_text(translate(scalar_mul_hi_values()), encoding="ascii")
+    compile_shader(compiler, source, shader, ieee=False)
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    for a, b in ((0, 0x80000000), (0x7fffffff, 0x7fffffff), (0x80000000, 3),
+                 (3, 0x80000000), (0x1234abcd, 0x5678ef90), (0xffffffff, 0xffffffff)):
+        signed_a, signed_b = struct.unpack("<ii", struct.pack("<II", a, b))
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, a, b, (signed_a * signed_b >> 32) & 0xffffffff, a * b >> 32)
+        case.write_bytes(constants + struct.pack("<4f", 1, 1, a == b, 0) * 64)
+        subprocess.run(draw, check=True)
+    # For the final inputs, signed high is zero and unsigned high is 0xfffffffe.
+    source.write_text(translate(scalar_mul_hi_values("u32")), encoding="ascii")
+    compile_shader(compiler, source, shader, ieee=False)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Unsigned high product matched the signed reference")
+
+
 def scalar_pack_values(halves):
     return with_constants([
         "s_cmp_eq_u32 s47, 1", f"s_pack_{halves}_b32_b16 s44, s44, s45",
@@ -2379,7 +2413,7 @@ def check_scalar_controls():
     # Neighbouring forms that the lowerer does not implement, operand kinds it cannot read, and
     # destinations other than plain scalar registers.
     first = "s_add_u32 s62, s44, s45"
-    for new in ("s_addc_u32 s62, s44, s45", "s_subb_u32 s62, s44, s45", "s_mul_hi_u32 s62, s44, s45",
+    for new in ("s_addc_u32 s62, s44, s45", "s_subb_u32 s62, s44, s45",
                 "s_absdiff_i32 s62, s44, s45",
                 "s_nand_b32 s62, v12, s45", "s_nor_b32 v62, s44, s45", "s_xnor_b32 s62, s44",
                 "s_bfe_u32 s62, v12, s45", "s_lshl1_add_u32 s62, s44, s45",
@@ -4576,6 +4610,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((sext_values(), translate))
     fixtures.append((sop1_scalar_ops(), translate_int))
     fixtures.extend((scalar_pack_values(halves), translate) for halves in PACK_HALVES)
+    fixtures.append((scalar_mul_hi_values(), translate))
     fixtures.append((with_constants(RECIPROCAL_BODY), translate))
     fixtures.append((bitwise_program(), translate))
     fixtures.append((fract_values(), translate))
@@ -6016,6 +6051,7 @@ def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
     check_int_predicate_draws(directory, compiler, renderer, backend)
     check_sext_draw(directory, compiler, renderer, backend)
     check_scalar_pack_draw(directory, compiler, renderer, backend)
+    check_scalar_mul_hi_draw(directory, compiler, renderer, backend)
     check_int16_predicate_draws(directory, compiler, renderer, backend)
     check_sdwa_predicate_draws(directory, compiler, renderer, backend)
     check_literal_fma_draw(directory, compiler, renderer, backend)

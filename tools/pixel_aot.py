@@ -416,6 +416,19 @@ SALU_BIT64 = {
     "xnor": "uint2(~({0} ^ {2}), ~({1} ^ {3}))",
 }
 SALU_HELPERS = {
+    "scalar_mul_hi": """uint mul_hi_u32(uint a, uint b) {
+    // Carry the low halfword product into the two cross products.
+    uint low_a = a & 0xffffu;
+    uint low_b = b & 0xffffu;
+    uint middle = (a >> 16) * low_b + ((low_a * low_b) >> 16);
+    return (a >> 16) * (b >> 16) + (middle >> 16)
+         + (((middle & 0xffffu) + low_a * (b >> 16)) >> 16);
+}
+uint mul_hi_i32(uint a, uint b) {
+    // Reinterpreting either operand as signed subtracts its partner from the high word.
+    return mul_hi_u32(a, b) - ((a >> 31) != 0u ? b : 0u) - ((b >> 31) != 0u ? a : 0u);
+}
+""",
     "s_lshl_b64": (
         "uint2 s_lshl_b64(uint2 v, uint s) {\n"
         "    s &= 63u;\n"
@@ -803,6 +816,8 @@ def lane_mask(token):
 # {r} names the result. Shift counts use their low five bits; signed overflow sets SCC for _i32 add/sub.
 NONZERO = "{r} != 0u"
 SCALAR = {
+    "mul_hi_u32": (2, "mul_hi_u32({0}, {1})", None),
+    "mul_hi_i32": (2, "mul_hi_i32({0}, {1})", None),
     "pack_ll_b32_b16": (2, "({0} & 0xffffu) | ({1} << 16)", None),
     "pack_lh_b32_b16": (2, "({0} & 0xffffu) | ({1} & 0xffff0000u)", None),
     "pack_hh_b32_b16": (2, "({0} >> 16) | ({1} & 0xffff0000u)", None),
@@ -1533,6 +1548,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Write overlaps an outstanding scalar load")
             if len(tokens) != arity:
                 raise ValueError("Invalid scalar operation")
+            if op in ("mul_hi_u32", "mul_hi_i32"):
+                helpers.add("scalar_mul_hi")
             values = [scalar_u32(t, scalar, pending) for t in tokens]
             lines.append(f"    uint salu{i} = {template.format(*values)};")
             if carry:
