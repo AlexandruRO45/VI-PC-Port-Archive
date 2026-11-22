@@ -1121,5 +1121,172 @@ class TestDSMaxRtnF32RegisterAliasing(unittest.TestCase):
             self.assertEqual(self.lds.read_by_byte_addr(addr), TWO_F32)
 
 
+@dataclasses.dataclass
+class FloatConditionCodes:
+    """Architectural floating-point condition flags for result evaluation."""
+    zero: bool = False
+    negative: bool = False
+    nan: bool = False
+    infinity: bool = False
+    subnormal: bool = False
+
+
+@dataclasses.dataclass
+class LDSStatusFlags:
+    """Architectural status flags, condition tracking, and bank conflict metrics."""
+    mem_updated: bool = False
+    mem_unchanged: bool = False
+    flags: FloatConditionCodes = dataclasses.field(default_factory=FloatConditionCodes)
+    bank_conflicts: int = 0
+    conflict_lanes: List[Tuple[int, int]] = dataclasses.field(default_factory=list)
+
+
+def evaluate_float_conditions(bits: int) -> FloatConditionCodes:
+    """Evaluate floating-point status flags from 32-bit float bit pattern."""
+    bits &= MASK32
+    nan_flag = is_nan(bits)
+    return FloatConditionCodes(
+        zero=is_zero(bits),
+        negative=bool(bits & SIGN_MASK) and not nan_flag,
+        nan=nan_flag,
+        infinity=is_inf(bits),
+        subnormal=is_subnormal(bits),
+    )
+
+
+def analyze_bank_conflicts(
+    lane_addrs: List[Tuple[int, int]],
+    capacity_dwords: int = DEFAULT_LDS_NUM_DWORDS,
+) -> Tuple[int, List[Tuple[int, int]]]:
+    """Analyze LDS memory bank conflicts across active lanes in a wave.
+
+    A conflict occurs when two lanes access the same bank but different dword indices.
+    Accesses to the exact same dword are arbitrated/broadcast without bank conflict.
+    """
+    bank_to_dwords: Dict[int, List[Tuple[int, int]]] = {}
+    for lane, eff_addr in lane_addrs:
+        dword = calc_lds_dword_index(eff_addr, capacity_dwords)
+        bank = dword % NUM_LDS_BANKS
+        bank_to_dwords.setdefault(bank, []).append((lane, dword))
+
+    conflicts = 0
+    conflicting_pairs: List[Tuple[int, int]] = []
+    for bank, accesses in bank_to_dwords.items():
+        if len(accesses) > 1:
+            unique_dwords = set(dw for _, dw in accesses)
+            if len(unique_dwords) > 1:
+                conflicts += len(accesses) - 1
+                for i in range(len(accesses)):
+                    for j in range(i + 1, len(accesses)):
+                        if accesses[i][1] != accesses[j][1]:
+                            conflicting_pairs.append((accesses[i][0], accesses[j][0]))
+    return conflicts, conflicting_pairs
+
+
+class TestDSMaxRtnF32StatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and bank conflict metrics."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(65536)
+        self.state = ScalarThreadState(lds=self.lds)
+        self.interp = ScalarDSInterpreter(state=self.state)
+
+    def test_vcc_isolation(self) -> None:
+        # VCC condition code register should never be modified by LDS operations
+        vcc_canary = 0xFEEDFACECAFEBEEF
+        self.state.vcc = vcc_canary
+        self.state.set_vgpr(0, 0x10)
+        self.state.set_vgpr(1, TWO_F32)
+        self.lds.write_by_byte_addr(0x10, ONE_F32)
+
+        inst = DSMaxRtnF32Instruction(
+            opcode=DSOpcode.DS_MAX_RTN_F32,
+            vdst=vgpr(2),
+            vaddr=vgpr(0),
+            vdata0=vgpr(1),
+        )
+        self.interp.execute_instruction(inst)
+
+        self.assertEqual(getattr(self.state, "vcc", 0), vcc_canary)
+        self.assertEqual(self.state.get_vgpr(2), ONE_F32)
+        self.assertEqual(self.lds.read_by_byte_addr(0x10), TWO_F32)
+
+    def test_status_flags_mem_updated_and_unchanged(self) -> None:
+        # Case 1: candidate (2.0f) > old_val (1.0f) -> mem_updated = True
+        old_val = ONE_F32
+        cand = TWO_F32
+        _, new_val = ref_ds_max_rtn_f32(old_val, cand)
+        flags1 = LDSStatusFlags(
+            mem_updated=(new_val != old_val),
+            mem_unchanged=(new_val == old_val),
+            flags=evaluate_float_conditions(new_val),
+        )
+        self.assertTrue(flags1.mem_updated)
+        self.assertFalse(flags1.mem_unchanged)
+        self.assertFalse(flags1.flags.zero)
+        self.assertFalse(flags1.flags.negative)
+
+        # Case 2: candidate (0.5f) < old_val (1.0f) -> mem_updated = False, mem_unchanged = True
+        cand_smaller = HALF_F32
+        _, new_val2 = ref_ds_max_rtn_f32(old_val, cand_smaller)
+        flags2 = LDSStatusFlags(
+            mem_updated=(new_val2 != old_val),
+            mem_unchanged=(new_val2 == old_val),
+            flags=evaluate_float_conditions(new_val2),
+        )
+        self.assertFalse(flags2.mem_updated)
+        self.assertTrue(flags2.mem_unchanged)
+
+    def test_float_condition_codes_evaluation(self) -> None:
+        # Zero conditions (+0.0 and -0.0)
+        pos_z = evaluate_float_conditions(POS_ZERO)
+        self.assertTrue(pos_z.zero)
+        self.assertFalse(pos_z.negative)
+
+        neg_z = evaluate_float_conditions(NEG_ZERO)
+        self.assertTrue(neg_z.zero)
+
+        # Negative normal
+        neg_val = evaluate_float_conditions(NEG_TEN_F32)
+        self.assertTrue(neg_val.negative)
+        self.assertFalse(neg_val.zero)
+
+        # Infinities
+        inf_val = evaluate_float_conditions(POS_INF)
+        self.assertTrue(inf_val.infinity)
+        self.assertFalse(inf_val.nan)
+
+        # NaNs
+        nan_val = evaluate_float_conditions(QNAN_PAYLOAD_A)
+        self.assertTrue(nan_val.nan)
+        self.assertFalse(nan_val.infinity)
+
+        # Subnormal
+        sub_val = evaluate_float_conditions(SUBNORM_MIN)
+        self.assertTrue(sub_val.subnormal)
+        self.assertFalse(sub_val.zero)
+
+    def test_bank_conflicts_stride_1_conflict_free(self) -> None:
+        # 32 lanes access contiguous dwords 0..31 -> exactly banks 0..31
+        lane_addrs = [(lane, lane * 4) for lane in range(32)]
+        conflicts, pairs = analyze_bank_conflicts(lane_addrs)
+        self.assertEqual(conflicts, 0)
+        self.assertEqual(len(pairs), 0)
+
+    def test_bank_conflicts_stride_32_maximum_conflicts(self) -> None:
+        # 4 lanes access dwords 0, 32, 64, 96 -> all hit bank 0 with different dwords
+        lane_addrs = [(lane, lane * 32 * 4) for lane in range(4)]
+        conflicts, pairs = analyze_bank_conflicts(lane_addrs)
+        self.assertEqual(conflicts, 3)
+        self.assertGreater(len(pairs), 0)
+
+    def test_bank_conflicts_identical_dword_no_conflict(self) -> None:
+        # Multiple lanes accessing the exact same dword do not cause bank conflicts
+        lane_addrs = [(lane, 0x100) for lane in range(8)]
+        conflicts, pairs = analyze_bank_conflicts(lane_addrs)
+        self.assertEqual(conflicts, 0)
+        self.assertEqual(len(pairs), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
