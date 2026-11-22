@@ -665,16 +665,13 @@ def disassembly_matches(dxbc: str, signature: str) -> bool:
         return False
     try:
         with os.scandir(os.path.join(dxbc, "disasm")) as entries:
-            found = False
-            for entry in entries:
-                if entry.name.endswith(".s") and entry.is_file():
-                    if entry.name[:-2] not in names:
-                        return False
-                    found = True
-            # An emptied folder (the .s files deleted to save disk) is not a finished disassembly: decode it again.
-            return found
+            found = {entry.name[:-2] for entry in entries if entry.name.endswith(".s") and entry.is_file()}
     except OSError:
         return False
+    # One .s per unpacked shader: an emptied folder (the .s files deleted to save disk), or one with a few of them
+    # deleted, is not a finished disassembly. Decode it again instead of translating a corpus that silently lacks
+    # the missing shaders and publishing an index that says it is complete.
+    return found == names
 
 
 def shader_outputs_reusable(work: str, emulate: bool, keep_emulated: bool,

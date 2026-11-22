@@ -58,6 +58,13 @@ class DisassemblyMatchesTest(unittest.TestCase):
         os.makedirs(self.disasm)
         self.assertFalse(make_game.disassembly_matches(self.dxbc, SIGNATURE))
 
+    def test_a_partly_emptied_disassembly_does_not_match(self):
+        # Two unpacked shaders, one .s left: translating this would publish a corpus that lacks the other silently.
+        self.indexes(carved=("shader_0", "shader_1"), unpacked=("shader_0", "shader_1"))
+        self.sign()
+        self.assembly("shader_0")
+        self.assertFalse(make_game.disassembly_matches(self.dxbc, SIGNATURE))
+
     def test_assembly_for_a_shader_that_is_no_longer_unpacked_does_not_match(self):
         self.indexes()
         self.sign()
