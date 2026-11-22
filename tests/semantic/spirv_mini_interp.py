@@ -320,6 +320,9 @@ def _invocation(text, inputs, push_constants, memory, step=False):
     id_type = {}                # constant / result id -> its type id (the width of a signed comparison)
     pc_type = {}                # id -> pointee type id of a PushConstant pointer
     in_body = False
+    cur_fn = None
+    entry_fn = None
+    funcs = {}                  # fn id -> ([(param_id, type_id), ...], body lines)
     body = []
     outputs = []
 
@@ -353,11 +356,22 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             raise UnsupportedConstruct(f"cannot parse line: {line!r}")
         res, op, rest = m.groups()
         a = rest.split()
-        if in_body:
-            body.append((res, op, a, line))
+        if cur_fn is not None:
+            if op == "OpFunctionParameter":
+                funcs[cur_fn][0].append((res, a[0]))
+            elif op == "OpFunctionEnd":
+                cur_fn = None
+            else:
+                funcs[cur_fn][1].append((res, op, a, line))
             continue
         if op == "OpFunction":
             in_body = True
+            cur_fn = res
+            funcs[cur_fn] = ([], [])
+            continue
+        if op == "OpEntryPoint":
+            if len(a) >= 2:
+                entry_fn = a[1]
             continue
         if op in _IGNORED:
             continue
@@ -421,8 +435,14 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             pointers[res] = ("pc", 0) if cls == "PushConstant" else (var_box[res], 0)
         else:
             raise UnsupportedConstruct(f"{op} in module header")
-    if not in_body:
+    if not funcs:
         raise UnsupportedConstruct("no function body")
+    if entry_fn in funcs:
+        body = funcs[entry_fn][1]
+    elif "%main" in funcs:
+        body = funcs["%main"][1]
+    else:
+        body = next(reversed(funcs.values()))[1]
 
     def deref(p):
         box, i = p
@@ -449,7 +469,12 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             raise UnsupportedConstruct(f"signed comparison of a {t[0]}")
         return signed(val(x), t[1] if t else 32)
 
+    fn_labels = {
+        fid: {r: idx for idx, (r, op_i, _, _) in enumerate(fbody) if op_i == "OpLabel" and r}
+        for fid, (_, fbody) in funcs.items()
+    }
     labels = {res: idx for idx, (res, op, _, _) in enumerate(body) if op == "OpLabel" and res}
+    call_stack = []
     pc = 0
     killed = False
     cur_label = prev_label = None
@@ -462,6 +487,34 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             id_type[res] = a[0]
         if op == "OpLabel":
             prev_label, cur_label = cur_label, res
+            continue
+        if op == "OpFunctionCall":
+            callee = a[1]
+            if callee not in funcs:
+                raise UnsupportedConstruct(f"OpFunctionCall to unknown function {callee}")
+            c_params, c_body = funcs[callee]
+            call_args = [val(x) for x in a[2:]]
+            if len(call_args) != len(c_params):
+                raise UnsupportedConstruct(f"OpFunctionCall arity mismatch for {callee}")
+            call_stack.append((body, labels, pc, cur_label, prev_label, res))
+            for (pname, ptype), aval in zip(c_params, call_args):
+                values[pname] = aval
+                id_type[pname] = ptype
+            body, labels, pc = c_body, fn_labels[callee], 0
+            cur_label = prev_label = None
+            continue
+        if op == "OpReturnValue":
+            rv = val(a[0])
+            if not call_stack:
+                break
+            body, labels, pc, cur_label, prev_label, call_res = call_stack.pop()
+            if call_res:
+                values[call_res] = rv
+            continue
+        if op == "OpReturn":
+            if not call_stack:
+                break
+            body, labels, pc, cur_label, prev_label, _ = call_stack.pop()
             continue
         if op in _IGNORED:
             continue

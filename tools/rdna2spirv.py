@@ -160,6 +160,9 @@ class Gen:
         self.blocks = []      # per basic block: list of SPIR-V lines (dispatch-loop form), empty = straight-line
         self.succ = []        # per basic block: the blocks it can go to next (none = the program ends there)
         self.desc_fn = None   # lines of the descriptor-lookup function, once an instruction needs it
+        self.norm_bits_fn = None       # lines of %norm_bits_fn, once UNORM/SNORM decode needs it
+        self.snorm_bits_fn = None      # lines of %snorm_bits_fn, once SNORM decode needs it
+        self.decode_dyn_fmt_fn = None  # lines of %decode_dyn_fmt_fn, once dynamic buffer_load_format needs it
         self.sgpr_imm = {}    # SGPR -> literal an s_mov_b32 put there earlier in this basic block (see gather_addr_modes)
         self.desc_cache = {}  # (first SGPR, dwords) -> id of the %desc_lookup_fn result in the current basic block
         self._scan = (None, 0, [])   # (body list, lines already seen, open merge labels): see desc_cache_ok
@@ -929,20 +932,14 @@ class Gen:
             bit += w
         return words
 
-    def norm_bits(self, m, n):
-        """f32 bits of m / (2^n - 1), correctly rounded, for an n-bit unsigned id m (1 <= n <= 16), integer ops only.
-
-        In binary, m / (2^n - 1) is m's n bits repeated forever. T = m * sum(2^(64 - n(k+1))) holds the first 64 of
-        them (the partial block at the bottom is dropped, below every bit used here). For 0 < m < 2^n - 1 the top 1 of
-        T is in its high dword (T >= 2^(64-n)), so p = FindUMsb(T >> 32) is 16..31 and the value is in [2^(p-32),
-        2^(p-31)). The mantissa is T >> (p + 9) (24 bits with the hidden one) and the round bit the one below it. The
-        repeating tail is never all zero, so a tie can't happen: round to nearest is "add the round bit". A carry
-        out of the mantissa moves into the exponent through the plain add. 0 and 2^n - 1 are exact (0 and 1.0)."""
-        rep = sum(1 << (64 - n * (k + 1)) for k in range(64 // n))
-        m64, t, h64, hi, pi, p, s, s64, q64, q, s1, s164, r64, rb, e, eb, b0, b1, b2, z, one, b3, b4 = \
-            (self.tmp() for _ in range(23))
-        self.emit(f"{m64} = OpUConvert %ulong {m}")
-        self.emit(f"{t} = OpIMul %ulong {m64} {self.cl(rep)}")
+    def _ensure_norm_bits_fn(self):
+        if self.norm_bits_fn is not None:
+            return
+        saved, self.body = self.body, []
+        m64, t, h64, hi, pi, p, s, s64, q64, q, s1, s164, r64, rb, e, eb, b0, b1, b2, z, one, b3, b4, res = \
+            (self.tmp() for _ in range(24))
+        self.emit(f"{m64} = OpUConvert %ulong %nb_m")
+        self.emit(f"{t} = OpIMul %ulong {m64} %nb_rep")
         self.emit(f"{h64} = OpShiftRightLogical %ulong {t} {self.cl(32)}")
         self.emit(f"{hi} = OpUConvert %uint {h64}")
         self.emit(f"{pi} = OpExtInst %int %glsl FindUMsb {hi}")
@@ -961,11 +958,71 @@ class Gen:
         self.emit(f"{b1} = OpIAdd %uint {eb} {b0}")
         self.emit(f"{b2} = OpBitwiseAnd %uint {rb} {self.cu(1)}")
         self.emit(f"{b3} = OpIAdd %uint {b1} {b2}")
-        self.emit(f"{z} = OpIEqual %bool {m} {self.cu(0)}")
-        self.emit(f"{one} = OpIEqual %bool {m} {self.cu((1 << n) - 1)}")
+        self.emit(f"{z} = OpIEqual %bool %nb_m {self.cu(0)}")
+        self.emit(f"{one} = OpIEqual %bool %nb_m %nb_max")
         self.emit(f"{b4} = OpSelect %uint {one} {self.cu(0x3F800000)} {b3}")
-        res = self.tmp()
         self.emit(f"{res} = OpSelect %uint {z} {self.cu(0)} {b4}")
+        lines, self.body = self.body, saved
+        self.norm_bits_fn = [
+            "%norm_bits_fn = OpFunction %uint None %fn_norm_bits",
+            "%nb_m = OpFunctionParameter %uint",
+            "%nb_max = OpFunctionParameter %uint",
+            "%nb_rep = OpFunctionParameter %ulong",
+            "%nb_entry = OpLabel",
+        ] + lines + [f"         OpReturnValue {res}", "OpFunctionEnd"]
+
+    def norm_bits(self, m, n):
+        """f32 bits of m / (2^n - 1), correctly rounded, for an n-bit unsigned id m (1 <= n <= 16), integer ops only.
+
+        In binary, m / (2^n - 1) is m's n bits repeated forever. T = m * sum(2^(64 - n(k+1))) holds the first 64 of
+        them (the partial block at the bottom is dropped, below every bit used here). For 0 < m < 2^n - 1 the top 1 of
+        T is in its high dword (T >= 2^(64-n)), so p = FindUMsb(T >> 32) is 16..31 and the value is in [2^(p-32),
+        2^(p-31)). The mantissa is T >> (p + 9) (24 bits with the hidden one) and the round bit the one below it. The
+        repeating tail is never all zero, so a tie can't happen: round to nearest is "add the round bit". A carry
+        out of the mantissa moves into the exponent through the plain add. 0 and 2^n - 1 are exact (0 and 1.0).
+
+        Emitted once per module as %norm_bits_fn so large shaders don't exceed the SPIR-V id bound (#881)."""
+        self._ensure_norm_bits_fn()
+        rep = sum(1 << (64 - n * (k + 1)) for k in range(64 // n))
+        res = self.tmp()
+        self.emit(f"{res} = OpFunctionCall %uint %norm_bits_fn {m} {self.cu((1 << n) - 1)} {self.cl(rep)}")
+        return res
+
+    def snorm_bits(self, src, bit_off, w):
+        """f32 bits of signed w-bit field at bit_off in src / (2^(w-1) - 1), clamped to [-1.0, 1.0].
+
+        Emitted once per module as %snorm_bits_fn (#881)."""
+        self._ensure_norm_bits_fn()
+        if self.snorm_bits_fn is None:
+            saved, self.body = self.body, []
+            si, neg, ab, au, mag, sg, sel, lim, lo, res = (self.tmp() for _ in range(10))
+            self.emit(f"{si} = OpBitFieldSExtract %int {self.as_int('%snb_src')} %snb_off %snb_w")
+            self.emit(f"{neg} = OpSLessThan %bool {si} {self.as_int(self.cu(0))}")
+            self.emit(f"{ab} = OpExtInst %int %glsl SAbs {si}")
+            self.emit(f"{au} = OpBitcast %uint {ab}")
+            self.emit(f"{mag} = OpFunctionCall %uint %norm_bits_fn {au} %snb_max %snb_rep")
+            self.emit(f"{sg} = OpBitwiseOr %uint {mag} {self.cu(0x80000000)}")
+            self.emit(f"{sel} = OpSelect %uint {neg} {sg} {mag}")
+            self.emit(f"{lim} = OpIAdd %uint %snb_max {self.cu(1)}")
+            self.emit(f"{lo} = OpULessThan %bool {au} {lim}")
+            self.emit(f"{res} = OpSelect %uint {lo} {sel} {self.cu(0xBF800000)}")
+            lines, self.body = self.body, saved
+            self.snorm_bits_fn = [
+                "%snorm_bits_fn = OpFunction %uint None %fn_snorm_bits",
+                "%snb_src = OpFunctionParameter %uint",
+                "%snb_off = OpFunctionParameter %uint",
+                "%snb_w = OpFunctionParameter %uint",
+                "%snb_max = OpFunctionParameter %uint",
+                "%snb_rep = OpFunctionParameter %ulong",
+                "%snb_entry = OpLabel",
+            ] + lines + [f"         OpReturnValue {res}", "OpFunctionEnd"]
+        n = w - 1
+        rep = sum(1 << (64 - n * (k + 1)) for k in range(64 // n))
+        res = self.tmp()
+        self.emit(
+            f"{res} = OpFunctionCall %uint %snorm_bits_fn {src} {self.cu(bit_off)} {self.cu(w)} "
+            f"{self.cu((1 << n) - 1)} {self.cl(rep)}"
+        )
         return res
 
     def decode_format(self, words, code):
@@ -987,30 +1044,21 @@ class Gen:
         out, bit = [], 0
         for w in widths:
             src = words[bit // 32]
-            f = self.tmp()
-            self.emit(f"{f} = OpBitFieldUExtract %uint {src} {self.cu(bit % 32)} {self.cu(w)}")
-            if kind == "f16":
-                v2, x = self.tmp(), self.tmp()
-                self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {f}")
-                self.emit(f"{x} = OpCompositeExtract %float {v2} 0")
-                out.append(self.tou(x))
-            elif kind == "unorm":
-                out.append(self.norm_bits(f, w))
-            elif kind == "snorm":
+            if kind == "snorm":
                 # magnitude over 2^(w-1)-1 with the same integer rounding; the most negative code is -1.0
-                si, neg, ab, au, sg, sel, lo, res = (self.tmp() for _ in range(8))
-                self.emit(f"{si} = OpBitFieldSExtract %int {self.as_int(src)} {self.cu(bit % 32)} {self.cu(w)}")
-                self.emit(f"{neg} = OpSLessThan %bool {si} {self.as_int(self.cu(0))}")
-                self.emit(f"{ab} = OpExtInst %int %glsl SAbs {si}")
-                self.emit(f"{au} = OpBitcast %uint {ab}")
-                mag = self.norm_bits(au, w - 1)
-                self.emit(f"{sg} = OpBitwiseOr %uint {mag} {self.cu(0x80000000)}")
-                self.emit(f"{sel} = OpSelect %uint {neg} {sg} {mag}")
-                self.emit(f"{lo} = OpULessThan %bool {au} {self.cu(1 << (w - 1))}")
-                self.emit(f"{res} = OpSelect %uint {lo} {sel} {self.cu(0xBF800000)}")
-                out.append(res)
-            else:   # uint: raw integer
-                out.append(f)
+                out.append(self.snorm_bits(src, bit % 32, w))
+            else:
+                f = self.tmp()
+                self.emit(f"{f} = OpBitFieldUExtract %uint {src} {self.cu(bit % 32)} {self.cu(w)}")
+                if kind == "f16":
+                    v2, x = self.tmp(), self.tmp()
+                    self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {f}")
+                    self.emit(f"{x} = OpCompositeExtract %float {v2} 0")
+                    out.append(self.tou(x))
+                elif kind == "unorm":
+                    out.append(self.norm_bits(f, w))
+                else:   # uint: raw integer
+                    out.append(f)
             bit += w
         n = len(out)
         while len(out) < 4:
@@ -1179,17 +1227,41 @@ class Gen:
             packed.append(bw)
         words = packed
         # Decode every supported format, then pick by FORMAT.
-        comps = [self.cu(0)] * 4
-        for code in self.FORMATS:
-            dec = self.decode_format(words, code)
-            e = self.tmp()
-            self.emit(f"{e} = OpIEqual %bool {fmt} {self.cu(code)}")
-            nxt = []
-            for c in range(4):
-                s = self.tmp()
-                self.emit(f"{s} = OpSelect %uint {e} {dec[c]} {comps[c]}")
-                nxt.append(s)
-            comps = nxt
+        # Emitted once per module as %decode_dyn_fmt_fn so repeated dynamic buffer_load_format
+        # instructions don't explode the SPIR-V id bound (#881).
+        if self.decode_dyn_fmt_fn is None:
+            saved, self.body = self.body, []
+            params = ["%df_w0", "%df_w1", "%df_w2", "%df_w3"]
+            fcomps = [self.cu(0)] * 4
+            for code in self.FORMATS:
+                dec = self.decode_format(params, code)
+                e = self.tmp()
+                self.emit(f"{e} = OpIEqual %bool %df_fmt {self.cu(code)}")
+                nxt = []
+                for c in range(4):
+                    s = self.tmp()
+                    self.emit(f"{s} = OpSelect %uint {e} {dec[c]} {fcomps[c]}")
+                    nxt.append(s)
+                fcomps = nxt
+            vec = self.tmp()
+            self.emit(f"{vec} = OpCompositeConstruct %v4uint_df " + " ".join(fcomps))
+            lines, self.body = self.body, saved
+            self.decode_dyn_fmt_fn = [
+                "%decode_dyn_fmt_fn = OpFunction %v4uint_df None %fn_decode_dyn_fmt",
+                "%df_w0 = OpFunctionParameter %uint",
+                "%df_w1 = OpFunctionParameter %uint",
+                "%df_w2 = OpFunctionParameter %uint",
+                "%df_w3 = OpFunctionParameter %uint",
+                "%df_fmt = OpFunctionParameter %uint",
+                "%df_entry = OpLabel",
+            ] + lines + [f"         OpReturnValue {vec}", "OpFunctionEnd"]
+        dvec = self.tmp()
+        self.emit(f"{dvec} = OpFunctionCall %v4uint_df %decode_dyn_fmt_fn " + " ".join(words) + f" {fmt}")
+        comps = []
+        for c in range(4):
+            ci = self.tmp()
+            self.emit(f"{ci} = OpCompositeExtract %uint {dvec} {c}")
+            comps.append(ci)
         # DST_SEL swizzle: 0 -> 0, 1 -> 1.0 (float/norm) or integer 1 (UINT/SINT; SHADER-86), 4..7 -> X..W.
         is_int_fmt = "%false"
         for code_v, (_, kind, _) in self.FORMATS.items():
@@ -6446,6 +6518,13 @@ def assemble(gen):
         types.append(f"{name} = OpConstant %uint {v}")
     if gen.desc_fn:
         types.append("%fn_desc_lookup = OpTypeFunction %uint " + " ".join(["%uint"] * 8))
+    if gen.norm_bits_fn:
+        types.append("%fn_norm_bits = OpTypeFunction %uint %uint %uint %ulong")
+    if gen.snorm_bits_fn:
+        types.append("%fn_snorm_bits = OpTypeFunction %uint %uint %uint %uint %uint %ulong")
+    if gen.decode_dyn_fmt_fn:
+        types.append("%v4uint_df = OpTypeVector %uint 4")
+        types.append("%fn_decode_dyn_fmt = OpTypeFunction %v4uint_df %uint %uint %uint %uint %uint")
     if gen.uses_ballot:
         types.append("%v4uint_bal = OpTypeVector %uint 4")       # dedupe_types merges it with any other uvec4
     if gen.uses_bvh and not any(t.startswith("%v3float = ") for t in types):
@@ -6724,7 +6803,13 @@ def assemble(gen):
                    f"OpStore %vinp{reg}_{c} %vinb{reg}_{c}"]
     # Spill pointers last: a spilled value's type may be declared anywhere above.
     types += [f"{ptr} = OpTypePointer Function {t}" for t, ptr in gen.x_ptr_types.items()]
-    out = hdr + dec + types + gvars + (gen.desc_fn or []) + fn
+    helper_fns = (
+        (gen.norm_bits_fn or []) +
+        (gen.snorm_bits_fn or []) +
+        (gen.decode_dyn_fmt_fn or []) +
+        (gen.desc_fn or [])
+    )
+    out = hdr + dec + types + gvars + helper_fns + fn
     tree = cfg_structure.structure(gen.succ) if gen.blocks and STRUCTURED and not gen.emulate else None
     gen.control_flow = "structured" if tree is not None else "dispatch loop" if gen.blocks else "straight line"
     if gen.emulate:
@@ -6799,7 +6884,7 @@ def assemble(gen):
         fn = fn[:last_var + 1] + fn_vars + fn[last_var + 1:]
         if pops:
             fn.append("OpBeginInvocationInterlockEXT")   # end of the entry block: uniform, executed once
-        out = hdr + dec + types + gvars + (gen.desc_fn or []) + fn
+        out = hdr + dec + types + gvars + helper_fns + fn
         gen.body =["         " + l if not (l.startswith("%") and " = OpLabel" in l) else l for l in flow + body]
     end_lock = "         OpEndInvocationInterlockEXT\n" if pops else ""
     if ms:

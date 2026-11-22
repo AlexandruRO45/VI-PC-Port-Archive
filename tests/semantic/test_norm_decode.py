@@ -54,11 +54,14 @@ def norm_bits_on_interp(m: int, n: int) -> int:
     res = gen.norm_bits(gen.cu(m), n)
     consts = "".join(f"{name} = OpConstant %uint {v}\n" for v, name in gen.consts.items())
     consts += "".join(f"{name} = OpConstant %ulong {v}\n" for v, name in gen.lconsts.items())
+    helper = "".join(line + "\n" for line in (gen.norm_bits_fn or []))
     text = ("OpCapability Shader\nOpCapability Int64\n%glsl = OpExtInstImport \"GLSL.std.450\"\n"
             "OpMemoryModel Logical GLSL450\nOpEntryPoint Fragment %main \"main\" %out\n"
             "%void = OpTypeVoid\n%fn = OpTypeFunction %void\n%bool = OpTypeBool\n%uint = OpTypeInt 32 0\n"
-            "%int = OpTypeInt 32 1\n%ulong = OpTypeInt 64 0\n%_ptr_Output_uint = OpTypePointer Output %uint\n"
-            "%out = OpVariable %_ptr_Output_uint Output\n" + consts
+            "%int = OpTypeInt 32 1\n%ulong = OpTypeInt 64 0\n"
+            "%fn_norm_bits = OpTypeFunction %uint %uint %uint %ulong\n"
+            "%_ptr_Output_uint = OpTypePointer Output %uint\n"
+            "%out = OpVariable %_ptr_Output_uint Output\n" + consts + helper
             + "%main = OpFunction %void None %fn\n%entry = OpLabel\n"
             + "".join(line.strip() + "\n" for line in gen.body)
             + f"OpStore %out {res}\nOpReturn\nOpFunctionEnd\n")
@@ -122,6 +125,73 @@ class DecodeThroughBufferLoad(unittest.TestCase):
         self.assertEqual(load_format(8, 2, 1, memory=mem)[0], 0xBF800000)
         # 16_SNORM: the most negative code, -32768, is -1.0 too
         self.assertEqual(load_format(8, 0, 1, memory={BASE: 0x8000})[0], 0xBF800000)
+
+
+class IdBoundHelperFunctions(unittest.TestCase):
+    """Repeated dynamic buffer_load_format decodes share module-level helper functions (#881)."""
+
+    def test_repeated_dynamic_loads_share_helpers_and_validate(self):
+        import shutil
+        import struct
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        body_lines = [
+            "; cs_idbound_test",
+            "\ts_mov_b64 exec, -1",
+            "\ts_mov_b32 s4, 0x10000",
+            "\ts_mov_b32 s5, 0",
+            "\ts_mov_b32 s6, 256",
+            "\ts_mov_b32 s7, 0x001C3FAC",
+            "\tv_mov_b32 v0, 0",
+        ]
+        # 50 dynamic buffer_load_format_xyzw instructions: previously ~75k+ IDs inlined, now O(1) per load.
+        for _ in range(50):
+            body_lines.append("\tbuffer_load_format_xyzw v[1:4], v0, s[4:7], 0 offen")
+        body_lines.append("\ts_waitcnt vmcnt(0)")
+        body_lines.append("\ts_endpgm")
+        asm = "\n".join(body_lines) + "\n"
+
+        orig_emulate = rdna2spirv.WAVE64_EMULATE
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                disasm_dir = Path(td) / "disasm"
+                fssm_dir = Path(td) / "fssm"
+                disasm_dir.mkdir()
+                fssm_dir.mkdir()
+                (Path(td) / "cs_idbound.dxbc").write_bytes(b"DXBC" + bytes(24) + b"\x00\x00\x00\x00" + bytes(4))
+                hdr = bytearray(0x148)
+                struct.pack_into("<4I", hdr, 0x138, 0x8088, 64, 1, 1)
+                (fssm_dir / "cs_idbound.fssm").write_bytes(bytes(hdr))
+                s_path = disasm_dir / "cs_idbound.s"
+                s_path.write_text(asm, encoding="utf-8")
+                for emulate in (False, True):
+                    rdna2spirv.WAVE64_EMULATE = emulate
+                    spv_txt = rdna2spirv.translate(str(s_path))
+                    if emulate:
+                        self.assertIn("%x_it = OpVariable", spv_txt)
+                    self.assertEqual(spv_txt.count("%norm_bits_fn = OpFunction"), 1)
+                    self.assertEqual(spv_txt.count("%snorm_bits_fn = OpFunction"), 1)
+                    self.assertEqual(spv_txt.count("%decode_dyn_fmt_fn = OpFunction"), 1)
+                    self.assertEqual(spv_txt.count("OpFunctionCall %v4uint_df %decode_dyn_fmt_fn"), 50)
+                    id_count = sum(1 for ln in spv_txt.splitlines() if ln.lstrip().startswith("%") and " = " in ln)
+                    self.assertLess(id_count, 25000, f"ID count blew up for emulate={emulate}: {id_count}")
+
+                    spirv_as = shutil.which("spirv-as")
+                    spirv_val = shutil.which("spirv-val")
+                    if spirv_as and spirv_val:
+                        asm_p = Path(td) / f"s_{int(emulate)}.spvasm"
+                        spv_p = Path(td) / f"s_{int(emulate)}.spv"
+                        asm_p.write_text(spv_txt, encoding="utf-8")
+                        r1 = subprocess.run([spirv_as, "--target-env", "vulkan1.3", str(asm_p), "-o", str(spv_p)],
+                                            capture_output=True, text=True)
+                        self.assertEqual(r1.returncode, 0, r1.stderr)
+                        r2 = subprocess.run([spirv_val, "--target-env", "vulkan1.3", str(spv_p)],
+                                            capture_output=True, text=True)
+                        self.assertEqual(r2.returncode, 0, r2.stderr)
+        finally:
+            rdna2spirv.WAVE64_EMULATE = orig_emulate
 
 
 if __name__ == "__main__":
