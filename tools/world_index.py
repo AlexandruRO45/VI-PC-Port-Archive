@@ -479,7 +479,7 @@ def main(argv=None):
     agg = ArchetypeCounts() if a.archetypes_out else None
     try:
         rows, stats = scan_path(a.path, a.start, a.limit, a.max_inflate, agg)
-    except ValueError as e:                 # a --start outside an archive's data area; nothing is written
+    except (ValueError, OSError) as e:      # a bad window or an unreadable input; nothing is written
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
     summary = dict(stats)

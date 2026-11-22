@@ -9,6 +9,8 @@ import io
 import json
 import os
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 import zlib
@@ -299,6 +301,20 @@ class WorldIndexTest(unittest.TestCase):
         WI.parse_resource(make_resource(), agg)
         stats = WN.resolve_archetypes(agg.to_json(), WN.NameDictionary())
         self.assertEqual((stats["entities"], stats["unique_hashes"], stats["unresolved_hashes"]), (1, 1, 1))
+
+
+class MissingInputTest(unittest.TestCase):
+    def test_missing_path_is_one_error_and_no_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "missing.rpf")
+            out = os.path.join(tmp, "reports", "world_index.json")
+            p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "world_index.py"),
+                                missing, "--out", out], capture_output=True, text=True)
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertIn("ERROR:", p.stderr)
+            self.assertIn("missing.rpf", p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            self.assertFalse(os.path.exists(out))
 
 
 if __name__ == "__main__":
