@@ -731,12 +731,13 @@ public:
     }
 
     // ClearDepthStencilView; the cleared planes must be in depth_write state at execution.
-    // D3D12 requires depth in [0, 1] and at least one clear flag.
+    // The host runtime accepts out-of-range and NaN depth values, ignores unrecognised flag bits,
+    // and records no clear when neither known plane is selected (D3D12 Close parity against WARP).
     bool clear_depth_stencil(const TargetView& target, std::uint32_t flags, float depth, std::uint8_t stencil,
                              std::span<const Rect> rects = {}) {
         if (!valid(target)) return false;
-        if (!flags || (flags & ~(clear_depth | clear_stencil))) return false;
-        if ((flags & clear_depth) && !(depth >= 0.0f && depth <= 1.0f)) return false;
+        flags &= clear_depth | clear_stencil;
+        if (!flags) return !closed_;  // Do not create a zero-aspect Vulkan clear operation.
         return append(ClearDepthStencil{target, flags, depth, stencil, {rects.begin(), rects.end()}});
     }
 
