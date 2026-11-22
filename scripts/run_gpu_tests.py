@@ -1023,6 +1023,8 @@ def run_suite(a, work: str) -> int:
                 "ps_vop3_const_mods": (0xC0000000, 0xBF800000, 0x3F800000, 0xAAAABC00),
                 "ps_interp_f32_mods": (0x3F800000, 0x00000000, 0x3F400000, 0x3F800000),   # drawn with vs_interp_consts
                 "ps_interp_mov_mods": (0x3F800000, 0x3FC00000, 0x40000000, 0x3F400000),
+                # s_pack_*, s_sext, s_lshlN_add, s_absdiff, s_mul_hi_i32, s_cmov(k) with SCC (.asm header)
+                "ps_salu_pack_add": (0x98846211, 0xFFFFFF8D, 0x83328116, 0xFD3DB108),
             }
             if name in const_wants:
                 ok, detail = check_pixel_const(raw, const_wants[name])
