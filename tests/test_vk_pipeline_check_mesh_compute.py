@@ -99,6 +99,22 @@ class MeshComputeEntries(unittest.TestCase):
         r = self.run_tool({"m": {"stage": "ms", "lds_bytes": huge}})
         self.assertNotIn("workgroup memory", r.stdout)
 
+    def test_push_constant_layout_covers_the_index_size(self):
+        # rdna2spirv.py records 152 bytes for a --mesh-compute module (the buffer address after the 144-byte user
+        # SGPRs). The entry is built as compute, so it has to find the 152-byte layout, next to a 144-byte cs.
+        r = self.run_tool({"mc": {"stage": "ms", "mesh_compute": LAYOUT, "subgroup_size": None,
+                                  "push_constant_bytes": 152},
+                           "cs": {"stage": "cs", "subgroup_size": None, "push_constant_bytes": 144}})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("ms-compute pipelines: 1 ok, 0 failed, 0 skipped", r.stdout)
+        self.assertIn("cs pipelines: 1 ok, 0 failed, 0 skipped", r.stdout)
+
+    def test_push_constants_over_the_device_limit_are_skipped(self):
+        r = self.run_tool({"mc": {"stage": "ms", "mesh_compute": LAYOUT, "subgroup_size": None,
+                                  "push_constant_bytes": 1 << 20}})
+        self.assertIn("needs 1048576 push-constant bytes", r.stdout)
+        self.assertIn("ms-compute pipelines: 0 ok, 0 failed, 1 skipped", r.stdout)
+
     def test_bool_and_null_forms(self):
         r = self.run_tool({"mc": {"stage": "ms", "mesh_compute": True, "subgroup_size": None}})
         self.assertIn("ms-compute pipelines: 1 ok", r.stdout)

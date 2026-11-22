@@ -23,7 +23,9 @@ support still use the existing feature skip.
 A corpus translated with `--mesh-compute` (the GPUs without `VK_EXT_mesh_shader`, such as MoltenVK) has its mesh
 shaders as GLCompute modules, and their entries carry the buffer layout under `mesh_compute`. Those are created as
 compute pipelines and reported as `ms-compute`, apart from `cs` and from real `ms` pipelines; `--compute-only`
-includes them. Until 2026-11-22 they were skipped as `no VK_EXT_mesh_shader`: on an Apple M4 (MoltenVK 1.4.2) that
+includes them. Like every entry, they get a pipeline layout of the `push_constant_bytes` the index gives (152: the
+buffer address follows the 144 bytes of user SGPRs), and an entry over the device's `maxPushConstantsSize` is
+skipped. Until 2026-11-22 they were skipped as `no VK_EXT_mesh_shader`: on an Apple M4 (MoltenVK 1.4.2) that
 left 9,282 of the 26,118 modules of a full translation unchecked. Two 100-entry slices of that corpus now give 200 of
 200 `ms-compute` pipelines, 0 failed (`tests/test_vk_pipeline_check_mesh_compute.py` checks the rule with a
 hand-built module).
