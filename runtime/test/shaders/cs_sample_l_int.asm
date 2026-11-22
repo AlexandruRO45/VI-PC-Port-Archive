@@ -2,7 +2,7 @@
 ; fallback as a control. vk_store_test sample-l fills the uint image with 100 + i, the sint image with -2i and the
 ; rgba8 image with its gradient (r = round(x / 7 * 255)), texel (x, y) at i = 8y + x. Each lane samples its own
 ; texel centre:
-;   sint image <- uint + sint texel = 100 - i, if the 32-bit and the D16 samples agree, else 0x7fffffff
+;   sint image <- uint + sint texel = 100 - i, if each D16 sample agrees with its own 32-bit sample, else 0x7fffffff
 ;   uint image <- round(r * 255) through a T# that is not in the table but names R32_UINT: a miss reads the float
 ;                 fallback (index 0 = the rgba8 image), so round(x / 7 * 255)
 ; The rgba8 image is not written, so it still holds its gradient. Before the explicit-LOD form used the T# format
@@ -52,12 +52,17 @@ s_mov_b32 s46, 0x77
 s_mov_b32 s47, 0x77
 image_sample_l v15, v[8:10], s[40:47], s[32:35] dmask:0x1 dim:SQ_RSRC_IMG_2D
 s_waitcnt vmcnt(0)
-v_add_nc_u32_e32 v11, v7, v11
 v_and_b32_e32 v19, 0xffff, v19
 v_bfe_i32 v20, v20, 0, 16
-v_add_nc_u32_e32 v19, v19, v20
+; Compare uint and sint separately: +1 in the uint D16 sample and -1 in the sint D16 sample must not cancel.
+v_mov_b32_e32 v21, 1
+v_cmp_eq_u32_e32 vcc_lo, v7, v19
+v_cndmask_b32_e32 v19, 0, v21, vcc_lo
+v_cmp_eq_u32_e32 vcc_lo, v11, v20
+v_cndmask_b32_e32 v19, 0, v19, vcc_lo
+v_add_nc_u32_e32 v11, v7, v11
 v_mov_b32_e32 v21, 0x7fffffff
-v_cmp_eq_u32_e32 vcc_lo, v11, v19
+v_cmp_eq_u32_e32 vcc_lo, 1, v19
 v_cndmask_b32_e32 v11, v21, v11, vcc_lo
 v_mov_b32_e32 v12, 0
 v_mov_b32_e32 v13, 0
