@@ -385,6 +385,29 @@ def self_test():
     return 0
 
 
+def validate_json_output_path(path):
+    """Validate --json output path before opening the hardware oracle; create missing parent dirs."""
+    if not path or not path.strip():
+        raise ValueError("--json path must not be empty")
+    abs_path = os.path.abspath(path)
+    if os.path.isdir(abs_path):
+        raise ValueError(f"--json path is a directory: {path}")
+    cur = os.path.dirname(abs_path)
+    while cur:
+        if os.path.exists(cur):
+            if not os.path.isdir(cur):
+                raise ValueError(f"--json ancestor is not a directory: {cur}")
+            break
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    parent_dir = os.path.dirname(abs_path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
+    return abs_path
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--ops", default=",".join(OPS))
@@ -403,6 +426,12 @@ def main(argv=None):
                                                                                     if w not in (32, 64)]
     if bad:
         ap.error("unknown: " + ", ".join(bad))
+    if a.json is not None:
+        try:
+            validate_json_output_path(a.json)
+        except (ValueError, OSError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
     from hw_oracle import runner
     try:
         oracle = runner.open_oracle(arch=a.hw_arch)
@@ -453,9 +482,13 @@ def main(argv=None):
         return 2
     finally:
         oracle.close()
-    if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=1)
+    if a.json is not None:
+        try:
+            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(report, f, indent=1)
+        except OSError as e:
+            print(f"error: failed to write --json {a.json}: {e}", file=sys.stderr)
+            return 2
     return rc
 
 

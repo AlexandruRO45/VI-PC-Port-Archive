@@ -1,6 +1,8 @@
 """tools/f16_trans_sweep.py: the f16 reference and its rounding, which input each kernel thread computes and where it
 stores it, the classification, and the exit-77 contract. The last test runs on the hardware when the oracle tools
 are present and is skipped otherwise. Standard library only."""
+import io
+import json
 import os
 from decimal import Decimal
 from pathlib import Path
@@ -9,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
 sys.path.insert(0, str(TOOLS))
@@ -122,6 +125,65 @@ class Cli(unittest.TestCase):
                            capture_output=True, text=True)
         self.assertEqual(r.returncode, 2)
         self.assertIn("v_exp_f32", r.stderr)
+
+    def test_bad_json_paths_fail_before_opening_oracle(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            existing_dir = root / "outdir"
+            existing_dir.mkdir()
+            regular_file = root / "notadir.txt"
+            regular_file.write_text("x", encoding="utf-8")
+
+            bad_paths = [
+                "",
+                "   ",
+                str(existing_dir),
+                str(regular_file / "nested" / "report.json"),
+            ]
+            for bad in bad_paths:
+                with self.subTest(json_path=bad):
+                    err = io.StringIO()
+                    with mock.patch.object(runner, "open_oracle") as mock_open:
+                        with mock.patch.object(sys, "stderr", err):
+                            rc = sw.main(["--ops", "v_exp_f16", "--modes", "keep16", "--waves", "32", "--json", bad])
+                    self.assertEqual(rc, 2)
+                    mock_open.assert_not_called()
+                    self.assertTrue(err.getvalue().strip())
+
+    def test_valid_nested_json_path_creates_parent_and_writes_report(self):
+        fake_oracle = mock.MagicMock()
+        fake_oracle.device = "synthetic-gpu"
+        fake_oracle.arch = "gfx1030"
+        fake_hw = sw.reference("v_exp_f16")
+        with tempfile.TemporaryDirectory() as d:
+            out_json = Path(d) / "nested" / "sub" / "report.json"
+            with mock.patch.object(runner, "open_oracle", return_value=fake_oracle), \
+                 mock.patch.object(sw, "check_modes"), \
+                 mock.patch.object(sw, "sweep", return_value=fake_hw):
+                rc = sw.main(["--ops", "v_exp_f16", "--modes", "keep16", "--waves", "32", "--json", str(out_json)])
+            self.assertEqual(rc, 0)
+            fake_oracle.close.assert_called_once()
+            self.assertTrue(out_json.is_file())
+            data = json.loads(out_json.read_text(encoding="utf-8"))
+            self.assertEqual(data["device"], "synthetic-gpu")
+            self.assertIn("v_exp_f16", data["ops"])
+
+    def test_json_write_oserror_returns_exit_2_without_traceback(self):
+        fake_oracle = mock.MagicMock()
+        fake_oracle.device = "synthetic-gpu"
+        fake_oracle.arch = "gfx1030"
+        fake_hw = sw.reference("v_exp_f16")
+        with tempfile.TemporaryDirectory() as d:
+            out_json = Path(d) / "report.json"
+            err = io.StringIO()
+            with mock.patch.object(runner, "open_oracle", return_value=fake_oracle), \
+                 mock.patch.object(sw, "check_modes"), \
+                 mock.patch.object(sw, "sweep", return_value=fake_hw), \
+                 mock.patch("builtins.open", side_effect=PermissionError("denied")), \
+                 mock.patch.object(sys, "stderr", err):
+                rc = sw.main(["--ops", "v_exp_f16", "--modes", "keep16", "--waves", "32", "--json", str(out_json)])
+            self.assertEqual(rc, 2)
+            self.assertIn("denied", err.getvalue())
 
 
 class OnHardware(unittest.TestCase):
