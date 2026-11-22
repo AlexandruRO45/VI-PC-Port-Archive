@@ -1438,5 +1438,129 @@ class TestLdsRsubRtnBoundaryExtremes(unittest.TestCase):
         self.assertEqual(idx, 16383)
 
 
+class TestLdsRsubRtnNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_negative_and_out_of_range_registers(self) -> None:
+        # Negative register index
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1)
+
+        # Register index out of bounds
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256)
+
+        # Invalid count
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 0, count=3)
+
+        # Register group exceeding file boundary
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 254, count=4)
+
+        # Instruction with non-VGPR vdst
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.DS_RSUB_RTN_U32,
+                vdst=Register(RegKind.SGPR, 0),
+                vaddr=Register(RegKind.VGPR, 1),
+                vdata0=Register(RegKind.VGPR, 2),
+            )
+
+        # Instruction with non-VGPR vaddr
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.DS_RSUB_RTN_U32,
+                vdst=Register(RegKind.VGPR, 0),
+                vaddr=Register(RegKind.SGPR, 1),
+                vdata0=Register(RegKind.VGPR, 2),
+            )
+
+        # Instruction with non-VGPR vdata0
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.DS_RSUB_RTN_U32,
+                vdst=Register(RegKind.VGPR, 0),
+                vaddr=Register(RegKind.VGPR, 1),
+                vdata0=Register(RegKind.SGPR, 2),
+            )
+
+    def test_syntax_rejection_invalid_modifiers(self) -> None:
+        with self.assertRaises(ValueError):
+            DSOffset(offset16=-1)
+
+        with self.assertRaises(ValueError):
+            DSOffset(offset16=65536)
+
+    def test_syntax_rejection_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDLDSWavefrontInterpreter(wave_size=16)
+
+        with self.assertRaises(ValueError):
+            SIMDLDSWavefrontInterpreter(wave_size=128)
+
+    def test_mutation_rejection_sub_instead_of_rsub(self) -> None:
+        # Forward subtraction mutant: (current_mem - vdata0) instead of (vdata0 - current_mem)
+        def mutant_sub(current_mem: int, vdata0: int) -> int:
+            return (current_mem - vdata0) & MASK32
+
+        current_mem = 100
+        vdata0 = 30
+        _, correct_new = ref_ds_rsub_rtn_u32(current_mem, vdata0)
+        self.assertEqual(correct_new, u32(-70))
+        self.assertEqual(correct_new, 0xFFFFFFBA)
+
+        mutant_new = mutant_sub(current_mem, vdata0)
+        self.assertEqual(mutant_new, 70)
+        self.assertNotEqual(mutant_new, correct_new)
+
+    def test_mutation_rejection_add_instead_of_rsub(self) -> None:
+        # Addition mutant: (vdata0 + current_mem) instead of (vdata0 - current_mem)
+        def mutant_add(current_mem: int, vdata0: int) -> int:
+            return (vdata0 + current_mem) & MASK32
+
+        current_mem = 50
+        vdata0 = 100
+        _, correct_new = ref_ds_rsub_rtn_u32(current_mem, vdata0)
+        self.assertEqual(correct_new, 50)
+
+        mutant_new = mutant_add(current_mem, vdata0)
+        self.assertEqual(mutant_new, 150)
+        self.assertNotEqual(mutant_new, correct_new)
+
+    def test_mutation_rejection_exec_mask_ignored(self) -> None:
+        simd = SIMDLDSWavefrontInterpreter(wave_size=32, lds_size_bytes=256)
+        simd.set_exec_mask(0)  # All inactive
+        simd.lds.write_dword(0, 100)
+        simd.write_lane_reg_u32(0, RegKind.VGPR, 0, 0xCAFE)
+        simd.write_lane_reg_u32(0, RegKind.VGPR, 1, 0)
+        simd.write_lane_reg_u32(0, RegKind.VGPR, 2, 50)
+
+        inst = Instruction(
+            opcode=Opcode.DS_RSUB_RTN_U32,
+            vdst=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata0=Register(RegKind.VGPR, 2),
+        )
+        results = simd.step(inst)
+        # Inactive lane must return (None, None)
+        self.assertEqual(results[0], (None, None))
+        # Memory must remain untouched
+        self.assertEqual(simd.lds.read_dword(0), 100)
+        # Register vdst must remain untouched
+        self.assertEqual(simd.read_lane_reg_u32(0, RegKind.VGPR, 0), 0xCAFE)
+
+    def test_mutation_rejection_return_new_instead_of_old(self) -> None:
+        lds = LDSMemory(256)
+        lds.write_dword(0, 20)
+        # Correct ds_rsub_rtn_u32 returns old_val (20), writes new_mem = 100 - 20 = 80
+        old_val, new_mem = lds.atomic_rsub_rtn_u32(vaddr=0, vdata0=100)
+        self.assertEqual(old_val, 20)
+        self.assertEqual(new_mem, 80)
+        # If mutant returned new_mem to destination:
+        mutant_return = new_mem
+        self.assertNotEqual(mutant_return, old_val)
+
+
 if __name__ == "__main__":
     unittest.main()
