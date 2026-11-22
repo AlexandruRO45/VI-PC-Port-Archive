@@ -1196,5 +1196,212 @@ class TestSignedBoundaryExtremesAndIEEE754BitPatterns(unittest.TestCase):
         self.assertEqual(oracle_min_i32(pat_b, pat_a), pat_b)
 
 
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_opcodes_and_syntax(self) -> None:
+        invalid_assemblies = [
+            "",
+            "   ",
+            "v_min_i32 v0, v1",
+            "ds_min_f32 v0, v1",
+            "ds_min_u32 v0, v1",
+            "ds_min_i64 v0, v1",
+            "ds_min_rtn_i32",
+            "ds_min_rtn_i32 v0, v1",
+            "ds_min_i32 v0",
+            "ds_min_i32 v0, v1, v2",
+            "ds_min_rtn_i32 v0, v1, v2, v3",
+            "ds_min_i32 s0, v1",
+            "ds_min_i32 r0, v1",
+            "ds_min_i32 v256, v1",
+            "ds_min_i32 v0, v256",
+            "ds_min_i32 v0, v1 offset:70000",
+            "ds_min_i32 v0, v1 offset:-1",
+            "ds_min_i32 v0, v1 offset:invalid",
+            "ds_min_i32 v0, v1 badmod",
+        ]
+        for asm in invalid_assemblies:
+            with self.subTest(asm=asm):
+                with self.assertRaises((ValueError, IndexError)):
+                    DSMinRtnI32Instruction.parse(asm)
+
+    def test_architectural_model_negative_controls(self) -> None:
+        with self.assertRaises(ValueError):
+            LDSMemory(0)
+        with self.assertRaises(ValueError):
+            LDSMemory(-64)
+        with self.assertRaises(ValueError):
+            LDSMemory(1000)
+
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=128)
+
+    def test_mutation_detection_inverted_min_to_max(self) -> None:
+        def mutant_min(a: int, b: int) -> int:
+            sa = s32(a)
+            sb = s32(b)
+            return u32(max(sa, sb))
+
+        self.assertNotEqual(mutant_min(10, 20), oracle_min_i32(10, 20))
+        self.assertNotEqual(mutant_min(u32(-10), u32(-30)), oracle_min_i32(u32(-10), u32(-30)))
+
+    def test_mutation_detection_unsigned_comparison(self) -> None:
+        # Mutant: treats 32-bit values as unsigned integers
+        def mutant_min_unsigned(a: int, b: int) -> int:
+            return u32(min(u32(a), u32(b)))
+
+        # In signed: -1 (0xFFFFFFFF) < 0. But in unsigned: 0 < 0xFFFFFFFF!
+        # The mutant returns 0, whereas true signed min is 0xFFFFFFFF.
+        self.assertNotEqual(mutant_min_unsigned(0, 0xFFFFFFFF), oracle_min_i32(0, 0xFFFFFFFF))
+        # -2147483648 (0x80000000) < 1. In unsigned: 1 < 0x80000000.
+        self.assertNotEqual(mutant_min_unsigned(1, 0x80000000), oracle_min_i32(1, 0x80000000))
+
+    def test_mutation_detection_destructive_aliasing(self) -> None:
+        class DestructiveMutantInterpreter(ScalarDSInterpreter):
+            def execute(self, state: ScalarThreadState, inst: DSMinRtnI32Instruction) -> Optional[int]:
+                if inst.opcode.is_return:
+                    assert inst.vdst is not None
+                    # Bug: prematurely corrupt vdst before reading operands or computing address
+                    state.set_vgpr(inst.vdst, 0xBAD00000)
+                return super().execute(state, inst)
+
+        lds = LDSMemory(65536)
+        lds.write_dword(2, 500)
+        state = ScalarThreadState(lds=lds)
+        state.set_vgpr(VGPR(1), 8)  # dword 2
+        state.set_vgpr(VGPR(2), 50)
+
+        # vdst aliases vaddr (v1)
+        inst = DSMinRtnI32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_I32,
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+            vdst=VGPR(1),
+        )
+        mutant = DestructiveMutantInterpreter()
+        mutant.execute(state, inst)
+
+        # The corrupted address causes write to wrong location, leaving dword 2 unupdated
+        self.assertNotEqual(lds.read_dword(2), 50)
+
+    def test_mutation_detection_ignore_exec_mask(self) -> None:
+        class MutantSIMDInterpreter(SIMDDSInterpreter):
+            def execute(self, state: SIMDWaveState, inst: DSMinRtnI32Instruction) -> Dict[int, Optional[int]]:
+                saved_mask = state.exec_mask
+                state.exec_mask = (1 << state.wave_size) - 1  # Force all lanes active
+                try:
+                    return super().execute(state, inst)
+                finally:
+                    state.exec_mask = saved_mask
+
+        lds = LDSMemory(65536)
+        lds.write_dword(5, 500)
+        wave = SIMDWaveState(wave_size=32, exec_mask=0x0, lds=lds)
+        for l in range(32):
+            wave.set_vgpr(l, VGPR(1), 20)
+            wave.set_vgpr(l, VGPR(2), 10)
+
+        inst = DSMinRtnI32Instruction(
+            opcode=DSOpcode.DS_MIN_I32,
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        mutant = MutantSIMDInterpreter()
+        mutant.execute(wave, inst)
+
+        # Mutant improperly modified memory when exec_mask was 0
+        self.assertEqual(lds.read_dword(5), 10)
+
+        # Correct interpreter leaves it untouched
+        lds.write_dword(5, 500)
+        SIMDDSInterpreter().execute(wave, inst)
+        self.assertEqual(lds.read_dword(5), 500)
+
+    def test_mutation_detection_dropped_offset(self) -> None:
+        class DroppedOffsetInterpreter(ScalarDSInterpreter):
+            def execute(self, state: ScalarThreadState, inst: DSMinRtnI32Instruction) -> Optional[int]:
+                no_off_inst = DSMinRtnI32Instruction(
+                    opcode=inst.opcode,
+                    vaddr=inst.vaddr,
+                    vdata=inst.vdata,
+                    vdst=inst.vdst,
+                    offset=OffsetImmediate(0),  # Dropped offset
+                )
+                return super().execute(state, no_off_inst)
+
+        lds = LDSMemory(65536)
+        lds.write_dword(1, 500)
+        lds.write_dword(2, 500)
+        state = ScalarThreadState(lds=lds)
+        state.set_vgpr(VGPR(1), 4)  # dword 1
+        state.set_vgpr(VGPR(2), 50)
+
+        inst = DSMinRtnI32Instruction(
+            opcode=DSOpcode.DS_MIN_I32,
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+            offset=OffsetImmediate(4),  # Points to dword 2 (4 + 4 = 8)
+        )
+        mutant = DroppedOffsetInterpreter()
+        mutant.execute(state, inst)
+
+        # Mutant updated dword 1 instead of dword 2
+        self.assertEqual(lds.read_dword(1), 50)
+        self.assertEqual(lds.read_dword(2), 500)
+
+    def test_mutation_detection_non_atomic_collision(self) -> None:
+        class NonAtomicSIMDInterpreter(SIMDDSInterpreter):
+            def execute(self, state: SIMDWaveState, inst: DSMinRtnI32Instruction) -> Dict[int, Optional[int]]:
+                # Reads initial value for all lanes without updating memory sequentially
+                results: Dict[int, Optional[int]] = {}
+                read_vals: Dict[int, int] = {}
+                for lane in range(state.wave_size):
+                    if state.is_lane_active(lane):
+                        vaddr_val = state.get_vgpr(lane, inst.vaddr)
+                        idx = state.lds.get_dword_index(vaddr_val, inst.offset.value)
+                        read_vals[lane] = state.lds.read_dword(idx)
+                # Overwrite directly without chained return values
+                for lane in range(state.wave_size):
+                    if state.is_lane_active(lane):
+                        if inst.opcode.is_return:
+                            assert inst.vdst is not None
+                            state.set_vgpr(lane, inst.vdst, read_vals[lane])
+                            results[lane] = read_vals[lane]
+                return results
+
+        lds = LDSMemory(65536)
+        lds.write_dword(0, 100)
+        wave = SIMDWaveState(wave_size=32, exec_mask=0x3, lds=lds)
+        # Lane 0 sends 50, Lane 1 sends 20 to address 0
+        wave.set_vgpr(0, VGPR(1), 0)
+        wave.set_vgpr(0, VGPR(2), 50)
+        wave.set_vgpr(1, VGPR(1), 0)
+        wave.set_vgpr(1, VGPR(2), 20)
+
+        inst = DSMinRtnI32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_I32,
+            vdst=VGPR(0),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+
+        mutant = NonAtomicSIMDInterpreter()
+        mutant_res = mutant.execute(wave, inst)
+        # In non-atomic execution, Lane 1 gets 100 instead of serialized 50
+        self.assertEqual(mutant_res[1], 100)
+
+        # In true serialized atomic execution:
+        lds.write_dword(0, 100)
+        true_res = SIMDDSInterpreter().execute(wave, inst)
+        self.assertEqual(true_res[1], 50)
+
+
 if __name__ == "__main__":
     unittest.main()
