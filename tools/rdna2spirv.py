@@ -184,6 +184,8 @@ class Gen:
         self.lane_masks = {}           # id(instruction) -> registers holding a lane mask there (lane_masks.py)
         self.ever_mask = set()         # SGPRs that held a lane mask anywhere in the shader (conservative)
         self.cur_masks = {}
+        self.lane_consts = {}          # id(instruction) -> {SGPR: known 32-bit constant} there (lane_masks.constants)
+        self.cur_consts = {}
         self.mask_writes = set()       # id(instruction) of the ones that write a lane mask to a VGPR
         self.write_all_lanes = False
         self.dpp_guard = None       # per-lane bool: a DPP instruction's row/bank/valid write mask
@@ -3055,6 +3057,7 @@ class Gen:
         # lane_masks merges a mask on one path with plain data on another by dropping the register,
         # so "not in cur_masks" does not prove it is data on every path. Keep a conservative set.
         self.ever_mask = {r for m in self.lane_masks.values() for r in m if isinstance(r, int)}
+        self.lane_consts = lane_masks.constants(*blocks)
         slots = lane_masks.parked(blocks[0], self.lane_masks)
         self.parked = {slot: self.SGPRS + i for i, slot in enumerate(slots)}
 
@@ -3313,8 +3316,15 @@ class Gen:
         bit per lane, so lane L takes its bit L: of the 64-bit value (`wide`, the default: a 64-bit SALU operand or
         the VALU mask of a wave64; inline constants sign-extended, a literal with a zero high word, as src64_data)
         or of the 32-bit value with L mod 32 (a b32 op). Until 2026-11-22 every lane took bit 0 (0xff00 was no
-        lane, 5 every lane)."""
+        lane, 5 every lane).
+        An SGPR (or pair) holding a known constant here (lane_masks.constants, e.g. after `s_mov_b32 s20,
+        0x3ffffc00`) is read as that constant: every invocation has the raw value in it, not its own bit, so until
+        2026-11-22 any non-zero value was every lane. A single SGPR as the 64-bit mask of a wave64 stays a load."""
         if a["k"] == "sgpr":
+            n, c = a.get("n", 1), self.cur_consts
+            if all(a["r"] + i in c for i in range(n)) and not (n == 1 and wide and self.wave64):
+                v = c[a["r"]] | (c[a["r"] + 1] << 32 if n == 2 else 0)
+                return self.mask_src({"k": "imm", "v": v}, wide)
             return self.load_reg("sgpr", a["r"])
         if a["k"] == "special" and a["t"] in ("vcc", "vcc_lo", "vcc_hi"):
             v = self.tmp()
@@ -3541,6 +3551,7 @@ class Gen:
         deciding the other bits (PAD = zero, SEXT = sign-extend, PRESERVE = keep the old bits). VOPC has no
         dst_sel; v_cmpx (GFX10) has no written destination operand."""
         self.cur_masks = self.lane_masks.get(id(ins), {})
+        self.cur_consts = self.lane_consts.get(id(ins), {})
         self.write_all_lanes = id(ins) in self.mask_writes
         self.cur_uniform_readlane = bool(self.w64g) and id(ins) in self.w64g["uniform_readlane"]
         if self.emulate:
@@ -3867,11 +3878,14 @@ class Gen:
         if op in ("s_denorm_mode", "s_round_mode"):
             raise Unsupported(op + " (not in the corpus; MODE is modelled through s_setreg only)")
         if op == "s_mov_b32" and a[0]["k"] == "special" and a[0]["t"] in ("exec_lo", "exec_hi") and \
-                (a[0]["t"] == "exec_hi" or a[1]["k"] in ("imm", "fimm")):
+                (a[0]["t"] == "exec_hi" or a[1]["k"] in ("imm", "fimm") or
+                 (a[1]["k"] == "sgpr" and a[1]["r"] in self.cur_consts)):
             src = a[1]
             const = (src["v"] & 0xFFFFFFFF) if src["k"] == "imm" else None
             if src["k"] == "fimm":
                 const = struct.unpack("<I", struct.pack("<f", src["v"]))[0]
+            if src["k"] == "sgpr" and src["r"] in self.cur_consts:
+                const = self.cur_consts[src["r"]]     # a known constant in the SGPR: lane L takes bit L, as for imm
             self.exec_half_write(0 if a[0]["t"] == "exec_lo" else 1, None if const is not None else self.src_u(src),
                                  const)
         elif op == "v_mov_b32" or op == "s_mov_b32":

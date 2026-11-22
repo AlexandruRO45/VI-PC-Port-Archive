@@ -208,3 +208,63 @@ def analyse(blocks, succ):
             if step(state, ins):
                 writes.add(id(ins))
     return out, writes
+
+
+def written_sgprs(op, a):
+    """SGPR numbers an instruction may write: its first operand, plus the carry / sign SGPR of v_add_co_u32,
+    v_mad_u64_u32, v_div_scale and the like. A store's data operand counts too, which only forgets more."""
+    outs = [a[0]]
+    if op.startswith("v_") and len(a) > 1 and ("_co_" in op or op.startswith(("v_mad_u64", "v_mad_i64",
+                                                                               "v_div_scale"))):
+        outs.append(a[1])
+    return [x["r"] + i for x in outs if x["k"] == "sgpr" for i in range(x.get("n", 1))]
+
+
+def const_step(state, ins):
+    """Update `state` (SGPR number -> its 32-bit value) for one instruction."""
+    op, a = base_op(ins["op"]), ins["args"]
+    if not a or op.startswith(NO_DESTINATION):
+        return
+    new = {}
+    if op in ("s_mov_b32", "s_mov_b64") and len(a) == 2 and a[0]["k"] == "sgpr":
+        n, src = (2 if op.endswith("b64") else 1), a[1]
+        if a[0].get("n", 1) == n and src["k"] == "imm" and isinstance(src["v"], int) and \
+                not src.get("abs") and not src.get("neg"):
+            # As Gen.mask_src reads an immediate: an inline constant sign-extended, a literal with a zero high word.
+            v = src["v"] & ((1 << 32 * n) - 1)
+            new = {a[0]["r"] + i: (v >> 32 * i) & 0xFFFFFFFF for i in range(n)}
+        elif a[0].get("n", 1) == n and src["k"] == "sgpr" and src.get("n", 1) == n and \
+                all(src["r"] + i in state for i in range(n)):
+            new = {a[0]["r"] + i: state[src["r"] + i] for i in range(n)}
+    for r in written_sgprs(op, a):
+        state.pop(r, None)
+    state.update(new)
+
+
+def constants(blocks, succ):
+    """Which SGPRs hold a known constant, from s_mov_b32 / s_mov_b64 of an immediate (or of such an SGPR):
+    id(ins) -> {SGPR number: 32-bit value} when the instruction runs, for those that hold the same value on every
+    path. Every invocation has the raw constant there, so a lane-mask reader (Gen.mask_src) gives lane L bit L of
+    it, as for an immediate, instead of taking any non-zero value as this lane's bit."""
+    entry = [None] * len(blocks)
+    if blocks:
+        entry[0] = {}
+    work = [0] if blocks else []
+    while work:
+        n = work.pop()
+        state = dict(entry[n])
+        for ins in blocks[n]:
+            const_step(state, ins)
+        for s in succ[n]:
+            merged = dict(state) if entry[s] is None else \
+                {r: c for r, c in entry[s].items() if state.get(r) == c}
+            if merged != entry[s]:
+                entry[s] = merged
+                work.append(s)
+    out = {}
+    for n, blk in enumerate(blocks):
+        state = dict(entry[n] or {})
+        for ins in blk:
+            out[id(ins)] = dict(state)
+            const_step(state, ins)
+    return out

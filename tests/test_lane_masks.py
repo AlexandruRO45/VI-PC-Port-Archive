@@ -150,10 +150,41 @@ def test_bfm64_and_half_kinds():
     assert got3 == {6: L.MASK}
 
 
+def test_constants():
+    def at_last(blocks, succ):
+        return L.constants(blocks, succ)[id(blocks[-1][-1])]
+    use = ins("s_and_saveexec_b32", s(6), s(20))
+    # A moved literal, an inline constant (sign-extended), a copy, and a 64-bit move (literal: zero high word).
+    assert at_last([[ins("s_mov_b32", s(20), imm(0x3FFFFC00)), use]], [[]]) == {20: 0x3FFFFC00}
+    assert at_last([[ins("s_mov_b32", s(20), imm(-16)), ins("s_mov_b32", s(21), s(20)), use]], [[]]) == \
+        {20: 0xFFFFFFF0, 21: 0xFFFFFFF0}
+    assert at_last([[ins("s_mov_b64", s(20, 2), imm(-16)), use]], [[]]) == {20: 0xFFFFFFF0, 21: 0xFFFFFFFF}
+    assert at_last([[ins("s_mov_b64", s(20, 2), imm(0xFF00)), use]], [[]]) == {20: 0xFF00, 21: 0}
+    # Any other write forgets it: an ALU result, a compare into the SGPR, the carry of v_add_co_u32, a load.
+    for w in (ins("s_add_u32", s(20), s(20), imm(1)), ins("v_cmp_gt_u32_e64", s(20), imm(3), v(4)),
+              ins("v_add_co_u32", v(1), s(20), v(2), v(3)), ins("s_load_dwordx2", s(20, 2), s(0, 2), imm(0)),
+              ins("s_mov_b32", s(20), s(9))):
+        assert at_last([[ins("s_mov_b32", s(20), imm(5)), w, use]], [[]]) == {}, w["op"]
+    # Reads and compares keep it.
+    assert at_last([[ins("s_mov_b32", s(20), imm(5)), ins("s_cmp_eq_u32", s(20), imm(5)), use]], [[]]) == {20: 5}
+    # Joins keep only the same value on every path: two different constants, or one path without, are unknown.
+    def diamond(left, right):
+        return at_last([[ins("s_nop")], [left], [right], [use]], [[1, 2], [3], [3], []])
+    assert diamond(ins("s_mov_b32", s(20), imm(5)), ins("s_mov_b32", s(20), imm(5))) == {20: 5}
+    assert diamond(ins("s_mov_b32", s(20), imm(5)), ins("s_mov_b32", s(20), imm(6))) == {}
+    assert diamond(ins("s_mov_b32", s(20), imm(5)), ins("s_nop")) == {}
+    # A loop that changes it is unknown at the loop head.
+    assert at_last([[ins("s_mov_b32", s(20), imm(5))], [ins("s_nop")], [ins("s_mov_b32", s(20), imm(9))], [use]],
+                   [[1], [2, 3], [1], []]) == {}
+    # The mask analysis is unchanged by it: a constant SGPR is still not a lane mask.
+    assert masks_at_last([[ins("s_mov_b32", s(20), imm(0x3FFFFC00)), use]], [[]]) == set()
+
+
 if __name__ == "__main__":
     test_straight_line()
     test_joins()
     test_parked_masks()
     test_masks_through_a_vgpr()
     test_bfm64_and_half_kinds()
+    test_constants()
     print("ok")
