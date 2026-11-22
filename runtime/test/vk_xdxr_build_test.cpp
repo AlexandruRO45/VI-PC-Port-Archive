@@ -135,7 +135,7 @@ int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir
         XdxrTriangles d;
         d.vertices = v.address;
         d.vertex_stride = geo.stride;
-        d.xy_only = geo.xy;
+        d.format = geo.xy ? XdxrVertexFormat::r32g32_float : XdxrVertexFormat::r32g32b32_float;
         d.triangle_count = geo.triangle_count;
         d.flags = 1;
         keep.push_back(v);

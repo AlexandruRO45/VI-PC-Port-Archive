@@ -47,6 +47,10 @@ struct XdxrLayout {
     static constexpr std::uint32_t radix_passes = 8;
     static constexpr std::uint32_t small_sort_max = 1024;  // xdxr_build.comp SMALL_SORT_MAX: one-workgroup sort
     std::uint64_t scratch = 0;         // scratch bytes
+    // TLAS: where a build from D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS gathers its 64-byte instance descs, in instance
+    // order, before reading them as an ARRAY (the last 64 * elements scratch bytes; 0 for a BLAS). Counted for either
+    // layout, so GetRaytracingAccelerationStructurePrebuildInfo, which knows the count only, gives one answer.
+    std::uint64_t gather_off = 0;
 
     // False when the count would overflow the 32-bit offsets of the format.
     bool compute(std::uint32_t count, bool top_level) {
@@ -77,17 +81,33 @@ struct XdxrLayout {
         // centroid bounds, keys and element indices twice, digit counts per tile and their prefix sums, a box per
         // element and per node
         scratch = 64 + 16ull * sort_size + 8ull * radix_bins * tiles() + 24ull * (std::uint64_t(count) + nodes);
+        if (tlas) {
+            gather_off = (scratch + 63) / 64 * 64;
+            scratch = gather_off + 64ull * count;
+        }
         return true;
     }
     std::uint32_t root() const { return nodes - 1; }
     std::uint32_t tiles() const { return (sort_size + radix_tile - 1) / radix_tile; }
 };
 
+// The vertex formats D3D12 allows for triangle geometry (xdxr_build.comp pc.arg1). The two-component ones read z = 0,
+// and the A of the four-component ones is not read. SNORM16 is max(c / 32767, -1), so -32768 and -32767 are both -1.
+// The 16-bit ones are read as halves of aligned words: their address and stride must be even (as D3D12 requires).
+enum class XdxrVertexFormat : std::uint32_t {
+    r32g32b32_float = 0,
+    r32g32_float = 1,
+    r16g16b16a16_float = 2,
+    r16g16_float = 3,
+    r16g16b16a16_snorm = 4,
+    r16g16_snorm = 5,
+};
+
 // One geometry of a bottom-level build, as D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC gives it.
 struct XdxrTriangles {
     std::uint64_t vertices = 0;       // device address
     std::uint32_t vertex_stride = 12;
-    bool xy_only = false;             // DXGI_FORMAT_R32G32_FLOAT (z = 0); otherwise R32G32B32_FLOAT
+    XdxrVertexFormat format = XdxrVertexFormat::r32g32b32_float;
     std::uint64_t indices = 0;        // device address, 0 = none
     std::uint32_t index_type = 0;     // 0 none, 1 R16_UINT, 2 R32_UINT
     std::uint32_t triangle_count = 0;
@@ -133,7 +153,7 @@ public:
             t.src1 = split(geo.indices);
             t.src2 = split(geo.transform);
             t.arg0 = geo.vertex_stride;
-            t.arg1 = geo.xy_only ? 1u : 0u;
+            t.arg1 = static_cast<std::uint32_t>(geo.format);
             t.arg2 = geo.index_type;
             t.geometry = std::uint32_t(g) << 8 | (geo.flags & 0xffu);
             dispatch(cb, t, t.count);
@@ -144,7 +164,8 @@ public:
         return true;
     }
 
-    // Records a top-level build from `count` D3D12_RAYTRACING_INSTANCE_DESCs at `instances`.
+    // Records a top-level build from `count` D3D12_RAYTRACING_INSTANCE_DESCs at `instances`, consecutively (an
+    // ARRAY_OF_POINTERS build is gathered into the scratch at layout.gather_off first, and that is `instances`).
     // `update_from`: as for record_blas; the instances may move, and name other BLASes.
     bool record_tlas(VkCommandBuffer cb, const XdxrLayout& layout, std::uint64_t instances, std::uint64_t dst,
                      std::uint64_t scratch, std::uint64_t bias = 0, std::uint64_t update_from = 0) {

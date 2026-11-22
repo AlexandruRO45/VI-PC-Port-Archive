@@ -375,8 +375,88 @@ class ConsoleParentTable(unittest.TestCase):
             struct.pack_into("<I", bad, entry, struct.unpack_from("<I", bad, entry)[0] ^ 0x10)
         self.assertTrue(any("parent table entry" in e for e in X.validate(bytes(bad))))
 
+def exact_snorm16(c):
+    """float32 nearest to max(c / 32767, -1), ties to even, from integers only."""
+    from fractions import Fraction
+    q = max(Fraction(c, 32767), Fraction(-1))
+    if q == 0:
+        return 0.0
+    a = abs(q)
+    e = 0
+    while a < 1:
+        a *= 2
+        e -= 1
+    m = round(a * 2 ** 23)                         # Fraction rounds half to even
+    return math.copysign(m * 2.0 ** (e - 23), q)
+
+
+class VertexFormats(unittest.TestCase):
+    def test_snorm16_minus_one_twice(self):
+        self.assertEqual(X.snorm16(0x8000), -1.0)    # -32768
+        self.assertEqual(X.snorm16(0x8001), -1.0)    # -32767
+        self.assertEqual(X.snorm16(0x7FFF), 1.0)
+        self.assertEqual(X.snorm16(0), 0.0)
+
+    def test_snorm16_is_correctly_rounded_for_every_value(self):
+        for bits in range(0x10000):
+            c = bits - 0x10000 if bits & 0x8000 else bits
+            self.assertEqual(X.snorm16(bits), exact_snorm16(c), hex(bits))
+
+    def test_decode_each_format(self):
+        p = (1.5, -0.25, 3.0)
+        h = struct.pack("<4e", *p, math.nan)                    # A: NaN, not read
+        s = struct.pack("<4h", 32767, -32768, 0, 12345)
+        f = struct.pack("<3f", *p)
+        self.assertEqual(X.decode_vertex("R32G32B32_FLOAT", f, 0), list(p))
+        self.assertEqual(X.decode_vertex("R32G32_FLOAT", f, 0), [1.5, -0.25, 0.0])
+        self.assertEqual(X.decode_vertex("R16G16B16A16_FLOAT", h, 0), list(p))
+        self.assertEqual(X.decode_vertex("R16G16_FLOAT", h, 0), [1.5, -0.25, 0.0])
+        self.assertEqual(X.decode_vertex("R16G16B16A16_SNORM", s, 0), [1.0, -1.0, 0.0])
+        self.assertEqual(X.decode_vertex("R16G16_SNORM", b"\0\0" + s, 2), [1.0, -1.0, 0.0])
+        self.assertEqual(X.decode_vertex("R16G16_FLOAT", struct.pack("<2H", 0x0001, 0x8000), 0),
+                         [2.0 ** -24, -0.0, 0.0])                # a denormal half is a normal float
+
+    def test_source_triangles_indexed_and_not(self):
+        verts = struct.pack("<6h", 0, 0, 32767, 0, 0, 32767)
+        src = {"format": "R16G16_SNORM", "stride": 4, "vertices": verts.hex(), "indices": [2, 1, 0]}
+        self.assertEqual(X.source_triangles(src), [[[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]]])
+        src["indices"] = None
+        self.assertEqual(X.source_triangles(src), [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]])
+
+
 class CheckBuild(unittest.TestCase):
     """check-build on cases written the way vk_xdxr_build_test writes them, built here by the reference."""
+
+    def write_source_case(self, d, wrong_bits=False):
+        """A BLAS of 30 triangles from R16G16B16A16_SNORM vertices (stride 8, A junk), with the "sources" entry
+        d3d12_xdxr_rt_test writes; with wrong_bits the stated vertex buffer is one step off in one component."""
+        import json
+        rng = random.Random(3)
+        raw = [rng.randrange(0x10000) for _ in range(4 * 3 * 30)]
+        tris = [[[X.snorm16(raw[4 * (3 * t + k) + c]) for c in range(3)] for k in range(3)] for t in range(30)]
+        blas, _ = X.build_blas(tris)
+        if wrong_bits:
+            raw[4 * 7 + 1] ^= 0x0100                          # vertex 7 (triangle 2), y
+        src = {"geometry": 0, "format": "R16G16B16A16_SNORM", "stride": 8, "indices": None,
+               "vertices": struct.pack(f"<{len(raw)}H", *raw).hex()}
+        with open(os.path.join(d, "blas_src.bin"), "wb") as f:
+            f.write(blas)
+        with open(os.path.join(d, "blas_src.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"kind": "blas", "address": 0x10000,
+                       "triangles": [t + [0, i] for i, t in enumerate(tris)], "sources": [src]}, f)
+
+    def test_sources_match(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write_source_case(d)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(X.check_build(d, rays=100), [])
+
+    def test_sources_catch_one_component(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write_source_case(d, wrong_bits=True)
+            with contextlib.redirect_stdout(io.StringIO()):
+                problems = X.check_build(d, rays=100)
+            self.assertTrue(any("the source decodes to" in p for p in problems), problems)
 
     def write_cases(self, d, corrupt=False):
         import json

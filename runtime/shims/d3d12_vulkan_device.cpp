@@ -1641,6 +1641,7 @@ public:
             binding.va = va_;
             binding.buffer = device_.arena.buffer;
             binding.buffer_offset = arena_offset_;
+            binding.host = device_.arena.mapped + arena_offset_;
             // A default-heap AS resource is one of these ranges: a GENERIC acceleration structure covers it where
             // it sits. It is named by its real device address (heap base + offset), as instance descriptors and
             // BuildRaytracingAccelerationStructure hand that address to the driver, not a console VA.
@@ -1729,6 +1730,7 @@ public:
         }
         binding.buffer = buffer_;
         binding.size = desc_.Width;
+        binding.host = static_cast<const std::uint8_t*>(mapped_);
         binding.host_readable = (heap_.Type == D3D12_HEAP_TYPE_READBACK ||
                                  (heap_.Type == D3D12_HEAP_TYPE_CUSTOM &&
                                   heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
@@ -1779,6 +1781,7 @@ public:
         binding.buffer = device_.arena.buffer;
         binding.buffer_offset = va_;
         binding.va = va_;
+        binding.host = device_.arena.mapped + va_;
         binding.host_readable = (heap_.Type == D3D12_HEAP_TYPE_READBACK ||
                                  (heap_.Type == D3D12_HEAP_TYPE_CUSTOM &&
                                   heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
