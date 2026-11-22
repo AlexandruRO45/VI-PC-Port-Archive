@@ -4854,6 +4854,8 @@ public:
                     return (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
                 });
         }
+        if (state_.context->xdxr_acceleration_structures())
+            state_.context->set_xdxr_readback_memory(state_.memory);
         if (info.buffer_device_address && state_.context->loaded() && !create_arena())
             std::fprintf(stderr, "[rt] d3d12: the GPU address arena could not be created\n");
         if (info.conditional_rendering) {
@@ -5364,12 +5366,18 @@ public:
         return E_INVALIDARG;
     }
 
-    // STUB
     D3D12_DRIVER_MATCHING_IDENTIFIER_STATUS STDMETHODCALLTYPE CheckDriverMatchingIdentifier(
-        D3D12_SERIALIZED_DATA_TYPE type, const D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER*) override {
-        return type == D3D12_SERIALIZED_DATA_RAYTRACING_ACCELERATION_STRUCTURE
-                   ? D3D12_DRIVER_MATCHING_IDENTIFIER_UNRECOGNIZED
-                   : D3D12_DRIVER_MATCHING_IDENTIFIER_UNSUPPORTED_TYPE;
+        D3D12_SERIALIZED_DATA_TYPE type, const D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER* identifier) override {
+        if (type != D3D12_SERIALIZED_DATA_RAYTRACING_ACCELERATION_STRUCTURE)
+            return D3D12_DRIVER_MATCHING_IDENTIFIER_UNSUPPORTED_TYPE;
+        constexpr auto& expected = leonida::xdxr::serialized_identifier;
+        static_assert(sizeof(*identifier) == sizeof(expected));
+        if (!state_.context->xdxr_acceleration_structures() || !identifier ||
+            std::memcmp(&identifier->DriverOpaqueGUID, expected.data(), sizeof(GUID)) != 0)
+            return D3D12_DRIVER_MATCHING_IDENTIFIER_UNRECOGNIZED;
+        return std::memcmp(identifier->DriverOpaqueVersioningData, expected.data() + 4, 16) == 0
+                   ? D3D12_DRIVER_MATCHING_IDENTIFIER_COMPATIBLE_WITH_DEVICE
+                   : D3D12_DRIVER_MATCHING_IDENTIFIER_INCOMPATIBLE_VERSION;
     }
 
     // STUB
@@ -5455,7 +5463,8 @@ public:
         if (out) *out = nullptr;
         if (node_mask & ~1u) return d3d12_trace::result(method, E_INVALIDARG);  // one node, as the host answers
         // The initial pipeline state is set as SetPipelineState would set it (a bundle's is its first deferred call).
-        HRESULT hr = create_command_list(type, allocator, riid, out, identity(), state);
+        HRESULT hr = create_command_list(type, allocator, riid, out, identity(), state,
+                                         state_.context->xdxr_acceleration_structures());
         return d3d12_trace::result(method, hr);
     }
 
@@ -5473,7 +5482,8 @@ public:
         HRESULT hr = create_command_allocator(type, IID_PPV_ARGS(&allocator), identity());
         if (FAILED(hr)) return d3d12_trace::result(method, hr);
         ID3D12GraphicsCommandList* list = nullptr;
-        hr = create_command_list(type, allocator, IID_PPV_ARGS(&list), identity());
+        hr = create_command_list(type, allocator, IID_PPV_ARGS(&list), identity(), nullptr,
+                                 state_.context->xdxr_acceleration_structures());
         allocator->Release();
         if (FAILED(hr)) return d3d12_trace::result(method, hr);
         list->Close();

@@ -1030,13 +1030,20 @@ public:
                                            xdxr_pair(b));
                     }
                 };
-                replay_.xdxr_copy = [this](VkCommandBuffer cb, std::uint64_t src, std::uint64_t dst, std::uint64_t bytes) {
+                replay_.xdxr_copy = [this](VkCommandBuffer cb, const CopyAccelerationStructure& copy,
+                                           std::uint64_t src_bytes, std::uint64_t dst_bytes, VkDeviceAddress status) {
                     const std::uint64_t base = replay_.heap_base;
-                    xdxr_->record_copy(cb, base + src, base + dst, bytes);
+                    if (copy.serialization()) {
+                        xdxr_->record_serial_copy(cb, base + copy.src_va, base + copy.dst_va, src_bytes, dst_bytes,
+                                                 status, copy.mode == CopyAccelerationStructure::deserialize);
+                    } else {
+                        xdxr_->record_copy(cb, base + copy.src_va, base + copy.dst_va, std::min(src_bytes, dst_bytes));
+                    }
                 };
-                replay_.xdxr_postbuild = [this](VkCommandBuffer cb, std::uint64_t src, std::uint64_t dest) {
+                replay_.xdxr_postbuild = [this](VkCommandBuffer cb, std::uint64_t src, std::uint64_t dest,
+                                                VkDeviceAddress status, std::uint64_t src_bytes) {
                     const std::uint64_t base = replay_.heap_base;
-                    xdxr_->record_postbuild(cb, base + src, base + dest);
+                    xdxr_->record_postbuild(cb, base + src, base + dest, status, src_bytes);
                 };
             } else {
                 xdxr_.reset();
@@ -1289,6 +1296,7 @@ public:
 
     bool ray_tracing_supported() const { return ray_tracing_ && vk.vkCmdBuildAccelerationStructuresKHR != nullptr; }
     bool xdxr_acceleration_structures() const { return xdxr_ != nullptr; }
+    void set_xdxr_readback_memory(const VkPhysicalDeviceMemoryProperties& memory) { xdxr_readback_memory_ = memory; }
 
     // Whether a build's inner nodes are BOX16 (64 bytes, half boxes rounded outward) instead of BOX32: bottom-level
     // builds with MINIMIZE_MEMORY (VK LOW_MEMORY). A top-level build keeps BOX32: it is in world space, where half
@@ -1681,6 +1689,7 @@ private:
     double timestamp_period_ = 0;
     bool order_timestamp_copies_ = false;
     VkPhysicalDeviceMemoryProperties occlusion_resolve_memory_{};
+    VkPhysicalDeviceMemoryProperties xdxr_readback_memory_{};
     ReplayFunctions replay_;
     std::unique_ptr<PredicateReducer> predicate_reducer_;
     std::unique_ptr<PredicatedBufferCopier> predicated_copier_;
@@ -1823,6 +1832,7 @@ public:
             const VkResult idle_result = vk.vkQueueWaitIdle(queue_);
             if (idle_result == VK_SUCCESS) {
                 if (progress_) context_.retire_queue_idle_locked(progress_);
+                for (auto& slot : buffers_) finish_xdxr_status(slot);
             } else {
                 context_.mark_device_lost();
             }
@@ -2028,8 +2038,11 @@ public:
     }
 
     bool idle() {
+        std::lock_guard state(state_mutex_);
         std::lock_guard lock(context_.submit_mutex());
-        return context_.vk.vkQueueWaitIdle(queue_) == VK_SUCCESS;
+        if (context_.vk.vkQueueWaitIdle(queue_) != VK_SUCCESS) return false;
+        for (auto& slot : buffers_) finish_xdxr_status(slot);
+        return true;
     }
 
 private:
@@ -2209,9 +2222,29 @@ private:
             return stage_khr_instances(replay, build, khr_guard.stages, address);
         };
         std::uint64_t captures = 0;
-        for (const auto* list : lists)
-            for (const auto& command : list->commands())
+        std::vector<const char*> serialization_operations;
+        for (const auto* list : lists) {
+            for (const auto& command : list->commands()) {
                 if (const auto* p = std::get_if<Predication>(&command); p && p->buffer) ++captures;
+                if (const auto* copy = std::get_if<CopyAccelerationStructure>(&command); copy && copy->serialization()) {
+                    serialization_operations.push_back(copy->mode == CopyAccelerationStructure::serialize ?
+                                                           "serialize" : "deserialize");
+                } else if (const auto* info = std::get_if<AccelerationStructurePostbuild>(&command);
+                           info && info->type == AccelerationStructurePostbuild::serialization) {
+                    serialization_operations.insert(serialization_operations.end(), info->sources.size(),
+                                                    "serialization postbuild");
+                }
+            }
+        }
+        std::unique_ptr<XdxrSerializationStatus> xdxr_status;
+        std::size_t next_serialization = 0;
+        if (!serialization_operations.empty()) {
+            if (!replay.xdxr_copy || kind_ == QueueKind::copy) return ReplayResult::unsupported;
+            xdxr_status = std::make_unique<XdxrSerializationStatus>(context_.vk, context_.device(),
+                                                                    std::move(serialization_operations));
+            if (!xdxr_status->initialize(context_.xdxr_readback_memory_)) return ReplayResult::unsupported;
+            replay.xdxr_serialization_status = [&] { return xdxr_status->address(next_serialization++); };
+        }
         std::unique_ptr<PredicateReducer::Batch> batch;
         std::unique_ptr<PredicatedBufferCopier::Batch> copy_batch;
         std::unique_ptr<IndirectDispatchCounter::Batch> counted_batch;
@@ -2475,8 +2508,8 @@ private:
             auto pieces = detail::current(&next_tracker, id, range, VK_IMAGE_LAYOUT_UNDEFINED);
             detail::initialize(replay, command_buffer, *image, id, pieces, VK_IMAGE_LAYOUT_GENERAL, &next_tracker);
         }
-        bool wrote_readback = false;
-        VkPipelineStageFlags2 readback_stages = 0;
+        bool wrote_readback = xdxr_status != nullptr;
+        VkPipelineStageFlags2 readback_stages = wrote_readback ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT : 0;
         std::uint32_t open_labels = 0;  // events may span the lists of one ExecuteCommandLists
         for (std::size_t i = 0; i < lists.size(); ++i) {
             const auto& list = prepared[i];
@@ -2552,6 +2585,7 @@ private:
             slot->predicate = std::move(batch);
             slot->predicated_copy = std::move(copy_batch);
             slot->counted_dispatch = std::move(counted_batch);
+            slot->xdxr_status = std::move(xdxr_status);
             queries.commit();
             slot->segments = std::move(queries.retained);
         } else {
@@ -2778,6 +2812,73 @@ private:
         // The pins (fences, pipeline states) are released here, outside the lock.
     }
 
+    // One host-coherent buffer per serialization submission. Each operation writes a header and pointer status.
+    // Retain it with the command buffer until the queue reaches its timeline ticket.
+    class XdxrSerializationStatus {
+    public:
+        XdxrSerializationStatus(const VulkanDeviceFunctions& vk, VkDevice device, std::vector<const char*> operations)
+            : vk_(vk), device_(device), operations_(std::move(operations)) {}
+        ~XdxrSerializationStatus() {
+            if (mapped_) vk_.vkUnmapMemory(device_, memory_);
+            if (buffer_) vk_.vkDestroyBuffer(device_, buffer_, nullptr);
+            if (memory_) vk_.vkFreeMemory(device_, memory_, nullptr);
+        }
+
+        bool initialize(const VkPhysicalDeviceMemoryProperties& memory) {
+            VkBufferCreateInfo buffer{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            buffer.size = operations_.size() * 2 * sizeof(std::uint32_t);
+            buffer.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+            if (vk_.vkCreateBuffer(device_, &buffer, nullptr, &buffer_) != VK_SUCCESS) return false;
+            VkMemoryRequirements requirements{};
+            vk_.vkGetBufferMemoryRequirements(device_, buffer_, &requirements);
+            constexpr auto coherent = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            std::uint32_t type = 0;
+            for (; type < memory.memoryTypeCount; ++type) {
+                if ((requirements.memoryTypeBits & (1u << type)) &&
+                    (memory.memoryTypes[type].propertyFlags & coherent) == coherent) break;
+            }
+            if (type == memory.memoryTypeCount) return false;
+            VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+            flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+            VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
+            allocation.allocationSize = requirements.size;
+            allocation.memoryTypeIndex = type;
+            if (vk_.vkAllocateMemory(device_, &allocation, nullptr, &memory_) != VK_SUCCESS ||
+                vk_.vkBindBufferMemory(device_, buffer_, memory_, 0) != VK_SUCCESS ||
+                vk_.vkMapMemory(device_, memory_, 0, VK_WHOLE_SIZE, 0, &mapped_) != VK_SUCCESS)
+                return false;
+            VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+            info.buffer = buffer_;
+            address_ = vk_.vkGetBufferDeviceAddress(device_, &info);
+            return address_ != 0;
+        }
+
+        VkDeviceAddress address(std::size_t index) const { return address_ + index * 2 * sizeof(std::uint32_t); }
+
+        void report() const {
+            const auto* words = static_cast<const std::uint32_t*>(mapped_);
+            for (std::size_t index = 0; index < operations_.size(); ++index) {
+                const auto code = std::max(words[2 * index], words[2 * index + 1]);
+                if (!code) continue;
+                const char* error = "invalid XDXR layout, buffer range, or overlap";
+                if (code == 1) error = "incompatible driver identifier";
+                if (code == 3) error = "invalid BLAS pointer in the serialized data";
+                if (code == 4) error = "unsupported XDXR root type (expected BOX32)";
+                std::fprintf(stderr, "[rt] d3d12: XDXR %s operation %zu rejected: %s\n",
+                             operations_[index], index + 1, error);
+            }
+        }
+
+    private:
+        const VulkanDeviceFunctions& vk_;
+        VkDevice device_;
+        std::vector<const char*> operations_;
+        VkBuffer buffer_ = VK_NULL_HANDLE;
+        VkDeviceMemory memory_ = VK_NULL_HANDLE;
+        void* mapped_ = nullptr;
+        VkDeviceAddress address_ = 0;
+    };
+
     struct CommandSlot {
         VkCommandBuffer buffer;
         std::uint64_t ticket;
@@ -2787,6 +2888,7 @@ private:
         std::unique_ptr<IndirectDispatchCounter::Batch> counted_dispatch;
         std::unique_ptr<PredicateReducer::Batch> predicate; // retained until this slot completes
         std::vector<KhrInstanceStage> khr_instances;  // KHR ARRAY_OF_POINTERS staging, same lifetime
+        std::unique_ptr<XdxrSerializationStatus> xdxr_status;
     };
 
     struct PendingBindings {
@@ -2938,6 +3040,12 @@ private:
         if (last_sparse_ <= done) last_sparse_ = 0;
     }
 
+    static void finish_xdxr_status(CommandSlot& slot) {
+        if (!slot.xdxr_status) return;
+        slot.xdxr_status->report();
+        slot.xdxr_status.reset();
+    }
+
     // Releases what every finished command buffer holds; the first of them, or null when none has finished.
     CommandSlot* recycle_finished() {
         const auto done = completed();
@@ -2952,6 +3060,7 @@ private:
                 if (context_.vk.vkResetEvent(context_.device(), event) == VK_SUCCESS) free_events_.push_back(event);
                 else context_.vk.vkDestroyEvent(context_.device(), event, nullptr);
             slot.events.clear();
+            finish_xdxr_status(slot);
             if (!reuse) reuse = &slot;
         }
         return reuse;

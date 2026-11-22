@@ -17,6 +17,7 @@
 
 #include "../src/gfx10_descriptors.h"
 #include "../src/vulkan_backend.h"
+#include "../src/xdxr_descs.h"
 
 #include <functional>
 #include <memory>
@@ -51,7 +52,13 @@ HRESULT create_command_queue(leonida::VulkanContext& context, VkQueue queue, std
                              std::shared_ptr<void> queue_lease = {});
 HRESULT create_command_allocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out, IUnknown* device = nullptr);
 HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator, REFIID riid,
-                            void** out, IUnknown* device = nullptr, ID3D12PipelineState* initial_state = nullptr);
+                            void** out, IUnknown* device = nullptr, ID3D12PipelineState* initial_state = nullptr,
+                            bool xdxr = false);
+
+
+// Adapter for the measured Xbox batched-build descriptors. The SDK's command-list vtables stay in PC order.
+HRESULT build_xdxr_acceleration_structures(ID3D12GraphicsCommandList* list, UINT count,
+                                          const leonida::xdxr::BatchedDesc2* descs);
 HRESULT create_fence(leonida::VulkanContext& context, UINT64 initial_value, D3D12_FENCE_FLAGS flags, REFIID riid,
                      void** out, IUnknown* device = nullptr);
 HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride, REFIID riid, void** out,

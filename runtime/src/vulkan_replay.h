@@ -33,6 +33,7 @@
 #include "command_list.h"
 #include "depth24.h"
 #include "uav_clear.h"
+#include "xdxr_descs.h"
 
 #include <vulkan/vulkan.h>
 #include "vulkan_predicate.h"
@@ -905,10 +906,11 @@ struct ReplayFunctions {
     // cannot read while the list is prepared, `xdxr_record` records the build.
     std::function<bool(const BuildAccelerationStructure&)> xdxr_check;
     std::function<void(VkCommandBuffer, const BuildAccelerationStructure&)> xdxr_record;
-    // CopyRaytracingAccelerationStructure (CLONE, COMPACT) of XDXR structures: `bytes` is the room the destination
-    // resource has; and one postbuild value (COMPACTED_SIZE, CURRENT_SIZE) of the structure at `src` to `dest`.
-    std::function<void(VkCommandBuffer, std::uint64_t src_va, std::uint64_t dst_va, std::uint64_t bytes)> xdxr_copy;
-    std::function<void(VkCommandBuffer, std::uint64_t src_va, std::uint64_t dest_va)> xdxr_postbuild;
+    std::function<void(VkCommandBuffer, const CopyAccelerationStructure&, std::uint64_t src_bytes,
+                       std::uint64_t dst_bytes, VkDeviceAddress status)> xdxr_copy;
+    std::function<VkDeviceAddress()> xdxr_serialization_status;
+    std::function<void(VkCommandBuffer, std::uint64_t src_va, std::uint64_t dest_va, VkDeviceAddress status,
+                       std::uint64_t src_bytes)> xdxr_postbuild;
     std::function<VkAccelerationStructureKHR(std::uint64_t)> resolve_acceleration_structure;
     // Preparation only allocates a slot; capture records the GPU snapshot at the SetPredication command.
     std::function<bool(VkBuffer, VkDeviceSize, PredicateCapture&)> prepare_predicate;
@@ -1024,6 +1026,8 @@ struct Prepared {
     VkAccelerationStructureKHR accel_dst = VK_NULL_HANDLE;
     VkDeviceAddress khr_instances = 0;  // staged ARRAY_OF_POINTERS instance list for a KHR TLAS; 0: use the VA directly
     std::uint64_t xdxr_bytes = 0;     // CopyAccelerationStructure: the most bytes the copy may write
+    std::uint64_t xdxr_src_bytes = 0, xdxr_dst_bytes = 0;
+    std::vector<std::uint64_t> xdxr_postbuild_bytes;
     VkAccelerationStructureKHR accel_src = VK_NULL_HANDLE;
 };
 
@@ -3048,27 +3052,48 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 }
             }
         } else if (const auto* copy = std::get_if<CopyAccelerationStructure>(&command)) {
-            // XDXR only (a KHR copy needs VkAccelerationStructureKHR handles and vkCmdCopyAccelerationStructureKHR);
-            // the destination's room bounds the copy, as the size is only known to the GPU.
-            if (!vk.xdxr_copy || !vk.buffer_at || copy->mode > 1) return ReplayResult::unsupported;
-            std::uint64_t room = ~std::uint64_t(0);
+            // XDXR buffers have their own representation. Both live resource ranges bound GPU-side copies.
+            if (!vk.xdxr_copy || !vk.buffer_at || (copy->mode > 1 && !copy->serialization()))
+                return ReplayResult::unsupported;
+            if (copy->serialization() && (!vk.xdxr_serialization_status || statistics_active))
+                return ReplayResult::unsupported;
             VkBuffer buffer = VK_NULL_HANDLE;
             VkDeviceSize offset = 0;
-            if (!vk.buffer_at(copy->dst_va, room, buffer, offset)) return ReplayResult::unresolved_resource;
-            std::uint64_t source = ~std::uint64_t(0);
-            if (!vk.buffer_at(copy->src_va, source, buffer, offset)) return ReplayResult::unresolved_resource;
-            p.xdxr_bytes = std::min(room, source);
-        } else if (const auto* info = std::get_if<AccelerationStructurePostbuild>(&command)) {
+            p.xdxr_src_bytes = p.xdxr_dst_bytes = UINT64_MAX;
+            if (!vk.buffer_at(copy->src_va, p.xdxr_src_bytes, buffer, offset) ||
+                !vk.buffer_at(copy->dst_va, p.xdxr_dst_bytes, buffer, offset))
+                return ReplayResult::unresolved_resource;
+            if (copy->serialization()) {
+                const bool deserialize = copy->mode == CopyAccelerationStructure::deserialize;
+                if (p.xdxr_src_bytes < (deserialize ? xdxr::serialized_header_size : 64u) ||
+                    p.xdxr_dst_bytes < (deserialize ? 64u : xdxr::serialized_header_size))
+                    return ReplayResult::invalid_copy;
+            }
+        } else if (const auto* postbuild = std::get_if<AccelerationStructurePostbuild>(&command)) {
             // The KHR path never wrote postbuild values; it keeps skipping them rather than failing the list.
+            const bool serialization = postbuild->type == AccelerationStructurePostbuild::serialization;
             if (!vk.xdxr_postbuild) {
+                if (serialization) return ReplayResult::unsupported;
                 p.skip = true;
             } else {
-                if (!vk.buffer_at || (info->type != 0 && info->type != 3)) return ReplayResult::unsupported;
-                std::uint64_t room = 8 * info->sources.size();
+                if (!vk.buffer_at || (!serialization && postbuild->type != 0 && postbuild->type != 3) ||
+                    (serialization && (!vk.xdxr_serialization_status || statistics_active)))
+                    return ReplayResult::unsupported;
+                const std::uint64_t stride = serialization ? xdxr::serialization_postbuild_size : 8u;
+                const std::uint64_t bytes = stride * postbuild->sources.size();
+                std::uint64_t room = bytes;
                 VkBuffer buffer = VK_NULL_HANDLE;
                 VkDeviceSize offset = 0;
-                if (!vk.buffer_at(info->dest_va, room, buffer, offset)) return ReplayResult::unresolved_resource;
-                if (room < 8 * info->sources.size()) return ReplayResult::invalid_copy;
+                if (!vk.buffer_at(postbuild->dest_va, room, buffer, offset)) return ReplayResult::unresolved_resource;
+                if (room < bytes) return ReplayResult::invalid_copy;
+                if (serialization) {
+                    for (const auto va : postbuild->sources) {
+                        room = UINT64_MAX;
+                        if (!vk.buffer_at(va, room, buffer, offset) || room < 64u)
+                            return ReplayResult::unresolved_resource;
+                        p.xdxr_postbuild_bytes.push_back(room);
+                    }
+                }
             }
         } else if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
             if (!vk.bind_pipeline || !vk.push_constants || !vk.dispatch || !vk.compute_pipeline)
@@ -3952,11 +3977,21 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                    xdxr_build && vk.xdxr_record) {
             vk.xdxr_record(command_buffer, *xdxr_build);
         } else if (const auto* copy = std::get_if<CopyAccelerationStructure>(&command)) {
-            vk.xdxr_copy(command_buffer, copy->src_va, copy->dst_va, p.xdxr_bytes);
-        } else if (const auto* postbuild = std::get_if<AccelerationStructurePostbuild>(&command);
-                   postbuild && !p.skip) {
-            for (std::size_t s = 0; s < postbuild->sources.size(); ++s)
-                vk.xdxr_postbuild(command_buffer, postbuild->sources[s], postbuild->dest_va + 8 * s);
+            const bool serialization = copy->serialization();
+            if (serialization && predicate.buffer) vk.end_conditional_rendering(command_buffer);
+            const auto status = serialization ? vk.xdxr_serialization_status() : 0;
+            vk.xdxr_copy(command_buffer, *copy, p.xdxr_src_bytes, p.xdxr_dst_bytes, status);
+            if (serialization && predicate.buffer) vk.begin_conditional_rendering(command_buffer, &predicate);
+        } else if (const auto* postbuild = std::get_if<AccelerationStructurePostbuild>(&command); postbuild && !p.skip) {
+            const bool serialization = postbuild->type == AccelerationStructurePostbuild::serialization;
+            if (serialization && predicate.buffer) vk.end_conditional_rendering(command_buffer);
+            const std::uint64_t stride = serialization ? xdxr::serialization_postbuild_size : 8u;
+            for (std::size_t source = 0; source < postbuild->sources.size(); ++source) {
+                const auto status = serialization ? vk.xdxr_serialization_status() : 0;
+                vk.xdxr_postbuild(command_buffer, postbuild->sources[source], postbuild->dest_va + stride * source,
+                                 status, serialization ? p.xdxr_postbuild_bytes[source] : 0);
+            }
+            if (serialization && predicate.buffer) vk.begin_conditional_rendering(command_buffer, &predicate);
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             // The build's addresses are console VAs into the GPU address arena (heap_base is its device address).
             // A null VA (no index buffer, no transform) stays null: heap_base + 0 would name the arena's zero page.

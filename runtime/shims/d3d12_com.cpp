@@ -11,6 +11,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cmath>
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -184,7 +185,7 @@ class GraphicsCommandList final
 public:
     // {2f8a7c33-91d4-4b6e-8e05-6d3f1a9b2c47}
     static constexpr GUID kTag{0x2f8a7c33, 0x91d4, 0x4b6e, {0x8e, 0x05, 0x6d, 0x3f, 0x1a, 0x9b, 0x2c, 0x47}};
-    explicit GraphicsCommandList(D3D12_COMMAND_LIST_TYPE type) : type_(type) {}
+    explicit GraphicsCommandList(D3D12_COMMAND_LIST_TYPE type, bool xdxr) : type_(type), xdxr_(xdxr) {}
     ~GraphicsCommandList() override {
         stop_recording();
         release_held();
@@ -849,7 +850,7 @@ public:
     void STDMETHODCALLTYPE BuildRaytracingAccelerationStructure(
         const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* desc, UINT postbuild_count,
         const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* postbuild) override {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || !desc) return check(false);
+        if (!supports_raytracing_commands() || !desc) return check(false);
         if (postbuild_count && !postbuild) return check(false);
         for (UINT i = 0; i < postbuild_count; ++i) {
             if (!valid_postbuild_info_type(postbuild[i].InfoType)) return check(false);
@@ -862,6 +863,140 @@ public:
             in.DescsLayout != D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS)
             return check(false);
         leonida::BuildAccelerationStructure cmd{};
+        if (!read_acceleration_structure_build(*desc, cmd)) return check(false);
+        const std::uint64_t built = cmd.dst_va;
+        const bool recorded = list_.build_acceleration_structure(std::move(cmd));
+        check(recorded);
+        if (!recorded) return;
+        // D3D12 orders postbuild results after the build.
+        for (UINT i = 0; postbuild && i < postbuild_count; ++i) {
+            const bool ok = list_.acceleration_structure_postbuild(
+                {postbuild[i].DestBuffer, static_cast<std::uint32_t>(postbuild[i].InfoType), {built}});
+            check(ok);
+            if (!ok) return;
+        }
+    }
+
+    HRESULT build_xdxr_batch(UINT count, const leonida::xdxr::BatchedDesc2* descs) {
+        if (!xdxr_ || !supports_raytracing_commands())
+            return reject_xdxr_batch("a direct or compute XDXR command list is required", E_NOTIMPL);
+        if (list_.closed() || (count && !descs)) return E_INVALIDARG;
+
+        using namespace leonida;
+        struct Entry {
+            BuildAccelerationStructure build;
+            std::vector<AccelerationStructurePostbuild> postbuild;
+        };
+        constexpr UINT build_flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE |
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION |
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE |
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD |
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_MINIMIZE_MEMORY |
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+        std::vector<Entry> batch;
+        for (UINT i = 0; i < count; ++i) {
+            const auto& batched = descs[i];
+            const auto& inputs = batched.inputs;
+            if (inputs.type > D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL ||
+                inputs.descs_layout > D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS || (inputs.flags & ~build_flags) ||
+                (inputs.type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL &&
+                 inputs.descs_layout != D3D12_ELEMENTS_LAYOUT_ARRAY) ||
+                batched.dest_acceleration_structure_data % D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT ||
+                (batched.num_postbuild_info_descs && !batched.postbuild_info_descs))
+                return reject_xdxr_batch("invalid build descriptor");
+            if (!supported_xdxr_stream(batched.stream, inputs))
+                return reject_xdxr_batch("unsupported XDXR stream settings");
+
+            D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC desc;
+            static_assert(sizeof(desc) == offsetof(xdxr::BatchedDesc2, num_postbuild_info_descs));
+            std::memcpy(&desc, &batched, sizeof(desc));
+            auto& entry = batch.emplace_back();
+            auto& build = entry.build;
+            XdxrLayout layout;
+            if (!read_acceleration_structure_build(desc, build) || !build.dst_va || !build.scratch_va ||
+                (build.instance_count && !build.instances_va) || !VulkanContext::xdxr_inputs(build, nullptr, 0) ||
+                !layout.compute(VulkanContext::xdxr_elements(build), build.is_tlas))
+                return reject_xdxr_batch("unsupported XDXR build inputs");
+            if (std::any_of(build.triangles.begin(), build.triangles.end(), [](const auto& triangle) {
+                    return triangle.index_count && !triangle.index_type;
+                }))
+                return reject_xdxr_batch("unsupported XDXR index format");
+
+            for (UINT j = 0; j < batched.num_postbuild_info_descs; ++j) {
+                const auto& info = batched.postbuild_info_descs[j];
+                if (!info.dest_buffer || info.dest_buffer % 8 ||
+                    (info.info_type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE &&
+                     info.info_type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_CURRENT_SIZE &&
+                     info.info_type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_SERIALIZATION))
+                    return reject_xdxr_batch("unsupported postbuild info");
+                entry.postbuild.push_back({info.dest_buffer, info.info_type, {build.dst_va}});
+            }
+        }
+
+        // The batch can reuse scratch or consume a BLAS built by an earlier entry. Order the builds on replay.
+        for (std::size_t i = 0; i < batch.size(); ++i) {
+            if (i) check(list_.uav_barrier({}));
+            check(list_.build_acceleration_structure(std::move(batch[i].build)));
+            for (auto& info : batch[i].postbuild) check(list_.acceleration_structure_postbuild(std::move(info)));
+        }
+        return S_OK;
+    }
+
+private:
+    bool supports_raytracing_commands() const {
+        return type_ == D3D12_COMMAND_LIST_TYPE_DIRECT || type_ == D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    }
+
+    static HRESULT reject_xdxr_batch(const char* reason, HRESULT result = E_INVALIDARG) {
+        std::fprintf(stderr, "[rt] d3d12: BuildRaytracingAccelerationStructureBatched2X rejected: %s\n", reason);
+        return result;
+    }
+
+    static bool supported_xdxr_stream(const leonida::xdxr::StreamDesc& stream,
+                                      const leonida::xdxr::BuildInputs& inputs) {
+        using namespace leonida::xdxr;
+        if (!stream.size_in_bytes || !stream.stream) return true;  // measured default
+        if (stream.size_in_bytes % sizeof(StreamRecord) || stream.size_in_bytes > PTRDIFF_MAX) return false;
+        const auto* bytes = static_cast<const unsigned char*>(stream.stream);
+        bool seen[3]{};
+        for (std::size_t offset = 0; offset < stream.size_in_bytes; offset += sizeof(StreamRecord)) {
+            std::uint32_t type = 0;
+            std::memcpy(&type, bytes + offset, sizeof(type));
+            if (type > 2) return false;
+            if (seen[type]) continue;  // the first record of each type supplies its settings
+            seen[type] = true;
+            switch (type) {
+            case 0: {
+                StreamRecord0 record;
+                std::memcpy(&record, bytes + offset, sizeof(record));
+                if (record.value_04 != -1.0f || !std::isfinite(record.value_08) ||
+                    (record.value_08 >= 0.0f && record.value_08 != default_record0_value_08(inputs.flags)) ||
+                    record.bytes_0c[0] || record.bytes_0c[1] || record.bytes_0c[2] || record.bytes_0c[3])
+                    return false;
+                break;
+            }
+            case 1: {
+                StreamRecord1 record;
+                std::memcpy(&record, bytes + offset, sizeof(record));
+                if (inputs.type == 0 ? record.flag_0e != 0 : record.level_0d != 0) return false;
+                break;
+            }
+            case 2: {
+                StreamRecord2 record;
+                std::memcpy(&record, bytes + offset, sizeof(record));
+                if ((record.count_08 != -1.0f && record.count_08 != 0.2f) ||
+                    (record.value_0c != 0.0f && record.value_0c != 0.75f))
+                    return false;
+                break;
+            }
+            }
+        }
+        return true;
+    }
+
+    static bool read_acceleration_structure_build(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC& desc,
+                                                  leonida::BuildAccelerationStructure& cmd) {
+        const auto& in = desc.Inputs;
         cmd.is_tlas = (in.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL);
         cmd.update = (in.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE) != 0;
         if (in.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE)
@@ -874,9 +1009,9 @@ public:
             cmd.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
         if (in.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_MINIMIZE_MEMORY)
             cmd.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_LOW_MEMORY_BIT_KHR;   // XDXR: BOX16 nodes (BLAS)
-        cmd.dst_va = desc->DestAccelerationStructureData;
-        cmd.src_va = desc->SourceAccelerationStructureData;
-        cmd.scratch_va = desc->ScratchAccelerationStructureData;
+        cmd.dst_va = desc.DestAccelerationStructureData;
+        cmd.src_va = desc.SourceAccelerationStructureData;
+        cmd.scratch_va = desc.ScratchAccelerationStructureData;
         if (cmd.is_tlas) {
             cmd.instances_va = in.InstanceDescs;
             cmd.instance_count = in.NumDescs;
@@ -887,7 +1022,9 @@ public:
                     (in.DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS)
                         ? (in.ppGeometryDescs ? in.ppGeometryDescs[i] : nullptr)
                         : (in.pGeometryDescs ? &in.pGeometryDescs[i] : nullptr);
-                if (!gd || gd->Type != D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES) return check(false);
+                if (!gd || gd->Type != D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES ||
+                    gd->Triangles.VertexBuffer.StrideInBytes > UINT32_MAX)
+                    return false;
                 leonida::RtTriangleGeometry t{};
                 t.vertex_va = gd->Triangles.VertexBuffer.StartAddress;
                 t.vertex_count = gd->Triangles.VertexCount;
@@ -915,26 +1052,14 @@ public:
                 cmd.triangles.push_back(t);
             }
         }
-        const std::uint64_t built = cmd.dst_va;
-        const bool recorded = list_.build_acceleration_structure(std::move(cmd));
-        check(recorded);
-        if (!recorded) return;
-        // The postbuild values of the structure just built, after it (D3D12 orders them after the build).
-        for (UINT i = 0; postbuild && i < postbuild_count; ++i) {
-            leonida::AccelerationStructurePostbuild info{};
-            info.dest_va = postbuild[i].DestBuffer;
-            info.type = static_cast<std::uint32_t>(postbuild[i].InfoType);
-            info.sources = {built};
-            const bool ok = list_.acceleration_structure_postbuild(std::move(info));
-            check(ok);
-            if (!ok) return;
-        }
+        return true;
     }
 
+public:
     void STDMETHODCALLTYPE EmitRaytracingAccelerationStructurePostbuildInfo(
         const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* desc, UINT count,
         const D3D12_GPU_VIRTUAL_ADDRESS* sources) override {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || !desc || !count || !sources) return check(false);
+        if (!supports_raytracing_commands() || !desc || !count || !sources) return check(false);
         if (!valid_postbuild_info_type(desc->InfoType)) return check(false);
         leonida::AccelerationStructurePostbuild info{};
         info.dest_va = desc->DestBuffer;
@@ -946,7 +1071,7 @@ public:
     void STDMETHODCALLTYPE CopyRaytracingAccelerationStructure(D3D12_GPU_VIRTUAL_ADDRESS dest,
                                                                D3D12_GPU_VIRTUAL_ADDRESS source,
                                                                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode) override {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (!supports_raytracing_commands()) return check(false);
         if (!valid_copy_mode(mode)) return check(false);
         check(list_.copy_acceleration_structure({dest, source, static_cast<std::uint32_t>(mode)}));
     }
@@ -1175,6 +1300,7 @@ private:
     }
 
     D3D12_COMMAND_LIST_TYPE type_;
+    bool xdxr_;
     CommandAllocator* allocator_ = nullptr;  // referenced while the list is open
     leonida::CommandList list_;
     bool invalid_ = false;
@@ -1876,7 +2002,7 @@ HRESULT create_command_allocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void
 }
 
 HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator, REFIID riid,
-                            void** out, IUnknown* device, ID3D12PipelineState* initial_state) {
+                            void** out, IUnknown* device, ID3D12PipelineState* initial_state, bool xdxr) {
     if (out) *out = nullptr;
     CommandAllocator* command_allocator = CommandAllocator::from(allocator);
     if (!command_allocator || command_allocator->type() != type) return E_INVALIDARG;
@@ -1887,7 +2013,7 @@ HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator
     if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_BUNDLE &&
         type != D3D12_COMMAND_LIST_TYPE_COMPUTE && type != D3D12_COMMAND_LIST_TYPE_COPY)
         stub("create_command_list(non-direct type)");
-    auto* object = new GraphicsCommandList(type);  // created open, as D3D12 does
+    auto* object = new GraphicsCommandList(type, xdxr);  // created open, as D3D12 does
     object->record_into(command_allocator);
     object->attach_device(device);
     const HRESULT hr = hand_out(object, riid, out);  // releases the creation reference, so a failure frees the list
@@ -1896,6 +2022,12 @@ HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator
         if (GraphicsCommandList* list = GraphicsCommandList::from(static_cast<IUnknown*>(*out)))
             list->set_initial_pipeline(initial_state);
     return hr;
+}
+
+HRESULT build_xdxr_acceleration_structures(ID3D12GraphicsCommandList* list, UINT count,
+                                          const leonida::xdxr::BatchedDesc2* descs) {
+    auto* command_list = GraphicsCommandList::from(list);
+    return command_list ? command_list->build_xdxr_batch(count, descs) : E_INVALIDARG;
 }
 
 HRESULT create_fence(leonida::VulkanContext& context, UINT64 initial_value, D3D12_FENCE_FLAGS flags, REFIID riid,

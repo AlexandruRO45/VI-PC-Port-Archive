@@ -76,7 +76,9 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint
 const uint MODE_INIT = 0u, MODE_TRIANGLES = 1u, MODE_INSTANCES = 2u, MODE_MORTON = 3u, MODE_KARRAS = 4u,
            MODE_NODES = 5u, MODE_HEADER = 6u, MODE_RADIX_COUNT = 7u, MODE_RADIX_SCAN = 8u, MODE_RADIX_SCATTER = 9u,
            MODE_SMALL_SORT = 10u, MODE_COPY_AS = 12u, MODE_POSTBUILD = 13u, MODE_KEPT = 14u,
-           MODE_KEPT_SCAN = 15u, MODE_KEPT_INDEX = 16u, MODE_PROPAGATE = 17u, MODE_CLEAR = 18u;
+           MODE_KEPT_SCAN = 15u, MODE_KEPT_INDEX = 16u, MODE_PROPAGATE = 17u, MODE_CLEAR = 18u,
+           MODE_SERIAL_VALIDATE = 19u, MODE_SERIAL_POINTERS = 20u, MODE_SERIAL_COPY = 21u,
+           MODE_SERIAL_POSTBUILD = 22u;
 const uint SMALL_SORT_MAX = 1024u;          // xdxr_build.h XdxrLayout::small_sort_max
 const uint RADIX_BITS = 4u, RADIX_BINS = 16u, RADIX_PASSES = 8u;
 const uint RADIX_TILE = 256u;              // elements per workgroup in count and scatter: 4 chunks of 64
@@ -759,6 +761,141 @@ void build_header() {
     store(pc.dst, 60u, 0u);                              // compressionParams: uncompressed
 }
 
+// D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE_HEADER, then one VA per TLAS instance and the BVH4 bytes.
+// The GUID names Leonida's format, and the following 16 bytes version it (xdxr_descs.h).
+const uint SERIAL_HEADER = 56u, BVH_HEADER = 64u;
+const uint SERIAL_ID[8] = uint[8](0x31ce7ef2u, 0x4e257020u, 0x5272039fu, 0xc85eac1bu, 2u, 0u, 0u, 0u);
+const uint SERIAL_BAD_IDENTIFIER = 1u, SERIAL_BAD_LAYOUT = 2u, SERIAL_BAD_REFERENCE = 3u;
+const uint SERIAL_BAD_ROOT = 4u;
+
+// RT-151: totalSizeIn64BNodes excludes the 64-byte header. Check the count before adding it.
+// Keep the root and size checks together. RT-214 (#3315) adds a 64-byte BOX16 root plus a spare unit.
+uint runtime_bvh_bytes(uvec2 bvh, uint available, out uint references, out uint error) {
+    references = 0u;
+    error = SERIAL_BAD_LAYOUT;
+    if (available < BVH_HEADER) return 0u;
+    uint flags = load(bvh, 0u);
+    uint units = load(bvh, 4u);
+    if ((flags & ~FLAG_BOTTOM_LEVEL) != VERSION_2403 || units < 2u || units >= available / BVH_HEADER ||
+        load(bvh, 60u) != 0u)
+        return 0u;
+    uint size = (units + 1u) * BVH_HEADER;
+    uint nodes = load(bvh, 40u);
+    uint root = load(bvh, 48u);
+    uint elements = load(bvh, 52u);
+    if ((root & 7u) != BOX32) {
+        error = SERIAL_BAD_ROOT;
+        return 0u;
+    }
+    if (elements < BVH_HEADER || elements > nodes || (elements | nodes) % 64u != 0u ||
+        nodes > size - 128u || ptr_unit(root) < nodes / 64u ||
+        ptr_unit(root) > (size - 128u) / 64u)
+        return 0u;
+    bool top_level = (flags & FLAG_BOTTOM_LEVEL) == 0u;
+    uint count = load(bvh, 12u);
+    uint element_size = top_level ? 128u : 64u;
+    if (count != (nodes - elements) / element_size || (nodes - elements) % element_size != 0u) return 0u;
+    references = top_level ? count : 0u;
+    error = 0u;
+    return size;
+}
+
+bool addr_less(uvec2 a, uvec2 b) {
+    return a.y < b.y || (a.y == b.y && a.x < b.x);
+}
+
+uint serialized_bvh_offset(uint references) { return SERIAL_HEADER + 8u * references; }
+
+uint validate_serial_copy() {
+    // arg0/arg1 are the sizes of the live buffer ranges; arg2 selects deserialize.
+    uint references, error;
+    uint read_size, write_size;
+    if (pc.arg2 == 0u) {
+        read_size = runtime_bvh_bytes(pc.src0, pc.arg0, references, error);
+        if (error != 0u) return error;
+        uint prefix = serialized_bvh_offset(references);
+        if (prefix > pc.arg1 || read_size > pc.arg1 - prefix) return SERIAL_BAD_LAYOUT;
+        write_size = prefix + read_size;
+    } else {
+        if (pc.arg0 < SERIAL_HEADER) return SERIAL_BAD_LAYOUT;
+        for (uint i = 0u; i < 8u; ++i)
+            if (load(pc.src0, i * 4u) != SERIAL_ID[i]) return SERIAL_BAD_IDENTIFIER;
+        read_size = load(pc.src0, 32u);
+        write_size = load(pc.src0, 40u);
+        uint header_references = load(pc.src0, 48u);
+        if (load(pc.src0, 36u) != 0u || load(pc.src0, 44u) != 0u || load(pc.src0, 52u) != 0u ||
+            read_size < SERIAL_HEADER || read_size > pc.arg0 || write_size > pc.arg1 ||
+            header_references > (read_size - SERIAL_HEADER) / 8u)
+            return SERIAL_BAD_LAYOUT;
+        uint prefix = serialized_bvh_offset(header_references);
+        uint payload = runtime_bvh_bytes(add(pc.src0, prefix), read_size - prefix, references, error);
+        if (error != 0u) return error;
+        if (payload != write_size || payload != read_size - prefix || references != header_references)
+            return SERIAL_BAD_LAYOUT;
+    }
+    if (addr_less(pc.src0, add(pc.dst, write_size)) && addr_less(pc.dst, add(pc.src0, read_size)))
+        return SERIAL_BAD_LAYOUT;
+    return 0u;
+}
+
+uint instance_addresses_offset(uvec2 bvh) { return load(bvh, 52u) + 60u; }
+uint serialized_pointer_offset(uint instance) { return SERIAL_HEADER + 8u * instance; }
+
+void validate_blas_addresses(uint lane) {
+    // Only the preceding dispatch writes the initial status. All failing lanes set the same error.
+    uint references = load(pc.src0, 48u);
+    if (references > (pc.arg0 - SERIAL_HEADER) / 8u) return;
+    uvec2 bvh = add(pc.src0, serialized_bvh_offset(references));
+    uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    for (uint i = lane; i < references; i += stride) {
+        uvec2 va = uvec2(load(pc.src0, serialized_pointer_offset(i)), load(pc.src0, serialized_pointer_offset(i) + 4u));
+        uint old_va = load(bvh, instance_addresses_offset(bvh) + 128u * i);
+        if (va.x % 256u != 0u || va.y > 255u || ((va.x | va.y) == 0u) != (old_va == 0u)) {
+            atomicExchange(at(pc.scratch, 4u).w[0], SERIAL_BAD_REFERENCE);
+            return;
+        }
+    }
+}
+
+void copy_serial_bvh(uint lane) {
+    const uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    if (pc.arg2 == 0u) {
+        uint references, error;
+        uint size = runtime_bvh_bytes(pc.src0, pc.arg0, references, error);
+        uint prefix = serialized_bvh_offset(references);
+        if (lane == 0u) {
+            for (uint i = 0u; i < 8u; ++i) store(pc.dst, 4u * i, SERIAL_ID[i]);
+            store(pc.dst, 32u, prefix + size); store(pc.dst, 36u, 0u);
+            store(pc.dst, 40u, size);          store(pc.dst, 44u, 0u);
+            store(pc.dst, 48u, references);    store(pc.dst, 52u, 0u);
+        }
+        for (uint i = lane; i < references; i += stride) {
+            uint va_units = load(pc.src0, instance_addresses_offset(pc.src0) + 128u * i);
+            store(pc.dst, serialized_pointer_offset(i), va_units << 8u);
+            store(pc.dst, serialized_pointer_offset(i) + 4u, va_units >> 24u);
+        }
+        for (uint i = lane; i < size / 4u; i += stride)
+            store(pc.dst, prefix + 4u * i, load(pc.src0, 4u * i));
+    } else {
+        uint references = load(pc.src0, 48u);
+        uint size = load(pc.src0, 40u);
+        uvec2 bvh = add(pc.src0, serialized_bvh_offset(references));
+        uint addresses = instance_addresses_offset(bvh);
+        for (uint i = lane; i < size / 4u; i += stride) {
+            uint offset = 4u * i;
+            uint value = load(bvh, offset);
+            if (offset >= addresses && (offset - addresses) % 128u == 0u) {
+                uint instance = (offset - addresses) / 128u;
+                if (instance < references) {
+                    uint va_offset = serialized_pointer_offset(instance);
+                    value = (load(pc.src0, va_offset) >> 8u) | (load(pc.src0, va_offset + 4u) << 24u);
+                }
+            }
+            store(pc.dst, offset, value);
+        }
+    }
+}
+
 void main() {
     uint i = gl_GlobalInvocationID.x;
     // the radix and kept modes use shared memory and barriers: every invocation of a workgroup takes part
@@ -780,6 +917,31 @@ void main() {
         return;
     }
     if (i >= pc.count) return;
+    if (pc.mode == MODE_SERIAL_VALIDATE) {
+        store(pc.scratch, 0u, validate_serial_copy());
+        store(pc.scratch, 4u, 0u);
+        return;
+    }
+    if (pc.mode == MODE_SERIAL_POINTERS) {
+        if (load(pc.scratch, 0u) == 0u) validate_blas_addresses(i);
+        return;
+    }
+    if (pc.mode == MODE_SERIAL_COPY) {
+        if (load(pc.scratch, 0u) == 0u && load(pc.scratch, 4u) == 0u) copy_serial_bvh(i);
+        return;
+    }
+    if (pc.mode == MODE_SERIAL_POSTBUILD) {
+        uint references, error;
+        uint size = runtime_bvh_bytes(pc.src0, pc.arg0, references, error);
+        store(pc.scratch, 0u, error);
+        store(pc.scratch, 4u, 0u);
+        uint prefix = serialized_bvh_offset(references);
+        store(pc.dst, 0u, size == 0u ? 0u : prefix + size);
+        store(pc.dst, 4u, size != 0u && prefix > 0xffffffffu - size ? 1u : 0u);
+        store(pc.dst, 8u, references);
+        store(pc.dst, 12u, 0u);
+        return;
+    }
     if (pc.mode == MODE_POSTBUILD) {
         if (i == 0u) { store(pc.dst, 0u, (load(pc.src0, 4u) + 1u) * 64u); store(pc.dst, 4u, 0u); }
         return;

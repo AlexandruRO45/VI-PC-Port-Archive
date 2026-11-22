@@ -194,9 +194,35 @@ public:
         return true;
     }
 
-    // One postbuild value (COMPACTED_SIZE or CURRENT_SIZE, the same for these builds): 8 bytes at `dst` for the
-    // structure at `src`. A barrier first: a build or copy recorded just before writes the header it reads.
-    bool record_postbuild(VkCommandBuffer cb, std::uint64_t src, std::uint64_t dst) {
+    // Validate the GPU-resident header and pointer table before writing any destination bytes. The queue reads the
+    // two status words after completion. Each dispatch uses a grid-stride loop for large buffers.
+    bool record_serial_copy(VkCommandBuffer cb, std::uint64_t src, std::uint64_t dst, std::uint64_t src_bytes,
+                            std::uint64_t dst_bytes, std::uint64_t status, bool deserialize) {
+        if (!loaded_ || !src || !dst || !status) return false;
+        vk_.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+        Push p{};
+        p.src0 = split(src);
+        p.dst = split(dst);
+        p.scratch = split(status);
+        p.arg0 = std::uint32_t(std::min<std::uint64_t>(src_bytes, UINT32_MAX));
+        p.arg1 = std::uint32_t(std::min<std::uint64_t>(dst_bytes, UINT32_MAX));
+        p.arg2 = deserialize ? 1u : 0u;
+        p.mode = mode_serial_validate;
+        p.count = 1;
+        dispatch(cb, p, p.count);
+        p.count = std::min(65536u, std::min(p.arg0, p.arg1) / 4u);
+        if (deserialize) {
+            p.mode = mode_serial_pointers;
+            dispatch(cb, p, p.count);
+        }
+        p.mode = mode_serial_copy;
+        dispatch(cb, p, p.count, false);
+        return true;
+    }
+
+    // A barrier first: a build or copy recorded just before writes the header it reads.
+    bool record_postbuild(VkCommandBuffer cb, std::uint64_t src, std::uint64_t dst, std::uint64_t status = 0,
+                          std::uint64_t src_bytes = 0) {
         if (!loaded_ || !src || !dst) return false;
         VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT,
                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
@@ -204,10 +230,12 @@ public:
                                  &b, 0, nullptr, 0, nullptr);
         vk_.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
         Push p{};
-        p.mode = mode_postbuild;
+        p.mode = status ? mode_serial_postbuild : mode_postbuild;
         p.src0 = split(src);
         p.dst = split(dst);
+        p.scratch = split(status);
         p.count = 1;
+        p.arg0 = std::uint32_t(std::min<std::uint64_t>(src_bytes, UINT32_MAX));
         dispatch(cb, p, 1, false);
         return true;
     }
@@ -217,7 +245,8 @@ private:
         mode_init = 0, mode_triangles = 1, mode_instances = 2, mode_morton = 3, mode_karras = 4, mode_nodes = 5,
         mode_header = 6, mode_radix_count = 7, mode_radix_scan = 8, mode_radix_scatter = 9, mode_small_sort = 10,
         mode_copy_as = 12, mode_postbuild = 13, mode_kept = 14, mode_kept_scan = 15,
-        mode_kept_index = 16, mode_propagate = 17, mode_clear = 18
+        mode_kept_index = 16, mode_propagate = 17, mode_clear = 18,
+        mode_serial_validate = 19, mode_serial_pointers = 20, mode_serial_copy = 21, mode_serial_postbuild = 22
     };
     struct Addr { std::uint32_t lo = 0, hi = 0; };
     struct Push {  // xdxr_build.comp `Push`, std430 push-constant layout

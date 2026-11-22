@@ -634,8 +634,12 @@ struct BuildAccelerationStructure {
 };
 
 // CopyRaytracingAccelerationStructure. `mode` is D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE; replay supports
-// CLONE (0) and COMPACT (1) for XDXR structures.
+// CLONE (0), COMPACT (1), SERIALIZE (3) and DESERIALIZE (4) for XDXR structures.
 struct CopyAccelerationStructure {
+    static constexpr std::uint32_t serialize = 3, deserialize = 4;
+
+    bool serialization() const { return mode == serialize || mode == deserialize; }
+
     std::uint64_t dst_va = 0;
     std::uint64_t src_va = 0;
     std::uint32_t mode = 0;
@@ -643,8 +647,10 @@ struct CopyAccelerationStructure {
 
 // EmitRaytracingAccelerationStructurePostbuildInfo, and each postbuild desc of BuildRaytracingAccelerationStructure:
 // one value per source, consecutively from `dest_va`. `type` is D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_TYPE;
-// replay supports COMPACTED_SIZE (0) and CURRENT_SIZE (3), 8 bytes each.
+// replay supports COMPACTED_SIZE (0), CURRENT_SIZE (3) and SERIALIZATION (2).
 struct AccelerationStructurePostbuild {
+    static constexpr std::uint32_t serialization = 2;
+
     std::uint64_t dest_va = 0;
     std::uint32_t type = 0;
     std::vector<std::uint64_t> sources;

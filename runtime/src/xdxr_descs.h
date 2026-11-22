@@ -4,10 +4,18 @@
 // Windows SDK, and xdxr_descs_test checks it against d3d12.h where that is available.
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
 namespace leonida::xdxr {
+
+// DriverMatchingIdentifier words as stored by xdxr_build.comp (little-endian GUID and version).
+// Version 2 uses the RT-151 size field. Version 1 was used by the pre-RT-151 development branch.
+inline constexpr std::array<std::uint32_t, 8> serialized_identifier{
+    0x31ce7ef2u, 0x4e257020u, 0x5272039fu, 0xc85eac1bu, 2u, 0u, 0u, 0u};
+inline constexpr std::uint32_t serialized_header_size = 56;
+inline constexpr std::uint32_t serialization_postbuild_size = 16;
 
 // D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS (public layout).
 struct BuildInputs {

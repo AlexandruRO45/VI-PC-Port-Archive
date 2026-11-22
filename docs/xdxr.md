@@ -118,3 +118,22 @@ None of the 15 other DLLs in the package names the type or an offline builder.
 - The offline statistics layout (§4). It is not in the package: the one DLL that knows the type only rejects or
   skips it (RT-155). A runtime doesn't need it, because the shipped builder refuses the request.
 - Whether the game passes a non-empty stream desc at all. That needs the executable's call sites (RT-5).
+
+## 6. Standalone Vulkan runtime
+
+`rt::d3d12::build_xdxr_acceleration_structures` takes an XDXR direct or compute list and an array of
+`BatchedDesc2`. It validates the whole batch before recording. Each descriptor goes through the standard XDXR
+build and its postbuild operations. A UAV barrier between entries allows scratch reuse and makes an earlier
+BLAS available to a later TLAS. The adapter accepts empty streams and the measured default settings. A record
+type or setting with unknown runtime behavior is rejected. Supported postbuild types are compacted size,
+current size and serialization size. The adapter uses a named runtime entry point. The shipping Xbox call
+route still needs a measured binding.
+
+The D3D12 serialize and deserialize modes use a 56-byte public header, an array of 64-bit BLAS addresses for
+the TLAS instances in order, then the raw runtime BVH4 payload. Its size comes from the RT-151 BVH4 field
+(`64 * (totalSizeIn64BNodes + 1)` bytes). BLAS blobs have no address array. The header's driver identifier
+identifies the runtime format and version. A deserialized TLAS takes its BLAS addresses from
+the array, so callers can restore each original BLAS at a different VA. Serialized payloads must fit in a 32-bit
+byte range and contain the uncompressed runtime format with a BOX32 root. An unsupported root produces a
+diagnostic, and a serialization size query returns zero for it. Invalid blobs leave the destination untouched
+and the queue logs the failed validation when it retires the submission.

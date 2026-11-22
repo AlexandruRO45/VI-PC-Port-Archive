@@ -3423,14 +3423,16 @@ Vulkan AS would be invisible to them. Two paths:
    DEFAULT and READBACK lists are refused as `unsupported` before submission, since their mapped bytes can still hold
    an earlier frame's pointers when the CPU prepares the build. Completed staging buffers
    are reused, so a per-frame rebuild does not allocate memory each frame. Updates refit the source structure instead of rebuilding it, `CopyRaytracingAccelerationStructure` clones and compacts, and the
-   postbuild compacted and current sizes are written ([bvh.md](bvh.md) §7a). Serialization and the Xbox
-   batched/streaming builds are not implemented. The
+   postbuild compacted and current sizes are written ([bvh.md](bvh.md) §7a). XDXR serialization writes the public
+   D3D12 header, the TLAS BLAS-address array, and the runtime BVH4 payload. Deserialization validates the
+   format identifier and sizes on the GPU and applies the caller's BLAS addresses. The runtime's batch adapter
+   records the measured Xbox descriptors with the standard build path ([xdxr.md](xdxr.md) §6). The
    reported `RaytracingTier` is unchanged (`NOT_SUPPORTED`). Checked by `runtime/test/d3d12_xdxr_rt_test.cpp` through
-   the D3D12 API.
+   the D3D12 API, including XDXR serialization and batched builds.
 
 **Open:** which path the game uses. Resolve by logging the first call to the standard AS methods and by tracing the
-builder's command-list usage. If XDXR batched/streaming builds are used, their structs and compression formats need
-to be recovered from call sites (or the NDA GDK headers, if a developer has access); they cannot be guessed.
+builder's command-list usage. The Xbox batch entry point and the behavior of non-default stream settings still
+need to be measured at the game's call sites.
 
 ### 4.9 Xbox-specific surface
 
