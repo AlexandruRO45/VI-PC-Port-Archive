@@ -35,7 +35,9 @@ Standard library Python only: unittest, dataclasses, enum, math, struct.
 Single module scope, zero game data.
 """
 
-from typing import Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
+from dataclasses import dataclass, field
+from enum import Enum, auto
 import math
 import struct
 import unittest
@@ -144,6 +146,153 @@ def ref_mad_i64_i32(s0: int, s1: int, s2: int) -> Tuple[int, int]:
     max_s64 = (1 << 63) - 1
     overflow = 1 if (full_sum < min_s64 or full_sum > max_s64) else 0
     return dst, overflow
+
+
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    """Register and operand addressing modes for AMD RDNA2 VALU."""
+    VGPR = auto()
+    SGPR = auto()
+    VCC = auto()
+    EXEC = auto()
+    LITERAL = auto()
+    INLINE_INT = auto()
+
+
+@dataclass(frozen=True)
+class Operand:
+    """Strongly-typed representation of an instruction operand."""
+    reg_type: RegType
+    index: int = 0
+    size_bits: int = 32
+    literal_val: Optional[int] = None
+
+    @classmethod
+    def vgpr(cls, index: int, size_bits: int = 32) -> Operand:
+        if not (0 <= index < 256):
+            raise ValueError(f"VGPR index out of bounds [0..255]: v{index}")
+        if size_bits == 64 and (index % 2 != 0):
+            raise ValueError(f"64-bit VGPR pair must be even-aligned: v[{index}:{index+1}]")
+        return cls(RegType.VGPR, index=index, size_bits=size_bits)
+
+    @classmethod
+    def sgpr(cls, index: int, size_bits: int = 32) -> Operand:
+        if not (0 <= index < 106):
+            raise ValueError(f"SGPR index out of bounds [0..105]: s{index}")
+        if size_bits == 64 and (index % 2 != 0):
+            raise ValueError(f"64-bit SGPR pair must be even-aligned: s[{index}:{index+1}]")
+        return cls(RegType.SGPR, index=index, size_bits=size_bits)
+
+    @classmethod
+    def vcc(cls, size_bits: int = 64) -> Operand:
+        return cls(RegType.VCC, index=0, size_bits=size_bits)
+
+    @classmethod
+    def literal(cls, val: int, size_bits: int = 32) -> Operand:
+        mask = MASK64 if size_bits == 64 else MASK32
+        return cls(RegType.LITERAL, size_bits=size_bits, literal_val=val & mask)
+
+    @classmethod
+    def inline_int(cls, val: int, size_bits: int = 32) -> Operand:
+        if not (-16 <= val <= 64):
+            raise ValueError(f"Inline integer constant must be in [-16..64]: {val}")
+        return cls(RegType.INLINE_INT, size_bits=size_bits, literal_val=val)
+
+    def disasm_str(self) -> str:
+        if self.reg_type == RegType.VGPR:
+            if self.size_bits == 64:
+                return f"v[{self.index}:{self.index + 1}]"
+            return f"v{self.index}"
+        elif self.reg_type == RegType.SGPR:
+            if self.size_bits == 64:
+                return f"s[{self.index}:{self.index + 1}]"
+            return f"s{self.index}"
+        elif self.reg_type == RegType.VCC:
+            return "vcc"
+        elif self.reg_type == RegType.EXEC:
+            return "exec"
+        elif self.reg_type == RegType.LITERAL:
+            return hex(self.literal_val or 0)
+        elif self.reg_type == RegType.INLINE_INT:
+            return str(self.literal_val or 0)
+        return "unknown"
+
+
+@dataclass
+class VMadU64U32Instruction:
+    """Symbolic AST node for AMD RDNA2 v_mad_u64_u32 instruction."""
+    vdst: Operand
+    sdst: Optional[Operand]
+    src0: Operand
+    src1: Operand
+    src2: Operand
+    is_nc: bool = False
+    opcode: str = "v_mad_u64_u32"
+
+    def __post_init__(self) -> None:
+        if self.is_nc:
+            self.opcode = "v_mad_nc_u64_u32"
+            self.sdst = None
+        self.validate()
+
+    def validate(self) -> None:
+        if self.vdst.reg_type != RegType.VGPR or self.vdst.size_bits != 64:
+            raise ValueError(f"VDST must be a 64-bit VGPR pair, got {self.vdst}")
+        if self.vdst.index % 2 != 0:
+            raise ValueError(f"VDST 64-bit pair must be even-aligned: v{self.vdst.index}")
+        if not self.is_nc:
+            if self.sdst is None:
+                raise ValueError("v_mad_u64_u32 requires SDST (e.g. VCC or SGPR pair)")
+            if self.sdst.reg_type not in (RegType.VCC, RegType.SGPR):
+                raise ValueError(f"SDST must be VCC or SGPR, got {self.sdst.reg_type}")
+        if self.src0.size_bits != 32:
+            raise ValueError(f"src0 must be 32-bit operand, got {self.src0.size_bits}")
+        if self.src1.size_bits != 32:
+            raise ValueError(f"src1 must be 32-bit operand, got {self.src1.size_bits}")
+        if self.src2.size_bits != 64:
+            raise ValueError(f"src2 must be 64-bit operand, got {self.src2.size_bits}")
+
+        # VOP3 literal constraint: at most one 32-bit literal across source operands
+        literals = [s for s in (self.src0, self.src1, self.src2) if s.reg_type == RegType.LITERAL]
+        if len(literals) > 1:
+            raise ValueError(f"VOP3 encoding allows at most 1 literal operand, found {len(literals)}")
+
+    def disasm(self) -> str:
+        if self.is_nc:
+            return f"{self.opcode} {self.vdst.disasm_str()}, {self.src0.disasm_str()}, {self.src1.disasm_str()}, {self.src2.disasm_str()}"
+        assert self.sdst is not None
+        return f"{self.opcode} {self.vdst.disasm_str()}, {self.sdst.disasm_str()}, {self.src0.disasm_str()}, {self.src1.disasm_str()}, {self.src2.disasm_str()}"
+
+
+@dataclass
+class VMadI64I32Instruction:
+    """Symbolic AST node for AMD RDNA2 signed v_mad_i64_i32 instruction."""
+    vdst: Operand
+    sdst: Optional[Operand]
+    src0: Operand
+    src1: Operand
+    src2: Operand
+    opcode: str = "v_mad_i64_i32"
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        if self.vdst.reg_type != RegType.VGPR or self.vdst.size_bits != 64:
+            raise ValueError(f"VDST must be a 64-bit VGPR pair, got {self.vdst}")
+        if self.vdst.index % 2 != 0:
+            raise ValueError(f"VDST 64-bit pair must be even-aligned: v{self.vdst.index}")
+        if self.src0.size_bits != 32 or self.src1.size_bits != 32:
+            raise ValueError("src0 and src1 must be 32-bit operands")
+        if self.src2.size_bits != 64:
+            raise ValueError("src2 must be 64-bit operand")
+
+    def disasm(self) -> str:
+        sdst_str = f", {self.sdst.disasm_str()}" if self.sdst else ""
+        return f"{self.opcode} {self.vdst.disasm_str()}{sdst_str}, {self.src0.disasm_str()}, {self.src1.disasm_str()}, {self.src2.disasm_str()}"
 
 
 class TestValuMadU64U32Oracle(unittest.TestCase):
@@ -303,6 +452,123 @@ class TestValuMadU64U32Oracle(unittest.TestCase):
         self.assertEqual(carry_u, 0)
         self.assertEqual(dst_s, 1)
         self.assertEqual(overflow_s, 0)
+
+
+class TestValuMadU64U32SymbolicAST(unittest.TestCase):
+    """Unit tests for the symbolic AST representations, operand typing, and syntax validation."""
+
+    def test_ast_construction_valid_instruction(self) -> None:
+        inst = VMadU64U32Instruction(
+            vdst=Operand.vgpr(0, size_bits=64),
+            sdst=Operand.vcc(size_bits=64),
+            src0=Operand.vgpr(2, size_bits=32),
+            src1=Operand.sgpr(4, size_bits=32),
+            src2=Operand.vgpr(6, size_bits=64),
+        )
+        self.assertEqual(inst.opcode, "v_mad_u64_u32")
+        self.assertEqual(inst.vdst.index, 0)
+        self.assertEqual(inst.vdst.size_bits, 64)
+        self.assertEqual(inst.src0.index, 2)
+        self.assertEqual(inst.src1.index, 4)
+        self.assertEqual(inst.src2.index, 6)
+        self.assertEqual(inst.disasm(), "v_mad_u64_u32 v[0:1], vcc, v2, s4, v[6:7]")
+
+    def test_ast_non_carry_variant(self) -> None:
+        inst_nc = VMadU64U32Instruction(
+            vdst=Operand.vgpr(2, size_bits=64),
+            sdst=None,
+            src0=Operand.vgpr(4, size_bits=32),
+            src1=Operand.literal(0x1234, size_bits=32),
+            src2=Operand.sgpr(8, size_bits=64),
+            is_nc=True,
+        )
+        self.assertEqual(inst_nc.opcode, "v_mad_nc_u64_u32")
+        self.assertIsNone(inst_nc.sdst)
+        self.assertEqual(inst_nc.disasm(), "v_mad_nc_u64_u32 v[2:3], v4, 0x1234, s[8:9]")
+
+    def test_ast_signed_variant(self) -> None:
+        inst_signed = VMadI64I32Instruction(
+            vdst=Operand.vgpr(4, size_bits=64),
+            sdst=Operand.vcc(size_bits=64),
+            src0=Operand.vgpr(6, size_bits=32),
+            src1=Operand.inline_int(-1, size_bits=32),
+            src2=Operand.vgpr(8, size_bits=64),
+        )
+        self.assertEqual(inst_signed.opcode, "v_mad_i64_i32")
+        self.assertEqual(inst_signed.disasm(), "v_mad_i64_i32 v[4:5], vcc, v6, -1, v[8:9]")
+
+    def test_odd_vgpr_alignment_rejection(self) -> None:
+        with self.assertRaises(ValueError):
+            Operand.vgpr(1, size_bits=64)
+        with self.assertRaises(ValueError):
+            Operand.vgpr(255, size_bits=64)
+
+    def test_odd_sgpr_alignment_rejection(self) -> None:
+        with self.assertRaises(ValueError):
+            Operand.sgpr(3, size_bits=64)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(105, size_bits=64)
+
+    def test_out_of_bounds_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256, size_bits=32)
+        with self.assertRaises(ValueError):
+            Operand.vgpr(-1, size_bits=32)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106, size_bits=32)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(-2, size_bits=32)
+
+    def test_operand_size_mismatch_rejection(self) -> None:
+        # vdst must be 64-bit
+        with self.assertRaises(ValueError):
+            VMadU64U32Instruction(
+                vdst=Operand.vgpr(0, size_bits=32),
+                sdst=Operand.vcc(),
+                src0=Operand.vgpr(2, size_bits=32),
+                src1=Operand.vgpr(3, size_bits=32),
+                src2=Operand.vgpr(4, size_bits=64),
+            )
+        # src0 must be 32-bit
+        with self.assertRaises(ValueError):
+            VMadU64U32Instruction(
+                vdst=Operand.vgpr(0, size_bits=64),
+                sdst=Operand.vcc(),
+                src0=Operand.vgpr(2, size_bits=64),
+                src1=Operand.vgpr(4, size_bits=32),
+                src2=Operand.vgpr(6, size_bits=64),
+            )
+        # src2 must be 64-bit
+        with self.assertRaises(ValueError):
+            VMadU64U32Instruction(
+                vdst=Operand.vgpr(0, size_bits=64),
+                sdst=Operand.vcc(),
+                src0=Operand.vgpr(2, size_bits=32),
+                src1=Operand.vgpr(3, size_bits=32),
+                src2=Operand.vgpr(4, size_bits=32),
+            )
+
+    def test_vop3_multiple_literals_rejection(self) -> None:
+        # VOP3 instructions allow at most 1 literal constant
+        with self.assertRaises(ValueError):
+            VMadU64U32Instruction(
+                vdst=Operand.vgpr(0, size_bits=64),
+                sdst=Operand.vcc(),
+                src0=Operand.literal(10, size_bits=32),
+                src1=Operand.literal(20, size_bits=32),
+                src2=Operand.vgpr(2, size_bits=64),
+            )
+
+    def test_inline_integer_constant_bounds(self) -> None:
+        # Valid inline integers [-16..64]
+        for val in (-16, 0, 1, 64):
+            op = Operand.inline_int(val)
+            self.assertEqual(op.literal_val, val)
+        # Invalid inline integers
+        with self.assertRaises(ValueError):
+            Operand.inline_int(-17)
+        with self.assertRaises(ValueError):
+            Operand.inline_int(65)
 
 
 if __name__ == "__main__":
