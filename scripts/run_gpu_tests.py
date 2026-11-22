@@ -1023,6 +1023,10 @@ def run_suite(a, work: str) -> int:
                 "ps_vop3_const_mods": (0xC0000000, 0xBF800000, 0x3F800000, 0xAAAABC00),
                 "ps_interp_f32_mods": (0x3F800000, 0x00000000, 0x3F400000, 0x3F800000),   # drawn with vs_interp_consts
                 "ps_interp_mov_mods": (0x3F800000, 0x3FC00000, 0x40000000, 0x3F400000),
+                # 64-bit SALU data ops on SGPR pairs that are not lane masks (derivations in the .asm headers)
+                "ps_salu64_bfe": (0x389ABCDE, 0x0000002C, 0x1D2C389A, 0xFFFFFFFE),
+                "ps_salu64_bitset": (0x76543210, 0xDEDCBA98, 0x76543210, 0xFEDCBA9C),
+                "ps_salu64_brev_flbit": (0xB00F0000, 0x1E6A2C48, 47, 44),
             }
             if name in const_wants:
                 ok, detail = check_pixel_const(raw, const_wants[name])
