@@ -36,8 +36,11 @@ Architecture & Specification:
       Vector general-purpose registers (VGPRs) are not modified.
 """
 
+from dataclasses import dataclass, field
+from enum import Enum, auto
+import re
 import unittest
-from typing import Tuple
+from typing import Optional, Tuple
 
 # RDNA2 Local Data Share (LDS) Architectural Constants
 MASK64: int = 0xFFFF_FFFF_FFFF_FFFF  # 64-bit unsigned mask
@@ -237,6 +240,180 @@ class TestReferenceModelAndOracle(unittest.TestCase):
         new_val = lds.atomic_inc_src2_u64(vaddr=0, offset0=idx_a, offset1=idx_b)
         self.assertEqual(new_val, 0)
         self.assertEqual(lds.read_qword(idx_a), 0)
+
+
+# ==============================================================================
+# Phase 2: Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class DSOpcode(Enum):
+    """Data Share (DS) atomic opcodes."""
+    DS_INC_SRC2_U64 = "ds_inc_src2_u64"
+
+
+class RegType(Enum):
+    """Register file classes."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclass(frozen=True)
+class RegisterOperand:
+    """Typed symbolic register operand representation."""
+    index: int
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        max_limit = DEFAULT_NUM_VGPRS if self.reg_type == RegType.VGPR else DEFAULT_NUM_SGPRS
+        if not (0 <= self.index < max_limit):
+            raise ValueError(
+                f"{self.reg_type.name} index out of architectural bounds [0..{max_limit - 1}]: {self.index}"
+            )
+
+    @property
+    def name(self) -> str:
+        return f"{self.reg_type.value}{self.index}"
+
+    def __str__(self) -> str:
+        return self.name
+
+
+@dataclass(frozen=True)
+class LDSAddressExpression:
+    """Dual-source LDS address expression with offset0 and offset1 immediates."""
+    base_reg: RegisterOperand
+    offset0: int = 0
+    offset1: int = 0
+    gds: bool = False
+
+    def __post_init__(self) -> None:
+        if self.base_reg.reg_type != RegType.VGPR:
+            raise TypeError(f"base_reg must be VGPR, got: {self.base_reg.reg_type}")
+        if not (0 <= self.offset0 <= OFFSET8_MASK):
+            raise ValueError(f"offset0 out of bounds [0..{OFFSET8_MASK}]: {self.offset0}")
+        if not (0 <= self.offset1 <= OFFSET8_MASK):
+            raise ValueError(f"offset1 out of bounds [0..{OFFSET8_MASK}]: {self.offset1}")
+
+
+@dataclass(frozen=True)
+class DSIncSrc2U64Instruction:
+    """Symbolic AST node for ds_inc_src2_u64 instruction."""
+    addr: LDSAddressExpression
+    opcode: DSOpcode = DSOpcode.DS_INC_SRC2_U64
+
+    def format_asm(self) -> str:
+        parts = [self.opcode.value, self.addr.base_reg.name]
+        if self.addr.offset0 != 0:
+            parts.append(f"offset0:{self.addr.offset0}")
+        if self.addr.offset1 != 0:
+            parts.append(f"offset1:{self.addr.offset1}")
+        if self.addr.gds:
+            parts.append("gds")
+        return " ".join(parts)
+
+    @classmethod
+    def parse(cls, asm_line: str) -> DSIncSrc2U64Instruction:
+        clean = re.sub(r"//.*|/\*.*?\*/|;.*", "", asm_line).strip()
+        if not clean:
+            raise ValueError("Empty assembly line")
+
+        tokens = [t.strip() for t in clean.replace(",", " ").split() if t.strip()]
+        if len(tokens) < 2:
+            raise ValueError(f"Too few tokens for ds_inc_src2_u64 instruction: '{clean}'")
+
+        op_str = tokens[0].lower()
+        if op_str != DSOpcode.DS_INC_SRC2_U64.value:
+            raise ValueError(f"Expected opcode {DSOpcode.DS_INC_SRC2_U64.value}, got: '{tokens[0]}'")
+
+        m = re.match(r"^v(\d+)$", tokens[1].lower())
+        if not m:
+            raise ValueError(f"Expected base VGPR token (e.g. v0), got: '{tokens[1]}'")
+        base_reg = RegisterOperand(int(m.group(1)), RegType.VGPR)
+
+        offset0 = 0
+        offset1 = 0
+        gds = False
+
+        for extra in tokens[2:]:
+            low = extra.lower()
+            m0 = re.match(r"^offset0:(\d+|0x[0-9a-fA-F]+)$", low)
+            m1 = re.match(r"^offset1:(\d+|0x[0-9a-fA-F]+)$", low)
+            if m0:
+                val = m0.group(1)
+                offset0 = int(val, 16 if val.startswith("0x") else 10)
+            elif m1:
+                val = m1.group(1)
+                offset1 = int(val, 16 if val.startswith("0x") else 10)
+            elif low == "gds":
+                gds = True
+            else:
+                raise ValueError(f"Unrecognized instruction modifier: '{extra}'")
+
+        addr = LDSAddressExpression(base_reg=base_reg, offset0=offset0, offset1=offset1, gds=gds)
+        return cls(addr=addr)
+
+
+class TestSymbolicASTAndInstruction(unittest.TestCase):
+    """Phase 2: Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_instantiation_valid(self) -> None:
+        v0 = RegisterOperand(0, RegType.VGPR)
+        addr = LDSAddressExpression(base_reg=v0, offset0=2, offset1=4)
+        instr = DSIncSrc2U64Instruction(addr=addr)
+
+        self.assertEqual(instr.opcode, DSOpcode.DS_INC_SRC2_U64)
+        self.assertEqual(instr.addr.base_reg.name, "v0")
+        self.assertEqual(instr.addr.offset0, 2)
+        self.assertEqual(instr.addr.offset1, 4)
+        self.assertFalse(instr.addr.gds)
+
+    def test_asm_formatting(self) -> None:
+        v1 = RegisterOperand(1, RegType.VGPR)
+        instr_basic = DSIncSrc2U64Instruction(addr=LDSAddressExpression(base_reg=v1))
+        self.assertEqual(instr_basic.format_asm(), "ds_inc_src2_u64 v1")
+
+        instr_offsets = DSIncSrc2U64Instruction(
+            addr=LDSAddressExpression(base_reg=v1, offset0=10, offset1=20)
+        )
+        self.assertEqual(instr_offsets.format_asm(), "ds_inc_src2_u64 v1 offset0:10 offset1:20")
+
+    def test_asm_parsing_valid(self) -> None:
+        instr1 = DSIncSrc2U64Instruction.parse("ds_inc_src2_u64 v0")
+        self.assertEqual(instr1.addr.base_reg.index, 0)
+        self.assertEqual(instr1.addr.offset0, 0)
+        self.assertEqual(instr1.addr.offset1, 0)
+
+        instr2 = DSIncSrc2U64Instruction.parse("ds_inc_src2_u64 v5 offset0:3 offset1:7 ; comment")
+        self.assertEqual(instr2.addr.base_reg.index, 5)
+        self.assertEqual(instr2.addr.offset0, 3)
+        self.assertEqual(instr2.addr.offset1, 7)
+
+        instr3 = DSIncSrc2U64Instruction.parse("ds_inc_src2_u64 v10 offset0:0x10 offset1:0x20 gds")
+        self.assertEqual(instr3.addr.offset0, 16)
+        self.assertEqual(instr3.addr.offset1, 32)
+        self.assertTrue(instr3.addr.gds)
+
+    def test_syntax_rejection_registers_and_offsets(self) -> None:
+        s0 = RegisterOperand(0, RegType.SGPR)
+        with self.assertRaises(TypeError):
+            LDSAddressExpression(base_reg=s0)
+
+        v0 = RegisterOperand(0, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(base_reg=v0, offset0=-1)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(base_reg=v0, offset0=256)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(base_reg=v0, offset1=-1)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(base_reg=v0, offset1=256)
+
+        with self.assertRaises(ValueError):
+            DSIncSrc2U64Instruction.parse("ds_inc_src2_u32 v0")  # wrong opcode
+        with self.assertRaises(ValueError):
+            DSIncSrc2U64Instruction.parse("ds_inc_src2_u64 s0")  # SGPR not allowed
+        with self.assertRaises(ValueError):
+            DSIncSrc2U64Instruction.parse("ds_inc_src2_u64 v0 bad_token")
 
 
 if __name__ == "__main__":
