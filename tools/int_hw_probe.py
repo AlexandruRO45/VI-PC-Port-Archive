@@ -77,16 +77,6 @@ KNOWN_DIVERGENCES = {
         [0xFFFFFFFF, 0x00000001, 0x00000000, 0x00000001],
         "translator ignores VOP3 clamp on v_add_co_ci_u32 / v_sub_co_ci_u32",
     ),
-    "v_cvt_rpi_precision": (
-        "cvt_rpi_exact_half",
-        [0x00000000, 0x00800001, 0x00FFFFFF, 0x00000000],
-        "hardware computes exact floor(x + 0.5); translator rounds x + 0.5 in binary32 first",
-    ),
-    "v_cvt_flr_rpi_nan_inf": (
-        "cvt_flr_rpi_nan_sign",
-        [0x7FFFFFFF, 0x80000000, 0x7FFFFFFF, 0x80000000],
-        "hardware saturates NaN by sign (+NaN -> 0x7fffffff, -NaN -> 0x80000000); translator gives 0",
-    ),
 }
 
 

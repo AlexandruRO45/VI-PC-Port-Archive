@@ -70,7 +70,8 @@ class IntHwProbeTests(unittest.TestCase):
         self.assertIn("no GPU", err.getvalue())
 
     def test_known_divergence_vs_strict_and_json_output(self):
-        # Mock hardware oracle returning the measured gfx1035 words for valu_cvt_flr_rpi.
+        # Mock hardware oracle returning the measured gfx1035 words for valu_cvt_flr_rpi (now 4/4 match)
+        # and also test KNOWN_DIVERGENCES / --strict with a synthetic pinned divergence.
         measured = {
             "v_cvt_rpi_precision": [0x00000000, 0x00800001, 0x00FFFFFF, 0x00000000],
             "v_cvt_flr_rpi_nan_inf": [0x7FFFFFFF, 0x80000000, 0x7FFFFFFF, 0x80000000],
@@ -83,18 +84,29 @@ class IntHwProbeTests(unittest.TestCase):
             out = io.StringIO()
             with unittest.mock.patch.object(probe, "run_hw", return_value=fake_hw):
                 with redirect_stdout(out):
-                    rc = probe.main(["--oracle", "both", "--group", "valu_cvt_flr_rpi", "--json", jpath])
+                    rc = probe.main(["--oracle", "both", "--group", "valu_cvt_flr_rpi", "--strict", "--json", jpath])
             self.assertEqual(rc, 0)
-            self.assertIn("2 match, 2 known divergence, 0 unexpected mismatch, 0 wave32/64 diff", out.getvalue())
+            self.assertIn("4 match, 0 known divergence, 0 unexpected mismatch, 0 wave32/64 diff", out.getvalue())
             data = json.loads(Path(jpath).read_text(encoding="utf-8"))
             self.assertEqual(data["device"], "device=mock arch=gfx1035")
             self.assertEqual(len(data["cases"]), 4)
 
-            out2 = io.StringIO()
-            with unittest.mock.patch.object(probe, "run_hw", return_value=fake_hw):
-                with redirect_stdout(out2):
+            # Synthetic divergence pinned in KNOWN_DIVERGENCES: passes without --strict, fails with --strict.
+            div_words = dict(measured, v_cvt_flr_edges=[1, 2, 3, 4])
+            div_hw = ("device=mock arch=gfx1035", {32: div_words, 64: div_words})
+            fake_known = {"v_cvt_flr_edges": ("synthetic_div", [1, 2, 3, 4], "synthetic divergence")}
+            with unittest.mock.patch.object(probe, "run_hw", return_value=div_hw), \
+                 unittest.mock.patch.dict(probe.KNOWN_DIVERGENCES, fake_known, clear=True):
+                out_ok = io.StringIO()
+                with redirect_stdout(out_ok):
+                    rc_ok = probe.main(["--oracle", "both", "--group", "valu_cvt_flr_rpi"])
+                self.assertEqual(rc_ok, 0)
+                self.assertIn("3 match, 1 known divergence, 0 unexpected mismatch, 0 wave32/64 diff", out_ok.getvalue())
+
+                out_strict = io.StringIO()
+                with redirect_stdout(out_strict):
                     rc_strict = probe.main(["--oracle", "both", "--group", "valu_cvt_flr_rpi", "--strict"])
-            self.assertEqual(rc_strict, 1)
+                self.assertEqual(rc_strict, 1)
 
             err = io.StringIO()
             with unittest.mock.patch.object(probe, "run_hw", return_value=fake_hw):
