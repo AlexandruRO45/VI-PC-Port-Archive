@@ -128,6 +128,20 @@ Check(ScanCounts.IsFullScan(Index(string.Format(System.Globalization.CultureInfo
 Check(!ScanCounts.IsFullScan(null), "no cached index");
 Console.WriteLine("Cached index tests passed.");
 
+// ASSET-113: AWC Opus frame counts are 48 kHz frames whatever the rate field says, so audio_manifest.json durations
+// divide by 48,000. A 32 kHz tag declaring 58,880 frames is 1.226667 s, not 1.84 s (#1462's corpus example).
+Check(Near(Awc(0x0B, 32000, 58880, 1, 58880).DurationSeconds, 58880 / 48000.0), "32 kHz Opus, +0x0C frames");
+Check(Near(Awc(0x0B, 32000, 9600, 2, null).DurationSeconds, 0.1), "32 kHz stereo Opus, interleaved count halved");
+Check(Near(Awc(0x0B, 48000, 96000, 2, null).DurationSeconds, 1.0), "48 kHz stereo Opus");
+Check(Near(Awc(0x00, 44100, 44100, 1, null).DurationSeconds, 1.0), "PCM keeps its own rate");
+Check(Near(Awc(0x05, 32000, 32000, 1, null).DurationSeconds, 1.0), "XMA2 keeps its own rate");
+Console.WriteLine("AWC duration tests passed.");
+
+static RpfPreview.Core.AwcStreamInfo Awc(int codec, int rate, long samples, int channels, long? frames) =>
+    new(0, 0, rate, samples, codec, 0, 1) { Channels = channels, OpusFrameCountPerChannel = frames };
+
+static bool Near(double a, double b) => Math.Abs(a - b) < 1e-9;
+
 static void Check(bool ok, string what)
 {
     if (!ok) throw new Exception($"Failed: {what}");
