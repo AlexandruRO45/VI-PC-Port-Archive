@@ -158,6 +158,64 @@ BOUNDS = [("cs_bounds", [0x12345678, 0x12345678, 0x00000000, 0xEEEEEEEE]),
           # swizzled MUBUF addressing (RDNA2 ISA 8.1.5) and ADD_TID_ENABLE on lanes 0 and 1, derived in the .asm header
           ("cs_buf_swizzle", [0x5eed0024, 0x5eed0044, 0x5eed004c, 0x5eed0008, 0x5eed0028, 0, 0xbeef0000, 0xbeef0001])]
 CMPX_CLASS_WORDS = [0xEEEEEEEE] * 3 + [0x22] + [0x11] * 4
+def _dot4_carry_words():
+    """cs_w32_dot4_carry.asm's 456 words, from the formulas in its header (the ISA pseudocode, plain integers)."""
+    m32 = 0xFFFFFFFF
+    cin = [(0x5A5A5A5A >> lane) & 1 for lane in range(32)]
+    lanes = range(32)
+
+    def mask(bits):
+        return sum(1 << lane for lane in lanes if bits[lane])
+
+    dot = [0x00010000, 0xFFFF0200, 0xFFFFFF04, 0x8000FC03, 0xFFFFC083, 0x8000FC03, 0x7FFFFE03, 0x000001F0]
+    words = list(dot)
+    words += [(0x100 + 4 * lane * -128) & m32 for lane in lanes]                       # v_dot4c, S0 bytes all = lane
+    arrays, masks = [], []
+
+    def add(sums, borrow=False, clamp=False):
+        vals, flags = [], []
+        for s in sums:
+            flag = s < 0 if borrow else s > m32
+            vals.append((0 if borrow else m32) if flag and clamp else s & m32)
+            flags.append(flag)
+        arrays.append(vals)
+        masks.append(mask(flags))
+
+    a1, a2 = 0xFFFFFFF0, 0xFFFFFFEE
+    k1 = [a1 + lane for lane in lanes]                                                   # v_add_co_u32
+    k2 = [a2 + lane + cin[lane] for lane in lanes]                                       # v_add_co_ci_u32
+    k4 = [16 - lane for lane in lanes]                                                   # v_sub_co_u32
+    k5 = [lane - 16 for lane in lanes]                                                   # v_subrev_co_u32
+    k6 = [lane - 14 - cin[lane] for lane in lanes]                                       # v_sub_co_ci_u32
+    add(k1)
+    add(k2)
+    # 96-bit ripple: word 0 is -1 + (lane & 1), then -1 + 0 + carry, then 0x7fffffff + 0 + carry
+    s0 = [m32 + (lane & 1) for lane in lanes]
+    c0 = [s > m32 for s in s0]
+    s1 = [m32 + c for c in c0]
+    c1 = [s > m32 for s in s1]
+    s2 = [0x7FFFFFFF + c for c in c1]
+    add(s0)
+    add(s1)
+    add(s2)
+    add(k4, borrow=True)
+    add(k5, borrow=True)
+    add(k6, borrow=True)
+    add(k1, clamp=True)
+    add(k2, clamp=True)
+    add(k4, borrow=True, clamp=True)
+    add(k6, borrow=True, clamp=True)
+    for vals in arrays:
+        words += vals
+    # one flag word per lane: bit k is lane L's bit of mask K1 K2 K4 K5 K6 K3a K3b K3c C1 C2 C3 C4
+    # (arrays: K1 K2 K3a K3b K3c K4 K5 K6 C1 C2 C3 C4)
+    k1m, k2m, k3a, k3b, k3c, k4m, k5m, k6m, c1m, c2m, c3m, c4m = masks
+    order = [k1m, k2m, k4m, k5m, k6m, k3a, k3b, k3c, c1m, c2m, c3m, c4m]
+    return words + [sum(((m >> lane) & 1) << k for k, m in enumerate(order)) for lane in lanes]
+
+
+DOT4_CARRY_WORDS = _dot4_carry_words()
+
 # cs_fmt_1010102.asm: descriptor loads, immediate-format load, raw input words and the two packed stores.
 FMT_1010102_WORDS = [0, 0x3F800000, 0, 0x3F800000, 0x3F800000, 0, 0x3F800000, 0,
                      0, 0x3F800000, 0, 0x3F800000, 0xC00FFC00, 0x003FF003, 0xE00003FF, 0xFFE00003]
@@ -444,15 +502,19 @@ def failure(code, output, lines):
     return f"exit {code}: {details or 'no test output'}"
 
 
-def dump_test(tools, spirv, name, want, words, env=None):
+def dump_test(tools, spirv, name, want, words, env=None, lanes32=False):
     """Run one group with a heap of `words` words and compare the first len(want) words of the whole dump. The
-    console dump stops at word 7."""
+    console dump stops at word 7. lanes32: the shader needs 32 lanes (WAVE32_LANE_ENV), a Skip on a narrower device."""
     with tempfile.TemporaryDirectory(prefix="leonida-fmt-") as tmp:
         dump = Path(tmp) / "out.bin"
         # VKC_OUT_WORDS sets a minimum. Pin this dispatch to exactly `words` words.
         child = dict(os.environ if env is None else env, VKC_DUMP=str(dump), VKC_OUT_WORDS=str(words))
+        if lanes32:
+            child.update(WAVE32_LANE_ENV)
         code, out = run(os.path.join(tools, "vk_compute_test" + EXE), os.path.join(spirv, name + ".spv"),
                         "1", "dump", env=child)
+        if lanes32 and (skip := wave32_lane_skip(out)):
+            return skip
         if code:
             return failure(code, out, 3)
         if not dump.is_file():
@@ -473,6 +535,11 @@ def fmt_1010102_test(tools, spirv, env=None):
 
 def fmt_sint32_test(tools, spirv, env=None):
     return dump_test(tools, spirv, "cs_fmt_sint32", FMT_SINT32_WORDS, len(FMT_SINT32_WORDS), env)
+
+
+def dot4_carry_test(tools, spirv, env=None):
+    """v_dot4_i32_i8 / v_dot4c_i32_i8 and the carry forms, per lane of a wave32 group (456 words)."""
+    return dump_test(tools, spirv, "cs_w32_dot4_carry", DOT4_CARRY_WORDS, len(DOT4_CARRY_WORDS), env, lanes32=True)
 
 
 def fmt_xy_xyz_test(tools, spirv, env=None):
@@ -1286,6 +1353,7 @@ def main():
                                                       expected_words=CMPX_CLASS_WORDS)))
     results.append(("cs_fmt_1010102", fmt_1010102_test(tools, spirv)))
     results.append(("cs_fmt_sint32", fmt_sint32_test(tools, spirv)))
+    results.append(("cs_w32_dot4_carry", dot4_carry_test(tools, spirv)))
     results.append(("cs_fmt_xy_xyz", fmt_xy_xyz_test(tools, spirv)))
     results.append(("cs_tbuffer_store", tbuffer_store_test(tools, spirv)))
     for name, groups, want in GLOBAL_OFFSET:

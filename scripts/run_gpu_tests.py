@@ -25,10 +25,10 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mc_command  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container, shader_source
-from check import Skip, clip_test, fmt_1010102_test, fmt_sint32_test, fmt_xy_xyz_test, tbuffer_store_test
+from check import Skip, clip_test, dot4_carry_test, fmt_1010102_test, fmt_sint32_test, fmt_xy_xyz_test, tbuffer_store_test
 from compute_fixture import compute_header
 from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
-from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
+from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, DOT4_CARRY_WORDS, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
                    TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, TEXTURE_CONSTANTS, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
 from check import SIGNED_MIP_TEST
@@ -837,6 +837,11 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_fmt_sint32":
             problem = fmt_sint32_test(a.build, spirv_dir, cs_env)
             results.append((name, not problem, problem or "64/64 dumped words exact"))
+        elif name == "cs_w32_dot4_carry":
+            # v_dot4_i32_i8, v_dot4c_i32_i8 and the carry forms, per lane of a wave32 group (derivations in the .asm)
+            problem = dot4_carry_test(a.build, spirv_dir, cs_env)
+            ok = None if isinstance(problem, Skip) else not problem
+            results.append((name, ok, problem or f"{len(DOT4_CARRY_WORDS)}/{len(DOT4_CARRY_WORDS)} dumped words exact"))
         elif name == "cs_fmt_xy_xyz":
             # TEST-185: xy/xyz format loads and stores, words measured natively on a Radeon 680M (the .asm header)
             problem = fmt_xy_xyz_test(a.build, spirv_dir, cs_env)
