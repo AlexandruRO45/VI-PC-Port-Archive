@@ -1644,6 +1644,20 @@ if(EXISTS "${INTAKE_PYTHON}")
     cpu_asm_fixture(cpu_two_imports two_imports)
     target_link_libraries(cpu_two_imports PRIVATE cpu_import_provider cpu_register_probe)
     add_library(pe_map SHARED tools/pe_map.cpp)
+    add_library(cpu_shim_startup_guest SHARED tests/cpu/shim_startup.cpp)
+    target_compile_features(cpu_shim_startup_guest PRIVATE cxx_std_17)
+    set_target_properties(cpu_shim_startup_guest PROPERTIES MSVC_RUNTIME_LIBRARY MultiThreaded)
+    target_link_libraries(cpu_shim_startup_guest PRIVATE xmem_shim d3d12_xs_shim)
+    add_executable(cpu_shim_startup tests/cpu/shim_startup.asm tests/cpu/exe_startup.asm)
+    set_target_properties(cpu_shim_startup PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_shim_startup PRIVATE /ENTRY:native_startup /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+    target_link_libraries(cpu_shim_startup PRIVATE cpu_shim_startup_guest cpu_exe_io)
+    add_test(NAME cpu_native_shim_startup COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/shim_startup_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_shim_startup>" "$<TARGET_FILE:cpu_shim_startup_guest>" "$<TARGET_FILE:cpu_exe_io>"
+        "$<TARGET_FILE:xmem_shim>" "$<TARGET_FILE:d3d12_xs_shim>")
+    set_tests_properties(cpu_native_shim_startup PROPERTIES TIMEOUT 100)
+
     add_test(NAME cpu_native_exe_chain COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/mapped_exe_chain_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_exe_original>" "$<TARGET_FILE:cpu_exe_original_lifted>"

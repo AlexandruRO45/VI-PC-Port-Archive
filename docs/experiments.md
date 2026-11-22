@@ -73,6 +73,28 @@ cmake --build --preset dev --target cpu_crc_line_lifted cpu_crc_castagnoli_lifte
 ctest --preset dev --no-tests=error -R '^cpu_native_crc_line$' -V
 ```
 
+## EXE startup through the desktop runtime shims
+
+The source-built `cpu_shim_startup` EXE calls a companion DLL that links
+against the desktop `xmem.dll` and `d3d12_xs.dll`. The DLL checks that its
+process attach ran once before the call. It allocates, writes, queries and frees
+a page-backed XMem block, then checks that the freed range is no longer committed
+or registered as graphics memory under the desktop policy. It also checks the
+unsupported working-set reply and round-trips a tagged root signature. The
+resulting descriptor retains its root constants and the desktop flag.
+
+`cpu_native_shim_startup` runs the same EXE and companion under Windows and
+under `pe_map`. The mapped host loads both desktop shims from the build and
+maps the companion before resolving its entry export for the EXE. The test
+checks all six shim requests, the ordered output, exit status 42 and the
+mapped host's return marker. Withholding either provider identifies the first
+unbound import from that DLL before guest entry.
+
+```powershell
+cmake --build --preset dev --target cpu_shim_startup pe_map
+ctest --preset dev --no-tests=error -R '^cpu_native_shim_startup$' -V
+```
+
 ## Source-built EXE entry to a DLL import
 
 MSVC assembles a small CRT-free [EXE entry body](../tests/cpu/exe_entry.asm) and links it with the existing `call_mix` fixture. The [translator](../tools/cpu_exe_aot.py) takes the fixture's `native_entry` export through `--entry-export`, reads its unwind-bounded instruction range, follows the relative call to `call_mix`, and resolves its IAT slot against `cpu_import_provider.dll!mix_args`. It emits both functions as C++. The translated EXE uses ordinary Windows C++ startup to enter the generated `main`. Both versions use the same native provider and the same I/O DLL.
