@@ -318,6 +318,28 @@ int main() {
 
     if (!check_statistics_disjoint(sc)) return fail("initial frame-statistics disjoint notification");
 
+    // D3D-389: the app-facing BufferCount is the requested count, not the Vulkan image count. A surface whose
+    // minImageCount exceeds BufferCount (or a driver that returns more images) must not enlarge GetDesc's
+    // BufferCount, accept GetBuffer past it, or return a back-buffer index past it.
+    {
+        DXGI_SWAP_CHAIN_DESC1 d1{};
+        DXGI_SWAP_CHAIN_DESC d0{};
+        if (FAILED(sc->GetDesc1(&d1)) || d1.BufferCount != scd.BufferCount)
+            return fail("GetDesc1 BufferCount != the requested count (D3D-389)");
+        if (FAILED(sc->GetDesc(&d0)) || d0.BufferCount != scd.BufferCount)
+            return fail("GetDesc BufferCount != the requested count (D3D-389)");
+        IUnknown* extra = nullptr;
+        if (sc->GetBuffer(scd.BufferCount, IID_IUnknown, reinterpret_cast<void**>(&extra)) != E_INVALIDARG || extra) {
+            if (extra) extra->Release();
+            return fail("GetBuffer accepted an index past the requested BufferCount (D3D-389)");
+        }
+        for (int frame = 0; frame < 8; ++frame) {
+            if (sc->GetCurrentBackBufferIndex() >= scd.BufferCount)
+                return fail("GetCurrentBackBufferIndex past the requested BufferCount (D3D-389)");
+            if (FAILED(sc->Present(0, 0))) return fail("Present in the D3D-389 index loop");
+        }
+    }
+
     ID3D12Device* got_device = nullptr;
     if (FAILED(sc->GetDevice(IID_PPV_ARGS(&got_device))) || got_device != dev) {
         if (got_device) got_device->Release();

@@ -166,7 +166,7 @@ public:
         }
         allow_tearing_ = allow_tearing;
         const VkFormat fmt = (preferred_format != VK_FORMAT_UNDEFINED) ? preferred_format : format_;
-        const std::uint32_t count = buffer_count ? buffer_count : static_cast<std::uint32_t>(images_.size());
+        const std::uint32_t count = buffer_count ? buffer_count : buffer_count_;
         return rebuild(width, height, fmt, count ? count : 2u);
     }
 
@@ -190,22 +190,31 @@ public:
         return true;
     }
 
-    bool present(std::uint32_t image_index) {
-        if (!swapchain_ || image_index >= images_.size()) return false;
+    bool present(std::uint32_t app_index) {
+        // Present the acquired Vulkan image (current_index_), not the app-facing index: when the swapchain holds
+        // more images than the app's buffer count the two differ (D3D-389). The offscreen blit copies the app's
+        // back buffer app_index into that acquired image.
+        if (!swapchain_ || current_index_ >= images_.size()) return false;
         if (!offscreen_images_.empty()) {
-            if (!blit_to_swapchain(image_index)) return false;
+            if (!blit_to_swapchain(app_index, current_index_)) return false;
         }
         VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
         pi.swapchainCount = 1;
         pi.pSwapchains = &swapchain_;
-        pi.pImageIndices = &image_index;
+        pi.pImageIndices = &current_index_;
         std::lock_guard lock(submit_mutex_);
         const VkResult r = fn_.queue_present(queue_, &pi);
         return r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR;
     }
 
     std::uint32_t image_count() const { return static_cast<std::uint32_t>(images_.size()); }
-    std::uint32_t current_back_buffer_index() const { return current_index_; }
+    // The app-facing buffer count is the count the caller requested, not the Vulkan image count: a surface whose
+    // minImageCount exceeds it (or a driver that returns more images) must not enlarge GetDesc's BufferCount or
+    // hand back an index past the app's per-buffer arrays (D3D-389).
+    std::uint32_t buffer_count() const { return buffer_count_; }
+    std::uint32_t current_back_buffer_index() const {
+        return buffer_count_ ? current_index_ % buffer_count_ : current_index_;
+    }
     VkFormat format() const { return format_; }
     VkExtent2D extent() const { return extent_; }
     bool is_offscreen() const { return !offscreen_images_.empty(); }
@@ -382,8 +391,9 @@ private:
         return true;
     }
 
-    bool blit_to_swapchain(std::uint32_t image_index) {
-        if (!blit_cmd_ || !blit_fence_ || image_index >= offscreen_images_.size()) return false;
+    bool blit_to_swapchain(std::uint32_t app_index, std::uint32_t vk_index) {
+        if (!blit_cmd_ || !blit_fence_ || app_index >= offscreen_images_.size() || vk_index >= images_.size())
+            return false;
         std::lock_guard lock(submit_mutex_);
         if (fn_.reset_fences(device_, 1, &blit_fence_) != VK_SUCCESS) return false;
         if (fn_.reset_cmd_buf(blit_cmd_, 0) != VK_SUCCESS) return false;
@@ -399,7 +409,7 @@ private:
         pre[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         pre[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         pre[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        pre[0].image = offscreen_images_[image_index];
+        pre[0].image = offscreen_images_[app_index];
         pre[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
         pre[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -409,7 +419,7 @@ private:
         pre[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         pre[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         pre[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        pre[1].image = images_[image_index];
+        pre[1].image = images_[vk_index];
         pre[1].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
         fn_.cmd_barrier(blit_cmd_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
@@ -421,8 +431,8 @@ private:
         region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         region.dstOffsets[1] = {static_cast<std::int32_t>(surface_extent_.width),
                                 static_cast<std::int32_t>(surface_extent_.height), 1};
-        fn_.cmd_blit(blit_cmd_, offscreen_images_[image_index], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                     images_[image_index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_LINEAR);
+        fn_.cmd_blit(blit_cmd_, offscreen_images_[app_index], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                     images_[vk_index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_LINEAR);
 
         VkImageMemoryBarrier post[2]{};
         post[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -432,7 +442,7 @@ private:
         post[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
         post[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         post[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        post[0].image = offscreen_images_[image_index];
+        post[0].image = offscreen_images_[app_index];
         post[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
         post[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -442,7 +452,7 @@ private:
         post[1].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
         post[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         post[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        post[1].image = images_[image_index];
+        post[1].image = images_[vk_index];
         post[1].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
         fn_.cmd_barrier(blit_cmd_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
@@ -535,9 +545,13 @@ private:
         images_.resize(img_count);
         fn_.get_images(device_, swapchain_, &img_count, images_.data());
         image_initialized_.assign(img_count, false);
-        if (extent_.width != surface_extent_.width || extent_.height != surface_extent_.height ||
+        buffer_count_ = buffer_count ? buffer_count : img_count;
+        // Decouple the app's buffer count from the Vulkan image count whenever they differ (D3D-389): the app sees
+        // exactly buffer_count_ back buffers, blitted into whichever image Vulkan acquires.
+        if (img_count != buffer_count_ ||
+            extent_.width != surface_extent_.width || extent_.height != surface_extent_.height ||
             format_ != chosen.format) {
-            if (!create_offscreen_backbuffers(img_count)) return false;
+            if (!create_offscreen_backbuffers(buffer_count_)) return false;
         }
         current_index_ = 0;
         return !images_.empty();
@@ -567,6 +581,7 @@ private:
     std::vector<VkImage> offscreen_images_;
     std::vector<VkDeviceMemory> offscreen_memory_;
     std::uint32_t current_index_ = 0;
+    std::uint32_t buffer_count_ = 0;
 };
 
 }  // namespace leonida

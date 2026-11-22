@@ -230,7 +230,7 @@ public:
         desc->BufferDesc.Format = vk_to_dxgi_format(swapchain_.format());
         desc->SampleDesc.Count = 1;
         desc->BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        desc->BufferCount = swapchain_.image_count();
+        desc->BufferCount = swapchain_.buffer_count();
         desc->OutputWindow = hwnd_;
         desc->Windowed = TRUE;
         desc->SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
@@ -295,7 +295,7 @@ public:
         desc->Format = vk_to_dxgi_format(swapchain_.format());
         desc->SampleDesc.Count = 1;
         desc->BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        desc->BufferCount = swapchain_.image_count();
+        desc->BufferCount = swapchain_.buffer_count();
         desc->Scaling = DXGI_SCALING_STRETCH;
         desc->SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         desc->AlphaMode = DXGI_ALPHA_MODE_IGNORE;
@@ -416,7 +416,7 @@ private:
     }
 
     void register_buffers() {
-        const std::uint32_t count = swapchain_.image_count();
+        const std::uint32_t count = swapchain_.buffer_count();
         D3D12_RESOURCE_DESC desc{};
         desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         desc.Width = swapchain_.extent().width;
