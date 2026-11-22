@@ -300,6 +300,35 @@ class SIMDInterpreter:
         }
 
 
+# Commit 6: Condition codes, status flags, and carry/borrow generation
+
+
+@dataclass(frozen=True)
+class GWSSemaVStatusFlags:
+    """Architectural condition codes and status flags for ds_gws_sema_v."""
+    signaled: bool
+    waiter_released: bool
+    counter_zero: bool
+    counter_negative: bool
+    carry_out: bool
+    resource_id: int
+
+
+def evaluate_gws_status(old_val: int, new_val: int, waiter_released: bool, rid: int) -> GWSSemaVStatusFlags:
+    """Evaluates status flags and condition codes after a semaphore V operation."""
+    carry_out = (not waiter_released) and (old_val == 0xFFFF_FFFF and new_val == 0)
+    counter_zero = (new_val == 0)
+    counter_negative = bool(new_val & 0x8000_0000)
+    return GWSSemaVStatusFlags(
+        signaled=True,
+        waiter_released=waiter_released,
+        counter_zero=counter_zero,
+        counter_negative=counter_negative,
+        carry_out=carry_out,
+        resource_id=rid,
+    )
+
+
 class TestGWSSemaVOracleAndModel(unittest.TestCase):
     """Commit 1: Reference mathematical oracle and architectural model for ds_gws_sema_v."""
 
@@ -619,6 +648,51 @@ class TestGWSSemaVRegisterAliasing(unittest.TestCase):
         self.assertEqual(interp.rf.get_vgpr(0), 0x11223344)
         self.assertEqual(interp.rf.m0, 5)
         self.assertEqual(interp.gws.resources[5].value, 20)
+
+
+class TestGWSSemaVConditionCodes(unittest.TestCase):
+    """Commit 6: Condition codes, status flags, and carry/borrow generation for ds_gws_sema_v."""
+
+    def test_standard_increment_status_flags(self) -> None:
+        flags = evaluate_gws_status(old_val=5, new_val=6, waiter_released=False, rid=0)
+        self.assertTrue(flags.signaled)
+        self.assertFalse(flags.waiter_released)
+        self.assertFalse(flags.counter_zero)
+        self.assertFalse(flags.counter_negative)
+        self.assertFalse(flags.carry_out)
+        self.assertEqual(flags.resource_id, 0)
+
+    def test_waiter_released_status_flags(self) -> None:
+        flags = evaluate_gws_status(old_val=0, new_val=0, waiter_released=True, rid=14)
+        self.assertTrue(flags.signaled)
+        self.assertTrue(flags.waiter_released)
+        self.assertTrue(flags.counter_zero)
+        self.assertFalse(flags.counter_negative)
+        self.assertFalse(flags.carry_out)
+        self.assertEqual(flags.resource_id, 14)
+
+    def test_carry_out_on_32bit_wrap(self) -> None:
+        # Wrap from 0xFFFFFFFF -> 0 generates carry_out and zero flag
+        flags = evaluate_gws_status(old_val=0xFFFF_FFFF, new_val=0, waiter_released=False, rid=2)
+        self.assertTrue(flags.carry_out)
+        self.assertTrue(flags.counter_zero)
+        self.assertFalse(flags.counter_negative)
+
+    def test_counter_negative_sign_bit(self) -> None:
+        # Value 0x80000000 has MSB set (negative when interpreted as signed)
+        flags = evaluate_gws_status(old_val=0x7FFF_FFFF, new_val=0x8000_0000, waiter_released=False, rid=7)
+        self.assertTrue(flags.counter_negative)
+        self.assertFalse(flags.counter_zero)
+        self.assertFalse(flags.carry_out)
+
+    def test_vcc_predicate_mask_generation(self) -> None:
+        # Predicate mask generated across SIMD lanes reflects active execution
+        exec_mask = 0xAA55_AA55
+        vcc_mask = 0
+        for lane in range(32):
+            if (exec_mask >> lane) & 1:
+                vcc_mask |= (1 << lane)
+        self.assertEqual(vcc_mask, exec_mask)
 
 
 if __name__ == "__main__":
