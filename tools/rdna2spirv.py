@@ -7377,7 +7377,7 @@ class Gen:
                 self.emit(f"{z} = OpIEqual %bool {x} {self.cu(0)}")
                 self.emit(f"{r} = OpSelect %uint {z} {self.cu(0xFFFFFFFF)} {d}")
             self.dst(a[0], r)
-        elif op in ("image_get_resinfo", "image_load_mip", "image_store", "image_atomic_cmpswap") \
+        elif op in ("image_get_resinfo", "image_load_mip", "image_store", "image_store_pck", "image_atomic_cmpswap") \
                 or op in self.IMG_ATOMICS or op in self.IMG_ATOMICS_EXTRA:
             self.image_misc(op, a, mods)
         elif op in ("v_cubema_f32", "v_cubeid_f32", "v_cubesc_f32", "v_cubetc_f32"):
@@ -13128,16 +13128,16 @@ class Gen:
             halves.extend((lo, hi))
         return halves
 
-    def image_store(self, a, mods, dim):
-        """image_store vData, vAddr, T#: write the dmask components to a storage image. The view is picked at run
-        time from T# word1 FORMAT [28:20]: *_UINT -> uint view, *_SINT -> sint view, anything else -> float view
-        (UNORM/SNORM/FLOAT convert from the float bits the shader wrote). Missing components are 0.
-        With d16, enabled components are packed two 16-bit values per consecutive VGPR (low half first): IEEE f16
-        widened to f32 for float/norm views, zero-extended u16 for UINT views, and sign-extended i16 for SINT views."""
+    def image_store(self, a, mods, dim, pck=False):
+        """image_store[_pck] vData, vAddr, T#: write the dmask components to a storage image. For image_store,
+        the view is picked at run time from T# word1 FORMAT [28:20] (uint/sint/float). With d16 on image_store,
+        enabled components are packed two 16-bit values per consecutive VGPR (low half first). For image_store_pck,
+        pre-packed raw texel dwords are written directly to the uint view (%stv1) without format conversion."""
         # Cube storage images are bound as 6-layer 2D arrays (runtime/src/vulkan_bindless.h).
         view_dim = "dim:SQ_RSRC_IMG_2D_ARRAY" if dim == "dim:SQ_RSRC_IMG_CUBE" else dim
-        if view_dim not in self.STORE_DIMS or any(m in mods for m in ("tfe", "lwe")):
-            raise Unsupported("image_store " + dim.split("SQ_RSRC_IMG_")[-1] + (" a16" if "a16" in mods else "")
+        name = "image_store_pck" if pck else "image_store"
+        if view_dim not in self.STORE_DIMS or any(m in mods for m in ("tfe", "lwe")) or (pck and "d16" in mods):
+            raise Unsupported(name + " " + dim.split("SQ_RSRC_IMG_")[-1] + (" a16" if "a16" in mods else "")
                               + (" d16" if "d16" in mods else ""))
         di, _, _, nc = self.STORE_DIMS[view_dim]
         if "glc" in mods:
@@ -13151,7 +13151,7 @@ class Gen:
         if "a16" in mods:
             raw = self.unpack_image_a16_uints(raw)
         if len(raw) < nc:
-            raise Unsupported("image_store coords")
+            raise Unsupported(name + " coords")
         if "d16" in mods:
             # Packed 16-bit data: enabled dmask components occupy consecutive 16-bit halves (low first) across
             # ceil(popcount(dmask) / 2) VGPRs starting at vData.
@@ -13189,28 +13189,40 @@ class Gen:
             sv = [self.as_int(v) for v in vals]
         coords = [self.as_int(c) for c in raw[:nc]]
         idx = self.desc_lookup_sgpr(a[2], 8)
-        t1 = self.sgpr_word(a[2], 1)
         self.uses_store_views.add(di)
-        for w in [16] + sum(self.int_format_masks(), []):      # constants used by assemble's format masks
-            self.cu(w)
         if nc == 1:
             iv = coords[0]
         else:
             iv = self.tmp()
             self.emit(f"{iv} = OpCompositeConstruct {'%v2int' if nc == 2 else '%v3int'} {' '.join(coords)}")
-        is_u, is_s = self.fmt_int_flags(t1)
-        v4f, v4u, v4s = self.tmp(), self.tmp(), self.tmp()
-        self.emit(f"{v4f} = OpCompositeConstruct %v4float {' '.join(fv)}")
+        v4u = self.tmp()
         self.emit(f"{v4u} = OpCompositeConstruct %v4uint_st {' '.join(uv)}")
-        self.emit(f"{v4s} = OpCompositeConstruct %v4int_st {' '.join(sv)}")
         act = self.active_b()
-        L = {k: self.tmp() + "_" + k for k in ("do", "end", "s", "rest", "e2", "u", "f", "e3")}
 
         def write(cls, texel):
             ip, img = self.tmp(), self.tmp()
             self.dynamic_storage_access(ip, f"%_ptr_UC_stv{cls}_{di}", f"%stv{cls}_{di}", idx)
             self.emit(f"{img} = OpLoad %stimg{cls}_{di} {ip}")
             self.emit(f"OpImageWrite {img} {iv} {texel}")
+
+        if pck:
+            do_l, end_l = self.tmp() + "_do", self.tmp() + "_end"
+            self.emit(f"OpSelectionMerge {end_l} None")
+            self.emit(f"OpBranchConditional {act} {do_l} {end_l}")
+            self.emit(f"{do_l} = OpLabel")
+            write(1, v4u)
+            self.emit(f"OpBranch {end_l}")
+            self.emit(f"{end_l} = OpLabel")
+            return
+
+        t1 = self.sgpr_word(a[2], 1)
+        for w in [16] + sum(self.int_format_masks(), []):      # constants used by assemble's format masks
+            self.cu(w)
+        is_u, is_s = self.fmt_int_flags(t1)
+        v4f, v4s = self.tmp(), self.tmp()
+        self.emit(f"{v4f} = OpCompositeConstruct %v4float {' '.join(fv)}")
+        self.emit(f"{v4s} = OpCompositeConstruct %v4int_st {' '.join(sv)}")
+        L = {k: self.tmp() + "_" + k for k in ("do", "end", "s", "rest", "e2", "u", "f", "e3")}
 
         self.emit(f"OpSelectionMerge {L['end']} None")
         self.emit(f"OpBranchConditional {act} {L['do']} {L['end']}")
@@ -13384,8 +13396,8 @@ class Gen:
         array_query = op == "image_get_resinfo" and dim == "dim:SQ_RSRC_IMG_2D_ARRAY"
         is_atomic = op in self.IMG_ATOMICS or op == "image_atomic_cmpswap" or op in self.IMG_ATOMICS_EXTRA
         is3d_atomic = dim == "dim:SQ_RSRC_IMG_3D" and is_atomic
-        if op == "image_store":
-            self.image_store(a, mods, dim)
+        if op in ("image_store", "image_store_pck"):
+            self.image_store(a, mods, dim, pck=op == "image_store_pck")
             return
         if op == "image_load_mip" and "glc" in mods:
             # A coherent read of one mip: image_load_coherent reads a storage view, which has one level.
