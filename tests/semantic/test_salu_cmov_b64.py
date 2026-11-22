@@ -242,8 +242,7 @@ class RejectionTests(unittest.TestCase):
 
     def test_invalid_destinations_rejected_with_message(self):
         for line in ("s_cmov_b64 exec, s[4:5]", "s_cmov_b64 vcc, s[4:5]",
-                     "s_cmov_b64 m0, s[4:5]", "s_cmov_b64 s4, s[4:5]",
-                     "s_cmov_b64 null, s[4:5]"):
+                     "s_cmov_b64 m0, s[4:5]", "s_cmov_b64 s4, s[4:5]"):
             with self.subTest(line=line):
                 full = [line, "exp mrt0 v0, v0, v0, v0 done vm", "s_endpgm"]
                 with self.assertRaisesRegex(rdna2spirv.Unsupported, re.escape(self.DEST)):
@@ -562,11 +561,10 @@ class ScalarCselectB64AliasingAndControlsTests(unittest.TestCase):
                 self.assertNotEqual(res64, unselected)
 
     def test_invalid_destinations_rejected_with_message(self):
-        # Destination must be a 2-SGPR pair for 64-bit scalar data select.
+        # Destination must be a 2-SGPR pair (or null) for 64-bit scalar data select.
         for line in (
             "s_cselect_b64 s4, s[6:7], s[8:9]",
             "s_cselect_b64 m0, s[6:7], s[8:9]",
-            "s_cselect_b64 null, s[6:7], s[8:9]",
             "s_cselect_b64 s[4:7], s[8:9], s[10:11]",
         ):
             with self.subTest(line=line):

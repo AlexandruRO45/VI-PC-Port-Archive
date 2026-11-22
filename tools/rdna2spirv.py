@@ -1045,6 +1045,8 @@ class Gen:
         if d["k"] == "special" and d["t"] in ("vcc", "vcc_lo"):
             self.emit(f"OpStore %vcc {self.mask_src(s)}")
             return
+        if d["k"] == "special" and d["t"] == "null":
+            return
         if d["k"] != "sgpr" or d.get("n") != 2:
             raise Unsupported("s_mov_b64 destination")
         lit_lo = lit_hi = None
@@ -1061,6 +1063,9 @@ class Gen:
             lit_lo = v & 0xFFFFFFFF
             lit_hi = (v >> 32) & 0xFFFFFFFF
             lo, hi = self.cu(lit_lo), self.cu(lit_hi)
+        elif s["k"] == "special" and s["t"] == "null":
+            lit_lo = lit_hi = 0
+            lo, hi = self.cu(0), self.cu(0)
         elif s["k"] == "special" and s["t"] == "vcc":
             lo = hi = self.tmp()            # this lane's bit in both halves, as for EXEC
             self.emit(f"{lo} = OpLoad %uint %vcc")
@@ -3838,6 +3843,8 @@ class Gen:
             self.store_reg("sgpr", d["r"], res[0])
             if len(res) == 2:
                 self.store_reg("sgpr", d["r"] + 1, res[1])
+        elif d["k"] == "special" and d.get("t") == "null":
+            pass
         else:
             # EXEC / VCC filled from data: this lane takes its own bit of the result.
             lane = self.wave_lane()
@@ -4540,20 +4547,14 @@ class Gen:
             # D = the 64 bits of S0 in reverse order: D.lo = reverse(S0.hi), D.hi = reverse(S0.lo). SCC is not
             # written. The pair is 64-bit data (as for s_lshl_b64); a lane-mask source stays Unsupported (#210).
             d, x = a[0], a[1]
-            if d["k"] != "sgpr" or d.get("n") != 2 or self.holds_lane_mask(x):
+            if (not ((d["k"] == "sgpr" and d.get("n") == 2) or (d["k"] == "special" and d.get("t") == "null"))
+                    or self.holds_lane_mask(x)):
                 raise Unsupported(op + " operands")
-            if x["k"] == "sgpr" and x.get("n") == 2:
-                lo, hi = self.load_reg("sgpr", x["r"]), self.load_reg("sgpr", x["r"] + 1)
-            elif x["k"] == "imm":
-                v = x["v"] & 0xFFFFFFFFFFFFFFFF          # 64-bit inline/literal constant: sign-extended
-                lo, hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
-            else:
-                raise Unsupported(op + " source")
+            lo, hi = self.src64_data(x, op)
             rlo, rhi = self.tmp(), self.tmp()
             self.emit(f"{rlo} = OpBitReverse %uint {hi}")
             self.emit(f"{rhi} = OpBitReverse %uint {lo}")
-            self.store_reg("sgpr", d["r"], rlo)
-            self.store_reg("sgpr", d["r"] + 1, rhi)
+            self.dst64_data(d, rlo, rhi, op, allow_null=True)
         elif op == "s_brev_b32":
             x = self.src_u(a[1])
             r = self.tmp()
@@ -4595,7 +4596,7 @@ class Gen:
                     self.emit(f"{u} = OpShiftLeftLogical %uint {t} {self.cu(1)}")
                     self.emit(f"{r} = OpBitwiseOr %uint {t} {u}")
                     out.append(r)
-                self.dst64_data(d, out[0], out[1], op)
+                self.dst64_data(d, out[0], out[1], op, allow_null=True)
             else:
                 parts = []
                 for w in words:
@@ -4623,7 +4624,7 @@ class Gen:
                     self.emit(f"{o} = OpBitwiseOr %uint {r} {u}")
                     r = o
                 if wide_dst:
-                    self.dst64_data(d, r, self.cu(0), op)
+                    self.dst64_data(d, r, self.cu(0), op, allow_null=True)
                 else:
                     self.dst(d, r)
                 self.scc_nonzero(r)
@@ -5145,13 +5146,7 @@ class Gen:
             x = a[1]
             if self.holds_lane_mask(x):
                 raise Unsupported(op + " of a lane mask")
-            if x["k"] == "sgpr" and x.get("n") == 2:
-                lo, hi = self.load_reg("sgpr", x["r"]), self.load_reg("sgpr", x["r"] + 1)
-            elif x["k"] == "imm":
-                v = x["v"] & 0xFFFFFFFFFFFFFFFF
-                lo, hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
-            else:
-                raise Unsupported(op + " source")
+            lo, hi = self.src64_data(x, op)
             if op == "s_flbit_i32_i64":
                 neg, nlo, nhi, slo, shi = (self.tmp() for _ in range(5))
                 self.emit(f"{neg} = OpSLessThan %bool {self.as_int(hi)} {self.as_int(self.cu(0))}")
@@ -5291,6 +5286,8 @@ class Gen:
         elif op == "s_bfm_b64":
             # D = ((1 << size) - 1) << offset as a lane mask: in the per-lane model this lane's bit is
             # offset <= lane < offset + size (size/offset taken mod 64).
+            if a[0]["k"] == "special" and a[0].get("t") == "null":
+                return
             size, off = self.src_u(a[1]), self.src_u(a[2])
             lane = self.wave_lane()
             sz, of, end, ge, lt, on, m = (self.tmp() for _ in range(7))
@@ -5473,6 +5470,8 @@ class Gen:
             # D[S0 & 63] = 0 / 1 in the SGPR pair D (D is both source and destination); SCC is not written. The pair
             # is 64-bit data (as for s_lshl_b64); a pair that lane_masks.py marks as a lane mask stays Unsupported.
             d = a[0]
+            if d["k"] == "special" and d.get("t") == "null":
+                return
             if d["k"] != "sgpr" or d.get("n") != 2 or self.holds_lane_mask(d):
                 raise Unsupported(op + " destination")
             b = self.src_u(a[1])
@@ -6048,7 +6047,11 @@ class Gen:
             # invalidate.
             n = 2 if op.endswith("_b64") else 1
             d, src = a[0], a[1]
-            if d["k"] != "sgpr" or src["k"] != "sgpr" or d.get("n", 1) != n or src.get("n", 1) != n:
+            if src["k"] != "sgpr" or src.get("n", 1) != n:
+                raise Unsupported(op + " operands")
+            if d["k"] == "special" and d.get("t") == "null":
+                return
+            if d["k"] != "sgpr" or d.get("n", 1) != n:
                 raise Unsupported(op + " operands")
             # An SGPR that lane_masks.py marks as a lane mask holds only this lane's bit, so a plain load would copy
             # that bit as data (a saved EXEC of 5 read back as 0xffffffff in lanes 0 and 2, 0 elsewhere). For each
@@ -6421,6 +6424,8 @@ class Gen:
             m0, m1 = self.holds_lane_mask(a[0]), self.holds_lane_mask(a[1])
 
             def _is_u64_zero_or_all_ones(src):
+                if src["k"] == "special" and src.get("t") == "null":
+                    return True
                 if src["k"] != "imm":
                     return False
                 v = src["v"] & 0xFFFFFFFFFFFFFFFF
@@ -6547,15 +6552,9 @@ class Gen:
         elif op in ("s_lshl_b64", "s_lshr_b64", "s_ashr_i64"):
             # 64-bit shift of an SGPR pair by (src1 & 63); SCC = result != 0.
             d, x = a[0], a[1]
-            if d["k"] != "sgpr" or d.get("n") != 2:
+            if not ((d["k"] == "sgpr" and d.get("n") == 2) or (d["k"] == "special" and d.get("t") == "null")):
                 raise Unsupported(op + " destination")
-            if x["k"] == "sgpr" and x.get("n") == 2:
-                lo, hi = self.load_reg("sgpr", x["r"]), self.load_reg("sgpr", x["r"] + 1)
-            elif x["k"] == "imm":
-                v = x["v"] & 0xFFFFFFFFFFFFFFFF
-                lo, hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
-            else:
-                raise Unsupported(op + " source")
+            lo, hi = self.src64_data(x, op)
             sh = self.src_u(a[2])
             l64, h64, t, v64, m, s64, r, rlo, rh, rhi = (self.tmp() for _ in range(10))
             self.emit(f"{l64} = OpUConvert %ulong {lo}")
@@ -6576,8 +6575,7 @@ class Gen:
             self.emit(f"{rlo} = OpUConvert %uint {r}")
             self.emit(f"{rh} = OpShiftRightLogical %ulong {r} %c64_32")
             self.emit(f"{rhi} = OpUConvert %uint {rh}")
-            self.store_reg("sgpr", d["r"], rlo)
-            self.store_reg("sgpr", d["r"] + 1, rhi)
+            self.dst64_data(d, rlo, rhi, op, allow_null=True)
             nz, z = self.tmp(), self.tmp()
             orr = self.tmp()
             self.emit(f"{orr} = OpBitwiseOr %uint {rlo} {rhi}")
@@ -6646,6 +6644,8 @@ class Gen:
         elif op == "s_getpc_b64":
             # Address of the next instruction: code base (push constants 34-35: where the runtime put this shader's
             # FSSM blob in the Xbox VA window) + offset of the next instruction within the blob.
+            if a[0]["k"] == "special" and a[0].get("t") == "null":
+                return
             if a[0]["k"] != "sgpr" or a[0].get("n") != 2:
                 raise Unsupported("s_getpc_b64 destination")
             if not ins.get("enc"):
@@ -6971,6 +6971,8 @@ class Gen:
             # (issue #210). Those operands keep failing loudly.
             if self.is_mask_op(a[1]) or self.any_mask_word(a[1]) or self.any_ever_mask_word(a[1]):
                 raise Unsupported("s_cmov_b64 lane-mask source")
+            if a[0]["k"] == "special" and a[0].get("t") == "null":
+                return
             if a[0]["k"] != "sgpr" or a[0].get("n") != 2:
                 raise Unsupported("s_cmov_b64 destination")
             if self.holds_lane_mask(a[0]) or self.any_mask_word(a[0]) or self.any_ever_mask_word(a[0]):
@@ -7011,15 +7013,10 @@ class Gen:
             # width is cut to 64 - offset. SCC = (D != 0). The pair is 64-bit data (as for s_lshl_b64); a lane-mask
             # source stays Unsupported (#210).
             d, x = a[0], a[1]
-            if d["k"] != "sgpr" or d.get("n") != 2 or self.holds_lane_mask(x):
+            if (not ((d["k"] == "sgpr" and d.get("n") == 2) or (d["k"] == "special" and d.get("t") == "null"))
+                    or self.holds_lane_mask(x)):
                 raise Unsupported(op + " operands")
-            if x["k"] == "sgpr" and x.get("n") == 2:
-                lo, hi = self.load_reg("sgpr", x["r"]), self.load_reg("sgpr", x["r"] + 1)
-            elif x["k"] == "imm":
-                v = x["v"] & 0xFFFFFFFFFFFFFFFF
-                lo, hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
-            else:
-                raise Unsupported(op + " source")
+            lo, hi = self.src64_data(x, op)
             ctl = self.src_u(a[2])
             off, wid, room, fits, w, l64, h64, t, v64 = (self.tmp() for _ in range(9))
             self.emit(f"{off} = OpBitwiseAnd %uint {ctl} {self.cu(63)}")
@@ -7057,8 +7054,7 @@ class Gen:
             self.emit(f"{fhi} = OpUConvert %uint {fh}")
             self.emit(f"{rlo} = OpSelect %uint {wz} {self.cu(0)} {flo}")
             self.emit(f"{rhi} = OpSelect %uint {wz} {self.cu(0)} {fhi}")
-            self.store_reg("sgpr", d["r"], rlo)
-            self.store_reg("sgpr", d["r"] + 1, rhi)
+            self.dst64_data(d, rlo, rhi, op, allow_null=True)
             orr = self.tmp()
             self.emit(f"{orr} = OpBitwiseOr %uint {rlo} {rhi}")
             self.scc_nonzero(orr)
@@ -7175,7 +7171,8 @@ class Gen:
                 self.emit(f"{r} = OpSelect %uint {b} {x} {y}")
                 self.mask_dst(a[0], r)
             else:
-                if a[0]["k"] != "sgpr" or a[0].get("n") != 2:
+                if not ((a[0]["k"] == "sgpr" and a[0].get("n") == 2) or
+                        (a[0]["k"] == "special" and a[0].get("t") == "null")):
                     raise Unsupported("s_cselect_b64 destination")
                 # Load all source dwords before storing to a[0] so destination aliasing stays exact;
                 # lane_masks.py already clears a[0]'s mask state when either source is non-mask.
@@ -7185,7 +7182,7 @@ class Gen:
                 self.emit(f"{b} = OpINotEqual %bool {c} {self.cu(0)}")
                 self.emit(f"{rlo} = OpSelect %uint {b} {lo1} {lo2}")
                 self.emit(f"{rhi} = OpSelect %uint {b} {hi1} {hi2}")
-                self.dst64_data(a[0], rlo, rhi, op)
+                self.dst64_data(a[0], rlo, rhi, op, allow_null=True)
         elif op in ("v_interp_p1ll_f16", "v_interp_p1lv_f16", "v_interp_p2_f16"):
             attr = next((x for x in a if x["k"] == "attr"), None)
             if attr is None or self.stage != "ps":

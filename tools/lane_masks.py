@@ -65,6 +65,8 @@ def kind(state, a):
             if vk in MASK_KINDS:
                 return MASK_LO if t == "vcc_lo" else MASK_HI
             return vk if t == "vcc_lo" else None
+        if t == "null":
+            return EITHER
         return None
     if a["k"] == "sgpr":
         n = a.get("n", 1)
