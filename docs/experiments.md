@@ -954,6 +954,30 @@ Two independently located local effects yielded 5 and 81 candidates across all g
 
 ## Single-group mesh entry specialization
 
+The indexed variant, selected with `--vertex-header WORD`, specializes packed
+16-bit geometry indices and the vertex header while leaving the actual float3
+vertices in a 512-byte GPU SRV at t0. Table slots 0, 0x20 and 0x40 select
+geometry, object transform and projection buffers. The profile binds the low/high
+pointer inputs in s18/s19 and verifies the constructed four-word vertex
+descriptor before accepting a read. A changed header or index stream requires
+retranslation. A changed vertex position can use the same DXIL. Undefined
+registers, reads before their waits and out-of-range vertex accesses are rejected.
+
+```text
+python3 -B tests/mesh_indexed_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+ctest --preset dev --no-tests=error -R "^mesh_indexed_draw_" -V
+```
+
+A local 1,028-byte entry (197 instructions) read three distinct vertex
+positions and produced visible geometry with controlled indices, transforms and
+vertex data. The two sets of positions cover 1,024 and 276 of the 1,024 pixel
+centers. Both plain and instrumented mesh DXIL match the CPU raster reference.
+The instrumented draw also checks counts, three float4 positions, the primitive
+indices and guard bytes. Aliasing one vertex to another changes exactly the
+276 covered pixels and fails the export check. Measured with the debug layer
+enabled on Windows 26200.9974, RTX 4060 Laptop 32.0.16.1656 and WARP
+10.0.26100.9818. The source-built fixture also permutes the packed indices.
+
 `tools/mesh_entry_aot.py` takes an extracted mesh container and a JSON array of
 unsigned geometry words. It checks the native extent and the PSV triangle
 topology, group size and output bounds. It decodes the entry with LLVM in

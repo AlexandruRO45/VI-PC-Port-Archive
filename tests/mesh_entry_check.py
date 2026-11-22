@@ -1,6 +1,7 @@
 """Translate a source-built mesh triangle and compare exports and rasterization."""
 
 from pathlib import Path
+import json
 import struct
 import subprocess
 import sys
@@ -59,10 +60,15 @@ def fixture(constants, positions, visible, traced):
         for i, vertex in enumerate(positions):
             struct.pack_into("<4f", trace, 16 + i * 16, *vertex)
         struct.pack_into("<3I", trace, 64, 0, 1, 2)
-    return constants + trace + bytes([0, 255 if visible else 0, 0, 255]) * 1024
+    pixels = (
+        visible
+        if isinstance(visible, bytes)
+        else bytes([0, 255 if visible else 0, 0, 255]) * 1024
+    )
+    return constants + trace + pixels
 
 
-def draw(dxc, renderer, adapter, tmp, source, cases):
+def draw(dxc, renderer, adapter, tmp, source, cases, *, indexed=False):
     pixel = tmp / "pixel.hlsl"
     pixel.write_text(PIXEL)
     ps = tmp / "pixel.dxil"
@@ -79,7 +85,14 @@ def draw(dxc, renderer, adapter, tmp, source, cases):
             path = tmp / "draw.bin"
             data = fixture(constants, positions, visible, traced)
             path.write_bytes(data)
-            args = [renderer, adapter, "--mesh-entry", ms, ps, path]
+            args = [
+                renderer,
+                adapter,
+                "--mesh-indexed" if indexed else "--mesh-entry",
+                ms,
+                ps,
+                path,
+            ]
             result = subprocess.run(args)
             if result.returncode == 77:
                 return 77
@@ -106,9 +119,14 @@ def triangle_inputs():
     return inputs
 
 
+def enumerate_pcs(program):
+    # All fixture branch displacements span only scalar four-byte instructions.
+    return [(i * 4, line) for i, line in enumerate(program)]
+
+
 def source():
     # Branches only span scalar instructions of known 4-byte length.
-    decoded = [(i * 4, op) for i, op in enumerate(PROGRAM)]
+    decoded = enumerate_pcs(PROGRAM)
     for bad in ((2, 1), (3, 0)):
         try:
             lower(decoded, [0x1003], bad)
@@ -131,12 +149,12 @@ def source():
     return lower(decoded, [0x1003], (3, 1))
 
 
-def binary(tmp, assembler, objcopy, library):
+def binary(tmp, assembler, objcopy, library, *, program=None, words=None, header=None):
     from pixel_aot_check import envelope
     from pixel_aot import _read_named_container
 
     src, obj, raw = (tmp / name for name in ("fixture.s", "fixture.o", "fixture.bin"))
-    lines = PROGRAM
+    lines = PROGRAM if program is None else program
     src.write_text(
         "\n".join(
             s.replace("mrtz,", "mrtz")
@@ -175,7 +193,7 @@ def binary(tmp, assembler, objcopy, library):
     container.write_bytes(_read_named_container(record, len(b"fixture") + 2))
     translated = tmp / "out.hlsl"
     geometry = tmp / "geometry.json"
-    geometry.write_text("[4099]")
+    geometry.write_text(json.dumps(words if words is not None else [4099]))
     tool = Path(__file__).resolve().parents[1] / "tools" / "mesh_entry_aot.py"
     subprocess.run(
         [
@@ -187,12 +205,18 @@ def binary(tmp, assembler, objcopy, library):
             library,
             "--output",
             translated,
+            *(["--vertex-header", str(header)] if header is not None else []),
             "--geometry-words",
             geometry,
         ],
         check=True,
     )
-    assert translated.read_text() == source()
+    expected = (
+        source()
+        if program is None
+        else lower(enumerate_pcs(program), words, (3, 1), header)
+    )
+    assert translated.read_text() == expected
 
 
 if __name__ == "__main__":
