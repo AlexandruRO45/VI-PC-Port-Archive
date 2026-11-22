@@ -5,7 +5,7 @@ import math
 import struct
 import unittest
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # AMD RDNA2 / GFX10 GWS (Global Wavefront Sync) Architectural Constants
 GWS_NUM_RESOURCES: int = 64  # Hardware semaphore / barrier resource slots (0..63)
@@ -241,6 +241,65 @@ class ScalarInterpreter:
         return new_val, awakened
 
 
+# Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking
+
+
+class SIMDWaveState:
+    """Models multi-lane SIMD wave state (Wave32 or Wave64)."""
+
+    def __init__(self, wave_id: int = 0, wave_size: int = 32, exec_mask: int = MASK32) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Wave size must be 32 or 64, got: {wave_size}")
+        self.wave_id: int = wave_id
+        self.wave_size: int = wave_size
+        self.exec_mask: int = exec_mask & (MASK64 if wave_size == 64 else MASK32)
+        self.vgprs: List[List[int]] = [[0] * 256 for _ in range(wave_size)]
+        self.sgprs: List[int] = [0] * 104
+        self.m0: int = 0
+        self.vcc: int = 0
+
+    def is_lane_active(self, lane: int) -> bool:
+        return bool((self.exec_mask >> lane) & 1)
+
+    def get_vgpr(self, lane: int, reg_idx: int) -> int:
+        return self.vgprs[lane][reg_idx] & MASK32
+
+    def set_vgpr(self, lane: int, reg_idx: int, val: int) -> None:
+        self.vgprs[lane][reg_idx] = val & MASK32
+
+
+class SIMDInterpreter:
+    """SIMD instruction interpreter handling multi-lane divergence and EXEC masking."""
+
+    def __init__(self, gws: Optional[GWSSubsystem] = None) -> None:
+        self.gws: GWSSubsystem = gws if gws is not None else GWSSubsystem()
+
+    def step_wave(self, wave: SIMDWaveState, instr: Instruction) -> Dict[str, Any]:
+        if instr.opcode != Opcode.DS_GWS_SEMA_V:
+            raise NotImplementedError(f"Unsupported opcode in SIMD interpreter: {instr.opcode}")
+
+        rid = ref_gws_resource_id(wave.m0, instr.offset)
+        active_count = 0
+        signals_issued = 0
+        awakened_waves: List[int] = []
+
+        for lane in range(wave.wave_size):
+            if wave.is_lane_active(lane):
+                active_count += 1
+                _, awakened = self.gws.signal_v(rid)
+                signals_issued += 1
+                if awakened is not None:
+                    awakened_waves.append(awakened)
+
+        return {
+            "resource_id": rid,
+            "active_lanes": active_count,
+            "signals_issued": signals_issued,
+            "awakened_waves": awakened_waves,
+            "final_value": self.gws.resources[rid].value,
+        }
+
+
 class TestGWSSemaVOracleAndModel(unittest.TestCase):
     """Commit 1: Reference mathematical oracle and architectural model for ds_gws_sema_v."""
 
@@ -413,6 +472,85 @@ class TestGWSSemaVScalarInterpreter(unittest.TestCase):
             self.assertEqual(val, i)
         self.assertEqual(len(self.interp.trace), 5)
         self.assertEqual(self.interp.trace[-1], ("ds_gws_sema_v offset:1 gds", 5, None))
+
+
+class TestGWSSemaVSIMD(unittest.TestCase):
+    """Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking for ds_gws_sema_v."""
+
+    def setUp(self) -> None:
+        self.simd = SIMDInterpreter()
+
+    def test_wave32_full_exec_signals_32_times(self) -> None:
+        wave = SIMDWaveState(wave_id=1, wave_size=32, exec_mask=0xFFFF_FFFF)
+        wave.m0 = 0
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_V, offset=3)
+        res = self.simd.step_wave(wave, instr)
+
+        self.assertEqual(res["active_lanes"], 32)
+        self.assertEqual(res["signals_issued"], 32)
+        self.assertEqual(res["final_value"], 32)
+        self.assertEqual(self.simd.gws.resources[3].value, 32)
+
+    def test_wave64_full_exec_signals_64_times(self) -> None:
+        wave = SIMDWaveState(wave_id=2, wave_size=64, exec_mask=0xFFFF_FFFF_FFFF_FFFF)
+        wave.m0 = 8
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_V, offset=0)
+        res = self.simd.step_wave(wave, instr)
+
+        self.assertEqual(res["active_lanes"], 64)
+        self.assertEqual(res["signals_issued"], 64)
+        self.assertEqual(res["final_value"], 64)
+        self.assertEqual(self.simd.gws.resources[8].value, 64)
+
+    def test_partial_exec_checkerboard(self) -> None:
+        # Alternating bits 0x55555555: 16 active lanes in Wave32
+        wave = SIMDWaveState(wave_id=3, wave_size=32, exec_mask=0x5555_5555)
+        wave.m0 = 20
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_V, offset=0)
+        res = self.simd.step_wave(wave, instr)
+
+        self.assertEqual(res["active_lanes"], 16)
+        self.assertEqual(res["signals_issued"], 16)
+        self.assertEqual(res["final_value"], 16)
+
+    def test_single_active_lane(self) -> None:
+        # Only lane 0 active
+        wave = SIMDWaveState(wave_id=4, wave_size=32, exec_mask=0x0000_0001)
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_V, offset=5)
+        res = self.simd.step_wave(wave, instr)
+
+        self.assertEqual(res["active_lanes"], 1)
+        self.assertEqual(res["signals_issued"], 1)
+        self.assertEqual(res["final_value"], 1)
+
+    def test_completely_inactive_wave(self) -> None:
+        # EXEC mask == 0
+        wave = SIMDWaveState(wave_id=5, wave_size=32, exec_mask=0)
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_V, offset=5)
+        res = self.simd.step_wave(wave, instr)
+
+        self.assertEqual(res["active_lanes"], 0)
+        self.assertEqual(res["signals_issued"], 0)
+        self.assertEqual(res["final_value"], 0)
+        self.assertEqual(self.simd.gws.resources[5].value, 0)
+
+    def test_simd_wakes_queued_wavefronts_in_active_lanes(self) -> None:
+        rid = 18
+        # Enqueue 3 waiting wavefronts
+        for w in [50, 51, 52]:
+            self.simd.gws.wait_p(rid, wave_id=w)
+
+        # Wave has 5 active lanes
+        wave = SIMDWaveState(wave_id=6, wave_size=32, exec_mask=0x0000_001F)  # 5 lanes active
+        wave.m0 = rid
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_V, offset=0)
+        res = self.simd.step_wave(wave, instr)
+
+        self.assertEqual(res["active_lanes"], 5)
+        self.assertEqual(res["signals_issued"], 5)
+        self.assertEqual(res["awakened_waves"], [50, 51, 52])
+        # 3 signals consumed by 3 waiters, remaining 2 signals increment counter
+        self.assertEqual(res["final_value"], 2)
 
 
 if __name__ == "__main__":
