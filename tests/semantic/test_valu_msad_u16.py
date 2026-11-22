@@ -1108,5 +1108,205 @@ class TestValuMsadU16IEEE754BoundaryExtremes(unittest.TestCase):
                 self.assertEqual(res, (acc + 2) & MASK32)
 
 
+class TestValuMsadU16NegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Reg32(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg32(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg32(999, RegType.SGPR)
+
+    def test_syntax_rejection_valu_destination_must_be_vgpr(self) -> None:
+        dst_sgpr = Reg32(0, RegType.SGPR)
+        src = VMsadU16Operand(Reg32(1, RegType.VGPR))
+        with self.assertRaises(TypeError):
+            VMsadU16Instruction(dst=dst_sgpr, src0=src, src1=src, src2=src)
+
+    def test_syntax_rejection_literal_as_destination(self) -> None:
+        dst_lit = Literal32(0)  # type: ignore[arg-type]
+        src = VMsadU16Operand(Reg32(1, RegType.VGPR))
+        with self.assertRaises(AttributeError):
+            VMsadU16Instruction(dst=dst_lit, src0=src, src1=src, src2=src)  # type: ignore
+
+    def test_syntax_rejection_clamp_modifier(self) -> None:
+        dst = Reg32(0, RegType.VGPR)
+        src = VMsadU16Operand(Reg32(1, RegType.VGPR))
+        with self.assertRaises(ValueError):
+            VMsadU16Instruction(dst=dst, src0=src, src1=src, src2=src, clamp=True)
+
+    def test_syntax_rejection_invalid_simd_lane_count(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_negative_control_bit_flip_detection(self) -> None:
+        s0 = 0x10002000
+        s1 = 0x50006000
+        s2 = 100
+        correct = oracle_v_msad_u16(s0, s1, s2)
+
+        for bit_pos in (0, 7, 8, 15, 16, 23, 24, 31):
+            corrupted = correct ^ (1 << bit_pos)
+            self.assertNotEqual(correct, corrupted)
+
+    def test_mutation_unmasked_sad_detected(self) -> None:
+        """Mutant: Omits mask check and calculates SAD for all lanes regardless of s1."""
+        def mutant_unmasked_msad(s0: int, s1: int, s2: int) -> int:
+            h0_lanes = unpack_halves_u32(s0)
+            h1_lanes = unpack_halves_u32(s1)
+            # Bug: fails to check h1 == 0
+            diff = sum(abs(h0 - h1) for h0, h1 in zip(h0_lanes, h1_lanes))
+            return (s2 + diff) & MASK32
+
+        s0 = pack_halves_u32(100, 200)
+        s1 = pack_halves_u32(0, 0)  # All masked in correct oracle
+        s2 = 0
+
+        oracle_res = oracle_v_msad_u16(s0, s1, s2)
+        mutant_res = mutant_unmasked_msad(s0, s1, s2)
+
+        self.assertEqual(oracle_res, 0)
+        self.assertEqual(mutant_res, 300)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_reverse_mask_operand_detected(self) -> None:
+        """Mutant: Checks s0 == 0 instead of s1 == 0 for masking."""
+        def mutant_reverse_mask(s0: int, s1: int, s2: int) -> int:
+            h0_lanes = unpack_halves_u32(s0)
+            h1_lanes = unpack_halves_u32(s1)
+            # Bug: checks h0 instead of h1
+            diff = sum(0 if h0 == 0 else abs(h0 - h1) for h0, h1 in zip(h0_lanes, h1_lanes))
+            return (s2 + diff) & MASK32
+
+        s0 = pack_halves_u32(0, 0)
+        s1 = pack_halves_u32(500, 500)
+        s2 = 0
+
+        oracle_res = oracle_v_msad_u16(s0, s1, s2)
+        mutant_res = mutant_reverse_mask(s0, s1, s2)
+
+        # In correct oracle, s1 != 0, so diff is 2 * 500 = 1000
+        self.assertEqual(oracle_res, 1000)
+        # In mutant, s0 == 0 masks everything -> 0
+        self.assertEqual(mutant_res, 0)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_signed_half_interpretation_detected(self) -> None:
+        """Mutant: Casts halves to signed int16 (-32768..32767) before difference."""
+        def mutant_signed_msad_half(h0: int, h1: int) -> int:
+            if h1 == 0:
+                return 0
+            sh0 = (h0 & 0xFFFF) if (h0 & 0x8000) == 0 else (h0 & 0xFFFF) - 65536
+            sh1 = (h1 & 0xFFFF) if (h1 & 0x8000) == 0 else (h1 & 0xFFFF) - 65536
+            return abs(sh0 - sh1)
+
+        h0 = 0xFFFF  # 65535 unsigned, -1 signed
+        h1 = 0x0001  # 1
+
+        oracle_diff = ref_msad_half(h0, h1)
+        mutant_diff = mutant_signed_msad_half(h0, h1)
+
+        # Unsigned diff: |65535 - 1| = 65534
+        self.assertEqual(oracle_diff, 65534)
+        # Signed diff: |-1 - 1| = 2
+        self.assertEqual(mutant_diff, 2)
+        self.assertNotEqual(oracle_diff, mutant_diff)
+
+    def test_mutation_ignore_simd_exec_mask_detected(self) -> None:
+        """Mutant: SIMD interpreter writes to inactive lanes."""
+        sentinel = 0xCAFEBABE
+        state = SIMDState(num_lanes=32, exec_mask=0x00000000)  # all inactive
+        for lane in range(32):
+            state.set_vgpr(lane, 0, sentinel)
+
+        class BrokenSIMDInterpreter(SIMDInterpreter):
+            def step(self, instr: VMsadU16Instruction, state: SIMDState) -> List[Optional[int]]:
+                results = []
+                for lane in range(state.num_lanes):
+                    # Bug: no exec_mask check
+                    res = oracle_v_msad_u16(0, 0, 0)
+                    state.set_vgpr(lane, instr.dst.index, res)
+                    results.append(res)
+                return results
+
+        broken = BrokenSIMDInterpreter()
+        instr = VMsadU16Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VMsadU16Operand(Literal32(0)),
+            src1=VMsadU16Operand(Literal32(0)),
+            src2=VMsadU16Operand(Literal32(0)),
+        )
+        broken.step(instr, state)
+
+        # All 32 lanes were corrupted
+        corrupted = [lane for lane in range(32) if state.get_vgpr(lane, 0) != sentinel]
+        self.assertEqual(len(corrupted), 32)
+
+    def test_mutation_diff_sum_16bit_truncation_detected(self) -> None:
+        """Mutant: Truncates intermediate SAD sum to 16 bits before accumulation."""
+        def mutant_truncated_msad(s0: int, s1: int, s2: int) -> int:
+            h0_lanes = unpack_halves_u32(s0)
+            h1_lanes = unpack_halves_u32(s1)
+            diff = sum(0 if h1 == 0 else abs(h0 - h1) for h0, h1 in zip(h0_lanes, h1_lanes))
+            # Bug: truncates diff to 16 bits
+            diff_16 = diff & 0xFFFF
+            return (s2 + diff_16) & MASK32
+
+        s0 = pack_halves_u32(0, 0)
+        s1 = pack_halves_u32(65535, 65535)  # diff = 2 * 65535 = 131070 (0x1FFFE)
+
+        oracle_res = oracle_v_msad_u16(s0, s1, 0)
+        mutant_res = mutant_truncated_msad(s0, s1, 0)
+
+        # 131070 vs (131070 & 0xFFFF = 65534)
+        self.assertEqual(oracle_res, 131070)
+        self.assertEqual(mutant_res, 65534)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_cross_half_bleed_detected(self) -> None:
+        """Mutant: Performs whole 32-bit subtraction instead of per-half SAD."""
+        def mutant_whole_word_sad(s0: int, s1: int, s2: int) -> int:
+            # Bug: whole word diff instead of per-half isolation
+            diff = abs((s0 & MASK32) - (s1 & MASK32))
+            return (s2 + diff) & MASK32
+
+        s0 = 0x0001_0000  # half 0 = 0, half 1 = 1
+        s1 = 0x0000_0001  # half 0 = 1, half 1 = 0
+        s2 = 0
+
+        # Oracle: half 0 |0 - 1| = 1; half 1 is masked (s1 half 1 == 0) -> diff = 1
+        oracle_res = oracle_v_msad_u16(s0, s1, s2)
+        mutant_res = mutant_whole_word_sad(s0, s1, s2)
+
+        self.assertEqual(oracle_res, 1)
+        # Mutant: |0x10000 - 0x1| = 0xFFFF = 65535
+        self.assertEqual(mutant_res, 65535)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_shift_half_sum_hi_detected(self) -> None:
+        """Mutant: Shifts half sum left by 16 bits."""
+        def mutant_sad_hi_msad(s0: int, s1: int, s2: int) -> int:
+            h0_lanes = unpack_halves_u32(s0)
+            h1_lanes = unpack_halves_u32(s1)
+            diff = sum(0 if h1 == 0 else abs(h0 - h1) for h0, h1 in zip(h0_lanes, h1_lanes))
+            # Bug: shifts left by 16
+            return (s2 + (diff << 16)) & MASK32
+
+        s0 = pack_halves_u32(1, 1)
+        s1 = pack_halves_u32(2, 2)  # diff = 2
+        s2 = 0
+
+        oracle_res = oracle_v_msad_u16(s0, s1, s2)
+        mutant_res = mutant_sad_hi_msad(s0, s1, s2)
+
+        self.assertEqual(oracle_res, 2)
+        self.assertEqual(mutant_res, 2 << 16)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+
 if __name__ == "__main__":
     unittest.main()
