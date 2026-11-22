@@ -644,5 +644,116 @@ class TestValuDot4U32U8SIMDMultiLane(unittest.TestCase):
             self.assertEqual(results[lane], expected_sum)
 
 
+class TestValuDot4U32U8RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_dst_aliases_src2_accumulator(self) -> None:
+        regs = ScalarRegisterFile()
+        interp = ScalarVALUInterpreter(regs)
+
+        # In-place accumulation: v0 = v1 . v2 + v0
+        regs.write(Operand.vgpr(0), 1000)
+        regs.write(Operand.vgpr(1), 0x01020304)
+        regs.write(Operand.vgpr(2), 0x05060708)
+
+        instr = VDot4U32U8Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(0),  # aliased
+        )
+
+        res = interp.step(instr)
+        self.assertEqual(res, 1070)
+        self.assertEqual(regs.read(Operand.vgpr(0)), 1070)
+        # src0 and src1 remain uncorrupted
+        self.assertEqual(regs.read(Operand.vgpr(1)), 0x01020304)
+        self.assertEqual(regs.read(Operand.vgpr(2)), 0x05060708)
+
+    def test_dst_aliases_src0(self) -> None:
+        regs = ScalarRegisterFile()
+        interp = ScalarVALUInterpreter(regs)
+
+        # v0 = v0 . v1 + v2
+        regs.write(Operand.vgpr(0), 0x01020304)
+        regs.write(Operand.vgpr(1), 0x05060708)
+        regs.write(Operand.vgpr(2), 100)
+
+        instr = VDot4U32U8Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(0),  # aliased with dst
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2),
+        )
+
+        res = interp.step(instr)
+        self.assertEqual(res, 170)
+        self.assertEqual(regs.read(Operand.vgpr(0)), 170)
+
+    def test_dst_aliases_src1(self) -> None:
+        regs = ScalarRegisterFile()
+        interp = ScalarVALUInterpreter(regs)
+
+        # v0 = v1 . v0 + v2
+        regs.write(Operand.vgpr(1), 0x01020304)
+        regs.write(Operand.vgpr(0), 0x05060708)
+        regs.write(Operand.vgpr(2), 50)
+
+        instr = VDot4U32U8Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(0),  # aliased with dst
+            src2=Operand.vgpr(2),
+        )
+
+        res = interp.step(instr)
+        self.assertEqual(res, 120)
+        self.assertEqual(regs.read(Operand.vgpr(0)), 120)
+
+    def test_dst_aliases_all_operands(self) -> None:
+        regs = ScalarRegisterFile()
+        interp = ScalarVALUInterpreter(regs)
+
+        # v0 = v0 . v0 + v0
+        # For v0 = 0x01010101: 4 * (1 * 1) = 4. 4 + 0x01010101 = 0x01010105
+        regs.write(Operand.vgpr(0), 0x01010101)
+
+        instr = VDot4U32U8Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(0),
+            src2=Operand.vgpr(0),
+        )
+
+        res = interp.step(instr)
+        self.assertEqual(res, 0x01010105)
+        self.assertEqual(regs.read(Operand.vgpr(0)), 0x01010105)
+
+    def test_simd_aliased_in_place_preservation_with_exec_mask(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0x0000FFFF)  # lanes 0..15 active
+        interp = SIMDInterpreter()
+
+        initial_acc = 5000
+        for lane in range(32):
+            state.write_lane(Operand.vgpr(0), lane, initial_acc)
+            state.write_lane(Operand.vgpr(1), lane, 0x01020304)
+            state.write_lane(Operand.vgpr(2), lane, 0x05060708)
+
+        instr = VDot4U32U8Instruction(
+            dst=Operand.vgpr(0),  # aliased with src2 accumulator
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(0),
+        )
+
+        interp.step(instr, state)
+
+        for lane in range(32):
+            if lane < 16:
+                self.assertEqual(state.read_lane(Operand.vgpr(0), lane), initial_acc + 70)
+            else:
+                self.assertEqual(state.read_lane(Operand.vgpr(0), lane), initial_acc)
+
+
 if __name__ == "__main__":
     unittest.main()
