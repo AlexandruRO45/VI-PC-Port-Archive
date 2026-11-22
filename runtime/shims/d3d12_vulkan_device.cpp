@@ -463,6 +463,22 @@ struct DeviceState {
         return VK_SAMPLE_COUNT_1_BIT;
     }
 
+    // D24S8 creation and capability queries must agree on the backing format.
+    Format depth24_backing(Format format) const {
+        format.d24 = format.format == VK_FORMAT_D24_UNORM_S8_UINT;  // native or not: clears are quantised
+        if (format.d24 && format_properties && !depth_usable(format.format)) {
+            format.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+            format.d24_as_float = true;
+        }
+        return format;
+    }
+
+    Format texture_query_format(DXGI_FORMAT dxgi) const {
+        Format format = texture_storage_format(dxgi, false);
+        if (format.format == VK_FORMAT_UNDEFINED) format = vulkan_format(dxgi, true);
+        return depth24_backing(format);
+    }
+
     // The format a texture description is created with, D24S8 and R9G9B9E5 UAV fallbacks included.
     Format texture_format(const D3D12_RESOURCE_DESC& desc) const {
         if (!xr_bias_compatible(desc)) return {};
@@ -490,13 +506,10 @@ struct DeviceState {
                 log_once("96-bit (R32G32B32) render targets not supported; format", desc.Format);
             return {};
         }
-        Format format = texture_storage_format(desc.Format, desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
-        format.d24 = format.format == VK_FORMAT_D24_UNORM_S8_UINT;  // native or not: clears are quantised
-        if (format.format == VK_FORMAT_D24_UNORM_S8_UINT && !depth_usable(format.format)) {
+        const Format format = depth24_backing(
+            texture_storage_format(desc.Format, desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
+        if (format.d24_as_float)
             log_once("D24_UNORM_S8_UINT unavailable, using D32_SFLOAT_S8_UINT; format", desc.Format);
-            format.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
-            format.d24_as_float = true;
-        }
         return format;
     }
 
@@ -3089,9 +3102,8 @@ public:
             auto* fs = static_cast<D3D12_FEATURE_DATA_FORMAT_SUPPORT*>(data);
             fs->Support1 = D3D12_FORMAT_SUPPORT1_NONE;
             fs->Support2 = D3D12_FORMAT_SUPPORT2_NONE;
-            const Format fmt = texture_storage_format(fs->Format, false);
-            const Format depth_fmt = vulkan_format(fs->Format, true);
-            const VkFormat vk_fmt = fmt.format != VK_FORMAT_UNDEFINED ? fmt.format : depth_fmt.format;
+            const Format fmt = state_.texture_query_format(fs->Format);
+            const VkFormat vk_fmt = fmt.format;
             if (vk_fmt == VK_FORMAT_UNDEFINED || !state_.format_properties) {
                 return d3d12_trace::result(method, DXGI_ERROR_UNSUPPORTED);
             }
@@ -3223,13 +3235,7 @@ public:
             if (alpha_only && levels->SampleCount != 1) return d3d12_trace::result(method, S_OK);
             if (levels->Format == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM && levels->SampleCount != 1)
                 return d3d12_trace::result(method, S_OK);  // single-sample 2D only; no quality levels
-            Format format = texture_storage_format(levels->Format, false);
-            if (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
-                D3D12_RESOURCE_DESC depth_desc{};
-                depth_desc.Format = levels->Format;
-                depth_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-                format = state_.texture_format(depth_desc);  // includes the D24-to-D32 fallback used by creation
-            }
+            const Format format = state_.texture_query_format(levels->Format);
             if (format.format == VK_FORMAT_UNDEFINED || !state_.image_format_properties)
                 return d3d12_trace::result(method, DXGI_ERROR_UNSUPPORTED);
             if (format.rgb96) {  // no 96-bit render targets yet, so no multisampled ones
