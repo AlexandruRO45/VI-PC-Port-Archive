@@ -29,7 +29,10 @@ int main() {
     limits.maxVertexInputBindings = 4;
     limits.maxVertexInputAttributeOffset = 32;
     VertexLayout result;
-    CHECK(build_vertex_layout({elements, 3}, vs, limits, result) == S_OK);
+    const auto build = [&](UINT count, bool divisor_supported = false) {
+        return build_vertex_layout({elements, count}, vs, limits, divisor_supported, result);
+    };
+    CHECK(build(3) == S_OK);
     CHECK(result.attributes.size() == 3 && result.bindings.size() == 2 && result.slots == 9);
     CHECK(result.zero_step_slots == 8 && result.bindings[1].inputRate == VK_VERTEX_INPUT_RATE_INSTANCE);
     CHECK(result.attributes[0].location == 1 && result.attributes[0].offset == 4);
@@ -37,35 +40,43 @@ int main() {
           result.attributes[1].offset == 16 && result.attributes[1].format == VK_FORMAT_R32G32_SINT);
     CHECK(result.attributes[2].location == 0 && result.attributes[2].binding == 3 &&
           result.attributes[2].offset == 8 && result.attributes[2].format == VK_FORMAT_R32G32_UINT);
+    CHECK(result.divisors.empty());
+
+    elements[2].InstanceDataStepRate = 2;
+    CHECK(build(3) == E_NOTIMPL);
+    CHECK(build(3, true) == S_OK);
+    CHECK(result.divisors.size() == 1 && result.divisors[0].binding == 3 && result.divisors[0].divisor == 2);
+    CHECK(result.zero_step_slots == 0);
+    elements[2].InstanceDataStepRate = 0;
 
     // Reverse the two TEXCOORD elements and interleave them in one buffer instead.
     std::swap(elements[1], elements[2]);
     elements[1].InputSlot = 0;
     elements[1].AlignedByteOffset = 16;
     elements[1].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
-    CHECK(build_vertex_layout({elements, 3}, vs, limits, result) == S_OK);
+    CHECK(build(3) == S_OK);
     CHECK(result.attributes.size() == 3 && result.bindings.size() == 1 && result.slots == 1);
     CHECK(result.attributes[1].location == 0 && result.attributes[1].offset == 16);
     CHECK(result.attributes[2].location == 2 && result.attributes[2].offset == 24);
 
-    CHECK(build_vertex_layout({elements, 2}, vs, limits, result) == E_INVALIDARG);
+    CHECK(build(2) == E_INVALIDARG);
     elements[2].SemanticIndex = 3;
-    CHECK(build_vertex_layout({elements, 3}, vs, limits, result) == E_INVALIDARG);
+    CHECK(build(3) == E_INVALIDARG);
     elements[2].SemanticIndex = 7;
     elements[2].SemanticName = "COLOR";
-    CHECK(build_vertex_layout({elements, 3}, vs, limits, result) == E_INVALIDARG);
+    CHECK(build(3) == E_INVALIDARG);
     elements[2].SemanticName = "TexCoord";
     limits.maxVertexInputAttributes = 2;
-    CHECK(build_vertex_layout({elements, 3}, vs, limits, result) == E_INVALIDARG);
+    CHECK(build(3) == E_INVALIDARG);
     limits.maxVertexInputAttributes = 3;
     limits.maxVertexInputAttributeOffset = 23;
-    CHECK(build_vertex_layout({elements, 3}, vs, limits, result) == E_INVALIDARG);
+    CHECK(build(3) == E_INVALIDARG);
     limits.maxVertexInputAttributeOffset = 32;
     vs.input_signature[0].location.reset();
-    CHECK(build_vertex_layout({elements, 3}, vs, limits, result) == E_INVALIDARG);
+    CHECK(build(3) == E_INVALIDARG);
 
     // An index without a location field still binds an ordinary input by register.
     vs.input_signature.erase(vs.input_signature.begin(), vs.input_signature.begin() + 2);
-    CHECK(build_vertex_layout({elements, 1}, vs, limits, result) == S_OK);
+    CHECK(build(1) == S_OK);
     CHECK(result.attributes.size() == 1 && result.attributes[0].location == 1);
 }
