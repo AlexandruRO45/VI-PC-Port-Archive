@@ -11,7 +11,6 @@ Standard library only. Never reads or exports game content; reports only sizes, 
 from __future__ import annotations
 
 import argparse
-import compileall
 import hashlib
 import json
 import os
@@ -540,23 +539,41 @@ def validate_codebase(root_dir: str = ROOT_DIR) -> ValidationReport:
         ),
     ))
 
-    # 3. Python syntax compilation
+    # 3. Python syntax check (in-memory compile so it works in read-only bundles too)
     compile_targets = [
         os.path.join(root_dir, "make_game.py"),
         os.path.join(root_dir, "tools"),
         os.path.join(root_dir, "gui"),
     ]
     compile_ok = True
+    syntax_errors: list[str] = []
+
+    def _check_py_file(fpath: str) -> None:
+        nonlocal compile_ok
+        try:
+            with open(fpath, encoding="utf-8", errors="replace") as f:
+                compile(f.read(), fpath, "exec")
+        except (SyntaxError, ValueError, OSError) as exc:
+            compile_ok = False
+            syntax_errors.append(f"{os.path.relpath(fpath, root_dir)}: {exc}")
+
     for target in compile_targets:
         if os.path.isfile(target):
-            compile_ok = compileall.compile_file(target, quiet=2) and compile_ok
+            _check_py_file(target)
         elif os.path.isdir(target):
-            compile_ok = compileall.compile_dir(target, quiet=2, maxlevels=4) and compile_ok
+            for base, dirs, files in os.walk(target):
+                dirs[:] = [d for d in dirs if d != "__pycache__"]
+                for fname in sorted(files):
+                    if fname.endswith(".py"):
+                        _check_py_file(os.path.join(base, fname))
     checks.append(CheckItem(
         id="python_syntax",
-        name="Python Bytecode Compilation",
+        name="Python Syntax Validation",
         status="ok" if compile_ok else "error",
-        detail="make_game.py, tools/, and gui/ compiled cleanly." if compile_ok else "Syntax error detected.",
+        detail=(
+            "make_game.py, tools/, and gui/ parsed cleanly."
+            if compile_ok else "; ".join(syntax_errors[:5])
+        ),
     ))
 
     # 4. No-game-data check (via git ls-files when inside a git checkout)
