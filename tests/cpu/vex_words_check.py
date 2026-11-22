@@ -101,6 +101,7 @@ def code_offsets(image, name):
 # Hand-encoded leaf bodies that the profile excludes, each with the disassembly iced must report
 # (checked first, so a wrong encoding fails the test instead of passing vacuously) and the reason.
 REJECTED = (
+    ("C5 F1 FD C2", "vpaddw xmm0,xmm1,xmm2", "undefined XMM source"),
     ("62 F1 75 09 FD C2", "vpaddw xmm0{k1},xmm1,xmm2", "non-VEX encoding"),
     ("66 0F FD C1", "paddw xmm0,xmm1", "non-VEX encoding"),
     ("C5 F9 FD F1", "vpaddw xmm6,xmm0,xmm1", "nonvolatile XMM register"),
