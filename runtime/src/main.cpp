@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <map>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "base_reservation.h"
@@ -65,9 +66,12 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--init") init = true;
         else if (a == L"--run") run = true;
         else if (a == L"--trace-d3d12") trace_d3d12 = true;
-        else if (a == L"--game-dir" && i + 1 < argc) game_dir = argv[++i];
-        else if (a == L"--overlay" && i + 1 < argc) overlay_dir = argv[++i];
-        else if (image.empty()) image = a;
+        else if (a == L"--game-dir" || a == L"--overlay") {
+            if (i + 1 >= argc) return usage();
+            const std::wstring_view value = argv[i + 1];
+            if (value.empty() || value.starts_with(L"--")) return usage();
+            (a == L"--game-dir" ? game_dir : overlay_dir) = argv[++i];
+        } else if (!a.starts_with(L"--") && image.empty()) image = a;
         else return usage();
     }
     if (image.empty()) return usage();
