@@ -246,6 +246,97 @@ class DSCmpstRtnB64Instruction:
         return f"{parts[0]} {', '.join(parts[1:])}"
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarState:
+    """Scalar machine state comprising 32-bit/64-bit register files and LDS memory."""
+
+    def __init__(self, lds_size_dwords: int = LDS_SIZE_DWORDS) -> None:
+        self.vgprs: list[int] = [0] * DEFAULT_NUM_VGPRS
+        self.sgprs: list[int] = [0] * DEFAULT_NUM_SGPRS
+        self.lds: LDSMemory = LDSMemory(size_dwords=lds_size_dwords)
+
+    def get_vgpr(self, index: int) -> int:
+        return self.vgprs[index]
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        self.vgprs[index] = u32(val)
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index]
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        self.sgprs[index] = u32(val)
+
+    def get_u64_vgpr(self, base_index: int) -> int:
+        return combine_u32s_to_u64(self.get_vgpr(base_index), self.get_vgpr(base_index + 1))
+
+    def set_u64_vgpr(self, base_index: int, val64: int) -> None:
+        lo, hi = split_u64_to_u32s(val64)
+        self.set_vgpr(base_index, lo)
+        self.set_vgpr(base_index + 1, hi)
+
+    def get_reg_single(self, reg: RegSingle) -> int:
+        if reg.reg_type == RegType.VGPR:
+            return self.get_vgpr(reg.index)
+        return self.get_sgpr(reg.index)
+
+    def set_reg_single(self, reg: RegSingle, val: int) -> None:
+        if reg.reg_type == RegType.VGPR:
+            self.set_vgpr(reg.index, val)
+        else:
+            self.set_sgpr(reg.index, val)
+
+    def get_reg_pair(self, reg: RegPair) -> int:
+        if reg.reg_type == RegType.VGPR:
+            return self.get_u64_vgpr(reg.index)
+        return combine_u32s_to_u64(self.get_sgpr(reg.index), self.get_sgpr(reg.index + 1))
+
+    def set_reg_pair(self, reg: RegPair, val64: int) -> None:
+        if reg.reg_type == RegType.VGPR:
+            self.set_u64_vgpr(reg.index, val64)
+        else:
+            lo, hi = split_u64_to_u32s(val64)
+            self.set_sgpr(reg.index, lo)
+            self.set_sgpr(reg.index + 1, hi)
+
+    def resolve_operand64(self, op: Operand64) -> int:
+        if isinstance(op, Immediate64):
+            return op.val
+        return self.get_reg_pair(op)
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for ds_cmpst_rtn_b64."""
+
+    def execute(self, instr: DSCmpstRtnB64Instruction, state: ScalarState) -> Tuple[int, int, bool]:
+        """Execute a single ds_cmpst_rtn_b64 instruction on scalar state.
+
+        Returns:
+            Tuple[int, int, bool]: (old_val64, new_mem64, swapped)
+        """
+        # 1. Latch inputs prior to any register writeback
+        vaddr = state.get_reg_single(instr.vaddr)
+        cmp_val = state.resolve_operand64(instr.vdata0)
+        new_val = state.resolve_operand64(instr.vdata1)
+
+        # 2. Perform atomic LDS 64-bit compare-and-swap
+        old_val, new_mem, swapped = state.lds.atomic_cmpst_rtn_b64(
+            vaddr=vaddr,
+            cmp_val64=cmp_val,
+            new_val64=new_val,
+            offset=instr.offset,
+        )
+
+        # 3. Write pre-operation original 64-bit value back to destination register pair
+        state.set_reg_pair(instr.vdst, old_val)
+
+        return old_val, new_mem, swapped
+
+
+
 
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Phase 1: Unit tests for reference mathematical oracle and architectural model."""
@@ -401,6 +492,95 @@ class TestSymbolicAST(unittest.TestCase):
             DSCmpstRtnB64Instruction(vdst=v0, vaddr=v1, vdata0=v0, vdata1=v0, offset=65536)
 
 
+class TestScalarInterpreter(unittest.TestCase):
+    """Phase 3: Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.state = ScalarState(lds_size_dwords=1024)
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_64bit_cmpst_match_execution(self) -> None:
+        addr = 0x40
+        initial_val = 0x1122_3344_5566_7788
+        new_val = 0x99AA_BBCC_DDEE_FF00
+
+        self.state.lds.write_qword(addr, initial_val)
+        self.state.set_reg_single(RegSingle(1), addr)
+        self.state.set_reg_pair(RegPair(2), initial_val)  # v[2:3] = cmp_val
+        self.state.set_reg_pair(RegPair(4), new_val)      # v[4:5] = new_val
+        self.state.set_reg_pair(RegPair(6), 0xDEAD_BEEF)  # v[6:7] = sentinel
+
+        instr = DSCmpstRtnB64Instruction(
+            vdst=RegPair(6),
+            vaddr=RegSingle(1),
+            vdata0=RegPair(2),
+            vdata1=RegPair(4),
+            offset=0,
+        )
+
+        old_val, new_mem, swapped = self.interp.execute(instr, self.state)
+
+        self.assertTrue(swapped)
+        self.assertEqual(old_val, initial_val)
+        self.assertEqual(new_mem, new_val)
+        self.assertEqual(self.state.get_reg_pair(RegPair(6)), initial_val)
+        self.assertEqual(self.state.lds.read_qword(addr), new_val)
+
+    def test_scalar_64bit_cmpst_mismatch_execution(self) -> None:
+        addr = 0x40
+        initial_val = 0x1122_3344_5566_7788
+        cmp_val = 0x1122_3344_0000_0000
+
+        self.state.lds.write_qword(addr, initial_val)
+        self.state.set_reg_single(RegSingle(1), addr)
+        self.state.set_reg_pair(RegPair(2), cmp_val)
+        self.state.set_reg_pair(RegPair(4), 0x9999_9999_9999_9999)
+
+        instr = DSCmpstRtnB64Instruction(
+            vdst=RegPair(6),
+            vaddr=RegSingle(1),
+            vdata0=RegPair(2),
+            vdata1=RegPair(4),
+            offset=0,
+        )
+
+        old_val, new_mem, swapped = self.interp.execute(instr, self.state)
+
+        self.assertFalse(swapped)
+        self.assertEqual(old_val, initial_val)
+        self.assertEqual(new_mem, initial_val)
+        self.assertEqual(self.state.get_reg_pair(RegPair(6)), initial_val)
+        self.assertEqual(self.state.lds.read_qword(addr), initial_val)
+
+    def test_scalar_execution_with_offset(self) -> None:
+        base_addr = 0x100
+        offset = 0x18
+        eff_addr = base_addr + offset
+
+        initial_val = 0xCAFE_BABE_0123_4567
+        new_val = 0x5555_AAAA_6666_BBBB
+
+        self.state.lds.write_qword(eff_addr, initial_val)
+        self.state.set_reg_single(RegSingle(1), base_addr)
+
+        instr = DSCmpstRtnB64Instruction(
+            vdst=RegPair(0),
+            vaddr=RegSingle(1),
+            vdata0=Immediate64(initial_val),
+            vdata1=Immediate64(new_val),
+            offset=offset,
+        )
+
+        old_val, new_mem, swapped = self.interp.execute(instr, self.state)
+
+        self.assertTrue(swapped)
+        self.assertEqual(old_val, initial_val)
+        self.assertEqual(new_mem, new_val)
+        self.assertEqual(self.state.get_reg_pair(RegPair(0)), initial_val)
+        self.assertEqual(self.state.lds.read_qword(eff_addr), new_val)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
