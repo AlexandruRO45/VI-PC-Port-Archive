@@ -1163,5 +1163,204 @@ class TestRegisterAliasingAndPreservation(unittest.TestCase):
             self.assertEqual(state.lds.read_dword(addr), 0x8000_0000 | (1 << lane))
 
 
+# ==============================================================================
+# Phase 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class AtomicBitwiseFlags:
+    """Architectural condition codes, status flags, and arithmetic analysis for ds_or_rtn_b32."""
+    zero: bool
+    negative: bool
+    old_zero: bool
+    old_negative: bool
+    parity_even: bool
+    popcount: int
+    changed: bool
+    bits_added: int
+    unaligned_addr: bool
+    bank: int
+    carry_or_sum: bool
+    borrow: bool
+
+
+def evaluate_ds_or_flags(
+    old_val: int,
+    or_val: int,
+    new_mem: int,
+    eff_addr: int,
+) -> AtomicBitwiseFlags:
+    """Evaluate condition codes, bitwise status flags, and arithmetic carry/borrow metrics."""
+    u_old = old_val & MASK_32
+    u_or = or_val & MASK_32
+    u_new = new_mem & MASK_32
+
+    zero = (u_new == 0)
+    negative = bool(u_new & 0x8000_0000)
+    old_zero = (u_old == 0)
+    old_negative = bool(u_old & 0x8000_0000)
+
+    popcount = bin(u_new).count("1")
+    parity_even = (popcount % 2 == 0)
+
+    bits_added = (u_or & (~u_old)) & MASK_32
+    changed = (bits_added != 0)
+
+    unaligned = bool(eff_addr & 0x3)
+    bank = calc_lds_bank(eff_addr)
+
+    carry_or_sum = ((u_old + u_or) > MASK_32)
+    borrow = (u_old < u_or)
+
+    return AtomicBitwiseFlags(
+        zero=zero,
+        negative=negative,
+        old_zero=old_zero,
+        old_negative=old_negative,
+        parity_even=parity_even,
+        popcount=popcount,
+        changed=changed,
+        bits_added=bits_added,
+        unaligned_addr=unaligned,
+        bank=bank,
+        carry_or_sum=carry_or_sum,
+        borrow=borrow,
+    )
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Phase 6: Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def test_flags_zero_result(self) -> None:
+        flags = evaluate_ds_or_flags(
+            old_val=0,
+            or_val=0,
+            new_mem=0,
+            eff_addr=0x100,
+        )
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertTrue(flags.old_zero)
+        self.assertFalse(flags.old_negative)
+        self.assertTrue(flags.parity_even)
+        self.assertEqual(flags.popcount, 0)
+        self.assertFalse(flags.changed)
+        self.assertEqual(flags.bits_added, 0)
+        self.assertFalse(flags.unaligned_addr)
+        self.assertEqual(flags.bank, (0x100 >> 2) & 31)
+
+    def test_flags_negative_msb_set(self) -> None:
+        flags = evaluate_ds_or_flags(
+            old_val=0x0000_0001,
+            or_val=0x8000_0000,
+            new_mem=0x8000_0001,
+            eff_addr=0x200,
+        )
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.negative)
+        self.assertFalse(flags.old_zero)
+        self.assertFalse(flags.old_negative)
+        self.assertEqual(flags.popcount, 2)
+        self.assertTrue(flags.parity_even)
+        self.assertTrue(flags.changed)
+        self.assertEqual(flags.bits_added, 0x8000_0000)
+
+    def test_flags_old_zero_and_negative(self) -> None:
+        flags = evaluate_ds_or_flags(
+            old_val=0x8000_0000,
+            or_val=0x0000_0002,
+            new_mem=0x8000_0002,
+            eff_addr=0x300,
+        )
+        self.assertFalse(flags.old_zero)
+        self.assertTrue(flags.old_negative)
+        self.assertTrue(flags.negative)
+        self.assertTrue(flags.changed)
+        self.assertEqual(flags.bits_added, 0x0000_0002)
+
+    def test_flags_parity_and_popcount(self) -> None:
+        # Odd popcount: 0b111 = 3 bits set -> parity_even is False
+        flags_odd = evaluate_ds_or_flags(0, 0b111, 0b111, eff_addr=0x400)
+        self.assertEqual(flags_odd.popcount, 3)
+        self.assertFalse(flags_odd.parity_even)
+
+        # Even popcount: 0b1111 = 4 bits set -> parity_even is True
+        flags_even = evaluate_ds_or_flags(0, 0b1111, 0b1111, eff_addr=0x400)
+        self.assertEqual(flags_even.popcount, 4)
+        self.assertTrue(flags_even.parity_even)
+
+    def test_flags_changed_and_bits_added(self) -> None:
+        # Subsumed mask: ORing 0x01 into memory that already has 0x03
+        flags_unchanged = evaluate_ds_or_flags(
+            old_val=0x03,
+            or_val=0x01,
+            new_mem=0x03,
+            eff_addr=0x500,
+        )
+        self.assertFalse(flags_unchanged.changed)
+        self.assertEqual(flags_unchanged.bits_added, 0)
+
+        # New bits added: ORing 0x04 into memory that has 0x03
+        flags_changed = evaluate_ds_or_flags(
+            old_val=0x03,
+            or_val=0x04,
+            new_mem=0x07,
+            eff_addr=0x500,
+        )
+        self.assertTrue(flags_changed.changed)
+        self.assertEqual(flags_changed.bits_added, 0x04)
+
+    def test_flags_unaligned_address_detection(self) -> None:
+        flags_aligned = evaluate_ds_or_flags(0, 0, 0, eff_addr=0x1000)
+        self.assertFalse(flags_aligned.unaligned_addr)
+
+        for byte_off in (1, 2, 3):
+            flags_unaligned = evaluate_ds_or_flags(0, 0, 0, eff_addr=0x1000 + byte_off)
+            self.assertTrue(flags_unaligned.unaligned_addr)
+
+    def test_flags_bank_selection(self) -> None:
+        for bank_idx in range(32):
+            addr = bank_idx * 4
+            flags = evaluate_ds_or_flags(0, 0, 0, eff_addr=addr)
+            self.assertEqual(flags.bank, bank_idx)
+
+    def test_flags_carry_and_borrow_metrics(self) -> None:
+        # Carry if addition would overflow: 0xFFFFFFFF + 1 > 0xFFFFFFFF
+        flags_carry = evaluate_ds_or_flags(
+            old_val=0xFFFF_FFFF,
+            or_val=0x0000_0001,
+            new_mem=0xFFFF_FFFF,
+            eff_addr=0x600,
+        )
+        self.assertTrue(flags_carry.carry_or_sum)
+
+        # No carry if sum fits: 0x1000 + 0x2000
+        flags_no_carry = evaluate_ds_or_flags(
+            old_val=0x1000,
+            or_val=0x2000,
+            new_mem=0x3000,
+            eff_addr=0x600,
+        )
+        self.assertFalse(flags_no_carry.carry_or_sum)
+
+        # Borrow when old_val < or_val
+        flags_borrow = evaluate_ds_or_flags(
+            old_val=10,
+            or_val=20,
+            new_mem=30,
+            eff_addr=0x600,
+        )
+        self.assertTrue(flags_borrow.borrow)
+
+        # No borrow when old_val >= or_val
+        flags_no_borrow = evaluate_ds_or_flags(
+            old_val=20,
+            or_val=10,
+            new_mem=30,
+            eff_addr=0x600,
+        )
+        self.assertFalse(flags_no_borrow.borrow)
+
+
 if __name__ == "__main__":
     unittest.main()
