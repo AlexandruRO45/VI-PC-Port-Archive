@@ -400,6 +400,70 @@ class ScalarVALUInterpreter:
 
 
 # ==============================================================================
+# SIMD Multi-Lane Execution Engine and EXEC Masking
+# ==============================================================================
+
+@dataclass
+class SIMDState:
+    """Multi-lane SIMD register state representing Wave32 or Wave64."""
+    num_lanes: int
+    exec_mask: Optional[int] = None
+    vgprs: List[List[int]] = field(default_factory=list)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+
+    def __post_init__(self) -> None:
+        if self.num_lanes not in (32, 64):
+            raise ValueError(f"num_lanes must be 32 or 64, got {self.num_lanes}")
+        if not self.vgprs:
+            self.vgprs = [[0] * 256 for _ in range(self.num_lanes)]
+        if self.exec_mask is None:
+            self.exec_mask = (1 << self.num_lanes) - 1
+
+    def read_lane(self, op: Operand, lane: int) -> int:
+        """Read operand value for a specific SIMD lane."""
+        if op.reg_type == RegType.LITERAL:
+            assert op.literal_value is not None
+            if op.literal_bits == 128:
+                return op.literal_value & MASK128
+            if op.literal_bits == 64:
+                return op.literal_value & MASK64
+            return op.literal_value & MASK32
+
+        bank = self.vgprs[lane] if op.reg_type == RegType.VGPR else self.sgprs
+        res = 0
+        for i in range(op.size):
+            res |= (bank[op.index + i] & MASK32) << (32 * i)
+        return res
+
+    def write_lane(self, op: Operand, lane: int, value: int) -> None:
+        """Write value to register operand in a specific lane."""
+        if op.reg_type not in (RegType.VGPR, RegType.SGPR):
+            raise TypeError("Cannot write to literal operand")
+
+        bank = self.vgprs[lane] if op.reg_type == RegType.VGPR else self.sgprs
+        for i in range(op.size):
+            bank[op.index + i] = u32(value >> (32 * i))
+
+
+class SIMDInterpreter:
+    """SIMD instruction interpreter handling multi-lane divergence and EXEC masking."""
+
+    def step(self, instr: VMqsadPkU32U8Instruction, state: SIMDState) -> List[Optional[int]]:
+        results: List[Optional[int]] = [None] * state.num_lanes
+        s0_vals = [state.read_lane(instr.src0, lane) for lane in range(state.num_lanes)]
+        s1_vals = [state.read_lane(instr.src1, lane) for lane in range(state.num_lanes)]
+        s2_vals = [state.read_lane(instr.src2, lane) for lane in range(state.num_lanes)]
+
+        for lane in range(state.num_lanes):
+            if (state.exec_mask & (1 << lane)) != 0:
+                res = ref_mqsad_pk_u32_u8(s0_vals[lane], s1_vals[lane], s2_vals[lane], clamp=instr.clamp)
+                state.write_lane(instr.dst, lane, res)
+                results[lane] = res
+
+        return results
+
+
+# ==============================================================================
 # Unit Tests: Model and Reference Oracle
 # ==============================================================================
 
@@ -697,6 +761,168 @@ class TestValuMqsadPkU32U8ScalarInterpreter(unittest.TestCase):
         res2 = self.interp.step(instr2)
         self.assertEqual(unpack_u32x4(res2), (0, 40, 80, 120))
         self.assertEqual(self.regs.read(Operand.vgpr_quad(12)), res1)
+
+
+class TestValuMqsadPkU32U8SIMDMultiLane(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and EXEC masking."""
+
+    def test_wave32_all_lanes_active(self) -> None:
+        state = SIMDState(num_lanes=32)
+        interp = SIMDInterpreter()
+
+        for lane in range(32):
+            ref = pack_u8x8(lane, lane + 1, lane + 2, lane + 3, lane + 4, lane + 5, lane + 6, lane + 7)
+            query = pack_u8x8(lane, lane + 1, lane + 2, lane + 3, 0, 0, 0, 0) & MASK32
+            acc = pack_u32x4(lane * 10, lane * 20, lane * 30, lane * 40)
+            state.write_lane(Operand.vgpr_pair(4), lane, ref)
+            state.write_lane(Operand.vgpr(6), lane, query)
+            state.write_lane(Operand.vgpr_quad(8), lane, acc)
+
+        instr = VMqsadPkU32U8Instruction(
+            dst=Operand.vgpr_quad(0),
+            src0=Operand.vgpr_pair(4),
+            src1=Operand.vgpr(6),
+            src2=Operand.vgpr_quad(8),
+        )
+
+        results = interp.step(instr, state)
+        self.assertEqual(len(results), 32)
+        for lane in range(32):
+            self.assertIsNotNone(results[lane])
+            read_back = state.read_lane(Operand.vgpr_quad(0), lane)
+            self.assertEqual(results[lane], read_back)
+            d0, d1, d2, d3 = unpack_u32x4(read_back)
+            self.assertEqual(d0, lane * 10)  # SAD=0 + acc[0]
+
+    def test_wave64_all_lanes_active(self) -> None:
+        state = SIMDState(num_lanes=64)
+        interp = SIMDInterpreter()
+
+        for lane in range(64):
+            ref = pack_u8x8(1, 2, 3, 4, 5, 6, 7, 8)
+            query = pack_u8x8(1, 2, 3, 4, 0, 0, 0, 0) & MASK32
+            acc = pack_u32x4(lane, lane, lane, lane)
+            state.write_lane(Operand.vgpr_pair(4), lane, ref)
+            state.write_lane(Operand.vgpr(6), lane, query)
+            state.write_lane(Operand.vgpr_quad(8), lane, acc)
+
+        instr = VMqsadPkU32U8Instruction(
+            dst=Operand.vgpr_quad(0),
+            src0=Operand.vgpr_pair(4),
+            src1=Operand.vgpr(6),
+            src2=Operand.vgpr_quad(8),
+        )
+
+        results = interp.step(instr, state)
+        self.assertEqual(len(results), 64)
+        for lane in range(64):
+            self.assertIsNotNone(results[lane])
+            d0, _, _, _ = unpack_u32x4(state.read_lane(Operand.vgpr_quad(0), lane))
+            self.assertEqual(d0, lane)
+
+    def test_partial_exec_mask_even_lanes(self) -> None:
+        sentinel = (0xDEADBEEF << 96) | (0xCAFEBABE << 64) | (0xBAADF00D << 32) | 0xFEEDFACE
+        state = SIMDState(num_lanes=32, exec_mask=0x55555555)  # even lanes active
+        interp = SIMDInterpreter()
+
+        for lane in range(32):
+            state.write_lane(Operand.vgpr_quad(0), lane, sentinel)
+            ref = pack_u8x8(10, 20, 30, 40, 50, 60, 70, 80)
+            query = pack_u8x8(10, 20, 30, 40, 0, 0, 0, 0) & MASK32
+            acc = 0
+            state.write_lane(Operand.vgpr_pair(4), lane, ref)
+            state.write_lane(Operand.vgpr(6), lane, query)
+            state.write_lane(Operand.vgpr_quad(8), lane, acc)
+
+        instr = VMqsadPkU32U8Instruction(
+            dst=Operand.vgpr_quad(0),
+            src0=Operand.vgpr_pair(4),
+            src1=Operand.vgpr(6),
+            src2=Operand.vgpr_quad(8),
+        )
+
+        results = interp.step(instr, state)
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertIsNotNone(results[lane])
+                self.assertEqual(state.read_lane(Operand.vgpr_quad(0), lane), pack_u32x4(0, 40, 80, 120))
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.read_lane(Operand.vgpr_quad(0), lane), sentinel)
+
+    def test_zero_exec_mask_no_modification(self) -> None:
+        sentinel = 0x99999999888888887777777766666666
+        state = SIMDState(num_lanes=32, exec_mask=0)
+        interp = SIMDInterpreter()
+
+        for lane in range(32):
+            state.write_lane(Operand.vgpr_quad(0), lane, sentinel)
+
+        instr = VMqsadPkU32U8Instruction(
+            dst=Operand.vgpr_quad(0),
+            src0=Operand.literal64(0),
+            src1=Operand.literal(0),
+            src2=Operand.literal128(0),
+        )
+
+        results = interp.step(instr, state)
+        self.assertEqual(results, [None] * 32)
+        for lane in range(32):
+            self.assertEqual(state.read_lane(Operand.vgpr_quad(0), lane), sentinel)
+
+    def test_sgpr_uniform_broadcast_across_divergent_lanes(self) -> None:
+        state = SIMDState(num_lanes=32)
+        interp = SIMDInterpreter()
+
+        query = pack_u8x8(10, 20, 30, 40, 0, 0, 0, 0) & MASK32
+        acc = pack_u32x4(100, 200, 300, 400)
+        state.sgprs[2] = query
+        for i in range(4):
+            state.sgprs[4 + i] = extract_u32(acc, i)
+
+        for lane in range(32):
+            ref = pack_u8x8(10 + lane, 20, 30, 40, 50, 60, 70, 80)
+            state.write_lane(Operand.vgpr_pair(4), lane, ref)
+
+        instr = VMqsadPkU32U8Instruction(
+            dst=Operand.vgpr_quad(0),
+            src0=Operand.vgpr_pair(4),
+            src1=Operand.sgpr(2),
+            src2=Operand.sgpr_quad(4),
+        )
+
+        results = interp.step(instr, state)
+        for lane in range(32):
+            d0, _, _, _ = unpack_u32x4(state.read_lane(Operand.vgpr_quad(0), lane))
+            self.assertEqual(d0, 100 + lane)
+
+    def test_wave64_upper_divergence(self) -> None:
+        state = SIMDState(num_lanes=64, exec_mask=0xFFFF_FFFF_0000_0000)
+        interp = SIMDInterpreter()
+        sentinel = 0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+
+        for lane in range(64):
+            state.write_lane(Operand.vgpr_quad(0), lane, sentinel)
+            ref = pack_u8x8(1, 2, 3, 4, 5, 6, 7, 8)
+            query = pack_u8x8(1, 2, 3, 4, 0, 0, 0, 0) & MASK32
+            state.write_lane(Operand.vgpr_pair(4), lane, ref)
+            state.write_lane(Operand.vgpr(6), lane, query)
+
+        instr = VMqsadPkU32U8Instruction(
+            dst=Operand.vgpr_quad(0),
+            src0=Operand.vgpr_pair(4),
+            src1=Operand.vgpr(6),
+            src2=Operand.literal128(0),
+        )
+
+        results = interp.step(instr, state)
+        for lane in range(64):
+            if lane < 32:
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.read_lane(Operand.vgpr_quad(0), lane), sentinel)
+            else:
+                self.assertIsNotNone(results[lane])
+                self.assertNotEqual(state.read_lane(Operand.vgpr_quad(0), lane), sentinel)
 
 
 if __name__ == "__main__":
