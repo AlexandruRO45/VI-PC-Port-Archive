@@ -7,7 +7,7 @@ from pathlib import Path
 
 def compute_header(asm_path):
     # Default: four user SGPRs (V#), TGID_X, 512 bytes LDS, 64 threads.
-    rsrc2, group = 0x8088, (64, 1, 1)
+    rsrc2, group, wave = 0x8088, (64, 1, 1), None
     for line in Path(asm_path).read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
@@ -19,8 +19,13 @@ def compute_header(asm_path):
             group = tuple(map(int, size.groups()))
         elif line[1:].lstrip().startswith("rsrc2:"):
             rsrc2 = int(line.split(":", 1)[1].strip(), 0)
+        elif line[1:].lstrip().startswith("fssm-wave:"):   # a real FSSM header (magic and the wave size flag), 32 or 64
+            wave = int(line.split(":", 1)[1].strip(), 0)
     header = bytearray(0x148)
     struct.pack_into("<4I", header, 0x138, rsrc2, *group)
+    if wave:
+        header[0:4] = b"FSSM"
+        struct.pack_into("<I", header, 0xD4, 0x20 if wave == 32 else 0)
     return header
 
 

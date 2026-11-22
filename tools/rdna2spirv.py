@@ -10954,6 +10954,12 @@ WAVE64_RE = re.compile(
     r"exec_hi|v_mbcnt_hi_u32_b32|_saveexec_b64|_wrexec_b64|"
     r"s_bcnt[01]_i32_b64|s_ff[01]_i32_b64|s_wqm_b64|s_bfm_b64"
 )
+# The markers above that wave32 code can never contain: a wave64 FSSM header is not contradicted by anything else.
+# s_bcnt/s_ff on a 64-bit SGPR pair and v_mbcnt_hi are plain data ops that wave32 compiler output uses too (LLVM
+# -mno-wavefrontsize64 emits s_bcnt1_i32_b64 and s_ff1_i32_b64 for a 64-bit popcount / ctz), so they only imply wave64
+# when no FSSM header says otherwise; s_wqm_b64 and s_bfm_b64 stay here because the translator models their result as a
+# lane mask, which a wave32 shader does not have.
+WAVE64_ONLY_RE = re.compile(r"exec_hi|_saveexec_b64|_wrexec_b64|s_wqm_b64|s_bfm_b64")
 # Wave32-only EXEC mask ops, used to catch a wave64 FSSM header contradicting wave32 code.
 WAVE32_RE = re.compile(r"_(?:saveexec|wrexec)_b32\b")
 
@@ -11622,6 +11628,9 @@ def translate(path):
     code_w64 = any(WAVE64_RE.search(" ".join([i["op"]] + [x.get("t", "") for x in i["args"]])) or
                    (base_op(i["op"]).endswith("_b64") and any(x.get("t") in ("exec", "vcc") for x in i["args"]))
                    for i in insns)
+    code_w64_only = any(WAVE64_ONLY_RE.search(" ".join([i["op"]] + [x.get("t", "") for x in i["args"]])) or
+                        (base_op(i["op"]).endswith("_b64") and any(x.get("t") in ("exec", "vcc") for x in i["args"]))
+                        for i in insns)
     code_w32 = any(WAVE32_RE.search(i["op"]) for i in insns)
     # Authoritative wave size from the FSSM header flags at 0xD4 bit 5 (0x20 = wave32, 0 = wave64;
     # verified with 0 contradictions across all 26,503 corpus blobs). Falls back to the code-marker
@@ -11635,7 +11644,7 @@ def translate(path):
     except OSError:
         pass
     if fssm_ws is not None:
-        if fssm_ws == 32 and code_w64:
+        if fssm_ws == 32 and code_w64_only:
             raise Unsupported("FSSM wave32 header contradicts wave64 code")
         if fssm_ws == 64 and code_w32:
             raise Unsupported("FSSM wave64 header contradicts wave32 code")
