@@ -311,5 +311,34 @@ class MalformedJsavTest(unittest.TestCase):
         self.assertNotIn("Traceback", p.stderr)
 
 
+class MalformedAsavTest(unittest.TestCase):
+    """A truncated ASAV or a lying payload offset is one error, not a struct.error traceback."""
+
+    def test_short_header_is_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            saves.parse_asav(b"ASAV")
+        self.assertIn("ASAV header is only 4 bytes", str(ctx.exception))
+
+    def test_payload_offset_past_end_is_rejected(self):
+        data = bytearray(saves.ASAV_HDR)
+        struct.pack_into("<4sIIIIIII", data, 0, b"ASAV", 1, 3, 1, 0, 0xFFFF, 0, saves.ASAV_HDR)
+        header = saves.parse_asav(bytes(data))
+        with self.assertRaises(ValueError) as ctx:
+            saves.asav_payload(bytes(data), header)
+        self.assertIn("payload offset past the end", str(ctx.exception))
+
+    def test_cli_reports_an_error_without_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "truncated.asav")
+            with open(path, "wb") as f:
+                f.write(b"ASAV")
+            p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "saves.py"),
+                                "info", path], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("ERROR:", p.stderr)
+        self.assertIn("ASAV header is only 4 bytes", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

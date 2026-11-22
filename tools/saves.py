@@ -42,6 +42,8 @@ def ts(v):
 def parse_asav(d):
     if d[:4] != b'ASAV':
         raise ValueError('not ASAV')
+    if len(d) < ASAV_HDR:
+        raise ValueError('ASAV header is only %d bytes' % len(d))
     f = struct.unpack_from('<IIIIIII', d, 4)
     h = {
         'magic': 'ASAV',
@@ -65,6 +67,8 @@ def parse_asav(d):
 
 
 def asav_payload(d, h):
+    if h['payload_offset'] > len(d):
+        raise ValueError('ASAV payload offset past the end of the file')
     end = h['field_1c'] if h['unk_0c'] == 1 and h['field_1c'] <= len(d) else len(d)
     return d[h['payload_offset']:end]
 
