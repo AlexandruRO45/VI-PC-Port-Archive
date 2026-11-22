@@ -422,8 +422,8 @@ def run_one(name, lines, wave=64):
     """("match" | "mismatch" | "skip", detail)."""
     try:
         model = run_model(lines, wave)
-    except cpu_ref.CpuRefError as e:
-        return "skip", f"reference: {e}"
+    except cpu_ref.Unsupported as e:
+        return "skip", f"reference: {e}"          # a ProgramError is a harness error, reported by run_suite
     try:
         spv = translate(name, lines, wave)
     except rdna2spirv.Unsupported as e:

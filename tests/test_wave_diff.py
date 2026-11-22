@@ -102,6 +102,19 @@ class Fuzzer(unittest.TestCase):
     def test_canaries(self):
         self.assertTrue(wave_diff.self_test())
 
+    def test_a_reference_program_error_is_a_harness_error_not_a_skip(self):
+        def broken(lines, wave):
+            raise cf_ref.ProgramError("reference broke")
+        real = wave_diff.run_model
+        wave_diff.run_model = broken
+        try:
+            counts, first = wave_diff.run_suite(programs=1, seed=1, max_ops=2)
+            self.assertEqual(wave_diff.main(["--programs", "1", "--max-ops", "2"]), 2)
+        finally:
+            wave_diff.run_model = real
+        self.assertEqual((counts["harness-error"], counts["skip"]), (1, {}))
+        self.assertIn("reference broke", first)
+
     def test_seeded_run_on_both_wave_sizes(self):
         counts, first = wave_diff.run_suite(programs=8, seed=1, max_ops=10, waves=(32, 64))
         self.assertEqual(counts["mismatch"], 0, first)
