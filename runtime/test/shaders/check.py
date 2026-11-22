@@ -172,6 +172,16 @@ BOUNDS = [("cs_bounds", [0x12345678, 0x12345678, 0x00000000, 0xEEEEEEEE]),
           ("cs_oob_tail", [0, 0, 0x5eed0010, 0, 0xbeef0000, 0xeeeeeeee, 0, 0x5eed0010]),
           # swizzled MUBUF addressing (measured natively on gfx1036) and ADD_TID_ENABLE on lanes 0 and 1, derived in the .asm header
           ("cs_buf_swizzle", [0x5eed0024, 0x5eed0044, 0x5eed004c, 0x5eed0008, 0x5eed000c, 0, 0xbeef0000, 0xbeef0001])]
+# cs_buf_sub.asm: the sub-dword MUBUF loads and GFX10_FORMAT_8_UINT, hand-derived in the .asm header. Words 0..1 and
+# 4..15 are the untouched heap around the seeds at 2..3, 16..40 are the 23 loads, 41..63 stay untouched.
+BUF_SUB_WORDS = [
+    0xEEEEEEEE, 0xEEEEEEEE, 0x01FF807F, 0xFE00CDAB, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE,
+    0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE,
+    0x0000007F, 0xFFFFFF80, 0x0000AB01, 0xFFFFAB01, 0x0000FE00, 0x000000FE, 0xEEEEEEEE, 0xEEEEEEEE,
+    0x00000001, 0x00000000, 0x000001FF, 0x00000000, 0x0000AB01, 0x0000FE00, 0x00000000, 0x00000000,
+    0x0000007F, 0x00000080, 0x000000FF, 0x00000001, 0x00000000, 0x000000FF, 0x00000000, 0x00000001,
+    0x00000001,
+] + [0xEEEEEEEE] * 23
 CMPX_CLASS_WORDS = [0xEEEEEEEE] * 3 + [0x22] + [0x11] * 4
 # cs_fmt_1010102.asm: descriptor loads, immediate-format load, raw input words and the two packed stores.
 FMT_1010102_WORDS = [0, 0x3F800000, 0, 0x3F800000, 0x3F800000, 0, 0x3F800000, 0,
@@ -588,6 +598,12 @@ def tbuffer_store_test(tools, spirv, env=None):
 def fmt_d16_xyz_test(tools, spirv, env=None):
     """The d16_xyz/d16_xy loads and d16_xyz stores of cs_fmt_d16_xyz.asm: the whole 80-word heap."""
     return dump_test(tools, spirv, "cs_fmt_d16_xyz", FMT_D16_XYZ_WORDS, len(FMT_D16_XYZ_WORDS), env)
+
+
+def buf_sub_test(tools, spirv, env=None):
+    """All 64 words of cs_buf_sub: the seeds, the sub-dword and format-8 loads, and the untouched heap around them.
+    One thread, so no 64-wide subgroup requirement."""
+    return dump_test(tools, spirv, "cs_buf_sub", BUF_SUB_WORDS, 64, env)
 
 
 class Skip(str):
@@ -1521,6 +1537,7 @@ def main():
     results.append(("cs_fmt_xy_xyz", fmt_xy_xyz_test(tools, spirv)))
     results.append(("cs_tbuffer_store", tbuffer_store_test(tools, spirv)))
     results.append(("cs_fmt_d16_xyz", fmt_d16_xyz_test(tools, spirv)))
+    results.append(("cs_buf_sub", buf_sub_test(tools, spirv)))
     for name, groups, want in GLOBAL_OFFSET:
         results.append((name, compute_test(tools, spirv, name, groups, "dump", expected_words=want)))
     results.append(("cs_user_sgprs", compute_test(tools, spirv, "cs_user_sgprs", "1", "dump",
