@@ -37,6 +37,12 @@ This page collects the setup steps and the problems testers have run into so far
 
   If it reports `not a valid operand`, point `LLVM_MC` at a build that accepts this instruction. The Windows
   conda-forge `llvm-tools` 23.1.6 package assembled the same f16 programs.
+
+  Assembly support and disassembly correctness are separate checks. Run
+  `python -I tools/shader_disasm.py --check-madk` to probe the selected `LLVM_MC` on eight synthetic GFX10 cases.
+  An [independent Linux check on LLVM 23.1.5](https://github.com/ItsNotRexed/Leonida/pull/2414#issuecomment-7082609066)
+  misprinted `K=0x80` as `0x0` in all four FP16 and FP32 MADK forms and crashed on the two FP16 forms
+  with `K=0xff`. See [LLVM issue #237158](https://github.com/llvm/llvm-project/issues/237158).
 - **SPIRV-Tools** (`spirv-as`, `spirv-val`): part of the Vulkan SDK, or a distribution package.
 - **A C++20 compiler, CMake and the Vulkan headers** to build the test programs:
   - Windows: the full runtime needs Visual Studio 2022 with "Desktop development with C++" and Windows SDK
