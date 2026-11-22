@@ -581,5 +581,77 @@ class TestGWSSemaBrSIMD(unittest.TestCase):
         self.assertEqual(res["final_value"], 2)
 
 
+class TestGWSSemaBrRegisterAliasing(unittest.TestCase):
+    """Commit 5: Register aliasing and in-place operand preservation for ds_gws_sema_br."""
+
+    def test_m0_register_preservation(self) -> None:
+        interp = ScalarInterpreter()
+        initial_m0 = 33
+        interp.rf.m0 = initial_m0
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_BR, offset=5)
+        interp.step(instr)
+        self.assertEqual(interp.rf.m0, initial_m0)
+
+    def test_vdata_operand_preservation(self) -> None:
+        interp = ScalarInterpreter()
+        test_count = 42
+        interp.rf.set_vgpr(3, test_count)
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_BR, vdata=Register(3, RegKind.VGPR), offset=0)
+        interp.step(instr)
+        self.assertEqual(interp.rf.get_vgpr(3), test_count)
+
+    def test_comprehensive_256_vgpr_preservation(self) -> None:
+        interp = ScalarInterpreter()
+        for i in range(256):
+            interp.rf.set_vgpr(i, (i * 0x05050505 + 0xA3) & MASK32)
+
+        # Use v15 as vdata count operand
+        count_val = interp.rf.get_vgpr(15)
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_BR, vdata=Register(15, RegKind.VGPR), offset=2)
+        interp.step(instr)
+
+        for i in range(256):
+            expected = (i * 0x05050505 + 0xA3) & MASK32
+            self.assertEqual(interp.rf.get_vgpr(i), expected, f"VGPR v{i} mutated")
+
+    def test_comprehensive_104_sgpr_preservation(self) -> None:
+        interp = ScalarInterpreter()
+        for i in range(104):
+            interp.rf.set_sgpr(i, (i * 0x09090909 + 0x71) & MASK32)
+
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_BR, offset=0)
+        interp.step(instr)
+
+        for i in range(104):
+            expected = (i * 0x09090909 + 0x71) & MASK32
+            self.assertEqual(interp.rf.get_sgpr(i), expected, f"SGPR s{i} mutated")
+
+    def test_simd_per_lane_vdata_preservation(self) -> None:
+        simd = SIMDInterpreter()
+        wave = SIMDWaveState(wave_id=1, wave_size=32, exec_mask=0x0F0F_0F0F)
+        for lane in range(32):
+            wave.set_vgpr(lane, 4, 0x55000000 | lane)
+
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_BR, vdata=Register(4, RegKind.VGPR), offset=0)
+        simd.step_wave(wave, instr)
+
+        for lane in range(32):
+            expected = 0x55000000 | lane
+            self.assertEqual(wave.get_vgpr(lane, 4), expected, f"Lane {lane} v4 mutated")
+
+    def test_chained_bulk_release_in_place_loop(self) -> None:
+        interp = ScalarInterpreter()
+        interp.rf.m0 = 10
+        interp.rf.set_vgpr(0, 3)
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_BR, vdata=Register(0, RegKind.VGPR), offset=0)
+
+        for _ in range(50):
+            interp.step(instr)
+
+        self.assertEqual(interp.rf.get_vgpr(0), 3)
+        self.assertEqual(interp.rf.m0, 10)
+        self.assertEqual(interp.gws.resources[10].value, 150)
+
+
 if __name__ == "__main__":
     unittest.main()
