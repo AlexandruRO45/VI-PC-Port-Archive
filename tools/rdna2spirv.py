@@ -3315,7 +3315,25 @@ class Gen:
         or of the 32-bit value with L mod 32 (a b32 op). Until 2026-11-22 every lane took bit 0 (0xff00 was no
         lane, 5 every lane)."""
         if a["k"] == "sgpr":
-            return self.load_reg("sgpr", a["r"])
+            lo = self.load_reg("sgpr", a["r"])
+            if self.holds_lane_mask(a):
+                return lo
+            # Plain wave-uniform data: this lane's mask is bit `lane` of the register (of r+1 for lanes 32-63 of a
+            # wave64 pair). A register already in per-lane form (all ones or 0) gives the same value this way.
+            lane = self.wave_lane()
+            if self.wave64 and a.get("n", 1) == 2:
+                low, w = self.tmp(), self.tmp()
+                hi = self.load_reg("sgpr", a["r"] + 1)
+                self.emit(f"{low} = OpULessThan %bool {lane} {self.cu(32)}")
+                self.emit(f"{w} = OpSelect %uint {low} {lo} {hi}")
+                lo = w
+            sh, sv, bit, nz, m = (self.tmp() for _ in range(5))
+            self.emit(f"{sh} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
+            self.emit(f"{sv} = OpShiftRightLogical %uint {lo} {sh}")
+            self.emit(f"{bit} = OpBitwiseAnd %uint {sv} {self.cu(1)}")
+            self.emit(f"{nz} = OpINotEqual %bool {bit} {self.cu(0)}")
+            self.emit(f"{m} = OpSelect %uint {nz} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+            return m
         if a["k"] == "special" and a["t"] in ("vcc", "vcc_lo", "vcc_hi"):
             v = self.tmp()
             self.emit(f"{v} = OpLoad %uint %vcc")
