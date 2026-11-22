@@ -204,8 +204,8 @@ class GameCheckTest(PreflightTestBase):
                     res = make_game.check(game_dir, full=False)
 
             self.assertEqual(res["version"], "9.9.9.9")
-            self.assertIn("all files present", stdout_buf.getvalue())
-            self.assertIn("Executable found.", stdout_buf.getvalue())
+            self.assertIn("4 manifest file sizes match", stdout_buf.getvalue())
+            self.assertIn("Could not read executable headers: no MZ header", stdout_buf.getvalue())
 
     def test_check_missing_files_fails(self):
         with tempfile.TemporaryDirectory() as tmp:

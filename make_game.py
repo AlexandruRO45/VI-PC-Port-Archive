@@ -31,6 +31,7 @@ import functools
 import glob
 import hashlib
 import json
+import mmap
 import ntpath
 import os
 import re
@@ -45,6 +46,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(ROOT, "tools")
 sys.path.insert(0, TOOLS)
 from mc_command import mc_command  # noqa: E402
+from pe_inspect import MACHINES, PeImage  # noqa: E402
 
 VERSIONS = os.path.join(ROOT, "game")
 STAGES = ["check", "shaders", "assets", "runtime", "pipelines"]
@@ -582,6 +584,31 @@ def ensure_submodule() -> None:
          "git clone --recursive <this repository's URL>")
 
 
+def executable_status(path: str) -> str:
+    """Read the candidate's PE headers without executing it or loading its full contents."""
+    try:
+        with open(path, "rb") as stream:
+            if not os.fstat(stream.fileno()).st_size:
+                return "Executable file is empty."
+            with mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                image = PeImage(data)
+                if image.machine != 0x8664 or not image.is64:
+                    machine = MACHINES.get(image.machine, hex(image.machine))
+                    return f"Expected an x86-64 PE32+ executable. Candidate machine: {machine}."
+                if image.characteristics & 0x2000 or not image.characteristics & 0x0002:
+                    return "Candidate PE header does not identify a standalone executable."
+                if image.offset(image.entry_rva) is None or not any(
+                    section["exec"] and section["rva"] <= image.entry_rva <
+                    section["rva"] + (section["vsize"] or section["rawsize"]) for section in image.sections
+                ):
+                    return "Candidate has no file-backed entry point in an executable section."
+                return f"x86-64 PE32+ executable header found (entry RVA {image.entry_rva:#x}). Boot untested."
+    except FileNotFoundError:
+        return f"{os.path.basename(path)} is not in the folder: the runtime stage can be built but not run."
+    except (OSError, ValueError, OverflowError) as error:
+        return f"Could not read executable headers: {error}."
+
+
 def check(game: str, full: bool) -> dict:
     if not os.path.isdir(game):
         fail(f"Game folder not found: {game}")
@@ -599,9 +626,8 @@ def check(game: str, full: bool) -> dict:
     if full:
         py("manifest.py", "verify", game, "--manifest", os.path.join(VERSIONS, f"xbox-{v['version']}.json"))
     exe = os.path.join(game, v["expected_exe"])
-    log(f"check: all files present{' and hashes match' if full else ''}. "
-        + ("Executable found." if os.path.isfile(exe) else
-           f"{v['expected_exe']} is not in the folder: the runtime stage can be built but not run."))
+    log(f"check: {len(v['files'])} manifest file sizes match" + (" and hashes match." if full else "."))
+    log(f"check: {executable_status(exe)}")
     return v
 
 
