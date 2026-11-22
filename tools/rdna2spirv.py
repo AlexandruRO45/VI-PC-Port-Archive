@@ -3321,6 +3321,8 @@ class Gen:
             # Plain wave-uniform data: this lane's mask is bit `lane` of the register (of r+1 for lanes 32-63 of a
             # wave64 pair). A register already in per-lane form (all ones or 0) gives the same value this way.
             lane = self.wave_lane()
+            # A single SGPR in wave64 is the low half only: lanes 32-63 read bit lane-32 of r (the shift below uses
+            # lane & 31), the same word as lanes 0-31. The pair form selects r+1 for them.
             if self.wave64 and a.get("n", 1) == 2:
                 low, w = self.tmp(), self.tmp()
                 hi = self.load_reg("sgpr", a["r"] + 1)
