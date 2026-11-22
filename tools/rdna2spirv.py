@@ -5733,10 +5733,12 @@ class Gen:
             # 16-bit integer ops on the low halves (op_sel picks high halves in the VOP3 form). Per Mesa ACO
             # (can_use_opsel): the opsel-capable VOP3 (_e64) forms are partial writes that keep the high half,
             # and the VOP2 (_e32) forms define the whole register (high half modelled as zero).
-            # VOP3 = an 8-byte encoding. LLVM 21 prints the VOP3 form of these ops without the _e64 suffix (every
-            # one in the game's shaders), so the mnemonic alone would make them VOP2 writes and zero the high half.
+            # LLVM 21 prints the VOP3 form of these ops without the _e64 suffix (every one in the game's shaders), so
+            # the mnemonic alone would make them VOP2 writes and zero the high half: the encoding decides. VOP3 is
+            # the major opcode in bits 31:26 of the first dword (110101 on GFX10, 110100 before), not the length:
+            # a VOP3 with a 32-bit literal operand is 12 bytes, and was taken for a VOP2 while this asked for 8.
             enc = ins.get("enc")
-            e64 = len(enc) == 16 if enc else ins["op"].endswith("_e64")
+            e64 = (int(enc[6:8], 16) & 0xFC) in (0xD4, 0xD0) if enc else ins["op"].endswith("_e64")
             sel = next((m for m in mods if m.startswith("op_sel:")), "op_sel:[0,0,0]")
             sb = [int(x) for x in sel.split("[")[1].rstrip("]").split(",")] + [0, 0, 0]
             if not e64 and sb[:2] != [0, 0]:
