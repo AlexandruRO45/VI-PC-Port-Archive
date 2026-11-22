@@ -1322,5 +1322,75 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertTrue(st_wrapped.address_wrapped)
 
 
+# ==============================================================================
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Phase 7: Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_signed_zeros_comprehensive(self) -> None:
+        self.assertEqual(oracle_min_f32(POS_ZERO, NEG_ZERO), NEG_ZERO)
+        self.assertEqual(oracle_min_f32(NEG_ZERO, POS_ZERO), NEG_ZERO)
+        self.assertEqual(oracle_min_f32(POS_ZERO, POS_ZERO), POS_ZERO)
+        self.assertEqual(oracle_min_f32(NEG_ZERO, NEG_ZERO), NEG_ZERO)
+
+    def test_infinities_comprehensive(self) -> None:
+        self.assertEqual(oracle_min_f32(POS_INF, POS_INF), POS_INF)
+        self.assertEqual(oracle_min_f32(NEG_INF, NEG_INF), NEG_INF)
+        self.assertEqual(oracle_min_f32(POS_INF, NEG_INF), NEG_INF)
+        self.assertEqual(oracle_min_f32(NEG_INF, POS_INF), NEG_INF)
+        self.assertEqual(oracle_min_f32(POS_INF, FLT_MAX), FLT_MAX)
+        self.assertEqual(oracle_min_f32(NEG_INF, NEG_FLT_MAX), NEG_INF)
+
+    def test_subnormals_preservation_and_comparison(self) -> None:
+        # Smallest subnormal (2^-149) vs smallest normal (2^-126)
+        self.assertEqual(oracle_min_f32(SUBNORM_MIN, FLT_MIN), SUBNORM_MIN)
+        self.assertNotEqual(oracle_min_f32(SUBNORM_MIN, FLT_MIN), POS_ZERO)
+
+        # Largest subnormal vs smallest normal
+        self.assertEqual(oracle_min_f32(SUBNORM_MAX, FLT_MIN), SUBNORM_MAX)
+
+        # Subnormal vs zeros
+        self.assertEqual(oracle_min_f32(SUBNORM_MIN, POS_ZERO), POS_ZERO)
+        self.assertEqual(oracle_min_f32(SUBNORM_MIN, NEG_ZERO), NEG_ZERO)
+
+        # Negative subnormals
+        self.assertEqual(oracle_min_f32(NEG_SUBNORM_MIN, POS_ZERO), NEG_SUBNORM_MIN)
+        self.assertEqual(oracle_min_f32(NEG_SUBNORM_MAX, NEG_SUBNORM_MIN), NEG_SUBNORM_MAX)
+
+    def test_nan_suppression_comprehensive(self) -> None:
+        # Single quiet NaN with normal, infinity, zero, subnormal
+        for normal_val in (ONE_F32, NEG_ONE_F32, POS_INF, NEG_INF, POS_ZERO, NEG_ZERO, SUBNORM_MIN):
+            with self.subTest(val=hex(normal_val)):
+                self.assertEqual(oracle_min_f32(QNAN_PAYLOAD_A, normal_val), normal_val)
+                self.assertEqual(oracle_min_f32(normal_val, QNAN_PAYLOAD_A), normal_val)
+
+        # Single signaling NaN
+        for normal_val in (TWO_F32, NEG_TWO_F32, FLT_MAX, NEG_FLT_MAX):
+            with self.subTest(val=hex(normal_val)):
+                self.assertEqual(oracle_min_f32(SNAN_PAYLOAD_A, normal_val), normal_val)
+                self.assertEqual(oracle_min_f32(normal_val, SNAN_PAYLOAD_A), normal_val)
+
+    def test_dual_nans(self) -> None:
+        # Quiet + Quiet
+        q_q = oracle_min_f32(QNAN_PAYLOAD_A, QNAN_PAYLOAD_B)
+        self.assertTrue(is_qnan(q_q))
+
+        # Signaling + Signaling
+        s_s = oracle_min_f32(SNAN_PAYLOAD_A, SNAN_PAYLOAD_B)
+        self.assertTrue(is_qnan(s_s))
+
+        # Quiet + Signaling
+        q_s = oracle_min_f32(QNAN_PAYLOAD_A, SNAN_PAYLOAD_A)
+        self.assertTrue(is_qnan(q_s))
+
+    def test_floating_point_normal_extremes(self) -> None:
+        self.assertEqual(oracle_min_f32(FLT_MAX, NEG_FLT_MAX), NEG_FLT_MAX)
+        self.assertEqual(oracle_min_f32(NEG_FLT_MAX, FLT_MAX), NEG_FLT_MAX)
+        self.assertEqual(oracle_min_f32(FLT_MIN, NEG_FLT_MIN), NEG_FLT_MIN)
+        self.assertEqual(oracle_min_f32(NEG_FLT_MIN, FLT_MIN), NEG_FLT_MIN)
+
+
 if __name__ == "__main__":
     unittest.main()
