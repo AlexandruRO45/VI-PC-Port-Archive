@@ -1284,5 +1284,183 @@ class TestBufferAtomicSminX2ConditionCodes(unittest.TestCase):
         self.assertEqual(self.interp.vcc, canary)
 
 
+class TestBufferAtomicSminX2BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 bit-pattern preservation, signed extremes, and buffer boundary limits."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarBufferInterpreter(mem_size=4096)
+        self.desc = BufferResourceDescriptor(
+            base_address=0,
+            stride=0,
+            num_records=1024,
+        )
+        self.interp.set_buffer_descriptor(4, self.desc)
+
+    def test_signed_64bit_min_max_extremes(self) -> None:
+        int64_min = 0x8000000000000000
+        int64_max = 0x7FFFFFFFFFFFFFFF
+        self.interp.mem.write_u64(0, int64_max)
+        self.interp.write_reg_u64(0, int64_min)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        # min(int64_max, int64_min) -> int64_min
+        ret, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, int64_max)
+        self.assertEqual(self.interp.mem.read_u64(0), int64_min)
+        self.assertEqual(self.interp.read_reg_u64(0), int64_max)
+
+    def test_signed_negative_vs_zero_and_minus_one(self) -> None:
+        minus_one = 0xFFFFFFFFFFFFFFFF
+        zero = 0x0
+        self.interp.mem.write_u64(0, zero)
+        self.interp.write_reg_u64(0, minus_one)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        # min(0, -1) -> -1
+        ret, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, zero)
+        self.assertEqual(self.interp.mem.read_u64(0), minus_one)
+
+    def test_ieee754_double_sign_bit_and_zero_ordering(self) -> None:
+        # IEEE 754 +0.0 is 0x0000000000000000
+        # IEEE 754 -0.0 is 0x8000000000000000 (signed int64: -9223372036854775808)
+        # In signed integer arithmetic, -0.0 bit pattern < +0.0 bit pattern
+        pos_zero = 0x0000000000000000
+        neg_zero = 0x8000000000000000
+        self.interp.mem.write_u64(0, pos_zero)
+        self.interp.write_reg_u64(0, neg_zero)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, pos_zero)
+        self.assertEqual(self.interp.mem.read_u64(0), neg_zero)
+
+    def test_ieee754_subnormals_bitwise_integrity_no_flush(self) -> None:
+        # Verify subnormal double bit patterns are preserved exactly without flush-to-zero (FTZ)
+        pos_subnormal = 0x0000000000000005
+        neg_subnormal = 0x8000000000000005
+        self.interp.mem.write_u64(0, pos_subnormal)
+        self.interp.write_reg_u64(0, neg_subnormal)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, pos_subnormal)
+        # Exactly neg_subnormal bitwise, no FTZ
+        self.assertEqual(self.interp.mem.read_u64(0), neg_subnormal)
+
+    def test_ieee754_nan_and_inf_no_canonicalization(self) -> None:
+        # Double quiet NaN: 0x7FF80000CAFEBABE (positive sign bit -> positive s64)
+        # Double -Infinity: 0xFFF0000000000000 (negative sign bit -> negative s64)
+        # s64(-Inf) < s64(NaN)
+        qnan = 0x7FF80000CAFEBABE
+        neg_inf = 0xFFF0000000000000
+        self.interp.mem.write_u64(0, qnan)
+        self.interp.write_reg_u64(0, neg_inf)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, qnan)
+        # Exact payload preserved with no NaN quiet-bit modifications
+        self.assertEqual(self.interp.mem.read_u64(0), neg_inf)
+
+    def test_buffer_boundary_exact_fit_and_overrun(self) -> None:
+        # Buffer has 1024 records (bytes). 64-bit access is 8 bytes.
+        # Offset 1016: 1016 + 8 == 1024 (valid)
+        self.interp.mem.write_u64(1016, 500)
+        self.interp.write_reg_u64(0, 100)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 1016)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 500)
+        self.assertEqual(self.interp.mem.read_u64(1016), 100)
+        self.assertIsNotNone(self.interp.last_status_flags)
+        assert self.interp.last_status_flags is not None
+        self.assertTrue(self.interp.last_status_flags.in_bounds)
+
+        # Offset 1017: 1017 + 8 == 1025 > 1024 (OOB fault)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 1017)
+        ret_oob, in_bounds_oob = self.interp.step(inst)
+        self.assertFalse(in_bounds_oob)
+        self.assertEqual(ret_oob, 0)
+        self.assertIsNotNone(self.interp.last_status_flags)
+        assert self.interp.last_status_flags is not None
+        self.assertTrue(self.interp.last_status_flags.oob_fault)
+
+    def test_zero_capacity_buffer_rejection(self) -> None:
+        zero_desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=0)
+        self.interp.set_buffer_descriptor(8, zero_desc)
+        self.interp.write_reg_u64(0, 42)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 8, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertFalse(in_bounds)
+        self.assertEqual(ret, 0)
+        self.assertIsNotNone(self.interp.last_status_flags)
+        assert self.interp.last_status_flags is not None
+        self.assertTrue(self.interp.last_status_flags.oob_fault)
+
+
 if __name__ == "__main__":
     unittest.main()
