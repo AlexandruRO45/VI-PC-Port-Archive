@@ -308,6 +308,100 @@ class ScalarDSInterpreter:
 
 
 # ==============================================================================
+# SIMD Wave Execution and EXEC Masking
+# ==============================================================================
+
+class SIMDWaveState:
+    """SIMD wave architectural execution state supporting Wave32 and Wave64 execution modes."""
+
+    def __init__(
+        self,
+        wave_size: int = 32,
+        exec_mask: Optional[int] = None,
+        lds: Optional[LDSMemory] = None,
+    ) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"wave_size must be 32 or 64, got {wave_size}")
+        self.wave_size: int = wave_size
+        self.full_mask: int = (1 << wave_size) - 1
+        self.exec_mask: int = exec_mask if exec_mask is not None else self.full_mask
+        self.lane_vgprs: List[List[int]] = [[0] * DEFAULT_NUM_VGPRS for _ in range(wave_size)]
+        self.sgprs: List[int] = [0] * DEFAULT_NUM_SGPRS
+        self.lds: LDSMemory = lds if lds is not None else LDSMemory()
+
+    def is_lane_active(self, lane: int) -> bool:
+        return bool((self.exec_mask >> lane) & 1)
+
+    def get_lane_vgpr(self, lane: int, reg_idx: int) -> int:
+        return self.lane_vgprs[lane][reg_idx]
+
+    def set_lane_vgpr(self, lane: int, reg_idx: int, val: int) -> None:
+        self.lane_vgprs[lane][reg_idx] = u32(val)
+
+
+def detect_lds_bank_conflicts(eff_addrs: List[int]) -> Dict[int, List[int]]:
+    """Analyze a list of effective byte addresses from active lanes to detect bank conflicts.
+
+    In RDNA2 LDS architecture:
+    - LDS has 32 banks (bank = (eff_addr >> 2) % 32).
+    - If multiple active lanes access the same bank with different dword addresses,
+      hardware serializes the accesses (bank conflict).
+
+    Returns:
+        Mapping from bank index (0..31) to list of conflicting lane indices.
+    """
+    bank_to_dwords: Dict[int, Dict[int, List[int]]] = {}
+    for lane, addr in enumerate(eff_addrs):
+        idx = (addr >> 2) & (LDS_SIZE_DWORDS - 1)
+        bank = idx % LDS_BANK_COUNT
+        if bank not in bank_to_dwords:
+            bank_to_dwords[bank] = {}
+        if idx not in bank_to_dwords[bank]:
+            bank_to_dwords[bank][idx] = []
+        bank_to_dwords[bank][idx].append(lane)
+
+    conflicts: Dict[int, List[int]] = {}
+    for bank, dword_map in bank_to_dwords.items():
+        if len(dword_map) > 1:
+            lanes: List[int] = []
+            for lane_list in dword_map.values():
+                lanes.extend(lane_list)
+            conflicts[bank] = sorted(lanes)
+    return conflicts
+
+
+class SIMDDSInterpreter:
+    """SIMD wave execution interpreter handling lane divergence, EXEC masking, and atomics."""
+
+    def execute(
+        self,
+        state: SIMDWaveState,
+        inst: DSMaxRtnI32Instruction,
+    ) -> Dict[int, int]:
+        """Execute ds_max_rtn_i32 across all active SIMD lanes.
+
+        In AMD RDNA2:
+        - Only active lanes (where (exec_mask >> lane) & 1 == 1) perform memory operations and update VGPRs.
+        - Inactive lanes do not touch LDS and their vdst VGPRs remain unchanged.
+        - If multiple active lanes target the exact same LDS dword, the atomic operations
+          are serialized deterministically in lane order.
+
+        Returns:
+            Dictionary mapping active lane index to the returned old 32-bit value.
+        """
+        results: Dict[int, int] = {}
+        for lane in range(state.wave_size):
+            if not state.is_lane_active(lane):
+                continue
+            vaddr = state.get_lane_vgpr(lane, inst.vaddr.index)
+            vdata0 = state.get_lane_vgpr(lane, inst.vdata0.index)
+            old_val, _ = state.lds.atomic_max_rtn_i32(vaddr, vdata0, inst.offset)
+            state.set_lane_vgpr(lane, inst.vdst.index, old_val)
+            results[lane] = old_val
+        return results
+
+
+# ==============================================================================
 # Unit Tests
 # ==============================================================================
 
@@ -586,6 +680,171 @@ class TestDSMaxRtnI32ScalarInterpreter(unittest.TestCase):
         ret = self.interp.execute(self.state, inst)
         self.assertEqual(ret, 77)
         self.assertEqual(self.lds.read_dword(0x20), 99)
+
+
+class TestDSMaxRtnI32SIMDMultiLane(unittest.TestCase):
+    """Phase 4: Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(size_dwords=2048)
+        self.interp = SIMDDSInterpreter()
+
+    def test_wave32_independent_lanes(self) -> None:
+        wave = SIMDWaveState(wave_size=32, exec_mask=0xFFFFFFFF, lds=self.lds)
+        inst = DSMaxRtnI32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+        )
+
+        for l in range(32):
+            addr = l * 4
+            self.lds.write_dword(addr, u32(-100 + l))
+            wave.set_lane_vgpr(l, 1, addr)
+            wave.set_lane_vgpr(l, 2, u32(-50 + l))
+
+        results = self.interp.execute(wave, inst)
+        self.assertEqual(len(results), 32)
+
+        for l in range(32):
+            addr = l * 4
+            expected_old = -100 + l
+            expected_new = -50 + l  # since -50 + l > -100 + l
+            self.assertEqual(s32(results[l]), expected_old)
+            self.assertEqual(s32(wave.get_lane_vgpr(l, 0)), expected_old)
+            self.assertEqual(s32(self.lds.read_dword(addr)), expected_new)
+
+    def test_wave64_full_divergence(self) -> None:
+        wave = SIMDWaveState(wave_size=64, exec_mask=0xFFFFFFFFFFFFFFFF, lds=self.lds)
+        inst = DSMaxRtnI32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+        )
+
+        for l in range(64):
+            addr = l * 4
+            self.lds.write_dword(addr, u32(l))
+            wave.set_lane_vgpr(l, 1, addr)
+            wave.set_lane_vgpr(l, 2, u32(l + 10))
+
+        results = self.interp.execute(wave, inst)
+        self.assertEqual(len(results), 64)
+
+        for l in range(64):
+            addr = l * 4
+            self.assertEqual(results[l], l)
+            self.assertEqual(wave.get_lane_vgpr(l, 0), l)
+            self.assertEqual(self.lds.read_dword(addr), l + 10)
+
+    def test_wave32_exec_masking_partial(self) -> None:
+        # Lanes 0..15 active (0x0000FFFF), lanes 16..31 inactive
+        mask = 0x0000FFFF
+        wave = SIMDWaveState(wave_size=32, exec_mask=mask, lds=self.lds)
+        inst = DSMaxRtnI32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+        )
+
+        canary_vgpr = 0xDEADBEEF
+        canary_mem = 0xCAFEBABE
+
+        for l in range(32):
+            addr = l * 4
+            self.lds.write_dword(addr, canary_mem)
+            wave.set_lane_vgpr(l, 0, canary_vgpr)
+            wave.set_lane_vgpr(l, 1, addr)
+            wave.set_lane_vgpr(l, 2, 42)
+
+        results = self.interp.execute(wave, inst)
+        self.assertEqual(len(results), 16)
+
+        # Active lanes 0..15
+        for l in range(16):
+            addr = l * 4
+            self.assertIn(l, results)
+            self.assertEqual(results[l], canary_mem)
+            self.assertEqual(wave.get_lane_vgpr(l, 0), canary_mem)
+            # 42 vs canary_mem (0xCAFEBABE is negative in signed i32: -889275714), so max is 42
+            self.assertEqual(self.lds.read_dword(addr), 42)
+
+        # Inactive lanes 16..31: must remain untouched!
+        for l in range(16, 32):
+            addr = l * 4
+            self.assertNotIn(l, results)
+            self.assertEqual(wave.get_lane_vgpr(l, 0), canary_vgpr)
+            self.assertEqual(self.lds.read_dword(addr), canary_mem)
+
+    def test_wave32_exec_mask_zero(self) -> None:
+        wave = SIMDWaveState(wave_size=32, exec_mask=0, lds=self.lds)
+        inst = DSMaxRtnI32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+        )
+
+        for l in range(32):
+            addr = l * 4
+            self.lds.write_dword(addr, 100)
+            wave.set_lane_vgpr(l, 0, 0x11111111)
+            wave.set_lane_vgpr(l, 1, addr)
+            wave.set_lane_vgpr(l, 2, 200)
+
+        results = self.interp.execute(wave, inst)
+        self.assertEqual(len(results), 0)
+
+        for l in range(32):
+            addr = l * 4
+            self.assertEqual(wave.get_lane_vgpr(l, 0), 0x11111111)
+            self.assertEqual(self.lds.read_dword(addr), 100)
+
+    def test_simd_atomic_race_reduction_same_address(self) -> None:
+        # All 32 lanes atomically target address 0x100
+        target_addr = 0x100
+        self.lds.write_dword(target_addr, u32(-1000))
+        wave = SIMDWaveState(wave_size=32, exec_mask=0xFFFFFFFF, lds=self.lds)
+
+        inst = DSMaxRtnI32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+        )
+
+        # Values written by lanes: varying signed values
+        test_values = [
+            -500, 10, -200, 50, -1, 100, -80, 200,
+            -300, 0, -50, 150, -400, 75, -25, 250,
+            -10, 5, -20, 15, -30, 25, -40, 35,
+            -60, 45, -70, 55, -90, 65, -110, 70,
+        ]
+        expected_global_max = max([-1000] + test_values)  # should be 250
+
+        for l in range(32):
+            wave.set_lane_vgpr(l, 1, target_addr)
+            wave.set_lane_vgpr(l, 2, u32(test_values[l]))
+
+        results = self.interp.execute(wave, inst)
+        self.assertEqual(len(results), 32)
+
+        # Memory must end up with the overall signed maximum
+        final_mem = s32(self.lds.read_dword(target_addr))
+        self.assertEqual(final_mem, expected_global_max)
+
+    def test_lds_bank_conflict_detection(self) -> None:
+        # Bank conflict: Lane 0 targets dword 0 (bank 0), Lane 1 targets dword 32 (bank 0)
+        eff_addrs_conflict = [0 * 4, 32 * 4]
+        conflicts = detect_lds_bank_conflicts(eff_addrs_conflict)
+        self.assertIn(0, conflicts)
+        self.assertEqual(conflicts[0], [0, 1])
+
+        # No conflict: Lane 0 and Lane 1 target identical dword (broadcast / atomics to same word)
+        eff_addrs_same_dword = [16 * 4, 16 * 4]
+        self.assertEqual(detect_lds_bank_conflicts(eff_addrs_same_dword), {})
+
+        # No conflict: 32 lanes targeting consecutive dwords 0..31 (banks 0..31)
+        eff_addrs_no_conflict = [l * 4 for l in range(32)]
+        self.assertEqual(detect_lds_bank_conflicts(eff_addrs_no_conflict), {})
 
 
 if __name__ == "__main__":
