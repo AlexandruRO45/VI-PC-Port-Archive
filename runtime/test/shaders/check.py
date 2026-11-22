@@ -99,7 +99,9 @@ CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
           ("cs_dpp_ops", [100, 10, 11, 12, 13, 14, 15, 16]),
           ("cs_dpp_bound", [10, 10, 11, 12, 13, 14, 15, 16]),
           ("cs_dpp_bank", [0xffffffff, 0xfffffffe, 0xfffffffd, 0xfffffffc, 7, 7, 7, 7]),
-          ("cs_dpp_fi", [1, 2, 3, 0x7777, 5, 6, 7, 0x7777])]
+          ("cs_dpp_fi", [1, 2, 3, 0x7777, 5, 6, 7, 0x7777]),
+          # DPP on the reversed integer ops selects the second source operand (measured on RDNA2; cs_dpp_rev.asm)
+          ("cs_dpp_rev", [0x00DD00EE, 0xE0640227, 0xEE300829, 0xF617182B, 0xA8B0042D, 0xD0540A2F, 0xE6281831, 0xF2133833])]
 WAVE32_DUMPS += tuple(n for n, _ in CS_DPP)
 WAVE32_LANE_DUMPS += tuple(n for n, _ in CS_DPP)
 CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
@@ -263,6 +265,8 @@ BARY_FALLBACK = os.environ.get("LEONIDA_BARY_FALLBACK") == "1"
 # PerVertexKHR inputs at all, so the translator refuses a computed I/J pair (ps_ij_computed) there.
 F16_HALVES = os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1"
 W64X_DUMPS = [("cs_dpp_w64", [1, 0, 3, 2, 5, 4, 7, 6]),
+              # cs_dpp_rev in row 2 (lanes 32-39), with v_subrev_f32_dpp as the first-operand control
+              ("cs_dpp_rev_w64", [0x000500EE, 0x602C4267, 0xAE2D8869, 0xD62E186B, 0xA82F246D, 0x50304A6F, 0xA6319871, 0xD2323873]),
               ("cs_w64x_readlane", [121, 121, 16, 97, 16, 100, 100, 121]),
               ("cs_w64x_writelane", [4660, 77, 99, 2748, 0, 0, 4660, 99]),
               ("cs_w64x_readfirstlane", [140, 140, 163, 132, 100, 105, 133, 48]),

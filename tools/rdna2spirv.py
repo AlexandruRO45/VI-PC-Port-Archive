@@ -4609,6 +4609,12 @@ class Gen:
         self.emit(f"{r} = OpShiftLeftLogical %uint {lo} {self.cu(off)}")
         return r
 
+    # VOP2 ops whose DPP lane select (and the bound_ctrl zero) lands on the second source operand as the assembler
+    # prints it: D = S1 - S0 and D = S1 shifted by S0 read S1 from the selected lane. Measured on RDNA2 (gfx1036, raw
+    # wave32 and wave64 kernels; docs/design.md, DPP on the reversed integer ops). v_subrev_f32 / v_subrev_f16 are
+    # not in the set: they select the first operand like every other VOP2 op.
+    DPP_SRC1_OPS = frozenset(("v_subrev_nc_u32", "v_lshlrev_b32", "v_lshrrev_b32", "v_ashrrev_i32"))
+
     def dpp_insn(self, ins):
         """DPP (data-parallel primitives) on a VOP1/VOP2 src0. The source lane follows quad_perm/row_* or dpp8,
         then row_mask (one bit per 16-lane row) and bank_mask (one bit per 4-lane bank) decide which destination
@@ -4683,9 +4689,12 @@ class Gen:
             raise Unsupported("DPP operands")
         if args[0].get("k") != "vgpr" or args[0].get("n", 1) != 1:
             raise Unsupported("DPP destination")
-        if args[1].get("n", 1) != 1:
+        # The lane select applies to the first source operand, except for the integer reversed ops, where the
+        # hardware selects the second one (the value shifted, the minuend); see DPP_SRC1_OPS.
+        si = 2 if base_op(ins["op"]) in self.DPP_SRC1_OPS and len(args) >= 3 else 1
+        if args[si].get("n", 1) != 1:
             raise Unsupported("DPP 64-bit source")
-        src = args[1]
+        src = args[si]
         src_val = self.src_u(src)    # neg/abs are lane-uniform, so before or after the shuffle is the same
 
         lane = self.wave_lane()
@@ -4853,7 +4862,7 @@ class Gen:
         else:
             write = self.tmp()
             self.emit(f"{write} = OpLogicalAnd %bool {enabled} {src_ok}")
-        args[1] = {"k": "ssa", "v": src0}
+        args[si] = {"k": "ssa", "v": src0}
         previous = self.dpp_guard
         self.dpp_guard = write
         try:

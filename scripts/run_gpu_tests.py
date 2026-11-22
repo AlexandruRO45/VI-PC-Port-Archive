@@ -921,7 +921,7 @@ def run_suite(a, work: str) -> int:
             results.append((name,) + wavemask_check(vk_compute, spv, cs_env, w64_emulated()))
         elif name in ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_w32_sincos", "cs_exec_const", "cs_w32_mask_imm", "cs_w64_mask_imm", "cs_w32_lds_u8_d16", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
                       "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8", "cs_dpp_ops", "cs_dpp_bank", "cs_dpp_fi",
-                      "cs_dpp_bound", "cs_dpp_w64",
+                      "cs_dpp_bound", "cs_dpp_rev", "cs_dpp_w64", "cs_dpp_rev_w64",
                       "cs_w64_mask_detect",
                       "cs_w64x_readlane", "cs_w64x_writelane", "cs_w64x_readfirstlane", "cs_w64x_bpermute", "cs_w64x_permute",
                       "cs_w64x_branch", "cs_w64x_ballot", "cs_w64x_wg128_branches", "cs_w64x_lds_raw",
@@ -968,6 +968,8 @@ def run_suite(a, work: str) -> int:
                 "cs_dpp_bank": [0xFFFFFFFF, 0xFFFFFFFE, 0xFFFFFFFD, 0xFFFFFFFC, 7, 7, 7, 7],
                 "cs_dpp_fi": [1, 2, 3, 0x7777, 5, 6, 7, 0x7777],
                 "cs_dpp_w64": [1, 0, 3, 2, 5, 4, 7, 6],
+                "cs_dpp_rev": [0x00DD00EE, 0xE0640227, 0xEE300829, 0xF617182B, 0xA8B0042D, 0xD0540A2F, 0xE6281831, 0xF2133833],
+                "cs_dpp_rev_w64": [0x000500EE, 0x602C4267, 0xAE2D8869, 0xD62E186B, 0xA82F246D, 0x50304A6F, 0xA6319871, 0xD2323873],
                 # SHADER-99: -0 and NaN survive (SignedZeroInfNanPreserve, cs_signed_zero_nan.asm); 0 in out[4..7]
                 # without it
                 "cs_signed_zero_nan": [0x80000000, 0x80000000, 0x80008000, 0x00008000, 1, 1, 1, 0x00007C00],
@@ -1031,7 +1033,7 @@ def run_suite(a, work: str) -> int:
                                   "cs_bpermute32", "cs_w32_partial_scmp", "cs_w32_sincos",
                                   "cs_lds_b64_cmpst", "cs_exec_const", "cs_w32_mask_imm", "cs_mask_vgpr_exec",
                                   "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8",
-                                  "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi") and not emulated and not partial
+                                  "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi", "cs_dpp_rev") and not emulated and not partial
             if partial and not emulated:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
             if name in WAVE32_LANE_DUMPS:   # 32 lanes even without index.json, as check.py requests (#774)
