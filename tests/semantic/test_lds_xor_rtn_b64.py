@@ -789,5 +789,91 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
             flags_unaligned = evaluate_ds_xor_b64_flags(0, 0, 0, eff_addr=0x1000 + byte_off)
             self.assertTrue(flags_unaligned.unaligned_addr)
 
+# ==============================================================================
+# Phase 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+F64_POS_ZERO: int = 0x0000_0000_0000_0000
+F64_NEG_ZERO: int = 0x8000_0000_0000_0000
+F64_POS_INF: int = 0x7FF0_0000_0000_0000
+F64_NEG_INF: int = 0xFFF0_0000_0000_0000
+F64_CANONICAL_QNAN: int = 0x7FF8_0000_0000_0000
+F64_SIGNALING_NAN: int = 0x7FF0_0000_0000_0001
+F64_MIN_SUBNORMAL: int = 0x0000_0000_0000_0001
+F64_MAX_SUBNORMAL: int = 0x000F_FFFF_FFFF_FFFF
+
+
+def f64_to_bits(val: float) -> int:
+    return struct.unpack("<Q", struct.pack("<d", val))[0]
+
+
+def bits_to_f64(bits: int) -> float:
+    return struct.unpack("<d", struct.pack("<Q", bits & MASK_64))[0]
+
+
+def is_f64_nan(bits: int) -> bool:
+    return ((bits & 0x7FF0_0000_0000_0000) == 0x7FF0_0000_0000_0000) and ((bits & 0x000F_FFFF_FFFF_FFFF) != 0)
+
+
+def is_f64_subnormal(bits: int) -> bool:
+    return ((bits & 0x7FF0_0000_0000_0000) == 0) and ((bits & 0x000F_FFFF_FFFF_FFFF) != 0)
+
+
+class TestIEEE754BoundaryExtremesAndBitwiseLimits(unittest.TestCase):
+    def setUp(self) -> None:
+        self.lds = LDSModel()
+        self.interp = ScalarInterpreter()
+        self.state = ScalarMachineState(lds=self.lds)
+
+    def test_signed_zeros_bitwise_xor(self) -> None:
+        addr = 0x100
+        self.lds.write_qword(addr, F64_POS_ZERO)
+        self.state.set_vgpr(0, addr)
+
+        # XOR sign bit turns +0.0 into -0.0
+        instr = DSXor64Instruction(
+            opcode=DSOpcode64.DS_XOR_RTN_B64,
+            dst=VGPRPair(2),
+            addr=VGPR(0),
+            data=Immediate64(F64_NEG_ZERO),
+        )
+        old, mem = self.interp.step(instr, self.state)
+        self.assertEqual(old, F64_POS_ZERO)
+        self.assertEqual(mem, F64_NEG_ZERO)
+
+    def test_subnormals_preservation_no_ftz(self) -> None:
+        self.assertTrue(is_f64_subnormal(F64_MIN_SUBNORMAL))
+        addr = 0x200
+        self.lds.write_qword(addr, F64_MIN_SUBNORMAL)
+        self.state.set_vgpr(0, addr)
+
+        instr = DSXor64Instruction(
+            opcode=DSOpcode64.DS_XOR_RTN_B64,
+            dst=VGPRPair(4),
+            addr=VGPR(0),
+            data=Immediate64(0x02),
+        )
+        old, mem = self.interp.step(instr, self.state)
+        self.assertEqual(old, F64_MIN_SUBNORMAL)
+        self.assertEqual(mem, 0x03)
+        self.assertTrue(is_f64_subnormal(mem))
+
+    def test_walking_ones_boundary_coverage(self) -> None:
+        addr = 0x500
+        for bit in range(64):
+            mask = 1 << bit
+            self.lds.write_qword(addr, 0)
+            self.state.set_vgpr(0, addr)
+
+            instr = DSXor64Instruction(
+                opcode=DSOpcode64.DS_XOR_RTN_B64,
+                dst=VGPRPair(8),
+                addr=VGPR(0),
+                data=Immediate64(mask),
+            )
+            old, mem = self.interp.step(instr, self.state)
+            self.assertEqual(old, 0)
+            self.assertEqual(mem, mask)
+
 if __name__ == "__main__":
     unittest.main()
