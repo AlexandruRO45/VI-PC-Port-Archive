@@ -143,6 +143,11 @@ above is the route for a title that reads only gamepads, and the two can be on t
 - Mouse: `GetMouseState` gives the left, right, middle and X1/X2 buttons, and `positionX`/`positionY` as the sum of the
   cursor's movement between polls, as GameInput's relative positions are. There is no wheel (no window, so no wheel
   messages); the mouse info says so (`hasWheelX`/`hasWheelY` false).
+- Device info: the keyboard's `layout` is the active layout's identifier (`GetKeyboardLayoutNameW`, e.g. 0x0000040E),
+  read when the device is made; `keyCount` counts the reportable virtual keys that have a scan code;
+  `functionKeyCount` is `GetKeyboardType(2)` (12 if Windows doesn't say); `nativeLanguage` is an empty string. The
+  mouse's `sampleRate` is 500, one sample per 2 ms poll; `sensorDpi` is 0 (unknown from the cursor). A key's scan code
+  or character changing while it is held (a layout switch) is a new reading, like a key going down or up.
 - Keys and buttons come from `GetAsyncKeyState` with the keyboard pad's focus rule: with `1` only while this
   process's window has focus, with `always` whatever has focus. Out of focus nothing is held and cursor movement is
   not counted. Cursor deltas stop at the screen edge, as the keyboard pad's do.

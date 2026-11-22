@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -1127,6 +1128,19 @@ void test_keyboard_mouse(IGameInput* input) {
     check(ki->supportedInput == GameInputKindKeyboard && ki->keyboardInfo && !ki->gamepadInfo &&
               static_cast<const GameInputKeyboardInfo*>(ki->keyboardInfo)->maxSimultaneousKeys == 16,
           "keyboard/mouse: keyboard info (16 keys at once, no gamepad info)");
+    if (const auto* kinfo = static_cast<const GameInputKeyboardInfo*>(ki->keyboardInfo)) {
+        wchar_t klid[KL_NAMELENGTH] = {};
+        const uint32_t layout = GetKeyboardLayoutNameW(klid) ? uint32_t(std::wcstoul(klid, nullptr, 16)) : 0;
+        check(kinfo->layout == layout && layout != 0, "keyboard/mouse: layout is the active KLID");
+        const int function_keys = GetKeyboardType(2);
+        check(kinfo->keyCount > 0 && kinfo->keyCount < 255 &&
+                  kinfo->functionKeyCount == (function_keys > 0 ? uint32_t(function_keys) : 12u),
+              "keyboard/mouse: key count, and the function keys Windows counts");
+        check(kinfo->nativeLanguage && kinfo->nativeLanguage->data && kinfo->nativeLanguage->sizeInBytes == 0,
+              "keyboard/mouse: nativeLanguage is an empty string, not null");
+    }
+    check(mi->mouseInfo && static_cast<const GameInputMouseInfo*>(mi->mouseInfo)->sampleRate == 500,
+          "keyboard/mouse: mouse sample rate is the 2 ms poll");
     check(mi->supportedInput == GameInputKindMouse && mi->mouseInfo &&
               !static_cast<const GameInputMouseInfo*>(mi->mouseInfo)->hasWheelY,
           "keyboard/mouse: mouse info (no wheel)");

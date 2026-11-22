@@ -516,6 +516,7 @@ public:
     GameInputHapticWaveformInfo haptic_waveform_info[kHapticMotors]{};     // one waveform each, an intensity
     GameInputKeyboardInfo keyboard_info{};  // the keyboard device's; info.keyboardInfo points at it
     GameInputMouseInfo mouse_info{};        // the mouse device's; info.mouseInfo points at it
+    GameInputString native_language{0, 0, ""};  // keyboard_info.nativeLanguage points at it: unknown, never null
     std::atomic<uint32_t> status{GameInputDeviceNoStatus};
     std::deque<Reading*> history;  // one reference each, oldest first; the newest is the current reading
     uint64_t evicted_order = 0;    // order of the newest reading dropped from history
@@ -1550,6 +1551,17 @@ KbmPoll g_kbm;
 
 constexpr const char* kKbmNames[2] = {"Keyboard (Leonida)", "Mouse (Leonida)"};
 
+// The mouse buttons GetAsyncKeyState reports as virtual keys: they are the mouse's, not the keyboard's.
+bool is_mouse_key(int vk) {
+    return vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON || vk == VK_XBUTTON1 || vk == VK_XBUTTON2;
+}
+
+// A virtual key the keyboard reading lists: not a mouse button, and not the side-neutral Shift/Ctrl/Alt (their left
+// and right keys are reported themselves).
+bool reportable_key(int vk) {
+    return !is_mouse_key(vk) && vk != VK_SHIFT && vk != VK_CONTROL && vk != VK_MENU;
+}
+
 Device* kbm_device(int which) {
     State& s = g();
     if (s.kbm_devices[which]) return s.kbm_devices[which];
@@ -1564,7 +1576,17 @@ Device* kbm_device(int which) {
     if (which == 0) {
         i.usage = {0x01, 0x06};  // HID generic desktop / keyboard
         i.supportedInput = GameInputKindKeyboard;
-        d->keyboard_info = {GameInputUnknownKeyboard, 0, 0, 12, kMaxKeys, 0, 0, nullptr};
+        // The active layout's identifier (KLID, e.g. 0x0000040E), the keys the reading can report, and the function
+        // keys Windows counts for this keyboard. Layout id and key count after @justr4mzi's #2426. VERIFY what the
+        // console reports for a USB keyboard.
+        uint32_t layout = 0;
+        wchar_t klid[KL_NAMELENGTH] = {};
+        if (GetKeyboardLayoutNameW(klid)) layout = static_cast<uint32_t>(std::wcstoul(klid, nullptr, 16));
+        uint32_t keys = 0;
+        for (int vk = 1; vk < 255; ++vk) keys += reportable_key(vk) && MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX) != 0;
+        const int function_keys = GetKeyboardType(2);
+        d->keyboard_info = {GameInputUnknownKeyboard, layout, keys, function_keys > 0 ? uint32_t(function_keys) : 12u,
+                            kMaxKeys, 0, 0, &d->native_language};
         d->keyboard_info.platformType = static_cast<uint32_t>(std::max(0, GetKeyboardType(0)));
         d->keyboard_info.platformSubtype = static_cast<uint32_t>(std::max(0, GetKeyboardType(1)));
         i.keyboardInfo = &d->keyboard_info;
@@ -1573,7 +1595,7 @@ Device* kbm_device(int which) {
         i.supportedInput = GameInputKindMouse;
         d->mouse_info = {GameInputMouseLeftButton | GameInputMouseRightButton | GameInputMouseMiddleButton |
                              GameInputMouseButton4 | GameInputMouseButton5,
-                         0, 0, false, false};
+                         500, 0, false, false};  // one sample per 2 ms poll_thread() pass; DPI unknown from the cursor
         i.mouseInfo = &d->mouse_info;
     }
     d->name = kKbmNames[which];
@@ -1606,21 +1628,21 @@ void kbm_disconnect(Device* d, uint64_t ts) {
     std::fprintf(stderr, "[rt] gameinput: disconnected %s\n", d->name.c_str());
 }
 
+// Every field: a layout switch while a key is held changes its scan code or character, and is a new reading.
 bool same_keys(const Snapshot& a, const Snapshot& b) {
     if (a.key_count != b.key_count) return false;
-    for (uint32_t k = 0; k < a.key_count; ++k)
-        if (a.keys[k].virtualKey != b.keys[k].virtualKey) return false;
+    for (uint32_t k = 0; k < a.key_count; ++k) {
+        const GameInputKeyState &x = a.keys[k], &y = b.keys[k];
+        if (x.virtualKey != y.virtualKey || x.scanCode != y.scanCode || x.codePoint != y.codePoint ||
+            x.isDeadKey != y.isDeadKey)
+            return false;
+    }
     return true;
 }
 
 bool same_mouse(const Snapshot& a, const Snapshot& b) {
     return a.mouse.buttons == b.mouse.buttons && a.mouse.positionX == b.mouse.positionX &&
            a.mouse.positionY == b.mouse.positionY;
-}
-
-// The mouse buttons GetAsyncKeyState reports as virtual keys: they are the mouse's, not the keyboard's.
-bool is_mouse_key(int vk) {
-    return vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON || vk == VK_XBUTTON1 || vk == VK_XBUTTON2;
 }
 
 void update_keyboard_mouse(uint64_t now) {
@@ -1645,10 +1667,9 @@ void update_keyboard_mouse(uint64_t now) {
     Snapshot mouse{};
     mouse.kbm_kind = GameInputKindMouse;
     if (focus) {
-        // Every virtual key but the mouse buttons and the side-neutral Shift/Ctrl/Alt (their left and right keys are
-        // reported themselves), in virtual-key order, up to kMaxKeys.
+        // The reportable keys that are down, in virtual-key order, up to kMaxKeys.
         for (int vk = 1; vk < 255 && keys.key_count < kMaxKeys; ++vk) {
-            if (is_mouse_key(vk) || vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU || !key_down(vk)) continue;
+            if (!reportable_key(vk) || !key_down(vk)) continue;
             GameInputKeyState& k = keys.keys[keys.key_count++];
             k.virtualKey = static_cast<uint8_t>(vk);
             k.scanCode = MapVirtualKeyW(static_cast<UINT>(vk), MAPVK_VK_TO_VSC_EX);
