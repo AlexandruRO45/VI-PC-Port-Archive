@@ -12808,7 +12808,10 @@ def translate(path):
                 attr_reads[op].update(arg["a"] for arg in ins["args"] if arg["k"] == "attr")
         f16_read = attr_reads["v_interp_p1ll_f16"] | attr_reads["v_interp_p1lv_f16"] | attr_reads["v_interp_p2_f16"]
         mixed_f32 = attr_reads["v_interp_mov_f32"] & (attr_reads["v_interp_p1_f32"] | attr_reads["v_interp_p2_f32"])
-        if mixed_f32 and (BARY_FALLBACK or F16_HALVES):
+        # Under --computed-ij-flat-inputs a mixed attribute that is also a computed I/J site gets its three
+        # vertex values as flat inputs, which serve the MOV as well: refused below, after the I/J analysis,
+        # only if it is not one of those.
+        if mixed_f32 and (BARY_FALLBACK or F16_HALVES) and not COMPUTED_IJ_FLAT_INPUTS:
             raise Unsupported("flat and interpolated reads of one f32 attribute need per-vertex inputs")
         if F16_HALVES:      # decoded halves from the producer: no per-vertex inputs (and no barycentrics)
             g.f16_halves = f16_read
@@ -12876,7 +12879,9 @@ def translate(path):
                 mode = "--bary-fallback" if BARY_FALLBACK else "--f16-interp-fallback"
                 raise Unsupported(f"computed I/J pair under {mode}: no PerVertexKHR inputs")
             g.ij_flat_inputs = computed_ij_inputs(g, insns, computed_ij)
-        else:
+        if (BARY_FALLBACK or F16_HALVES) and COMPUTED_IJ_FLAT_INPUTS and mixed_f32 - set(g.ij_flat_inputs):
+            raise Unsupported("flat and interpolated reads of one f32 attribute need per-vertex inputs")
+        if not (computed_ij and (BARY_FALLBACK or F16_HALVES)):
             g.per_vertex |= computed_ij
         if any("ij" in i for i in insns):
             # Computed v_interp sites load their I/J VGPRs at runtime; no_bary above stripped all
