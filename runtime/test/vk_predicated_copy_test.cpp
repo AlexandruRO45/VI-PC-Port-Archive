@@ -126,6 +126,86 @@ int main() {
         EXPECT(std::memcmp(dst_data,expected.data(),bytes)==0);
     }
     context.vk.vkCmdPipelineBarrier2=real_barrier2;
+    // Forced-window GPU stress for PredicatedOps (strided upload/readback & phase-continuous repeating-element fill)
+    // under the same tiny maxStorageBufferRange + maxComputeWorkGroupCount[0]=1 limits.
+    {
+        context.enable_copy_scratch(d.device_proc, [&](const VkMemoryRequirements& req) -> VkDeviceMemory {
+            for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+                if (!(req.memoryTypeBits & (1u << i))) continue;
+                if (!(memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) continue;
+                VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                ai.allocationSize = req.size;
+                ai.memoryTypeIndex = i;
+                VkDeviceMemory mem = VK_NULL_HANDLE;
+                if (d.fn<PFN_vkAllocateMemory>("vkAllocateMemory")(d.device, &ai, nullptr, &mem) == VK_SUCCESS)
+                    return mem;
+            }
+            return VK_NULL_HANDLE;
+        });
+        constexpr std::uint32_t w = 16, h = 5, pitch = 256, fp_bytes = pitch * h, fill_buf_bytes = 512;
+        void *up_ptr = nullptr, *rb_ptr = nullptr, *fill_ptr = nullptr;
+        const VkBuffer up_buf = d.buffer(fp_bytes, usage, &up_ptr);
+        const VkBuffer rb_buf = d.buffer(fp_bytes, usage, &rb_ptr);
+        const VkBuffer fill_buf = d.buffer(fill_buf_bytes, usage, &fill_ptr);
+        const VkImage tex = d.image(VK_FORMAT_R8G8B8A8_UNORM, w, h, 1,
+                                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        EXPECT(up_buf && rb_buf && fill_buf && tex && up_ptr && rb_ptr && fill_ptr);
+        std::array<unsigned char, fp_bytes> up_init{}, rb_init{}, rb_exp{};
+        for (std::size_t i = 0; i < fp_bytes; ++i) {
+            up_init[i] = static_cast<unsigned char>(i * 29 + 7);
+            rb_init[i] = 0xA5;
+        }
+        rb_exp = rb_init;
+        for (std::uint32_t y = 0; y < h; ++y)
+            std::memcpy(rb_exp.data() + y * pitch, up_init.data() + y * pitch, w * 4);
+        std::memcpy(up_ptr, up_init.data(), fp_bytes);
+        std::memcpy(rb_ptr, rb_init.data(), fp_bytes);
+        std::array<unsigned char, fill_buf_bytes> fill_init{}, fill_exp{};
+        for (std::size_t i = 0; i < fill_buf_bytes; ++i) fill_init[i] = static_cast<unsigned char>(i * 11 + 0x40);
+        fill_exp = fill_init;
+        const std::array<std::uint32_t, 4> uav_vals{0x01020304u, 0x05060708u, 0x090A0B0Cu, 0x0D0E0F10u};
+        std::uint8_t pat16[16]{};
+        std::memcpy(pat16, uav_vals.data(), 16);
+        for (std::size_t i = 0; i < 400; ++i) fill_exp[16 + i] = pat16[i % 16];
+        std::memcpy(fill_ptr, fill_init.data(), fill_buf_bytes);
+
+        ResourceBinding r_up{}, r_rb{}, r_fill{}, r_tex{};
+        r_up.buffer = up_buf; r_up.size = fp_bytes;
+        r_rb.buffer = rb_buf; r_rb.size = fp_bytes; r_rb.host_readable = true;
+        r_fill.buffer = fill_buf; r_fill.size = fill_buf_bytes; r_fill.host_readable = true;
+        r_tex.image = tex; r_tex.format = VK_FORMAT_R8G8B8A8_UNORM; r_tex.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+        r_tex.width = w; r_tex.height = h; r_tex.depth = 1; r_tex.mip_levels = 1; r_tex.array_layers = 1; r_tex.samples = 1;
+        context.add_resource(10, r_up);
+        context.add_resource(11, r_rb);
+        context.add_resource(12, r_fill);
+        context.add_resource(13, r_tex, VK_IMAGE_LAYOUT_UNDEFINED);
+
+        const CopyLocation loc_up{10, true, 0, 0, w, h, 1, pitch};
+        const CopyLocation loc_rb{11, true, 0, 0, w, h, 1, pitch};
+        const CopyLocation loc_tex{13, false, 0, 0, 0, 0, 0, 0};
+        CommandList ops_list;
+        EXPECT(ops_list.set_predication({3, 0, d3d12_predication::equal_zero}));  // true (1<<32)
+        EXPECT(ops_list.copy_texture({loc_tex, 0, 0, 0, loc_up, false, {}}));
+        EXPECT(ops_list.transition({13, all_subresources, d3d12_state::copy_dest, d3d12_state::copy_source}));
+        EXPECT(ops_list.copy_texture({loc_rb, 0, 0, 0, loc_tex, false, {}}));
+        EXPECT(ops_list.clear_unordered_access({12, true, std::uint32_t(VK_FORMAT_R32G32B32A32_UINT), 16, 400, 16, 0, 0, 1},
+                                               false, uav_vals, {}));
+        EXPECT(ops_list.set_predication({3, 8, d3d12_predication::equal_zero}));  // false (0)
+        EXPECT(ops_list.clear_unordered_access({12, true, 0, 0, 512, 4, 0, 0, 1}, false, {0xFFFFFFFFu, 0, 0, 0}, {}));
+        EXPECT(ops_list.set_predication({0, 0, 0}));
+        EXPECT(ops_list.transition({13, all_subresources, d3d12_state::copy_source, d3d12_state::copy_dest}));
+        EXPECT(ops_list.close());
+
+        const CommandList* ops_ptr = &ops_list;
+        for (unsigned i = 0; i < 8; ++i) EXPECT(queue.execute({&ops_ptr, 1}) == ReplayResult::success);
+        EXPECT(queue.idle());
+        EXPECT(std::memcmp(rb_ptr, rb_exp.data(), fp_bytes) == 0);
+        EXPECT(std::memcmp(fill_ptr, fill_exp.data(), fill_buf_bytes) == 0);
+        context.remove_resource(10);
+        context.remove_resource(11);
+        context.remove_resource(12);
+        context.remove_resource(13);
+    }
     if (statistics) {
         for (unsigned word=0; word<11; ++word) {
             std::uint64_t value=UINT64_MAX;

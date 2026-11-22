@@ -37,6 +37,7 @@
 #include <vulkan/vulkan.h>
 #include "vulkan_predicate.h"
 #include "vulkan_predicated_copy.h"
+#include "vulkan_predicated_ops.h"
 
 #include <algorithm>
 #include <array>
@@ -853,6 +854,13 @@ struct ReplayFunctions {
     std::function<bool(VkBuffer, VkBuffer, VkDeviceSize, VkDeviceSize, VkDeviceSize,
                        std::vector<PredicatedCopyDispatch>&)> prepare_predicated_copy;
     std::function<void(VkCommandBuffer, const std::vector<PredicatedCopyDispatch>&)> emit_predicated_copy;
+    std::function<bool(VkBuffer, VkBuffer, VkDeviceSize, VkDeviceSize, VkDeviceSize, std::uint32_t, std::uint32_t,
+                       VkDeviceSize, VkDeviceSize, VkDeviceSize, VkDeviceSize,
+                       std::vector<PredicatedStridedDispatch>&)> prepare_predicated_strided;
+    std::function<void(VkCommandBuffer, const std::vector<PredicatedStridedDispatch>&)> emit_predicated_strided;
+    std::function<bool(VkBuffer, VkDeviceSize, VkDeviceSize, const std::uint8_t*, std::uint32_t,
+                       std::vector<PredicatedFillDispatch>&)> prepare_predicated_fill;
+    std::function<void(VkCommandBuffer, const std::vector<PredicatedFillDispatch>&)> emit_predicated_fill;
     // Returns a 2D-array view of the range (caller-owned, alive until execution completes); rectangle clears.
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
     // Optional format check for color-attachment reinterpretation on mutable UAV clears; unset assumes every format
@@ -917,6 +925,8 @@ struct Prepared {
     std::uint32_t statistics_begin = PreparedQuery::no_segment;
     PredicateCapture predicate;
     std::vector<PredicatedCopyDispatch> predicated_copy;
+    std::vector<PredicatedStridedDispatch> predicated_strided;
+    std::vector<PredicatedFillDispatch> predicated_fill;
     ResourceBinding binding;
     VkImageSubresourceRange range{};  // the barrier range, or the cleared view (cleared aspects only)
     VkImageView view = VK_NULL_HANDLE;
@@ -934,13 +944,24 @@ struct Prepared {
     VkImageView resolve_view = VK_NULL_HANDLE;
     bool has_depth24 = false;  // a depth plane copy of a depth24_as_float texture: convert through depth24
                                // (or a copy of an rgb96 texture: repacked by the same pass)
+    bool predicated_depth24_readback = false;  // depth24/rgb96 readback compute runs inside conditional rendering
     std::uint32_t rgb96_row_words = 0;    // an rgb96 footprint: words between its rows and between its slices
     std::uint32_t rgb96_slice_words = 0;
+    VkDeviceSize copy_row_bytes = 0;      // footprint copy geometry for predicated strided upload/readback
+    VkDeviceSize copy_row_pitch = 0;
+    VkDeviceSize copy_slice_pitch = 0;
+    std::uint32_t copy_rows = 0;
     Depth24Job depth24;                    // the whole copy: where its scratch floats are
     std::vector<Depth24Job> depth24_parts;  // the dispatches that convert it
-    // A depth <-> colour copy: the source into `staged` (image to buffer), then `staged` into the destination.
+    // A depth <-> colour copy or predicated staged op: scratch buffers and image-buffer transfer regions.
     VkBuffer staged = VK_NULL_HANDLE;
+    VkBuffer staged_dst = VK_NULL_HANDLE;
     std::vector<VkBufferImageCopy> staged_reads, staged_writes;
+    // Predicated resolves: saved original destination rectangle and captured post-resolve rectangle.
+    VkBuffer staged_resolve_saved = VK_NULL_HANDLE;
+    VkBuffer staged_resolve_captured = VK_NULL_HANDLE;
+    VkBufferImageCopy staged_resolve_dst{};
+    VkBufferImageCopy staged_resolve_src{};
     std::vector<VkImageSubresourceRange> discards;  // DiscardResource: the subresources to discard
     VkBuffer write_buffer = VK_NULL_HANDLE;          // WriteBufferImmediate: where the address lands
     VkDeviceSize write_offset = 0;
@@ -1361,7 +1382,7 @@ inline bool indirect_range(const ResourceBinding& binding, VkDeviceSize offset, 
 // repeat in every aligned word, so vkCmdFillBuffer writes the aligned middle and copies from it the unaligned ends
 // (vkCmdCopyBuffer has no alignment rule); that needs one whole word in the middle. Wider elements are written
 // with vkCmdUpdateBuffer and doubled with copies, which needs a word-aligned range.
-inline ReplayResult prepare_buffer_uav_clear(const ClearUnorderedAccess& clear, Prepared& p) {
+inline ReplayResult prepare_buffer_uav_clear(const ClearUnorderedAccess& clear, Prepared& p, bool predicated = false) {
     const UavView& view = clear.view;
     if (!p.binding.buffer || p.binding.image) return ReplayResult::invalid_clear;
     if (view.offset >= p.binding.size) return ReplayResult::invalid_subresource;
@@ -1378,12 +1399,16 @@ inline ReplayResult prepare_buffer_uav_clear(const ClearUnorderedAccess& clear, 
     const auto add = [&](std::uint64_t offset, std::uint64_t bytes) {
         if (!bytes) return ReplayResult::success;
         if (offset % std::min(e, 4u)) return ReplayResult::invalid_clear;
+        if (offset > UINT64_MAX - p.binding.buffer_offset) return ReplayResult::invalid_clear;
         offset += p.binding.buffer_offset;  // the view is relative to the resource, which starts at buffer_offset
-        if (e <= 4) {
-            const std::uint64_t a0 = (offset + 3) / 4 * 4, a1 = (offset + bytes) / 4 * 4;
-            if ((a0 != offset || a1 != offset + bytes) && a1 < a0 + 4) return ReplayResult::unsupported;
-        } else if (bytes % 4) {
-            return ReplayResult::unsupported;
+        if (bytes > UINT64_MAX - offset) return ReplayResult::invalid_clear;
+        if (!predicated) {
+            if (e <= 4) {
+                const std::uint64_t a0 = (offset + 3) / 4 * 4, a1 = (offset + bytes) / 4 * 4;
+                if ((a0 != offset || a1 != offset + bytes) && a1 < a0 + 4) return ReplayResult::unsupported;
+            } else if (bytes % 4) {
+                return ReplayResult::unsupported;
+            }
         }
         p.fills.push_back({offset, bytes});
         return ReplayResult::success;
@@ -1595,6 +1620,11 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
         region.bufferRowLength = 0;
         region.bufferImageHeight = 0;
     }
+    if (rows > UINT32_MAX) return ReplayResult::unsupported;
+    p.copy_row_bytes = row_bytes;
+    p.copy_rows = static_cast<std::uint32_t>(rows);
+    p.copy_row_pitch = placed.row_pitch;
+    p.copy_slice_pitch = slice_pitch;
     p.buffer_image_copies.push_back(region);
     (upload ? p.range : p.source_range) = range;
     return ReplayResult::success;
@@ -2039,7 +2069,8 @@ inline void plan_statistics_segments(PreparedList& out) {
     std::size_t next_query = 0;
     for (std::size_t i = 0; i < out.commands.size(); ++i) {
         auto& p = out.commands[i];
-        if (begin && (p.predicate.scratch || !p.predicated_copy.empty() || p.has_depth24))
+        if (begin && (p.predicate.scratch || !p.predicated_copy.empty() || !p.predicated_strided.empty() ||
+                      !p.predicated_fill.empty() || p.has_depth24))
             inner.push_back({&p.statistics_end, &p.statistics_begin});
         if (next_query == out.queries.size() || out.queries[next_query].command != i) continue;
         auto& query = out.queries[next_query++];
@@ -2242,12 +2273,25 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             const UavView& view = uav->view;
             if (!bind(view.resource)) return ReplayResult::unresolved_resource;
             if (view.buffer) {
-                if (!vk.fill_buffer || !vk.update_buffer || !vk.copy_buffer) return ReplayResult::unsupported;
-                if (predicated) ++out.unpredicated_copies;  // fills and copies are transfer commands
-                if (const auto r = detail::prepare_buffer_uav_clear(*uav, p); r != ReplayResult::success) return r;
-                if (!p.skip && !p.fills.empty() && p.binding.host_readable) {
+                if (!predicated && (!vk.fill_buffer || !vk.update_buffer || !vk.copy_buffer))
+                    return ReplayResult::unsupported;
+                if (const auto r = detail::prepare_buffer_uav_clear(*uav, p, predicated); r != ReplayResult::success)
+                    return r;
+                if (predicated && !p.skip && !p.fills.empty()) {
+                    if ((statistics_active && !statistics_helpers) || !vk.prepare_predicated_fill ||
+                        !vk.emit_predicated_fill)
+                        return ReplayResult::unsupported;
+                    for (const auto& fill : p.fills) {
+                        if (!vk.prepare_predicated_fill(p.binding.buffer, fill[0], fill[1],
+                                                        p.element.bytes.data(), p.element.size, p.predicated_fill))
+                            return ReplayResult::unsupported;
+                    }
+                    p.fills.clear();
+                }
+                if (!p.skip && (!p.fills.empty() || !p.predicated_fill.empty()) && p.binding.host_readable) {
                     out.wrote_readback = true;
-                    out.readback_src_stages |= VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+                    out.readback_src_stages |= !p.predicated_fill.empty() ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+                                                                          : VK_PIPELINE_STAGE_2_TRANSFER_BIT;
                 }
                 continue;
             }
@@ -2279,8 +2323,38 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!uav->rects.empty() && !attachment)
                 return ReplayResult::unsupported;
             // Under a predicate a whole view is cleared as one rectangle where the image can be an attachment, as
-            // render targets are; otherwise vkCmdClearColorImage runs unconditionally and is counted.
-            if (predicated && uav->rects.empty() && !attachment) ++out.unpredicated_copies;
+            // render targets are; 3D and non-attachment views stage through scratch and fill conditionally via compute.
+            if (predicated && uav->rects.empty() && !attachment) {
+                if ((statistics_active && !statistics_helpers) || !vk.copy_scratch || !vk.copy_image_to_buffer ||
+                    !vk.copy_buffer_to_image || !vk.prepare_predicated_fill || !vk.emit_predicated_fill)
+                    return ReplayResult::unsupported;
+                const BlockFormat fmt = block_format(p.binding.format, VK_IMAGE_ASPECT_COLOR_BIT);
+                if (!fmt.bytes || fmt.block != 1 || fmt.bytes != p.element.size || p.binding.samples != 1)
+                    return ReplayResult::unsupported;
+                const VkExtent2D mip = detail::mip_extent(p.binding, view.mip);
+                // Matches unpredicated vkCmdClearColorImage (and d3d12_com.cpp): a 3D UAV clear covers every W slice
+                // of the mip, while 2D/2D-array views cover [first_layer, first_layer + layer_count).
+                const std::uint32_t slices = p.binding.volume ? std::max(1u, p.binding.depth >> view.mip) : 1u;
+                const std::uint32_t layers = p.binding.volume ? 1u : view.layer_count;
+                const std::uint64_t pixels = std::uint64_t(mip.width) * mip.height;
+                if (!pixels || slices > UINT64_MAX / pixels || layers > UINT64_MAX / (pixels * slices) ||
+                    fmt.bytes > UINT64_MAX / (pixels * slices * layers))
+                    return ReplayResult::unsupported;
+                const VkDeviceSize total = pixels * slices * layers * fmt.bytes;
+                VkDeviceSize base = 0;
+                if (!vk.copy_scratch(total, p.staged, base) ||
+                    !vk.prepare_predicated_fill(p.staged, base, total, p.element.bytes.data(), p.element.size,
+                                                p.predicated_fill))
+                    return ReplayResult::unsupported;
+                VkBufferImageCopy region{};
+                region.bufferOffset = base;
+                region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, view.mip,
+                                           p.binding.volume ? 0u : view.first_layer, layers};
+                region.imageOffset = {0, 0, 0};
+                region.imageExtent = {mip.width, mip.height, slices};
+                p.staged_writes.push_back(region);
+                continue;
+            }
             const auto rects = (reinterpret && uav->rects.empty())
                                    ? std::span<const Rect>(&whole_view, 1)
                                    : attachment ? clear_rects(uav->rects) : std::span<const Rect>(uav->rects);
@@ -2290,7 +2364,6 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         } else if (std::holds_alternative<CopyBuffer>(command) || std::holds_alternative<CopyTexture>(command) ||
                    std::holds_alternative<CopyResource>(command)) {
             if (!copies) return ReplayResult::unsupported;
-            if (predicated && !std::holds_alternative<CopyBuffer>(command)) ++out.unpredicated_copies;
             const auto [dst_id, src_id] = copy_ids(command);
             const ResourceBinding* source = resolve(src_id);
             if (!bind(dst_id) || !source) return ReplayResult::unresolved_resource;
@@ -2364,10 +2437,139 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     if (!vk.depth24_prepare || !vk.depth24_run || !vk.depth24_prepare(job, p.depth24_parts)) return ReplayResult::unsupported;
                     p.has_depth24 = true;
                 }
+                if (result == ReplayResult::success && predicated && !p.buffer_image_copies.empty()) {
+                    const VkBufferImageCopy& region = p.buffer_image_copies[0];
+                    if (p.has_depth24 && upload) {
+                        if ((statistics_active && !statistics_helpers) || !vk.copy_scratch ||
+                            !vk.prepare_predicated_copy || !vk.emit_predicated_copy)
+                            return ReplayResult::unsupported;
+                        const std::uint32_t texel =
+                            block_format(p.binding.format, region.imageSubresource.aspectMask).bytes;
+                        const std::uint64_t pixels = std::uint64_t(region.imageExtent.width) * region.imageExtent.height;
+                        if (!texel || !pixels || region.imageExtent.depth > UINT64_MAX / pixels ||
+                            texel > UINT64_MAX / (pixels * region.imageExtent.depth))
+                            return ReplayResult::unsupported;
+                        const VkDeviceSize packed_bytes = pixels * region.imageExtent.depth * texel;
+                        VkDeviceSize dst_base = 0;
+                        if (!vk.copy_scratch(packed_bytes, p.staged, dst_base) ||
+                            !vk.prepare_predicated_copy(p.depth24.scratch, p.staged, p.depth24.scratch_offset,
+                                                        dst_base, packed_bytes, p.predicated_copy))
+                            return ReplayResult::unsupported;
+                        VkBufferImageCopy staged_region = region;
+                        staged_region.bufferOffset = dst_base;
+                        staged_region.bufferRowLength = 0;
+                        staged_region.bufferImageHeight = 0;
+                        p.staged_writes.push_back(staged_region);
+                    } else if (p.has_depth24 && !upload) {
+                        // Readback stages image -> depth24.scratch unconditionally, then runs depth24_run predicated.
+                        p.predicated_depth24_readback = true;
+                    } else {
+                        if ((statistics_active && !statistics_helpers) || !vk.copy_scratch ||
+                            !vk.prepare_predicated_strided || !vk.emit_predicated_strided)
+                            return ReplayResult::unsupported;
+                        if (!p.copy_row_bytes || !p.copy_rows || p.copy_rows > UINT64_MAX / p.copy_row_bytes)
+                            return ReplayResult::unsupported;
+                        const VkDeviceSize packed_slice = p.copy_row_bytes * p.copy_rows;
+                        if (region.imageExtent.depth > UINT64_MAX / packed_slice) return ReplayResult::unsupported;
+                        const VkDeviceSize packed_bytes = packed_slice * region.imageExtent.depth;
+                        VkDeviceSize scratch_base = 0;
+                        if (!vk.copy_scratch(packed_bytes, p.staged, scratch_base)) return ReplayResult::unsupported;
+                        VkBufferImageCopy staged_region = region;
+                        staged_region.bufferOffset = scratch_base;
+                        staged_region.bufferRowLength = 0;
+                        staged_region.bufferImageHeight = 0;
+                        if (upload) {
+                            if (!vk.prepare_predicated_strided(
+                                    p.source.buffer, p.staged, region.bufferOffset, scratch_base, p.copy_row_bytes,
+                                    p.copy_rows, region.imageExtent.depth, p.copy_row_pitch, p.copy_slice_pitch,
+                                    p.copy_row_bytes, packed_slice, p.predicated_strided))
+                                return ReplayResult::unsupported;
+                            p.staged_writes.push_back(staged_region);
+                        } else {
+                            if (!vk.prepare_predicated_strided(
+                                    p.staged, p.binding.buffer, scratch_base, region.bufferOffset, p.copy_row_bytes,
+                                    p.copy_rows, region.imageExtent.depth, p.copy_row_bytes, packed_slice,
+                                    p.copy_row_pitch, p.copy_slice_pitch, p.predicated_strided))
+                                return ReplayResult::unsupported;
+                            p.staged_reads.push_back(staged_region);
+                        }
+                    }
+                }
             } else {
                 result = detail::prepare_resource_copy(p);
+                if (result == ReplayResult::success && predicated && !p.buffer_copies.empty()) {
+                    if ((statistics_active && !statistics_helpers) || !vk.prepare_predicated_copy ||
+                        !vk.emit_predicated_copy ||
+                        !vk.prepare_predicated_copy(p.source.buffer, p.binding.buffer, p.buffer_copies[0].srcOffset,
+                                                    p.buffer_copies[0].dstOffset, p.buffer_copies[0].size,
+                                                    p.predicated_copy))
+                        return ReplayResult::unsupported;
+                    p.buffer_copies.clear();
+                }
             }
-            if (result == ReplayResult::success && !p.image_copies.empty() &&
+            if (result == ReplayResult::success && !p.image_copies.empty() && predicated) {
+                // Predicated texture-to-texture copies stage source and destination through scratch buffers so the
+                // conditional compute copy selects between them; Vulkan forbids image-buffer copies on MSAA images.
+                if (p.source.samples != 1 || p.binding.samples != 1 ||
+                    (statistics_active && !statistics_helpers) || !vk.copy_scratch || !vk.prepare_predicated_copy ||
+                    !vk.emit_predicated_copy)
+                    return ReplayResult::unsupported;
+                VkDeviceSize total = 0;
+                std::vector<VkDeviceSize> offsets;
+                std::vector<VkExtent3D> dst_extents;
+                offsets.reserve(p.image_copies.size());
+                dst_extents.reserve(p.image_copies.size());
+                for (const VkImageCopy& c : p.image_copies) {
+                    const BlockFormat sf = block_format(p.source.format, c.srcSubresource.aspectMask);
+                    const BlockFormat df = block_format(p.binding.format, c.dstSubresource.aspectMask);
+                    if (!sf.bytes || sf.bytes != df.bytes) return ReplayResult::unsupported;
+                    const std::uint64_t bw = (std::uint64_t(c.extent.width) + sf.block - 1) / sf.block;
+                    const std::uint64_t bh = (std::uint64_t(c.extent.height) + sf.block - 1) / sf.block;
+                    const std::uint64_t blocks = bw * bh;
+                    if (!blocks || c.extent.depth > UINT64_MAX / blocks ||
+                        c.srcSubresource.layerCount > UINT64_MAX / (blocks * c.extent.depth) ||
+                        sf.bytes > UINT64_MAX / (blocks * c.extent.depth * c.srcSubresource.layerCount))
+                        return ReplayResult::unsupported;
+                    const VkDeviceSize region_bytes = blocks * c.extent.depth * c.srcSubresource.layerCount * sf.bytes;
+                    if (region_bytes > UINT64_MAX - 15) return ReplayResult::unsupported;
+                    const VkDeviceSize aligned = (region_bytes + 15) / 16 * 16;
+                    if (aligned > UINT64_MAX - total) return ReplayResult::unsupported;
+                    offsets.push_back(total);
+                    total += aligned;
+                    VkExtent3D dst_ext = c.extent;
+                    if (sf.block != df.block) {
+                        const VkExtent2D dst_mip = detail::mip_extent(p.binding, c.dstSubresource.mipLevel);
+                        dst_ext.width = std::min<std::uint32_t>(
+                            static_cast<std::uint32_t>(bw * df.block),
+                            dst_mip.width - static_cast<std::uint32_t>(c.dstOffset.x));
+                        dst_ext.height = std::min<std::uint32_t>(
+                            static_cast<std::uint32_t>(bh * df.block),
+                            dst_mip.height - static_cast<std::uint32_t>(c.dstOffset.y));
+                    }
+                    dst_extents.push_back(dst_ext);
+                }
+                VkDeviceSize src_base = 0, dst_base = 0;
+                if (!total || !vk.copy_scratch(total, p.staged, src_base) ||
+                    !vk.copy_scratch(total, p.staged_dst, dst_base) ||
+                    !vk.prepare_predicated_copy(p.staged, p.staged_dst, src_base, dst_base, total, p.predicated_copy))
+                    return ReplayResult::unsupported;
+                for (std::size_t r = 0; r < p.image_copies.size(); ++r) {
+                    const VkImageCopy& c = p.image_copies[r];
+                    VkBufferImageCopy read_r{};
+                    read_r.bufferOffset = src_base + offsets[r];
+                    read_r.imageSubresource = c.srcSubresource;
+                    read_r.imageOffset = c.srcOffset;
+                    read_r.imageExtent = c.extent;
+                    p.staged_reads.push_back(read_r);
+                    VkBufferImageCopy write_r{};
+                    write_r.bufferOffset = dst_base + offsets[r];
+                    write_r.imageSubresource = c.dstSubresource;
+                    write_r.imageOffset = c.dstOffset;
+                    write_r.imageExtent = dst_extents[r];
+                    p.staged_writes.push_back(write_r);
+                }
+                p.image_copies.clear();
+            } else if (result == ReplayResult::success && !p.image_copies.empty() &&
                 p.image_copies[0].srcSubresource.aspectMask != p.image_copies[0].dstSubresource.aspectMask) {
                 // Depth <-> colour: vkCmdCopyImage cannot mix aspects, so each region goes image -> scratch -> image,
                 // tightly packed. Depth aspects want 4-byte buffer offsets; 16 covers every texel size here.
@@ -2400,14 +2602,13 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (result != ReplayResult::success) return result;
             if (p.binding.host_readable) {
                 out.wrote_readback = true;
-                const bool compute_write =
-                    (predicated && std::holds_alternative<CopyBuffer>(command)) || (p.has_depth24 && !p.binding.image);
+                const bool compute_write = !p.predicated_copy.empty() || !p.predicated_strided.empty() ||
+                                           (p.has_depth24 && !p.binding.image);
                 out.readback_src_stages |= compute_write
                     ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_2_COPY_BIT;
             }
         } else if (const auto* resolve_command = std::get_if<ResolveSubresource>(&command)) {
             if (!vk.resolve_image) return ReplayResult::unsupported;
-            if (predicated) ++out.unpredicated_copies;  // a transfer command, like the copies
             const ResourceBinding* source = resolve(resolve_command->src);
             if (!bind(resolve_command->dst) || !source) return ReplayResult::unresolved_resource;
             p.source = *source;
@@ -2420,6 +2621,24 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!p.view || !p.resolve_view) return ReplayResult::unsupported;
                 if (const auto result = detail::keep_around_resolve(vk, p); result != ReplayResult::success)
                     return result;
+            }
+            if (predicated) {
+                if ((statistics_active && !statistics_helpers) || !vk.copy_scratch || !vk.copy_image_to_buffer ||
+                    !vk.copy_buffer_to_image || !vk.prepare_predicated_copy || !vk.emit_predicated_copy)
+                    return ReplayResult::unsupported;
+                const BlockFormat fmt = block_format(p.binding.format, p.range.aspectMask);
+                if (!fmt.bytes || fmt.block != 1) return ReplayResult::unsupported;
+                const std::uint64_t pixels = std::uint64_t(p.resolve.extent.width) * p.resolve.extent.height;
+                if (!pixels || fmt.bytes > UINT64_MAX / pixels) return ReplayResult::unsupported;
+                const VkDeviceSize rect_bytes = pixels * fmt.bytes;
+                VkDeviceSize saved_base = 0, captured_base = 0;
+                if (!vk.copy_scratch(rect_bytes, p.staged_resolve_saved, saved_base) ||
+                    !vk.copy_scratch(rect_bytes, p.staged_resolve_captured, captured_base) ||
+                    !vk.prepare_predicated_copy(p.staged_resolve_captured, p.staged_resolve_saved, captured_base,
+                                                saved_base, rect_bytes, p.predicated_copy))
+                    return ReplayResult::unsupported;
+                p.staged_resolve_dst = {saved_base, 0, 0, p.resolve.dstSubresource, p.resolve.dstOffset, p.resolve.extent};
+                p.staged_resolve_src = {captured_base, 0, 0, p.resolve.dstSubresource, p.resolve.dstOffset, p.resolve.extent};
             }
         } else if (const auto* discard = std::get_if<DiscardResource>(&command)) {
             // Buffers and partial (rectangle) discards keep their contents, which "undefined" allows.
@@ -2450,12 +2669,18 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             out.readback_src_stages |= VK_PIPELINE_STAGE_2_TRANSFER_BIT;
         } else if (const auto* atomic = std::get_if<AtomicCopyBuffer>(&command)) {
             if (!vk.copy_buffer) return ReplayResult::unsupported;
-            if (predicated) ++out.unpredicated_copies;  // a transfer command, like the copies
             const ResourceBinding* source = resolve(atomic->src);
             if (!bind(atomic->dst) || !source) return ReplayResult::unresolved_resource;
             p.source = *source;
             if (!p.binding.buffer || !p.source.buffer || !detail::within(atomic->dst_offset, atomic->bytes, p.binding.size) ||
                 !detail::within(atomic->src_offset, atomic->bytes, p.source.size))
+                return ReplayResult::invalid_copy;
+            if (atomic->src_offset > UINT64_MAX - p.source.buffer_offset ||
+                atomic->dst_offset > UINT64_MAX - p.binding.buffer_offset)
+                return ReplayResult::invalid_copy;
+            const VkDeviceSize src_off = p.source.buffer_offset + atomic->src_offset;
+            const VkDeviceSize dst_off = p.binding.buffer_offset + atomic->dst_offset;
+            if (atomic->bytes > UINT64_MAX - src_off || atomic->bytes > UINT64_MAX - dst_off)
                 return ReplayResult::invalid_copy;
             for (const auto& d : atomic->dependencies) {
                 const ResourceBinding* dependent = resolve(d.resource);
@@ -2463,11 +2688,23 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!dependent->image && (d.subresource != 0 || d.begin > d.end || d.end > dependent->size))
                     return ReplayResult::invalid_copy;
             }
-            p.buffer_copies.push_back({p.source.buffer_offset + atomic->src_offset,
-                                       p.binding.buffer_offset + atomic->dst_offset, atomic->bytes});
+            if (predicated) {
+                if (p.source.buffer == p.binding.buffer && src_off < dst_off + atomic->bytes &&
+                    dst_off < src_off + atomic->bytes)
+                    return ReplayResult::invalid_copy;
+                if ((statistics_active && !statistics_helpers) || !vk.prepare_predicated_copy ||
+                    !vk.emit_predicated_copy ||
+                    !vk.prepare_predicated_copy(p.source.buffer, p.binding.buffer, src_off, dst_off, atomic->bytes,
+                                                p.predicated_copy))
+                    return ReplayResult::unsupported;
+            } else {
+                p.buffer_copies.push_back({src_off, dst_off, atomic->bytes});
+            }
             if (p.binding.host_readable) {
                 out.wrote_readback = true;
-                out.readback_src_stages |= VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+                out.readback_src_stages |= predicated
+                    ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+                    : (VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT);
             }
         } else if (const auto* predication = std::get_if<Predication>(&command)) {
             predicated = predication->buffer != 0;
@@ -2821,12 +3058,26 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
     const bool predicates = vk.begin_conditional_rendering != nullptr;
     VkConditionalRenderingBeginInfoEXT predicate{VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT};
     std::size_t next_query = 0;
-    // A dispatch honours conditional rendering and a copy does not (the layer runs copies unpredicated), so the
-    // conversion around a copy must run whatever the predicate says: end it for the dispatch and begin it again.
+    // Helper transfers and staging dispatches run unconditionally regardless of the active predicate: suspend
+    // conditional rendering around them so drivers that suppress transfers inside conditional rendering (D3D-148)
+    // still stage cleanly, and re-enter conditional rendering for the predicated compute step.
+    struct SuspendPredicate {
+        const ReplayFunctions& vk;
+        VkCommandBuffer cb;
+        const VkConditionalRenderingBeginInfoEXT& pred;
+        SuspendPredicate(const ReplayFunctions& v, VkCommandBuffer c, const VkConditionalRenderingBeginInfoEXT& p_)
+            : vk(v), cb(c), pred(p_) {
+            if (pred.buffer) vk.end_conditional_rendering(cb);
+        }
+        ~SuspendPredicate() {
+            if (pred.buffer) vk.begin_conditional_rendering(cb, &pred);
+        }
+        SuspendPredicate(const SuspendPredicate&) = delete;
+        SuspendPredicate& operator=(const SuspendPredicate&) = delete;
+    };
     const auto run_depth24 = [&](const Depth24Job& job) {
-        if (predicate.buffer) vk.end_conditional_rendering(command_buffer);
+        SuspendPredicate suspend(vk, command_buffer, predicate);
         vk.depth24_run(command_buffer, job);
-        if (predicate.buffer) vk.begin_conditional_rendering(command_buffer, &predicate);
     };
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
@@ -3044,6 +3295,12 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             state.access |= VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
             state.stages |= VK_PIPELINE_STAGE_TRANSFER_BIT;
             if (uav->view.buffer) {
+                if (!p.predicated_fill.empty()) {
+                    end_statistics();
+                    vk.emit_predicated_fill(command_buffer, p.predicated_fill);
+                    begin_statistics();
+                    continue;
+                }
                 constexpr VkAccessFlags transfer = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
                 detail::memory_barrier(vk, command_buffer, state.access, state.stages, transfer,
                                        VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -3061,6 +3318,33 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             // Cleared in place in GENERAL, the UAV layout, which transfer clears and attachments both accept.
             const VkImageLayout layout = image_layout(p.binding, state.layout);
             auto pieces = detail::current(tracker, id, p.range, layout);
+            if (!p.predicated_fill.empty()) {
+                {
+                    SuspendPredicate suspend(vk, command_buffer, predicate);
+                    detail::initialize(vk, command_buffer, p.binding, id, pieces, layout, tracker);
+                    detail::round_trip(vk, command_buffer, p.binding, pieces, layout, state,
+                                       VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, [&] {
+                        vk.copy_image_to_buffer(command_buffer, p.binding.image, layout, p.staged,
+                                                std::uint32_t(p.staged_writes.size()), p.staged_writes.data());
+                    });
+                }
+                end_statistics();
+                vk.emit_predicated_fill(command_buffer, p.predicated_fill);
+                begin_statistics();
+                {
+                    SuspendPredicate suspend(vk, command_buffer, predicate);
+                    detail::memory_barrier(vk, command_buffer,
+                                           VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                           VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                           VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                    detail::round_trip(vk, command_buffer, p.binding, pieces, layout, state,
+                                       VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, [&] {
+                        vk.copy_buffer_to_image(command_buffer, p.staged, p.binding.image, layout,
+                                                std::uint32_t(p.staged_writes.size()), p.staged_writes.data());
+                    });
+                }
+                continue;
+            }
             detail::initialize(vk, command_buffer, p.binding, id, pieces, layout, tracker);
             if (p.rects.empty()) {
                 detail::round_trip(vk, command_buffer, p.binding, pieces, layout, state,
@@ -3091,14 +3375,78 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         } else if (std::holds_alternative<CopyBuffer>(command) || std::holds_alternative<CopyTexture>(command) ||
                    std::holds_alternative<CopyResource>(command)) {
             const auto [dst_id, src_id] = copy_ids(command);
-            if (!p.predicated_copy.empty()) {
+            if (!p.predicated_copy.empty() && !p.staged) {
                 end_statistics();
                 vk.emit_predicated_copy(command_buffer, p.predicated_copy);
                 begin_statistics();
             } else if (!p.buffer_copies.empty()) {
                 vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, std::uint32_t(p.buffer_copies.size()),
                                p.buffer_copies.data());
-            } else if (p.staged) {
+            } else if (p.staged && p.staged_dst) {
+                // Predicated texture-to-texture copy: stage source and destination into scratch buffers outside
+                // conditional rendering, run the byte-copy compute inside conditional rendering, then write back.
+                const auto depth_stencil = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+                const bool split_ds = std::holds_alternative<CopyResource>(command) &&
+                                      (p.binding.aspects & depth_stencil) == depth_stencil;
+                const auto count = std::uint32_t(p.staged_writes.size());
+                const auto depth_count = p.source.mip_levels;
+                {
+                    SuspendPredicate suspend(vk, command_buffer, predicate);
+                    const VkImageLayout src_layout = detail::copy_layout(
+                        vk, command_buffer, p.source, src_id,
+                        detail::planes_for_layout(p.source, p.source_range, separate),
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
+                    if (split_ds) {
+                        vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, p.staged,
+                                                depth_count, p.staged_reads.data());
+                        vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, p.staged,
+                                                count - depth_count, p.staged_reads.data() + depth_count);
+                    } else {
+                        vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, p.staged,
+                                                std::uint32_t(p.staged_reads.size()), p.staged_reads.data());
+                    }
+                    const VkImageLayout dst_read = detail::copy_layout(
+                        vk, command_buffer, p.binding, dst_id,
+                        detail::planes_for_layout(p.binding, p.range, separate),
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
+                    if (split_ds) {
+                        vk.copy_image_to_buffer(command_buffer, p.binding.image, dst_read, p.staged_dst,
+                                                depth_count, p.staged_writes.data());
+                        vk.copy_image_to_buffer(command_buffer, p.binding.image, dst_read, p.staged_dst,
+                                                count - depth_count, p.staged_writes.data() + depth_count);
+                    } else {
+                        vk.copy_image_to_buffer(command_buffer, p.binding.image, dst_read, p.staged_dst,
+                                                count, p.staged_writes.data());
+                    }
+                }
+                end_statistics();
+                vk.emit_predicated_copy(command_buffer, p.predicated_copy);
+                begin_statistics();
+                {
+                    SuspendPredicate suspend(vk, command_buffer, predicate);
+                    detail::memory_barrier(vk, command_buffer,
+                                           VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                           VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                           VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                    const VkImageLayout dst_write = detail::copy_layout(
+                        vk, command_buffer, p.binding, dst_id,
+                        detail::planes_for_layout(p.binding, p.range, separate),
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
+                    if (split_ds) {
+                        vk.copy_buffer_to_image(command_buffer, p.staged_dst, p.binding.image, dst_write,
+                                                depth_count, p.staged_writes.data());
+                        detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                               VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                               VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                                               VK_PIPELINE_STAGE_TRANSFER_BIT);
+                        vk.copy_buffer_to_image(command_buffer, p.staged_dst, p.binding.image, dst_write,
+                                                count - depth_count, p.staged_writes.data() + depth_count);
+                    } else {
+                        vk.copy_buffer_to_image(command_buffer, p.staged_dst, p.binding.image, dst_write,
+                                                count, p.staged_writes.data());
+                    }
+                }
+            } else if (p.staged && p.predicated_strided.empty() && p.predicated_copy.empty()) {
                 // Depth <-> colour: the source into the scratch, then the scratch into the destination.
                 const VkImageLayout src_layout = detail::copy_layout(
                     vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),
@@ -3141,54 +3489,164 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                   count, p.image_copies.data());
                 }
             } else if (p.binding.image) {
-                VkBuffer source = p.source.buffer;
-                std::vector<VkBufferImageCopy> converted;
-                const std::vector<VkBufferImageCopy>* regions = &p.buffer_image_copies;
-                if (p.has_depth24) {
-                    // The words become floats in the scratch buffer, which the copy then reads (tightly packed).
-                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-                                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                if (p.has_depth24 && !p.predicated_copy.empty()) {
+                    // Predicated depth24/rgb96 upload: convert into depth24.scratch and save dst outside conditional
+                    // rendering, select via conditional byte-copy inside one statistics split, then upload back.
                     end_statistics();
-                    for (const auto& part : p.depth24_parts) run_depth24(part);
+                    {
+                        SuspendPredicate suspend(vk, command_buffer, predicate);
+                        detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT,
+                                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                               VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                        for (const auto& part : p.depth24_parts) vk.depth24_run(command_buffer, part);
+                        const VkImageLayout dst_read = detail::copy_layout(
+                            vk, command_buffer, p.binding, dst_id,
+                            detail::planes_for_layout(p.binding, p.range, separate),
+                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
+                        vk.copy_image_to_buffer(command_buffer, p.binding.image, dst_read, p.staged,
+                                                std::uint32_t(p.staged_writes.size()), p.staged_writes.data());
+                    }
+                    vk.emit_predicated_copy(command_buffer, p.predicated_copy);
                     begin_statistics();
-                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                           VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-                    converted = p.buffer_image_copies;
-                    converted[0].bufferOffset = p.depth24.scratch_offset;
-                    converted[0].bufferRowLength = 0;
-                    converted[0].bufferImageHeight = 0;
-                    regions = &converted;
-                    source = p.depth24.scratch;
-                }
-                const VkImageLayout dst_layout = detail::copy_layout(
-                    vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
-                vk.copy_buffer_to_image(command_buffer, source, p.binding.image, dst_layout,
-                                        std::uint32_t(regions->size()), regions->data());
-            } else {
-                const VkImageLayout src_layout = detail::copy_layout(
-                    vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),
-                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
-                if (!p.has_depth24) {
-                    vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, p.binding.buffer,
-                                            std::uint32_t(p.buffer_image_copies.size()), p.buffer_image_copies.data());
+                    {
+                        SuspendPredicate suspend(vk, command_buffer, predicate);
+                        detail::memory_barrier(vk, command_buffer,
+                                               VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                               VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                               VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                        const VkImageLayout dst_write = detail::copy_layout(
+                            vk, command_buffer, p.binding, dst_id,
+                            detail::planes_for_layout(p.binding, p.range, separate),
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
+                        vk.copy_buffer_to_image(command_buffer, p.staged, p.binding.image, dst_write,
+                                                std::uint32_t(p.staged_writes.size()), p.staged_writes.data());
+                    }
+                } else if (!p.predicated_strided.empty()) {
+                    // Predicated upload: save dst region to scratch, strided-copy upload footprint into scratch
+                    // inside conditional rendering, then write scratch back into dst.
+                    {
+                        SuspendPredicate suspend(vk, command_buffer, predicate);
+                        const VkImageLayout dst_read = detail::copy_layout(
+                            vk, command_buffer, p.binding, dst_id,
+                            detail::planes_for_layout(p.binding, p.range, separate),
+                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
+                        vk.copy_image_to_buffer(command_buffer, p.binding.image, dst_read, p.staged,
+                                                std::uint32_t(p.staged_writes.size()), p.staged_writes.data());
+                    }
+                    end_statistics();
+                    vk.emit_predicated_strided(command_buffer, p.predicated_strided);
+                    begin_statistics();
+                    {
+                        SuspendPredicate suspend(vk, command_buffer, predicate);
+                        detail::memory_barrier(vk, command_buffer,
+                                               VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                               VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                               VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                        const VkImageLayout dst_write = detail::copy_layout(
+                            vk, command_buffer, p.binding, dst_id,
+                            detail::planes_for_layout(p.binding, p.range, separate),
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
+                        vk.copy_buffer_to_image(command_buffer, p.staged, p.binding.image, dst_write,
+                                                std::uint32_t(p.staged_writes.size()), p.staged_writes.data());
+                    }
                 } else {
-                    // The floats land tightly packed in the scratch buffer; the pass turns them into the footprint's words.
-                    VkBufferImageCopy region = p.buffer_image_copies[0];
-                    region.bufferOffset = p.depth24.scratch_offset;
-                    region.bufferRowLength = 0;
-                    region.bufferImageHeight = 0;
-                    vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, p.depth24.scratch, 1, &region);
-                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    VkBuffer source = p.source.buffer;
+                    std::vector<VkBufferImageCopy> converted;
+                    const std::vector<VkBufferImageCopy>* regions = &p.buffer_image_copies;
+                    if (p.has_depth24) {
+                        // The words become floats in the scratch buffer, which the copy then reads (tightly packed).
+                        detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                               VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                        end_statistics();
+                        for (const auto& part : p.depth24_parts) run_depth24(part);
+                        begin_statistics();
+                        detail::memory_barrier(vk, command_buffer, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                               VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                        converted = p.buffer_image_copies;
+                        converted[0].bufferOffset = p.depth24.scratch_offset;
+                        converted[0].bufferRowLength = 0;
+                        converted[0].bufferImageHeight = 0;
+                        regions = &converted;
+                        source = p.depth24.scratch;
+                    }
+                    const VkImageLayout dst_layout = detail::copy_layout(
+                        vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
+                    vk.copy_buffer_to_image(command_buffer, source, p.binding.image, dst_layout,
+                                            std::uint32_t(regions->size()), regions->data());
+                }
+            } else {
+                if (!p.predicated_strided.empty()) {
+                    // Predicated readback: stage image -> scratch outside conditional rendering, then strided-copy
+                    // into the application buffer inside conditional rendering so skipped/padding bytes stay untouched.
+                    {
+                        SuspendPredicate suspend(vk, command_buffer, predicate);
+                        const VkImageLayout src_layout = detail::copy_layout(
+                            vk, command_buffer, p.source, src_id,
+                            detail::planes_for_layout(p.source, p.source_range, separate),
+                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
+                        vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, p.staged,
+                                                std::uint32_t(p.staged_reads.size()), p.staged_reads.data());
+                    }
+                    end_statistics();
+                    vk.emit_predicated_strided(command_buffer, p.predicated_strided);
+                    begin_statistics();
+                } else if (p.has_depth24 && p.predicated_depth24_readback) {
+                    // Predicated depth24/rgb96 readback: stage image -> depth24.scratch unconditionally, then run
+                    // depth24_run inside active conditional rendering so the destination buffer is only written if true.
+                    {
+                        SuspendPredicate suspend(vk, command_buffer, predicate);
+                        const VkImageLayout src_layout = detail::copy_layout(
+                            vk, command_buffer, p.source, src_id,
+                            detail::planes_for_layout(p.source, p.source_range, separate),
+                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
+                        VkBufferImageCopy region = p.buffer_image_copies[0];
+                        region.bufferOffset = p.depth24.scratch_offset;
+                        region.bufferRowLength = 0;
+                        region.bufferImageHeight = 0;
+                        vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, p.depth24.scratch, 1, &region);
+                    }
+                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT,
+                                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
                     end_statistics();
-                    for (const auto& part : p.depth24_parts) run_depth24(part);
+                    for (const auto& part : p.depth24_parts) vk.depth24_run(command_buffer, part);
                     begin_statistics();
-                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_SHADER_WRITE_BIT,
+                                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
                                            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+                } else {
+                    const VkImageLayout src_layout = detail::copy_layout(
+                        vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
+                    if (!p.has_depth24) {
+                        // D3D12 orders back-to-back writes to a COPY_DEST buffer (e.g. a readback heap) without a barrier.
+                        detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                               VK_PIPELINE_STAGE_TRANSFER_BIT);
+                        vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, p.binding.buffer,
+                                                std::uint32_t(p.buffer_image_copies.size()), p.buffer_image_copies.data());
+                    } else {
+                        // The floats land tightly packed in the scratch buffer; the pass turns them into the footprint's words.
+                        VkBufferImageCopy region = p.buffer_image_copies[0];
+                        region.bufferOffset = p.depth24.scratch_offset;
+                        region.bufferRowLength = 0;
+                        region.bufferImageHeight = 0;
+                        vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, p.depth24.scratch, 1, &region);
+                        detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                               VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                        end_statistics();
+                        for (const auto& part : p.depth24_parts) run_depth24(part);
+                        begin_statistics();
+                        detail::memory_barrier(vk, command_buffer, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                               VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+                    }
                 }
             }
         } else if (std::holds_alternative<ResolveSubresource>(command)) {
@@ -3208,6 +3666,86 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 const VulkanAccess dest_state = vulkan_access(d3d12_state::resolve_dest, false);
                 const VkImageLayout source_layout = image_layout(p.source, source_state.layout);
                 const VkImageLayout dest_layout = image_layout(p.binding, dest_state.layout);
+                if (!p.predicated_copy.empty()) {
+                    const auto bands = std::uint32_t(p.staged_reads.size());
+                    LayoutPieces dest_pieces;
+                    {
+                        SuspendPredicate suspend(vk, command_buffer, predicate);
+                        auto source_pieces = detail::current(
+                            tracker, src_id, detail::planes_for_layout(p.source, p.source_range, separate), source_layout);
+                        detail::initialize(vk, command_buffer, p.source, src_id, source_pieces, source_layout, tracker);
+                        dest_pieces = detail::current(
+                            tracker, dst_id, detail::planes_for_layout(p.binding, p.range, separate), dest_layout);
+                        detail::initialize(vk, command_buffer, p.binding, dst_id, dest_pieces, dest_layout, tracker);
+                        const auto keep = [&](VkImageLayout wanted, VkAccessFlags access, const VulkanAccess& src_state,
+                                              auto&& copy) {
+                            const VkImageLayout layout = image_layout(p.binding, wanted);
+                            detail::round_trip(vk, command_buffer, p.binding, dest_pieces, layout, src_state, access,
+                                               VK_PIPELINE_STAGE_TRANSFER_BIT, [&] { copy(layout); });
+                        };
+                        keep(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, dest_state,
+                             [&](VkImageLayout layout) {
+                            if (p.staged)
+                                vk.copy_image_to_buffer(command_buffer, p.binding.image, layout, p.staged, bands,
+                                                        p.staged_reads.data());
+                            vk.copy_image_to_buffer(command_buffer, p.binding.image, layout, p.staged_resolve_saved, 1,
+                                                    &p.staged_resolve_dst);
+                        });
+                        const VkImageLayout source_attachment =
+                            image_layout(p.source, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+                        const VkImageLayout dest_attachment =
+                            image_layout(p.binding, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+                        detail::round_trip(vk, command_buffer, p.source, source_pieces, source_attachment, source_state,
+                                           attachment_access, attachment_stages, [&] {
+                            detail::round_trip(vk, command_buffer, p.binding, dest_pieces, dest_attachment, dest_state,
+                                               attachment_access, attachment_stages, [&] {
+                                VkRenderingAttachmentInfo info{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+                                info.imageView = p.view;
+                                info.imageLayout = source_attachment;
+                                info.resolveMode = p.resolve_mode;
+                                info.resolveImageView = p.resolve_view;
+                                info.resolveImageLayout = dest_attachment;
+                                info.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                                info.storeOp = VK_ATTACHMENT_STORE_OP_NONE;
+                                VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+                                rendering.renderArea = {{p.resolve.srcOffset.x, p.resolve.srcOffset.y},
+                                                        {p.resolve.extent.width, p.resolve.extent.height}};
+                                rendering.layerCount = 1;
+                                if (p.range.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT) rendering.pDepthAttachment = &info;
+                                else rendering.pStencilAttachment = &info;
+                                vk.begin_rendering(command_buffer, &rendering);
+                                vk.end_rendering(command_buffer);
+                            });
+                        });
+                        const VulkanAccess post_resolve{dest_state.layout, dest_state.access | attachment_access,
+                                                        dest_state.stages | attachment_stages};
+                        keep(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, post_resolve,
+                             [&](VkImageLayout layout) {
+                            vk.copy_image_to_buffer(command_buffer, p.binding.image, layout, p.staged_resolve_captured,
+                                                    1, &p.staged_resolve_src);
+                        });
+                    }
+                    end_statistics();
+                    vk.emit_predicated_copy(command_buffer, p.predicated_copy);
+                    begin_statistics();
+                    {
+                        SuspendPredicate suspend(vk, command_buffer, predicate);
+                        detail::memory_barrier(vk, command_buffer,
+                                               VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                               VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                               VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                        const VkImageLayout layout = image_layout(p.binding, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                        detail::round_trip(vk, command_buffer, p.binding, dest_pieces, layout, dest_state,
+                                           VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, [&] {
+                            if (p.staged)
+                                vk.copy_buffer_to_image(command_buffer, p.staged, p.binding.image, layout, bands,
+                                                        p.staged_reads.data());
+                            vk.copy_buffer_to_image(command_buffer, p.staged_resolve_saved, p.binding.image, layout, 1,
+                                                    &p.staged_resolve_dst);
+                        });
+                    }
+                    continue;
+                }
                 auto source_pieces = detail::current(
                     tracker, src_id, detail::planes_for_layout(p.source, p.source_range, separate), source_layout);
                 detail::initialize(vk, command_buffer, p.source, src_id, source_pieces, source_layout, tracker);
@@ -3262,6 +3800,50 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                         vk.copy_buffer_to_image(command_buffer, p.staged, p.binding.image, layout, bands,
                                                 p.staged_reads.data());
                     });
+                }
+                continue;
+            }
+            if (!p.predicated_copy.empty()) {
+                {
+                    SuspendPredicate suspend(vk, command_buffer, predicate);
+                    const VkImageLayout dst_read = detail::copy_layout(
+                        vk, command_buffer, p.binding, dst_id,
+                        detail::planes_for_layout(p.binding, p.range, separate),
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
+                    vk.copy_image_to_buffer(command_buffer, p.binding.image, dst_read, p.staged_resolve_saved, 1,
+                                            &p.staged_resolve_dst);
+                    const VkImageLayout src_layout = detail::copy_layout(
+                        vk, command_buffer, p.source, src_id,
+                        detail::planes_for_layout(p.source, p.source_range, separate),
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
+                    const VkImageLayout dst_write = detail::copy_layout(
+                        vk, command_buffer, p.binding, dst_id,
+                        detail::planes_for_layout(p.binding, p.range, separate),
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
+                    vk.resolve_image(command_buffer, p.source.image, src_layout, p.binding.image, dst_write, 1,
+                                     &p.resolve);
+                    const VkImageLayout dst_cap = detail::copy_layout(
+                        vk, command_buffer, p.binding, dst_id,
+                        detail::planes_for_layout(p.binding, p.range, separate),
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
+                    vk.copy_image_to_buffer(command_buffer, p.binding.image, dst_cap, p.staged_resolve_captured, 1,
+                                            &p.staged_resolve_src);
+                }
+                end_statistics();
+                vk.emit_predicated_copy(command_buffer, p.predicated_copy);
+                begin_statistics();
+                {
+                    SuspendPredicate suspend(vk, command_buffer, predicate);
+                    detail::memory_barrier(vk, command_buffer,
+                                           VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                           VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                           VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                    const VkImageLayout dst_final = detail::copy_layout(
+                        vk, command_buffer, p.binding, dst_id,
+                        detail::planes_for_layout(p.binding, p.range, separate),
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
+                    vk.copy_buffer_to_image(command_buffer, p.staged_resolve_saved, p.binding.image, dst_final, 1,
+                                            &p.staged_resolve_dst);
                 }
                 continue;
             }
@@ -3320,13 +3902,19 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             vk.update_buffer(command_buffer, p.write_buffer, p.write_offset, 4, &write->value);
             if (predicate.buffer) vk.begin_conditional_rendering(command_buffer, &predicate);
         } else if (std::holds_alternative<AtomicCopyBuffer>(command)) {
-            // Every earlier write, to the dependent resources among others, finishes and is visible before the copy.
-            // Vulkan promises no atomicity for a transfer; that a naturally aligned 4- or 8-byte copy is one write
-            // is an assumption about the hardware (docs/d3d12_vulkan.md, section 4.2).
-            detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                   VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
-                                   VK_PIPELINE_STAGE_TRANSFER_BIT);
-            vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, 1, p.buffer_copies.data());
+            if (!p.predicated_copy.empty()) {
+                end_statistics();
+                vk.emit_predicated_copy(command_buffer, p.predicated_copy);
+                begin_statistics();
+            } else {
+                // Every earlier write, to the dependent resources among others, finishes and is visible before the copy.
+                // Vulkan promises no atomicity for a transfer; that a naturally aligned 4- or 8-byte copy is one write
+                // is an assumption about the hardware (docs/d3d12_vulkan.md, section 4.2).
+                detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                       VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT);
+                vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, 1, p.buffer_copies.data());
+            }
         } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command)) {
             const VkDeviceSize arguments = p.binding.buffer_offset + ind->argument_offset;
             if (ind->count_buffer) {

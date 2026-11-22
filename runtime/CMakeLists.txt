@@ -938,7 +938,7 @@ if(TARGET Vulkan::Headers)
     target_include_directories(gta6rt_d3d12_com PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_link_libraries(gta6rt_d3d12_com PUBLIC Vulkan::Headers gta6rt_root_signature)
     target_compile_definitions(gta6rt_d3d12_com PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-    target_compile_options(gta6rt_d3d12_com PRIVATE /W4 /permissive- /utf-8)
+    target_compile_options(gta6rt_d3d12_com PRIVATE /W4 /permissive- /utf-8 /bigobj)
 
     add_executable(d3d12_com_test test/d3d12_com_test.cpp)
     target_link_libraries(d3d12_com_test PRIVATE gta6rt_d3d12_com)
@@ -1157,6 +1157,13 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_predicated_copy_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_predicated_copy COMMAND d3d12_predicated_copy_test)
     set_tests_properties(d3d12_predicated_copy PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(d3d12_predicated_ops_test test/d3d12_predicated_ops_test.cpp)
+    target_link_libraries(d3d12_predicated_ops_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_predicated_ops_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_predicated_ops_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_predicated_ops COMMAND d3d12_predicated_ops_test)
+    set_tests_properties(d3d12_predicated_ops PROPERTIES SKIP_RETURN_CODE 77)
 
     # Differential regression: run explicitly (requires Vulkan hardware and Windows WARP).
     add_executable(d3d12_clear_test test/d3d12_clear_test.cpp)

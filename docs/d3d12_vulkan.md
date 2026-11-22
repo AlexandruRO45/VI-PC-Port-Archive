@@ -2278,15 +2278,32 @@ Not implemented yet:
   reset, 32 gated plus 32 reused submissions, failed-submit cleanup and host stages on all three queue kinds.
   Binary and overlapping occlusion fixtures also verify that query results resolve under a false predicate while
   a dedicated copy destination remains unchanged; disabling predication copies into a separate region.
-  The embedded shader is generated from `predicated_copy.comp`
-  with glslang 16.6.0 (`-V --target-env vulkan1.2 -Os`) and validated for Vulkan 1.2.
+  The embedded shaders are generated from `predicated_copy.comp`, `predicated_strided_copy.comp`, and
+  `predicated_fill.comp` with glslang 16.6.0 (`-V --target-env vulkan1.2 -Os`) and validated for Vulkan 1.2
+  (using `StorageBuffer8BitAccess`, not `Int8`).
+  `CopyResource` (buffer-to-buffer and single-sampled texture-to-texture, including multi-mip/array, BC, depth/stencil,
+  BC <-> uncompressed, and depth <-> colour), `CopyTextureRegion` (upload, readback, and texture-to-texture, including
+  `depth24_as_float` and `rgb96` conversions, partial boxes, padded row/slice pitches, and 3D volumes),
+  `ResolveSubresource` / `ResolveSubresourceRegion` (colour and depth/stencil MIN/MAX/AVERAGE, whole and partial
+  rectangles), `ClearUnorderedAccessViewUint` / `ClearUnorderedAccessViewFloat` (buffers, 2D attachment textures via
+  `vkCmdClearAttachments`, and 3D / non-attachment textures via staged fill), and `AtomicCopyBufferUINT` /
+  `AtomicCopyBufferUINT64` are also predicated through `PredicatedBufferCopier`, `PredicatedOps`
+  (`runtime/src/vulkan_predicated_ops.h`), and transfer+storage scratch buffers (`runtime/src/vulkan_scratch.h`).
+  Unconditional staging transfers suspend `VK_EXT_conditional_rendering` (protecting against D3D-148 on Intel drivers)
+  and re-enter it around the predicated compute pass; active `PIPELINE_STATISTICS` queries split once per command
+  around the helper dispatches (D3D-162), and predicated readbacks report `VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT`.
+  Checked by `d3d12_predicated_ops_test` (203 differential cases vs WARP + statistics isolation on RTX 3060 Ti with
+  validation enabled), plus expanded CPU/mock/forced-window checks in `predicated_copy_test`,
+  `replay_query_predication_test`, and `vk_predicated_copy_test`.
 
   Open:
-  - Texture copies, `CopyResource` and resolves. Vulkan's conditional rendering does not cover transfer
-    commands, so these still run unconditionally and `PreparedList::unpredicated_copies` counts them.
+  - Predicated texture-to-texture `CopyResource` / `CopyTextureRegion` on multisampled images (`samples > 1`) returns
+    `ReplayResult::unsupported`, as Vulkan forbids `vkCmdCopyImageToBuffer` / `vkCmdCopyBufferToImage` on multisampled
+    images. (Multisampled `ResolveSubresource` / `ResolveSubresourceRegion` writes to single-sampled targets and is
+    fully predicated.)
 
-  - Draws, dispatches and `ExecuteIndirect` are covered by conditional rendering as soon as they are replayed
-    (D3D-3, D3D-4, D3D-17); `ClearUnorderedAccessView*` and `ResolveSubresource` need the same check when added.
+  - Draws, dispatches, `ExecuteIndirect`, `ClearUnorderedAccessView*` and `ResolveSubresource` /
+    `ResolveSubresourceRegion` are covered by conditional rendering.
 
 ### 4.8 Ray tracing and XDXR
 

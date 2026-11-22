@@ -909,6 +909,7 @@ public:
     void configure_predicated_copy(PFN_vkGetDeviceProcAddr get, const VkPhysicalDeviceLimits& limits) {
         std::unique_lock lock(resource_mutex_);
         predicated_copier_ = std::make_unique<PredicatedBufferCopier>(get, device_, limits);
+        predicated_ops_ = std::make_unique<PredicatedOps>(get, device_, limits);
     }
     VkDevice device() const { return device_; }
 
@@ -1293,6 +1294,7 @@ private:
     ReplayFunctions replay_;
     std::unique_ptr<PredicateReducer> predicate_reducer_;
     std::unique_ptr<PredicatedBufferCopier> predicated_copier_;
+    std::unique_ptr<PredicatedOps> predicated_ops_;
     std::uint32_t predicate_family_ = UINT32_MAX;
     DebugLabelFunctions labels_;
 };
@@ -1512,6 +1514,7 @@ public:
                 if (const auto* p = std::get_if<Predication>(&command); p && p->buffer) ++captures;
         std::unique_ptr<PredicateReducer::Batch> batch;
         std::unique_ptr<PredicatedBufferCopier::Batch> copy_batch;
+        std::unique_ptr<PredicatedOps::Batch> ops_batch;
         if (captures) {
             if (kind_ == QueueKind::copy || !context_.predicate_reducer_ || family_ != context_.predicate_family_)
                 return ReplayResult::unsupported;
@@ -1535,6 +1538,33 @@ public:
                 };
                 replay.emit_predicated_copy = [&](VkCommandBuffer cb, const std::vector<PredicatedCopyDispatch>& jobs) {
                     context_.predicated_copier_->emit(cb, jobs);
+                };
+            }
+            if (context_.predicated_ops_) {
+                ops_batch = context_.predicated_ops_->batch();
+                replay.prepare_predicated_strided = [&](VkBuffer source, VkBuffer destination,
+                                                        VkDeviceSize src_base, VkDeviceSize dst_base,
+                                                        VkDeviceSize row_bytes, std::uint32_t rows,
+                                                        std::uint32_t slices, VkDeviceSize src_row_pitch,
+                                                        VkDeviceSize src_slice_pitch, VkDeviceSize dst_row_pitch,
+                                                        VkDeviceSize dst_slice_pitch,
+                                                        std::vector<PredicatedStridedDispatch>& out) {
+                    return ops_batch->prepare_strided(source, destination, src_base, dst_base, row_bytes, rows, slices,
+                                                      src_row_pitch, src_slice_pitch, dst_row_pitch, dst_slice_pitch,
+                                                      out);
+                };
+                replay.emit_predicated_strided = [&](VkCommandBuffer cb,
+                                                     const std::vector<PredicatedStridedDispatch>& jobs) {
+                    context_.predicated_ops_->emit_strided(cb, jobs);
+                };
+                replay.prepare_predicated_fill = [&](VkBuffer destination, VkDeviceSize dst_base, VkDeviceSize size,
+                                                     const std::uint8_t* pattern, std::uint32_t element_size,
+                                                     std::vector<PredicatedFillDispatch>& out) {
+                    return ops_batch->append_fill(destination, dst_base, size, pattern, element_size, out);
+                };
+                replay.emit_predicated_fill = [&](VkCommandBuffer cb,
+                                                  const std::vector<PredicatedFillDispatch>& jobs) {
+                    context_.predicated_ops_->emit_fill(cb, jobs);
                 };
             }
         }
@@ -1746,6 +1776,7 @@ public:
             context_.tracker_ = std::move(next_tracker);
             slot->predicate = std::move(batch);
             slot->predicated_copy = std::move(copy_batch);
+            slot->predicated_ops = std::move(ops_batch);
             queries.commit();
             slot->segments = std::move(queries.retained);
         } else {
@@ -1805,6 +1836,7 @@ private:
         std::uint64_t ticket;
         std::vector<std::shared_ptr<const OcclusionSegmentPool>> segments;
         std::unique_ptr<PredicatedBufferCopier::Batch> predicated_copy;
+        std::unique_ptr<PredicatedOps::Batch> predicated_ops;
         std::unique_ptr<PredicateReducer::Batch> predicate; // retained until this slot completes
     };
 
@@ -1919,6 +1951,7 @@ private:
             if (context_.vk.vkResetCommandBuffer(reuse->buffer, 0) != VK_SUCCESS) return nullptr;
             reuse->predicate.reset();
             reuse->predicated_copy.reset();
+            reuse->predicated_ops.reset();
             reuse->ticket = UINT64_MAX;  // in use until submitted
             return reuse;
         }

@@ -275,9 +275,15 @@ int main() {
             parts.assign(2, job);
             return true;
         };
-        helpers.depth24_run = [](VkCommandBuffer, const Depth24Job&) {
-            expect(!g_trace->cond_active, "footprint helper is unconditional");
+        helpers.depth24_run = [upload](VkCommandBuffer, const Depth24Job&) {
+            expect(g_trace->cond_active == !upload,
+                   upload ? "footprint upload conversion is unconditional" : "footprint readback conversion is predicated");
             g_trace->events.push_back("footprint");
+        };
+        helpers.copy_scratch = [](VkDeviceSize, VkBuffer& buffer, VkDeviceSize& offset) {
+            buffer = handle<VkBuffer>(12);
+            offset = 0;
+            return true;
         };
         helpers.pipeline_barrier = +[](VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags,
                                        VkDependencyFlags, std::uint32_t, const VkMemoryBarrier*, std::uint32_t,
@@ -287,10 +293,12 @@ int main() {
                                  std::uint32_t, const VkImageCopy*) {};
         helpers.copy_buffer_to_image = +[](VkCommandBuffer, VkBuffer, VkImage, VkImageLayout,
                                            std::uint32_t, const VkBufferImageCopy*) {
+            expect(!g_trace->cond_active, "staging upload transfer runs outside conditional rendering");
             g_trace->events.push_back("upload");
         };
         helpers.copy_image_to_buffer = +[](VkCommandBuffer, VkImage, VkImageLayout, VkBuffer,
                                            std::uint32_t, const VkBufferImageCopy*) {
+            expect(!g_trace->cond_active, "staging readback transfer runs outside conditional rendering");
             g_trace->events.push_back("readback");
         };
         ResourceBinding buffer = dst;
@@ -320,7 +328,7 @@ int main() {
         expect(list.close(), "close mixed list");
         PreparedList prepared;
         expect(prepare(list, resources, helpers, prepared, true) == ReplayResult::success, "prepare mixed helpers");
-        expect(prepared.statistics_segment_count == 5 && allocations == 3, "five shared segments");
+        expect(prepared.statistics_segment_count == 5 && allocations == (upload ? 4u : 3u), "five shared segments");
         QueryReplay no_pool;
         expect(no_pool.plan(prepared, {}, 0, true) == ReplayResult::unsupported,
                "plan refuses helper markers without statistics pool");
@@ -336,12 +344,17 @@ int main() {
             "begin_query 9:4", "end_query 9:4", "capture", "begin_query 9:5", "begin_cond",
             "end_query 9:5", "end_cond", "binary", "begin_cond", "begin_query 9:6",
             "end_query 9:6", "predicated_copy", "begin_query 9:7"};
-        if (!upload) want.push_back("readback");
-        const std::vector<std::string> conversion{
-            "end_query 9:7", "end_cond", "footprint", "begin_cond", "end_cond", "footprint", "begin_cond",
-            "begin_query 9:8"};
-        want.insert(want.end(), conversion.begin(), conversion.end());
-        if (upload) want.push_back("upload");
+        if (!upload) {
+            const std::vector<std::string> rb_seq{
+                "end_cond", "readback", "begin_cond",
+                "end_query 9:7", "footprint", "footprint", "begin_query 9:8"};
+            want.insert(want.end(), rb_seq.begin(), rb_seq.end());
+        } else {
+            const std::vector<std::string> up_seq{
+                "end_query 9:7", "end_cond", "footprint", "footprint", "readback", "begin_cond",
+                "predicated_copy", "begin_query 9:8", "end_cond", "upload", "begin_cond"};
+            want.insert(want.end(), up_seq.begin(), up_seq.end());
+        }
         const std::vector<std::string> tail{
             "end_query 9:8", "end_cond", "sum_statistics 9:4+5", "begin_cond", "end_cond"};
         want.insert(want.end(), tail.begin(), tail.end());
@@ -368,6 +381,121 @@ int main() {
             QueryReplay missing;
             expect(missing.plan(prepared) == ReplayResult::unsupported, "each helper needs a statistics pool");
         }
+    }
+
+    // 9. Predicated strided upload/readback, resolve and UAV fills suspend conditional rendering around all staging
+    //    transfers and execute their compute dispatches inside active conditional rendering and single stats splits.
+    {
+        Trace trace;
+        g_trace = &trace;
+        auto helpers = vk;
+        helpers.pipeline_barrier = +[](VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags,
+                                       VkDependencyFlags, std::uint32_t, const VkMemoryBarrier*, std::uint32_t,
+                                       const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {};
+        helpers.copy_buffer = +[](VkCommandBuffer, VkBuffer, VkBuffer, std::uint32_t, const VkBufferCopy*) {};
+        helpers.copy_image = +[](VkCommandBuffer, VkImage, VkImageLayout, VkImage, VkImageLayout,
+                                 std::uint32_t, const VkImageCopy*) {};
+        helpers.copy_buffer_to_image = +[](VkCommandBuffer, VkBuffer, VkImage, VkImageLayout,
+                                           std::uint32_t, const VkBufferImageCopy*) {
+            expect(!g_trace->cond_active, "ops staging upload outside conditional rendering");
+            g_trace->events.push_back("upload");
+        };
+        helpers.copy_image_to_buffer = +[](VkCommandBuffer, VkImage, VkImageLayout, VkBuffer,
+                                           std::uint32_t, const VkBufferImageCopy*) {
+            expect(!g_trace->cond_active, "ops staging readback outside conditional rendering");
+            g_trace->events.push_back("readback");
+        };
+        helpers.resolve_image = +[](VkCommandBuffer, VkImage, VkImageLayout, VkImage, VkImageLayout,
+                                    std::uint32_t, const VkImageResolve*) {
+            expect(!g_trace->cond_active, "staging resolve_image outside conditional rendering");
+            g_trace->events.push_back("resolve_image");
+        };
+        helpers.copy_scratch = [](VkDeviceSize, VkBuffer& buf, VkDeviceSize& off) {
+            static std::uintptr_t next = 100;
+            buf = handle<VkBuffer>(next++);
+            off = 0;
+            return true;
+        };
+        helpers.prepare_predicated_copy = [](VkBuffer, VkBuffer, VkDeviceSize, VkDeviceSize, VkDeviceSize,
+                                             std::vector<PredicatedCopyDispatch>& out) {
+            out.push_back({});
+            return true;
+        };
+        helpers.emit_predicated_copy = [](VkCommandBuffer, const std::vector<PredicatedCopyDispatch>&) {
+            expect(g_trace->cond_active, "predicated_copy inside conditional rendering");
+            g_trace->events.push_back("predicated_copy");
+        };
+        helpers.prepare_predicated_strided = [](VkBuffer, VkBuffer, VkDeviceSize, VkDeviceSize, VkDeviceSize,
+                                                std::uint32_t, std::uint32_t, VkDeviceSize, VkDeviceSize,
+                                                VkDeviceSize, VkDeviceSize, std::vector<PredicatedStridedDispatch>& out) {
+            out.push_back({});
+            return true;
+        };
+        helpers.emit_predicated_strided = [](VkCommandBuffer, const std::vector<PredicatedStridedDispatch>&) {
+            expect(g_trace->cond_active, "predicated_strided inside conditional rendering");
+            g_trace->events.push_back("predicated_strided");
+        };
+        helpers.prepare_predicated_fill = [](VkBuffer, VkDeviceSize, VkDeviceSize, const std::uint8_t*, std::uint32_t,
+                                             std::vector<PredicatedFillDispatch>& out) {
+            out.push_back({});
+            return true;
+        };
+        helpers.emit_predicated_fill = [](VkCommandBuffer, const std::vector<PredicatedFillDispatch>&) {
+            expect(g_trace->cond_active, "predicated_fill inside conditional rendering");
+            g_trace->events.push_back("predicated_fill");
+        };
+
+        ResourceBinding buf = dst; buf.buffer_offset = 0; buf.size = 1024;
+        ResourceBinding img{}; img.image = handle<VkImage>(20); img.format = VK_FORMAT_R8G8B8A8_UNORM;
+        img.aspects = VK_IMAGE_ASPECT_COLOR_BIT; img.width = img.height = 4; img.depth = img.mip_levels = img.array_layers = img.samples = 1;
+        ResourceBinding msaa = img; msaa.image = handle<VkImage>(21); msaa.samples = 4;
+        ResourceBinding vol = img; vol.image = handle<VkImage>(22); vol.depth = 2; vol.volume = true;
+        const auto res = [&](ResourceId id) -> const ResourceBinding* {
+            if (id == 1) return &buf;
+            if (id == 2) return &pred;
+            if (id == 3) return &img;
+            if (id == 4) return &msaa;
+            if (id == 5) return &vol;
+            return nullptr;
+        };
+        const CopyLocation fp{1, true, 0, 0, 4, 4, 1, 256}, tex{3, false, 0, 0, 0, 0, 0, 0};
+        CommandList list;
+        expect(list.set_predication({2, 0, d3d12_predication::equal_zero}), "ops pred");
+        expect(list.begin_query({6, d3d12_query::pipeline_statistics, 0}), "ops stats begin");
+        expect(list.copy_texture({tex, 0, 0, 0, fp, false, {}}), "ops upload");
+        expect(list.copy_texture({fp, 0, 0, 0, tex, false, {}}), "ops readback");
+        expect(list.resolve_subresource({3, 0, 4, 0, {}}), "ops resolve");
+        expect(list.clear_unordered_access({1, true, 0, 0, 64, 4, 0, 0, 1}, false, {1, 2, 3, 4}, {}), "ops buf uav");
+        expect(list.clear_unordered_access({5, false, std::uint32_t(VK_FORMAT_R8G8B8A8_UNORM), 0, 0, 0, 0, 0, 1},
+                                           false, {1, 2, 3, 4}, {}), "ops 3d uav");
+        expect(list.end_query({6, d3d12_query::pipeline_statistics, 0}), "ops stats end");
+        expect(list.close(), "ops close");
+        PreparedList prepared;
+        expect(prepare(list, res, helpers, prepared, true) == ReplayResult::success, "ops prepare");
+        expect(prepared.statistics_segment_count == 6, "ops six statistics segments");
+        auto pool = std::make_shared<OcclusionSegmentPool>();
+        pool->pool = handle<VkQueryPool>(19);
+        pool->destroy = mock_destroy_pool;
+        QueryReplay queries;
+        expect(queries.plan(prepared, {}, 0, true, pool, 0) == ReplayResult::success, "ops plan");
+        emit(prepared, VK_NULL_HANDLE, helpers);
+        const std::vector<std::string> want{
+            "capture", "begin_cond", "begin_query 19:0",
+            // strided upload
+            "end_cond", "readback", "begin_cond", "end_query 19:0", "predicated_strided", "begin_query 19:1",
+            "end_cond", "upload", "begin_cond",
+            // strided readback
+            "end_cond", "readback", "begin_cond", "end_query 19:1", "predicated_strided", "begin_query 19:2",
+            // color resolve
+            "end_cond", "readback", "resolve_image", "readback", "begin_cond", "end_query 19:2",
+            "predicated_copy", "begin_query 19:3", "end_cond", "upload", "begin_cond",
+            // buffer UAV fill
+            "end_query 19:3", "predicated_fill", "begin_query 19:4",
+            // 3D texture UAV fill
+            "end_cond", "readback", "begin_cond", "end_query 19:4", "predicated_fill", "begin_query 19:5",
+            "end_cond", "upload", "begin_cond",
+            "end_query 19:5", "end_cond"};
+        expect(trace.events == want, "ops: exact transfer suspend/resume and single statistics split order");
     }
 
     if (failures) return 1;
