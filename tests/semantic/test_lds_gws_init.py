@@ -690,5 +690,97 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
                 self.assertEqual(state.get_lane_vgpr(lane, reg), expected)
 
 
+class TestRegisterAliasingAndOperandPreservation(unittest.TestCase):
+    """Phase 5: Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_scalar_operand_preservation_boundary_registers(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        # Test first VGPR (v0) and last VGPR (v255)
+        state.set_vgpr(0, 0xAA55AA55)
+        state.set_vgpr(255, 0x12345678)
+        state.set_m0(4)
+
+        instr_v0 = DSGWSInitInstruction(vdata0=RegisterOperand(0, RegType.VGPR), offset=1)
+        rid0, val0 = interp.execute(instr_v0, state)
+        self.assertEqual(rid0, 5)
+        self.assertEqual(val0, 0xAA55AA55)
+        self.assertEqual(state.get_vgpr(0), 0xAA55AA55)
+        self.assertEqual(state.get_m0(), 4)
+
+        instr_v255 = DSGWSInitInstruction(vdata0=RegisterOperand(255, RegType.VGPR), offset=2)
+        rid255, val255 = interp.execute(instr_v255, state)
+        self.assertEqual(rid255, 6)
+        self.assertEqual(val255, 0x12345678)
+        self.assertEqual(state.get_vgpr(255), 0x12345678)
+        self.assertEqual(state.get_m0(), 4)
+
+    def test_scalar_full_register_file_undisturbed(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        # Seed every register with a unique signature
+        for i in range(DEFAULT_NUM_VGPRS):
+            state.set_vgpr(i, 0xDEAD0000 | i)
+        for i in range(DEFAULT_NUM_SGPRS):
+            state.set_sgpr(i, 0xBEEF0000 | i)
+        state.set_m0(0x42)
+
+        target_reg = 127
+        instr = DSGWSInitInstruction(vdata0=RegisterOperand(target_reg, RegType.VGPR), offset=15)
+        rid, val = interp.execute(instr, state)
+
+        self.assertEqual(rid, (0x42 + 15) & 0x3F)
+        self.assertEqual(val, 0xDEAD0000 | target_reg)
+
+        # Confirm all 256 VGPRs and 106 SGPRs remain perfectly intact
+        for i in range(DEFAULT_NUM_VGPRS):
+            self.assertEqual(state.get_vgpr(i), 0xDEAD0000 | i)
+        for i in range(DEFAULT_NUM_SGPRS):
+            self.assertEqual(state.get_sgpr(i), 0xBEEF0000 | i)
+        self.assertEqual(state.get_m0(), 0x42)
+
+    def test_scalar_repeated_operand_use_across_inits(self) -> None:
+        # A single VGPR used to initialize multiple GWS resources
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        common_val = 0xCAFE1234
+        state.set_vgpr(10, common_val)
+
+        for off in range(8):
+            instr = DSGWSInitInstruction(vdata0=RegisterOperand(10, RegType.VGPR), offset=off)
+            rid, val = interp.execute(instr, state)
+            self.assertEqual(rid, off)
+            self.assertEqual(val, common_val)
+            self.assertEqual(state.get_vgpr(10), common_val)
+
+        for off in range(8):
+            self.assertEqual(state.gws.read_resource(off), common_val)
+
+    def test_simd_multi_lane_preservation_under_divergence(self) -> None:
+        # Wave64 with divergent EXEC mask (scattered lanes)
+        scattered_mask = 0x9090909012345678
+        state = SIMDState(num_lanes=64, exec_mask=scattered_mask)
+        interp = SIMDInterpreter()
+
+        # Initialize all registers in all lanes
+        for lane in range(64):
+            for r in range(16):
+                state.set_lane_vgpr(lane, r, ((lane + 1) * 1000) + r)
+
+        vdata_reg = 5
+        instr = DSGWSInitInstruction(vdata0=RegisterOperand(vdata_reg, RegType.VGPR), offset=20)
+        res = interp.execute(instr, state)
+        self.assertIsNotNone(res)
+
+        # Check every lane's register file
+        for lane in range(64):
+            for r in range(16):
+                expected = ((lane + 1) * 1000) + r
+                self.assertEqual(state.get_lane_vgpr(lane, r), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
