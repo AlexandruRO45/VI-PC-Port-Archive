@@ -140,18 +140,6 @@ int main() {
               attributes_ex_w && delete_w && delete_a,
           "the file API resolves through the registry under kernel32/kernelbase and the api sets");
 
-    // XPersistentLocalStorage's folder is in the overlay but no part of GAME:, so a listing of the root skips it.
-    {
-        const std::filesystem::path pls = rt::fs::persistent_local_storage_dir();
-        check(pls == (std::filesystem::absolute(overlay) / ".gta6rt-pls").lexically_normal(),
-              "persistent_local_storage_dir() is <overlay>\\.gta6rt-pls, absolute");
-        write_path(pls / "save.bin", "pls");
-        const auto names = list(first_w, next_w, find_close, L"GAME:\\*");
-        check(contains(names, L"data") && !contains(names, L".gta6rt-pls"),
-              "a GAME:\\ listing does not show the persistent local storage folder");
-        std::filesystem::remove_all(pls);
-    }
-
     // A read of a package file, through the mixed-case prefix and through forward slashes.
     {
         HANDLE h = create_w(L"GAME:\\data\\hello.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);

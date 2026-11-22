@@ -27,9 +27,4 @@ void configure(const std::filesystem::path& game_dir, const std::filesystem::pat
 std::filesystem::path game_dir();
 std::filesystem::path overlay_dir();
 
-// The folder XPersistentLocalStorage hands a title (xgameruntime.cpp): <overlay dir>\.gta6rt-pls, as an absolute host
-// path. Listings of GAME:\ don't show it, as they don't show the overlay's marker folder, so the title's view of the
-// package is unchanged. Empty when no overlay is set; not created here.
-std::filesystem::path persistent_local_storage_dir();
-
 }  // namespace rt::fs

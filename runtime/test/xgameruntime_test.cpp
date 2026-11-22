@@ -12,16 +12,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
-#include <iterator>
-#include <string>
-#include <vector>
 
 #include <XAsync.h>
 #include <XAsyncProvider.h>
 #include <XTaskQueue.h>
 
-#include "file_system.h"
 #include "shims.h"
 
 namespace {
@@ -173,158 +168,11 @@ void* ask(QueryFn query, const GUID& cls, const GUID& iid) {
     void* p = nullptr;
     return query(&cls, iid, &p) == S_OK ? p : nullptr;
 }
-// Every id answers with the same object (a derived interface answers for each one it inherits).
-bool answers_all(QueryFn query, const GUID& cls, const GUID* ids, size_t n, void* expected) {
-    bool all = true;
-    for (size_t i = 0; i < n; ++i) {
-        void* same = nullptr;
-        all = all && query(&cls, ids[i], &same) == S_OK && same == expected;
-        if (same) release_object(same);
-    }
-    return all;
-}
 
 const GUID kSystem5Id = {0x1861cf2e, 0xe18b, 0x4834, {0xa9, 0xf5, 0xb4, 0xa4, 0xe6, 0xef, 0xb4, 0xcf}};
 
-struct PlsSpaceInfo {
-    uint64_t available_free, total_free, used, total;
-};
-
-std::vector<std::wstring> list_game_root() {
-    using First = HANDLE(WINAPI*)(LPCWSTR, LPWIN32_FIND_DATAW);
-    using Next = BOOL(WINAPI*)(HANDLE, LPWIN32_FIND_DATAW);
-    using Close = BOOL(WINAPI*)(HANDLE);
-    auto first = reinterpret_cast<First>(rt::shims::find("kernel32.dll", "FindFirstFileW"));
-    auto next = reinterpret_cast<Next>(rt::shims::find("kernel32.dll", "FindNextFileW"));
-    auto close = reinterpret_cast<Close>(rt::shims::find("kernel32.dll", "FindClose"));
-    std::vector<std::wstring> names;
-    if (!first || !next || !close) return names;
-    WIN32_FIND_DATAW found{};
-    const HANDLE h = first(L"GAME:\\*", &found);
-    if (h == INVALID_HANDLE_VALUE) return names;
-    do names.push_back(found.cFileName);
-    while (next(h, &found));
-    close(h);
-    return names;
-}
-
-// XPersistentLocalStorageImpl as IXPersistentLocalStorageImpl3 (slots 3-8), over folders in %TEMP%.
-void check_persistent_local_storage(QueryFn query) {
-    const GUID cls = {0xf4faf4d4, 0x2d04, 0x4fce, {0xb3, 0xe0, 0x47, 0x4a, 0x71, 0x3a, 0x3e, 0x84}};
-    const GUID chain[] = {cls,
-                          {0xd29411df, 0x0794, 0x4553, {0x8b, 0x27, 0x95, 0xfc, 0x02, 0xd0, 0xf7, 0x5d}},
-                          {0x41a4e10c, 0x5a7e, 0x41d9, {0x8c, 0x37, 0x37, 0xbd, 0xe6, 0x2a, 0x07, 0xd6}}};
-    wchar_t temp[MAX_PATH] = {};
-    GetTempPathW(MAX_PATH, temp);
-    const std::filesystem::path root =
-        std::filesystem::path(temp) / (L"leonida_xgameruntime_test_" + std::to_wstring(GetCurrentProcessId()));
-    const std::filesystem::path game = root / L"game", overlay = root / L"overlay";
-    std::error_code ec;
-    std::filesystem::remove_all(root, ec);
-    std::filesystem::create_directories(game, ec);
-    if (HANDLE f = CreateFileW((game / L"data.bin").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
-        f != INVALID_HANDLE_VALUE)
-        CloseHandle(f);
-    rt::fs::configure(game, overlay);
-
-    void* p = ask(query, cls, chain[2]);
-    check(p != nullptr, "QueryApiImpl hands out XPersistentLocalStorageImpl for IXPersistentLocalStorageImpl3");
-    if (!p) return;
-    check(answers_all(query, cls, chain, std::size(chain), p),
-          "IXPersistentLocalStorageImpl3 answers for IXPersistentLocalStorageImpl and IXPersistentLocalStorageImpl2");
-
-    using PathSize = HRESULT(STDMETHODCALLTYPE*)(void*, size_t*);
-    using GetPath = HRESULT(STDMETHODCALLTYPE*)(void*, size_t, char*, size_t*);
-    using SpaceInfo = HRESULT(STDMETHODCALLTYPE*)(void*, PlsSpaceInfo*);
-    using PromptAsync = HRESULT(STDMETHODCALLTYPE*)(void*, uint64_t, XAsyncBlock*);
-    using PromptResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*);
-    using Mount = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, uint64_t*);
-
-    const std::filesystem::path pls = (std::filesystem::absolute(overlay) / L".gta6rt-pls").lexically_normal();
-    check(!std::filesystem::exists(pls), "the storage folder does not exist before first use");
-    size_t size = 0;
-    check(method<PathSize>(p, 3)(p, &size) == S_OK && size > 1, "slot 3 (XPersistentLocalStorageGetPathSize) succeeds");
-    check(method<PathSize>(p, 3)(p, nullptr) == E_INVALIDARG, "slot 3 refuses a null pathSize (E_INVALIDARG)");
-    check(std::filesystem::is_directory(pls) && !std::filesystem::exists(game / L".gta6rt-pls"),
-          "first use makes <overlay>\\.gta6rt-pls; nothing is written in the package");
-
-    std::string path(size, 'x');
-    size_t used = 0;
-    const std::string expected = pls.string() + "\\";
-    check(method<GetPath>(p, 4)(p, size, path.data(), &used) == S_OK && used == size && path[size - 1] == '\0' &&
-              std::strlen(path.c_str()) == size - 1 && _stricmp(path.c_str(), expected.c_str()) == 0,
-          "slot 4 (XPersistentLocalStorageGetPath) fills exactly GetPathSize's characters: the folder, a separator, "
-          "the terminator");
-    std::string short_buffer(size - 1, 'x');
-    used = 77;
-    check(method<GetPath>(p, 4)(p, size - 1, short_buffer.data(), &used) == E_FAIL && used == 77,
-          "slot 4: a buffer one character short fails with E_FAIL (Xbox devices) and leaves pathUsed alone");
-    SetEnvironmentVariableA("LEONIDA_DEVICE_TYPE", "1");
-    check(method<GetPath>(p, 4)(p, size - 1, short_buffer.data(), &used) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
-          "slot 4: the same with device type Pc is ERROR_INSUFFICIENT_BUFFER (PC devices)");
-    SetEnvironmentVariableA("LEONIDA_DEVICE_TYPE", nullptr);
-    check(method<GetPath>(p, 4)(p, size, nullptr, &used) == E_INVALIDARG &&
-              method<GetPath>(p, 4)(p, size, path.data(), nullptr) == S_OK,
-          "slot 4 refuses a null path; pathUsed is optional");
-
-    // The title writes through the path it was given (a host path; the file shims pass it through).
-    const std::string save = path.c_str() + std::string("save.bin");
-    std::vector<char> bytes(4096, 'p');
-    DWORD written = 0;
-    if (HANDLE f = CreateFileA(save.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
-        f != INVALID_HANDLE_VALUE) {
-        WriteFile(f, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr);
-        CloseHandle(f);
-    }
-    PlsSpaceInfo info{1, 2, 3, 4};
-    check(written == 4096 && method<SpaceInfo>(p, 5)(p, &info) == S_OK && info.used == 4096 &&
-              info.available_free > 0 && info.total_free == info.available_free &&
-              info.total == info.used + info.available_free,
-          "slot 5 (XPersistentLocalStorageGetSpaceInfo): the folder's files are used, the volume's free bytes "
-          "available, the total both");
-    check(method<SpaceInfo>(p, 5)(p, nullptr) == E_INVALIDARG, "slot 5 refuses a null info");
-
-    bool package_seen = false, storage_seen = false;
-    for (const std::wstring& name : list_game_root()) {
-        package_seen = package_seen || _wcsicmp(name.c_str(), L"data.bin") == 0;
-        storage_seen = storage_seen || _wcsicmp(name.c_str(), L".gta6rt-pls") == 0;
-    }
-    check(package_seen && !storage_seen, "a GAME:\\ listing shows the package, not the storage folder");
-
-    std::atomic<int> completions{0};
-    XAsyncBlock block{};
-    block.context = &completions;
-    block.callback = [](XAsyncBlock* b) { static_cast<std::atomic<int>*>(b->context)->fetch_add(1); };
-    check(method<PromptAsync>(p, 6)(p, 1ull << 30, &block) == S_OK,
-          "slot 6 (XPersistentLocalStoragePromptUserForSpaceAsync) starts the request");
-    const HRESULT status = XAsyncGetStatus(&block, true);
-    for (int i = 0; i < 500 && completions.load() == 0; ++i) Sleep(2);
-    check(status == E_ABORT && method<PromptResult>(p, 7)(p, &block) == E_ABORT && completions.load() == 1,
-          "no prompt offline: the request completes once, with E_ABORT, which slot 7 (...PromptUserForSpaceResult) "
-          "returns");
-    check(method<PromptAsync>(p, 6)(p, 1, nullptr) == E_INVALIDARG && method<PromptResult>(p, 7)(p, nullptr) == E_INVALIDARG,
-          "slots 6 and 7 refuse a null XAsyncBlock");
-
-    uint64_t mount = 0x1234;
-    check(method<Mount>(p, 8)(p, "AnotherTitle_8wekyb3d8bbwe", &mount) == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) &&
-              mount == 0,
-          "slot 8 (XPersistentLocalStorageMountForPackage): no other title's storage offline, FILE_NOT_FOUND, handle "
-          "cleared");
-    check(method<Mount>(p, 8)(p, nullptr, &mount) == E_INVALIDARG && method<Mount>(p, 8)(p, "x", nullptr) == E_INVALIDARG,
-          "slot 8 refuses a null identifier or handle");
-
-    rt::fs::configure({}, {});
-    size = 7;
-    check(method<PathSize>(p, 3)(p, &size) == HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND) && size == 0,
-          "without an overlay folder, slot 3 fails with ERROR_PATH_NOT_FOUND and reports 0");
-    release_object(p);
-    std::filesystem::remove_all(root, ec);
-}
-
 // XGameRuntimeFeatureImpl, XGameEventImpl, XSystemAnalyticsImpl and XDisplayImpl.
 void check_measured_classes(QueryFn query, XSystemAnalyticsInfo (*named_analytics)()) {
-    check_persistent_local_storage(query);
-
     const GUID feature_cls = {0x8836fe87, 0xedb9, 0x4fe3, {0x8d, 0xad, 0x05, 0xf0, 0xd2, 0xcd, 0x5b, 0x40}};
     void* f = ask(query, feature_cls, feature_cls);
     check(f != nullptr, "QueryApiImpl hands out XGameRuntimeFeatureImpl for its class id");
@@ -332,9 +180,9 @@ void check_measured_classes(QueryFn query, XSystemAnalyticsInfo (*named_analytic
         using Available = bool(STDMETHODCALLTYPE*)(void*, uint32_t);  // bool, per Microsoft's reference page
         auto available = method<Available>(f, 3);
         // XGameRuntimeFeature values: XAsync 2, XAsyncProvider 3, XDisplay 4, XNetworking 10, XPackage 11,
-        // XPersistentLocalStorage 12, XStore 14, XSystem 15, XTaskQueue 16, XThread 17, XError 19, XGameEvent 20.
+        // XStore 14, XSystem 15, XTaskQueue 16, XThread 17, XError 19, XGameEvent 20.
         bool served = true;
-        for (uint32_t v : {2u, 3u, 10u, 12u, 15u, 16u, 17u, 19u, 20u}) served = served && available(f, v);
+        for (uint32_t v : {2u, 3u, 10u, 15u, 16u, 17u, 19u, 20u}) served = served && available(f, v);
         check(served, "slot 3 (XGameRuntimeIsFeatureAvailable): true for the features whose classes are served");
         check(!available(f, 4) && !available(f, 14) && !available(f, 22) && !available(f, 0xFFFFFFFFu),
               "slot 3: false for XDisplay (documented for the consoles only), XStore and values past the enum");
@@ -351,6 +199,7 @@ void check_measured_classes(QueryFn query, XSystemAnalyticsInfo (*named_analytic
             {8, {0xdfcd4649, 0x4ff8, 0x4043, {0xba, 0x07, 0x35, 0xd6, 0x07, 0xdf, 0x98, 0xb0}}},   // XGameUI
             {9, {0x1b339674, 0x328d, 0x4283, {0xa2, 0x00, 0x31, 0x71, 0xf1, 0x8d, 0x36, 0x39}}},   // XLauncher
             {11, {0xaf406016, 0xe850, 0x4aa8, {0xa8, 0x8d, 0x2f, 0x3d, 0xcb, 0x9d, 0xac, 0x7e}}},  // XPackage
+            {12, {0xf4faf4d4, 0x2d04, 0x4fce, {0xb3, 0xe0, 0x47, 0x4a, 0x71, 0x3a, 0x3e, 0x84}}},  // XPersistentLocalStorage
             {13, {0x3e241977, 0x6237, 0x41e9, {0x85, 0x59, 0x10, 0x2c, 0x2d, 0x99, 0x83, 0xf1}}},  // XSpeechSynthesizer
             {18, {0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0}}},  // XUser
             {21, {0x0a2192aa, 0xb2d5, 0x4d58, {0x83, 0xbe, 0x38, 0x3b, 0x6d, 0x80, 0x79, 0x9e}}},  // XGameStreaming
