@@ -1037,6 +1037,14 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_queue_wait_timeout COMMAND d3d12_queue_wait_test --timeout-control)
     set_tests_properties(d3d12_queue_wait_timeout PROPERTIES SKIP_RETURN_CODE 77 WILL_FAIL TRUE TIMEOUT 10)
 
+    # Both CPU and queued GPU fence signals must permit retry after one-shot Vulkan host OOM.
+    add_executable(d3d12_fence_signal_retry_test test/d3d12_fence_signal_retry_test.cpp)
+    target_link_libraries(d3d12_fence_signal_retry_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_fence_signal_retry_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_fence_signal_retry_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_fence_signal_retry COMMAND d3d12_fence_signal_retry_test)
+    set_tests_properties(d3d12_fence_signal_retry PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
+
     # XDXR acceleration structures through BuildRaytracingAccelerationStructure (docs/d3d12_vulkan.md 4.8): the
     # device builds them, tools/xdxr_bvh.py checks them.
     add_executable(d3d12_xdxr_rt_test test/d3d12_xdxr_rt_test.cpp)

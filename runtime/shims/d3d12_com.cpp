@@ -1098,13 +1098,20 @@ public:
     VkSemaphore semaphore() const { return fence_.semaphore(); }
 
     // A Vulkan timeline only increases; D3D12 allows setting a fence lower. Such a signal is reported and dropped.
-    bool claim(UINT64 value) {
-        UINT64 current = highest_.load();
-        while (value > current)
-            if (highest_.compare_exchange_weak(current, value)) return true;
-        std::fprintf(stderr, "[rt] d3d12: fence signal %llu is not above %llu; Vulkan timelines cannot go back\n",
-                     static_cast<unsigned long long>(value), static_cast<unsigned long long>(current));
-        return false;
+    // Commit the high-water mark only after the backend accepted a signal. In particular, a transient Vulkan OOM
+    // must not consume a fence value: the caller is allowed to retry it after an E_FAIL. Serialize host callers
+    // (including callers on different D3D12 queues) so a failed lower value cannot roll back a successful higher one.
+    template<class Submit>
+    HRESULT signal_transaction(UINT64 value, Submit&& submit) {
+        std::lock_guard lock(signal_mutex_);
+        if (value <= highest_) {
+            std::fprintf(stderr, "[rt] d3d12: fence signal %llu is not above %llu; Vulkan timelines cannot go back\n",
+                         static_cast<unsigned long long>(value), static_cast<unsigned long long>(highest_));
+            return S_OK;
+        }
+        if (!submit()) return E_FAIL;
+        highest_ = value;
+        return S_OK;
     }
 
     UINT64 STDMETHODCALLTYPE GetCompletedValue() override {
@@ -1113,8 +1120,7 @@ public:
     D3D12_FENCE_FLAGS STDMETHODCALLTYPE GetCreationFlags() override { return flags_; }
 
     HRESULT STDMETHODCALLTYPE Signal(UINT64 value) override {
-        if (claim(value) && !fence_.signal(value)) return E_FAIL;
-        return S_OK;
+        return signal_transaction(value, [&] { return fence_.signal(value); });
     }
 
     // A null event blocks until the value is reached, as D3D12 does.
@@ -1143,7 +1149,8 @@ private:
     leonida::VulkanContext& context_;
     leonida::VulkanFence fence_;
     D3D12_FENCE_FLAGS flags_;
-    std::atomic<UINT64> highest_;
+    std::mutex signal_mutex_;
+    UINT64 highest_;
 };
 
 class CommandQueue final
@@ -1258,8 +1265,9 @@ public:
         Fence* f = Fence::from(fence);
         if (!f) return d3d12_trace::result(method, E_INVALIDARG);
         std::lock_guard lock(mutex_);
-        if (!f->claim(value)) return d3d12_trace::result(method, S_OK);
-        return d3d12_trace::result(method, queue_.signal(f->semaphore(), value) ? S_OK : E_FAIL);
+        return d3d12_trace::result(method, f->signal_transaction(value, [&] {
+            return queue_.signal(f->semaphore(), value);
+        }));
     }
 
     HRESULT STDMETHODCALLTYPE Wait(ID3D12Fence* fence, UINT64 value) override {
