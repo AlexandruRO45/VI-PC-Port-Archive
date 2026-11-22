@@ -794,5 +794,42 @@ class TestValuCvtNormI32F16ConditionCodes(unittest.TestCase):
         interp.step(inst)
         self.assertEqual(interp.vcc, canary)
 
+# ---------------------------------------------------------------------------
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ---------------------------------------------------------------------------
+
+class TestValuCvtNormI32F16IEEE754Boundaries(unittest.TestCase):
+    """Exhaustive unit tests for IEEE 754 boundary extremes, subnormals, and NaNs."""
+
+    def test_signed_zeros(self) -> None:
+        self.assertEqual(ref_cvt_norm_i32_f16(POS_ZERO_F16), SNORM32_ZERO)
+        self.assertEqual(ref_cvt_norm_i32_f16(NEG_ZERO_F16), SNORM32_ZERO)
+        self.assertEqual(ref_cvt_norm_i32_f16(POS_ZERO_F16, abs_val=True), SNORM32_ZERO)
+        self.assertEqual(ref_cvt_norm_i32_f16(NEG_ZERO_F16, neg=True), SNORM32_ZERO)
+
+    def test_subnormals(self) -> None:
+        # Min subnormal: 2^-24 * (2^31 - 1) = 127.99999994 -> 128
+        self.assertEqual(ref_cvt_norm_i32_f16(MIN_SUBNORMAL_F16), 128)
+        # Max subnormal: (1023/1024) * 2^-14 * (2^31 - 1) ~= 130944
+        self.assertEqual(ref_cvt_norm_i32_f16(MAX_SUBNORMAL_F16), 130944)
+
+    def test_unit_and_saturation(self) -> None:
+        self.assertEqual(ref_cvt_norm_i32_f16(ONE_F16), SNORM32_MAX)
+        self.assertEqual(ref_cvt_norm_i32_f16(NEG_ONE_F16), SNORM32_MIN_RAW)
+
+        # 2.0 saturates to SNORM32_MAX
+        self.assertEqual(ref_cvt_norm_i32_f16(TWO_F16), SNORM32_MAX)
+        # -2.0 saturates to SNORM32_MIN
+        self.assertEqual(ref_cvt_norm_i32_f16(NEG_TWO_F16), SNORM32_MIN_RAW)
+
+    def test_infinities(self) -> None:
+        self.assertEqual(ref_cvt_norm_i32_f16(POS_INF_F16), SNORM32_MAX)
+        self.assertEqual(ref_cvt_norm_i32_f16(NEG_INF_F16), SNORM32_MIN_RAW)
+
+    def test_nans(self) -> None:
+        nan_list = [QNAN_F16, NEG_QNAN_F16, SNAN_F16, NEG_SNAN_F16, 0x7E42, 0xFE42]
+        for n in nan_list:
+            self.assertEqual(ref_cvt_norm_i32_f16(n), SNORM32_ZERO)
+
 if __name__ == "__main__":
     unittest.main()
