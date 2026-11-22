@@ -849,8 +849,106 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
             self.assertEqual(oracle_v_and_or_b32(b, b, b), b)
 
 
+
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Reg(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(999, RegType.SGPR)
+
+    def test_syntax_rejection_valu_destination_must_be_vgpr(self) -> None:
+        dst_sgpr = Reg(0, RegType.SGPR)
+        src = VOP3Operand(Reg(1, RegType.VGPR))
+        with self.assertRaises(TypeError):
+            VAndOrB32Instruction(dst=dst_sgpr, src0=src, src1=src, src2=src)
+
+    def test_syntax_rejection_invalid_simd_lane_count(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_negative_control_swapped_and_or_operands(self) -> None:
+        s0, s1, s2 = 0xF0, 0x0F, 0x55
+        # (0xF0 & 0x0F) | 0x55 = 0 | 0x55 = 0x55
+        correct = oracle_v_and_or_b32(s0, s1, s2)
+        # Swapping s1 and s2: (0xF0 & 0x55) | 0x0F = 0x50 | 0x0F = 0x5F
+        swapped = oracle_v_and_or_b32(s0, s2, s1)
+        self.assertNotEqual(correct, swapped)
+
+    def test_negative_control_xor_instead_of_or(self) -> None:
+        s0, s1, s2 = 0xFF, 0xFF, 0xFF
+        correct = oracle_v_and_or_b32(s0, s1, s2)  # (0xFF & 0xFF) | 0xFF = 0xFF
+        wrong_xor = (s0 & s1) ^ s2                 # (0xFF & 0xFF) ^ 0xFF = 0x00
+        self.assertNotEqual(correct, wrong_xor)
+
+    def test_negative_control_addition_instead_of_or(self) -> None:
+        s0, s1, s2 = 0x01, 0x01, 0x01
+        correct = oracle_v_and_or_b32(s0, s1, s2)  # (1 & 1) | 1 = 1
+        wrong_add = ((s0 & s1) + s2) & MASK32      # (1 & 1) + 1 = 2
+        self.assertNotEqual(correct, wrong_add)
+
+    def test_mutation_or_then_and_detected(self) -> None:
+        """Mutant: Executes (S0 | S1) & S2 instead of (S0 & S1) | S2."""
+        def mutant_or_then_and(s0: int, s1: int, s2: int) -> int:
+            return ((s0 | s1) & s2) & MASK32
+
+        s0, s1, s2 = 0, 0, 1
+        oracle_res = oracle_v_and_or_b32(s0, s1, s2)  # (0 & 0) | 1 = 1
+        mutant_res = mutant_or_then_and(s0, s1, s2)   # (0 | 0) & 1 = 0
+        self.assertEqual(oracle_res, 1)
+        self.assertEqual(mutant_res, 0)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_bitwise_and_all_three_detected(self) -> None:
+        """Mutant: Executes S0 & S1 & S2 instead of (S0 & S1) | S2."""
+        def mutant_and3(s0: int, s1: int, s2: int) -> int:
+            return (s0 & s1 & s2) & MASK32
+
+        s0, s1, s2 = 0, 0, 0xFF
+        oracle_res = oracle_v_and_or_b32(s0, s1, s2)  # 0xFF
+        mutant_res = mutant_and3(s0, s1, s2)          # 0x00
+        self.assertEqual(oracle_res, 0xFF)
+        self.assertEqual(mutant_res, 0x00)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_bitwise_or_all_three_detected(self) -> None:
+        """Mutant: Executes S0 | S1 | S2 instead of (S0 & S1) | S2."""
+        def mutant_or3(s0: int, s1: int, s2: int) -> int:
+            return (s0 | s1 | s2) & MASK32
+
+        s0, s1, s2 = 0xF0, 0x0F, 0x00
+        oracle_res = oracle_v_and_or_b32(s0, s1, s2)  # (0xF0 & 0x0F) | 0 = 0
+        mutant_res = mutant_or3(s0, s1, s2)           # 0xF0 | 0x0F | 0 = 0xFF
+        self.assertEqual(oracle_res, 0x00)
+        self.assertEqual(mutant_res, 0xFF)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_xor_instead_of_and_detected(self) -> None:
+        """Mutant: Executes (S0 ^ S1) | S2 instead of (S0 & S1) | S2."""
+        def mutant_xor_or(s0: int, s1: int, s2: int) -> int:
+            return ((s0 ^ s1) | s2) & MASK32
+
+        s0, s1, s2 = 1, 1, 0
+        oracle_res = oracle_v_and_or_b32(s0, s1, s2)  # (1 & 1) | 0 = 1
+        mutant_res = mutant_xor_or(s0, s1, s2)        # (1 ^ 1) | 0 = 0
+        self.assertEqual(oracle_res, 1)
+        self.assertEqual(mutant_res, 0)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
