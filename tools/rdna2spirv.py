@@ -9208,6 +9208,18 @@ class Gen:
             self.emit(f"{sel} = OpSelect %float {either} %f0 {self.flush_f32(m)}")
             self.emit(f"{r} = OpFAdd %float {sel} {z}")
             self.dst(a[0], self.tou(self.flush_f32_mods(r, mods)))
+        elif op in ("v_fma_legacy_f32", "v_fmac_legacy_f32"):
+            # GFX10.3 single-rounded FMA with DX9 0 * anything = +0.0 rule (does not flush f32 denormals).
+            srcs = (a[1], a[2], a[0]) if op == "v_fmac_legacy_f32" else a[1:4]
+            x, y, z = (self.src_f(t) for t in srcs)
+            zx, zy, either, fma_r, add_r, r = (self.tmp() for _ in range(6))
+            self.emit(f"{zx} = OpFOrdEqual %bool {x} %f0")
+            self.emit(f"{zy} = OpFOrdEqual %bool {y} %f0")
+            self.emit(f"{either} = OpLogicalOr %bool {zx} {zy}")
+            self.emit_fma(fma_r, x, y, z)
+            self.emit(f"{add_r} = OpFAdd %float %f0 {z}")
+            self.emit(f"{r} = OpSelect %float {either} {add_r} {fma_r}")
+            self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in ("v_min3_i32", "v_min3_u32", "v_max3_i32", "v_max3_u32"):
             x, y, z = (self.src_u(t) for t in a[1:4])
             f = ("S" if op.endswith("i32") else "U") + ("Min" if "min" in op else "Max")
@@ -15823,9 +15835,9 @@ def read_before_write_vgprs(insns):
                 regs += range(x["r"], x["r"] + x.get("n", 1))
             elif x["k"] == "vlist":
                 regs += x["r"]
-        if (base_op(op) in ("v_swap_b32", "v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8", "v_pk_fmac_f16",
-                            "v_dot2c_f32_f16", "v_dot2c_i32_i16", "v_dot2c_u32_u16", "v_dot4c_u32_u8",
-                            "v_dot8c_i32_i4", "v_dot8c_u32_u4") or
+        if (base_op(op) in ("v_swap_b32", "v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_legacy_f32",
+                            "v_fmac_f16", "v_dot4c_i32_i8", "v_pk_fmac_f16", "v_dot2c_f32_f16", "v_dot2c_i32_i16",
+                            "v_dot2c_u32_u16", "v_dot4c_u32_u8", "v_dot8c_i32_i4", "v_dot8c_u32_u4") or
                 (op.startswith(("global_load_", "buffer_load_")) and "_d16" in op and "format" not in op)) and \
                 a[0]["k"] == "vgpr":   # d16 keeps a half
             regs.append(a[0]["r"])
@@ -16084,9 +16096,9 @@ def reg_reads_writes(insns):
                 regs += range(x["r"], x["r"] + x.get("n", 1))
             elif x["k"] == "vlist":
                 regs += x["r"]
-        if base_op(op) in ("v_swap_b32", "v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8", "v_pk_fmac_f16",
-                           "v_dot2c_f32_f16", "v_dot2c_i32_i16", "v_dot2c_u32_u16", "v_dot4c_u32_u8",
-                           "v_dot8c_i32_i4", "v_dot8c_u32_u4") and a[0]["k"] == "vgpr":
+        if base_op(op) in ("v_swap_b32", "v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_legacy_f32",
+                           "v_fmac_f16", "v_dot4c_i32_i8", "v_pk_fmac_f16", "v_dot2c_f32_f16", "v_dot2c_i32_i16",
+                           "v_dot2c_u32_u16", "v_dot4c_u32_u8", "v_dot8c_i32_i4", "v_dot8c_u32_u4") and a[0]["k"] == "vgpr":
             regs.append(a[0]["r"])
         rr.update(regs)
         if not reads_all and a[0]["k"] == "vgpr":
