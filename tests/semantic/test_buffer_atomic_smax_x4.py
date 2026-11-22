@@ -1225,5 +1225,171 @@ class TestBufferAtomicSmaxX4RegisterAliasing(unittest.TestCase):
             self.assertEqual(simd.mem.read_u128(addr), 500)
             self.assertEqual(simd.read_lane_reg_u128(lane, 0), addr)
 
+class TestBufferAtomicSmaxX4BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 bit-pattern preservation, signed extremes, and buffer boundary limits."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarBufferInterpreter(mem_size=4096)
+        self.desc = BufferResourceDescriptor(
+            base_address=0,
+            stride=0,
+            num_records=1024,
+        )
+        self.interp.set_buffer_descriptor(4, self.desc)
+
+    def test_signed_128bit_min_max_extremes(self) -> None:
+        int128_min = 1 << 127
+        int128_max = (1 << 127) - 1
+        self.interp.mem.write_u128(0, int128_min)
+        self.interp.write_reg_u128(0, int128_max)
+        self.interp.write_reg_u32(RegKind.VGPR, 4, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX_X4,
+            vdata=Register(RegKind.VGPR, 0, count=4),
+            vaddr=Register(RegKind.VGPR, 4, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, int128_min)
+        self.assertEqual(self.interp.mem.read_u128(0), int128_max)
+        self.assertEqual(self.interp.read_reg_u128(0), int128_min)
+
+    def test_signed_negative_vs_zero_and_minus_one(self) -> None:
+        minus_one = MASK128
+        zero = 0x0
+        self.interp.mem.write_u128(0, minus_one)
+        self.interp.write_reg_u128(0, zero)
+        self.interp.write_reg_u32(RegKind.VGPR, 4, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX_X4,
+            vdata=Register(RegKind.VGPR, 0, count=4),
+            vaddr=Register(RegKind.VGPR, 4, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, minus_one)
+        self.assertEqual(self.interp.mem.read_u128(0), zero)
+
+    def test_ieee754_double_sign_bit_and_zero_ordering(self) -> None:
+        pos_zero = 0x0000000000000000
+        neg_zero = 1 << 127
+        self.interp.mem.write_u128(0, neg_zero)
+        self.interp.write_reg_u128(0, pos_zero)
+        self.interp.write_reg_u32(RegKind.VGPR, 4, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX_X4,
+            vdata=Register(RegKind.VGPR, 0, count=4),
+            vaddr=Register(RegKind.VGPR, 4, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, neg_zero)
+        self.assertEqual(self.interp.mem.read_u128(0), pos_zero)
+
+    def test_ieee754_subnormals_bitwise_integrity_no_flush(self) -> None:
+        pos_subnormal = pack_u128(1, 0, 0, 0)
+        neg_subnormal = (1 << 127) | 1
+        self.interp.mem.write_u128(0, neg_subnormal)
+        self.interp.write_reg_u128(0, pos_subnormal)
+        self.interp.write_reg_u32(RegKind.VGPR, 4, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX_X4,
+            vdata=Register(RegKind.VGPR, 0, count=4),
+            vaddr=Register(RegKind.VGPR, 4, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, neg_subnormal)
+        self.assertEqual(self.interp.mem.read_u128(0), pos_subnormal)
+
+    def test_ieee754_nan_and_inf_no_canonicalization(self) -> None:
+        qnan = pack_u128(0xCAFEBABE, 0x7FF80000, 0, 0)
+        neg_inf = pack_u128(0, 0, 0, 0xFFF00000)
+        self.interp.mem.write_u128(0, neg_inf)
+        self.interp.write_reg_u128(0, qnan)
+        self.interp.write_reg_u32(RegKind.VGPR, 4, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX_X4,
+            vdata=Register(RegKind.VGPR, 0, count=4),
+            vaddr=Register(RegKind.VGPR, 4, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, neg_inf)
+        self.assertEqual(self.interp.mem.read_u128(0), qnan)
+
+    def test_buffer_boundary_exact_fit_and_overrun(self) -> None:
+        # Buffer has 1024 bytes. 128-bit access is 16 bytes.
+        # Offset 1008: 1008 + 16 == 1024 (valid)
+        self.interp.mem.write_u128(1008, 100)
+        self.interp.write_reg_u128(0, 500)
+        self.interp.write_reg_u32(RegKind.VGPR, 4, 1008)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX_X4,
+            vdata=Register(RegKind.VGPR, 0, count=4),
+            vaddr=Register(RegKind.VGPR, 4, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 100)
+        self.assertEqual(self.interp.mem.read_u128(1008), 500)
+        self.assertIsNotNone(self.interp.last_status_flags)
+        assert self.interp.last_status_flags is not None
+        self.assertTrue(self.interp.last_status_flags.in_bounds)
+
+        # Offset 1009: 1009 + 16 == 1025 > 1024 (OOB fault)
+        self.interp.write_reg_u32(RegKind.VGPR, 4, 1009)
+        ret_oob, in_bounds_oob = self.interp.step(inst)
+        self.assertFalse(in_bounds_oob)
+        self.assertEqual(ret_oob, 0)
+        self.assertIsNotNone(self.interp.last_status_flags)
+        assert self.interp.last_status_flags is not None
+        self.assertTrue(self.interp.last_status_flags.oob_fault)
+
+    def test_zero_capacity_buffer_rejection(self) -> None:
+        zero_desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=0)
+        self.interp.set_buffer_descriptor(8, zero_desc)
+        self.interp.write_reg_u128(0, 42)
+        self.interp.write_reg_u32(RegKind.VGPR, 4, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX_X4,
+            vdata=Register(RegKind.VGPR, 0, count=4),
+            vaddr=Register(RegKind.VGPR, 4, count=1),
+            srsrc=Register(RegKind.SGPR, 8, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertFalse(in_bounds)
+        self.assertEqual(ret, 0)
+        self.assertIsNotNone(self.interp.last_status_flags)
+        assert self.interp.last_status_flags is not None
+        self.assertTrue(self.interp.last_status_flags.oob_fault)
+
 if __name__ == "__main__":
     unittest.main()
