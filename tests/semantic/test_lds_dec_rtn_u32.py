@@ -1162,5 +1162,136 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertTrue(wrap_overflow.address_wrapped)
 
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def setUp(self) -> None:
+        self.state = ScalarMachineState(lds_dwords=1024)
+        self.interp = ScalarInterpreter()
+
+    def test_snan_preservation_without_quietening(self) -> None:
+        # Signaling NaN: exponent=0xFF, fraction != 0, quiet bit 22 (0x00400000) is 0
+        snan = 0x7F800002
+        self.assertEqual(snan & 0x00400000, 0)
+
+        dword_idx = 10
+        self.state.lds.write_dword(dword_idx, snan)
+        self.state.set_vgpr(1, dword_idx * 4)
+        self.state.set_vgpr(2, MASK32)  # Bound is max u32, so normal decrement occurs
+
+        instr = DSDecRtnInstruction(
+            vdst=RegisterOperand(3),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+            offset=0,
+        )
+
+        old_val, new_val = self.interp.step(instr, self.state)
+        # Old val preserved with quiet bit clear
+        self.assertEqual(old_val, snan)
+        self.assertEqual(old_val & 0x00400000, 0)
+        self.assertEqual(self.state.get_vgpr(3), snan)
+
+        # New val is integer decremented: 0x7F800001 (still sNaN, quiet bit still clear)
+        self.assertEqual(new_val, 0x7F800001)
+        self.assertEqual(new_val & 0x00400000, 0)
+        self.assertEqual(self.state.lds.read_dword(dword_idx), 0x7F800001)
+
+    def test_qnan_payload_preservation(self) -> None:
+        # Quiet NaN with specific payload: 0x7FC01234
+        qnan = 0x7FC01234
+        dword_idx = 12
+        self.state.lds.write_dword(dword_idx, qnan)
+        self.state.set_vgpr(1, dword_idx * 4)
+        self.state.set_vgpr(2, MASK32)
+
+        instr = DSDecRtnInstruction(
+            vdst=RegisterOperand(3),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+            offset=0,
+        )
+
+        old_val, new_val = self.interp.step(instr, self.state)
+        self.assertEqual(old_val, qnan)
+        self.assertEqual(new_val, 0x7FC01233)
+        self.assertEqual(self.state.get_vgpr(3), qnan)
+        self.assertEqual(self.state.lds.read_dword(dword_idx), 0x7FC01233)
+
+    def test_signed_zeros_distinct_behavior(self) -> None:
+        # +0.0 is 0x00000000 -> triggers wrap on zero
+        dword_pos = 14
+        self.state.lds.write_dword(dword_pos, POS_ZERO_F32)
+        self.state.set_vgpr(1, dword_pos * 4)
+        self.state.set_vgpr(2, 50)
+
+        instr1 = DSDecRtnInstruction(
+            vdst=RegisterOperand(3),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+        )
+        old1, new1 = self.interp.step(instr1, self.state)
+        self.assertEqual(old1, POS_ZERO_F32)
+        self.assertEqual(new1, 50)
+        self.assertEqual(self.state.get_vgpr(3), POS_ZERO_F32)
+
+        # -0.0 is 0x80000000 (2147483648) -> not equal to 0; strictly > 50 -> wraps to 50
+        dword_neg = 15
+        self.state.lds.write_dword(dword_neg, NEG_ZERO_F32)
+        self.state.set_vgpr(1, dword_neg * 4)
+        self.state.set_vgpr(2, 50)
+
+        instr2 = DSDecRtnInstruction(
+            vdst=RegisterOperand(4),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+        )
+        old2, new2 = self.interp.step(instr2, self.state)
+        self.assertEqual(old2, NEG_ZERO_F32)
+        self.assertEqual(new2, 50)
+        self.assertEqual(self.state.get_vgpr(4), NEG_ZERO_F32)
+
+    def test_subnormals_without_flush_to_zero(self) -> None:
+        # Min subnormal 0x00000001
+        dword_idx = 16
+        self.state.lds.write_dword(dword_idx, MIN_SUBNORMAL_F32)
+        self.state.set_vgpr(1, dword_idx * 4)
+        self.state.set_vgpr(2, 100)
+
+        instr = DSDecRtnInstruction(
+            vdst=RegisterOperand(5),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+        )
+        old_val, new_val = self.interp.step(instr, self.state)
+        self.assertEqual(old_val, MIN_SUBNORMAL_F32)
+        # Decrements by 1 to 0
+        self.assertEqual(new_val, 0)
+        self.assertEqual(self.state.get_vgpr(5), MIN_SUBNORMAL_F32)
+
+        # Max subnormal 0x007FFFFF decrements to 0x007FFFFE with bound >= MAX_SUBNORMAL_F32
+        self.state.lds.write_dword(dword_idx, MAX_SUBNORMAL_F32)
+        self.state.set_vgpr(2, MASK32)
+        old_max, new_max = self.interp.step(instr, self.state)
+        self.assertEqual(old_max, MAX_SUBNORMAL_F32)
+        self.assertEqual(new_max, MAX_SUBNORMAL_F32 - 1)
+
+    def test_signed_infinities_preservation(self) -> None:
+        dword_idx = 18
+        self.state.lds.write_dword(dword_idx, POS_INF_F32)
+        self.state.set_vgpr(1, dword_idx * 4)
+        self.state.set_vgpr(2, MASK32)
+
+        instr = DSDecRtnInstruction(
+            vdst=RegisterOperand(6),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+        )
+        old_inf, new_inf = self.interp.step(instr, self.state)
+        self.assertEqual(old_inf, POS_INF_F32)
+        self.assertEqual(new_inf, POS_INF_F32 - 1)
+        self.assertEqual(self.state.get_vgpr(6), POS_INF_F32)
+
+
 if __name__ == "__main__":
     unittest.main()
