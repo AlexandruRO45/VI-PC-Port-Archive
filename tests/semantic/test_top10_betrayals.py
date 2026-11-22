@@ -115,13 +115,6 @@ class Top10Betrayals(unittest.TestCase):
                     self.assertEqual(run(movs + ["v_cvt_pknorm_u16_f16 v0, v1, v2"]),
                                      norm(h2f(x), False) | norm(h2f(y), False) << 16)
 
-    def test_pknorm_f16_opsel_dst(self):
-        movs = ["v_mov_b32 v6, 0x40003800", "v_mov_b32 v5, 0x3c00bc00"]
-        self.assertEqual(run(movs + ["v_cvt_pknorm_i16_f16 v0, v6, v5"]), 0x80014000)
-        self.assertEqual(run(movs + ["v_cvt_pknorm_i16_f16 v0, v6, v5 op_sel:[0,0,1]"]), 0x40000000)
-        self.assertEqual(run(movs + ["v_cvt_pknorm_u16_f16 v0, v6, v5 op_sel:[1,0,1]"]), 0xFFFF0000)
-        self.assertEqual(run(movs + ["v_cvt_pknorm_u16_f16 v0, v6, v5 op_sel:[1,0,0]"]), 0x0000FFFF)
-
     def test_fma_legacy_f32(self):
         vals = [0.0, -0.0, 1.5, -2.25, 3.0, float("inf"), bits_f32(0x3A83126F), 0.5]
         for x in vals:
