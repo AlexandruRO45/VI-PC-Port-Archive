@@ -17,6 +17,7 @@
 //                 the memory available at start, at large_module_gate.h's estimate per module, up to --jobs, with the
 //                 small ones compiling alongside; 1 = each large module alone, the other threads waiting (the
 //                 behaviour before; also what 0 falls back to when the available memory can't be read)
+//   --max-commit-mib N|auto  Windows job-wide commit cap for this checker and its child processes
 //   --start I --count N   check only index entries [I, I+N) (sorted by name)
 //   --slow SEC    print pipelines slower than SEC (default 30); compiles past 60 s are named while running
 //   --max-bytes N skip modules whose .spv is larger than N bytes (0 = no limit; names every skip)
@@ -53,6 +54,7 @@
 #include "pipeline_summary.h"
 #include "../src/spirv_words.h"
 #include "../src/subgroup_size.h"
+#include "pipeline_commit_budget.h"
 
 #include <algorithm>
 #include <array>
@@ -788,6 +790,7 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
             "usage: vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--start I] [--count N] [--slow SEC] "
+            "[--max-commit-mib N|auto (Windows)] "
             "[--max-bytes N] [--large-module-bytes N] [--large-parallel N] [--stage all|cs|graphics | --compute-only | --graphics-only] "
             "[--stats FILE] [--cache-feedback] [--isolate [--isolate-batch N]] [--inflight-file F] "
             "[--skip-file F]\n");
@@ -800,6 +803,7 @@ int main(int argc, char** argv) {
     size_t start = 0, count = 0, max_bytes = 0;
     size_t large_module_bytes = 4 * 1024 * 1024;
     unsigned large_parallel = 0;   // 0 = by the memory budget
+    std::optional<leonida::pipeline_budget::Budget> commit_budget;
     double slow = 30.0;
     std::string stage_filter = "all";
     bool cache_feedback = false, isolate = false, iso_child = false;
@@ -842,6 +846,10 @@ int main(int argc, char** argv) {
         else if (a == "--max-bytes") valid = number(max_bytes);
         else if (a == "--large-module-bytes") valid = number(large_module_bytes);
         else if (a == "--large-parallel") valid = number(large_parallel);
+        else if (a == "--max-commit-mib") {
+            commit_budget = leonida::pipeline_budget::parse(value());
+            valid = commit_budget.has_value();
+        }
         else if (a == "--stats") valid = !(stats_path = value()).empty();
         else if (a == "--inflight-file") valid = !(inflight_path = value()).empty();
         else if (a == "--skip-file") valid = !(skip_path = value()).empty();
@@ -879,6 +887,22 @@ int main(int argc, char** argv) {
     }
 #ifdef _WIN32
     if (iso_child) SetErrorMode(GetErrorMode() | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+    leonida::pipeline_budget::CommitJob commit_job;
+    if (commit_budget) {
+        if (const auto error = commit_job.apply(*commit_budget)) {
+            std::fprintf(stderr, "--max-commit-mib: %s failed (Windows error %lu); Vulkan was not started\n",
+                         error->operation, static_cast<unsigned long>(error->code));
+            return 1;
+        }
+        std::fprintf(stderr, "pipeline compiler commit cap: %zu MiB (%s)\n",
+                     commit_job.limit() / leonida::pipeline_budget::mib,
+                     commit_budget->automatic ? "auto" : "explicit");
+    }
+#else
+    if (commit_budget) {
+        std::fprintf(stderr, "--max-commit-mib is supported only on Windows\n");
+        return 2;
+    }
 #endif
 
     const std::string index_path = dir + "/index.json";
@@ -1988,5 +2012,14 @@ int main(int argc, char** argv) {
             check_failed = true;
         }
     }
+#ifdef _WIN32
+    if (commit_budget) {
+        if (const auto peak = commit_job.peak())
+            std::printf("pipeline compiler peak job commit: %.1f MiB\n",
+                        static_cast<double>(*peak) / leonida::pipeline_budget::mib);
+        else
+            std::fprintf(stderr, "pipeline compiler peak job commit unavailable\n");
+    }
+#endif
     return (check_failed || !cache_saved) ? 1 : 0;
 }

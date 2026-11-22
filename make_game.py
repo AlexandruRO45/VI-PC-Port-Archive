@@ -1924,7 +1924,19 @@ def require_translated_shaders(work: str) -> str:
     return spirv
 
 
-def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: str | None = None) -> None:
+def pipeline_commit_mib(text: str) -> str:
+    if text == "auto":
+        return text
+    value = positive_int(text)
+    if value >= 1 << 44:  # 64-bit byte count, same limit as vk_pipeline_check
+        raise argparse.ArgumentTypeError("commit cap is too large")
+    return str(value)
+
+
+def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: str | None = None,
+              max_commit_mib: "str | None" = None) -> None:
+    if max_commit_mib is not None and os.name != "nt":
+        fail("--pipeline-max-commit-mib is supported only on Windows.")
     exe = pipeline_check_exe(runtime_build)
     if not exe and os.name == "nt":
         fail("vk_pipeline_check.exe wasn't built: run the runtime stage with the Vulkan SDK installed.")
@@ -1941,6 +1953,8 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     drop(inflight, skip)   # every module gets a fresh chance on each run (a new translator may have fixed it)
     # --jobs: make_game.py's own; without it vk_pipeline_check uses half the hardware threads whatever was asked
     base = [exe, spirv, cache, *(["--jobs", str(jobs)] if jobs else [])]
+    commit_args = ["--max-commit-mib", max_commit_mib] if max_commit_mib is not None else []
+    base += commit_args
     if not checker_supports(exe, "--inflight-file", "--skip-file"):
         # An older build takes any argument it doesn't know as the cache path, so it would write the cache into
         # pipeline_inflight.txt and exit 0. Run it as before: a module that kills it stops the stage.
@@ -1972,7 +1986,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
                                           if n not in crashed and (allowed is None or n in allowed)))
             # Even the last in-flight module can be innocent after other heavy compiles in the batch.
             if count is not None or len(suspects) > 1:
-                suspects = [n for n in suspects if crashes_alone(exe, spirv, cache, n, inflight)]
+                suspects = [n for n in suspects if crashes_alone(exe, spirv, cache, n, inflight, commit_args=commit_args)]
             if not suspects:
                 if count is not None and count > 1:
                     # All suspects survived in fresh processes: do not blacklist them. Re-check the entire failed
@@ -1993,6 +2007,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
             crashed.extend(suspects)
             with open(skip, "w", encoding="utf-8", newline="\n") as f:
                 f.write("".join(n + "\n" for n in crashed))
+
         fail(f"vk_pipeline_check still crashed after {PIPELINE_CRASH_RETRIES} retries; modules that took it down: "
              + ", ".join(crashed))
 
@@ -2069,12 +2084,13 @@ def pipeline_names(spirv: str) -> "list[str]":
     return sorted(index, key=lambda n: n.encode("utf-8"))
 
 
-def crashes_alone(exe: str, spirv: str, cache: str, name: str, inflight: str | None = None) -> bool:
+def crashes_alone(exe: str, spirv: str, cache: str, name: str, inflight: str | None = None,
+                  *, commit_args: "list[str] | tuple[str, ...]" = ()) -> bool:
     """Confirm a crash only when this probe's fresh report names the selected module as in flight."""
     names = pipeline_names(spirv)
     if name not in names:
         return False
-    args = [exe, spirv, cache, "--jobs", "1", "--start", str(names.index(name)), "--count", "1"]
+    args = [exe, spirv, cache, "--jobs", "1", "--start", str(names.index(name)), "--count", "1", *commit_args]
     if inflight:
         drop(inflight)
         args += ["--inflight-file", inflight]
@@ -2117,6 +2133,8 @@ def main() -> int:
     ap.add_argument("--wav", action="store_true",
                     help="also decode the Ogg Opus audio to 16-bit PCM WAV (much larger; needs ffmpeg)")
     ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
+    ap.add_argument("--pipeline-max-commit-mib", type=pipeline_commit_mib, metavar="N|auto",
+                    help="Windows only: limit committed memory of the pipeline checker and its child processes")
     ap.add_argument("--find", action="store_true", help="only list the game copies found on this PC")
     ap.add_argument("--runtime-build", metavar="DIR",
                     help="a Windows build of runtime/ (gta6rt.exe and gta6rt_tls_host.dll) for the runtime stage "
@@ -2158,6 +2176,9 @@ def main() -> int:
                 ap.error(f"--stages: unknown stage '{s}' (choose from: {','.join(STAGES)})")
     if a.pick and a.game:
         ap.error("--pick and --game both choose the game folder: give one")
+    if (a.pipeline_max_commit_mib is not None and os.name != "nt" and "pipelines" in stages
+            and not (a.find or a.check)):
+        ap.error("--pipeline-max-commit-mib is supported only on Windows")
     below_normal()
     if a.find:
         containers = []
@@ -2243,7 +2264,8 @@ def main() -> int:
     if "runtime" in stages:
         runtime(game, out, v, runtime_build, a.jobs, work=work)
     if "pipelines" in stages:
-        pipelines(work, out, a.jobs, runtime_build=runtime_build)
+        budget = {} if a.pipeline_max_commit_mib is None else {"max_commit_mib": a.pipeline_max_commit_mib}
+        pipelines(work, out, a.jobs, runtime_build=runtime_build, **budget)
     log(f"finished in {(time.time() - t0) / 60:.0f} min")
     return 0
 

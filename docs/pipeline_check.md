@@ -270,6 +270,30 @@ of the arenas (16 modules, 6 threads: 6.2 GB; with `MALLOC_ARENA_MAX=1`: 2.1 GB)
 - `--inflight-file` names every module in flight when a large one enters or leaves the driver, so with several
   large modules in flight it names all of them; the `pipelines` stage of `make_game.py` checks each alone.
 
+## Bounding Windows shader compiler memory
+
+On Windows, the Vulkan driver's shader compiler can consume tens of GiB of host commit during
+a single pipeline creation. Reports in [#884](https://github.com/ItsNotRexed/Leonida/issues/884)
+and [#2111](https://github.com/ItsNotRexed/Leonida/pull/2111) describe builds running out of
+memory in the driver. Set an optional commit cap for the checker and the processes it starts:
+
+```powershell
+python -I make_game.py --stages pipelines --jobs 1 --pipeline-max-commit-mib auto
+vk_pipeline_check <spirv dir> cache.bin --jobs 1 --max-commit-mib 8192
+```
+
+An explicit number is the job's total committed memory in MiB. `auto` takes 75 percent of the smaller
+of the currently available physical memory and available commit, rounds down to a whole MiB, and
+requires at least 256 MiB. The checker installs the Windows Job Object before opening Vulkan and
+prints the selected cap. The cap excludes GPU memory and uncommitted virtual address reservations.
+On normal completion the checker prints the job's peak commit, including the final cache save.
+
+If Windows cannot install the limit, the checker stops before starting Vulkan. At the limit Windows
+can refuse further allocations. A compile can fail or the Vulkan driver can abort, so a capped run
+can still fail. The regular pipeline cache and large-module concurrency rules also apply under the
+cap. `--jobs 1` limits how many compiles compete for the budget. On systems that need a large shader
+or cache to finish, choose a cap with enough headroom for both.
+
 ## Skipping huge modules
 
 `vk_pipeline_check` now accepts `--max-bytes N`:

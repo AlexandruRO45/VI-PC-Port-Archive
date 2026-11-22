@@ -429,6 +429,12 @@ if(BUILD_TESTING)
 
   add_executable(pipeline_cache_file_test test/pipeline_cache_file_test.cpp)
   add_test(NAME pipeline_cache_file COMMAND pipeline_cache_file_test)
+  add_executable(pipeline_commit_budget_test test/pipeline_commit_budget_test.cpp)
+  if(WIN32)
+    target_compile_definitions(pipeline_commit_budget_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  endif()
+  add_test(NAME pipeline_commit_budget COMMAND pipeline_commit_budget_test)
+  set_tests_properties(pipeline_commit_budget PROPERTIES TIMEOUT 30)
 
   add_executable(xdxr_build_output_test test/xdxr_build_output_test.cpp)
   add_test(NAME xdxr_build_output COMMAND xdxr_build_output_test)

@@ -2,6 +2,7 @@
 
 Standard library only; no GPU, no Vulkan SDK, no game data: the checker is mocked.
 """
+import argparse
 import io
 import json
 import os
@@ -79,7 +80,33 @@ class PipelinesJobsTest(unittest.TestCase):
     def test_the_default_matches_the_checker_default(self):
         # vk_pipeline_check's own default is half the hardware threads, as is make_game.py's --jobs.
         want = str(max(1, (os.cpu_count() or 2) // 2))
-        self.assertEqual(self.jobs_of(self.checker_args(lambda: self.main_with())), want)
+        args = self.checker_args(lambda: self.main_with())
+        self.assertEqual(self.jobs_of(args), want)
+        self.assertNotIn("--max-commit-mib", args)
+
+    def test_explicit_and_auto_caps_reach_the_windows_checker(self):
+        with mock.patch.object(make_game.os, "name", "nt"):
+            for value in ("8192", "auto"):
+                with self.subTest(value=value):
+                    args = self.checker_args(lambda: self.main_with("--jobs", "3", "--pipeline-max-commit-mib", value))
+                    self.assertEqual(args[-4:], ["--jobs", "3", "--max-commit-mib", value])
+
+    def test_invalid_caps_are_rejected_by_argument_parser(self):
+        for value in ("0", "-1", "1.5", "3GiB", "17592186044416"):
+            with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
+                make_game.pipeline_commit_mib(value)
+
+    def test_budget_is_rejected_before_platform_preflight_off_windows(self):
+        with (
+            mock.patch.object(make_game.os, "name", "posix"),
+            mock.patch.object(make_game, "below_normal") as start,
+            mock.patch.object(sys, "argv", ["make_game.py", "--stages", "pipelines",
+                                            "--pipeline-max-commit-mib", "auto"]),
+        ):
+            with self.assertRaises(SystemExit) as exit_status:
+                make_game.main()
+            self.assertEqual(exit_status.exception.code, 2)
+            start.assert_not_called()
 
     def test_the_stage_log_names_compute_and_graphics_pipelines(self):
         # The stage runs vk_pipeline_check without --stage, and its default is all: cs become compute pipelines,
