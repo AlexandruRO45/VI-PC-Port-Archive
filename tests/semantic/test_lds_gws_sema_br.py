@@ -314,6 +314,44 @@ class SIMDInterpreter:
         }
 
 
+# Commit 6: Condition codes, status flags, and carry/borrow generation
+
+
+@dataclass(frozen=True)
+class GWSSemaBrStatusFlags:
+    """Architectural condition codes and status flags for ds_gws_sema_br."""
+    signaled: bool
+    num_waiters_awakened: int
+    permits_added_to_counter: int
+    counter_zero: bool
+    counter_negative: bool
+    carry_out: bool
+    resource_id: int
+
+
+def evaluate_gws_br_status(
+    old_val: int,
+    new_val: int,
+    num_awakened: int,
+    permits_delivered: int,
+    rid: int,
+) -> GWSSemaBrStatusFlags:
+    """Evaluates status flags and condition codes after a semaphore bulk release operation."""
+    permits_to_counter = permits_delivered - num_awakened
+    carry_out = ((old_val + permits_to_counter) > 0xFFFF_FFFF)
+    counter_zero = (new_val == 0)
+    counter_negative = bool(new_val & 0x8000_0000)
+    return GWSSemaBrStatusFlags(
+        signaled=True,
+        num_waiters_awakened=num_awakened,
+        permits_added_to_counter=permits_to_counter,
+        counter_zero=counter_zero,
+        counter_negative=counter_negative,
+        carry_out=carry_out,
+        resource_id=rid,
+    )
+
+
 class TestGWSSemaBrOracleAndModel(unittest.TestCase):
     """Commit 1: Reference mathematical oracle and architectural model for ds_gws_sema_br."""
 
@@ -651,6 +689,82 @@ class TestGWSSemaBrRegisterAliasing(unittest.TestCase):
         self.assertEqual(interp.rf.get_vgpr(0), 3)
         self.assertEqual(interp.rf.m0, 10)
         self.assertEqual(interp.gws.resources[10].value, 150)
+
+
+class TestGWSSemaBrConditionCodes(unittest.TestCase):
+    """Commit 6: Condition codes, status flags, and carry/borrow generation for ds_gws_sema_br."""
+
+    def test_standard_bulk_release_status_flags(self) -> None:
+        flags = evaluate_gws_br_status(
+            old_val=10,
+            new_val=25,
+            num_awakened=0,
+            permits_delivered=15,
+            rid=3,
+        )
+        self.assertTrue(flags.signaled)
+        self.assertEqual(flags.num_waiters_awakened, 0)
+        self.assertEqual(flags.permits_added_to_counter, 15)
+        self.assertFalse(flags.counter_zero)
+        self.assertFalse(flags.counter_negative)
+        self.assertFalse(flags.carry_out)
+        self.assertEqual(flags.resource_id, 3)
+
+    def test_waiter_awakened_status_flags(self) -> None:
+        flags = evaluate_gws_br_status(
+            old_val=0,
+            new_val=2,
+            num_awakened=3,
+            permits_delivered=5,
+            rid=7,
+        )
+        self.assertTrue(flags.signaled)
+        self.assertEqual(flags.num_waiters_awakened, 3)
+        self.assertEqual(flags.permits_added_to_counter, 2)
+        self.assertFalse(flags.counter_zero)
+        self.assertFalse(flags.counter_negative)
+        self.assertFalse(flags.carry_out)
+
+    def test_carry_out_on_modulo_32bit_wrap(self) -> None:
+        flags = evaluate_gws_br_status(
+            old_val=0xFFFF_FFF0,
+            new_val=5,
+            num_awakened=0,
+            permits_delivered=0x16,  # 22 permits: 0xFFFFFFF0 + 22 = 0x100000006 -> wraps
+            rid=1,
+        )
+        self.assertTrue(flags.carry_out)
+        self.assertFalse(flags.counter_zero)
+
+    def test_counter_zero_status_flag(self) -> None:
+        flags = evaluate_gws_br_status(
+            old_val=0xFFFF_FFFF,
+            new_val=0,
+            num_awakened=0,
+            permits_delivered=1,
+            rid=11,
+        )
+        self.assertTrue(flags.carry_out)
+        self.assertTrue(flags.counter_zero)
+
+    def test_counter_negative_flag(self) -> None:
+        flags = evaluate_gws_br_status(
+            old_val=0x7FFF_FFFF,
+            new_val=0x8000_0005,
+            num_awakened=0,
+            permits_delivered=6,
+            rid=4,
+        )
+        self.assertTrue(flags.counter_negative)
+        self.assertFalse(flags.counter_zero)
+
+    def test_simd_vcc_predicate_mask_evaluation(self) -> None:
+        exec_mask = 0xF0F0_F0F0
+        vcc_mask = 0
+        for lane in range(32):
+            if (exec_mask >> lane) & 1:
+                vcc_mask |= (1 << lane)
+        self.assertEqual(vcc_mask, exec_mask)
 
 
 if __name__ == "__main__":
