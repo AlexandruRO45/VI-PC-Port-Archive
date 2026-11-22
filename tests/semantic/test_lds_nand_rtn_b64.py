@@ -1440,5 +1440,348 @@ class TestIEEE754BoundaryExtremesAndBitwiseLimits(unittest.TestCase):
             self.assertEqual(mem, (~val) & MASK_64)
 
 
+# ==============================================================================
+# Phase 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+def parse_ds_nand_b64_assembly(asm_str: str) -> DSNand64Instruction:
+    """Parse AMD assembly string into a DSNand64Instruction AST node.
+    
+    Accepts formats:
+        ds_nand_rtn_b64 v[dst:dst+1], vaddr, v[data:data+1] [offset:N]
+        ds_nand_b64 vaddr, v[data:data+1] [offset:N]
+    """
+    text = asm_str.strip()
+    if not text:
+        raise ValueError("Empty assembly string")
+
+    parts = text.replace(",", " ").split()
+    if not parts:
+        raise ValueError("Empty assembly string")
+
+    op_str = parts[0].lower()
+    if op_str == "ds_nand_rtn_b64":
+        opcode = DSOpcode64.DS_NAND_RTN_B64
+    elif op_str == "ds_nand_b64":
+        opcode = DSOpcode64.DS_NAND_B64
+    else:
+        raise ValueError(f"Unknown opcode '{op_str}', expected ds_nand_rtn_b64 or ds_nand_b64")
+
+    offset = 0
+    clean_parts: List[str] = [parts[0]]
+    for token in parts[1:]:
+        if token.lower().startswith("offset:"):
+            try:
+                offset_val = int(token.split(":", 1)[1], 0)
+            except ValueError as exc:
+                raise ValueError(f"Invalid offset format: {token}") from exc
+            if not (0 <= offset_val <= 65535):
+                raise ValueError(f"Offset {offset_val} out of 16-bit range [0, 65535]")
+            offset = offset_val
+        else:
+            clean_parts.append(token)
+
+    def parse_reg_pair(token: str, expected_type: str) -> Union[VGPRPair, SGPRPair]:
+        t = token.lower()
+        if t.startswith("v[") and t.endswith("]") and ":" in t:
+            inner = t[2:-1]
+            base_str, hi_str = inner.split(":", 1)
+            prefix = "v"
+        elif t.startswith("s[") and t.endswith("]") and ":" in t:
+            inner = t[2:-1]
+            base_str, hi_str = inner.split(":", 1)
+            prefix = "s"
+        else:
+            raise ValueError(f"Invalid 64-bit register pair syntax: '{token}', expected v[N:N+1] or s[N:N+1]")
+
+        if prefix != expected_type:
+            raise TypeError(f"Expected register type '{expected_type}', got '{prefix}' in '{token}'")
+        base_idx = int(base_str)
+        hi_idx = int(hi_str)
+        if hi_idx != base_idx + 1:
+            raise ValueError(f"Register pair must be consecutive, got {base_idx}:{hi_idx}")
+        return VGPRPair(base_idx) if prefix == "v" else SGPRPair(base_idx)
+
+    def parse_vgpr(token: str) -> VGPR:
+        t = token.lower()
+        if t.startswith("v[") and t.endswith("]"):
+            idx = int(t[2:-1])
+        elif t.startswith("v") and t[1:].isdigit():
+            idx = int(t[1:])
+        else:
+            raise ValueError(f"Invalid VGPR syntax: '{token}'")
+        return VGPR(idx)
+
+    def parse_operand64(token: str) -> Operand64:
+        t = token.lower()
+        if t.startswith("v"):
+            return parse_reg_pair(token, "v")
+        if t.startswith("s"):
+            return parse_reg_pair(token, "s")
+        val = int(token, 0)
+        return Immediate64(val)
+
+    if opcode.is_return:
+        if len(clean_parts) != 4:
+            raise ValueError(f"ds_nand_rtn_b64 expects 3 operands (vdst, vaddr, vdata), got {len(clean_parts) - 1}")
+        dst_pair = parse_reg_pair(clean_parts[1], "v")
+        assert isinstance(dst_pair, VGPRPair)
+        addr_reg = parse_vgpr(clean_parts[2])
+        data_op = parse_operand64(clean_parts[3])
+        return DSNand64Instruction(opcode=opcode, dst=dst_pair, addr=addr_reg, data=data_op, offset=offset)
+    else:
+        if len(clean_parts) != 3:
+            raise ValueError(f"ds_nand_b64 expects 2 operands (vaddr, vdata), got {len(clean_parts) - 1}")
+        addr_reg = parse_vgpr(clean_parts[1])
+        data_op = parse_operand64(clean_parts[2])
+        return DSNand64Instruction(opcode=opcode, dst=None, addr=addr_reg, data=data_op, offset=offset)
+
+
+class TestNegativeControlsAndMutationDetection(unittest.TestCase):
+    """Phase 8: Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_assembly_parser_valid_syntaxes(self) -> None:
+        inst1 = parse_ds_nand_b64_assembly("ds_nand_rtn_b64 v[0:1], v2, v[4:5]")
+        self.assertEqual(inst1.opcode, DSOpcode64.DS_NAND_RTN_B64)
+        self.assertEqual(inst1.dst, VGPRPair(0))
+        self.assertEqual(inst1.addr, VGPR(2))
+        self.assertEqual(inst1.data, VGPRPair(4))
+        self.assertEqual(inst1.offset, 0)
+
+        inst2 = parse_ds_nand_b64_assembly("ds_nand_rtn_b64 v[6:7], v5, s[10:11] offset:32")
+        self.assertEqual(inst2.dst, VGPRPair(6))
+        self.assertEqual(inst2.addr, VGPR(5))
+        self.assertEqual(inst2.data, SGPRPair(10))
+        self.assertEqual(inst2.offset, 32)
+
+        inst3 = parse_ds_nand_b64_assembly("ds_nand_b64 v3, 0x1234 offset:0x10")
+        self.assertEqual(inst3.opcode, DSOpcode64.DS_NAND_B64)
+        self.assertIsNone(inst3.dst)
+        self.assertEqual(inst3.addr, VGPR(3))
+        self.assertEqual(inst3.data, Immediate64(0x1234))
+        self.assertEqual(inst3.offset, 16)
+
+    def test_syntax_rejection_invalid_instructions(self) -> None:
+        invalid_cases = [
+            "",
+            "   ",
+            "v_add_f32 v0, v1, v2",
+            "ds_nand_rtn_b64",
+            "ds_nand_rtn_b64 v[0:1], v2",
+            "ds_nand_b64 v2, v[4:5], v[6:7]",
+            "ds_nand_rtn_b64 v0, v2, v[4:5]",            # Single VGPR instead of pair for dst
+            "ds_nand_rtn_b64 s[0:1], v2, v[4:5]",        # SGPRPair as destination
+            "ds_nand_rtn_b64 v[0:1], s2, v[4:5]",        # SGPR as address
+            "ds_nand_rtn_b64 v[0:2], v2, v[4:5]",        # Non-consecutive pair
+            "ds_nand_rtn_b64 v[255:256], v2, v[4:5]",    # Out of bounds register pair
+            "ds_nand_rtn_b64 v[0:1], v2, v[4:5] offset:65536",
+            "ds_nand_rtn_b64 v[0:1], v2, v[4:5] offset:-1",
+            "ds_nand_rtn_b64 v[0:1], v2, v[4:5] offset:bad",
+        ]
+        for case in invalid_cases:
+            with self.subTest(case=case):
+                with self.assertRaises((ValueError, TypeError)):
+                    parse_ds_nand_b64_assembly(case)
+
+    def test_architectural_model_negative_controls(self) -> None:
+        with self.assertRaises(ValueError):
+            LDSModel(capacity_qwords=0)
+        with self.assertRaises(ValueError):
+            LDSModel(capacity_qwords=1000)
+        with self.assertRaises(ValueError):
+            LDSModel(capacity_qwords=-16)
+
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+        state32 = SIMDState(num_lanes=32)
+        with self.assertRaises(IndexError):
+            state32.is_lane_active(32)
+        with self.assertRaises(IndexError):
+            state32.is_lane_active(-1)
+
+    def test_mutation_detection_and_instead_of_nand(self) -> None:
+        """Mutant: bitwise AND instead of bitwise NAND."""
+        def mutant_and(a: int, b: int) -> int:
+            return a & b
+
+        val_a = 0x0000_0000_FFFF_0000
+        val_b = 0x0000_0000_00FF_FF00
+        ref_old, ref_new = oracle_ds_nand_b64(val_a, val_b)
+        mutant_res = mutant_and(val_a, val_b)
+        self.assertEqual(ref_new, (~0x0000_0000_00FF_0000) & MASK_64)
+        self.assertEqual(mutant_res, 0x0000_0000_00FF_0000)
+        self.assertNotEqual(ref_new, mutant_res)
+
+    def test_mutation_detection_or_instead_of_nand(self) -> None:
+        """Mutant: bitwise OR instead of bitwise NAND."""
+        def mutant_or(a: int, b: int) -> int:
+            return a | b
+
+        val_a = MASK_64
+        val_b = MASK_64
+        ref_old, ref_new = oracle_ds_nand_b64(val_a, val_b)
+        mutant_res = mutant_or(val_a, val_b)
+        self.assertEqual(ref_new, 0)
+        self.assertEqual(mutant_res, MASK_64)
+        self.assertNotEqual(ref_new, mutant_res)
+
+    def test_mutation_detection_non_returning_destination(self) -> None:
+        """Mutant: failing to return pre-operation value to destination VGPR pair."""
+        class NonReturningMutant(ScalarInterpreter):
+            def step(self, instr: DSNand64Instruction, state: ScalarMachineState) -> Tuple[Optional[int], int]:
+                old_val, next_mem = super().step(instr, state)
+                if instr.opcode.is_return:
+                    assert instr.dst is not None
+                    state.set_vgpr_pair(instr.dst.base_index, next_mem)
+                return old_val, next_mem
+
+        state = ScalarMachineState()
+        addr = 0x100
+        state.set_vgpr(1, addr)
+        state.set_vgpr_pair(4, 0x02)
+        state.lds.write_qword(addr, 0x01)
+
+        instr = DSNand64Instruction(
+            opcode=DSOpcode64.DS_NAND_RTN_B64,
+            dst=VGPRPair(2),
+            addr=VGPR(1),
+            data=VGPRPair(4),
+        )
+        mutant = NonReturningMutant()
+        mutant.step(instr, state)
+        self.assertNotEqual(state.get_vgpr_pair(2), 0x01)
+        self.assertEqual(state.get_vgpr_pair(2), MASK_64)
+
+    def test_mutation_detection_premature_writeback_aliasing(self) -> None:
+        """Mutant: Destination register written before address is latched."""
+        class PrematureWritebackInterpreter(ScalarInterpreter):
+            def step(self, instr: DSNand64Instruction, state: ScalarMachineState) -> Tuple[Optional[int], int]:
+                if instr.opcode.is_return:
+                    assert instr.dst is not None
+                    state.set_vgpr_pair(instr.dst.base_index, 0xBAD0)
+                vaddr = state.get_vgpr(instr.addr.index)
+                eff_addr = calc_lds_effective_address(vaddr, instr.offset)
+                curr_mem = state.lds.read_qword(eff_addr)
+                data_val = self.resolve_operand(instr.data, state)
+                old_val, next_mem = oracle_ds_nand_b64(curr_mem, data_val)
+                state.lds.write_qword(eff_addr, next_mem)
+                return old_val, next_mem
+
+        state = ScalarMachineState()
+        addr = 0x200
+        state.set_vgpr(0, addr)
+        state.set_vgpr(1, 0)
+        state.set_vgpr_pair(2, 0)
+        state.lds.write_qword(addr, 0xAA)
+
+        instr = DSNand64Instruction(
+            opcode=DSOpcode64.DS_NAND_RTN_B64,
+            dst=VGPRPair(0),
+            addr=VGPR(0),
+            data=VGPRPair(2),
+        )
+        mutant = PrematureWritebackInterpreter()
+        old, mem = mutant.step(instr, state)
+        self.assertNotEqual(state.lds.read_qword(addr), MASK_64)
+        self.assertEqual(state.lds.read_qword(0xBAD0), MASK_64)
+
+    def test_mutation_detection_inverted_lane_collision_order(self) -> None:
+        """Mutant: SIMD collision serialized in reverse order (lane N to lane 0)."""
+        class ReverseSIMDInterpreter(SIMDInterpreter):
+            def step(self, instr: DSNand64Instruction, state: SIMDState) -> List[Tuple[int, Optional[int], int]]:
+                results = []
+                for lane in reversed(range(state.num_lanes)):
+                    if not state.is_lane_active(lane):
+                        continue
+                    vaddr = state.get_vgpr(lane, instr.addr.index)
+                    data_val = self.resolve_lane_operand(instr.data, lane, state)
+                    eff_addr = calc_lds_effective_address(vaddr, instr.offset)
+                    curr_mem = state.lds.read_qword(eff_addr)
+                    old_val, next_mem = oracle_ds_nand_b64(curr_mem, data_val)
+                    state.lds.write_qword(eff_addr, next_mem)
+                    if instr.opcode.is_return:
+                        assert instr.dst is not None
+                        state.set_vgpr_pair(lane, instr.dst.base_index, old_val)
+                    results.append((lane, old_val, next_mem))
+                return results
+
+        state = SIMDState(num_lanes=32, exec_mask=0x3)  # Lanes 0 and 1 active
+        common_addr = 0x300
+        state.lds.write_qword(common_addr, MASK_64)
+
+        state.set_vgpr(0, 1, common_addr)
+        state.set_vgpr_pair(0, 4, 0x0000_00FF_0000_0000)
+        state.set_vgpr(1, 1, common_addr)
+        state.set_vgpr_pair(1, 4, 0x0000_FF00_0000_0000)
+
+        instr = DSNand64Instruction(
+            opcode=DSOpcode64.DS_NAND_RTN_B64,
+            dst=VGPRPair(2),
+            addr=VGPR(1),
+            data=VGPRPair(4),
+        )
+        mutant = ReverseSIMDInterpreter()
+        mutant.step(instr, state)
+
+        # In reverse order, Lane 0 executed second and saw Lane 1's intermediate memory!
+        self.assertNotEqual(state.get_vgpr_pair(0, 2), MASK_64)
+        self.assertEqual(state.get_vgpr_pair(0, 2), (~0x0000_FF00_0000_0000) & MASK_64)
+
+    def test_mutation_detection_ignore_exec_mask(self) -> None:
+        """Mutant: Inactive lanes execute and corrupt registers/memory."""
+        class InactiveExecMutant(SIMDInterpreter):
+            def step(self, instr: DSNand64Instruction, state: SIMDState) -> List[Tuple[int, Optional[int], int]]:
+                orig_mask = state.exec_mask
+                state.exec_mask = 0xFFFF_FFFF
+                try:
+                    return super().step(instr, state)
+                finally:
+                    state.exec_mask = orig_mask
+
+        state = SIMDState(num_lanes=32, exec_mask=0x1)  # Only lane 0 active
+        sentinel = 0xC001_CAFE_0000_0000
+        for lane in range(32):
+            state.set_vgpr_pair(lane, 2, sentinel)
+            state.set_vgpr(lane, 1, 0x400 + lane * 8)
+            state.set_vgpr_pair(lane, 4, 0xFF)
+
+        instr = DSNand64Instruction(
+            opcode=DSOpcode64.DS_NAND_RTN_B64,
+            dst=VGPRPair(2),
+            addr=VGPR(1),
+            data=VGPRPair(4),
+        )
+        mutant = InactiveExecMutant()
+        mutant.step(instr, state)
+
+        self.assertNotEqual(state.get_vgpr_pair(5, 2), sentinel)
+
+    def test_mutation_detection_dropped_immediate_offset(self) -> None:
+        def mutant_calc_addr(vaddr: int, offset: int = 0) -> int:
+            return vaddr & MASK_32
+
+        base = 0x200
+        off = 0x10
+        correct = calc_lds_effective_address(base, off)
+        buggy = mutant_calc_addr(base, off)
+        self.assertEqual(correct, 0x210)
+        self.assertEqual(buggy, 0x200)
+        self.assertNotEqual(correct, buggy)
+
+    def test_mutation_detection_wrong_alignment_shift(self) -> None:
+        # For 64-bit qword, shift must be >> 3 (8 bytes), not >> 2 (4 bytes dword)
+        def mutant_qword_idx(eff_addr: int, capacity: int = 8192) -> int:
+            return (eff_addr >> 2) & (capacity - 1)
+
+        addr = 0x100
+        correct = calc_lds_qword_index(addr)
+        buggy = mutant_qword_idx(addr)
+        self.assertEqual(correct, 0x20)
+        self.assertEqual(buggy, 0x40)
+        self.assertNotEqual(correct, buggy)
+
+
 if __name__ == "__main__":
     unittest.main()
