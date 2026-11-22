@@ -7,6 +7,7 @@ label/offset (for branches), hw register, and raw text for anything else.
 As a module: parse_file(path) -> {"name", "code_start", "insns": [...], "invalid": [pc...]}
 As a tool:  python -I shader_ir.py <disasm dir> [--limit N]   (parses everything and reports coverage)
 """
+import argparse
 import os
 import re
 import sys
@@ -66,7 +67,9 @@ def operand(tok):
     if core in SPECIAL:
         return {"k": "special", "t": core, "neg": neg, "abs": absm}
     if re.fullmatch(r"-?(0x[0-9a-fA-F]+|\d+)", core):
-        v = int(core, 0)
+        # int(core, 0) rejects the leading-zero decimals this regex accepts ('010', '08', '0001'),
+        # which aborts a whole parse_file() run on one disassembly line.
+        v = int(core, 16) if core.lower().startswith("0x") else int(core, 10)
         return {"k": "imm", "v": -v if neg else v}
     if re.fullmatch(r"-?\d+\.\d+(e[+-]?\d+)?", core):
         return {"k": "fimm", "v": float(core) * (-1 if neg else 1), "abs": absm}
@@ -135,10 +138,11 @@ def parse_file(path):
     m = HDR.match(lines[0]) if lines else None
     pc = int(m.group(2), 16) if m else 0
     info["code_start"] = pc
-    for ln in lines[1:]:
+    start = 1 if (lines and not lines[0].startswith("\t")) else 0
+    for ln in lines[start:]:
         if ln.startswith("; ---"):
             break
-        if not ln.startswith("\t"):
+        if not ln.startswith("\t") or ln.lstrip().startswith("."):
             continue
         ins = parse_line(ln)
         if not ins:
@@ -152,13 +156,27 @@ def parse_file(path):
     return info
 
 
-def main():
-    src = sys.argv[1]
-    limit = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[2] == "--limit" else None
-    files = sorted(f for f in os.listdir(src) if f.endswith(".s"))[:limit]
+def positive_int(text):
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Parse a folder of .s disassembly and report operand coverage.")
+    ap.add_argument("src", help="folder of .s files written by shader_disasm.py")
+    ap.add_argument("--limit", type=positive_int, help="parse only the first N files, sorted by name")
+    a = ap.parse_args(argv)
+    if not os.path.isdir(a.src):
+        ap.error(f"{a.src} is not a folder")
+    files = sorted(f for f in os.listdir(a.src) if f.endswith(".s"))[:a.limit]
     kinds, raw, n_ins, no_enc = Counter(), Counter(), 0, 0
     for f in files:
-        info = parse_file(os.path.join(src, f))
+        info = parse_file(os.path.join(a.src, f))
         for ins in info["insns"]:
             n_ins += 1
             no_enc += ins["enc"] is None

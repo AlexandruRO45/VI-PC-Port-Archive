@@ -3,16 +3,18 @@
     python3 -I runtime/test/shaders/build.py <out dir> [name ...]
 
 Each .asm is RDNA2 assembly. It is assembled with llvm-mc (LLVM 21+ with the AMDGPU target; set LLVM_MC to its
-path, as for the shaders stage). Listings, synthetic FSSM headers and DXBC containers are staged in a temporary
-directory. After validation, the build writes <out>/spirv/<name>.spv and the translator metadata.
+path or to a whole command, as for the shaders stage). Listings, synthetic FSSM headers and DXBC containers are
+staged in a temporary directory. After validation, the build writes <out>/spirv/<name>.spv and the translator
+metadata.
 
-Compute shaders get the header the tests were written for: RSRC2 0x8088 (4 user SGPRs holding the V#, the
-workgroup id in s4, 512 bytes of LDS) and a 64x1x1 group. The stage comes from the name's prefix. Mesh and
-geometry shaders (ms_, gs_) also need a DXBC container with their signatures, which this doesn't make.
+Compute shaders can override the default header with leading "; group: X,Y,Z" and "; rsrc2: 0x..." comments.
+The stage comes from the name's prefix. Mesh and geometry shaders (ms_, gs_) also need a DXBC container with
+their signatures, which this doesn't make.
 The comment at the top of each .asm says which test program to run on the result and what it should print.
 """
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -20,9 +22,43 @@ import tempfile
 from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TRANSLATOR = os.path.join(HERE, "..", "..", "..", "tools", "rdna2spirv.py")
-LLVM_MC = os.environ.get("LLVM_MC", "llvm-mc")
+TOOLS = os.path.join(HERE, "..", "..", "..", "tools")
+TRANSLATOR = os.path.join(TOOLS, "rdna2spirv.py")
+sys.path.insert(0, TOOLS)
+import mc_command  # noqa: E402
+
+MC = mc_command.mc_command()
 RSRC2, GROUP = 0x8088, (64, 1, 1)
+sys.path.insert(0, HERE)  # this script is also run with python -I
+from compute_fixture import compute_header  # noqa: E402
+
+
+def asm_mattr(path):
+    for ln in Path(path).read_text(encoding="utf-8").splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if not s.startswith(";"):
+            break
+        m = re.match(r";\s*mattr:\s*(\S+)", s)
+        if m:
+            return m.group(1)
+    return None
+
+
+CLIP_CASES = {"vs_clip": 1, "vs_clip_param4": 4, "vs_clip_undeclared": 1}
+
+
+def shader_source(name):
+    return "vs_clip" if name in CLIP_CASES else name
+
+
+def clip_container():
+    # One OSG1 element: stream 0, SV_ClipDistance0.xy, float, logical register 2.
+    name = b"SV_ClipDistance\0"
+    payload = struct.pack("<8I2B6x", 1, 8, 0, 40, 0, 2, 3, 2, 3, 0) + name
+    return (b"DXBC" + bytes(16) + struct.pack("<4I", 1, 44 + len(payload), 1, 36)
+            + b"OSG1" + struct.pack("<I", len(payload)) + payload)
 
 
 def translate_tests(work, names):
@@ -30,25 +66,39 @@ def translate_tests(work, names):
     disasm.mkdir()
     fssm.mkdir()
     for n in names:
-        r = subprocess.run([LLVM_MC, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding",
-                            os.path.join(HERE, n + ".asm")], capture_output=True, text=True)
+        asm_path = os.path.join(HERE, shader_source(n) + ".asm")
+        raw = Path(asm_path).read_text(encoding="utf-8")
+        mattr = asm_mattr(asm_path)
+        cmd = MC + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
+        if n in CLIP_CASES:
+            cmd.append(f"-defsym=PARAM_SLOT={CLIP_CASES[n]}")
+        if mattr:
+            cmd.append(f"-mattr={mattr}")
+        cmd.append("-show-encoding")
+        # Feed the text on stdin: an LLVM_MC command that runs in WSL cannot open a Windows path argument.
+        r = subprocess.run(cmd, input=raw, capture_output=True, text=True)
         if r.returncode or "error:" in r.stderr:
             sys.exit(f"{n}.asm did not assemble:\n{r.stderr}")
-        (disasm / (n + ".s")).write_text(f"; {n}  hand-written test\n{r.stdout}", encoding="utf-8")
+        # rdna2spirv.py rejects assembler directives such as the "\t.text" llvm-mc prints first.
+        code = "".join(ln for ln in r.stdout.splitlines(keepends=True) if not ln.lstrip().startswith("."))
+        (disasm / (n + ".s")).write_text(f"; {n}  hand-written test\n{code}", encoding="utf-8")
         if n.startswith("cs_"):
-            header = bytearray(0x148)
-            struct.pack_into("<4I", header, 0x138, RSRC2, *GROUP)
-            (fssm / (n + ".fssm")).write_bytes(header)
+            (fssm / (n + ".fssm")).write_bytes(compute_header(asm_path))
+        elif n in CLIP_CASES and n != "vs_clip_undeclared":
+            (work / (n + ".dxbc")).write_bytes(clip_container())
         else:
             (work / (n + ".dxbc")).write_bytes(bytes(32))  # chunk count 0
-    return subprocess.run([sys.executable, "-I", TRANSLATOR, disasm, "--out", spirv]).returncode
+    cmd = [sys.executable, "-I", TRANSLATOR, disasm, "--out", spirv]
+    if os.environ.get("LEONIDA_W64_EMULATE") == "1":   # wave64 on 32-wide subgroups (compute shaders only)
+        cmd.append("--wave64-emulate")
+    return subprocess.run(cmd).returncode
 
 
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     out = Path(sys.argv[1])
-    available = sorted(p.stem for p in Path(HERE).glob("*.asm"))
+    available = sorted({p.stem for p in Path(HERE).glob("*.asm")} | CLIP_CASES.keys())
     names = sys.argv[2:] or available
     unknown = sorted(set(names) - set(available))
     if unknown:
@@ -82,6 +132,9 @@ def main():
                 artifact = built / (n + suffix)
                 artifact.replace(spirv / artifact.name)
         index.replace(published_index)
+        sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "tools"))
+        import spirv_stubs
+        spirv_stubs.generate_for_index(str(spirv), combined)
     return 0
 
 

@@ -11,6 +11,7 @@ Usage:
 
 Writes <out_dir>/<name>.dxbc and <out_dir>/index.json (name, offset, stage, shader model, parts).
 """
+import argparse
 import json
 import mmap
 import os
@@ -21,29 +22,69 @@ import zlib
 
 ENTRY = re.compile(rb"([\x21-\x7e]{3,200})\x00(.)(....)(....)\3(....)", re.DOTALL)
 STAGES = {0: "ps", 1: "vs", 2: "gs", 3: "hs", 4: "ds", 5: "cs", 6: "lib", 13: "ms", 14: "as"}
+RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 
 
 def parts(dxbc: bytes) -> dict:
-    n = struct.unpack_from("<I", dxbc, 28)[0]
+    if len(dxbc) < 32:
+        raise ValueError("truncated DXBC header")
+    count = struct.unpack_from("<I", dxbc, 28)[0]
+    table_end = 32 + 4 * count
+    if table_end > len(dxbc):
+        raise ValueError("truncated DXBC part table")
     out = {}
-    for k in range(n):
-        off = struct.unpack_from("<I", dxbc, 32 + 4 * k)[0]
-        out[dxbc[off:off + 4].decode("latin-1")] = (off + 8, struct.unpack_from("<I", dxbc, off + 4)[0])
+    for entry in range(32, table_end, 4):
+        off = struct.unpack_from("<I", dxbc, entry)[0]
+        if not table_end <= off <= len(dxbc) - 8:
+            raise ValueError("DXBC part header outside the part data")
+        fourcc, size = struct.unpack_from("<4sI", dxbc, off)
+        if off + 8 + size > len(dxbc):
+            raise ValueError("truncated DXBC part payload")
+        out[fourcc.decode("latin-1")] = (off + 8, size)
     return out
 
 
 def shader_model(dxbc: bytes, p: dict):
     if "DXIL" not in p:
         return None, None
-    off, _ = p["DXIL"]
+    off, size = p["DXIL"]
+    if size < 4:
+        raise ValueError("truncated DXIL version and stage")
     ver, kind = struct.unpack_from("<HH", dxbc, off)
     return STAGES.get(kind, str(kind)), f"{ver >> 4}.{ver & 0xF}"
 
 
-def main() -> int:
-    src, out = sys.argv[1], sys.argv[2]
+def file_name(name: str, seen: dict, used: set) -> str:
+    """A file name for `name` that no earlier shader has, as Windows compares them: without case, and with the
+    device names (CON, NUL, COM1...) that open a device instead of a file. Same name twice means distinct
+    variants; the second gets ~1, the third ~2."""
+    base = re.sub(r'[<>:"/\\|?*]', "_", name)
+    if base.split(".")[0].upper() in RESERVED:
+        base = "_" + base
+    key = base.lower()
+    n = seen.get(key, 0)
+    while True:
+        fname = base + (f"~{n}" if n else "") + ".dxbc"
+        if fname.lower() not in used:
+            break
+        n += 1
+    seen[key] = n + 1
+    used.add(fname.lower())
+    return fname
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="Carve DXBC shader containers out of an RPF9 archive.")
+    ap.add_argument("src", help="the shaders.rpf archive")
+    ap.add_argument("out", help="folder for the .dxbc files and index.json")
+    a = ap.parse_args(argv)
+    src, out = a.src, a.out
+    if not os.path.isfile(src):
+        ap.error(f"{src} is not a file")
+    if os.path.getsize(src) == 0:
+        ap.error(f"{src} is empty")
     os.makedirs(out, exist_ok=True)
-    index, seen, bad = [], {}, 0
+    index, seen, used, bad = [], {}, set(), 0
     with open(src, "rb") as fh:
         m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
         for mt in ENTRY.finditer(m):
@@ -61,18 +102,24 @@ def main() -> int:
             if data[:4] != b"DXBC" or len(data) != size:
                 bad += 1
                 continue
-            p = parts(data)
-            stage, sm = shader_model(data, p)
-            # Same name twice means distinct variants; keep both.
-            n = seen.get(name, 0)
-            seen[name] = n + 1
-            fname = re.sub(r'[<>:"/\\|?*]', "_", name) + (f"~{n}" if n else "") + ".dxbc"
+            try:
+                p = parts(data)
+                stage, sm = shader_model(data, p)
+            except ValueError:
+                bad += 1
+                continue
+            fname = file_name(name, seen, used)
             with open(os.path.join(out, fname), "wb") as f:
                 f.write(data)
             index.append({"name": name, "file": fname, "offset": mt.start(), "kind": mt.group(2)[0],
                           "stage": stage, "sm": sm, "size": size, "parts": {k: v[1] for k, v in p.items()}})
-    with open(os.path.join(out, "index.json"), "w", encoding="utf-8") as f:
+    # make_game.py takes index.json as proof the carve finished: write it last, under another name, then rename.
+    tmp = os.path.join(out, "index.json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(index, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, os.path.join(out, "index.json"))
     from collections import Counter
     print(f"{len(index)} shaders carved, {bad} candidates rejected")
     print("stages:", dict(Counter(e["stage"] for e in index)))

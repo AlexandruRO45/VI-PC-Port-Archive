@@ -1,14 +1,25 @@
 // Headless Vulkan compute test for translated compute shaders.
-// Usage: vk_compute_test cs.spv groups expect
+// Usage: vk_compute_test cs.spv groups expect [--require-wave64]
 //   expect = "mirror64": out[g*64 + t] == g*64 + (63 - t)   (runtime/test/shaders/cs_lds.asm)
+//            "workgroup_yz": pass 2x3x4 for groups; check the Y/Z histogram (cs_workgroup_yz.asm)
 //            "exec64", "wavemask", "bvh": see cs_exec64.asm, cs_wavemask.asm, cs_bvh.asm; anything else prints out[0..7]
+//   VKC_BENCH=N (env): dispatch N more times after the checked one and print the median / min / max wall time of one
+//   dispatch (submit to queue idle) as "bench ms: median=.. min=.. max=.. n=..". The buffer is not cleared in between.
+//   VKC_OUT_WORDS=N (env): make the output buffer at least N words (default groups * 64), so a single group can
+//   write more than one word per thread. VKC_DUMP=<file> (env): write the whole buffer to <file> after the dispatch.
+//   --require-wave64: require full 64-wide subgroups (local size X must be a multiple of 64), or exit 77.
+//   VKC_SGPRS=w4,w5,... (env): set s4, s5, ... (decimal or 0x hex, up to s31), the user SGPRs after the output V#,
+//   so a test can take input words (cs_user_sgprs.asm). They are zero otherwise. Same syntax as vk_harness's VKH_SGPRS.
 // Contract (docs/design.md): push constants = s0..s31 (128 bytes), heap base lo/hi, code base lo/hi (144 bytes).
 // The output buffer is the "heap": Xbox VA 0 maps to its device address, and s[0:3] hold a V# with base 0.
 #include "vulkan_loader.h"
 
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -24,12 +35,64 @@ static PFN_vkGetInstanceProcAddr gipa;
         }                                                                                \
     } while (0)
 
+// The same word list parser as vk_harness: decimal or 0x hex, no sign or space, and "1,2," is rejected.
+static bool parse_u32(const char*& s, uint32_t& v) {
+    const bool hex = s[0] == '0' && (s[1] == 'x' || s[1] == 'X');
+    const char* digits = hex ? s + 2 : s;
+    if (!(hex ? std::isxdigit(uint8_t(*digits)) : std::isdigit(uint8_t(*digits)))) return false;
+    char* end;
+    unsigned long long x = std::strtoull(digits, &end, hex ? 16 : 10);
+    if (x > 0xFFFFFFFFull) return false;
+    v = uint32_t(x); s = end;
+    return true;
+}
+
+static bool next_item(const char*& s) {
+    if (!*s) return true;
+    return *s++ == ',' && *s;
+}
+
+// VKC_SGPRS: s4, s5, ... in order, at most s31 (s[0:3] stay the output V#).
+static bool parse_user_sgprs(const char* s, uint32_t* pc) {
+    for (uint32_t i = 4; *s; i++) {
+        if (i == 32 || !parse_u32(s, pc[i]) || !next_item(s)) return false;
+    }
+    return true;
+}
+
 int main(int argc, char** argv) {
-    if (argc < 4) {
-        std::fprintf(stderr, "usage: vk_compute_test cs.spv groups expect\n");
+    const bool require_wave64 = argc == 5 && !std::strcmp(argv[4], "--require-wave64");
+    if (argc != 4 && !require_wave64) {
+        std::fprintf(stderr, "usage: vk_compute_test cs.spv groups expect [--require-wave64]\n");
         return 2;
     }
-    const uint32_t groups = uint32_t(atoi(argv[2]));
+    uint32_t pc[36] = {};
+    const char* sgprs_env = std::getenv("VKC_SGPRS");
+    if (sgprs_env && !parse_user_sgprs(sgprs_env, pc)) {
+        std::fprintf(stderr, "VKC_SGPRS: expected up to 28 comma-separated words for s4..s31, got \"%s\"\n", sgprs_env);
+        return 2;
+    }
+    const bool workgroup_yz = !std::strcmp(argv[3], "workgroup_yz");
+    if (workgroup_yz && std::strcmp(argv[2], "2x3x4")) {
+        std::fprintf(stderr, "workgroup_yz expects a 2x3x4 dispatch\n");
+        return 2;
+    }
+    const uint32_t groups = workgroup_yz ? 2u : uint32_t(atoi(argv[2]));
+    const uint32_t groups_y = workgroup_yz ? 3u : 1u, groups_z = workgroup_yz ? 4u : 1u;
+    const uint32_t yz_bins = (groups_y + 1) * (groups_z + 1);
+    const uint32_t origins = workgroup_yz ? groups * groups_y * groups_z : 0;
+    const char* out_words_env = std::getenv("VKC_OUT_WORDS");
+    const char* dump_path = std::getenv("VKC_DUMP");
+    uint32_t out_words = 0;
+    if (out_words_env) {
+        char* end;
+        const unsigned long n = std::strtoul(out_words_env, &end, 10);
+        if (*out_words_env < '0' || *out_words_env > '9' || *end || n == 0 || n > (1ul << 24)) {
+            std::fprintf(stderr, "VKC_OUT_WORDS: expected 1..16777216, got \"%s\"\n", out_words_env);
+            return 2;
+        }
+        out_words = uint32_t(n);
+    }
     gipa = load_vulkan();
     if (!gipa) return 1;
 #define LOADI(name) auto name = reinterpret_cast<PFN_##name>(gipa(inst, #name))
@@ -53,10 +116,16 @@ int main(int argc, char** argv) {
         VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(d, &p);
         if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU || !pd) pd = d;
     }
+    if (!pd) {
+        std::fprintf(stderr, "no Vulkan physical device found\n");
+        return 1;
+    }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+    VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    subgroup.pNext = &sgProps;
     VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
-    props2.pNext = &sgProps;
+    props2.pNext = &subgroup;
     vkGetPhysicalDeviceProperties2(pd, &props2);
     std::fprintf(stderr, "device: %s (subgroup %u..%u)\n", props.deviceName, sgProps.minSubgroupSize, sgProps.maxSubgroupSize);
     uint32_t qn = 0;
@@ -72,11 +141,21 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceFeatures2 f2q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2q.pNext = &f13q;
     vkGetPhysicalDeviceFeatures2(pd, &f2q);
+    const char* sg_env = std::getenv("VKC_SUBGROUP_SIZE");
+    const uint32_t req_sg = require_wave64 ? 64u : (sg_env ? uint32_t(std::atoi(sg_env)) : 0u);
+    const bool can_request_size = req_sg > 0 && f13q.subgroupSizeControl &&
+        req_sg >= sgProps.minSubgroupSize && req_sg <= sgProps.maxSubgroupSize &&
+        (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT);
+    if (require_wave64 && (!f13q.computeFullSubgroups || (!can_request_size && subgroup.subgroupSize != 64))) {
+        std::fprintf(stderr, "full 64-wide compute subgroups unavailable\n");
+        return 77;
+    }
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     f12.bufferDeviceAddress = VK_TRUE;
-    if (f13q.subgroupSizeControl) {
-        f13.subgroupSizeControl = VK_TRUE;
+    if (f13q.subgroupSizeControl || require_wave64) {
+        f13.subgroupSizeControl = f13q.subgroupSizeControl;
+        f13.computeFullSubgroups = require_wave64 ? VK_TRUE : VK_FALSE;
         f12.pNext = &f13;
     }
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
@@ -92,11 +171,13 @@ int main(int argc, char** argv) {
     LOADD(vkCreatePipelineLayout); LOADD(vkCreateComputePipelines); LOADD(vkCreateCommandPool);
     LOADD(vkAllocateCommandBuffers); LOADD(vkBeginCommandBuffer); LOADD(vkCmdBindPipeline);
     LOADD(vkCmdPushConstants); LOADD(vkCmdDispatch); LOADD(vkEndCommandBuffer); LOADD(vkQueueSubmit);
-    LOADD(vkQueueWaitIdle);
+    LOADD(vkQueueWaitIdle); LOADD(vkCmdPipelineBarrier); LOADD(vkCmdDispatchBase);
     VkQueue q; vkGetDeviceQueue(dev, qi, 0, &q);
 
     // Output buffer = heap. Host-visible so the result can be read back directly.
-    const VkDeviceSize bytes = VkDeviceSize(groups) * 64 * 4;
+    VkDeviceSize words = workgroup_yz ? yz_bins * (1 + origins) : VkDeviceSize(groups) * 64;
+    if (out_words > words) words = out_words;
+    const VkDeviceSize bytes = words * sizeof(uint32_t);
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = bytes;
     bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
@@ -115,7 +196,7 @@ int main(int argc, char** argv) {
     VkDeviceMemory mem; CHECK(vkAllocateMemory(dev, &mai, nullptr, &mem));
     CHECK(vkBindBufferMemory(dev, buf, mem, 0));
     void* map; CHECK(vkMapMemory(dev, mem, 0, bytes, 0, &map));
-    std::memset(map, !std::strcmp(argv[3], "exec64") ? 0 : 0xEE, size_t(bytes));
+    std::memset(map, workgroup_yz || !std::strcmp(argv[3], "exec64") ? 0 : 0xEE, size_t(bytes));
     if (!std::strcmp(argv[3], "bvh")) {
         // AMD-format BVH in the heap (runtime/test/shaders/cs_bvh.asm): box32 root at 0x100 whose children are a
         // triangle at z=10 (node 0x40, addr 0x200), a triangle at z=5 (node 0x48, addr 0x240), a box the ray
@@ -142,21 +223,20 @@ int main(int argc, char** argv) {
     pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pcr;
     VkPipelineLayout pl; CHECK(vkCreatePipelineLayout(dev, &pli, nullptr, &pl));
     VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    if (workgroup_yz) cpi.flags |= VK_PIPELINE_CREATE_DISPATCH_BASE_BIT;
     cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
     cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; cpi.stage.module = sm; cpi.stage.pName = "main";
-    const char* sg_env = std::getenv("VKC_SUBGROUP_SIZE");
-    const uint32_t req_sg = sg_env ? uint32_t(std::atoi(sg_env)) : 0;
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo reqSg{
         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
     reqSg.requiredSubgroupSize = req_sg;
-    if (req_sg > 0 && f13q.subgroupSizeControl &&
-        req_sg >= sgProps.minSubgroupSize && req_sg <= sgProps.maxSubgroupSize &&
-        (sgProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT))
+    if (can_request_size)
         cpi.stage.pNext = &reqSg;
+    if (require_wave64)
+        cpi.stage.flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
     cpi.layout = pl;
     VkPipeline pipe; CHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipe));
+    if (require_wave64) std::printf("compute subgroup size: 64\n");
 
-    uint32_t pc[36] = {};
     pc[0] = 0; pc[1] = 0; pc[2] = 0xFFFFFFFFu; pc[3] = 0;     // V#: base 0, stride 0, num_records max
     pc[32] = uint32_t(heap); pc[33] = uint32_t(heap >> 32);    // heap base
     VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -169,15 +249,85 @@ int main(int argc, char** argv) {
     CHECK(vkBeginCommandBuffer(cmd, &cbi));
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 144, pc);
-    vkCmdDispatch(cmd, groups, 1, 1);
+    vkCmdDispatch(cmd, groups, groups_y, groups_z);
+    // A permutation within one axis can leave the full-grid histogram unchanged. Dispatch one group at
+    // each known origin into its own histogram, selected by the host independently of the shader's SGPRs.
+    for (uint32_t g = 0; g < origins; ++g) {
+        const uint64_t base = heap + (g + 1) * yz_bins * sizeof(uint32_t);
+        const uint32_t address[] = {uint32_t(base), uint32_t(base >> 32)};
+        vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_COMPUTE_BIT, 32 * sizeof(uint32_t), sizeof(address), address);
+        vkCmdDispatchBase(cmd, g % groups, (g / groups) % groups_y, g / (groups * groups_y), 1, 1, 1);
+    }
+    VkMemoryBarrier readback{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    readback.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    readback.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                         1, &readback, 0, nullptr, 0, nullptr);
     CHECK(vkEndCommandBuffer(cmd));
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     CHECK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE));
     CHECK(vkQueueWaitIdle(q));
+    if (const char* b = std::getenv("VKC_BENCH")) {
+        std::vector<double> ms;
+        for (int i = 0, n = std::atoi(b); i < n; i++) {
+            auto t0 = std::chrono::steady_clock::now();
+            CHECK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE));
+            CHECK(vkQueueWaitIdle(q));
+            ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        }
+        if (!ms.empty()) {
+            std::sort(ms.begin(), ms.end());
+            std::printf("bench ms: median=%.3f min=%.3f max=%.3f n=%zu\n", ms[ms.size() / 2], ms.front(), ms.back(), ms.size());
+        }
+        uint32_t h = 2166136261u;   // FNV-1a of the whole output buffer, to compare configurations
+        for (VkDeviceSize i = 0; i < bytes; i++) h = (h ^ static_cast<const unsigned char*>(map)[i]) * 16777619u;
+        std::printf("bench out fnv1a: %08x\n", h);
+    }
+
+    if (dump_path) {
+        std::ofstream dump(dump_path, std::ios::binary);
+        dump.write(static_cast<const char*>(map), std::streamsize(bytes));
+        dump.close();
+        if (dump.fail()) {
+            std::fprintf(stderr, "VKC_DUMP: could not write %s\n", dump_path);
+            return 1;
+        }
+    }
 
     const uint32_t* out = static_cast<const uint32_t*>(map);
     uint32_t bad = 0, first_bad = ~0u;
+    if (workgroup_yz) {
+        // X is disabled in RSRC2. Both X groups must contribute to each valid (Y,Z) bin.
+        // The last column and row catch out-of-range register values without indexing past the buffer.
+        for (uint32_t z = 0; z <= groups_z; ++z) {
+            for (uint32_t y = 0; y <= groups_y; ++y) {
+                const uint32_t want = y < groups_y && z < groups_z ? groups : 0;
+                const uint32_t got = out[z * (groups_y + 1) + y];
+                if (got != want) {
+                    std::fprintf(stderr, "(Y=%u, Z=%u): got %u, expected %u\n", y, z, got, want);
+                    ++bad;
+                }
+            }
+        }
+        std::printf("2x3x4 workgroup Y/Z: %u mismatches\n", bad);
+        uint32_t wrong_origins = 0;
+        for (uint32_t g = 0; g < origins; ++g) {
+            const uint32_t y = (g / groups) % groups_y, z = g / (groups * groups_y);
+            const uint32_t* histogram = out + (g + 1) * yz_bins;
+            for (uint32_t bin = 0; bin < yz_bins; ++bin) {
+                const uint32_t want = bin == z * (groups_y + 1) + y ? 1u : 0u;
+                if (histogram[bin] != want) {
+                    std::fprintf(stderr, "origin (%u,%u,%u), bin %u: got %u, expected %u\n",
+                                 g % groups, y, z, bin, histogram[bin], want);
+                    ++wrong_origins;
+                    break;
+                }
+            }
+        }
+        std::printf("single-group origins: %u/%u matched\n", origins - wrong_origins, origins);
+        return bad || wrong_origins ? 1 : 0;
+    }
     if (!std::strcmp(argv[3], "mirror64")) {
         for (uint32_t g = 0; g < groups; g++)
             for (uint32_t t = 0; t < 64; t++) {

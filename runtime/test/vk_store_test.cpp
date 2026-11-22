@@ -55,7 +55,7 @@ int main(int argc, char** argv) {
     CHECK(vkCreateInstance(&ici, nullptr, &inst));
     LOADI(vkEnumeratePhysicalDevices); LOADI(vkGetPhysicalDeviceProperties); LOADI(vkCreateDevice);
     LOADI(vkGetPhysicalDeviceQueueFamilyProperties); LOADI(vkGetDeviceProcAddr);
-    LOADI(vkGetPhysicalDeviceMemoryProperties);
+    LOADI(vkGetPhysicalDeviceMemoryProperties); LOADI(vkGetPhysicalDeviceFeatures);
     uint32_t n = 0;
     vkEnumeratePhysicalDevices(inst, &n, nullptr);
     std::vector<VkPhysicalDevice> pds(n);
@@ -76,15 +76,31 @@ int main(int argc, char** argv) {
     float prio = 1;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = qi; qci.queueCount = 1; qci.pQueuePriorities = &prio;
+    // The typed stores/loads need format-less storage image access. Some GPUs (e.g. Intel Gen9) lack the read side:
+    // report that and exit 77 (unsupported, as vk_compute_test does) instead of failing vkCreateDevice.
+    VkPhysicalDeviceFeatures have{};
+    vkGetPhysicalDeviceFeatures(pd, &have);
+    if (!have.shaderStorageImageWriteWithoutFormat || !have.shaderInt64) {   // every mode; reads: load mode, below
+        std::printf("unsupported: shaderStorageImageWriteWithoutFormat=%u shaderInt64=%u\n",
+                    have.shaderStorageImageWriteWithoutFormat, have.shaderInt64);
+        return 77;
+    }
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     f12.runtimeDescriptorArray = VK_TRUE; f12.bufferDeviceAddress = VK_TRUE;
     f12.shaderStorageImageArrayNonUniformIndexing = VK_TRUE;
     f12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
-    f2.features.shaderStorageImageReadWithoutFormat = VK_TRUE;
     // "load" mode (cs_imgload.asm): the sint image receives the uint texel read back with image_load.
     const bool load_mode = argc > 2 && !std::strcmp(argv[2], "load");
+    if (load_mode) {
+        // Only image_load needs it, and some GPUs (Intel Gen9) lack it: report that instead of a failed vkCreateDevice.
+        if (!have.shaderStorageImageReadWithoutFormat) {
+            std::printf("unsupported: shaderStorageImageReadWithoutFormat\n");
+            return 77;
+        }
+        f2.features.shaderStorageImageReadWithoutFormat = VK_TRUE;
+    }
     f2.features.shaderInt64 = VK_TRUE;
     f2.pNext = &f12;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};

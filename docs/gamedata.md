@@ -1,0 +1,443 @@
+# Game data in `common.rpf`
+
+This note measures the `common.rpf` archive from the Xbox Series 1.0.2.1 package. It records aggregate
+counts, sizes and schema/root names only. No archive, carved file, XML value, entry name or per-file path is
+committed. Everything below comes from a local copy and can be reproduced on any copy of the same version.
+
+`common.rpf` is 6,642,192 bytes. Its RPF9 header is `RPF9` (`9FPR` little-endian) and the data area starts at
+byte 38,272 (`0x9580`). The table of contents is encrypted/opaque; nothing here decrypts it or looks for keys.
+The measurements cover the data area only.
+
+## How to carve it
+
+Use the carver with the short-final-slice fix (advance by the bytes actually read, not by the 1 MiB request):
+
+```powershell
+python -I tools/rpf9_carve.py common.rpf <work>\carve\common
+```
+
+Its `index.json` has `off`, `stored`, `size`, `pre` and `head` per stream. The `.bin` files are named by
+offset and are **zlib streams, not files**. RPF9 splits a large file into 64 KiB inflated blocks, each with
+its own zlib stream. A logical XML document is the concatenation of consecutive streams until its root element
+closes; 178 of the 257 header-bearing documents are one stream, and the largest document spans 218.
+
+`tools/gamedata_index.py` groups those blocks into payloads and writes an offset/size/type/root index:
+
+```powershell
+python -I tools/gamedata_index.py <work>\carve\common --csv common.csv --json common.json
+```
+
+The CSV/JSON contain offsets, sizes, the coarse type and the XML root element. They contain no element values
+or entry names, but they are still local work products and must not be committed or attached to an issue.
+
+### Coverage
+
+| Measure | Value | Share of data span |
+|---|---:|---:|
+| Data span (file size minus header) | 6,603,920 B | 100.0% |
+| zlib streams | 954 | - |
+| Stored stream bytes | 5,647,255 B | 85.5% |
+| Inflated bytes | 50,231,123 B | 8.9x the stored bytes |
+| Zero padding | 386,138 B | 5.8% |
+| Unread bytes | 570,527 B | 8.6% |
+
+The earlier 781-stream / 39.5 MB / 87.3% figure came from the carver that advanced by the 1 MiB read request.
+It counted skipped regions as part of the preceding stream, so its stored-byte total was too high and its
+inflated total was too low. The fixed carver finds 173 more streams and 10.7 MB more data; its stored total is
+lower because it measures each zlib stream's real end. Treat the old figures as superseded.
+
+The 8.6% unread region is the non-zero gaps between streams: high-entropy bytes that do not decode as complete
+zlib streams. Some contain a zlib header but fail the Adler check or are truncated. This is why 9 XML documents
+survive only from their closing half and one 64 KiB XML block has no recoverable root. The carve does not guess
+their content.
+
+## Type split
+
+Stream-level split, using the requested classes. `other` is 2 `MHIU` payloads (38 streams), 1 `PAMH` and 1
+`SPS1Z`; there are no `RBF0`, `PSIN` or Bink 2 streams in this archive.
+
+| Type | Streams | Stored B | Inflated B | Logical payloads |
+|---|---:|---:|---:|---:|
+| XML (`<?xml` / `<`) | 844 | 3,764,523 | 43,284,925 | 267 (266 docs + 1 fragment) |
+| `RBF0` | 0 | 0 | 0 | 0 |
+| `PSIN` | 0 | 0 | 0 | 0 |
+| text / INI-like | 4 | 30,162 | 142,036 | 3 |
+| binary | 66 | 1,396,087 | 4,312,136 | 2 |
+| other (`MHIU`/`PAMH`/`SPS1Z`) | 40 | 456,483 | 2,492,026 | 4 |
+| **total** | **954** | **5,647,255** | **50,231,123** | **276** |
+
+By inflated bytes: 86.2% XML, 8.6% binary, 5.0% `other`, 0.3% text. XML is only 66.7% of stored bytes,
+which is why a 6.6 MB archive inflates to 50.2 MB. XML grouping is exact because each document closes on its
+root element. Non-XML grouping follows the 64 KiB block rule; none of the nine non-XML payloads here has a size
+that is an exact multiple of 64 KiB, so their counts are unambiguous too.
+
+The four non-XML structured payloads are the only readable binary metadata here: two `MHIU` blobs (about
+1.19 MB and 1.21 MB inflated), one `PAMH` blob (48.6 KB) and one `SPS1Z` shader-parameter table (43.8 KB).
+The two large opaque blobs (1.04 MB and 3.27 MB) have no recognised header and are left as binary. No model,
+texture or audio signature is present in `common.rpf`; the two opaque blobs are not identified.
+
+## MHIU and PAMH heightmaps
+
+`tools/gamedata_maps.py` decodes both payloads. They are **heightmaps**, not
+generic square arrays: each has a 44-byte header, a row table and u8 heights,
+and both scale a value into the header's Z box with
+
+```
+z = bounds.min.z + value / 255 * (bounds.max.z - bounds.min.z)
+```
+
+`common.rpf`'s manifest names `common:/data/levels/americas/heightmap.dat` as a
+`WORLD_HEIGHTMAP_FILE`, and the `PAMH` magic is the GTA V `HMAP` magic stored
+little-endian. The row-table layout matches the published GTA V
+`heightmap.dat` reader (`HMAP`, 44-byte header, 8-byte row headers, max/min
+u8 arrays). The measured file is version 1.2; GTA V writes 1.1.
+
+### `MHIU`: 2048 x 2048 single-layer heightmap
+
+| Header | Offset | Type | Measured |
+|---|---|---|---|
+| magic | 0x00 | 4 bytes | `MHIU` |
+| version | 0x04 | `u16` | 1 |
+| width | 0x06 | `u16` | 2048 |
+| height | 0x08 | `u16` | 2048 |
+| pad | 0x0A | `u16` | 0 |
+| six bounds | 0x0C | 6 x `f32` | `(-13000, -9000, -50)` to `(7000, 11000, 500)` |
+| data size | 0x24 | `u32` | bytes after the 44-byte header |
+| default height | 0x28 | `u8` | 23 in both (0 m quantised) |
+| pad | 0x29 | 3 bytes | differ per file; not a checksum |
+
+At 0x2C there are `height` records of eight bytes
+`{u16 start, u16 count, i32 offset}`, then the packed u8 heights. A row with
+`count = 0` keeps the default height from byte 0x28 (**23** in both payloads); the other rows fill cells
+`start .. start + count - 1` from `pixels[offset + start + i]`.
+
+| Payload | Filled rows | Empty rows | Packed bytes | Height range |
+|---|---:|---:|---:|---|
+| `0x144000` | 1,724 | 324 | 1,172,743 | 19..209 |
+| `0x16E000` | 1,727 | 321 | 1,194,048 | 0..209 |
+
+The row spans cover the packed bytes exactly: **0 gaps, 0 overlaps** in both
+payloads. The default 23 is `-0.39 m`, and 209 is `400.8 m`, so the default is
+the sea surface: `(0 - min.z) / (max.z - min.z) * 255 = 23.18`, so 23 is 0 m
+quantised to the header's Z box.
+
+The encoder crops each row to its first and last non-default cell. Over the
+3,451 filled rows of both payloads, **0 of the 6,902 span ends** hold 23,
+although 23 is 82% of all cells and occurs 849,544 times *inside* spans. The
+ends are 24 (6,402), 22 (343) and other neighbours of 23. Empty rows are rows
+that are entirely default. The decoder reads the default from byte 0x28 and
+reports `span_ends_at_default` so a different build can be checked the same way.
+
+The earlier "zero-filled prefix plus square byte grid" reading (1,090 x 1,090
+and 1,100 x 1,100) was an artifact. The prefix is the zeroed row headers of
+the empty rows, and the grid is 2048 x 2048. The largest square that ends at
+the payload end happened to fit the byte count, but it is not the format.
+
+### `PAMH`: `HMAP` max/min heightmap (`common.rpf` 144 x 164, tiles 64 x 64)
+
+| Header | Offset | Type | Measured |
+|---|---|---|---|
+| magic | 0x00 | 4 bytes | `PAMH` (little-endian `HMAP`) |
+| version | 0x04 | 2 x `u8` | 1.2 in `common.rpf`; overwritten in the `levels.rpf` tiles |
+| pad | 0x06 | `u16` | 0 in `common.rpf`; text in the tiles |
+| flag word | 0x08 | `u32` | `0x1BBC8CED` in `common.rpf`; padding in the tiles |
+| width, height | 0x0C | 2 x `u16` | 144, 164 in `common.rpf`; 64, 64 in every tile |
+| six bounds | 0x10 | 6 x `f32` | `(-13312, -9728, -302)` to `(5120, 11264, 404)` |
+| data size | 0x28 | `u32` | 48,544 in `common.rpf`; 8,704 in a tile |
+
+At 0x2C there are 164 row records, then `width * height` **max** bytes and
+`width * height` **min** bytes. The measured max layer runs 110..255 and the
+min layer 0..238; `min <= max` in all 23,616 cells. The max layer is a flat
+110 (2.5 m) over most of the map - the sea surface - and rises to 255 (404 m)
+on land. The min layer is the ground or sea floor.
+
+The earlier u16 reading interleaved the two arrays: every measured `0x6E6E`
+was a `(110, 110)` max/min pair, not the value 28,270.
+
+### The 1,476 `PAMH` tiles in `levels.rpf`
+
+`levels.rpf` holds 1,476 more `PAMH` payloads. All of them decode with the
+same rules: a 44-byte header, 64 x 64 cells, 64 full-width row records with
+`start = 0`, `count = 64` and `offset = y * 64`, then 4,096 **max** bytes and
+4,096 **min** bytes. That is 6,045,696 cells in total.
+
+- The tiles are a 36 x 41 rectangle with **512 m** spacing, so they cover the
+  same `(-13312, -9728)` to `(5120, 11264)` box as the `common.rpf` payload,
+  with the same Z box `-302` to `404`.
+- Max values span 0..255 and min values 0..254. `min <= max` in all but 62
+  cells, all in the tile at `(-5120, 2048)`, where the encoder wrote a min
+  above its max.
+- Bytes 0x05..0x0B are leftover text, not a version minor and a flag. 0x04
+  stays 1, 0x05.. hold the tile name `n_m` (column + 1, row + 1), and the
+  remaining bytes keep the tail of the string `height`, right-aligned at 0x0B.
+  The 28 distinct 0x08..0x0B words are all text; none is zero and none changes
+  the arrays.
+- The census groups by grid size, not by the 0x04 version bytes, because
+  0x05 is the first digit of the name. Nothing depends on the 0x08 word.
+
+```powershell
+python -I tools/gamedata_maps.py <work>\carve\levels --json levels.json
+```
+
+The tool prints one `PAMH census 64x64: ...` line and writes the per-group
+counts. Only header fields and counts are written, never the height bytes.
+
+### Cross-check and Z mapping
+
+MHIU and PAMH cover slightly different boxes at different resolutions.
+Sampling MHIU at the PAMH cell centres over their overlap gives a Pearson
+correlation of **r = 0.861** for payload `0x144000` and **r = 0.870** for
+`0x16E000` against the PAMH max layer. Mirrored or transposed orientations
+give `r <= 0.64`. The land masks (`MHIU > 23` and `PAMH max > 110`) overlap
+with **IoU 0.61**. Row 0 is therefore `bounds.min.y`, column 0 is
+`bounds.min.x`, and the linear Z formula above is the same for both.
+
+The HMAP header and row-table rules were cross-checked against the public
+[rage-formats](https://github.com/VIRUXE/rage-formats) reader (`Unlicense`)
+and [gta-op/heightmap](https://github.com/gta-op/heightmap) (`MIT`); no code is
+copied. The MHIU field offsets, the span checks and the Z correlation are
+measured on this package.
+
+```powershell
+python -I tools/gamedata_maps.py <work>\carve\common --json maps.json
+```
+
+### Checksum and unknown fields
+
+- `PAMH` 0x08 is GTA V's `compressed` word only in the `common.rpf` payload,
+  where it holds `0x1BBC8CED`. In the 1,476 `levels.rpf` tiles bytes 0x04..0x0B
+  are leftover text (tile name plus `height`), so 0x08 is padding there. The
+  `0x1BBC8CED` value is not CRC32, Adler32, FNV-1a, joaat32 or a hashlib
+  digest of the max/min arrays; it is reported as a flag word, not a proven
+  checksum.
+- `MHIU` 0x28 is a `u8` default height, not a 32-bit word (ASSET-48). Its
+  value is 23 in both payloads, the same value the empty rows were measured
+  to hold, and the row cropping above uses it. A full scan of all 12 archives
+  of package 1.0.2.1 (every zlib stream inflated far enough to read its magic)
+  finds **2 MHIU payloads**, both in `common.rpf`, so N = 2 for the header
+  values; the cropping rule is measured over all 6,902 span ends.
+- `MHIU` 0x29..0x2B differ between the two files and match none of CRC32,
+  Adler32, FNV-1/FNV-1a, joaat32 or an MD5/SHA-1/SHA-256/SHA3/BLAKE2 digest
+  (any 3-byte window, either byte order, or a 24-bit slice of the 32-bit
+  hashes) over the grid, the packed bytes, the row table, the header, the
+  body or the payload with 0x28..0x2B zeroed. They do not equal any count or
+  sum of the grid. They are most likely uninitialised struct padding after the
+  `u8` and are reported as `pad_29`; with N = 2 this is a hypothesis.
+
+## XML documents
+
+257 documents start with an XML declaration and all 257 parse as well-formed XML with a standard parser.
+Nine more complete documents are visible only from their closing root tag because their first block was in
+the unread region; 2 of those 9 still parse from their first retained byte, and 7 are truncated at the start.
+One 64 KiB XML block has no root at all. That gives 266 recoverable documents and 118 distinct root elements.
+
+Size distribution of the 257 header-bearing documents: minimum 88 B, median 13,435 B, mean 165,603 B,
+maximum 14,262,150 B. 59 are at most 1 KiB, 178 are at most 64 KiB, 3 exceed 1 MiB and the largest spans 218
+streams. 41 start with a UTF-8 BOM; 255 declare UTF-8 (214 uppercase, 41 lowercase), 2 omit the encoding
+attribute, 11 say `standalone="yes"`, and the 412 comments are hand-edit notes.
+
+### Root elements
+
+| Root element | Documents |
+|---|---:|
+| `timecycle_modifier_data` | 49 |
+| `CVehiclePoints` | 32 |
+| `timecycle_keyframe_data` | 27 |
+| `CDataFileMgr__ContentChangeSetDef` | 23 |
+| `CTuningFile` | 10 |
+| `CDamageDataManager` | 5 |
+| `GridAtlasInfo` | 4 |
+| `CCoverProcessorTuning` | 3 |
+| `CDataFileMgr__ContentDef` | 2 |
+| `CVehiclePerformanceMaps` | 2 |
+| `CVehicleBoneOffsetsArray` | 2 |
+| 107 other root elements | 107 |
+| **total** | **266** |
+
+The repeated roots matter: a root element alone does not identify a file. There are 49 timecycle modifier
+documents, 32 vehicle-point documents and so on. Original paths and names would have to come from the missing
+table of contents.
+
+### Functional categories
+
+The 118 root elements group into these categories. Counts and bytes cover the 266 recoverable documents
+(41.2 MiB), not the one unattributed block.
+
+| Category | Files | Inflated B | Roots | Representative root elements |
+|---|---:|---:|---:|---|
+| time, weather, sky, water | 87 | 17,339,011 | 13 | `timecycle_modifier_data`, `timecycle_keyframe_data`, `CContentsOfWeatherXmlFile`, `ShoreWavePlacementData` |
+| vehicles, tyres, handling data | 45 | 19,618,605 | 12 | `CVehiclePoints`, `CVehicleBoneOffsetsArray`, `CTyreDataSet`, `CVehiclePerformanceMaps` |
+| peds, schedules, appearance | 29 | 2,029,321 | 29 | `CPedScheduleInfoManager`, `CPedVariationBodyTypeManager`, `CPairedPedDataBlock`, `CEnergyConfigInfos` |
+| tuning, parameters, effects | 28 | 343,601 | 14 | `CTuningFile`, `CCoverProcessorTuning`, `GridAtlasInfo`, `PatchConstants` |
+| mount / content manifests | 25 | 450,316 | 2 | `CDataFileMgr__ContentChangeSetDef`, `CDataFileMgr__ContentDef` |
+| world, navigation, map | 19 | 1,660,133 | 19 | `GameShape__Data__LocationNameLoopkup`, `PathingStyleData`, `CTrainConfigs`, `CHazardNodes` |
+| combat and AI behaviour | 13 | 809,074 | 13 | `CCombatInfoMgr`, `CFiringPatternInfoManager`, `CFleeDecisionMakerData`, `Combat__GoalData__Store` |
+| animation, poses, weapons | 6 | 162,778 | 6 | `WeaponAnimations__FullbodyControllerData`, `WeaponAnimations__ConfigData`, `CAimUpperBodyDataBlock` |
+| damage | 5 | 485,482 | 1 | `CDamageDataManager` |
+| audio, video, speech | 4 | 13,741 | 4 | `LandingPageVideos`, `CTVPlaylistContainer`, `naSpeechEventTypeBatchRequestParams` |
+| missions, scenarios, respawn | 3 | 57,327 | 3 | `CDynamicScenarioManager`, `CMissions`, `Respawn__MetaData` |
+| conversation | 2 | 250,000 | 2 | `CConversationList`, `CConversationDictionary` |
+| **total** | **266** | **43,219,389** | **118** | |
+
+This archive has no root element for popcycle, weapon stats or handling. Weapon-related documents here cover
+loadouts, combat references and animation configuration. Vehicle handling-style values appear under the
+vehicle/tyre roots, and the remaining gameplay tables are not XML. Do not infer a full gameplay schema from
+`common.rpf` alone.
+
+## Schema style
+
+Four patterns cover almost everything:
+
+1. **Mount/content manifests.** `CDataFileMgr__ContentChangeSetDef` has `<id>`, optional registration/map
+   fields, a `<fileList>` of `<Item>` with `<filename>` and `<fileType>`, plus flags and map phases.
+   `CDataFileMgr__ContentDef` is the companion content description. There are 25 such documents and 3,315
+   `<filename>` elements in total. The path tokens are `$(common)`, `$(target)` and `platform:/`; no XInclude
+   is used.
+2. **Typed object graphs.** `CCombatInfoMgr` and the conversations/damage roots use `<Item type="...">`.
+   Fields are usually child elements, scalars use `value="..."`, and enums are bare text. Across the 259
+   parseable documents there are 428,611 elements, 5,293 distinct tag names, 318 distinct `type` values
+   (7,181 `type` attributes) and 33 distinct attribute names. The most common are `value` (84,585), `x`/`y`
+   (20,825 each), `content` (13,449), `key` (9,180), `type` (7,181), `name` (4,688) and `ref` (924).
+3. **Compact numeric tables.** `CVehicleBoneOffsetsArray` stores `<packedIndices content="short_array">`
+   and `<palette content="float16_array">` as whitespace-separated numbers, with `numEntries` and
+   `bitsPerIndex`. `content` values seen: `short_array` (10,309), `float16_array` (2,481),
+   `float_array` (536), `matrix34` (46), `vector2_array` (40), `matrix33` (28), `vec3v_array` (9).
+   `CTyreDataSet` uses nested groups of named floats. These tables are why the largest single document is
+   14.26 MB and spans 218 streams.
+4. **Timecycle arrays.** `timecycle_modifier_data` has a version root attribute, `<modifier>` records with
+   name/description/apply-tag/index/user-flag attributes, and parameter elements whose text is a
+   space-separated vector (`a b`, sometimes `a b c d`). Keyframe documents add `<cycle>`/`<region>`/`<axis>`.
+   This is not the `name=value` attribute style of pattern 2.
+
+A runtime consumer needs:
+
+- a UTF-8 XML parser that tolerates a BOM, CRLF, tabs, comments and inconsistent whitespace around `=`;
+- a root-element dispatch table (118 roots, 5,293 tag names), or an RTTI/class-metadata bridge if the
+  executable's class names are available;
+- a polymorphic `Item` type registry for `type=`;
+- enum and symbolic-reference resolution: this archive uses symbolic `ref`/`key`/`name` strings
+  (924 `ref`, 9,180 `key`); only 28 `key` values look like 8-digit hex hashes, so a name registry matters more
+  than a joaat table here;
+- whitespace-array and float16/packed-index decoders for the compact vehicle tables;
+- a mount resolver for `$(common)`, `$(target)` and `platform:/` prefixes;
+- streaming rather than whole-file parsing for the 14 MB table;
+- strict handling of the 9 tail-only and 1 unattributed blocks: they are incomplete evidence, not documents
+  to guess at.
+
+## XML catalog
+
+`tools/gamedata_xml.py` turns a carve into a per-file and per-root catalog. It is stdlib-only and rebuilds
+multi-stream documents with `gamedata_index.py`, so it reads the same 267 XML payloads the index reports:
+
+```powershell
+python -I tools/gamedata_xml.py <work>\carve\common --json xml.json --csv xml.csv --check
+```
+
+The file rows carry offset/bytes/chunks, root, category, element count, maximum depth, attribute names, `$(name)`
+and `platform:/` counts, include-like counts and the well-formed/fragment flags. The root rows add the
+element-name and attribute histograms and the reference targets. `--check` separates a rootless fragment, a
+tail-only document and a malformed document instead of treating all three as parse failures.
+
+Measured over the 267 payloads (43,284,925 B):
+
+| Measure | Value |
+|---|---:|
+| Well-formed | 259 (257 with a declaration, 2 tail-only) |
+| Truncated at the start | 7 |
+| Rootless fragment | 1 |
+| Malformed | 0 |
+| Named roots / catalogued roots | 118 (+1 unattributed) / 118 |
+| Elements / distinct element names | 428,611 / 5,293 |
+| Attribute names / `type` values / `content` kinds | 33 / 318 / 7 |
+| Maximum depth | 17 |
+| Comment starts (all / declaration-bearing) | 507 / 412 |
+| `filename` / `parentPath` / `parentFile` / XInclude | 3,315 / 40 / 3 / 0 |
+| `platform:/` references (levels / other) | 2,674 (2,346 / 328) |
+| `$(common)` / `$(root)` / `$(target)` references | 588 / 28 / 23 |
+
+Macro counts cover all element text; 587 of the 588 `$(common)` hits are in `<filename>` elements, which is the
+filename-only bucket in the table above.
+
+The root and element distribution is the one in the tables above: the five repeated roots hold 141 of the 266
+documents, and the element histogram is dominated by the general node names `Item` (118,179), `item` (16,316)
+and `Name` (12,850). The long tail is per-system parameter names; the manifest and timecycle names are a small
+part of it. A category is a dispatch bucket, not a schema: for the 266 documents the catalog reproduces the
+file and root counts in the functional table and assigns each root one category. No root has more than one
+handler.
+
+Reference handling is narrow. Every `$(...)` and `platform:/` string is element text, not an attribute; no
+document uses XInclude. The macro alphabet is `$(common)`, `$(target)` and `$(root)`, and the platform targets
+split into `platform:/levels/` and everything else. `filename` is the only include-like element with a large
+population; `parentPath`/`parentFile` are the only relative references outside it. A resolver therefore needs
+four prefix rules and a content-set/mount walk, not a general include processor.
+
+A runtime dispatcher needs the 118-root table (or an RTTI class bridge), the 12 category buckets, the 318-value
+`type` registry, the 33-name attribute whitelist, the `content=` array decoders and a streaming reader for the
+14 MB document. The mount/reference half of that layer is measured separately in
+[gamedata_graph.md](gamedata_graph.md): 25 manifest documents, 30 content-set ids, 12 resolved include edges
+and 3,343 reachable target references. It also needs to mark the 9 tail-only documents and the one rootless
+block as incomplete evidence: `gamedata_xml.py --check` is the reference for that split. The catalog is a local work product. Only
+aggregate counts and schema/root/element/attribute names belong in git; the CSV/JSON, the element values, the
+`type`/`content` values and per-file paths stay on the local machine. The tests are synthetic.
+
+## Relationship to `data.rpf` and `script.rpf`
+
+| Archive | Size | Streams | Inflated | Dominant payloads | XML | `RBF0` | `PSIN` |
+|---|---:|---:|---:|---|---:|---:|---:|
+| `common.rpf` | 6.6 MB | 954 | 50.2 MB | XML/config, text, `MHIU`, `PAMH`, `SPS1Z` | 844 streams | 0 | 0 |
+| `data.rpf` | 481.5 MB | 28,509 | 1,403.3 MB | models/GPU pages, 1,263 `RBF0`, 2,281 `PSIN`, 3,132 resource pages | 0 | 1,263 | 2,281 |
+| `script.rpf` | 4.4 MB | 714 | 5.0 MB | 671 `PSIN` plus binary | 0 | 0 | 671 |
+
+There is **no XML, `RBF0` or `PSIN` duplication** between them: `common.rpf` contains no `RBF0`/`PSIN`, and
+`data.rpf`/`script.rpf` have no XML documents at all — no stream starts as XML and no inflated stream contains
+an XML declaration (the ten `<`-leading `data.rpf` streams are binary). This is a type-level and stream-start
+check, not a byte hash of all 1.4 GB of inflated `data.rpf`; without the table of contents a duplicate stored
+at a different block boundary would not be recognised.
+
+The manifests in `common.rpf` reference the other archives by path token, not by archive handle. Counted over
+the 3,315 `<filename>` elements:
+
+| Reference bucket | Count |
+|---|---:|
+| `platform:/levels/` | 2,346 |
+| `$(common)/` | 587 |
+| other `platform:/` | 328 |
+| relative/other | 31 |
+| `$(target)/data/` | 23 |
+| `$(target)/script/` | 0 |
+
+So `common.rpf` is the XML/config layer that mounts levels content and references 23 `data.rpf` paths; none
+of its `<filename>` entries use the `script` token. It may still reference script content through non-path
+content names, which this count does not cover. The 587 `$(common)/` entries are mostly movie paths (537 end
+in `.bk2`), not XML. Of the 57 `.xml` path entries, 50 are under `$(common)/` and 7 are relative/other; none
+are under `data/` or `script/`. A further 40 `parentPath` attributes are relative references that cannot be
+resolved without the table of contents. No XInclude (`xi:include`) elements occur.
+
+## Readable vs binary
+
+Readable: the 266 XML documents, 3 text/INI-like files, and the two `MHIU` 2048 x 2048
+heightmaps plus the `PAMH` max/min heightmap and the `SPS1Z` header. The XML is ordinary text
+and can be consumed by any parser. `tools/gamedata_maps.py` decodes the `MHIU` row table and
+packed heights and the `PAMH` row table and max/min arrays. `SPS1Z` is a NUL-separated
+table of path/key strings with per-entry type/length markers; its structure is visible but its consumer is not
+implemented.
+
+Not fully readable: the 8.6% unread span, the two opaque binary blobs, and the missing first blocks of the 9
+tail-only documents (their retained tails are readable but incomplete). The encrypted table of contents is
+outside this work by rule; names and exact file boundaries stay unknown until a documented table reader exists.
+
+## No-sharing rule
+
+The archive, every carved `.bin`, `index.json` (its `head`/`pre` fields contain payload bytes), XML
+excerpts, entry names, values, paths, screenshots and per-file reports stay on the local machine. Only
+aggregate counts, sizes and schema/category names belong in git, issues or pull requests. The unit test uses
+synthetic data; CI never reads a game folder. This is the same rule as `AGENTS.md` and `CONTRIBUTING.md`, and
+it applies to this note as well.
+
+## Next step
+
+The most useful next step is a **schema bridge**, not more carving: check whether the 118 XML root tags match
+RTTI class names in the executable, then build a streaming reader that dispatches on root and `type`. That
+turns the measured XML into the runtime's config layer without hand-writing 5,293 tags. The `MHIU`/`PAMH`
+heightmaps are decoded by `tools/gamedata_maps.py`; every MHIU header field is identified (0x28 is the
+default height), and the row-table layouts and the value-to-Z mapping are measured.

@@ -1,5 +1,9 @@
 """Export textures found by tex_headers.py as standard DDS files (top mip, slice 0), detiled from AMD SW_4K_S.
 
+The compact TTPF mip-tail rule lives in tex_headers.py and is used by tools/ttpf_mips.py.
+This carve exporter cannot apply it: the carved descriptor has no tile-mode field or native
+allocation span, so the first/last heuristic below stays the only verified placement here.
+
 For each texture:
   - element size from the DXGI format (BC: 8/16 bytes per 4x4 block; uncompressed: bytes per pixel)
   - the top mip is either at the data offset or at the end of the mip chain (GFX10 stores mips smallest first);
@@ -32,14 +36,17 @@ PILLOW_OK = {71, 72, 74, 77, 78, 80, 81, 83, 84, 98, 99, 28, 29, 87, 91}
 # Pillow can't open sRGB DXGI codes; the bytes are identical to the UNORM twin, so decode with that for scoring.
 DECODE_AS = {72: 71, 78: 77, 99: 98, 29: 28, 91: 87}
 
-_NIB, _TAB = load()
 _EQ = {}
+_PATTERNS = []  # (nibbles, tables) from addrlib, read on first use so the module imports without the header
 
 
 def eq4k(bpe):
     if bpe not in _EQ:
-        e = [e for e in _TAB["GFX10_SW_4K_S_PATINFO"] if f" {bpe} bpe" in e[5]][0]
-        _EQ[bpe] = equation(_NIB, e, 12)
+        if not _PATTERNS:
+            _PATTERNS.append(load())
+        nib, tab = _PATTERNS[0]
+        e = [e for e in tab["GFX10_SW_4K_S_PATINFO"] if f" {bpe} bpe" in e[5]][0]
+        _EQ[bpe] = equation(nib, e, 12)
     return _EQ[bpe]
 
 
@@ -77,9 +84,10 @@ def score_image(w, h, fmt, payload, bpe):
         im = Image.open(io.BytesIO(dds_bytes(w, h, DECODE_AS.get(fmt, fmt), payload))).convert("RGB")
         a = np.asarray(im.reduce(4) if min(w, h) >= 64 else im, np.float32)
     else:
-        a = np.frombuffer(payload, np.uint8).reshape(-1, bpe)[:, :4].astype(np.float32)
-        a = a.reshape(-1, max(1, (w + 3) // 4 if bpe >= 8 and FMT[fmt][1] == 4 else w), 4)
-    d = np.abs(np.diff(a, axis=0)).mean() + np.abs(np.diff(a, axis=1)).mean()
+        block = FMT[fmt][1]
+        we, he = (w + block - 1) // block, (h + block - 1) // block
+        a = np.frombuffer(payload, np.uint8).reshape(he, we, bpe)[:, :, :4].astype(np.float32)
+    d = sum(np.abs(np.diff(a, axis=axis)).mean() for axis in (0, 1) if a.shape[axis] > 1)
     return float(d / (a.std() + 1e-6))
 
 
@@ -128,16 +136,26 @@ def export_one(t, carve, out, blob_cache):
     return "ok:" + place
 
 
+def positive_int(text):
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("index")
     ap.add_argument("carve")
     ap.add_argument("out")
-    ap.add_argument("--limit", type=int)
+    ap.add_argument("--limit", type=positive_int, help="export only the first N textures (N >= 1)")
     a = ap.parse_args()
     texs = json.load(open(a.index, encoding="utf-8"))
     texs.sort(key=lambda t: (t["archive"], t["gpu"]))
-    if a.limit:
+    if a.limit is not None:         # 0 used to read as "no limit", and a negative N dropped the last N
         texs = texs[: a.limit]
     os.makedirs(a.out, exist_ok=True)
     res, cache = Counter(), {}
