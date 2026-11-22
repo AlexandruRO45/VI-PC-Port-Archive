@@ -1466,6 +1466,17 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             scalar[regs[0]], scalar[regs[1]] = ("uint", f"salu{i}.x"), ("uint", f"salu{i}.y")
             if op == "not":
                 scc = f"((salu{i}.x | salu{i}.y) != 0u)"
+        elif m := match(r"s_cselect_b64 (s\[\d+:\d+\]), ([^,]+), ([^,]+)"):
+            dst, src0, src1 = m.groups()
+            if scc is None:
+                raise ValueError("Select condition is not a tracked scalar result")
+            regs = sgpr_pair(dst)
+            if pending.intersection(regs):
+                raise ValueError("Write overlaps an outstanding scalar load")
+            a0, a1 = scalar_u64(src0, scalar, pending)
+            b0, b1 = scalar_u64(src1, scalar, pending)
+            lines.append(f"    uint2 salu{i} = {scc} ? uint2({a0}, {a1}) : uint2({b0}, {b1});")
+            scalar[regs[0]], scalar[regs[1]] = ("uint", f"salu{i}.x"), ("uint", f"salu{i}.y")
         elif m := match(rf"s_({'|'.join(SALU_BIT64)})_b64 (s\[\d+:\d+\]), ([^,]+), ([^,]+)"):
             op, dst, src0, src1 = m.groups()
             regs = sgpr_pair(dst)

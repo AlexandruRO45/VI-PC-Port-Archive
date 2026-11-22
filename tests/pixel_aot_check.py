@@ -1817,6 +1817,47 @@ def check_cube_draw(directory, compiler, renderer, backend):
     assert math.copysign(1.0, cube_reference(0.0, 0.0, -0.0)[3]) < 0
 
 
+S_CSELECT_B64 = "s_cselect_b64 s[44:45], s[44:45], s[46:47]"
+
+
+def scalar_select64():
+    return uncompressed_export([
+        "s_cmp_eq_u32 s44, 0",
+        S_CSELECT_B64,
+        "s_cselect_b64 s[48:49], 0, -1",
+        "v_mov_b32_e32 v12, s44",
+        "v_mov_b32_e32 v13, s45",
+        "v_mov_b32_e32 v14, s48",
+        "v_mov_b32_e32 v15, s49",
+    ])
+
+
+def check_scalar_select64_draw(directory, compiler, renderer, backend):
+    source = directory / "scalar-select64.hlsl"
+    shader = directory / "scalar-select64.cso"
+    program = scalar_select64()
+    source.write_text(translate_int(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+
+    # Select a zero pair with SCC set and a nonzero pair with SCC clear to
+    # distinguish preservation from recomputing SCC from the selected words.
+    other = (0x87654321, 0x43218765)
+    cases = []
+    for i, (lo, hi) in enumerate(((0, 0), (0x89abcdef, 0x12345678), (0, 0x76543210))):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, lo, hi, *other)
+        expected = (*other, 0xffffffff, 0xffffffff) if lo else (lo, hi, 0, 0)
+        case = directory / f"scalar-select64-{i}.case"
+        write_case(case, constants, tuple(as_float(word) for word in expected), integer_rt=True)
+        cases.append(case)
+    run_pixel_batch(renderer, backend, shader, [(case, "pass") for case in cases])
+
+    program[program.index(S_CSELECT_B64)] = "s_cselect_b64 s[44:45], s[46:47], s[44:45]"
+    source.write_text(translate_int(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    run_pixel_batch(renderer, backend, shader, [(case, "mismatch") for case in cases])
+
+
 SCALAR64_SETS = (
     # (a_lo, a_hi, b_lo, b_hi, sh_lo, sh_hi, bfm_w, bfm_off, bfe_src, bfe_ctrl_a, bfe_ctrl_b, alt)
     (0x89abcdef, 0x91234567, 0x55aa55aa, 0x7fffffff, 5, 37, 12, 28, 0x9a345f50, 0x00080004, 0x00100018, 0x55aa55aa),
@@ -4461,6 +4502,16 @@ def check_controls(directory):
     must_reject(translate, with_constants(["v_madmk_f32_sdwa v12, v13, 0x3e800000, v14 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD"]))
 
     # 64-bit scalar ALU and 32-bit BFE controls.
+    select64 = scalar_select64()
+    translate_int(select64)
+    selected = select64.index(S_CSELECT_B64)
+    for bad in ("s_cselect_b64 s[45:46], s[44:45], s[46:47]",
+                "s_cselect_b64 exec, s[44:45], s[46:47]",
+                "s_cselect_b64 s[44:45], exec, s[46:47]"):
+        must_reject(translate_int, select64[:selected] + [bad] + select64[selected+1:])
+    wait = select64.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc") + 1
+    for bad in ("s_cselect_b64 s[44:45], 0, -1", "s_cselect_b64 s[48:49], s[44:45], 0"):
+        must_reject(translate_int, select64[:wait] + ["s_cmp_eq_u32 0, 0", bad] + select64[wait:])
     program = scalar64()
     source = translate(program)
     for expected in ("uint2 s_lshl_b64(", "uint2 s_lshr_b64(", "uint2 s_ashr_i64(",
@@ -4505,7 +4556,7 @@ def check_controls(directory):
         "s_and_b64 s[70:71], s[50:51], s[52:53]",  # saved exec source
         "s_and_b64 s[70:71], s[20:21], s[52:53]",  # texture_ptr source
         "s_and_b64 s[70:71], s[90:91], s[52:53]",  # unset source
-        "s_cselect_b64 s[70:71], s[52:53], s[54:55]",
+        "s_cselect_b64 s[70:71], s[52:53], s[54:55]",  # before any SCC write
         "s_bfe_u64 s[70:71], s[52:53], s61",
         "s_bfe_i64 s[70:71], s[52:53], s61",
         "s_bfm_b32 s70, v12, 8",  # VGPR source
@@ -4822,6 +4873,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((sext_values(), translate))
     fixtures.append((sop1_scalar_ops(), translate_int))
     fixtures.append((bfm_scalar_ops(), translate_int))
+    fixtures.append((scalar_select64(), translate_int))
     fixtures.extend((scalar_pack_values(halves), translate) for halves in PACK_HALVES)
     fixtures.extend((scalar_bit_count_values(width), translate) for width in (32, 64))
     fixtures.append((scalar_mul_hi_values(), translate))
@@ -6370,6 +6422,7 @@ def check_blend_and_scalar_draws(directory, compiler, renderer, backend):
 
     check_frexp_ldexp_draws(directory, compiler, renderer, backend)
     check_mul24_draws(directory, compiler, renderer, backend)
+    check_scalar_select64_draw(directory, compiler, renderer, backend)
 
     program = scalar64()
     source.write_text(translate(program), encoding="ascii")
