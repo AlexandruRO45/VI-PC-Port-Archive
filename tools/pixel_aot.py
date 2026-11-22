@@ -316,6 +316,8 @@ HINT_LIMITS = {"s_clause": 0x3f, "s_setprio": 3, "s_sleep": 0x7f}
 
 ALU = {
     "log": (1, "log2({0})"), "exp": (1, "exp2({0})"), "rcp": (1, "(1.0f / {0})"),
+    # Same reciprocal; the integer-divide flag it raises has no desktop equivalent.
+    "rcp_iflag": (1, "(1.0f / {0})"),
     "sqrt": (1, "sqrt({0})"), "rsq": (1, "rsqrt({0})"),
     "floor": (1, "floor({0})"), "ceil": (1, "ceil({0})"), "fract": (1, "fract32({0})"),
     "trunc": (1, "trunc({0})"), "frexp_mant": (1, "frexp_mant32({0})"),
@@ -546,6 +548,15 @@ INLINE_F16 = {
     "0.5": 0x3800, "-0.5": 0xb800, "1.0": 0x3c00, "-1.0": 0xbc00,
     "2.0": 0x4000, "-2.0": 0xc000, "4.0": 0x4400, "-4.0": 0xc400,
     "0.15915494": 0x3118,
+}
+VOP3P_INT16 = {
+    "add_i16": (2, True), "add_u16": (2, True),
+    "sub_i16": (2, True), "sub_u16": (2, True),
+    "min_i16": (2, False), "min_u16": (2, False),
+    "max_i16": (2, False), "max_u16": (2, False),
+    "mul_lo_u16": (2, False),
+    "mad_i16": (3, True), "mad_u16": (3, True),
+    "lshlrev_b16": (2, False), "lshrrev_b16": (2, False), "ashrrev_i16": (2, False),
 }
 
 
@@ -901,6 +912,98 @@ def parse_dot(rest, *, allow_opsel, allow_neg):
     if op_sel[2] != 0 or op_sel_hi[2] != 1 or neg_hi[2] != 0:
         raise ValueError("Unsupported accumulator lane modifier on dot product")
     return operands, op_sel, op_sel_hi, neg_lo, neg_hi, clamp
+def vop3p_int_word(token, scalar, vector, pending, sample_dest):
+    """Return a 32-bit uint HLSL expression for one packed 16-bit integer VOP3P source operand."""
+    if m := re.fullmatch(r"([vs])(\d+)", token):
+        limit = 255 if m.group(1) == "v" else 105
+        if not 0 <= int(m.group(2)) <= limit:
+            raise ValueError(f"Register out of range: {token}")
+        if token in pending:
+            raise ValueError("Constant read before load completion")
+        value = (vector if m.group(1) == "v" else scalar)[token]
+        if isinstance(value, int):
+            return f"{value}u"
+        if isinstance(value, tuple) and len(value) == 2 and value[0] == "uint":
+            return value[1]
+        if not isinstance(value, str) or not value.startswith(("sample", "alu", "params[")):
+            raise ValueError("Expected a numeric register")
+        if token in sample_dest:
+            raise ValueError("Sample used before vmcnt wait")
+        return f"asuint({value})"
+    if re.fullmatch(r"0x[0-9a-f]{1,8}", token):
+        return f"{int(token, 16)}u"
+    if re.fullmatch(r"-?\d+", token):
+        value = int(token)
+        if not -16 <= value <= 64:
+            raise ValueError(f"Unsupported packed integer inline constant {token}")
+        return f"{value & 0xffffffff}u"
+    raise ValueError(f"Unsupported packed integer operand {token}")
+
+
+def parse_vop3p_int16(rest, arity, *, allow_clamp):
+    parts_ = rest.split(", ")
+    if len(parts_) != arity:
+        raise ValueError("Invalid packed integer operand count")
+    last_op, _, mod_text = parts_[-1].partition(" ")
+    operands = [*parts_[:-1], last_op]
+    opts = {}
+    clamp = False
+    for mod in mod_text.split():
+        if mod == "clamp":
+            if clamp or not allow_clamp:
+                raise ValueError("Invalid clamp modifier")
+            clamp = True
+        elif m := re.fullmatch(r"(op_sel|op_sel_hi):\[([01](?:,[01])*)\]", mod):
+            name = m.group(1)
+            bits = [int(b) for b in m.group(2).split(",")]
+            if name in opts or len(bits) != arity:
+                raise ValueError(f"Invalid packed integer modifier {mod}")
+            opts[name] = bits
+        else:
+            raise ValueError(f"Unsupported packed integer modifier {mod}")
+    return operands, opts, clamp
+
+
+def pk_int16_lane_expr(op, word_vars, sel, clamp):
+    def u16(w, hi):
+        return f"(({w} >> 16) & 0xffffu)" if hi else f"({w} & 0xffffu)"
+
+    def i16(w, hi):
+        return f"(asint({w}) >> 16)" if hi else f"(asint({w} << 16) >> 16)"
+
+    if op == "add_i16":
+        r = f"({i16(word_vars[0], sel[0])} + {i16(word_vars[1], sel[1])})"
+        return f"(asuint(clamp({r}, -32768, 32767)) & 0xffffu)" if clamp else f"(asuint({r}) & 0xffffu)"
+    if op == "add_u16":
+        r = f"({u16(word_vars[0], sel[0])} + {u16(word_vars[1], sel[1])})"
+        return f"min({r}, 65535u)" if clamp else f"({r} & 0xffffu)"
+    if op == "sub_i16":
+        r = f"({i16(word_vars[0], sel[0])} - {i16(word_vars[1], sel[1])})"
+        return f"(asuint(clamp({r}, -32768, 32767)) & 0xffffu)" if clamp else f"(asuint({r}) & 0xffffu)"
+    if op == "sub_u16":
+        a, b = u16(word_vars[0], sel[0]), u16(word_vars[1], sel[1])
+        return f"({a} < {b} ? 0u : ({a} - {b}))" if clamp else f"(({a} - {b}) & 0xffffu)"
+    if op == "min_i16":
+        return f"(asuint(min({i16(word_vars[0], sel[0])}, {i16(word_vars[1], sel[1])})) & 0xffffu)"
+    if op == "min_u16":
+        return f"min({u16(word_vars[0], sel[0])}, {u16(word_vars[1], sel[1])})"
+    if op == "max_i16":
+        return f"(asuint(max({i16(word_vars[0], sel[0])}, {i16(word_vars[1], sel[1])})) & 0xffffu)"
+    if op == "max_u16":
+        return f"max({u16(word_vars[0], sel[0])}, {u16(word_vars[1], sel[1])})"
+    if op == "mul_lo_u16":
+        return f"(({u16(word_vars[0], sel[0])} * {u16(word_vars[1], sel[1])}) & 0xffffu)"
+    if op == "mad_i16":
+        r = f"({i16(word_vars[0], sel[0])} * {i16(word_vars[1], sel[1])} + {i16(word_vars[2], sel[2])})"
+        return f"(asuint(clamp({r}, -32768, 32767)) & 0xffffu)" if clamp else f"(asuint({r}) & 0xffffu)"
+    if op == "mad_u16":
+        r = f"({u16(word_vars[0], sel[0])} * {u16(word_vars[1], sel[1])} + {u16(word_vars[2], sel[2])})"
+        return f"min({r}, 65535u)" if clamp else f"({r} & 0xffffu)"
+    if op == "lshlrev_b16":
+        return f"(({u16(word_vars[1], sel[1])} << ({u16(word_vars[0], sel[0])} & 15u)) & 0xffffu)"
+    if op == "lshrrev_b16":
+        return f"({u16(word_vars[1], sel[1])} >> ({u16(word_vars[0], sel[0])} & 15u))"
+    return f"(asuint({i16(word_vars[1], sel[1])} >> ({u16(word_vars[0], sel[0])} & 15u)) & 0xffffu)"
 # SDWA selections: (bit offset, width). A source selection is zero-extended, or sign-extended with sext();
 # a destination selection writes the low bits of the result into that field. Following the equivalences in
 # LLVM's SIPeepholeSDWA, UNUSED_PAD zeroes the other bits and UNUSED_PRESERVE keeps them from the destination.
@@ -1233,10 +1336,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     vector[dst] = f"uv.{component}"
             else:
                 raise ValueError("Unpaired interpolation")
-        elif m := match(r"image_sample v\[(\d+):(\d+)\], v\[(\d+):(\d+)\], s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0xf dim:SQ_RSRC_IMG_2D"):
-            operands = m.groups()
+        elif m := match(r"image_sample v\[(\d+):(\d+)\], v\[(\d+):(\d+)\], s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:(0x[7f]) dim:SQ_RSRC_IMG_2D"):
+            *operands, dmask = m.groups()
+            channel_count = 3 if dmask == "0x7" else 4
             dest, coords, image, state = [registers(*operands[k:k+2], width)
-                                          for k, width in zip((0,2,4,6), (4,2,8,4))]
+                                          for k, width in zip((0,2,4,6), (channel_count,2,8,4))]
             if any(f"v{n}" in sample_dest for n in dest):
                 raise ValueError("Write overlaps an outstanding sample")
             descriptor = [scalar.get(f"s{n}") for n in image]
@@ -1300,7 +1404,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             value = fp_operand(src, scalar, vector, pending, sample_dest)
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {value};")
-        elif m := match(r"v_(log|exp|rcp|sqrt|rsq|floor|ceil|fract|trunc|frexp_mant|add|mul|max|min|sub|subrev|mul_legacy|fma|fmac|mad|mac|min3|max3|med3)_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
+        elif m := match(r"v_(log|exp|rcp_iflag|rcp|sqrt|rsq|floor|ceil|fract|trunc|frexp_mant|add|mul|max|min|sub|subrev|mul_legacy|fma|fmac|mad|mac|min3|max3|med3)_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
             op, dst, operands, clamp = m.groups()
             tokens = operands.split(", ")
             if op in ("fmac", "mac"):
@@ -1591,6 +1695,26 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     call = f"{op}({w0}, {w1}, {w2}, {sat})"
                 vector[dst] = f"alu{i}"
                 lines.append(f"    precise float alu{i} = asfloat({call});")
+        elif m := match(rf"v_pk_({'|'.join(VOP3P_INT16)}) (v\d+), (.+)"):
+            op, dst, rest = m.groups()
+            arity, allow_clamp = VOP3P_INT16[op]
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid packed integer operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            tokens, opts, clamp = parse_vop3p_int16(rest, arity, allow_clamp=allow_clamp)
+            words = [vop3p_int_word(t, scalar, vector, pending, sample_dest) for t in tokens]
+            word_vars = []
+            for k, expr in enumerate(words):
+                wvar = f"pki{i}_{k}"
+                lines.append(f"    uint {wvar} = {expr};")
+                word_vars.append(wvar)
+            lo_expr = pk_int16_lane_expr(op, word_vars, opts.get("op_sel", [0] * arity), clamp)
+            hi_expr = pk_int16_lane_expr(op, word_vars, opts.get("op_sel_hi", [1] * arity), clamp)
+            lines.append(f"    uint pki{i}_l0 = {lo_expr};")
+            lines.append(f"    uint pki{i}_l1 = {hi_expr};")
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat(pki{i}_l0 | (pki{i}_l1 << 16));")
         elif m := match(r"v_cvt_pkrtz_f16_f32_e32 (v\d+), (v\d+), (v\d+)"):
             dst, lo, hi = m.groups()
             if dst in sample_dest:
