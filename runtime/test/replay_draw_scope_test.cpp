@@ -111,7 +111,7 @@ void expect_well_formed(const Trace& t, const char* what) {
 }
 
 enum : ResourceId { color_a = 1, color_b, depth_id, vertex_id, index_id, predicate_id };
-enum : std::uintptr_t { pso_a = 100, pso_b, pso_stencil };
+enum : std::uintptr_t { pso_a = 100, pso_b, pso_stencil, pso_fullscreen };
 
 }  // namespace
 
@@ -167,6 +167,8 @@ int main() {
     const GraphicsPipeline b = pipeline(pso_b, VK_IMAGE_ASPECT_DEPTH_BIT);
     const GraphicsPipeline with_stencil =
         pipeline(pso_stencil, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+    GraphicsPipeline fullscreen = pipeline(pso_fullscreen, VK_IMAGE_ASPECT_DEPTH_BIT);
+    fullscreen.vertex_slots = 0;  // vertices from SV_VertexID: no vertex input, so no dynamic stride state
 
     ReplayFunctions vk{};
     vk.pipeline_barrier = barrier;
@@ -189,6 +191,7 @@ int main() {
         if (id == pso_a) return &a;
         if (id == pso_b) return &b;
         if (id == pso_stencil) return &with_stencil;
+        if (id == pso_fullscreen) return &fullscreen;
         return nullptr;
     };
     vk.image_view = [](const ResourceBinding& r, const VkImageSubresourceRange& range) {
@@ -347,6 +350,23 @@ int main() {
         expect(t.begins == 1 && t.barriers == 2, "tracked: one transition and one depth barrier, once");
         expect(tracker.layout(color_a, 0) == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                "tracked: the render target is recorded in COLOR_ATTACHMENT_OPTIMAL");
+    }
+
+    // 8. A pipeline without vertex input leaves the stride out of its dynamic states, so binding it invalidates the
+    // strides: the next draw that reads vertex buffers binds them again, even when they did not change.
+    {
+        Trace t;
+        CommandList list;
+        expect(list.draw(make_draw(pso_a, color_a)), "record a draw with vertex input");
+        Draw fs = make_draw(pso_fullscreen, color_a);
+        fs.indexed = false;
+        expect(list.draw(fs), "record a full-screen draw without vertex input");
+        expect(list.draw(make_draw(pso_a, color_a)), "record the first draw again");
+        run(list, t);
+        expect_well_formed(t, "pipeline without vertex input");
+        expect(t.begins == 1 && t.draws == 3, "pipeline without vertex input: one scope");
+        expect(t.pipelines == 3, "pipeline without vertex input: three pipeline binds");
+        expect(t.vertex_binds == 2, "pipeline without vertex input: the vertex buffer is bound again after it");
     }
 
     if (failures) {

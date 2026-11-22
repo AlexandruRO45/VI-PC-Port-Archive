@@ -3774,6 +3774,11 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             if (scope.state.pipeline != p.graphics.pipeline) {
                 vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, p.graphics.pipeline);
                 scope.state.pipeline = p.graphics.pipeline;
+                // A pipeline with no vertex input leaves VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE out of its
+                // dynamic states (d3d12_vulkan_device.cpp, pipeline creation), so binding it invalidates the strides
+                // set so far: the next pipeline that reads vertex buffers must have them bound again
+                // (VUID-vkCmdDrawIndexed-pStrides-04913).
+                if (!p.graphics.vertex_slots) scope.state.vertex_valid = 0;
             }
             if (p.graphics.bindless_set &&
                 (scope.state.set != p.graphics.bindless_set || scope.state.set_layout != p.graphics.layout)) {
