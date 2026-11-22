@@ -162,9 +162,9 @@ def parse_other_block(data, at):
     return record, end
 
 
-def positions_4240(data, block):
-    """Decode a `42 40` block's slot-0 positions (the packed 8-byte form; see the module docstring). Returns a list of
-    (x, y, z) floats. Raises PageError for an axis word other than 0, 1 or 2 or a slot 0 that isn't tag 0x42."""
+def iter_positions_4240(data, block):
+    """Decode a `42 40` block's slot-0 positions (the packed 8-byte form; see the module docstring). Yields (x, y, z)
+    floats. Raises PageError for an axis word other than 0, 1 or 2 or a slot 0 that isn't tag 0x42."""
     at, n = block["offset"], block["vertices"]
     slots = {i: (tag, off) for i, tag, off in block["slots"]}
     if slots.get(0, (None,))[0] != 0x42:
@@ -174,13 +174,17 @@ def positions_4240(data, block):
     scale = struct.unpack_from("<3f", data, at + 0x70)
     if axis > 2:
         raise PageError(f"42 40 block at +0x{at:x}: axis word {axis} is not 0, 1 or 2")
-    out = []
     for (q,) in struct.iter_unpack("<Q", data[at + slots[0][1]:at + slots[0][1] + 8 * n]):
         a = bias[0] + scale[0] * ((q >> 8) & 0xFFFFFF)
         b = bias[1] + scale[1] * (((q >> 32) & 0xFFFF) << 8 | (q & 0xFF))
         c = bias[2] + scale[2] * (q >> 48)
-        out.append((c, b, a) if axis == 0 else (b, c, a) if axis == 1 else (a, b, c))
-    return out
+        yield (c, b, a) if axis == 0 else (b, c, a) if axis == 1 else (a, b, c)
+
+
+def positions_4240(data, block):
+    """Decode a `42 40` block's slot-0 positions (the packed 8-byte form; see the module docstring). Returns a list of
+    (x, y, z) floats. Raises PageError for an axis word other than 0, 1 or 2 or a slot 0 that isn't tag 0x42."""
+    return list(iter_positions_4240(data, block))
 
 
 def group_triangles(data, group):
@@ -251,11 +255,18 @@ def centre_agreement(data, group, positions):
 
 
 def block4240_checks(data, block):
-    """Count-only plausibility checks for one `42 40` block's decoded positions."""
-    pos = positions_4240(data, block)
-    finite = [p for p in pos if all(math.isfinite(c) for c in p)]
-    return {"positions_4240": len(pos), "positions_4240_finite": len(finite),
-            "positions_4240_within_300m": sum(1 for p in finite if all(abs(c) <= 300 for c in p))}
+    """Count-only plausibility checks for one `42 40` block's decoded positions. The positions are streamed, so the
+    block's vertex list is never materialised."""
+    total = finite = within = 0
+    for p in iter_positions_4240(data, block):
+        total += 1
+        if not all(math.isfinite(c) for c in p):
+            continue
+        finite += 1
+        if all(abs(c) <= 300 for c in p):
+            within += 1
+    return {"positions_4240": total, "positions_4240_finite": finite,
+            "positions_4240_within_300m": within}
 
 
 def parse_group(data, at):
@@ -429,6 +440,7 @@ def summarise_page(data, name, faces=False, centres=False):
     except PageError as exc:
         return {"name": name, "size": len(data), "error": str(exc)}
     counts = {b["vertices"] for b in blocks}
+    other_counts = {b["vertices"] for b in others}
     stop = [c for c in chunks if c["kind"] == "stop"]
     return {"name": name, "size": len(data), "starts_with": chunks[0]["kind"],
             "sequence": "".join({"block": "B", "block4240": "Q", "group": "G", "stop": "."}[c["kind"]] for c in chunks),
@@ -447,8 +459,7 @@ def summarise_page(data, name, faces=False, centres=False):
             "blocks_4240": len(others), "vertices_4240": sum(b["vertices"] for b in others),
             "blocks_4240_flags": sorted({b["flags"] for b in others}),
             "blocks_4240_axes": sorted({b["axis"] for b in others}),
-            "groups_matching_4240_block_here": sum(1 for g in groups
-                                                   if g["vertex_span"] in {b["vertices"] for b in others}),
+            "groups_matching_4240_block_here": sum(1 for g in groups if g["vertex_span"] in other_counts),
             "group_spans": [g["vertex_span"] for g in groups],
             "block_counts": [b["vertices"] for b in blocks],
             "checks": checks}

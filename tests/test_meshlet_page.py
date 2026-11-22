@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "meshlet_page.py")
@@ -383,6 +384,25 @@ class Positions4240Tests(unittest.TestCase):
         xyz = self.decode(2)
         self.assertEqual(self.decode(0), [(c, b, a) for a, b, c in xyz])
         self.assertEqual(self.decode(1), [(b, c, a) for a, b, c in xyz])
+
+    def test_block_checks_stream_positions(self):
+        data = page(other_block(4, packed=self.PACKED, bias=self.BIAS, scale=self.SCALE))
+        block = mp.parse_page(data)[0]
+        expected = mp.block4240_checks(data, block)
+        with mock.patch.object(mp, "positions_4240", side_effect=AssertionError("materialised positions")):
+            self.assertEqual(mp.block4240_checks(data, block), expected)
+
+    def test_block_checks_count_nonfinite_and_far_positions(self):
+        near = page(other_block(4, packed=[(0, 0, 0), (1, 0, 0), (2, 0, 0), (0, 0, 0)],
+                               bias=(0.0, 0.0, 0.0), scale=(400.0, 0.0, 0.0)))
+        self.assertEqual(mp.block4240_checks(near, mp.parse_page(near)[0]),
+                         {"positions_4240": 4, "positions_4240_finite": 4,
+                          "positions_4240_within_300m": 2})
+        nan = page(other_block(4, packed=[(0, 0, 0)] * 4, bias=(float("nan"), 0.0, 0.0),
+                               scale=(0.0, 0.0, 0.0)))
+        self.assertEqual(mp.block4240_checks(nan, mp.parse_page(nan)[0]),
+                         {"positions_4240": 4, "positions_4240_finite": 0,
+                          "positions_4240_within_300m": 0})
 
     def test_bad_axis_and_tag_are_errors(self):
         data = page(other_block(4, axis=3))
