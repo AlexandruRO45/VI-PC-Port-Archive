@@ -1384,6 +1384,16 @@ python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLV
 
 Build the emitted source with `dxc -T cs_6_0 -E main`. The Windows fixture reads back all 320 words, including gaps between records and the untouched tail, after one and three indexed groups. A wrong stored word and a wrong guard word must both fail. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_'`.
 
+An optional `--constant-descriptor BYTE_OFFSET` binds a second table entry to
+b0. It must be distinct from the 16-byte u0 descriptor. The translator accepts
+aligned immediate `s_buffer_load_dword`, `s_buffer_load_dwordx2`, and
+`s_buffer_load_dwordx4` reads within the 64-byte binding. It tracks scalar waits,
+register copies, and each loaded DWORD through the raw UAV store. The Windows
+test dispatches one compiled shader with two different root-constant uploads and
+compares all 320 output words each time. The stale reference fails on exactly
+eight stored words. The binding is limited to unsigned 32-bit words and fixed
+byte offsets.
+
 A local scan of 2,689 compute records accepted 12 records (10 distinct instruction streams). Ten use one-thread groups and fixed addresses. Two use 32- and 64-thread groups and indexed addresses. Tested table bindings used s4 or s5 with descriptor offsets of 0, 32 or 64. The indexed bindings used strides of 4, 8, 12 or 16 bytes, selecting the first compatible profile. On RTX 4060 Laptop (32.0.16.1656) and WARP (10.0.26100.9818), each record compiled to desktop DXIL and dispatched. Each adapter completed 14 full-buffer comparisons with zero mismatches, including two different group counts for both indexed records.
 ## AVX2 leaf recompilation
 
