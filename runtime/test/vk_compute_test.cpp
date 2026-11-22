@@ -20,6 +20,7 @@
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
 #include "vk_pc_tail.h"
+#include "../src/moltenvk_no_contraction.h"
 
 #include <cctype>
 #include <cmath>
@@ -137,7 +138,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
+    VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+    sgProps.pNext = &driver;
     VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
     subgroup.pNext = &sgProps;
     VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
@@ -259,8 +262,11 @@ int main(int argc, char** argv) {
     const uint64_t heap = vkGetBufferDeviceAddress(dev, &bai);
 
     if (!fma.accepts(code.data(), code.size(), argv[1])) return 77;
+    std::vector<uint32_t> spirv(code.size() / 4);
+    std::memcpy(spirv.data(), code.data(), spirv.size() * 4);
+    spirv = leonida::drop_no_contraction(spirv, leonida::moltenvk_safe_math(driver.driverID, props.driverVersion));
     VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    smi.codeSize = code.size(); smi.pCode = reinterpret_cast<const uint32_t*>(code.data());
+    smi.codeSize = spirv.size() * 4; smi.pCode = spirv.data();
     VkShaderModule sm; CHECK(vkCreateShaderModule(dev, &smi, nullptr, &sm));
     // 144 push-constant bytes: s0..s31, heap base, code base. With LEONIDA_PC_TAIL_UBO=1 (rdna2spirv.py
     // --pc-tail-ubo) only s0..s31; the tail, if the module reads it, is a uniform block at set 1 (vk_pc_tail.h), one

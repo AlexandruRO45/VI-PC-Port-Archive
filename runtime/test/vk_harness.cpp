@@ -33,6 +33,7 @@
 #include "vk_pc_tail.h"
 #include "../src/descriptor_table.h"
 #include "../src/gfx10_descriptors.h"
+#include "../src/moltenvk_no_contraction.h"
 
 #include <cctype>
 #include <cstddef>
@@ -264,11 +265,14 @@ int main(int argc, char** argv) {
         return 1;
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
+    VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+    sgProps.pNext = &driver;
     VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     props2.pNext = &sgProps;
     vkGetPhysicalDeviceProperties2(pd, &props2);
     std::fprintf(stderr, "device: %s (subgroup %u..%u)\n", props.deviceName, sgProps.minSubgroupSize, sgProps.maxSubgroupSize);
+    const auto safe_math = leonida::moltenvk_safe_math(driver.driverID, props.driverVersion);
     uint32_t qn = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, nullptr);
     std::vector<VkQueueFamilyProperties> qf(qn);
@@ -583,7 +587,7 @@ int main(int argc, char** argv) {
     VkFramebuffer fb; CHECK(vkCreateFramebuffer(dev, &fbi, nullptr, &fb));
     bool tail_block = false;   // some stage reads the --pc-tail-ubo block (declares set 1)
     auto module = [&](const char* p, VkShaderModule* m) {
-        auto code = read_spv(p);
+        auto code = leonida::drop_no_contraction(read_spv(p), safe_math);
         if (pc_tail && leonida::vk_test::spirv_declares_set(code.data(), code.size() * 4, leonida::vk_test::pc_tail_set))
             tail_block = true;
         VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
