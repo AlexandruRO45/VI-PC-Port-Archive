@@ -229,13 +229,52 @@ def pose_value(sample, column):
     return sample + column / 16
 
 
+BONES = [("root", -1, 0, (0.0, 0.0, 0.0, 1.0), (0.0, 0.0, 0.0)),
+         ("spine", 0, 0x1111, (0.0, 0.0, 0.6, 0.8), (0.0, 1.0, 0.0)),
+         ("head", 1, 0x2222, (0.0, 0.0, 0.0, 1.0), (0.0, 0.5, 0.0))]
+
+
+def skeleton(p):
+    """A three-bone chain: 80-byte bones, local and inverse bind matrices, s16 parents, and a tag table that maps
+    each bone's joaat32(name) and its u16 id to its index."""
+    a = p.alloc(bytes(0x80))
+    n = len(BONES)
+    struct.pack_into("<HH", p.b, a + 0x6C, n, n)
+    bones, local, inverse, world = b"", b"", b"", []
+    for i, (name, parent, bone_id, q, t) in enumerate(BONES):
+        b = bytearray(80)
+        struct.pack_into("<4f3f4x4f", b, 0, *q, *t, 1, 1, 1, 1)
+        struct.pack_into("<Q", b, 0x30, SYSTEM + p.alloc(name.encode() + bytes(1)))
+        struct.pack_into("<hHHH", b, 0x46, parent, i, bone_id, i)
+        bones += bytes(b)
+        r = anim_clips.quaternion_rows(*q)
+        m = [r[0] + [0.0], r[1] + [0.0], r[2] + [0.0], list(t) + [1.0]]
+        local += struct.pack("<16f", *(x for row in m for x in row))
+        g = m if parent < 0 else [[sum(m[x][k] * world[parent][k][y] for k in range(4)) for y in range(4)]
+                                  for x in range(4)]
+        world.append(g)
+        rt = [[g[y][x] for y in range(3)] for x in range(3)]                      # rotation transposed
+        tt = [-sum(g[3][k] * rt[k][y] for k in range(3)) for y in range(3)]
+        inverse += struct.pack("<16f", *rt[0], 0, *rt[1], 0, *rt[2], 0, *tt, 1)
+    p.ptr(a + 0x28, p.alloc(bones))
+    p.ptr(a + 0x30, p.alloc(inverse))
+    p.ptr(a + 0x38, p.alloc(local))
+    p.ptr(a + 0x40, p.alloc(struct.pack(f"<{n}h", *(b[1] for b in BONES))))
+    slots = [(0xFFFFFFFF, 0)] * 8
+    for i, (name, _parent, bone_id, _q, _t) in enumerate(BONES):
+        slots[2 * i], slots[2 * i + 1] = (joaat32(name), i), (bone_id, i)
+    struct.pack_into("<II", p.b, a + 0x18, 8, 2 * n)
+    p.ptr(a + 0x20, p.alloc(b"".join(struct.pack("<II", *x) for x in slots)))
+    return a
+
+
 def features(p, rows=True):
     """A `.motionmatcher` feature object: a vec3 feature at column 0 and a two-vec3 one at column 3, a name table
     that maps another hash of each name to its index, and a 9-sample x 9-column pose matrix, row-major when the
     `+0x30` object is there (`rows`), else in blocks of 8 samples."""
     obj = p.alloc(bytes(0x140))
     struct.pack_into("<I", p.b, obj + 0x18, 1)
-    p.ptr(obj + 0x28, p.alloc(bytes(0x80)))           # not decoded
+    p.ptr(obj + 0x28, skeleton(p))
     samples, cols = 9, 9
     if rows:
         p.ptr(obj + 0x30, p.alloc(bytes(0x70)))       # not decoded
@@ -244,6 +283,7 @@ def features(p, rows=True):
         struct.pack_into("<IIII", p.b, obj + 0xF8, samples, cols, 1, 1)
         transforms = b"".join(struct.pack("<12f", 0, 0, 0, 1, r, 0, 0, 0, 1, 1, 1, 0) for r in range(samples))
         matcher_array(p, obj + 0xA8, transforms, samples)
+        matcher_array(p, obj + 0x98, struct.pack("<9I", *([1] * 4 + [2] * 5)), samples)  # one per sample
     else:
         stride = cols + 1
         h = [0.0] * (2 * 8 * stride)
@@ -254,10 +294,10 @@ def features(p, rows=True):
         struct.pack_into("<I", p.b, obj + 0x128, samples)
     matcher_array(p, obj + 0xF0, struct.pack(f"<{len(h)}e", *h), len(h) // 16)
     items = []
-    for column, width, name in ((0, 3, 0xF1), (3, 6, 0xF2)):
+    for column, width, name, kind in ((0, 3, joaat32("spine"), 1), (3, 6, joaat32("head"), 3)):
         f = p.alloc(bytes(0x30))
         struct.pack_into("<IHH", p.b, f + 8, column, width, 1)
-        struct.pack_into("<I", p.b, f + 0x18, name)
+        struct.pack_into("<II", p.b, f + 0x18, name, kind)
         items.append(f)
     matcher_array(p, obj + 0x40, struct.pack("<2Q", *(SYSTEM + f for f in items)), 2)
     table(p, obj + 0x48, 2, 8, [(0, 4, struct.pack("<II", 0xA1, 1)), (1, 0, struct.pack("<II", 0xA2, 0))])
@@ -443,7 +483,13 @@ class DecodeTest(unittest.TestCase):
         self.assertEqual(m["keys"], [(0x5A, 2), (1, 0), (0x5B, 1)])
         self.assertEqual(m["self"], (c["hash"], self.d["hash"]))
         self.assertEqual((m["u16_78"], m["u8_b8"]), ([0, 1, 2], [0, 1]))
-        self.assertEqual(m["features"], [(0, 3, 0xF1), (3, 6, 0xF2)])
+        self.assertEqual(m["features"], [(0, 3, joaat32("spine")), (3, 6, joaat32("head"))])
+        self.assertEqual(m["feature_kinds"], [(1, 1), (1, 3)])
+        sk = m["skeleton"]
+        self.assertEqual([b[:3] for b in sk["bones"]], [b[:3] for b in BONES])
+        self.assertEqual((sk["parents"], len(sk["tags"]), len(sk["local"])), ([-1, 0, 1], 6, 3))
+        self.assertEqual(anim_clips.skeleton_checks(sk), (True, True))
+        self.assertEqual(m["sample_u32"], [1] * 4 + [2] * 5)
         self.assertEqual(m["feature_names"], [(0xA1, 1), (0xA2, 0)])
         self.assertTrue(m["feature_second"])
         self.assertEqual((m["poses"]["layout"], m["poses"]["samples"], m["poses"]["columns"]), ("rows", 9, 9))
@@ -465,11 +511,20 @@ class DecodeTest(unittest.TestCase):
                   "matcher_feature_object_second_pointer", "matcher_pose_layout_rows",
                   "matcher_pose_samples_are_offsets_end", "matcher_pose_values_finite",
                   "matcher_pose_padding_as_expected", "matcher_pose_transforms_one_per_sample",
-                  "matcher_pose_transforms_unit_quaternion_scale_1"):
+                  "matcher_pose_transforms_unit_quaternion_scale_1", "matcher_skeleton_one_root_parents_first",
+                  "matcher_skeleton_tags_are_name_hash_and_id", "matcher_skeleton_local_is_bone_transform",
+                  "matcher_skeleton_inverse_bind_undoes_chain", "matcher_sample_u32_one_per_sample",
+                  "matcher_sample_u32_same_within_a_record"):
             self.assertEqual(stats[k], 1, k)
         self.assertEqual((stats["matcher_records"], stats["matcher_clip_table_entries"], stats["matcher_refs"],
                           stats["matcher_key_table_entries"], stats["matcher_features"],
-                          stats["matcher_feature_columns"]), (2, 2, 2, 3, 2, 9))
+                          stats["matcher_feature_columns"], stats["matcher_skeleton_bones"],
+                          stats["matcher_features_with_0e_1"], stats["matcher_features_0e_1_name_a_bone"],
+                          stats["matcher_features_0e_1_width_from_kind_bits"]), (2, 2, 2, 3, 2, 9, 3, 2, 2, 2))
+        sk["inverse_bind"][2][3] = (0.0, 0.0, 0.0, 1.0)                              # a bind that doesn't undo
+        self.assertEqual(anim_clips.skeleton_checks(sk), (True, False))
+        sk["local"][1][0] = (1.0, 0.0, 0.0, 0.0)                                     # not the bone's rotation
+        self.assertEqual(anim_clips.skeleton_checks(sk)[0], False)
 
     def test_motionmatcher_poses_in_blocks_of_8(self):
         s = anim_clips.System(bytearray(two_sequence_dictionary(pose_rows=False)))
@@ -532,6 +587,28 @@ class DecodeTest(unittest.TestCase):
                 struct.pack_into(fmt, s.d, f, v)
         anim_clips.parse_matcher(s, at)
 
+    def test_motionmatcher_skeleton_that_does_not_fit(self):
+        s = anim_clips.System(bytearray(two_sequence_dictionary()))
+        at = [v for k, v in s.atmap(0x48) if k & 0xFFFFFFFF == 3][0]
+        obj = s.ptr(at + 0x20)
+        sk = s.ptr(obj + 0x28)
+        name = s.ptr(s.ptr(sk + 0x28) + 0x30)
+        for writes in ([(sk + 0x1C, "<I", 5)],                                      # 6 full slots for 5 entries
+                       [(sk + 0x20, "<Q", 0)],                                      # no tag table
+                       [(sk + 0x18, "<I", len(s.d))],                               # tag table past the pages
+                       [(sk + 0x38, "<Q", 0)],                                      # no local matrices
+                       [(sk + 0x6C, "<H", 0x7FFF)],                                 # bones past the pages
+                       [(name + 8 * i, "<Q", 0x6161616161616161) for i in range(40)],  # a name without its end
+                       [(obj + 0x94, "<I", len(s.d))]):                             # per-sample words past the pages
+            kept = [(f, fmt, struct.unpack_from(fmt, s.d, f)[0]) for f, fmt, _v in writes]
+            for f, fmt, v in writes:
+                struct.pack_into(fmt, s.d, f, v)
+            with self.assertRaises(anim_clips.DecodeError, msg=repr(writes[0])):
+                anim_clips.parse_matcher(s, at)
+            for f, fmt, v in kept:
+                struct.pack_into(fmt, s.d, f, v)
+        anim_clips.parse_matcher(s, at)
+
     def test_motionmatcher_without_refs_and_with_a_bad_table(self):
         d = anim_clips.parse_dictionary(anim_clips.System(two_sequence_dictionary(matcher_refs=False)))
         c = [c for c in d["clips"] if c["kind"] == "motionmatcher"][0]
@@ -554,7 +631,7 @@ class DecodeTest(unittest.TestCase):
             anim_clips.parse_matcher(s, at)
         struct.pack_into("<Q", s.d, first, kept)
         for field, value in ((at + 0x20, 0),                                        # no feature object
-                             (s.ptr(at + 0x20) + 0x28, 0),                         # no +0x28 object
+                             (s.ptr(at + 0x20) + 0x28, 0),                         # no skeleton
                              (first, 0x50000000 + len(s.d) - 8),                   # a feature past the pages
                              (s.ptr(at + 0x20) + 0x48, 3)):                        # feature table: 3 groups
             kept = s.u64(field)

@@ -248,8 +248,11 @@ def parse_matcher(s, at):
 
 def matcher_features(s, at):
     """The `.motionmatcher`'s `+0x20` object: the features a pose is compared on. `+0x40` is an array of pointers to
-    0x30-byte features {u32 column at +0x08; u16 width at +0x0C; u16 at +0x0E; u32 name hash at +0x18}, and
-    `+0x48` a hash table of (name hash, feature index) with 8-byte slots, hashed differently from `+0x18`."""
+    0x30-byte features {u32 column at +0x08; u16 width at +0x0C; u16 at +0x0E; u32 name hash at +0x18; u32 kind
+    bits at +0x1C}, and `+0x48` a hash table of (name hash, feature index) with 8-byte slots, hashed differently
+    from `+0x18`. With `+0x0E` = 1 the name hash is joaat32 of a skeleton bone's name and the width is 3 columns
+    for kind bit 0, 3 for bit 1 and 6 for bit 3. `+0x28` is the skeleton (`matcher_skeleton`); with the `+0x30`
+    object, `+0x98` holds one u32 per sample."""
     obj = s.ptr(at + 0x20)
     if obj is None:
         raise DecodeError("motionmatcher without a feature object")
@@ -260,14 +263,58 @@ def matcher_features(s, at):
         if f is None:
             raise DecodeError("motionmatcher feature pointer is null")
         features.append((s.u32(f + 0x08), s.u16(f + 0x0C), s.u32(f + 0x18)))
+    kinds = [(s.u16(s.ptr(arr + 8 * i) + 0x0E), s.u32(s.ptr(arr + 8 * i) + 0x1C)) for i in range(n)]
     names = [(s.u32(o), s.u32(o + 4)) for o in hash_table(s, obj + 0x48, 8)]
-    if s.ptr(obj + 0x28) is None:
-        raise DecodeError("motionmatcher feature object without its +0x28 object")
+    skel = s.ptr(obj + 0x28)
+    if skel is None:
+        raise DecodeError("motionmatcher feature object without its skeleton")
     second = s.ptr(obj + 0x30) is not None
     columns = features[-1][0] + features[-1][1] if features else 0
+    poses = matcher_poses(s, obj, columns, second)
+    tags, nt = matcher_array(s, obj + 0x98)
+    sample_u32 = []
+    if second and nt:
+        if tags + 4 * nt > len(s.d):
+            raise DecodeError("motionmatcher per-sample words run past the pages")
+        sample_u32 = list(struct.unpack_from(f"<{nt}I", s.d, tags))
     return {"features": features, "feature_names": names,                  # (column, width, name hash); (hash, index)
+            "feature_kinds": kinds,                                         # (u16 +0x0E, u32 +0x1C) per feature
             "feature_second": second,                                       # +0x30 object present (not decoded)
-            **matcher_poses(s, obj, columns, second)}
+            "skeleton": matcher_skeleton(s, skel), "sample_u32": sample_u32, **poses}
+
+
+def matcher_skeleton(s, at):
+    """The feature object's `+0x28`: the skeleton the features are measured on. `+0x6C` u16 bone count; `+0x28` the
+    80-byte bones {f32 rotation quaternion[4]; f32 translation[3]; f32 ?; f32 1.0[4]; char *name at +0x30; s16
+    parent at +0x46; u16 index at +0x48 and +0x4C; u16 bone id at +0x4A}; `+0x38` each bone's 4x4 local matrix and
+    `+0x30` its inverse bind matrix (row-vector convention, translation in row 3); `+0x40` the parents as s16; and a
+    tag table at `+0x18` (u32 slots, u32 entries, pointer) of 8-byte {u32 tag; u32 bone} slots, empty tag 0xFFFFFFFF.
+    -> {"bones": [(name, parent, id, rotation, translation)], "tags", "local", "inverse_bind"}"""
+    n, bones = s.u16(at + 0x6C), s.ptr(at + 0x28)
+    mats = [s.ptr(at + 0x38), s.ptr(at + 0x30), s.ptr(at + 0x40)]
+    if n and (bones is None or None in mats):
+        raise DecodeError("motionmatcher skeleton without its arrays")
+    if n and (bones + 80 * n > len(s.d) or max(mats[0], mats[1]) + 64 * n > len(s.d) or mats[2] + 2 * n > len(s.d)):
+        raise DecodeError("motionmatcher skeleton runs past the pages")
+    out = []
+    for i in range(n):
+        b = bones + 80 * i
+        name_at = s.ptr(b + 0x30)
+        end = s.d.find(b"\0", name_at, name_at + 256) if name_at is not None else -1
+        if end < 0:
+            raise DecodeError("motionmatcher bone without a name")
+        out.append((s.d[name_at:end].decode("latin-1"), struct.unpack_from("<h", s.d, b + 0x46)[0], s.u16(b + 0x4A),
+                    struct.unpack_from("<4f", s.d, b), struct.unpack_from("<3f", s.d, b + 0x10)))
+    slots, entries, tt = s.u32(at + 0x18), s.u32(at + 0x1C), s.ptr(at + 0x20)
+    if tt is None or tt + 8 * slots > len(s.d):
+        raise DecodeError("motionmatcher skeleton tag table runs past the pages")
+    tags = [struct.unpack_from("<II", s.d, tt + 8 * i) for i in range(slots)]
+    tags = [t for t in tags if t[0] != 0xFFFFFFFF]
+    if len(tags) != entries:
+        raise DecodeError("motionmatcher skeleton tag table count does not fit")
+    matrix = lambda p, i: [struct.unpack_from("<4f", s.d, p + 64 * i + 16 * r) for r in range(4)]  # noqa: E731
+    return {"bones": out, "tags": tags, "parents": list(struct.unpack_from(f"<{n}h", s.d, mats[2])) if n else [],
+            "local": [matrix(mats[0], i) for i in range(n)], "inverse_bind": [matrix(mats[1], i) for i in range(n)]}
 
 
 def matcher_poses(s, obj, columns, rows_layout):
@@ -324,6 +371,33 @@ def matcher_pose(s, poses, sample):
     return [struct.unpack_from("<e", s.d, base + 2 * (c * 8 + sample % 8))[0] for c in range(cols)]
 
 
+def quaternion_rows(x, y, z, w):
+    """The rotation of a unit quaternion as a 3x3 matrix for row vectors (v' = v M)."""
+    return [[1 - 2 * (y * y + z * z), 2 * (x * y + z * w), 2 * (x * z - y * w)],
+            [2 * (x * y - z * w), 1 - 2 * (x * x + z * z), 2 * (y * z + x * w)],
+            [2 * (x * z + y * w), 2 * (y * z - x * w), 1 - 2 * (x * x + y * y)]]
+
+
+def skeleton_checks(skel):
+    """-> (local matrices are the bones' rotation and translation, inverse binds undo the parent chain), each
+    to 2e-3, for the row-vector convention."""
+    local_ok, inverse_ok, world = True, True, []
+    for i, (_name, parent, _id, q, t) in enumerate(skel["bones"]):
+        m = skel["local"][i]
+        r = quaternion_rows(*q)
+        local_ok &= all(abs(m[a][b] - r[a][b]) < 2e-3 for a in range(3) for b in range(3)) and all(
+            abs(m[3][a] - t[a]) < 2e-3 for a in range(3))
+        lm = [list(m[a][:3]) + [0.0] for a in range(3)] + [list(t) + [1.0]]
+        g = lm if parent < 0 else [[sum(lm[a][k] * world[parent][k][b] for k in range(4)) for b in range(4)]
+                                   for a in range(4)]
+        world.append(g)
+        ib = skel["inverse_bind"][i]
+        inv = [list(row[:3]) + [0.0] for row in ib[:3]] + [list(ib[3][:3]) + [1.0]]
+        inverse_ok &= all(abs(sum(g[a][k] * inv[k][b] for k in range(4)) - (a == b)) < 2e-3
+                          for a in range(4) for b in range(4))
+    return local_ok, inverse_ok
+
+
 def count_matcher(c, dictionary_hash, stats):
     """Counts for a `.motionmatcher`'s decoded fields (no values)."""
     m = c.get("matcher")
@@ -365,6 +439,28 @@ def count_matcher(c, dictionary_hash, stats):
     stats["matcher_feature_name_table_indices_0_to_f"] += bool(f) and sorted(
         i for _h, i in m["feature_names"]) == list(range(len(f)))
     stats["matcher_feature_object_second_pointer"] += m["feature_second"]
+    sk = m["skeleton"]
+    bones = sk["bones"]
+    stats["matcher_skeleton_bones"] += len(bones)
+    parents = sk["parents"]
+    stats["matcher_skeleton_one_root_parents_first"] += bool(bones) and parents == [b[1] for b in bones] and sum(
+        p < 0 for p in parents) == 1 and all(0 <= p < i for i, p in enumerate(parents) if p >= 0)
+    stats["matcher_skeleton_tags_are_name_hash_and_id"] += bool(bones) and sorted(sk["tags"]) == sorted(
+        [(anim_index.joaat32(b[0]), i) for i, b in enumerate(bones)] + [(b[2], i) for i, b in enumerate(bones)])
+    local_ok, inverse_ok = skeleton_checks(sk)
+    stats["matcher_skeleton_local_is_bone_transform"] += bool(bones) and local_ok
+    stats["matcher_skeleton_inverse_bind_undoes_chain"] += bool(bones) and inverse_ok
+    names = {anim_index.joaat32(b[0]) for b in bones}
+    simple = [(w, k, h) for (_c, w, h), (e, k) in zip(f, m["feature_kinds"]) if e == 1]
+    stats["matcher_features_with_0e_1"] += len(simple)
+    stats["matcher_features_0e_1_name_a_bone"] += sum(h in names for _w, _k, h in simple)
+    stats["matcher_features_0e_1_width_from_kind_bits"] += sum(
+        w == 3 * (k & 1) + 3 * (k >> 1 & 1) + 6 * (k >> 3 & 1) for w, k, _h in simple)
+    u = m["sample_u32"]
+    if u:
+        stats["matcher_sample_u32_one_per_sample"] += len(u) == m["poses"]["samples"]
+        stats["matcher_sample_u32_same_within_a_record"] += all(
+            len(set(u[a:b])) <= 1 for a, b in zip(m["offsets"], m["offsets"][1:]))
     p = m["poses"]
     stats["matcher_pose_layout_rows" if p["layout"] == "rows" else "matcher_pose_layout_blocks_of_8"] += 1
     stats["matcher_pose_samples"] += p["samples"]
