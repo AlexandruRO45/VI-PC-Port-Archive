@@ -16,7 +16,7 @@ import pefile
 TOOLS = Path(__file__).resolve().parents[2] / "tools"
 sys.path.insert(0, str(TOOLS))
 from intake_exe import main as intake_main
-from pe_inventory import scan
+from pe_inventory import exports, scan
 
 
 def check(folder, fixture, provider):
@@ -250,7 +250,22 @@ def check_export_reads(folder, provider):
         pe.set_dword_at_rva(d.AddressOfFunctions + 4 * (77 - d.Base), rva)
         return rva
 
+    def directory_edge(pe, d, section, include_nul):
+        value = b"fixture.target\0"
+        rva = section.VirtualAddress + section.SizeOfRawData - len(value)
+        section.Misc_VirtualSize = section.SizeOfRawData
+        pe.set_bytes_at_rva(rva, value)
+        pe.set_dword_at_rva(d.AddressOfFunctions + 4 * (77 - d.Base), rva)
+        directory = pe.OPTIONAL_HEADER.DATA_DIRECTORY[0]
+        directory.Size = rva + len(value) - directory.VirtualAddress - int(not include_nul)
+        return rva
+
+    valid, _ = patched("last-byte", lambda *args: directory_edge(*args, include_nul=True))
+    with pefile.PE(str(valid / provider.name)) as pe:
+        assert any(row["ordinal"] == 77 and row["forwarder"] == "fixture.target" for row in exports(pe))
+
     for name, change, message in (
+            ("past-end", lambda *args: directory_edge(*args, include_nul=False), "Unterminated export forwarder at RVA {:#x}"),
             ("outside", outside, "Export name at RVA {:#x} is outside the file's sections"),
             ("unterminated", unterminated, "Unterminated export name at RVA {:#x}"),
             ("short-names", short_names, "Export name pointer table at RVA {:#x} is outside the file's sections"),

@@ -90,7 +90,7 @@ def exports(pe):
     named = set(indices)
     entries += [(i, None) for i in range(len(functions)) if i not in named]
     return [dict(ordinal=base + i, name=label(name),
-                 forwarder=label(read_name(pe, functions[i], "export forwarder"))
+                 forwarder=label(read_name(pe, functions[i], "export forwarder", end=start + size))
                  if start <= functions[i] < start + size else None)
             for i, name in entries if functions[i]]
 
@@ -159,9 +159,10 @@ def read_rva(pe, rva, size, what="Import data"):
     return data
 
 
-def read_name(pe, rva, what="import name"):
+def read_name(pe, rva, what="import name", *, end=None):
     section = pe.get_section_by_rva(rva)
-    data = section.get_data(rva, 0x10000) if section else b""
+    limit = 0x10000 if end is None else min(0x10000, end - rva)
+    data = section.get_data(rva, limit) if section and limit > 0 else b""
     if not data:
         raise ValueError(f"{what.capitalize()} at RVA {rva:#x} is outside the file's sections")
     name, terminator, _ = data.partition(b"\0")
