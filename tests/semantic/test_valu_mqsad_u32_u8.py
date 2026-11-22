@@ -390,6 +390,76 @@ class SIMDInterpreter:
 
 
 # ==============================================================================
+# Condition Codes, Status Flags, and Carry Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class MqsadDwordStatus:
+    """Per-dword status flags for v_mqsad_u32_u8 accumulator."""
+    carry: bool
+    zero: bool
+    sad_zero: bool
+    max_sad: bool
+    byte_sad: int
+    full_sum: int
+
+
+@dataclass(frozen=True)
+class MqsadStatusFlags:
+    """Aggregate status flags and carry generation for v_mqsad_u32_u8."""
+    dword_status: Tuple[MqsadDwordStatus, MqsadDwordStatus, MqsadDwordStatus, MqsadDwordStatus]
+    any_carry: bool
+    all_carry: bool
+    any_zero: bool
+    all_zero: bool
+    all_sad_zero: bool
+    active_mask_bytes: int
+
+
+def compute_mqsad_dword_status(win: int, mask: int, acc: int) -> MqsadDwordStatus:
+    """Compute status and carry for a single accumulator dword."""
+    sad = ref_masked_byte_sad_u32(win, mask)
+    acc_u32 = acc & MASK32
+    full_sum = acc_u32 + sad
+    carry = bool(full_sum >= (1 << 32))
+    res = full_sum & MASK32
+    return MqsadDwordStatus(
+        carry=carry,
+        zero=(res == 0),
+        sad_zero=(sad == 0),
+        max_sad=(sad == MAX_BYTE_SAD),
+        byte_sad=sad,
+        full_sum=full_sum,
+    )
+
+
+def evaluate_mqsad_flags(s0_64: int, s1_32: int, s2_quad: Sequence[int]) -> MqsadStatusFlags:
+    """Evaluate architectural condition codes and status flags for v_mqsad_u32_u8."""
+    if len(s2_quad) != 4:
+        raise ValueError(f"src2 accumulator must have 4 elements, got {len(s2_quad)}")
+
+    statuses = []
+    for k in range(4):
+        win = byte_window_u32(s0_64, k)
+        statuses.append(compute_mqsad_dword_status(win, s1_32, s2_quad[k]))
+
+    d0, d1, d2, d3 = statuses
+    tuple_statuses = (d0, d1, d2, d3)
+
+    active_bytes = sum(1 for i in range(4) if extract_byte(s1_32, i) != 0)
+
+    return MqsadStatusFlags(
+        dword_status=tuple_statuses,
+        any_carry=any(s.carry for s in statuses),
+        all_carry=all(s.carry for s in statuses),
+        any_zero=any(s.zero for s in statuses),
+        all_zero=all(s.zero for s in statuses),
+        all_sad_zero=all(s.sad_zero for s in statuses),
+        active_mask_bytes=active_bytes,
+    )
+
+
+# ==============================================================================
 # Unit Tests: Model and Reference Oracle
 # ==============================================================================
 
@@ -964,6 +1034,73 @@ class TestValuMqsadU32U8RegisterAliasing(unittest.TestCase):
                     state.read_lane(Operand.vgpr(4, count=4), lane),
                     initial_acc,
                 )
+
+
+class TestValuMqsadU32U8StatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry generation."""
+
+    def test_dword_carry_exact_boundary(self) -> None:
+        # acc = 0xFFFFFFFF, win = 0x05, mask = 0x04 -> diff = 1 -> full_sum = 0x100000000
+        # carry = True, zero = True (wrapped to 0)
+        status = compute_mqsad_dword_status(win=0x05, mask=0x04, acc=0xFFFF_FFFF)
+        self.assertTrue(status.carry)
+        self.assertTrue(status.zero)
+        self.assertEqual(status.full_sum, 0x1_0000_0000)
+        self.assertEqual(status.byte_sad, 1)
+
+        # acc = 0xFFFFFFFF, but sad = 0 -> full_sum = 0xFFFFFFFF -> carry = False, zero = False
+        status_no_carry = compute_mqsad_dword_status(win=0x04, mask=0x04, acc=0xFFFF_FFFF)
+        self.assertFalse(status_no_carry.carry)
+        self.assertFalse(status_no_carry.zero)
+        self.assertEqual(status_no_carry.full_sum, 0xFFFF_FFFF)
+        self.assertEqual(status_no_carry.byte_sad, 0)
+
+    def test_all_carry_generation(self) -> None:
+        # Each window produces SAD >= 1, and all accumulators are 0xFFFFFFFF
+        src0 = 0x0807060504030201
+        src1 = 0x04030201  # SADs are [0, 4, 8, 12] -> window 0 has SAD 0, so no carry on d0
+        flags = evaluate_mqsad_flags(src0, src1, [0xFFFF_FFFF] * 4)
+        self.assertTrue(flags.any_carry)
+        self.assertFalse(flags.all_carry)
+        self.assertFalse(flags.dword_status[0].carry)
+        self.assertTrue(flags.dword_status[1].carry)
+        self.assertTrue(flags.dword_status[2].carry)
+        self.assertTrue(flags.dword_status[3].carry)
+
+        # When all windows produce SAD >= 1
+        src0_all_diff = 0xFFFFFFFFFFFFFFFF
+        src1_all_diff = 0x01010101
+        flags_all = evaluate_mqsad_flags(src0_all_diff, src1_all_diff, [0xFFFF_FFFF] * 4)
+        self.assertTrue(flags_all.all_carry)
+
+    def test_all_zero_condition(self) -> None:
+        flags = evaluate_mqsad_flags(0, 0, [0, 0, 0, 0])
+        self.assertTrue(flags.all_zero)
+        self.assertTrue(flags.all_sad_zero)
+        self.assertFalse(flags.any_carry)
+        self.assertEqual(flags.active_mask_bytes, 0)
+
+    def test_active_mask_byte_counting(self) -> None:
+        patterns = [
+            (0x00000000, 0),
+            (0x000000FF, 1),
+            (0x0000FFFF, 2),
+            (0x00FFFFFF, 3),
+            (0xFFFFFFFF, 4),
+            (0xAA005500, 2),
+        ]
+        for mask, expected_count in patterns:
+            with self.subTest(mask=hex(mask)):
+                flags = evaluate_mqsad_flags(0, mask, [0, 0, 0, 0])
+                self.assertEqual(flags.active_mask_bytes, expected_count)
+
+    def test_max_byte_sad_flag(self) -> None:
+        # win has 4 bytes of 0x00, mask has 4 bytes of 0xFF -> SAD = 4 * 255 = 1020
+        status = compute_mqsad_dword_status(win=0x00000000, mask=0xFFFFFFFF, acc=0)
+        self.assertTrue(status.max_sad)
+        self.assertEqual(status.byte_sad, 1020)
+        self.assertFalse(status.carry)
+        self.assertFalse(status.zero)
 
 
 if __name__ == "__main__":
