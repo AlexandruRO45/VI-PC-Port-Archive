@@ -89,6 +89,8 @@ struct ShaderMeta {
     uint32_t push_constant_bytes = 0;  // 0 = absent in index (128 with pc_tail, else 144)
     uint32_t pc_tail_bytes = 0;        // >0 = --pc-tail-ubo uniform block at set 1, binding 0
     bool writes_depth = false;
+    bool writes_stencil = false;
+    bool writes_sample_mask = false;
     bool needs_maintenance8 = false;
     std::vector<std::string> features;
     std::vector<std::string> float_controls;   // VkPhysicalDeviceFloatControlsProperties members that must be true
@@ -317,6 +319,8 @@ struct JsonParser {
                 m.push_constant_bytes = parse_strict_u32("expected unsigned 32-bit push_constant_bytes");
             else if (k == "pc_tail") m.pc_tail_bytes = parse_pc_tail_bytes();
             else if (k == "writes_depth") m.writes_depth = parse_bool();
+            else if (k == "writes_stencil") m.writes_stencil = parse_bool();
+            else if (k == "writes_sample_mask") m.writes_sample_mask = parse_bool();
             else if (k == "needs_maintenance8") m.needs_maintenance8 = parse_bool();
             else if (k == "features") m.features = parse_str_array();
             else if (k == "float_controls") m.float_controls = parse_str_array();
@@ -813,15 +817,17 @@ int main(int argc, char** argv) {
 #endif
 
     // Scan selected shaders to request only the optional extensions they actually use.
-    bool want_mesh = false, want_bary = false, want_lock = false, want_m8 = false, want_fma = false;
+    bool want_mesh = false, want_bary = false, want_lock = false, want_m8 = false, want_fma = false, want_stencil = false;
     for (auto& [_, meta] : work) {
         if (meta->stage == "ms") want_mesh = true;
         if (meta->needs_maintenance8) want_m8 = true;
+        if (meta->writes_stencil) want_stencil = true;
         for (const auto& feat : meta->features) {
             if (feat == "meshShader") want_mesh = true;
             else if (feat == "fragmentShaderBarycentric") want_bary = true;
             else if (feat == "fragmentShaderPixelInterlock") want_lock = true;
             else if (feat == "shaderFmaFloat32") want_fma = true;   // OpFmaKHR (rdna2spirv.py --fma khr)
+            else if (feat == "shaderStencilExport") want_stencil = true;
         }
     }
 
@@ -838,6 +844,7 @@ int main(int argc, char** argv) {
     LOADI(vkEnumeratePhysicalDevices); LOADI(vkGetPhysicalDeviceProperties); LOADI(vkCreateDevice);
     LOADI(vkGetPhysicalDeviceProperties2);
     LOADI(vkGetDeviceProcAddr); LOADI(vkEnumerateDeviceExtensionProperties); LOADI(vkGetPhysicalDeviceFeatures2);
+    LOADI(vkGetPhysicalDeviceFormatProperties);
     uint32_t n = 0;
     vkEnumeratePhysicalDevices(inst, &n, nullptr);
     if (n == 0) { std::fprintf(stderr, "no Vulkan physical devices found\n"); return 1; }
@@ -905,6 +912,17 @@ int main(int argc, char** argv) {
     const bool ext_fma = false;
     (void)want_fma;
 #endif
+    const bool ext_stencil = want_stencil && has(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
+    if (ext_stencil) enable.push_back(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
+    VkFormat ds_format = VK_FORMAT_UNDEFINED;
+    for (VkFormat fmt : {VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT}) {
+        VkFormatProperties fp{};
+        vkGetPhysicalDeviceFormatProperties(pd, fmt, &fp);
+        if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) {
+            ds_format = fmt;
+            break;
+        }
+    }
     const bool ext_exe = link(&exe, reinterpret_cast<VkBaseOutStructure*>(&exe),
                               VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME, !stats_path.empty());
     if (!stats_path.empty() && !ext_exe) {
@@ -999,6 +1017,7 @@ int main(int argc, char** argv) {
                 return "unknown float control " + fc;
             }
         }
+        if (meta.writes_stencil && !ext_stencil) return "no VK_EXT_shader_stencil_export";
         for (const auto& feat : meta.features) {
             if (feat == "meshShader" && !(ext_mesh && mesh.meshShader)) return "no VK_EXT_mesh_shader";
             if (feat == "geometryShader" && !f2.features.geometryShader) return "no geometryShader";
@@ -1011,6 +1030,7 @@ int main(int argc, char** argv) {
                 return "no VK_KHR_shader_fma (shaderFmaFloat32)";
 #endif
             }
+            if (feat == "shaderStencilExport" && !ext_stencil) return "no VK_EXT_shader_stencil_export";
             if (feat == "shaderFloat64" && !f2.features.shaderFloat64) return "no shaderFloat64";
             if (feat == "shaderInt64" && !f2.features.shaderInt64) return "no shaderInt64";
             if (feat == "shaderDrawParameters" && !f11.shaderDrawParameters) return "no shaderDrawParameters";
@@ -1362,6 +1382,7 @@ int main(int argc, char** argv) {
                     std::string skip_reason;
                     std::vector<VkFormat> color_formats;
                     VkFormat depth_format = VK_FORMAT_UNDEFINED;
+                    VkFormat stencil_format = VK_FORMAT_UNDEFINED;
                     bool use_vertex_input = true;
 
                     if (stage == "ps") {
@@ -1374,9 +1395,16 @@ int main(int argc, char** argv) {
                             for (uint32_t loc : meta.outputs) n_color = std::max(n_color, loc + 1);
                             if (n_color > props.limits.maxColorAttachments) {
                                 skip_reason = "exceeds maxColorAttachments";
+                            } else if (meta.writes_stencil && ds_format == VK_FORMAT_UNDEFINED) {
+                                skip_reason = "no depth-stencil attachment format";
                             } else {
                                 color_formats.assign(n_color, VK_FORMAT_R32G32B32A32_SFLOAT);
-                                if (meta.writes_depth) depth_format = VK_FORMAT_D32_SFLOAT;
+                                if (meta.writes_stencil) {
+                                    depth_format = ds_format;
+                                    stencil_format = ds_format;
+                                } else if (meta.writes_depth) {
+                                    depth_format = VK_FORMAT_D32_SFLOAT;
+                                }
                                 stages.push_back(make_stage(VK_SHADER_STAGE_VERTEX_BIT, vs_mod, false));
                                 stages.push_back(make_stage(VK_SHADER_STAGE_FRAGMENT_BIT, sm, true));
                             }
@@ -1460,10 +1488,18 @@ int main(int argc, char** argv) {
                         msaa.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
                         VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-                        if (depth_format != VK_FORMAT_UNDEFINED) {
+                        if (meta.writes_depth) {
                             ds.depthTestEnable = VK_TRUE;
                             ds.depthWriteEnable = VK_TRUE;
                             ds.depthCompareOp = VK_COMPARE_OP_LESS;
+                        }
+                        if (meta.writes_stencil) {
+                            ds.stencilTestEnable = VK_TRUE;
+                            ds.front.compareOp = VK_COMPARE_OP_ALWAYS;
+                            ds.front.passOp = VK_STENCIL_OP_REPLACE;
+                            ds.front.compareMask = 0xFF;
+                            ds.front.writeMask = 0xFF;
+                            ds.back = ds.front;
                         }
 
                         std::vector<VkPipelineColorBlendAttachmentState> blend_atts(color_formats.size());
@@ -1476,6 +1512,7 @@ int main(int argc, char** argv) {
                         rend.colorAttachmentCount = uint32_t(color_formats.size());
                         rend.pColorAttachmentFormats = color_formats.empty() ? nullptr : color_formats.data();
                         rend.depthAttachmentFormat = depth_format;
+                        rend.stencilAttachmentFormat = stencil_format;
 
                         VkGraphicsPipelineCreateInfo gpci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
                         gpci.pNext = &rend;
