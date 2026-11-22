@@ -936,5 +936,92 @@ class TestValuMqsadPkU16U8ConditionCodesAndFlags(unittest.TestCase):
         self.assertTrue(flags.carry_lanes[1])
 
 
+# ==============================================================================
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Bit Patterns
+# ==============================================================================
+
+class TestValuMqsadPkU16U8IEEE754BitPatterns(unittest.TestCase):
+    """Verifies integer interpretation of IEEE 754 float bit patterns in VALU registers.
+
+    VALU integer SAD instructions process operands strictly as packed raw bits.
+    No floating-point exception, canonicalization, or subnormal flushing occurs.
+    """
+
+    # IEEE 754 Float32 bit constants
+    POS_ZERO_F32 = 0x0000_0000
+    NEG_ZERO_F32 = 0x8000_0000
+    POS_INF_F32 = 0x7F80_0000
+    NEG_INF_F32 = 0xFF80_0000
+    QNAN_F32 = 0x7FC0_0000
+    SNAN_F32 = 0x7F80_0001
+    SUBNORMAL_MIN_F32 = 0x0000_0001
+    SUBNORMAL_MAX_F32 = 0x007F_FFFF
+
+    # IEEE 754 Float16 packed pairs
+    POS_ZERO_F16_PAIR = 0x0000_0000
+    NEG_ZERO_F16_PAIR = 0x8000_8000
+    POS_ONE_F16_PAIR = 0x3C00_3C00
+    NEG_ONE_F16_PAIR = 0xBC00_BC00
+
+    def test_signed_zeros_integer_distance(self) -> None:
+        """+0.0 (0x00000000) vs -0.0 (0x80000000): differs only in sign byte (0x80 vs 0x00)."""
+        s0 = self.POS_ZERO_F32
+        # s1 query is -0.0
+        s1 = self.NEG_ZERO_F32
+        w0, _, _, _ = ref_mqsad_pk_u16_u8(s0, s1, 0)
+        # Byte 0: s1=0 -> masked out (0)
+        # Byte 1: s1=0 -> masked out (0)
+        # Byte 2: s1=0 -> masked out (0)
+        # Byte 3: s1=0x80 != 0 -> |0x00 - 0x80| = 128
+        self.assertEqual(w0, 128)
+
+    def test_subnormal_no_flush_to_zero(self) -> None:
+        """Subnormal bit patterns are NOT flushed to zero; raw bits participate in arithmetic."""
+        # Query byte 0 is 1 (subnormal min)
+        s1 = self.SUBNORMAL_MIN_F32  # 0x00000001
+        s0 = 0x0000_0005
+        w0, _, _, _ = ref_mqsad_pk_u16_u8(s0, s1, 0)
+        # Byte 0: |5 - 1| = 4. Bytes 1..3: s1 is 0 -> masked out.
+        self.assertEqual(w0, 4)
+
+    def test_nan_bit_patterns_preserve_payload_without_canonicalization(self) -> None:
+        """Signaling and Quiet NaNs are treated purely as integer bitmasks without canonicalization."""
+        # s0 is QNaN (0x7FC00000), s1 is SNaN (0x7F800001)
+        s0 = self.QNAN_F32
+        s1 = self.SNAN_F32
+        w0, _, _, _ = ref_mqsad_pk_u16_u8(s0, s1, 0)
+        # S0 bytes: [0x00, 0x00, 0xC0, 0x7F]
+        # S1 bytes: [0x01, 0x00, 0x80, 0x7F]
+        # Byte 0: |0x00 - 0x01| = 1
+        # Byte 1: S1 byte 1 is 0 -> masked out (0)
+        # Byte 2: |0xC0 - 0x80| = 0x40 = 64
+        # Byte 3: |0x7F - 0x7F| = 0
+        # Expected = 1 + 0 + 64 + 0 = 65
+        self.assertEqual(w0, 65)
+
+    def test_infinity_extremes(self) -> None:
+        """+inf (0x7F800000) vs -inf (0xFF800000): difference is only sign bit in byte 3."""
+        s0 = self.POS_INF_F32
+        s1 = self.NEG_INF_F32
+        w0, _, _, _ = ref_mqsad_pk_u16_u8(s0, s1, 0)
+        # S0 bytes: [0x00, 0x00, 0x80, 0x7F]
+        # S1 bytes: [0x00, 0x00, 0x80, 0xFF]
+        # Byte 0: s1=0 -> masked out
+        # Byte 1: s1=0 -> masked out
+        # Byte 2: |0x80 - 0x80| = 0
+        # Byte 3: |0x7F - 0xFF| = 128
+        self.assertEqual(w0, 128)
+
+    def test_packed_float16_pairs(self) -> None:
+        """Packed FP16 pairs (+1.0, -1.0) = (0x3C00, 0xBC00)."""
+        s0 = self.POS_ONE_F16_PAIR | (self.NEG_ONE_F16_PAIR << 32)
+        s1 = self.POS_ONE_F16_PAIR
+        w0, _, _, _ = ref_mqsad_pk_u16_u8(s0, s1, 0)
+        # S0 window 0: bytes of 0x3C003C00 -> [0x00, 0x3C, 0x00, 0x3C]
+        # S1: bytes of 0x3C003C00 -> [0x00, 0x3C, 0x00, 0x3C]
+        # Exact match on non-zero bytes (bytes 1 and 3 match, diff 0)
+        self.assertEqual(w0, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
