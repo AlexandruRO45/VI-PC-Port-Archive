@@ -132,6 +132,13 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             stmt = write(f"(carry || zero) ? {operand(1)} : {operand(0)}")
         elif op == M.LEA:
             stmt = write(address())
+        elif op == M.MOVBE:
+            # One operand is memory and the other a register of the same width; the bytes are reversed in
+            # either direction, no flag changes, and a 16-bit register destination keeps its upper bits.
+            width = UINT[MemorySizeExt.size(i.memory_size)]
+            stmt = (f"{{ const {width} a = {operand(1)}; {width} v = 0; "
+                    f"for (unsigned k = 0; k < sizeof v; ++k) v = static_cast<{width}>((v << 8) | ((a >> (8 * k)) & 0xffu)); "
+                    f"{write('v')} }}")
         elif op == M.CMP:
             # Sign-extended immediates arrive as 64-bit values; compare at the destination width.
             width = UINT[MemorySizeExt.size(i.memory_size) if i.op0_kind == K.MEMORY else RegisterExt.size(i.op0_register)]

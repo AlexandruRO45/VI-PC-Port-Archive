@@ -637,6 +637,21 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_library(cpu_address_size_lifted SHARED "${address_fixture}")
     add_test(NAME cpu_aot_address_size COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/address_size.py"
         check "$<TARGET_FILE:cpu_address_size>" "$<TARGET_FILE:cpu_address_size_lifted>")
+    cpu_asm_fixture(cpu_movbe movbe)
+    # The lifted DLL and three mutated controls that the check requires to mismatch.
+    foreach(variant IN ITEMS lifted noswap clear16 flags)
+        set(movbe_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_movbe_${variant}.cpp")
+        add_custom_command(OUTPUT "${movbe_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/movbe.py"
+                emit "$<TARGET_FILE:cpu_movbe>" "${movbe_fixture}" ${variant}
+            DEPENDS cpu_movbe tests/cpu/movbe.py tools/ffx_version_query.py
+                tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_movbe_${variant} SHARED "${movbe_fixture}")
+    endforeach()
+    add_test(NAME cpu_aot_movbe COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/movbe.py"
+        check "$<TARGET_FILE:cpu_movbe>" "$<TARGET_FILE:cpu_movbe_lifted>"
+        "$<TARGET_FILE:cpu_movbe_noswap>" "$<TARGET_FILE:cpu_movbe_clear16>" "$<TARGET_FILE:cpu_movbe_flags>")
+    set_tests_properties(cpu_aot_movbe PROPERTIES SKIP_RETURN_CODE 77)
     cpu_asm_fixture(cpu_bmi1 bmi1)
     set(bmi1_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_bmi1_lifted.cpp")
     add_custom_command(OUTPUT "${bmi1_fixture}"
