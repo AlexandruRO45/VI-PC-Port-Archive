@@ -19,6 +19,14 @@ For an index entry with `lds_bytes`, the checker compares the reported workgroup
 limit counts as a module failure before Vulkan receives the shader. Older indexes without this field still use the
 normal driver check. Mesh pipelines on devices without mesh shader support still use the existing feature skip.
 
+A corpus translated with `--mesh-compute` (the GPUs without `VK_EXT_mesh_shader`, such as MoltenVK) has its mesh
+shaders as GLCompute modules, and their entries carry the buffer layout under `mesh_compute`. Those are created as
+compute pipelines and reported as `ms-compute`, apart from `cs` and from real `ms` pipelines; `--compute-only`
+includes them. Until 2026-11-22 they were skipped as `no VK_EXT_mesh_shader`: on an Apple M4 (MoltenVK 1.4.2) that
+left 9,282 of the 26,118 modules of a full translation unchecked. Two 100-entry slices of that corpus now give 200 of
+200 `ms-compute` pipelines, 0 failed (`tests/test_vk_pipeline_check_mesh_compute.py` checks the rule with a
+hand-built module).
+
 ## Options
 
 `vk_pipeline_check <spirv dir> [cache.bin] [options]`
