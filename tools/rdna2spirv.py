@@ -409,12 +409,13 @@ class Gen:
         return self.modify_f(f, s)
 
     def fma_mix_srcs(self, a, mods):
-        """Read the 3 operands of v_fma_mix*: f16 at op_sel[i] when op_sel_hi[i] is set (via src_h so fimm is binary16), else f32."""
+        """Read the 3 operands of v_fma_mix*: f16 at op_sel[i] when op_sel_hi[i] is set (via src_h so fimm is binary16), else f32
+        (flushed to signed zero when subnormal under denorm_mode_32 = 0, SHADER-298)."""
         sel = next((m for m in mods if m.startswith("op_sel:")), "op_sel:[0,0,0]")
         selhi = next((m for m in mods if m.startswith("op_sel_hi:")), "op_sel_hi:[0,0,0]")
         sb = [int(x) for x in sel.split("[")[1].rstrip("]").split(",")]
         hb = [int(x) for x in selhi.split("[")[1].rstrip("]").split(",")]
-        return [self.f16_in(src, sb[i]) if hb[i] else self.src_f(src) for i, src in enumerate(a[1:4])]
+        return [self.f16_in(src, sb[i]) if hb[i] else self.flush_f32(self.src_f(src)) for i, src in enumerate(a[1:4])]
 
     def f16_bits(self, f, rtz=False):
         """f32 ``f`` -> f16 bits in the low 16 bits of a %uint, computed with integer ops only (SHADER-56).

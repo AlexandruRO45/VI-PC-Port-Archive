@@ -59,8 +59,16 @@ def pack_h(lo: float, hi: float) -> int:
     return (f2h(hi) << 16) | f2h(lo)
 
 
+def flush_f32_bits(b: int) -> int:
+    """Flush f32 denormals to signed zero under denorm_mode_32 = 0 (SHADER-298)."""
+    return (b & 0x80000000) if (b & 0x7FFFFFFF) < 0x00800000 else b
+
+
 def unpack_src(word: int, is_f16: int, sel_hi_half: int, neg: bool = False, abs_: bool = False) -> float:
-    v = h2f((word >> 16) if sel_hi_half else word) if is_f16 else u2f(word)
+    if is_f16:
+        v = h2f((word >> 16) if sel_hi_half else word)
+    else:
+        v = u2f(flush_f32_bits(word))
     if abs_:
         v = math.copysign(v, 1.0)
     if neg:
@@ -213,6 +221,116 @@ class FmaMixF16Tests(unittest.TestCase):
         self.assertEqual(got, pack_h(1.5, 3.5))
 
 
+class FmaMixDenormalFlushTests(unittest.TestCase):
+    """v_fma_mix* flushes f32 denormal operands to signed zero under denorm_mode_32 = 0 (SHADER-298).
+
+    On gfx1036 (RDNA2), reading an f32 denormal operand (such as 0x00000001, 0x807fffff, or integer
+    constants 1/64 used as f32) reads as signed zero in the game's MODE (found by @Sanonymous01).
+    """
+
+    SUBNORM_POS_MIN = 0x00000001       # 2^-149 (smallest positive subnormal)
+    SUBNORM_POS_MAX = 0x007FFFFF       # largest positive subnormal (just below 2^-126)
+    SUBNORM_NEG_MIN = 0x80000001       # -2^-149 (smallest negative subnormal)
+    SUBNORM_NEG_MAX = 0x807FFFFF       # largest negative subnormal
+    FLT_MIN = 0x00800000               # 2^-126 (normal float: must NOT flush)
+    FLT_MIN_NEG = 0x80800000           # -2^-126 (normal float: must NOT flush)
+    POS_ZERO = 0x00000000
+    NEG_ZERO = 0x80000000
+
+    def test_f32_denormal_operands_flush_to_signed_zero(self):
+        # fma(src0, src1, src2) = src0 * src1 + src2
+        # If an operand is denormal, it is flushed to +0.0 or -0.0 depending on sign.
+        two = f2u(2.0)
+        three = f2u(3.0)
+        five = f2u(5.0)
+
+        cases = [
+            # (src0, src1, src2, expected_result)
+            # src0 is positive denormal -> +0 * 2.0 + 5.0 = 5.0
+            (self.SUBNORM_POS_MIN, two, five, five),
+            (self.SUBNORM_POS_MAX, two, five, five),
+            # src0 is negative denormal -> -0 * 2.0 + 5.0 = 5.0
+            (self.SUBNORM_NEG_MIN, two, five, five),
+            (self.SUBNORM_NEG_MAX, two, five, five),
+            # src1 is positive denormal -> 2.0 * +0 + 5.0 = 5.0
+            (two, self.SUBNORM_POS_MIN, five, five),
+            (two, self.SUBNORM_POS_MAX, five, five),
+            # src1 is negative denormal -> 2.0 * -0 + 5.0 = 5.0
+            (two, self.SUBNORM_NEG_MIN, five, five),
+            (two, self.SUBNORM_NEG_MAX, five, five),
+            # src2 is positive denormal -> 2.0 * 3.0 + 0 = 6.0
+            (two, three, self.SUBNORM_POS_MIN, f2u(6.0)),
+            (two, three, self.SUBNORM_POS_MAX, f2u(6.0)),
+            # src2 is negative denormal -> 2.0 * 3.0 + (-0) = 6.0
+            (two, three, self.SUBNORM_NEG_MIN, f2u(6.0)),
+            (two, three, self.SUBNORM_NEG_MAX, f2u(6.0)),
+            # Flush to zero multiplying to zero: denorm * 1.0 + 0.0 -> 0.0
+            (self.SUBNORM_POS_MIN, f2u(1.0), self.POS_ZERO, self.POS_ZERO),
+            (self.SUBNORM_POS_MAX, f2u(1.0), self.POS_ZERO, self.POS_ZERO),
+        ]
+        for s0, s1, s2, want in cases:
+            with self.subTest(s0=hex(s0), s1=hex(s1), s2=hex(s2)):
+                got = run("v_fma_mix_f32 v0, v1, v2, v3", s0, s1, s2)
+                self.assertEqual(got, want)
+
+    def test_signed_zero_preserved_when_flushing(self):
+        # 1.0 * (-denorm) + (-0.0) -> 1.0 * (-0.0) + (-0.0) = -0.0
+        got = run("v_fma_mix_f32 v0, v1, v2, v3", f2u(1.0), self.SUBNORM_NEG_MAX, self.NEG_ZERO)
+        self.assertEqual(got, self.NEG_ZERO)
+
+        # -1.0 * (+denorm) + (-0.0) -> -1.0 * (+0.0) + (-0.0) = -0.0
+        got = run("v_fma_mix_f32 v0, v1, v2, v3", f2u(-1.0), self.SUBNORM_POS_MIN, self.NEG_ZERO)
+        self.assertEqual(got, self.NEG_ZERO)
+
+        # -1.0 * (-denorm) + (+0.0) -> -1.0 * (-0.0) + (+0.0) = +0.0
+        got = run("v_fma_mix_f32 v0, v1, v2, v3", f2u(-1.0), self.SUBNORM_NEG_MAX, self.POS_ZERO)
+        self.assertEqual(got, self.POS_ZERO)
+
+    def test_integer_inline_constants_used_as_f32(self):
+        # Integer constants 1 (0x00000001) and 64 (0x00000040) used as f32 are subnormals on RDNA2.
+        # Under denorm_mode_32 = 0 they read as +0.0.
+        two = f2u(2.0)
+        three = f2u(3.0)
+        seven = f2u(7.0)
+        # 1 * 2.0 + 7.0 -> 0.0 * 2.0 + 7.0 = 7.0
+        got = run("v_fma_mix_f32 v0, 1, v2, v3", 0, two, seven)
+        self.assertEqual(got, seven)
+        # 64 * 2.0 + 7.0 -> 0.0 * 2.0 + 7.0 = 7.0
+        got = run("v_fma_mix_f32 v0, 64, v2, v3", 0, two, seven)
+        self.assertEqual(got, seven)
+        # 2.0 * 1 + 7.0 -> 2.0 * 0.0 + 7.0 = 7.0
+        got = run("v_fma_mix_f32 v0, v1, 1, v3", two, 0, seven)
+        self.assertEqual(got, seven)
+        # 2.0 * 3.0 + 1 -> 6.0 + 0.0 = 6.0
+        got = run("v_fma_mix_f32 v0, v1, v2, 1", two, three, 0)
+        self.assertEqual(got, f2u(6.0))
+
+    def test_flt_min_boundary_not_flushed(self):
+        # FLT_MIN (0x00800000, 2^-126) is the smallest normal float and must NOT be flushed.
+        got = run("v_fma_mix_f32 v0, v1, v2, v3", self.FLT_MIN, f2u(1.0), self.POS_ZERO)
+        self.assertEqual(got, self.FLT_MIN)
+
+        got = run("v_fma_mix_f32 v0, v1, v2, v3", self.FLT_MIN_NEG, f2u(1.0), self.POS_ZERO)
+        self.assertEqual(got, self.FLT_MIN_NEG)
+
+    def test_fma_mix_f16_with_f32_denormal_operand(self):
+        # v_fma_mixlo_f16 / v_fma_mixhi_f16: when an operand is f32 (op_sel_hi[i] == 0),
+        # an f32 denormal must flush to signed zero.
+        h_1_5 = pack_h(1.5, 0.0)
+        h_2_0 = pack_h(2.0, 0.0)
+        got = run(
+            "v_fma_mixlo_f16 v0, v1, v2, v3 op_sel:[0,0,0] op_sel_hi:[0,1,1]",
+            self.SUBNORM_POS_MIN, h_1_5, h_2_0, old=OLD
+        )
+        self.assertEqual(got, (OLD & 0xFFFF0000) | f2h(2.0))
+
+        got_hi = run(
+            "v_fma_mixhi_f16 v0, v1, v2, v3 op_sel:[0,0,0] op_sel_hi:[0,1,1]",
+            self.SUBNORM_NEG_MAX, h_1_5, h_2_0, old=OLD
+        )
+        self.assertEqual(got_hi, (f2h(2.0) << 16) | (OLD & 0xFFFF))
+
+
 class NegativeControls(unittest.TestCase):
     """Sabotaging the translated SPIR-V must change the observed output."""
 
@@ -224,6 +342,20 @@ class NegativeControls(unittest.TestCase):
         bad, n = re.subn(r"(OpConstant %uint )65535\b", r"\g<1>0", spv)
         self.assertGreaterEqual(n, 1)
         self.assertNotEqual(si.run_fragment(bad)["%out_mrt0"][0], good)
+
+    def test_sabotage_f32_denormal_flush_detected(self):
+        # Without flush_f32, 2^-149 * 1.0 + 0.0 yields 2^-149 (0x00000001); with flush it yields 0.
+        spv, good = translate_and_run(
+            "v_fma_mix_f32 v0, v1, v2, v3",
+            0x00000001, f2u(1.0), 0
+        )
+        self.assertEqual(good, 0)
+        # Sabotage: replace the OpSelect in flush_f32 with the unfiltered float operand
+        bad, n = re.subn(r"(%\w+) = OpSelect %float (%\w+) (%\w+) (%\w+)", r"\1 = OpCopyObject %float \4", spv)
+        self.assertGreaterEqual(n, 1)
+        res = si.run_fragment(bad)["%out_mrt0"][0]
+        self.assertEqual(res, 0x00000001)
+        self.assertNotEqual(res, good)
 
 
 if __name__ == "__main__":
