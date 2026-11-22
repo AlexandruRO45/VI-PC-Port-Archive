@@ -148,6 +148,8 @@ struct Clear {
     std::uint64_t offset = 0;  // buffer
     std::uint32_t count = 0;   // buffer: elements (raw: bytes / 4)
     std::uint32_t stride = 0;  // structured
+    bool create_view = false;  // let CreateUnorderedAccessView write the slot
+    DXGI_FORMAT dxgi_format = DXGI_FORMAT_UNKNOWN;
     std::uint32_t mip = 0;     // texture
     std::uint32_t first_layer = 0;
     std::uint32_t layer_count = 1;
@@ -157,6 +159,7 @@ struct BufferCase {
     const char* name;
     UINT64 size;
     std::vector<Clear> clears;  // the first one should cover the whole buffer: default-heap buffers start undefined
+    bool resource_uav = false;  // create the resource with ALLOW_UNORDERED_ACCESS
 };
 
 struct TextureCase {
@@ -274,7 +277,9 @@ void compare(const char* what, const std::uint8_t* got, const std::uint8_t* want
 }
 
 int run_buffer(Harness& h, const BufferCase& test) {
-    Ref<ID3D12Resource> buffer = h.committed(buffer_desc(test.size), D3D12_HEAP_TYPE_DEFAULT);
+    D3D12_RESOURCE_DESC resource_desc = buffer_desc(test.size);
+    if (test.resource_uav) resource_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    Ref<ID3D12Resource> buffer = h.committed(resource_desc, D3D12_HEAP_TYPE_DEFAULT);
     auto readback_desc = buffer_desc(test.size);
     readback_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
     Ref<ID3D12Resource> readback = h.committed(readback_desc, D3D12_HEAP_TYPE_READBACK);
@@ -285,7 +290,23 @@ int run_buffer(Harness& h, const BufferCase& test) {
     const auto result = h.run(close, [&](ID3D12GraphicsCommandList* list) {
         for (UINT i = 0; i < test.clears.size(); ++i) {
             const Clear& c = test.clears[i];
-            const auto view = h.write(i, buffer_view(va, c));  // each clear has its own slot
+            D3D12_CPU_DESCRIPTOR_HANDLE view;
+            if (c.create_view) {
+                D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
+                desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+                desc.Format = c.dxgi_format;
+                const UINT64 element = c.stride ? c.stride : 4;
+                desc.Buffer.FirstElement = UINT(c.offset / element);
+                desc.Buffer.NumElements = c.count;
+                desc.Buffer.StructureByteStride = c.stride;
+                desc.Buffer.Flags = c.dxgi_format == DXGI_FORMAT_R32_TYPELESS && !c.stride
+                                        ? D3D12_BUFFER_UAV_FLAG_RAW
+                                        : D3D12_BUFFER_UAV_FLAGS(0);
+                view = h.slot(i);
+                h.device->CreateUnorderedAccessView(buffer.p, nullptr, &desc, view);
+            } else {
+                view = h.write(i, buffer_view(va, c));  // each clear has its own slot
+            }
             const auto* rects = c.rects.empty() ? nullptr : c.rects.data();
             if (c.is_float) {
                 const float v[4] = {std::bit_cast<float>(c.values[0]), std::bit_cast<float>(c.values[1]),
@@ -447,6 +468,7 @@ int main() {
         info.device = d.device;
         info.queue = d.queue;
         info.queue_family = d.family;
+        info.buffer_device_address = true;  // created buffer UAVs need a console VA
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))));
         Ref<ID3D12CommandQueue> queue;
@@ -516,6 +538,29 @@ int main() {
             c.rects = {{2, 0, 5, 1}, {7, 0, 9, 1}};
             structured.clears.push_back(c);
             buffers.push_back(structured);
+        }
+        {
+            // The same raw and structured clear slots, but written by CreateUnorderedAccessView instead of by hand.
+            BufferCase created{"created raw buffer UAV", 1024, {}};
+            created.resource_uav = true;
+            Clear c = whole(256);
+            c.create_view = true;
+            c.dxgi_format = DXGI_FORMAT_R32_TYPELESS;
+            created.clears.push_back(c);
+            buffers.push_back(created);
+        }
+        {
+            BufferCase created{"created structured buffer UAV", 1024, {}};
+            created.resource_uav = true;
+            Clear c;
+            c.values = {0xaabbccdd, 0, 0, 0};
+            c.offset = 48;
+            c.count = 10;
+            c.stride = 12;
+            c.create_view = true;
+            c.dxgi_format = DXGI_FORMAT_UNKNOWN;
+            created.clears.push_back(c);
+            buffers.push_back(created);
         }
         {
             // Elements narrower than a word at unaligned offsets: fill the middle, copy the ends.

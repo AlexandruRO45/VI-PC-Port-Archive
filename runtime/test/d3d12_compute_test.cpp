@@ -380,7 +380,7 @@ int main() {
             EXPECT(leonida::gfx10::decode({words[0], words[1], words[2], words[3]}, decoded));
             EXPECT(decoded.address == uav_buffer->GetGPUVirtualAddress() + 16);
             EXPECT(decoded.stride == 0 && decoded.num_records == 64);
-            EXPECT(decoded.format == leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT));
+            EXPECT(decoded.format == 0);
             EXPECT(decoded.oob_select == leonida::gfx10::OobSelect::raw);
 
             slot.ptr += stride;

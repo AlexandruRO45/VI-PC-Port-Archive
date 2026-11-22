@@ -3980,7 +3980,6 @@ public:
                 buffer.address = base_va + byte_off;
                 buffer.stride = 0;
                 buffer.num_records = std::uint32_t(byte_size);
-                buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
                 buffer.oob_select = leonida::gfx10::OobSelect::raw;
             } else if (uav.StructureByteStride != 0) {
                 if (desc->Format != DXGI_FORMAT_UNKNOWN || uav.StructureByteStride > 16383) return;
@@ -3992,7 +3991,6 @@ public:
                 buffer.address = base_va + byte_off;
                 buffer.stride = std::uint32_t(stride);
                 buffer.num_records = uav.NumElements;
-                buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
                 buffer.oob_select = leonida::gfx10::OobSelect::structured;
             } else {
                 const Format fmt = vulkan_format(desc->Format, false);
