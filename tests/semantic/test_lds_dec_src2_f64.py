@@ -217,5 +217,134 @@ class TestReferenceOracleAndLDSModel64(unittest.TestCase):
         self.assertEqual(lds.read_qword(idx_b), f64_to_bits(10.0))
 
 
+# ==============================================================================
+# Phase 2: Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+import dataclasses
+import enum
+
+
+class RegKind(enum.Enum):
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclasses.dataclass(frozen=True)
+class Register:
+    kind: RegKind
+    index: int
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        if self.index < 0 or self.index >= DEFAULT_NUM_VGPRS:
+            raise ValueError(f"Register index out of range [0, 255]: {self.index}")
+        if self.count not in (1, 2, 4):
+            raise ValueError(f"Unsupported register count: {self.count}")
+        if self.index + self.count > DEFAULT_NUM_VGPRS:
+            raise ValueError(f"Register range exceeds register file boundary: {self.index}")
+
+    @property
+    def is_vgpr(self) -> bool:
+        return self.kind == RegKind.VGPR
+
+    @property
+    def is_sgpr(self) -> bool:
+        return self.kind == RegKind.SGPR
+
+    def format_asm(self) -> str:
+        if self.count > 1:
+            return f"{self.kind.value}[{self.index}:{self.index + self.count - 1}]"
+        return f"{self.kind.value}{self.index}"
+
+
+class DsSrc2F64Opcode(enum.Enum):
+    DS_DEC_SRC2_F64 = "ds_dec_src2_f64"
+    DS_INC_SRC2_F64 = "ds_inc_src2_f64"
+
+
+@dataclasses.dataclass(frozen=True)
+class DsSrc2F64Instruction:
+    opcode: DsSrc2F64Opcode
+    vaddr: Register
+    offset0: int = 0
+    offset1: int = 0
+    gds: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.vaddr.is_vgpr or self.vaddr.count != 1:
+            raise ValueError(f"vaddr must be a single 32-bit VGPR: {self.vaddr}")
+        if self.offset0 < 0 or self.offset0 > 255:
+            raise ValueError(f"offset0 must be 8-bit unsigned [0, 255], got {self.offset0}")
+        if self.offset1 < 0 or self.offset1 > 255:
+            raise ValueError(f"offset1 must be 8-bit unsigned [0, 255], got {self.offset1}")
+
+    def to_assembly(self) -> str:
+        parts: list[str] = [self.opcode.value, self.vaddr.format_asm()]
+        if self.offset0 != 0:
+            parts.append(f"offset0:{self.offset0}")
+        if self.offset1 != 0:
+            parts.append(f"offset1:{self.offset1}")
+        if self.gds:
+            parts.append("gds")
+        return " ".join(parts)
+
+
+class DsDecSrc2F64Expr:
+    def __init__(self, vaddr: int, offset0: int = 0, offset1: int = 0) -> None:
+        self.vaddr = vaddr & MASK32
+        self.offset0 = offset0 & OFFSET8_MASK
+        self.offset1 = offset1 & OFFSET8_MASK
+
+    def evaluate(self, lds: LDSModel64) -> int:
+        return lds.atomic_dec_src2_f64(self.vaddr, self.offset0, self.offset1)
+
+
+class TestDsDecSrc2F64AST(unittest.TestCase):
+    """Phase 2: Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_opcode_values(self) -> None:
+        self.assertEqual(DsSrc2F64Opcode.DS_DEC_SRC2_F64.value, "ds_dec_src2_f64")
+        self.assertEqual(DsSrc2F64Opcode.DS_INC_SRC2_F64.value, "ds_inc_src2_f64")
+
+    def test_register_operand_validation(self) -> None:
+        v0 = Register(RegKind.VGPR, 0)
+        self.assertEqual(v0.format_asm(), "v0")
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256)
+
+    def test_instruction_creation_and_assembly(self) -> None:
+        v1 = Register(RegKind.VGPR, 1)
+        inst = DsSrc2F64Instruction(
+            opcode=DsSrc2F64Opcode.DS_DEC_SRC2_F64,
+            vaddr=v1,
+            offset0=1,
+            offset1=2,
+            gds=True,
+        )
+        self.assertEqual(inst.to_assembly(), "ds_dec_src2_f64 v1 offset0:1 offset1:2 gds")
+
+    def test_instruction_validation_errors(self) -> None:
+        s0 = Register(RegKind.SGPR, 0)
+        v0 = Register(RegKind.VGPR, 0)
+        with self.assertRaises(ValueError):
+            DsSrc2F64Instruction(opcode=DsSrc2F64Opcode.DS_DEC_SRC2_F64, vaddr=s0)
+        with self.assertRaises(ValueError):
+            DsSrc2F64Instruction(opcode=DsSrc2F64Opcode.DS_DEC_SRC2_F64, vaddr=v0, offset0=300)
+
+    def test_typed_expression_evaluation(self) -> None:
+        lds = LDSModel64(capacity_qwords=512)
+        vaddr = 0x200
+        idx_a = 0x200 >> 3
+        idx_b = (0x200 + 8) >> 3
+
+        lds.write_qword(idx_a, f64_to_bits(8.0))
+        lds.write_qword(idx_b, f64_to_bits(12.0))
+
+        expr = DsDecSrc2F64Expr(vaddr=vaddr, offset0=0, offset1=1)
+        res = expr.evaluate(lds)
+        self.assertEqual(res, f64_to_bits(7.0))
+
+
 if __name__ == "__main__":
     unittest.main()
