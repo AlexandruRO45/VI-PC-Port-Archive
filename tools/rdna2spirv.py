@@ -5359,7 +5359,8 @@ class Gen:
                 self.emit(f"{z} = OpIEqual %bool {x} {self.cu(0)}")
                 self.emit(f"{r} = OpSelect %uint {z} {self.cu(0xFFFFFFFF)} {d}")
             self.dst(a[0], r)
-        elif op in ("image_get_resinfo", "image_load_mip", "image_store", "image_atomic_cmpswap") or op in self.IMG_ATOMICS:
+        elif op in ("image_get_resinfo", "image_load_mip", "image_store", "image_atomic_cmpswap") or \
+                op in self.IMG_ATOMICS or op in self.IMG_ATOMIC_CAS:
             self.image_misc(op, a, mods)
         elif op in ("v_cubema_f32", "v_cubeid_f32", "v_cubesc_f32", "v_cubetc_f32"):
             # Cube face selection (standard table): major axis Z if |z|>=|x| and |z|>=|y|, else Y if |y|>=|x|,
@@ -9585,6 +9586,11 @@ class Gen:
                    "image_atomic_and": ("OpAtomicAnd", 0xFFFFFFFF), "image_atomic_add": ("OpAtomicIAdd", 0),
                    "image_atomic_sub": ("OpAtomicISub", 0)}
 
+    # image atomic -> kind: an exchange, or the wrap-around inc/dec a CAS loop builds (RDNA2 ISA: inc wraps
+    # M to 0 when M >= DATA, dec wraps it to DATA when M == 0 or M > DATA). None of the three has an operand
+    # that leaves memory unchanged, so like cmpswap they run only in lanes EXEC leaves on.
+    IMG_ATOMIC_CAS = {"image_atomic_swap": "swap", "image_atomic_inc": "inc", "image_atomic_dec": "dec"}
+
     # image_store views: dim -> (index, SPIR-V Dim, arrayed, coordinate count). Bindings 8 + 3 * index + class,
     # class 0 = float, 1 = uint, 2 = sint (Vulkan needs the shader's component type to match the image format).
     STORE_DIMS = {"dim:SQ_RSRC_IMG_2D": (0, "2D", 0, 2), "dim:SQ_RSRC_IMG_2D_ARRAY": (1, "2D", 1, 3),
@@ -9873,7 +9879,7 @@ class Gen:
         """Query sampled image dimensions, load mip texels and handle storage image operations."""
         dim = next((m for m in mods if m.startswith("dim:")), "dim:SQ_RSRC_IMG_2D")
         array_query = op == "image_get_resinfo" and dim == "dim:SQ_RSRC_IMG_2D_ARRAY"
-        is3d_atomic = dim == "dim:SQ_RSRC_IMG_3D" and (op in self.IMG_ATOMICS or op == "image_atomic_cmpswap")
+        is3d_atomic = dim == "dim:SQ_RSRC_IMG_3D" and (op in self.IMG_ATOMICS or op == "image_atomic_cmpswap" or op in self.IMG_ATOMIC_CAS)
         if op == "image_store":
             self.image_store(a, mods, dim)
             return
@@ -9898,7 +9904,7 @@ class Gen:
             self.image_load_typed(dim, self.sgpr_word(a[2], 1), iv, img, idx, int(dm.split(":")[1], 0),
                                   vdata, xs[3], d16="d16" in mods)
             return
-        is_atomic = op in self.IMG_ATOMICS or op == "image_atomic_cmpswap"
+        is_atomic = op in self.IMG_ATOMICS or op == "image_atomic_cmpswap" or op in self.IMG_ATOMIC_CAS
         packed_mip = op == "image_load_mip" and "tfe" not in mods and "lwe" not in mods
         if ((dim != "dim:SQ_RSRC_IMG_2D" and not (is3d_atomic or array_query))
                 or ("a16" in mods and not (is_atomic or packed_mip))
@@ -9944,6 +9950,24 @@ class Gen:
                 self.emit(f"OpBranch {end}")
                 self.emit(f"{end} = OpLabel")
                 return
+            if op in self.IMG_ATOMIC_CAS:
+                kind = self.IMG_ATOMIC_CAS[op]
+                act = self.active_b()
+                do, end = self.tmp() + "_do", self.tmp() + "_end"
+                self.emit(f"OpSelectionMerge {end} None")
+                self.emit(f"OpBranchConditional {act} {do} {end}")
+                self.emit(f"{do} = OpLabel")
+                tp2, old = self.tmp(), self.tmp()
+                self.emit(f"{tp2} = OpImageTexelPointer %_ptr_Image_uint {ip} {iv} {self.cu(0)}")
+                if kind == "swap":
+                    self.emit(f"{old} = OpAtomicExchange %uint {tp2} {self.cu(1)} {self.cu(0)} {val}")
+                else:
+                    old, _exit = self.atomic_inc_dec_cas(tp2, val, kind, do)
+                if "glc" in mods:
+                    self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, old)
+                self.emit(f"OpBranch {end}")
+                self.emit(f"{end} = OpLabel")
+                return
             spv, neutral = self.IMG_ATOMICS[op]
             self.emit(f"{tp} = OpImageTexelPointer %_ptr_Image_uint {ip} {iv} {self.cu(0)}")
             self.emit(f"{safe} = OpSelect %uint {self.active_b()} {val} {self.cu(neutral)}")
@@ -9954,7 +9978,7 @@ class Gen:
         if op == "image_store":
             self.image_store(a, mods, dim)
             return
-        if op in self.IMG_ATOMICS or op == "image_atomic_cmpswap":
+        if op in self.IMG_ATOMICS or op == "image_atomic_cmpswap" or op in self.IMG_ATOMIC_CAS:
             # Storage image (2D r32ui). Atomics: vdata holds the operand; with 'glc' the pre-op value comes back.
             self.uses_storage = True
             coords = atomic_coords(2)
@@ -9989,6 +10013,24 @@ class Gen:
                 tp, old = self.tmp(), self.tmp()
                 self.emit(f"{tp} = OpImageTexelPointer %_ptr_Image_uint {ip} {iv} {self.cu(0)}")
                 self.emit(f"{old} = OpAtomicCompareExchange %uint {tp} {self.cu(1)} {self.cu(0)} {self.cu(0)} {val} {cmpv}")
+                if "glc" in mods:
+                    self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, old)
+                self.emit(f"OpBranch {end}")
+                self.emit(f"{end} = OpLabel")
+                return
+            if op in self.IMG_ATOMIC_CAS:
+                kind = self.IMG_ATOMIC_CAS[op]
+                act = self.active_b()
+                do, end = self.tmp() + "_do", self.tmp() + "_end"
+                self.emit(f"OpSelectionMerge {end} None")
+                self.emit(f"OpBranchConditional {act} {do} {end}")
+                self.emit(f"{do} = OpLabel")
+                tp2, old = self.tmp(), self.tmp()
+                self.emit(f"{tp2} = OpImageTexelPointer %_ptr_Image_uint {ip} {iv} {self.cu(0)}")
+                if kind == "swap":
+                    self.emit(f"{old} = OpAtomicExchange %uint {tp2} {self.cu(1)} {self.cu(0)} {val}")
+                else:
+                    old, _exit = self.atomic_inc_dec_cas(tp2, val, kind, do)
                 if "glc" in mods:
                     self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, old)
                 self.emit(f"OpBranch {end}")
