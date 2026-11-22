@@ -3443,6 +3443,17 @@ class Gen:
         if a["k"] == "special" and a["t"] in ("vcc", "vcc_lo", "vcc_hi"):
             v = self.tmp()
             self.emit(f"{v} = OpLoad %uint %vcc")
+            if not self.wave64 and "vcc" not in self.cur_masks:
+                # Wave32 VCC that lane_masks.py does not certify as a mask holds the data a scalar write put there
+                # (s_mov_b32 vcc_lo, 0xa; a copy of a data SGPR; a load), the same in every invocation, so lane L
+                # takes its bit L, as for a data SGPR above. Until 2026-11-22 the raw word was used and any non-zero
+                # value selected every lane. A mask the analysis missed is still exact: 0 or ~0 has the same bit L.
+                lane = self.wave_lane()
+                shr, bit, r = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{shr} = OpShiftRightLogical %uint {v} {lane}")
+                self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
+                self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+                return r
             return v
         if a["k"] == "special" and a["t"] in ("exec", "exec_lo", "exec_hi"):
             return self.exec_value()

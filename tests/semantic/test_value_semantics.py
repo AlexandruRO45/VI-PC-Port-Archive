@@ -626,14 +626,20 @@ class MeasuredBoundsShaders(unittest.TestCase):
 class LaneMaskConstants(unittest.TestCase):
     """runtime/test/shaders/cs_w32_mask_imm.asm and cs_w64_mask_imm.asm: a constant read as a lane mask (saveexec,
     wrexec, s_and_b64 / s_not_b64 / s_mov_b64 into EXEC or VCC) gives lane L its bit L, not bit 0 for every lane.
+    cs_w32_vcc_data.asm: the same for a wave32 VCC holding data (s_mov_b32 vcc_lo, K) read by v_cndmask_b32, a
+    carry-in and s_and_saveexec_b32.
     Run on all lanes of one wave (32 on a 32-wide subgroup, 64 on a 64-wide one, no --wave64-emulate) with a heap
     of 0xee bytes; the words are the GPU check's (check.py CS_DUMPS), derived by hand in each .asm header."""
 
     WANT = {"cs_w32_mask_imm": (32, [2056, 20, 2, 6152, 2050, 4112, 258, 32]),
-            "cs_w64_mask_imm": (64, [2056, 1084, 828, 2052, 319, 2104, 516, 2064])}
+            "cs_w64_mask_imm": (64, [2056, 1084, 828, 2052, 319, 2104, 516, 2064]),
+            # wave32 VCC holding data (s_mov_b32 vcc_lo, K; a copy of a data SGPR) read as a lane mask
+            "cs_w32_vcc_data": (32, [258, 1032, 2, 1052, 0xFFFFFF00, 5, 4104, 781])}
     # Bit 0 of the constant for every lane, the translation before the fix (in the .asm headers).
     OLD = {"cs_w32_mask_imm": [0xFFFFFF00, 32, 32, 0xFFFFFF00, 2072, 0xFFFFFF00, 0xFFFFFF00, 32],
-           "cs_w64_mask_imm": [0xFFFFFF00] * 7 + [2080]}
+           "cs_w64_mask_imm": [0xFFFFFF00] * 7 + [2080],
+           # the raw VCC word for every lane: a non-zero value selected all 32 lanes
+           "cs_w32_vcc_data": [32, 32, 32, 32, 0xFFFFFF00, 5, 32, 32]}
 
     def run_words(self, name, lanes):
         sys.path.insert(0, os.path.join(support.ROOT, "runtime", "test", "shaders"))
@@ -665,6 +671,12 @@ class LaneMaskConstants(unittest.TestCase):
                word(-2 & m64), word(~0xFF & m64), word(0x3C), bin(0xFF00FF).count("1") | 8 << 8]
         self.assertEqual(w32, self.WANT["cs_w32_mask_imm"][1])
         self.assertEqual(w64, self.WANT["cs_w64_mask_imm"][1])
+        # cs_w32_vcc_data: the 32-bit value moved into VCC_LO is the mask (lane L reads bit L); case 2's carry-in
+        # adds 0 + 0 + VCC[L], case 5 is a compare (lanes 0-4), case 6 is EXEC = VCC & all lanes.
+        lanes = range(32)
+        wv = [word(0xA), word(0xF0F0), word(0x80000001), word(-16 & m32), word(0),
+              word(sum(1 << l for l in lanes if l < 5)), word(0xFF0000 & m32), word(0x12345678)]
+        self.assertEqual(wv, self.WANT["cs_w32_vcc_data"][1])
 
 
 if __name__ == "__main__":
