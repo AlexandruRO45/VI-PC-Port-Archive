@@ -294,9 +294,12 @@ def iter_archive(path):
 
 
 def iter_inputs(paths):
+    def scan_failed(error):
+        raise error
+
     for path in paths:
         if os.path.isdir(path):
-            for root, _, files in os.walk(path):
+            for root, _, files in os.walk(path, onerror=scan_failed):
                 for f in sorted(files):
                     full = os.path.join(root, f)
                     with open(full, "rb") as fh:
@@ -504,7 +507,11 @@ def main(argv=None):
         if not os.path.exists(path):
             print(f"error: {path} does not exist", file=sys.stderr)
             return 2
-    pages = [summarise_page(data, name) for name, data in iter_inputs(args.inputs)]
+    try:
+        pages = [summarise_page(data, name) for name, data in iter_inputs(args.inputs)]
+    except OSError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     total = totals(pages)
     if not args.quiet:
         for p in pages:

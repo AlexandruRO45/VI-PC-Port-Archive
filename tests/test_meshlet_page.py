@@ -4,6 +4,8 @@
 
 Every byte here is built by the test. No game file, value or name is used.
 """
+import contextlib
+import io
 import json
 import os
 import struct
@@ -12,6 +14,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "meshlet_page.py")
@@ -298,6 +301,27 @@ class CliTests(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             with open(out2, encoding="utf-8") as fh:
                 self.assertEqual(json.load(fh)["totals"]["pages"], 2)
+
+    def test_directory_read_failure_preserves_the_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "pages")
+            os.mkdir(source)
+            out = os.path.join(tmp, "report.json")
+            with open(out, "wb") as f:
+                f.write(b"previous report")
+            blocked = os.path.join(source, "blocked")
+
+            def walk(root, onerror=None):
+                if onerror:
+                    onerror(PermissionError(13, "Permission denied", blocked))
+                return iter(())
+
+            with mock.patch.object(mp.os, "walk", walk), contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(mp.main([source, "--json", out, "--quiet"]), 2)
+            self.assertIn(blocked, err.getvalue())
+            with open(out, "rb") as f:
+                self.assertEqual(f.read(), b"previous report")
 
     def test_page_report_write_failure_is_reported(self):
         with tempfile.TemporaryDirectory() as tmp:
