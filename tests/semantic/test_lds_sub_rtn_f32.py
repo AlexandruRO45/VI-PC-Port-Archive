@@ -862,5 +862,152 @@ class TestSIMDMultiLane(unittest.TestCase):
         self.assertEqual(state.lds.read_dword(idx), TEN_F32)
 
 
+class TestRegisterAliasing(unittest.TestCase):
+    """Phase 5: Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.state = ScalarState(lds_size_dwords=1024)
+        self.interp = ScalarInterpreter()
+
+    def test_aliasing_vdst_equals_vaddr(self) -> None:
+        # v0 serves as both vdst and vaddr
+        addr = 0x40
+        idx = addr >> 2
+        self.state.lds.write_dword(idx, TEN_F32)
+        self.state.set_vgpr(0, addr)      # v0 = 0x40
+        self.state.set_vgpr(1, THREE_F32) # v1 = subtrahend (3.0)
+
+        instr = DSSubRtnF32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(0, RegType.VGPR),
+            vdata0=RegisterOperand(1, RegType.VGPR),
+            offset=0,
+        )
+
+        old_val, new_mem = self.interp.execute(instr, self.state)
+
+        seven_f32 = f32_to_bits(7.0)
+        self.assertEqual(old_val, TEN_F32)
+        self.assertEqual(new_mem, seven_f32)
+        self.assertEqual(self.state.lds.read_dword(idx), seven_f32)
+        self.assertEqual(self.state.get_vgpr(0), TEN_F32)
+
+    def test_aliasing_vdst_equals_vdata0(self) -> None:
+        # v0 serves as both vdst and vdata0 (sub value)
+        addr = 0x80
+        idx = addr >> 2
+        self.state.lds.write_dword(idx, FIVE_F32)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(0, TWO_F32)  # v0 = subtrahend (2.0)
+
+        instr = DSSubRtnF32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(0, RegType.VGPR),
+            offset=0,
+        )
+
+        old_val, new_mem = self.interp.execute(instr, self.state)
+
+        # 5.0 - 2.0 = 3.0
+        self.assertEqual(old_val, FIVE_F32)
+        self.assertEqual(new_mem, THREE_F32)
+        self.assertEqual(self.state.lds.read_dword(idx), THREE_F32)
+        self.assertEqual(self.state.get_vgpr(0), FIVE_F32)
+
+    def test_three_way_aliasing_vdst_vaddr_vdata0(self) -> None:
+        addr = 0x40
+        idx = addr >> 2
+        self.state.lds.write_dword(idx, FIVE_F32)
+        self.state.set_vgpr(0, addr)
+
+        instr = DSSubRtnF32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(0, RegType.VGPR),
+            vdata0=RegisterOperand(0, RegType.VGPR),
+            offset=0,
+        )
+
+        old_val, new_mem = self.interp.execute(instr, self.state)
+
+        self.assertEqual(old_val, FIVE_F32)
+        self.assertEqual(self.state.lds.read_dword(idx), new_mem)
+        self.assertEqual(self.state.get_vgpr(0), FIVE_F32)
+
+    def test_unrelated_vgprs_preserved(self) -> None:
+        for i in range(10, 20):
+            self.state.set_vgpr(i, 0x11223300 + i)
+
+        addr = 0x100
+        idx = addr >> 2
+        self.state.lds.write_dword(idx, TEN_F32)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, ONE_F32)
+
+        instr = DSSubRtnF32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+        )
+
+        self.interp.execute(instr, self.state)
+
+        for i in range(10, 20):
+            self.assertEqual(self.state.get_vgpr(i), 0x11223300 + i)
+
+    def test_sgprs_preserved(self) -> None:
+        for i in range(8):
+            self.state.set_sgpr(i, 0x99000000 + i)
+
+        addr = 0x20
+        idx = addr >> 2
+        self.state.lds.write_dword(idx, FIVE_F32)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, ONE_F32)
+
+        instr = DSSubRtnF32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+        )
+
+        self.interp.execute(instr, self.state)
+
+        for i in range(8):
+            self.assertEqual(self.state.get_sgpr(i), 0x99000000 + i)
+
+    def test_simd_aliasing_with_divergent_exec_mask(self) -> None:
+        simd = SIMDState(num_lanes=32, exec_mask=0x0000000F, lds_size_dwords=1024)
+        interp = SIMDInterpreter()
+
+        addr = 0x80
+        idx = addr >> 2
+        simd.lds.write_dword(idx, TEN_F32)
+
+        for lane in range(32):
+            simd.set_lane_vgpr(lane, 1, addr)
+            simd.set_lane_vgpr(lane, 0, ONE_F32)
+
+        instr = DSSubRtnF32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(0, RegType.VGPR),
+            offset=0,
+        )
+
+        results = interp.execute(instr, simd)
+
+        expected_active = [TEN_F32, f32_to_bits(9.0), f32_to_bits(8.0), f32_to_bits(7.0)]
+        for lane in range(4):
+            self.assertEqual(results[lane], expected_active[lane])
+            self.assertEqual(simd.get_lane_vgpr(lane, 0), expected_active[lane])
+
+        for lane in range(4, 32):
+            self.assertIsNone(results[lane])
+            self.assertEqual(simd.get_lane_vgpr(lane, 0), ONE_F32)
+
+        self.assertEqual(simd.lds.read_dword(idx), f32_to_bits(6.0))
+
+
 if __name__ == "__main__":
     unittest.main()
