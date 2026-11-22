@@ -25,11 +25,11 @@ STRING_OPS = {
     C.CMPSB_M8_M8: ("cmps", 1), C.CMPSW_M16_M16: ("cmps", 2), C.CMPSD_M32_M32: ("cmps", 4), C.CMPSQ_M64_M64: ("cmps", 8),
 }
 
-INTEGER_HEADER = """#include <array>
+INTEGER_HEADER = """#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <intrin.h>
-#include <emmintrin.h>
 using std::memcpy;
 using std::memset;
 using word = uint64_t;
@@ -39,6 +39,14 @@ template<class T> T load(word address) {
 }
 template<class T> void store(word address, T v) {
     memcpy(reinterpret_cast<void*>(address), &v, sizeof v);
+}
+template<class T> T xmm_read(const std::array<uint8_t, 16>& x, size_t index = 0) {
+    T val;
+    memcpy(&val, x.data() + index * sizeof(T), sizeof(T));
+    return val;
+}
+template<class T> void xmm_write(std::array<uint8_t, 16>& x, size_t index, T val) {
+    memcpy(x.data() + index * sizeof(T), &val, sizeof(T));
 }
 static inline uint32_t sha_rol32(uint32_t x, unsigned n) { return (x << n) | (x >> (32u - n)); }
 static inline uint32_t sha_ror32(uint32_t x, unsigned n) { return (x >> n) | (x << (32u - n)); }
@@ -66,6 +74,7 @@ static inline void sha256_rnds2(uint32_t d[4], const uint32_t s[4], const uint32
         h = g; g = f; f = e; e = ne; dv = c; c = b; b = a; a = na;
     }
     d[3] = a; d[2] = b; d[1] = e; d[0] = f;
+}
 }
 """
 HEADER = INTEGER_HEADER + "struct Query { word type, next, effect, device, count, ids, names; };\n"
@@ -121,10 +130,18 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
     # The x87 profile checks every x87 instruction of the body before any of it is lowered.
     x87_depth = x87_lower.depths(body, exits) if x87 and any(map(x87_lower.is_x87, body)) else None
     xmm = {R.XMM0: "xmm0", R.XMM1: "xmm1", R.XMM2: "xmm2"}
+    MMX_REGS = {getattr(R, f"MM{k}") for k in range(8)}
+    ALL_XMM = {getattr(R, f"XMM{k}") for k in range(32) if hasattr(R, f"XMM{k}")}
+    SSE_PACKED_OPS = (
+        M.PAVGB, M.PAVGW, M.PEXTRW, M.PINSRW, M.PMAXSW, M.PMAXUB,
+        M.PMINSW, M.PMINUB, M.PMOVMSKB, M.PMULHUW, M.PSADBW,
+        M.MOVDQU, M.MOVD,
+    )
     has_xmm_math = any(i.mnemonic in (M.VMOVDQU, M.VPSRLDQ, M.VMOVD)
+                       or i.mnemonic in SSE_PACKED_OPS
                        or (i.mnemonic == M.VPADDD and i.op2_kind != K.MEMORY) for i in body)
     if has_xmm_math:
-        lines.append("__m128i xmm0{}, xmm1{}, xmm2{};")
+        lines.append("std::array<uint8_t, 16> xmm0{}, xmm1{}, xmm2{};")
     # Unaligned YMM copies and VEX zeroing in the descriptor builder need
     # only byte storage on the desktop host.
     wide = {R.YMM0: "wide0", R.YMM1: "wide1", R.YMM2: "wide2"}
@@ -183,6 +200,33 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
             if size < 4:
                 value = f"({reg(dest)} & ~{(1 << (8*size))-1}ull) | {value}"
             return f"{reg(dest)} = {value};"
+
+        def xmm_operand(n):
+            kind = i.op_kind(n)
+            if kind == K.MEMORY:
+                return f"load<std::array<uint8_t, 16>>({address()})"
+            register = i.op_register(n)
+            if register in MMX_REGS:
+                raise ValueError(f"unsupported MMX operand at {i.ip:#x}: {i}")
+            if register not in xmm:
+                raise ValueError(f"unsupported XMM operand at {i.ip:#x}: {i}")
+            return xmm[register]
+
+        def xmm_dst(n=0):
+            register = i.op_register(n)
+            if register in MMX_REGS:
+                raise ValueError(f"unsupported MMX operand at {i.ip:#x}: {i}")
+            if register not in xmm:
+                raise ValueError(f"unsupported XMM operand at {i.ip:#x}: {i}")
+            return xmm[register]
+
+        for op_idx in range(i.op_count):
+            if i.op_kind(op_idx) == K.REGISTER:
+                op_reg = i.op_register(op_idx)
+                if op_reg in MMX_REGS:
+                    raise ValueError(f"unsupported MMX operand at {i.ip:#x}: {i}")
+                if op_reg in ALL_XMM and op_reg not in xmm:
+                    raise ValueError(f"unsupported XMM operand at {i.ip:#x}: {i}")
 
         if host_ops and i.ip in host_ops:
             stmt = host_ops[i.ip]
@@ -515,14 +559,100 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
             stmt = {R.XMM0: "wide0", R.XMM1: "wide1", R.XMM2: "wide2"}[i.op0_register] + " = {};"
         elif op == M.VZEROUPPER:
             stmt = " ".join(f"memset({v}.data()+16, 0, 16);" for v in wide.values()) if has_wide else ";"
-        elif op == M.VMOVDQU and i.op1_kind == K.MEMORY:
-            stmt = f"{xmm[i.op0_register]} = load<__m128i>({address()});"
+        elif op in (M.MOVDQU, M.VMOVDQU) and i.op1_kind == K.MEMORY:
+            stmt = f"{xmm_dst(0)} = load<std::array<uint8_t, 16>>({address()});"
+        elif op in (M.MOVDQU, M.VMOVDQU) and i.op0_kind == K.MEMORY:
+            stmt = f"store({address()}, {xmm_operand(1)});"
+        elif op in (M.MOVDQU, M.VMOVDQU) and i.op0_kind == K.REGISTER and i.op1_kind == K.REGISTER:
+            stmt = f"{xmm_dst(0)} = {xmm_operand(1)};"
         elif op == M.VPSRLDQ:
-            stmt = f"{xmm[i.op0_register]} = _mm_srli_si128({xmm[i.op1_register]}, {i.immediate(2)});"
+            shift = i.immediate(2)
+            stmt = (f"{{ const auto src = {xmm_operand(1)}; {xmm_dst(0)} = {{}}; "
+                    f"if ({shift} < 16) memcpy({xmm_dst(0)}.data(), src.data() + {shift}, 16 - {shift}); }}")
         elif op == M.VPADDD:
-            stmt = f"{xmm[i.op0_register]} = _mm_add_epi32({xmm[i.op1_register]}, {xmm[i.op2_register]});"
-        elif op == M.VMOVD and i.op1_register in xmm:
-            stmt = write(f"_mm_cvtsi128_si32({xmm[i.op1_register]})")
+            stmt = (f"{{ const auto a = {xmm_operand(1)}, b = {xmm_operand(2)}; "
+                    f"for (size_t n = 0; n < 4; ++n) xmm_write<uint32_t>({xmm_dst(0)}, n, "
+                    f"xmm_read<uint32_t>(a, n) + xmm_read<uint32_t>(b, n)); }}")
+        elif op in (M.MOVD, M.VMOVD) and i.op1_kind == K.REGISTER and i.op1_register in xmm:
+            stmt = write(f"xmm_read<uint32_t>({xmm[i.op1_register]}, 0)")
+        elif op in (M.MOVD, M.VMOVD) and i.op0_kind == K.REGISTER and i.op0_register in xmm:
+            val = f"load<uint32_t>({address()})" if i.op1_kind == K.MEMORY else f"static_cast<uint32_t>({reg(i.op1_register)})"
+            stmt = f"{xmm[i.op0_register]} = {{}}; xmm_write<uint32_t>({xmm[i.op0_register]}, 0, {val});"
+        elif op == M.PAVGB:
+            dst = xmm_dst(0)
+            src = xmm_operand(1)
+            stmt = (f"{{ const auto a = {dst}, b = {src}; "
+                    f"for (size_t k = 0; k < 16; ++k) {{ "
+                    f"const uint16_t va = xmm_read<uint8_t>(a, k), vb = xmm_read<uint8_t>(b, k); "
+                    f"xmm_write<uint8_t>({dst}, k, static_cast<uint8_t>((va + vb + 1u) >> 1)); }} }}")
+        elif op == M.PAVGW:
+            dst = xmm_dst(0)
+            src = xmm_operand(1)
+            stmt = (f"{{ const auto a = {dst}, b = {src}; "
+                    f"for (size_t k = 0; k < 8; ++k) {{ "
+                    f"const uint32_t va = xmm_read<uint16_t>(a, k), vb = xmm_read<uint16_t>(b, k); "
+                    f"xmm_write<uint16_t>({dst}, k, static_cast<uint16_t>((va + vb + 1u) >> 1)); }} }}")
+        elif op == M.PMAXSW:
+            dst = xmm_dst(0)
+            src = xmm_operand(1)
+            stmt = (f"{{ const auto a = {dst}, b = {src}; "
+                    f"for (size_t k = 0; k < 8; ++k) {{ "
+                    f"const int16_t va = xmm_read<int16_t>(a, k), vb = xmm_read<int16_t>(b, k); "
+                    f"xmm_write<int16_t>({dst}, k, std::max(va, vb)); }} }}")
+        elif op == M.PMAXUB:
+            dst = xmm_dst(0)
+            src = xmm_operand(1)
+            stmt = (f"{{ const auto a = {dst}, b = {src}; "
+                    f"for (size_t k = 0; k < 16; ++k) {{ "
+                    f"const uint8_t va = xmm_read<uint8_t>(a, k), vb = xmm_read<uint8_t>(b, k); "
+                    f"xmm_write<uint8_t>({dst}, k, std::max(va, vb)); }} }}")
+        elif op == M.PMINSW:
+            dst = xmm_dst(0)
+            src = xmm_operand(1)
+            stmt = (f"{{ const auto a = {dst}, b = {src}; "
+                    f"for (size_t k = 0; k < 8; ++k) {{ "
+                    f"const int16_t va = xmm_read<int16_t>(a, k), vb = xmm_read<int16_t>(b, k); "
+                    f"xmm_write<int16_t>({dst}, k, std::min(va, vb)); }} }}")
+        elif op == M.PMINUB:
+            dst = xmm_dst(0)
+            src = xmm_operand(1)
+            stmt = (f"{{ const auto a = {dst}, b = {src}; "
+                    f"for (size_t k = 0; k < 16; ++k) {{ "
+                    f"const uint8_t va = xmm_read<uint8_t>(a, k), vb = xmm_read<uint8_t>(b, k); "
+                    f"xmm_write<uint8_t>({dst}, k, std::min(va, vb)); }} }}")
+        elif op == M.PMULHUW:
+            dst = xmm_dst(0)
+            src = xmm_operand(1)
+            stmt = (f"{{ const auto a = {dst}, b = {src}; "
+                    f"for (size_t k = 0; k < 8; ++k) {{ "
+                    f"const uint32_t prod = static_cast<uint32_t>(xmm_read<uint16_t>(a, k)) * static_cast<uint32_t>(xmm_read<uint16_t>(b, k)); "
+                    f"xmm_write<uint16_t>({dst}, k, static_cast<uint16_t>(prod >> 16)); }} }}")
+        elif op == M.PSADBW:
+            dst = xmm_dst(0)
+            src = xmm_operand(1)
+            stmt = (f"{{ const auto a = {dst}, b = {src}; uint16_t s0 = 0, s1 = 0; "
+                    f"for (size_t k = 0; k < 8; ++k) {{ "
+                    f"const int d = static_cast<int>(xmm_read<uint8_t>(a, k)) - static_cast<int>(xmm_read<uint8_t>(b, k)); "
+                    f"s0 += static_cast<uint16_t>(d < 0 ? -d : d); }} "
+                    f"for (size_t k = 8; k < 16; ++k) {{ "
+                    f"const int d = static_cast<int>(xmm_read<uint8_t>(a, k)) - static_cast<int>(xmm_read<uint8_t>(b, k)); "
+                    f"s1 += static_cast<uint16_t>(d < 0 ? -d : d); }} "
+                    f"{dst} = {{}}; xmm_write<uint16_t>({dst}, 0, s0); xmm_write<uint16_t>({dst}, 4, s1); }}")
+        elif op == M.PMOVMSKB:
+            src = xmm_operand(1)
+            stmt = (f"{{ const auto a = {src}; uint32_t mask = 0; "
+                    f"for (size_t k = 0; k < 16; ++k) {{ "
+                    f"if ((xmm_read<uint8_t>(a, k) & 0x80u) != 0) mask |= (1u << k); }} "
+                    f"{write('mask')} }}")
+        elif op == M.PEXTRW:
+            src = xmm_operand(1)
+            lane = i.immediate(2) & 7
+            stmt = write(f"xmm_read<uint16_t>({src}, {lane})")
+        elif op == M.PINSRW:
+            dst = xmm_dst(0)
+            val = f"load<uint16_t>({address()})" if i.op1_kind == K.MEMORY else f"static_cast<uint16_t>({reg(i.op1_register)})"
+            lane = i.immediate(2) & 7
+            stmt = f"xmm_write<uint16_t>({dst}, {lane}, {val});"
         elif op == M.XCHG and i.op_count == 2 and i.op0_kind == i.op1_kind == K.REGISTER:
             # Both values are read before either write; 32-bit forms zero-extend both registers, so
             # 87 C0 (xchg eax, eax) clears the upper half of RAX where the one-byte 90 is a NOP.

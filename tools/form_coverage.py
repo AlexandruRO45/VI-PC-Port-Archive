@@ -74,6 +74,7 @@ CPU_FIXTURES = {
     "call_pair": "cpu_aot_call_pair",
     "movbe": "cpu_aot_movbe",
     "bmi1": "cpu_aot_bmi1",
+    "sse_packed": "cpu_aot_sse_packed",
     "rotates_shifts": "cpu_aot_rotates_shifts",
     "frame": "cpu_aot_stack_frames",
     "calls": "cpu_aot_direct_calls",

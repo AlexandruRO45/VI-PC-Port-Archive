@@ -1,0 +1,27 @@
+LIBRARY cpu_sse_packed
+EXPORTS
+    test_pavgb
+    test_pavgw
+    test_pmaxsw
+    test_pmaxub
+    test_pminsw
+    test_pminub
+    test_pmulhuw
+    test_psadbw
+    test_pmovmskb
+    test_pextrw_0
+    test_pextrw_1
+    test_pextrw_2
+    test_pextrw_3
+    test_pextrw_4
+    test_pextrw_5
+    test_pextrw_6
+    test_pextrw_7
+    test_pinsrw_0
+    test_pinsrw_1
+    test_pinsrw_2
+    test_pinsrw_3
+    test_pinsrw_4
+    test_pinsrw_5
+    test_pinsrw_6
+    test_pinsrw_7

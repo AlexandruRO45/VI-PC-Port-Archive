@@ -1075,6 +1075,17 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_crypto_sha COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/crypto_sha.py"
         check "$<TARGET_FILE:cpu_crypto_sha>" "$<TARGET_FILE:cpu_crypto_sha_lifted>")
     set_tests_properties(cpu_aot_crypto_sha PROPERTIES SKIP_RETURN_CODE 77)
+
+    cpu_asm_fixture(cpu_sse_packed sse_packed)
+    set(sse_packed_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_sse_packed_lifted.cpp")
+    add_custom_command(OUTPUT "${sse_packed_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/sse_packed.py"
+            emit "$<TARGET_FILE:cpu_sse_packed>" "${sse_packed_fixture}"
+        DEPENDS cpu_sse_packed tests/cpu/sse_packed.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_sse_packed_lifted SHARED "${sse_packed_fixture}")
+    add_test(NAME cpu_aot_sse_packed COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/sse_packed.py"
+        check "$<TARGET_FILE:cpu_sse_packed>" "$<TARGET_FILE:cpu_sse_packed_lifted>")
     cpu_translation(cpu_callback cpu_chained_aot call_context CALLBACK_OFFSET 8)
     cpu_asm_fixture(cpu_xlatb xlatb)
     # The lifted DLL and three mutated controls that the check requires to mismatch.
