@@ -230,7 +230,8 @@ LEONIDA_VK_DEVICE=9070 python3 -I runtime/test/shaders/w64_graphics.py /tmp/w64g
 LEONIDA_VK_DEVICE=9070 python3 -I runtime/test/shaders/w64_graphics.py /tmp/w64g runtime/build/linux gs_w64_a_ring
 ```
 
-Each line prints `ok`, a `SKIP` with its reason, or what differed. To add a fixture:
+Each line prints `ok`, a `SKIP` with its reason, or what differed. An unknown name is a usage error (one `error:`
+line, non-zero exit), so a typo cannot drop a check without notice. To add a fixture:
 
 1. Write `runtime/test/shaders/{ps,vs,gs}_w64_<tier>_<name>.asm` with `; mattr: +wavefrontsize64,-wavefrontsize32`
    and a header that says what every result word is. Vertex and geometry fixtures store four words per vertex or
