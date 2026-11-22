@@ -857,5 +857,74 @@ class TestValuCvtNormI16F16SIMD(unittest.TestCase):
             self.assertEqual(simd.get_vgpr_u32(0, lane), 0x12345678)
 
 
+# ---------------------------------------------------------------------------
+# Register aliasing and in-place operand preservation
+# ---------------------------------------------------------------------------
+
+class TestValuCvtNormI16F16Aliasing(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarVALUInterpreter()
+
+    def test_in_place_self_aliasing_low_half(self) -> None:
+        # Set v0: high half = 0x5A5A, low half = ONE_F16 (1.0)
+        self.interp.set_vgpr_u32(0, (0x5A5A << 16) | ONE_F16)
+        res = self.interp.execute_asm("v_cvt_norm_i16_f16 v0.l, v0.l")
+        # Low half should be 32767, high half preserved as 0x5A5A
+        self.assertEqual(res & MASK16, 32767)
+        self.assertEqual(res >> 16, 0x5A5A)
+        self.assertEqual(self.interp.get_vgpr_u32(0), (0x5A5A << 16) | 32767)
+
+    def test_in_place_self_aliasing_high_half(self) -> None:
+        # Set v0: high half = NEG_ONE_F16 (-1.0), low half = 0xA5A5
+        self.interp.set_vgpr_u32(0, (NEG_ONE_F16 << 16) | 0xA5A5)
+        res = self.interp.execute_asm("v_cvt_norm_i16_f16 v0.h, v0.h")
+        # High half should be 0x8001 (-32767), low half preserved as 0xA5A5
+        self.assertEqual(res >> 16, 0x8001)
+        self.assertEqual(res & MASK16, 0xA5A5)
+        self.assertEqual(self.interp.get_vgpr_u32(0), (0x8001 << 16) | 0xA5A5)
+
+    def test_cross_halfword_aliasing_low_to_high(self) -> None:
+        # Set v0: high half = 0x1111, low half = HALF_F16 (0.5)
+        self.interp.set_vgpr_u32(0, (0x1111 << 16) | HALF_F16)
+        res = self.interp.execute_asm("v_cvt_norm_i16_f16 v0.h, v0.l")
+        # High half should be 16384, low half remains HALF_F16
+        self.assertEqual(res >> 16, 16384)
+        self.assertEqual(res & MASK16, HALF_F16)
+        self.assertEqual(self.interp.get_vgpr_u32(0), (16384 << 16) | HALF_F16)
+
+    def test_cross_halfword_aliasing_high_to_low(self) -> None:
+        # Set v0: high half = TWO_F16 (2.0), low half = 0x2222
+        self.interp.set_vgpr_u32(0, (TWO_F16 << 16) | 0x2222)
+        res = self.interp.execute_asm("v_cvt_norm_i16_f16 v0.l, v0.h")
+        # Low half should be clamped to 32767, high half remains TWO_F16
+        self.assertEqual(res & MASK16, 32767)
+        self.assertEqual(res >> 16, TWO_F16)
+        self.assertEqual(self.interp.get_vgpr_u32(0), (TWO_F16 << 16) | 32767)
+
+    def test_multi_instruction_aliasing_pipeline(self) -> None:
+        # v0 holds two f16 inputs: high = NEG_ONE_F16 (-1.0), low = ONE_F16 (1.0)
+        self.interp.set_vgpr_u32(0, (NEG_ONE_F16 << 16) | ONE_F16)
+        # Step 1: convert low half in-place
+        self.interp.execute_asm("v_cvt_norm_i16_f16 v0.l, v0.l")
+        self.assertEqual(self.interp.get_vgpr_half(0, False), 32767)
+        self.assertEqual(self.interp.get_vgpr_half(0, True), NEG_ONE_F16)
+
+        # Step 2: convert high half in-place
+        self.interp.execute_asm("v_cvt_norm_i16_f16 v0.h, v0.h")
+        self.assertEqual(self.interp.get_vgpr_half(0, True), 0x8001)
+        self.assertEqual(self.interp.get_vgpr_half(0, False), 32767)
+        self.assertEqual(self.interp.get_vgpr_u32(0), (0x8001 << 16) | 32767)
+
+    def test_aliased_source_with_abs_modifier(self) -> None:
+        # v0 low half = NEG_ONE_F16 (-1.0), high half = 0x3333
+        self.interp.set_vgpr_u32(0, (0x3333 << 16) | NEG_ONE_F16)
+        # Apply |src0|: |-1.0| = 1.0 -> 32767
+        res = self.interp.execute_asm("v_cvt_norm_i16_f16 v0.l, |v0.l|")
+        self.assertEqual(res & MASK16, 32767)
+        self.assertEqual(res >> 16, 0x3333)
+
+
 if __name__ == "__main__":
     unittest.main()
