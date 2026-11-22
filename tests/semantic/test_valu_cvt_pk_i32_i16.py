@@ -881,5 +881,66 @@ class TestValuCvtPkI32I16ConditionCodes(unittest.TestCase):
         self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 0)), 0xFFFF_FFFF)
         self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 1)), 0xFFFF_FFFF)
 
+# ==============================================================================
+# Unit Tests: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestValuCvtPkI32I16IEEE754EdgeCases(unittest.TestCase):
+    """Unit tests for packed IEEE 754 float16 bit patterns and integer boundaries."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarVALUInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_ieee754_half_precision_constants(self) -> None:
+        # Common FP16 bit patterns:
+        # +0.0 = 0x0000 (sign 0), -0.0 = 0x8000 (sign 1)
+        # +1.0 = 0x3C00 (sign 0), -1.0 = 0xBC00 (sign 1)
+        # +Inf = 0x7C00 (sign 0), -Inf = 0xFC00 (sign 1)
+        # qNaN = 0x7E00 (sign 0), sNaN = 0x7C01 (sign 0)
+        patterns = [
+            (0x8000_0000, 0x0000_0000, 0xFFFF_8000, "+0.0 (lo), -0.0 (hi)"),
+            (0xBC00_3C00, 0x0000_3C00, 0xFFFF_BC00, "+1.0 (lo), -1.0 (hi)"),
+            (0xFC00_7C00, 0x0000_7C00, 0xFFFF_FC00, "+Inf (lo), -Inf (hi)"),
+            (0x7C01_7E00, 0x0000_7E00, 0x0000_7C01, "qNaN (lo), sNaN (hi)"),
+            (0x03FF_0001, 0x0000_0001, 0x0000_03FF, "min subnormal (lo), max subnormal (hi)"),
+        ]
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_I32_I16,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Register(RegKind.VGPR, 2),
+        )
+
+        for packed, exp_d0, exp_d1, desc in patterns:
+            with self.subTest(desc=desc):
+                self.state.write_reg(Register(RegKind.VGPR, 2), packed)
+                self.interp.step(inst, self.state)
+                self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 0)), exp_d0)
+                self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 1)), exp_d1)
+
+    def test_nan_payload_preservation_without_trap(self) -> None:
+        payload_lo = 0x7C01  # sNaN
+        payload_hi = 0xFEFF  # negative NaN (bit 15 is 1)
+        packed = (payload_hi << 16) | payload_lo
+
+        d0, d1 = ref_cvt_pk_i32_i16(packed)
+        self.assertEqual(d0, 0x0000_7C01)
+        self.assertEqual(d1, 0xFFFF_FEFF)
+
+    def test_integer_boundary_extremes(self) -> None:
+        cases = [
+            (0x7FFF_8000, 0xFFFF_8000, 0x0000_7FFF),
+            (0x8000_7FFF, 0x0000_7FFF, 0xFFFF_8000),
+            (0xFFFF_0000, 0x0000_0000, 0xFFFF_FFFF),
+            (0x0000_FFFF, 0xFFFF_FFFF, 0x0000_0000),
+            (0xFFFE_0001, 0x0000_0001, 0xFFFF_FFFE),
+        ]
+        for src, exp0, exp1 in cases:
+            with self.subTest(src=hex(src)):
+                d0, d1 = ref_cvt_pk_i32_i16(src)
+                self.assertEqual(d0, exp0)
+                self.assertEqual(d1, exp1)
+
 if __name__ == "__main__":
     unittest.main()
