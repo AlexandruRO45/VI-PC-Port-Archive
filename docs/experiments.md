@@ -826,6 +826,51 @@ ctest --preset dev --no-tests=error -R '^cpu_native_mutation$' -V
 ctest --preset dev --no-tests=error -R '^cpu_native_forwarder$' -V
 ```
 
+## VEX.128 16-bit packed-integer leaf functions
+
+The [translator](../tools/cpu_vex_aot.py) lifts Windows x64 leaf functions that use VEX.128 word forms. It supports:
+- `vpaddw`, `vpsubw`, `vpmaxsw`, `vpminsw`, `vpmulhw` and `vpavgw`;
+- `vpsraw`, `vpsllw` and `vpsrlw` with an immediate count;
+- `vpunpcklbw`, `vpunpckhbw`, `vpunpcklwd` and `vpunpckhwd`;
+- `vpackuswb`;
+- the 16-byte moves `vmovdqu` and `vmovdqa`, the logic ops `vpxor`, `vpand` and `vpor`, and `vzeroupper`.
+
+The ABI belongs to this profile: RCX and RDX hold the addresses of two 16-byte inputs, R8 the address of a 16-byte output, and no return bits are defined. Each XMM register becomes a 16-byte value and each form an explicit per-lane loop, so the generated C++ states the wraparound, the unsigned saturation of signed words in `vpackuswb`, the shift-count limits and the `vpavgw` rounding instead of using intrinsics. Memory operands must be exactly `[RCX]`, `[RDX]` or `[R8]` with a 16-byte access, and stores go only to `[R8]`. Only VEX encodings and the volatile XMM0-XMM5 are accepted. Any other instruction, an EVEX form such as a masked `vpaddw`, a legacy SSE encoding, XMM6-XMM15, a VEX.256 operand or another operand shape is rejected with its RVA. Decoding uses iced-x86, and function bounds come from `cpu_leaf_aot.bounded_code`.
+
+```powershell
+cmake --build --preset dev --target cpu_vex_words_original_lifted cpu_vex_words_altered_lifted
+ctest --preset dev --no-tests=error -R '^cpu_aot_vex_words$' -V
+```
+
+The [fixture](../tests/cpu/vex_words.asm) has five functions. The test runs each through the native and lifted DLLs on the same 4096 input pairs:
+- every pairing of eight edge words, including 0x7fff, 0x8000, 0xffff and 0x00ff, broadcast to all lanes;
+- the edge words rotated across lanes;
+- seeded random lanes.
+
+Each call runs in one 16-byte-aligned arena in which the two inputs and the output are separated by 0xcc guard zones. The whole arena must match bit for bit, and the native call must leave everything outside its output unchanged.
+
+**Alignment.** `vmovdqu` accepts any address, and the four functions that use only `vmovdqu` also match on buffers 8 bytes off alignment. `vmovdqa` requires 16-byte alignment. `aligned_ops` is called only with aligned buffers, because the generated C++ does not check the precondition that the native instruction would fault on.
+
+**Aliases.** The output may alias either input exactly. Reads and the store then happen in program order, each as one 16-byte copy. With the output aliasing A and then B, and with RCX equal to RDX, all five functions match on 512 pairs. `store_reload` stores, reads the inputs again and stores a second result; with the output aliasing an input, its result differs from the non-aliased one in 955 of these cases, so the order is observed. Partial overlaps are not tested.
+
+**Controls.** A second fixture build replaces one `vpsraw` with `vpsrlw` in `shift_edges`. Its lifted DLL matches its own native build and differs from the original in 4044 of 4096 outputs, while the other functions are unchanged. Translation rejects three patched copies: a VEX.256 load, a VEX.256 store, which uses a three-byte VEX prefix because of R8, and a `vpaddw` turned into `vpaddd`. It also rejects eight hand-encoded bodies, each first checked against its iced disassembly: an EVEX `vpaddw xmm0{k1}`, a legacy `paddw`, `xmm6` as destination and as source, `[rcx+10h]`, `[rax]`, a store to `[rcx]` and `vpsraw` with an XMM count.
+
+Sixteen mutations of the translator each fail the test:
+- `vpavgw` without rounding;
+- `vpmulhw` keeping bit 15;
+- `vpsraw` counts above 15 not clamped;
+- `vpsllw` and `vpsrlw` counts above 15 not cleared;
+- `vpackuswb` without saturation;
+- `vpunpckhbw` and `vpunpckhwd` reading the low half;
+- `vpmaxsw` comparing unsigned;
+- either YMM check removed;
+- the VEX-encoding check removed;
+- either nonvolatile-register check removed;
+- stores deferred to the end of the function;
+- input reads cached.
+
+Only the alias checks catch the last two.
+
 ## Switch dispatch through jump tables
 
 Compilers lower a dense `switch` to a bounds check and an indirect `JMP` through a table of 32-bit entries. The [jump-table translator](../tools/cpu_switch_aot.py) recognizes the two x64 layouts in common use. MSVC stores image-relative entries and loads them through a register holding `__ImageBase`. LLVM stores signed offsets from the table and adds the table address. The translator reads the table from the PE, then emits a C++ `switch` whose cases jump to labels at the decoded targets. The host compiler builds its own dispatch from that switch.
@@ -1236,6 +1281,35 @@ An `ALTER_IMM` variant changes immediates or memory displacements on 10 exports 
 
 Not covered by this experiment: the 5 move forms carved out to `cpu_vex_aot.py (PR #325)`, memory operands on the 28 register-only AVX forms, FP arithmetic/compare/convert/test instructions, control flow or calls mixed with AVX state, nonvolatile `XMM6`..`XMM15` save/restore prologues, and title CPU code execution.
 
+## Scalar SSE and SSE2 leaf functions
+
+Compilers keep `float` and `double` values in XMM registers and use the scalar SSE and SSE2 instructions for them. The [scalar float translator](../tools/cpu_sse_aot.py) adds these instructions to the control flow and integer instructions of the [jump-table translator](../tools/cpu_switch_aot.py), without its jump tables. It lifts `MOVSS` and `MOVSD` between registers and memory, register `MOVAPS`/`MOVUPS` copies, `ADD`/`SUB`/`MUL`/`DIV` in both precisions, `CVTSI2SS`/`CVTSI2SD` from 32- and 64-bit integers, the truncating `CVTTSS2SI`/`CVTTSD2SI`, `CVTSS2SD`/`CVTSD2SS`, the four `COMISS`-family compares, `MOVD`, `MOVQ` between XMM registers and memory, and `XORPS`/`XORPD`/`PXOR` of a register with itself.
+
+```powershell
+cmake --build --preset dev --target cpu_float_original_lifted cpu_float_swapped_lifted
+ctest --preset dev --no-tests=error -R '^cpu_aot_scalar_float$' -V
+```
+
+A PE does not record argument types, so each export is named with its signature, such as `blend_ss=f:ffqf`: the result, then up to four slots, each `f` (float), `d` (double) or `q` (a 64-bit integer or pointer). Under the Windows x64 convention, slot N arrives in XMM0 to XMM3 when it is floating point and in RCX, RDX, R8 or R9 otherwise. The generated function has the matching C++ signature. XMM6 to XMM15 are nonvolatile and a leaf has no frame to save them in, so any use is rejected.
+
+The generated C++ keeps the low quadword of each XMM register in a 64-bit integer. Every supported instruction computes that quadword from low quadwords only, so the upper half of a register never reaches a result and is not modelled. The two dwords of the quadword are tracked as defined or undefined along every path. A `float` argument defines the low dword alone, a register copy carries undefined parts with it, and a read of an undefined part is rejected. `MOVSS` between registers and every single-precision result replace the low dword and keep bits 32 to 63.
+
+Results must match the processor bit for bit, and three rules are written out because C++ leaves them to the host compiler:
+
+- **NaN operands.** `ADDSS xmm0, xmm1` returns the quieted NaN of its destination when that is a NaN, otherwise the quieted source NaN. A compiler may swap the operands of `a + b`, which changes the payload when both are NaN, so the generated code tests the operands before the arithmetic. An invalid operation such as `inf - inf` gives the default NaN with the sign bit set.
+- **Truncation.** `CVTTSS2SI` and `CVTTSD2SI` return the integer indefinite, `0x80000000` or `0x8000000000000000`, for a NaN or a value outside the destination range. The C++ cast is undefined there, so the range is tested first.
+- **Compares.** An unordered compare sets ZF, PF and CF together. The three flags are stored by the compare and may feed a run of conditional jumps, as in the `JP`, `JNE` pair compilers emit for equality. `JE`, `JNE`, `JB`, `JAE`, `JBE`, `JA`, `JP` and `JNP` are accepted. Integer flags still feed only the jump that follows their producer.
+
+Addition, subtraction, multiplication, division and the conversions run as one host instruction each under the thread's MXCSR, as in the original, with contraction to fused multiply-add switched off. Exceptions are assumed masked.
+
+The [source fixture](../tests/cpu/scalar_float.asm) exports six functions: single- and double-precision arithmetic through register and memory operands, conversions in both directions and between the precisions, and two classifiers that turn compare flags into a bit mask. The test passes every floating-point slot as a `double` whose bit pattern it chooses, so signalling NaNs reach XMM unchanged and the upper dword of a `float` slot holds junk. Inputs cover zeros of both signs, denormals, infinities, quiet and signalling NaNs with distinct payloads, the values around ±2^31 and ±2^63, ties in the narrowing conversions and random patterns. For 13,287 calls it compares the result bits and a guarded output buffer between the original DLL and its translation, and again between a control build and the control's translation. The control assembles the same source with one operand order or source changed in each function. In `blend_ss` the control computes `b + a` instead of `a + b`, and the test requires that its results differ exactly when both operands are NaN. 23 calls have results fixed in the test from the instruction set reference, including both integer indefinites and the sign of the default NaN.
+
+On a copy of the linked DLL, the test patches one instruction at a time and expects each to be rejected: packed `ADDPS`, `SQRTSS`, VEX-encoded `VADDSS`, `XORPS` of two different registers, `CVTSS2SI` (which rounds by MXCSR), `MOVQ` to an integer register, a RIP-relative load, a write to XMM6, a read of an unwritten register, `ADDSD` on `float` arguments, `JLE` after `COMISS`, a compare with no jump after it, and a second jump after an integer compare. Eight wrong signatures are rejected as well, for example a `double` result from a function that defines only a `float`.
+
+Not covered: RIP-relative constants, packed operations, `SQRT`, `MIN` and `MAX`, the rounding conversions, `SETcc` and `CMOVcc` after a compare, stack frames and calls.
+
+On Linux, `llvm-ml` assembled the fixture and `lld-link` linked it. The original machine code ran in-process through a Windows-ABI trampoline that loads each slot into both its integer and its XMM register. It matched the lifted C++ built with clang at `-O0`, `-O2` and `-O3` on every call, for both builds, and all rejection controls passed. The generated sources compile without warnings under clang-cl `/W4 /WX`. A Windows run of `cpu_aot_scalar_float` with ML64 and MSVC has not been recorded yet.
+
 ## Offline pixel shader recompilation
 
 #The bitwise fixture uses AND, OR, XOR, NOT, BFI and three reversed shifts. Two constant sets exercise counts above 31. Exact mantissa bits distinguish the arithmetic and logical right shifts in GPU readback.
@@ -1284,6 +1358,8 @@ The SDWA forms of the 16 `v_cmp_*_f32` predicates are lowered when both `src0_se
 
 Scalar comparison lowering covers 18 RDNA2 SOPC instructions: 32-bit signed comparisons (`s_cmp_eq_i32`, `s_cmp_lg_i32`, `s_cmp_gt_i32`, `s_cmp_ge_i32`, `s_cmp_lt_i32`, `s_cmp_le_i32`), 32-bit unsigned comparisons (`s_cmp_eq_u32`, `s_cmp_lg_u32`, `s_cmp_gt_u32`, `s_cmp_ge_u32`, `s_cmp_lt_u32`, `s_cmp_le_u32`), 64-bit scalar comparisons (`s_cmp_eq_u64`, `s_cmp_lg_u64`), 32-bit bit comparisons (`s_bitcmp0_b32`, `s_bitcmp1_b32`), and 64-bit bit comparisons (`s_bitcmp0_b64`, `s_bitcmp1_b64`). Each comparison sets the scalar condition code boolean (`scc`) to the comparison outcome, making it available for subsequent conditional moves (`s_cmov_b64`). Signed integer comparisons cast operands with `asint`, 64-bit comparisons inspect both low and high dwords across even-aligned SGPR pairs, and bit comparisons mask by `src1 & 31u` (selecting low or high dword via bit 5 for 64-bit forms). Unaligned register pairs, out-of-range registers (`s106`), and unsupported comparison types (`s_cmp_gt_u64`, `s_cmp_eq_i64`) are rejected.
 
+Scalar ALU instructions act on uniform 32-bit values: immediates, loaded constant words and earlier scalar results. Each result becomes an HLSL `uint` local, and a vector move or operand reads it through `asfloat`. Supported forms are `s_add_u32`, `s_sub_u32`, `s_add_i32`, `s_sub_i32`, `s_mul_i32`, `s_min_u32`, `s_max_u32`, `s_min_i32`, `s_max_i32`, `s_and_b32`, `s_or_b32`, `s_xor_b32`, `s_andn2_b32`, `s_orn2_b32`, `s_not_b32`, `s_lshl_b32`, `s_lshr_b32`, `s_ashr_i32`, the six `s_cmp_*_i32` and six `s_cmp_*_u32` relations, and `s_cselect_b32`, besides the existing `s_mov_b32` and `s_movk_i32`. SCC follows the RDNA definitions: carry or borrow for the unsigned add and subtract, signed overflow for the signed ones, the comparison for min, max and `s_cmp_*`, and a nonzero result for the bitwise and shift forms. `s_mul_i32` leaves it unchanged. A shift uses the low five bits of its count. `s_cselect_b32` is rejected unless the lowerer saw SCC written, and `s_wqm_b64` and the exec restore clear the tracked SCC. Scalar results are not folded to constants, so they cannot supply a texture address or sampler word. Carry-in, 64-bit, high-half multiply, bitfield, `s_cmpk_*`, `s_bitcmp*` and `s_cmov*` forms remain unsupported. The draw test packs 23 SCC outcomes and a 17-bit hash of the 32-bit results into four channels, ten bits each, exported as 1 + k/1024, which binary16 holds exactly. The program is drawn with two sets of constant words, including negative and sign-bit inputs, and every select takes a different arm between the sets. A CPU interpreter written from the instruction definitions supplies the expected color. Replacing `s_ashr_i32` with `s_lshr_b32`, `s_cmp_lt_i32` with `s_cmp_lt_u32`, or swapping the subtraction's sources must produce a mismatch.
+
 From the repository root on Linux with LLVM 15 installed, assemble the original test shaders, wrap them in synthetic records, then extract, decode and translate them. The test compares the result with lowering the source operands directly.
 
 ```sh
@@ -1325,6 +1401,8 @@ Several VOP3 (e64) encodings were accepted by the translator but drawn by no fix
 `v_frexp_mant_f32` (in e32 and e64 encodings) and `v_ldexp_f32` lower through explicit IEEE-754 binary32 bit helpers (`frexp_mant32` and `ldexp32`) so subnormals, signed zero, infinity, NaN, and large exponent shifts stay independent of desktop driver flush-to-zero modes. `v_ldexp_f32` accepts float source modifiers on `src0` and `clamp`, while decoding `src1` as a signed 32-bit integer and rejecting float modifiers on the exponent. Binary and draw fixtures check normal values, signed zero, source negation and absolute value, runtime scalar exponents, negative exponents, and output clamping; replacing `v_frexp_mant_f32` with `v_mov_b32` or inverting a `v_ldexp_f32` exponent sign must report a pixel mismatch.
 
 Packed binary16 `VOP3P` arithmetic (`v_pk_add_f16`, `v_pk_mul_f16`, `v_pk_min_f16`, `v_pk_max_f16` and `v_pk_fma_f16`) widens each selected 16-bit lane with `op_sel`, `op_sel_hi`, `neg_lo` and `neg_hi`, applies IEEE `minNum`/`maxNum` or arithmetic in binary32, optionally clamps to `[0, 1]`, and repacks both lanes with an explicit round-to-nearest-even helper (`pack16_rne`) so results do not depend on `f32tof16` rounding differences across desktop adapters. Inline binary16 float constants occupy bits `[15:0]` with bits `[31:16]` zeroed, matching `gfx1013` hardware, while 32-bit hex literals and integer inline constants supply both halves. The `vop3p` fixture draws three constant sets covering lane selection, negation, inline high-half zero extension, `minNum` against a quiet NaN literal (`0x40007e00`), `[0, 1]` clamp and exact binary16 halfway ties, with five mutations (`neg_lo`, `neg_hi`, `min` vs `max`, inline high-half zero extension and `clamp`) that must each report a mismatch; packed integer `VOP3P`, `v_fma_mix_*` and dot-product forms stay rejected. [AMD RDNA 2 ISA reference](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+
+Mixed-precision `VOP3P` FMA (`v_fma_mix_f32`, `v_fma_mixlo_f16` and `v_fma_mixhi_f16`) interprets each source as binary32 (`op_sel == 0`) or binary16 (`op_sel == 1`, low or high half via `op_sel_hi`, widened through `widen16`), applies `abs` and `neg` after widening, evaluates the multiply-add with optional `[0, 1]` clamp, and for `v_fma_mixlo_f16`/`v_fma_mixhi_f16` packs the destination half with `pack16_rne` while preserving the untouched 16 bits of `vdst` (rejecting an uninitialized destination). The `fma_mix` fixture draws three constant sets covering mixed f16/f32 inputs, `|.|`/`-`, `op_sel_hi`, preserved high/low destination halves, `[0, 1]` clamp, and binary16 halfway RNE ties, with five mutations (`abs`, `neg`, `op_sel_hi`, `mixhi` preservation and `clamp`) that must each report a mismatch. [AMD RDNA 2 ISA reference](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
 
 `s_buffer_load_dword` reads one word from the tracked four-SGPR constant descriptor. Supported offsets are dword-aligned immediates within the 256-byte desktop binding, with `null` denoting offset zero. The lowerer requires the descriptor to be ready and tracks the destination until `s_waitcnt lgkmcnt(0)`. The synthetic binary and draw checks cover offsets 0, 8 and 252. Two sets of constant words matched all four channels of 4,096 pixels per draw on WARP and RTX 5080. Reading the neighboring word changes the first pixel on both adapters. [AMD RDNA 2 scalar memory rules](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
 

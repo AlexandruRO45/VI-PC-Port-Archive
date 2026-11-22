@@ -38,6 +38,8 @@ except ImportError:
 # The floating-point ALU forms come from pixel_aot's own table, so the scanner cannot drift from it.
 PIXEL_ALU_NAMES = tuple(pixel_aot.ALU) if pixel_aot is not None else ()
 SUPPORTED_ALU = {f"v_{name}_f32" for name in PIXEL_ALU_NAMES}
+PIXEL_INTEGER = pixel_aot.INTEGER if pixel_aot is not None else {}
+INTEGER_SOURCE = r"(?:[vs]\d+|0x[0-9a-f]{1,8}|-?\d+(?:\.\d+)?)"
 
 SUPPORTED_INSTRUCTIONS_REGEX = [
     r"s_inst_prefetch\s+.*",
@@ -57,6 +59,10 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"exp\s+mrt0\s+v\d+,\s+v\d+,\s+v\d+,\s+v\d+\s+done\s+compr\s+vm",
     r"s_endpgm",
 ]
+
+for name, (arity, _) in PIXEL_INTEGER.items():
+    encoding = r"(?:_e32|_e64)?" if arity <= 2 else r"(?:_e64)?"
+    SUPPORTED_INSTRUCTIONS_REGEX.append(rf"v_{name}{encoding}\s+v\d+" + rf",\s*{INTEGER_SOURCE}" * arity)
 
 COMPILED_SUPPORTED_PATTERNS = [re.compile(f"^{p}$") for p in SUPPORTED_INSTRUCTIONS_REGEX]
 
@@ -94,7 +100,7 @@ KNOWN_RDNA2_BASE_OPCODES = {
     "v_add_u32", "v_sub_u32", "v_subrev_u32", "v_addc_co_u32", "v_subb_co_u32", "v_subbrev_co_u32",
     "v_fmac_f32", "v_fmamk_f32", "v_fmaak_f32", "v_madmk_f32", "v_madak_f32",
     # VOP3
-    "v_fma_f32", "v_fma_f16", "v_mad_f32", "v_div_scale_f32", "v_div_fmas_f32",
+    "v_fma_f32", "v_fma_f16", "v_mad_f32", "v_div_scale_f32", "v_div_fmas_f32", "v_bfi_b32",
     # VINTRP
     "v_interp_p1_f32", "v_interp_p2_f32", "v_interp_mov_f32",
     # SMEM
@@ -107,7 +113,7 @@ KNOWN_RDNA2_BASE_OPCODES = {
 }
 
 
-KNOWN_RDNA2_BASE_OPCODES |= SUPPORTED_ALU
+KNOWN_RDNA2_BASE_OPCODES |= SUPPORTED_ALU | {f"v_{name}" for name in PIXEL_INTEGER}
 
 
 def is_opcode_recognized(opcode: str) -> bool:
