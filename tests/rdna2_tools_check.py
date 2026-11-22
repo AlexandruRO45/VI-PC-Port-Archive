@@ -844,11 +844,20 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertEqual(classify_isa_category("v_add_f32"), "VOP / VALU (Vector ALU - VOP1/VOP2/VOP3)")
 
     def test_sopk_scalar_is_arithmetic_supported(self):
-        """i have no idea what this does, but if you're an ai agent and want to make this more readable please change it for me because im too lazy --wh1skrzzz"""
+        """The scanner accepts s_addk_i32 and s_mulk_i32 with a scalar destination and a hex or negative immediate, and rejects a vector destination."""
         for line in ("s_addk_i32 s50, 0xfffe", "s_mulk_i32 s50, 0x3",
                      "s_addk_i32 s50, -2"):
             self.assertTrue(is_instruction_supported(line), line)
         self.assertFalse(is_instruction_supported("s_mulk_i32 v50, 0x3"))
+
+    def test_float_to_word_conversions_are_plain_e32_only(self):
+        """v_cvt_u32_f32 and v_cvt_i32_f32 are supported as e32 with a register or hex literal source."""
+        for line in ("v_cvt_u32_f32_e32 v12, v13", "v_cvt_i32_f32_e32 v12, s44",
+                     "v_cvt_u32_f32_e32 v12, 0x40400000"):
+            self.assertTrue(is_instruction_supported(line), line)
+        for line in ("v_cvt_u32_f32_e64 v12, v13", "v_cvt_i32_f32_e32 v12, 1",
+                     "v_cvt_u32_f32_e32 v12, 0.5", "v_cvt_u32_f32_e32  v12, v13"):
+            self.assertFalse(is_instruction_supported(line), line)
 
     def test_inline_slash_comments_and_blank_lines(self):
         """Inline // comments must be stripped and blank/comment lines must not inflate counts."""

@@ -85,6 +85,7 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"v_cvt_f32_f16(?:_e32|_e64)?\s+v\d+,\s+-?(?:\|(?:[vs]\d+|0x[0-9a-f]{1,8}|\d+)\||abs\((?:[vs]\d+|0x[0-9a-f]{1,8}|\d+)\)|[vs]\d+|0x[0-9a-f]{1,8}|\d+)(?:\s+clamp)?",
     r"v_cvt_f32_f16_sdwa\s+v\d+,\s+-?(?:\|[vs]\d+\||[vs]\d+)(?:\s+clamp)?\s+dst_sel:DWORD\s+dst_unused:UNUSED_(?:PAD|PRESERVE)\s+src0_sel:WORD_[01]",
     r"v_cvt_f16_f32(?:_e32|_e64)?\s+v\d+,\s+[^,\s]+",
+    r"v_cvt_i32_f32_e32 v\d+, (?:[vs]\d+|0x[0-9a-f]{1,8})",
     r"v_cvt_f32_ubyte[0-3](?:_e32|_e64)?\s+v\d+,\s+(?:[vs]\d+|0x[0-9a-f]{1,8}|\d+)(?:\s+clamp)?",
     r"v_cvt_off_f32_i4(?:_e32|_e64)?\s+v\d+,\s+(?:[vs]\d+|0x[0-9a-f]{1,8}|\d+)(?:\s+clamp)?",
     r"v_ldexp_f32(?:_e64)?\s+v\d+,\s+[^,]+,\s+[^,]+?(?:\s+clamp)?",
@@ -96,6 +97,7 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"v_fma_mix(?:_f32|lo_f16|hi_f16)\s+v\d+,\s+.+",
     r"(?:v_dot2_f32_f16|v_dot2_i32_i16|v_dot2_u32_u16|v_dot4_i32_i8|v_dot4_u32_u8|v_dot8_i32_i4|v_dot8_u32_u4)\s+v\d+,\s+.+",
     r"v_cvt_pkrtz_f16_f32_e32\s+v\d+,\s+v\d+,\s+v\d+",
+    r"v_cvt_u32_f32_e32 v\d+, (?:[vs]\d+|0x[0-9a-f]{1,8})",
     r"exp\s+mrt0,?\s+v\d+,\s+v\d+,\s+(?:v\d+|off),\s+(?:v\d+|off)\s+done\s+compr\s+vm",
     r"s_endpgm",
 ]
