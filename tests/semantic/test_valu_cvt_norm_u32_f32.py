@@ -782,5 +782,153 @@ class TestValuCvtNormU32F32RegisterAliasing(unittest.TestCase):
             self.assertEqual(final_word, expected)
 
 
+# ---------------------------------------------------------------------------
+# Condition Codes, Status Flags, and Carry/Borrow Isolation
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class ConditionCodes:
+    """Architectural condition codes evaluating properties of converted UNORM32 results."""
+    zero: bool
+    max_val: bool
+    even: bool
+    negative: bool
+    midpoint: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class FPStatusFlags:
+    """IEEE 754 and hardware status flags for f32 to unorm32 conversion."""
+    invalid: bool       # e.g., sNaN operand
+    denormal: bool      # e.g., subnormal f32 operand
+    inexact: bool       # non-integer scaling requiring rounding
+    overflow: bool      # finite input > 1.0 clamped to 4294967295
+    underflow: bool     # positive finite input rounded to 0
+
+
+def compute_condition_codes_u32(result: int) -> ConditionCodes:
+    """Computes condition codes evaluating attributes of a 32-bit UNORM result."""
+    u32 = result & MASK32
+    return ConditionCodes(
+        zero=(u32 == UNORM32_MIN),
+        max_val=(u32 == UNORM32_MAX),
+        even=(u32 % 2 == 0),
+        negative=False,
+        midpoint=(u32 == UNORM32_HALF),
+    )
+
+
+def compute_fp_status_flags_cvt_norm_u32_f32(src32: int, result32: int) -> FPStatusFlags:
+    """Computes IEEE 754 / architectural exception status flags."""
+    src32 &= MASK32
+    result32 &= MASK32
+
+    invalid = is_snan_f32(src32)
+    denormal = is_subnormal_f32(src32)
+
+    is_src_nan = is_nan_f32(src32)
+    is_src_inf = is_inf_f32(src32)
+
+    overflow = False
+    underflow = False
+    inexact = False
+
+    if not is_src_nan and not is_src_inf:
+        f_val = bits_to_f32(src32)
+        if f_val > 1.0:
+            overflow = True
+            inexact = True
+        elif 0.0 < f_val < 1.0:
+            scaled = Fraction(f_val) * 4294967295
+            if scaled.denominator != 1:
+                inexact = True
+            if result32 == UNORM32_MIN:
+                underflow = True
+
+    return FPStatusFlags(
+        invalid=invalid,
+        denormal=denormal,
+        inexact=inexact,
+        overflow=overflow,
+        underflow=underflow,
+    )
+
+
+class TestValuCvtNormU32F32ConditionCodes(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow isolation."""
+
+    def test_condition_codes(self) -> None:
+        cc_zero = compute_condition_codes_u32(UNORM32_MIN)
+        self.assertTrue(cc_zero.zero)
+        self.assertTrue(cc_zero.even)
+        self.assertFalse(cc_zero.max_val)
+        self.assertFalse(cc_zero.negative)
+        self.assertFalse(cc_zero.midpoint)
+
+        cc_max = compute_condition_codes_u32(UNORM32_MAX)
+        self.assertFalse(cc_max.zero)
+        self.assertFalse(cc_max.even)
+        self.assertTrue(cc_max.max_val)
+        self.assertFalse(cc_max.negative)
+
+        cc_mid = compute_condition_codes_u32(UNORM32_HALF)
+        self.assertFalse(cc_mid.zero)
+        self.assertTrue(cc_mid.even)
+        self.assertTrue(cc_mid.midpoint)
+
+    def test_status_flags_snan_invalid(self) -> None:
+        res = ref_cvt_norm_u32_f32(SNAN_F32)
+        flags = compute_fp_status_flags_cvt_norm_u32_f32(SNAN_F32, res)
+        self.assertTrue(flags.invalid)
+        self.assertFalse(flags.denormal)
+        self.assertFalse(flags.overflow)
+
+        res_qnan = ref_cvt_norm_u32_f32(QNAN_F32)
+        flags_qnan = compute_fp_status_flags_cvt_norm_u32_f32(QNAN_F32, res_qnan)
+        self.assertFalse(flags_qnan.invalid)
+
+    def test_status_flags_denormal(self) -> None:
+        res = ref_cvt_norm_u32_f32(MIN_SUBNORMAL_F32)
+        flags = compute_fp_status_flags_cvt_norm_u32_f32(MIN_SUBNORMAL_F32, res)
+        self.assertTrue(flags.denormal)
+        self.assertFalse(flags.invalid)
+        self.assertTrue(flags.underflow)
+
+    def test_status_flags_overflow(self) -> None:
+        res = ref_cvt_norm_u32_f32(TWO_F32)
+        self.assertEqual(res, UNORM32_MAX)
+        flags = compute_fp_status_flags_cvt_norm_u32_f32(TWO_F32, res)
+        self.assertTrue(flags.overflow)
+        self.assertTrue(flags.inexact)
+        self.assertFalse(flags.invalid)
+
+    def test_status_flags_inexact(self) -> None:
+        res_one = ref_cvt_norm_u32_f32(ONE_F32)
+        flags_one = compute_fp_status_flags_cvt_norm_u32_f32(ONE_F32, res_one)
+        self.assertFalse(flags_one.inexact)
+
+        res_half = ref_cvt_norm_u32_f32(HALF_F32)
+        flags_half = compute_fp_status_flags_cvt_norm_u32_f32(HALF_F32, res_half)
+        self.assertTrue(flags_half.inexact)
+
+    def test_carry_borrow_vcc_isolation(self) -> None:
+        interp = ScalarVALUInterpreter()
+        canary_vcc = 0xFEDCBA9876543210
+        interp.vcc = canary_vcc
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_U32_F32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Immediate(1.0),
+        )
+        interp.step(inst)
+        self.assertEqual(interp.vcc, canary_vcc)
+
+        simd = SIMDWavefrontInterpreter(wave_size=64)
+        simd.vcc = canary_vcc
+        simd.step(inst)
+        self.assertEqual(simd.vcc, canary_vcc)
+
+
 if __name__ == "__main__":
     unittest.main()
