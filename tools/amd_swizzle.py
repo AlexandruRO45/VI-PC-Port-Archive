@@ -153,6 +153,8 @@ def main():
     ap.add_argument("--modes", default="_64K_")
     ap.add_argument("--out")
     a = ap.parse_args()
+    if min(a.width, a.height) < 1:
+        ap.error("--width and --height must be positive")
     if a.out:
         check_preview_path(a.out, a.blob)
     nibbles, tables = load()
@@ -160,7 +162,7 @@ def main():
         data = f.read()[a.offset:]
     # BC formats cover 4x4 pixels per element; uncompressed 1/2/4 bpe formats have one pixel per element.
     block = 4 if a.bpe in (8, 16) else 1
-    wb, hb = a.width // block, a.height // block
+    wb, hb = (a.width + block - 1) // block, (a.height + block - 1) // block
     res = []
     for tname, entries in tables.items():
         bits = block_bits(tname)

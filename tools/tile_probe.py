@@ -73,8 +73,8 @@ def layout(nblocks, wblocks, mode, bpe):
 
 
 def score(img):
-    dx = np.abs(np.diff(img, axis=1)).mean()
-    dy = np.abs(np.diff(img, axis=0)).mean()
+    dx = np.abs(np.diff(img, axis=1)).mean() if img.shape[1] > 1 else 0.0
+    dy = np.abs(np.diff(img, axis=0)).mean() if img.shape[0] > 1 else 0.0
     return dx + dy
 
 

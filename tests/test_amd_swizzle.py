@@ -5,6 +5,8 @@
 import pytest  # noqa: E402 (keeps the CI bash loop from running this file)
 
 import os
+import struct
+import subprocess
 import sys
 import tempfile
 
@@ -72,7 +74,6 @@ def test_64k_block_extent_comes_from_the_element_count():
 
 
 def cli(tmp_path, *args):
-    import subprocess
     tool = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools", "amd_swizzle.py")
     return subprocess.run([sys.executable, "-I", tool, str(tmp_path / "blob.bin"), *args],
                           capture_output=True, text=True, timeout=120, check=False)
@@ -106,10 +107,24 @@ def test_uncompressed_feature_uses_raw_rgb_bytes():
     assert got.tolist() == [[0, 1, 2], [4, 5, 6]]
 
 
+def test_cli_ranks_partial_bc_blocks(tmp_path):
+    # A 5x4 image has two BC1 blocks across, even though the second has only one visible column.
+    hdr = tmp_path / "patterns.h"
+    text = header(["0", "0", "0", "X0", "Y0", "X1", "Y1", "X2"])
+    hdr.write_text(text.replace("1 pipes 1 bpe", "1 pipes 8 bpe"), encoding="utf-8", newline="\n")
+    blob = tmp_path / "bc1.bin"
+    blob.write_bytes(struct.pack("<HHIHHI", 0xF800, 0xF800, 0, 0x07E0, 0x07E0, 0))
+    result = subprocess.run([sys.executable, "-I", A.__file__, str(blob), "--width", "5", "--height", "4"],
+                            capture_output=True, text=True, env=dict(os.environ, AMD_SWIZZLE_HEADER=str(hdr)),
+                            timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert not result.stderr, result.stderr
+    assert float(result.stdout.split()[0]) > 0, result.stdout
+
+
 def test_cli_detiles_4k_tables_with_4k_blocks():
     # A 128x128 RGBA gradient tiled in 4 KB blocks (32x32 elements, row-major). The same pattern entry under
     # a 64K table name must not be picked by --modes 4K, and the 4K table must detile with 12-bit, 4 KB blocks.
-    import subprocess
     import numpy as np
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
     from tile_probe import score
