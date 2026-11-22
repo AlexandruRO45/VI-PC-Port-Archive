@@ -738,5 +738,177 @@ class TestValuMsadU8SIMDMultiLaneDivergence(unittest.TestCase):
             self.assertEqual(state.get_vgpr(lane, 0), 42)
 
 
+class TestValuMsadU8RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_dst_aliases_src0(self) -> None:
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        val_a = 0x10203040
+        val_b = 0x30405060
+        acc_val = 1000
+
+        state.set_vgpr(0, val_a)
+        state.set_vgpr(1, val_b)
+        state.set_vgpr(2, acc_val)
+
+        instr = VMsadU8Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VMsadOperand(Reg32(0, RegType.VGPR)),  # Aliased with dst
+            src1=VMsadOperand(Reg32(1, RegType.VGPR)),
+            src2=VMsadOperand(Reg32(2, RegType.VGPR)),
+        )
+
+        expected = oracle_v_msad_u8(val_a, val_b, acc_val)
+        res = interp.step(instr, state)
+        self.assertEqual(res, expected)
+        self.assertEqual(state.get_vgpr(0), expected)
+        # Verify src1 and src2 remain intact
+        self.assertEqual(state.get_vgpr(1), val_b)
+        self.assertEqual(state.get_vgpr(2), acc_val)
+
+    def test_dst_aliases_src1(self) -> None:
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        val_a = 0x10203040
+        val_b = 0x30005000  # lanes 0 and 2 masked
+        acc_val = 500
+
+        state.set_vgpr(0, val_a)
+        state.set_vgpr(1, val_b)
+        state.set_vgpr(2, acc_val)
+
+        instr = VMsadU8Instruction(
+            dst=Reg32(1, RegType.VGPR),
+            src0=VMsadOperand(Reg32(0, RegType.VGPR)),
+            src1=VMsadOperand(Reg32(1, RegType.VGPR)),  # Aliased with dst
+            src2=VMsadOperand(Reg32(2, RegType.VGPR)),
+        )
+
+        expected = oracle_v_msad_u8(val_a, val_b, acc_val)
+        res = interp.step(instr, state)
+        self.assertEqual(res, expected)
+        self.assertEqual(state.get_vgpr(1), expected)
+        self.assertEqual(state.get_vgpr(0), val_a)
+        self.assertEqual(state.get_vgpr(2), acc_val)
+
+    def test_dst_aliases_src2(self) -> None:
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        val_a = 0x10203040
+        val_b = 0x30405060
+        acc_val = 200
+
+        state.set_vgpr(0, val_a)
+        state.set_vgpr(1, val_b)
+        state.set_vgpr(2, acc_val)
+
+        instr = VMsadU8Instruction(
+            dst=Reg32(2, RegType.VGPR),
+            src0=VMsadOperand(Reg32(0, RegType.VGPR)),
+            src1=VMsadOperand(Reg32(1, RegType.VGPR)),
+            src2=VMsadOperand(Reg32(2, RegType.VGPR)),  # Aliased with dst
+        )
+
+        expected = oracle_v_msad_u8(val_a, val_b, acc_val)
+        res = interp.step(instr, state)
+        self.assertEqual(res, expected)
+        self.assertEqual(state.get_vgpr(2), expected)
+        self.assertEqual(state.get_vgpr(0), val_a)
+        self.assertEqual(state.get_vgpr(1), val_b)
+
+    def test_dst_aliases_src0_and_src1_identity_zero_diff(self) -> None:
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        val = 0x55AA00CC  # note byte 1 is 0
+        acc = 1234
+        state.set_vgpr(0, val)
+        state.set_vgpr(1, acc)
+
+        # When src0 == src1, diff is 0 for all non-zero bytes (|x-x|=0),
+        # and 0 for zero bytes (masked). So sad_sum is strictly 0.
+        instr = VMsadU8Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VMsadOperand(Reg32(0, RegType.VGPR)),
+            src1=VMsadOperand(Reg32(0, RegType.VGPR)),
+            src2=VMsadOperand(Reg32(1, RegType.VGPR)),
+        )
+
+        res = interp.step(instr, state)
+        self.assertEqual(res, acc)
+        self.assertEqual(state.get_vgpr(0), acc)
+
+    def test_dst_aliases_all_operands(self) -> None:
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        val = 0x7E8000FF
+        state.set_vgpr(0, val)
+
+        # v_msad_u8 v0, v0, v0, v0:
+        # sad_sum(v0, v0) is 0, acc is v0 -> result is 0 + v0 = v0
+        instr = VMsadU8Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VMsadOperand(Reg32(0, RegType.VGPR)),
+            src1=VMsadOperand(Reg32(0, RegType.VGPR)),
+            src2=VMsadOperand(Reg32(0, RegType.VGPR)),
+        )
+
+        res = interp.step(instr, state)
+        self.assertEqual(res, val)
+        self.assertEqual(state.get_vgpr(0), val)
+
+    def test_simd_multi_lane_aliased_dst_preservation(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0x0000FFFF)  # lanes 0..15 active, 16..31 inactive
+        interp = SIMDInterpreter()
+
+        original_v0 = [0x10000000 | lane for lane in range(32)]
+        for lane in range(32):
+            state.set_vgpr(lane, 0, original_v0[lane])
+            state.set_vgpr(lane, 1, 0x20202020)
+
+        instr = VMsadU8Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VMsadOperand(Reg32(0, RegType.VGPR)),  # Aliased
+            src1=VMsadOperand(Reg32(1, RegType.VGPR)),
+            src2=VMsadOperand(Literal32(0)),
+        )
+
+        interp.step(instr, state)
+
+        for lane in range(32):
+            if lane < 16:
+                expected = oracle_v_msad_u8(original_v0[lane], 0x20202020, 0)
+                self.assertEqual(state.get_vgpr(lane, 0), expected)
+            else:
+                self.assertEqual(state.get_vgpr(lane, 0), original_v0[lane])
+
+    def test_chained_in_place_accumulation(self) -> None:
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        # Step 0: v0 starts at 0
+        state.set_vgpr(0, 0)
+        state.set_vgpr(1, pack_bytes_u32(10, 20, 30, 40))
+        state.set_vgpr(2, pack_bytes_u32(15, 25, 35, 45))  # diff = 5*4 = 20
+
+        instr = VMsadU8Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VMsadOperand(Reg32(1, RegType.VGPR)),
+            src1=VMsadOperand(Reg32(2, RegType.VGPR)),
+            src2=VMsadOperand(Reg32(0, RegType.VGPR)),  # accum from v0
+        )
+
+        # Run 5 iterations: v0 should accumulate 20 each time
+        for i in range(1, 6):
+            res = interp.step(instr, state)
+            self.assertEqual(res, 20 * i)
+            self.assertEqual(state.get_vgpr(0), 20 * i)
+
+
 if __name__ == "__main__":
     unittest.main()
