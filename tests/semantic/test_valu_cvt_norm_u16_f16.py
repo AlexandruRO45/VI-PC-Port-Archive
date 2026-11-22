@@ -1095,5 +1095,103 @@ class TestValuCvtNormU16F16ConditionCodes(unittest.TestCase):
         self.assertEqual(simd.vcc, canary_vcc)
 
 
+# ---------------------------------------------------------------------------
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ---------------------------------------------------------------------------
+
+class TestValuCvtNormU16F16IEEE754Boundaries(unittest.TestCase):
+    """Exhaustive unit tests for IEEE 754 boundary extremes, subnormals, and NaNs."""
+
+    def test_signed_zeros_and_modifiers(self) -> None:
+        # +0.0 and -0.0 always produce UNORM16_MIN (0)
+        self.assertEqual(ref_cvt_norm_u16_f16(POS_ZERO_F16), UNORM16_MIN)
+        self.assertEqual(ref_cvt_norm_u16_f16(NEG_ZERO_F16), UNORM16_MIN)
+        self.assertEqual(ref_cvt_norm_u16_f16(POS_ZERO_F16, abs_val=True), UNORM16_MIN)
+        self.assertEqual(ref_cvt_norm_u16_f16(NEG_ZERO_F16, abs_val=True), UNORM16_MIN)
+        self.assertEqual(ref_cvt_norm_u16_f16(POS_ZERO_F16, neg=True), UNORM16_MIN)
+        self.assertEqual(ref_cvt_norm_u16_f16(NEG_ZERO_F16, neg=True), UNORM16_MIN)
+
+    def test_subnormal_scale_boundaries(self) -> None:
+        # 0x0001 = 2^-24 -> scales to ~0.0039 -> 0
+        self.assertEqual(ref_cvt_norm_u16_f16(0x0001), 0)
+        # 0x0002 = 2^-23 -> scales to ~0.0078 -> 0
+        self.assertEqual(ref_cvt_norm_u16_f16(0x0002), 0)
+        # 0x0100 = 2^-16 -> scales to ~0.99998 -> 1
+        self.assertEqual(ref_cvt_norm_u16_f16(0x0100), 1)
+        # 0x0200 = 2^-15 -> scales to ~1.99996 -> 2
+        self.assertEqual(ref_cvt_norm_u16_f16(0x0200), 2)
+        # 0x03FF = max subnormal -> scales to ~3.996 -> 4
+        self.assertEqual(ref_cvt_norm_u16_f16(MAX_SUBNORMAL_F16), 4)
+
+    def test_negative_subnormals_saturation(self) -> None:
+        # Negative subnormals without abs modifier clamp to 0
+        neg_subnormals = [0x8001, 0x8002, 0x8100, 0x8200, 0x83FF]
+        for ns in neg_subnormals:
+            self.assertEqual(ref_cvt_norm_u16_f16(ns), UNORM16_MIN)
+
+        # With abs modifier, negative subnormals mirror positive subnormals
+        self.assertEqual(ref_cvt_norm_u16_f16(0x8001, abs_val=True), 0)
+        self.assertEqual(ref_cvt_norm_u16_f16(0x8100, abs_val=True), 1)
+        self.assertEqual(ref_cvt_norm_u16_f16(0x8200, abs_val=True), 2)
+        self.assertEqual(ref_cvt_norm_u16_f16(0x83FF, abs_val=True), 4)
+
+    def test_small_normals_boundary(self) -> None:
+        # Smallest normal f16: 0x0400 = 2^-14 -> scales to ~3.9999 -> 4
+        self.assertEqual(ref_cvt_norm_u16_f16(MIN_NORMAL_F16), 4)
+        # 0x0800 = 2^-13 -> scales to ~7.9998 -> 8
+        self.assertEqual(ref_cvt_norm_u16_f16(0x0800), 8)
+        # 0x1000 = 2^-11 -> scales to ~31.9995 -> 32
+        self.assertEqual(ref_cvt_norm_u16_f16(0x1000), 32)
+
+    def test_unit_boundary_and_saturation(self) -> None:
+        # Exact 1.0 (0x3C00) -> 65535
+        self.assertEqual(ref_cvt_norm_u16_f16(ONE_F16), UNORM16_MAX)
+
+        # 1.0 - epsilon: 0x3BFF (0.99951171875) -> 65503
+        self.assertEqual(ref_cvt_norm_u16_f16(0x3BFF), 65503)
+
+        # 1.0 + epsilon: 0x3C01 (1.0009765625) -> saturates to 65535
+        self.assertEqual(ref_cvt_norm_u16_f16(0x3C01), UNORM16_MAX)
+
+    def test_infinities_and_saturation(self) -> None:
+        # +infinity -> 65535
+        self.assertEqual(ref_cvt_norm_u16_f16(POS_INF_F16), UNORM16_MAX)
+        # -infinity -> 0
+        self.assertEqual(ref_cvt_norm_u16_f16(NEG_INF_F16), UNORM16_MIN)
+
+        # abs(-inf) -> +inf -> 65535
+        self.assertEqual(ref_cvt_norm_u16_f16(NEG_INF_F16, abs_val=True), UNORM16_MAX)
+        # neg(+inf) -> -inf -> 0
+        self.assertEqual(ref_cvt_norm_u16_f16(POS_INF_F16, neg=True), UNORM16_MIN)
+        # neg(-inf) -> +inf -> 65535
+        self.assertEqual(ref_cvt_norm_u16_f16(NEG_INF_F16, neg=True), UNORM16_MAX)
+
+    def test_nan_exhaustive_handling(self) -> None:
+        # All NaN representations must convert to 0 regardless of payload or sign
+        nan_samples = [
+            QNAN_F16,
+            NEG_QNAN_F16,
+            SNAN_F16,
+            NEG_SNAN_F16,
+            0x7C02,  # sNaN
+            0x7C03,  # sNaN
+            0x7E01,  # qNaN with payload
+            0x7EFF,  # qNaN with payload
+            0x7FFF,  # all-ones exponent and mantissa
+            0xFFFF,  # negative all-ones
+        ]
+        for nan_val in nan_samples:
+            self.assertEqual(ref_cvt_norm_u16_f16(nan_val), UNORM16_MIN)
+            self.assertEqual(ref_cvt_norm_u16_f16(nan_val, abs_val=True), UNORM16_MIN)
+            self.assertEqual(ref_cvt_norm_u16_f16(nan_val, neg=True), UNORM16_MIN)
+            self.assertEqual(ref_cvt_norm_u16_f16(nan_val, clamp=True), UNORM16_MIN)
+
+    def test_round_ties_to_even_halfway(self) -> None:
+        # Halfway case: 0.5 * 65535 = 32767.5 -> 32768 (even)
+        res_half = ref_cvt_norm_u16_f16(HALF_F16)
+        self.assertEqual(res_half, 32768)
+        self.assertEqual(res_half % 2, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
