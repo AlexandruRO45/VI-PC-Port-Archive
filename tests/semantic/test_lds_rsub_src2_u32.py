@@ -585,5 +585,58 @@ class TestLdsRsubSrc2ReferenceOracle(unittest.TestCase):
         self.assertEqual(mem.read_dword(0x00), 35)
 
 
+
+
+class TestLdsRsubSrc2RegisterAliasing(unittest.TestCase):
+    """Unit tests for register preservation and non-returning contract."""
+
+    def test_unrelated_vgprs_preserved(self) -> None:
+        interp = ScalarLDSInterpreter(capacity_dwords=1024)
+        for r in range(256):
+            interp.write_reg_u32(RegKind.VGPR, r, 0xCAFE0000 | r)
+        interp.write_reg_u32(RegKind.VGPR, 5, 0x100)
+        interp.lds.write_dword(0x100, 20)
+        interp.lds.write_dword(0x104, 50)
+        inst = Instruction(
+            opcode=Opcode.DS_RSUB_SRC2_U32,
+            vaddr=Register(RegKind.VGPR, 5),
+            offset=DSSrc2Offset(offset0=0, offset1=1),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, 30)
+        for r in range(256):
+            expected = 0x100 if r == 5 else (0xCAFE0000 | r)
+            self.assertEqual(interp.read_reg_u32(RegKind.VGPR, r), expected)
+
+    def test_vaddr_preservation(self) -> None:
+        interp = ScalarLDSInterpreter(capacity_dwords=1024)
+        interp.write_reg_u32(RegKind.VGPR, 10, 0x1234)
+        interp.lds.write_dword(0x1234, 10)
+        interp.lds.write_dword(0x1238, 90)
+        inst = Instruction(
+            opcode=Opcode.DS_RSUB_SRC2_U32,
+            vaddr=Register(RegKind.VGPR, 10),
+            offset=DSSrc2Offset(offset0=0, offset1=1),
+        )
+        interp.step(inst)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 10), 0x1234)
+
+    def test_simd_shared_vaddr_across_divergent_lanes(self) -> None:
+        simd = SIMDLDSWavefrontInterpreter(wave_size=32, capacity_dwords=1024)
+        for lane in range(32):
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 3, 0x200)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 4, 0xDEAD0000 | lane)
+        inst = Instruction(
+            opcode=Opcode.DS_RSUB_SRC2_U32,
+            vaddr=Register(RegKind.VGPR, 3),
+            offset=DSSrc2Offset(offset0=0, offset1=1),
+        )
+        simd.lds.write_dword(0x200, 10)
+        simd.lds.write_dword(0x204, 100)
+        simd.step(inst)
+        for lane in range(32):
+            self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 3), 0x200)
+            self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 4), 0xDEAD0000 | lane)
+
 if __name__ == "__main__":
     unittest.main()
