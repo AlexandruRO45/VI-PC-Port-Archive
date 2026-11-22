@@ -67,10 +67,10 @@ def _parse_spv(asm):
     types = {}
     ptr_elem = {}
     gvars = {}       # %name -> (storage_class, elem_type)
-    fvars = []       # [(%name, elem_type, init_id_or_None)]
+    functions = {}   # %name -> params, fvars, entry
     blocks = {}      # %label -> [(res, op, args), ...]
     cur = None
-    in_main = False
+    function = None
 
     for raw in asm.splitlines():
         s = raw.strip()
@@ -83,14 +83,19 @@ def _parse_spv(asm):
             res, op, args = None, toks[0], toks[1:]
 
         if op == "OpFunction":
-            in_main = (res == "%main")
+            function = {"params": [], "fvars": [], "entry": None}
+            functions[res] = function
+            cur = None
+            continue
+        if op == "OpFunctionParameter":
+            function["params"].append(res)
             continue
         if op == "OpFunctionEnd":
-            in_main = False
+            function = None
             cur = None
             continue
 
-        if not in_main:
+        if function is None:
             if op == "OpTypeInt":
                 types[res] = ("int", int(args[0]), int(args[1]))
             elif op == "OpTypeBool":
@@ -128,12 +133,14 @@ def _parse_spv(asm):
 
         if op == "OpLabel":
             cur = res
+            if function["entry"] is None:
+                function["entry"] = cur
             blocks[cur] = []
             continue
         if op == "OpVariable":
             _, elem = ptr_elem[args[0]]
             init = args[2] if len(args) > 2 else None
-            fvars.append((res, elem, init))
+            function["fvars"].append((res, elem, init))
             continue
         if cur is not None:
             blocks[cur].append((res, op, args))
@@ -162,7 +169,7 @@ def _parse_spv(asm):
         "types": types,
         "ptr_elem": ptr_elem,
         "gvars": gvars,
-        "fvars": fvars,
+        "functions": functions,
         "blocks": blocks,
         "make_zero": make_zero,
     }
@@ -200,6 +207,7 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
     gvars = mod["gvars"]
     blocks = mod["blocks"]
     make_zero = mod["make_zero"]
+    functions = mod["functions"]
     mem = {} if memory is None else memory
     pc_words = list(push_constants or [0] * 32)
     if len(pc_words) < 32:
@@ -222,7 +230,7 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
     # Per-invocation state
     class Inv:
         __slots__ = ("gid", "sg_id", "sg_lane", "lid", "fn_mem", "ssa", "blk", "ip", "prev_blk",
-                     "done", "waiting_barrier", "waiting_sg", "steps")
+                     "done", "waiting_barrier", "waiting_sg", "steps", "calls")
 
         def __init__(self, gid):
             self.gid = gid
@@ -232,22 +240,27 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
             y = (gid // sx) % sy
             z = gid // (sx * sy)
             self.lid = [x, y, z]
-            self.fn_mem = {}
-            for vname, elem, init in mod["fvars"]:
-                if init is None:
-                    self.fn_mem[vname] = make_zero(elem)
-                elif isinstance(consts[init], tuple) and consts[init][0] == "null":
-                    self.fn_mem[vname] = make_zero(consts[init][1])
-                else:
-                    self.fn_mem[vname] = consts[init]
+            self.fn_mem = function_memory(functions["%main"])
             self.ssa = dict(consts)
-            self.blk = "%entry"
+            self.blk = functions["%main"]["entry"]
             self.ip = 0
             self.prev_blk = None
             self.done = False
-            self.waiting_barrier = None   # (blk, ip) when paused at OpControlBarrier
-            self.waiting_sg = None        # (blk, ip, res, op, args) when paused at subgroup op
+            self.waiting_barrier = None   # (blk, ip, callers) when paused at OpControlBarrier
+            self.waiting_sg = None        # (site, ip, res, op, args) when paused at subgroup op
             self.steps = 0
+            self.calls = []
+
+    def function_memory(function):
+        storage = {}
+        for name, elem, init in function["fvars"]:
+            if init is None:
+                storage[name] = make_zero(elem)
+            elif isinstance(consts[init], tuple) and consts[init][0] == "null":
+                storage[name] = make_zero(consts[init][1])
+            else:
+                storage[name] = consts[init]
+        return storage
 
     invs = [Inv(i) for i in range(threads)]
     subgroups = []
@@ -264,8 +277,8 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
     def read_ptr(inv, ptr):
         kind = ptr[0]
         if kind == "fn":
-            obj = inv.fn_mem[ptr[1]]
-            for idx in ptr[2:]:
+            obj = ptr[1][ptr[2]]
+            for idx in ptr[3:]:
                 obj = obj[idx]
             return obj
         if kind == "wg":
@@ -296,11 +309,11 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
     def write_ptr(inv, ptr, v):
         kind = ptr[0]
         if kind == "fn":
-            if len(ptr) == 2:
-                inv.fn_mem[ptr[1]] = v
+            if len(ptr) == 3:
+                ptr[1][ptr[2]] = v
             else:
-                obj = inv.fn_mem[ptr[1]]
-                for idx in ptr[2:-1]:
+                obj = ptr[1][ptr[2]]
+                for idx in ptr[3:-1]:
                     obj = obj[idx]
                 obj[ptr[-1]] = v
             return
@@ -320,7 +333,7 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
 
     def base_ptr(inv, tok):
         if tok in inv.fn_mem:
-            return ("fn", tok)
+            return ("fn", inv.fn_mem, tok)
         if tok in gvars:
             sc, _ = gvars[tok]
             if sc == "Workgroup":
@@ -341,18 +354,36 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
             res, op, args = insns[inv.ip]
 
             if op == "OpControlBarrier":
-                inv.waiting_barrier = (inv.blk, inv.ip)
+                inv.waiting_barrier = (inv.blk, inv.ip, tuple((f[0], f[1]) for f in inv.calls))
                 return
             if op in SUBGROUP_OPS:
-                inv.waiting_sg = (inv.blk, inv.ip, res, op, args)
+                site = (inv.blk, tuple((f[0], f[1]) for f in inv.calls))
+                inv.waiting_sg = (site, inv.ip, res, op, args)
                 return
 
             inv.ip += 1
             if op in ("OpSelectionMerge", "OpLoopMerge"):
                 continue
-            if op == "OpReturn":
-                inv.done = True
-                return
+            if op == "OpFunctionCall":
+                function = functions[args[1]]
+                values = [base_ptr(inv, arg) for arg in args[2:]]
+                if len(values) != len(function["params"]):
+                    raise ValueError(f"Wrong argument count for {args[1]}")
+                inv.calls.append((inv.blk, inv.ip, inv.prev_blk, inv.ssa, inv.fn_mem, res))
+                inv.ssa = dict(consts)
+                inv.ssa.update(zip(function["params"], values))
+                inv.fn_mem = function_memory(function)
+                inv.blk, inv.ip, inv.prev_blk = function["entry"], 0, None
+                continue
+            if op in ("OpReturn", "OpReturnValue"):
+                value = val_of(inv, args[0]) if op == "OpReturnValue" else None
+                if not inv.calls:
+                    inv.done = True
+                    return
+                inv.blk, inv.ip, inv.prev_blk, inv.ssa, inv.fn_mem, result = inv.calls.pop()
+                if op == "OpReturnValue":
+                    inv.ssa[result] = value
+                continue
             if op == "OpBranch":
                 inv.prev_blk = inv.blk
                 inv.blk = args[0]
@@ -716,7 +747,7 @@ def _resolve_labels(items):
     return out
 
 
-def _translate_cs(name, items, threads=64, lds_bytes=0, emulate=False, size_xyz=None):
+def _translate_cs(name, items, threads=64, lds_bytes=0, emulate=False, size_xyz=None, structured=True):
     lines = _resolve_labels(items)
     sx, sy, sz = size_xyz if size_xyz is not None else (threads, 1, 1)
     lds_blocks = (lds_bytes + 511) // 512
@@ -734,7 +765,9 @@ def _translate_cs(name, items, threads=64, lds_bytes=0, emulate=False, size_xyz=
         with open(os.path.join(tmp, "fssm", name + ".fssm"), "wb") as f:
             f.write(bytes(0x138) + struct.pack("<4I", rsrc2, sx, sy, sz))
         old_em = rdna2spirv.WAVE64_EMULATE
+        old_structured = rdna2spirv.STRUCTURED
         rdna2spirv.WAVE64_EMULATE = emulate
+        rdna2spirv.STRUCTURED = structured
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", ResourceWarning)
@@ -743,6 +776,7 @@ def _translate_cs(name, items, threads=64, lds_bytes=0, emulate=False, size_xyz=
                 gc.collect()
         finally:
             rdna2spirv.WAVE64_EMULATE = old_em
+            rdna2spirv.STRUCTURED = old_structured
     return spv, gen
 
 
@@ -1013,17 +1047,22 @@ class DivergentLoopBallotTests(unittest.TestCase):
             return out
 
         configs = [
-            ("native_64", 64, 64, False),
-            ("native_128", 128, 64, False),
-            ("emulate_64_sg32", 64, 32, True),
-            ("emulate_128_sg32", 128, 32, True),
-            ("emulate_40_partial_sg32", 40, 32, True),
+            ("native_64", 64, 64, False, True),
+            ("native_128", 128, 64, False, True),
+            ("emulate_64_sg32", 64, 32, True, True),
+            ("emulate_128_sg32", 128, 32, True, True),
+            ("emulate_40_partial_sg32", 40, 32, True, True),
+            ("emulate_64_rounds", 64, 32, True, False),
+            ("emulate_128_rounds", 128, 32, True, False),
+            ("emulate_40_partial_rounds", 40, 32, True, False),
         ]
-        for label, threads, sg_sz, emulate in configs:
+        for label, threads, sg_sz, emulate, structured in configs:
             with self.subTest(mode=label):
-                spv, gen = _translate_cs("cs_div_loop_" + label, prog, threads=threads, emulate=emulate)
+                spv, gen = _translate_cs("cs_div_loop_" + label, prog, threads=threads, emulate=emulate,
+                                          structured=structured)
                 if emulate:
-                    self.assertEqual(gen.control_flow, "emulated wave64 rounds")
+                    self.assertEqual(gen.control_flow, "emulated wave64 structured" if structured
+                                     else "emulated wave64 rounds")
                 mem = run_compute_workgroup(spv, threads, sg_sz, push_constants=VSHARP)
                 want = expected_for(threads)
                 for t in range(threads):
