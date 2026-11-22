@@ -22,6 +22,7 @@ RDNA2 Vector Arithmetic Logic Unit (VALU) Architecture:
 Standard library only: Python 3.9+ compatible, zero game data, zero external dependencies.
 """
 
+from enum import Enum, auto
 import math
 import struct
 import unittest
@@ -369,6 +370,354 @@ class TestDivFixupF16MathematicalOracle(unittest.TestCase):
 
         reg.as_u16 = F16_ONE
         self.assertEqual(reg.as_f16, 1.0)
+
+
+class Opcode(Enum):
+    V_DIV_FIXUP_F16 = "v_div_fixup_f16"
+
+
+class OperandKind(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    INLINE_CONST = auto()
+    LITERAL_CONST = auto()
+
+
+class TypeKind(Enum):
+    FLOAT16 = "f16"
+    UINT16 = "u16"
+
+
+class OMod(Enum):
+    NONE = 0
+    MUL2 = 1
+    MUL4 = 2
+    DIV2 = 3
+
+    def to_asm(self) -> str:
+        if self == OMod.MUL2:
+            return "mul:2"
+        elif self == OMod.MUL4:
+            return "mul:4"
+        elif self == OMod.DIV2:
+            return "div:2"
+        return ""
+
+
+class ASTOperand:
+    """Symbolic AST operand representing a 16-bit register, constant, or literal with modifiers."""
+
+    def __init__(
+        self,
+        kind: OperandKind,
+        index: int = 0,
+        value: float | int | None = None,
+        *,
+        neg: bool = False,
+        abs_: bool = False,
+        type_kind: TypeKind = TypeKind.FLOAT16,
+    ) -> None:
+        self.kind = kind
+        self.index = index
+        self.value = value
+        self.neg = neg
+        self.abs_ = abs_
+        self.type_kind = type_kind
+
+    @classmethod
+    def vgpr(cls, index: int, *, neg: bool = False, abs_: bool = False) -> ASTOperand:
+        return cls(OperandKind.VGPR, index=index, neg=neg, abs_=abs_)
+
+    @classmethod
+    def sgpr(cls, index: int, *, neg: bool = False, abs_: bool = False) -> ASTOperand:
+        return cls(OperandKind.SGPR, index=index, neg=neg, abs_=abs_)
+
+    @classmethod
+    def inline_const(cls, value: float, *, neg: bool = False, abs_: bool = False) -> ASTOperand:
+        return cls(OperandKind.INLINE_CONST, value=value, neg=neg, abs_=abs_)
+
+    @classmethod
+    def literal_const(cls, value: float, *, neg: bool = False, abs_: bool = False) -> ASTOperand:
+        return cls(OperandKind.LITERAL_CONST, value=value, neg=neg, abs_=abs_)
+
+    def disasm(self) -> str:
+        if self.kind == OperandKind.VGPR:
+            body = f"v{self.index}"
+        elif self.kind == OperandKind.SGPR:
+            body = f"s{self.index}"
+        elif self.kind in (OperandKind.INLINE_CONST, OperandKind.LITERAL_CONST):
+            body = str(self.value)
+        else:
+            raise ValueError(f"Unknown operand kind: {self.kind}")
+
+        if self.abs_:
+            body = f"|{body}|"
+        if self.neg:
+            body = f"-{body}"
+        return body
+
+    def __repr__(self) -> str:
+        return f"ASTOperand({self.disasm()}, type={self.type_kind.value})"
+
+
+class ASTInstruction:
+    """Symbolic AST instruction representation for v_div_fixup_f16."""
+
+    def __init__(
+        self,
+        opcode: Opcode,
+        dst: ASTOperand,
+        src0: ASTOperand,
+        src1: ASTOperand,
+        src2: ASTOperand,
+        *,
+        clamp: bool = False,
+        omod: OMod = OMod.NONE,
+    ) -> None:
+        self.opcode = opcode
+        self.dst = dst
+        self.src0 = src0
+        self.src1 = src1
+        self.src2 = src2
+        self.clamp = clamp
+        self.omod = omod
+
+    def validate(self) -> None:
+        if self.opcode != Opcode.V_DIV_FIXUP_F16:
+            raise ValueError(f"Invalid opcode for v_div_fixup_f16 AST: {self.opcode}")
+        if self.dst.kind != OperandKind.VGPR:
+            raise TypeError("Destination must be a VGPR")
+        if self.dst.type_kind != TypeKind.FLOAT16:
+            raise TypeError(f"Destination type must be FLOAT16, got {self.dst.type_kind}")
+        if not (0 <= self.dst.index <= 255):
+            raise ValueError(f"Destination VGPR index out of range: {self.dst.index}")
+        if self.dst.neg or self.dst.abs_:
+            raise ValueError("Destination operand cannot have neg/abs modifiers")
+
+        for i, src in enumerate((self.src0, self.src1, self.src2)):
+            if src.type_kind != TypeKind.FLOAT16:
+                raise TypeError(f"Source operand {i} type must be FLOAT16, got {src.type_kind}")
+            if src.kind == OperandKind.VGPR and not (0 <= src.index <= 255):
+                raise ValueError(f"Source {i} VGPR index out of range: {src.index}")
+            if src.kind == OperandKind.SGPR and not (0 <= src.index <= 105):
+                raise ValueError(f"Source {i} SGPR index out of range: {src.index}")
+
+    def disasm(self) -> str:
+        parts = [
+            self.opcode.value,
+            f"{self.dst.disasm()},",
+            f"{self.src0.disasm()},",
+            f"{self.src1.disasm()},",
+            self.src2.disasm(),
+        ]
+        if self.omod != OMod.NONE:
+            parts.append(self.omod.to_asm())
+        if self.clamp:
+            parts.append("clamp")
+        return " ".join(parts)
+
+    def __repr__(self) -> str:
+        return f"ASTInstruction({self.disasm()})"
+
+
+class TypedExpr:
+    """Base class for typed symbolic expressions."""
+
+    def __init__(self, type_kind: TypeKind = TypeKind.FLOAT16) -> None:
+        self.type_kind = type_kind
+
+    def evaluate(self, env: dict[str, float]) -> float:
+        raise NotImplementedError
+
+    def simplify(self) -> TypedExpr:
+        return self
+
+
+class VariableExpr(TypedExpr):
+    """Named variable in symbolic expression tree (e.g. representing a register value)."""
+
+    def __init__(self, name: str, type_kind: TypeKind = TypeKind.FLOAT16) -> None:
+        super().__init__(type_kind)
+        self.name = name
+
+    def evaluate(self, env: dict[str, float]) -> float:
+        if self.name not in env:
+            raise KeyError(f"Variable {self.name} not found in evaluation environment")
+        return env[self.name]
+
+    def __repr__(self) -> str:
+        return f"Var({self.name})"
+
+
+class ConstantExpr(TypedExpr):
+    """Constant literal in symbolic expression tree."""
+
+    def __init__(self, value: float, type_kind: TypeKind = TypeKind.FLOAT16) -> None:
+        super().__init__(type_kind)
+        self.value = value
+
+    def evaluate(self, env: dict[str, float]) -> float:
+        return self.value
+
+    def __repr__(self) -> str:
+        return f"Const({self.value})"
+
+
+class UnaryOpExpr(TypedExpr):
+    """Unary modifier applied to a typed expression ('neg' or 'abs')."""
+
+    def __init__(self, op: str, expr: TypedExpr, type_kind: TypeKind = TypeKind.FLOAT16) -> None:
+        super().__init__(type_kind)
+        if op not in ("neg", "abs"):
+            raise ValueError(f"Unknown unary operator: {op}")
+        self.op = op
+        self.expr = expr
+
+    def evaluate(self, env: dict[str, float]) -> float:
+        val = self.expr.evaluate(env)
+        if self.op == "abs":
+            return math.fabs(val)
+        elif self.op == "neg":
+            return -val
+        return val
+
+    def simplify(self) -> TypedExpr:
+        sub = self.expr.simplify()
+        if isinstance(sub, ConstantExpr):
+            if self.op == "abs":
+                return ConstantExpr(math.fabs(sub.value), self.type_kind)
+            elif self.op == "neg":
+                return ConstantExpr(-sub.value, self.type_kind)
+        return UnaryOpExpr(self.op, sub, self.type_kind)
+
+    def __repr__(self) -> str:
+        return f"{self.op}({self.expr})"
+
+
+class DivFixupF16Expr(TypedExpr):
+    """Symbolic DivFixupF16 ternary expression: div_fixup(src0, src1, src2) with modifiers."""
+
+    def __init__(
+        self,
+        src0: TypedExpr,
+        src1: TypedExpr,
+        src2: TypedExpr,
+        *,
+        clamp: bool = False,
+        omod: OMod = OMod.NONE,
+        type_kind: TypeKind = TypeKind.FLOAT16,
+    ) -> None:
+        super().__init__(type_kind)
+        self.src0 = src0
+        self.src1 = src1
+        self.src2 = src2
+        self.clamp = clamp
+        self.omod = omod
+
+    def evaluate(self, env: dict[str, float]) -> float:
+        v0 = self.src0.evaluate(env)
+        v1 = self.src1.evaluate(env)
+        v2 = self.src2.evaluate(env)
+        return ref_div_fixup_f16_float(v0, v1, v2, clamp=self.clamp, omod=self.omod.value)
+
+    def simplify(self) -> TypedExpr:
+        s0 = self.src0.simplify()
+        s1 = self.src1.simplify()
+        s2 = self.src2.simplify()
+        if isinstance(s0, ConstantExpr) and isinstance(s1, ConstantExpr) and isinstance(s2, ConstantExpr):
+            res = ref_div_fixup_f16_float(s0.value, s1.value, s2.value, clamp=self.clamp, omod=self.omod.value)
+            return ConstantExpr(res, self.type_kind)
+        return DivFixupF16Expr(s0, s1, s2, clamp=self.clamp, omod=self.omod, type_kind=self.type_kind)
+
+    def __repr__(self) -> str:
+        return f"DivFixupF16({self.src0}, {self.src1}, {self.src2}, clamp={self.clamp}, omod={self.omod.name})"
+
+
+class TestDivFixupF16SymbolicAST(unittest.TestCase):
+    """Test suite for symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_construction_and_validation(self):
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_FIXUP_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(3),
+        )
+        inst.validate()
+        self.assertEqual(inst.disasm(), "v_div_fixup_f16 v0, v1, v2, v3")
+
+    def test_ast_with_modifiers_and_disasm(self):
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_FIXUP_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1, neg=True, abs_=True),
+            src1=ASTOperand.sgpr(2),
+            src2=ASTOperand.inline_const(1.0),
+            clamp=True,
+            omod=OMod.MUL2,
+        )
+        inst.validate()
+        self.assertEqual(inst.disasm(), "v_div_fixup_f16 v0, -|v1|, s2, 1.0 mul:2 clamp")
+
+    def test_ast_validation_errors(self):
+        # Invalid destination kind (SGPR)
+        bad_dst = ASTInstruction(
+            opcode=Opcode.V_DIV_FIXUP_F16,
+            dst=ASTOperand.sgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(3),
+        )
+        with self.assertRaises(TypeError):
+            bad_dst.validate()
+
+        # Destination has modifiers (illegal in RDNA2)
+        bad_dst_mod = ASTInstruction(
+            opcode=Opcode.V_DIV_FIXUP_F16,
+            dst=ASTOperand.vgpr(0, neg=True),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(3),
+        )
+        with self.assertRaises(ValueError):
+            bad_dst_mod.validate()
+
+        # Destination out of bounds
+        bad_index = ASTInstruction(
+            opcode=Opcode.V_DIV_FIXUP_F16,
+            dst=ASTOperand.vgpr(256),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(3),
+        )
+        with self.assertRaises(ValueError):
+            bad_index.validate()
+
+    def test_typed_expressions_and_evaluation(self):
+        expr = DivFixupF16Expr(
+            VariableExpr("q"),
+            VariableExpr("denom"),
+            VariableExpr("num"),
+        )
+        env = {"q": 2.0, "denom": 3.0, "num": 6.0}
+        self.assertEqual(expr.evaluate(env), 2.0)
+
+    def test_typed_expression_constant_folding(self):
+        c_expr = DivFixupF16Expr(
+            ConstantExpr(2.0),
+            ConstantExpr(3.0),
+            ConstantExpr(6.0),
+        )
+        folded = c_expr.simplify()
+        self.assertIsInstance(folded, ConstantExpr)
+        self.assertEqual(folded.value, 2.0)
+
+        # Unary folding
+        u_expr = UnaryOpExpr("neg", ConstantExpr(1.5))
+        u_folded = u_expr.simplify()
+        self.assertIsInstance(u_folded, ConstantExpr)
+        self.assertEqual(u_folded.value, -1.5)
 
 
 if __name__ == "__main__":
