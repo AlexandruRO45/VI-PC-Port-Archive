@@ -123,7 +123,7 @@ if PIXEL_COMPARE:
 if PIXEL_INT_COMPARE:
     icmp_ops = "|".join(map(re.escape, PIXEL_INT_COMPARE))
     SUPPORTED_INSTRUCTIONS_REGEX.append(
-        rf"v_cmp_(?:{icmp_ops})_(?:i32|u32)(?:_e32|_e64)?\s+{PIXEL_LANE_MASK},\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}"
+        rf"v_cmp_(?:{icmp_ops})_(?:i32|u32|i16|u16)(?:_e32|_e64)?\s+{PIXEL_LANE_MASK},\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}"
     )
 if PIXEL_VOP3P_F16:
     SUPPORTED_INSTRUCTIONS_REGEX.append(
@@ -232,7 +232,7 @@ def is_opcode_recognized(opcode: str) -> bool:
     base = re.sub(r"_(?:e32|e64|sdwa|dpp.*)$", "", clean)
     if base in KNOWN_RDNA2_BASE_OPCODES or clean in KNOWN_RDNA2_BASE_OPCODES:
         return True
-    if base.startswith("v_cmp_") or clean.startswith("v_cmp_"):
+    if base.startswith(("v_cmp_", "v_cmpx_")) or clean.startswith(("v_cmp_", "v_cmpx_")):
         return True
     if base.startswith("image_") or clean.startswith("image_"):
         return True
@@ -247,7 +247,7 @@ def classify_isa_category(opcode: str) -> str:
     if op.startswith("v_interp"):
         return "VINTRP (Parameter Interpolation)"
     if op.startswith("v_"):
-        if op.startswith("v_cmp"):
+        if op.startswith(("v_cmp_", "v_cmpx_")):
             return "VOPC (Vector Compare)"
         if op.startswith("v_pk_") or op.startswith("v_dot") or op.startswith("v_fma_mix"):
             return "VOP3P (Vector Packed / Mixed-Precision)"

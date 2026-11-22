@@ -199,6 +199,12 @@ class TestRdna2Disasm(unittest.TestCase):
             ("220790f02040210310080000", "image_sample_l", "image_sample_l v[64:66], [v32, v16, v8], s[4:11], s[100:103] dmask:0x7 dim:SQ_RSRC_IMG_1D_ARRAY"),
             ("220794f02040210310080000", "image_sample_b", "image_sample_b v[64:66], [v32, v16, v8], s[4:11], s[100:103] dmask:0x7 dim:SQ_RSRC_IMG_1D_ARRAY"),
             ("22079cf02040210310000000", "image_sample_lz", "image_sample_lz v[64:66], [v32, v16], s[4:11], s[100:103] dmask:0x7 dim:SQ_RSRC_IMG_1D_ARRAY"),
+            # GFX10 VOPC vector comparisons
+            ("0105027c", "v_cmp_lt_f32_e32", "v_cmp_lt_f32_e32 vcc_lo, v1, v2"),
+            ("0104027c", "v_cmp_lt_f32_e32", "v_cmp_lt_f32_e32 vcc_lo, s1, v2"),
+            ("2510027c", "v_cmp_lt_f32_e32", "v_cmp_lt_f32_e32 vcc_lo, s37, v8"),
+            ("ff04027c0000803f", "v_cmp_lt_f32_e32", "v_cmp_lt_f32_e32 vcc_lo, 0x3f800000, v2"),
+            ("0105227c", "v_cmpx_lt_f32_e32", "v_cmpx_lt_f32_e32 v1, v2"),
             # GFX10 VOP3P packed float16, integer16, dot-products, and mixed-precision FMA
             ("04400acc03030118", "v_pk_add_u16", "v_pk_add_u16 v4, v3, 1"),
             ("04000acc03030118", "v_pk_add_u16", "v_pk_add_u16 v4, v3, 1"),
@@ -236,6 +242,7 @@ class TestRdna2Disasm(unittest.TestCase):
             "ff02087e 89674523"  # v_mov_b32_e32 v4, 0x23456789
             "ff040606 0000803f"  # v_add_f32_e32 v3, 0x3f800000, v2
             "01050a5a 41312111"  # v_fmaak_f32 v5, v1, v2, 0x11213141
+            "ff04027c 0000803f"  # v_cmp_lt_f32_e32 vcc_lo, 0x3f800000, v2
             "000081bf"           # s_endpgm
         )
         insns = disasm_rdna2(stream)
@@ -247,6 +254,7 @@ class TestRdna2Disasm(unittest.TestCase):
                 ("v_mov_b32_e32", 8, "v_mov_b32_e32 v4, 0x23456789"),
                 ("v_add_f32_e32", 8, "v_add_f32_e32 v3, 0x3f800000, v2"),
                 ("v_fmaak_f32", 8, "v_fmaak_f32 v5, v1, v2, 0x11213141"),
+                ("v_cmp_lt_f32_e32", 8, "v_cmp_lt_f32_e32 vcc_lo, 0x3f800000, v2"),
                 ("s_endpgm", 4, "s_endpgm"),
             ],
         )
@@ -256,6 +264,7 @@ class TestRdna2Disasm(unittest.TestCase):
             ("02ff0380", "sop2_truncated"),
             ("ff02087e", "vop1_truncated"),
             ("01050a5a", "vop2_truncated"),
+            ("ff04027c", "vopc_truncated"),
             ("220790f020402103", "mimg_truncated"),
         ):
             insns = disasm_rdna2(bytes.fromhex(bad_hex))
@@ -292,6 +301,41 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertEqual(len(insns), 1)
         self.assertEqual(insns[0]["opcode"], "sopc_truncated")
         self.assertIn("<truncated>", insns[0]["assembly"])
+
+    def test_vopc_opcode_table_synthetic_forms(self):
+        from disasm_rdna2 import VOPC_OPS
+        for op, (expected_name, _) in VOPC_OPS.items():
+            w0 = 0x7c000000 | (op << 17) | (2 << 9) | 1  # vsrc1=v2, src0=s1
+            raw = struct.pack("<I", w0)
+            insns = disasm_rdna2(raw)
+            self.assertEqual(len(insns), 1, f"Failed decoding VOPC op 0x{op:02x}")
+            self.assertEqual(insns[0]["opcode"], expected_name)
+            self.assertEqual(insns[0]["length"], 4)
+            if expected_name.startswith("v_cmpx_"):
+                self.assertEqual(insns[0]["assembly"], f"{expected_name} s1, v2")
+            else:
+                self.assertEqual(insns[0]["assembly"], f"{expected_name} vcc_lo, s1, v2")
+
+        # Truncated VOPC literal
+        w0_lit = 0x7c000000 | (0x01 << 17) | (2 << 9) | 255
+        insns = disasm_rdna2(struct.pack("<I", w0_lit))
+        self.assertEqual(len(insns), 1)
+        self.assertEqual(insns[0]["opcode"], "vopc_truncated")
+        self.assertIn("<truncated>", insns[0]["assembly"])
+
+        # Literal source in VOPC
+        raw_lit = struct.pack("<2I", w0_lit, 0x3f800000)
+        insns = disasm_rdna2(raw_lit)
+        self.assertEqual(len(insns), 1)
+        self.assertEqual(insns[0]["opcode"], "v_cmp_lt_f32_e32")
+        self.assertEqual(insns[0]["length"], 8)
+        self.assertEqual(insns[0]["assembly"], "v_cmp_lt_f32_e32 vcc_lo, 0x3f800000, v2")
+
+        # Scanner recognizes VOPC and assigns correct category
+        self.assertTrue(is_opcode_recognized("v_cmp_lt_f32_e32"))
+        self.assertTrue(is_opcode_recognized("v_cmpx_gt_i32_e32"))
+        self.assertEqual(classify_isa_category("v_cmp_lt_f32_e32"), "VOPC (Vector Compare)")
+        self.assertEqual(classify_isa_category("v_cmpx_gt_i32_e32"), "VOPC (Vector Compare)")
 
     def test_vop2_integer_opcode_table_synthetic_forms(self):
         from disasm_rdna2 import VOP2_OPS
@@ -514,6 +558,9 @@ class TestRdna2Disasm(unittest.TestCase):
             "s_bitcmp0_b32 s0, s1",
             "s_bitcmp0_b64 s[4:5], s6",
             "v_pk_add_u16 v4, v3, 1",
+            "v_cmp_lt_f32_e32 vcc_lo, v1, v2",
+            "v_cmp_eq_u32_e32 vcc_lo, s1, v2",
+            "v_cmpx_gt_i32_e32 v1, v2",
             "s_endpgm",
         ]
 
