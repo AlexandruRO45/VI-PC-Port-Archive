@@ -3,5 +3,9 @@ EXPORTS
     rep_movsw_forward
     rep_movsd_forward
     rep_movsq_forward
+    rep_stosb_forward
+    rep_stosw_forward
+    rep_stosd_forward
+    rep_stosq_forward
     loop_copy
     call_copy

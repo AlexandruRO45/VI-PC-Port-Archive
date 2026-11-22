@@ -17,7 +17,7 @@ MASK = (1 << 64) - 1
 SENTINELS = (0x0123456789abcdef, 0xfedcba9876543210, 0)
 GUARDS = (0xa55aa55adeadbeef, 0x5aa55aa5feedface)
 WIDTHS = dict(b=1, w=2, d=4, q=8)
-NAMES = ('rep_movsb_forward', 'rep_movsw_forward', 'rep_movsd_forward', 'rep_movsq_forward', 'loop_copy', 'call_copy')
+NAMES = ('rep_movsb_forward', 'rep_movsw_forward', 'rep_movsd_forward', 'rep_movsq_forward', 'rep_stosb_forward', 'rep_stosw_forward', 'rep_stosd_forward', 'rep_stosq_forward', 'loop_copy', 'call_copy')
 
 
 def spec(name, backwards):

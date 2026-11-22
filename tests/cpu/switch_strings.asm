@@ -41,6 +41,10 @@ STRING_CASE rep_movsb_forward, movsb, 0, 1
 STRING_CASE rep_movsw_forward, movsw, 0, 1
 STRING_CASE rep_movsd_forward, movsd, 0, 1
 STRING_CASE rep_movsq_forward, movsq, 0, 1
+STRING_CASE rep_stosb_forward, stosb, 0, 1
+STRING_CASE rep_stosw_forward, stosw, 0, 1
+STRING_CASE rep_stosd_forward, stosd, 0, 1
+STRING_CASE rep_stosq_forward, stosq, 0, 1
 
 ; Two paths join with different DF values. The selected direction is live at REP.
 

@@ -1201,9 +1201,9 @@ Sixteen mutations of the translator each fail the test:
 
 Only the alias checks catch the last two.
 
-## Repeated memory copies in the control-flow CPU lifter
+## Repeated memory copies and fills in the control-flow CPU lifter
 
-`tools/cpu_switch_aot.py` now lowers rep movsb/movsw/movsd/movsq copy 1-, 2-, 4- and 8-byte elements. These instructions
+`tools/cpu_switch_aot.py` now lowers rep movs and rep stos copy and fill 1-, 2-, 4- and 8-byte elements. These instructions
 can occur inside branches, loops and translated callees; they use the existing
 register-definedness and nonvolatile-save proofs. A zero REP count touches no memory
 and leaves the pointers unchanged. The loop updates RSI/RDI and RCX at their architectural widths.
@@ -1212,7 +1212,7 @@ Each element is read before it is written. Forward overlapping copies deliberate
 observe bytes written by preceding iterations, unlike `memmove`. Volatile guest
 reads and writes preserve access faults and iteration order under `/O2`. Multi-byte accesses allow unaligned addresses and keep the original element width.
 Arithmetic flags survive a transfer and remain available to the existing bounded
-flag-consumer proof. DF is assumed clear at entry under the Windows x64 ABI. CLD is accepted; STD is rejected. Non-repeated string instructions remain rejected. STOS remains rejected.
+flag-consumer proof. DF is assumed clear at entry under the Windows x64 ABI. CLD is accepted; STD is rejected. Non-repeated string instructions remain rejected.
 Address-size overrides, segment prefixes, REPNE, LODS, CMPS and SCAS remain rejected
 in this control-flow profile. The shared straight-line translator has its separate
 string-instruction coverage. Guest exception resumption, native REP register values
@@ -1231,7 +1231,7 @@ ctest --test-dir out/native --no-tests=error -R '^cpu_aot_switch_strings$' -V
 ```
 
 Windows 11 build 26300.9974, MSVC/ML64 19.44.35230 and Python 3.12.8:
-6 exports, 2,280 native/AOT/reference comparisons and 39 access-violation
+10 exports, 3,804 native/AOT/reference comparisons and 63 access-violation
 comparisons passed, including the `/O2` translation. Compiled incorrect
 implementations must fail the comparison: a bulk `memmove` on destructive overlap
 and a truncated repeat count.
