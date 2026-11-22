@@ -288,6 +288,8 @@ int main() {
         expect_well_formed(t, "other targets");
         expect(t.begins == 3 && t.draws == 4, "other targets: a scope for A, one for B, one with stencil");
         expect(t.pipelines == 3, "other targets: the pipeline is bound again in each new scope");
+        expect(t.vertex_binds == 3 && t.index_binds == 3,
+               "other targets: vertex and index buffers are bound again in each new scope");
     }
 
     // 4. Any other command ends the scope before it: a UAV barrier between draws.
