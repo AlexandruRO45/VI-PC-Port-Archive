@@ -1059,5 +1059,142 @@ class TestStatusFlagsAndConditionCodes(unittest.TestCase):
         self.assertEqual(vcc_after, vcc_sentinel)
 
 
+# ==============================================================================
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestSignedBoundaryExtremesAndIEEE754BitPatterns(unittest.TestCase):
+    """Exhaustive unit tests for boundary extremes, integer ranges, and IEEE 754 bit-patterns."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(DEFAULT_LDS_SIZE_BYTES)
+        self.state = ScalarThreadState(lds=self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_signed_zero_bit_patterns_as_integers(self) -> None:
+        # In float32: +0.0 is 0x00000000, -0.0 is 0x80000000
+        # In signed 32-bit int: 0x80000000 is -2147483648, 0x00000000 is 0
+        # min(0, -2147483648) = -2147483648 (0x80000000)
+        self.assertEqual(oracle_min_i32(0x00000000, 0x80000000), 0x80000000)
+        self.assertEqual(oracle_min_i32(0x80000000, 0x00000000), 0x80000000)
+
+        self.lds.write_dword(0, 0)
+        self.state.set_vgpr(VGPR(1), 0)
+        self.state.set_vgpr(VGPR(2), 0x80000000)
+        inst = DSMinRtnI32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_I32,
+            vdst=VGPR(0),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, 0)
+        self.assertEqual(self.lds.read_dword(0), 0x80000000)
+
+    def test_signed_infinities_as_integers(self) -> None:
+        # +inf (0x7F800000 = +2139095040), -inf (0xFF800000 = -8388608)
+        self.assertEqual(oracle_min_i32(0x7F800000, 0xFF800000), 0xFF800000)
+        self.assertEqual(oracle_min_i32(0xFF800000, 0x7F800000), 0xFF800000)
+
+        self.lds.write_dword(1, 0x7F800000)
+        self.state.set_vgpr(VGPR(1), 4)
+        self.state.set_vgpr(VGPR(2), 0xFF800000)
+        inst = DSMinRtnI32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_I32,
+            vdst=VGPR(0),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, 0x7F800000)
+        self.assertEqual(self.lds.read_dword(1), 0xFF800000)
+
+    def test_nan_bit_patterns_unaltered_and_no_traps(self) -> None:
+        # qNaN (0x7FC00000 = +2143289344) vs -1 (0xFFFFFFFF = -1) -> min is -1
+        self.assertEqual(oracle_min_i32(0x7FC00000, 0xFFFFFFFF), 0xFFFFFFFF)
+
+        self.lds.write_dword(2, 0x7FC00000)
+        self.state.set_vgpr(VGPR(1), 8)
+        self.state.set_vgpr(VGPR(2), 0xFFFFFFFF)
+        inst = DSMinRtnI32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_I32,
+            vdst=VGPR(0),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, 0x7FC00000)
+        self.assertEqual(self.lds.read_dword(2), 0xFFFFFFFF)
+
+        # sNaN (0x7F800001 = +2139095041) vs +100 -> min is +100
+        self.assertEqual(oracle_min_i32(0x7F800001, 100), 100)
+
+        # Negative qNaN (0xFFC00000 = -4194304) vs 0 -> min is -4194304
+        self.assertEqual(oracle_min_i32(0xFFC00000, 0), 0xFFC00000)
+
+    def test_subnormal_bit_patterns_as_integers(self) -> None:
+        # Smallest positive subnormal (0x00000001 = +1) vs -5 -> min is -5
+        self.assertEqual(oracle_min_i32(1, u32(-5)), u32(-5))
+
+        # Negative subnormal (0x80000001 = -2147483647) vs INT32_MIN (0x80000000 = -2147483648)
+        self.assertEqual(oracle_min_i32(0x80000001, 0x80000000), 0x80000000)
+
+    def test_signed_boundary_extremes_permutations(self) -> None:
+        extremes = [
+            0x80000000,  # INT32_MIN: -2147483648
+            0x80000001,  # INT32_MIN + 1: -2147483647
+            0xFFFFFFFF,  # -1
+            0x00000000,  # 0
+            0x00000001,  # +1
+            0x7FFFFFFE,  # INT32_MAX - 1: +2147483646
+            0x7FFFFFFF,  # INT32_MAX: +2147483647
+        ]
+        for a in extremes:
+            for b in extremes:
+                sa = s32(a)
+                sb = s32(b)
+                exp = u32(min(sa, sb))
+                self.assertEqual(oracle_min_i32(a, b), exp)
+
+                # Test in-place scalar execution
+                self.lds.write_dword(0, a)
+                self.state.set_vgpr(VGPR(1), 0)
+                self.state.set_vgpr(VGPR(2), b)
+                inst = DSMinRtnI32Instruction(
+                    opcode=DSOpcode.DS_MIN_RTN_I32,
+                    vdst=VGPR(0),
+                    vaddr=VGPR(1),
+                    vdata=VGPR(2),
+                )
+                ret = self.interp.execute(self.state, inst)
+                self.assertEqual(ret, a)
+                self.assertEqual(self.lds.read_dword(0), exp)
+
+    def test_signed_vs_unsigned_ordering_distinction(self) -> None:
+        # In signed comparison: -1 (0xFFFFFFFF) < 0 -> min is 0xFFFFFFFF
+        # In unsigned comparison: 0 < 0xFFFFFFFF -> min would be 0
+        self.assertEqual(oracle_min_i32(0xFFFFFFFF, 0), 0xFFFFFFFF)
+        self.assertEqual(oracle_min_i32(0, 0xFFFFFFFF), 0xFFFFFFFF)
+
+        # In signed: -2147483648 (0x80000000) < 1 -> min is 0x80000000
+        # In unsigned: 1 < 2147483648 -> min would be 1
+        self.assertEqual(oracle_min_i32(0x80000000, 1), 0x80000000)
+
+    def test_single_bit_walks(self) -> None:
+        # Bit 31 is the sign bit; setting it makes the number negative
+        for k in range(31):
+            pos_val = 1 << k
+            # Positive value compared with INT32_MIN (0x80000000)
+            self.assertEqual(oracle_min_i32(pos_val, 0x80000000), 0x80000000)
+            # Positive value compared with -1 (0xFFFFFFFF)
+            self.assertEqual(oracle_min_i32(pos_val, 0xFFFFFFFF), 0xFFFFFFFF)
+
+    def test_alternating_bit_patterns(self) -> None:
+        pat_a = 0x55555555  # +1431655765
+        pat_b = 0xAAAAAAAA  # -1431655766 (sign bit set, negative)
+        self.assertEqual(oracle_min_i32(pat_a, pat_b), pat_b)
+        self.assertEqual(oracle_min_i32(pat_b, pat_a), pat_b)
+
+
 if __name__ == "__main__":
     unittest.main()
