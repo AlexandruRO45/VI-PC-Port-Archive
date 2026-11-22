@@ -85,6 +85,8 @@ EXPECTED_SAD = [0x4000010D, 0x00FDABCD, 0x40000004, 0x2DCBA989]
 EXPECTED_MSAD_LERP = [0x4000000E, 0x3F80004D, 0xFF7F0380, 0x00FE3BE9]
 EXPECTED_QSAD = [0x01D500FB, 0x01FE0119, 0x01D0000B, 0x00FF0099]
 EXPECTED_MQSAD_U32 = [0x4000000B, 0x010001CE, 0xC0000099, 0x123457D7]
+# ps_sdwa_f16_const, measured on gfx1036 (the .asm header): f16 inline constant, then src_sel
+EXPECTED_SDWA_F16_CONST = [0xAAAA3800, 0xAAAA1C00, 0xAAAA3E00, 0xAAAA73F0]
 
 
 def _f32_bits(x):
@@ -318,8 +320,6 @@ def reference_valu16_subrev():
     a, b, d = _unhalf(0x3E00), _unhalf(0x3800), _unhalf(0x3C00)        # low halves: v0 1.5, v1 0.5, v5 1.0
     return [0xAAAA0000 | _half(b - a), 0xAAAA0000 | _half(-b - a), 0xAAAA0000 | _half(min(1.0, b + a)),
             0x42000000 | _half(a - d)]
-
-
 def _lanes(x, width):
     """The unsigned lanes of a 32-bit word, lowest first."""
     return [(x >> o) & ((1 << width) - 1) for o in range(0, 32, width)]
@@ -370,6 +370,21 @@ def reference_mqsad_u32():
     s2 = (0xFFFFFF00, 0x00FFFFFF, 0xBFFFFFFF, 0x12345678)
     d = [(s2[k] + _sad(_window(QSAD_S0, k), QSAD_S1, 8, masked=True)) & 0xFFFFFFFF for k in range(4)]
     return [d[0] ^ 0x40000000] + d[1:]
+
+
+
+
+def reference_sdwa_f16_const():
+    # An f16 float inline constant is its f16 bits over a zero high half; an integer op reads 1.0 as its f32 bits.
+    # src_sel then picks a zero-extended field of those 32 bits, like a register's.
+    def sel(word, off, width):
+        return (word >> off) & ((1 << width) - 1)
+    v1, s8 = 0x64003800, 0x3C000000
+    x = _unhalf(sel(_half(1.0), 16, 16)) + _unhalf(sel(v1, 0, 16))          # +0.0 + 0.5
+    y = _unhalf(sel(_half(2.0), 8, 8)) * _unhalf(sel(v1, 16, 16))           # 2^-18 * 1024.0
+    z = _unhalf(sel(s8, 16, 16)) + _unhalf(sel(v1, 0, 16))                  # 1.0 + 0.5
+    w = float(sel(struct.unpack("<I", struct.pack("<f", 1.0))[0], 16, 16))  # u16 0x3f80 -> f16
+    return [0xAAAA0000 | _half(v) for v in (x, y, z, w)]
 
 
 def _isg1_dxbc(elements):
@@ -426,6 +441,7 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_msad_lerp(), EXPECTED_MSAD_LERP)
         self.assertEqual(reference_qsad(), EXPECTED_QSAD)
         self.assertEqual(reference_mqsad_u32(), EXPECTED_MQSAD_U32)
+        self.assertEqual(reference_sdwa_f16_const(), EXPECTED_SDWA_F16_CONST)
 
 
 class TranslatorValueSemantics(unittest.TestCase):
@@ -492,6 +508,11 @@ class TranslatorValueSemantics(unittest.TestCase):
         # when the destination is a source.
         self.check("ps_valu16_subrev", EXPECTED_VALU16_SUBREV)
 
+    def test_sdwa_src_sel_narrows_an_f16_inline_constant(self):
+        # 1.0 in v_add_f16_sdwa is 0x00003c00, so src0_sel:WORD_1 reads +0.0 and BYTE_1 of 2.0 is the denormal
+        # 0x0040; an SGPR source and v_cvt_f16_u16 reading the f32 bits of 1.0 are narrowed the same way.
+        self.check("ps_sdwa_f16_const", EXPECTED_SDWA_F16_CONST)
+
     def test_s_buffer_load_dwordx2_into_vcc(self):
         # The V# in s[0:3] points at 0x1000; the two dwords must come back in vcc_lo and vcc_hi, not be lost.
         push = [0x1000, 0, 16, 0] + [0] * 28
@@ -537,6 +558,23 @@ class TranslatorValueSemantics(unittest.TestCase):
             with self.subTest(address=address):
                 self.assertEqual(f"{memory.get(address, 0):#010x}", f"{want:#010x}")
 
+    def test_narrow_integer_typed_buffers(self):
+        # cs_fmt_int_narrow.asm in the interpreter against the words check.py expects from the GPU, which are the
+        # same program's output on gfx1036 run natively: a 136-word heap filled with 0xee as vk_compute_test's.
+        sys.path.insert(0, os.path.join(support.ROOT, "runtime", "test", "shaders"))
+        try:
+            import check
+        finally:
+            sys.path.pop(0)
+        spv = support.translate_fixture("cs_fmt_int_narrow", fssm=CS_BOUNDS_FSSM)
+        memory = {4 * i: 0xEEEEEEEE for i in range(len(check.FMT_INT_NARROW_WORDS))}
+        support.run_fragment(
+            spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+            push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28, memory=memory)
+        for i, word in enumerate(check.FMT_INT_NARROW_WORDS):
+            with self.subTest(word=i):
+                self.assertEqual(memory[4 * i], word)
+
     def test_signed_typed_buffers(self):
         spv = support.translate_fixture("cs_fmt_sint32", fssm=CS_BOUNDS_FSSM)
         memory = {}
@@ -565,7 +603,6 @@ class TranslatorValueSemantics(unittest.TestCase):
         # SHADER-46: an inline constant or literal is a 32-bit value. Read as a lane mask (all ones or zero from
         # bit 0), s_ff0 of 61 and of 0x0000ffff gave -1; the s_ff1 words guard the path it already got right.
         self.check("ps_sff_imm", EXPECTED_SFF_IMM)
-
     def test_sad_u8_hi_u16_u32_unsigned_and_wrapping(self):
         # Every byte or half of S0/S1 differs, signed lanes would give other sums, and every S2 carries out of bit 31.
         self.check("ps_sad", EXPECTED_SAD)
@@ -583,6 +620,7 @@ class TranslatorValueSemantics(unittest.TestCase):
     def test_mqsad_u32_has_four_32_bit_accumulators(self):
         # The 128-bit S2 and D: each window's masked SAD lands in its own dword, wrapping at 32 bits, not 16.
         self.check("ps_mqsad_u32", EXPECTED_MQSAD_U32)
+
 
 
 class ReadLog(dict):
