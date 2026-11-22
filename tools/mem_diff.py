@@ -21,7 +21,8 @@ so they are left to a GPU-confirmed follow-up instead of being guessed here.
 
 Typed buffer loads (buffer_load_format_*, tbuffer_load_format_*) are decoded from the GFX10 format names in
 tools/gfx10_formats.json, not from the translator's table. Missing channels repeat (*c* mod *n*), UNORM/SNORM
-use correctly rounded division, and DST_SEL 1 is integer 1 for UINT/SINT (SHADER-86, RX 6700).
+use correctly rounded division, and DST_SEL 1 is integer 1 for UINT/SINT (SHADER-86, RX 6700). A tbuffer V#
+carries the instruction's format too: one with FORMAT=INVALID is an unbound descriptor and reads zeros.
 
 Usage:
     python -I tools/mem_diff.py [--programs N] [--seed S] [--max-ops N]
@@ -547,7 +548,11 @@ def gen_buffer_format(rng, prog):
     if tbuffer:
         fname = rng.choice(TBUFFER_FORMATS)
         widths, kind = parse_format("GFX10_FORMAT_" + fname)
-        word3 = XYZW                                   # tbuffer: format in the instruction, identity swizzle
+        # tbuffer: the format comes from the instruction, with an identity swizzle. The V# still needs a valid
+        # FORMAT: FORMAT=INVALID (0) marks an unbound descriptor, which reads zeros even for MTBUF (measured on
+        # gfx1036, 2dfd8d47). Give it the instruction's format, as a descriptor bound to this data would have.
+        code = next(c for c, n in FORMAT_NAMES.items() if n == "GFX10_FORMAT_" + fname)
+        word3 = code << 12 | XYZW
     else:
         code = rng.choice(_typed_codes())
         widths, kind = parse_format(FORMAT_NAMES[code])
