@@ -740,5 +740,93 @@ class TestBufferAtomicAndX2SIMD(unittest.TestCase):
                 self.assertEqual(simd.read_lane_reg_u64(lane, 0), 0x12345678)
 
 
+# ---------------------------------------------------------------------------
+# Register Aliasing and In-Place Operand Preservation
+# ---------------------------------------------------------------------------
+
+class TestBufferAtomicAndX2RegisterAliasing(unittest.TestCase):
+    """Unit tests for overlapping register allocations and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarBufferInterpreter(mem_size=4096)
+        self.desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=4096)
+        self.interp.set_buffer_descriptor(0, self.desc)
+
+    def test_aliasing_vdata_overlaps_vaddr_low(self) -> None:
+        self.interp.mem.write_u64(64, 0xAAAAAAAAAAAAAAAA)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 64)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x5555)
+
+        and_operand = 64 | (0x5555 << 32)
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_AND_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 0),
+            srsrc=Register(RegKind.SGPR, 0, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0xAAAAAAAAAAAAAAAA)
+        self.assertEqual(self.interp.read_reg_u64(RegKind.VGPR, 0), 0xAAAAAAAAAAAAAAAA)
+        self.assertEqual(self.interp.mem.read_u64(64), 0xAAAAAAAAAAAAAAAA & and_operand)
+
+    def test_aliasing_vdata_overlaps_vaddr_high(self) -> None:
+        self.interp.mem.write_u64(128, 0xFFFFFFFFFFFFFFFF)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 0x0F0F0F0F)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 128)
+
+        and_operand = 0x0F0F0F0F | (128 << 32)
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_AND_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 0, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0xFFFFFFFFFFFFFFFF)
+        self.assertEqual(self.interp.read_reg_u64(RegKind.VGPR, 0), 0xFFFFFFFFFFFFFFFF)
+        self.assertEqual(self.interp.mem.read_u64(128), and_operand)
+
+    def test_preserve_adjacent_registers(self) -> None:
+        self.interp.mem.write_u64(32, 0x7777777777777777)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x11111111)
+        self.interp.write_reg_u64(RegKind.VGPR, 2, 0x3333333333333333)
+        self.interp.write_reg_u32(RegKind.VGPR, 4, 0x44444444)
+        self.interp.write_reg_u32(RegKind.VGPR, 5, 32)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_AND_X2,
+            vdata=Register(RegKind.VGPR, 2, count=2),
+            vaddr=Register(RegKind.VGPR, 5),
+            srsrc=Register(RegKind.SGPR, 0, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        self.interp.step(inst)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 1), 0x11111111)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 4), 0x44444444)
+
+    def test_no_glc_preserves_input_vdata(self) -> None:
+        self.interp.mem.write_u64(16, 0xFF)
+        self.interp.write_reg_u64(RegKind.VGPR, 0, 0xCAFEBABEDEADBEEF)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 16)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_AND_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2),
+            srsrc=Register(RegKind.SGPR, 0, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=False),
+        )
+        self.interp.step(inst)
+        self.assertEqual(self.interp.read_reg_u64(RegKind.VGPR, 0), 0xCAFEBABEDEADBEEF)
+
+
 if __name__ == "__main__":
     unittest.main()
