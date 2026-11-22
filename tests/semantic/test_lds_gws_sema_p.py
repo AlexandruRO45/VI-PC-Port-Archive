@@ -283,6 +283,88 @@ class SemaphoreAcquireExpr:
         return (c - 1) & MASK32 if c > 0 else 0
 
 
+# ============================================================================
+# Commit 3: Deterministic scalar instruction interpreter
+# ============================================================================
+
+
+class ThreadExecutionStatus(enum.Enum):
+    """Thread / Wavefront execution lifecycle status."""
+    RUNNING = "running"
+    BLOCKED = "blocked"
+    COMPLETED = "completed"
+
+
+@dataclass
+class ScalarThreadState:
+    """Models the execution state of an individual scalar thread in RDNA2."""
+    wave_id: int = 0
+    m0: int = 0
+    sgprs: Dict[int, int] = field(default_factory=dict)
+    vgprs: Dict[int, int] = field(default_factory=dict)
+    exec_mask: int = 1
+    status: ThreadExecutionStatus = ThreadExecutionStatus.RUNNING
+    scc: int = 0
+    gws: GWSSubsystem = field(default_factory=GWSSubsystem)
+
+    def get_sgpr(self, idx: int) -> int:
+        if not (0 <= idx <= 255):
+            raise ValueError(f"SGPR index out of bounds: {idx}")
+        return self.sgprs.get(idx, 0)
+
+    def set_sgpr(self, idx: int, val: int) -> None:
+        if not (0 <= idx <= 255):
+            raise ValueError(f"SGPR index out of bounds: {idx}")
+        self.sgprs[idx] = val & MASK32
+
+    def get_vgpr(self, idx: int) -> int:
+        if not (0 <= idx <= 255):
+            raise ValueError(f"VGPR index out of bounds: {idx}")
+        return self.vgprs.get(idx, 0)
+
+    def set_vgpr(self, idx: int, val: int) -> None:
+        if not (0 <= idx <= 255):
+            raise ValueError(f"VGPR index out of bounds: {idx}")
+        self.vgprs[idx] = val & MASK32
+
+    def set_m0(self, val: int) -> None:
+        self.m0 = val & MASK32
+
+
+class ScalarGWSInterpreter:
+    """Deterministic scalar instruction interpreter for GWS instructions."""
+
+    def execute(self, state: ScalarThreadState, inst: Instruction) -> Tuple[bool, int, bool]:
+        """Execute a single GWS instruction deterministically on scalar state.
+
+        Returns:
+            Tuple[bool, int, bool]: (acquired, new_counter_val, blocked)
+        """
+        if state.status == ThreadExecutionStatus.BLOCKED:
+            raise RuntimeError(f"Cannot execute instruction on suspended wavefront {state.wave_id}")
+
+        if inst.opcode != Opcode.DS_GWS_SEMA_P:
+            raise ValueError(f"Unsupported opcode in ScalarGWSInterpreter: {inst.opcode}")
+
+        # Check if lane 0 is active in exec_mask
+        if (state.exec_mask & 1) == 0:
+            rid = ref_gws_resource_id(state.m0, inst.offset)
+            current_val = state.gws.resources[rid].value
+            return False, current_val, False
+
+        rid = ref_gws_resource_id(state.m0, inst.offset)
+        acquired, val, blocked = state.gws.wait_p(rid, state.wave_id)
+
+        if acquired:
+            state.status = ThreadExecutionStatus.RUNNING
+            state.scc = 1 if val > 0 else 0
+            return True, val, False
+        else:
+            state.status = ThreadExecutionStatus.BLOCKED
+            state.scc = 0
+            return False, 0, True
+
+
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Commit 1: Reference mathematical oracle and architectural model for ds_gws_sema_p."""
 
@@ -466,6 +548,100 @@ class TestSymbolicASTAndTypedExpressions(unittest.TestCase):
 
         self.assertFalse(expr.can_acquire(0))
         self.assertEqual(expr.next_counter(0), 0)
+
+
+class TestDeterministicScalarInterpreter(unittest.TestCase):
+    """Commit 3: Deterministic scalar instruction interpreter for ds_gws_sema_p."""
+
+    def setUp(self) -> None:
+        self.gws = GWSSubsystem()
+        self.interp = ScalarGWSInterpreter()
+
+    def test_scalar_acquire_success(self) -> None:
+        rid = 4
+        self.gws.init_resource(rid, init_val=2)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=0, gds=True)
+
+        acquired, val, blocked = self.interp.execute(state, inst)
+        self.assertTrue(acquired)
+        self.assertEqual(val, 1)
+        self.assertFalse(blocked)
+        self.assertEqual(state.status, ThreadExecutionStatus.RUNNING)
+        self.assertEqual(state.scc, 1)  # remaining counter > 0
+
+        # Second acquire decrements to 0
+        acquired2, val2, blocked2 = self.interp.execute(state, inst)
+        self.assertTrue(acquired2)
+        self.assertEqual(val2, 0)
+        self.assertFalse(blocked2)
+        self.assertEqual(state.status, ThreadExecutionStatus.RUNNING)
+        self.assertEqual(state.scc, 0)  # remaining counter == 0
+
+    def test_scalar_acquire_blocks_when_zero(self) -> None:
+        rid = 6
+        self.gws.init_resource(rid, init_val=0)
+        state = ScalarThreadState(wave_id=7, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=0, gds=True)
+
+        acquired, val, blocked = self.interp.execute(state, inst)
+        self.assertFalse(acquired)
+        self.assertEqual(val, 0)
+        self.assertTrue(blocked)
+        self.assertEqual(state.status, ThreadExecutionStatus.BLOCKED)
+        self.assertEqual(state.scc, 0)
+        self.assertEqual(self.gws.resources[rid].wait_queue, [7])
+
+    def test_blocked_thread_rejection(self) -> None:
+        rid = 10
+        self.gws.init_resource(rid, init_val=0)
+        state = ScalarThreadState(wave_id=5, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=0, gds=True)
+
+        self.interp.execute(state, inst)
+        self.assertEqual(state.status, ThreadExecutionStatus.BLOCKED)
+
+        with self.assertRaises(RuntimeError):
+            self.interp.execute(state, inst)
+
+    def test_waking_blocked_thread(self) -> None:
+        rid = 11
+        self.gws.init_resource(rid, init_val=0)
+        state = ScalarThreadState(wave_id=22, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=0, gds=True)
+
+        self.interp.execute(state, inst)
+        self.assertEqual(state.status, ThreadExecutionStatus.BLOCKED)
+
+        # External signal_v wakes wavefront 22
+        val, awakened = self.gws.signal_v(rid)
+        self.assertEqual(awakened, 22)
+        # Restore status to RUNNING upon wakeup
+        state.status = ThreadExecutionStatus.RUNNING
+        self.assertEqual(state.status, ThreadExecutionStatus.RUNNING)
+
+    def test_inactive_exec_mask_is_noop(self) -> None:
+        rid = 14
+        self.gws.init_resource(rid, init_val=5)
+        state = ScalarThreadState(wave_id=1, m0=rid, exec_mask=0, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=0, gds=True)
+
+        acquired, val, blocked = self.interp.execute(state, inst)
+        self.assertFalse(acquired)
+        self.assertEqual(val, 5)
+        self.assertFalse(blocked)
+        self.assertEqual(self.gws.resources[rid].value, 5)
+        self.assertEqual(state.status, ThreadExecutionStatus.RUNNING)
+
+    def test_dynamic_m0_offset_resolution(self) -> None:
+        self.gws.init_resource(12, init_val=3)
+        state = ScalarThreadState(wave_id=1, m0=10, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=2, gds=True)
+
+        acquired, val, blocked = self.interp.execute(state, inst)
+        self.assertTrue(acquired)
+        self.assertEqual(val, 2)
+        self.assertEqual(self.gws.resources[12].value, 2)
 
 
 if __name__ == "__main__":
