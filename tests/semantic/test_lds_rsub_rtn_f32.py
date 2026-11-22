@@ -696,5 +696,95 @@ class TestSIMDWavefrontDivergence(unittest.TestCase):
         self.assertAlmostEqual(u32_to_f32(sim.mem.read_dword(5)), 4.0, places=5)
 
 
+# ==============================================================================
+# Register Aliasing & In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarLDSInterpreter(lds_size_dwords=1024)
+
+    def test_vdst_aliases_vaddr(self) -> None:
+        # vdst == vaddr == v1
+        # Target address is 40 (dword 10), pre-seeded with 2.0f
+        self.interp.mem.write_dword(10, TWO_F32)
+        self.interp.write_reg(RegisterOperand(1), 40)
+        self.interp.write_reg(RegisterOperand(2), FIVE_F32)
+
+        instr = DSRsubRtnInstruction(
+            vdst=RegisterOperand(1),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+        )
+        old_val, new_val = self.interp.step(instr)
+
+        # Reverse subtraction: 5.0f - 2.0f = 3.0f
+        self.assertEqual(old_val, TWO_F32)
+        self.assertEqual(new_val, THREE_F32)
+        self.assertEqual(self.interp.mem.read_dword(10), THREE_F32)
+        # v1 overwritten with old_val (2.0f)
+        self.assertEqual(self.interp.read_reg(RegisterOperand(1)), TWO_F32)
+
+    def test_vdst_aliases_vdata0(self) -> None:
+        # vdst == vdata0 == v2
+        self.interp.mem.write_dword(10, TWO_F32)
+        self.interp.write_reg(RegisterOperand(1), 40)
+        self.interp.write_reg(RegisterOperand(2), FIVE_F32)
+
+        instr = DSRsubRtnInstruction(
+            vdst=RegisterOperand(2),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+        )
+        old_val, new_val = self.interp.step(instr)
+
+        self.assertEqual(old_val, TWO_F32)
+        self.assertEqual(new_val, THREE_F32)
+        self.assertEqual(self.interp.mem.read_dword(10), THREE_F32)
+        # v2 overwritten with old_val (2.0f) instead of original 5.0f
+        self.assertEqual(self.interp.read_reg(RegisterOperand(2)), TWO_F32)
+
+    def test_three_way_aliasing(self) -> None:
+        # vdst == vaddr == vdata0 == v0
+        # v0 = 0 (address 0, and float value 0.0f)
+        self.interp.mem.write_dword(0, TWO_F32)
+        self.interp.write_reg(RegisterOperand(0), POS_ZERO_F32)
+
+        instr = DSRsubRtnInstruction(
+            vdst=RegisterOperand(0),
+            vaddr=RegisterOperand(0),
+            vdata0=RegisterOperand(0),
+        )
+        old_val, new_val = self.interp.step(instr)
+
+        # 0.0f - 2.0f = -2.0f
+        minus_two_f32 = f32_to_u32(-2.0)
+        self.assertEqual(old_val, TWO_F32)
+        self.assertEqual(new_val, minus_two_f32)
+        self.assertEqual(self.interp.mem.read_dword(0), minus_two_f32)
+        # v0 overwritten with old_val (2.0f)
+        self.assertEqual(self.interp.read_reg(RegisterOperand(0)), TWO_F32)
+
+    def test_operand_preservation_when_unaliased(self) -> None:
+        # When vdst is distinct from vaddr and vdata0, sources must be strictly preserved
+        self.interp.mem.write_dword(5, ONE_F32)
+        self.interp.write_reg(RegisterOperand(1), 20)
+        self.interp.write_reg(RegisterOperand(2), TEN_F32)
+        self.interp.write_reg(RegisterOperand(3), 0)
+
+        instr = DSRsubRtnInstruction(
+            vdst=RegisterOperand(3),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+        )
+        self.interp.step(instr)
+
+        # v1 and v2 unchanged
+        self.assertEqual(self.interp.read_reg(RegisterOperand(1)), 20)
+        self.assertEqual(self.interp.read_reg(RegisterOperand(2)), TEN_F32)
+
+
 if __name__ == "__main__":
     unittest.main()
