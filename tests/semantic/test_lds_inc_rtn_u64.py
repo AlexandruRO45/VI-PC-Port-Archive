@@ -836,5 +836,131 @@ class TestDsIncRtnU64SIMDMultiLane(unittest.TestCase):
         self.assertEqual(lds.read_qword(target_addr), 1)
 
 
+# ==============================================================================
+# Phase 5: Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestDsIncRtnU64RegisterAliasing(unittest.TestCase):
+    """Phase 5: Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_alias_vdst_shares_register_with_vaddr(self) -> None:
+        # vdst = v[0:1], vaddr = v0 (vaddr in low dword of destination)
+        lds = LDSModel64(capacity_qwords=512)
+        rf = ScalarRegisterFile()
+        interp = ScalarLDS64Interpreter(lds, rf)
+
+        addr = 0x80
+        val64 = 0xABCD_EF01_2345_6789
+        lds.write_qword(addr, val64)
+
+        rf.write_vgpr(0, addr)               # v0 holds address
+        rf.write_vgpr_64(2, 0xFFFF_FFFF_FFFF_FFFF)  # v[2:3] holds limit
+
+        inst = Ds64Instruction(
+            opcode=Ds64Opcode.DS_INC_RTN_U64,
+            vdst=Register(RegKind.VGPR, 0, count=2),  # v[0:1]
+            vaddr=Register(RegKind.VGPR, 0, count=1), # v0
+            vdata0=Register(RegKind.VGPR, 2, count=2),# v[2:3]
+        )
+
+        old, new_mem = interp.step(inst)
+        self.assertEqual(old, val64)
+        self.assertEqual(new_mem, val64 + 1)
+        # v[0:1] now holds returned value val64
+        self.assertEqual(rf.read_vgpr_64(0), val64)
+        self.assertEqual(lds.read_qword(addr), val64 + 1)
+        # v[2:3] remains unchanged
+        self.assertEqual(rf.read_vgpr_64(2), 0xFFFF_FFFF_FFFF_FFFF)
+
+    def test_alias_vdst_equals_vdata0(self) -> None:
+        # vdst = v[0:1], vdata0 = v[0:1] (identical 64-bit register pair)
+        lds = LDSModel64(capacity_qwords=512)
+        rf = ScalarRegisterFile()
+        interp = ScalarLDS64Interpreter(lds, rf)
+
+        addr = 0xA0
+        lds.write_qword(addr, 50)
+
+        rf.write_vgpr(2, addr)        # v2 holds address
+        rf.write_vgpr_64(0, 50)       # v[0:1] holds wrap limit (50 == 50 -> wrap)
+
+        inst = Ds64Instruction(
+            opcode=Ds64Opcode.DS_INC_RTN_U64,
+            vdst=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            vdata0=Register(RegKind.VGPR, 0, count=2),
+        )
+
+        old, new_mem = interp.step(inst)
+        self.assertEqual(old, 50)
+        self.assertEqual(new_mem, 0)
+        # v[0:1] overwritten with old value 50
+        self.assertEqual(rf.read_vgpr_64(0), 50)
+        self.assertEqual(lds.read_qword(addr), 0)
+        # v2 preserved
+        self.assertEqual(rf.read_vgpr(2), addr)
+
+    def test_alias_vaddr_shares_register_with_vdata0_low(self) -> None:
+        # vaddr = v0, vdata0 = v[0:1], vdst = v[4:5]
+        lds = LDSModel64(capacity_qwords=512)
+        rf = ScalarRegisterFile()
+        interp = ScalarLDS64Interpreter(lds, rf)
+
+        # Let v0 = 0x80 (128). If v[0:1] = 0x80, wrap limit is 128
+        addr_and_limit_lo = 0x80
+        lds.write_qword(addr_and_limit_lo, 10)
+
+        rf.write_vgpr(0, addr_and_limit_lo)
+        rf.write_vgpr(1, 0)
+        rf.write_vgpr_64(4, 0xCAFE_BABE)
+
+        inst = Ds64Instruction(
+            opcode=Ds64Opcode.DS_INC_RTN_U64,
+            vdst=Register(RegKind.VGPR, 4, count=2),
+            vaddr=Register(RegKind.VGPR, 0, count=1),
+            vdata0=Register(RegKind.VGPR, 0, count=2),
+        )
+
+        old, new_mem = interp.step(inst)
+        self.assertEqual(old, 10)
+        self.assertEqual(new_mem, 11)
+        self.assertEqual(rf.read_vgpr_64(4), 10)
+        self.assertEqual(rf.read_vgpr(0), addr_and_limit_lo)
+        self.assertEqual(lds.read_qword(addr_and_limit_lo), 11)
+
+    def test_simd_aliasing_divergent_across_lanes(self) -> None:
+        # Wave64 with alternating mask: vdst = v[0:1], vaddr = v0
+        lds = LDSModel64(capacity_qwords=1024)
+        simd = SIMDLDS64WavefrontInterpreter(wave_size=64, lds=lds)
+        simd.set_exec_mask(0x5555_5555_5555_5555)  # Even lanes active
+
+        for lane in range(64):
+            addr = 0x100 + lane * 8
+            lds.write_qword(addr, 1000 + lane)
+            simd.write_lane_vgpr(lane, 0, addr) # v0 is address
+            simd.write_lane_vgpr_64(lane, 2, 5000)
+
+        inst = Ds64Instruction(
+            opcode=Ds64Opcode.DS_INC_RTN_U64,
+            vdst=Register(RegKind.VGPR, 0, count=2),  # v[0:1]
+            vaddr=Register(RegKind.VGPR, 0, count=1), # v0
+            vdata0=Register(RegKind.VGPR, 2, count=2),# v[2:3]
+        )
+
+        results = simd.step(inst)
+        for lane in range(64):
+            addr = 0x100 + lane * 8
+            if lane % 2 == 0:
+                expected_old = 1000 + lane
+                self.assertEqual(results[lane], (expected_old, expected_old + 1))
+                self.assertEqual(simd.read_lane_vgpr_64(lane, 0), expected_old)
+                self.assertEqual(lds.read_qword(addr), expected_old + 1)
+            else:
+                self.assertIsNone(results[lane])
+                # Inactive lane preserves original address in v0
+                self.assertEqual(simd.read_lane_vgpr(lane, 0), addr)
+                self.assertEqual(lds.read_qword(addr), 1000 + lane)
+
+
 if __name__ == "__main__":
     unittest.main()
