@@ -445,7 +445,7 @@ u32; u32 count}` with `Entry {u64 key; T *value; Entry *next}`. Hashes are `joaa
 | | `+0xA0` u32 groups, `+0xA4` u32 entries, `+0xA8` pointer | a hash table of the clips: per group 16 control bytes (0x80 empty, below 0x80 full), then 16 slots `{u32 clip hash; u32 not decoded; u32 record index; u32 0}` |
 | | `+0x170`/`+0x174`/`+0x178` | the same kind of table with 8-byte slots `{u32 hash; u32 index}` |
 | | `+0x188` u32, `+0x18C` u32 | the clip's own hash and the dictionary's `joaat32(name)`, as `.motion` has at `+0x28`/`+0x2C` |
-| | `+0x48` pointer, count at `+0x44` | one 40-byte item, zero except a u32 1 at its `+0x20` (`+0x40` is the name's length and capacity) |
+| | `+0x48` pointer, count at `+0x44` | one 40-byte item, zero except a u32 1 at its `+0x20` (`+0x40` holds the name's length and capacity, measured separately) |
 | | `+0x118` pointer, count at `+0x114` | one u32: the pose sample count |
 | | `+0x128` pointer, count at `+0x124` | one u16, 0 |
 | matcher feature object | `+0x18` u32, `+0x28` pointer, `+0x30` pointer or null | 1 (measured separately), then the skeleton and the `+0x30` object (both below) |
@@ -458,7 +458,7 @@ u32; u32 count}` with `Entry {u64 key; T *value; Entry *next}`. Hashes are `joaa
 | | with `+0x30`: `+0x98` pointer, count at `+0x94` | one u32 per sample, the same for every sample of a record |
 | | `+0xB8` pointer, count at `+0xB4` | one f32 per 8 pose columns (rounded up) |
 | | `+0xC0` f32, `+0xC4` f32, `+0xC8` u32 | not decoded, then 1.0, then 1 with rows and 3 with blocks of 8 |
-| matcher `+0x30` object (112 bytes) | `+0x08` u32 | its form: 1 or 2 |
+| matcher `+0x30` object (112 bytes, measured separately) | `+0x08` u32 | its form: 1 or 2 |
 | | form 2: `+0x18`/`+0x1C` f32, `+0x4C` u32, `+0x68` u32 | two weights; a feature kind (bits as `+0x1C` of a feature) and its width |
 | | form 1: `+0x40` {u32 n; u32 n; pointer}, `+0x50` the same | n f32 values, then n f32 weights |
 | matcher skeleton (feature object `+0x28`) | `+0x18` u32 slots, `+0x1C` u32 entries, `+0x20` pointer | tag table, 8-byte slots `{u32 tag; u32 bone}`, empty tag 0xFFFFFFFF |
@@ -703,7 +703,9 @@ A `.motionmatcher` object has fields up to `+0x18F`; they are in the object tabl
   costs against something else (a trajectory, say) is a hypothesis.
 - **Per column group (`+0xB8`, `+0xC0`).** `+0xB8` has one f32 per 8 pose columns, rounded up, on 180 of 180
   (positive, measured separately). They are not the reciprocal, the deviation or the variance of their 8 columns
-  over the samples (0 of 138 clips with 8 samples or more, measured separately). `+0xC4` is 1.0, and `+0xC8` is 1
+  over the samples, of one clip (0 of 138 clips with 8 samples or more) or of all clips that share the values
+  (0 of 272 groups), measured separately. A clip's `+0xB8` and `+0xC0` are the same for every clip with the same
+  features on 20 of 23 feature sets (measured separately), so they look like settings, not statistics. `+0xC4` is 1.0, and `+0xC8` is 1
   with rows and 3 with blocks of 8, on 180 of 180.
 - Not decoded: the second word of a clip table slot and what the clip table hashes, the hash of the features'
   `+0x48` table (not joaat32, one-at-a-time, FNV-1/1a, ELF or CRC-32 of the bone name in any case, nor of the

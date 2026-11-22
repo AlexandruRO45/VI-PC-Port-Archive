@@ -635,7 +635,8 @@ class DecodeTest(unittest.TestCase):
         struct.pack_into("<I", s.d, b + 8, 7)                                         # another form: not read
         self.assertEqual(anim_clips.matcher_object_b(s, b), {"form": 7})
         struct.pack_into("<I", s.d, b + 8, 1)
-        for field, fmt, value in ((b + 0x50, "<I", len(s.d)),                       # weights past the pages
+        for field, fmt, value in ((obj + 0x30, "<Q", 0x50000000 + len(s.d) - 0x40),  # the object past the pages
+                                  (b + 0x50, "<I", len(s.d)),                       # weights past the pages
                                   (b + 0x58, "<Q", 0),                              # weights without data
                                   (at + 0x114, "<I", len(s.d)),                     # +0x118 past the pages
                                   (obj + 0xB4, "<I", len(s.d))):                    # +0xB8 past the pages

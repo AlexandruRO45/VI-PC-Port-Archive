@@ -318,6 +318,8 @@ def matcher_object_b(s, at):
     """The feature object's `+0x30` object (112 bytes), in two forms told apart by its u32 at `+0x08`. Form 2: a
     feature kind at `+0x4C`, its width at `+0x68`, and two f32 weights at `+0x18`/`+0x1C`. Form 1: two arrays of
     {u32 count; u32 capacity; pointer} at `+0x40` and `+0x50`, n f32 values and n f32 weights. -> dict"""
+    if at + 0x70 > len(s.d):
+        raise DecodeError("motionmatcher +0x30 object runs past the pages")
     form = s.u32(at + 8)
     if form == 2:
         return {"form": 2, "kind": s.u32(at + 0x4C), "width": s.u32(at + 0x68),
