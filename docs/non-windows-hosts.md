@@ -148,6 +148,37 @@ Do not work around this by stubbing `cl`, MASM, D3D12, or WARP to make CMake con
 - **Linux GPU Check via Proton:** A contributor recorded a passing run of the standalone Windows GPU Check on CachyOS with an RTX 3060 through Proton and `vkd3d-proton` in [the hardware coverage thread](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7064204388). If you report a translation-layer run of the standalone GPU Check in `#1`, include the commit or release tag, GPU model, Mesa or NVIDIA driver version, Proton and `vkd3d-proton` versions, and each subtest's output (including skips).
 - A native Linux runtime is outside the scope of this guide and remains a separate request from the x64 Windows target.
 
+### Compile check with msvc-wine
+
+[msvc-wine](https://github.com/mstorsjo/msvc-wine) runs the real MSVC toolchain and Windows SDK under Wine. This is not a stub, so you can use it to confirm that a C++ or HLSL change compiles with `cl` and DXC before Windows CI runs. Its `vsdownload.py` asks you to accept the Visual Studio Build Tools license.
+
+```bash
+python3 vsdownload.py --accept-license --dest ~/.local/msvc
+./install.sh ~/.local/msvc
+```
+
+The SDK's `dxc.exe` is not wrapped. Save this script as `~/.local/msvc/bin/x64/dxc` and make it executable. It maps absolute Linux paths to Wine's `Z:` drive:
+
+```bash
+#!/bin/bash
+DXC="$HOME/.local/msvc/Windows Kits/10/bin/10.0.26100.0/x64/dxc.exe"
+args=()
+for a in "$@"; do
+  if [[ $a == /* && -e $(dirname "$a") ]]; then args+=("z:${a//\//\\}"); else args+=("$a"); fi
+done
+WINEDEBUG=-all exec wine "$DXC" "${args[@]}"
+```
+
+Then configure with `CMAKE_SYSTEM_NAME=Windows`. Without it, CMake's compiler check fails to link with `LNK1181`.
+
+```bash
+export PATH="$HOME/.local/msvc/bin/x64:$PATH"
+cmake --preset release -DCMAKE_SYSTEM_NAME=Windows -DDXC_EXECUTABLE="$HOME/.local/msvc/bin/x64/dxc"
+cmake --build --preset release
+```
+
+The resulting test binaries run under Wine and `vkd3d`, not Windows D3D12 or WARP. Expect `desktop_memory_query`, the `d3d12_xs_shim_*` export and root checks, and `ffx_provider_loop_*` and `bvh_root_roundtrip_*` to fail there, and the DXR and BVH tests to skip. Treat a Wine run as a compile check only. Do not report Wine test results as Windows verification or hardware coverage.
+
 ## Troubleshooting
 
 - **Homebrew `llvm@15` is keg-only:** Homebrew does not symlink `llvm@15` binaries into `PATH` by default. Pass `"$(brew --prefix llvm@15)"` explicitly instead of calling bare `llvm-mc`.
