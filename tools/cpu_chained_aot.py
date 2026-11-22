@@ -196,7 +196,7 @@ using word = std::uint64_t;
 // Every guest MOV load, once per instruction: the compiler must perform it even when its value is unused,
 // because the original faults on an inaccessible address either way.
 template <class T> static T load_always(word address) {
-    return *reinterpret_cast<const volatile T*>(address);
+    return *reinterpret_cast<const volatile T __unaligned*>(address);
 }
 """
     if ffx_destroy or callback_offset is not None:

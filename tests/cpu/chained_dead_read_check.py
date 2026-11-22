@@ -86,11 +86,12 @@ def check(guard_path, original_path, *pairs):
 
     clean = (VALUE,) * (PAGE // 8)
 
-    def compare(name, pointer, y, case, faults):
+    def compare(name, pointer, y, case, faults, *, expected=None):
         """The original must return the reference or raise an access violation; both translations must give
         what the original gives."""
         original = run(getattr(native, name), pointer, y, False)
-        wanted = (ACCESS_VIOLATION, None, clean) if faults else (0, reference(name, y), clean)
+        value = reference(name, y) if expected is None else expected
+        wanted = (ACCESS_VIOLATION, None, clean) if faults else (0, value, clean)
         if original != wanted:
             raise AssertionError(f"original {name}, {case}: code {original[0]:#x}, {original[1]}")
         for label, function in zip(("translation", "/O2 translation"), translations[name]):
@@ -107,6 +108,9 @@ def check(guard_path, original_path, *pairs):
         # The last read ends exactly at the inaccessible page, then one byte into it.
         compare(name, base + PAGE - end, 5, "reads end at an inaccessible page", False)
         compare(name, base + PAGE - end + 1, 5, "last read crosses into an inaccessible page", True)
+    word_bytes = VALUE.to_bytes(8, "little")
+    rotated = int.from_bytes(word_bytes[1:] + word_bytes[:1], "little")
+    compare("read_live", base + 1, 5, "readable unaligned operand", False, expected=rotated)
     # pair_dead's first read succeeds and its second is entirely in the inaccessible page.
     compare("pair_dead", base + PAGE - 8, 5, "second operand in an inaccessible page", True)
     # The same inaccessible addresses on the path that skips the read: a normal return.
