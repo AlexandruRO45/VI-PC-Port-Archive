@@ -636,6 +636,23 @@ node --test tests\test_viewer_streaming.cjs
 ```
 
 The entity rows and the placed chunks come from your own copy of the game; keep them in the local work folder.
+
+### Navigate the map viewer
+
+Choose **Fly**, **Walk**, or **Drive** in the viewer, or press **M** to cycle. Fly keeps the original free camera.
+Walk follows the visible surface at eye height. Drive accelerates and brakes with the same movement keys, and
+**A** and **D** steer. Ground modes wait when the nearby displayed meshes do not provide a reachable surface.
+They follow the streamed render geometry, so a missing or coarse tile can affect where the camera can move.
+
+Open **Go to** to select a location or enter three comma-separated world coordinates in metres (X, Y up, Z).
+**Esc** releases the pointer to use the controls. Fly goes directly to the entered position. Walk and Drive use
+that height as the starting point for finding ground. The **P** camera link still shares the position and look
+direction.
+
+The menu includes Spawn. You can add your own waypoints to the local `world.json` by supplying an optional
+`"locations": [{"name": "Overview", "position": [100, 120, -50]}]` field. Add `?test` to the viewer URL to try
+all three modes and two sample locations on generated terrain.
+
 ## Trains (`CTrainConfigs`)
 
 Trains are configured by one `CTrainConfigs` XML document in `common.rpf` (see [gamedata.md](gamedata.md)).

@@ -16,6 +16,16 @@
   #help kbd { color: var(--fg); background: #1c2129; padding: 0 5px; border-radius: 3px; }
   #start { position: fixed; inset: 0; display: grid; place-items: center; background: rgba(0,0,0,.45); cursor: pointer; font-size: 15px; }
   #start.hidden { display: none; }
+  #navigation { position: fixed; left: 12px; top: 134px; max-width: calc(100vw - 48px); background: var(--panel); padding: 10px 12px; border-radius: 8px; }
+  #navigation summary { margin-top: 6px; cursor: pointer; }
+  #navigation form { display: grid; gap: 6px; margin-top: 6px; }
+  #navigation input, #navigation select, #navigation button {
+    font: inherit; color: var(--fg); background: #1c2129; border: 1px solid #606975; border-radius: 4px; padding: 3px 6px;
+  }
+  #navigation input { width: 15ch; max-width: 100%; }
+  #navigation select { max-width: 16ch; }
+  #navigation output { color: var(--warn); }
+  #navigation output:empty { display: none; }
   @media (max-width: 760px) {
     #hud { right: 12px; min-width: 0; }
     #banner { top: auto; bottom: 104px; left: 12px; max-width: none; }
@@ -31,10 +41,22 @@
   and serve with <code>python -I viewer/serve.py --world &lt;work&gt;\world</code>.
 </div>
 <div id="help">
-  <kbd>W A S D</kbd> move · <kbd>Q</kbd>/<kbd>E</kbd> down/up · <kbd>Shift</kbd> fast · <kbd>Ctrl</kbd> slow · wheel: speed<br>
+  <kbd>W A S D</kbd> move/steer · <kbd>M</kbd> change mode · Fly: <kbd>Q</kbd>/<kbd>E</kbd> down/up, <kbd>Shift</kbd> fast, <kbd>Ctrl</kbd> slow, wheel speed<br>
   <kbd>F</kbd> wireframe · <kbd>T</kbd> textures/clay · <kbd>G</kbd> chunk bounds · <kbd>R</kbd> back to spawn · <kbd>P</kbd> copy link to this view · <kbd>Esc</kbd> release mouse
 </div>
-<div id="start">Click to fly</div>
+<div id="start">Click to look</div>
+<aside id="navigation" aria-label="Map navigation">
+  <label>Mode <select id="movement-mode"><option value="fly">Fly</option><option value="walk">Walk</option><option value="drive">Drive</option></select></label>
+  <details>
+    <summary>Go to</summary>
+    <form id="go-to">
+      <label>Location <select id="go-to-location"><option value="">Choose a location</option><option value="0">Spawn</option></select></label>
+      <label>X, Y, Z <input id="go-to-position" type="text" placeholder="0, 120, 0" autocomplete="off"></label>
+      <button type="submit">Go</button>
+      <output id="go-to-feedback" aria-live="polite"></output>
+    </form>
+  </details>
+</aside>
 
 <script type="importmap">
 { "imports": {
@@ -48,13 +70,26 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 
 // ---------- world description ----------
 // world/world.json: { "spawn": [x,y,z], "chunks": [ { "id", "url", "bounds": [minx,miny,minz,maxx,maxy,maxz] } ] }
+// Optional "locations": [{ "name": "Overview", "position": [x,y,z] }].
 // A world built with world_build --lod-sets also has "lod_bands": { tier: [start, end] } (metres), and each
 // chunk names its "lod" tier and its grid "cell": [minx, minz, maxx, maxz].
 // Each chunk is a .glb in world space (Y up, metres). Validate the manifest before
 // the camera and streaming code use its coordinates and chunk identifiers.
+function isPosition(value, length = 3) {
+  return Array.isArray(value) && value.length === length && value.every(Number.isFinite);
+}
+function validLocations(locations) {
+  // Optional waypoints must not make the rest of a usable map unloadable.
+  return Array.isArray(locations) ? locations.filter(entry =>
+    typeof entry?.name === "string" && entry.name.trim() && isPosition(entry.position)) : [];
+}
+function parsePosition(text) {
+  const parts = text.split(",");
+  if (parts.length !== 3 || parts.some(part => !part.trim())) return null;
+  const position = parts.map(Number);
+  return isPosition(position) ? position : null;
+}
 function manifestError(world) {
-  const isPosition = (value, length) =>
-    Array.isArray(value) && value.length === length && value.every(Number.isFinite);
   const isNonemptyString = value => typeof value === "string" && value.trim().length > 0;
   if (!isPosition(world?.spawn, 3)) return "spawn must contain three finite coordinates";
   if (!Array.isArray(world.chunks)) return "chunks must be an array";
@@ -111,7 +146,7 @@ async function loadWorld() {
   }
   const error = manifestError(world);
   if (error) return testWorld(`Invalid world/world.json: ${error}.`);
-  return { ...world, test: false };
+  return { ...world, locations: validLocations(world.locations), test: false };
 }
 
 function testWorld(reason) {
@@ -120,7 +155,10 @@ function testWorld(reason) {
     for (let x = -n / 2; x < n / 2; x++)
       chunks.push({ id: `test_${x}_${z}`, test: [x, z, size],
                     bounds: [x * size, -50, z * size, (x + 1) * size, 200, (z + 1) * size] });
-  return { test: true, reason, spawn: [0, 120, 0], chunks };
+  return { test: true, reason, spawn: [0, 120, 0], chunks, locations: [
+    { name: "West hills", position: [-960, 150, -480] },
+    { name: "East valley", position: [720, 120, 640] },
+  ] };
 }
 
 // Deterministic test terrain: rolling hills plus a grid of boxes. Nothing here comes from the game.
@@ -163,13 +201,88 @@ function buildTestChunk([cx, cz, size]) {
   const count = 18, inst = new THREE.InstancedMesh(box, new THREE.MeshStandardMaterial({ color: 0x9aa4b1, roughness: 0.7 }), count);
   const m = new THREE.Matrix4();
   for (let i = 0; i < count; i++) {
-    const x = cx * size + hash(cx * 31 + i, cz) * size, z = cz * size + hash(cx, cz * 17 + i) * size;
     const w = 8 + 22 * hash(i, cx + cz), h = 6 + 70 * hash(cz + i, cx) ** 3;
+    // Keep the whole box within its chunk bounds, including at the spawn on a chunk corner.
+    const inset = w / 2 + 1, span = size - 2 * inset;
+    const x = cx * size + inset + hash(cx * 31 + i, cz) * span;
+    const z = cz * size + inset + hash(cx, cz * 17 + i) * span;
     m.compose(new THREE.Vector3(x, height(x, z) - 1, z), new THREE.Quaternion(), new THREE.Vector3(w, h, w));
     inst.setMatrixAt(i, m);
   }
   g.add(inst);
   return g;
+}
+
+// ---------- ground navigation ----------
+const GROUND_STEP = 0.05, GROUND_RETRY = 0.2;
+function groundState() {
+  return { floor: null, speed: 0, segment: null, retry: 0, waiting: false };
+}
+function moveOnGround(p, yaw, keys, mode, dt, state, floorAt) {
+  const driving = mode === "drive", eye = driving ? 2.5 : 1.7;
+  const forward = Number(keys.has("KeyW")) - Number(keys.has("KeyS"));
+  const side = Number(keys.has("KeyD")) - Number(keys.has("KeyA"));
+  while (dt > 0) {
+    if (state.segment) {
+      const s = state.segment;
+      const elapsed = Math.min(dt, GROUND_STEP - s.elapsed);
+      s.elapsed += elapsed;
+      dt -= elapsed;
+      const t = s.elapsed / GROUND_STEP;
+      p.x = s.x + s.dx * t;
+      p.y = s.y + (s.floor + eye - s.y) * t;
+      p.z = s.z + s.dz * t;
+      if (s.elapsed >= GROUND_STEP) {
+        state.floor = s.floor;
+        state.segment = null;
+      }
+      continue;
+    }
+    if (state.retry > 0) {
+      const elapsed = Math.min(dt, state.retry);
+      state.retry -= elapsed;
+      dt -= elapsed;
+      continue;
+    }
+    // On entering a mode or teleporting, settle onto the nearest visible surface below the camera.
+    if (state.floor === null) {
+      state.floor = floorAt(p.x, p.z, p.y - 1600, p.y + 0.5);
+      if (state.floor === null) {
+        state.waiting = true;
+        state.retry = GROUND_RETRY;
+        break;
+      }
+      p.y = state.floor + eye;
+    }
+    state.waiting = false;
+    let ahead = forward * 4.5, across = side * 4.5;
+    let heading = yaw;
+    if (driving) {
+      const target = forward * (forward < 0 ? 6 : 20);
+      const braking = target === 0 || target * state.speed < 0 || Math.abs(target) < Math.abs(state.speed);
+      const change = (braking ? 14 : 8) * GROUND_STEP;
+      state.speed += Math.max(-change, Math.min(change, target - state.speed));
+      heading -= side * Math.sign(state.speed) * 1.1 * GROUND_STEP;
+      ahead = state.speed;
+      across = 0;
+    } else if (forward && side) {
+      ahead *= Math.SQRT1_2;
+      across *= Math.SQRT1_2;
+    }
+    if (!ahead && !across) break;
+    const dx = (across * Math.cos(heading) - ahead * Math.sin(heading)) * GROUND_STEP;
+    const dz = (-ahead * Math.cos(heading) - across * Math.sin(heading)) * GROUND_STEP;
+    const floor = floorAt(p.x + dx, p.z + dz, state.floor - 2, state.floor + 0.8);
+    if (floor === null) {
+      state.waiting = true;
+      state.retry = GROUND_RETRY;
+      state.speed = 0;
+      break;
+    }
+    yaw = heading;
+    state.segment = { x: p.x, y: p.y, z: p.z, dx, dz, floor, elapsed: 0 };
+  }
+  return yaw;
 }
 
 // ---------- scene ----------
@@ -196,6 +309,19 @@ addEventListener("resize", () => { camera.aspect = innerWidth / innerHeight; cam
 
 // ---------- freecam ----------
 const keys = new Set(); let yaw = 0, pitch = -0.25, speed = 40, locked = false;
+const modes = ["fly", "walk", "drive"];
+let mode = "fly", ground = groundState();
+const modePicker = document.getElementById("movement-mode");
+function changeMode(next) {
+  if (!modes.includes(next) || next === mode) return;
+  modePicker.value = mode = next;
+  ground = groundState();
+}
+function goTo(position) {
+  camera.position.fromArray(position);
+  ground = groundState();
+  keys.clear();
+}
 // Pointer lock when the browser allows it; embedded views (iframes, preview panes) fall back to drag-to-look.
 const start = document.getElementById("start");
 let dragLook = false, dragging = false;
@@ -211,15 +337,20 @@ addEventListener("mousemove", e => {
   if (!locked && !(dragLook && dragging)) return;
   yaw -= e.movementX * 0.0022; pitch = THREE.MathUtils.clamp(pitch - e.movementY * 0.0022, -1.55, 1.55);
 });
-addEventListener("wheel", e => { speed = THREE.MathUtils.clamp(speed * (e.deltaY < 0 ? 1.15 : 1 / 1.15), 1, 3000); }, { passive: true });
+addEventListener("wheel", e => {
+  if (mode === "fly" && !e.target?.closest?.("#navigation"))
+    speed = THREE.MathUtils.clamp(speed * (e.deltaY < 0 ? 1.15 : 1 / 1.15), 1, 3000);
+}, { passive: true });
 addEventListener("blur", () => { keys.clear(); dragging = false; });
 const world = await loadWorld();
 addEventListener("keydown", e => {
+  if (e.target?.closest?.("#navigation")) return;
   keys.add(e.code);
+  if (e.code === "KeyM" && !e.repeat) changeMode(modes[(modes.indexOf(mode) + 1) % modes.length]);
   if (e.code === "KeyF" && !e.repeat) wire = !wire, applyWire();
   if (e.code === "KeyT" && !e.repeat) clay = !clay, applyClay();
   if (e.code === "KeyG" && !e.repeat) toggleBounds();
-  if (e.code === "KeyR") camera.position.fromArray(world.spawn);
+  if (e.code === "KeyR" && !e.repeat) goTo(world.spawn);
   if (e.code === "KeyP" && !e.repeat) {
     history.replaceState(null, "", formatCamHash(camera.position.toArray(), yaw, pitch));
     navigator.clipboard?.writeText(location.href).catch(() => {});
@@ -375,32 +506,90 @@ function stream(now = performance.now()) {
   }
 }
 
+let groundRay;
+function sampleGround(x, z, bottom, top) {
+  if (!groundRay) {
+    groundRay = new THREE.Raycaster();
+    groundRay.ray.direction.set(0, -1, 0);
+  }
+  groundRay.ray.origin.set(x, top, z);
+  let highest = null;
+  // Only the local, visible streamed geometry can support the camera. Shorten the ray after each hit.
+  for (const { def, obj } of live.values()) {
+    if (!obj || obj.visible === false) continue;
+    const [minX, minY, minZ, maxX, maxY, maxZ] = def.bounds;
+    if (x < minX || x > maxX || z < minZ || z > maxZ || top < minY || maxY < (highest ?? bottom)) continue;
+    groundRay.far = top - (highest ?? bottom);
+    const [hit] = groundRay.intersectObject(obj, true);
+    if (hit) highest = hit.point.y;
+  }
+  return highest;
+}
+
 // ---------- main loop ----------
-camera.position.fromArray(world.spawn);
+goTo(world.spawn);
 const startCam = parseCamHash(location.hash);
-if (startCam) { camera.position.fromArray(startCam.pos); yaw = startCam.yaw; pitch = THREE.MathUtils.clamp(startCam.pitch, -1.55, 1.55); }
+if (startCam) { goTo(startCam.pos); yaw = startCam.yaw; pitch = THREE.MathUtils.clamp(startCam.pitch, -1.55, 1.55); }
 if (world.test) {
   document.getElementById("world-status").textContent = world.reason;
   document.getElementById("banner").classList.remove("hidden");
 }
+const locationPicker = document.getElementById("go-to-location");
+const positionInput = document.getElementById("go-to-position");
+const goToFeedback = document.getElementById("go-to-feedback");
+const locations = [{ name: "Spawn", position: world.spawn }, ...world.locations];
+modePicker.onchange = () => changeMode(modePicker.value);
+document.getElementById("navigation").onfocusin = () => keys.clear();
+for (const [i, place] of locations.entries()) {
+  if (i === 0) continue; // Spawn is already in the static menu.
+  const option = document.createElement("option");
+  option.value = String(i);
+  option.textContent = place.name;
+  locationPicker.append(option);
+}
+locationPicker.onchange = () => {
+  const place = locationPicker.value === "" ? null : locations[Number(locationPicker.value)];
+  if (place) positionInput.value = place.position.join(", ");
+  goToFeedback.textContent = "";
+};
+positionInput.oninput = () => {
+  locationPicker.value = "";
+  goToFeedback.textContent = "";
+};
+document.getElementById("go-to").onsubmit = e => {
+  e.preventDefault();
+  const position = parsePosition(positionInput.value);
+  goToFeedback.textContent = position ? "" : "Enter three finite coordinates separated by commas.";
+  if (position) goTo(position);
+};
+
 const hud = document.getElementById("hud"), clock = new THREE.Clock();
 let fpsT = 0, fpsN = 0, fps = 0;
-const fwd = new THREE.Vector3(), right = new THREE.Vector3(), up = new THREE.Vector3(0, 1, 0);
+const fwd = new THREE.Vector3(), right = new THREE.Vector3(), up = new THREE.Vector3(0, 1, 0), motion = new THREE.Vector3();
+const orientation = new THREE.Euler(0, 0, 0, "YXZ");
+function fly(dt) {
+  camera.getWorldDirection(fwd); right.crossVectors(fwd, up).normalize();
+  motion.set(0, 0, 0);
+  const s = speed * (keys.has("ShiftLeft") || keys.has("ShiftRight") ? 5 : 1) * (keys.has("ControlLeft") ? 0.2 : 1);
+  if (keys.has("KeyW")) motion.add(fwd); if (keys.has("KeyS")) motion.sub(fwd);
+  if (keys.has("KeyD")) motion.add(right); if (keys.has("KeyA")) motion.sub(right);
+  if (keys.has("KeyE")) motion.y += 1; if (keys.has("KeyQ")) motion.y -= 1;
+  if (motion.lengthSq()) camera.position.addScaledVector(motion.normalize(), s * dt);
+}
 renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.1);
-  camera.quaternion.setFromEuler(new THREE.Euler(pitch, yaw, 0, "YXZ"));
-  camera.getWorldDirection(fwd); right.crossVectors(fwd, up).normalize();
-  const v = new THREE.Vector3(), s = speed * (keys.has("ShiftLeft") || keys.has("ShiftRight") ? 5 : 1) * (keys.has("ControlLeft") ? 0.2 : 1);
-  if (keys.has("KeyW")) v.add(fwd); if (keys.has("KeyS")) v.sub(fwd);
-  if (keys.has("KeyD")) v.add(right); if (keys.has("KeyA")) v.sub(right);
-  if (keys.has("KeyE")) v.y += 1; if (keys.has("KeyQ")) v.y -= 1;
-  if (v.lengthSq()) camera.position.addScaledVector(v.normalize(), s * dt);
+  if (mode !== "fly") yaw = moveOnGround(camera.position, yaw, keys, mode, dt, ground, sampleGround);
+  camera.quaternion.setFromEuler(orientation.set(pitch, yaw, 0));
+  if (mode === "fly") fly(dt);
   stream();
   renderer.render(scene, camera);
   fpsN++; fpsT += dt; if (fpsT > 0.5) { fps = fpsN / fpsT; fpsN = 0; fpsT = 0; }
   const p = camera.position, loaded = [...live.values()].filter(c => c.obj).length;
+  const movement = mode === "fly" ? `fly · ${speed.toFixed(0)} m/s` :
+    ground.waiting ? `${mode} · no nearby surface` :
+    mode === "drive" ? `drive · ${Math.round(Math.abs(ground.speed) * 3.6)} km/h` : "walk";
   hud.innerHTML = `<b>${world.test ? "test terrain" : "world"}</b><br>pos ${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)}<br>` +
-    `speed ${speed.toFixed(0)} m/s · ${fps.toFixed(0)} fps<br>chunks ${loaded}/${world.chunks.length} loaded, ${inflight} loading` +
+    `${movement} · ${fps.toFixed(0)} fps<br>chunks ${loaded}/${world.chunks.length} loaded, ${inflight} loading` +
     (failed ? `, <span style="color:var(--warn)">${failed} load errors</span>` : "") +
     `<br>draw calls ${renderer.info.render.calls}, tris ${(renderer.info.render.triangles / 1000).toFixed(0)}k`;
 });

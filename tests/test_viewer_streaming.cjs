@@ -31,6 +31,16 @@ test('a valid manifest is used, including an intentionally empty world', async (
     }
 });
 
+test('only valid optional locations are used without rejecting the world', async () => {
+    const locations = [
+        { name: 'Hilltop', position: [10, 20, -30] },
+        { name: '', position: [0, 0, 0] }, { name: 'Bad', position: [0, Infinity, 0] }, null,
+    ];
+    const world = await loadWorld(manifestResponse({ spawn: [0, 0, 0], chunks: [], locations }));
+    assert.equal(world.test, false);
+    assert.deepEqual(Array.from(world.locations), locations.slice(0, 1));
+});
+
 test('malformed manifests keep the viewer usable and identify the invalid field', async t => {
     const cases = [
         ['missing spawn', {}, /spawn/],
@@ -70,7 +80,7 @@ test('test mode, a missing manifest, and an unreadable manifest have distinct me
     assert.match(unreachable.reason, /could not be loaded/);
 });
 
-test('generated terrain shares vertex normals at both kinds of chunk border', () => {
+test('generated terrain shares border normals and keeps box footprints inside the chunk', () => {
     class Attribute {
         constructor(count) { this.count = count; this.array = new Float32Array(count * 3); }
         getX(i) { return this.array[i * 3]; }
@@ -118,8 +128,14 @@ test('generated terrain shares vertex normals at both kinds of chunk border', ()
             Mesh: class { constructor(geometry) { this.geometry = geometry; } },
             MathUtils: { clamp: (x, low, high) => Math.min(high, Math.max(low, x)) },
             MeshStandardMaterial: class {}, Float32BufferAttribute: class {},
-            BoxGeometry: class { translate() {} }, InstancedMesh: class { setMatrixAt() {} },
-            Matrix4: class { compose() {} }, Vector3: class {}, Quaternion: class {},
+            BoxGeometry: class { translate() {} },
+            InstancedMesh: class {
+                boxes = [];
+                setMatrixAt(i, matrix) { this.boxes[i] = [matrix.position, matrix.scale]; }
+            },
+            Matrix4: class { compose(position, _, scale) { Object.assign(this, { position, scale }); } },
+            Vector3: class { constructor(x, y, z) { Object.assign(this, { x, y, z }); } },
+            Quaternion: class {},
         },
     });
     const read = (chunk, name, row, col) => {
@@ -132,6 +148,10 @@ test('generated terrain shares vertex normals at both kinds of chunk border', ()
     assert.deepEqual(read(center, 'position', 32, 16), read(south, 'position', 0, 16));
     assert.deepEqual(read(center, 'normal', 32, 16), read(south, 'normal', 0, 16));
     assert.deepEqual(read(center, 'normal', 32, 16), [-1/3, 2/3, -2/3].map(Math.fround));
+    for (const [position, scale] of center.children[1].boxes) {
+        assert.ok(position.x > scale.x / 2 && position.x < 256 - scale.x / 2);
+        assert.ok(position.z > scale.z / 2 && position.z < 256 - scale.z / 2);
+    }
 });
 
 test('a WebGL startup error replaces the fly prompt and preserves the original error', async () => {
@@ -161,11 +181,12 @@ async function freecamFixture() {
         addEventListener: (type, handler) => documentEvents.set(type, handler),
     };
     const source = viewerModule.split('// ---------- freecam ----------')[1].split('// ---------- chunk streaming ----------')[0];
-    const state = await vm.runInNewContext(`(async () => { ${source}\nreturn { yaw: () => yaw, keys }; })()`, {
+    const state = await vm.runInNewContext(`(async () => { ${source}\nreturn { yaw: () => yaw, mode: () => mode, keys }; })()`, {
         THREE: { MathUtils: { clamp: (x, min, max) => Math.min(Math.max(x, min), max) } },
         renderer: { domElement: canvas }, document,
         addEventListener: (type, handler) => windowEvents.set(type, handler),
         loadWorld: async () => ({}),
+        groundState: () => ({}),
     });
     return {
         ...state,
@@ -174,7 +195,7 @@ async function freecamFixture() {
         down: button => canvasEvents.get('mousedown')({ button }),
         up: button => windowEvents.get('mouseup')({ button }),
         move: buttons => windowEvents.get('mousemove')({ buttons, movementX: 10, movementY: 0 }),
-        key: code => windowEvents.get('keydown')({ code }),
+        key: (code, extra) => windowEvents.get('keydown')({ code, ...extra }),
         blur: () => windowEvents.get('blur')(),
     };
 }
@@ -231,6 +252,22 @@ test('pointer lock turns the camera without a pressed mouse button', async () =>
     assert.ok(cam.yaw() < 0);
 });
 
+test('M cycles camera modes once per press and navigation controls retain keyboard input', async () => {
+    const cam = await freecamFixture();
+    assert.equal(cam.mode(), 'fly');
+    cam.key('KeyM');
+    cam.key('KeyM', { repeat: true });
+    assert.equal(cam.mode(), 'walk');
+    cam.key('KeyM');
+    assert.equal(cam.mode(), 'drive');
+    cam.key('KeyM', { target: { closest: () => true } });
+    cam.key('KeyW', { target: { closest: () => true } });
+    assert.equal(cam.mode(), 'drive');
+    assert.equal(cam.keys.has('KeyW'), false);
+    cam.key('KeyM');
+    assert.equal(cam.mode(), 'fly');
+});
+
 test('the bounds overlay creates helpers on the first G press and reuses them', async () => {
     const chunks = [worldChunk, { id: 'other', url: 'other.glb', bounds: [5, 6, 7, 8, 9, 10] }];
     const handlers = new Map();
@@ -242,6 +279,7 @@ test('the bounds overlay creates helpers on the first G press and reuses them', 
             DirectionalLight: class { position = { set() {} }; },
             Color: class {}, Fog: class {}, HemisphereLight: class {}, Clock: class {}, MeshStandardMaterial: class {},
             Vector3: class { constructor(...xyz) { this.xyz = xyz; } },
+            Euler: class {},
             Box3: class { constructor(min, max) { Object.assign(this, { min, max }); } },
             Box3Helper: class { constructor(box, color) { Object.assign(this, { box, color }); } },
             Group: class { children = []; add(child) { this.children.push(child); } },
@@ -267,6 +305,93 @@ test('the bounds overlay creates helpers on the first G press and reuses them', 
     assert.equal(boundsGroup.visible, true);
     assert.equal(boundsGroup.children.length, helpers.length);
     helpers.forEach((helper, i) => assert.equal(boundsGroup.children[i], helper));
+});
+
+const groundSource = viewerModule.split('// ---------- ground navigation ----------')[1].split('// ---------- scene ----------')[0];
+const { groundState, moveOnGround } = vm.runInNewContext(groundSource + '\n({ groundState, moveOnGround })');
+
+test('walk follows a sloping surface at eye level with normalized diagonal movement', () => {
+    const p = { x: 0, y: 10, z: 0 }, ground = groundState();
+    const terrain = (x, z) => x / 4 - z / 2;
+    let probes = 0;
+    const floorAt = (x, z, bottom, top) => {
+        probes++;
+        const y = terrain(x, z);
+        return y >= bottom && y <= top ? y : null;
+    };
+    const keys = new Set(['KeyW', 'KeyD', 'KeyE']);
+    for (let i = 0; i < 20; i++) moveOnGround(p, 0, keys, 'walk', 0.05, ground, floorAt);
+    assert.ok(Math.abs(Math.hypot(p.x, p.z) - 4.5) < 1e-9);
+    assert.ok(p.x > 0 && p.z < 0);
+    assert.ok(Math.abs(p.y - terrain(p.x, p.z) - 1.7) < 1e-9);
+    assert.equal(probes, 21); // Initial landing, then one probe per 50 ms of movement.
+});
+
+test('ground movement interpolates between probes and waits at an unloaded edge', () => {
+    const p = { x: 0, y: 10, z: 0 }, ground = groundState();
+    let available = false, probes = 0;
+    const floorAt = (x, z) => {
+        probes++;
+        return available && z >= -0.3 ? 0 : null;
+    };
+    const step = dt => moveOnGround(p, 0, new Set(['KeyW']), 'walk', dt, ground, floorAt);
+    step(0.02);
+    step(0.02);
+    assert.equal(probes, 1);
+    assert.deepEqual(p, { x: 0, y: 10, z: 0 });
+    available = true;
+    step(0.1);
+    step(0.1);
+    step(0.025);
+    assert.ok(p.z < 0 && p.z > -0.225);
+    step(0.025);
+    step(0.05);
+    assert.equal(p.z, -0.225);
+    assert.equal(p.y, 1.7);
+    assert.equal(ground.waiting, true);
+});
+
+test('ground sampling considers the highest local visible surface in reach', () => {
+    const tested = [];
+    const live = new Map([
+        ['below', { def: { bounds: [-1, 0, -1, 1, 1, 1] }, obj: { y: 1 } }],
+        ['hidden', { def: { bounds: [-1, 0, -1, 1, 4, 1] }, obj: { y: 4, visible: false } }],
+        ['outside', { def: { bounds: [8, 0, -1, 9, 4, 1] }, obj: { y: 4 } }],
+        ['above', { def: { bounds: [-1, 8, -1, 1, 9, 1] }, obj: { y: 9 } }],
+        ['local', { def: { bounds: [-1, 0, -1, 1, 3, 1] }, obj: { y: 3 } }],
+    ]);
+    class Raycaster {
+        ray = { direction: { set() {} }, origin: { set: (x, y, z) => { this.top = y; } } };
+        intersectObject(obj, recursive) {
+            assert.equal(recursive, true);
+            tested.push(obj.y);
+            return this.top - obj.y <= this.far ? [{ point: { y: obj.y } }] : [];
+        }
+    }
+    const source = viewerModule.split('let groundRay;')[1].split('// ---------- main loop ----------')[0];
+    const sample = vm.runInNewContext('let groundRay;' + source + '\nsampleGround', { live, THREE: { Raycaster } });
+    assert.equal(sample(0, 0, 0, 5), 3);
+    assert.deepEqual(tested, [1, 3]);
+    assert.equal(sample(5, 0, 0, 5), null);
+});
+
+test('drive accelerates, steers, and brakes to a stop', () => {
+    const p = { x: 0, y: 5, z: 0 }, ground = groundState();
+    let heading = 0;
+    const step = keys => { heading = moveOnGround(p, heading, new Set(keys), 'drive', 0.05, ground, () => 0); };
+    for (let i = 0; i < 20; i++) step(['KeyW', 'KeyD']);
+    assert.ok(heading < -1 && p.x > 0 && p.z < 0);
+    assert.ok(Math.abs(ground.speed - 8) < 1e-9);
+    for (let i = 0; i < 20; i++) step([]);
+    assert.equal(ground.speed, 0);
+    assert.equal(p.y, 2.5);
+});
+
+test('coordinate jumps require three finite comma-separated values', () => {
+    const parse = vm.runInNewContext(worldSource + '\nparsePosition');
+    assert.deepEqual(Array.from(parse(' -12.5, 20, 0 ')), [-12.5, 20, 0]);
+    for (const value of ['1,2', '1,,2', '1,2,3,4', '1,NaN,2', '1,2,Infinity'])
+        assert.equal(parse(value), null, value);
 });
 
 const begin = html.indexOf('// ---------- chunk streaming ----------');
