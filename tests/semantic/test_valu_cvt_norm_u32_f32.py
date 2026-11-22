@@ -1018,5 +1018,270 @@ class TestValuCvtNormU32F32IEEE754Boundaries(unittest.TestCase):
         self.assertEqual(res_half % 2, 0)
 
 
+# ---------------------------------------------------------------------------
+# Mutated Oracles and Negative Controls / Syntax Rejection
+# ---------------------------------------------------------------------------
+
+def mutant_nan_to_max(src32: int) -> int:
+    """Mutant 1: improperly converts NaN to UNORM32_MAX instead of 0."""
+    if is_nan_f32(src32):
+        return UNORM32_MAX
+    return ref_cvt_norm_u32_f32(src32)
+
+
+def mutant_drop_sign(src32: int) -> int:
+    """Mutant 2: improperly drops sign bit and treats negative numbers as positive."""
+    s_unsigned = src32 & ~SIGN_MASK_F32
+    return ref_cvt_norm_u32_f32(s_unsigned)
+
+
+def mutant_no_saturation(src32: int) -> int:
+    """Mutant 3: fails to saturate values > 1.0, wrapping modulo 2^32."""
+    f_val = bits_to_f32(src32 & ~SIGN_MASK_F32)
+    scaled = int(f_val * 4294967295)
+    return scaled & MASK32
+
+
+def mutant_truncation(src32: int) -> int:
+    """Mutant 4: uses truncation towards zero instead of IEEE 754 roundTiesToEven."""
+    if is_nan_f32(src32) or (src32 & SIGN_MASK_F32):
+        return UNORM32_MIN
+    f_val = bits_to_f32(src32)
+    if f_val >= 1.0:
+        return UNORM32_MAX
+    return int(f_val * 4294967295)
+
+
+def mutant_leak_vcc(interp: ScalarVALUInterpreter, inst: Instruction) -> None:
+    """Mutant 5: improperly corrupts VCC register during VALU execution."""
+    interp.step(inst)
+    interp.vcc ^= 0x1
+
+
+def mutant_exec_leak(sim: SIMDWavefrontInterpreter, inst: Instruction) -> None:
+    """Mutant 6: improperly writes to inactive SIMD lanes under EXEC mask."""
+    sim.step(inst)
+    sim.write_lane_reg32(0, inst.dst.kind, inst.dst.index, 0xDEADBEEF)
+
+
+def mutant_ignore_abs_modifier(src32: int, abs_val: bool) -> int:
+    """Mutant 7: ignores abs modifier on negative inputs."""
+    return ref_cvt_norm_u32_f32(src32, abs_val=False)
+
+
+def mutant_ignore_neg_modifier(src32: int, neg: bool) -> int:
+    """Mutant 8: ignores neg modifier on inputs."""
+    return ref_cvt_norm_u32_f32(src32, neg=False)
+
+
+def parse_register(tok: str) -> Register:
+    """Parses a register string like 'v0', 's2'."""
+    tok = tok.strip()
+    if tok.startswith("v"):
+        kind = RegKind.VGPR
+        idx_str = tok[1:]
+    elif tok.startswith("s"):
+        kind = RegKind.SGPR
+        idx_str = tok[1:]
+    else:
+        raise ValueError(f"Unrecognized register prefix in: {tok}")
+
+    if not idx_str.isdigit():
+        raise ValueError(f"Invalid register index in: {tok}")
+
+    idx = int(idx_str)
+    return Register(kind=kind, index=idx)
+
+
+def parse_vop_cvt(asm_str: str) -> Instruction:
+    """Parses assembly text for v_cvt_norm_u32_f32 instruction."""
+    asm_str = asm_str.strip()
+    if not asm_str:
+        raise ValueError("Empty assembly string")
+
+    tokens = asm_str.split(None, 1)
+    op_token = tokens[0]
+    rest = tokens[1] if len(tokens) > 1 else ""
+
+    encoding = Encoding.VOP1
+    if op_token.endswith("_e64"):
+        encoding = Encoding.VOP3
+        base_op = op_token[:-4]
+    elif op_token.endswith("_e32"):
+        encoding = Encoding.VOP1
+        base_op = op_token[:-4]
+    else:
+        base_op = op_token
+
+    if base_op != "v_cvt_norm_u32_f32":
+        raise ValueError(f"Unsupported opcode: {op_token}")
+
+    if not rest:
+        raise ValueError("Missing operands for instruction")
+
+    parts = [p.strip() for p in rest.split(",")]
+    if len(parts) != 2:
+        raise ValueError(f"Expected 2 operands (dst, src0), got {len(parts)} in '{rest}'")
+
+    dst_str, src_str = parts[0], parts[1]
+    dst = parse_register(dst_str)
+    if dst.kind != RegKind.VGPR:
+        raise ValueError(f"Destination must be VGPR, got {dst.name()}")
+
+    src_tokens = src_str.split()
+    clamp = False
+    if "clamp" in src_tokens:
+        clamp = True
+        src_tokens.remove("clamp")
+
+    if not src_tokens:
+        raise ValueError("Missing source operand after removing modifiers")
+    if len(src_tokens) > 1:
+        raise ValueError(f"Extraneous tokens in source operand: {src_tokens}")
+
+    raw_src = src_tokens[0]
+    abs_src = False
+    neg_src = False
+
+    if raw_src.startswith("-"):
+        neg_src = True
+        raw_src = raw_src[1:]
+
+    if raw_src.startswith("|") and raw_src.endswith("|"):
+        abs_src = True
+        raw_src = raw_src[1:-1]
+
+    if raw_src.startswith("-"):
+        neg_src = True
+        raw_src = raw_src[1:]
+
+    if raw_src.startswith("v") or raw_src.startswith("s"):
+        src_op: Union[Register, Immediate] = parse_register(raw_src)
+    else:
+        try:
+            if raw_src.startswith("0x") or raw_src.startswith("0X"):
+                src_op = Immediate(int(raw_src, 16))
+            elif "." in raw_src:
+                src_op = Immediate(float(raw_src))
+            else:
+                src_op = Immediate(int(raw_src))
+        except ValueError:
+            raise ValueError(f"Invalid operand literal or identifier: {raw_src}")
+
+    if encoding == Encoding.VOP1 and (abs_src or neg_src or clamp):
+        raise ValueError("VOP1 encoding does not support modifiers or clamp")
+
+    return Instruction(
+        opcode=Opcode.V_CVT_NORM_U32_F32,
+        dst=dst,
+        src0=src_op,
+        abs_src0=abs_src,
+        neg_src0=neg_src,
+        clamp=clamp,
+        encoding=encoding,
+    )
+
+
+class TestValuCvtNormU32F32NegativeControls(unittest.TestCase):
+    """Negative controls, syntax rejection tests, and mutation detection validation."""
+
+    def test_syntax_rejection_invalid_opcode(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_vop_cvt("v_add_f32 v0, v1")
+        with self.assertRaises(ValueError):
+            parse_vop_cvt("v_cvt_u32_f32 v0, v1")
+
+    def test_syntax_rejection_missing_or_extra_operands(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_vop_cvt("v_cvt_norm_u32_f32 v0")
+        with self.assertRaises(ValueError):
+            parse_vop_cvt("v_cvt_norm_u32_f32 v0, v1, v2")
+        with self.assertRaises(ValueError):
+            parse_vop_cvt("v_cvt_norm_u32_f32")
+
+    def test_syntax_rejection_sgpr_destination(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_vop_cvt("v_cvt_norm_u32_f32 s0, v1")
+
+    def test_syntax_rejection_register_out_of_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_vop_cvt("v_cvt_norm_u32_f32 v256, v1")
+        with self.assertRaises(ValueError):
+            parse_vop_cvt("v_cvt_norm_u32_f32 v0, v256")
+
+    def test_syntax_rejection_vop1_with_modifiers(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_vop_cvt("v_cvt_norm_u32_f32_e32 v0, -v1")
+        with self.assertRaises(ValueError):
+            parse_vop_cvt("v_cvt_norm_u32_f32_e32 v0, |v1|")
+        with self.assertRaises(ValueError):
+            parse_vop_cvt("v_cvt_norm_u32_f32_e32 v0, v1 clamp")
+
+    def test_mutation_detection_nan_to_max(self) -> None:
+        correct = ref_cvt_norm_u32_f32(QNAN_F32)
+        mutant = mutant_nan_to_max(QNAN_F32)
+        self.assertEqual(correct, UNORM32_MIN)
+        self.assertEqual(mutant, UNORM32_MAX)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_drop_sign(self) -> None:
+        correct = ref_cvt_norm_u32_f32(NEG_ONE_F32)
+        mutant = mutant_drop_sign(NEG_ONE_F32)
+        self.assertEqual(correct, UNORM32_MIN)
+        self.assertEqual(mutant, UNORM32_MAX)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_no_saturation(self) -> None:
+        val_two = f32_to_bits(2.0)
+        correct = ref_cvt_norm_u32_f32(val_two)
+        mutant = mutant_no_saturation(val_two)
+        self.assertEqual(correct, UNORM32_MAX)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_truncation_vs_ties_to_even(self) -> None:
+        # 0.5f * 4294967295 = 2147483647.5 -> roundTiesToEven gives 2147483648, truncation gives 2147483647
+        correct = ref_cvt_norm_u32_f32(HALF_F32)
+        mutant = mutant_truncation(HALF_F32)
+        self.assertEqual(correct, 2147483648)
+        self.assertEqual(mutant, 2147483647)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_leak_vcc(self) -> None:
+        interp = ScalarVALUInterpreter()
+        interp.vcc = 0xAAAAAAAAAAAAAAAA
+        inst = parse_vop_cvt("v_cvt_norm_u32_f32 v0, v1")
+
+        interp.step(inst)
+        self.assertEqual(interp.vcc, 0xAAAAAAAAAAAAAAAA)
+
+        mutant_leak_vcc(interp, inst)
+        self.assertNotEqual(interp.vcc, 0xAAAAAAAAAAAAAAAA)
+
+    def test_mutation_detection_exec_leak(self) -> None:
+        sim = SIMDWavefrontInterpreter(wave_size=32)
+        sim.set_exec_mask(0)
+        sim.write_lane_reg32(0, RegKind.VGPR, 0, 0x12345678)
+        inst = parse_vop_cvt("v_cvt_norm_u32_f32 v0, v1")
+
+        sim.step(inst)
+        self.assertEqual(sim.read_lane_reg32(0, RegKind.VGPR, 0), 0x12345678)
+
+        mutant_exec_leak(sim, inst)
+        self.assertNotEqual(sim.read_lane_reg32(0, RegKind.VGPR, 0), 0x12345678)
+
+    def test_mutation_detection_modifiers(self) -> None:
+        correct_abs = ref_cvt_norm_u32_f32(NEG_ONE_F32, abs_val=True)
+        mutant_abs = mutant_ignore_abs_modifier(NEG_ONE_F32, abs_val=True)
+        self.assertEqual(correct_abs, UNORM32_MAX)
+        self.assertEqual(mutant_abs, UNORM32_MIN)
+        self.assertNotEqual(correct_abs, mutant_abs)
+
+        correct_neg = ref_cvt_norm_u32_f32(NEG_ONE_F32, neg=True)
+        mutant_neg = mutant_ignore_neg_modifier(NEG_ONE_F32, neg=True)
+        self.assertEqual(correct_neg, UNORM32_MAX)
+        self.assertEqual(mutant_neg, UNORM32_MIN)
+        self.assertNotEqual(correct_neg, mutant_neg)
+
+
 if __name__ == "__main__":
     unittest.main()
