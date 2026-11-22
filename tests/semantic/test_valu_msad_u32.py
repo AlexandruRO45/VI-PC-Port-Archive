@@ -906,5 +906,58 @@ class TestValuMsadU32ConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(flags_masked.diff, 0)
 
 
+class TestValuMsadU32IEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 float bit pattern handling, 32-bit extremes, and boundary limits."""
+
+    def test_ieee754_special_float_bitpatterns_treated_as_raw_dwords(self) -> None:
+        pos_zero = 0x0000_0000
+        neg_zero = 0x8000_0000
+        pos_inf = 0x7F80_0000
+        neg_inf = 0xFF80_0000
+        qnan = 0x7FC0_0000
+        snan = 0x7F80_0001
+
+        special_floats = [pos_zero, neg_zero, pos_inf, neg_inf, qnan, snan]
+        for f0 in special_floats:
+            for f1 in special_floats:
+                with self.subTest(f0=hex(f0), f1=hex(f1)):
+                    res0 = oracle_v_msad_u32(f0, f1, 0)
+                    res1 = oracle_v_msad_u32(f0, f1, 100)
+
+                    expected_diff = 0 if f1 == 0 else (f0 - f1 if f0 >= f1 else f1 - f0)
+                    self.assertEqual(res0, expected_diff)
+                    self.assertEqual(res1, (100 + expected_diff) & MASK32)
+
+    def test_subnormal_float_bits_no_flush_to_zero(self) -> None:
+        sub1 = 0x0000_0001
+        sub3 = 0x0000_0003
+        res = oracle_v_msad_u32(sub3, sub1, 0)
+        self.assertEqual(res, 2)
+
+    def test_nan_payload_treated_as_raw_dword_data(self) -> None:
+        nan_payload = 0x7FA5_5A3C
+        res = oracle_v_msad_u32(0, nan_payload, 0)
+        self.assertEqual(res, nan_payload)
+
+    def test_extreme_dword_boundary_combinations(self) -> None:
+        extremes = [0x0000_0000, 0x0000_0001, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFE, 0xFFFF_FFFF]
+        for s0 in extremes:
+            for s1 in extremes:
+                val = oracle_v_msad_u32(s0, s1, 0)
+                if s1 == 0:
+                    self.assertEqual(val, 0)
+                else:
+                    self.assertEqual(val, ref_abs_diff_u32(s0, s1))
+
+    def test_accumulator_boundary_extremes(self) -> None:
+        s0 = 0
+        s1 = 1  # diff = 1
+        boundaries = [0, 1, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFE, 0xFFFF_FFFF]
+        for acc in boundaries:
+            with self.subTest(acc=hex(acc)):
+                res = oracle_v_msad_u32(s0, s1, acc)
+                self.assertEqual(res, (acc + 1) & MASK32)
+
+
 if __name__ == "__main__":
     unittest.main()
