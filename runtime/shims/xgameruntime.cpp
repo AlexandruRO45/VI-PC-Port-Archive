@@ -101,6 +101,11 @@ void print_guid(char (&out)[40], const GUID* g) {
 constexpr GUID kThreadingClass = {0x073b7dcb, 0x1fcf, 0x4030, {0x94, 0xbe, 0xe3, 0xc9, 0xeb, 0x62, 0x34, 0x28}};
 constexpr GUID kErrorClass = {0x8ca467f7, 0x22e8, 0x4096, {0x84, 0x56, 0xbb, 0x8a, 0xa1, 0x3f, 0x79, 0xd8}};
 constexpr GUID kNetworkingClass = {0x37e56907, 0x2f10, 0x41e8, {0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a}};
+// IXNetworkingImpl2 (xgameruntime include/xnetworking.idl). XCurl.dll's thunks pass it as the interface id with the
+// class id (lea rdx / lea rcx before each QueryApiImpl call), so the object must answer for it, not only for the
+// class id (IXNetworkingImpl's).
+constexpr GUID kNetworking2 = {0xbf2346b2, 0x39af, 0x4658, {0xb5, 0xea, 0x44, 0x71, 0x3c, 0x7e, 0x83, 0xb3}};
+const GUID* const kNetworkingIids[] = {&kNetworking2, nullptr};
 
 // A function's arguments after `this`, forwarded unchanged (x64 has one calling convention).
 // Specialised on the function's exact type, so a noexcept function matches only one form.
@@ -344,7 +349,7 @@ static_assert(std::size(kNetworkingVtable) == 21, "IUnknown + IXNetworkingImpl2'
 // XThreadingImpl's and XErrorImpl's class id is also their one interface's.
 RuntimeObject g_threading{kThreadingVtable, &kThreadingClass, nullptr};
 RuntimeObject g_error{kErrorVtable, &kErrorClass, nullptr};
-RuntimeObject g_networking{kNetworkingVtable, &kNetworkingClass, nullptr};
+RuntimeObject g_networking{kNetworkingVtable, &kNetworkingClass, kNetworkingIids};
 
 RuntimeObject& system_object();  // XSystemImpl, defined after the XSystem functions it serves
 

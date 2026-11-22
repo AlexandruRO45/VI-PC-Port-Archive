@@ -297,6 +297,14 @@ void check_run_time_load() {
     const GUID networking_cls = {0x37e56907, 0x2f10, 0x41e8, {0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a}};
     void* n = get(networking_cls);
     check(n != nullptr, "QueryApiImpl hands out XNetworkingImpl for its class id");
+    {
+        // XCurl.dll asks with the class id and IXNetworkingImpl2's id (measured: lea rdx/rcx before QueryApiImpl).
+        const GUID networking2 = {0xbf2346b2, 0x39af, 0x4658, {0xb5, 0xea, 0x44, 0x71, 0x3c, 0x7e, 0x83, 0xb3}};
+        void* as2 = nullptr;
+        check(query(&networking_cls, networking2, &as2) == S_OK && as2 == n,
+              "QueryApiImpl hands out XNetworkingImpl when asked with IXNetworkingImpl2's id, as XCurl.dll asks");
+        if (as2) release(as2);
+    }
     if (n) {
         void* again = get(networking_cls);
         check(again == n, "XNetworkingImpl is one process-wide object");
