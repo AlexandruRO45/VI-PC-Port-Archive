@@ -11366,10 +11366,11 @@ def input_signature(path, name):
 
 def same_encoding(raw, printed, op):
     """True if the bytes in the blob are the instruction LLVM printed. Exact match, except for fields the
-    hardware ignores that LLVM re-encodes with its default: VOP3P op_sel_hi[2] (bit 14) on two-source packed
-    ops (seen: v_pk_add_f16 stored with 0, printed with 1), and unused VOP3/VOP3P SRC1 (bits 49:41) and SRC2
-    (bits 58:50) fields, which the game's compiler stores as 0 and LLVM 23 prints as 0x80 (inline constant 0;
-    seen on two-source v_mul_legacy_f32/v_sub_f32/v_cmp_*_e64/v_mul_lo_u32/v_pk_mul_f16 and one-source
+    hardware ignores that LLVM re-encodes with its default: plain-VOP3 src2 op_sel_hi[2] (dword1 bit 25,
+    bit 57; BUILD-250), VOP3P op_sel_hi[2] (bit 14) on two-source packed ops (seen: v_pk_add_f16 stored
+    with 0, printed with 1), and unused VOP3/VOP3P SRC1 (bits 49:41) and SRC2 (bits 58:50) fields, which
+    the game's compiler stores as 0 and LLVM 23 prints as 0x80 (inline constant 0; seen on two-source
+    v_mul_legacy_f32/v_sub_f32/v_cmp_*_e64/v_mul_lo_u32/v_pk_mul_f16 and one-source
     v_rcp/v_log/v_sqrt_f32_e64). LLVM decoded these bytes, so a source it actually reads would have printed as
     s0, not 0x80."""
     if raw == printed:
@@ -11387,6 +11388,8 @@ def same_encoding(raw, printed, op):
     two_src = op.startswith("v_pk_") and not any(k in op for k in ("fma", "mad"))
     if vop3p and two_src:
         diff &= ~(1 << 14)
+    if vop3:
+        diff &= ~(1 << (32 + 25))                  # plain-VOP3 src2 op_sel_hi[2] (dword1 bit 25; BUILD-250)
     return diff == 0
 
 
