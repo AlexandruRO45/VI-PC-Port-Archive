@@ -1306,9 +1306,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_integers>"
         "$<TARGET_FILE:cpu_x87_integers_lifted>" ${x87_integers_control_files})
     cpu_asm_fixture(cpu_x87_compare x87_compare)
-    # The lifted DLL and six mutated controls that the check requires to mismatch.
+    # The lifted DLL and seven mutated controls that the check requires to mismatch.
     set(x87_compare_control_files "")
-    foreach(variant IN ITEMS lifted unordeq swap zeroorder low11 rawexp unnormal)
+    foreach(variant IN ITEMS lifted unordeq swap zeroorder low11 rawexp unnormal keepof)
         set(x87_compare_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_x87_compare_${variant}.cpp")
         add_custom_command(OUTPUT "${x87_compare_fixture}"
             COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_compare.py"

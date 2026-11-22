@@ -6,8 +6,8 @@ The profile accepts:
 - FXTRACT, which replaces ST(0) by its exponent and pushes its significand, and FSCALE;
 - the constant loads FLD1, FLDZ, FLDPI, FLDL2T, FLDL2E, FLDLG2 and FLDLN2;
 - FILD, FISTP and FISTTP with an m16, m32 or m64 integer operand, and FIST with m16 or m32;
-- FCOMI, FCOMIP, FUCOMI and FUCOMIP ST(0), ST(i), which set ZF and CF for the integer lowering (PF is
-  not modelled, and the integer lowering rejects every instruction that reads it);
+- FCOMI, FCOMIP, FUCOMI and FUCOMIP ST(0), ST(i), which set ZF and CF and clear OF for the integer
+  lowering (PF is not modelled, and the integer lowering rejects every instruction that reads it);
 - FCMOVB, FCMOVE, FCMOVBE, FCMOVNB, FCMOVNE and FCMOVNBE ST(0), ST(i), which read ZF and CF (FCMOVU
   and FCMOVNU read PF and stay outside the profile). In a function with a move, each status flag that any
   instruction reads must be written by an earlier instruction on every path from the entry: the caller's
@@ -365,9 +365,9 @@ def statement(i, depth, address, checked=None):
         name = next(n for n, v in vars(M).items() if v == op).lower()
         return f"if ({FCMOV[op]}) x87_slot[{top}] = x87_slot[{top - k}];  // {name} st({k})"
     if op in COMPARES:  # ZF and CF: 1 and 0 for equal, 0 and 1 for less, 0 and 0 for greater, 1 and 1 unordered
-        k = top - (i.op1_register - R.ST0)
+        k = top - (i.op1_register - R.ST0)  # OF is always cleared
         return (f"{{ const int r = x87_compare(x87_slot[{top}], x87_slot[{k}]); "
-                f"zero = r == 1 || r == 3; carry = r == 0 || r == 3; }}")
+                f"zero = r == 1 || r == 3; carry = r == 0 || r == 3; overflow = false; }}")
     if op in (M.FILD, M.FIST, M.FISTP, M.FISTTP):
         signed, unsigned, bits = INTEGERS[i.memory_size]
         if op == M.FILD:
