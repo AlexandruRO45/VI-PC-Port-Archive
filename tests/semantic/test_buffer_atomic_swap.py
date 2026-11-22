@@ -584,6 +584,9 @@ class TestBufferAtomicSwapAST(unittest.TestCase):
         )
         self.assertEqual(
             inst.to_assembly(),
+            "buffer_atomic_swap v0, v1, s[4:7], s2 offset:16 glc",
+        ) if not inst.mods.offen else self.assertEqual(
+            inst.to_assembly(),
             "buffer_atomic_swap v0, v1, s[4:7], s2 offen offset:16 glc",
         )
 
@@ -1292,6 +1295,148 @@ class TestBufferAtomicSwapBoundaryExtremes(unittest.TestCase):
             self.assertEqual(self.interp.mem.read_u32(offset), pattern, f"Failed for {name}")
             # Register must have received the previous memory value
             self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 0), 0x3F800000)
+
+
+class TestBufferAtomicSwapNegativeControls(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and invalid input states."""
+
+    def test_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, -5)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 256)
+
+    def test_invalid_destination_kind(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SWAP,
+                vdata=Register(RegKind.SGPR, 0),  # must be VGPR
+                vaddr=Register(RegKind.VGPR, 1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=0,
+            )
+
+    def test_invalid_descriptor_size(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SWAP,
+                vdata=Register(RegKind.VGPR, 0),
+                vaddr=Register(RegKind.VGPR, 1),
+                srsrc=Register(RegKind.SGPR, 4, count=2),  # must be count=4
+                soffset=0,
+            )
+
+    def test_invalid_soffset_kind(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SWAP,
+                vdata=Register(RegKind.VGPR, 0),
+                vaddr=Register(RegKind.VGPR, 1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=Register(RegKind.VGPR, 2),  # soffset must be SGPR
+            )
+
+    def test_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDBufferWavefrontInterpreter(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDBufferWavefrontInterpreter(wave_size=128)
+
+    def test_invalid_offset_immediate(self) -> None:
+        with self.assertRaises(ValueError):
+            BufferAtomicModifiers(offset=-1)
+        with self.assertRaises(ValueError):
+            BufferAtomicModifiers(offset=4096)
+
+
+class TestBufferAtomicSwapMutationDetection(unittest.TestCase):
+    """Unit tests detecting injected bugs and mutations in buffer atomic swap semantics."""
+
+    def setUp(self) -> None:
+        self.desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=1024)
+
+    def test_mutation_oob_check_omission(self) -> None:
+        def mutated_swap_no_bounds_check(mem: BufferMemory, vaddr: int, val: int) -> int:
+            old = mem.read_u32(vaddr)
+            mem.write_u32(vaddr, val)
+            return old
+
+        mem_ref = BufferMemory(2048)
+        mem_mut = BufferMemory(2048)
+        mem_ref.write_u32(1024, 0x55555555)
+        mem_mut.write_u32(1024, 0x55555555)
+
+        # Standard reference detects OOB: memory untouched
+        ret_ref, in_bounds_ref = ref_buffer_atomic_swap(
+            mem_ref, self.desc, soffset=0, vaddr=1024, swap_val=0x66666666, glc=True
+        )
+        self.assertFalse(in_bounds_ref)
+        self.assertEqual(ret_ref, 0)
+        self.assertEqual(mem_ref.read_u32(1024), 0x55555555)
+
+        # Mutated logic erroneously updates memory
+        ret_mut = mutated_swap_no_bounds_check(mem_mut, 1024, 0x66666666)
+        self.assertEqual(ret_mut, 0x55555555)
+        self.assertEqual(mem_mut.read_u32(1024), 0x66666666)
+        self.assertNotEqual(mem_ref.read_u32(1024), mem_mut.read_u32(1024))
+
+    def test_mutation_glc_returns_post_op_value(self) -> None:
+        mem = BufferMemory(1024)
+        mem.write_u32(0, 0x11111111)
+
+        # Reference oracle correctly returns pre-op value
+        ret, in_bounds = ref_buffer_atomic_swap(
+            mem, self.desc, soffset=0, vaddr=0, swap_val=0x22222222, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0x11111111)  # pre-op, NOT post-op (0x22222222)
+        self.assertNotEqual(ret, 0x22222222)
+
+    def test_mutation_no_memory_update(self) -> None:
+        mem = BufferMemory(1024)
+        mem.write_u32(0, 0xABCDEF00)
+
+        ret, in_bounds = ref_buffer_atomic_swap(
+            mem, self.desc, soffset=0, vaddr=0, swap_val=0x12345678, glc=False
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(mem.read_u32(0), 0x12345678)
+        self.assertNotEqual(mem.read_u32(0), 0xABCDEF00)
+
+    def test_mutation_simd_exec_leak(self) -> None:
+        simd = SIMDBufferWavefrontInterpreter(wave_size=32, mem_size=1024)
+        simd.set_buffer_descriptor(0, self.desc)
+        # Only lane 0 active
+        simd.set_exec_mask(0x1)
+
+        for lane in range(32):
+            simd.mem.write_u32(lane * 4, 0xAA)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 0, 0xFF)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 1, lane * 4)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SWAP,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 0, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+
+        results = simd.step(inst)
+        # Lane 0 active: swapped
+        self.assertEqual(results[0], (0xAA, True))
+        self.assertEqual(simd.mem.read_u32(0), 0xFF)
+
+        # Inactive lanes 1..31 must never execute or modify memory/registers
+        for lane in range(1, 32):
+            self.assertEqual(results[lane], (None, False))
+            self.assertEqual(simd.mem.read_u32(lane * 4), 0xAA)
+            self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), 0xFF)
 
 
 if __name__ == "__main__":
