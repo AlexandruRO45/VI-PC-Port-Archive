@@ -6958,7 +6958,7 @@ class Gen:
             self.emit(f"{r} = OpGroupNonUniformShuffle %uint {self.cu(3)} {v} {first}")
             self.dst(a[0], r)
         elif op in ("image_sample_o", "image_sample_lz_o", "image_sample_l_o", "image_sample_b_o",
-                    "image_sample_c_lz_o", "image_sample_c_o", "image_sample_c_b_o", "image_sample_cl_o", "image_sample_b_cl_o",
+                    "image_sample_c_lz_o", "image_sample_c_l_o", "image_sample_c_o", "image_sample_c_b_o", "image_sample_cl_o", "image_sample_b_cl_o",
                     "image_sample_c_cl_o", "image_sample_c_b_cl_o") or                 op in ("image_sample", "image_sample_lz", "image_sample_l", "image_sample_b", "image_sample_c_lz",
                     "image_sample_c_l", "image_sample_c", "image_sample_c_b", "image_sample_cl", "image_sample_b_cl", "image_sample_c_cl",
                     "image_sample_c_b_cl",
@@ -12489,9 +12489,10 @@ class Gen:
         if vdata["k"] != "vgpr":          # `off`, an SGPR or a constant where the VGPR range of the result goes
             raise Unsupported(op + " destination")
         addr = self.addr_regs(a[1])
-        if op == "image_sample_c_l":
+        if op in ("image_sample_c_l", "image_sample_c_l_o"):
             # Vulkan Dref returns one scalar. Other component masks require the depth view's swizzle.
-            if (dim != "dim:SQ_RSRC_IMG_2D" or dmask != 1 or len(addr) != (3 if a16 else 4)
+            want_addr = (4 if op == "image_sample_c_l_o" else 3) if a16 else (5 if op == "image_sample_c_l_o" else 4)
+            if (dim != "dim:SQ_RSRC_IMG_2D" or dmask != 1 or len(addr) != want_addr
                     or any(m not in (dim, dm, "a16", "d16") for m in mods)):
                 raise Unsupported(op + " needs scalar 2D depth comparison")
         img_idx = self.desc_lookup_sgpr(a[2], 8)
@@ -12789,7 +12790,7 @@ class Gen:
             else:
                 uv = self.tmp()
                 self.emit(f"{uv} = OpCompositeConstruct %v2float {f[0]} {f[1]}")
-            lod = f[ncoord] if kind == "_l" and len(f) > ncoord else "%f0"
+            lod = f[ncoord] if kind in ("_l", "_c_l") and len(f) > ncoord else "%f0"
             if typed_sample:
                 operands = f"Lod {lod}"
                 if typed_implicit:
@@ -12810,7 +12811,7 @@ class Gen:
                                       dmask, vdata, d16, sample)
                 return
             res = self.tmp()
-            if off is not None and kind not in ("", "_lz", "_l", "_b", "_c_lz", "_c", "_c_b"):
+            if off is not None and kind not in ("", "_lz", "_l", "_b", "_c_lz", "_c_l", "_c", "_c_b"):
                 raise Unsupported(op)
             implicit = kind in ("", "_b", "_c", "_c_b") and self.stage == "ps"
             # A min-LOD clamp (_cl): MinLod goes with the implicit-LOD forms and Grad. Without derivatives (outside the
@@ -13651,7 +13652,7 @@ class Gen:
             uvs = self.tmp()
             self.emit(f"{uvs} = OpVectorShuffle %v2float {uv} {uv} 0 1")
         level_f = None
-        if kind == "_l":
+        if kind in ("_l", "_c_l"):
             level_f = lod if lod is not None else "%f0"
         elif implicit:
             q, qx = self.tmp(), self.tmp()
