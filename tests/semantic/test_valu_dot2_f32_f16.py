@@ -319,5 +319,150 @@ class TestValuDot2F32F16SymbolicAST(unittest.TestCase):
             Operand.vgpr(-1)
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarRegisterState:
+    """Architectural register state for a single scalar thread."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+
+    def read_operand_32(self, op: Operand) -> int:
+        if op.reg_type == RegType.VGPR:
+            return self.vgprs[op.index] & MASK32
+        if op.reg_type == RegType.SGPR:
+            return self.sgprs[op.index] & MASK32
+        assert op.literal_value is not None
+        return op.literal_value & MASK32
+
+    def write_vgpr_32(self, index: int, val: int) -> None:
+        self.vgprs[index] = val & MASK32
+
+
+class ScalarInterpreter:
+    """Deterministic scalar interpreter executing v_dot2_f32_f16 instructions."""
+
+    def step(self, instr: VDot2F32F16Instruction, state: ScalarRegisterState) -> int:
+        s0 = state.read_operand_32(instr.src0)
+        s1 = state.read_operand_32(instr.src1)
+        s2 = state.read_operand_32(instr.src2)
+        res = ref_dot2_f32_f16_bits(s0, s1, s2, clamp=instr.clamp)
+        state.write_vgpr_32(instr.dst.index, res)
+        return res
+
+
+class TestValuDot2F32F16ScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction execution."""
+
+    def setUp(self) -> None:
+        self.state = ScalarRegisterState()
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_execution_from_vgprs(self) -> None:
+        # s0 in v1: (2.0, 3.0)
+        s0_val = pack_f16x2(f16_to_bits(2.0), f16_to_bits(3.0))
+        self.state.vgprs[1] = s0_val
+
+        # s1 in v2: (4.0, 5.0)
+        s1_val = pack_f16x2(f16_to_bits(4.0), f16_to_bits(5.0))
+        self.state.vgprs[2] = s1_val
+
+        # s2 in v3: 6.0f
+        s2_val = f32_to_bits(6.0)
+        self.state.vgprs[3] = s2_val
+
+        instr = VDot2F32F16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+
+        res_bits = self.interp.step(instr, self.state)
+        # Expected: 2*4 + 3*5 + 6 = 8 + 15 + 6 = 29.0
+        expected_bits = f32_to_bits(29.0)
+        self.assertEqual(res_bits, expected_bits)
+        self.assertEqual(self.state.vgprs[0], expected_bits)
+
+    def test_scalar_execution_with_sgpr_and_literal(self) -> None:
+        # s0 in v0: (1.5, -2.0)
+        s0_val = pack_f16x2(f16_to_bits(1.5), f16_to_bits(-2.0))
+        self.state.vgprs[0] = s0_val
+
+        # s1 in s4: (2.0, 3.0)
+        s1_val = pack_f16x2(f16_to_bits(2.0), f16_to_bits(3.0))
+        self.state.sgprs[4] = s1_val
+
+        # s2 literal: 10.0f
+        s2_lit = f32_to_bits(10.0)
+
+        instr = VDot2F32F16Instruction(
+            dst=Operand.vgpr(1),
+            src0=Operand.vgpr(0),
+            src1=Operand.sgpr(4),
+            src2=Operand.literal(s2_lit),
+        )
+
+        res_bits = self.interp.step(instr, self.state)
+        # 1.5*2.0 + (-2.0)*3.0 + 10.0 = 3.0 - 6.0 + 10.0 = 7.0
+        self.assertEqual(res_bits, f32_to_bits(7.0))
+
+    def test_multi_step_chained_accumulation(self) -> None:
+        """Step 1 produces float in v0; Step 2 feeds v0 as accumulator."""
+        s0_1 = pack_f16x2(f16_to_bits(1.0), f16_to_bits(1.0))
+        s1_1 = pack_f16x2(f16_to_bits(2.0), f16_to_bits(2.0))
+        self.state.vgprs[1] = s0_1
+        self.state.vgprs[2] = s1_1
+        self.state.vgprs[3] = f32_to_bits(0.0)
+
+        # v0 = (1,1) . (2,2) + 0 = 4.0
+        instr1 = VDot2F32F16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+        self.interp.step(instr1, self.state)
+        self.assertEqual(self.state.vgprs[0], f32_to_bits(4.0))
+
+        # v0 = (3,3) . (1,1) + v0 = 6.0 + 4.0 = 10.0
+        s0_2 = pack_f16x2(f16_to_bits(3.0), f16_to_bits(3.0))
+        s1_2 = pack_f16x2(f16_to_bits(1.0), f16_to_bits(1.0))
+        self.state.vgprs[4] = s0_2
+        self.state.vgprs[5] = s1_2
+
+        instr2 = VDot2F32F16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(4),
+            src1=Operand.vgpr(5),
+            src2=Operand.vgpr(0),
+        )
+        self.interp.step(instr2, self.state)
+        self.assertEqual(self.state.vgprs[0], f32_to_bits(10.0))
+
+    def test_scalar_determinism(self) -> None:
+        state_a = ScalarRegisterState()
+        state_b = ScalarRegisterState()
+        val_s0 = pack_f16x2(f16_to_bits(1.234), f16_to_bits(-0.567))
+        val_s1 = pack_f16x2(f16_to_bits(4.321), f16_to_bits(2.468))
+        state_a.vgprs[1] = val_s0
+        state_b.vgprs[1] = val_s0
+        state_a.sgprs[0] = val_s1
+        state_b.sgprs[0] = val_s1
+
+        instr = VDot2F32F16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.sgpr(0),
+            src2=Operand.literal(f32_to_bits(1.0)),
+        )
+        res_a = self.interp.step(instr, state_a)
+        res_b = self.interp.step(instr, state_b)
+        self.assertEqual(res_a, res_b)
+        self.assertEqual(state_a.vgprs, state_b.vgprs)
+
+
 if __name__ == "__main__":
     unittest.main()
