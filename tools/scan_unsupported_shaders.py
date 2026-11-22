@@ -38,7 +38,8 @@ except ImportError:
 # The floating-point ALU forms come from pixel_aot's own table, so the scanner cannot drift from it.
 PIXEL_ALU_NAMES = tuple(pixel_aot.ALU) if pixel_aot is not None else ()
 SUPPORTED_ALU = {f"v_{name}_f32" for name in PIXEL_ALU_NAMES}
-PIXEL_INTEGER_NAMES = tuple(f"v_{name}" for name in pixel_aot.INTEGER) if pixel_aot is not None and hasattr(pixel_aot, "INTEGER") else ()
+PIXEL_INTEGER = pixel_aot.INTEGER if pixel_aot is not None else {}
+INTEGER_SOURCE = r"(?:[vs]\d+|0x[0-9a-f]{1,8}|-?\d+(?:\.\d+)?)"
 
 SUPPORTED_INSTRUCTIONS_REGEX = [
     r"s_inst_prefetch\s+.*",
@@ -54,11 +55,14 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"v_interp_p[12]_f32_e32\s+v\d+,\s+v\d+,\s+attr0\.[xy]",
     r"image_sample\s+v\[\d+:\d+\],\s+v\[\d+:\d+\],\s+s\[\d+:\d+\],\s+s\[\d+:\d+\]\s+dmask:0xf\s+dim:SQ_RSRC_IMG_2D",
     r"v_(?:" + "|".join(map(re.escape, PIXEL_ALU_NAMES)) + r")_f32(?:_e32|_e64)?\s+v\d+,\s+.*",
-    r"(?:" + "|".join(map(re.escape, PIXEL_INTEGER_NAMES)) + r")(?:_e32|_e64)?\s+v\d+,\s+.*",
     r"v_cvt_pkrtz_f16_f32_e32\s+v\d+,\s+v\d+,\s+v\d+",
     r"exp\s+mrt0\s+v\d+,\s+v\d+,\s+v\d+,\s+v\d+\s+done\s+compr\s+vm",
     r"s_endpgm",
 ]
+
+for name, (arity, _) in PIXEL_INTEGER.items():
+    encoding = r"(?:_e32|_e64)?" if arity <= 2 else r"(?:_e64)?"
+    SUPPORTED_INSTRUCTIONS_REGEX.append(rf"v_{name}{encoding}\s+v\d+" + rf",\s*{INTEGER_SOURCE}" * arity)
 
 COMPILED_SUPPORTED_PATTERNS = [re.compile(f"^{p}$") for p in SUPPORTED_INSTRUCTIONS_REGEX]
 
@@ -109,7 +113,7 @@ KNOWN_RDNA2_BASE_OPCODES = {
 }
 
 
-KNOWN_RDNA2_BASE_OPCODES |= SUPPORTED_ALU | set(PIXEL_INTEGER_NAMES)
+KNOWN_RDNA2_BASE_OPCODES |= SUPPORTED_ALU | {f"v_{name}" for name in PIXEL_INTEGER}
 
 
 def is_opcode_recognized(opcode: str) -> bool:
