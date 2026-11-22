@@ -112,6 +112,16 @@ def ref_cvt_pk_u16_u32_decomposed(src0: int, src1: int) -> Tuple[int, int]:
     return u16_sat(src0), u16_sat(src1)
 
 
+def f32_to_bits(f: float) -> int:
+    """Convert Python float to IEEE 754 binary32 raw 32-bit integer."""
+    return struct.unpack("<I", struct.pack("<f", f))[0]
+
+
+def bits_to_f32(b: int) -> float:
+    """Convert raw 32-bit integer to IEEE 754 binary32 Python float."""
+    return struct.unpack("<f", struct.pack("<I", b & MASK32))[0]
+
+
 # ==============================================================================
 # Symbolic AST Opcode Definitions and Typed Expressions
 # ==============================================================================
@@ -982,6 +992,76 @@ class TestValuCvtPkU16U32StatusFlags(unittest.TestCase):
         # So only lanes that are multiples of 4 should match!
         expected_vcc = sum(1 << lane for lane in range(0, 32, 4))
         self.assertEqual(vcc_mask, expected_vcc)
+
+
+# ==============================================================================
+# Unit Tests: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestValuCvtPkU16U32IEEE754Bitpatterns(unittest.TestCase):
+    """Unit tests for IEEE 754 float bit pattern interactions with v_cvt_pk_u16_u32.
+    
+    In shaders, 32-bit registers frequently contain raw IEEE 754 bit patterns.
+    v_cvt_pk_u16_u32 interprets them as raw unsigned 32-bit integers without FP traps.
+    """
+
+    def test_ieee754_fp32_zeros(self) -> None:
+        pos_zero = f32_to_bits(0.0)    # 0x0000_0000
+        neg_zero = f32_to_bits(-0.0)   # 0x8000_0000
+        # +0.0 is 0 -> 0x0000
+        # -0.0 is 0x8000_0000 (2147483648 > 65535) -> saturates to 0xFFFF
+        packed = ref_cvt_pk_u16_u32(pos_zero, neg_zero)
+        self.assertEqual(packed, 0xFFFF_0000)
+
+    def test_ieee754_fp32_subnormals(self) -> None:
+        # Smallest positive single-precision subnormal (2^-149): 0x0000_0001
+        sub_min = 0x0000_0001
+        # Subnormal within 16-bit range: 0x0000_1234
+        sub_mid = 0x0000_1234
+        # Largest positive subnormal: 0x007F_FFFF (> 65535, saturates)
+        sub_max = 0x007F_FFFF
+
+        self.assertEqual(u16_sat(sub_min), 0x0001)
+        self.assertEqual(u16_sat(sub_mid), 0x1234)
+        self.assertEqual(u16_sat(sub_max), 0xFFFF)
+        self.assertEqual(ref_cvt_pk_u16_u32(sub_min, sub_mid), 0x1234_0001)
+
+    def test_ieee754_fp32_infinities_and_nans(self) -> None:
+        pos_inf = f32_to_bits(float("inf"))        # 0x7F80_0000
+        neg_inf = f32_to_bits(float("-inf"))       # 0xFF80_0000
+        qnan = 0x7FC0_0000                          # Quiet NaN
+        snan = 0x7F80_0001                          # Signaling NaN
+        neg_nan = 0xFFC0_0000                       # Negative Quiet NaN
+
+        # All of these exponents are >= 0x7F80_0000 > 65535, so they all saturate to 0xFFFF
+        for bitpattern in [pos_inf, neg_inf, qnan, snan, neg_nan]:
+            with self.subTest(pattern=hex(bitpattern)):
+                self.assertEqual(u16_sat(bitpattern), 0xFFFF)
+
+        self.assertEqual(ref_cvt_pk_u16_u32(pos_inf, qnan), 0xFFFF_FFFF)
+
+    def test_ieee754_fp16_packed_pairs(self) -> None:
+        # In shaders, half-precision (FP16) floats can be stored in the low 16 bits of a 32-bit VGPR:
+        # 1.0 in FP16 = 0x3C00 (15360 <= 65535)
+        # 2.0 in FP16 = 0x4000 (16384 <= 65535)
+        # -1.0 in FP16 = 0xBC00 (48128 <= 65535)
+        fp16_one = 0x3C00
+        fp16_two = 0x4000
+        fp16_neg_one = 0xBC00
+
+        # Packing two positive FP16 scalars into a packed FP16 vector:
+        packed_vec = ref_cvt_pk_u16_u32(fp16_one, fp16_two)
+        self.assertEqual(packed_vec, (fp16_two << 16) | fp16_one)
+
+        packed_neg = ref_cvt_pk_u16_u32(fp16_neg_one, fp16_one)
+        self.assertEqual(packed_neg, (fp16_one << 16) | fp16_neg_one)
+
+    def test_no_cpu_floating_point_exception_traps(self) -> None:
+        # Feeding signaling NaN, inf, division-by-zero bit patterns must never raise Python FP exceptions
+        trap_patterns = [0x7F80_0001, 0xFF80_0001, 0x7FFF_FFFF, 0xFFFF_FFFF]
+        for p in trap_patterns:
+            res = ref_cvt_pk_u16_u32(p, p)
+            self.assertEqual(res, 0xFFFF_FFFF)
 
 
 if __name__ == "__main__":
