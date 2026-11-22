@@ -38,6 +38,45 @@ def blob_with(records, elements):
     return blob
 
 
+def slot112(key, pos, rot):
+    """One 112-byte pair slot: u32 key, 12 zero bytes, pos (x,y,z,x), rot (x,y,z,x), 64 tail bytes."""
+    return (struct.pack("<I", key) + bytes(12)
+            + struct.pack("<4f", pos[0], pos[1], pos[2], pos[0])
+            + struct.pack("<4f", rot[0], rot[1], rot[2], rot[0])
+            + bytes(64))
+
+
+def psin_with_blocks(blocks):
+    """A minimal PSIN container: block table + blocks + one empty LGID section, no LSCH/LRSC.
+
+    blocks: [(kind, bytes)] in block-table order. Row 0 is the header's version/table_bytes dword pair,
+    exactly as in a measured container, so a block number of 1 is the first row.
+    Returns (blob, [base per block]).
+    """
+    rows = len(blocks)
+    pad_at = 8 + 16 * rows
+    pad_end = (pad_at + 15) & ~15
+    bases, at = [], pad_end
+    for _kind, data in blocks:
+        bases.append(at)
+        at += (len(data) + 15) & ~15
+    first = at
+    blob = bytearray(first + 8)
+    blob[0:4] = b"PSIN"
+    struct.pack_into(">I", blob, 4, first)
+    for index, (kind, data) in enumerate(blocks):
+        row = 8 + 16 * index
+        struct.pack_into("<II", blob, row, kind, len(data))
+        blob[row + 8:row + 16] = b"\xaa" * 8
+    struct.pack_into("<I", blob, pad_at, 0x70707070)
+    blob[pad_at + 4:pad_end] = b"\x70" * (pad_end - pad_at - 4)
+    for (_kind, data), base in zip(blocks, bases):
+        blob[base:base + len(data)] = data
+    blob[first:first + 4] = b"LGID"
+    struct.pack_into(">I", blob, first + 4, 8)
+    return bytes(blob), bases
+
+
 def good_element(archetype=0x11223344, pos=(1.5, -2.25, 3.75), rot=(0.25, 0.5, -0.75),
                  link=0x55667788, extra=0):
     return element(archetype, pos, rot, link, extra=extra)
@@ -110,6 +149,23 @@ class TestElement(unittest.TestCase):
         second = by_archetype[0x99887766]
         self.assertEqual([round(value, 4) for value in second["pos"]], [-10.0, 20.0, 30.0])
 
+    def test_resolves_later_slots_when_first_slot_is_missing(self) -> None:
+        blob = blob_with(
+            [(0x100, record(0x11111111, 7, 0x180, 2)),
+             (0x120, record(0x22222222, 7, 0x200, 1))],
+            [(0x1C0, good_element(archetype=0xAABBCCDD, pos=(10.0, 20.0, 30.0))),
+             (0x200, good_element(archetype=0x99887766))],
+        )
+
+        result = M.parse_blob(bytes(blob), "missing-first-slot.bin")
+
+        self.assertEqual((result["records"], result["entities"]), (2, 2))
+        self.assertEqual(result["skipped_slots"], 1)
+        self.assertEqual(result["unresolved_records"], 0)
+        first = result["entity_list"][0]
+        self.assertEqual((first["offset"], first["archetype"], first["pos"]),
+                         (0x1C0, 0xAABBCCDD, [10.0, 20.0, 30.0]))
+
     def test_mismatched_duplicated_position_is_not_an_entity(self):
         broken = bytearray(good_element(archetype=0xDEADBEEF, link=0x00000001))
         struct.pack_into("<I", broken, 0x1C, 0x7FC00000)  # pos.x copy no longer equals pos.x
@@ -150,6 +206,70 @@ class TestElement(unittest.TestCase):
         self.assertEqual(result["entity_list"][0]["extra"], 0xFEEDFACE)
 
 
+class TestBlockIndexed(unittest.TestCase):
+    """The third resolution: kind is a 1-based block number and the u64 at +16 is a PSIN pointer."""
+
+    def test_stride_comes_from_the_chunk_slices(self):
+        blocks = [(0x11, 0x100, 0x1000), (0x22, 0x1100, 0x1000)]
+        records = [
+            {"kind": 2, "band": 0, "poolOffset": 0x0000, "count": 2},
+            {"kind": 2, "band": 0, "poolOffset": 0x0E00, "count": 2},
+        ]
+        # 0x0E00 >> 4 = 0xE0 = 2 * 112, so the two slices tile the block at a 112-byte stride.
+        self.assertEqual(M.chunk_stride(records, blocks), 112)
+        self.assertIsNone(M.chunk_stride(records, []))
+        broken = [dict(records[0], count=5), dict(records[1])]   # 0xC0 / 5 is not an integer
+        self.assertIsNone(M.chunk_stride(broken, blocks))
+
+    def test_band_carries_the_offset_high_bits(self):
+        blocks = [(0x11, 0x0000, 0x40), (0x22, 0x0040, 0x40), (0x33, 0x0080, 0x2000)]
+        blob = bytearray(0x2100)
+        base = blocks[2][1]
+        blob[base + 0x1070:base + 0x1070 + 112] = slot112(0xAAAA0001, (1.0, 2.0, 3.0), (0.1, 0.2, 0.3))
+        blob[base + 0x10E0:base + 0x10E0 + 112] = slot112(0xAAAA0002, (4.0, 5.0, 6.0), (0.4, 0.5, 0.6))
+        elements = M.scan_elements(bytes(blob), len(blob))
+        record = {"kind": 3, "band": 1, "poolOffset": 0x0700, "count": 2}   # 0x1070, not 0x0070
+        found, mode, skipped = M.resolve(record, elements, None, blocks, 112)
+        self.assertEqual(mode, "block")
+        self.assertEqual(len(found), 2)
+        self.assertEqual(skipped, 0)
+        self.assertEqual([address for address, _element in found], [base + 0x1070, base + 0x10E0])
+
+    def test_block_indexed_slots_resume_after_the_first_slot(self) -> None:
+        blocks = [(0x11, 0x100, 0x1000)]
+        record = {"kind": 1, "band": 0, "poolOffset": 0, "count": 2}
+        address = 0x100 + 112
+        entity = {"pos": [1.0, 2.0, 3.0], "archetype": 0x1000}
+
+        found, mode, skipped = M.resolve(record, {address: entity}, None, blocks, 112)
+
+        self.assertEqual((found, mode, skipped), ([(address, entity)], "block", 1))
+
+    def test_psin_container_resolves_a_112_byte_slot_array(self):
+        slots = bytearray(0x1240)
+        for index, (position, rotation) in enumerate((
+                ((1.0, 2.0, 3.0), (0.1, 0.2, 0.3)),
+                ((4.0, 5.0, 6.0), (0.4, 0.5, 0.6)),
+                ((7.0, 8.0, 9.0), (0.7, 0.8, 0.9)),
+                ((-1.0, -2.0, -3.0), (-0.1, -0.2, -0.3)))):
+            at = 0x1070 + index * 112
+            slots[at:at + 112] = slot112(0x1000 + index, position, rotation)
+        block_records = (record(0x11111111, 3, 0x0700, 2, band=1)     # byte offset 0x1070
+                         + record(0x22222222, 3, 0x1500, 2, band=1))    # byte offset 0x1150
+        blob, bases = psin_with_blocks([(0x11111111, bytes(0x20)),
+                                        (0x22222222, block_records),
+                                        (0x33333333, bytes(slots))])
+        result = M.parse_blob(blob, "block-indexed.bin")
+        self.assertEqual(result["record_blocks"], 1)
+        self.assertEqual(result["records"], 2)
+        self.assertEqual(result["unresolved_records"], 0)
+        self.assertEqual(result["skipped_slots"], 0)
+        self.assertEqual(result["entities"], 4)
+        self.assertEqual([entity["offset"] for entity in result["entity_list"]],
+                         [bases[2] + 0x1070, bases[2] + 0x10E0,
+                          bases[2] + 0x1150, bases[2] + 0x11C0])
+
+
 class TestBrokenInput(unittest.TestCase):
     def test_truncated_element_is_skipped_without_a_crash(self):
         blob = blob_with(
@@ -185,6 +305,16 @@ class TestBrokenInput(unittest.TestCase):
         self.assertEqual(result["unresolved_records"], 1)
         self.assertEqual(result["entity_list"][0]["archetype"], 0xABCDEF01)
         self.assertIn(0x22222222, {state["key"] for state in result["states"]})
+
+    def test_rejected_lone_record_does_not_skip_adjacent_table(self):
+        # 24-byte prefix + valid 2-record chunk at +0x18: bytes 0x00..0x1F decode as a rejected lone
+        # false positive, so advancing by 32 bytes instead of 4 used to jump past +0x18 and drop the table.
+        prefix = struct.pack("<6I", 0x12345678, 0, 0, 0, 0x99990001, 0)
+        rec0 = struct.pack("<8I", 0x00010001, 0, 1, 0, (0x0000 << 16) | 3, 0, (1 << 16) | 1, 0)
+        rec1 = struct.pack("<8I", 0x11223344, 0, 1, 0, (0x0080 << 16) | 3, 0, (1 << 16) | 1, 0)
+        result = M.parse_blob(prefix + rec0 + rec1, "after_false_positive.bin")
+        self.assertEqual(result["chunks"], 1)
+        self.assertEqual(result["records"], 2)
 
 
 class TestCli(unittest.TestCase):
