@@ -1,6 +1,8 @@
 """End-to-end CLI checks with locally compiled PE fixtures. Never load a fixture."""
 
+from contextlib import redirect_stderr, redirect_stdout
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -13,6 +15,7 @@ import pefile
 
 TOOLS = Path(__file__).resolve().parents[2] / "tools"
 sys.path.insert(0, str(TOOLS))
+from intake_exe import main as intake_main
 from pe_inventory import scan
 
 
@@ -44,12 +47,24 @@ def check(folder, fixture, provider):
     original = baseline.read_bytes()
     reports = folder / "reports"
 
+    cli_checked = False
+
     def run(expected_exit, *args):
+        nonlocal cli_checked
         before = set(reports.glob("*.json"))
-        result = subprocess.run([sys.executable, "-B", str(TOOLS / "intake_exe.py"), "--build", str(root),
-                                 "--baseline", str(baseline), "--integrity", str(integrity),
-                                 "--reports", str(reports), *args], capture_output=True, text=True)
-        assert result.returncode == expected_exit, (result.stdout, result.stderr)
+        cli_args = ["--build", str(root), "--baseline", str(baseline), "--integrity", str(integrity),
+                    "--reports", str(reports), *map(str, args)]
+        if not cli_checked:
+            result = subprocess.run([sys.executable, "-B", str(TOOLS / "intake_exe.py"), *cli_args],
+                                    capture_output=True, text=True)
+            code, out, err = result.returncode, result.stdout, result.stderr
+            cli_checked = True
+        else:
+            out_buf, err_buf = io.StringIO(), io.StringIO()
+            with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                code = intake_main(cli_args)
+            out, err = out_buf.getvalue(), err_buf.getvalue()
+        assert code == expected_exit, (out, err)
         new, = set(reports.glob("*.json")) - before
         assert baseline.read_bytes() == original
         return json.loads(new.read_text(encoding="utf-8"))
@@ -119,6 +134,26 @@ def check(folder, fixture, provider):
     peer.unlink()
     assert repeated["entry_import_gaps"]
     assert all(r["seen_unresolved_in_baseline"] for r in repeated["entry_import_gaps"])
+    # pefile skips import names outside letters, digits and ._?@$()<>, and drops a descriptor
+    # left empty. A same-length rename keeps the image layout and must keep both edges.
+    renamed = folder / "renamed-imports.exe"
+    with pefile.PE(str(fixture)) as pe:
+        targets = [s for d in pe.DIRECTORY_ENTRY_IMPORT + pe.DIRECTORY_ENTRY_DELAY_IMPORT
+                   for s in d.imports if s.name in (b"named_value", b"delayed_value")]
+        assert len(targets) == 2
+        for s in targets:
+            pe.set_bytes_at_offset(s.name_offset, s.name.replace(b"_", b"-"))
+        pe.write(str(renamed))
+    renamed_report = run(0, renamed)
+    renamed_edges = {(r["kind"], r["dll"], r["symbol"]) for r in renamed_report["inventory"]["imports"]
+                     if r["image"] == slot}
+    assert renamed_edges == set(edges) - {("normal", provider.name, "named_value"),
+                                          ("delay", "intake_delay.dll", "delayed_value")} | {
+        ("normal", provider.name, "named-value"), ("delay", "intake_delay.dll", "delayed-value")}
+    renamed_gaps = {(r["kind"], r["dll"], r["symbol"]) for r in renamed_report["entry_import_gaps"]}
+    assert {("normal", provider.name, "named-value"), ("delay", "intake_delay.dll", "delayed-value")} <= renamed_gaps
+    mismatch, = [f for f in renamed_report["dependency_paths"]["findings"] if f.get("symbol") == "named-value"]
+    assert mismatch["problem"] == "bundled_export_missing" and mismatch["candidates"] == [provider.name]
     truncated = folder / "truncated.exe"
     truncated.write_bytes(fixture.read_bytes()[:-256])
     assert "Section extends" in run(2, truncated)["error"]
@@ -128,6 +163,29 @@ def check(folder, fixture, provider):
         pe.set_qword_at_rva(table_va - pe.OPTIONAL_HEADER.ImageBase, 1)
         pe.write(str(bad_tls))
     assert "RVA" in run(2, bad_tls)["error"]
+    # Windows locates the TLS directory by VirtualAddress alone and ignores Size.
+    for size in (0, 39):
+        small_tls = folder / f"tls-size-{size}.exe"
+        with pefile.PE(str(fixture), fast_load=True) as pe:
+            pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].Size = size
+            pe.write(str(small_tls))
+        small_report = run(0, small_tls)
+        assert small_report["pe"]["tls"] == report["pe"]["tls"]
+        assert small_report["pe"]["startup"]["locations"] == locations
+    zero_tls_addr = folder / "tls-zero-addr.exe"
+    with pefile.PE(str(fixture), fast_load=True) as pe:
+        pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].VirtualAddress = 0
+        pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].Size = 40
+        pe.write(str(zero_tls_addr))
+    zero_tls_report = run(0, zero_tls_addr)
+    assert zero_tls_report["pe"]["tls"] is None
+    assert [loc["role"] for loc in zero_tls_report["pe"]["startup"]["locations"]] == ["entry"]
+    oob_tls = folder / "tls-oob.exe"
+    with pefile.PE(str(fixture), fast_load=True) as pe:
+        pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].VirtualAddress = pe.OPTIONAL_HEADER.SizeOfImage - 16
+        pe.OPTIONAL_HEADER.DATA_DIRECTORY[9].Size = 0
+        pe.write(str(oob_tls))
+    assert "RVA" in run(2, oob_tls)["error"]
     staged = root / "incoming.exe"
     shutil.copyfile(fixture, staged)
     assert run(0, staged)["diff"]["added_images"] == [slot]
@@ -137,6 +195,45 @@ def check(folder, fixture, provider):
     assert "occupies" in run(2, fixture)["error"]
     torrent.write_bytes(b"different")
     assert "Torrent hash differs" in run(2)["error"]
+    check_modified_directory(folder, fixture, provider)
+
+
+def check_modified_directory(folder, fixture, provider):
+    """Scan a synthetic directory twice after replacing a DLL in place and adding a new DLL."""
+    synth_root = folder / "synth-pkg"
+    synth_system = folder / "synth-sys"
+    synth_root.mkdir()
+    synth_system.mkdir()
+    shutil.copyfile(Path(os.environ["SystemRoot"]) / "System32" / "apisetschema.dll",
+                    synth_system / "apisetschema.dll")
+    shutil.copyfile(fixture, synth_root / "main.exe")
+    tampered = bytearray(provider.read_bytes())
+    pos = tampered.index(b"named_value\0")
+    tampered[pos:pos + 11] = b"other_value"
+    sys_provider = synth_system / provider.name
+    pkg_provider = synth_root / provider.name
+    sys_provider.write_bytes(tampered)
+    pkg_provider.write_bytes(tampered)
+
+    first = scan(synth_root, system=synth_system)
+    first_edges = {(r["kind"], r["dll"], r["symbol"]): r for r in first["imports"] if r["image"] == "main.exe"}
+    assert first_edges["normal", provider.name.lower(), "named_value"]["desktop_export"] == "export_not_found"
+    assert first_edges["normal", provider.name.lower(), "named_value"]["bundle_exports_in"] == []
+    assert first_edges["delay", "intake_delay.dll", "delayed_value"]["desktop_export"] == "provider_not_found"
+
+    # Replace intake_provider.dll at the exact same path and add a new DLL (intake_delay.dll) to both directories.
+    sys_provider.write_bytes(provider.read_bytes())
+    pkg_provider.write_bytes(provider.read_bytes())
+    delay_fixture = provider.parent / "intake_delay.dll"
+    shutil.copyfile(delay_fixture, synth_system / "intake_delay.dll")
+    shutil.copyfile(delay_fixture, synth_root / "intake_delay.dll")
+
+    second = scan(synth_root, system=synth_system)
+    second_edges = {(r["kind"], r["dll"], r["symbol"]): r for r in second["imports"] if r["image"] == "main.exe"}
+    assert second_edges["normal", provider.name.lower(), "named_value"]["desktop_export"] == "export_present"
+    assert second_edges["normal", provider.name.lower(), "named_value"]["bundle_exports_in"] == [provider.name]
+    assert second_edges["delay", "intake_delay.dll", "delayed_value"]["desktop_export"] == "export_present"
+    assert second_edges["delay", "intake_delay.dll", "delayed_value"]["bundle_exports_in"] == ["intake_delay.dll"]
 
 
 if __name__ == "__main__":

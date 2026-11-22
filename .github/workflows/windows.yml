@@ -19,12 +19,15 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+      - name: Check the GPU report summary and submit path
+        run: python3 -B tests/gpu_report_format_check.py
       - name: Check machine-code inputs with LLVM 15
         run: |
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends llvm-15
           python3 -B tests/pixel_aot_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
           python3 -B tests/ffx_dispatch_aot_check.py llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+          LLVM_LIB=libLLVM-15.so.1 LLVM_MC=llvm-mc-15 LLVM_OBJCOPY=llvm-objcopy-15 python3 -B tests/rdna2_tools_check.py
   python-linux:
     name: Run platform-independent Python checks on Linux
     runs-on: ubuntu-24.04
@@ -41,11 +44,23 @@ jobs:
       - name: Run Python checks
         run: |
           python -B tests/script_state_check.py
+          python -B tests/resource_root_check.py
           python -B tests/bcpack_check.py
+          python -B tests/bc7_blocks_check.py
+          python -B tests/form_coverage_check.py
           python -B tests/resource_ranges_check.py
+          python -B tests/awc_metadata_check.py
+          python -B tests/sgd5_effects_check.py
           python -B tests/dxcontainer_part_offsets_check.py
           python -B tests/layout_chunks_check.py
+          python -B tests/dependency_paths_check.py
           python -B tests/intake/paths_check.py
+          python -B tests/shader_probe_check.py
+          python -B tests/dxil_retarget_check.py
+          python -B tests/rdna2_tools_check.py
+          python -B tests/pso_readiness_check.py
+          python -B tests/docs_links_check.py
+          python -B tests/bidi_controls_check.py
   build-and-test:
     name: Build and test on Windows
     runs-on: windows-2025

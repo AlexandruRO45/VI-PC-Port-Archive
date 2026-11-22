@@ -8,11 +8,13 @@ from iced_x86 import Decoder, MemorySizeExt, Mnemonic as M, OpKind as K, Registe
 
 from cpu_leaf_aot import export_rva
 from cpu_ranges import function_ranges, image_bytes
+import x87_lower
 
 
 LOADER = "431bdd2e26c0c8214fd7601140eb9fe6d8a249f5000539453a9a9b6a0b7c0ee8"
 UPSCALER = "faff02f294a7e9149ce079dffe3dedbcabe99b1f180ab14222aa8689e00a75fa"
 REGS = {getattr(R, n.upper()): n for n in "rax rbx rcx rdx rsi rdi rbp rsp r8 r9 r10 r11 r12 r13 r14 r15".split()}
+HIGH_BYTE = {R.AH, R.BH, R.CH, R.DH}
 UINT = {1: "uint8_t", 2: "uint16_t", 4: "uint32_t", 8: "uint64_t"}
 
 INTEGER_HEADER = """#include <array>
@@ -44,11 +46,13 @@ def region(pe, start, end):
     return ins
 
 
-def lower(body, initial, globals_, calls, exits, *, host_ops=None):
+def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
     """Emit only query integer operations. All external edges and calls need named bindings."""
     lines = ["word frame[16]{};", "word " + ", ".join(r + "=0" for r in REGS.values()) + ";",
              "bool zero=false, carry=false;", "rsp = reinterpret_cast<word>(frame);", *initial]
     allowed = {i.ip for i in body} | set(exits)
+    # The x87 profile checks every x87 instruction of the body before any of it is lowered.
+    x87_depth = x87_lower.depths(body, exits) if x87 and any(map(x87_lower.is_x87, body)) else None
     xmm = {R.XMM0: "xmm0", R.XMM1: "xmm1", R.XMM2: "xmm2"}
     has_xmm_math = any(i.mnemonic in (M.VMOVDQU, M.VPSRLDQ, M.VMOVD)
                        or (i.mnemonic == M.VPADDD and i.op2_kind != K.MEMORY) for i in body)
@@ -67,19 +71,28 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
 
         def address():
             if i.is_ip_rel_memory_operand:
+                if i.memory_base == R.EIP:
+                    # The hardware adds the low 32 bits of the runtime RIP; an RVA binding cannot model that.
+                    raise ValueError(f"unsupported EIP-relative operand at {i.ip:#x}: {i}")
                 return globals_[i.ip_rel_memory_address]
             terms = []
+            addr32 = False
             if i.memory_base != R.NONE:
+                addr32 |= RegisterExt.size(i.memory_base) == 4
                 terms.append(reg(i.memory_base))
             if i.memory_index != R.NONE:
+                addr32 |= RegisterExt.size(i.memory_index) == 4
                 terms.append(f"{reg(i.memory_index)} * {i.memory_index_scale}ull")
             terms.append(f"{i.memory_displacement}ull")
-            return " + ".join(terms)
+            expr = " + ".join(terms)
+            return f"static_cast<uint32_t>({expr})" if addr32 else expr
 
         def operand(n):
             kind = i.op_kind(n)
             if kind == K.REGISTER:
                 register = i.op_register(n)
+                if register in HIGH_BYTE:
+                    return f"static_cast<uint8_t>({reg(register)} >> 8)"
                 return f"static_cast<{UINT[RegisterExt.size(register)]}>({reg(register)})"
             if kind == K.MEMORY:
                 return f"load<{UINT[MemorySizeExt.size(i.memory_size)]}>({address()})"
@@ -89,6 +102,8 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             if i.op0_kind == K.MEMORY:
                 return f"store<{UINT[MemorySizeExt.size(i.memory_size)]}>({address()}, {expr});"
             dest = i.op0_register
+            if dest in HIGH_BYTE:
+                return f"{reg(dest)} = ({reg(dest)} & ~0xff00ull) | (static_cast<word>(static_cast<uint8_t>({expr})) << 8);"
             size = RegisterExt.size(dest)
             value = f"static_cast<{UINT[size]}>({expr})"
             if size < 4:
@@ -97,6 +112,10 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
 
         if host_ops and i.ip in host_ops:
             stmt = host_ops[i.ip]
+        elif i.segment_prefix in (R.FS, R.GS) or i.has_lock_prefix:
+            # FS/GS select a thread block base and LOCK makes the access atomic;
+            # the flat loads and stores below would silently drop both.
+            raise ValueError(f"unsupported instruction prefix at {i.ip:#x}: {i}")
         elif op in (M.JE, M.JNE, M.JAE, M.JA, M.JB, M.JBE, M.JMP):
             target = i.near_branch_target
             if target not in allowed:
@@ -116,8 +135,18 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             stmt = write(f"(carry || zero) ? {operand(1)} : {operand(0)}")
         elif op == M.LEA:
             stmt = write(address())
+        elif op == M.MOVBE:
+            # One operand is memory and the other a register of the same width; the bytes are reversed in
+            # either direction, no flag changes, and a 16-bit register destination keeps its upper bits.
+            width = UINT[MemorySizeExt.size(i.memory_size)]
+            stmt = (f"{{ const {width} a = {operand(1)}; {width} v = 0; "
+                    f"for (unsigned k = 0; k < sizeof v; ++k) v = static_cast<{width}>((v << 8) | ((a >> (8 * k)) & 0xffu)); "
+                    f"{write('v')} }}")
         elif op == M.CMP:
-            stmt = f"zero = ({operand(0)} == {operand(1)}); carry = ({operand(0)} < {operand(1)});"
+            # Sign-extended immediates arrive as 64-bit values; compare at the destination width.
+            width = UINT[MemorySizeExt.size(i.memory_size) if i.op0_kind == K.MEMORY else RegisterExt.size(i.op0_register)]
+            stmt = (f"{{ const {width} a = {operand(0)}, b = static_cast<{width}>({operand(1)}); "
+                    f"zero = a == b; carry = a < b; }}")
         elif op == M.TEST:
             stmt = f"zero = (({operand(0)} & {operand(1)}) == 0); carry = false;"
         elif op == M.IMUL and i.op_count in (2, 3) and RegisterExt.size(i.op0_register) == 4:
@@ -133,7 +162,8 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             shift, last = ("<<", bits-count) if op == M.SHL else (">>", count-1)
             lhs = f"int{bits}_t(a)" if op == M.SAR else "a"
             stmt = (f"{{ const {UINT[size]} a = {operand(0)}, v = {lhs} {shift} {count}; "
-                    f"carry = ((a >> {last}) & 1) != 0; zero = v == 0; {write('v')} }}") if count else ";"
+                    f"carry = ((a >> {last}) & 1) != 0; zero = v == 0; {write('v')} }}") if count else \
+                write(operand(0))  # A masked zero count keeps the flags but still zero-extends a 32-bit destination.
         elif op in (M.ADD, M.AND, M.OR, M.XOR, M.INC, M.DEC, M.SUB, M.SBB):
             operator = {M.ADD: "+", M.INC: "+", M.DEC: "-", M.AND: "&", M.OR: "|", M.XOR: "^", M.SUB: "-", M.SBB: "-"}[op]
             rhs = "1" if op in (M.INC, M.DEC) else operand(1)
@@ -143,6 +173,65 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
                       M.INC: "", M.DEC: "", M.XOR: "carry = false;", M.AND: "carry = false;", M.OR: "carry = false;"}[op]
             stmt = (f"{{ const {width} a = {operand(0)}, b = static_cast<{width}>({rhs}); "
                     f"const {width} v = static_cast<{width}>({expr}); {update} zero = v == 0; {write('v')} }}")
+        elif op in (M.ANDN, M.BEXTR, M.BLSI, M.BLSMSK, M.BLSR, M.TZCNT) and RegisterExt.size(i.op0_register) in (4, 8):
+            size = RegisterExt.size(i.op0_register)
+            width, bits = UINT[size], 8 * size
+            if op == M.ANDN:
+                stmt = (f"{{ const {width} v = static_cast<{width}>(~static_cast<{width}>({operand(1)}) "
+                        f"& static_cast<{width}>({operand(2)})); carry = false; zero = v == 0; {write('v')} }}")
+            elif op == M.BEXTR:
+                stmt = (f"{{ const {width} a = {operand(1)}, ctrl = {operand(2)}; "
+                        f"const unsigned start = static_cast<unsigned>(ctrl & 0xffu), "
+                        f"len = static_cast<unsigned>((ctrl >> 8) & 0xffu); "
+                        f"{width} v = 0; if (start < {bits}u && len > 0u) {{ "
+                        f"const {width} s = a >> start; "
+                        f"v = len >= {bits}u ? s : static_cast<{width}>(s & ((static_cast<{width}>(1) << len) - 1)); }} "
+                        f"carry = false; zero = v == 0; {write('v')} }}")
+            elif op == M.BLSI:
+                stmt = (f"{{ const {width} a = {operand(1)}, v = static_cast<{width}>(a & (static_cast<{width}>(0) - a)); "
+                        f"carry = a != 0; zero = v == 0; {write('v')} }}")
+            elif op == M.BLSMSK:
+                stmt = (f"{{ const {width} a = {operand(1)}, v = static_cast<{width}>(a ^ (a - 1)); "
+                        f"carry = a == 0; zero = false; {write('v')} }}")
+            elif op == M.BLSR:
+                stmt = (f"{{ const {width} a = {operand(1)}, v = static_cast<{width}>(a & (a - 1)); "
+                        f"carry = a == 0; zero = v == 0; {write('v')} }}")
+            else:  # M.TZCNT
+                stmt = (f"{{ const {width} a = {operand(1)}; {width} v = 0; "
+                        f"if (a == 0) {{ v = {bits}; }} else {{ while (((a >> v) & 1) == 0) ++v; }} "
+                        f"carry = a == 0; zero = v == 0; {write('v')} }}")
+        elif (op in (M.ROL, M.ROR) and i.op0_kind == K.REGISTER and RegisterExt.size(i.op0_register) in (4, 8)
+              and (i.op1_kind == K.IMMEDIATE8 or i.op1_register == R.CL)):
+            size = RegisterExt.size(i.op0_register)
+            width, bits = UINT[size], 8 * size
+            if i.op1_kind == K.IMMEDIATE8 and (i.immediate(1) & (bits - 1)) == 0:
+                stmt = write(operand(0))
+            else:
+                count_expr = f"{i.immediate(1) & (bits - 1)}u" if i.op1_kind == K.IMMEDIATE8 else f"static_cast<unsigned>(rcx) & {bits - 1}u"
+                if op == M.ROL:
+                    stmt = (f"{{ const {width} a = {operand(0)}; const unsigned c = {count_expr}; "
+                            f"{width} v = a; if (c != 0u) {{ v = static_cast<{width}>((a << c) | (a >> ({bits}u - c))); "
+                            f"carry = (v & 1u) != 0; }} {write('v')} }}")
+                else:  # M.ROR
+                    stmt = (f"{{ const {width} a = {operand(0)}; const unsigned c = {count_expr}; "
+                            f"{width} v = a; if (c != 0u) {{ v = static_cast<{width}>((a >> c) | (a << ({bits}u - c))); "
+                            f"carry = ((v >> {bits - 1}u) & 1u) != 0; }} {write('v')} }}")
+        elif (op in (M.SHLD, M.SHRD) and i.op0_kind == K.REGISTER and RegisterExt.size(i.op0_register) in (4, 8)
+              and (i.op2_kind == K.IMMEDIATE8 or i.op2_register == R.CL)):
+            size = RegisterExt.size(i.op0_register)
+            width, bits = UINT[size], 8 * size
+            if i.op2_kind == K.IMMEDIATE8 and (i.immediate(2) & (bits - 1)) == 0:
+                stmt = write(operand(0))
+            else:
+                count_expr = f"{i.immediate(2) & (bits - 1)}u" if i.op2_kind == K.IMMEDIATE8 else f"static_cast<unsigned>(rcx) & {bits - 1}u"
+                if op == M.SHLD:
+                    stmt = (f"{{ const {width} a = {operand(0)}, b = {operand(1)}; const unsigned c = {count_expr}; "
+                            f"{width} v = a; if (c != 0u) {{ v = static_cast<{width}>((a << c) | (b >> ({bits}u - c))); "
+                            f"carry = ((a >> ({bits}u - c)) & 1u) != 0; zero = v == 0; }} {write('v')} }}")
+                else:  # M.SHRD
+                    stmt = (f"{{ const {width} a = {operand(0)}, b = {operand(1)}; const unsigned c = {count_expr}; "
+                            f"{width} v = a; if (c != 0u) {{ v = static_cast<{width}>((a >> c) | (b << ({bits}u - c))); "
+                            f"carry = ((a >> (c - 1u)) & 1u) != 0; zero = v == 0; }} {write('v')} }}")
         elif op in (M.VMOVQ, M.VMOVSD, M.VMOVHPD) and has_wide:
             lanes = {R.XMM0: "wide0", R.XMM1: "wide1", R.XMM2: "wide2"}
             if i.op1_kind == K.MEMORY and op != M.VMOVHPD:
@@ -189,8 +278,17 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             stmt = write("zero")
         elif op == M.CALL:
             stmt = calls[i.ip]
+        elif op == M.XLATB:
+            # AL = [RBX + AL]: iced names AL as the index, and address() would add all of RAX. The sum
+            # wraps at 32 bits under 67h (base EBX). The flags and bits 8 to 63 of RAX are unchanged.
+            table = f"{reg(i.memory_base)} + static_cast<uint8_t>(rax)"
+            if RegisterExt.size(i.memory_base) == 4:
+                table = f"static_cast<uint32_t>({table})"
+            stmt = f"rax = (rax & ~0xffull) | load<uint8_t>({table});"
         elif op == M.RET:
             stmt = "return rax;"
+        elif x87_depth is not None and op in x87_lower.X87_OPS:
+            stmt = x87_lower.statement(i, x87_depth[i.ip], address)
         else:
             raise ValueError(f"unsupported query operation at {i.ip:#x}: {i}")
         lines.append(f"block_{i.ip:x}: {stmt}")
@@ -199,6 +297,8 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None):
             if i.next_ip not in allowed:
                 raise ValueError(f"unbound fallthrough at {i.ip:#x}")
             lines.append(f"goto block_{i.next_ip:x};")
+    if x87_depth is not None:
+        lines.insert(3, x87_lower.DECLARATION)
     lines.extend(f"block_{target:x}: {statement}" for target, statement in exits.items())
     return "\n".join("    " + line for line in lines)
 

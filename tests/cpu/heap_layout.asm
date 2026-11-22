@@ -73,4 +73,21 @@ out_of_heap:
     mov eax,0ffffffffh
     ret
 view_offset ENDP
+
+; Compare 32-bit registers with sign-extended 8-bit immediates.
+index_guard PROC FRAME
+    .endprolog
+    mov eax,ecx
+    cmp ecx,-1
+    je no_index
+    cmp ecx,-3
+    jae reserved_index
+    ret
+no_index:
+    xor eax,eax
+    ret
+reserved_index:
+    mov eax,1
+    ret
+index_guard ENDP
 END

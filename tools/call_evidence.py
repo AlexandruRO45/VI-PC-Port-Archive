@@ -12,7 +12,7 @@ import subprocess
 import pefile
 
 from pe_inventory import EXPERIMENTS
-from resource_inventory import dxil_program
+from resource_inventory import dxil_program, parts as container_parts
 
 NAMES = ("Bink2Scarlett.dll", "XboxBvhBuilder.dll", "amd_fidelityfx_upscaler_xbox.dll")
 INSTRUCTION = re.compile(r"^\s*([\dA-F]{16}):\s+(\w+)\s+(.*)$", re.I)
@@ -36,6 +36,17 @@ def instruction_refs(path, base):
     return memory, branches
 
 
+def _mapped_rva(pe, offset, length):
+    section = pe.get_section_by_offset(offset)
+    if section is None or not section.PointerToRawData:
+        return None
+    rel = offset - section.PointerToRawData
+    limit = min(section.SizeOfRawData, section.Misc_VirtualSize) if section.Misc_VirtualSize else section.SizeOfRawData
+    if rel < 0 or rel + length > limit:
+        return None
+    return section.VirtualAddress + rel
+
+
 def shader_containers(data, pe, memory):
     base = pe.OPTIONAL_HEADER.ImageBase
     rows = []
@@ -46,33 +57,34 @@ def shader_containers(data, pe, memory):
         version, size, count = struct.unpack_from("<3I", data, off + 20)
         if version != 1 or not 1 <= count <= 128 or not 32 + count * 4 <= size <= len(data) - off:
             continue
-        parts, root = [], None
-        end = 32 + count * 4
-        for i in range(count):
-            rel, = struct.unpack_from("<I", data, off + 32 + i * 4)
-            if rel < end or rel + 8 > size:
-                break
-            tag, length = struct.unpack_from("<4sI", data, off + rel)
-            end = rel + 8 + length
-            if end > size:
-                break
-            parts.append(tag.decode("ascii", "replace"))
-            if tag == b"RTS0" and length >= 24:
-                ver, nparam, _, nsampler, _, flags = struct.unpack_from("<6I", data, off + rel + 8)
-                root = dict(version=ver, parameter_count=nparam, static_sampler_count=nsampler, flags=hex(flags))
-        else:
-            rva = pe.get_rva_from_offset(off)
-            refs = []
-            for ref in re.finditer(re.escape(struct.pack("<Q", base + rva)), data):
-                pos = ref.start()
-                if pos >= 8 and struct.unpack_from("<I", data, pos - 8)[0] == size:
-                    slot = pe.get_rva_from_offset(pos)
-                    refs.append(dict(pointer_slot=hex(slot), size_slot=hex(slot - 8),
-                                     pointer_code_refs=[hex(a) for a, _ in memory[slot]],
-                                     size_code_refs=[hex(a) for a, _ in memory[slot - 8]]))
-            rows.append(dict(rva=hex(rva), bytes=size, parts=parts, root_header=root,
-                             framed_dxil=dxil_program(data, off), size_pointer_pairs=refs,
-                             direct_code_refs=[hex(a) for a, _ in memory[rva]]))
+        try:
+            sections = container_parts(data[off:off + size])
+        except ValueError:
+            continue
+        rva = _mapped_rva(pe, off, size)
+        if rva is None:
+            continue
+        root = None
+        rts0 = sections.get(b"RTS0")
+        if rts0 is not None and len(rts0) >= 24:
+            ver, nparam, _, nsampler, _, flags = struct.unpack_from("<6I", rts0)
+            root = dict(version=ver, parameter_count=nparam, static_sampler_count=nsampler, flags=hex(flags))
+        refs = []
+        for ref in re.finditer(re.escape(struct.pack("<Q", base + rva)), data):
+            pos = ref.start()
+            if pos >= 8 and struct.unpack_from("<I", data, pos - 8)[0] == size:
+                size_slot = _mapped_rva(pe, pos - 8, 16)
+                if size_slot is None:
+                    continue
+                slot = size_slot + 8
+                refs.append(dict(pointer_slot=hex(slot), size_slot=hex(size_slot),
+                                 pointer_code_refs=[hex(a) for a, _ in memory[slot]],
+                                 size_code_refs=[hex(a) for a, _ in memory[size_slot]]))
+        rows.append(dict(rva=hex(rva), bytes=size,
+                         parts=[tag.decode("ascii", "replace") for tag in sections],
+                         root_header=root, framed_dxil=dxil_program(data, off),
+                         size_pointer_pairs=refs,
+                         direct_code_refs=[hex(a) for a, _ in memory[rva]]))
     return rows
 
 

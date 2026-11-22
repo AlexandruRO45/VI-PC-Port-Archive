@@ -33,6 +33,16 @@ void check(HRESULT hr, const char* stage)
     }
 }
 
+HRESULT check_feature(ID3D12Device* device, D3D12_FEATURE feature, void* data, UINT size)
+{
+#if defined(OFFSCREEN_AGILITY_620) && defined(__ID3D12Device16_INTERFACE_DEFINED__)
+    ComPtr<ID3D12Device16> versioned;
+    if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&versioned))))
+        return versioned->CheckFeatureSupport1(feature, data, size, D3D12SDKVersion);
+#endif
+    return device->CheckFeatureSupport(feature, data, size);
+}
+
 bool contains_ignoring_case(const wchar_t* text, const wchar_t* part)
 {
     const size_t length = std::wcslen(part);
@@ -45,11 +55,30 @@ bool contains_ignoring_case(const wchar_t* text, const wchar_t* part)
 // Without XBOX2WINDOWS_ADAPTER, the first D3D12 hardware adapter in high-performance order is used.
 // With it, the first whose description contains the value, ignoring case, so a PC with several GPUs
 // can test each one. A value that matches no adapter is an error, not a skipped test.
-ComPtr<IDXGIAdapter1> select_adapter(IDXGIFactory6* factory, bool warp)
+ComPtr<IDXGIAdapter1> select_adapter(IDXGIFactory6* factory, bool warp, ComPtr<ID3D12Device>& device
+#ifdef OFFSCREEN_AGILITY_620
+    , ID3D12DeviceFactory* device_factory
+#endif
+)
 {
+    auto create_device = [&](IDXGIAdapter1* candidate) {
+#ifdef OFFSCREEN_AGILITY_620
+        return device_factory->CreateDevice(candidate, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(device.ReleaseAndGetAddressOf()));
+#else
+        return D3D12CreateDevice(candidate, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(device.ReleaseAndGetAddressOf()));
+#endif
+    };
+    auto supports_d3d12 = [&](IDXGIAdapter1* candidate) {
+#ifdef OFFSCREEN_AGILITY_620
+        return SUCCEEDED(device_factory->CreateDevice(candidate, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), nullptr));
+#else
+        return SUCCEEDED(D3D12CreateDevice(candidate, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), nullptr));
+#endif
+    };
     ComPtr<IDXGIAdapter1> adapter;
     if (warp) {
         check(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)), "EnumWarpAdapter");
+        check(create_device(adapter.Get()), "Create device");
         return adapter;
     }
     wchar_t wanted[128]{};
@@ -66,9 +95,10 @@ ComPtr<IDXGIAdapter1> select_adapter(IDXGIFactory6* factory, bool warp)
         check(hr, "Enumerate hardware");
         DXGI_ADAPTER_DESC1 desc{};
         check(adapter->GetDesc1(&desc), "Adapter description");
-        if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
-            SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), nullptr))) {
-            if (!filter || contains_ignoring_case(desc.Description, wanted)) return adapter;
+        if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+        if (!filter || contains_ignoring_case(desc.Description, wanted)) {
+            if (SUCCEEDED(create_device(adapter.Get()))) return adapter;
+        } else if (supports_d3d12(adapter.Get())) {
             std::fprintf(stderr, "XBOX2WINDOWS_ADAPTER: skipping %ls\n", desc.Description);
         }
     }
@@ -309,12 +339,31 @@ bool report_debug_errors(ID3D12InfoQueue* messages)
     return errors != 0;
 }
 
+// These operations create pipelines from cs_6_5 fixtures. An adapter below SM 6.5, such as the
+// Windows 10 in-box WARP (SM 6.2), rejects them at pipeline creation with E_INVALIDARG.
+bool needs_cs_6_5(std::string_view operation)
+{
+    return operation == "--buffer-ops" || operation == "--bvh-reads" || operation == "--bvh-waves" ||
+           operation == "--bvh-hits" || operation == "--bvh-packed" || operation == "--bvh-numeric" ||
+           operation == "--bvh-atomics";
+}
+
+bool supports_cs_6_5(ID3D12Device* device)
+{
+    D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_5};
+    check(check_feature(device, D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model)), "Query fixture shader model");
+    std::printf("shader_model_capped_at_6_5=0x%x\n", model.HighestShaderModel);
+    return model.HighestShaderModel >= D3D_SHADER_MODEL_6_5;
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 3) return 2;
     const std::string_view operation = argv[2];
-    if (operation == "--check-bc7-tail") {
-        if (argc < 6 || argc > 16) return 2;
+    if (operation == "--check-pixel-quad-lod") {
+        if (argc != 4) return 2;
+    } else if (operation == "--check-bc7-tail") {
+        if (argc < 6) return 2;
     } else {
         if (argc != 3 && argc != 5 && argc != 6) return 2;
         if (argc == 6 && operation != "--check-bc7" && operation != "--check-bc7-mip1") return 2;
@@ -328,8 +377,11 @@ int main(int argc, char** argv)
 #ifdef OFFSCREEN_AGILITY_620
         ComPtr<ID3D12DeviceFactory> device_factory;
         check(D3D12GetInterface(CLSID_D3D12DeviceFactory, IID_PPV_ARGS(&device_factory)), "Load device factory");
-        check(device_factory->GetConfigurationInterface(CLSID_D3D12Debug, IID_PPV_ARGS(&debug)),
-              "Load app-local debug layer");
+        // Without Graphics Tools (for example on a default Windows 10 install) the debug layer reports
+        // DXGI_ERROR_SDK_COMPONENT_MISSING even with the SDK layers app-local. The runtime itself still
+        // loads, so continue without the layer and report it as unavailable. Other failures stay fatal.
+        const HRESULT debug_hr = device_factory->GetConfigurationInterface(CLSID_D3D12Debug, IID_PPV_ARGS(&debug));
+        if (debug_hr != DXGI_ERROR_SDK_COMPONENT_MISSING) check(debug_hr, "Load app-local debug layer");
 #else
         D3D12GetDebugInterface(IID_PPV_ARGS(&debug));
 #endif
@@ -337,7 +389,12 @@ int main(int argc, char** argv)
         std::printf("backend=%s debug_layer=%s\n", argv[1], debug ? "enabled" : "unavailable");
         ComPtr<IDXGIFactory6> factory;
         check(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)), "Create DXGI factory");
-        auto adapter = select_adapter(factory.Get(), mode == "warp");
+        ComPtr<ID3D12Device> device;
+#ifdef OFFSCREEN_AGILITY_620
+        auto adapter = select_adapter(factory.Get(), mode == "warp", device, device_factory.Get());
+#else
+        auto adapter = select_adapter(factory.Get(), mode == "warp", device);
+#endif
         if (!adapter) {
             std::puts("No D3D12-capable hardware adapter visible");
             return 77;
@@ -352,14 +409,8 @@ int main(int argc, char** argv)
         } else {
             std::puts("driver=unavailable via DXGI");
         }
-        ComPtr<ID3D12Device> device;
-#ifdef OFFSCREEN_AGILITY_620
-        check(device_factory->CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)),
-              "Create device with debug factory");
-#else
-        check(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "Create device");
-#endif
         if (debug) check(device.As(&messages), "Read debug queue");
+        if (argc == 3 && needs_cs_6_5(operation) && !supports_cs_6_5(device.Get())) return 77;
         if (argc == 3 && (operation == "--compute-root" || operation == "--compute-tables")) {
             check_compute(device.Get(), operation == "--compute-tables");
         } else if (argc == 3 && operation == "--ffx-device-init") {
@@ -374,8 +425,12 @@ int main(int argc, char** argv)
             check_bc7_pixel(device.Get(), argv[3], argv[4], nullptr, argv[5]);
         } else if ((argc == 5 || argc == 6) && operation == "--check-bc7") {
             check_bc7_pixel(device.Get(), argv[3], argv[4], argc == 6 ? argv[5] : nullptr);
+        } else if (argc == 5 && (operation == "--dual-pixel" || operation == "--dual-pixel-swapped")) {
+            check_dual_pixel(device.Get(), argv[3], argv[4], operation == "--dual-pixel-swapped");
         } else if (argc == 5 && operation == "--check-pixel-case") {
             check_translated_pixel(device.Get(), argv[3], false, argv[4]);
+        } else if (operation == "--check-pixel-quad-lod") {
+            check_pixel_quad_lod(device.Get(), argv[3]);
         } else if (operation == "--check-pixel") {
             if (argc != 5 || (std::string_view(argv[4]) != "rgba" && std::string_view(argv[4]) != "bgra"))
                 throw std::runtime_error("Expected --check-pixel <pixel.cso> rgba|bgra");
@@ -392,6 +447,8 @@ int main(int argc, char** argv)
             check_bvh_hits(device.Get());
         } else if (argc == 3 && operation == "--dxr-update") {
             if (!check_dxr_update(device.Get())) return 77;
+        } else if (argc == 3 && operation == "--dxr-facing") {
+            if (!check_dxr_facing(device.Get())) return 77;
         } else if (argc == 3 && operation == "--bvh-packed") {
             check_bvh_packed(device.Get());
         } else if (argc == 3 && operation == "--bvh-numeric") {
@@ -402,10 +459,21 @@ int main(int argc, char** argv)
             check_bvh_reads(device.Get());
         } else if (argc == 3 && (operation == "--bvh-waves" || operation == "--bvh-wave64")) {
             if (!check_bvh_waves(device.Get(), operation == "--bvh-wave64")) return 77;
+        } else if (argc == 3 && operation == "--gpu-alias") {
+            if (!check_gpu_alias(device.Get())) return 77;
+        } else if (argc == 3 && operation == "--gpu-alias-lookup") {
+            if (!check_gpu_alias_lookup(device.Get())) return 77;
+        } else if (argc == 3 && operation == "--gpu-alias-lookup-writes") {
+            if (!check_gpu_alias_lookup_writes(device.Get())) return 77;
         } else if (argc == 3 && operation == "--buffer-ops") {
             check_buffer_ops(device.Get());
         } else if (argc == 3 && operation == "--ray-query") {
             if (!check_ray_query(device.Get())) return 77;
+        } else if (argc == 3 && operation == "--wave-shuffle") {
+            if (!check_wave_shuffle(device.Get())) return 77;
+        } else if (operation.substr(0, 2) == "--") {
+            std::fprintf(stderr, "Unknown GPU operation or invalid arguments: %s\n", argv[2]);
+            return 2;
         } else {
             draw(device.Get(), argv[2], argc == 5 ? argv + 3 : nullptr);
         }

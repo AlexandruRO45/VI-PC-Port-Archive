@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 FFX_LOADER = "431bdd2e26c0c8214fd7601140eb9fe6d8a249f5000539453a9a9b6a0b7c0ee8"
+FFX_LOADER_NAME = "amd_fidelityfx_loader_xbox.dll"
 FFX_EXPORTS = ("ffxConfigure", "ffxCreateContext", "ffxDestroyContext", "ffxDispatch", "ffxQuery")
 
 
@@ -30,17 +31,29 @@ def trace(report, entry):
             continue
         reached[image] = dict(conditional=conditional, path=path, reasons=reasons)
         targets = set()
+        forwarded = defaultdict(set)
         for row in imports[image]:
             dll, symbol, kind = row["dll"], row["symbol"], row["kind"]
             providers = by_name[dll.casefold()]
             if symbol in {"GetProcAddress", "LoadPackagedLibrary", "LoadLibraryA", "LoadLibraryW",
                           "LoadLibraryExA", "LoadLibraryExW"}:
                 lookups.append(dict(image=image, symbol=symbol, kind=kind))
+            package = row.get("package_resolution")
             if len(providers) == 1:
                 targets.add((kind, providers[0]))
                 if providers[0] in row["bundle_exports_in"]:
-                    continue
-                problem = "bundled_export_missing"
+                    if not package:
+                        continue
+                    # Snapping a forwarded export also loads each packaged module named in its chain.
+                    hops = tuple(dict.fromkeys(s["provider"] for s in package["chain"][1:]
+                                               if s["package"] and s["provider"] and s["provider"] != providers[0]))
+                    if hops:
+                        forwarded[(kind, providers[0])].add(hops)
+                    if package["status"] == "export_present":
+                        continue
+                    problem = package["status"]
+                else:
+                    problem = "bundled_export_missing"
             elif len(providers) > 1:
                 problem = "ambiguous_package_basename"
             else:
@@ -51,6 +64,8 @@ def trace(report, entry):
                            dll=dll, symbol=symbol, problem=problem, candidates=providers)
             if not providers and "desktop_resolution" in row:
                 finding["desktop_chain"] = row["desktop_resolution"]["chain"]
+            elif package and len(providers) == 1 and problem != "bundled_export_missing":
+                finding["package_chain"] = package["chain"]
             findings.append(finding)
 
         if images[image]["sha256"] == FFX_LOADER:
@@ -70,13 +85,23 @@ def trace(report, entry):
                     problem = "conditional_module_absent_from_package" if not providers else "ambiguous_package_basename"
                 findings.append(dict(path=path, reasons=reasons + (condition,), conditional=True, dll=dll,
                                      missing_exports=missing, problem=problem, candidates=providers))
+        elif Path(image).name.casefold() == FFX_LOADER_NAME:
+            # The conditional routes are pinned to one loader hash. Report a different build instead
+            # of returning no conditional edge and exiting successfully.
+            findings.append(dict(path=path, reasons=reasons, dll=Path(image).name,
+                                 problem="unverified_loader_hash",
+                                 sha256=images[image]["sha256"], expected=FFX_LOADER))
         for edge, target in sorted(targets):
             heapq.heappush(queue, (conditional or edge != "normal", depth + 1, path + (target,), reasons + (edge,)))
+            for hops in sorted(forwarded[(edge, target)]):
+                for n in range(1, len(hops) + 1):
+                    heapq.heappush(queue, (conditional or edge != "normal", depth + 1 + n,
+                                           path + (target, *hops[:n]), reasons + (edge,) + ("forwarder",) * n))
     return dict(entry=entry, reachable=reached, findings=findings, dynamic_lookup_imports=lookups,
                 unlinked_in_this_graph=sorted(set(images) - set(reached)),
-                scope="Package imports and identified FFX routes. Desktop findings use terminal export status "
-                      "where available and first-hop status for older inventories. Dynamic targets and actual "
-                      "execution order require independent evidence.")
+                scope="Package imports, packaged export forwarders and identified FFX routes. Desktop findings "
+                      "use terminal export status where available and first-hop status for older inventories. "
+                      "Dynamic targets and actual execution order require independent evidence.")
 
 
 def main():

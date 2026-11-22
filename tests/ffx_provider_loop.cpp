@@ -176,7 +176,7 @@ uint32_t LoopContext::create(uintptr_t backend, const LoopDesc& d, uint32_t cont
         desc.Format = format_for(d.format);
         if (desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) {
             D3D12_FEATURE_DATA_FORMAT_SUPPORT support{desc.Format};
-            check(probe.device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof support),
+            check(check_feature(probe.device, D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof support),
                   "Query packed RCAS UAV");
             if (force_packed_rcas || !(support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) ||
                 !(support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE))

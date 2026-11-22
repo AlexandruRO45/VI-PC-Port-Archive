@@ -3,3 +3,4 @@ EXPORTS
     slot_probe
     descriptor_fields
     view_offset
+    index_guard

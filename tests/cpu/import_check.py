@@ -80,6 +80,26 @@ def reject(image, provider, reason, binding):
         raise AssertionError(f"expected {reason!r}, got {run.returncode}: {run.stderr}")
 
 
+def system_ordinal(image, provider):
+    # pefile names ordinal imports from ws2_32.dll with its built-in table (#77 becomes
+    # WSAInstallServiceClassA). The binding must still use the ordinal the image stores.
+    folder = image.parent / "system-ordinal"
+    folder.mkdir()
+    renamed, bound, output = folder / image.name, folder / "ws2_32.dll", folder / "lifted.cpp"
+    shutil.copy2(provider, bound)
+    with pefile.PE(str(image)) as pe:
+        desc, = pe.DIRECTORY_ENTRY_IMPORT
+        assert [(i.name, i.ordinal) for i in desc.imports] == [(None, 77)]
+        pe.set_bytes_at_rva(desc.struct.Name, b"ws2_32.dll\0")
+        pe.write(str(renamed))
+    tool = Path(__file__).resolve().parents[2] / "tools/cpu_call_aot.py"
+    run = subprocess.run([sys.executable, "-B", str(tool), str(renamed), "call_mix", str(output),
+                          "--bind", str(bound), "#77", "--link-name", "mix_args"], capture_output=True, text=True)
+    if run.returncode or "dllimport) word mix_args(" not in output.read_text(encoding="utf-8"):
+        raise AssertionError(f"system ordinal binding failed with {run.returncode}: {run.stderr}")
+    reject(renamed, bound, "unbound import ws2_32.dll!#77", ["WSAInstallServiceClassA"])
+
+
 def check(native, lifted, provider, altered, probe, ordinal_control=None):
     ordinal = 77 if ordinal_control else None
     binding = ["#77", "--link-name", "mix_args"] if ordinal else ["mix_args"]
@@ -110,6 +130,7 @@ def check(native, lifted, provider, altered, probe, ordinal_control=None):
                 if ordinal:
                     reject(source, bound, f"unbound import {identity}", ["mix_args"])
                     reject(source, bound, f"import-library link name required for {identity}", ["#77"])
+                    system_ordinal(source, bound)
                 # Move the RIP-relative call one byte into the same IAT slot.
                 data = bytearray(source.read_bytes())
                 delta, = struct.unpack_from("<i", data, disp)

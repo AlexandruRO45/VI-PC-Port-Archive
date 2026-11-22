@@ -64,7 +64,7 @@ def parts(blob):
 
 def dxil_program(data, offset):
     """Check container/part extents and DXIL bitcode framing; no shader execution."""
-    if len(data) - offset < 32:
+    if offset < 0 or len(data) - offset < 32 or data[offset:offset + 4] != b"DXBC":
         return False
     version, size, parts = struct.unpack_from("<III", data, offset + 20)
     if version != 1 or size > len(data) - offset or not 0 < parts <= (size - 32) // 4:
@@ -175,7 +175,7 @@ def scene_records(data, validator=None):
             rejected["container_framing"] += 1
             continue
         program = sections.get(b"DXIL", b"")
-        if len(program) < 24:
+        if len(program) < 24 or program[8:12] != b"DXIL":
             rejected["no_program_header"] += 1
             continue
         kind = struct.unpack_from("<H", program, 2)[0]
@@ -190,7 +190,7 @@ def scene_records(data, validator=None):
                                  timeout=15, check=True)
             result = json.loads(run.stdout)
             samples[stage] = {"call_hr": result["call_hr"], "status": result.get("status")}
-        cursor = start + stored
+        cursor = start + (stored - len(stream.unused_data))
     return {"records": sum(stages.values()), "stages": stages, "section_counts": sections_seen,
             "framed_bitcode": framed, "trailing_byte_counts": tails, "candidate_rejections": rejected,
             "validator_samples": len(samples), "first_per_stage": samples}

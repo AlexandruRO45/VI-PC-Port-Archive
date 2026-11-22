@@ -37,6 +37,16 @@ def function_bytes(image, name):
         return start, bounded_code(pe, start)
 
 
+CONDITIONS = {
+    0x72: "<",
+    0x73: ">=",
+    0x74: "==",
+    0x75: "!=",
+    0x76: "<=",
+    0x77: ">",
+}
+
+
 def translate(start, code):
     # This profile initializes EAX from ECX before either branch. A compare and
     # its immediate consumer form one operation, so flags never cross a join.
@@ -51,10 +61,16 @@ def translate(start, code):
         prefix = code[pos:pos + 2]
         opcode = code[pos]
         jump = False
-        if prefix == b"\x83\xf8" and pos + 5 <= len(code) and code[pos + 3] in (0x72, 0x73):
+        if prefix == b"\x83\xf8" and pos + 5 <= len(code) and code[pos + 3] in CONDITIONS:
             limit = struct.unpack_from("b", code, pos + 2)[0] & 0xffffffff
-            condition = "<" if code[pos + 3] == 0x72 else ">="
+            condition = CONDITIONS[code[pos + 3]]
             offset += 5
+            jump = True
+            statement = f"if (eax {condition} {limit}u) "
+        elif opcode == 0x3d and pos + 7 <= len(code) and code[pos + 5] in CONDITIONS:
+            limit = struct.unpack_from("<I", code, pos + 1)[0]
+            condition = CONDITIONS[code[pos + 5]]
+            offset += 7
             jump = True
             statement = f"if (eax {condition} {limit}u) "
         elif opcode == 0xeb and pos + 2 <= len(code):
@@ -66,6 +82,11 @@ def translate(start, code):
             operator = "+=" if prefix[1] == 0xc0 else "-="
             statement = f"eax {operator} {immediate}u;"
             offset += 3
+        elif opcode in (0x05, 0x2d) and pos + 5 <= len(code):
+            immediate = struct.unpack_from("<I", code, pos + 1)[0]
+            operator = "+=" if opcode == 0x05 else "-="
+            statement = f"eax {operator} {immediate}u;"
+            offset += 5
         elif prefix == b"\x89\x02":
             statement = "*output = eax;"
             offset += 2

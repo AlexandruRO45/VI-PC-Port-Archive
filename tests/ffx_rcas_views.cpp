@@ -33,16 +33,20 @@ std::vector<RGB> test_colors()
     return colors;
 }
 
+enum class Rounding { nearest_even, half_up, toward_zero };
+
 // Choose the first scale at which all rounded mantissas fit. Double arithmetic
 // keeps this oracle independent of the shader's float exponent-bit selection.
-uint32_t reference_word(const RGB& rgb, bool ties_up)
+uint32_t reference_word(const RGB& rgb, Rounding rounding)
 {
     for (int e = 0; e < 32; ++e) {
         uint32_t packed = uint32_t(e) << 27;
         bool fits = true;
         for (int c = 0; c < 3; ++c) {
             const double scaled = std::ldexp(std::clamp(double(rgb[c]), 0.0, 65408.0), 24 - e);
-            const double rounded = ties_up ? std::floor(scaled + 0.5) : std::nearbyint(scaled);
+            const double rounded = rounding == Rounding::half_up       ? std::floor(scaled + 0.5)
+                                   : rounding == Rounding::toward_zero ? std::floor(scaled)
+                                                                       : std::nearbyint(scaled);
             if (rounded > 511) { fits = false; break; }
             packed |= uint32_t(rounded) << (9 * c);
         }
@@ -132,12 +136,16 @@ void check_rcas_views(LoopContext& ctx, uint32_t index, uint32_t uav_slot)
     cmd.submit_and_wait(device);
 
     const auto words = bvh_fixture::read(back.Get(), bytes / 4);
-    UINT native_half_up = 0;
+    UINT native_half_up = 0, native_toward_zero = 0;
     for (UINT i = 0; i < texels; ++i) {
         const auto raw = words[strip.Offset / 4 + i];
-        const auto canonical = reference_word(inputs[i], false);
-        // Direct3D permits round-to-nearest as well as nearest-even on native stores.
-        if (!packed && raw != canonical && raw == reference_word(inputs[i], true)) ++native_half_up;
+        const auto canonical = reference_word(inputs[i], Rounding::nearest_even);
+        // For FLOAT -> RGBE, D3D11.3 section 19.3.2.2 recommends nearest-even and allows round-to-nearest,
+        // and notes that hardware does not perform the conversion; its general rule for conversion to
+        // another float format (3.2.2) is round-to-zero. A native store may follow any one of the three.
+        if (!packed && raw != canonical && raw == reference_word(inputs[i], Rounding::half_up)) ++native_half_up;
+        else if (!packed && raw != canonical && raw == reference_word(inputs[i], Rounding::toward_zero))
+            ++native_toward_zero;
         else expect_word(raw, canonical, i, 4);
         for (unsigned c = 0; c < 4; ++c) {
             const float value = c == 3 ? 1.0f : std::ldexp(float((raw >> (9*c)) & 511), int(raw >> 27) - 24);
@@ -146,6 +154,9 @@ void check_rcas_views(LoopContext& ctx, uint32_t index, uint32_t uav_slot)
             expect_word(words[4*i+c], bits, i, c);
         }
     }
-    std::printf("rcas_texels=%u format=%u id=16 index=%u uav_slot=%u native_half_up=%u mismatches=0\n",
-                texels, unsigned(desc.Format), index, uav_slot, native_half_up);
+    if (native_half_up && native_toward_zero)
+        throw std::runtime_error("RCAS native store mixes round-to-nearest and round-to-zero");
+    std::printf("rcas_texels=%u format=%u id=16 index=%u uav_slot=%u native_half_up=%u native_toward_zero=%u "
+                "mismatches=0\n",
+                texels, unsigned(desc.Format), index, uav_slot, native_half_up, native_toward_zero);
 }

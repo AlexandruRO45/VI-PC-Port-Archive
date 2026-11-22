@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -19,14 +20,19 @@ def decode_torrent(data):
         offset += 1
         if token == b"i":
             end = data.index(b"e", offset)
-            value = int(data[offset:end])
+            raw = data[offset:end]
+            if not re.fullmatch(rb"0|-?[1-9][0-9]*", raw):
+                raise ValueError("Invalid bencode integer")
+            value = int(raw)
             offset = end + 1
         elif token == b"d":
             value = {}
+            previous_key = None
             while data[offset:offset + 1] != b"e":
                 key = read()
-                if not isinstance(key, bytes) or key in value:
+                if not isinstance(key, bytes) or (previous_key is not None and key <= previous_key):
                     raise ValueError("Invalid torrent dictionary key")
+                previous_key = key
                 value[key] = read()
             offset += 1
         elif token == b"l":
@@ -36,7 +42,10 @@ def decode_torrent(data):
             offset += 1
         elif token.isdigit():
             end = data.index(b":", offset)
-            size = int(data[offset - 1:end])
+            raw_size = data[offset - 1:end]
+            if not re.fullmatch(rb"0|[1-9][0-9]*", raw_size):
+                raise ValueError("Invalid bencode string length")
+            size = int(raw_size)
             offset = end + 1 + size
             if offset > len(data):
                 raise ValueError("Truncated torrent string")
@@ -119,7 +128,8 @@ def read_layout_chunks(path):
     for chunk in ET.parse(path).getroot().findall("Chunk"):
         files = []
         for group in chunk.findall("FileGroup"):
-            directory = group.attrib["DestinationPath"].replace("\\", "/").strip("/")
+            parts = group.attrib["DestinationPath"].replace("\\", "/").split("/")
+            directory = "/".join(part for part in parts if part not in ("", "."))
             files.append("/".join(filter(None, [directory, group.attrib["Include"]])))
         chunks.append({"id": chunk.attrib["Id"], "marker": chunk.get("Marker"), "files": files})
     return chunks
@@ -171,8 +181,15 @@ def main():
     destination = args.output or Path(__file__).resolve().parents[1] / "out" / "integrity" / (root.name + ".json")
     if destination.resolve().is_relative_to(root):
         parser.error("Choose an output outside the input directory")
-    torrent, = root.glob("*.torrent")
-    layout, = root.glob("layout*.xml")
+
+    def manifest(pattern: str) -> Path:
+        matches = [path for path in root.glob(pattern) if path.is_file()]
+        if len(matches) != 1:
+            parser.error(f"expected exactly one {pattern} file in {root}, found {len(matches)}")
+        return matches[0]
+
+    torrent = manifest("*.torrent")
+    layout = manifest("layout*.xml")
     start = datetime.now(timezone.utc)
     raw = torrent.read_bytes()
     info = decode_torrent(raw)[b"info"]

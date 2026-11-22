@@ -34,8 +34,11 @@ try {
     if ($report -notmatch 'dual_uav_warp - PASS' -or $report -notmatch 'texture_mips_warp - PASS' -or
         $report -notmatch 'bvh_waves_warp - PASS' -or $report -notmatch 'bvh_atomics_warp - PASS' -or
         $report -notmatch 'bvh_packed_warp - PASS' -or $report -notmatch 'bvh_root_roundtrip_warp - PASS' -or
-        $report -notmatch [regex]::Escape($revision)) {
-        throw 'The extracted package is missing a required WARP pass or source revision.'
+        $report -notmatch [regex]::Escape($revision) -or
+        $report -notmatch '### Summary' -or
+        $report -notmatch '### Submit this report' -or
+        $report -notmatch 'https://github.com/R0Y00/Xbox2Windows/issues/1') {
+        throw 'The extracted package is missing a required WARP pass, source revision or submit path.'
     }
 } finally {
     Pop-Location

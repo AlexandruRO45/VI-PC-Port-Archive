@@ -1,0 +1,8 @@
+left hardware adapter=NVIDIA GeForce RTX 4060 center=26 mismatches=0/64
+left warp adapter=Microsoft Basic Render Driver center=26 mismatches=0/64
+up hardware adapter=NVIDIA GeForce RTX 4060 center=19 mismatches=0/64
+up warp adapter=Microsoft Basic Render Driver center=19 mismatches=0/64
+diagonal hardware adapter=NVIDIA GeForce RTX 4060 center=18 mismatches=0/64
+diagonal warp adapter=Microsoft Basic Render Driver center=18 mismatches=0/64
+wrong-high-half hardware adapter=NVIDIA GeForce RTX 4060 center=18 mismatches=55/64
+wrong-high-half warp adapter=Microsoft Basic Render Driver center=18 mismatches=55/64

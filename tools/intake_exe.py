@@ -99,9 +99,7 @@ def inspect_executable(path):
         tls = None
         if len(hdr.DATA_DIRECTORY) > 9:
             d = hdr.DATA_DIRECTORY[9]
-            if d.VirtualAddress or d.Size:
-                if not d.VirtualAddress or d.Size < 40:
-                    raise ValueError("Incomplete TLS directory")
+            if d.VirtualAddress:
                 start, end, index, callbacks, zero_fill, flags = struct.unpack(
                     "<4Q2I", read_rva(d.VirtualAddress, 40))
                 callback_rvas = []

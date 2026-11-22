@@ -18,11 +18,17 @@ def record(blob, *, repeat_delta=0, decoded_delta=0, tail=b""):
 def main():
     compute_path, pixel_path, validator = map(Path, sys.argv[1:])
     compute, pixel = compute_path.read_bytes(), pixel_path.read_bytes()
-    # Frame a DXIL section with a stage token and an empty bitcode header.
-    stub = struct.pack("<6I", 5 << 16, 6, 0, 0, 0, 0)
+    # Give the stub a DXIL program header and four bytes without LLVM framing.
+    stub = struct.pack("<II4sIII", (5 << 16) | 0x60, 7, b"DXIL", 0x100, 16, 4) + bytes(4)
     container = (b"DXBC" + bytes(16) + struct.pack("<4I", 1, 44 + len(stub), 1, 36)
                  + b"DXIL" + struct.pack("<I", len(stub)) + stub)
-    data = record(compute, tail=b"pad") + record(compute) + record(pixel) + record(container)
+    bad_magic = container[:-len(stub)] + stub[:8] + b"BAD!" + stub[12:]
+    invalid = scene_records(record(bad_magic))
+    assert invalid["records"] == 0, invalid
+    assert invalid["candidate_rejections"] == {"no_program_header": 1}, invalid
+
+    data = (record(bad_magic) + record(compute, tail=b"pad") + record(compute)
+            + record(pixel) + record(container))
     result = scene_records(data, validator)
     assert result["records"] == 4 and result["stages"] == {"compute": 3, "pixel": 1}
     assert result["framed_bitcode"] == 3 and result["section_counts"]["DXIL"] == 4

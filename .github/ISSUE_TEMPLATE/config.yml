@@ -1,8 +1,11 @@
-blank_issues_enabled: true
+blank_issues_enabled: false
 contact_links:
   - name: Submit a GPU hardware report
     url: https://github.com/R0Y00/Xbox2Windows/issues/1
     about: Add your adapter, driver and standalone GPU-check result to the shared coverage thread.
+  - name: Read the contributor guide
+    url: https://github.com/R0Y00/Xbox2Windows/blob/main/CONTRIBUTING.md
+    about: Review the build, test and evidence requirements before opening a task.
   - name: Report a security issue privately
     url: https://github.com/R0Y00/Xbox2Windows/blob/main/SECURITY.md
     about: Contact the maintainer about a vulnerability in this project's code or tools.

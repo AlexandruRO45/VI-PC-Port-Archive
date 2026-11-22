@@ -30,6 +30,18 @@ def check_desktop_forwarders():
     broken = resolve("front.dll", "Broken")
     assert broken["status"] == "export_not_found" and broken["chain"][-1]["symbol"] == "Missing"
 
+    # A packaged module shadows the System32 name. API-set contracts still select System32 hosts.
+    package = {"shim.dll": (["bin/shim.dll"], {"Begin": "middle.#77", "Api": "api-ms-fixture-l1-1-0.#77"}),
+               "middle.dll": (["bin/middle.dll"], {}), "twin.dll": (["a/twin.dll", "b/twin.dll"], None)}
+    shadowed = resolve_desktop("shim.dll", "Begin", "entry.exe", contracts, tables.get,
+                               lambda name: package.get(name, ((), None)))
+    assert shadowed["status"] == "export_not_found" and shadowed["chain"][-1]["provider"] == "bin/middle.dll"
+    contract = resolve_desktop("shim.dll", "Api", "entry.exe", contracts, tables.get,
+                               lambda name: package.get(name, ((), None)))
+    assert contract["status"] == "provider_not_found" and contract["chain"][-1]["provider"] == "absent.dll"
+    twin = resolve_desktop("twin.dll", "Value", "entry.exe", contracts, tables.get, package.get)
+    assert twin["status"] == "ambiguous_package_basename" and twin["chain"][-1]["provider"] is None
+
     row = dict(image="entry.exe", kind="normal", dll="front.dll", symbol="Broken",
                bundle_exports_in=[], desktop_export="export_present", desktop_resolution=broken)
     inventory = dict(images={"entry.exe": {"sha256": "fixture", "exports": []}}, imports=[row])
@@ -38,6 +50,48 @@ def check_desktop_forwarders():
     assert finding["desktop_chain"][-1] == dict(dll="middle.dll", provider="middle.dll", symbol="Missing")
     del row["desktop_resolution"]
     assert not trace(inventory, "entry.exe")["findings"]
+
+    # Each packaged module in a forwarder chain is loaded with the provider, including intermediate ones.
+    modules = ("front.dll", "relay.dll", "last.dll")
+    hops = [dict(dll=n, provider=n, symbol="Value", package=True) for n in modules]
+    inventory["images"].update({n: {"sha256": "fixture", "exports": []} for n in modules})
+    row.update(symbol="Value", bundle_exports_in=["front.dll"],
+               package_resolution=dict(status="export_present", chain=hops))
+    report = trace(inventory, "entry.exe")
+    assert not report["findings"]
+    assert report["reachable"]["relay.dll"]["reasons"] == ("normal", "forwarder")
+    assert report["reachable"]["last.dll"]["path"] == ("entry.exe", "front.dll", "relay.dll", "last.dll")
+
+    # Forwarded chains ending at an ambiguous package basename keep resolved hops without queuing None.
+    ambiguous_pkg = {
+        "front.dll": (["front.dll"], {"DirectTwin": "twin.Value", "Twin": "mid.Step"}),
+        "mid.dll": (["bin/mid.dll"], {"Step": "twin.Value"}),
+        "twin.dll": (["a/twin.dll", "b/twin.dll"], None),
+    }
+    direct_twin = resolve_desktop("front.dll", "DirectTwin", "entry.exe", contracts, tables.get,
+                                  lambda name: ambiguous_pkg.get(name, ((), None)))
+    relayed_twin = resolve_desktop("front.dll", "Twin", "entry.exe", contracts, tables.get,
+                                   lambda name: ambiguous_pkg.get(name, ((), None)))
+    for result in (direct_twin, relayed_twin):
+        assert result["status"] == "ambiguous_package_basename"
+        assert result["chain"][-1] == dict(dll="twin.dll", provider=None, symbol="Value", package=True)
+    inventory["images"].update({n: {"sha256": "fixture", "exports": []}
+                                for n in ("bin/mid.dll", "a/twin.dll", "b/twin.dll")})
+    direct_row = dict(image="entry.exe", kind="normal", dll="front.dll", symbol="DirectTwin",
+                      bundle_exports_in=["front.dll"], desktop_export="provider_not_found",
+                      package_resolution=direct_twin)
+    relayed_row = dict(image="entry.exe", kind="normal", dll="front.dll", symbol="Twin",
+                       bundle_exports_in=["front.dll"], desktop_export="provider_not_found",
+                       package_resolution=relayed_twin)
+    for imports_case in ([direct_row], [row, direct_row, relayed_row]):
+        inventory["imports"] = imports_case
+        report = trace(inventory, "entry.exe")
+        assert None not in report["reachable"]
+        problems = {f["symbol"]: (f["problem"], f["package_chain"]) for f in report["findings"]}
+        assert problems["DirectTwin"] == ("ambiguous_package_basename", direct_twin["chain"])
+    assert report["reachable"]["bin/mid.dll"]["path"] == ("entry.exe", "front.dll", "bin/mid.dll")
+    assert report["reachable"]["bin/mid.dll"]["reasons"] == ("normal", "forwarder")
+    assert problems["Twin"] == ("ambiguous_package_basename", relayed_twin["chain"])
 
 
 def main():
@@ -61,8 +115,13 @@ def main():
     assert report["reachable"][upscaler]["reasons"] == ("normal", "normal", "normal")
     finding, = report["findings"]
     assert finding["dll"] == framegen and finding["conditional"]
+    # A different loader build has no conditional routes, and the report says why instead of staying silent.
     data["images"][loader]["sha256"] = "other build"
-    assert not trace(data, "entry.exe")["findings"]
+    unknown = trace(data, "entry.exe")
+    finding, = unknown["findings"]
+    assert finding["problem"] == "unverified_loader_hash", finding
+    assert finding["sha256"] == "other build" and finding["expected"] == FFX_LOADER
+    assert "ffx:0x10000" not in unknown["reachable"][upscaler]["reasons"]
 
 
 if __name__ == "__main__":

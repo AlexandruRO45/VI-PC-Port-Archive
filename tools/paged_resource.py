@@ -33,6 +33,19 @@ class PagedResource:
         self.starts = tuple(starts)
         self.size = logical_end
 
+    def _read_at(self, offset: int, size: int) -> bytes:
+        self.stream.seek(offset)
+        first = self.stream.read(size)
+        if not first or len(first) == size:
+            return first or b""
+        data = bytearray(first)
+        while len(data) < size:
+            chunk = self.stream.read(size - len(data))
+            if not chunk:
+                break
+            data.extend(chunk)
+        return bytes(data)
+
     def read(self, offset, length, *, limit=64 << 20):
         if offset < 0 or length < 0 or length > limit or offset + length > self.size:
             raise ValueError("Logical range outside resource or read budget")
@@ -43,13 +56,11 @@ class PagedResource:
             inside = offset + len(result) - self.starts[index]
             take = min(length - len(result), segment.size - inside)
             if segment.codec == "raw":
-                self.stream.seek(segment.offset + inside)
-                chunk = self.stream.read(take)
+                chunk = self._read_at(segment.offset + inside, take)
             elif segment.codec == "zlib":
                 if max(segment.size, segment.stored) > limit:
                     raise ValueError("Compressed segment exceeds read budget")
-                self.stream.seek(segment.offset)
-                data = self.stream.read(segment.stored)
+                data = self._read_at(segment.offset, segment.stored)
                 decoder = zlib.decompressobj()
                 decoded = decoder.decompress(data, segment.size + 1)
                 if (len(data) != segment.stored or not decoder.eof or decoder.unused_data

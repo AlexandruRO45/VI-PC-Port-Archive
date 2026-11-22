@@ -5,8 +5,22 @@ $hashes = @{
     'PixelShader.hlsl' = 'ADBCA57C5709070DEEB2D5CFE87FF67054B684E4318DC55AC1B1D95113EC2940'
     'media/image1.png' = '7F154D7B06DBC92013E3E8C909BE2CB25E7620F48A4C9D921B68F05F2E872AE1'
 }
+# The hashes are of the files as stored in Xbox-GDK-Samples. Its .gitattributes sets *.hlsl eol=crlf,
+# so a git checkout writes CRLF shaders. Hash those with CRLF folded to LF; the PNG is compared as is.
+function Get-ReferenceHash([string]$Path) {
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    if ($Path.EndsWith('.hlsl')) {
+        $lf = [Collections.Generic.List[byte]]::new($bytes.Length)
+        for ($i = 0; $i -lt $bytes.Length; ++$i) {
+            if ($bytes[$i] -ne 13 -or $i + 1 -ge $bytes.Length -or $bytes[$i + 1] -ne 10) { $lf.Add($bytes[$i]) }
+        }
+        $bytes = $lf.ToArray()
+    }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { -join ($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString('X2') }) } finally { $sha.Dispose() }
+}
 foreach ($name in $hashes.Keys) {
-    if ((Get-FileHash -LiteralPath (Join-Path $Sample $name)).Hash -ne $hashes[$name]) {
+    if ((Get-ReferenceHash (Join-Path $Sample $name)) -ne $hashes[$name]) {
         throw "Unexpected reference version: $name"
     }
 }

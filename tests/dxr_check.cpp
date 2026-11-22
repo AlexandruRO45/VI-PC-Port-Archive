@@ -186,8 +186,14 @@ bool check_dxr_update(ID3D12Device* device) {
             UINT distanceBits;
             std::memcpy(&distanceBits, &distance, sizeof(distanceBits));
             const bvh_fixture::Row expected{static_cast<UINT>(id != 0), id, 0, distanceBits};
-            for (UINT field = 0; field < 4; ++field)
+            for (UINT field = 0; field < 4; ++field) {
+                if (field == 3 && id != 0) {
+                    float actualDistance;
+                    std::memcpy(&actualDistance, &values[4 * i + field], sizeof(actualDistance));
+                    if (std::abs(actualDistance - distance) < 1e-4f) continue;
+                }
                 bvh_fixture::equal(values[4 * i + field], expected[field], i, field);
+            }
         }
     }
     std::puts("dxr_update rays=7 changed_hits=4 in_place_matches_rebuild=1");

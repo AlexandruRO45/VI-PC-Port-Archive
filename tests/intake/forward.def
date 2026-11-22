@@ -1,0 +1,8 @@
+LIBRARY intake_forward
+EXPORTS
+    forwarded_value = named_value
+    forwarded_ordinal = named_value
+    forwarded_chain = named_value
+    forwarded_missing = named_value
+    forwarded_loop = named_value
+    forwarded_absent = named_value

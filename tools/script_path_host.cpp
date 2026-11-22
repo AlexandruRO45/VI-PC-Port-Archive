@@ -49,6 +49,7 @@ extern "C" __declspec(dllexport) int resolve_script_path(
     for (unsigned level = 0; level < depth; ++level) {
         unsigned previous = noNode;
         unsigned match = noNode;
+        bool ambiguous = false;
         unsigned visits = 0;
         for (unsigned i = nodes[parent].firstChild; i != noNode; i = nodes[i].nextSibling) {
             if (i >= nodeCount || ++visits > nodeCount) return -3;
@@ -64,11 +65,14 @@ extern "C" __declspec(dllexport) int resolve_script_path(
                 if (seenId || attrs[a].kind != 5) return -3;
                 seenId = true;
                 if (attrs[a].textHash == path[level]) {
-                    if (match != noNode) return -2;
-                    match = i;
+                    if (match != noNode)
+                        ambiguous = true;
+                    else
+                        match = i;
                 }
             }
         }
+        if (ambiguous) return -2;
         if (match == noNode) return -1;
         parent = match;
     }

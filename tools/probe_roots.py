@@ -64,7 +64,8 @@ def packing_evidence(text):
                 adjacent_extrema_store_pairs=adjacent_extrema)
 
 
-def validate_shader(probe, blob, program):
+def validate_shader(probe, blob, program, optional_modes=()):
+    """Validate the container and its bitcode. A refused optional mode keeps its record without a status."""
     if len(program) < 24:
         raise ValueError("Truncated DXIL program")
     _, words, magic, _, offset, size = struct.unpack_from("<II4sIII", program)
@@ -77,7 +78,7 @@ def validate_shader(probe, blob, program):
         result = subprocess.run([str(probe), "--" + mode], input=data, capture_output=True,
                                 check=True, timeout=10)
         record = json.loads(result.stdout)
-        if "status" not in record:
+        if "status" not in record and mode not in optional_modes:
             raise ValueError(f"Validator operation unavailable for {mode}: {record}")
         record["diagnostics"] = result.stderr.decode("utf-8", "replace").rstrip("\0\r\n").splitlines()
         checks[mode] = record

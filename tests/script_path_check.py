@@ -54,6 +54,30 @@ class PathTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "Linked traversal"):
                     self.walk(tree, "station/panel")
 
+    def test_broken_link_after_ambiguous_siblings(self):
+        none = 0xffff
+
+        def three_children():
+            nodes, attrs, vectors = fixture(duplicate=True)
+            row = list(nodes[6])
+            row[3] = 7
+            nodes[6] = tuple(row)
+            first = len(attrs)
+            attrs.append((joaat("id"), joaat("extra"), 0, 5, 1, 0))
+            nodes.append((joaat("state"), 3, none, none, 6, first, 1, 1))
+            return nodes, attrs, vectors
+
+        rows = self.walk(three_children(), "station", "./panel")
+        self.assertEqual((rows[-1]["status"], rows[-1]["after"]), ("ambiguous", 3))
+        for index, link, value in ((7, 4, 5), (6, 3, 5), (7, 1, 1)):
+            with self.subTest(index=index, link=link):
+                tree = three_children()
+                row = list(tree[0][index])
+                row[link] = value
+                tree[0][index] = tuple(row)
+                with self.assertRaisesRegex(ValueError, "Linked traversal returned -3"):
+                    self.walk(tree, "station", "./panel")
+
 
 if __name__ == "__main__":
     HOST = Path(sys.argv.pop(1))

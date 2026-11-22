@@ -5,8 +5,11 @@ namespace dxr_fixture {
 struct Ray {
     float x, y, z, nearT, dx, dy, dz, farT;
     UINT mask = 255;
+    UINT flags = 0; // RAY_FLAG_* bits, optionally with report_facing.
 };
-static_assert(sizeof(Ray) == 36);
+static_assert(sizeof(Ray) == 40);
+// Not a ray flag: asks the shader to add 2 to the hit word for a front-facing hit.
+constexpr UINT report_facing = 0x80000000u;
 using Vertex = std::array<float, 3>;
 struct SceneUpdate {
     std::vector<Vertex> vertices;
