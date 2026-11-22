@@ -188,22 +188,22 @@ The WARP control compiles the source-built compute shader with its root signatur
 
 ### Fixed-profile archive rescan
 
-The Windows readback run at `1aafb0f` revisited all 26,503 records using the preceding PS, CS and MS binding profiles. Reclassification at `f94c254` returned the same record identities for both affected PS profiles. The emitted sources for all passing records and both coverage selector values matched those used in the Windows run. Compared with the previous per-profile runs, one additional PS compiled, built a graphics pipeline and produced the expected pixels on both adapters. No previously passing record dropped out.
+The fixed profiles previously verified 861 records. The Windows readback run at `1aafb0f` revisited all 26,503 records and added a packed RGB PS. Reclassification at `f94c254` reproduced the same 862 passes. A final full scan at `26544c6` reproduced every previous accepted source byte for byte and added one texture-sampling PS. The table incorporates its separate Windows readback.
 
 | Stage | Records | Desktop DXIL | D3D12 pipeline | Output matched on both adapters | Change in each verified column |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| PS | 12,101 | 848 | 848 | 848 | +1 |
+| PS | 12,101 | 849 | 849 | 849 | +2 |
 | MS | 9,282 | 2 | 2 | 2 | 0 |
 | CS | 2,689 | 12 | 12 | 12 | 0 |
 | VS | 2,236 | 0 | 0 | 0 | 0 |
 | GS | 195 | 0 | 0 | 0 | 0 |
-| Total | 26,503 | 862 | 862 | 862 | +1 |
+| Total | 26,503 | 863 | 863 | 863 | +2 |
 
 Each archive record counts once across profiles, inputs and adapters. Generated variants and repeated copies of the same native program can serve multiple records. The graphics checks use controlled partner stages, descriptors and draw inputs. The compute checks use a fixed raw UAV with an independent expected word array.
 
-- **PS.** The accepted sets were disjoint in this input: 335 general color, 35 interpolated attribute, 354 two-table depth and 124 sampled coverage. Of the remaining records, 837 stopped at the native program boundary or its control-flow checks and 10,416 reached lowering without matching a binding profile. For those 10,416 records, the first general configuration alone (table s8, interpolation s9, fixed sampler, no CB) first rejected 2,927 for an unresolved constant buffer and 2,007 at `s_setreg_imm32_b32`. A different binding can expose a different next instruction.
+- **PS.** The accepted sets were disjoint in this input and covered 336 general color, 35 interpolated attribute, 354 two-table depth and 124 sampled coverage. Of the remaining records, 837 stopped at the native program boundary or its control-flow checks and 10,415 reached lowering without matching a binding profile. For those 10,415 records, the first general configuration alone (table s8, interpolation s9, fixed sampler, no CB) first rejected 2,927 for an unresolved constant buffer and 2,007 at `s_setreg_imm32_b32`. A different binding can expose a different next instruction.
 - **CS.** The first rejection was unsupported thread-group dimensions for 1,054 records, an unverified multi-exit program for 1,002 and the fixed store lowering for 621. The 12 successes were tested with 320-word readbacks in 14 dispatches on each adapter.
-- **MS.** All 9,282 programs supplied a bounded span. As in the preceding survey, the point profile targeted the shortest program (832 bytes) and the indexed profile examined the 531 programs at most 1,200 bytes long. The length-first survey counted 8,751 longer programs. The audit CLI checks the entry before applying the size filter: 309 of those longer programs were rejected for multiple exits and 8,442 reached the size filter. All 531 shorter entries passed entry validation. Within the 531, 427 records (24 native streams) first read entry register `s23` without an established binding. One indexed record reached a visible triangle. The shortest, degenerate case was checked using exported positions and indices as well as raster pixels.
+- **MS.** All 9,282 programs supplied a bounded span. As in the preceding survey, the point profile targeted the shortest program (832 bytes) and the indexed profile examined the 531 programs at most 1,200 bytes long. The length-first survey counted 8,751 longer programs. The audit CLI checks the entry before applying the size filter. It rejected 309 of those longer programs for multiple exits. The other 8,442 reached the size filter. All 531 shorter entries passed entry validation. Within the 531, 427 records (24 native streams) first read entry register `s23` without an established binding. One indexed record reached a visible triangle. The shortest, degenerate case was checked using exported positions and indices as well as raster pixels.
 - **VS and GS.** Neither stage has a package translator in these profiles. Their first stop is stage dispatch.
 
 Windows 11 build 26200.9974, D3D12 debug layer enabled, NVIDIA GeForce RTX 4060 Laptop GPU 32.0.16.1656 and WARP 10.0.26100.9818. Both adapters completed every accepted record. The sampled coverage group used two separate selector bindings. The mesh and depth checks retained their indexed-export and swapped-table controls.
@@ -214,9 +214,9 @@ To repeat the inventory with a local archive and an LLVM 15 library built with A
 python3 -B tools/shader_profile_audit.py "$ARCHIVE" --llvm libLLVM-15.so.1 --source-dir out/profile-sources > out/profile-counts.json
 ```
 
-The additional PS reads a packed word from the first constant buffer. Its low three bytes select RGB and each byte goes through the piecewise sRGB-to-linear conversion before a round-toward-zero binary16 export. The new readback reference evaluates the scalar transfer function independently. Inputs include byte values 10 and 11 on opposite sides of the threshold, distinct channel values and a change to the unused high byte. All six positive draws across the two adapters matched. All six rotated-channel references failed at pixel comparison.
+The first additional PS reads a packed word from the first constant buffer. Its low three bytes select RGB and each byte goes through the piecewise sRGB-to-linear conversion before a round-toward-zero binary16 export. The new readback reference evaluates the scalar transfer function independently. Inputs include byte values 10 and 11 on opposite sides of the threshold, distinct channel values and a change to the unused high byte. All six positive draws across the two adapters matched. All six rotated-channel references failed at pixel comparison.
 
-With the archive scan complete, run the following in Developer PowerShell. The source selector identifies the three-byte conversion in this measured corpus and rejects a missing or ambiguous match. The other profiles use the draw and dispatch fixtures documented in their experiment sections.
+With the archive scan complete and `offscreen_check` configured, run the following in Developer PowerShell. The source selector identifies the three-byte conversion in this measured corpus and rejects a missing or ambiguous match. The other profiles use the draw and dispatch fixtures documented in their experiment sections.
 
 ```powershell
 $packed = @(Get-ChildItem out/profile-sources/general/*.hlsl | Where-Object {
@@ -228,6 +228,25 @@ if ($LASTEXITCODE -ne 0) { throw "DXC failed" }
 cmake --build --preset dev --target offscreen_check
 python -B tests/packed_rgb_case.py out/build/dev/offscreen_check.exe out/packed-rgb.dxil hardware
 python -B tests/packed_rgb_case.py out/build/dev/offscreen_check.exe out/packed-rgb.dxil warp
+```
+
+The second additional PS samples RGB and supplies a constant 1 for alpha. The color ramp check covered 4,096 pixels, and the transparent black input produced opaque black for all 1,024 pixels. Both adapters caught red/blue exchange on the ramp and rejected a reference that copied the input alpha. To repeat on the final scan, select the local source with that three-channel sample export and run the existing draw modes:
+
+```powershell
+$opaque = @(Get-ChildItem out/profile-sources/general/*.hlsl | Where-Object {
+    (Get-Content -Raw $_.FullName) -match 'return float4\(export16\(sample\d+\.x\), export16\(sample\d+\.y\), export16\(sample\d+\.z\), export16\(alu\d+\)\);'
+})
+if ($opaque.Count -ne 1) { throw "Expected one sampled RGB / constant alpha export" }
+dxc -Gis -T ps_6_0 -E main -Fo out/opaque.dxil $opaque[0].FullName
+if ($LASTEXITCODE -ne 0) { throw "DXC failed" }
+python -c "import struct,pathlib; p=pathlib.Path('out'); (p/'opaque.case').write_bytes(bytes(256)+struct.pack('<4f',0,0,0,1)*1024); (p/'copied-alpha.case').write_bytes(bytes(256+16*1024))"
+foreach ($adapter in 'hardware','warp') {
+    out/build/dev/offscreen_check.exe $adapter --check-pixel out/opaque.dxil rgba
+    out/build/dev/offscreen_check.exe $adapter --check-pixel-attribute out/opaque.dxil out/opaque.case
+    # Each control below should exit 1 with pixel_mismatch.
+    out/build/dev/offscreen_check.exe $adapter --check-pixel out/opaque.dxil bgra
+    out/build/dev/offscreen_check.exe $adapter --check-pixel-attribute out/opaque.dxil out/copied-alpha.case
+}
 ```
 
 ## Offline CPU leaf recompilation
