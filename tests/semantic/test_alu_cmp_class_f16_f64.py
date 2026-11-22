@@ -196,6 +196,8 @@ class CmpClassF64Tests(unittest.TestCase):
             "v_cmp_class_f16_e64 s0, v1, 1 op_sel:[0,1]",
             "v_cmp_class_f64_e64 s0, v[2:3], 1 clamp",
             "v_cmp_class_f64_e64 s0, v[2:3], 1 op_sel:[1,0]",
+            "v_cmp_class_f16_e64 s0, v1, -v2",      # src1 is the integer mask, not a float: no neg/abs on it
+            "v_cmpx_class_f16_e64 s0, v1, 1",      # v_cmpx writes EXEC and has no VDST
         ):
             with self.subTest(bad=bad), self.assertRaises(rdna2spirv.Unsupported):
                 translate_lines([bad])
