@@ -120,8 +120,8 @@ const std::vector<Case>& cases() {
         {"D2 in-range Draw control", 1, 3, no_index_buffer, {}, 0, false, 3, 0, false, true, {red, blue, blue, red},
          0, -1, true},
         // The view ends 8 bytes into vertex 3: its position is inside, its colour outside. Measured: D3D12 keeps the
-        // position and zeroes the colour (per element); so does the layer on the RTX 4060 Ti. Vulkan allows other
-        // vertex inputs of the binding to read as zero too, so another driver may differ.
+        // position and zeroes the colour (per element). Vulkan allows other vertex inputs of a binding to read as zero
+        // too, so the layer gives each element its own binding (D3D-353) and the bound is per element on any driver.
         {"E partial vertex: view of 3 vertices + 8 bytes, uses vertex 3", 1, 3, DXGI_FORMAT_R16_UINT, {0, 1, 3}, 3,
          true, 3, 4, false, true,
          {Pixel{229, 0, 0, 229}, Pixel{149, 0, 0, 149}, Pixel{53, 0, 0, 53}, Pixel{181, 0, 0, 181}}, 8, 2},

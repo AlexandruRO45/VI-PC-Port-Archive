@@ -751,6 +751,16 @@ struct GraphicsPipeline {
     VkImageAspectFlags depth_aspects = 0;
     std::uint32_t vertex_slots = 0;       // bit per input slot the input layout uses
     std::uint32_t zero_step_slots = 0;    // per-instance slots with InstanceDataStepRate 0: stride 0 at draw time
+    // D3D-353: Vulkan binding i reads input slot element_bindings[i].slot from element_bindings[i].offset on, one
+    // binding per input element with its attribute at offset 0. D3D12 bounds a vertex read per element, while
+    // robustBufferAccess2 may treat every attribute of a binding as out of range when one is ("Vertex Input
+    // Description" in the Vulkan spec); with one attribute per binding the binding's range is the element's.
+    // Empty: one binding per input slot (more attributes than maxVertexInputBindings).
+    struct ElementBinding {
+        std::uint32_t slot = 0;
+        std::uint32_t offset = 0;
+    };
+    std::vector<ElementBinding> element_bindings;
     std::uint32_t strip_cut = 0;          // D3D12_INDEX_BUFFER_STRIP_CUT_VALUE (0: off, 1: 0xFFFF, 2: 0xFFFFFFFF)
     // The same pipeline with some attachment formats VK_FORMAT_UNDEFINED, for a draw that leaves those slots
     // unbound (D3D12 allows it; dynamic rendering needs the formats to agree). Bit i: colour slot i, bit 8: depth
@@ -1947,7 +1957,41 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
 
     // An unbound vertex-buffer slot reads zeros, as in D3D12: the zero page with stride 0. Per-instance slots with
     // step rate 0 also take stride 0, so every instance reads element 0.
-    for (std::uint32_t slot = 0; slot < 32; ++slot) {
+    if (!pipeline->element_bindings.empty()) {
+        // One binding per input element (D3D-353): the slot's view, starting at the element's offset. An element at
+        // or past the view's end reads zeros for every vertex, as D3D12 bounds it: the zero page.
+        const std::size_t count = pipeline->element_bindings.size();
+        p.vertex_buffers.assign(count, VK_NULL_HANDLE);
+        p.vertex_offsets.assign(count, 0);
+        p.vertex_sizes.assign(count, VK_WHOLE_SIZE);
+        p.vertex_strides.assign(count, 0);
+        for (std::size_t b = 0; b < count; ++b) {
+            const auto [slot, element_offset] = pipeline->element_bindings[b];
+            const bool bound = slot < draw.vertex_buffers.size() && draw.vertex_buffers[slot].va;
+            const VertexBufferView* view = bound ? &draw.vertex_buffers[slot] : nullptr;
+            if (!view || element_offset >= view->size) {
+                if (!vk.zero_buffer) return ReplayResult::unresolved_resource;
+                p.vertex_buffers[b] = vk.zero_buffer;
+                p.vertex_offsets[b] = vk.zero_offset;
+                p.vertex_sizes[b] = vk.zero_size;
+                continue;
+            }
+            std::uint64_t size = view->size;
+            if (!vk.buffer_at(view->va, size, p.vertex_buffers[b], p.vertex_offsets[b]))
+                return ReplayResult::unresolved_resource;
+            if (size <= element_offset) {  // buffer_at cut the range at the buffer's end before the element
+                p.vertex_buffers[b] = vk.zero_buffer;
+                p.vertex_offsets[b] = vk.zero_offset;
+                p.vertex_sizes[b] = vk.zero_size;
+                if (!vk.zero_buffer) return ReplayResult::unresolved_resource;
+                continue;
+            }
+            p.vertex_offsets[b] += element_offset;
+            p.vertex_sizes[b] = size - element_offset;
+            p.vertex_strides[b] = (pipeline->zero_step_slots & (1u << slot)) ? 0 : view->stride;
+        }
+    }
+    for (std::uint32_t slot = 0; pipeline->element_bindings.empty() && slot < 32; ++slot) {
         if (!(pipeline->vertex_slots & (1u << slot))) continue;
         p.vertex_buffers.resize(slot + 1, VK_NULL_HANDLE);
         p.vertex_offsets.resize(slot + 1, 0);

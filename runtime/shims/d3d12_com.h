@@ -85,6 +85,9 @@ struct VulkanDeviceInfo {
     bool separate_depth_stencil_layouts = true;
     std::uint32_t max_push_constants_size = 0;
     bool push_constants_need_fallback = false;
+    // maxVertexInputBindings; 0 until read, then a pipeline whose input layout feeds more attributes than this keeps
+    // one binding per input slot (D3D-353).
+    std::uint32_t max_vertex_input_bindings = 0;
     // The subgroup sizes the device offers and whether subgroupSizeControl / computeFullSubgroups are enabled on it
     // (src/subgroup_size.h). Default: nothing, so pipelines request no size.
     leonida::SubgroupSizeCaps subgroup;

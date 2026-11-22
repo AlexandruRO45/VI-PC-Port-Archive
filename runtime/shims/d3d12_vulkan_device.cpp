@@ -2620,6 +2620,11 @@ public:
         std::vector<VkVertexInputAttributeDescription> attributes;
         std::vector<VkVertexInputBindingDescription> bindings;
         UINT slot_end[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] = {};
+        struct PerElement {
+            leonida::GraphicsPipeline::ElementBinding binding;
+            bool instance = false;
+        };
+        std::vector<PerElement> per_element;  // by attribute, for the one-binding-per-element layout below
         for (UINT i = 0; i < desc.InputLayout.NumElements; ++i) {
             const D3D12_INPUT_ELEMENT_DESC& element = desc.InputLayout.pInputElementDescs[i];
             if (element.InputSlot >= D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) return E_INVALIDARG;
@@ -2642,6 +2647,7 @@ public:
             if (!input) continue;  // the shader does not read this element
             attributes.push_back({input->register_index, element.InputSlot, format, offset});
             const bool instance = element.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA;
+            per_element.push_back({{element.InputSlot, offset}, instance});
             // Step rate 0: every instance reads element 0, which a stride of 0 gives (set at each draw).
             if (instance && element.InstanceDataStepRate == 0) graphics_.zero_step_slots |= 1u << element.InputSlot;
             if (instance && element.InstanceDataStepRate > 1)
@@ -2660,6 +2666,23 @@ public:
                 std::fprintf(stderr, "[rt] d3d12: the input layout does not feed %s%u (register %u)\n",
                              e.semantic.c_str(), e.semantic_index, e.register_index);
                 return E_INVALIDARG;
+            }
+        }
+        // D3D-353: one binding per attribute, the element's offset moved into the binding's offset at each draw, so
+        // a view that ends inside a vertex cuts off only the elements past its end, as D3D12 does. 16 is the Vulkan
+        // minimum of maxVertexInputBindings, for a device that has not been asked.
+        const std::uint32_t binding_limit =
+            device_.info.max_vertex_input_bindings ? device_.info.max_vertex_input_bindings : 16;
+        if (!attributes.empty() && attributes.size() <= binding_limit) {
+            bindings.clear();
+            graphics_.element_bindings.clear();
+            for (std::uint32_t a = 0; a < attributes.size(); ++a) {
+                attributes[a].binding = a;
+                attributes[a].offset = 0;
+                bindings.push_back({a, 0,  // stride: dynamic, from IASetVertexBuffers
+                                    per_element[a].instance ? VK_VERTEX_INPUT_RATE_INSTANCE
+                                                            : VK_VERTEX_INPUT_RATE_VERTEX});
+                graphics_.element_bindings.push_back(per_element[a].binding);
             }
         }
         VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
@@ -3874,6 +3897,8 @@ public:
                     state_.info.max_push_constants_size = props.limits.maxPushConstantsSize;
                     state_.info.push_constants_need_fallback = (state_.info.max_push_constants_size < 144);
                 }
+                if (state_.info.max_vertex_input_bindings == 0)
+                    state_.info.max_vertex_input_bindings = props.limits.maxVertexInputBindings;
                 // The counts D3D12 offers with no outputs are the target-independent-rasterization ones: 1, 4, 8
                 // and 16 (ForcedSampleCount is 0, 1, 4, 8 or 16; DirectX-Specs VulkanOn12.md "Sample-frequency MSAA
                 // with no render targets bound": a driver reports at least 0b11101). 2x is not one of them, though

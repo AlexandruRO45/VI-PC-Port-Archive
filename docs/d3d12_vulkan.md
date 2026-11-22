@@ -706,8 +706,14 @@ The compute path, end to end:
       (173, 0, 0, 173) and (208, 0, 0, 208) on both);
     - a view that ends 8 bytes into a vertex keeps that vertex's position (inside) and zeroes its colour (outside):
       D3D12 checks per element (probes (229, 0, 0, 229), (149, 0, 0, 149), (53, 0, 0, 53), (181, 0, 0, 181), the same on
-      both hosts and on the layer on the RTX 4060 Ti). Vulkan only promises that the other vertex inputs of the binding
-      may behave as out of range too, so another driver may zero the whole vertex;
+      both hosts and on the layer on the RTX 4060 Ti). Vulkan lets the other vertex inputs of a binding behave as out of
+      range too when one is, and AMD's 23.40 driver on an RDNA2 iGPU (gfx1036) zeroed the whole vertex (D3D-353). So
+      the layer gives each input element its own binding (D3D-353): the slot's buffer from the element's offset on,
+      with the attribute at offset 0, so the binding's range is the element's and the bound is per element on every
+      driver. An element at or past the view's end binds the zero page. A layout that feeds more attributes than
+      `maxVertexInputBindings` (16 at least) keeps one binding per slot and the driver's choice. Checked on an AMD
+      RX 7700 XT (RDNA3, Windows driver 26.10.1), which matched D3D12 per element before and after the change;
+      with it, the fallback pass (`LEONIDA_NO_IA_BOUNDS=1`) also draws case E as D3D12 does;
     - a draw with no index buffer bound and more indices than the zero page holds reads index 0 throughout.
 
     Every resource is a range of the one arena buffer, so Vulkan's own bounds are the arena's. With both
