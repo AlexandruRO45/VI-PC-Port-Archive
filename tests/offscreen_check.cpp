@@ -343,7 +343,7 @@ bool report_debug_errors(ID3D12InfoQueue* messages)
 // Windows 10 in-box WARP (SM 6.2), rejects them at pipeline creation with E_INVALIDARG.
 bool needs_cs_6_5(std::string_view operation)
 {
-    return operation == "--buffer-ops" || operation == "--bvh-reads" || operation == "--bvh-waves" ||
+    return operation == "--bvh-reads" || operation == "--bvh-waves" ||
            operation == "--bvh-hits" || operation == "--bvh-packed" || operation == "--bvh-numeric" ||
            operation == "--bvh-atomics";
 }
@@ -546,6 +546,14 @@ int main(int argc, char** argv)
         } else if (argc == 3 && operation == "--gpu-alias-registry") {
             if (!check_gpu_alias_registry(device.Get())) return 77;
         } else if (argc == 3 && operation == "--buffer-ops") {
+            D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_0};
+            const HRESULT hr = check_feature(device.Get(), D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model));
+            if (hr != E_INVALIDARG) check(hr, "Query buffer operation shader model");
+            if (hr == E_INVALIDARG || model.HighestShaderModel < D3D_SHADER_MODEL_6_0) {
+                std::puts("Buffer operations require Shader Model 6.0");
+                return 77;
+            }
+            std::printf("shader_model_capped_at_6_0=0x%x\n", model.HighestShaderModel);
             check_buffer_ops(device.Get());
         } else if (argc == 3 && (operation == "--ray-query" || operation == "--dxr-pipeline")) {
             if (!check_dxr_rays(device.Get(), operation == "--dxr-pipeline")) return 77;
