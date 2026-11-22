@@ -224,11 +224,14 @@ class StageValidationAndSequencingTest(unittest.TestCase):
         mocks["pipelines"].assert_not_called()
 
     def test_independent_stages_all_run_when_listed_out_of_order(self):
-        """shaders/assets/runtime overlap; pipelines still runs once shaders (and the checker) are ready."""
+        """shaders/assets/runtime overlap; pipelines still runs once shaders (and the checker) are ready.
+        wave64_settings is patched: left to probe the installed GPU it returns keep_emulated=False on native-wave64
+        RDNA2 under the AMD Windows driver, and the test then failed there (TEST-461)."""
         manager = MagicMock()
         with patch.object(sys, "argv", ["make_game.py", "--game", self.game_dir,
                                         "--out", self.out_dir, "--work", self.work_dir, "--no-tui",
-                                        "--stages", "pipelines,runtime,assets,shaders"]):
+                                        "--stages", "pipelines,runtime,assets,shaders"]), \
+                patch("make_game.wave64_settings", return_value=(False, True)):
             with patch("make_game.below_normal"):
                 with patch("make_game.check", return_value={"expected_exe": "Leonida.exe"}):
                     with patch("make_game.preflight"):
@@ -322,10 +325,11 @@ class JobsHandlingTest(unittest.TestCase):
                             with patch("make_game.log"):
                                 with patch("make_game.shaders") as mock_shaders, \
                                         patch("make_game.wave64_settings", return_value=(True, True)) as probe, \
-                                        patch("make_game.runtime_gpu_per_vertex", return_value=None):
+                                        patch("make_game.runtime_gpu_per_vertex", return_value=None), \
+                                        patch("make_game.runtime_gpu_max_push_constants", return_value=None):
                                     ret = make_game.main()
                                     self.assertEqual(ret, 0)
-                                    probe.assert_called_once_with("auto")
+                                    probe.assert_called_once_with("auto", mesh_compute=False)
                                     mock_preflight.assert_called_once_with(
                                         ["shaders"], os.path.abspath(work), False, None,
                                         emulate=True, keep_emulated=True, fallbacks=(), jobs=6)
