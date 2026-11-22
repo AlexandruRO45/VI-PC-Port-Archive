@@ -1182,5 +1182,88 @@ class TestValuMadU32U16StatusFlags(unittest.TestCase):
         self.assertTrue(flags.overflow_s32)
 
 
+class TestValuMadU32U16IEEE754Boundaries(unittest.TestCase):
+    """Unit tests for IEEE 754 bit-pattern extremes, subnormals, and NaN handling."""
+
+    POS_ZERO_F16: int = 0x0000
+    NEG_ZERO_F16: int = 0x8000
+    POS_INF_F16: int = 0x7C00
+    NEG_INF_F16: int = 0xFC00
+    QNAN_F16: int = 0x7E00
+    SNAN_F16: int = 0x7D00
+    MIN_NORMAL_F16: int = 0x0400
+    MAX_SUBNORMAL_F16: int = 0x03FF
+    MIN_SUBNORMAL_F16: int = 0x0001
+
+    POS_ZERO_F32: int = 0x0000_0000
+    NEG_ZERO_F32: int = 0x8000_0000
+    POS_INF_F32: int = 0x7F80_0000
+    NEG_INF_F32: int = 0xFF80_0000
+    QNAN_F32: int = 0x7FC0_0000
+    SNAN_F32: int = 0x7F80_0001
+
+    @staticmethod
+    def f16_to_bits(val: float) -> int:
+        return struct.unpack("<H", struct.pack("<e", val))[0]
+
+    @staticmethod
+    def f32_to_bits(val: float) -> int:
+        return struct.unpack("<I", struct.pack("<f", val))[0]
+
+    def test_ieee754_zero_bit_patterns(self) -> None:
+        dst_pos, carry_pos = ref_mad_u32_u16(self.POS_ZERO_F16, 2, 0)
+        self.assertEqual(dst_pos, 0)
+        self.assertEqual(carry_pos, 0)
+
+        # -0.0 in f16 is 0x8000 = 32768 unsigned
+        # 32768 * 2 = 65536 = 0x10000
+        dst_neg, carry_neg = ref_mad_u32_u16(self.NEG_ZERO_F16, 2, 0)
+        self.assertEqual(dst_neg, 0x1_0000)
+        self.assertEqual(carry_neg, 0)
+
+    def test_subnormal_no_flush_to_zero(self) -> None:
+        dst_min, _ = ref_mad_u32_u16(self.MIN_SUBNORMAL_F16, 0x100, 5)
+        self.assertEqual(dst_min, 0x105)
+
+        dst_max, _ = ref_mad_u32_u16(self.MAX_SUBNORMAL_F16, 1, 0)
+        self.assertEqual(dst_max, self.MAX_SUBNORMAL_F16)
+
+    def test_nan_payload_preservation(self) -> None:
+        dst_qnan, _ = ref_mad_u32_u16(self.QNAN_F16, 1, 0)
+        self.assertEqual(dst_qnan, self.QNAN_F16)
+
+        dst_snan, _ = ref_mad_u32_u16(self.SNAN_F16, 1, 0)
+        self.assertEqual(dst_snan, self.SNAN_F16)
+
+    def test_infinity_bit_patterns(self) -> None:
+        dst_pos_inf, _ = ref_mad_u32_u16(self.POS_INF_F16, 2, 0)
+        self.assertEqual(dst_pos_inf, self.POS_INF_F16 * 2)
+
+        dst_neg_inf, carry = ref_mad_u32_u16(self.NEG_INF_F16, 2, 0)
+        self.assertEqual(dst_neg_inf, self.NEG_INF_F16 * 2)
+        self.assertEqual(carry, 0)
+
+    def test_float32_src2_patterns(self) -> None:
+        dst_qnan32, carry = ref_mad_u32_u16(0, 0, self.QNAN_F32)
+        self.assertEqual(dst_qnan32, self.QNAN_F32)
+        self.assertEqual(carry, 0)
+
+        dst_inf32, carry = ref_mad_u32_u16(0, 0, self.POS_INF_F32)
+        self.assertEqual(dst_inf32, self.POS_INF_F32)
+        self.assertEqual(carry, 0)
+
+    def test_fixed_point_8_8_arithmetic(self) -> None:
+        # Emulate 8.8 fixed-point arithmetic using v_mad_u32_u16:
+        # 1.5 * 2.5 = 3.75
+        fp_1_5 = int(1.5 * 256)  # 384 = 0x0180
+        fp_2_5 = int(2.5 * 256)  # 640 = 0x0280
+
+        dst32, carry = ref_mad_u32_u16(fp_1_5, fp_2_5, 0)
+        # Expected in 16.16: 3.75 * 65536 = 245760 = 0x03C000
+        expected_16_16 = int(3.75 * 65536)
+        self.assertEqual(dst32, expected_16_16)
+        self.assertEqual(carry, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
