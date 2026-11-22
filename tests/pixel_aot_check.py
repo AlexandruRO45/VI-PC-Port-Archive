@@ -209,8 +209,8 @@ def write_case(path, constants, pixels, *, nan_mask=None, integer_rt=False):
     """Write a renderer case: 256 constant bytes, then 64 expected float4 rows in row-major order.
 
     A single float4 broadcasts to every texel. The optional trailer appends one flags byte, whose
-    bit 0 selects the lossless R32G32B32A32_UINT readback target, followed by 64 per-texel mask
-    bytes whose bit ch accepts a NaN of any sign or payload on that channel. Cases written without
+    bit 0 selects the lossless R32G32B32A32_UINT readback target. Floating-point cases may instead
+    append a zero flags byte and 64 mask bytes for per-channel NaN-class checks. Cases written without
     integer_rt or nan_mask keep the original 1280-byte format exactly.
     """
     rows = [pixels] * 64 if len(pixels) == 4 and not isinstance(pixels[0], (list, tuple)) else list(pixels)
@@ -219,14 +219,16 @@ def write_case(path, constants, pixels, *, nan_mask=None, integer_rt=False):
     data = bytearray(bytes(constants))
     for row in rows:
         data += struct.pack("<4f", *row)
-    if integer_rt or nan_mask is not None:
+    if integer_rt:
+        if nan_mask is not None:
+            raise ValueError("NaN-class masks require a floating-point render target")
+        data.append(1)
+    elif nan_mask is not None:
         if isinstance(nan_mask, int):
             nan_mask = bytes([nan_mask]) * 64
-        elif nan_mask is None:
-            nan_mask = bytes(64)
         elif len(nan_mask) != 64:
             raise ValueError("The NaN-class mask needs exactly 64 texel bytes")
-        data.append(1 if integer_rt else 0)
+        data.append(0)
         data += nan_mask
     Path(path).write_bytes(data)
     return Path(path)
