@@ -18,7 +18,8 @@
 //                                indices; the layout lists location:float-components, one item per attribute.
 //   VKH_BINARY_OUT=<file>        writes the pipeline's VK_KHR_pipeline_binary data after building it
 //   VKH_BINARY_IN=<file>         builds the pipeline from such a file instead (tools/ps_oracle.py patches the pixel
-//                                shader in it); both exit 77 without VK_KHR_pipeline_binary
+//                                shader in it); both exit 77 without VK_KHR_pipeline_binary, on the device or in
+//                                the Vulkan headers this was built with
 //   VKH_COLOR_FORMAT=<VkFormat>:<bytes>  the color target's format and texel size (default RGBA32F, 16); out.raw
 //                                holds the texels as stored; 77 when the format is no color attachment
 //   VKH_SUBGROUP_SIZE=32|64      requires that subgroup size of the fragment shader (or of the compute or geometry
@@ -453,9 +454,12 @@ int main(int argc, char** argv) {
     // size, the data.
     const char* bin_out = std::getenv("VKH_BINARY_OUT");
     const char* bin_in = std::getenv("VKH_BINARY_IN");
+#ifdef VK_KHR_PIPELINE_BINARY_EXTENSION_NAME  // Vulkan headers older than 1.3.294 (Ubuntu 24.04's 1.3.275) lack it
     VkPhysicalDevicePipelineBinaryFeaturesKHR pbf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR};
     VkPhysicalDeviceMaintenance5FeaturesKHR m5{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
+#endif
     if (bin_out || bin_in) {
+#ifdef VK_KHR_PIPELINE_BINARY_EXTENSION_NAME
         VkPhysicalDeviceFeatures2 q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         VkPhysicalDevicePipelineBinaryFeaturesKHR pbq{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR};
         q.pNext = &pbq;
@@ -469,6 +473,10 @@ int main(int argc, char** argv) {
         enable.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
         pbf.pipelineBinaries = VK_TRUE; pbf.pNext = chain; chain = &pbf;
         m5.maintenance5 = VK_TRUE; m5.pNext = chain; chain = &m5;
+#else
+        std::fprintf(stderr, "unsupported: no VK_KHR_pipeline_binary (built with Vulkan headers without it)\n");
+        return 77;
+#endif
     }
     for (auto e : enable) std::fprintf(stderr, "enabled %s\n", e);
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
@@ -749,6 +757,7 @@ int main(int argc, char** argv) {
         gpi.pDepthStencilState = &ds_state;
     }
     gpi.layout = pl; gpi.renderPass = rp;
+#ifdef VK_KHR_PIPELINE_BINARY_EXTENSION_NAME   // without it VKH_BINARY_OUT / _IN already exited 77 above
     VkPipelineCreateFlags2CreateInfoKHR capture{VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR};
     std::vector<VkPipelineBinaryKHR> in_bins;
     VkPipelineBinaryInfoKHR bin_info{VK_STRUCTURE_TYPE_PIPELINE_BINARY_INFO_KHR};
@@ -787,7 +796,9 @@ int main(int argc, char** argv) {
         gpi.pNext = &bin_info;
         std::fprintf(stderr, "pipeline from %u binaries in %s\n", count, bin_in);
     }
+#endif
     VkPipeline pipe; CHECK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpi, nullptr, &pipe));
+#ifdef VK_KHR_PIPELINE_BINARY_EXTENSION_NAME
     if (bin_out) {
         auto vkCreatePipelineBinariesKHR = reinterpret_cast<PFN_vkCreatePipelineBinariesKHR>(
             vkGetDeviceProcAddr(dev, "vkCreatePipelineBinariesKHR"));
@@ -824,6 +835,7 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "wrote %u pipeline binaries to %s\n", count, bin_out);
     }
+#endif
     VkPipeline cpipe = VK_NULL_HANDLE;
     if (mesh_compute) {
         VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
