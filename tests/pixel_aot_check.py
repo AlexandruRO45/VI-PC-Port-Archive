@@ -551,6 +551,8 @@ SOPK_CMPK_WORDS = (
     (0xffff8000, 0x00008000, 0x13579bdf, 0x0000ffff),
     (0x00008000, 0xffff8000, 0x2468ace0, 0xffffffff),
     (0xffff8001, 0x00008001, 0x2468ace0, 0),
+    (0xffff8001, 0x00008001, 0xfffffffe, 0xffffffff),
+    (0xffff8001, 0x00008001, 0x2468ace0, 1),
 )
 
 
@@ -567,11 +569,16 @@ def sopk_cmpk_cmovk() -> list[str]:
             "s_or_b32 s53, s53, s63",
         ]
     body += [
+        "s_cmpk_eq_u32 s45, 0x8001",
+        "s_cselect_b32 s63, 64, 0",
+        "s_or_b32 s53, s53, s63",
         "s_mov_b32 s50, s46",
         "s_mov_b32 s51, s46",
         "s_cmpk_eq_i32 s47, 0xffff",
         "s_cmovk_i32 s50, 0xfffe",
         "s_cmovk_i32 s51, 0x7fff",
+        "s_cmpk_eq_i32 s47, 1",
+        "s_cmovk_i32 s51, 0x8000",
         "v_mov_b32_e32 v12, s52",
         "v_mov_b32_e32 v13, s53",
         "v_mov_b32_e32 v14, s50",
@@ -593,8 +600,11 @@ def sopk_cmpk_cmovk_reference(words):
     }
     mask_i32 = sum((1 << bit) for bit, op in enumerate(SOPK_CMPK_OPS) if preds[op](signed44, -0x8000))
     mask_u32 = sum((1 << bit) for bit, op in enumerate(SOPK_CMPK_OPS) if preds[op](s45, 0x8000))
+    mask_u32 |= (1 << len(SOPK_CMPK_OPS)) * (s45 == 0x8001)
     take = s47 == 0xffffffff
-    return (mask_i32, mask_u32, 0xfffffffe if take else s46, 0x00007fff if take else s46)
+    first = 0xfffffffe if take else s46
+    second = {-1: 0x7fff, 1: -32768}.get(s47 - (1 << 32) if s47 >> 31 else s47, s46)
+    return (mask_i32, mask_u32, first, second % (1 << 32))
 
 
 def rounding():
@@ -2349,13 +2359,13 @@ def sop1_scalar_ops() -> list[str]:
     ])
 
 
-def sop1_scalar_ops_reference(words):
+def sop1_scalar_ops_reference(words, set_bit=31):
     s44, s45, s46, s47 = words
     signed44 = s44 - (1 << 32) if s44 >> 31 else s44
     abs44 = (-signed44 if signed44 < 0 else signed44) & 0xffffffff
     scc = abs44 != 0
     cmov_reg = s45 if scc else s46
-    bitset = (s46 & ~(1 << (s47 & 31))) | (1 << 31)
+    bitset = (s46 & ~(1 << (s47 & 31))) | (1 << set_bit)
     cmov_lit = 0x12345678 if scc else s46
     return (abs44, cmov_reg, bitset & 0xffffffff, cmov_lit)
 
@@ -5120,7 +5130,8 @@ def check_subrev_u32_draw(directory, compiler, renderer, backend):
         "v_mov_b32_e32 v18, s45",
         "v_subrev_nc_u32_e32 v12, s44, v18",
         "v_sub_nc_u32_e32 v13, s44, v18",
-        "v_mov_b32_e32 v14, 0",
+        "v_mov_b32_e32 v19, s44",
+        "v_subrev_nc_u32_e32 v14, v19, v18",
         "v_mov_b32_e32 v15, 0",
     ])
     source.write_text(lower(program, 20, 24, [1, 2, 3, 4], constant_descriptor=64,
@@ -5136,7 +5147,9 @@ def check_subrev_u32_draw(directory, compiler, renderer, backend):
         constants = bytearray(256)
         struct.pack_into("<2I", constants, 12, *inputs)
         case = directory / f"subrev-u32-{name}.case"
-        case.write_bytes(constants + struct.pack("<4I", *words, 0, 0) * 64 + b"\x01")
+        a, b = inputs
+        two_vgprs = (b - a) % (1 << 32)
+        case.write_bytes(constants + struct.pack("<4I", *words, two_vgprs, 0) * 64 + b"\x01")
         cases.append((case, status))
     run_pixel_batch(renderer, backend, shader, cases)
 
@@ -6457,6 +6470,16 @@ def check_sop1_scalar_ops_draw(directory, compiler, renderer, backend):
         wrong = subprocess.run(draw, capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError(f"Mutating {label} escaped detection")
+
+    # Both high bits start set; s45 equals s46, so the taken s_cmov_b32 leaves the value unchanged.
+    words = (2, 0xc1400009, 0xc1400009, 31)
+    set_bit = 4
+    probe = [line.replace("s_bitset1_b32 s52, 31", f"s_bitset1_b32 s52, {set_bit}") for line in program]
+    assert probe != program
+    source.write_text(translate_int(probe), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    write_words(words, sop1_scalar_ops_reference(words, set_bit))
+    subprocess.run(draw, check=True)
 
 
 def check_bfm_draw(directory, compiler, renderer, backend):
