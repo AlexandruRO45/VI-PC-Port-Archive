@@ -9801,6 +9801,11 @@ def assemble(gen):
             fn.append("OpBeginInvocationInterlockEXT")   # end of the entry block: uniform, executed once
         out = hdr + dec + types + gvars + helpers + fn
         gen.body =["         " + l if not (l.startswith("%") and " = OpLabel" in l) else l for l in flow + body]
+    elif pops:
+        # Straight-line shader (SHADER-350): the same place, the end of the entry prologue before the body, so the
+        # End below always has its Begin.
+        fn.append("OpBeginInvocationInterlockEXT")
+        out = hdr + dec + types + gvars + helpers + fn
     end_lock = "         OpEndInvocationInterlockEXT\n" if pops else ""
     if msc:
         end_lock = gen.msc_epilogue + end_lock
