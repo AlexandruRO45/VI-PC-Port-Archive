@@ -113,6 +113,20 @@ foreach(stage IN ITEMS vs ps)
         DEPENDS tests/triangle.hlsl VERBATIM)
     target_sources(offscreen_check PRIVATE "${header}")
 endforeach()
+foreach(stage IN ITEMS vs ps)
+    string(TOUPPER "${stage}" entry)
+    set(flip_header "${CMAKE_CURRENT_BINARY_DIR}/triangle_${stage}_flip.h")
+    add_custom_command(OUTPUT "${flip_header}"
+        COMMAND "${DXC_EXECUTABLE}" -T ${stage}_6_0 -E ${entry}Main -DFLIP -Vn triangle_${stage}_flip
+                -Fh "${flip_header}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/triangle.hlsl"
+        DEPENDS tests/triangle.hlsl VERBATIM)
+endforeach()
+add_custom_target(triangle_headers DEPENDS
+    "${CMAKE_CURRENT_BINARY_DIR}/triangle_vs.h"
+    "${CMAKE_CURRENT_BINARY_DIR}/triangle_ps.h"
+    "${CMAKE_CURRENT_BINARY_DIR}/triangle_vs_flip.h"
+    "${CMAKE_CURRENT_BINARY_DIR}/triangle_ps_flip.h")
+add_dependencies(offscreen_check triangle_headers)
 set(ray_header "${CMAKE_CURRENT_BINARY_DIR}/ray_query.h")
 set(pixel_vs "${CMAKE_CURRENT_BINARY_DIR}/pixel_aot_vs.h")
 add_custom_command(OUTPUT "${pixel_vs}" COMMAND "${DXC_EXECUTABLE}" -T vs_6_0 -E main
@@ -1830,10 +1844,20 @@ if(EXISTS "${INTAKE_PYTHON}")
     target_include_directories(cpu_shim_compute PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
     target_compile_features(cpu_shim_compute PRIVATE cxx_std_17)
     target_link_libraries(cpu_shim_compute PRIVATE xmem_shim dxgi d3d12)
+    add_library(cpu_shim_draw SHARED tests/cpu/shim_draw_provider.cpp tests/cpu/shim_draw_gpu.cpp)
+    add_dependencies(cpu_shim_draw triangle_headers)
+    target_sources(cpu_shim_draw PRIVATE
+        "${CMAKE_CURRENT_BINARY_DIR}/triangle_vs.h"
+        "${CMAKE_CURRENT_BINARY_DIR}/triangle_ps.h"
+        "${CMAKE_CURRENT_BINARY_DIR}/triangle_vs_flip.h"
+        "${CMAKE_CURRENT_BINARY_DIR}/triangle_ps_flip.h")
+    target_include_directories(cpu_shim_draw PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+    target_compile_features(cpu_shim_draw PRIVATE cxx_std_17)
+    target_link_libraries(cpu_shim_draw PRIVATE dxgi d3d12)
     add_executable(cpu_shim_startup tests/cpu/shim_startup.asm tests/cpu/exe_startup.asm)
     set_target_properties(cpu_shim_startup PROPERTIES LINKER_LANGUAGE CXX)
     target_link_options(cpu_shim_startup PRIVATE /ENTRY:native_startup /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
-    target_link_libraries(cpu_shim_startup PRIVATE cpu_shim_startup_guest cpu_exe_io cpu_shim_compute)
+    target_link_libraries(cpu_shim_startup PRIVATE cpu_shim_startup_guest cpu_exe_io cpu_shim_compute cpu_shim_draw)
     set(shim_startup_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_shim_startup_lifted.cpp")
     add_custom_command(OUTPUT "${shim_startup_cpp}"
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/translate_shim_startup.py"
@@ -1842,12 +1866,13 @@ if(EXISTS "${INTAKE_PYTHON}")
             tools/cpu_call_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
     add_executable(cpu_shim_startup_lifted "${shim_startup_cpp}")
     target_compile_features(cpu_shim_startup_lifted PRIVATE cxx_std_17)
-    target_link_libraries(cpu_shim_startup_lifted PRIVATE cpu_shim_startup_guest cpu_exe_io cpu_shim_compute)
+    target_link_libraries(cpu_shim_startup_lifted PRIVATE cpu_shim_startup_guest cpu_exe_io cpu_shim_compute cpu_shim_draw)
     add_test(NAME cpu_native_shim_startup COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/shim_startup_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_shim_startup>" "$<TARGET_FILE:cpu_shim_startup_guest>" "$<TARGET_FILE:cpu_exe_io>"
         "$<TARGET_FILE:xmem_shim>" "$<TARGET_FILE:d3d12_xs_shim>")
-    set_tests_properties(cpu_native_shim_startup PROPERTIES TIMEOUT 100 ENVIRONMENT "X2W_SHIM_COMPUTE_CASE=")
+    set_tests_properties(cpu_native_shim_startup PROPERTIES TIMEOUT 100
+        ENVIRONMENT "X2W_SHIM_COMPUTE_CASE=;X2W_SHIM_DRAW_CASE=")
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME cpu_shim_compute_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/shim_compute_check.py"
@@ -1855,9 +1880,19 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:cpu_shim_startup_guest>" "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:xmem_shim>"
             "$<TARGET_FILE:d3d12_xs_shim>")
         set_tests_properties(cpu_shim_compute_${adapter} PROPERTIES TIMEOUT 120
-            ENVIRONMENT "X2W_SHIM_COMPUTE_ADAPTER=${adapter}")
+            ENVIRONMENT "X2W_SHIM_COMPUTE_ADAPTER=${adapter};X2W_SHIM_DRAW_CASE=")
     endforeach()
     set_tests_properties(cpu_shim_compute_hardware PROPERTIES SKIP_RETURN_CODE 77)
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME cpu_shim_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/shim_draw_check.py"
+            "$<TARGET_FILE:pe_map>" "$<TARGET_FILE:cpu_shim_startup>" "$<TARGET_FILE:cpu_shim_startup_lifted>"
+            "$<TARGET_FILE:cpu_shim_startup_guest>" "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:xmem_shim>"
+            "$<TARGET_FILE:d3d12_xs_shim>" "$<TARGET_FILE:cpu_shim_draw>")
+        set_tests_properties(cpu_shim_draw_${adapter} PROPERTIES TIMEOUT 180
+            ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=${adapter};X2W_SHIM_COMPUTE_CASE=")
+    endforeach()
+    set_tests_properties(cpu_shim_draw_hardware PROPERTIES SKIP_RETURN_CODE 77)
 
     add_test(NAME cpu_native_exe_chain COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/mapped_exe_chain_check.py" "$<TARGET_FILE:pe_map>"

@@ -121,6 +121,23 @@ cmake --build --preset dev --target cpu_shim_startup_lifted pe_map
 ctest --preset dev --no-tests=error -R '^cpu_shim_compute_(warp|hardware)$' -V
 ```
 
+The same EXE drives a raster draw when the test requests it. The draw branch
+calls the new `cpu_shim_draw` provider, which renders the repository's 64x64
+test triangle offscreen on a D3D12 direct queue, waits for a fence, copies the
+render target to a readback buffer and publishes the raw RGBA bytes. The
+guest exits 42 only when every one of the 16,384 bytes matches the CPU pixel
+rule (`x >= 8 && y >= 8 && x + y <= 63` green, black otherwise, opaque). The
+check compares the native EXE, the `pe_map` mapping and the AOT build byte for
+byte. A mirrored-X shader variant must exit 20 with a different frame that
+still agrees across runners; an unknown draw case must exit 21 with no frame.
+The non-mirrored shader object is unchanged, so the existing triangle draws are
+unaffected.
+
+```powershell
+cmake --build --preset dev --target cpu_shim_startup cpu_shim_startup_lifted pe_map
+ctest --preset dev --no-tests=error -R '^cpu_shim_draw_warp$' -V
+```
+
 ## Source-built EXE entry to a DLL import
 
 MSVC assembles a small CRT-free [EXE entry body](../tests/cpu/exe_entry.asm) and links it with the existing `call_mix` fixture. The [translator](../tools/cpu_exe_aot.py) takes the fixture's `native_entry` export through `--entry-export`, reads its unwind-bounded instruction range, follows the relative call to `call_mix`, and resolves its IAT slot against `cpu_import_provider.dll!mix_args`. It emits both functions as C++. The translated EXE uses ordinary Windows C++ startup to enter the generated `main`. Both versions use the same native provider and the same I/O DLL.
