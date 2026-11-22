@@ -291,6 +291,183 @@ class ScalarLDSInterpreter64:
         return [self.step(inst) for inst in prog.instructions]
 
 
+# ---------------------------------------------------------------------------
+# SIMD Wavefront Interpreter (Multi-Lane Divergence & 32/64-Bit EXEC Masking)
+# ---------------------------------------------------------------------------
+
+class SIMDLDSWavefrontInterpreter64:
+    """Multi-lane SIMD interpreter modeling Wave32 and Wave64 execution for LDS 64-bit atomics."""
+
+    def __init__(self, wave_size: int = 64, lds_size_bytes: int = DEFAULT_LDS_SIZE_BYTES) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Invalid wave_size: {wave_size} (must be 32 or 64)")
+        self.wave_size: int = wave_size
+        self.exec_mask: int = (1 << wave_size) - 1
+        self.vgprs: list[list[int]] = [[0] * DEFAULT_NUM_VGPRS for _ in range(wave_size)]
+        self.sgprs: list[int] = [0] * DEFAULT_NUM_SGPRS
+        self.lds: LDSMemory64 = LDSMemory64(lds_size_bytes)
+
+    def set_exec_mask(self, mask: int) -> None:
+        valid_mask = (1 << self.wave_size) - 1
+        self.exec_mask = mask & valid_mask
+
+    def read_lane_reg_u32(self, lane: int, kind: RegKind, idx: int) -> int:
+        if kind == RegKind.VGPR:
+            return self.vgprs[lane][idx] & MASK32
+        return self.sgprs[idx] & MASK32
+
+    def write_lane_reg_u32(self, lane: int, kind: RegKind, idx: int, val: int) -> None:
+        val32 = val & MASK32
+        if kind == RegKind.VGPR:
+            self.vgprs[lane][idx] = val32
+        else:
+            self.sgprs[idx] = val32
+
+    def read_lane_reg_u64(self, lane: int, kind: RegKind, idx: int) -> int:
+        lo = self.read_lane_reg_u32(lane, kind, idx)
+        hi = self.read_lane_reg_u32(lane, kind, idx + 1)
+        return (hi << 32) | lo
+
+    def write_lane_reg_u64(self, lane: int, kind: RegKind, idx: int, val: int) -> None:
+        val64 = val & MASK64
+        self.write_lane_reg_u32(lane, kind, idx, val64 & MASK32)
+        self.write_lane_reg_u32(lane, kind, idx + 1, (val64 >> 32) & MASK32)
+
+    def step(self, inst: Instruction) -> list[tuple[int | None, int | None]]:
+        """Executes a ds_rsub_rtn_u64 instruction across all lanes in the wavefront."""
+        # 1. Latch inputs for each lane
+        lane_inputs: list[tuple[int, int]] = []
+        for lane in range(self.wave_size):
+            va = self.read_lane_reg_u32(lane, RegKind.VGPR, inst.vaddr.index)
+            v0 = self.read_lane_reg_u64(lane, RegKind.VGPR, inst.vdata0.index)
+            lane_inputs.append((va, v0))
+
+        # 2. Serialize atomic operations across active lanes
+        lane_results: list[tuple[int | None, int | None]] = []
+        for lane in range(self.wave_size):
+            is_active = bool((self.exec_mask >> lane) & 1)
+            if not is_active:
+                lane_results.append((None, None))
+                continue
+
+            vaddr, vdata0 = lane_inputs[lane]
+            old_val, new_mem = self.lds.atomic_rsub_rtn_u64(
+                vaddr=vaddr,
+                vdata0=vdata0,
+                offset=inst.offset.offset16,
+            )
+
+            self.write_lane_reg_u64(lane, RegKind.VGPR, inst.vdst.index, old_val)
+            lane_results.append((old_val, new_mem))
+
+        return lane_results
+
+
+class TestLdsRsubRtnU64SIMD(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_divergent_addresses(self) -> None:
+        simd = SIMDLDSWavefrontInterpreter64(wave_size=32, lds_size_bytes=4096)
+        # Pre-seed each 8-byte address with 10
+        for lane in range(32):
+            simd.lds.write_qword(lane * 8, 10)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 2, lane * 8)  # vaddr (v2)
+            simd.write_lane_reg_u64(lane, RegKind.VGPR, 4, 100 + lane)  # vdata0 (v[4:5])
+
+        inst = Instruction(
+            opcode=Opcode.DS_RSUB_RTN_U64,
+            vdst=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            vdata0=Register(RegKind.VGPR, 4, count=2),
+        )
+        results = simd.step(inst)
+        self.assertEqual(len(results), 32)
+        for lane in range(32):
+            self.assertEqual(results[lane][0], 10)
+            self.assertEqual(results[lane][1], 90 + lane)
+            self.assertEqual(simd.read_lane_reg_u64(lane, RegKind.VGPR, 0), 10)
+            self.assertEqual(simd.lds.read_qword(lane * 8), 90 + lane)
+
+    def test_wave64_convergent_shared_address(self) -> None:
+        simd = SIMDLDSWavefrontInterpreter64(wave_size=64, lds_size_bytes=4096)
+        simd.lds.write_qword(0, 0)
+
+        for lane in range(64):
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 2, 0)
+            simd.write_lane_reg_u64(lane, RegKind.VGPR, 4, (lane + 1) * 10)
+
+        inst = Instruction(
+            opcode=Opcode.DS_RSUB_RTN_U64,
+            vdst=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            vdata0=Register(RegKind.VGPR, 4, count=2),
+        )
+        results = simd.step(inst)
+        self.assertEqual(len(results), 64)
+
+        curr_mem = 0
+        for lane in range(64):
+            vdata0 = (lane + 1) * 10
+            expected_old = curr_mem
+            expected_new = (vdata0 - expected_old) & MASK64
+            self.assertEqual(results[lane], (expected_old, expected_new))
+            self.assertEqual(simd.read_lane_reg_u64(lane, RegKind.VGPR, 0), expected_old)
+            curr_mem = expected_new
+
+        self.assertEqual(simd.lds.read_qword(0), curr_mem)
+
+    def test_wave32_exec_masking_partial_lanes(self) -> None:
+        simd = SIMDLDSWavefrontInterpreter64(wave_size=32, lds_size_bytes=4096)
+        simd.set_exec_mask(0x000000FF)  # Only lanes 0..7 active
+        canary = 0x1122334455667788
+
+        for lane in range(32):
+            simd.lds.write_qword(lane * 8, 20)
+            simd.write_lane_reg_u64(lane, RegKind.VGPR, 0, canary)  # vdst canary
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 2, lane * 8)  # vaddr
+            simd.write_lane_reg_u64(lane, RegKind.VGPR, 4, 100)  # vdata0
+
+        inst = Instruction(
+            opcode=Opcode.DS_RSUB_RTN_U64,
+            vdst=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            vdata0=Register(RegKind.VGPR, 4, count=2),
+        )
+        results = simd.step(inst)
+
+        for lane in range(32):
+            if lane < 8:
+                self.assertEqual(results[lane], (20, 80))
+                self.assertEqual(simd.read_lane_reg_u64(lane, RegKind.VGPR, 0), 20)
+                self.assertEqual(simd.lds.read_qword(lane * 8), 80)
+            else:
+                self.assertEqual(results[lane], (None, None))
+                self.assertEqual(simd.read_lane_reg_u64(lane, RegKind.VGPR, 0), canary)
+                self.assertEqual(simd.lds.read_qword(lane * 8), 20)
+
+    def test_wave64_exec_masking_all_inactive(self) -> None:
+        simd = SIMDLDSWavefrontInterpreter64(wave_size=64, lds_size_bytes=4096)
+        simd.set_exec_mask(0)  # All inactive
+        simd.lds.write_qword(0, 9999)
+
+        for lane in range(64):
+            simd.write_lane_reg_u64(lane, RegKind.VGPR, 0, 7777)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 2, 0)
+            simd.write_lane_reg_u64(lane, RegKind.VGPR, 4, 500)
+
+        inst = Instruction(
+            opcode=Opcode.DS_RSUB_RTN_U64,
+            vdst=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            vdata0=Register(RegKind.VGPR, 4, count=2),
+        )
+        results = simd.step(inst)
+        self.assertEqual(results, [(None, None)] * 64)
+        self.assertEqual(simd.lds.read_qword(0), 9999)
+        for lane in range(64):
+            self.assertEqual(simd.read_lane_reg_u64(lane, RegKind.VGPR, 0), 7777)
+
+
 class TestLdsRsubRtnU64ScalarInterpreter(unittest.TestCase):
     """Unit tests for the deterministic scalar instruction interpreter."""
 
