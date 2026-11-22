@@ -254,6 +254,12 @@ class TestGalleryServer(unittest.TestCase):
             self.assertEqual(r.status, 200)
             self.assertIn(b"console.log", r.read())
 
+    def test_the_textures_api_does_not_send_the_folder_path(self) -> None:
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/api/textures", timeout=3) as r:
+            body = r.read()
+        self.assertNotIn("textures_dir", json.loads(body))
+        self.assertNotIn(os.path.basename(self.tmp.name).encode(), body)
+
     def test_traversal_and_sibling_prefix_escapes_are_forbidden(self) -> None:
         host = f"127.0.0.1:{self.port}"
         cases = (

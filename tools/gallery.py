@@ -329,7 +329,6 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
         payload = json.dumps({
             "count": len(items),
             "textures": items,
-            "textures_dir": self.textures_dir,
         }, ensure_ascii=False).encode("utf-8")
 
         self.send_response(200)
