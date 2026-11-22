@@ -83,6 +83,16 @@ void test_working_set(XMemGetWorkingSetStatisticsFn get_stats) {
     std::memcpy(&working_set, stats + 8, sizeof(working_set));
     check(ok != FALSE && working_set != 0, "XMemGetWorkingSetStatistics writes a non-zero size at +8");
 
+    // +0 is the title's memory total (the pair the pool-sizing engines read). It must be the same number
+    // XSystemGetAppMemoryUsageLimit answers: total physical RAM, or the 12 GB fallback when the query fails.
+    uint64_t total = 0;
+    std::memcpy(&total, stats + 0, sizeof(total));
+    MEMORYSTATUSEX ms{sizeof(ms)};
+    uint64_t limit = 12ULL * 1024 * 1024 * 1024;
+    if (GlobalMemoryStatusEx(&ms)) limit = ms.ullTotalPhys;
+    check(total == limit, "XMemGetWorkingSetStatistics writes the app memory usage limit at +0");
+    check(total >= working_set, "XMemGetWorkingSetStatistics writes a total at +0 that covers the +8 use");
+
     bool tail_untouched = true;
     for (size_t i = 16; i < sizeof(stats); ++i) {
         if (stats[i] != 0xa5) {
