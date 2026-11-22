@@ -31,7 +31,7 @@ import enum
 import math
 import struct
 import unittest
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 # RDNA2 LDS Architectural Constants
 LDS_SIZE_BYTES: int = 65536         # 64 KiB default capacity
@@ -383,6 +383,71 @@ class SIMDInterpreter:
             results.append((lane, old_val, new_mem))
 
         return results
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class StatusFlags:
+    """Architectural status flags and condition codes for atomic max."""
+    zero: bool
+    sign: bool
+    modified: bool
+    borrow: bool
+    bank_conflict: bool
+
+
+def compute_status_flags(
+    old_val: int,
+    new_val: int,
+    input_val: int,
+    has_conflict: bool = False,
+) -> StatusFlags:
+    """Compute condition codes and status flags for ds_max_rtn_u32 operation.
+
+    - Zero Flag (Z): True if resulting memory dword is 0.
+    - Sign Flag (N): True if MSB (bit 31) of resulting memory dword is 1.
+    - Modified Flag (M): True if input_val caused memory to update (input_val > old_val).
+    - Borrow Flag (B): True if unsigned comparison old_val < input_val (borrow on subtraction).
+    - Bank Conflict: True if 2 or more active wavefront lanes collide on the same LDS bank.
+    """
+    res = new_val & MASK32
+    u_old = old_val & MASK32
+    u_in = input_val & MASK32
+    return StatusFlags(
+        zero=(res == 0),
+        sign=bool(res & SIGN_BIT32),
+        modified=(res != u_old),
+        borrow=(u_old < u_in),
+        bank_conflict=has_conflict,
+    )
+
+
+def detect_simd_bank_conflicts(
+    instr: DSMaxRtnU32Instruction,
+    state: SIMDState,
+) -> Set[int]:
+    """Detect LDS bank conflicts across active lanes in a wavefront.
+
+    Returns:
+        Set of bank indices (0..31) that experience conflicting accesses.
+    """
+    accessed_banks: Dict[int, List[int]] = {}
+    for lane in range(state.num_lanes):
+        if not state.is_lane_active(lane):
+            continue
+        vaddr = state.get_vgpr(lane, instr.addr.index)
+        eff_addr = calc_lds_effective_address(vaddr, instr.offset)
+        bank = calc_lds_bank(eff_addr)
+        accessed_banks.setdefault(bank, []).append(lane)
+
+    conflicts: Set[int] = set()
+    for bank, lanes in accessed_banks.items():
+        if len(lanes) > 1:
+            conflicts.add(bank)
+    return conflicts
 
 
 class TestLdsMaxRtnU32ReferenceOracle(unittest.TestCase):
@@ -968,6 +1033,71 @@ class TestLdsMaxRtnU32Aliasing(unittest.TestCase):
         self.assertEqual(results[2], (2, 100, 200))
         self.assertEqual(state.get_vgpr(2, 0), 100)
         self.assertEqual(state.lds.read_dword(0x30), 200)
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: Condition Codes, Status Flags, and Carry/Borrow Tests
+# ---------------------------------------------------------------------------
+
+class TestLdsMaxRtnU32StatusFlags(unittest.TestCase):
+    """Phase 6: Unit tests for condition codes, status flags, and borrow generation."""
+
+    def test_status_flags_zero_result(self) -> None:
+        # Both old and input are 0 -> result is 0
+        flags = compute_status_flags(old_val=0, new_val=0, input_val=0)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.sign)
+        self.assertFalse(flags.modified)
+        self.assertFalse(flags.borrow)
+
+    def test_status_flags_nonzero_clears_zero_flag(self) -> None:
+        flags = compute_status_flags(old_val=0, new_val=1, input_val=1)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.sign)
+        self.assertTrue(flags.modified)
+        self.assertTrue(flags.borrow)
+
+    def test_status_flags_sign_flag_msb_set(self) -> None:
+        # 0x80000000 has MSB set
+        flags = compute_status_flags(old_val=0, new_val=0x80000000, input_val=0x80000000)
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.sign)
+        self.assertTrue(flags.modified)
+        self.assertTrue(flags.borrow)
+
+        # 0x7FFFFFFF has MSB clear
+        flags2 = compute_status_flags(old_val=0, new_val=0x7FFFFFFF, input_val=0x7FFFFFFF)
+        self.assertFalse(flags2.sign)
+
+    def test_status_flags_borrow_and_modified(self) -> None:
+        # Memory had 100, input is 50 -> input <= old_val
+        # Result = 100, unmodified, no borrow
+        flags_no_mod = compute_status_flags(old_val=100, new_val=100, input_val=50)
+        self.assertFalse(flags_no_mod.modified)
+        self.assertFalse(flags_no_mod.borrow)
+
+        # Memory had 100, input is 200 -> input > old_val
+        # Result = 200, modified, borrow generated
+        flags_mod = compute_status_flags(old_val=100, new_val=200, input_val=200)
+        self.assertTrue(flags_mod.modified)
+        self.assertTrue(flags_mod.borrow)
+
+    def test_simd_bank_conflict_detection(self) -> None:
+        # LDS has 32 banks. Dwords 0 and 32 map to bank 0.
+        state = SIMDState(num_lanes=32, exec_mask=0x3)  # Lanes 0 and 1 active
+        # Lane 0 targets byte address 0x00 (bank 0)
+        # Lane 1 targets byte address 0x80 (dword 32 -> bank 0)
+        state.set_vgpr(0, 1, 0x00)
+        state.set_vgpr(1, 1, 0x80)
+
+        inst = DSMaxRtnU32Instruction(Opcode.DS_MAX_RTN_U32, VGPR(0), VGPR(1), Immediate(10))
+        conflicts = detect_simd_bank_conflicts(inst, state)
+        self.assertIn(0, conflicts)
+
+        # Non-conflicting: Lane 0 targets bank 0 (0x00), Lane 1 targets bank 1 (0x04)
+        state.set_vgpr(1, 1, 0x04)
+        conflicts_none = detect_simd_bank_conflicts(inst, state)
+        self.assertEqual(len(conflicts_none), 0)
 
 
 if __name__ == "__main__":
