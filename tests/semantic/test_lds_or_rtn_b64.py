@@ -803,5 +803,135 @@ class TestIEEE754BitPatternHandling(unittest.TestCase):
         self.assertEqual(state.lds.read_qword(32), MAX_SUBNORMAL_F64)
 
 
+class TestNegativeControlsAndMutationDetection(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_and_parameter_rejection(self) -> None:
+        with self.assertRaises(ValueError):
+            RegSingle(-1)
+        with self.assertRaises(ValueError):
+            RegSingle(256)
+        with self.assertRaises(ValueError):
+            RegPair(-1)
+        with self.assertRaises(ValueError):
+            RegPair(255)
+
+        s_single = RegSingle(0, RegType.SGPR)
+        s_pair = RegPair(0, RegType.SGPR)
+        v_single = RegSingle(0, RegType.VGPR)
+        v_pair = RegPair(0, RegType.VGPR)
+
+        with self.assertRaises(TypeError):
+            DSOrRtnB64Instruction(dst=s_pair, addr=v_single, data=v_pair)
+        with self.assertRaises(TypeError):
+            DSOrRtnB64Instruction(dst=v_pair, addr=s_single, data=v_pair)
+        with self.assertRaises(TypeError):
+            DSOrRtnB64Instruction(dst=v_pair, addr=v_single, data=s_pair)
+
+        with self.assertRaises(ValueError):
+            DSOrRtnB64Instruction(dst=v_pair, addr=v_single, data=v_pair, offset=-1)
+        with self.assertRaises(ValueError):
+            DSOrRtnB64Instruction(dst=v_pair, addr=v_single, data=v_pair, offset=65536)
+
+        with self.assertRaises(ValueError):
+            LDSMemory(size_bytes=0)
+        with self.assertRaises(ValueError):
+            LDSMemory(size_bytes=100)
+
+    def test_mutation_bitwise_and_instead_of_or(self) -> None:
+        def mutant_oracle(mem: LDSMemory, vaddr: int, vdata: int, offset: int = 0) -> int:
+            eff = u32(vaddr + offset)
+            old_val = mem.read_qword(eff)
+            mem.write_qword(eff, u64(old_val & vdata))  # Bug: & instead of |
+            return old_val
+
+        m_correct = LDSMemory(512)
+        m_mutant = LDSMemory(512)
+        m_correct.write_qword(16, 0x0F0F)
+        m_mutant.write_qword(16, 0x0F0F)
+
+        ref_ds_or_rtn_b64(m_correct, 16, 0xF0F0)
+        mutant_oracle(m_mutant, 16, 0xF0F0)
+
+        self.assertEqual(m_correct.read_qword(16), 0xFFFF)
+        self.assertEqual(m_mutant.read_qword(16), 0)
+        self.assertNotEqual(m_correct.read_qword(16), m_mutant.read_qword(16))
+
+    def test_mutation_missing_destination_writeback(self) -> None:
+        class BuggyInterpreter(ScalarInterpreter):
+            def execute(self, instr: DSOrRtnB64Instruction, state: ScalarMachineState) -> int:
+                vaddr = state.get_vgpr(instr.addr.index)
+                vdata = state.get_vgpr64(instr.data)
+                old_val = ref_ds_or_rtn_b64(state.lds, vaddr=vaddr, vdata=vdata, offset=instr.offset)
+                eff = u32(vaddr + instr.offset)
+                new_val = state.lds.read_qword(eff)
+                state.set_vgpr64(instr.dst, new_val)
+                return old_val
+
+        state = ScalarMachineState(512)
+        state.lds.write_qword(32, 0x00FF)
+        state.set_vgpr(2, 32)
+        state.set_vgpr64(RegPair(4), 0xFF00)
+
+        instr = DSOrRtnB64Instruction(dst=RegPair(0), addr=RegSingle(2), data=RegPair(4))
+        BuggyInterpreter().execute(instr, state)
+
+        self.assertNotEqual(state.get_vgpr64(RegPair(0)), 0x00FF)
+        self.assertEqual(state.get_vgpr64(RegPair(0)), 0xFFFF)
+
+    def test_mutation_inactive_lane_leakage(self) -> None:
+        class LeakySIMDInterpreter(SIMDInterpreter):
+            def execute(self, instr: DSOrRtnB64Instruction, state: SIMDState) -> list[tuple[int, int]]:
+                results = []
+                for lane in range(state.num_lanes):
+                    vaddr = state.get_vgpr(lane, instr.addr.index)
+                    vdata = state.get_vgpr64(lane, instr.data)
+                    old_val = ref_ds_or_rtn_b64(state.lds, vaddr=vaddr, vdata=vdata, offset=instr.offset)
+                    state.set_vgpr64(lane, instr.dst, old_val)
+                    results.append((lane, old_val))
+                return results
+
+        state = SIMDState(num_lanes=32, exec_mask=0x1, lds_bytes=1024)
+        state.lds.write_qword(16, 0x1111222233334444)
+        state.set_vgpr(1, 2, 16)
+        state.set_vgpr64(1, RegPair(4), 0xFFFFFFFFFFFFFFFF)
+        state.set_vgpr64(1, RegPair(0), 0xCAFEBABECAFEBABE)
+
+        instr = DSOrRtnB64Instruction(dst=RegPair(0), addr=RegSingle(2), data=RegPair(4))
+        LeakySIMDInterpreter().execute(instr, state)
+
+        self.assertNotEqual(state.get_vgpr64(1, RegPair(0)), 0xCAFEBABECAFEBABE)
+
+    def test_mutation_dropped_immediate_offset(self) -> None:
+        def buggy_address(vaddr: int, offset: int = 0) -> int:
+            return u32(vaddr)
+
+        vaddr = 40
+        offset = 16
+        correct = u32(vaddr + offset)
+        buggy = buggy_address(vaddr, offset)
+        self.assertEqual(correct, 56)
+        self.assertEqual(buggy, 40)
+        self.assertNotEqual(correct, buggy)
+
+    def test_mutation_premature_writeback_when_aliased(self) -> None:
+        class PrematureWritebackInterpreter(ScalarInterpreter):
+            def execute(self, instr: DSOrRtnB64Instruction, state: ScalarMachineState) -> int:
+                state.set_vgpr64(instr.dst, 0x1234)
+                vaddr = state.get_vgpr(instr.addr.index)
+                vdata = state.get_vgpr64(instr.data)
+                return ref_ds_or_rtn_b64(state.lds, vaddr=vaddr, vdata=vdata, offset=instr.offset)
+
+        state = ScalarMachineState(1024)
+        state.lds.write_qword(16, 0x9999)
+        state.set_vgpr(0, 16)
+        state.set_vgpr64(RegPair(2), 0x1111)
+
+        instr = DSOrRtnB64Instruction(dst=RegPair(0), addr=RegSingle(0), data=RegPair(2))
+        PrematureWritebackInterpreter().execute(instr, state)
+
+        self.assertEqual(state.lds.read_qword(16), 0x9999)
+
+
 if __name__ == '__main__':
     unittest.main()
