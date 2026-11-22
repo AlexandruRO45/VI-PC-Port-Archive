@@ -693,5 +693,45 @@ class LaneMaskConstants(unittest.TestCase):
         self.assertEqual(w64, self.WANT["cs_w64_mask_imm"][1])
 
 
+class DppSourceModifiers(unittest.TestCase):
+    """runtime/test/shaders/cs_dpp_mods.asm: neg/abs on a DPP src0 apply to the fetched word, after the lane select
+    (EGEN-DPP-SRCMOD). An f16 op negates bit 15, and a bound_ctrl:1 zero takes the sign. One wave32 group; lanes 0
+    and 1 store v[10:13]. The words are the GPU check's (check.py CS_DPP), derived by hand in the .asm header."""
+
+    WANT = [0xAAAA3C00, 0xBBBB8000, 0x80000000, 0xBF800000, 0xAAAA3C00, 0xBBBBC000, 0xBF800000, 0xBF800000]
+    # The translation before the fix: f32 neg/abs before the shuffle (bit 31 for an f16 op, no sign on the zero).
+    OLD = [0xAAAA4200, 0xBBBB0000, 0x00000000, 0x3F800000, 0xAAAA4200, 0xBBBB4000, 0xBF800000, 0x3F800000]
+
+    def test_words(self):
+        sys.path.insert(0, os.path.join(support.ROOT, "runtime", "test", "shaders"))
+        from compute_fixture import compute_header
+        header = compute_header(os.path.join(support.ROOT, "runtime", "test", "shaders", "cs_dpp_mods.asm"))
+        spv = support.translate_fixture("cs_dpp_mods", fssm=bytes(header))
+        memory = {a: 0xEEEEEEEE for a in range(0, 0x100, 4)}
+        si.run_workgroup(spv, 32, 32,
+                         inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+                         push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28, memory=memory)
+        self.assertEqual(set(memory), set(range(0, 0x100, 4)), "nothing written outside the heap")
+        got = [memory[4 * i] for i in range(8)]
+        self.assertEqual([f"{w:#010x}" for w in got], [f"{w:#010x}" for w in self.WANT])
+        self.assertNotEqual(got, self.OLD)
+
+    def test_words_follow_from_the_values(self):
+        # Plain-Python reference: decode the f16 / f32 inputs, apply the modifiers to the fetched value, encode.
+        h = lambda x: struct.unpack("<H", struct.pack("<e", x))[0]          # noqa: E731
+        f = lambda x: struct.unpack("<I", struct.pack("<f", x))[0]          # noqa: E731
+        one_h = struct.unpack("<e", struct.pack("<H", 0x12343C00 & 0xFFFF))[0]
+        two_h = struct.unpack("<e", struct.pack("<H", 0x56784000 & 0xFFFF))[0]
+        neg_zero = -0.0
+        lane = []
+        for src0 in (None, one_h):       # lane 0: row_shr:1 has no source (bound_ctrl:1 reads 0); lane 1: lane 0
+            v10 = 0xAAAA0000 | h(-one_h + two_h)
+            v11 = 0xBBBB0000 | h(-abs(src0 if src0 is not None else 0.0) * two_h)
+            v12 = f(-(1.0 if src0 is not None else 0.0) + neg_zero)
+            v13 = f(-one_h)
+            lane += [v10, v11, v12, v13]
+        self.assertEqual(lane, self.WANT)
+
+
 if __name__ == "__main__":
     unittest.main()

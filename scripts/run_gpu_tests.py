@@ -880,7 +880,7 @@ def run_suite(a, work: str) -> int:
             results.append((name,) + wavemask_check(vk_compute, spv, cs_env, w64_emulated()))
         elif name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_w32_sincos", "cs_exec_const", "cs_w32_mask_imm", "cs_w64_mask_imm", "cs_w32_lds_u8_d16", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
                       "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8", "cs_dpp_ops", "cs_dpp_bank", "cs_dpp_fi",
-                      "cs_dpp_bound", "cs_dpp_w64",
+                      "cs_dpp_bound", "cs_dpp_w64", "cs_dpp_mods",
                       "cs_w64_mask_detect",
                       "cs_w64x_readlane", "cs_w64x_writelane", "cs_w64x_readfirstlane", "cs_w64x_bpermute", "cs_w64x_permute",
                       "cs_w64x_branch", "cs_w64x_ballot", "cs_w64x_wg128_branches", "cs_w64x_lds_raw",
@@ -926,6 +926,8 @@ def run_suite(a, work: str) -> int:
                 "cs_dpp_bank": [0xFFFFFFFF, 0xFFFFFFFE, 0xFFFFFFFD, 0xFFFFFFFC, 7, 7, 7, 7],
                 "cs_dpp_fi": [1, 2, 3, 0x7777, 5, 6, 7, 0x7777],
                 "cs_dpp_w64": [1, 0, 3, 2, 5, 4, 7, 6],
+                "cs_dpp_mods": [0xAAAA3C00, 0xBBBB8000, 0x80000000, 0xBF800000,      # cs_dpp_mods.asm header
+                                0xAAAA3C00, 0xBBBBC000, 0xBF800000, 0xBF800000],
                 "cs_wave64_ballot": [32, 16, 24, 40, 8, 48],
                 "cs_wm_half_ops": [32, 16, 16, 0, 16],
                 "cs_wm_half_cmp": [1, 0, 1, 1],
@@ -982,7 +984,8 @@ def run_suite(a, work: str) -> int:
                                   "cs_bpermute32", "cs_w32_partial_scmp", "cs_w32_sincos",
                                   "cs_lds_b64_cmpst", "cs_exec_const", "cs_w32_mask_imm",
                                   "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8",
-                                  "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi") and not emulated and not partial
+                                  "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi",
+                                  "cs_dpp_mods") and not emulated and not partial
             if partial and not emulated:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
             if name in WAVE32_LANE_DUMPS:   # 32 lanes even without index.json, as check.py requests (#774)
@@ -994,7 +997,7 @@ def run_suite(a, work: str) -> int:
             else:
                 ok, detail = judge_cs_dump(rc, msg, want, wave64=wave64, partial=partial, emulated=emulated,
                                            hexwords=name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lds_u8_d16",
-                                                             "cs_lds_b64_cmpst"))
+                                                             "cs_lds_b64_cmpst", "cs_dpp_mods"))
             results.append((name, ok, detail))
         elif name == "cs_imgstore":
             rc, msg = run_cmd([vk_store, spv])

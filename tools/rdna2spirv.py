@@ -4010,7 +4010,10 @@ class Gen:
         if args[1].get("n", 1) != 1:
             raise Unsupported("DPP 64-bit source")
         src = args[1]
-        src_val = self.src_u(src)    # neg/abs are lane-uniform, so before or after the shuffle is the same
+        # The shuffle moves the raw register; neg/abs stay on the operand for the op itself to apply, as the
+        # hardware applies input modifiers after the DPP fetch: an f16 op flips bit 15 (not 31), and a bound_ctrl
+        # or fi:0 zero still takes the sign (-v with an invalid source reads -0.0).
+        src_val = self.src_u({**src, "neg": False, "abs": False})
 
         lane = self.wave_lane()
         group_bits = 7 if dpp8 is not None else 15
@@ -4177,7 +4180,7 @@ class Gen:
         else:
             write = self.tmp()
             self.emit(f"{write} = OpLogicalAnd %bool {enabled} {src_ok}")
-        args[1] = {"k": "ssa", "v": src0}
+        args[1] = {"k": "ssa", "v": src0, "neg": src.get("neg", False), "abs": src.get("abs", False)}
         previous = self.dpp_guard
         self.dpp_guard = write
         try:
