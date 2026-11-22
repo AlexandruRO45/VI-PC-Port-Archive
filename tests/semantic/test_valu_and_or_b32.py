@@ -776,8 +776,82 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
                     self.assertEqual(cout, expected_cout)
 
 
+
+# ==============================================================================
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 float bit pattern handling, boundary extremes, and raw integer casting."""
+
+    F32_POS_ZERO: int = 0x0000_0000
+    F32_NEG_ZERO: int = 0x8000_0000
+    F32_POS_INF: int = 0x7F80_0000
+    F32_NEG_INF: int = 0xFF80_0000
+    F32_QNAN: int = 0x7FC0_0000
+    F32_SNAN: int = 0x7F80_0001
+    F32_MIN_SUBNORMAL: int = 0x0000_0001
+
+    def test_ieee754_special_float_bitcasts_treated_as_raw_bits(self) -> None:
+        # v_and_or_b32 is a bitwise instruction. Shaders bit-casting
+        # floats (+0, -0, +/-inf, NaNs) operate on raw 32-bit words without FPU exceptions.
+        specials = [
+            self.F32_POS_ZERO,
+            self.F32_NEG_ZERO,
+            self.F32_POS_INF,
+            self.F32_NEG_INF,
+            self.F32_QNAN,
+            self.F32_SNAN,
+        ]
+        for f in specials:
+            # Identity pass-through: (f & 0xFFFFFFFF) | 0 == f
+            self.assertEqual(oracle_v_and_or_b32(f, MASK32, 0), f)
+            # Identity through S2: (0 & 0) | f == f
+            self.assertEqual(oracle_v_and_or_b32(0, 0, f), f)
+
+    def test_subnormal_float_bits_no_flush_to_zero(self) -> None:
+        # Smallest positive subnormal float (bit 0 = 1): must not be flushed to 0
+        sub = self.F32_MIN_SUBNORMAL
+        res = oracle_v_and_or_b32(sub, MASK32, 0)
+        self.assertEqual(res, sub)
+
+        # Masking specific bit in subnormal without flush
+        res2 = oracle_v_and_or_b32(sub, 0x01, 0x00)
+        self.assertEqual(res2, 0x01)
+
+    def test_nan_payload_masking_and_synthesis(self) -> None:
+        custom_nan = 0x7FA5_5A3C
+        # Extract payload: (custom_nan & 0x007FFFFF) | 0
+        payload = oracle_v_and_or_b32(custom_nan, 0x007F_FFFF, 0)
+        self.assertEqual(payload, 0x0025_5A3C)
+
+        # Set quiet NaN bit: (snan & 0xFFFFFFFF) | 0x00400000
+        snan = self.F32_SNAN
+        qnan_synthesized = oracle_v_and_or_b32(snan, MASK32, 0x0040_0000)
+        self.assertEqual(qnan_synthesized, 0x7FC0_0001)
+
+    def test_sign_bit_manipulation_raw_bits(self) -> None:
+        # Bitwise float abs equivalent: (val & 0x7FFFFFFF) | 0
+        neg_val = self.F32_NEG_ZERO  # 0x80000000 (-0.0)
+        abs_res = oracle_v_and_or_b32(neg_val, 0x7FFF_FFFF, 0)
+        self.assertEqual(abs_res, self.F32_POS_ZERO)  # 0x00000000 (+0.0)
+
+        # Bitwise float neg equivalent: (val & 0xFFFFFFFF) | 0x80000000 (forces negative sign)
+        pos_val = self.F32_POS_ZERO
+        forced_neg = oracle_v_and_or_b32(pos_val, MASK32, 0x8000_0000)
+        self.assertEqual(forced_neg, self.F32_NEG_ZERO)
+
+    def test_extreme_u32_boundaries(self) -> None:
+        boundaries = [0x0000_0000, 0x0000_0001, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFF]
+        for b in boundaries:
+            self.assertEqual(oracle_v_and_or_b32(b, MASK32, 0), b)
+            self.assertEqual(oracle_v_and_or_b32(b, 0, b), b)
+            self.assertEqual(oracle_v_and_or_b32(b, b, b), b)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
