@@ -73,6 +73,22 @@ class LDSMemory:
         self.data[index & (self.size_dwords - 1)] = u32(val)
 
 
+
+def compute_sub_borrow_u32(a: int, b: int) -> int:
+    """Calculate whether 32-bit subtraction (a - b) produces an unsigned borrow."""
+    return 1 if (u32(a) < u32(b)) else 0
+
+
+def compute_sub_zero_u32(a: int, b: int) -> int:
+    """Calculate whether 32-bit subtraction (a - b) produces zero."""
+    return 1 if (u32(a) == u32(b)) else 0
+
+
+def compute_sub_sign_u32(a: int, b: int) -> int:
+    """Calculate the sign bit (bit 31) of 32-bit subtraction result."""
+    return 1 if bool(u32(a - b) & 0x80000000) else 0
+
+
 def ref_ds_sub_rtn_u32(
     mem: LDSMemory,
     vaddr: int,
@@ -609,6 +625,57 @@ class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
             self.assertEqual(state.get_vgpr(r), 0xA000 + r)
         for s in range(5):
             self.assertEqual(state.get_sgpr(s), 0xB000 + s)
+
+
+class TestConditionCodesAndBorrow(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def test_flags_preserved_on_scalar_underflow_borrow(self) -> None:
+        state = ScalarMachineState(lds_dwords=256)
+        state.lds.write_dword(1, 5)
+        state.set_vgpr(1, 4)
+        state.set_vgpr(2, 10)
+
+        instr = DSSubRtnInstruction(
+            dst=RegisterOperand(0),
+            addr=RegisterOperand(1),
+            data=RegisterOperand(2),
+        )
+        interp = ScalarInterpreter()
+        old_val = interp.execute(instr, state)
+
+        self.assertEqual(old_val, 5)
+        self.assertEqual(state.lds.read_dword(1), MASK32 - 4)
+
+    def test_flags_preserved_on_zero_result(self) -> None:
+        state = ScalarMachineState(lds_dwords=256)
+        state.lds.write_dword(2, 42)
+        state.set_vgpr(1, 8)
+        state.set_vgpr(2, 42)
+
+        instr = DSSubRtnInstruction(
+            dst=RegisterOperand(0),
+            addr=RegisterOperand(1),
+            data=RegisterOperand(2),
+        )
+        interp = ScalarInterpreter()
+        interp.execute(instr, state)
+
+        self.assertEqual(state.lds.read_dword(2), 0)
+
+    def test_mathematical_borrow_and_status_oracles(self) -> None:
+        self.assertEqual(compute_sub_borrow_u32(0, 1), 1)
+        self.assertEqual(compute_sub_borrow_u32(5, 10), 1)
+        self.assertEqual(compute_sub_borrow_u32(10, 5), 0)
+        self.assertEqual(compute_sub_borrow_u32(0, 0), 0)
+        self.assertEqual(compute_sub_borrow_u32(MASK32, 1), 0)
+        self.assertEqual(compute_sub_borrow_u32(0, MASK32), 1)
+
+        self.assertEqual(compute_sub_zero_u32(50, 50), 1)
+        self.assertEqual(compute_sub_zero_u32(50, 49), 0)
+
+        self.assertEqual(compute_sub_sign_u32(10, 20), 1)
+        self.assertEqual(compute_sub_sign_u32(20, 10), 0)
 
 
 if __name__ == '__main__':
