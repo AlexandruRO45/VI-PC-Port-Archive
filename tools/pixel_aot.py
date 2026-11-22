@@ -52,7 +52,72 @@ def _select_named_container(data: mmap.mmap, needle: bytes, digest: str) -> byte
     return selected
 
 
-def native_program(archive: Path, record: str, *, container_sha256: str | None = None) -> tuple[bytes, bytes]:
+def _bounded_code(image, start):
+    """Strip code padding within the FSSM v0x101 section directory."""
+    if len(image) < 240 or struct.unpack_from("<I", image, 4)[0] != 0x101:
+        raise ValueError("Unknown multi-exit FSSM layout")
+    base, size = struct.unpack_from("<QQ", image, 192)
+    limit, = struct.unpack_from("<Q", image, 232)
+    if limit == 0xdeadbeefdeadbeef:
+        limit = base + size
+        if image[limit:limit+16] != b"\x00\x00\x9f\xbf" * 4:
+            raise ValueError("Unverified FSSM sentinel extent")
+    if (base < 240 or base + 40 != start or size % 16 or base + size != limit
+            or limit > len(image) or limit <= start):
+        raise ValueError("Inconsistent FSSM code extent")
+    end = limit
+    while end > start and image[end-4:end] == b"\x00\x00\x9f\xbf":
+        end -= 4
+    if end <= start or end == limit or image[end-4:end] != b"\x00\x00\x81\xbf":
+        raise ValueError("Expected termination followed by code padding")
+    return image[start:end]
+
+
+def _check_two_exits(code, llvm):
+    """Both decoded exits must be reachable from the single entry."""
+    instructions = dict(disassemble(code, llvm, offsets=True))
+    exits = [pc for pc, line in instructions.items() if line == "s_endpgm"]
+    if len(exits) != 2 or exits[-1] + 4 != len(code):
+        raise ValueError("Expected two decoded exits")
+    # An aligned word can be a literal or the second half of an instruction.
+    # Follow branches only from decoded PCs and reject unresolved transfers.
+    pcs = list(instructions)
+    following = dict(zip(pcs, pcs[1:] + [len(code)]))
+    pending, visited, targets = [0], set(), set()
+    while pending:
+        pc = pending.pop()
+        if pc in visited:
+            continue
+        if pc not in instructions:
+            raise ValueError("Branch outside decoded instruction boundaries")
+        visited.add(pc)
+        op = instructions[pc].split()[0]
+        if op == "s_endpgm":
+            continue
+        if op == "s_branch" or op in ("s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_vccz",
+                                      "s_cbranch_vccnz", "s_cbranch_execz", "s_cbranch_execnz"):
+            target = pc + 4 + 4 * struct.unpack_from("<h", code, pc)[0]
+            targets.add(target)
+            pending.append(target)
+            if op == "s_branch":
+                continue
+        elif not (op.startswith(("v_", "image_", "buffer_", "tbuffer_", "ds_", "flat_", "global_",
+                                 "scratch_", "exp", "s_load_", "s_buffer_load_", "s_cmp", "s_bitcmp",
+                                 "s_mov_", "s_and", "s_or_", "s_xor_", "s_not_", "s_lsh", "s_ash",
+                                 "s_add", "s_sub", "s_mul", "s_min_", "s_max_", "s_cselect", "s_bfe",
+                                 "s_bfm", "s_brev", "s_ff", "s_bcnt", "s_wqm", "s_quadmask"))
+                  or op in ("s_nop", "s_inst_prefetch", "s_waitcnt", "s_clause", "s_delay_alu",
+                            "s_setprio", "s_sleep", "s_movk_i32", "s_mulk_i32", "s_flbit_i32_b32",
+                            "s_setreg_imm32_b32")):
+            raise ValueError(f"Unverified multi-exit control flow: {op}")
+        pending.append(following[pc])
+    # A direct branch may skip alignment NOPs. Keep them in the original span.
+    unreachable = instructions.keys() - visited
+    if exits[0] + 4 not in targets or any(instructions[pc].split()[0] != "s_nop" for pc in unreachable):
+        raise ValueError("Unreachable code or unverified alternate exit")
+
+
+def native_program(archive: Path, record: str, *, container_sha256: str | None = None, llvm=None) -> tuple[bytes, bytes]:
     name = record.encode("ascii")
     if not 0 < len(name) < 255 or b"\0" in name:
         raise ValueError("Invalid length-prefixed record name")
@@ -70,9 +135,13 @@ def native_program(archive: Path, record: str, *, container_sha256: str | None =
             blob = _read_named_container(data, end)
         else:
             blob = _select_named_container(data, needle, container_sha256.lower())
-    program = parts(blob)[b"DXIL"]
-    if len(program) < 24 or struct.unpack_from("<H", program, 2)[0] != 0:
-        raise ValueError("Expected a pixel shader")
+    return blob, container_code(parts(blob)[b"DXIL"], stage=0, llvm=llvm)
+
+
+def container_code(program, *, stage, llvm=None):
+    """Extract the stage-specific instruction stream from a DXIL program part."""
+    if len(program) < 24 or struct.unpack_from("<H", program, 2)[0] != stage:
+        raise ValueError("Unexpected shader stage")
     table = program.index(b"XDAT", 24)
     if table + 12 > len(program):
         raise ValueError("Truncated XDAT header")
@@ -93,10 +162,22 @@ def native_program(archive: Path, record: str, *, container_sha256: str | None =
     start = struct.unpack_from("<I", image, 192)[0] + 40
     if start < 196 or start % 4 or start + 4 > len(image):
         raise ValueError("Invalid native code offset")
+    if struct.unpack_from("<I", image, 4)[0] == 0x101:
+        code = _bounded_code(image, start)
+        markers = sum(word == 0xbf810000 for word, in struct.iter_unpack("<I", code))
+        if markers == 1:
+            return code
+        if stage == 0 and markers == 2 and llvm is not None:
+            _check_two_exits(code, llvm)
+            return code
+        raise ValueError("Unverified multi-exit program")
+    # Older fixtures lack the section extent; preserve their unique-marker rule.
+    if stage != 0:
+        raise ValueError("Compute requires a bounded FSSM section")
     ends = [i+4 for i in range(start, len(image)-3, 4) if image[i:i+4] == b"\0\0\x81\xbf"]
     if len(ends) != 1:
         raise ValueError("Expected one aligned, terminated program")
-    return blob, image[start:ends[0]]
+    return image[start:ends[0]]
 
 
 def disassemble(code, library, *, cpu=b"gfx1013", offsets=False):
@@ -130,13 +211,76 @@ def disassemble(code, library, *, cpu=b"gfx1013", offsets=False):
     return instructions
 
 
-PREAMBLE = """Texture2D<float4> tex : register(t0);
-SamplerState samp : register(s0);
+SAMPLED_RESOURCES = """Texture2D<float4> tex : register(t0);
+SamplerState samp : register(s0);"""
+PREAMBLE = """// v_cmp_class_f32: the ten binary32 classes of LLVM SIInstrFlags::ClassFlags, from the raw encoding:
+// signaling NaN, quiet NaN, -inf, -normal, -denormal, -0, +0, +denormal, +normal, +inf.
+uint class32(float value) {
+    uint bits = asuint(value);
+    uint magnitude = bits & 0x7fffffffu;
+    bool negative = bits >= 0x80000000u;
+    if (magnitude > 0x7f800000u) return (bits & 0x00400000u) != 0u ? 0x2u : 0x1u;
+    if (magnitude == 0x7f800000u) return negative ? 0x4u : 0x200u;
+    if (magnitude >= 0x00800000u) return negative ? 0x8u : 0x100u;
+    if (magnitude != 0u) return negative ? 0x10u : 0x80u;
+    return negative ? 0x20u : 0x40u;
+}
 // v_fract_f32: x - floor(x) clamped to 0x3f7fffff, so a tiny negative input cannot round up to 1.0.
 // D3D frac has no clamp and differs between adapters. NaN fails the comparison and propagates.
 float fract32(float value) {
     float f = frac(value);
     return f >= 1.0f ? asfloat(0x3f7fffffu) : f;
+}
+// v_mad_f32 and v_mac_f32 round the product before the add and do not support binary32 denormals.
+// Flush each operand, the product and the sum to signed zero; NaN fails the comparison and propagates.
+float ftz32(float value) {
+    return abs(value) < asfloat(0x00800000u) ? asfloat(asuint(value) & 0x80000000u) : value;
+}
+float mad32(float a, float b, float c) {
+    precise float product = ftz32(ftz32(a) * ftz32(b));
+    precise float sum = product + ftz32(c);
+    return ftz32(sum);
+}
+// v_frexp_mant_f32: normalized significand in (-1, -0.5] U [0.5, 1), preserving +/-0, +/-Inf and NaN.
+float frexp_mant32(float value) {
+    uint bits = asuint(value);
+    uint exp = (bits >> 23) & 0xffu;
+    uint mant = bits & 0x7fffffu;
+    if (exp == 0xffu || (exp == 0u && mant == 0u)) return value;
+    uint sign = bits & 0x80000000u;
+    if (exp == 0u) {
+        uint shift = 23u - firstbithigh(mant);
+        mant = (mant << shift) & 0x7fffffu;
+    }
+    return asfloat(sign | 0x3f000000u | mant);
+}
+// v_ldexp_f32: exact binary32 scaling by 2^delta, preserving +/-0, +/-Inf and NaN.
+float ldexp32(float value, int delta) {
+    uint bits = asuint(value);
+    uint sign = bits & 0x80000000u;
+    uint exp = (bits >> 23) & 0xffu;
+    uint mant = bits & 0x7fffffu;
+    if (exp == 0xffu || (exp == 0u && mant == 0u)) return value;
+    int e = (int)exp;
+    if (exp == 0u) {
+        uint shift = 23u - firstbithigh(mant);
+        mant = (mant << shift) & 0x7fffffu;
+        e = 1 - (int)shift;
+    }
+    e += clamp(delta, -512, 512);
+    if (e >= 255) return asfloat(sign | 0x7f800000u);
+    if (e <= 0) {
+        if (e < -23) return asfloat(sign);
+        uint full = mant | 0x800000u;
+        uint shift = (uint)(1 - e);
+        uint half_bit = 1u << (shift - 1u);
+        uint mask = (1u << shift) - 1u;
+        uint rem = full & mask;
+        uint q = full >> shift;
+        if (rem > half_bit || (rem == half_bit && (q & 1u) != 0u)) q++;
+        return asfloat(sign | q);
+    }
+    return asfloat(sign | ((uint)e << 23) | mant);
 }
 // Finite binary32 to binary16, round toward zero, then widen for the float target.
 float export16(float value) {
@@ -158,7 +302,7 @@ float widen16(uint word) {
     uint wide = exponent == 0x1fu ? 0xffu : exponent + 112u;
     return asfloat(sign | (wide << 23) | (mantissa << 13));
 }
-float4 main(float2 uv : TEXCOORD0) : SV_Target0 {"""
+"""
 
 
 def registers(first, last, count):
@@ -168,16 +312,22 @@ def registers(first, last, count):
     return range(first, last+1)
 
 
+HINT_LIMITS = {"s_clause": 0x3f, "s_setprio": 3, "s_sleep": 0x7f}
+
 ALU = {
     "log": (1, "log2({0})"), "exp": (1, "exp2({0})"), "rcp": (1, "(1.0f / {0})"),
     "sqrt": (1, "sqrt({0})"), "rsq": (1, "rsqrt({0})"),
     "floor": (1, "floor({0})"), "ceil": (1, "ceil({0})"), "fract": (1, "fract32({0})"),
-    "trunc": (1, "trunc({0})"),
+    "trunc": (1, "trunc({0})"), "frexp_mant": (1, "frexp_mant32({0})"),
     "add": (2, "({0} + {1})"), "mul": (2, "({0} * {1})"),
     "max": (2, "max({0}, {1})"), "min": (2, "min({0}, {1})"), "sub": (2, "({0} - {1})"),
     "subrev": (2, "({1} - {0})"),
     "mul_legacy": (2, "(({0} == 0 || {1} == 0) ? 0.0f : {0} * {1})"),
     "fma": (3, "mad({0}, {1}, {2})"), "fmac": (3, "mad({0}, {1}, {2})"),
+    "mad": (3, "mad32({0}, {1}, {2})"), "mac": (3, "mad32({0}, {1}, {2})"),
+    # Each result is one of the operands, so finite inputs need no rounding.
+    "min3": (3, "min(min({0}, {1}), {2})"), "max3": (3, "max(max({0}, {1}), {2})"),
+    "med3": (3, "max(min({0}, {1}), min(max({0}, {1}), {2}))"),
 }
 # N-prefixed predicates include unordered operands. Keep NLG's NaN case explicit in DXIL.
 COMPARE = {
@@ -189,6 +339,10 @@ COMPARE = {
     "ngt": "({0} <= {1} || isnan({0}) || isnan({1}))", "nle": "({0} > {1} || isnan({0}) || isnan({1}))",
     "neq": "!({0} == {1})", "nlt": "({0} >= {1} || isnan({0}) || isnan({1}))",
 }
+INT_COMPARE = {
+    "f": "false", "lt": "{0} < {1}", "eq": "{0} == {1}", "le": "{0} <= {1}",
+    "gt": "{0} > {1}", "ne": "{0} != {1}", "ge": "{0} >= {1}", "t": "true",
+}
 LANE_MASK = r"(vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
 SALU_BIT64 = {
     "and": "uint2({0} & {2}, {1} & {3})",
@@ -196,6 +350,9 @@ SALU_BIT64 = {
     "xor": "uint2({0} ^ {2}, {1} ^ {3})",
     "andn2": "uint2({0} & ~{2}, {1} & ~{3})",
     "orn2": "uint2({0} | ~{2}, {1} | ~{3})",
+    "nand": "uint2(~({0} & {2}), ~({1} & {3}))",
+    "nor": "uint2(~({0} | {2}), ~({1} | {3}))",
+    "xnor": "uint2(~({0} ^ {2}), ~({1} ^ {3}))",
 }
 SALU_HELPERS = {
     "s_lshl_b64": (
@@ -322,25 +479,28 @@ def lane_mask(token):
     return [token]
 
 
-def fp_operand(token, scalar, vector, pending, sample_pending):
+def fp_operand(token, scalar, vector, pending, sample_dest, *, quad_values: dict[str, bool] | None = None):
     if re.fullmatch(r"-\d+", token):
         return f"asfloat({int(token) & 0xffffffff}u)"
     if token.startswith("-"):
-        return "(-" + fp_operand(token[1:], scalar, vector, pending, sample_pending) + ")"
+        return "(-" + fp_operand(token[1:], scalar, vector, pending, sample_dest, quad_values=quad_values) + ")"
     if absolute := re.fullmatch(r"abs\(([^()|]+)\)|\|([^()|]+)\|", token):
         inner = absolute.group(1) or absolute.group(2)
-        return f"abs({fp_operand(inner, scalar, vector, pending, sample_pending)})"
+        return f"abs({fp_operand(inner, scalar, vector, pending, sample_dest, quad_values=quad_values)})"
     if re.fullmatch(r"[vs]\d+", token):
         if token in pending:
             raise ValueError("Constant read before load completion")
         value = (vector if token.startswith("v") else scalar)[token]
+        if quad_values is not None and token.startswith("v") and value not in quad_values:
+            raise ValueError("Operand lacks a helper-lane definition")
         if isinstance(value, int):
             return f"asfloat({value}u)"
         if isinstance(value, tuple) and len(value) == 2 and value[0] == "uint":
             return f"asfloat({value[1]})"
-        if not isinstance(value, str) or not value.startswith(("sample", "alu", "params[")):
+        if not isinstance(value, str) or not (value.startswith(("sample", "alu", "params["))
+                or (quad_values is not None and value in quad_values)):
             raise ValueError("Expected a numeric register")
-        if sample_pending and value.startswith("sample"):
+        if token in sample_dest:
             raise ValueError("Sample used before vmcnt wait")
         return value
     if re.fullmatch(r"0x[0-9a-f]{1,8}|\d+", token):
@@ -350,20 +510,40 @@ def fp_operand(token, scalar, vector, pending, sample_pending):
     raise ValueError(f"Unsupported arithmetic operand {token}")
 
 
+def int_operand(token, scalar, vector, pending, sample_dest, *, signed):
+    if re.fullmatch(r"v\d+", token):
+        value = vector[token]
+        if not isinstance(value, str) or not value.startswith(("sample", "alu", "params[")):
+            raise ValueError("Expected a numeric register")
+        if token in sample_dest:
+            raise ValueError("Sample used before vmcnt wait")
+        return f"asint({value})" if signed else f"asuint({value})"
+    bits = scalar_u32(token, scalar, pending)
+    if signed and bits.startswith("asuint(") and bits.endswith(")"):
+        return f"asint({bits[7:-1]})"
+    return f"asint({bits})" if signed else bits
+
+
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *, second_texture_offset=None):
     """Track descriptor provenance, interpolation and packed exports through register writes."""
-    if (texture_sgpr == interp_sgpr or not 0 <= texture_sgpr <= 105 or not 0 <= interp_sgpr <= 105
-            or len(sampler) != 4 or any(not 0 <= word <= 0xffffffff for word in sampler)):
-        raise ValueError("Invalid scalar inputs or sampler descriptor words")
+    if texture_sgpr == interp_sgpr or not 0 <= texture_sgpr <= 105 or not 0 <= interp_sgpr <= 105:
+        raise ValueError("Invalid scalar inputs")
+    if sampler is not None and (len(sampler) != 4 or any(not 0 <= word <= 0xffffffff for word in sampler)):
+        raise ValueError("Invalid sampler descriptor words")
     scalar = {f"s{texture_sgpr}": "texture_ptr", f"s{interp_sgpr}": "interp_base"}
     vector = {"v0": "bary_i", "v1": "bary_j"}
-    lines = [PREAMBLE]
+    # Each emitted value has a unique identity. Entry-only writes never gain a helper definition.
+    # The boolean records whether the quad value depends on interpolated coordinates.
+    quad_values = {"uv.x": True, "uv.y": True}
+    lines = [PREAMBLE] if sampler is None else [SAMPLED_RESOURCES, PREAMBLE]
     if constant_descriptor is not None:
         if constant_descriptor < 0 or constant_descriptor % 4:
             raise ValueError("Invalid constant descriptor offset")
         lines.insert(0, "cbuffer Constants : register(b0) { float4 params[16]; };")
-    bindings = {0: "tex"}
+    bindings = {} if sampler is None else {0: "tex"}
     if second_texture_offset is not None:
+        if sampler is None:
+            raise ValueError("Second texture requires a sampler")
         if second_texture_offset < 32 or second_texture_offset % 32:
             raise ValueError("Second texture descriptor must have a distinct aligned offset")
         bindings[second_texture_offset] = "tex1"
@@ -376,10 +556,12 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     helpers = set()
     mask = "entry"
     samples = 0
-    sample_pending = False
-    sample_dest = set()
+    sample_dest = {}  # VGPR -> issue number of its outstanding image_sample
     exported = False
     ended = False
+    entry_line = len(lines)
+    lines.append("float4 main(float2 uv : TEXCOORD0) : SV_Target0 {")
+    attribute_input = False
     for i, line in enumerate(instructions):
         def match(pattern):
             return re.fullmatch(pattern, line)
@@ -390,11 +572,21 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             raise ValueError("Unexpected instruction after color export")
         if match(r"(?:s_inst_prefetch|s_nop) (?:0x[0-9a-f]+|\d+)"):
             continue
+        # Scheduling hints with no effect on results. Each operand is limited to the width
+        # of its RDNA 2 field: clause length minus one, wave priority and sleep duration.
+        if m := match(r"(s_clause|s_setprio|s_sleep) (0x[0-9a-f]+|\d+)"):
+            if int(m[2], 0) > HINT_LIMITS[m[1]]:
+                raise ValueError(f"Invalid {m[1]} operand")
+            continue
         if line == "s_waitcnt lgkmcnt(0)":
             pending.clear()
-        elif line == "s_waitcnt vmcnt(0)":
-            sample_pending = False
-            sample_dest.clear()
+        elif m := match(r"s_waitcnt vmcnt\((\d+)\)"):
+            limit = int(m[1])
+            if limit > 63:
+                raise ValueError("VM wait count exceeds the gfx10 six-bit field")
+            # Only the newest limit samples can remain outstanding. Filtering
+            # the current set also preserves guarantees made by earlier waits.
+            sample_dest = {reg: issue for reg, issue in sample_dest.items() if issue > samples - limit}
         elif m := match(r"s_mov_b64 s\[(\d+):(\d+)\], exec"):
             regs = registers(*m.groups(), 2)
             for n in regs:
@@ -489,14 +681,18 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for j, n in enumerate(dst):
                 scalar[f"s{n}"] = (bindings[offset], j)
                 pending.add(f"s{n}")
-        elif m := match(r"(?:(s_load_dwordx4|s_buffer_load_dwordx4) s\[(\d+):(\d+)\]|s_buffer_load_dword s(\d+))"
+        elif m := match(r"(?:(s_load_dwordx4|s_buffer_load_dwordx[24]) s\[(\d+):(\d+)\]|s_buffer_load_dword s(\d+))"
                         r", s\[(\d+):(\d+)\], (0x[0-9a-f]+|null)"):
             op, first, last, single, low, high, imm = m.groups()
             offset = 0 if imm == "null" else int(imm, 16)
             descriptor = op == "s_load_dwordx4"
-            if single is not None and (int(single) > 105 or int(low) % 4 or int(high) > 105):
+            width = 1 if single is not None else 2 if op == "s_buffer_load_dwordx2" else 4
+            if single is not None:
+                first = last = single
+            # LLVM names a 64-bit scalar destination only as an even-aligned pair.
+            if width < 4 and (int(last) > 105 or int(first) % width or int(low) % 4 or int(high) > 105):
                 raise ValueError("Invalid scalar buffer registers")
-            dst = registers(single, single, 1) if single is not None else registers(first, last, 4)
+            dst = registers(first, last, width)
             base = [f"s{n}" for n in registers(low, high, 2 if descriptor else 4)]
             expected = ["texture_ptr", 0] if descriptor else [("cbv", n) for n in range(4)]
             if constant_descriptor is None or pending.intersection(base) or [scalar.get(r) for r in base] != expected:
@@ -519,7 +715,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Invalid cube operation")
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
-            x, y, z = [fp_operand(t, scalar, vector, pending, sample_pending) for t in tokens]
+            x, y, z = [fp_operand(t, scalar, vector, pending, sample_dest) for t in tokens]
             lines.append(f"    precise float3 cube{i} = float3({x}, {y}, {z});")
             c, a = f"cube{i}", f"abs(cube{i})"
             zmajor = f"({a}.z >= {a}.x && {a}.z >= {a}.y)"
@@ -534,20 +730,31 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
-        elif m := match(r"v_interp_p([12])_f32_e32 (v\d+), (v\d+), attr0\.([xy])"):
+        elif m := match(r"v_interp_p([12])_f32_e32 (v\d+), (v\d+), attr0\.([xyzw])"):
             phase, dst, src, component = m.groups()
-            if mask != "quad" or scalar.get("m0") != "interp_base":
+            entry_interp = mask == "entry" and sampler is None
+            if ((not entry_interp and (mask != "quad" or component not in "xy"))
+                    or scalar.get("m0") != "interp_base"):
                 raise ValueError("Unknown interpolation context")
-            if phase == "1" and vector[src] == "bary_i":
-                vector[dst] = ("partial", component)
-            elif phase == "2" and vector[src] == "bary_j" and vector[dst] == ("partial", component):
-                vector[dst] = f"uv.{component}"
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            if phase == "1" and vector.get(src) == "bary_i":
+                vector[dst] = ("partial", component, mask)
+            elif phase == "2" and vector.get(src) == "bary_j" and vector.get(dst) == ("partial", component, mask):
+                if entry_interp:
+                    attribute_input = True
+                    vector[dst] = f"alu{i}"
+                    lines.append(f"    float alu{i} = uv.{component};")
+                else:
+                    vector[dst] = f"uv.{component}"
             else:
                 raise ValueError("Unpaired interpolation")
         elif m := match(r"image_sample v\[(\d+):(\d+)\], v\[(\d+):(\d+)\], s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0xf dim:SQ_RSRC_IMG_2D"):
             operands = m.groups()
             dest, coords, image, state = [registers(*operands[k:k+2], width)
                                           for k, width in zip((0,2,4,6), (4,2,8,4))]
+            if any(f"v{n}" in sample_dest for n in dest):
+                raise ValueError("Write overlaps an outstanding sample")
             descriptor = [scalar.get(f"s{n}") for n in image]
             texture = next((name for name in bindings.values() if descriptor == [(name, j) for j in range(8)]), None)
             if (mask != "entry" or any(f"s{n}" in pending for n in (*image, *state))
@@ -555,14 +762,13 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     or [scalar.get(f"s{n}") for n in state] != list(sampler)):
                 raise ValueError("Unsupported image or sampler binding")
             uv = [vector[f"v{n}"] for n in coords]
-            if any(v not in ("uv.x", "uv.y") for v in uv):
+            if any(v not in quad_values for v in uv):
                 raise ValueError("Unsupported texture coordinate")
             lines.append(f"    float4 sample{i} = {texture}.Sample(samp, float2({', '.join(uv)}));")
             samples += 1
-            sample_pending = True
             for j, n in enumerate(dest):
                 vector[f"v{n}"] = f"sample{i}.{'xyzw'[j]}"
-                sample_dest.add(f"v{n}")
+                sample_dest[f"v{n}"] = samples
         elif m := match(r"v_(fmaak|fmamk)_f32 (v\d+), ([^,]+), ([^,]+), ([^,]+)"):
             op, dst, *tokens = m.groups()
             literal = tokens[2] if op == "fmaak" else tokens[1]
@@ -570,7 +776,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Invalid literal multiply-add")
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
-            values = [fp_operand(t, scalar, vector, pending, sample_pending) for t in tokens]
+            values = [fp_operand(t, scalar, vector, pending, sample_dest) for t in tokens]
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {ALU['fma'][1].format(*values)};")
         elif m := match(r"v_mov_b32(?:_e32|_e64)? (v\d+), (-?\d+(?:\.\d+)?|0x[0-9a-f]{1,8}|[vs]\d+)"):
@@ -580,21 +786,89 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Invalid register move")
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
-            value = fp_operand(src, scalar, vector, pending, sample_pending)
+            value = fp_operand(src, scalar, vector, pending, sample_dest)
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {value};")
-        elif m := match(r"v_(log|exp|rcp|sqrt|rsq|floor|ceil|fract|trunc|add|mul|max|min|sub|subrev|mul_legacy|fma|fmac)_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
+        elif m := match(r"v_(log|exp|rcp|sqrt|rsq|floor|ceil|fract|trunc|frexp_mant|add|mul|max|min|sub|subrev|mul_legacy|fma|fmac|mad|mac|min3|max3|med3)_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
             op, dst, operands, clamp = m.groups()
             tokens = operands.split(", ")
-            if op == "fmac":
+            if op in ("fmac", "mac"):
                 tokens.append(dst)
             arity, template = ALU[op]
-            if mask != "entry" or len(tokens) != arity:
+            quad = mask == "quad"
+            if (mask not in ("entry", "quad") or len(tokens) != arity
+                    or (quad and (samples or second_texture_offset is not None
+                                  or op not in ("add", "fma", "mul_legacy")))):
                 raise ValueError("Invalid arithmetic operation")
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
-            values = [fp_operand(t, scalar, vector, pending, sample_pending) for t in tokens]
+            if quad and (clamp or any("|" in t or "abs(" in t for t in tokens)):
+                raise ValueError("Whole-quad coordinate arithmetic must be affine")
+            provenance = quad_values if quad else None
+            values = [fp_operand(t, scalar, vector, pending, sample_dest, quad_values=provenance) for t in tokens]
+            if quad:
+                varying = [quad_values.get(vector.get(t.lstrip("-"), ""), False) for t in tokens]
+                if op != "add" and all(varying[:2]):
+                    raise ValueError("Whole-quad coordinate arithmetic must be affine")
+                quad_values[f"alu{i}"] = any(varying)
             expression = template.format(*values)
+            if clamp:
+                expression = f"saturate({expression})"
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(rf"v_cmp_class_f32(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
+            dst, value, classes = m.groups()
+            regs = lane_mask(dst)
+            if mask != "entry" or pending.intersection(regs):
+                raise ValueError("Invalid comparison")
+            if re.fullmatch(r"-?\d+|0x[0-9a-f]{1,8}", classes):
+                bits = f"{int(classes, 0) & 0xffffffff}u"
+            elif re.fullmatch(r"[vs]\d+", classes):
+                bits = f"asuint({fp_operand(classes, scalar, vector, pending, sample_dest)})"
+            else:
+                raise ValueError("Unsupported class mask")
+            operand = fp_operand(value, scalar, vector, pending, sample_dest)
+            for j, reg in enumerate(regs):
+                scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+            lines.append(f"    bool cmp{i} = (class32({operand}) & {bits}) != 0u;")
+
+        elif m := match(r"v_(min|max)_(i32|u32)(?:_e32|_e64)? (v\d+), ([^,]+), ([^,]+)"):
+            op, kind, dst, *tokens = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid integer arithmetic operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            values = [int_operand(t, scalar, vector, pending, sample_dest, signed=kind == "i32")
+                      for t in tokens]
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat({op}({values[0]}, {values[1]}));")
+        elif m := match(r"v_(min3|max3|med3)_(i32|u32)(?:_e64)? (v\d+), ([^,]+), ([^,]+), ([^,]+)"):
+            op, kind, dst, *tokens = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid integer arithmetic operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            values = [int_operand(t, scalar, vector, pending, sample_dest, signed=kind == "i32")
+                      for t in tokens]
+            if op == "med3":
+                vec_type = "int3" if kind == "i32" else "uint3"
+                lines.append(f"    {vec_type} med{i} = {vec_type}({values[0]}, {values[1]}, {values[2]});")
+                expression = f"max(min(med{i}.x, med{i}.y), min(max(med{i}.x, med{i}.y), med{i}.z))"
+            else:
+                fn = op[:-1]
+                expression = f"{fn}({fn}({values[0]}, {values[1]}), {values[2]})"
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat({expression});")
+
+        elif m := match(r"v_ldexp_f32(?:_e64)? (v\d+), ([^,]+), ([^,]+?)( clamp)?"):
+            dst, src0, src1, clamp = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid arithmetic operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            value = fp_operand(src0, scalar, vector, pending, sample_dest)
+            exponent = int_operand(src1, scalar, vector, pending, sample_dest, signed=True)
+            expression = f"ldexp32({value}, {exponent})"
             if clamp:
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
@@ -604,10 +878,20 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             regs = lane_mask(dst)
             if mask != "entry" or pending.intersection(regs):
                 raise ValueError("Invalid comparison")
-            values = [fp_operand(t, scalar, vector, pending, sample_pending) for t in tokens]
+            values = [fp_operand(t, scalar, vector, pending, sample_dest) for t in tokens]
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             lines.append(f"    bool cmp{i} = {COMPARE[op].format(*values)};")
+        elif m := match(rf"v_cmp_({'|'.join(INT_COMPARE)})_(i32|u32)(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
+            op, kind, dst, *tokens = m.groups()
+            regs = lane_mask(dst)
+            if mask != "entry" or pending.intersection(regs):
+                raise ValueError("Invalid comparison")
+            values = [int_operand(t, scalar, vector, pending, sample_dest, signed=kind == "i32")
+                      for t in tokens]
+            for j, reg in enumerate(regs):
+                scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+            lines.append(f"    bool cmp{i} = {INT_COMPARE[op].format(*values)};")
         elif m := match(rf"v_cndmask_b32(?:_e32|_e64)? (v\d+), ([^,]+), ([^,]+), {LANE_MASK}"):
             dst, unset, chosen, source = m.groups()
             regs = lane_mask(source)
@@ -616,7 +900,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     or condition[0] != "condition"
                     or [scalar.get(r) for r in regs] != [(*condition[:2], j, len(regs)) for j in range(len(regs))]):
                 raise ValueError("Select mask is not a tracked comparison")
-            values = [fp_operand(t, scalar, vector, pending, sample_pending) for t in (chosen, unset)]
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            values = [fp_operand(t, scalar, vector, pending, sample_dest) for t in (chosen, unset)]
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {condition[1]} ? {values[0]} : {values[1]};")
         elif m := match(r"v_cvt_f32_f16(?:_e32|_e64)? (v\d+), (-?)(?:\|([vs]\d+|0x[0-9a-f]{1,8}|\d+)\||abs\(([vs]\d+|0x[0-9a-f]{1,8}|\d+)\)|([vs]\d+|0x[0-9a-f]{1,8}|\d+))( clamp)?"):
@@ -629,7 +915,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if re.fullmatch(r"0x[0-9a-f]{1,8}|\d+", source):
                 word = f"{int(source, 0) & 0xffffffff}u"
             else:
-                word = f"asuint({fp_operand(source, scalar, vector, pending, sample_pending)})"
+                word = f"asuint({fp_operand(source, scalar, vector, pending, sample_dest)})"
             expression = f"widen16({word})"
             if bars or call:
                 expression = f"abs({expression})"
@@ -641,28 +927,31 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    precise float alu{i} = {expression};")
         elif m := match(r"v_cvt_pkrtz_f16_f32_e32 (v\d+), (v\d+), (v\d+)"):
             dst, lo, hi = m.groups()
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
             pair = (vector[lo], vector[hi])
-            if mask != "entry" or sample_pending or not all(isinstance(v, str) and v.startswith(("sample", "alu")) for v in pair):
+            if mask != "entry" or lo in sample_dest or hi in sample_dest or not all(isinstance(v, str) and v.startswith(("sample", "alu")) for v in pair):
                 raise ValueError("Unsupported pack operand")
             vector[dst] = pair
-        elif m := match(r"exp mrt0,? (v\d+), \1, (v\d+), \2 done compr vm"):
-            pairs = [vector[v] for v in m.groups()]
+        elif m := match(r"exp mrt0,? (v\d+), \1, (v\d+|off), \2 done compr vm"):
+            pairs = [vector[v] for v in m.groups() if v != "off"]
             if mask != "entry" or exported or not all(isinstance(p, tuple) and len(p)==2 and
                     all(v.startswith(("sample", "alu")) for v in p) for p in pairs):
                 raise ValueError("Unsupported export")
             args = [f"export16({v})" for pair in pairs for v in pair]
-            lines.append(f"    return float4({', '.join(args)});")
+            input_type = "float4" if attribute_input else "float2"
+            lines[entry_line] = f"float{len(args)} main({input_type} uv : TEXCOORD0) : SV_Target0 {{"
+            lines.append(f"    return float{len(args)}({', '.join(args)});")
             exported = True
         elif line == "s_endpgm" and exported:
             ended = True
         else:
             raise ValueError(f"Unsupported instruction {i}: {line}")
-    if not ended or samples != (2 if second_texture_offset is not None else 1):
+    if not ended or samples != len(bindings):
         raise ValueError("Unexpected sample count or missing color export")
     if helpers:
         defs = [body for name, body in SALU_HELPERS.items() if name in helpers]
-        pos = lines.index(PREAMBLE)
-        lines[pos:pos] = defs
+        lines[:0] = defs
     return "\n".join([*lines, "}",""])
 
 
@@ -672,9 +961,11 @@ def main():
     parser.add_argument("record")
     parser.add_argument("--container-sha256", help="SHA-256 of the full decoded DXBC container to select by name")
     parser.add_argument("--llvm", required=True, help="LLVM C library with AMDGPU support")
-    parser.add_argument("--texture-sgpr", type=int, required=True, help="Entry register for the low texture address")
+    parser.add_argument("--texture-sgpr", type=int, required=True, help="Entry register for the low descriptor-table address")
     parser.add_argument("--interp-sgpr", type=int, required=True, help="Entry register for the interpolation base")
-    parser.add_argument("--sampler-words", nargs=4, type=lambda s: int(s, 0), required=True,
+    profile = parser.add_mutually_exclusive_group(required=True)
+    profile.add_argument("--no-texture", action="store_true", help="Require zero texture samples")
+    profile.add_argument("--sampler-words", nargs=4, type=lambda s: int(s, 0),
                         help="Four descriptor words to bind to the supplied desktop sampler at s0")
     parser.add_argument("--output", type=Path, required=True, help="Destination .hlsl in a local output directory")
     parser.add_argument("--constant-descriptor", type=lambda s: int(s, 0),
@@ -685,7 +976,7 @@ def main():
     if dest.suffix.lower() != ".hlsl" or dest == args.archive.resolve():
         parser.error("Choose an HLSL destination distinct from the input")
     try:
-        blob, code = native_program(args.archive, args.record, container_sha256=args.container_sha256)
+        blob, code = native_program(args.archive, args.record, container_sha256=args.container_sha256, llvm=args.llvm)
         instructions = disassemble(code, args.llvm)
         source = lower(instructions, args.texture_sgpr, args.interp_sgpr, args.sampler_words, args.constant_descriptor, second_texture_offset=args.second_texture_offset)
     except (ValueError, KeyError, struct.error, OSError, AttributeError, zlib.error) as exc:
