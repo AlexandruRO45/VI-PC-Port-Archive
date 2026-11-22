@@ -362,6 +362,8 @@ int main(int argc, char** argv)
     const std::string_view operation = argv[2];
     if (operation == "--check-pixel-quad-lod") {
         if (argc != 4) return 2;
+    } else if (operation == "--mesh-entry") {
+        if (argc != 6) return 2;
     } else if (operation == "--check-bc7-tail") {
         if (argc < 6) return 2;
     } else if ((operation == "--compute-root-file" || operation == "--ffx-immediate-conversion")) {
@@ -458,6 +460,8 @@ int main(int argc, char** argv)
             check_bvh_hits(device.Get());
         } else if (argc == 3 && operation == "--dxr-update") {
             if (!check_dxr_update(device.Get())) return 77;
+        } else if (operation == "--mesh-entry") {
+            if (!check_mesh_entry_draw(device.Get(), argv[3], argv[4], argv[5])) return 77;
         } else if (argc == 3 && operation == "--dxr-facing") {
             if (!check_dxr_facing(device.Get())) return 77;
         } else if (argc == 3 && operation == "--bvh-packed") {

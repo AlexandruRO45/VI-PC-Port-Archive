@@ -180,17 +180,17 @@ def container_code(program, *, stage, llvm=None):
     return image[start:ends[0]]
 
 
-def disassemble(code, library, *, cpu=b"gfx1013", offsets=False):
+def disassemble(code, library, *, cpu=b"gfx1013", offsets=False, features=b""):
     llvm = C.CDLL(library)
     for component in ("TargetInfo", "Target", "TargetMC", "AsmPrinter", "Disassembler"):
         getattr(llvm, "LLVMInitializeAMDGPU" + component)()
     pointer, string = C.c_void_p, C.c_char_p
-    llvm.LLVMCreateDisasmCPU.argtypes = [string, string, pointer, C.c_int, pointer, pointer]
-    llvm.LLVMCreateDisasmCPU.restype = pointer
+    llvm.LLVMCreateDisasmCPUFeatures.argtypes = [string, string, string, pointer, C.c_int, pointer, pointer]
+    llvm.LLVMCreateDisasmCPUFeatures.restype = pointer
     llvm.LLVMDisasmInstruction.argtypes = [pointer, pointer, C.c_uint64, C.c_uint64, pointer, C.c_size_t]
     llvm.LLVMDisasmInstruction.restype = C.c_size_t
     llvm.LLVMDisasmDispose.argtypes = [pointer]
-    ctx = llvm.LLVMCreateDisasmCPU(b"amdgcn--amdpal", cpu, None, 0, None, None)
+    ctx = llvm.LLVMCreateDisasmCPUFeatures(b"amdgcn--amdpal", cpu, features, None, 0, None, None)
     if not ctx:
         raise ValueError(f"LLVM has no {cpu.decode()} disassembler")
     raw = C.create_string_buffer(code)

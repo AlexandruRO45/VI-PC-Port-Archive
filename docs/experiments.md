@@ -932,6 +932,41 @@ The report follows the effect's stored list order. Each entry gives its stored g
 
 Two independently located local effects yielded 5 and 81 candidates across all groups. Their pixel lists contained 2 and 41 candidates respectively, and every pixel-container digest matched an independent decode. Identifying which candidate a draw uses still requires evidence of pass selection.
 
+## Single-group mesh entry specialization
+
+`tools/mesh_entry_aot.py` takes an extracted mesh container and a JSON array of
+unsigned geometry words. It checks the native extent and the PSV triangle
+topology, group size and output bounds. It decodes the entry with LLVM in
+wave64 mode, follows two waves of forward control flow and specializes the
+geometry reads and lane masks. The resulting desktop mesh shader reads position
+and transform data from b0 and b1, emits three vertices and one primitive, and
+can record its exports to a diagnostic UAV when compiled with `TRACE_EXPORTS`.
+
+The specialization assumes one 128-thread group, wave ID in bits 24–27 of s3,
+a descriptor table token in s17, and zero for s20, s21 and v5. Table offsets
+0x20, 0x60 and 0x80 select static geometry, point data and the transform,
+respectively. Changing geometry requires retranslating the entry. The native
+draw state and application bindings remain unverified. Each public test builds
+its own inputs. The visible triangle control uses an independently authored
+native program, and the CPU checks its 32×32 target, exported vertices,
+primitive index order and guard bytes.
+
+```text
+python3 -B tests/mesh_entry_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+ctest --preset dev --no-tests=error -R "^mesh_entry_draw_" -V
+```
+
+A local scan based on main `933cbad` selected the shortest validated native
+stream among 9,282 MS records (832 bytes, 153 instructions). For the tested
+geometry its three vertices receive the same transformed position. The raster
+target therefore retains its clear color. Two independently calculated
+point/matrix cases matched all three exported positions and the (0,1,2) index
+triple. The uninstrumented shader also completed a draw for both inputs. The
+source-built visible triangle filled all 1,024 pixels, while altering a
+reference index caused the comparison to fail. Tested on Windows build
+26200.9974, RTX 4060 Laptop driver 32.0.16.1656 and WARP 10.0.26100.9818,
+with the debug layer enabled.
+
 ## Compute UAV stores from a native container
 
 `tools/compute_store_aot.py` accepts a local extracted DXBC compute container. It checks the stage in both the DXIL and PSV0 parts, the group dimensions, the FSSM v0x101 extent and termination, then decodes the gfx1013 instructions with LLVM. The first profile translates one raw UAV store of one to four immediate words per invocation. A test binding maps one four-word descriptor to u0. Its table pointer has a known low register and a zero high word. Scalar loads must complete before use. For an indexed store the caller also supplies the group-X register and byte stride, v0 carries local X, and the decoded shift and add must produce the dispatch-thread index. The tests bind in-range raw buffers with no swizzle, format conversion or out-of-range accesses. The original descriptor contents and dispatch configuration require separate evidence.
