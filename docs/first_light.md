@@ -64,7 +64,7 @@ python -I tools/first_light.py --check --out ~/leonida-work/first_light/out
 `--check` on an existing folder re-runs the harness through the same fresh path and `check_image` as the test; a
 harness that exits 0 without writing, an all-opaque image and a swapped-U/V image all exit 1. The test has
 36 cases. Three are package-gated and skip without `LEONIDA_FIRST_LIGHT_DIR`. The other 33 need no package:
-the oracle fixtures, the CPU checks of `--camera` (section 6) and, from section 7, the layout derivation, the
+the oracle fixtures, the CPU checks of `--camera` (section 7) and, from section 8, the layout derivation, the
 constant-colour oracle and the prop rule. The prop rule is checked end to end on a box built in the test (six 7 x 7
 grids with UVs, 588 triangles): manifest, `pick()`, the CLI line, `read_obj` and the coverage masks.
 
@@ -106,7 +106,38 @@ LEONIDA_FIRST_LIGHT_DIR=~/leonida-work/first_light/out ctest --test-dir <build> 
 
 Without `LEONIDA_FIRST_LIGHT_DIR` the test prints SKIP and exits 77.
 
-## 6. A camera (TEST-523)
+## 6. With a texture (`TEST-524`)
+
+Passing `--dds <exported.dds>` to `tools/first_light.py` switches the default pixel shader to a translated
+single-sample game pixel shader (`PS_Copy_3ea4b38a_Wrapped`, FSSM SHA-256
+`19e2e7612505b9d3b19e6607b47e09dcdde02a2c9987a63e834d9586f217090f`, wave32, `inputs=[0]`, `outputs=[0]`,
+`shader_link_check.py check`: compatible with `VS_main_170e32e6_Wrapped`). `first_light.py` decodes the DDS
+(for example a BCPack-decoded TTPF albedo) with `tools/dds_png.py`, writes `texture.rgba` (`u32 width, u32 height` +
+`R8G8B8A8_UNORM` texels) into the output folder, and passes `VKH_TEX_RGBA`, `VKH_TSHARP_VA` (`0x100`),
+`VKH_SSHARP` (the shader's literal sampler `0x92, 0xc00000, 0x14500000, 0`, bilinear + clamp-to-edge) and
+`VKH_SGPRS` (`s9 = 0x100`) to `vk_harness`.
+
+`vk_harness` enables `bufferDeviceAddress`, `runtimeDescriptorArray` and `descriptorIndexing` only when
+`VKH_TEX_RGBA` is set (inert otherwise), writes the 8-dword `T#` at `VKH_TSHARP_VA` in the 64 KiB heap, binds
+set 0 (`binding 0` 2D images with a 1×1 magenta fallback at index 0 and the decoded texture at index 1; `binding 1`
+samplers with the decoded `S#` at index 1; `binding 2` the `DescriptorTable` hash buffer), and draws the mesh.
+
+The CPU oracle (`check_image`) samples the decoded `R8G8B8A8_UNORM` texture bilinearly (clamp-to-edge) at
+`centre_uv` and each `uv_probes` entry and requires the GPU readback to match within `0.02` (rejecting the
+magenta unbound-texture fallback and wrong-colour probes). Verified on Windows 11 with an NVIDIA GeForce RTX 3060
+(driver 621.24, Vulkan 1.4.357): **12,804/16,384 (0.781)** covered. Without `LEONIDA_FIRST_LIGHT_DIR`,
+`python -I tests/test_first_light.py -v` runs **14 tests: 11 passed, 3 skipped** (the 3 package-gated
+`FirstLightTests` require `LEONIDA_FIRST_LIGHT_DIR`; the 4 `OracleTests` and 7 `TexturedOracleTests` run without a
+package). With `LEONIDA_FIRST_LIGHT_DIR` set against a local package run, all **14/14** tests pass.
+
+```sh
+python -I tools/first_light.py --game "<package>" --work ~/leonida-work \
+    --obj ~/leonida-work/assets/data/models/<model>.obj \
+    --dds ~/leonida-work/assets/ttpf/<pool>/<texture>.dds --no-fit --run
+LEONIDA_FIRST_LIGHT_DIR=~/leonida-work/first_light/out python -I tests/test_first_light.py -v
+```
+
+## 7. A camera (TEST-523)
 
 `first_light.py --camera` draws the same model in perspective with a game VS that applies a world matrix and a
 view-projection matrix of its own, read from two constant buffers. The PS is the one from section 1:
@@ -157,7 +188,7 @@ python -I tools/first_light.py --game "<package>" --work ~/leonida-work \
 LEONIDA_FIRST_LIGHT_DIR=~/leonida-work/first_light/camera python -I tests/test_first_light.py -v
 ```
 
-## 7. A world prop from levels.rpf (TEST-525)
+## 8. A world prop from levels.rpf (TEST-525)
 
 The same camera path draws a world prop from `levels.rpf` with a second game VS, `sga_dr_vs_pos_tex`, which applies
 its own world and view-projection matrices too. **Measured** on an RTX 4090 (Windows 11, driver 617.42,
@@ -180,7 +211,7 @@ unpacked from a constant (`v_cvt_f32_ubyte0..3` of one SGPR, times 1/255), UV go
 param0 as the colour, so the image is a constant colour, not a UV map. The task's alternative, `sga_dr_vs_pos_feff6b5f`
 with `sga_dr_ps_feff6b5f`, has the same constant-colour shape (also param0 from `v_cvt_f32_ubyte` of an SGPR); it was
 run as a cross-check. What the pair gives up: the UV is read from the vertex buffer but never reaches a pixel, so
-section 6's UV oracle does not apply; the texture is TEST-524's.
+section 7's UV oracle does not apply; the texture is TEST-524's.
 
 **The constant layout is derived, not hard-coded.** `first_light.constant_layout` reads the VS's disassembly: the
 descriptor table is the SGPR pair `s_load_dwordx4` loads from (the low half followed through `s_mov_b32` copies,
@@ -191,7 +222,7 @@ fit is rejected with an error naming it (`VS_main_170e32e6`, which loads no V#, 
 
 | VS | table SGPR | world V# | view V# | view-projection | colour dword |
 |---|---|---|---|---|---|
-| `VS_TransformVT_e6ebb353` (section 6) | s9, copied to s2 | table + 0x20 | table + 0x60 | 0x160 | none |
+| `VS_TransformVT_e6ebb353` (section 7) | s9, copied to s2 | table + 0x20 | table + 0x60 | 0x160 | none |
 | `sga_dr_vs_pos_tex_90997d1b` | s8 | table + 0x00 | table + 0x40 | 0x160 | world + 0x0C |
 | `sga_dr_vs_pos_feff6b5f` | s8 | table + 0x00 | table + 0x20 | 0x160 | world + 0x0C |
 
@@ -199,7 +230,7 @@ fit is rejected with an error naming it (`VS_main_170e32e6`, which loads no V#, 
 and its error cases (no table, high half not 0, missing world rows, missing view-projection, a V# not loaded from a
 table, a colour outside a row's w).
 
-**The oracle** is CPU-derived, like section 6: the prop is projected with the same float32 matrices, and a
+**The oracle** is CPU-derived, like section 7: the prop is projected with the same float32 matrices, and a
 rasterization of the projected triangles gives two masks over the 128×128 pixel centres. A pixel is *certain* when
 its centre is more than 0.02 px inside some triangle and *possible* when it is not more than 0.02 px outside every
 one (the band stands for the GPU's sub-pixel snap and top-left rule; 0.02 px assumes 8 `subPixelPrecisionBits`, as on the
@@ -218,7 +249,7 @@ bit-equal) on every covered pixel. The constant is packed `0xC0C08040`, so the e
 | clear corner (0, 0) | clear (-1) | clear |
 | covered pixels that differ from the constant | 0 | 0 |
 
-The same prop with `VS_TransformVT_e6ebb353` and the UV oracle of section 6 also passes (1,946 covered, the centre UV
+The same prop with `VS_TransformVT_e6ebb353` and the UV oracle of section 7 also passes (1,946 covered, the centre UV
 and the probes within 2e-3), and the `feff6b5f` pair covers the same 1,946 pixels with the same constant. Negative
 controls: a draw without the constants makes the harness fail, a table SGPR of 0 covers nothing, and a wrong expected
 channel is rejected. The pair also passes `spirv-val`.
@@ -240,14 +271,15 @@ LEONIDA_FIRST_LIGHT_DIR=~/leonida-work/first_light/camera python -I tests/test_f
 (The carve index names this VS with the leading `#`; `--list` shows the exact spelling. `--min-coverage` is lowered
 because a prop is a small part of the frame; the mask check above is the oracle.)
 
-## 8. Limits and next
+## 9. Limits and next
 
-* The camera draws (sections 6 and 7) run in `vk_harness` only. Through the D3D12 layer, the table SGPR and the table
+* The camera draws (sections 7 and 8) run in `vk_harness` only. Through the D3D12 layer, the table SGPR and the table
   it points at have to come from root arguments, which `d3d12_first_light_test` does not set up yet.
+* `--camera` and `--dds` don't combine: the camera VS's table and the textured PS's T# both take s9 of the shared
+  push constants and heap VA 0x100, so `first_light.py` refuses the pair. A textured perspective draw needs a
+  second constant layout.
 * Some candidate VSs (one of the `Rage_TransformPosTex` pair among them) are carved under a renamed `~1` file,
   which `first_light.py` does not follow when copying the SPIR-V (#2419).
-* No texture: the PS writes the UV map. A texture path needs a TTPF albedo, BCPack decode, a T# in the bindless
-  set and the game's sampler.
 * One model and one draw per run; the prop's quantized vertex formats and packed normals are not exercised (the OBJ
   already holds the floats), and the `levels.rpf` props with COLOUR or NORMAL inputs need the other `sga_dr_*`
   families and a vertex-input layout with more attributes.
