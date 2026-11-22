@@ -1646,6 +1646,16 @@ following valid draw must pass. The fixture checks each status in order and
 checks the process exit code. This leaves four device creations for the
 predicate groups in place of 21, without changing the number of DXC calls.
 
+The 32-bit integer, 16-bit integer and SDWA predicate draws use the same
+runner, one batch per compiled group, with the same references. The
+signed-against-unsigned control of the first `i32` e32 group and the
+inverted-unordered control of each SDWA group run inside their batch as
+expected mismatches, each followed by a passing draw. The three 16-bit
+`must_mismatch` controls, two of them on mutated shaders, keep one single-case
+draw each. These three suites
+go from 108 device creations to 23, and DXC compiles one shader fewer, because
+the signed/unsigned control now reuses the group's compiled shader.
+
 #The bitwise fixture uses AND, OR, XOR, NOT, BFI and three reversed shifts. Two constant sets exercise counts above 31. Exact mantissa bits distinguish the arithmetic and logical right shifts in GPU readback.
 
 ## Pixel color without a texture sample
