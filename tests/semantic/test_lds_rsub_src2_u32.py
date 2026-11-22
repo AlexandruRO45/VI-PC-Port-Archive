@@ -111,6 +111,156 @@ class LDSModel:
         return res
 
 
+# ---------------------------------------------------------------------------
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ---------------------------------------------------------------------------
+
+class RegKind(enum.Enum):
+    """Register file domain."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclasses.dataclass(frozen=True)
+class Register:
+    """Symbolic register operand representation."""
+    kind: RegKind
+    index: int
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        if self.index < 0 or self.index >= 256:
+            raise ValueError(f"Register index out of range [0, 255]: {self.index}")
+        if self.count not in (1, 2, 4):
+            raise ValueError(f"Unsupported register count: {self.count}")
+        if self.index + self.count > 256:
+            raise ValueError(f"Register range exceeds register file boundary: {self.index}")
+
+    @property
+    def is_vgpr(self) -> bool:
+        return self.kind == RegKind.VGPR
+
+    @property
+    def is_sgpr(self) -> bool:
+        return self.kind == RegKind.SGPR
+
+    def format_asm(self) -> str:
+        if self.count > 1:
+            return f"{self.kind.value}[{self.index}:{self.index + self.count - 1}]"
+        return f"{self.kind.value}{self.index}"
+
+
+@dataclasses.dataclass(frozen=True)
+class DSSrc2Offset:
+    """Immediate byte offset modifiers for DS dual-source instructions."""
+    offset0: int = 0
+    offset1: int = 0
+
+    def __post_init__(self) -> None:
+        if self.offset0 < 0 or self.offset0 > 255:
+            raise ValueError(f"offset0 must be in unsigned 8-bit range [0, 255]: {self.offset0}")
+        if self.offset1 < 0 or self.offset1 > 255:
+            raise ValueError(f"offset1 must be in unsigned 8-bit range [0, 255]: {self.offset1}")
+
+
+class Opcode(enum.Enum):
+    """LDS dual-source instruction opcodes."""
+    DS_RSUB_SRC2_U32 = "ds_rsub_src2_u32"
+
+
+@dataclasses.dataclass(frozen=True)
+class Instruction:
+    """Symbolic AST node representing a ds_rsub_src2_u32 instruction."""
+    opcode: Opcode
+    vaddr: Register
+    offset: DSSrc2Offset = dataclasses.field(default_factory=DSSrc2Offset)
+
+    def __post_init__(self) -> None:
+        if not self.vaddr.is_vgpr or self.vaddr.count != 1:
+            raise ValueError(f"vaddr must be a single 32-bit VGPR (count=1): {self.vaddr}")
+
+    def to_assembly(self) -> str:
+        va_str = self.vaddr.format_asm()
+        off_parts: list[str] = []
+        if self.offset.offset0 != 0:
+            off_parts.append(f"offset0:{self.offset.offset0}")
+        if self.offset.offset1 != 0:
+            off_parts.append(f"offset1:{self.offset.offset1}")
+        off_str = (" " + " ".join(off_parts)) if off_parts else ""
+        return f"{self.opcode.value} {va_str}{off_str}"
+
+
+@dataclasses.dataclass
+class Program:
+    """Symbolic sequence of LDS dual-source instructions."""
+    instructions: list[Instruction] = dataclasses.field(default_factory=list)
+
+    def append(self, inst: Instruction) -> None:
+        self.instructions.append(inst)
+
+    def to_assembly(self) -> str:
+        return "\n".join(inst.to_assembly() for inst in self.instructions)
+
+
+class TestLdsRsubSrc2AST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_register_construction(self) -> None:
+        v0 = Register(RegKind.VGPR, 0)
+        v1 = Register(RegKind.VGPR, 1)
+        self.assertEqual(v0.format_asm(), "v0")
+        self.assertEqual(v1.format_asm(), "v1")
+
+    def test_instruction_formatting(self) -> None:
+        inst_no_off = Instruction(
+            opcode=Opcode.DS_RSUB_SRC2_U32,
+            vaddr=Register(RegKind.VGPR, 1),
+        )
+        self.assertEqual(inst_no_off.to_assembly(), "ds_rsub_src2_u32 v1")
+
+        inst_with_off = Instruction(
+            opcode=Opcode.DS_RSUB_SRC2_U32,
+            vaddr=Register(RegKind.VGPR, 2),
+            offset=DSSrc2Offset(offset0=4, offset1=8),
+        )
+        self.assertEqual(inst_with_off.to_assembly(), "ds_rsub_src2_u32 v2 offset0:4 offset1:8")
+
+    def test_instruction_validation(self) -> None:
+        # vaddr cannot be SGPR
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.DS_RSUB_SRC2_U32,
+                vaddr=Register(RegKind.SGPR, 1),
+            )
+
+        # vaddr cannot be multi-register
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.DS_RSUB_SRC2_U32,
+                vaddr=Register(RegKind.VGPR, 1, count=2),
+            )
+
+    def test_offset_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            DSSrc2Offset(offset0=-1, offset1=0)
+        with self.assertRaises(ValueError):
+            DSSrc2Offset(offset0=0, offset1=256)
+
+    def test_program_assembly(self) -> None:
+        prog = Program()
+        prog.append(Instruction(
+            opcode=Opcode.DS_RSUB_SRC2_U32,
+            vaddr=Register(RegKind.VGPR, 1),
+            offset=DSSrc2Offset(offset0=1, offset1=2),
+        ))
+        prog.append(Instruction(
+            opcode=Opcode.DS_RSUB_SRC2_U32,
+            vaddr=Register(RegKind.VGPR, 3),
+        ))
+        expected = "ds_rsub_src2_u32 v1 offset0:1 offset1:2\nds_rsub_src2_u32 v3"
+        self.assertEqual(prog.to_assembly(), expected)
+
+
 class TestLdsRsubSrc2ReferenceOracle(unittest.TestCase):
     """Unit tests for reference mathematical oracle and architectural model of ds_rsub_src2_u32."""
 
