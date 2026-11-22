@@ -553,6 +553,237 @@ class TestScalarInterpreter(unittest.TestCase):
         self.assertEqual(state.get_vgpr(6), 0xDEADBEEF)
 
 
+# ==============================================================================
+# Phase 4: SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# ==============================================================================
+
+class SIMDState32:
+    """Architectural SIMD wavefront state for Wave32 and Wave64 execution."""
+
+    def __init__(
+        self,
+        num_lanes: int = DEFAULT_NUM_LANES,
+        exec_mask: int = MASK32,
+        lds_capacity_dwords: int = DEFAULT_LDS_DWORDS,
+        num_vgprs: int = DEFAULT_NUM_VGPRS,
+    ) -> None:
+        if num_lanes not in (32, 64):
+            raise ValueError(f"num_lanes must be 32 or 64, got: {num_lanes}")
+        self.num_lanes = num_lanes
+        self.mask_limit = 0xFFFFFFFF if num_lanes == 32 else MASK64
+        self.exec_mask = exec_mask & self.mask_limit
+        self.num_vgprs = num_vgprs
+        self.lds = LDSModel32(capacity_dwords=lds_capacity_dwords)
+        self.vgprs: list[list[int]] = [[0] * num_vgprs for _ in range(num_lanes)]
+
+    def is_lane_active(self, lane: int) -> bool:
+        if not (0 <= lane < self.num_lanes):
+            raise IndexError(f"Lane index out of bounds [0..{self.num_lanes - 1}]: {lane}")
+        return bool((self.exec_mask >> lane) & 1)
+
+    def set_lane_vgpr(self, lane: int, reg_idx: int, val: int) -> None:
+        if not (0 <= lane < self.num_lanes):
+            raise IndexError(f"Lane index out of bounds [0..{self.num_lanes - 1}]: {lane}")
+        if not (0 <= reg_idx < self.num_vgprs):
+            raise IndexError(f"VGPR index out of bounds [0..{self.num_vgprs - 1}]: {reg_idx}")
+        self.vgprs[lane][reg_idx] = u32(val)
+
+    def get_lane_vgpr(self, lane: int, reg_idx: int) -> int:
+        if not (0 <= lane < self.num_lanes):
+            raise IndexError(f"Lane index out of bounds [0..{self.num_lanes - 1}]: {lane}")
+        if not (0 <= reg_idx < self.num_vgprs):
+            raise IndexError(f"VGPR index out of bounds [0..{self.num_vgprs - 1}]: {reg_idx}")
+        return self.vgprs[lane][reg_idx]
+
+
+class SIMDInterpreter32:
+    """Multi-lane SIMD interpreter executing ds_dec_src2_u32 across wavefronts."""
+
+    def execute(
+        self,
+        instr: DSDecSrc2U32Instruction,
+        state: SIMDState32,
+    ) -> list[Optional[int]]:
+        """Execute ds_dec_src2_u32 across all active lanes with LDS arbitration."""
+        results: list[Optional[int]] = [None] * state.num_lanes
+
+        for lane in range(state.num_lanes):
+            if not state.is_lane_active(lane):
+                continue
+
+            vaddr = state.get_lane_vgpr(lane, instr.addr.base_reg.index)
+            new_val = state.lds.atomic_dec_src2_u32(
+                vaddr=vaddr,
+                offset0=instr.addr.offset0,
+                offset1=instr.addr.offset1,
+            )
+            results[lane] = new_val
+
+        return results
+
+
+class TestSIMDMultiLaneAndExecMasking(unittest.TestCase):
+    """Phase 4: Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_uniform_execution(self) -> None:
+        state = SIMDState32(num_lanes=32, exec_mask=0xFFFFFFFF, lds_capacity_dwords=512)
+        interp = SIMDInterpreter32()
+
+        for lane in range(32):
+            d_a = lane * 2
+            d_b = lane * 2 + 1
+            state.lds.write_dword(d_a, 20)
+            state.lds.write_dword(d_b, 50)
+            state.set_lane_vgpr(lane, 0, d_a * 4)
+
+        instr = DSDecSrc2U32Instruction(
+            addr=LDSAddressExpression(
+                base_reg=RegisterOperand(0, RegType.VGPR),
+                offset0=0,
+                offset1=1,
+            )
+        )
+
+        results = interp.execute(instr, state)
+
+        for lane in range(32):
+            d_a = lane * 2
+            self.assertEqual(results[lane], 19)
+            self.assertEqual(state.lds.read_dword(d_a), 19)
+
+    def test_wave64_divergent_even_lanes(self) -> None:
+        even_mask = 0x5555555555555555
+        state = SIMDState32(num_lanes=64, exec_mask=even_mask, lds_capacity_dwords=512)
+        interp = SIMDInterpreter32()
+
+        for lane in range(64):
+            d_a = lane * 2
+            d_b = lane * 2 + 1
+            state.lds.write_dword(d_a, 50)
+            state.lds.write_dword(d_b, 100)
+            state.set_lane_vgpr(lane, 0, d_a * 4)
+
+        instr = DSDecSrc2U32Instruction(
+            addr=LDSAddressExpression(
+                base_reg=RegisterOperand(0, RegType.VGPR),
+                offset0=0,
+                offset1=1,
+            )
+        )
+
+        results = interp.execute(instr, state)
+
+        for lane in range(64):
+            d_a = lane * 2
+            if lane % 2 == 0:
+                self.assertEqual(results[lane], 49)
+                self.assertEqual(state.lds.read_dword(d_a), 49)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.lds.read_dword(d_a), 50)
+
+    def test_zero_exec_mask(self) -> None:
+        state = SIMDState32(num_lanes=64, exec_mask=0, lds_capacity_dwords=512)
+        interp = SIMDInterpreter32()
+
+        state.lds.write_dword(0, 10)
+        state.lds.write_dword(1, 20)
+        for lane in range(64):
+            state.set_lane_vgpr(lane, 0, 0)
+
+        instr = DSDecSrc2U32Instruction(
+            addr=LDSAddressExpression(
+                base_reg=RegisterOperand(0, RegType.VGPR),
+                offset0=0,
+                offset1=1,
+            )
+        )
+
+        results = interp.execute(instr, state)
+
+        for lane in range(64):
+            self.assertIsNone(results[lane])
+        self.assertEqual(state.lds.read_dword(0), 10)
+
+    def test_single_lane_63_active(self) -> None:
+        state = SIMDState32(num_lanes=64, exec_mask=(1 << 63), lds_capacity_dwords=512)
+        interp = SIMDInterpreter32()
+
+        state.lds.write_dword(10, 42)
+        state.lds.write_dword(11, 100)
+        state.set_lane_vgpr(63, 0, 10 * 4)
+
+        instr = DSDecSrc2U32Instruction(
+            addr=LDSAddressExpression(
+                base_reg=RegisterOperand(0, RegType.VGPR),
+                offset0=0,
+                offset1=1,
+            )
+        )
+
+        results = interp.execute(instr, state)
+
+        for lane in range(63):
+            self.assertIsNone(results[lane])
+        self.assertEqual(results[63], 41)
+        self.assertEqual(state.lds.read_dword(10), 41)
+
+    def test_multi_lane_lds_address_collision_serialization(self) -> None:
+        state = SIMDState32(num_lanes=32, exec_mask=0xF, lds_capacity_dwords=512)
+        interp = SIMDInterpreter32()
+
+        d_a = 5
+        d_b = 6
+        state.lds.write_dword(d_a, 10)
+        state.lds.write_dword(d_b, 100)
+        for lane in range(4):
+            state.set_lane_vgpr(lane, 0, d_a * 4)
+
+        instr = DSDecSrc2U32Instruction(
+            addr=LDSAddressExpression(
+                base_reg=RegisterOperand(0, RegType.VGPR),
+                offset0=0,
+                offset1=1,
+            )
+        )
+
+        results = interp.execute(instr, state)
+
+        # Serialized decrements: 9, 8, 7, 6
+        self.assertEqual(results[0], 9)
+        self.assertEqual(results[1], 8)
+        self.assertEqual(results[2], 7)
+        self.assertEqual(results[3], 6)
+        self.assertEqual(state.lds.read_dword(d_a), 6)
+
+    def test_multi_lane_collision_with_wrapping(self) -> None:
+        state = SIMDState32(num_lanes=32, exec_mask=0xF, lds_capacity_dwords=512)
+        interp = SIMDInterpreter32()
+
+        d_a = 8
+        d_b = 9
+        state.lds.write_dword(d_a, 1)
+        state.lds.write_dword(d_b, 3) # limit 3: 1 -> 0 -> wrap to 3 -> 2
+        for lane in range(4):
+            state.set_lane_vgpr(lane, 0, d_a * 4)
+
+        instr = DSDecSrc2U32Instruction(
+            addr=LDSAddressExpression(
+                base_reg=RegisterOperand(0, RegType.VGPR),
+                offset0=0,
+                offset1=1,
+            )
+        )
+
+        results = interp.execute(instr, state)
+
+        self.assertEqual(results[0], 0)
+        self.assertEqual(results[1], 3) # wrapped to limit 3!
+        self.assertEqual(results[2], 2)
+        self.assertEqual(results[3], 1)
+        self.assertEqual(state.lds.read_dword(d_a), 1)
+
+
 
 if __name__ == "__main__":
     unittest.main()
