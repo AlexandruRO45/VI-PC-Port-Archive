@@ -367,12 +367,17 @@ def parse_junit(text):
 
 
 def parse_lasttest(text):
-    """[(name, result, seconds)] from CTest's Testing/Temporary/LastTest.log."""
-    out, name, secs = [], None, None
+    """[(name, result, seconds)] from CTest's Testing/Temporary/LastTest.log.
+
+    A verdict that carries an explicit reason replaces the plain line with
+    'Test Pass Reason:' / 'Test Fail Reason:' plus the reason text on the
+    following line: a pass reason is a pass, unless its text is a skip
+    ('Skip regular expression ...'); a fail reason is a fail (BUILD-1192)."""
+    out, name, secs, reason = [], None, None, None
     for line in text.splitlines():
         m = re.match(r"^\d+/\d+ Test: (.+)$", line)
         if m:
-            name, secs = m.group(1).strip(), None
+            name, secs, reason = m.group(1).strip(), None, None
             continue
         m = re.match(r"^Test time =\s*([\d.]+) sec", line)
         if m:
@@ -382,6 +387,14 @@ def parse_lasttest(text):
             res = "pass" if "Passed" in line else ("fail" if "Failed" in line else "skip")
             out.append((name, res, secs))
             name = None
+            continue
+        if name and line.startswith(("Test Pass Reason", "Test Fail Reason")):
+            reason = "fail" if "Fail" in line else "pass"
+            continue
+        if name and reason and line.strip():
+            res = "skip" if (reason == "pass" and line.strip().startswith("Skip")) else reason
+            out.append((name, res, secs))
+            name, reason = None, None
     return out
 
 

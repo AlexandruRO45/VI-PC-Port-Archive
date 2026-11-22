@@ -72,6 +72,20 @@ class Tests(unittest.TestCase):
         log = "Start testing: Nov 22 10:00 X\n1/2 Test: loader\nTest time =   0.91 sec\nTest Passed.\n2/2 Test: xmem\nTest Failed.\n"
         self.assertEqual(pd.parse_lasttest(log), [("loader", "pass", 0.91), ("xmem", "fail", None)])
 
+    def test_lasttest_log_keeps_explicit_reasons(self):
+        # BUILD-1192: CTest replaces the plain verdict with 'Test Pass/Fail
+        # Reason:' plus the reason text (measured with CTest 4.5.1; the finding
+        # reports the same shape on Windows CTest 3.31.6).
+        log = ("1/5 Test: plain_pass\nTest Passed.\n"
+               "2/5 Test: reason_fail\nTest Fail Reason:\nError regular expression found in output. Regex=[boom]\n"
+               "3/5 Test: reason_skip\nTest Pass Reason:\nSkip regular expression found in output. Regex=[skip me]\n"
+               "4/5 Test: reason_fail2\nTest Fail Reason:\nRequired regular expression not found. Regex=[must have]\n"
+               "5/5 Test: reason_pass\nTest time =   0.02 sec\nTest Pass Reason:\nRequired regular expression found. Regex=[all good]\n")
+        self.assertEqual(pd.parse_lasttest(log),
+                         [("plain_pass", "pass", None), ("reason_fail", "fail", None),
+                          ("reason_skip", "skip", None), ("reason_fail2", "fail", None),
+                          ("reason_pass", "pass", 0.02)])
+
     def test_ci_selection_matches_the_workflow_rule(self):
         files = pd.ci_test_files()
         self.assertIn("tests/test_progress_dashboard.py", files)
