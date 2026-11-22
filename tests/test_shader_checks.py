@@ -434,6 +434,7 @@ class Wave32LaneDumps(unittest.TestCase):
     def test_lane_dumps_are_wave32_dumps(self):
         self.assertTrue(set(check.WAVE32_LANE_DUMPS) <= set(check.WAVE32_DUMPS))
         self.assertTrue(set(check.WAVE32_LANE_DUMPS) <= set(dict(check.CS_DUMPS)))
+        self.assertIn("cs_barrier_loop", check.WAVE32_LANE_DUMPS)
 
     def test_skipped_below_32_lanes_whatever_the_words(self):
         for name in check.WAVE32_LANE_DUMPS:
