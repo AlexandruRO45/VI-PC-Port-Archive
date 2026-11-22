@@ -10,6 +10,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -371,6 +372,50 @@ class ScanTest(unittest.TestCase):
                 bvh_index.main([self.dir, "--out", outdir])
         self.assertEqual(cm.exception.code, 2)
         self.assertIn("is a folder, not a report file", err.getvalue())
+
+    def test_report_folder_that_is_a_file_is_rejected_before_the_scan(self):
+        # A file where the report's folder (or a folder above it) has to be used to end the run after the scan,
+        # with a FileExistsError or NotADirectoryError traceback from _make_parent.
+        blocker = os.path.join(self.dir, "blocker.txt")
+        with open(blocker, "wb") as f:
+            f.write(b"keep")
+        with open(os.path.join(self.dir, "a.bin"), "wb") as f:
+            f.write(bvh_payload(2))
+        for flag, path in (("--out", os.path.join(blocker, "index.json")),
+                           ("--out", os.path.join(blocker, "deep", "index.json")),
+                           ("--csv", os.path.join(blocker, "index.csv"))):
+            with self.subTest(flag=flag, path=path):
+                err = io.StringIO()
+                with mock.patch.object(bvh_index, "scan_dir", side_effect=AssertionError("scanned")), \
+                     contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit) as cm:
+                        bvh_index.main([self.dir, flag, path])
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn(f"{blocker} is not a folder, so {flag}", err.getvalue())
+        with open(blocker, "rb") as f:
+            self.assertEqual(f.read(), b"keep")
+
+    def test_report_write_error_exits_2_without_a_traceback(self):
+        # What the preflight can't see (here: the folder became a file after the check) ends in one line, exit 2.
+        blocker = os.path.join(self.dir, "blocker.txt")
+        with open(blocker, "wb") as f:
+            f.write(b"keep")
+        with open(os.path.join(self.dir, "a.bin"), "wb") as f:
+            f.write(bvh_payload(2))
+        out = os.path.join(blocker, "index.json")
+        err, stdout = io.StringIO(), io.StringIO()
+        with mock.patch.object(bvh_index, "_file_in_the_way", return_value=None), \
+             contextlib.redirect_stderr(err), contextlib.redirect_stdout(stdout):
+            self.assertEqual(bvh_index.main([self.dir, "--out", out]), 2)
+        self.assertIn("bvh_index: error: cannot write the report:", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+        self.assertIn('"streams": 1', stdout.getvalue())  # the summary is still printed
+        with open(blocker, "rb") as f:
+            self.assertEqual(f.read(), b"keep")
+
+    def test_new_report_folders_under_a_folder_are_still_allowed(self):
+        self.assertIsNone(bvh_index._file_in_the_way(os.path.join(self.dir, "a", "b", "index.json")))
+        self.assertIsNone(bvh_index._file_in_the_way("index.json"))
 
 
 def setUpModule():

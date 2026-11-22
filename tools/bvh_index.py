@@ -431,6 +431,19 @@ def same_output_path(first, second):
         return False
 
 
+def _file_in_the_way(path):
+    """The existing file that stands where the report's folder, or one of the folders above it, has to be; None
+    when _make_parent can create the folder. Checked before the scan: a file there only showed up afterwards, as a
+    traceback from _make_parent, and the whole scan was lost."""
+    folder = os.path.dirname(os.path.abspath(path))
+    while not os.path.exists(folder):
+        parent = os.path.dirname(folder)
+        if parent == folder:
+            return None
+        folder = parent
+    return None if os.path.isdir(folder) else folder
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("target", help="RPF9 archive or a directory of .rpf/.bin payloads")
@@ -450,6 +463,9 @@ def main(argv=None):
     for flag, path in (("--out", a.out), ("--csv", a.csv)):
         if path and os.path.isdir(path):
             ap.error(f"{flag} is a folder, not a report file: {path}")
+        blocker = path and _file_in_the_way(path)
+        if blocker:
+            ap.error(f"{blocker} is not a folder, so {flag} {path} cannot be written")
     if os.path.isdir(a.target):
         manifest = os.path.join(a.target, "index.json")
         for flag, path in (("--out", a.out), ("--csv", a.csv)):
@@ -477,7 +493,13 @@ def main(argv=None):
             return 2
     for s in summaries:
         print(json.dumps(s, indent=1))
-    write_outputs(rows, summaries, a.out, a.csv)
+    try:
+        write_outputs(rows, summaries, a.out, a.csv)
+    except OSError as e:
+        # Whatever the preflight above can't see (no permission, a full disk, a folder made a file meanwhile):
+        # one line and exit 2, as for an unreadable archive, not a traceback. The summary is printed above.
+        print(f"bvh_index: error: cannot write the report: {e}", file=sys.stderr)
+        return 2
     if not rows:
         print("no zlib streams found", file=sys.stderr)
     return 0
