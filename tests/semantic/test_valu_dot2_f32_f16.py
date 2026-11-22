@@ -728,5 +728,100 @@ class TestValuDot2F32F16RegisterAliasing(unittest.TestCase):
         self.assertEqual(self.state.vgprs[0], expected)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class FloatingPointStatusFlags:
+    """Architectural status flags for IEEE 754 floating-point results."""
+    is_zero: bool
+    is_negative: bool
+    is_infinity: bool
+    is_nan: bool
+    is_subnormal: bool
+
+
+def compute_fp_status_flags(
+    s0_packed: int,
+    s1_packed: int,
+    s2_f32_bits: int,
+    *,
+    clamp: bool = False,
+) -> FloatingPointStatusFlags:
+    """Compute architectural floating-point condition flags for v_dot2_f32_f16."""
+    res_f = ref_dot2_f32_f16(s0_packed, s1_packed, s2_f32_bits, clamp=clamp)
+    res_bits = f32_to_bits(res_f)
+
+    exp = (res_bits >> 23) & 0xFF
+    frac = res_bits & 0x7F_FFFF
+    sign = bool((res_bits >> 31) & 1)
+
+    is_nan = (exp == 0xFF) and (frac != 0)
+    is_inf = (exp == 0xFF) and (frac == 0)
+    is_zero = (exp == 0) and (frac == 0)
+    is_subnorm = (exp == 0) and (frac != 0)
+
+    return FloatingPointStatusFlags(
+        is_zero=is_zero,
+        is_negative=sign and not is_nan,
+        is_infinity=is_inf,
+        is_nan=is_nan,
+        is_subnormal=is_subnorm,
+    )
+
+
+class TestValuDot2F32F16ConditionCodesAndFlags(unittest.TestCase):
+    """Unit tests for condition codes, IEEE 754 status flags, and classification."""
+
+    def test_zero_flag(self) -> None:
+        flags = compute_fp_status_flags(0, 0, 0)
+        self.assertTrue(flags.is_zero)
+        self.assertFalse(flags.is_negative)
+        self.assertFalse(flags.is_infinity)
+        self.assertFalse(flags.is_nan)
+
+    def test_negative_flag(self) -> None:
+        s0 = pack_f16x2(f16_to_bits(-2.0), f16_to_bits(0.0))
+        s1 = pack_f16x2(f16_to_bits(3.0), f16_to_bits(0.0))
+        s2 = f32_to_bits(0.0)
+        flags = compute_fp_status_flags(s0, s1, s2)
+        self.assertTrue(flags.is_negative)
+        self.assertFalse(flags.is_zero)
+
+    def test_infinity_flag(self) -> None:
+        # Accumulator is +infinity (0x7F800000)
+        s0 = pack_f16x2(f16_to_bits(1.0), f16_to_bits(1.0))
+        s1 = pack_f16x2(f16_to_bits(1.0), f16_to_bits(1.0))
+        s2 = 0x7F80_0000  # +inf
+        flags = compute_fp_status_flags(s0, s1, s2)
+        self.assertTrue(flags.is_infinity)
+        self.assertFalse(flags.is_negative)
+
+    def test_nan_generation_flag(self) -> None:
+        # +inf + (-inf) = NaN
+        s0 = pack_f16x2(f16_to_bits(1.0), f16_to_bits(0.0))
+        s1 = pack_f16x2(0x7C00, f16_to_bits(0.0))  # 0x7C00 = +inf
+        s2 = 0xFF80_0000  # -inf
+        flags = compute_fp_status_flags(s0, s1, s2)
+        self.assertTrue(flags.is_nan)
+
+    def test_clamp_clears_nan_and_negative_flags(self) -> None:
+        """With clamp=True, negative and NaN values saturate to +0.0, asserting is_zero."""
+        # Negative result with clamp
+        s0 = pack_f16x2(f16_to_bits(-5.0), f16_to_bits(0.0))
+        s1 = pack_f16x2(f16_to_bits(2.0), f16_to_bits(0.0))
+        s2 = f32_to_bits(0.0)
+        flags_neg_clamped = compute_fp_status_flags(s0, s1, s2, clamp=True)
+        self.assertTrue(flags_neg_clamped.is_zero)
+        self.assertFalse(flags_neg_clamped.is_negative)
+
+        # NaN result with clamp
+        s0_nan = pack_f16x2(0x7E00, 0)  # qNaN
+        flags_nan_clamped = compute_fp_status_flags(s0_nan, 0, 0, clamp=True)
+        self.assertTrue(flags_nan_clamped.is_zero)
+        self.assertFalse(flags_nan_clamped.is_nan)
+
+
 if __name__ == "__main__":
     unittest.main()
