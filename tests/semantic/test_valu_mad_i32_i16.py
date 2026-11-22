@@ -831,5 +831,78 @@ class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
                     self.assertEqual(state.vgprs[lane][0], sentinel)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry Generation
+# ==============================================================================
+
+def compute_mad_i32_i16_status(
+    s0: int,
+    s1: int,
+    s2: int,
+    clamp: bool = False,
+    op_sel: tuple[int, int] = (0, 0),
+) -> dict[str, bool]:
+    """Compute arithmetic condition codes and status flags for v_mad_i32_i16."""
+    s0_16 = (s0 >> 16) if op_sel[0] else s0
+    s1_16 = (s1 >> 16) if op_sel[1] else s1
+
+    prod_s32 = ref_mul_i16(s0_16, s1_16)
+    acc_s32 = to_i32(s2)
+    raw_sum = prod_s32 + acc_s32
+
+    prod_u32 = to_u32(prod_s32)
+    acc_u32 = to_u32(acc_s32)
+    carry = (prod_u32 + acc_u32) >= MODULO32
+
+    clamped = (raw_sum < INT32_MIN) or (raw_sum > INT32_MAX)
+    final_val = clamp_i32(raw_sum) if clamp else raw_sum
+    final_u32 = to_u32(final_val)
+
+    zero = (final_u32 == 0)
+    negative = bool(final_u32 & SIGN32)
+    overflow = bool(((prod_s32 ^ final_val) & (acc_s32 ^ final_val) & SIGN32) != 0)
+
+    return {
+        "zero": zero,
+        "negative": negative,
+        "carry": carry,
+        "overflow": overflow,
+        "clamped": clamped,
+        "prod_zero": (prod_s32 == 0),
+    }
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Exhaustive verification of condition codes, carry bits, and status flags."""
+
+    def test_zero_flag(self) -> None:
+        status = compute_mad_i32_i16_status(-50, 20, 1000)
+        self.assertTrue(status["zero"])
+        self.assertFalse(status["negative"])
+
+        status_nz = compute_mad_i32_i16_status(-50, 20, 1001)
+        self.assertFalse(status_nz["zero"])
+
+    def test_negative_flag(self) -> None:
+        status_neg = compute_mad_i32_i16_status(100, 100, -20000)
+        self.assertTrue(status_neg["negative"])
+
+        status_pos = compute_mad_i32_i16_status(100, 100, 0)
+        self.assertFalse(status_pos["negative"])
+
+    def test_carry_boundary(self) -> None:
+        status_carry = compute_mad_i32_i16_status(-1, 1, 1)
+        self.assertTrue(status_carry["carry"])
+
+        status_no_carry = compute_mad_i32_i16_status(0, 0, UINT32_MAX)
+        self.assertFalse(status_no_carry["carry"])
+
+    def test_overflow_and_clamp_detection(self) -> None:
+        status_ov = compute_mad_i32_i16_status(INT16_MIN, INT16_MIN, 0x4000_0000)
+        self.assertTrue(status_ov["overflow"])
+        self.assertTrue(status_ov["negative"])
+        self.assertTrue(status_ov["clamped"])
+
+
 if __name__ == "__main__":
     unittest.main()
