@@ -3732,10 +3732,18 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw->stencil_front);
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);
             vk.set_blend_constants(command_buffer, draw->blend_factor.data());
-            for (std::uint32_t slot = 0; slot < p.vertex_buffers.size(); ++slot) {
-                if (!p.vertex_buffers[slot]) continue;
-                vk.bind_vertex_buffers2(command_buffer, slot, 1, &p.vertex_buffers[slot], &p.vertex_offsets[slot],
-                                        &p.vertex_sizes[slot], &p.vertex_strides[slot]);
+            // One call per run of consecutive bound bindings: the per-element bindings (D3D-353) are all bound and
+            // numbered from 0, so they take a single call; per-slot bindings skip the slots the layout leaves out.
+            for (std::uint32_t first = 0; first < p.vertex_buffers.size();) {
+                if (!p.vertex_buffers[first]) {
+                    ++first;
+                    continue;
+                }
+                std::uint32_t end = first + 1;
+                while (end < p.vertex_buffers.size() && p.vertex_buffers[end]) ++end;
+                vk.bind_vertex_buffers2(command_buffer, first, end - first, &p.vertex_buffers[first],
+                                        &p.vertex_offsets[first], &p.vertex_sizes[first], &p.vertex_strides[first]);
+                first = end;
             }
             if (draw->indexed) {
                 // Sized only on a device with robustBufferAccess2 (the context sets bind_index_buffer2 only then): a
