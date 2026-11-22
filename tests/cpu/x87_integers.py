@@ -48,9 +48,9 @@ SEQUENCES = {
 
 CONTROLS = {
     # FIST and FISTP truncate like FISTTP.
-    "chopall": (re.compile(r", (16|32|64), false\)"), r", \1, true)"),
+    "chopall": (re.compile(r", (16|32|64), false, x87_cw\)"), r", \1, true, x87_cw)"),
     # FISTTP rounds to nearest like FIST.
-    "roundtt": (re.compile(r", (16|32|64), true\)"), r", \1, false)"),
+    "roundtt": (re.compile(r", (16|32|64), true, x87_cw\)"), r", \1, false, x87_cw)"),
     # An out-of-range value saturates instead of giving the integer indefinite.
     "saturate": (re.compile(r"if \(magnitude > indefinite - \(x87_sign\(v\) \? 0 : 1\)\) return indefinite;"),
                  "if (magnitude > indefinite - (x87_sign(v) ? 0 : 1)) return x87_sign(v) ? indefinite : indefinite - 1;"),
@@ -302,7 +302,7 @@ def check_rejections():
         "fist m16 on an empty stack": (attempt("df 12 c3"), "x87 stack underflow"),
         "fisttp m64 on an empty stack": (attempt("dd 0a c3"), "x87 stack underflow"),
         "fist m32 without a pop": (attempt(f"{fld} db 12 c3"), "x87 stack not empty at return"),
-        "fiadd m32": (attempt(f"{fld} da 01 {fstp} c3"), "unsupported x87 operation"),
+        "fldenv": (attempt(f"{fld} d9 21 {fstp} c3"), "unsupported x87 operation"),
         "ficom m16": (attempt(f"{fld} de 11 {fstp} c3"), "unsupported x87 operation"),
         "fbld m80": (attempt(f"df 21 {fstp} c3"), "unsupported x87 operation"),
         "fbstp m80": (attempt(f"{fld} df 32 c3"), "unsupported x87 operation"),
