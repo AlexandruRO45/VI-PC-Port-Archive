@@ -60,12 +60,12 @@ CONTROLS = {
     # The quotient rounds in the binary64 exponent range, as host double arithmetic would.
     "double": (base.ARITH, "x87_arith{53, 1023, 0x7fe}"),
     # A nonzero remainder is ignored when rounding.
-    "nosticky": (re.compile(r"const uint64_t lo = remainder != 0;"), "const uint64_t lo = 0;"),
+    "nosticky": (re.compile(r"const uint64_t lo = [^;]*;  // div sticky"), "const uint64_t lo = 0;  // div sticky"),
     # A finite nonzero value by zero gives the indefinite instead of infinity.
     "divzero": (re.compile(r"if \(ia \|\| zb\) return"), "if (zb) return x87_indefinite; if (ia) return"),
     # FDIVR divides in the FDIV order.
-    "reverse": (re.compile(r"x87_divr\(X87Value a, X87Value b\) \{ return x87_div\(b, a\); \}"),
-                "x87_divr(X87Value a, X87Value b) { return x87_div(a, b); }"),
+    "reverse": (re.compile(r"x87_divr\(X87Value a, X87Value b, uint16_t cw\) \{ return x87_div\(b, a, cw\); \}"),
+                "x87_divr(X87Value a, X87Value b, uint16_t cw) { return x87_div(a, b, cw); }"),
     # A zero quotient (zero dividend or infinite divisor) is always +0.
     "zerosign": (re.compile(r"if \(ib \|\| za\) return \{0, s\};"), "if (ib || za) return {0, 0};"),
     # m32 and m64 operands are quieted before the NaN rules see them, as a plain load would.
@@ -360,11 +360,11 @@ def check_rejections():
         "fdiv m32 on an empty stack": (attempt(f"d8 31 {fld} {fstp} c3"), "x87 stack underflow"),
         "fdivr st(2), st with two values": (attempt(f"{fld} {fld} dc f2 {fstp} {fstp} c3"), "x87 stack underflow"),
         "fdivrp with one value": (attempt(f"{fld} de f1 {fstp} c3"), "x87 stack underflow"),
-        "fidiv m32": (attempt(f"{fld} da 31 {fstp} c3"), "unsupported x87 operation"),
-        "fidivr m16": (attempt(f"{fld} de 39 {fstp} c3"), "unsupported x87 operation"),
+        "fldenv": (attempt(f"{fld} d9 21 {fstp} c3"), "unsupported x87 operation"),
+        "fdecstp": (attempt(f"{fld} d9 f6 {fstp} c3"), "unsupported x87 operation"),
         "fnsave": (attempt(f"{fld} dd 31 {fstp} c3"), "unsupported x87 operation"),
         "fprem": (attempt(f"{fld} {fld} d9 f8 {fstp} {fstp} c3"), "unsupported x87 operation"),
-        "fiadd m32": (attempt(f"{fld} da 01 {fstp} c3"), "unsupported x87 operation"),
+        "fincstp": (attempt(f"{fld} d9 f7 {fstp} c3"), "unsupported x87 operation"),
     }
     for case, (message, needle) in rejected.items():
         if message is None or needle not in message:
