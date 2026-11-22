@@ -186,6 +186,129 @@ class TestValuLshlAddU32SymbolicAST(unittest.TestCase):
             VLshlAddU32Instruction(dst=dst_sgpr, src0=src, src1=src, src2=src)
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState:
+    """Architectural register file for a single wavefront lane."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    vcc: int = 0
+
+    def get_vgpr(self, index: int) -> int:
+        return self.vgprs[index] & MASK32
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        self.vgprs[index] = val & MASK32
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index] & MASK32
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        self.sgprs[index] = val & MASK32
+
+
+class ScalarVALUInterpreter:
+    """Deterministic scalar instruction interpreter for v_lshl_add_u32."""
+
+    def resolve_operand(self, op: VOP3Operand, state: ScalarMachineState) -> int:
+        if isinstance(op.source, Reg):
+            if op.source.reg_type == RegType.VGPR:
+                return state.get_vgpr(op.source.index)
+            elif op.source.reg_type == RegType.SGPR:
+                return state.get_sgpr(op.source.index)
+            else:
+                raise ValueError(f"Unknown register type: {op.source.reg_type}")
+        elif isinstance(op.source, Literal32):
+            return op.source.bits & MASK32
+        else:
+            raise TypeError(f"Unsupported operand source type: {type(op.source)}")
+
+    def step(self, instr: VLshlAddU32Instruction, state: ScalarMachineState) -> int:
+        # Atomic read phase
+        s0_raw = self.resolve_operand(instr.src0, state)
+        s1_raw = self.resolve_operand(instr.src1, state)
+        s2_raw = self.resolve_operand(instr.src2, state)
+
+        # Computation phase
+        result = oracle_v_lshl_add_u32(s0_raw, s1_raw, s2_raw)
+
+        # Write-back phase
+        state.set_vgpr(instr.dst.index, result)
+        return result
+
+
+class TestValuLshlAddU32ScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarVALUInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_basic_step_vgprs(self) -> None:
+        self.state.set_vgpr(1, 0x00000005)
+        self.state.set_vgpr(2, 3)
+        self.state.set_vgpr(3, 0x00000010)
+        instr = VLshlAddU32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(1, RegType.VGPR)),
+            src1=VOP3Operand(Reg(2, RegType.VGPR)),
+            src2=VOP3Operand(Reg(3, RegType.VGPR)),
+        )
+        # (5 << 3) + 16 = 40 + 16 = 56 (0x38)
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 56)
+        self.assertEqual(self.state.get_vgpr(0), 56)
+
+    def test_step_sgpr_and_literal(self) -> None:
+        self.state.set_sgpr(4, 0x00000100)
+        self.state.set_vgpr(1, 0x00000020)
+        instr = VLshlAddU32Instruction(
+            dst=Reg(5, RegType.VGPR),
+            src0=VOP3Operand(Reg(4, RegType.SGPR)),
+            src1=VOP3Operand(Literal32(2)),
+            src2=VOP3Operand(Reg(1, RegType.VGPR)),
+        )
+        # (0x100 << 2) + 0x20 = 0x400 + 0x20 = 0x420
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 0x420)
+        self.assertEqual(self.state.get_vgpr(5), 0x420)
+
+    def test_deterministic_repeatability(self) -> None:
+        self.state.set_vgpr(10, 0x12345678)
+        self.state.set_vgpr(11, 4)
+        self.state.set_vgpr(12, 0x0000ABCD)
+        instr = VLshlAddU32Instruction(
+            dst=Reg(13, RegType.VGPR),
+            src0=VOP3Operand(Reg(10, RegType.VGPR)),
+            src1=VOP3Operand(Reg(11, RegType.VGPR)),
+            src2=VOP3Operand(Reg(12, RegType.VGPR)),
+        )
+        res0 = self.interp.step(instr, self.state)
+        for _ in range(50):
+            res_n = self.interp.step(instr, self.state)
+            self.assertEqual(res0, res_n)
+
+    def test_unaffected_registers_preserved(self) -> None:
+        self.state.set_vgpr(1, 10)
+        self.state.set_vgpr(2, 1)
+        self.state.set_vgpr(3, 5)
+        self.state.set_vgpr(7, 0xDEADBEEF)
+        self.state.set_sgpr(9, 0xCAFEBABE)
+        instr = VLshlAddU32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(1, RegType.VGPR)),
+            src1=VOP3Operand(Reg(2, RegType.VGPR)),
+            src2=VOP3Operand(Reg(3, RegType.VGPR)),
+        )
+        self.interp.step(instr, self.state)
+        self.assertEqual(self.state.get_vgpr(7), 0xDEADBEEF)
+        self.assertEqual(self.state.get_sgpr(9), 0xCAFEBABE)
+
+
+
 
 if __name__ == "__main__":
     unittest.main()
