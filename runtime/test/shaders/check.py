@@ -223,6 +223,8 @@ CVT_F32_SAT_CASES = (
     (0x4F800000, 0xFFFFFFFF, 0x7FFFFFFF), (0xCEFFFFFF, 0, 0x80000080), (0xCF000000, 0, 0x80000000),
     (0xCF000001, 0, 0x80000000), (0x7F800000, 0xFFFFFFFF, 0x7FFFFFFF), (0xFF800000, 0, 0x80000000),
     (0x7F800001, 0, 0), (0xFFC00000, 0, 0))
+# v_cvt_pk_u8_f32 (cs_cvt_pk_u8.asm), measured natively on RDNA2 (gfx1036): halves round to even, NaN gives 0.
+CVT_PK_U8_WORDS = [0x1122330C, 0x11220E44, 0x11003344, 0xFE223344, 0x1122330D, 0x11220044, 0x11FF3344, 0x00223344]
 # cs_f16_frexp_ldexp.asm: every binary16 input x through v_frexp_mant_f16, v_frexp_exp_i16_f16 and v_ldexp_f16(x, S1)
 # with f16 denormals kept (docs/design.md, measured on gfx1036). One dispatch of 1024 groups per S1 below: zero, the
 # ends of the normal range, the denormal and flush edges, the clamp to [-64, 64] from both sides, and S1 words whose
@@ -332,6 +334,7 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_scc_logic64": (0x0fff0fff, 0xff000000, 0xff0000ff, 0x16),
               "ps_fma_literal": (0x41b80000, 0x41800000, 0x40e00000, 0x41a40000),
               "ps_f64_mods": (0x40040000, 0x3ff00000, 0x3fe40000, 0x3ff00000),
+              "ps_outmods_f16": (0xaaaa3c00, 0xaaaa3e00, 0x7c000000, 0x3c000000),
               # f16 op_sel, partial writes, inline constants: words measured on RDNA2 hardware (.asm headers)
               "ps_f16_med3_opsel": (0xaaaa4100, 0xaaaa4200, 0xaaaa3e00, 0x40005555),
               "ps_f16_med3_mods": (0x41005555, 0x3c005555, 0x41003800, 0xaaaaba00),
@@ -383,6 +386,7 @@ PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x1
 # texture); the expected channels are derived in the .asm header.
 TEXTURE_CONSTANTS = {
     "ps_gather_wrap": (5090733.0, 14942181.0, 258623.0, 9702309.0),
+    "ps_gather_border": (32776.0, 34935.0, 34680.0, 28679.0),  # SHADER-348: border modes 6 and 7, derived in the .asm
     "ps_array_resinfo": (8.0, 8.0, 12.0, 1.0),  # binding 3, index 1: two 6-face cubes, one mip
 }
 CLIP_TESTS = ("vs_clip", "vs_clip_param4", "vs_clip_undeclared")
@@ -1390,6 +1394,8 @@ def main():
     results.append(("cs_f16_frexp_ldexp", f16_frexp_ldexp_test(tools, spirv)))
     results.append(("cs_fma_fused", compute_test(tools, spirv, "cs_fma_fused", "1", "dump", expected_words=FMA_FUSED,
                                                  env=FMA_FUSED_ENV)))
+    results.append(("cs_cvt_pk_u8", compute_test(tools, spirv, "cs_cvt_pk_u8", "1", "dump",
+                                                 expected_words=CVT_PK_U8_WORDS)))
     for name, want in W64X_DUMPS:   # without --require-wave64 when LEONIDA_W64_EMULATE=1
         results.append((name, compute_test(tools, spirv, name, "1", "dump", require_wave64=not W64_EMULATED,
                                            expected_words=want)))
