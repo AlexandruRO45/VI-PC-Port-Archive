@@ -803,6 +803,8 @@ def lane_mask(token):
 # {r} names the result. Shift counts use their low five bits; signed overflow sets SCC for _i32 add/sub.
 NONZERO = "{r} != 0u"
 SCALAR = {
+    "bcnt0_i32_b32": (1, "32u - countbits({0})", NONZERO),
+    "bcnt1_i32_b32": (1, "countbits({0})", NONZERO),
     "pack_ll_b32_b16": (2, "({0} & 0xffffu) | ({1} << 16)", None),
     "pack_lh_b32_b16": (2, "({0} & 0xffffu) | ({1} & 0xffff0000u)", None),
     "pack_hh_b32_b16": (2, "({0} >> 16) | ({1} & 0xffff0000u)", None),
@@ -1523,6 +1525,17 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     raise ValueError("Invalid movk immediate")
                 val = (val if val < 0x8000 else val - 0x10000) & 0xffffffff
             scalar[dst] = val
+        elif m := match(r"s_bcnt([01])_i32_b64 (s\d+), ([^,]+)"):
+            bit, dst, src = m.groups()
+            sgpr_name(dst)
+            if dst in pending:
+                raise ValueError("Write overlaps an outstanding scalar load")
+            lo, hi = scalar_u64(src, scalar, pending)
+            ones = f"(countbits({lo}) + countbits({hi}))"
+            value = f"64u - {ones}" if bit == "0" else ones
+            lines.append(f"    uint salu{i} = {value};")
+            scalar[dst] = ("uint", f"salu{i}")
+            scc = NONZERO.format(r=f"salu{i}")
         elif m := match(rf"s_({'|'.join(SCALAR)}) (s\d+), (.+)"):
             # Uniform values become HLSL uint locals; an exec mask does not affect them.
             op, dst, operands = m.groups()

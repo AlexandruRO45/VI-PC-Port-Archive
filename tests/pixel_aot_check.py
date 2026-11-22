@@ -2132,6 +2132,47 @@ def scalar_body():
 PACK_HALVES = ("ll", "lh", "hh")
 
 
+def scalar_bit_count_values(width):
+    src = "s44" if width == 32 else "s[44:45]"
+    body = []
+    for bit in (0, 1):
+        # Seed SCC from a runtime word. The reference always seeds the opposite of the expected SCC.
+        body.extend([
+            f"s_cmp_eq_u32 s{46 + bit}, 1",
+            f"s_bcnt{bit}_i32_b{width} s62, {src}",
+            "s_cselect_b32 s63, 0x3f800000, 0", f"v_mov_b32_e32 v{14 + bit}, s63",
+            "s_lshl_b32 s62, s62, 13", "s_or_b32 s62, s62, 0x3f800000",
+            f"v_mov_b32_e32 v{12 + bit}, s62",
+        ])
+    return with_constants(body)
+
+
+def check_scalar_bit_count_draw(directory, compiler, renderer, backend):
+    source, shader, case = (directory / name for name in ("bit-count.hlsl", "bit-count.cso", "bit-count.case"))
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    for width in (32, 64):
+        program = scalar_bit_count_values(width)
+        source.write_text(translate(program), encoding="ascii")
+        compile_shader(compiler, source, shader, ieee=False)
+        for lo, hi in ((0, 0), (0xffffffff, 0xffffffff), (0x1234abcd, 0x5678ef90), (0, 0x80000000)):
+            word = lo if width == 32 else lo | (hi << 32)
+            ones = word.bit_count()
+            zeros = width - ones
+            constants = bytearray(256)
+            struct.pack_into("<4I", constants, 12, lo, hi, zeros == 0, ones == 0)
+            case.write_bytes(constants + struct.pack("<4f", 1 + zeros / 1024, 1 + ones / 1024,
+                                                      zeros != 0, ones != 0) * 64)
+            subprocess.run(draw, check=True)
+    # The last input has one bit set in the high word and none in the low word.
+    program = [line.replace("s_bcnt1_i32_b64 s62, s[44:45]", "s_bcnt1_i32_b32 s62, s44")
+               for line in scalar_bit_count_values(64)]
+    source.write_text(translate(program), encoding="ascii")
+    compile_shader(compiler, source, shader, ieee=False)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Dropping the high word matched the original reference")
+
+
 def scalar_pack_values(halves):
     return with_constants([
         "s_cmp_eq_u32 s47, 1", f"s_pack_{halves}_b32_b16 s44, s44, s45",
@@ -4576,6 +4617,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((sext_values(), translate))
     fixtures.append((sop1_scalar_ops(), translate_int))
     fixtures.extend((scalar_pack_values(halves), translate) for halves in PACK_HALVES)
+    fixtures.extend((scalar_bit_count_values(width), translate) for width in (32, 64))
     fixtures.append((with_constants(RECIPROCAL_BODY), translate))
     fixtures.append((bitwise_program(), translate))
     fixtures.append((fract_values(), translate))
@@ -6016,6 +6058,7 @@ def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
     check_int_predicate_draws(directory, compiler, renderer, backend)
     check_sext_draw(directory, compiler, renderer, backend)
     check_scalar_pack_draw(directory, compiler, renderer, backend)
+    check_scalar_bit_count_draw(directory, compiler, renderer, backend)
     check_int16_predicate_draws(directory, compiler, renderer, backend)
     check_sdwa_predicate_draws(directory, compiler, renderer, backend)
     check_literal_fma_draw(directory, compiler, renderer, backend)
