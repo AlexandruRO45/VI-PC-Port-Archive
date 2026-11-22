@@ -91,6 +91,35 @@ def rejected_output(decode):
     check("output refusal", (result, trace), (1, [("input", 101), ("output", 202, b"AIAIAIAIAIAIA")]))
 
 
+def window_record(copies):
+    """DCL stream: three literals, overlapping 512-byte copies at distance 3, final literal and end."""
+    bits = []
+
+    def put(value, width):
+        bits.extend((value >> n) & 1 for n in range(width))
+
+    def literal(byte):
+        put(0, 1)
+        put(byte, 8)
+
+    for byte in b"ABC":
+        literal(byte)
+    for _ in range(copies):
+        put(1, 1)
+        put(0, 7)    # Length symbol 15 (base 264).
+        put(248, 8)  # 264 + 248 = 512.
+        put(3, 2)    # Distance symbol 0.
+        put(2, 4)    # Distance 1 + 2 = 3.
+    literal(ord("Z"))
+    put(1, 1)
+    put(0, 7)
+    put(255, 8)      # Length 519 ends the stream.
+    packed = bytes(sum(bit << n for n, bit in enumerate(bits[start:start + 8]))
+                   for start in range(0, len(bits), 8))
+    payload = b"\x00\x04" + packed
+    return bytes([len(payload)]) + payload
+
+
 def compare(mapper, native, lifted, codec, *blast_images):
     wider_exit_control(native)
     first = bytes.fromhex("08 00 04 82 24 25 8f 80 7f")
@@ -107,6 +136,18 @@ def compare(mapper, native, lifted, codec, *blast_images):
         for dll in (source, translated):
             rejected_output(ctypes.CDLL(str(dll)).blast)
         mapped.append(source)
+        # 3 + 8 * 512 + 1 = 4100 bytes. The distance-three match straddles
+        # the first flush, then a distinct literal verifies decoding continued.
+        accepted = window_record(8)
+        refused = window_record(16)
+        first_output = b"AIAIAIAIAIAIA"
+        cases.extend([
+            (first + accepted, first_output + b"ABC" * 1366 + b"AZ", 0, full + [
+                f"alloc {accepted[0]}", f"input {accepted[0]}", "output 4096", "output 4", "free", "completed 2"]),
+            (first + refused, first_output, 2, full + [
+                f"alloc {refused[0]}", f"input {refused[0]}", "output 4096", "output 4096",
+                "refused after 4096", "free", "completed 1"]),
+        ])
         check("native codec binding", source.name.lower() in module_names(codec), True)
         check("AOT reader binding", adapter.name.lower() in module_names(lifted), True)
         check("AOT decoder binding", translated.name.lower() in module_names(adapter), True)
@@ -119,7 +160,7 @@ def compare(mapper, native, lifted, codec, *blast_images):
             child = subprocess.run(command, input=data, capture_output=True, timeout=15)
             check(str(command), Observation(child.stderr, child.stdout, child.returncode),
                   Observation(trace, output, code))
-        print(f"{len(data)} input bytes: {output!r}, exit {code}, {events}")
+        print(f"{len(data)} input bytes: {len(output)} published bytes, exit {code}, {events}")
 
 
 if __name__ == "__main__":

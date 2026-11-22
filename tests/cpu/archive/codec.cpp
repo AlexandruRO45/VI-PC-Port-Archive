@@ -11,7 +11,8 @@ struct Record {
     unsigned remaining;
     unsigned size;
     unsigned char input[255];
-    unsigned char output[4096];
+    // Stage one full blast window and up to another half window before publication.
+    unsigned char output[6144];
 };
 
 #define API extern "C" __declspec(dllexport)
@@ -45,7 +46,10 @@ static unsigned input(void* context, unsigned char** bytes) {
 static int output(void* context, unsigned char* bytes, unsigned n) {
     auto* record = static_cast<Record*>(context);
     std::fprintf(stderr, "output %u\n", n);
-    if (n > sizeof(record->output) - record->size) return 1;
+    if (n > sizeof(record->output) - record->size) {
+        std::fprintf(stderr, "refused after %u\n", record->size);
+        return 1;
+    }
     std::memcpy(record->output + record->size, bytes, n);
     record->size += n;
     return 0;
