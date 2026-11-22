@@ -104,7 +104,7 @@ command-list IIDs in §4: SCARAB's provenance note says the runtime does not exp
 have no ordinal here and are absent from this export dump.
 
 Leonida serves all 93 by name as data (`runtime/shims/d3d12_xs.cpp`, from
-`runtime/shims/d3d12_xs_guids.inc`, which `tools/d3d12_xs_surface.py --inc` writes): a title linked
+`runtime/shims/d3d12_xs_guids.inc`, which `tools/d3d12_xs_surface.py --inc PATH` writes): a title linked
 against the console import library imports them, and its import slot then holds the address of the
 GUID. Before that an imported GUID was bound to the unimplemented-import thunk and read back as 16
 bytes of thunk code. They are not served by ordinal, because 34 of the ordinals are derived, not
