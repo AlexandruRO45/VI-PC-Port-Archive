@@ -1125,5 +1125,184 @@ class TestDsDecSrc2U64IEEE754EdgeCases(unittest.TestCase):
         self.assertEqual(curr, limit)
 
 
+# ==============================================================================
+# Phase 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+import re
+
+
+_ASM_SRC2_RE = re.compile(
+    r"^(ds_dec_src2_u64|ds_inc_src2_u64)\s+"
+    r"(v\d+)"                        # vaddr
+    r"(?:\s+offset0:(\d+))?"         # optional offset0
+    r"(?:\s+offset1:(\d+))?"         # optional offset1
+    r"(?:\s+(gds))?$"                # optional gds
+)
+
+
+def parse_ds_dec_src2_u64_asm(asm_line: str) -> DsSrc2Instruction:
+    """Parse a single assembly line into a DsSrc2Instruction node."""
+    line = asm_line.strip()
+    if not line:
+        raise ValueError("Empty assembly instruction line")
+
+    m = _ASM_SRC2_RE.match(line)
+    if not m:
+        raise ValueError(f"Malformed ds_dec_src2_u64 instruction syntax: {line!r}")
+
+    op_str, addr_str, off0_str, off1_str, gds_str = m.groups()
+    opcode = DsSrc2Opcode(op_str)
+
+    if not (addr_str.startswith("v") and addr_str[1:].isdigit()):
+        raise ValueError(f"Invalid VGPR address operand: {addr_str}")
+    vaddr = Register(RegKind.VGPR, int(addr_str[1:]), count=1)
+
+    offset0 = int(off0_str) if off0_str else 0
+    offset1 = int(off1_str) if off1_str else 0
+    gds = (gds_str == "gds")
+
+    return DsSrc2Instruction(
+        opcode=opcode,
+        vaddr=vaddr,
+        offset0=offset0,
+        offset1=offset1,
+        gds=gds,
+    )
+
+
+class TestDsDecSrc2U64NegativeRejectionAndMutations(unittest.TestCase):
+    """Phase 8: Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_malformed_tokens(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_ds_dec_src2_u64_asm("")
+        with self.assertRaises(ValueError):
+            parse_ds_dec_src2_u64_asm("ds_dec_src2_u64")
+        with self.assertRaises(ValueError):
+            parse_ds_dec_src2_u64_asm("ds_dec_u64 v0")
+        with self.assertRaises(ValueError):
+            parse_ds_dec_src2_u64_asm("ds_dec_src2_u64 v0, v1")
+        with self.assertRaises(ValueError):
+            parse_ds_dec_src2_u64_asm("ds_dec_src2_u64 v0 invalid_mod:5")
+
+    def test_syntax_rejection_register_classes(self) -> None:
+        s0 = Register(RegKind.SGPR, 0)
+        with self.assertRaises(ValueError):
+            DsSrc2Instruction(opcode=DsSrc2Opcode.DS_DEC_SRC2_U64, vaddr=s0)
+
+    def test_syntax_rejection_offset_ranges(self) -> None:
+        v0 = Register(RegKind.VGPR, 0)
+        with self.assertRaises(ValueError):
+            DsSrc2Instruction(opcode=DsSrc2Opcode.DS_DEC_SRC2_U64, vaddr=v0, offset0=-1)
+        with self.assertRaises(ValueError):
+            DsSrc2Instruction(opcode=DsSrc2Opcode.DS_DEC_SRC2_U64, vaddr=v0, offset0=256)
+        with self.assertRaises(ValueError):
+            DsSrc2Instruction(opcode=DsSrc2Opcode.DS_DEC_SRC2_U64, vaddr=v0, offset1=-1)
+        with self.assertRaises(ValueError):
+            DsSrc2Instruction(opcode=DsSrc2Opcode.DS_DEC_SRC2_U64, vaddr=v0, offset1=256)
+
+    def test_syntax_rejection_capacity(self) -> None:
+        with self.assertRaises(ValueError):
+            LDSModel64(capacity_qwords=0)
+        with self.assertRaises(ValueError):
+            LDSModel64(capacity_qwords=-32)
+        with self.assertRaises(ValueError):
+            LDSModel64(capacity_qwords=600)  # Non-power-of-two
+
+    def test_mutation_detection_zero_wrap_omission(self) -> None:
+        # Mutant: decrements 0 to MASK64 instead of wrapping to threshold val_b
+        def mutant_dec(val_a: int, val_b: int) -> int:
+            a = u64(val_a)
+            b = u64(val_b)
+            if a > b:
+                return b
+            return u64(a - 1)  # Bug: missing `a == 0` check!
+
+        val_a = 0
+        val_b = 50
+        correct_res = ref_ds_dec_src2_u64(val_a, val_b)
+        mutant_res = mutant_dec(val_a, val_b)
+
+        self.assertEqual(correct_res, 50)
+        self.assertEqual(mutant_res, MASK64)
+        self.assertNotEqual(correct_res, mutant_res)
+
+    def test_mutation_detection_strict_greater_threshold(self) -> None:
+        # Mutant: resets when `val_a >= val_b` instead of strictly `val_a > val_b`
+        def mutant_dec(val_a: int, val_b: int) -> int:
+            a = u64(val_a)
+            b = u64(val_b)
+            if a == 0 or a >= b:  # Bug: `>=` instead of `>`
+                return b
+            return u64(a - 1)
+
+        val_a = 10
+        val_b = 10
+        correct_res = ref_ds_dec_src2_u64(val_a, val_b)
+        mutant_res = mutant_dec(val_a, val_b)
+
+        self.assertEqual(correct_res, 9)
+        self.assertEqual(mutant_res, 10)
+        self.assertNotEqual(correct_res, mutant_res)
+
+    def test_mutation_detection_missing_stride_multiplication(self) -> None:
+        # Mutant: fails to multiply 8-bit offset by 8 bytes
+        def mutant_addresses(vaddr: int, off0: int) -> int:
+            return u32(vaddr + (off0 & OFFSET8_MASK))  # Missing `* 8`
+
+        vaddr = 0x1000
+        offset0 = 4
+        correct_addr, _, _, _ = calc_lds_src2_u64_addresses(vaddr, offset0=offset0)
+        mutant_addr = mutant_addresses(vaddr, offset0)
+
+        self.assertEqual(correct_addr, 0x1020)  # 4 * 8 = 32 = 0x20
+        self.assertEqual(mutant_addr, 0x1004)
+        self.assertNotEqual(correct_addr, mutant_addr)
+
+    def test_mutation_detection_missing_qword_shift(self) -> None:
+        # Mutant: uses 32-bit dword shift >> 2 instead of 64-bit qword shift >> 3
+        def mutant_qword_idx(addr: int, capacity: int) -> int:
+            return (addr >> 2) & (capacity - 1)
+
+        addr = 0x100
+        correct_idx = (addr >> 3) & (512 - 1)
+        mutant_idx = mutant_qword_idx(addr, 512)
+
+        self.assertEqual(correct_idx, 32)
+        self.assertEqual(mutant_idx, 64)
+        self.assertNotEqual(correct_idx, mutant_idx)
+
+    def test_mutation_detection_exec_mask_leak(self) -> None:
+        # Mutant: inactive SIMD lane touches LDS memory
+        lds = LDSModel64(capacity_qwords=512)
+        simd = SIMDLDS64WavefrontInterpreter(wave_size=32, lds=lds)
+        simd.set_exec_mask(0x1)  # Lane 0 only active
+
+        addr_0 = 0x100  # Lane 0 targets 0x100
+        addr_1 = 0x200  # Lane 1 targets 0x200
+
+        lds.write_qword(addr_0 >> 3, 10)
+        lds.write_qword((addr_0 + 8) >> 3, 50)
+        lds.write_qword(addr_1 >> 3, 20)
+        lds.write_qword((addr_1 + 8) >> 3, 50)
+
+        simd.write_lane_vgpr(0, 0, addr_0)
+        simd.write_lane_vgpr(1, 0, addr_1)
+
+        inst = DsSrc2Instruction(
+            opcode=DsSrc2Opcode.DS_DEC_SRC2_U64,
+            vaddr=Register(RegKind.VGPR, 0),
+            offset0=0,
+            offset1=1,
+        )
+
+        results = simd.step(inst)
+        self.assertEqual(results[0], 9)
+        self.assertIsNone(results[1])
+        # Inactive lane must not have modified memory at addr_1
+        self.assertEqual(lds.read_qword(addr_1 >> 3), 20)
+
+
 if __name__ == "__main__":
     unittest.main()
