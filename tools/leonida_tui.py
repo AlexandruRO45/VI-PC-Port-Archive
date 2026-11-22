@@ -46,6 +46,22 @@ _live_procs_lock = threading.Lock()
 _interrupt_lock = threading.Lock()
 _interrupt_fired = False
 _ctrl_handler_installed = False
+# Windows console input mode while the board is live (mouse wheel → scroll).
+_nt_mouse_armed: tuple | None = None  # (handle, old_mode) or None
+_nt_key_queue: deque = deque()
+
+# Console input flags (Windows).
+_ENABLE_PROCESSED_INPUT = 0x0001
+_ENABLE_LINE_INPUT = 0x0002
+_ENABLE_ECHO_INPUT = 0x0004
+_ENABLE_WINDOW_INPUT = 0x0008
+_ENABLE_MOUSE_INPUT = 0x0010
+_ENABLE_EXTENDED_FLAGS = 0x0080
+_ENABLE_QUICK_EDIT_MODE = 0x0040
+_KEY_EVENT = 0x0001
+_MOUSE_EVENT = 0x0002
+_MOUSE_WHEELED = 0x0004
+_MOUSE_HWHEELED = 0x0008
 
 
 @dataclass
@@ -134,27 +150,33 @@ def term_size() -> tuple[int, int]:
 def restore_console(stream=None, *, ansi: bool, leave_alt: bool = False) -> None:
     """Undo TUI modes and clear the visible buffer so the shell prompt is not painted over leftovers."""
     out = stream if stream is not None else sys.stdout
-    if not ansi:
+    try:
+        if not ansi:
+            try:
+                out.write("\n")
+                out.flush()
+            except OSError:
+                pass
+            return
+        parts = [
+            "\033[?1007l",  # alternate scroll (wheel → arrows) off
+            "\033[?1000l",  # mouse tracking off
+            "\033[?1006l",  # SGR mouse off
+            "\033[?7h",     # wrap on
+            "\033[?25h",    # cursor on
+            "\033[0m",      # attributes off
+        ]
+        if leave_alt:
+            parts.append("\033[?1049l")
+        # Clear the buffer we are about to show the user (main screen after leaving alt).
+        parts.extend(["\033[H", "\033[J"])
         try:
-            out.write("\n")
+            out.write("".join(parts))
             out.flush()
         except OSError:
             pass
-        return
-    parts = [
-        "\033[?7h",   # wrap on
-        "\033[?25h",  # cursor on
-        "\033[0m",    # attributes off
-    ]
-    if leave_alt:
-        parts.append("\033[?1049l")
-    # Clear the buffer we are about to show the user (main screen after leaving alt).
-    parts.extend(["\033[H", "\033[J"])
-    try:
-        out.write("".join(parts))
-        out.flush()
-    except OSError:
-        pass
+    finally:
+        _nt_disarm_mouse_input()
 
 
 def _c(text: str, *codes: str, on: bool) -> str:
@@ -180,9 +202,211 @@ def wrap_log_lines(lines: list[str], width: int, max_rows: int) -> list[str]:
     return wrapped[-max_rows:]
 
 
+def _nt_arm_mouse_input() -> None:
+    """Enable console mouse-wheel reports; disable Quick Edit so the OS delivers them."""
+    global _nt_mouse_armed
+    if os.name != "nt" or _nt_mouse_armed is not None:
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        old = wintypes.DWORD()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(old)):
+            return
+        # Keep processed input; drop line/echo/quick-edit so keys and wheel are readable.
+        new_mode = (
+            (old.value | _ENABLE_PROCESSED_INPUT | _ENABLE_MOUSE_INPUT
+             | _ENABLE_EXTENDED_FLAGS | _ENABLE_WINDOW_INPUT)
+            & ~(_ENABLE_LINE_INPUT | _ENABLE_ECHO_INPUT | _ENABLE_QUICK_EDIT_MODE)
+        )
+        if not kernel32.SetConsoleMode(handle, new_mode):
+            return
+        _nt_mouse_armed = (handle, old.value)
+        _nt_key_queue.clear()
+    except Exception:
+        _nt_mouse_armed = None
+
+
+def _nt_disarm_mouse_input() -> None:
+    global _nt_mouse_armed
+    if _nt_mouse_armed is None:
+        return
+    handle, old_mode = _nt_mouse_armed
+    _nt_mouse_armed = None
+    _nt_key_queue.clear()
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleMode(handle, old_mode)
+    except Exception:
+        pass
+
+
+def _nt_wheel_delta_to_keys(delta: int, *, horizontal: bool = False) -> list[str]:
+    """Map a Win32 wheel delta to keys (120 units ≈ one notch).
+
+    Vertical → Up/Down (log scroll). Horizontal → Left/Right (stage tabs), inverted so a
+    right tilt/swipe selects the previous tab (opposite of the keyboard arrows).
+    """
+    if delta == 0:
+        return []
+    notches = max(1, abs(int(delta)) // 120)
+    if horizontal:
+        key = "Left" if delta > 0 else "Right"
+    else:
+        key = "Up" if delta > 0 else "Down"
+    return [key] * notches
+
+
+def _nt_decode_key_event(key_down: bool, vk: int, ch: str) -> str | None:
+    if not key_down:
+        return None
+    if ch in ("\x03", "\x1a"):
+        request_interrupt()
+        return None
+    # Virtual-key map for arrows / paging (UnicodeChar is often NUL for these).
+    vk_map = {
+        0x26: "Up", 0x28: "Down", 0x25: "Left", 0x27: "Right",
+        0x21: "PageUp", 0x22: "PageDown", 0x24: "Home", 0x23: "End",
+        0x09: "Tab", 0x0D: "Enter", 0x1B: "Esc", 0x20: "Space",
+    }
+    if vk in vk_map:
+        return vk_map[vk]
+    if ch == "\r":
+        return "Enter"
+    if ch == "\t":
+        return "Tab"
+    if ch == "\x1b":
+        return "Esc"
+    if ch == " ":
+        return "Space"
+    if ch and ch.isprintable():
+        return ch
+    return None
+
+
+def _nt_read_console_key(timeout_s: float) -> str | None:
+    """Read one key or wheel step via ReadConsoleInput (mouse mode armed)."""
+    if _nt_key_queue:
+        return _nt_key_queue.popleft()
+    if _nt_mouse_armed is None:
+        return None
+    handle, _ = _nt_mouse_armed
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError:
+        return None
+
+    class COORD(ctypes.Structure):
+        _fields_ = [("X", wintypes.SHORT), ("Y", wintypes.SHORT)]
+
+    class KEY_EVENT_RECORD(ctypes.Structure):
+        _fields_ = [
+            ("bKeyDown", wintypes.BOOL),
+            ("wRepeatCount", wintypes.WORD),
+            ("wVirtualKeyCode", wintypes.WORD),
+            ("wVirtualScanCode", wintypes.WORD),
+            ("UnicodeChar", wintypes.WCHAR),
+            ("dwControlKeyState", wintypes.DWORD),
+        ]
+
+    class MOUSE_EVENT_RECORD(ctypes.Structure):
+        _fields_ = [
+            ("dwMousePosition", COORD),
+            ("dwButtonState", wintypes.DWORD),
+            ("dwControlKeyState", wintypes.DWORD),
+            ("dwEventFlags", wintypes.DWORD),
+        ]
+
+    class INPUT_UNION(ctypes.Union):
+        _fields_ = [("KeyEvent", KEY_EVENT_RECORD), ("MouseEvent", MOUSE_EVENT_RECORD)]
+
+    class INPUT_RECORD(ctypes.Structure):
+        _fields_ = [("EventType", wintypes.WORD), ("Event", INPUT_UNION)]
+
+    kernel32 = ctypes.windll.kernel32
+    timeout_ms = 0 if timeout_s <= 0 else max(1, int(timeout_s * 1000))
+    deadline = time.monotonic() + max(0.0, timeout_s)
+
+    while True:
+        if _nt_key_queue:
+            return _nt_key_queue.popleft()
+        wait = kernel32.WaitForSingleObject(handle, timeout_ms if timeout_s > 0 else 0)
+        if wait != 0:  # WAIT_OBJECT_0 == 0
+            if timeout_s <= 0 or time.monotonic() >= deadline:
+                return None
+            remaining = deadline - time.monotonic()
+            timeout_ms = max(1, int(remaining * 1000))
+            continue
+        rec = INPUT_RECORD()
+        nread = wintypes.DWORD()
+        if not kernel32.ReadConsoleInputW(handle, ctypes.byref(rec), 1, ctypes.byref(nread)):
+            return None
+        if nread.value == 0:
+            return None
+        if rec.EventType == _MOUSE_EVENT:
+            flags = rec.Event.MouseEvent.dwEventFlags
+            if flags & (_MOUSE_WHEELED | _MOUSE_HWHEELED):
+                # High word of ButtonState is a signed wheel delta.
+                raw = rec.Event.MouseEvent.dwButtonState
+                delta = ctypes.c_short((raw >> 16) & 0xFFFF).value
+                keys = _nt_wheel_delta_to_keys(delta, horizontal=bool(flags & _MOUSE_HWHEELED))
+                if not keys:
+                    continue
+                _nt_key_queue.extend(keys[1:])
+                return keys[0]
+            # Clicks / moves: consume so they do not clog the buffer.
+            continue
+        if rec.EventType != _KEY_EVENT:
+            continue
+        ke = rec.Event.KeyEvent
+        mapped = _nt_decode_key_event(bool(ke.bKeyDown), int(ke.wVirtualKeyCode), ke.UnicodeChar or "")
+        if mapped is not None:
+            # RepeatCount > 1 (held key): queue extras.
+            for _ in range(max(0, int(ke.wRepeatCount) - 1)):
+                _nt_key_queue.append(mapped)
+            return mapped
+        if timeout_s <= 0:
+            # Non-blocking: keep draining until a useful event or empty.
+            wait = kernel32.WaitForSingleObject(handle, 0)
+            if wait != 0:
+                return None
+            continue
+        if time.monotonic() >= deadline:
+            return None
+
+
+def _parse_sgr_mouse(params: str, trail: str) -> str | None:
+    """CSI < btn ; col ; row M/m → wheel buttons (64/65 vertical, 66/67 horizontal)."""
+    if trail not in ("M", "m"):
+        return None
+    parts = params.split(";")
+    if not parts:
+        return None
+    try:
+        btn = int(parts[0])
+    except ValueError:
+        return None
+    # 64/65 = vertical wheel; 66/67 = horizontal (inverted: 66 → Left, 67 → Right).
+    if btn == 64:
+        return "Up"
+    if btn == 65:
+        return "Down"
+    if btn == 66:
+        return "Left"
+    if btn == 67:
+        return "Right"
+    return None
+
+
 def _read_key(timeout_s: float = 0.05) -> str | None:
     """One key from stdin, or None. Returns Tab, Left, Right, Enter, Esc, Space, or a character."""
     if os.name == "nt":
+        if _nt_mouse_armed is not None:
+            return _nt_read_console_key(timeout_s)
         try:
             import msvcrt
         except ImportError:
@@ -220,16 +444,44 @@ def _read_key(timeout_s: float = 0.05) -> str | None:
             return None
         if ch == "\x1b":
             ready, _, _ = select.select([sys.stdin], [], [], 0.02)
-            if ready:
-                rest = sys.stdin.read(2)
-                if rest == "[A":
-                    return "Up"
-                if rest == "[B":
-                    return "Down"
-                if rest == "[D":
-                    return "Left"
-                if rest == "[C":
-                    return "Right"
+            if not ready:
+                return "Esc"
+            rest = sys.stdin.read(1)
+            if rest != "[":
+                return "Esc"
+            ready, _, _ = select.select([sys.stdin], [], [], 0.02)
+            if not ready:
+                return "Esc"
+            code = sys.stdin.read(1)
+            if code == "<":
+                # SGR mouse: CSI < btn ; col ; row M/m (wheel → Up/Down).
+                buf = ""
+                while len(buf) < 32:
+                    ready, _, _ = select.select([sys.stdin], [], [], 0.02)
+                    if not ready:
+                        break
+                    c = sys.stdin.read(1)
+                    if c in ("M", "m"):
+                        return _parse_sgr_mouse(buf, c)
+                    buf += c
+                return None
+            if code == "A":
+                return "Up"
+            if code == "B":
+                return "Down"
+            if code == "D":
+                return "Left"
+            if code == "C":
+                return "Right"
+            if code == "H":
+                return "Home"
+            if code == "F":
+                return "End"
+            # CSI n~ : PageUp=5, PageDown=6, Home=1, End=4
+            ready, _, _ = select.select([sys.stdin], [], [], 0.02)
+            tilde = sys.stdin.read(1) if ready else ""
+            if tilde == "~":
+                return {"5": "PageUp", "6": "PageDown", "1": "Home", "4": "End"}.get(code)
             return "Esc"
         if ch == "\n":
             return "Enter"
@@ -251,7 +503,8 @@ def _nt_consume(msvcrt) -> str | None:
         return None
     if ch in ("\x00", "\xe0"):
         code = msvcrt.getwch()
-        return {"H": "Up", "P": "Down", "K": "Left", "M": "Right"}.get(code)
+        return {"H": "Up", "P": "Down", "K": "Left", "M": "Right",
+                "I": "PageUp", "Q": "PageDown", "G": "Home", "O": "End"}.get(code)
     if ch == "\r":
         return "Enter"
     if ch == "\x1b":
@@ -518,6 +771,10 @@ class StageConsole:
                 return list(self.lines)
             return list(self.lines)[-n:]
 
+    def line_count(self) -> int:
+        with self._lock:
+            return len(self.lines)
+
 
 class _BoardStream:
     """Catch stray print()/stdout writes and fold them into the active stage pane."""
@@ -577,6 +834,8 @@ class LeonidaBoard:
         }
         self.selected = 0
         self.summary = "build starting"
+        # Lines scrolled up from the live tail (0 = follow newest output).
+        self.scroll = 0
         self._ansi = enable_ansi()
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -603,10 +862,12 @@ class LeonidaBoard:
         if self._ansi:
             try:
                 # Alt screen + hide cursor + disable autowrap (wrap is what pushes logs "below").
-                self._raw("\033[?1049h\033[?25l\033[?7l")
+                # 1007: wheel → Up/Down in alt screen; 1000/1006: SGR mouse wheel reports.
+                self._raw("\033[?1049h\033[?25l\033[?7l\033[?1007h\033[?1000h\033[?1006h")
                 self._alt_screen = True
             except OSError:
                 self._alt_screen = False
+        _nt_arm_mouse_input()
         self._thread = threading.Thread(target=self._loop, name="leonida-board", daemon=True)
         self._thread.start()
         self._redraw(force=True)
@@ -694,15 +955,35 @@ class LeonidaBoard:
         with self._lock:
             if key in ("Tab", "Right"):
                 self.selected = (self.selected + 1) % n
+                self.scroll = 0
                 self._dirty = True
             elif key == "Left":
                 self.selected = (self.selected - 1) % n
+                self.scroll = 0
                 self._dirty = True
             elif key in "1234":
                 idx = int(key) - 1
                 if idx < n:
                     self.selected = idx
+                    self.scroll = 0
                     self._dirty = True
+            elif key in ("Up", "Down", "PageUp", "PageDown", "Home", "End"):
+                # Pane height is measured at redraw; use a conservative step here.
+                _, height = term_size()
+                pane_h = max(1, height - self.PANE_TOP - 2)
+                if key == "Up":
+                    self.scroll += 1
+                elif key == "Down":
+                    self.scroll = max(0, self.scroll - 1)
+                elif key == "PageUp":
+                    self.scroll += pane_h
+                elif key == "PageDown":
+                    self.scroll = max(0, self.scroll - pane_h)
+                elif key == "Home":
+                    self.scroll = 10**9  # clamped in _redraw against buffer length
+                elif key == "End":
+                    self.scroll = 0
+                self._dirty = True
 
     def _status_style(self, status: str) -> tuple[str, tuple[str, ...]]:
         if status == "running":
@@ -720,6 +1001,7 @@ class LeonidaBoard:
             self._dirty = False
             selected = self.selected
             summary = self.summary
+            scroll = self.scroll
             stages = list(self.stages)
             statuses = {n: self.consoles[n].status for n in stages}
         if not stages:
@@ -733,11 +1015,18 @@ class LeonidaBoard:
         pane_h = max(1, pane_bottom - pane_top + 1)
 
         name = stages[selected]
-        # Pull extra logical lines so wrapping still fills the pane with the newest content.
-        log_lines = self.consoles[name].snapshot(max(pane_h * 8, pane_h))
+        log_lines = self.consoles[name].snapshot(0)
         if not log_lines:
             log_lines = ["(no output yet)"]
-        body = wrap_log_lines(log_lines, max(1, width - 2), pane_h)
+        wrapped = wrap_log_lines(log_lines, max(1, width - 2), max_rows=0)
+        max_scroll = max(0, len(wrapped) - pane_h)
+        if scroll > max_scroll:
+            scroll = max_scroll
+            with self._lock:
+                self.scroll = scroll
+        end = len(wrapped) - scroll
+        start = max(0, end - pane_h)
+        body = wrapped[start:end]
         body = [""] * (pane_h - len(body)) + body
 
         ansi = self._ansi
@@ -753,8 +1042,10 @@ class LeonidaBoard:
                 tabs.append(_c(label, *style, on=ansi))
 
         banner = [_c(line[:width].ljust(width), _BOLD, _CYAN, on=ansi) for line in LEONIDA_BANNER]
+        scroll_hint = "  Up/Down/wheel scroll" if scroll else ""
         help_line = _c(
-            f"  Left/Right / Tab / 1-{len(stages)}  switch stage     logs: {self.log_dir}"[:width].ljust(width),
+            (f"  Left/Right / Tab / 1-{len(stages)}  stage"
+             f"{scroll_hint}    End live    logs: {self.log_dir}")[:width].ljust(width),
             _DIM, on=ansi)
 
         # Exact height rows — never emit more lines than the terminal has (avoids scroll).

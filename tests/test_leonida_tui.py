@@ -51,7 +51,8 @@ class JobsBoundsTest(unittest.TestCase):
         self.assertEqual(calls["hit"], 1)
 
     def test_nt_arrow_scan_codes(self):
-        seq = iter(["\xe0", "H", "\xe0", "P", "\xe0", "K", "\xe0", "M"])
+        seq = iter(["\xe0", "H", "\xe0", "P", "\xe0", "K", "\xe0", "M",
+                    "\xe0", "I", "\xe0", "Q", "\xe0", "G", "\xe0", "O"])
 
         class FakeMsvcrt:
             def getwch(self):
@@ -61,6 +62,25 @@ class JobsBoundsTest(unittest.TestCase):
         self.assertEqual(leonida_tui._nt_consume(FakeMsvcrt()), "Down")
         self.assertEqual(leonida_tui._nt_consume(FakeMsvcrt()), "Left")
         self.assertEqual(leonida_tui._nt_consume(FakeMsvcrt()), "Right")
+        self.assertEqual(leonida_tui._nt_consume(FakeMsvcrt()), "PageUp")
+        self.assertEqual(leonida_tui._nt_consume(FakeMsvcrt()), "PageDown")
+        self.assertEqual(leonida_tui._nt_consume(FakeMsvcrt()), "Home")
+        self.assertEqual(leonida_tui._nt_consume(FakeMsvcrt()), "End")
+
+    def test_wheel_delta_to_keys(self):
+        self.assertEqual(leonida_tui._nt_wheel_delta_to_keys(120), ["Up"])
+        self.assertEqual(leonida_tui._nt_wheel_delta_to_keys(-240), ["Down", "Down"])
+        self.assertEqual(leonida_tui._nt_wheel_delta_to_keys(0), [])
+        # Horizontal is inverted vs keyboard: tilt right → previous tab (Left).
+        self.assertEqual(leonida_tui._nt_wheel_delta_to_keys(120, horizontal=True), ["Left"])
+        self.assertEqual(leonida_tui._nt_wheel_delta_to_keys(-120, horizontal=True), ["Right"])
+
+    def test_sgr_mouse_wheel(self):
+        self.assertEqual(leonida_tui._parse_sgr_mouse("64;10;5", "M"), "Up")
+        self.assertEqual(leonida_tui._parse_sgr_mouse("65;1;1", "m"), "Down")
+        self.assertEqual(leonida_tui._parse_sgr_mouse("66;1;1", "M"), "Left")
+        self.assertEqual(leonida_tui._parse_sgr_mouse("67;1;1", "M"), "Right")
+        self.assertIsNone(leonida_tui._parse_sgr_mouse("0;1;1", "M"))  # click ignored
 
 
 class StageConsoleTest(unittest.TestCase):
@@ -166,6 +186,37 @@ class BoardSelectTest(unittest.TestCase):
             self.assertFalse(board._dirty)
             board.write("shaders", "visible")
             self.assertTrue(board._dirty)
+            board.stop()
+            for c in board.consoles.values():
+                c.close()
+
+    def test_up_scrolls_log_and_end_returns_to_live(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            board = leonida_tui.LeonidaBoard(["shaders"], tmp)
+            for i in range(20):
+                board.write("shaders", f"line-{i}")
+            self.assertEqual(board.scroll, 0)
+            board._handle_key("Up")
+            board._handle_key("Up")
+            self.assertEqual(board.scroll, 2)
+            board._handle_key("End")
+            self.assertEqual(board.scroll, 0)
+            board._handle_key("Up")
+            board._handle_key("Tab")  # only one stage; still resets scroll
+            self.assertEqual(board.scroll, 0)
+            board.stop()
+            for c in board.consoles.values():
+                c.close()
+
+    def test_wheel_keys_scroll_like_arrows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            board = leonida_tui.LeonidaBoard(["shaders"], tmp)
+            for i in range(20):
+                board.write("shaders", f"line-{i}")
+            board._handle_key("Up")  # wheel-up maps to Up
+            self.assertEqual(board.scroll, 1)
+            board._handle_key("Down")  # wheel-down maps to Down
+            self.assertEqual(board.scroll, 0)
             board.stop()
             for c in board.consoles.values():
                 c.close()
