@@ -1741,8 +1741,10 @@ The trace will enumerate them.
     cannot mix placed buffers and sparse mappings. Sparse mapping and `CopyTiles` for reserved textures are open.
 - `D3D12_RESOURCE_DESC::Layout`: the public `ROW_MAJOR` and `64KB_STANDARD_SWIZZLE` values plus the Xbox `0x101`
   tiled value from slot 76. Row-major textures need `VK_IMAGE_TILING_LINEAR` (not usable for RT/DS) or a staging
-  copy; `64KB_STANDARD_SWIZZLE` and `0x101` have no direct Vulkan equivalent. If the game uploads console-tiled data,
-  the layer needs a detile step or a matching tiled image. **Open**; the ABI value is known, the data layout is not.
+  copy; `64KB_STANDARD_SWIZZLE` and `0x101` have no direct Vulkan equivalent. `64KB_STANDARD_SWIZZLE` is refused by
+  every creation call (`StandardSwizzle64KBSupported` is FALSE) and sized in tiles by `GetResourceAllocationInfo`,
+  as on a GPU without it (D3D-347, below). If the game uploads console-tiled data, the layer needs a detile step or
+  a matching tiled image. **Open**; the ABI value is known, the data layout is not.
 - Formats: a `DXGI_FORMAT` → `VkFormat` table, including sRGB and typeless variants. Typeless resources get a
   concrete image format plus `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT` and a `VK_KHR_image_format_list` when views cast
   within the family; unsupported casts are logged and fall back to the resource format. `CreateCommittedResource3`'s
@@ -1784,8 +1786,30 @@ The trace will enumerate them.
     blending. `ALLOW_UNORDERED_ACCESS` and `ALLOW_DEPTH_STENCIL` are refused, as on WARP (measured in the test).
     `GetResourceAllocationInfo` gives no size for a description creation refuses. A typed 96-bit texture has
     views of its own format only; the `TYPELESS` one has `FLOAT`, `UINT` and `SINT` views (sampled in
-    `d3d12_descriptor_test`). `GetResourceTiling` reports nothing for a 96-bit texture: the tile shape of a
-    12-byte texel is not measured.
+    `d3d12_descriptor_test`).
+  - Tiled (D3D-347): D3D12 has no tiled 96-bit texture, so there is no tile shape of a 12-byte texel to measure.
+    On the PC runtime (an RTX 3060 on driver 32.0.16.1714, and WARP; the same answers) no `R32G32B32` format has
+    `FORMAT_SUPPORT2_TILED`, and every tiled description of one is invalid, in 2D, 2D arrays and volumes, at any
+    mip count: `CreateReservedResource` and, with `64KB_UNDEFINED_SWIZZLE` or `64KB_STANDARD_SWIZZLE`,
+    `CreateCommittedResource` and `CreatePlacedResource` return `E_INVALIDARG` (the debug layer names the missing
+    `TILED` bit), `GetResourceAllocationInfo` answers `UINT64_MAX` with a 64 KiB alignment, and
+    `MULTISAMPLE_QUALITY_LEVELS` with `TILED_RESOURCE` has no level at 1x or 4x. `GetResourceTiling` therefore only
+    meets untiled 96-bit textures, for which it writes zeros and a subresource count of 0 and leaves the array
+    alone. The layer answered the same through `CreateReservedResource`, `CreateCommittedResource`,
+    `CreatePlacedResource` and `GetResourceAllocationInfo` with `64KB_UNDEFINED_SWIZZLE` (`resource_tiling` has no
+    tile shape for a 96-bit format), but not everywhere else; fixed:
+    - `CreateCommittedResource3`, which skips `CreateCommittedResource`'s size check, created a tiled 96-bit
+      texture; it now refuses a tiled layout that `GetResourceAllocationInfo` cannot size.
+    - `64KB_STANDARD_SWIZZLE`: the layer reports `StandardSwizzle64KBSupported` as FALSE and now refuses the layout
+      in `CreateCommittedResource`, `CreateCommittedResource3` and `CreatePlacedResource`, as the RTX 3060 (which
+      has no standard swizzle) does, where it used to create an ordinary texture; `GetResourceAllocationInfo`
+      sizes it in tiles (none for 96-bit), as both hosts do, where it used to give the Vulkan size.
+
+    `d3d12_rgb96_test` compares 220 answers (the above for the four formats in three shapes and both 64 KiB
+    layouts, and the tiled sizes of single-mip `R32G32B32A32_FLOAT` textures) with WARP and with the host runtime
+    on the layer's own adapter, found by LUID; before the fixes 61 of them differed from WARP. Vulkan's sparse
+    support for `R32G32B32` images (often absent) does not come into it: the layer would back a 96-bit texture with
+    an `R32G32B32A32` image anyway.
 - Resource flags map to Vulkan usage: `ALLOW_RENDER_TARGET` → `COLOR_ATTACHMENT`, `ALLOW_DEPTH_STENCIL` →
   `DEPTH_STENCIL_ATTACHMENT`, `ALLOW_UNORDERED_ACCESS` → `STORAGE`, `ALLOW_SIMULTANEOUS_ACCESS` → concurrent
   sharing, `DENY_*` → omit the corresponding usage. Buffers get the union of usages their states and flags imply;

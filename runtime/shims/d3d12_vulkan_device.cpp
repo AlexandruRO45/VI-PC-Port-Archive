@@ -5392,6 +5392,7 @@ public:
                                               D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0;
             if (rt_ds && (heap->flags() & D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES)) return E_INVALIDARG;
             if (!rt_ds && (heap->flags() & D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES)) return E_INVALIDARG;
+            if (desc->Layout == D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE) return E_INVALIDARG;  // as committed
             if (tiled || msaa) {
                 if (tiled && desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
                     desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
@@ -6301,7 +6302,10 @@ private:
         if (((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) && (depth_stencil || samples > 1)) ||
             (volume && depth_stencil))
             return kInvalidAllocation;
-        const bool tiled = is_tiled_layout(desc.Layout);
+        // 64KB_STANDARD_SWIZZLE is sized in tiles too, though creation refuses it (StandardSwizzle64KBSupported is
+        // FALSE): an RTX 3060, which has no standard swizzle, and WARP give the same sizes (d3d12_rgb96_test).
+        const bool tiled =
+            is_tiled_layout(desc.Layout) || desc.Layout == D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE;
         if (tiled) {
             if (one_d || (samples > 1 && samples != 4)) return kInvalidAllocation;
             if (desc.Alignment && desc.Alignment != align_64k) return kInvalidAllocation;
@@ -6407,6 +6411,13 @@ private:
         } else if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
                    (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) {
             log_once("volume depth-stencil resources not supported, flags:", int(desc->Flags));
+        } else if (desc->Layout == D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE ||
+                   (is_tiled_layout(desc->Layout) && allocation(*desc).SizeInBytes == UINT64_MAX)) {
+            // CheckFeatureSupport reports StandardSwizzle64KBSupported as FALSE, and a GPU without it (an RTX 3060)
+            // refuses the layout, as CreatePlacedResource does here; GetResourceAllocationInfo still sizes it in
+            // tiles. A tiled layout needs a tile shape (none for 96-bit formats): CreateCommittedResource checks it
+            // with every texture's size, CreateCommittedResource3 comes here directly.
+            hr = E_INVALIDARG;
         } else if (heap->Type == D3D12_HEAP_TYPE_UPLOAD || heap->Type == D3D12_HEAP_TYPE_READBACK) {
             hr = E_INVALIDARG;  // D3D12 places textures on default heaps unless they are row-major
         } else if (const UINT samples = desc->SampleDesc.Count;
@@ -6563,7 +6574,9 @@ private:
                                                                            : leonida::TiledKind::texture2d;
         const Format format = vulkan_format(desc.Format, false);
         if (!format.format || (format.aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) return false;
-        if (format.rgb96) return false;  // the tile shape of a 12-byte texel is not measured
+        // D3D12 has no tiled 96-bit texture: no R32G32B32 format has FORMAT_SUPPORT2_TILED on the PC runtime, which
+        // refuses every tiled description of one (RTX 3060 and WARP, d3d12_rgb96_test). The callers refuse it too.
+        if (format.rgb96) return false;
         const leonida::BlockFormat block = leonida::block_format(format.format, format.aspects);
         tiling.element_bytes = block.bytes;
         tiling.block = block.block;

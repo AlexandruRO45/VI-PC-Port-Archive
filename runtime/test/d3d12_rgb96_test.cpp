@@ -11,6 +11,9 @@
 //     host image copies and on one without, before and after a barrier has moved the texture;
 //   - what creation, GetResourceAllocationInfo and CheckFeatureSupport say, next to WARP's answers, and that
 //     the three agree with each other;
+//   - that every tiled description is refused (reserved; committed and placed with a 64KB layout), with no size,
+//     no tiled quality level and no TILED format support, and that GetResourceTiling on a 96-bit texture writes
+//     zeros: as WARP and the host runtime on the layer's own adapter (matched by LUID) answer;
 //   - copies between a 96-bit texture and an RGBA32 one refused;
 //   - an upload and a readback on a COPY queue;
 //   - how long an upload and a readback take at 64x64 and 256x256, and up to 4096x4096 with LEONIDA_RGB96_LARGE
@@ -23,6 +26,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 #define CHECK(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return false; } \
@@ -522,10 +526,153 @@ bool refusals(ID3D12Device* device) {
     CHECK(refused(leonida::ReplayResult::invalid_copy));
     return true;
 }
+
+// What a 96-bit texture gets wherever D3D12 asks for a tile layout (D3D-347). None of the four formats has
+// D3D12_FORMAT_SUPPORT2_TILED on the PC runtime (an RTX 3060 on 32.0.16.1714 and WARP, measured), so every tiled
+// description of one is invalid there: CreateReservedResource and, with 64KB_UNDEFINED_SWIZZLE,
+// CreateCommittedResource (and CreateCommittedResource3) and CreatePlacedResource refuse it with E_INVALIDARG,
+// GetResourceAllocationInfo has no size, and MULTISAMPLE_QUALITY_LEVELS with the TILED_RESOURCE flag has no level.
+// GetResourceTiling on a 96-bit texture (committed, the only kind there is) writes zeros and a subresource count of
+// 0, as for any untiled resource. The answers are collected on each device in the same order and compared.
+struct Answer {
+    std::string what;
+    UINT64 value = 0;
+};
+constexpr UINT64 kNotAsked = ~UINT64(1);  // no heap (no GPU address arena) or no ID3D12Device10 on that device
+
+std::vector<Answer> tiled_answers(ID3D12Device* device, const DXGI_FORMAT (&formats)[4]) {
+    std::vector<Answer> out;
+    const auto add = [&](DXGI_FORMAT format, const std::string& what, UINT64 value) {
+        out.push_back({"format " + std::to_string(int(format)) + " " + what, value});
+    };
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+    const D3D12_HEAP_DESC heap_desc{UINT64(1) << 22, default_heap, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
+                                    D3D12_HEAP_FLAG_DENY_BUFFERS | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES};
+    Ref<ID3D12Heap> heap;
+    if (FAILED(device->CreateHeap(&heap_desc, IID_PPV_ARGS(&heap.p)))) heap.p = nullptr;
+    Ref<ID3D12Device10> device10;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device10.p)))) device10.p = nullptr;
+    for (const DXGI_FORMAT format : formats) {
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
+        add(format, "FORMAT_SUPPORT2_TILED",
+            SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)))
+                ? (support.Support2 & D3D12_FORMAT_SUPPORT2_TILED) : UINT64_MAX);
+        for (const UINT samples : {1u, 4u}) {
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels{
+                format, samples, D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE, 77};
+            const HRESULT hr = device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &levels,
+                                                           sizeof(levels));
+            const std::string count = "tiled " + std::to_string(samples) + "x quality levels";
+            add(format, count + " HRESULT", UINT(hr));
+            add(format, count, levels.NumQualityLevels);
+        }
+        const D3D12_RESOURCE_DESC shapes[] = {texture_desc(format, false, 256, 256, 1, 1),
+                                              texture_desc(format, false, 1000, 300, 3, 0),
+                                              texture_desc(format, true, 64, 64, 64, 0)};
+        for (D3D12_RESOURCE_DESC desc : shapes) {
+            for (const auto layout : {D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE}) {
+                desc.Layout = layout;
+                const std::string shape =
+                    std::string(desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? "3D " : "2D ") +
+                    std::to_string(desc.Width) + "x" + std::to_string(desc.Height) + "x" +
+                    std::to_string(desc.DepthOrArraySize) + " mips " + std::to_string(desc.MipLevels) + " layout " +
+                    std::to_string(int(layout));
+                Ref<ID3D12Resource> reserved, committed, committed3, placed;
+                add(format, shape + " CreateReservedResource",
+                    UINT(device->CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                        IID_PPV_ARGS(&reserved.p))));
+                add(format, shape + " CreateCommittedResource",
+                    UINT(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                         D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                         IID_PPV_ARGS(&committed.p))));
+                const D3D12_RESOURCE_DESC1 desc1{desc.Dimension, desc.Alignment, desc.Width, desc.Height,
+                                                 desc.DepthOrArraySize, desc.MipLevels, desc.Format, desc.SampleDesc,
+                                                 desc.Layout, desc.Flags, {}};
+                add(format, shape + " CreateCommittedResource3",
+                    device10.p ? UINT(device10->CreateCommittedResource3(
+                                     &default_heap, D3D12_HEAP_FLAG_NONE, &desc1, D3D12_BARRIER_LAYOUT_COMMON, nullptr,
+                                     nullptr, 0, nullptr, IID_PPV_ARGS(&committed3.p)))
+                               : kNotAsked);
+                add(format, shape + " CreatePlacedResource",
+                    heap.p ? UINT(device->CreatePlacedResource(heap.p, 0, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                               IID_PPV_ARGS(&placed.p)))
+                           : kNotAsked);
+                const D3D12_RESOURCE_ALLOCATION_INFO info = device->GetResourceAllocationInfo(0, 1, &desc);
+                add(format, shape + " GetResourceAllocationInfo size", info.SizeInBytes);
+                add(format, shape + " GetResourceAllocationInfo alignment", info.Alignment);
+            }
+        }
+        // GetResourceTiling on a 96-bit texture, with every output prefilled.
+        const D3D12_RESOURCE_DESC plain = texture_desc(format, false, 64, 64, 2, 0);
+        Ref<ID3D12Resource> texture;
+        const HRESULT created = device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &plain,
+                                                                D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                IID_PPV_ARGS(&texture.p));
+        add(format, "untiled texture created", UINT(created));
+        if (FAILED(created)) continue;
+        UINT total = 0xcdcdcdcd, count = 16;
+        D3D12_PACKED_MIP_INFO packed;
+        D3D12_TILE_SHAPE shape;
+        D3D12_SUBRESOURCE_TILING tilings[16];
+        std::memset(&packed, 0xcd, sizeof(packed));
+        std::memset(&shape, 0xcd, sizeof(shape));
+        std::memset(tilings, 0xcd, sizeof(tilings));
+        device->GetResourceTiling(texture.p, &total, &packed, &shape, &count, 0, tilings);
+        add(format, "GetResourceTiling total", total);
+        add(format, "GetResourceTiling standard mips", packed.NumStandardMips);
+        add(format, "GetResourceTiling packed mips", packed.NumPackedMips);
+        add(format, "GetResourceTiling packed tiles", packed.NumTilesForPackedMips);
+        add(format, "GetResourceTiling packed start", packed.StartTileIndexInOverallResource);
+        add(format, "GetResourceTiling shape width", shape.WidthInTexels);
+        add(format, "GetResourceTiling shape height", shape.HeightInTexels);
+        add(format, "GetResourceTiling shape depth", shape.DepthInTexels);
+        add(format, "GetResourceTiling count", count);
+        add(format, "GetResourceTiling first subresource untouched",
+            tilings[0].WidthInTiles == 0xcdcdcdcd && tilings[0].StartTileIndexInOverallResource == 0xcdcdcdcd);
+    }
+    // The four-channel format of the layer's 96-bit images has a tile shape: the same descriptions get tiles, with
+    // the standard swizzle too (sized by the RTX 3060, which cannot create it, as by WARP, which can). One mip each:
+    // how many tiles a packed tail takes is the driver's (src/resource_tiling.h), and WARP packs nothing.
+    constexpr DXGI_FORMAT wide = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    for (D3D12_RESOURCE_DESC desc : {texture_desc(wide, false, 256, 256, 1, 1), texture_desc(wide, false, 1000, 300, 3, 1),
+                                     texture_desc(wide, true, 64, 64, 64, 1)})
+        for (const auto layout : {D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE}) {
+            desc.Layout = layout;
+            const D3D12_RESOURCE_ALLOCATION_INFO info = device->GetResourceAllocationInfo(0, 1, &desc);
+            const std::string shape = std::string(desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? "3D " : "2D ") +
+                                      std::to_string(desc.Width) + " layout " + std::to_string(int(layout));
+            add(wide, shape + " GetResourceAllocationInfo size", info.SizeInBytes);
+            add(wide, shape + " GetResourceAllocationInfo alignment", info.Alignment);
+        }
+    return out;
+}
+
+// The layer's tiled answers against one host's; false on any difference. An answer one device was not asked (no
+// heap, no ID3D12Device10) is not compared.
+bool same_tiled_answers(const std::vector<Answer>& ours, const std::vector<Answer>& host, const char* host_name) {
+    if (ours.size() != host.size()) {
+        std::fprintf(stderr, "tiled 96-bit: %zu answers, %s %zu\n", ours.size(), host_name, host.size());
+        return false;
+    }
+    unsigned compared = 0, differ = 0;
+    for (std::size_t i = 0; i < ours.size(); ++i) {
+        if (ours[i].value == kNotAsked || host[i].value == kNotAsked) continue;
+        ++compared;
+        if (ours[i].value == host[i].value) continue;
+        if (differ++ < 16)
+            std::fprintf(stderr, "tiled 96-bit %s: ours 0x%llx, %s 0x%llx\n", ours[i].what.c_str(),
+                         static_cast<unsigned long long>(ours[i].value), host_name,
+                         static_cast<unsigned long long>(host[i].value));
+    }
+    std::printf("tiled 96-bit: %u of %zu answers compared with %s, %u differ\n", compared, ours.size(), host_name,
+                differ);
+    return differ == 0;
+}
 } // namespace
 
 int main() {
     vktest::Device vk;
+    vk.request_buffer_device_address = true;  // for the device of the tiled answers, which places textures in heaps
     const auto device_status = vk.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;  // no Vulkan GPU: ctest skips
     if (device_status != vktest::DeviceStatus::ready) return 1;
@@ -631,6 +778,31 @@ int main() {
             std::printf("format %d: FORMAT_SUPPORT ours %08x/%08x, WARP %08x/%08x; render target: ours %08lx, WARP %08lx\n",
                         int(format), unsigned(mine.Support1), unsigned(mine.Support2), unsigned(theirs.Support1),
                         unsigned(theirs.Support2), target, host_target);
+        }
+        // Tiled descriptions (D3D-347), against WARP and against the host runtime on the layer's own adapter
+        // (matched by LUID; WARP only when it has no D3D12 device). This layer device has the GPU address arena, so
+        // it has heaps and placed resources are asked too.
+        Ref<ID3D12Device> ours_tiled;
+        info.buffer_device_address = vk.buffer_device_address;
+        if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours_tiled.p)))) return 1;
+        const std::vector<Answer> tiled = tiled_answers(ours_tiled.p, formats);
+        if (!same_tiled_answers(tiled, tiled_answers(host.p, formats), "WARP")) return 1;
+        VkPhysicalDeviceIDProperties id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &id};
+        vk.instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(vk.physical, &properties);
+        LUID luid{};
+        std::memcpy(&luid, id.deviceLUID, sizeof(luid));
+        Ref<IDXGIAdapter1> adapter;
+        Ref<ID3D12Device> same;
+        DXGI_ADAPTER_DESC1 adapter_desc{};
+        if (id.deviceLUIDValid && SUCCEEDED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter.p))) &&
+            SUCCEEDED(adapter->GetDesc1(&adapter_desc)) &&
+            SUCCEEDED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&same.p)))) {
+            char name[128]{};
+            WideCharToMultiByte(CP_UTF8, 0, adapter_desc.Description, -1, name, sizeof(name), nullptr, nullptr);
+            if (!same_tiled_answers(tiled, tiled_answers(same.p, formats), name)) return 1;
+        } else {
+            std::printf("tiled 96-bit: no host D3D12 device on the layer's adapter, compared with WARP only\n");
         }
         if (!refusals(ours.p)) return 1;
         if (!copy_queue(ours.p) || !copy_queue(host.p)) return 1;
