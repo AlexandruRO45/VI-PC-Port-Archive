@@ -720,5 +720,134 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
         self.assertEqual(lds.read_dword(0), 0x12345678)
 
 
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(DEFAULT_LDS_SIZE_BYTES)
+        self.scalar_interp = ScalarDSInterpreter()
+        self.simd_interp = SIMDDSInterpreter()
+
+    def test_alias_vdst_and_vaddr(self) -> None:
+        # ds_nor_rtn_b32 v1, v1, v2: vdst == vaddr
+        state = ScalarThreadState(lds=self.lds)
+        # LDS[dword 3] (addr 12) = 0x00000000
+        self.lds.write_dword(3, 0x00000000)
+        state.set_vgpr(VGPR(1), 12)          # vaddr is v1
+        state.set_vgpr(VGPR(2), 0x00000000)  # vdata is v2
+
+        inst = DSNorRtnB32Instruction(
+            opcode=DSOpcode.DS_NOR_RTN_B32,
+            vdst=VGPR(1),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        ret = self.scalar_interp.execute(state, inst)
+
+        # Must return old memory value 0 into v1
+        self.assertEqual(ret, 0)
+        self.assertEqual(state.get_vgpr(VGPR(1)), 0)
+        # Memory must be updated with ~(0 | 0) = 0xFFFFFFFF
+        self.assertEqual(self.lds.read_dword(3), 0xFFFFFFFF)
+
+    def test_alias_vdst_and_vdata(self) -> None:
+        # ds_nor_rtn_b32 v2, v1, v2: vdst == vdata
+        state = ScalarThreadState(lds=self.lds)
+        # LDS[dword 4] (addr 16) = 0x55555555
+        self.lds.write_dword(4, 0x55555555)
+        state.set_vgpr(VGPR(1), 16)          # vaddr is v1
+        state.set_vgpr(VGPR(2), 0xAAAAAAAA)  # vdata is v2
+
+        inst = DSNorRtnB32Instruction(
+            opcode=DSOpcode.DS_NOR_RTN_B32,
+            vdst=VGPR(2),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        ret = self.scalar_interp.execute(state, inst)
+
+        # Must return old memory value 0x55555555 into v2
+        self.assertEqual(ret, 0x55555555)
+        self.assertEqual(state.get_vgpr(VGPR(2)), 0x55555555)
+        # Memory must be updated with ~(0x55555555 | 0xAAAAAAAA) = 0x00000000
+        self.assertEqual(self.lds.read_dword(4), 0x00000000)
+
+    def test_alias_all_operands_same_register(self) -> None:
+        # ds_nor_rtn_b32 v0, v0, v0: vdst == vaddr == vdata
+        state = ScalarThreadState(lds=self.lds)
+        # Address is 8 (dword 2). LDS[2] = 0x00000000
+        self.lds.write_dword(2, 0x00000000)
+        state.set_vgpr(VGPR(0), 8)
+
+        inst = DSNorRtnB32Instruction(
+            opcode=DSOpcode.DS_NOR_RTN_B32,
+            vdst=VGPR(0),
+            vaddr=VGPR(0),
+            vdata=VGPR(0),
+        )
+        ret = self.scalar_interp.execute(state, inst)
+
+        # vaddr = 8, vdata = 8.
+        # LDS was 0. ~(0 | 8) = ~8 = 0xFFFFFFF7.
+        # vdst (v0) gets old memory value 0.
+        self.assertEqual(ret, 0)
+        self.assertEqual(state.get_vgpr(VGPR(0)), 0)
+        self.assertEqual(self.lds.read_dword(2), 0xFFFFFFF7)
+
+    def test_simd_wave32_aliasing_vdst_vaddr(self) -> None:
+        wave = SIMDWaveState(wave_size=32, exec_mask=0xFFFFFFFF, lds=self.lds)
+        for lane in range(32):
+            addr = lane * 4
+            self.lds.write_dword(lane, 0x00000000)
+            wave.set_vgpr(lane, VGPR(1), addr)
+            wave.set_vgpr(lane, VGPR(2), 0x00000000)
+
+        inst = DSNorRtnB32Instruction(
+            opcode=DSOpcode.DS_NOR_RTN_B32,
+            vdst=VGPR(1),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        results = self.simd_interp.execute(wave, inst)
+
+        for lane in range(32):
+            self.assertEqual(results[lane], 0)
+            self.assertEqual(wave.get_vgpr(lane, VGPR(1)), 0)
+            self.assertEqual(self.lds.read_dword(lane), 0xFFFFFFFF)
+
+    def test_bit_toggling_oscillation(self) -> None:
+        state = ScalarThreadState(lds=self.lds)
+        initial = 0xF0F0F0F0
+        self.lds.write_dword(0, initial)
+        state.set_vgpr(VGPR(1), 0)
+        state.set_vgpr(VGPR(2), 0)  # NOR with 0 inverts
+
+        inst = DSNorRtnB32Instruction(
+            opcode=DSOpcode.DS_NOR_RTN_B32,
+            vdst=VGPR(0),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+
+        # Pass 1: initial -> ~initial
+        ret1 = self.scalar_interp.execute(state, inst)
+        self.assertEqual(ret1, initial)
+        self.assertEqual(self.lds.read_dword(0), 0x0F0F0F0F)
+
+        # Pass 2: ~initial -> initial
+        ret2 = self.scalar_interp.execute(state, inst)
+        self.assertEqual(ret2, 0x0F0F0F0F)
+        self.assertEqual(self.lds.read_dword(0), initial)
+
+        # Pass 3: initial -> ~initial
+        ret3 = self.scalar_interp.execute(state, inst)
+        self.assertEqual(ret3, initial)
+        self.assertEqual(self.lds.read_dword(0), 0x0F0F0F0F)
+
+
 if __name__ == "__main__":
     unittest.main()
