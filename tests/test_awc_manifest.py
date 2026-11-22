@@ -97,7 +97,7 @@ class ManifestTest(unittest.TestCase):
         self.assertNotIn("Traceback", p.stderr)
         self.assertIn("warning", p.stderr.lower())
         self.assertIn("bad.awc", p.stderr)
-        self.assertIn("2 banks, 5 streams, 2 streamed-music channels", p.stderr)
+        self.assertIn("1 banks, 5 streams, 2 streamed-music channels", p.stderr)
         reader = csv.DictReader(io.StringIO(p.stdout))
         self.assertEqual(reader.fieldnames, HEADER)
         rows = {r["stream"]: r for r in reader}
@@ -173,6 +173,21 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual((row["channels"], row["declared_samples"]), ("2", "960"))
         self.assertAlmostEqual(float(row["duration_s"]), 0.02, places=6)
         self.assertEqual(row["streamed_music"], "yes")
+
+    def test_skipped_banks_are_excluded_from_bank_count(self):
+        for name in ("bad1.awc", "bad2.awc"):
+            with open(os.path.join(self.tmp.name, name), "wb") as f:
+                f.write(b"NOT_AN_AWC_FILE")
+        p = self.run_tool(self.tmp.name, "--format", "json")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("bad1.awc", p.stderr)
+        self.assertIn("bad2.awc", p.stderr)
+        self.assertIn("0 banks, 0 streams, 0 streamed-music channels", p.stderr)
+        doc = json.loads(p.stdout)
+        self.assertEqual(doc["bank_count"], 0)
+        self.assertEqual(doc["stream_count"], 0)
+        self.assertEqual(doc["streamed_music_channel_count"], 0)
+        self.assertEqual(doc["streams"], [])
 
 
 if __name__ == "__main__":

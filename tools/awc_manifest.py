@@ -127,14 +127,16 @@ def collect(src: str):
     else:
         banks = [src]
     rows = []
+    parsed = 0
     for path in banks:
         try:
             bank = os.path.relpath(path, src).replace(os.sep, "/") if recursive else os.path.basename(path)
             rows += _bank_rows(path, bank)
+            parsed += 1
         except (ValueError, struct.error, IndexError, OSError) as e:
             print(f"awc_manifest: warning: skipping {path}: {e}", file=sys.stderr)
     rows.sort(key=lambda r: (r["bank"].lower(), int(r["stream"], 16)))
-    return len(banks), rows, sum(1 for r in rows if r["streamed_music"])
+    return parsed, rows, sum(1 for r in rows if r["streamed_music"])
 
 
 def write_manifest(rows: list, banks: int, streamed: int, fmt: str, out: str) -> None:
