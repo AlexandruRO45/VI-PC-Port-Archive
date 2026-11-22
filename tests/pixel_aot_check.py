@@ -1846,7 +1846,6 @@ def check_render(directory, compiler, renderer, backend):
     check_predicate_draws(directory, compiler, renderer, backend)
     check_int_predicate_draws(directory, compiler, renderer, backend)
     check_literal_fma_draw(directory, compiler, renderer, backend)
-    check_e64_draws(directory, compiler, renderer, backend)
     capture = directory / "blend.rgba"
     draw = [renderer, backend, "--dual-pixel", shader, capture]
     for case in DUAL_CASES:
@@ -1903,17 +1902,32 @@ def check_render(directory, compiler, renderer, backend):
     return 0
 
 
+def check_e64_render(directory, compiler, renderer, backend):
+    """The e64 draw cases on their own, so they run as a separate CTest entry per backend. A renderer that reports an
+    unavailable adapter (exit 77) makes this a skip, as for the other pixel draws."""
+    try:
+        check_e64_draws(directory, compiler, renderer, backend)
+    except subprocess.CalledProcessError as error:
+        if error.returncode == 77:
+            return 77
+        raise
+    return 0
+
+
 def main():
     mode, *args = sys.argv[1:]
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
+        if mode == "draw-e64":
+            # The controls already run in the binary and draw modes; this mode only draws.
+            return check_e64_render(directory, *args)
         check_controls(directory)
         if mode == "binary":
             check_binary(directory, *args)
         elif mode == "draw":
             return check_render(directory, *args)
         else:
-            raise ValueError("Expected binary or draw mode")
+            raise ValueError("Expected binary, draw or draw-e64 mode")
 
 
 if __name__ == "__main__":
