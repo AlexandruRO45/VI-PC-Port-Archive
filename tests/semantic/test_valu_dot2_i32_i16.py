@@ -805,5 +805,120 @@ class TestValuDot2I32I16IEEE754BitPatterns(unittest.TestCase):
         self.assertEqual(res, 96868)
 
 
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestValuDot2I32I16NegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_dst_cannot_be_sgpr(self) -> None:
+        with self.assertRaises(TypeError):
+            VDot2I32I16Instruction(
+                dst=Operand.sgpr(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.vgpr(3),
+            )
+
+    def test_syntax_rejection_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106)
+        with self.assertRaises(ValueError):
+            Operand.vgpr(-1)
+
+    def test_syntax_rejection_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=128)
+
+    def test_negative_control_bit_flip_detection(self) -> None:
+        s0 = pack_i16x2(10, 20)
+        s1 = pack_i16x2(30, 40)
+        s2 = 50
+        correct = ref_dot2_i32_i16(s0, s1, s2)
+        corrupted = correct ^ 1
+        self.assertNotEqual(correct, corrupted)
+
+    def test_mutation_detection_signed_vs_unsigned_multiplication(self) -> None:
+        """Mutant computes unsigned 16-bit multiplication instead of signed."""
+        def mutant_dot2(s0: int, s1: int, s2: int) -> int:
+            u_a0 = s0 & MASK16
+            u_b0 = s1 & MASK16
+            return u32((u_a0 * u_b0) + s32(s2))
+
+        s0 = pack_i16x2(-1, 0)
+        s1 = pack_i16x2(1, 0)
+        s2 = 0
+
+        correct = ref_dot2_i32_i16(s0, s1, s2)
+        mutant = mutant_dot2(s0, s1, s2)
+        self.assertEqual(correct, 0xFFFF_FFFF)
+        self.assertEqual(mutant, 0x0000_FFFF)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_omitted_accumulator(self) -> None:
+        """Mutant forgets to add accumulator s2."""
+        def mutant_dot2(s0: int, s1: int, s2: int) -> int:
+            return ref_dot2_i32_i16(s0, s1, 0)
+
+        s0 = pack_i16x2(1, 1)
+        s1 = pack_i16x2(1, 1)
+        s2 = 100
+        correct = ref_dot2_i32_i16(s0, s1, s2)
+        mutant = mutant_dot2(s0, s1, s2)
+        self.assertEqual(correct, 102)
+        self.assertEqual(mutant, 2)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_clamp_omitted(self) -> None:
+        """Mutant ignores clamp flag on overflowing result."""
+        def mutant_dot2(s0: int, s1: int, s2: int) -> int:
+            return ref_dot2_i32_i16(s0, s1, s2, clamp=False)
+
+        s0 = pack_i16x2(-32768, -32768)
+        s1 = pack_i16x2(-32768, -32768)
+        s2 = 0
+        correct = ref_dot2_i32_i16(s0, s1, s2, clamp=True)
+        mutant = mutant_dot2(s0, s1, s2)
+        self.assertEqual(correct, UINT32_INT_MAX)
+        self.assertEqual(mutant, 0x8000_0000)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_simd_exec_mask_bypass(self) -> None:
+        """Mutant SIMD interpreter writes to inactive lanes ignoring EXEC mask."""
+        class BuggySIMDInterpreter(SIMDInterpreter):
+            def step(self, instr: VDot2I32I16Instruction, state: SIMDWaveState) -> List[Optional[int]]:
+                results: List[Optional[int]] = []
+                for lane in range(state.wave_size):
+                    s0 = state.read_lane_operand_32(instr.src0, lane)
+                    s1 = state.read_lane_operand_32(instr.src1, lane)
+                    s2 = state.read_lane_operand_32(instr.src2, lane)
+                    res = ref_dot2_i32_i16(s0, s1, s2, clamp=instr.clamp)
+                    state.write_lane_vgpr_32(instr.dst.index, lane, res)
+                    results.append(res)
+                return results
+
+        sentinel = 0x55AA_55AA
+        state = SIMDWaveState(wave_size=32, exec_mask=0x0000_0000)
+        for lane in range(32):
+            state.write_lane_vgpr_32(0, lane, sentinel)
+
+        buggy = BuggySIMDInterpreter()
+        instr = VDot2I32I16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.literal(0),
+            src1=Operand.literal(0),
+            src2=Operand.literal(0),
+        )
+        buggy.step(instr, state)
+
+        corrupted = [lane for lane in range(32) if state.vgprs[lane][0] != sentinel]
+        self.assertEqual(len(corrupted), 32)
+
+
 if __name__ == "__main__":
     unittest.main()
