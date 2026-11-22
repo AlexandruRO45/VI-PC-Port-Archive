@@ -1,0 +1,21 @@
+EXPORTS
+    byte_merge
+    word_ops
+    byte_shift
+    byte_unary
+    al_less
+    mixed_width
+    ax_copy
+    zx_byte
+    set_less
+    set_zx
+    store_only
+    store_ret0
+    qword_ops
+    flag_results
+    self_loop
+    join_wide
+    cmov_word
+    address_return
+    imul3_fresh
+    imul2_undefined

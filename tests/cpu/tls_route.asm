@@ -4,6 +4,9 @@
 ; The callback list has its own read-only section, so a test can make the list unreadable
 ; without touching the directory in .data.
 EXTERN __imp_sink_record:QWORD
+IFDEF FRAME_GUEST
+EXTERN __imp_frame_render:QWORD
+ENDIF
 CALLER_TLS EQU 1
 CALLER_ENTRY EQU 2
 
@@ -52,4 +55,12 @@ tls_index_address PROC
     lea rax, tls_index
     ret
 tls_index_address ENDP
+
+IFDEF FRAME_GUEST
+guest_draw PROC
+    mov rdx, rcx
+    mov ecx, 2
+    jmp QWORD PTR [__imp_frame_render]
+guest_draw ENDP
+ENDIF
 END

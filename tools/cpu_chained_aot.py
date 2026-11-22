@@ -64,9 +64,9 @@ def translate(image, name, partial=False, callback_offset=None, ffx_destroy=Fals
             elif code == Code.POP_R64 and reg_dst and sp in stack:
                 regs[dst] = stack.pop(sp)
                 sp += 8
-            elif code in (Code.ADD_RM64_IMM8, Code.SUB_RM64_IMM8) and dst == R.RSP:
-                delta = ins.immediate8to64
-                sp += delta if code == Code.ADD_RM64_IMM8 else -delta
+            elif code in (Code.ADD_RM64_IMM8, Code.SUB_RM64_IMM8, Code.ADD_RM64_IMM32, Code.SUB_RM64_IMM32) and dst == R.RSP:
+                delta = ins.immediate8to64 if code in (Code.ADD_RM64_IMM8, Code.SUB_RM64_IMM8) else ins.immediate32to64
+                sp += delta if code in (Code.ADD_RM64_IMM8, Code.ADD_RM64_IMM32) else -delta
                 if not -4096 <= sp <= 0 or sp % 8:
                     raise ValueError(f"unsupported stack adjustment at {ip:#x}")
                 stack = {k: v for k, v in stack.items() if k >= sp}
@@ -86,8 +86,12 @@ def translate(image, name, partial=False, callback_offset=None, ffx_destroy=Fals
                     regs[dst] = var
                 else:
                     regs[dst] = address
-            elif code == Code.MOV_R32_IMM32 and dst == R.EAX:
-                regs[R.RAX] = str(ins.immediate32)
+            elif code == Code.MOV_R32_IMM32 and RegisterExt.full_register(dst) in GPRS:
+                regs[RegisterExt.full_register(dst)] = f"{ins.immediate32}ull"
+            elif (code in (Code.XOR_RM32_R32, Code.XOR_R32_RM32, Code.XOR_RM64_R64, Code.XOR_R64_RM64)
+                  and ins.op0_kind == ins.op1_kind == OpKind.REGISTER and dst == src
+                  and RegisterExt.full_register(dst) in GPRS):
+                regs[RegisterExt.full_register(dst)] = "0ull"
             elif code in (Code.MOV_RM32_R32, Code.MOV_R32_RM32) and ins.op0_kind == ins.op1_kind == OpKind.REGISTER:
                 dest, source = RegisterExt.full_register(dst), RegisterExt.full_register(src)
                 if dest not in GPRS or regs.get(source) in (None, *SAVED.values()):
@@ -95,15 +99,18 @@ def translate(image, name, partial=False, callback_offset=None, ffx_destroy=Fals
                 regs[dest] = f"static_cast<std::uint32_t>({regs[source]})"
             elif code == Code.TEST_RM64_R64 and dst == src and reg_src and regs[src] not in SAVED.values():
                 branch = instructions.get(ins.next_ip)
-                if branch is None or branch.code not in (Code.JE_REL8_64, Code.JE_REL32_64):
-                    raise ValueError(f"expected JE after TEST at {ip:#x}")
-                lines.append(indent + f"if ({regs[src]} == 0) {{")
+                if branch is None or branch.code not in (
+                        Code.JE_REL8_64, Code.JE_REL32_64, Code.JNE_REL8_64, Code.JNE_REL32_64):
+                    raise ValueError(f"expected JE or JNE after TEST at {ip:#x}")
+                taken_zero = branch.code in (Code.JE_REL8_64, Code.JE_REL32_64)
+                op = "==" if taken_zero else "!="
+                lines.append(indent + f"if ({regs[src]} {op} 0) {{")
                 checks_allocator = ffx_destroy and regs[src] == "second"
                 walk(branch.near_branch_target, regs.copy(), stack.copy(), sp, visited.copy(), indent + "    ",
-                     stage, True if checks_allocator else allocator_null)
+                     stage, taken_zero if checks_allocator else allocator_null)
                 lines.append(indent + "}")
                 if checks_allocator:
-                    allocator_null = False
+                    allocator_null = not taken_zero
                 ip = branch.next_ip
                 continue
             elif code in (Code.JMP_REL8_64, Code.JMP_REL32_64):

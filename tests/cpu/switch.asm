@@ -202,4 +202,92 @@ narrow_table:
     DD narrow_shl8 - narrow_table, narrow_shr8 - narrow_table, narrow_sar8 - narrow_table
     DD narrow_shl16 - narrow_table, narrow_shr16 - narrow_table, narrow_sar16 - narrow_table
 shift_narrow ENDP
+
+; Flag consumers: ECX selects a SETcc or CMOVcc case that compares A = EDX with B = RDX bits
+; 32..63 (in R9). The DWORD at R8 receives EAX and RAX is returned whole, so the upper half
+; shows where a 32-bit CMOVcc zero-extends and where a byte SETcc keeps bits 8..63.
+flag_select PROC FRAME
+    .endprolog
+    mov r9, rdx
+    shr r9, 32
+    mov eax, ecx
+    cmp ecx, 7
+    ja flag_default
+    mov ecx, eax
+    lea r10, flag_table
+    movsxd rcx, DWORD PTR [r10+rcx*4]
+    add rcx, r10
+    jmp rcx
+flag_setl:
+    xor eax, eax
+    cmp edx, r9d
+    setl al
+    jmp flag_store
+flag_setbe:
+    xor eax, eax
+    cmp edx, r9d
+    setbe al
+    jmp flag_store
+flag_setg_byte:
+    mov DWORD PTR [r8], edx
+    cmp edx, r9d
+    setg BYTE PTR [r8]
+    mov eax, DWORD PTR [r8]
+    ret
+flag_cmova:
+    mov rax, -1
+    cmp edx, r9d
+    cmova eax, r9d
+    jmp flag_store
+flag_cmovns:
+    mov rax, rdx
+    test rdx, rdx
+    cmovns rax, r9
+    jmp flag_store
+flag_cmovge_mem:
+    mov DWORD PTR [r8], r9d
+    cmp edx, r9d
+    mov eax, edx
+    cmovge eax, DWORD PTR [r8]
+    jmp flag_store
+flag_setne_word:
+    mov rax, rdx
+    cmp dx, r9w
+    setne al
+    jmp flag_store
+flag_cmove_test:
+    mov eax, edx
+    test edx, 0F0h
+    cmove eax, r9d
+    jmp flag_store
+flag_default:
+    mov eax, edx
+flag_store:
+    mov DWORD PTR [r8], eax
+    ret
+    ALIGN 4
+flag_table:
+IFDEF SWAP_TABLE
+    DD flag_cmova - flag_table
+ELSE
+    DD flag_setl - flag_table
+ENDIF
+    DD flag_setbe - flag_table, flag_setg_byte - flag_table
+IFDEF SWAP_TABLE
+    DD flag_setl - flag_table
+ELSE
+    DD flag_cmova - flag_table
+ENDIF
+    DD flag_cmovns - flag_table, flag_cmovge_mem - flag_table
+    DD flag_setne_word - flag_table, flag_cmove_test - flag_table
+flag_select ENDP
+
+; A CMOVcc whose condition is always false still reads its memory source, so an inaccessible
+; R8 faults: the translation must keep the load.
+cmov_read PROC
+    mov rax, rdx
+    cmp ecx, ecx
+    cmovne eax, DWORD PTR [r8]
+    ret
+cmov_read ENDP
 END

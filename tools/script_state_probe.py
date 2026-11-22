@@ -101,7 +101,8 @@ def tree_arrays(fields):
                    struct.iter_unpack("<IIBBHI", schema[pos:end])}
         schemas[kind] = size, members
         pos = end
-    if (joaat("attributes"), 0, 0x5c) not in schemas.get(root_kind, (0, set()))[1]:
+    root_size, root_members = schemas.get(root_kind, (0, set()))
+    if root_size != len(root) or (joaat("attributes"), 0, 0x5c) not in root_members:
         return None
 
     def array(slot, stride, required):
@@ -151,10 +152,21 @@ def verified_camera(values, vectors):
     return verified
 
 
-def inspect_tree(nodes, attrs, vectors, state_id):
+def state_ids(rows):
+    """Return a state's id digests, rejecting any id that is not label-kind (5) as resolve_script_path does."""
+    ids = []
+    for key, digest, _, kind, _, _ in rows:
+        if key == joaat("id"):
+            if kind != 5:
+                raise ValueError("Non-label state ID attribute")
+            ids.append(digest)
+    return ids
+
+
+def inspect_tree(nodes, attrs, vectors, state_id, record_index=0):
     counts = Counter()
-    witness = None
-    state_ids = {}
+    candidates = {}
+    states = set()
     for index, (name, parent, _, _, _, first, count, _) in enumerate(nodes):
         if (index == 0 and parent != 65535) or (index and parent >= index):
             raise ValueError("Invalid parent index")
@@ -163,39 +175,49 @@ def inspect_tree(nodes, attrs, vectors, state_id):
         values = {key: (digest, value, kind) for key, digest, value, kind, _, _ in attrs[first:first + count]}
         if name == joaat("state"):
             counts["state_nodes"] += 1
-            # Only a label-kind (5) id names a state, as in script_path_replay.state_index.
-            digest, _, kind = values.get(joaat("id"), (None, 0, 0))
-            state_ids[index] = digest if kind == 5 else None
-        if parent not in state_ids or not CAMERA.keys() <= values.keys():
+            states.add(index)
+            ids = state_ids(attrs[first:first + count])
+            if len(ids) > 1:
+                raise ValueError("Duplicate state ID attribute")
+            if ids and ids[0] == state_id:
+                path = [index]
+                while path[-1] != 0:
+                    path.append(nodes[path[-1]][1])
+                candidates[index] = {"record_index": record_index, "node_path": path[::-1],
+                                     "first_verified_example": None}
+        if parent not in states or not CAMERA.keys() <= values.keys():
             continue
         counts["camera_parameter_sets"] += 1
         verified = verified_camera(values, vectors)
         if verified is not None:
             counts["all_five_literals_verified"] += 1
-            if state_ids[parent] == state_id and witness is None and state_id is not None:
-                witness = verified
-    return counts, witness
+            if parent in candidates and candidates[parent]["first_verified_example"] is None:
+                candidates[parent]["first_verified_example"] = verified
+    return counts, list(candidates.values())
 
 
 def inspect(path, state=None):
     totals = Counter()
-    witness = None
+    candidates = []
     state_id = joaat(state) if state is not None else None
     with path.open("rb") as stream:
         if stream.read(4) != b"9FPR":
             raise ValueError("Expected an RPF9 archive")
         with mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as data:
-            for fields in records(data):
+            for record_index, fields in enumerate(records(data)):
                 totals["section_records"] += 1
                 tree = tree_arrays(fields)
                 if tree is None:
                     continue
-                found, example = inspect_tree(*tree, state_id)
+                found, matches = inspect_tree(*tree, state_id, record_index)
                 totals.update(found)
                 totals["node_trees"] += 1
-                if witness is None:
-                    witness = example
-    return {"counts": dict(totals), "requested_state": state, "first_verified_example": witness}
+                candidates.extend(matches)
+    witness = candidates[0]["first_verified_example"] if len(candidates) == 1 else None
+    result = {"counts": dict(totals), "requested_state": state, "first_verified_example": witness}
+    if len(candidates) > 1:
+        result["ambiguous_state_candidates"] = candidates
+    return result
 
 
 if __name__ == "__main__":

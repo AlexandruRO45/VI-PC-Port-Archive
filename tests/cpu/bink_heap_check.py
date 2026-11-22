@@ -145,6 +145,14 @@ def check(path, provider):
     C.memset(pointer, 0x47, 33)
     lib.heap_release(pointer)
 
+    # The binding serves the request from the shared ERA heap: the alignment exponent in the word
+    # selects 32 bytes and the block comes back zeroed.
+    for size in (97, 129):
+        raw = provider.windows_allocate(size, ATTRIBUTES)
+        assert raw and raw % 32 == 0
+        assert C.string_at(raw, size) == bytes(size)
+        assert provider.windows_release(raw, ATTRIBUTES)
+
     trace = HeapTrace(provider)
     provider.bind_heap_observers(trace.allocate_hook, trace.release_hook)
     try:

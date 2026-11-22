@@ -5,6 +5,7 @@ import shutil
 import struct
 import sys
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import pefile
 
@@ -22,6 +23,7 @@ TARGETS = {
     "forwarded_missing": "intake_provider.absent_value",
     "forwarded_loop": "intake_forward.forwarded_loop",
     "forwarded_absent": "intake_absent.absent_value",
+    "forwarded_upper": "INTAKE_PROVIDER.named_value",
 }
 
 
@@ -92,6 +94,7 @@ def check(root, caller, forward, provider):
         return rows[symbol]["package_resolution"]["status"], [(s["provider"], s["symbol"]) for s in chain]
 
     assert hops("forwarded_value") == ("export_present", [(FORWARD, "forwarded_value"), (PROVIDER, "named_value")])
+    assert hops("forwarded_upper") == ("export_present", [(FORWARD, "forwarded_upper"), (PROVIDER, "named_value")])
     assert hops("forwarded_ordinal") == ("export_present", [(FORWARD, "forwarded_ordinal"), (PROVIDER, "#77")])
     assert hops("forwarded_chain") == ("export_present", [
         (FORWARD, "forwarded_chain"), (FORWARD, "forwarded_value"), (PROVIDER, "named_value")])
@@ -117,11 +120,86 @@ def check(root, caller, forward, provider):
         "forwarded_absent": "provider_not_found"}
     assert problems["forwarded_missing"]["package_chain"][-1]["symbol"] == "absent_value"
 
+    check_descriptor_names(root, caller, report, entry)
+
+    # The loader maps a KnownDLL from System32 before it searches the application directory, so a
+    # package file named kernel32.dll is never loaded. Its exports must not decide KERNEL32 imports.
+    shadow = root / "kernel32.dll"
+    shutil.copyfile(provider, shadow)
+    shadowed = scan(root)
+    shadow.unlink()
+    assert "kernel32.dll" in shadowed["known_dlls"] and "kernel32.dll" in shadowed["images"]
+    system = [r for r in shadowed["imports"] if r["image"] == entry and r["dll"] == "kernel32.dll"]
+    assert system and all(r["bundle_exports_in"] == [] for r in system)
+    for r in system:
+        assert r["package_resolution"]["status"] == r["desktop_resolution"]["status"] == "export_present"
+        first = r["package_resolution"]["chain"][0]
+        assert (first["provider"], first["package"], first["known_dll"]) == ("kernel32.dll", False, True)
+        assert [(s["provider"], s["symbol"], s["package"]) for s in r["package_resolution"]["chain"]] == [
+            (s["provider"], s["symbol"], False) for s in r["desktop_resolution"]["chain"]]
+    shadowed_paths = trace(shadowed, entry)
+    assert "kernel32.dll" in shadowed_paths["unlinked_in_this_graph"]
+    assert not any(f["dll"] == "kernel32.dll" for f in shadowed_paths["findings"])
+
+    # Put the source-built KnownDLL only in a separate synthetic system directory.
+    with TemporaryDirectory() as directory:
+        system_dir = Path(directory)
+        system_copy = system_dir / FORWARD
+        (root / FORWARD).rename(system_copy)
+        try:
+            with patch("pe_inventory.known_dlls", return_value={FORWARD}), patch("pe_inventory.api_sets", return_value={}):
+                first_system = scan(root, system=system_dir)
+                with TemporaryDirectory(dir=root) as other:
+                    shutil.copyfile(provider, Path(other) / PROVIDER)
+                    duplicate = trace(scan(root, system=system_dir), entry)
+        finally:
+            system_copy.rename(root / FORWARD)
+    edges = {r["symbol"]: r for r in first_system["imports"] if r["image"] == entry and r["dll"] == FORWARD}
+    resolved = edges["forwarded_value"]
+    assert not resolved["bundle_exports_in"]
+    assert resolved["package_resolution"]["status"] == "export_present"
+    assert [s["package"] for s in resolved["package_resolution"]["chain"]] == [False, True]
+    missing = {r["symbol"] for r in first_system["unresolved_edges"] if r["image"] == entry and r["dll"] == FORWARD}
+    assert "forwarded_value" not in missing and "forwarded_missing" in missing
+    assert PROVIDER in trace(first_system, entry)["reachable"]
+    assert any(f["symbol"] == "forwarded_value" and f["problem"] == "ambiguous_package_basename"
+               for f in duplicate["findings"])
+
     # Older inventories lack package chains and keep the first-hop bundled result.
     for row in report["imports"]:
         del row["package_resolution"]
     legacy = trace(report, entry)
     assert not legacy["findings"] and PROVIDER in legacy["unlinked_in_this_graph"]
+
+
+def check_descriptor_names(root, caller, report, entry):
+    """An import descriptor may omit the extension. The loader then appends .dll, unless the name
+    ends with a dot, which stops the append and is dropped from the file name."""
+    def results(rows):
+        return {(r["dll"], r["symbol"]): (r["bundle_exports_in"], r["desktop_export"],
+                                         r["package_resolution"]) for r in rows}
+
+    expected = results(r for r in report["imports"] if r["image"] == entry)
+    with pefile.PE(str(caller), fast_load=True) as pe:
+        pe.parse_data_directories(directories=[1])
+        descriptor, = [d for d in pe.DIRECTORY_ENTRY_IMPORT if d.dll.lower() == FORWARD.encode()]
+        offset = pe.get_offset_from_rva(descriptor.struct.Name)
+        image = bytearray(pe.__data__)
+    stored = len(FORWARD)
+    for name, provider in ((b"INTAKE_FORWARD", FORWARD), (b"intake_forward.", "intake_forward")):
+        # Same-length rewrite of the descriptor's name; the rest of the image is unchanged.
+        image[offset:offset + stored] = name.ljust(stored, b"\0")
+        (root / entry).write_bytes(image)
+        rows = [r for r in scan(root)["imports"] if r["image"] == entry]
+        named = {r["dll"] for r in rows} - {r["dll"] for r in report["imports"] if r["image"] == entry}
+        if provider == FORWARD:
+            assert not named and results(rows) == expected, named
+        else:
+            assert named == {provider}, named
+            assert {r["desktop_export"] for r in rows if r["dll"] == provider} == {"provider_not_found"}
+            assert all(not r["bundle_exports_in"] and r["package_resolution"] is None
+                       for r in rows if r["dll"] == provider)
+    (root / entry).write_bytes(caller.read_bytes())
 
 
 if __name__ == "__main__":

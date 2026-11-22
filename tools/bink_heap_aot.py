@@ -139,7 +139,27 @@ def translate(pe, start, allocate, module, callback_slots):
                  {}, {}, {}, host_ops=host_ops)
 
 
-def generate(image, entries):
+def group_caller(pe: pefile.PE, entry: int, allocator: int) -> str:
+    (bounds,) = function_ranges(pe, entry)
+    body = region(pe, *bounds)
+    bindings = {}
+    transfers = set()
+    for ins in body:
+        if (ins.mnemonic in (M.JMP, M.CALL) and ins.op0_kind == K.NEAR_BRANCH64
+                and ins.near_branch_target == allocator):
+            transfers.add(ins.mnemonic)
+            bindings[ins.ip] = ("return request(rcx);" if ins.mnemonic == M.JMP
+                                else "rax = request(rcx);")
+        elif ins.mnemonic in (M.PUSH, M.POP) and ins.op0_register == R.RDI:
+            bindings[ins.ip] = ("rsp -= 8; store<word>(rsp, rdi);" if ins.mnemonic == M.PUSH
+                                else "rdi = load<word>(rsp); rsp += 8;")
+    if transfers != {M.JMP, M.CALL}:
+        raise ValueError("expected a tail jump and a call to the selected allocator")
+    return lower(body, ["rsp = reinterpret_cast<word>(frame + 12);",
+                        "rcx = group; rdx = bytes;"], {}, {}, {}, host_ops=bindings)
+
+
+def generate(image, entries, group_entry=None):
     with pefile.PE(str(image), fast_load=True) as pe:
         if pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20b:
             raise ValueError("expected AMD64 PE32+")
@@ -152,6 +172,12 @@ def generate(image, entries):
         setter, slots = callback_setter(pe)
         request = translate(pe, alloc, True, module, slots)
         release = translate(pe, free, False, module, slots)
+        group = ""
+        if group_entry is not None:
+            entry = export_rva(pe, "heap_group") if group_entry == "heap_group" else int(group_entry, 0)
+            body = group_caller(pe, entry, alloc)
+            group = ('extern "C" __declspec(dllexport) word heap_group(word group, word bytes) {\n'
+                     + body + "\n}\n")
     return INTEGER_HEADER + """
 #include <atomic>
 using Allocate = void* (*)(word);
@@ -177,7 +203,7 @@ extern "C" __declspec(dllexport) void* heap_request(word bytes) {
 extern "C" __declspec(dllexport) void heap_release(void* pointer) {
     release(reinterpret_cast<word>(pointer));
 }
-"""
+""" + group
 
 
 if __name__ == "__main__":
@@ -186,7 +212,8 @@ if __name__ == "__main__":
     parser.add_argument("output", type=Path)
     parser.add_argument("--entries", nargs=2, type=lambda value: int(value, 0),
                         metavar=("ALLOC_RVA", "FREE_RVA"))
+    parser.add_argument("--group-entry", help="Grouped allocation caller RVA or the fixture export heap_group")
     args = parser.parse_args()
     if args.output.suffix.lower() != ".cpp" or args.output.resolve() == args.image.resolve():
         parser.error("choose a distinct .cpp output")
-    args.output.write_text(generate(args.image, args.entries), encoding="ascii")
+    args.output.write_text(generate(args.image, args.entries, args.group_entry), encoding="ascii")

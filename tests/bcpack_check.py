@@ -10,6 +10,34 @@ from bcpack_probe import probe, scan_lanes
 
 
 class TextureChecks(unittest.TestCase):
+    def test_forward_decode_supplied_refills(self) -> None:
+        prefix = bytearray(48)
+        # Mode DD has eight escape slots. Encoding 100,000 fixed symbols
+        # backwards from 2**24 emits E3 then 93 and leaves state 030B87C1.
+        prefix[3::8] = bytes.fromhex("dd 05 03 0b 87 c1")
+        for second, status in ((b"\xe3", "verified_constant_lane_with_supplied_refills"),
+                               (b"\xe2", "header_match")):
+            result, = probe(prefix, 100000, prefetch_mask=0x09, prefetch=b"\xaa\x93",
+                            next_mask=0x18, next_bytes=second + b"\xbb")
+            self.assertEqual(result["status"], status)
+            if second == b"\xe3":
+                self.assertEqual(result["refill_symbol_indices"], [9129, 54564])
+            else:
+                self.assertNotIn("refill_symbol_indices", result)
+
+        partial, = probe(prefix, 100000, prefetch_mask=0x08, prefetch=b"\x93")
+        self.assertEqual(partial["status"], "header_match")
+
+        # At 50,000 symbols the same model needs just E3, supplied in round two.
+        prefix[3::8] = bytes.fromhex("dd 04 01 be a9 cd")
+        delayed, = probe(prefix, 50000, prefetch_mask=0x01, prefetch=b"\xaa",
+                         next_mask=0x08, next_bytes=b"\xe3")
+        self.assertEqual(delayed["refill_symbol_indices"], [4564])
+        surplus, = probe(prefix, 50000, prefetch_mask=0x08, prefetch=b"\xe3",
+                         next_mask=0x08, next_bytes=b"\x00")
+        self.assertEqual(surplus["status"], "header_match")
+        self.assertEqual(surplus["unbudgeted_read_offsets"], [49])
+
     def test_constant_lane_with_two_refills(self):
         prefix = bytearray(48)
         prefix[4::8] = bytes.fromhex("de 05 03 0c 86 4e")
@@ -30,6 +58,30 @@ class TextureChecks(unittest.TestCase):
             self.assertEqual(result["second_refill_matches"], expected)
         with self.assertRaises(ValueError):
             probe(prefix, 25000, next_mask=0x10)
+
+    def test_refill_follows_lane_read_count(self):
+        prefix = bytearray(48)
+        prefix[4::8] = bytes.fromhex("de 05 03 0c 86 4e")
+        # Lane 4 skips the first round, so its first read in the second round takes AC.
+        for byte, expected in ((0xAC, True), (0x7D, False)):
+            result, = probe(prefix, 25000, prefetch_mask=0x01, prefetch=b"\x00",
+                            next_mask=0x11, next_bytes=bytes([0, byte]))
+            self.assertEqual(result["first_refill_offset"], 50)
+            self.assertEqual(result["first_refill_matches"], expected)
+            self.assertNotIn("second_refill_offset", result)
+
+        # The one-refill lane has no byte left for a second read.
+        prefix[4::8] = bytes.fromhex("de 04 01 00 11 30")
+        result, = probe(prefix, 11358, prefetch_mask=0x10, prefetch=b"\x7d",
+                        next_mask=0x11, next_bytes=b"\x00\x00")
+        self.assertTrue(result["first_refill_matches"])
+        self.assertEqual(result["unbudgeted_read_offsets"], [50])
+        self.assertNotIn("second_refill_offset", result)
+        # A verified constant lane reads nothing after its header.
+        prefix[4::8] = bytes.fromhex("de 03 01 00 40 02")
+        result, = probe(prefix, 2, prefetch_mask=0x10, prefetch=b"\x00")
+        self.assertEqual((result["status"], result["unbudgeted_read_offsets"]), ("verified_constant_lane", [48]))
+        self.assertNotIn("first_refill_matches", result)
 
     def test_constant_lane(self):
         prefix = bytearray(48)
@@ -93,6 +145,32 @@ class TextureChecks(unittest.TestCase):
         for size, level in ((64, 0), (8, 7), (1, 8)):
             with self.assertRaises(ValueError):
                 linearize_4k_s_tail(tile, size, size, level)
+
+    def test_partial_tail_reads(self) -> None:
+        class CountedTile(bytes):
+            bytes_read: int = 0
+
+            def __getitem__(self, key: int | slice) -> int | bytes:
+                value = super().__getitem__(key)
+                self.bytes_read += 1 if isinstance(value, int) else len(value)
+                return value
+
+        # Each physical block carries its own address in all sixteen bytes.
+        tile = CountedTile(b"".join(bytes([index]) * 16 for index in range(256)))
+        # At level zero the fifth block in a row crosses a swizzle boundary.
+        for width, height, level, addresses in (
+            (17, 5, 0, (128, 132, 136, 140, 160, 129, 133, 137, 141, 161)),
+            (1, 1, 7, (0,)),
+        ):
+            with self.subTest(level=level):
+                tile.bytes_read = 0
+                expected = b"".join(bytes([index]) * 16 for index in addresses)
+                self.assertEqual(linearize_4k_s_tail(tile, width, height, level), expected)
+                self.assertLessEqual(tile.bytes_read, len(expected))
+
+        for size in (4095, 4097):
+            with self.assertRaises(ValueError):
+                linearize_4k_s_tail(bytes(size), 1, 1, 7)
 
 
 if __name__ == "__main__":

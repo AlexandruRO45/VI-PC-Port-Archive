@@ -1,4 +1,5 @@
 #include "../src/rgb9e5.hlsli"
+#include "../src/ffx_float_to_int.hlsli"
 
 #define SCRATCH_ROOT "UAV(u11)"
 #define PRODUCER_ROOT "DescriptorTable(UAV(u2), UAV(u1), UAV(u6)), SRV(t3), SRV(t9), UAV(u11), UAV(u12)"
@@ -37,6 +38,58 @@ int median_i(int a, int b, int c) { return max(min(a,b), min(max(a,b),c)); }
 float median_f(float a, float b, float c) { return max(min(a,b), min(max(a,b),c)); }
 uint insert_byte(uint old, uint lane, uint value) {
     return (old & ~(255u << (8*lane))) | (value << (8*lane));
+}
+uint bfe_u(uint src, uint offset, uint width) {
+    uint count = min(width, 32u);
+    return count != 0u ? (src >> (offset & 31u)) & (0xffffffffu >> ((32u - count) & 31u)) : 0u;
+}
+int bfe_i(uint src, uint offset, uint width) {
+    uint count = min(width, 32u);
+    uint shift = (32u - count) & 31u;
+    int shifted = asint(src) >> (offset & 31u);
+    return count != 0u ? (asint(uint(shifted) << shift) >> shift) : 0;
+}
+uint sadd_u(uint a, uint b, out uint scc) {
+    uint r = a + b;
+    scc = r < a ? 1u : 0u;
+    return r;
+}
+uint slshl4_add_u(uint a, uint b, out uint scc) {
+    uint shifted = a << 4;
+    uint r = shifted + b;
+    scc = ((a >> 28) != 0u || r < shifted) ? 1u : 0u;
+    return r;
+}
+uint sadd_i(uint a, uint b, out uint scc) {
+    uint r = a + b;
+    scc = (~(a ^ b) & (a ^ r)) >> 31;
+    return r;
+}
+uint ssub_i(uint a, uint b, out uint scc) {
+    uint r = a - b;
+    scc = ((a ^ b) & (a ^ r)) >> 31;
+    return r;
+}
+uint smin_u(uint a, uint b, out uint scc) {
+    scc = a < b ? 1u : 0u;
+    return scc != 0u ? a : b;
+}
+uint smax_u(uint a, uint b, out uint scc) {
+    scc = a > b ? 1u : 0u;
+    return scc != 0u ? a : b;
+}
+uint smin_i(uint a, uint b, out uint scc) {
+    scc = asint(a) < asint(b) ? 1u : 0u;
+    return scc != 0u ? a : b;
+}
+uint smax_i(uint a, uint b, out uint scc) {
+    scc = asint(a) > asint(b) ? 1u : 0u;
+    return scc != 0u ? a : b;
+}
+uint sabs_i(uint a, out uint scc) {
+    uint r = asint(a) < 0 ? 0u - a : a;
+    scc = r != 0u ? 1u : 0u;
+    return r;
 }
 int idot(uint a, uint b, int sum) {
     [unroll] for (int i=0; i<4; ++i) {

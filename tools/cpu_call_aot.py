@@ -1,4 +1,4 @@
-"""Recompile a bounded Windows x64 caller with one direct or ordinary import call."""
+"""Recompile a bounded Windows x64 caller with direct calls or one ordinary import call."""
 
 import argparse
 from pathlib import Path
@@ -14,7 +14,27 @@ OPERATORS = {0x89: "=", 0x8b: "=", 0x01: "+=", 0x03: "+=",
              0x29: "-=", 0x2b: "-=", 0x31: "^=", 0x33: "^="}
 
 
-def lift_body(start, code, *, caller, bind_import=None):
+def r8_register_move(body, pos):
+    """Decode a 64-bit register move between R8 and a profile GPR as (write, read)."""
+    if pos + 3 > len(body) or body[pos + 2] >> 6 != 3:
+        return None
+    rex, opcode, modrm = body[pos:pos + 3]
+    reg, rm = GPR.get((modrm >> 3) & 7), GPR.get(modrm & 7)
+    # REX.B selects R8 in the r/m field and REX.R selects it in the reg field.
+    if rex == 0x49 and modrm & 7 == 0 and reg:
+        return {0x8b: (reg, "r8"), 0x89: ("r8", reg)}.get(opcode)
+    if rex == 0x4c and (modrm >> 3) & 7 == 0 and rm:
+        return {0x8b: ("r8", rm), 0x89: (rm, "r8")}.get(opcode)
+    return None
+
+
+def callee_name(index):
+    # The first callee keeps the name used before more than one target was supported.
+    return "lifted_callee" if index == 0 else f"lifted_callee{index + 1}"
+
+
+def lift_body(start, code, *, caller, bind_import=None, name=None,
+              allow_distinct_imports=False):
     # In this profile only RBX/RSI survive the call. The host compiler owns
     # physical register allocation and emits its own ABI frame for each function.
     frame = 40 if caller else 8
@@ -24,8 +44,11 @@ def lift_body(start, code, *, caller, bind_import=None):
         raise ValueError(f"unsupported save/restore frame at RVA {start:#x}")
     body = code[len(prologue):-len(epilogue)]
     available = {"rcx", "rdx", "r8"}
+    # Registers that hold the entry R8 value, so stores stay inside the trace.
+    pointer = {"r8"}
     lines = []
     target = None
+    imported_symbols = {}
     pos = 0
     while pos < len(body):
         rva = start + len(prologue) + pos
@@ -33,9 +56,14 @@ def lift_body(start, code, *, caller, bind_import=None):
         write = None
         via_iat = body[pos:pos + 2] == b"\xff\x15"
         is_call = via_iat or body[pos] == 0xe8
+        r8_move = r8_register_move(body, pos)
         if is_call:
-            if not caller or target is not None:
+            # Direct calls may repeat or name further targets, and each distinct
+            # target is lifted once. Import slots require an explicit binding.
+            if not caller:
                 raise ValueError(f"unexpected additional call at RVA {rva:#x}")
+            if target is not None and (target[0] == "import") != via_iat:
+                raise ValueError(f"mixed import and direct calls at RVA {rva:#x}")
             length = 6 if via_iat else 5
             if pos + length > len(body):
                 raise ValueError(f"truncated call at RVA {rva:#x}")
@@ -43,16 +71,32 @@ def lift_body(start, code, *, caller, bind_import=None):
             if via_iat:
                 if bind_import is None:
                     raise ValueError(f"no provider binding for IAT slot RVA {address:#x}")
-                name = bind_import(address)
-                target = ("import", name)
-                callee = f"::{name}"
+                if target is not None and target[1] != address and not allow_distinct_imports:
+                    raise ValueError(f"call to a second IAT slot at RVA {rva:#x}")
+                if address not in imported_symbols:
+                    imported_symbols[address] = bind_import(address)
+                symbol = imported_symbols[address]
+                if target is None:
+                    target = ("import", address, symbol)
+                callee = f"::{symbol}"
             else:
-                target = ("direct", address)
-                callee = "lifted_callee"
+                if target is None:
+                    target = ("direct", [])
+                if address not in target[1]:
+                    target[1].append(address)
+                callee = callee_name(target[1].index(address))
             reads = {"rcx", "rdx", "r8"}
             statement = f"rax = {callee}(rcx, rdx, r8);"
             write = "rax"
             pos += length
+        elif r8_move:
+            write, source = r8_move
+            reads = {source}
+            if write == "r8":
+                statement = f"r8 = reinterpret_cast<word*>({source});"
+            else:
+                statement = f"{write} = reinterpret_cast<word>(r8);"
+            pos += 3
         elif body[pos:pos + 2] == b"\x49\x89" and pos + 3 <= len(body):
             modrm = body[pos + 2]
             src = GPR.get((modrm >> 3) & 7)
@@ -93,15 +137,24 @@ def lift_body(start, code, *, caller, bind_import=None):
 
         if not reads <= available:
             raise ValueError(f"undefined register at RVA {rva:#x}: {sorted(reads - available)}")
+        if r8_move and write == "r8" and source not in pointer:
+            raise ValueError(f"R8 reloaded without the output pointer at RVA {rva:#x}")
         if is_call:
             available.intersection_update({"rbx", "rsi"})
+            pointer.intersection_update({"rbx", "rsi"})
         if write:
             available.add(write)
+            # Only an R8 move copies the output pointer; any other write replaces it.
+            if r8_move:
+                pointer.add(write)
+            else:
+                pointer.discard(write)
         lines.append("    " + statement)
 
     if "rax" not in available or (caller and target is None):
         raise ValueError(f"missing return value or call at RVA {start:#x}")
-    name = "lifted" if caller else "lifted_callee"
+    if name is None:
+        name = "lifted" if caller else "lifted_callee"
     signature = f'extern "C" __declspec(dllexport) __declspec(noinline) word {name}(word rcx, word rdx, word* r8)'
     return "\n".join([signature + " {", "    word rax, rbx, rsi;", *lines, "    return rax;", "}"]), target
 
@@ -149,17 +202,27 @@ def translate(image, entry, binding=None, link_name=None):
         def bind_import(slot):
             return resolve_import(pe, slot, Path(binding[0]), binding[1], link_name)
 
-        caller, (kind, target) = lift_body(start, code, caller=True, bind_import=bind_import if binding else None)
+        caller, target_info = lift_body(start, code, caller=True, bind_import=bind_import if binding else None)
+        kind = target_info[0]
         if kind == "import":
-            callee = f'extern "C" __declspec(dllimport) word {target}(word, word, word*);'
+            callees = [f'extern "C" __declspec(dllimport) word {target_info[2]}(word, word, word*);']
         else:
+            target = target_info[1]
             if binding:
                 raise ValueError("provider binding supplied for a direct call")
-            callee_code = bounded_code(pe, target)
-            if target < start + len(code) and start < target + len(callee_code):
-                raise ValueError(f"overlapping call target at RVA {target:#x}")
-            callee, _ = lift_body(target, callee_code, caller=False)
-    return f"#include <cstdint>\nusing word = std::uint64_t;\n{callee}\n\n{caller}\n"
+            intervals = [(start, start + len(code))]
+            callees = []
+            for index, address in enumerate(target):
+                callee_code = bounded_code(pe, address)
+                end = address + len(callee_code)
+                # Each target must own an interval apart from the caller and the other callees.
+                if any(address < high and low < end for low, high in intervals):
+                    raise ValueError(f"overlapping call target at RVA {address:#x}")
+                intervals.append((address, end))
+                callee, _ = lift_body(address, callee_code, caller=False, name=callee_name(index))
+                callees.append(callee)
+    body = "\n\n".join([*callees, caller])
+    return f"#include <cstdint>\nusing word = std::uint64_t;\n{body}\n"
 
 
 if __name__ == "__main__":

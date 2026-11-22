@@ -46,4 +46,33 @@ invalid:
     mov eax,6
     ret
 fixture_query ENDP
+
+high_byte_probe PROC FRAME
+    .endprolog
+    mov rax,rcx
+    add ah,dh
+    test ah,1
+    jz even_high
+    xor ch,al
+    mov r8,rdx
+    movzx edx,ch
+    xor rax,rdx
+    mov rdx,r8
+even_high:
+    cmp dh,ah
+    jae done
+    mov dh,ch
+    movzx ecx,dh
+    add rax,rcx
+done:
+    ret
+high_byte_probe ENDP
+
+addr32_probe PROC FRAME
+    .endprolog
+    lea rax,[ecx+edx*2+4]
+    lea r8,[ecx+1]
+    xor rax,r8
+    ret
+addr32_probe ENDP
 END

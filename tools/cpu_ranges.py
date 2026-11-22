@@ -27,10 +27,11 @@ def function_ranges(pe, entry):
             raise ValueError(f"invalid runtime-function interval at {begin:#x}")
         previous = end
         header = image_bytes(pe, info, 4)
+        version = header[0] & 7
         flags = header[0] >> 3
         parent = None
         if flags & 4:
-            if flags != 4 or header[0] & 7 != 1:
+            if flags != 4 or version not in (1, 2):
                 raise ValueError(f"unsupported chained unwind header at {info:#x}")
             trailer = info + 4 + ((header[2] + 1) & ~1) * 2
             parent = struct.unpack("<III", image_bytes(pe, trailer, 12))

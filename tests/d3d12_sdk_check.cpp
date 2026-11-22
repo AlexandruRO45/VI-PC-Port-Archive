@@ -28,13 +28,20 @@ int main(int argc, char** argv)
         desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
         desc.Desc_1_1.NumParameters = 1;
         desc.Desc_1_1.pParameters = &root_parameter;
-        ComPtr<ID3DBlob> control, observed;
+        ComPtr<ID3DBlob> control;
         HRESULT plain = D3D12SerializeVersionedRootSignature(&desc, &control, nullptr);
-        desc.Desc_1_1.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(0x03000000);
-        HRESULT tagged = D3D12SerializeVersionedRootSignature(&desc, &observed, nullptr);
-        std::printf("v1.1 control=0x%08lx flags_03000000=0x%08lx\n",
-                    static_cast<unsigned long>(plain), static_cast<unsigned long>(tagged));
-        return SUCCEEDED(plain) && control.Get() && tagged == E_INVALIDARG && !observed.Get() ? 0 : 1;
+        std::printf("v1.1 control=0x%08lx", static_cast<unsigned long>(plain));
+        bool rejected = SUCCEEDED(plain) && control.Get();
+        // Each console bit is tested alone before the pair, so a change in one bit is visible on its own.
+        for (const unsigned flags : {0x01000000u, 0x02000000u, 0x03000000u}) {
+            ComPtr<ID3DBlob> observed;
+            desc.Desc_1_1.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(flags);
+            HRESULT tagged = D3D12SerializeVersionedRootSignature(&desc, &observed, nullptr);
+            std::printf(" flags_%08x=0x%08lx", flags, static_cast<unsigned long>(tagged));
+            rejected = rejected && tagged == E_INVALIDARG && !observed.Get();
+        }
+        std::puts("");
+        return rejected ? 0 : 1;
     }
     ComPtr<ID3DBlob> blob;
     HRESULT hr = D3D12SerializeVersionedRootSignature(&input, &blob, nullptr);

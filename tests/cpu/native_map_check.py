@@ -13,7 +13,10 @@ import pefile
 from direct_check import input_pairs, observe, reference, register_probe
 
 Resolver = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32)
-STATUS = {"ok": 0, "format": 2, "unresolved": 5, "unsupported": 6, "init_failed": 9}  # MapStatus in tools/pe_map.cpp
+STATUS = {
+    "ok": 0, "format": 2, "relocation": 4, "unresolved": 5,
+    "unsupported": 6, "function_table": 8, "init_failed": 9,
+}  # MapStatus in tools/pe_map.cpp
 kernel = ctypes.WinDLL("kernel32", use_last_error=True)
 kernel.GetProcAddress.argtypes = [wintypes.HMODULE, ctypes.c_void_p]
 kernel.GetProcAddress.restype = ctypes.c_void_p
@@ -35,11 +38,15 @@ class Mapper:
         self.export = lib.pe_map_export
         self.export.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         self.export.restype = ctypes.c_void_p
+        self.resolved = lib.pe_map_export_resolved
+        self.resolved.argtypes = [ctypes.c_void_p, ctypes.c_char_p, Resolver]
+        self.resolved.restype = ctypes.c_void_p
         self.release = lib.pe_map_release
         self.release.argtypes = [ctypes.c_void_p]
+        self.release.restype = ctypes.c_int  # 1 released, 0 unknown or already released
 
     def __call__(self, image, bindings):
-        """Map image; bindings maps a lower-case DLL name to the module that serves its imports."""
+        """Map image; bindings maps a DLL name to a host module or a dictionary of mapped export addresses."""
         requests = []
 
         def resolve(dll, name, ordinal):
@@ -47,6 +54,8 @@ class Mapper:
             module = bindings.get(dll.decode().casefold())
             if module is None:
                 return None
+            if isinstance(module, dict):
+                return module.get(name if name else ordinal)
             return kernel.GetProcAddress(module._handle, name if name else ordinal)
 
         callback = Resolver(resolve)
@@ -245,7 +254,8 @@ def check_delay_directory(mapper, image, provider):
         ("address 0, Size 32", [(size, 32)], "ok", ""),
         ("address past the image", [(address, image_size + 0x1000), (size, 32)], "format",
          "delay import directory outside image"),
-        ("descriptor naming a DLL, Size 0", [(address, named)], "unsupported", "delay imports"),
+        ("descriptor naming a DLL, Size 0", [(address, named)], "unsupported",
+         "delay imports without RVA attributes"),
     )
     bindings = {provider.name.casefold(): ctypes.CDLL(str(provider))}
     for name, edits, expected, message in cases:
@@ -268,7 +278,65 @@ def check_delay_directory(mapper, image, provider):
                 or bool(requests) != (expected == "ok"):
             raise AssertionError(f"delay {name}: {base=} {status=} {detail=} {requests=}")
     print(f"{image.name}: Windows loads every delay-import variant; pe_map maps an address of 0 and an empty "
-          "table, and rejects a directory past the image (format) and a descriptor naming a DLL (unsupported)")
+          "table, and rejects a directory past the image (format) and a descriptor naming a DLL without RVA "
+          "attributes (unsupported)")
+
+
+kernel.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD]
+kernel.VirtualAlloc.restype = ctypes.c_void_p
+kernel.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD]
+
+
+def check_reloc_address_zero(mapper, image, provider, *, oversized):
+    """Compare a zero directory RVA with the linked size or a size larger than the image."""
+    preferred, _, stored, _ = describe(image)
+    (rva, value), = stored.items()
+    with pefile.PE(str(image)) as pe:
+        relocs = pe.OPTIONAL_HEADER.DATA_DIRECTORY[5]
+        address = relocs.get_field_absolute_offset("VirtualAddress")
+        size_field = relocs.get_field_absolute_offset("Size")
+        built = relocs.Size
+        size = pe.OPTIONAL_HEADER.SizeOfImage
+    if not built:
+        raise AssertionError(f"{image.name}: fixture must have a relocation directory")
+    data = bytearray(image.read_bytes())
+    struct.pack_into("<I", data, address, 0)
+    if oversized:
+        built = size + 1
+        struct.pack_into("<I", data, size_field, built)
+    bindings = {provider.name.casefold(): ctypes.CDLL(str(provider))}
+    with TemporaryDirectory() as temp:
+        copy = Path(temp) / image.name
+        copy.write_bytes(data)
+        (Path(temp) / provider.name).write_bytes(provider.read_bytes())
+        # Hold the preferred base so neither loader can map the copy there. If the reservation fails,
+        # part of that range is already in use, which blocks it just as well; the bases are checked below.
+        held = kernel.VirtualAlloc(preferred, size, 0x2000, 0x01)  # MEM_RESERVE, PAGE_NOACCESS
+        try:
+            # Windows: the copy has no entry point, so loading it runs nothing in the image.
+            module = kernel.LoadLibraryExW(str(copy), None, LOAD_ALTERED_SEARCH)
+            if not module:
+                raise AssertionError(f"relocations at address 0: LoadLibraryExW failed with {ctypes.get_last_error()}")
+            try:
+                windows = module, ctypes.c_uint64.from_address(module + rva).value
+            finally:
+                kernel.FreeLibrary(module)
+            base, status, detail, _ = mapper(copy, bindings)
+        finally:
+            if held:
+                kernel.VirtualFree(held, 0, 0x8000)  # MEM_RELEASE
+    if status != STATUS["ok"] or not base:
+        raise AssertionError(f"relocations at address 0, Size {built}: pe_map failed with {status}: {detail}")
+    try:
+        mapped = base, ctypes.c_uint64.from_address(base + rva).value
+    finally:
+        mapper.release(base)
+    for name, (at, slot) in (("LoadLibraryExW", windows), ("pe_map", mapped)):
+        if at == preferred or slot != value:
+            raise AssertionError(f"relocations at address 0: {name} mapped at {at:#x} (preferred {preferred:#x}) "
+                                 f"with DIR64 at {rva:#x} holding {slot:#x}, expected the linked {value:#x}")
+    print(f"{image.name}: relocation directory at address 0 with Size {built} is ignored by LoadLibraryExW and "
+          f"pe_map; both map away from {preferred:#x} and leave the DIR64 entry at {value:#x}")
 
 
 def check_empty_export_slot(mapper, image):
@@ -296,6 +364,100 @@ def check_empty_export_slot(mapper, image):
     print(f"{image.name}: empty export slot returns null, probe still resolves")
 
 
+def check_unreadable_export(mapper, image):
+    """Map a copy whose export section cannot be read: lookup must return null, not a pointer into it.
+
+    A section can be mapped without read access by its characteristics. The export directory, its
+    three tables and each name string must be checked against the live protection before they are
+    read, so a lookup returns null instead of faulting or returning a pointer into an unreadable page.
+    """
+    with pefile.PE(str(image)) as pe:
+        export = pe.OPTIONAL_HEADER.DATA_DIRECTORY[0]
+        span = lambda s: max(s.Misc_VirtualSize, s.SizeOfRawData)
+        section = next(s for s in pe.sections
+                       if s.VirtualAddress <= export.VirtualAddress < s.VirtualAddress + span(s))
+        offset = (pe.OPTIONAL_HEADER.get_file_offset() + pe.FILE_HEADER.SizeOfOptionalHeader
+                  + pe.sections.index(section) * 40 + 36)  # Characteristics in IMAGE_SECTION_HEADER
+        characteristics = section.Characteristics
+    cases = (("no read", characteristics & ~0x40000000),
+             ("execute only", (characteristics & ~0x40000000) | 0x20000000))
+    for name, value in cases:
+        data = bytearray(image.read_bytes())
+        struct.pack_into("<I", data, offset, value)
+        with TemporaryDirectory() as temp:
+            copy = Path(temp) / image.name
+            copy.write_bytes(data)
+            base, status, detail, requests = mapper(copy, {})
+        if not base or status != STATUS["ok"] or requests:
+            raise AssertionError(f"unreadable export {name}: map failed with {status}: {detail}")
+        try:
+            resolved = [mapper.export(base, symbol) for symbol in (b"probe", b"clobber_control")]
+        finally:
+            mapper.release(base)
+        if any(resolved):
+            raise AssertionError(f"unreadable export {name}: lookup returned {resolved}")
+    print(f"{image.name}: export lookup returns null when the export section has no read access")
+
+
+def check_reloc_and_pdata_bounds(mapper, image, provider):
+    """Record native loader observations and check the mapper against its supported directory bounds."""
+    with pefile.PE(str(image)) as pe:
+        relocs = pe.OPTIONAL_HEADER.DATA_DIRECTORY[5]
+        reloc_size = relocs.get_field_absolute_offset("Size")
+        block_size = pe.get_offset_from_rva(relocs.VirtualAddress) + 4
+        orig_block_len = pe.get_dword_at_rva(relocs.VirtualAddress + 4)
+        pdata = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]
+        pdata_size = pdata.get_field_absolute_offset("Size")
+        export_rva = next(e.address for e in pe.DIRECTORY_ENTRY_EXPORT.symbols if e.name == b"call_mix")
+    bindings = {provider.name.casefold(): ctypes.CDLL(str(provider))}
+    cases = (
+        ("reloc Size=4", [(reloc_size, 4)], "relocation", "bad relocation block", False),
+        ("reloc trailing +4", [(reloc_size, relocs.Size + 4)], "relocation", "bad relocation block", False),
+        ("reloc odd SizeOfBlock leaving 1 byte", [(block_size, orig_block_len - 1)],
+         "relocation", "bad relocation block", False),
+        ("reloc odd SizeOfBlock matching Size", [(block_size, orig_block_len - 1), (reloc_size, orig_block_len - 1)],
+         "relocation", "bad relocation block", False),
+        ("pdata Size=0 with non-zero RVA", [(pdata_size, 0)], "ok", "", True),
+        ("pdata Size=11", [(pdata_size, 11)], "function_table", "cannot register .pdata", True),
+        ("pdata Size=20", [(pdata_size, 20)], "function_table", "cannot register .pdata", True),
+    )
+    preferred, _, _, _ = describe(image)
+    for name, edits, expected, message, want_requests in cases:
+        data = bytearray(image.read_bytes())
+        for offset, value in edits:
+            struct.pack_into("<I", data, offset, value)
+        with TemporaryDirectory() as temp:
+            copy = Path(temp) / image.name
+            copy.write_bytes(data)
+            (Path(temp) / provider.name).write_bytes(provider.read_bytes())
+            ctypes.set_last_error(0)
+            module = kernel.LoadLibraryExW(str(copy), None, LOAD_SEARCH)
+            err = ctypes.get_last_error()
+            try:
+                found = None
+                if module:
+                    image_base = ctypes.c_uint64()
+                    found = bool(lookup_entry(module + export_rva, ctypes.byref(image_base), None))
+                print(f"{name}: Windows build {sys.getwindowsversion().build}, module={module}, "
+                      f"preferred={preferred:#x}, error={err}, function_entry={found}")
+            finally:
+                if module:
+                    kernel.FreeLibrary(module)
+            base, status, detail, requests = mapper(copy, bindings)
+        if base:
+            try:
+                if expected == "ok":
+                    owner = ctypes.c_uint64()
+                    if lookup_entry(base + export_rva, ctypes.byref(owner), None):
+                        raise AssertionError(f"{name}: unexpectedly registered an unwind entry")
+            finally:
+                mapper.release(base)
+        if bool(base) != (expected == "ok") or status != STATUS[expected] or detail != message or bool(requests) != want_requests:
+            raise AssertionError(f"{name}: {base=} {status=} {detail=} {requests=}")
+    print(f"{image.name}: compared trailing relocation bytes, odd SizeOfBlock and unaligned .pdata "
+          "under LoadLibraryExW and pe_map")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mapper", type=Path)
@@ -310,7 +472,10 @@ def main():
     mapper = Mapper(args.mapper)
     probe = register_probe(str(args.probe))
     check_empty_export_slot(mapper, args.probe)
+    check_unreadable_export(mapper, args.probe)
     check_delay_directory(mapper, args.named[0], args.named[2])
+    for oversized in (False, True):
+        check_reloc_address_zero(mapper, args.reloc[0], args.reloc[1], oversized=oversized)
     for case, paths, symbol in (("named", args.named, "mix_args"), ("ordinal", args.ordinal, 77)):
         original, lifted, provider, altered = paths
         natives = [("native LoadLibrary", ctypes.CDLL(str(original)).call_mix),
@@ -324,6 +489,7 @@ def main():
         raise AssertionError("relocation fixture must have exactly one DIR64 entry")
     check_mapping(mapper, "relocated", original, provider, "mix_args", probe, natives)
     check_mapping(mapper, "relocated with altered shim", original, provider, "mix_args", probe, [], altered)
+    check_reloc_and_pdata_bounds(mapper, original, provider)
     image, *providers = args.two
     check_import_walk(mapper, image, providers)
 

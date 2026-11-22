@@ -24,14 +24,18 @@ def sections(data):
 def scan_window(data, base, first, last):
     valid = 0
     layouts = Counter()
-    # A common RFC 1950 header with a 32 KiB history and no preset dictionary.
-    for m in re.finditer(b"\x78[\x01\x5e\x9c\xda]", data):
-        pos = m.start()
-        if (base + pos) % 16:
+    # RFC 1950 CMF bytes for DEFLATE with a window exponent from 8 through 15.
+    first_aligned = -base % 16
+    window = memoryview(data)
+    aligned_methods = bytes(data[first_aligned:-1:16])
+    for match in re.finditer(rb"[\x08\x18\x28\x38\x48\x58\x68\x78]", aligned_methods):
+        pos = first_aligned + match.start() * 16
+        flags = data[pos + 1]
+        if flags & 0x20 or (data[pos] * 256 + flags) % 31:
             continue
         decoder = zlib.decompressobj()
         try:
-            decoded = decoder.decompress(memoryview(data)[pos:pos + (256 << 10)], (256 << 10) + 1)
+            decoded = decoder.decompress(window[pos:pos + (256 << 10)], (256 << 10) + 1)
         except zlib.error:
             continue
         if not decoder.eof or len(decoded) > 256 << 10:

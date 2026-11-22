@@ -1,8 +1,10 @@
+#define NOMINMAX
 #include "bvh_fixture.h"
 #include "dxr_fixture.h"
 #include "TraceHits.h"
 #include "WriteScene.h"
 #include "ExpandLeaves.h"
+#include <algorithm>
 
 using namespace bvh_fixture;
 namespace {
@@ -73,8 +75,26 @@ std::vector<Ray> make_rays() {
         rays.push_back({x-1,.25f,0,0, .5f,.125f,1,40});
     }
     rays.push_back({0,0,0,0, 1,0,0,40});               // Parallel, off every plane.
+    rays.push_back({-1,.5f,1,0, 1,0,0,40});            // In the first row's plane.
+    rays.push_back({-1,.5f,1,0, 1,0,0,9});             // Ends on the third box's face.
     rays.push_back({-10,-10,0,0, 0,0,1,40});
     return rays;
+}
+// Closed parametric overlap of a ray lying in a leaf's plane with its 2x2 square.
+bool in_plane_box(const Leaf& leaf, const Ray& r) {
+    double nearT = r.nearT, farT = r.farT;
+    const double origin[]{r.x, r.y}, direction[]{r.dx, r.dy}, low[]{leaf.x, leaf.y};
+    for (int axis = 0; axis < 2; ++axis) {
+        if (direction[axis] == 0) {
+            if (origin[axis] < low[axis] || origin[axis] > low[axis] + 2) return false;
+            continue;
+        }
+        const double a = (low[axis] - origin[axis]) / direction[axis];
+        const double b = (low[axis] + 2 - origin[axis]) / direction[axis];
+        nearT = std::max(nearT, std::min(a, b));
+        farT = std::min(farT, std::max(a, b));
+    }
+    return nearT <= farT;
 }
 template<size_t N>
 Row reference(const std::array<Leaf, N>& scene, const Ray& r) {
@@ -82,7 +102,11 @@ Row reference(const std::array<Leaf, N>& scene, const Ray& r) {
     // Brute-force analytic plane intersections in double precision. No
     // packed addresses, BVH traversal, compaction or wave ordering involved.
     for (const auto& leaf : scene) {
-        if (r.dz == 0) continue; // Parallel fixture ray starts below every box.
+        if (r.dz == 0) {
+            // A coplanar ray can enter the flat box but never hits the triangle.
+            result[2] += r.z == leaf.z && in_plane_box(leaf, r);
+            continue;
+        }
         const double t = (double(leaf.z) - r.z) / r.dz;
         const double x = r.x + t*r.dx - leaf.x, y = r.y + t*r.dy - leaf.y;
         if (t < r.nearT || t > r.farT || x < 0 || x > 2 || y < 0 || y > 2) continue;

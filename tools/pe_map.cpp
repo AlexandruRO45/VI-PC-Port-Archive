@@ -1,11 +1,13 @@
 // Map an x64 PE image without LoadLibrary and bind its imports through a host resolver.
-// Scope: DIR64 relocations, ordinary imports by name or ordinal, section protections, .pdata
-// registration, TLS callbacks and the entry point. TLS data templates and delay imports are rejected.
-// Header fields are checked against the file or SizeOfImage before they are used.
+// Scope: DIR64 relocations, ordinary and delay imports by name or ordinal, section protections,
+// .pdata registration, TLS callbacks and the entry point. Delay imports are bound eagerly: the
+// image's delay-load helper would call LoadLibrary and bypass the host resolver. TLS data
+// templates are rejected. Header fields are checked against the file or SizeOfImage before use.
 #include <windows.h>
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <new>
 #include <string>
@@ -115,8 +117,40 @@ bool readable(const void* address, std::size_t size) {
     return true;
 }
 
+// True if the page at address is committed and neither guarded nor PAGE_NOACCESS. Unlike
+// readable(), this accepts execute-only pages, which can hold exported code GetProcAddress returns.
+bool accessible(const void* address) {
+    MEMORY_BASIC_INFORMATION info{};
+    if (!VirtualQuery(address, &info, sizeof(info)) || info.State != MEM_COMMIT) return false;
+    const DWORD access = info.Protect & 0xff;
+    return !(info.Protect & PAGE_GUARD) && access != PAGE_NOACCESS;
+}
+
+// A NUL-terminated string inside the image, scanned only across readable committed pages.
+// Returns null if the string would require reading past the image or an unreadable page.
+const char* readable_string(const Image& image, std::uint64_t rva) {
+    if (rva >= image.size) return nullptr;
+    const auto* start = image.base + rva;
+    for (std::uint64_t scanned = 0; scanned < image.size - rva;) {
+        const auto* cursor = start + scanned;
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(cursor, &info, sizeof(info)) || info.State != MEM_COMMIT) return nullptr;
+        const DWORD access = info.Protect & 0xff;
+        if ((info.Protect & PAGE_GUARD) || access == PAGE_NOACCESS || access == PAGE_EXECUTE) return nullptr;
+        const auto offset = static_cast<std::uint64_t>(cursor - static_cast<const std::uint8_t*>(info.BaseAddress));
+        const std::uint64_t run = info.RegionSize - offset;
+        const std::uint64_t left = image.size - rva - scanned;
+        const std::uint64_t span = run < left ? run : left;
+        if (std::memchr(cursor, 0, static_cast<std::size_t>(span))) return reinterpret_cast<const char*>(start);
+        scanned += span;
+    }
+    return nullptr;
+}
+
 constexpr std::uint64_t MAX_TLS_CALLBACKS = 256;
 constexpr const char* TOO_MANY_TLS_CALLBACKS = "more than 256 TLS callbacks";
+// dlattrRva: descriptor fields hold RVAs instead of virtual addresses. Every x64 linker sets it.
+constexpr DWORD DELAY_IMPORT_RVA_BASED = 1;
 
 // TLS callbacks of a mapped, relocated image in table order. Returns null or the reason the list is rejected.
 const char* tls_callbacks(const Image& image, const IMAGE_NT_HEADERS64* nt, std::vector<PIMAGE_TLS_CALLBACK>& out) {
@@ -178,7 +212,110 @@ bool read_file(const wchar_t* path, std::vector<std::uint8_t>& raw) {
     return ok;
 }
 
+// Images attached by pe_map_image. pe_map.dll is itself loaded by Windows, so its DllMain receives
+// DLL_THREAD_ATTACH/DETACH and forwards them to these images: attach in mapping order, detach in
+// reverse mapping order, as measured with two LoadLibraryW copies on Windows 11 build 26300.
+//
+// Lifetime protocol: each image holds one reference for its registration and one per thread
+// notification in flight. DllMain takes those references under mapped_lock and calls the guest
+// callbacks after releasing it, so a callback may map or release any image, its own included.
+// pe_map_release unregisters the image and drops the registration reference without waiting. The
+// image's process detach and unmapping run when the last reference goes, either inside
+// pe_map_release or on the thread that finishes the last notification. A notification is admitted
+// when its thread takes the reference under the registry lock; none is admitted after the release
+// unregisters the image. An admitted notification skips an image already marked released, but one
+// whose callback has started finishes: when a TLS callback releases its own image, that image's
+// entry point still receives the same thread attach. Addresses are the only identity, so once a
+// released address is reused by a new mapping, a stale pointer releases that new mapping.
+SRWLOCK mapped_lock = SRWLOCK_INIT;
+
+struct Mapped {
+    std::uint8_t* base;
+    volatile LONG references;
+    volatile LONG released;  // set by pe_map_release; notifiers skip the image from then on
+};
+
+struct SharedLock {
+    SharedLock() { AcquireSRWLockShared(&mapped_lock); }
+    ~SharedLock() { ReleaseSRWLockShared(&mapped_lock); }
+    SharedLock(const SharedLock&) = delete;
+    SharedLock& operator=(const SharedLock&) = delete;
+};
+
+struct ExclusiveLock {
+    ExclusiveLock() { AcquireSRWLockExclusive(&mapped_lock); }
+    ~ExclusiveLock() { ReleaseSRWLockExclusive(&mapped_lock); }
+    ExclusiveLock(const ExclusiveLock&) = delete;
+    ExclusiveLock& operator=(const ExclusiveLock&) = delete;
+};
+
+std::vector<Mapped*>& mapped_images() {
+    static std::vector<Mapped*> images;
+    return images;
+}
+
+// Notify a mapped image, re-reading its callback list as Windows does; if the list was
+// overwritten or made unreadable, the entry point is still notified.
+void notify_mapped(std::uint8_t* base, DWORD reason) {
+    const auto* nt = Image{base, 0}.headers();
+    const Image image{base, nt->OptionalHeader.SizeOfImage};
+    std::vector<PIMAGE_TLS_CALLBACK> callbacks;
+    try {
+        if (tls_callbacks(image, nt, callbacks)) callbacks.clear();
+    } catch (const std::bad_alloc&) {
+        // Never let an allocation failure escape DllMain or pe_map_release; the entry point is
+        // still notified.
+        callbacks.clear();
+    }
+    notify(image, nt, callbacks, reason);
+}
+
+// Process detach, function-table removal and unmapping, once no reference remains.
+void finalize(std::uint8_t* base) {
+    const auto* nt = Image{base, 0}.headers();
+    notify_mapped(base, DLL_PROCESS_DETACH);
+    const auto& pdata = directory(nt, IMAGE_DIRECTORY_ENTRY_EXCEPTION);
+    if (pdata.Size) RtlDeleteFunctionTable(reinterpret_cast<PRUNTIME_FUNCTION>(base + pdata.VirtualAddress));
+    VirtualFree(base, 0, MEM_RELEASE);
+}
+
+void drop_reference(Mapped* record) {
+    if (InterlockedDecrement(&record->references) != 0) return;
+    finalize(record->base);
+    delete record;
+}
+
 }  // namespace
+
+BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
+    if (reason == DLL_THREAD_ATTACH || reason == DLL_THREAD_DETACH) {
+        std::vector<Mapped*> snapshot;
+        {
+            const SharedLock hold;
+            try {
+                snapshot.reserve(mapped_images().size());
+            } catch (const std::bad_alloc&) {
+                return TRUE;  // no references were taken, so nothing is left pending
+            }
+            for (auto* record : mapped_images()) {
+                InterlockedIncrement(&record->references);
+                snapshot.push_back(record);
+            }
+        }
+        // Guest callbacks run without mapped_lock. An image released meanwhile is still mapped
+        // until its last reference is dropped here.
+        auto notify_one = [reason](Mapped* record) {
+            if (!InterlockedCompareExchange(&record->released, 0, 0)) notify_mapped(record->base, reason);
+            drop_reference(record);
+        };
+        if (reason == DLL_THREAD_ATTACH) {
+            for (auto it = snapshot.begin(); it != snapshot.end(); ++it) notify_one(*it);
+        } else {
+            for (auto it = snapshot.rbegin(); it != snapshot.rend(); ++it) notify_one(*it);
+        }
+    }
+    return TRUE;
+}
 
 extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolver resolve,
                                                     std::uint32_t* status, char* detail,
@@ -206,6 +343,21 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
         || dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > opt.SizeOfHeaders || table_end > opt.SizeOfHeaders
         || opt.SizeOfHeaders > opt.SizeOfImage || opt.SizeOfHeaders > raw.size())
         return fail(MAP_FORMAT, "section table outside headers");
+    // Section protections are applied per page, so a section that started inside a page shared with
+    // the headers or another section would change that page's protection as well. Windows refuses an
+    // alignment that is not a power of two and a section that does not start on it. An alignment
+    // below the page size, which Windows maps as one view when FileAlignment matches, is not modeled.
+    SYSTEM_INFO system{};
+    GetSystemInfo(&system);
+    if (opt.SectionAlignment & (opt.SectionAlignment - 1))
+        return fail(MAP_FORMAT, "section alignment %#lx is not a power of two", opt.SectionAlignment);
+    if (opt.SectionAlignment < system.dwPageSize)
+        return fail(MAP_UNSUPPORTED, "section alignment %#lx below the page size", opt.SectionAlignment);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        if (sections[i].VirtualAddress & (opt.SectionAlignment - 1))
+            return fail(MAP_FORMAT, "section %.8s not aligned to %#lx",
+                        reinterpret_cast<const char*>(sections[i].Name), opt.SectionAlignment);
+    }
 
     if (opt.AddressOfEntryPoint && !executable(nt, opt.AddressOfEntryPoint))
         return fail(MAP_FORMAT, "entry point outside executable section");
@@ -259,17 +411,10 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
     // TLS data needs a slot in each thread's ThreadLocalStoragePointer array, which ntdll owns.
     // Only an empty template is accepted. Unlike Windows, which assigns an index even for an
     // empty template, pe_map leaves AddressOfIndex as linked.
-    // Like the Windows loader, the TLS and delay-import directories are found by their address
-    // alone; Size is not used. Measured on Windows 11 build 26200: a TLS directory with Size 0, 1
-    // or 39 still runs its callback, one with address 0 is ignored whatever its Size, and one that
-    // does not fit in the image fails the load. The loader does not read the delay-import directory
-    // at all; pe_map rejects a malformed one and one that lists a DLL.
-    const auto& delay = directory(nt, IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT);
-    if (delay.VirtualAddress) {
-        const auto* first = image.at<IMAGE_DELAYLOAD_DESCRIPTOR>(delay.VirtualAddress);
-        if (!first) return release(fail(MAP_FORMAT, "delay import directory outside image"));
-        if (first->DllNameRVA) return release(fail(MAP_UNSUPPORTED, "delay imports"));
-    }
+    // Like the Windows loader, the TLS directory is found by its address alone; Size is not used.
+    // Measured on Windows 11 build 26200: a TLS directory with Size 0, 1 or 39 still runs its
+    // callback, one with address 0 is ignored whatever its Size, and one that does not fit in the
+    // image fails the load.
     const auto& tls = directory(nt, IMAGE_DIRECTORY_ENTRY_TLS);
     if (tls.VirtualAddress) {
         const auto* t = image.at<IMAGE_TLS_DIRECTORY64>(tls.VirtualAddress);
@@ -278,57 +423,140 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
             return release(fail(MAP_UNSUPPORTED, "TLS data"));
     }
 
+    const auto& imports = directory(nt, IMAGE_DIRECTORY_ENTRY_IMPORT);
+    const auto& delay = directory(nt, IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT);
+
     // Writes below (relocations, IAT) must land in sections, never in the headers or in the
     // directory that drives them, so validated structures cannot change while they are walked.
-    auto writable = [&](std::uint64_t rva, const IMAGE_DATA_DIRECTORY& driver) {
+    auto overlaps = [&](std::uint64_t rva, const IMAGE_DATA_DIRECTORY& driver) {
         const std::uint64_t start = driver.VirtualAddress, end = start + driver.Size;
-        const bool overlaps = rva + 8 > start && rva < end;
-        return rva >= opt.SizeOfHeaders && image.at<std::uint64_t>(rva) && !overlaps;
+        return rva + 8 > start && rva < end;
+    };
+    auto writable = [&](std::uint64_t rva, const IMAGE_DATA_DIRECTORY& driver) {
+        return rva >= opt.SizeOfHeaders && image.at<std::uint64_t>(rva) && !overlaps(rva, driver);
     };
 
+    // Only complete relocation blocks and complete WORD entries can be applied.
     const auto delta = reinterpret_cast<std::uint64_t>(base) - opt.ImageBase;
-    const auto& relocs = directory(nt, IMAGE_DIRECTORY_ENTRY_BASERELOC);
+    // Like the Windows loader (RtlImageDirectoryEntryToData), a relocation directory at address 0
+    // is absent whatever its Size: the image maps as relocation-free instead of the headers being
+    // parsed as relocation blocks.
+    const auto& linked_relocs = directory(nt, IMAGE_DIRECTORY_ENTRY_BASERELOC);
+    static const IMAGE_DATA_DIRECTORY no_relocs{};
+    const auto& relocs = linked_relocs.VirtualAddress ? linked_relocs : no_relocs;
     if (nt->FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED)
         return release(fail(MAP_RELOCATION, "relocations stripped"));
     if (!inside(relocs.VirtualAddress, relocs.Size, opt.SizeOfImage))
         return release(fail(MAP_RELOCATION, "relocation directory outside image"));
-    for (std::uint64_t offset = 0; offset + sizeof(IMAGE_BASE_RELOCATION) <= relocs.Size;) {
-        const auto* block = image.at<IMAGE_BASE_RELOCATION>(relocs.VirtualAddress + offset);
-        const DWORD page = block->VirtualAddress, length = block->SizeOfBlock;
-        if (length < sizeof(IMAGE_BASE_RELOCATION) || length > relocs.Size - offset)
-            return release(fail(MAP_RELOCATION, "bad relocation block"));
-        const auto* entry = reinterpret_cast<const WORD*>(block + 1);
-        const DWORD count = (length - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
-        for (DWORD k = 0; k < count; ++k) {
-            const WORD type = entry[k] >> 12;
-            const std::uint64_t target = page + std::uint64_t{entry[k] & 0xfffu};
-            if (type == IMAGE_REL_BASED_ABSOLUTE) continue;
-            if (type != IMAGE_REL_BASED_DIR64 || !writable(target, relocs))
-                return release(fail(MAP_RELOCATION, "unsupported relocation at RVA %#llx",
-                                    static_cast<unsigned long long>(target)));
-            *image.at<std::uint64_t>(target) += delta;
+    if (relocs.VirtualAddress && relocs.Size) {
+        std::uint64_t offset = 0;
+        while (offset + sizeof(IMAGE_BASE_RELOCATION) <= relocs.Size) {
+            const auto* block = image.at<IMAGE_BASE_RELOCATION>(relocs.VirtualAddress + offset);
+            const DWORD page = block->VirtualAddress, length = block->SizeOfBlock;
+            if (length < sizeof(IMAGE_BASE_RELOCATION) || length > relocs.Size - offset || length % sizeof(WORD))
+                return release(fail(MAP_RELOCATION, "bad relocation block"));
+            const auto* entry = reinterpret_cast<const WORD*>(block + 1);
+            const DWORD count = (length - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+            for (DWORD k = 0; k < count; ++k) {
+                const WORD type = entry[k] >> 12;
+                const std::uint64_t target = page + std::uint64_t{entry[k] & 0xfffu};
+                if (type == IMAGE_REL_BASED_ABSOLUTE) continue;
+                if (type != IMAGE_REL_BASED_DIR64 || !writable(target, relocs))
+                    return release(fail(MAP_RELOCATION, "unsupported relocation at RVA %#llx",
+                                        static_cast<unsigned long long>(target)));
+                *image.at<std::uint64_t>(target) += delta;
+            }
+            offset += length;
         }
-        offset += length;
+        if (offset != relocs.Size)
+            return release(fail(MAP_RELOCATION, "bad relocation block"));
+    }
+
+    // The delay-import directory is found by its address, like Windows; Size is not used. Walk both
+    // tables to their null descriptors before either is bound, so an IAT write cannot change the
+    // table the other walk reads.
+    std::uint64_t delay_descriptors = 0;
+    IMAGE_DATA_DIRECTORY delay_walked{};
+    if (delay.VirtualAddress) {
+        for (;; ++delay_descriptors) {
+            const auto* d = image.at<IMAGE_DELAYLOAD_DESCRIPTOR>(
+                delay.VirtualAddress + delay_descriptors * sizeof(IMAGE_DELAYLOAD_DESCRIPTOR));
+            if (!d) return release(fail(MAP_FORMAT, "delay import directory outside image"));
+            if (!d->DllNameRVA) break;
+        }
+        // The walked table, terminator included, is what IAT writes must not overlap.
+        delay_walked = {delay.VirtualAddress,
+                        static_cast<DWORD>((delay_descriptors + 1) * sizeof(IMAGE_DELAYLOAD_DESCRIPTOR))};
     }
 
     // Like the Windows loader, find the import table by its address and walk it to the null
-    // descriptor; the directory Size is not used. Measured on Windows 11 builds 26200 and 26300: copies with
-    // Size 0, 19 or 20 still load and bind every slot. Each descriptor is bounds-checked on its own.
-    const auto& imports = directory(nt, IMAGE_DIRECTORY_ENTRY_IMPORT);
+    // descriptor; the directory Size is not used. Measured on Windows 11 builds 26200 and 26300:
+    // copies with Size 0, 19 or 20 still load and bind every slot. Each descriptor is
+    // bounds-checked on its own.
+    std::uint64_t import_descriptors = 0;
+    IMAGE_DATA_DIRECTORY imports_walked{};
     if (imports.VirtualAddress) {
-        std::uint64_t descriptors = 0;
-        for (;; ++descriptors) {
+        for (;; ++import_descriptors) {
             const auto* d = image.at<IMAGE_IMPORT_DESCRIPTOR>(
-                imports.VirtualAddress + descriptors * sizeof(IMAGE_IMPORT_DESCRIPTOR));
+                imports.VirtualAddress + import_descriptors * sizeof(IMAGE_IMPORT_DESCRIPTOR));
             if (!d) return release(fail(MAP_FORMAT, "import directory outside image"));
             if (!d->Name) break;
         }
         // The walked table, terminator included, is what IAT writes must not overlap.
-        const IMAGE_DATA_DIRECTORY walked{
-            imports.VirtualAddress, static_cast<DWORD>((descriptors + 1) * sizeof(IMAGE_IMPORT_DESCRIPTOR))};
-        if (descriptors && !resolve) return release(fail(MAP_UNRESOLVED_IMPORT, "imports present without a resolver"));
-        const auto* desc = image.at<IMAGE_IMPORT_DESCRIPTOR>(imports.VirtualAddress, descriptors + 1);
-        for (std::uint64_t d = 0; d < descriptors; ++d) {
+        imports_walked = {imports.VirtualAddress,
+                          static_cast<DWORD>((import_descriptors + 1) * sizeof(IMAGE_IMPORT_DESCRIPTOR))};
+    }
+
+    // The PE loader leaves delay imports to the image's helper, which calls LoadLibrary and would
+    // bypass the host resolver. pe_map has no LoadLibrary, so it resolves each delay descriptor
+    // through the same resolver at map time and writes the bound address into its IAT. A descriptor
+    // without dlattrRva stores virtual addresses rather than RVAs and is rejected. The directory is
+    // found by its address, like Windows; Size is not used, and the table is walked above.
+    if (delay_descriptors) {
+        if (!resolve) return release(fail(MAP_UNRESOLVED_IMPORT, "delay imports present without a resolver"));
+        const auto* desc = image.at<IMAGE_DELAYLOAD_DESCRIPTOR>(delay.VirtualAddress, delay_descriptors + 1);
+        if (!desc) return release(fail(MAP_FORMAT, "delay import directory outside image"));
+        for (std::uint64_t d = 0; d < delay_descriptors; ++d) {
+            if (!(desc[d].Attributes.AllAttributes & DELAY_IMPORT_RVA_BASED))
+                return release(fail(MAP_UNSUPPORTED, "delay imports without RVA attributes"));
+            const char* name_in_image = image.string(desc[d].DllNameRVA);
+            if (!name_in_image) return release(fail(MAP_FORMAT, "delay import DLL name outside image"));
+            // Keep a copy: an IAT write below may legally overlap the string in the image.
+            const std::string dll_name(name_in_image);
+            const char* dll = dll_name.c_str();
+            const DWORD lookup = desc[d].ImportNameTableRVA, iat = desc[d].ImportAddressTableRVA;
+            if (!lookup || !iat)
+                return release(fail(MAP_FORMAT, "delay import tables for %s outside image", dll));
+            for (std::uint64_t i = 0;; ++i) {
+                const auto* word = image.at<std::uint64_t>(lookup + 8 * i);
+                if (!word) return release(fail(MAP_FORMAT, "delay import thunk for %s outside image", dll));
+                const std::uint64_t slot = iat + 8 * i;
+                if (!writable(slot, delay_walked) || overlaps(slot, imports_walked))
+                    return release(fail(MAP_FORMAT, "delay import IAT for %s outside image", dll));
+                if (!*word) break;
+                const bool by_ordinal = IMAGE_SNAP_BY_ORDINAL64(*word);
+                const auto ordinal = by_ordinal ? static_cast<std::uint32_t>(IMAGE_ORDINAL64(*word)) : 0u;
+                // Bits 31..62 of a named thunk must be zero: masking them could alias a valid low RVA.
+                const std::uint64_t name_rva = by_ordinal ? 0 : *word;
+                const auto* hint = by_ordinal || name_rva >> 31 ? nullptr : image.at<WORD>(name_rva);
+                const char* name = hint ? image.string(name_rva + sizeof(WORD)) : nullptr;
+                if (!by_ordinal && !name)
+                    return release(fail(MAP_FORMAT, "delay import name for %s outside image", dll));
+                void* bound = resolve(dll, name, ordinal);
+                if (!bound && name)
+                    return release(fail(MAP_UNRESOLVED_IMPORT, "unresolved delay import %s!%s", dll, name));
+                if (!bound)
+                    return release(fail(MAP_UNRESOLVED_IMPORT, "unresolved delay import %s!#%u", dll,
+                                        static_cast<unsigned>(ordinal)));
+                *image.at<std::uint64_t>(slot) = reinterpret_cast<std::uint64_t>(bound);
+            }
+        }
+    }
+
+    if (import_descriptors) {
+        if (!resolve) return release(fail(MAP_UNRESOLVED_IMPORT, "imports present without a resolver"));
+        const auto* desc = image.at<IMAGE_IMPORT_DESCRIPTOR>(imports.VirtualAddress, import_descriptors + 1);
+        for (std::uint64_t d = 0; d < import_descriptors; ++d) {
             const char* name_in_image = image.string(desc[d].Name);
             if (!name_in_image) return release(fail(MAP_FORMAT, "import DLL name outside image"));
             // Keep a copy: an IAT write below may legally overlap the string in the image.
@@ -337,7 +565,9 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
             const DWORD lookup = desc[d].OriginalFirstThunk ? desc[d].OriginalFirstThunk : desc[d].FirstThunk;
             for (std::uint64_t i = 0;; ++i) {
                 const auto* word = image.at<std::uint64_t>(lookup + 8 * i);
-                if (!word || !writable(desc[d].FirstThunk + 8 * i, walked))
+                const std::uint64_t target = desc[d].FirstThunk + 8 * i;
+                // The delay directory was read above, but a normal IAT write must still not reach it.
+                if (!word || !writable(target, imports_walked) || overlaps(target, delay_walked))
                     return release(fail(MAP_FORMAT, "import thunk for %s outside image", dll));
                 if (!*word) break;
                 const bool by_ordinal = IMAGE_SNAP_BY_ORDINAL64(*word);
@@ -350,7 +580,7 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
                 if (!bound)
                     return release(fail(MAP_UNRESOLVED_IMPORT, "unresolved import %s!#%u", dll,
                                         static_cast<unsigned>(ordinal)));
-                *image.at<std::uint64_t>(desc[d].FirstThunk + 8 * i) = reinterpret_cast<std::uint64_t>(bound);
+                *image.at<std::uint64_t>(target) = reinterpret_cast<std::uint64_t>(bound);
             }
         }
     }
@@ -369,14 +599,19 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
     }
     FlushInstructionCache(GetCurrentProcess(), base, opt.SizeOfImage);
 
+    // An empty exception directory registers nothing. Require complete entries otherwise.
     const auto& pdata = directory(nt, IMAGE_DIRECTORY_ENTRY_EXCEPTION);
     if (pdata.Size) {
-        auto* table = image.at<RUNTIME_FUNCTION>(pdata.VirtualAddress, pdata.Size / sizeof(RUNTIME_FUNCTION));
-        if (!table || !RtlAddFunctionTable(table, pdata.Size / sizeof(RUNTIME_FUNCTION),
+        if (!pdata.VirtualAddress || pdata.Size % sizeof(RUNTIME_FUNCTION))
+            return release(fail(MAP_FUNCTION_TABLE, "cannot register .pdata"));
+        const auto count = pdata.Size / sizeof(RUNTIME_FUNCTION);
+        auto* table = image.at<RUNTIME_FUNCTION>(pdata.VirtualAddress, count);
+        if (table && !readable(table, pdata.Size))
+            return release(fail(MAP_UNSUPPORTED, "exception table is not readable after section protection"));
+        if (!table || !RtlAddFunctionTable(table, static_cast<DWORD>(count),
                                            reinterpret_cast<DWORD64>(base)))
             return release(fail(MAP_FUNCTION_TABLE, "cannot register .pdata"));
     }
-
     std::vector<PIMAGE_TLS_CALLBACK> callbacks;
     const auto* mapped_nt = image.headers();
     if (const char* reason = tls_callbacks(image, mapped_nt, callbacks)) {
@@ -391,43 +626,159 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
         if (pdata.Size) RtlDeleteFunctionTable(image.at<RUNTIME_FUNCTION>(pdata.VirtualAddress));
         return release(fail(MAP_INIT_FAILED, "entry point returned FALSE"));
     }
+    Mapped* record = new (std::nothrow) Mapped{base, 1, 0};
+    bool registered = record != nullptr;
+    if (record) {
+        const ExclusiveLock hold;
+        try {
+            mapped_images().push_back(record);
+        } catch (const std::bad_alloc&) {
+            registered = false;
+        }
+    }
+    if (!registered) {
+        delete record;
+        notify(image, mapped_nt, callbacks, DLL_PROCESS_DETACH);
+        if (pdata.Size) RtlDeleteFunctionTable(image.at<RUNTIME_FUNCTION>(pdata.VirtualAddress));
+        return release(fail(MAP_MEMORY, "cannot register image for thread notifications"));
+    }
     return base;
 }
+
+namespace {
+
+struct ExportLookup {
+    DWORD rva = 0;
+    const char* forwarder = nullptr;
+};
+
+// Finds one named export. The export directory, its three tables and the forwarder string are
+// checked against the live page protection, as the TLS path does.
+bool find_export(const Image& image, const IMAGE_NT_HEADERS64* nt, const char* name, ExportLookup& out) {
+    const auto& exports = directory(nt, IMAGE_DIRECTORY_ENTRY_EXPORT);
+    if (exports.Size < sizeof(IMAGE_EXPORT_DIRECTORY) || !inside(exports.VirtualAddress, exports.Size, image.size))
+        return false;
+    const auto* dir = exports.Size ? image.at<IMAGE_EXPORT_DIRECTORY>(exports.VirtualAddress) : nullptr;
+    if (!dir || !readable(dir, sizeof(IMAGE_EXPORT_DIRECTORY))) return false;
+    const auto* names = image.at<DWORD>(dir->AddressOfNames, dir->NumberOfNames);
+    const auto* ordinals = image.at<WORD>(dir->AddressOfNameOrdinals, dir->NumberOfNames);
+    const auto* functions = image.at<DWORD>(dir->AddressOfFunctions, dir->NumberOfFunctions);
+    if (!names || !ordinals || !functions) return false;
+    if (!readable(names, sizeof(DWORD) * dir->NumberOfNames) ||
+        !readable(ordinals, sizeof(WORD) * dir->NumberOfNames) ||
+        !readable(functions, sizeof(DWORD) * dir->NumberOfFunctions)) return false;
+    for (DWORD i = 0; i < dir->NumberOfNames; ++i) {
+        const char* exported = readable_string(image, names[i]);
+        if (!exported || std::strcmp(exported, name) != 0) continue;
+        if (ordinals[i] >= dir->NumberOfFunctions) return false;
+        const DWORD rva = functions[ordinals[i]];
+        // A forwarded export points back into the export directory, where its target string lives.
+        if (rva >= exports.VirtualAddress && rva - exports.VirtualAddress < exports.Size) {
+            const Image directory_view{image.base, std::uint64_t{exports.VirtualAddress} + exports.Size};
+            out.forwarder = readable_string(directory_view, rva);
+            return out.forwarder != nullptr;
+        }
+        out.rva = rva;
+        return true;
+    }
+    return false;
+}
+
+}  // namespace
 
 // Only valid for a base returned by pe_map_image, whose headers were validated and are read-only.
 extern "C" __declspec(dllexport) void* pe_map_export(void* mapped, const char* name) {
     const auto* nt = Image{static_cast<std::uint8_t*>(mapped), 0}.headers();
     const Image image{static_cast<std::uint8_t*>(mapped), nt->OptionalHeader.SizeOfImage};
-    const auto& exports = directory(nt, IMAGE_DIRECTORY_ENTRY_EXPORT);
-    const auto* dir = exports.Size ? image.at<IMAGE_EXPORT_DIRECTORY>(exports.VirtualAddress) : nullptr;
-    if (!dir) return nullptr;
-    const auto* names = image.at<DWORD>(dir->AddressOfNames, dir->NumberOfNames);
-    const auto* ordinals = image.at<WORD>(dir->AddressOfNameOrdinals, dir->NumberOfNames);
-    const auto* functions = image.at<DWORD>(dir->AddressOfFunctions, dir->NumberOfFunctions);
-    if (!names || !ordinals || !functions) return nullptr;
-    for (DWORD i = 0; i < dir->NumberOfNames; ++i) {
-        const char* exported = image.string(names[i]);
-        if (!exported || std::strcmp(exported, name) != 0) continue;
-        if (ordinals[i] >= dir->NumberOfFunctions) return nullptr;
-        const DWORD rva = functions[ordinals[i]];
-        // Forwarded exports point back into the export directory; they are not code here.
-        if (rva >= exports.VirtualAddress && rva - exports.VirtualAddress < exports.Size) return nullptr;
-        // An empty slot (RVA 0) names no code; returning the image base would be wrong.
-        return rva && rva < image.size ? image.base + rva : nullptr;
-    }
-    return nullptr;
+    ExportLookup found;
+    // A forwarded export is not code in this image, so this entry point keeps returning null.
+    if (!find_export(image, nt, name, found) || found.forwarder) return nullptr;
+    // An empty slot (RVA 0) names no code; returning the image base would be wrong. An exported
+    // address must be accessible, but it may be execute-only, so readable() is not used here.
+    return found.rva && found.rva < image.size && accessible(image.base + found.rva)
+        ? image.base + found.rva : nullptr;
 }
 
-extern "C" __declspec(dllexport) void pe_map_release(void* mapped) {
+// Like pe_map_export, but a forwarded export is resolved through the host resolver. The forwarder
+// string is "Module.Symbol" or "Module.#ordinal", with the module as the linker recorded it.
+extern "C" __declspec(dllexport) void* pe_map_export_resolved(void* mapped, const char* name, Resolver resolve) {
+    const auto* nt = Image{static_cast<std::uint8_t*>(mapped), 0}.headers();
+    const Image image{static_cast<std::uint8_t*>(mapped), nt->OptionalHeader.SizeOfImage};
+    ExportLookup found;
+    if (!find_export(image, nt, name, found)) return nullptr;
+    if (!found.forwarder)
+        return found.rva && found.rva < image.size && accessible(image.base + found.rva)
+            ? image.base + found.rva : nullptr;
+    if (!resolve) return nullptr;
+    const std::string target(found.forwarder);
+    const auto dot = target.rfind('.');
+    if (dot == std::string::npos || dot == 0 || dot + 1 == target.size()) return nullptr;
+    const std::string module = target.substr(0, dot);
+    const std::string symbol = target.substr(dot + 1);
+    if (symbol.front() == '#') {
+        std::uint32_t ordinal = 0;
+        for (std::size_t i = 1; i < symbol.size(); ++i) {
+            const char digit = symbol[i];
+            if (digit < '0' || digit > '9') return nullptr;
+            ordinal = ordinal * 10 + static_cast<unsigned>(digit - '0');
+            if (ordinal > 65535) return nullptr;
+        }
+        return ordinal ? resolve(module.c_str(), nullptr, ordinal) : nullptr;
+    }
+    return resolve(module.c_str(), symbol.c_str(), 0);
+}
+
+// Returns 1 after unregistering an image that pe_map_image returned, and 0 for null, for any
+// other pointer and for a second release. Process detach and unmapping follow the protocol above:
+// at once if no thread notification for the image is in flight, otherwise when the last one ends.
+extern "C" __declspec(dllexport) int pe_map_release(void* mapped) {
+    Mapped* record = nullptr;
+    {
+        const ExclusiveLock hold;
+        auto& images = mapped_images();
+        for (auto it = images.begin(); it != images.end(); ++it) {
+            if ((*it)->base == mapped) {
+                record = *it;
+                images.erase(it);
+                break;
+            }
+        }
+    }
+    if (!record) return 0;
+    InterlockedExchange(&record->released, 1);
+    drop_reference(record);
+    return 1;
+}
+
+// Start a mapped EXE on the calling thread the way the loader starts a process: TLS callbacks in table
+// order with DLL_PROCESS_ATTACH and a null reserved argument, then the entry point, whose return value is
+// the exit code Windows would use. Measured on Windows 11 build 26300 with tests/cpu/exe_start.asm.
+//
+// Preconditions, none of which is checked:
+// - `mapped` is a base returned by pe_map_image, still live and not yet released. Like pe_map_export,
+//   this reads the headers of the argument directly, so any other pointer is undefined behavior.
+// - The caller trusts the image. The entry point and the callbacks are arbitrary machine code that runs
+//   in the host process with the host's privileges. They can crash, hang or terminate it (an entry point
+//   that calls ExitProcess ends the host), and they run on the calling thread, so their stack, TLS and
+//   loader-lock state are the caller's. Run untrusted or unknown images in a child process.
+// pe_map_image maps an EXE without notifying it, like LoadLibrary, so nothing has run before this call.
+// Start once per mapping. The caller keeps it live throughout the call and prevents any thread,
+// TLS callback or entry point from re-entering run or releasing this mapping during startup.
+//
+// Returns 0 without running anything for a DLL, which pe_map_image already notified, for an image without
+// an entry point, for a null exit_code and for an unreadable TLS callback list. The PEB argument that
+// Windows passes to the entry point is not forwarded, and no process-detach notification follows because
+// the process goes on.
+extern "C" __declspec(dllexport) int pe_map_run(void* mapped, std::uint32_t* exit_code) {
     auto* base = static_cast<std::uint8_t*>(mapped);
     const auto* nt = Image{base, 0}.headers();
+    if (!exit_code || (nt->FileHeader.Characteristics & IMAGE_FILE_DLL) || !nt->OptionalHeader.AddressOfEntryPoint)
+        return 0;
     const Image image{base, nt->OptionalHeader.SizeOfImage};
     std::vector<PIMAGE_TLS_CALLBACK> callbacks;
-    // The list is re-read, as Windows does; if it was overwritten or made unreadable,
-    // the entry point is still notified.
-    if (tls_callbacks(image, nt, callbacks)) callbacks.clear();
-    notify(image, nt, callbacks, DLL_PROCESS_DETACH);
-    const auto& pdata = directory(nt, IMAGE_DIRECTORY_ENTRY_EXCEPTION);
-    if (pdata.Size) RtlDeleteFunctionTable(reinterpret_cast<PRUNTIME_FUNCTION>(base + pdata.VirtualAddress));
-    VirtualFree(base, 0, MEM_RELEASE);
+    if (tls_callbacks(image, nt, callbacks)) return 0;
+    for (auto callback : callbacks) callback(base, DLL_PROCESS_ATTACH, nullptr);
+    using Entry = DWORD(WINAPI*)(void*);
+    *exit_code = reinterpret_cast<Entry>(base + nt->OptionalHeader.AddressOfEntryPoint)(nullptr);
+    return 1;
 }
