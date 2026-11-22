@@ -18,6 +18,13 @@ from pixel_aot import ALU, disassemble, native_program
 # First word of each line of every program lower() accepted in this run. tools/form_coverage.py counts
 # these when this test passes; a program a check expects to be rejected raises before it is recorded.
 ACCEPTED = set()
+SOPC_OPS = (
+    "s_cmp_eq_i32", "s_cmp_lg_i32", "s_cmp_gt_i32", "s_cmp_ge_i32", "s_cmp_lt_i32", "s_cmp_le_i32",
+    "s_cmp_eq_u32", "s_cmp_lg_u32", "s_cmp_gt_u32", "s_cmp_ge_u32", "s_cmp_lt_u32", "s_cmp_le_u32",
+    "s_cmp_eq_u64", "s_cmp_lg_u64",
+    "s_bitcmp0_b32", "s_bitcmp1_b32",
+    "s_bitcmp0_b64", "s_bitcmp1_b64",
+)
 
 
 def lower(instructions, *args, **kwargs):
@@ -1596,6 +1603,29 @@ def check_three_way_templates():
                                 "med3": sorted((a, b, c))[1]}, (a, b, c)
 
 
+def sopc_group() -> list[str]:
+    body = [
+        "s_mov_b32 s70, 0",
+        "s_mov_b32 s71, 0",
+        "s_mov_b32 s72, 1",
+        "s_mov_b32 s73, 0",
+    ]
+    for op in (
+        "s_cmp_eq_i32", "s_cmp_lg_i32", "s_cmp_gt_i32", "s_cmp_ge_i32", "s_cmp_lt_i32", "s_cmp_le_i32",
+        "s_cmp_eq_u32", "s_cmp_lg_u32", "s_cmp_gt_u32", "s_cmp_ge_u32", "s_cmp_lt_u32", "s_cmp_le_u32",
+    ):
+        body.extend([f"{op} s44, s45", "s_cmov_b64 s[70:71], s[72:73]"])
+    body.extend([
+        "s_cmp_eq_u64 s[44:45], s[46:47]", "s_cmov_b64 s[70:71], s[72:73]",
+        "s_cmp_lg_u64 s[44:45], s[46:47]", "s_cmov_b64 s[70:71], s[72:73]",
+        "s_bitcmp0_b32 s44, 5", "s_cmov_b64 s[70:71], s[72:73]",
+        "s_bitcmp1_b32 s44, 5", "s_cmov_b64 s[70:71], s[72:73]",
+        "s_bitcmp0_b64 s[44:45], 37", "s_cmov_b64 s[70:71], s[72:73]",
+        "s_bitcmp1_b64 s[44:45], 37", "s_cmov_b64 s[70:71], s[72:73]",
+    ])
+    return with_constants(body)
+
+
 def check_controls(directory):
     program = buffer_color(True)
     assert "float2 main(" in translate_buffer_color(program)
@@ -1614,6 +1644,29 @@ def check_controls(directory):
     check_scalar_helpers_with_vector_arithmetic()
     check_adapter_skip(directory)
     check_scalar_pair_reads()
+    sopc_source = translate(sopc_group())
+    assert set(SOPC_OPS) <= ACCEPTED
+    for expected in (
+        "asint(asuint(params[0].w)) == asint(asuint(params[1].x))",
+        "asint(asuint(params[0].w)) < asint(asuint(params[1].x))",
+        "asuint(params[0].w) == asuint(params[1].x)",
+        "asuint(params[0].w) < asuint(params[1].x)",
+        "asuint(params[0].w) == asuint(params[1].y) && asuint(params[1].x) == asuint(params[1].z)",
+        "asuint(params[0].w) != asuint(params[1].y) || asuint(params[1].x) != asuint(params[1].z)",
+        "((asuint(params[0].w) & (1u << (5u & 31u))) == 0u)",
+        "((asuint(params[0].w) & (1u << (5u & 31u))) != 0u)",
+        "(((37u & 32u) != 0u ? (asuint(params[1].x) & (1u << (37u & 31u))) : (asuint(params[0].w) & (1u << (37u & 31u)))) == 0u)",
+        "(((37u & 32u) != 0u ? (asuint(params[1].x) & (1u << (37u & 31u))) : (asuint(params[0].w) & (1u << (37u & 31u)))) != 0u)",
+    ):
+        assert expected in sopc_source, expected
+    for bad_sopc in (
+        "s_cmp_gt_u64 s[44:45], s[46:47]",
+        "s_cmp_eq_i64 s[44:45], s[46:47]",
+        "s_cmp_eq_u64 s[65:66], s[46:47]",
+        "s_cmp_eq_u32 s106, s44",
+        "s_cmp_eq_u64 s[105:106], s[46:47]",
+    ):
+        must_reject(translate, with_constants([bad_sopc]))
     # v_cvt_f32_f16 widens the low half through widen16 and applies modifiers after widening.
     body = translate(with_constants(HALF_BODY)).split("float4 main", 1)[1]
     assert body.count("widen16(asuint(") == 4 and "(-abs(widen16(" in body, body
@@ -1861,13 +1914,10 @@ def check_controls(directory):
         "s_cselect_b64 s[70:71], s[52:53], s[54:55]",
         "s_bfe_u64 s[70:71], s[52:53], s61",
         "s_bfe_i64 s[70:71], s[52:53], s61",
-        "s_cmp_eq_u64 s[52:53], s[54:55]",
-        "s_bitcmp1_b64 s[52:53], 0",
         "s_bfm_b32 s70, 4, 8",
         "s_add_u32 s70, s56, s57",
         "s_and_b32 s70, s56, s57",
         "s_not_b32 s70, s56",
-        "s_cmp_eq_i32 s56, s57",
         "s_cselect_b32 s70, s56, s57",
     ):
         must_reject(translate, program[:body_start] + [bad] + program[body_start:])
@@ -2497,6 +2547,10 @@ def check_render(directory, compiler, renderer, backend):
 
 
 def main():
+    if len(sys.argv) == 1:
+        with tempfile.TemporaryDirectory() as tmp:
+            check_controls(Path(tmp))
+        return 0
     mode, *args = sys.argv[1:]
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)

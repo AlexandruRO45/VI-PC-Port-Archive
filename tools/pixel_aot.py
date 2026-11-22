@@ -660,6 +660,37 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    uint salu{i} = {op}({a}, {b});")
             scalar[dst] = ("uint", f"salu{i}")
             scc = f"(salu{i} != 0u)"
+        elif m := match(r"(s_cmp_eq_u64|s_cmp_lg_u64) ([^,]+), ([^,]+)"):
+            op, src0, src1 = m.groups()
+            a0, a1 = scalar_u64(src0, scalar, pending)
+            b0, b1 = scalar_u64(src1, scalar, pending)
+            cond = f"({a0} == {b0} && {a1} == {b1})" if op == "s_cmp_eq_u64" else f"({a0} != {b0} || {a1} != {b1})"
+            lines.append(f"    bool scc{i} = {cond};")
+            scc = f"scc{i}"
+        elif m := match(r"(s_bitcmp0_b64|s_bitcmp1_b64) ([^,]+), ([^,]+)"):
+            op, src0, src1 = m.groups()
+            a0, a1 = scalar_u64(src0, scalar, pending)
+            b = scalar_u32(src1, scalar, pending)
+            bit_test = f"((({b} & 32u) != 0u ? ({a1} & (1u << ({b} & 31u))) : ({a0} & (1u << ({b} & 31u)))) {'==' if op == 's_bitcmp0_b64' else '!='} 0u)"
+            lines.append(f"    bool scc{i} = {bit_test};")
+            scc = f"scc{i}"
+        elif m := match(r"(s_bitcmp0_b32|s_bitcmp1_b32) ([^,]+), ([^,]+)"):
+            op, src0, src1 = m.groups()
+            a = scalar_u32(src0, scalar, pending)
+            b = scalar_u32(src1, scalar, pending)
+            bit_test = f"(({a} & (1u << ({b} & 31u))) {'==' if op == 's_bitcmp0_b32' else '!='} 0u)"
+            lines.append(f"    bool scc{i} = {bit_test};")
+            scc = f"scc{i}"
+        elif m := match(r"(s_cmp_(?:eq|lg|gt|ge|lt|le)_(?:i32|u32)) ([^,]+), ([^,]+)"):
+            op, src0, src1 = m.groups()
+            signed = op.endswith("_i32")
+            comp = op.split("_")[2]
+            op_sym = {"eq": "==", "lg": "!=", "gt": ">", "ge": ">=", "lt": "<", "le": "<="}[comp]
+            a = scalar_u32(src0, scalar, pending)
+            b = scalar_u32(src1, scalar, pending)
+            cond = f"(asint({a}) {op_sym} asint({b}))" if signed else f"({a} {op_sym} {b})"
+            lines.append(f"    bool scc{i} = {cond};")
+            scc = f"scc{i}"
         elif m := match(r"(s_mov_b32|s_movk_i32) (s\d+|m0), (s\d+|0x[0-9a-f]+|\d+)"):
             op, dst, src = m.groups()
             if src in pending or dst in pending:

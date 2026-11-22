@@ -228,16 +228,27 @@ def check_shader_records():
         ("SOP2", "s_lshl_b64"), ("SOP2", "s_lshr_b64"), ("SOP2", "s_ashr_i64"),
         ("SOP2", "s_bfm_b64"), ("SOP2", "s_bfe_u32"), ("SOP2", "s_bfe_i32"),
     }
+    sopc_forms = {
+        ("SOPC", "s_cmp_eq_i32"), ("SOPC", "s_cmp_lg_i32"),
+        ("SOPC", "s_cmp_gt_i32"), ("SOPC", "s_cmp_ge_i32"),
+        ("SOPC", "s_cmp_lt_i32"), ("SOPC", "s_cmp_le_i32"),
+        ("SOPC", "s_cmp_eq_u32"), ("SOPC", "s_cmp_lg_u32"),
+        ("SOPC", "s_cmp_gt_u32"), ("SOPC", "s_cmp_ge_u32"),
+        ("SOPC", "s_cmp_lt_u32"), ("SOPC", "s_cmp_le_u32"),
+        ("SOPC", "s_cmp_eq_u64"), ("SOPC", "s_cmp_lg_u64"),
+        ("SOPC", "s_bitcmp0_b32"), ("SOPC", "s_bitcmp1_b32"),
+        ("SOPC", "s_bitcmp0_b64"), ("SOPC", "s_bitcmp1_b64"),
+    }
     rejected_forms = {
         "s_and_saveexec_b64", "s_or_saveexec_b64", "s_andn2_saveexec_b64",
-        "s_cselect_b64", "s_bfe_u64", "s_bfe_i64",
-        "s_cmp_eq_u64", "s_bitcmp1_b64", "s_bfm_b32",
-        "s_add_u32", "s_and_b32", "s_not_b32", "s_cmp_eq_i32", "s_cselect_b32",
+        "s_cselect_b64", "s_bfe_u64", "s_bfe_i64", "s_bfm_b32",
+        "s_add_u32", "s_and_b32", "s_not_b32", "s_cselect_b32",
     }
     assert not (pixel.ACCEPTED & rejected_forms), pixel.ACCEPTED & rejected_forms
     for name in ("gfx1013.tsv", "rdna2.tsv"):
         covered = fc.gfx_forms(pixel.ACCEPTED, fc.load_reference(name))
         assert scalar64_forms <= covered, (name, scalar64_forms - covered)
+        assert sopc_forms <= covered, (name, sopc_forms - covered)
 
 
 def check_parsing():
