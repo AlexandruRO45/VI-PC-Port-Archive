@@ -1665,9 +1665,11 @@ if(TARGET Vulkan::Headers)
       set(LEONIDA_TEST_VS_FULLSCREEN ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_fullscreen.spv)
       set(LEONIDA_TEST_VS_INT ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_draw_int.spv)
       set(LEONIDA_TEST_GS_DOUBLE ${CMAKE_CURRENT_BINARY_DIR}/generated/gs_double.spv)
+      set(LEONIDA_TEST_VS_VIEWPORTS ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_viewports.spv)
       foreach(pair "vs_draw.vert;${LEONIDA_TEST_VS}" "ps_draw.frag;${LEONIDA_TEST_PS}"
                    "vs_fullscreen.vert;${LEONIDA_TEST_VS_FULLSCREEN}" "vs_draw_int.vert;${LEONIDA_TEST_VS_INT}"
-                   "gs_double.geom;${LEONIDA_TEST_GS_DOUBLE}")
+                   "gs_double.geom;${LEONIDA_TEST_GS_DOUBLE}"
+                   "vs_viewports.vert;${LEONIDA_TEST_VS_VIEWPORTS}")
         list(GET pair 0 source)
         list(GET pair 1 output)
         add_custom_command(
@@ -1742,6 +1744,14 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_bundle_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_bundle COMMAND d3d12_bundle_test)
       set_tests_properties(d3d12_bundle PROPERTIES SKIP_RETURN_CODE 77)
+      add_executable(d3d12_viewport_array_test test/d3d12_viewport_array_test.cpp shims/d3d12_xs_device.cpp
+                     ${LEONIDA_TEST_VS_VIEWPORTS} ${LEONIDA_TEST_PS})
+      target_link_libraries(d3d12_viewport_array_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_viewport_array_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS_VIEWPORTS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}")
+      target_compile_options(d3d12_viewport_array_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_viewport_array COMMAND d3d12_viewport_array_test)
+      set_tests_properties(d3d12_viewport_array PROPERTIES SKIP_RETURN_CODE 77)
     else()
       message(STATUS "glslangValidator not found: d3d12_compute_test, d3d12_draw_test and d3d12_set0_compute_test are not built")
     endif()

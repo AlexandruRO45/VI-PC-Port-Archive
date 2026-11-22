@@ -98,6 +98,7 @@ public:
     std::uint32_t compute_family = 0, copy_family = 0;
     std::vector<VkQueueFamilyProperties> families;
     VkPhysicalDeviceFeatures enabled{};  // the core features enabled on `device`
+    bool multi_viewport = false;  // multiViewport, shaderOutputViewportIndex and shaderOutputLayer enabled
     bool bindless = false;         // the features the bindless set 0 needs are enabled
     bool partially_bound = false;  // and its slots can stay empty
     bool image_view_min_lod = false;
@@ -393,6 +394,11 @@ public:
         sampler_filter_minmax = features12.samplerFilterMinmax == VK_TRUE;
         enable12.samplerFilterMinmax = sampler_filter_minmax;
         enable12.bufferDeviceAddress = VK_TRUE;
+        // Viewport arrays and the VS outputs that pick one (d3d12_viewport_array_test), where available.
+        multi_viewport = features.features.multiViewport && features12.shaderOutputViewportIndex &&
+                         features12.shaderOutputLayer;
+        enable12.shaderOutputViewportIndex = multi_viewport ? VK_TRUE : VK_FALSE;
+        enable12.shaderOutputLayer = multi_viewport ? VK_TRUE : VK_FALSE;
 
         const std::uint32_t graphics_count = std::max(1u, std::min(queue_count_wanted, family_queue_count));
         const std::vector<float> priority(graphics_count, 1.0f);
@@ -429,6 +435,7 @@ public:
         enable.logicOp = features.features.logicOp;  // d3d12_draw_test's logic-op draw, where available
         enable.geometryShader = features.features.geometryShader;  // d3d12_geometry_test, where available
         enable.shaderInt64 = features.features.shaderInt64;  // translated shaders declare Int64 for their addresses
+        enable.multiViewport = multi_viewport ? VK_TRUE : VK_FALSE;
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
 
         // VK_EXT_host_image_copy where the device has it, for the D3D12 layer's CPU texture copies.

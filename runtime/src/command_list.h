@@ -392,6 +392,24 @@ struct IndexBufferView {
     std::uint32_t format;  // DXGI_FORMAT_R16_UINT (57) or DXGI_FORMAT_R32_UINT (42)
 };
 
+// A fixed-capacity list kept inside the Draw, so recording a draw allocates nothing (D3D-289): the viewports and
+// scissor rectangles of RSSetViewports / RSSetScissorRects, at most 16 each
+// (D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE, which both calls already enforce).
+template<typename T, std::size_t N>
+struct InlineList {
+    std::array<T, N> items{};
+    std::uint32_t count = 0;
+    const T* begin() const { return items.data(); }
+    const T* end() const { return items.data() + count; }
+    std::size_t size() const { return count; }
+    bool empty() const { return count == 0; }
+    const T& operator[](std::size_t i) const { return items[i]; }
+    void clear() { count = 0; }
+    void push_back(const T& value) {
+        if (count < N) items[count++] = value;
+    }
+};
+
 // DrawInstanced / DrawIndexedInstanced, with everything they use captured when they are recorded: D3D12 reads
 // render-target and depth descriptors at OMSetRenderTargets, and every other piece of state is the list's state at
 // the draw. resource 0 marks an unbound render-target slot or no depth buffer.
@@ -417,6 +435,9 @@ struct Draw {
     std::int32_t base_vertex = 0;
     std::uint32_t first_instance = 0;
     std::uint32_t render_target_count = 8;
+    // RSSetViewports / RSSetScissorRects, all of them; viewport and scissor above are the first.
+    InlineList<Viewport, 16> viewports;
+    InlineList<Rect, 16> scissors;
 };
 
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
