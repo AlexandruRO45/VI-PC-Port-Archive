@@ -842,5 +842,100 @@ class TestSIMDMultiLaneDivergenceAndExecMasking(unittest.TestCase):
         self.assertEqual(self.gws.resources[rid].wait_queue, [99])
 
 
+class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
+    """Commit 5: Register aliasing and in-place operand preservation for ds_gws_sema_p."""
+
+    def setUp(self) -> None:
+        self.gws = GWSSubsystem()
+        self.scalar_interp = ScalarGWSInterpreter()
+        self.simd_interp = SIMDGWSInterpreter()
+
+    def test_m0_preservation_after_successful_acquire(self) -> None:
+        rid = 7
+        self.gws.init_resource(rid, init_val=4)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=0, gds=True)
+
+        self.scalar_interp.execute(state, inst)
+        self.assertEqual(state.m0, rid)
+
+    def test_m0_preservation_after_blocked_acquire(self) -> None:
+        rid = 9
+        self.gws.init_resource(rid, init_val=0)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=0, gds=True)
+
+        self.scalar_interp.execute(state, inst)
+        self.assertEqual(state.m0, rid)
+
+    def test_all_sgprs_preserved_in_place(self) -> None:
+        rid = 3
+        self.gws.init_resource(rid, init_val=5)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        # Populate various SGPRs with distinct bit patterns
+        for s in range(106):
+            state.set_sgpr(s, (0xCAFE0000 + s * 17) & MASK32)
+        saved_sgprs = dict(state.sgprs)
+
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=0, gds=True)
+        self.scalar_interp.execute(state, inst)
+
+        self.assertEqual(state.sgprs, saved_sgprs)
+
+    def test_all_lane_vgprs_preserved_in_simd(self) -> None:
+        rid = 10
+        self.gws.init_resource(rid, init_val=2)
+        wave = SIMDWaveState(wave_id=2, wave_size=32, m0=rid, gws=self.gws)
+        # Populate VGPRs across all 32 lanes
+        for lane in range(32):
+            for v in range(0, 256, 32):
+                wave.set_vgpr(lane, v, (lane << 16) | v)
+        saved_vgprs = [dict(lane_dict) for lane_dict in wave.lane_vgprs]
+
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=0, gds=True)
+        self.simd_interp.execute(wave, inst)
+
+        self.assertEqual(wave.lane_vgprs, saved_vgprs)
+
+    def test_aliased_m0_and_sgpr_operand_integrity(self) -> None:
+        rid = 14
+        self.gws.init_resource(rid, init_val=1)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        state.set_sgpr(0, rid)
+        state.set_sgpr(1, rid)
+
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=0, gds=True)
+        self.scalar_interp.execute(state, inst)
+
+        self.assertEqual(state.m0, rid)
+        self.assertEqual(state.get_sgpr(0), rid)
+        self.assertEqual(state.get_sgpr(1), rid)
+
+    def test_vdata_operand_preservation(self) -> None:
+        rid = 18
+        self.gws.init_resource(rid, init_val=3)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        state.set_vgpr(5, 0x12345678)
+
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=0, gds=True, vdata=Register(5, RegKind.VGPR))
+        self.scalar_interp.execute(state, inst)
+
+        self.assertEqual(state.get_vgpr(5), 0x12345678)
+
+    def test_consecutive_pipeline_operand_preservation(self) -> None:
+        rid = 22
+        self.gws.init_resource(rid, init_val=3)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        state.set_sgpr(10, 0xDEADBEEF)
+        state.set_vgpr(20, 0xBEEFBEEF)
+
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=0, gds=True)
+        for _ in range(3):
+            self.scalar_interp.execute(state, inst)
+            self.assertEqual(state.m0, rid)
+            self.assertEqual(state.get_sgpr(10), 0xDEADBEEF)
+            self.assertEqual(state.get_vgpr(20), 0xBEEFBEEF)
+
+
 if __name__ == "__main__":
     unittest.main()
