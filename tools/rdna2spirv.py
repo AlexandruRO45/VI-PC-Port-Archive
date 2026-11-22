@@ -1463,8 +1463,9 @@ class Gen:
         spv = self.BUF_ATOMICS[kind][0]
         lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
         pre = self.current_label_placeholder()
+        act = self.active_b()      # before the merge: OpSelectionMerge must directly precede its branch (spirv-val)
         self.emit(f"OpSelectionMerge {lbl_end} None")
-        self.emit(f"OpBranchConditional {self.active_b()} {lbl_do} {lbl_end}")
+        self.emit(f"OpBranchConditional {act} {lbl_do} {lbl_end}")
         self.emit(f"{lbl_do} = OpLabel")
         ptr = self.tmp()
         self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(full)}")
