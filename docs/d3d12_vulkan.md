@@ -199,6 +199,13 @@ What is implemented (all of it testable without the game):
   depth with stencil (two planes), a D24 stored as D32, and multisampled textures; they are still refused. A float
   written into a `D32_SFLOAT` image outside [0, 1] is undefined in Vulkan without `VK_EXT_depth_range_unrestricted`,
   where D3D12 keeps the bits; `d3d12_copy_xfmt_test` uses values in [0, 1).
+  For **D32 depth clears**, the standalone Vulkan device opts into `VK_EXT_depth_range_unrestricted` where the GPU
+  advertises it. External-device callers set `VulkanDeviceInfo::depth_range_unrestricted` only if they enabled the
+  extension. Replay preserves finite out-of-range values, infinities and NaN payloads when enabled, flushing positive
+  and negative subnormal depths to signed zero as native D3D12 does. Without the extension, Vulkan requires [0,1]
+  depth clears: the layer clamps them (NaN to zero), so **bit-exact unrestricted D32 parity is not guaranteed**.
+  D24 clears still quantise to 24-bit UNORM. `d3d12_dsv_clear_parity_test` compares 18 WARP/Vulkan D32S8 full and
+  rectangle readbacks with the extension, and exercises portable D24S8 and no-extension clear/submit paths.
   **D24_UNORM_S8_UINT without a native D24** (the Radeon 880M, AMD hardware generally, RADV): the layer stores
   `D32_SFLOAT_S8_UINT` and makes it behave as D24 (`src/depth24.h`, `src/vulkan_depth24.h`). A footprint
   of the depth plane holds 24-bit UNORM words (bits 0-23; the top byte is unspecified, the PC runtime reads it as

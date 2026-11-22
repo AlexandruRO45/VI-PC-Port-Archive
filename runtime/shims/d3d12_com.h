@@ -83,6 +83,9 @@ struct VulkanDeviceInfo {
     std::vector<VkQueue> compute_queues;
     std::vector<VkQueue> copy_queues;
     bool separate_depth_stencil_layouts = true;
+    // VK_EXT_depth_range_unrestricted was enabled when the logical device was created. Needed to
+    // preserve out-of-[0,1], infinities and NaN values in D32 depth clears without a Vulkan VUID.
+    bool depth_range_unrestricted = false;
     std::uint32_t max_push_constants_size = 0;
     bool push_constants_need_fallback = false;
     // The subgroup sizes the device offers and whether subgroupSizeControl / computeFullSubgroups are enabled on it

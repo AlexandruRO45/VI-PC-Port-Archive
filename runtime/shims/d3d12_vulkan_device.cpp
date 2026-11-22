@@ -4086,7 +4086,8 @@ public:
                                                                   info.separate_depth_stencil_layouts,
                                                                   info.conditional_rendering, info.ray_tracing,
                                                                   info.xdxr_acceleration_structures &&
-                                                                      info.buffer_device_address);
+                                                                      info.buffer_device_address,
+                                                                  info.depth_range_unrestricted);
         if (info.physical && state_.format_properties) {
             state_.context->set_color_attachment_format(
                 [physical = info.physical, get_props = state_.format_properties](VkFormat format) {
@@ -7732,6 +7733,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
                 info.conditional_rendering = conditional.conditionalRendering == VK_TRUE;
             } else if (!std::strcmp(e.extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) {
                 has_swapchain = true;
+            } else if (!std::strcmp(e.extensionName, VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME)) {
+                info.depth_range_unrestricted = true;
             } else if (!std::strcmp(e.extensionName, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
                 has_as = true;
             } else if (!std::strcmp(e.extensionName, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME)) {
@@ -8134,6 +8137,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     info.presentation = has_swapchain && instance_has_surface;
     info.swapchain_colorspace = info.presentation && swapchain_colorspace_enabled;
     if (info.custom_border_color) device_extensions.push_back(custom_border_name);
+    if (info.depth_range_unrestricted)
+        device_extensions.push_back(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)

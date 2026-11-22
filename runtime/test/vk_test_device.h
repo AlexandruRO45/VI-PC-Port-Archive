@@ -105,6 +105,7 @@ public:
     bool vertex_attribute_divisor = false;
     bool storage_buffer_8bit = false; // storageBuffer8BitAccess enabled
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
+    bool depth_range_unrestricted = false;  // VK_EXT_depth_range_unrestricted enabled when supported
     bool host_image_copy = false;  // VK_EXT_host_image_copy and hostImageCopy enabled
     // create(true) only: VK_KHR (else EXT) swapchain_maintenance1 and its feature enabled, with the surface half on the
     // instance, so a vsync swapchain can switch to IMMEDIATE or FIFO_RELAXED per present.
@@ -353,6 +354,8 @@ public:
                     VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &supported};
                     instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
                     conditional_rendering = supported.conditionalRendering == VK_TRUE;
+                } else if (!std::strcmp(e.extensionName, VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME)) {
+                    depth_range_unrestricted = true;
                 }
         }
         VkPhysicalDeviceConditionalRenderingFeaturesEXT enable_conditional{
@@ -546,6 +549,7 @@ public:
         if (image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
         if (vertex_attribute_divisor) device_extensions.push_back(divisor_extension);
         if (conditional_rendering) device_extensions.push_back(conditional_extension);
+        if (depth_range_unrestricted) device_extensions.push_back(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
         if (host_image_copy) device_extensions.push_back(host_image_copy_name);
         const char* swapchain = "VK_KHR_swapchain";
         if (presentation) device_extensions.push_back(swapchain);

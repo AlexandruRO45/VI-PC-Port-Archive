@@ -807,12 +807,14 @@ public:
     // ray_tracing: VK_KHR_acceleration_structure + VK_KHR_ray_query are enabled on `device`.
     // xdxr: acceleration-structure builds write XDXR BVH4 records (xdxr_build.h) instead; needs bufferDeviceAddress.
     VulkanContext(PFN_vkGetDeviceProcAddr get, VkDevice device, bool separate_depth_stencil_layouts,
-                  bool conditional_rendering = false, bool ray_tracing = false, bool xdxr = false)
+                  bool conditional_rendering = false, bool ray_tracing = false, bool xdxr = false,
+                  bool depth_range_unrestricted = false)
         : device_(device), tracker_(separate_depth_stencil_layouts), ray_tracing_(ray_tracing) {
         loaded_ = vk.load(get, device);
         replay_.pipeline_barrier = vk.vkCmdPipelineBarrier;
         replay_.clear_color_image = vk.vkCmdClearColorImage;
         replay_.clear_depth_stencil_image = vk.vkCmdClearDepthStencilImage;
+        replay_.depth_range_unrestricted = depth_range_unrestricted;
         replay_.pipeline_barrier2 = vk.vkCmdPipelineBarrier2;
         replay_.begin_rendering = vk.vkCmdBeginRendering;
         replay_.end_rendering = vk.vkCmdEndRendering;

@@ -773,6 +773,7 @@ struct ReplayFunctions {
     PFN_vkCmdPipelineBarrier pipeline_barrier = nullptr;
     PFN_vkCmdClearColorImage clear_color_image = nullptr;
     PFN_vkCmdClearDepthStencilImage clear_depth_stencil_image = nullptr;
+    bool depth_range_unrestricted = false;  // VK_EXT_depth_range_unrestricted was enabled on this device.
     // Optional; a list that needs a missing one is rejected with ReplayResult::unsupported.
     PFN_vkCmdPipelineBarrier2 pipeline_barrier2 = nullptr;  // enhanced barriers
     VkPipelineStageFlags2 queue_stages = 0;
@@ -3237,11 +3238,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const VulkanAccess state = vulkan_access(d3d12_state::depth_write, false);
             auto pieces = detail::current(tracker, id, range, image_layout(p.binding, state.layout));
             detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker);
-            // Host D3D12 accepts all float depth values at Close; Vulkan clear commands reject
-            // out-of-range values unless VK_EXT_depth_range_unrestricted is enabled. Clamp finite
-            // values to D3D's normalized depth interval and choose zero for an unordered NaN.
-            const float valid_depth = std::isnan(depth_clear->depth) ? 0.0f
-                                        : std::clamp(depth_clear->depth, 0.0f, 1.0f);
+            // D3D12 flushes depth denormals to signed zero, including negative subnormals. On D32
+            // images, preserve out-of-range and NaN payloads when the device explicitly enabled
+            // VK_EXT_depth_range_unrestricted; otherwise the Vulkan clear must stay in [0,1].
+            const float input = depth_clear->depth;
+            const float flushed = std::fpclassify(input) == FP_SUBNORMAL ? std::copysign(0.0f, input) : input;
+            const float valid_depth = vk.depth_range_unrestricted ? flushed
+                                     : std::isnan(flushed) ? 0.0f : std::clamp(flushed, 0.0f, 1.0f);
             const float depth = p.binding.depth24 ? depth24_clear_value(valid_depth)  // see depth24.h
                                                    : valid_depth;
             const VkClearDepthStencilValue value{depth, depth_clear->stencil};
