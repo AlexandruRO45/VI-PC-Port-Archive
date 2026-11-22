@@ -68,7 +68,10 @@ def u32_to_f32(val: int) -> float:
 
 def f32_to_u32(val: float) -> int:
     """Pack Python float to IEEE 754 single-precision 32-bit unsigned integer."""
-    return struct.unpack("<I", struct.pack("<f", val))[0]
+    try:
+        return struct.unpack("<I", struct.pack("<f", val))[0]
+    except OverflowError:
+        return NEG_INF_F32 if val < 0 else POS_INF_F32
 
 
 def ieee754_rsub_f32(vdata0_u32: int, old_val_u32: int) -> int:
@@ -880,6 +883,75 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         # Condition codes remain strictly untouched
         self.assertEqual(vcc_initial, 0x12345678_9ABCDEF0)
         self.assertEqual(scc_initial, 1)
+
+
+# ==============================================================================
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 special values, boundary extremes, and NaN propagation."""
+
+    def test_signed_zeros(self) -> None:
+        # (+0.0) - (+0.0) = +0.0
+        self.assertEqual(ieee754_rsub_f32(POS_ZERO_F32, POS_ZERO_F32), POS_ZERO_F32)
+
+        # (-0.0) - (-0.0) = +0.0
+        self.assertEqual(ieee754_rsub_f32(NEG_ZERO_F32, NEG_ZERO_F32), POS_ZERO_F32)
+
+        # (-0.0) - (+0.0) = -0.0
+        self.assertEqual(ieee754_rsub_f32(NEG_ZERO_F32, POS_ZERO_F32), NEG_ZERO_F32)
+
+        # (+0.0) - (-0.0) = +0.0
+        self.assertEqual(ieee754_rsub_f32(POS_ZERO_F32, NEG_ZERO_F32), POS_ZERO_F32)
+
+    def test_infinities(self) -> None:
+        # Invalid operation: (+Inf) - (+Inf) -> QNaN
+        self.assertEqual(ieee754_rsub_f32(POS_INF_F32, POS_INF_F32), QNAN_DEFAULT)
+
+        # Invalid operation: (-Inf) - (-Inf) -> QNaN
+        self.assertEqual(ieee754_rsub_f32(NEG_INF_F32, NEG_INF_F32), QNAN_DEFAULT)
+
+        # (+Inf) - (-Inf) = +Inf
+        self.assertEqual(ieee754_rsub_f32(POS_INF_F32, NEG_INF_F32), POS_INF_F32)
+
+        # (-Inf) - (+Inf) = -Inf
+        self.assertEqual(ieee754_rsub_f32(NEG_INF_F32, POS_INF_F32), NEG_INF_F32)
+
+        # Finite - (+Inf) = -Inf (reverse subtraction where old_val is +Inf)
+        self.assertEqual(ieee754_rsub_f32(FIVE_F32, POS_INF_F32), NEG_INF_F32)
+
+        # (+Inf) - Finite = +Inf (vdata0 is +Inf, old_val is Finite)
+        self.assertEqual(ieee754_rsub_f32(POS_INF_F32, FIVE_F32), POS_INF_F32)
+
+    def test_nan_propagation(self) -> None:
+        # QNaN as minuend
+        self.assertEqual(ieee754_rsub_f32(QNAN_DEFAULT, ONE_F32), QNAN_DEFAULT)
+
+        # QNaN as subtrahend
+        self.assertEqual(ieee754_rsub_f32(ONE_F32, QNAN_DEFAULT), QNAN_DEFAULT)
+
+        # SNaN as minuend -> quieted to QNaN
+        self.assertEqual(ieee754_rsub_f32(SNAN_DEFAULT, TWO_F32), QNAN_DEFAULT)
+
+        # SNaN as subtrahend -> quieted to QNaN
+        self.assertEqual(ieee754_rsub_f32(TWO_F32, SNAN_DEFAULT), QNAN_DEFAULT)
+
+    def test_subnormals(self) -> None:
+        # Subnormals (denormals) preservation
+        subnorm1 = 0x0000_0001  # Smallest positive subnormal (2^-149)
+        subnorm2 = 0x0000_0002  # 2 * 2^-149
+        res = ieee754_rsub_f32(subnorm2, subnorm1)
+        self.assertEqual(res, subnorm1)
+
+    def test_overflow_to_infinity(self) -> None:
+        # Max normal positive: 0x7F7F_FFFF (~3.4028235e38)
+        # Max normal negative: 0xFF7F_FFFF
+        max_norm_pos = 0x7F7F_FFFF
+        max_norm_neg = 0xFF7F_FFFF
+        # max_pos - (-max_pos) overflows to +Infinity
+        res = ieee754_rsub_f32(max_norm_pos, max_norm_neg)
+        self.assertEqual(res, POS_INF_F32)
 
 
 if __name__ == "__main__":
