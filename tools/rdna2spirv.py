@@ -3545,12 +3545,13 @@ class Gen:
         self.emit(f"{do} = OpLabel")
         self.emit(f"{p} = OpAccessChain %_ptr_WG_uint %lds {i}")
         r = fn(p)
+        last = self.current_label_placeholder()      # `do`, or the block a looping fn (ds_wrap_rtn_b32) ended in
         self.emit(f"OpBranch {end}")
         self.emit(f"{end} = OpLabel")
         if r is None:
             return None
         v = self.tmp()
-        self.emit(f"{v} = OpPhi %uint {r} {do} {self.cu(0)} {pre}")
+        self.emit(f"{v} = OpPhi %uint {r} {last} {self.cu(0)} {pre}")
         return v
 
     def lds_load(self, addr, byte_off):
@@ -3694,6 +3695,37 @@ class Gen:
                                   f"{self.LDS_ATOMICS[name]} %uint {{p}} {sc} {sem} {self.src_u(dat)}")
             if d is not None:
                 self.dst(d, old)
+        elif op == "ds_wrap_rtn_b32":
+            # RDNA ISA: tmp = M; M = (tmp >= DATA) ? tmp - DATA : tmp + DATA2 (unsigned compare, both wrap at 32 bits);
+            # vD = tmp. Measured natively on gfx1036 (16 cases, hunt6 hw_wrap.py). A compare-exchange loop on the
+            # LDS dword, like the inc/dec CAS loops of the buffer atomics.
+            d, ad, d0, d1 = a[0], a[1], a[2], a[3]
+            data, data2 = self.src_u(d0), self.src_u(d1)
+
+            def wrap(p):
+                entry = self.current_label_placeholder()
+                hdr, cont, ext = (self.tmp() + s_ for s_ in ("_whdr", "_wcont", "_wexit"))
+                init = self.tmp()
+                self.emit(f"{init} = OpAtomicLoad %uint {p} {sc} {sem}")
+                self.emit(f"OpBranch {hdr}")
+                self.emit(f"{hdr} = OpLabel")
+                cur, got, ge, sub_, add_, new_, done = (self.tmp() for _ in range(7))
+                self.emit(f"{cur} = OpPhi %uint {init} {entry} {got} {cont}")
+                self.emit(f"{ge} = OpUGreaterThanEqual %bool {cur} {data}")
+                self.emit(f"{sub_} = OpISub %uint {cur} {data}")
+                self.emit(f"{add_} = OpIAdd %uint {cur} {data2}")
+                self.emit(f"{new_} = OpSelect %uint {ge} {sub_} {add_}")
+                self.emit(f"{got} = OpAtomicCompareExchange %uint {p} {sc} {sem} {sem} {new_} {cur}")
+                self.emit(f"{done} = OpIEqual %bool {got} {cur}")
+                self.emit(f"OpLoopMerge {ext} {cont} None")
+                self.emit(f"OpBranchConditional {done} {ext} {cont}")
+                self.emit(f"{cont} = OpLabel")
+                self.emit(f"OpBranch {hdr}")
+                self.emit(f"{ext} = OpLabel")
+                return cur
+
+            old = self.lds_access(self.src_u(ad), off, wrap)
+            self.dst(d, old)
         elif op in ("ds_wrxchg2_rtn_b32", "ds_wrxchg2st64_rtn_b32"):
             # Two atomic exchanges, at ADDR + offset0 * unit and ADDR + offset1 * unit (unit 4 bytes, x64 for st64),
             # as ds_write2_b32 addresses them: M[A0] = DATA, M[A1] = DATA2; vdst = {old M[A0], old M[A1]}.
