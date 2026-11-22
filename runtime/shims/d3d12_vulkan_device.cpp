@@ -1650,12 +1650,32 @@ WindowPresenter::~WindowPresenter() {
     device_->Release();
 }
 
-HRESULT WindowPresenter::present(ID3D12Resource* back_buffer, UINT sync_interval) {
-    if (!back_buffer) return E_INVALIDARG;
-    const VkResult result = presenter_->present(resource_id(back_buffer), sync_interval > 0);
+namespace {
+HRESULT present_result(VkResult result) {
     if (result == VK_SUCCESS) return S_OK;
     std::fprintf(stderr, "[rt] d3d12: present failed (VkResult %d)\n", int(result));
-    return result == VK_ERROR_DEVICE_LOST ? DXGI_ERROR_DEVICE_REMOVED : E_FAIL;
+    if (result == VK_ERROR_DEVICE_LOST) return DXGI_ERROR_DEVICE_REMOVED;
+    if (result == VK_ERROR_FORMAT_NOT_SUPPORTED) return DXGI_ERROR_UNSUPPORTED;
+    return E_FAIL;
+}
+}  // namespace
+
+HRESULT WindowPresenter::present(ID3D12Resource* back_buffer, UINT sync_interval, const D3D12_RECT* src_rect) {
+    if (!back_buffer) return E_INVALIDARG;
+    const leonida::PresentRect rect = src_rect ? leonida::PresentRect{src_rect->left, src_rect->top, src_rect->right,
+                                                                       src_rect->bottom}
+                                               : leonida::PresentRect{};
+    return present_result(presenter_->present(resource_id(back_buffer), sync_interval > 0, src_rect ? &rect : nullptr));
+}
+
+HRESULT WindowPresenter::present_blank(UINT sync_interval) {
+    return present_result(presenter_->present_blank(sync_interval > 0));
+}
+
+bool WindowPresenter::enable_capture() { return presenter_->enable_capture(); }
+
+bool WindowPresenter::read_back(std::vector<std::uint8_t>& pixels, VkExtent2D* extent, VkFormat* format) {
+    return presenter_->read_back(pixels, extent, format);
 }
 
 VkExtent2D WindowPresenter::extent() const { return presenter_->extent(); }
@@ -1818,10 +1838,10 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     VkPhysicalDeviceConditionalRenderingFeaturesEXT conditional{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
     {
-        std::uint32_t extension_count = 0;
-        vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, nullptr);
-        std::vector<VkExtensionProperties> extensions(extension_count);
-        vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, extensions.data());
+        std::uint32_t conditional_count = 0;
+        vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &conditional_count, nullptr);
+        std::vector<VkExtensionProperties> extensions(conditional_count);
+        vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &conditional_count, extensions.data());
         for (const auto& e : extensions)
             if (!std::strcmp(e.extensionName, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
                 VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &conditional};
@@ -1876,9 +1896,10 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
     device_info.pEnabledFeatures = &enable;
-    vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, nullptr);
-    std::vector<VkExtensionProperties> device_extensions(extension_count);
-    vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, device_extensions.data());
+    std::uint32_t device_extension_count = 0;
+    vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &device_extension_count, nullptr);
+    std::vector<VkExtensionProperties> device_extensions(device_extension_count);
+    vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &device_extension_count, device_extensions.data());
     const char* swapchain = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     info.presentation = surfaces && has(device_extensions, swapchain);
     std::vector<const char*> enabled_extensions;
