@@ -895,14 +895,19 @@ def emit_quad_swizzle_u32(lines, idx, base_expr, perm):
     bits = f"asuint({base_expr})"
     if perm == [0, 1, 2, 3]:
         return bits
+    svar = f"dpp{idx}_s"
     if perm == [1, 0, 3, 2]:
-        return f"QuadReadAcrossX({bits})"
+        lines.append(f"    uint {svar} = QuadReadAcrossX({bits});")
+        return svar
     if perm == [2, 3, 0, 1]:
-        return f"QuadReadAcrossY({bits})"
+        lines.append(f"    uint {svar} = QuadReadAcrossY({bits});")
+        return svar
     if perm == [3, 2, 1, 0]:
-        return f"QuadReadAcrossDiagonal({bits})"
+        lines.append(f"    uint {svar} = QuadReadAcrossDiagonal({bits});")
+        return svar
     if len(set(perm)) == 1:
-        return f"QuadReadLaneAt({bits}, {perm[0]})"
+        lines.append(f"    uint {svar} = QuadReadLaneAt({bits}, {perm[0]});")
+        return svar
     lines.append(f"    uint dpp{idx}_in = {bits};")
     lines.append(f"    uint dpp{idx}_q = WaveGetLaneIndex() & 3u;")
     lane_vars = {}
@@ -911,7 +916,6 @@ def emit_quad_swizzle_u32(lines, idx, base_expr, perm):
         lines.append(f"    uint {lv} = QuadReadLaneAt(dpp{idx}_in, {lane});")
         lane_vars[lane] = lv
     l0, l1, l2, l3 = (lane_vars[p] for p in perm)
-    svar = f"dpp{idx}_s"
     lines.append(f"    uint {svar} = (dpp{idx}_q == 0u ? {l0} : (dpp{idx}_q == 1u ? {l1} : (dpp{idx}_q == 2u ? {l2} : {l3})));")
     return svar
 

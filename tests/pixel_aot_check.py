@@ -2999,11 +2999,16 @@ def check_dpp_draw(directory, compiler, renderer, backend):
     case = directory / "dpp.case"
     draw = [renderer, backend, "--check-pixel-case", shader, case]
     source.write_text(translate(program), encoding="ascii")
-    compile_shader(compiler, source, shader)
+    # The NVIDIA driver (32.0.16.2101, RTX 5080) refuses PSO creation for the dpp program
+    # under -denorm preserve (E_OUTOFMEMORY), matching the recorded curve exception. Its rows
+    # contain no binary32 subnormals, so record this fixture's mode as any and assert that
+    # flushing leaves every expected word unchanged.
+    compile_shader(compiler, source, shader, mode="any")
     for a, b, h_bits, c in DPP_SETS:
         constants = bytearray(256)
         struct.pack_into("<2fIf", constants, 12, a, b, h_bits, c)
         expected = dpp_reference(a, b, h_bits, c)
+        assert all(flush_ftz(word) == word for word in expected), expected
         case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
         subprocess.run(draw, check=True)
     for set_idx, old, new, label in (
@@ -3025,7 +3030,7 @@ def check_dpp_draw(directory, compiler, renderer, backend):
         mutated = [line.replace(old, new) for line in program]
         assert mutated != program, label
         source.write_text(translate(mutated), encoding="ascii")
-        compile_shader(compiler, source, shader)
+        compile_shader(compiler, source, shader, mode="any")
         wrong = subprocess.run(draw, capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError(f"Mutation of {label} escaped detection")
@@ -3414,6 +3419,14 @@ def check_controls(directory):
     must_reject(translate, with_constants([
         "v_mov_b32_dpp v12, v255 dpp8:[1,2,3,0,5,6,7,4]",
     ]))
+    # Fast-path quad swizzles must hoist QuadRead* into an unconditional local before any ternary.
+    dpp_ternary = translate(with_constants([
+        "v_cmp_gt_f32_e32 vcc_lo, 0, v12",
+        "v_cndmask_b32_dpp v13, v12, v13, vcc_lo quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+        "v_mul_legacy_f32_dpp v12, v12, v13 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf",
+    ]))
+    assert dpp_ternary.count("QuadReadAcrossX(") == 1 and dpp_ternary.count("QuadReadLaneAt(") == 1
+    assert not any("?" in line and "QuadRead" in line for line in dpp_ternary.splitlines())
     check_f16_denorm_controls()
     program = bitwise_program()
     for before, after in (("s44, v18", "s44, |v18|"), ("20, v19", "20, v19 clamp"),
