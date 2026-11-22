@@ -58,3 +58,18 @@ void WriteTitleAddresses(uint id : SV_DispatchThreadID)
     }
     Results.Store(id * 4, 1);
 }
+
+// Correctness probe for the atomics above, run on plain buffers before the fixture. Each of
+// recordCount threads adds 1 to word 0 of Aliases[id % rangeCount], the same per-thread index
+// into the UAV array that WriteTitleAddresses uses, so buffer i must gain exactly the number of
+// ids congruent to i.
+#define ProbeRoot "DescriptorTable(UAV(u0, space = 1, numDescriptors = 8)), RootConstants(num32BitConstants = 2, b0)"
+
+[RootSignature(ProbeRoot)]
+[numthreads(64, 1, 1)]
+void ProbeArrayAtomics(uint id : SV_DispatchThreadID)
+{
+    if (id >= recordCount) return;
+    uint previous;
+    Aliases[NonUniformResourceIndex(id % rangeCount)].InterlockedAdd(0, 1, previous);
+}
