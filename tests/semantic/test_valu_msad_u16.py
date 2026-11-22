@@ -313,6 +313,65 @@ class SIMDInterpreter:
         return results
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class VMsadU16StatusFlags:
+    """Architectural condition codes, status flags, and carry generation for v_msad_u16."""
+    zero: bool
+    sign: bool
+    carry_out: bool
+    masked_lanes_count: int
+    active_lanes_count: int
+    lane_masked: Tuple[bool, bool]
+    lane_diff: Tuple[int, int]
+    diff_sum: int
+
+
+def evaluate_v_msad_u16_flags(src0: int, src1: int, src2: int, result: int) -> VMsadU16StatusFlags:
+    """Evaluate architectural condition codes, masking status, and 32-bit carry generation."""
+    s0_lanes = unpack_halves_u32(src0)
+    s1_lanes = unpack_halves_u32(src1)
+    acc = src2 & MASK32
+
+    lane_masked: List[bool] = []
+    lane_diff: List[int] = []
+
+    for i in range(2):
+        h0 = s0_lanes[i]
+        h1 = s1_lanes[i]
+        if h1 == 0:
+            lane_masked.append(True)
+            lane_diff.append(0)
+        else:
+            lane_masked.append(False)
+            lane_diff.append(abs(h0 - h1))
+
+    diff_sum = sum(lane_diff)
+    full_sum = acc + diff_sum
+    carry_out = full_sum > MASK32
+    res32 = result & MASK32
+
+    zero = (res32 == 0)
+    sign = bool(res32 & 0x8000_0000)
+    masked_count = sum(1 for m in lane_masked if m)
+    active_count = 2 - masked_count
+
+    return VMsadU16StatusFlags(
+        zero=zero,
+        sign=sign,
+        carry_out=carry_out,
+        masked_lanes_count=masked_count,
+        active_lanes_count=active_count,
+        lane_masked=(lane_masked[0], lane_masked[1]),
+        lane_diff=(lane_diff[0], lane_diff[1]),
+        diff_sum=diff_sum,
+    )
+
+
+
 
 # ==============================================================================
 # Unit Tests: Model and Reference Oracle
@@ -879,6 +938,97 @@ class TestValuMsadU16RegisterAliasing(unittest.TestCase):
             res = interp.step(instr, state)
             self.assertEqual(res, 100 * i)
             self.assertEqual(state.get_vgpr(0), 100 * i)
+
+
+class TestValuMsadU16ConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry generation."""
+
+    def test_zero_flag_when_result_is_zero(self) -> None:
+        # Case 1: 0 + 0 = 0
+        res = oracle_v_msad_u16(0, 0, 0)
+        flags = evaluate_v_msad_u16_flags(0, 0, 0, res)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.sign)
+        self.assertFalse(flags.carry_out)
+        self.assertEqual(flags.masked_lanes_count, 2)
+        self.assertEqual(flags.active_lanes_count, 0)
+
+        # Case 2: exact 32-bit overflow wrapping to 0:
+        # acc = 0xFFFE_0002, diff_sum = 131070 -> full sum = 0x1_0000_0000 -> res = 0
+        s0 = 0x00000000
+        s1 = 0xFFFFFFFF
+        acc = 0xFFFE_0002
+        res_wrap = oracle_v_msad_u16(s0, s1, acc)
+        self.assertEqual(res_wrap, 0)
+        flags_wrap = evaluate_v_msad_u16_flags(s0, s1, acc, res_wrap)
+        self.assertTrue(flags_wrap.zero)
+        self.assertFalse(flags_wrap.sign)
+        self.assertTrue(flags_wrap.carry_out)  # Overflowed!
+        self.assertEqual(flags_wrap.diff_sum, 131070)
+
+    def test_sign_flag_high_bit_set(self) -> None:
+        acc_neg = 0x8000_0000
+        res = oracle_v_msad_u16(0, 0, acc_neg)
+        flags = evaluate_v_msad_u16_flags(0, 0, acc_neg, res)
+        self.assertTrue(flags.sign)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.carry_out)
+
+        # acc just below bit 31 (0x7FFF_FFFF) + diff 1 -> 0x8000_0000
+        s0 = pack_halves_u32(1, 0)
+        s1 = pack_halves_u32(2, 0)  # diff = 1
+        res_trans = oracle_v_msad_u16(s0, s1, 0x7FFF_FFFF)
+        self.assertEqual(res_trans, 0x8000_0000)
+        flags_trans = evaluate_v_msad_u16_flags(s0, s1, 0x7FFF_FFFF, res_trans)
+        self.assertTrue(flags_trans.sign)
+
+    def test_carry_out_32bit_overflow(self) -> None:
+        # 0xFFFFFFFF + diff 1 -> carry_out True
+        s0 = pack_halves_u32(1, 0)
+        s1 = pack_halves_u32(2, 0)  # diff = 1
+        res = oracle_v_msad_u16(s0, s1, 0xFFFFFFFF)
+        self.assertEqual(res, 0)
+        flags = evaluate_v_msad_u16_flags(s0, s1, 0xFFFFFFFF, res)
+        self.assertTrue(flags.carry_out)
+        self.assertTrue(flags.zero)
+
+    def test_carry_out_no_overflow(self) -> None:
+        # 0x00001000 + diff 100 -> no overflow
+        res = oracle_v_msad_u16(0, 0, 0x1000)
+        flags = evaluate_v_msad_u16_flags(0, 0, 0x1000, res)
+        self.assertFalse(flags.carry_out)
+
+    def test_masked_lanes_counting(self) -> None:
+        # 0 masked lanes: both halves non-zero
+        s1_none = pack_halves_u32(1, 2)
+        flags_none = evaluate_v_msad_u16_flags(0, s1_none, 0, 0)
+        self.assertEqual(flags_none.masked_lanes_count, 0)
+        self.assertEqual(flags_none.active_lanes_count, 2)
+        self.assertEqual(flags_none.lane_masked, (False, False))
+
+        # 1 masked lane: half 0 is 0
+        s1_one = pack_halves_u32(0, 5)
+        flags_one = evaluate_v_msad_u16_flags(0, s1_one, 0, 0)
+        self.assertEqual(flags_one.masked_lanes_count, 1)
+        self.assertEqual(flags_one.active_lanes_count, 1)
+        self.assertEqual(flags_one.lane_masked, (True, False))
+
+        # 2 masked lanes: all 0
+        flags_two = evaluate_v_msad_u16_flags(0, 0, 0, 0)
+        self.assertEqual(flags_two.masked_lanes_count, 2)
+        self.assertEqual(flags_two.active_lanes_count, 0)
+        self.assertEqual(flags_two.lane_masked, (True, True))
+
+    def test_per_lane_diff_tracking(self) -> None:
+        # Lane 0: s0=1000, s1=2500 -> diff 1500
+        # Lane 1: s0=5000, s1=0    -> masked -> diff 0
+        s0 = pack_halves_u32(1000, 5000)
+        s1 = pack_halves_u32(2500, 0)
+        res = oracle_v_msad_u16(s0, s1, 0)
+        self.assertEqual(res, 1500)
+        flags = evaluate_v_msad_u16_flags(s0, s1, 0, res)
+        self.assertEqual(flags.lane_diff, (1500, 0))
+        self.assertEqual(flags.diff_sum, 1500)
 
 
 if __name__ == "__main__":
