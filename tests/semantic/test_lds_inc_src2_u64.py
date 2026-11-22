@@ -798,5 +798,115 @@ class TestSIMDMultiLaneAndExecMasking(unittest.TestCase):
         self.assertEqual(state.lds.read_qword(q_a), 1)
 
 
+# ==============================================================================
+# Phase 5: Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasingAndPreservation(unittest.TestCase):
+    """Phase 5: Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_self_referencing_identical_offsets_always_wrap_to_zero(self) -> None:
+        # When offset0 == offset1, Location A and Location B are the exact same qword
+        state = ScalarMachineState64(lds_capacity_qwords=512)
+        interp = ScalarInterpreter64()
+
+        # Location qword 10 initially has 42
+        state.lds.write_qword(10, 42)
+        state.set_vgpr(0, 0)
+
+        # offset0:10, offset1:10 -> A and B both point to qword 10
+        instr = DSIncSrc2U64Instruction(
+            addr=LDSAddressExpression(
+                base_reg=RegisterOperand(0, RegType.VGPR),
+                offset0=10,
+                offset1=10,
+            )
+        )
+
+        # 42 >= 42 -> wraps to 0
+        new_val = interp.step(instr, state)
+        self.assertEqual(new_val, 0)
+        self.assertEqual(state.lds.read_qword(10), 0)
+
+        # Second step: 0 >= 0 -> wraps to 0 again
+        new_val2 = interp.step(instr, state)
+        self.assertEqual(new_val2, 0)
+        self.assertEqual(state.lds.read_qword(10), 0)
+
+        # Register v0 must be intact
+        self.assertEqual(state.get_vgpr(0), 0)
+
+    def test_secondary_location_b_preserved_when_distinct(self) -> None:
+        state = ScalarMachineState64(lds_capacity_qwords=512)
+        interp = ScalarInterpreter64()
+
+        state.lds.write_qword(20, 1)
+        state.lds.write_qword(21, 5) # limit = 5
+        state.set_vgpr(1, 0)
+
+        instr = DSIncSrc2U64Instruction(
+            addr=LDSAddressExpression(
+                base_reg=RegisterOperand(1, RegType.VGPR),
+                offset0=20,
+                offset1=21,
+            )
+        )
+
+        for expected in [2, 3, 4, 5, 0]:
+            res = interp.step(instr, state)
+            self.assertEqual(res, expected)
+            self.assertEqual(state.lds.read_qword(20), expected)
+            # Location B must remain strictly 5 throughout
+            self.assertEqual(state.lds.read_qword(21), 5)
+
+    def test_vaddr_register_preservation_under_scalar_step(self) -> None:
+        state = ScalarMachineState64(lds_capacity_qwords=512)
+        interp = ScalarInterpreter64()
+
+        # v5 holds base address 0x200
+        state.set_vgpr(5, 0x200)
+        state.lds.write_qword(0x200 >> 3, 100)
+        state.lds.write_qword((0x200 >> 3) + 1, 200)
+
+        instr = DSIncSrc2U64Instruction(
+            addr=LDSAddressExpression(
+                base_reg=RegisterOperand(5, RegType.VGPR),
+                offset0=0,
+                offset1=1,
+            )
+        )
+
+        interp.step(instr, state)
+        # Verify base VGPR is not clobbered
+        self.assertEqual(state.get_vgpr(5), 0x200)
+
+    def test_simd_register_preservation_across_all_divergent_lanes(self) -> None:
+        # Wave64 with alternating mask
+        even_mask = 0x5555555555555555
+        state = SIMDState64(num_lanes=64, exec_mask=even_mask, lds_capacity_qwords=512)
+        interp = SIMDInterpreter64()
+
+        sentinels = [1000 + lane for lane in range(64)]
+        for lane in range(64):
+            state.set_lane_vgpr(lane, 0, sentinels[lane])
+            q_a = (sentinels[lane] >> 3) & 511
+            state.lds.write_qword(q_a, 10)
+            state.lds.write_qword((q_a + 1) & 511, 20)
+
+        instr = DSIncSrc2U64Instruction(
+            addr=LDSAddressExpression(
+                base_reg=RegisterOperand(0, RegType.VGPR),
+                offset0=0,
+                offset1=1,
+            )
+        )
+
+        interp.execute(instr, state)
+
+        # Every lane's VGPR must be perfectly preserved
+        for lane in range(64):
+            self.assertEqual(state.get_lane_vgpr(lane, 0), sentinels[lane])
+
+
 if __name__ == "__main__":
     unittest.main()
