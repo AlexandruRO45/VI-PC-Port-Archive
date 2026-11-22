@@ -1330,6 +1330,19 @@ python3 -B tests/mesh_attribute_check.py binary llvm-mc-15 llvm-objcopy-15 libLL
 ctest --preset dev --no-tests=error -R "^mesh_attribute_draw_" -V
 ```
 
+A separate draw binds two immutable constant buffers through a shader-visible
+D3D12 table. The translated mesh reads depth from b0 and a horizontal offset
+from b1. The translated pixel stage reads a packed color from b0. Both draws
+reuse the same shaders and upload bytes. Exchanging the two CBV slots moves the
+triangle's left edge from column 0 to column 8 and changes the covered pixels
+from red to green. The test compares all 1,024 pixels and the mesh export trace.
+Using the old pixel reference reports 1,024 mismatches. Using just the old mesh
+reference fails the trace check while every pixel still matches.
+
+```sh
+ctest --preset dev --no-tests=error -R "^mesh_descriptor_swap_" -V
+```
+
 A local 1,028-byte entry (197 instructions) read three distinct vertex
 positions and produced visible geometry with controlled indices, transforms and
 vertex data. The two sets of positions cover 1,024 and 276 of the 1,024 pixel

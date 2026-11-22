@@ -366,6 +366,8 @@ int main(int argc, char** argv)
         if (argc != 4) return 2;
     } else if (operation == "--mesh-entry" || operation == "--mesh-indexed") {
         if (argc != 6) return 2;
+    } else if (operation == "--mesh-entry-table") {
+        if (argc != 6 && (argc != 7 || std::string_view(argv[6]) != "--swap")) return 2;
     } else if (operation == "--check-bc7-tail") {
         if (argc < 6) return 2;
     } else if ((operation == "--depth-mask" || operation == "--depth-mask-swapped")) {
@@ -506,6 +508,9 @@ int main(int argc, char** argv)
             if (!check_dxr_update(device.Get())) return 77;
         } else if (operation == "--mesh-entry" || operation == "--mesh-indexed") {
             if (!check_mesh_entry_draw(device.Get(), argv[3], argv[4], argv[5], operation == "--mesh-indexed")) return 77;
+        } else if (operation == "--mesh-entry-table") {
+            const auto binding = argc == 7 ? MeshConstantBinding::swapped_table : MeshConstantBinding::table;
+            if (!check_mesh_entry_draw(device.Get(), argv[3], argv[4], argv[5], false, binding)) return 77;
         } else if (argc == 3 && operation == "--dxr-facing") {
             if (!check_dxr_facing(device.Get())) return 77;
         } else if (argc == 3 && operation == "--dxr-opacity") {
