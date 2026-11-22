@@ -6,6 +6,7 @@
 // without a Vulkan GPU; without a host D3D12 device only the layer's own record is printed. Set
 // LEONIDA_D3D49_VERBOSE=1 to print every step.
 #include "vk_test_device.h"
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 
 #include <cstdint>
@@ -314,7 +315,8 @@ int main() {
                                              reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
                                        : nullptr;
         Ref<ID3D12Device> host;
-        if (!create_host || FAILED(create_host(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
+        if (!create_host || hostwine::host_is_wine() ||
+            FAILED(create_host(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
             std::printf("private data: no host D3D12 device to compare with; %zu steps recorded, not compared\n",
                         ours.values.size());
         } else {

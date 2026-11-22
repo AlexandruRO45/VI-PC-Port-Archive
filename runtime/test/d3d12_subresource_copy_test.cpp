@@ -8,6 +8,7 @@
 // without a Vulkan GPU; without a host D3D12 device only the layer's own record is printed. Set
 // LEONIDA_D3D49_VERBOSE=1 to print every step.
 #include "vk_test_device.h"
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 
 #include <cstdint>
@@ -297,7 +298,8 @@ int main() {
                                    : nullptr;
     Ref<ID3D12Device> host;
     Record theirs;
-    if (create_host && SUCCEEDED(create_host(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p))))
+    if (create_host && !hostwine::host_is_wine() &&
+        SUCCEEDED(create_host(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p))))
         EXPECT(run(host.p, d.bc, theirs));
 
     // Once per copy path: on the host with VK_EXT_host_image_copy where the GPU has it, and through a staging submit

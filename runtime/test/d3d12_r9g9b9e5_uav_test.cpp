@@ -17,6 +17,7 @@
 //
 // Synthetic data only; no game files. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/uav_clear.h"
@@ -581,7 +582,7 @@ int main() {
 
         // 4. Differential UAV clear comparison against Windows WARP.
         Ref<ID3D12Device> warp;
-        {
+        if (!hostwine::host_is_wine()) {
             Ref<IDXGIFactory4> factory;
             Ref<IDXGIAdapter> adapter;
             if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) &&

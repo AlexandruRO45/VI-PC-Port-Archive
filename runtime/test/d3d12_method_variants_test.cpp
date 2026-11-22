@@ -6,6 +6,7 @@
 // a D3D12 device. A texture from CreateCommittedResource3 goes through an upload, a copy and a readback on a queue
 // from CreateCommandQueue1. No shaders or game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails.
 #include "vk_test_device.h"
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 
 #include <cstdint>
@@ -312,7 +313,8 @@ int main() {
                                                  reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
                                            : nullptr;
             Ref<ID3D12Device10> host;
-            if (create_host && SUCCEEDED(create_host(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
+            if (create_host && !hostwine::host_is_wine() &&
+                SUCCEEDED(create_host(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
                 const std::vector<Edge> theirs = edge_answers(host.p);
                 for (std::size_t i = 0; i < ours.size(); ++i) {
                     if (ours[i].got == theirs[i].got) continue;
