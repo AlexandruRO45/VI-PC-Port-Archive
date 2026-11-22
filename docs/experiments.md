@@ -344,6 +344,24 @@ With the previous fixed bindings and the `--cb-reads` command above, all 530 rec
 
 The fixed-profile full scan covered 26,503 records. Output-verified totals stayed at 851 PS, 12 CS, 2 MS, 0 VS and 0 GS (865 overall). All 988 previous profile/container files, including selector variants, recurred. Of those, 616 had identical generated source; recompiling the remaining 372 old/new pairs with the same DXC produced identical desktop DXIL. The existing pipeline and readback results apply to the same binaries. The new conversion draws are counted as source-built fixtures.
 
+### SPIR-V physical addresses in a D3D12 buffer window
+
+An optional offline experiment accepts validated Vulkan 1.2 SPIR-V assembly with the named user-data and physical DWORD pointer types emitted by [Leonida at `f85582e`](https://github.com/ItsNotRexed/Leonida/blob/f85582e23d4ab9e19acbf694358f137d6b8531b1/tools/rdna2spirv.py). [SPIRV-Cross at `57e4efc`](https://github.com/KhronosGroup/SPIRV-Cross/tree/57e4efcc84112abcd426dc5ec248b5339bee04f2) rejects the physical addressing model on its HLSL path. The [window adapter](../tools/spirv_address_window.py) converts direct DWORD loads, stores and array element addresses to logical storage-buffer accesses. It validates the input and the result before publishing the output module.
+
+The host contract supplies a read-only raw SRV at `t0, space1` containing the original packed user-data bytes and a raw UAV at `u0, space2` covering the address window. Physical addresses supplied to the adapter are byte offsets relative to this view; an upstream heap base added to these offsets must be zero. The descriptor must have at most 1,073,741,823 DWORDs. The final byte offset `0xfffffffc` lies outside the view. An address above the window, an unaligned access, or an overflowing array-index addition selects this offset. D3D12 descriptor bounds then provide a zero read or discarded write. A production runtime still needs to locate each guest allocation, establish its lifetime and supply its real descriptors. This profile makes no claim about arbitrary GPU virtual addresses or atomics.
+
+The [source-built compute shader](../tests/spirv_window/subtract.spvasm) reads two distinct addresses, subtracts their words and writes to a third. Windows checks all 16 words of the arena, including guards, for eight cases. Swapping the two reads reverses the result; moving the store changes which guard is replaced. High addresses, misalignment, 64-bit index overflow and a write past the actual descriptor exercise the window bounds.
+
+With SPIRV-Tools and SPIRV-Cross on the Windows PATH, reconfigure to register the optional GPU tests:
+
+```powershell
+cmake --preset dev
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^spirv_address_window_' -V
+```
+
+With SPIRV-Tools on Linux, run `python3 -B tests/spirv_window/check.py` to assemble and validate the fixture and exercise the rejection paths. The GPU check can also use WSL tools: generate a logical module with `python3 tools/spirv_address_window.py tests/spirv_window/subtract.spvasm out/window.spv`, then generate HLSL with `spirv-cross out/window.spv --hlsl --shader-model 66 --output out/window.hlsl`. Compile it on Windows with `dxc -T cs_6_6 -E main -Fo out/window.dxil out/window.hlsl` and run `out/build/dev/offscreen_check.exe hardware --spirv-address-window out/window.dxil`, then repeat with `warp`.
+
 ## Offline CPU leaf recompilation
 
 With the Python-enabled Windows dev preset configured, run:
@@ -749,6 +767,8 @@ The shared lowering also handles 128-bit legacy `movdqu` and 14 SSE4.1 integer v
 The shared lowering also handles all 12 SSE4.1 sign/zero-extending vector moves (`pmovsxbw/bd/bq/wd/wq/dq`, `pmovzxbw/bd/bq/wd/wq/dq`) and legacy `movdqu`, reading only the narrow source lane extent for memory operands. `cpu_aot_sse41_extend` probes CPUID leaf 1 ECX bit 19 (`SSE4.1`) before invoking the native fixture and exits 77 (capability skip) on unsupported hosts; on SSE4.1-capable hosts it builds all 13 exports from MASM source (`tests/cpu/sse41_extend.asm`), translates them, and verifies bit-for-bit agreement with the native DLL. Run `cmake --build --preset dev --target cpu_sse41_extend_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_sse41_extend$' -V`.
 
 Baseline 128-bit SSE2 packed saturating add/sub, multiply, min/max, average, and sum-of-absolute-differences forms (`movdqu`, `paddsb`/`sw`/`usb`/`usw`, `psubsb`/`sw`/`usb`/`usw`, `pmulhw`, `pmulhuw`, `pmullw`, `pmaddwd`, `pmuludq`, `pminub`, `pmaxub`, `pminsw`, `pmaxsw`, `pavgb`, `pavgw`, `psadbw`) are also lowered for legacy XMM encodings while preserving upper YMM bytes and rejecting 64-bit MMX forms. `cpu_aot_sse2_sat_mul` builds all twenty exports from MASM source (`tests/cpu/sse2_sat_mul.asm`), translates them, compares all 16 output bytes against the native DLL and an independent reference (including saturation extremes and `pmaddwd` signed-product wrapping), and checks that 64-bit MMX `paddsb mm0, mm1` is rejected. Run `cmake --build --preset dev --target cpu_sse2_sat_mul_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_sse2_sat_mul$' -V`.
+
+Legacy and 128-bit VEX AES-NI and carryless-multiply forms (`aesenc`, `aesenclast`, `aesdec`, `aesdeclast`, `aesimc`, `aeskeygenassist`, `pclmulqdq`, and their `v*` 128-bit VEX counterparts) are also lowered using portable FIPS-197 GF(2^8) and GF(2) arithmetic while rejecting 256-bit VAES encodings. `cpu_aot_crypto_aes_pclmul` probes CPUID leaf 1 ECX bits 1 (`PCLMULQDQ`), 25 (`AES`), 27 (`OSXSAVE`), and 28 (`AVX`) plus XCR0 XMM/YMM state before invoking the native fixture and exits 77 on hosts without those features; on capable hosts it builds all 15 exports from MASM source (`tests/cpu/crypto_aes_pclmul.asm`), translates them, compares exact 16-byte outputs against the native DLL, and checks that 256-bit `vaesenc` is rejected. Run `cmake --build --preset dev --target cpu_crypto_aes_pclmul_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_crypto_aes_pclmul$' -V`.
 
 Baseline 128-bit SSE2 packed integer ALU forms (`movdqu`, `paddb`/`w`/`d`/`q`, `psubb`/`w`/`d`/`q`, `pand`, `pandn`, `por`, `pxor`, `pcmpeqb`/`w`/`d`, `pcmpgtb`/`w`/`d`) are also lowered for legacy XMM register operands while preserving upper YMM bytes and rejecting 64-bit MMX forms. `cpu_aot_sse2_int` builds all eighteen exports from MASM source (`tests/cpu/sse2_int.asm`), translates them, compares all 16 output bytes between the native and translated DLLs, and checks that 64-bit MMX `paddb mm0, mm1` is rejected. Run `cmake --build --preset dev --target cpu_sse2_int_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_sse2_int$' -V`.
 

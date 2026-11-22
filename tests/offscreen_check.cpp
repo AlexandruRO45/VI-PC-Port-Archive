@@ -370,7 +370,8 @@ int main(int argc, char** argv)
         if (argc < 6) return 2;
     } else if ((operation == "--depth-mask" || operation == "--depth-mask-swapped")) {
         if (argc != 6) return 2;
-    } else if ((operation == "--compute-root-file" || operation == "--ffx-immediate-conversion")) {
+    } else if (operation == "--compute-root-file" || operation == "--ffx-immediate-conversion" ||
+               operation == "--spirv-address-window") {
         if (argc != 4) return 2;
     } else {
         if (argc != 3 && argc != 5 && argc != 6) return 2;
@@ -444,6 +445,18 @@ int main(int argc, char** argv)
         if (argc == 3 && needs_cs_6_5(operation) && !supports_cs_6_5(device.Get())) return 77;
         if (argc == 3 && (operation == "--compute-root" || operation == "--compute-tables")) {
             check_compute(device.Get(), operation == "--compute-tables");
+        } else if (operation == "--spirv-address-window") {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS1 options{};
+            check(check_feature(device.Get(), D3D12_FEATURE_D3D12_OPTIONS1, &options, sizeof(options)),
+                  "Query 64-bit shader integer support");
+            D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
+            auto model_hr = check_feature(device.Get(), D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model));
+            if (model_hr != E_INVALIDARG) check(model_hr, "Query address-window shader model");
+            if (!options.Int64ShaderOps || model_hr == E_INVALIDARG || model.HighestShaderModel < D3D_SHADER_MODEL_6_6) {
+                std::puts("skip: address window fixture requires SM 6.6 and 64-bit shader integer operations");
+                return 77;
+            }
+            check_spirv_window(device.Get(), argv[3]);
         } else if (argc == 4 && (operation == "--compute-root-file" || operation == "--ffx-immediate-conversion")) {
             check_compute_file(device.Get(), argv[3], operation == "--ffx-immediate-conversion");
         } else if (argc == 5 && operation == "--compute-store-case") {
