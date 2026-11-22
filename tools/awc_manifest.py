@@ -156,7 +156,11 @@ def collect(src: str, *, out: str | None = None):
     recursive = os.path.isdir(src)
     if recursive:
         banks = []
-        for root, dirs, files in os.walk(src):
+
+        def scan_failed(error: OSError) -> None:
+            raise error   # an unreadable sub-folder must not pass for "no banks there"
+
+        for root, dirs, files in os.walk(src, onerror=scan_failed):
             dirs.sort()
             banks += [os.path.join(root, f) for f in files if f.lower().endswith(".awc")]
         banks.sort(key=lambda p: (os.path.basename(p).lower(), p.lower()))

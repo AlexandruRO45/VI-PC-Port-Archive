@@ -335,6 +335,28 @@ class ManifestTest(unittest.TestCase):
             self.assertEqual(f.read(), '{"previous": true}\n')
         self.assertEqual(os.listdir(self.tmp.name), ["manifest.json"])   # no temporary file left
 
+    def test_unreadable_subfolder_fails_the_scan_and_keeps_the_previous_manifest(self):
+        self.write_bank("valid.awc", with_music=False)
+        out = os.path.join(self.tmp.name, "out", "manifest.json")
+        os.mkdir(os.path.dirname(out))
+        with open(out, "w", encoding="utf-8") as f:
+            f.write('{"previous": true}\n')
+        blocked = os.path.join(self.tmp.name, "blocked")
+
+        def walk(root, onerror=None):    # os.walk as it behaves when "blocked" cannot be listed
+            yield root, ["blocked"], ["valid.awc"]
+            if onerror:
+                onerror(PermissionError(13, "Permission denied", blocked))
+
+        err = io.StringIO()
+        with mock.patch.object(awc_manifest.os, "walk", walk), contextlib.redirect_stderr(err):
+            rc = awc_manifest.main([self.tmp.name, "--out", out])
+        self.assertEqual(rc, 1)
+        self.assertIn("blocked", err.getvalue())
+        self.assertIn("Permission denied", err.getvalue())
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), '{"previous": true}\n')
+
     def test_recursive_report_distinguishes_banks_with_the_same_basename(self):
         for folder in ("left", "right"):
             os.mkdir(os.path.join(self.tmp.name, folder))
