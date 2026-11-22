@@ -1,4 +1,4 @@
-"""Translate single-store gfx1013 compute programs under an explicit raw-UAV binding."""
+"""Translate raw-UAV constant-store gfx1013 compute programs under an explicit binding."""
 import argparse
 import hashlib
 import json
@@ -34,26 +34,43 @@ def lower(instructions, width, *, table_reg, descriptor_offset, group_reg=None, 
         scalar[group_reg] = "group"
     vector = {0: "local"}
     pending = set()
-    store = None
+    stores = []
+    written_spans = []
     if not instructions or instructions[-1] != "s_endpgm":
         raise ValueError("Missing final program exit")
 
     for line in instructions[:-1]:
         if re.fullmatch(r"s_inst_prefetch (?:0x[0-9a-f]+|\d+)|s_nop \d+", line):
             continue
-        if line == "s_waitcnt lgkmcnt(0)":
+        if m := re.fullmatch(r"s_clause (0x[0-9a-f]+|\d+)", line):
+            if int(m[1], 0) > 0x3f:
+                raise ValueError("Invalid s_clause operand")
+            continue
+        if line in ("s_waitcnt lgkmcnt(0)", "s_waitcnt lgkmcnt(0) vmcnt(0)", "s_waitcnt vmcnt(0) lgkmcnt(0)"):
             pending.clear()
-        elif m := re.fullmatch(r"s_mov_b32 s(\d+), (s\d+|0)", line):
+        elif line == "s_waitcnt vmcnt(0)":
+            continue
+        elif m := re.fullmatch(r"s_mov_b32 s(\d+), (s\d+|-?\d+|0x[0-9a-f]+)", line):
             dst, src = int(m[1]), m[2]
             if dst in pending or dst > 105:
                 raise ValueError("Invalid scalar destination or pending load")
-            if src == "0":
-                scalar[dst] = 0
-            else:
+            if src.startswith("s"):
                 n = int(src[1:])
-                if n in pending or n not in scalar:
+                if n > 105 or n in pending or n not in scalar:
                     raise ValueError("Unknown or pending scalar source")
                 scalar[dst] = scalar[n]
+            else:
+                value = int(src, 0)
+                if not -(1 << 31) <= value <= 0xffffffff:
+                    raise ValueError("Invalid scalar immediate")
+                scalar[dst] = value & 0xffffffff
+        elif m := re.fullmatch(r"s_movk_i32 s(\d+), (-?\d+|0x[0-9a-f]+)", line):
+            dst = int(m[1])
+            value = int(m[2], 0)
+            if dst in pending or dst > 105 or not -0x8000 <= value <= 0xffff:
+                raise ValueError("Invalid scalar destination or movk immediate")
+            signed = value - 0x10000 if value >= 0x8000 else value
+            scalar[dst] = signed & 0xffffffff
         elif m := re.fullmatch(r"s_load_dwordx4 s\[(\d+):(\d+)\], s\[(\d+):(\d+)\], (null|0x[0-9a-f]+)", line):
             dest, last, base, high = map(int, m.groups()[:4])
             offset = 0 if m[5] == "null" else int(m[5], 16)
@@ -65,11 +82,27 @@ def lower(instructions, width, *, table_reg, descriptor_offset, group_reg=None, 
             for component, reg in enumerate(regs):
                 scalar[reg] = ("uav", component)
             pending.update(regs)
-        elif m := re.fullmatch(r"v_mov_b32_e32 v(\d+), (-?\d+|0x[0-9a-f]+)", line):
-            value = int(m[2], 0)
-            if int(m[1]) > 255 or not -(1 << 31) <= value <= 0xffffffff:
-                raise ValueError("Invalid literal move")
-            vector[int(m[1])] = value & 0xffffffff
+        elif m := re.fullmatch(r"v_mov_b32(?:_e32|_e64)? v(\d+), (s\d+|v\d+|-?\d+|0x[0-9a-f]+)", line):
+            dst, src = int(m[1]), m[2]
+            if dst > 255:
+                raise ValueError("Invalid vector destination")
+            if src.startswith("s"):
+                n = int(src[1:])
+                val = scalar.get(n)
+                if n > 105 or n in pending or not isinstance(val, int):
+                    raise ValueError("Unresolved or non-constant scalar move source")
+                vector[dst] = val
+            elif src.startswith("v"):
+                n = int(src[1:])
+                val = vector.get(n)
+                if n > 255 or not isinstance(val, int):
+                    raise ValueError("Unresolved or non-constant vector move source")
+                vector[dst] = val
+            else:
+                value = int(src, 0)
+                if not -(1 << 31) <= value <= 0xffffffff:
+                    raise ValueError("Invalid literal move")
+                vector[dst] = value & 0xffffffff
         elif m := re.fullmatch(r"v_lshl_add_u32 v(\d+), s(\d+), (\d+), v(\d+)", line):
             dst, group, shift, local = map(int, m.groups())
             if (dst > 255 or group in pending or scalar.get(group) != "group"
@@ -82,7 +115,7 @@ def lower(instructions, width, *, table_reg, descriptor_offset, group_reg=None, 
             first, *last = map(int, re.findall(r"\d+", m[2]))
             base, high = int(m[4]), int(m[5])
             offset = int(m[7] or 0)
-            if (store or last != ([] if count == 1 else [first + count - 1])
+            if (last != ([] if count == 1 else [first + count - 1])
                     or high != base + 3 or base % 4 or offset % 4 or offset > 4095
                     or pending.intersection(range(base, high + 1))
                     or any(scalar.get(base + i) != ("uav", i) for i in range(4))):
@@ -95,18 +128,23 @@ def lower(instructions, width, *, table_reg, descriptor_offset, group_reg=None, 
                 address = f"tid.x * {stride}u + {offset}u"
             else:
                 raise ValueError("Unsupported store address")
+            span_end = offset + 4 * count
+            if any(lo < span_end and offset < hi for lo, hi in written_spans):
+                raise ValueError("Overlapping raw UAV stores")
+            written_spans.append((offset, span_end))
             values = [vector.get(reg) for reg in range(first, first + count)]
             if not all(isinstance(value, int) for value in values):
                 raise ValueError("Store data is not a known word")
             words = ", ".join(f"0x{value:08x}u" for value in values)
             arg = words if count == 1 else f"uint{count}({words})"
-            store = f"    outputData.Store{count if count > 1 else ''}({address}, {arg});"
+            stores.append(f"    outputData.Store{count if count > 1 else ''}({address}, {arg});")
         else:
             raise ValueError(f"Unsupported compute instruction: {line}")
-    if store is None:
-        raise ValueError("Expected one observable store")
+    if not stores:
+        raise ValueError("Expected at least one observable store")
+    body = "\n".join(stores)
     return (f"RWByteAddressBuffer outputData : register(u0);\n[numthreads({width},1,1)]\n"
-            f"void main(uint3 tid : SV_DispatchThreadID) {{\n{store}\n}}\n")
+            f"void main(uint3 tid : SV_DispatchThreadID) {{\n{body}\n}}\n")
 
 
 def main():
