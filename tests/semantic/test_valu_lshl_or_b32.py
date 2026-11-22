@@ -648,6 +648,134 @@ class TestValuLshlOrB32RegisterAliasing(unittest.TestCase):
             self.assertEqual(state.get_vgpr(lane, 1), 0x80)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class LshlOrStatusFlags:
+    """Architectural condition codes and status flags for v_lshl_or_b32."""
+    zero: bool
+    sign: bool
+    shift_truncated: bool
+    shift_overflow: bool
+    bitwise_overlap: bool
+    parity: bool
+    vcc_modified: bool = False
+
+
+def evaluate_lshl_or_flags(
+    res32: int,
+    s0: int,
+    s1: int,
+    s2: int,
+) -> LshlOrStatusFlags:
+    """Evaluate condition codes, bitwise overlap, and shift overflow."""
+    res = res32 & MASK32
+    shift = s1 & SHIFT_MASK
+    shifted_full = (s0 & MASK32) << shift
+    shifted32 = shifted_full & MASK32
+    s2_u32 = s2 & MASK32
+
+    bits_set = bin(res).count("1")
+
+    return LshlOrStatusFlags(
+        zero=(res == 0),
+        sign=bool(res & 0x8000_0000),
+        shift_truncated=(s1 > SHIFT_MASK),
+        shift_overflow=(shifted_full > MASK32),
+        bitwise_overlap=((shifted32 & s2_u32) != 0),
+        parity=(bits_set % 2) == 0,
+        vcc_modified=False,
+    )
+
+
+def compute_u32_bitwise_carry(a: int, b: int) -> int:
+    """Compute overlapping bit carry generation for logical operations."""
+    return (a & MASK32) & (b & MASK32)
+
+
+class TestValuLshlOrB32ConditionCodes(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow isolation."""
+
+    def test_condition_codes_zero_flag(self) -> None:
+        res = oracle_v_lshl_or_b32(0, 5, 0)
+        flags = evaluate_lshl_or_flags(res, 0, 5, 0)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.sign)
+        self.assertTrue(flags.parity)
+        self.assertFalse(flags.bitwise_overlap)
+
+        # Zero via shift overflow and zero mask: (0x80000000 << 1) | 0 == 0
+        res2 = oracle_v_lshl_or_b32(0x80000000, 1, 0)
+        flags2 = evaluate_lshl_or_flags(res2, 0x80000000, 1, 0)
+        self.assertTrue(flags2.zero)
+        self.assertTrue(flags2.shift_overflow)
+        self.assertFalse(flags2.bitwise_overlap)
+
+    def test_condition_codes_sign_flag(self) -> None:
+        res = oracle_v_lshl_or_b32(1, 31, 0)
+        flags = evaluate_lshl_or_flags(res, 1, 31, 0)
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.sign)
+
+        # Sign bit introduced via S2
+        res2 = oracle_v_lshl_or_b32(0x1234, 0, 0x80000000)
+        flags2 = evaluate_lshl_or_flags(res2, 0x1234, 0, 0x80000000)
+        self.assertTrue(flags2.sign)
+
+    def test_condition_codes_parity(self) -> None:
+        # 0 bits -> even (True)
+        self.assertTrue(evaluate_lshl_or_flags(0, 0, 0, 0).parity)
+        # 1 bit -> odd (False)
+        self.assertFalse(evaluate_lshl_or_flags(1, 0, 0, 1).parity)
+        # 2 bits -> even (True)
+        self.assertTrue(evaluate_lshl_or_flags(3, 0, 0, 3).parity)
+
+    def test_bitwise_overlap_and_shift_overflow(self) -> None:
+        # Overlapping bits: (0x0F << 4) | 0xF0 => 0xF0 & 0xF0 != 0
+        res = oracle_v_lshl_or_b32(0x0F, 4, 0xF0)
+        flags = evaluate_lshl_or_flags(res, 0x0F, 4, 0xF0)
+        self.assertTrue(flags.bitwise_overlap)
+        self.assertFalse(flags.shift_overflow)
+
+        # Non-overlapping: (0x0F << 4) | 0x0F => 0xF0 & 0x0F == 0
+        res2 = oracle_v_lshl_or_b32(0x0F, 4, 0x0F)
+        flags2 = evaluate_lshl_or_flags(res2, 0x0F, 4, 0x0F)
+        self.assertFalse(flags2.bitwise_overlap)
+
+        # Carry overlap function
+        carry = compute_u32_bitwise_carry(0xFF, 0x0F)
+        self.assertEqual(carry, 0x0F)
+
+    def test_shift_truncation_detection(self) -> None:
+        # S1 = 33 => truncated to 1
+        res = oracle_v_lshl_or_b32(0x11, 33, 0x22)
+        flags = evaluate_lshl_or_flags(res, 0x11, 33, 0x22)
+        self.assertTrue(flags.shift_truncated)
+        self.assertEqual(res, (0x11 << 1) | 0x22)
+
+    def test_vcc_isolation(self) -> None:
+        interp = ScalarVALUInterpreter()
+        canary_vcc = 0xFEEDFACECAFEBEEF
+        state = ScalarMachineState(vcc=canary_vcc)
+
+        instr = VLshlOrB32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Literal32(0xFFFFFFFF)),
+            src1=VOP3Operand(Literal32(1)),
+            src2=VOP3Operand(Literal32(0xFFFFFFFF)),
+        )
+        interp.step(instr, state)
+        self.assertEqual(state.vcc, canary_vcc)
+
+        simd = SIMDInterpreter()
+        simd_state = SIMDState(num_lanes=64, vcc=canary_vcc)
+        simd.step(instr, simd_state)
+        self.assertEqual(simd_state.vcc, canary_vcc)
+
+
+
 
 
 
