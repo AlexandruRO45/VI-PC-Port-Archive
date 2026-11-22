@@ -5,13 +5,19 @@
 Fully synthetic: the folders and their JSON files are written by hand in a temporary directory, so this needs no
 package, no built harness and no LEONIDA_FIRST_LIGHT_DIR.
 """
+from contextlib import redirect_stderr
+import io
+import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+import first_light as fl
 
 
 class CliBadJsonTests(unittest.TestCase):
@@ -75,6 +81,36 @@ class CliBadJsonTests(unittest.TestCase):
     def test_check_reports_a_manifest_without_its_required_keys(self):
         path = self.bad_manifest('{"foo": 1}')  # run_draw reads width/height first
         self.assert_one_clean_line(self.check_cli(), path)
+
+    def test_check_preserves_readback_when_a_manifest_dimension_is_invalid(self):
+        raw = os.path.join(self.out, "image.raw")
+        previous = b"previous readback"
+        for dimension in ("width", "height"):
+            for value in (0, -1, 4.0, True, "4", None):
+                with self.subTest(dimension=dimension, value=value):
+                    manifest = {"width": 4, "height": 4, dimension: value}
+                    path = self.bad_manifest(json.dumps(manifest))
+                    self.write(raw, previous)
+                    with patch.object(fl, "find_harness", return_value="fake-harness"), \
+                            patch.object(fl.subprocess, "run", side_effect=AssertionError("harness started")):
+                        with self.assertRaises(SystemExit) as failure:
+                            fl.main(["--check", "--out", self.out, "--work", self.work])
+                    self.assertIn(path, str(failure.exception))
+                    self.assertIn(f"positive integer for {dimension}", str(failure.exception))
+                    with open(raw, "rb") as saved:
+                        self.assertEqual(saved.read(), previous)
+
+    def test_prepare_rejects_nonpositive_dimensions_before_carving(self):
+        for dimension in ("width", "height"):
+            for value in ("0", "-1"):
+                with self.subTest(dimension=dimension, value=value):
+                    with patch.object(fl, "ensure_carve", side_effect=AssertionError("carve started")), \
+                            redirect_stderr(io.StringIO()) as stderr:
+                        with self.assertRaises(SystemExit) as failure:
+                            fl.main(["--game", self.game, "--work", self.work, "--out", self.out, "--no-fit",
+                                     f"--{dimension}", value])
+                    self.assertEqual(failure.exception.code, 2)
+                    self.assertIn(f"--{dimension} must be a positive integer", stderr.getvalue())
 
     def test_list_reports_a_truncated_index(self):
         path = self.bad_index('[{"name": "x", ')

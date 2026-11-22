@@ -380,6 +380,11 @@ def write_ppm(path: str, pixels, width: int, height: int) -> None:
 
 def run_draw(args, manifest: dict, out_dir: str) -> dict:
     harness = find_harness(args.harness)
+    for dimension in ("width", "height"):
+        size = manifest[dimension]
+        if type(size) is not int or size < 1:
+            path = os.path.join(out_dir, "manifest.json")
+            raise SystemExit(f"the first-light manifest {path} requires a positive integer for {dimension}")
     raw = os.path.join(out_dir, "image.raw")
     if os.path.exists(raw):
         os.unlink(
@@ -535,6 +540,9 @@ def main(argv=None) -> int:
     game = os.path.abspath(os.path.expanduser(a.game))
     if not a.no_fit and not a.obj:
         raise SystemExit("--obj is required unless --no-fit")
+    for dimension, size in (("width", a.width), ("height", a.height)):
+        if size < 1:
+            ap.error(f"--{dimension} must be a positive integer")
 
     index = ensure_carve(game, work)
     picked = choose(index, a.vs, a.ps)
