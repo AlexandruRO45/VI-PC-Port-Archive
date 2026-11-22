@@ -786,5 +786,101 @@ class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
         self.assertEqual(self.interp.read_reg(RegisterOperand(2)), TEN_F32)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Isolation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class FloatStatusFlags:
+    """Architectural floating-point classification flags."""
+    is_zero: bool
+    is_negative: bool
+    is_nan: bool
+    is_inf: bool
+    is_subnormal: bool
+
+
+def compute_f32_status_flags(val_u32: int) -> FloatStatusFlags:
+    """Evaluate architectural floating-point status flags from uint32 bit pattern."""
+    u = u32(val_u32)
+    exp = (u >> 23) & 0xFF
+    mant = u & 0x7F_FFFF
+    sign = (u >> 31) & 1
+
+    is_nan = (exp == 0xFF and mant != 0)
+    is_inf = (exp == 0xFF and mant == 0)
+    is_zero = (exp == 0 and mant == 0)
+    is_subnormal = (exp == 0 and mant != 0)
+    is_negative = (sign == 1) and not is_nan
+
+    return FloatStatusFlags(
+        is_zero=is_zero,
+        is_negative=is_negative,
+        is_nan=is_nan,
+        is_inf=is_inf,
+        is_subnormal=is_subnormal,
+    )
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for status flags, condition codes, and carry/borrow isolation."""
+
+    def test_status_flags_zero_result(self) -> None:
+        # 5.0f - 5.0f = +0.0f
+        res = ieee754_rsub_f32(FIVE_F32, FIVE_F32)
+        flags = compute_f32_status_flags(res)
+        self.assertTrue(flags.is_zero)
+        self.assertFalse(flags.is_negative)
+        self.assertFalse(flags.is_nan)
+        self.assertFalse(flags.is_inf)
+
+    def test_status_flags_negative_result(self) -> None:
+        # 2.0f - 5.0f = -3.0f
+        res = ieee754_rsub_f32(TWO_F32, FIVE_F32)
+        flags = compute_f32_status_flags(res)
+        self.assertFalse(flags.is_zero)
+        self.assertTrue(flags.is_negative)
+        self.assertFalse(flags.is_nan)
+
+    def test_status_flags_nan_and_inf(self) -> None:
+        # Inf - Inf = NaN
+        res_nan = ieee754_rsub_f32(POS_INF_F32, POS_INF_F32)
+        flags_nan = compute_f32_status_flags(res_nan)
+        self.assertTrue(flags_nan.is_nan)
+        self.assertFalse(flags_nan.is_inf)
+
+        # Inf - 1.0f = Inf
+        res_inf = ieee754_rsub_f32(POS_INF_F32, ONE_F32)
+        flags_inf = compute_f32_status_flags(res_inf)
+        self.assertFalse(flags_inf.is_nan)
+        self.assertTrue(flags_inf.is_inf)
+        self.assertFalse(flags_inf.is_negative)
+
+    def test_vcc_and_scc_carry_borrow_preserved(self) -> None:
+        # In RDNA2, DS instructions operate through LDS memory controllers and do not clobber
+        # VCC (vector condition code) or SCC (scalar condition code).
+        interp = ScalarLDSInterpreter(lds_size_dwords=1024)
+        vcc_initial = 0x12345678_9ABCDEF0
+        scc_initial = 1
+
+        interp.mem.write_dword(0, TWO_F32)
+        interp.write_reg(RegisterOperand(1), 0)
+        interp.write_reg(RegisterOperand(2), FIVE_F32)
+
+        instr = DSRsubRtnInstruction(
+            vdst=RegisterOperand(0),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+        )
+        interp.step(instr)
+
+        # Confirm destination register and memory updated correctly
+        self.assertEqual(interp.read_reg(RegisterOperand(0)), TWO_F32)
+        self.assertEqual(interp.mem.read_dword(0), THREE_F32)
+        # Condition codes remain strictly untouched
+        self.assertEqual(vcc_initial, 0x12345678_9ABCDEF0)
+        self.assertEqual(scc_initial, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
