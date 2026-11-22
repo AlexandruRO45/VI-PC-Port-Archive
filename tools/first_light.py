@@ -94,13 +94,22 @@ def prepare_lock(work: str):
     """Hold <work>/first_light/prepare.lock while this process prepares shaders in <work>.
 
     A prepare reads and writes folders that every prepare on the same --work shares: the carve under
-    <work>/shaders and the staged pair under <work>/first_light. Two of them at once replace each other's inputs
-    (the second run's container is translated, or its index published, under the first run), whatever --out each
-    was given. The second one stops with a message instead, before it touches anything. The lock is an operating
-    system lock on one byte of the file, so it is released when the process ends, however it ends: a crashed run
-    leaves nothing to clean up.
+    <work>/shaders, the staged pair under <work>/first_light and, by default, the output folder. Two of them at once
+    replace each other's inputs (the second run's container is translated, or its files published, under the first
+    run), whatever --out each was given. The second one stops with a message instead, before it touches anything.
+    The lock is an operating system lock on one byte of the file, so it is released when the process ends, however
+    it ends: a crashed run leaves nothing to clean up. main() keeps it until it returns, so it covers the mesh and
+    the manifest and the draw that reads the output as well. The folder that holds the lock must not be a link.
     """
     folder = os.path.join(work, "first_light")
+    real = os.path.join(os.path.realpath(work), "first_light")
+    if os.path.lexists(folder) and (
+        not os.path.isdir(folder) or os.path.normcase(os.path.realpath(folder)) != os.path.normcase(real)
+    ):
+        raise SystemExit(
+            f"{folder} is a symlink, a junction or a file: first_light.py creates its lock and its run folders "
+            "there and does not follow a link; remove it and run again"
+        )
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, "prepare.lock")
     handle = open(path, "a+b")
@@ -545,7 +554,7 @@ def load_json(
 
 
 def prepare_shaders(game: str, work: str, out_dir: str, vs: str, ps: str) -> tuple[list[dict], dict]:
-    """Carve if needed, translate the chosen pair and publish its files in out_dir (under prepare_lock)."""
+    """Carve if needed, translate the chosen pair and publish its files in out_dir (main holds prepare_lock)."""
     index = ensure_carve(game, work)
     picked = choose(index, vs, ps)
     meta = translate(work, picked)
@@ -570,6 +579,11 @@ def prepare_shaders(game: str, work: str, out_dir: str, vs: str, ps: str) -> tup
 
 
 def main(argv=None) -> int:
+    with contextlib.ExitStack() as locks:  # prepare_lock, once taken, is held until the run ends
+        return _main(argv, locks)
+
+
+def _main(argv, locks) -> int:
     ap = argparse.ArgumentParser(
         description="Draw one real game model with its own translated VS/PS."
     )
@@ -624,14 +638,16 @@ def main(argv=None) -> int:
     if a.list:
         if not a.game:
             raise SystemExit("--list needs --game")
-        with prepare_lock(work):
-            index = ensure_carve(os.path.abspath(a.game), work)
+        locks.enter_context(prepare_lock(work))
+        index = ensure_carve(os.path.abspath(a.game), work)
         for e in load_json(index, "carve index", list, entry_keys=("stage", "name")):
             if e["stage"] in ("vs", "ps"):
                 print(f"{e['stage']} {e['name']}")
         return 0
     existing = os.path.join(out_dir, "manifest.json")
     if a.check and not a.game and os.path.isfile(existing):
+        if os.path.lexists(os.path.join(work, "first_light")):  # a prepare could be rewriting this output
+            locks.enter_context(prepare_lock(work))
         manifest = load_json(existing, "first-light manifest", dict, keys=("width", "height"))
         run_draw(a, manifest, out_dir)
         return 0
@@ -641,8 +657,8 @@ def main(argv=None) -> int:
     if not a.no_fit and not a.obj:
         raise SystemExit("--obj is required unless --no-fit")
 
-    with prepare_lock(work):
-        picked, meta = prepare_shaders(game, work, out_dir, a.vs, a.ps)
+    locks.enter_context(prepare_lock(work))
+    picked, meta = prepare_shaders(game, work, out_dir, a.vs, a.ps)
     vertices, indices = read_obj(a.obj) if a.obj else ([], [])
     obj_sha256 = None
     if a.obj:

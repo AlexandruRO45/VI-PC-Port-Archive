@@ -76,10 +76,13 @@ are removed at the start of a run, so they hold that run's two shaders and nothi
 keep files there. The output folder (`first_light/out` or `--out`) and `<work>/shaders` are not emptied. If either
 folder is a symlink or a junction, or a file in it cannot be removed, the run stops and names it.
 Prepares that share a `--work` also share `<work>/shaders` and those two folders, whatever `--out` each has, so a
-run holds an operating-system lock on `<work>/first_light/prepare.lock` from the carve to the last file it writes into
-its output folder. A second `first_light.py` started in the meantime (also `--list`) stops before touching anything
+run holds an operating-system lock on `<work>/first_light/prepare.lock` from the carve until it exits, so the mesh, the
+manifest and the draw that reads them are covered too. A second `first_light.py` started in the meantime (also `--list`,
+and `--check` of an existing output when `<work>/first_light` exists) stops before touching anything
 and says another is preparing in that work folder; give it its own `--work`, or run it after the first. The lock is
-released when the process ends, even when it crashes, so there is no stale lock to delete.
+released when the process ends, even when it crashes, so there is no stale lock to delete. If `<work>/first_light` is a
+symlink or a junction the run stops before creating the lock. Two runs with different `--work` but the same `--out`
+are not covered.
 
 ## 4. The harness mode
 

@@ -339,6 +339,44 @@ class RunFolderTests(unittest.TestCase):
         self.prepare("first", "--out", str(self.tmp / "out_again"))
         self.assertEqual(self.handed[-1], ["first", "vertex"])
 
+    def test_the_lock_is_held_until_the_draw_that_reads_the_output_is_done(self) -> None:
+        """The default output folder is shared too: a second prepare must not rewrite it under a draw."""
+        refused = []
+
+        def draw(args, manifest, out_dir):
+            self.assertEqual(self.files(Path(out_dir)),
+                             ["index.json", "manifest.json", "ps.dxbc", "ps.spv", "vs.dxbc", "vs.spv"])
+            with self.assertRaises(SystemExit) as busy:
+                self.prepare("second")  # same default --out as the running prepare
+            self.assertIn("another first_light.py is preparing shaders", str(busy.exception))
+            refused.append(True)
+            return {}
+
+        with patch.object(fl, "run", side_effect=self.tools), patch.object(fl, "run_draw", side_effect=draw),                 redirect_stdout(io.StringIO()):
+            self.assertEqual(fl.main(["--game", str(self.tmp), "--work", str(self.work), "--no-fit",
+                                      "--vs", "vertex", "--ps", "first", "--run"]), 0)
+        self.assertEqual(refused, [True])
+        self.assertEqual(self.handed, [["first", "vertex"]])
+        self.assertEqual((self.work / "first_light" / "out" / "ps.spv").read_bytes(), b"spv first")
+        self.prepare("second")  # the lock went with the run
+
+    def test_the_lock_is_not_created_through_a_link_at_first_light(self) -> None:
+        for kind in LINK_KINDS:
+            with self.subTest(kind=kind):
+                work, outside = self.tmp / kind / "work", self.tmp / kind / "outside"
+                work.mkdir(parents=True)
+                outside.mkdir()
+                if not link_folder(kind, work / "first_light", outside):
+                    self.skipTest(f"cannot create a {kind} here")
+                with self.assertRaises(SystemExit) as refused:
+                    with fl.prepare_lock(str(work)):
+                        self.fail("the lock must not be taken through a link")
+                self.assertIn(str(work / "first_light"), str(refused.exception))
+                with self.assertRaises(SystemExit):
+                    with redirect_stdout(io.StringIO()):
+                        fl.main(["--game", str(self.tmp), "--work", str(work), "--list"])
+                self.assertEqual(os.listdir(outside), [])  # nothing was created in the link's target
+
     def linked(self, kind: str, where: str) -> tuple[Path, Path]:
         """A work folder whose first_light/<where> is a link of this kind to a folder outside it."""
         work, outside = self.tmp / kind / "work", self.tmp / kind / "outside"
