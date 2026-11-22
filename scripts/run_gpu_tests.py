@@ -23,6 +23,7 @@ SHADER_DIR = os.path.join(ROOT, "runtime", "test", "shaders")
 TRANSLATOR = os.path.join(ROOT, "tools", "rdna2spirv.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mc_command  # noqa: E402
+import translator_modes  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container, shader_source
 from check import Skip, clip_test, fmt_1010102_test, fmt_int_narrow_test, fmt_sint32_test, fmt_xy_xyz_test, tbuffer_store_test
@@ -273,15 +274,10 @@ def f16_interp_fallback() -> bool:
 
 
 def subgroup_temps() -> bool:
-    """LEONIDA_SUBGROUP_TEMPS=1 (or 0): translate with --subgroup-temps, so MoltenVK's SPIRV-Cross can't move a
-    subgroup operation into a short-circuiting && / ?: (cs_dpp_ops on MoltenVK 1.4.2). Unset, it is on where
-    tools/vk_subgroup_info.py reports driver_id 14 (VK_DRIVER_ID_MOLTENVK)."""
-    v = (os.environ.get("LEONIDA_SUBGROUP_TEMPS") or "").strip().lower()
-    if v in ("1", "true", "yes", "on"):
-        return True
-    if v in ("0", "false", "no", "off"):
-        return False
-    return _device_info().get("driver_id") == 14
+    """Translate with --subgroup-temps, so MoltenVK's SPIRV-Cross can't move a subgroup operation into a
+    short-circuiting && / ?: (cs_dpp_ops on MoltenVK 1.4.2): LEONIDA_SUBGROUP_TEMPS=1/0, else driver id 14, as every
+    entry point decides it (tools/translator_modes.py)."""
+    return translator_modes.resolve("subgroup_temps", info=_device_info)
 
 
 _DEVICE_INFO = []

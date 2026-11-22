@@ -37,6 +37,7 @@ TOOLS = os.path.join(HERE, "..", "..", "..", "tools")
 TRANSLATOR = os.path.join(TOOLS, "rdna2spirv.py")
 sys.path.insert(0, TOOLS)
 import mc_command  # noqa: E402
+import translator_modes  # noqa: E402
 
 MC = mc_command.mc_command()
 RSRC2, GROUP = 0x8088, (64, 1, 1)
@@ -165,7 +166,7 @@ def translate_tests(work, names):
         cmd.append("--f16-interp-fallback")
     if os.environ.get("LEONIDA_TEXOFF_FALLBACK") == "1":   # texel offsets without VK_KHR_maintenance8
         cmd.append("--texel-offset-fallback")
-    if os.environ.get("LEONIDA_SUBGROUP_TEMPS") == "1":   # subgroup operations kept out of && / ?: (SPIRV-Cross: MoltenVK)
+    if translator_modes.resolve("subgroup_temps"):   # LEONIDA_SUBGROUP_TEMPS, else the device (MoltenVK: SPIRV-Cross)
         cmd.append("--subgroup-temps")
     return subprocess.run(cmd).returncode
 

@@ -29,6 +29,8 @@ import tempfile
 from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "tools"))
+import translator_modes  # noqa: E402  (tools/: device-dependent translator modes, chosen as build.py chooses them)
 EXE = ".exe" if os.name == "nt" else ""
 UNSUPPORTED = 77                                       # a test tool exits with this when the device lacks a feature
 
@@ -796,6 +798,30 @@ def subgroup_size(spirv, name):
         return None
 
 
+def translator_modes_check(spirv, info=None):
+    """An empty string when the build was translated with the device-dependent modes this device takes
+    (tools/translator_modes.py: --subgroup-temps, from LEONIDA_SUBGROUP_TEMPS or the device), else what differs. Each
+    index.json entry translated with the mode records it, so a build made for another device, or with another setting of the
+    variable, is caught instead of giving words that depend on it. `info` is for the tests."""
+    try:
+        with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
+            index = json.load(f)
+    except (OSError, ValueError):
+        return ""            # no index: the shader checks report the missing modules
+    uses = [n for n, e in sorted(index.items()) if isinstance(e, dict)]
+    marked = [n for n in uses if index[n].get("subgroup_temps")]
+    want = translator_modes.resolve("subgroup_temps", info=info)
+    if want and len(marked) < len(uses):
+        missing = [n for n in uses if n not in marked]
+        return (f"{len(missing)} modules (first {missing[0]}) were translated without "
+                "--subgroup-temps, which this device takes (MoltenVK, or LEONIDA_SUBGROUP_TEMPS=1): run build.py "
+                "with the same device or variable")
+    if not want and marked:
+        return (f"{len(marked)} modules (first {marked[0]}) were translated with --subgroup-temps, which this device "
+                "doesn't take: run build.py with the same device, or set LEONIDA_SUBGROUP_TEMPS=1 here too")
+    return ""
+
+
 def bindless_test(tools, spirv, pixel="ps_tex"):
     """ps_tex: a texture found through the descriptor hash table and the bindless set (vk_bindless_test).
     ps_imgatomic: image atomics in a pixel shader through the set's r32ui storage arrays, checked per texel."""
@@ -1337,6 +1363,8 @@ def main():
     tools = sys.argv[2] if len(sys.argv) > 2 else os.path.join(HERE, "..", "..", "build")
     tools = pick_build_dir(os.path.abspath(tools), tuple(t + EXE for t in TEST_PROGRAMS))
     results = []
+    if problem := translator_modes_check(spirv):   # a build for another device: listed as a failure of its own
+        results.append(("translator_modes", problem))
     for name, groups, expect in COMPUTE:
         results.append((name, compute_test(tools, spirv, name, groups, expect)))
     results.append(("cs_wavemask", compute_test(tools, spirv, "cs_wavemask", "1", "wavemask",

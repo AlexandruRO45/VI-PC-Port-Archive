@@ -46,6 +46,7 @@ TOOLS = os.path.join(ROOT, "tools")
 sys.path.insert(0, TOOLS)
 from mc_command import mc_command  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
+import translator_modes  # noqa: E402
 
 VERSIONS = os.path.join(ROOT, "game")
 STAGES = ["check", "shaders", "assets", "runtime", "pipelines"]
@@ -971,15 +972,6 @@ def runtime_gpu_info() -> dict:
         return {}
 
 
-VK_DRIVER_ID_MOLTENVK = 14
-
-
-def runtime_gpu_spirv_cross() -> bool:
-    """Whether the GPU the runtime would use turns SPIR-V into source through SPIRV-Cross (MoltenVK, driver id 14),
-    which needs --subgroup-temps (tools/rdna2spirv.py, SUBGROUP_TEMPS). False when it can't tell."""
-    return runtime_gpu_info().get("driver_id") == VK_DRIVER_ID_MOLTENVK
-
-
 def runtime_gpu_per_vertex():
     """per_vertex_inputs as tools/vk_subgroup_info.py answers for the GPU the runtime would use: False where the
     driver can't compile PerVertexKHR (MoltenVK) or lacks fragmentShaderBarycentric, None when it can't tell."""
@@ -1607,10 +1599,14 @@ def main() -> int:
         log("shaders: the GPU the runtime would use can't take PerVertexKHR inputs (MoltenVK, or no "
             "fragmentShaderBarycentric): translating with --f16-interp-fallback")
         a.f16_interp_fallback = True
-    if "shaders" in stages and not a.subgroup_temps and runtime_gpu_spirv_cross():
-        log("shaders: the GPU the runtime would use is on MoltenVK, whose SPIRV-Cross can move a subgroup operation "
-            "into a short-circuiting expression: translating with --subgroup-temps")
-        a.subgroup_temps = True
+    if "shaders" in stages:
+        # tools/translator_modes.py, as every other entry point: --subgroup-temps, then LEONIDA_SUBGROUP_TEMPS, then
+        # the GPU the runtime would use (MoltenVK, whose SPIRV-Cross moves subgroup operations into && / ?:).
+        asked = a.subgroup_temps
+        a.subgroup_temps = translator_modes.resolve("subgroup_temps", cli=asked, info=runtime_gpu_info)
+        if a.subgroup_temps and not asked:
+            log("shaders: translating with --subgroup-temps (LEONIDA_SUBGROUP_TEMPS, or the runtime's GPU is on "
+                "MoltenVK, whose SPIRV-Cross can move a subgroup operation into a short-circuiting expression)")
     fallbacks = fallback_flags(a) if "shaders" in stages else ()
     preflight(stages, work, a.wav, runtime_build, emulate=emulate, keep_emulated=keep_emulated,
               fallbacks=fallbacks, jobs=a.jobs)

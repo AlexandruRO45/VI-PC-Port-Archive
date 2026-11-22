@@ -879,6 +879,44 @@ class Wave32LaneDumps(unittest.TestCase):
                 self.assertIn("observed wrong", problem)
 
 
+class TranslatorModesCheck(unittest.TestCase):
+    """check.py catches a build translated with other device-dependent modes than this device takes
+    (tools/translator_modes.py): every module translated with --subgroup-temps records subgroup_temps."""
+
+    def judge(self, index, info, env=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "index.json").write_text(json.dumps(index), encoding="utf-8")
+            environ = {k: v for k, v in check.os.environ.items() if k != "LEONIDA_SUBGROUP_TEMPS"}
+            environ.update(env or {})
+            with patch.dict(check.os.environ, environ, clear=True):
+                return check.translator_modes_check(tmp, info=info)
+
+    SG = {"capabilities": ["Shader", "GroupNonUniformBallot"]}
+    PLAIN = {"capabilities": ["Shader"]}
+
+    def test_matching_builds_pass(self):
+        self.assertEqual(self.judge({"a": self.SG, "b": self.PLAIN}, {"driver_id": 3}), "")
+        both = {"a": dict(self.SG, subgroup_temps=True), "b": dict(self.PLAIN, subgroup_temps=True)}
+        self.assertEqual(self.judge(both, {"driver_id": 14}), "")
+
+    def test_a_build_without_the_mode_on_moltenvk_fails(self):
+        problem = self.judge({"a": self.SG, "b": self.PLAIN}, {"driver_id": 14})
+        self.assertIn("without --subgroup-temps", problem)
+        self.assertIn("first a", problem)
+
+    def test_a_build_with_the_mode_elsewhere_fails(self):
+        self.assertIn("with --subgroup-temps", self.judge({"a": dict(self.SG, subgroup_temps=True)}, {"driver_id": 3}))
+
+    def test_the_variable_decides_as_for_build_py(self):
+        marked = {"a": dict(self.SG, subgroup_temps=True)}
+        self.assertEqual(self.judge(marked, {"driver_id": 3}, env={"LEONIDA_SUBGROUP_TEMPS": "1"}), "")
+        self.assertEqual(self.judge({"a": self.SG}, {"driver_id": 14}, env={"LEONIDA_SUBGROUP_TEMPS": "0"}), "")
+
+    def test_no_index_is_left_to_the_shader_checks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(check.translator_modes_check(tmp, info={"driver_id": 14}), "")
+
+
 class SamplerMipChecks(unittest.TestCase):
     """The S#/T# oracle check.py judges vk_sampler_test with, against hand-worked levels."""
 

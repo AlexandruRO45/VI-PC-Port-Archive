@@ -154,15 +154,19 @@ class RecordedFlagsTest(unittest.TestCase):
 class MainWiringTest(unittest.TestCase):
     """main() parses the four flags and hands the same tuple to preflight() and shaders()."""
 
-    def run_main(self, *extra_argv, per_vertex=None, driver_id=None):
+    def run_main(self, *extra_argv, per_vertex=None, driver_id=None, env=None):
         argv = ["make_game.py", "--stages", "shaders", *extra_argv]
+        environ = {k: v for k, v in os.environ.items() if k != "LEONIDA_SUBGROUP_TEMPS"}
+        environ.update(env or {})
         with mock.patch.object(sys, "argv", argv), \
+                mock.patch.dict(os.environ, environ, clear=True), \
                 mock.patch("make_game.below_normal"), \
                 mock.patch("make_game.choose_game", return_value=os.path.abspath("C:/dummy_game")), \
                 mock.patch("make_game.check", return_value={"expected_exe": "game.exe"}), \
                 mock.patch("make_game.wave64_settings", return_value=(False, True)), \
                 mock.patch("make_game.runtime_gpu_per_vertex", return_value=per_vertex), \
-                mock.patch("make_game.runtime_gpu_info", return_value={} if driver_id is None else {"driver_id": driver_id}), \
+                mock.patch("make_game.runtime_gpu_info",
+                           return_value={} if driver_id is None else {"driver_id": driver_id}), \
                 mock.patch("make_game.preflight") as preflight, \
                 mock.patch("make_game.shaders") as shaders, \
                 mock.patch("make_game.log"):
@@ -193,6 +197,15 @@ class MainWiringTest(unittest.TestCase):
         self.assertEqual(self.run_main(driver_id=3), ((), ()))
         self.assertEqual(self.run_main(), ((), ()))
         self.assertEqual(self.run_main("--subgroup-temps", driver_id=3), (("--subgroup-temps",),) * 2)
+
+    def test_subgroup_temps_takes_the_variable_as_the_other_entry_points_do(self):
+        """tools/translator_modes.py's order, as in run_gpu_tests.py and build.py: the flag, LEONIDA_SUBGROUP_TEMPS,
+        then the device. =0 turns it off on MoltenVK, =1 on elsewhere; the flag still wins over =0."""
+        self.assertEqual(self.run_main(driver_id=14, env={"LEONIDA_SUBGROUP_TEMPS": "0"}), ((), ()))
+        self.assertEqual(self.run_main(driver_id=3, env={"LEONIDA_SUBGROUP_TEMPS": "1"}),
+                         (("--subgroup-temps",),) * 2)
+        self.assertEqual(self.run_main("--subgroup-temps", driver_id=14, env={"LEONIDA_SUBGROUP_TEMPS": "0"}),
+                         (("--subgroup-temps",),) * 2)
 
 
 if __name__ == "__main__":
