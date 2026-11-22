@@ -1365,5 +1365,155 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(self.state.lds.read_dword(expected_idx), f32_to_bits(9.0))
 
 
+class TestNegativeControlsAndMutationDetection(unittest.TestCase):
+    """Phase 8: Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_and_parameter_rejection(self) -> None:
+        # Register bounds
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(256, RegType.VGPR)
+
+        v0 = RegisterOperand(0, RegType.VGPR)
+        s0 = RegisterOperand(0, RegType.SGPR)
+
+        # vdst cannot be SGPR
+        with self.assertRaises(ValueError):
+            DSSubRtnF32Instruction(vdst=s0, vaddr=v0, vdata0=v0)
+
+        # vaddr cannot be SGPR
+        with self.assertRaises(ValueError):
+            DSSubRtnF32Instruction(vdst=v0, vaddr=s0, vdata0=v0)
+
+        # Offset bounds (16-bit unsigned: 0..65535)
+        with self.assertRaises(ValueError):
+            DSSubRtnF32Instruction(vdst=v0, vaddr=v0, vdata0=v0, offset=-1)
+        with self.assertRaises(ValueError):
+            DSSubRtnF32Instruction(vdst=v0, vaddr=v0, vdata0=v0, offset=65536)
+
+        # LDS size must be power of two > 0
+        with self.assertRaises(ValueError):
+            LDSMemory(size_dwords=0)
+        with self.assertRaises(ValueError):
+            LDSMemory(size_dwords=-16)
+        with self.assertRaises(ValueError):
+            LDSMemory(size_dwords=100)
+
+        # SIMD wave_size must be 32 or 64
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_mutation_detection_addition_instead_of_subtraction(self) -> None:
+        def mutant_sub(a: int, b: int) -> int:
+            fa = bits_to_f32(a)
+            fb = bits_to_f32(b)
+            return f32_to_bits(fa + fb)
+
+        correct_result = oracle_sub_f32(FIVE_F32, TWO_F32)
+        mutant_result = mutant_sub(FIVE_F32, TWO_F32)
+
+        self.assertEqual(correct_result, THREE_F32)
+        self.assertEqual(mutant_result, f32_to_bits(7.0))
+        self.assertNotEqual(correct_result, mutant_result)
+
+    def test_mutation_detection_return_new_instead_of_old(self) -> None:
+        class PostOpReturnInterpreter(ScalarInterpreter):
+            def execute(self, instr: DSSubRtnF32Instruction, state: ScalarState) -> Tuple[int, int]:
+                old_val, new_mem = super().execute(instr, state)
+                state.set_reg(instr.vdst, new_mem)
+                return old_val, new_mem
+
+        state = ScalarState(lds_size_dwords=256)
+        state.lds.write_dword(2, TEN_F32)
+        state.set_vgpr(1, 8)
+        state.set_vgpr(2, TWO_F32)
+
+        instr = DSSubRtnF32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+        )
+
+        PostOpReturnInterpreter().execute(instr, state)
+        eight_f32 = f32_to_bits(8.0)
+        self.assertEqual(state.get_vgpr(0), eight_f32)
+        self.assertNotEqual(state.get_vgpr(0), TEN_F32)
+
+    def test_mutation_detection_dropped_offset(self) -> None:
+        class DroppedOffsetInterpreter(ScalarInterpreter):
+            def execute(self, instr: DSSubRtnF32Instruction, state: ScalarState) -> Tuple[int, int]:
+                no_off = DSSubRtnF32Instruction(
+                    vdst=instr.vdst,
+                    vaddr=instr.vaddr,
+                    vdata0=instr.vdata0,
+                    offset=0,
+                )
+                return super().execute(no_off, state)
+
+        state = ScalarState(lds_size_dwords=256)
+        state.lds.write_dword(1, TEN_F32)
+        state.lds.write_dword(2, TEN_F32)
+        state.set_vgpr(1, 4)
+        state.set_vgpr(2, ONE_F32)
+
+        instr = DSSubRtnF32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+            offset=4,
+        )
+
+        DroppedOffsetInterpreter().execute(instr, state)
+        self.assertEqual(state.lds.read_dword(1), f32_to_bits(9.0))
+        self.assertEqual(state.lds.read_dword(2), TEN_F32)
+
+    def test_mutation_detection_exec_mask_ignored(self) -> None:
+        class LeakySIMDInterpreter(SIMDInterpreter):
+            def execute(self, instr: DSSubRtnF32Instruction, state: SIMDState) -> list[Optional[int]]:
+                saved_mask = state.exec_mask
+                state.exec_mask = (1 << state.num_lanes) - 1
+                try:
+                    return super().execute(instr, state)
+                finally:
+                    state.exec_mask = saved_mask
+
+        simd = SIMDState(num_lanes=32, exec_mask=0, lds_size_dwords=256)
+        simd.lds.write_dword(5, TEN_F32)
+        for lane in range(32):
+            simd.set_lane_vgpr(lane, 1, 20)
+            simd.set_lane_vgpr(lane, 2, ONE_F32)
+
+        instr = DSSubRtnF32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+        )
+
+        LeakySIMDInterpreter().execute(instr, simd)
+        self.assertNotEqual(simd.lds.read_dword(5), TEN_F32)
+
+        simd.lds.write_dword(5, TEN_F32)
+        SIMDInterpreter().execute(instr, simd)
+        self.assertEqual(simd.lds.read_dword(5), TEN_F32)
+
+    def test_mutation_detection_ftz_flush_to_zero(self) -> None:
+        def mutant_oracle_ftz(a: int, b: int) -> int:
+            if is_subnormal(a):
+                a = POS_ZERO_F32
+            if is_subnormal(b):
+                b = POS_ZERO_F32
+            return oracle_sub_f32(a, b)
+
+        correct = oracle_sub_f32(SUBNORM_MAX, SUBNORM_MIN)
+        mutant = mutant_oracle_ftz(SUBNORM_MAX, SUBNORM_MIN)
+
+        self.assertEqual(correct, SUBNORM_MAX - SUBNORM_MIN)
+        self.assertEqual(mutant, POS_ZERO_F32)
+        self.assertNotEqual(correct, mutant)
+
+
 if __name__ == "__main__":
     unittest.main()
