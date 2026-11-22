@@ -9209,9 +9209,10 @@ class Gen:
             self.emit(f"{r} = OpFAdd %float {sel} {z}")
             self.dst(a[0], self.tou(self.flush_f32_mods(r, mods)))
         elif op in ("v_fma_legacy_f32", "v_fmac_legacy_f32"):
-            # GFX10.3 single-rounded FMA with DX9 0 * anything = +0.0 rule (does not flush f32 denormals).
+            # GFX10.3 single-rounded FMA with DX9 0 * anything = +0.0 rule; hardware (gfx1036) flushes f32
+            # denormals on inputs and result.
             srcs = (a[1], a[2], a[0]) if op == "v_fmac_legacy_f32" else a[1:4]
-            x, y, z = (self.src_f(t) for t in srcs)
+            x, y, z = (self.flush_f32(self.src_f(t)) for t in srcs)
             zx, zy, either, fma_r, add_r, r = (self.tmp() for _ in range(6))
             self.emit(f"{zx} = OpFOrdEqual %bool {x} %f0")
             self.emit(f"{zy} = OpFOrdEqual %bool {y} %f0")
@@ -9219,7 +9220,7 @@ class Gen:
             self.emit_fma(fma_r, x, y, z)
             self.emit(f"{add_r} = OpFAdd %float %f0 {z}")
             self.emit(f"{r} = OpSelect %float {either} {add_r} {fma_r}")
-            self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
+            self.dst(a[0], self.tou(self.flush_f32(self.clamp_mods(r, mods))))
         elif op in ("v_min3_i32", "v_min3_u32", "v_max3_i32", "v_max3_u32"):
             x, y, z = (self.src_u(t) for t in a[1:4])
             f = ("S" if op.endswith("i32") else "U") + ("Min" if "min" in op else "Max")

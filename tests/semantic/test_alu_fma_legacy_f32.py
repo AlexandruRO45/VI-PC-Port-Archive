@@ -109,16 +109,28 @@ class FmaLegacyF32Tests(unittest.TestCase):
         self.assertTrue(is_nan_bits(got2[2]))
         self.assertEqual(got2[3], POS_ZERO)
 
-    def test_denormals_not_flushed(self):
-        got = run_ps([
-            f"v_mov_b32 v1, {SUB_2M127:#x}",
-            f"v_mov_b32 v2, {ONE:#x}",
-            "v_mov_b32 v3, 0",
-            "v_fma_legacy_f32 v0, v1, v2, v3",
-            "v_fmac_legacy_f32 v3, v1, v2",
-        ])
-        self.assertEqual(got[0], SUB_2M127)
-        self.assertEqual(got[3], SUB_2M127)
+    def test_denormals_flushed_gfx1036(self):
+        # 7 native RDNA2 (gfx1036) denormal cases measured by @TheMrBeez: inputs and result flush f32 denormals.
+        cases = [
+            (0x00000003, ONE, POS_ZERO, 0x00000000),
+            (0x80000003, ONE, POS_ZERO, 0x00000000),
+            (TWO, 0x00000003, POS_ZERO, 0x00000000),
+            (POS_ZERO, ONE, 0x00000003, 0x00000000),
+            (0x00800000, HALF, POS_ZERO, 0x00000000),
+            (0x80800000, HALF, POS_ZERO, 0x80000000),
+            (ONE, 0x00800000, 0x80000003, 0x00800000),
+        ]
+        for x, y, z, want in cases:
+            with self.subTest(x=hex(x), y=hex(y), z=hex(z)):
+                got = run_ps([
+                    f"v_mov_b32 v1, {x:#x}",
+                    f"v_mov_b32 v2, {y:#x}",
+                    f"v_mov_b32 v3, {z:#x}",
+                    "v_fma_legacy_f32 v0, v1, v2, v3",
+                    "v_fmac_legacy_f32 v3, v1, v2",
+                ])
+                self.assertEqual(got[0], want)
+                self.assertEqual(got[3], want)
 
     def test_source_and_output_modifiers_and_operands(self):
         # Source abs/neg, output mul:2, div:2, clamp, SGPR + inline constants
