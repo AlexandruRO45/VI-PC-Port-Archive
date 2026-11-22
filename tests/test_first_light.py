@@ -318,6 +318,18 @@ class TexturedOracleTests(unittest.TestCase):
     def test_accepts_expected_textured_image(self):
         check_image(self.image(), self.manifest)
 
+    def test_coverage_includes_transparent_and_half_alpha_fragments(self):
+        centre = (0.0, 0.0, 0.0, 0.0)
+        probe = (0.8, 0.2, 0.1, 0.5)
+        self.manifest["centre_rgba"] = centre
+        self.manifest["rgba_probes"][0]["rgba"] = probe
+        stats = check_image(self.image(centre=centre, probe=probe), self.manifest)
+        self.assertEqual(stats["covered"], 4)
+
+    def test_untouched_textured_image_has_zero_coverage(self):
+        with self.assertRaisesRegex(AssertionError, "coverage 0.0000 outside"):
+            check_image(struct.pack("<64f", *([CLEAR] * 64)), self.manifest)
+
     def test_rejects_magenta_fallback_texture(self):
         with self.assertRaises(AssertionError):
             check_image(self.image(centre=(1.0, 0.0, 1.0, 1.0)), self.manifest)

@@ -420,7 +420,12 @@ def check_image(data: bytes, manifest: dict) -> dict:
             f"raw is {len(data)} bytes, expected {width * height * 16}"
         )
     pixels = struct.unpack(f"<{len(data) // 4}f", data)
-    covered = sum(1 for i in range(3, len(pixels), 4) if pixels[i] > 0.5)
+    if manifest.get("texture"):
+        # A sampled texel can be transparent black. The harness clears all four channels to -1.
+        clear_rgba = (manifest.get("clear", CLEAR),) * 4
+        covered = sum(pixel != clear_rgba for pixel in struct.iter_unpack("<4f", data))
+    else:
+        covered = sum(1 for i in range(3, len(pixels), 4) if pixels[i] > 0.5)
     ratio = covered / (width * height)
     if (
         not manifest.get("min_coverage", 0.0)
