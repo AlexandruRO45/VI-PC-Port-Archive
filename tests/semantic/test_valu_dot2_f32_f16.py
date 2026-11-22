@@ -637,5 +637,96 @@ class TestValuDot2F32F16SIMDDivergence(unittest.TestCase):
                 self.assertEqual(state.vgprs[lane][0], sentinel)
 
 
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestValuDot2F32F16RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing hazards and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.state = ScalarRegisterState()
+        self.interp = ScalarInterpreter()
+
+    def test_aliasing_dst_equals_src2_inplace_accumulator(self) -> None:
+        """v0 = v_dot2_f32_f16 v1, v2, v0 (in-place accumulator)."""
+        acc_initial = f32_to_bits(10.0)
+        self.state.vgprs[0] = acc_initial
+        self.state.vgprs[1] = pack_f16x2(f16_to_bits(2.0), f16_to_bits(3.0))
+        self.state.vgprs[2] = pack_f16x2(f16_to_bits(4.0), f16_to_bits(5.0))
+
+        instr = VDot2F32F16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(0),
+        )
+
+        res = self.interp.step(instr, self.state)
+        # 2*4 + 3*5 + 10 = 8 + 15 + 10 = 33.0
+        expected = f32_to_bits(33.0)
+        self.assertEqual(res, expected)
+        self.assertEqual(self.state.vgprs[0], expected)
+
+    def test_aliasing_dst_equals_src0_vector_overwrite(self) -> None:
+        """v0 = v_dot2_f32_f16 v0, v1, v2 (destination overwrites src0)."""
+        s0_val = pack_f16x2(f16_to_bits(1.5), f16_to_bits(2.5))
+        self.state.vgprs[0] = s0_val
+        self.state.vgprs[1] = pack_f16x2(f16_to_bits(2.0), f16_to_bits(4.0))
+        self.state.vgprs[2] = f32_to_bits(5.0)
+
+        instr = VDot2F32F16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2),
+        )
+
+        res = self.interp.step(instr, self.state)
+        # 1.5*2.0 + 2.5*4.0 + 5.0 = 3.0 + 10.0 + 5.0 = 18.0
+        expected = f32_to_bits(18.0)
+        self.assertEqual(res, expected)
+        self.assertEqual(self.state.vgprs[0], expected)
+
+    def test_aliasing_src0_equals_src1_self_dot_product(self) -> None:
+        """v0 = v_dot2_f32_f16 v1, v1, v2 (squared magnitude |v1|^2 + v2)."""
+        val_v1 = pack_f16x2(f16_to_bits(3.0), f16_to_bits(4.0))
+        self.state.vgprs[1] = val_v1
+        self.state.vgprs[2] = f32_to_bits(0.0)
+
+        instr = VDot2F32F16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2),
+        )
+
+        res = self.interp.step(instr, self.state)
+        # 3^2 + 4^2 + 0 = 9 + 16 = 25.0
+        expected = f32_to_bits(25.0)
+        self.assertEqual(res, expected)
+        # Source register v1 must remain unmodified
+        self.assertEqual(self.state.vgprs[1], val_v1)
+
+    def test_aliasing_triple_collision(self) -> None:
+        """v0 = v_dot2_f32_f16 v0, v0, v0."""
+        # Initial v0 bits: low f16=1.0 (0x3C00), high f16=2.0 (0x4000)
+        # Interpreted as f32: bits 0x40003C00 (~2.003662f)
+        s0_val = pack_f16x2(f16_to_bits(1.0), f16_to_bits(2.0))
+        self.state.vgprs[0] = s0_val
+
+        instr = VDot2F32F16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(0),
+            src2=Operand.vgpr(0),
+        )
+
+        expected = ref_dot2_f32_f16_bits(s0_val, s0_val, s0_val)
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, expected)
+        self.assertEqual(self.state.vgprs[0], expected)
+
+
 if __name__ == "__main__":
     unittest.main()
