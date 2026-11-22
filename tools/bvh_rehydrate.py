@@ -498,6 +498,15 @@ def main(argv=None):
             geometries.append(Geometry(vb, a.stride, ib, a.index16, transform))
         with open(a.dehydrated, "rb") as f:
             data = f.read()
+        # Read every input before publishing: a bad --compare must not replace --out.
+        ref = None
+        if a.compare:
+            try:
+                with open(a.compare, "rb") as f:
+                    ref = f.read()
+            except OSError as e:
+                print("error: cannot read %s: %s" % (a.compare, e), file=sys.stderr)
+                return 2
         out = rehydrate(data, geometries, a.header_offset)
     except (OSError, ValueError, struct.error) as e:
         print("error: %s" % e, file=sys.stderr)
@@ -509,13 +518,7 @@ def main(argv=None):
         return 2
     print("rehydrated %d bytes, %d leaves, %d geometries -> %s" % (len(out), Header(data, a.header_offset).num_elements,
                                                                   len(geometries), a.out))
-    if a.compare:
-        try:
-            with open(a.compare, "rb") as f:
-                ref = f.read()
-        except OSError as e:
-            print("error: cannot read %s: %s" % (a.compare, e), file=sys.stderr)
-            return 2
+    if ref is not None:
         diff = sum(x != y for x, y in zip(out, ref)) + abs(len(out) - len(ref))
         print("differs from %s in %d bytes" % (a.compare, diff))
     return 0

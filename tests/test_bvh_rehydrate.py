@@ -237,6 +237,27 @@ class TestErrorsAndCli(unittest.TestCase):
                 self.assertEqual(R.main([paths["in.bin"], "--geom", paths["vb.bin"], "--out", paths["out.bin"],
                                          "--transform", "1,2,3"]), 2)
 
+    def test_unreadable_compare_does_not_replace_out(self):
+        # BUILD-1188: the old output must survive a --compare file that cannot be read. The run would otherwise
+        # succeed (a geometry is given), so only the comparison read can stop it.
+        src, _, _ = build([(0, 0x01, 0, None, 0x09)])
+        with tempfile.TemporaryDirectory() as d:
+            paths = {k: os.path.join(d, k) for k in ("in.bin", "vb.bin", "ib.bin", "out.bin")}
+            for k, data in (("in.bin", src), ("vb.bin", QUADS.vertices), ("ib.bin", QUADS.indices)):
+                with open(paths[k], "wb") as f:
+                    f.write(data)
+            with open(paths["out.bin"], "wb") as f:
+                f.write(b"previous output")
+            for what, compare in (("missing", os.path.join(d, "missing.bin")), ("directory", d)):
+                out, err = io.StringIO(), io.StringIO()
+                with self.subTest(compare=what), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    self.assertEqual(R.main([paths["in.bin"], "--geom", paths["vb.bin"] + "," + paths["ib.bin"],
+                                             "--out", paths["out.bin"], "--compare", compare]), 2)
+                self.assertIn(compare, err.getvalue())
+                self.assertNotIn("rehydrated", out.getvalue())
+                with open(paths["out.bin"], "rb") as f:
+                    self.assertEqual(f.read(), b"previous output", what)
+
     def test_out_must_not_overwrite_an_input(self):
         src, _, _ = build([(0, 0x01, 0, None, 0x09), (0, 0x81, 0, 1, 0x09)])
         with tempfile.TemporaryDirectory() as d:
