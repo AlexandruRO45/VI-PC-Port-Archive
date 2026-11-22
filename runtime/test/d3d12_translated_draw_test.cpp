@@ -83,7 +83,10 @@ std::array<std::uint32_t, 4> make_vsharp(std::uint64_t base, std::uint32_t recor
 
 int main() {
     vktest::Device d;
-    EXPECT(d.create());
+    if (!d.create()) {  // no Vulkan loader or no 1.3 device: nothing to test (ctest: skipped)
+        std::fprintf(stderr, "d3d12_translated_draw_test: no Vulkan device, skipped\n");
+        return 77;
+    }
 
     // The translator-style library the build wrote, and the FSSM programs its index entries are keyed by.
     const std::filesystem::path root_dir = LEONIDA_TEST_M15_DIR;
