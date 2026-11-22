@@ -35,7 +35,7 @@ Mathematical and Architectural Properties:
       and rejected rather than guessed.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import List, Optional, Tuple, Union
 import unittest
@@ -173,6 +173,67 @@ class VMsadU8Instruction:
 
     def disassemble(self) -> str:
         return f"v_msad_u8 {self.dst.name}, {self.src0.disassemble()}, {self.src1.disassemble()}, {self.src2.disassemble()}"
+
+
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState:
+    """Architectural register file for a single execution thread."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 256)
+
+    def get_vgpr(self, index: int) -> int:
+        if not (0 <= index <= 255):
+            raise IndexError(f"VGPR index {index} out of range [0, 255]")
+        return self.vgprs[index] & MASK32
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        if not (0 <= index <= 255):
+            raise IndexError(f"VGPR index {index} out of range [0, 255]")
+        self.vgprs[index] = val & MASK32
+
+    def get_sgpr(self, index: int) -> int:
+        if not (0 <= index <= 255):
+            raise IndexError(f"SGPR index {index} out of range [0, 255]")
+        return self.sgprs[index] & MASK32
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        if not (0 <= index <= 255):
+            raise IndexError(f"SGPR index {index} out of range [0, 255]")
+        self.sgprs[index] = val & MASK32
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for v_msad_u8."""
+
+    def resolve_operand(self, op: VMsadOperand, state: ScalarMachineState) -> int:
+        if isinstance(op.source, Reg32):
+            if op.source.reg_type == RegType.VGPR:
+                return state.get_vgpr(op.source.index)
+            elif op.source.reg_type == RegType.SGPR:
+                return state.get_sgpr(op.source.index)
+            else:
+                raise ValueError(f"Unknown register type: {op.source.reg_type}")
+        elif isinstance(op.source, Literal32):
+            return op.source.value & MASK32
+        else:
+            raise TypeError(f"Unsupported operand source type: {type(op.source)}")
+
+    def step(self, instr: VMsadU8Instruction, state: ScalarMachineState) -> int:
+        # Atomic operand read phase
+        s0 = self.resolve_operand(instr.src0, state)
+        s1 = self.resolve_operand(instr.src1, state)
+        s2 = self.resolve_operand(instr.src2, state)
+
+        # Computation phase via reference oracle
+        result = oracle_v_msad_u8(s0, s1, s2)
+
+        # Write-back phase
+        state.set_vgpr(instr.dst.index, result)
+        return result
 
 
 # ==============================================================================
@@ -329,6 +390,108 @@ class TestValuMsadU8SymbolicAST(unittest.TestCase):
         src = VMsadOperand(Reg32(1, RegType.VGPR))
         with self.assertRaises(ValueError):
             VMsadU8Instruction(dst=dst, src0=src, src1=src, src2=src, clamp=True)
+
+
+class TestValuMsadU8ScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar interpreter."""
+
+    def setUp(self) -> None:
+        self.state = ScalarMachineState()
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_state_get_set(self) -> None:
+        self.assertEqual(self.state.get_vgpr(0), 0)
+        self.assertEqual(self.state.get_sgpr(0), 0)
+
+        self.state.set_vgpr(10, 0x12345678)
+        self.assertEqual(self.state.get_vgpr(10), 0x12345678)
+
+        self.state.set_sgpr(5, 0xABCDEF01)
+        self.assertEqual(self.state.get_sgpr(5), 0xABCDEF01)
+
+        # 32-bit truncation masking
+        self.state.set_vgpr(1, 0x1_0000_0042)
+        self.assertEqual(self.state.get_vgpr(1), 0x42)
+
+        with self.assertRaises(IndexError):
+            self.state.get_vgpr(-1)
+        with self.assertRaises(IndexError):
+            self.state.get_vgpr(256)
+        with self.assertRaises(IndexError):
+            self.state.get_sgpr(-1)
+        with self.assertRaises(IndexError):
+            self.state.get_sgpr(256)
+
+    def test_scalar_step_vgpr_sources(self) -> None:
+        # s0 = [10, 20, 30, 40], s1 = [10, 0, 30, 50], s2 = 100
+        # lane 1 is masked (s1 byte == 0)
+        # diffs: |10-10|=0, 0 (masked), |30-30|=0, |40-50|=10 -> sum = 10
+        # result = 100 + 10 = 110
+        s0_val = pack_bytes_u32(10, 20, 30, 40)
+        s1_val = pack_bytes_u32(10, 0, 30, 50)
+        s2_val = 100
+
+        self.state.set_vgpr(1, s0_val)
+        self.state.set_vgpr(2, s1_val)
+        self.state.set_vgpr(3, s2_val)
+
+        instr = VMsadU8Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VMsadOperand(Reg32(1, RegType.VGPR)),
+            src1=VMsadOperand(Reg32(2, RegType.VGPR)),
+            src2=VMsadOperand(Reg32(3, RegType.VGPR)),
+        )
+
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 110)
+        self.assertEqual(self.state.get_vgpr(0), 110)
+
+    def test_scalar_step_sgpr_and_literal_sources(self) -> None:
+        s0_val = pack_bytes_u32(0, 0, 0, 0)
+        s1_val = 0xFFFFFFFF  # max diff 1020
+
+        self.state.set_vgpr(1, s0_val)
+        self.state.set_sgpr(4, s1_val)
+
+        instr = VMsadU8Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VMsadOperand(Reg32(1, RegType.VGPR)),
+            src1=VMsadOperand(Reg32(4, RegType.SGPR)),
+            src2=VMsadOperand(Literal32(500)),
+        )
+
+        res = self.interp.step(instr, self.state)
+        # 500 + 1020 = 1520
+        self.assertEqual(res, 1520)
+        self.assertEqual(self.state.get_vgpr(0), 1520)
+
+    def test_sequential_instruction_flow(self) -> None:
+        # Step 1: v0 = v_msad_u8(v1, v2, 0)
+        # Step 2: v3 = v_msad_u8(v1, v2, v0)  (accumulating with previous result)
+        self.state.set_vgpr(1, pack_bytes_u32(1, 2, 3, 4))
+        self.state.set_vgpr(2, pack_bytes_u32(2, 3, 4, 5))
+
+        # diffs: |1-2|=1, |2-3|=1, |3-4|=1, |4-5|=1 -> sum = 4
+        instr1 = VMsadU8Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VMsadOperand(Reg32(1, RegType.VGPR)),
+            src1=VMsadOperand(Reg32(2, RegType.VGPR)),
+            src2=VMsadOperand(Literal32(0)),
+        )
+        res1 = self.interp.step(instr1, self.state)
+        self.assertEqual(res1, 4)
+        self.assertEqual(self.state.get_vgpr(0), 4)
+
+        instr2 = VMsadU8Instruction(
+            dst=Reg32(3, RegType.VGPR),
+            src0=VMsadOperand(Reg32(1, RegType.VGPR)),
+            src1=VMsadOperand(Reg32(2, RegType.VGPR)),
+            src2=VMsadOperand(Reg32(0, RegType.VGPR)),
+        )
+        res2 = self.interp.step(instr2, self.state)
+        # 4 + 4 = 8
+        self.assertEqual(res2, 8)
+        self.assertEqual(self.state.get_vgpr(3), 8)
 
 
 if __name__ == "__main__":
