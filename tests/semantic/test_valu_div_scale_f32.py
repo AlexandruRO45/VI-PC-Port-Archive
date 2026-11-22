@@ -1241,5 +1241,128 @@ class TestDivScaleF32SIMDMultiLane(unittest.TestCase):
         self.assertEqual(wave.exec_hi, 0x9ABCDEF0)
 
 
+class TestDivScaleF32RegisterAliasing(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def test_dst_alias_src0_in_place(self):
+        rf = ScalarRegisterFile()
+        interp = DivScaleF32ScalarInterpreter(rf)
+
+        small = 2.0 ** -100
+        # v0 = small (s0), v1 = small (s1), v2 = 1.0 (s2)
+        rf.write_vgpr_f32(0, small)
+        rf.write_vgpr_f32(1, small)
+        rf.write_vgpr_f32(2, 1.0)
+
+        # In-place scaling of v0
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F32,
+            dst=ASTOperand.vgpr(0),
+            sdst=ASTOperand.vcc(),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(1),
+            src2=ASTOperand.vgpr(2),
+        )
+        d_res, vcc_res = interp.step(inst)
+        self.assertEqual(vcc_res, 1)
+        self.assertAlmostEqual(rf.read_vgpr_f32(0), small * SCALE64_POS)
+
+        # src1 and src2 must remain strictly preserved
+        self.assertEqual(rf.read_vgpr_f32(1), small)
+        self.assertEqual(rf.read_vgpr_f32(2), 1.0)
+
+    def test_dst_alias_src1_denominator(self):
+        rf = ScalarRegisterFile()
+        interp = DivScaleF32ScalarInterpreter(rf)
+
+        small = 2.0 ** -100
+        rf.write_vgpr_f32(0, small)  # dst and src1
+        rf.write_vgpr_f32(1, small)  # src0
+        rf.write_vgpr_f32(2, 1.0)    # src2
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F32,
+            dst=ASTOperand.vgpr(0),
+            sdst=ASTOperand.vcc(),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(0),
+            src2=ASTOperand.vgpr(2),
+        )
+        d_res, vcc_res = interp.step(inst)
+        self.assertEqual(vcc_res, 1)
+        self.assertAlmostEqual(rf.read_vgpr_f32(0), small * SCALE64_POS)
+        self.assertEqual(rf.read_vgpr_f32(1), small)
+        self.assertEqual(rf.read_vgpr_f32(2), 1.0)
+
+    def test_dst_alias_src2_numerator(self):
+        rf = ScalarRegisterFile()
+        interp = DivScaleF32ScalarInterpreter(rf)
+
+        small = 2.0 ** -100
+        rf.write_vgpr_f32(0, 1.0)    # dst and src2
+        rf.write_vgpr_f32(1, small)  # src0
+        rf.write_vgpr_f32(2, small)  # src1
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F32,
+            dst=ASTOperand.vgpr(0),
+            sdst=ASTOperand.vcc(),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(0),
+        )
+        d_res, vcc_res = interp.step(inst)
+        self.assertEqual(vcc_res, 1)
+        self.assertAlmostEqual(rf.read_vgpr_f32(0), small * SCALE64_POS)
+        self.assertEqual(rf.read_vgpr_f32(1), small)
+        self.assertEqual(rf.read_vgpr_f32(2), small)
+
+    def test_all_operands_fully_aliased(self):
+        rf = ScalarRegisterFile()
+        interp = DivScaleF32ScalarInterpreter(rf)
+
+        normal = 2.0
+        rf.write_vgpr_f32(0, normal)
+
+        # v_div_scale_f32 v0, vcc, v0, v0, v0
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F32,
+            dst=ASTOperand.vgpr(0),
+            sdst=ASTOperand.vcc(),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(0),
+            src2=ASTOperand.vgpr(0),
+        )
+        d_res, vcc_res = interp.step(inst)
+        self.assertEqual(vcc_res, 0)
+        self.assertEqual(rf.read_vgpr_f32(0), normal)
+
+    def test_unrelated_registers_strictly_preserved(self):
+        rf = ScalarRegisterFile()
+        interp = DivScaleF32ScalarInterpreter(rf)
+
+        sentinel = 0xDEADBEEF
+        for i in range(16):
+            rf.write_vgpr(i, sentinel)
+
+        rf.write_vgpr_f32(1, 2.0)
+        rf.write_vgpr_f32(2, 2.0)
+        rf.write_vgpr_f32(3, 10.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F32,
+            dst=ASTOperand.vgpr(0),
+            sdst=ASTOperand.vcc(),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(3),
+        )
+        interp.step(inst)
+
+        self.assertEqual(rf.read_vgpr_f32(0), 2.0)
+        for i in range(4, 16):
+            self.assertEqual(rf.read_vgpr(i), sentinel)
+
+
 if __name__ == "__main__":
     unittest.main()
