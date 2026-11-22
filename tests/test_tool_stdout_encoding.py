@@ -1,4 +1,4 @@
-"""Tools must not die printing a path that the console's code page can't write.
+"""Tools and scripts must not die printing a path that the console's code page can't write.
 
 On Windows a redirected stdout (tool.py > log.txt, or a pipe from make_game.py) is encoded with the console's ANSI
 code page, and `python -I` ignores PYTHONUTF8 and PYTHONIOENCODING. A caller path with a character outside that
@@ -21,11 +21,7 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
 PROGRAM_DIRS = ("tools", "scripts", "viewer")
-# Still without the guard because other open pull requests change these files; each gets it there or after them.
-NOT_YET_GUARDED = {
-    "scripts/shader_stats.py",    # guard added separately, see #2135's file
-    "scripts/run_wine_tests.py",  # guard added separately; open Wine runner pull requests change this file
-}
+NOT_YET_GUARDED = set()
 MARK = ""
 
 
@@ -77,7 +73,7 @@ class ScriptsAndViewer(unittest.TestCase):
             os.makedirs(disasm)
             report = os.path.join(tmp, "rep-" + MARK + ".json")
             r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "scripts", "audit_shader4_regs.py"),
-                                disasm, "--json", report], capture_output=True, cwd=ROOT, timeout=300)
+                                 disasm, "--json", report], capture_output=True, cwd=ROOT, timeout=300)
             err = r.stderr.decode("utf-8", "replace")
             self.assertNotIn("Traceback", err)
             self.assertEqual(r.returncode, 0, err)
