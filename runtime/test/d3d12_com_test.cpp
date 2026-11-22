@@ -262,8 +262,8 @@ int main(int argc, char** argv) {
                        !indirect->count_buffer);
             }
 
-            // A dispatch needs the parent's compute pipeline and root signature, which the bundle cannot know:
-            // the parent's Close fails when the bundle plays, not the bundle's.
+            // A bundle recorded without a compute pipeline does not borrow one from the parent. It closes and plays
+            // successfully, but contributes no dispatch command (D3D-378; measured on the default adapter and WARP).
             Ref<ID3D12CommandAllocator> dispatch_bundle_allocator, dispatch_parent_allocator;
             Ref<ID3D12GraphicsCommandList8> dispatch_bundle, dispatch_parent;
             EXPECT(make_bundle(dispatch_bundle_allocator, dispatch_bundle) &&
@@ -271,7 +271,9 @@ int main(int argc, char** argv) {
             dispatch_bundle->ExecuteIndirect(dispatch_signature.p, 1, arguments, 0, nullptr, 0);
             EXPECT(dispatch_bundle->Close() == S_OK);
             dispatch_parent->ExecuteBundle(dispatch_bundle.p);
-            EXPECT(dispatch_parent->Close() == E_INVALIDARG);
+            EXPECT(dispatch_parent->Close() == S_OK);
+            played.clear();
+            EXPECT(rt::d3d12::recorded_commands(dispatch_parent.p, played) && played.empty());
 
             // Arguments that need nothing from the parent fail the bundle's own Close.
             Ref<ID3D12CommandAllocator> count_allocator, null_allocator, zero_allocator;

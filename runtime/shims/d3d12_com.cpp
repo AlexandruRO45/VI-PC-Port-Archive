@@ -221,7 +221,9 @@ public:
         if (!state) return;
         if (type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE) return SetPipelineState(state);
         defer([=](GraphicsCommandList& l) { l.set_pipeline(state); });
-        hold(state);
+        // The deferred call supplies the state when the bundle plays; the local copy records what later bundle
+        // commands had bound when the application recorded them.
+        set_pipeline(state);
     }
 
     void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList* command_list) override {
@@ -256,7 +258,11 @@ public:
 
     void STDMETHODCALLTYPE SetPipelineState(ID3D12PipelineState* state) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::SetPipelineState");
-        if (defer([=](GraphicsCommandList& l) { l.set_pipeline(state); })) return hold(state);
+        if (defer([=](GraphicsCommandList& l) { l.set_pipeline(state); })) {
+            // Keep the bundle's recording-time pipeline state too. Commands replay on the parent later, but whether
+            // an indirect dispatch has a pipeline is decided where it is recorded, not from the parent's state.
+            return set_pipeline(state);
+        }
         set_pipeline(state);
     }
 
@@ -678,7 +684,12 @@ public:
             UINT stride = 0;
             if (!command_signature_info(signature, kind, stride) || !argument_buffer || count_buffer)
                 return check(false);
+            const bool dispatch_without_pipeline =
+                kind == leonida::IndirectKind::dispatch && max_command_count && !compute_pipeline_;
             if (defer([=](GraphicsCommandList& l) {
+                    // A bundle created without a compute PSO does not borrow the parent's PSO for this command. Both
+                    // the default Windows adapter and WARP leave the output untouched (D3D-378).
+                    if (dispatch_without_pipeline) return;
                     l.record_execute_indirect(signature, max_command_count, argument_buffer, argument_buffer_offset,
                                               nullptr, 0);
                 }, true)) {
