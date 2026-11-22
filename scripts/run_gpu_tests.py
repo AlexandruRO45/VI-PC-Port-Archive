@@ -997,6 +997,11 @@ def run_suite(a, work: str) -> int:
                 with open(raw, "rb") as f:
                     problem, covered = texoff_problem(f.read(), msg)
                 results.append((name, not problem, problem or f"4096/4096 pixels exact ({covered})"))
+        elif name.startswith("ps_w64_"):
+            # SHADER-10 partition-invariance fixtures: judged by comparing the same shader at a required fragment
+            # subgroup size of 64 and of 32 (tier A/B must agree, tier C must differ), which one vk_harness run
+            # can't do. runtime/test/shaders/w64_graphics.py runs them.
+            results.append((name, None, "SKIP (run by runtime/test/shaders/w64_graphics.py)"))
         elif name.startswith("ps_"):
             raw = os.path.join(raw_dir, f"{name}.raw")
             vs = os.path.join(spirv_dir, "vs_ids.spv") if name == "ps_flat" else vs_tri   # check.py draws ps_flat with vs_ids
