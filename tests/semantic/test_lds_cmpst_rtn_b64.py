@@ -1207,8 +1207,213 @@ class TestIEEE754Boundaries(unittest.TestCase):
         self.assertEqual(state.lds.read_qword(addr), MAX_SUBNORMAL_F64)
 
 
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Phase 8: Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_registers(self) -> None:
+        with self.assertRaises(ValueError):
+            RegSingle(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegSingle(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegPair(255, RegType.VGPR)  # Pair cannot start at 255 (needs 255 and 256)
+        with self.assertRaises(ValueError):
+            RegPair(-1, RegType.VGPR)
+
+    def test_syntax_rejection_instruction_operands(self) -> None:
+        v0_pair = RegPair(0, RegType.VGPR)
+        v0_single = RegSingle(0, RegType.VGPR)
+        s0_pair = RegPair(0, RegType.SGPR)
+
+        with self.assertRaises(ValueError):
+            DSCmpstRtnB64Instruction(vdst=s0_pair, vaddr=v0_single, vdata0=v0_pair, vdata1=v0_pair)
+        with self.assertRaises(ValueError):
+            DSCmpstRtnB64Instruction(vdst=v0_pair, vaddr=v0_single, vdata0=v0_pair, vdata1=v0_pair, offset=-1)
+        with self.assertRaises(ValueError):
+            DSCmpstRtnB64Instruction(vdst=v0_pair, vaddr=v0_single, vdata0=v0_pair, vdata1=v0_pair, offset=65536)
+
+    def test_syntax_rejection_memory_and_simd_state(self) -> None:
+        with self.assertRaises(ValueError):
+            LDSMemory(size_dwords=0)
+        with self.assertRaises(ValueError):
+            LDSMemory(size_dwords=-16)
+        with self.assertRaises(ValueError):
+            LDSMemory(size_dwords=500)  # Non-power-of-2
+
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_negative_control_bit_perturbation(self) -> None:
+        old_val, new_mem, swapped = ref_ds_cmpst_rtn_b64(0x1000, 0x1000, 0x2000)
+        self.assertTrue(swapped)
+
+        perturbed_old = old_val ^ 1
+        perturbed_new = new_mem ^ (1 << 63)
+        self.assertNotEqual(old_val, perturbed_old)
+        self.assertNotEqual(new_mem, perturbed_new)
+
+    def test_mutation_detection_low_dword_only(self) -> None:
+        # Mutant: only updates low 32 bits in 64-bit compare-and-swap
+        def mutant_cmpst_b64(curr: int, cmp_val: int, new_val: int) -> Tuple[int, int, bool]:
+            if curr == cmp_val:
+                # Bug: preserves old high dword, only overwriting low dword
+                new_mem = (curr & (MASK32 << 32)) | (new_val & MASK32)
+                return curr, new_mem, True
+            return curr, curr, False
+
+        initial = 0x1111_2222_3333_4444
+        target = 0xAAAA_BBBB_CCCC_DDDD
+
+        correct_old, correct_new, _ = ref_ds_cmpst_rtn_b64(initial, initial, target)
+        mutant_old, mutant_new, _ = mutant_cmpst_b64(initial, initial, target)
+
+        self.assertEqual(correct_new, target)
+        self.assertNotEqual(correct_new, mutant_new)
+
+    def test_mutation_detection_unconditional_swap(self) -> None:
+        def mutant_cmpst(curr: int, cmp_val: int, new_val: int) -> Tuple[int, int, bool]:
+            return curr, new_val, True
+
+        correct_old, correct_new, correct_swap = ref_ds_cmpst_rtn_b64(100, 200, 300)
+        mutant_old, mutant_new, mutant_swap = mutant_cmpst(100, 200, 300)
+
+        self.assertFalse(correct_swap)
+        self.assertTrue(mutant_swap)
+        self.assertNotEqual(correct_new, mutant_new)
+
+    def test_mutation_detection_return_new_instead_of_old(self) -> None:
+        def mutant_return_post_val(curr: int, cmp_val: int, new_val: int) -> Tuple[int, int, bool]:
+            old, new_m, sw = ref_ds_cmpst_rtn_b64(curr, cmp_val, new_val)
+            return new_m, new_m, sw
+
+        correct_old, _, _ = ref_ds_cmpst_rtn_b64(50, 50, 99)
+        mutant_old, _, _ = mutant_return_post_val(50, 50, 99)
+
+        self.assertEqual(correct_old, 50)
+        self.assertEqual(mutant_old, 99)
+        self.assertNotEqual(correct_old, mutant_old)
+
+    def test_mutation_detection_simd_exec_leak(self) -> None:
+        class MutantSIMDInterpreter(SIMDInterpreter):
+            def execute(self, instr: DSCmpstRtnB64Instruction, state: SIMDState) -> List[Optional[int]]:
+                results: List[Optional[int]] = [None] * state.num_lanes
+                for lane in range(state.num_lanes):
+                    # Bug: ignores is_lane_active
+                    vaddr = state.get_lane_vgpr(lane, instr.vaddr.index)
+                    cmp_val = state.resolve_lane_operand64(instr.vdata0, lane)
+                    new_val = state.resolve_lane_operand64(instr.vdata1, lane)
+                    eff_addr = calc_lds_effective_address(vaddr, instr.offset)
+                    curr_val = state.lds.read_qword(eff_addr)
+                    old_val, updated_mem, swapped = ref_ds_cmpst_rtn_b64(curr_val, cmp_val, new_val)
+                    if swapped:
+                        state.lds.write_qword(eff_addr, updated_mem)
+                    results[lane] = old_val
+                    state.set_lane_u64_vgpr(lane, instr.vdst.index, old_val)
+                return results
+
+        state = SIMDState(num_lanes=32, exec_mask=0, lds_size_dwords=1024)
+        sentinel = 0x9999_9999_9999_9999
+        for lane in range(32):
+            state.set_lane_u64_vgpr(lane, 0, sentinel)
+            state.set_lane_vgpr(lane, 2, 0x40)
+            state.set_lane_u64_vgpr(lane, 4, 10)
+            state.set_lane_u64_vgpr(lane, 6, 20)
+
+        state.lds.write_qword(0x40, 10)
+        instr = DSCmpstRtnB64Instruction(
+            vdst=RegPair(0),
+            vaddr=RegSingle(2),
+            vdata0=RegPair(4),
+            vdata1=RegPair(6),
+        )
+
+        mutant = MutantSIMDInterpreter()
+        mutant.execute(instr, state)
+
+        corrupted = [l for l in range(32) if state.get_lane_u64_vgpr(l, 0) != sentinel]
+        self.assertEqual(len(corrupted), 32)
+        self.assertNotEqual(state.lds.read_qword(0x40), 10)
+
+    def test_mutation_detection_premature_writeback_aliasing(self) -> None:
+        class PrematureWritebackInterpreter(ScalarInterpreter):
+            def execute(self, instr: DSCmpstRtnB64Instruction, state: ScalarState) -> Tuple[int, int, bool]:
+                state.set_reg_pair(instr.vdst, 0xDEAD_BEEF_DEAD_BEEF)
+                vaddr = state.get_reg_single(instr.vaddr)
+                cmp_val = state.resolve_operand64(instr.vdata0)
+                new_val = state.resolve_operand64(instr.vdata1)
+                return state.lds.atomic_cmpst_rtn_b64(vaddr=vaddr, cmp_val64=cmp_val, new_val64=new_val, offset=instr.offset)
+
+        state = ScalarState(lds_size_dwords=1024)
+        addr = 0x50
+        initial_val = 0x1111_2222_3333_4444
+        state.lds.write_qword(addr, initial_val)
+        state.set_reg_single(RegSingle(2), addr)
+        state.set_reg_pair(RegPair(0), initial_val) # v[0:1] is both vdst and vdata0
+        state.set_reg_pair(RegPair(4), 0x9999)
+
+        instr = DSCmpstRtnB64Instruction(
+            vdst=RegPair(0),
+            vaddr=RegSingle(2),
+            vdata0=RegPair(0),
+            vdata1=RegPair(4),
+        )
+
+        buggy = PrematureWritebackInterpreter()
+        old_val, new_mem, swapped = buggy.execute(instr, state)
+        # Buggy interpreter overwrote cmp_val before reading it, causing mismatch
+        self.assertFalse(swapped)
+        self.assertNotEqual(new_mem, 0x9999)
+
+    def test_mutation_detection_reversed_collision_order(self) -> None:
+        class ReversedCollisionSIMDInterpreter(SIMDInterpreter):
+            def execute(self, instr: DSCmpstRtnB64Instruction, state: SIMDState) -> List[Optional[int]]:
+                results: List[Optional[int]] = [None] * state.num_lanes
+                for lane in reversed(range(state.num_lanes)):
+                    if not state.is_lane_active(lane):
+                        continue
+                    vaddr = state.get_lane_vgpr(lane, instr.vaddr.index)
+                    cmp_val = state.resolve_lane_operand64(instr.vdata0, lane)
+                    new_val = state.resolve_lane_operand64(instr.vdata1, lane)
+                    eff_addr = calc_lds_effective_address(vaddr, instr.offset)
+                    curr_val = state.lds.read_qword(eff_addr)
+                    old_val, updated_mem, swapped = ref_ds_cmpst_rtn_b64(curr_val, cmp_val, new_val)
+                    if swapped:
+                        state.lds.write_qword(eff_addr, updated_mem)
+                    results[lane] = old_val
+                    state.set_lane_u64_vgpr(lane, instr.vdst.index, old_val)
+                return results
+
+        state = SIMDState(num_lanes=32, exec_mask=0x3, lds_size_dwords=1024)
+        common_addr = 0x100
+        state.lds.write_qword(common_addr, 10)
+
+        state.set_lane_vgpr(0, 2, common_addr)
+        state.set_lane_u64_vgpr(0, 4, 10)
+        state.set_lane_u64_vgpr(0, 6, 20)
+        state.set_lane_vgpr(1, 2, common_addr)
+        state.set_lane_u64_vgpr(1, 4, 20)
+        state.set_lane_u64_vgpr(1, 6, 30)
+
+        instr = DSCmpstRtnB64Instruction(
+            vdst=RegPair(0),
+            vaddr=RegSingle(2),
+            vdata0=RegPair(4),
+            vdata1=RegPair(6),
+        )
+
+        buggy = ReversedCollisionSIMDInterpreter()
+        results = buggy.execute(instr, state)
+
+        # In reverse order, Lane 1 runs first against 10 (mismatches 20!), fails; Lane 0 turns 10 into 20
+        self.assertEqual(state.lds.read_qword(common_addr), 20)
+        self.assertNotEqual(state.lds.read_qword(common_addr), 30)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
