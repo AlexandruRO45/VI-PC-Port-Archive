@@ -499,6 +499,54 @@ def ldexp_values():
     ])
 
 
+# The eight VOP3-only three-operand integer forms. Each result goes to its own register and int3_program(k)
+# exports the four bytes of result k through v_cvt_f32_ubyte0-3, so each channel is an exact integer 0..255.
+INT3_FORMS = ("v_lshl_add_u32", "v_add_lshl_u32", "v_lshl_or_b32", "v_and_or_b32",
+              "v_or3_b32", "v_xor3_b32", "v_xad_u32", "v_add3_u32")
+INT3_OPS = (
+    "v_lshl_add_u32 v20, s44, s47, v19",
+    "v_add_lshl_u32 v21, v18, s44, s47",
+    "v_lshl_or_b32 v22, v19, 7, s44",
+    "v_and_or_b32 v23, s44, v18, 0x0f0f00f0",
+    "v_or3_b32 v24, v18, s47, 64",
+    "v_xor3_b32 v25, s44, v18, v19",
+    "v_xad_u32 v26, s44, v19, -7",
+    "v_add3_u32 v27, s44, v18, v19",
+)
+# Constant words 3 to 6 (s44 to s47). Every input and result is the bit pattern of a normal binary32 value, so
+# no register move can flush or quiet it on the desktop side. The shift counts 0x...13 and 0x...0d use bits [4:0]
+# only, the left shifts drop high bits, and both add3 sums carry out of bit 31.
+INT3_WORDS = ((0x128b2f33, 0xd23f0824, 0x892f902b, 0x1818e813),
+              (0xd3ac94af, 0x90c192cf, 0x1fb17c23, 0xf28c104d))
+
+
+def int3_program(k):
+    return with_constants([
+        "v_mov_b32_e32 v18, s45",
+        "v_mov_b32_e32 v19, s46",
+        *INT3_OPS,
+        *(f"v_cvt_f32_ubyte{n}_e32 v{12 + n}, v{20 + k}" for n in range(4)),
+    ])
+
+
+def int3_reference(a, b, c, d):
+    """Independent CPU model of the RDNA 2 ISA definitions, in Python integers."""
+    mask = 0xffffffff
+    results = (
+        ((a << (d & 31)) + c) & mask,      # v_lshl_add_u32: (S0 << S1[4:0]) + S2
+        ((b + a) << (d & 31)) & mask,      # v_add_lshl_u32: (S0 + S1) << S2[4:0]
+        ((c << 7) | a) & mask,             # v_lshl_or_b32: (S0 << S1[4:0]) | S2
+        (a & b) | 0x0f0f00f0,              # v_and_or_b32: (S0 & S1) | S2
+        b | d | 64,                        # v_or3_b32
+        a ^ b ^ c,                         # v_xor3_b32
+        ((a ^ c) + (-7 & mask)) & mask,    # v_xad_u32: (S0 ^ S1) + S2
+        (a + b + c) & mask,                # v_add3_u32
+    )
+    for word in (a, b, c, d, *results):
+        assert 0 < (word >> 23) & 0xff < 0xff, hex(word)
+    return results
+
+
 # The gfx10 predicate number is a four-bit truth table. Bits 0..3 select
 # less, equal, greater and unordered respectively, independent of the HLSL.
 PREDICATES = ("f", "lt", "eq", "le", "gt", "lg", "ge", "o",
@@ -2666,6 +2714,62 @@ def check_controls(directory):
     wqm = base_ld.index("s_wqm_b64 exec, exec") + 1
     must_reject(translate, base_ld[:wqm] + ["v_ldexp_f32 v20, 1.0, 2"] + base_ld[wqm:])
 
+    # Three-operand VOP3 integer controls and rejections.
+    int3_source = translate(int3_program(0))
+    assert set(INT3_FORMS) <= ACCEPTED
+    for expected in (
+        "asfloat((asuint(params[0].w) << (asuint(params[1].z) & 31u)) + asuint(alu21))",
+        "asfloat((asuint(alu20) + asuint(params[0].w)) << (asuint(params[1].z) & 31u))",
+        "asfloat((asuint(alu21) << (7u & 31u)) | asuint(params[0].w))",
+        "asfloat((asuint(params[0].w) & asuint(alu20)) | 252641520u)",
+        "asfloat(asuint(alu20) | asuint(params[1].z) | 64u)",
+        "asfloat(asuint(params[0].w) ^ asuint(alu20) ^ asuint(alu21))",
+        "asfloat((asuint(params[0].w) ^ asuint(alu21)) + 4294967289u)",
+        "asfloat(asuint(params[0].w) + asuint(alu20) + asuint(alu21))",
+    ):
+        assert expected in int3_source, expected
+    # A shift count is masked to five bits, also for an inline constant above 31.
+    assert "<< (35u & 31u)" in translate(with_constants(["v_lshl_or_b32 v12, s44, 35, s45"]))
+    for bad in (
+        "v_add3_u32 v27, -s44, v18, v19",
+        "v_add3_u32 v27, s44, |v18|, v19",
+        "v_add3_u32 v27, s44, v18, abs(v19)",
+        "v_add3_u32 v27, s44, v18, v19 clamp",
+        "v_add3_u32 v27, s44, v18",
+        "v_add3_u32 v27, s44, v18, v19, v19",
+        "v_add3_u32 v27, s44, v18, 0x100000000",
+        "v_add3_u32 v27, s44, v18, v30",
+        "v_add3_u32 v27, s44, v18, s106",
+    ):
+        changed = [line.replace("v_add3_u32 v27, s44, v18, v19", bad) for line in int3_program(7)]
+        assert changed != int3_program(7)
+        must_reject(translate, changed)
+    # Neighbouring VOP3 integer forms stay rejected.
+    for neighbour in (
+        "v_alignbit_b32 v27, s44, v18, v19", "v_alignbyte_b32 v27, s44, v18, v19",
+        "v_perm_b32 v27, s44, v18, v19", "v_mad_u32_u24 v27, s44, v18, v19",
+        "v_mad_u32_u16 v27, s44, v18, v19", "v_sad_u32 v27, s44, v18, v19",
+        "v_lerp_u8 v27, s44, v18, v19", "v_mul_lo_u32 v27, s44, v18",
+    ):
+        must_reject(translate, [line.replace("v_add3_u32 v27, s44, v18, v19", neighbour) for line in int3_program(7)])
+    base_int3 = int3_program(0)
+    wait = base_int3.index("s_waitcnt vmcnt(0)")
+    must_reject(translate, base_int3[:wait] + ["v_or3_b32 v12, 1, 2, 3"] + base_int3[wait:])
+    must_reject(translate, base_int3[:wait] + ["v_add3_u32 v20, v12, 1, 2"] + base_int3[wait:])
+    load = next(i for i, line in enumerate(base_int3) if line.startswith("s_buffer_load_dwordx4"))
+    lgkm = base_int3.index("s_waitcnt lgkmcnt(0)", load)
+    must_reject(translate, base_int3[:lgkm] + ["v_xad_u32 v20, s44, 1, 2"] + base_int3[lgkm:])
+    wqm = base_int3.index("s_wqm_b64 exec, exec") + 1
+    must_reject(translate, base_int3[:wqm] + ["v_lshl_add_u32 v20, 1, 2, 3"] + base_int3[wqm:])
+    # Each draw mutation computes a different word on the first input set.
+    a, b, c, d = INT3_WORDS[0]
+    good = int3_reference(a, b, c, d)
+    assert (((a << (d & 31)) | c) & 0xffffffff) != good[0]
+    assert (((b << (a & 31)) + d) & 0xffffffff) != good[1]
+    assert (a | b | 0x0f0f00f0) != good[3]
+    assert (a ^ c ^ (-7 & 0xffffffff)) != good[6]
+    assert (a ^ b ^ c) != good[7]
+
 
 def check_program_extent(directory, library):
     # A conditional jumps over the early exit. The alternate block starts
@@ -2719,6 +2823,7 @@ def check_binary(directory, assembler, objcopy, library):
 
     fixtures.extend((int_minmax_pair(encoding), translate) for encoding in ("e32", "e64"))
     fixtures.extend((int_minmax_triple(kind), translate) for kind in ("i32", "u32"))
+    fixtures.extend((int3_program(k), translate) for k in (0, len(INT3_OPS) - 1))
     fixtures.extend((predicate_group(first, sdwa=True), translate) for first in range(0, 16, 4))
     fixtures.append((with_constants(CUBE_BODY), translate))
     fixtures.append((with_constants(MAD_BODY), translate))
@@ -2867,6 +2972,55 @@ def check_int_minmax_draws(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Replacing v_med3_i32 with v_med3_u32 escaped detection")
+
+def check_int3_draws(directory, compiler, renderer, backend):
+    source = directory / "int3.hlsl"
+    shader = directory / "int3.cso"
+    case = directory / "int3.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+
+    def write_case(words, k):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        result = int3_reference(*words)[k]
+        case.write_bytes(constants + struct.pack("<4f", *[float((result >> 8 * n) & 0xff) for n in range(4)]) * 64)
+
+    for k in range(len(INT3_OPS)):
+        source.write_text(translate(int3_program(k)), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        for words in INT3_WORDS:
+            write_case(words, k)
+            subprocess.run(draw, check=True)
+
+    # Each neighbour gives a different word for the first input set, so the draw must report a mismatch.
+    for k, old, new in (
+        (0, "v_lshl_add_u32", "v_lshl_or_b32"),
+        (1, "v_add_lshl_u32 v21, v18, s44, s47", "v_lshl_add_u32 v21, v18, s44, s47"),
+        (3, "v_and_or_b32", "v_or3_b32"),
+        (6, "v_xad_u32", "v_xor3_b32"),
+        (7, "v_add3_u32", "v_xor3_b32"),
+    ):
+        mutated = [line.replace(old, new) for line in int3_program(k)]
+        assert mutated != int3_program(k), old
+        source.write_text(translate(mutated), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        write_case(INT3_WORDS[0], k)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Replacing {old} with {new} escaped detection")
+
+
+def check_int3_render(directory, compiler, renderer, backend):
+    """The three-operand integer draws as their own CTest entry per backend; exit 77 from the renderer is a skip."""
+    try:
+        check_int3_draws(directory, compiler, renderer, backend)
+    except subprocess.CalledProcessError as error:
+        if error.returncode == 77:
+            return 77
+        raise
+    return 0
+
 
 def check_frexp_ldexp_draws(directory, compiler, renderer, backend):
     source = directory / "frexp_ldexp.hlsl"
@@ -3266,6 +3420,8 @@ def main():
         if mode == "draw-e64":
             # The controls already run in the binary and draw modes; this mode only draws.
             return check_e64_render(directory, *args)
+        if mode == "draw-int3":
+            return check_int3_render(directory, *args)
         check_controls(directory)
         if mode == "binary":
             check_binary(directory, *args)
@@ -3276,7 +3432,7 @@ def main():
         elif mode == "buffer-color":
             return check_buffer_color_draw(directory, *args)
         else:
-            raise ValueError("Expected binary, draw, draw-e64, three-way or buffer-color mode")
+            raise ValueError("Expected binary, draw, draw-e64, draw-int3, three-way or buffer-color mode")
 
 
 if __name__ == "__main__":

@@ -287,6 +287,20 @@ def check_shader_records():
         assert scalar64_forms <= covered, (name, scalar64_forms - covered)
         assert sopc_forms <= covered, (name, sopc_forms - covered)
         assert vop2_forms <= covered, (name, vop2_forms - covered)
+    # The eight VOP3-only three-operand integer forms are counted in both lists; the neighbouring VOP3 integer
+    # forms the controls reject stay out.
+    int3_forms = {("VOP3", form) for form in pixel.INT3_FORMS}
+    assert len(int3_forms) == 8
+    int3_neighbours = {"v_alignbit_b32", "v_alignbyte_b32", "v_perm_b32", "v_mad_u32_u24", "v_mad_u32_u16",
+                       "v_sad_u32", "v_lerp_u8", "v_mul_lo_u32"}
+    assert not (pixel.ACCEPTED & int3_neighbours), pixel.ACCEPTED & int3_neighbours
+    for name in ("gfx1013.tsv", "rdna2.tsv"):
+        reference = fc.load_reference(name)
+        assert int3_forms | {("VOP3", form) for form in int3_neighbours} <= reference, name
+        covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+        assert int3_forms <= covered, (name, int3_forms - covered)
+        without = fc.gfx_forms(pixel.ACCEPTED - set(pixel.INT3_FORMS), reference)
+        assert len(covered) - len(without) == 8, name
     # The scalar ALU fixture counts its SOP1, SOP2, SOPK and SOPC forms; the neighbours the controls
     # reject (s_addc_u32, s_cmp_eq_u64, s_cmpk_eq_u32, s_cselect_b64) stay out.
     scalar = {"s_movk_i32", "s_not_b32", "s_add_u32", "s_sub_u32", "s_add_i32", "s_sub_i32", "s_mul_i32",

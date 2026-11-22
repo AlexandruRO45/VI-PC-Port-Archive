@@ -349,6 +349,11 @@ INTEGER = {
     "not_b32": (1, "~{0}"), "bfi_b32": (3, "({0} & {1}) | (~{0} & {2})"),
     "lshlrev_b32": (2, "{1} << ({0} & 31u)"), "lshrrev_b32": (2, "{1} >> ({0} & 31u)"),
     "ashrrev_i32": (2, "asuint(asint({1}) >> ({0} & 31u))"),
+    # VOP3-only three-operand forms. Sums wrap modulo 2^32 and the shift count is bits [4:0] of its operand.
+    "lshl_add_u32": (3, "({0} << ({1} & 31u)) + {2}"), "add_lshl_u32": (3, "({0} + {1}) << ({2} & 31u)"),
+    "lshl_or_b32": (3, "({0} << ({1} & 31u)) | {2}"), "and_or_b32": (3, "({0} & {1}) | {2}"),
+    "or3_b32": (3, "{0} | {1} | {2}"), "xor3_b32": (3, "{0} ^ {1} ^ {2}"),
+    "xad_u32": (3, "({0} ^ {1}) + {2}"), "add3_u32": (3, "{0} + {1} + {2}"),
 }
 LANE_MASK = r"(vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
 SALU_BIT64 = {
