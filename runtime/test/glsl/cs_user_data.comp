@@ -8,6 +8,8 @@
 //   s4:s5    a descriptor table: its first entry is a 64-bit console VA the application wrote itself
 //   code     the shader's own program (FSSM blob), dword 1
 // and writes out[i] = s0 + s1 * i + table_target[i % 4] + code[1].
+// Compiled with -DPC_TAIL it is a shader translated with --pc-tail-ubo instead: s0..s31 alone fill the 128-byte
+// push-constant block, and the heap base and code base come from the uniform block at set 1, binding 0.
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference_uvec2 : require
 
@@ -17,11 +19,25 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words {
     uint w[];
 };
 
+#ifdef PC_TAIL
+layout(push_constant) uniform UserData {
+    uint s[32];
+} pc;
+layout(set = 1, binding = 0) uniform PcTail {
+    uvec2 heap_base;
+    uvec2 code_base;
+} tail;
+#define HEAP_BASE tail.heap_base
+#define CODE_BASE tail.code_base
+#else
 layout(push_constant) uniform UserData {
     uint s[32];
     uvec2 heap_base;
     uvec2 code_base;
 } pc;
+#define HEAP_BASE pc.heap_base
+#define CODE_BASE pc.code_base
+#endif
 
 uvec2 add64(uvec2 a, uvec2 b) {
     uint carry;
@@ -30,7 +46,7 @@ uvec2 add64(uvec2 a, uvec2 b) {
 }
 
 Words at(uvec2 va) {
-    return Words(add64(pc.heap_base, va));
+    return Words(add64(HEAP_BASE, va));
 }
 
 void main() {
@@ -50,6 +66,6 @@ void main() {
         return;
     }
     Words constants = at(uvec2(table.w[0], table.w[1]));
-    Words code = at(pc.code_base);
+    Words code = at(CODE_BASE);
     result.w[i] = pc.s[0] + pc.s[1] * i + constants.w[i % 4] + code.w[1];
 }
