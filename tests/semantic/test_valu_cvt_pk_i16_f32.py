@@ -248,6 +248,8 @@ class Instruction:
                 raise TypeError(f"Destination for {self.opcode.value} must be a VGPR, got {self.dst.kind.name}")
             if self.src1 is None:
                 raise ValueError(f"{self.opcode.value} requires two source operands")
+            if "clamp" in self.modifiers:
+                raise ValueError(f"{self.opcode.value} does not support clamp modifier")
 
     def to_assembly(self) -> str:
         parts = [self.opcode.value, self.dst.to_assembly()]
@@ -1172,6 +1174,168 @@ class TestValuCvtPkI16F32IEEE754Boundaries(unittest.TestCase):
         for val, expected in cases:
             bits = f32_to_bits(val)
             self.assertEqual(f32_to_i16(bits), expected)
+
+
+class TestValuCvtPkI16F32NegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_negative_control_sgpr_as_destination(self) -> None:
+        """v_cvt_pk_i16_f32 cannot target an SGPR destination."""
+        with self.assertRaises(TypeError):
+            Instruction(
+                opcode=Opcode.V_CVT_PK_I16_F32,
+                dst=Register(RegKind.SGPR, 0),
+                src0=Register(RegKind.VGPR, 1),
+                src1=Register(RegKind.VGPR, 2),
+            )
+
+    def test_negative_control_literal_as_destination(self) -> None:
+        """Instruction destination cannot be an immediate/literal."""
+        with self.assertRaises(TypeError):
+            Instruction(
+                opcode=Opcode.V_CVT_PK_I16_F32,
+                dst=Immediate(0),  # type: ignore[arg-type]
+                src0=Register(RegKind.VGPR, 1),
+                src1=Register(RegKind.VGPR, 2),
+            )
+
+    def test_negative_control_missing_source_operand(self) -> None:
+        """v_cvt_pk_i16_f32 requires exactly two source operands."""
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_CVT_PK_I16_F32,
+                dst=Register(RegKind.VGPR, 0),
+                src0=Register(RegKind.VGPR, 1),
+                src1=None,
+            )
+
+    def test_negative_control_out_of_bounds_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 106)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1)
+
+    def test_negative_control_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDWavefrontInterpreter(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWavefrontInterpreter(wave_size=128)
+
+    def test_negative_control_unsupported_operand_type(self) -> None:
+        interp = ScalarVALUInterpreter()
+        with self.assertRaises(TypeError):
+            interp.read_operand("v0")  # type: ignore[arg-type]
+
+    def test_negative_control_unsupported_opcode_rejection(self) -> None:
+        class FakeOpcode(enum.Enum):
+            UNKNOWN = "v_unknown"
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_I16_F32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+            src1=Register(RegKind.VGPR, 2),
+        )
+        object.__setattr__(inst, "opcode", FakeOpcode.UNKNOWN)
+
+        interp = ScalarVALUInterpreter()
+        with self.assertRaises(NotImplementedError):
+            interp.step(inst)
+
+    def test_negative_control_clamp_modifier_rejection(self) -> None:
+        """v_cvt_pk_i16_f32 strictly rejects the clamp modifier."""
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_CVT_PK_I16_F32,
+                dst=Register(RegKind.VGPR, 0),
+                src0=Immediate(POS_ONE_F32),
+                src1=Immediate(NEG_ONE_F32),
+                modifiers=("clamp",),
+            )
+
+    def test_mutation_detection_round_to_nearest_instead_of_rtz(self) -> None:
+        """Sabotage: rounding to nearest instead of truncation toward zero."""
+        def mutant_f32_to_i16(bits: int) -> int:
+            val = bits_to_f32(bits)
+            return round(val) & MASK16
+
+        # For 1.9, RTZ produces 1 (0x0001). Mutant produces 2 (0x0002).
+        f19 = f32_to_bits(1.9)
+        expected = f32_to_i16(f19)
+        mutant = mutant_f32_to_i16(f19)
+        self.assertEqual(expected, 1)
+        self.assertEqual(mutant, 2)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutant, expected)
+
+    def test_mutation_detection_inverted_operand_order(self) -> None:
+        """Sabotage: packing S1 into low half and S0 into high half."""
+        def mutant_cvt_pk(s0: int, s1: int) -> int:
+            return pack_i16_to_u32(f32_to_i16(s1), f32_to_i16(s0))
+
+        s0 = f32_to_bits(10.0)
+        s1 = f32_to_bits(20.0)
+        expected = ref_cvt_pk_i16_f32(s0, s1)
+        mutant = mutant_cvt_pk(s0, s1)
+        self.assertEqual(expected, 0x0014000A)
+        self.assertEqual(mutant, 0x000A0014)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutant, expected)
+
+    def test_mutation_detection_nan_returns_nonzero(self) -> None:
+        """Sabotage: NaN produces non-zero (or passes through)."""
+        def mutant_f32_to_i16(bits: int) -> int:
+            if is_nan_f32(bits):
+                return 0x7FFF  # Bug: returns non-zero
+            return f32_to_i16(bits)
+
+        expected = f32_to_i16(QNAN_F32)
+        mutant = mutant_f32_to_i16(QNAN_F32)
+        self.assertEqual(expected, 0)
+        self.assertEqual(mutant, 0x7FFF)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutant, expected)
+
+    def test_mutation_detection_simd_exec_leak(self) -> None:
+        """Sabotage: inactive SIMD lane modifies destination register."""
+        simd = SIMDWavefrontInterpreter(wave_size=32)
+        simd.set_exec_mask(0)
+        canary = 0xBAD0CAFE
+        simd.write_lane_reg_u32(0, RegKind.VGPR, 0, canary)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_I16_F32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Immediate(POS_ONE_F32),
+            src1=Immediate(NEG_ONE_F32),
+        )
+        simd.step(inst)
+        self.assertEqual(simd.read_lane_reg_u32(0, RegKind.VGPR, 0), canary)
+
+        simd.write_lane_reg_u32(0, RegKind.VGPR, 0, 0x12345678)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(simd.read_lane_reg_u32(0, RegKind.VGPR, 0), canary)
+
+    def test_mutation_detection_vcc_corruption(self) -> None:
+        """Sabotage: v_cvt_pk_i16_f32 clobbering VCC."""
+        interp = ScalarVALUInterpreter()
+        canary_vcc = 0x1234567890ABCDEF
+        interp.vcc = canary_vcc
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_I16_F32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Immediate(POS_ONE_F32),
+            src1=Immediate(NEG_ONE_F32),
+        )
+        interp.step(inst)
+        self.assertEqual(interp.vcc, canary_vcc)
+
+        interp.vcc = 0
+        with self.assertRaises(AssertionError):
+            self.assertEqual(interp.vcc, canary_vcc)
 
 
 if __name__ == "__main__":
