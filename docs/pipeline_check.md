@@ -286,7 +286,10 @@ An explicit number is the job's total committed memory in MiB. `auto` takes 75 p
 of the currently available physical memory and available commit, rounds down to a whole MiB, and
 requires at least 256 MiB. The checker installs the Windows Job Object before opening Vulkan and
 prints the selected cap. The cap excludes GPU memory and uncommitted virtual address reservations.
-On normal completion the checker prints the job's peak commit, including the final cache save.
+On normal completion the checker prints the Windows `PeakJobMemoryUsed` counter after the final cache
+save. This counter can include address reservations and allocation attempts that Windows denied, so
+it can exceed the installed commit cap even when allocation denial works. The budget test checks
+enforcement through the allocation results themselves.
 
 If Windows cannot install the limit, the checker stops before starting Vulkan. At the limit Windows
 can refuse further allocations. A compile can fail or the Vulkan driver can abort, so a capped run

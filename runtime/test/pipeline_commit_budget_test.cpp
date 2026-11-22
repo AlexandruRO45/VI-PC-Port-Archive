@@ -108,20 +108,23 @@ void check_windows_job() {
     }
     check(job.limit() == limit_mib * mib, "report installed budget");
     check(job.apply({limit_mib * mib, false}).has_value(), "refuse to replace a live job");
+
+    void* p = allocate(large_mib);
+    check(p != nullptr, "parent can commit below the cap");
+    if (p) {
+        // Query the counter while the successful allocation is live, before the reservation and denial probes.
+        const auto peak = job.peak_job_memory_used();
+        check(peak && *peak >= large_mib * mib, "Windows peak counter includes the successful allocation");
+        check_child();
+        VirtualFree(p, 0, MEM_RELEASE);
+    }
+
     // Windows distinguishes address reservation from memory commit, important to GPU drivers that reserve
     // a large range up front. A single commit above the cap must fail even when the VA reservation fits.
     void* reservation = allocate(2 * limit_mib, MEM_RESERVE);
     check(reservation != nullptr, "uncommitted address reservation can exceed the cap");
     if (reservation) VirtualFree(reservation, 0, MEM_RELEASE);
     check(allocation_denied(2 * limit_mib), "a commit above the cap is denied");
-    void* p = allocate(large_mib);
-    check(p != nullptr, "parent can commit below the cap");
-    if (p) {
-        check_child();
-        VirtualFree(p, 0, MEM_RELEASE);
-    }
-    const auto peak = job.peak();
-    check(peak && *peak >= large_mib * mib && *peak <= limit_mib * mib, "query peak aggregate job commit");
 }
 #endif
 }  // namespace

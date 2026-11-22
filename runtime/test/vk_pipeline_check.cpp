@@ -2014,11 +2014,11 @@ int main(int argc, char** argv) {
     }
 #ifdef _WIN32
     if (commit_budget) {
-        if (const auto peak = commit_job.peak())
-            std::printf("pipeline compiler peak job commit: %.1f MiB\n",
+        if (const auto peak = commit_job.peak_job_memory_used())
+            std::printf("pipeline compiler Windows PeakJobMemoryUsed: %.1f MiB\n",
                         static_cast<double>(*peak) / leonida::pipeline_budget::mib);
         else
-            std::fprintf(stderr, "pipeline compiler peak job commit unavailable\n");
+            std::fprintf(stderr, "pipeline compiler Windows PeakJobMemoryUsed unavailable\n");
     }
 #endif
     return (check_failed || !cache_saved) ? 1 : 0;

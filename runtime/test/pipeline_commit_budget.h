@@ -109,7 +109,8 @@ public:
 
     std::size_t limit() const { return limit_; }
 
-    std::optional<std::size_t> peak() const {
+    // Windows can account for reservations or rejected allocation attempts in this high-water mark.
+    std::optional<std::size_t> peak_job_memory_used() const {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION info{};
         if (!job_ || !QueryInformationJobObject(job_, JobObjectExtendedLimitInformation, &info, sizeof(info), nullptr))
             return std::nullopt;
