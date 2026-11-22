@@ -820,5 +820,40 @@ class TestPermB32F16ConditionCodesAndStatus(unittest.TestCase):
         self.interp.execute(instr)
         self.assertEqual(self.rf.scc, 1)
 
+# ==============================================================================
+# IEEE 754 Boundaries, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestPermB32F16IEEE754Boundaries(unittest.TestCase):
+    def test_subnormal_half_preservation(self):
+        src1 = pack_halves(MIN_SUBNORMAL, MAX_SUBNORMAL)
+        sel = PermSelectorWord.identity_src1().raw
+        res = oracle_v_perm_b32_f16(0, src1, sel)
+        self.assertEqual(extract_half(res, 0), MIN_SUBNORMAL)
+        self.assertEqual(extract_half(res, 1), MAX_SUBNORMAL)
+
+    def test_infinities_preservation(self):
+        src1 = pack_halves(POS_INF, NEG_INF)
+        sel = PermSelectorWord.swap_halves_src1().raw
+        res = oracle_v_perm_b32_f16(0, src1, sel)
+        self.assertEqual(extract_half(res, 0), NEG_INF)
+        self.assertEqual(extract_half(res, 1), POS_INF)
+
+    def test_quiet_nan_payload_preservation(self):
+        qnan1 = 0x7E55
+        qnan2 = 0x7EFF
+        src0 = pack_halves(qnan1, qnan2)
+        sel = PermSelectorWord.identity_src0().raw
+        res = oracle_v_perm_b32_f16(src0, 0, sel)
+        self.assertEqual(extract_half(res, 0), qnan1)
+        self.assertEqual(extract_half(res, 1), qnan2)
+
+    def test_clamp_behavior_on_nans_and_infinities(self):
+        src1 = pack_halves(POS_QNAN, POS_INF)
+        sel = make_selector(SEL_SRC1_LO, SEL_SRC1_HI)
+        res = oracle_v_perm_b32_f16(0, src1, sel, clamp=True)
+        self.assertEqual(extract_half(res, 0), POS_ZERO)
+        self.assertEqual(extract_half(res, 1), POS_ONE)
+
 if __name__ == "__main__":
     unittest.main()
