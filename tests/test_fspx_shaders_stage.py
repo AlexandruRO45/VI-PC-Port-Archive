@@ -268,7 +268,7 @@ class ShadersStageWithTheDll(unittest.TestCase):
                     with open(os.path.join(dxbc, "fssm_index.json"), "w") as f:
                         f.write('[{"name": "shader"}]')
                 elif tool == "shader_disasm.py":
-                    os.makedirs(os.path.join(dxbc, "disasm"), exist_ok=True)
+                    touch(dxbc, "disasm", "shader.s")   # a successful decode leaves assembly
                 elif tool == "rdna2spirv.py":
                     touch(args[args.index("--out") + 1], "index.json")
                     with open(os.path.join(args[args.index("--out") + 1], "index.json"), "w") as f:

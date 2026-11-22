@@ -406,7 +406,8 @@ class PipelineCheckExeTest(unittest.TestCase):
         exe = self.touch("linux", "vk_pipeline_check")
         work = os.path.join(self.tmp.name, "work")
         os.makedirs(os.path.join(work, "shaders", "spirv"))
-        open(os.path.join(work, "shaders", "spirv", "index.json"), "w").close()
+        with open(os.path.join(work, "shaders", "spirv", "index.json"), "w", encoding="utf-8") as f:
+            f.write('{"shader_0": {"stage": "ps"}}')   # an empty index is refused by the stage
         out = os.path.join(self.tmp.name, "out")
         with mock.patch.object(make_game.os, "name", "posix"), \
                 mock.patch.object(make_game, "log"), \

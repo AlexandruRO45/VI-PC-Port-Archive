@@ -287,7 +287,7 @@ class PipelineStageIsolationTest(unittest.TestCase):
         spirv_dir = os.path.join(self.work_dir, "shaders", "spirv")
         os.makedirs(spirv_dir, exist_ok=True)
         with open(os.path.join(spirv_dir, "index.json"), "w", encoding="utf-8") as f:
-            f.write("{}")
+            f.write('{"shader": {"stage": "ps"}}')   # an empty index is refused by the pipelines stage
 
         with mock.patch("make_game.pipeline_check_exe", return_value=None), \
                 mock.patch.object(make_game.os, "name", "nt"):
@@ -302,7 +302,7 @@ class PipelineStageIsolationTest(unittest.TestCase):
         spirv_dir = os.path.join(self.work_dir, "shaders", "spirv")
         os.makedirs(spirv_dir, exist_ok=True)
         with open(os.path.join(spirv_dir, "index.json"), "w", encoding="utf-8") as f:
-            f.write("{}")
+            f.write('{"shader": {"stage": "ps"}}')   # an empty index is refused by the pipelines stage
 
         with mock.patch("make_game.pipeline_check_exe", return_value=None), \
                 mock.patch.object(make_game.os, "name", "posix"):
@@ -318,7 +318,7 @@ class PipelineStageIsolationTest(unittest.TestCase):
         os.makedirs(spirv_dir, exist_ok=True)
         index_path = os.path.join(spirv_dir, "index.json")
         with open(index_path, "w", encoding="utf-8") as f:
-            f.write("{}")
+            f.write('{"shader": {"stage": "ps"}}')   # an empty index is refused by the pipelines stage
 
         dummy_exe = os.path.join(self.tmp.name, "vk_pipeline_check.exe")
         with open(dummy_exe, "w", encoding="utf-8") as f:
@@ -386,6 +386,8 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
         spirv_dir = os.path.join(self.work_dir, "shaders", "spirv")
         os.makedirs(os.path.join(dxbc_dir, "disasm"))
         os.makedirs(spirv_dir, exist_ok=True)
+        with open(os.path.join(dxbc_dir, "disasm", "shader.s"), "w", encoding="utf-8") as f:
+            f.write("s_endpgm\n")   # an emptied disassembly is decoded again (disassembly_matches)
 
         with open(os.path.join(dxbc_dir, "index.json"), "w", encoding="utf-8") as f:
             f.write('[{"file": "shader.dxbc"}]')

@@ -103,7 +103,7 @@ class ShaderStageResumeTest(unittest.TestCase):
             self.touch(self.dxbc, "fssm_index.json")
         elif tool == "shader_disasm.py":
             self.assertEqual(args[1:3], ("--unpack-index", os.path.join(self.dxbc, "fssm_index.json")))
-            os.makedirs(os.path.join(self.dxbc, "disasm"), exist_ok=True)
+            self.touch(self.dxbc, "disasm", "s0.s")   # a successful decode leaves assembly, not an empty folder
 
     def fake_translate(self, disasm, spirv, jobs, emulate=False, fallbacks=()):
         self.ran.append("translate (emulated)" if emulate else "translate")
@@ -232,11 +232,26 @@ class ShaderStageResumeTest(unittest.TestCase):
     def test_old_disassembly_layout_is_rebuilt_in_the_current_location(self):
         self.touch(self.dxbc, "index.json")
         self.touch(self.dxbc, "fssm_index.json")
-        self.touch(self.work, "shaders", "disasm", "s0.s")  # disasm next to the carve folder, the old layout
+        self.touch(self.work, "shaders", "disasm", "stale.s")  # disasm next to the carve folder, the old layout
         self.touch(self.spirv, "index.json")
         self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
         self.assertTrue(os.path.isdir(os.path.join(self.dxbc, "disasm")))
-        self.assertFalse(os.path.exists(os.path.join(self.dxbc, "disasm", "s0.s")))
+        # This run's assembly is here; the old layout's file was not reused as the new decode.
+        self.assertTrue(os.path.isfile(os.path.join(self.dxbc, "disasm", "s0.s")))
+        self.assertFalse(os.path.exists(os.path.join(self.dxbc, "disasm", "stale.s")))
+
+    def test_an_emptied_disassembly_is_decoded_again(self):
+        # The .s files deleted to save disk leave the folder and its signature: decode again instead of
+        # translating nothing and publishing an empty index.
+        self.touch(self.dxbc, "index.json")
+        self.touch(self.dxbc, "fssm_index.json")
+        self.touch(self.dxbc, "disasm.done")
+        with open(os.path.join(self.dxbc, "disasm.done"), "w", encoding="utf-8") as f:
+            f.write("test llvm-mc 21\n")
+        os.makedirs(os.path.join(self.dxbc, "disasm"))
+        self.touch(self.spirv, "index.json")
+        self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
+        self.assertTrue(os.path.isfile(os.path.join(self.dxbc, "disasm", "s0.s")))
 
     # SHADER-11: the translation depends on --wave64-emulate, so a change of mode translates again.
     def mode(self):

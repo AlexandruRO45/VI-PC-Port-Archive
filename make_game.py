@@ -665,8 +665,14 @@ def disassembly_matches(dxbc: str, signature: str) -> bool:
         return False
     try:
         with os.scandir(os.path.join(dxbc, "disasm")) as entries:
-            return all(entry.name[:-2] in names for entry in entries
-                       if entry.name.endswith(".s") and entry.is_file())
+            found = False
+            for entry in entries:
+                if entry.name.endswith(".s") and entry.is_file():
+                    if entry.name[:-2] not in names:
+                        return False
+                    found = True
+            # An emptied folder (the .s files deleted to save disk) is not a finished disassembly: decode it again.
+            return found
     except OSError:
         return False
 
@@ -1095,6 +1101,17 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
     if bad:
         fail("rdna2spirv.py: " + ", ".join(bad))
     py("rdna2spirv.py", disasm, "--out", spirv, "--merge")
+    index = os.path.join(spirv, "index.json")
+    if os.path.isfile(index):
+        # Present but empty or unreadable: the merge published nothing, and the next run would read that as finished.
+        try:
+            with open(index, encoding="utf-8") as f:
+                merged = json.load(f)
+        except ValueError as e:
+            fail(f"rdna2spirv.py --merge wrote an unreadable {index}: {e}")
+        if not merged:
+            fail("rdna2spirv.py translated 0 shaders, so the empty index is not kept. Run the shaders stage again; "
+                 "if it happens again, the disassembly logged above is why.")
 
 
 # ---------------------------------------------------------------- assets
@@ -1382,8 +1399,18 @@ def pipeline_check_exe():
 
 def require_translated_shaders(work: str) -> str:
     spirv = os.path.join(work, "shaders", "spirv")
-    if not os.path.isfile(os.path.join(spirv, "index.json")):
+    index = os.path.join(spirv, "index.json")
+    if not os.path.isfile(index):
         fail("No translated shaders yet: run the shaders stage first.")
+    try:
+        with open(index, encoding="utf-8") as f:
+            translated = json.load(f)
+    except (OSError, ValueError) as e:
+        fail(f"The translated shader index {index} is unreadable ({e}): run the shaders stage again.")
+    if not translated:
+        # A build from before the shaders stage refused an empty merge can carry this marker.
+        fail(f"The translated shader index {index} is empty, so there is nothing to check. Run the shaders stage "
+             "again.")
     return spirv
 
 
