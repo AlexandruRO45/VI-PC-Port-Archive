@@ -15,7 +15,7 @@ Skeleton (measured on the 596-bone female and 560-bone male humanoid fragments o
                                   +0x30 name pointer, +0x46 u16 parent, +0x48 u16 own index
 
 The default rotation, translation and scale are local to the parent. Composed down the hierarchy they give each
-joint's model-space transform, and its inverse is the stored inverse bind matrix (the check is in `read_skeleton`).
+joint's model-space transform. `read_skeleton` checks its origin against the one from the stored inverse bind.
 The matrices are row-vector (D3D) matrices; stored row by row, they are glTF's column-major layout as is.
 
 Part meshes: grmModel + 0x14 u16 bone count, grmModel + 0x28 pointer to that many u32 bone hashes (joaat32 of the
@@ -58,6 +58,7 @@ import anim_clips  # noqa: E402
 import anim_index  # noqa: E402
 import glb_writer  # noqa: E402
 import skin_streams  # noqa: E402
+from skin_matrices import mat_mul, try_invert_affine  # noqa: E402
 
 SYSTEM = 0x50000000
 GRAPHICS = 0x60000000
@@ -177,8 +178,8 @@ def quat_rotate(q, v):
 def read_skeleton(sys, drawable):
     """-> list of joints {hash, name, parent, rotation, translation, scale, inverse_bind (16 floats)}.
 
-    Also returns the largest distance between a joint's model-space position composed from the default
-    transforms and the one its inverse bind matrix gives; `export` refuses a skeleton where they disagree."""
+    Also returns the largest per-axis difference between a joint's model-space origin composed from
+    the default transforms and the origin recovered from its inverse bind matrix."""
     header = sys_at(sys, drawable + 0x18, 0x70, "skeleton")
     count = u16(sys, header + 0x6C)
     require(0 < count <= MAX_BONES and count == u16(sys, header + 0x6E), "skeleton bone count")
@@ -193,13 +194,6 @@ def read_skeleton(sys, drawable):
         require(parent == 0xFFFF or parent < i, f"bone {i} parent {parent} is not an earlier bone")
         m = struct.unpack_from("<16f", sys, inverse + 64 * i)
         require(all(math.isfinite(v) for v in m) and m[3] == m[7] == m[11] == 0, f"inverse bind matrix {i}")
-        # RageSkeleton.cs:109 also refuses a degenerate matrix. The stored last column is (0, 0, 0, 1),
-        # so the 4x4 determinant is the determinant of the upper-left 3x3 linear part. As in the C#,
-        # abs() keeps mirrored binds; the epsilon rejects clearly non-invertible ones, not just float32 zero.
-        det = (m[0] * (m[5] * m[10] - m[6] * m[9])
-               - m[1] * (m[4] * m[10] - m[6] * m[8])
-               + m[2] * (m[4] * m[9] - m[5] * m[8]))
-        require(math.isfinite(det) and abs(det) >= 1e-12, f"inverse bind matrix {i} determinant")
         joints.append({
             "hash": u32(sys, r + 0x1C), "name": c_string(sys, r + 0x30), "parent": None if parent == 0xFFFF else parent,
             "rotation": struct.unpack_from("<4f", sys, r), "translation": struct.unpack_from("<3f", sys, r + 0x10),
@@ -207,17 +201,21 @@ def read_skeleton(sys, drawable):
         })
     # Compose the default transforms; compare each joint's origin with the one its inverse bind matrix gives.
     world, worst = [], 0.0
-    for j in joints:
-        q, t = j["rotation"], j["translation"]
-        if j["parent"] is None:
-            world.append((q, t))
-        else:
-            pq, pt = world[j["parent"]]
-            world.append((quat_mul(pq, q), tuple(a + b for a, b in zip(pt, quat_rotate(pq, t)))))
-        m = j["inverse_bind"]
-        rows, t_inv = (m[0:3], m[4:7], m[8:11]), m[12:15]
-        origin = tuple(-sum(t_inv[k] * rows[c][k] for k in range(3)) for c in range(3))
-        worst = max(worst, max(abs(a - b) for a, b in zip(origin, world[-1][1])))
+    for i, j in enumerate(joints):
+        q = j["rotation"]
+        sx, sy, sz = j["scale"]
+        # Columns of T * R * S. A rotated child under a non-uniform scale can have shear in model space.
+        local = [*quat_rotate(q, (sx, 0, 0)), 0.0,
+                 *quat_rotate(q, (0, sy, 0)), 0.0,
+                 *quat_rotate(q, (0, 0, sz)), 0.0,
+                 *j["translation"], 1.0]
+        parent = j["parent"]
+        model = local if parent is None else mat_mul(world[parent], local)
+        require(all(map(math.isfinite, model)), f"bone {i} has a non-finite model-space transform")
+        world.append(model)
+        bind = try_invert_affine(j["inverse_bind"])
+        require(bind is not None, f"inverse bind matrix {i} determinant")
+        worst = max(worst, max(abs(a - b) for a, b in zip(model[12:15], bind[12:15])))
     return joints, worst
 
 

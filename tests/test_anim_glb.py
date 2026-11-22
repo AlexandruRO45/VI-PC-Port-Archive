@@ -91,7 +91,27 @@ def inverse_bind(q, t):
             r[2][0], r[2][1], r[2][2], 0.0, last[0], last[1], last[2], 1.0]
 
 
-def skeleton_resource(shift_bind=0.0, singular_bind=False):
+# The model-space origins are (4, 0, 0), (2, 0, 0) and (0.8, 0.8, 0).
+SCALED_BINDS = (
+    (-0.5, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 1.0),
+    (-0.3, 0.4, 0.0, 0.0, 0.8, 0.6, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.6, -0.8, 0.0, 1.0),
+    (-0.3, 0.4, 0.0, 0.0, 0.8, 0.6, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -0.4, -0.8, 0.0, 1.0),
+)
+
+
+def scaled_skeleton_resource(*, displaced=False, root_scale=(-2, 1, 1)):
+    identity = (0, 0, 0, 1)
+    # A reflection and unequal axis scales precede a child rotation (cos = 3/5, sin = 4/5).
+    rotations = (identity, (0, 0, 1 / math.sqrt(5), 2 / math.sqrt(5)), identity)
+    binds = list(SCALED_BINDS)
+    if displaced:  # Move the last bind origin +0.25 m along model-space X.
+        binds[-1] = (*binds[-1][:12], -0.325, -0.9, 0, 1)
+    return skeleton_resource(rotations=rotations, translations=((4, 0, 0), (1, 0, 0), (1, 0, 0)),
+                             scales=(root_scale, (1, 1, 1), (1, 1, 1)), bind_matrices=binds)
+
+
+def skeleton_resource(shift_bind=0.0, singular_bind=False, *, rotations=ROTATIONS, translations=TRANSLATIONS,
+                      scales=None, bind_matrices=None):
     p = Page()
     directory = drawable_header(p, "synthetic_skeleton")
     p.b[directory + 8], p.b[directory + 9] = 1, 0
@@ -99,20 +119,24 @@ def skeleton_resource(shift_bind=0.0, singular_bind=False):
     n = len(NAMES)
     header = p.alloc(bytes(0x70))
     records = p.alloc(bytes(0x50 * n))
-    world = world_transforms()
-    binds = [inverse_bind(q, (t[0] + shift_bind, t[1], t[2])) for q, t in world]
+    if bind_matrices is None:
+        world = world_transforms(rotations, translations)
+        binds = [inverse_bind(q, (t[0] + shift_bind, t[1], t[2])) for q, t in world]
+    else:
+        binds = list(bind_matrices)
     if singular_bind:
         # Rows 0 and 1 are equal, so the determinant is zero, but the origin still resolves to (0, 0, 1),
         # which is bone 0's composed translation. Only the determinant distinguishes this from a valid bind.
         binds[0] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0, 1.0]
     matrices = p.alloc(b"".join(struct.pack("<16f", *m) for m in binds))
     parents = p.alloc(b"".join(struct.pack("<H", 0xFFFF if x is None else x) for x in PARENTS))
+    record_scales = scales or ((1.0, 1.0, 1.0),) * n
     for i, name in enumerate(NAMES):
         r = records + 0x50 * i
-        struct.pack_into("<4f", p.b, r, *ROTATIONS[i])
-        struct.pack_into("<3f", p.b, r + 0x10, *TRANSLATIONS[i])
+        struct.pack_into("<4f", p.b, r, *rotations[i])
+        struct.pack_into("<3f", p.b, r + 0x10, *translations[i])
         struct.pack_into("<I", p.b, r + 0x1C, joaat32(name.lower()))
-        struct.pack_into("<3f", p.b, r + 0x20, 1.0, 1.0, 1.0)
+        struct.pack_into("<3f", p.b, r + 0x20, *record_scales[i])
         p.ptr(r + 0x30, p.alloc(name.encode() + b"\0"))
         struct.pack_into("<HH", p.b, r + 0x46, 0xFFFF if PARENTS[i] is None else PARENTS[i], i)
     p.ptr(0x18, header)
@@ -231,6 +255,24 @@ class SkeletonAndPartTest(unittest.TestCase):
         self.assertEqual([j["hash"] for j in joints], [joaat32(n.lower()) for n in NAMES])
         self.assertLess(worst, 1e-6)
         self.assertAlmostEqual(joints[2]["translation"][1], 0.25)
+
+    def test_nonuniform_scaled_hierarchy_matches_model_space_bind_origins(self):
+        sys_page = scaled_skeleton_resource()
+        joints, worst = anim_glb.read_skeleton(sys_page, anim_glb.drawable_at(sys_page, None))
+        self.assertLess(worst, 1e-5)
+        self.assertEqual(joints[0]["scale"], (-2.0, 1.0, 1.0))
+        self.assertAlmostEqual(joints[1]["rotation"][2], 1 / math.sqrt(5), places=6)
+        self.assertEqual(joints[2]["translation"], (1.0, 0.0, 0.0))
+
+    def test_displaced_scaled_bind_reports_known_model_space_error(self):
+        sys_page = scaled_skeleton_resource(displaced=True)
+        _joints, worst = anim_glb.read_skeleton(sys_page, anim_glb.drawable_at(sys_page, None))
+        self.assertAlmostEqual(worst, 0.25, places=5)
+
+    def test_nonfinite_parent_scale_cannot_mask_a_displaced_bind(self):
+        sys_page = scaled_skeleton_resource(displaced=True, root_scale=(math.nan, 1, 1))
+        with self.assertRaisesRegex(anim_glb.ExportError, "bone 0.*non-finite"):
+            anim_glb.read_skeleton(sys_page, 0)
 
     def test_a_skeleton_whose_binds_disagree_reports_the_error(self):
         sys_page = skeleton_resource(shift_bind=0.3)
@@ -432,6 +474,19 @@ class ExportTest(unittest.TestCase):
         for got, want in zip(values, tracks[0]):
             for a, b in zip(got, want):
                 self.assertAlmostEqual(a, b, places=5)
+
+    def test_cli_exports_nonuniform_scaled_hierarchy_and_literal_inverse_binds(self):
+        part = part_resource([joaat32("skel_c")])
+        self.offsets = write_archive(self.packs, [[scaled_skeleton_resource()], part])
+        (gltf, binary), report = self.export()
+        self.assertLess(report["skeleton"]["bind_error"], 1e-5)
+        nodes = {node["name"]: node for node in gltf["nodes"]}
+        self.assertEqual(nodes["SKEL_A"]["scale"], [-2.0, 1.0, 1.0])
+        self.assertAlmostEqual(nodes["SKEL_B"]["rotation"][2], 1 / math.sqrt(5), places=6)
+        self.assertEqual(nodes["SKEL_C"]["translation"], [1.0, 0.0, 0.0])
+        ibm = accessor_values(gltf, binary, gltf["skins"][0]["inverseBindMatrices"])
+        expected_f32 = [struct.unpack("<16f", struct.pack("<16f", *m)) for m in SCALED_BINDS]
+        self.assertEqual(ibm, expected_f32)
 
     def test_dictionary_lookup_stops_before_adjacent_resource(self):
         data = clips_fixture.two_sequence_dictionary()

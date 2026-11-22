@@ -238,9 +238,11 @@ Offsets are zlib stream offsets (as `tools/skin_streams.py` and `rpf9dump` repor
 output is a standard glTF 2.0 file; Blender and the three.js editor play its animations. What
 it does and why:
 
-- **Joints** are the skeleton's bones with their default transforms as the rest pose, and the
-  stored inverse bind matrices. The export refuses a skeleton whose default transforms disagree
-  with them by 1e-3 or more.
+- **Joints** use the default local translation, rotation and scale as their rest pose. The skin stores
+  their inverse bind matrices. The exporter composes the local transforms down the hierarchy and compares
+  each joint's model-space origin with the point its inverse bind maps to `(0, 0, 0)`. It refuses the
+  export if any coordinate differs by 0.001 m or more. The report records the largest difference as
+  `skeleton.bind_error`.
 - **Part meshes** bind through their model's bone list: vertex bone index → `grmModel + 0x28` hash
   → the skeleton bone with that `joaat32`. Weights are the UNORM bytes divided by their sum; up to
   eight influences become `JOINTS_0/1` and `WEIGHTS_0/1`. three.js reads only the first set, and

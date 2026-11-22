@@ -70,6 +70,9 @@ import os
 import struct
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from skin_matrices import mat_mul, try_invert_affine  # noqa: E402
+
 try:  # optional: the stdlib path below is the fallback and is covered by the tests
     import numpy as _np
 except ImportError:  # pragma: no cover - depends on the interpreter
@@ -129,45 +132,12 @@ def joaat32(name: str) -> int:
     return (value + (value << 15)) & 0xFFFFFFFF
 
 
-def mat_mul(a, b):
-    """Column-major 4x4 product ``a * b``."""
-    out = [0.0] * 16
-    for column in range(4):
-        for row in range(4):
-            out[column * 4 + row] = sum(a[k * 4 + row] * b[column * 4 + k] for k in range(4))
-    return out
-
-
 def invert_affine(m):
     """Inverse of a column-major affine 4x4 (bottom row 0, 0, 0, 1)."""
-    a = lambda row, column: m[column * 4 + row]
-    det = (a(0, 0) * (a(1, 1) * a(2, 2) - a(1, 2) * a(2, 1))
-           - a(0, 1) * (a(1, 0) * a(2, 2) - a(1, 2) * a(2, 0))
-           + a(0, 2) * (a(1, 0) * a(2, 1) - a(1, 1) * a(2, 0)))
-    if not math.isfinite(det) or abs(det) < 1e-12:
+    inverse = try_invert_affine(m)
+    if inverse is None:
         raise SkinError("singular or non-finite bind matrix")
-    k = 1.0 / det
-    cofactors = (
-        (a(1, 1) * a(2, 2) - a(1, 2) * a(2, 1)) * k,
-        (a(0, 2) * a(2, 1) - a(0, 1) * a(2, 2)) * k,
-        (a(0, 1) * a(1, 2) - a(0, 2) * a(1, 1)) * k,
-        (a(1, 2) * a(2, 0) - a(1, 0) * a(2, 2)) * k,
-        (a(0, 0) * a(2, 2) - a(0, 2) * a(2, 0)) * k,
-        (a(0, 2) * a(1, 0) - a(0, 0) * a(1, 2)) * k,
-        (a(1, 0) * a(2, 1) - a(1, 1) * a(2, 0)) * k,
-        (a(0, 1) * a(2, 0) - a(0, 0) * a(2, 1)) * k,
-        (a(0, 0) * a(1, 1) - a(0, 1) * a(1, 0)) * k,
-    )
-    tx, ty, tz = a(0, 3), a(1, 3), a(2, 3)
-    out = [0.0] * 16
-    for row in range(3):
-        for column in range(3):
-            out[column * 4 + row] = cofactors[row * 3 + column]
-        out[12 + row] = -(cofactors[row * 3] * tx
-                          + cofactors[row * 3 + 1] * ty
-                          + cofactors[row * 3 + 2] * tz)
-    out[15] = 1.0
-    return out
+    return inverse
 
 
 def bind_to_gltf(m):
