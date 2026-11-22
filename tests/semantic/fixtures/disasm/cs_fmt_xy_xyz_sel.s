@@ -226,7 +226,7 @@
 	v_mov_b32_e32 v20, 0xdeadbeef
 	v_mov_b32_e32 v21, 0x1234567
 	s_mov_b32 s6, 0xffffffff
-	s_mov_b32 s7, 0x3103efac
+	s_mov_b32 s7, 0x3103e22c
 	v_mov_b32_e32 v5, 0x280
 	buffer_store_format_xy v[20:21], v5, s[4:7], 0 offen
 	v_mov_b32_e32 v20, 0x7
@@ -252,7 +252,7 @@
 	v_mov_b32_e32 v20, 0x3e800000
 	v_mov_b32_e32 v21, 0x40000000
 	s_mov_b32 s6, 0xffffffff
-	s_mov_b32 s7, 0x31017fac
+	s_mov_b32 s7, 0x3101722c
 	v_mov_b32_e32 v5, 0x2c0
 	buffer_store_format_xy v[20:21], v5, s[4:7], 0 offen
 	s_or_b32 s5, s1, 0x100000

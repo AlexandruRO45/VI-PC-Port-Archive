@@ -286,11 +286,12 @@ buffer_load_format_xy v[10:11], v5, s[4:7], 0 offen
 s_waitcnt vmcnt(0)
 v_mov_b32_e32 v6, 0xd0
 buffer_store_dwordx4 v[10:13], v6, s[0:3], 0 offen
-; 0x280: buffer_store_format_xy, 32_32_UINT
+; 0x280: buffer_store_format_xy, 32_32_UINT, DST_SEL XY01 (0x22c): a 2-component MUBUF store with the identity
+; XYZW writes (x, w) on RDNA2 (docs/design.md, SHADER-364), so the two 2-component stores use XY01
 v_mov_b32_e32 v20, 0xdeadbeef
 v_mov_b32_e32 v21, 0x1234567
 s_mov_b32 s6, 0xffffffff
-s_mov_b32 s7, 0x3103efac
+s_mov_b32 s7, 0x3103e22c
 v_mov_b32_e32 v5, 0x280
 buffer_store_format_xy v[20:21], v5, s[4:7], 0 offen
 ; 0x290: buffer_store_format_xyz, 32_32_32_UINT
@@ -316,11 +317,11 @@ s_mov_b32 s6, 0xffffffff
 s_mov_b32 s7, 0x3104afac
 v_mov_b32_e32 v5, 0x2b0
 buffer_store_format_xy v[20:21], v5, s[4:7], 0 offen
-; 0x2c0: buffer_store_format_xy, 16_16_UNORM, x = 0.25, y = 2.0 clamps
+; 0x2c0: buffer_store_format_xy, 16_16_UNORM, DST_SEL XY01, x = 0.25, y = 2.0 clamps
 v_mov_b32_e32 v20, 0x3e800000
 v_mov_b32_e32 v21, 0x40000000
 s_mov_b32 s6, 0xffffffff
-s_mov_b32 s7, 0x31017fac
+s_mov_b32 s7, 0x3101722c
 v_mov_b32_e32 v5, 0x2c0
 buffer_store_format_xy v[20:21], v5, s[4:7], 0 offen
 ; 0x2d0: buffer_store_format_xyz, 32_32_32_FLOAT, structured, stride 16, NR 1, index 0: 0x2d0
