@@ -184,7 +184,7 @@ class MainWiringTest(unittest.TestCase):
     """main() parses the fallback flags and hands the same tuple to preflight() and shaders()."""
 
     def run_main(self, *extra_argv, per_vertex=None, barycentric_fallback=None, max_push_constants=None,
-                 mesh_crash=False):
+                 mesh_crash=False, lod_bias=None):
         # An empty --out: main() reads the flags an existing translation was made with, and the default folder
         # is the user's own.
         out = tempfile.TemporaryDirectory()
@@ -199,6 +199,7 @@ class MainWiringTest(unittest.TestCase):
                 mock.patch("make_game.runtime_gpu_barycentric_fallback", return_value=barycentric_fallback), \
                 mock.patch("make_game.runtime_gpu_max_push_constants", return_value=max_push_constants), \
                 mock.patch("make_game.runtime_gpu_mesh_draws_crash", return_value=mesh_crash), \
+                mock.patch("make_game.runtime_gpu_sampler_lod_bias", return_value=lod_bias), \
                 mock.patch("make_game.preflight") as preflight, \
                 mock.patch("make_game.shaders") as shaders, \
                 mock.patch("make_game.log"):
@@ -303,6 +304,16 @@ class MainWiringTest(unittest.TestCase):
             with self.subTest(raw=raw), mock.patch("make_game.runtime_gpu_info", return_value=raw):
                 self.assertEqual(make_game.runtime_gpu_max_push_constants(), want)
 
+    def test_lod_bias_fallback_follows_the_device(self):
+        """On by itself where vk_subgroup_info says the GPU's samplers take no LOD bias (MoltenVK), not where they do
+        or it can't tell; asked for explicitly, it is on everywhere. It comes after the f16 one (FALLBACK_FLAGS)."""
+        self.assertEqual(self.run_main(lod_bias=False), (("--lod-bias-fallback",),) * 2)
+        self.assertEqual(self.run_main(lod_bias=True), ((), ()))
+        self.assertEqual(self.run_main(lod_bias=None), ((), ()))
+        self.assertEqual(self.run_main("--lod-bias-fallback", lod_bias=True), (("--lod-bias-fallback",),) * 2)
+        self.assertEqual(self.run_main(per_vertex=False, lod_bias=False),
+                         (("--f16-interp-fallback", "--lod-bias-fallback"),) * 2)
+
 
 class ProbeFailureKeepsAutomaticFlagsTest(RecordedFlagsTest):
     """A GPU probe that can't tell must not change the flags a finished translation was made with: one failed or
@@ -311,7 +322,7 @@ class ProbeFailureKeepsAutomaticFlagsTest(RecordedFlagsTest):
 
     AUTOMATIC = ("--f16-interp-fallback", "--pc-tail-ubo")
 
-    def build(self, *extra_argv, per_vertex, max_push_constants, mesh_crash=False):
+    def build(self, *extra_argv, per_vertex, max_push_constants, mesh_crash=False, lod_bias=None):
         """One `make_game.py --stages shaders` run: (the fallbacks of each translation it started, its log)."""
         translations, lines = [], []
 
@@ -338,6 +349,7 @@ class ProbeFailureKeepsAutomaticFlagsTest(RecordedFlagsTest):
                 mock.patch("make_game.runtime_gpu_barycentric_fallback", return_value=None), \
                 mock.patch("make_game.runtime_gpu_max_push_constants", return_value=max_push_constants), \
                 mock.patch("make_game.runtime_gpu_mesh_draws_crash", return_value=mesh_crash), \
+                mock.patch("make_game.runtime_gpu_sampler_lod_bias", return_value=lod_bias), \
                 mock.patch("make_game.preflight"), \
                 mock.patch.object(make_game, "py", fake_py), \
                 mock.patch.object(make_game, "need", lambda *a: None), \
@@ -390,7 +402,6 @@ class ProbeFailureKeepsAutomaticFlagsTest(RecordedFlagsTest):
         self.assertEqual(self.recorded(), "--no-float-controls --f16-interp-fallback")
         translations, _ = self.build(per_vertex=None, max_push_constants=None)
         self.assertEqual(translations, [("--f16-interp-fallback",)])
-
 
 if __name__ == "__main__":
     unittest.main()

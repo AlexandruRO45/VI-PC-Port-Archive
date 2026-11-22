@@ -31,6 +31,7 @@
 #include "../src/vulkan_present.h"
 #include "../src/vulkan_device_filter.h"
 #include "../src/vulkan13_features.h"
+#include "../src/vulkan_portability.h"
 
 #include <vulkan/vulkan_win32.h>
 #ifdef _MSC_VER
@@ -1254,7 +1255,8 @@ struct DeviceState {
         const leonida::DescriptorKey key = leonida::make_ssharp_key(words.data());
         if (sampler_entries.count(key)) return true;
         const g::Sampler sampler = g::decode(words);
-        VkSamplerCreateInfo sampler_info = g::vulkan_sampler(sampler, max_sampler_lod_bias);
+        VkSamplerCreateInfo sampler_info =
+            g::vulkan_sampler(sampler, info.sampler_mip_lod_bias ? max_sampler_lod_bias : 0.0f);
         // What vulkan_sampler leaves to its caller, and features this device may not have enabled.
         if (sampler_info.anisotropyEnable && !info.sampler_anisotropy) {
             log_once("anisotropic sampler without samplerAnisotropy; anisotropy", int(sampler.max_anisotropy));
@@ -8969,6 +8971,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
     VkPhysicalDeviceRayQueryFeaturesKHR rq_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
     VkPhysicalDeviceMeshShaderFeaturesEXT mesh_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
+    bool has_portability_subset = false;  // enabled where offered (VUID-VkDeviceCreateInfo-pProperties-04451)
     {
         std::uint32_t extension_count = 0;
         vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, nullptr);
@@ -8976,7 +8979,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, extensions.data());
         bool has_as = false, has_dho = false, has_rq = false;
         for (const auto& e : extensions) {
-            if (!std::strcmp(e.extensionName, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
+            if (!std::strcmp(e.extensionName, leonida::kPortabilitySubsetExtension)) {
+                has_portability_subset = true;
+            } else if (!std::strcmp(e.extensionName, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
                 VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &conditional};
                 vkGetPhysicalDeviceFeatures2(info.physical, &features);
                 info.conditional_rendering = conditional.conditionalRendering == VK_TRUE;
@@ -9014,6 +9019,15 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         }
         if (!info.conditional_rendering)
             std::fprintf(stderr, "[rt] d3d12: the GPU has no VK_EXT_conditional_rendering: SetPredication is unsupported\n");
+        // One answer for the runtime and for the tests (vulkan_portability.h): the portability subset's feature, a
+        // device whose samplers have none (MoltenVK, and KosmicKrisp, which reports the feature but ignores the bias
+        // in OpImageQueryLod, #3124). The samplers get mipLodBias 0 there and the shaders apply the S#'s bias.
+        info.sampler_mip_lod_bias = leonida::sampler_mip_lod_bias(
+            vkEnumerateDeviceExtensionProperties, vkGetPhysicalDeviceFeatures2, info.physical,
+            vkGetPhysicalDeviceProperties2);
+        if (!info.sampler_mip_lod_bias)
+            std::fprintf(stderr, "[rt] d3d12: the GPU's samplers take no LOD bias: samplers get mipLodBias 0, and the "
+                                 "shaders must apply it (--lod-bias-fallback)\n");
     }
     VkPhysicalDeviceConditionalRenderingFeaturesEXT enable_conditional{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
@@ -9390,6 +9404,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     std::vector<const char*> device_extensions;
     v13.add_extensions(device_extensions);
     if (info.conservative_rasterization) device_extensions.push_back(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME);
+    if (has_portability_subset) device_extensions.push_back(leonida::kPortabilitySubsetExtension);
     if (info.image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     if (info.vertex_attribute_divisor) device_extensions.push_back(divisor_extension);
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);

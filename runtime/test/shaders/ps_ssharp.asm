@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; The S# and T# mip fields through the descriptor path. s0:s1 is the console VA of a T# (8 dwords) with the S#
 ; (4 dwords) 32 bytes after it; the translator hashes both and looks them up in the descriptor hash table.
 ; Run: vk_sampler_test vs_ids.spv ps_ssharp.spv out.raw <S# words> [<base level> <last level>]  (check.py: SAMPLER_CASES)

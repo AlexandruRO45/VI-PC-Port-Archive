@@ -46,6 +46,11 @@ max_push_constants_size is VkPhysicalDeviceProperties.limits.maxPushConstantsSiz
 contract uses 144 bytes (152 with --mesh-compute); where a device reports less (e.g. 128 on AMD's Windows driver for
 RDNA2 iGPUs and some Intel Arc drivers), make_game.py translates with --pc-tail-ubo.
 Usage: `python -I tools/vk_subgroup_info.py --help` lists the options.
+sampler_lod_bias says whether the device's samplers take a LOD bias: false where it has
+VK_KHR_portability_subset and that extension's samplerMipLodBias feature is false (MoltenVK, since Metal
+samplers have none), and false on KosmicKrisp, which reports the feature but ignores the bias in
+OpImageQueryLod (#3124). Where it is false, the shaders are translated with --lod-bias-fallback and apply
+the S#'s LOD_BIAS themselves, and the runtime creates its samplers with mipLodBias 0.
 """
 import argparse
 import ctypes
@@ -65,6 +70,7 @@ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR = 1000314007
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES = 1000225000
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES = 1000196000
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR = 1000203000
+VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR = 1000163000
 VK_DRIVER_ID_MOLTENVK = 14
 VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA = 6
 VK_DRIVER_ID_AMD_PROPRIETARY = 1
@@ -81,6 +87,9 @@ RDNA2_DEVICE_IDS = ((0x73A0, 0x73FF), (0x7420, 0x743F), (0x163F, 0x163F), (0x143
 # Cezanne and Barcelo. #5933's wrong BaryCoordKHR was measured on 0x15E7 (Vega 8 of a Ryzen 7 5825U). Other GCN 5
 # parts (Raven/Picasso gfx902, Vega 10/12/20 cards) are a different GPU and are not tested, so they are not listed.
 GFX90C_DEVICE_IDS = (0x15E7, 0x1636, 0x1638, 0x164C)
+PORTABILITY_FEATURES_SIZE = 80          # 16 + 15 VkBool32, padded to 8
+PORTABILITY_SAMPLER_MIP_LOD_BIAS = 16 + 4 * 8
+EXTENSION_PROPERTIES_SIZE = 260         # sizeof(VkExtensionProperties): char[256] + specVersion
 DRIVER_PROPS_SIZE = 536     # sizeof(VkPhysicalDeviceDriverProperties): 16 + driverID + 2 x char[256] + version, padded
 BARY_FEATURES_SIZE = 24     # sizeof(VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR): 16 + one VkBool32
 VK_SHADER_STAGE_COMPUTE_BIT = 0x20
@@ -249,6 +258,7 @@ def query(*, stage_caps=False) -> dict:
     vk.vkGetPhysicalDeviceProperties2.argtypes = [vp, vp]
     vk.vkGetPhysicalDeviceFeatures2.argtypes = [vp, vp]
     vk.vkGetPhysicalDeviceQueueFamilyProperties.argtypes = [vp, vp, vp]
+    vk.vkEnumerateDeviceExtensionProperties.argtypes = [vp, vp, vp, vp]
     vk.vkDestroyInstance.argtypes = [vp, vp]
     app = AppInfo(VK_STRUCTURE_TYPE_APPLICATION_INFO, None, b"leonida-subgroup-info", 1, None, 0, VK_API_VERSION_1_3)
     info = InstanceInfo(VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, None, 0, ctypes.pointer(app), 0, None, 0, None)
@@ -286,6 +296,9 @@ def query(*, stage_caps=False) -> dict:
             f13 = block(F13_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES)
             f12 = block(F12_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)
             bary = block(BARY_FEATURES_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR)
+            subset = block(PORTABILITY_FEATURES_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR)
+            # Without VK_KHR_portability_subset the device is conformant: its samplers take a LOD bias.
+            portability = b"VK_KHR_portability_subset" in device_extensions(vk, d)
             if core13:
                 set_next(f12, f13)
                 set_next(f13, bary)
@@ -295,6 +308,8 @@ def query(*, stage_caps=False) -> dict:
                 set_next(f12, rendering)
                 set_next(rendering, sync2)
                 set_next(sync2, bary)
+            if portability:
+                set_next(bary, subset)
             f2 = block(FEATURES2_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)
             set_next(f2, f12)
             vk.vkGetPhysicalDeviceFeatures2(d, f2)
@@ -323,7 +338,8 @@ def query(*, stage_caps=False) -> dict:
                           bool(u32(bary, 16)) and u32(drv, 16) != VK_DRIVER_ID_MOLTENVK,
                           int.from_bytes(raw[PROPS_MAX_PUSH_CONSTANTS_SIZE:PROPS_MAX_PUSH_CONSTANTS_SIZE + 4], "little"),
                           int.from_bytes(raw[PROPS_VENDOR_ID:PROPS_VENDOR_ID + 4], "little"),
-                          int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16))
+                          int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16),
+                          not portability or bool(u32(subset, PORTABILITY_SAMPLER_MIP_LOD_BIAS)))
         if chosen is None:
             if device_filter:
                 raise RuntimeError(
@@ -332,7 +348,7 @@ def query(*, stage_caps=False) -> dict:
                 )
             raise RuntimeError("no Vulkan 1.3 GPU with the features and graphics queue the runtime needs")
         (name, subgroup_size, supported_stages, lo, hi, required_stages, max_workgroup_subgroups,
-         sgc, per_vertex, max_push_constants_size, vendor, device, driver) = chosen
+         sgc, per_vertex, max_push_constants_size, vendor, device, driver, lod_bias) = chosen
         compute_required = bool(required_stages & VK_SHADER_STAGE_COMPUTE_BIT)
         mesh_required = bool(required_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
         compute_supported = bool(supported_stages & VK_SHADER_STAGE_COMPUTE_BIT)
@@ -362,6 +378,7 @@ def query(*, stage_caps=False) -> dict:
             "rdna1_amd_windows": (vendor == AMD_VENDOR_ID and driver == VK_DRIVER_ID_AMD_PROPRIETARY
                                   and device in RDNA1_DEVICE_IDS),
             "rdna2_amd_windows": rdna2_amd_windows(vendor, device, driver),
+            "sampler_lod_bias": lod_bias,
         }
         if stage_caps:
             result.update(supported_subgroup_stages=supported_stages,

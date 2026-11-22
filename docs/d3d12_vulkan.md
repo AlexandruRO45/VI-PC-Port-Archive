@@ -1094,11 +1094,21 @@ and any validation error fails them.
 - `vk_sampler_test` (run the same way): the S# and T# mip fields as `gfx10_descriptors.h` maps them. `ps_ssharp.asm`
   loads a T# and an S# from the heap and samples a 128x128 two-level texture twice, with `image_sample_lz` (LOD 0)
   and `image_sample` (LOD 1 at this size). The sampler is `vulkan_sampler(decode(S#))` and the view's levels come
-  from `decode(T#)`. `check.py`'s `SAMPLER_CASES` cover a point mip filter, MAX_LOD 0, MIN_LOD 1, LOD_BIAS ±1,
-  MIP_FILTER_NONE with and without MIN_LOD, and a T# whose BASE_LEVEL is 1. Each pixel is judged against levels
-  worked out from the S# and T# bits in Python, independently of the header. On Vulkan, the sampler's minLod and
-  mipLodBias apply to an explicit LOD as well. The T#'s MIN_LOD (D3D12's ResourceMinLODClamp) is not covered by
-  this test.
+  from `decode(T#)`. `check.py`'s `SAMPLER_CASES` cover a point mip filter, MAX_LOD 0, MIN_LOD 1, LOD_BIAS ±1 and
+  +0.375, LOD_BIAS −1 with MIN_LOD 1 and +1 with MAX_LOD 0 (the bias comes before the clamp), MIP_FILTER_NONE with
+  and without MIN_LOD, and a T# whose BASE_LEVEL is 1. Each pixel is judged against levels worked out from the S# and
+  T# bits in Python, independently of the header. `ps_ssharp_ops.asm` draws the same cases with `image_sample_l`,
+  `_b`, `_d` and `_d_cl` (`sampler_ops_mismatch`), and `ps_ssharp_lod.asm` queries `image_get_lod` at LOD 1 and 2
+  over `SAMPLER_LOD_CASES` (those without MIN_LOD = MAX_LOD, plus MAX_LOD 0.25; `sampler_lod_mismatch`). Where the
+  device's samplers take no LOD bias (MoltenVK) the sampler gets `mipLodBias` 0, and so does a shader the index
+  marks `lod_bias_fallback` (`--shader-lod-bias`): such a shader applies the S#'s bias itself (`docs/design.md`,
+  "Sampler LOD bias in the shader"). The D3D12 device tells such a device by its portability subset, by
+  KosmicKrisp's driver ID (it reports the feature but ignores the bias in `OpImageQueryLod`, #3124) or, under Wine,
+  where winevulkan doesn't pass `VK_KHR_portability_subset` on to Windows programs, by MoltenVK's driver ID
+  (`runtime/src/vulkan_portability.h`, `is_moltenvk` and `is_kosmickrisp`). `d3d12_descriptor_test` samples literal
+  S#s through a GLSL shader, which applies no bias, so there its "literal sampler bias 31" case is reported as not
+  judged. On Vulkan, the sampler's minLod and mipLodBias apply to an explicit LOD as well. The T#'s MIN_LOD
+  (D3D12's ResourceMinLODClamp) is not covered by this test.
 - **Measured on RDNA2** (SHADER-539): `tools/sampler_lod_probe.py --oracle hw` samples a linear 64x64 R32_SFLOAT
   texture with seven levels at its top-left texel. The texture memory is a dword ramp, so each result names the
   level it was read from, and a calibration row per level finds the level starts. It runs 43 rows of

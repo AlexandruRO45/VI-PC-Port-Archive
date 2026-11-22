@@ -49,7 +49,7 @@ class FakeDevice:
 
     name: str | bytes = "Synthetic GPU"
     api_version: int = vk_info.VK_API_VERSION_1_3
-    extension_names: tuple[bytes, ...] = ()
+    extension_names: tuple[bytes, ...] = ()   # device extensions, e.g. b"VK_KHR_portability_subset"
     device_type: int = vk_info.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
     dynamic_rendering: bool = True
     synchronization2: bool = True
@@ -73,6 +73,7 @@ class FakeDevice:
     driver_id: int = 1      # VK_DRIVER_ID_AMD_PROPRIETARY
     vendor_id: int = 0
     device_id: int = 0
+    sampler_mip_lod_bias: bool = False      # the portability subset's feature, written only when it is chained
 
 
 class FakeVulkan:
@@ -100,6 +101,7 @@ class FakeVulkan:
         self.vkGetPhysicalDeviceProperties2 = _VkProc(self._get_physical_device_properties2)
         self.vkGetPhysicalDeviceFeatures2 = _VkProc(self._get_physical_device_features2)
         self.vkGetPhysicalDeviceQueueFamilyProperties = _VkProc(self._get_queue_family_properties)
+        self.portability_chained = []
         self.vkDestroyInstance = _VkProc(self._destroy_instance)
 
     @staticmethod
@@ -250,6 +252,13 @@ class FakeVulkan:
                 ctypes.c_uint32.from_address(node_addr + 16).value = int(dev.synchronization2)
             elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR:
                 ctypes.c_uint32.from_address(node_addr + 16).value = int(dev.fragment_shader_barycentric)
+            elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR:
+                if b"VK_KHR_portability_subset" not in dev.extension_names:
+                    raise AssertionError("portability subset features chained for a device without the extension")
+                self.portability_chained.append(handle)
+                ctypes.c_uint32.from_address(
+                    node_addr + vk_info.PORTABILITY_SAMPLER_MIP_LOD_BIAS
+                ).value = int(dev.sampler_mip_lod_bias)
         expected = {
             vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
             vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
@@ -259,6 +268,9 @@ class FakeVulkan:
             expected.add(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES)
         else:
             expected.update((1000044003, 1000314007))
+        if b"VK_KHR_portability_subset" in dev.extension_names:
+            # samplerMipLodBias comes from the subset's own features struct (--lod-bias-fallback)
+            expected.add(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR)
         if expected != seen_types:
             raise AssertionError(f"unexpected feature structs in pNext chain: {seen_types!r}")
 
@@ -804,6 +816,7 @@ class QueryTest(unittest.TestCase):
                     "driver_id": 1,
                     "rdna1_amd_windows": False,
                     "rdna2_amd_windows": False,
+                    "sampler_lod_bias": True,
                 })
 
     def test_max_push_constants_size(self):
@@ -917,6 +930,18 @@ class QueryTest(unittest.TestCase):
                 self.assertEqual(res["device"], "AMD Radeon RX 6700")
                 self.assertTrue(res["rdna2_amd_windows"])
                 self.assertTrue(res["native64"])
+
+    def test_sampler_lod_bias(self):
+        """Samplers take a LOD bias unless the device has VK_KHR_portability_subset without samplerMipLodBias
+        (MoltenVK); the subset's features are only asked of a device that offers the extension."""
+        subset = (b"VK_KHR_swapchain", b"VK_KHR_portability_subset")
+        for label, extensions, feature, want in (("conformant", (b"VK_KHR_swapchain",), False, True),
+                                                 ("subset_with_bias", subset, True, True),
+                                                 ("moltenvk", subset, False, False)):
+            with self.subTest(case=label):
+                res, vk = self._run_query(FakeDevice(extension_names=extensions, sampler_mip_lod_bias=feature))
+                self.assertIs(res["sampler_lod_bias"], want)
+                self.assertEqual(bool(vk.portability_chained), b"VK_KHR_portability_subset" in extensions)
 
     def test_native64_uses_default_size_without_required_mesh_stage(self):
         dev = FakeDevice(

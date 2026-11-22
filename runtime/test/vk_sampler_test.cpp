@@ -3,22 +3,27 @@
 // and sampler those keys name. Unlike vk_texture_test, which binds a fixed nearest sampler and one level, the
 // VkSampler here is vulkan_sampler(decode(S#)) and the view's levels come from decode(T#).
 //
-//   vk_sampler_test <vs_ids.spv> <ps_ssharp.spv> <out.raw> <s0> <s1> <s2> <s3> [<base level> <last level>]
+//   vk_sampler_test [--shader-lod-bias] <vs_ids.spv> <ps_ssharp.spv> <out.raw> <s0> <s1> <s2> <s3> [<base> <last>]
 //
 // S# words are hex. The T# is encode() of a 128x128 RGBA8 image with two levels, with BASE_LEVEL and LAST_LEVEL as
 // given (default 0 and 1). Level 0 has four solid quadrants: red, green, blue and yellow. Level 1 is solid grey
 // (128/255). vs_ids runs UV 0..1 over the 64x64 target, so implicit sampling sees two level-0 texels per pixel
 // (LOD 1) and image_sample_lz asks for LOD 0. The 64x64 RGBA32F result is written to <out.raw>; check.py judges it.
 // Exit 77 with "unsupported: ..." when the device lacks a feature the shader or sampler needs.
+// The sampler's mipLodBias is the S#'s LOD_BIAS, except where the shader applies it itself (--shader-lod-bias: it was
+// translated with --lod-bias-fallback) or the device's samplers take none (VK_KHR_portability_subset without
+// samplerMipLodBias, as on MoltenVK): there it is 0, as the runtime makes it. A device with the portability subset gets
+// it enabled, and an instance that offers VK_KHR_portability_enumeration enumerates portability drivers, so MoltenVK
+// also runs behind the Vulkan loader (and its validation layer).
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
 #include "vk_shader_fma.h"
 #include "../src/vulkan_device_filter.h"
 #include "vk_pc_tail.h"
-#include "vk_shader_fma.h"
 
 #include "../src/descriptor_table.h"
 #include "../src/gfx10_descriptors.h"
+#include "../src/vulkan_portability.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -49,11 +54,29 @@ std::vector<std::uint32_t> read_spv(const char* path) {
     return words;
 }
 
+// Whether the SPIR-V declares `capability` (OpCapability is opcode 17, two words).
+bool declares_capability(const std::vector<std::uint32_t>& code, std::uint32_t capability) {
+    for (std::size_t i = 5; i < code.size();) {
+        const std::uint32_t count = code[i] >> 16, opcode = code[i] & 0xffffu;
+        if (!count) break;
+        if (opcode == 17 && count == 2 && i + 1 < code.size() && code[i + 1] == capability) return true;
+        i += count;
+    }
+    return false;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    bool shader_lod_bias = false;
+    if (argc > 1 && !std::strcmp(argv[1], "--shader-lod-bias")) {
+        shader_lod_bias = true;
+        ++argv;
+        --argc;
+    }
     if (argc != 8 && argc != 10) {
-        std::fprintf(stderr, "usage: vk_sampler_test <vs.spv> <fs.spv> <out.raw> <s0> <s1> <s2> <s3> [<base> <last>]\n");
+        std::fprintf(stderr, "usage: vk_sampler_test [--shader-lod-bias] <vs.spv> <fs.spv> <out.raw> <s0> <s1> <s2> <s3> "
+                             "[<base> <last>]\n");
         return 2;
     }
     namespace gfx10 = leonida::gfx10;
@@ -74,23 +97,36 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "the T# does not decode to a view of the %u levels\n", levels);
         return 2;
     }
-    const VkSamplerCreateInfo sampler_info = gfx10::vulkan_sampler(gfx10::decode(ssharp));
-    std::printf("S# %08x %08x %08x %08x: mipmapMode %d, minLod %g, maxLod %g, mipLodBias %g; view levels %u..%u\n",
-                ssharp[0], ssharp[1], ssharp[2], ssharp[3], int(sampler_info.mipmapMode), sampler_info.minLod,
-                sampler_info.maxLod, sampler_info.mipLodBias, view_of.first_mip, view_of.first_mip + view_of.mip_count - 1);
+    const gfx10::Sampler sampler_fields = gfx10::decode(ssharp);
+    const auto fs_code = read_spv(argv[2]);
+    constexpr std::uint32_t min_lod_capability = 42;  // MinLod: image_sample_*_cl (shaderResourceMinLod)
 
     const PFN_vkGetInstanceProcAddr gipa = load_vulkan();
     if (!gipa) { std::fprintf(stderr, "the Vulkan loader was not found\n"); return 1; }
     VkInstance inst = VK_NULL_HANDLE;
 #define LI(n) const auto n = reinterpret_cast<PFN_##n>(gipa(inst, #n))
-    LI(vkCreateInstance);
+    LI(vkCreateInstance); LI(vkEnumerateInstanceExtensionProperties);
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.apiVersion = VK_API_VERSION_1_2;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
+    const char* portability_enumeration = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+    {
+        std::uint32_t count = 0;
+        if (vkEnumerateInstanceExtensionProperties) vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr);
+        std::vector<VkExtensionProperties> extensions(count);
+        if (count) vkEnumerateInstanceExtensionProperties(nullptr, &count, extensions.data());
+        for (const auto& e : extensions) {
+            if (std::strcmp(e.extensionName, portability_enumeration)) continue;
+            ici.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+            ici.enabledExtensionCount = 1;
+            ici.ppEnabledExtensionNames = &portability_enumeration;
+        }
+    }
     CHECK(vkCreateInstance(&ici, nullptr, &inst));
     LI(vkEnumeratePhysicalDevices); LI(vkGetPhysicalDeviceProperties); LI(vkGetPhysicalDeviceQueueFamilyProperties);
     LI(vkGetPhysicalDeviceMemoryProperties); LI(vkGetPhysicalDeviceFeatures2); LI(vkCreateDevice); LI(vkGetDeviceProcAddr);
+    LI(vkEnumerateDeviceExtensionProperties); LI(vkGetPhysicalDeviceProperties2);
     std::uint32_t n = 0;
     vkEnumeratePhysicalDevices(inst, &n, nullptr);
     std::vector<VkPhysicalDevice> pds(n);
@@ -127,11 +163,31 @@ int main(int argc, char** argv) {
         std::printf("unsupported: the device lacks bufferDeviceAddress, runtimeDescriptorArray or shaderInt64\n");
         return unsupported;
     }
-    const auto fragment_code = read_spv(argv[2]);
     const bool dynamic_sampled = leonida::vk_test::spirv_declares_capability(
-        fragment_code.data(), fragment_code.size() * 4, leonida::vk_test::spv_sampled_image_array_dynamic_indexing);
+        fs_code.data(), fs_code.size() * 4, leonida::vk_test::spv_sampled_image_array_dynamic_indexing);
     if (dynamic_sampled && !have.features.shaderSampledImageArrayDynamicIndexing) {
         std::printf("unsupported: shaderSampledImageArrayDynamicIndexing\n");
+        return unsupported;
+    }
+    // One answer for the runtime and for this test (vulkan_portability.h): the portability subset's feature, a
+    // device whose samplers have none (MoltenVK, and KosmicKrisp, which reports the feature but ignores the bias in
+    // OpImageQueryLod, #3124), or, for a shader translated with --lod-bias-fallback, none at all.
+    const bool portability = leonida::has_portability_subset(vkEnumerateDeviceExtensionProperties, pd);
+    const bool device_lod_bias = leonida::sampler_mip_lod_bias(vkEnumerateDeviceExtensionProperties,
+                                                               vkGetPhysicalDeviceFeatures2, pd,
+                                                               vkGetPhysicalDeviceProperties2);
+    const bool sampler_lod_bias = device_lod_bias && !shader_lod_bias;
+    const VkSamplerCreateInfo sampler_info =
+        gfx10::vulkan_sampler(sampler_fields, sampler_lod_bias ? props.limits.maxSamplerLodBias : 0.0f);
+    std::printf("S# %08x %08x %08x %08x: mipmapMode %d, minLod %g, maxLod %g, mipLodBias %g%s; view levels %u..%u\n",
+                ssharp[0], ssharp[1], ssharp[2], ssharp[3], int(sampler_info.mipmapMode), sampler_info.minLod,
+                sampler_info.maxLod, sampler_info.mipLodBias,
+                shader_lod_bias ? " (the shader applies the S# bias)"
+                : device_lod_bias ? "" : " (the device's samplers take no LOD bias)",
+                view_of.first_mip, view_of.first_mip + view_of.mip_count - 1);
+    const bool min_lod = declares_capability(fs_code, min_lod_capability);
+    if (min_lod && !have.features.shaderResourceMinLod) {
+        std::printf("unsupported: the shader clamps the LOD (MinLod) and the device has no shaderResourceMinLod\n");
         return unsupported;
     }
     if (sampler_info.anisotropyEnable && !have.features.samplerAnisotropy) {
@@ -164,16 +220,21 @@ int main(int argc, char** argv) {
     enable.features.shaderInt64 = VK_TRUE;
     enable.features.shaderSampledImageArrayDynamicIndexing = dynamic_sampled;
     enable.features.samplerAnisotropy = sampler_info.anisotropyEnable;
+    enable.features.shaderResourceMinLod = min_lod ? VK_TRUE : VK_FALSE;
     leonida::vk_test::ShaderFma fma;      // OpFmaKHR (rdna2spirv.py --fma khr), when the device has it
     fma.query(gipa, inst, pd);
     // A device without VK_KHR_shader_fma cannot create a pipeline from a stage that uses OpFmaKHR: skip the pair.
     if (!fma.accepts_file(argv[1]) || !fma.accepts_file(argv[2])) return unsupported;
     fma.link_after(&enable);
-    const char* fma_extension = fma.extension();
+    const char* portability_subset = leonida::kPortabilitySubsetExtension;
+    std::vector<const char*> device_extensions;
+    if (fma.supported()) device_extensions.push_back(fma.extension());
+    if (portability) device_extensions.push_back(portability_subset);   // required where offered (04451)
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable};
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    if (fma.supported()) { dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = &fma_extension; }
+    dci.enabledExtensionCount = std::uint32_t(device_extensions.size());
+    dci.ppEnabledExtensionNames = device_extensions.data();
     VkDevice dev = VK_NULL_HANDLE;
     CHECK(vkCreateDevice(pd, &dci, nullptr, &dev));
 #define LD(n) const auto n = reinterpret_cast<PFN_##n>(vkGetDeviceProcAddr(dev, #n))
@@ -387,7 +448,7 @@ int main(int argc, char** argv) {
     const std::uint32_t push_bytes = pc_tail ? 128u : 144u;
     bool tail_block = false;
     for (int stage = 0; stage < 2; ++stage) {
-        const auto& code = stage == 0 ? vertex_code : fragment_code;
+        const auto& code = stage == 0 ? vertex_code : fs_code;
         if (code.empty()) {
             std::fprintf(stderr, "cannot read %s\n", argv[1 + stage]);
             return 1;

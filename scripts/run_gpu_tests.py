@@ -29,7 +29,7 @@ from check import (Skip, clip_test, fmt_1010102_test, fmt_d16_xyz_test, fmt_int_
                    fmt_xy_xyz_test, tbuffer_store_test)
 from check import compute_unsupported   # vk_compute_test's exit 77 over a feature the module needs
 from compute_fixture import compute_header
-from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
+from check import sampler_cases, sampler_test   # ps_ssharp*: the S#/T# mip fields (vk_sampler_test)
 from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, PK_MUL_LO_WORDS, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
                    TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, TEXTURE_CONSTANTS, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, table_fetch_test, texture_gradient_a16_test, texture_mip_test)
@@ -324,25 +324,44 @@ def f16_interp_fallback() -> bool:
         return True
     if v in ("0", "false", "no", "off"):
         return False
-    return _device_per_vertex() is False
+    return _device_info("per_vertex_inputs") is False
 
 
 _PER_VERTEX = []
 _BARYCENTRIC_FALLBACK = []
+_LOD_BIAS = []
 
 
-def _device_per_vertex():
-    """per_vertex_inputs from tools/vk_subgroup_info.py for the device the tests run on (cached), or None."""
-    if not _PER_VERTEX:
-        answer = None
+def lod_bias_fallback() -> bool:
+    """LEONIDA_LOD_BIAS_FALLBACK=1 (or 0): translate with --lod-bias-fallback, so samples apply the S#'s LOD_BIAS
+    themselves and vk_sampler_test creates its sampler with mipLodBias 0 (ps_ssharp*). Unset, it is on where the
+    device's samplers take no LOD bias: tools/vk_subgroup_info.py reports sampler_lod_bias false (MoltenVK,
+    KosmicKrisp)."""
+    v = (os.environ.get("LEONIDA_LOD_BIAS_FALLBACK") or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    if not _LOD_BIAS:
+        _LOD_BIAS.append(_device_info("sampler_lod_bias"))
+    return _LOD_BIAS[0] is False
+
+
+_DEVICE_INFO = []
+
+
+def _device_info(key: str):
+    """`key` of tools/vk_subgroup_info.py's answer for the device the tests run on (cached), or None."""
+    if not _DEVICE_INFO:
+        answer = {}
         try:
             r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "vk_subgroup_info.py")],
                                capture_output=True, text=True, timeout=60)
-            answer = json.loads(r.stdout.strip().splitlines()[-1]).get("per_vertex_inputs")
+            answer = json.loads(r.stdout.strip().splitlines()[-1])
         except (OSError, ValueError, IndexError, subprocess.SubprocessError):
             pass
-        _PER_VERTEX.append(answer)
-    return _PER_VERTEX[0]
+        _DEVICE_INFO.append(answer if isinstance(answer, dict) else {})
+    return _DEVICE_INFO[0].get(key)
 
 
 def _device_barycentric_fallback():
@@ -664,6 +683,7 @@ DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_persp_
               "ps_texture_sample_d16": "vs_ids.asm", "ps_sample_c_lz": "vs_ids.asm", "ps_sample_c_lz_a16": "vs_ids.asm",
               "ps_table_fetch": "vs_ids.asm", "ps_sample_c": "vs_ids.asm", "ps_sample_c_b": "vs_ids.asm",
               **{name: "vs_ids.asm" for name in TEXTURE_CONSTANTS}, "ps_ssharp": "vs_ids.asm", "ps_imgatomic": "vs_ids.asm",
+              "ps_ssharp_ops": "vs_ids.asm", "ps_ssharp_lod": "vs_ids.asm",
               **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_clip_color.asm",
               "ps_interp_f16_high": "vs_f16_pack.asm", "ms_f16_pack": "ps_interp_f16_high.asm",
               "ps_interp_f32_mods": "vs_interp_consts.asm", "ps_interp_mov_mods": "vs_interp_consts.asm",
@@ -909,6 +929,8 @@ def run_suite(a, work: str) -> int:
             cmd.append("--bary-fallback")
         if f16_interp_fallback():   # *_f16 interps from decoded-half inputs, no PerVertexKHR (MoltenVK)
             cmd.append("--f16-interp-fallback")
+        if lod_bias_fallback():   # the S#'s LOD_BIAS applied by the shader, samplers without mipLodBias (MoltenVK)
+            cmd.append("--lod-bias-fallback")
         if TEXOFF_FALLBACK:   # image_sample*_o: offset folded into the coordinate, no VK_KHR_maintenance8
             cmd.append("--texel-offset-fallback")
         if MESH_COMPUTE:   # mesh shaders as compute writing to a buffer, drawn by tools/mesh_compute_vs.py
@@ -1369,11 +1391,12 @@ def run_suite(a, work: str) -> int:
                 results.append((name, None, f"SKIP ({reason})"))
             else:
                 results.append((name, rc == 0, verdict_line(rc, msg)))
-        elif name == "ps_ssharp":
+        elif name in ("ps_ssharp", "ps_ssharp_ops", "ps_ssharp_lod"):
             # The S#/T# mip fields through vulkan_sampler() and the view range (check.py's SAMPLER_CASES).
-            problem = sampler_test(a.build, spirv_dir)
+            problem = sampler_test(a.build, spirv_dir, name)
             results.append((name, None if isinstance(problem, Skip) else not problem,
-                            problem or f"{len(SAMPLER_CASES)} S#/T# cases, 4096 pixels each exact"))
+                            problem or f"{len(sampler_cases(name))} S#/T# cases, 4096 pixels each "
+                                       f"{'within 1/16' if name == 'ps_ssharp_lod' else 'exact'}"))
         elif name in ("ps_texoff", "ps_texoff_implicit", "ps_texoff_forms"):
             # Texel offsets: needs vk_texture_test's texture, sampler and descriptor table (vk_harness binds none),
             # and VK_KHR_maintenance8 for the non-constant Offset; the tool exits 77 without it.
