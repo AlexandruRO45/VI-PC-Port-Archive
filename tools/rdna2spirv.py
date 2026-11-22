@@ -2183,6 +2183,40 @@ class Gen:
             self.emit(f"{ph} = OpPhi %uint {new} {lbl_do} {old} {pre}")
             self.store_reg("vgpr", data["r"], ph)
 
+    def flat_mem(self, op, a, mods):
+        """flat_load_*, flat_store_* and flat_atomic_* (RDNA2 ISA, FLAT): the access global_* makes with saddr = off, at
+        the 64-bit address in the vaddr VGPR pair plus the 11-bit unsigned instruction offset (llvm-mc rejects a
+        negative or larger one). A flat address can also name the LDS or the private (scratch) aperture; the shared and
+        private bases come from src_shared_base / src_private_base and FLAT_SCRATCH, none of which the translator reads,
+        so a program that could form such an address is refused before it gets here and a flat address is a global one.
+        Measured on gfx1036 (wave32 and wave64, tools/hw_oracle): every load, store and atomic form here gives the words
+        of its global_* twin, including the d16 halves, sign extension and the cmpswap pair order."""
+        mods = list(mods)
+        for m in mods:
+            if m.startswith("offset:"):
+                try:
+                    ok = 0 <= int(m.split(":", 1)[1], 0) <= 2047
+                except ValueError:
+                    ok = False
+                if not ok:
+                    raise Unsupported(f"{op} offset form")
+        if a and a[-1].get("k") == "special" and a[-1].get("t") == "off":
+            raise Unsupported(op + " operands")
+        gop = "global_" + op[len("flat_"):]
+        a = list(a) + [{"k": "special", "t": "off"}]
+        try:
+            if op.startswith("flat_atomic_"):
+                self.global_atomic(gop, a, mods)
+            elif gop in self.GLOBAL_SUB:
+                self.global_sub(gop, a, mods)
+            elif gop.startswith(("global_load_dword", "global_store_dword")) or \
+                    gop in ("global_load_ushort", "global_load_sshort", "global_load_ubyte", "global_load_sbyte"):
+                self.global_mem(gop, a, mods)
+            else:
+                raise Unsupported(op)
+        except Unsupported as e:
+            raise Unsupported(str(e).replace("global_", "flat_")) from None
+
     def global_mem(self, op, a, mods):
         """global_load_dword[xN] vD, vaddr, saddr|off offset:N / global_store_dword[xN] vaddr, vD, saddr|off.
         Address = (saddr: 64-bit SGPR pair + zero-extended 32-bit vaddr | off: 64-bit VGPR pair) + offset,
@@ -6287,6 +6321,8 @@ class Gen:
             z = self.tmp()
             self.emit(f"{z} = OpSelect %uint {self.tmp_bool_nz(r)} {self.cu(1)} {self.cu(0)}")
             self.emit(f"OpStore %scc {z}")
+        elif op.startswith(("flat_load_", "flat_store_", "flat_atomic_")):
+            self.flat_mem(op, a, mods)
         elif op.startswith("global_atomic_"):
             self.global_atomic(op, a, mods)
         elif op in self.GLOBAL_SUB:
@@ -10715,8 +10751,8 @@ def read_before_write_vgprs(insns):
         if not a:
             continue
         reads_all = op.startswith(("exp", "buffer_store", "tbuffer_store", "image_store", "v_cmp", "v_cmpx", "ds_write",
-                                   "global_store")) \
-            or (op.startswith("global_atomic_") and "glc" not in ins["mods"])   # no vdst without glc
+                                   "global_store", "flat_store")) \
+            or (op.startswith(("global_atomic_", "flat_atomic_")) and "glc" not in ins["mods"])   # no vdst without glc
         regs = []
         for x in (a if reads_all else a[1:]):
             if x["k"] == "vgpr":
@@ -10724,7 +10760,7 @@ def read_before_write_vgprs(insns):
             elif x["k"] == "vlist":
                 regs += x["r"]
         if (base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8", "v_pk_fmac_f16") or
-                (op.startswith("global_load_") and "_d16" in op)) and a[0]["k"] == "vgpr":   # d16 keeps a half
+                (op.startswith(("global_load_", "flat_load_")) and "_d16" in op)) and a[0]["k"] == "vgpr":   # d16 keeps a half
             regs.append(a[0]["r"])
         for r in regs:
             if r not in written and r not in first:
@@ -10774,7 +10810,7 @@ def interp_ij_analysis(insns, g):
         if not a:
             continue
         reads_all = op.startswith(("exp", "buffer_store", "tbuffer_store", "image_store", "v_cmp", "v_cmpx", "ds_write",
-                                   "global_store"))
+                                   "global_store", "flat_store"))
         if not reads_all and a[0]["k"] == "vgpr":
             for r in range(a[0]["r"], a[0]["r"] + a[0].get("n", 1)):
                 writes[r].append(n)
@@ -10946,7 +10982,7 @@ def reg_reads_writes(insns):
         if not a:
             continue
         reads_all = op.startswith(("exp", "buffer_store", "tbuffer_store", "image_store", "v_cmp", "v_cmpx", "ds_write",
-                                   "global_store"))
+                                   "global_store", "flat_store"))
         regs = []
         for x in (a if reads_all else a[1:]):
             if x["k"] == "vgpr":
@@ -11657,7 +11693,7 @@ def interp_copy_sources(insns):
         ins["seq"] = i      # program order: also unique without encoding comments (test fixtures share a pc)
         a = ins["args"]
         if not (a and a[0].get("k") == "vgpr") or base_op(ins["op"]).startswith(
-                ("buffer_store", "tbuffer_store", "scratch_store", "global_store", "image_store", "ds_write")):
+                ("buffer_store", "tbuffer_store", "scratch_store", "global_store", "flat_store", "image_store", "ds_write")):
             continue
         for r in range(a[0]["r"], a[0]["r"] + a[0].get("n", 1) + (1 if "tfe" in ins["mods"] else 0)):
             writes.setdefault(r, []).append(ins)
