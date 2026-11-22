@@ -9,18 +9,23 @@
 // (a) DispatchMesh: a 4x2x2 grid (all three counts reach the shader: 16 cells, so every group got its own index), a
 //     3x1x1 grid and a 1x1x1 grid at other first cells and colours, and an empty grid that draws nothing.
 // (b) ExecuteIndirect with DISPATCH_MESH signatures, with additive blending, so a cell's colour counts the records
-//     whose group count reached it, and each record's counts show in the pixels:
+//     whose group count reached it, so each record's group total shows in the pixels (the split of a total into X,
+//     Y and Z, and the order groups are numbered in, are not visible: a group sees only its linear index):
 //       I1  5 CPU-written records, stride 12, at argument offset 36, one of them empty;
 //       I2  4 records, stride 24, copied by the GPU into a default buffer (COPY_DEST -> INDIRECT_ARGUMENT) at offset
 //           48, with a count buffer holding 3 (so the 4th record is not drawn);
 //       I3  a count of 0: nothing;
 //       I4  a count of 7 against MaxCommandCount 2: the first two records only;
-//       I5  20 records of one group each, without a count buffer: one call of 20 (or 20 calls without
-//           multiDrawIndirect).
+//       I5  20 records of 1 to 4 groups, stride 24 with zeroed padding (a wrong stride would read empty records),
+//           without a count buffer: one call of 20, or calls of at most maxDrawIndirectCount records, or 20 calls
+//           without multiDrawIndirect.
 //     Without drawIndirectCount, I2..I4 are left out, and a count-buffer call must fail as unsupported.
 //     --single-calls and --no-count-buffers turn multiDrawIndirect and drawIndirectCount off on the layer's device
-//     (registered as d3d12_m5_mesh_fallbacks), so those paths run on any GPU.
-// (c) Refusals: a DISPATCH_MESH signature whose stride is below 12 is E_INVALIDARG; one on a device without
+//     (registered as d3d12_m5_mesh_fallbacks), so those paths run on any GPU; --max-draw-indirect-count N lowers the
+//     layer's limit (d3d12_m5_mesh_chunks runs N = 3, so I5 is split into calls of 3 records at stride 24). The
+//     one-call-per-record split itself only shows as a validation error on a device without multiDrawIndirect.
+// (c) Refusals: a DISPATCH_MESH signature whose stride is below 12 is E_INVALIDARG; one with a root constant before
+//     DISPATCH_MESH is E_NOTIMPL (multi-argument signatures are not expanded); one on a device without
 //     VK_EXT_mesh_shader is E_NOTIMPL; a DISPATCH_MESH signature run with a VS PSO, and a DRAW signature with the mesh
 //     PSO, fail at execution (ReplayResult::invalid_draw).
 // Needs VK_EXT_mesh_shader (exit 77 without it). No game data. Set LEONIDA_VK_VALIDATION=1 to run under
@@ -32,6 +37,7 @@
 #include "../src/shader_library.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <cstring>
 #include <filesystem>
@@ -125,11 +131,15 @@ Constants constants(UINT first, unsigned r, unsigned g) { return {first, float(r
 
 int main(int argc, char** argv) {
     bool single_calls = false, no_count_buffers = false;
+    std::uint32_t max_draw_count = 0;  // 0: the device's maxDrawIndirectCount
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--single-calls") == 0) single_calls = true;
         else if (std::strcmp(argv[i], "--no-count-buffers") == 0) no_count_buffers = true;
+        else if (std::strcmp(argv[i], "--max-draw-indirect-count") == 0 && i + 1 < argc)
+            max_draw_count = std::uint32_t(std::strtoul(argv[++i], nullptr, 10));
         else {
-            std::fprintf(stderr, "usage: d3d12_m5_mesh_test [--single-calls] [--no-count-buffers]\n");
+            std::fprintf(stderr, "usage: d3d12_m5_mesh_test [--single-calls] [--no-count-buffers] "
+                                 "[--max-draw-indirect-count N]\n");
             return 2;
         }
     }
@@ -164,7 +174,8 @@ int main(int argc, char** argv) {
         info.buffer_device_address = true;
         info.multi_draw_indirect = d.multi_draw_indirect && !single_calls;
         info.draw_indirect_count = d.draw_indirect_count && !no_count_buffers;
-        info.max_draw_indirect_count = d.max_draw_indirect_count;
+        info.max_draw_indirect_count =
+            max_draw_count ? std::min(max_draw_count, d.max_draw_indirect_count) : d.max_draw_indirect_count;
         info.mesh_shader = mesh;
         info.subgroup = d.subgroup;  // so the wave64 mesh stage asks for 64 where the device can require it
         info.shader_dir = (root_dir / "spirv").string();
@@ -288,13 +299,20 @@ int main(int argc, char** argv) {
             // ms_m5 is wave64 (not built with --wave64-emulate): it needs 64-wide subgroups in the mesh stage.
             const auto* requests = rt::d3d12::pipeline_subgroup_requests(mesh_opaque.p);
             EXPECT(requests);
+            bool mesh_request = false;
             for (const auto& request : *requests) {
                 if (request.stage != VK_SHADER_STAGE_MESH_BIT_EXT) continue;
+                mesh_request = true;
                 switch (request.outcome) {
                 case leonida::SubgroupOutcome::required: subgroup = "required subgroup size 64"; break;
                 case leonida::SubgroupOutcome::device_fixed: subgroup = "the device's only subgroup size, 64"; break;
                 case leonida::SubgroupOutcome::device_default: subgroup = "the default subgroup size, 64"; break;
                 case leonida::SubgroupOutcome::emulated: subgroup = "wave64 emulation"; break;
+                case leonida::SubgroupOutcome::unknown_device:
+                case leonida::SubgroupOutcome::unknown_stage:
+                    std::fprintf(stderr, "the mesh stage's subgroup size was not decided (outcome %d)\n",
+                                 int(request.outcome));
+                    return 1;
                 default:
                     std::printf("SKIP: the wave64 mesh shader cannot run 64-wide here (subgroup sizes %u..%u, default "
                                 "%u, requirable stages 0x%x)\n", d.subgroup.min_size, d.subgroup.max_size,
@@ -302,6 +320,7 @@ int main(int argc, char** argv) {
                     return 77;
                 }
             }
+            EXPECT(mesh_request);
             Stream v;
             v.add(RootSubobject{.inner = root.p}).add(VsSubobject{.inner = {vs_rect.data(), vs_rect.size()}});
             v.add(PsSubobject{.inner = {ps_flat.data(), ps_flat.size()}});
@@ -403,6 +422,15 @@ int main(int argc, char** argv) {
             Ref<ID3D12CommandSignature> sig12, sig24, refused;
             EXPECT(SUCCEEDED(mesh_signature(device.p, 12, sig12)) && SUCCEEDED(mesh_signature(device.p, 24, sig24)));
             EXPECT(mesh_signature(device.p, 8, refused) == E_INVALIDARG && !refused.p);  // (c) stride below a record
+            {   // (c) a root constant before DISPATCH_MESH: not expanded, so refused rather than misread
+                D3D12_INDIRECT_ARGUMENT_DESC args[2] = {};
+                args[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+                args[0].Constant = {0, 0, 1};
+                args[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
+                const D3D12_COMMAND_SIGNATURE_DESC desc{16, 2, args, 0};
+                EXPECT(device->CreateCommandSignature(&desc, root.p, IID_PPV_ARGS(&refused.p)) == E_NOTIMPL &&
+                       !refused.p);
+            }
 
             // The CPU-written records (I1, I4, I5) in an upload buffer; I2's records and the count words staged in a
             // second one and copied into default buffers by the GPU.
@@ -447,9 +475,16 @@ int main(int argc, char** argv) {
             put(cpu + 268, 2, 1, 1);
             put(cpu + 280, 4, 1, 1);
             if (counts) expect_records(40, 0, 64, {1, 2});
-            // I5: offset 512, stride 12, 20 records of one group each.
-            for (unsigned r = 0; r < 20; ++r) put(cpu + 512 + 12 * r, 1, 1, 1);
-            expect_records(48, 8, 8, std::vector<unsigned>(20, 1));
+            // I5: offset 512, stride 24, 20 records of 1 + r % 4 groups (as 1x1, then 2x1x1, 1x3x1, 2x1x2), each
+            // followed by 12 zero bytes: read at stride 12, half the records would be empty.
+            std::memset(cpu + 512, 0, 20 * 24);
+            std::vector<unsigned> i5;
+            for (unsigned r = 0; r < 20; ++r) {
+                static constexpr UINT shapes[4][3] = {{1, 1, 1}, {2, 1, 1}, {1, 3, 1}, {2, 1, 2}};
+                put(cpu + 512 + 24 * r, shapes[r % 4][0], shapes[r % 4][1], shapes[r % 4][2]);
+                i5.push_back(1 + r % 4);
+            }
+            expect_records(48, 8, 8, i5);
             // I2 (staged at 0, copied to args_gpu at 48): stride 24, 4, 3, 5 and 8 groups, the count 3 drops the 8.
             put(stage + 0, 2, 2, 1);
             put(stage + 24, 1, 1, 3);
@@ -478,7 +513,7 @@ int main(int argc, char** argv) {
                 list->ExecuteIndirect(sig12.p, 2, args_cpu.p, 256, count_gpu.p, 24);
             }
             set_constants(constants(48, 8, 8));
-            list->ExecuteIndirect(sig12.p, 20, args_cpu.p, 512, nullptr, 0);
+            list->ExecuteIndirect(sig24.p, 20, args_cpu.p, 512, nullptr, 0);
             EXPECT(end());
             const auto result = run(list.p);
             if (result != leonida::ReplayResult::success)
@@ -522,5 +557,9 @@ int main(int argc, char** argv) {
                 "wrong-kind indirect draws fail at execution\n",
                 subgroup, direct_mismatches, records_drawn, counts ? " (count buffers included)" : " (no count buffers)",
                 indirect_mismatches);
+    if (d.validation_errors()) {
+        std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
+        return 1;
+    }
     return direct_mismatches == 0 && indirect_mismatches == 0 ? 0 : 1;
 }

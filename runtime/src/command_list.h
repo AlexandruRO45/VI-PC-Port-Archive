@@ -896,6 +896,8 @@ public:
     bool execute_indirect(const ExecuteIndirect& indirect) {
         if (!indirect.argument_buffer || !indirect.stride) return false;
         if (indirect.state && (!indirect.state->pipeline || indirect.kind == IndirectKind::dispatch)) return false;
+        // A mesh dispatch carries DispatchMesh's state, a draw kind a draw's.
+        if (indirect.state && indirect.state->mesh != (indirect.kind == IndirectKind::dispatch_mesh)) return false;
         if (!indirect.max_count) return !closed_;  // the PC runtime takes MaxCommandCount 0 as a no-op
         return append(indirect);
     }

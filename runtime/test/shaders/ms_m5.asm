@@ -1,7 +1,8 @@
 ; M5 mesh shader (NGG, wave64, 128 threads = two waves), written with the corpus's mesh idioms (docs/design.md, "Mesh
 ; shaders"): the group index from v5 (v_readfirstlane_b32, then >> 7, as all 9,282 corpus mesh shaders do), the
-; thread id from the wave index in s3[27:24] and mbcnt, GS_ALLOC_REQ with m0 = prims << 12 | verts, and one vertex
-; and one primitive export per thread. Run: d3d12_m5_mesh_test (found by the SHA-256 of its FSSM program).
+; thread id from the wave index in s3[27:24] and mbcnt, GS_ALLOC_REQ with m0 = prims << 12 | verts (sent by every
+; thread with the same m0, as ms_tri.asm does; the corpus sends it from thread 0), and one vertex and one primitive
+; export per thread. Run: d3d12_m5_mesh_test (found by the SHA-256 of its FSSM program).
 ; psv0: 128 128 128
 ; Each group draws one quad, 4 vertices and 2 triangles, into cell k of an 8x8 grid on a 64x64 target:
 ;   L = v5 >> 7, the linear group index (x + X * (y + Y * z) of the DispatchMesh grid, as the translator numbers it)

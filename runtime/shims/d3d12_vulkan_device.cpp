@@ -5574,6 +5574,9 @@ public:
             // Replayed as vkCmdDrawMeshTasksIndirect(Count)EXT; without VK_EXT_mesh_shader there is no mesh PSO to
             // run it with (the device reports MeshShaderTier NOT_SUPPORTED then).
             if (!state_.info.mesh_shader || !state_.context->vk.vkCmdDrawMeshTasksIndirectEXT) return E_NOTIMPL;
+            // Root arguments or views before it would need the per-record expansion the draw kinds lack too
+            // (section 4.7); refuse rather than read the group counts from the record's first bytes.
+            if (desc->NumArgumentDescs != 1) return E_NOTIMPL;
             kind = leonida::IndirectKind::dispatch_mesh;
             break;
         default: return E_NOTIMPL;
