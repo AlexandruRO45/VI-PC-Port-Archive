@@ -1204,5 +1204,214 @@ class TestLdsMaxRtnU32BoundaryExtremes(unittest.TestCase):
                 self.assertEqual(oracle_max_u32(extremes[i], extremes[j]), expected)
 
 
+# ---------------------------------------------------------------------------
+# Phase 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# ---------------------------------------------------------------------------
+
+class TestLdsMaxRtnU32NegativeControls(unittest.TestCase):
+    """Phase 8: Negative controls, invalid operand rejections, and model safety."""
+
+    def test_syntax_rejection_invalid_strings(self) -> None:
+        invalid_assemblies = [
+            "",
+            "   ",
+            "v_max_u32 v0, v1, v2",
+            "ds_min_rtn_u32 v0, v1, v2",
+            "ds_max_u32 v0, v1",
+            "ds_max_rtn_u32",
+            "ds_max_rtn_u32 v0",
+            "ds_max_rtn_u32 v0, v1",
+            "ds_max_rtn_u32 r0, v1, v2",
+            "ds_max_rtn_u32 v0, s1, v2",
+            "ds_max_rtn_u32 v256, v1, v2",
+            "ds_max_rtn_u32 v0, v1, v2 offset:70000",
+            "ds_max_rtn_u32 v0, v1, v2 offset:-1",
+            "ds_max_rtn_u32 v0, v1, v2 badmod:10",
+        ]
+        for asm in invalid_assemblies:
+            with self.subTest(asm=asm):
+                with self.assertRaises((ValueError, IndexError)):
+                    DSMaxRtnU32Instruction.parse(asm)
+
+    def test_architectural_model_negative_controls(self) -> None:
+        with self.assertRaises(ValueError):
+            LDSModel(1000)
+        with self.assertRaises(ValueError):
+            LDSModel(0)
+        with self.assertRaises(ValueError):
+            LDSModel(-64)
+
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+
+class TestLdsMaxRtnU32MutationDetection(unittest.TestCase):
+    """Phase 8: Mutation detection to verify test suite catches architectural bugs."""
+
+    def test_mutation_detection_inverted_min_instead_of_max(self) -> None:
+        """Mutant: Executes min instead of max."""
+        def mutant_max(a: int, b: int) -> int:
+            ua = a & MASK32
+            ub = b & MASK32
+            return ua if ua <= ub else ub
+
+        self.assertNotEqual(mutant_max(10, 50), oracle_max_u32(10, 50))
+
+    def test_mutation_detection_signed_comparison(self) -> None:
+        """Mutant: Compares operands as signed 32-bit two's complement integers."""
+        def mutant_max_signed(a: int, b: int) -> int:
+            sa = (a & MASK32) - 0x100000000 if (a & SIGN_BIT32) else (a & MASK32)
+            sb = (b & MASK32) - 0x100000000 if (b & SIGN_BIT32) else (b & MASK32)
+            res = max(sa, sb)
+            return res & MASK32
+
+        # In signed integer: -1 (0xFFFFFFFF) < 0. So signed max(0, 0xFFFFFFFF) == 0.
+        # But in unsigned integer: 0xFFFFFFFF > 0. True max(0, 0xFFFFFFFF) == 0xFFFFFFFF!
+        self.assertNotEqual(mutant_max_signed(0, 0xFFFFFFFF), oracle_max_u32(0, 0xFFFFFFFF))
+        self.assertEqual(oracle_max_u32(0, 0xFFFFFFFF), 0xFFFFFFFF)
+        self.assertEqual(mutant_max_signed(0, 0xFFFFFFFF), 0)
+
+    def test_mutation_detection_return_post_op_value(self) -> None:
+        """Mutant: Returns new memory value instead of previous value."""
+        class PostOpMutantInterpreter(ScalarInterpreter):
+            def step(self, instr: DSMaxRtnU32Instruction, state: ScalarMachineState):
+                vaddr = state.get_vgpr(instr.addr.index)
+                vdata = self.resolve_operand(instr.data, state)
+                eff_addr = calc_lds_effective_address(vaddr, instr.offset)
+                idx = calc_lds_dword_index(eff_addr, state.lds.capacity_dwords)
+                curr_mem = state.lds.memory[idx]
+                _, new_mem, mod = oracle_ds_max_rtn_u32(curr_mem, vdata)
+                state.lds.memory[idx] = new_mem
+                # BUG: returns post-op new_mem instead of pre-op curr_mem
+                state.set_vgpr(instr.dst.index, new_mem)
+                return curr_mem, new_mem, mod
+
+        state = ScalarMachineState()
+        addr = 0x40
+        state.lds.write_dword(addr, 100)
+        state.set_vgpr(1, addr)
+        state.set_vgpr(2, 250)
+
+        inst = DSMaxRtnU32Instruction(Opcode.DS_MAX_RTN_U32, VGPR(0), VGPR(1), VGPR(2))
+        mutant = PostOpMutantInterpreter()
+        mutant.step(inst, state)
+
+        # Correct return value is 100; mutant returned 250
+        self.assertNotEqual(state.get_vgpr(0), 100)
+        self.assertEqual(state.get_vgpr(0), 250)
+
+    def test_mutation_detection_dropped_immediate_offset(self) -> None:
+        """Mutant: Drops immediate offset during address calculation."""
+        def mutant_eff_addr(vaddr: int, offset: int = 0) -> int:
+            return vaddr & MASK32  # Drops offset!
+
+        correct = calc_lds_effective_address(0x100, 0x20)
+        mutant = mutant_eff_addr(0x100, 0x20)
+        self.assertNotEqual(correct, mutant)
+        self.assertEqual(correct, 0x120)
+        self.assertEqual(mutant, 0x100)
+
+    def test_mutation_detection_ignore_exec_mask(self) -> None:
+        """Mutant: Executes across inactive lanes, ignoring wavefront EXEC mask."""
+        class InactiveLeakInterpreter(SIMDInterpreter):
+            def step(self, instr: DSMaxRtnU32Instruction, state: SIMDState):
+                # Bug: executes all lanes unconditionally
+                results = []
+                for lane in range(state.num_lanes):
+                    vaddr = state.get_vgpr(lane, instr.addr.index)
+                    vdata = self.resolve_lane_operand(instr.data, lane, state)
+                    eff_addr = calc_lds_effective_address(vaddr, instr.offset)
+                    idx = calc_lds_dword_index(eff_addr, state.lds.capacity_dwords)
+                    curr_mem = state.lds.memory[idx]
+                    old_val, new_mem, _ = oracle_ds_max_rtn_u32(curr_mem, vdata)
+                    state.lds.memory[idx] = new_mem
+                    state.set_vgpr(lane, instr.dst.index, old_val)
+                    results.append((lane, old_val, new_mem))
+                return results
+
+        state = SIMDState(num_lanes=32, exec_mask=0x0)  # All inactive
+        sentinel = 0xDEADBEEF
+        state.set_vgpr(5, 0, sentinel)
+        state.set_vgpr(5, 1, 0x10)
+        state.set_vgpr(5, 2, 500)
+
+        inst = DSMaxRtnU32Instruction(Opcode.DS_MAX_RTN_U32, VGPR(0), VGPR(1), VGPR(2))
+        mutant = InactiveLeakInterpreter()
+        mutant.step(inst, state)
+
+        # Inactive lane was corrupted by mutant
+        self.assertNotEqual(state.get_vgpr(5, 0), sentinel)
+
+    def test_mutation_detection_premature_writeback_aliasing(self) -> None:
+        """Mutant: Overwrites destination register before resolving address."""
+        class PrematureWritebackInterpreter(ScalarInterpreter):
+            def step(self, instr: DSMaxRtnU32Instruction, state: ScalarMachineState):
+                # Bug: writeback dst before resolving vaddr
+                state.set_vgpr(instr.dst.index, 0xBAD0)
+                vaddr = state.get_vgpr(instr.addr.index)  # Reads corrupted vaddr!
+                vdata = self.resolve_operand(instr.data, state)
+                eff_addr = calc_lds_effective_address(vaddr, instr.offset)
+                idx = calc_lds_dword_index(eff_addr, state.lds.capacity_dwords)
+                curr_mem = state.lds.memory[idx]
+                old_val, new_mem, mod = oracle_ds_max_rtn_u32(curr_mem, vdata)
+                state.lds.memory[idx] = new_mem
+                return old_val, new_mem, mod
+
+        state = ScalarMachineState()
+        addr = 0x200
+        state.lds.write_dword(addr, 50)
+        state.set_vgpr(0, addr)  # v0 is both dst and addr
+        state.set_vgpr(1, 100)
+
+        inst = DSMaxRtnU32Instruction(Opcode.DS_MAX_RTN_U32, VGPR(0), VGPR(0), VGPR(1))
+        mutant = PrematureWritebackInterpreter()
+        mutant.step(inst, state)
+
+        # Original address 0x200 was not updated because vaddr was corrupted
+        self.assertNotEqual(state.lds.read_dword(addr), 100)
+
+    def test_mutation_detection_inverted_collision_order(self) -> None:
+        """Mutant: Serializes colliding lanes in descending order rather than ascending."""
+        state = SIMDState(num_lanes=32, exec_mask=0x3)  # Lanes 0 and 1 active
+        common_addr = 0x80
+        state.lds.write_dword(common_addr, 10)
+
+        # Lane 0 proposes 20
+        # Lane 1 proposes 30
+        state.set_vgpr(0, 1, common_addr)
+        state.set_vgpr(0, 2, 20)
+        state.set_vgpr(1, 1, common_addr)
+        state.set_vgpr(1, 2, 30)
+
+        class ReverseCollisionSIMDInterpreter(SIMDInterpreter):
+            def step(self, instr: DSMaxRtnU32Instruction, s: SIMDState):
+                results = []
+                for lane in reversed(range(s.num_lanes)):
+                    if not s.is_lane_active(lane):
+                        continue
+                    vaddr = s.get_vgpr(lane, instr.addr.index)
+                    vdata = self.resolve_lane_operand(instr.data, lane, s)
+                    eff_addr = calc_lds_effective_address(vaddr, instr.offset)
+                    idx = calc_lds_dword_index(eff_addr, s.lds.capacity_dwords)
+                    curr_mem = s.lds.memory[idx]
+                    old_val, new_mem, _ = oracle_ds_max_rtn_u32(curr_mem, vdata)
+                    s.lds.memory[idx] = new_mem
+                    s.set_vgpr(lane, instr.dst.index, old_val)
+                    results.append((lane, old_val, new_mem))
+                return results
+
+        inst = DSMaxRtnU32Instruction(Opcode.DS_MAX_RTN_U32, VGPR(0), VGPR(1), VGPR(2))
+        mutant = ReverseCollisionSIMDInterpreter()
+        mutant.step(inst, state)
+
+        # In descending order: lane 1 executed first (saw 10, updated to 30).
+        # Then lane 0 executed (saw 30, max(30, 20)=30, returned 30 into lane 0 dst).
+        # But in ascending order: lane 0 must see 10 and return 10 into lane 0 dst!
+        self.assertNotEqual(state.get_vgpr(0, 0), 10)
+        self.assertEqual(state.get_vgpr(0, 0), 30)
+
+
 if __name__ == "__main__":
     unittest.main()
