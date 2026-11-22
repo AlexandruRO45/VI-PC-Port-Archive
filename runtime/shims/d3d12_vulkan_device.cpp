@@ -1225,10 +1225,17 @@ public:
         if (const Resource* r = Resource::from<Resource>(resource)) {
             const D3D12_RESOURCE_DESC rd = const_cast<Resource*>(r)->GetDesc();
             view = {r->id(), 0, 0, rd.DepthOrArraySize};
-            if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2D) {
+            if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE1D) {
+                view = {r->id(), desc->Texture1D.MipSlice, 0, 1};
+            } else if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE1DARRAY) {
+                view = {r->id(), desc->Texture1DArray.MipSlice, desc->Texture1DArray.FirstArraySlice,
+                        desc->Texture1DArray.ArraySize};
+            } else if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2D) {
                 view = {r->id(), desc->Texture2D.MipSlice, 0, 1};
             } else if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DMS) {
                 view = {r->id(), 0, 0, 1};
+            } else if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY) {
+                view = {r->id(), 0, desc->Texture2DMSArray.FirstArraySlice, desc->Texture2DMSArray.ArraySize};
             } else if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DARRAY) {
                 view = {r->id(), desc->Texture2DArray.MipSlice, desc->Texture2DArray.FirstArraySlice,
                         desc->Texture2DArray.ArraySize};
