@@ -40,11 +40,11 @@ template<class T> T load(word address) {
 template<class T> void store(word address, T v) {
     memcpy(reinterpret_cast<void*>(address), &v, sizeof v);
 }
-[[noreturn]] static void raise_de() {
-    volatile uint32_t zero_divisor = 0;
-    volatile uint32_t sink = 1u / zero_divisor;
-    (void)sink;
-    for (;;) {}
+extern "C" __declspec(dllimport) void __stdcall RaiseException(unsigned long, unsigned long, unsigned long, const uintptr_t*);
+[[noreturn]] static void raise_de(bool zero_divisor) {
+    // Windows distinguishes a zero divisor from a quotient that does not fit.
+    RaiseException(zero_divisor ? 0xc0000094ul : 0xc0000095ul, 1, 0, nullptr);
+    __assume(0);
 }
 """
 HEADER = INTEGER_HEADER + "struct Query { word type, next, effect, device, count, ids, names; };\n"
@@ -395,12 +395,12 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
             elif op == M.DIV:
                 if size == 4:
                     stmt = (f"{{ const uint32_t hi = static_cast<uint32_t>(rdx), den = {operand(0)}; "
-                            f"if (den == 0u || hi >= den) raise_de(); "
+                            f"if (den == 0u || hi >= den) raise_de(den == 0); "
                             f"const uint64_t num = (static_cast<uint64_t>(hi) << 32) | static_cast<uint32_t>(rax); "
                             f"rax = static_cast<uint32_t>(num / den); rdx = static_cast<uint32_t>(num % den); }}")
                 else:
                     stmt = (f"{{ uint64_t hi = rdx, lo = rax, den = {operand(0)}, q = 0; "
-                            f"if (den == 0ull || hi >= den) raise_de(); "
+                            f"if (den == 0ull || hi >= den) raise_de(den == 0); "
                             f"for (int b = 63; b >= 0; --b) {{ const bool top = (hi >> 63) != 0; "
                             f"hi = (hi << 1) | ((lo >> b) & 1u); if (top || hi >= den) {{ hi -= den; q |= 1ull << b; }} }} "
                             f"rax = q; rdx = hi; }}")
@@ -408,22 +408,22 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                 if size == 4:
                     stmt = (f"{{ const int64_t num = static_cast<int64_t>((static_cast<uint64_t>(static_cast<uint32_t>(rdx)) << 32) | static_cast<uint32_t>(rax)); "
                             f"const int32_t den = static_cast<int32_t>({operand(0)}); "
-                            f"if (den == 0 || (num == (-9223372036854775807ll - 1) && den == -1)) raise_de(); "
+                            f"if (den == 0 || (num == (-9223372036854775807ll - 1) && den == -1)) raise_de(den == 0); "
                             f"const int64_t q = num / den, r = num % den; "
-                            f"if (q < -2147483648ll || q > 2147483647ll) raise_de(); "
+                            f"if (q < -2147483648ll || q > 2147483647ll) raise_de(false); "
                             f"rax = static_cast<uint32_t>(static_cast<int32_t>(q)); rdx = static_cast<uint32_t>(static_cast<int32_t>(r)); }}")
                 else:
                     stmt = (f"{{ uint64_t hi = rdx, lo = rax, d = {operand(0)}; "
-                            f"if (d == 0ull) raise_de(); "
+                            f"if (d == 0ull) raise_de(true); "
                             f"const bool neg_n = (hi >> 63) != 0, neg_d = (d >> 63) != 0; "
                             f"if (neg_n) {{ lo = 0ull - lo; hi = ~hi + (lo == 0ull ? 1ull : 0ull); }} "
                             f"if (neg_d) {{ d = 0ull - d; }} "
-                            f"if (hi >= d) raise_de(); "
+                            f"if (hi >= d) raise_de(false); "
                             f"uint64_t q = 0; "
                             f"for (int b = 63; b >= 0; --b) {{ const bool top = (hi >> 63) != 0; "
                             f"hi = (hi << 1) | ((lo >> b) & 1u); if (top || hi >= d) {{ hi -= d; q |= 1ull << b; }} }} "
                             f"const bool neg_q = neg_n != neg_d; "
-                            f"if ((!neg_q && q > 0x7fffffffffffffffull) || (neg_q && q > 0x8000000000000000ull)) raise_de(); "
+                            f"if ((!neg_q && q > 0x7fffffffffffffffull) || (neg_q && q > 0x8000000000000000ull)) raise_de(false); "
                             f"rax = neg_q ? (0ull - q) : q; rdx = neg_n ? (0ull - hi) : hi; }}")
         elif op in (M.XADD, M.CMPXCHG):
             size = MemorySizeExt.size(i.memory_size) if i.op0_kind == K.MEMORY else RegisterExt.size(i.op0_register)
