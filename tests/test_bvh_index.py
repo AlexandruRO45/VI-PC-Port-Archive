@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -371,6 +372,34 @@ class ScanTest(unittest.TestCase):
                 bvh_index.main([self.dir, "--out", outdir])
         self.assertEqual(cm.exception.code, 2)
         self.assertIn("is a folder, not a report file", err.getvalue())
+
+    def test_report_parent_is_file_rejected_in_preflight(self):
+        blocker = os.path.join(self.dir, "blocker.txt")
+        with open(blocker, "w", encoding="utf-8") as f:
+            f.write("not a directory")
+        out = os.path.join(blocker, "report.json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                bvh_index.main([self.dir, "--out", out])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("parent is not a directory", err.getvalue())
+
+        csv_out = os.path.join(blocker, "report.csv")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                bvh_index.main([self.dir, "--csv", csv_out])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("parent is not a directory", err.getvalue())
+
+    def test_write_outputs_catches_oserror(self):
+        err = io.StringIO()
+        with mock.patch("bvh_index.write_outputs", side_effect=OSError("disk failure")), \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            rc = bvh_index.main([self.dir, "--out", os.path.join(self.dir, "out.json")])
+        self.assertEqual(rc, 2)
+        self.assertIn("cannot write report: disk failure", err.getvalue())
 
 
 def setUpModule():

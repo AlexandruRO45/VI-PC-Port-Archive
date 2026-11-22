@@ -460,6 +460,44 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(lines[3], "ERROR: --limit must be at least 1")
         self.assertEqual(lines[4], "ERROR: --limit must be at least 1")
 
+    def test_lights_out_preserves_old_report_on_entity_parse_failure(self):
+        lights = os.path.join(self.tmp.name, "existing_lights.jsonl")
+        with open(lights, "w", encoding="utf-8", newline="\n") as f:
+            f.write('{"preserved": true}\n')
+        corrupt_entities = os.path.join(self.tmp.name, "corrupt_entities.jsonl")
+        with open(corrupt_entities, "w", encoding="utf-8", newline="\n") as f:
+            f.write("{not valid json\n")
+
+        with self.assertRaises(json.JSONDecodeError):
+            T.main([self.rpf, "--entities", corrupt_entities, "--lights-out", lights])
+
+        with open(lights, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), '{"preserved": true}\n')
+
+    def test_lights_out_and_out_parent_file_or_directory_rejected(self):
+        outdir = os.path.join(self.tmp.name, "some_dir")
+        os.makedirs(outdir, exist_ok=True)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            T.main([self.rpf, "--lights-out", outdir])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("is a folder, not a report file", err.getvalue())
+
+        blocker = os.path.join(self.tmp.name, "blocker_file")
+        with open(blocker, "w", encoding="utf-8") as f:
+            f.write("text")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            T.main([self.rpf, "--lights-out", os.path.join(blocker, "sub.jsonl")])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("parent is not a directory", err.getvalue())
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            T.main([self.rpf, "--out", os.path.join(blocker, "sub.json")])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("parent is not a directory", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

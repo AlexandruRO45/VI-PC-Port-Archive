@@ -33,10 +33,12 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import json
 import math
 import mmap
 import os
+import stat
 import struct
 import sys
 import tempfile
@@ -657,6 +659,40 @@ def scan(path, jobs=1, start=None, limit=None, lights_out=False):
     return total
 
 
+@contextlib.contextmanager
+def _staged_writer(path):
+    """Stage a report write in a temporary directory and atomically replace destination on success."""
+    if not path:
+        yield None
+        return
+    destination = os.path.abspath(path)
+    parent = os.path.dirname(destination)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        raise OSError(f"report destination is not a regular file: {path}")
+
+    directory = tempfile.mkdtemp(dir=parent if parent else None, prefix=".world-lights-")
+    staged = os.path.join(directory, os.path.basename(destination) + ".tmp")
+    try:
+        with open(staged, "w", encoding="utf-8", newline="\n") as handle:
+            yield handle
+        if mode is not None:
+            os.chmod(staged, mode & 0o777)
+        os.replace(staged, destination)
+    finally:
+        if os.path.exists(staged):
+            if os.name == "nt":
+                os.chmod(staged, stat.S_IWRITE)
+            os.unlink(staged)
+        if os.path.exists(directory):
+            os.rmdir(directory)
+
+
 def summarize(total, entities=None, lights_out=None):
     """Build the counts-only summary, and place archetype lights through the entity rows if given."""
     lights = dict(total["lights"])
@@ -671,10 +707,8 @@ def summarize(total, entities=None, lights_out=None):
                                                   if len(sets) > 1 and any(len(s) != len(sets[0]) for s in sets)),
     }
     placed = collections.Counter()
-    out = None
-    try:
-        if lights_out:
-            out = open(lights_out, "w", encoding="utf-8", newline="\n")
+    with _staged_writer(lights_out) as out:
+        if out is not None:
             for row in total["world_lights"]:
                 out.write(json.dumps(row, separators=(",", ":")) + "\n")
         placed["entity_lights_in_maps"] = len(total["world_lights"]) if lights_out else lights.get("lights_entity_in_map_placed", 0)
@@ -700,9 +734,6 @@ def summarize(total, entities=None, lights_out=None):
                                          e.get("scale_xy"), e.get("scale_z"))
                             out.write(json.dumps(_light_row(p, d, L, "archetype", a),
                                                  separators=(",", ":")) + "\n")
-    finally:
-        if out is not None:
-            out.close()
     summary["placement"] = dict(placed)
     nodes = [n for part in total["nodes"] for n in part]
     links = [l for part in total["links"] for l in part]
@@ -768,13 +799,27 @@ def main(argv=None):
     if a.entities and not os.path.isfile(a.entities):
         print(f"ERROR: {a.entities}: no such file", file=sys.stderr)
         return 2
+    for flag, path in (("--out", a.out), ("--lights-out", a.lights_out)):
+        if not path:
+            continue
+        if os.path.isdir(path):
+            ap.error(f"{flag} is a folder, not a report file: {path}")
+        parent = os.path.dirname(os.path.abspath(path))
+        p = parent
+        while p and not os.path.exists(p):
+            prev = p
+            p = os.path.dirname(p)
+            if p == prev:
+                break
+        if p and not os.path.isdir(p):
+            ap.error(f"{flag} parent is not a directory: {parent}")
     if a.out and a.lights_out and same_report_path(a.out, a.lights_out):
         ap.error("--out and --lights-out must use different paths")
     total = scan(a.archive, a.jobs, a.start, a.limit, bool(a.lights_out))
     summary = summarize(total, a.entities, a.lights_out)
     text = json.dumps(summary, indent=1, sort_keys=True)
     if a.out:
-        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
+        with _staged_writer(a.out) as f:
             f.write(text + "\n")
     else:
         sys.stdout.write(text + "\n")
