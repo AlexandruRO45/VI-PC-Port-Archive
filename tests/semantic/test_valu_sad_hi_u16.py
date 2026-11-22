@@ -286,6 +286,72 @@ SadHiU16Instruction = Union[VSadHiU16Instruction, VMsadHiU16Instruction]
 
 
 # ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarRegisterFile:
+    """Architectural register file for a single scalar/lane execution context."""
+
+    def __init__(self) -> None:
+        self.vgprs: List[int] = [0] * 256
+        self.sgprs: List[int] = [0] * 106
+
+    def read(self, op: Operand) -> int:
+        """Read operand value as unsigned 32-bit dword."""
+        if op.reg_type == RegType.LITERAL:
+            assert op.literal_value is not None
+            return op.literal_value
+        if op.reg_type == RegType.VGPR:
+            return self.vgprs[op.index] & MASK32
+        if op.reg_type == RegType.SGPR:
+            return self.sgprs[op.index] & MASK32
+        raise ValueError(f"Unknown operand type: {op.reg_type}")
+
+    def write(self, op: Operand, value: int) -> None:
+        """Write value to register operand (VGPR or SGPR)."""
+        if op.reg_type == RegType.VGPR:
+            self.vgprs[op.index] = u32(value)
+        elif op.reg_type == RegType.SGPR:
+            self.sgprs[op.index] = u32(value)
+        else:
+            raise TypeError("Cannot write to literal operand")
+
+
+class ScalarVALUInterpreter:
+    """Deterministic instruction interpreter for VALU SAD HI u16 instructions on a scalar register file."""
+
+    def __init__(self, regs: ScalarRegisterFile | None = None) -> None:
+        self.regs: ScalarRegisterFile = regs if regs is not None else ScalarRegisterFile()
+
+    def execute_sad_hi_u16(self, instr: VSadHiU16Instruction) -> int:
+        s0 = self.regs.read(instr.src0)
+        s1 = self.regs.read(instr.src1)
+        s2 = self.regs.read(instr.src2)
+        result = ref_sad_hi_u16(s0, s1, s2, clamp=instr.clamp)
+        self.regs.write(instr.dst, result)
+        return result
+
+    def execute_msad_hi_u16(self, instr: VMsadHiU16Instruction) -> int:
+        s0 = self.regs.read(instr.src0)
+        s1 = self.regs.read(instr.src1)
+        s2 = self.regs.read(instr.src2)
+        result = ref_msad_hi_u16(s0, s1, s2, clamp=instr.clamp)
+        self.regs.write(instr.dst, result)
+        return result
+
+    def step(self, instr: SadHiU16Instruction) -> int:
+        if isinstance(instr, VSadHiU16Instruction):
+            return self.execute_sad_hi_u16(instr)
+        if isinstance(instr, VMsadHiU16Instruction):
+            return self.execute_msad_hi_u16(instr)
+        raise TypeError(f"Unsupported instruction AST: {type(instr)}")
+
+    def run_program(self, instructions: Sequence[SadHiU16Instruction]) -> None:
+        for instr in instructions:
+            self.step(instr)
+
+
+# ==============================================================================
 # Unit Tests: Reference Mathematical Oracles
 # ==============================================================================
 
@@ -502,6 +568,103 @@ class TestValuSadHiU16SymbolicAST(unittest.TestCase):
                 src1=Operand.vgpr(3),
                 src2=Operand.vgpr(4),
             )
+
+
+class TestValuSadHiU16ScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.rf = ScalarRegisterFile()
+        self.interp = ScalarVALUInterpreter(self.rf)
+
+    def test_execute_sad_hi_u16_basic(self) -> None:
+        self.rf.vgprs[1] = pack_halfwords_u32(100, 200)
+        self.rf.vgprs[2] = pack_halfwords_u32(120, 250)
+        self.rf.vgprs[3] = 0x0001_0000
+        # diffs: 20 + 50 = 70. Shifted = 70 << 16 = 0x0046_0000. Total = 0x0047_0000
+        instr = VSadHiU16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+        res = self.interp.step(instr)
+        self.assertEqual(res, 0x0047_0000)
+        self.assertEqual(self.rf.vgprs[0], 0x0047_0000)
+
+    def test_execute_sad_hi_u16_with_literal_operands(self) -> None:
+        self.rf.vgprs[1] = pack_halfwords_u32(10, 10)
+        instr = VSadHiU16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.literal(pack_halfwords_u32(5, 5)),
+            src2=Operand.literal(0x1000),
+        )
+        # diffs: 5 + 5 = 10. Shifted = 10 << 16 = 0x000A_0000. Total = 0x000A_1000
+        res = self.interp.step(instr)
+        self.assertEqual(res, 0x000A_1000)
+        self.assertEqual(self.rf.vgprs[0], 0x000A_1000)
+
+    def test_execute_sad_hi_u16_clamp_saturation(self) -> None:
+        self.rf.vgprs[1] = 0xFFFF_FFFF
+        self.rf.vgprs[2] = 0x0000_0000
+        self.rf.vgprs[3] = MASK32
+        instr = VSadHiU16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+            clamp=True,
+        )
+        res = self.interp.step(instr)
+        self.assertEqual(res, MASK32)
+        self.assertEqual(self.rf.vgprs[0], MASK32)
+
+    def test_execute_msad_hi_u16_masked_execution(self) -> None:
+        self.rf.vgprs[1] = pack_halfwords_u32(500, 1000)
+        self.rf.sgprs[5] = pack_halfwords_u32(0, 800)  # low halfword masked out
+        self.rf.vgprs[2] = 0x0010_0000
+        # low skipped; high diff: 200. Shifted: 200 << 16 = 0x00C8_0000. Total: 0x00D8_0000
+        instr = VMsadHiU16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.sgpr(5),
+            src2=Operand.vgpr(2),
+        )
+        res = self.interp.step(instr)
+        self.assertEqual(res, 0x00D8_0000)
+        self.assertEqual(self.rf.vgprs[0], 0x00D8_0000)
+
+    def test_execute_msad_hi_u16_clamp(self) -> None:
+        self.rf.vgprs[1] = pack_halfwords_u32(1000, 1000)
+        self.rf.vgprs[2] = pack_halfwords_u32(500, 500)
+        self.rf.vgprs[3] = MASK32
+        instr = VMsadHiU16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+            clamp=True,
+        )
+        res = self.interp.step(instr)
+        self.assertEqual(res, MASK32)
+        self.assertEqual(self.rf.vgprs[0], MASK32)
+
+    def test_run_program_sequential_chaining(self) -> None:
+        self.rf.vgprs[1] = pack_halfwords_u32(1, 1)
+        self.rf.vgprs[2] = pack_halfwords_u32(2, 2)  # diff = 2 -> 2 << 16 = 0x0002_0000
+        self.rf.vgprs[3] = pack_halfwords_u32(10, 10)
+        self.rf.vgprs[4] = pack_halfwords_u32(12, 12)  # diff = 4 -> 4 << 16 = 0x0004_0000
+        prog = [
+            VSadHiU16Instruction(Operand.vgpr(0), Operand.vgpr(1), Operand.vgpr(2), Operand.literal(0)),
+            VSadHiU16Instruction(Operand.vgpr(0), Operand.vgpr(3), Operand.vgpr(4), Operand.vgpr(0)),
+        ]
+        self.interp.run_program(prog)
+        self.assertEqual(self.rf.vgprs[0], 0x0006_0000)
+
+    def test_unsupported_instruction_type_raises(self) -> None:
+        with self.assertRaises(TypeError):
+            self.interp.step("invalid")  # type: ignore
 
 
 if __name__ == "__main__":
