@@ -3759,7 +3759,8 @@ public:
         if (!info.memory_budget)
             std::fprintf(stderr, "[rt] d3d12: VK_EXT_memory_budget is not enabled; heap usage telemetry is off\n");
         else if (!state_.memory_properties2)
-            std::fprintf(stderr,\n                         "[rt] d3d12: vkGetPhysicalDeviceMemoryProperties2 is unavailable; heap usage telemetry is off\n");
+            std::fprintf(stderr,
+                         "[rt] d3d12: vkGetPhysicalDeviceMemoryProperties2 is unavailable; heap usage telemetry is off\n");
         else
             state_.report_memory_budget("device start");
         {
