@@ -1392,5 +1392,182 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(oracle_min_f32(NEG_FLT_MIN, FLT_MIN), NEG_FLT_MIN)
 
 
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Phase 8: Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_assembly(self) -> None:
+        invalid_assemblies = [
+            "",
+            "   ",
+            "v_min_f32 v0, v1, v2",
+            "ds_min_f32 v0, v1, v2",
+            "ds_max_rtn_f32 v0, v1, v2",
+            "ds_min_rtn_u32 v0, v1, v2",
+            "ds_min_rtn_f32",
+            "ds_min_rtn_f32 v0",
+            "ds_min_rtn_f32 v0, v1",
+            "ds_min_rtn_f32 s0, v1, v2",
+            "ds_min_rtn_f32 v0, s1, v2",
+            "ds_min_rtn_f32 v0, v1, s2",
+            "ds_min_rtn_f32 r0, v1, v2",
+            "ds_min_rtn_f32 v256, v1, v2",
+            "ds_min_rtn_f32 v0, v1, v2 offset:70000",
+            "ds_min_rtn_f32 v0, v1, v2 offset:-1",
+            "ds_min_rtn_f32 v0, v1, v2 invalid_token",
+        ]
+        for asm in invalid_assemblies:
+            with self.subTest(asm=asm):
+                with self.assertRaises((ValueError, IndexError)):
+                    DSMinRtnF32Instruction.parse(asm)
+
+    def test_architectural_model_negative_controls(self) -> None:
+        with self.assertRaises(ValueError):
+            LDSMemory(0)
+        with self.assertRaises(ValueError):
+            LDSMemory(-1024)
+        with self.assertRaises(ValueError):
+            LDSMemory(1000)
+
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=128)
+
+    def test_mutation_detection_inverted_min_max(self) -> None:
+        def mutant_min(a: int, b: int) -> int:
+            fa = bits_to_f32(a)
+            fb = bits_to_f32(b)
+            return a if fa > fb else b
+
+        # min(1.0, 2.0) should be 1.0, mutant returns 2.0
+        self.assertNotEqual(mutant_min(ONE_F32, TWO_F32), oracle_min_f32(ONE_F32, TWO_F32))
+
+    def test_mutation_detection_integer_comparison(self) -> None:
+        # Treats bits as unsigned integer instead of IEEE 754 float
+        def mutant_min_uint(a: int, b: int) -> int:
+            return a if (a & MASK32) < (b & MASK32) else b
+
+        # ONE_F32 is 0x3F800000 (1.0). NEG_TWO_F32 is 0xC0000000 (-2.0).
+        # In float: -2.0 < 1.0 (correct min is NEG_TWO_F32).
+        # In unsigned int: 0x3F800000 < 0xC0000000 (mutant returns ONE_F32).
+        self.assertNotEqual(
+            mutant_min_uint(ONE_F32, NEG_TWO_F32),
+            oracle_min_f32(ONE_F32, NEG_TWO_F32),
+        )
+
+    def test_mutation_detection_flush_subnormals_to_zero(self) -> None:
+        def mutant_min_ftz(a: int, b: int) -> int:
+            a_clean = POS_ZERO if is_subnormal(a) else a
+            b_clean = POS_ZERO if is_subnormal(b) else b
+            return oracle_min_f32(a_clean, b_clean)
+
+        # SUBNORM_MIN vs FLT_MIN
+        self.assertNotEqual(
+            mutant_min_ftz(SUBNORM_MIN, FLT_MIN),
+            oracle_min_f32(SUBNORM_MIN, FLT_MIN),
+        )
+
+    def test_mutation_detection_nan_propagation(self) -> None:
+        # Mutant: propagates NaN instead of suppressing it
+        def mutant_min_nan_propagate(a: int, b: int) -> int:
+            if is_nan(a):
+                return a
+            if is_nan(b):
+                return b
+            return oracle_min_f32(a, b)
+
+        self.assertNotEqual(
+            mutant_min_nan_propagate(QNAN_PAYLOAD_A, ONE_F32),
+            oracle_min_f32(QNAN_PAYLOAD_A, ONE_F32),
+        )
+
+    def test_mutation_detection_lost_return_value(self) -> None:
+        class MutantScalarInterpreter(ScalarDSInterpreter):
+            def execute(self, state: ScalarThreadState, inst: DSMinRtnF32Instruction) -> Tuple[int, int]:
+                old_val, new_mem = super().execute(state, inst)
+                # Bug: writes new_mem into vdst instead of old_val
+                state.set_vgpr(inst.vdst, new_mem)
+                return old_val, new_mem
+
+        lds = LDSMemory(65536)
+        lds.write_dword(0x40, TEN_F32)
+        state = ScalarThreadState(lds=lds)
+        state.set_vgpr(1, 0x40)
+        state.set_vgpr(2, TWO_F32)
+
+        inst = DSMinRtnF32Instruction(vdst=RegisterOperand(0), vaddr=RegisterOperand(1), vdata0=RegisterOperand(2))
+        mutant = MutantScalarInterpreter()
+        mutant.execute(state, inst)
+
+        # Correct return in vdst is TEN_F32 (10.0), mutant placed TWO_F32 (2.0)
+        self.assertNotEqual(state.get_vgpr(0), TEN_F32)
+
+    def test_mutation_detection_ignore_exec_mask(self) -> None:
+        class MutantSIMDInterpreter(SIMDDSInterpreter):
+            def execute(self, wave: SIMDWaveState, inst: DSMinRtnF32Instruction) -> List[Optional[Tuple[int, int]]]:
+                saved_mask = wave.exec_mask
+                wave.exec_mask = wave.mask_limit
+                try:
+                    return super().execute(wave, inst)
+                finally:
+                    wave.exec_mask = saved_mask
+
+        lds = LDSMemory(65536)
+        lds.write_dword(0, TEN_F32)
+        wave = SIMDWaveState(wave_size=32, exec_mask=0, lds=lds)
+        for l in range(32):
+            wave.set_vgpr(l, 1, l * 4)
+            wave.set_vgpr(l, 2, ONE_F32)
+
+        inst = DSMinRtnF32Instruction(vdst=RegisterOperand(0), vaddr=RegisterOperand(1), vdata0=RegisterOperand(2))
+        mutant = MutantSIMDInterpreter()
+        mutant.execute(wave, inst)
+
+        # Mutant executed inactive lane and modified LDS to ONE_F32
+        self.assertEqual(lds.read_dword(0), ONE_F32)
+
+        # Standard interpreter leaves it unchanged
+        lds.write_dword(0, TEN_F32)
+        SIMDDSInterpreter().execute(wave, inst)
+        self.assertEqual(lds.read_dword(0), TEN_F32)
+
+    def test_mutation_detection_dropped_offset(self) -> None:
+        class DroppedOffsetInterpreter(ScalarDSInterpreter):
+            def execute(self, state: ScalarThreadState, inst: DSMinRtnF32Instruction) -> Tuple[int, int]:
+                no_off = DSMinRtnF32Instruction(
+                    vdst=inst.vdst,
+                    vaddr=inst.vaddr,
+                    vdata0=inst.vdata0,
+                    offset=0,
+                    gds=inst.gds,
+                )
+                return super().execute(state, no_off)
+
+        lds = LDSMemory(65536)
+        lds.write_dword(0x20, TEN_F32)
+        lds.write_dword(0x24, TEN_F32)
+        state = ScalarThreadState(lds=lds)
+        state.set_vgpr(1, 0x20)
+        state.set_vgpr(2, ONE_F32)
+
+        inst = DSMinRtnF32Instruction(
+            vdst=RegisterOperand(0),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+            offset=4,
+        )
+
+        mutant = DroppedOffsetInterpreter()
+        mutant.execute(state, inst)
+
+        # Mutant modified 0x20 instead of 0x24
+        self.assertEqual(lds.read_dword(0x20), ONE_F32)
+        self.assertEqual(lds.read_dword(0x24), TEN_F32)
+
+
 if __name__ == "__main__":
     unittest.main()
