@@ -3324,7 +3324,7 @@ class Gen:
             # A single SGPR in wave64 is one 32-lane half: lane L reads bit L & 31 of r, so lanes 32-63 read bit
             # lane-32 of r (a half-mask operand such as the hi half). The pair form selects r+1 for them. No
             # corpus caller passes a plain single SGPR here: the VOP3 v_cndmask widens its `sN` to the pair.
-            if self.wave64 and a.get("n", 1) == 2:
+            if wide and self.wave64 and a.get("n", 1) == 2:
                 low, w = self.tmp(), self.tmp()
                 hi = self.load_reg("sgpr", a["r"] + 1)
                 self.emit(f"{low} = OpULessThan %bool {lane} {self.cu(32)}")

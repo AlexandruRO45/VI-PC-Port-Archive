@@ -9,7 +9,7 @@ and a value already in per-lane form (a mask ANDed with data, say) gives the sam
 * The GPU tests runtime/test/shaders/cs_w32_mask_sgpr.asm and cs_w64_mask_sgpr.asm (fixtures from regen_fixtures.py)
   run here on one 32-wide subgroup (wave32) and one 64-wide subgroup (wave64): every word equals the GPU check's value
   (check.py CS_DUMPS). On an NVIDIA GeForce RTX 4090 (driver 617.42) run_gpu_tests.py gives the same words, for wave64
-  with LEONIDA_W64_EMULATE=1, and the pre-fix translator gives 32 32 32 4294967040 32 32 16 2072 (wave32).
+  with LEONIDA_W64_EMULATE=1, and the translator before this change gave 32 32 32 4294967040 32 32 16 2072 (wave32).
 * --wave64-emulate is only translated here, not run: the interpreter has no OpControlBarrier and does not share
   Workgroup memory between invocations. The test checks that the emulated pair read is the same bit test.
 * A few more cases as short hand-written programs, checked lane by lane: 0xff00ff gives 16 lanes, 0 none, all ones
@@ -79,10 +79,8 @@ class GpuTestFixtures(unittest.TestCase):
 
     def test_mask_anded_with_unmarked_data(self):
         # out[6] of both fixtures: a lane mask (v_cmp) ANDed with a data register (per-lane form), then saveexec.
-        self.assertEqual(W32_WORDS[6], 8)       # 0xffff & 0xff00ff = lanes 0-7
-        self.assertEqual(W64_WORDS[6], 24)      # lanes 0-39 & (0xff_00ff00ff) = lanes 0-7, 16-23, 32-39
-        self.assertEqual(run(translate("cs_w32_mask_sgpr", 32), 32, 32).get(24), 8)
-        self.assertEqual(run(translate("cs_w64_mask_sgpr", 64), 64, 64).get(24), 24)
+        self.assertEqual(run(translate("cs_w32_mask_sgpr", 32), 32, 32).get(24), 8)     # 0xffff & 0xff00ff: lanes 0-7
+        self.assertEqual(run(translate("cs_w64_mask_sgpr", 64), 64, 64).get(24), 24)    # lanes 0-7, 16-23, 32-39
 
 
 TAIL = ["v_mov_b32 v8, 1", "v_lshlrev_b32 v10, 2, v0", "buffer_store_dword v8, v10, s[0:3], 0 offen"]
@@ -117,41 +115,31 @@ class HandWrittenCases(unittest.TestCase):
                                          "s_and_saveexec_b32 s6, s4"])
         self.assertEqual(got, [1 if i == 5 else 0 for i in range(32)])
 
-    def w64(self, lo, hi, emulate=False):
+    def w64(self, lo, hi):
         return flags("cs_ms_w64", 64, ["s_mov_b64 exec, -1", f"s_mov_b32 s4, {lo}", f"s_mov_b32 s5, {hi}",
-                                       "s_and_saveexec_b64 s[6:7], s[4:5]"], emulate=False)
+                                       "s_and_saveexec_b64 s[6:7], s[4:5]"])
 
     def test_wave64_pair_data(self):
-        for emulate in (False,):
-            with self.subTest(emulate=False):
-                got = self.w64("0xff00ff", "0xf0f0f0f0", emulate)
-                self.assertEqual(got, bits(0xFF00FF, 0, 32) + bits(0xF0F0F0F0, 0, 32))
+        got = self.w64("0xff00ff", "0xf0f0f0f0")
+        self.assertEqual(got, bits(0xFF00FF, 0, 32) + bits(0xF0F0F0F0, 0, 32))
 
     def test_wave64_high_only_zero_and_all_ones(self):
-        for emulate in (False,):
-            with self.subTest(emulate=False):
-                self.assertEqual(self.w64("0", "1", emulate), [0] * 32 + [1] + [0] * 31)
-                self.assertEqual(self.w64("0", "0", emulate), [0] * 64)
-                self.assertEqual(self.w64("-1", "-1", emulate), [1] * 64)
+        self.assertEqual(self.w64("0", "1"), [0] * 32 + [1] + [0] * 31)
+        self.assertEqual(self.w64("0", "0"), [0] * 64)
+        self.assertEqual(self.w64("-1", "-1"), [1] * 64)
 
     def test_wave64_certified_mask_unchanged(self):
-        for emulate in (False,):
-            with self.subTest(emulate=False):
-                got = flags("cs_ms_cert64", 64, ["s_mov_b64 exec, -1", "v_cmp_eq_u32_e64 s[4:5], v0, 40",
-                                                 "s_and_saveexec_b64 s[6:7], s[4:5]"], emulate=False)
-                self.assertEqual(got, [1 if i == 40 else 0 for i in range(64)])
+        got = flags("cs_ms_cert64", 64, ["s_mov_b64 exec, -1", "v_cmp_eq_u32_e64 s[4:5], v0, 40",
+                                         "s_and_saveexec_b64 s[6:7], s[4:5]"])
+        self.assertEqual(got, [1 if i == 40 else 0 for i in range(64)])
 
     def test_wave64_pair_anded_with_mask(self):
         # A per-lane-form result (mask & data) is read back through the bit test: same lanes as the ISA's AND.
-        for emulate in (False,):
-            with self.subTest(emulate=False):
-                got = flags("cs_ms_and64", 64, ["s_mov_b64 exec, -1", "v_cmp_gt_u32_e64 s[10:11], 40, v0",
-                                                "s_mov_b32 s4, 0xff00ff", "s_mov_b32 s5, 0xff",
-                                                "s_and_b64 s[12:13], s[10:11], s[4:5]",
-                                                "s_and_saveexec_b64 s[6:7], s[12:13]"], emulate=False)
-                want = bits(0xFF00FF, 0, 32) + bits(0xFF, 0, 32)
-                self.assertEqual(got, want)
-
+        got = flags("cs_ms_and64", 64, ["s_mov_b64 exec, -1", "v_cmp_gt_u32_e64 s[10:11], 40, v0",
+                                        "s_mov_b32 s4, 0xff00ff", "s_mov_b32 s5, 0xff",
+                                        "s_and_b64 s[12:13], s[10:11], s[4:5]",
+                                        "s_and_saveexec_b64 s[6:7], s[12:13]"])
+        self.assertEqual(got, bits(0xFF00FF, 0, 32) + bits(0xFF, 0, 32))
 
     def test_wave64_cndmask_listing_syntax(self):
         # The corpus prints the VOP3 mask operand in wave32 syntax (`s4` for the pair s[4:5]); lanes 32-63 read s5.

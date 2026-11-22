@@ -8,14 +8,14 @@
 ;   out[1] s[4:5] = 1_00000000, s_and_saveexec_b64                          -> lane 32 only        1 | 32<<8 = 8193
 ;   out[2] s[4:5] = 0, s_and_saveexec_b64                                   -> no lane             4294967040
 ;   out[3] s[4:5] = -1, s_and_saveexec_b64                                  -> all 64 lanes        64 | 0     = 64
-;   out[4] v_cndmask_b32_e64 v, 0, 1, s[4:5] with s[4:5] = 0x0000ff00_f0f00ff0  -> lanes 4-11, 20-27, 40-47   24 | 4<<8 = 1048
+;   out[4] v_cndmask_b32_e64 v, 0, 1, s[4:5] with s[4:5] = 0x0000ff00_f0f00ff0  -> lanes 4-11, 20-23, 28-31, 40-47  24 | 4<<8 = 1048
 ;   out[5] EXEC = lanes 0-7, s[4:5] = 0xf0f0f0f0_00ff00ff, s_andn2_saveexec_b64 -> S0 & ~EXEC = 0xf0f0f0f0_00ff0000
 ;                                                                                            24 | 16<<8 = 4120
 ;   out[6] s[10:11] = lanes 0-39 (v_cmp), s[4:5] = 0xff_00ff00ff data, s_and_b64 s[12:13], s[10:11], s[4:5],
 ;          s_and_saveexec_b64 s[8:9], s[12:13]                              -> lanes 0-7, 16-23, 32-39   24 | 0 = 24
 ;   out[7] EXEC = lanes 0-7, s[4:5] = 1_ff00ff00, s_or_saveexec_b64              -> 0x1_ff00ffff        25 | 0     = 25
 ; The raw s[r] for every lane (the old translation) made every non-zero pair mean all lanes, so out[0..7] were
-; 64 4294967040 4294967040 64 64 2104 40 64 before the fix (measured on the GPU: see design.md).
+; 64 4294967040 4294967040 64 64 2104 40 64 before the fix (measured on the GPU).
 ; group: 64,1,1
 ; Run: VKC_SUBGROUP_SIZE=64 vk_compute_test cs_w64_mask_sgpr.spv 1 dump --require-wave64
 ;   (or translated with --wave64-emulate, on any subgroup size) -> out[0..7] = 32 8193 4294967040 64 1048 4120 24 25

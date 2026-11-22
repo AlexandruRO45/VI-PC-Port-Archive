@@ -11,12 +11,12 @@
 ;   out[2] EXEC=0xffff, s4 = 0xff00ff00, s_or_saveexec_b32 s7, s4     -> 0xff00ffff                 24 | 0    = 24
 ;   out[3] EXEC=all,    s4 = 0, s_and_saveexec_b32 s7, s4             -> no lane                    0xffffff00 = 4294967040
 ;   out[4] EXEC=all,    s4 = -1, s_and_saveexec_b32 s7, s4            -> all lanes                  32 | 0     = 32
-;   out[5] v_cndmask_b32_e64 v15, 0, 1, s4 with s4 = 0xf0f00ff0       -> lanes 4-11, 20-27          16 | 4<<8 = 1040
+;   out[5] v_cndmask_b32_e64 v15, 0, 1, s4 with s4 = 0xf0f00ff0       -> lanes 4-11, 20-23, 28-31         16 | 4<<8 = 1040
 ;   out[6] s5 = lanes 0-15 (v_cmp), s4 = 0xff00ff data, s_and_b32 s6, s5, s4, s_and_saveexec_b32 s7, s6
 ;                                                                     -> 0xffff & 0xff00ff = lanes 0-7   8 | 0 = 8
 ;   out[7] EXEC=lanes 0-7, s4 = 0xff00ff, s_andn2_saveexec_b32 s7, s4 -> S0 & ~EXEC = 0xff0000 = lanes 16-23  8 | 16<<8 = 4104
 ; The raw value for every lane (the old translation) made a non-zero register mean all lanes, so out[0..7] were
-; 32 32 32 4294967040 32 32 16 2072 before the fix (measured on the GPU: see design.md).
+; 32 32 32 4294967040 32 32 16 2072 before the fix (measured on the GPU).
 ; group: 32,1,1
 ; Run: VKC_SUBGROUP_SIZE=32 vk_compute_test cs_w32_mask_sgpr.spv 1 dump
 ;   -> out[0..7] = 16 1028 24 4294967040 32 1040 8 4104
