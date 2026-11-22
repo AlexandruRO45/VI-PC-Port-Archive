@@ -24,6 +24,7 @@
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstddef>
 #include <cstdio>
@@ -115,11 +116,18 @@ static bool read_mesh(const char* path, uint32_t stride, std::vector<uint8_t>& v
     f.read(reinterpret_cast<char*>(&vcount), 4);
     f.read(reinterpret_cast<char*>(&icount), 4);
     if (!f || vcount == 0 || icount == 0 || vcount > 10000000u || icount > 30000000u) return false;
-    vertices.resize(size_t(vcount) * stride);
+    const size_t vertex_bytes = size_t(vcount) * stride;
+    const size_t index_bytes = size_t(icount) * sizeof(uint32_t);
+    f.seekg(0, std::ios::end);
+    if (f.tellg() != std::streamoff(8 + vertex_bytes + index_bytes)) return false;
+    f.seekg(8);
+    vertices.resize(vertex_bytes);
     indices.resize(icount);
     f.read(reinterpret_cast<char*>(vertices.data()), std::streamsize(vertices.size()));
     f.read(reinterpret_cast<char*>(indices.data()), std::streamsize(indices.size() * 4));
-    return bool(f);
+    return f && std::all_of(indices.begin(), indices.end(), [vcount](uint32_t index) {
+        return index < vcount;
+    });
 }
 
 int main(int argc, char** argv) {
@@ -157,10 +165,16 @@ int main(int argc, char** argv) {
     if (draw_mesh_path && !*draw_mesh_path) draw_mesh_path = nullptr;
     VertexAttr vertex_attrs[8];
     uint32_t vertex_attr_count = 0, vertex_stride = 0;
+    std::vector<uint8_t> mesh_vertices;
+    std::vector<uint32_t> mesh_indices;
     if (draw_mesh_path) {
         const char* layout = std::getenv("VKH_VERTEX_LAYOUT");
         if (!layout || !parse_vertex_layout(layout, vertex_attrs, vertex_attr_count, vertex_stride)) {
             std::fprintf(stderr, "VKH_VERTEX_LAYOUT: expected locations like 0:3f,1:2f with VKH_DRAW_MESH\n");
+            return 2;
+        }
+        if (!read_mesh(draw_mesh_path, vertex_stride, mesh_vertices, mesh_indices)) {
+            std::fprintf(stderr, "VKH_DRAW_MESH: invalid or unreadable mesh %s\n", draw_mesh_path);
             return 2;
         }
     }
@@ -577,15 +591,9 @@ int main(int argc, char** argv) {
     bai.memoryTypeIndex = memtype(br.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     VkDeviceMemory bmem; CHECK(vkAllocateMemory(dev, &bai, nullptr, &bmem));
     CHECK(vkBindBufferMemory(dev, buf, bmem, 0));
-    std::vector<uint8_t> mesh_vertices;
-    std::vector<uint32_t> mesh_indices;
     VkBuffer vbo = VK_NULL_HANDLE, ibo = VK_NULL_HANDLE;
     VkDeviceMemory vbo_mem = VK_NULL_HANDLE, ibo_mem = VK_NULL_HANDLE;
     if (draw_mesh_path) {
-        if (!read_mesh(draw_mesh_path, vertex_stride, mesh_vertices, mesh_indices)) {
-            std::fprintf(stderr, "VKH_DRAW_MESH: cannot read %s\n", draw_mesh_path);
-            return 1;
-        }
         auto host_buffer = [&](VkDeviceSize bytes, VkBufferUsageFlags usage, VkBuffer& b,
                                VkDeviceMemory& m, void*& p) -> bool {
             VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
