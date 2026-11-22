@@ -480,6 +480,8 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_vint_mul24": (0x13345678, 0xfffffffd, 0x00007fff, 0x0000ffff),
               "ps_vint_minmax": (0x7ffffffe, 0x80000001, 0x80000001, 0x7ffffffe),
               "ps_vint_minmax3": (0xf0f0f0f0, 0xab800000, 0xf0f0f0f0, 0xab800000),
+              # SDWA v_lshlrev/v_lshrrev/v_ashrrev by a constant SGPR narrowed by src0_sel (.asm header)
+              "ps_sdwa_shift_sel": (0x040c0000, 0x04000000, 0xfc040000, 0x06000000),
               # v_readlane_b32 across both halves of a wave64 (the .asm header derives the words)
               "ps_w64x_readlane": (0x40000079, 0x40000010, 0x40000064, 0x400000be)}
 # Pixel shaders that are exact only when the pixel stage really ran 64 lanes wide. vk_harness says so when it chained

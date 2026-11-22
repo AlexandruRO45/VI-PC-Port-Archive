@@ -1483,6 +1483,7 @@ def run_suite(a, work: str) -> int:
                 "ps_vint_mul24": (0x13345678, 0xFFFFFFFD, 0x00007FFF, 0x0000FFFF),
                 "ps_vint_minmax": (0x7FFFFFFE, 0x80000001, 0x80000001, 0x7FFFFFFE),
                 "ps_vint_minmax3": (0xF0F0F0F0, 0xAB800000, 0xF0F0F0F0, 0xAB800000),
+                "ps_sdwa_shift_sel": (0x040C0000, 0x04000000, 0xFC040000, 0x06000000),   # SDWA shift by a constant SGPR
                 "ps_w64x_readlane": (0x40000079, 0x40000010, 0x40000064, 0x400000BE),   # same expectation as check.py
             }
             if skip := wide_pixel_skip(name, msg):   # a 64-wide pixel stage the device could not give: nothing to judge

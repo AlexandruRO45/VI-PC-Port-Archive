@@ -115,6 +115,8 @@ EXPECTED_ANDN2_EXEC = [1, 8, 16, 2064, 2068, 3, 20, 1544]                   # de
 VCMP_F32_HEAP = (0x7FC10001, 0x3F800000, 0x40000000)                        # NaN, 1.0, 2.0
 # Four (A, B) pairs as A.lo A.hi B.lo B.hi (ps_vcmp_64.asm header).
 VCMP_64_HEAP = (0x80000000, 0, 1, 0, 0xFFFFFFFF, 0xFFFFFFFF, 1, 0, 1, 0, 0x80000000, 0, 7, 5, 7, 5)
+# SDWA v_lshrrev/v_lshlrev/v_ashrrev by a constant SGPR narrowed by src0_sel (derivation in ps_sdwa_shift_sel.asm)
+EXPECTED_SDWA_SHIFT_SEL = [0x040C0000, 0x04000000, 0xFC040000, 0x06000000]
 
 
 def _f32_bits(x):
@@ -482,6 +484,19 @@ FLAT_ATTR1_X = struct.unpack("<f", struct.pack("<I", 0x101))[0]
 CS_BOUNDS_FSSM = _fssm(0x8088, (64, 1, 1))
 
 
+def reference_sdwa_shift_sel():
+    s2, s3, v0, v1 = 0x00040001, 0x00000300, 0x40C00000, 0xC0400000
+
+    def sel(word, off, width):                  # SDWA src0_sel without sext: the field, zero-extended
+        return (word >> off) & ((1 << width) - 1)
+
+    def ashr(x, n):
+        return ((x - (1 << 32) if x >> 31 else x) >> n) & 0xFFFFFFFF
+
+    return [v0 >> (sel(s2, 16, 16) & 31), (v1 << (sel(s2, 16, 16) & 31)) & 0xFFFFFFFF,
+            ashr(v1, sel(s2, 16, 8) & 31), (v0 << (sel(s3, 8, 8) & 31)) & 0xFFFFFFFF]
+
+
 class OracleTests(unittest.TestCase):
     """The hand-written constants and the plain-Python reference agree (so the oracle is self-consistent)."""
 
@@ -510,6 +525,7 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_vcmp_f32_nan(), EXPECTED_VCMP_F32_NAN)
         self.assertEqual(reference_vcmp_64(), EXPECTED_VCMP_64)
         self.assertEqual(reference_andn2_exec(), EXPECTED_ANDN2_EXEC)
+        self.assertEqual(reference_sdwa_shift_sel(), EXPECTED_SDWA_SHIFT_SEL)
 
 
 class TranslatorValueSemantics(unittest.TestCase):
@@ -601,6 +617,10 @@ class TranslatorValueSemantics(unittest.TestCase):
 
         with mock.patch.object(si, "half_to_float", flushing):
             self.check("ps_sdwa_f16_const", EXPECTED_SDWA_F16_CONST)
+    def test_sdwa_shift_by_constant_sgpr_keeps_src0_sel(self):
+        # The shift amount is an SGPR set by s_mov_b32, so the translator knows it; SDWA still narrows it to
+        # src0_sel (WORD_1 / BYTE_2 of 0x00040001 = 4, BYTE_1 of 0x300 = 3) before the low five bits are used.
+        self.check("ps_sdwa_shift_sel", EXPECTED_SDWA_SHIFT_SEL)
 
     def test_s_buffer_load_dwordx2_into_vcc(self):
         # The V# in s[0:3] points at 0x1000; the two dwords must come back in vcc_lo and vcc_hi, not be lost.
