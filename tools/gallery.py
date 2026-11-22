@@ -42,6 +42,34 @@ def categorize_model(name: str, folder: str = "") -> str:
     return "Прочее (Miscellaneous)"
 
 
+def contained_file(root: str, rel: str) -> str | None:
+    """A regular file inside ``root``, or None.
+
+    A `..` segment, a prefix of a sibling directory (`models` versus `models_extra`),
+    and a symlink whose target sits outside ``root`` are refused. The check uses the
+    real paths, the same way the map viewer keeps `/world/` inside its folder.
+    """
+    if not root or not isinstance(rel, str) or "\x00" in rel:
+        return None
+    rel = rel.replace("\\", "/").lstrip("/")
+    if not rel:
+        return None
+    parts = rel.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        return None
+    root_real = os.path.realpath(root)
+    target = os.path.realpath(os.path.join(root_real, *parts))
+    try:
+        common = os.path.commonpath([root_real, target])
+    except ValueError:
+        return None
+    if os.path.normcase(common) != os.path.normcase(root_real):
+        return None
+    if not os.path.isfile(target):
+        return None
+    return target
+
+
 class StudioHandler(http.server.BaseHTTPRequestHandler):
     models_dir: str = ""
     textures_dir: str = ""
@@ -65,9 +93,9 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if path.startswith("/vendor/"):
-            rel = path[len("/vendor/"):].lstrip("/")
-            vpath = os.path.normpath(os.path.join(self.viewer_dir, "vendor", rel))
-            if os.path.isfile(vpath):
+            rel = path[len("/vendor/"):]
+            vpath = contained_file(os.path.join(self.viewer_dir, "vendor"), rel)
+            if vpath:
                 mime = mimetypes.guess_type(vpath)[0] or "application/javascript"
                 self._send_file(vpath, mime)
             else:
@@ -75,9 +103,8 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
             return
 
         # Serve static assets from viewer directory (e.g. style.css, app.js)
-        rel_viewer = path.lstrip("/")
-        vfile = os.path.normpath(os.path.join(self.viewer_dir, rel_viewer))
-        if os.path.isfile(vfile) and vfile.startswith(self.viewer_dir):
+        vfile = contained_file(self.viewer_dir, path.lstrip("/"))
+        if vfile:
             mime = mimetypes.guess_type(vfile)[0] or "application/octet-stream"
             if mime.startswith("text/"):
                 mime += "; charset=utf-8"
@@ -93,24 +120,22 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if path.startswith("/models/"):
-            rel = path[len("/models/"):].lstrip("/")
-            mpath = os.path.normpath(os.path.join(self.models_dir, rel))
-            # Security: ensure mpath is inside models_dir
-            if os.path.isfile(mpath) and mpath.startswith(self.models_dir):
+            mpath = contained_file(self.models_dir, path[len("/models/"):])
+            if mpath:
                 self._send_file(mpath, "model/gltf-binary")
             else:
                 self.send_error(404, "Model not found")
             return
 
         if path.startswith("/textures/"):
-            rel = path[len("/textures/"):].lstrip("/")
-            tpath = os.path.normpath(os.path.join(self.textures_dir, rel))
+            rel = path[len("/textures/"):]
+            tpath = contained_file(self.textures_dir, rel)
 
-            if not os.path.isfile(tpath) and rel.lower().endswith(".png"):
-                # Try matching .dds file if png requested
+            if tpath is None and rel.lower().endswith(".png"):
+                # Try matching .dds file if png requested, still inside the textures root.
                 stem = os.path.splitext(rel)[0]
-                dds_cand = os.path.normpath(os.path.join(self.textures_dir, stem + ".dds"))
-                if os.path.isfile(dds_cand) and dds_png:
+                dds_cand = contained_file(self.textures_dir, stem + ".dds")
+                if dds_cand and dds_png:
                     try:
                         png_bytes = dds_png.dds_file_to_png_bytes(dds_cand, max_size=1024)
                         self.send_response(200)
@@ -123,7 +148,7 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
                     except Exception:
                         pass
 
-            if os.path.isfile(tpath) and tpath.startswith(self.textures_dir):
+            if tpath:
                 mime = mimetypes.guess_type(tpath)[0] or "application/octet-stream"
                 self._send_file(tpath, mime)
             else:
