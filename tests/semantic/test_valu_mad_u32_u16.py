@@ -38,7 +38,9 @@ Standard library Python only: unittest, dataclasses, enum, math, struct.
 Single module scope, zero game data.
 """
 
-from typing import Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
+from dataclasses import dataclass, field
+from enum import Enum, auto
 import math
 import struct
 import unittest
@@ -152,6 +154,132 @@ def ref_mad_i32_i16(
     else:
         dst = full_sum & MASK32
     return dst, overflow
+
+
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    """Register and operand addressing modes for AMD RDNA2 VALU."""
+    VGPR = auto()
+    SGPR = auto()
+    VCC = auto()
+    EXEC = auto()
+    LITERAL = auto()
+    INLINE_INT = auto()
+
+
+@dataclass(frozen=True)
+class Operand:
+    """Strongly-typed representation of an instruction operand."""
+    reg_type: RegType
+    index: int = 0
+    size_bits: int = 32
+    literal_val: Optional[int] = None
+
+    @classmethod
+    def vgpr(cls, index: int, size_bits: int = 32) -> Operand:
+        if not (0 <= index < 256):
+            raise ValueError(f"VGPR index out of bounds [0..255]: v{index}")
+        return cls(RegType.VGPR, index=index, size_bits=size_bits)
+
+    @classmethod
+    def sgpr(cls, index: int, size_bits: int = 32) -> Operand:
+        if not (0 <= index < 106):
+            raise ValueError(f"SGPR index out of bounds [0..105]: s{index}")
+        return cls(RegType.SGPR, index=index, size_bits=size_bits)
+
+    @classmethod
+    def literal(cls, val: int, size_bits: int = 32) -> Operand:
+        mask = MASK64 if size_bits == 64 else MASK32
+        return cls(RegType.LITERAL, size_bits=size_bits, literal_val=val & mask)
+
+    @classmethod
+    def inline_int(cls, val: int, size_bits: int = 32) -> Operand:
+        if not (-16 <= val <= 64):
+            raise ValueError(f"Inline integer constant must be in [-16..64]: {val}")
+        return cls(RegType.INLINE_INT, size_bits=size_bits, literal_val=val)
+
+    def disasm_str(self) -> str:
+        if self.reg_type == RegType.VGPR:
+            return f"v{self.index}"
+        elif self.reg_type == RegType.SGPR:
+            return f"s{self.index}"
+        elif self.reg_type == RegType.VCC:
+            return "vcc"
+        elif self.reg_type == RegType.EXEC:
+            return "exec"
+        elif self.reg_type == RegType.LITERAL:
+            return hex(self.literal_val or 0)
+        elif self.reg_type == RegType.INLINE_INT:
+            return str(self.literal_val or 0)
+        return "unknown"
+
+
+@dataclass
+class VMadU32U16Instruction:
+    """Symbolic AST node for AMD RDNA2 v_mad_u32_u16 instruction."""
+    vdst: Operand
+    src0: Operand
+    src1: Operand
+    src2: Operand
+    op_sel: Tuple[bool, bool] = (False, False)
+    clamp: bool = False
+    opcode: str = "v_mad_u32_u16"
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        if self.vdst.reg_type != RegType.VGPR or self.vdst.size_bits != 32:
+            raise ValueError(f"VDST must be a 32-bit VGPR, got {self.vdst}")
+        if self.src0.size_bits != 32 or self.src1.size_bits != 32 or self.src2.size_bits != 32:
+            raise ValueError("All source operands must be 32-bit registers or literals")
+
+        # VOP3 literal constraint: at most one literal operand across sources
+        literals = [s for s in (self.src0, self.src1, self.src2) if s.reg_type == RegType.LITERAL]
+        if len(literals) > 1:
+            raise ValueError(f"VOP3 encoding allows at most 1 literal operand, found {len(literals)}")
+
+    def disasm(self) -> str:
+        clamp_str = " clamp" if self.clamp else ""
+        op_sel_str = ""
+        if any(self.op_sel):
+            sel0 = 1 if self.op_sel[0] else 0
+            sel1 = 1 if self.op_sel[1] else 0
+            op_sel_str = f" op_sel:[{sel0},{sel1},0]"
+        return f"{self.opcode} {self.vdst.disasm_str()}, {self.src0.disasm_str()}, {self.src1.disasm_str()}, {self.src2.disasm_str()}{clamp_str}{op_sel_str}"
+
+
+@dataclass
+class VMadI32I16Instruction:
+    """Symbolic AST node for AMD RDNA2 signed v_mad_i32_i16 instruction."""
+    vdst: Operand
+    src0: Operand
+    src1: Operand
+    src2: Operand
+    op_sel: Tuple[bool, bool] = (False, False)
+    clamp: bool = False
+    opcode: str = "v_mad_i32_i16"
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        if self.vdst.reg_type != RegType.VGPR or self.vdst.size_bits != 32:
+            raise ValueError(f"VDST must be a 32-bit VGPR, got {self.vdst}")
+        if self.src0.size_bits != 32 or self.src1.size_bits != 32 or self.src2.size_bits != 32:
+            raise ValueError("All source operands must be 32-bit registers or literals")
+
+    def disasm(self) -> str:
+        clamp_str = " clamp" if self.clamp else ""
+        op_sel_str = ""
+        if any(self.op_sel):
+            sel0 = 1 if self.op_sel[0] else 0
+            sel1 = 1 if self.op_sel[1] else 0
+            op_sel_str = f" op_sel:[{sel0},{sel1},0]"
+        return f"{self.opcode} {self.vdst.disasm_str()}, {self.src0.disasm_str()}, {self.src1.disasm_str()}, {self.src2.disasm_str()}{clamp_str}{op_sel_str}"
 
 
 class TestValuMadU32U16Oracle(unittest.TestCase):
@@ -308,6 +436,74 @@ class TestValuMadU32U16Oracle(unittest.TestCase):
             self.assertEqual(carry, 0)
 
         self.assertEqual(current_acc, expected)
+
+
+class TestValuMadU32U16SymbolicAST(unittest.TestCase):
+    """Unit tests for the symbolic AST representations, operand typing, and syntax validation."""
+
+    def test_instruction_construction_valid(self) -> None:
+        inst = VMadU32U16Instruction(
+            vdst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.sgpr(2),
+            src2=Operand.literal(0x1234),
+        )
+        self.assertEqual(inst.opcode, "v_mad_u32_u16")
+        self.assertEqual(inst.vdst.index, 0)
+        self.assertEqual(inst.src0.index, 1)
+        self.assertEqual(inst.src1.index, 2)
+        self.assertEqual(inst.disasm(), "v_mad_u32_u16 v0, v1, s2, 0x1234")
+
+    def test_instruction_with_clamp_and_op_sel(self) -> None:
+        inst = VMadU32U16Instruction(
+            vdst=Operand.vgpr(3),
+            src0=Operand.vgpr(4),
+            src1=Operand.vgpr(5),
+            src2=Operand.vgpr(6),
+            op_sel=(True, False),
+            clamp=True,
+        )
+        self.assertEqual(inst.disasm(), "v_mad_u32_u16 v3, v4, v5, v6 clamp op_sel:[1,0,0]")
+
+    def test_signed_instruction_ast(self) -> None:
+        inst = VMadI32I16Instruction(
+            vdst=Operand.vgpr(7),
+            src0=Operand.inline_int(-5),
+            src1=Operand.vgpr(8),
+            src2=Operand.vgpr(9),
+            op_sel=(False, True),
+            clamp=True,
+        )
+        self.assertEqual(inst.opcode, "v_mad_i32_i16")
+        self.assertEqual(inst.disasm(), "v_mad_i32_i16 v7, -5, v8, v9 clamp op_sel:[0,1,0]")
+
+    def test_register_bounds_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+        with self.assertRaises(ValueError):
+            Operand.vgpr(-1)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(-1)
+
+    def test_multiple_literals_rejection(self) -> None:
+        with self.assertRaises(ValueError):
+            VMadU32U16Instruction(
+                vdst=Operand.vgpr(0),
+                src0=Operand.literal(10),
+                src1=Operand.literal(20),
+                src2=Operand.vgpr(1),
+            )
+
+    def test_inline_integer_constant_bounds(self) -> None:
+        for val in (-16, 0, 1, 64):
+            op = Operand.inline_int(val)
+            self.assertEqual(op.literal_val, val)
+        with self.assertRaises(ValueError):
+            Operand.inline_int(-17)
+        with self.assertRaises(ValueError):
+            Operand.inline_int(65)
 
 
 if __name__ == "__main__":
