@@ -209,6 +209,12 @@ def test_data_reads():
     store = ins("buffer_store_dword", v(10), v(2), s(0, 4), imm(0))
     assert reads_of([cmp, mov]) == {}
     assert reads_of([cmp, mov, store]) == {("vgpr", 10): L.MASK_LO}
+    # One lane of that VGPR then overwritten with data (v_writelane): no gather, which would take the lane's data
+    # as its bit (crosslane_fuzz seed 6, cs_xl32_600042).
+    wl = ins("v_writelane_b32", v(10), s(15), imm(27))
+    assert reads_of([cmp, mov, wl, store]) == {}
+    assert reads_of([cmp, mov, wl, ins("v_mov_b32_e32", v(11), v(10)),
+                     ins("buffer_store_dword", v(11), v(2), s(0, 4), imm(0))]) == {}
     park = [cmp, ins("v_writelane_b32", v(20), s(20), imm(0)), ins("v_readlane_b32", s(44), v(20), imm(0))]
     assert reads_of(park, 1) == {} and reads_of(park, 2) == {}
     assert reads_of(park + [ins("s_add_u32", s(45), s(44), imm(1))]) == {("sgpr", 44): L.MASK_LO}

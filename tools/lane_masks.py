@@ -139,6 +139,8 @@ def step(state, ins, wave64=False):
             state.pop(lane_slot(a[0], a[2]), None)
         else:
             state[lane_slot(a[0], a[2])] = k
+        if ("v", a[0]["r"]) in state:                   # one lane of a mask copied into this VGPR now holds
+            state[("vw", a[0]["r"])] = True             # something else: data_reads no longer gathers it
         return
     if op == "v_readlane_b32" and len(a) == 3:                                  # sD = vS[lane]
         put(state, a[0], state.get(lane_slot(a[1], a[2])))
@@ -152,11 +154,14 @@ def step(state, ins, wave64=False):
         # plain writes skip inactive lanes. The sources are looked at first: the destination can be one of them.
         kinds = [kind(state, x) for x in a[1:]] if op in VECTOR_BITWISE and a[0].get("n", 1) == 1 else [None]
         written = range(a[0]["r"], a[0]["r"] + a[0].get("n", 1))
+        vw = {k for k in state if isinstance(k, tuple) and k[0] == "vw"}
         for key in [k for k in state if isinstance(k, tuple) and k[1] in written]:
             del state[key]
         if None not in kinds and any(k in MASK_KINDS for k in kinds):
             ms = {k for k in kinds if k in MASK_KINDS}
             state[("v", a[0]["r"])] = ms.pop() if len(ms) == 1 else MASK
+            if any(x["k"] == "vgpr" and ("vw", x["r"]) in vw for x in a[1:]):
+                state[("vw", a[0]["r"])] = True          # copied from a VGPR with an overwritten lane: still not gathered
             # A plain copy (v_mov_b32) is an ordinary VALU write: inactive lanes keep the old
             # VGPR (SHADER-21 part 2). Only per-lane mask computations take the all-lanes store,
             # because whole-wave readers (wave_mask, v_readfirstlane) read every lane's bit.
@@ -254,6 +259,9 @@ def data_reads(ins, state):
     out = {}
     for x in srcs:
         for key in reg_keys(x):
+            if key[0] == "vgpr" and ("vw", key[1]) in state:
+                continue        # a mask copied into this VGPR, then one lane overwritten by v_writelane: the
+                                # gather would take that lane's data as its bit, so the VGPR is read lane by lane
             k = reg_kind(state, key)
             if k is not None:
                 out[key] = k
@@ -300,6 +308,8 @@ def analyse(blocks, succ, wave64=False, *, include_either=False, reads=None):
                         merged[r] = a_k
                     else:
                         merged[r] = MASK
+                # a VGPR one of whose lanes v_writelane overwrote on either path stays so (data_reads)
+                merged.update({r: True for r in entry[s].keys() | state.keys() if isinstance(r, tuple) and r[0] == "vw"})
             if merged != entry[s]:
                 entry[s] = merged
                 work.append(s)
