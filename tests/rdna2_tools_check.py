@@ -130,6 +130,15 @@ class TestRdna2Disasm(unittest.TestCase):
             ("01020083", "s_min_i32", "s_min_i32 s0, s1, s2"),
             ("01020093", "s_mul_i32", "s_mul_i32 s0, s1, s2"),
             ("341281b1", "s_cmpk_eq_i32", "s_cmpk_eq_i32 s1, 0x1234"),
+            # SOPC: [31:23] == 0b101111110. These encodings were previously
+            # consumed by the SOPK prefix check (e.g. 000100bf as s_sopk_1e).
+            ("000100bf", "s_cmp_eq_i32", "s_cmp_eq_i32 s0, s1"),
+            ("000106bf", "s_cmp_eq_u32", "s_cmp_eq_u32 s0, s1"),
+            ("020302bf", "s_cmp_gt_i32", "s_cmp_gt_i32 s2, s3"),
+            ("007d00bf", "s_cmp_eq_i32", "s_cmp_eq_i32 s0, null"),
+            ("00010cbf", "s_bitcmp0_b32", "s_bitcmp0_b32 s0, s1"),
+            ("000212bf", "s_cmp_eq_u64", "s_cmp_eq_u64 s[0:1], s[2:3]"),
+            ("04060ebf", "s_bitcmp0_b64", "s_bitcmp0_b64 s[4:5], s6"),
             ("000080bb", "s_waitcnt_vscnt", "s_waitcnt_vscnt s0, 0x0"),
             ("0100a0bf", "s_inst_prefetch", "s_inst_prefetch 0x1"),
             ("0255027e", "v_rcp_f32_e32", "v_rcp_f32_e32 v1, v2"),
@@ -141,10 +150,15 @@ class TestRdna2Disasm(unittest.TestCase):
             ("f202047e", "v_mov_b32_e32", "v_mov_b32_e32 v2, 1.0"),
             ("f002067e", "v_mov_b32_e32", "v_mov_b32_e32 v3, 0.5"),
             ("8002087e", "v_mov_b32_e32", "v_mov_b32_e32 v4, 0"),
-            # VOP2 9-bit SRC0 (VGPR vs SGPR vs inline constant)
-            ("01050602", "v_add_f32_e32", "v_add_f32_e32 v3, v1, v2"),
-            ("01040602", "v_add_f32_e32", "v_add_f32_e32 v3, s1, v2"),
-            ("f0040602", "v_add_f32_e32", "v_add_f32_e32 v3, 0.5, v2"),
+            # VOP2 9-bit SRC0 (VGPR vs SGPR vs inline constant) with GFX10/RDNA 2 opcodes
+            ("01050602", "v_cndmask_b32_e32", "v_cndmask_b32_e32 v3, v1, v2, vcc_lo"),
+            ("01050606", "v_add_f32_e32", "v_add_f32_e32 v3, v1, v2"),
+            ("01040606", "v_add_f32_e32", "v_add_f32_e32 v3, s1, v2"),
+            ("f0040606", "v_add_f32_e32", "v_add_f32_e32 v3, 0.5, v2"),
+            ("01050610", "v_mul_f32_e32", "v_mul_f32_e32 v3, v1, v2"),
+            ("01050636", "v_and_b32_e32", "v_and_b32_e32 v3, v1, v2"),
+            ("0105064a", "v_add_nc_u32_e32", "v_add_nc_u32_e32 v3, v1, v2"),
+            ("01050656", "v_fmac_f32_e32", "v_fmac_f32_e32 v3, v1, v2"),
         ]
         for hex_str, expected_op, expected_asm in vectors:
             raw = bytes.fromhex(hex_str)
@@ -152,6 +166,19 @@ class TestRdna2Disasm(unittest.TestCase):
             self.assertEqual(len(insns), 1, f"Failed for {hex_str}")
             self.assertEqual(insns[0]["opcode"], expected_op, f"Mismatched opcode for {hex_str}")
             self.assertEqual(insns[0]["assembly"], expected_asm, f"Mismatched assembly for {hex_str}")
+
+    def test_sopc_literal_keeps_the_following_instruction_aligned(self):
+        # src1 == literal (255) makes the SOPC encoding 8 bytes. Without
+        # consuming the literal dword, the following s_endpgm would be misread.
+        raw = bytes.fromhex("00ff06bf 78563412 000081bf")
+        insns = disasm_rdna2(raw)
+        self.assertEqual(
+            [(i["opcode"], i["length"], i["assembly"]) for i in insns],
+            [
+                ("s_cmp_eq_u32", 8, "s_cmp_eq_u32 s0, 0x12345678"),
+                ("s_endpgm", 4, "s_endpgm"),
+            ],
+        )
 
     def test_cli_hex_entry_point(self):
         script = Path(__file__).resolve().parents[1] / "tools" / "disasm_rdna2.py"
@@ -182,6 +209,35 @@ class TestRdna2Disasm(unittest.TestCase):
             "v_mov_b32_e32 v2, 1.0",
             "v_mov_b32_e32 v3, 0.5",
             "v_mov_b32_e32 v4, 0",
+            "v_cndmask_b32_e32 v3, v1, v2, vcc_lo",
+            "v_add_f32_e32 v3, v1, v2",
+            "v_sub_f32_e32 v3, v1, v2",
+            "v_subrev_f32_e32 v3, v1, v2",
+            "v_mul_legacy_f32_e32 v3, v1, v2",
+            "v_mul_f32_e32 v3, v1, v2",
+            "v_min_f32_e32 v3, v1, v2",
+            "v_max_f32_e32 v3, v1, v2",
+            "v_min_i32_e32 v3, v1, v2",
+            "v_max_i32_e32 v3, v1, v2",
+            "v_min_u32_e32 v3, v1, v2",
+            "v_max_u32_e32 v3, v1, v2",
+            "v_lshrrev_b32_e32 v3, v1, v2",
+            "v_ashrrev_i32_e32 v3, v1, v2",
+            "v_lshlrev_b32_e32 v3, v1, v2",
+            "v_and_b32_e32 v3, v1, v2",
+            "v_or_b32_e32 v3, v1, v2",
+            "v_xor_b32_e32 v3, v1, v2",
+            "v_add_nc_u32_e32 v3, v1, v2",
+            "v_sub_nc_u32_e32 v3, v1, v2",
+            "v_subrev_nc_u32_e32 v3, v1, v2",
+            "v_fmac_f32_e32 v3, v1, v2",
+            "v_cvt_pkrtz_f16_f32_e32 v3, v1, v2",
+            "s_cmp_eq_i32 s0, s1",
+            "s_cmp_eq_u32 s0, s1",
+            "s_cmp_gt_i32 s2, s3",
+            "s_cmp_eq_u64 s[0:1], s[2:3]",
+            "s_bitcmp0_b32 s0, s1",
+            "s_bitcmp0_b64 s[4:5], s6",
             "s_endpgm",
         ]
 
