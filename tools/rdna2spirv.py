@@ -136,6 +136,16 @@ def base_op(op):
     return op
 
 
+def imm64(v, signed):
+    """The 64-bit value of an integer constant in a 64-bit operand. An inline constant (-16..64) is sign-extended; a
+    32-bit literal is sign-extended where the operand is i64 and zero-extended where it is b64/u64 (measured on
+    RDNA2, gfx1036: docs/design.md "64-bit operand literals")."""
+    v &= 0xFFFFFFFFFFFFFFFF
+    if signed and v <= 0xFFFFFFFF and v & 0x80000000:
+        v |= 0xFFFFFFFF00000000
+    return v
+
+
 class Unsupported(Exception):
     pass
 
@@ -4434,7 +4444,7 @@ class Gen:
             if x["k"] == "sgpr" and x.get("n") == 2:
                 lo, hi = self.load_reg("sgpr", x["r"]), self.load_reg("sgpr", x["r"] + 1)
             elif x["k"] == "imm":
-                v = x["v"] & 0xFFFFFFFFFFFFFFFF
+                v = imm64(x["v"], op == "s_flbit_i32_i64")
                 lo, hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
             else:
                 raise Unsupported(op + " source")
@@ -4972,8 +4982,8 @@ class Gen:
             if src["k"] in ("vgpr", "sgpr") and src.get("n") == 2:
                 lo, hi = self.load_reg(src["k"], src["r"]), self.load_reg(src["k"], src["r"] + 1)
             elif src["k"] == "imm":
-                # 64-bit inline/literal constant: sign-extended from 32 bits.
-                v = src["v"] & 0xFFFFFFFFFFFFFFFF
+                # 64-bit constant: an inline one sign-extended; a literal zero-extended (b64) or sign-extended (i64).
+                v = imm64(src["v"], op == "v_ashrrev_i64")
                 lo, hi = self.cu(v & 0xFFFFFFFF), self.cu((v >> 32) & 0xFFFFFFFF)
             else:
                 raise Unsupported(op + " operands")
@@ -5779,7 +5789,7 @@ class Gen:
             if x["k"] == "sgpr" and x.get("n") == 2:
                 lo, hi = self.load_reg("sgpr", x["r"]), self.load_reg("sgpr", x["r"] + 1)
             elif x["k"] == "imm":
-                v = x["v"] & 0xFFFFFFFFFFFFFFFF
+                v = imm64(x["v"], op == "s_ashr_i64")
                 lo, hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
             else:
                 raise Unsupported(op + " source")
@@ -6200,7 +6210,7 @@ class Gen:
             if x["k"] == "sgpr" and x.get("n") == 2:
                 lo, hi = self.load_reg("sgpr", x["r"]), self.load_reg("sgpr", x["r"] + 1)
             elif x["k"] == "imm":
-                v = x["v"] & 0xFFFFFFFFFFFFFFFF
+                v = imm64(x["v"], op == "s_bfe_i64")
                 lo, hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
             else:
                 raise Unsupported(op + " source")
@@ -6777,7 +6787,7 @@ class Gen:
             if s2["k"] in ("vgpr", "sgpr") and s2.get("n") == 2:
                 c_lo, c_hi = self.load_reg(s2["k"], s2["r"]), self.load_reg(s2["k"], s2["r"] + 1)
             elif s2["k"] == "imm":
-                v = s2["v"] & 0xFFFFFFFFFFFFFFFF          # 64-bit inline/literal constant: sign-extended from 32 bits
+                v = imm64(s2["v"], signed)                # a literal is sign-extended for i64, zero-extended for u64
                 c_lo, c_hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
             else:
                 raise Unsupported(op + " operands")
