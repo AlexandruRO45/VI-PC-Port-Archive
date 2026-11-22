@@ -1097,8 +1097,8 @@ def test_pk_and_scalar_f16_ops_emit_no_packhalf2x16(op_asm, make_shader):
     "buffer_store_format_xyzw v[2:5], v1, s[0:3], 0 offen\nexp mrt0 v2, v3, v4, v5 done vm",
 ], ids=["d16-load", "store"])
 def test_buffer_format_f16_narrowing_avoids_packhalf2x16(make_shader, body):
-    """The f16 of a d16 typed buffer load, and of an f16 format a typed buffer store writes, narrow with integer RTE
-    like the d16 image results (#489): PackHalf2x16 rounds toward zero on AMD drivers."""
+    """The f16 of a d16 typed buffer load (integer RTE) and of an f16 format a typed buffer store writes
+    (integer RTZ with +-65504 saturation, SHADER-395) narrow through Gen.f16_bits, avoiding PackHalf2x16."""
     shader = make_shader("s_mov_b32 s0, 0x1000\ns_mov_b32 s1, 0\ns_mov_b32 s2, 0x100\ns_mov_b32 s3, 0x31001fac\n"
                          "v_mov_b32 v1, 0\n" + body + "\ns_endpgm\n", "ps_buf_f16")
     spv = shader.translate()
@@ -1248,25 +1248,31 @@ def test_fma_mix_f16_rte_edge_cases_and_half_preservation(
     assert out[0] == expected_word
 
 
-@pytest.mark.parametrize("suffix,fmt_code,expected_word", [
-    ("xy", 29, 0x3C023C00),  # format 29 = (4, "f16", (16, 16)): lo=0x3c00, hi=0x3c02
-    ("x", 13, 0x00003C00),   # format 13 = (2, "f16", (16,)): lo=0x3c00
+@pytest.mark.parametrize("suffix,fmt_code,v2_bits,v3_bits,expected_word", [
+    # Ties round toward zero (0x3f801000 -> 0x3c00, 0x3f803000 -> 0x3c01, not RTE 0x3c02; SHADER-395)
+    ("xy", 29, 0x3F801000, 0x3F803000, 0x3C013C00),  # format 29 = (4, "f16", (16, 16))
+    ("x", 13, 0x3F803000, 0x00000000, 0x00003C01),   # format 13 = (2, "f16", (16,))
+    # Finite overflow saturates to +-65504 (0x7bff / 0xfbff), not +-inf
+    ("xy", 29, 0x477FF000, 0xC7800000, 0xFBFF7BFF),  # +65520.0 -> 0x7bff, -65536.0 -> 0xfbff
+    ("xy", 29, 0x7F7FFFFF, 0xFF7FFFFF, 0xFBFF7BFF),  # +FLT_MAX -> 0x7bff, -FLT_MAX -> 0xfbff
+    # Infinities keep +-inf, subnormal underflow below 2^-24 truncates toward zero
+    ("xy", 29, 0x7F800000, 0x337FFFFF, 0x00007C00),  # +inf -> 0x7c00, just below 2^-24 -> 0x0000
 ])
-def test_encode_format_f16_uses_f16_bits_rte(suffix, fmt_code, expected_word, make_shader):
-    """buffer_store_format_{x,xy} with f16 V# formats uses f16_bits RTE (no PackHalf2x16),
-    validates with spirv-val, and stores exact tie-to-even f16 bits."""
+def test_encode_format_f16_uses_f16_bits_rtz(suffix, fmt_code, v2_bits, v3_bits, expected_word, make_shader):
+    """buffer_store_format_{x,xy} with f16 V# formats uses f16_bits(..., rtz=True) (no PackHalf2x16),
+    validates with spirv-val, rounds ties toward zero, and saturates finite overflow at +-65504 (SHADER-395)."""
     si = _load_mini_interp()
     base = 0x1000
     vdata = "v2" if suffix == "x" else "v[2:3]"
     ps = (
-        "; buffer_store_format_f16_rte\n"
+        "; buffer_store_format_f16_rtz\n"
         f"s_mov_b32 s0, {base:#x}\n"
         "s_mov_b32 s1, 0\n"
         "s_mov_b32 s2, 0x100\n"
         f"s_mov_b32 s3, {fmt_code << 12 | 0x30000000:#x}\n"
         "v_mov_b32 v1, 0\n"
-        "v_mov_b32 v2, 0x3f801000\n"  # 1.0 + 2^-11 -> 0x3c00 (tie to even)
-        "v_mov_b32 v3, 0x3f803000\n"  # 1.0 + 3*2^-11 -> 0x3c02 (tie to even)
+        f"v_mov_b32 v2, {v2_bits:#010x}\n"
+        f"v_mov_b32 v3, {v3_bits:#010x}\n"
         f"buffer_store_format_{suffix} {vdata}, v1, s[0:3], 0 offen\n"
         "s_waitcnt vmcnt(0)\n"
         "exp mrt0 v2, v3, v2, v3 done vm\n"
