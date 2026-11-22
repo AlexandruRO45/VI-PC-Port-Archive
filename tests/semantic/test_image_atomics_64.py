@@ -92,6 +92,8 @@ def run(line, regs, memory, active=True):
             env[res] = env[args[1]] >> env[args[2]]
         elif op == "OpBitwiseOr":
             env[res] = env[args[1]] | env[args[2]]
+        elif op == "OpBitwiseAnd":                            # a16: the low coordinate of a VGPR
+            env[res] = env[args[1]] & env[args[2]]
         elif op == "OpSelect":
             env[res] = env[args[2]] if env[args[1]] else env[args[3]]
         elif op == "OpImageTexelPointer":
@@ -188,6 +190,20 @@ class ImageAtomics64(unittest.TestCase):
                 self.assertEqual(regs[:2], list(split(d)))
                 # The exchanges are skipped; the others run with the operand that leaves the texel as it is.
                 self.assertEqual(ran, [] if kind in ("swap", "cmpswap") else [SPIRV[kind]])
+
+    def test_a16_coordinates(self):
+        """a16 packs two 16-bit coordinates per address VGPR, low half first, as for the 32-bit atomics."""
+        d = 0x00000001_00000010
+        for three in (False, True):
+            with self.subTest(three=three):
+                addr, dim, coords = ("v[1:2]", "3D", (5, 7, 9)) if three else ("v1", "2D", (5, 7))
+                regs = {1: 7 << 16 | 5, 2: 9, 4: d & M32, 5: d >> 32}
+                array = "%simages64_3d" if three else "%simages64"
+                memory = {(array, coords): 0x00000002_FFFFFFF0}
+                line = f"image_atomic_add v[4:5], {addr}, s[16:23] dmask:0x3 dim:SQ_RSRC_IMG_{dim} unorm glc a16"
+                self.assertEqual(run(line, regs, memory), ["OpAtomicIAdd"])
+                self.assertEqual(memory[(array, coords)], 0x00000004_00000000)
+                self.assertEqual((regs[4], regs[5]), (0xFFFFFFF0, 2))
 
     def test_32_bit_masks_are_not_this_rule(self):
         g = rdna2spirv.Gen("cs")
