@@ -16,7 +16,7 @@
 // (VK_ERROR_DEVICE_LOST) the outputs hold what the layer knows, and nothing it does not:
 //   - a node for each list kept by the breadcrumb ring that the GPU did not complete, oldest first. The
 //     granularity is the list: *pLastBreadcrumbValue is 0 (one that started may have run some of its operations).
-//     The list and queue debug names are copies taken at submission (dred_debug_name); pCommandList and
+//     The list and queue debug names are copies taken at submission (Object::debug_name); pCommandList and
 //     pCommandQueue stay null, since nothing keeps those objects alive after ExecuteCommandLists, and there are no
 //     breadcrumb contexts. Without VK_AMD_buffer_marker the GPU progress is unknown and there is no node at all;
 //     the stderr report lists the submitted lists instead;
@@ -40,21 +40,6 @@
 #include <vector>
 
 namespace rt::d3d12 {
-
-// The D3D12 debug name of `object` (SetName stores it as WKPDID_D3DDebugObjectNameW), copied; empty when it has
-// none. GetPrivateData takes the object's own lock, so a concurrent SetName yields the old name, the new one, or
-// (a size that changed between the two calls) none, never a torn one.
-inline std::wstring dred_debug_name(ID3D12Object* object) {
-    static constexpr GUID kName{0x4cca5fd8, 0x921f, 0x42c8, {0x85, 0x99, 0xd2, 0x86, 0x6a, 0x3e, 0x5f, 0x7e}};
-    if (!object) return {};
-    UINT size = 0;
-    if (FAILED(object->GetPrivateData(kName, &size, nullptr)) || size < sizeof(wchar_t)) return {};
-    std::wstring name(size / sizeof(wchar_t), L'\0');
-    if (FAILED(object->GetPrivateData(kName, &size, name.data()))) return {};
-    name.resize(size / sizeof(wchar_t));
-    while (!name.empty() && name.back() == L'\0') name.pop_back();
-    return name;
-}
 
 // LEONIDA_DRED=1 asks for device-lost diagnostics, read once.
 inline bool dred_requested() {
