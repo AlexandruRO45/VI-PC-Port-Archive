@@ -1842,6 +1842,8 @@ Scalar ALU instructions act on uniform 32-bit values: immediates, loaded constan
 
 The `s_bcnt0_i32_b32` and `s_bcnt1_i32_b32` instructions count zero or one bits in a 32-bit scalar. Their `b64` forms count across an SGPR pair. All four set SCC when the count is nonzero. The predicate and rounding draw checks the count and SCC against a Python reference and rejects a 64-bit count that ignores the upper word.
 
+`s_bfe_u64` and `s_bfe_i64` extract a field from two scalar dwords. The control supplies the offset in bits 5:0 and the width in bits 22:16. An empty field returns zero. A field extending past bit 63 stops at bit 63, and the signed form extends the top bit of the resulting field. The lowerer reuses the two-dword shifts and sets SCC when either result word is nonzero. The source-built test uses raw UINT readback to check both words and SCC independently. Cases include an extraction across the dword boundary, a result with only its high word set, and offsets and widths at their limits. The signed and unsigned draws each require a mismatch against the other's cross-dword reference. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_blend_scalar_(warp|hardware)$' -V`. [AMD RDNA 2 instruction set](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
+
 From the repository root on Linux with LLVM 15 installed, assemble the original test shaders, wrap them in synthetic records, then extract, decode and translate them. The test compares the result with lowering the source operands directly.
 
 ```sh

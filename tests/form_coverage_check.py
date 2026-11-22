@@ -264,8 +264,7 @@ def check_shader_records():
         covered = fc.measure({"pixel_aot_warp": "pass"}, root, {"pixel_aot_warp": set(pixel.ACCEPTED)})
         without = fc.measure({"pixel_aot_warp": "pass"}, root, {"pixel_aot_warp": pixel.ACCEPTED - words})
         assert covered["gfx1013"]["covered"] == without["gfx1013"]["covered"] + len(trig)
-    # Every newly lowered 64-bit SOP1/SOP2 and 32-bit BFE form is counted in both gfx1013 and rdna2,
-    # while rejected neighbors (exec save/restore, #257 ops, 64-bit BFE/cselect) stay out of covered.
+    # Count the supported 64-bit SOP1/SOP2 and BFE forms in both gfx1013 and rdna2.
     scalar64_forms = {
         ("SOP1", "s_cmov_b64"), ("SOP1", "s_not_b64"), ("SOP1", "s_brev_b64"),
         ("SOP2", "s_and_b64"), ("SOP2", "s_or_b64"), ("SOP2", "s_xor_b64"),
@@ -273,6 +272,7 @@ def check_shader_records():
         ("SOP2", "s_nand_b64"), ("SOP2", "s_nor_b64"), ("SOP2", "s_xnor_b64"),
         ("SOP2", "s_lshl_b64"), ("SOP2", "s_lshr_b64"), ("SOP2", "s_ashr_i64"),
         ("SOP2", "s_bfm_b32"), ("SOP2", "s_bfm_b64"), ("SOP2", "s_bfe_u32"), ("SOP2", "s_bfe_i32"),
+        ("SOP2", "s_bfe_u64"), ("SOP2", "s_bfe_i64"),
     }
     sopc_forms = {
         ("SOPC", "s_cmp_eq_i32"), ("SOPC", "s_cmp_lg_i32"),
@@ -302,7 +302,7 @@ def check_shader_records():
     }
     rejected_forms = {
         "s_and_saveexec_b64", "s_or_saveexec_b64", "s_andn2_saveexec_b64",
-        "s_cselect_b64", "s_bfe_u64", "s_bfe_i64",
+        "s_cselect_b64",
         "v_mul_i32_i24_sdwa",
         "s_lshl0_add_u32", "s_lshl5_add_u32",
     }

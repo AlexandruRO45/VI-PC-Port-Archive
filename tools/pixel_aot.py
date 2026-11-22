@@ -483,6 +483,16 @@ uint mul_hi_i32(uint a, uint b) {
         "    return asuint(asint(src) >> off);\n"
         "}"
     ),
+    "s_bfe64": (
+        "uint2 s_bfe64(uint2 src, uint ctrl, bool is_signed) {\n"
+        "    uint offset = ctrl & 63u;\n"
+        "    uint width = min((ctrl >> 16) & 127u, 64u - offset);\n"
+        "    if (width == 0u) return uint2(0u, 0u);\n"
+        "    uint right = 64u - width;\n"
+        "    uint2 aligned = s_lshl_b64(src, right - offset);\n"
+        "    return is_signed ? s_ashr_i64(aligned, right) : s_lshr_b64(aligned, right);\n"
+        "}"
+    ),
     "dpp_ffbh_u32": (
         "uint dpp_ffbh_u32(uint x) {\n"
         "    return x == 0u ? 0xffffffffu : (31u - firstbithigh(x));\n"
@@ -1498,6 +1508,18 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             scalar[regs[0]], scalar[regs[1]] = ("uint", f"salu{i}.x"), ("uint", f"salu{i}.y")
             if op != "s_bfm_b64":
                 scc = f"((salu{i}.x | salu{i}.y) != 0u)"
+        elif m := match(r"s_bfe_([ui])64 (s\[\d+:\d+\]), ([^,]+), ([^,]+)"):
+            kind, dst, src, ctrl = m.groups()
+            regs = sgpr_pair(dst)
+            if pending.intersection(regs):
+                raise ValueError("Write overlaps an outstanding scalar load")
+            is_signed = kind == "i"
+            lo, hi = scalar_u64(src, scalar, pending, signed=is_signed)
+            field = scalar_u32(ctrl, scalar, pending)
+            helpers.update(("s_lshl_b64", "s_lshr_b64", "s_ashr_i64", "s_bfe64"))
+            lines.append(f"    uint2 salu{i} = s_bfe64(uint2({lo}, {hi}), {field}, {str(is_signed).lower()});")
+            scalar[regs[0]], scalar[regs[1]] = ("uint", f"salu{i}.x"), ("uint", f"salu{i}.y")
+            scc = f"((salu{i}.x | salu{i}.y) != 0u)"
         elif m := match(r"(s_bfe_u32|s_bfe_i32) (s\d+), ([^,]+), ([^,]+)"):
             op, dst, src0, src1 = m.groups()
             sgpr_name(dst)
