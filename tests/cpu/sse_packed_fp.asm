@@ -1,3 +1,4 @@
+; coverage: source cpu_aot_sse_packed_fp
 ; Source-owned differential fixture for 32 baseline 128-bit SSE/SSE2 packed floating-point instructions.
 .code
 
