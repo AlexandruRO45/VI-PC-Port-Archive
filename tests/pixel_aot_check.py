@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import zlib
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import pixel_aot
@@ -1179,12 +1180,29 @@ def check_scheduling_hints():
     must_reject(translate, plain[:-1] + ["s_setprio 0", plain[-1]])
 
 
+def check_adapter_skip(directory: Path) -> None:
+    compiler, renderer = "stub-dxc", "stub-offscreen"
+    work = directory / "no-adapter"
+    work.mkdir()
+
+    def run_without_adapter(args: list[str | Path], *, check: bool = False) -> subprocess.CompletedProcess[None]:
+        assert args[0] in (compiler, renderer)
+        result = subprocess.CompletedProcess(args, 77 if args[0] == renderer else 0)
+        if check:
+            result.check_returncode()
+        return result
+
+    with patch.object(subprocess, "run", side_effect=run_without_adapter):
+        assert check_render(work, compiler, renderer, "hardware") == 77
+
+
 def check_controls(directory):
     check_scheduling_hints()
     check_constant_descriptor_bounds()
     check_scalar_constant_reads()
     check_affine_coordinates()
     check_scalar_helpers_with_vector_arithmetic()
+    check_adapter_skip(directory)
     # v_cvt_f32_f16 widens the low half through widen16 and applies modifiers after widening.
     body = translate(with_constants(HALF_BODY)).split("float4 main", 1)[1]
     assert body.count("widen16(asuint(") == 4 and "(-abs(widen16(" in body, body
@@ -1500,8 +1518,6 @@ def check_affine_lod_draw(directory: Path, compiler: str, renderer: str, backend
 
 
 def check_render(directory, compiler, renderer, backend):
-    check_movk_draw(directory, compiler, renderer, backend)
-    check_half_draw(directory, compiler, renderer, backend)
     for swap in (False, True):
         source = directory / "fixture.hlsl"
         shader = directory / "fixture.cso"
@@ -1515,6 +1531,8 @@ def check_render(directory, compiler, renderer, backend):
             wrong = subprocess.run([*draw, "rgba"], capture_output=True, text=True)
             if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
                 raise AssertionError("The renderer failed to detect the changed channel order")
+    check_movk_draw(directory, compiler, renderer, backend)
+    check_half_draw(directory, compiler, renderer, backend)
     program = arithmetic()
     source.write_text(translate(program), encoding="ascii")
     subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
