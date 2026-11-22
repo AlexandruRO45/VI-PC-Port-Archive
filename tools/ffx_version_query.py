@@ -136,6 +136,11 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
     # the fixed control word, or an x87_lower.Checked for the checked entry, which also accepts FLDCW.
     checked = x87 if isinstance(x87, x87_lower.Checked) else None
     x87_depth = x87_lower.depths(body, exits, checked) if x87 and any(map(x87_lower.is_x87, body)) else None
+    # JP and JNP read PF, which only a function the x87 profile has checked models (x87_lower.check_flags);
+    # SAHF and the 8-bit TEST and AND set it there. Other functions keep their two flags.
+    parity = x87_depth is not None and any(i.mnemonic in (M.JP, M.JNP) for i in body)
+    if parity:
+        lines[2] = "bool zero=false, carry=false, overflow=false, parity=false;"
     xmm = {R.XMM0: "xmm0", R.XMM1: "xmm1", R.XMM2: "xmm2"}
     has_xmm_math = any(i.mnemonic in (M.VMOVDQU, M.VPSRLDQ, M.VMOVD)
                        or (i.mnemonic == M.VPADDD and i.op2_kind != K.MEMORY) for i in body)
@@ -222,6 +227,15 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
             cond = {M.JE: "if (zero) ", M.JNE: "if (!zero) ", M.JAE: "if (!carry) ",
                     M.JA: "if (!carry && !zero) ", M.JB: "if (carry) ", M.JBE: "if (carry || zero) ", M.JMP: ""}[op]
             stmt = f"{cond}goto block_{target:x};"
+        elif op in (M.JP, M.JNP) and parity:
+            target = i.near_branch_target
+            if target not in allowed:
+                raise ValueError(f"unbound branch at {i.ip:#x}")
+            stmt = f"if ({'' if op == M.JP else '!'}parity) goto block_{target:x};"
+        elif op == M.SAHF and x87_depth is not None:
+            # CF, PF and ZF from bits 0, 2 and 6 of AH; SF and AF are not modelled.
+            stmt = ("{ const uint8_t h = static_cast<uint8_t>(rax >> 8); carry = (h & 1) != 0; zero = (h & 0x40) != 0;"
+                    + (" parity = (h & 4) != 0;" if parity else "") + " }")
         elif op in (M.LOOP, M.LOOPE, M.LOOPNE, M.JRCXZ, M.JECXZ):
             # RCX-counted branches. A 67h prefix selects ECX (loopd, jecxz). None of them changes a flag;
             # LOOPE and LOOPNE test ZF after the decrement.
@@ -268,6 +282,9 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
             stmt = (f"{{ const {width} a = {operand(0)}, b = static_cast<{width}>({operand(1)}), "
                     f"d = static_cast<{width}>(a - b); "
                     f"zero = a == b; carry = a < b; overflow = (((a ^ b) & (a ^ d)) >> {8 * size - 1}) != 0; }}")
+        elif op == M.TEST and parity and x87_lower.assigns_parity(i):
+            stmt = (f"{{ const uint8_t v = static_cast<uint8_t>({operand(0)} & {operand(1)}); zero = v == 0; "
+                    f"carry = false; overflow = false; {x87_lower.parity_statement('v')} }}")
         elif op == M.TEST:
             stmt = f"zero = (({operand(0)} & {operand(1)}) == 0); carry = false; overflow = false;"
         elif op == M.IMUL and i.op_count in (2, 3) and RegisterExt.size(i.op0_register) == 4:
@@ -345,6 +362,8 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                 M.AND: "carry = false; overflow = false;",
                 M.OR: "carry = false; overflow = false;",
             }[op]
+            if op == M.AND and parity and x87_lower.assigns_parity(i):
+                update += " " + x87_lower.parity_statement("v")
             stmt = (f"{{ const {width} a = {operand(0)}, b = static_cast<{width}>({rhs}); "
                     f"const {width} v = static_cast<{width}>({expr}); {update} zero = v == 0; {write('v')} }}")
         elif op in (M.ADCX, M.ADOX) and RegisterExt.size(i.op0_register) in (4, 8):
@@ -719,7 +738,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                 raise ValueError(f"unbound fallthrough at {i.ip:#x}")
             lines.append(f"goto block_{i.next_ip:x};")
     if x87_depth is not None:
-        lines.insert(3, x87_lower.DECLARATION if checked is None else x87_lower.CHECKED_DECLARATION)
+        lines.insert(3, x87_lower.declaration(body, checked))
     lines.extend(f"block_{target:x}: {statement}" for target, statement in exits.items())
     return "\n".join("    " + line for line in lines)
 
