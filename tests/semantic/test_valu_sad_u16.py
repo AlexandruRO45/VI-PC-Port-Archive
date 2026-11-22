@@ -29,7 +29,7 @@ Mathematical Properties and Bounds:
     v_sad_u16(src0, src1, src2) == v_sad_u16(src1, src0, src2).
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import List, Optional, Tuple, Union
 import unittest
@@ -174,6 +174,46 @@ class VSadU16Instruction:
             f"v_sad_u16 {self.dst.disassemble()}, "
             f"{self.src0.disassemble()}, {self.src1.disassemble()}, {self.src2.disassemble()}"
         )
+
+
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarState:
+    """Architectural register state for single-thread scalar emulation."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+
+    def read_operand(self, op: Operand) -> int:
+        """Resolve operand value from architectural state or inline constant."""
+        if op.reg_type == RegType.VGPR:
+            return self.vgprs[op.index] & MASK32
+        if op.reg_type == RegType.SGPR:
+            return self.sgprs[op.index] & MASK32
+        assert op.literal_value is not None
+        return op.literal_value & MASK32
+
+    def write_vgpr(self, index: int, value: int) -> None:
+        """Write 32-bit dword to destination VGPR."""
+        if not (0 <= index <= 255):
+            raise ValueError(f"VGPR index {index} out of range [0, 255]")
+        self.vgprs[index] = value & MASK32
+
+
+class ScalarInterpreter:
+    """Deterministic scalar interpreter executing v_sad_u16 instructions."""
+
+    def step(self, instr: VSadU16Instruction, state: ScalarState) -> int:
+        """Execute a single v_sad_u16 instruction against architectural scalar state."""
+        s0 = state.read_operand(instr.src0)
+        s1 = state.read_operand(instr.src1)
+        s2 = state.read_operand(instr.src2)
+
+        res = ref_sad_u16(s0, s1, s2)
+        state.write_vgpr(instr.dst.index, res)
+        return res
 
 
 # ==============================================================================
@@ -352,6 +392,104 @@ class TestVSadU16SymbolicAST(unittest.TestCase):
         instr2 = VSadU16Instruction(Operand.vgpr(1), Operand.vgpr(2), Operand.vgpr(3), Operand.vgpr(4))
         self.assertEqual(instr1, instr2)
         self.assertEqual(hash(instr1), hash(instr2))
+
+
+# ==============================================================================
+# Unit Tests: Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class TestVSadU16ScalarInterpreter(unittest.TestCase):
+    """Test suite verifying single-thread deterministic scalar interpreter execution."""
+
+    def setUp(self) -> None:
+        self.state = ScalarState()
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_interp_basic_execution(self) -> None:
+        """Execute basic v_sad_u16 instruction updating state.vgprs[dst]."""
+        self.state.vgprs[1] = pack_halfwords_u32(100, 200)
+        self.state.vgprs[2] = pack_halfwords_u32(0, 0)
+        self.state.sgprs[0] = 0x1000
+
+        instr = VSadU16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.sgpr(0),
+        )
+
+        res = self.interp.step(instr, self.state)
+        # diff = 100 + 200 = 300 -> + 0x1000 = 0x112C
+        self.assertEqual(res, 0x1000 + 300)
+        self.assertEqual(self.state.vgprs[0], 0x1000 + 300)
+
+    def test_scalar_interp_multi_step_sequence(self) -> None:
+        """Sequential chained execution with accumulation."""
+        self.state.vgprs[1] = pack_halfwords_u32(50, 50)
+        self.state.vgprs[2] = pack_halfwords_u32(0, 0)
+        self.state.vgprs[0] = 0
+
+        # Step 1: v0 = v_sad_u16(v1, v2, 0) -> diff = 100
+        instr1 = VSadU16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.literal(0),
+        )
+        self.interp.step(instr1, self.state)
+        self.assertEqual(self.state.vgprs[0], 100)
+
+        # Step 2: v0 = v_sad_u16(v1, v2, v0) -> adds another 100 -> 200
+        instr2 = VSadU16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(0),
+        )
+        self.interp.step(instr2, self.state)
+        self.assertEqual(self.state.vgprs[0], 200)
+
+    def test_scalar_interp_operand_types(self) -> None:
+        """Execution with combinations of VGPR, SGPR, and Literal operands."""
+        self.state.vgprs[3] = 0xFFFFFFFF
+        self.state.sgprs[5] = 0x00000000
+        literal_val = 0x00005555
+
+        instr = VSadU16Instruction(
+            dst=Operand.vgpr(10),
+            src0=Operand.vgpr(3),
+            src1=Operand.sgpr(5),
+            src2=Operand.literal(literal_val),
+        )
+        res = self.interp.step(instr, self.state)
+        # sum_diff = 131070 (0x1FFFE) -> + 0x5555 = 0x25553
+        expected = 131070 + literal_val
+        self.assertEqual(res, expected)
+        self.assertEqual(self.state.vgprs[10], expected)
+
+    def test_scalar_interp_matches_oracle(self) -> None:
+        """Check scalar interpreter against reference oracle across test vectors."""
+        test_vectors = [
+            (0x00000000, 0x00000000, 0x00000000),
+            (0xFFFFFFFF, 0x00000000, 0x00000000),
+            (0x12345678, 0x87654321, 0x00010000),
+            (0x55555555, 0xAAAAAAAA, 0xFFFFFFFF),
+            (0xFFFFFFFF, 0xFFFFFFFF, 0x12345678),
+        ]
+        for s0, s1, s2 in test_vectors:
+            self.state.vgprs[1] = s0
+            self.state.vgprs[2] = s1
+            self.state.vgprs[3] = s2
+            instr = VSadU16Instruction(
+                dst=Operand.vgpr(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.vgpr(3),
+            )
+            res = self.interp.step(instr, self.state)
+            expected = ref_sad_u16(s0, s1, s2)
+            self.assertEqual(res, expected)
+            self.assertEqual(self.state.vgprs[0], expected)
 
 
 if __name__ == "__main__":
