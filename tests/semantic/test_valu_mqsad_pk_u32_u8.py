@@ -464,6 +464,48 @@ class SIMDInterpreter:
 
 
 # ==============================================================================
+# Condition Codes, Status Flags, and Carry Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class MqsadStatusFlags:
+    """Architectural condition codes and status flags for v_mqsad_pk_u32_u8."""
+    element_zeros: Tuple[bool, bool, bool, bool]
+    all_zero: bool
+    any_zero: bool
+    element_carries: Tuple[bool, bool, bool, bool]
+    any_carry: bool
+    all_carry: bool
+    element_sad_zeros: Tuple[bool, bool, bool, bool]
+    all_sad_zero: bool
+    element_clamped: Tuple[bool, bool, bool, bool]
+    any_clamped: bool
+
+
+def evaluate_mqsad_flags(src0: int, src1: int, src2: int, clamp: bool, res: int) -> MqsadStatusFlags:
+    """Evaluate architectural condition codes and status flags for v_mqsad_pk_u32_u8."""
+    sads, raw_sums, carries, _ = ref_mqsad_pk_u32_u8_details(src0, src1, src2, clamp=clamp)
+    res_elems = unpack_u32x4(res)
+
+    elem_zeros = tuple(e == 0 for e in res_elems)
+    sad_zeros = tuple(s == 0 for s in sads)
+    clamped = tuple(clamp and (raw > MASK32) for raw in raw_sums)
+
+    return MqsadStatusFlags(
+        element_zeros=(elem_zeros[0], elem_zeros[1], elem_zeros[2], elem_zeros[3]),
+        all_zero=all(elem_zeros),
+        any_zero=any(elem_zeros),
+        element_carries=carries,
+        any_carry=any(carries),
+        all_carry=all(carries),
+        element_sad_zeros=(sad_zeros[0], sad_zeros[1], sad_zeros[2], sad_zeros[3]),
+        all_sad_zero=all(sad_zeros),
+        element_clamped=(clamped[0], clamped[1], clamped[2], clamped[3]),
+        any_clamped=any(clamped),
+    )
+
+
+# ==============================================================================
 # Unit Tests: Model and Reference Oracle
 # ==============================================================================
 
@@ -1079,6 +1121,77 @@ class TestValuMqsadPkU32U8RegisterAliasing(unittest.TestCase):
             else:
                 original = pack_u32x4(lane, lane, lane, lane)
                 self.assertEqual(val, original)
+
+
+class TestValuMqsadPkU32U8StatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry generation."""
+
+    def test_all_zero_flag(self) -> None:
+        res = ref_mqsad_pk_u32_u8(0, 0, 0)
+        flags = evaluate_mqsad_flags(0, 0, 0, clamp=False, res=res)
+        self.assertTrue(flags.all_zero)
+        self.assertTrue(flags.any_zero)
+        self.assertEqual(flags.element_zeros, (True, True, True, True))
+        self.assertTrue(flags.all_sad_zero)
+        self.assertFalse(flags.any_carry)
+        self.assertFalse(flags.any_clamped)
+
+    def test_individual_element_zero_flags(self) -> None:
+        ref = pack_u8x8(1, 2, 3, 4, 10, 20, 30, 40)
+        query = pack_u8x8(1, 2, 3, 4, 0, 0, 0, 0) & MASK32
+        acc = pack_u32x4(0, 5, 10, 15)
+
+        res = ref_mqsad_pk_u32_u8(ref, query, acc)
+        flags = evaluate_mqsad_flags(ref, query, acc, clamp=False, res=res)
+        self.assertFalse(flags.all_zero)
+        self.assertTrue(flags.any_zero)
+        self.assertEqual(flags.element_zeros, (True, False, False, False))
+
+    def test_single_and_multiple_carry_generation(self) -> None:
+        ref = pack_u8x8(0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF)
+        query = 0x01010101  # SAD = 1016
+        # Element 1 has accumulator 0xFFFFFFFF -> carry!
+        acc = pack_u32x4(0, 0xFFFF_FFFF, 10, 20)
+
+        res = ref_mqsad_pk_u32_u8(ref, query, acc, clamp=False)
+        flags = evaluate_mqsad_flags(ref, query, acc, clamp=False, res=res)
+        self.assertEqual(flags.element_carries, (False, True, False, False))
+        self.assertTrue(flags.any_carry)
+        self.assertFalse(flags.all_carry)
+
+        # All carries: accumulator 0xFFFFFFFF across all elements
+        acc_all = pack_u32x4(0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF)
+        res_all = ref_mqsad_pk_u32_u8(ref, query, acc_all, clamp=False)
+        flags_all = evaluate_mqsad_flags(ref, query, acc_all, clamp=False, res=res_all)
+        self.assertEqual(flags_all.element_carries, (True, True, True, True))
+        self.assertTrue(flags_all.all_carry)
+
+    def test_sad_zero_detection(self) -> None:
+        ref = pack_u8x8(1, 2, 3, 4, 1, 2, 3, 4)
+        query = pack_u8x8(1, 2, 3, 4, 0, 0, 0, 0) & MASK32
+        acc = pack_u32x4(10, 20, 30, 40)
+
+        res = ref_mqsad_pk_u32_u8(ref, query, acc)
+        flags = evaluate_mqsad_flags(ref, query, acc, clamp=False, res=res)
+        self.assertEqual(flags.element_sad_zeros, (True, False, False, False))
+        self.assertFalse(flags.all_sad_zero)
+
+    def test_clamped_flag_evaluation(self) -> None:
+        ref = pack_u8x8(0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF)
+        query = 0x01010101  # SAD = 1016
+        acc = pack_u32x4(0xFFFF_FFFF, 0x00000000, 0xFFFF_FFFF, 0x00000000)
+
+        # With clamp=True
+        res_clamped = ref_mqsad_pk_u32_u8(ref, query, acc, clamp=True)
+        flags_clamped = evaluate_mqsad_flags(ref, query, acc, clamp=True, res=res_clamped)
+        self.assertEqual(flags_clamped.element_clamped, (True, False, True, False))
+        self.assertTrue(flags_clamped.any_clamped)
+
+        # With clamp=False
+        res_unclamped = ref_mqsad_pk_u32_u8(ref, query, acc, clamp=False)
+        flags_unclamped = evaluate_mqsad_flags(ref, query, acc, clamp=False, res=res_unclamped)
+        self.assertEqual(flags_unclamped.element_clamped, (False, False, False, False))
+        self.assertFalse(flags_unclamped.any_clamped)
 
 
 if __name__ == "__main__":
