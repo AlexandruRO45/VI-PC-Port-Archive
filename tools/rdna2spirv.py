@@ -1214,7 +1214,11 @@ class Gen:
     # The names list the widths from the top bit down, so 2_10_10_10 (50) is R10G10B10A2.
     FORMATS = {22: (4, "f32", (32,)), 64: (8, "f32", (32, 32)), 74: (12, "f32", (32, 32, 32)),
                77: (16, "f32", (32, 32, 32, 32)), 20: (4, "u32", (32,)), 62: (8, "u32", (32, 32)),
-               75: (16, "u32", (32, 32, 32, 32)), 13: (2, "f16", (16,)), 29: (4, "f16", (16, 16)),
+               75: (16, "u32", (32, 32, 32, 32)),
+               # 32-bit SINT next to the UINT codes (SHADER-257): same dword pass-through as u32.
+               21: (4, "s32", (32,)), 63: (8, "s32", (32, 32)), 73: (12, "s32", (32, 32, 32)),
+               76: (16, "s32", (32, 32, 32, 32)),
+               13: (2, "f16", (16,)), 29: (4, "f16", (16, 16)),
                71: (8, "f16", (16, 16, 16, 16)), 1: (1, "unorm", (8,)), 14: (2, "unorm", (8, 8)),
                56: (4, "unorm", (8, 8, 8, 8)), 57: (4, "snorm", (8, 8, 8, 8)), 60: (4, "uint", (8, 8, 8, 8)),
                7: (2, "unorm", (16,)), 23: (4, "unorm", (16, 16)), 24: (4, "snorm", (16, 16)),
@@ -1232,7 +1236,7 @@ class Gen:
             raise Unsupported(f"format {code} (not in FORMATS)")
         if kind == "f32":
             return list(fcomps[:len(widths)])
-        if kind == "u32":
+        if kind in ("u32", "s32"):
             return list(icomps[:len(widths)])
         words = [self.cu(0)] * max(1, (size + 3) // 4)
         bit = 0
@@ -1330,7 +1334,7 @@ class Gen:
             size, kind, widths = self.FORMATS[code]
         except KeyError:
             raise Unsupported(f"format {code} (not in FORMATS)")
-        if kind in ("f32", "u32"):
+        if kind in ("f32", "u32", "s32"):
             n = len(widths)
             vals = list(words[:n])
             while len(vals) < 4:
@@ -1588,7 +1592,7 @@ class Gen:
         # DST_SEL swizzle: 0 -> 0, 1 -> 1.0 (float/norm) or integer 1 (UINT/SINT; SHADER-86), 4..7 -> X..W.
         is_int_fmt = "%false"
         for code_v, (_, kind, _) in self.FORMATS.items():
-            if kind in ("u32", "uint"):
+            if kind in ("u32", "s32", "uint"):
                 e, o = self.tmp(), self.tmp()
                 self.emit(f"{e} = OpIEqual %bool {fmt} {self.cu(code_v)}")
                 self.emit(f"{o} = OpLogicalOr %bool {is_int_fmt} {e}")
@@ -1613,10 +1617,10 @@ class Gen:
                 self.dst({"k": "vgpr", "r": vd["r"] + c, "n": 1}, rb)
         if d16:
             # d16: two 16-bit results per register (x | y << 16, z | w << 16): f16 for float/normalized formats,
-            # saturating unsigned conversion for integer formats (FORMATS kinds u32/uint).
+            # saturating unsigned conversion for integer formats (FORMATS kinds u32/s32/uint).
             is_int = "%false"
             for code_v, (_, kind, _) in self.FORMATS.items():
-                if kind in ("u32", "uint"):
+                if kind in ("u32", "s32", "uint"):
                     e, o = self.tmp(), self.tmp()
                     self.emit(f"{e} = OpIEqual %bool {fmt} {self.cu(code_v)}")
                     self.emit(f"{o} = OpLogicalOr %bool {is_int} {e}")

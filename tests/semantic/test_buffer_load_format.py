@@ -32,6 +32,7 @@ BASE = 0x1000
 MEMORY = {BASE: 0x11223344, BASE + 4: 0xDEADBEEF, BASE + 8: 0xCAFEF00D, BASE + 12: 0x0BADC0DE}
 # V# FORMAT codes (word3 bits 12-18), from rdna2spirv.FORMATS
 FMT_U32, FMT_U32X2, FMT_U32X4, FMT_UINT8X4, FMT_UINT16X2, FMT_UINT16X4, FMT_F16 = 20, 62, 75, 60, 27, 69, 13
+FMT_S32, FMT_S32X2, FMT_S32X3, FMT_S32X4 = 21, 63, 73, 76
 FMT_F32, FMT_F32X2, FMT_F32X3, FMT_UNORM8, FMT_UNORM8X4 = 22, 64, 74, 1, 56
 DST_SEL_XYZW = 4 | 5 << 3 | 6 << 6 | 7 << 9
 # DST_SEL (X, 0, 1, 1): code 4, 0, 1, 1 — SHADER-86 measures float 1.0 vs integer 1
@@ -108,6 +109,18 @@ class DwordAlignedElements(unittest.TestCase):
     def test_u32x2_and_x4(self):
         self.assertEqual(load_format(FMT_U32X2, 4, 2)[:2], (0xDEADBEEF, 0xCAFEF00D))
         self.assertEqual(load_format(FMT_U32X4, 0), (0x11223344, 0xDEADBEEF, 0xCAFEF00D, 0x0BADC0DE))
+
+    def test_s32_variants(self):
+        """SHADER-257: 32-bit SINT formats pass the dword bits through like UINT (BetterJdue RX 6700)."""
+        # Negative-looking bit pattern: 0xDEADBEEF as signed is still that dword in the VGPR.
+        self.assertEqual(load_format(FMT_S32, 4, 1)[0], 0xDEADBEEF)
+        self.assertEqual(load_format(FMT_S32X2, 4, 2)[:2], (0xDEADBEEF, 0xCAFEF00D))
+        self.assertEqual(load_format(FMT_S32X3, 0, 3)[:3], (0x11223344, 0xDEADBEEF, 0xCAFEF00D))
+        self.assertEqual(load_format(FMT_S32X4, 0), (0x11223344, 0xDEADBEEF, 0xCAFEF00D, 0x0BADC0DE))
+        # Missing channels repeat; DST_SEL 1 is integer 1 (SHADER-86 on SINT).
+        self.assertEqual(load_format(FMT_S32, 4), (0xDEADBEEF,) * 4)
+        self.assertEqual(load_format(FMT_S32, 4, dst_sel=DST_SEL_X_0_1_1),
+                         (0xDEADBEEF, 0, 1, 1))
 
     def test_uint8x4(self):
         self.assertEqual(load_format(FMT_UINT8X4, 4), (0xEF, 0xBE, 0xAD, 0xDE))
