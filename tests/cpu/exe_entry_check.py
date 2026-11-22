@@ -1,15 +1,18 @@
 """Compare complete Windows processes, including a translated inverted branch."""
+from functools import partial
 from pathlib import Path
 import struct
-import subprocess
 import sys
 from tempfile import TemporaryDirectory
 from typing import NamedTuple
 
 import pefile
+from exe_process import launch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
-from cpu_exe_aot import translate
+from cpu_exe_aot import translate as translate_exe
+
+translate = partial(translate_exe, entry_export="native_entry")
 
 
 class Observation(NamedTuple):
@@ -18,9 +21,14 @@ class Observation(NamedTuple):
     exit_code: int
 
 
+def observation(row):
+    if not row["process_signaled"] or not all(row[name]["eof"] for name in ("stdout", "stderr")):
+        raise AssertionError(f"expected process signal and both EOFs: {row}")
+    return Observation(row["stderr"]["bytes"], row["stdout"]["bytes"], row["code"])
+
+
 def run(executable, selector):
-    child = subprocess.run([executable], input=selector, capture_output=True, timeout=15)
-    return Observation(child.stderr, child.stdout, child.returncode)
+    return observation(launch([executable], selector))
 
 
 def check(label, actual, expected):
@@ -28,18 +36,25 @@ def check(label, actual, expected):
         raise AssertionError(f"{label}: expected {expected!r}, got {actual!r}")
 
 
-def compare(native, lifted, inverted_native, inverted_lifted):
+def compare(native, lifted, inverted_native, inverted_lifted, *, targets=False):
     references = [
         Observation(struct.pack("<QQ", 0x100000303, 0xfffffffd), bytes.fromhex("1103000000000000"), 0x60d),
         Observation(struct.pack("<QQ", 48, 6), bytes.fromhex("3500000000000000"), 0x57),
     ]
+    control = list(reversed(references))
+    if targets:
+        control = [
+            Observation(struct.pack("<QQ", 0x100000305, 0xfffffffd), struct.pack("<Q", 0x313), 0x60f),
+            references[1],
+        ]
+        references[1] = Observation(struct.pack("<QQ", 50, 6), struct.pack("<Q", 55), 0x69)
     for selector, expected in enumerate(references):
         data = bytes([selector])
         original = run(native, data)
         check(f"native selector {selector}", original, expected)
         check(f"AOT selector {selector}", run(lifted, data), original)
         inverted = run(inverted_native, data)
-        check("inverted native", inverted, references[1 - selector])
+        check("inverted native", inverted, control[selector])
         check("inverted AOT", run(inverted_lifted, data), inverted)
         for field in Observation._fields:
             if getattr(original, field) == getattr(inverted, field):
@@ -88,6 +103,9 @@ def check_header_guards(native, io_provider, mix_provider):
 
 
 if __name__ == "__main__":
-    compare(*sys.argv[1:5])
-    if len(sys.argv) > 5:
-        check_header_guards(sys.argv[1], sys.argv[5], sys.argv[6])
+    if sys.argv[1] == "--targets":
+        compare(*sys.argv[2:], targets=True)
+    else:
+        compare(*sys.argv[1:5])
+        if len(sys.argv) > 5:
+            check_header_guards(sys.argv[1], sys.argv[5], sys.argv[6])
