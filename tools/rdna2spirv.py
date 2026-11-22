@@ -2913,12 +2913,8 @@ class Gen:
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
 
-    def cmp_class(self, a, exec_only=False):
-        """Test x's class against the mask and write the result to VCC/SGPR or EXEC.
-        Bits: 0 sNaN, 1 qNaN, 2 -inf, 3 -normal, 4 -denormal, 5 -0, 6 +0, 7 +denormal, 8 +normal, 9 +inf."""
-        src, mask = a[-2], self.src_u(a[-1])
-        # Apply abs/neg as raw sign-bit moves on uint bits: RDNA2 (gfx1036, wave32/64, IEEE=0/1, denorm keep/flush)
-        # never quiets an sNaN or flushes a denormal on v_cmp(x)_class_f32, whereas SPIR-V FAbs/OpFNegate may quiet.
+    def f32_source_bits(self, src: dict) -> str:
+        """Apply f32 abs/neg on raw bits so a signalling NaN keeps its payload and quiet bit."""
         u = self.src_u({k: v for k, v in src.items() if k not in ("abs", "neg")})
         if src.get("abs"):
             g = self.tmp()
@@ -2928,6 +2924,13 @@ class Gen:
             g = self.tmp()
             self.emit(f"{g} = OpBitwiseXor %uint {u} {self.cu(0x80000000)}")
             u = g
+        return u
+
+    def cmp_class(self, a, exec_only=False):
+        """Test x's class against the mask and write the result to VCC/SGPR or EXEC.
+        Bits: 0 sNaN, 1 qNaN, 2 -inf, 3 -normal, 4 -denormal, 5 -0, 6 +0, 7 +denormal, 8 +normal, 9 +inf."""
+        mask = self.src_u(a[-1])
+        u = self.f32_source_bits(a[-2])
         sign, absu = self.tmp(), self.tmp()
         self.emit(f"{sign} = OpShiftRightLogical %uint {u} {self.cu(31)}")
         self.emit(f"{absu} = OpBitwiseAnd %uint {u} {self.cu(0x7FFFFFFF)}")
@@ -4010,6 +4013,47 @@ class Gen:
             self.emit(f"{g} = OpExtInst %float %glsl FClamp {v} %f0 %f1")
             return g
         return v
+
+    def mullit_f32(self, args: list[dict], mods: list[str]) -> None:
+        """Lighting multiply in the inferred MODE (f32 RN, flush denormals, IEEE off)."""
+        if mods:
+            raise Unsupported("v_mullit_f32 output modifiers")
+        words = [self.f32_source_bits(a) for a in args[1:]]
+        x, y, gate = (self.tof(w) for w in words)
+        lowest = self.cu(0xFF7FFFFF)
+        gate_on, y_valid, lit = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{gate_on} = OpFOrdGreaterThanEqual %bool {gate} {self.fconst(2.0 ** -126)}")
+        self.emit(f"{y_valid} = OpFOrdGreaterThan %bool {y} {self.tof(lowest)}")
+        self.emit(f"{lit} = OpLogicalAnd %bool {gate_on} {y_valid}")
+
+        # RDNA2 tests tininess after rounding at 24-bit precision with an unbounded exponent.
+        # Scaling the product first distinguishes a value just below the normal range that rounds up.
+        product, scaled_x, scaled, magnitude = (self.tmp() for _ in range(4))
+        self.emit(f"{product} = OpFMul %float {x} {y}")
+        self.emit(f"{scaled_x} = OpFMul %float {x} {self.fconst(2.0 ** 64)}")
+        self.emit(f"{scaled} = OpFMul %float {scaled_x} {y}")
+        self.emit(f"{magnitude} = OpExtInst %float %glsl FAbs {scaled}")
+        threshold = self.fconst(2.0 ** -62)
+        tiny, boundary, signs, minimum, normal, flushed = (self.tmp() for _ in range(6))
+        self.emit(f"{tiny} = OpFOrdLessThan %bool {magnitude} {threshold}")
+        self.emit(f"{boundary} = OpFOrdEqual %bool {magnitude} {threshold}")
+        self.emit(f"{signs} = OpBitwiseXor %uint {words[0]} {words[1]}")
+        sign = self.emit_and(signs, 0x80000000)
+        self.emit(f"{minimum} = OpBitwiseOr %uint {sign} {self.cu(0x00800000)}")
+        self.emit(f"{normal} = OpSelect %uint {boundary} {minimum} {self.tou(product)}")
+        self.emit(f"{flushed} = OpSelect %uint {tiny} {sign} {normal}")
+
+        # A zero (including a flushed source) wins over an S0 NaN. An invalid lighting input wins over both.
+        ax, ay = (self.emit_and(w, 0x7FFFFFFF) for w in words[:2])
+        zx, zy, zero, nan_x, value, legacy, result = (self.tmp() for _ in range(7))
+        self.emit(f"{zx} = OpULessThan %bool {ax} {self.cu(0x00800000)}")
+        self.emit(f"{zy} = OpULessThan %bool {ay} {self.cu(0x00800000)}")
+        self.emit(f"{zero} = OpLogicalOr %bool {zx} {zy}")
+        self.emit(f"{nan_x} = OpUGreaterThan %bool {ax} {self.cu(0x7F800000)}")
+        self.emit(f"{value} = OpSelect %uint {nan_x} {words[0]} {flushed}")
+        self.emit(f"{legacy} = OpSelect %uint {zero} {self.cu(0)} {value}")
+        self.emit(f"{result} = OpSelect %uint {lit} {legacy} {lowest}")
+        self.dst(args[0], result)
 
     def flush_f32(self, f):
         """v_mad_f32, v_mac_f32 and v_mad_legacy_f32 have no f32 denormal support: a subnormal operand or result
@@ -6503,6 +6547,8 @@ class Gen:
                 self.emit(f"{cm} = OpLogicalAnd %bool {carry_nz} {self.active_b()}")  # inactive lanes write 0
                 self.emit(f"{m} = OpSelect %uint {cm} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
                 self.mask_dst(cd, m)
+        elif op == "v_mullit_f32":
+            self.mullit_f32(a, mods)
         elif op == "v_mul_legacy_f32":
             # Legacy multiply treats 0 * anything (inf/NaN included) as 0.
             x, y = self.src_f(a[1]), self.src_f(a[2])
