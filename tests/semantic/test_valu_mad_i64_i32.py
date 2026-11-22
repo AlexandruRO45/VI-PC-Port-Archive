@@ -950,5 +950,150 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
             self.assertEqual(state.vgprs[lane][1], 0x2222_2222)
 
 
+# ==============================================================================
+# Unit Tests: Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
+    """Register aliasing, overlapping destination/source, and immutability tests."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_inplace_accumulator_aliasing_dst_equals_src2(self) -> None:
+        state = ScalarState()
+        state.rf.write_vgpr_64(0, 500)
+        state.rf.write_vgpr(4, 50)
+        state.rf.write_vgpr(5, 20)
+
+        instr = VMadI64I32Instruction(
+            dst=Operand.vgpr(0, is_64bit=True),
+            sdst=Operand.sgpr(2, is_64bit=True),
+            src0=Operand.vgpr(4),
+            src1=Operand.vgpr(5),
+            src2=Operand.vgpr(0, is_64bit=True),
+        )
+
+        dst, carry = self.scalar_interp.step(instr, state)
+        self.assertEqual(dst, 1500)
+        self.assertEqual(carry, 0)
+        self.assertEqual(state.rf.read_vgpr_64(0), 1500)
+        self.assertEqual(state.rf.read_vgpr(4), 50)
+        self.assertEqual(state.rf.read_vgpr(5), 20)
+
+    def test_low_word_destination_aliasing_dst_lo_equals_src0(self) -> None:
+        state = ScalarState()
+        state.rf.write_vgpr(0, 25)
+        state.rf.write_vgpr(1, 0xAAAA_BBBB)
+
+        instr = VMadI64I32Instruction(
+            dst=Operand.vgpr(0, is_64bit=True),
+            sdst=Operand.sgpr(0, is_64bit=False),
+            src0=Operand.vgpr(0),
+            src1=Operand.literal(10),
+            src2=Operand.literal(1000, is_64bit=True),
+        )
+
+        dst, carry = self.scalar_interp.step(instr, state)
+        self.assertEqual(dst, 1250)
+        self.assertEqual(carry, 0)
+        self.assertEqual(state.rf.read_vgpr(0), 1250)
+        self.assertEqual(state.rf.read_vgpr(1), 0)
+
+    def test_high_word_destination_aliasing_dst_hi_equals_src1(self) -> None:
+        state = ScalarState()
+        state.rf.write_vgpr(0, 0x1111_2222)
+        state.rf.write_vgpr(1, 7)
+
+        instr = VMadI64I32Instruction(
+            dst=Operand.vgpr(0, is_64bit=True),
+            sdst=Operand.sgpr(0, is_64bit=False),
+            src0=Operand.literal(100),
+            src1=Operand.vgpr(1),
+            src2=Operand.literal(500, is_64bit=True),
+        )
+
+        dst, carry = self.scalar_interp.step(instr, state)
+        self.assertEqual(dst, 1200)
+        self.assertEqual(carry, 0)
+        self.assertEqual(state.rf.read_vgpr(0), 1200)
+        self.assertEqual(state.rf.read_vgpr(1), 0)
+
+    def test_total_overlap_all_operands_in_dst_pair(self) -> None:
+        state = ScalarState()
+        v0_initial = 3
+        v1_initial = to_u32(-4)
+        state.rf.write_vgpr(0, v0_initial)
+        state.rf.write_vgpr(1, v1_initial)
+
+        s2_expected = combine_u32(v0_initial, v1_initial)
+        expected_dst, expected_carry = ref_mad_i64_i32(3, -4, s2_expected)
+
+        instr = VMadI64I32Instruction(
+            dst=Operand.vgpr(0, is_64bit=True),
+            sdst=Operand.sgpr(10, is_64bit=False),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(0, is_64bit=True),
+        )
+
+        dst, carry = self.scalar_interp.step(instr, state)
+        self.assertEqual(dst, expected_dst)
+        self.assertEqual(carry, expected_carry)
+        self.assertEqual(state.rf.read_vgpr_64(0), expected_dst)
+
+    def test_unaliased_operands_immutability(self) -> None:
+        state = ScalarState()
+        state.rf.write_vgpr(10, 123)
+        state.rf.write_vgpr(11, 456)
+        state.rf.write_vgpr_64(12, 0xCAFE_BABE_DEAD_BEEF)
+        state.rf.write_sgpr(50, 0x1337_C0DE)
+
+        instr = VMadI64I32Instruction(
+            dst=Operand.vgpr(20, is_64bit=True),
+            sdst=Operand.sgpr(2, is_64bit=True),
+            src0=Operand.vgpr(10),
+            src1=Operand.vgpr(11),
+            src2=Operand.vgpr(12, is_64bit=True),
+        )
+
+        self.scalar_interp.step(instr, state)
+        self.assertEqual(state.rf.read_vgpr(10), 123)
+        self.assertEqual(state.rf.read_vgpr(11), 456)
+        self.assertEqual(state.rf.read_vgpr_64(12), 0xCAFE_BABE_DEAD_BEEF)
+        self.assertEqual(state.rf.read_sgpr(50), 0x1337_C0DE)
+
+    def test_simd_inplace_multi_iteration_accumulation(self) -> None:
+        state = SIMDState(wave_mode=WaveMode.WAVE32, exec_mask=0x00FF_00FF)
+        sentinel = 0x8888_7777_6666_5555
+        for lane in range(32):
+            if bool(state.exec_mask & (1 << lane)):
+                state.write_lane_64(Operand.vgpr(0, is_64bit=True), lane, 0)
+                state.vgprs[lane][2] = lane
+                state.vgprs[lane][3] = 10
+            else:
+                state.write_lane_64(Operand.vgpr(0, is_64bit=True), lane, sentinel)
+
+        instr = VMadI64I32Instruction(
+            dst=Operand.vgpr(0, is_64bit=True),
+            sdst=Operand.sgpr(0, is_64bit=False),
+            src0=Operand.vgpr(2),
+            src1=Operand.vgpr(3),
+            src2=Operand.vgpr(0, is_64bit=True),
+        )
+
+        for it in range(1, 4):
+            self.simd_interp.step(instr, state)
+            for lane in range(32):
+                if bool(state.exec_mask & (1 << lane)):
+                    expected = (lane * 10) * it
+                    actual = combine_u32(state.vgprs[lane][0], state.vgprs[lane][1])
+                    self.assertEqual(actual, expected)
+                else:
+                    actual = combine_u32(state.vgprs[lane][0], state.vgprs[lane][1])
+                    self.assertEqual(actual, sentinel)
+
+
 if __name__ == "__main__":
     unittest.main()
