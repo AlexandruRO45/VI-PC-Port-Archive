@@ -407,6 +407,127 @@ class TestSymbolicASTAndTypedExpressions(unittest.TestCase):
                 parsed = DSCondXchg32F32Instruction.parse(asm)
                 self.assertEqual(inst, parsed)
 
+class ScalarRegisterFile:
+    """Architectural register file for a single wavefront lane (256 32-bit VGPRs)."""
+
+    def __init__(self) -> None:
+        self.regs: List[int] = [0] * 256
+
+    def get(self, reg: VGPR) -> int:
+        """Read 32-bit VGPR value."""
+        return self.regs[reg.index] & MASK32
+
+    def set(self, reg: VGPR, val: int) -> None:
+        """Write 32-bit VGPR value."""
+        self.regs[reg.index] = val & MASK32
+
+
+class ScalarThreadState:
+    """Execution state of a single scalar thread executing LDS instructions."""
+
+    def __init__(self, lds: Optional[LDSMemory] = None) -> None:
+        self.rf: ScalarRegisterFile = ScalarRegisterFile()
+        self.lds: LDSMemory = lds if lds is not None else LDSMemory()
+
+    def get_vgpr(self, reg: VGPR) -> int:
+        return self.rf.get(reg)
+
+    def set_vgpr(self, reg: VGPR, val: int) -> None:
+        self.rf.set(reg, val)
+
+
+class ScalarDSInterpreter:
+    """Deterministic scalar instruction interpreter for non-returning RDNA2 DS conditional exchange f32."""
+
+    def execute(self, state: ScalarThreadState, inst: DSCondXchg32F32Instruction) -> bool:
+        """Execute a single non-returning DS conditional exchange f32 instruction."""
+        addr = state.get_vgpr(inst.vaddr)
+        cmp_val = state.get_vgpr(inst.vdata0)
+        new_val = state.get_vgpr(inst.vdata1)
+
+        old_val, new_mem, exchanged = state.lds.atomic_condxchg32_f32(
+            addr, cmp_val, new_val, offset=inst.offset.value
+        )
+        return exchanged
+
+
+class TestDeterministicScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction execution of ds_condxchg32_f32."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(65536)
+        self.state = ScalarThreadState(lds=self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_scalar_exchange_success_on_match(self) -> None:
+        self.lds.write_dword(5, ONE_RAW)
+        self.state.set_vgpr(VGPR(1), 20)      # dword 5
+        self.state.set_vgpr(VGPR(2), ONE_RAW)  # cmp_val = 1.0f
+        self.state.set_vgpr(VGPR(3), TWO_RAW)  # new_val = 2.0f
+
+        inst = DSCondXchg32F32Instruction(
+            DSOpcode.DS_CONDXCHG32_F32,
+            vaddr=VGPR(1),
+            vdata0=VGPR(2),
+            vdata1=VGPR(3),
+        )
+        swapped = self.interp.execute(self.state, inst)
+
+        self.assertTrue(swapped)
+        self.assertEqual(self.lds.read_dword(5), TWO_RAW)
+
+    def test_scalar_exchange_failure_on_mismatch(self) -> None:
+        self.lds.write_dword(8, ONE_RAW)
+        self.state.set_vgpr(VGPR(1), 32)        # dword 8
+        self.state.set_vgpr(VGPR(2), THREE_RAW)  # cmp_val = 3.0f (mismatch)
+        self.state.set_vgpr(VGPR(3), TWO_RAW)    # new_val = 2.0f
+
+        inst = DSCondXchg32F32Instruction(
+            DSOpcode.DS_CONDXCHG32_F32,
+            vaddr=VGPR(1),
+            vdata0=VGPR(2),
+            vdata1=VGPR(3),
+        )
+        swapped = self.interp.execute(self.state, inst)
+
+        self.assertFalse(swapped)
+        self.assertEqual(self.lds.read_dword(8), ONE_RAW)
+
+    def test_scalar_exchange_with_offset(self) -> None:
+        self.lds.write_dword(10, TWO_RAW)
+        self.state.set_vgpr(VGPR(1), 36)        # dword 9
+        self.state.set_vgpr(VGPR(2), TWO_RAW)   # cmp_val = 2.0f
+        self.state.set_vgpr(VGPR(3), THREE_RAW) # new_val = 3.0f
+
+        inst = DSCondXchg32F32Instruction(
+            DSOpcode.DS_CONDXCHG32_F32,
+            vaddr=VGPR(1),
+            vdata0=VGPR(2),
+            vdata1=VGPR(3),
+            offset=OffsetImmediate(4),  # offset 4 -> dword 10
+        )
+        swapped = self.interp.execute(self.state, inst)
+
+        self.assertTrue(swapped)
+        self.assertEqual(self.lds.read_dword(10), THREE_RAW)
+
+    def test_scalar_signed_zero_exchange(self) -> None:
+        self.lds.write_dword(2, NEG_ZERO_RAW)
+        self.state.set_vgpr(VGPR(1), 8)
+        self.state.set_vgpr(VGPR(2), POS_ZERO_RAW)
+        self.state.set_vgpr(VGPR(3), ONE_RAW)
+
+        inst = DSCondXchg32F32Instruction(
+            DSOpcode.DS_CONDXCHG32_F32,
+            vaddr=VGPR(1),
+            vdata0=VGPR(2),
+            vdata1=VGPR(3),
+        )
+        swapped = self.interp.execute(self.state, inst)
+
+        self.assertTrue(swapped)
+        self.assertEqual(self.lds.read_dword(2), ONE_RAW)
+
 
 if __name__ == "__main__":
     unittest.main()
