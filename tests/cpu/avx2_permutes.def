@@ -4,6 +4,7 @@ EXPORTS
     insert_i128_hi
     pblendd256
     pblendd256_mem
+    pblendd256_mem_zero
     perm2i128_hi
     perm2i128_zero
     permd256
