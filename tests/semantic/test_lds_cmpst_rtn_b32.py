@@ -33,6 +33,40 @@ DEFAULT_NUM_SGPRS: int = 106
 MASK32: int = 0xFFFF_FFFF           # 32-bit unsigned mask
 OFFSET16_MASK: int = 0xFFFF         # 16-bit immediate byte offset mask
 
+# IEEE 754 Single-Precision Boundary Constants
+POS_ZERO_F32: int = 0x00000000
+NEG_ZERO_F32: int = 0x80000000
+POS_INF_F32: int = 0x7F800000
+NEG_INF_F32: int = 0xFF800000
+QNAN_F32: int = 0x7FC00000
+SNAN_F32: int = 0x7F800001
+MIN_NORMAL_F32: int = 0x00800000
+MIN_SUBNORMAL_F32: int = 0x00000001
+MAX_SUBNORMAL_F32: int = 0x007FFFFF
+MAX_NORMAL_F32: int = 0x7F7FFFFF
+ONE_F32: int = 0x3F800000
+
+
+def bits_to_f32(bits: int) -> float:
+    """Interpret 32-bit unsigned integer as IEEE 754 single-precision float."""
+    return struct.unpack("<f", struct.pack("<I", bits & MASK32))[0]
+
+
+def f32_to_bits(val: float) -> int:
+    """Pack IEEE 754 single-precision float into 32-bit unsigned integer."""
+    return struct.unpack("<I", struct.pack("<f", val))[0]
+
+
+def is_f32_nan(bits: int) -> bool:
+    """Test if 32-bit bit pattern is an IEEE 754 NaN."""
+    return (bits & 0x7F800000) == 0x7F800000 and (bits & 0x007FFFFF) != 0
+
+
+def is_f32_subnormal(bits: int) -> bool:
+    """Test if 32-bit bit pattern is an IEEE 754 subnormal float."""
+    return (bits & 0x7F800000) == 0 and (bits & 0x007FFFFF) != 0
+
+
 
 def u32(val: int) -> int:
     """Normalize integer to unsigned 32-bit dword."""
@@ -1081,8 +1115,83 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertFalse(flags.zero_result)
 
 
+class TestIEEE754Boundaries(unittest.TestCase):
+    """Phase 7: Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_signed_zeros_bitwise_inequality(self) -> None:
+        # In IEEE 754, +0.0 == -0.0, but in bitwise CAS: 0x00000000 != 0x80000000
+        old_val, new_mem, swapped = ref_ds_cmpst_rtn_b32(POS_ZERO_F32, NEG_ZERO_F32, 0x1234)
+        self.assertFalse(swapped)
+        self.assertEqual(old_val, POS_ZERO_F32)
+        self.assertEqual(new_mem, POS_ZERO_F32)
+
+    def test_matching_signed_zero(self) -> None:
+        old_val, new_mem, swapped = ref_ds_cmpst_rtn_b32(NEG_ZERO_F32, NEG_ZERO_F32, POS_ZERO_F32)
+        self.assertTrue(swapped)
+        self.assertEqual(old_val, NEG_ZERO_F32)
+        self.assertEqual(new_mem, POS_ZERO_F32)
+
+    def test_subnormal_no_ftz_swap(self) -> None:
+        self.assertTrue(is_f32_subnormal(MIN_SUBNORMAL_F32))
+        self.assertTrue(is_f32_subnormal(MAX_SUBNORMAL_F32))
+
+        old_val, new_mem, swapped = ref_ds_cmpst_rtn_b32(MIN_SUBNORMAL_F32, MIN_SUBNORMAL_F32, MAX_SUBNORMAL_F32)
+        self.assertTrue(swapped)
+        self.assertEqual(old_val, MIN_SUBNORMAL_F32)
+        self.assertEqual(new_mem, MAX_SUBNORMAL_F32)
+        self.assertTrue(is_f32_subnormal(new_mem))
+
+    def test_signaling_nan_preserved_no_quietening(self) -> None:
+        self.assertTrue(is_f32_nan(SNAN_F32))
+        old_val, new_mem, swapped = ref_ds_cmpst_rtn_b32(SNAN_F32, SNAN_F32, 0x5555)
+        self.assertTrue(swapped)
+        self.assertEqual(old_val, SNAN_F32)
+        self.assertEqual(new_mem, 0x5555)
+        # Ensure SNAN returned to vdst preserves signaling bit (does not quieten to QNAN)
+        self.assertNotEqual(old_val, QNAN_F32)
+
+    def test_nan_payload_mismatch(self) -> None:
+        # Different NaN bit patterns must not match
+        old_val, new_mem, swapped = ref_ds_cmpst_rtn_b32(QNAN_F32, SNAN_F32, 0x9999)
+        self.assertFalse(swapped)
+        self.assertEqual(old_val, QNAN_F32)
+        self.assertEqual(new_mem, QNAN_F32)
+
+    def test_infinities_distinct(self) -> None:
+        # Positive and negative infinity are distinct bit patterns
+        old_val, new_mem, swapped = ref_ds_cmpst_rtn_b32(POS_INF_F32, NEG_INF_F32, 0)
+        self.assertFalse(swapped)
+        self.assertEqual(old_val, POS_INF_F32)
+        self.assertEqual(new_mem, POS_INF_F32)
+
+    def test_subnormal_in_scalar_interpreter(self) -> None:
+        state = ScalarState(lds_size_dwords=1024)
+        interp = ScalarInterpreter()
+
+        addr = 0x20
+        state.lds.write_dword(addr, MIN_SUBNORMAL_F32)
+        state.set_vgpr(1, addr)
+        state.set_vgpr(2, MIN_SUBNORMAL_F32)
+        state.set_vgpr(3, MAX_SUBNORMAL_F32)
+
+        instr = DSCmpstRtnInstruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+            vdata1=RegisterOperand(3, RegType.VGPR),
+        )
+
+        old_val, new_mem, swapped = interp.execute(instr, state)
+        self.assertTrue(swapped)
+        self.assertEqual(old_val, MIN_SUBNORMAL_F32)
+        self.assertEqual(new_mem, MAX_SUBNORMAL_F32)
+        self.assertEqual(state.get_vgpr(0), MIN_SUBNORMAL_F32)
+        self.assertEqual(state.lds.read_dword(addr), MAX_SUBNORMAL_F32)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
