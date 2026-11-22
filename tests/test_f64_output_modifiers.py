@@ -65,9 +65,15 @@ class F64OutputModifiersTest(unittest.TestCase):
         else:
             self.assertNotRegex(spv, r"OpFMul %double")
         if clamp:
-            value = result(rf"OpExtInst %double %glsl FClamp {value} {double(0.0)} {double(1.0)}")
+            # clamp to [0, 1] as ordered compares and selects, so a NaN and -0 give +0 (SHADER-186), not FClamp
+            zero, one = double(0.0), double(1.0)
+            positive = result(rf"OpFOrdGreaterThan %bool {value} {zero}")
+            low = result(rf"OpSelect %double {positive} {value} {zero}")
+            below = result(rf"OpFOrdLessThan %bool {low} {one}")
+            value = result(rf"OpSelect %double {below} {low} {one}")
         else:
-            self.assertNotIn("FClamp", spv)
+            self.assertNotIn("OpSelect %double", spv)
+        self.assertNotIn("FClamp", spv)
         pair = result(rf"OpBitcast %v2uint_d {value}")
         for index, register in ((0, "%c4"), (1, "%c5")):
             word = result(rf"OpCompositeExtract %uint {pair} {index}")

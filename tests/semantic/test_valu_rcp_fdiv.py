@@ -36,6 +36,7 @@ if HERE not in sys.path:
 
 import rdna2spirv  # noqa: E402
 import spirv_mini_interp as si  # noqa: E402
+import support  # noqa: E402
 
 MASK32 = 0xFFFFFFFF
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
@@ -186,13 +187,11 @@ def ref_rcp_f32(x_bits: int, *, scale: Fraction = Fraction(1), clamp: bool = Fal
     if absu == 0:
         raise ValueError("division by zero is undefined in SPIR-V")
     if absu > 0x7F800000:
-        if clamp:
-            raise ValueError("clamp of NaN is undefined in GLSL.std.450")
-        return 0x7FC00000
+        return 0 if clamp else 0x7FC00000      # clamp of a NaN is +0 with DX10_CLAMP set (SHADER-186)
     if absu == 0x7F800000:
         # 1 / (+-inf) = +-0.0; omod preserves sign of zero, clamp orders -0 below +0 -> +0.
         return 0 if clamp else sign
-    # Match OpFDiv(1, x) rounded to binary32 before clamp_mods (scale, then FClamp [0, 1]).
+    # Match OpFDiv(1, x) rounded to binary32 before clamp_mods (scale, then clamp to [0, 1]).
     r_bits = round_fraction_to_f32(Fraction(1) / f32_to_fraction(bits))
     if (r_bits & 0x7FFFFFFF) == 0x7F800000:
         r_sign = r_bits & 0x80000000
@@ -216,9 +215,7 @@ def ref_rcp_f16(h_bits: int, *, scale: Fraction = Fraction(1), clamp: bool = Fal
     if absh == 0:
         raise ValueError("division by zero is undefined in SPIR-V")
     if absh > 0x7C00:
-        if clamp:
-            raise ValueError("clamp of NaN is undefined in GLSL.std.450")
-        return (h & 0x8000) | 0x7E00
+        return 0 if clamp else (h & 0x8000) | 0x7E00      # clamp of a NaN is +0 (SHADER-186)
     if absh == 0x7C00:
         return 0 if clamp else (h & 0x8000)
     # Widening f16 -> f32 is exact, then f32 OpFDiv + omod/clamp, then f16 nearest-even narrowing.
@@ -808,14 +805,14 @@ class NegativeControlTests(unittest.TestCase):
                 self.assertEqual(n, 1)
                 self.assertNotEqual(si.run_fragment(bad)["%out_mrt0"][0], want)
 
-        # Sabotaging FClamp on v_rcp_iflag_f32_e64 clamp changes clamped 1/0.5 = 2.0 -> 1.0.
+        # Dropping the clamp on v_rcp_iflag_f32_e64 clamp changes clamped 1/0.5 = 2.0 -> 1.0.
         spv_clamp = translate_ps([
             f"v_mov_b32 v0, {OLD:#x}",
             f"v_mov_b32 v1, {f32_bits(0.5):#x}",
             "v_rcp_iflag_f32_e64 v0, v1 clamp",
         ])
         self.assertEqual(si.run_fragment(spv_clamp)["%out_mrt0"][0], f32_bits(1.0))
-        bad_clamp, n = re.subn(r"OpExtInst %float %glsl FClamp (%\w+) %f0 %f1", r"OpCopyObject %float \1", spv_clamp)
+        bad_clamp, n = support.drop_clamp01(spv_clamp)
         self.assertEqual(n, 1)
         self.assertEqual(si.run_fragment(bad_clamp)["%out_mrt0"][0], f32_bits(2.0))
 

@@ -173,14 +173,14 @@ class InterpP1lvF16DefaultTests(unittest.TestCase):
         # attr0.x: lo=1.5 (clamp->1.0), hi=-0.25 (clamp->+0.0); attr0.y: lo=0.5 (in-range); attr0.z: lo=3.5 (p1lv)
         attrs = {0: [(pack_f16(1.5, -0.25), pack_f16(0.5, 0.0), pack_f16(3.5, 0.0), 0)] * 3}
         spv_clamp, _ = translate_with_flags("ps_p1lv_clamp", P1LV_CLAMP_PAIR, dxbc=PS_ATTR01_DXBC)
-        self.assertIn("FClamp", spv_clamp)
+        self.assertGreater(support.clamp01_count(spv_clamp), 0)
         words_clamp = support.mrt0_words(spv_clamp, inputs=support.varyings(spv_clamp, attrs, BARY))
         self.assertEqual([w & 0xFFFF for w in words_clamp[:3]], [0x3C00, 0x0000, 0x3800])
         self.assertEqual(words_clamp[3], f32_bits(3.5))
 
         no_clamp_lines = [ln.replace(" clamp", "") for ln in P1LV_CLAMP_PAIR]
         spv_raw, _ = translate_with_flags("ps_p1lv_noclamp", no_clamp_lines, dxbc=PS_ATTR01_DXBC)
-        self.assertNotIn("FClamp", spv_raw)
+        self.assertEqual(support.clamp01_count(spv_raw), 0)
         words_raw = support.mrt0_words(spv_raw, inputs=support.varyings(spv_raw, attrs, BARY))
         self.assertEqual([w & 0xFFFF for w in words_raw[:3]], [f16_bits(1.5), f16_bits(-0.25), 0x3800])
 
@@ -243,8 +243,8 @@ class InterpP1lvF16DefaultTests(unittest.TestCase):
         self.assertNotEqual(bad_half, spv)
         self.assertNotEqual(support.mrt0_words(bad_half, inputs=inputs), baseline)
 
-        # Sabotage 2: drop FClamp by replacing FClamp %v %f0 %f1 with FMax %v %f0.
-        bad_clamp = re.sub(r"OpExtInst %float %glsl FClamp (%\S+) %f0 %f1", r"OpExtInst %float %glsl FMax \1 %f0", spv)
+        # Sabotage 2: drop the clamp (each clamp-bit sequence replaced by its unclamped input).
+        bad_clamp, _ = support.drop_clamp01(spv)
         self.assertNotEqual(bad_clamp, spv)
         self.assertNotEqual(support.mrt0_words(bad_clamp, inputs=inputs), baseline)
 

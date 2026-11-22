@@ -3542,10 +3542,23 @@ class Gen:
                 self.emit(f"{g} = OpFMul %float {v} {c}")
                 v = g
         if "clamp" in mods:
-            g = self.tmp()
-            self.emit(f"{g} = OpExtInst %float %glsl FClamp {v} %f0 %f1")
-            return g
+            return self.clamp01(v)
         return v
+
+    def clamp01(self, v, ty="%float"):
+        """The VOP3 clamp bit: min(max(v, 0), 1) as RDNA2 computes it with DX10_CLAMP set, the MODE assumed for the
+        game. A NaN gives +0, -0 gives +0 (in every MODE), and an infinity clamps like any other value. Measured on
+        gfx1036 (RDNA2) and gfx1150 for f32 results, and on gfx1036 for f16 and mix-op results (SHADER-186;
+        docs/shader_validation.md). Emitted as ordered compares and selects rather than GLSL.std.450 FClamp, which
+        leaves the NaN result undefined and the sign of a -0 result open: v > 0 is false for a NaN and for both
+        zeros, so they all select +0. ty is %float or %double (the f64 clamp is the same VOP3 field, unmeasured)."""
+        zero, one = ("%f0", "%f1") if ty == "%float" else (self.dconst(0.0), self.dconst(1.0))
+        pos, lo, below, r = (self.tmp() for _ in range(4))
+        self.emit(f"{pos} = OpFOrdGreaterThan %bool {v} {zero}")
+        self.emit(f"{lo} = OpSelect {ty} {pos} {v} {zero}")
+        self.emit(f"{below} = OpFOrdLessThan %bool {lo} {one}")
+        self.emit(f"{r} = OpSelect {ty} {below} {lo} {one}")
+        return r
 
     def flush_f32(self, f):
         """v_mad_f32, v_mac_f32 and v_mad_legacy_f32 have no f32 denormal support: a subnormal operand or result
@@ -3563,18 +3576,15 @@ class Gen:
         return r
 
     def clamp_mods_f64(self, v, mods):
-        """clamp_mods for a %double result (VOP3 f64 arithmetic): omod scales first, then clamp to [0, 1]. As
-        for f32 the clamp is GLSL.std.450 FClamp, so a NaN result and the sign of a -0 result are left to the
-        driver (the hardware, with DX10_CLAMP set, gives +0 for NaN)."""
+        """clamp_mods for a %double result (VOP3 f64 arithmetic): omod scales first, then clamp to [0, 1] with the
+        f32 rule (clamp01: a NaN and -0 give +0)."""
         for m in mods:
             if m in ("mul:2", "mul:4", "div:2"):
                 g = self.tmp()
                 self.emit(f"{g} = OpFMul %double {v} {self.dconst({'mul:2': 2.0, 'mul:4': 4.0, 'div:2': 0.5}[m])}")
                 v = g
         if "clamp" in mods:
-            g = self.tmp()
-            self.emit(f"{g} = OpExtInst %double %glsl FClamp {v} {self.dconst(0.0)} {self.dconst(1.0)}")
-            return g
+            return self.clamp01(v, "%double")
         return v
 
     def turn_angle(self, x):
@@ -5376,17 +5386,13 @@ class Gen:
                     r = self.sum_toward_zero2(vx, vy, r)
             else:
                 self.emit(f"{r} = OpExtInst %v2float %glsl {'NMax' if 'max' in op else 'NMin'} {vx} {vy}")
-            if "clamp" in mods:
-                c = self.tmp()
-                z2, o2 = self.tmp(), self.tmp()
-                self.emit(f"{z2} = OpCompositeConstruct %v2float %f0 %f0")
-                self.emit(f"{o2} = OpCompositeConstruct %v2float %f1 %f1")
-                self.emit(f"{c} = OpExtInst %v2float %glsl FClamp {r} {z2} {o2}")
-                r = c
             p = self.tmp()
             c0, c1 = self.tmp(), self.tmp()
             self.emit(f"{c0} = OpCompositeExtract %float {r} 0")
             self.emit(f"{c1} = OpCompositeExtract %float {r} 1")
+            if "clamp" in mods:
+                # Each half clamps on its own, NaN and -0 to +0 (clamp01), before narrowing to f16.
+                c0, c1 = self.clamp01(c0), self.clamp01(c1)
             self.emit(f"{p} = OpCopyObject %uint {self.f16_pack2(c0, c1)}")
             self.dst(a[0], p)
         elif op in ("s_movrels_b32", "s_movrels_b64"):

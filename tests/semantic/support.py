@@ -1,6 +1,7 @@
 """Shared helpers for the translator tests (standard library only)."""
 import gc
 import os
+import re
 import struct
 import sys
 import tempfile
@@ -20,6 +21,21 @@ from spirv_mini_interp import run_fragment  # noqa: E402
 # translate() reads <dir>/<name>.s and, for pixel shaders, an input signature from <dir>/../<name>.dxbc.
 # A DXBC container with zero parts (magic, 24 zero bytes, part count 0, 4 more bytes) declares no inputs.
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
+
+# The VOP3 clamp bit on an f32 result (Gen.clamp01, SHADER-186): v > 0 selects v or +0, then lo < 1 selects lo or 1.0.
+# Group 1 is the indent, 3 the value being clamped, 6 the clamped result.
+CLAMP01_RE = re.compile(r"(?m)^( *)(%\w+) = OpFOrdGreaterThan %bool (%\w+) %f0\n *(%\w+) = OpSelect %float \2 \3 %f0\n"
+                        r" *(%\w+) = OpFOrdLessThan %bool \4 %f1\n *(%\w+) = OpSelect %float \5 \4 %f1$")
+
+
+def clamp01_count(spvasm):
+    """How many f32 clamp-bit sequences the module has."""
+    return len(CLAMP01_RE.findall(spvasm))
+
+
+def drop_clamp01(spvasm):
+    """A negative control: each f32 clamp-bit sequence replaced by its unclamped input. Returns (text, count)."""
+    return CLAMP01_RE.subn(lambda m: f"{m.group(1)}{m.group(6)} = OpCopyObject %float {m.group(3)}", spvasm)
 
 
 def translate_fixture(name, dxbc=STUB_DXBC, fssm=None):

@@ -1156,6 +1156,8 @@ are not NaN, and for the f16 denormals. It differs in five ways, none fixed here
    when "output denormals" are off, the `SIFoldOperands.cpp` comment quoted above). That count needs the game files.
 2. **clamp of a NaN.** The interpreter refuses `FClamp` with a NaN operand, which GLSL.std.450 leaves undefined. The
    hardware gives +0 with DX10_CLAMP 1, for `v_fmac_f16`, `v_fma_mixlo_f16` and `v_fma_mix_f32` alike (SHADER-186).
+   **Fixed since:** the translator now emits the clamp as compares and selects that give +0 for a NaN and for -0
+   (`docs/design.md`, "Float `clamp` bit"; `tests/semantic/test_float_clamp_nan.py`).
 3. **Mix-op rounding.** The hardware rounds once (the section above).
 4. **f32 denormal operands of the mix ops.** They are not flushed with `denorm_mode_32 = 0`: `0x00000001`, `0x807fffff`
    and the integer constants `1` and `64` used as f32 give the denormal, where the hardware gives a zero of its sign

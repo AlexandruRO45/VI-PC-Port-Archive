@@ -12,8 +12,8 @@ plain-Python IEEE-754 binary32 / RDNA2 ISA reference oracle (stdlib only, no gam
 Observed translator / interpreter findings (kept out of failing assertions and documented here):
   1. v_min3_f32 / v_max3_f32 with NaN operands: tools/rdna2spirv.py emits GLSL.std.450 NMin / NMax, which give the
      other operand for a NaN, as RDNA2 hardware does. Those rows are asserted in tests/semantic/
-     test_float_nan_fract.py; NaN inputs stay out of the value assertions here (clamp-on-NaN is still FClamp, which
-     spirv_mini_interp.py rejects). NaN semantics are tested on v_mad_f32, v_fmac_f32, and v_mad_legacy_f32.
+     test_float_nan_fract.py; NaN inputs stay out of the min3/max3 value assertions here (clamp of a NaN, +0 with
+     DX10_CLAMP set, is in test_float_clamp_nan.py). NaN semantics are tested on v_mad_f32, v_fmac_f32, and v_mad_legacy_f32.
   2. v_min3_f32 / v_max3_f32 signed-zero ties: RDNA2 hardware orders -0.0 below +0.0 (measured on an AMD Radeon
      RX 6800: min(+0, -0) = -0 and max(+0, -0) = +0 in either operand order), and spirv_mini_interp.py's NMin / NMax
      do the same, so every zero triple asserts exact bit patterns.
@@ -48,6 +48,7 @@ if HERE not in sys.path:
 
 import rdna2spirv  # noqa: E402
 import spirv_mini_interp as si  # noqa: E402
+import support  # noqa: E402
 
 MASK32 = 0xFFFFFFFF
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
@@ -281,9 +282,7 @@ def apply_out_mods(bits: int, omod: str | None = None, clamp: bool = False) -> i
         bits = _mul_bits_f32(bits, factor)
     if clamp:
         v = bits_to_f32(bits)
-        if math.isnan(v):
-            raise ValueError("clamp on NaN is undefined in GLSL FClamp")
-        if v < 0.0:
+        if math.isnan(v) or v <= 0.0:       # NaN and -0 clamp to +0 (DX10_CLAMP set; SHADER-186)
             return POS_ZERO
         if v > 1.0:
             return ONE
@@ -958,11 +957,7 @@ class NegativeControlsTests(unittest.TestCase):
             "v_mad_f32 v0, v1, v2, v3 clamp",
         ])
         self.assertEqual(si.run_fragment(spv_clamp)["%out_mrt0"][0], ONE)
-        bad_clamp, clamp_cnt = re.subn(
-            r"(%\w+) = OpExtInst %float %glsl FClamp (%\w+) %f0 %f1",
-            r"\1 = OpCopyObject %float \2",
-            spv_clamp,
-        )
+        bad_clamp, clamp_cnt = support.drop_clamp01(spv_clamp)
         self.assertEqual(clamp_cnt, 1)
         self.assertNotEqual(si.run_fragment(bad_clamp)["%out_mrt0"][0], ONE)
 

@@ -38,6 +38,7 @@ sys.path.insert(0, HERE)
 
 import rdna2spirv  # noqa: E402
 import spirv_mini_interp as si  # noqa: E402
+import support  # noqa: E402
 
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 OLD = 0xBEEF1234
@@ -342,7 +343,7 @@ class FractF16TranslationTests(unittest.TestCase):
         ])
         self.assertIn("UnpackHalf2x16", spv)
         self.assertRegex(spv, r"OpExtInst %float %glsl Fract %\w+")
-        self.assertRegex(spv, r"OpExtInst %float %glsl FClamp %\w+ %f0 %f1")
+        self.assertEqual(support.clamp01_count(spv), 1)
         # op_sel:[1,1]: fract of the high half (-1.25 -> 0.75 = 0x3a00) into the high half; the low half is kept.
         self.assertEqual(si.run_fragment(spv)["%out_mrt0"][0], (0x3A00 << 16) | (OLD & 0xFFFF))
 
