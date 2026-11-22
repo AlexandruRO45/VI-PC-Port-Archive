@@ -1100,5 +1100,79 @@ class TestValuCvtPkI16F32ConditionCodes(unittest.TestCase):
         self.assertEqual(simd.vcc, canary_vcc)
 
 
+class TestValuCvtPkI16F32IEEE754Boundaries(unittest.TestCase):
+    """Exhaustive unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_signed_zeros_distinction(self) -> None:
+        """Both +0.0 and -0.0 truncate to integer 0."""
+        self.assertEqual(f32_to_i16(POS_ZERO_F32), 0)
+        self.assertEqual(f32_to_i16(NEG_ZERO_F32), 0)
+        self.assertEqual(ref_cvt_pk_i16_f32(POS_ZERO_F32, NEG_ZERO_F32), 0x00000000)
+
+    def test_subnormals_truncate_to_zero(self) -> None:
+        """Subnormal floats have magnitude < 1.0, so they strictly truncate toward zero."""
+        subnormals = [
+            0x00000001,  # min positive subnormal
+            0x007FFFFF,  # max positive subnormal
+            0x80000001,  # min negative subnormal
+            0x807FFFFF,  # max negative subnormal
+            0x00000042,
+            0x00012345,
+        ]
+        for sub in subnormals:
+            with self.subTest(sub=hex(sub)):
+                self.assertEqual(f32_to_i16(sub), 0)
+                self.assertEqual(ref_cvt_pk_i16_f32(sub, sub), 0x00000000)
+
+    def test_nan_variants_produce_zero(self) -> None:
+        """Quiet and signaling NaNs of all signs and payloads produce zero."""
+        nans = [
+            QNAN_F32,
+            SNAN_F32,
+            0x7FC00001,
+            0x7F800002,
+            0x7FC01234,
+            0x7F804321,
+            0xFFC00000,
+            0xFF800001,
+            0xFFC01234,
+            0xFF804321,
+        ]
+        for nan_bits in nans:
+            with self.subTest(nan=hex(nan_bits)):
+                self.assertTrue(is_nan_f32(nan_bits))
+                self.assertEqual(f32_to_i16(nan_bits), 0)
+                self.assertEqual(ref_cvt_pk_i16_f32(nan_bits, nan_bits), 0x00000000)
+
+    def test_infinities_and_large_floats(self) -> None:
+        """Infinities and large floats saturate to signed 16-bit boundaries."""
+        self.assertEqual(f32_to_i16(POS_INF_F32), 0x7FFF)
+        self.assertEqual(f32_to_i16(NEG_INF_F32), 0x8000)
+        self.assertEqual(ref_cvt_pk_i16_f32(POS_INF_F32, NEG_INF_F32), 0x80007FFF)
+
+        # 0x7F7FFFFF (FLT_MAX)
+        self.assertEqual(f32_to_i16(0x7F7FFFFF), 0x7FFF)
+        # 0xFF7FFFFF (-FLT_MAX)
+        self.assertEqual(f32_to_i16(0xFF7FFFFF), 0x8000)
+
+    def test_fractional_truncation_around_zero(self) -> None:
+        """Verify strict round-toward-zero across fractional values."""
+        cases = [
+            (0.9999999, 0),
+            (-0.9999999, 0),
+            (1.0, 1),
+            (-1.0, 0xFFFF),
+            (1.99999, 1),
+            (-1.99999, 0xFFFF),
+            (2.5, 2),
+            (-2.5, 0xFFFE),
+            (32766.99, 32766),
+            (-32767.99, 0x8001),
+        ]
+        for val, expected in cases:
+            bits = f32_to_bits(val)
+            self.assertEqual(f32_to_i16(bits), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
