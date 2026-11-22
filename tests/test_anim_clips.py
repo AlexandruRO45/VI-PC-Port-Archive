@@ -265,6 +265,11 @@ def skeleton(p):
         slots[2 * i], slots[2 * i + 1] = (joaat32(name), i), (bone_id, i)
     struct.pack_into("<II", p.b, a + 0x18, 8, 2 * n)
     p.ptr(a + 0x20, p.alloc(b"".join(struct.pack("<II", *x) for x in slots)))
+    # the name tree: "head", "root", then "sp" with the child "ine"; values point into the bone array at +46
+    tree = struct.pack("<HH", n, 46) + struct.pack("<HHh", 11, 0, 42) + b"head\0" + struct.pack(
+        "<HHh", 11, 0, 33) + b"root\0" + struct.pack("<HHh", 0, 9, -26) + b"sp\0" + struct.pack(
+        "<HHh", 0, 0, 15) + b"ine\0" + b"\0" + struct.pack("<3H", 2, 0, 1)
+    p.ptr(a + 0x48, p.alloc(tree))
     return a
 
 
@@ -501,6 +506,7 @@ class DecodeTest(unittest.TestCase):
         self.assertEqual([b[:3] for b in sk["bones"]], [b[:3] for b in BONES])
         self.assertEqual((sk["parents"], len(sk["tags"]), len(sk["local"])), ([-1, 0, 1], 6, 3))
         self.assertEqual(anim_clips.skeleton_checks(sk), (True, True))
+        self.assertEqual(sk["name_tree"], [("head", 2), ("root", 0), ("spine", 1)])
         self.assertEqual(m["sample_u32"], [1] * 4 + [2] * 5)
         self.assertEqual(m["feature_names"], [(0x21, 1), (0xA2, 0)])
         self.assertEqual(m["tables_placed_by_key"], (False, False, True))
@@ -529,6 +535,7 @@ class DecodeTest(unittest.TestCase):
                   "matcher_pose_padding_as_expected", "matcher_pose_transforms_one_per_sample",
                   "matcher_pose_transforms_unit_quaternion_scale_1", "matcher_skeleton_one_root_parents_first",
                   "matcher_skeleton_tags_are_name_hash_and_id", "matcher_skeleton_local_is_bone_transform",
+                  "matcher_skeleton_name_tree_maps_each_name_to_its_bone",
                   "matcher_skeleton_inverse_bind_undoes_chain", "matcher_sample_u32_one_per_sample",
                   "matcher_sample_u32_same_within_a_record", "matcher_feature_name_table_placed_by_key",
                   "matcher_item_48_one_zero_item_with_u32_1_at_0x20", "matcher_u32_118_is_the_sample_count",
@@ -653,12 +660,15 @@ class DecodeTest(unittest.TestCase):
         obj = s.ptr(at + 0x20)
         sk = s.ptr(obj + 0x28)
         name = s.ptr(s.ptr(sk + 0x28) + 0x30)
+        tree = s.ptr(sk + 0x48)
         for writes in ([(sk + 0x1C, "<I", 5)],                                      # 6 full slots for 5 entries
                        [(sk + 0x20, "<Q", 0)],                                      # no tag table
                        [(sk + 0x18, "<I", len(s.d))],                               # tag table past the pages
                        [(sk + 0x38, "<Q", 0)],                                      # no local matrices
                        [(sk + 0x6C, "<H", 0x7FFF)],                                 # bones past the pages
                        [(name + 8 * i, "<Q", 0x6161616161616161) for i in range(40)],  # a name without its end
+                       [(tree + 4, "<H", 200)],                                     # a sibling outside the tree
+                       [(tree + 2, "<H", 10)],                                      # a node text without its end
                        [(obj + 0x94, "<I", len(s.d))]):                             # per-sample words past the pages
             kept = [(f, fmt, struct.unpack_from(fmt, s.d, f)[0]) for f, fmt, _v in writes]
             for f, fmt, v in writes:

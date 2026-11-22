@@ -341,7 +341,8 @@ def matcher_skeleton(s, at):
     parent at +0x46; u16 index at +0x48 and +0x4C; u16 bone id at +0x4A}; `+0x38` each bone's 4x4 local matrix and
     `+0x30` its inverse bind matrix (row-vector convention, translation in row 3); `+0x40` the parents as s16; and a
     tag table at `+0x18` (u32 slots, u32 entries, pointer) of 8-byte {u32 tag; u32 bone} slots, empty tag 0xFFFFFFFF.
-    -> {"bones": [(name, parent, id, rotation, translation)], "tags", "local", "inverse_bind"}"""
+    `+0x48` is a tree of the bone names (`skeleton_name_tree`).
+    -> {"bones": [(name, parent, id, rotation, translation)], "tags", "local", "inverse_bind", "name_tree"}"""
     n, bones = s.u16(at + 0x6C), s.ptr(at + 0x28)
     mats = [s.ptr(at + 0x38), s.ptr(at + 0x30), s.ptr(at + 0x40)]
     if n and (bones is None or None in mats):
@@ -366,7 +367,37 @@ def matcher_skeleton(s, at):
         raise DecodeError("motionmatcher skeleton tag table count does not fit")
     matrix = lambda p, i: [struct.unpack_from("<4f", s.d, p + 64 * i + 16 * r) for r in range(4)]  # noqa: E731
     return {"bones": out, "tags": tags, "parents": list(struct.unpack_from(f"<{n}h", s.d, mats[2])) if n else [],
-            "local": [matrix(mats[0], i) for i in range(n)], "inverse_bind": [matrix(mats[1], i) for i in range(n)]}
+            "local": [matrix(mats[0], i) for i in range(n)], "inverse_bind": [matrix(mats[1], i) for i in range(n)],
+            "name_tree": skeleton_name_tree(s, s.ptr(at + 0x48))}
+
+
+def skeleton_name_tree(s, at):
+    """The skeleton's `+0x48` block: a prefix tree of the bone names. `{u16 n; u16 size}`, then nodes from `+4`, each
+    `{u16 next sibling (relative, 0 for the last); u16 first child (relative, 0 for none); s16 value; char text[]}`.
+    A node's name is its parents' texts and its own; where node + value lands in the n u16 at `+size`, that u16 is
+    the bone the name belongs to. -> [(name, bone index)] in tree order, or [] for a null pointer"""
+    if at is None:
+        return []
+    n, size = s.u16(at), s.u16(at + 2)
+    if at + size + 2 * n > len(s.d):
+        raise DecodeError("motionmatcher bone name tree runs past the pages")
+    out, stack, steps = [], [(4, "")] if size > 4 else [], 0
+    while stack:
+        node, prefix = stack.pop()
+        steps += 1
+        end = s.d.find(b"\0", at + node + 6, at + size) if 4 <= node and node + 6 < size else -1
+        if end < 0 or steps > size:
+            raise DecodeError("motionmatcher bone name tree node outside its block")
+        sibling, child, value = struct.unpack_from("<HHh", s.d, at + node)
+        name = prefix + s.d[at + node + 6:end].decode("latin-1")
+        target = node + value
+        if size <= target < size + 2 * n and (target - size) % 2 == 0:
+            out.append((name, s.u16(at + target)))
+        if sibling:
+            stack.append((node + sibling, prefix))
+        if child:                                                           # children before the next sibling
+            stack.append((node + child, name))
+    return out
 
 
 def matcher_poses(s, obj, columns, rows_layout):
@@ -524,6 +555,8 @@ def count_matcher(c, dictionary_hash, stats):
         p < 0 for p in parents) == 1 and all(0 <= p < i for i, p in enumerate(parents) if p >= 0)
     stats["matcher_skeleton_tags_are_name_hash_and_id"] += bool(bones) and sorted(sk["tags"]) == sorted(
         [(anim_index.joaat32(b[0]), i) for i, b in enumerate(bones)] + [(b[2], i) for i, b in enumerate(bones)])
+    stats["matcher_skeleton_name_tree_maps_each_name_to_its_bone"] += bool(bones) and sorted(
+        sk["name_tree"], key=lambda x: x[1]) == [(b[0], i) for i, b in enumerate(bones)]
     local_ok, inverse_ok = skeleton_checks(sk)
     stats["matcher_skeleton_local_is_bone_transform"] += bool(bones) and local_ok
     stats["matcher_skeleton_inverse_bind_undoes_chain"] += bool(bones) and inverse_ok

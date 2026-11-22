@@ -465,6 +465,7 @@ u32; u32 count}` with `Entry {u64 key; T *value; Entry *next}`. Hashes are `joaa
 | | `+0x28` pointer, `+0x6C` u16 count (`+0x6E` the same, measured separately) | the bones, 80 bytes each: `{f32 rotation quaternion[4]; f32 translation[3]; 4 bytes; f32 1.0[4]; char *name at +0x30; s16 parent at +0x46; u16 index at +0x48 and +0x4C; u16 bone id at +0x4A}` (the 1.0s and the two indices on 180 of 180, measured separately) |
 | | `+0x30`, `+0x38` pointers | per bone a 4x4 f32 matrix: the inverse bind matrix, and the local matrix (row vectors, translation in row 3) |
 | | `+0x40` pointer | the parents, one s16 per bone, −1 for the root |
+| | `+0x48` pointer | a prefix tree of the bone names: `{u16 n; u16 size}`, nodes from `+4` `{u16 next sibling; u16 first child; s16 value; char text[]}` (offsets relative to the node), then n u16 bone indices at `+size` |
 | animation | `+0x24` u16 | frame count |
 | | `+0x28` f32 | duration = (frames − 1) / fps |
 | | `+0x50` array | sequence pointers |
@@ -674,7 +675,10 @@ A `.motionmatcher` object has fields up to `+0x18F`; they are in the object tabl
   child on 180 of 180, the bones' parent field is the `+0x40` array, and the tag table holds exactly two tags per
   bone, `joaat32` of its name and its u16 id, on 180 of 180 (the root's id is 0, measured separately). The local
   matrix is the bone's rotation and translation, and the inverse bind matrix times the product of the local
-  matrices up the chain is the identity (to 2e-3), on 180 of 180. `parse_matcher` returns it as `skeleton`.
+  matrices up the chain is the identity (to 2e-3), on 180 of 180. `+0x48` is a prefix tree of the bone names
+  (shared prefixes stored once): walking it, a node whose value lands in the u16 array after the tree names the
+  bone in that slot, and every bone's name leads to that bone, on 180 of 180 (`skeleton_name_tree`). The array
+  lists the bones in tree order (measured separately). `parse_matcher` returns it all as `skeleton`.
 - **Per sample (`+0x98`).** On the 149 clips with rows, one u32 per sample, the same for every sample of a record
   on 149 of 149. It is 1 everywhere on 148 clips and 0 to 3 on the other (measured separately); what it says is
   not decoded.
@@ -711,9 +715,8 @@ A `.motionmatcher` object has fields up to `+0x18F`; they are in the object tabl
   `+0x48` table (not joaat32, one-at-a-time, FNV-1/1a, ELF or CRC-32 of the bone name in any case, nor of the
   feature's `+0x18`/`+0x1C` words; measured separately), the features with `+0x0E` = 5 (their `+0x18`, `+0x1C`
   and `+0x24` are in none of the clip's tables, measured separately), how the bone ids are made, what the pose
-  columns mean beyond their feature (and any normalisation), the skeleton's `+0x48` block (its first u16 is the
-  bone count on 180 of 180, measured separately), the meaning of the `+0x98` values, the `+0x30` object's other
-  floats and form 1's values, what the `+0xB8` values are, and the f32 at `+0xC0`.
+  columns mean beyond their feature (and any normalisation), the meaning of the `+0x98` values, the `+0x30`
+  object's other floats and form 1's values, what the `+0xB8` values are, and the f32 at `+0xC0`.
 
 ### Other archives
 
