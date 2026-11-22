@@ -179,7 +179,7 @@ int main(int argc, char** argv) {
         EXPECT(SUCCEEDED(rt::d3d12::create_command_list(D3D12_COMMAND_LIST_TYPE_BUNDLE, bundle_parent_allocator.p,
                                                          IID_PPV_ARGS(&bundle_parent.p))));
         bundle_parent->ExecuteBundle(bundle.p);  // caller must be a direct list
-        EXPECT(bundle_parent->Close() == E_INVALIDARG);
+        EXPECT(bundle_parent->Close() == E_FAIL);
 
         // Clear calls are forbidden in bundles; a failed bundle also invalidates its caller.
         Ref<ID3D12CommandAllocator> invalid_bundle_allocator, invalid_caller_allocator;
@@ -190,7 +190,7 @@ int main(int argc, char** argv) {
                                                          IID_PPV_ARGS(&invalid_bundle.p))));
         const FLOAT forbidden_clear[4] = {0, 0, 0, 1};
         invalid_bundle->ClearRenderTargetView(rtv_handle, forbidden_clear, 0, nullptr);
-        EXPECT(invalid_bundle->Close() == E_INVALIDARG);
+        EXPECT(invalid_bundle->Close() == E_FAIL);
         EXPECT(SUCCEEDED(rt::d3d12::create_command_allocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
                                                               IID_PPV_ARGS(&invalid_caller_allocator.p))));
         EXPECT(SUCCEEDED(rt::d3d12::create_command_list(D3D12_COMMAND_LIST_TYPE_DIRECT, invalid_caller_allocator.p,
@@ -238,7 +238,7 @@ int main(int argc, char** argv) {
 
         // Each currently implemented bundle-forbidden method independently invalidates the bundle.
         const FLOAT bundle_clear_color[4] = {0, 1, 0, 1};
-        auto invalid_bundle_call = [&](auto record) {
+        auto bundle_closes_with = [&](auto record, HRESULT expected = E_FAIL) {
             Ref<ID3D12CommandAllocator> test_allocator;
             Ref<ID3D12GraphicsCommandList8> test_bundle;
             if (FAILED(rt::d3d12::create_command_allocator(D3D12_COMMAND_LIST_TYPE_BUNDLE,
@@ -248,27 +248,27 @@ int main(int argc, char** argv) {
                                                       IID_PPV_ARGS(&test_bundle.p))))
                 return false;
             record(test_bundle.p);
-            return test_bundle->Close() == E_INVALIDARG;
+            return test_bundle->Close() == expected;
         };
-        EXPECT(invalid_bundle_call([&](auto* b) { b->ResourceBarrier(1, &transition); }));
-        EXPECT(invalid_bundle_call([&](auto* b) { b->Barrier(1, &group); }));
-        EXPECT(invalid_bundle_call([&](auto* b) { b->CopyBufferRegion(rt_resource, 0, ds_resource, 0, 16); }));
+        EXPECT(bundle_closes_with([&](auto* b) { b->ResourceBarrier(1, &transition); }));
+        EXPECT(bundle_closes_with([&](auto* b) { b->Barrier(1, &group); }));
+        EXPECT(bundle_closes_with([&](auto* b) { b->CopyBufferRegion(rt_resource, 0, ds_resource, 0, 16); }));
         D3D12_TEXTURE_COPY_LOCATION copy_dst{};
         copy_dst.pResource = rt_resource;
         copy_dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         D3D12_TEXTURE_COPY_LOCATION copy_src{};
         copy_src.pResource = ds_resource;
         copy_src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        EXPECT(invalid_bundle_call([&](auto* b) { b->CopyTextureRegion(&copy_dst, 0, 0, 0, &copy_src, nullptr); }));
-        EXPECT(invalid_bundle_call([&](auto* b) { b->CopyResource(rt_resource, ds_resource); }));
-        EXPECT(invalid_bundle_call([&](auto* b) { b->ResolveSubresource(rt_resource, 0, ds_resource, 0,
+        EXPECT(bundle_closes_with([&](auto* b) { b->CopyTextureRegion(&copy_dst, 0, 0, 0, &copy_src, nullptr); }));
+        EXPECT(bundle_closes_with([&](auto* b) { b->CopyResource(rt_resource, ds_resource); }));
+        EXPECT(bundle_closes_with([&](auto* b) { b->ResolveSubresource(rt_resource, 0, ds_resource, 0,
                                                                           DXGI_FORMAT_R8G8B8A8_UNORM); }));
-        EXPECT(invalid_bundle_call([&](auto* b) { b->ResolveSubresourceRegion(rt_resource, 0, 0, 0, ds_resource,
+        EXPECT(bundle_closes_with([&](auto* b) { b->ResolveSubresourceRegion(rt_resource, 0, 0, 0, ds_resource,
                                                                                0, nullptr,
                                                                                DXGI_FORMAT_R8G8B8A8_UNORM,
                                                                                D3D12_RESOLVE_MODE_AVERAGE); }));
-        EXPECT(invalid_bundle_call([&](auto* b) { b->ClearRenderTargetView(rtv_handle, bundle_clear_color, 0, nullptr); }));
-        EXPECT(invalid_bundle_call([&](auto* b) { b->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH,
+        EXPECT(bundle_closes_with([&](auto* b) { b->ClearRenderTargetView(rtv_handle, bundle_clear_color, 0, nullptr); }));
+        EXPECT(bundle_closes_with([&](auto* b) { b->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH,
                                                                             0.5f, 0, 0, nullptr); }));
         // A valid texture UAV descriptor, which a direct list would accept: only the bundle refuses the clear.
         const UINT uav_uint[4] = {};
@@ -278,25 +278,29 @@ int main(int argc, char** argv) {
         uav_image.width = uav_image.height = 4;
         const auto uav_words = leonida::gfx10::encode(uav_image);
         const D3D12_CPU_DESCRIPTOR_HANDLE uav_view{reinterpret_cast<SIZE_T>(uav_words.data())};
-        EXPECT(invalid_bundle_call([&](auto* b) {
+        EXPECT(bundle_closes_with([&](auto* b) {
             b->ClearUnorderedAccessViewUint({}, uav_view, rt_resource, uav_uint, 0, nullptr); }));
-        EXPECT(invalid_bundle_call([&](auto* b) {
+        EXPECT(bundle_closes_with([&](auto* b) {
             b->ClearUnorderedAccessViewFloat({}, uav_view, rt_resource, uav_float, 0, nullptr); }));
-        EXPECT(invalid_bundle_call([&](auto* b) { b->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO); }));
+        EXPECT(bundle_closes_with([&](auto* b) { b->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO); }));
         // D3D-26: DiscardResource and the atomic copies are not allowed in a bundle; WriteBufferImmediate is
         // ("Recording command lists and bundles", the bundle restrictions and the API restrictions table).
-        EXPECT(invalid_bundle_call([&](auto* b) { b->DiscardResource(rt_resource, nullptr); }));
+        EXPECT(bundle_closes_with([&](auto* b) { b->DiscardResource(rt_resource, nullptr); }));
         ID3D12Resource* const bundle_dependents[] = {ds_resource};
         const D3D12_SUBRESOURCE_RANGE_UINT64 bundle_ranges[] = {{0, {0, 8}}};
-        EXPECT(invalid_bundle_call([&](auto* b) {
+        EXPECT(bundle_closes_with([&](auto* b) {
             b->AtomicCopyBufferUINT(rt_resource, 0, ds_resource, 0, 1, bundle_dependents, bundle_ranges); }));
-        EXPECT(invalid_bundle_call([&](auto* b) {
+        EXPECT(bundle_closes_with([&](auto* b) {
             b->AtomicCopyBufferUINT64(rt_resource, 0, ds_resource, 0, 1, bundle_dependents, bundle_ranges); }));
-        EXPECT(!invalid_bundle_call([&](auto* b) {
+        EXPECT(bundle_closes_with([&](auto* b) {
             const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER write{0x1000, 1};
-            b->WriteBufferImmediate(1, &write, nullptr); }));
+            b->WriteBufferImmediate(1, &write, nullptr); }, S_OK));
+        EXPECT(bundle_closes_with([](auto* b) {
+            b->IASetVertexBuffers(D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT, 1, nullptr); }, E_INVALIDARG));
 
         list->Barrier(1, &group);
+        // The same predication call that invalidates a bundle is legal on this direct list.
+        list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
         // Not implemented: reported once by its generated stub, recording continues.
         list->SetProtectedResourceSession(nullptr);
         EXPECT(list->Close() == S_OK);
