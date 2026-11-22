@@ -45,6 +45,8 @@ Python 3.9+ compatible (from __future__ import annotations).
 
 import dataclasses
 import enum
+import math
+import struct
 from typing import Union
 import unittest
 
@@ -1130,6 +1132,132 @@ class TestValuCvtPkI16I32ConditionCodes(unittest.TestCase):
         simd.vcc = canary_vcc
         simd.step(inst)
         self.assertEqual(simd.vcc, canary_vcc)
+
+
+# ---------------------------------------------------------------------------
+# IEEE 754 Floating-Point Constants, Decoders, and Boundary Behavior
+# ---------------------------------------------------------------------------
+
+POS_ZERO_F32: int = 0x00000000
+NEG_ZERO_F32: int = 0x80000000
+POS_ONE_F32: int = 0x3F800000
+NEG_ONE_F32: int = 0xBF800000
+POS_INF_F32: int = 0x7F800000
+NEG_INF_F32: int = 0xFF800000
+QNAN_F32: int = 0x7FC00000
+SNAN_F32: int = 0x7F800001
+QNAN_PAYLOAD_F32: int = 0x7FC01234
+SNAN_PAYLOAD_F32: int = 0x7F804321
+SUBNORM_MIN_F32: int = 0x00000001
+SUBNORM_MAX_F32: int = 0x007FFFFF
+NEG_SUBNORM_MIN_F32: int = 0x80000001
+NEG_SUBNORM_MAX_F32: int = 0x807FFFFF
+FLT_MIN_F32: int = 0x00800000
+FLT_MAX_F32: int = 0x7F7FFFFF
+
+
+def f32_to_bits(val: float) -> int:
+    """Encode float to IEEE 754 single-precision 32-bit unsigned integer."""
+    return struct.unpack("<I", struct.pack("<f", val))[0]
+
+
+def bits_to_f32(bits: int) -> float:
+    """Decode 32-bit unsigned integer to IEEE 754 single-precision float."""
+    return struct.unpack("<f", struct.pack("<I", bits & MASK32))[0]
+
+
+def is_nan_f32(bits: int) -> bool:
+    """True if 32-bit integer represents an IEEE 754 single-precision NaN."""
+    bits &= MASK32
+    return (bits & 0x7F800000) == 0x7F800000 and (bits & 0x007FFFFF) != 0
+
+
+def is_subnormal_f32(bits: int) -> bool:
+    """True if 32-bit integer represents an IEEE 754 single-precision subnormal."""
+    bits &= MASK32
+    return (bits & 0x7F800000) == 0 and (bits & 0x007FFFFF) != 0
+
+
+class TestValuCvtPkI16I32IEEE754Boundaries(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_float_zeros_as_integers(self) -> None:
+        """+0.0 has bit pattern 0x00000000 (int 0); -0.0 has bit pattern 0x80000000 (int -2147483648)."""
+        # +0.0 -> 0x0000
+        self.assertEqual(sat_i16(POS_ZERO_F32), 0x0000)
+        # -0.0 -> int -2147483648 -> saturates to INT16_MIN (-32768 = 0x8000)
+        self.assertEqual(sat_i16(NEG_ZERO_F32), 0x8000)
+
+        # Packed +0.0 and -0.0
+        self.assertEqual(ref_cvt_pk_i16_i32(POS_ZERO_F32, NEG_ZERO_F32), 0x80000000)
+        self.assertEqual(ref_cvt_pk_i16_i32(NEG_ZERO_F32, POS_ZERO_F32), 0x00008000)
+
+    def test_positive_floats_saturate_to_max_int16(self) -> None:
+        """Positive float patterns exceeding 32767 saturate to 32767 (0x7FFF)."""
+        pos_floats = [
+            POS_ONE_F32,      # 1.0 (int 1065353216)
+            POS_INF_F32,      # +inf (int 2139095040)
+            QNAN_F32,         # qNaN (int 2143289344)
+            SNAN_F32,         # sNaN (int 2139095041)
+            QNAN_PAYLOAD_F32, # qNaN with payload
+            SNAN_PAYLOAD_F32, # sNaN with payload
+            FLT_MIN_F32,      # 1.175e-38 (int 8388608)
+            FLT_MAX_F32,      # ~3.4e38 (int 2139095039)
+            SUBNORM_MAX_F32,  # max subnormal (int 8388607)
+        ]
+        for flt_bits in pos_floats:
+            with self.subTest(flt=f"{flt_bits:#010x}"):
+                self.assertEqual(sat_i16(flt_bits), 0x7FFF)
+                self.assertEqual(ref_cvt_pk_i16_i32(flt_bits, flt_bits), 0x7FFF7FFF)
+
+    def test_negative_floats_saturate_to_min_int16(self) -> None:
+        """Negative float patterns with bit 31 set represent negative integers < -32768."""
+        neg_floats = [
+            NEG_ONE_F32,         # -1.0 (int -1082130432)
+            NEG_INF_F32,         # -inf (int -8388608)
+            NEG_SUBNORM_MIN_F32, # -subnorm_min (int -2147483647)
+            NEG_SUBNORM_MAX_F32, # -subnorm_max (int -2139095041)
+            0xFFC00000,          # negative qNaN (int -4194304)
+            0xFF800001,          # negative sNaN (int -8388607)
+        ]
+        for flt_bits in neg_floats:
+            with self.subTest(flt=f"{flt_bits:#010x}"):
+                self.assertEqual(sat_i16(flt_bits), 0x8000)
+                self.assertEqual(ref_cvt_pk_i16_i32(flt_bits, flt_bits), 0x80008000)
+
+    def test_subnormals_integer_interpretation_no_ftz(self) -> None:
+        """Subnormal floats with integer values in [1, 32767] pass through without flush-to-zero."""
+        # 0x00000001: float 1.4e-45 -> int 1 -> returns 0x0001
+        self.assertEqual(sat_i16(SUBNORM_MIN_F32), 0x0001)
+
+        # 0x00000042: float 9.25e-44 -> int 66 -> returns 0x0042
+        self.assertEqual(sat_i16(0x00000042), 0x0042)
+
+        # 0x00007FFF: float 4.5916e-41 -> int 32767 -> returns 0x7FFF
+        self.assertEqual(sat_i16(0x00007FFF), 0x7FFF)
+
+        # 0x00008000: float 4.5918e-41 -> int 32768 -> saturates to 0x7FFF
+        self.assertEqual(sat_i16(0x00008000), 0x7FFF)
+
+        # Packed combination of two in-range subnormals
+        self.assertEqual(ref_cvt_pk_i16_i32(0x00000005, 0x0000000A), 0x000A0005)
+
+    def test_float_bitcasts_through_interpreter(self) -> None:
+        """End-to-end execution of float bit patterns through scalar interpreter."""
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u32(RegKind.VGPR, 1, POS_INF_F32)
+        interp.write_reg_u32(RegKind.VGPR, 2, NEG_INF_F32)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_I16_I32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+            src1=Register(RegKind.VGPR, 2),
+        )
+        res = interp.step(inst)
+        # S0 = +inf -> 0x7FFF, S1 = -inf -> 0x8000 => 0x80007FFF
+        self.assertEqual(res, 0x80007FFF)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), 0x80007FFF)
 
 
 if __name__ == "__main__":
