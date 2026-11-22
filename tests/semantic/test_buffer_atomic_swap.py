@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import math
 import os
 import struct
 import sys
@@ -1177,6 +1178,120 @@ class TestBufferAtomicSwapConditionCodes(unittest.TestCase):
         self.interp.step(inst)
         # VCC must not be corrupted by buffer atomic swap
         self.assertEqual(self.interp.vcc, canary)
+
+
+class TestBufferAtomicSwapBoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarBufferInterpreter(mem_size=4096)
+        self.desc = BufferResourceDescriptor(
+            base_address=0,
+            stride=0,
+            num_records=1024,
+        )
+        self.interp.set_buffer_descriptor(4, self.desc)
+
+    def test_last_valid_dword_boundary(self) -> None:
+        # Buffer limit: 1024 bytes. Last valid dword starts at offset 1020.
+        self.interp.mem.write_u32(1020, 0x12345678)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 0x99998888)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 1020)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SWAP,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0x12345678)
+        self.assertEqual(self.interp.mem.read_u32(1020), 0x99998888)
+
+        # Offset 1021 is OOB: 1021 + 4 = 1025 > 1024
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 1021)
+        ret_oob, in_bounds_oob = self.interp.step(inst)
+        self.assertFalse(in_bounds_oob)
+        self.assertEqual(ret_oob, 0)
+
+    def test_zero_capacity_buffer(self) -> None:
+        empty_desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=0)
+        self.interp.set_buffer_descriptor(8, empty_desc)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 0x1234)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SWAP,
+            vdata=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            srsrc=Register(RegKind.SGPR, 8, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertFalse(in_bounds)
+        self.assertEqual(ret, 0)
+
+    def test_integer_extremes(self) -> None:
+        extremes = [0x00000000, 0xFFFFFFFF, 0x7FFFFFFF, 0x80000000]
+        for idx, val in enumerate(extremes):
+            offset = idx * 4
+            self.interp.mem.write_u32(offset, val)
+            self.interp.write_reg_u32(RegKind.VGPR, 0, ~val & MASK32)
+            self.interp.write_reg_u32(RegKind.VGPR, 1, offset)
+
+            inst = Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SWAP,
+                vdata=Register(RegKind.VGPR, 0),
+                vaddr=Register(RegKind.VGPR, 1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=0,
+                mods=BufferAtomicModifiers(glc=True),
+            )
+            ret, in_bounds = self.interp.step(inst)
+            self.assertTrue(in_bounds)
+            self.assertEqual(ret, val)
+            self.assertEqual(self.interp.mem.read_u32(offset), ~val & MASK32)
+
+    def test_ieee754_boundary_and_nan_preservation(self) -> None:
+        # Untyped buffer atomic swap performs raw bitwise dword exchange;
+        # floating point bit patterns (including subnormals, inf, quiet/signaling NaNs)
+        # must never be canonicalized or flushed to zero.
+        ieee_patterns = {
+            "pos_zero": 0x00000000,
+            "neg_zero": 0x80000000,
+            "pos_inf": 0x7F800000,
+            "neg_inf": 0xFF800000,
+            "qnan": 0x7FC00001,
+            "snan": 0x7F800001,
+            "min_subnormal": 0x00000001,
+            "max_subnormal": 0x007FFFFF,
+        }
+
+        offset = 64
+        for name, pattern in ieee_patterns.items():
+            self.interp.mem.write_u32(offset, 0x3F800000)  # 1.0f
+            self.interp.write_reg_u32(RegKind.VGPR, 0, pattern)
+            self.interp.write_reg_u32(RegKind.VGPR, 1, offset)
+
+            inst = Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SWAP,
+                vdata=Register(RegKind.VGPR, 0),
+                vaddr=Register(RegKind.VGPR, 1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=0,
+                mods=BufferAtomicModifiers(glc=True),
+            )
+            ret, in_bounds = self.interp.step(inst)
+            self.assertTrue(in_bounds)
+            self.assertEqual(ret, 0x3F800000)
+            # Memory must hold the exact NaN/subnormal bit pattern
+            self.assertEqual(self.interp.mem.read_u32(offset), pattern, f"Failed for {name}")
+            # Register must have received the previous memory value
+            self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 0), 0x3F800000)
 
 
 if __name__ == "__main__":
