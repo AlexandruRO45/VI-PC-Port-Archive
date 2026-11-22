@@ -82,11 +82,37 @@ when the actual device enables that feature and the pipeline relies on matching 
 narrower input vector. See [Vulkan interface matching][interfaces].
 
 Exit codes are `0` for compatible interfaces, `1` for a mismatch and `2` for a bad input or an interface
-the reader cannot interpret. Continue with the driver checker for shader instruction validation, resource
-bindings, device limits and pipeline state. Shader pairs must come from the caller. Share aggregate counts
-and error classes, keeping the local shader files and reports that identify them on your PC.
+the reader cannot interpret. Shader pairs must come from the caller. Share aggregate counts and error
+classes, keeping the local shader files and reports that identify them on your PC.
 
 [interfaces]: https://docs.vulkan.org/spec/latest/chapters/interfaces.html#interfaces-iointerfaces-matching
+
+### Compile the same chains with Vulkan
+
+After the interface check passes, give the same manifest to the native driver checker.
+
+```powershell
+vk_pipeline_check <spirv> chains.cache --graphics-manifest pairs.json --jobs 2 --cache-feedback
+```
+
+The checker loads each stage and entry point named in the manifest, with metadata from
+`<spirv>/index.json`. Each chain uses the largest push-constant range needed by its
+stages and includes descriptor set 1 if a stage was translated with `--pc-tail-ubo`. It creates VS → PS, VS → GS → PS, VS → GS, and native Mesh → PS
+pipelines without partner stubs. The GS entry point supplies the input primitive topology. A chain
+ending at GS uses rasterizer discard. The VS vertex attributes and the PS color/depth attachments
+come from the translator index. Each stage uses its own subgroup size when the device supports it.
+
+`--start` and `--count` select chains in manifest order. `--max-bytes` skips a chain if any of its
+modules exceeds the limit. The large-module gate uses the combined SPIR-V size of all stages.
+Set `--large-module-bytes` to tune the size at which the gate applies and `--large-parallel 1`
+to compile large chains exclusively. A failed module or pipeline is counted once per chain and the remaining
+chains still run. Unsupported stage features are reported as skips. Check the final pass, fail
+and skip counts. `--stats` records each compiled stage under the chain's name. `--isolate`,
+`--inflight-file` and `--skip-file` are available only for corpus mode.
+
+The driver check uses the translator's resource layout and synthetic graphics state. A successful
+pipeline creation establishes acceptance on that device. Draw results and the game's actual
+pipeline state are separate tests.
 
 ## Audit wave fidelity for the target GPU
 
