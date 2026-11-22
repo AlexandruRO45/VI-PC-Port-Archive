@@ -142,6 +142,10 @@ def observe_native(name, image, expected, log, *, timeout=10, settle=10, env=Non
         raise AssertionError(
             f"{name}: process exited {row['code']:#x} after {row['elapsed_ms']} ms, expected {expected:#x} "
             f"(TLS/entry digits {decode_log(row['code'])}, expected {log})")
+    for stream in ("stdout", "stderr"):
+        pipe = row[stream]
+        if not pipe["eof"] or pipe["error"]:
+            raise AssertionError(f"{name}: process exited but {stream} did not reach clean EOF: {pipe!r}")
     if row["stdout"]["bytes"] or row["stderr"]["bytes"]:
         raise AssertionError(f"{name}: wrote output {row['stdout']['bytes']!r} {row['stderr']['bytes']!r}")
     return row
@@ -230,6 +234,14 @@ def check_late_exit_diagnostic():
         expect_failure("same row without the late exit", lambda: observe_native("original", "x.exe", 0x60d, [1, 2],
                                                                                 status_rva=0),
                        "state unknown", "lingering process")
+        clean = {"bytes": b"", "eof": True, "error": None}
+        for stream in ("stdout", "stderr"):
+            row = {"process_signaled": True, "code": 0x60d, "elapsed_ms": 50.0, "stdout": clean, "stderr": clean}
+            row[stream] = {**clean, "eof": False}
+            expect_failure(f"open {stream} after exit",
+                           lambda: observe_native("original", "x.exe", 0x60d, [1, 2], status_rva=0),
+                           f"{stream} did not reach clean EOF")
+
     finally:
         launch = real
 

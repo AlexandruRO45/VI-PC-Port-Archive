@@ -533,6 +533,58 @@ def sopk_scalar() -> list[str]:
     ])
 
 
+SOPK_CMPK_OPS = ("eq", "lg", "gt", "ge", "lt", "le")
+SOPK_CMPK_WORDS = (
+    (0xffff7fff, 0x00007fff, 0x13579bdf, 0xffffffff),
+    (0xffff8000, 0x00008000, 0x13579bdf, 0x0000ffff),
+    (0x00008000, 0xffff8000, 0x2468ace0, 0xffffffff),
+    (0xffff8001, 0x00008001, 0x2468ace0, 0),
+)
+
+
+def sopk_cmpk_cmovk() -> list[str]:
+    body = ["s_mov_b32 s52, 0", "s_mov_b32 s53, 0"]
+    for bit, op in enumerate(SOPK_CMPK_OPS):
+        flag = 1 << bit
+        body += [
+            f"s_cmpk_{op}_i32 s44, 0x8000",
+            f"s_cselect_b32 s63, {flag}, 0",
+            "s_or_b32 s52, s52, s63",
+            f"s_cmpk_{op}_u32 s45, 0x8000",
+            f"s_cselect_b32 s63, {flag}, 0",
+            "s_or_b32 s53, s53, s63",
+        ]
+    body += [
+        "s_mov_b32 s50, s46",
+        "s_mov_b32 s51, s46",
+        "s_cmpk_eq_i32 s47, 0xffff",
+        "s_cmovk_i32 s50, 0xfffe",
+        "s_cmovk_i32 s51, 0x7fff",
+        "v_mov_b32_e32 v12, s52",
+        "v_mov_b32_e32 v13, s53",
+        "v_mov_b32_e32 v14, s50",
+        "v_mov_b32_e32 v15, s51",
+    ]
+    return uncompressed_export(body)
+
+
+def sopk_cmpk_cmovk_reference(words):
+    s44, s45, s46, s47 = words
+    signed44 = s44 - (1 << 32) if s44 >> 31 else s44
+    preds = {
+        "eq": lambda a, b: a == b,
+        "lg": lambda a, b: a != b,
+        "gt": lambda a, b: a > b,
+        "ge": lambda a, b: a >= b,
+        "lt": lambda a, b: a < b,
+        "le": lambda a, b: a <= b,
+    }
+    mask_i32 = sum((1 << bit) for bit, op in enumerate(SOPK_CMPK_OPS) if preds[op](signed44, -0x8000))
+    mask_u32 = sum((1 << bit) for bit, op in enumerate(SOPK_CMPK_OPS) if preds[op](s45, 0x8000))
+    take = s47 == 0xffffffff
+    return (mask_i32, mask_u32, 0xfffffffe if take else s46, 0x00007fff if take else s46)
+
+
 def rounding():
     """Round scaled samples up and to nearest even, and a constant tie through the VOP3 encoding."""
     return with_constants([
@@ -2088,14 +2140,18 @@ def check_scalar_pack_draw(directory, compiler, renderer, backend):
     for halves in PACK_HALVES:
         source.write_text(translate(scalar_pack_values(halves)), encoding="ascii")
         compile_shader(compiler, source, shader, ieee=False)
-        for flag, words in enumerate(((0x1234abcd, 0x5678ef90), (0xffff0000, 0x0000ffff))):
+        # The third pair sets every bit of each half LL and LH select, so a mask that drops any one bit
+        # of a selected half (0xfffd for the low half, 0xfffe0000 for the high half) breaks the equality.
+        for index, words in enumerate(((0x1234abcd, 0x5678ef90), (0xffff0000, 0x0000ffff),
+                                       (0x0000ffff, 0xffffffff))):
+            flag = index % 2
             selected = [struct.unpack("<HH", struct.pack("<I", word))[half == "h"]
                         for word, half in zip(words, halves)]
             constants = bytearray(256)
             struct.pack_into("<IIHHI", constants, 12, *words, *selected, flag)
             case.write_bytes(constants + struct.pack("<4f", 1, flag, 0, 0) * 64)
             subprocess.run(draw, check=True)
-            if halves == "lh" and flag == 0:
+            if halves == "lh" and index == 0:
                 # Compile LL against the unchanged LH reference; only the selected high half differs.
                 source.write_text(translate(scalar_pack_values("ll")), encoding="ascii")
                 mutant = directory / "wrong-pack.cso"
@@ -2136,6 +2192,42 @@ def check_sext_draw(directory, compiler, renderer, backend):
     struct.pack_into("<II", constants, 16, 255, 65535)
     case.write_bytes(constants + struct.pack("<4f", 0, 0, flag, flag) * 64)
     subprocess.run(draw, check=True)
+
+
+SOP1_WORDS = (
+    (0, 0x2468ace1, 0x12400009, 3),
+    (0xfffffffb, 0x2468ace1, 0x12400009, 35),
+    (5, 0x11223344, 0x81400008, 0),
+    (0x80000000, 0x55667788, 0x81400009, 31),
+)
+
+
+def sop1_scalar_ops() -> list[str]:
+    return uncompressed_export([
+        "s_abs_i32 s50, s44",
+        "s_mov_b32 s51, s46",
+        "s_cmov_b32 s51, s45",
+        "s_mov_b32 s52, s46",
+        "s_bitset0_b32 s52, s47",
+        "s_bitset1_b32 s52, 31",
+        "s_mov_b32 s53, s46",
+        "s_cmov_b32 s53, 0x12345678",
+        "v_mov_b32_e32 v12, s50",
+        "v_mov_b32_e32 v13, s51",
+        "v_mov_b32_e32 v14, s52",
+        "v_mov_b32_e32 v15, s53",
+    ])
+
+
+def sop1_scalar_ops_reference(words):
+    s44, s45, s46, s47 = words
+    signed44 = s44 - (1 << 32) if s44 >> 31 else s44
+    abs44 = (-signed44 if signed44 < 0 else signed44) & 0xffffffff
+    scc = abs44 != 0
+    cmov_reg = s45 if scc else s46
+    bitset = (s46 & ~(1 << (s47 & 31))) | (1 << 31)
+    cmov_lit = 0x12345678 if scc else s46
+    return (abs44, cmov_reg, bitset & 0xffffffff, cmov_lit)
 
 
 def scalar():
@@ -2283,21 +2375,23 @@ def check_scalar_controls():
     for new in ("s_addc_u32 s62, s44, s45", "s_subb_u32 s62, s44, s45", "s_mul_hi_u32 s62, s44, s45",
                 "s_absdiff_i32 s62, s44, s45",
                 "s_nand_b32 s62, v12, s45", "s_nor_b32 v62, s44, s45", "s_xnor_b32 s62, s44",
-                "s_bfe_u32 s62, v12, s45", "s_lshl1_add_u32 s62, s44, s45", "s_abs_i32 s62, s44",
+                "s_bfe_u32 s62, v12, s45", "s_lshl1_add_u32 s62, s44, s45",
+                "s_quadmask_b32 s62, s44", "s_bitset0_b64 s[62:63], s44",
                 "s_brev_b32 s62, s44", "s_and_b64 s[62:63], s[44:46], s[46:47]",
                 "s_add_u32 s62, s[44:45], s45", "s_add_u32 s62, s44", "s_add_u32 s62, s44, s45, s46",
                 "s_add_u32 s62, -s44, s45", "s_add_u32 s62, s28, s45", "s_add_u32 s62, s20, s45",
                 "s_add_u32 s62, s90, s45", "s_add_u32 s62, vcc_lo, s45", "s_add_u32 s62, exec_lo, s45",
                 "s_add_u32 s62, v12, s45", "s_add_u32 m0, s44, s45", "s_add_u32 vcc_lo, s44, s45",
                 "s_add_u32 s62, s44, |s45|",
-                "s_cmp_eq_u64 s[44:46], s[46:47]", "s_bitcmp1_b32 v12, s45", "s_cmpk_eq_u32 s44, 0x10",
+                "s_cmp_eq_u64 s[44:46], s[46:47]", "s_bitcmp1_b32 v12, s45",
+                "s_cmpk_eq_u32 s44, 0x10000", "s_cmpk_eq_u32 s44, -1", "s_cmpk_eq_f32 s44, 0x10",
                 "s_cmp_lt_i32 s44", "s_cmp_lt_f32 s44, s45"):
         changed = [line.replace(first, new) for line in program]
         assert changed != program, new
         must_reject(translate, changed)
     flag = program.index(first) + 1
-    for new in ("s_cselect_b64 s[62:63], s44, s45", "s_cmovk_i32 s63, 0x1", "s_cselect_b32 s63, s28, 0",
-                "s_cselect_b32 vcc_lo, 1, 0"):
+    for new in ("s_cselect_b64 s[62:63], s44, s45", "s_cmovk_i32 s63, 0x10000", "s_cmovk_i32 vcc_lo, 0x1",
+                "s_cselect_b32 s63, s28, 0", "s_cselect_b32 vcc_lo, 1, 0"):
         must_reject(translate, program[:flag] + [new] + program[flag + 1:])
     # Before lgkmcnt(0) the constant words are still loading: neither read nor overwrite them.
     load = program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc") + 1
@@ -2305,6 +2399,37 @@ def check_scalar_controls():
                  "s_cselect_b32 s47, 1, 0"):
         must_reject(translate, program[:load] + ["s_cmp_eq_u32 1, 1", line] + program[load:])
     translate(program[:load] + ["s_cmp_eq_u32 1, 1", "s_cselect_b32 s62, 1, 0"] + program[load:])
+
+    sop1_program = sop1_scalar_ops()
+    sop1_source = translate_int(sop1_program)
+    for expected in ("(asint(asuint(params[0].w)) < 0 ? (0u - asuint(params[0].w)) : asuint(params[0].w))",
+                     "& ~(1u << (", "| (1u << (31u & 31u))", "? 305419896u :"):
+        assert expected in sop1_source, expected
+    sop1_refs = [sop1_scalar_ops_reference(words) for words in SOP1_WORDS]
+    assert any(r[0] == 0 for r in sop1_refs) and any(r[0] == 0x80000000 for r in sop1_refs)
+    assert any(r[3] == 0x12400009 for r in sop1_refs) and any(r[3] == 0x12345678 for r in sop1_refs)
+    must_reject(translate, base[:andexec] + ["s_mov_b32 s51, 0", "s_cmov_b32 s51, s40"] + base[andexec:])
+    must_reject(translate, base[:andexec] + ["s_cmp_eq_u32 1, 1"] + base[andexec:andexec + 1]
+                + ["s_mov_b32 s51, 0", "s_cmov_b32 s51, s40"] + base[andexec + 1:])
+    must_reject(translate, base[:wqm] + ["s_cmp_eq_u32 1, 1"] + base[wqm:wqm + 1]
+                + ["s_mov_b32 s51, 0", "s_cmov_b32 s51, s40"] + base[wqm + 1:])
+    for uninit in ("s_cmov_b32 s60, s44", "s_bitset0_b32 s60, 1", "s_bitset1_b32 s60, 1"):
+        must_reject(translate, base[:andexec] + ["s_cmp_eq_u32 1, 1", uninit] + base[andexec:])
+    sop1_wait = sop1_program.index("s_waitcnt lgkmcnt(0)", sop1_program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc"))
+    for bad in ("s_abs_i32 s50, s44", "s_cmov_b32 s44, 1", "s_bitset0_b32 s44, 1", "s_bitset1_b32 s44, 1"):
+        must_reject(translate_int, sop1_program[:sop1_wait] + ["s_cmp_eq_u32 1, 1", bad] + sop1_program[sop1_wait:])
+    for old, new in (("s_abs_i32 s50, s44", "s_abs_i32 v12, s44"),
+                     ("s_abs_i32 s50, s44", "s_abs_i32 s106, s44"),
+                     ("s_cmov_b32 s51, s45", "s_cmov_b32 vcc_lo, s45"),
+                     ("s_cmov_b32 s51, s45", "s_cmov_b32 s106, s45"),
+                     ("s_bitset0_b32 s52, s47", "s_bitset0_b32 v12, 1"),
+                     ("s_bitset1_b32 s52, 31", "s_bitset1_b32 s106, 1"),
+                     ("s_bitset0_b32 s52, s47", "s_bitset0_b64 s[52:53], 1"),
+                     ("s_bitset1_b32 s52, 31", "s_bitset1_b64 s[52:53], 1"),
+                     ("s_bitset0_b32 s52, s47", "s_bitset0_b32 s52, v12")):
+        changed = [line.replace(old, new) for line in sop1_program]
+        assert changed != sop1_program, new
+        must_reject(translate_int, changed)
 
 
 # SDWA moves and half widening. In SDWA_PRESERVE_BODY each move writes a 16-bit field into WORD_0 of a register
@@ -2971,6 +3096,10 @@ DPP_BODY = [
     "v_add_f32_e32 v12, v21, v22",
     "v_add_f32_e32 v12, v12, v23",
     "v_add_f32_e32 v12, v12, v27",
+    # DPP16 neg on src1: v23 is 3 in every lane, so v45 = 3 + -3 = 0 and leaves channel 0 unchanged;
+    # a dropped src1 neg gives 6.
+    "v_add_f32_dpp v45, v23, -v23 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf",
+    "v_add_f32_e32 v12, v12, v45",
     "v_add_f32_e32 v12, s44, v12",
     "v_mov_b32_e32 v28, s45",
     "v_mov_b32_e32 v29, s46",
@@ -3048,6 +3177,7 @@ def check_dpp_draw(directory, compiler, renderer, backend):
         (0, "v_mul_f32_dpp v31, v20, v28 quad_perm:[3,3,3,3]",
          "v_mul_f32_dpp v31, v20, v28 quad_perm:[1,1,1,1]", "lane broadcast"),
         (0, "v_min_f32_dpp v33, -v31, v30", "v_min_f32_dpp v33, v31, v30", "DPP16 neg modifier"),
+        (0, "v_add_f32_dpp v45, v23, -v23", "v_add_f32_dpp v45, v23, v23", "DPP16 src1 neg modifier"),
         (1, "v_floor_f32_dpp v36, v35", "v_ceil_f32_dpp v36, v35", "floor vs ceil DPP"),
     ):
         a, b, h_bits, c = DPP_SETS[set_idx]
@@ -3806,6 +3936,44 @@ def check_controls(directory):
 
     wait = program.index("s_waitcnt lgkmcnt(0)", program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc"))
     must_reject(translate, program[:wait] + ["s_mulk_i32 s44, 0x3"] + program[wait:])
+
+    cmpk_program = sopk_cmpk_cmovk()
+    cmpk_source = translate_int(cmpk_program)
+    for expected in ("(asint(asuint(params[0].w)) < asint(4294934528u))",
+                     "(asuint(params[1].x) < 32768u)",
+                     "? 4294967294u : ",
+                     "? 32767u : "):
+        assert expected in cmpk_source, expected
+    refs = [sopk_cmpk_cmovk_reference(words) for words in SOPK_CMPK_WORDS]
+    for bit in range(len(SOPK_CMPK_OPS)):
+        assert any(r[0] & (1 << bit) for r in refs) and any(not (r[0] & (1 << bit)) for r in refs)
+        assert any(r[1] & (1 << bit) for r in refs) and any(not (r[1] & (1 << bit)) for r in refs)
+    assert any(r[2] == 0xfffffffe for r in refs) and any(r[2] == 0x13579bdf for r in refs)
+    base = assembly(False)
+    wqm = base.index("s_wqm_b64 exec, exec")
+    andexec = base.index("s_and_b64 exec, exec, s[50:51]")
+    must_reject(translate, base[:andexec] + ["s_mov_b32 s50, 0", "s_cmovk_i32 s50, 1"] + base[andexec:])
+    must_reject(translate, base[:andexec] + ["s_cmp_eq_u32 1, 1"] + base[andexec:andexec + 1]
+                + ["s_mov_b32 s50, 0", "s_cmovk_i32 s50, 1"] + base[andexec + 1:])
+    must_reject(translate, base[:wqm] + ["s_cmp_eq_u32 1, 1"] + base[wqm:wqm + 1]
+                + ["s_mov_b32 s50, 0", "s_cmovk_i32 s50, 1"] + base[wqm + 1:])
+    must_reject(translate_int, [line.replace("s_mov_b32 s50, s46", "s_nop 0") for line in cmpk_program])
+    cmpk_wait = cmpk_program.index("s_waitcnt lgkmcnt(0)", cmpk_program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc"))
+    for bad in ("s_cmpk_eq_i32 s44, 0x0", "s_cmovk_i32 s44, 0x1"):
+        must_reject(translate_int, cmpk_program[:cmpk_wait] + ["s_cmp_eq_u32 1, 1", bad] + cmpk_program[cmpk_wait:])
+    for old, new in (("s_cmpk_eq_i32 s44, 0x8000", "s_cmpk_eq_i32 s44, 0x10000"),
+                     ("s_cmpk_eq_i32 s44, 0x8000", "s_cmpk_eq_i32 s44, -32769"),
+                     ("s_cmpk_eq_u32 s45, 0x8000", "s_cmpk_eq_u32 s45, 0x10000"),
+                     ("s_cmpk_eq_u32 s45, 0x8000", "s_cmpk_eq_u32 s45, -1"),
+                     ("s_cmpk_eq_i32 s44, 0x8000", "s_cmpk_eq_i32 s106, 0x0"),
+                     ("s_cmpk_eq_i32 s44, 0x8000", "s_cmpk_eq_i32 v12, 0x0"),
+                     ("s_cmovk_i32 s50, 0xfffe", "s_cmovk_i32 s50, 0x10000"),
+                     ("s_cmovk_i32 s50, 0xfffe", "s_cmovk_i32 s50, -32769"),
+                     ("s_cmovk_i32 s50, 0xfffe", "s_cmovk_i32 s106, 0x1"),
+                     ("s_cmovk_i32 s50, 0xfffe", "s_cmovk_i32 v12, 0x1")):
+        changed = [line.replace(old, new) for line in cmpk_program]
+        assert changed != cmpk_program, new
+        must_reject(translate_int, changed)
     source = translate(rounding())
     for expected in ("= ceil(alu", "= round(alu", "= round(params[1].x);", "= ceil((-params[1].y));"):
         assert expected in source, expected
@@ -4318,11 +4486,12 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
                 (rounding(), translate), (arithmetic(), translate), (with_scalar_constant_reads(), translate), (with_scalar_pair_reads(), translate),
                 (truncate_values(), translate), (affine_coordinates(), translate), (ceiling(), translate),
-                (scalar64(), translate), (sopk_scalar(), translate)]
+                (scalar64(), translate), (sopk_scalar(), translate), (sopk_cmpk_cmovk(), translate_int)]
     fixtures.append((rgb_sample(), translate))
     fixtures.append((with_constants(TRIG_BODY), translate))
     fixtures.append((with_constants(CLASS_BODY), translate))
     fixtures.append((sext_values(), translate))
+    fixtures.append((sop1_scalar_ops(), translate_int))
     fixtures.extend((scalar_pack_values(halves), translate) for halves in PACK_HALVES)
     fixtures.append((with_constants(RECIPROCAL_BODY), translate))
     fixtures.append((bitwise_program(), translate))
@@ -4641,13 +4810,15 @@ def check_subrev_u32_draw(directory, compiler, renderer, backend):
 # v_cvt_f32_u32_e32 and v_cvt_f32_i32_e32 convert one 32-bit word to binary32, reading it unsigned
 # or two's-complement. The inputs are shader literals moved through v_mov_b32 bit copies, not
 # constant-buffer words (#360): the pairs cover zero and one, the last exactly representable integer
-# 2**24, the ties 2**24+1 and 2**25+2, the non-tie neighbors 2**25+1 and 2**25+3 of a midpoint, and
+# 2**24, the ties 2**24+1 and 2**25+2, the non-tie neighbors 2**25+1 and 2**25+3 of a midpoint, the
+# ties 2**24+3 and 2**25-1 that round up (3 mod 4, so clearing their low bit changes the result), and
 # the extreme words 0xFFFFFFFF, 0x80000000 and 0x7FFFFFFF.
 CVT_INT_WORDS = (
     (0, 1),
     (2**24, 2**24 + 1),
     (2**25 + 1, 2**25 + 3),
     (2**25 + 2, 0x7FFFFFFF),
+    (2**24 + 3, 2**25 - 1),
     (0xFFFFFFFF, 0x80000000),
 )
 
@@ -4682,6 +4853,18 @@ def check_cvt_int_f32_draw(directory, compiler, renderer, backend):
         compile_shader(compiler, source, shader)
         write_case(case, constants, (u32f(w0), i32f(w0), u32f(w1), i32f(w1)))
         subprocess.run(draw, check=True)
+    # The round-up ties of [2**24, 2**25) must not be read with their low bit cleared: that lands on the
+    # representable value 2 below the nearest-even result.
+    w0, w1 = 2**24 + 3, 2**25 - 1
+    assert (w0, w1) in CVT_INT_WORDS
+    assert (u32f(w0), u32f(w1)) == (2.0**24 + 4, 2.0**25)
+    assert (u32f(w0 & ~1), u32f(w1 & ~1)) == (2.0**24 + 2, 2.0**25 - 2)
+    source.write_text(translate(uncompressed_export(cvt_int_body(w0, w1))), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    write_case(case, constants, (u32f(w0 & ~1), i32f(w0), u32f(w1 & ~1), i32f(w1)))
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Rounding a midpoint u32 word from its low-bit-cleared neighbor escaped detection")
     # The last pair's words all have the sign bit set, so swapping the two conversions must be caught.
     w0, w1 = CVT_INT_WORDS[-1]
     assert u32f(w0) != i32f(w0) and u32f(w1) != i32f(w1)
@@ -4706,6 +4889,25 @@ def check_cvt_int_f32_e64_draw(directory, compiler, renderer, backend):
         compile_shader(compiler, source, shader)
         write_case(case, constants, (u32f(w0), i32f(w0), u32f(w1), i32f(w1)))
         subprocess.run(draw, check=True)
+    # SGPR source row: constant-buffer words with the sign bit set, read directly by the unclamped e64
+    # conversions. The words are the normal binary32 patterns of -2.0 and -1.0, so the load carries no
+    # NaN or denormal. Reading the unsigned conversion as signed must be caught.
+    w0, w1 = 0xC0000000, 0xBF800000
+    scalar_constants = bytearray(256)
+    struct.pack_into("<2I", scalar_constants, 12, w0, w1)
+    scalar_constants = bytes(scalar_constants)
+    assert (u32f(w0), u32f(w1)) == (3221225472.0, 3212836864.0)
+    assert (i32f(w0), i32f(w1)) == (-1073741824.0, -1082130432.0)
+    program = uncompressed_export(["v_cvt_f32_u32_e64 v12, s44", "v_cvt_f32_i32_e64 v13, s44",
+                                   "v_cvt_f32_u32_e64 v14, s45", "v_cvt_f32_i32_e64 v15, s45"])
+    source.write_text(translate(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    write_case(case, scalar_constants, (u32f(w0), i32f(w0), u32f(w1), i32f(w1)))
+    subprocess.run(draw, check=True)
+    write_case(case, scalar_constants, (i32f(w0), i32f(w0), i32f(w1), i32f(w1)))
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Reading an SGPR word as signed in v_cvt_f32_u32_e64 escaped detection")
     # Clamp rows: the modifier maps the conversion through min(1.0, max(0.0, .)), computed from
     # the same u32f/i32f references. The words cover the interior 0 and 1, values past 1 (2,
     # 0xFFFFFFFF and 0x7FFFFFFF, which rounds to 2147483648.0 before clamping) and the negative
@@ -4726,6 +4928,24 @@ def check_cvt_int_f32_e64_draw(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Dropping clamp from the e64 conversion escaped detection")
+    # Clamped VGPR row whose positive words have a zero low half: the signed conversion clamps them to
+    # 1.0, and any reading that drops bits 16 to 30 gives 0 and clamps to 0.0.
+    w0, w1 = 0x00010000, 0x7FFF0000
+    program = uncompressed_export(cvt_int_body(w0, w1, e64=True, clamp=True))
+    source.write_text(translate(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    expected = tuple(min(1.0, max(0.0, ref(word)))
+                     for word, ref in ((w0, u32f), (w0, i32f), (w1, u32f), (w1, i32f)))
+    assert expected == (1.0, 1.0, 1.0, 1.0)
+    write_case(case, constants, expected)
+    subprocess.run(draw, check=True)
+    masked = tuple(min(1.0, max(0.0, ref(word)))
+                   for word, ref in ((w0, u32f), (w0 & 0x8000FFFF, i32f), (w1, u32f), (w1 & 0x8000FFFF, i32f)))
+    assert masked == (1.0, 0.0, 1.0, 0.0)
+    write_case(case, constants, masked)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Dropping the high bits of a clamped signed conversion escaped detection")
     # The last pair's words all have the sign bit set, so under clamp swapping the two conversions
     # exchanges 1.0 and 0.0 on every channel: u32 clamps to 1 where i32 of the same word clamps to 0.
     w0, w1 = CVT_INT_WORDS[-1]
@@ -4834,6 +5054,31 @@ def check_cvt_float_int_draw(directory, compiler, renderer, backend):
     compile_shader(compiler, source, shader)
     write_words((3, 0xfffffffd, 0xffffffff, 0x80000000))
     subprocess.run(draw, check=True)
+
+    # Literal source: hex binary32 operands outside the inline-constant set, converted directly. The
+    # unsigned values exceed 1.0 and the signed ones are negative below -1.0, so clamping the unsigned
+    # operand or taking the magnitude of the signed one changes every channel.
+    constants = bytes(256)
+    literals = (0x40600000, 0xc0300000, 0x4f7fffff, 0xc0500000)
+    program = uncompressed_export([f"v_cvt_u32_f32_e32 v12, {literals[0]:#010x}",
+                                   f"v_cvt_i32_f32_e32 v13, {literals[1]:#010x}",
+                                   f"v_cvt_u32_f32_e32 v14, {literals[2]:#010x}",
+                                   f"v_cvt_i32_f32_e32 v15, {literals[3]:#010x}"])
+    source.write_text(translate_int(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    expected = (cvt_u32_ref(literals[0]), cvt_i32_ref(literals[1]),
+                cvt_u32_ref(literals[2]), cvt_i32_ref(literals[3]))
+    assert expected == (3, 0xfffffffe, 0xffffff00, 0xfffffffd)
+    write_words(expected)
+    subprocess.run(draw, check=True)
+    one = 0x3f800000
+    mutated = (cvt_u32_ref(one), cvt_i32_ref(literals[1] & 0x7fffffff),
+               cvt_u32_ref(one), cvt_i32_ref(literals[3] & 0x7fffffff))
+    assert mutated == (1, 2, 1, 3)
+    write_words(mutated)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Clamping or dropping the sign of a literal float-to-word operand escaped detection")
 
     # Negative control: swapped conversions against the unswapped expectation. Channels v14 and v15
     # hold -1.0, which converts to 0 unsigned and 0xffffffff signed.
@@ -5501,6 +5746,41 @@ def check_render(directory, compiler, renderer, backend, *, core_only=False):
     return check_blend_and_scalar_draws(directory, compiler, renderer, backend)
 
 
+def check_sopk_cmpk_cmovk_draw(directory, compiler, renderer, backend):
+    source = directory / "sopk_cmpk_cmovk.hlsl"
+    shader = directory / "sopk_cmpk_cmovk.cso"
+    case = directory / "sopk_cmpk_cmovk.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    program = sopk_cmpk_cmovk()
+
+    def write_words(words, expected):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        for word in expected:
+            assert struct.unpack("<I", struct.pack("<f", as_float(word)))[0] == word, hex(word)
+        write_case(case, bytes(constants), tuple(as_float(word) for word in expected), integer_rt=True)
+
+    source.write_text(translate_int(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    for words in SOPK_CMPK_WORDS:
+        write_words(words, sopk_cmpk_cmovk_reference(words))
+        subprocess.run(draw, check=True)
+
+    words = SOPK_CMPK_WORDS[0]
+    write_words(words, sopk_cmpk_cmovk_reference(words))
+    for old, new, label in (
+        ("s_cmpk_lt_i32 s44, 0x8000", "s_cmpk_lt_u32 s44, 0x8000", "signed sopk comparison"),
+        ("s_cmovk_i32 s50, 0xfffe", "s_cmovk_i32 s50, 0x7fff", "sopk conditional move"),
+    ):
+        mutated = [line.replace(old, new) for line in program]
+        assert mutated != program, label
+        source.write_text(translate_int(mutated), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Mutating {label} escaped detection")
+
+
 def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
     source = directory / "fixture.hlsl"
     shader = directory / "fixture.cso"
@@ -5534,6 +5814,8 @@ def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
 
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Changing the sopk multiply escaped detection")
+
+    check_sopk_cmpk_cmovk_draw(directory, compiler, renderer, backend)
 
     source.write_text(translate(rounding()), encoding="ascii")
     compile_shader(compiler, source, shader)
@@ -5681,7 +5963,43 @@ def check_blend_and_scalar_draws(directory, compiler, renderer, backend):
         wrong = subprocess.run([renderer, backend, "--check-pixel-case", shader, case], capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError(f"Replacing {old} with {new} escaped detection")
+    check_sop1_scalar_ops_draw(directory, compiler, renderer, backend)
     return 0
+
+
+def check_sop1_scalar_ops_draw(directory, compiler, renderer, backend):
+    source = directory / "sop1_scalar_ops.hlsl"
+    shader = directory / "sop1_scalar_ops.cso"
+    case = directory / "sop1_scalar_ops.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    program = sop1_scalar_ops()
+
+    def write_words(words, expected):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        for word in expected:
+            assert struct.unpack("<I", struct.pack("<f", as_float(word)))[0] == word, hex(word)
+        write_case(case, bytes(constants), tuple(as_float(word) for word in expected), integer_rt=True)
+
+    source.write_text(translate_int(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    for words in SOP1_WORDS:
+        write_words(words, sop1_scalar_ops_reference(words))
+        subprocess.run(draw, check=True)
+
+    words = SOP1_WORDS[1]
+    write_words(words, sop1_scalar_ops_reference(words))
+    for old, new, label in (
+        ("s_abs_i32 s50, s44", "s_not_b32 s50, s44", "signed scalar abs"),
+        ("s_bitset0_b32 s52, s47", "s_bitset1_b32 s52, s47", "scalar bitset clear"),
+    ):
+        mutated = [line.replace(old, new) for line in program]
+        assert mutated != program, label
+        source.write_text(translate_int(mutated), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Mutating {label} escaped detection")
 
 
 def check_e64_render(directory, compiler, renderer, backend):

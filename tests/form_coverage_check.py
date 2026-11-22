@@ -324,15 +324,16 @@ def check_shader_records():
         assert compare_forms <= covered, (name, sorted(compare_forms - covered))
         assert not {form for _, form in covered} & (compare_neighbours | {f"{n}_e64" for n in compare_neighbours})
     # The scalar ALU fixture counts its SOP1, SOP2, SOPK and SOPC forms; the neighbours the controls
-    # reject (s_addc_u32, s_cmp_eq_u64, s_cmpk_eq_u32, s_cselect_b64) stay out.
-    scalar = {"s_movk_i32", "s_not_b32", "s_add_u32", "s_sub_u32", "s_add_i32", "s_sub_i32", "s_mul_i32",
-              "s_min_u32", "s_max_u32", "s_min_i32", "s_max_i32", "s_and_b32", "s_or_b32", "s_xor_b32",
-              "s_andn2_b32", "s_orn2_b32", "s_lshl_b32", "s_lshr_b32", "s_ashr_i32", "s_cselect_b32",
-              *(f"s_cmp_{r}_{t}32" for r in ("eq", "lg", "gt", "ge", "lt", "le") for t in "iu")}
+    # reject (s_addc_u32, s_cmp_eq_u64, s_getreg_b32, s_cselect_b64) stay out.
+    scalar = {"s_movk_i32", "s_cmovk_i32", "s_not_b32", "s_add_u32", "s_sub_u32", "s_add_i32", "s_sub_i32",
+              "s_mul_i32", "s_min_u32", "s_max_u32", "s_min_i32", "s_max_i32", "s_and_b32", "s_or_b32",
+              "s_xor_b32", "s_andn2_b32", "s_orn2_b32", "s_lshl_b32", "s_lshr_b32", "s_ashr_i32",
+              "s_cselect_b32", *(f"s_cmp_{r}_{t}32" for r in ("eq", "lg", "gt", "ge", "lt", "le") for t in "iu"),
+              *(f"s_cmpk_{r}_{t}32" for r in ("eq", "lg", "gt", "ge", "lt", "le") for t in "iu")}
     for name in ("gfx1013.tsv", "rdna2.tsv"):
         forms = fc.gfx_forms(pixel.ACCEPTED, fc.load_reference(name))
         assert {form for _, form in forms} >= scalar, sorted(scalar - {form for _, form in forms})
-        assert not {"s_addc_u32", "s_cmp_lt_u64", "s_cmpk_eq_u32", "s_cselect_b64"} & {f for _, f in forms}
+        assert not {"s_addc_u32", "s_cmp_lt_u64", "s_getreg_b32", "s_cselect_b64"} & {f for _, f in forms}
         assert {group for group, form in forms if form in scalar} == {"SOP1", "SOP2", "SOPC", "SOPK"}
     # The rounding fixture covers both encodings of v_ceil_f32 and v_rndne_f32 once its test passes.
     rounding = {("VOP1", "v_ceil_f32"), ("VOP1", "v_rndne_f32"),

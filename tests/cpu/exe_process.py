@@ -162,7 +162,7 @@ def launch(command, data, *, env=None, timeout=15, on_unfinished=None):
                           entry_signaled=_winapi.WaitForSingleObject(entry_handle, 0) == 0,
                           entry_code=thread_exit_code(entry_handle),
                           live_threads=thread_ids(child.pid))
-            if on_unfinished:
+            if on_unfinished and not process_signaled:
                 result["unfinished"] = on_unfinished(child.pid)
             # The process may have ended between the deadline and the end of the hook; record that separately.
             result["signaled_after_hook"] = _winapi.WaitForSingleObject(child._handle, 0) == 0
