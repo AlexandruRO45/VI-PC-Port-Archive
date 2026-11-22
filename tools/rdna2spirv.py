@@ -7320,6 +7320,42 @@ class Gen:
             self.emit(f"{fi} = OpConvertSToF %float {self.as_int(i4)}")
             self.emit(f"{r} = OpFMul %float {fi} {self.fconst(0.0625)}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
+        elif op == "v_sat_pk_u8_i16":
+            # RDNA2 ISA VOP1/VOP3 (opcode 0x062, LLVM VOP1Instructions.td: VOP_I16_I32):
+            # S0 holds two signed 16-bit integers (S0[15:0].i16, S0[31:16].i16). Each is saturated to [0, 255] and
+            # packed into a 16-bit result: res[7:0] = sat_u8(S0[15:0].i16), res[15:8] = sat_u8(S0[31:16].i16).
+            # Written to D[15:0] (or D[31:16] with VOP3 op_sel:[0,1]), preserving the untouched half of D.
+            if any(m == "clamp" or m.startswith(("mul:", "div:", "op_sel_hi:", "neg_lo:", "neg_hi:")) for m in mods):
+                raise Unsupported(op + " modifier")
+            if a[1].get("neg") or a[1].get("abs"):
+                raise Unsupported(op + " source modifier")
+            sel, dhi = self.opsel_bits(mods, 1)
+            if sel[0]:
+                raise Unsupported(op + " source op_sel")
+            x = self.src_u(a[1])
+            xi = self.as_int(x)
+            z0 = self.as_int(self.cu(0))
+            hi255 = self.as_int(self.cu(255))
+            s0, s1, c0, c1, u0, u1, sh8, pk = (self.tmp() for _ in range(8))
+            self.emit(f"{s0} = OpBitFieldSExtract %int {xi} {self.cu(0)} {self.cu(16)}")
+            self.emit(f"{s1} = OpBitFieldSExtract %int {xi} {self.cu(16)} {self.cu(16)}")
+            self.emit(f"{c0} = OpExtInst %int %glsl SClamp {s0} {z0} {hi255}")
+            self.emit(f"{c1} = OpExtInst %int %glsl SClamp {s1} {z0} {hi255}")
+            self.emit(f"{u0} = OpBitcast %uint {c0}")
+            self.emit(f"{u1} = OpBitcast %uint {c1}")
+            self.emit(f"{sh8} = OpShiftLeftLogical %uint {u1} {self.cu(8)}")
+            self.emit(f"{pk} = OpBitwiseOr %uint {u0} {sh8}")
+            if not dhi:
+                self.write_lo16(a[0], pk)
+            else:
+                if a[0]["k"] != "vgpr":
+                    raise Unsupported("op_sel destination")
+                old, keep, sh16, v = (self.tmp() for _ in range(4))
+                self.emit(f"{old} = OpCopyObject %uint {self.load_reg('vgpr', a[0]['r'])}")
+                self.emit(f"{keep} = OpBitwiseAnd %uint {old} {self.cu(0xFFFF)}")
+                self.emit(f"{sh16} = OpShiftLeftLogical %uint {pk} {self.cu(16)}")
+                self.emit(f"{v} = OpBitwiseOr %uint {keep} {sh16}")
+                self.dst(a[0], v)
         elif op == "v_rcp_iflag_f32":
             x = self.src_f(a[1])
             r = self.tmp()
