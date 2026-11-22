@@ -1509,5 +1509,215 @@ class TestDivFixupF32IEEE754Boundaries(unittest.TestCase):
         self.assertEqual(res_neg, F32_MAX_NORMAL | F32_SIGN_MASK)
 
 
+def parse_operand_asm(op_str: str) -> ASTOperand:
+    """Parse a single operand string with potential neg/abs modifiers."""
+    op_str = op_str.strip()
+    neg = False
+    abs_ = False
+
+    if op_str.startswith("-"):
+        neg = True
+        op_str = op_str[1:].strip()
+
+    if op_str.startswith("|") and op_str.endswith("|"):
+        abs_ = True
+        op_str = op_str[1:-1].strip()
+
+    if op_str.startswith("v") and op_str[1:].isdigit():
+        idx = int(op_str[1:])
+        return ASTOperand.vgpr(idx, neg=neg, abs_=abs_)
+
+    if op_str.startswith("s") and op_str[1:].isdigit():
+        idx = int(op_str[1:])
+        return ASTOperand.sgpr(idx, neg=neg, abs_=abs_)
+
+    try:
+        val = float(op_str)
+        return ASTOperand.inline_const(val, neg=neg, abs_=abs_)
+    except ValueError:
+        raise ValueError(f"Unrecognized operand syntax: {op_str}")
+
+
+def parse_div_fixup_f32_asm(line: str) -> ASTInstruction:
+    """Parse a complete v_div_fixup_f32 assembly instruction string."""
+    line = line.strip()
+    if not line:
+        raise ValueError("Empty assembly line")
+
+    tokens = line.split(None, 1)
+    if not tokens or tokens[0] != Opcode.V_DIV_FIXUP_F32.value:
+        raise ValueError(f"Expected opcode '{Opcode.V_DIV_FIXUP_F32.value}', got '{tokens[0] if tokens else ''}'")
+
+    if len(tokens) < 2:
+        raise ValueError("Missing operands in assembly line")
+
+    rest = tokens[1].strip()
+    parts = [p.strip() for p in rest.split(",")]
+    if len(parts) < 4:
+        raise ValueError(f"Expected at least 4 comma-separated fields, got {len(parts)}")
+
+    dst_str = parts[0]
+    src0_str = parts[1]
+    src1_str = parts[2]
+    last_tokens = parts[3].split()
+    if not last_tokens:
+        raise ValueError("Missing third source operand")
+
+    src2_str = last_tokens[0]
+    mod_tokens = last_tokens[1:]
+
+    clamp = False
+    omod = OMod.NONE
+
+    for mod in mod_tokens:
+        if mod == "clamp":
+            clamp = True
+        elif mod == "mul:2":
+            omod = OMod.MUL2
+        elif mod == "mul:4":
+            omod = OMod.MUL4
+        elif mod == "div:2":
+            omod = OMod.DIV2
+        else:
+            raise ValueError(f"Unknown instruction modifier: {mod}")
+
+    dst = parse_operand_asm(dst_str)
+    src0 = parse_operand_asm(src0_str)
+    src1 = parse_operand_asm(src1_str)
+    src2 = parse_operand_asm(src2_str)
+
+    inst = ASTInstruction(
+        opcode=Opcode.V_DIV_FIXUP_F32,
+        dst=dst,
+        src0=src0,
+        src1=src1,
+        src2=src2,
+        clamp=clamp,
+        omod=omod,
+    )
+    inst.validate()
+    return inst
+
+
+# Mutant functions for mutation testing
+def mutant_omit_00_nan(s0: int, s1: int, s2: int, **kwargs) -> int:
+    """Mutant 1: returns +0.0 instead of Indefinite QNaN for 0.0 / 0.0."""
+    if is_f32_zero(s1) and is_f32_zero(s2):
+        return F32_POS_ZERO
+    return ref_div_fixup_f32(s0, s1, s2, **kwargs)
+
+
+def mutant_invert_sign(s0: int, s1: int, s2: int, **kwargs) -> int:
+    """Mutant 2: inverts the output sign for non-NaN cases."""
+    res = ref_div_fixup_f32(s0, s1, s2, **kwargs)
+    if not is_f32_nan(res):
+        return res ^ F32_SIGN_MASK
+    return res
+
+
+def mutant_omit_s0_nan_overflow(s0: int, s1: int, s2: int, **kwargs) -> int:
+    """Mutant 3: preserves S0 NaN instead of producing signed infinity."""
+    if is_f32_nan(s0) and not is_f32_nan(s1) and not is_f32_nan(s2):
+        return quiet_f32(s0)
+    return ref_div_fixup_f32(s0, s1, s2, **kwargs)
+
+
+def mutant_clamp_nan_to_nan(s0: int, s1: int, s2: int, clamp: bool = False, **kwargs) -> int:
+    """Mutant 4: leaves NaN untouched instead of clamping to +0.0."""
+    res = ref_div_fixup_f32(s0, s1, s2, clamp=False, **kwargs)
+    if clamp:
+        if is_f32_nan(res):
+            return res  # mutant: does not map to +0.0
+        return apply_clamp_f32(res)
+    return res
+
+
+class TestDivFixupF32NegativeControlsAndMutations(unittest.TestCase):
+    """Test suite for syntax rejection, negative controls, and mutation detection."""
+
+    def test_syntax_rejection_malformed_instructions(self):
+        with self.assertRaises(ValueError):
+            parse_div_fixup_f32_asm("")
+
+        with self.assertRaises(ValueError):
+            parse_div_fixup_f32_asm("v_div_fixup_f64 v0, v1, v2, v3")
+
+        with self.assertRaises(ValueError):
+            parse_div_fixup_f32_asm("v_div_fixup_f32 v0, v1, v2")
+
+        with self.assertRaises(TypeError):
+            parse_div_fixup_f32_asm("v_div_fixup_f32 s0, v1, v2, v3")
+
+        with self.assertRaises(ValueError):
+            parse_div_fixup_f32_asm("v_div_fixup_f32 -v0, v1, v2, v3")
+
+        with self.assertRaises(ValueError):
+            parse_div_fixup_f32_asm("v_div_fixup_f32 |v0|, v1, v2, v3")
+
+        with self.assertRaises(ValueError):
+            parse_div_fixup_f32_asm("v_div_fixup_f32 v256, v1, v2, v3")
+
+        with self.assertRaises(ValueError):
+            parse_div_fixup_f32_asm("v_div_fixup_f32 v0, v1, v2, v3 clamp_invalid")
+
+    def test_mutation_detection_00_nan(self):
+        correct = ref_div_fixup_f32(F32_POS_ZERO, F32_POS_ZERO, F32_POS_ZERO)
+        mutated = mutant_omit_00_nan(F32_POS_ZERO, F32_POS_ZERO, F32_POS_ZERO)
+        self.assertEqual(correct, F32_INDEFINITE_QNAN)
+        self.assertNotEqual(correct, mutated)
+
+    def test_mutation_detection_invert_sign(self):
+        s0 = f32_to_u32(2.0)
+        s1 = f32_to_u32(3.0)
+        s2 = f32_to_u32(6.0)
+        correct = ref_div_fixup_f32(s0, s1, s2)
+        mutated = mutant_invert_sign(s0, s1, s2)
+        self.assertNotEqual(correct, mutated)
+        self.assertEqual(u32_to_f32(correct), 2.0)
+        self.assertEqual(u32_to_f32(mutated), -2.0)
+
+    def test_mutation_detection_s0_nan_overflow(self):
+        correct = ref_div_fixup_f32(F32_CANONICAL_QNAN, F32_ONE, F32_ONE)
+        mutated = mutant_omit_s0_nan_overflow(F32_CANONICAL_QNAN, F32_ONE, F32_ONE)
+        self.assertEqual(correct, F32_POS_INF)
+        self.assertNotEqual(correct, mutated)
+        self.assertTrue(is_f32_qnan(mutated))
+
+    def test_mutation_detection_clamp_nan(self):
+        snan = 0x7F800001
+        correct = ref_div_fixup_f32(F32_ONE, F32_ONE, snan, clamp=True)
+        mutated = mutant_clamp_nan_to_nan(F32_ONE, F32_ONE, snan, clamp=True)
+        self.assertEqual(correct, F32_POS_ZERO)
+        self.assertTrue(is_f32_nan(mutated))
+        self.assertNotEqual(correct, mutated)
+
+    def test_mutation_detection_simd_exec_mask_leak(self):
+        wave = SIMDWaveState(wave_size=64)
+        wave.exec_mask = 0  # all lanes inactive
+        old_val = 0x11223344
+        for lane in range(64):
+            wave.set_lane_vgpr_u32(lane, 0, old_val)
+
+        def buggy_execute(wave: SIMDWaveState, inst: ASTInstruction) -> None:
+            for lane in range(wave.wave_size):
+                # Bug: ignoring exec_mask check
+                wave.set_lane_vgpr_f32(lane, inst.dst.index, 999.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_FIXUP_F32,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.inline_const(1.0),
+            src1=ASTOperand.inline_const(1.0),
+            src2=ASTOperand.inline_const(1.0),
+        )
+
+        wave.execute(inst)
+        for lane in range(64):
+            self.assertEqual(wave.get_lane_vgpr_u32(lane, 0), old_val)
+
+        buggy_execute(wave, inst)
+        self.assertNotEqual(wave.get_lane_vgpr_u32(0, 0), old_val)
+
+
 if __name__ == "__main__":
     unittest.main()
