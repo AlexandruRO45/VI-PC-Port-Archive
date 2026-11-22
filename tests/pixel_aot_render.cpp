@@ -1,10 +1,12 @@
 #include "bvh_fixture.h"
+#include "desktop_gpu.h"
 #include "pixel_aot_vs.h"
 #include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <string_view>
 
 using namespace bvh_fixture;
@@ -46,6 +48,10 @@ struct PixelInput {
     std::vector<BYTE> secondRows;
     std::vector<Word> constants = std::vector<Word>(64);
     UINT8 writeMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    std::vector<BYTE> coverage;
+    bool integerRT = false;      // bit 0 of the optional case-trailer flags byte
+    std::vector<BYTE> nanMask;   // 64 per-texel NaN-class mask bytes, empty without a trailer
+    std::optional<D3D12_VIEWPORT> viewport;
 };
 
 struct MipDraw {
@@ -89,7 +95,8 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
     desc.SampleMask = UINT_MAX;
     desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     desc.NumRenderTargets = desc.SampleDesc.Count = 1;
-    desc.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    desc.RTVFormats[0] = input.integerRT ? DXGI_FORMAT_R32G32B32A32_UINT
+                                         : DXGI_FORMAT_R32G32B32A32_FLOAT;
     ComPtr<ID3D12PipelineState> pso;
     check(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso)), "Translated pixel pipeline");
 
@@ -200,15 +207,38 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
         };
         const float viewportWidth = viewportAxis(width, input.width, base.width);
         const float viewportHeight = viewportAxis(height, input.height, base.height);
-        const D3D12_VIEWPORT viewport{(width - viewportWidth) * 0.5f, (height - viewportHeight) * 0.5f,
-                                      viewportWidth, viewportHeight, 0, 1};
+        const D3D12_VIEWPORT viewport = input.viewport.value_or(
+            D3D12_VIEWPORT{(width - viewportWidth) * 0.5f, (height - viewportHeight) * 0.5f,
+                           viewportWidth, viewportHeight, 0, 1});
         const D3D12_RECT scissor{0,0,LONG(width),LONG(height)};
         list->RSSetViewports(1, &viewport);
         list->RSSetScissorRects(1, &scissor);
         list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
         list->ClearRenderTargetView(rtv, clear.Color, 0, nullptr);
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        if (partialTriangle) {
+        ComPtr<ID3D12QueryHeap> queries;
+        ComPtr<ID3D12Resource> queryResults;
+        if (!input.coverage.empty()) {
+            const UINT pixels = width * height;
+            if (pixels != input.coverage.size()) throw std::runtime_error("Coverage reference extent");
+            D3D12_QUERY_HEAP_DESC queryDesc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, pixels + 1, 0};
+            check(device->CreateQueryHeap(&queryDesc, IID_PPV_ARGS(&queries)), "Coverage queries");
+            queryResults = make_buffer(device, (pixels + 1) * sizeof(UINT64), D3D12_HEAP_TYPE_READBACK,
+                                       D3D12_RESOURCE_STATE_COPY_DEST);
+            // First measure a full draw with neighboring lanes active, then locate
+            // each surviving sample with a one-pixel scissor.
+            for (UINT i = 0; i <= pixels; ++i) {
+                if (i) {
+                    LONG x = (i - 1) % width, y = (i - 1) / width;
+                    const D3D12_RECT pixel{x, y, x + 1, y + 1};
+                    list->RSSetScissorRects(1, &pixel);
+                }
+                list->BeginQuery(queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, i);
+                list->DrawInstanced(3, 1, 0, 0);
+                list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, i);
+            }
+            list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0, pixels + 1, queryResults.Get(), 0);
+        } else if (partialTriangle) {
             const D3D12_INDEX_BUFFER_VIEW indices{partialTriangle->GetGPUVirtualAddress(),
                                                    3 * sizeof(Word), DXGI_FORMAT_R32_UINT};
             list->IASetIndexBuffer(&indices);
@@ -225,6 +255,19 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
         dst.PlacedFootprint = resultLayout;
         list->CopyTextureRegion(&dst, 0,0,0, &src, nullptr);
         cmd.submit_and_wait(device);
+        if (queryResults) {
+            auto counts = read(queryResults.Get(), (input.coverage.size() + 1) * 2);
+            UINT sum = 0;
+            for (size_t i = 0; i < input.coverage.size(); ++i) {
+                sum += input.coverage[i];
+                if (counts[2*i+2] != input.coverage[i] || counts[2*i+3]) {
+                    std::fprintf(stderr, "coverage pixel=%zu expected=%u actual=%u\n", i, unsigned(input.coverage[i]), counts[2*i+2]);
+                    throw std::runtime_error("Sample coverage mismatch");
+                }
+            }
+            if (counts[0] != sum || counts[1]) throw std::runtime_error("Full draw coverage mismatch");
+            std::printf("covered_samples=%u checked_pixels=%zu\n", sum, input.coverage.size());
+        }
         auto words = read(back.Get(), resultBytes/4);
         std::vector<BYTE> image;
         if (capture) image.reserve(size_t(width) * height * 4);
@@ -238,10 +281,37 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
                 const auto offset = y * resultLayout.Footprint.RowPitch / 4 + x * 4;
                 Color actual;
                 std::memcpy(actual.data(), words.data() + offset, sizeof(actual));
-                const auto matches = [&](const Color& ref) {
-                    return std::memcmp(actual.data(), ref.data(), sizeof(actual)) == 0;
+                const auto bits = [](float value) {
+                    UINT word;
+                    std::memcpy(&word, &value, sizeof(word));
+                    return word;
                 };
-                bool matched = matches(expected);
+                const auto is_nan_bits = [](UINT word) {
+                    return (word & 0x7f800000u) == 0x7f800000u && (word & 0x007fffffu) != 0u;
+                };
+                // Per-channel compare against one expected texel. Unmasked channels are strict
+                // bitwise. A masked channel accepts a NaN against an expected NaN of any sign or
+                // payload and still logs both raw words; masking a channel whose expected word is
+                // not NaN is a case-format error.
+                const auto matches_at = [&](size_t index) {
+                    const auto& reference = sampled.expected[index];
+                    const BYTE mask = index < sampled.nanMask.size() ? sampled.nanMask[index] : BYTE{0};
+                    for (size_t c = 0; c < actual.size(); ++c) {
+                        const UINT expected_bits = bits(reference[c]);
+                        const UINT actual_bits = bits(actual[c]);
+                        if (mask >> c & 1) {
+                            if (!is_nan_bits(expected_bits))
+                                throw std::runtime_error("NaN-class mask on a channel whose expected word is not NaN");
+                            std::printf("nan_class x=%u y=%u ch=%zu expected=%08x actual=%08x\n",
+                                        x, y, c, expected_bits, actual_bits);
+                            if (!is_nan_bits(actual_bits)) return false;
+                        } else if (expected_bits != actual_bits) {
+                            return false;
+                        }
+                    }
+                    return true;
+                };
+                bool matched = matches_at(sampleY * sampled.width + sampleX);
                 // The exact texel is always tried first. Neighbors are admitted only
                 // for magnified tail draws, which sample through the root signature's
                 // single static sampler (MIN_MAG_MIP_POINT, clamp addressing).
@@ -261,15 +331,16 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
                     const UINT nearX = neighbor(numeratorX, 2 * width, sampleX, sampled.width);
                     const UINT nearY = neighbor(numeratorY, 2 * height, sampleY, sampled.height);
                     // Each candidate must match as a whole RGBA texel.
-                    matched = matches(sampled.expected[sampleY * sampled.width + nearX]) ||
-                              matches(sampled.expected[nearY * sampled.width + sampleX]) ||
-                              matches(sampled.expected[nearY * sampled.width + nearX]);
+                    matched = matches_at(sampleY * sampled.width + nearX) ||
+                              matches_at(nearY * sampled.width + sampleX) ||
+                              matches_at(nearY * sampled.width + nearX);
                 }
                 if (!matched) {
                     std::fprintf(stderr, "pixel_mismatch x=%u y=%u\n", x, y);
                     for (size_t c = 0; c < actual.size(); ++c)
-                        std::fprintf(stderr, "channel=%zu expected=%g actual=%g\n", c, expected[c], actual[c]);
-                    throw std::runtime_error("AOT color export differs from CPU reference");
+                        std::fprintf(stderr, "channel=%zu expected=%g actual=%g expected_bits=%08x actual_bits=%08x\n",
+                                     c, expected[c], actual[c], bits(expected[c]), bits(actual[c]));
+                    throw PixelMismatch();
                 }
                 if (capture) {
                     for (float value : actual) image.push_back(static_cast<BYTE>(std::lround(value * 255)));
@@ -311,8 +382,35 @@ void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB,
         std::ifstream file(reference, std::ios::binary);
         file.read(reinterpret_cast<char*>(input.constants.data()), input.constants.size() * sizeof(Word));
         file.read(reinterpret_cast<char*>(input.expected.data()), input.expected.size() * sizeof(Color));
-        if (!file || file.peek() != std::char_traits<char>::eof())
+        if (!file)
             throw std::runtime_error("Expected a 256-byte constant buffer and 64 float4 reference colors");
+        if (file.peek() != std::char_traits<char>::eof()) {
+            BYTE flags = 0;
+            file.read(reinterpret_cast<char*>(&flags), 1);
+            if (flags & 0xfcu)
+                throw std::runtime_error("Unknown case trailer flag bits");
+            input.integerRT = (flags & 1u) != 0;
+            if (flags & 2u) {
+                std::array<UINT, 4> rect{};
+                file.read(reinterpret_cast<char*>(rect.data()), sizeof(rect));
+                const auto [left, top, width, height] = rect;
+                if (!file || !width || !height || left >= input.width || top >= input.height ||
+                    width > input.width - left || height > input.height - top)
+                    throw std::runtime_error("Invalid pixel case viewport");
+                // Explicit viewport cases provide one reference color per target pixel.
+                input.scale = 1;
+                input.viewport = D3D12_VIEWPORT{float(left), float(top), float(width), float(height), 0, 1};
+            }
+            if (file.peek() != std::char_traits<char>::eof()) {
+                if (input.integerRT)
+                    throw std::runtime_error("NaN-class masks require a floating-point render target");
+                input.nanMask.resize(64);
+                file.read(reinterpret_cast<char*>(input.nanMask.data()),
+                          static_cast<std::streamsize>(input.nanMask.size()));
+                if (!file || file.peek() != std::char_traits<char>::eof())
+                    throw std::runtime_error("Expected exactly 64 NaN mask bytes after the case trailer fields");
+            }
+        }
     }
     std::vector<PixelInput> levels;
     levels.push_back(std::move(input));
@@ -351,6 +449,27 @@ void check_attribute_pixel(ID3D12Device* device, const char* shader, const char*
     if (!file || file.peek() != std::char_traits<char>::eof())
         throw std::runtime_error("Expected a 256-byte constant buffer and 32 by 32 float4 colors");
     draw_verified(device, shader, {std::move(input)}, 0, 0, nullptr);
+}
+
+void check_sampled_coverage(ID3D12Device* device, const char* shader, const char* reference)
+{
+    PixelInput input{8, 8, 1, DXGI_FORMAT_R8G8B8A8_UNORM};
+    for (UINT y = 0; y < 8; ++y) {
+        for (UINT x = 0; x < 8; ++x) {
+            BYTE alpha = BYTE((x*41 + y*19) & 255);
+            input.rows.insert(input.rows.end(), {255, 0, 128, alpha});
+            input.secondRows.insert(input.secondRows.end(), {0, 255, 128, BYTE(255-alpha)});
+        }
+    }
+    input.expected.assign(64, Color{-1, -1, -1, -1});
+    input.coverage.resize(64);
+    std::ifstream file(reference, std::ios::binary);
+    file.read(reinterpret_cast<char*>(input.constants.data()), input.constants.size() * sizeof(Word));
+    file.read(reinterpret_cast<char*>(input.coverage.data()), input.coverage.size());
+    if (!file || file.peek() != std::char_traits<char>::eof() ||
+        std::any_of(input.coverage.begin(), input.coverage.end(), [](BYTE v){ return v > 1; }))
+        throw std::runtime_error("Invalid coverage case");
+    draw_verified(device, shader, {input}, 0, 0, nullptr);
 }
 
 void check_dual_pixel(ID3D12Device* device, const char* shader, const char* capture, bool swap)

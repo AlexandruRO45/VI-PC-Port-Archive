@@ -360,11 +360,19 @@ int main(int argc, char** argv)
 {
     if (argc < 3) return 2;
     const std::string_view operation = argv[2];
-    if (operation == "--check-pixel-quad-lod") {
+    if (operation == "--check-pixel-batch") {
+        if (argc < 5) return 2;
+    } else if (operation == "--check-pixel-quad-lod") {
         if (argc != 4) return 2;
+    } else if (operation == "--mesh-entry" || operation == "--mesh-indexed") {
+        if (argc != 6 && !(operation == "--mesh-entry" && argc == 7 &&
+            (std::string_view(argv[6]) == "ab" || std::string_view(argv[6]) == "ba"))) return 2;
     } else if (operation == "--check-bc7-tail") {
         if (argc < 6) return 2;
-    } else if ((operation == "--compute-root-file" || operation == "--ffx-immediate-conversion")) {
+    } else if ((operation == "--depth-mask" || operation == "--depth-mask-swapped")) {
+        if (argc != 6) return 2;
+    } else if (operation == "--compute-root-file" || operation == "--ffx-immediate-conversion" ||
+               operation == "--spirv-address-window") {
         if (argc != 4) return 2;
     } else {
         if (argc != 3 && argc != 5 && argc != 6) return 2;
@@ -412,9 +420,44 @@ int main(int argc, char** argv)
             std::puts("driver=unavailable via DXGI");
         }
         if (debug) check(device.As(&messages), "Read debug queue");
+        if (operation == "--check-pixel-batch") {
+            bool failed = false;
+            for (int i = 4; i < argc; ++i) {
+                const char* status = "pass";
+                std::fprintf(stderr, "case=%d path=%s\n", i - 4, argv[i]);
+                try {
+                    check(device->GetDeviceRemovedReason(), "Pixel batch device");
+                    check_translated_pixel(device.Get(), argv[3], false, argv[i]);
+                } catch (const PixelMismatch& e) {
+                    std::fprintf(stderr, "%s\n", e.what());
+                    status = "mismatch";
+                } catch (const std::exception& e) {
+                    std::fprintf(stderr, "%s\n", e.what());
+                    status = "error";
+                }
+                if (report_debug_errors(messages.Get()) || FAILED(device->GetDeviceRemovedReason()))
+                    status = "error";
+                if (messages) messages->ClearStoredMessages();
+                std::printf("case=%d status=%s\n", i - 4, status);
+                failed |= std::string_view(status) != "pass";
+            }
+            return failed ? 1 : 0;
+        }
         if (argc == 3 && needs_cs_6_5(operation) && !supports_cs_6_5(device.Get())) return 77;
         if (argc == 3 && (operation == "--compute-root" || operation == "--compute-tables")) {
             check_compute(device.Get(), operation == "--compute-tables");
+        } else if (operation == "--spirv-address-window") {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS1 options{};
+            check(check_feature(device.Get(), D3D12_FEATURE_D3D12_OPTIONS1, &options, sizeof(options)),
+                  "Query 64-bit shader integer support");
+            D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
+            auto model_hr = check_feature(device.Get(), D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model));
+            if (model_hr != E_INVALIDARG) check(model_hr, "Query address-window shader model");
+            if (!options.Int64ShaderOps || model_hr == E_INVALIDARG || model.HighestShaderModel < D3D_SHADER_MODEL_6_6) {
+                std::puts("skip: address window fixture requires SM 6.6 and 64-bit shader integer operations");
+                return 77;
+            }
+            check_spirv_window(device.Get(), argv[3]);
         } else if (argc == 4 && (operation == "--compute-root-file" || operation == "--ffx-immediate-conversion")) {
             check_compute_file(device.Get(), argv[3], operation == "--ffx-immediate-conversion");
         } else if (argc == 5 && operation == "--compute-store-case") {
@@ -433,6 +476,8 @@ int main(int argc, char** argv)
             check_bc7_pixel(device.Get(), argv[3], argv[4], argc == 6 ? argv[5] : nullptr);
         } else if (argc == 5 && (operation == "--dual-pixel" || operation == "--dual-pixel-swapped")) {
             check_dual_pixel(device.Get(), argv[3], argv[4], operation == "--dual-pixel-swapped");
+        } else if (argc == 5 && operation == "--sampled-coverage") {
+            check_sampled_coverage(device.Get(), argv[3], argv[4]);
         } else if (argc == 5 && operation == "--check-pixel-case") {
             check_translated_pixel(device.Get(), argv[3], false, argv[4]);
         } else if (argc == 5 && (operation == "--check-pixel-attribute" || operation == "--check-pixel-attribute-rg")) {
@@ -446,6 +491,8 @@ int main(int argc, char** argv)
             if (argc != 5 || (std::string_view(argv[4]) != "rgba" && std::string_view(argv[4]) != "bgra"))
                 throw std::runtime_error("Expected --check-pixel <pixel.cso> rgba|bgra");
             check_translated_pixel(device.Get(), argv[3], std::string_view(argv[4]) == "bgra");
+        } else if ((operation == "--depth-mask" || operation == "--depth-mask-swapped")) {
+            check_depth_mask_draw(device.Get(), argv[3], argv[4], argv[5], operation == "--depth-mask-swapped");
         } else if (argc == 3 && operation == "--dual-uav") {
             check_dual_uav(device.Get());
         } else if (argc == 3 && operation == "--texture-mips") {
@@ -458,8 +505,13 @@ int main(int argc, char** argv)
             check_bvh_hits(device.Get());
         } else if (argc == 3 && operation == "--dxr-update") {
             if (!check_dxr_update(device.Get())) return 77;
+        } else if (operation == "--mesh-entry" || operation == "--mesh-indexed") {
+            if (!check_mesh_entry_draw(device.Get(), argv[3], argv[4], argv[5],
+                                       operation == "--mesh-indexed", argc == 7 ? argv[6] : nullptr)) return 77;
         } else if (argc == 3 && operation == "--dxr-facing") {
             if (!check_dxr_facing(device.Get())) return 77;
+        } else if (argc == 3 && operation == "--dxr-opacity") {
+            if (!check_dxr_opacity(device.Get(), mode == "warp")) return 77;
         } else if (argc == 3 && operation == "--bvh-packed") {
             check_bvh_packed(device.Get());
         } else if (argc == 3 && operation == "--bvh-numeric") {
