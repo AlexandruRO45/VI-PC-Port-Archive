@@ -5552,6 +5552,10 @@ class Gen:
                 sh, r = self.tmp(), self.tmp()
                 self.emit(f"{sh} = OpShiftLeftLogical %uint {halves[1]} {self.cu(16)}")
                 self.emit(f"{r} = OpBitwiseOr %uint {halves[0]} {sh}")
+                if dhi:
+                    r2 = self.tmp()
+                    self.emit(f"{r2} = OpShiftLeftLogical %uint {r} {self.cu(16)}")
+                    r = r2
                 self.dst(a[0], r)
             elif not dhi:
                 self.write_lo16(a[0], halves[0])
