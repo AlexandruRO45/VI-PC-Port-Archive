@@ -1133,12 +1133,15 @@ public:
         if (graphics_.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT) rendering.depthAttachmentFormat = graphics_.depth_format;
         if (graphics_.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT) rendering.stencilAttachmentFormat = graphics_.depth_format;
 
+        // The binding stride is dynamic and comes from IASetVertexBuffers. A pipeline with no vertex bindings has
+        // none to set, and vkCmdDraw then breaks VUID-vkCmdDraw-pStrides-04913 for the state it declared, so the
+        // stride state comes last and is left out then.
         static constexpr VkDynamicState dynamic_states[] = {
-            VK_DYNAMIC_STATE_VIEWPORT,          VK_DYNAMIC_STATE_SCISSOR,
-            VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE,
-            VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+            VK_DYNAMIC_STATE_VIEWPORT,           VK_DYNAMIC_STATE_SCISSOR,
+            VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+            VK_DYNAMIC_STATE_BLEND_CONSTANTS,    VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE};
         VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-        dynamic.dynamicStateCount = std::uint32_t(std::size(dynamic_states));
+        dynamic.dynamicStateCount = std::uint32_t(std::size(dynamic_states)) - (bindings.empty() ? 1 : 0);
         dynamic.pDynamicStates = dynamic_states;
 
         // Every stage this path accepts reads the user SGPRs, so the range covers the whole stage table, not only the
