@@ -181,6 +181,19 @@ class Run(unittest.TestCase):
         with open(os.path.join(out, next(f for f in files if f.startswith("CSyntheticRoot"))), encoding="utf-8") as f:
             self.assertEqual(json.load(f)["label"], "synthetic_name")
 
+    def test_cli_reports_an_index_that_is_not_a_carve(self):
+        # gamedata_xml.py and gamedata_index.py both report a bad index.json in one line; this tool reads the same
+        # index through the same module, so a shape they refuse must not escape as a traceback here.
+        for body in ("{}", "[]", "null", '"x"', '{"files": 1}'):
+            with self.subTest(index=body), tempfile.TemporaryDirectory() as d:
+                with open(os.path.join(d, "index.json"), "w", encoding="utf-8") as f:
+                    f.write(body)
+                r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "gamedata_reader.py"), d],
+                                   capture_output=True, text=True)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn("cannot read", r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+
     def test_cli_missing_target(self):
         r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "gamedata_reader.py"),
                             os.path.join(self.tmp.name, "nope")], capture_output=True, text=True)

@@ -261,6 +261,15 @@ def main(argv=None):
     except FileNotFoundError as e:
         print(f"ERROR: {e} does not exist", file=sys.stderr)
         return 2
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        # Same one-line contract as gamedata_xml.py and gamedata_index.py, which read the same carve index: a
+        # truncated, hand-edited or wrong-shaped index.json is an error, not a traceback.
+        where = getattr(e, "filename", None) or a.targets[0]
+        print(f"ERROR: cannot read {where}: {getattr(e, 'strerror', None) or e!r}", file=sys.stderr)
+        return 2
     print(f"{s['documents']} documents read, {s['roots']} roots, {s['not_well_formed']} not well-formed "
           f"{s['parse_errors'] or ''}".rstrip())
     print("elements by convention:", ", ".join(f"{k} {v}" for k, v in sorted(s["elements_by_convention"].items())))
