@@ -102,7 +102,9 @@ class ScalarLifter(Lifter):
         mnemonic = ins.mnemonic
         reads, writes = set(), set()
         self.merges = []
-        if mnemonic == M.RET and self.result != "q":
+        if mnemonic == M.RET and self.result == "q":
+            return "return rax;", {R.RAX}, writes
+        if mnemonic == M.RET:
             width = 4 if self.result == "f" else 8
             self.vectors.add(R.XMM0)
             bits = "xmm0" if width == 8 else "static_cast<std::uint32_t>(xmm0)"
@@ -114,7 +116,11 @@ class ScalarLifter(Lifter):
                 ins.op_kind(n) in (OpKind.REGISTER, OpKind.MEMORY) for n in range(2)):
             if vector:
                 raise unsupported
-            return super().statement(ins, next_ins)
+            text, gpr_reads, gpr_writes = super().statement(
+                ins, next_ins is not None and next_ins.flow_control == FlowControl.CONDITIONAL_BRANCH)
+            # This leaf profile tracks whole GPRs. A byte or word write retains the previous high bits.
+            partial = {register for register, width in gpr_writes.items() if width < 4}
+            return text, set(gpr_reads) | partial, set(gpr_writes)
 
         if mnemonic in MOVES or mnemonic in (M.MOVD, M.MOVQ):
             width = MOVES.get(mnemonic, 4 if mnemonic == M.MOVD else 8)

@@ -1,3 +1,4 @@
+; coverage: source cpu_aot_scalar_float
 ; Windows x64 leaves built from scalar SSE/SSE2 instructions. An argument arrives in the XMM
 ; register of its slot when it is floating point and in the integer register otherwise.
 ; SWAP_OPERANDS builds the control: one operand order or source differs in every function.

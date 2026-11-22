@@ -18,6 +18,23 @@ struct Range {
     std::uint64_t gpu_begin;  // desktop GPU virtual address of title_begin
 };
 
+// Layout of TitleRange in src/title_va_lookup.hlsli (StructuredBuffer stride 24).
+struct ShaderRange {
+    std::uint32_t begin_low;
+    std::uint32_t begin_high;
+    std::uint32_t end_low;
+    std::uint32_t end_high;
+    std::uint32_t slot;  // descriptor index of the buffer that aliases the range
+    std::uint32_t reserved;
+};
+static_assert(sizeof(ShaderRange) == 24);
+
+// Packs sorted, non-overlapping ranges for the shader lookup; slot i is ranges[i]. Returns false
+// and leaves `packed` empty when the ranges are unsorted or overlap, when a range is 4 GiB or
+// longer, which a raw buffer view cannot cover, or when a range does not start on a 4-byte
+// boundary, which would misalign raw DWORD offsets.
+bool shader_ranges(const std::vector<Range>& ranges, std::vector<ShaderRange>& packed);
+
 class Table {
 public:
     // Ranges must not overlap. Returns false for an empty, wrapping or overlapping title range,
