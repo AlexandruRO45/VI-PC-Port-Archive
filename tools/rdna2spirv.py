@@ -2697,8 +2697,20 @@ class Gen:
     def cmp_class(self, a, exec_only=False):
         """Test x's class against the mask and write the result to VCC/SGPR or EXEC.
         Bits: 0 sNaN, 1 qNaN, 2 -inf, 3 -normal, 4 -denormal, 5 -0, 6 +0, 7 +denormal, 8 +normal, 9 +inf."""
-        x, mask = self.src_f(a[-2]), self.src_u(a[-1])
-        u = self.tou(x)
+        # The VOP3 source modifiers act on the sign bit (SHADER-457): abs clears it, neg flips it, as integer ops on the
+        # raw bits. modify()'s float FAbs/FNegate need not keep a signalling NaN signalling, and the class test
+        # reads exactly those bits (RDNA2 gfx1036 keeps it signalling).
+        src = a[-2]
+        u = self.src_u({k: v for k, v in src.items() if k not in ("abs", "neg")})
+        if src.get("abs"):
+            t = self.tmp()
+            self.emit(f"{t} = OpBitwiseAnd %uint {u} {self.cu(0x7FFFFFFF)}")
+            u = t
+        if src.get("neg"):
+            t = self.tmp()
+            self.emit(f"{t} = OpBitwiseXor %uint {u} {self.cu(0x80000000)}")
+            u = t
+        mask = self.src_u(a[-1])
         sign, absu = self.tmp(), self.tmp()
         self.emit(f"{sign} = OpShiftRightLogical %uint {u} {self.cu(31)}")
         self.emit(f"{absu} = OpBitwiseAnd %uint {u} {self.cu(0x7FFFFFFF)}")

@@ -30,10 +30,10 @@ Findings & exclusions (no shared files modified):
      - For `v_rndne_f32` on NaN (`qNaN` / `sNaN`), SPIR-V / GLSL.std.450 `RoundEven` leaves NaN payload/quieting
        unspecified (spirv_mini_interp.py returns the input NaN unchanged; hardware quiets `sNaN`). Tests assert
        that the result is a binary32 NaN rather than pinning an exact NaN payload.
-     - For `v_cmp_class_f32` / `v_cmpx_class_f32` VOP3 source modifiers (`-`, `|..|`), tools/rdna2spirv.py emits
-       float `OpFNegate`/`FAbs`, which in spirv_mini_interp.py goes through Python float packing and quiets `sNaN`
-       (see tests/semantic/test_interp.py). Source modifiers are therefore tested on `+-inf`, `+-normal`,
-       `+-subnormal`, `+-0.0`, and `qNaN`; raw `sNaN` (`+sNaN` / `-sNaN`) is tested without float modifiers.
+     - For `v_cmp_class_f32` / `v_cmpx_class_f32` VOP3 source modifiers (`-`, `|..|`), tools/rdna2spirv.py used to
+       emit float `OpFNegate`/`FAbs`, which in spirv_mini_interp.py goes through Python float packing and quiets `sNaN`
+       (see tests/semantic/test_interp.py). Since SHADER-457 the translator applies those two modifiers as
+       integer sign-bit operations instead, so they are tested on `sNaN` as well (it must stay signalling).
 """
 import gc
 import math
@@ -463,6 +463,12 @@ class CmpClassF32Tests(unittest.TestCase):
             (0x00000001, "-v1", CLASS_NSUBNORM, 1),     # -(+subnorm) -> -subnorm
             (0x3F800000, "-v1", CLASS_NNORM, 1),        # -(+1.0) -> -1.0
             (0xFFC00000, "|v1|", CLASS_QNAN, 1),        # |-qNaN| -> qNaN
+            # SHADER-457: the modifiers are sign-bit operations, so a signalling NaN stays signalling under them
+            # (RDNA2 gfx1036 keeps it; a float FNegate/FAbs may quiet it).
+            (0x7F800001, "-v1", CLASS_SNAN, 1),         # -(+sNaN) -> -sNaN
+            (0x7F800001, "-v1", CLASS_QNAN, 0),
+            (0xFF800001, "|v1|", CLASS_SNAN, 1),        # |-sNaN| -> +sNaN
+            (0xFFBFFFFF, "-|v1|", CLASS_SNAN, 1),       # -|-sNaN| -> -sNaN, payload kept
         ]
         for x_bits, src_expr, mask, want in mod_cases:
             with self.subTest(x=f"{x_bits:#010x}", src=src_expr, mask=hex(mask)):
