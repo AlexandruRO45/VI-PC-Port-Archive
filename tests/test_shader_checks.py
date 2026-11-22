@@ -34,7 +34,7 @@ TOTAL = (len(check.COMPUTE) + 5 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 11)  # three mesh fixtures, ps_tex, ps_imgatomic, five compute fixtures and
+         + len(check.TEXTURE_CONSTANTS) + 12)  # three mesh fixtures, ps_tex, ps_imgatomic, six compute fixtures and
          # ps_ssharp
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
@@ -75,6 +75,10 @@ class Wave64Checks(unittest.TestCase):
                 self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "192"))
                 Path(env["VKC_DUMP"]).write_bytes(GOOD_XY_XYZ if name == "cs_fmt_xy_xyz" else GOOD_TBUFFER_STORE)
                 return 0, "out[0..7] = 0 0 0 0 0 0 0 0\n"
+            if name == "cs_div_fixup_f32":
+                self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "64"))
+                Path(env["VKC_DUMP"]).write_bytes(struct.pack("<64I", *check.DIV_FIXUP_F32_WORDS))
+                return 0, ""
             if name == "cs_user_sgprs":
                 # The seeded words come back only if check.py passed them in VKC_SGPRS.
                 seeded = (env or {}).get("VKC_SGPRS") == check.USER_SGPRS_ENV["VKC_SGPRS"]

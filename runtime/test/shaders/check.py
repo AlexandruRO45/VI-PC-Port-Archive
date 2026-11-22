@@ -222,6 +222,11 @@ CVT_F32_SAT_CASES = (
     (0x4F800000, 0xFFFFFFFF, 0x7FFFFFFF), (0xCEFFFFFF, 0, 0x80000080), (0xCF000000, 0, 0x80000000),
     (0xCF000001, 0, 0x80000000), (0x7F800000, 0xFFFFFFFF, 0x7FFFFFFF), (0xFF800000, 0, 0x80000000),
     (0x7F800001, 0, 0), (0xFFC00000, 0, 0))
+# cs_div_fixup_f32.asm: D for 20 v_div_fixup_f32 cases (derived in the .asm header, measured on RDNA2 gfx1036), then
+# untouched words.
+DIV_FIXUP_F32_WORDS = [0xBFC00000, 0x3FC00000, 0x7FE00000, 0xFFC00001, 0xFFC00000, 0xFFC00000, 0xFF800000,
+                       0x7F800000, 0x80000000, 0x00000000, 0x80000000, 0x80000000, 0x00800003, 0xFF800000,
+                       0x00000005, 0x3FC00000, 0xBFC00000, 0x00000000, 0x3F800000, 0x3FC00000] + [0xEEEEEEEE] * 44
 # v_cvt_pk_u8_f32 (cs_cvt_pk_u8.asm), measured natively on RDNA2 (gfx1036): halves round to even, NaN gives 0.
 CVT_PK_U8_WORDS = [0x1122330C, 0x11220E44, 0x11003344, 0xFE223344, 0x1122330D, 0x11220044, 0x11FF3344, 0x00223344]
 # Wave64-only dump tests (mostly the x = cross-half checks): exact results need 64 lanes, or an emulation of them
@@ -483,6 +488,10 @@ def fmt_xy_xyz_test(tools, spirv, env=None):
     """TEST-185: the 84 result words and the untouched words after them, up to the inputs at 0x200. The heap needs
     0x2d0 bytes, so it is 192 words."""
     return dump_test(tools, spirv, "cs_fmt_xy_xyz", FMT_XY_XYZ_WORDS + [0xEEEEEEEE] * 44, 192, env)
+
+
+def div_fixup_f32_test(tools, spirv, env=None):
+    return dump_test(tools, spirv, "cs_div_fixup_f32", DIV_FIXUP_F32_WORDS, len(DIV_FIXUP_F32_WORDS), env)
 
 
 def tbuffer_store_test(tools, spirv, env=None):
@@ -1292,6 +1301,7 @@ def main():
     results.append(("cs_fmt_sint32", fmt_sint32_test(tools, spirv)))
     results.append(("cs_fmt_xy_xyz", fmt_xy_xyz_test(tools, spirv)))
     results.append(("cs_tbuffer_store", tbuffer_store_test(tools, spirv)))
+    results.append(("cs_div_fixup_f32", div_fixup_f32_test(tools, spirv)))
     for name, groups, want in GLOBAL_OFFSET:
         results.append((name, compute_test(tools, spirv, name, groups, "dump", expected_words=want)))
     results.append(("cs_user_sgprs", compute_test(tools, spirv, "cs_user_sgprs", "1", "dump",

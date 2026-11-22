@@ -3797,6 +3797,78 @@ class Gen:
             return g
         return v
 
+    def div_fixup_f32(self, a, mods):
+        """v_div_fixup_f32 D, S0, S1, S2 (S0 the quotient, S1 the denominator, S2 the numerator): the last step of
+        a float division, which puts the special cases back. Measured natively on RDNA2 gfx1036 (tools/hw_oracle,
+        4,940 operand triples) in the game's MODE (f32 denormals flushed). abs/neg act on the sign bit first. A
+        denormal S1 or S2 reads as a zero of its sign; S0 is not flushed. With s = sign(S1) ^ sign(S2), the first
+        match wins:
+          S2 NaN                        S2 quieted (bit 22 set)
+          S1 NaN                        S1 quieted
+          S1, S2 both zero or both inf  0xffc00000
+          S1 zero or S2 inf             inf with sign s
+          S1 inf or S2 zero             zero with sign s
+          exp(S2) - exp(S1) < -150      zero with sign s
+          S0 NaN                        inf with sign s
+          otherwise                     |S0| with sign s (a denormal S0 too)
+        clamp gives +0 for NaN, zeros and negatives and 1.0 from 1.0 up; omod is ignored. Integer ops only."""
+        u = self.cu
+
+        def op(opc, *xs, ty="%uint"):
+            r = self.tmp()
+            self.emit(f"{r} = {opc} {ty} {' '.join(xs)}")
+            return r
+
+        def cmp(opc, x, y):
+            return op(opc, x, y, ty="%bool")
+
+        def sel(c, x, y):
+            return op("OpSelect", c, x, y)
+
+        def word(sv):
+            w = self.src_u({**sv, "neg": False, "abs": False})   # src_u would modify as a float
+            if sv.get("abs"):
+                w = op("OpBitwiseAnd", w, u(0x7FFFFFFF))
+            if sv.get("neg"):
+                w = op("OpBitwiseXor", w, u(0x80000000))
+            return w
+
+        def mag(w):
+            return op("OpBitwiseAnd", w, u(0x7FFFFFFF))
+
+        w0, w1, w2 = (word(s) for s in a[1:4])
+        m0, m1, m2 = mag(w0), mag(w1), mag(w2)
+        inf = u(0x7F800000)
+        nan0, nan1, nan2 = (cmp("OpUGreaterThan", m, inf) for m in (m0, m1, m2))
+        e1, e2 = (op("OpShiftRightLogical", m, u(23)) for m in (m1, m2))
+        z1, z2 = (cmp("OpIEqual", e, u(0)) for e in (e1, e2))                # zero or flushed denormal
+        i1, i2 = (cmp("OpIEqual", m, inf) for m in (m1, m2))
+        sign = op("OpBitwiseAnd", op("OpBitwiseXor", w1, w2), u(0x80000000))
+
+        def lor(x, y):
+            return op("OpLogicalOr", x, y, ty="%bool")
+
+        def land(x, y):
+            return op("OpLogicalAnd", x, y, ty="%bool")
+
+        signed_inf = op("OpBitwiseOr", sign, inf)
+        tiny = cmp("OpULessThan", op("OpIAdd", e2, u(150)), e1)              # e2 - e1 < -150
+        d = op("OpBitwiseOr", sign, m0)
+        # lowest priority first, each later rule overrides
+        for cond, val in ((nan0, signed_inf),
+                          (tiny, sign),
+                          (lor(i1, z2), sign),
+                          (lor(z1, i2), signed_inf),
+                          (lor(land(z1, z2), land(i1, i2)), u(0xFFC00000)),
+                          (nan1, op("OpBitwiseOr", w1, u(0x400000))),
+                          (nan2, op("OpBitwiseOr", w2, u(0x400000)))):
+            d = sel(cond, val, d)
+        if "clamp" in mods:
+            # measured: NaN, zeros and negatives give +0, 1.0 and up (+inf too) give 1.0; a positive denormal stays
+            pos = land(cmp("OpULessThanEqual", d, inf), cmp("OpINotEqual", d, u(0)))
+            d = sel(pos, sel(cmp("OpUGreaterThanEqual", d, u(0x3F800000)), u(0x3F800000), d), u(0))
+        self.dst(a[0], d)
+
     def turn_angle(self, x):
         """Reduce a turn count to [-0.5, 0.5] before scaling by 2*pi (SHADER-88).
 
@@ -4978,6 +5050,8 @@ class Gen:
                 r = self.tmp()
                 self.emit(f"{r} = OpFConvert %float {x}")
                 self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
+        elif op == "v_div_fixup_f32":
+            self.div_fixup_f32(a, mods)
         elif op in ("image_bvh_intersect_ray", "image_bvh64_intersect_ray"):
             self.image_bvh(op, a, mods)
         elif op == "s_bfm_b64":

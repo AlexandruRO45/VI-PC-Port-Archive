@@ -28,6 +28,7 @@ from build import CLIP_CASES, clip_container, shader_source
 from check import Skip, clip_test, fmt_1010102_test, fmt_sint32_test, fmt_xy_xyz_test, tbuffer_store_test
 from compute_fixture import compute_header
 from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
+from check import div_fixup_f32_test
 from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
                    TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, TEXTURE_CONSTANTS, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
@@ -847,6 +848,9 @@ def run_suite(a, work: str) -> int:
             # tbuffer_store_format_*: the instruction's format, words measured natively on a Radeon 680M (the .asm header)
             problem = tbuffer_store_test(a.build, spirv_dir, cs_env)
             results.append((name, not problem, problem or "128/128 dumped words exact"))
+        elif name == "cs_div_fixup_f32":
+            problem = div_fixup_f32_test(a.build, spirv_dir, cs_env)
+            results.append((name, not problem, problem or "64/64 dumped words exact"))
         elif name == "cs_global_neg_offset":
             # Negative global_load/global_store offsets (cs_global_neg_offset.asm): 40 groups give a 0x2800-byte
             # heap holding both the right addresses and the 4096-lower ones. One thread, no wave64 requirement.
