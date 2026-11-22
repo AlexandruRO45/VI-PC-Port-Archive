@@ -343,6 +343,21 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
         || dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > opt.SizeOfHeaders || table_end > opt.SizeOfHeaders
         || opt.SizeOfHeaders > opt.SizeOfImage || opt.SizeOfHeaders > raw.size())
         return fail(MAP_FORMAT, "section table outside headers");
+    // Section protections are applied per page, so a section that started inside a page shared with
+    // the headers or another section would change that page's protection as well. Windows refuses an
+    // alignment that is not a power of two and a section that does not start on it. An alignment
+    // below the page size, which Windows maps as one view when FileAlignment matches, is not modeled.
+    SYSTEM_INFO system{};
+    GetSystemInfo(&system);
+    if (opt.SectionAlignment & (opt.SectionAlignment - 1))
+        return fail(MAP_FORMAT, "section alignment %#lx is not a power of two", opt.SectionAlignment);
+    if (opt.SectionAlignment < system.dwPageSize)
+        return fail(MAP_UNSUPPORTED, "section alignment %#lx below the page size", opt.SectionAlignment);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        if (sections[i].VirtualAddress & (opt.SectionAlignment - 1))
+            return fail(MAP_FORMAT, "section %.8s not aligned to %#lx",
+                        reinterpret_cast<const char*>(sections[i].Name), opt.SectionAlignment);
+    }
 
     if (opt.AddressOfEntryPoint && !executable(nt, opt.AddressOfEntryPoint))
         return fail(MAP_FORMAT, "entry point outside executable section");
@@ -584,11 +599,12 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
             return release(fail(MAP_FUNCTION_TABLE, "cannot register .pdata"));
         const auto count = pdata.Size / sizeof(RUNTIME_FUNCTION);
         auto* table = image.at<RUNTIME_FUNCTION>(pdata.VirtualAddress, count);
+        if (table && !readable(table, pdata.Size))
+            return release(fail(MAP_UNSUPPORTED, "exception table is not readable after section protection"));
         if (!table || !RtlAddFunctionTable(table, static_cast<DWORD>(count),
                                            reinterpret_cast<DWORD64>(base)))
             return release(fail(MAP_FUNCTION_TABLE, "cannot register .pdata"));
     }
-
     std::vector<PIMAGE_TLS_CALLBACK> callbacks;
     const auto* mapped_nt = image.headers();
     if (const char* reason = tls_callbacks(image, mapped_nt, callbacks)) {

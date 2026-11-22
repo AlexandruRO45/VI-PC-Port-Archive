@@ -520,6 +520,19 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_entry_order COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/entry_order_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_entry_order>" "$<TARGET_FILE:cpu_entry_order_lifted>")
+    cpu_asm_fixture(cpu_dead_read dead_read)
+    cpu_translation(cpu_dead_read cpu_switch_aot
+        read_dead,cmp_dead,byte_dead,pair_dead,read_live,read_skip,sum_zero,add_in_place)
+    # The same translation built with /O2, where the compiler removes a read that the generated C++ lets it remove.
+    set(dead_read_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_dead_read_lifted_o2.dll")
+    add_custom_command(OUTPUT "${dead_read_o2}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /LD "${CMAKE_CURRENT_BINARY_DIR}/cpu_dead_read_lifted.cpp"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_dead_read_lifted_o2.obj" "/Fe${dead_read_o2}"
+        DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/cpu_dead_read_lifted.cpp" VERBATIM)
+    add_custom_target(cpu_dead_read_lifted_o2 ALL DEPENDS "${dead_read_o2}")
+    add_test(NAME cpu_aot_dead_reads COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/dead_read_check.py" "$<TARGET_FILE:cpu_guarded_call>"
+        "$<TARGET_FILE:cpu_dead_read>" "$<TARGET_FILE:cpu_dead_read_lifted>" "${dead_read_o2}")
     cpu_asm_fixture(cpu_narrow narrow)
     cpu_translation(cpu_narrow cpu_switch_aot
         byte_merge,word_ops,byte_shift,byte_unary,al_less,mixed_width,ax_copy,zx_byte,set_less,set_zx,store_only,store_ret0,self_loop,qword_ops,flag_results,imul3_fresh)
@@ -595,6 +608,118 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/dead_div_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_guarded_call>" "$<TARGET_FILE:cpu_dead_div>" "$<TARGET_FILE:cpu_dead_div_lifted>"
         "${dead_div_o2}")
+    set(cpu_avx2_exports
+        "op_broadcasti128,op_extracti128_lo,op_extracti128_hi,op_inserti128_lo,op_inserti128_hi,"
+        "op_perm2i128_mix,op_perm2i128_swap,op_perm2i128_zero_lo,op_perm2i128_zero_hi,"
+        "op_perm2i128_zero_both,op_perm2i128_ignored,op_pbroadcastb_xmm,op_pbroadcastb_ymm,"
+        "op_pbroadcastw_xmm,op_pbroadcastw_ymm,op_pbroadcastd_xmm,op_pbroadcastd_ymm,"
+        "op_pbroadcastq_xmm,op_pbroadcastq_ymm,op_permd,op_permps,op_permq,op_permq_dup,"
+        "op_permpd,op_pblendd_xmm,op_pblendd_ymm,op_pblendd_ymm_all,op_pblendd_ymm_none,"
+        "op_psllvd_xmm,op_psllvd_ymm,op_psllvq_xmm,op_psllvq_ymm,op_psravd_xmm,op_psravd_ymm,"
+        "op_psrlvd_xmm,op_psrlvd_ymm,op_psrlvq_xmm,op_psrlvq_ymm,op_zeroupper,op_pipeline,"
+        "op_movdqu_store128,op_movdqu_copy128,"
+        "op_gatherdps_xmm,op_gatherdps_ymm,op_gatherdps_ymm_scale1_disp,op_gatherdpd_xmm,"
+        "op_gatherdpd_ymm,op_gatherqps_xmm_vm64x,op_gatherqps_xmm_vm64y,op_gatherqpd_xmm,"
+        "op_gatherqpd_ymm,op_pgatherdd_xmm,op_pgatherdd_ymm,op_pgatherdq_xmm,op_pgatherdq_ymm,"
+        "op_pgatherqd_xmm_vm64x,op_pgatherqd_xmm_vm64y,op_pgatherqq_xmm,op_pgatherqq_ymm,"
+        "op_pgatherdd_ymm_rdx,"
+        "op_pmaskmovd_load_xmm,op_pmaskmovd_load_ymm,op_pmaskmovq_load_xmm,op_pmaskmovq_load_ymm,"
+        "op_pmaskmovd_store_xmm,op_pmaskmovd_store_ymm,op_pmaskmovq_store_xmm,op_pmaskmovq_store_ymm")
+    string(CONCAT cpu_avx2_exports ${cpu_avx2_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_avx2_regs_${variant} avx2_regs)
+        cpu_translation(cpu_avx2_regs_${variant} cpu_avx2_aot "${cpu_avx2_exports}")
+    endforeach()
+    target_compile_definitions(cpu_avx2_regs_altered PRIVATE ALTER_IMM)
+    add_test(NAME cpu_aot_avx2_regs COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/avx2_regs_check.py"
+        "$<TARGET_FILE:cpu_avx2_regs_original>"
+        "$<TARGET_FILE:cpu_avx2_regs_original_lifted>"
+        "$<TARGET_FILE:cpu_avx2_regs_altered_lifted>")
+    set(cpu_avx_int_exports
+        "op_pabsb,op_pabsw,op_pabsd,"
+        "op_packsswb,op_packssdw,op_packusdw,"
+        "op_paddb,op_paddq,op_paddsb,op_paddusb,op_paddusw,"
+        "op_psubb,op_psubd,op_psubq,op_psubsb,op_psubsw,op_psubusb,op_psubusw,"
+        "op_palignr_0,op_palignr_5,op_palignr_16,op_palignr_23,op_palignr_32,"
+        "op_pblendvb,op_pblendw,op_pblendw_all,op_pblendw_none,"
+        "op_pcmpeqb,op_pcmpeqw,op_pcmpeqd,op_pcmpeqq,op_pcmpgtb,op_pcmpgtw,op_pcmpgtd,op_pcmpgtq,"
+        "op_pmaxsb,op_pmaxsd,op_pmaxub,op_pmaxuw,op_pmaxud,"
+        "op_pminsb,op_pminsd,op_pminub,op_pminuw,op_pminud,"
+        "op_phaddw,op_phaddd,op_phaddsw,op_phsubw,op_phsubd,op_phsubsw,op_phminposuw,"
+        "op_pmaddwd,op_pmuldq,op_pmuludq,op_pmulhrsw,op_pmulhuw,op_pmulld,"
+        "op_psadbw,op_mpsadbw_0,op_mpsadbw_3,op_mpsadbw_7_ignored,"
+        "op_pshufhw,op_pshuflw,"
+        "op_psignb,op_psignw,op_psignd,"
+        "op_pmovsxbw,op_pmovsxbd,op_pmovsxbq,op_pmovsxwd,op_pmovsxwq,op_pmovsxdq,"
+        "op_pmovzxbw,op_pmovzxbd,op_pmovzxbq,op_pmovzxwd,op_pmovzxwq,op_pmovzxdq,"
+        "op_punpckldq,op_punpckhdq,op_punpcklqdq,op_punpckhqdq,"
+        "op_pslld_xmm,op_psllq_xmm,op_psrld_xmm,op_psrlq_xmm,"
+        "op_pslld_imm,op_pslld_imm_ovf,op_psllq_imm,op_psllq_imm_ovf,"
+        "op_psrld_imm,op_psrld_imm_ovf,op_psrlq_imm,op_psrlq_imm_ovf,"
+        "op_pmovmskb,"
+        "op_pextrb_reg,op_pextrb_mem,op_pextrw_reg,op_pextrw_mem,"
+        "op_pextrd_reg,op_pextrd_mem,op_pextrq_reg,op_pextrq_mem,"
+        "op_pinsrb_reg,op_pinsrb_mem,op_pinsrw_reg,op_pinsrw_mem,"
+        "op_pinsrd_reg,op_pinsrd_mem,op_pinsrq_reg,op_pinsrq_mem,"
+        "op_zeroupper,op_zeroall,op_pipeline,op_movdqu_copy128,op_mov_store32,op_movdqu_regcopy,op_movdqu_store128")
+    string(CONCAT cpu_avx_int_exports ${cpu_avx_int_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_avx_int_regs_${variant} avx_int_regs)
+        cpu_translation(cpu_avx_int_regs_${variant} cpu_avx_int_aot "${cpu_avx_int_exports}")
+    endforeach()
+    target_compile_definitions(cpu_avx_int_regs_altered PRIVATE ALTER_IMM)
+    add_test(NAME cpu_aot_avx_int_regs COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/avx_int_regs_check.py"
+        "$<TARGET_FILE:cpu_avx_int_regs_original>"
+        "$<TARGET_FILE:cpu_avx_int_regs_original_lifted>"
+        "$<TARGET_FILE:cpu_avx_int_regs_altered_lifted>")
+    set(cpu_avx_move_exports
+        "op_andpd_xmm,op_andpd_ymm,op_andps_xmm,op_andps_ymm,op_andnpd_xmm,op_andnpd_ymm,"
+        "op_andnps_xmm,op_andnps_ymm,op_orpd_xmm,op_orpd_ymm,op_orps_xmm,op_orps_ymm,"
+        "op_xorpd_xmm,op_xorpd_ymm,op_xorps_xmm,op_xorps_ymm,"
+        "op_blendpd_xmm,op_blendpd_ymm,op_blendpd_ymm_all,op_blendpd_ymm_none,"
+        "op_blendps_xmm,op_blendps_ymm,op_blendps_ymm_all,op_blendps_ymm_none,"
+        "op_blendvpd_xmm,op_blendvpd_ymm,op_blendvps_xmm,op_blendvps_ymm,"
+        "op_broadcastf128,op_broadcastsd_mem0,op_broadcastsd_mem1,op_broadcastsd_mem2,"
+        "op_broadcastsd_mem3,op_broadcastsd_reg,op_broadcastss_xmm_mem0,op_broadcastss_xmm_mem1,"
+        "op_broadcastss_xmm_mem2,op_broadcastss_xmm_mem3,op_broadcastss_ymm_mem4,op_broadcastss_ymm_mem5,"
+        "op_broadcastss_ymm_mem6,op_broadcastss_ymm_mem7,op_broadcastss_xmm_reg,op_broadcastss_ymm_reg,"
+        "op_extractf128_lo,op_extractf128_hi,op_insertf128_lo,op_insertf128_hi,"
+        "op_extractps_lane0,op_extractps_lane1,op_extractps_lane2,op_extractps_lane3,"
+        "op_insertps_s0d1_z0,op_insertps_s3d2_zmask,op_insertps_zero_all,"
+        "op_perm2f128_mix,op_perm2f128_swap,op_perm2f128_zero_lo,op_perm2f128_zero_hi,"
+        "op_perm2f128_zero_both,op_perm2f128_ignored,op_permilpd_imm_xmm,op_permilpd_imm_ymm,"
+        "op_permilpd_imm_ymm_lo,op_permilpd_imm_ymm_hi,op_permilpd_var_xmm,op_permilpd_var_ymm,"
+        "op_permilps_imm_xmm,op_permilps_imm_ymm,op_permilps_imm_ymm_lo,op_permilps_imm_ymm_hi,"
+        "op_permilps_var_xmm,op_permilps_var_ymm,"
+        "op_shufpd_xmm,op_shufpd_ymm,op_shufpd_ymm_lo,op_shufpd_ymm_hi,"
+        "op_shufps_xmm,op_shufps_ymm,op_shufps_ymm_lo,op_shufps_ymm_hi,"
+        "op_unpcklpd_xmm,op_unpcklpd_ymm,op_unpckhpd_xmm,op_unpckhpd_ymm,"
+        "op_unpcklps_xmm,op_unpcklps_ymm,op_unpckhps_xmm,op_unpckhps_ymm,"
+        "op_movapd_xmm,op_movapd_ymm,op_movapd_store128,"
+        "op_movupd_xmm,op_movupd_ymm,op_movupd_store128,"
+        "op_lddqu_xmm,op_lddqu_ymm,op_movntdq_xmm,op_movntdq_ymm,op_movntdqa_xmm,op_movntdqa_ymm,"
+        "op_movntpd_xmm,op_movntpd_ymm,op_movntps_xmm,op_movntps_ymm,"
+        "op_movddup_xmm,op_movddup_ymm,op_movshdup_xmm,op_movshdup_ymm,op_movsldup_xmm,op_movsldup_ymm,"
+        "op_movhlps,op_movlhps,op_movhpd_load,op_movhpd_store,op_movhps_load,op_movhps_store,"
+        "op_movlpd_load,op_movlpd_store,op_movlps_load,op_movlps_store,"
+        "op_movsd_load,op_movsd_store,op_movsd_reg,op_movss_load,op_movss_store,op_movss_reg,"
+        "op_movmskpd_xmm,op_movmskpd_ymm,op_movmskps_xmm,op_movmskps_ymm,"
+        "op_maskmovps_load_xmm,op_maskmovps_load_ymm,op_maskmovpd_load_xmm,op_maskmovpd_load_ymm,"
+        "op_maskmovps_store_xmm,op_maskmovps_store_ymm,op_maskmovpd_store_xmm,op_maskmovpd_store_ymm,"
+        "op_zeroupper,op_pipeline,op_mov_load32")
+    string(CONCAT cpu_avx_move_exports ${cpu_avx_move_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_avx_move_regs_${variant} avx_move_regs)
+        cpu_translation(cpu_avx_move_regs_${variant} cpu_avx_move_aot "${cpu_avx_move_exports}")
+    endforeach()
+    target_compile_definitions(cpu_avx_move_regs_altered PRIVATE ALTER_IMM)
+    add_test(NAME cpu_aot_avx_move_regs COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/avx_move_regs_check.py"
+        "$<TARGET_FILE:cpu_avx_move_regs_original>"
+        "$<TARGET_FILE:cpu_avx_move_regs_original_lifted>"
+        "$<TARGET_FILE:cpu_avx_move_regs_altered_lifted>")
     cpu_asm_fixture(cpu_chained chained)
     cpu_translation(cpu_chained cpu_chained_aot choose_value)
     cpu_asm_fixture(cpu_chained_jne chained)
@@ -1168,6 +1293,25 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_x87_fcmov COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_fcmov.py"
         check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_fcmov>"
         "$<TARGET_FILE:cpu_x87_fcmov_lifted>" ${x87_fcmov_control_files})
+    cpu_asm_fixture(cpu_x87_iarith x87_iarith)
+    # The lifted DLL and six mutated controls that the check requires to mismatch.
+    set(x87_iarith_control_files "")
+    foreach(variant IN ITEMS lifted subrev divrev zext16 zext32 wide16 pc64)
+        set(x87_iarith_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_x87_iarith_${variant}.cpp")
+        add_custom_command(OUTPUT "${x87_iarith_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_iarith.py"
+                emit "$<TARGET_FILE:cpu_x87_iarith>" "${x87_iarith_fixture}" ${variant}
+            DEPENDS cpu_x87_iarith tests/cpu/x87_iarith.py tests/cpu/x87_integers.py tests/cpu/x87_moves.py tests/cpu/x87_sub.py
+                tests/cpu/x87_div.py tests/cpu/x87_mul.py tests/cpu/x87_add.py tools/ffx_version_query.py
+                tools/x87_lower.py tools/x87_soft.h tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_x87_iarith_${variant} SHARED "${x87_iarith_fixture}")
+        if(NOT variant STREQUAL "lifted")
+            list(APPEND x87_iarith_control_files "$<TARGET_FILE:cpu_x87_iarith_${variant}>")
+        endif()
+    endforeach()
+    add_test(NAME cpu_aot_x87_iarith COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_iarith.py"
+        check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_iarith>"
+        "$<TARGET_FILE:cpu_x87_iarith_lifted>" ${x87_iarith_control_files})
     cpu_asm_fixture(cpu_create create_context)
     set(create_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_create_lifted.cpp")
     add_custom_command(OUTPUT "${create_fixture}"
@@ -1288,20 +1432,21 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:blast_source>" "$<TARGET_FILE:blast_lifted>" "$<TARGET_FILE:archive_codec_lifted>")
 
     function(crc_line_program target polynomial)
-        # Use the same optimized source PE as input to both Debug and Release AOT builds.
+        # Use the same CRC object optimization flags in Debug and Release.
         set(crc_object "${CMAKE_CURRENT_BINARY_DIR}/${target}_step.obj")
         add_custom_command(OUTPUT "${crc_object}"
             COMMAND "${CMAKE_CXX_COMPILER}" /nologo /c /O1 /GS- /Zl "/DCRC_POLYNOMIAL=${polynomial}" "/Fo${crc_object}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/crc_line/crc_step.cpp"
             DEPENDS tests/cpu/crc_line/crc_step.cpp VERBATIM)
-        add_executable(${target} tests/cpu/crc_line/entry.asm "${crc_object}")
+        add_executable(${target} tests/cpu/crc_line/entry.asm tests/cpu/exe_startup.asm "${crc_object}")
         set_target_properties(${target} PROPERTIES LINKER_LANGUAGE CXX)
-        target_link_options(${target} PRIVATE /ENTRY:program_entry /EXPORT:crc_step /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
-        target_link_libraries(${target} PRIVATE ucrt)
+        target_link_options(${target} PRIVATE /ENTRY:native_startup /EXPORT:native_entry /EXPORT:crc_step
+            /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+        target_link_libraries(${target} PRIVATE ucrt cpu_exe_io)
         set(crc_source "${CMAKE_CURRENT_BINARY_DIR}/${target}_lifted.cpp")
         add_custom_command(OUTPUT "${crc_source}"
             COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tools/cpu_stdio_exe_aot.py"
-                "$<TARGET_FILE:${target}>" "${crc_source}"
+                "$<TARGET_FILE:${target}>" "${crc_source}" --entry-export native_entry
             DEPENDS ${target} tools/cpu_stdio_exe_aot.py tools/cpu_switch_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py
             VERBATIM)
         add_executable(${target}_lifted "${crc_source}")
@@ -1311,7 +1456,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     crc_line_program(cpu_crc_castagnoli 0x82f63b78u)
     add_test(NAME cpu_native_crc_line COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/crc_line_check.py" "$<TARGET_FILE:pe_map>"
-        "$<TARGET_FILE:cpu_crc_line>" "$<TARGET_FILE:cpu_crc_line_lifted>"
+        "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:cpu_crc_line>" "$<TARGET_FILE:cpu_crc_line_lifted>"
         "$<TARGET_FILE:cpu_crc_castagnoli>" "$<TARGET_FILE:cpu_crc_castagnoli_lifted>")
     foreach(variant IN ITEMS original inverted pair swapped framed image)
         set(native cpu_exe_${variant})
@@ -1598,6 +1743,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomics.cso" "${CMAKE_SOURCE_DIR}/tests/gpu_alias_writes.hlsl"
         "${CMAKE_SOURCE_DIR}/src")
     foreach(adapter IN ITEMS hardware warp)
+        add_test(NAME mesh_indexed_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/mesh_indexed_check.py" "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(mesh_indexed_draw_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME mesh_entry_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/mesh_entry_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -1623,6 +1772,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/depth_mask_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(depth_mask_draw_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME sampled_coverage_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/sampled_coverage_check.py" "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(sampled_coverage_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME pixel_aot_attribute_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_attribute_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
