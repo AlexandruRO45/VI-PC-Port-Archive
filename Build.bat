@@ -26,6 +26,12 @@ if not defined PY (
   pause
   exit /b 1
 )
+if "%~1"=="" (
+  %PY% -c "import PySide6" >nul 2>nul && (
+    %PY% -I "%~dp0leonida_gui.py"
+    exit /b %ERRORLEVEL%
+  )
+)
 %PY% -I "%~dp0make_game.py" %*
 set "RC=%ERRORLEVEL%"
 echo.

@@ -4,9 +4,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Map Viewer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   :root { --bg: #0d1014; --fg: #e6e8eb; --dim: #8b929b; --accent: #5fb3ff; --warn: #ffb454; --panel: rgba(13,16,20,.82); }
-  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 13px/1.45 ui-monospace, Consolas, monospace; overflow: hidden; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 13px/1.45 "Outfit", ui-sans-serif, system-ui, sans-serif; overflow: hidden; }
   canvas { display: block; }
   #hud { position: fixed; top: 12px; left: 12px; background: var(--panel); padding: 10px 12px; border-radius: 8px; min-width: 250px; pointer-events: none; }
   #hud b { color: var(--accent); font-weight: 600; }

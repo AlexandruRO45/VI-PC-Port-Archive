@@ -13,6 +13,8 @@
 </h4>
 
 <p align="center">
+  <a href="https://felipemzero.github.io/Leonida/">Website</a> |
+  <a href="https://github.com/FelipeMzero/Leonida/releases">Releases (GUI)</a> |
   <a href="docs/i18n/README.md">Other languages</a> |
   <a href="#project-status">Status</a> |
   <a href="#how-to-build">How to build</a> |

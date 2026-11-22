@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Leonida — Recompilação Nativa &amp; GUI Multiplataforma</title>
+  <meta name="description" content="Leonida: construtor gráfico (Windows, Linux e macOS), tradutor RDNA2 → SPIR-V e validador de integridade para sua própria cópia.">
+  <link rel="icon" type="image/png" href="assets/logo.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="bg-glow glow-1" aria-hidden="true"></div>
+  <div class="bg-glow glow-2" aria-hidden="true"></div>
+
+  <header class="navbar">
+    <div class="container nav-inner">
+      <a class="brand" href="#top">
+        <img src="assets/logo.png" alt="Leonida" width="36" height="36">
+        <span>Leonida</span>
+      </a>
+      <nav class="nav-links">
+        <a href="#downloads" data-i18n="nav_downloads">Downloads</a>
+        <a href="#gui" data-i18n="nav_gui">Interface GUI</a>
+        <a href="#validation" data-i18n="nav_validation">Validação</a>
+        <a href="#pipeline" data-i18n="nav_pipeline">Pipeline</a>
+        <a href="https://github.com/FelipeMzero/Leonida" target="_blank" rel="noopener">GitHub</a>
+        <button id="lang-toggle" class="btn-ghost" type="button" aria-label="Switch language">EN</button>
+      </nav>
+    </div>
+  </header>
+
+  <main id="top">
+    <section class="hero container">
+      <div class="hero-copy">
+        <div class="pill">
+          <span class="dot"></span>
+          <span id="release-badge" data-i18n="badge_loading">Carregando última release...</span>
+        </div>
+        <h1 data-i18n="hero_title">Recompilação estática com interface gráfica nativa.</h1>
+        <p class="lead" data-i18n="hero_desc">
+          Construa, valide e acompanhe todo o pipeline do Leonida no Windows, Linux e macOS —
+          sem precisar decorar comandos de terminal. Tudo roda localmente a partir da sua própria cópia.
+        </p>
+        <div class="hero-actions">
+          <a id="primary-download" class="btn-primary" href="https://github.com/FelipeMzero/Leonida/releases/latest">
+            <span data-i18n="hero_cta">Baixar Leonida GUI</span>
+          </a>
+          <a class="btn-secondary" href="https://github.com/FelipeMzero/Leonida" target="_blank" rel="noopener" data-i18n="hero_repo">
+            Ver Código-Fonte
+          </a>
+        </div>
+        <p class="os-hint" id="os-hint"></p>
+      </div>
+
+      <div class="hero-preview" id="gui">
+        <div class="app-window">
+          <div class="window-bar">
+            <span class="win-dot red"></span>
+            <span class="win-dot yellow"></span>
+            <span class="win-dot green"></span>
+            <span class="win-title">Leonida — Builder &amp; Validator</span>
+          </div>
+          <div class="window-body">
+            <aside class="mock-sidebar">
+              <div class="mock-nav active">Compilar</div>
+              <div class="mock-nav">Validação</div>
+              <div class="mock-nav">Opções</div>
+              <div class="mock-nav">Console</div>
+              <div class="mock-nav">Mapa &amp; Sobre</div>
+            </aside>
+            <div class="mock-content">
+              <div class="mock-card">
+                <div class="mock-label">Pasta do Jogo (Xbox Series 1.0.2.1)</div>
+                <div class="mock-input">D:\Games\LeonidaPackage</div>
+              </div>
+              <div class="mock-stages">
+                <span class="chip ok">check</span>
+                <span class="chip ok">shaders</span>
+                <span class="chip ok">assets</span>
+                <span class="chip active">runtime</span>
+                <span class="chip">pipelines</span>
+              </div>
+              <div class="mock-card">
+                <div class="mock-row">
+                  <span>Validação SHA-256 &amp; Pré-requisitos</span>
+                  <span class="tag-ok">PASS</span>
+                </div>
+                <div class="progress-track"><div class="progress-fill"></div></div>
+                <div class="mock-log">
+                  [13:42:08] Shaders: 26,503 / 26,503 spirv-val OK<br>
+                  [13:42:11] Codebase &amp; Manifests: validados
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="stats container">
+      <div class="stat-card">
+        <div class="stat-num">26.503</div>
+        <div class="stat-label" data-i18n="stat_shaders">Shaders RDNA2 → SPIR-V validados</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-num">3 OS</div>
+        <div class="stat-label" data-i18n="stat_os">Executáveis Windows, Linux e macOS</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-num">SHA-256</div>
+        <div class="stat-label" data-i18n="stat_val">Validação integrada de pacote e código</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-num">100%</div>
+        <div class="stat-label" data-i18n="stat_local">Local na sua máquina · Sem arquivos do jogo</div>
+      </div>
+    </section>
+
+    <section class="section container" id="downloads">
+      <div class="section-head">
+        <h2 data-i18n="dl_title">Downloads por Plataforma</h2>
+        <p data-i18n="dl_sub">Executáveis compilados automaticamente via GitHub Actions com verificação SHA-256 em cada release.</p>
+      </div>
+      <div class="download-grid">
+        <article class="dl-card" data-os="windows">
+          <div class="dl-os">Windows</div>
+          <div class="dl-arch">x64 · Executável portátil (.exe)</div>
+          <p data-i18n="dl_win_desc">Duplo clique para abrir a GUI com detecção automática de pasta e validador embutido.</p>
+          <a id="dl-windows" class="btn-primary full" href="https://github.com/FelipeMzero/Leonida/releases/latest">Baixar para Windows</a>
+        </article>
+        <article class="dl-card" data-os="linux">
+          <div class="dl-os">Linux</div>
+          <div class="dl-arch">x64 · Pacote portátil (.tar.gz)</div>
+          <p data-i18n="dl_linux_desc">Inclui executável Qt6 com fonte Outfit embutida e integração com Wine/Proton.</p>
+          <a id="dl-linux" class="btn-secondary full" href="https://github.com/FelipeMzero/Leonida/releases/latest">Baixar para Linux</a>
+        </article>
+        <article class="dl-card" data-os="macos">
+          <div class="dl-os">macOS</div>
+          <div class="dl-arch">Apple Silicon / Universal (.zip)</div>
+          <p data-i18n="dl_mac_desc">App bundle nativo com suporte a detecção de iCloud Drive e validação local.</p>
+          <a id="dl-macos" class="btn-secondary full" href="https://github.com/FelipeMzero/Leonida/releases/latest">Baixar para macOS</a>
+        </article>
+      </div>
+      <div class="checksum-bar">
+        <span data-i18n="dl_checksums">Verifique a integridade dos binários baixados:</span>
+        <a id="dl-sha256" href="https://github.com/FelipeMzero/Leonida/releases/latest" target="_blank" rel="noopener">SHA256SUMS.txt</a>
+      </div>
+    </section>
+
+    <section class="section container" id="validation">
+      <div class="section-head">
+        <h2 data-i18n="val_title">Motor de Validação Integrado</h2>
+        <p data-i18n="val_sub">Valide o ambiente, o código-fonte e a integridade da sua cópia antes de iniciar um build longo.</p>
+      </div>
+      <div class="feature-grid">
+        <div class="feature-card">
+          <h3 data-i18n="val_f1_t">Pré-requisitos do Sistema</h3>
+          <p data-i18n="val_f1_d">Verifica Python 3.12+, .NET 8 SDK, Vulkan SDK (spirv-as/spirv-val), LLVM llvm-mc com target AMDGPU, Visual Studio C++, FFmpeg e espaço livre em disco.</p>
+        </div>
+        <div class="feature-card">
+          <h3 data-i18n="val_f2_t">Integridade do Pacote (SHA-256)</h3>
+          <p data-i18n="val_f2_d">Compara nomes, tamanhos e hashes SHA-256 contra game/xbox-1.0.2.1.json em paralelo, relatando arquivos ausentes ou corrompidos.</p>
+        </div>
+        <div class="feature-card">
+          <h3 data-i18n="val_f3_t">Validação de Código &amp; CI</h3>
+          <p data-i18n="val_f3_d">tools/validate.py e a suíte de testes unitários verificam sintaxe Python, esquemas de manifesto e garantem zero dados do jogo no repositório.</p>
+        </div>
+      </div>
+      <div class="code-box">
+        <code>python -I tools/validate.py env &amp;&amp; python -I tools/validate.py code</code>
+      </div>
+    </section>
+
+    <section class="section container" id="pipeline">
+      <div class="section-head">
+        <h2 data-i18n="pipe_title">Pipeline Completo</h2>
+        <p data-i18n="pipe_sub">Cada estágio salva marcadores de progresso: se o build parar, ele continua exatamente de onde parou.</p>
+      </div>
+      <div class="pipeline-steps">
+        <div class="step"><span>01</span><strong>check</strong><small>Manifesto &amp; SHA-256</small></div>
+        <div class="step"><span>02</span><strong>shaders</strong><small>RDNA2 → SPIR-V</small></div>
+        <div class="step"><span>03</span><strong>assets</strong><small>OBJ, DDS &amp; Áudio</small></div>
+        <div class="step"><span>04</span><strong>runtime</strong><small>PE Loader &amp; Shims</small></div>
+        <div class="step"><span>05</span><strong>pipelines</strong><small>Cache Vulkan</small></div>
+      </div>
+    </section>
+
+    <section class="notice container">
+      <strong data-i18n="legal_title">Aviso Legal Importante</strong>
+      <p data-i18n="legal_body">
+        Este repositório e seus executáveis não contêm arquivos do jogo, chaves ou executáveis proprietários, e não descriptografam nem contornam proteções.
+        Você precisa da sua própria cópia em disco. Tudo o que o build gera permanece exclusivamente no seu computador.
+      </p>
+    </section>
+  </main>
+
+  <footer class="footer container">
+    <span>Leonida · GPLv3 · Fonte: Outfit</span>
+    <div class="footer-links">
+      <a href="https://github.com/FelipeMzero/Leonida" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://github.com/FelipeMzero/Leonida/releases" target="_blank" rel="noopener">Releases</a>
+      <a href="https://github.com/FelipeMzero/Leonida/actions" target="_blank" rel="noopener">Actions / CI</a>
+    </div>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
