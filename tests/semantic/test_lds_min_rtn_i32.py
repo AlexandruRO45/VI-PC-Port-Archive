@@ -425,5 +425,136 @@ class TestSymbolicAST(unittest.TestCase):
         self.assertEqual(inst3.to_assembly(), asm3)
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarThreadState:
+    """Architectural register and local memory state for a single scalar lane."""
+
+    def __init__(self, lds: Optional[LDSMemory] = None) -> None:
+        self.vgprs: List[int] = [0] * 256
+        self.lds: LDSMemory = lds if lds is not None else LDSMemory(DEFAULT_LDS_SIZE_BYTES)
+
+    def get_vgpr(self, reg: VGPR) -> int:
+        return self.vgprs[reg.index]
+
+    def set_vgpr(self, reg: VGPR, val: int) -> None:
+        self.vgprs[reg.index] = u32(val)
+
+
+class ScalarDSInterpreter:
+    """Deterministic scalar interpreter for ds_min_rtn_i32 and ds_min_i32."""
+
+    def execute(self, state: ScalarThreadState, inst: DSMinRtnI32Instruction) -> Optional[int]:
+        vaddr_val = state.get_vgpr(inst.vaddr)
+        vdata_val = state.get_vgpr(inst.vdata)
+
+        old_val, new_val = state.lds.atomic_min_rtn_i32(
+            byte_addr=vaddr_val,
+            val=vdata_val,
+            offset=inst.offset.value,
+        )
+
+        if inst.opcode.is_return:
+            assert inst.vdst is not None
+            state.set_vgpr(inst.vdst, old_val)
+            return old_val
+        return None
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction execution."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(DEFAULT_LDS_SIZE_BYTES)
+        self.state = ScalarThreadState(lds=self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_ds_min_rtn_i32_execution(self) -> None:
+        # LDS[dword 10] = 500
+        self.lds.write_dword(10, 500)
+        # v1 (vaddr) = 40 (byte address 40 -> dword 10)
+        self.state.set_vgpr(VGPR(1), 40)
+        # v2 (vdata) = 250
+        self.state.set_vgpr(VGPR(2), 250)
+        # v0 (vdst) = sentinel 0xDEADBEEF
+        self.state.set_vgpr(VGPR(0), 0xDEADBEEF)
+
+        inst = DSMinRtnI32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_I32,
+            vdst=VGPR(0),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        ret = self.interp.execute(self.state, inst)
+
+        self.assertEqual(ret, 500)
+        self.assertEqual(self.state.get_vgpr(VGPR(0)), 500)
+        self.assertEqual(self.lds.read_dword(10), 250)
+
+    def test_ds_min_i32_non_return(self) -> None:
+        self.lds.write_dword(5, 100)
+        self.state.set_vgpr(VGPR(1), 20)  # dword 5
+        self.state.set_vgpr(VGPR(2), 40)
+        self.state.set_vgpr(VGPR(0), 0x1234)
+
+        inst = DSMinRtnI32Instruction(
+            opcode=DSOpcode.DS_MIN_I32,
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        ret = self.interp.execute(self.state, inst)
+
+        self.assertIsNone(ret)
+        self.assertEqual(self.state.get_vgpr(VGPR(0)), 0x1234)  # untouched
+        self.assertEqual(self.lds.read_dword(5), 40)
+
+    def test_signed_negative_updates(self) -> None:
+        # Starting with positive 50
+        self.lds.write_dword(2, 50)
+        self.state.set_vgpr(VGPR(1), 8)
+        # Compare with -10
+        self.state.set_vgpr(VGPR(2), u32(-10))
+        inst = DSMinRtnI32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_I32,
+            vdst=VGPR(0),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        ret1 = self.interp.execute(self.state, inst)
+        self.assertEqual(ret1, 50)
+        self.assertEqual(self.lds.read_dword(2), u32(-10))
+
+        # Compare with -25
+        self.state.set_vgpr(VGPR(2), u32(-25))
+        ret2 = self.interp.execute(self.state, inst)
+        self.assertEqual(ret2, u32(-10))
+        self.assertEqual(self.lds.read_dword(2), u32(-25))
+
+        # Compare with 10 (larger than -25, so memory remains -25)
+        self.state.set_vgpr(VGPR(2), 10)
+        ret3 = self.interp.execute(self.state, inst)
+        self.assertEqual(ret3, u32(-25))
+        self.assertEqual(self.lds.read_dword(2), u32(-25))
+
+    def test_offset_immediate_computation(self) -> None:
+        self.lds.write_dword(20, 1000)
+        # vaddr = 64 (dword 16), offset = 16 bytes -> dword 20 (80 bytes)
+        self.state.set_vgpr(VGPR(1), 64)
+        self.state.set_vgpr(VGPR(2), 300)
+
+        inst = DSMinRtnI32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_I32,
+            vdst=VGPR(0),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+            offset=OffsetImmediate(16),
+        )
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, 1000)
+        self.assertEqual(self.lds.read_dword(20), 300)
+
+
 if __name__ == "__main__":
     unittest.main()
