@@ -200,6 +200,78 @@ class DSGWSInitInstruction:
         return f"{parts[0]} {', '.join(parts[1:])}"
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarState:
+    """Scalar machine state comprising register files, m0, and GWS memory."""
+
+    def __init__(self, num_gws_resources: int = GWS_NUM_RESOURCES) -> None:
+        self.vgprs: list[int] = [0] * DEFAULT_NUM_VGPRS
+        self.sgprs: list[int] = [0] * DEFAULT_NUM_SGPRS
+        self.m0: int = 0
+        self.gws: GWSMemory = GWSMemory(num_resources=num_gws_resources)
+
+    def get_vgpr(self, index: int) -> int:
+        return self.vgprs[index]
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        self.vgprs[index] = u32(val)
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index]
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        self.sgprs[index] = u32(val)
+
+    def get_m0(self) -> int:
+        return self.m0
+
+    def set_m0(self, val: int) -> None:
+        self.m0 = u32(val)
+
+    def get_reg(self, reg: RegisterOperand) -> int:
+        if reg.reg_type == RegType.VGPR:
+            return self.get_vgpr(reg.index)
+        return self.get_sgpr(reg.index)
+
+    def set_reg(self, reg: RegisterOperand, val: int) -> None:
+        if reg.reg_type == RegType.VGPR:
+            self.set_vgpr(reg.index, val)
+        else:
+            self.set_sgpr(reg.index, val)
+
+    def resolve_operand(self, op: Operand) -> int:
+        if isinstance(op, Immediate):
+            return op.val
+        return self.get_reg(op)
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for ds_gws_init."""
+
+    def execute(self, instr: DSGWSInitInstruction, state: ScalarState) -> Tuple[int, int]:
+        """Execute a single ds_gws_init instruction on scalar state.
+
+        Returns:
+            Tuple[int, int]: (resource_id, initialized_value)
+        """
+        # 1. Latch inputs prior to any execution
+        vdata0 = state.get_reg(instr.vdata0)
+        m0 = state.get_m0()
+
+        # 2. Perform GWS resource initialization
+        rid, val = state.gws.init_resource(
+            offset=instr.offset,
+            m0=m0,
+            value=vdata0,
+        )
+
+        # ds_gws_init produces no register writeback; registers are preserved
+        return rid, val
+
+
 class TestGWSInitReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Phase 1: Unit tests for reference mathematical oracle and architectural model."""
 
@@ -338,6 +410,86 @@ class TestSymbolicAST(unittest.TestCase):
             RegisterOperand(256, RegType.VGPR)
         with self.assertRaises(ValueError):
             RegisterOperand(106, RegType.SGPR)
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Phase 3: Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.state = ScalarState()
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_gws_init_basic(self) -> None:
+        # v3 holds initial value 100
+        self.state.set_vgpr(3, 100)
+        instr = DSGWSInitInstruction(vdata0=RegisterOperand(3, RegType.VGPR), offset=0)
+
+        rid, val = self.interp.execute(instr, self.state)
+        self.assertEqual(rid, 0)
+        self.assertEqual(val, 100)
+        self.assertEqual(self.state.gws.read_resource(0), 100)
+        self.assertTrue(self.state.gws.resources[0].initialized)
+
+        # Registers must remain unmodified
+        self.assertEqual(self.state.get_vgpr(3), 100)
+
+    def test_scalar_gws_init_with_offset(self) -> None:
+        self.state.set_vgpr(1, 0x1234)
+        instr = DSGWSInitInstruction(vdata0=RegisterOperand(1, RegType.VGPR), offset=12)
+
+        rid, val = self.interp.execute(instr, self.state)
+        self.assertEqual(rid, 12)
+        self.assertEqual(val, 0x1234)
+        self.assertEqual(self.state.gws.read_resource(12), 0x1234)
+
+    def test_scalar_gws_init_with_m0(self) -> None:
+        self.state.set_m0(20)
+        self.state.set_vgpr(2, 555)
+        instr = DSGWSInitInstruction(vdata0=RegisterOperand(2, RegType.VGPR), offset=5)
+
+        rid, val = self.interp.execute(instr, self.state)
+        self.assertEqual(rid, 25)
+        self.assertEqual(val, 555)
+        self.assertEqual(self.state.gws.read_resource(25), 555)
+        self.assertEqual(self.state.get_m0(), 20)
+
+    def test_scalar_sequential_inits(self) -> None:
+        # Initialize resources 0, 1, 2 sequentially
+        for i in range(3):
+            self.state.set_vgpr(i, 1000 + i)
+            instr = DSGWSInitInstruction(vdata0=RegisterOperand(i, RegType.VGPR), offset=i)
+            rid, val = self.interp.execute(instr, self.state)
+            self.assertEqual(rid, i)
+            self.assertEqual(val, 1000 + i)
+
+        for i in range(3):
+            self.assertEqual(self.state.gws.read_resource(i), 1000 + i)
+
+    def test_scalar_registers_unmodified(self) -> None:
+        # Set all registers to known sentinels
+        for i in range(DEFAULT_NUM_VGPRS):
+            self.state.set_vgpr(i, 0x1000 + i)
+        for i in range(DEFAULT_NUM_SGPRS):
+            self.state.set_sgpr(i, 0x2000 + i)
+        self.state.set_m0(7)
+
+        instr = DSGWSInitInstruction(vdata0=RegisterOperand(42, RegType.VGPR), offset=3)
+        self.interp.execute(instr, self.state)
+
+        # Check all registers are untouched
+        for i in range(DEFAULT_NUM_VGPRS):
+            self.assertEqual(self.state.get_vgpr(i), 0x1000 + i)
+        for i in range(DEFAULT_NUM_SGPRS):
+            self.assertEqual(self.state.get_sgpr(i), 0x2000 + i)
+        self.assertEqual(self.state.get_m0(), 7)
+
+    def test_scalar_large_values_and_wrapping(self) -> None:
+        self.state.set_vgpr(0, 0xFFFFFFFF)
+        instr = DSGWSInitInstruction(vdata0=RegisterOperand(0, RegType.VGPR), offset=70)  # 70 % 64 = 6
+        rid, val = self.interp.execute(instr, self.state)
+        self.assertEqual(rid, 6)
+        self.assertEqual(val, 0xFFFFFFFF)
+        self.assertEqual(self.state.gws.read_resource(6), 0xFFFFFFFF)
 
 
 if __name__ == "__main__":
