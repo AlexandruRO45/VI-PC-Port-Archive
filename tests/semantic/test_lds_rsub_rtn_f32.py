@@ -420,5 +420,122 @@ class TestSymbolicASTAndTypedExpressions(unittest.TestCase):
             )
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarLDSInterpreter:
+    """Deterministic scalar architectural interpreter for LDS instructions."""
+
+    def __init__(self, lds_size_dwords: int = LDS_SIZE_DWORDS) -> None:
+        self.vgprs: List[int] = [0] * DEFAULT_NUM_VGPRS
+        self.sgprs: List[int] = [0] * DEFAULT_NUM_SGPRS
+        self.mem: LDSMemory = LDSMemory(size_dwords=lds_size_dwords)
+
+    def read_reg(self, op: RegisterOperand) -> int:
+        if op.reg_type == RegType.VGPR:
+            return self.vgprs[op.index]
+        return self.sgprs[op.index]
+
+    def write_reg(self, op: RegisterOperand, val: int) -> None:
+        val32 = u32(val)
+        if op.reg_type == RegType.VGPR:
+            self.vgprs[op.index] = val32
+        else:
+            self.sgprs[op.index] = val32
+
+    def step(self, instr: DSRsubRtnInstruction) -> Tuple[int, int]:
+        """Execute a single ds_rsub_rtn_f32 instruction deterministically."""
+        vaddr_val = self.read_reg(instr.vaddr)
+        vdata0_val = self.read_reg(instr.vdata0)
+        old_val, new_val = self.mem.atomic_rsub_rtn_f32(
+            vaddr=vaddr_val,
+            vdata0=vdata0_val,
+            offset=instr.offset,
+        )
+        self.write_reg(instr.vdst, old_val)
+        return old_val, new_val
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarLDSInterpreter(lds_size_dwords=1024)
+
+    def test_scalar_rsub_step_execution(self) -> None:
+        # Pre-seed memory index 10 (byte address 40) with 2.0f
+        self.interp.mem.write_dword(10, TWO_F32)
+        # v1 (vaddr) = 40
+        self.interp.write_reg(RegisterOperand(1), 40)
+        # v2 (vdata0) = 5.0f
+        self.interp.write_reg(RegisterOperand(2), FIVE_F32)
+
+        instr = DSRsubRtnInstruction(
+            vdst=RegisterOperand(0),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+            offset=0,
+        )
+        old_val, new_val = self.interp.step(instr)
+
+        # Pre-op memory value was 2.0f -> returned into v0
+        self.assertEqual(old_val, TWO_F32)
+        self.assertEqual(self.interp.read_reg(RegisterOperand(0)), TWO_F32)
+        # Post-op memory value is 5.0f - 2.0f = 3.0f
+        self.assertEqual(new_val, THREE_F32)
+        self.assertEqual(self.interp.mem.read_dword(10), THREE_F32)
+
+    def test_scalar_multi_step_sequence(self) -> None:
+        # Pre-seed memory index 20 (byte address 80) with 1.0f
+        self.interp.mem.write_dword(20, ONE_F32)
+        self.interp.write_reg(RegisterOperand(5), 80)
+
+        # Step 1: vdata0 = 4.0f -> new = 4.0 - 1.0 = 3.0f
+        four_f32 = f32_to_u32(4.0)
+        self.interp.write_reg(RegisterOperand(6), four_f32)
+        instr1 = DSRsubRtnInstruction(
+            vdst=RegisterOperand(4),
+            vaddr=RegisterOperand(5),
+            vdata0=RegisterOperand(6),
+        )
+        old1, new1 = self.interp.step(instr1)
+        self.assertEqual(old1, ONE_F32)
+        self.assertEqual(self.interp.read_reg(RegisterOperand(4)), ONE_F32)
+        self.assertEqual(new1, THREE_F32)
+        self.assertEqual(self.interp.mem.read_dword(20), THREE_F32)
+
+        # Step 2: vdata0 = 10.0f -> new = 10.0 - 3.0 = 7.0f
+        self.interp.write_reg(RegisterOperand(6), TEN_F32)
+        instr2 = DSRsubRtnInstruction(
+            vdst=RegisterOperand(4),
+            vaddr=RegisterOperand(5),
+            vdata0=RegisterOperand(6),
+        )
+        old2, new2 = self.interp.step(instr2)
+        self.assertEqual(old2, THREE_F32)
+        self.assertEqual(self.interp.read_reg(RegisterOperand(4)), THREE_F32)
+        self.assertAlmostEqual(u32_to_f32(new2), 7.0, places=5)
+        self.assertAlmostEqual(u32_to_f32(self.interp.mem.read_dword(20)), 7.0, places=5)
+
+    def test_scalar_immediate_offset(self) -> None:
+        # vaddr = 0x100, offset = 8 -> effective = 0x108 -> dword index = 0x42
+        self.interp.mem.write_dword(0x42, TWO_F32)
+        self.interp.write_reg(RegisterOperand(10), 0x100)
+        self.interp.write_reg(RegisterOperand(11), TEN_F32)
+
+        instr = DSRsubRtnInstruction(
+            vdst=RegisterOperand(12),
+            vaddr=RegisterOperand(10),
+            vdata0=RegisterOperand(11),
+            offset=8,
+        )
+        old_val, new_val = self.interp.step(instr)
+        self.assertEqual(old_val, TWO_F32)
+        self.assertEqual(self.interp.read_reg(RegisterOperand(12)), TWO_F32)
+        self.assertAlmostEqual(u32_to_f32(new_val), 8.0, places=5)
+        self.assertAlmostEqual(u32_to_f32(self.interp.mem.read_dword(0x42)), 8.0, places=5)
+
+
 if __name__ == "__main__":
     unittest.main()
