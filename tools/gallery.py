@@ -297,7 +297,7 @@ def start_server(
         addr = ("127.0.0.1", port + 1)
         httpd = ThreadingServer(addr, StudioHandler)
 
-    url = f"http://localhost:{addr[1]}"
+    url = f"http://localhost:{httpd.server_port}"
     print(f"======================================================")
     print(f"       LEONIDA 3D ASSET STUDIO (VICE CITY EDITION)    ")
     print(f"======================================================")
