@@ -215,10 +215,10 @@ def read_tests(path: str) -> list[dict] | None:
     except (OSError, ValueError) as e:
         print(f"ERROR: cannot read {path}: {e}", file=sys.stderr)
         return None
-    if not isinstance(doc, dict) or not isinstance(doc.get("tests", []), list):
+    if not isinstance(doc, dict) or not isinstance(doc.get("tests"), list):
         print(f"ERROR: {path} is not the output of ctest --show-only=json-v1", file=sys.stderr)
         return None
-    return doc.get("tests", [])
+    return doc["tests"]
 
 
 def main() -> int:

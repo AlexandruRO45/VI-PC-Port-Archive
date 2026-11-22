@@ -414,9 +414,16 @@ class MainTest(unittest.TestCase):
         self.assertNotIn("Traceback", err.getvalue())
 
     def test_json_that_is_not_ctest_output_is_one_error_line(self):
-        code, _, err = self.run_main_json([{"name": "t"}])
-        self.assertEqual(code, 2)
-        self.assertIn("not the output of ctest", err)
+        for document in ([{"name": "t"}], {}, {"results": []}):
+            with self.subTest(document=document):
+                code, _, err = self.run_main_json(document)
+                self.assertEqual(code, 2)
+                self.assertIn("not the output of ctest", err)
+
+    def test_explicit_empty_ctest_listing_is_accepted(self):
+        code, out, _ = self.run_main_json({"tests": []})
+        self.assertEqual(code, 0)
+        self.assertIn("(0 tests)", out)
 
     def run_main_json(self, document):
         listing = self.root / "wrong.json"
