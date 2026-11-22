@@ -428,6 +428,58 @@ class SIMDInterpreter:
         return results
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Evaluation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class ComparisonStatusFlags64:
+    """Condition codes and status flags for 64-bit compare-and-swap operations."""
+    equal: bool
+    less_unsigned: bool
+    less_signed: bool
+    zero_result: bool
+    sign_result: bool
+    borrow: bool
+
+
+def evaluate_cmpst_b64_status_flags(
+    old_val: int,
+    cmp_val: int,
+    new_mem: int,
+) -> ComparisonStatusFlags64:
+    """Evaluate 64-bit condition codes, comparison flags, and borrow generation.
+
+    Args:
+        old_val: 64-bit memory value retrieved from LDS.
+        cmp_val: 64-bit expected value compared against memory.
+        new_mem: 64-bit memory value after compare-and-swap.
+
+    Returns:
+        ComparisonStatusFlags64: Evaluated relational and arithmetic status flags.
+    """
+    u_old = u64(old_val)
+    u_cmp = u64(cmp_val)
+    u_res = u64(new_mem)
+
+    equal = (u_old == u_cmp)
+    less_unsigned = (u_old < u_cmp)
+    less_signed = (s64(u_old) < s64(u_cmp))
+    zero_result = (u_res == 0)
+    sign_result = bool(u_res & 0x8000_0000_0000_0000)
+    borrow = less_unsigned
+
+    return ComparisonStatusFlags64(
+        equal=equal,
+        less_unsigned=less_unsigned,
+        less_signed=less_signed,
+        zero_result=zero_result,
+        sign_result=sign_result,
+        borrow=borrow,
+    )
+
+
+
 
 
 
@@ -980,8 +1032,79 @@ class TestRegisterAliasing(unittest.TestCase):
             self.assertEqual(state.lds.read_qword(lane * 8), 0x9000_0000_0000_0000 + lane)
 
 
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Phase 6: Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def test_64bit_equality_flags(self) -> None:
+        val = 0x1234_5678_9ABC_DEF0
+        old_val, new_mem, swapped = ref_ds_cmpst_rtn_b64(val, val, 0x1111)
+        self.assertTrue(swapped)
+        flags = evaluate_cmpst_b64_status_flags(old_val, val, new_mem)
+
+        self.assertTrue(flags.equal)
+        self.assertFalse(flags.less_unsigned)
+        self.assertFalse(flags.less_signed)
+        self.assertFalse(flags.borrow)
+        self.assertFalse(flags.zero_result)
+        self.assertFalse(flags.sign_result)
+
+    def test_64bit_less_unsigned_and_borrow(self) -> None:
+        old_val = 0x0000_0000_0000_0010
+        cmp_val = 0x0000_0000_0000_0020
+        old_val, new_mem, swapped = ref_ds_cmpst_rtn_b64(old_val, cmp_val, 0)
+        self.assertFalse(swapped)
+        flags = evaluate_cmpst_b64_status_flags(old_val, cmp_val, new_mem)
+
+        self.assertFalse(flags.equal)
+        self.assertTrue(flags.less_unsigned)
+        self.assertTrue(flags.less_signed)
+        self.assertTrue(flags.borrow)
+
+    def test_64bit_greater_unsigned_no_borrow(self) -> None:
+        old_val = 0x0000_0000_0000_0050
+        cmp_val = 0x0000_0000_0000_0020
+        old_val, new_mem, swapped = ref_ds_cmpst_rtn_b64(old_val, cmp_val, 0)
+        self.assertFalse(swapped)
+        flags = evaluate_cmpst_b64_status_flags(old_val, cmp_val, new_mem)
+
+        self.assertFalse(flags.equal)
+        self.assertFalse(flags.less_unsigned)
+        self.assertFalse(flags.less_signed)
+        self.assertFalse(flags.borrow)
+
+    def test_64bit_signed_vs_unsigned_divergence(self) -> None:
+        # 0xFFFF_FFFF_FFFF_FFFF (-1 signed) vs 0x0000_0000_0000_0001 (+1 signed)
+        old_val = MASK64
+        cmp_val = 1
+        _, new_mem, _ = ref_ds_cmpst_rtn_b64(old_val, cmp_val, 0)
+        flags = evaluate_cmpst_b64_status_flags(old_val, cmp_val, new_mem)
+
+        self.assertFalse(flags.equal)
+        self.assertFalse(flags.less_unsigned)
+        self.assertFalse(flags.borrow)
+        self.assertTrue(flags.less_signed)
+
+    def test_64bit_zero_result_flag(self) -> None:
+        val = 0x1234
+        old_val, new_mem, swapped = ref_ds_cmpst_rtn_b64(val, val, 0)
+        self.assertTrue(swapped)
+        flags = evaluate_cmpst_b64_status_flags(old_val, val, new_mem)
+        self.assertTrue(flags.zero_result)
+        self.assertFalse(flags.sign_result)
+
+    def test_64bit_negative_sign_result_flag(self) -> None:
+        val = 0x1234
+        neg = 0x8000_0000_0000_0000
+        old_val, new_mem, swapped = ref_ds_cmpst_rtn_b64(val, val, neg)
+        self.assertTrue(swapped)
+        flags = evaluate_cmpst_b64_status_flags(old_val, val, new_mem)
+        self.assertTrue(flags.sign_result)
+        self.assertFalse(flags.zero_result)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
