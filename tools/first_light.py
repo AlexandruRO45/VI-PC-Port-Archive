@@ -42,6 +42,7 @@ TOOLS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TOOLS)
 DEFAULT_VS = "VS_main_170e32e6_Wrapped"
 DEFAULT_PS = "$PS_Rage_Untextured_14f8529b_Wrapped"
+MAX_FRAME_DIMENSION = (1 << 31) - 1  # vk_harness parses each dimension as a signed int.
 MESH_HEADER = struct.Struct("<II")
 
 
@@ -379,12 +380,14 @@ def write_ppm(path: str, pixels, width: int, height: int) -> None:
 
 
 def run_draw(args, manifest: dict, out_dir: str) -> dict:
-    harness = find_harness(args.harness)
     for dimension in ("width", "height"):
         size = manifest[dimension]
-        if type(size) is not int or size < 1:
+        if type(size) is not int or not 1 <= size <= MAX_FRAME_DIMENSION:
             path = os.path.join(out_dir, "manifest.json")
-            raise SystemExit(f"the first-light manifest {path} requires a positive integer for {dimension}")
+            raise SystemExit(
+                f"the first-light manifest {path} requires an integer from 1 to {MAX_FRAME_DIMENSION} for {dimension}"
+            )
+    harness = find_harness(args.harness)
     raw = os.path.join(out_dir, "image.raw")
     if os.path.exists(raw):
         os.unlink(
@@ -541,8 +544,8 @@ def main(argv=None) -> int:
     if not a.no_fit and not a.obj:
         raise SystemExit("--obj is required unless --no-fit")
     for dimension, size in (("width", a.width), ("height", a.height)):
-        if size < 1:
-            ap.error(f"--{dimension} must be a positive integer")
+        if not 1 <= size <= MAX_FRAME_DIMENSION:
+            ap.error(f"--{dimension} must be an integer from 1 to {MAX_FRAME_DIMENSION}")
 
     index = ensure_carve(game, work)
     picked = choose(index, a.vs, a.ps)
