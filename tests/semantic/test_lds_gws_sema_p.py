@@ -235,23 +235,21 @@ class Instruction:
         except ValueError:
             raise ValueError(f"Unrecognized opcode: {op_str}")
 
+        if tokens[-1] != "gds":
+            raise ValueError("Instruction must end with 'gds' modifier")
+        gds = True
+
         offset = 0
-        gds = False
         vdata = None
 
-        for tok in tokens[1:]:
-            if tok == "gds":
-                gds = True
-            elif tok.startswith("offset:"):
+        for tok in tokens[1:-1]:
+            if tok.startswith("offset:"):
                 raw_off = tok.split(":", 1)[1]
                 offset = int(raw_off, 0)
             elif tok.startswith("v") and tok[1:].isdigit():
                 vdata = Register(int(tok[1:]), RegKind.VGPR)
             else:
                 raise ValueError(f"Unexpected token in instruction: {tok}")
-
-        if not gds:
-            raise ValueError("Instruction missing required 'gds' modifier")
 
         return cls(opcode=opcode, offset=offset, gds=gds, vdata=vdata)
 
@@ -1201,6 +1199,173 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
             self.assertTrue(acquired)
             self.assertEqual(val, 2)
             self.assertEqual(self.gws.resources[expected_rid].value, 2)
+
+
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Commit 8: Negative controls, syntax rejection, and mutation detection for ds_gws_sema_p."""
+
+    def test_assembly_syntax_rejection(self) -> None:
+        invalid_assemblies = [
+            "",
+            "   ",
+            "v_add_f32 v0, v1, v2",
+            "ds_min_u32 v0, v1",
+            "ds_gws_sema_p offset:0",  # missing gds keyword
+            "ds_gws_sema_p gds offset:0",  # incorrect order/format
+            "ds_gws_sema_p offset:-1 gds",  # negative offset
+            "ds_gws_sema_p offset:70000 gds",  # offset > 65535
+            "ds_gws_sema_p s0 offset:0 gds",  # SGPR for vdata
+            "ds_gws_sema_p v256 offset:0 gds",  # VGPR > 255
+            "ds_gws_sema_p unexpected_token offset:0 gds",
+            "ds_gws_sema_x offset:0 gds",  # invalid opcode
+        ]
+        for asm in invalid_assemblies:
+            with self.subTest(asm=asm):
+                with self.assertRaises((ValueError, TypeError, IndexError)):
+                    Instruction.parse(asm)
+
+    def test_architectural_bounds_rejection(self) -> None:
+        with self.assertRaises(ValueError):
+            GWSSemaphoreResource(res_id=-1)
+        with self.assertRaises(ValueError):
+            GWSSemaphoreResource(res_id=64)
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=128)
+
+    def test_barrier_mode_execution_rejection(self) -> None:
+        gws = GWSSubsystem()
+        gws.init_resource(10, init_val=0, res_type=GWSResourceType.BARRIER)
+        with self.assertRaises(TypeError):
+            gws.wait_p(10, wave_id=1)
+
+    def test_mutation_killer_inverted_logic(self) -> None:
+        # Mutant: increments counter on acquire instead of decrementing
+        def mutant_wait_p(res: GWSSemaphoreResource) -> Tuple[bool, int, bool]:
+            res.value = (res.value + 1) & MASK32
+            return True, res.value, False
+
+        res = GWSSemaphoreResource(res_id=0, value=5)
+        _, mutant_val, _ = mutant_wait_p(res)
+
+        gws = GWSSubsystem()
+        gws.init_resource(0, init_val=5)
+        acquired, oracle_val, blocked = ref_ds_gws_sema_p(gws, m0_val=0, offset=0, wave_id=1)
+
+        self.assertNotEqual(mutant_val, oracle_val)
+        self.assertEqual(mutant_val, 6)
+        self.assertEqual(oracle_val, 4)
+
+    def test_mutation_killer_underflow_wrapping(self) -> None:
+        # Mutant: decrements 0 to 0xFFFFFFFF instead of blocking
+        def mutant_underflow(res: GWSSemaphoreResource) -> Tuple[bool, int, bool]:
+            res.value = (res.value - 1) & MASK32
+            return True, res.value, False
+
+        res = GWSSemaphoreResource(res_id=0, value=0)
+        acquired, val, blocked = mutant_underflow(res)
+        self.assertEqual(val, 0xFFFF_FFFF)
+
+        # Architectural behavior: must NOT underflow; must block!
+        gws = GWSSubsystem()
+        gws.init_resource(0, init_val=0)
+        arch_acquired, arch_val, arch_blocked = ref_ds_gws_sema_p(gws, m0_val=0, offset=0, wave_id=1)
+        self.assertNotEqual(val, arch_val)
+        self.assertFalse(arch_acquired)
+        self.assertTrue(arch_blocked)
+        self.assertEqual(arch_val, 0)
+
+    def test_mutation_killer_ignore_exec_mask(self) -> None:
+        # Mutant: executes instruction regardless of whether EXEC == 0
+        class MutantSIMDInterpreter(SIMDGWSInterpreter):
+            def execute(self, wave: SIMDWaveState, inst: Instruction) -> Tuple[bool, int, bool]:
+                saved_exec = wave.exec_mask
+                wave.exec_mask = 0xFFFF_FFFF
+                try:
+                    return super().execute(wave, inst)
+                finally:
+                    wave.exec_mask = saved_exec
+
+        gws = GWSSubsystem()
+        gws.init_resource(0, init_val=5)
+        wave = SIMDWaveState(wave_id=1, wave_size=32, exec_mask=0, m0=0, gws=gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=0, gds=True)
+
+        mutant = MutantSIMDInterpreter()
+        mutant.execute(wave, inst)
+        self.assertEqual(gws.resources[0].value, 4)  # mutant incorrectly modified state!
+
+        # Correct interpreter must NOT modify counter when EXEC == 0
+        gws.init_resource(0, init_val=5)
+        SIMDGWSInterpreter().execute(wave, inst)
+        self.assertEqual(gws.resources[0].value, 5)
+
+    def test_mutation_killer_dropped_offset(self) -> None:
+        # Mutant: always uses offset 0, ignoring inst.offset
+        class MutantDroppedOffsetInterpreter(ScalarGWSInterpreter):
+            def execute(self, state: ScalarThreadState, inst: Instruction) -> Tuple[bool, int, bool]:
+                no_off_inst = Instruction(opcode=inst.opcode, offset=0, gds=inst.gds)
+                return super().execute(state, no_off_inst)
+
+        gws = GWSSubsystem()
+        gws.init_resource(0, init_val=10)
+        gws.init_resource(4, init_val=10)
+
+        state = ScalarThreadState(wave_id=1, m0=0, gws=gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=4, gds=True)
+
+        mutant = MutantDroppedOffsetInterpreter()
+        mutant.execute(state, inst)
+        self.assertEqual(gws.resources[0].value, 9)  # wrongly decremented slot 0!
+        self.assertEqual(gws.resources[4].value, 10)
+
+        # Reset and run correct interpreter
+        gws.init_resource(0, init_val=10)
+        gws.init_resource(4, init_val=10)
+        ScalarGWSInterpreter().execute(state, inst)
+        self.assertEqual(gws.resources[0].value, 10)  # slot 0 preserved
+        self.assertEqual(gws.resources[4].value, 9)   # slot 4 decremented
+
+    def test_mutation_killer_lifo_queue_ordering(self) -> None:
+        # Mutant: wakes newest waiter (LIFO) instead of oldest (FIFO)
+        def mutant_signal_v_lifo(res: GWSSemaphoreResource) -> Optional[int]:
+            if res.wait_queue:
+                return res.wait_queue.pop()  # pop from back (LIFO)!
+            return None
+
+        res = GWSSemaphoreResource(res_id=0, wait_queue=[101, 102, 103])
+        lifo_awakened = mutant_signal_v_lifo(res)
+        self.assertEqual(lifo_awakened, 103)
+
+        # Correct FIFO ordering:
+        gws = GWSSubsystem()
+        gws.init_resource(0, init_val=0)
+        for w in [101, 102, 103]:
+            gws.wait_p(0, wave_id=w)
+        _, fifo_awakened = gws.signal_v(0)
+        self.assertEqual(fifo_awakened, 101)
+        self.assertNotEqual(lifo_awakened, fifo_awakened)
+
+    def test_mutation_killer_floating_point_conversion(self) -> None:
+        # Mutant: converts counter to float32 and back, which flushes subnormals
+        def mutant_fp_counter(val: int) -> int:
+            f = struct.unpack(">f", struct.pack(">I", val))[0]
+            # In FTZ (flush-to-zero) mode, subnormals are flushed to 0.0
+            if math.fabs(f) < 1.17549435e-38:
+                f = 0.0
+            return struct.unpack(">I", struct.pack(">f", f))[0]
+
+        max_subnormal = 0x007F_FFFF
+        mutant_res = mutant_fp_counter(max_subnormal)
+        self.assertEqual(mutant_res, 0x0000_0000)
+
+        # Pure integer architectural behavior decrements by 1
+        gws = GWSSubsystem()
+        gws.init_resource(0, init_val=max_subnormal)
+        ref_ds_gws_sema_p(gws, m0_val=0, offset=0, wave_id=1)
+        self.assertEqual(gws.resources[0].value, 0x007F_FFFE)
+        self.assertNotEqual(mutant_res, gws.resources[0].value)
 
 
 if __name__ == "__main__":
