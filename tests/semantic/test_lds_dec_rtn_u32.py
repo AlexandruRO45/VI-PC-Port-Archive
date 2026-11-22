@@ -876,5 +876,149 @@ class TestSIMDMultiLaneDivergenceAndExecMasking(unittest.TestCase):
         self.assertEqual(state.lds.read_dword(target_dword), 3)
 
 
+class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_alias_vdst_with_vaddr(self) -> None:
+        # vdst = v1, vaddr = v1, vdata0 = v2
+        interp = ScalarInterpreter()
+        state = ScalarMachineState(lds_dwords=1024)
+
+        target_dword = 10
+        target_byte = target_dword * 4  # 40
+        state.lds.write_dword(target_dword, 75)
+
+        state.set_vgpr(1, target_byte)  # vaddr
+        state.set_vgpr(2, 100)          # vdata0
+
+        instr = DSDecRtnInstruction(
+            vdst=RegisterOperand(1),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+            offset=0,
+        )
+
+        old_val, new_val = interp.step(instr, state)
+        self.assertEqual(old_val, 75)
+        self.assertEqual(new_val, 74)
+        # v1 overwritten with old_val 75
+        self.assertEqual(state.get_vgpr(1), 75)
+        # Memory at address 40 updated to 74
+        self.assertEqual(state.lds.read_dword(target_dword), 74)
+        # v2 preserved
+        self.assertEqual(state.get_vgpr(2), 100)
+
+    def test_alias_vdst_with_vdata0_preserves_bound_snapshot(self) -> None:
+        # vdst = v2, vaddr = v1, vdata0 = v2
+        interp = ScalarInterpreter()
+        state = ScalarMachineState(lds_dwords=1024)
+
+        target_dword = 15
+        target_byte = target_dword * 4
+        # Memory is 0 -> will wrap to vdata0
+        state.lds.write_dword(target_dword, 0)
+
+        state.set_vgpr(1, target_byte)
+        orig_bound = 88
+        state.set_vgpr(2, orig_bound)  # vdata0
+
+        instr = DSDecRtnInstruction(
+            vdst=RegisterOperand(2),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+            offset=0,
+        )
+
+        old_val, new_val = interp.step(instr, state)
+        # Old memory was 0, wraps to 88
+        self.assertEqual(old_val, 0)
+        self.assertEqual(new_val, orig_bound)
+        # v2 overwritten with old_val (0)
+        self.assertEqual(state.get_vgpr(2), 0)
+        # Memory received orig_bound (88) despite v2 now being 0
+        self.assertEqual(state.lds.read_dword(target_dword), orig_bound)
+        # vaddr preserved
+        self.assertEqual(state.get_vgpr(1), target_byte)
+
+    def test_alias_vaddr_with_vdata0(self) -> None:
+        # vdst = v3, vaddr = v1, vdata0 = v1
+        interp = ScalarInterpreter()
+        state = ScalarMachineState(lds_dwords=1024)
+
+        # Let v1 = 64 (byte address 64 -> dword 16; and bound = 64)
+        val_shared = 64
+        dword_idx = val_shared // 4
+        state.lds.write_dword(dword_idx, 10)
+        state.set_vgpr(1, val_shared)
+        state.set_vgpr(3, 0)
+
+        instr = DSDecRtnInstruction(
+            vdst=RegisterOperand(3),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(1),
+            offset=0,
+        )
+
+        old_val, new_val = interp.step(instr, state)
+        self.assertEqual(old_val, 10)
+        self.assertEqual(new_val, 9)
+        self.assertEqual(state.get_vgpr(3), 10)
+        self.assertEqual(state.lds.read_dword(dword_idx), 9)
+        # v1 operand register preserved
+        self.assertEqual(state.get_vgpr(1), val_shared)
+
+    def test_triple_aliasing_all_operands_same_register(self) -> None:
+        # vdst = vaddr = vdata0 = v1
+        interp = ScalarInterpreter()
+        state = ScalarMachineState(lds_dwords=1024)
+
+        # Register holds 128 (byte address 128 -> dword 32; and bound = 128)
+        initial_reg = 128
+        dword_idx = initial_reg // 4
+        # Memory holds 5 (5 <= 128, so decrements to 4)
+        state.lds.write_dword(dword_idx, 5)
+        state.set_vgpr(1, initial_reg)
+
+        instr = DSDecRtnInstruction(
+            vdst=RegisterOperand(1),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(1),
+            offset=0,
+        )
+
+        old_val, new_val = interp.step(instr, state)
+        self.assertEqual(old_val, 5)
+        self.assertEqual(new_val, 4)
+        # v1 overwritten with old_val (5)
+        self.assertEqual(state.get_vgpr(1), 5)
+        # Memory at dword 32 holds 4
+        self.assertEqual(state.lds.read_dword(dword_idx), 4)
+
+    def test_triple_aliasing_wrap_from_zero(self) -> None:
+        # vdst = vaddr = vdata0 = v1 where memory holds 0
+        interp = ScalarInterpreter()
+        state = ScalarMachineState(lds_dwords=1024)
+
+        initial_reg = 100
+        dword_idx = initial_reg // 4
+        state.lds.write_dword(dword_idx, 0)
+        state.set_vgpr(1, initial_reg)
+
+        instr = DSDecRtnInstruction(
+            vdst=RegisterOperand(1),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(1),
+            offset=0,
+        )
+
+        old_val, new_val = interp.step(instr, state)
+        self.assertEqual(old_val, 0)
+        self.assertEqual(new_val, 100)
+        # v1 gets old_val (0)
+        self.assertEqual(state.get_vgpr(1), 0)
+        # Memory gets bound (100)
+        self.assertEqual(state.lds.read_dword(dword_idx), 100)
+
+
 if __name__ == "__main__":
     unittest.main()
