@@ -8,6 +8,7 @@ repository. The script runs as itself, through its own command line.
 """
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -62,10 +63,18 @@ def run(args, cwd=None):
     return subprocess.run([sys.executable, "-I", SCRIPT, *args], cwd=cwd, capture_output=True, text=True)
 
 
+def remove_tree(path):
+    """rmtree that clears the read-only bit Git leaves on objects, which Windows otherwise refuses to delete."""
+    def onerror(func, target, _exc):
+        os.chmod(target, stat.S_IWRITE)
+        func(target)
+    shutil.rmtree(path, onerror=onerror)
+
+
 class CheckNoGameData(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, self.dir)
+        self.addCleanup(remove_tree, self.dir)
 
     def write(self, name, data):
         path = os.path.join(self.dir, name)
