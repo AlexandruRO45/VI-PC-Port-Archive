@@ -231,8 +231,8 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
             stmt = "direction = false;"
         elif op == M.STD:
             stmt = "direction = true;"
-        elif op in (M.JE, M.JNE, M.JAE, M.JA, M.JB, M.JBE, M.JMP,
-                    M.JL, M.JGE, M.JLE, M.JG, M.JS, M.JNS, M.JO, M.JNO):
+        elif (op in (M.JE, M.JNE, M.JAE, M.JA, M.JB, M.JBE, M.JMP) or
+              (x87_depth is None and op in (M.JL, M.JGE, M.JLE, M.JG, M.JS, M.JNS, M.JO, M.JNO))):
             target = i.near_branch_target
             if target not in allowed:
                 raise ValueError(f"unbound branch at {i.ip:#x}")
@@ -274,8 +274,9 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
             src_bits = 8 * (MemorySizeExt.size(i.memory_size) if i.op1_kind == K.MEMORY else RegisterExt.size(i.op1_register))
             dst_bits = 8 * RegisterExt.size(i.op0_register)
             stmt = write(f"static_cast<int{dst_bits}_t>(static_cast<int{src_bits}_t>({operand(1)}))")
-        elif op in (M.CMOVE, M.CMOVNE, M.CMOVA, M.CMOVAE, M.CMOVB, M.CMOVBE,
-                    M.CMOVL, M.CMOVGE, M.CMOVLE, M.CMOVG, M.CMOVS, M.CMOVNS, M.CMOVO, M.CMOVNO):
+        elif ((op in (M.CMOVE, M.CMOVNE, M.CMOVA, M.CMOVAE, M.CMOVB, M.CMOVBE) or
+               (x87_depth is None and op in (M.CMOVL, M.CMOVGE, M.CMOVLE, M.CMOVG, M.CMOVS, M.CMOVNS, M.CMOVO, M.CMOVNO))) and
+              RegisterExt.size(i.op0_register) in (4, 8)):
             cond = {M.CMOVE: "zero", M.CMOVNE: "!zero", M.CMOVA: "!carry && !zero",
                     M.CMOVAE: "!carry", M.CMOVB: "carry", M.CMOVBE: "carry || zero",
                     M.CMOVL: "sign != overflow", M.CMOVGE: "sign == overflow",
@@ -315,7 +316,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
             lhs, rhs = operand(i.op_count - 2), operand(i.op_count - 1)
             stmt = (f"{{ const int64_t product = int64_t(int32_t({lhs})) * int32_t({rhs}); "
                     f"carry = product != int32_t(product); overflow = carry; {write('product')} }}")
-        elif op == M.CWD:
+        elif op == M.CWD and x87_depth is None:
             stmt = "rdx = (rdx & ~0xffffull) | (static_cast<int16_t>(rax) < 0 ? 0xffffull : 0ull);"
         elif op == M.CDQ:
             stmt = "rdx = uint32_t(int32_t(rax) >> 31);"
@@ -370,7 +371,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
             stmt = "carry = true;"
         elif op == M.CMC:
             stmt = "carry = !carry;"
-        elif op == M.NEG:
+        elif op == M.NEG and x87_depth is None:
             size = MemorySizeExt.size(i.memory_size) if i.op0_kind == K.MEMORY else RegisterExt.size(i.op0_register)
             width = UINT[size]
             sign_shift = 8 * size - 1
@@ -876,8 +877,8 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                                             f"static_cast<{host}>({operand(n)}))")
         elif op == M.NOP or (op == M.XCHG and i.op0_register == i.op1_register == R.AX):
             stmt = ";"
-        elif op in (M.SETE, M.SETNE, M.SETA, M.SETAE, M.SETB, M.SETBE,
-                    M.SETL, M.SETGE, M.SETLE, M.SETG, M.SETS, M.SETNS, M.SETO, M.SETNO):
+        elif (op in (M.SETE, M.SETNE, M.SETA, M.SETAE, M.SETB, M.SETBE) or
+              (x87_depth is None and op in (M.SETL, M.SETGE, M.SETLE, M.SETG, M.SETS, M.SETNS, M.SETO, M.SETNO))):
             cond = {M.SETE: "zero", M.SETNE: "!zero", M.SETA: "!carry && !zero",
                     M.SETAE: "!carry", M.SETB: "carry", M.SETBE: "carry || zero",
                     M.SETL: "sign != overflow", M.SETGE: "sign == overflow",
@@ -885,6 +886,8 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                     M.SETS: "sign", M.SETNS: "!sign",
                     M.SETO: "overflow", M.SETNO: "!overflow"}[op]
             stmt = write(f"({cond})")
+        elif op == M.SETO:
+            stmt = write("overflow")
         elif op == M.CALL:
             stmt = calls[i.ip]
         elif op == M.XLATB:

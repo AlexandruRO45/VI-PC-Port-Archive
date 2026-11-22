@@ -346,12 +346,13 @@ neg64 ENDP
 
 cwd_op PROC FRAME
     .endprolog
+    xor edx, edx
     mov rax, rcx
     cwd
-    and eax, 0ffffh
-    shl rdx, 16
-    and rdx, 0ffff0000h
-    or rax, rdx
+    movzx eax, ax
+    movzx edx, dx
+    shl edx, 16
+    or eax, edx
     ret
 cwd_op ENDP
 
