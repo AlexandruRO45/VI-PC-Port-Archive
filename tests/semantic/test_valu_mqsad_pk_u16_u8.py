@@ -709,5 +709,130 @@ class TestValuMqsadPkU16U8SIMDDivergence(unittest.TestCase):
                 self.assertEqual(state.read_lane_operand_64(Operand.vgpr(0, count=2), lane), sentinel)
 
 
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestValuMqsadPkU16U8RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing hazards and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.state = ScalarRegisterState()
+        self.interp = ScalarInterpreter()
+
+    def test_aliasing_dst_equals_src2_inplace_accumulator(self) -> None:
+        """v[0:1] = v_mqsad_pk_u16_u8 v[0:1], v[2:3], s4, v[0:1]"""
+        # Initial accumulator in v[0:1]
+        acc_initial = pack_u16_to_u64(10, 20, 30, 40)
+        self.state.write_vgpr_64(0, acc_initial)
+
+        # src0 in v[2:3]
+        s0_val = sum((i + 1) << (8 * i) for i in range(8))
+        self.state.write_vgpr_64(2, s0_val)
+
+        # src1 query in s4
+        s1_val = 1 | (2 << 8) | (3 << 16) | (4 << 24)
+        self.state.sgprs[4] = s1_val
+
+        instr = VMqsadPkU16U8Instruction(
+            dst=Operand.vgpr(0, count=2),
+            src0=Operand.vgpr(2, count=2),
+            src1=Operand.sgpr(4, count=1),
+            src2=Operand.vgpr(0, count=2),
+        )
+
+        expected = ref_mqsad_pk_u16_u8_u64(s0_val, s1_val, acc_initial)
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, expected)
+        self.assertEqual(self.state.read_operand_64(Operand.vgpr(0, count=2)), expected)
+
+    def test_aliasing_dst_equals_src0_reference_window(self) -> None:
+        """v[0:1] = v_mqsad_pk_u16_u8 v[0:1], v[0:1], s2, v[4:5]"""
+        s0_initial = 0xAABBCCDD_11223344
+        self.state.write_vgpr_64(0, s0_initial)
+
+        s1_val = 0x11223344
+        self.state.sgprs[2] = s1_val
+
+        acc_val = pack_u16_to_u64(100, 200, 300, 400)
+        self.state.write_vgpr_64(4, acc_val)
+
+        instr = VMqsadPkU16U8Instruction(
+            dst=Operand.vgpr(0, count=2),
+            src0=Operand.vgpr(0, count=2),
+            src1=Operand.sgpr(2, count=1),
+            src2=Operand.vgpr(4, count=2),
+        )
+
+        expected = ref_mqsad_pk_u16_u8_u64(s0_initial, s1_val, acc_val)
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, expected)
+        self.assertEqual(self.state.read_operand_64(Operand.vgpr(0, count=2)), expected)
+
+    def test_aliasing_src0_equals_src2_shared_operands(self) -> None:
+        """dst v[0:1] distinct, src0 and src2 both read from v[2:3]."""
+        shared_val = 0x01020304_05060708
+        self.state.write_vgpr_64(2, shared_val)
+        self.state.sgprs[0] = 0x05060708
+
+        instr = VMqsadPkU16U8Instruction(
+            dst=Operand.vgpr(0, count=2),
+            src0=Operand.vgpr(2, count=2),
+            src1=Operand.sgpr(0, count=1),
+            src2=Operand.vgpr(2, count=2),
+        )
+
+        expected = ref_mqsad_pk_u16_u8_u64(shared_val, 0x05060708, shared_val)
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, expected)
+        # Verify source v[2:3] is uncorrupted
+        self.assertEqual(self.state.read_operand_64(Operand.vgpr(2, count=2)), shared_val)
+
+    def test_aliasing_triple_collision(self) -> None:
+        """dst == src0 == src2 (v[0:1] all aliased)."""
+        initial = 0x55AA55AA_AA55AA55
+        self.state.write_vgpr_64(0, initial)
+        self.state.sgprs[0] = 0xAA55AA55
+
+        instr = VMqsadPkU16U8Instruction(
+            dst=Operand.vgpr(0, count=2),
+            src0=Operand.vgpr(0, count=2),
+            src1=Operand.sgpr(0, count=1),
+            src2=Operand.vgpr(0, count=2),
+        )
+
+        expected = ref_mqsad_pk_u16_u8_u64(initial, 0xAA55AA55, initial)
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, expected)
+        self.assertEqual(self.state.read_operand_64(Operand.vgpr(0, count=2)), expected)
+
+    def test_aliasing_partial_overlap_low_and_high(self) -> None:
+        """dst v[1:2] partially overlaps with src0 v[0:1]."""
+        # Set v0 = 0x11223344, v1 = 0x55667788, v2 = 0x99AABBCC
+        self.state.vgprs[0] = 0x11223344
+        self.state.vgprs[1] = 0x55667788
+        self.state.vgprs[2] = 0x99AABBCC
+
+        src0_val = 0x11223344 | (0x55667788 << 32)
+        s1_val = 0x12345678
+        acc_val = pack_u16_to_u64(1, 2, 3, 4)
+        self.state.write_vgpr_64(4, acc_val)
+
+        instr = VMqsadPkU16U8Instruction(
+            dst=Operand.vgpr(1, count=2),
+            src0=Operand.vgpr(0, count=2),
+            src1=Operand.literal(s1_val),
+            src2=Operand.vgpr(4, count=2),
+        )
+
+        expected = ref_mqsad_pk_u16_u8_u64(src0_val, s1_val, acc_val)
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, expected)
+        # v0 must remain intact
+        self.assertEqual(self.state.vgprs[0], 0x11223344)
+        # v[1:2] must hold result
+        self.assertEqual(self.state.read_operand_64(Operand.vgpr(1, count=2)), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
