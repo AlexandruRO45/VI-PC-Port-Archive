@@ -200,6 +200,9 @@ The biggest open pieces:
 See [CONTRIBUTING.md](CONTRIBUTING.md). Never attach game files, extracted assets or generated shaders to issues or
 pull requests.
 
+To see what is open, claimed, waiting for CI or ready to merge, open the live dashboard in `dashboard/`
+([what it shows](dashboard/README.md)).
+
 ## Credits
 
 - [rpf9-explorer](https://github.com/breadbbbb/rpf9-explorer) by breadbbbb: the RPF9 model, texture-pool and AWC

@@ -15,6 +15,7 @@ loader that maps the game's executable and resolves its imports to shims. Nothin
 - The notes under `docs/` record measured formats, indexed by [docs/README.md](docs/README.md); `docs/design.md` is the one quoted most.
 - `scripts/` holds the GPU/Wine test runners (`run_gpu_tests.py`, `run_wine_tests.py`) and PowerShell build helpers.
 - `viewer/` is the map viewer: `index.html` plus `serve.py`, a local-only server for the exported world.
+- `dashboard/` is a live overview of the GitHub side (PR pipeline, merge queue, coordination claims): a static page that reads public GitHub data in the browser, described in [dashboard/README.md](dashboard/README.md).
 - `third_party/` holds the `rpf9-explorer` submodule (`tools/rpf9dump` needs `git submodule update --init`) and the vendored `xtaskqueue` the `xgameruntime` shim links.
 - `game/xbox-1.0.2.1.json` is the per-file size and SHA-256 manifest of the Xbox package — hashes only, no game content.
 - `tests/semantic/` is the translator regression suite; a new translator rule comes with a small hand-written `.asm` fixture there.
