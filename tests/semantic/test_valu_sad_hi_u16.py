@@ -1042,5 +1042,81 @@ class TestValuSadHiU16StatusFlags(unittest.TestCase):
         self.assertFalse(flags.carry)
 
 
+class TestValuSadHiU16IEEE754Boundaries(unittest.TestCase):
+    """Unit tests for IEEE 754 bit-pattern extremes, subnormals, and NaN handling."""
+
+    # IEEE 754 float32 constants
+    POS_ZERO_F32: int = 0x0000_0000
+    NEG_ZERO_F32: int = 0x8000_0000
+    POS_INF_F32: int = 0x7F80_0000
+    NEG_INF_F32: int = 0xFF80_0000
+    QNAN_F32: int = 0x7FC0_0000
+    SNAN_F32: int = 0x7F80_0001
+    MIN_NORMAL_F32: int = 0x0080_0000
+    MAX_SUBNORMAL_F32: int = 0x007F_FFFF
+
+    # IEEE 754 float16 halfword constants
+    POS_ZERO_F16: int = 0x0000
+    NEG_ZERO_F16: int = 0x8000
+    POS_INF_F16: int = 0x7C00
+    NEG_INF_F16: int = 0xFC00
+    QNAN_F16: int = 0x7E00
+    SNAN_F16: int = 0x7C01
+    MIN_NORMAL_F16: int = 0x0400
+    MAX_SUBNORMAL_F16: int = 0x03FF
+
+    @staticmethod
+    def f32_to_bits(val: float) -> int:
+        return struct.unpack("<I", struct.pack("<f", val))[0]
+
+    def test_signed_zero_f16_halfword_distance(self) -> None:
+        # Distance between +0.0 (0x0000) and -0.0 (0x8000) in float16 halfword lane
+        s0 = pack_halfwords_u32(self.POS_ZERO_F16, 0)
+        s1 = pack_halfwords_u32(self.NEG_ZERO_F16, 0)
+        # diff = 32768 (0x8000). Shifted = 0x8000_0000
+        self.assertEqual(ref_sad_hi_u16(s0, s1, 0), 0x8000_0000)
+
+    def test_nan_quiet_bit_f16_isolation(self) -> None:
+        # +Inf (0x7C00) vs QNaN (0x7E00) in float16
+        s0 = pack_halfwords_u32(self.POS_INF_F16, 0)
+        s1 = pack_halfwords_u32(self.QNAN_F16, 0)
+        # diff = |0x7C00 - 0x7E00| = 512 (0x0200). Shifted = 512 << 16 = 0x0200_0000
+        self.assertEqual(ref_sad_hi_u16(s0, s1, 0), 0x0200_0000)
+
+        # +Inf (0x7C00) vs SNaN (0x7C01) in float16
+        s2 = pack_halfwords_u32(self.SNAN_F16, 0)
+        # diff = 1. Shifted = 1 << 16 = 0x0001_0000
+        self.assertEqual(ref_sad_hi_u16(s0, s2, 0), 0x0001_0000)
+
+    def test_subnormal_to_normal_boundary_step_f16(self) -> None:
+        # Between float16 min normal (0x0400) and max subnormal (0x03FF)
+        s0 = pack_halfwords_u32(self.MIN_NORMAL_F16, 0)
+        s1 = pack_halfwords_u32(self.MAX_SUBNORMAL_F16, 0)
+        # diff = 1. Shifted = 0x0001_0000
+        self.assertEqual(ref_sad_hi_u16(s0, s1, 0), 0x0001_0000)
+
+    def test_inf_to_neg_inf_f16_distance(self) -> None:
+        # Float16 +Inf (0x7C00) vs -Inf (0xFC00)
+        s0 = pack_halfwords_u32(self.POS_INF_F16, 0)
+        s1 = pack_halfwords_u32(self.NEG_INF_F16, 0)
+        # diff = 0x8000. Shifted = 0x8000_0000
+        self.assertEqual(ref_sad_hi_u16(s0, s1, 0), 0x8000_0000)
+
+    def test_f32_signed_zero_upper_halfword_distance(self) -> None:
+        # +0.0f (0x00000000) vs -0.0f (0x80000000)
+        # Lower halfwords: 0 vs 0 -> diff 0. Upper halfwords: 0 vs 0x8000 -> diff 0x8000
+        # sum = 0x8000. Shifted = 0x8000_0000
+        self.assertEqual(ref_sad_hi_u16(self.POS_ZERO_F32, self.NEG_ZERO_F32, 0), 0x8000_0000)
+
+    def test_nan_quiet_bit_msad_hi_u16(self) -> None:
+        # QNaN_f16 (0x7E00) in low halfword, zero in high halfword
+        s0 = 0xFFFF_FFFF
+        s1 = pack_halfwords_u32(self.QNAN_F16, 0)  # high halfword masked out
+        # low diff: |0xFFFF - 0x7E00| = 33279 (0x81FF)
+        # high skipped (diff 0)
+        # sum = 0x81FF. Shifted = 0x81FF_0000
+        self.assertEqual(ref_msad_hi_u16(s0, s1, 0), 0x81FF_0000)
+
+
 if __name__ == "__main__":
     unittest.main()
