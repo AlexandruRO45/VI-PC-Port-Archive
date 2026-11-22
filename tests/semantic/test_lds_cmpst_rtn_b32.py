@@ -364,6 +364,58 @@ class SIMDInterpreter:
         return results
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Evaluation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class ComparisonStatusFlags:
+    """Condition codes and status flags for 32-bit compare-and-swap operations."""
+    equal: bool
+    less_unsigned: bool
+    less_signed: bool
+    zero_result: bool
+    sign_result: bool
+    borrow: bool
+
+
+def evaluate_cmpst_status_flags(
+    old_val: int,
+    cmp_val: int,
+    new_mem: int,
+) -> ComparisonStatusFlags:
+    """Evaluate condition codes, comparison flags, and borrow generation.
+
+    Args:
+        old_val: Memory value retrieved from LDS.
+        cmp_val: Expected value compared against memory.
+        new_mem: Memory value after compare-and-swap.
+
+    Returns:
+        ComparisonStatusFlags: Evaluated relational and arithmetic status flags.
+    """
+    u_old = u32(old_val)
+    u_cmp = u32(cmp_val)
+    u_res = u32(new_mem)
+
+    equal = (u_old == u_cmp)
+    less_unsigned = (u_old < u_cmp)
+    less_signed = (s32(u_old) < s32(u_cmp))
+    zero_result = (u_res == 0)
+    sign_result = bool(u_res & 0x80000000)
+    borrow = less_unsigned
+
+    return ComparisonStatusFlags(
+        equal=equal,
+        less_unsigned=less_unsigned,
+        less_signed=less_signed,
+        zero_result=zero_result,
+        sign_result=sign_result,
+        borrow=borrow,
+    )
+
+
+
 
 
 
@@ -965,8 +1017,73 @@ class TestRegisterAliasing(unittest.TestCase):
             self.assertEqual(state.lds.read_dword(lane * 4), 0x700 + lane)
 
 
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Phase 6: Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def test_equality_flags(self) -> None:
+        old_val, new_mem, swapped = ref_ds_cmpst_rtn_b32(0x1000, 0x1000, 0x2000)
+        self.assertTrue(swapped)
+        flags = evaluate_cmpst_status_flags(old_val, 0x1000, new_mem)
+
+        self.assertTrue(flags.equal)
+        self.assertFalse(flags.less_unsigned)
+        self.assertFalse(flags.less_signed)
+        self.assertFalse(flags.borrow)
+        self.assertFalse(flags.zero_result)
+        self.assertFalse(flags.sign_result)
+
+    def test_less_unsigned_and_borrow(self) -> None:
+        old_val, new_mem, swapped = ref_ds_cmpst_rtn_b32(10, 20, 99)
+        self.assertFalse(swapped)
+        flags = evaluate_cmpst_status_flags(old_val, 20, new_mem)
+
+        self.assertFalse(flags.equal)
+        self.assertTrue(flags.less_unsigned)
+        self.assertTrue(flags.less_signed)
+        self.assertTrue(flags.borrow)
+
+    def test_greater_unsigned_no_borrow(self) -> None:
+        old_val, new_mem, swapped = ref_ds_cmpst_rtn_b32(50, 20, 99)
+        self.assertFalse(swapped)
+        flags = evaluate_cmpst_status_flags(old_val, 20, new_mem)
+
+        self.assertFalse(flags.equal)
+        self.assertFalse(flags.less_unsigned)
+        self.assertFalse(flags.less_signed)
+        self.assertFalse(flags.borrow)
+
+    def test_signed_vs_unsigned_divergence(self) -> None:
+        # 0xFFFFFFFF (-1 signed, 4294967295 unsigned) vs 0x00000001 (+1)
+        old_val = 0xFFFFFFFF
+        cmp_val = 0x00000001
+        _, new_mem, _ = ref_ds_cmpst_rtn_b32(old_val, cmp_val, 0)
+        flags = evaluate_cmpst_status_flags(old_val, cmp_val, new_mem)
+
+        self.assertFalse(flags.equal)
+        self.assertFalse(flags.less_unsigned) # Unsigned: 0xFFFFFFFF > 1
+        self.assertFalse(flags.borrow)
+        self.assertTrue(flags.less_signed)    # Signed: -1 < +1
+
+    def test_zero_result_flag(self) -> None:
+        old_val, new_mem, swapped = ref_ds_cmpst_rtn_b32(42, 42, 0)
+        self.assertTrue(swapped)
+        self.assertEqual(new_mem, 0)
+        flags = evaluate_cmpst_status_flags(old_val, 42, new_mem)
+        self.assertTrue(flags.zero_result)
+        self.assertFalse(flags.sign_result)
+
+    def test_negative_sign_result_flag(self) -> None:
+        old_val, new_mem, swapped = ref_ds_cmpst_rtn_b32(0, 0, 0x80000000)
+        self.assertTrue(swapped)
+        self.assertEqual(new_mem, 0x80000000)
+        flags = evaluate_cmpst_status_flags(old_val, 0, new_mem)
+        self.assertTrue(flags.sign_result)
+        self.assertFalse(flags.zero_result)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
