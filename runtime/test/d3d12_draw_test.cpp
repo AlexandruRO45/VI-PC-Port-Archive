@@ -41,7 +41,9 @@ struct Vertex {
 
 int main() {
     vktest::Device d;
-    EXPECT(d.create());
+    const auto device_status = d.initialize();
+    if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
+    EXPECT(device_status == vktest::DeviceStatus::ready);
 
     // Shader programs and the index that maps their hashes to the compiled test modules.
     const auto vs_program = fssm_program({0x56530001, 0xbf810000});
