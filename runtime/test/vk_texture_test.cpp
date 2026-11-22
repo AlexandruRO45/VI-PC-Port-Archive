@@ -5,8 +5,9 @@
 // registers that T# -> image index 1 and the shader's literal S# -> sampler index 1, binds an 8x8 gradient at
 // index 1 and a magenta fallback at index 0, draws a full-screen triangle and dumps the RGBA32F result.
 //
-//   vk_texture_test <vs.spv> <fs.spv> <out.raw> <ptr_sgpr> <s0> <s1> <s2> <s3> [--two-mip]   (S# words as hex)
+//   vk_texture_test <vs.spv> <fs.spv> <out.raw> <ptr_sgpr> <s0> <s1> <s2> <s3> [--two-mip|--rect-mip]   (S# words as hex)
 //   --two-mip: expose a 128x128 quadrant texture and its solid cyan mip 1 to the 64x64 draw.
+//   --rect-mip: expose a 16x8 texture with 3 mip levels (16x8, 8x4, 4x2) for image_get_resinfo tests.
 //   vk_texture_test cube [out.raw]: ps_cube_sample against two 8x8 cubes, a 12-layer 2D array at binding 3 (the
 //   translator's view of a cube array); every pixel must be the texel a cube sample of its direction reads.
 //   vk_texture_test dref [out.raw]: ps_sample_c_lz against an 8x8 D32 texture at index 1 (texel x holds depth
@@ -64,9 +65,12 @@ static bool declares_capability(const std::vector<uint32_t>& spv, uint32_t cap) 
 int main(int argc, char** argv) {
     const uint32_t W = 64, H = 64, TW = 8;
     const bool two_mip = argc == 10 && std::strcmp(argv[9], "--two-mip") == 0;
-    // With vs_ids spanning UV [0,1] over the viewport, adjacent fragments differ by two base texels.
-    const uint32_t texture_side = two_mip ? 2 * W : TW;
-    const uint32_t levels = two_mip ? 2 : 1;
+    const bool rect_mip = argc == 10 && std::strcmp(argv[9], "--rect-mip") == 0;
+    const bool extra_mip = two_mip || rect_mip;
+    // With vs_ids spanning UV [0,1] over the viewport, adjacent fragments differ by two base texels in --two-mip.
+    const uint32_t texture_w = rect_mip ? 16 : (two_mip ? 2 * W : TW);
+    const uint32_t texture_h = rect_mip ? 8 : (two_mip ? 2 * W : TW);
+    const uint32_t levels = rect_mip ? 3 : (two_mip ? 2 : 1);
     std::string vs_path, fs_path, out_path;
     int ptr_sgpr = 0;
     const bool cube = argc >= 2 && !std::strcmp(argv[1], "cube");
@@ -75,7 +79,7 @@ int main(int argc, char** argv) {
     bool autonomous = false;
     uint32_t ssharp[8] = {0x92, 0xc00000, 0x14500000, 0,
                           0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
-    if (argc == 9 || two_mip) {
+    if (argc == 9 || extra_mip) {
         vs_path = argv[1];
         fs_path = argv[2];
         out_path = argv[3];
@@ -108,7 +112,7 @@ int main(int argc, char** argv) {
         if (dref)
             ssharp[0] |= 3u << 12;              // the shader's S#: DEPTH_COMPARE_FUNC = LESSEQUAL
     } else {
-        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip]\n");
+        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--rect-mip]\n");
         return 2;
     }
     // Word 1 also selects the numeric type when the shader fetches through this key.
@@ -133,7 +137,7 @@ int main(int argc, char** argv) {
     if (n) CHECK(vkEnumeratePhysicalDevices(inst, &n, pds.data()));
     if (!n) {
         std::fprintf(stderr, "unsupported: no Vulkan physical device\n");
-        return two_mip ? 77 : 1;
+        return extra_mip ? 77 : 1;
     }
     VkPhysicalDevice pd = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties properties{};
@@ -160,7 +164,7 @@ int main(int argc, char** argv) {
     while (qi < qn && !(qf[qi].queueFlags & VK_QUEUE_GRAPHICS_BIT)) ++qi;
     if (qi == qn) {
         std::fprintf(stderr, "unsupported: no graphics queue family\n");
-        return two_mip ? 77 : 1;
+        return extra_mip ? 77 : 1;
     }
     float prio = 1;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -208,7 +212,7 @@ int main(int argc, char** argv) {
     dci.enabledExtensionCount = uint32_t(enable.size()); dci.ppEnabledExtensionNames = enable.data();
     VkDevice dev;
     VkResult created = vkCreateDevice(pd, &dci, nullptr, &dev);
-    if (two_mip && created == VK_ERROR_FEATURE_NOT_PRESENT) {
+    if (extra_mip && created == VK_ERROR_FEATURE_NOT_PRESENT) {
         std::fprintf(stderr, "unsupported: device lacks a requested texture test feature\n");
         return 77;
     }
@@ -252,7 +256,7 @@ int main(int argc, char** argv) {
     CHECK(make_buffer(heap_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, &heap, &heapm, &heapp));
     std::memset(heapp, 0, size_t(heap_bytes));
     std::memcpy(static_cast<char*>(heapp) + tsharp_va, tsharp, 32);
-    if (two_mip)  // The gather test loads its S# from the four words just after the T#.
+    if (extra_mip)  // The gather / lod / resinfo tests load S# from the four words just after the T#.
         std::memcpy(static_cast<char*>(heapp) + tsharp_va + 32, ssharp, 16);
     VkBufferDeviceAddressInfo bdai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO}; bdai.buffer = heap;
     VkDeviceAddress heap_base = vkGetBufferDeviceAddress(dev, &bdai);
@@ -291,11 +295,14 @@ int main(int argc, char** argv) {
     const uint32_t magenta = 0xFFFF00FFu;
     // R8G8B8A8 in memory: red, green, blue, transparent yellow, then solid cyan in mip 1.
     const uint32_t quadrants[2][2] = {{0xFF0000FFu, 0xFF00FF00u}, {0xFFFF0000u, 0x0000FFFFu}};
-    std::vector<uint32_t> texels(texture_side * texture_side + (two_mip ? (texture_side / 2) * (texture_side / 2) : 0), 0xFFFFFF00u);
-    for (uint32_t y = 0; y < texture_side; y++) {
-        for (uint32_t x = 0; x < texture_side; x++) {
-            texels[y * texture_side + x] = two_mip ? quadrants[y >= texture_side / 2][x >= texture_side / 2]
-                                         : (x * 32u) | ((y * 32u) << 8) | (128u << 16) | (255u << 24);
+    uint32_t total_texels = 0;
+    for (uint32_t level = 0; level < levels; ++level)
+        total_texels += std::max(1u, texture_w >> level) * std::max(1u, texture_h >> level);
+    std::vector<uint32_t> texels(total_texels, 0xFFFFFF00u);
+    for (uint32_t y = 0; y < texture_h; y++) {
+        for (uint32_t x = 0; x < texture_w; x++) {
+            texels[y * texture_w + x] = two_mip ? quadrants[y >= texture_h / 2][x >= texture_w / 2]
+                                      : (x * 32u) | ((y * 32u) << 8) | (128u << 16) | (255u << 24);
         }
     }
     if (dref) {   // same size as the 8x8 gradient: one 32-bit word a texel
@@ -316,7 +323,7 @@ int main(int argc, char** argv) {
                               VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM};
     VkImage timg[4]; VkImageView tview[4];
     CHECK(make_tex(1, 1, 1, 1, VK_IMAGE_VIEW_TYPE_2D, tfmt[0], &timg[0], &tview[0]));
-    CHECK(make_tex(texture_side, texture_side, levels, 1, VK_IMAGE_VIEW_TYPE_2D, tfmt[1], &timg[1], &tview[1]));
+    CHECK(make_tex(texture_w, texture_h, levels, 1, VK_IMAGE_VIEW_TYPE_2D, tfmt[1], &timg[1], &tview[1]));
     CHECK(make_tex(1, 1, 1, 1, VK_IMAGE_VIEW_TYPE_2D_ARRAY, tfmt[2], &timg[2], &tview[2]));
     CHECK(make_tex(TW, TW, 1, CUBE_LAYERS, VK_IMAGE_VIEW_TYPE_2D_ARRAY, tfmt[3], &timg[3], &tview[3]));
     VkBuffer up; VkDeviceMemory upm; void* upp;
@@ -333,7 +340,7 @@ int main(int argc, char** argv) {
     sci.maxLod = float(levels - 1);
     sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     VkSamplerCreateInfo sci1 = sci;            // index 1: the S# the shader names
-    if (two_mip) {
+    if (extra_mip) {
         const leonida::gfx10::SamplerWords words{ssharp[0], ssharp[1], ssharp[2], ssharp[3]};
         const auto sampler = leonida::gfx10::decode(words);
         sci1.minLod = sampler.min_lod;
@@ -439,7 +446,7 @@ int main(int argc, char** argv) {
     VkCommandBuffer cmd; CHECK(vkAllocateCommandBuffers(dev, &cai, &cmd));
     VkCommandBufferBeginInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; CHECK(vkBeginCommandBuffer(cmd, &cbi));
     const VkDeviceSize up_offset[4] = {0, texture_offset, 0, cube_offset};
-    const uint32_t up_size[4] = {1, texture_side, 1, TW}, up_layers[4] = {1, 1, 1, CUBE_LAYERS};
+    const uint32_t up_w[4] = {1, texture_w, 1, TW}, up_h[4] = {1, texture_h, 1, TW}, up_layers[4] = {1, 1, 1, CUBE_LAYERS};
     for (int t = 0; t < 4; t++) {
         VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; ib.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; ib.image = timg[t];
@@ -449,11 +456,11 @@ int main(int argc, char** argv) {
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &ib);
         VkDeviceSize offset = up_offset[t];
         for (uint32_t level = 0; level < mip_levels; ++level) {
-            const uint32_t side = up_size[t] >> level;
+            const uint32_t w = std::max(1u, up_w[t] >> level), h = std::max(1u, up_h[t] >> level);
             VkBufferImageCopy c{}; c.bufferOffset = offset; c.imageSubresource = {aspect_of(tfmt[t]), level, 0, up_layers[t]};
-            c.imageExtent = {side, side, 1};
+            c.imageExtent = {w, h, 1};
             vkCmdCopyBufferToImage(cmd, up, timg[t], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
-            offset += VkDeviceSize(side) * side * up_layers[t] * sizeof(uint32_t);
+            offset += VkDeviceSize(w) * h * up_layers[t] * sizeof(uint32_t);
         }
         ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; ib.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         ib.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; ib.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;

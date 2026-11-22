@@ -28,8 +28,9 @@ from build import CLIP_CASES, clip_container, shader_source
 from check import Skip, clip_test, fmt_1010102_test, fmt_xy_xyz_test
 from compute_fixture import compute_header
 from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
-                   TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, GATHER_WRAP, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
-                   pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
+                   TEXTURE_MIP_TEST, TEXTURE_QUERY_TESTS, GATHER_LOD_TEST, MIP_TEST_PASSES, GATHER_WRAP, USER_SGPRS_ENV,
+                   USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message, pick_build_dir, start_failure,
+                   texture_gradient_a16_test, texture_mip_test, texture_query_test)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
 from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
@@ -536,7 +537,8 @@ def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, 
 DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm",
               "ps_texture_sample_d16": "vs_ids.asm", "ps_sample_c_lz": "vs_ids.asm", "ps_sample_c_lz_a16": "vs_ids.asm",
               "ps_gather_wrap": "vs_ids.asm",
-              **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_clip_color.asm",
+              **{name: "vs_ids.asm" for name in GRADIENT_TESTS},
+              **{name: "vs_ids.asm" for name in TEXTURE_QUERY_TESTS}, "vs_clip": "ps_clip_color.asm",
               "ps_interp_f16_high": "vs_f16_pack.asm", "ms_f16_pack": "ps_interp_f16_high.asm",
               "ps_interp_f32_mods": "vs_interp_consts.asm", "ps_interp_mov_mods": "vs_interp_consts.asm"}
 
@@ -746,7 +748,7 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_exec64":
             rc, msg = run_cmd([vk_compute, spv, "1", "exec64"], env=cs_env)
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
-        elif name == "cs_bvh":
+        elif name in ("cs_bvh", "cs_bvh32"):
             rc, msg = run_cmd([vk_compute, spv, "1", "bvh"], env=cs_env)
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
         elif name in ("cs_bounds", "cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_buf_tail", "cs_oob_select", "cs_oob_tail",
@@ -916,10 +918,21 @@ def run_suite(a, work: str) -> int:
             results.append((name, ok, detail))
         elif name == "cs_imgstore":
             rc, msg = run_cmd([vk_store, spv])
-            results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+            results.append((name, None if rc == UNSUPPORTED else rc == 0,
+                            unsupported_skip(msg) if rc == UNSUPPORTED else (msg.splitlines()[-1] if msg else "")))
         elif name in ("cs_imgload", "cs_imgload_d16", "cs_sample_lz_int_d16"):
             rc, msg = run_cmd([vk_store, spv, "load" if name == "cs_imgload" else "load-d16"])
-            results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+            results.append((name, None if rc == UNSUPPORTED else rc == 0,
+                            unsupported_skip(msg) if rc == UNSUPPORTED else (msg.splitlines()[-1] if msg else "")))
+        elif name == "cs_imgatomic":
+            rc, msg = run_cmd([vk_store, spv, "atomic"])
+            if rc == UNSUPPORTED:
+                results.append((name, None, unsupported_skip(msg)))
+            else:
+                bad = re.findall(r"(\d+) bad", msg)
+                ok = rc == 0 and len(bad) == 2 and set(bad) == {"0"}
+                results.append((name, ok, "2D 8x8 and 3D 4x4x4 r32ui atomics exact" if ok else
+                                (msg.splitlines()[-1] if msg else f"exit {rc}")))
         elif name in MIP_TEST_PASSES:
             problem = texture_mip_test(a.build, spirv_dir, name)
             ok = None if isinstance(problem, Skip) else not problem
@@ -928,6 +941,10 @@ def run_suite(a, work: str) -> int:
             problem = texture_gradient_a16_test(a.build, spirv_dir, name)
             ok = None if isinstance(problem, Skip) else not problem
             results.append((name, ok, problem or "4096 RGBA pixels matched"))
+        elif name in TEXTURE_QUERY_TESTS:
+            problem = texture_query_test(a.build, spirv_dir, name)
+            ok = None if isinstance(problem, Skip) else not problem
+            results.append((name, ok, problem or "4096/4096 RGBA32F pixels exact"))
         elif name in ("ps_texture_sample", "ps_cube_sample", "ps_texture_sample_d16", "ps_sample_c_lz",
                       "ps_sample_c_lz_a16"):
             # Bindless texture tests: vk_texture_test finds vs_ids.spv and the shader in its working directory.

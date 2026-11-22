@@ -72,7 +72,7 @@ def not_found_message(build, missing):
             "Vulkan headers (vulkan-headers on Arch) and configure again.")
 
 COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh", "1", "bvh"),
-           ("cs_workgroup_yz", "2x3x4", "workgroup_yz")]
+           ("cs_bvh32", "1", "bvh"), ("cs_workgroup_yz", "2x3x4", "workgroup_yz")]
 CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800, 0x40ff8000, 0x3ff00000]
 CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
 WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute",
@@ -622,6 +622,56 @@ def bindless_test(tools, spirv):
 # clamp picks mip 0 left of x = 32 and mip 1 from there on.
 GRADIENT_TESTS = ("ps_texture_grad_a16", "ps_texture_bias_a16", "ps_texture_grad_cl_a16")
 
+# MIMG image query tests (TEST-184): vk_texture_test args and expected RGBA32F values on every one of the 4096 pixels.
+TEXTURE_QUERY_TESTS = {
+    "ps_get_lod": (("0", "92", "100000", "14500000", "0", "--two-mip"), (1.0, 3.0, -1.0, 2.0)),
+    "ps_get_resinfo": (("0", "92", "c00000", "14500000", "0", "--rect-mip"), (2064.0, 769.0, 776.0, 258.0)),
+}
+
+# vk_store_test checks: (shader name, extra CLI args, number of "<N> bad" summary lines expected).
+STORE_TESTS = (
+    ("cs_imgstore", [], 3),
+    ("cs_imgload", ["load"], 3),
+    ("cs_imgload_d16", ["load-d16"], 3),
+    ("cs_sample_lz_int_d16", ["load-d16"], 3),
+    ("cs_imgatomic", ["atomic"], 2),
+)
+
+
+def texture_query_problem(data: bytes, want: tuple[float, float, float, float]) -> str:
+    """Check every pixel of a 64x64 RGBA32F MIMG query draw against `want`."""
+    if len(data) != 64 * 64 * 16:
+        return f"expected 4096 RGBA32F pixels, got {len(data)} bytes"
+    wrong = 0
+    first = ""
+    for index, pixel in enumerate(struct.iter_unpack("<4f", data)):
+        if any((not math.isfinite(actual)) or not math.isclose(actual, expected, rel_tol=0, abs_tol=1e-5)
+               for actual, expected in zip(pixel, want)):
+            if not wrong:
+                first = f"at ({index % 64},{index // 64}): got {pixel}, expected {want}"
+            wrong += 1
+    return f"{wrong} of 4096 pixels differ; {first}" if wrong else ""
+
+
+def texture_query_test(tools: str, spirv: str, name: str) -> str:
+    """Run one of TEXTURE_QUERY_TESTS through vk_texture_test and verify every pixel."""
+    vs = os.path.join(spirv, "vs_ids.spv")
+    fs = os.path.join(spirv, name + ".spv")
+    for path in (vs, fs):
+        if not os.path.isfile(path):
+            return f"missing {os.path.basename(path)}"
+    args, want = TEXTURE_QUERY_TESTS[name]
+    with tempfile.TemporaryDirectory(prefix="leonida-query-") as tmp:
+        raw = Path(tmp) / "pixels.raw"
+        code, out = run(os.path.join(tools, "vk_texture_test" + EXE), vs, fs, raw, *args)
+        if code == UNSUPPORTED:
+            m = re.search(r"unsupported: .*", out)
+            return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
+        if code or not raw.is_file():
+            return failure(code, out, 3)
+        data = raw.read_bytes()
+    return texture_query_problem(data, want)
+
 
 def texture_gradient_a16_test(tools: str, spirv: str, name: str = "ps_texture_grad_a16") -> str:
     """Check every pixel of one of the GRADIENT_TESTS samples."""
@@ -943,15 +993,15 @@ def main():
     results.append(("ms_wave_info_s3", mesh_w64x_test(tools, spirv, "ms_wave_info_s3")))
     with tempfile.TemporaryDirectory(prefix="leonida-mesh-") as tmp:
         results.append(("ms_v5_workgroup", mesh_v5_test(tools, spirv, Path(tmp) / "groups.raw")))
-    for name, args in (("cs_imgstore", []), ("cs_imgload", ["load"]), ("cs_imgload_d16", ["load-d16"]),
-                       ("cs_sample_lz_int_d16", ["load-d16"])):
+    for name, args, expected_counts in STORE_TESTS:
         code, out = run(os.path.join(tools, "vk_store_test" + EXE), os.path.join(spirv, name + ".spv"), *args)
         if code == UNSUPPORTED:   # vk_store_test: the device lacks a feature this test needs
             m = re.search(r"unsupported: .*", out)
             results.append((name, Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")))
             continue
         bad = re.findall(r"(\d+) bad", out)
-        results.append((name, "" if code == 0 and len(bad) == 3 and set(bad) == {"0"} else failure(code, out, 3)))
+        results.append((name, "" if code == 0 and len(bad) == expected_counts and set(bad) == {"0"}
+                        else failure(code, out, 3)))
     for name in CLIP_TESTS:
         results.append((name, clip_test(tools, spirv, name)))
     for name in PIXEL_TESTS:
@@ -962,6 +1012,8 @@ def main():
         results.append((name, texture_mip_test(tools, spirv, name)))
     for name in GRADIENT_TESTS:
         results.append((name, texture_gradient_a16_test(tools, spirv, name)))
+    for name in TEXTURE_QUERY_TESTS:
+        results.append((name, texture_query_test(tools, spirv, name)))
     for name, problem in results:
         if problem is None:
             problem = "SKIP (full 64-wide compute subgroups unavailable)"

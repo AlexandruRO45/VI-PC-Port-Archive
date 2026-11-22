@@ -27,10 +27,11 @@ PARTIAL = {n for n, _ in check.W64X_PARTIAL}
 WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n not in ("cs_store", "cs_smem_soffset_imm")}
 
 
-# All check.py cases, including the four vk_store_test shaders and the three mesh fixtures.
-TOTAL = (len(check.COMPUTE) + 3 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 4
-         + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
-         + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
+# All check.py cases, including STORE_TESTS (vk_store_test), TEXTURE_QUERY_TESTS and the three mesh fixtures.
+TOTAL = (len(check.COMPUTE) + 3 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL)
+         + len(check.STORE_TESTS) + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS)
+         + len(check.GLOBAL_OFFSET) + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
+         + len(check.TEXTURE_QUERY_TESTS)
          + 9)  # three mesh fixtures, ps_tex, cs_cmpx_class_f32, cs_user_sgprs, cs_cvt_f32_sat, cs_fma_fused and ps_gather_wrap
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
@@ -117,6 +118,9 @@ class Wave64Checks(unittest.TestCase):
                 return 0, "2x3x4 workgroup Y/Z: 0 mismatches\n"
             if name in ("cs_imgstore", "cs_imgload", "cs_imgload_d16", "cs_sample_lz_int_d16"):   # vk_store_test checks
                 return 0, "0 bad\n0 bad\n0 bad\n"
+            if name == "cs_imgatomic":
+                self.assertEqual(args, ("atomic",))
+                return 0, "2d r32ui atomics: 0 bad\n3d r32ui atomics: 0 bad\n"
             return 0, "0 mismatches\n"
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -133,6 +137,7 @@ class Wave64Checks(unittest.TestCase):
                   patch.object(check, "pixel_test", return_value=""), patch.object(check, "texture_mip_test", return_value=""),
                   patch.object(check, "bindless_test", return_value=""), patch.object(check, "W64_EMULATED", emulated),
                   patch.object(check, "texture_gradient_a16_test", return_value=""),
+                  patch.object(check, "texture_query_test", return_value=""),
                   patch.object(check, "gather_wrap_test", return_value=""),
                   contextlib.redirect_stdout(output)):
                 status = check.main()
