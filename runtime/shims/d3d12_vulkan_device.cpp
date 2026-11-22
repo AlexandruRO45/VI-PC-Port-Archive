@@ -47,6 +47,36 @@ struct Format {
 
 // DXGI -> Vulkan for the formats render targets, depth buffers and common textures use. Typeless depth families
 // become depth formats when the resource allows depth-stencil.
+// The TYPELESS format of the color family a format belongs to (the formats a typed view of that TYPELESS resource
+// may use), or DXGI_FORMAT_UNKNOWN. Depth formats are left out: they are not render-target views.
+DXGI_FORMAT typeless_family(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS: case DXGI_FORMAT_B8G8R8X8_UNORM: case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+        return DXGI_FORMAT_B8G8R8X8_TYPELESS;
+    case DXGI_FORMAT_D32_FLOAT: case DXGI_FORMAT_D16_UNORM: return DXGI_FORMAT_UNKNOWN;
+    default: break;
+    }
+    // Each family is its TYPELESS format followed by its typed formats.
+    constexpr std::pair<DXGI_FORMAT, DXGI_FORMAT> families[] = {
+        {DXGI_FORMAT_R32G32B32A32_TYPELESS, DXGI_FORMAT_R32G32B32A32_SINT},
+        {DXGI_FORMAT_R32G32B32_TYPELESS, DXGI_FORMAT_R32G32B32_SINT},
+        {DXGI_FORMAT_R16G16B16A16_TYPELESS, DXGI_FORMAT_R16G16B16A16_SINT},
+        {DXGI_FORMAT_R32G32_TYPELESS, DXGI_FORMAT_R32G32_SINT},
+        {DXGI_FORMAT_R10G10B10A2_TYPELESS, DXGI_FORMAT_R10G10B10A2_UINT},
+        {DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_SINT},
+        {DXGI_FORMAT_R16G16_TYPELESS, DXGI_FORMAT_R16G16_SINT},
+        {DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_SINT},
+        {DXGI_FORMAT_R8G8_TYPELESS, DXGI_FORMAT_R8G8_SINT},
+        {DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_SINT},
+        {DXGI_FORMAT_R8_TYPELESS, DXGI_FORMAT_R8_SINT},
+    };
+    for (const auto& [first, last] : families)
+        if (format >= first && format <= last) return first;
+    return DXGI_FORMAT_UNKNOWN;
+}
+
 Format vulkan_format(DXGI_FORMAT format, bool depth) {
     constexpr VkImageAspectFlags color = VK_IMAGE_ASPECT_COLOR_BIT, d = VK_IMAGE_ASPECT_DEPTH_BIT,
                                  ds = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
@@ -555,6 +585,7 @@ public:
         leonida::ResourceBinding binding{};
         binding.image = image_;
         binding.rgba8_typeless = desc_.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        binding.mutable_format = format.typeless;
         binding.format = format.format;
         binding.aspects = format.aspects;
         binding.width = std::uint32_t(desc_.Width);
@@ -1196,21 +1227,32 @@ public:
             const bool typeless_rgba8 = rd.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS;
             const bool typed_rgba8 = rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
                 rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || rd.Format == DXGI_FORMAT_R8G8B8A8_UINT;
-            if (typeless_rgba8 || typed_rgba8) {
-                const DXGI_FORMAT requested = desc && desc->Format != DXGI_FORMAT_UNKNOWN ? desc->Format : rd.Format;
-                if (typeless_rgba8) {
+            const DXGI_FORMAT requested = desc && desc->Format != DXGI_FORMAT_UNKNOWN ? desc->Format : rd.Format;
+            // Another TYPELESS family viewed in a format the resource wasn't created as (a UINT, SINT, SNORM or sRGB
+            // view of a resource the layer creates as UNORM or float). A view in the resource's own format keeps it.
+            const Format resource_format = vulkan_format(rd.Format, false);
+            const bool typeless_cast = !typeless_rgba8 && resource_format.typeless && requested != rd.Format &&
+                vulkan_format(requested, false).format != resource_format.format;
+            if (typeless_rgba8 || typed_rgba8 || typeless_cast) {
+                if (typeless_rgba8 || typeless_cast) {
                     // This first typeless RTV slice deliberately covers only a single 2D subresource.
                     if (!desc || desc->ViewDimension != D3D12_RTV_DIMENSION_TEXTURE2D ||
                         rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || rd.MipLevels != 1 ||
                         rd.DepthOrArraySize != 1 || rd.SampleDesc.Count != 1 || desc->Texture2D.MipSlice ||
                         desc->Texture2D.PlaneSlice || !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
                         view = {};
+                    } else if (typeless_family(requested) != rd.Format || vulkan_format(requested, false).typeless) {
+                        view = {};
                     } else {
                         switch (requested) {
                         case DXGI_FORMAT_R8G8B8A8_UNORM: view.format = leonida::ColorViewFormat::rgba8_unorm; break;
                         case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: view.format = leonida::ColorViewFormat::rgba8_srgb; break;
                         case DXGI_FORMAT_R8G8B8A8_UINT: view.format = leonida::ColorViewFormat::rgba8_uint; break;
-                        default: view = {}; break;
+                        default:
+                            view.format = leonida::ColorViewFormat::vulkan;
+                            view.vulkan_format = std::uint32_t(vulkan_format(requested, false).format);
+                            if (!view.vulkan_format) view = {};
+                            break;
                         }
                         if (view.resource) {
                             const auto format = vulkan_format(requested, false);
@@ -1222,7 +1264,7 @@ public:
                 } else if (requested != rd.Format) {
                     view = {}; // No typed-resource format casting is advertised by this backend.
                 }
-                if (!view.resource) log_once("unsupported RGBA8 RTV format/subresource:", int(requested));
+                if (!view.resource) log_once("unsupported typed RTV format/subresource:", int(requested));
             }
         } else if (resource) {
             stub("ID3D12Device::CreateRenderTargetView(resource from another device)");

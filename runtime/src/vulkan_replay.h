@@ -62,6 +62,7 @@ struct ResourceBinding {
     bool volume = false;               // one array layer, including at mips with a single slice
     std::uint32_t samples = 1;         // more than one: a multisampled 2D texture
     bool rgba8_typeless = false;       // Original resource was R8G8B8A8_TYPELESS; views may reinterpret it.
+    bool mutable_format = false;       // Created from any TYPELESS format: a ColorViewFormat::vulkan view may reinterpret it.
 };
 
 struct VulkanAccess {
@@ -715,7 +716,8 @@ inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearC
     return value;
 }
 
-// Only the RGBA8 family is explicitly reinterpreted here. Legacy views retain their resource format.
+// The RGBA8 family has named view formats; other typed views of a TYPELESS resource carry their VkFormat
+// (ColorViewFormat::vulkan). Legacy views retain their resource format.
 inline VkFormat color_view_format(const ResourceBinding& resource, const TargetView& target) {
     if (target.format == ColorViewFormat::resource)
         return resource.rgba8_typeless ? VK_FORMAT_UNDEFINED : resource.format;
@@ -724,10 +726,20 @@ inline VkFormat color_view_format(const ResourceBinding& resource, const TargetV
     case ColorViewFormat::rgba8_unorm: format = VK_FORMAT_R8G8B8A8_UNORM; break;
     case ColorViewFormat::rgba8_srgb: format = VK_FORMAT_R8G8B8A8_SRGB; break;
     case ColorViewFormat::rgba8_uint: format = VK_FORMAT_R8G8B8A8_UINT; break;
+    case ColorViewFormat::vulkan: format = VkFormat(target.vulkan_format); break;
     default: return VK_FORMAT_UNDEFINED;
     }
-    if (!resource.rgba8_typeless) return format == resource.format ? format : VK_FORMAT_UNDEFINED;
-    if (resource.format != VK_FORMAT_R8G8B8A8_UNORM || resource.mip_levels != 1 || resource.array_layers != 1 ||
+    const bool named = target.format != ColorViewFormat::vulkan;
+    const bool reinterpretable = resource.rgba8_typeless || (!named && resource.mutable_format);
+    if (format == VK_FORMAT_UNDEFINED) return VK_FORMAT_UNDEFINED;
+    if (!reinterpretable) return format == resource.format ? format : VK_FORMAT_UNDEFINED;
+    // A view of another format keeps the texel size (D3D12: a format of the resource's TYPELESS family).
+    const BlockFormat view_block = block_format(format, VK_IMAGE_ASPECT_COLOR_BIT);
+    const BlockFormat resource_block = block_format(resource.format, VK_IMAGE_ASPECT_COLOR_BIT);
+    if (!view_block.bytes || view_block.block != 1 || view_block.bytes != resource_block.bytes ||
+        resource_block.block != 1)
+        return VK_FORMAT_UNDEFINED;
+    if ((named && resource.format != VK_FORMAT_R8G8B8A8_UNORM) || resource.mip_levels != 1 || resource.array_layers != 1 ||
         resource.volume || resource.depth != 1 || resource.samples != 1 ||
         target.mip || target.first_layer || target.layer_count != 1)
         return VK_FORMAT_UNDEFINED;
