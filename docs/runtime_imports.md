@@ -216,6 +216,11 @@ binds its console imports (`xmem.dll`, `d3d12_xs.dll`) through the shim registry
 and resolves direct, ordinal and forwarded exports from the mapped image. `run_tiny_bundled_load` exercises this path
 end to end with a synthetic bundled DLL importing `xmem.dll!XMemAlloc` and `XMemFree`.
 
+A bundled DLL can make such a call from its own `DllMain`: on another bundled DLL, or on itself, the idiom that pins a
+module. The loader does not enter a `DllMain` that is still running a second time; the call returns the module's handle,
+as Windows does, and the other DLL gets its `DLL_PROCESS_ATTACH` inside the call. `init_tiny_reent` runs a fixture that
+does both under `gta6rt --init`.
+
 ## WinHTTP offline
 
 `XCurl.dll` and `libHttpClient.GDK.dll` do their HTTP through WinHTTP: between them they import 16 functions from

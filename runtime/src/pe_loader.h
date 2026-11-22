@@ -34,6 +34,10 @@ struct Module {
     uint32_t entry_rva = 0;
     bool relocated = false;
     bool initialised = false;
+    // True while initialise() is inside this module's TLS callbacks or DllMain(DLL_PROCESS_ATTACH). A run-time load
+    // made from there initialises every module that is waiting, and must pass this one by: Windows never re-enters
+    // a DllMain that is still running.
+    bool initialising = false;
 
     // The image's exception directory (.pdata), registered with RtlAddFunctionTable by load() so that exception
     // dispatch and stack walks can unwind through its frames. Removed when the loader is destroyed.

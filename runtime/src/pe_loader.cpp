@@ -685,11 +685,20 @@ void Loader::register_unwind(Module& m) {
 void Loader::initialise() {
     // Not order_: map_image pushes a module there before bind_imports maps its dependencies, so order_ lists an
     // importer ahead of the DLLs it imports. init_order_ is filled once a module's imports are all loaded.
-    for (auto* m : init_order_) initialise(*m);
+    // By index: a DllMain can load another bundled DLL, which appends to init_order_ while this loop is in it.
+    for (size_t i = 0; i < init_order_.size(); ++i) initialise(*init_order_[i]);
 }
 
 void Loader::initialise(Module& m) {
-    if (m.initialised) return;
+    // A DllMain that calls LoadLibrary (on another bundled DLL, or on its own module to pin it) comes back here
+    // through load_runtime_module while it is still running. It is not entered a second time; the caller gets the
+    // handle of the module, which Windows also hands out before DLL_PROCESS_ATTACH has returned.
+    if (m.initialised || m.initialising) return;
+    m.initialising = true;
+    struct Done {
+        Module& m;
+        ~Done() { m.initialising = false; }
+    } done{m};
 
     // TLS was installed by load(); initialise() only delivers the events, so no slot is allocated or written twice.
     run_tls_callbacks(m, DLL_PROCESS_ATTACH);

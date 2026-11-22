@@ -422,6 +422,21 @@ if(BUILD_TESTING)
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
       ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/stubs/$<CONFIG>"
     )
+    # A bundled DLL whose DllMain calls LoadLibrary on itself and on a second bundled DLL (gta6rt --init).
+    foreach(_reent tiny_reent tiny_reent_dep)
+      add_library(${_reent} SHARED test/fixtures/${_reent}.cpp)
+      target_compile_definitions(${_reent} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_compile_options(${_reent} PRIVATE /W4 /permissive- /utf-8 /GS-)
+      target_link_options(${_reent} PRIVATE /NODEFAULTLIB /ENTRY:DllMain)
+      target_link_libraries(${_reent} PRIVATE kernel32)
+      set_target_properties(${_reent} PROPERTIES
+        OUTPUT_NAME ${_reent}
+        PREFIX ""
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
+        ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/stubs/$<CONFIG>"
+      )
+    endforeach()
+    add_dependencies(tiny_reent tiny_reent_dep)
     add_executable(tiny_bundled_load test/fixtures/tiny_bundled_load.cpp)
     target_compile_definitions(tiny_bundled_load PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_bundled_load PRIVATE /W4 /permissive- /utf-8)
@@ -735,6 +750,9 @@ if(BUILD_TESTING)
     add_test(NAME run_tiny_bundled_load COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_bundled_load>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_loaded_bundled.cmake")
+    add_test(NAME init_tiny_reent COMMAND ${CMAKE_COMMAND}
+      "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_reent>"
+      "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_reent.cmake")
     add_test(NAME run_tiny_game COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42)
     add_test(NAME run_tiny_game_exit_code COMMAND tiny_game_exit_code_test
              "$<TARGET_FILE:gta6rt>" "$<TARGET_FILE:tiny_game>")
