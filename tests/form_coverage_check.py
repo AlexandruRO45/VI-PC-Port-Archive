@@ -239,6 +239,11 @@ def check_shader_records():
         ("SOPC", "s_bitcmp0_b32"), ("SOPC", "s_bitcmp1_b32"),
         ("SOPC", "s_bitcmp0_b64"), ("SOPC", "s_bitcmp1_b64"),
     }
+    vop2_forms = {
+        ("VOP2", "v_lshrrev_b32"), ("VOP2", "v_ashrrev_i32"), ("VOP2", "v_lshlrev_b32"),
+        ("VOP2", "v_and_b32"), ("VOP2", "v_or_b32"), ("VOP2", "v_xor_b32"),
+        ("VOP2", "v_add_nc_u32"), ("VOP2", "v_sub_nc_u32"),
+    }
     rejected_forms = {
         "s_and_saveexec_b64", "s_or_saveexec_b64", "s_andn2_saveexec_b64",
         "s_cselect_b64", "s_bfe_u64", "s_bfe_i64", "s_bfm_b32",
@@ -248,6 +253,7 @@ def check_shader_records():
         covered = fc.gfx_forms(pixel.ACCEPTED, fc.load_reference(name))
         assert scalar64_forms <= covered, (name, scalar64_forms - covered)
         assert sopc_forms <= covered, (name, sopc_forms - covered)
+        assert vop2_forms <= covered, (name, vop2_forms - covered)
     # The scalar ALU fixture counts its SOP1, SOP2, SOPK and SOPC forms; the neighbours the controls
     # reject (s_addc_u32, s_cmp_eq_u64, s_cmpk_eq_u32, s_cselect_b64) stay out.
     scalar = {"s_movk_i32", "s_not_b32", "s_add_u32", "s_sub_u32", "s_add_i32", "s_sub_i32", "s_mul_i32",
@@ -292,6 +298,20 @@ def check_parsing():
     assert full["x64_zen2"]["covered"] == full["gfx1013"]["covered"] == 0
     unmatched = full["x64_zen2"]["fixture_forms_not_in_reference"]
     assert {"delta", "local", "plane_request"}.isdisjoint(unmatched), unmatched
+
+
+def check_gaps():
+    reference = {("VOP1", "v_a"), ("VOP3", "v_a_e64"), ("VOP3", "v_b_e64"), ("VOP1", "v_c")}
+    fixtures = {"passing": ({"v_a_e32"}, "pass"),
+                "skipping": ({"v_a_e32", "v_a_e64"}, "skip"),
+                "failing": ({"v_a_e64", "v_b_e64"}, "fail")}
+    measured = fc.summarize(reference, fixtures, fc.gfx_forms, include_gaps=True)
+    assert measured.pop("gaps") == [
+        ("VOP1", "v_c", "unobserved"),
+        ("VOP3", "v_a_e64", "skipped"),
+        ("VOP3", "v_b_e64", "observed_without_pass"),
+    ]
+    assert measured == fc.summarize(reference, fixtures, fc.gfx_forms)
 
 
 def check_dashboard():
@@ -522,6 +542,7 @@ if __name__ == "__main__":
     check_cpu_records()
     check_shader_records()
     check_parsing()
+    check_gaps()
     check_dashboard()
     check_avx2_regs()
     check_avx_int_regs()

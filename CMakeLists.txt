@@ -425,7 +425,11 @@ if(EXISTS "${INTAKE_PYTHON}")
         target_link_options(${image} PRIVATE /NOENTRY /NODEFAULTLIB /INCREMENTAL:NO)
     endfunction()
     function(cpu_translation image translator entry)
-        cmake_parse_arguments(BIND "FFX_DESTROY;IMAGE_DATA" "PROVIDER;SYMBOL;LINK_NAME;CALLBACK_OFFSET;RANGES" "" ${ARGN})
+        cmake_parse_arguments(BIND "FFX_DESTROY;IMAGE_DATA"
+            "PROVIDER;SYMBOL;LINK_NAME;CALLBACK_OFFSET;IMPORT_ARGUMENTS;RETURN_BYTES;NAME;RANGES" "" ${ARGN})
+        if(NOT BIND_NAME)
+            set(BIND_NAME ${image}_lifted)
+        endif()
         set(binding)
         if(BIND_FFX_DESTROY)
             list(APPEND binding --ffx-destroy)
@@ -441,18 +445,22 @@ if(EXISTS "${INTAKE_PYTHON}")
             if(BIND_LINK_NAME)
                 list(APPEND binding --link-name "${BIND_LINK_NAME}")
             endif()
+            if(DEFINED BIND_IMPORT_ARGUMENTS)
+                list(APPEND binding --import-arguments "${BIND_IMPORT_ARGUMENTS}" --return-bytes "${BIND_RETURN_BYTES}")
+            endif()
         endif()
         if(BIND_IMAGE_DATA)
             list(APPEND binding --image-data)
         endif()
-        set(lifted "${CMAKE_CURRENT_BINARY_DIR}/${image}_lifted.cpp")
+        set(lifted "${CMAKE_CURRENT_BINARY_DIR}/${BIND_NAME}.cpp")
         add_custom_command(OUTPUT "${lifted}"
             COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/${translator}.py"
                 "$<TARGET_FILE:${image}>" ${entry} "${lifted}" ${binding}
-            DEPENDS ${image} ${BIND_PROVIDER} ${BIND_RANGES} tools/${translator}.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
-        add_library(${image}_lifted SHARED "${lifted}")
+            DEPENDS ${image} ${BIND_PROVIDER} ${BIND_RANGES} tools/${translator}.py tools/cpu_leaf_aot.py tools/cpu_ranges.py
+                tools/cpu_call_aot.py VERBATIM)
+        add_library(${BIND_NAME} SHARED "${lifted}")
         if(BIND_PROVIDER)
-            target_link_libraries(${image}_lifted PRIVATE ${BIND_PROVIDER})
+            target_link_libraries(${BIND_NAME} PRIVATE ${BIND_PROVIDER})
         endif()
     endfunction()
     foreach(variant IN ITEMS original inverted)
@@ -720,6 +728,34 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_avx_move_regs_original>"
         "$<TARGET_FILE:cpu_avx_move_regs_original_lifted>"
         "$<TARGET_FILE:cpu_avx_move_regs_altered_lifted>")
+    # Import tail jumps: one caller per provider (named, altered return, ordinal-only), each translated twice:
+    # tail_mix (three arguments) bound to mix3 with three, tail_choose (three) and tail_pass4 (four) to mix4 with four.
+    set(tail_files)
+    foreach(variant IN ITEMS named altered ordinal)
+        set(provider cpu_tail_${variant}_provider)
+        if(variant STREQUAL "ordinal")
+            add_library(${provider} SHARED tests/cpu/tail_provider.cpp tests/cpu/tail_ordinal.def)
+            set(mix3 SYMBOL "#3" LINK_NAME mix3)
+            set(mix4 SYMBOL "#4" LINK_NAME mix4)
+        else()
+            add_library(${provider} SHARED tests/cpu/tail_provider.cpp tests/cpu/tail_provider.def)
+            set(mix3 SYMBOL mix3)
+            set(mix4 SYMBOL mix4)
+        endif()
+        cpu_asm_fixture(cpu_tail_${variant} tail_import)
+        target_link_libraries(cpu_tail_${variant} PRIVATE ${provider})
+        cpu_translation(cpu_tail_${variant} cpu_switch_aot tail_mix NAME cpu_tail_${variant}_mix3
+            PROVIDER ${provider} ${mix3} IMPORT_ARGUMENTS 3 RETURN_BYTES 8)
+        cpu_translation(cpu_tail_${variant} cpu_switch_aot tail_choose,tail_pass4:4 NAME cpu_tail_${variant}_mix4
+            PROVIDER ${provider} ${mix4} IMPORT_ARGUMENTS 4 RETURN_BYTES 8)
+        list(APPEND tail_files "$<TARGET_FILE:cpu_tail_${variant}>"
+            "$<TARGET_FILE:cpu_tail_${variant}_mix3>" "${CMAKE_CURRENT_BINARY_DIR}/cpu_tail_${variant}_mix3.cpp"
+            "$<TARGET_FILE:cpu_tail_${variant}_mix4>" "${CMAKE_CURRENT_BINARY_DIR}/cpu_tail_${variant}_mix4.cpp"
+            "$<TARGET_FILE:${provider}>")
+    endforeach()
+    target_compile_definitions(cpu_tail_altered_provider PRIVATE ALTER_RETURN)
+    add_test(NAME cpu_aot_import_tail_jump COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/tail_import_check.py" "$<TARGET_FILE:cpu_register_probe>" ${tail_files})
     cpu_asm_fixture(cpu_chained chained)
     cpu_translation(cpu_chained cpu_chained_aot choose_value)
     cpu_asm_fixture(cpu_chained_jne chained)
@@ -1027,6 +1063,18 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_bmi2 COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/bmi2.py"
         check "$<TARGET_FILE:cpu_bmi2>" "$<TARGET_FILE:cpu_bmi2_lifted>")
     set_tests_properties(cpu_aot_bmi2 PROPERTIES SKIP_RETURN_CODE 77)
+
+    cpu_asm_fixture(cpu_crypto_sha crypto_sha)
+    set(crypto_sha_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_crypto_sha_lifted.cpp")
+    add_custom_command(OUTPUT "${crypto_sha_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/crypto_sha.py"
+            emit "$<TARGET_FILE:cpu_crypto_sha>" "${crypto_sha_fixture}"
+        DEPENDS cpu_crypto_sha tests/cpu/crypto_sha.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_crypto_sha_lifted SHARED "${crypto_sha_fixture}")
+    add_test(NAME cpu_aot_crypto_sha COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/crypto_sha.py"
+        check "$<TARGET_FILE:cpu_crypto_sha>" "$<TARGET_FILE:cpu_crypto_sha_lifted>")
+    set_tests_properties(cpu_aot_crypto_sha PROPERTIES SKIP_RETURN_CODE 77)
     cpu_translation(cpu_callback cpu_chained_aot call_context CALLBACK_OFFSET 8)
     cpu_asm_fixture(cpu_xlatb xlatb)
     # The lifted DLL and three mutated controls that the check requires to mismatch.
@@ -1458,10 +1506,18 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/crc_line_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:cpu_crc_line>" "$<TARGET_FILE:cpu_crc_line_lifted>"
         "$<TARGET_FILE:cpu_crc_castagnoli>" "$<TARGET_FILE:cpu_crc_castagnoli_lifted>")
-    foreach(variant IN ITEMS original inverted pair swapped framed image)
+    add_library(cpu_exe_second_provider SHARED tests/cpu/exe_second_provider.cpp)
+    target_link_libraries(cpu_exe_second_provider PRIVATE cpu_exe_io)
+    foreach(variant IN ITEMS original inverted pair swapped framed image two_providers)
         set(native cpu_exe_${variant})
         set(lifted ${native}_lifted)
-        add_executable(${native} tests/cpu/exe_entry.asm tests/cpu/direct.asm)
+        add_executable(${native} tests/cpu/exe_entry.asm)
+        if(variant STREQUAL "two_providers")
+            target_sources(${native} PRIVATE tests/cpu/repeat_call.asm)
+            target_compile_definitions(${native} PRIVATE TWO_PROVIDERS IMPORT_ACCUMULATE)
+        else()
+            target_sources(${native} PRIVATE tests/cpu/direct.asm)
+        endif()
         set(entry_options)
         set(image_options)
         if(variant STREQUAL "image")
@@ -1489,12 +1545,18 @@ if(EXISTS "${INTAKE_PYTHON}")
         endif()
         target_sources(${native} PRIVATE tests/cpu/exe_startup.asm)
         target_link_options(${native} PRIVATE /ENTRY:native_startup /EXPORT:native_entry /NODEFAULTLIB /INCREMENTAL:NO)
+        set(extra_provider_args)
+        set(extra_provider_target)
+        if(variant STREQUAL "two_providers")
+            set(extra_provider_args --provider "$<TARGET_FILE:cpu_exe_second_provider>" accumulate_args)
+            set(extra_provider_target cpu_exe_second_provider)
+        endif()
         set(source "${CMAKE_CURRENT_BINARY_DIR}/${lifted}.cpp")
         add_custom_command(OUTPUT "${source}"
             COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_exe_aot.py"
                 "$<TARGET_FILE:${native}>" "$<TARGET_FILE:cpu_exe_io>"
-                "$<TARGET_FILE:cpu_import_provider>" "${source}" --entry-export native_entry ${entry_options}
-            DEPENDS ${native} cpu_exe_io cpu_import_provider tools/cpu_exe_aot.py
+                "$<TARGET_FILE:cpu_import_provider>" "${source}" --entry-export native_entry ${entry_options} ${extra_provider_args}
+            DEPENDS ${native} cpu_exe_io cpu_import_provider ${extra_provider_target} tools/cpu_exe_aot.py
                 tools/cpu_call_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py tools/ffx_version_query.py
             VERBATIM)
         add_executable(${lifted} "${source}")
@@ -1517,7 +1579,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         endif()
         target_link_options(${lifted} PRIVATE /INCREMENTAL:NO)
         foreach(program IN ITEMS ${native} ${lifted})
-            target_link_libraries(${program} PRIVATE cpu_exe_io cpu_import_provider)
+            target_link_libraries(${program} PRIVATE cpu_exe_io cpu_import_provider ${extra_provider_target})
         endforeach()
     endforeach()
     add_test(NAME cpu_aot_exe_entry COMMAND "${INTAKE_PYTHON}" -B
@@ -1551,6 +1613,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/exe_image_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_exe_image>" "$<TARGET_FILE:cpu_exe_image_lifted>"
         "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:cpu_import_provider>")
+    add_test(NAME cpu_native_exe_two_providers COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/mapped_exe_chain_check.py" --two-providers "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_exe_two_providers>" "$<TARGET_FILE:cpu_exe_two_providers_lifted>"
+        "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:cpu_import_provider>" "$<TARGET_FILE:cpu_exe_second_provider>")
     target_compile_features(pe_map PRIVATE cxx_std_17)
     add_test(NAME cpu_native_exe_termination COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/exe_termination_check.py" "$<TARGET_FILE:pe_map>"
@@ -1761,7 +1827,7 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${DXC_EXECUTABLE}" "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(cpu_native_frame_${adapter} PROPERTIES TIMEOUT 95)
         add_test(NAME pixel_aot_${adapter} COMMAND "${INTAKE_PYTHON}" -B
-            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw "${DXC_EXECUTABLE}"
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-core "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_${adapter} PROPERTIES TIMEOUT 60)
         add_test(NAME pixel_aot_buffer_color_${adapter} COMMAND "${INTAKE_PYTHON}" -B
@@ -1784,18 +1850,37 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" three-way "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_three_way_${adapter} PROPERTIES TIMEOUT 60)
+        add_test(NAME pixel_aot_predicate_rounding_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-predicate-rounding "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_predicate_rounding_${adapter} PROPERTIES TIMEOUT 60)
+        add_test(NAME pixel_aot_blend_scalar_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-blend-scalar "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_blend_scalar_${adapter} PROPERTIES TIMEOUT 60)
+        add_test(NAME pixel_aot_e64_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-e64 "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_e64_${adapter} PROPERTIES TIMEOUT 60)
         add_test(NAME bc7_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/bc7_draw_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(bc7_draw_${adapter} PROPERTIES TIMEOUT 60)
     endforeach()
     set_tests_properties(cpu_native_frame_hardware pixel_aot_hardware pixel_aot_buffer_color_hardware
-        pixel_aot_three_way_hardware bc7_draw_hardware PROPERTIES SKIP_RETURN_CODE 77)
+        pixel_aot_three_way_hardware pixel_aot_e64_hardware pixel_aot_blend_scalar_hardware pixel_aot_predicate_rounding_hardware bc7_draw_hardware
+        PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(compute_store_aot_hardware PROPERTIES SKIP_RETURN_CODE 77)
     foreach(adapter IN ITEMS hardware warp)
         # The gfx programs this test translated, for tools/form_coverage.py.
         set_tests_properties(pixel_aot_${adapter} PROPERTIES
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_${adapter}.txt")
+        set_tests_properties(pixel_aot_predicate_rounding_${adapter} PROPERTIES
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_predicate_rounding_${adapter}.txt")
+        set_tests_properties(pixel_aot_blend_scalar_${adapter} PROPERTIES
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_blend_scalar_${adapter}.txt")
+        set_tests_properties(pixel_aot_e64_${adapter} PROPERTIES
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_e64_${adapter}.txt")
     endforeach()
     set_tests_properties(pixel_aot_attribute_hardware PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME compressed_scene_metadata COMMAND "${INTAKE_PYTHON}" -B

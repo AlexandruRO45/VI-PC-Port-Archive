@@ -199,6 +199,24 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertEqual(insns[0]["opcode"], "sopc_truncated")
         self.assertIn("<truncated>", insns[0]["assembly"])
 
+    def test_vop2_integer_opcode_table_synthetic_forms(self):
+        from disasm_rdna2 import VOP2_OPS
+        target_ops = {0x16, 0x18, 0x1a, 0x1b, 0x1c, 0x1d, 0x25, 0x26}
+        for op in target_ops:
+            expected_name, _ = VOP2_OPS[op]
+            w0 = (op << 25) | (2 << 17) | (1 << 9) | 0
+            raw = struct.pack("<I", w0)
+            insns = disasm_rdna2(raw)
+            self.assertEqual(len(insns), 1, f"Failed decoding VOP2 op 0x{op:02x}")
+            self.assertEqual(insns[0]["opcode"], expected_name)
+            self.assertEqual(insns[0]["length"], 4)
+
+        truncated_raw = b"\x16\x00"
+        insns = disasm_rdna2(truncated_raw)
+        self.assertEqual(len(insns), 1)
+        self.assertEqual(insns[0]["opcode"], "data")
+        self.assertEqual(insns[0]["length"], 2)
+
     def test_cli_hex_entry_point(self):
         script = Path(__file__).resolve().parents[1] / "tools" / "disasm_rdna2.py"
         res = subprocess.run(
