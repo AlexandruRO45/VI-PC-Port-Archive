@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import struct
 import sys
 import unittest
@@ -1010,3 +1011,29 @@ class TestSpirvEndToEndExecution(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRuntimeFormatSizeTable(unittest.TestCase):
+    """`%fmt_size_tab` holds one byte size per V# FORMAT code (a buffer_load/store_format at a run-time format), so it
+    declares a constant for each size plus the array length. Those have to be emitted with the rest of the constant
+    section: the table block asked for them after that section was written, so a module that needed the length (128)
+    nowhere else referenced an id it never declared, and spirv-val rejects it with
+    `Operand '<id>' requires a previous definition`. A format load also decodes the format, which registers 128 on
+    its own; a format store does not, which is the case pinned here."""
+
+    def test_runtime_format_store_declares_every_table_constant(self) -> None:
+        spv = support.translate_lines("ps_fmt_store_runtime", [
+            "s_mov_b32 s4, 0x1000",
+            "s_mov_b32 s5, 0",
+            "s_mov_b32 s6, 0x100",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0x11223344",
+            # s7 is never written, so the V# FORMAT field is run-time data and the element size comes from the table
+            "buffer_store_format_xyzw v[2:5], v1, s[4:7], 0 offen",
+            "s_endpgm",
+        ])
+        self.assertIn("%fmt_size_arr", spv)
+        self.assertIn("%c80 = OpConstant %uint 128", spv)          # the array length nothing else asks for
+        declared = {line.split()[0] for line in spv.splitlines() if " = OpConstant " in line}
+        referenced = set(re.findall(r"%c[0-9a-f]+\b", spv))
+        self.assertEqual(sorted(referenced - declared), [], "the module references a constant it never declares")

@@ -2284,6 +2284,11 @@ class Gen:
             comps.append(x)
         return comps
 
+    @staticmethod
+    def fmt_size_table():
+        """Byte size of each 7-bit buffer FORMAT code, 0 for a code FORMATS does not decode: %fmt_size_tab's values."""
+        return [Gen.FORMATS[c][0] if c in Gen.FORMATS else 0 for c in range(128)]
+
     def fmt_size_of(self, fmt):
         """Byte size of the 7-bit buffer FORMAT code `fmt` (a uint id), 0 for a code FORMATS does not decode: one load
         from %fmt_size_tab. Typed loads used to select it through a chain over all of FORMATS per load (about 150
@@ -12182,6 +12187,15 @@ def assemble(gen):
             gen.cu(ms_clip_member)
         if ms_cull_member is not None:
             gen.cu(ms_cull_member)
+    if gen.uses_fmt_size:
+        # The size table's length and every value it holds are constants too, and they are asked for here: before the
+        # OpConstant section below is emitted. A value registered after that loop (as the table block itself used to
+        # do) is referenced by %fmt_size_arr/%fmt_size_init and never declared, which spirv-val rejects with
+        # "Operand '...' requires a previous definition". A buffer_store_format_* at a run-time V# did exactly that
+        # with the array length: a store decodes no format, so nothing else in the module asks for 128.
+        gen.cu(128)
+        for v in Gen.fmt_size_table():
+            gen.cu(v)
     gen.consts.setdefault(0, "%c0")
     for v, name in sorted(gen.consts.items()):
         types.append(f"{name} = OpConstant %uint {v}")
@@ -12226,7 +12240,7 @@ def assemble(gen):
     if gen.uses_ballot:
         types += ["%v4uint_bal = OpTypeVector %uint 4"]
     if gen.uses_fmt_size:
-        sizes = [Gen.FORMATS[c][0] if c in Gen.FORMATS else 0 for c in range(128)]
+        sizes = Gen.fmt_size_table()          # registered above with the rest of the constants
         types += [f"%fmt_size_arr = OpTypeArray %uint {gen.cu(128)}",
                   "%_ptr_Private_fmt_size = OpTypePointer Private %fmt_size_arr"]
         if not (gen.uses_store_views or gen.uses_int_fetch):
