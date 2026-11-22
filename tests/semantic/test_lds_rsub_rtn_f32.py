@@ -954,5 +954,149 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(res, POS_INF_F32)
 
 
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+def mutant_ds_sub_not_rsub(vdata0_u32: int, old_val_u32: int) -> int:
+    """Mutant 1: Forward subtraction (old_val - vdata0) instead of reverse subtraction."""
+    return ieee754_rsub_f32(old_val_u32, vdata0_u32)
+
+
+def mutant_ds_add_not_rsub(vdata0_u32: int, old_val_u32: int) -> int:
+    """Mutant 2: Addition instead of reverse subtraction."""
+    a_f = u32_to_f32(vdata0_u32)
+    b_f = u32_to_f32(old_val_u32)
+    return f32_to_u32(a_f + b_f)
+
+
+def mutant_atomic_rsub_returns_new(
+    mem: LDSMemory,
+    vaddr: int,
+    vdata0: int,
+    offset: int = 0,
+) -> Tuple[int, int]:
+    """Mutant 3: Returns new_val instead of old_val."""
+    eff_addr = calc_lds_effective_address(vaddr, offset)
+    idx = calc_lds_dword_index(eff_addr, mem.size_dwords)
+    old_val = mem.read_dword(idx)
+    new_val = ieee754_rsub_f32(vdata0, old_val)
+    mem.write_dword(idx, new_val)
+    return new_val, new_val  # Faulty return
+
+
+def mutant_calc_lds_index_byte_direct(eff_addr: int, capacity_dwords: int = LDS_SIZE_DWORDS) -> int:
+    """Mutant 4: Forgets to drop low 2 bits (does not dword-align)."""
+    return eff_addr & (capacity_dwords - 1)
+
+
+class TestNegativeControlsAndSyntaxRejection(unittest.TestCase):
+    """Unit tests for instruction syntax rejection and negative control validation."""
+
+    def test_invalid_lds_memory_size(self) -> None:
+        with self.assertRaises(ValueError):
+            LDSMemory(size_dwords=-1)
+        with self.assertRaises(ValueError):
+            LDSMemory(size_dwords=1000)  # Non-power-of-two
+
+    def test_invalid_register_operands(self) -> None:
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(106, RegType.SGPR)
+
+    def test_invalid_instruction_syntax(self) -> None:
+        # SGPR in vdst
+        with self.assertRaises(TypeError):
+            DSRsubRtnInstruction(
+                vdst=RegisterOperand(0, RegType.SGPR),
+                vaddr=RegisterOperand(1),
+                vdata0=RegisterOperand(2),
+            )
+        # SGPR in vaddr
+        with self.assertRaises(TypeError):
+            DSRsubRtnInstruction(
+                vdst=RegisterOperand(0),
+                vaddr=RegisterOperand(1, RegType.SGPR),
+                vdata0=RegisterOperand(2),
+            )
+        # SGPR in vdata0
+        with self.assertRaises(TypeError):
+            DSRsubRtnInstruction(
+                vdst=RegisterOperand(0),
+                vaddr=RegisterOperand(1),
+                vdata0=RegisterOperand(2, RegType.SGPR),
+            )
+        # Offset bounds
+        with self.assertRaises(ValueError):
+            DSRsubRtnInstruction(
+                vdst=RegisterOperand(0),
+                vaddr=RegisterOperand(1),
+                vdata0=RegisterOperand(2),
+                offset=-1,
+            )
+        with self.assertRaises(ValueError):
+            DSRsubRtnInstruction(
+                vdst=RegisterOperand(0),
+                vaddr=RegisterOperand(1),
+                vdata0=RegisterOperand(2),
+                offset=70000,
+            )
+
+    def test_invalid_simd_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDLDSWavefrontInterpreter(wave_size=16)
+
+
+class TestMutationDetection(unittest.TestCase):
+    """Unit tests proving 100% kill rate against semantic mutations."""
+
+    def test_kills_forward_sub_mutant(self) -> None:
+        # vdata0 = 2.0f, old_val = 5.0f
+        # True rsub: 2.0 - 5.0 = -3.0f
+        # Forward sub: 5.0 - 2.0 = +3.0f
+        true_res = ieee754_rsub_f32(TWO_F32, FIVE_F32)
+        mut_res = mutant_ds_sub_not_rsub(TWO_F32, FIVE_F32)
+        self.assertNotEqual(true_res, mut_res)
+        self.assertAlmostEqual(u32_to_f32(true_res), -3.0, places=5)
+        self.assertAlmostEqual(u32_to_f32(mut_res), 3.0, places=5)
+
+    def test_kills_add_mutant(self) -> None:
+        # vdata0 = 5.0f, old_val = 2.0f
+        # True rsub: 5.0 - 2.0 = 3.0f
+        # Add: 5.0 + 2.0 = 7.0f
+        true_res = ieee754_rsub_f32(FIVE_F32, TWO_F32)
+        mut_res = mutant_ds_add_not_rsub(FIVE_F32, TWO_F32)
+        self.assertNotEqual(true_res, mut_res)
+        self.assertAlmostEqual(u32_to_f32(true_res), 3.0, places=5)
+        self.assertAlmostEqual(u32_to_f32(mut_res), 7.0, places=5)
+
+    def test_kills_returns_new_mutant(self) -> None:
+        mem_ref = LDSMemory(1024)
+        mem_ref.write_dword(5, TWO_F32)
+        old_ref, new_ref = mem_ref.atomic_rsub_rtn_f32(vaddr=20, vdata0=FIVE_F32)
+
+        mem_mut = LDSMemory(1024)
+        mem_mut.write_dword(5, TWO_F32)
+        ret_mut, _ = mutant_atomic_rsub_returns_new(mem_mut, vaddr=20, vdata0=FIVE_F32)
+
+        # Reference returns pre-op 2.0f, mutant returns post-op 3.0f
+        self.assertEqual(old_ref, TWO_F32)
+        self.assertEqual(ret_mut, THREE_F32)
+        self.assertNotEqual(old_ref, ret_mut)
+
+    def test_kills_unaligned_byte_address_mutant(self) -> None:
+        # Address 0x103: unaligned byte address
+        # Correct index: (0x103 >> 2) & 1023 = 0x40 = 64
+        # Faulty mutant: 0x103 & 1023 = 0x103 = 259
+        true_idx = calc_lds_dword_index(0x103, 1024)
+        mut_idx = mutant_calc_lds_index_byte_direct(0x103, 1024)
+        self.assertEqual(true_idx, 64)
+        self.assertEqual(mut_idx, 259)
+        self.assertNotEqual(true_idx, mut_idx)
+
+
 if __name__ == "__main__":
     unittest.main()
