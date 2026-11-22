@@ -54,13 +54,33 @@ MULTI_INDEXED = [
     "buffer_store_dword v11, v8, s[20:23], 0 idxen offset:8",
     "s_endpgm",
 ]
+RUNTIME = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "s_load_dwordx4 s[16:19], s[8:9], 0x20",
+    "s_waitcnt lgkmcnt(0)",
+    "s_buffer_load_dword s20, s[16:19], null",
+    "s_buffer_load_dwordx2 s[22:23], s[16:19], 0xc",
+    "s_buffer_load_dwordx4 s[24:27], s[16:19], 0x30",
+    "s_waitcnt lgkmcnt(0)",
+    "s_mov_b32 s28, s20",
+    "v_mov_b32_e32 v10, s28", "v_mov_b32_e32 v11, s22", "v_mov_b32_e32 v12, s23",
+    "v_mov_b32_e32 v13, s27", "v_mov_b32_e32 v14, s26", "v_mov_b32_e32 v15, s25",
+    "v_mov_b32_e32 v16, s24", "v_mov_b32_e32 v17, v16",
+    "buffer_store_dwordx3 v[10:12], off, s[12:15], 0 offset:16",
+    "buffer_store_dwordx4 v[13:16], off, s[12:15], 0 offset:32",
+    "buffer_store_dword v17, off, s[12:15], 0 offset:64",
+    "s_endpgm",
+]
 INDEX_BINDING = dict(table_reg=7, group_reg=11, descriptor_offset=48, stride=12)
 FIXED_BINDING = dict(table_reg=8, descriptor_offset=0)
+RUNTIME_BINDING = dict(FIXED_BINDING, constant_descriptor=32)
 CASES = [
     ("indexed", INDEXED, 32, INDEX_BINDING),
     ("fixed", FIXED, 1, FIXED_BINDING),
     ("multi_fixed", MULTI_FIXED, 1, FIXED_BINDING),
     ("multi_indexed", MULTI_INDEXED, 32, INDEX_BINDING),
+    ("runtime", RUNTIME, 1, RUNTIME_BINDING),
 ]
 
 
@@ -98,6 +118,21 @@ def controls():
         [s.replace("s_movk_i32 s11, 0xfffc", "s_movk_i32 s11, 0x10000") for s in MULTI_FIXED],
         1, **FIXED_BINDING))
     must_reject(aot.group_width, bytes(52))
+    for descriptor in (None, 8, 16, 33):
+        must_reject(lambda: aot.lower(RUNTIME, 1, **dict(FIXED_BINDING, constant_descriptor=descriptor)))
+    for old, new in (
+        ("s[16:19], 0x30", "s[16:19], 0x34"),
+        ("s[16:19], 0xc", "s[16:19], 0xa"),
+        ("s[16:19], 0xc", "s[12:15], 0xc"),
+        ("s[22:23]", "s[21:22]"),
+        ("s[24:27]", "s[20:23]"),
+        ("s[12:15], 0 offset:64", "s[16:19], 0 offset:64"),
+    ):
+        must_reject(lambda: aot.lower([line.replace(old, new) for line in RUNTIME], 1, **RUNTIME_BINDING))
+    for slot in (3, 7):
+        early = RUNTIME.copy()
+        early[slot] = "s_waitcnt vmcnt(0)"
+        must_reject(lambda: aot.lower(early, 1, **RUNTIME_BINDING))
 
 
 def binary(directory, assembler, objcopy, library):
@@ -123,12 +158,43 @@ def binary(directory, assembler, objcopy, library):
         assert output.read_text() == aot.lower(lines, width, **binding)
 
 
+def draw_runtime(cmd, case):
+    first = [0x80000000 + i * 0x101 for i in range(16)]
+    second = [0x7fc00000 + i * 0x181 for i in range(16)]
+    refs = []
+    for values in (first, second):
+        words = [SENTINEL] * 320
+        words[4:7] = [values[0], values[3], values[4]]
+        words[8:12] = values[12:16][::-1]
+        words[16] = values[12]
+        refs.append(words)
+        case.write_bytes(struct.pack("<337I", 1, *words, *values))
+        result = subprocess.run(cmd)
+        if result.returncode:
+            return result.returncode
+    case.write_bytes(struct.pack("<337I", 1, *refs[0], *second))
+    stale = subprocess.run(cmd, capture_output=True, text=True)
+    if (stale.returncode != 1 or "word=4 expected=80000000 actual=7fc00000" not in stale.stderr
+            or "groups=1 compared_words=320 mismatches=8" not in stale.stdout.splitlines()):
+        raise AssertionError(f"Expected a stale runtime constant mismatch\n{stale.stdout}\n{stale.stderr}")
+    case.write_bytes(struct.pack("<337I", 1, *refs[1], *second)[:-4])
+    truncated = subprocess.run(cmd, capture_output=True, text=True)
+    if truncated.returncode != 1 or "Invalid compute store constants" not in truncated.stderr:
+        raise AssertionError(f"Expected a truncated constants error\n{truncated.stdout}\n{truncated.stderr}")
+    return 0
+
+
 def draw(directory, compiler, renderer, backend):
     for name, lines, width, binding in CASES:
         src, cso, case = [directory / x for x in ("store.hlsl", "store.cso", "store.case")]
         src.write_text(aot.lower(lines, width, **binding), encoding="ascii")
         subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
         cmd = [renderer, backend, "--compute-store-case", cso, case]
+        if name == "runtime":
+            result = draw_runtime(cmd, case)
+            if result:
+                return result
+            continue
         for groups in ((1, 3) if width == 32 else (1,)):
             words = [SENTINEL] * 320
             if name == "fixed":

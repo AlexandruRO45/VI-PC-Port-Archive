@@ -1,4 +1,4 @@
-"""Translate raw-UAV constant-store gfx1013 compute programs under an explicit binding."""
+"""Translate bounded raw-UAV gfx1013 compute programs under explicit bindings."""
 import argparse
 import hashlib
 import json
@@ -8,6 +8,9 @@ from pathlib import Path
 
 from pixel_aot import container_code, disassemble
 from resource_inventory import parts
+
+
+CONSTANT_WORDS = 16
 
 
 def group_width(psv):
@@ -20,11 +23,22 @@ def group_width(psv):
     return x
 
 
-def lower(instructions, width, *, table_reg, descriptor_offset, group_reg=None, stride=None):
-    """v0 is local X, group_reg is group X, and the selected descriptor names u0."""
+def is_word(value):
+    return isinstance(value, int) or (isinstance(value, tuple) and value[0] == "constant_word")
+
+
+def lower(instructions, width, *, table_reg, descriptor_offset, group_reg=None, stride=None,
+          constant_descriptor=None):
+    """v0 is local X, group_reg is group X, and descriptors name u0 and optionally b0."""
     if (width not in (1, 32, 64) or not 0 <= table_reg <= 105
             or not 0 <= descriptor_offset < 1 << 20 or descriptor_offset % 4):
         raise ValueError("Invalid table or thread group binding")
+    descriptor_bindings = {descriptor_offset: "uav"}
+    if constant_descriptor is not None:
+        if (not 0 <= constant_descriptor < 1 << 20 or constant_descriptor % 4
+                or abs(constant_descriptor - descriptor_offset) < 16):
+            raise ValueError("Invalid or overlapping constant descriptor binding")
+        descriptor_bindings[constant_descriptor] = "cbv"
     if group_reg is not None and (not 0 <= group_reg <= 105 or group_reg == table_reg):
         raise ValueError("Invalid group register")
     if stride is not None and (group_reg is None or not 4 <= stride <= 0x3fff or stride % 4):
@@ -77,10 +91,26 @@ def lower(instructions, width, *, table_reg, descriptor_offset, group_reg=None, 
             regs = range(dest, last + 1)
             if (dest % 4 or last != dest + 3 or last > 105 or base % 2 or high != base + 1
                     or high > 105 or pending.intersection((*regs, base, high))
-                    or (scalar.get(base), scalar.get(high)) != ("table", 0) or offset != descriptor_offset):
-                raise ValueError("Unresolved UAV descriptor load")
+                    or (scalar.get(base), scalar.get(high)) != ("table", 0) or offset not in descriptor_bindings):
+                raise ValueError("Unresolved compute descriptor load")
             for component, reg in enumerate(regs):
-                scalar[reg] = ("uav", component)
+                scalar[reg] = (descriptor_bindings[offset], component)
+            pending.update(regs)
+        elif m := re.fullmatch(r"(?:s_buffer_load_dwordx([24]) s\[(\d+):(\d+)\]|s_buffer_load_dword s(\d+)), "
+                               r"s\[(\d+):(\d+)\], (null|0x[0-9a-f]+)", line):
+            count = int(m[1] or 1)
+            dest, last = (int(m[4]), int(m[4])) if m[4] else (int(m[2]), int(m[3]))
+            base, high = int(m[5]), int(m[6])
+            offset = 0 if m[7] == "null" else int(m[7], 16)
+            regs = range(dest, last + 1)
+            if (dest % count or last != dest + count - 1 or last > 105
+                    or base % 4 or high != base + 3 or high > 105
+                    or offset % 4 or offset // 4 + count > CONSTANT_WORDS
+                    or pending.intersection((*regs, *range(base, high + 1)))
+                    or any(scalar.get(base + i) != ("cbv", i) for i in range(4))):
+                raise ValueError("Unresolved or out-of-range compute constant read")
+            for word, reg in enumerate(regs, offset // 4):
+                scalar[reg] = ("constant_word", word)
             pending.update(regs)
         elif m := re.fullmatch(r"v_mov_b32(?:_e32|_e64)? v(\d+), (s\d+|v\d+|-?\d+|0x[0-9a-f]+)", line):
             dst, src = int(m[1]), m[2]
@@ -89,14 +119,14 @@ def lower(instructions, width, *, table_reg, descriptor_offset, group_reg=None, 
             if src.startswith("s"):
                 n = int(src[1:])
                 val = scalar.get(n)
-                if n > 105 or n in pending or not isinstance(val, int):
-                    raise ValueError("Unresolved or non-constant scalar move source")
+                if n > 105 or n in pending or not is_word(val):
+                    raise ValueError("Unresolved scalar move source")
                 vector[dst] = val
             elif src.startswith("v"):
                 n = int(src[1:])
                 val = vector.get(n)
-                if n > 255 or not isinstance(val, int):
-                    raise ValueError("Unresolved or non-constant vector move source")
+                if n > 255 or not is_word(val):
+                    raise ValueError("Unresolved vector move source")
                 vector[dst] = val
             else:
                 value = int(src, 0)
@@ -133,9 +163,13 @@ def lower(instructions, width, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Overlapping raw UAV stores")
             written_spans.append((offset, span_end))
             values = [vector.get(reg) for reg in range(first, first + count)]
-            if not all(isinstance(value, int) for value in values):
+            if not all(is_word(value) for value in values):
                 raise ValueError("Store data is not a known word")
-            words = ", ".join(f"0x{value:08x}u" for value in values)
+            words = ", ".join(
+                f"0x{value:08x}u" if isinstance(value, int)
+                else f"params[{value[1] // 4}].{'xyzw'[value[1] % 4]}"
+                for value in values
+            )
             arg = words if count == 1 else f"uint{count}({words})"
             stores.append(f"    outputData.Store{count if count > 1 else ''}({address}, {arg});")
         else:
@@ -143,7 +177,9 @@ def lower(instructions, width, *, table_reg, descriptor_offset, group_reg=None, 
     if not stores:
         raise ValueError("Expected at least one observable store")
     body = "\n".join(stores)
-    return (f"RWByteAddressBuffer outputData : register(u0);\n[numthreads({width},1,1)]\n"
+    cbuffer = (f"cbuffer Constants : register(b0) {{ uint4 params[{CONSTANT_WORDS // 4}]; }};\n"
+               if constant_descriptor is not None else "")
+    return (f"{cbuffer}RWByteAddressBuffer outputData : register(u0);\n[numthreads({width},1,1)]\n"
             f"void main(uint3 tid : SV_DispatchThreadID) {{\n{body}\n}}\n")
 
 
@@ -154,6 +190,7 @@ def main():
     parser.add_argument("--llvm", required=True)
     parser.add_argument("--table-reg", type=int, required=True)
     parser.add_argument("--descriptor-offset", type=lambda n: int(n, 0), required=True)
+    parser.add_argument("--constant-descriptor", type=lambda n: int(n, 0), help="Table byte offset bound to b0")
     parser.add_argument("--group-reg", type=int)
     parser.add_argument("--stride", type=int, help="Indexed raw UAV byte stride")
     args = parser.parse_args()
@@ -164,7 +201,8 @@ def main():
     width = group_width(chunks.get(b"PSV0", b""))
     code = container_code(chunks.get(b"DXIL", b""), stage=5)
     source = lower(disassemble(code, args.llvm), width, table_reg=args.table_reg,
-                   descriptor_offset=args.descriptor_offset, group_reg=args.group_reg, stride=args.stride)
+                   descriptor_offset=args.descriptor_offset, group_reg=args.group_reg, stride=args.stride,
+                   constant_descriptor=args.constant_descriptor)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(source, encoding="ascii")
     print(json.dumps({"container_sha256": hashlib.sha256(blob).hexdigest(),

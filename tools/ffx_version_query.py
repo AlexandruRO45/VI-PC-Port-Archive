@@ -220,9 +220,10 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
     # the fixed control word, or an x87_lower.Checked for the checked entry, which also accepts FLDCW.
     checked = x87 if isinstance(x87, x87_lower.Checked) else None
     x87_depth = x87_lower.depths(body, exits, checked) if x87 and any(map(x87_lower.is_x87, body)) else None
-    # JP and JNP read PF, which only a function the x87 profile has checked models (x87_lower.check_flags);
-    # SAHF and the 8-bit TEST and AND set it there. Other functions keep their two flags.
-    parity = x87_depth is not None and any(i.mnemonic in (M.JP, M.JNP) for i in body)
+    # JP, JNP, FCMOVU and FCMOVNU read PF, which only a function the x87 profile has checked models
+    # (x87_lower.check_flags); SAHF, the FCOMI family and the 8-bit TEST and AND set it there. Other functions
+    # keep their two flags.
+    parity = x87_depth is not None and any(i.mnemonic in (M.JP, M.JNP, M.FCMOVU, M.FCMOVNU) for i in body)
     if parity:
         lines[2] = "bool zero=false, carry=false, overflow=false, parity=false;"
     xmm = {R.XMM0: "xmm0", R.XMM1: "xmm1", R.XMM2: "xmm2"}
@@ -1122,7 +1123,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
         elif op == M.RET:
             stmt = "return rax;" if checked is None or x87_depth is None else x87_lower.return_statement(checked)
         elif x87_depth is not None and op in x87_lower.X87_OPS:
-            stmt = x87_lower.statement(i, x87_depth[i.ip], address, checked)
+            stmt = x87_lower.statement(i, x87_depth[i.ip], address, checked, parity)
         else:
             raise ValueError(f"unsupported query operation at {i.ip:#x}: {i}")
         lines.append(f"block_{i.ip:x}: {stmt}")
