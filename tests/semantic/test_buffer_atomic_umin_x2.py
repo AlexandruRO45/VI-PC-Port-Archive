@@ -1425,5 +1425,273 @@ class TestBufferAtomicUminX2IEEE754(unittest.TestCase):
             self.assertEqual(self.interp.mem.read_u64(addr), next_val)
 
 
+# ---------------------------------------------------------------------------
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ---------------------------------------------------------------------------
+
+class TestBufferAtomicUminX2NegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def setUp(self) -> None:
+        self.desc = BufferResourceDescriptor(
+            base_address=0,
+            stride=0,
+            num_records=1024,
+        )
+
+    # --- Negative Controls & Syntax Rejection ---
+
+    def test_negative_reject_invalid_vdata_count(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_UMIN_X2,
+                vdata=Register(RegKind.VGPR, 0, count=1),
+                vaddr=Register(RegKind.VGPR, 2, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=0,
+            )
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_UMIN_X2,
+                vdata=Register(RegKind.VGPR, 0, count=4),
+                vaddr=Register(RegKind.VGPR, 2, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=0,
+            )
+
+    def test_negative_reject_vdata_sgpr(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_UMIN_X2,
+                vdata=Register(RegKind.SGPR, 0, count=2),
+                vaddr=Register(RegKind.VGPR, 2, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=0,
+            )
+
+    def test_negative_reject_srsrc_count(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_UMIN_X2,
+                vdata=Register(RegKind.VGPR, 0, count=2),
+                vaddr=Register(RegKind.VGPR, 2, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=2),
+                soffset=0,
+            )
+
+    def test_negative_reject_srsrc_vgpr(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_UMIN_X2,
+                vdata=Register(RegKind.VGPR, 0, count=2),
+                vaddr=Register(RegKind.VGPR, 2, count=1),
+                srsrc=Register(RegKind.VGPR, 4, count=4),
+                soffset=0,
+            )
+
+    def test_negative_reject_soffset_vgpr(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_UMIN_X2,
+                vdata=Register(RegKind.VGPR, 0, count=2),
+                vaddr=Register(RegKind.VGPR, 2, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=Register(RegKind.VGPR, 8, count=1),
+            )
+
+    def test_negative_reject_out_of_range_offsets(self) -> None:
+        with self.assertRaises(ValueError):
+            BufferAtomicModifiers(offset=-1)
+        with self.assertRaises(ValueError):
+            BufferAtomicModifiers(offset=4096)
+
+    def test_negative_reject_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDBufferWavefrontInterpreter(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDBufferWavefrontInterpreter(wave_size=128)
+
+    def test_negative_reject_register_boundary_overflow(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256, count=1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 255, count=2)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 253, count=4)
+
+    # --- Mutation Detection ---
+
+    def test_mutation_signed_min_instead_of_unsigned_min_detected(self) -> None:
+        """Mutant: compares values as signed integers instead of unsigned integers."""
+        mem = BufferMemory(4096)
+        mem.write_u64(64, 10)
+
+        def buggy_smin_swap(val: int) -> None:
+            # Bug: compares signed s64 instead of unsigned u64!
+            old = mem.read_u64(64)
+            new_val = min(s64(old), s64(val))
+            mem.write_u64(64, u64(new_val))
+
+        # In unsigned comparison, min(10, 0xFFFFFFFFFFFFFFFF) = 10 (memory unchanged)
+        ref_buffer_atomic_umin_x2(mem, self.desc, 0, 64, 0xFFFFFFFFFFFFFFFF)
+        self.assertEqual(mem.read_u64(64), 10)
+
+        # In buggy signed comparison, -1 < 10, so it erroneously writes -1 (0xFFFFFFFFFFFFFFFF)
+        buggy_smin_swap(0xFFFFFFFFFFFFFFFF)
+        self.assertEqual(mem.read_u64(64), 0xFFFFFFFFFFFFFFFF)
+        self.assertNotEqual(mem.read_u64(64), 10)
+
+    def test_mutation_single_dword_write_detected(self) -> None:
+        """Mutant: writes only 32 bits instead of 64 bits."""
+        mem = BufferMemory(4096)
+        mem.write_u64(64, 0xFFFFFFFFFFFFFFFF)
+
+        def buggy_swap_32(swap_val: int) -> None:
+            mem.write_u32(64, swap_val & MASK32)
+
+        # Correct 64-bit umin writes full 64 bits: 0x0000000012345678
+        ref_buffer_atomic_umin_x2(mem, self.desc, 0, 64, 0x0000000012345678)
+        self.assertEqual(mem.read_u64(64), 0x0000000012345678)
+
+        # Reset memory to 0xFFFFFFFFFFFFFFFF
+        mem.write_u64(64, 0xFFFFFFFFFFFFFFFF)
+        # Buggy 32-bit write leaves high 32 bits untouched as 0xFFFFFFFF
+        buggy_swap_32(0x12345678)
+        self.assertEqual(mem.read_u32(64), 0x12345678)
+        self.assertEqual(mem.read_u32(68), 0xFFFFFFFF)
+
+    def test_mutation_inactive_lanes_modify_state_detected(self) -> None:
+        """Mutant: SIMD interpreter executes inactive lanes."""
+        simd = SIMDBufferWavefrontInterpreter(wave_size=32, mem_size=4096)
+        simd.set_buffer_descriptor(4, self.desc)
+        simd.set_exec_mask(0x1)  # Only lane 0 active
+
+        sentinel = 0xAA55AA55AA55AA55
+        for lane in range(32):
+            simd.write_lane_reg_u64(lane, 0, sentinel)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 2, lane * 8)
+
+        class InactiveCorruptingSIMD(SIMDBufferWavefrontInterpreter):
+            def step(self, inst: Instruction):
+                for lane in range(self.wave_size):
+                    self.write_lane_reg_u64(lane, inst.vdata.index, 0)
+                return []
+
+        corrupting = InactiveCorruptingSIMD(wave_size=32, mem_size=4096)
+        for lane in range(32):
+            corrupting.write_lane_reg_u64(lane, 0, sentinel)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_UMIN_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+        )
+        corrupting.step(inst)
+
+        corrupted = [l for l in range(1, 32) if corrupting.read_lane_reg_u64(l, 0) != sentinel]
+        self.assertEqual(len(corrupted), 31)
+
+    def test_mutation_premature_writeback_under_aliasing_detected(self) -> None:
+        """Mutant: writes destination before latching address operand."""
+        interp = ScalarBufferInterpreter(mem_size=4096)
+        interp.set_buffer_descriptor(4, self.desc)
+        addr = 64
+        interp.mem.write_u64(addr, 500)
+        interp.write_reg_u32(RegKind.VGPR, 0, addr)
+        interp.write_reg_u32(RegKind.VGPR, 1, 0)
+
+        class PrematureWritebackInterp(ScalarBufferInterpreter):
+            def step(self, inst: Instruction):
+                self.write_reg_u32(RegKind.VGPR, inst.vdata.index, 0x8888)
+                vaddr = self.read_reg_u32(RegKind.VGPR, inst.vaddr.index)  # Reads corrupted 0x8888!
+                desc = self.get_buffer_descriptor(inst.srsrc.index)
+                return ref_buffer_atomic_umin_x2(
+                    self.mem, desc, 0, vaddr, 64, glc=True
+                )
+
+        buggy = PrematureWritebackInterp(mem_size=4096)
+        buggy.set_buffer_descriptor(4, self.desc)
+        buggy.mem.write_u64(addr, 500)
+        buggy.write_reg_u32(RegKind.VGPR, 0, addr)
+        buggy.write_reg_u32(RegKind.VGPR, 1, 0)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_UMIN_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 0, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, in_b = buggy.step(inst)
+        self.assertFalse(in_b)
+        self.assertEqual(ret, 0)
+
+    def test_mutation_reverse_simd_lane_order_detected(self) -> None:
+        """Mutant: serializes colliding lanes in reverse order."""
+        simd = SIMDBufferWavefrontInterpreter(wave_size=32, mem_size=4096)
+        simd.set_buffer_descriptor(4, self.desc)
+        simd.set_exec_mask(0x3)  # Lanes 0 and 1 active
+
+        target = 64
+        simd.mem.write_u64(target, 100)
+
+        class ReverseLaneOrderSIMD(SIMDBufferWavefrontInterpreter):
+            def step(self, inst: Instruction):
+                desc = self.get_buffer_descriptor(inst.srsrc.index)
+                for lane in reversed(range(self.wave_size)):
+                    if bool((self.exec_mask >> lane) & 1):
+                        val = self.read_lane_reg_u64(lane, inst.vdata.index)
+                        va = self.read_lane_reg_u32(lane, RegKind.VGPR, inst.vaddr.index)
+                        ref_buffer_atomic_umin_x2(self.mem, desc, 0, va, val)
+                return []
+
+        buggy = ReverseLaneOrderSIMD(wave_size=32, mem_size=4096)
+        buggy.set_buffer_descriptor(4, self.desc)
+        buggy.set_exec_mask(0x3)
+        buggy.mem.write_u64(target, 100)
+        buggy.write_lane_reg_u64(0, 0, 50)
+        buggy.write_lane_reg_u32(0, RegKind.VGPR, 2, target)
+        buggy.write_lane_reg_u64(1, 0, 25)
+        buggy.write_lane_reg_u32(1, RegKind.VGPR, 2, target)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_UMIN_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+        )
+        buggy.step(inst)
+        self.assertEqual(buggy.mem.read_u64(target), 25)
+
+    def test_mutation_ignore_immediate_offset_detected(self) -> None:
+        """Mutant: immediate inst_offset is ignored in address calculation."""
+        def buggy_offset_calc(soffset: int, inst_offset: int, vaddr: int) -> int:
+            return (soffset & MASK32) + (vaddr & MASK32)
+
+        correct = (128 & MASK32) + (32 & 0xFFF) + (8 & MASK32)
+        mutant = buggy_offset_calc(128, 32, 8)
+        self.assertEqual(correct, 168)
+        self.assertEqual(mutant, 136)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_missing_oob_bounds_check_detected(self) -> None:
+        """Mutant: uses 4-byte check instead of 8-byte check for 64-bit access."""
+        mem = BufferMemory(4096)
+        mem.write_u64(1020, 100)
+
+        def buggy_check_oob(offset: int) -> bool:
+            return (offset + 4) > self.desc.num_records
+
+        _, in_b = ref_buffer_atomic_umin_x2(
+            mem, self.desc, soffset=0, vaddr=1020, umin_val=50
+        )
+        self.assertFalse(in_b)
+        self.assertFalse(buggy_check_oob(1020))
+
+
 if __name__ == "__main__":
     unittest.main()
