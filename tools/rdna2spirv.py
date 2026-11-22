@@ -12183,6 +12183,17 @@ def assemble(gen):
         if ms_cull_member is not None:
             gen.cu(ms_cull_member)
     gen.consts.setdefault(0, "%c0")
+    # The format tables below name their array lengths and members through gen.cu(); register those constants
+    # before the constant block is emitted, or the emitted SPIR-V references an id defined after its use.
+    if gen.uses_fmt_size:
+        gen.cu(128)
+        for c in range(128):
+            gen.cu(Gen.FORMATS[c][0] if c in Gen.FORMATS else 0)
+    if gen.uses_store_views or gen.uses_int_fetch:
+        fmt_uint, fmt_sint = Gen.int_format_masks()
+        gen.cu(16)
+        for w in fmt_uint + fmt_sint:
+            gen.cu(w)
     for v, name in sorted(gen.consts.items()):
         types.append(f"{name} = OpConstant %uint {v}")
     if gen.desc_fn:
