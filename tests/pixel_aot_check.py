@@ -890,6 +890,17 @@ def predicate_group_e64(first):
     return with_constants(body)
 
 
+def run_pixel_batch(renderer, backend, shader, cases):
+    command = [renderer, backend, "--check-pixel-batch", shader, *(path for path, _ in cases)]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode == 77:
+        result.check_returncode()
+    expected = [f"case={i} status={status}" for i, (_, status) in enumerate(cases)]
+    actual = [line for line in result.stdout.splitlines() if line.startswith("case=")]
+    if actual != expected or result.returncode != int(any(status != "pass" for _, status in cases)):
+        raise AssertionError(f"Expected {expected}\n{result.stdout}\n{result.stderr}")
+
+
 def check_e64_draws(directory, compiler, renderer, backend):
     source = directory / "e64.hlsl"
     shader = directory / "e64.cso"
@@ -897,16 +908,6 @@ def check_e64_draws(directory, compiler, renderer, backend):
         path = directory / f"e64-{len(cases)}.case"
         path.write_bytes(constants + struct.pack("<4f", *expected) * 64)
         cases.append((path, status))
-
-    def run_cases(cases):
-        command = [renderer, backend, "--check-pixel-batch", shader, *(path for path, _ in cases)]
-        result = subprocess.run(command, capture_output=True, text=True)
-        if result.returncode == 77:
-            result.check_returncode()
-        expected = [f"case={i} status={status}" for i, (_, status) in enumerate(cases)]
-        actual = [line for line in result.stdout.splitlines() if line.startswith("case=")]
-        if actual != expected or result.returncode != int(any(status != "pass" for _, status in cases)):
-            raise AssertionError(f"Expected {expected}\n{result.stdout}\n{result.stderr}")
 
     x, y, z, w = E64_ARITH_INPUTS
     assert [math.floor(-abs(x)), -y - math.floor(-y), max(-z, abs(w)), min(z, -abs(w))] == E64_ARITH[0][1]
@@ -923,7 +924,7 @@ def check_e64_draws(directory, compiler, renderer, backend):
             wrong_values[channel] = value
             add_case(cases, constants, wrong_values, "mismatch")
         add_case(cases, constants, expected, "pass")
-        run_cases(cases)
+        run_pixel_batch(renderer, backend, shader, cases)
     inputs = ((-1, 1, 0), (-0.0, 0.0, 1), (1, -1, 2), (math.nan, 1, 3), (1, math.nan, 3))
     negated = {0: 2, 1: 1, 2: 0, 3: 3}
     for first in range(0, 16, 4):
@@ -939,7 +940,7 @@ def check_e64_draws(directory, compiler, renderer, backend):
             unnegated = [float((op >> relation) & 1) for op in range(first, first + 4)]
             if unnegated != expected:
                 add_case(cases, constants, unnegated, "mismatch")
-        run_cases(cases)
+        run_pixel_batch(renderer, backend, shader, cases)
 
 
 def bitwise_program():
@@ -1049,8 +1050,6 @@ def check_mad_draw(directory, compiler, renderer, backend):
 def check_predicate_draws(directory, compiler, renderer, backend):
     source = directory / "predicates.hlsl"
     shader = directory / "predicates.cso"
-    case = directory / "predicates.case"
-    draw = [renderer, backend, "--check-pixel-case", shader, case]
     # Isolate each negated relation so another predicate cannot supply the unordered test. An
     # unordered relational fcmp alone is not enough: the Windows 10 in-box WARP 10.0.19041
     # evaluates fcmp ult, ule, ugt and uge as their ordered forms.
@@ -1064,32 +1063,31 @@ def check_predicate_draws(directory, compiler, renderer, backend):
         dxil = listing.read_text(encoding="utf-8")
         if not any(text in dxil for text in ("@dx.op.isSpecialFloat.f32(i32 8,", "fcmp uno ", "fcmp ueq ")):
             raise AssertionError(f"{op.upper()} lacks an explicit unordered comparison in DXIL")
-    inputs = ((-1, 1, 0), (-0.0, 0.0, 1), (1, -1, 2),
-              (math.nan, 1, 3), (1, math.nan, 3))
+    inputs = (("lt", -1, 1, 0), ("signed-zero", -0.0, 0.0, 1), ("gt", 1, -1, 2),
+              ("left-nan", math.nan, 1, 3), ("right-nan", 1, math.nan, 3))
     for first in range(0, 16, 4):
         source.write_text(translate(predicate_group(first)), encoding="ascii")
         compile_shader(compiler, source, shader)
-        for left, right, relation in inputs:
+        cases = []
+        for label, left, right, relation in inputs:
             constants = bytearray(256)
             struct.pack_into("<4f", constants, 12, left, right, 0, 1)
             pixel = tuple((op >> relation) & 1 for op in range(first, first + 4))
+            case = directory / f"predicates-{first}-{label}.case"
             write_case(case, constants, pixel)
-            try:
-                subprocess.run(draw, check=True)
-            except subprocess.CalledProcessError as error:
-                channels = ", ".join(
-                    f"{channel}={op}" for channel, op in enumerate(PREDICATES[first:first + 4])
-                )
-                error.add_note(
-                    f"Predicate draw on {backend}, first={first}, left={left!r}, right={right!r}, channels {channels}"
-                )
-                raise
-    # Keep the unordered oracle and change only the NaN operand to equal.
-    struct.pack_into("<f", constants, 16, 1.0)
-    write_case(case, constants, pixel)
-    wrong = subprocess.run(draw, capture_output=True, text=True)
-    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
-        raise AssertionError("Replacing NaN with a finite equal operand escaped detection")
+            cases.append((case, "pass"))
+        if first == 12:
+            # Keep the unordered oracle and replace the final NaN operand with an equal value.
+            struct.pack_into("<f", constants, 16, 1.0)
+            wrong = directory / f"predicates-{first}-finite-instead-of-nan.case"
+            write_case(wrong, constants, pixel)
+            cases.insert(-1, (wrong, "mismatch"))
+        try:
+            run_pixel_batch(renderer, backend, shader, cases)
+        except AssertionError as error:
+            channels = ", ".join(f"{channel}={op}" for channel, op in enumerate(PREDICATES[first:first + 4]))
+            error.add_note(f"Predicate draw on {backend}, first={first}, channels {channels}")
+            raise
 
 
 def check_int_predicate_draws(directory, compiler, renderer, backend):

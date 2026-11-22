@@ -1591,6 +1591,13 @@ On Linux, `llvm-ml` assembled the fixture and `lld-link` linked it. The original
 
 ## Offline pixel shader recompilation
 
+The floating-point predicate draw uses one `--check-pixel-batch` process per
+compiled shader group. All 20 reference draws still run. For the final group,
+the finite-instead-of-NaN control produces a mismatch inside the batch and the
+following valid draw must pass. The fixture checks each status in order and
+checks the process exit code. This leaves four device creations for the
+predicate groups in place of 21, without changing the number of DXC calls.
+
 #The bitwise fixture uses AND, OR, XOR, NOT, BFI and three reversed shifts. Two constant sets exercise counts above 31. Exact mantissa bits distinguish the arithmetic and logical right shifts in GPU readback.
 
 ## Pixel color without a texture sample
