@@ -11,8 +11,10 @@ import struct
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "meshlet_page.py")
@@ -580,6 +582,105 @@ class MeshletCentreTests(unittest.TestCase):
                 checks = json.load(fh)["totals"]["checks"]
         self.assertEqual((checks["centres_4240_axes_exact"], checks["centres_4240_axes_within_step"]), (2, 3))
         self.assertNotIn("faces_4240_shared_edges", checks)
+
+
+class SummaryWorkTests(unittest.TestCase):
+    """The default summary and the 42/40 count stay one pass over their inputs (BUILD-1050)."""
+
+    def test_default_summary_reads_each_4240_count_once_per_block(self):
+        n = 80
+        data = page(*([other_block(5), group([(5, 3)])] * n))
+        real = mp.parse_page
+        reads = [0]
+
+        class Counted(dict):
+            def __getitem__(self, key):
+                if key == "vertices":
+                    reads[0] += 1
+                return dict.__getitem__(self, key)
+
+        with mock.patch.object(mp, "parse_page", lambda d: [Counted(c) for c in real(d)]):
+            summary = mp.summarise_page(data, "p")
+        self.assertEqual(summary["groups_matching_4240_block_here"], n)
+        # A small constant per block. The old per-group set read every block's count n times per group, so n * n.
+        self.assertLessEqual(reads[0], 8 * n)
+
+    def test_4240_counts_do_not_keep_the_position_lists(self):
+        packed = [((i * 2654435761) & 0xFFFFFF, (i * 40503) & 0xFFFFFF, (i * 31) & 0xFFFF)
+                  for i in range(7000)]
+        cases = [((0.0, 0.0, 0.0), (2.0 ** -20, 2.0 ** -18, 2.0 ** -10)),
+                 ((300.0, -300.0, 0.0), (0.0, 0.0, 0.0)),
+                 ((300.0001, 0.0, 0.0), (0.0, 0.0, 0.0)),
+                 ((float("inf"), 0.0, 0.0), (0.0, 0.0, 0.0))]
+        for bias, scale in cases:
+            data = page(other_block(7000, packed=packed, bias=bias, scale=scale))
+            block = mp.parse_page(data)[0]
+            positions = mp.positions_4240(data, block)
+            finite = [p for p in positions if all(math.isfinite(c) for c in p)]
+            want = {"positions_4240": len(positions), "positions_4240_finite": len(finite),
+                    "positions_4240_within_300m": sum(1 for p in finite if all(abs(c) <= 300 for c in p))}
+            tracemalloc.start()
+            got = mp.block4240_checks(data, block)
+            peak = tracemalloc.get_traced_memory()[1]
+            tracemalloc.stop()
+            self.assertEqual(got, want)
+            # The decoded list and its finite copy peaked above 1.1 MB for this block; the streaming count does not.
+            self.assertLess(peak, 300_000, (bias, peak))
+
+    def test_4240_count_does_not_copy_the_packed_stream(self):
+        # A box far outside 300 m forces the vertex-by-vertex decode. A bytes slice of the packed stream would grow
+        # the peak by 8 bytes per vertex; the memoryview does not, so doubling the block adds no copy.
+        packed = [(i & 0xFFFFFF, (i * 7) & 0xFFFFFF, i & 0xFFFF) for i in range(8192)]
+        peaks = {}
+        for n in (4096, 8192):
+            data = page(other_block(n, packed=packed[:n], bias=(1e6, 0.0, 0.0), scale=(0.5, 0.5, 0.5)))
+            block = mp.parse_page(data)[0]
+            tracemalloc.start()
+            got = mp.block4240_checks(data, block)
+            peaks[n] = tracemalloc.get_traced_memory()[1]
+            tracemalloc.stop()
+            self.assertEqual(got, {"positions_4240": n, "positions_4240_finite": n,
+                                   "positions_4240_within_300m": 0})
+        self.assertLess(peaks[8192] - peaks[4096], 8 * 4096 // 2, peaks)
+
+    def test_faces_and_centres_keep_the_nearest_matching_block(self):
+        # bias cancels the grid's mean position, so the stored centre word (the origin) is exact for a and
+        # one metre away for b; the fixture therefore sees which block each group picked.
+        bias, scale = (-1.0 / 256, -1.0 / 64, -3.0 / 1024), (2.0 ** -20, 2.0 ** -18, 2.0 ** -10)
+
+        def grid_block(shift):
+            packed = [(c * 4096 + shift, r * 4096, 3) for r in range(3) for c in range(3)]
+            return other_block(9, packed=packed, bias=bias, scale=scale)
+
+        a, b = grid_block(0), grid_block(1 << 20)     # b sits one metre further along x
+        g = grid_group(3, 3)
+        data = page(g, a, g, b, g)                    # a group before both blocks, between them and after both
+        got = mp.summarise_page(data, "p", faces=True, centres=True)["checks"]
+
+        chunks = mp.parse_page(data)
+        others = [c for c in chunks if c["kind"] == "block4240"]
+        groups = [c for c in chunks if c["kind"] == "group"]
+
+        def counts(pick):
+            out = {}
+            for grp in groups:
+                same = [c for c in others if c["vertices"] == grp["vertex_span"]]
+                positions = mp.positions_4240(data, pick(same, grp))
+                for k, v in mp.face_agreement(positions, list(mp.group_triangles(data, grp))).items():
+                    out["faces_4240_" + k] = out.get("faces_4240_" + k, 0) + v
+                for k, v in mp.centre_agreement(data, grp, positions).items():
+                    out["centres_4240_" + k] = out.get("centres_4240_" + k, 0) + v
+            return out
+
+        def nearest(same, grp):
+            before = [c for c in same if c["offset"] < grp["offset"]]
+            return before[-1] if before else same[0]
+
+        want = counts(nearest)
+        self.assertTrue(want)
+        self.assertEqual({k: v for k, v in got.items() if k.startswith(("faces_4240_", "centres_4240_"))}, want)
+        # The fixture can tell the choices apart: always taking the last candidate gives other counts.
+        self.assertNotEqual(want, counts(lambda same, grp: same[-1]))
 
 
 class SlotTagTests(unittest.TestCase):

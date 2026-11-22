@@ -67,6 +67,7 @@ Usage:
     python -I tools/meshlet_page.py <graphics-segment> --draw-system <system-segment> --drawable-offset <offset>
 """
 import argparse
+import bisect
 import json
 import math
 import mmap
@@ -172,9 +173,9 @@ def parse_other_block(data, at):
     return record, end
 
 
-def positions_4240(data, block):
-    """Decode a `42 40` block's slot-0 positions (the packed 8-byte form; see the module docstring). Returns a list of
-    (x, y, z) floats. Raises PageError for an axis word other than 0, 1 or 2 or a slot 0 that isn't tag 0x42."""
+def _iter_positions_4240(data, block):
+    """Yield a `42 40` block's slot-0 positions (the packed 8-byte form; see the module docstring) one at a time,
+    as (x, y, z) floats. Raises PageError for an axis word other than 0, 1 or 2 or a slot 0 that isn't tag 0x42."""
     at, n = block["offset"], block["vertices"]
     slots = {i: (tag, off) for i, tag, off in block["slots"]}
     if slots.get(0, (None,))[0] != 0x42:
@@ -184,13 +185,18 @@ def positions_4240(data, block):
     scale = struct.unpack_from("<3f", data, at + 0x70)
     if axis > 2:
         raise PageError(f"42 40 block at +0x{at:x}: axis word {axis} is not 0, 1 or 2")
-    out = []
-    for (q,) in struct.iter_unpack("<Q", data[at + slots[0][1]:at + slots[0][1] + 8 * n]):
+    # A memoryview, not a bytes slice: the slice would copy the whole packed stream (8 bytes per vertex).
+    for (q,) in struct.iter_unpack("<Q", memoryview(data)[at + slots[0][1]:at + slots[0][1] + 8 * n]):
         a = bias[0] + scale[0] * ((q >> 8) & 0xFFFFFF)
         b = bias[1] + scale[1] * (((q >> 32) & 0xFFFF) << 8 | (q & 0xFF))
         c = bias[2] + scale[2] * (q >> 48)
-        out.append((c, b, a) if axis == 0 else (b, c, a) if axis == 1 else (a, b, c))
-    return out
+        yield (c, b, a) if axis == 0 else (b, c, a) if axis == 1 else (a, b, c)
+
+
+def positions_4240(data, block):
+    """Decode a `42 40` block's slot-0 positions (the packed 8-byte form; see the module docstring). Returns a list of
+    (x, y, z) floats. Raises PageError for an axis word other than 0, 1 or 2 or a slot 0 that isn't tag 0x42."""
+    return list(_iter_positions_4240(data, block))
 
 
 def group_triangles(data, group):
@@ -422,7 +428,8 @@ def normal_agreement(positions, normals, triangles):
 def block4240_checks(data, block):
     """Count-only plausibility checks for one `42 40` block's decoded positions. Every position is bias + scale * q
     with q between 0 and 2^24 - 1 (2^16 - 1 for the third field), so when the header's box is finite and inside
-    300 m on every axis the counts follow from the header alone; only other blocks are decoded vertex by vertex."""
+    300 m on every axis the counts follow from the header alone; only other blocks are decoded vertex by vertex, in
+    one streaming pass (the position list and a second list of its finite entries are not kept)."""
     at, n = block["offset"], block["vertices"]
     bias, scale = struct.unpack_from("<3f", data, at + 0x60), struct.unpack_from("<3f", data, at + 0x70)
     slot0 = {i: tag for i, tag, _ in block["slots"]}.get(0)
@@ -430,10 +437,15 @@ def block4240_checks(data, block):
         ends = [(b, b + s * q) for b, s, q in zip(bias, scale, (0xFFFFFF, 0xFFFFFF, 0xFFFF))]
         if all(math.isfinite(e) for pair in ends for e in pair) and all(abs(e) <= 300 for pair in ends for e in pair):
             return {"positions_4240": n, "positions_4240_finite": n, "positions_4240_within_300m": n}
-    pos = positions_4240(data, block)
-    finite = [p for p in pos if all(math.isfinite(c) for c in p)]
-    return {"positions_4240": len(pos), "positions_4240_finite": len(finite),
-            "positions_4240_within_300m": sum(1 for p in finite if all(abs(c) <= 300 for c in p))}
+    total = finite = within = 0
+    for p in _iter_positions_4240(data, block):
+        total += 1
+        if all(math.isfinite(c) for c in p):
+            finite += 1
+            if all(abs(c) <= 300 for c in p):
+                within += 1
+    return {"positions_4240": total, "positions_4240_finite": finite,
+            "positions_4240_within_300m": within}
 
 
 def parse_group(data, at):
@@ -594,6 +606,8 @@ def summarise_page(data, name, faces=False, centres=False, normals=False, cones=
     blocks = [c for c in chunks if c["kind"] == "block"]
     others = [c for c in chunks if c["kind"] == "block4240"]
     groups = [c for c in chunks if c["kind"] == "group"]
+    counts = {b["vertices"] for b in blocks}
+    other_counts = {b["vertices"] for b in others}
     checks = {}
     try:
         for b in blocks:
@@ -608,13 +622,20 @@ def summarise_page(data, name, faces=False, centres=False, normals=False, cones=
                     for k, v in tangent_agreement(nrm, tangents_4240(data, b)).items():
                         checks["tangents_4240_" + k] = checks.get("tangents_4240_" + k, 0) + v
         if faces or centres or normals or cones:
+            # One lookup per distinct vertex count, in page order, instead of rescanning every 42 40 block for each
+            # group. The rule stays the docstring's: the nearest such block before the group, else the first after it.
+            by_count = {}
+            for b in others:
+                by_count.setdefault(b["vertices"], []).append(b)
+            matching = {count: (bs, [b["offset"] for b in bs]) for count, bs in by_count.items()}
             decoded = {}
             for g in groups:
-                same = [b for b in others if b["vertices"] == g["vertex_span"]]
-                if not same:
+                entry = matching.get(g["vertex_span"])
+                if entry is None:
                     continue
-                before = [b for b in same if b["offset"] < g["offset"]]
-                b = before[-1] if before else same[0]
+                bs, offsets = entry
+                k = bisect.bisect_left(offsets, g["offset"])
+                b = bs[k - 1] if k else bs[0]
                 if b["offset"] not in decoded:
                     decoded[b["offset"]] = positions_4240(data, b)
                 if faces:
@@ -634,7 +655,6 @@ def summarise_page(data, name, faces=False, centres=False, normals=False, cones=
                             checks["normals_4240_" + k] = checks.get("normals_4240_" + k, 0) + v
     except PageError as exc:
         return {"name": name, "size": len(data), "error": str(exc)}
-    counts = {b["vertices"] for b in blocks}
     stop = [c for c in chunks if c["kind"] == "stop"]
     return {"name": name, "size": len(data), "starts_with": chunks[0]["kind"],
             "sequence": "".join({"block": "B", "block4240": "Q", "group": "G", "stop": "."}[c["kind"]] for c in chunks),
@@ -653,8 +673,7 @@ def summarise_page(data, name, faces=False, centres=False, normals=False, cones=
             "blocks_4240": len(others), "vertices_4240": sum(b["vertices"] for b in others),
             "blocks_4240_flags": sorted({b["flags"] for b in others}),
             "blocks_4240_axes": sorted({b["axis"] for b in others}),
-            "groups_matching_4240_block_here": sum(1 for g in groups
-                                                   if g["vertex_span"] in {b["vertices"] for b in others}),
+            "groups_matching_4240_block_here": sum(1 for g in groups if g["vertex_span"] in other_counts),
             "group_spans": [g["vertex_span"] for g in groups],
             "block_counts": [b["vertices"] for b in blocks],
             "checks": checks}
