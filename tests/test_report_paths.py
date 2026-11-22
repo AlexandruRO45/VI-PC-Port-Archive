@@ -8,6 +8,7 @@ case-insensitive-volume branch is exercised with patches, so it runs on every pl
 import ast
 import os
 import pathlib
+import posixpath
 import sys
 import tempfile
 import unittest
@@ -90,7 +91,7 @@ class MacVolumeTests(unittest.TestCase):
     def darwin(self, case_sensitive_result):
         return mock.patch.multiple(
             report_paths, sys=mock.Mock(platform="darwin"),
-            os=mock.Mock(wraps=os, pathconf=mock.Mock(return_value=case_sensitive_result)))
+            os=mock.Mock(wraps=os, path=posixpath, pathconf=mock.Mock(return_value=case_sensitive_result)))
 
     def test_not_macos_is_never_case_insensitive(self):
         with mock.patch.object(report_paths, "sys", mock.Mock(platform="linux")):
