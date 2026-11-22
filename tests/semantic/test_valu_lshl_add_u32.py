@@ -544,6 +544,119 @@ class TestValuLshlAddU32SIMDDivergence(unittest.TestCase):
             self.assertEqual(state.get_vgpr(lane, 0), self.CANARY_OLD)
 
 
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestValuLshlAddU32RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing hazards and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarVALUInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_dst_aliases_src0(self) -> None:
+        # v0 = (v0 << v1) + v2
+        self.state.set_vgpr(0, 7)
+        self.state.set_vgpr(1, 2)
+        self.state.set_vgpr(2, 5)
+        instr = VLshlAddU32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+            src2=VOP3Operand(Reg(2, RegType.VGPR)),
+        )
+        # (7 << 2) + 5 = 28 + 5 = 33
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 33)
+        self.assertEqual(self.state.get_vgpr(0), 33)
+        self.assertEqual(self.state.get_vgpr(1), 2)
+        self.assertEqual(self.state.get_vgpr(2), 5)
+
+    def test_dst_aliases_src1(self) -> None:
+        # v1 = (v0 << v1) + v2
+        self.state.set_vgpr(0, 10)
+        self.state.set_vgpr(1, 3)
+        self.state.set_vgpr(2, 4)
+        instr = VLshlAddU32Instruction(
+            dst=Reg(1, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+            src2=VOP3Operand(Reg(2, RegType.VGPR)),
+        )
+        # (10 << 3) + 4 = 80 + 4 = 84
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 84)
+        self.assertEqual(self.state.get_vgpr(1), 84)
+        self.assertEqual(self.state.get_vgpr(0), 10)
+        self.assertEqual(self.state.get_vgpr(2), 4)
+
+    def test_dst_aliases_src2(self) -> None:
+        # v2 = (v0 << v1) + v2
+        self.state.set_vgpr(0, 6)
+        self.state.set_vgpr(1, 4)
+        self.state.set_vgpr(2, 10)
+        instr = VLshlAddU32Instruction(
+            dst=Reg(2, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+            src2=VOP3Operand(Reg(2, RegType.VGPR)),
+        )
+        # (6 << 4) + 10 = 96 + 10 = 106
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 106)
+        self.assertEqual(self.state.get_vgpr(2), 106)
+        self.assertEqual(self.state.get_vgpr(0), 6)
+        self.assertEqual(self.state.get_vgpr(1), 4)
+
+    def test_dst_aliases_src0_and_src2_scale_and_accumulate(self) -> None:
+        # v0 = (v0 << 2) + v0 => multiplies v0 by 5
+        self.state.set_vgpr(0, 20)
+        instr = VLshlAddU32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Literal32(2)),
+            src2=VOP3Operand(Reg(0, RegType.VGPR)),
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 100)
+        self.assertEqual(self.state.get_vgpr(0), 100)
+
+    def test_dst_aliases_all_operands(self) -> None:
+        # v0 = (v0 << v0) + v0 with v0 = 2 => (2 << 2) + 2 = 8 + 2 = 10
+        self.state.set_vgpr(0, 2)
+        instr = VLshlAddU32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(0, RegType.VGPR)),
+            src2=VOP3Operand(Reg(0, RegType.VGPR)),
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 10)
+        self.assertEqual(self.state.get_vgpr(0), 10)
+
+    def test_simd_multi_lane_aliasing(self) -> None:
+        simd = SIMDInterpreter()
+        state = SIMDState(num_lanes=64)
+        for lane in range(64):
+            state.set_vgpr(lane, 0, lane)
+            state.set_vgpr(lane, 1, 10)
+
+        # v0 = (v0 << 3) + v1 => (lane * 8) + 10
+        instr = VLshlAddU32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Literal32(3)),
+            src2=VOP3Operand(Reg(1, RegType.VGPR)),
+        )
+        simd.step(instr, state)
+        for lane in range(64):
+            expected = (lane * 8 + 10) & MASK32
+            self.assertEqual(state.get_vgpr(lane, 0), expected)
+            self.assertEqual(state.get_vgpr(lane, 1), 10)
+
+
+
 
 
 
