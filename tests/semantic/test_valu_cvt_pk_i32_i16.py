@@ -710,5 +710,98 @@ class TestValuCvtPkI32I16SIMD(unittest.TestCase):
                 self.assertEqual(v0, 0x0000_0001)
                 self.assertEqual(v1, 0xFFFF_8000)
 
+# ==============================================================================
+# Unit Tests: Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestValuCvtPkI32I16Aliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarVALUInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_dst_lo_aliases_src(self) -> None:
+        self.state.write_reg(Register(RegKind.VGPR, 0), 0xFFFF_0020)
+        self.state.write_reg(Register(RegKind.VGPR, 1), 0xDEAD_BEEF)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_I32_I16,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Register(RegKind.VGPR, 0),
+        )
+        self.interp.step(inst, self.state)
+        self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 0)), 0x0000_0020)
+        self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 1)), 0xFFFF_FFFF)
+
+    def test_dst_hi_aliases_src(self) -> None:
+        self.state.write_reg(Register(RegKind.VGPR, 0), 0xDEAD_BEEF)
+        self.state.write_reg(Register(RegKind.VGPR, 1), 0x8000_7FFF)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_I32_I16,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Register(RegKind.VGPR, 1),
+        )
+        self.interp.step(inst, self.state)
+        self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 0)), 0x0000_7FFF)
+        self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 1)), 0xFFFF_8000)
+
+    def test_dual_source_aliasing(self) -> None:
+        self.state.write_reg(Register(RegKind.VGPR, 0), 0xFFFF)
+        self.state.write_reg(Register(RegKind.VGPR, 1), 0x0005)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_I32_I16,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Register(RegKind.VGPR, 0),
+            src1=Register(RegKind.VGPR, 1),
+        )
+        self.interp.step(inst, self.state)
+        self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 0)), 0xFFFF_FFFF)
+        self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 1)), 0x0000_0005)
+
+    def test_dual_source_reversed_aliasing(self) -> None:
+        self.state.write_reg(Register(RegKind.VGPR, 0), 0xFFFF)
+        self.state.write_reg(Register(RegKind.VGPR, 1), 0x0005)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_I32_I16,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Register(RegKind.VGPR, 1),
+            src1=Register(RegKind.VGPR, 0),
+        )
+        self.interp.step(inst, self.state)
+        self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 0)), 0x0000_0005)
+        self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 1)), 0xFFFF_FFFF)
+
+    def test_simd_inplace_aliasing_divergent(self) -> None:
+        state = SIMDState(wave_size=32, exec_mask=0x0000_FFFF)
+        interp = SIMDWavefrontInterpreter(wave_size=32)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_I32_I16,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Register(RegKind.VGPR, 0),
+        )
+
+        for lane in range(32):
+            packed = (0xFFFF << 16) | (lane + 1)
+            state.write_lane_reg(lane, Register(RegKind.VGPR, 0), packed)
+            state.write_lane_reg(lane, Register(RegKind.VGPR, 1), 0xCAFE_BABE)
+
+        interp.step(inst, state)
+
+        for lane in range(32):
+            v0 = state.read_lane_reg(lane, Register(RegKind.VGPR, 0))
+            v1 = state.read_lane_reg(lane, Register(RegKind.VGPR, 1))
+            if lane < 16:
+                self.assertEqual(v0, lane + 1)
+                self.assertEqual(v1, 0xFFFF_FFFF)
+            else:
+                expected_unmodified_v0 = (0xFFFF << 16) | (lane + 1)
+                self.assertEqual(v0, expected_unmodified_v0)
+                self.assertEqual(v1, 0xCAFE_BABE)
+
 if __name__ == "__main__":
     unittest.main()
