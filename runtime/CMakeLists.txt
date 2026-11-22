@@ -115,6 +115,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/xgameruntime_gamesave.cpp
     shims/xgameruntime_store.cpp
     shims/xgameruntime_offline.cpp
+    shims/xaudio2.cpp
     shims/library_loader.cpp
     shims/process.cpp
   )
@@ -329,6 +330,18 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(xgameruntime_offline_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(xgameruntime_offline_test PRIVATE /OPT:NOREF)
   target_link_libraries(xgameruntime_offline_test PRIVATE gta6rt_xtaskqueue)
+
+  # Host XAudio2 factory forwarding for the console DLL names; creates no mastering voice or audio output.
+  add_executable(xaudio2_test
+    test/xaudio2_test.cpp
+    shims/xaudio2.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(xaudio2_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(xaudio2_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(xaudio2_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(xaudio2_test PRIVATE /OPT:NOREF)
+  add_test(NAME xaudio2 COMMAND xaudio2_test)
 
   # GameInput shim on SDL3 (zlib licence): any controller SDL supports, DualSense trigger effects and lightbar.
   # Nothing is downloaded unless asked. The shim is built when SDL3 is available:
