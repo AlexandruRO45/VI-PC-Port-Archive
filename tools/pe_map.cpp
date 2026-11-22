@@ -342,6 +342,21 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
         || dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > opt.SizeOfHeaders || table_end > opt.SizeOfHeaders
         || opt.SizeOfHeaders > opt.SizeOfImage || opt.SizeOfHeaders > raw.size())
         return fail(MAP_FORMAT, "section table outside headers");
+    // Section protections are applied per page, so a section that started inside a page shared with
+    // the headers or another section would change that page's protection as well. Windows refuses an
+    // alignment that is not a power of two and a section that does not start on it. An alignment
+    // below the page size, which Windows maps as one view when FileAlignment matches, is not modeled.
+    SYSTEM_INFO system{};
+    GetSystemInfo(&system);
+    if (opt.SectionAlignment & (opt.SectionAlignment - 1))
+        return fail(MAP_FORMAT, "section alignment %#lx is not a power of two", opt.SectionAlignment);
+    if (opt.SectionAlignment < system.dwPageSize)
+        return fail(MAP_UNSUPPORTED, "section alignment %#lx below the page size", opt.SectionAlignment);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        if (sections[i].VirtualAddress & (opt.SectionAlignment - 1))
+            return fail(MAP_FORMAT, "section %.8s not aligned to %#lx",
+                        reinterpret_cast<const char*>(sections[i].Name), opt.SectionAlignment);
+    }
 
     if (opt.AddressOfEntryPoint && !executable(nt, opt.AddressOfEntryPoint))
         return fail(MAP_FORMAT, "entry point outside executable section");
@@ -551,20 +566,10 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
         }
     }
 
-    // Record the actual base in the mapped headers, as the Windows loader does.
-    reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew)->OptionalHeader.ImageBase =
-        reinterpret_cast<std::uint64_t>(base);
-    DWORD old = 0;
-    if (!VirtualProtect(base, opt.SizeOfHeaders, PAGE_READONLY, &old))
-        return release(fail(MAP_PROTECT, "cannot protect headers"));
-    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
-        const auto& s = sections[i];
-        const DWORD span = s.Misc.VirtualSize ? s.Misc.VirtualSize : s.SizeOfRawData;
-        if (span && !VirtualProtect(base + s.VirtualAddress, span, protection(s.Characteristics), &old))
-            return release(fail(MAP_PROTECT, "cannot protect section %.8s", reinterpret_cast<const char*>(s.Name)));
-    }
-    FlushInstructionCache(GetCurrentProcess(), base, opt.SizeOfImage);
-
+    // Register .pdata while every page is still read/write. RtlAddFunctionTable reads the table to find
+    // its address range, and the section protections below may leave it unreadable: Windows maps an
+    // image whose exception directory lies in a section without IMAGE_SCN_MEM_READ and keeps that page
+    // PAGE_NOACCESS.
     const auto& pdata = directory(nt, IMAGE_DIRECTORY_ENTRY_EXCEPTION);
     if (pdata.Size) {
         auto* table = image.at<RUNTIME_FUNCTION>(pdata.VirtualAddress, pdata.Size / sizeof(RUNTIME_FUNCTION));
@@ -572,6 +577,27 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
                                            reinterpret_cast<DWORD64>(base)))
             return release(fail(MAP_FUNCTION_TABLE, "cannot register .pdata"));
     }
+    const auto unregister = [&] {
+        if (pdata.Size) RtlDeleteFunctionTable(image.at<RUNTIME_FUNCTION>(pdata.VirtualAddress));
+    };
+
+    // Record the actual base in the mapped headers, as the Windows loader does.
+    reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew)->OptionalHeader.ImageBase =
+        reinterpret_cast<std::uint64_t>(base);
+    DWORD old = 0;
+    if (!VirtualProtect(base, opt.SizeOfHeaders, PAGE_READONLY, &old)) {
+        unregister();
+        return release(fail(MAP_PROTECT, "cannot protect headers"));
+    }
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        const auto& s = sections[i];
+        const DWORD span = s.Misc.VirtualSize ? s.Misc.VirtualSize : s.SizeOfRawData;
+        if (span && !VirtualProtect(base + s.VirtualAddress, span, protection(s.Characteristics), &old)) {
+            unregister();
+            return release(fail(MAP_PROTECT, "cannot protect section %.8s", reinterpret_cast<const char*>(s.Name)));
+        }
+    }
+    FlushInstructionCache(GetCurrentProcess(), base, opt.SizeOfImage);
 
     std::vector<PIMAGE_TLS_CALLBACK> callbacks;
     const auto* mapped_nt = image.headers();
