@@ -845,5 +845,122 @@ class TestValuCvtPkI16I32SIMDDivergence(unittest.TestCase):
                 self.assertEqual(actual, 0x11111111)
 
 
+class TestValuCvtPkI16I32RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_alias_dst_equals_src0(self) -> None:
+        """v_cvt_pk_i16_i32 v0, v0, v1: D aliases with S0."""
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u32(RegKind.VGPR, 0, 40000)  # > 32767 -> sat to 0x7FFF
+        interp.write_reg_u32(RegKind.VGPR, 1, -50000) # < -32768 -> sat to 0x8000
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_I16_I32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 0),
+            src1=Register(RegKind.VGPR, 1),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, 0x80007FFF)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), 0x80007FFF)
+        # S1 (v1) remains unmodified
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 1), u32(-50000))
+
+    def test_alias_dst_equals_src1(self) -> None:
+        """v_cvt_pk_i16_i32 v0, v1, v0: D aliases with S1."""
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u32(RegKind.VGPR, 1, 100)    # S0 in-range -> 0x0064
+        interp.write_reg_u32(RegKind.VGPR, 0, -200)   # S1 in-range -> 0xFF38
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_I16_I32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+            src1=Register(RegKind.VGPR, 0),
+        )
+        res = interp.step(inst)
+        expected = ((s32(-200) & 0xFFFF) << 16) | (100 & 0xFFFF)
+        self.assertEqual(res, expected)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), expected)
+        # S0 (v1) remains unmodified
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 1), 100)
+
+    def test_alias_dst_equals_src0_and_src1(self) -> None:
+        """v_cvt_pk_i16_i32 v0, v0, v0: Full self-aliasing."""
+        interp = ScalarVALUInterpreter()
+        # 0x00010000 = 65536 in signed 32-bit integer -> saturates to 0x7FFF
+        interp.write_reg_u32(RegKind.VGPR, 0, 0x00010000)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_I16_I32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 0),
+            src1=Register(RegKind.VGPR, 0),
+        )
+        res = interp.step(inst)
+        # Both halves must saturate independently to 0x7FFF
+        self.assertEqual(res, 0x7FFF7FFF)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), 0x7FFF7FFF)
+
+    def test_duplicate_sources_distinct_destination(self) -> None:
+        """v_cvt_pk_i16_i32 v2, v0, v0: Duplicate source operands produce twin halfwords."""
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u32(RegKind.VGPR, 0, -32768)  # -> sat to 0x8000
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_I16_I32,
+            dst=Register(RegKind.VGPR, 2),
+            src0=Register(RegKind.VGPR, 0),
+            src1=Register(RegKind.VGPR, 0),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, 0x80008000)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 2), 0x80008000)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), u32(-32768))
+
+    def test_adjacent_register_preservation(self) -> None:
+        """Writes to target VGPR must not leak into adjacent register dwords."""
+        interp = ScalarVALUInterpreter()
+        canary_prev = 0xAAAA5555
+        canary_next = 0x5555AAAA
+        interp.write_reg_u32(RegKind.VGPR, 4, canary_prev)
+        interp.write_reg_u32(RegKind.VGPR, 6, canary_next)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_I16_I32,
+            dst=Register(RegKind.VGPR, 5),
+            src0=Immediate(1),
+            src1=Immediate(2),
+        )
+        interp.step(inst)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 4), canary_prev)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 6), canary_next)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 5), 0x00020001)
+
+    def test_simd_multi_lane_self_aliasing(self) -> None:
+        """In-place self-aliasing across divergent SIMD wavefront."""
+        simd = SIMDWavefrontInterpreter(wave_size=32)
+        simd.set_exec_mask(0x0000FFFF)  # Low 16 lanes active
+
+        for lane in range(32):
+            # Give each lane a value that exceeds 32767
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 0, 50000 + lane)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_I16_I32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 0),
+            src1=Register(RegKind.VGPR, 0),
+        )
+        simd.step(inst)
+
+        for lane in range(32):
+            actual = simd.read_lane_reg_u32(lane, RegKind.VGPR, 0)
+            if lane < 16:
+                self.assertEqual(actual, 0x7FFF7FFF)
+            else:
+                self.assertEqual(actual, 50000 + lane)
+
+
 if __name__ == "__main__":
     unittest.main()
