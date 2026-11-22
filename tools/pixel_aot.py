@@ -325,6 +325,9 @@ ALU = {
     "mul_legacy": (2, "(({0} == 0 || {1} == 0) ? 0.0f : {0} * {1})"),
     "fma": (3, "mad({0}, {1}, {2})"), "fmac": (3, "mad({0}, {1}, {2})"),
     "mad": (3, "mad32({0}, {1}, {2})"), "mac": (3, "mad32({0}, {1}, {2})"),
+    # Each result is one of the operands, so finite inputs need no rounding.
+    "min3": (3, "min(min({0}, {1}), {2})"), "max3": (3, "max(max({0}, {1}), {2})"),
+    "med3": (3, "max(min({0}, {1}), min(max({0}, {1}), {2}))"),
 }
 # N-prefixed predicates include unordered operands. Keep NLG's NaN case explicit in DXIL.
 COMPARE = {
@@ -772,7 +775,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             value = fp_operand(src, scalar, vector, pending, sample_pending)
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {value};")
-        elif m := match(r"v_(log|exp|rcp|sqrt|rsq|floor|ceil|fract|trunc|frexp_mant|add|mul|max|min|sub|subrev|mul_legacy|fma|fmac|mad|mac)_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
+        elif m := match(r"v_(log|exp|rcp|sqrt|rsq|floor|ceil|fract|trunc|frexp_mant|add|mul|max|min|sub|subrev|mul_legacy|fma|fmac|mad|mac|min3|max3|med3)_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
             op, dst, operands, clamp = m.groups()
             tokens = operands.split(", ")
             if op in ("fmac", "mac"):
