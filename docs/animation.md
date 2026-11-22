@@ -651,10 +651,10 @@ A `.motionmatcher` object has fields up to `+0x18F`; they are in the object tabl
   sample count equals the last `+0x68` offset on 180 of 180 (36,436 samples), so record i owns the rows from
   offset i to offset i+1, and the column count is the features' total on 180 of 180. Two layouts, told apart by
   the feature object's `+0x30` object (149 with it, 31 without):
-  - **Rows** (149): row-major, each row padded with zero columns to a multiple of 16 (`+0x100` chunks of 16).
+  - **Rows** (149): row-major, each row padded with zero columns to the next multiple of 16 (`+0x100` chunks of 16).
   - **Blocks of 8** (31): 8 samples at a time, column-major inside a block, so column c of sample r is at
-    `(r // 8) · D' · 8 + c · 8 + r mod 8`, with D' the column count rounded up to even. The lanes after the last
-    sample repeat it.
+    `(r // 8) · D' · 8 + c · 8 + r mod 8`, with D' the column count rounded up to even (the spare column is zero).
+    The lanes after the last sample repeat it.
 
   The sizes fit these layouts on 180 of 180 (`parse_matcher` refuses one that doesn't), every value is finite and
   the padding is as described on 180 of 180. On the 149 with rows, `+0xA8` has one 48-byte item per sample: a
@@ -667,7 +667,7 @@ A `.motionmatcher` object has fields up to `+0x18F`; they are in the object tabl
   bytes with six pointers in the examples looked at, measured separately) and its `+0x30` object (on 149), the one 0x28-byte item at `+0x48` of the matcher, the one-item arrays at `+0x118` and
   `+0x128`, the second word of a clip table slot, the features' `+0x0E` and `+0x1C`, how the table hashes are made,
   what the pose columns mean beyond their feature (and any normalisation), and the feature object's `+0x98`
-  (one u32 per sample), `+0xB8` and `+0xC0`.
+  (one u32 per sample on the 149 with rows, measured separately), `+0xB8` and `+0xC0`.
 
 ### Other archives
 

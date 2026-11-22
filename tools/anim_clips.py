@@ -273,10 +273,10 @@ def matcher_features(s, at):
 def matcher_poses(s, obj, columns, rows_layout):
     """The pose matrix of a `.motionmatcher`: one row of f16 feature values per sample, at the feature object's
     `+0xF0` (pointer) with its count of 32-byte chunks at `+0xEC`. Two layouts, told apart by the `+0x30` object:
-    with it, row-major, `+0xF8` samples, `+0xFC` columns, `+0x100` chunks per row (a row padded to 16 columns with
-    zeros); without it, blocks of 8 samples, column-major inside a block (column c of sample r at
+    with it, row-major, `+0xF8` samples, `+0xFC` columns, `+0x100` chunks per row (the fewest that hold the columns;
+    the rest of a row is zero); without it, blocks of 8 samples, column-major inside a block (column c of sample r at
     `(r // 8) * D' * 8 + c * 8 + r % 8`, D' = columns rounded up to even), the samples at `+0x128`, and the lanes
-    after the last sample copy it. With rows, `+0xA8` holds one 48-byte `{f32 quaternion[4]; f32 vec3; f32 0; f32
+    after the last sample copy it (and an odd column count's spare column is zero). With rows, `+0xA8` holds one 48-byte `{f32 quaternion[4]; f32 vec3; f32 0; f32
     1, 1, 1; f32 0}` per sample (count at `+0xA4`). -> {"poses": {...}, "pose_transforms": [...]}"""
     chunks, data = s.u32(obj + 0xEC), s.ptr(obj + 0xF0)
     if data is None:
@@ -284,23 +284,29 @@ def matcher_poses(s, obj, columns, rows_layout):
     if rows_layout:
         samples, cols, per_row = s.u32(obj + 0xF8), s.u32(obj + 0xFC), s.u32(obj + 0x100)
         stride, layout = 16 * per_row, "rows"
-        if cols != columns or chunks != samples * per_row or stride < cols:
+        if not samples or cols != columns or per_row != -(-cols // 16) or chunks != samples * per_row:
             raise DecodeError("motionmatcher pose matrix size does not fit its rows")
     else:
         samples, cols = s.u32(obj + 0x128), s.u32(obj + 0xFC)
         stride, layout = cols + (cols & 1), "blocks of 8"
-        if cols != columns or 16 * chunks != -(-samples // 8) * 8 * stride:
+        if not samples or cols != columns or 16 * chunks != -(-samples // 8) * 8 * stride:
             raise DecodeError("motionmatcher pose matrix size does not fit its blocks")
+    if data + 32 * chunks > len(s.d):
+        raise DecodeError("motionmatcher pose matrix runs past the pages")
     h = struct.unpack_from(f"<{16 * chunks}e", s.d, data)
     if layout == "rows":
         padding = all(h[r * stride + c] == 0 for r in range(samples) for c in range(cols, stride))
     else:
         last, base = samples - 1, (samples - 1) // 8 * stride * 8
-        padding = samples > 0 and all(h[base + c * 8 + lane] == h[base + c * 8 + last % 8]
-                                      for c in range(cols) for lane in range(last % 8 + 1, 8))
+        padding = all(h[base + c * 8 + lane] == h[base + c * 8 + last % 8]
+                      for c in range(cols) for lane in range(last % 8 + 1, 8)) and all(
+            h[b * stride * 8 + c * 8 + lane] == 0 for b in range(-(-samples // 8)) for c in range(cols, stride)
+            for lane in range(8))
     transforms = []
     if rows_layout:
         tr, nt = matcher_array(s, obj + 0xA8)
+        if nt and tr + 48 * nt > len(s.d):
+            raise DecodeError("motionmatcher pose transforms run past the pages")
         transforms = [struct.unpack_from("<12f", s.d, tr + 48 * i) for i in range(nt)]
     poses = {"layout": layout, "samples": samples, "columns": cols, "stride": stride, "at": data,
              "finite": all(map(math.isfinite, h)), "padding": padding}

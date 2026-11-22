@@ -491,9 +491,23 @@ class DecodeTest(unittest.TestCase):
         last = s.ptr(obj + 0xF0) + 2 * (1 * 10 * 8 + 0 * 8 + 7)                    # column 0, last lane
         struct.pack_into("<e", s.d, last, 99.0)                                     # padding that doesn't copy
         self.assertFalse(anim_clips.parse_matcher(s, at)["poses"]["padding"])
-        struct.pack_into("<I", s.d, obj + 0x128, 17)                                # 17 samples need 3 blocks
-        with self.assertRaises(anim_clips.DecodeError):
-            anim_clips.parse_matcher(s, at)
+        struct.pack_into("<e", s.d, last, pose_value(8, 0))                         # restored
+        spare = s.ptr(obj + 0xF0) + 2 * (9 * 8 + 3)                                 # the spare 10th column
+        struct.pack_into("<e", s.d, spare, 1.0)
+        self.assertFalse(anim_clips.parse_matcher(s, at)["poses"]["padding"])
+        struct.pack_into("<e", s.d, spare, 0.0)
+        self.assertTrue(anim_clips.parse_matcher(s, at)["poses"]["padding"])
+        for field, value in ((obj + 0x128, 17),                                     # 17 samples need 3 blocks
+                             (obj + 0x128, 0),                                      # no samples
+                             (obj + 0xFC, 8),                                       # not the features' columns
+                             (obj + 0xF0, 0x50000000 + len(s.d) - 64)):            # past the pages
+            fmt = "<Q" if field == obj + 0xF0 else "<I"
+            kept = struct.unpack_from(fmt, s.d, field)[0]
+            struct.pack_into(fmt, s.d, field, value)
+            with self.assertRaises(anim_clips.DecodeError, msg=hex(field - obj)):
+                anim_clips.parse_matcher(s, at)
+            struct.pack_into(fmt, s.d, field, kept)
+        anim_clips.parse_matcher(s, at)
 
     def test_motionmatcher_pose_rows_that_do_not_fit(self):
         s = anim_clips.System(bytearray(two_sequence_dictionary()))
@@ -501,15 +515,21 @@ class DecodeTest(unittest.TestCase):
         obj = s.ptr(at + 0x20)
         struct.pack_into("<e", s.d, s.ptr(obj + 0xF0) + 2 * 12, 1.0)                # a padding column not 0
         self.assertFalse(anim_clips.parse_matcher(s, at)["poses"]["padding"])
-        for field, value in ((obj + 0xFC, 8), (obj + 0xF8, 10), (obj + 0xF0, 0)):  # columns, samples, no data
-            kept = s.u64(field) if field == obj + 0xF0 else s.u32(field)
-            if field == obj + 0xF0:
-                struct.pack_into("<Q", s.d, field, value)
-            else:
-                struct.pack_into("<I", s.d, field, value)
-            with self.assertRaises(anim_clips.DecodeError, msg=hex(field - obj)):
+        struct.pack_into("<e", s.d, s.ptr(obj + 0xF0) + 2 * 12, 0.0)
+        for writes in ([(obj + 0xFC, "<I", 8)],                                     # not the features' columns
+                       [(obj + 0xF8, "<I", 10)],                                    # chunks don't fit 10 samples
+                       [(obj + 0xF8, "<I", 0), (obj + 0xEC, "<I", 0)],             # no samples
+                       [(obj + 0x100, "<I", 2), (obj + 0xEC, "<I", 18)],           # wider rows than needed
+                       [(obj + 0xF0, "<Q", 0)],                                     # no data
+                       [(obj + 0xF0, "<Q", 0x50000000 + len(s.d) - 64)],           # matrix past the pages
+                       [(obj + 0xA4, "<I", len(s.d))]):                             # transforms past the pages
+            kept = [(f, fmt, struct.unpack_from(fmt, s.d, f)[0]) for f, fmt, _v in writes]
+            for f, fmt, v in writes:
+                struct.pack_into(fmt, s.d, f, v)
+            with self.assertRaises(anim_clips.DecodeError, msg=repr(writes)):
                 anim_clips.parse_matcher(s, at)
-            struct.pack_into("<Q" if field == obj + 0xF0 else "<I", s.d, field, kept)
+            for f, fmt, v in kept:
+                struct.pack_into(fmt, s.d, f, v)
         anim_clips.parse_matcher(s, at)
 
     def test_motionmatcher_without_refs_and_with_a_bad_table(self):
