@@ -1315,5 +1315,143 @@ class TestDivScaleF64SIMDMultiLane(unittest.TestCase):
         self.assertEqual(wave.exec_hi, 0x9ABCDEF0)
 
 
+class TestDivScaleF64RegisterAliasing(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def test_dst_alias_src0_in_place(self):
+        rf = ScalarRegisterFile()
+        interp = DivScaleF64ScalarInterpreter(rf)
+
+        one5 = 0x3FF0000000000005
+        big = 0x71F0000000000000
+
+        # v[0:1] holds s0 (one5), v[2:3] holds s1 (one5), v[4:5] holds s2 (big)
+        rf.write_vgpr_pair_u64(0, one5)
+        rf.write_vgpr_pair_u64(2, one5)
+        rf.write_vgpr_pair_u64(4, big)
+
+        # In-place scaling of v[0:1]
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F64,
+            dst=ASTOperand.vgpr(0),
+            sdst=ASTOperand.vcc(),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(4),
+        )
+        d_res, vcc_res = interp.step(inst)
+        self.assertEqual(vcc_res, 1)
+        self.assertEqual(rf.read_vgpr_pair_u64(0), d_res)
+        self.assertEqual(rf.read_vgpr(0), 0x00000005)
+        self.assertEqual(rf.read_vgpr(1), 0x47F00000)
+
+        # src1 and src2 must be strictly preserved
+        self.assertEqual(rf.read_vgpr_pair_u64(2), one5)
+        self.assertEqual(rf.read_vgpr_pair_u64(4), big)
+
+    def test_dst_alias_src1_denominator(self):
+        rf = ScalarRegisterFile()
+        interp = DivScaleF64ScalarInterpreter(rf)
+
+        one5 = 0x3FF0000000000005
+        big = 0x71F0000000000000
+
+        rf.write_vgpr_pair_u64(0, one5)  # dst and src1
+        rf.write_vgpr_pair_u64(2, one5)  # src0
+        rf.write_vgpr_pair_u64(4, big)   # src2
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F64,
+            dst=ASTOperand.vgpr(0),
+            sdst=ASTOperand.vcc(),
+            src0=ASTOperand.vgpr(2),
+            src1=ASTOperand.vgpr(0),
+            src2=ASTOperand.vgpr(4),
+        )
+        d_res, vcc_res = interp.step(inst)
+        self.assertEqual(vcc_res, 1)
+        self.assertEqual(rf.read_vgpr_pair_u64(0), d_res)
+        self.assertEqual(rf.read_vgpr_pair_u64(2), one5)
+        self.assertEqual(rf.read_vgpr_pair_u64(4), big)
+
+    def test_dst_alias_src2_numerator(self):
+        rf = ScalarRegisterFile()
+        interp = DivScaleF64ScalarInterpreter(rf)
+
+        one5 = 0x3FF0000000000005
+        big = 0x71F0000000000000
+
+        rf.write_vgpr_pair_u64(0, big)   # dst and src2
+        rf.write_vgpr_pair_u64(2, one5)  # src0
+        rf.write_vgpr_pair_u64(4, one5)  # src1
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F64,
+            dst=ASTOperand.vgpr(0),
+            sdst=ASTOperand.vcc(),
+            src0=ASTOperand.vgpr(2),
+            src1=ASTOperand.vgpr(4),
+            src2=ASTOperand.vgpr(0),
+        )
+        d_res, vcc_res = interp.step(inst)
+        self.assertEqual(vcc_res, 1)
+        self.assertEqual(rf.read_vgpr_pair_u64(0), d_res)
+        self.assertEqual(rf.read_vgpr_pair_u64(2), one5)
+        self.assertEqual(rf.read_vgpr_pair_u64(4), one5)
+
+    def test_all_operands_fully_aliased(self):
+        rf = ScalarRegisterFile()
+        interp = DivScaleF64ScalarInterpreter(rf)
+
+        normal = 0x3FF0000000000000  # 1.0
+        rf.write_vgpr_pair_u64(0, normal)
+
+        # v_div_scale_f64 v[0:1], vcc, v[0:1], v[0:1], v[0:1]
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F64,
+            dst=ASTOperand.vgpr(0),
+            sdst=ASTOperand.vcc(),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(0),
+            src2=ASTOperand.vgpr(0),
+        )
+        d_res, vcc_res = interp.step(inst)
+        self.assertEqual(vcc_res, 0)
+        self.assertEqual(d_res, normal)
+        self.assertEqual(rf.read_vgpr_pair_u64(0), normal)
+
+    def test_unrelated_registers_strictly_preserved(self):
+        rf = ScalarRegisterFile()
+        interp = DivScaleF64ScalarInterpreter(rf)
+
+        sentinel = 0xDEADBEEF
+        for i in range(16):
+            rf.write_vgpr(i, sentinel)
+
+        one5 = 0x3FF0000000000005
+        big = 0x71F0000000000000
+        rf.write_vgpr_pair_u64(2, one5)
+        rf.write_vgpr_pair_u64(4, one5)
+        rf.write_vgpr_pair_u64(6, big)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F64,
+            dst=ASTOperand.vgpr(0),
+            sdst=ASTOperand.vcc(),
+            src0=ASTOperand.vgpr(2),
+            src1=ASTOperand.vgpr(4),
+            src2=ASTOperand.vgpr(6),
+        )
+        interp.step(inst)
+
+        # v[0:1] updated
+        self.assertEqual(rf.read_vgpr(0), 0x00000005)
+        self.assertEqual(rf.read_vgpr(1), 0x47F00000)
+
+        # v[8..15] must still be sentinel
+        for i in range(8, 16):
+            self.assertEqual(rf.read_vgpr(i), sentinel)
+
+
 if __name__ == "__main__":
     unittest.main()
