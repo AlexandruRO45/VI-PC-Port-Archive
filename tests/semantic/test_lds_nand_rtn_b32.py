@@ -1122,5 +1122,155 @@ class TestRegisterAliasingAndPreservation(unittest.TestCase):
             self.assertEqual(state.lds.read_dword(addr), 0xFFFFFFFF)
 
 
+# ==============================================================================
+# Phase 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class AtomicBitwiseFlags:
+    """Architectural condition codes, status flags, and arithmetic analysis for ds_nand_rtn_b32."""
+    zero: bool
+    negative: bool
+    old_zero: bool
+    old_negative: bool
+    parity_even: bool
+    popcount: int
+    changed: bool
+    unaligned_addr: bool
+    bank: int
+    carry_or_sum: bool
+    borrow: bool
+
+
+def evaluate_ds_nand_flags(
+    old_val: int,
+    nand_val: int,
+    new_mem: int,
+    eff_addr: int,
+) -> AtomicBitwiseFlags:
+    """Evaluate condition codes, bitwise status flags, and arithmetic carry/borrow metrics."""
+    u_old = old_val & MASK_32
+    u_nand = nand_val & MASK_32
+    u_new = new_mem & MASK_32
+
+    zero = (u_new == 0)
+    negative = bool(u_new & 0x8000_0000)
+    old_zero = (u_old == 0)
+    old_negative = bool(u_old & 0x8000_0000)
+
+    popcount = bin(u_new).count("1")
+    parity_even = (popcount % 2 == 0)
+    changed = (u_new != u_old)
+
+    unaligned = bool(eff_addr & 0x3)
+    bank = calc_lds_bank(eff_addr)
+
+    carry_or_sum = ((u_old + u_nand) > MASK_32)
+    borrow = (u_old < u_nand)
+
+    return AtomicBitwiseFlags(
+        zero=zero,
+        negative=negative,
+        old_zero=old_zero,
+        old_negative=old_negative,
+        parity_even=parity_even,
+        popcount=popcount,
+        changed=changed,
+        unaligned_addr=unaligned,
+        bank=bank,
+        carry_or_sum=carry_or_sum,
+        borrow=borrow,
+    )
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Phase 6: Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def test_flags_zero_result(self) -> None:
+        # Both 0xFFFFFFFF -> ~(0xFFFFFFFF & 0xFFFFFFFF) = 0!
+        flags = evaluate_ds_nand_flags(
+            old_val=0xFFFF_FFFF,
+            nand_val=0xFFFF_FFFF,
+            new_mem=0,
+            eff_addr=0x100,
+        )
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertFalse(flags.old_zero)
+        self.assertTrue(flags.old_negative)
+        self.assertTrue(flags.parity_even)
+        self.assertEqual(flags.popcount, 0)
+        self.assertTrue(flags.changed)
+        self.assertFalse(flags.unaligned_addr)
+        self.assertEqual(flags.bank, (0x100 >> 2) & 31)
+
+    def test_flags_negative_msb_set(self) -> None:
+        flags = evaluate_ds_nand_flags(
+            old_val=0,
+            nand_val=0,
+            new_mem=0xFFFF_FFFF,
+            eff_addr=0x200,
+        )
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.negative)
+        self.assertTrue(flags.old_zero)
+        self.assertFalse(flags.old_negative)
+        self.assertEqual(flags.popcount, 32)
+        self.assertTrue(flags.parity_even)
+        self.assertTrue(flags.changed)
+
+    def test_flags_old_zero_and_negative(self) -> None:
+        flags = evaluate_ds_nand_flags(
+            old_val=0x8000_0000,
+            nand_val=0x8000_0000,
+            new_mem=0x7FFF_FFFF,
+            eff_addr=0x300,
+        )
+        self.assertFalse(flags.old_zero)
+        self.assertTrue(flags.old_negative)
+        self.assertFalse(flags.negative)
+        self.assertTrue(flags.changed)
+
+    def test_flags_parity_and_popcount(self) -> None:
+        flags_odd = evaluate_ds_nand_flags(0, 0, 0b111, eff_addr=0x400)
+        self.assertEqual(flags_odd.popcount, 3)
+        self.assertFalse(flags_odd.parity_even)
+
+        flags_even = evaluate_ds_nand_flags(0, 0, 0b1111, eff_addr=0x400)
+        self.assertEqual(flags_even.popcount, 4)
+        self.assertTrue(flags_even.parity_even)
+
+    def test_flags_unaligned_address_detection(self) -> None:
+        flags_aligned = evaluate_ds_nand_flags(0, 0, 0, eff_addr=0x1000)
+        self.assertFalse(flags_aligned.unaligned_addr)
+
+        for byte_off in (1, 2, 3):
+            flags_unaligned = evaluate_ds_nand_flags(0, 0, 0, eff_addr=0x1000 + byte_off)
+            self.assertTrue(flags_unaligned.unaligned_addr)
+
+    def test_flags_bank_selection(self) -> None:
+        for bank_idx in range(32):
+            addr = bank_idx * 4
+            flags = evaluate_ds_nand_flags(0, 0, 0, eff_addr=addr)
+            self.assertEqual(flags.bank, bank_idx)
+
+    def test_flags_carry_and_borrow_metrics(self) -> None:
+        flags_carry = evaluate_ds_nand_flags(
+            old_val=0xFFFF_FFFF,
+            nand_val=0x0000_0001,
+            new_mem=0,
+            eff_addr=0x600,
+        )
+        self.assertTrue(flags_carry.carry_or_sum)
+
+        flags_borrow = evaluate_ds_nand_flags(
+            old_val=10,
+            nand_val=20,
+            new_mem=0,
+            eff_addr=0x600,
+        )
+        self.assertTrue(flags_borrow.borrow)
+
+
 if __name__ == "__main__":
     unittest.main()
