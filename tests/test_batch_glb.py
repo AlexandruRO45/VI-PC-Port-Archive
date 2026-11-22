@@ -143,7 +143,12 @@ class TestBatchGlb(unittest.TestCase):
             (tex_dir / "panel.png").write_bytes(blue_png)
 
             stats = batch_glb.batch_convert(str(in_dir), str(out_dir), texture_dir=str(tex_dir), jobs=1)
-            self.assertEqual(stats, {"total": 1, "succeeded": 1, "failed": 0})
+            self.assertEqual(
+                {k: stats[k] for k in ("total", "succeeded", "failed")},
+                {"total": 1, "succeeded": 1, "failed": 0},
+            )
+            self.assertEqual(stats["failures"], [])          # every model converted, nothing was dropped
+            self.assertEqual(stats["dropped_textures"], [])
             glb = (out_dir / "panel.detail.glb").read_bytes()
             json_size, = struct.unpack_from("<I", glb, 12)
             gltf = json.loads(glb[20:20 + json_size])
