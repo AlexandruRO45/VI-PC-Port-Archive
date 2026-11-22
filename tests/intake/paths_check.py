@@ -1,11 +1,14 @@
 """Conditional routes must not overrule an ordinary import path or apply to unknown binaries."""
 
 from pathlib import Path
+import struct
 import sys
+
+import pefile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 from dependency_paths import FFX_EXPORTS, FFX_LOADER, trace
-from pe_inventory import resolve_desktop
+from pe_inventory import import_tables, resolve_desktop
 
 
 def check_desktop_forwarders():
@@ -41,6 +44,30 @@ def check_desktop_forwarders():
     assert contract["status"] == "provider_not_found" and contract["chain"][-1]["provider"] == "absent.dll"
     twin = resolve_desktop("twin.dll", "Value", "entry.exe", contracts, tables.get, package.get)
     assert twin["status"] == "ambiguous_package_basename" and twin["chain"][-1]["provider"] is None
+
+    # A KnownDLL name maps from System32 before the application directory, also at a forwarder hop.
+    tables["known.dll"] = {"Value": None}
+    package.update({"known.dll": (["bin/known.dll"], {"Value": None, "Extra": None}),
+                    "relay.dll": (["bin/relay.dll"], {"Value": "KNOWN.Value", "Extra": "known.Extra"})})
+    known = {"known.dll"}
+
+    def packaged(dll, name, known_dlls=known):
+        return resolve_desktop(dll, name, "entry.exe", contracts, tables.get,
+                               lambda module: package.get(module, ((), None)), known_dlls)
+
+    assert packaged("known.dll", "Extra", ())["chain"][0]["provider"] == "bin/known.dll"
+    system = packaged("known.dll", "Value")
+    assert system["status"] == "export_present"
+    assert system["chain"] == [dict(dll="known.dll", provider="known.dll", symbol="Value", package=False,
+                                    known_dll=True)]
+    assert packaged("known.dll", "Extra")["status"] == "export_not_found"
+    hop = packaged("relay.dll", "Extra")
+    assert hop["status"] == "export_not_found"
+    assert [(s["provider"], s["package"], s.get("known_dll")) for s in hop["chain"]] == [
+        ("bin/relay.dll", True, None), ("known.dll", False, True)]
+    assert packaged("relay.dll", "Value")["chain"][-1]["provider"] == "known.dll"
+    # API-set contracts keep their own route even if a schema host name is also a KnownDLL.
+    assert "known_dll" not in packaged("api-ms-fixture-l1-1-0.dll", "#77", {"absent.dll"})["chain"][0]
 
     row = dict(image="entry.exe", kind="normal", dll="front.dll", symbol="Broken",
                bundle_exports_in=[], desktop_export="export_present", desktop_resolution=broken)
@@ -93,6 +120,43 @@ def check_desktop_forwarders():
     assert report["reachable"]["bin/mid.dll"]["reasons"] == ("normal", "forwarder")
     assert problems["Twin"] == ("ambiguous_package_basename", relayed_twin["chain"])
 
+    inventory["imports"] = [row]
+    # A package copy of a KnownDLL is not loaded. The System32 result decides the edge.
+    inventory["images"]["known.dll"] = {"sha256": "fixture", "exports": [{"name": "Extra"}]}
+    missing = packaged("known.dll", "Extra")
+    row.update(dll="known.dll", symbol="Extra", bundle_exports_in=["known.dll"], desktop_export="export_not_found",
+               desktop_resolution=resolve("known.dll", "Extra"), package_resolution=missing)
+    report = trace(inventory, "entry.exe")
+    assert "known.dll" in report["unlinked_in_this_graph"]
+    finding, = report["findings"]
+    assert finding["problem"] == "export_not_found" and finding["candidates"] == []
+    assert finding["desktop_chain"] == [dict(dll="known.dll", provider="known.dll", symbol="Extra")]
+    row.update(symbol="Value", desktop_export="export_present", desktop_resolution=resolve("known.dll", "Value"),
+               package_resolution=packaged("known.dll", "Value"))
+    report = trace(inventory, "entry.exe")
+    assert not report["findings"] and "known.dll" in report["unlinked_in_this_graph"]
+
+    # A forwarder in the System32 copy of a known DLL can name a packaged module. That module is loaded,
+    # and the package chain's terminal status decides the edge, not the first hop's System32 table.
+    tables["known.dll"].update({"Fwd": "target.Fwd", "Gap": "target.Gap"})
+    tables["target.dll"] = {"Fwd": None, "Gap": None}
+    package["target.dll"] = (["bin/target.dll"], {"Fwd": None})
+    forward, gap = packaged("known.dll", "Fwd"), packaged("known.dll", "Gap")
+    assert forward["status"] == "export_present" and gap["status"] == "export_not_found"
+    assert [(s["provider"], s["package"]) for s in forward["chain"]] == [("known.dll", False), ("bin/target.dll", True)]
+    assert resolve_desktop("known.dll", "Gap", "entry.exe", contracts, tables.get)["status"] == "export_present"
+    inventory["images"]["bin/target.dll"] = {"sha256": "fixture", "exports": [{"name": "Fwd"}]}
+    row.update(symbol="Fwd", desktop_export="export_present", desktop_resolution=resolve("known.dll", "Fwd"),
+               package_resolution=forward)
+    report = trace(inventory, "entry.exe")
+    assert not report["findings"] and "known.dll" in report["unlinked_in_this_graph"]
+    assert report["reachable"]["bin/target.dll"]["path"] == ("entry.exe", "bin/target.dll")
+    assert report["reachable"]["bin/target.dll"]["reasons"] == ("forwarder",)
+    row.update(symbol="Gap", desktop_resolution=resolve("known.dll", "Gap"), package_resolution=gap)
+    report = trace(inventory, "entry.exe")
+    finding, = report["findings"]
+    assert finding["problem"] == "export_not_found" and finding["package_chain"] == gap["chain"]
+    assert "bin/target.dll" in report["reachable"]
 
 def main():
     loader = "amd_fidelityfx_loader_xbox.dll"
@@ -124,6 +188,55 @@ def main():
     assert "ffx:0x10000" not in unknown["reachable"][upscaler]["reasons"]
 
 
+def check_pe32plus_import_reserved_bits():
+    """Reject PE32+ by-name import thunks with reserved bits 62-31 set."""
+    def build_pe(thunk_val):
+        pe_offset = 0x80
+        section_rva = 0x1000
+        raw_offset = 0x200
+        raw_size = 0x200
+        buf = bytearray(raw_offset + raw_size)
+        buf[0:2] = b"MZ"
+        struct.pack_into("<I", buf, 60, pe_offset)
+        buf[pe_offset:pe_offset + 4] = b"PE\0\0"
+        struct.pack_into("<HHIIIHH", buf, pe_offset + 4, 0x8664, 1, 0, 0, 0, 240, 0x2022)
+        opt = pe_offset + 24
+        struct.pack_into("<HBBIIIIIQIIHHHHHHIIIIHHQQQQII", buf, opt,
+                         0x20B, 0, 0, 0, raw_size, 0, 0, section_rva, 0x180000000,
+                         0x1000, 0x200, 6, 0, 0, 0, 6, 0, 0, 0x2000, raw_offset,
+                         0, 3, 0, 0, 0, 0, 0, 0, 16)
+        sec = opt + 240
+        struct.pack_into("<8sIIIIIIHHI", buf, sec,
+                         b".rdata\0\0", 0x200, section_rva, raw_size, raw_offset,
+                         0, 0, 0, 0, 0x40000040)
+        struct.pack_into("<II", buf, opt + 112 + 8, section_rva, 40)
+        struct.pack_into("<5I", buf, raw_offset, section_rva + 0x30, 0, 0, section_rva + 0x50, 0)
+        struct.pack_into("<QQ", buf, raw_offset + 0x30, thunk_val, 0)
+        module_name = b"provider.dll\0"
+        buf[raw_offset + 0x50:raw_offset + 0x50 + len(module_name)] = module_name
+        struct.pack_into("<H", buf, raw_offset + 0x70, 0)
+        func_name = b"test_func\0"
+        buf[raw_offset + 0x72:raw_offset + 0x72 + len(func_name)] = func_name
+        assert len(buf) == raw_offset + raw_size
+        return bytes(buf)
+
+    valid_pe = build_pe(0x1070)
+    with pefile.PE(data=valid_pe, fast_load=True) as pe:
+        rows = import_tables(pe, "synthetic.exe")
+    assert rows == [("normal", "provider.dll", "test_func")]
+
+    for bad_thunk in (0x1070 | (1 << 31), 0x1070 | (1 << 40), 0x1070 | (1 << 62)):
+        invalid_pe = build_pe(bad_thunk)
+        with pefile.PE(data=invalid_pe, fast_load=True) as pe:
+            try:
+                import_tables(pe, "synthetic.exe")
+            except ValueError as error:
+                assert "Reserved bits set in PE32+ import thunk" in str(error)
+            else:
+                raise AssertionError(f"import_tables accepted reserved bits in thunk {bad_thunk:#x}")
+
+
 if __name__ == "__main__":
     check_desktop_forwarders()
+    check_pe32plus_import_reserved_bits()
     main()
