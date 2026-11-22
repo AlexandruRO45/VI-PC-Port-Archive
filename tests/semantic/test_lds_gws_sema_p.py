@@ -458,6 +458,41 @@ class SIMDGWSInterpreter:
             return False, 0, True
 
 
+# ============================================================================
+# Commit 6: Condition codes, status flags, and carry/borrow generation
+# ============================================================================
+
+
+@dataclass(frozen=True)
+class GWSStatusFlags:
+    """Architectural condition codes and hardware status flags for GWS operations."""
+    zero_flag: bool = False
+    negative_flag: bool = False
+    borrow_flag: bool = False
+    halt_flag: bool = False
+    gws_pending: bool = False
+
+    @classmethod
+    def compute(cls, acquired: bool, counter_val: int, blocked: bool) -> GWSStatusFlags:
+        """Derive hardware condition codes from GWS operation result."""
+        # Zero flag is set when counter was decremented to 0
+        zero = acquired and (counter_val == 0)
+        # Negative flag is always False: GWS counters are unsigned and never wrap negative
+        negative = False
+        # Borrow flag: prevented because counter never underflows below 0
+        borrow = False
+        # Halt and pending flags are set when wavefront blocks on zero counter
+        halt = blocked
+        pending = blocked
+        return cls(
+            zero_flag=zero,
+            negative_flag=negative,
+            borrow_flag=borrow,
+            halt_flag=halt,
+            gws_pending=pending,
+        )
+
+
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Commit 1: Reference mathematical oracle and architectural model for ds_gws_sema_p."""
 
@@ -935,6 +970,98 @@ class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
             self.assertEqual(state.m0, rid)
             self.assertEqual(state.get_sgpr(10), 0xDEADBEEF)
             self.assertEqual(state.get_vgpr(20), 0xBEEFBEEF)
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Commit 6: Condition codes, status flags, and carry/borrow generation for ds_gws_sema_p."""
+
+    def setUp(self) -> None:
+        self.gws = GWSSubsystem()
+        self.interp = ScalarGWSInterpreter()
+
+    def test_zero_flag_set_on_counter_exhaustion(self) -> None:
+        rid = 5
+        self.gws.init_resource(rid, init_val=1)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=0, gds=True)
+
+        acquired, val, blocked = self.interp.execute(state, inst)
+        flags = GWSStatusFlags.compute(acquired, val, blocked)
+
+        self.assertTrue(flags.zero_flag)
+        self.assertFalse(flags.negative_flag)
+        self.assertFalse(flags.borrow_flag)
+        self.assertFalse(flags.halt_flag)
+        self.assertFalse(flags.gws_pending)
+        self.assertEqual(state.scc, 0)
+
+    def test_zero_flag_clear_when_counter_remains_positive(self) -> None:
+        rid = 6
+        self.gws.init_resource(rid, init_val=5)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=0, gds=True)
+
+        acquired, val, blocked = self.interp.execute(state, inst)
+        flags = GWSStatusFlags.compute(acquired, val, blocked)
+
+        self.assertFalse(flags.zero_flag)
+        self.assertFalse(flags.negative_flag)
+        self.assertFalse(flags.borrow_flag)
+        self.assertFalse(flags.halt_flag)
+        self.assertEqual(state.scc, 1)
+
+    def test_borrow_prevention_on_zero_counter(self) -> None:
+        rid = 7
+        self.gws.init_resource(rid, init_val=0)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=0, gds=True)
+
+        acquired, val, blocked = self.interp.execute(state, inst)
+        flags = GWSStatusFlags.compute(acquired, val, blocked)
+
+        # Counter must NOT underflow to 0xFFFFFFFF
+        self.assertEqual(val, 0)
+        self.assertEqual(self.gws.resources[rid].value, 0)
+        self.assertFalse(flags.borrow_flag)
+        self.assertTrue(flags.halt_flag)
+        self.assertTrue(flags.gws_pending)
+        self.assertEqual(state.status, ThreadExecutionStatus.BLOCKED)
+
+    def test_status_flag_transition_on_signal_v_wakeup(self) -> None:
+        rid = 8
+        self.gws.init_resource(rid, init_val=0)
+        state = ScalarThreadState(wave_id=44, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=0, gds=True)
+
+        # Thread blocks
+        acquired, val, blocked = self.interp.execute(state, inst)
+        flags_blocked = GWSStatusFlags.compute(acquired, val, blocked)
+        self.assertTrue(flags_blocked.halt_flag)
+        self.assertTrue(flags_blocked.gws_pending)
+
+        # Paired signal_v awakens wave 44
+        _, awakened = self.gws.signal_v(rid)
+        self.assertEqual(awakened, 44)
+
+        # Wakeup clears halt and pending
+        state.status = ThreadExecutionStatus.RUNNING
+        flags_resumed = GWSStatusFlags.compute(acquired=True, counter_val=0, blocked=False)
+        self.assertFalse(flags_resumed.halt_flag)
+        self.assertFalse(flags_resumed.gws_pending)
+
+    def test_scc_tracking_across_depletion_sequence(self) -> None:
+        rid = 9
+        self.gws.init_resource(rid, init_val=2)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_P, offset=0, gds=True)
+
+        # 2 -> 1: scc=1 (still > 0)
+        self.interp.execute(state, inst)
+        self.assertEqual(state.scc, 1)
+
+        # 1 -> 0: scc=0 (hit 0)
+        self.interp.execute(state, inst)
+        self.assertEqual(state.scc, 0)
 
 
 if __name__ == "__main__":
