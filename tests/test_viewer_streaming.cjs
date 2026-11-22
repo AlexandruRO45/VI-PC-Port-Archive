@@ -351,6 +351,22 @@ test('ground movement interpolates between probes and waits at an unloaded edge'
     assert.equal(ground.waiting, true);
 });
 
+test('walk and drive recover when streaming replaces the surface below them', () => {
+    for (const [mode, eye] of [['walk', 1.7], ['drive', 2.5]]) {
+        const p = { x: 0, y: 10, z: 0 }, ground = groundState();
+        let floor = 4;
+        const floorAt = (x, z, bottom, top) => floor >= bottom && floor <= top ? floor : null;
+        moveOnGround(p, 0, new Set(), mode, 0.05, ground, floorAt);
+        assert.equal(p.y, 4 + eye, mode);
+        floor = 0;
+        const keys = new Set(['KeyW']);
+        for (let i = 0; i < 30; i++) moveOnGround(p, 0, keys, mode, 0.05, ground, floorAt);
+        assert.ok(p.z < -1, mode);
+        assert.equal(p.y, eye, mode);
+        assert.equal(ground.waiting, false, mode);
+    }
+});
+
 test('ground sampling considers the highest local visible surface in reach', () => {
     const tested = [];
     const live = new Map([

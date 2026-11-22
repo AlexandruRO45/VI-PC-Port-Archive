@@ -274,6 +274,8 @@ function moveOnGround(p, yaw, keys, mode, dt, state, floorAt) {
     const dz = (-ahead * Math.cos(heading) - across * Math.sin(heading)) * GROUND_STEP;
     const floor = floorAt(p.x + dx, p.z + dz, state.floor - 2, state.floor + 0.8);
     if (floor === null) {
+      // Streaming can replace the surface under us. Retry from the current position, before moving.
+      state.floor = null;
       state.waiting = true;
       state.retry = GROUND_RETRY;
       state.speed = 0;
