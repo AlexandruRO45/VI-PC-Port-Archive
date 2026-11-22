@@ -6676,7 +6676,7 @@ class Gen:
                 if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
                     return self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
                 if sv["k"] == "imm":
-                    v = sv["v"] & 0xFFFFFFFFFFFFFFFF
+                    v = imm64(sv["v"], op.endswith("_i64"))
                     return self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
                 raise Unsupported(op + " operand")
             (x0, x1), (y0, y1) = pair64(x), pair64(y)
@@ -7408,7 +7408,7 @@ class Gen:
                 if s["k"] in ("vgpr", "sgpr") and s.get("n") == 2:
                     return self.load_reg(s["k"], s["r"]), self.load_reg(s["k"], s["r"] + 1)
                 if s["k"] == "imm":
-                    v = s["v"] & 0xFFFFFFFFFFFFFFFF
+                    v = imm64(s["v"], op.endswith("_i64"))
                     return self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
                 raise Unsupported(op + " operand")
             (x0, x1), (y0, y1) = pair(x), pair(y)
