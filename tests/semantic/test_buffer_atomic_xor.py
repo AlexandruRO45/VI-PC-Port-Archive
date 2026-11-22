@@ -1084,5 +1084,89 @@ class TestBufferAtomicXorConditionCodes(unittest.TestCase):
         self.assertEqual(self.interp.vcc, canary)
 
 
+class TestBufferAtomicXorBoundaryExtremes(unittest.TestCase):
+    """Unit tests for boundary extremes, bitwise patterns, and IEEE 754 float/NaN handling."""
+
+    def setUp(self) -> None:
+        self.mem = BufferMemory(4096)
+
+    def test_last_valid_dword_boundary(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=100)
+        # Last valid 4-byte dword starts at offset 96 (96 + 4 = 100)
+        self.mem.write_u32(96, 0x55555555)
+        ret, in_bounds = ref_buffer_atomic_xor(self.mem, desc, soffset=0, vaddr=96, xor_val=0xAAAAAAAA, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0x55555555)
+        self.assertEqual(self.mem.read_u32(96), 0xFFFFFFFF)
+
+        # Offsets 97, 98, 99 all exceed num_records (97 + 4 = 101 > 100)
+        for oob_off in (97, 98, 99, 100):
+            ret, in_bounds = ref_buffer_atomic_xor(self.mem, desc, soffset=0, vaddr=oob_off, xor_val=0xFFFFFFFF, glc=True)
+            self.assertFalse(in_bounds)
+            self.assertEqual(ret, 0)
+
+    def test_zero_capacity_buffer(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=0)
+        ret, in_bounds = ref_buffer_atomic_xor(self.mem, desc, soffset=0, vaddr=0, xor_val=0xFFFFFFFF, glc=True)
+        self.assertFalse(in_bounds)
+        self.assertEqual(ret, 0)
+
+    def test_integer_bitwise_extremes(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        # 0x00000000 ^ 0x00000000 = 0
+        self.mem.write_u32(0, 0)
+        ret, in_bounds = ref_buffer_atomic_xor(self.mem, desc, soffset=0, vaddr=0, xor_val=0, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0)
+        self.assertEqual(self.mem.read_u32(0), 0)
+
+        # 0xFFFFFFFF ^ 0xFFFFFFFF = 0
+        self.mem.write_u32(4, 0xFFFFFFFF)
+        ret, in_bounds = ref_buffer_atomic_xor(self.mem, desc, soffset=0, vaddr=4, xor_val=0xFFFFFFFF, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0xFFFFFFFF)
+        self.assertEqual(self.mem.read_u32(4), 0)
+
+        # 0x80000000 ^ 0x7FFFFFFF = 0xFFFFFFFF
+        self.mem.write_u32(8, 0x80000000)
+        ret, in_bounds = ref_buffer_atomic_xor(self.mem, desc, soffset=0, vaddr=8, xor_val=0x7FFFFFFF, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0x80000000)
+        self.assertEqual(self.mem.read_u32(8), 0xFFFFFFFF)
+
+    def test_float_and_nan_bit_patterns_preserve_bitwise_xor(self) -> None:
+        # Buffer atomic xor operates purely on 32-bit bit patterns, even if holding float/NaN bits
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+
+        # IEEE 754 +0.0 (0x00000000) toggled to -0.0 (0x80000000)
+        self.mem.write_u32(0, 0x00000000)
+        ret, in_bounds = ref_buffer_atomic_xor(self.mem, desc, soffset=0, vaddr=0, xor_val=0x80000000, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0x00000000)
+        self.assertEqual(self.mem.read_u32(0), 0x80000000)
+
+        # IEEE 754 smallest subnormal (0x00000001)
+        self.mem.write_u32(4, 0x00000001)
+        ret, in_bounds = ref_buffer_atomic_xor(self.mem, desc, soffset=0, vaddr=4, xor_val=0x00000003, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0x00000001)
+        self.assertEqual(self.mem.read_u32(4), 0x00000002)
+
+        # IEEE 754 +inf (0x7F800000) toggled to -inf (0xFF800000)
+        self.mem.write_u32(8, 0x7F800000)
+        ret, in_bounds = ref_buffer_atomic_xor(self.mem, desc, soffset=0, vaddr=8, xor_val=0x80000000, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0x7F800000)
+        self.assertEqual(self.mem.read_u32(8), 0xFF800000)
+
+        # IEEE 754 quiet NaN (0x7FC00000) payload modification
+        qnan_bits = 0x7FC00000
+        self.mem.write_u32(12, qnan_bits)
+        ret, in_bounds = ref_buffer_atomic_xor(self.mem, desc, soffset=0, vaddr=12, xor_val=0x00000001, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, qnan_bits)
+        self.assertEqual(self.mem.read_u32(12), qnan_bits ^ 1)
+
+
 if __name__ == "__main__":
     unittest.main()
