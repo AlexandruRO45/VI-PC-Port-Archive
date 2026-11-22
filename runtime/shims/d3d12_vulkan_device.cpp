@@ -3920,13 +3920,6 @@ private:
         }
         multisample.pSampleMask = &r.sample_mask;
         VkPipelineColorBlendStateCreateInfo blend = r.blend;
-        // VUID-VkGraphicsPipelineCreateInfo-renderPass-06055: the blend attachment count must equal the rendering
-        // colour-attachment count. VUID 06062: a slot the PSO did not declare, or whose format the pass reinterprets
-        // or leaves UNDEFINED, must not carry blendEnable=TRUE. The helper keeps only states whose format is the
-        // PSO's own and zeroes the rest.
-        const std::vector<VkPipelineColorBlendAttachmentState> blend_states =
-            leonida::variant_blend_states(r.blends, colors, graphics_.color_formats);
-        blend.attachmentCount = std::uint32_t(blend_states.size());
         // The blend attachment count must equal the rendering colour-attachment count (VUID 06055).
         const auto blend_states = leonida::variant_blend_states(
             r.blends, colors, graphics_.color_formats, device_.info.features.independentBlend != VK_FALSE,
