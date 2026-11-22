@@ -956,5 +956,197 @@ class TestValuQsadPkU16U8SIMDMultiLane(unittest.TestCase):
                 self.assertNotEqual(state.read_lane(Operand.vgpr_pair(0), lane), sentinel)
 
 
+class TestValuQsadPkU16U8RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_dst_aliases_src0(self) -> None:
+        regs = ScalarRegisterFile()
+        interp = ScalarVALUInterpreter(regs)
+
+        # Ref in v[0:1], will be overwritten by dst v[0:1]
+        ref = pack_u8x8(10, 20, 30, 40, 50, 60, 70, 80)
+        query = pack_u8x8(10, 20, 30, 40, 0, 0, 0, 0) & MASK32
+        acc = pack_u16x4(1, 2, 3, 4)
+
+        regs.write(Operand.vgpr_pair(0), ref)  # src0 and dst
+        regs.write(Operand.vgpr(2), query)     # src1
+        regs.write(Operand.vgpr_pair(4), acc)  # src2
+
+        instr = VQsadPkU16U8Instruction(
+            dst=Operand.vgpr_pair(0),
+            src0=Operand.vgpr_pair(0),  # Aliased with dst
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr_pair(4),
+        )
+
+        res = interp.step(instr)
+        expected = pack_u16x4(1, 42, 83, 124)
+        self.assertEqual(res, expected)
+        self.assertEqual(regs.read(Operand.vgpr_pair(0)), expected)
+        # src1 and src2 remain intact
+        self.assertEqual(regs.read(Operand.vgpr(2)), query)
+        self.assertEqual(regs.read(Operand.vgpr_pair(4)), acc)
+
+    def test_dst_aliases_src1_low_dword(self) -> None:
+        regs = ScalarRegisterFile()
+        interp = ScalarVALUInterpreter(regs)
+
+        # src1 is v0 (low dword of dst v[0:1])
+        query = pack_u8x8(1, 2, 3, 4, 0, 0, 0, 0) & MASK32
+        ref = pack_u8x8(1, 2, 3, 4, 5, 6, 7, 8)
+        acc = pack_u16x4(0, 0, 0, 0)
+
+        regs.write(Operand.vgpr(0), query)     # src1 and dst lo
+        regs.write(Operand.vgpr(1), 0xCAFEBABE)  # dst hi
+        regs.write(Operand.vgpr_pair(2), ref)  # src0
+        regs.write(Operand.vgpr_pair(4), acc)  # src2
+
+        instr = VQsadPkU16U8Instruction(
+            dst=Operand.vgpr_pair(0),
+            src0=Operand.vgpr_pair(2),
+            src1=Operand.vgpr(0),  # Aliased with dst lo
+            src2=Operand.vgpr_pair(4),
+        )
+
+        res = interp.step(instr)
+        e0, e1, e2, e3 = unpack_u16x4(res)
+        self.assertEqual(e0, 0)  # [1,2,3,4] vs [1,2,3,4] -> SAD=0
+        self.assertEqual(regs.read(Operand.vgpr_pair(0)), res)
+
+    def test_dst_aliases_src1_high_dword(self) -> None:
+        regs = ScalarRegisterFile()
+        interp = ScalarVALUInterpreter(regs)
+
+        # src1 is v1 (high dword of dst v[0:1])
+        query = pack_u8x8(5, 6, 7, 8, 0, 0, 0, 0) & MASK32
+        ref = pack_u8x8(1, 2, 3, 4, 5, 6, 7, 8)
+
+        regs.write(Operand.vgpr(0), 0x11111111)  # dst lo
+        regs.write(Operand.vgpr(1), query)       # src1 and dst hi
+        regs.write(Operand.vgpr_pair(2), ref)    # src0
+        regs.write(Operand.vgpr_pair(4), 0)      # src2
+
+        instr = VQsadPkU16U8Instruction(
+            dst=Operand.vgpr_pair(0),
+            src0=Operand.vgpr_pair(2),
+            src1=Operand.vgpr(1),  # Aliased with dst hi
+            src2=Operand.vgpr_pair(4),
+        )
+
+        res = interp.step(instr)
+        # Window 3 is [4,5,6,7] vs [5,6,7,8] -> SAD = 4
+        e0, e1, e2, e3 = unpack_u16x4(res)
+        self.assertEqual(e3, 4)
+        self.assertEqual(regs.read(Operand.vgpr_pair(0)), res)
+
+    def test_dst_aliases_src2_in_place_accumulation(self) -> None:
+        regs = ScalarRegisterFile()
+        interp = ScalarVALUInterpreter(regs)
+
+        # Accumulator initially in v[0:1]
+        initial_acc = pack_u16x4(100, 200, 300, 400)
+        ref = pack_u8x8(10, 20, 30, 40, 50, 60, 70, 80)
+        query = pack_u8x8(10, 20, 30, 40, 0, 0, 0, 0) & MASK32
+
+        regs.write(Operand.vgpr_pair(0), initial_acc)  # src2 and dst
+        regs.write(Operand.vgpr_pair(2), ref)          # src0
+        regs.write(Operand.vgpr(4), query)             # src1
+
+        instr = VQsadPkU16U8Instruction(
+            dst=Operand.vgpr_pair(0),
+            src0=Operand.vgpr_pair(2),
+            src1=Operand.vgpr(4),
+            src2=Operand.vgpr_pair(0),  # In-place accumulation!
+        )
+
+        res = interp.step(instr)
+        expected = pack_u16x4(100, 240, 380, 520)
+        self.assertEqual(res, expected)
+        self.assertEqual(regs.read(Operand.vgpr_pair(0)), expected)
+
+    def test_dst_aliases_src0_and_src2(self) -> None:
+        regs = ScalarRegisterFile()
+        interp = ScalarVALUInterpreter(regs)
+
+        # v[0:1] is used for both reference window and accumulator!
+        val = pack_u8x8(1, 2, 3, 4, 5, 6, 7, 8)
+        query = pack_u8x8(1, 2, 3, 4, 0, 0, 0, 0) & MASK32
+
+        regs.write(Operand.vgpr_pair(0), val)
+        regs.write(Operand.vgpr(2), query)
+
+        instr = VQsadPkU16U8Instruction(
+            dst=Operand.vgpr_pair(0),
+            src0=Operand.vgpr_pair(0),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr_pair(0),
+        )
+
+        # Expected calculation:
+        # src0 = val, src1 = query, src2 = val
+        expected = ref_qsad_pk_u16_u8(val, query, val)
+        res = interp.step(instr)
+        self.assertEqual(res, expected)
+        self.assertEqual(regs.read(Operand.vgpr_pair(0)), expected)
+
+    def test_partial_overlap_dst_and_src0(self) -> None:
+        regs = ScalarRegisterFile()
+        interp = ScalarVALUInterpreter(regs)
+
+        # dst is v[0:1], src0 is v[1:2] (overlapping at v1)
+        # v1 is src0 lo, v2 is src0 hi
+        src0_lo = 0x04030201
+        src0_hi = 0x08070605
+        src0 = (src0_hi << 32) | src0_lo
+
+        regs.write(Operand.vgpr(0), 0xAAAAAAAA)
+        regs.write(Operand.vgpr(1), src0_lo)
+        regs.write(Operand.vgpr(2), src0_hi)
+        regs.write(Operand.vgpr(3), 0x04030201)  # query
+        regs.write(Operand.vgpr_pair(4), 0)      # acc
+
+        instr = VQsadPkU16U8Instruction(
+            dst=Operand.vgpr_pair(0),
+            src0=Operand.vgpr_pair(1),  # Overlaps with dst at v1
+            src1=Operand.vgpr(3),
+            src2=Operand.vgpr_pair(4),
+        )
+
+        expected = ref_qsad_pk_u16_u8(src0, 0x04030201, 0)
+        res = interp.step(instr)
+        self.assertEqual(res, expected)
+        self.assertEqual(regs.read(Operand.vgpr_pair(0)), expected)
+
+    def test_simd_multi_lane_aliased_in_place(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0x0000FFFF)  # lanes 0..15 active
+        interp = SIMDInterpreter()
+
+        ref = pack_u8x8(10, 20, 30, 40, 50, 60, 70, 80)
+        query = pack_u8x8(10, 20, 30, 40, 0, 0, 0, 0) & MASK32
+
+        for lane in range(32):
+            acc = pack_u16x4(lane, lane, lane, lane)
+            state.write_lane(Operand.vgpr_pair(0), lane, acc)  # dst and src2
+            state.write_lane(Operand.vgpr_pair(2), lane, ref)  # src0
+            state.write_lane(Operand.vgpr(4), lane, query)     # src1
+
+        instr = VQsadPkU16U8Instruction(
+            dst=Operand.vgpr_pair(0),
+            src0=Operand.vgpr_pair(2),
+            src1=Operand.vgpr(4),
+            src2=Operand.vgpr_pair(0),  # In-place accumulation across SIMD lanes
+        )
+
+        interp.step(instr, state)
+        for lane in range(32):
+            val = state.read_lane(Operand.vgpr_pair(0), lane)
+            if lane < 16:
+                expected = pack_u16x4(lane, 40 + lane, 80 + lane, 120 + lane)
+                self.assertEqual(val, expected)
+            else:
+                original = pack_u16x4(lane, lane, lane, lane)
+                self.assertEqual(val, original)
+
+
 if __name__ == "__main__":
     unittest.main()
