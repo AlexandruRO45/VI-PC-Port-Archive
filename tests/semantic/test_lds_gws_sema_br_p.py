@@ -518,6 +518,41 @@ class SIMDGWSInterpreter:
             return False, val, False
 
 
+# ============================================================================
+# Commit 6: Condition codes, status flags, and carry/borrow generation
+# ============================================================================
+
+
+@dataclass(frozen=True)
+class GWSBranchProbeStatusFlags:
+    """Architectural condition codes and status flags for GWS branch probe."""
+    scc: int = 0
+    zero_flag: bool = False
+    negative_flag: bool = False
+    borrow_flag: bool = False
+    halt_flag: bool = False
+    branch_taken: bool = False
+
+    @classmethod
+    def compute(cls, probe_success: bool, counter_val: int) -> GWSBranchProbeStatusFlags:
+        """Derive hardware condition codes and flags from branch probe result."""
+        scc = 1 if probe_success else 0
+        zero = (counter_val == 0)
+        negative = False
+        borrow = False
+        # Branch probe is non-blocking: halt_flag is always False!
+        halt = False
+        branch = probe_success
+        return cls(
+            scc=scc,
+            zero_flag=zero,
+            negative_flag=negative,
+            borrow_flag=borrow,
+            halt_flag=halt,
+            branch_taken=branch,
+        )
+
+
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Commit 1: Reference mathematical oracle and architectural model for ds_gws_sema_br_p."""
 
@@ -994,6 +1029,102 @@ class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
             self.assertEqual(state.m0, rid)
             self.assertEqual(state.get_sgpr(10), 0x12345678)
             self.assertEqual(state.get_vgpr(20), 0x9ABCDEF0)
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Commit 6: Condition codes, status flags, and carry/borrow generation for ds_gws_sema_br_p."""
+
+    def setUp(self) -> None:
+        self.gws = GWSSubsystem()
+        self.interp = ScalarGWSInterpreter()
+
+    def test_scc_and_branch_taken_on_success(self) -> None:
+        rid = 2
+        self.gws.init_resource(rid, init_val=3)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_P, offset=0, gds=True)
+
+        success, val, branch = self.interp.execute(state, inst, branch_pc=0x8000)
+        flags = GWSBranchProbeStatusFlags.compute(success, val)
+
+        self.assertTrue(success)
+        self.assertEqual(flags.scc, 1)
+        self.assertTrue(flags.branch_taken)
+        self.assertEqual(state.scc, 1)
+        self.assertEqual(state.branch_target, 0x8000)
+        self.assertFalse(flags.zero_flag)
+        self.assertFalse(flags.halt_flag)
+
+    def test_scc_and_branch_not_taken_on_fail(self) -> None:
+        rid = 3
+        self.gws.init_resource(rid, init_val=0)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_P, offset=0, gds=True)
+
+        success, val, branch = self.interp.execute(state, inst, branch_pc=0x8000)
+        flags = GWSBranchProbeStatusFlags.compute(success, val)
+
+        self.assertFalse(success)
+        self.assertEqual(flags.scc, 0)
+        self.assertFalse(flags.branch_taken)
+        self.assertEqual(state.scc, 0)
+        self.assertIsNone(state.branch_target)
+        self.assertTrue(flags.zero_flag)
+        # Non-blocking: halt_flag remains False!
+        self.assertFalse(flags.halt_flag)
+        self.assertEqual(state.status, ThreadExecutionStatus.RUNNING)
+
+    def test_zero_flag_set_when_counter_reaches_zero(self) -> None:
+        rid = 4
+        self.gws.init_resource(rid, init_val=1)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_P, offset=0, gds=True)
+
+        success, val, branch = self.interp.execute(state, inst)
+        flags = GWSBranchProbeStatusFlags.compute(success, val)
+
+        self.assertTrue(success)
+        self.assertEqual(val, 0)
+        self.assertTrue(flags.zero_flag)
+        self.assertEqual(flags.scc, 1)
+
+    def test_borrow_prevention_on_insufficient_permits(self) -> None:
+        rid = 5
+        self.gws.init_resource(rid, init_val=2)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        state.set_vgpr(1, 5)  # request 5 permits
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_P, offset=0, gds=True, vdata=Register(1, RegKind.VGPR))
+
+        success, val, branch = self.interp.execute(state, inst)
+        flags = GWSBranchProbeStatusFlags.compute(success, val)
+
+        # Counter must NOT underflow to 0xFFFFFFFD; must be preserved at 2!
+        self.assertFalse(success)
+        self.assertEqual(val, 2)
+        self.assertFalse(flags.borrow_flag)
+        self.assertEqual(flags.scc, 0)
+        self.assertFalse(flags.zero_flag)
+
+    def test_scc_alternation_across_probe_sequence(self) -> None:
+        rid = 6
+        self.gws.init_resource(rid, init_val=1)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_P, offset=0, gds=True)
+
+        # Probe 1: counter 1 -> 0, succeeds, scc=1
+        self.interp.execute(state, inst)
+        self.assertEqual(state.scc, 1)
+
+        # Probe 2: counter 0, fails, scc=0
+        self.interp.execute(state, inst)
+        self.assertEqual(state.scc, 0)
+
+        # External signal_v restores counter to 1
+        self.gws.signal_v(rid)
+
+        # Probe 3: counter 1 -> 0, succeeds, scc=1
+        self.interp.execute(state, inst)
+        self.assertEqual(state.scc, 1)
 
 
 if __name__ == "__main__":
