@@ -63,13 +63,24 @@ work on booting can start as soon as one is available to a developer.
 
 The port isn't downloaded ready-made. It's built on your PC from your own copy.
 
-**The easy way:**
+**The easy way (Desktop GUI):**
+
+- Download the prebuilt Desktop GUI for **Windows x64**, **Linux x64**, or **macOS arm64** from
+  [Releases](https://github.com/FelipeMzero/Leonida/releases) (or via the
+  [responsive web page](https://felipemzero.github.io/Leonida/)).
+- On Windows the executable requests Administrator privileges automatically (`--uac-admin`). On startup it detects your
+  system language (`pt-BR`, `en`, `es`), verifies all prerequisites, and lets you **auto-install only what is pending**
+  (or open the official download sites). Press **`F11`** to toggle fullscreen (`Esc` to exit).
+- From source: install `pip install -r gui/requirements.txt` and run `python -I leonida_gui.py` (or double-click
+  **`Build.bat`**, which opens the GUI when PySide6 is installed and falls back to the CLI otherwise).
+
+**The easy way (CLI):**
 
 1. Install the prerequisites below.
 2. Download this project **with its submodule**: `git clone --recursive https://github.com/ItsNotRexed/Leonida`. A
    "Download ZIP" from GitHub leaves out `third_party/rpf9-explorer`. The build fetches it if `git` is installed,
    and otherwise tells you what to do.
-3. Double-click **`Build.bat`**.
+3. Double-click **`Build.bat`** (pass any CLI flag to bypass the GUI).
 
 It finds your copy of the game by itself: it looks in Downloads, Desktop, Documents (also where Windows keeps them,
 such as in OneDrive), Games, your home folder and the top of every drive, two folders deep. It recognises the
@@ -88,9 +99,10 @@ Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` arc
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
 - [Vulkan SDK](https://vulkan.lunarg.com/), for `spirv-as` / `spirv-val`.
 - [LLVM 21+](https://github.com/llvm/llvm-project/releases) with the **AMDGPU target** for `llvm-mc`. The official
-  Windows build has no AMDGPU target. On Windows, `scripts\build_llvm_mc.ps1` builds a native `llvm-mc.exe` with it
-  (no WSL; needs git and the Visual Studio C++ tools below) and sets `LLVM_MC`. Or install `llvm-21` in WSL and set
-  `LLVM_MC` to the whole command, `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"` (see
+  Windows build has no AMDGPU target. Run the automatic installer `powershell -ExecutionPolicy Bypass -File scripts\install_llvm.ps1`
+  (or cross-platform `python -I scripts/install_llvm.py`), which downloads the SHA-256-verified `llvm-mc` built from
+  `llvm/llvm-project` (or builds from source via `scripts\build_llvm_mc.ps1` / `--from-source`) and sets `LLVM_MC`.
+  You can also install `llvm-21` in WSL and set `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"` (see
   [docs/design.md](docs/design.md#disassembling-shaders)). On Linux, `llvm-mc` on PATH is enough.
 - Visual Studio 2022 with **Desktop development with C++** and the **Windows SDK 10.0.26100 or newer**, for the
   runtime stage (the runtime uses version 1.2 root signatures, which older SDKs don't declare).
@@ -107,6 +119,9 @@ python -I make_game.py --game "D:\path\to\your\package" --out "D:\Games\Leonida"
 python -I make_game.py --stages shaders,assets         # only some stages
 python -I make_game.py --game "D:\path\to\your\package" --wav   # also decode Opus to PCM WAV (large)
 python -I make_game.py --wave64-emulate off            # auto (default), on or off; see below
+python -I tools/validate.py env                        # check system prerequisites (JSON with --json)
+python -I tools/validate.py code                       # self-check Python syntax, manifests & no-game-data
+python -I scripts/install_llvm.py                      # install/verify llvm-mc (AMDGPU) automatically
 ```
 
 `--wave64-emulate` decides whether wave64 compute and mesh shaders are translated to be exact on any subgroup size
