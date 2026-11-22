@@ -534,6 +534,37 @@ def fract_values():
     ])
 
 
+RECIPROCAL_BODY = [
+    "v_rcp_f32_e64 v12, |s44|",
+    "v_rcp_f32_e64 v13, -|s45|",
+    "v_rsq_f32_e64 v14, |s46|",
+    "v_rsq_f32_e64 v15, |s47| clamp",
+]
+
+
+def check_reciprocal_draw(directory, compiler, renderer, backend):
+    source = directory / "reciprocal.hlsl"
+    shader = directory / "reciprocal.cso"
+    case = directory / "reciprocal.case"
+    constants = bytearray(256)
+    struct.pack_into("<4f", constants, 12, -4.0, 8.0, -16.0, -0.25)
+    case.write_bytes(constants + struct.pack("<4f", 0.25, -0.125, 0.25, 1.0) * 64)
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    for mutation in (False, True):
+        body = RECIPROCAL_BODY.copy()
+        if mutation:
+            # 1 / abs(-16) is 1/16, while its reciprocal square root is 1/4.
+            body[2] = body[2].replace("v_rsq", "v_rcp")
+        source.write_text(translate(with_constants(body)), encoding="ascii")
+        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        if mutation:
+            wrong = subprocess.run(draw, capture_output=True, text=True)
+            if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+                raise AssertionError("Substituting reciprocal for reciprocal square root escaped detection")
+        else:
+            subprocess.run(draw, check=True)
+
+
 def check_fract_draw(directory, compiler, renderer, backend):
     source = directory / "fract.hlsl"
     shader = directory / "fract.cso"
@@ -1899,6 +1930,7 @@ def check_binary(directory, assembler, objcopy, library):
                 (truncate_values(), translate), (affine_coordinates(), translate), (ceiling(), translate),
                 (scalar64(), translate)]
     fixtures.append((with_constants(CLASS_BODY), translate))
+    fixtures.append((with_constants(RECIPROCAL_BODY), translate))
     fixtures.append((fract_values(), translate))
     fixtures.extend([(frexp_mant_values(), translate), (ldexp_values(), translate)])
     fixtures.extend((predicate_group(first), translate) for first in range(0, 16, 4))
@@ -2280,6 +2312,7 @@ def check_render(directory, compiler, renderer, backend):
         raise AssertionError("Swapped blend weights escaped detection")
     check_cube_draw(directory, compiler, renderer, backend)
     check_fract_draw(directory, compiler, renderer, backend)
+    check_reciprocal_draw(directory, compiler, renderer, backend)
     check_int_minmax_draws(directory, compiler, renderer, backend)
 
     check_frexp_ldexp_draws(directory, compiler, renderer, backend)
