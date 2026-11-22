@@ -324,7 +324,7 @@ class ArchiveTests(unittest.TestCase):
 
     def test_directory_scan_uses_stable_archive_order(self):
         with tempfile.TemporaryDirectory() as root:
-            def walk(path):
+            def walk(path, *, onerror=None):
                 directories = ["z", "a"]
                 yield path, directories, []
                 for directory in directories:
@@ -405,6 +405,29 @@ class ArchiveTests(unittest.TestCase):
             self.assertIn("cannot write", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
             self.assertIn('"blocks"', r.stdout)
+
+
+class DirectoryScanTests(unittest.TestCase):
+    def test_an_unreadable_subtree_does_not_replace_the_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.join(tmp, "archives")
+            os.mkdir(folder)
+            blocked = os.path.join(folder, "blocked")
+            out = os.path.join(tmp, "report.json")
+            with open(out, "wb") as f:
+                f.write(b"previous report")
+
+            def walk(root, onerror=None):
+                if onerror:
+                    onerror(PermissionError(13, "Permission denied", blocked))
+                return iter(())
+
+            with mock.patch.object(vt.os, "walk", walk), contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(vt.main([folder, "--json", out]), 2)
+            self.assertIn(blocked, err.getvalue())
+            with open(out, "rb") as f:
+                self.assertEqual(f.read(), b"previous report")
 
 
 class Rpf9ValidationTests(unittest.TestCase):

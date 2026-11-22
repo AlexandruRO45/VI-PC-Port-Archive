@@ -580,15 +580,23 @@ def main(argv=None):
     if args.limit < 0:
         print("error: --limit must be >= 0", file=sys.stderr)
         return 2
+
+    def scan_failed(error):
+        raise error
+
     archives = []
     for p in args.inputs:
         if not os.path.exists(p):
             print(f"error: {p} does not exist", file=sys.stderr)
             return 2
         if os.path.isdir(p):
-            for root, directories, files in os.walk(p):
-                directories.sort()
-                archives += [os.path.join(root, f) for f in sorted(files) if f.lower().endswith(".rpf")]
+            try:
+                for root, directories, files in os.walk(p, onerror=scan_failed):
+                    directories.sort()
+                    archives += [os.path.join(root, f) for f in sorted(files) if f.lower().endswith(".rpf")]
+            except OSError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
         else:
             archives.append(p)
     # The report is written after the whole scan, so check its path first: an archive given as --json used to be
