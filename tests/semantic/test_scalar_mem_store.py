@@ -31,7 +31,7 @@ Covers AMD RDNA2 / GFX10 SMEM (Scalar Memory) store instruction semantics:
       - Tokenization and AST validation for scalar store instructions and operand variants
       - Validation of invalid operand configurations (wrong register counts, vgpr base)
   * Translator and mini-interpreter contracts:
-      - rdna2spirv.Gen dispatch validation (raises Unsupported until translator implements scalar store)
+      - rdna2spirv.Gen emits one PhysicalStorageBuffer OpStore per dword
       - spirv_mini_interp strictness validation (rejection of unmodelled storage classes)
 """
 
@@ -667,21 +667,20 @@ class SmemStoreProgramEvaluatorTests(unittest.TestCase):
 class SmemStoreTranslatorContractTests(unittest.TestCase):
     """Verifies translator handling of scalar stores.
 
-    tools/rdna2spirv.py Gen currently raises Unsupported on s_store_dword, protecting against
-    silent miscompilations until SMEM store PhysicalStorageBuffer write emission is supported.
+    tools/rdna2spirv.py Gen translates the GFX10.1 scalar stores as PhysicalStorageBuffer stores, one OpStore per
+    dword (until 2026-11-22 it raised Unsupported). Their values are checked by test_value_semantics.ScalarStores.
     """
 
-    def test_translator_raises_unsupported_on_s_store(self):
-        g = rdna2spirv.Gen("cs")
-        for line in ("s_store_dword s0, s[2:3], 0",
-                     "s_store_dwordx2 s[0:1], s[2:3], 0",
-                     "s_store_dwordx4 s[0:3], s[4:5], 0",
-                     "s_buffer_store_dword s0, s[0:3], 0"):
+    def test_translator_emits_one_store_per_dword(self):
+        for line, n in (("s_store_dword s0, s[2:3], 0", 1),
+                        ("s_store_dwordx2 s[0:1], s[2:3], 0", 2),
+                        ("s_store_dwordx4 s[0:3], s[4:5], 0", 4),
+                        ("s_buffer_store_dword s0, s[0:3], 0", 1)):
             with self.subTest(line=line):
-                ins = parse_line(line)
-                with self.assertRaises(rdna2spirv.Unsupported) as ctx:
-                    g.insn(ins)
-                self.assertIn(ins["op"], str(ctx.exception))
+                g = rdna2spirv.Gen("cs")
+                g.insn(parse_line(line))
+                stores = [ln for ln in g.body if "OpStore" in ln and "Aligned 4" in ln]
+                self.assertEqual(len(stores), n)
 
 
 class SmemStoreMiniInterpStrictnessTests(unittest.TestCase):

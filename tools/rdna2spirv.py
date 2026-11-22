@@ -3747,7 +3747,7 @@ class Gen:
         if op.startswith("ds_"):
             kind = "lds"
         elif op.startswith(("buffer_", "tbuffer_", "global_", "flat_", "image_load", "image_store", "image_atomic",
-                            "s_load_", "s_buffer_load_")):
+                            "s_load_", "s_buffer_load_", "s_store_", "s_buffer_store_")):
             kind = "mem"
         else:
             return
@@ -7168,6 +7168,8 @@ class Gen:
                 self.dst({"k": "vgpr", "r": d["r"] + 1, "n": 1}, r_hi)
         elif op.startswith("s_load_dword") or op.startswith("s_buffer_load_dword"):
             self.scalar_load(op, a, ins["mods"])
+        elif op in self.SCALAR_STORES:
+            self.scalar_load(op, a, ins["mods"], store=True)
         elif op in ("s_lshl_b64", "s_lshr_b64", "s_ashr_i64"):
             # 64-bit shift of an SGPR pair by (src1 & 63); SCC = result != 0.
             d, x = a[0], a[1]
@@ -8677,7 +8679,11 @@ class Gen:
         else:
             raise Unsupported(op)
 
-    def scalar_load(self, op, a, mods):
+    # GFX10.1 (gfx1010-gfx1013, the console) scalar stores; gfx103x has none (llvm-mc rejects them for gfx1030/gfx1036).
+    SCALAR_STORES = ("s_store_dword", "s_store_dwordx2", "s_store_dwordx4",
+                     "s_buffer_store_dword", "s_buffer_store_dwordx2", "s_buffer_store_dwordx4")
+
+    def scalar_load(self, op, a, mods, store=False):
         """s_load_dwordxN sD, s[p:p+1], off   -> N dwords from a 64-bit pointer, no bound
         s_buffer_load_dwordxN sD, s[v:v+3], off -> N dwords from a V#, each checked against NUM_RECORDS
         Both become PhysicalStorageBuffer loads (Vulkan buffer device address). V# base = dword0 | (dword1 & 0xFFFF) << 32
@@ -8692,6 +8698,12 @@ class Gen:
           stride bytes when the V# stride (dword1[29:16]) is not 0, else NUM_RECORDS bytes (V# dword2). The bound
           is per dword and does not see base & 3; IMM is unsigned.
           s_load*: IMM is sign-extended from 21 bits and the sum is formed in 64 bits; no bound.
+        store=True: s_store_dwordxN / s_buffer_store_dwordxN sD, ... (GFX10.1 only) write the N SGPRs at the same
+        addresses, with the same bound (an out-of-range dword is not written). On hardware the write goes through the
+        scalar data cache and other readers see it after s_dcache_wb; here it is a direct PhysicalStorageBuffer
+        store, visible at least as early. Every invocation of the wave writes the same words (scalar data), so a
+        lane-mask source (one bit per invocation here) is refused. Not measured: the gfx1036 oracle has no scalar
+        stores; the address and bound rules are the measured s_load / s_buffer_load ones, assumed shared.
         Not measured, and inferred: s_load with sOFF + IMM < 0 (the 64-bit signed sum is used), x16 (same rule as
         x8), an s_buffer_load immediate with bit 20 set or a negative one (kept as the 32-bit value, as before)."""
         n = 1 if op.endswith("dword") else int(op.rsplit("x", 1)[1])
@@ -8705,6 +8717,9 @@ class Gen:
                       else list(base["r"]) if base["k"] == "slist" else None)
         if (d["k"] != "sgpr" and not single_special and not slist_dst) or base_slots is None:
             raise Unsupported(f"{op} operands {d.get('t', d['k'])} {base.get('t', base['k'])}")
+        if store and (self.holds_lane_mask(d) or self.any_mask_word(d) or self.any_ever_mask_word(d) or
+                      (d["k"] == "special" and d["t"].startswith("vcc") and "vcc" in self.cur_masks)):
+            raise Unsupported(f"{op} of a lane mask")
 
         def load_slot(slot):
             if isinstance(slot, int):
@@ -8720,6 +8735,14 @@ class Gen:
                 self.emit(f"OpStore {'%vcc' if slot == 'vcc_lo' else '%vcc_hi'} {val}")
 
         sbuf = op.startswith("s_buffer")
+        if store:
+            # Read every data dword before anything is written (sD may overlap the base or offset registers).
+            if single_special:
+                data = [self.src_u(d)] if n == 1 else                     [self.src_u({"k": "special", "t": "vcc_lo"}), self.src_u({"k": "special", "t": "vcc_hi"})]
+            elif slist_dst:
+                data = [load_slot(x) for x in d["r"]]
+            else:
+                data = [self.load_reg("sgpr", d["r"] + i) for i in range(n)]
         if sbuf:
             if len(base_slots) != 4:
                 raise Unsupported("s_buffer_load without V#")
@@ -8803,7 +8826,29 @@ class Gen:
                 self.emit(f"{prod} = OpIMul %ulong {nr64} {st64}")
                 self.emit(f"{raw} = OpIEqual %bool {stride} {self.cu(0)}")
                 self.emit(f"{lim} = OpSelect %ulong {raw} {nr64} {prod}")
-        for i in range(n):
+        for i in range(n if store else 0):
+            p = self.tmp()
+            if lim is None or (lim_val is not None and reg is None and lim_val >= imm + 4 * i + 4):
+                self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
+                self.emit(f"OpStore {p} {data[i]} Aligned 4")
+            elif lim_val is not None and reg is None:
+                pass                                    # out of range: not written
+            else:
+                end, ok = self.tmp(), self.tmp()
+                lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
+                if reg is not None:
+                    self.emit(f"{end} = OpIAdd %ulong {o64} {self.cl(4 * i + 4)}")
+                else:
+                    end = self.cl(imm + 4 * i + 4)
+                self.emit(f"{ok} = OpUGreaterThanEqual %bool {lim} {end}")
+                self.emit(f"OpSelectionMerge {lbl_end} None")
+                self.emit(f"OpBranchConditional {ok} {lbl_do} {lbl_end}")
+                self.emit(f"{lbl_do} = OpLabel")
+                self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
+                self.emit(f"OpStore {p} {data[i]} Aligned 4")
+                self.emit(f"OpBranch {lbl_end}")
+                self.emit(f"{lbl_end} = OpLabel")
+        for i in range(0 if store else n):
             p, v = self.tmp(), self.tmp()
             if lim is None:
                 self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")

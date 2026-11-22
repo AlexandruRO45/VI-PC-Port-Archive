@@ -749,5 +749,47 @@ class LaneMaskConstants(unittest.TestCase):
         self.assertEqual(w64, self.WANT["cs_w64_mask_imm"][1])
 
 
+
+class ScalarStores(LaneMaskConstants):
+    """runtime/test/shaders/cs_w32_scalar_store.asm: the GFX10.1 scalar stores s_store_dword(x2) and
+    s_buffer_store_dword(x4) with immediate, run-time SGPR and SGPR + immediate offsets, written at the addresses an
+    s_load / s_buffer_load of the same operands reads. Before, they raised Unsupported."""
+
+    WANT = {"cs_w32_scalar_store": (32, [0x11111111, 0x22222222, 0x33333333, 0x44444444, 0x55555555, 0x66666666, 0x77777777, 0x88888888])}
+    OLD = {"cs_w32_scalar_store": None}
+
+    def test_words_follow_from_the_masks(self):
+        # Plain-Python reference: dword k of the output is written by the store whose byte range covers 4 * k.
+        out = [None] * 8
+        for off, words in ((0x0, [0x11111111, 0x22222222, 0x33333333, 0x44444444]), (0x10, [0x55555555, 0x66666666]),
+                           (0x18, [0x77777777]), (0x18 + 4, [0x88888888])):
+            for i, w in enumerate(words):
+                out[off // 4 + i] = w
+        self.assertEqual(out, self.WANT["cs_w32_scalar_store"][1])
+
+    def test_buffer_store_bound_and_mask_refusal(self):
+        import rdna2spirv
+        # NUM_RECORDS = 0x40 bytes: an x4 store at 0x38 writes 0x38 and 0x3c, the two dwords past the end are dropped.
+        spv = support.translate_lines("cs_sstore_bound", [
+            "s_mov_b32 s20, 0x11111111", "s_mov_b32 s21, 0x22222222", "s_mov_b32 s22, 0x33333333",
+            "s_mov_b32 s23, 0x44444444", "s_mov_b32 s2, 0x40", "s_buffer_store_dwordx4 s[20:23], s[0:3], 0x38",
+            "s_endpgm"], fssm=bytes(self.fssm32()))
+        memory = {}
+        si.run_workgroup(spv, 32, 32,
+                         inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+                         push_constants=[0, 0, 0x40, 0x31016FAC] + [0] * 28, memory=memory)
+        self.assertEqual(memory, {0x38: 0x11111111, 0x3C: 0x22222222})
+        with self.assertRaisesRegex(rdna2spirv.Unsupported, "of a lane mask"):
+            support.translate_lines("cs_sstore_mask", ["v_cmp_gt_u32 vcc_lo, 5, v0", "s_mov_b32 s20, vcc_lo",
+                                                       "s_store_dword s20, s[0:1], 0x0", "s_endpgm"],
+                                    fssm=bytes(self.fssm32()))
+
+    @staticmethod
+    def fssm32():
+        sys.path.insert(0, os.path.join(support.ROOT, "runtime", "test", "shaders"))
+        from compute_fixture import compute_header
+        return compute_header(os.path.join(support.ROOT, "runtime", "test", "shaders", "cs_w32_scalar_store.asm"))
+
+
 if __name__ == "__main__":
     unittest.main()
