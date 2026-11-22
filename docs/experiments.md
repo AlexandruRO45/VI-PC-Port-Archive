@@ -1434,6 +1434,25 @@ python3 -B tests/mesh_attribute_check.py binary llvm-mc-15 llvm-objcopy-15 libLL
 ctest --preset dev --no-tests=error -R "^mesh_attribute_draw_" -V
 ```
 
+The mesh depth-pair fixture draws two partially overlapping indexed triangles
+with translated mesh and pixel stages. The two dispatches share one RGBA8
+target and one D32_FLOAT depth buffer with depth writes and LESS enabled.
+It clears both targets once and compares both complete 32×32 readbacks
+against a CPU edge test. It also checks each dispatch's geometry trace.
+
+Reversing draw order preserves every color and depth value. Exchanging the
+two depths changes the winning color at the 190 overlapping pixel centers.
+At the 172 centers covered by one triangle, the color stays fixed and the
+depth changes. Separate stale-color and stale-depth references verify both
+comparators. These CPU reference images matched the GPU readbacks on
+RTX 4060 and WARP.
+
+![Mesh depth-pair color references before and after the depth exchange](mesh-depth-pair-reference.png)
+
+```powershell
+ctest --preset dev --no-tests=error -R "^mesh_depth_pair_" -V
+```
+
 A separate draw binds two immutable constant buffers through a shader-visible
 D3D12 table. The translated mesh reads depth from b0 and a horizontal offset
 from b1. The translated pixel stage reads a packed color from b0. Both draws
