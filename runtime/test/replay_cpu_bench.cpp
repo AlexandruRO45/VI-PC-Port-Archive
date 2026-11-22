@@ -598,6 +598,24 @@ int main(int argc, char** argv) {
             ++failures;
         }
 
+        // The same for copies: a buffer copy prepared where a texture upload was before keeps none of its regions.
+        CommandList uploads, buffer_copy;
+        const CopyBuffer constants_copy{Scene::constants, 0, Scene::upload, 0, 256};
+        const bool copies_recorded = texture_copy(uploads, 0) && uploads.copy_buffer(constants_copy) &&
+                                     uploads.close() && buffer_copy.copy_buffer(constants_copy) && buffer_copy.close();
+        const bool copies_replayed = copies_recorded &&
+                                     prepare(uploads, resolve, scene.vk, prepared) == ReplayResult::success &&
+                                     prepare(buffer_copy, resolve, scene.vk, prepared) == ReplayResult::success;
+        const detail::PreparedCopy* c = copies_replayed && prepared.copy_count == 1 &&
+                                                prepared.commands[0].copy == 0
+                                            ? &prepared.copies[0]
+                                            : nullptr;
+        if (!c || c->buffer_copies.size() != 1 || !c->buffer_image_copies.empty() || c->has_depth24 ||
+            c->source.buffer != scene.resolve(Scene::upload)->buffer) {
+            std::fprintf(stderr, "FAIL copy storage: a copy kept state from the copy prepared there before\n");
+            ++failures;
+        }
+
         // The counts don't depend on timing: a second run must make exactly the same allocations and calls.
         const Result again = run(scene, lists, frame, reps, warmup);
         if (again.emit.vk_calls != f.emit.vk_calls || again.prepare.allocations != f.prepare.allocations) {

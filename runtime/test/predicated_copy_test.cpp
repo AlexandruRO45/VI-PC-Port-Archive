@@ -32,16 +32,17 @@ int main(){
         list.copy_buffer(copy);list.close();
         return prepare(list,resolve,vk,result);
     };
+    auto copies=[&]()->const detail::PreparedCopy&{return result.copies[result.commands.back().copy];};
     EXPECT(check({2,3,1,1,7})==ReplayResult::unsupported); // optional capability absent
     vk.prepare_predicated_copy=copier;
     EXPECT(check({2,3,1,1,7})==ReplayResult::unsupported); // emitter absent
     vk.emit_predicated_copy=[](VkCommandBuffer,const std::vector<PredicatedCopyDispatch>&){};
     EXPECT(check({2,3,1,1,7})==ReplayResult::success);
     EXPECT(prepared==1&&got_src==source.buffer_offset+1&&got_dst==destination.buffer_offset+3&&got_bytes==7);
-    EXPECT(result.unpredicated_copies==0&&result.commands.back().buffer_copies.empty());
+    EXPECT(result.unpredicated_copies==0&&copies().buffer_copies.empty());
     EXPECT(check({2,63,1,63,1},false)==ReplayResult::success);
-    EXPECT(result.commands.back().buffer_copies[0].srcOffset==source.buffer_offset+63);
-    EXPECT(result.commands.back().buffer_copies[0].dstOffset==destination.buffer_offset+63&&prepared==1);
+    EXPECT(copies().buffer_copies[0].srcOffset==source.buffer_offset+63);
+    EXPECT(copies().buffer_copies[0].dstOffset==destination.buffer_offset+63&&prepared==1);
     EXPECT(check({2,64,1,64,0})==ReplayResult::success&&prepared==1); // native no-op; no shader/descriptor
     EXPECT(check({2,64,1,0,1})==ReplayResult::invalid_copy);
     EXPECT(check({2,0,1,64,1})==ReplayResult::invalid_copy);

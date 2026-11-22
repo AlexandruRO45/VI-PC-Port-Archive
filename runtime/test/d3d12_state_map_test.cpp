@@ -304,17 +304,18 @@ int main() {
     upload.binding.height = 3;
     upload.binding.depth = 2;
     upload.binding.volume = true;
-    upload.source.buffer = reinterpret_cast<VkBuffer>(std::uintptr_t{2});
-    upload.source.size = 5 * 256 + 4;
+    detail::PreparedCopy upload_copy{};
+    upload_copy.source.buffer = reinterpret_cast<VkBuffer>(std::uintptr_t{2});
+    upload_copy.source.size = 5 * 256 + 4;
     CopyTexture copy{};
     copy.src = {2, true, 0, 0, 4, 3, 2, 256};
-    CHECK(detail::prepare_texture_copy(copy, upload) == ReplayResult::success);
-    --upload.source.size;
-    CHECK(detail::prepare_texture_copy(copy, upload) == ReplayResult::invalid_copy);
-    ++upload.source.size;
+    CHECK(detail::prepare_texture_copy(copy, upload, upload_copy) == ReplayResult::success);
+    --upload_copy.source.size;
+    CHECK(detail::prepare_texture_copy(copy, upload, upload_copy) == ReplayResult::invalid_copy);
+    ++upload_copy.source.size;
     copy.z = 1;
-    CHECK(detail::prepare_texture_copy(copy, upload) == ReplayResult::invalid_copy);
-    CHECK(upload.buffer_image_copies.size() == 1);
+    CHECK(detail::prepare_texture_copy(copy, upload, upload_copy) == ReplayResult::invalid_copy);
+    CHECK(upload_copy.buffer_image_copies.size() == 1);
 
     // Block-compressed texture to texture between mips of a 24x24 BC1 texture (mips 24, 12, 6, 3, 1). The host
     // copies whole blocks; where one vkCmdCopyImage extent cannot reach the edge of both mips, the copy is described
@@ -327,9 +328,11 @@ int main() {
         bc1.mip_levels = 5;
         bc1.array_layers = 1;
         const auto bc_copy = [&](std::uint32_t dst_mip, std::uint32_t x, std::uint32_t y, std::uint32_t src_mip,
-                                 bool has_box, CopyBox box, detail::Prepared& p) {
+                                 bool has_box, CopyBox box, detail::PreparedCopy& p) {
             p = {};
-            p.binding = p.source = bc1;
+            p.source = bc1;
+            detail::Prepared destination{};
+            destination.binding = bc1;
             CopyTexture c{};
             c.dst = {1, false, dst_mip, 0, 0, 0, 0, 0};
             c.src = {1, false, src_mip, 0, 0, 0, 0, 0};
@@ -337,15 +340,15 @@ int main() {
             c.y = y;
             c.has_box = has_box;
             c.box = box;
-            return detail::prepare_texture_copy(c, p);
+            return detail::prepare_texture_copy(c, destination, p);
         };
         const auto extent_is = [](const VkExtent3D& e, std::uint32_t w, std::uint32_t h) {
             return e.width == w && e.height == h && e.depth == 1;
         };
-        const auto staged = [](const detail::Prepared& p) {
+        const auto staged = [](const detail::PreparedCopy& p) {
             return p.image_copies.empty() && p.staged_reads.size() == 1 && p.staged_writes.size() == 1;
         };
-        detail::Prepared p{};
+        detail::PreparedCopy p{};
         // Both edges reachable with one extent: a direct copy, nothing staged.
         CHECK(bc_copy(1, 0, 0, 0, true, {0, 0, 0, 12, 12, 1}, p) == ReplayResult::success);
         CHECK(p.image_copies.size() == 1 && p.staged_reads.empty() && extent_is(p.image_copies[0].extent, 12, 12));
