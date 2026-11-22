@@ -1,6 +1,6 @@
 # Xbox2Windows
 
-Xbox2Windows investigates **static recompilation of Xbox Series X|S (Scarlett) software for x64 Windows**. Windows, the mapped original and the recompiled build agree on output and exit codes for source-built programs. Two pixel shaders from the inspected package compiled to desktop DXIL and matched reference pixels on an RTX 4060 Laptop GPU and WARP. Execution of the title's CPU code, full-game startup and frame rate remain unverified.
+Xbox2Windows researches **GTA VI static recompilation** from Xbox Series X|S (Scarlett) to x64 Windows. Windows, the mapped original and the recompiled build agree on output and exit codes for source-built programs. Two pixel shaders from the inspected package compiled to desktop DXIL and matched reference pixels on an RTX 4060 Laptop GPU and WARP. Execution of the title's CPU code, full-game startup and frame rate remain unverified.
 
 **Help wanted on Windows:** [Claim a batch of GPU reports in #1](https://github.com/R0Y00/Xbox2Windows/issues/1). Link the reports you will cover, check each original log against the hardware table, and submit one README PR for the batch. You can do this without a GPU or a local copy of the package.
 
