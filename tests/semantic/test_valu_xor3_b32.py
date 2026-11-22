@@ -641,5 +641,112 @@ class TestValuXor3B32RegisterAliasing(unittest.TestCase):
             self.assertEqual(state.get_vgpr(lane, 1), 0x100)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class Xor3StatusFlags:
+    """Architectural condition codes and status flags for v_xor3_b32."""
+    zero: bool
+    sign: bool
+    all_ones: bool
+    parity: bool
+    odd_bit_count: bool
+    vcc_modified: bool = False
+
+
+def evaluate_xor3_flags(
+    res32: int,
+    s0: int,
+    s1: int,
+    s2: int,
+) -> Xor3StatusFlags:
+    """Evaluate condition codes and parity across 3 operands."""
+    res = res32 & MASK32
+    bits_set = bin(res).count("1")
+
+    return Xor3StatusFlags(
+        zero=(res == 0),
+        sign=bool(res & 0x8000_0000),
+        all_ones=(res == MASK32),
+        parity=(bits_set % 2) == 0,
+        odd_bit_count=(bits_set % 2) != 0,
+        vcc_modified=False,
+    )
+
+
+def compute_u32_xor3_carry(s0: int, s1: int, s2: int) -> int:
+    """Compute 3-operand carry / majority function: (s0&s1)|(s0&s2)|(s1&s2)."""
+    a = s0 & MASK32
+    b = s1 & MASK32
+    c = s2 & MASK32
+    return (a & b) | (a & c) | (b & c)
+
+
+class TestValuXor3B32ConditionCodes(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow isolation."""
+
+    def test_condition_codes_zero_flag(self) -> None:
+        # 0 ^ 0 ^ 0 == 0
+        res = oracle_v_xor3_b32(0, 0, 0)
+        flags = evaluate_xor3_flags(res, 0, 0, 0)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.sign)
+        self.assertFalse(flags.all_ones)
+        self.assertTrue(flags.parity)
+
+        # Cancellation to zero: S ^ S ^ 0 == 0
+        res2 = oracle_v_xor3_b32(0x12345678, 0x12345678, 0)
+        flags2 = evaluate_xor3_flags(res2, 0x12345678, 0x12345678, 0)
+        self.assertTrue(flags2.zero)
+        self.assertFalse(flags2.sign)
+
+    def test_condition_codes_sign_flag(self) -> None:
+        res = oracle_v_xor3_b32(0x80000000, 0x10, 0x20)
+        flags = evaluate_xor3_flags(res, 0x80000000, 0x10, 0x20)
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.sign)
+        self.assertFalse(flags.all_ones)
+
+    def test_condition_codes_all_ones_flag(self) -> None:
+        res = oracle_v_xor3_b32(0xAAAAAAAA, 0x55555555, 0x00000000)
+        flags = evaluate_xor3_flags(res, 0xAAAAAAAA, 0x55555555, 0x00000000)
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.all_ones)
+        self.assertTrue(flags.sign)
+        self.assertTrue(flags.parity)
+
+    def test_condition_codes_parity(self) -> None:
+        self.assertTrue(evaluate_xor3_flags(0, 0, 0, 0).parity)
+        self.assertFalse(evaluate_xor3_flags(1, 1, 0, 0).parity)
+        self.assertTrue(evaluate_xor3_flags(3, 1, 2, 0).parity)
+
+    def test_majority_carry_evaluation(self) -> None:
+        # No two bits match -> carry = 0
+        self.assertEqual(compute_u32_xor3_carry(0x01, 0x02, 0x04), 0)
+        # S0 and S1 both have bit 0 set -> carry has bit 0 set
+        self.assertEqual(compute_u32_xor3_carry(0x03, 0x01, 0x04), 0x01)
+
+    def test_vcc_isolation(self) -> None:
+        interp = ScalarVALUInterpreter()
+        canary_vcc = 0xFEEDFACECAFEBEEF
+        state = ScalarMachineState(vcc=canary_vcc)
+
+        instr = VXor3B32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Literal32(0xFFFFFFFF)),
+            src1=VOP3Operand(Literal32(0xFFFFFFFF)),
+            src2=VOP3Operand(Literal32(0xFFFFFFFF)),
+        )
+        interp.step(instr, state)
+        self.assertEqual(state.vcc, canary_vcc)
+
+        simd = SIMDInterpreter()
+        simd_state = SIMDState(num_lanes=64, vcc=canary_vcc)
+        simd.step(instr, simd_state)
+        self.assertEqual(simd_state.vcc, canary_vcc)
+
+
 if __name__ == "__main__":
     unittest.main()
