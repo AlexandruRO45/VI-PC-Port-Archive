@@ -40,9 +40,11 @@ def path_key(path):
     # posixpath and keeps case; on Windows ntpath lowercases. Resolving a simulated
     # macOS path through ntpath would hide the case-sensitive branch under test.
     path = posixpath.normcase(path) if sys.platform == "darwin" else os.path.normcase(path)
+
     if case_insensitive_volume(path):
         # APFS and HFS+ also treat composed and decomposed accents as one name.
         path = unicodedata.normalize("NFD", path.casefold())
+
     return path
 
 

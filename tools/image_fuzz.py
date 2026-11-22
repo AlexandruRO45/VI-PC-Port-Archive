@@ -64,7 +64,10 @@ FORMATS = {
     "R8G8B8A8_SINT": ("R8G8B8A8_SINT", 61, 4, "sint8"),
 }
 SIZES = (8, 16, 32, 64)
-DMASKS = (0xf, *range(1, 0xf))
+DMASKS = (
+    0x5, 0xA, 0x6, 0x9, 0xB, 0xD, 0xE, 0xC,
+    0x3, 0x7, 0xF, 0x1, 0x2, 0x4, 0x8
+)
 STDERR_TAIL = 20  # lines of the harness's output a failure prints
 
 # Windows reports a crash as an NTSTATUS exit code (unsigned); the ones a driver crash tends to end with
@@ -512,7 +515,11 @@ def negative_control(oracle, cases, a):
     for name, what in PERTURBATIONS.items():
         PERTURB.add(name)
         try:
-            n = sum(bool(compare_hw(c, words[c.index])) for c in ran)
+            mismatched = [c for c in ran if compare_hw(c, words[c.index])]
+            n = len(mismatched)
+
+            
+                    
         finally:
             PERTURB.discard(name)
         print(f"perturbation {name} ({what}): caught by {n} of {len(ran)} cases" + ("" if n else "   <-- NOT CAUGHT"))

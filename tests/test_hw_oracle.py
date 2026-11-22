@@ -46,9 +46,11 @@ class Text(unittest.TestCase):
 
     def test_raw_kernels_get_the_memory_mnemonics_of_their_family(self):
         body = ["v_mov_b32 v20, 7", "global_store_b32 v22, v20, s[2:3] offset:4", "s_endpgm"]
-        k10, k11 = asm.raw_kernel_text("k0", body, "gfx1036"), asm.raw_kernel_text("k0", body, "gfx1150")
+        k10, k11, k12 = asm.raw_kernel_text("k0", body, "gfx1036"), asm.raw_kernel_text("k0", body, "gfx1150"), asm.raw_kernel_text("k0", body, "gfx1201")
         self.assertIn("  global_store_dword v22, v20, s[2:3] offset:4\n", k10)     # GFX10 has no global_store_b32
         self.assertNotIn("global_store_b32", k10)
+        self.assertIn("s_load_b64 s[2:3], s[0:1], 0x0", k12)
+        self.assertNotIn("s_load_dwordx2", k12)
         self.assertIn("  global_store_b32 v22, v20, s[2:3] offset:4\n", k11)
         self.assertEqual(asm.gfx10_spelling("global_load_b128 v[4:7], v0, s[2:3]"), "global_load_dwordx4 v[4:7], v0, s[2:3]")
         self.assertEqual(asm.gfx10_spelling("v_mov_b32 v20, 7"), "v_mov_b32 v20, 7")
@@ -683,4 +685,3 @@ class WrappedKernelsOnHardware(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

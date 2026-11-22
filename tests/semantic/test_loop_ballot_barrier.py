@@ -62,35 +62,37 @@ def _s32(u):
 # ---------------------------------------------------------------------------
 
 def _parse_spv(asm):
-    """Parse SPIR-V assembly into constants, global/function var layouts, and labeled basic blocks."""
+    """Parse SPIR-V assembly into module metadata and per-function basic blocks."""
     consts = {}
     types = {}
     ptr_elem = {}
-    gvars = {}       # %name -> (storage_class, elem_type)
-    fvars = []       # [(%name, elem_type, init_id_or_None)]
-    blocks = {}      # %label -> [(res, op, args), ...]
-    cur = None
-    in_main = False
+    gvars = {}
+    blocks = {}
+    functions = {}
+    cur_fn = None
+    cur_block = None
 
     for raw in asm.splitlines():
-        s = raw.strip()
-        if not s or s.startswith(";"):
+        line = raw.strip()
+        if not line or line.startswith(";"):
             continue
-        toks = s.split()
+        toks = line.split()
         if len(toks) >= 3 and toks[1] == "=":
             res, op, args = toks[0], toks[2], toks[3:]
         else:
             res, op, args = None, toks[0], toks[1:]
 
         if op == "OpFunction":
-            in_main = (res == "%main")
+            cur_fn = res
+            functions[cur_fn] = {"params": [], "locals": [], "entry": None}
+            cur_block = None
             continue
         if op == "OpFunctionEnd":
-            in_main = False
-            cur = None
+            cur_fn = None
+            cur_block = None
             continue
 
-        if not in_main:
+        if cur_fn is None:
             if op == "OpTypeInt":
                 types[res] = ("int", int(args[0]), int(args[1]))
             elif op == "OpTypeBool":
@@ -109,7 +111,7 @@ def _parse_spv(asm):
                 ty = types.get(args[0])
                 if ty and ty[0] == "int":
                     val = int(args[1], 0)
-                    consts[res] = val & M32 if ty[1] == 32 else val & M64
+                    consts[res] = val & (M32 if ty[1] == 32 else M64)
                 elif ty and ty[0] == "float":
                     consts[res] = float(args[1])
                 else:
@@ -126,17 +128,20 @@ def _parse_spv(asm):
                 gvars[res] = (sc, elem)
             continue
 
-        if op == "OpLabel":
-            cur = res
-            blocks[cur] = []
-            continue
-        if op == "OpVariable":
+        fn = functions[cur_fn]
+        if op == "OpFunctionParameter":
+            fn["params"].append(res)
+        elif op == "OpLabel":
+            cur_block = res
+            blocks[cur_block] = []
+            if fn["entry"] is None:
+                fn["entry"] = cur_block
+        elif op == "OpVariable":
             _, elem = ptr_elem[args[0]]
             init = args[2] if len(args) > 2 else None
-            fvars.append((res, elem, init))
-            continue
-        if cur is not None:
-            blocks[cur].append((res, op, args))
+            fn["locals"].append((res, elem, init))
+        elif cur_block is not None:
+            blocks[cur_block].append((res, op, args))
 
     def make_zero(ty_id):
         ty = types.get(ty_id)
@@ -151,20 +156,16 @@ def _parse_spv(asm):
         if ty[0] == "vec":
             return [make_zero(ty[1]) for _ in range(ty[2])]
         if ty[0] == "arr":
-            n = consts[ty[2]]
-            return [make_zero(ty[1]) for _ in range(n)]
+            return [make_zero(ty[1]) for _ in range(consts[ty[2]])]
         if ty[0] == "struct":
-            return [make_zero(f) for f in ty[1]]
+            return [make_zero(member) for member in ty[1]]
         return 0
 
+    if "%main" not in functions or functions["%main"]["entry"] is None:
+        raise ValueError("SPIR-V module has no %main entry-point function")
     return {
-        "consts": consts,
-        "types": types,
-        "ptr_elem": ptr_elem,
-        "gvars": gvars,
-        "fvars": fvars,
-        "blocks": blocks,
-        "make_zero": make_zero,
+        "consts": consts, "types": types, "ptr_elem": ptr_elem, "gvars": gvars,
+        "functions": functions, "blocks": blocks, "make_zero": make_zero,
     }
 
 
@@ -199,6 +200,7 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
     types = mod["types"]
     gvars = mod["gvars"]
     blocks = mod["blocks"]
+    functions = mod["functions"]
     make_zero = mod["make_zero"]
     mem = {} if memory is None else memory
     pc_words = list(push_constants or [0] * 32)
@@ -219,10 +221,21 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
     # PushConstant struct layout matches rdna2spirv: member 0 = array[32] of uint, members 1..4 = heap/code ptrs
     pc_struct = [pc_words[:32], 0, 0, 0, 0]
 
+    def init_fn_mem(fn_id):
+        local_mem = {}
+        for vname, elem, init in functions[fn_id]["locals"]:
+            if init is None:
+                local_mem[vname] = make_zero(elem)
+            elif isinstance(consts[init], tuple) and consts[init][0] == "null":
+                local_mem[vname] = make_zero(consts[init][1])
+            else:
+                local_mem[vname] = consts[init]
+        return local_mem
+
     # Per-invocation state
     class Inv:
         __slots__ = ("gid", "sg_id", "sg_lane", "lid", "fn_mem", "ssa", "blk", "ip", "prev_blk",
-                     "done", "waiting_barrier", "waiting_sg", "steps")
+                     "fn_id", "call_stack", "done", "waiting_barrier", "waiting_sg", "steps")
 
         def __init__(self, gid):
             self.gid = gid
@@ -232,16 +245,11 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
             y = (gid // sx) % sy
             z = gid // (sx * sy)
             self.lid = [x, y, z]
-            self.fn_mem = {}
-            for vname, elem, init in mod["fvars"]:
-                if init is None:
-                    self.fn_mem[vname] = make_zero(elem)
-                elif isinstance(consts[init], tuple) and consts[init][0] == "null":
-                    self.fn_mem[vname] = make_zero(consts[init][1])
-                else:
-                    self.fn_mem[vname] = consts[init]
+            self.fn_id = "%main"
+            self.call_stack = []
+            self.fn_mem = init_fn_mem("%main")
             self.ssa = dict(consts)
-            self.blk = "%entry"
+            self.blk = functions["%main"]["entry"]
             self.ip = 0
             self.prev_blk = None
             self.done = False
@@ -332,7 +340,7 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
         return val_of(inv, tok)
 
     def step_inv(inv):
-        """Step one invocation until OpControlBarrier, a subgroup op, or OpReturn."""
+        """Step one invocation until a barrier/subgroup rendezvous or function return."""
         while not inv.done and inv.waiting_barrier is None and inv.waiting_sg is None:
             inv.steps += 1
             if inv.steps > max_steps:
@@ -350,9 +358,51 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
             inv.ip += 1
             if op in ("OpSelectionMerge", "OpLoopMerge"):
                 continue
-            if op == "OpReturn":
-                inv.done = True
-                return
+            if op == "OpFunctionCall":
+                if len(args) < 2:
+                    raise RuntimeError(f"Malformed OpFunctionCall in {inv.blk}: {args}")
+                callee = args[1]
+                if callee not in functions:
+                    raise NotImplementedError(f"Unknown called function {callee}")
+                params = functions[callee]["params"]
+                call_args = args[2:]
+                if len(call_args) != len(params):
+                    raise RuntimeError(
+                        f"OpFunctionCall {callee} has {len(call_args)} args for {len(params)} parameters"
+                    )
+                if len(inv.call_stack) >= 32:
+                    raise RecursionError(f"SPIR-V call depth exceeded 32 at {callee}")
+                values = [val_of(inv, tok) for tok in call_args]
+                inv.call_stack.append((
+                    inv.fn_id, inv.blk, inv.ip, inv.prev_blk, inv.ssa, inv.fn_mem, res
+                ))
+                inv.fn_id = callee
+                inv.ssa = dict(consts)
+                for param, value in zip(params, values):
+                    inv.ssa[param] = value
+                inv.fn_mem = init_fn_mem(callee)
+                inv.blk = functions[callee]["entry"]
+                inv.ip = 0
+                inv.prev_blk = None
+                continue
+            if op in ("OpReturn", "OpReturnValue"):
+                ret_value = val_of(inv, args[0]) if op == "OpReturnValue" else None
+                if not inv.call_stack:
+                    inv.done = True
+                    return
+                (caller_fn, caller_blk, caller_ip, caller_prev, caller_ssa,
+                 caller_mem, result_id) = inv.call_stack.pop()
+                inv.fn_id = caller_fn
+                inv.blk = caller_blk
+                inv.ip = caller_ip
+                inv.prev_blk = caller_prev
+                inv.ssa = caller_ssa
+                inv.fn_mem = caller_mem
+                if op == "OpReturnValue":
+                    if result_id is None:
+                        raise RuntimeError("OpReturnValue from a void-result call")
+                    inv.ssa[result_id] = ret_value
+                continue
             if op == "OpBranch":
                 inv.prev_blk = inv.blk
                 inv.blk = args[0]
@@ -1023,7 +1073,7 @@ class DivergentLoopBallotTests(unittest.TestCase):
             with self.subTest(mode=label):
                 spv, gen = _translate_cs("cs_div_loop_" + label, prog, threads=threads, emulate=emulate)
                 if emulate:
-                    self.assertEqual(gen.control_flow, "emulated wave64 rounds")
+                    self.assertEqual(gen.control_flow, "emulated wave64 structured")
                 mem = run_compute_workgroup(spv, threads, sg_sz, push_constants=VSHARP)
                 want = expected_for(threads)
                 for t in range(threads):
@@ -1507,6 +1557,69 @@ class BarrierInLoopsTests(unittest.TestCase):
                                        threads=threads, lds_bytes=threads * 4, emulate=emulate)
                 mem = run_compute_workgroup(spv, threads, sg_sz, push_constants=VSHARP)
                 self.assertEqual([mem[4 * t] for t in range(threads)], oracle(threads, 64 if wave64 else 32))
+
+
+class ComputeFunctionCallTests(unittest.TestCase):
+    """Regression coverage for per-invocation SPIR-V function frames."""
+
+    def test_nested_function_calls_return_values(self):
+        spv = """
+%uint = OpTypeInt 32 0
+%ulong = OpTypeInt 64 0
+%void = OpTypeVoid
+%ptr_phys_uint = OpTypePointer PhysicalStorageBuffer %uint
+%ptr_fn_uint = OpTypePointer Function %uint
+%fn_void = OpTypeFunction %void
+%fn_uint_uint = OpTypeFunction %uint %uint
+%zero64 = OpConstant %ulong 0
+%one = OpConstant %uint 1
+%main = OpFunction %void None %fn_void
+%main_entry = OpLabel
+%out = OpConvertUToPtr %ptr_phys_uint %zero64
+%value = OpFunctionCall %uint %twice %one
+OpStore %out %value
+OpReturn
+OpFunctionEnd
+%twice = OpFunction %uint None %fn_uint_uint
+%twice_arg = OpFunctionParameter %uint
+%twice_entry = OpLabel
+%first = OpFunctionCall %uint %increment %twice_arg
+%second = OpFunctionCall %uint %increment %first
+OpReturnValue %second
+OpFunctionEnd
+%increment = OpFunction %uint None %fn_uint_uint
+%inc_arg = OpFunctionParameter %uint
+%inc_entry = OpLabel
+%inc_local = OpVariable %ptr_fn_uint Function
+OpStore %inc_local %inc_arg
+%loaded = OpLoad %uint %inc_local
+%inc_result = OpIAdd %uint %loaded %one
+OpReturnValue %inc_result
+OpFunctionEnd
+"""
+        memory = run_compute_workgroup(spv, 1, 1)
+        self.assertEqual(memory, {0: 3})
+
+    def test_barrier_inside_called_function(self):
+        spv = """
+%void = OpTypeVoid
+%uint = OpTypeInt 32 0
+%fn_void = OpTypeFunction %void
+%main = OpFunction %void None %fn_void
+%main_entry = OpLabel
+%call = OpFunctionCall %void %synchronize
+OpReturn
+OpFunctionEnd
+%synchronize = OpFunction %void None %fn_void
+%sync_entry = OpLabel
+OpControlBarrier %uint_2 %uint_2 %uint_0
+OpReturn
+OpFunctionEnd
+%uint_0 = OpConstant %uint 0
+%uint_2 = OpConstant %uint 2
+"""
+        memory = run_compute_workgroup(spv, 2, 2)
+        self.assertEqual(memory, {})
 
 
 if __name__ == "__main__":

@@ -33,6 +33,10 @@ IMG_FORMATS = {
               "R8G8B8A8_UINT": 60, "R8G8B8A8_SINT": 61},
     "gfx11": {"R8G8B8A8_UNORM": 42, "R16G16B16A16_SFLOAT": 57, "R32G32B32A32_SFLOAT": 63, "R32_SFLOAT": 22,
               "R8G8B8A8_UINT": 46, "R8G8B8A8_SINT": 47},
+    "gfx12": {"R8G8B8A8_UNORM": 42,"R16G16B16A16_SFLOAT": 57,"R32G32B32A32_SFLOAT": 63,"R32_SFLOAT": 22,
+              "R8G8B8A8_UINT": 46,"R8G8B8A8_SINT": 47,},       
+              
+              
 }
 SQ_RSRC_IMG_2D = 9
 SEL_0, SEL_1, SEL_X, SEL_Y, SEL_Z, SEL_W = 0, 1, 4, 5, 6, 7   # SQ_SEL_*: DST_SEL values
@@ -50,10 +54,12 @@ def check_arch(arch):
 
 
 def has_custom_pitch(arch):
-    """Whether WORD4 can carry a linear image's pitch: GFX10.3 (gfx1030..gfx1036) and GFX11. GFX10.1 has no such
-    field and takes the default pitch (width rounded up to 256 bytes), which pitch_texels also produces."""
+    """Whether WORD4 can carry a linear image's pitch."""
     fam = check_arch(arch)
-    return fam == "gfx11" or re.fullmatch(r"gfx103[0-9a-f]", arch) is not None
+    return (
+        fam in ("gfx11", "gfx12")
+        or re.fullmatch(r"gfx103[0-9a-f]", arch) is not None
+    )
 
 
 def pitch_texels(width, bytes_per_texel):
@@ -63,24 +69,42 @@ def pitch_texels(width, bytes_per_texel):
 
 
 def image_words(arch, fmt, width, height, bytes_per_texel, swizzle=(SEL_X, SEL_Y, SEL_Z, SEL_W)):
-    """The 8 words of a 2D, one-mip, linear T# for gfx10/gfx11, with the base address (WORD0 and WORD1 [7:0]) left
-    zero: the kernel adds them once it knows where its texture landed."""
+    """Build an 8-word linear 2D T# descriptor."""
     fam = check_arch(arch)
+
     if not (1 <= width <= 16384 and 1 <= height <= 16384):
         raise ValueError(f"size {width}x{height} is outside 1..16384")
+
     code = IMG_FORMATS[fam][fmt]
     w, h = width - 1, height - 1
-    word1 = (code << 20) | ((w & 3) << 30)
+
+    if fam == "gfx12":
+        # GFX12: FORMAT occupies WORD1 bits 17..24
+        word1 = (code << 17) | ((w & 3) << 30)
+    else:
+        # GFX10/GFX11
+        word1 = (code << 20) | ((w & 3) << 30)
+
     word2 = ((w >> 2) & 0xFFF) | (h << 14)
+
     if fam == "gfx10":
-        word2 |= 1 << 31                    # RESOURCE_LEVEL, "must be 1" on GFX10 and 0 on GFX11
-    word3 = sum(s << (3 * i) for i, s in enumerate(swizzle)) | (SQ_RSRC_IMG_2D << 28)   # levels 0, SW_MODE 0 = linear
+        word2 |= 1 << 31
+
+    word3 = sum(s << (3 * i) for i, s in enumerate(swizzle)) | (SQ_RSRC_IMG_2D << 28)
+
     word4 = 0
     if has_custom_pitch(arch):
         pitch = pitch_texels(width, bytes_per_texel) - 1
-        word4 = (pitch & 0x1FFF) | (((pitch >> 13) & 1) << 13)    # DEPTH holds the low bits, PITCH_MSB bit 13
+
+        if fam == "gfx12":
+            word4 = (pitch & 0x3FFF) | (((pitch >> 14) & 0x3) << 14)
+        else:
+            word4 = (pitch & 0x1FFF) | (((pitch >> 13) & 1) << 13)
+
     word5 = PERF_MOD << 20
-    return [0, word1, word2, word3, word4, word5, 0, 0]
+    word6 = (1 << 15) if fam == "gfx12" else 0
+
+    return [0, word1, word2, word3, word4, word5, word6, 0]
 
 
 def lay_out(texels, width, height, bytes_per_texel):
@@ -128,6 +152,10 @@ def kernel_lines(arch, uid, fmt, width, height, bytes_per_texel, dmask, texture,
            "s_and_b32 s9, s5, 255",
            f"s_or_b32 s9, s9, 0x{t[1]:08x}"]
     out += [f"s_mov_b32 s{8 + i}, 0x{t[i]:08x}" for i in range(2, 8)]
+    fam = check_arch(arch)
+    coords = "[v2, v3]" if fam == "gfx12" else "v[2:3]"
+    norm = "" if fam == "gfx12" else " unorm"
+
     for k in range(iterations):
         out += [f"v_add_nc_u32 v1, {k * threads}, v0",
                 f"v_and_b32 v2, {width - 1}, v1",
@@ -138,10 +166,11 @@ def kernel_lines(arch, uid, fmt, width, height, bytes_per_texel, dmask, texture,
         out += [f"v_mov_b32 v{8 + i}, 0x{POISON:08x}" for i in range(4)]
         out += [f"s_branch .Lst{uid}_{k}",
                 f".Lok{uid}_{k}:",
-                f"image_load {dst}, v[2:3], s[8:15] dmask:0x{dmask:x} dim:SQ_RSRC_IMG_2D unorm",
+                f"image_load {dst}, {coords}, s[8:15] dmask:0x{dmask:x} dim:SQ_RSRC_IMG_2D{norm}",
                 "s_waitcnt vmcnt(0)",
                 f".Lst{uid}_{k}:",
                 "v_lshlrev_b32 v4, 4, v1",
                 "global_store_b128 v4, v[8:11], s[2:3]"]
+
     out += ["s_endpgm", ".p2align 8", f".Ltex{uid}:"]
     return out + _longs(texture)

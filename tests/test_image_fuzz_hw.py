@@ -19,6 +19,33 @@ from hw_oracle import asm, runner, tsharp  # noqa: E402
 GFX11, GFX10, GFX101 = "gfx1150", "gfx1030", "gfx1010"
 
 
+####
+GFX12 = "gfx1201"
+
+
+def test_t_sharp_gfx12_exact_words():
+    assert tsharp.image_words(
+        GFX12, "R8G8B8A8_UNORM", 16, 8, 4
+    ) == [
+        0,
+        0xC0540000,
+        0x0001C003,
+        0x90000FAC,
+        0x3F,
+        0x00400000,
+        0x8000,
+        0,
+    ]
+
+
+def test_t_sharp_gfx12_has_custom_pitch():
+    assert tsharp.has_custom_pitch(GFX12)
+
+
+
+
+####
+
 def test_t_sharp_gfx11_exact_words():
     # 16x8 R8G8B8A8_UNORM, linear: FORMAT 42 at [27:20], WIDTH_LO = 15 & 3 at [31:30], WIDTH_HI = 15 >> 2,
     # HEIGHT = 7 at [27:14], DST_SEL 4 5 6 7, TYPE 9 (2D) at [31:28], pitch 64 texels (256 bytes) - 1 in DEPTH.
@@ -49,9 +76,11 @@ def test_t_sharp_wide_texture_and_one_channel_swizzle():
 
 def test_t_sharp_rejects_what_it_cannot_describe():
     with pytest.raises(ValueError):
-        tsharp.image_words("gfx1201", "R8G8B8A8_UNORM", 8, 8, 4)    # GFX12 is another layout
+        tsharp.image_words("gfx1300", "R8G8B8A8_UNORM", 8, 8, 4)
+
     with pytest.raises(ValueError):
         tsharp.image_words(GFX11, "R8G8B8A8_UNORM", 0, 8, 4)
+
     with pytest.raises(KeyError):
         tsharp.image_words(GFX11, "D32_SFLOAT", 8, 8, 4)
 
@@ -249,13 +278,13 @@ def test_main_exits_77_when_the_hardware_oracle_is_missing(monkeypatch, capsys):
     assert "hardware oracle unavailable: no AMD clang" in capsys.readouterr().out
 
 
-def test_main_exits_77_for_a_family_without_a_t_sharp(monkeypatch, capsys):
+def test_main_exits_77_for_an_unsupported_architecture(monkeypatch, capsys):
     class Gfx12(ModelOracle):
-        arch = "gfx1201"
+        arch = "gfx1300"
     monkeypatch.setattr(runner, "open_oracle", lambda **_kw: Gfx12([]))
     monkeypatch.setattr(sys, "argv", ["image_fuzz.py", "--oracle", "hw", "--programs", "2"])
     assert imf.main() == 77
-    assert "no T# layout for gfx12" in capsys.readouterr().out
+    assert "unsupported GPU architecture 'gfx1300'" in capsys.readouterr().out
 
 
 def test_options_that_need_the_hardware_oracle(monkeypatch):

@@ -175,7 +175,7 @@ def raw_kernel_text(name, lines, arch, wave=32, mode=None, lds=0, vgprs=32, sgpr
                 "on gfx1170+, and the hardware keeps its fixed behaviour there; only denormal and rounding "
                 "mode fields are available")
     modes = "".join(f"\n  {MODE_FIELDS[k]} {int(v)}" for k, v in sorted((mode or {}).items()))
-    load = "s_load_b64" if fam == "gfx11" else "s_load_dwordx2"
+    load = "s_load_dwordx2" if fam == "gfx10" else "s_load_b64"
     if fam == "gfx10":
         lines = [gfx10_spelling(ln) for ln in lines]
     body = "\n".join("  " + ln for ln in lines)
