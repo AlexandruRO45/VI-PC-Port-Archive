@@ -392,5 +392,197 @@ class TestLDSMemoryAndOracle(unittest.TestCase):
         self.assertEqual(mem.read_dword(0x50), NEG_TWO_F32)
 
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class DSOpcode(enum.Enum):
+    """Data Share (DS) atomic opcodes."""
+    DS_MIN_RTN_F32 = "ds_min_rtn_f32"
+
+
+class RegType(enum.Enum):
+    """Register file classes."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclasses.dataclass(frozen=True)
+class RegisterOperand:
+    """Typed symbolic register operand representation."""
+    index: int
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        limit = DEFAULT_NUM_VGPRS if self.reg_type == RegType.VGPR else DEFAULT_NUM_SGPRS
+        if not (0 <= self.index < limit):
+            raise ValueError(f"Register index out of range: {self.reg_type.value}{self.index}")
+
+    @property
+    def name(self) -> str:
+        return f"{self.reg_type.value}{self.index}"
+
+
+@dataclasses.dataclass(frozen=True)
+class Immediate:
+    """32-bit immediate value representing float bit pattern."""
+    value: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value", u32(self.value))
+
+    @property
+    def name(self) -> str:
+        return hex(self.value)
+
+
+@dataclasses.dataclass(frozen=True)
+class OffsetImmediate:
+    """16-bit immediate byte offset descriptor."""
+    offset: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.offset <= OFFSET16_MASK):
+            raise ValueError(f"Offset out of 16-bit range: {self.offset}")
+
+
+@dataclasses.dataclass(frozen=True)
+class DSMinRtnF32Instruction:
+    """Symbolic AST node representing a ds_min_rtn_f32 instruction."""
+    vdst: RegisterOperand
+    vaddr: RegisterOperand
+    vdata0: Union[RegisterOperand, Immediate]
+    offset: int = 0
+    gds: bool = False
+    opcode: DSOpcode = DSOpcode.DS_MIN_RTN_F32
+
+    def __post_init__(self) -> None:
+        if self.vdst.reg_type != RegType.VGPR:
+            raise ValueError(f"vdst must be VGPR, got {self.vdst.reg_type.value}")
+        if self.vaddr.reg_type != RegType.VGPR:
+            raise ValueError(f"vaddr must be VGPR, got {self.vaddr.reg_type.value}")
+        if isinstance(self.vdata0, RegisterOperand) and self.vdata0.reg_type != RegType.VGPR:
+            raise ValueError(f"vdata0 register must be VGPR, got {self.vdata0.reg_type.value}")
+        if not (0 <= self.offset <= OFFSET16_MASK):
+            raise ValueError(f"offset out of 16-bit range: {self.offset}")
+
+    def disasm(self) -> str:
+        vdata_str = self.vdata0.name
+        parts = [f"{self.opcode.value} {self.vdst.name}, {self.vaddr.name}, {vdata_str}"]
+        if self.offset != 0:
+            parts.append(f"offset:{self.offset}")
+        if self.gds:
+            parts.append("gds")
+        return " ".join(parts)
+
+    @classmethod
+    def parse(cls, line: str) -> DSMinRtnF32Instruction:
+        import re
+        raw = line.split("//")[0].split(";")[0].strip()
+        if not raw:
+            raise ValueError("Empty instruction line")
+        tokens = raw.replace(",", " ").split()
+        if not tokens:
+            raise ValueError("No tokens found")
+        mnemonic = tokens[0].lower()
+        if mnemonic != DSOpcode.DS_MIN_RTN_F32.value:
+            raise ValueError(f"Unknown opcode: {mnemonic}")
+
+        if len(tokens) < 4:
+            raise ValueError(f"Insufficient operands for {mnemonic}")
+
+        def parse_reg(tok: str) -> RegisterOperand:
+            m = re.match(r"^([vs])\[?(\d+)\]?$", tok.lower())
+            if not m:
+                raise ValueError(f"Invalid register operand: {tok}")
+            rtype = RegType.VGPR if m.group(1) == "v" else RegType.SGPR
+            idx = int(m.group(2))
+            return RegisterOperand(idx, rtype)
+
+        vdst = parse_reg(tokens[1])
+        vaddr = parse_reg(tokens[2])
+        vdata_tok = tokens[3]
+        if vdata_tok.lower().startswith("v") or vdata_tok.lower().startswith("s"):
+            vdata0: Union[RegisterOperand, Immediate] = parse_reg(vdata_tok)
+        else:
+            vdata0 = Immediate(int(vdata_tok, 0))
+
+        offset = 0
+        gds = False
+        for opt in tokens[4:]:
+            opt_l = opt.lower()
+            if opt_l == "gds":
+                gds = True
+            elif opt_l.startswith("offset:"):
+                offset = int(opt_l.split(":", 1)[1], 0)
+            else:
+                raise ValueError(f"Unexpected token in instruction: {opt}")
+
+        return cls(vdst=vdst, vaddr=vaddr, vdata0=vdata0, offset=offset, gds=gds)
+
+
+class TestDSMinRtnF32AST(unittest.TestCase):
+    """Phase 2: Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_instantiation_and_disasm(self) -> None:
+        v0 = RegisterOperand(0, RegType.VGPR)
+        v1 = RegisterOperand(1, RegType.VGPR)
+        v2 = RegisterOperand(2, RegType.VGPR)
+
+        inst_simple = DSMinRtnF32Instruction(vdst=v0, vaddr=v1, vdata0=v2)
+        self.assertEqual(inst_simple.disasm(), "ds_min_rtn_f32 v0, v1, v2")
+        self.assertEqual(inst_simple.offset, 0)
+        self.assertFalse(inst_simple.gds)
+
+        inst_opts = DSMinRtnF32Instruction(vdst=v0, vaddr=v1, vdata0=v2, offset=32, gds=True)
+        self.assertEqual(inst_opts.disasm(), "ds_min_rtn_f32 v0, v1, v2 offset:32 gds")
+
+        inst_imm = DSMinRtnF32Instruction(vdst=v0, vaddr=v1, vdata0=Immediate(ONE_F32), offset=16)
+        self.assertEqual(inst_imm.disasm(), f"ds_min_rtn_f32 v0, v1, {hex(ONE_F32)} offset:16")
+
+    def test_ast_parse_canonical(self) -> None:
+        inst1 = DSMinRtnF32Instruction.parse("ds_min_rtn_f32 v0, v1, v2")
+        self.assertEqual(inst1.vdst, RegisterOperand(0, RegType.VGPR))
+        self.assertEqual(inst1.vaddr, RegisterOperand(1, RegType.VGPR))
+        self.assertEqual(inst1.vdata0, RegisterOperand(2, RegType.VGPR))
+        self.assertEqual(inst1.offset, 0)
+        self.assertFalse(inst1.gds)
+
+        inst2 = DSMinRtnF32Instruction.parse("ds_min_rtn_f32 v[5], v[6], v[7] offset:64 gds")
+        self.assertEqual(inst2.vdst, RegisterOperand(5, RegType.VGPR))
+        self.assertEqual(inst2.vaddr, RegisterOperand(6, RegType.VGPR))
+        self.assertEqual(inst2.vdata0, RegisterOperand(7, RegType.VGPR))
+        self.assertEqual(inst2.offset, 64)
+        self.assertTrue(inst2.gds)
+
+        inst3 = DSMinRtnF32Instruction.parse("ds_min_rtn_f32 v10, v11, 0x3f800000 offset:0x10")
+        self.assertEqual(inst3.vdata0, Immediate(ONE_F32))
+        self.assertEqual(inst3.offset, 16)
+
+    def test_ast_validation_errors(self) -> None:
+        v0 = RegisterOperand(0, RegType.VGPR)
+        s0 = RegisterOperand(0, RegType.SGPR)
+
+        with self.assertRaises(ValueError):
+            DSMinRtnF32Instruction(vdst=s0, vaddr=v0, vdata0=v0)
+
+        with self.assertRaises(ValueError):
+            DSMinRtnF32Instruction(vdst=v0, vaddr=s0, vdata0=v0)
+
+        with self.assertRaises(ValueError):
+            DSMinRtnF32Instruction(vdst=v0, vaddr=v0, vdata0=s0)
+
+        with self.assertRaises(ValueError):
+            DSMinRtnF32Instruction(vdst=v0, vaddr=v0, vdata0=v0, offset=-1)
+
+        with self.assertRaises(ValueError):
+            DSMinRtnF32Instruction(vdst=v0, vaddr=v0, vdata0=v0, offset=65536)
+
+        with self.assertRaises(ValueError):
+            RegisterOperand(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.VGPR)
+
+
 if __name__ == "__main__":
     unittest.main()
