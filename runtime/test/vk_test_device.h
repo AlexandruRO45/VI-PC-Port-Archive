@@ -197,9 +197,9 @@ public:
                 instance_fn<PFN_vkEnumerateDeviceExtensionProperties>("vkEnumerateDeviceExtensionProperties");
             std::uint32_t extension_count = 0;
             extensions_of(physical, nullptr, &extension_count, nullptr);
-            std::vector<VkExtensionProperties> extensions(extension_count);
-            extensions_of(physical, nullptr, &extension_count, extensions.data());
-            for (const auto& e : extensions)
+            std::vector<VkExtensionProperties> device_extensions(extension_count);
+            extensions_of(physical, nullptr, &extension_count, device_extensions.data());
+            for (const auto& e : device_extensions)
                 if (!std::strcmp(e.extensionName, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
                     VkPhysicalDeviceConditionalRenderingFeaturesEXT supported{
                         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
