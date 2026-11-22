@@ -1355,6 +1355,21 @@ if(TARGET Vulkan::Headers)
     # programs their index entries are keyed by. Needs llvm-mc with the AMDGPU target (LLVM_MC in the environment, as
     # for the other shader tests, or llvm-mc on PATH or in C:/msys64/ucrt64/bin) and the Vulkan SDK's spirv-as and
     # spirv-val; without them the test is not built.
+    # Track the scripts and data used by the shader build separately from each target's .asm inputs.
+    set(LEONIDA_RDNA2_TEST_SHADER_DEPS
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+        ${CMAKE_CURRENT_SOURCE_DIR}/../tools/bary_fallback_gs.py
+        ${CMAKE_CURRENT_SOURCE_DIR}/../tools/cfg_structure.py
+        ${CMAKE_CURRENT_SOURCE_DIR}/../tools/fssm_header.py
+        ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gfx10_formats.json
+        ${CMAKE_CURRENT_SOURCE_DIR}/../tools/lane_masks.py
+        ${CMAKE_CURRENT_SOURCE_DIR}/../tools/mc_command.py
+        ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
+        ${CMAKE_CURRENT_SOURCE_DIR}/../tools/shader_ir.py
+        ${CMAKE_CURRENT_SOURCE_DIR}/../tools/shader_meta.py
+        ${CMAKE_CURRENT_SOURCE_DIR}/../tools/spirv_stubs.py
+        ${CMAKE_CURRENT_SOURCE_DIR}/../tools/wave64_halves.py)
     if(NOT LEONIDA_LLVM_MC)
       if(DEFINED ENV{LLVM_MC})
         set(LEONIDA_LLVM_MC "$ENV{LLVM_MC}")
@@ -1376,11 +1391,9 @@ if(TARGET Vulkan::Headers)
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_M15_DIR} vs_m15 ps_m15
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+        DEPENDS ${LEONIDA_RDNA2_TEST_SHADER_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m15.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m15.asm
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating vs_m15 and ps_m15 for the translated draw test"
         VERBATIM)
       add_executable(d3d12_translated_draw_test test/d3d12_translated_draw_test.cpp shims/d3d12_xs_device.cpp
@@ -1404,12 +1417,10 @@ if(TARGET Vulkan::Headers)
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_M2_DIR} vs_m2 ps_m2 ps_m2_uoff
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+        DEPENDS ${LEONIDA_RDNA2_TEST_SHADER_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m2.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m2.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m2_uoff.asm
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating vs_m2 and ps_m2 for the textured draw test"
         VERBATIM)
       add_executable(d3d12_m2_textured_test test/d3d12_m2_textured_test.cpp shims/d3d12_xs_device.cpp
@@ -1432,12 +1443,10 @@ if(TARGET Vulkan::Headers)
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "PATH=${LEONIDA_SPIRV_TOOLS_NATIVE};$ENV{PATH}"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_M2F_DIR} vs_m2 ps_m2 ps_m2_array
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+        DEPENDS ${LEONIDA_RDNA2_TEST_SHADER_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m2.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m2.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m2_array.asm
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating vs_m2, ps_m2 and ps_m2_array for the M2 formats test"
         VERBATIM)
       add_executable(d3d12_m2_formats_test test/d3d12_m2_formats_test.cpp shims/d3d12_xs_device.cpp
@@ -1462,14 +1471,12 @@ if(TARGET Vulkan::Headers)
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_M3_DIR} vs_m3 ps_m3 vs_m2 ps_m3_post ps_m3_query
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+        DEPENDS ${LEONIDA_RDNA2_TEST_SHADER_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m3.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m3.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m2.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m3_post.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m3_query.asm
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating M3 frame and single-output occlusion-probe shaders"
         VERBATIM)
       add_executable(d3d12_m3_frame_test test/d3d12_m3_frame_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_M3_FILES})
@@ -1495,11 +1502,9 @@ if(TARGET Vulkan::Headers)
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_M4_DIR} cs_m4_fill cs_m4_indirect
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+        DEPENDS ${LEONIDA_RDNA2_TEST_SHADER_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_m4_fill.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_m4_indirect.asm
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating cs_m4_fill and cs_m4_indirect for the compute test"
         VERBATIM)
       add_executable(d3d12_m4_compute_test test/d3d12_m4_compute_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_M4_FILES})
@@ -1523,11 +1528,9 @@ if(TARGET Vulkan::Headers)
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_BUFFER_UAV_DIR} cs_buf_typed cs_buf_counter
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+        DEPENDS ${LEONIDA_RDNA2_TEST_SHADER_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_buf_typed.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_buf_counter.asm
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating cs_buf_typed and cs_buf_counter for the buffer UAV test"
         VERBATIM)
       add_executable(d3d12_buffer_uav_test test/d3d12_buffer_uav_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_BUFFER_UAV_FILES})
@@ -1769,9 +1772,8 @@ if(TARGET Vulkan::Headers)
           COMMAND ${CMAKE_COMMAND} -E env LLVM_MC=${LEONIDA_LLVM_MC} LEONIDA_W64_EMULATE=${emulate}
                   $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                   ${LEONIDA_SG_DIR}/${folder} ${shader}
-          DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+          DEPENDS ${LEONIDA_RDNA2_TEST_SHADER_DEPS}
                   ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/${shader}.asm
-                  ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
           COMMENT "Translating ${shader} for the subgroup size test (${folder})"
           VERBATIM)
         list(APPEND LEONIDA_SG_INDEXES ${index})
