@@ -7000,7 +7000,12 @@ class Gen:
         elif op == "v_cndmask_b32":
             # e32: dst, src0, src1 (vcc) ; e64: dst, src0, src1, sN[:N+1]/vcc
             x, y = self.src_u(a[1]), self.src_u(a[2])
-            c = self.mask_src(a[3]) if len(a) > 3 else self.mask_src({"k": "special", "t": "vcc"})
+            m = a[3] if len(a) > 3 else {"k": "special", "t": "vcc"}
+            if self.wave64 and m["k"] == "sgpr" and m.get("n", 1) == 1 and not self.holds_lane_mask(m):
+                # The corpus listing prints the wave64 mask operand of the VOP3 form in wave32 syntax (`s4`, like
+                # `vcc_lo`), but the hardware reads the 64-bit pair s[4:5]: lanes 32-63 take their bit from r+1.
+                m = dict(m, n=2)
+            c = self.mask_src(m)
             b, r = self.tmp(), self.tmp()
             self.emit(f"{b} = OpINotEqual %bool {c} {self.cu(0)}")
             self.emit(f"{r} = OpSelect %uint {b} {y} {x}")

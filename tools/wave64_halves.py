@@ -377,6 +377,13 @@ class Analysis:
                 elif self.is_mask(ins, x) and x.get("k") != "special" or (
                         x.get("k") == "special" and x.get("t") in ("vcc", "exec") and self.is_mask(ins, x)):
                     md |= MASKD | X
+        # an SGPR that holds plain data and is read as a lane mask (Gen.mask_src): hardware takes lane L's bit from
+        # the pair (r+1 for lanes 32-63); a 32-lane half only knows its own lane, so the high half would read r
+        mo = a[3] if op in ("v_cndmask_b32", "v_cndmask_b16") and len(a) == 4 else (
+            a[4] if op in ("v_addc_co_u32", "v_subb_co_u32", "v_subbrev_co_u32") and len(a) == 5 else None)
+        if mo is not None and mo.get("k") == "sgpr" and not self.is_mask(ins, mo):
+            violation("mask-data")
+            md |= X
         t_src |= md
 
         # --- lane masks and counts

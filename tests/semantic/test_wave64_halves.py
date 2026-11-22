@@ -225,6 +225,14 @@ class Classification(unittest.TestCase):
         self.tier("ps_c_maskdata", ps(["v_cmp_eq_u32_e32 vcc, 1, v0", "s_mov_b64 s[6:7], vcc",
                                        "v_mov_b32_e32 v6, s6"]), "C")
 
+    def test_c_data_sgpr_as_lane_mask(self):
+        # Gen.mask_src reads a data SGPR pair as bits (lanes 32-63 from r+1); a 32-lane half cannot tell which half
+        # it is, so both v_cndmask forms are refused, while a certified mask is not (SHADER-200).
+        self.tier("ps_c_datamask", ps(["s_mov_b32 s4, 0xff00ff", "s_mov_b32 s5, 0xf0f0f0f0",
+                                       "v_cndmask_b32_e64 v6, 0, 1, s4"]), "C",
+                  contains=["mask-data"])
+        self.tier("ps_a_certmask", ps(["v_cmp_eq_u32_e64 s[4:5], 1, v0", "v_cndmask_b32_e64 v6, 0, 1, s4"]), "A", [], [])
+
     def test_c_elected_lane_side_effect_not_a_count(self):
         self.tier("ps_c_elect", ps([
             "v_and_b32_e32 v4, 3, v0", "v_cmp_eq_u32_e32 vcc, 1, v4", "s_and_saveexec_b64 s[12:13], vcc",
