@@ -1178,5 +1178,192 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(self.state.vcc, canary)
 
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Phase 7: Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def setUp(self) -> None:
+        self.state = ScalarState(lds_size_dwords=1024)
+        self.interp = ScalarInterpreter()
+
+    def test_signed_zeros(self) -> None:
+        addr = 0x40
+        idx = addr >> 2
+
+        # (+0.0) - (+0.0) = +0.0
+        self.state.lds.write_dword(idx, POS_ZERO_F32)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, POS_ZERO_F32)
+        instr = DSSubRtnF32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+        )
+        old_val, new_mem = self.interp.execute(instr, self.state)
+        self.assertEqual(old_val, POS_ZERO_F32)
+        self.assertEqual(new_mem, POS_ZERO_F32)
+
+        # (-0.0) - (-0.0) = +0.0
+        self.state.lds.write_dword(idx, NEG_ZERO_F32)
+        self.state.set_vgpr(2, NEG_ZERO_F32)
+        old_val, new_mem = self.interp.execute(instr, self.state)
+        self.assertEqual(old_val, NEG_ZERO_F32)
+        self.assertEqual(new_mem, POS_ZERO_F32)
+
+        # (+0.0) - (-0.0) = +0.0
+        self.state.lds.write_dword(idx, POS_ZERO_F32)
+        self.state.set_vgpr(2, NEG_ZERO_F32)
+        old_val, new_mem = self.interp.execute(instr, self.state)
+        self.assertEqual(old_val, POS_ZERO_F32)
+        self.assertEqual(new_mem, POS_ZERO_F32)
+
+        # (-0.0) - (+0.0) = -0.0
+        self.state.lds.write_dword(idx, NEG_ZERO_F32)
+        self.state.set_vgpr(2, POS_ZERO_F32)
+        old_val, new_mem = self.interp.execute(instr, self.state)
+        self.assertEqual(old_val, NEG_ZERO_F32)
+        self.assertEqual(new_mem, NEG_ZERO_F32)
+
+        # Finite x - x = +0.0
+        self.state.lds.write_dword(idx, FIVE_F32)
+        self.state.set_vgpr(2, FIVE_F32)
+        old_val, new_mem = self.interp.execute(instr, self.state)
+        self.assertEqual(old_val, FIVE_F32)
+        self.assertEqual(new_mem, POS_ZERO_F32)
+
+    def test_infinities(self) -> None:
+        addr = 0x60
+        idx = addr >> 2
+        self.state.set_vgpr(1, addr)
+
+        # (+inf) - (+inf) = NaN
+        self.state.lds.write_dword(idx, POS_INF_F32)
+        self.state.set_vgpr(2, POS_INF_F32)
+        instr = DSSubRtnF32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+        )
+        old_val, new_mem = self.interp.execute(instr, self.state)
+        self.assertEqual(old_val, POS_INF_F32)
+        self.assertTrue(is_nan(new_mem))
+
+        # (-inf) - (-inf) = NaN
+        self.state.lds.write_dword(idx, NEG_INF_F32)
+        self.state.set_vgpr(2, NEG_INF_F32)
+        old_val, new_mem = self.interp.execute(instr, self.state)
+        self.assertEqual(old_val, NEG_INF_F32)
+        self.assertTrue(is_nan(new_mem))
+
+        # (+inf) - (-inf) = +inf
+        self.state.lds.write_dword(idx, POS_INF_F32)
+        self.state.set_vgpr(2, NEG_INF_F32)
+        old_val, new_mem = self.interp.execute(instr, self.state)
+        self.assertEqual(old_val, POS_INF_F32)
+        self.assertEqual(new_mem, POS_INF_F32)
+
+        # (-inf) - (+inf) = -inf
+        self.state.lds.write_dword(idx, NEG_INF_F32)
+        self.state.set_vgpr(2, POS_INF_F32)
+        old_val, new_mem = self.interp.execute(instr, self.state)
+        self.assertEqual(old_val, NEG_INF_F32)
+        self.assertEqual(new_mem, NEG_INF_F32)
+
+        # 5.0 - (+inf) = -inf
+        self.state.lds.write_dword(idx, FIVE_F32)
+        self.state.set_vgpr(2, POS_INF_F32)
+        old_val, new_mem = self.interp.execute(instr, self.state)
+        self.assertEqual(old_val, FIVE_F32)
+        self.assertEqual(new_mem, NEG_INF_F32)
+
+        # 5.0 - (-inf) = +inf
+        self.state.lds.write_dword(idx, FIVE_F32)
+        self.state.set_vgpr(2, NEG_INF_F32)
+        old_val, new_mem = self.interp.execute(instr, self.state)
+        self.assertEqual(old_val, FIVE_F32)
+        self.assertEqual(new_mem, POS_INF_F32)
+
+    def test_nan_propagation(self) -> None:
+        addr = 0x80
+        idx = addr >> 2
+        self.state.set_vgpr(1, addr)
+
+        # QNAN - 5.0 = QNAN
+        self.state.lds.write_dword(idx, QNAN_F32)
+        self.state.set_vgpr(2, FIVE_F32)
+        instr = DSSubRtnF32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+        )
+        old_val, new_mem = self.interp.execute(instr, self.state)
+        self.assertEqual(old_val, QNAN_F32)
+        self.assertTrue(is_nan(new_mem))
+
+        # 5.0 - SNAN = QNAN
+        self.state.lds.write_dword(idx, FIVE_F32)
+        self.state.set_vgpr(2, SNAN_F32)
+        old_val, new_mem = self.interp.execute(instr, self.state)
+        self.assertEqual(old_val, FIVE_F32)
+        self.assertTrue(is_nan(new_mem))
+
+    def test_subnormals_without_flushing(self) -> None:
+        addr = 0xA0
+        idx = addr >> 2
+        self.state.set_vgpr(1, addr)
+
+        # Subnormal arithmetic is preserved without flushing to zero
+        self.state.lds.write_dword(idx, SUBNORM_MAX)
+        self.state.set_vgpr(2, SUBNORM_MIN)
+        instr = DSSubRtnF32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+        )
+        old_val, new_mem = self.interp.execute(instr, self.state)
+        self.assertEqual(old_val, SUBNORM_MAX)
+        self.assertEqual(new_mem, SUBNORM_MAX - SUBNORM_MIN)
+        self.assertTrue(is_subnormal(new_mem))
+
+        # Transition from normal to subnormal: FLT_MIN - SUBNORM_MIN = SUBNORM_MAX
+        self.state.lds.write_dword(idx, FLT_MIN)
+        old_val, new_mem = self.interp.execute(instr, self.state)
+        self.assertEqual(old_val, FLT_MIN)
+        self.assertEqual(new_mem, SUBNORM_MAX)
+
+    def test_overflow_to_infinity(self) -> None:
+        addr = 0xC0
+        idx = addr >> 2
+        self.state.set_vgpr(1, addr)
+
+        # FLT_MAX - (-FLT_MAX) overflows to +inf
+        self.state.lds.write_dword(idx, FLT_MAX)
+        neg_flt_max = FLT_MAX | SIGN_MASK
+        self.state.set_vgpr(2, neg_flt_max)
+        instr = DSSubRtnF32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+        )
+        old_val, new_mem = self.interp.execute(instr, self.state)
+        self.assertEqual(old_val, FLT_MAX)
+        self.assertEqual(new_mem, POS_INF_F32)
+
+    def test_offset_boundary_extremes(self) -> None:
+        # Max 16-bit offset: 0xFFFF
+        self.state.set_vgpr(1, 4)
+        instr = DSSubRtnF32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=Immediate(ONE_F32),
+            offset=0xFFFF,
+        )
+        expected_idx = (0x10003 >> 2) & 1023
+        self.state.lds.write_dword(expected_idx, TEN_F32)
+        old_val, new_mem = self.interp.execute(instr, self.state)
+        self.assertEqual(old_val, TEN_F32)
+        self.assertEqual(new_mem, f32_to_bits(9.0))
+        self.assertEqual(self.state.lds.read_dword(expected_idx), f32_to_bits(9.0))
+
+
 if __name__ == "__main__":
     unittest.main()
