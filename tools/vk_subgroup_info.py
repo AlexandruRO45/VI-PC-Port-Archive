@@ -44,6 +44,8 @@ VK_STRUCTURE_TYPE_APPLICATION_INFO = 0
 VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO = 1
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 = 1000059000
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 = 1000059001
+VK_SHADER_STAGE_VERTEX_BIT = 0x1
+VK_SUBGROUP_FEATURE_BALLOT_BIT = 0x8
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES = 1000094000
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES = 51
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES = 53
@@ -285,7 +287,8 @@ def query() -> dict:
             if rank > chosen_rank:
                 chosen_rank = rank
                 chosen = (dev_name,
-                          subgroup.subgroupSize, subgroup.supportedStages, sg.minSubgroupSize, sg.maxSubgroupSize,
+                          subgroup.subgroupSize, subgroup.supportedStages, subgroup.supportedOperations,
+                          sg.minSubgroupSize, sg.maxSubgroupSize,
                           sg.requiredSubgroupSizeStages, bool(u32(f13, F13_SUBGROUP_SIZE_CONTROL)),
                           bool(u32(bary, 16)) and u32(drv, 16) != VK_DRIVER_ID_MOLTENVK,
                           int.from_bytes(raw[PROPS_MAX_PUSH_CONSTANTS_SIZE:PROPS_MAX_PUSH_CONSTANTS_SIZE + 4], "little"),
@@ -298,7 +301,7 @@ def query() -> dict:
                     "the runtime needs matches"
                 )
             raise RuntimeError("no Vulkan 1.3 GPU with the features and graphics queue the runtime needs")
-        (name, subgroup_size, supported_stages, lo, hi, required_stages, sgc, per_vertex,
+        (name, subgroup_size, supported_stages, operations, lo, hi, required_stages, sgc, per_vertex,
          max_push_constants_size, vendor, device, driver) = chosen
         compute_required = bool(required_stages & VK_SHADER_STAGE_COMPUTE_BIT)
         mesh_required = bool(required_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
@@ -318,6 +321,7 @@ def query() -> dict:
             "mesh_in_required_stages": mesh_required,
             "compute_in_supported_stages": compute_supported,
             "mesh_in_supported_stages": mesh_supported,
+            "vertex_ballot": bool(supported_stages & VK_SHADER_STAGE_VERTEX_BIT and operations & VK_SUBGROUP_FEATURE_BALLOT_BIT),
             "native64_compute": compute64,
             "native64": compute64 and mesh64,
             "per_vertex_inputs": per_vertex,

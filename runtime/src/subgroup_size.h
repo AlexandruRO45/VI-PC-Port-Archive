@@ -68,7 +68,7 @@ enum class SubgroupOutcome {
     device_default,   // cannot be required, but the default size is the wanted one: works, not guaranteed stable
     unavailable,      // the wanted size cannot be had: the shader runs at another size and may be inexact
     halves,           // wave32 with `wave32_halves`: the size cannot be had, but every size the device runs is a
-                      // multiple of 32 and the shader keeps each wave in its own 32 lanes, so it is exact
+                      // multiple of 32 and the shader keeps each wave in its own 32 lanes
     unknown_stage,    // no Vulkan stage for this entry
     unknown_device,   // the device sizes were not queried (all zero): nothing is asked for
 };
@@ -105,9 +105,9 @@ inline bool subgroup_workgroup_fits(const std::array<std::uint32_t, 3>& local_si
 //   - A device whose one and only subgroup size (min == max) is the wanted one needs nothing (`device_fixed`).
 //   - Where the size cannot be required (stage not listed, feature off) but the device default is the wanted size,
 //     the shader works as it is (`device_default`): nothing guarantees it, a driver may change its default.
-//   - A wave32 entry with `wave32_halves` (a vertex shader) is exact on any subgroup of 32k lanes, so where neither
+//   - A wave32 entry with `wave32_halves` (a vertex shader) partitions a wide subgroup into 32-lane waves, so where neither
 //     holds but the device's smallest size (minSubgroupSize, else the default) is at least 32 the outcome is
-//     `halves`: nothing to ask for, nothing inexact. The AMD Windows driver (vertex stage 64-wide, VERTEX not
+//     `halves`: no width to request. The tested RX 7600 Windows driver (vertex stage 64-wide, VERTEX not
 //     requirable) is that case.
 //     Otherwise the outcome is `unavailable`.
 inline SubgroupRequest decide_subgroup_size(const ShaderEntry& entry, const SubgroupSizeCaps& caps) {

@@ -47,7 +47,7 @@ STRUCTURED = True     # False (--dispatch-loop): every shader with branches as o
 MAX_STRUCTURED_DEPTH = 16
 WAVE64_EMULATE = False   # --wave64-emulate: wave64 compute/mesh shaders exact on any subgroup size (Gen.x_round)
 # Wave32 vertex shaders keep each wave in its own 32-lane part of the subgroup (Gen.halves; --no-wave32-halves turns
-# it off): exact on vertex subgroups of 32, 64 or any multiple of 32 (the AMD driver runs the VS stage 64-wide).
+# it off). The tested RX 7600 driver runs the vertex stage 64-wide.
 WAVE32_HALVES = True
 # --max-shared-memory: a cap on a compute shader's Workgroup variables, LDS plus %x_buf (SHADER-309, #1721). The
 # default is the hard cap: 64 KiB, RDNA2's LDS per workgroup and the largest maxComputeSharedMemorySize drivers
@@ -237,6 +237,7 @@ class Gen:
         self.uses_perm = False     # emulate: ds_permute_b32 parks its winning source lane in %x_perm
         self.uses_tex = False
         self.uses_subgroup = False
+        self.uses_shuffle = False
         self.uses_tex_array = False
         self.uses_storage = False
         self.uses_query = False
@@ -3947,12 +3948,9 @@ class Gen:
         return r
 
     # ---- wave32 halves (Gen.halves, wave32 vertex shaders) ----
-    # Vulkan cannot require a subgroup size for the vertex stage (no driver lists VERTEX in requiredSubgroupSizeStages),
-    # and the AMD Windows driver runs it 64-wide: a wave32 VS then shares one subgroup with a second wave's worth of
-    # vertices. With `halves`, subgroup lanes 32k..32k+31 are one wave: the wave lane is the subgroup lane mod 32, a
-    # ballot is read through this wave's word, a vote is that word, and a shuffle's source lane stays in this wave's
-    # 32 lanes. On a 32-wide subgroup that is what the plain translation does (word 0, base 0); on 64 it is two exact
-    # wave32s. Below 32 lanes nothing changes. Quad, DPP row, swizzle and permlane sources already stay inside 32 lanes.
+    # The tested RX 7600 driver runs vertex shaders 64-wide and omits VERTEX from requiredSubgroupSizeStages.
+    # Each group of 32 physical lanes is one guest wave. Votes use the corresponding word of a ballot,
+    # and reads of a logical lane add the physical base of the caller's wave.
     def half_base(self):
         """halves: the subgroup lane of this wave's lane 0 (the subgroup lane with its low 5 bits cleared)."""
         sg, r = self.subgroup_lane(), self.tmp()
@@ -4316,12 +4314,16 @@ class Gen:
         lo = self.x_round(bits=(bit, None))[1][0]
         self.emit(f"{r} = {'OpIEqual' if kind == 'All' else 'OpINotEqual'} %bool {lo} {self.cu(0)}")
 
+    def subgroup_shuffle(self, result, value, physical_lane):
+        self.uses_shuffle = True
+        self.emit(f"{result} = OpGroupNonUniformShuffle %uint {self.cu(3)} {value} {physical_lane}")
+
     def g_shuffle(self, r, v, src):
         """r = v of lane src of this wave (OpGroupNonUniformShuffle, or any emulated lane 0-63)."""
         if self.halves:
             src = self.half_lane(src)
         if not self.emulate:
-            self.emit(f"{r} = OpGroupNonUniformShuffle %uint %c3 {v} {src}")
+            self.subgroup_shuffle(r, v, src)
             return
         read = self.x_round(data=v)[0]
         self.emit(f"{r} = OpCopyObject %uint {read(src)}")
@@ -4338,7 +4340,7 @@ class Gen:
             self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
             self.emit(f"{present} = OpGroupNonUniformBallotBitExtract %bool %c3 {ballot} {src}")
             self.emit(f"{safe_src} = OpSelect %uint {present} {src} {lane}")
-            self.emit(f"{shuffled} = OpGroupNonUniformShuffle %uint %c3 {value} {safe_src}")
+            self.subgroup_shuffle(shuffled, value, safe_src)
             self.emit(f"{mask} = OpSelect %uint {present} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
             self.emit(f"{result} = OpBitwiseAnd %uint {shuffled} {mask}")
             self.uses_subgroup = self.uses_ballot = True
@@ -4417,9 +4419,9 @@ class Gen:
             ex, shv, v, shd, hit, nxt = (self.tmp() for _ in range(6))
             # a shuffle from a lane that isn't running (the missing lanes of a partial wave) is undefined
             self.emit(f"{ex} = OpGroupNonUniformBallotBitExtract %bool %c3 {bal} {src}")
-            self.emit(f"{shv} = OpGroupNonUniformShuffle %uint %c3 {tp} {src}")
+            self.subgroup_shuffle(shv, tp, src)
             self.emit(f"{v} = OpSelect %uint {ex} {shv} {self.cu(0)}")
-            self.emit(f"{shd} = OpGroupNonUniformShuffle %uint %c3 {dat} {src}")
+            self.subgroup_shuffle(shd, dat, src)
             self.emit(f"{hit} = OpIEqual %bool {v} {mine}")
             self.emit(f"{nxt} = OpSelect %uint {hit} {shd} {acc}")
             acc = nxt
@@ -5408,7 +5410,7 @@ class Gen:
             if src.get("k") == "vgpr":
                 self.uses_subgroup = True
                 shuffled = self.tmp()
-                self.emit(f"{shuffled} = OpGroupNonUniformShuffle %uint {self.cu(3)} {src_val} {safe_sg}")
+                self.subgroup_shuffle(shuffled, src_val, safe_sg)
             else:
                 shuffled = src_val
 
@@ -5685,7 +5687,7 @@ class Gen:
                 self.emit(f"{any_} = OpINotEqual %bool {w} {self.cu(0)}")
                 self.emit(f"{rel} = OpSelect %uint {any_} {lsb} {self.cu(0)}")
                 self.emit(f"{first} = OpBitwiseOr %uint {rel} {self.half_base()}")
-                self.emit(f"{r} = OpGroupNonUniformShuffle %uint {self.cu(3)} {v} {first}")
+                self.subgroup_shuffle(r, v, first)
                 self.dst(a[0], r)
                 return
             self.uses_subgroup = self.uses_ballot = self.uses_vote = True
@@ -5698,7 +5700,7 @@ class Gen:
                 self.emit(f"{lsb} = OpGroupNonUniformBallotFindLSB %uint {self.cu(3)} {bal}")
             self.emit(f"{any_} = OpGroupNonUniformAny %bool {self.cu(3)} {act}")
             self.emit(f"{first} = OpSelect %uint {any_} {lsb} {self.cu(0)}")
-            self.emit(f"{r} = OpGroupNonUniformShuffle %uint {self.cu(3)} {v} {first}")
+            self.subgroup_shuffle(r, v, first)
             self.dst(a[0], r)
         elif op in ("image_sample_o", "image_sample_lz_o", "image_sample_l_o", "image_sample_b_o",
                     "image_sample_c_lz_o") or                 op in ("image_sample", "image_sample_lz", "image_sample_l", "image_sample_b", "image_sample_c_lz",
@@ -6418,14 +6420,13 @@ class Gen:
             self.emit(f"{ln} = OpShiftRightLogical %uint {s1} {self.cu(2)}")
             self.emit(f"{src} = OpBitwiseAnd %uint {ln} {self.cu(31)}")
             self.sub_lane(lane)
-            if self.wave64:
-                # RDNA2 ISA 10.4.4: each half-wave permutes independently.
+            if self.wave64 or self.halves:
+                # Wave64 permutes each half independently (ISA 10.4.4). Partitioned VSs use the full
+                # physical base so the third and fourth waves of a 128-wide subgroup also stay local.
                 half, full_src = self.tmp(), self.tmp()
-                self.emit(f"{half} = OpBitwiseAnd %uint {lane} {self.cu(32)}")
+                self.emit(f"{half} = OpBitwiseAnd %uint {lane} {self.cu(0xFFFFFFE0 if self.halves else 32)}")
                 self.emit(f"{full_src} = OpBitwiseOr %uint {half} {src}")
                 src = full_src
-            elif self.halves:
-                src = self.half_lane(src)
             self.ds_lane_read(d, dat, src, lane)
         elif op == "ds_permute_b32":
             self.ds_permute(a, mods)
@@ -12015,16 +12016,19 @@ def assemble(gen):
     for i in range(USER_SGPRS):          # index constants for the user-data copy at entry
         gen.cu(i)
     # SPIR-V module layout: every OpCapability, then every OpExtension, then imports.
+    # In a partitioned VS the lane input requires Basic. Only an actual shuffle needs Shuffle;
+    # votes and mask reductions use a ballot word. Keep fallback modules byte-compatible.
+    shuffle = sg and (gen.uses_shuffle or not gen.halves)
     caps = ["Shader"] + (["Int64", "PhysicalStorageBufferAddresses"] if psb else []) + \
-        (["RuntimeDescriptorArray"] if tex else []) + (["GroupNonUniform", "GroupNonUniformShuffle"] if sg else []) + \
-        (["ImageQuery"] if gen.uses_query else []) + (["Sampled1D"] if gen.uses_tex_1d else []) + \
+        (["RuntimeDescriptorArray"] if tex else []) + (["GroupNonUniform"] if sg else []) + \
+        (["GroupNonUniformShuffle"] if shuffle else []) + (["ImageQuery"] if gen.uses_query else []) + (["Sampled1D"] if gen.uses_tex_1d else []) + \
         (["MinLod"] if gen.uses_minlod else []) + (["ImageGatherExtended"] if gen.uses_img_offset else []) + \
         (["FragmentBarycentricKHR"] if bary_builtin else [])
-    if gen.uses_vote:
+    if gen.uses_vote and not gen.halves:
         caps += [c for c in ("GroupNonUniform", "GroupNonUniformVote") if c not in caps]
     if gen.uses_ballot or gen.uses_bcast_first:
         caps += [c for c in ("GroupNonUniform", "GroupNonUniformBallot") if c not in caps]
-    if gen.uses_wave_bits:
+    if gen.uses_wave_bits and not gen.halves:
         caps += [c for c in ("GroupNonUniform", "GroupNonUniformArithmetic") if c not in caps]
     if gen.uses_quad:
         caps += [c for c in ("GroupNonUniform", "GroupNonUniformQuad") if c not in caps]
@@ -14690,7 +14694,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         if g.w64g["idioms"]:
             m["wave64_graphics_idioms"] = g.w64g["idioms"]
     if g.halves:
-        # Exact on any vertex subgroup size that is a multiple of 32 (runtime/src/subgroup_size.h: `halves`).
+        # The runtime can accept wide vertex subgroups for these partitioned lane operations.
         m["wave32_halves"] = True
     if g.emulate:
         # Exact on any subgroup size: no subgroup operation, cross-lane data in %x_buf (workgroup memory).
@@ -14997,8 +15001,7 @@ def main():
                     help="wave64 compute and mesh shaders exact on any subgroup size (32-wide NVIDIA, Intel): "
                          "cross-lane operations go through workgroup memory instead of subgroup operations")
     ap.add_argument("--no-wave32-halves", action="store_true",
-                    help="translate wave32 vertex shaders as one wave per subgroup (exact only on 32-wide vertex "
-                         "subgroups) instead of one wave per 32 subgroup lanes (exact on 32, 64 or any multiple)")
+                    help="translate wave32 vertex shaders as one wave per subgroup instead of one wave per 32 subgroup lanes")
     ap.add_argument("--wave64-graphics", choices=("warn", "error", "off"), default="warn",
                     help="wave64 vertex, pixel and geometry shaders that are not exact on 32-wide subgroups (tier C of "
                          "tools/wave64_halves.py): warn = count them in the summary and mark them in the index, "

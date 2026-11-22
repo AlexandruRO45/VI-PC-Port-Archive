@@ -58,6 +58,7 @@ class FakeDevice:
     buffer_device_address: bool = True
     subgroup_size_control: bool = True
     queue_flags: tuple[int, ...] = (vk_info.VK_QUEUE_GRAPHICS_BIT,)
+    subgroup_operations: int = 0
     subgroup_size: int = 32
     subgroup_supported_stages: int = (
         vk_info.VK_SHADER_STAGE_COMPUTE_BIT | vk_info.VK_SHADER_STAGE_MESH_BIT_EXT
@@ -199,6 +200,7 @@ class FakeVulkan:
                 subgroup = vk_info.SubgroupProperties.from_address(node_addr)
                 subgroup.subgroupSize = dev.subgroup_size
                 subgroup.supportedStages = dev.subgroup_supported_stages
+                subgroup.supportedOperations = dev.subgroup_operations
             elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES:
                 found_sg = True
                 sg = vk_info.SubgroupSizeControl.from_address(node_addr)
@@ -794,6 +796,7 @@ class QueryTest(unittest.TestCase):
                     "mesh_in_required_stages": want_mesh,
                     "compute_in_supported_stages": True,
                     "mesh_in_supported_stages": True,
+                    "vertex_ballot": False,
                     "native64_compute": want_native64 or label == "missing_mesh_stage_bit",
                     "native64": want_native64,
                     "per_vertex_inputs": True,
@@ -804,6 +807,13 @@ class QueryTest(unittest.TestCase):
                     "rdna1_amd_windows": False,
                     "rdna2_amd_windows": False,
                 })
+
+    def test_vertex_ballot_requires_both_stage_and_operation(self):
+        for stage in (0, vk_info.VK_SHADER_STAGE_VERTEX_BIT):
+            for ops in (2, 2 | vk_info.VK_SUBGROUP_FEATURE_BALLOT_BIT):
+                with self.subTest(stage=stage, operations=ops):
+                    result, _ = self._run_query(FakeDevice(subgroup_supported_stages=stage, subgroup_operations=ops))
+                    self.assertEqual(result["vertex_ballot"], bool(stage and ops & 8))
 
     def test_max_push_constants_size(self):
         """limits.maxPushConstantsSize is read from VkPhysicalDeviceProperties (offset 328 on 64-bit)."""

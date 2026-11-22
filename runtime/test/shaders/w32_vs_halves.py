@@ -1,5 +1,5 @@
-"""Wave32 vertex shaders on a vertex subgroup wider than 32 lanes (the AMD Windows driver runs the vertex stage
-64-wide and Vulkan cannot require 32 for it: requiredSubgroupSizeStages has no VERTEX).
+"""Wave32 vertex shaders on a vertex subgroup wider than 32 lanes (the tested RX 7600 Windows driver runs the
+vertex stage 64-wide and omits VERTEX from requiredSubgroupSizeStages).
 
     python3 -I runtime/test/shaders/w32_vs_halves.py <dir with vk_harness> <spirv dir> [name ...]
 

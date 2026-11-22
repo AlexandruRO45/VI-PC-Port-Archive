@@ -45,11 +45,14 @@ class Wave32HalvesFallbackTest(unittest.TestCase):
         self.assertIn(("--no-wave32-halves", "no_wave32_halves"), make_game.FALLBACK_FLAGS)
 
     def test_moltenvk_has_no_vertex_lane(self):
-        self.assertTrue(make_game.vertex_lane_unavailable({"driver_id": 14}))
+        self.assertTrue(make_game.wave32_halves_fallback({"driver_id": 14, "vertex_ballot": True}))
+
+    def test_missing_vertex_ballot_uses_fallback(self):
+        self.assertTrue(make_game.wave32_halves_fallback({"driver_id": 1, "vertex_ballot": False}))
 
     def test_other_drivers_and_unknown_keep_halves(self):
         for info in ({"driver_id": 1}, {"driver_id": 3}, {"driver_id": None}, {}):
-            self.assertFalse(make_game.vertex_lane_unavailable(info), info)
+            self.assertFalse(make_game.wave32_halves_fallback(info), info)
 
 
 class TranslateFallbacksTest(unittest.TestCase):

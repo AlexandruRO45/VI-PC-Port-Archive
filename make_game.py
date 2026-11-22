@@ -1236,13 +1236,13 @@ def runtime_gpu_per_vertex():
 VK_DRIVER_ID_MOLTENVK = 14
 
 
-def vertex_lane_unavailable(info: dict) -> bool:
-    """Whether the GPU in `info` (tools/vk_subgroup_info.py's answer) can't give a vertex shader its subgroup lane:
-    MoltenVK, whose SPIR-V to MSL conversion has no SIMD-group lane in a vertex function ("Subgroup builtins are not
-    available in this type of function", #1784, #2493). Wave32 vertex shaders translated with halves read that lane,
-    so there they are translated with --no-wave32-halves; Apple GPUs run 32-wide SIMD-groups, where the halves change
-    nothing. False when the driver is not known."""
-    return info.get("driver_id") == VK_DRIVER_ID_MOLTENVK
+def wave32_halves_fallback(info: dict) -> str | None:
+    """Reason to use the old VS lowering on the selected GPU, if known."""
+    if info.get("driver_id") == VK_DRIVER_ID_MOLTENVK:
+        return "MoltenVK vertex functions cannot read the subgroup lane"
+    if info.get("vertex_ballot") is False:
+        return "the device does not support subgroup ballots in vertex shaders"
+    return None
 
 
 def runtime_gpu_max_push_constants():
@@ -1854,8 +1854,7 @@ def main() -> int:
                          "without VK_EXT_mesh_shader")
     ap.add_argument("--no-wave32-halves", action="store_true",
                     help="translate wave32 vertex shaders as one wave per subgroup instead of one per 32 subgroup "
-                         "lanes (exact on 64-wide vertex subgroups, as on AMD); on by itself on MoltenVK, whose "
-                         "vertex functions have no subgroup lane")
+                         "lanes; selected automatically on MoltenVK and devices without vertex subgroup ballots")
     ap.add_argument("--pc-tail-ubo", action="store_true",
                     help="keep s0..s31 in 128 push-constant bytes and move heap/code base to a set-1 uniform "
                          "block; on by itself when the runtime's GPU reports maxPushConstantsSize below what "
@@ -1932,10 +1931,11 @@ def main() -> int:
         log("shaders: the GPU the runtime would use can't take PerVertexKHR inputs (MoltenVK, or no "
             "fragmentShaderBarycentric): translating with --f16-interp-fallback")
         a.f16_interp_fallback = True
-    if "shaders" in stages and not a.no_wave32_halves and vertex_lane_unavailable(runtime_gpu_info()):
-        log("shaders: the GPU the runtime would use is MoltenVK, whose vertex functions have no subgroup lane: "
-            "translating with --no-wave32-halves (its 32-wide SIMD-groups don't need the halves)")
-        a.no_wave32_halves = True
+    if "shaders" in stages and not a.no_wave32_halves:
+        reason = wave32_halves_fallback(runtime_gpu_info())
+        if reason:
+            log(f"shaders: {reason}; translating with --no-wave32-halves")
+            a.no_wave32_halves = True
     if "shaders" in stages and not a.pc_tail_ubo:
         need_pc = 152 if a.mesh_compute else 144
         max_pc = runtime_gpu_max_push_constants()

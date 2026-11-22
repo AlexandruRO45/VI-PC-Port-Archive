@@ -798,7 +798,7 @@ the game's present entry point (`PresentX`; the DXGI factory/swapchain and the p
     so a wave32 VS shared one subgroup with a second wave's worth of vertices: lanes 32..63 reported lane 32,
     `v_readfirstlane`, ballots, votes and `s_bcnt1` covered 64 vertices, `ds_bpermute` read the other half and a
     write to `exec_lo` did not reach lanes 32..63. The translator now keeps each wave in its own 32 subgroup lanes
-    (docs/design.md, "Wave32 vertex shaders on wider subgroups"), which is exact on any subgroup of 32k lanes, and the
+    (docs/design.md, "Wave32 vertex shaders on wider subgroups"), and the
     decision is `halves` there: nothing is required and nothing is logged. A device that can run the stage below
     32 lanes still gets `unavailable` (or `device_default` when its default is 32).
   - **A size the device cannot give** is logged once per stage with the first shader's name (and again at 10, 100,

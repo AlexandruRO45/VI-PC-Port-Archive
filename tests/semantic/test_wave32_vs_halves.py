@@ -1,7 +1,6 @@
 """Wave32 vertex shaders on vertex subgroups of 32 and 64 invocations (tools/rdna2spirv.py `Gen.halves`).
 
-Vulkan cannot require a vertex subgroup size (no driver lists VERTEX in requiredSubgroupSizeStages) and the AMD
-Windows driver runs the vertex stage 64-wide (measured on an RX 7600, driver 26.11.2, by
+The tested AMD Windows driver omits VERTEX from requiredSubgroupSizeStages and runs the vertex stage 64-wide (measured on an RX 7600, driver 26.11.2, by
 runtime/test/shaders/w32_vs_halves.py). A wave32 VS then shares one subgroup with a second wave's worth of
 vertices. With halves (the default), subgroup lanes 32k..32k+31 are one wave: the reference here is an independent
 model of two wave32s of 32 lanes each, written from the RDNA2 ISA (v_mbcnt_lo, s_bcnt1, s_ff1, v_readfirstlane,
@@ -84,7 +83,11 @@ def model(name, invocations):
 
 
 def translate(name, halves):
-    body = sized(PROLOGUE + PROGRAMS[name] + EPILOGUE)
+    return translate_program(name, PROLOGUE + PROGRAMS[name] + EPILOGUE, halves)
+
+
+def translate_program(name, program, halves):
+    body = sized(program)
     asm = f"; vs_w32_{name}\n" + "".join(f"\t{ln}\n" for ln in body)
     saved = rdna2spirv.WAVE32_HALVES
     rdna2spirv.WAVE32_HALVES = halves
@@ -92,7 +95,7 @@ def translate(name, halves):
         with tempfile.TemporaryDirectory() as tmp:
             os.mkdir(os.path.join(tmp, "disasm"))
             src = os.path.join(tmp, "disasm", f"vs_w32_{name}.s")
-            with open(src, "w", encoding="utf-8") as f:
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
                 f.write(asm)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", ResourceWarning)
@@ -125,6 +128,38 @@ class Wave32VertexHalves(unittest.TestCase):
 
     def test_vccz_vote_and_exec_lo_write(self):
         self.check("vote")
+
+    def test_bpermute_masks_the_source_and_preserves_inactive_destinations(self):
+        program = ["v_mbcnt_lo_u32_b32 v6, -1, 0", "v_mov_b32_e32 v7, 42",
+                   "v_and_b32_e32 v4, 2, v6", "v_add_nc_u32_e32 v4, 1, v4",
+                   "v_lshlrev_b32_e32 v4, 2, v4", "s_mov_b32 exec_lo, 0xfffffffd",
+                   "ds_bpermute_b32 v7, v4, v0", "s_waitcnt lgkmcnt(0)", "s_mov_b32 exec_lo, -1"]
+        spv = translate_program("inactive_gather", program + EPILOGUE, True)
+        for size in (32, 64):
+            rows = run(spv, size)
+            for i, (param0, _) in enumerate(rows):
+                lane = i % 32
+                # Source lane 1 is disabled. Source lane 3 holds a different vertex in each wave.
+                want = BASE + i - lane + 3 if lane & 2 else 0
+                if lane == 1:
+                    want = 42
+                self.assertEqual(param0[1], want, (size, i))
+
+    def test_partitioned_capabilities_follow_the_operations(self):
+        exports = ["exp pos0 v0, v0, v0, v0 done", "exp param0 v6, v6, v6, v6", "s_endpgm"]
+        cases = [
+            ("plain", ["v_mov_b32_e32 v6, v0"], set()),
+            ("lane_only", ["v_mbcnt_lo_u32_b32 v6, -1, 0"], {""}),
+            ("vote_only", ["v_cmp_eq_u32_e32 vcc_lo, 37, v0", "s_cbranch_vccz 1",
+                           "s_mov_b32 s5, 7", "v_mov_b32_e32 v6, s5"], {"", "Ballot"}),
+            ("mask_only", ["s_bcnt1_i32_b32 s5, exec_lo", "v_mov_b32_e32 v6, s5"], {"", "Ballot"}),
+            ("first", ["v_readfirstlane_b32 s5, v0", "v_mov_b32_e32 v6, s5"], {"", "Ballot", "Shuffle"}),
+            ("read", ["v_readlane_b32 s5, v0, 5", "v_mov_b32_e32 v6, s5"], {"", "Shuffle"}),
+        ]
+        for name, program, capabilities in cases:
+            with self.subTest(name=name):
+                spv = translate_program(name, program + exports, True)
+                self.assertEqual(set(re.findall(r"OpCapability GroupNonUniform(\w*)", spv)), capabilities)
 
     def test_reads_this_waves_ballot_word(self):
         spv = translate("lane", halves=True)
