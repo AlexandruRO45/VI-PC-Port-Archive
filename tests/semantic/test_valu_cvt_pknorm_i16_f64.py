@@ -363,5 +363,200 @@ class TestValuCvtPknormI16F64ModelAndOracle(unittest.TestCase):
             self.assertAlmostEqual(val, reconstructed, delta=1.0 / 32767.0)
 
 
+# ==============================================================================
+# Commit 2: Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+
+
+@dataclass(frozen=True)
+class Reg32:
+    """Represents an architectural 32-bit register (VGPR or SGPR)."""
+    index: int
+    reg_type: RegType
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"Reg32 index {self.index} out of range [0, 255]")
+
+    @property
+    def name(self) -> str:
+        prefix = "v" if self.reg_type == RegType.VGPR else "s"
+        return f"{prefix}{self.index}"
+
+
+@dataclass(frozen=True)
+class Reg64:
+    """Represents an architectural aligned 64-bit register pair (e.g. v[0:1] or s[0:1])."""
+    index: int
+    reg_type: RegType
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 254):
+            raise ValueError(f"Reg64 index {self.index} out of range [0, 254]")
+
+    @property
+    def name(self) -> str:
+        prefix = "v" if self.reg_type == RegType.VGPR else "s"
+        return f"{prefix}[{self.index}:{self.index + 1}]"
+
+
+@dataclass(frozen=True)
+class Literal64:
+    """Represents a 64-bit literal or inline float constant."""
+    bits: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.bits <= 0xFFFFFFFFFFFFFFFF):
+            raise ValueError(f"Literal64 bits 0x{self.bits:X} out of range [0, 0xFFFFFFFFFFFFFFFF]")
+
+    @classmethod
+    def from_float(cls, val: float) -> Literal64:
+        return cls(f64_to_bits(val))
+
+    @property
+    def name(self) -> str:
+        return f"0x{self.bits & MASK64:016X}"
+
+
+@dataclass(frozen=True)
+class VOP3Operand64:
+    """Typed 64-bit expression operand with optional input modifiers (abs, neg)."""
+    source: Union[Reg64, Literal64]
+    abs_mod: bool = False
+    neg_mod: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source, (Reg64, Literal64)):
+            raise TypeError(f"Operand source must be Reg64 or Literal64, got {type(self.source).__name__}")
+
+    def disassemble(self) -> str:
+        s = self.source.name
+        if self.abs_mod and self.neg_mod:
+            return f"-|{s}|"
+        elif self.abs_mod:
+            return f"|{s}|"
+        elif self.neg_mod:
+            return f"-{s}"
+        return s
+
+
+class Opcode(Enum):
+    V_CVT_PKNORM_I16_F64 = "v_cvt_pknorm_i16_f64"
+
+
+@dataclass(frozen=True)
+class VCvtPknormI16F64Instruction:
+    """Symbolic AST node representing a RDNA2 v_cvt_pknorm_i16_f64 instruction."""
+    dst: Reg32
+    src0: VOP3Operand64
+    src1: VOP3Operand64
+    clamp: bool = False
+    opcode: Opcode = Opcode.V_CVT_PKNORM_I16_F64
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination of VALU instruction must be VGPR, got {self.dst.reg_type}")
+        if not isinstance(self.src0, VOP3Operand64):
+            raise TypeError(f"src0 must be VOP3Operand64, got {type(self.src0).__name__}")
+        if not isinstance(self.src1, VOP3Operand64):
+            raise TypeError(f"src1 must be VOP3Operand64, got {type(self.src1).__name__}")
+
+    def disassemble(self) -> str:
+        s = f"{self.opcode.value} {self.dst.name}, {self.src0.disassemble()}, {self.src1.disassemble()}"
+        if self.clamp:
+            s += " clamp"
+        return s
+
+
+class TestValuCvtPknormI16F64SymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_reg_types_and_bounds(self) -> None:
+        """Verify register boundary indices and naming conventions."""
+        v0 = Reg32(0, RegType.VGPR)
+        v255 = Reg32(255, RegType.VGPR)
+        vpair = Reg64(0, RegType.VGPR)
+        spair = Reg64(2, RegType.SGPR)
+
+        self.assertEqual(v0.name, "v0")
+        self.assertEqual(v255.name, "v255")
+        self.assertEqual(vpair.name, "v[0:1]")
+        self.assertEqual(spair.name, "s[2:3]")
+
+        with self.assertRaises(ValueError):
+            Reg32(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg32(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg64(255, RegType.VGPR)
+
+    def test_literal_operand_creation(self) -> None:
+        """Verify 64-bit literal constants creation from integers and floats."""
+        lit_hex = Literal64(0x3FF0000000000000)
+        lit_f = Literal64.from_float(1.0)
+        self.assertEqual(lit_hex.bits, 0x3FF0000000000000)
+        self.assertEqual(lit_f.bits, 0x3FF0000000000000)
+
+        with self.assertRaises(ValueError):
+            Literal64(-1)
+        with self.assertRaises(ValueError):
+            Literal64(0x1_0000_0000_0000_0000)
+
+    def test_operand_modifiers_disassembly(self) -> None:
+        """Verify operand formatting with abs, neg, and abs+neg modifiers."""
+        vpair = Reg64(2, RegType.VGPR)
+        op_plain = VOP3Operand64(vpair)
+        op_abs = VOP3Operand64(vpair, abs_mod=True)
+        op_neg = VOP3Operand64(vpair, neg_mod=True)
+        op_absneg = VOP3Operand64(vpair, abs_mod=True, neg_mod=True)
+
+        self.assertEqual(op_plain.disassemble(), "v[2:3]")
+        self.assertEqual(op_abs.disassemble(), "|v[2:3]|")
+        self.assertEqual(op_neg.disassemble(), "-v[2:3]")
+        self.assertEqual(op_absneg.disassemble(), "-|v[2:3]|")
+
+    def test_instruction_disassembly(self) -> None:
+        """Verify complete instruction disassembly for standard and modified forms."""
+        dst = Reg32(5, RegType.VGPR)
+        s0 = VOP3Operand64(Reg64(0, RegType.VGPR))
+        s1 = VOP3Operand64(Reg64(2, RegType.SGPR), neg_mod=True)
+
+        instr = VCvtPknormI16F64Instruction(dst=dst, src0=s0, src1=s1)
+        self.assertEqual(instr.disassemble(), "v_cvt_pknorm_i16_f64 v5, v[0:1], -s[2:3]")
+
+        instr_clamped = VCvtPknormI16F64Instruction(dst=dst, src0=s0, src1=s1, clamp=True)
+        self.assertEqual(instr_clamped.disassemble(), "v_cvt_pknorm_i16_f64 v5, v[0:1], -s[2:3] clamp")
+
+    def test_ast_immutability_and_equality(self) -> None:
+        """Verify frozen AST dataclasses ensure immutability and valid hashing."""
+        v0 = Reg32(0, RegType.VGPR)
+        s0 = VOP3Operand64(Reg64(2, RegType.VGPR))
+        instr1 = VCvtPknormI16F64Instruction(v0, s0, s0)
+        instr2 = VCvtPknormI16F64Instruction(v0, s0, s0)
+
+        self.assertEqual(instr1, instr2)
+        self.assertEqual(hash(instr1), hash(instr2))
+        with self.assertRaises((dataclasses.FrozenInstanceError, TypeError)):
+            instr1.clamp = True  # type: ignore
+
+    def test_ast_rejection_sgpr_destination(self) -> None:
+        """Verify VALU instructions reject SGPR destinations."""
+        s0 = Reg32(0, RegType.SGPR)
+        v0 = VOP3Operand64(Reg64(2, RegType.VGPR))
+        with self.assertRaises(TypeError):
+            VCvtPknormI16F64Instruction(dst=s0, src0=v0, src1=v0)
+
+    def test_operand_type_rejection(self) -> None:
+        """Verify invalid operand types raise TypeError."""
+        with self.assertRaises(TypeError):
+            VOP3Operand64("v[0:1]")  # type: ignore
+        with self.assertRaises(TypeError):
+            VCvtPknormI16F64Instruction(Reg32(0, RegType.VGPR), "bad", VOP3Operand64(Reg64(2, RegType.VGPR)))  # type: ignore
+
+
 if __name__ == "__main__":
     unittest.main()
