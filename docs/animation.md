@@ -445,7 +445,10 @@ u32; u32 count}` with `Entry {u64 key; T *value; Entry *next}`. Hashes are `joaa
 | | `+0xA0` u32 groups, `+0xA4` u32 entries, `+0xA8` pointer | a hash table of the clips: per group 16 control bytes (0x80 empty, below 0x80 full), then 16 slots `{u32 clip hash; u32 not decoded; u32 record index; u32 0}` |
 | | `+0x170`/`+0x174`/`+0x178` | the same kind of table with 8-byte slots `{u32 hash; u32 index}` |
 | | `+0x188` u32, `+0x18C` u32 | the clip's own hash and the dictionary's `joaat32(name)`, as `.motion` has at `+0x28`/`+0x2C` |
-| matcher feature object | `+0x18` u32, `+0x28` pointer, `+0x30` pointer or null | 1 (measured separately), then the skeleton (below) and an object not decoded here |
+| | `+0x48` pointer, count at `+0x44` | one 40-byte item, zero except a u32 1 at its `+0x20` (`+0x40` is the name's length and capacity) |
+| | `+0x118` pointer, count at `+0x114` | one u32: the pose sample count |
+| | `+0x128` pointer, count at `+0x124` | one u16, 0 |
+| matcher feature object | `+0x18` u32, `+0x28` pointer, `+0x30` pointer or null | 1 (measured separately), then the skeleton and the `+0x30` object (both below) |
 | | `+0x40` pointer, count at `+0x3C` | pointers to the features, 0x30 bytes each: `{+0x08 u32 column; +0x0C u16 width; +0x0E u16 (1 or 5); +0x18 u32 bone name hash; +0x1C u32 kind bits}` |
 | | `+0x48` u32 groups, `+0x4C` u32 entries, `+0x50` pointer | a hash table like the clip table, 8-byte slots `{u32 hash; u32 feature index}` |
 | | `+0xF0` pointer, count at `+0xEC` | the pose matrix, f16, in 32-byte chunks: one row of feature values per sample (layouts below) |
@@ -453,6 +456,11 @@ u32; u32 count}` with `Entry {u64 key; T *value; Entry *next}`. Hashes are `joaa
 | | with `+0x30`: `+0xA8` pointer, count at `+0xA4` | one 48-byte `{f32 quaternion[4]; f32 vec3; f32 0; f32 1, 1, 1; f32 0}` per sample |
 | | without `+0x30`: `+0xFC` u32, `+0x128` u32 | columns, samples (the matrix is in blocks of 8 samples) |
 | | with `+0x30`: `+0x98` pointer, count at `+0x94` | one u32 per sample, the same for every sample of a record |
+| | `+0xB8` pointer, count at `+0xB4` | one f32 per 8 pose columns (rounded up) |
+| | `+0xC0` f32, `+0xC4` f32, `+0xC8` u32 | not decoded, then 1.0, then 1 with rows and 3 with blocks of 8 |
+| matcher `+0x30` object (112 bytes) | `+0x08` u32 | its form: 1 or 2 |
+| | form 2: `+0x18`/`+0x1C` f32, `+0x4C` u32, `+0x68` u32 | two weights; a feature kind (bits as `+0x1C` of a feature) and its width |
+| | form 1: `+0x40` {u32 n; u32 n; pointer}, `+0x50` the same | n f32 values, then n f32 weights |
 | matcher skeleton (feature object `+0x28`) | `+0x18` u32 slots, `+0x1C` u32 entries, `+0x20` pointer | tag table, 8-byte slots `{u32 tag; u32 bone}`, empty tag 0xFFFFFFFF |
 | | `+0x28` pointer, `+0x6C` u16 count (`+0x6E` the same, measured separately) | the bones, 80 bytes each: `{f32 rotation quaternion[4]; f32 translation[3]; 4 bytes; f32 1.0[4]; char *name at +0x30; s16 parent at +0x46; u16 index at +0x48 and +0x4C; u16 bone id at +0x4A}` (the 1.0s and the two indices on 180 of 180, measured separately) |
 | | `+0x30`, `+0x38` pointers | per bone a 4x4 f32 matrix: the inverse bind matrix, and the local matrix (row vectors, translation in row 3) |
@@ -686,12 +694,24 @@ A `.motionmatcher` object has fields up to `+0x18F`; they are in the object tabl
   with rows 1 / (the record's second float) seconds apart, they fit inside the clip's duration on 2,108 of the
   2,155 records whose clip duration is known without ambiguity (measured separately), which fits the sample-rate
   hypothesis above. Which part of the clip they cover is not decoded.
-- Not decoded: the feature object's `+0x30` object (on 149; 112 bytes, measured separately), the one 0x28-byte
-  item at `+0x48` of the matcher, the one-item arrays at `+0x118` and `+0x128`, the second word of a clip table
-  slot and what the clip table hashes, the features with `+0x0E` = 5, how the bone ids are made, what the pose columns mean
-  beyond their feature (and any normalisation), the skeleton's `+0x48` block (its first u16 is the bone count on
-  180 of 180, measured separately), the meaning of the `+0x98` values, and the feature object's `+0xB8` (positive
-  f32, a count that doesn't follow the features, measured separately) and `+0xC0`.
+- **One-item arrays.** The matcher's `+0x48` is one 40-byte item, zero except a u32 1 at `+0x20`; `+0x118` is
+  one u32 equal to the pose sample count; `+0x128` is one u16, 0; each on 180 of 180.
+- **`+0x30` object.** On the 149 clips that have it, its `+0x08` is 2 on 93 and 1 on 56. With 2, `+0x4C` is one
+  of the clip's feature kinds and `+0x68` that kind's width by the bit rule above, on 93 of 93; with 1, the arrays
+  at `+0x40` and `+0x50` have the same count n (1, 3, 4 or 6, measured separately). Its weights (form 2: the f32s at
+  `+0x18`/`+0x1C`; form 1: the second array) are positive and sum to 1 on 149 of 149. A weighting of the feature
+  costs against something else (a trajectory, say) is a hypothesis.
+- **Per column group (`+0xB8`, `+0xC0`).** `+0xB8` has one f32 per 8 pose columns, rounded up, on 180 of 180
+  (positive, measured separately). They are not the reciprocal, the deviation or the variance of their 8 columns
+  over the samples (0 of 138 clips with 8 samples or more, measured separately). `+0xC4` is 1.0, and `+0xC8` is 1
+  with rows and 3 with blocks of 8, on 180 of 180.
+- Not decoded: the second word of a clip table slot and what the clip table hashes, the hash of the features'
+  `+0x48` table (not joaat32, one-at-a-time, FNV-1/1a, ELF or CRC-32 of the bone name in any case, nor of the
+  feature's `+0x18`/`+0x1C` words; measured separately), the features with `+0x0E` = 5 (their `+0x18`, `+0x1C`
+  and `+0x24` are in none of the clip's tables, measured separately), how the bone ids are made, what the pose
+  columns mean beyond their feature (and any normalisation), the skeleton's `+0x48` block (its first u16 is the
+  bone count on 180 of 180, measured separately), the meaning of the `+0x98` values, the `+0x30` object's other
+  floats and form 1's values, what the `+0xB8` values are, and the f32 at `+0xC0`.
 
 ### Other archives
 
