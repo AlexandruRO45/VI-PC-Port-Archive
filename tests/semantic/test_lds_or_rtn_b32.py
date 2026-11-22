@@ -1572,5 +1572,353 @@ class TestIEEE754BoundaryExtremesAndBitwiseLimits(unittest.TestCase):
             self.assertEqual(mem, accum)
 
 
+# ==============================================================================
+# Phase 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+def parse_ds_or_assembly(asm_str: str) -> DSOrInstruction:
+    """Parse AMD assembly string into a DSOrInstruction AST node.
+    
+    Accepts formats:
+        ds_or_rtn_b32 vdst, vaddr, vdata [offset:N]
+        ds_or_b32 vaddr, vdata [offset:N]
+    """
+    text = asm_str.strip()
+    if not text:
+        raise ValueError("Empty assembly string")
+
+    # Normalize commas and whitespace
+    parts = text.replace(",", " ").split()
+    if not parts:
+        raise ValueError("Empty assembly string")
+
+    op_str = parts[0].lower()
+    if op_str == "ds_or_rtn_b32":
+        opcode = DSOpcode.DS_OR_RTN_B32
+    elif op_str == "ds_or_b32":
+        opcode = DSOpcode.DS_OR_B32
+    else:
+        raise ValueError(f"Unknown opcode '{op_str}', expected ds_or_rtn_b32 or ds_or_b32")
+
+    offset = 0
+    clean_parts: List[str] = [parts[0]]
+    for token in parts[1:]:
+        if token.lower().startswith("offset:"):
+            try:
+                offset_val = int(token.split(":", 1)[1], 0)
+            except ValueError as exc:
+                raise ValueError(f"Invalid offset format: {token}") from exc
+            if not (0 <= offset_val <= 65535):
+                raise ValueError(f"Offset {offset_val} out of 16-bit range [0, 65535]")
+            offset = offset_val
+        else:
+            clean_parts.append(token)
+
+    def parse_reg(token: str, expected_type: str) -> Union[VGPR, SGPR]:
+        t = token.lower()
+        if t.startswith("v[") and t.endswith("]"):
+            idx_str = t[2:-1]
+            prefix = "v"
+        elif t.startswith("v") and t[1:].isdigit():
+            idx_str = t[1:]
+            prefix = "v"
+        elif t.startswith("s[") and t.endswith("]"):
+            idx_str = t[2:-1]
+            prefix = "s"
+        elif t.startswith("s") and t[1:].isdigit():
+            idx_str = t[1:]
+            prefix = "s"
+        else:
+            raise ValueError(f"Invalid register syntax: '{token}'")
+
+        if prefix != expected_type:
+            raise TypeError(f"Expected register type '{expected_type}', got '{prefix}' in '{token}'")
+        idx = int(idx_str)
+        return VGPR(idx) if prefix == "v" else SGPR(idx)
+
+    def parse_operand(token: str) -> Operand:
+        t = token.lower()
+        if t.startswith("v"):
+            return parse_reg(token, "v")
+        if t.startswith("s"):
+            return parse_reg(token, "s")
+        # Literal / immediate constant
+        val = int(token, 0)
+        return Immediate(val)
+
+    if opcode.is_return:
+        if len(clean_parts) != 4:
+            raise ValueError(f"ds_or_rtn_b32 expects 3 operands (vdst, vaddr, vdata), got {len(clean_parts) - 1}")
+        dst_reg = parse_reg(clean_parts[1], "v")
+        assert isinstance(dst_reg, VGPR)
+        addr_reg = parse_reg(clean_parts[2], "v")
+        assert isinstance(addr_reg, VGPR)
+        data_op = parse_operand(clean_parts[3])
+        return DSOrInstruction(opcode=opcode, dst=dst_reg, addr=addr_reg, data=data_op, offset=offset)
+    else:
+        if len(clean_parts) != 3:
+            raise ValueError(f"ds_or_b32 expects 2 operands (vaddr, vdata), got {len(clean_parts) - 1}")
+        addr_reg = parse_reg(clean_parts[1], "v")
+        assert isinstance(addr_reg, VGPR)
+        data_op = parse_operand(clean_parts[2])
+        return DSOrInstruction(opcode=opcode, dst=None, addr=addr_reg, data=data_op, offset=offset)
+
+
+class TestNegativeControlsAndMutationDetection(unittest.TestCase):
+    """Phase 8: Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_assembly_parser_valid_syntaxes(self) -> None:
+        inst1 = parse_ds_or_assembly("ds_or_rtn_b32 v0, v1, v2")
+        self.assertEqual(inst1.opcode, DSOpcode.DS_OR_RTN_B32)
+        self.assertEqual(inst1.dst, VGPR(0))
+        self.assertEqual(inst1.addr, VGPR(1))
+        self.assertEqual(inst1.data, VGPR(2))
+        self.assertEqual(inst1.offset, 0)
+
+        inst2 = parse_ds_or_assembly("ds_or_rtn_b32 v[5], v[6], s[10] offset:32")
+        self.assertEqual(inst2.dst, VGPR(5))
+        self.assertEqual(inst2.addr, VGPR(6))
+        self.assertEqual(inst2.data, SGPR(10))
+        self.assertEqual(inst2.offset, 32)
+
+        inst3 = parse_ds_or_assembly("ds_or_b32 v3, 0x1234 offset:0x10")
+        self.assertEqual(inst3.opcode, DSOpcode.DS_OR_B32)
+        self.assertIsNone(inst3.dst)
+        self.assertEqual(inst3.addr, VGPR(3))
+        self.assertEqual(inst3.data, Immediate(0x1234))
+        self.assertEqual(inst3.offset, 16)
+
+    def test_syntax_rejection_invalid_instructions(self) -> None:
+        invalid_cases = [
+            "",
+            "   ",
+            "v_add_f32 v0, v1, v2",
+            "ds_or_rtn_b32",
+            "ds_or_rtn_b32 v0, v1",                # Missing operand for returning form
+            "ds_or_b32 v0, v1, v2",                # Too many operands for non-returning form
+            "ds_or_rtn_b32 s0, v1, v2",            # SGPR as destination
+            "ds_or_rtn_b32 v0, s1, v2",            # SGPR as address
+            "ds_or_rtn_b32 0x10, v1, v2",          # Immediate as destination
+            "ds_or_rtn_b32 v0, 0x20, v2",          # Immediate as address
+            "ds_or_rtn_b32 v256, v1, v2",          # VGPR index out of bounds
+            "ds_or_rtn_b32 v0, v1, s106",          # SGPR index out of bounds
+            "ds_or_rtn_b32 v0, v1, v2 offset:65536", # Offset > 65535
+            "ds_or_rtn_b32 v0, v1, v2 offset:-1",  # Negative offset
+            "ds_or_rtn_b32 v0, v1, v2 offset:bad", # Non-numeric offset
+        ]
+        for case in invalid_cases:
+            with self.subTest(case=case):
+                with self.assertRaises((ValueError, TypeError)):
+                    parse_ds_or_assembly(case)
+
+    def test_architectural_model_negative_controls(self) -> None:
+        # Invalid LDS memory capacity
+        with self.assertRaises(ValueError):
+            LDSModel(capacity_dwords=0)
+        with self.assertRaises(ValueError):
+            LDSModel(capacity_dwords=1000)  # Non-power-of-two
+        with self.assertRaises(ValueError):
+            LDSModel(capacity_dwords=-16)
+
+        # Invalid SIMDState configuration
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+        state32 = SIMDState(num_lanes=32)
+        with self.assertRaises(IndexError):
+            state32.is_lane_active(32)
+        with self.assertRaises(IndexError):
+            state32.is_lane_active(-1)
+
+    def test_mutation_detection_and_instead_of_or(self) -> None:
+        """Mutant: bitwise AND instead of bitwise OR."""
+        def mutant_and(a: int, b: int) -> int:
+            return a & b
+
+        val_a = 0b1010
+        val_b = 0b0110
+        ref_old, ref_new = oracle_ds_or_b32(val_a, val_b)
+        mutant_res = mutant_and(val_a, val_b)
+        self.assertEqual(ref_new, 0b1110)
+        self.assertEqual(mutant_res, 0b0010)
+        self.assertNotEqual(ref_new, mutant_res)
+
+    def test_mutation_detection_xor_instead_of_or(self) -> None:
+        """Mutant: bitwise XOR instead of bitwise OR."""
+        def mutant_xor(a: int, b: int) -> int:
+            return a ^ b
+
+        val_a = 0xFF
+        val_b = 0xFF
+        ref_old, ref_new = oracle_ds_or_b32(val_a, val_b)
+        mutant_res = mutant_xor(val_a, val_b)
+        self.assertEqual(ref_new, 0xFF)
+        self.assertEqual(mutant_res, 0x00)
+        self.assertNotEqual(ref_new, mutant_res)
+
+    def test_mutation_detection_non_returning_destination(self) -> None:
+        """Mutant: failing to return pre-operation value to destination VGPR."""
+        class NonReturningMutant(ScalarInterpreter):
+            def step(self, instr: DSOrInstruction, state: ScalarMachineState) -> Tuple[Optional[int], int]:
+                old_val, next_mem = super().step(instr, state)
+                # Bug: writes updated memory value into dst instead of old_val
+                if instr.opcode.is_return:
+                    assert instr.dst is not None
+                    state.set_vgpr(instr.dst.index, next_mem)
+                return old_val, next_mem
+
+        state = ScalarMachineState()
+        addr = 0x100
+        state.set_vgpr(1, addr)
+        state.set_vgpr(2, 0x02)
+        state.lds.write_dword(addr, 0x01)
+
+        instr = DSOrInstruction(
+            opcode=DSOpcode.DS_OR_RTN_B32,
+            dst=VGPR(0),
+            addr=VGPR(1),
+            data=VGPR(2),
+        )
+        mutant = NonReturningMutant()
+        mutant.step(instr, state)
+        # Correct behavior: v[0] gets old_val 0x01. Mutant wrote 0x03.
+        self.assertNotEqual(state.get_vgpr(0), 0x01)
+        self.assertEqual(state.get_vgpr(0), 0x03)
+
+    def test_mutation_detection_premature_writeback_aliasing(self) -> None:
+        """Mutant: Destination register written before address is latched."""
+        class PrematureWritebackInterpreter(ScalarInterpreter):
+            def step(self, instr: DSOrInstruction, state: ScalarMachineState) -> Tuple[Optional[int], int]:
+                # Bug: writes destination before reading address
+                if instr.opcode.is_return:
+                    assert instr.dst is not None
+                    state.set_vgpr(instr.dst.index, 0xBAD0)
+                vaddr = state.get_vgpr(instr.addr.index)  # Reads corrupted address 0xBAD0!
+                eff_addr = calc_lds_effective_address(vaddr, instr.offset)
+                curr_mem = state.lds.read_dword(eff_addr)
+                data_val = self.resolve_operand(instr.data, state)
+                old_val, next_mem = oracle_ds_or_b32(curr_mem, data_val)
+                state.lds.write_dword(eff_addr, next_mem)
+                return old_val, next_mem
+
+        state = ScalarMachineState()
+        addr = 0x200
+        state.set_vgpr(0, addr)  # v[0] is both dst and addr
+        state.set_vgpr(1, 0x55)
+        state.lds.write_dword(addr, 0xAA)
+
+        instr = DSOrInstruction(
+            opcode=DSOpcode.DS_OR_RTN_B32,
+            dst=VGPR(0),
+            addr=VGPR(0),
+            data=VGPR(1),
+        )
+        mutant = PrematureWritebackInterpreter()
+        old, mem = mutant.step(instr, state)
+        # Bug caused read/write from 0xBAD0 instead of 0x200
+        self.assertNotEqual(state.lds.read_dword(addr), 0xFF)
+        self.assertEqual(state.lds.read_dword(0xBAD0), 0x55)
+
+    def test_mutation_detection_inverted_lane_collision_order(self) -> None:
+        """Mutant: SIMD collision serialized in reverse order (lane N to lane 0)."""
+        class ReverseSIMDInterpreter(SIMDInterpreter):
+            def step(self, instr: DSOrInstruction, state: SIMDState) -> List[Tuple[int, Optional[int], int]]:
+                results = []
+                for lane in reversed(range(state.num_lanes)):
+                    if not state.is_lane_active(lane):
+                        continue
+                    vaddr = state.get_vgpr(lane, instr.addr.index)
+                    data_val = self.resolve_lane_operand(instr.data, lane, state)
+                    eff_addr = calc_lds_effective_address(vaddr, instr.offset)
+                    curr_mem = state.lds.read_dword(eff_addr)
+                    old_val, next_mem = oracle_ds_or_b32(curr_mem, data_val)
+                    state.lds.write_dword(eff_addr, next_mem)
+                    if instr.opcode.is_return:
+                        assert instr.dst is not None
+                        state.set_vgpr(lane, instr.dst.index, old_val)
+                    results.append((lane, old_val, next_mem))
+                return results
+
+        state = SIMDState(num_lanes=32, exec_mask=0x3)  # Lanes 0 and 1 active
+        common_addr = 0x300
+        state.lds.write_dword(common_addr, 0)
+
+        # Lane 0 sets 0x1, Lane 1 sets 0x2
+        state.set_vgpr(0, 1, common_addr)
+        state.set_vgpr(0, 2, 0x1)
+        state.set_vgpr(1, 1, common_addr)
+        state.set_vgpr(1, 2, 0x2)
+
+        instr = DSOrInstruction(
+            opcode=DSOpcode.DS_OR_RTN_B32,
+            dst=VGPR(0),
+            addr=VGPR(1),
+            data=VGPR(2),
+        )
+        mutant = ReverseSIMDInterpreter()
+        mutant.step(instr, state)
+
+        # In correct ascending order: Lane 0 sees 0, Lane 1 sees 0x1.
+        # In reverse order: Lane 1 saw 0 and wrote 0x2; Lane 0 saw 0x2!
+        self.assertNotEqual(state.get_vgpr(0, 0), 0)
+        self.assertEqual(state.get_vgpr(0, 0), 0x2)
+
+    def test_mutation_detection_ignore_exec_mask(self) -> None:
+        """Mutant: Inactive lanes execute and corrupt registers/memory."""
+        class InactiveExecMutant(SIMDInterpreter):
+            def step(self, instr: DSOrInstruction, state: SIMDState) -> List[Tuple[int, Optional[int], int]]:
+                orig_mask = state.exec_mask
+                state.exec_mask = 0xFFFF_FFFF  # Force all lanes active!
+                try:
+                    return super().step(instr, state)
+                finally:
+                    state.exec_mask = orig_mask
+
+        state = SIMDState(num_lanes=32, exec_mask=0x1)  # Only lane 0 active
+        sentinel = 0xC001
+        for lane in range(32):
+            state.set_vgpr(lane, 0, sentinel)
+            state.set_vgpr(lane, 1, 0x400 + lane * 4)
+            state.set_vgpr(lane, 2, 0xFF)
+
+        instr = DSOrInstruction(
+            opcode=DSOpcode.DS_OR_RTN_B32,
+            dst=VGPR(0),
+            addr=VGPR(1),
+            data=VGPR(2),
+        )
+        mutant = InactiveExecMutant()
+        mutant.step(instr, state)
+
+        # Inactive lane 5 should have stayed at sentinel, but mutant modified it
+        self.assertNotEqual(state.get_vgpr(5, 0), sentinel)
+
+    def test_mutation_detection_dropped_immediate_offset(self) -> None:
+        """Mutant: Drops immediate offset in address calculation."""
+        def mutant_calc_addr(vaddr: int, offset: int = 0) -> int:
+            return vaddr & MASK_32  # Drops offset!
+
+        base = 0x200
+        off = 0x10
+        correct = calc_lds_effective_address(base, off)
+        buggy = mutant_calc_addr(base, off)
+        self.assertEqual(correct, 0x210)
+        self.assertEqual(buggy, 0x200)
+        self.assertNotEqual(correct, buggy)
+
+    def test_mutation_detection_wrong_alignment_shift(self) -> None:
+        """Mutant: Shifts byte address by 1 instead of 2 (word instead of dword alignment)."""
+        def mutant_dword_idx(eff_addr: int, capacity: int = 16384) -> int:
+            return (eff_addr >> 1) & (capacity - 1)
+
+        addr = 0x100
+        correct = calc_lds_dword_index(addr)
+        buggy = mutant_dword_idx(addr)
+        self.assertEqual(correct, 0x40)
+        self.assertEqual(buggy, 0x80)
+        self.assertNotEqual(correct, buggy)
+
+
 if __name__ == "__main__":
     unittest.main()
