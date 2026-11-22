@@ -45,6 +45,19 @@ struct VulkanDeviceInfo {
     std::uint32_t max_push_constants_size = 0;
     bool push_constants_need_fallback = false;
     bool presentation = false;  // VK_KHR_surface + VK_KHR_win32_surface on the instance, VK_KHR_swapchain on the device
+    // Enabled: runtimeDescriptorArray, the dynamic indexing of sampled- and storage-image arrays, and update after
+    // bind for sampled images, storage images and storage buffers. The device then keeps the bindless set 0 of
+    // the translated shaders (docs section 3.4), and texture views and samplers are put in it as they are
+    // created. bindless_partially_bound: descriptorBindingPartiallyBound is enabled as well.
+    bool bindless = false;
+    bool bindless_partially_bound = false;
+    // samplerAnisotropy and samplerMirrorClampToEdge enabled; without them such samplers are approximated.
+    bool sampler_anisotropy = false;
+    bool sampler_mirror_clamp_to_edge = false;
+    // VK_EXT_conditional_rendering (with its conditionalRendering feature) is enabled: SetPredication works, and
+    // buffers are created with VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT. Without it a predicated list is
+    // rejected at ExecuteCommandLists.
+    bool conditional_rendering = false;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive
@@ -61,6 +74,9 @@ void set_device_outer(ID3D12Device* device, IUnknown* outer);
 
 // The VkImage behind a texture created by such a device, or VK_NULL_HANDLE. For tests and the swapchain.
 VkImage vulkan_image(ID3D12Resource* resource);
+
+// Whether both resources use the requested typed, non-integer colour format for a regional average resolve.
+bool color_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D12Resource* src);
 
 // The maxPushConstantsSize in bytes of the Vulkan physical device behind `device`, or 0 if not a Vulkan device.
 std::uint32_t device_max_push_constants_size(ID3D12Device* device);
@@ -91,6 +107,11 @@ private:
 
 // Null when `device` is not a Vulkan device created with presentation, or the window cannot be presented to.
 std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window);
+// The bindless set 0 a device with VulkanDeviceInfo::bindless keeps (vulkan_bindless.h), and its layout: what a
+// pipeline whose shader declares set-0 bindings is created with and binds. Null without such a set. The set is
+// brought up to date at every ExecuteCommandLists.
+VkDescriptorSet bindless_set(ID3D12Device* device);
+VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device);
 
 // ExecuteCommandLists returns void; this is what the last call on the queue did.
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue);
