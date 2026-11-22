@@ -85,6 +85,8 @@ EXPECTED_FMT_1010102 = {0x00: 0x00000000, 0x04: 0x3F800000, 0x08: 0x00000000, 0x
 EXPECTED_SFF_IMM = [0x00000002, 0x00000001, 0x00000014, 0x00000010]
 EXPECTED_VALU16_MAD = [0x00000002, 0x00030002, 0x00008000, 0x00000004]
 EXPECTED_VALU16_SUBREV = [0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800]
+# ps_sdwa_f16_const, measured on gfx1036 (the .asm header): f16 inline constant, then src_sel
+EXPECTED_SDWA_F16_CONST = [0xAAAA3800, 0xAAAA1C00, 0xAAAA3E00, 0xAAAA73F0]
 EXPECTED_SALU_PACK_ADD = [0x98846211, 0xFFFFFF8D, 0x83328116, 0xFD3DB108]
 
 
@@ -321,33 +323,39 @@ def reference_valu16_subrev():
             0x42000000 | _half(a - d)]
 
 
+def reference_sdwa_f16_const():
+    # An f16 float inline constant is its f16 bits over a zero high half; an integer op reads 1.0 as its f32 bits.
+    # src_sel then picks a zero-extended field of those 32 bits, like a register's.
+    def sel(word, off, width):
+        return (word >> off) & ((1 << width) - 1)
+    v1, s8 = 0x64003800, 0x3C000000
+    x = _unhalf(sel(_half(1.0), 16, 16)) + _unhalf(sel(v1, 0, 16))          # +0.0 + 0.5
+    y = _unhalf(sel(_half(2.0), 8, 8)) * _unhalf(sel(v1, 16, 16))           # 2^-18 * 1024.0
+    z = _unhalf(sel(s8, 16, 16)) + _unhalf(sel(v1, 0, 16))                  # 1.0 + 0.5
+    w = float(sel(struct.unpack("<I", struct.pack("<f", 1.0))[0], 16, 16))  # u16 0x3f80 -> f16
+    return [0xAAAA0000 | _half(v) for v in (x, y, z, w)]
+
+
 def reference_salu_pack_add():
     """ps_salu_pack_add (layout in the .asm header), from the RDNA2 ISA pseudocode of each op."""
     m = 0xFFFFFFFF
-
     def pack(kind, x, y):                     # s_pack_{ll,lh,hh}_b32_b16: low half from S0, high half from S1
         lo = x >> 16 if kind[0] == "h" else x & 0xFFFF
         hi = y >> 16 if kind[1] == "h" else y & 0xFFFF
         return hi << 16 | lo
-
     def sext(x, bits):
         x &= (1 << bits) - 1
         return (x - (1 << bits) if x >> (bits - 1) else x) & m
-
     def lshl_add(n, x, y):                    # (D, SCC): SCC = the 33rd bit of the sum (carry out)
         t = (x << n) + y
         return t & m, int(t > m)
-
     def absdiff(x, y):                        # (D, SCC): wrapped difference, then signed abs; SCC = D != 0
         d = abs(_s((x - y) & m)) & m
         return d, int(d != 0)
-
     def mul_hi_i32(x, y):
         return ((_s(x) * _s(y)) >> 32) & m
-
     def cmov(scc, src, old):
         return src if scc else old
-
     s0, s1 = 0x00020001, 0x00080004
     w0 = (pack("ll", s0, s1) | pack("lh", s0, s1) << 4 | pack("hh", s0, s1) << 8
           | (cmov(1, 2, 1) | cmov(0, 2, 1) << 2) << 12 | cmov(0, 3, 9) << 28)
@@ -365,8 +373,6 @@ def reference_salu_pack_add():
     w3 |= (mul_hi_i32(0xC0000000, m - 11) & 15) << 20 | (mul_hi_i32(0xC0000000, 12) & 15) << 24
     w3 |= cmov(1, sext(0xFFF8, 16), 5) & 0xF0000000
     return [w0 & m, w1, w2, w3]
-
-
 def _isg1_dxbc(elements):
     """A DXBC container with one ISG1 input signature. elements: (register, mask, system value, component type)."""
     payload = bytearray(struct.pack("<II", len(elements), 8))
@@ -417,6 +423,7 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_sff_imm(), EXPECTED_SFF_IMM)
         self.assertEqual(reference_valu16_mad(), EXPECTED_VALU16_MAD)
         self.assertEqual(reference_valu16_subrev(), EXPECTED_VALU16_SUBREV)
+        self.assertEqual(reference_sdwa_f16_const(), EXPECTED_SDWA_F16_CONST)
         self.assertEqual(reference_salu_pack_add(), EXPECTED_SALU_PACK_ADD)
 
 
@@ -484,6 +491,11 @@ class TranslatorValueSemantics(unittest.TestCase):
         # when the destination is a source.
         self.check("ps_valu16_subrev", EXPECTED_VALU16_SUBREV)
 
+    def test_sdwa_src_sel_narrows_an_f16_inline_constant(self):
+        # 1.0 in v_add_f16_sdwa is 0x00003c00, so src0_sel:WORD_1 reads +0.0 and BYTE_1 of 2.0 is the denormal
+        # 0x0040; an SGPR source and v_cvt_f16_u16 reading the f32 bits of 1.0 are narrowed the same way.
+        self.check("ps_sdwa_f16_const", EXPECTED_SDWA_F16_CONST)
+
     def test_s_buffer_load_dwordx2_into_vcc(self):
         # The V# in s[0:3] points at 0x1000; the two dwords must come back in vcc_lo and vcc_hi, not be lost.
         push = [0x1000, 0, 16, 0] + [0] * 28
@@ -528,6 +540,23 @@ class TranslatorValueSemantics(unittest.TestCase):
         for address, want in EXPECTED_FMT_1010102.items():
             with self.subTest(address=address):
                 self.assertEqual(f"{memory.get(address, 0):#010x}", f"{want:#010x}")
+
+    def test_narrow_integer_typed_buffers(self):
+        # cs_fmt_int_narrow.asm in the interpreter against the words check.py expects from the GPU, which are the
+        # same program's output on gfx1036 run natively: a 136-word heap filled with 0xee as vk_compute_test's.
+        sys.path.insert(0, os.path.join(support.ROOT, "runtime", "test", "shaders"))
+        try:
+            import check
+        finally:
+            sys.path.pop(0)
+        spv = support.translate_fixture("cs_fmt_int_narrow", fssm=CS_BOUNDS_FSSM)
+        memory = {4 * i: 0xEEEEEEEE for i in range(len(check.FMT_INT_NARROW_WORDS))}
+        support.run_fragment(
+            spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+            push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28, memory=memory)
+        for i, word in enumerate(check.FMT_INT_NARROW_WORDS):
+            with self.subTest(word=i):
+                self.assertEqual(memory[4 * i], word)
 
     def test_signed_typed_buffers(self):
         spv = support.translate_fixture("cs_fmt_sint32", fssm=CS_BOUNDS_FSSM)
