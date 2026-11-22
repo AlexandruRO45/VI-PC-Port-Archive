@@ -1,4 +1,6 @@
 """Unit tests for tools/gallery.py standalone 3D Studio & Asset Gallery server."""
+from contextlib import redirect_stdout
+from io import StringIO
 import json
 import os
 import sys
@@ -7,6 +9,7 @@ import threading
 import time
 import unittest
 import urllib.request
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -30,6 +33,30 @@ class TestGalleryCategorization(unittest.TestCase):
     def test_folder_inference(self) -> None:
         self.assertEqual(gallery.categorize_model("asset_01.glb", "clean_vehicles"), "Транспорт (Vehicles)")
         self.assertEqual(gallery.categorize_model("model.glb", "unpacked_peds"), "Персонажи (Characters)")
+
+
+class TestGalleryStartup(unittest.TestCase):
+    def test_port_zero_advertises_the_bound_port(self) -> None:
+        bound_ports = []
+
+        def stop_after_bind(server):
+            bound_ports.append(server.server_port)
+            server.server_close()
+
+        output = StringIO()
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            redirect_stdout(output),
+            mock.patch.object(gallery.http.server.HTTPServer, "serve_forever", stop_after_bind),
+            mock.patch.object(gallery.webbrowser, "open") as open_browser,
+        ):
+            gallery.start_server(port=0, models_dir=directory, textures_dir=directory)
+
+        self.assertEqual(len(bound_ports), 1)
+        self.assertGreater(bound_ports[0], 0)
+        url = f"http://localhost:{bound_ports[0]}"
+        self.assertIn(f"Web Studio URL:     {url}\n", output.getvalue())
+        open_browser.assert_called_once_with(url)
 
 
 class TestGalleryServer(unittest.TestCase):
