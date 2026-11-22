@@ -592,6 +592,38 @@ def find_test_programs(build: str, ext: str) -> str | None:
     return None
 
 
+def ansi_path(path, nt=os.name == "nt", codec="mbcs"):
+    """`path` as the ANSI-code-page tools (spirv-val, llvm-mc, the test programs) can open it on Windows: as is
+    when it encodes, else its 8.3 short form; None when neither works."""
+    if not nt:
+        return path
+    try:
+        path.encode(codec)
+        return path
+    except UnicodeEncodeError:
+        pass
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(32768)
+        n = ctypes.windll.kernel32.GetShortPathNameW(path, buf, len(buf))
+        short = buf.value if 0 < n < len(buf) else ""
+        short.encode(codec)
+        return short or None
+    except (OSError, AttributeError, UnicodeEncodeError):
+        return None
+
+
+def make_work_dir(nt=os.name == "nt", codec="mbcs"):
+    work = tempfile.mkdtemp(prefix="leonida_gpu_tests_")
+    safe = ansi_path(work, nt, codec)
+    if safe:
+        return safe
+    os.rmdir(work)
+    base = os.path.join(os.environ.get("SystemDrive", "C:") + os.sep, "leonida_gpu_tests")
+    os.makedirs(base, exist_ok=True)
+    return tempfile.mkdtemp(prefix="run_", dir=base)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--llvm-mc", default=os.environ.get("LLVM_MC", "llvm-mc"),
@@ -633,7 +665,14 @@ def main() -> int:
                  "Vulkan headers (vulkan-headers on Arch) and configure again.")
     a.build = resolved_build
 
-    work = a.work or tempfile.mkdtemp(prefix="leonida_gpu_tests_")
+    if a.work:
+        os.makedirs(a.work, exist_ok=True)
+        safe = ansi_path(a.work)
+        if not safe:
+            ap.error(f"--work {a.work}: the tools can't open this path (a character outside the ANSI code page); "
+                     "use a folder with an ASCII path")
+        a.work = safe
+    work = a.work or make_work_dir()
     try:
         return run_suite(a, work)
     finally:

@@ -424,3 +424,29 @@ class F16InterpUnderBaryFallback(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AnsiWorkPathTest(unittest.TestCase):
+    def test_ascii_path_is_kept(self):
+        self.assertEqual(rgt.ansi_path("C:\\Users\\bob\\x", nt=True, codec="ascii"), "C:\\Users\\bob\\x")
+
+    def test_non_ansi_path_without_a_short_name_is_refused(self):
+        with patch("ctypes.windll", create=True, new=None):
+            self.assertIsNone(rgt.ansi_path("C:\\Users\\\u0438\u0432\u0430\u043d\\x", nt=True, codec="ascii"))
+
+    def test_other_systems_keep_the_path(self):
+        self.assertEqual(rgt.ansi_path("/tmp/\u0438\u0432\u0430\u043d", nt=False), "/tmp/\u0438\u0432\u0430\u043d")
+
+    def test_default_work_dir_falls_back_to_an_ascii_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            uni = os.path.join(tmp, "\u0438\u0432\u0430\u043d")
+            os.mkdir(uni)
+            drive = os.path.join(tmp, "drive")
+            os.mkdir(drive)
+            with patch.object(rgt.tempfile, "tempdir", uni), \
+                    patch.dict(os.environ, {"SystemDrive": drive}), \
+                    patch("ctypes.windll", create=True, new=None):
+                work = rgt.make_work_dir(nt=True, codec="ascii")
+            self.assertTrue(work.startswith(os.path.join(drive, "leonida_gpu_tests")))
+            self.assertTrue(os.path.isdir(work))
+            self.assertEqual(os.listdir(uni), [])
