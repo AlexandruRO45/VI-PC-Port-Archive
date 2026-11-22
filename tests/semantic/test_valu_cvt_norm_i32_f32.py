@@ -735,5 +735,64 @@ class TestValuCvtNormI32F32SIMD(unittest.TestCase):
             self.assertEqual(simd.get_vgpr_u32(0, lane), 0x12345678)
 
 
+# ---------------------------------------------------------------------------
+# Register aliasing and in-place operand preservation
+# ---------------------------------------------------------------------------
+
+class TestValuCvtNormI32F32Aliasing(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarVALUInterpreter()
+
+    def test_in_place_self_aliasing(self) -> None:
+        self.interp.set_vgpr_u32(0, ONE_F32)
+        res = self.interp.execute_asm("v_cvt_norm_i32_f32 v0, v0")
+        self.assertEqual(res, 2147483647)
+        self.assertEqual(self.interp.get_vgpr_u32(0), 2147483647)
+
+    def test_in_place_self_aliasing_negative(self) -> None:
+        self.interp.set_vgpr_u32(0, NEG_ONE_F32)
+        res = self.interp.execute_asm("v_cvt_norm_i32_f32 v0, v0")
+        self.assertEqual(res, 0x80000001)
+        self.assertEqual(self.interp.get_vgpr_u32(0), 0x80000001)
+
+    def test_in_place_self_aliasing_with_abs_modifier(self) -> None:
+        self.interp.set_vgpr_u32(0, NEG_ONE_F32)
+        res = self.interp.execute_asm("v_cvt_norm_i32_f32 v0, |v0|")
+        self.assertEqual(res, 2147483647)
+        self.assertEqual(self.interp.get_vgpr_u32(0), 2147483647)
+
+    def test_in_place_self_aliasing_with_neg_modifier(self) -> None:
+        self.interp.set_vgpr_u32(0, ONE_F32)
+        res = self.interp.execute_asm("v_cvt_norm_i32_f32 v0, -v0")
+        self.assertEqual(res, 0x80000001)
+        self.assertEqual(self.interp.get_vgpr_u32(0), 0x80000001)
+
+    def test_distinct_registers_non_interference(self) -> None:
+        self.interp.set_vgpr_u32(0, 0xCAFEBABE)
+        self.interp.set_vgpr_u32(1, HALF_F32)
+        res = self.interp.execute_asm("v_cvt_norm_i32_f32 v0, v1")
+        self.assertEqual(res, 1073741824)
+        self.assertEqual(self.interp.get_vgpr_u32(0), 1073741824)
+        self.assertEqual(self.interp.get_vgpr_u32(1), HALF_F32)
+
+    def test_multi_instruction_aliased_pipeline(self) -> None:
+        self.interp.set_vgpr_u32(0, HALF_F32)
+        self.interp.set_vgpr_u32(1, NEG_TWO_F32)
+
+        # Step 1: in-place convert v0
+        self.interp.execute_asm("v_cvt_norm_i32_f32 v0, v0")
+        self.assertEqual(self.interp.get_vgpr_u32(0), 1073741824)  # 0x40000000
+
+        # Step 2: in-place convert v1
+        self.interp.execute_asm("v_cvt_norm_i32_f32 v1, v1")
+        self.assertEqual(self.interp.get_vgpr_u32(1), 0x80000001)
+
+        # Step 3: use converted v0 as source for v2 (0x40000000 bitwise is 2.0f in f32)
+        self.interp.execute_asm("v_cvt_norm_i32_f32 v2, v0")
+        self.assertEqual(self.interp.get_vgpr_u32(2), 2147483647)
+
+
 if __name__ == "__main__":
     unittest.main()
