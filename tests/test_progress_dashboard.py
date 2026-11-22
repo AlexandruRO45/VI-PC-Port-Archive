@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -223,6 +224,16 @@ class Scrub(unittest.TestCase):
     def test_paths_inside_the_repository_become_relative(self):
         line = "Error: " + os.path.join(ROOT, "tools", "text_tables.py") + " line 3"
         self.assertEqual(pd.scrub(line), "Error: tools/text_tables.py line 3")
+
+    def test_a_checkout_folder_with_spaces_stays_whole(self):
+        root = os.path.join(tempfile.gettempdir(), "My Projects", "GTA VI")
+        with mock.patch.object(pd, "ROOT", root):
+            line = "Error: " + os.path.join(root, "tools", "text_tables.py") + " line 3"
+            self.assertEqual(pd.scrub(line), "Error: tools/text_tables.py line 3")
+            self.assertEqual(pd.scrub(f"cd {root} failed"), "cd . failed")
+            self.assertTrue(pd.scrub(f"see {root}x{os.sep}a.log").startswith("see <path>"))   # a sibling folder
+            if os.name == "nt":
+                self.assertEqual(pd.scrub(root.upper().replace("\\", "/") + "/tools/a.py"), "tools/a.py")
 
     def test_urls_and_relative_paths_stay(self):
         self.assertEqual(pd.scrub("see https://github.com/ItsNotRexed/Leonida/issues/1"),

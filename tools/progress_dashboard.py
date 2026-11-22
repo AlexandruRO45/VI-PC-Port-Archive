@@ -118,12 +118,22 @@ def scrub(text, limit=240):
             return "." if rel == "." else rel
         return "<path>"
 
+    line = root_paths().sub(shown, line)
     line = re.sub(r"(?i)\b[a-z]:[\\/][^\s'\"]*", shown, line)
     line = re.sub(r"(?<![\w.:/~])/[^\s/'\"][^\s'\"]*", shown, line)
     if HOME and len(HOME) > 3:
         line = line.replace(HOME, "~")
     line = re.sub(r"~[\\/][^\s'\"]*", "<path>", line)
     return line[:limit]
+
+
+def root_paths():
+    """The repository root and any path under it, matched whole even when the checkout's folders have spaces
+    in their names ("GTA VI"), which the generic patterns in scrub would cut at the first space."""
+    roots = sorted({os.path.abspath(ROOT), os.path.realpath(ROOT)}, key=len, reverse=True)
+    alts = "|".join(r"[\\/]".join(map(re.escape, re.split(r"[\\/]", r))) for r in roots)
+    return re.compile(rf"(?<![\w.:/\\~])(?:{alts})(?:[\\/][^\s'\"]*)?(?![^\s\\/'\"])",
+                      re.I if os.name == "nt" else 0)
 
 
 def inside(child, parent):
