@@ -282,6 +282,74 @@ class ScalarInterpreter:
         return old_val
 
 
+# ---------------------------------------------------------------------------
+# SIMD Multi-Lane Divergence and 32/64-bit EXEC Masking
+# ---------------------------------------------------------------------------
+
+class SIMDState:
+    """Architectural state for SIMD Wave32 / Wave64 execution context."""
+
+    def __init__(
+        self,
+        num_lanes: int = DEFAULT_NUM_LANES,
+        exec_mask: int = MASK64,
+        lds_bytes: int = DEFAULT_LDS_SIZE_BYTES,
+    ) -> None:
+        if num_lanes not in (32, 64):
+            raise ValueError(f"Supported lane counts are 32 or 64, got: {num_lanes}")
+        self.num_lanes: int = num_lanes
+        mask_limit = MASK32 if num_lanes == 32 else MASK64
+        self.exec_mask: int = exec_mask & mask_limit
+        self.vgprs: list[list[int]] = [[0] * DEFAULT_NUM_VGPRS for _ in range(num_lanes)]
+        self.sgprs: list[int] = [0] * DEFAULT_NUM_SGPRS
+        self.lds: LDSMemory = LDSMemory(size_bytes=lds_bytes)
+
+    def is_lane_active(self, lane: int) -> bool:
+        if not (0 <= lane < self.num_lanes):
+            return False
+        return bool((self.exec_mask >> lane) & 1)
+
+    def get_vgpr(self, lane: int, reg_idx: int) -> int:
+        return self.vgprs[lane][reg_idx]
+
+    def set_vgpr(self, lane: int, reg_idx: int, val: int) -> None:
+        self.vgprs[lane][reg_idx] = u32(val)
+
+    def get_vgpr64(self, lane: int, reg: RegPair) -> int:
+        lo = self.vgprs[lane][reg.lo]
+        hi = self.vgprs[lane][reg.hi]
+        return u64(lo | (hi << 32))
+
+    def set_vgpr64(self, lane: int, reg: RegPair, val: int) -> None:
+        val = u64(val)
+        self.vgprs[lane][reg.lo] = u32(val)
+        self.vgprs[lane][reg.hi] = u32(val >> 32)
+
+
+class SIMDInterpreter:
+    """SIMD instruction interpreter handling multi-lane execution and EXEC masking."""
+
+    def execute(self, instr: DSAndRtnB64Instruction, state: SIMDState) -> list[tuple[int, int]]:
+        """Executes ds_and_rtn_b64 across SIMD lanes."""
+        if instr.opcode != DSOpcode.DS_AND_RTN_B64:
+            raise NotImplementedError(f"Unsupported opcode: {instr.opcode}")
+
+        latched_lanes: list[tuple[int, int, int]] = []
+        for lane in range(state.num_lanes):
+            if state.is_lane_active(lane):
+                vaddr = state.get_vgpr(lane, instr.addr.index)
+                vdata = state.get_vgpr64(lane, instr.data)
+                latched_lanes.append((lane, vaddr, vdata))
+
+        results: list[tuple[int, int]] = []
+        for lane, vaddr, vdata in latched_lanes:
+            old_val = ref_ds_and_rtn_b64(state.lds, vaddr=vaddr, vdata=vdata, offset=instr.offset)
+            state.set_vgpr64(lane, instr.dst, old_val)
+            results.append((lane, old_val))
+
+        return results
+
+
 class TestSymbolicAST(unittest.TestCase):
     """Unit tests for symbolic AST opcode definitions and typed expressions."""
 
@@ -413,6 +481,100 @@ class TestScalarInterpreter(unittest.TestCase):
             runs.append((ret, st.lds.read_qword(16)))
 
         self.assertTrue(all(r == (0xFEDCBA9876543210, 0x0E0C0A0806040200) for r in runs))
+
+
+class TestSIMDMultiLaneDivergence(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def setUp(self) -> None:
+        self.interp = SIMDInterpreter()
+
+    def test_wave32_full_execution(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=MASK32, lds_bytes=1024)
+        for i in range(32):
+            qword_addr = i * 8
+            state.lds.write_qword(qword_addr, 0xF0F0F0F0F0F0F0F0 | i)
+            state.set_vgpr(i, 2, qword_addr)
+            state.set_vgpr64(i, RegPair(4), 0x0F0F0F0F0F0F0F0F)
+
+        instr = DSAndRtnB64Instruction(
+            dst=RegPair(0),
+            addr=RegSingle(2),
+            data=RegPair(4),
+        )
+        results = self.interp.execute(instr, state)
+
+        self.assertEqual(len(results), 32)
+        for i in range(32):
+            expected_old = 0xF0F0F0F0F0F0F0F0 | i
+            self.assertEqual(state.get_vgpr64(i, RegPair(0)), expected_old)
+            self.assertEqual(state.lds.read_qword(i * 8), expected_old & 0x0F0F0F0F0F0F0F0F)
+
+    def test_wave64_divergence_and_exec_masking(self) -> None:
+        alt_mask = 0x5555555555555555
+        state = SIMDState(num_lanes=64, exec_mask=alt_mask, lds_bytes=2048)
+
+        for lane in range(64):
+            qword_addr = lane * 8
+            state.lds.write_qword(qword_addr, 0x1111222233334444 + lane)
+            state.set_vgpr(lane, 2, qword_addr)
+            state.set_vgpr64(lane, RegPair(4), 0xFFFFFFFF00000000)
+            state.set_vgpr64(lane, RegPair(0), 0xDEADBEEFCAFEBABE)
+
+        instr = DSAndRtnB64Instruction(
+            dst=RegPair(0),
+            addr=RegSingle(2),
+            data=RegPair(4),
+        )
+        results = self.interp.execute(instr, state)
+
+        self.assertEqual(len(results), 32)
+
+        for lane in range(64):
+            qword_addr = lane * 8
+            orig_val = 0x1111222233334444 + lane
+            if (lane % 2) == 0:
+                self.assertEqual(state.get_vgpr64(lane, RegPair(0)), orig_val)
+                self.assertEqual(state.lds.read_qword(qword_addr), orig_val & 0xFFFFFFFF00000000)
+            else:
+                self.assertEqual(state.get_vgpr64(lane, RegPair(0)), 0xDEADBEEFCAFEBABE)
+                self.assertEqual(state.lds.read_qword(qword_addr), orig_val)
+
+    def test_simd_lane_collision_serialization(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0x7, lds_bytes=1024)
+        target_addr = 64
+        initial_val = 0xFFFFFFFFFFFFFFFF
+        state.lds.write_qword(target_addr, initial_val)
+
+        # Lane 0: and with 0xFF00FF00FF00FF00
+        # Lane 1: and with 0x0FF00FF00FF00FF0
+        # Lane 2: and with 0x00FF00FF00FF00FF
+        masks = [0xFF00FF00FF00FF00, 0x0FF00FF00FF00FF0, 0x00FF00FF00FF00FF]
+        for lane in range(3):
+            state.set_vgpr(lane, 2, target_addr)
+            state.set_vgpr64(lane, RegPair(4), masks[lane])
+
+        instr = DSAndRtnB64Instruction(
+            dst=RegPair(0),
+            addr=RegSingle(2),
+            data=RegPair(4),
+        )
+        results = self.interp.execute(instr, state)
+
+        # Expected sequential results:
+        # Lane 0 sees initial_val
+        # Lane 1 sees initial_val & masks[0]
+        # Lane 2 sees initial_val & masks[0] & masks[1]
+        v0 = initial_val
+        v1 = v0 & masks[0]
+        v2 = v1 & masks[1]
+        final_mem = v2 & masks[2]
+
+        self.assertEqual(results, [(0, v0), (1, v1), (2, v2)])
+        self.assertEqual(state.get_vgpr64(0, RegPair(0)), v0)
+        self.assertEqual(state.get_vgpr64(1, RegPair(0)), v1)
+        self.assertEqual(state.get_vgpr64(2, RegPair(0)), v2)
+        self.assertEqual(state.lds.read_qword(target_addr), final_mem)
 
 
 if __name__ == '__main__':
