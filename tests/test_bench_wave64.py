@@ -5,12 +5,15 @@ import fnmatch
 import io
 import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
+sys.path.insert(0, os.path.join(ROOT, "tools"))
 import bench_wave64  # noqa: E402
+import rdna2spirv  # noqa: E402
 
 
 def bench(fail):
@@ -101,6 +104,45 @@ class DriverSelectors(unittest.TestCase):
         for other in ("amd-vulkan64.json", "radeon_icd.x86_64.json", "igvk64.json", "intel_icd.x86_64.json"):
             self.assertFalse(self._matches(selector, other), f"{selector!r} must not match {other!r}")
 
+
+
+def scheduler_module(values):
+    """A minimal emulated-style module whose scheduler switches %pcv over `values`, one %blk<v> block per case."""
+    cases = " ".join(f"{v} %blk{v}" for v in values)
+    lines = ["       %uint = OpTypeInt 32 0", "         %c0 = OpConstant %uint 0",
+             "   %not_done = OpLabel", "               OpSelectionMerge %sw_merge None",
+             f"               OpSwitch %pcv %sw_default {cases}"]
+    for v in values:
+        lines += [f"%blk{v} = OpLabel", "               OpBranch %sw_merge"]
+    lines += ["%sw_default = OpLabel", "               OpBranch %sw_merge", "%sw_merge = OpLabel", ""]
+    return "\n".join(lines)
+
+
+class SchedulerSegments(unittest.TestCase):
+    """segments() counts the scheduler's cases whether rdna2spirv.split_big_switch chunked its OpSwitch or not."""
+
+    def count(self, text):
+        with tempfile.TemporaryDirectory() as work:
+            spv = os.path.join(work, "x.spv")
+            with open(spv[:-4] + ".spvasm", "w", encoding="utf-8") as f:
+                f.write(text)
+            return bench_wave64.segments(spv)
+
+    def test_small_switch(self):
+        # blocks 0..3, then two continuation segments past a gap
+        self.assertEqual(self.count(scheduler_module([0, 1, 2, 3, 10, 11])), (6, 2))
+
+    def test_chunked_switch_counts_like_the_plain_one(self):
+        values = list(range(16384)) + [20000, 20001, 20002]   # past spirv-val's 16,383 pairs: split into chunks
+        plain = scheduler_module(values)
+        chunked = rdna2spirv.split_big_switch(plain)
+        self.assertNotIn("OpSwitch %pcv %sw_default", chunked)   # the shape the benchmark used to miss
+        self.assertIn("OpSwitch %pcc %sw_default", chunked)
+        self.assertEqual(self.count(plain), (16387, 3))
+        self.assertEqual(self.count(chunked), (16387, 3))
+
+    def test_no_scheduler(self):
+        self.assertIsNone(self.count("       %uint = OpTypeInt 32 0\n"))
 
 if __name__ == "__main__":
     unittest.main()

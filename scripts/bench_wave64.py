@@ -36,13 +36,25 @@ def build(work, name, emulate, llvm_mc):
     return os.path.join(out, "spirv", name + ".spv")
 
 
+_SCHEDULER_SWITCH = re.compile(r"OpSwitch %pcv %(?:sw_default|swm\d+) ([^\n]+)")
+
+
+def scheduler_cases(text):
+    """The case values of the scheduler's dispatch on %pcv, sorted. A scheduler past spirv-val's 16,383 pairs is
+    split by rdna2spirv.split_big_switch into an outer switch on the chunk (%pcc) and one inner switch on %pcv per
+    chunk, whose merge is %swm<k> instead of %sw_default: their cases together are the original switch's."""
+    cases = []
+    for m in _SCHEDULER_SWITCH.finditer(text):
+        cases += [int(x) for x in re.findall(r"(\d+) %blk\d+", m.group(1))]
+    return sorted(cases)
+
+
 def segments(spv):
     """(segments, continuation segments) of an emulated module: the cases of the scheduler's OpSwitch."""
     text = open(spv[:-4] + ".spvasm", encoding="utf-8").read()
-    m = re.search(r"OpSwitch %pcv %sw_default ([^\n]+)", text)
-    if not m:
+    cases = scheduler_cases(text)
+    if not cases:
         return None
-    cases = [int(x) for x in re.findall(r"(\d+) %blk\d+", m.group(1))]
     blocks = next((i for i, c in enumerate(cases) if c != i), len(cases))   # blocks 0..n-1, then "done" = n, then segments
     return len(cases), len(cases) - blocks
 
