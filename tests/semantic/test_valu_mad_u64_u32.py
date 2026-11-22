@@ -510,6 +510,44 @@ class SIMDVALUInterpreter:
                     ws.write_sgpr32(inst.sdst.index, carry_mask)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class MadU64StatusFlags:
+    """Architectural condition codes and status flags for v_mad_u64_u32."""
+    zero: bool
+    sign: bool
+    carry_out: bool
+    overflow_s64: bool
+    prod_overflow_u32: bool
+    s0_zero: bool
+    s1_zero: bool
+    s2_zero: bool
+
+    @classmethod
+    def from_mad_u64(cls, s0: int, s1: int, s2: int) -> MadU64StatusFlags:
+        s0_u32 = s0 & MASK32
+        s1_u32 = s1 & MASK32
+        s2_u64 = s2 & MASK64
+
+        dst_u64, carry = ref_mad_u64_u32(s0, s1, s2)
+        _, overflow_s = ref_mad_i64_i32(s0, s1, s2)
+        prod = ref_mul_u32_full(s0, s1)
+
+        return cls(
+            zero=(dst_u64 == 0),
+            sign=bool(dst_u64 & SIGN_BIT_64),
+            carry_out=bool(carry),
+            overflow_s64=bool(overflow_s),
+            prod_overflow_u32=(prod >= MODULO_32),
+            s0_zero=(s0_u32 == 0),
+            s1_zero=(s1_u32 == 0),
+            s2_zero=(s2_u64 == 0),
+        )
+
+
 class TestValuMadU64U32Oracle(unittest.TestCase):
     """Unit tests for the reference mathematical oracle and architectural model."""
 
@@ -1263,6 +1301,90 @@ class TestValuMadU64U32RegisterAliasing(unittest.TestCase):
                 self.assertEqual(ws.read_vgpr64(lane, 0), (1000 + lane) + (3 * 4))
             else:
                 self.assertEqual(ws.read_vgpr64(lane, 0), 1000 + lane)
+
+
+class TestValuMadU64U32StatusFlags(unittest.TestCase):
+    """Unit tests for status flags, condition codes, and carry generation."""
+
+    def test_status_flags_zero_result(self) -> None:
+        flags = MadU64StatusFlags.from_mad_u64(0, 0, 0)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.sign)
+        self.assertFalse(flags.carry_out)
+        self.assertFalse(flags.prod_overflow_u32)
+        self.assertTrue(flags.s0_zero)
+        self.assertTrue(flags.s1_zero)
+        self.assertTrue(flags.s2_zero)
+
+    def test_status_flags_zero_with_carry(self) -> None:
+        # 2 * 0x8000_0000 + 0xFFFF_FFFF_0000_0000 = 2^64 -> dst = 0, carry = 1
+        flags = MadU64StatusFlags.from_mad_u64(2, 0x8000_0000, 0xFFFF_FFFF_0000_0000)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.sign)
+        self.assertTrue(flags.carry_out)
+        self.assertTrue(flags.prod_overflow_u32)
+        self.assertFalse(flags.s0_zero)
+        self.assertFalse(flags.s1_zero)
+        self.assertFalse(flags.s2_zero)
+
+    def test_status_flags_sign_bit_set(self) -> None:
+        # MSB of 64-bit destination is set (bit 63)
+        flags = MadU64StatusFlags.from_mad_u64(0, 0, 0x8000_0000_0000_0000)
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.sign)
+        self.assertFalse(flags.carry_out)
+
+    def test_status_flags_product_overflow_u32(self) -> None:
+        # Product exceeds 32 bits: 0x10000 * 0x10000 = 0x1_0000_0000
+        flags_large = MadU64StatusFlags.from_mad_u64(0x10000, 0x10000, 0)
+        self.assertTrue(flags_large.prod_overflow_u32)
+
+        # Product fits in 32 bits: 100 * 200 = 20000
+        flags_small = MadU64StatusFlags.from_mad_u64(100, 200, 0)
+        self.assertFalse(flags_small.prod_overflow_u32)
+
+    def test_vcc_carry_consumption_in_extended_precision_chain(self) -> None:
+        # Multi-limb addition with carry propagation:
+        # Limb 0: v_mad_u64_u32 v[0:1], vcc, s0, s1, s2 -> writes carry to VCC
+        # Limb 1: subsequent addition consuming VCC bit: v_addc_u32 v2, vcc, v2, s3, vcc
+        rf = ScalarRegisterFile()
+        rf.write_vgpr32(2, 2)
+        rf.write_vgpr32(3, 0x8000_0000)
+        rf.write_vgpr64(4, 0xFFFF_FFFF_0000_0000)  # triggers carry = 1
+
+        inst = VMadU64U32Instruction(
+            vdst=Operand.vgpr(0, size_bits=64),
+            sdst=Operand.vcc(size_bits=64),
+            src0=Operand.vgpr(2, size_bits=32),
+            src1=Operand.vgpr(3, size_bits=32),
+            src2=Operand.vgpr(4, size_bits=64),
+        )
+        interp = ScalarVALUInterpreter(rf)
+        interp.execute(inst)
+
+        self.assertEqual(rf.read_vgpr64(0), 0)
+        self.assertEqual(rf.vcc, 1)
+
+        # Extended upper 64-bit limb accumulation with carry-in from VCC
+        upper_limb_in = 0x10
+        upper_limb_out = upper_limb_in + rf.vcc
+        self.assertEqual(upper_limb_out, 0x11)
+
+    def test_status_flags_operand_zeros(self) -> None:
+        flags_s0 = MadU64StatusFlags.from_mad_u64(0, 10, 20)
+        self.assertTrue(flags_s0.s0_zero)
+        self.assertFalse(flags_s0.s1_zero)
+        self.assertFalse(flags_s0.s2_zero)
+
+        flags_s1 = MadU64StatusFlags.from_mad_u64(10, 0, 20)
+        self.assertFalse(flags_s1.s0_zero)
+        self.assertTrue(flags_s1.s1_zero)
+        self.assertFalse(flags_s1.s2_zero)
+
+        flags_s2 = MadU64StatusFlags.from_mad_u64(10, 20, 0)
+        self.assertFalse(flags_s2.s0_zero)
+        self.assertFalse(flags_s2.s1_zero)
+        self.assertTrue(flags_s2.s2_zero)
 
 
 if __name__ == "__main__":
