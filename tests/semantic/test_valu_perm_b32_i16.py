@@ -487,5 +487,29 @@ class TestPermB32I16SIMDDivergence(unittest.TestCase):
             else:
                 self.assertEqual(wave.get_lane_vgpr(0, lane), 0xDEAD_BEEF)
 
+# ==============================================================================
+# Register Aliasing & In-Place Operand Preservation
+# ==============================================================================
+
+class TestPermB32I16RegisterAliasing(unittest.TestCase):
+    def setUp(self):
+        self.rf = ScalarRegisterFile()
+        self.interp = ScalarInterpreter(self.rf)
+
+    def test_dst_aliases_src0(self):
+        self.rf.set_vgpr(0, pack_halves(0x1111, 0x2222))
+        self.rf.set_vgpr(1, pack_halves(0x3333, 0x4444))
+        sel = make_selector(SEL_SRC1_LO, SEL_SRC0_HI)
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B32_I16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(1),
+            src2=ASTOperand.literal(sel),
+        )
+        self.interp.execute(instr)
+        self.assertEqual(self.rf.get_vgpr(0), pack_halves(0x3333, 0x2222))
+
 if __name__ == "__main__":
     unittest.main()
