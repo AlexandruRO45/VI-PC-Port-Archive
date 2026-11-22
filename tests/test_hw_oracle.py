@@ -28,6 +28,22 @@ class Text(unittest.TestCase):
         with self.assertRaises(ValueError):
             asm.family("gfx90a")
 
+    def test_amdgpu_arch_feature_suffixes(self):
+        # amdgpu-arch prints 'gfx1010:xnack-' (and sramecc forms); LLVM takes the suffix on -mcpu and in
+        # .amdgcn_target, but the family and stepping are spelled without it.
+        self.assertEqual(asm.base_arch("gfx1010:xnack-"), "gfx1010")
+        self.assertEqual(asm.family("gfx1010:xnack-"), "gfx10")
+        self.assertEqual(asm.kernel_text("k0", PROG, "gfx1010:xnack-"), asm.kernel_text("k0", PROG, "gfx1010"))
+        body = ["global_store_b32 v22, v20, s[2:3]", "s_endpgm"]
+        self.assertIn("global_store_dword", asm.raw_kernel_text("k0", body, "gfx1010:xnack-"))
+        # The stepping is parsed as hex from the base architecture, so the suffix does not reach int(..., 16).
+        self.assertIn("global_store_b32", asm.raw_kernel_text("k0", body, "gfx1170:xnack-"))
+
+    def test_device_line_matches_with_a_feature_suffix(self):
+        self.assertTrue(runner.device_matches("gfx1010:xnack-", "# arch=gfx1010 name=..."))
+        self.assertTrue(runner.device_matches("gfx1030", "no arch here"))
+        self.assertFalse(runner.device_matches("gfx1030", "# arch=gfx1010 name=..."))
+
     def test_kernel_uses_the_mnemonics_of_its_family(self):
         k11, k10 = asm.kernel_text("k0", PROG, "gfx1150"), asm.kernel_text("k0", PROG, "gfx1030")
         k12 = asm.kernel_text("k0", PROG, "gfx1201")

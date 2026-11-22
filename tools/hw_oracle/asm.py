@@ -25,10 +25,16 @@ GFX12_REMOVED = dict(GFX11_REMOVED, **{
 _LITERAL_FREE = ("s_movk_i32", "s_addk_i32", "s_mulk_i32")
 
 
+def base_arch(arch):
+    """'gfx1010' for 'gfx1010:xnack-': amdgpu-arch reports the target with its feature suffixes, and LLVM takes them
+    on -mcpu and in .amdgcn_target, but the family and the stepping are spelled without them."""
+    return arch.split(":", 1)[0]
+
+
 def family(arch):
     """'gfx10', 'gfx11' or 'gfx12' for gfx10xx, gfx11xx and gfx12xx. GFX12 uses GFX11's spellings for everything
     the kernels here emit; it differs only in which SALU opcodes exist (GFX12_REMOVED)."""
-    m = re.fullmatch(r"gfx(\d+?)[0-9a-f]{2}", arch)
+    m = re.fullmatch(r"gfx(\d+?)[0-9a-f]{2}", base_arch(arch))
     if not m or m.group(1) not in ("10", "11", "12"):
         raise ValueError(f"unsupported GPU architecture {arch!r} (expected gfx10xx, gfx11xx or gfx12xx)")
     return "gfx" + m.group(1)
@@ -144,7 +150,7 @@ def gfx10_spelling(line):
 def raw_kernel_text(name, lines, arch, wave=32, mode=None, lds=0, vgprs=32, sgprs=40):
     """A kernel whose body does its own stores. s[0:1] is the kernarg pointer, s[2:3] gets the output pointer."""
     fam = family(arch)
-    if int(arch[3:], 16) >= 0x1170:
+    if int(base_arch(arch)[3:], 16) >= 0x1170:
         unsupported = sorted(set(mode or {}) & set(_MODE_FIELDS_GONE_ON_GFX1170))
         if unsupported:
             fields = ", ".join(unsupported)

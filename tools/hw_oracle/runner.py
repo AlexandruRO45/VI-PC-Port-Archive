@@ -142,6 +142,12 @@ def build_command(kind, cc, src, out, workdir):
     return ["cmd.exe", "/d", "/c", script]
 
 
+def device_matches(arch, head):
+    """Whether the probe's '# arch=...' line names the architecture we assemble for. amdgpu-arch reports feature
+    suffixes ('gfx1010:xnack-'), which the device line does not carry, so compare the base architecture."""
+    return "arch=" not in head or asm.base_arch(arch) in head
+
+
 def detect_arch(clang):
     env = os.environ.get("LEONIDA_HW_ARCH")
     if env:
@@ -229,7 +235,7 @@ class Oracle:
         if rc:
             raise Unavailable(f"probe launch failed (exit {rc}): {err.strip()[:300]}")
         head = out.splitlines()[0] if out else ""
-        if "arch=" in head and self.arch not in head:
+        if not device_matches(self.arch, head):
             raise Unavailable(f"device reports {head!r} but assembling for {self.arch} (set LEONIDA_HW_ARCH)")
         return head.lstrip("# ")
 
