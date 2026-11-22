@@ -767,5 +767,109 @@ class TestGWSSemaBrConditionCodes(unittest.TestCase):
         self.assertEqual(vcc_mask, exec_mask)
 
 
+class TestGWSSemaBrIEEE754(unittest.TestCase):
+    """Commit 7: IEEE 754 boundary extremes, subnormals, and NaN handling for ds_gws_sema_br."""
+
+    def test_snan_payload_preservation_without_quietening(self) -> None:
+        # Signaling NaN with explicit payload: 0x7F800001
+        snan_bits = 0x7F80_0001
+        interp = ScalarInterpreter()
+        interp.rf.set_vgpr(5, snan_bits)
+        # v5 is touched as vdata operand
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_BR, vdata=Register(5, RegKind.VGPR), offset=0)
+        interp.step(instr)
+
+        val = interp.rf.get_vgpr(5)
+        self.assertEqual(val, snan_bits)
+        self.assertEqual(val & 0x0040_0000, 0)  # Quiet bit must remain 0
+
+    def test_qnan_payload_preservation(self) -> None:
+        # Quiet NaN with payload: 0x7FC0DEAD
+        qnan_bits = 0x7FC0_DEAD
+        interp = ScalarInterpreter()
+        interp.rf.set_vgpr(6, qnan_bits)
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_BR, vdata=Register(6, RegKind.VGPR), offset=1)
+        interp.step(instr)
+
+        self.assertEqual(interp.rf.get_vgpr(6), qnan_bits)
+
+    def test_signed_zeros_distinction(self) -> None:
+        pos_zero = 0x0000_0000
+        neg_zero = 0x8000_0000
+        interp = ScalarInterpreter()
+        interp.rf.set_vgpr(1, pos_zero)
+        interp.rf.set_vgpr(2, neg_zero)
+
+        instr1 = Instruction(opcode=Opcode.DS_GWS_SEMA_BR, vdata=Register(1, RegKind.VGPR), offset=0)
+        instr2 = Instruction(opcode=Opcode.DS_GWS_SEMA_BR, vdata=Register(2, RegKind.VGPR), offset=0)
+        interp.step(instr1)
+        interp.step(instr2)
+
+        self.assertEqual(interp.rf.get_vgpr(1), pos_zero)
+        self.assertEqual(interp.rf.get_vgpr(2), neg_zero)
+        self.assertEqual(interp.rf.get_vgpr(2) & 0x8000_0000, 0x8000_0000)
+
+    def test_subnormals_preservation_without_flush_to_zero(self) -> None:
+        subnormal_min = 0x0000_0001
+        subnormal_max = 0x007F_FFFF
+        interp = ScalarInterpreter()
+        interp.rf.set_vgpr(7, subnormal_min)
+        interp.rf.set_vgpr(8, subnormal_max)
+
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_BR, vdata=Register(7, RegKind.VGPR), offset=0)
+        interp.step(instr)
+
+        self.assertEqual(interp.rf.get_vgpr(7), subnormal_min)
+        self.assertEqual(interp.rf.get_vgpr(8), subnormal_max)
+        self.assertNotEqual(interp.rf.get_vgpr(7), 0)
+
+    def test_infinities_preservation(self) -> None:
+        pos_inf = 0x7F80_0000
+        neg_inf = 0xFF80_0000
+        interp = ScalarInterpreter()
+        interp.rf.set_vgpr(11, pos_inf)
+        interp.rf.set_vgpr(12, neg_inf)
+
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_BR, vdata=Register(11, RegKind.VGPR), offset=0)
+        interp.step(instr)
+
+        self.assertEqual(interp.rf.get_vgpr(11), pos_inf)
+        self.assertEqual(interp.rf.get_vgpr(12), neg_inf)
+
+    def test_normal_extremes_and_packed_f16(self) -> None:
+        flt_max = 0x7F7F_FFFF
+        flt_min = 0x0080_0000
+        packed_f16 = 0x7C00_7C00  # Dual +inf f16
+        interp = ScalarInterpreter()
+        interp.rf.set_vgpr(20, flt_max)
+        interp.rf.set_vgpr(21, flt_min)
+        interp.rf.set_vgpr(22, packed_f16)
+
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_BR, vdata=Register(20, RegKind.VGPR), offset=0)
+        interp.step(instr)
+
+        self.assertEqual(interp.rf.get_vgpr(20), flt_max)
+        self.assertEqual(interp.rf.get_vgpr(21), flt_min)
+        self.assertEqual(interp.rf.get_vgpr(22), packed_f16)
+
+    def test_floating_point_sweep_matrix(self) -> None:
+        # Sweep an array of 16 float bit representations
+        float_patterns = [
+            0x0000_0000, 0x8000_0000, 0x3F80_0000, 0xBF80_0000,
+            0x7F80_0000, 0xFF80_0000, 0x7FC0_0000, 0xFFC0_0000,
+            0x7F80_0001, 0xFF80_0001, 0x0000_0001, 0x8000_0001,
+            0x007F_FFFF, 0x807F_FFFF, 0x7F7F_FFFF, 0xFF7F_FFFF,
+        ]
+        interp = ScalarInterpreter()
+        for idx, pattern in enumerate(float_patterns):
+            interp.rf.set_vgpr(idx, pattern)
+
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_BR, vdata=Register(0, RegKind.VGPR), offset=0)
+        interp.step(instr)
+
+        for idx, expected in enumerate(float_patterns):
+            self.assertEqual(interp.rf.get_vgpr(idx), expected, f"Float pattern at v{idx} altered")
+
+
 if __name__ == "__main__":
     unittest.main()
