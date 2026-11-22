@@ -455,6 +455,16 @@ Target open_target(const std::wstring& path, DWORD access, DWORD disposition, DW
     // bytes; CREATE_ALWAYS and CREATE_NEW replace it.
     const bool keeps_contents =
         disposition == OPEN_EXISTING || disposition == OPEN_ALWAYS || disposition == TRUNCATE_EXISTING;
+    // CREATE_NEW goes to the overlay, where a file only the package has is not there to refuse it. With
+    // FILE_FLAG_DELETE_ON_CLOSE the new overlay file would then be what the close deletes and the marker would hide
+    // the package file, so the open is refused here as the host refuses it for a file that exists. A name a deletion
+    // marker has freed is not in the title's view and can be created.
+    std::vector<std::wstring> parts;
+    if (disposition == CREATE_NEW && (flags & FILE_FLAG_DELETE_ON_CLOSE) != 0 &&
+        parse_console(path, parts) == Parsed::Console) {
+        const View v = view(roots(), parts);
+        if (v.kind == Kind::File && v.in_package && !v.in_overlay) return fail(ERROR_FILE_EXISTS);
+    }
     return write_target(path, keeps_contents);
 }
 

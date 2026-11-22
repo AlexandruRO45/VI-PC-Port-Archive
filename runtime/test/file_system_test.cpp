@@ -1476,6 +1476,48 @@ void run_checks(const std::filesystem::path& root) {
         if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
         check(!std::filesystem::exists(overlay / ".gta6rt-deleted" / "data" / "absent.txt"),
               "a failed delete-on-close open leaves no deletion marker");
+
+        // CREATE_NEW with the flag is refused for a file the title can see, as the host refuses it: making a new
+        // overlay file there and marking the name on close would delete a file the open never got.
+        write_path(package / "data" / "once5.txt", "package");
+        for (const DWORD access : {DWORD{GENERIC_READ}, DWORD{GENERIC_WRITE}}) {
+            SetLastError(0);
+            h = create_w(L"GAME:\\data\\once5.txt", access, kShareAll, nullptr, CREATE_NEW, FILE_FLAG_DELETE_ON_CLOSE,
+                         nullptr);
+            open_error = GetLastError();
+            check(h == INVALID_HANDLE_VALUE && open_error == ERROR_FILE_EXISTS,
+                  "CREATE_NEW with delete-on-close on a package file the title sees fails with ERROR_FILE_EXISTS");
+            if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        }
+        ext.dwFileFlags = FILE_FLAG_DELETE_ON_CLOSE;
+        SetLastError(0);
+        h = create2 ? create2(L"GAME:\\data\\once5.txt", GENERIC_READ, kShareAll, CREATE_NEW, &ext)
+                    : INVALID_HANDLE_VALUE;
+        open_error = GetLastError();
+        check(h == INVALID_HANDLE_VALUE && open_error == ERROR_FILE_EXISTS,
+              "CreateFile2 CREATE_NEW with delete-on-close on such a file fails with ERROR_FILE_EXISTS");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(!std::filesystem::exists(overlay / ".gta6rt-deleted" / "data" / "once5.txt") &&
+                  !std::filesystem::exists(overlay / "data" / "once5.txt"),
+              "the refused opens leave no deletion marker and no overlay file");
+        h = create_w(L"GAME:\\data\\once5.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE && read_handle(h) == "package",
+              "and the title still reads the package file's bytes");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+
+        // A name a deletion marker has freed can be made again with CREATE_NEW, and the close deletes the new file.
+        check(delete_w(L"GAME:\\data\\once5.txt") != FALSE, "the title deletes that file");
+        SetLastError(ERROR_FILE_EXISTS);
+        h = create_w(L"GAME:\\data\\once5.txt", GENERIC_WRITE, kShareAll, nullptr, CREATE_NEW, FILE_FLAG_DELETE_ON_CLOSE,
+                     nullptr);
+        open_error = GetLastError();
+        check(h != INVALID_HANDLE_VALUE && open_error == ERROR_SUCCESS,
+              "CREATE_NEW with delete-on-close makes a name its deletion marker freed");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(attributes_w(L"GAME:\\data\\once5.txt") == INVALID_FILE_ATTRIBUTES &&
+                  !std::filesystem::exists(overlay / "data" / "once5.txt") &&
+                  read_path(package / "data" / "once5.txt") == "package",
+              "and after the close the name is gone again, with the package file untouched");
     }
 }
 
