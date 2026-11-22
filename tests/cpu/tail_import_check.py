@@ -250,7 +250,7 @@ def check_rejections(builds, sites, slots, terminator):
         ("AX writes patched to a tail jump through the slot of mix3", "second", "tail_choose", mix4,
          f"unbound import {named_dll}!mix3 at IAT slot RVA {slots['mix3']:#x}"),
         ("JAE patched to JMP, no reachable tail jump", "jmp", "tail_choose", mix4,
-         f"binding {named_dll}!mix4 supplied but no tail jump uses it"),
+         f"binding {named_dll}!mix4 supplied but no call or tail jump uses it"),
     ]
     with TemporaryDirectory() as folder:
         for label, image, name, bound, reason in controls:

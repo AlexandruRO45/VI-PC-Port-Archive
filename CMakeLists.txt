@@ -768,11 +768,47 @@ if(EXISTS "${INTAKE_PYTHON}")
     target_compile_definitions(cpu_tail_altered_provider PRIVATE ALTER_RETURN)
     add_test(NAME cpu_aot_import_tail_jump COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/tail_import_check.py" "$<TARGET_FILE:cpu_register_probe>" ${tail_files})
+    # Ordinary import calls, linked against the named and the altered provider above. Each caller is translated
+    # three times: call_keep,call_twice,outer_call,pass_result,read_then_call,call_then_read bound to mix3 with
+    # three arguments and 8 guaranteed bytes, low_result to mix3 with 1, and thunk_call,thunk_tail,outer_tail to
+    # mix4 with four arguments and 8.
+    set(icall_files)
+    foreach(variant IN ITEMS named altered)
+        set(provider cpu_tail_${variant}_provider)
+        cpu_asm_fixture(cpu_icall_${variant} import_calls)
+        target_link_libraries(cpu_icall_${variant} PRIVATE ${provider})
+        cpu_translation(cpu_icall_${variant} cpu_switch_aot
+            call_keep,call_twice,outer_call,pass_result,read_then_call,call_then_read
+            NAME cpu_icall_${variant}_mix3 PROVIDER ${provider} SYMBOL mix3 IMPORT_ARGUMENTS 3 RETURN_BYTES 8)
+        cpu_translation(cpu_icall_${variant} cpu_switch_aot low_result
+            NAME cpu_icall_${variant}_low PROVIDER ${provider} SYMBOL mix3 IMPORT_ARGUMENTS 3 RETURN_BYTES 1)
+        cpu_translation(cpu_icall_${variant} cpu_switch_aot thunk_call,thunk_tail,outer_tail
+            NAME cpu_icall_${variant}_mix4 PROVIDER ${provider} SYMBOL mix4 IMPORT_ARGUMENTS 4 RETURN_BYTES 8)
+        list(APPEND icall_files "$<TARGET_FILE:cpu_icall_${variant}>"
+            "$<TARGET_FILE:cpu_icall_${variant}_mix3>" "${CMAKE_CURRENT_BINARY_DIR}/cpu_icall_${variant}_mix3.cpp"
+            "$<TARGET_FILE:cpu_icall_${variant}_low>" "${CMAKE_CURRENT_BINARY_DIR}/cpu_icall_${variant}_low.cpp"
+            "$<TARGET_FILE:cpu_icall_${variant}_mix4>" "${CMAKE_CURRENT_BINARY_DIR}/cpu_icall_${variant}_mix4.cpp"
+            "$<TARGET_FILE:${provider}>")
+    endforeach()
+    # The named caller's three translations built again with a separate cl /O2 command, as for cpu_aot_dead_reads.
+    foreach(binding IN ITEMS mix3 low mix4)
+        set(icall_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_icall_named_${binding}_o2.dll")
+        add_custom_command(OUTPUT "${icall_o2}"
+            COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /LD "${CMAKE_CURRENT_BINARY_DIR}/cpu_icall_named_${binding}.cpp"
+                "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_icall_named_${binding}_o2.obj" "/Fe${icall_o2}"
+                /link "$<TARGET_LINKER_FILE:cpu_tail_named_provider>"
+            DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/cpu_icall_named_${binding}.cpp" cpu_tail_named_provider VERBATIM)
+        add_custom_target(cpu_icall_named_${binding}_o2 ALL DEPENDS "${icall_o2}")
+        list(APPEND icall_files "${icall_o2}")
+    endforeach()
+    add_test(NAME cpu_aot_import_calls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/import_calls_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_guarded_call>" ${icall_files})
 
     foreach(variant IN ITEMS original swapped)
         cpu_asm_fixture(cpu_float_${variant} scalar_float)
         cpu_translation(cpu_float_${variant} cpu_sse_aot
-            "blend_ss=f:ffqf,blend_sd=d:ddqd,convert=q:fdq,from_int=d:qq,classify_ss=q:ff,classify_sd=q:dq,round_trip=f:f,zero_xorps=d:d,zero_pxor=d:d,zero_xorpd=d:d")
+            "blend_ss=f:ffqf,blend_sd=d:ddqd,convert=q:fdq,from_int=d:qq,classify_ss=q:ff,classify_sd=q:dq,round_trip=f:f,zero_xorps=d:d,zero_pxor=d:d,zero_xorpd=d:d,probe_ss=q:qff")
         add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/cpu_float_${variant}_lifted.cpp" APPEND
             DEPENDS tools/cpu_switch_aot.py)
     endforeach()
@@ -1976,18 +2012,26 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_native_tls_value COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_tls_value_check.py" "$<TARGET_FILE:cpu_tls_value>"
         "$<TARGET_FILE:cpu_tls_original>" "$<TARGET_FILE:cpu_tls_sink>" "$<TARGET_FILE:pe_map>")
+    # Provider variant that starts a ready worker inside mix_args; the control installs it as cpu_import_provider.dll.
+    add_library(cpu_import_live SHARED tests/cpu/import_provider.cpp tests/cpu/named_provider.def)
+    target_compile_definitions(cpu_import_live PRIVATE LIVE_WORKER)
+    target_link_libraries(cpu_import_live PRIVATE cpu_exe_io)
+    # Simulation control: finish_exe never terminates; the control installs it as cpu_exe_io.dll.
+    add_library(cpu_exe_io_hang SHARED tests/cpu/exe_io.cpp)
+    target_compile_definitions(cpu_exe_io_hang PRIVATE FINISH_HANG)
     foreach(variant IN ITEMS original no_tls)
-        add_executable(cpu_exe_start_${variant} tests/cpu/exe_start.asm)
+        add_executable(cpu_exe_start_${variant} tests/cpu/exe_start.asm tests/cpu/exe_startup.asm)
         set_target_properties(cpu_exe_start_${variant} PROPERTIES LINKER_LANGUAGE CXX)
-        target_link_options(cpu_exe_start_${variant} PRIVATE /ENTRY:exe_entry /NODEFAULTLIB /SUBSYSTEM:CONSOLE
-            /DYNAMICBASE /INCREMENTAL:NO)
-        target_link_libraries(cpu_exe_start_${variant} PRIVATE cpu_import_provider)
+        target_link_options(cpu_exe_start_${variant} PRIVATE /ENTRY:native_startup /EXPORT:native_entry
+            /EXPORT:body_status,DATA /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE /INCREMENTAL:NO)
+        target_link_libraries(cpu_exe_start_${variant} PRIVATE cpu_import_provider cpu_exe_io)
     endforeach()
     target_compile_definitions(cpu_exe_start_no_tls PRIVATE NO_TLS)
     add_test(NAME cpu_native_exe_start COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_exe_start_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_exe_start_original>" "$<TARGET_FILE:cpu_exe_start_no_tls>"
-        "$<TARGET_FILE:cpu_import_provider>" "$<TARGET_FILE:cpu_import_altered>")
+        "$<TARGET_FILE:cpu_import_provider>" "$<TARGET_FILE:cpu_import_altered>"
+        "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:cpu_import_live>" "$<TARGET_FILE:cpu_exe_io_hang>")
     foreach(variant IN ITEMS original returning no_worker)
         add_executable(cpu_exe_worker_alive_${variant} tests/cpu/worker_alive_entry.asm)
         set_target_properties(cpu_exe_worker_alive_${variant} PROPERTIES LINKER_LANGUAGE CXX)
@@ -2207,6 +2251,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-e64 "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_e64_${adapter} PROPERTIES TIMEOUT 60)
+        add_test(NAME pixel_aot_integer_nc_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-integer-nc "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_integer_nc_${adapter} PROPERTIES TIMEOUT 60)
         add_test(NAME pixel_aot_rndne_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_rndne_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -2219,6 +2267,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     endforeach()
     set_tests_properties(cpu_native_frame_hardware pixel_aot_hardware pixel_aot_buffer_color_hardware
         pixel_aot_three_way_hardware pixel_aot_e64_hardware pixel_aot_blend_scalar_hardware pixel_aot_predicate_rounding_hardware bc7_draw_hardware
+        pixel_aot_integer_nc_hardware
         PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(compute_store_aot_hardware PROPERTIES SKIP_RETURN_CODE 77)
     foreach(adapter IN ITEMS hardware warp)
@@ -2231,6 +2280,8 @@ if(EXISTS "${INTAKE_PYTHON}")
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_blend_scalar_${adapter}.txt")
         set_tests_properties(pixel_aot_e64_${adapter} PROPERTIES
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_e64_${adapter}.txt")
+        set_tests_properties(pixel_aot_integer_nc_${adapter} PROPERTIES
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_integer_nc_${adapter}.txt")
     endforeach()
     set_tests_properties(pixel_aot_attribute_hardware pixel_aot_rndne_hardware PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME compressed_scene_metadata COMMAND "${INTAKE_PYTHON}" -B
