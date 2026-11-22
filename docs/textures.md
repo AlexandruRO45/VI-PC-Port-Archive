@@ -998,6 +998,13 @@ All 1,315 system streams are RAGE `pgDictionary<grcTexture>` pages containing de
     (`StreamingDesc/NumberOfTilesX, Y` in `docs/world.md:361`); whether the remaining 163 cells are inland/dry
     cells with no waterfog dictionary is a hypothesis.
 
+### Inspection and tooling
+
+For interactive inspection of converted glTF models, textures and direct DDS bitstreams in browser, a
+clean-room Web Studio with Vice City lighting presets and real-time dimension measurements is available at
+[wxrrry/leonida-asset-pipeline](https://github.com/wxrrry/leonida-asset-pipeline) (live at
+https://wxrrry.github.io/leonida-asset-pipeline/).
+
 ## Next step
 
 1. **Port BC6H/BC7 BCPack decoders to `TtpfReader` (`rpf9-explorer` / `tools/rpf9dump`).**
