@@ -234,3 +234,173 @@ class TestLdsAddSrc2U64ReferenceOracle(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ============================================================================
+# Section 2: Symbolic AST Opcode Definitions and Typed Expressions
+# ============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+
+
+@dataclass(frozen=True)
+class VGPR:
+    index: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index < DEFAULT_NUM_VGPRS):
+            raise ValueError(f"VGPR index out of range [0, {DEFAULT_NUM_VGPRS - 1}]: {self.index}")
+
+    def __str__(self) -> str:
+        return f"v{self.index}"
+
+
+@dataclass(frozen=True)
+class SGPR:
+    index: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index < DEFAULT_NUM_SGPRS):
+            raise ValueError(f"SGPR index out of range [0, {DEFAULT_NUM_SGPRS - 1}]: {self.index}")
+
+    def __str__(self) -> str:
+        return f"s{self.index}"
+
+
+@dataclass(frozen=True)
+class DSAddSrc2U64Instruction:
+    vaddr: VGPR
+    offset0: int = 0
+    offset1: int = 0
+    gds: bool = False
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.offset0 <= OFFSET8_MASK):
+            raise ValueError(f"offset0 out of 8-bit range [0, 255]: {self.offset0}")
+        if not (0 <= self.offset1 <= OFFSET8_MASK):
+            raise ValueError(f"offset1 out of 8-bit range [0, 255]: {self.offset1}")
+        if not isinstance(self.vaddr, VGPR):
+            raise TypeError(f"vaddr must be a VGPR, got {type(self.vaddr)}")
+
+    def disasm(self) -> str:
+        tokens = ["ds_add_src2_u64", str(self.vaddr)]
+        if self.offset0 != 0:
+            tokens.append(f"offset0:{self.offset0}")
+        if self.offset1 != 0:
+            tokens.append(f"offset1:{self.offset1}")
+        if self.gds:
+            tokens.append("gds")
+        return " ".join(tokens)
+
+
+class ASTExpr64:
+    """Base class for symbolic typed expressions in RDNA2 64-bit dual-source arithmetic."""
+
+    def simplify(self) -> ASTExpr64:
+        raise NotImplementedError
+
+    def evaluate(self, env: Dict[str, int]) -> int:
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class Symbol64(ASTExpr64):
+    name: str
+
+    def simplify(self) -> ASTExpr64:
+        return self
+
+    def evaluate(self, env: Dict[str, int]) -> int:
+        if self.name not in env:
+            raise KeyError(f"Symbol '{self.name}' not found in evaluation environment")
+        return u64(env[self.name])
+
+    def __str__(self) -> str:
+        return self.name
+
+
+@dataclass(frozen=True)
+class Constant64(ASTExpr64):
+    value: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value", u64(self.value))
+
+    def simplify(self) -> ASTExpr64:
+        return self
+
+    def evaluate(self, env: Dict[str, int]) -> int:
+        return self.value
+
+    def __str__(self) -> str:
+        return f"0x{self.value:016X}"
+
+
+@dataclass(frozen=True)
+class DualSourceAddExpr(ASTExpr64):
+    loc_a: ASTExpr64
+    loc_b: ASTExpr64
+
+    def simplify(self) -> ASTExpr64:
+        s_a = self.loc_a.simplify()
+        s_b = self.loc_b.simplify()
+
+        # Constant folding
+        if isinstance(s_a, Constant64) and isinstance(s_b, Constant64):
+            return Constant64(s_a.value + s_b.value)
+
+        # Identity addition: A + 0 -> A
+        if isinstance(s_b, Constant64) and s_b.value == 0:
+            return s_a
+
+        return DualSourceAddExpr(s_a, s_b)
+
+    def evaluate(self, env: Dict[str, int]) -> int:
+        return u64(self.loc_a.evaluate(env) + self.loc_b.evaluate(env))
+
+    def __str__(self) -> str:
+        return f"({self.loc_a} + {self.loc_b})"
+
+
+class TestSymbolicASTAndTypedExpressions(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_instruction_valid_creation_and_disassembly(self) -> None:
+        instr = DSAddSrc2U64Instruction(vaddr=VGPR(4), offset0=2, offset1=6)
+        self.assertEqual(instr.disasm(), "ds_add_src2_u64 v4 offset0:2 offset1:6")
+
+        instr_default = DSAddSrc2U64Instruction(vaddr=VGPR(1), offset0=0, offset1=0, gds=True)
+        self.assertEqual(instr_default.disasm(), "ds_add_src2_u64 v1 gds")
+
+    def test_instruction_validation_vgpr_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            VGPR(256)
+        with self.assertRaises(ValueError):
+            VGPR(-1)
+
+    def test_instruction_validation_offset_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            DSAddSrc2U64Instruction(vaddr=VGPR(0), offset0=256, offset1=0)
+        with self.assertRaises(ValueError):
+            DSAddSrc2U64Instruction(vaddr=VGPR(0), offset0=0, offset1=-1)
+
+    def test_symbolic_constant_folding(self) -> None:
+        expr = DualSourceAddExpr(Constant64(500), Constant64(250))
+        simplified = expr.simplify()
+        self.assertIsInstance(simplified, Constant64)
+        self.assertEqual(simplified.evaluate({}), 750)
+
+    def test_symbolic_identity_zero(self) -> None:
+        a = Symbol64("LDS_A")
+        expr = DualSourceAddExpr(a, Constant64(0))
+        simplified = expr.simplify()
+        self.assertEqual(simplified, a)
+
+    def test_symbolic_evaluation_env(self) -> None:
+        a = Symbol64("A")
+        b = Symbol64("B")
+        expr = DualSourceAddExpr(a, b)
+        env = {"A": 1000, "B": 2000}
+        self.assertEqual(expr.evaluate(env), 3000)
