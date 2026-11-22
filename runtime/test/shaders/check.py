@@ -294,6 +294,8 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_fnan_fract": (0x3f7fffff, 0x00003bff, 0xc0200000, 0xc0200000),
               # TEST-175: docs/design.md rules that were checked on the CPU only (derivations in the .asm headers)
               "ps_cmp_nlg": (0x40000037, 0x40000007, 0x40000001, 0x3f800000),
+              # relative SGPR writes s_movreld_b32/b64, s_movrelsd_2_b32: self-checking bit masks (.asm header)
+              "ps_movreld": (0x403fffff, 0x400fffff, 0x4fffffff, 0x40000007),
               "ps_cvt_off": (0xbf000000, 0x3ee00000, 0xbe800000, 0x3f800000),
               "ps_fmac_f16_mods": (0xaaaa3c00, 0xaaaa3e00, 0xaaaa0000, 0xaaaa4000),
               "ps_vop3_const_mods": (0xc0000000, 0xbf800000, 0x3f800000, 0xaaaabc00),

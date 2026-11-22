@@ -5770,6 +5770,54 @@ class Gen:
                 vals.append(v)
             for w, v in enumerate(vals):        # every read before the first write (D may overlap the source)
                 self.store_reg("sgpr", d["r"] + w, v)
+        elif op in ("s_movreld_b32", "s_movreld_b64", "s_movrelsd_2_b32"):
+            # Relative SGPR writes (RDNA2 ISA SOP1). s_movreld_b32: SGPR[D + M0] = S0 (the b64 form writes the pair at
+            # D + M0 and D + M0 + 1); s_movrelsd_2_b32 (GFX10): SGPR[D + M0[25:16]] = SGPR[S0 + M0[9:0]], other M0 bits
+            # ignored. Measured on RDNA2 (gfx1036, tools/int_hw_probe.py, salu_movreld). SCC is not written. The SGPR file
+            # is an array, so this is a dynamic store; the source is read before any write. The index wraps to the 128
+            # array slots, as for s_movrels. The hardware's range check is not modelled.
+            # The destination is only known at run time, so every translate-time belief about SGPR contents is dropped
+            # (literals an s_mov_b32 left, cached descriptor lookups, value tokens), and a program that holds a lane
+            # mask in an SGPR here is refused: the store could land on it.
+            n = 2 if op == "s_movreld_b64" else 1
+            d, src = a[0], a[1]
+            if d["k"] != "sgpr" or d.get("n", 1) != n:
+                raise Unsupported(op + " operands")
+            if op == "s_movrelsd_2_b32" and (src["k"] != "sgpr" or src.get("n", 1) != 1):
+                raise Unsupported(op + " operands")
+            if n == 2 and (src["k"] != "sgpr" or src.get("n", 1) != 2):
+                raise Unsupported(op + " operands")
+            if any(isinstance(k, int) and k < self.SGPRS for k in self.cur_masks):
+                raise Unsupported(op + " with a lane mask held in an SGPR")
+            m0 = self.tmp()
+            self.emit(f"{m0} = OpLoad %uint %m0")
+            if op == "s_movrelsd_2_b32":
+                lo, hi, md, si = (self.tmp() for _ in range(4))
+                self.emit(f"{lo} = OpBitwiseAnd %uint {m0} {self.cu(0x3FF)}")
+                self.emit(f"{hi} = OpShiftRightLogical %uint {m0} {self.cu(16)}")
+                self.emit(f"{md} = OpBitwiseAnd %uint {hi} {self.cu(0x3FF)}")
+                self.emit(f"{si} = OpIAdd %uint {self.cu(src['r'])} {lo}")
+                sj, sp, sv = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{sj} = OpBitwiseAnd %uint {si} {self.cu(self.SGPRS - 1)}")
+                self.emit(f"{sp} = OpAccessChain %_ptr_Function_uint %sgpr {sj}")
+                self.emit(f"{sv} = OpLoad %uint {sp}")
+                vals, off = [sv], md
+            else:
+                if n == 2:
+                    vals = [self.load_reg("sgpr", src["r"]), self.load_reg("sgpr", src["r"] + 1)]
+                else:
+                    vals = [self.src_u(src)]
+                off = m0
+            self.sgpr_imm.clear()
+            self.desc_cache.clear()
+            for key in [k for k in self.x_tok if isinstance(k, tuple) and k[0] == "sgpr"]:
+                del self.x_tok[key]
+            for w, v in enumerate(vals):
+                i, j, ptr = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{i} = OpIAdd %uint {self.cu(d['r'] + w)} {off}")
+                self.emit(f"{j} = OpBitwiseAnd %uint {i} {self.cu(self.SGPRS - 1)}")
+                self.emit(f"{ptr} = OpAccessChain %_ptr_Function_uint %sgpr {j}")
+                self.emit(f"OpStore {ptr} {v}")
         elif op == "v_swaprel_b32":
             # GFX10 VOP1 (opcode 104): swap VGPR[D + M0[25:16]] and VGPR[S0 + M0[9:0]], the fields v_movrelsd_2_b32
             # uses (RDNA2 ISA: tmp = VGPR[D + M0[25:16]]; VGPR[D + M0[25:16]] = VGPR[S0 + M0[9:0]];

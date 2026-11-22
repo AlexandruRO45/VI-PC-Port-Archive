@@ -291,6 +291,33 @@ def build_cases():
                      "s_movrels_b64 s[6:7], s[10:11]", 1, "SGPR[12:13], SCC kept"),
     ]
 
+    # 9b. s_movreld_b32 / s_movreld_b64 / s_movrelsd_2_b32 (the relative SGPR writes; SCC kept). Output v8, v9, v11
+    # are the SGPRs the write may reach, v10 is SCC.
+    def _rel(name, setup, op_line, scc_in, regs, note):
+        return Case("salu_movreld", name, [
+            *setup, _scc_seed(scc_in), op_line, "s_cselect_b32 s30, 1, 0",
+            f"v_mov_b32 v8, {regs[0]}", f"v_mov_b32 v9, {regs[1]}", "v_mov_b32 v10, s30", f"v_mov_b32 v11, {regs[2]}",
+        ], note)
+    fill = ["s_mov_b32 s10, 0x11111111", "s_mov_b32 s11, 0x22222222", "s_mov_b32 s12, 0x33333333",
+            "s_mov_b32 s13, 0x44444444", "s_mov_b32 s14, 0x55555555", "s_mov_b32 s15, 0x66666666",
+            "s_mov_b32 s16, 0x77777777", "s_mov_b32 s4, 0xcafe0004", "s_mov_b32 s5, 0xcafe0005"]
+    cases += [
+        _rel("s_movreld_b32_m0_2", fill + ["s_mov_b32 m0, 2"], "s_movreld_b32 s10, s4", 0,
+             ("s12", "s10", "s11"), "SGPR[10+2] = s4, s10 and s11 kept, SCC kept (0)"),
+        _rel("s_movreld_b32_m0_2_scc1", fill + ["s_mov_b32 m0, 2"], "s_movreld_b32 s10, s4", 1,
+             ("s12", "s10", "s13"), "same with SCC = 1"),
+        _rel("s_movreld_b32_literal", fill + ["s_mov_b32 m0, 3"], "s_movreld_b32 s10, 0x12345678", 0,
+             ("s13", "s10", "s12"), "SGPR[10+3] = literal"),
+        _rel("s_movreld_b32_m0_0", fill + ["s_mov_b32 m0, 0"], "s_movreld_b32 s10, s4", 0,
+             ("s10", "s11", "s12"), "M0 = 0 writes s10"),
+        _rel("s_movreld_b64_m0_2", fill + ["s_mov_b32 m0, 2"], "s_movreld_b64 s[10:11], s[4:5]", 1,
+             ("s12", "s13", "s10"), "SGPR[12:13] = s[4:5], SCC kept"),
+        _rel("s_movrelsd_2_m0", fill + ["s_mov_b32 m0, 0x30002"], "s_movrelsd_2_b32 s10, s14", 0,
+             ("s13", "s14", "s10"), "SGPR[10 + M0[25:16]=3] = SGPR[14 + M0[9:0]=2] = s16"),
+        _rel("s_movrelsd_2_m0_hi_bits", fill + ["s_mov_b32 m0, 0xfc030802"], "s_movrelsd_2_b32 s10, s14", 1,
+             ("s13", "s14", "s12"), "M0 bits 31:26 and 15:10 ignored"),
+    ]
+
     # 10. Integer clamp on v_add/sub/subrev_nc_u32, v_add/sub_nc_i32, v_add/sub_nc_u16
     cases += [
         _valu4_case("valu_add_nc_clamp", "v_add_sub_nc_u32_clamp", [

@@ -344,8 +344,9 @@ class Analysis:
             return
 
         if op.startswith(("ds_append", "ds_consume", "ds_ordered_count", "ds_gws", "ds_add_gs_reg", "ds_sub_gs_reg",
-                          "s_setpc", "s_swappc", "s_getpc_dummy")):
-            violation("unmodelled-op")        # wave-wide counters and indirect jumps: the count / target is the wave's
+                          "s_setpc", "s_swappc", "s_getpc_dummy", "s_movreld", "s_movrelsd")):
+            violation("unmodelled-op")        # wave-wide counters and indirect jumps: the count / target is the wave's;
+            # a relative SGPR write lands on a register only known at run time, so no taint can be put on it
             for d in dests:
                 put(d, X)
             return
