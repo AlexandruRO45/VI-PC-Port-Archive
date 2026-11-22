@@ -152,6 +152,31 @@ class True16(unittest.TestCase):
         self.assertEqual(out, text.replace("v_cvt_f16_f32 v8,", "v_cvt_f16_f32 v8.l,"))
 
 
+class DefenderQuarantine(unittest.TestCase):
+    """Starting a launcher that Windows Defender quarantined raises WinError 225; the oracle reports it as a skip."""
+
+    def oracle(self):
+        o = object.__new__(runner.Oracle)      # no tools, no GPU
+        o.exe, o.dll = os.path.join("tmp", "leonida_hw_oracle_abc.exe"), "amdhip64_7.dll"
+        return o
+
+    def test_a_quarantined_launcher_is_a_skip_with_an_exclusion_hint(self):
+        o = self.oracle()
+        err = OSError(22, "Operation did not complete successfully because the file contains a virus")
+        err.winerror = 225
+        with mock.patch.object(subprocess, "run", side_effect=err):
+            with self.assertRaisesRegex(runner.Unavailable, "exclusion") as cm:
+                o._launch("k.co", ["probe"])
+        self.assertIn(os.path.dirname(o.exe), str(cm.exception))
+        self.assertIn("225", str(cm.exception))
+
+    def test_other_launch_errors_still_raise(self):
+        o = self.oracle()
+        with mock.patch.object(subprocess, "run", side_effect=OSError(2, "no such file")):
+            with self.assertRaises(OSError):
+                o._launch("k.co", ["probe"])
+
+
 class ToolchainFallbacks(unittest.TestCase):
     """The two probes, with a stand-in for the assembler and the launcher."""
 

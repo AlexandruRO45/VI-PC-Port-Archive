@@ -279,7 +279,15 @@ class Oracle:
         return co, ""
 
     def _launch(self, co, names, words=4):
-        r = subprocess.run([self.exe, co, str(words), self.dll], input="\n".join(names) + "\n", capture_output=True, text=True)
+        try:
+            r = subprocess.run([self.exe, co, str(words), self.dll], input="\n".join(names) + "\n", capture_output=True,
+                               text=True)
+        except OSError as e:
+            if getattr(e, "winerror", None) == 225:   # ERROR_VIRUS_INFECTED: Defender quarantined the fresh build
+                raise Unavailable(f"Windows Defender quarantined the launcher {self.exe} (WinError 225): add an exclusion "
+                                  f"for {os.path.dirname(self.exe)} under Windows Security > Virus & threat protection > "
+                                  "Exclusions, then run again") from None
+            raise
         return r.returncode, r.stdout, r.stderr
 
     def run(self, programs, words=4):
