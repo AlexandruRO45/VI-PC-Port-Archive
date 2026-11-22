@@ -28,8 +28,12 @@ Architecture:
 
 from fractions import Fraction
 import math
+import re
 import struct
 import unittest
+from dataclasses import dataclass
+from enum import Enum
+from typing import Union
 
 MASK32: int = 0xFFFFFFFF
 MASK64: int = 0xFFFFFFFFFFFFFFFF
@@ -269,6 +273,236 @@ class TestValuCvtNormI32F32Oracle(unittest.TestCase):
         self.assertEqual(state.get_vgpr(0), 0x12345678)
         state.set_sgpr(5, 0x9ABCDEF0)
         self.assertEqual(state.get_sgpr(5), 0x9ABCDEF0)
+
+
+# ---------------------------------------------------------------------------
+# AST opcode definitions and typed expressions for v_cvt_norm_i32_f32
+# ---------------------------------------------------------------------------
+
+class RegType(Enum):
+    VGPR = "vgpr"
+    SGPR = "sgpr"
+
+
+@dataclass
+class RegOperand:
+    index: int
+    reg_type: RegType
+    abs_mod: bool = False
+    neg_mod: bool = False
+
+    def validate(self) -> None:
+        if self.reg_type == RegType.VGPR:
+            if not (0 <= self.index <= 255):
+                raise ValueError(f"VGPR index {self.index} out of range (0..255)")
+        elif self.reg_type == RegType.SGPR:
+            if not (0 <= self.index <= 105):
+                raise ValueError(f"SGPR index {self.index} out of range (0..105)")
+        else:
+            raise TypeError(f"Unknown register type: {self.reg_type}")
+
+
+@dataclass
+class ImmediateOperand:
+    value: int
+    is_f32: bool = True
+    abs_mod: bool = False
+    neg_mod: bool = False
+
+    def validate(self) -> None:
+        pass
+
+
+@dataclass
+class InstructionAST:
+    opcode: str
+    dst: RegOperand
+    src0: Union[RegOperand, ImmediateOperand]
+    clamp: bool = False
+
+    def validate(self) -> None:
+        if self.opcode != "v_cvt_norm_i32_f32":
+            raise ValueError(f"Unsupported opcode: {self.opcode}")
+        if not isinstance(self.dst, RegOperand):
+            raise TypeError("Destination must be a RegOperand")
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"VALU instruction destination must be a VGPR, got {self.dst.reg_type}")
+        if self.dst.abs_mod or self.dst.neg_mod:
+            raise ValueError("Destination operand cannot have abs or neg modifiers")
+        self.dst.validate()
+        self.src0.validate()
+
+
+def _parse_reg_token(token: str, is_dst: bool = False) -> RegOperand:
+    tok = token.strip()
+    abs_mod = False
+    neg_mod = False
+    if tok.startswith("-"):
+        neg_mod = True
+        tok = tok[1:].strip()
+    if tok.startswith("|") and tok.endswith("|"):
+        abs_mod = True
+        tok = tok[1:-1].strip()
+
+    m = re.match(r"^([vs])(\d+)$", tok, re.IGNORECASE)
+    if not m:
+        raise ValueError(f"Invalid register operand format: '{token}'")
+    prefix = m.group(1).lower()
+    idx = int(m.group(2))
+    reg_type = RegType.VGPR if prefix == "v" else RegType.SGPR
+
+    if is_dst and reg_type != RegType.VGPR:
+        raise TypeError(f"Destination register must be VGPR, got '{token}'")
+    if is_dst and (abs_mod or neg_mod):
+        raise ValueError(f"Destination cannot have modifiers: '{token}'")
+
+    op = RegOperand(index=idx, reg_type=reg_type, abs_mod=abs_mod, neg_mod=neg_mod)
+    op.validate()
+    return op
+
+
+def _parse_src_token(token: str) -> Union[RegOperand, ImmediateOperand]:
+    tok = token.strip()
+    abs_mod = False
+    neg_mod = False
+    if tok.startswith("-"):
+        neg_mod = True
+        tok = tok[1:].strip()
+    if tok.startswith("|") and tok.endswith("|"):
+        abs_mod = True
+        tok = tok[1:-1].strip()
+
+    if tok.startswith("0x") or tok.startswith("0X"):
+        try:
+            val = int(tok, 16) & MASK32
+            return ImmediateOperand(value=val, is_f32=True, abs_mod=abs_mod, neg_mod=neg_mod)
+        except ValueError:
+            raise ValueError(f"Invalid hex literal: '{token}'")
+    try:
+        val_f = float(tok)
+        val_bits = f32_to_bits(val_f)
+        return ImmediateOperand(value=val_bits, is_f32=True, abs_mod=abs_mod, neg_mod=neg_mod)
+    except ValueError:
+        pass
+
+    m = re.match(r"^([vs])(\d+)$", tok, re.IGNORECASE)
+    if not m:
+        raise ValueError(f"Invalid source operand: '{token}'")
+    prefix = m.group(1).lower()
+    idx = int(m.group(2))
+    reg_type = RegType.VGPR if prefix == "v" else RegType.SGPR
+    op = RegOperand(index=idx, reg_type=reg_type, abs_mod=abs_mod, neg_mod=neg_mod)
+    op.validate()
+    return op
+
+
+def parse_vop_cvt_norm_i32_f32(asm: str) -> InstructionAST:
+    """Parse assembly text representation of v_cvt_norm_i32_f32 into AST."""
+    line = asm.split(";")[0].split("//")[0].strip()
+    if not line:
+        raise ValueError("Empty assembly line")
+
+    tokens = line.split(None, 1)
+    mnemonic = tokens[0].lower()
+    if mnemonic != "v_cvt_norm_i32_f32":
+        raise ValueError(f"Invalid mnemonic '{mnemonic}', expected 'v_cvt_norm_i32_f32'")
+
+    if len(tokens) < 2:
+        raise ValueError(f"Missing operands for instruction '{asm}'")
+
+    body = tokens[1].strip()
+
+    clamp = False
+    if re.search(r"\bclamp\b", body):
+        clamp = True
+        body = re.sub(r"\bclamp\b", " ", body)
+
+    parts = [p.strip() for p in body.split(",") if p.strip()]
+    if len(parts) < 2:
+        raise ValueError(f"Too few operands in '{asm}'")
+    if len(parts) > 2:
+        raise ValueError(f"Too many operands in '{asm}'")
+
+    dst_op = _parse_reg_token(parts[0], is_dst=True)
+    src_words = parts[1].strip().split()
+    if not src_words:
+        raise ValueError(f"Missing src0 operand in '{asm}'")
+    if len(src_words) > 1:
+        raise ValueError(f"Extraneous token in instruction: '{src_words[1]}'")
+
+    src_op = _parse_src_token(src_words[0])
+
+    ast = InstructionAST(opcode="v_cvt_norm_i32_f32", dst=dst_op, src0=src_op, clamp=clamp)
+    ast.validate()
+    return ast
+
+
+class TestValuCvtNormI32F32AST(unittest.TestCase):
+    """Test suite for symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_creation_and_attributes(self) -> None:
+        dst = RegOperand(index=0, reg_type=RegType.VGPR)
+        src = RegOperand(index=1, reg_type=RegType.VGPR, abs_mod=True)
+        ast = InstructionAST(opcode="v_cvt_norm_i32_f32", dst=dst, src0=src)
+        ast.validate()
+        self.assertEqual(ast.opcode, "v_cvt_norm_i32_f32")
+        self.assertEqual(ast.dst.index, 0)
+        self.assertTrue(ast.src0.abs_mod)
+
+    def test_ast_validation_rejects_sgpr_dst(self) -> None:
+        dst = RegOperand(index=0, reg_type=RegType.SGPR)
+        src = RegOperand(index=1, reg_type=RegType.VGPR)
+        ast = InstructionAST(opcode="v_cvt_norm_i32_f32", dst=dst, src0=src)
+        with self.assertRaises(TypeError):
+            ast.validate()
+
+    def test_ast_validation_rejects_dst_modifiers(self) -> None:
+        dst = RegOperand(index=0, reg_type=RegType.VGPR, neg_mod=True)
+        src = RegOperand(index=1, reg_type=RegType.VGPR)
+        ast = InstructionAST(opcode="v_cvt_norm_i32_f32", dst=dst, src0=src)
+        with self.assertRaises(ValueError):
+            ast.validate()
+
+    def test_ast_validation_rejects_out_of_bounds_registers(self) -> None:
+        dst_oob = RegOperand(index=256, reg_type=RegType.VGPR)
+        src = RegOperand(index=0, reg_type=RegType.VGPR)
+        with self.assertRaises(ValueError):
+            InstructionAST(opcode="v_cvt_norm_i32_f32", dst=dst_oob, src0=src).validate()
+
+        dst = RegOperand(index=0, reg_type=RegType.VGPR)
+        src_oob = RegOperand(index=106, reg_type=RegType.SGPR)
+        with self.assertRaises(ValueError):
+            InstructionAST(opcode="v_cvt_norm_i32_f32", dst=dst, src0=src_oob).validate()
+
+    def test_parse_basic_asm(self) -> None:
+        ast = parse_vop_cvt_norm_i32_f32("v_cvt_norm_i32_f32 v0, v1")
+        self.assertEqual(ast.dst.index, 0)
+        self.assertEqual(ast.dst.reg_type, RegType.VGPR)
+        self.assertIsInstance(ast.src0, RegOperand)
+        self.assertEqual(ast.src0.index, 1)
+        self.assertEqual(ast.src0.reg_type, RegType.VGPR)
+
+    def test_parse_modifiers(self) -> None:
+        ast = parse_vop_cvt_norm_i32_f32("v_cvt_norm_i32_f32 v4, -|v5|")
+        self.assertTrue(ast.src0.abs_mod)
+        self.assertTrue(ast.src0.neg_mod)
+
+    def test_parse_literals_and_sgpr(self) -> None:
+        ast_s = parse_vop_cvt_norm_i32_f32("v_cvt_norm_i32_f32 v0, s4")
+        self.assertEqual(ast_s.src0.reg_type, RegType.SGPR)
+        self.assertEqual(ast_s.src0.index, 4)
+
+        ast_lit = parse_vop_cvt_norm_i32_f32("v_cvt_norm_i32_f32 v0, 1.0")
+        self.assertIsInstance(ast_lit.src0, ImmediateOperand)
+        self.assertEqual(ast_lit.src0.value, ONE_F32)
+
+        ast_hex = parse_vop_cvt_norm_i32_f32("v_cvt_norm_i32_f32 v0, 0x3F800000")
+        self.assertIsInstance(ast_hex.src0, ImmediateOperand)
+        self.assertEqual(ast_hex.src0.value, ONE_F32)
+
+    def test_parse_clamp(self) -> None:
+        ast = parse_vop_cvt_norm_i32_f32("v_cvt_norm_i32_f32 v0, v1 clamp")
+        self.assertTrue(ast.clamp)
 
 
 if __name__ == "__main__":
