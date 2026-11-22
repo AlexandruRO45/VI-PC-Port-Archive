@@ -404,6 +404,17 @@ def truncate_values() -> list[str]:
     ])
 
 
+def sopk_scalar() -> list[str]:
+    return with_constants([
+        "s_mov_b32 s50, s44",
+        "s_mulk_i32 s50, 0x3",
+        "s_mov_b32 s51, s45",
+        "s_addk_i32 s51, 0xfffe",
+        "v_mov_b32_e32 v12, s50",
+        "v_mov_b32_e32 v13, s51",
+    ])
+
+
 def rounding():
     """Round scaled samples up and to nearest even, and a constant tie through the VOP3 encoding."""
     return with_constants([
@@ -1193,6 +1204,24 @@ def truncate_case(directory: Path, bias: float, green: float, blue: float, alpha
             red = math.modf(bias + x / 255)[1]
             case.extend(struct.pack("<4f", red, green, blue, alpha))
     path = directory / "truncate.case"
+    path.write_bytes(case)
+    return path
+
+
+def sopk_case(directory, red: float, green: float) -> Path:
+    case = bytearray(256)
+    struct.pack_into("<4f", case, 12, red, green, 0, 1)
+
+    def bits(value):
+        return struct.unpack("<I", struct.pack("<f", value))[0]
+
+    results = (bits(red) * 3, bits(green) - 2)
+    expected = [struct.unpack("<f", struct.pack("<I", value & 0xffffffff))[0]
+                for value in results]
+    for _ in RAMP:
+        for x in RAMP:
+            case.extend(struct.pack("<4f", half_rtz(expected[0]), half_rtz(expected[1]), half_rtz(128 / 255), 1))
+    path = directory / "sopk.case"
     path.write_bytes(case)
     return path
 
@@ -2222,6 +2251,123 @@ def vop2_integer_group() -> list[str]:
         "v_add_nc_u32_e32 v14, s44, v18",
         "v_sub_nc_u32_e32 v15, s44, v18",
     ])
+def pack_f16_pair(lo, hi):
+    lo_b = struct.unpack("<H", struct.pack("<e", lo))[0]
+    hi_b = struct.unpack("<H", struct.pack("<e", hi))[0]
+    return lo_b | (hi_b << 16)
+
+
+# VOP3P dot-product fixture covering all 7 RDNA 2 (gfx1030) dot-product forms:
+# v_dot2_f32_f16 (op_sel, op_sel_hi, neg_lo, neg_hi, clamp), v_dot2_{i,u}32_{i,u}16,
+# v_dot4_{i,u}32_{i,u}8, and v_dot8_{i,u}32_{i,u}4 (wrapping and saturating clamp).
+DOT_BODY = [
+    "v_mov_b32_e32 v18, s44",
+    "v_mov_b32_e32 v19, s45",
+    "v_mov_b32_e32 v20, s46",
+    "v_mov_b32_e32 v21, s47",
+    "v_dot2_f32_f16 v22, v18, 0x40003800, 0.5 op_sel:[1,0,0] op_sel_hi:[0,1,1] neg_lo:[1,0,1] neg_hi:[0,1,0]",
+    "v_dot2_f32_f16 v12, v18, 0x3c003800, v22 clamp",
+    "v_dot2_i32_i16 v23, v19, v20, v21 op_sel:[0,1,0] op_sel_hi:[1,0,1] clamp",
+    "v_dot2_u32_u16 v24, v19, v20, v21 clamp",
+    "v_dot4_i32_i8 v25, v19, v20, v21 clamp",
+    "v_dot4_u32_u8 v26, v19, v20, v21",
+    "v_dot8_i32_i4 v27, v19, v20, v21",
+    "v_dot8_u32_u4 v28, v19, v20, v21 clamp",
+    "v_dot8_u32_u4 v29, v23, 0x12341234, 0",
+    "v_dot8_u32_u4 v29, v24, 0x43214321, v29",
+    "v_cvt_f32_f16_e32 v13, v29",
+    "v_mul_f32_e32 v13, 0x4b800000, v13",
+    "v_dot8_u32_u4 v30, v25, 0x12341234, 0",
+    "v_dot8_u32_u4 v30, v26, 0x43214321, v30",
+    "v_cvt_f32_f16_e32 v14, v30",
+    "v_mul_f32_e32 v14, 0x4b800000, v14",
+    "v_dot8_u32_u4 v31, v27, 0x12341234, 0",
+    "v_dot8_u32_u4 v31, v28, 0x43214321, v31",
+    "v_cvt_f32_f16_e32 v15, v31",
+    "v_mul_f32_e32 v15, 0x4b800000, v15",
+]
+
+DOT_SETS = (
+    # Set 1: mixed signs, interior v_dot2_f32_f16 value, non-overflowing signed & unsigned integer dots.
+    (pack_f16_pair(-0.5, 1.0), 0xfffc0005, 0x0003fffe, 0x00000010),
+    # Set 2: positive signed saturation (INT32_MAX) and unsigned saturation (UINT32_MAX).
+    (pack_f16_pair(2.0, 2.0), 0x7fff7fff, 0x7fff7fff, 0x7ffffff0),
+    # Set 3: negative signed saturation (INT32_MIN) and high-end clamp on v_dot2_f32_f16.
+    (pack_f16_pair(-2.0, 2.0), 0x8000ffff, 0x7fff7fff, 0x80000010),
+    # Set 4: v_dot8_u32_u4 unsigned saturation (UINT32_MAX) vs unwrapped v_dot4_u32_u8 wraparound.
+    (pack_f16_pair(0.5, -1.0), 0xffffffff, 0xffffffff, 0xfffffe00),
+)
+
+
+def dot_reference(f16_bits, x, y, acc):
+    def sext(val, bits):
+        mask = (1 << bits) - 1
+        v = val & mask
+        return v - (1 << bits) if v & (1 << (bits - 1)) else v
+
+    def sat_i32(v):
+        return max(-0x80000000, min(0x7fffffff, v)) & 0xffffffff
+
+    def sat_u32(v):
+        return min(0xffffffff, v) & 0xffffffff
+
+    def nibble_dot(a, b):
+        return sum(((a >> (4 * k)) & 0xf) * ((b >> (4 * k)) & 0xf) for k in range(8))
+
+    a_lo = struct.unpack("<e", struct.pack("<H", f16_bits & 0xffff))[0]
+    a_hi = struct.unpack("<e", struct.pack("<H", (f16_bits >> 16) & 0xffff))[0]
+    v22 = single((-a_hi) * 0.5 + a_lo * (-2.0) + (-0.5))
+    v12 = min(max(single(a_lo * 0.5 + a_hi * 1.0 + v22), 0.0), 1.0)
+
+    acc_s = sext(acc, 32)
+    v23 = sat_i32(sext(x, 16) * sext(y >> 16, 16) + sext(x >> 16, 16) * sext(y, 16) + acc_s)
+    v24 = sat_u32((x & 0xffff) * (y & 0xffff) + ((x >> 16) & 0xffff) * ((y >> 16) & 0xffff) + acc)
+    v25 = sat_i32(sum(sext(x >> (8 * k), 8) * sext(y >> (8 * k), 8) for k in range(4)) + acc_s)
+    v26 = (sum(((x >> (8 * k)) & 0xff) * ((y >> (8 * k)) & 0xff) for k in range(4)) + acc) & 0xffffffff
+    v27 = (sum(sext(x >> (4 * k), 4) * sext(y >> (4 * k), 4) for k in range(8)) + acc_s) & 0xffffffff
+    v28 = sat_u32(nibble_dot(x, y) + acc)
+
+    c1 = nibble_dot(v23, 0x12341234) + nibble_dot(v24, 0x43214321)
+    c2 = nibble_dot(v25, 0x12341234) + nibble_dot(v26, 0x43214321)
+    c3 = nibble_dot(v27, 0x12341234) + nibble_dot(v28, 0x43214321)
+    assert c1 < 1024 and c2 < 1024 and c3 < 1024, (c1, c2, c3)
+    return (half_rtz(v12), float(c1), float(c2), float(c3))
+
+
+def check_dot_draw(directory, compiler, renderer, backend):
+    program = with_constants(DOT_BODY)
+    source = directory / "dot.hlsl"
+    shader = directory / "dot.cso"
+    case = directory / "dot.case"
+    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    source.write_text(translate(program), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    for values in DOT_SETS:
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *values)
+        expected = dot_reference(*values)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+    for set_idx, old, new, label in (
+        (0, "neg_lo:[1,0,1]", "neg_lo:[0,0,1]", "dot2_f32_f16 neg_lo"),
+        (0, "v_dot2_i32_i16 v23", "v_dot2_u32_u16 v23", "dot2 signed vs unsigned"),
+        (1, "v_dot4_i32_i8 v25, v19, v20, v21 clamp", "v_dot4_i32_i8 v25, v19, v20, v21", "dot4_i32_i8 clamp"),
+        (0, "v_dot8_i32_i4 v27", "v_dot8_u32_u4 v27", "dot8 signed vs unsigned"),
+        (3, "v_dot8_u32_u4 v28, v19, v20, v21 clamp", "v_dot8_u32_u4 v28, v19, v20, v21", "dot8_u32_u4 clamp"),
+    ):
+        values = DOT_SETS[set_idx]
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *values)
+        expected = dot_reference(*values)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        mutated = [line.replace(old, new) for line in program]
+        assert mutated != program, label
+        source.write_text(translate(mutated), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Mutation of {label} escaped detection")
 
 
 def check_controls(directory):
@@ -2392,6 +2538,33 @@ def check_controls(directory):
     assert body.count("class32(") == 4 and "& 512u" in body and "asuint(alu" in body, body
     must_reject(translate, with_constants(["v_cmp_class_f32_e64 vcc_lo, s44, -s45"]))
     must_reject(translate, with_constants(["v_cmp_class_f32_e64 vcc_lo, s44"]))
+    program = sopk_scalar()
+    source = translate(program)
+    assert "(asuint(params[0].w) * 3u)" in source and "(asuint(params[1].x) + 4294967294u)" in source
+
+    scc_program = with_constants([
+        "s_mov_b32 s52, 0", "s_mov_b32 s53, 0", "s_mov_b32 s54, 0", "s_mov_b32 s55, 0",
+        "s_mov_b32 s50, s44", "s_addk_i32 s50, 0xfffe",
+        "s_mov_b32 s70, 0", "s_mov_b32 s71, 0", "s_mov_b32 s74, 1", "s_mov_b32 s75, 0",
+        "s_cmov_b64 s[70:71], s[74:75]",
+    ])
+
+    assert "0x80000000u" in translate(scc_program)
+    cmov = scc_program.index("s_cmov_b64 s[70:71], s[74:75]")
+    after_mul = scc_program[:cmov] + ["s_mulk_i32 s50, 0x3"] + scc_program[cmov:]
+    assert "0x80000000u" in translate(after_mul)
+
+    for old, new in (("s_mulk_i32 s50, 0x3", "s_mulk_i32 s50, 0x10000"),
+                     ("s_addk_i32 s51, 0xfffe", "s_addk_i32 s51, 0x10001"),
+                     ("s_mov_b32 s50, s44", "s_mov_b32 s50, s28"),
+                     ("s_mulk_i32 s50, 0x3", "s_mulk_i32 v50, 0x3"),
+                     ("s_addk_i32 s51, 0xfffe", "s_addk_i32 s51, v45")):
+        changed = [line.replace(old, new) for line in program]
+        assert changed != program
+        must_reject(translate, changed)
+
+    wait = program.index("s_waitcnt lgkmcnt(0)", program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc"))
+    must_reject(translate, program[:wait] + ["s_mulk_i32 s44, 0x3"] + program[wait:])
     source = translate(rounding())
     for expected in ("= ceil(alu", "= round(alu", "= round(params[1].x);", "= ceil((-params[1].y));"):
         assert expected in source, expected
@@ -2754,7 +2927,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
                 (rounding(), translate), (arithmetic(), translate), (with_scalar_constant_reads(), translate), (with_scalar_pair_reads(), translate),
                 (truncate_values(), translate), (affine_coordinates(), translate), (ceiling(), translate),
-                (scalar64(), translate)]
+                (scalar64(), translate), (sopk_scalar(), translate)]
     fixtures.append((with_constants(CLASS_BODY), translate))
     fixtures.append((with_constants(RECIPROCAL_BODY), translate))
     fixtures.append((bitwise_program(), translate))
@@ -2786,19 +2959,22 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((attribute_color(rg), translate_attribute) for rg in (False, True))
     exp_sync_program = ["s_waitcnt_expcnt null, 0"] + assembly(False)[:-1] + ["s_waitcnt_expcnt null, 0", "s_endpgm"]
     fixtures.append((exp_sync_program, translate))
-    for index, (instructions, lower_fixture) in enumerate(fixtures):
+    fixtures.append((with_constants(DOT_BODY), translate, "gfx1030"))
+    for index, entry in enumerate(fixtures):
+        instructions, lower_fixture = entry[:2]
+        cpu = entry[2] if len(entry) > 2 else "gfx1013"
         source = directory / "fixture.s"
         obj = directory / "fixture.o"
         binary = directory / "fixture.bin"
         source.write_text("\n".join(instructions) + "\n", encoding="ascii")
-        subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013",
+        subprocess.run([assembler, "-triple=amdgcn--amdpal", f"-mcpu={cpu}",
                         "-filetype=obj", source, "-o", obj], check=True)
         subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, binary], check=True)
         archive = directory / "fixture.rpf"
         archive.write_bytes(envelope(binary.read_bytes()))
         _, native = native_program(archive, "fixture")
         assert native == binary.read_bytes()
-        assert lower_fixture(disassemble(native, library)) == lower_fixture(instructions)
+        assert lower_fixture(disassemble(native, library, cpu=cpu.encode())) == lower_fixture(instructions)
         if index == 0:
             check_container_selector(directory, native, library)
 
@@ -3063,6 +3239,7 @@ def check_render(directory, compiler, renderer, backend, *, core_only=False):
     check_vop3p_draw(directory, compiler, renderer, backend)
     check_bitwise_draw(directory, compiler, renderer, backend)
     check_fma_mix_draw(directory, compiler, renderer, backend)
+    check_dot_draw(directory, compiler, renderer, backend)
     check_movk_draw(directory, compiler, renderer, backend)
     check_half_draw(directory, compiler, renderer, backend)
     for exp_shader_inst in ("s_waitcnt_expcnt null, 0x3", "s_waitcnt expcnt(0)"):
@@ -3162,6 +3339,23 @@ def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Rounding toward negative infinity escaped detection")
+
+    program = sopk_scalar()
+    source.write_text(translate(program), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    for red, green in ((0.5, 0.25), (0.125, 1.0)):
+        case = sopk_case(directory, red, green)
+        subprocess.run([renderer, backend, "--check-pixel-case", shader, case], check=True)
+
+    case = sopk_case(directory, 0.5, 0.25)
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    changed = [line.replace("s_mulk_i32 s50, 0x3", "s_mulk_i32 s50, 0x5") for line in program]
+    source.write_text(translate(changed), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Changing the sopk multiply escaped detection")
 
     source.write_text(translate(rounding()), encoding="ascii")
     subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
