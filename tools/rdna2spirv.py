@@ -2508,17 +2508,35 @@ class Gen:
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
 
-    def cmp_class(self, a, exec_only=False):
+    def cmp_class(self, a, exec_only=False, f16=False):
         """Test x's class against the mask and write the result to VCC/SGPR or EXEC.
-        Bits: 0 sNaN, 1 qNaN, 2 -inf, 3 -normal, 4 -denormal, 5 -0, 6 +0, 7 +denormal, 8 +normal, 9 +inf."""
-        x, mask = self.src_f(a[-2]), self.src_u(a[-1])
-        u = self.tou(x)
+        Bits: 0 sNaN, 1 qNaN, 2 -inf, 3 -normal, 4 -denormal, 5 -0, 6 +0, 7 +denormal, 8 +normal, 9 +inf.
+        f16 (v_cmp_class_f16): x is the low half's binary16 word (the high half is ignored, an inline float constant is
+        the f16 value), neg/abs flip/clear its bit 15; the same ten bits, mask bits above 9 ignored. Measured on RDNA2
+        gfx1036 (raw kernels, wave32 and wave64; f16 denormals kept, denorm_mode_16_64 = 3)."""
+        mask = self.src_u(a[-1])
+        if f16:
+            s = a[-2]
+            u = self.tmp()
+            self.emit(f"{u} = OpBitwiseAnd %uint {self.src_h(s)} {self.cu(0xFFFF)}")
+            if s.get("abs"):
+                g = self.tmp()
+                self.emit(f"{g} = OpBitwiseAnd %uint {u} {self.cu(0x7FFF)}")
+                u = g
+            if s.get("neg"):
+                g = self.tmp()
+                self.emit(f"{g} = OpBitwiseXor %uint {u} {self.cu(0x8000)}")
+                u = g
+            sbit, mbits, emax = 15, 10, 31
+        else:
+            u = self.tou(self.src_f(a[-2]))
+            sbit, mbits, emax = 31, 23, 255
         sign, absu = self.tmp(), self.tmp()
-        self.emit(f"{sign} = OpShiftRightLogical %uint {u} {self.cu(31)}")
-        self.emit(f"{absu} = OpBitwiseAnd %uint {u} {self.cu(0x7FFFFFFF)}")
+        self.emit(f"{sign} = OpShiftRightLogical %uint {u} {self.cu(sbit)}")
+        self.emit(f"{absu} = OpBitwiseAnd %uint {u} {self.cu((1 << sbit) - 1)}")
         exp_, man = self.tmp(), self.tmp()
-        self.emit(f"{exp_} = OpShiftRightLogical %uint {absu} {self.cu(23)}")
-        self.emit(f"{man} = OpBitwiseAnd %uint {absu} {self.cu(0x7FFFFF)}")
+        self.emit(f"{exp_} = OpShiftRightLogical %uint {absu} {self.cu(mbits)}")
+        self.emit(f"{man} = OpBitwiseAnd %uint {absu} {self.cu((1 << mbits) - 1)}")
         neg = self.tmp_bool_nz(sign)
 
         def b(cond_line):
@@ -2527,12 +2545,12 @@ class Gen:
             return t
         is_zero = b(f"OpIEqual %bool {absu} {self.cu(0)}")
         exp0 = b(f"OpIEqual %bool {exp_} {self.cu(0)}")
-        expmax = b(f"OpIEqual %bool {exp_} {self.cu(255)}")
+        expmax = b(f"OpIEqual %bool {exp_} {self.cu(emax)}")
         man0 = b(f"OpIEqual %bool {man} {self.cu(0)}")
         man_nz = b(f"OpLogicalNot %bool {man0}")
         is_inf = b(f"OpLogicalAnd %bool {expmax} {man0}")
         is_nan = b(f"OpLogicalAnd %bool {expmax} {man_nz}")
-        quiet = b(f"OpUGreaterThanEqual %bool {man} {self.cu(0x400000)}")
+        quiet = b(f"OpUGreaterThanEqual %bool {man} {self.cu(1 << (mbits - 1))}")
         snan = b(f"OpLogicalAnd %bool {is_nan} " + b(f"OpLogicalNot %bool {quiet}"))
         qnan = b(f"OpLogicalAnd %bool {is_nan} {quiet}")
         denorm = b(f"OpLogicalAnd %bool {exp0} {man_nz}")
@@ -4346,8 +4364,8 @@ class Gen:
             self.emit(f"{hi} = OpShiftLeftLogical %uint {halves[1]} {self.cu(16)}")
             self.emit(f"{r} = OpBitwiseOr %uint {halves[0]} {hi}")
             self.dst(a[0], r)
-        elif op in ("v_cmp_class_f32", "v_cmpx_class_f32"):
-            self.cmp_class(a, exec_only=op == "v_cmpx_class_f32")
+        elif op in ("v_cmp_class_f32", "v_cmpx_class_f32", "v_cmp_class_f16", "v_cmpx_class_f16"):
+            self.cmp_class(a, exec_only=op.startswith("v_cmpx_"), f16=op.endswith("_f16"))
         elif op in ("v_ffbl_b32", "v_ffbh_u32", "s_flbit_i32_b32") or \
                 (op == "s_ff1_i32_b32" and not self.holds_lane_mask(a[1])):       # of a lane mask: further down
             x = self.src_u(a[1])
