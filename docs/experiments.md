@@ -975,7 +975,7 @@ The model compares with the `Fraction` model of `cpu_aot_x87_compare` and copies
 
 ## Mapping an image without LoadLibrary
 
-`tools/pe_map.cpp` maps an x64 PE32+ image into memory it allocates itself, away from the preferred base, and applies its DIR64 base relocations. It binds ordinary and delay imports through a resolver supplied by the host, sets section protections, records the actual base in the mapped headers and registers `.pdata` with `RtlAddFunctionTable`. The original machine code runs unchanged. Header fields are checked against the file and image size before use. It then calls TLS callbacks and the entry point of a DLL; `pe_map_run` starts an EXE. TLS data templates are rejected. [Issue #46](https://github.com/R0Y00/Xbox2Windows/issues/46)
+`tools/pe_map.cpp` maps an x64 PE32+ image into memory it allocates itself, away from the preferred base, and applies its DIR64 and HIGHLOW base relocations. It binds ordinary and delay imports through a resolver supplied by the host, sets section protections, records the actual base in the mapped headers and registers `.pdata` with `RtlAddFunctionTable`. The original machine code runs unchanged. Header fields are checked against the file and image size before use. It then calls TLS callbacks and the entry point of a DLL; `pe_map_run` starts an EXE. TLS data templates are rejected. [Issue #46](https://github.com/R0Y00/Xbox2Windows/issues/46)
 
 ```powershell
 cmake --build --preset dev --target pe_map cpu_reloc_original cpu_import_original_lifted cpu_ordinal_original_lifted cpu_import_altered cpu_ordinal_altered cpu_register_probe cpu_two_imports
@@ -1013,6 +1013,39 @@ A `PointerToRawData` of zero is the exception: Windows leaves that section zero-
 ctest --preset dev --no-tests=error -R '^cpu_native_section$' -V
 ```
 
+
+### HIGHLOW and mixed-width base relocations
+
+The AMD64 mapper accepts `IMAGE_REL_BASED_HIGHLOW` as a four-byte addition of the
+low 32 bits of the load delta, with unsigned wraparound. `DIR64` remains an
+eight-byte addition. Unaligned entries are handled with byte copies. Bounds and
+overlap checks use the actual fixup width; IAT writes retain their eight-byte
+checks. Unknown types, header writes, writes into the relocation directory and
+fixups extending past the image are rejected.
+
+`cpu_native_highlow` modifies the relocation table of the source-built
+`reloc_route` DLL and compares seven cases with `LoadLibraryExW` using
+`DONT_RESOLVE_DLL_REFERENCES`. Both loaders are forced away from the preferred
+base. The check compares relocated values and adjacent bytes, normalizing for
+the different bases. Cases include zero/high-bit/all-one inputs, unaligned
+entries, mixed DIR64/HIGHLOW entries, the final image dword and a dword ending
+exactly before the relocation directory. Five malformed or unsupported controls
+must fail. The patched pointer is never called. The original fixtures and test
+are MIT source; no game inputs are included.
+
+```powershell
+cmake --build out/native --target pe_map cpu_reloc_original cpu_import_provider --parallel 4
+ctest --test-dir out/native --no-tests=error -R '^cpu_native_highlow$' -V
+```
+
+Measured on Windows 11 build 26300.9974 with MSVC/ML64 19.44.35230 and
+Python 3.12.8: the seven comparison cases and five rejection controls passed
+with Debug and Release (`/O2`) builds. The selected existing native-map,
+mutation and relocation-free tests also passed in both configurations.
+
+[Microsoft PE relocation definitions](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#base-relocation-types)
+define the four-byte HIGHLOW operation. This adds a mapper capability; no title
+startup or use of this relocation by a particular title is established.
 
 ### TLS callbacks and the entry point
 

@@ -1899,6 +1899,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         --ordinal-control "$<TARGET_FILE:cpu_import_provider>")
     cpu_asm_fixture(cpu_reloc_original reloc_route)
     target_link_libraries(cpu_reloc_original PRIVATE cpu_import_provider)
+    add_test(NAME cpu_native_highlow COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/highlow_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_reloc_original>" "$<TARGET_FILE:cpu_import_provider>")
     cpu_asm_fixture(cpu_two_imports two_imports)
     target_link_libraries(cpu_two_imports PRIVATE cpu_import_provider cpu_register_probe)
     add_library(pe_map SHARED tools/pe_map.cpp)
