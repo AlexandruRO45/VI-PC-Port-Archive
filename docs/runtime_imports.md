@@ -75,6 +75,32 @@ The six unique Xbox-specific imports (eight consumer/import pairs) are exactly t
 The video path (`Bink2Scarlett.dll`), the BVH builder and the FidelityFX upscaler therefore all go through the
 two shim DLLs that already exist. `libHttpClient.GDK.dll` and `XCurl.dll` import only desktop APIs.
 
+### What the `xmem.dll` answers carry
+
+Two values the shim used to leave as unknown. Each was read in other layers (facts only, no code: ivall/xcl is
+GPL-2.0-only, omonkeyz/xbox-emulator GPL-3.0, brcly/TuxBox has no licence; xcl and xbox-emulator share lineage, so
+their agreement is one reading, not two) and then checked against the package's own call sites with `llvm-objdump` (no
+code was run, nothing but the instructions around the calls read).
+
+| Import | Fact | Other layers | In the package |
+|---|---|---|---|
+| `XMemAlloc(size, attributes)` | The attribute word holds log2 of the alignment in bits 24-28 and a page-size code in bits 14-15 (0 = 4 KiB, 1 = 64 KiB). The other fields are an object type (bits 0-13), an allocator id (16-23) and a memory type (29-32) | xcl `crates/xcl/src/hle/kernelx.rs` (`cf08a50`) and xbox-emulator `crates/compat/xmem/src/alloc.rs` (`0fc7295`) decode the same fields; TuxBox `runtime/xmem/README.md` (`a067ba9`) measured `0x0480009e` → 16 bytes and `0x30804000` → 64 KiB on retail titles | `amd_fidelityfx_upscaler_xbox.dll` loads its word from a global holding `0xa8004000` (three sites: one alloc, two frees): alignment field 8, page code 1, for a block whose size it rounds up to 256 bytes itself. `Bink2Scarlett.dll` passes `0x5e50000` (alignment field 5) at its one alloc and one free and aligns to 64 bytes on its own |
+| `XMemVirtualQuery(process, address, out)` | A word follows `MEMORY_BASIC_INFORMATION` at +48 and says what kind of memory the region is; 1 is ordinary CPU memory | xcl (same file) sets it to 1 for committed, readable memory; xbox-emulator `crates/compat/xmem/src/virt.rs` sets it to 1 (xcl writes 32 bits, xbox-emulator 64; the value is the same bytes) | All four call sites in `XboxBvhBuilder.dll` (RVAs `0x19c69`, `0x19ccb`, `0x19d9d`, `0x19df9`) record an error for the pointer unless the return is non-zero, bits 0-1 of the byte at +0x30 are not both clear and `State` has `MEM_COMMIT`; the first also wants `PAGE_READONLY` or `PAGE_READWRITE` |
+
+So `XMemAlloc` aligns a block to what its alignment field asks, never to less than 64 bytes, and to 64 KiB when the
+page code is 1. A block is still carved from the heap, not given pages of its own, so each block with page code 1 or
+an alignment of 64 KiB pays up to 64 KiB of padding. `XMemVirtualQuery` writes 1 at +48 for committed memory and
+leaves the word zero otherwise; with a zero there the BVH builder's validation recorded an error for every pointer it
+checked. `xmem_test` covers both.
+
+Not acted on, each logged once when a title asks for it: page codes 2 and 3 (2 MiB pages in xbox-emulator alone;
+`XMemVirtualAlloc` refuses the 2 MiB mode for the same reason) leave the block at its alignment field, and an
+alignment field above 21 (2 MiB; the largest measured is 16) leaves it at 64 bytes, the answer before the word was
+decoded. Also open: the meaning of the memory-type field, whether a block is zero-filled (xcl zero-fills,
+xbox-emulator does not), what a zero-size request returns (null in xbox-emulator and TuxBox, a block in xcl and here),
+and the first eight bytes of `XMemGetWorkingSetStatistics`' output, which the shim zeroes: xcl and xbox-emulator put
+the memory the title may use there, and the package's one caller reads only +8.
+
 ## Console paths and the write overlay
 
 A title's file calls name the console's drives, so `GAME:\data\x.sps` is a file inside the installed game folder.

@@ -146,9 +146,10 @@ Current limits, by design:
 
 - `xmem.dll` — `XMemAlloc`, `XMemFree`, the measured two-argument `XMemGetWorkingSetStatistics(kind, out)`, and the
   measured three-argument
-  `XMemVirtualQuery(process, address, out)`. Allocations are 64-byte aligned; the working-set and
+  `XMemVirtualQuery(process, address, out)`. Allocations follow the alignment and page-size fields of the attribute
+  word and are never aligned to less than 64 bytes; the working-set and
   virtual-query outputs fill the observed 64-byte structures and return `FALSE`/`0` on a null or bad
-  address.
+  address (`docs/runtime_imports.md` lists the fields and where each was measured).
 - The `kernel32.dll` file API — `CreateFileA/W`, `FindFirstFileA/W`/`FindNextFileA/W`/`FindClose`,
   `GetFileAttributesA/W`, `GetFileAttributesExA/W` and `DeleteFileA/W`: a `GAME:` path maps under `--game-dir`, an
   open that can write and a delete go to `--overlay DIR` (default `<game-dir>\overlay`), which reads prefer, and a path

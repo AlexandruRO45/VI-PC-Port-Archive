@@ -6,9 +6,10 @@
 //   XMemVirtualQuery(process, address, out64)
 //   XMemGetWorkingSetStatistics(kind, out)   (kind 0x20000001 at all seven FSR call sites)
 //
-// ASSUMPTION: the attribute word is not decoded by the measured call sites (one passes 0x5e50000). Until a call
-// site shows the alignment/type fields, every block is 64-byte aligned (covers cache lines and SIMD) and a size of
-// zero is rounded up to one byte so the result is a stable, non-null pointer that XMemFree can release.
+// The attribute word carries the alignment the caller asks for (xmem_alignment below). No block is aligned to less
+// than 64 bytes (covers cache lines and SIMD), and a size of zero is rounded up to one byte so the result is a stable,
+// non-null pointer that XMemFree can release. The word's other fields (object type, allocator id, memory type) do not
+// change the answer.
 #include <windows.h>
 #include <malloc.h>
 #include <psapi.h>
@@ -25,15 +26,68 @@ namespace {
 
 constexpr size_t kAlign = 64;
 
-void* __stdcall XMemAlloc(size_t size, uint64_t /*attributes*/) { return _aligned_malloc(size ? size : 1, kAlign); }
+// The alignment an attribute word asks for. Two fields of the word matter here:
+//   bits 24-28  log2 of the alignment in bytes
+//   bits 14-15  page size: 0 = 4 KiB, 1 = 64 KiB; a block on 64 KiB pages starts on a page boundary
+// The package's two words agree with this: amd_fidelityfx_upscaler_xbox.dll passes 0xa8004000 (alignment field 8, page
+// field 1) for a block whose size it has rounded up to 256 bytes itself, and Bink2Scarlett.dll passes 0x5e50000
+// (alignment field 5, 32 bytes) and aligns the block to 64 bytes on its own. The layout is the one ivall/xcl and
+// omonkeyz/xbox-emulator decode (the two share lineage, so they count as one reading), and brcly/TuxBox measured
+// 0x0480009e -> 16 bytes and 0x30804000 -> 64 KiB on retail titles (facts only; docs/runtime_imports.md has the
+// files).
+//
+// Two things are deliberately not acted on, and each is logged once. Page codes 2 and 3 are 2 MiB pages in
+// xbox-emulator alone, and XMemVirtualAlloc below refuses the 2 MiB mode for the same lack of a measurement: such a
+// block is aligned by its alignment field only. An alignment field above 21 (2 MiB, the largest page size any layer
+// names; the largest measured field is 16) would make the heap commit the alignment for every block, so the block
+// keeps the 64-byte floor, the answer every caller got before the word was decoded.
+constexpr unsigned kMaxAlignmentLog2 = 21;
+
+void warn_once(std::atomic<bool>& warned, const char* what, uint64_t attributes) {
+    if (warned.exchange(true, std::memory_order_relaxed)) return;
+    std::fprintf(stderr, "[rt] xmem: XMemAlloc(attributes 0x%llx): %s\n", static_cast<unsigned long long>(attributes),
+                 what);
+}
+
+size_t xmem_alignment(uint64_t attributes) {
+    const unsigned log2 = static_cast<unsigned>((attributes >> 24) & 0x1f);
+    const unsigned page = static_cast<unsigned>((attributes >> 14) & 3);
+    size_t alignment = kAlign;
+    if (log2 > kMaxAlignmentLog2) {
+        static std::atomic<bool> warned{false};
+        warn_once(warned, "an alignment above 2 MiB is not honoured; the block is 64-byte aligned", attributes);
+    } else if ((size_t{1} << log2) > alignment) {
+        alignment = size_t{1} << log2;
+    }
+    if (page == 1) {
+        if (alignment < 0x10000) alignment = 0x10000;
+    } else if (page != 0) {
+        static std::atomic<bool> warned{false};
+        warn_once(warned, "page-size codes 2 and 3 are not measured; the block follows its alignment field only",
+                  attributes);
+    }
+    return alignment;
+}
+
+void* __stdcall XMemAlloc(size_t size, uint64_t attributes) {
+    return _aligned_malloc(size ? size : 1, xmem_alignment(attributes));
+}
 
 void __stdcall XMemFree(void* p, uint64_t /*attributes*/) { _aligned_free(p); }
 
-// Measured call sites pass a zeroed 64-byte structure. Only the MEMORY_BASIC_INFORMATION-compatible prefix is
-// known: callers read at least the base and size fields. Fill that prefix from VirtualQueryEx and zero the rest.
+// Measured call sites pass a zeroed 64-byte structure. The MEMORY_BASIC_INFORMATION-compatible prefix is filled from
+// VirtualQueryEx. The 32-bit word after it, at +48, says what kind of memory the region is: all four call sites in
+// XboxBvhBuilder.dll (1.0.2.1; calls at RVAs 0x19c69, 0x19ccb, 0x19d9d, 0x19df9) report the address as unusable
+// unless the call returns non-zero, bits 0-1 of that word are not both clear and State has MEM_COMMIT (the first
+// also wants PAGE_READONLY or PAGE_READWRITE in Protect). ivall/xcl and omonkeyz/xbox-emulator (shared lineage) both
+// answer 1 there for ordinary CPU memory, so committed memory gets 1 and the rest of the structure stays zero.
 constexpr size_t kVirtualQueryOutSize = 64;
+constexpr size_t kVirtualQueryKindOffset = sizeof(MEMORY_BASIC_INFORMATION);
+constexpr uint32_t kVirtualQueryCpuMemory = 1;
 static_assert(sizeof(MEMORY_BASIC_INFORMATION) <= kVirtualQueryOutSize,
               "the 64-byte XMemVirtualQuery output must hold MEMORY_BASIC_INFORMATION");
+static_assert(kVirtualQueryKindOffset == 48 && kVirtualQueryKindOffset + sizeof(uint32_t) <= kVirtualQueryOutSize,
+              "the memory-kind word follows MEMORY_BASIC_INFORMATION at +48");
 
 // Returns the number of bytes written (the VirtualQuery convention) or 0 on failure. The exact return type and the
 // meaning of every output field are not fully known; callers in the package only test for success.
@@ -45,7 +99,7 @@ SIZE_T __stdcall XMemVirtualQuery(HANDLE process, const void* address, void* out
     static std::atomic<bool> warned{false};
     if (!warned.exchange(true, std::memory_order_relaxed)) {
         std::fprintf(stderr,
-                     "[rt] xmem: XMemVirtualQuery: fields after MEMORY_BASIC_INFORMATION are unknown; "
+                     "[rt] xmem: XMemVirtualQuery: fields after the memory-kind word at +48 are unknown; "
                      "the 64-byte output is zero-filled there\n");
     }
 
@@ -56,6 +110,10 @@ SIZE_T __stdcall XMemVirtualQuery(HANDLE process, const void* address, void* out
     if (!written) return 0;
 
     std::memcpy(out, &info, written < kVirtualQueryOutSize ? written : kVirtualQueryOutSize);
+    if (info.State == MEM_COMMIT) {
+        std::memcpy(static_cast<uint8_t*>(out) + kVirtualQueryKindOffset, &kVirtualQueryCpuMemory,
+                    sizeof(kVirtualQueryCpuMemory));
+    }
     return written;
 }
 
