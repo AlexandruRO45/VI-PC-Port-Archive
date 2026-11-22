@@ -4741,13 +4741,15 @@ def check_subrev_u32_draw(directory, compiler, renderer, backend):
 # v_cvt_f32_u32_e32 and v_cvt_f32_i32_e32 convert one 32-bit word to binary32, reading it unsigned
 # or two's-complement. The inputs are shader literals moved through v_mov_b32 bit copies, not
 # constant-buffer words (#360): the pairs cover zero and one, the last exactly representable integer
-# 2**24, the ties 2**24+1 and 2**25+2, the non-tie neighbors 2**25+1 and 2**25+3 of a midpoint, and
+# 2**24, the ties 2**24+1 and 2**25+2, the non-tie neighbors 2**25+1 and 2**25+3 of a midpoint, the
+# ties 2**24+3 and 2**25-1 that round up (3 mod 4, so clearing their low bit changes the result), and
 # the extreme words 0xFFFFFFFF, 0x80000000 and 0x7FFFFFFF.
 CVT_INT_WORDS = (
     (0, 1),
     (2**24, 2**24 + 1),
     (2**25 + 1, 2**25 + 3),
     (2**25 + 2, 0x7FFFFFFF),
+    (2**24 + 3, 2**25 - 1),
     (0xFFFFFFFF, 0x80000000),
 )
 
@@ -4782,6 +4784,18 @@ def check_cvt_int_f32_draw(directory, compiler, renderer, backend):
         compile_shader(compiler, source, shader)
         write_case(case, constants, (u32f(w0), i32f(w0), u32f(w1), i32f(w1)))
         subprocess.run(draw, check=True)
+    # The round-up ties of [2**24, 2**25) must not be read with their low bit cleared: that lands on the
+    # representable value 2 below the nearest-even result.
+    w0, w1 = 2**24 + 3, 2**25 - 1
+    assert (w0, w1) in CVT_INT_WORDS
+    assert (u32f(w0), u32f(w1)) == (2.0**24 + 4, 2.0**25)
+    assert (u32f(w0 & ~1), u32f(w1 & ~1)) == (2.0**24 + 2, 2.0**25 - 2)
+    source.write_text(translate(uncompressed_export(cvt_int_body(w0, w1))), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    write_case(case, constants, (u32f(w0 & ~1), i32f(w0), u32f(w1 & ~1), i32f(w1)))
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Rounding a midpoint u32 word from its low-bit-cleared neighbor escaped detection")
     # The last pair's words all have the sign bit set, so swapping the two conversions must be caught.
     w0, w1 = CVT_INT_WORDS[-1]
     assert u32f(w0) != i32f(w0) and u32f(w1) != i32f(w1)
@@ -4806,6 +4820,25 @@ def check_cvt_int_f32_e64_draw(directory, compiler, renderer, backend):
         compile_shader(compiler, source, shader)
         write_case(case, constants, (u32f(w0), i32f(w0), u32f(w1), i32f(w1)))
         subprocess.run(draw, check=True)
+    # SGPR source row: constant-buffer words with the sign bit set, read directly by the unclamped e64
+    # conversions. The words are the normal binary32 patterns of -2.0 and -1.0, so the load carries no
+    # NaN or denormal. Reading the unsigned conversion as signed must be caught.
+    w0, w1 = 0xC0000000, 0xBF800000
+    scalar_constants = bytearray(256)
+    struct.pack_into("<2I", scalar_constants, 12, w0, w1)
+    scalar_constants = bytes(scalar_constants)
+    assert (u32f(w0), u32f(w1)) == (3221225472.0, 3212836864.0)
+    assert (i32f(w0), i32f(w1)) == (-1073741824.0, -1082130432.0)
+    program = uncompressed_export(["v_cvt_f32_u32_e64 v12, s44", "v_cvt_f32_i32_e64 v13, s44",
+                                   "v_cvt_f32_u32_e64 v14, s45", "v_cvt_f32_i32_e64 v15, s45"])
+    source.write_text(translate(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    write_case(case, scalar_constants, (u32f(w0), i32f(w0), u32f(w1), i32f(w1)))
+    subprocess.run(draw, check=True)
+    write_case(case, scalar_constants, (i32f(w0), i32f(w0), i32f(w1), i32f(w1)))
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Reading an SGPR word as signed in v_cvt_f32_u32_e64 escaped detection")
     # Clamp rows: the modifier maps the conversion through min(1.0, max(0.0, .)), computed from
     # the same u32f/i32f references. The words cover the interior 0 and 1, values past 1 (2,
     # 0xFFFFFFFF and 0x7FFFFFFF, which rounds to 2147483648.0 before clamping) and the negative
@@ -4826,6 +4859,24 @@ def check_cvt_int_f32_e64_draw(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Dropping clamp from the e64 conversion escaped detection")
+    # Clamped VGPR row whose positive words have a zero low half: the signed conversion clamps them to
+    # 1.0, and any reading that drops bits 16 to 30 gives 0 and clamps to 0.0.
+    w0, w1 = 0x00010000, 0x7FFF0000
+    program = uncompressed_export(cvt_int_body(w0, w1, e64=True, clamp=True))
+    source.write_text(translate(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    expected = tuple(min(1.0, max(0.0, ref(word)))
+                     for word, ref in ((w0, u32f), (w0, i32f), (w1, u32f), (w1, i32f)))
+    assert expected == (1.0, 1.0, 1.0, 1.0)
+    write_case(case, constants, expected)
+    subprocess.run(draw, check=True)
+    masked = tuple(min(1.0, max(0.0, ref(word)))
+                   for word, ref in ((w0, u32f), (w0 & 0x8000FFFF, i32f), (w1, u32f), (w1 & 0x8000FFFF, i32f)))
+    assert masked == (1.0, 0.0, 1.0, 0.0)
+    write_case(case, constants, masked)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Dropping the high bits of a clamped signed conversion escaped detection")
     # The last pair's words all have the sign bit set, so under clamp swapping the two conversions
     # exchanges 1.0 and 0.0 on every channel: u32 clamps to 1 where i32 of the same word clamps to 0.
     w0, w1 = CVT_INT_WORDS[-1]
@@ -4934,6 +4985,31 @@ def check_cvt_float_int_draw(directory, compiler, renderer, backend):
     compile_shader(compiler, source, shader)
     write_words((3, 0xfffffffd, 0xffffffff, 0x80000000))
     subprocess.run(draw, check=True)
+
+    # Literal source: hex binary32 operands outside the inline-constant set, converted directly. The
+    # unsigned values exceed 1.0 and the signed ones are negative below -1.0, so clamping the unsigned
+    # operand or taking the magnitude of the signed one changes every channel.
+    constants = bytes(256)
+    literals = (0x40600000, 0xc0300000, 0x4f7fffff, 0xc0500000)
+    program = uncompressed_export([f"v_cvt_u32_f32_e32 v12, {literals[0]:#010x}",
+                                   f"v_cvt_i32_f32_e32 v13, {literals[1]:#010x}",
+                                   f"v_cvt_u32_f32_e32 v14, {literals[2]:#010x}",
+                                   f"v_cvt_i32_f32_e32 v15, {literals[3]:#010x}"])
+    source.write_text(translate_int(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    expected = (cvt_u32_ref(literals[0]), cvt_i32_ref(literals[1]),
+                cvt_u32_ref(literals[2]), cvt_i32_ref(literals[3]))
+    assert expected == (3, 0xfffffffe, 0xffffff00, 0xfffffffd)
+    write_words(expected)
+    subprocess.run(draw, check=True)
+    one = 0x3f800000
+    mutated = (cvt_u32_ref(one), cvt_i32_ref(literals[1] & 0x7fffffff),
+               cvt_u32_ref(one), cvt_i32_ref(literals[3] & 0x7fffffff))
+    assert mutated == (1, 2, 1, 3)
+    write_words(mutated)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Clamping or dropping the sign of a literal float-to-word operand escaped detection")
 
     # Negative control: swapped conversions against the unswapped expectation. Channels v14 and v15
     # hold -1.0, which converts to 0 unsigned and 0xffffffff signed.
