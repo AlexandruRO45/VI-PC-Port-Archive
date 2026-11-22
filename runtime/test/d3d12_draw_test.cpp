@@ -111,6 +111,7 @@ int main() {
         info.queue = d.queue;
         info.queue_family = d.family;
         info.buffer_device_address = true;
+        info.vertex_divisor = d.vertex_divisor;
         info.subgroup = d.subgroup;
         info.shader_dir = library.string();
         // Of the PSO features only logicOp is passed on, so the other feature refusals below still apply.
@@ -817,6 +818,80 @@ int main() {
         EXPECT(SUCCEEDED(list->Reset(allocator.p, pso.p)));
         list->OMSetRenderTargets(9, &rtv, TRUE, nullptr);
         EXPECT(list->Close() == E_INVALIDARG);
+
+        // InstanceDataStepRate 2: the top-left quad drawn as 4 instances in one place, COLOR per instance from slot 1
+        // (red, blue, magenta, black). The last instance wins: with step rate 2 it reads colour 1 (blue); stepping
+        // every instance would read colour 3 (black). With the (1, 0, 1) tint the pixel shader keeps red and blue,
+        // over a green target. Needs VK_KHR_vertex_attribute_divisor; without it the layer logs and steps every
+        // instance, so the check is skipped.
+        bool step_rate_checked = false;
+        if (d.vertex_divisor) {
+            const std::uint8_t step_colours[4][4] = {{255, 0, 0, 255}, {0, 0, 255, 255}, {255, 0, 255, 255},
+                                                     {0, 0, 0, 255}};
+            std::memcpy(up + 3072, step_colours, sizeof(step_colours));
+            const D3D12_INPUT_ELEMENT_DESC stepped[2] = {
+                {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 1, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 2}};
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC step_desc = pso_desc;
+            step_desc.InputLayout = {stepped, 2};
+            Ref<ID3D12PipelineState> step_pso;
+            EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&step_desc, IID_PPV_ARGS(&step_pso.p))));
+            Ref<ID3D12Fence> step_fence;  // its own, so the values above stay in order
+            EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&step_fence.p))));
+            if (step_pso.p && step_fence.p) {
+                EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, step_pso.p)));
+                D3D12_RESOURCE_BARRIER drawable = transition(target.p, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                             D3D12_RESOURCE_STATE_RENDER_TARGET);
+                list->ResourceBarrier(1, &drawable);
+                const FLOAT green[4] = {0, 1, 0, 1};
+                list->ClearRenderTargetView(rtv, green, 0, nullptr);
+                list->SetGraphicsRootSignature(root.p);
+                list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                const D3D12_VERTEX_BUFFER_VIEW step_slots[2] = {vbv, {upload_va + 3072, sizeof(step_colours), 4}};
+                list->IASetVertexBuffers(0, 2, step_slots);
+                list->IASetIndexBuffer(&ibv);
+                const D3D12_VIEWPORT whole{0, 0, float(size), float(size), 0, 1};
+                const D3D12_RECT all{0, 0, LONG(size), LONG(size)};
+                list->RSSetViewports(1, &whole);
+                list->RSSetScissorRects(1, &all);
+                list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+                list->SetGraphicsRootConstantBufferView(1, upload_va + 512);  // tint (1, 0, 1)
+                list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
+                list->DrawIndexedInstanced(6, 4, 0, 0, 0);
+                D3D12_RESOURCE_BARRIER readable = transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                             D3D12_RESOURCE_STATE_COPY_SOURCE);
+                list->ResourceBarrier(1, &readable);
+                D3D12_TEXTURE_COPY_LOCATION step_dst{};
+                step_dst.pResource = readback.p;
+                step_dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                step_dst.PlacedFootprint = {0, {DXGI_FORMAT_R8G8B8A8_UNORM, size, size, 1, 256}};
+                D3D12_TEXTURE_COPY_LOCATION step_src{};
+                step_src.pResource = target.p;
+                step_src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                list->CopyTextureRegion(&step_dst, 0, 0, 0, &step_src, nullptr);
+                EXPECT(list->Close() == S_OK);
+                ID3D12CommandList* step_lists[] = {list.p};
+                queue->ExecuteCommandLists(1, step_lists);
+                EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                EXPECT(SUCCEEDED(queue->Signal(step_fence.p, 1)) && SUCCEEDED(step_fence->SetEventOnCompletion(1, nullptr)));
+                unsigned step_mismatches = 0;
+                const auto* step_pixels = static_cast<const std::uint8_t*>(mapped);
+                for (UINT row = 0; row < size; ++row)
+                    for (UINT col = 0; col < size; ++col) {
+                        const bool quad = row < size / 2 && col < size / 2;
+                        const std::uint8_t want[4] = {0, std::uint8_t(quad ? 0 : 255), std::uint8_t(quad ? 255 : 0), 255};
+                        const std::uint8_t* got = step_pixels + row * 256 + col * 4;
+                        if (std::memcmp(got, want, 4) == 0) continue;
+                        if (step_mismatches++ < 4)
+                            std::fprintf(stderr, "step-rate-2 pixel (%u, %u): got %u,%u,%u,%u want %u,%u,%u,%u\n",
+                                         col, row, got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]);
+                    }
+                EXPECT(!step_mismatches);
+                step_rate_checked = true;
+            }
+        }
+        std::printf("instance step rate 2: %s\n", step_rate_checked ? "the last of 4 instances read colour 1"
+                                                                  : "skipped (no VK_KHR_vertex_attribute_divisor)");
 
         for (auto* r : {&vertex_buffer, &upload, &readback, &target}) r->reset();
         for (auto* p : {&mrt, &instanced, &refused, &unfed, &xor_pso, &fullscreen}) p->reset();

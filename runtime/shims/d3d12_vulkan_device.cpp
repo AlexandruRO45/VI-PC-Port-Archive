@@ -2619,6 +2619,7 @@ public:
         // Input layout -> vertex input, by semantic.
         std::vector<VkVertexInputAttributeDescription> attributes;
         std::vector<VkVertexInputBindingDescription> bindings;
+        std::vector<VkVertexInputBindingDivisorDescriptionKHR> divisors;
         UINT slot_end[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] = {};
         for (UINT i = 0; i < desc.InputLayout.NumElements; ++i) {
             const D3D12_INPUT_ELEMENT_DESC& element = desc.InputLayout.pInputElementDescs[i];
@@ -2644,12 +2645,19 @@ public:
             const bool instance = element.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA;
             // Step rate 0: every instance reads element 0, which a stride of 0 gives (set at each draw).
             if (instance && element.InstanceDataStepRate == 0) graphics_.zero_step_slots |= 1u << element.InputSlot;
-            if (instance && element.InstanceDataStepRate > 1)
-                log_once("instance step rates above 1 are not modelled; rate", int(element.InstanceDataStepRate));
             if (!(graphics_.vertex_slots & (1u << element.InputSlot))) {
                 graphics_.vertex_slots |= 1u << element.InputSlot;
                 bindings.push_back({element.InputSlot, 0,  // stride: dynamic, from IASetVertexBuffers
                                     instance ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX});
+                // Step rate N > 1: advance every N instances, a binding divisor. Vulkan sets it per binding, D3D12 per
+                // element; the first element read from a slot names it. (Step rate 0 is the zero stride above.)
+                if (instance && element.InstanceDataStepRate > 1) {
+                    if (device_.info.vertex_divisor)
+                        divisors.push_back({element.InputSlot, element.InstanceDataStepRate});
+                    else
+                        log_once("instance step rate above 1 without VK_KHR_vertex_attribute_divisor: every instance "
+                                 "steps; rate", int(element.InstanceDataStepRate));
+                }
             }
         }
         for (const auto& e : stages[0].entry->input_signature) {
@@ -2869,6 +2877,7 @@ public:
         recipe_.stages = std::move(stage_infos);
         recipe_.attributes = std::move(attributes);
         recipe_.bindings = std::move(bindings);
+        recipe_.divisors = std::move(divisors);
         recipe_.assembly = assembly;
         recipe_.raster = raster;
         recipe_.multisample = multisample;
@@ -3013,6 +3022,7 @@ private:
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_sizes[3]{};
         std::vector<VkVertexInputAttributeDescription> attributes;
         std::vector<VkVertexInputBindingDescription> bindings;
+        std::vector<VkVertexInputBindingDivisorDescriptionKHR> divisors;  // InstanceDataStepRate > 1
         VkPipelineInputAssemblyStateCreateInfo assembly{};
         VkPipelineRasterizationStateCreateInfo raster{};
         VkPipelineMultisampleStateCreateInfo multisample{};
@@ -3050,6 +3060,13 @@ private:
         vertex_input.pVertexBindingDescriptions = r.bindings.data();
         vertex_input.vertexAttributeDescriptionCount = std::uint32_t(r.attributes.size());
         vertex_input.pVertexAttributeDescriptions = r.attributes.data();
+        VkPipelineVertexInputDivisorStateCreateInfoKHR divisor_state{
+            VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_KHR};
+        if (!r.divisors.empty()) {
+            divisor_state.vertexBindingDivisorCount = std::uint32_t(r.divisors.size());
+            divisor_state.pVertexBindingDivisors = r.divisors.data();
+            vertex_input.pNext = &divisor_state;
+        }
         VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
         viewport.viewportCount = 1;
         viewport.scissorCount = 1;
@@ -7609,6 +7626,19 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
             *v13.next() = &barycentric;
         }
     }
+    // InstanceDataStepRate above 1 (VulkanDeviceInfo::vertex_divisor), where the GPU has it.
+    VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR divisor{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR};
+    if (has_device_extension(VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &divisor};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.vertex_divisor = divisor.vertexAttributeInstanceRateDivisor == VK_TRUE;
+        if (info.vertex_divisor) {
+            divisor.vertexAttributeInstanceRateZeroDivisor = VK_FALSE;  // step rate 0 uses a zero stride instead
+            divisor.pNext = *v13.next();
+            *v13.next() = &divisor;
+        }
+    }
     VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT interlock{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
     if (has_device_extension(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME)) {
@@ -7750,6 +7780,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (info.fragment_shader_barycentric)
         device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
     if (info.fragment_shader_interlock) device_extensions.push_back(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
+    if (info.vertex_divisor) device_extensions.push_back(VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
     if (info.maintenance8) device_extensions.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
 #endif

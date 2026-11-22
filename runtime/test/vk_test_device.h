@@ -118,6 +118,7 @@ public:
     // The subgroup sizes of the device, with subgroupSizeControl and computeFullSubgroups enabled where it has them.
     leonida::SubgroupSizeCaps subgroup;
     bool custom_border_color = false;  // VK_EXT_custom_border_color and customBorderColors enabled
+    bool vertex_divisor = false;       // VK_KHR_vertex_attribute_divisor, instance-rate divisors (step rate > 1)
     bool custom_border_color_without_format = false;
 
     Device() = default;
@@ -500,6 +501,21 @@ public:
             *v13_.next() = &custom_border;
         }
 
+        // VK_KHR_vertex_attribute_divisor where the device has it (d3d12_draw_test's step-rate draws).
+        VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR divisor{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR};
+        for (const auto& extension : extensions) {
+            if (std::strcmp(extension.extensionName, VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME) != 0) continue;
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &divisor};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            vertex_divisor = divisor.vertexAttributeInstanceRateDivisor == VK_TRUE;
+        }
+        if (vertex_divisor) {
+            divisor.vertexAttributeInstanceRateZeroDivisor = VK_FALSE;
+            divisor.pNext = *v13_.next();
+            *v13_.next() = &divisor;
+        }
+
         VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
         device_info.queueCreateInfoCount = std::uint32_t(queue_infos.size());
         device_info.pQueueCreateInfos = queue_infos.data();
@@ -510,6 +526,7 @@ public:
         if (image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
         if (conditional_rendering) device_extensions.push_back(conditional_extension);
         if (host_image_copy) device_extensions.push_back(host_image_copy_name);
+        if (vertex_divisor) device_extensions.push_back(VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
         const char* swapchain = "VK_KHR_swapchain";
         if (presentation) device_extensions.push_back(swapchain);
 #if defined(VK_KHR_swapchain_maintenance1)

@@ -136,6 +136,9 @@ struct VulkanDeviceInfo {
     // offsets outside gathers: the index's needs_maintenance8).
     bool fragment_shader_barycentric = false;
     bool fragment_shader_interlock = false;
+    // VK_KHR_vertex_attribute_divisor and vertexAttributeInstanceRateDivisor are enabled on `device`: an
+    // InstanceDataStepRate above 1 becomes a binding divisor. Without them such slots step every instance (logged).
+    bool vertex_divisor = false;
     bool maintenance8 = false;
     // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
     // do nothing.
