@@ -912,5 +912,161 @@ class TestValuMadU32U16SIMDMultiLane(unittest.TestCase):
             self.assertEqual(ws.read_vgpr(lane, 0), expected)
 
 
+class TestValuMadU32U16RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing, self-overlapping operands, and state isolation."""
+
+    def test_in_place_accumulator_aliasing(self) -> None:
+        # vdst == src2 == v0
+        rf = ScalarRegisterFile()
+        rf.write_vgpr(0, 100)
+        rf.write_vgpr(1, 10)
+        rf.write_vgpr(2, 20)
+
+        inst = VMadU32U16Instruction(
+            vdst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(0),
+        )
+        interp = ScalarVALUInterpreter(rf)
+
+        # 5 iterations of in-place accumulation
+        for i in range(5):
+            interp.execute(inst)
+            expected = 100 + (i + 1) * 200
+            self.assertEqual(rf.read_vgpr(0), expected)
+
+    def test_destination_aliases_source0(self) -> None:
+        rf = ScalarRegisterFile()
+        rf.write_vgpr(0, 7)
+        rf.write_vgpr(1, 9)
+        rf.write_vgpr(2, 13)
+
+        inst = VMadU32U16Instruction(
+            vdst=Operand.vgpr(0),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2),
+        )
+        interp = ScalarVALUInterpreter(rf)
+        interp.execute(inst)
+
+        self.assertEqual(rf.read_vgpr(0), 7 * 9 + 13)
+
+    def test_destination_aliases_source1(self) -> None:
+        rf = ScalarRegisterFile()
+        rf.write_vgpr(0, 8)
+        rf.write_vgpr(1, 11)
+        rf.write_vgpr(2, 15)
+
+        inst = VMadU32U16Instruction(
+            vdst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(0),
+            src2=Operand.vgpr(2),
+        )
+        interp = ScalarVALUInterpreter(rf)
+        interp.execute(inst)
+
+        self.assertEqual(rf.read_vgpr(0), 11 * 8 + 15)
+
+    def test_source_squaring_aliasing(self) -> None:
+        rf = ScalarRegisterFile()
+        rf.write_vgpr(1, 1234)
+        rf.write_vgpr(2, 5678)
+
+        inst = VMadU32U16Instruction(
+            vdst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2),
+        )
+        interp = ScalarVALUInterpreter(rf)
+        interp.execute(inst)
+
+        self.assertEqual(rf.read_vgpr(0), 1234 * 1234 + 5678)
+        # Source register remains preserved
+        self.assertEqual(rf.read_vgpr(1), 1234)
+
+    def test_full_four_way_aliasing(self) -> None:
+        rf = ScalarRegisterFile()
+        rf.write_vgpr(0, 10)
+
+        inst = VMadU32U16Instruction(
+            vdst=Operand.vgpr(0),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(0),
+            src2=Operand.vgpr(0),
+        )
+        interp = ScalarVALUInterpreter(rf)
+        interp.execute(inst)
+
+        # 10 * 10 + 10 = 110
+        self.assertEqual(rf.read_vgpr(0), 110)
+
+    def test_aliasing_with_high_halfword_op_sel(self) -> None:
+        rf = ScalarRegisterFile()
+        # lo = 5, hi = 7
+        rf.write_vgpr(0, pack_halfwords(5, 7))
+        rf.write_vgpr(1, 10)
+
+        inst = VMadU32U16Instruction(
+            vdst=Operand.vgpr(0),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(0),
+            src2=Operand.vgpr(1),
+            op_sel=(True, True),
+        )
+        interp = ScalarVALUInterpreter(rf)
+        interp.execute(inst)
+
+        # 7 * 7 + 10 = 59
+        self.assertEqual(rf.read_vgpr(0), 59)
+
+    def test_unrelated_registers_preservation(self) -> None:
+        rf = ScalarRegisterFile()
+        for i in range(1, 256):
+            rf.write_vgpr(i, 0x2000 + i)
+        for i in range(106):
+            rf.write_sgpr(i, 0x6000 + i)
+
+        inst = VMadU32U16Instruction(
+            vdst=Operand.vgpr(0),
+            src0=Operand.inline_int(4),
+            src1=Operand.inline_int(5),
+            src2=Operand.inline_int(6),
+        )
+        interp = ScalarVALUInterpreter(rf)
+        interp.execute(inst)
+
+        self.assertEqual(rf.read_vgpr(0), 4 * 5 + 6)
+        for i in range(1, 256):
+            self.assertEqual(rf.read_vgpr(i), 0x2000 + i)
+        for i in range(106):
+            self.assertEqual(rf.read_sgpr(i), 0x6000 + i)
+
+    def test_simd_multi_lane_aliased_divergence(self) -> None:
+        ws = SIMDWaveState(wave_size=64, exec_mask=0x5555_5555_5555_5555)
+        for lane in range(64):
+            ws.write_vgpr(lane, 0, 1000 + lane)
+            ws.write_vgpr(lane, 1, 3)
+            ws.write_vgpr(lane, 2, 4)
+
+        inst = VMadU32U16Instruction(
+            vdst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(0),
+        )
+        interp = SIMDVALUInterpreter(ws)
+        interp.execute(inst)
+
+        for lane in range(64):
+            if lane % 2 == 0:
+                self.assertEqual(ws.read_vgpr(lane, 0), (1000 + lane) + (3 * 4))
+            else:
+                self.assertEqual(ws.read_vgpr(lane, 0), 1000 + lane)
+
+
 if __name__ == "__main__":
     unittest.main()
