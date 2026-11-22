@@ -134,6 +134,10 @@ def main():
     for name in ("original", "original_lifted", "altered", "altered_lifted"):
         parser.add_argument(name, type=Path)
     args = parser.parse_args()
+    if not ctypes.windll.kernel32.IsProcessorFeaturePresent(39):  # PF_AVX_INSTRUCTIONS_AVAILABLE
+        check_rejected_encodings()
+        print("Native VEX differential requires OS-enabled AVX")
+        sys.exit(77)
     pairs = inputs()
     _, native = bind(args.original)
     _, lifted = bind(args.original_lifted)

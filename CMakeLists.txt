@@ -630,6 +630,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/vex_words_check.py"
         "$<TARGET_FILE:cpu_vex_words_original>" "$<TARGET_FILE:cpu_vex_words_original_lifted>"
         "$<TARGET_FILE:cpu_vex_words_altered>" "$<TARGET_FILE:cpu_vex_words_altered_lifted>")
+    set_tests_properties(cpu_aot_vex_words PROPERTIES SKIP_RETURN_CODE 77)
     cpu_asm_fixture(cpu_bink_heap bink_heap)
     add_library(cpu_bink_heap_provider SHARED tests/cpu/bink_heap_provider.cpp src/era_heap.cpp)
     target_include_directories(cpu_bink_heap_provider PRIVATE src)
