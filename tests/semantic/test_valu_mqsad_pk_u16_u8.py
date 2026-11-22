@@ -834,5 +834,107 @@ class TestValuMqsadPkU16U8RegisterAliasing(unittest.TestCase):
         self.assertEqual(self.state.read_operand_64(Operand.vgpr(1, count=2)), expected)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class InstructionStatusFlags:
+    """Architectural status flags and carry generation for packed 16-bit operations."""
+    zero_all: bool
+    zero_lanes: Tuple[bool, bool, bool, bool]
+    carry_lanes: Tuple[bool, bool, bool, bool]
+    sign_lanes: Tuple[bool, bool, bool, bool]
+
+
+def compute_status_flags(s0_64: int, s1_32: int, s2_64: int) -> InstructionStatusFlags:
+    """Evaluate condition codes, per-lane zero flags, and 16-bit carry-out generation."""
+    zero_lanes_list = []
+    carry_lanes_list = []
+    sign_lanes_list = []
+
+    for i in range(4):
+        win = (s0_64 >> (8 * i)) & MASK32
+        acc = extract_u16(s2_64, i)
+
+        diff_sum = 0
+        for k in range(4):
+            b_s0 = extract_byte(win, k)
+            b_s1 = extract_byte(s1_32, k)
+            if b_s1 != 0:
+                diff_sum += ref_abs_diff_u8(b_s0, b_s1)
+
+        full_sum = acc + diff_sum
+        w_val = full_sum & MASK16
+
+        zero_lanes_list.append(w_val == 0)
+        carry_lanes_list.append(full_sum >= 0x1_0000)
+        sign_lanes_list.append(bool(w_val & 0x8000))
+
+    zero_lanes = (zero_lanes_list[0], zero_lanes_list[1], zero_lanes_list[2], zero_lanes_list[3])
+    carry_lanes = (carry_lanes_list[0], carry_lanes_list[1], carry_lanes_list[2], carry_lanes_list[3])
+    sign_lanes = (sign_lanes_list[0], sign_lanes_list[1], sign_lanes_list[2], sign_lanes_list[3])
+    zero_all = all(zero_lanes)
+
+    return InstructionStatusFlags(
+        zero_all=zero_all,
+        zero_lanes=zero_lanes,
+        carry_lanes=carry_lanes,
+        sign_lanes=sign_lanes,
+    )
+
+
+class TestValuMqsadPkU16U8ConditionCodesAndFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry generation."""
+
+    def test_all_zero_condition(self) -> None:
+        flags = compute_status_flags(0, 0, 0)
+        self.assertTrue(flags.zero_all)
+        self.assertEqual(flags.zero_lanes, (True, True, True, True))
+        self.assertEqual(flags.carry_lanes, (False, False, False, False))
+        self.assertEqual(flags.sign_lanes, (False, False, False, False))
+
+    def test_single_lane_non_zero_clears_zero_all(self) -> None:
+        # S0 has 1 in byte 0, s1 has 2 in byte 0
+        s0 = 1
+        s1 = 2
+        flags = compute_status_flags(s0, s1, 0)
+        self.assertFalse(flags.zero_all)
+        # Lane 0 has diff 1 -> not zero. Lanes 1, 2, 3 have diff 2 -> not zero.
+        self.assertEqual(flags.zero_lanes, (False, False, False, False))
+
+    def test_carry_out_generation_on_16bit_overflow(self) -> None:
+        """When acc + diff >= 0x10000, carry flag is asserted for that packed lane."""
+        # Query diff is 1020 for all lanes
+        s0 = 0
+        s1 = 0xFFFF_FFFF
+        # acc: lane 0 is 0xFFFF (overflows to 1019, carry), lane 1 is 0x0000 (no carry)
+        s2 = pack_u16_to_u64(0xFFFF, 0x0000, 0xFF00, 0xF000)
+        flags = compute_status_flags(s0, s1, s2)
+        # lane 0: 0xFFFF + 1020 = 0x103FB -> carry True
+        # lane 1: 0x0000 + 1020 = 1020 -> carry False
+        # lane 2: 0xFF00 (65280) + 1020 = 66300 (0x10300) -> carry True
+        # lane 3: 0xF000 (61440) + 1020 = 62460 -> carry False
+        self.assertEqual(flags.carry_lanes, (True, False, True, False))
+
+    def test_sign_bit_generation_on_high_halfword_bit(self) -> None:
+        """Bit 15 of 16-bit lane set indicates sign flag."""
+        s2 = pack_u16_to_u64(0x8000, 0x7FFF, 0xFFFF, 0x0001)
+        flags = compute_status_flags(0, 0, s2)
+        self.assertEqual(flags.sign_lanes, (True, False, True, False))
+
+    def test_carry_boundary_exact_threshold(self) -> None:
+        """Verify exact carry boundary: sum == 0x10000 produces carry, sum == 0xFFFF does not."""
+        # Query diff is 1
+        s0 = 1
+        s1 = 2  # |1 - 2| = 1
+        # Lane 0: acc = 0xFFFE + 1 = 0xFFFF (no carry)
+        # Lane 1: acc = 0xFFFF + 1 = 0x10000 (carry out!)
+        s2 = pack_u16_to_u64(0xFFFE, 0xFFFF, 0, 0)
+        flags = compute_status_flags(s0, s1, s2)
+        self.assertFalse(flags.carry_lanes[0])
+        self.assertTrue(flags.carry_lanes[1])
+
+
 if __name__ == "__main__":
     unittest.main()
