@@ -99,6 +99,18 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
 yet: `CreateDirectory*`/`RemoveDirectory*`, `MoveFile*`, `CopyFile*` and `SetFileAttributes*`; a title that makes a
 folder through them gets the host's error for a name like `GAME:\...`.
 
+## Title CPU affinity
+
+An Xbox Series title runs on 7 of the console's 8 physical cores (2 SMT threads per core). Under the unmeasured
+assumption that its affinity masks address one bit per console core (the game executable is not available yet to
+confirm it), `runtime/shims/cpu_affinity.cpp` translates `SetThreadAffinityMask`, `GetProcessAffinityMask`,
+`SetProcessAffinityMask`, `SetThreadIdealProcessor` and `SetThreadIdealProcessorEx` across `kernel32.dll`,
+`kernelbase.dll` and `api-ms-win-core-processthreads-l1-1-{0..3}.dll`: each console core maps to one host physical
+core's SMT sibling mask from `GetLogicalProcessorInformationEx(RelationProcessorCore)`, wrapping when the host has
+fewer cores, and `LEONIDA_TITLE_CORES` (1–64, default 7) overrides the console core count. `SetThreadSelectedCpuSets`
+and `SetProcessDefaultCpuSets` forward host CPU set IDs unchanged via `GetProcAddress` on `kernel32.dll`.
+`runtime/test/cpu_affinity_test.cpp` (`ctest` `cpu_affinity`) covers the topology mapping, env parsing and host calls.
+
 ## When an unimplemented import is called
 
 The table above has no unimplemented imports, but the game executable will. A call to one used to return 0

@@ -92,6 +92,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     src/pe_loader.cpp
     shims/registry.cpp
     shims/file_system.cpp
+    shims/cpu_affinity.cpp
     shims/xmem.cpp
     shims/d3d12_xs.cpp
     shims/d3d12_xs_device.cpp
@@ -208,6 +209,17 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(file_system_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(file_system_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(file_system_test PRIVATE /OPT:NOREF)
+
+  # Title CPU affinity: maps console core masks onto host physical cores (SMT pairs).
+  add_executable(cpu_affinity_test
+    test/cpu_affinity_test.cpp
+    shims/cpu_affinity.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(cpu_affinity_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(cpu_affinity_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(cpu_affinity_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(cpu_affinity_test PRIVATE /OPT:NOREF)
 
   # Offline GDK runtime shim (XGameRuntime, XSystem, XTaskQueue, XAsync), driven through the shim registry the way
   # a title calls it at boot. Like xmem_test it compiles its own registry.cpp.
@@ -630,6 +642,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET file_system_test)
     add_test(NAME file_system COMMAND file_system_test)
+  endif()
+  if(WIN32 AND TARGET cpu_affinity_test)
+    add_test(NAME cpu_affinity COMMAND cpu_affinity_test)
   endif()
   if(WIN32 AND TARGET xgameruntime_test)
     add_test(NAME xgameruntime COMMAND xgameruntime_test)
