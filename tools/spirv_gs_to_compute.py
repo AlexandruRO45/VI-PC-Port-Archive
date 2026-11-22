@@ -19,6 +19,8 @@ p, `InvocationId` reads 0 (only `Invocations 1` is supported). The workgroup is 
 `primitive_count` return at once. Push constants and set 0 are untouched. The draw afterwards turns each strip into
 triangles (or lines, points) in emission order.
 
+A helper that cannot be started, or that rejects its input, is one ERROR line and exit 2, not a traceback.
+
 Usage: spirv_gs_to_compute.py in.spv out.spv [--layout out.json]
 Needs spirv-dis and spirv-as (SPIRV-Tools) on PATH, or SPIRV_DIS / SPIRV_AS.
 """
@@ -334,6 +336,22 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
 USAGE = "\n".join(__doc__.strip().splitlines()[-2:])
 
 
+def run_tool(cmd, **kwargs):
+    """subprocess.run(check=True) for a SPIRV-Tools helper. One that cannot be started, or that rejects its
+    input, is one ERROR line and exit 2 instead of a traceback (as tools/spirv_metal_set0.py does)."""
+    try:
+        return subprocess.run(cmd, check=True, **kwargs)
+    except subprocess.CalledProcessError as e:
+        said = next((line.strip() for line in (e.stderr or "").splitlines() if line.strip()), "")
+        print(f"ERROR: {cmd[0]} failed with exit status {e.returncode}" + (f": {said}" if said else ""),
+              file=sys.stderr)
+        raise SystemExit(2) from None
+    except OSError as e:
+        print(f"ERROR: {cmd[0]}: {e.strerror or e} (SPIRV-Tools must be on PATH, or set SPIRV_DIS / SPIRV_AS)",
+              file=sys.stderr)
+        raise SystemExit(2) from None
+
+
 def main(argv):
     args = argv[1:]
     if args and args[0] in ("-h", "--help"):
@@ -361,7 +379,7 @@ def main(argv):
         return 2
     dis = os.environ.get("SPIRV_DIS", "spirv-dis")
     asm = os.environ.get("SPIRV_AS", "spirv-as")
-    text = subprocess.run([dis, "--raw-id", args[0]], check=True, capture_output=True, text=True).stdout
+    text = run_tool([dis, "--raw-id", args[0]], capture_output=True, text=True).stdout
     ver = re.search(r"; Version: (\d+)\.(\d+)", text)
     version = (int(ver[1]), int(ver[2])) if ver else (1, 5)
     try:
@@ -370,7 +388,7 @@ def main(argv):
         print(f"{args[0]}: not supported: {e}", file=sys.stderr)
         return 1
     target = f"spv{version[0]}.{version[1]}" if ver else "vulkan1.2"
-    subprocess.run([asm, "--target-env", target, "-", "-o", args[1]], input=new, check=True, text=True)
+    run_tool([asm, "--target-env", target, "-", "-o", args[1]], input=new, capture_output=True, text=True)
     if lay_path:
         with open(lay_path, "w", encoding="utf-8", newline="\n") as f:
             json.dump(lay, f, indent=1)

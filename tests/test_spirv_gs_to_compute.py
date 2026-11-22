@@ -279,3 +279,63 @@ def test_builtin_load_and_output_store_with_memory_operands():
     bad_gs = gs.replace("%pid = OpLoad %uint %prim_id Aligned 4", "OpCopyMemory %prim_id %inv_id")
     with pytest.raises(gsc.Unsupported, match="%prim_id"):
         gsc.rewrite(bad_gs)
+
+
+# ---- a SPIRV-Tools helper that cannot be started, or that rejects its input --------------------------------
+
+
+def _run_cli(source, output, env_extra, layout=None):
+    args = [sys.executable, "-I", os.path.join(ROOT, "tools", "spirv_gs_to_compute.py"),
+            str(source), str(output)]
+    if layout is not None:
+        args += ["--layout", str(layout)]
+    return subprocess.run(args, capture_output=True, text=True, env=dict(os.environ, **env_extra))
+
+
+def _assert_one_error_line(result, tool):
+    assert result.returncode == 2, result.stderr
+    lines = result.stderr.splitlines()
+    assert len(lines) == 1, result.stderr
+    assert lines[0].startswith("ERROR:"), lines[0]
+    assert tool in lines[0]
+    assert "Traceback" not in result.stderr
+
+
+def test_cli_missing_spirv_dis_is_one_error_line(tmp_path):
+    missing = str(tmp_path / "no-spirv-dis")
+    r = _run_cli(tmp_path / "in.spv", tmp_path / "out.spv", {"SPIRV_DIS": missing})
+    _assert_one_error_line(r, missing)
+    assert not (tmp_path / "out.spv").exists()
+
+
+def test_cli_missing_spirv_as_is_one_error_line(tmp_path, gs_module):
+    missing = str(tmp_path / "no-spirv-as")
+    layout = tmp_path / "lay.json"
+    r = _run_cli(gs_module, tmp_path / "out.spv", {"SPIRV_AS": missing}, layout=layout)
+    _assert_one_error_line(r, missing)
+    assert not (tmp_path / "out.spv").exists()
+    assert not layout.exists()
+
+
+@pytest.mark.skipif(not shutil.which("spirv-dis"), reason="needs spirv-dis on PATH")
+def test_cli_rejected_input_is_one_error_line(tmp_path):
+    source = tmp_path / "bad.spv"
+    source.write_bytes(b"not a SPIR-V module")
+    r = _run_cli(source, tmp_path / "out.spv", {"SPIRV_DIS": "spirv-dis"})
+    _assert_one_error_line(r, "spirv-dis")
+    assert not (tmp_path / "out.spv").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the fake helper is a POSIX executable script")
+@pytest.mark.parametrize("tool,env", [("spirv-dis", "SPIRV_DIS"), ("spirv-as", "SPIRV_AS")])
+def test_cli_failing_helper_reports_its_stderr(tmp_path, gs_module, tool, env):
+    helper = tmp_path / f"fake-{tool}"
+    helper.write_text(f"#!/bin/sh\necho '{tool} says no' >&2\nexit 3\n", encoding="utf-8")
+    helper.chmod(0o755)
+    layout = tmp_path / "lay.json"
+    r = _run_cli(gs_module, tmp_path / "out.spv", {env: str(helper)}, layout=layout)
+    _assert_one_error_line(r, str(helper))
+    assert "exit status 3" in r.stderr
+    assert f"{tool} says no" in r.stderr
+    assert not (tmp_path / "out.spv").exists()
+    assert not layout.exists()

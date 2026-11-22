@@ -5,6 +5,9 @@
 
 Usage:
   powershell -File C:\\Leonida-worktrees\\with-gpu-lock.ps1 "cd C:\\Leonida-worktrees\\w4-cmp16-opsel; python scripts/probe_gfx1036_vcmp16.py"
+
+Needs runtime/build/vk_compute_test.exe (the Windows runtime build). Without it the probe is one ERROR line
+and exit 2, not a traceback; 0 when every probe passed.
 """
 import math
 import os
@@ -334,6 +337,10 @@ def test_f16_nan_and_modifiers(wave_size=32):
 
 
 def main():
+    if not os.path.isfile(VK_COMPUTE_TEST):
+        print(f"ERROR: {VK_COMPUTE_TEST} not found: build the runtime first "
+              "(cmake -S runtime -B runtime/build && cmake --build runtime/build)", file=sys.stderr)
+        return 2
     print("=" * 70)
     print("PROBING GFX1036 SILICON FOR V_CMP(X) 16-BIT OP_SEL & CONSTANTS")
     print("=" * 70)
@@ -361,10 +368,11 @@ def main():
     print("\n" + "=" * 70)
     print("ALL GFX1036 SILICON PROBES (WAVE32 & WAVE64) PASSED WITH ZERO DIVERGENCES!")
     print("=" * 70)
+    return 0
 
 if __name__ == "__main__":
     try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
         sys.stdout.reconfigure(errors="replace")
     except (AttributeError, ValueError, OSError):
         pass
-    main()
+    sys.exit(main())
