@@ -924,11 +924,10 @@ private:
         // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
-        leonida::Draw draw{graphics_pipeline_, graphics_.data, render_targets_, depth_,
-                           {vertex_buffers_.begin(), vertex_buffers_.end()}, index_, topology_, viewport_, scissor_,
-                           blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances, first,
-                           base_vertex, first_instance};
-        check(list_.draw(draw));
+        const leonida::Draw draw{graphics_pipeline_, graphics_.data, {}, depth_, {}, index_, topology_, viewport_,
+                                 scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count,
+                                 instances, first, base_vertex, first_instance};
+        check(list_.draw(draw, render_targets_, vertex_buffers_));
     }
 };
 

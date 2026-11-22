@@ -228,6 +228,38 @@ int main() {
     CHECK(!open_parent.execute_bundle(open_parent));  // a list cannot execute itself
     CHECK(open_parent.commands().empty());
 
+    // A draw's render targets and vertex buffers are copied into the list; ExecuteBundle moves a bundle's draws to
+    // the parent's copies.
+    {
+        Draw d{};
+        d.pipeline = 1;
+        d.count = 3;
+        d.instances = 1;
+        TargetView targets[] = {{30, 0, 0, 1}, {}};
+        VertexBufferView vertex_buffers[] = {{0x1000, 64, 16}};
+        CommandList drawn, draw_bundle;
+        CHECK(drawn.draw(d, targets, vertex_buffers));
+        targets[0].resource = 31;
+        vertex_buffers[0].va = 0x2000;
+        CHECK(draw_bundle.draw(d, {targets, 1}, vertex_buffers));
+        Draw empty = d;
+        empty.count = 0;
+        CHECK(draw_bundle.draw(empty, targets, vertex_buffers));  // nothing to draw: not recorded
+        CHECK(draw_bundle.close());
+        CHECK(drawn.execute_bundle(draw_bundle));
+        CHECK(drawn.close());
+        CHECK(!drawn.draw(d, targets, vertex_buffers));
+        CHECK(drawn.commands().size() == 2);
+        const auto& first = std::get<Draw>(drawn.commands()[0]);
+        const auto& second = std::get<Draw>(drawn.commands()[1]);
+        CHECK(drawn.render_targets(first).size() == 2 && drawn.render_targets(first)[0].resource == 30 &&
+              !drawn.render_targets(first)[1].resource);
+        CHECK(drawn.vertex_buffers(first).size() == 1 && drawn.vertex_buffers(first)[0].va == 0x1000);
+        CHECK(drawn.render_targets(second).size() == 1 && drawn.render_targets(second)[0].resource == 31);
+        CHECK(drawn.vertex_buffers(second).size() == 1 && drawn.vertex_buffers(second)[0].va == 0x2000);
+        CHECK(draw_bundle.render_targets(std::get<Draw>(draw_bundle.commands()[0]))[0].resource == 31);
+    }
+
     // SetPredication (D3D-18): the op must be one of the two D3D12 values and the offset 8-byte aligned; a null
     // buffer turns it off whatever the other arguments are.
     namespace pred = d3d12_predication;

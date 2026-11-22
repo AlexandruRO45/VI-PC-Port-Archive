@@ -104,6 +104,11 @@ struct Scene {
              VkImageView>
         views;
     QueryPool occlusion, timestamps;
+    // One graphics pipeline: an RGBA8 target, D32 depth and two vertex input slots, as VulkanContext keeps them.
+    GraphicsPipeline pipeline;
+    static constexpr std::uintptr_t pipeline_id = 0x7000;
+    static constexpr std::uint64_t geometry_va = 0x100000000ull;  // a 16 MiB vertex and index arena
+    static constexpr std::uint64_t geometry_size = 16ull << 20;
     LayoutTracker tracker;
     ReplayFunctions vk;
 
@@ -184,6 +189,39 @@ struct Scene {
             if (id == timestamp_heap) return &timestamps;
             return nullptr;
         };
+
+        pipeline.pipeline = fake_handle<VkPipeline>(0x6000);
+        pipeline.layout = fake_handle<VkPipelineLayout>(0x6001);
+        pipeline.push_stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        pipeline.color_formats = {rgba8};
+        pipeline.depth_format = VK_FORMAT_D32_SFLOAT;
+        pipeline.depth_aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
+        pipeline.vertex_slots = 0b11;
+        vk.graphics_pipeline = [this](std::uintptr_t id) -> const GraphicsPipeline* {
+            return id == pipeline_id ? &pipeline : nullptr;
+        };
+        vk.buffer_at = [](std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
+            if (va < geometry_va || va >= geometry_va + geometry_size) return false;
+            buffer = fake_handle<VkBuffer>(0x2100);
+            offset = va - geometry_va;
+            size = std::min<std::uint64_t>(size, geometry_va + geometry_size - va);
+            return true;
+        };
+        vk.zero_buffer = fake_handle<VkBuffer>(0x2101);
+        vk.zero_size = 65536;
+        vk.bind_pipeline = nop<PFN_vkCmdBindPipeline>();
+        vk.push_constants = nop<PFN_vkCmdPushConstants>();
+        vk.bind_descriptor_sets = nop<PFN_vkCmdBindDescriptorSets>();
+        vk.bind_vertex_buffers2 = nop<PFN_vkCmdBindVertexBuffers2>();
+        vk.bind_index_buffer = nop<PFN_vkCmdBindIndexBuffer>();
+        vk.set_viewport = nop<PFN_vkCmdSetViewport>();
+        vk.set_scissor = nop<PFN_vkCmdSetScissor>();
+        vk.set_primitive_topology = nop<PFN_vkCmdSetPrimitiveTopology>();
+        vk.set_primitive_restart_enable = nop<PFN_vkCmdSetPrimitiveRestartEnable>();
+        vk.set_stencil_reference = nop<PFN_vkCmdSetStencilReference>();
+        vk.set_blend_constants = nop<PFN_vkCmdSetBlendConstants>();
+        vk.draw = nop<PFN_vkCmdDraw>();
+        vk.draw_indexed = nop<PFN_vkCmdDrawIndexed>();
     }
 
     const ResourceBinding* resolve(ResourceId id) const {
@@ -207,6 +245,8 @@ struct Kind {
     const char* name;
     bool (*record)(CommandList&, std::uint32_t index);
     std::uint32_t commands_per_record;
+    // Recording in a list kept from the last run makes no heap allocation: checked on every run.
+    bool records_without_allocation = false;
 };
 
 bool texture_copy(CommandList& list, std::uint32_t index) {
@@ -222,6 +262,25 @@ bool texture_copy(CommandList& list, std::uint32_t index) {
 bool uav_clear(CommandList& list, std::uint32_t index) {
     const UavView view{Scene::uav, true, VK_FORMAT_R32_UINT, (index % 256) * 4096ull, 4096, 4, 0, 0, 1};
     return list.clear_unordered_access(view, false, {index, 0, 0, 0});
+}
+
+// A draw into the colour and depth targets, as a scene's mesh draws are: two vertex streams, and for `indexed`
+// a 16-bit index buffer; each draw reads its own part of the geometry arena.
+bool draw(CommandList& list, std::uint32_t index, bool indexed) {
+    Draw d{};
+    d.pipeline = Scene::pipeline_id;
+    d.depth = depth_view;
+    const std::uint64_t base = Scene::geometry_va + (index % 256) * 65536ull;
+    const VertexBufferView vertex_buffers[] = {{base, 24576, 12}, {base + 24576, 16384, 8}};
+    if (indexed) d.index = {base + 40960, 6144, 57};
+    d.topology = 4;  // D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
+    d.viewport = {0, 0, 1920, 1080, 0, 1};
+    d.scissor = {0, 0, 1920, 1080};
+    d.blend_factor = {1, 1, 1, 1};
+    d.indexed = indexed;
+    d.count = indexed ? 3072 : 2048;
+    d.instances = 1;
+    return list.draw(d, {&color_view, 1}, vertex_buffers);
 }
 
 const Kind kinds[] = {
@@ -267,6 +326,8 @@ const Kind kinds[] = {
          return l.resolve_queries({Scene::occlusion_heap, q::binary_occlusion, first, 16, Scene::results, first * 8ull});
      },
      1},
+    {"draw", [](CommandList& l, std::uint32_t i) { return draw(l, i, false); }, 1, true},
+    {"draw indexed", [](CommandList& l, std::uint32_t i) { return draw(l, i, true); }, 1, true},
     {"predication on+off",
      [](CommandList& l, std::uint32_t) {
          return l.set_predication({Scene::predicate, 0, d3d12_predication::equal_zero}) &&
@@ -484,6 +545,11 @@ int main(int argc, char** argv) {
             },
             reps, warmup);
         check(kind.name, r);
+        if (kind.records_without_allocation && r.record.allocations != 0) {
+            std::fprintf(stderr, "FAIL %s: %.2f heap allocations per command recorded\n", kind.name,
+                         r.record.allocations);
+            ++failures;
+        }
         if (!self_test) print_row(kind.name, r, csv);
     }
     const auto frame = [&](CommandList& list) {

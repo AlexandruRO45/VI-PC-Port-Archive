@@ -387,15 +387,23 @@ struct IndexBufferView {
     std::uint32_t format;  // DXGI_FORMAT_R16_UINT (57) or DXGI_FORMAT_R32_UINT (42)
 };
 
+// Where a recorded draw's render targets or vertex buffers are in its CommandList (CommandList::render_targets,
+// CommandList::vertex_buffers). The list keeps every draw's in one array each, so recording a draw allocates
+// nothing once the list has recorded as many before.
+struct DrawRange {
+    std::uint32_t first;
+    std::uint32_t count;
+};
+
 // DrawInstanced / DrawIndexedInstanced, with everything they use captured when they are recorded: D3D12 reads
 // render-target and depth descriptors at OMSetRenderTargets, and every other piece of state is the list's state at
 // the draw. resource 0 marks an unbound render-target slot or no depth buffer.
 struct Draw {
     std::uintptr_t pipeline;
     std::array<std::uint32_t, 32> user_data;
-    std::vector<TargetView> render_targets;
+    DrawRange render_targets;  // set by CommandList::draw
     TargetView depth;
-    std::vector<VertexBufferView> vertex_buffers;  // by input slot
+    DrawRange vertex_buffers;  // by input slot; set by CommandList::draw
     IndexBufferView index;
     std::uint32_t topology;  // D3D_PRIMITIVE_TOPOLOGY
     Viewport viewport;       // the first; more viewports are not modelled yet
@@ -704,11 +712,26 @@ public:
         return append(dispatch);
     }
 
-    // A draw with no vertices or instances does nothing in D3D12, and is not recorded.
-    bool draw(const Draw& draw) {
-        if (!draw.pipeline) return false;
-        if (!draw.count || !draw.instances) return !closed_;
-        return append(draw);
+    // A draw with no vertices or instances does nothing in D3D12, and is not recorded. The list copies the render
+    // targets and vertex buffers (by input slot) and sets the draw's ranges to them.
+    bool draw(const Draw& draw, std::span<const TargetView> render_targets,
+              std::span<const VertexBufferView> vertex_buffers) {
+        if (closed_ || !draw.pipeline) return false;
+        if (!draw.count || !draw.instances) return true;
+        Draw& recorded = std::get<Draw>(commands_.emplace_back(draw));
+        recorded.render_targets = {std::uint32_t(draw_targets_.size()), std::uint32_t(render_targets.size())};
+        recorded.vertex_buffers = {std::uint32_t(draw_vertex_buffers_.size()), std::uint32_t(vertex_buffers.size())};
+        draw_targets_.insert(draw_targets_.end(), render_targets.begin(), render_targets.end());
+        draw_vertex_buffers_.insert(draw_vertex_buffers_.end(), vertex_buffers.begin(), vertex_buffers.end());
+        return true;
+    }
+
+    // A draw recorded in this list: its render targets, and its vertex buffers by input slot.
+    std::span<const TargetView> render_targets(const Draw& draw) const {
+        return std::span(draw_targets_).subspan(draw.render_targets.first, draw.render_targets.count);
+    }
+    std::span<const VertexBufferView> vertex_buffers(const Draw& draw) const {
+        return std::span(draw_vertex_buffers_).subspan(draw.vertex_buffers.first, draw.vertex_buffers.count);
     }
 
     // ClearRenderTargetView; the resource must be in render_target state at execution. No rects: the whole view.
@@ -771,7 +794,19 @@ public:
     // types and bundle-only restrictions before calling this method.
     bool execute_bundle(const CommandList& bundle) {
         if (this == &bundle || closed_ || !bundle.closed_) return false;
+        const std::size_t first = commands_.size();
+        const auto targets = std::uint32_t(draw_targets_.size());
+        const auto vertex_buffers = std::uint32_t(draw_vertex_buffers_.size());
         commands_.insert(commands_.end(), bundle.commands_.begin(), bundle.commands_.end());
+        draw_targets_.insert(draw_targets_.end(), bundle.draw_targets_.begin(), bundle.draw_targets_.end());
+        draw_vertex_buffers_.insert(draw_vertex_buffers_.end(), bundle.draw_vertex_buffers_.begin(),
+                                    bundle.draw_vertex_buffers_.end());
+        for (std::size_t i = first; i < commands_.size(); ++i) {
+            if (auto* draw = std::get_if<Draw>(&commands_[i])) {
+                draw->render_targets.first += targets;
+                draw->vertex_buffers.first += vertex_buffers;
+            }
+        }
         return true;
     }
 
@@ -852,6 +887,8 @@ public:
     bool reset() {
         if (!closed_) return false;
         commands_.clear();
+        draw_targets_.clear();
+        draw_vertex_buffers_.clear();
         active_.clear();
         closed_ = false;
         return true;
@@ -889,6 +926,8 @@ private:
     }
 
     std::vector<Command> commands_;
+    std::vector<TargetView> draw_targets_;  // every draw's render targets (Draw::render_targets)
+    std::vector<VertexBufferView> draw_vertex_buffers_;  // every draw's vertex buffers (Draw::vertex_buffers)
     std::vector<BeginQuery> active_;  // queries begun and not yet ended
     bool closed_ = false;
 };

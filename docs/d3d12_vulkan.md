@@ -650,9 +650,11 @@ The compute path, end to end:
 
   The command list keeps the input-assembler, viewport, scissor, render-target (read at `OMSetRenderTargets`, as
   D3D12 does), blend-factor and stencil-reference state, including CommandList8's front/back references. Each
-  `DrawInstanced` / `DrawIndexedInstanced` records a copy of that state. A draw with no viewport (never set, or
-  unbound with `RSSetViewports(0, …)`) or an empty one rasterizes nothing in D3D12. Such a draw is not recorded,
-  since Vulkan forbids a 0×0 viewport.
+  `DrawInstanced` / `DrawIndexedInstanced` records a copy of that state. The render targets and vertex-buffer
+  views go into two arrays the list keeps for all its draws (the draw holds where its run starts and how long it
+  is), so recording a draw makes no heap allocation once the list's arrays have grown (`replay_cpu_bench`'s `draw`
+  rows check it). A draw with no viewport (never set, or unbound with `RSSetViewports(0, …)`) or an empty one
+  rasterizes nothing in D3D12. Such a draw is not recorded, since Vulkan forbids a 0×0 viewport.
 
   At replay:
   - **Buffers:** vertex and index views resolve to buffers by VA (arena or upload). A view that runs past its
