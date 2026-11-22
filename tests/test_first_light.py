@@ -163,9 +163,199 @@ class OracleTests(unittest.TestCase):
             check_image(b"", self.manifest)
 
 
-def vs_on_cpu(sgprs: str, heap: str, x: float, y: float, z: float):
-    """CAMERA_VS's arithmetic, reading its constants the way its scalar loads do: the table address from s9, a V#
-    at table + 0x20 (world rows at 0x00..0x30) and one at table + 0x60 (view-projection rows at 0x160..0x19f)."""
+COPIED_TABLE = """
+    s_swappc_b64 s[4:5], s[4:5]
+    s_mov_b32 s2, s9
+    s_mov_b32 s3, 0
+    s_load_dwordx4 s[4:7], s[2:3], 0x20
+    s_load_dwordx4 s[0:3], s[2:3], 0x60
+    s_waitcnt lgkmcnt(0)
+    s_buffer_load_dwordx4 s[16:19], s[4:7], null
+    s_buffer_load_dwordx4 s[20:23], s[4:7], 0x10
+    s_buffer_load_dwordx4 s[24:27], s[4:7], 0x20
+    s_buffer_load_dwordx4 s[28:31], s[4:7], 0x30
+    s_buffer_load_dwordx16 s[0:15], s[0:3], 0x160
+    v_mul_legacy_f32_e32 v3, s16, v4
+"""
+
+DIRECT_TABLE_WITH_COLOUR = """
+    s_mov_b32 s9, 0
+    s_load_dwordx4 s[28:31], s[8:9], null
+    s_load_dwordx4 s[0:3], s[8:9], 0x40
+    s_waitcnt lgkmcnt(0)
+    s_buffer_load_dwordx16 s[0:15], s[0:3], 0x1a0
+    s_buffer_load_dwordx4 s[16:19], s[28:31], null
+    s_buffer_load_dwordx4 s[20:23], s[28:31], 0x10
+    s_buffer_load_dwordx4 s[24:27], s[28:31], 0x20
+    s_buffer_load_dwordx4 s[28:31], s[28:31], 0x30
+    v_cvt_f32_ubyte2_e32 v6, s19
+    v_cvt_f32_ubyte0_e32 v1, s19
+    v_cvt_f32_ubyte3_e32 v7, s19
+"""
+
+
+class LayoutTests(unittest.TestCase):
+    """constant_layout on hand-written listings: the table SGPR and V# offsets come from the VS's own loads."""
+
+    def test_a_table_pointer_copied_from_a_user_sgpr(self):
+        layout = fl.constant_layout(COPIED_TABLE)
+        self.assertEqual(
+            layout,
+            {"table_sgpr": 9, "world_vsharp": 0x20, "view_vsharp": 0x60, "world_size": 0x40, "view_size": 0x1A0,
+             "viewproj": 0x160, "colour_offset": None},
+        )
+
+    def test_a_direct_table_pointer_a_moved_view_projection_and_a_colour_dword(self):
+        layout = fl.constant_layout(DIRECT_TABLE_WITH_COLOUR)
+        self.assertEqual(
+            (layout["table_sgpr"], layout["world_vsharp"], layout["view_vsharp"], layout["viewproj"]),
+            (8, 0x00, 0x40, 0x1A0),
+        )
+        self.assertEqual((layout["view_size"], layout["colour_offset"]), (0x1E0, 0x0C))
+
+    def test_a_vs_that_does_not_fit_is_named_in_the_error(self):
+        cases = {
+            "no table": "    v_mov_b32_e32 v0, 0\n",
+            "high half": COPIED_TABLE.replace("    s_mov_b32 s3, 0\n", ""),
+            "no world rows": COPIED_TABLE.replace("    s_buffer_load_dwordx4 s[28:31], s[4:7], 0x30\n", ""),
+            "no view-projection": COPIED_TABLE.replace(
+                "s_buffer_load_dwordx16 s[0:15], s[0:3], 0x160", "s_buffer_load_dwordx4 s[0:3], s[0:3], 0x160"
+            ),
+            "raw V#": COPIED_TABLE.replace("    s_load_dwordx4 s[4:7], s[2:3], 0x20\n", ""),
+            "colour in the view buffer": COPIED_TABLE + "    v_cvt_f32_ubyte0_e32 v1, s5\n",
+        }
+        for label, listing in cases.items():
+            with self.subTest(label), self.assertRaises(SystemExit) as cm:
+                fl.constant_layout(listing, "VS_x")
+            self.assertIn("VS_x", str(cm.exception))
+
+    def test_the_colour_must_be_a_row_w(self):
+        listing = DIRECT_TABLE_WITH_COLOUR.replace("v_cvt_f32_ubyte2_e32 v6, s19", "v_cvt_f32_ubyte2_e32 v6, s18").replace(
+            "v_cvt_f32_ubyte0_e32 v1, s19", "v_cvt_f32_ubyte0_e32 v1, s18").replace(
+            "v_cvt_f32_ubyte3_e32 v7, s19", "v_cvt_f32_ubyte3_e32 v7, s18")
+        with self.assertRaises(SystemExit):
+            fl.constant_layout(listing)
+
+    def test_constants_for_a_colour_vs_need_a_colour_and_vice_versa(self):
+        eye = [[1.0 if i == j else 0.0 for j in range(4)] for i in range(4)]
+        with_colour = fl.constant_layout(DIRECT_TABLE_WITH_COLOUR)
+        plain = fl.constant_layout(COPIED_TABLE)
+        with self.assertRaises(SystemExit):
+            fl.camera_constants(eye, eye, with_colour)
+        with self.assertRaises(SystemExit):
+            fl.camera_constants(eye, eye, plain, 0xFF000000)
+        sgprs, heap = fl.camera_constants(eye, eye, with_colour, 0xC0C08040)
+        self.assertEqual(len(sgprs.split(",")), 9)  # s0..s8, the table address in s8
+        self.assertEqual(sgprs.split(",")[8], str(fl.TABLE_VA))
+        self.assertIn(f"{fl.WORLD_VA + 0x0C:#x}=0xc0c08040", heap)
+
+
+class ColourOracleTests(unittest.TestCase):
+    def test_expected_colour_is_the_constant_over_255_rounded_toward_zero(self):
+        got = fl.expected_colour(0xFF00FF00)
+        self.assertEqual((got[0], got[2]), (0.0, 0.0))
+        for g, b in zip(got, (0.0, 255, 0.0, 255)):
+            self.assertLessEqual(g, b / 255 + 1e-9)  # never above the exact value
+            self.assertGreater(g, b / 255 - 1e-3)
+        mid = fl.expected_colour(0x00000080)[0]
+        self.assertEqual(struct.unpack("<e", struct.pack("<e", mid))[0], mid)  # an f16 value
+        self.assertLess(mid, 128 / 255 + 1e-9)
+
+    def test_f16_rtz_never_rounds_up(self):
+        for x in (0.1, 0.3, 0.999999, 0.50195, 0.00392157):
+            h = fl.f16_rtz(x)
+            self.assertLessEqual(h, x)
+            self.assertGreater(h, x * 0.999)
+
+    def test_masks_pack_and_unpack(self):
+        mask = bytes([1, 0, 0, 1, 1, 0, 1, 0, 1])
+        self.assertEqual(fl.unpack_mask(fl.pack_mask(mask), 9), mask)
+
+    def test_coverage_masks_of_one_triangle(self):
+        tri = [(-0.5, -0.5, 0.5), (0.5, -0.5, 0.5), (0.0, 0.5, 0.5)]
+        certain, possible = fl.coverage_masks(tri, [0, 1, 2], 16, 16)
+        self.assertTrue(all(c <= p for c, p in zip(certain, possible)))
+        self.assertEqual(certain[8 * 16 + 8], 1)  # the middle pixel
+        self.assertEqual(possible[0], 0)  # a corner
+        self.assertEqual(possible[15 * 16 + 15], 0)
+        self.assertGreater(sum(certain), 15)  # the triangle is 8 pixels wide and 8 high: about 32 pixels
+
+    def setUp(self):
+        self.manifest = {
+            "width": 4, "height": 4, "min_coverage": 0.2, "max_coverage": 0.5,
+            "colour": [0.25, 0.5, 0.75, 1.0], "clear_pixel": [0, 0], "clear": CLEAR,
+            "certain_cover": fl.pack_mask(bytes([0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0])),
+            "possible_cover": fl.pack_mask(bytes([0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0, 0, 0, 0])),
+        }
+
+    def image(self, covered=(5, 6, 9, 10), colour=(0.25, 0.5, 0.75, 1.0)) -> bytes:
+        pixels = [[CLEAR] * 4 for _ in range(16)]
+        for n in covered:
+            pixels[n] = list(colour)
+        return struct.pack("<64f", *(v for p in pixels for v in p))
+
+    def test_accepts_the_constant_and_an_undecided_edge_pixel_either_way(self):
+        self.assertEqual(check_image(self.image(), self.manifest)["undecided"], 1)
+        check_image(self.image(covered=(5, 6, 9, 10, 11)), self.manifest)
+
+    def test_rejects_a_wrong_colour(self):
+        with self.assertRaises(AssertionError):
+            check_image(self.image(colour=(0.25, 0.5, 0.75001, 1.0)), self.manifest)
+
+    def test_rejects_a_missing_or_extra_pixel(self):
+        with self.assertRaises(AssertionError):
+            check_image(self.image(covered=(5, 6, 9)), self.manifest)
+        with self.assertRaises(AssertionError):
+            check_image(self.image(covered=(5, 6, 9, 10, 15)), self.manifest)
+
+    def test_rejects_the_uv_map_in_place_of_the_constant(self):
+        with self.assertRaises(AssertionError):
+            check_image(self.image(colour=(0.3, 0.7, 0.0, 1.0)), self.manifest)
+
+
+class PropRuleTests(unittest.TestCase):
+    """tools/first_light_prop.py on a hand-written manifest: the streaming reader and the rule."""
+
+    @staticmethod
+    def item(file, meshes=1, tris=1000, frag="false", bones="false", lo=(0, 0, 0), hi=(2, 2, 2)):
+        def arr(v):
+            return "[\n" + ",\n".join(f"        {x}" for x in v) + "\n      ]"
+
+        return (
+            "    {\n"
+            f'      "File": "{file}",\n      "Name": "x",\n      "Meshes": {meshes},\n      "Verts": 500,\n'
+            f'      "Tris": {tris},\n      "IsFragment": {frag},\n      "HasBoneBindings": {bones},\n'
+            f'      "Min": {arr(lo)},\n      "Max": {arr(hi)},\n'
+            '      "Materials": [\n        {\n          "Shader": "1",\n          "Tris": 99999\n        }\n      ]\n    }'
+        )
+
+    def test_the_stream_reads_items_and_the_rule_picks(self):
+        import first_light_prop as prop
+
+        items = [
+            self.item("a.obj", meshes=2),
+            self.item("b.obj", frag="true"),
+            self.item("c.obj", bones="true"),
+            self.item("d.obj", tris=100),
+            self.item("e.obj", lo=(0, 0, 0), hi=(2, 2, 0)),  # flat
+            self.item("f.obj", hi=(2, 2, 0.05)),  # thin: 2.5% of the longest extent
+            self.item("g.obj", tris=1400),
+            self.item("h.obj", tris=900),
+            self.item("i.obj", tris=1100),
+        ]
+        text = '{\n  "Count": 9,\n  "Items": [\n' + ",\n".join(items) + "\n  ]\n}\n"
+        parsed = list(prop.stream_items(text.splitlines(True)))
+        self.assertEqual([p["File"] for p in parsed], [f"{c}.obj" for c in "abcdefghi"])
+        self.assertEqual(parsed[6]["Tris"], 1400)  # a material's own "Tris" at a deeper level is not read
+        self.assertEqual(parsed[0]["Max"], [2.0, 2.0, 2.0])
+        passing = sorted((p for p in parsed if prop.qualifies(p)), key=prop.rank)
+        self.assertEqual([p["File"] for p in passing], ["h.obj", "i.obj", "g.obj"])  # 900 and 1100 tie; name breaks it
+
+
+def vs_on_cpu(sgprs: str, heap: str, layout: dict, x: float, y: float, z: float):
+    """A matrix VS's arithmetic, reading its constants the way its scalar loads do: the table address from its SGPR,
+    a V# at table + world_vsharp (world rows at 0x00..0x30) and one at table + view_vsharp (view-projection rows
+    at `viewproj`)."""
     s = [int(w, 0) for w in sgprs.split(",")]
     words = {}
     for item in heap.split(","):
@@ -183,9 +373,9 @@ def vs_on_cpu(sgprs: str, heap: str, x: float, y: float, z: float):
         assert offset + 4 * count <= size, "read past num_records"
         return [f(base + offset + 4 * i) for i in range(count)]
 
-    table = s[fl.CAMERA_TABLE_SGPR]
-    w = [load(table + fl.CAMERA_WORLD_VSHARP, 16 * r, 4) for r in range(4)]
-    vp = load(table + fl.CAMERA_VIEW_VSHARP, fl.CAMERA_VIEWPROJ, 16)
+    table = s[layout["table_sgpr"]]
+    w = [load(table + layout["world_vsharp"], 16 * r, 4) for r in range(4)]
+    vp = load(table + layout["view_vsharp"], layout["viewproj"], 16)
     world = [w[0][c] * x + w[1][c] * y + w[2][c] * z + w[3][c] for c in range(3)]
     return [vp[c] * world[0] + vp[4 + c] * world[1] + vp[8 + c] * world[2] + vp[12 + c] for c in range(4)]
 
@@ -209,9 +399,14 @@ class CameraTests(unittest.TestCase):
 
     def test_constants_are_where_the_vs_reads_them(self):
         world, viewproj = fl.camera_matrices(self.CUBE, 128, 128, -40.0, 10.0, 60.0)
-        sgprs, heap = fl.camera_constants(world, viewproj)
+        for listing, colour in ((COPIED_TABLE, None), (DIRECT_TABLE_WITH_COLOUR, 0xC0C08040)):
+            layout = fl.constant_layout(listing)
+            sgprs, heap = fl.camera_constants(world, viewproj, layout, colour)
+            self.check_constants(layout, sgprs, heap, world, viewproj)
+
+    def check_constants(self, layout, sgprs, heap, world, viewproj):
         for x, y, z, *_ in self.CUBE:
-            got = vs_on_cpu(sgprs, heap, x, y, z)
+            got = vs_on_cpu(sgprs, heap, layout, x, y, z)
             wx, wy, wz, _ = fl.row_times((x, y, z, 1.0), world)
             want = fl.row_times((wx, wy, wz, 1.0), viewproj)
             for g, e in zip(got, want):
@@ -239,7 +434,6 @@ class CameraTests(unittest.TestCase):
 
     def test_camera_flags_are_checked(self):
         for argv in (
-            ["--camera", "--vs", fl.DEFAULT_VS],  # another VS reads other constants
             ["--camera", "--no-fit"],
             ["--camera", "--pitch", "90"],  # straight down: the up axis is the view axis
         ):

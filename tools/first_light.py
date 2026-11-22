@@ -19,9 +19,12 @@ index_count u32 indices. By default the draw is orthographic: the model is centr
 flattened to z = 0.5, because the chosen VS does not apply a matrix (see docs/first_light.md).
 
 `--camera` draws in perspective instead, with a game VS that reads a world matrix and a view-projection matrix
-from two constant buffers (CAMERA_VS). The mesh keeps the model's own coordinates; the tool builds a camera, writes
-the matrices, the two V#s and the descriptor table into the harness heap (VKH_HEAP, VKH_SGPRS) and predicts the
-image with the same matrices, interpolating UV perspective-correctly as the rasterizer does. Its output goes to
+from two constant buffers (CAMERA_VS by default; `--vs` takes another that fits). The mesh keeps the model's own
+coordinates; the tool derives where the VS reads its constants from the VS's own disassembly (constant_layout),
+builds a camera, writes the matrices, the two V#s and the descriptor table into the harness heap (VKH_HEAP,
+VKH_SGPRS) and predicts the image with the same matrices, interpolating UV perspective-correctly as the rasterizer
+does. A VS that also unpacks a colour constant from the world buffer (`--colour`) is checked on the colour instead:
+every covered pixel must equal it exactly and the covered shape must match the CPU's prediction. Its output goes to
 <work>/first_light/camera, so the orthographic folder that d3d12_first_light_test reads is left alone.
 
 The model is an OBJ from `rpf9dump models` (tools/rpf9dump). Building that tool and exporting an archive is the
@@ -41,6 +44,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -52,19 +56,22 @@ DEFAULT_VS = "VS_main_170e32e6_Wrapped"
 DEFAULT_PS = "$PS_Rage_Untextured_14f8529b_Wrapped"
 MESH_HEADER = struct.Struct("<II")
 
-# --camera (TEST-523). CAMERA_VS forwards TEXCOORD like DEFAULT_VS but builds clip space from two constant buffers;
-# its scalar loads give the layout. The descriptor table's 32-bit address is in s9 (high half 0). The V# at table +
-# 0x20 holds the world rows (X, Y, Z and translation, one float4 each at 0x00..0x30; the VS reads xyz of each), and
-# the V# at table + 0x60 the four view-projection rows at 0x160..0x19f. Both multiply a row vector:
-# world = [x y z 1] W, clip = [world 1] VP. On 1.0.2.1, all 9 translated VS modules with exactly POSITION and
-# TEXCOORD inputs and a computed clip w read 16 dwords at 0x160 of a constant buffer, as do 1,266 of all 2,236 VS
-# modules (docs/first_light.md section 6).
+# --camera (TEST-523, generalised by TEST-525). CAMERA_VS forwards TEXCOORD like DEFAULT_VS but builds clip space
+# from two constant buffers; the VS's own scalar loads give the layout (constant_layout): a descriptor table whose
+# 32-bit address is in one user SGPR (high half 0), two V#s loaded from it, a world buffer read as four float4 rows
+# at 0x00..0x30 (X, Y, Z and translation; the VS reads xyz of each) and a view-projection buffer read as 16 dwords
+# (0x160 on 1.0.2.1). Both multiply a row vector: world = [x y z 1] W, clip = [world 1] VP. On 1.0.2.1, all 9
+# translated VS modules with exactly POSITION and TEXCOORD inputs and a computed clip w read 16 dwords at 0x160 of
+# a constant buffer, as do 1,266 of all 2,236 VS modules (docs/first_light.md section 6).
 CAMERA_VS = "VS_TransformVT_e6ebb353_Wrapped"
-CAMERA_TABLE_SGPR = 9
-CAMERA_WORLD_VSHARP = 0x20
-CAMERA_VIEW_VSHARP = 0x60
-CAMERA_VIEWPROJ = 0x160
 TABLE_VA, WORLD_VA, VIEW_VA = 0x100, 0x1000, 0x2000  # Xbox VAs inside vk_harness's 64 KiB VKH_HEAP
+WORLD_ROWS = (0x00, 0x10, 0x20, 0x30)
+# The constant a colour-forwarding VS unpacks: bytes 0x40, 0x80, 0xC0, 0xC0. Alpha is not 0xFF on purpose: the PS
+# sees the varying through barycentric interpolation, which turns 1.0 into 1.0 - 1 ulp on some pixels, and the
+# round-toward-zero pack then writes 0.99951 there (905 of 1,946 covered pixels on the TEST-525 draw). A value that
+# is not a half-float boundary survives (docs/first_light.md section 7).
+DEFAULT_COLOUR = 0xC0C08040
+UBYTE_SCALE = struct.unpack("<f", struct.pack("<I", 0x3B808081))[0]  # the 1/255 the game's VSs multiply by
 
 
 def run(argv, **kwargs):
@@ -285,10 +292,157 @@ def vsharp(base: int, size: int) -> list[int]:
     return [base, 0, size, 0]
 
 
-def camera_constants(world, viewproj) -> tuple[str, str]:
-    """VKH_SGPRS and VKH_HEAP for CAMERA_VS: the table address in s9, the two V#s in the table, the two matrices."""
-    sgprs = [0] * (CAMERA_TABLE_SGPR + 1)
-    sgprs[CAMERA_TABLE_SGPR] = TABLE_VA
+_SREG = re.compile(r"^s(\d+)$|^s\[(\d+):(\d+)\]$")
+
+
+def _sregs(operand: str):
+    """(first, last) SGPR of `s5` or `s[4:7]`, or None for anything else (a VGPR, a literal, null)."""
+    m = _SREG.match(operand.strip())
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(1))) if m.group(1) else (int(m.group(2)), int(m.group(3)))
+
+
+def _imm(operand: str):
+    text = operand.strip()
+    if text == "null":
+        return 0
+    return int(text, 0) if re.fullmatch(r"(0x[0-9a-fA-F]+|\d+)", text) else None
+
+
+def constant_layout(listing: str, name: str = "the VS") -> dict:
+    """Where a matrix VS reads its constants, from its own disassembly (scalar loads only).
+
+    The pattern: a descriptor table whose address is a user SGPR pair (the low half possibly copied with
+    s_mov_b32, the high half set to 0), `s_load_dwordx4` of two V#s from it, and `s_buffer_load` through those. The
+    world buffer is the V# read as four float4 at 0x00, 0x10, 0x20 and 0x30; the view-projection buffer is the V#
+    with one 16-dword read. A `v_cvt_f32_ubyte*` of an SGPR loaded from the world buffer marks a packed colour
+    constant (its byte offset in the buffer is `colour_offset`). Raises SystemExit naming the VS when it does not
+    fit, instead of drawing with the wrong constants.
+
+    Returns table_sgpr, world_vsharp and view_vsharp (offsets of the V#s in the table), world_size and view_size
+    (bytes the VS reads, which the V#s must cover), viewproj (offset of the 16 dwords) and colour_offset (or None).
+    """
+
+    def fail(why):
+        raise SystemExit(f"{name} does not fit the matrix-constant pattern: {why}")
+
+    copy: dict[int, int] = {}  # sgpr -> user sgpr it was copied from
+    zero: set[int] = set()
+    vsharps: dict[int, tuple[int, int]] = {}  # first sgpr of a loaded V# -> (table sgpr, offset in the table)
+    holds: dict[int, tuple[int, int]] = {}  # sgpr -> (table offset of the V#, byte offset read) from s_buffer_load
+    reads: dict[int, list[tuple[int, int]]] = {}  # table offset -> [(byte offset, dwords)]
+    ubytes: set[tuple[int, int]] = set()
+    tables: set[int] = set()
+
+    def clobber(lo, hi):
+        for r in range(lo, hi + 1):
+            copy.pop(r, None)
+            zero.discard(r)
+            holds.pop(r, None)
+        for first in [f for f in vsharps if f <= hi and f + 3 >= lo]:
+            del vsharps[first]
+
+    for raw in listing.splitlines():
+        text = raw.split(";")[0].strip()
+        if not text or text.startswith(("#", ".")) or text.endswith(":"):
+            continue
+        op, _, rest = text.partition(" ")
+        ops = [o.strip() for o in rest.split(",")] if rest else []
+        dst = _sregs(ops[0]) if ops else None
+        if op == "s_mov_b32" and dst and len(ops) == 2:
+            src = _sregs(ops[1])
+            clobber(*dst)
+            if _imm(ops[1]) == 0 and ops[1].strip() != "null":
+                zero.add(dst[0])
+            elif src and src[0] == src[1]:
+                copy[dst[0]] = copy.get(src[0], src[0])
+        elif op.startswith("s_load_dword") and dst and len(ops) == 3:
+            base, off = _sregs(ops[1]), _imm(ops[2])
+            if op == "s_load_dwordx4" and base and base[1] == base[0] + 1 and off is not None:
+                low = copy.get(base[0], base[0])
+                if base[1] not in zero:
+                    fail(f"the high half of the table pointer s{base[1]} is not set to 0")
+                tables.add(low)
+                clobber(*dst)
+                vsharps[dst[0]] = (low, off)
+            else:
+                clobber(*dst)
+        elif op.startswith("s_buffer_load_dword") and dst and len(ops) == 3:
+            base, off = _sregs(ops[1]), _imm(ops[2])
+            if not base or base[1] != base[0] + 3 or off is None:
+                fail(f"an s_buffer_load with an operand it cannot follow: {text}")
+            if base[0] not in vsharps:
+                fail(f"it reads a buffer whose V# is not loaded from a descriptor table: {text}")
+            table_off = vsharps[base[0]][1]
+            count = dst[1] - dst[0] + 1
+            clobber(*dst)
+            reads.setdefault(table_off, []).append((off, count))
+            for i in range(count):
+                holds[dst[0] + i] = (table_off, off + 4 * i)
+        elif op.startswith("v_cvt_f32_ubyte") and len(ops) == 2:
+            src = _sregs(ops[1])
+            if src and src[0] in holds:
+                ubytes.add(holds[src[0]])
+        elif op.startswith("s_") and dst and not op.startswith(("s_waitcnt", "s_cmp", "s_setpc", "s_swappc")):
+            clobber(*dst)
+    if not reads or not tables:
+        fail("no V# loaded from a descriptor table")
+    if len(tables) != 1:
+        fail(f"its V#s come from more than one table pointer (s{sorted(tables)})")
+    world = [t for t, r in reads.items() if sorted(o for o, n in r if n == 4) == list(WORLD_ROWS) and len(r) == 4]
+    viewproj = [t for t, r in reads.items() if any(n == 16 for _, n in r)]
+    if len(world) != 1:
+        fail("no V# read as four float4 rows at 0x00, 0x10, 0x20, 0x30 (a world matrix)")
+    if len(viewproj) != 1 or len(reads[viewproj[0]]) != 1:
+        fail("no V# with a single 16-dword read (a view-projection matrix)")
+    colour = {off for t, off in ubytes if t == world[0]}
+    if len(colour) > 1 or len(ubytes) != len(colour):
+        fail("it unpacks more than one constant dword, or one outside the world buffer")
+    vp_off = reads[viewproj[0]][0][0]
+    if colour and next(iter(colour)) not in (0x0C, 0x1C, 0x2C):
+        fail(f"its colour constant is at world buffer offset {next(iter(colour)):#x}, not the w of a row")
+    return {
+        "table_sgpr": tables.pop(),
+        "world_vsharp": world[0],
+        "view_vsharp": viewproj[0],
+        "world_size": 0x40,
+        "view_size": vp_off + 0x40,
+        "viewproj": vp_off,
+        "colour_offset": colour.pop() if colour else None,
+    }
+
+
+def f16_rtz(x: float) -> float:
+    """x >= 0 rounded toward zero to a half float, as v_cvt_pkrtz_f16_f32 does."""
+    h = struct.unpack("<e", struct.pack("<e", x))[0]
+    if h > x:
+        h = struct.unpack("<e", struct.pack("<H", struct.unpack("<H", struct.pack("<e", h))[0] - 1))[0]
+    return h
+
+
+def expected_colour(packed: int) -> list[float]:
+    """What a colour-forwarding VS and the default PS write for a packed u32: v_cvt_f32_ubyteN times the game's
+    1/255 in float32, then rounded toward zero to f16 by the PS's pack."""
+    return [
+        f16_rtz(f32(float((packed >> (8 * i)) & 0xFF) * UBYTE_SCALE)) for i in range(4)
+    ]
+
+
+def camera_constants(world, viewproj, layout: dict, colour: int | None = None) -> tuple[str, str]:
+    """VKH_SGPRS and VKH_HEAP for a matrix VS: the table address in its SGPR, two V#s in the table, the matrices.
+
+    `layout` is constant_layout(). `colour` (a packed u32) goes in the world buffer's colour dword, which a
+    colour-forwarding VS unpacks; the VS reads only xyz of the world rows, so the fourth column is free for it.
+    """
+    if (colour is None) != (layout["colour_offset"] is None):
+        raise SystemExit(
+            "a colour constant needs a VS that unpacks one, and such a VS needs one"
+            if colour is not None
+            else "this VS unpacks a colour constant: pass --colour"
+        )
+    sgprs = [0] * (layout["table_sgpr"] + 1)
+    sgprs[layout["table_sgpr"]] = TABLE_VA
     heap = {}
 
     def put(addr, words):
@@ -298,10 +452,13 @@ def camera_constants(world, viewproj) -> tuple[str, str]:
     def f32_words(m):
         return [struct.unpack("<I", struct.pack("<f", x))[0] for row in m for x in row]
 
-    put(TABLE_VA + CAMERA_WORLD_VSHARP, vsharp(WORLD_VA, 0x40))
-    put(TABLE_VA + CAMERA_VIEW_VSHARP, vsharp(VIEW_VA, CAMERA_VIEWPROJ + 0x40))
-    put(WORLD_VA, f32_words(world))
-    put(VIEW_VA + CAMERA_VIEWPROJ, f32_words(viewproj))
+    world_words = f32_words(world)
+    if colour is not None:
+        world_words[layout["colour_offset"] // 4] = colour
+    put(TABLE_VA + layout["world_vsharp"], vsharp(WORLD_VA, layout["world_size"]))
+    put(TABLE_VA + layout["view_vsharp"], vsharp(VIEW_VA, layout["view_size"]))
+    put(WORLD_VA, world_words)
+    put(VIEW_VA + layout["viewproj"], f32_words(viewproj))
     return (
         ",".join(str(w) for w in sgprs),
         ",".join(f"{addr:#x}={word:#x}" for addr, word in sorted(heap.items())),
@@ -403,6 +560,58 @@ def uv_probes(vertices, indices, width: int, height: int, limit: int = 4) -> lis
     return found
 
 
+EDGE_BAND = 0.02  # pixels: a centre this close to a triangle edge may go either way under the GPU's fixed-point snap
+
+
+def coverage_masks(vertices, indices, width: int, height: int) -> tuple[bytes, bytes]:
+    """Per-pixel masks (row-major, one byte each) of the pixel centres the mesh certainly and possibly covers.
+
+    A centre is `certain` when it lies more than EDGE_BAND pixels inside some triangle, and `possible` when it is not
+    more than EDGE_BAND outside every one. The band stands for the rasterizer's sub-pixel snap and top-left rule, so
+    the readback must cover every certain pixel and leave every non-possible one clear; the pixels between are not
+    judged. Vertices are NDC (x, y, ...) as project() returns them.
+    """
+    certain, possible = bytearray(width * height), bytearray(width * height)
+    for i in range(0, len(indices), 3):
+        pts = [((vertices[indices[i + k]][0] + 1.0) * width / 2.0, (vertices[indices[i + k]][1] + 1.0) * height / 2.0) for k in range(3)]
+        (ax, ay), (bx, by), (cx, cy) = pts
+        det = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay)
+        if abs(det) < 1e-12:
+            continue
+        lengths = [math.dist(pts[j], pts[(j + 1) % 3]) for j in range(3)]
+        if min(lengths) < 1e-12:
+            continue
+        x0 = max(0, int(math.floor(min(p[0] for p in pts) - EDGE_BAND - 0.5)))
+        x1 = min(width - 1, int(math.ceil(max(p[0] for p in pts) + EDGE_BAND - 0.5)))
+        y0 = max(0, int(math.floor(min(p[1] for p in pts) - EDGE_BAND - 0.5)))
+        y1 = min(height - 1, int(math.ceil(max(p[1] for p in pts) + EDGE_BAND - 0.5)))
+        sign = 1.0 if det > 0 else -1.0
+        for py in range(y0, y1 + 1):
+            for px in range(x0, x1 + 1):
+                qx, qy = px + 0.5, py + 0.5
+                # signed distance (pixels) of the centre inside each edge, positive on the triangle's side
+                inside = min(
+                    sign * ((pts[(j + 1) % 3][0] - pts[j][0]) * (qy - pts[j][1]) - (pts[(j + 1) % 3][1] - pts[j][1]) * (qx - pts[j][0])) / lengths[j]
+                    for j in range(3)
+                )
+                if inside >= -EDGE_BAND:
+                    possible[py * width + px] = 1
+                    if inside > EDGE_BAND:
+                        certain[py * width + px] = 1
+    return bytes(certain), bytes(possible)
+
+
+def pack_mask(mask: bytes) -> str:
+    """One bit per pixel, row-major, least significant bit first, as hex (the manifest's form)."""
+    value = sum(1 << i for i, b in enumerate(mask) if b)
+    return value.to_bytes((len(mask) + 7) // 8, "little").hex()
+
+
+def unpack_mask(text: str, count: int) -> bytes:
+    value = int.from_bytes(bytes.fromhex(text), "little")
+    return bytes((value >> i) & 1 for i in range(count))
+
+
 def find_harness(explicit: str | None) -> str:
     exe = ".exe" if os.name == "nt" else ""
     for candidate in (
@@ -469,7 +678,25 @@ def check_image(data: bytes, manifest: dict) -> dict:
                 raise AssertionError(
                     f"UV probe {probe['pixel']} is {pixels[i : i + 4]}, expected {want} at {c}"
                 )
-    return {"covered": covered, "ratio": ratio, "pixels": pixels}
+    undecided = 0
+    if (want := manifest.get("colour")) is not None:
+        # A constant-colour draw: the shape must match the CPU's prediction, and every covered pixel must carry
+        # the set constant exactly. Edge pixels the rasterizer may round either way are not judged.
+        certain = unpack_mask(manifest["certain_cover"], width * height)
+        possible = unpack_mask(manifest["possible_cover"], width * height)
+        for n in range(width * height):
+            px, py = n % width, n // width
+            got = pixels[4 * n : 4 * n + 4]
+            drawn = got[3] > 0.5
+            if certain[n] and not drawn:
+                raise AssertionError(f"pixel {[px, py]} is inside a triangle but is {got}")
+            if not possible[n]:
+                if any(abs(got[c] - CLEAR) > 1e-5 for c in range(4)):
+                    raise AssertionError(f"pixel {[px, py]} is outside every triangle but is {got}")
+            elif drawn and any(got[c] != want[c] for c in range(4)):
+                raise AssertionError(f"pixel {[px, py]} is {got}, expected the constant {want}")
+            undecided += possible[n] and not certain[n]
+    return {"covered": covered, "ratio": ratio, "pixels": pixels, "undecided": undecided}
 
 
 def write_ppm(path: str, pixels, width: int, height: int) -> None:
@@ -511,6 +738,7 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
     print(
         f"covered {result['covered']}/{manifest['width'] * manifest['height']} "
         f"({result['ratio']:.3f}); {ppm}"
+        + (f"; {result['undecided']} edge pixels not judged" if manifest.get("colour") else "")
     )
     manifest["result"] = {
         "covered": result["covered"],
@@ -567,6 +795,13 @@ def main(argv=None) -> int:
     )
     ap.add_argument("--fov", type=float, default=50.0, help="--camera: vertical field of view, degrees (default 50)")
     ap.add_argument(
+        "--colour",
+        type=lambda s: int(s, 0),
+        default=DEFAULT_COLOUR,
+        help="--camera, for a VS that unpacks a colour constant: the packed u32, byte 0 = red "
+        f"(default {DEFAULT_COLOUR:#x}); the oracle then expects that colour exactly on every covered pixel",
+    )
+    ap.add_argument(
         "--harness",
         help="vk_harness binary (default LEONIDA_VK_HARNESS or runtime/build/linux)",
     )
@@ -585,8 +820,6 @@ def main(argv=None) -> int:
     )
     a = ap.parse_args(argv)
     if a.camera:
-        if a.vs not in (None, CAMERA_VS):
-            ap.error(f"--camera writes the constant layout of {CAMERA_VS} only")
         if a.no_fit or a.keep_z:
             ap.error("--camera keeps the model's coordinates; --no-fit and --keep-z do not apply")
         if not -80.0 <= a.pitch <= 80.0 or not 1.0 <= a.fov <= 150.0:
@@ -648,22 +881,34 @@ def main(argv=None) -> int:
         with open(a.obj, "rb") as f:
             obj_sha256 = hashlib.sha256(f.read()).hexdigest()
     camera = None
+    colour = None  # expected pixel (r, g, b, a) of a constant-colour draw
     if vertices and a.camera:
-        # The mesh keeps the model's coordinates (CAMERA_VS applies the matrices); the prediction below works on
-        # the same vertices projected on the CPU.
+        # The mesh keeps the model's coordinates (the VS applies the matrices); the prediction below works on the
+        # same vertices projected on the CPU. The constants' places come from the VS's own scalar loads.
+        stem = os.path.splitext(picked[0]["file"])[0]
+        listing_path = os.path.join(work, "first_light", "dxbc", "disasm", stem + ".s")
+        if not os.path.isfile(listing_path):
+            raise SystemExit(f"no disassembly of {picked[0]['name']} at {listing_path}")
+        with open(listing_path, encoding="utf-8", errors="replace") as f:
+            layout = constant_layout(f.read(), picked[0]["name"])
         write_mesh(os.path.join(out_dir, "mesh.bin"), vertices, indices)
         world, viewproj = camera_matrices(vertices, a.width, a.height, a.yaw, a.pitch, a.fov)
-        sgprs, heap = camera_constants(world, viewproj)
+        packed = a.colour if layout["colour_offset"] is not None else None
+        sgprs, heap = camera_constants(world, viewproj, layout, packed)
         camera = {
             "yaw": a.yaw,
             "pitch": a.pitch,
             "fov": a.fov,
             "world": world,
             "viewproj": viewproj,
+            "layout": layout,
+            "colour": packed,
             "sgprs": sgprs,
             "heap": heap,
         }
         vertices = project(vertices, world, viewproj)
+        if packed is not None:
+            colour = expected_colour(packed)
     elif vertices:
         if not a.no_fit:
             vertices = fit(vertices, a.width, a.height, True, not a.keep_z)
@@ -671,11 +916,14 @@ def main(argv=None) -> int:
     centre_pixel = [a.width // 2, a.height // 2]
     centre_uv = (
         uv_at(vertices, indices, centre_pixel[0], centre_pixel[1], a.width, a.height)
-        if vertices
+        if vertices and colour is None  # a constant-colour PS writes no UV
         else None
     )
     clear = clear_pixel(vertices, indices, a.width, a.height) if vertices else None
-    probes = uv_probes(vertices, indices, a.width, a.height) if vertices else []
+    probes = uv_probes(vertices, indices, a.width, a.height) if vertices and colour is None else []
+    masks = coverage_masks(vertices, indices, a.width, a.height) if colour is not None else None
+    if masks is not None and not masks[0][centre_pixel[1] * a.width + centre_pixel[0]]:
+        raise SystemExit(f"the prop does not cover the centre pixel {centre_pixel}; pick another or move the camera")
     manifest = {
         "vs": {
             "name": picked[0]["name"],
@@ -701,6 +949,10 @@ def main(argv=None) -> int:
         "uv_probes": probes,
         "clear": -1.0,
         "camera": camera,
+        "colour": colour,
+        "certain_cover": pack_mask(masks[0]) if masks else None,
+        "possible_cover": pack_mask(masks[1]) if masks else None,
+        "predicted_covered": [sum(masks[0]), sum(masks[1])] if masks else None,
         "files": {
             "vs": "vs.spv",
             "ps": "ps.spv",
