@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
@@ -67,6 +68,22 @@ class CommandLine(unittest.TestCase):
             with redirect_stderr(io.StringIO()) as err:
                 self.assertEqual(sm.main([missing, missing]), 2)
         self.assertIn("anim_skel_match:", err.getvalue())
+
+    def test_json_report_cannot_replace_either_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            anim = Path(tmp) / "anim.rpf"
+            packs = Path(tmp) / "packs.rpf"
+            for path in (anim, packs):
+                path.write_bytes(b"existing synthetic input")
+            for path in (anim, packs):
+                with self.subTest(path=path):
+                    with mock.patch.object(sm, "stream_names", return_value={}) as scan, \
+                            mock.patch.object(sm, "read_skeletons", return_value=[]), \
+                            redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+                        self.assertEqual(sm.main([str(anim), str(packs), "--json", str(path)]), 2)
+                    scan.assert_not_called()
+                    self.assertIn("would overwrite", err.getvalue())
+                    self.assertEqual(path.read_bytes(), b"existing synthetic input")
 
     def test_offsets_parse_as_hex_or_decimal(self):
         self.assertEqual(sm.parse_offset("0x101a32160"), 0x101A32160)
