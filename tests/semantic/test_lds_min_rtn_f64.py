@@ -786,5 +786,286 @@ class TestScalarInterpreter64(unittest.TestCase):
         self.assertEqual(self.lds.read_qword(addr), ONE_F64)
 
 
+# ==============================================================================
+# SIMD Multi-Lane Divergence and 32/64-bit EXEC Masking
+# ==============================================================================
+
+class SIMDWaveState64:
+    """Architectural state for a SIMD wavefront executing 64-bit LDS instructions."""
+
+    def __init__(
+        self,
+        wave_size: int = 64,
+        exec_mask: Optional[int] = None,
+        lds: Optional[LDSMemory64] = None,
+        num_vgprs: int = DEFAULT_NUM_VGPRS,
+    ) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Wave size must be 32 or 64, got {wave_size}")
+        self.wave_size: int = wave_size
+        self.mask_limit: int = (1 << wave_size) - 1
+        self.exec_mask: int = (self.mask_limit if exec_mask is None else exec_mask) & self.mask_limit
+        self.lds: LDSMemory64 = lds if lds is not None else LDSMemory64()
+        self.lane_vgprs: List[List[int]] = [[0] * num_vgprs for _ in range(wave_size)]
+
+    def is_lane_active(self, lane: int) -> bool:
+        if not (0 <= lane < self.wave_size):
+            return False
+        return bool(self.exec_mask & (1 << lane))
+
+    def get_vgpr32(self, lane: int, idx: int) -> int:
+        return self.lane_vgprs[lane][idx]
+
+    def set_vgpr32(self, lane: int, idx: int, val: int) -> None:
+        self.lane_vgprs[lane][idx] = u32(val)
+
+    def get_vgpr64(self, lane: int, idx: int) -> int:
+        low = self.lane_vgprs[lane][idx]
+        high = self.lane_vgprs[lane][idx + 1]
+        return u64(low | (high << 32))
+
+    def set_vgpr64(self, lane: int, idx: int, val: int) -> None:
+        self.lane_vgprs[lane][idx] = u32(val)
+        self.lane_vgprs[lane][idx + 1] = u32(val >> 32)
+
+
+class SIMDDSInterpreter64:
+    """SIMD wavefront interpreter handling divergence and EXEC masking for 64-bit DS instructions."""
+
+    def execute(
+        self,
+        wave: SIMDWaveState64,
+        inst: DSMinRtnF64Instruction,
+    ) -> List[Optional[Tuple[int, int]]]:
+        results: List[Optional[Tuple[int, int]]] = [None] * wave.wave_size
+
+        for lane in range(wave.wave_size):
+            if not wave.is_lane_active(lane):
+                continue
+
+            base_addr = wave.get_vgpr32(lane, inst.vaddr.index)
+            if isinstance(inst.vdata0, RegisterOperand):
+                vdata_val = wave.get_vgpr64(lane, inst.vdata0.index)
+            else:
+                vdata_val = inst.vdata0.value
+
+            old_val, new_mem = wave.lds.atomic_min_rtn_f64(
+                vaddr=base_addr,
+                vdata0=vdata_val,
+                offset=inst.offset,
+            )
+
+            wave.set_vgpr64(lane, inst.vdst.index, old_val)
+            results[lane] = (old_val, new_mem)
+
+        return results
+
+    def detect_bank_conflicts(
+        self,
+        wave: SIMDWaveState64,
+        inst: DSMinRtnF64Instruction,
+    ) -> Dict[int, List[int]]:
+        bank_map: Dict[int, Dict[int, List[int]]] = {}
+        for lane in range(wave.wave_size):
+            if not wave.is_lane_active(lane):
+                continue
+            base_addr = wave.get_vgpr32(lane, inst.vaddr.index)
+            eff_addr = calc_lds_effective_address(base_addr, inst.offset)
+            qword_idx = calc_lds_qword_index(eff_addr, wave.lds.num_qwords)
+
+            # 64-bit operation accesses two consecutive 32-bit banks
+            bank0 = calc_lds_bank(eff_addr)
+            bank1 = calc_lds_bank(eff_addr + 4)
+
+            for b in (bank0, bank1):
+                if b not in bank_map:
+                    bank_map[b] = {}
+                if qword_idx not in bank_map[b]:
+                    bank_map[b][qword_idx] = []
+                bank_map[b][qword_idx].append(lane)
+
+        conflicts: Dict[int, List[int]] = {}
+        for b, qwords in bank_map.items():
+            if len(qwords) > 1:
+                all_lanes: List[int] = []
+                for lane_list in qwords.values():
+                    all_lanes.extend(lane_list)
+                conflicts[b] = sorted(list(set(all_lanes)))
+
+        return conflicts
+
+
+class TestSIMDInterpreter64(unittest.TestCase):
+    """Phase 4: Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_full_exec_independent_addresses(self) -> None:
+        lds = LDSMemory64(65536)
+        wave = SIMDWaveState64(wave_size=32, exec_mask=0xFFFFFFFF, lds=lds)
+        interp = SIMDDSInterpreter64()
+
+        for lane in range(32):
+            addr = lane * 8
+            lds.write_qword(addr, TEN_F64)
+            wave.set_vgpr32(lane, 2, addr)
+            wave.set_vgpr64(lane, 4, f64_to_bits(float(lane)))
+            wave.set_vgpr64(lane, 0, 0xCAFEBABE00000000)
+
+        inst = DSMinRtnF64Instruction(
+            vdst=RegisterOperand(0, count=2),
+            vaddr=RegisterOperand(2, count=1),
+            vdata0=RegisterOperand(4, count=2),
+        )
+
+        results = interp.execute(wave, inst)
+
+        for lane in range(32):
+            self.assertIsNotNone(results[lane])
+            old_val, new_mem = results[lane]  # type: ignore[misc]
+            self.assertEqual(old_val, TEN_F64)
+            expected_new = oracle_min_f64(TEN_F64, f64_to_bits(float(lane)))
+            self.assertEqual(new_mem, expected_new)
+            self.assertEqual(wave.get_vgpr64(lane, 0), TEN_F64)
+            self.assertEqual(lds.read_qword(lane * 8), expected_new)
+
+    def test_wave64_full_exec(self) -> None:
+        lds = LDSMemory64(65536)
+        wave = SIMDWaveState64(wave_size=64, exec_mask=MASK64, lds=lds)
+        interp = SIMDDSInterpreter64()
+
+        for lane in range(64):
+            addr = lane * 8
+            lds.write_qword(addr, TWO_F64)
+            wave.set_vgpr32(lane, 2, addr)
+            wave.set_vgpr64(lane, 4, ONE_F64)
+
+        inst = DSMinRtnF64Instruction(
+            vdst=RegisterOperand(0, count=2),
+            vaddr=RegisterOperand(2, count=1),
+            vdata0=RegisterOperand(4, count=2),
+        )
+
+        results = interp.execute(wave, inst)
+
+        for lane in range(64):
+            self.assertIsNotNone(results[lane])
+            old_val, new_mem = results[lane]  # type: ignore[misc]
+            self.assertEqual(old_val, TWO_F64)
+            self.assertEqual(new_mem, ONE_F64)
+            self.assertEqual(wave.get_vgpr64(lane, 0), TWO_F64)
+            self.assertEqual(lds.read_qword(lane * 8), ONE_F64)
+
+    def test_simd_exec_mask_inactive_lanes(self) -> None:
+        lds = LDSMemory64(65536)
+        even_mask = 0x5555555555555555
+        wave = SIMDWaveState64(wave_size=64, exec_mask=even_mask, lds=lds)
+        interp = SIMDDSInterpreter64()
+
+        for lane in range(64):
+            addr = lane * 8
+            lds.write_qword(addr, TEN_F64)
+            wave.set_vgpr32(lane, 2, addr)
+            wave.set_vgpr64(lane, 4, ONE_F64)
+            wave.set_vgpr64(lane, 0, 0x1234567890ABCDEF)
+
+        inst = DSMinRtnF64Instruction(
+            vdst=RegisterOperand(0, count=2),
+            vaddr=RegisterOperand(2, count=1),
+            vdata0=RegisterOperand(4, count=2),
+        )
+
+        results = interp.execute(wave, inst)
+
+        for lane in range(64):
+            if lane % 2 == 0:
+                self.assertIsNotNone(results[lane])
+                self.assertEqual(wave.get_vgpr64(lane, 0), TEN_F64)
+                self.assertEqual(lds.read_qword(lane * 8), ONE_F64)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(wave.get_vgpr64(lane, 0), 0x1234567890ABCDEF)
+                self.assertEqual(lds.read_qword(lane * 8), TEN_F64)
+
+    def test_simd_zero_exec_mask(self) -> None:
+        lds = LDSMemory64(65536)
+        wave = SIMDWaveState64(wave_size=32, exec_mask=0, lds=lds)
+        interp = SIMDDSInterpreter64()
+
+        lds.write_qword(0, TEN_F64)
+        wave.set_vgpr32(0, 2, 0)
+        wave.set_vgpr64(0, 4, ONE_F64)
+        wave.set_vgpr64(0, 0, 0xDEADBEEFCAFEBABE)
+
+        inst = DSMinRtnF64Instruction(
+            vdst=RegisterOperand(0, count=2),
+            vaddr=RegisterOperand(2, count=1),
+            vdata0=RegisterOperand(4, count=2),
+        )
+
+        results = interp.execute(wave, inst)
+        self.assertTrue(all(r is None for r in results))
+        self.assertEqual(wave.get_vgpr64(0, 0), 0xDEADBEEFCAFEBABE)
+        self.assertEqual(lds.read_qword(0), TEN_F64)
+
+    def test_simd_multi_lane_serialization_same_address(self) -> None:
+        lds = LDSMemory64(65536)
+        wave = SIMDWaveState64(wave_size=32, exec_mask=0x7, lds=lds)  # Lanes 0, 1, 2
+        interp = SIMDDSInterpreter64()
+
+        addr = 0x20
+        lds.write_qword(addr, TEN_F64)  # 10.0
+
+        # Lane 0: 3.0, Lane 1: 2.0, Lane 2: 1.0
+        wave.set_vgpr32(0, 2, addr)
+        wave.set_vgpr64(0, 4, THREE_F64)
+
+        wave.set_vgpr32(1, 2, addr)
+        wave.set_vgpr64(1, 4, TWO_F64)
+
+        wave.set_vgpr32(2, 2, addr)
+        wave.set_vgpr64(2, 4, ONE_F64)
+
+        inst = DSMinRtnF64Instruction(
+            vdst=RegisterOperand(0, count=2),
+            vaddr=RegisterOperand(2, count=1),
+            vdata0=RegisterOperand(4, count=2),
+        )
+
+        results = interp.execute(wave, inst)
+
+        # Lane 0: sees 10.0, writes min(10.0, 3.0) = 3.0
+        self.assertEqual(results[0], (TEN_F64, THREE_F64))
+        self.assertEqual(wave.get_vgpr64(0, 0), TEN_F64)
+
+        # Lane 1: sees 3.0, writes min(3.0, 2.0) = 2.0
+        self.assertEqual(results[1], (THREE_F64, TWO_F64))
+        self.assertEqual(wave.get_vgpr64(1, 0), THREE_F64)
+
+        # Lane 2: sees 2.0, writes min(2.0, 1.0) = 1.0
+        self.assertEqual(results[2], (TWO_F64, ONE_F64))
+        self.assertEqual(wave.get_vgpr64(2, 0), TWO_F64)
+
+        self.assertEqual(lds.read_qword(addr), ONE_F64)
+
+    def test_bank_conflict_detection(self) -> None:
+        lds = LDSMemory64(65536)
+        wave = SIMDWaveState64(wave_size=32, exec_mask=0x3, lds=lds)  # Lanes 0, 1
+        interp = SIMDDSInterpreter64()
+
+        # Lane 0 targets eff_addr 0 -> banks 0, 1
+        # Lane 1 targets eff_addr 128 -> banks 0, 1 (since 128 >> 2 = 32 % 32 = 0)
+        wave.set_vgpr32(0, 2, 0)
+        wave.set_vgpr32(1, 2, 128)
+
+        inst = DSMinRtnF64Instruction(
+            vdst=RegisterOperand(0, count=2),
+            vaddr=RegisterOperand(2, count=1),
+            vdata0=Immediate64(ONE_F64),
+        )
+
+        conflicts = interp.detect_bank_conflicts(wave, inst)
+        self.assertIn(0, conflicts)
+        self.assertEqual(conflicts[0], [0, 1])
+
+
 if __name__ == "__main__":
     unittest.main()
