@@ -149,6 +149,21 @@
     applyLang();
   });
 
+  const menuBtn = document.getElementById("menu-toggle");
+  const navLinks = document.getElementById("nav-links");
+  if (menuBtn && navLinks) {
+    menuBtn.addEventListener("click", () => {
+      const open = navLinks.classList.toggle("open");
+      menuBtn.setAttribute("aria-expanded", String(open));
+    });
+    navLinks.querySelectorAll("a").forEach((link) => {
+      link.addEventListener("click", () => {
+        navLinks.classList.remove("open");
+        menuBtn.setAttribute("aria-expanded", "false");
+      });
+    });
+  }
+
   applyLang();
   hydrateReleases();
 })();
