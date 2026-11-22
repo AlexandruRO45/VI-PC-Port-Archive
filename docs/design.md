@@ -277,6 +277,31 @@ The other blockers listed then (mesh, the vertex-fetch call, geometry, compute a
 for the corpus: all 26,503 shaders translate (see *Translator status*). The remaining fidelity gap is wave64
 cross-half code on 32-wide subgroups.
 
+## Retail packages (.EAppx / MSIXVC) are encrypted; the project does not unpack them
+
+Measured on a retail Store package (Phantom Dust, `Microsoft.MSEsper_1.3.25854.70_x64__8wekyb3d8bbwe.EAppx`,
+10,206,288,525 bytes, 2026-11-22): the file does **not** start with a ZIP `PK` signature. Its first eight bytes are
+`45 58 50 48 58 01 00 00 00` (`EXPHX\x01`), i.e. an MSIXVC container: the `.EAppx` extension names the *Store
+delivery* format, not the OPC/ZIP package inside it. The manifest and block map live inside that container too, so
+"parse the ZIP, read `AppxBlockMap.xml`, decrypt the 64 KiB blocks" does not even start at byte 0.
+
+The payload of a Store-delivered package is encrypted, and the content key is delivered in the licence, not in the
+package: the folder above contains the package and nothing else, and there is no licence file beside it.
+
+Per `AGENTS.md` ("No keys, decryption or protection workarounds. If a format turns out to be encrypted, write that
+down in `docs/design.md` and stop there"), this project stops here:
+
+- no licence parsing, no content-key handling, no AES of payload blocks, no tool that does any of it;
+- the PE loader consumes **loose files the user is entitled to have on disk**: an `.exe`, its `.dll`s and the data
+  next to them (see `docs/how_to_test_game.md`);
+- an encrypted package is a dead end for this pipeline. What unblocks it is a plain copy of the files, not a key:
+  a build the publisher hands out for debugging, a title (or demo) that ships unencrypted, or files a developer-mode
+  console or the PC install exposes as ordinary files.
+
+The runtime is validated without any retail package: `gta6rt --run leonida_test_harness.exe --shims
+leonida_shims.dll` drives loader → shim tables → D3D12/DXGI → shared-device Vulkan → present window, and is what
+`runtime/README.md` calls the self-check.
+
 ## Day one, in order
 
 1. `scripts\first_look.ps1 -Exe ...` checks the exe is plain, lists the imports to shim, and does a dry run.
