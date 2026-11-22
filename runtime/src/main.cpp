@@ -95,6 +95,7 @@ int wmain(int argc, wchar_t** argv) {
         rt::Loader loader(game_dir);
         rt::Module& main_module = loader.load(image);  // maps, binds and installs TLS; runs no image code
         const auto image_path = std::filesystem::absolute(image).wstring();
+        if (run) rt::process::set_command_line(image.filename().wstring(), game_args, image_path);
         if (init || run) {
             loader.initialise();  // TLS callbacks, then DllMain(DLL_PROCESS_ATTACH) for DLLs
             std::printf("%zu module(s) initialised\n", loader.modules().size());
@@ -129,7 +130,6 @@ int wmain(int argc, wchar_t** argv) {
             std::fprintf(stderr, "error: %s has no entry point\n", main_module.name.c_str());
             return 1;
         }
-        rt::process::set_command_line(image.filename().wstring(), game_args, image_path);
         std::printf("console paths: GAME: -> %ls, writes -> %ls\n", game_dir.c_str(), overlay_dir.c_str());
         std::printf("running %s\n", main_module.name.c_str());
         std::fflush(stdout);
