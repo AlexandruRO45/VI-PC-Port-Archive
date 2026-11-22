@@ -485,6 +485,224 @@ def instruction_to_expression(inst: ASTInstruction) -> F64DivFixup:
     return F64DivFixup(s0=s0_expr, s1=s1_expr, s2=s2_expr, clamp=inst.clamp, omod=inst.omod)
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+def parse_asm_operand(tok: str) -> ASTOperand:
+    tok = tok.strip()
+    neg = False
+    abs_val = False
+    if tok.startswith("-"):
+        neg = True
+        tok = tok[1:].strip()
+    if tok.startswith("|") and tok.endswith("|"):
+        abs_val = True
+        tok = tok[1:-1].strip()
+
+    if tok.startswith("v[") and tok.endswith("]"):
+        inner = tok[2:-1]
+        parts = inner.split(":")
+        reg_idx = int(parts[0])
+        return ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=reg_idx, neg=neg, abs_val=abs_val)
+    elif tok.startswith("s[") and tok.endswith("]"):
+        inner = tok[2:-1]
+        parts = inner.split(":")
+        reg_idx = int(parts[0])
+        return ASTOperand(kind=OperandKind.SGPR_PAIR, reg_idx=reg_idx, neg=neg, abs_val=abs_val)
+    elif tok.startswith("0x") or tok.startswith("0X"):
+        imm = int(tok, 16)
+        return ASTOperand(kind=OperandKind.LITERAL_64, imm_val=imm, neg=neg, abs_val=abs_val)
+    else:
+        try:
+            if "." in tok or "e" in tok.lower():
+                imm = f64_to_u64(float(tok))
+                return ASTOperand(kind=OperandKind.LITERAL_64, imm_val=imm, neg=neg, abs_val=abs_val)
+            imm = int(tok)
+            return ASTOperand(kind=OperandKind.INLINE_IMM, imm_val=imm, neg=neg, abs_val=abs_val)
+        except ValueError:
+            raise ValueError(f"Unrecognized assembly operand token: {tok}")
+
+
+def parse_asm_line(line: str) -> ASTInstruction:
+    clean = line.split(";")[0].split("//")[0].strip()
+    tokens = [t for t in clean.replace(",", " ").split() if t]
+    if not tokens:
+        raise ValueError("Empty assembly line")
+    opcode = tokens[0]
+    if opcode != "v_div_fixup_f64":
+        raise ValueError(f"Expected opcode v_div_fixup_f64, got {opcode}")
+
+    clamp = False
+    omod = 1.0
+    raw_ops = []
+    for tok in tokens[1:]:
+        if tok == "clamp":
+            clamp = True
+        elif tok == "mul:2":
+            omod = 2.0
+        elif tok == "mul:4":
+            omod = 4.0
+        elif tok == "div:2":
+            omod = 0.5
+        else:
+            raw_ops.append(tok)
+
+    if len(raw_ops) != 4:
+        raise ValueError(f"Expected 4 operands for v_div_fixup_f64, got {len(raw_ops)}: {raw_ops}")
+
+    dst = parse_asm_operand(raw_ops[0])
+    src0 = parse_asm_operand(raw_ops[1])
+    src1 = parse_asm_operand(raw_ops[2])
+    src2 = parse_asm_operand(raw_ops[3])
+
+    inst = ASTInstruction(
+        opcode=opcode,
+        dst=dst,
+        src0=src0,
+        src1=src1,
+        src2=src2,
+        clamp=clamp,
+        omod=omod,
+    )
+    inst.validate()
+    return inst
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for RDNA2 VALU v_div_fixup_f64."""
+
+    def __init__(self, num_vgprs: int = 256, num_sgprs: int = 106) -> None:
+        self.vgpr = VALURegisterFile(num_vgprs=num_vgprs)
+        self.num_sgprs = num_sgprs
+        self.sgprs = [0] * num_sgprs
+        self.vcc = 0
+        self.scc = 0
+
+    def get_sgpr(self, idx: int) -> int:
+        if not (0 <= idx < self.num_sgprs):
+            raise IndexError(f"SGPR index out of range: {idx}")
+        return self.sgprs[idx] & MASK32
+
+    def set_sgpr(self, idx: int, val: int) -> None:
+        if not (0 <= idx < self.num_sgprs):
+            raise IndexError(f"SGPR index out of range: {idx}")
+        self.sgprs[idx] = val & MASK32
+
+    def get_sgpr_pair(self, idx: int) -> int:
+        if not (0 <= idx < self.num_sgprs - 1):
+            raise IndexError(f"SGPR pair index out of range: s[{idx}:{idx+1}]")
+        lo = self.get_sgpr(idx)
+        hi = self.get_sgpr(idx + 1)
+        return join_dwords(lo, hi)
+
+    def set_sgpr_pair(self, idx: int, val64: int) -> None:
+        if not (0 <= idx < self.num_sgprs - 1):
+            raise IndexError(f"SGPR pair index out of range: s[{idx}:{idx+1}]")
+        lo, hi = split_dwords(val64)
+        self.set_sgpr(idx, lo)
+        self.set_sgpr(idx + 1, hi)
+
+    def resolve_operand(self, op: ASTOperand) -> int:
+        if op.kind == OperandKind.VGPR_PAIR:
+            val = self.vgpr.get_vgpr_pair(op.reg_idx)
+        elif op.kind == OperandKind.SGPR_PAIR:
+            val = self.get_sgpr_pair(op.reg_idx)
+        elif op.kind in (OperandKind.LITERAL_64, OperandKind.INLINE_IMM):
+            val = op.imm_val & MASK64
+        else:
+            raise ValueError(f"Unknown operand kind: {op.kind}")
+
+        return apply_src_mods_f64(val, neg=op.neg, abs_val=op.abs_val)
+
+    def execute_ast(self, inst: ASTInstruction) -> int:
+        inst.validate()
+        s0 = self.resolve_operand(inst.src0)
+        s1 = self.resolve_operand(inst.src1)
+        s2 = self.resolve_operand(inst.src2)
+
+        res = ref_div_fixup_f64(s0, s1, s2, clamp=inst.clamp, omod=inst.omod)
+        self.vgpr.set_vgpr_pair(inst.dst.reg_idx, res)
+        return res
+
+    def execute_asm(self, line: str) -> int:
+        inst = parse_asm_line(line)
+        return self.execute_ast(inst)
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Test suite for deterministic scalar instruction interpreter."""
+
+    def test_execute_vgpr_sources(self) -> None:
+        interp = ScalarInterpreter()
+        interp.vgpr.set_vgpr_pair(2, f64_to_u64(5.0))   # s0 (quotient)
+        interp.vgpr.set_vgpr_pair(4, f64_to_u64(2.0))   # s1 (denom)
+        interp.vgpr.set_vgpr_pair(6, f64_to_u64(10.0))  # s2 (numer)
+
+        dst = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=0)
+        src0 = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=2)
+        src1 = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=4)
+        src2 = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=6)
+        inst = ASTInstruction(opcode="v_div_fixup_f64", dst=dst, src0=src0, src1=src1, src2=src2)
+
+        res = interp.execute_ast(inst)
+        self.assertEqual(u64_to_f64(res), 5.0)
+        self.assertEqual(interp.vgpr.get_vgpr_pair(0), res)
+
+    def test_execute_sgpr_sources(self) -> None:
+        interp = ScalarInterpreter()
+        interp.vgpr.set_vgpr_pair(2, f64_to_u64(4.0))   # s0
+        interp.set_sgpr_pair(4, f64_to_u64(-3.0))       # s1
+        interp.set_sgpr_pair(6, f64_to_u64(12.0))       # s2
+
+        dst = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=0)
+        src0 = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=2)
+        src1 = ASTOperand(kind=OperandKind.SGPR_PAIR, reg_idx=4)
+        src2 = ASTOperand(kind=OperandKind.SGPR_PAIR, reg_idx=6)
+        inst = ASTInstruction(opcode="v_div_fixup_f64", dst=dst, src0=src0, src1=src1, src2=src2)
+
+        res = interp.execute_ast(inst)
+        # 12 / -3 = -4.0
+        self.assertEqual(u64_to_f64(res), -4.0)
+        self.assertEqual(interp.vgpr.get_vgpr_pair(0), res)
+
+    def test_execute_literal_source(self) -> None:
+        interp = ScalarInterpreter()
+        interp.vgpr.set_vgpr_pair(2, f64_to_u64(2.5))
+        interp.vgpr.set_vgpr_pair(4, f64_to_u64(2.0))
+
+        dst = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=0)
+        src0 = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=2)
+        src1 = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=4)
+        src2 = ASTOperand(kind=OperandKind.LITERAL_64, imm_val=f64_to_u64(5.0))
+        inst = ASTInstruction(opcode="v_div_fixup_f64", dst=dst, src0=src0, src1=src1, src2=src2)
+
+        res = interp.execute_ast(inst)
+        self.assertEqual(u64_to_f64(res), 2.5)
+        self.assertEqual(interp.vgpr.get_vgpr_pair(0), res)
+
+    def test_execute_text_asm(self) -> None:
+        interp = ScalarInterpreter()
+        interp.vgpr.set_vgpr_pair(2, f64_to_u64(7.0))
+        interp.vgpr.set_vgpr_pair(4, f64_to_u64(-2.0))
+        interp.vgpr.set_vgpr_pair(6, f64_to_u64(-14.0))
+
+        # Both negative (- / - -> +)
+        res = interp.execute_asm("v_div_fixup_f64 v[0:1], v[2:3], v[4:5], v[6:7]")
+        self.assertEqual(u64_to_f64(res), 7.0)
+        self.assertEqual(interp.vgpr.get_vgpr_pair(0), res)
+
+    def test_execute_with_clamp_and_omod(self) -> None:
+        interp = ScalarInterpreter()
+        interp.vgpr.set_vgpr_pair(2, f64_to_u64(0.25))
+        interp.vgpr.set_vgpr_pair(4, f64_to_u64(4.0))
+        interp.vgpr.set_vgpr_pair(6, f64_to_u64(1.0))
+
+        # omod mul:2 -> 0.25 * 2 = 0.5
+        res = interp.execute_asm("v_div_fixup_f64 v[0:1], v[2:3], v[4:5], v[6:7] mul:2 clamp")
+        self.assertEqual(u64_to_f64(res), 0.5)
+
+
 class TestSymbolicAST(unittest.TestCase):
     """Test suite for symbolic AST opcode definitions and typed expressions."""
 
