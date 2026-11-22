@@ -8,6 +8,7 @@
 
 #include <cstdio>
 #include <set>
+#include <thread>
 
 #define CHECK(condition) do {                                    \
     if (!(condition)) {                                          \
@@ -34,6 +35,35 @@ int main() {
     Image image{};
     image.address = 0xAB1234567800;  // BASE_ADDRESS = address >> 8, BASE_ADDRESS_HI = address >> 40
     CHECK((changed(image) == ImageWords{0x12345678, 0xAB, 0, 0, 0, 0, 0, 0}));
+    // WORD0 + WORD1[7:0] store 40 units bits, plus eight implied zero address bits. Even keys above 1 TiB
+    // survive the round trip; the first byte address at 2^48, or a non-256-aligned key, would alias.
+    CHECK(encodable_image_address(0));
+    CHECK(encodable_image_address(0x10000000000));
+    CHECK(encodable_image_address(0xFFFFFFFFFF00));
+    CHECK(!encodable_image_address(0x1000000000000));
+    CHECK(!encodable_image_address(0xFFFFFFFFFFFFFFFF));
+    CHECK(!encodable_image_address(0x100000001));
+    // Claim the last two 256-byte keys, then remain saturated. Failed claims must not change the supplied key.
+    std::atomic<std::uint64_t> next{image_address_limit - 512};
+    std::uint64_t key = 0;
+    CHECK(reserve_image_address(next, key) && key == image_address_limit - 512);
+    CHECK(reserve_image_address(next, key) && key == image_address_limit - 256);
+    CHECK(next.load() == image_address_limit);
+    CHECK(!reserve_image_address(next, key) && key == image_address_limit - 256);
+    CHECK(next.load() == image_address_limit);
+    std::atomic<std::uint64_t> bad_start{image_address_start - 256};
+    CHECK(!reserve_image_address(bad_start, key) && bad_start.load() == image_address_start - 256);
+    // Multiple racing callers must never receive the same key, even at the upper address boundary.
+    std::atomic<std::uint64_t> shared{image_address_limit - 8 * 256};
+    std::array<std::uint64_t, 16> claimed{};
+    std::array<std::thread, 16> workers;
+    for (std::size_t i = 0; i < workers.size(); ++i)
+        workers[i] = std::thread([&, i] { reserve_image_address(shared, claimed[i]); });
+    for (auto& worker : workers) worker.join();
+    std::set<std::uint64_t> unique;
+    for (const auto address : claimed) if (address) unique.insert(address);
+    CHECK(unique.size() == 8 && shared.load() == image_address_limit);
+    CHECK(*unique.begin() == image_address_limit - 8 * 256 && *unique.rbegin() == image_address_limit - 256);
     image = {};
     image.format = 0x1FF;  // FORMAT, word 1 bits 28:20
     CHECK((changed(image) == ImageWords{0, 0x1FF00000, 0, 0, 0, 0, 0, 0}));

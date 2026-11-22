@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstdint>
 
@@ -39,6 +40,27 @@ using ImageWords = std::array<std::uint32_t, 8>;    // a T#
 using SamplerWords = std::array<std::uint32_t, 4>;  // an S#
 using BufferWords = std::array<std::uint32_t, 4>;   // a V#
 using Swizzle = std::array<std::uint8_t, 4>;        // DST_SEL_X..W
+
+// The T# BASE_ADDRESS is 40 bits of 256-byte units: WORD0 holds 32 bits and WORD1[7:0] holds the other 8.
+// These are 48-bit byte addresses, not 40-bit byte addresses. Reject keys that would alias after encoding.
+inline constexpr std::uint64_t image_address_limit = std::uint64_t(1) << 48;
+inline constexpr std::uint64_t image_address_start = std::uint64_t(1) << 32;
+inline constexpr bool encodable_image_address(std::uint64_t address) {
+    return address < image_address_limit && (address & 0xFFu) == 0;
+}
+
+// Reserve one unique T# image key without wrapping or reissuing an old address. The failed compare/exchange
+// refreshes `next`, so concurrent callers still claim each key once. Only this counter's value is synchronized.
+inline bool reserve_image_address(std::atomic<std::uint64_t>& next, std::uint64_t& address) {
+    auto candidate = next.load(std::memory_order_relaxed);
+    while (candidate >= image_address_start && encodable_image_address(candidate)) {
+        if (next.compare_exchange_weak(candidate, candidate + 256, std::memory_order_relaxed)) {
+            address = candidate;
+            return true;
+        }
+    }
+    return false;
+}
 
 namespace detail {
 

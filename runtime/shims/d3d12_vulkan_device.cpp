@@ -767,7 +767,7 @@ struct DeviceState {
     // A T# names a texture by an address of its own: above 4 GiB, which the GPU address arena for buffers (docs
     // section 3.3) stays below, and 256 bytes apart (the T# keeps addresses in 256-byte units). Nothing
     // dereferences it.
-    std::atomic<std::uint64_t> next_image_address{std::uint64_t(1) << 32};
+    std::atomic<std::uint64_t> next_image_address{leonida::gfx10::image_address_start};
 
     // 0 float, 1 unsigned integer, 2 signed integer: which of the three storage-image arrays a view belongs in.
     static int numeric_class(VkFormat format) {
@@ -1563,6 +1563,10 @@ public:
             support = device_.check_image_support(info);
         }
         if (FAILED(support)) return support;
+        // Reserve before allocating Vulkan memory. The T# is limited to a 48-bit byte address, so a saturated
+        // counter must refuse future keys instead of wrapping and aliasing an existing texture.
+        if (!leonida::gfx10::reserve_image_address(device_.next_image_address, image_address_))
+            return E_OUTOFMEMORY;
         const VkResult created = vk.vkCreateImage(device_.info.device, &info, nullptr, &image_);
         if (created != VK_SUCCESS) {
             if (created == VK_ERROR_OUT_OF_HOST_MEMORY || created == VK_ERROR_OUT_OF_DEVICE_MEMORY)
@@ -1603,7 +1607,6 @@ public:
         format_ = format.format;
         r9g9b9e5_as_r32_uint_ = format.r9g9b9e5_as_r32_uint;
         aspects_ = format.aspects;
-        image_address_ = device_.next_image_address.fetch_add(256);
         binding_ = binding;
         if (host_transfer_) {
             // Moved to GENERAL and zero-filled on the host now, so the CPU can copy into it before any command

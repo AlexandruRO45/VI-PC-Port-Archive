@@ -1789,7 +1789,8 @@ if(TARGET Vulkan::Headers)
     add_test(NAME replay_query_predication COMMAND replay_query_predication_test)
     # GFX10 T#/S#/V# descriptor encoding and its Vulkan mappings (src/gfx10_descriptors.h).
     add_executable(gfx10_descriptors_test test/gfx10_descriptors_test.cpp)
-    target_link_libraries(gfx10_descriptors_test PRIVATE Vulkan::Headers)
+    find_package(Threads REQUIRED)
+    target_link_libraries(gfx10_descriptors_test PRIVATE Vulkan::Headers Threads::Threads)
     add_test(NAME gfx10_descriptors COMMAND gfx10_descriptors_test)
     # CPU cost of the D3D12 -> Vulkan replay per command (record, prepare, emit) with no-op Vulkan entry points:
     # no GPU or driver. ctest runs its quick self-test; run it without arguments for the numbers.
