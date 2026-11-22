@@ -69,6 +69,11 @@ FMA_EXACT = False        # --fma exact: fused multiply-adds are emulated from si
 # coordinate, so a per-pixel offset doesn't change the LOD. Gathers keep their Offset (shaderImageGatherExtended).
 TEXEL_OFFSET_FALLBACK = False
 FLOAT_CONTROLS = True    # False (--no-float-controls): no SignedZeroInfNanPreserve, for drivers without the property
+# --native-rounding: v_floor_f32 / v_ceil_f32 / v_fract_f32 become plain GLSL Floor / Ceil / Fract, without the code
+# that gives RDNA2's results for denormal operands, Fract's round-up to 1.0, signalling NaNs and infinities
+# (Gen.round_f32_flushed). Only exact where the driver compiles them to the hardware instructions: AMD (checked on
+# RADV, RX 5700 XT, every edge case in compute and pixel shaders). Elsewhere those cases differ (llvmpipe: 5 of 16).
+NATIVE_ROUNDING = False
 # --mesh-compute: mesh shaders become compute shaders (same workgroup size and code) for devices without
 # VK_EXT_mesh_shader. Instead of SetMeshOutputs and the mesh outputs, the epilogue writes the vertex and primitive
 # counts, each lane's vertex and each lane's primitive into this workgroup's slot of a buffer whose device address is
@@ -5316,7 +5321,11 @@ class Gen:
         operand is a zero of its sign (floor(-1e-45) = -0, ceil(+1e-45) = +0, fract of either 0; using the denormal
         gives -1.0, +1.0 and 0x3f7fffff), and a NaN operand passes through unchanged (signalling ones too).
         fract(+-inf) is the negative quiet NaN 0xffc00000. Done here rather than left to the driver's f32 denormal
-        handling, which Vulkan does not fix."""
+        handling, which Vulkan does not fix. With --native-rounding the plain GLSL function is the whole result."""
+        if NATIVE_ROUNDING:
+            r = self.tmp()
+            self.emit(f"{r} = OpExtInst %float %glsl {fn} {x}")
+            return r
         bits, mag, exp, den, sgn, sz, xf, r = (self.tmp() for _ in range(8))
         self.emit(f"{bits} = OpBitcast %uint {x}")
         self.emit(f"{mag} = OpBitwiseAnd %uint {bits} {self.cu(0x7FFFFFFF)}")
@@ -15850,6 +15859,10 @@ def main():
                     help="pixel shaders that read raw barycentrics take them from an ordinary interpolated input "
                          "(metadata: bary_fallback_input) instead of BaryCoordKHR, for devices without "
                          "VK_KHR_fragment_shader_barycentric (e.g. NVIDIA Pascal)")
+    ap.add_argument("--native-rounding", action="store_true",
+                    help="v_floor/v_ceil/v_fract_f32 as plain GLSL Floor/Ceil/Fract, without the code for RDNA2's "
+                         "denormal, round-up-to-1.0, NaN and infinity cases: faster, and exact only where the "
+                         "driver compiles them to the hardware instructions (AMD; checked on RADV)")
     ap.add_argument("--texel-offset-fallback", action="store_true",
                     help="image_sample*_o without VK_KHR_maintenance8 (e.g. NVIDIA Pascal): fold the texel offset into "
                          "the coordinate instead of the Offset operand")
@@ -15898,8 +15911,9 @@ def main():
         ap.error(f"cannot create {a.out}: {ancestor} is a file, not a folder")
     MAX_SHARED_BYTES = a.max_shared_memory
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES, OPT_SPIRV
-    global PC_TAIL_UBO
+    global PC_TAIL_UBO, NATIVE_ROUNDING
     PC_TAIL_UBO = a.pc_tail_ubo
+    NATIVE_ROUNDING = a.native_rounding
     global FMA_EXACT
     FMA_KHR = a.fma == "khr"
     FMA_EXACT = a.fma == "exact"

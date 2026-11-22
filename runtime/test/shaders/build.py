@@ -19,6 +19,9 @@ The comment at the top of each .asm says which test program to run on the result
 With LEONIDA_FMA=khr (or glsl, or exact), the fused multiply-adds are translated with --fma khr (OpFmaKHR, which needs
 VK_KHR_shader_fma; the test programs enable it when the device has it, else they exit 77), --fma glsl, or --fma exact
 (a single rounding built from plain f32 ops, for a driver that splits GLSL Fma and has no VK_KHR_shader_fma).
+With LEONIDA_NATIVE_ROUNDING=1, v_floor/v_ceil/v_fract_f32 are translated with --native-rounding (plain GLSL
+Floor/Ceil/Fract), which check.py then judges against the same RDNA2 words: a check that the driver's own functions
+match the hardware, as AMD's do.
 With LEONIDA_BARY_FALLBACK=1, pixel shaders that read raw barycentrics are translated with --bary-fallback, and
 each gets a pass-through geometry shader, <name>.bary_gs.spv, that check.py draws it with (tools/bary_fallback_gs.py).
 Under that or LEONIDA_F16_INTERP_FALLBACK=1, ps_ij_computed isn't built: its computed I/J pair needs PerVertexKHR
@@ -171,6 +174,8 @@ def translate_tests(work, names):
         cmd.append("--f16-interp-fallback")
     if os.environ.get("LEONIDA_TEXOFF_FALLBACK") == "1":   # texel offsets without VK_KHR_maintenance8
         cmd.append("--texel-offset-fallback")
+    if os.environ.get("LEONIDA_NATIVE_ROUNDING") == "1":   # plain GLSL Floor/Ceil/Fract (exact on AMD drivers)
+        cmd.append("--native-rounding")
     # 128-byte push constants: the tail in a set-1 uniform block. The values the test programs accept (vk_pc_tail.h).
     if (os.environ.get("LEONIDA_PC_TAIL_UBO") or "").strip().lower() in ("1", "true", "yes", "on"):
         cmd.append("--pc-tail-ubo")

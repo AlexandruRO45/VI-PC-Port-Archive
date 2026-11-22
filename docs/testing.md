@@ -351,6 +351,13 @@ MoltenVK can't convert to Metal ("PerVertexKHR decoration is not supported in MS
 on or off; `build.py` (for `check.py`) translates with the flag only when that variable is `1`. `ms_f16_pack` also runs
 on a Mac with `LEONIDA_MESH_COMPUTE=1 LEONIDA_W64_EMULATE=1`.
 
+## AMD GPUs: native rounding
+
+`LEONIDA_NATIVE_ROUNDING=1`, for both `build.py` and `check.py` (or for `run_gpu_tests.py`), translates with
+`--native-rounding`: `v_floor_f32`, `v_ceil_f32` and `v_fract_f32` become the driver's own `Floor`/`Ceil`/`Fract`. The
+checks stay the same RDNA2 words, so the run says whether this driver's functions match the hardware. They do on AMD
+(checked on RADV, RX 5700 XT); elsewhere `ps_fnan_fract` fails, and that's expected, not a translator bug.
+
 ## GPUs without VK_KHR_maintenance8 (NVIDIA Pascal and older)
 
 `ps_texoff` and `ps_texoff_implicit` sample with a run-time texel offset, which needs `VK_KHR_maintenance8`;
