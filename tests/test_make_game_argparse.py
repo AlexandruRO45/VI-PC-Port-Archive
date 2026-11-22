@@ -434,6 +434,7 @@ class WavValidationTest(unittest.TestCase):
             game = os.path.join(tmp, "game")
             out = os.path.join(work, "assets")
             # Populate manifest files so archive processing loops don't run external tools
+            decoder_sig = make_game.rpf9dump_digest()
             for rel in make_game.MODEL_ARCHIVES:
                 name = os.path.splitext(os.path.basename(rel))[0]
                 for mode in ("models", "textures"):
@@ -441,6 +442,8 @@ class WavValidationTest(unittest.TestCase):
                     os.makedirs(p, exist_ok=True)
                     with open(os.path.join(p, "manifest.json"), "w", encoding="utf-8") as f:
                         f.write("{}")
+                    with open(os.path.join(p, "decoder.sha256"), "w", encoding="utf-8") as f:
+                        f.write(decoder_sig + "\n")
             audio_dir = os.path.join(out, "audio")
             os.makedirs(audio_dir, exist_ok=True)
             with open(os.path.join(audio_dir, "audio_manifest.json"), "w", encoding="utf-8") as f:
@@ -462,6 +465,7 @@ class WavValidationTest(unittest.TestCase):
             game = os.path.join(tmp, "game")
             out = os.path.join(work, "assets")
             # Populate manifests for model archives
+            decoder_sig = make_game.rpf9dump_digest()
             for rel in make_game.MODEL_ARCHIVES:
                 name = os.path.splitext(os.path.basename(rel))[0]
                 for mode in ("models", "textures"):
@@ -469,6 +473,8 @@ class WavValidationTest(unittest.TestCase):
                     os.makedirs(p, exist_ok=True)
                     with open(os.path.join(p, "manifest.json"), "w", encoding="utf-8") as f:
                         f.write("{}")
+                    with open(os.path.join(p, "decoder.sha256"), "w", encoding="utf-8") as f:
+                        f.write(decoder_sig + "\n")
 
             ogg_dir = os.path.join(out, "audio", "ogg")
             wav_dir = os.path.join(out, "audio", "wav")
@@ -495,6 +501,7 @@ class WavValidationTest(unittest.TestCase):
             work = os.path.join(tmp, "work")
             game = os.path.join(tmp, "game")
             out = os.path.join(work, "assets")
+            decoder_sig = make_game.rpf9dump_digest()
             for rel in make_game.MODEL_ARCHIVES:
                 name = os.path.splitext(os.path.basename(rel))[0]
                 for mode in ("models", "textures"):
@@ -502,6 +509,8 @@ class WavValidationTest(unittest.TestCase):
                     os.makedirs(p, exist_ok=True)
                     with open(os.path.join(p, "manifest.json"), "w", encoding="utf-8") as f:
                         f.write("{}")
+                    with open(os.path.join(p, "decoder.sha256"), "w", encoding="utf-8") as f:
+                        f.write(decoder_sig + "\n")
             audio = os.path.join(out, "audio")
             os.makedirs(os.path.join(audio, "xma"), exist_ok=True)
             os.makedirs(game, exist_ok=True)
@@ -519,6 +528,7 @@ class WavValidationTest(unittest.TestCase):
             work = os.path.join(tmp, "work")
             game = os.path.join(tmp, "game")
             out = os.path.join(work, "assets")
+            decoder_sig = make_game.rpf9dump_digest()
             for rel in make_game.MODEL_ARCHIVES:
                 name = os.path.splitext(os.path.basename(rel))[0]
                 for mode in ("models", "textures"):
@@ -526,6 +536,8 @@ class WavValidationTest(unittest.TestCase):
                     os.makedirs(p, exist_ok=True)
                     with open(os.path.join(p, "manifest.json"), "w", encoding="utf-8") as f:
                         f.write("{}")
+                    with open(os.path.join(p, "decoder.sha256"), "w", encoding="utf-8") as f:
+                        f.write(decoder_sig + "\n")
 
             manifest_dir = os.path.join(out, "audio")
             os.makedirs(manifest_dir, exist_ok=True)

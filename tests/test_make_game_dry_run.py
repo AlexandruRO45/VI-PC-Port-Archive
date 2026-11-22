@@ -447,6 +447,7 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
         audio_dir = os.path.join(assets_dir, "audio")
         os.makedirs(audio_dir, exist_ok=True)
 
+        decoder_sig = make_game.rpf9dump_digest()
         for rel in make_game.MODEL_ARCHIVES:
             name = os.path.splitext(os.path.basename(rel))[0]
             for mode in ("models", "textures"):
@@ -454,6 +455,8 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
                 os.makedirs(dest, exist_ok=True)
                 with open(os.path.join(dest, "manifest.json"), "w", encoding="utf-8") as f:
                     f.write("{}")
+                with open(os.path.join(dest, "decoder.sha256"), "w", encoding="utf-8") as f:
+                    f.write(decoder_sig + "\n")
 
         with open(os.path.join(audio_dir, "audio_manifest.json"), "w", encoding="utf-8") as f:
             f.write("{}")

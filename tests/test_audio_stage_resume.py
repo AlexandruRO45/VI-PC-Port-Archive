@@ -111,10 +111,14 @@ class AudioStageResumeTest(unittest.TestCase):
         self.ran = []
         self.ffmpeg_ok = True
         # Model/texture manifests and the audio bank manifest present: only the steps under test can run.
+        decoder_sig = make_game.rpf9dump_digest()
         for rel in make_game.MODEL_ARCHIVES:
             name = os.path.splitext(os.path.basename(rel))[0]
             for mode in ("models", "textures"):
                 self.touch(self.work, "assets", name, mode, "manifest.json")
+                p = self.touch(self.work, "assets", name, mode, "decoder.sha256")
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write(decoder_sig + "\n")
         self.touch(self.audio, "audio_manifest.json")
 
     def tearDown(self):

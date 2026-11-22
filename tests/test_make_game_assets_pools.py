@@ -25,18 +25,21 @@ class AssetsPoolsTest(unittest.TestCase):
         self.work = os.path.join(self.tmp.name, "work")
         self.out = os.path.join(self.work, "assets")
         # Mark the other assets stages done so only the texture-pool loop runs.
+        decoder_sig = make_game.rpf9dump_digest()
         for rel in make_game.MODEL_ARCHIVES:
             stem = os.path.splitext(os.path.basename(rel))[0]
             for mode in ("models", "textures"):
                 self.stub(os.path.join(self.out, stem, mode, "manifest.json"))
+                self.stub(os.path.join(self.out, stem, mode, "decoder.sha256"), decoder_sig + "\n")
         self.stub(os.path.join(self.out, "audio", "audio_manifest.json"))
         self.stub(os.path.join(self.out, "audio", "ogg.done"))
         self.stub(os.path.join(self.out, "audio", "xma.done"))
 
-    def stub(self, path):
+    def stub(self, path, content=""):
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w"):
-            pass
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return path
 
     def pool(self, rel, size=100):
         path = os.path.join(self.game, *rel.split("/"))

@@ -1098,6 +1098,54 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
 
 
 # ---------------------------------------------------------------- assets
+def rpf9dump_digest() -> str:
+    """SHA-256 over the asset decoder: third_party/rpf9-explorer/Core and tools/rpf9dump sources."""
+    h = hashlib.sha256()
+    # If the submodule has git metadata, include its checked-out commit
+    git_file = os.path.join(ROOT, "third_party", "rpf9-explorer", ".git")
+    if os.path.isfile(git_file):
+        try:
+            with open(git_file, "r", encoding="utf-8") as f:
+                git_dir_line = f.read().strip()
+            if git_dir_line.startswith("gitdir:"):
+                git_dir = os.path.normpath(os.path.join(os.path.dirname(git_file), git_dir_line.split(":", 1)[1].strip()))
+                head_file = os.path.join(git_dir, "HEAD")
+                if os.path.isfile(head_file):
+                    with open(head_file, "rb") as f:
+                        h.update(b"submodule_head:" + f.read() + b"\0")
+        except OSError:
+            pass
+    # Source files in third_party/rpf9-explorer/Core
+    core = os.path.join(ROOT, "third_party", "rpf9-explorer", "Core")
+    if os.path.isdir(core):
+        for dirpath, _, filenames in os.walk(core):
+            for f in sorted(filenames):
+                if f.endswith((".cs", ".csproj")):
+                    p = os.path.join(dirpath, f)
+                    rel = os.path.relpath(p, core)
+                    try:
+                        with open(p, "rb") as fp:
+                            data = fp.read()
+                        h.update(f"{rel}\0{len(data)}\0".encode("utf-8"))
+                        h.update(data)
+                    except OSError:
+                        pass
+    # Source files in tools/rpf9dump
+    tools_dir = os.path.join(TOOLS, "rpf9dump")
+    if os.path.isdir(tools_dir):
+        for f in sorted(os.listdir(tools_dir)):
+            p = os.path.join(tools_dir, f)
+            if os.path.isfile(p) and not f.startswith("."):
+                try:
+                    with open(p, "rb") as fp:
+                        data = fp.read()
+                    h.update(f"{f}\0{len(data)}\0".encode("utf-8"))
+                    h.update(data)
+                except OSError:
+                    pass
+    return h.hexdigest()
+
+
 def rpf9dump(work: str) -> str:
     exe = os.path.join(work, "tools", "rpf9dump", "rpf9dump.exe" if os.name == "nt" else "rpf9dump")
     core = os.path.join(ROOT, "third_party", "rpf9-explorer", "Core")
@@ -1147,14 +1195,27 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
 
     get_exporter = functools.cache(rpf9dump)
     out = os.path.join(work, "assets")
+    decoder_ver = rpf9dump_digest()
     for rel in MODEL_ARCHIVES:
         src = os.path.join(game, rel)
         name = os.path.splitext(os.path.basename(rel))[0]
         for mode in ("models", "textures"):
-            if os.path.isfile(os.path.join(out, name, mode, "manifest.json")):
-                continue
+            dest_dir = os.path.join(out, name, mode)
+            manifest = os.path.join(dest_dir, "manifest.json")
+            ver_file = os.path.join(dest_dir, "decoder.sha256")
+            if os.path.isfile(manifest):
+                had = read_shader_setting(ver_file)
+                if had == decoder_ver:
+                    continue
+                if had:
+                    log(f"assets: decoder updated for {name} {mode}: exporting again")
+                else:
+                    log(f"assets: no decoder fingerprint for {name} {mode}: exporting again")
             log(f"assets: {mode} from {rel}")
             run([get_exporter(work), mode, src, out])
+            if os.path.isfile(manifest):
+                with open(ver_file, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(decoder_ver + "\n")
     # Texture pools: data/ttdb/** and each pack's own pack/<name>/data/ttdb/** (pool names repeat across packs,
     # so pack pools go under ttpf_pack/<pack>/).
     pools = []
