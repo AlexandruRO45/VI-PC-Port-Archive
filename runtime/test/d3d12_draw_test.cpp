@@ -2,10 +2,9 @@
 //   - a graphics PSO whose VS and PS come from containers shaped like the game's, found in a translator-style
 //     index by the SHA-256 of their FSSM programs; the input layout (POSITION, COLOR) is matched to the VS input
 //     signature by semantic, and the VS declares them in the opposite register order;
-//   - a vertex buffer copied into the GPU address arena, an index buffer read straight from an upload heap, root
-//     constants (a clip-space offset) and a root CBV (a tint) through the 32 user-data dwords;
-//   - a render target cleared blue, two indexed draws with different root arguments (top-left red, bottom-right
-//     green), and one back-facing triangle (bottom-left) that culling must remove;
+//   - vertex buffers in the GPU address arena and in an upload heap, with upload-backed indices and root CBVs;
+//   - three indexed draws (top-left red, bottom-right green, top-right white) on a blue target, and one
+//     back-facing triangle in the bottom-left quadrant that culling must remove;
 //   - the image read back through CopyTextureRegion and compared pixel by pixel. Where the quadrants land also
 //     checks the viewport flip (D3D clip space is y-up) and the front-face winding.
 // The shaders are GLSL written to the translator's contract (test/glsl/vs_draw.vert, ps_draw.frag). No game data.
@@ -128,6 +127,12 @@ int main() {
         const std::uint16_t indices[6] = {0, 1, 2, 2, 1, 3};
         const float tints[2][3] = {{1, 0, 1}, {0, 1, 0}};  // red stays red; then green
 
+        constexpr UINT upload_vertex_offset = 1024, upload_index_offset = 1088, upload_tint_offset = 1280;
+        const Vertex upload_vertices[] = {
+            {1, 0, 255, 0, 255, 255}, {1, 1, 255, 0, 255, 255}, {0, 0, 255, 0, 255, 255}, {0, 1, 255, 0, 255, 255}};
+        const std::uint16_t upload_indices[] = {3, 1, 2, 2, 1, 0};
+        const float upload_tint[] = {1, 1, 1};
+
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
         const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
@@ -162,6 +167,9 @@ int main() {
         std::memcpy(up + 256, indices, sizeof(indices));
         std::memcpy(up + 512, tints[0], sizeof(tints[0]));
         std::memcpy(up + 768, tints[1], sizeof(tints[1]));
+        std::memcpy(up + upload_vertex_offset, upload_vertices, sizeof(upload_vertices));
+        std::memcpy(up + upload_index_offset, upload_indices, sizeof(upload_indices));
+        std::memcpy(up + upload_tint_offset, upload_tint, sizeof(upload_tint));
         const D3D12_GPU_VIRTUAL_ADDRESS upload_va = upload->GetGPUVirtualAddress();
 
         const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
@@ -218,6 +226,13 @@ int main() {
         list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
         list->DrawInstanced(3, 1, 4, 0);
 
+        const D3D12_VERTEX_BUFFER_VIEW upload_vbv{upload_va + upload_vertex_offset, sizeof(upload_vertices), sizeof(Vertex)};
+        const D3D12_INDEX_BUFFER_VIEW upload_ibv{upload_va + upload_index_offset, sizeof(upload_indices), DXGI_FORMAT_R16_UINT};
+        list->IASetVertexBuffers(0, 1, &upload_vbv);
+        list->IASetIndexBuffer(&upload_ibv);
+        list->SetGraphicsRootConstantBufferView(1, upload_va + upload_tint_offset);
+        list->DrawIndexedInstanced(UINT(std::size(upload_indices)), 1, 0, 0, 0);
+
         D3D12_RESOURCE_BARRIER to_copy = transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
                                                     D3D12_RESOURCE_STATE_COPY_SOURCE);
         list->ResourceBarrier(1, &to_copy);
@@ -257,13 +272,13 @@ int main() {
     }
     std::filesystem::remove_all(library);
 
+    constexpr std::array<std::uint8_t, 4> quadrants[2][2] = {
+        {{255, 0, 0, 255}, {255, 255, 255, 255}},
+        {{0, 0, 255, 255}, {0, 255, 0, 255}}};
     unsigned mismatches = 0;
     for (UINT row = 0; row < size; ++row) {
         for (UINT col = 0; col < size; ++col) {
-            const bool top = row < size / 2, left = col < size / 2;
-            const std::array<std::uint8_t, 4> want = top && left     ? std::array<std::uint8_t, 4>{255, 0, 0, 255}
-                                                     : !top && !left ? std::array<std::uint8_t, 4>{0, 255, 0, 255}
-                                                                     : std::array<std::uint8_t, 4>{0, 0, 255, 255};
+            const auto& want = quadrants[row >= size / 2][col >= size / 2];
             const std::uint8_t* got = pixels.data() + row * 256 + col * 4;
             if (std::equal(want.begin(), want.end(), got)) continue;
             if (mismatches++ < 6)
@@ -276,8 +291,7 @@ int main() {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
     }
-    std::printf("M1: two indexed draws and a culled triangle matched all %u pixels: input layout by semantic, root "
-                "constants and a root CBV per draw, vertex buffer in the arena, index buffer in an upload heap\n",
+    std::printf("M1: indexed draws from default and upload vertex buffers and a culled triangle matched all %u pixels\n",
                 size * size);
     return 0;
 }
