@@ -238,6 +238,148 @@ class Program:
         return "\n".join(inst.to_assembly() for inst in self.instructions)
 
 
+# ---------------------------------------------------------------------------
+# Deterministic Scalar Instruction Interpreter
+# ---------------------------------------------------------------------------
+
+class ScalarLDSInterpreter:
+    """Deterministic scalar interpreter for ds_rsub_rtn_u32."""
+
+    def __init__(self, lds_size_bytes: int = DEFAULT_LDS_SIZE_BYTES) -> None:
+        self.vgprs: list[int] = [0] * DEFAULT_NUM_VGPRS
+        self.sgprs: list[int] = [0] * DEFAULT_NUM_SGPRS
+        self.lds: LDSMemory = LDSMemory(lds_size_bytes)
+        self.vcc: int = 0
+        self.last_condition_codes: Any | None = None
+        self.last_status_flags: Any | None = None
+        self.trace: list[str] = []
+
+    def read_reg_u32(self, kind: RegKind, idx: int) -> int:
+        if idx < 0 or (kind == RegKind.VGPR and idx >= len(self.vgprs)) or (kind == RegKind.SGPR and idx >= len(self.sgprs)):
+            raise IndexError(f"Register index out of bounds: {kind.value}{idx}")
+        return (self.vgprs[idx] if kind == RegKind.VGPR else self.sgprs[idx]) & MASK32
+
+    def write_reg_u32(self, kind: RegKind, idx: int, val: int) -> None:
+        if idx < 0 or (kind == RegKind.VGPR and idx >= len(self.vgprs)) or (kind == RegKind.SGPR and idx >= len(self.sgprs)):
+            raise IndexError(f"Register index out of bounds: {kind.value}{idx}")
+        val32 = val & MASK32
+        if kind == RegKind.VGPR:
+            self.vgprs[idx] = val32
+        else:
+            self.sgprs[idx] = val32
+
+    def step(self, inst: Instruction) -> tuple[int, int]:
+        """Executes a single ds_rsub_rtn_u32 instruction."""
+        vaddr = self.read_reg_u32(RegKind.VGPR, inst.vaddr.index)
+        vdata0 = self.read_reg_u32(RegKind.VGPR, inst.vdata0.index)
+
+        old_val, new_mem = self.lds.atomic_rsub_rtn_u32(
+            vaddr=vaddr,
+            vdata0=vdata0,
+            offset=inst.offset.offset16,
+        )
+
+        self.write_reg_u32(RegKind.VGPR, inst.vdst.index, old_val)
+        self.trace.append(f"{inst.to_assembly()} => old={old_val:#010x}, new={new_mem:#010x}")
+        return old_val, new_mem
+
+    def run_program(self, prog: Program) -> list[tuple[int, int]]:
+        """Executes all instructions in a program sequentially."""
+        return [self.step(inst) for inst in prog.instructions]
+
+
+class TestLdsRsubRtnScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarLDSInterpreter(lds_size_bytes=4096)
+
+    def test_scalar_execution_basic(self) -> None:
+        # Memory at 0x10 holds 20. vaddr=0x10, vdata0=100.
+        self.interp.lds.write_dword(0x10, 20)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x10)  # vaddr
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 100)   # vdata0
+
+        inst = Instruction(
+            opcode=Opcode.DS_RSUB_RTN_U32,
+            vdst=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata0=Register(RegKind.VGPR, 2),
+        )
+        old_val, new_mem = self.interp.step(inst)
+        self.assertEqual(old_val, 20)
+        self.assertEqual(new_mem, 80)
+        # vdst receives old_val
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 0), 20)
+        # LDS memory updated to 80
+        self.assertEqual(self.interp.lds.read_dword(0x10), 80)
+
+    def test_scalar_execution_with_offset(self) -> None:
+        # Memory at 0x24 holds 50. vaddr=0x20, offset=4, vdata0=200.
+        self.interp.lds.write_dword(0x24, 50)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x20)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 200)
+
+        inst = Instruction(
+            opcode=Opcode.DS_RSUB_RTN_U32,
+            vdst=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata0=Register(RegKind.VGPR, 2),
+            offset=DSOffset(offset16=4),
+        )
+        old_val, new_mem = self.interp.step(inst)
+        self.assertEqual(old_val, 50)
+        self.assertEqual(new_mem, 150)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 0), 50)
+        self.assertEqual(self.interp.lds.read_dword(0x24), 150)
+
+    def test_scalar_chained_execution(self) -> None:
+        self.interp.lds.write_dword(0, 10)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 100)
+        self.interp.write_reg_u32(RegKind.VGPR, 3, 200)
+
+        prog = Program()
+        prog.append(Instruction(
+            opcode=Opcode.DS_RSUB_RTN_U32,
+            vdst=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata0=Register(RegKind.VGPR, 2),
+        ))
+        prog.append(Instruction(
+            opcode=Opcode.DS_RSUB_RTN_U32,
+            vdst=Register(RegKind.VGPR, 4),
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata0=Register(RegKind.VGPR, 3),
+        ))
+
+        results = self.interp.run_program(prog)
+        # Step 1: 100 - 10 = 90 (old=10)
+        self.assertEqual(results[0], (10, 90))
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 0), 10)
+        # Step 2: 200 - 90 = 110 (old=90)
+        self.assertEqual(results[1], (90, 110))
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 4), 90)
+        self.assertEqual(self.interp.lds.read_dword(0), 110)
+
+    def test_scalar_underflow_wrap(self) -> None:
+        self.interp.lds.write_dword(0, 100)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 20)
+
+        inst = Instruction(
+            opcode=Opcode.DS_RSUB_RTN_U32,
+            vdst=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata0=Register(RegKind.VGPR, 2),
+        )
+        old_val, new_mem = self.interp.step(inst)
+        self.assertEqual(old_val, 100)
+        self.assertEqual(new_mem, u32(20 - 100))
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 0), 100)
+        self.assertEqual(self.interp.lds.read_dword(0), u32(20 - 100))
+
+
 class TestLdsRsubRtnAST(unittest.TestCase):
     """Unit tests for symbolic AST opcode definitions and typed expressions."""
 
