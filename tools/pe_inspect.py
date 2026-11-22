@@ -2,13 +2,19 @@
 
 Usage:
     python -I pe_inspect.py <image> [--game-dir DIR] [--out DIR]
+    python -I pe_inspect.py <image> --pdb <file.pdb>
 
 Writes <out>/<file>.json and <out>/<file>.md, where <file> is the image's full file name (game.exe.json,
 game.dll.md), so an exe and a dll with the same stem get separate reports. Images with the same file name from
 different directories get a numbered suffix (x.exe-2.json), and the name used is printed to stderr. The same file
 given twice with the same import search folder is inspected once. Reads the file only; never runs it.
 
-Standard library only: the headers, the section table, the import, delay-import, export, TLS and relocation
+The debug directory (data directory 6) is listed entry by entry. A CodeView `RSDS` entry gives the GUID, age and
+file name of the PDB the linker wrote for this image, which tells which build a PDB belongs to. `--pdb` reads that
+PDB (MSF 7.0: the PDB info stream for the GUID, the DBI stream for the age the debuggers match on) and says whether
+it is the one the image names; the exit code is 0 for a match and 1 otherwise.
+
+Standard library only: the headers, the section table, the import, delay-import, export, TLS, relocation and debug
 directories are parsed with struct, so the tool runs under `python -I` without third-party packages and is covered
 by the same standard-library-only CI job as the other tools.
 """
@@ -20,6 +26,7 @@ import math
 import os
 import struct
 import sys
+import uuid
 from collections import Counter
 
 SYSTEM32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
@@ -31,6 +38,7 @@ DIR_EXPORT = 0
 DIR_IMPORT = 1
 DIR_EXCEPTION = 3
 DIR_BASERELOC = 5
+DIR_DEBUG = 6
 DIR_TLS = 9
 DIR_DELAY_IMPORT = 13
 
@@ -266,6 +274,152 @@ def _tls_callbacks(img: PeImage) -> int:
     return count
 
 
+# IMAGE_DEBUG_TYPE_* (winnt.h). The names are winnt.h's without the prefix.
+DEBUG_TYPES = {
+    0: "UNKNOWN", 1: "COFF", 2: "CODEVIEW", 3: "FPO", 4: "MISC", 5: "EXCEPTION", 6: "FIXUP",
+    7: "OMAP_TO_SRC", 8: "OMAP_FROM_SRC", 9: "BORLAND", 10: "RESERVED10", 11: "CLSID", 12: "VC_FEATURE",
+    13: "POGO", 14: "ILTCG", 15: "MPX", 16: "REPRO", 17: "EMBEDDED_PORTABLE_PDB", 19: "SPGO",
+    20: "EX_DLLCHARACTERISTICS",
+}
+DEBUG_TYPE_CODEVIEW = 2
+DEBUG_ENTRY_SIZE = 28   # IMAGE_DEBUG_DIRECTORY
+PDB_NAME_LIMIT = 1024   # longer than any path the linker writes; bounds a missing terminator
+
+
+def _codeview(data: bytes, at: int, size: int) -> dict:
+    """A CodeView record: RSDS (PDB 7.0: GUID, age, name) or NB10 (PDB 2.0: signature, age, name). Only the bytes
+    the entry declares are read."""
+    end = min(len(data), at + size)
+    sig = data[at:at + 4] if at + 4 <= end else b""
+    if sig == b"RSDS" and at + 24 <= end:
+        guid = uuid.UUID(bytes_le=bytes(data[at + 4:at + 20]))
+        age = struct.unpack_from("<I", data, at + 20)[0]
+        name = _cstring(data, at + 24, min(PDB_NAME_LIMIT, end - at - 24))
+        return {"format": "RSDS", "guid": str(guid), "age": age, "pdb": name}
+    if sig == b"NB10" and at + 16 <= end:
+        signature, age = struct.unpack_from("<II", data, at + 8)
+        return {"format": "NB10", "signature": f"{signature:08x}", "age": age,
+                "pdb": _cstring(data, at + 16, min(PDB_NAME_LIMIT, end - at - 16))}
+    return {"format": sig.decode("ascii", "replace") if sig else "truncated"}
+
+
+def _debug_entries(img: PeImage) -> list[dict]:
+    """Every IMAGE_DEBUG_DIRECTORY entry. The directory's size is a whole number of 28-byte entries; a CodeView
+    entry's data is read from its file pointer (the linker always writes one), else from its RVA."""
+    rva, size = img.directory(DIR_DEBUG)
+    if not rva or size < DEBUG_ENTRY_SIZE:
+        return []
+    at = img.offset(rva)
+    if at is None:
+        return []
+    entries = []
+    for i in range(min(size // DEBUG_ENTRY_SIZE, MAX_ENTRIES)):
+        base = at + i * DEBUG_ENTRY_SIZE
+        if base + DEBUG_ENTRY_SIZE > len(img.data):
+            break
+        (_chars, stamp, major, minor, kind, data_size, data_rva,
+         data_ptr) = struct.unpack_from("<IIHHIIII", img.data, base)
+        entry = {"type": DEBUG_TYPES.get(kind, kind), "timestamp": stamp, "version": f"{major}.{minor}",
+                 "size": data_size}
+        if kind == DEBUG_TYPE_CODEVIEW:
+            where = data_ptr if data_ptr and data_ptr < len(img.data) else (img.offset(data_rva) if data_rva else None)
+            entry["codeview"] = _codeview(img.data, where, data_size) if where is not None else {"format": "missing"}
+        entries.append(entry)
+    return entries
+
+
+def rsds(report: dict) -> dict | None:
+    """The image's first CodeView RSDS record, the one a debugger matches a PDB against."""
+    for entry in report.get("debug", []):
+        cv = entry.get("codeview")
+        if cv and cv.get("format") == "RSDS":
+            return cv
+    return None
+
+
+class PdbFormatError(ValueError):
+    """The file is not an MSF 7.0 PDB this reader can read."""
+
+
+MSF7_MAGIC = b"Microsoft C/C++ MSF 7.00\r\n\x1aDS\0\0\0"
+MSF_BLOCK_SIZES = (512, 1024, 2048, 4096)
+PDB_INFO_STREAM = 1
+PDB_DBI_STREAM = 3
+NIL_STREAM = 0xFFFFFFFF
+
+
+def read_pdb_identity(data: bytes) -> dict:
+    """GUID and ages of an MSF 7.0 PDB. The superblock gives the block size and the block that lists the stream
+    directory's blocks; the directory gives each stream's size and blocks. The PDB info stream (1) holds version,
+    signature, age and GUID; the DBI stream (3) holds the age DbgHelp matches against an image's RSDS age, which can
+    differ from the info stream's after an incremental link."""
+    if len(data) < 0x38 or data[:len(MSF7_MAGIC)] != MSF7_MAGIC:
+        raise PdbFormatError("no MSF 7.0 superblock (an older PDB 2.0 file, or not a PDB)")
+    block, _free_map, blocks, dir_bytes, _unknown, map_block = struct.unpack_from("<IIIIII", data, 0x20)
+    if block not in MSF_BLOCK_SIZES:
+        raise PdbFormatError(f"block size {block} is not one of {MSF_BLOCK_SIZES}")
+
+    def block_bytes(index: int) -> bytes:
+        start = index * block
+        if index >= blocks or start + block > len(data):
+            raise PdbFormatError(f"block {index} is past the end of the file")
+        return data[start:start + block]
+
+    def gather(indices, length: int) -> bytes:
+        return b"".join(block_bytes(i) for i in indices)[:length]
+
+    dir_blocks = -(-dir_bytes // block)
+    if dir_blocks * 4 > block:
+        raise PdbFormatError("the stream directory needs more blocks than one block map holds")
+    directory = gather(struct.unpack_from(f"<{dir_blocks}I", block_bytes(map_block)), dir_bytes)
+    if len(directory) < 4:
+        raise PdbFormatError("stream directory is empty")
+    count = struct.unpack_from("<I", directory, 0)[0]
+    if 4 + 4 * count > len(directory):
+        raise PdbFormatError("stream directory is cut short")
+    sizes = struct.unpack_from(f"<{count}I", directory, 4)
+    streams, pos = [], 4 + 4 * count
+    for size in sizes:
+        n = 0 if size == NIL_STREAM else -(-size // block)
+        if pos + 4 * n > len(directory):
+            raise PdbFormatError("stream directory is cut short")
+        streams.append((0 if size == NIL_STREAM else size, struct.unpack_from(f"<{n}I", directory, pos)))
+        pos += 4 * n
+
+    def stream(i: int) -> bytes:
+        size, indices = streams[i]
+        return gather(indices, size)
+
+    if count <= PDB_INFO_STREAM:
+        raise PdbFormatError("no PDB info stream")
+    info = stream(PDB_INFO_STREAM)
+    if len(info) < 28:
+        raise PdbFormatError("PDB info stream is shorter than its 28-byte header")
+    version, signature, age = struct.unpack_from("<III", info, 0)
+    out = {"version": version, "signature": f"{signature:08x}", "info_age": age,
+           "guid": str(uuid.UUID(bytes_le=bytes(info[12:28]))), "dbi_age": None}
+    if count > PDB_DBI_STREAM:
+        dbi = stream(PDB_DBI_STREAM)
+        if len(dbi) >= 12:
+            out["dbi_age"] = struct.unpack_from("<I", dbi, 8)[0]
+    return out
+
+
+def match_pdb(record: dict | None, pdb: dict) -> dict:
+    """Whether a PDB is the one an RSDS record names: the same GUID and the same age (the DBI stream's age when the
+    PDB has one, as DbgHelp compares it; the info stream's otherwise)."""
+    age = pdb["dbi_age"] if pdb["dbi_age"] is not None else pdb["info_age"]
+    if record is None:
+        return {"match": False, "reason": "the image has no CodeView RSDS record", "pdb": pdb}
+    guid_match = record["guid"] == pdb["guid"]
+    age_match = record["age"] == age
+    reason = "match" if guid_match and age_match else (
+        "GUID differs: another link" if not guid_match else f"age differs: image {record['age']}, PDB {age}")
+    return {"match": guid_match and age_match, "guid_match": guid_match, "age_match": age_match,
+            "age_from": "dbi" if pdb["dbi_age"] is not None else "info", "reason": reason,
+            "image": {"guid": record["guid"], "age": record["age"]}, "pdb": pdb}
+
+
 _apiset_cache: dict[str, bool] = {}
 
 
@@ -364,6 +518,7 @@ def _inspect(path: str, game_dir: str | None) -> dict:
         "exports": exports,
         "pdata_functions": pdata_size // 12 if pdata_rva and pdata_size >= 12 else 0,
         "tls_callbacks": _tls_callbacks(img),
+        "debug": _debug_entries(img),
     }
 
 
@@ -378,6 +533,22 @@ def to_markdown(r: dict) -> str:
     for s in r["sections"]:
         flag = "**encrypted?**" if s["looks_encrypted"] else ""
         out.append(f"| {s['name']} | {s['rva']:#x} | {s['vsize']:,} | {s['exec']} | {s['write']} | {s['entropy']} | {flag} |")
+    out += ["", "## Debug directory", ""]
+    if not r.get("debug"):
+        out.append("none")
+    else:
+        out += ["| type | version | size | details |", "|---|---|---|---|"]
+        for d in r["debug"]:
+            cv = d.get("codeview")
+            if cv and cv.get("format") == "RSDS":
+                detail = f"RSDS {cv['guid']} age {cv['age']} `{cv['pdb']}`"
+            elif cv and cv.get("format") == "NB10":
+                detail = f"NB10 {cv['signature']} age {cv['age']} `{cv['pdb']}`"
+            elif cv:
+                detail = f"CodeView `{cv['format']}` (not read)"
+            else:
+                detail = ""
+            out.append(f"| {d['type']} | {d['version']} | {d['size']:,} | {detail} |")
     out += ["", "## Imports", ""]
     by_where = Counter()
     for imp in r["imports"]:
@@ -407,12 +578,40 @@ def same_output_path(first: str, second: str) -> bool:
         return False
 
 
+def check_pdb(images: list[str], pdb_path: str) -> int:
+    """--pdb: compare one image's RSDS record with a PDB. Writes no report files."""
+    if len(images) != 1:
+        print("--pdb takes exactly one image", file=sys.stderr)
+        return 2
+    try:
+        report = inspect(images[0], None)
+    except (PeFormatError, OSError) as e:
+        print(f"{images[0]}: not a PE image ({e})", file=sys.stderr)
+        return 1
+    try:
+        with open(pdb_path, "rb") as f:
+            pdb = read_pdb_identity(f.read())
+    except struct.error as e:
+        print(f"{pdb_path}: not a readable PDB (truncated or corrupt table: {e})", file=sys.stderr)
+        return 1
+    except (PdbFormatError, OSError) as e:
+        print(f"{pdb_path}: not a readable PDB ({e})", file=sys.stderr)
+        return 1
+    result = match_pdb(rsds(report), pdb)
+    print(json.dumps({"image_file": report["file"], "pdb_file": os.path.basename(pdb_path), **result}, indent=1))
+    return 0 if result["match"] else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("image", nargs="+")
     ap.add_argument("--game-dir")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "..", "reports", "pe"))
+    ap.add_argument("--pdb", help="check that this PDB is the one the image's RSDS record names (one image only); "
+                                  "prints the result as JSON and exits 0 on a match, 1 otherwise")
     a = ap.parse_args(argv)
+    if a.pdb:
+        return check_pdb(a.image, a.pdb)
     if os.path.isfile(a.out):
         print(f"cannot create output directory {a.out}: path is a file, not a directory", file=sys.stderr)
         return 1

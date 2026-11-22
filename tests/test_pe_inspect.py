@@ -674,5 +674,209 @@ class DeclaredOptionalHeaderSizeTest(unittest.TestCase):
                 ):
                     pe_inspect.PeImage(bytes(data))
 
+DEBUG_DIR = 0x1A40   # free space in build_image's section, after the relocation block
+CV_DATA = 0x1A80
+GUID = "6b29fc40-ca47-1067-b31d-00dd010662da"
+PDB_NAME = r"D:\build\sample.pdb"
+
+
+def with_debug(age: int = 3, guid: str = GUID, cv: bytes | None = None, use_pointer: bool = True,
+               dir_size: int | None = None, is64: bool = True) -> bytes:
+    """build_image() with a debug directory: a CodeView entry (RSDS by default) and a POGO entry."""
+    import uuid
+    buf = bytearray(build_image(is64=is64))
+    if cv is None:
+        cv = b"RSDS" + uuid.UUID(guid).bytes_le + struct.pack("<I", age) + PDB_NAME.encode() + b"\0"
+    place(buf, CV_DATA, cv)
+    cv_ptr = TEXT_RAW + (CV_DATA - TEXT_RVA) if use_pointer else 0
+    place(buf, DEBUG_DIR, struct.pack("<IIHHIIII", 0, 0x5F000000, 0, 0, 2, len(cv), CV_DATA, cv_ptr)
+          + struct.pack("<IIHHIIII", 0, 0x5F000000, 0, 0, 13, 16, 0, 0))
+    dirs_at = OPT + (112 if is64 else 96)
+    struct.pack_into("<II", buf, dirs_at + pe_inspect.DIR_DEBUG * 8, DEBUG_DIR, 56 if dir_size is None else dir_size)
+    return bytes(buf)
+
+
+def build_pdb(guid: str = GUID, info_age: int = 3, dbi_age: int | None = 3, block: int = 512) -> bytes:
+    """A minimal MSF 7.0 PDB: superblock, two free-block maps, the block map, the stream directory, then the PDB
+    info stream (1) and, unless dbi_age is None, a DBI stream (3) whose header carries the age."""
+    import uuid
+    info = struct.pack("<III", 20000404, 0x5F000000, info_age) + uuid.UUID(guid).bytes_le
+    streams = [b"", info, None, b""]   # stream 2 is a nil stream (size 0xFFFFFFFF)
+    if dbi_age is not None:
+        streams[3] = struct.pack("<iII", -1, 19990903, dbi_age) + bytes(52)
+    blocks = [b"", b"", b"", None, None]   # 0 superblock, 1-2 free maps, 3 block map, 4 directory
+    directory = struct.pack("<I", len(streams))
+    lists = b""
+    for s in streams:
+        if s is None:
+            directory += struct.pack("<I", 0xFFFFFFFF)
+            continue
+        directory += struct.pack("<I", len(s))
+        for i in range(0, len(s), block):
+            lists += struct.pack("<I", len(blocks))
+            blocks.append(s[i:i + block])
+    directory += lists
+    blocks[4] = directory
+    blocks[3] = struct.pack("<I", 4)
+    superblock = (pe_inspect.MSF7_MAGIC + struct.pack("<IIIIII", block, 1, len(blocks), len(directory), 0, 3))
+    blocks[0] = superblock
+    return b"".join(b.ljust(block, b"\0") for b in blocks)
+
+
+class DebugDirectoryTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = self.tmp.name
+
+    def write(self, name: str, data: bytes) -> str:
+        path = os.path.join(self.dir, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    def report(self, data: bytes) -> dict:
+        return pe_inspect.inspect(self.write("dbg.dll", data), None)
+
+    def test_rsds_and_pogo_entries(self):
+        for is64 in (True, False):
+            with self.subTest(is64=is64):
+                debug = self.report(with_debug(is64=is64))["debug"]
+                self.assertEqual([d["type"] for d in debug], ["CODEVIEW", "POGO"])
+                self.assertEqual(debug[0]["codeview"], {"format": "RSDS", "guid": GUID, "age": 3, "pdb": PDB_NAME})
+                self.assertNotIn("codeview", debug[1])
+
+    def test_codeview_read_from_the_rva_when_there_is_no_file_pointer(self):
+        cv = self.report(with_debug(use_pointer=False))["debug"][0]["codeview"]
+        self.assertEqual((cv["guid"], cv["age"]), (GUID, 3))
+
+    def test_nb10_record(self):
+        cv = b"NB10" + struct.pack("<III", 0, 0x12345678, 7) + b"old.pdb\0"
+        self.assertEqual(self.report(with_debug(cv=cv))["debug"][0]["codeview"],
+                         {"format": "NB10", "signature": "12345678", "age": 7, "pdb": "old.pdb"})
+
+    def test_record_cut_short_is_not_read_past_its_declared_size(self):
+        cv = self.report(with_debug(cv=b"RSDS" + bytes(10)))["debug"][0]["codeview"]
+        self.assertEqual(cv, {"format": "RSDS"})
+        unterminated = b"RSDS" + bytes(20) + b"name-without-end"
+        cv = self.report(with_debug(cv=unterminated))["debug"][0]["codeview"]
+        self.assertIsNone(cv["pdb"])
+
+    def test_partial_trailing_entry_is_ignored(self):
+        debug = self.report(with_debug(dir_size=28 + 10))["debug"]
+        self.assertEqual([d["type"] for d in debug], ["CODEVIEW"])
+
+    def test_no_debug_directory(self):
+        self.assertEqual(self.report(build_image())["debug"], [])
+
+    def test_markdown_lists_the_debug_directory(self):
+        md = pe_inspect.to_markdown(self.report(with_debug()))
+        self.assertIn("## Debug directory", md)
+        self.assertIn(f"RSDS {GUID} age 3", md)
+        self.assertIn("| POGO |", md)
+
+    def test_every_cut_length_gives_a_report_or_a_pe_format_error(self):
+        full = with_debug()
+        for n in range(0, len(full), 16):
+            with self.subTest(length=n):
+                try:
+                    self.report(full[:n])
+                except pe_inspect.PeFormatError:
+                    pass
+
+
+class PdbMatchTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = self.tmp.name
+        self.image = os.path.join(self.dir, "dbg.dll")
+        with open(self.image, "wb") as f:
+            f.write(with_debug(age=3))
+
+    def check(self, pdb: bytes, image: str | None = None) -> tuple[int, dict | None, str]:
+        path = os.path.join(self.dir, "dbg.pdb")
+        with open(path, "wb") as f:
+            f.write(pdb)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = pe_inspect.main([image or self.image, "--pdb", path])
+        return rc, (json.loads(out.getvalue()) if out.getvalue() else None), err.getvalue()
+
+    def test_identity_read_from_the_streams(self):
+        pdb = pe_inspect.read_pdb_identity(build_pdb(info_age=5, dbi_age=3))
+        self.assertEqual((pdb["guid"], pdb["info_age"], pdb["dbi_age"]), (GUID, 5, 3))
+
+    def test_streams_spanning_several_blocks(self):
+        pdb = pe_inspect.read_pdb_identity(build_pdb(block=512, dbi_age=9))
+        self.assertEqual(pdb["dbi_age"], 9)
+        big = pe_inspect.read_pdb_identity(build_pdb(block=4096))
+        self.assertEqual(big["guid"], GUID)
+
+    def test_match(self):
+        rc, result, _ = self.check(build_pdb())
+        self.assertEqual(rc, 0)
+        self.assertTrue(result["match"])
+        self.assertEqual(result["age_from"], "dbi")
+        self.assertEqual((result["image_file"], result["pdb_file"]), ("dbg.dll", "dbg.pdb"))
+        self.assertEqual(result["image"], {"guid": GUID, "age": 3})
+
+    def test_the_dbi_age_is_the_one_compared(self):
+        # after an incremental link the info stream's age can run ahead of the DBI stream's
+        rc, result, _ = self.check(build_pdb(info_age=4, dbi_age=3))
+        self.assertEqual(rc, 0)
+        rc, result, _ = self.check(build_pdb(info_age=3, dbi_age=4))
+        self.assertEqual((rc, result["age_match"]), (1, False))
+
+    def test_info_age_used_without_a_dbi_stream(self):
+        rc, result, _ = self.check(build_pdb(info_age=3, dbi_age=None))
+        self.assertEqual((rc, result["age_from"]), (0, "info"))
+
+    def test_guid_mismatch(self):
+        rc, result, _ = self.check(build_pdb(guid="00000000-0000-0000-0000-000000000001"))
+        self.assertEqual(rc, 1)
+        self.assertFalse(result["guid_match"])
+        self.assertIn("GUID differs", result["reason"])
+
+    def test_age_mismatch(self):
+        rc, result, _ = self.check(build_pdb(info_age=4, dbi_age=4))
+        self.assertEqual((rc, result["guid_match"], result["age_match"]), (1, True, False))
+        self.assertIn("age differs: image 3, PDB 4", result["reason"])
+
+    def test_image_without_rsds(self):
+        bare = os.path.join(self.dir, "bare.dll")
+        with open(bare, "wb") as f:
+            f.write(build_image())
+        rc, result, _ = self.check(build_pdb(), image=bare)
+        self.assertEqual(rc, 1)
+        self.assertIn("no CodeView RSDS", result["reason"])
+
+    def test_malformed_pdbs_are_reported_not_raised(self):
+        good = build_pdb()
+        cases = {
+            "not a pdb": b"Microsoft C/C++ program database 2.00\r\n\x1aJG\0\0" + bytes(64),
+            "bad block size": good[:0x20] + struct.pack("<I", 1000) + good[0x24:],
+            "directory past the end": good[:3 * 512 + 4],
+            "streams past the end": good[:5 * 512 + 10],
+        }
+        for what, data in cases.items():
+            with self.subTest(case=what):
+                rc, result, err = self.check(data)
+                self.assertEqual(rc, 1)
+                self.assertIsNone(result)
+                self.assertIn("not a readable PDB", err)
+        for n in range(0, len(good), 64):
+            with self.subTest(length=n):
+                rc, _result, err = self.check(good[:n])
+                self.assertEqual(rc, 1)
+                self.assertIn("not a readable PDB", err)
+
+    def test_pdb_takes_one_image(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(pe_inspect.main([self.image, self.image, "--pdb", "x.pdb"]), 2)
+        self.assertIn("exactly one image", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

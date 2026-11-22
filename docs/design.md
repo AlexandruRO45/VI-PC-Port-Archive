@@ -26,7 +26,8 @@ translated, most of the game's code can run as-is. The work is everything around
 
 ```
 tools/       Python analysis tools (no game data inside)
-  pe_inspect.py   PE headers, sections, entropy, imports sorted by where they resolve, .pdata, TLS
+  pe_inspect.py   PE headers, sections, entropy, imports sorted by where they resolve, .pdata, TLS, debug
+                  directory (CodeView RSDS: PDB GUID, age, name); --pdb checks that a PDB matches the image
   rpf_probe.py    RPF header survey of a game folder
   manifest.py     SHA-256 manifest of a game folder, plus a --verify mode
 scripts/
