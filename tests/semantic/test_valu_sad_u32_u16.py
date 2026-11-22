@@ -666,5 +666,70 @@ class TestVSadU32U16RegisterAliasing(unittest.TestCase):
         interp.step(instr, state)
         self.assertEqual(state.vgprs[0], 0xCAFEBABE)
 
+# ==============================================================================
+# Condition Codes and Architectural Status Flags
+# ==============================================================================
+
+@dataclass(frozen=True)
+class StatusFlags:
+    """Architectural status flags and condition codes for VALU ALU operations."""
+    zero: bool
+    sign: bool
+    carry: bool
+    overflow: bool
+
+
+def compute_flags(
+    s0: int,
+    s1: int,
+    s2: int,
+    op_sel0: bool = False,
+    op_sel1: bool = False,
+    clamp: bool = False,
+) -> StatusFlags:
+    """Evaluate condition codes and status flags resulting from v_sad_u32_u16 execution."""
+    dst, carry, _ = ref_sad_u32_u16_full(s0, s1, s2, op_sel0=op_sel0, op_sel1=op_sel1, clamp=clamp)
+    u0 = ref_extract_u16(s0, op_sel0)
+    u1 = ref_extract_u16(s1, op_sel1)
+    diff = ref_abs_diff_u16(u0, u1)
+    acc = s2 & MASK32
+
+    zero = (dst == 0)
+    sign = bool(dst & 0x8000_0000)
+    overflow = bool((~(diff ^ acc) & (diff ^ dst)) & 0x8000_0000)
+
+    return StatusFlags(zero=zero, sign=sign, carry=bool(carry), overflow=overflow)
+
+
+class TestVSadU32U16ConditionCodesAndFlags(unittest.TestCase):
+    """Test suite verifying condition codes, status flags, and carry generation."""
+
+    def test_flags_zero_result(self) -> None:
+        """Zero flag asserted when dst evaluates to 0x00000000."""
+        flags = compute_flags(0x1234, 0x1234, 0)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.sign)
+        self.assertFalse(flags.carry)
+
+        # diff=1, acc=0xFFFFFFFF -> sum=0x1_00000000 -> dst=0
+        flags_wrap = compute_flags(1, 0, 0xFFFF_FFFF)
+        self.assertTrue(flags_wrap.zero)
+        self.assertFalse(flags_wrap.sign)
+        self.assertTrue(flags_wrap.carry)
+
+    def test_flags_sign_bit_set(self) -> None:
+        """Sign flag asserted when dst MSB (bit 31) is set."""
+        flags = compute_flags(0, 0, 0x8000_0000)
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.sign)
+        self.assertFalse(flags.carry)
+
+    def test_flags_carry_out_generated(self) -> None:
+        """Carry flag asserted when full 64-bit sum overflows 32 bits."""
+        # max diff 65535 (0xFFFF); acc = 0xFFFF_0001
+        # 0xFFFF + 0xFFFF0001 = 0x1_00000000 -> carry = 1
+        flags = compute_flags(0xFFFF, 0x0000, 0xFFFF_0001)
+        self.assertTrue(flags.carry)
+
 if __name__ == "__main__":
     unittest.main()
