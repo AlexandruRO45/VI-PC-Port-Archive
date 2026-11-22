@@ -54,12 +54,12 @@ def export_bank(path: str, out_dir: str, min_seconds: float, max_seconds: float,
     if bank is None:
         bank = os.path.splitext(os.path.basename(path))[0]
     od = os.path.join(out_dir, bank)
-    os.makedirs(od, exist_ok=True)
     _streams, music = awc.parse_awc(d)
     rows = []
     for mus, data in music:
         for cid, frames, rate, packets, channel_count, duration in short_channels(
                 d, mus, data, min_seconds, max_seconds):
+            os.makedirs(od, exist_ok=True)
             op = os.path.join(od, f"{cid:08X}.ogg")
             awc.write_ogg_opus(op, packets, channel_count, cid, frames * 48000 // rate)
             rows.append({
@@ -74,9 +74,12 @@ def export_bank(path: str, out_dir: str, min_seconds: float, max_seconds: float,
 
 
 def _banks(src: str):
+    def scan_failed(error: OSError) -> None:
+        raise error
+
     if os.path.isdir(src):
         found = []
-        for root, _dirs, files in os.walk(src):
+        for root, _dirs, files in os.walk(src, onerror=scan_failed):
             found += [os.path.join(root, name) for name in files if name.lower().endswith(".awc")]
         return [(path, os.path.splitext(os.path.relpath(path, src))[0].replace(os.sep, "/"))
                 for path in sorted(found)]
@@ -100,7 +103,11 @@ def main(argv=None) -> int:
     if not os.path.exists(a.src):
         print(f"awc_shorts: error: source does not exist: {a.src!r}", file=sys.stderr)
         return 2
-    banks = _banks(a.src)
+    try:
+        banks = _banks(a.src)
+    except OSError as e:
+        print(f"awc_shorts: cannot scan {a.src}: {e}", file=sys.stderr)
+        return 1
     try:
         os.makedirs(a.out, exist_ok=True)
     except OSError as e:

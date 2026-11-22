@@ -217,6 +217,33 @@ class ShortsTest(unittest.TestCase):
         with open(os.path.join(self.out, "shorts.csv"), encoding="utf-8") as f:
             rows = list(csv.DictReader(f))
         self.assertEqual([(r["bank"], r["stream"]) for r in rows], [("good", "00001234")])
+        self.assertEqual(sorted(os.listdir(self.out)), ["good", "shorts.csv"])
+
+    def test_non_matching_bank_does_not_create_empty_folder(self):
+        path = self.write("mono.awc", 0x78, 480000)      # 10 s mono
+        self.assertEqual(shorts.export_bank(path, self.out, 4, 6), [])
+        self.assertFalse(os.path.exists(os.path.join(self.out, "mono")))
+
+    def test_unreadable_subdirectory_fails_and_preserves_catalog(self):
+        os.makedirs(self.out, exist_ok=True)
+        index = os.path.join(self.out, "shorts.csv")
+        with open(index, "wb") as f:
+            f.write(b"previous catalog\n")
+
+        def walk_err(top, *args, onerror=None, **kwargs):
+            if onerror is not None:
+                onerror(PermissionError(13, "Permission denied", os.path.join(top, "locked")))
+            return
+            yield  # pragma: no cover
+
+        with mock.patch.object(shorts.os, "walk", side_effect=walk_err), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(shorts.main([self.tmp.name, self.out, "--jobs", "1"]), 1)
+        self.assertIn("Permission denied", err.getvalue())
+        with open(index, "rb") as f:
+            self.assertEqual(f.read(), b"previous catalog\n")
+
 
     def test_truncated_bank_skipped_serial(self):
         self.check_truncated_bank_skipped(shorts, 1)
