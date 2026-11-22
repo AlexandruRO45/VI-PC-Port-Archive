@@ -75,6 +75,20 @@ The six unique Xbox-specific imports (eight consumer/import pairs) are exactly t
 The video path (`Bink2Scarlett.dll`), the BVH builder and the FidelityFX upscaler therefore all go through the
 two shim DLLs that already exist. `libHttpClient.GDK.dll` and `XCurl.dll` import only desktop APIs.
 
+## Console allocation flags
+
+Mapped `kernel32.dll` and `kernelbase.dll` imports of `VirtualAlloc`, and `xmem.dll!XMemVirtualAlloc`, accept the
+console allocation tags `MEM_GRAPHICS` (`0x10000000`), `MEM_TITLE` (`0x40000000`), and the protection tag
+`0x04000000`. Stock Win32 `VirtualAlloc` rejects those tags. The shim drops them before allocating host memory and
+keeps the ordinary Win32 protection bits. Where a mapped `VirtualAlloc` call also carries a console-only tag,
+guest page modes use the same rules as `XMemVirtualAlloc`: 64 KiB requests are rounded to guest pages and the
+unsupported 2 MiB mode fails explicitly. Untagged `VirtualAlloc` calls retain Win32's interpretation of those bits.
+
+This is host-backed allocation. `MEM_GRAPHICS` does not reserve from a Vulkan or D3D12 allocation arena. The flag
+values and Win32 rejection were [reported in the RT-217 finding](https://github.com/ItsNotRexed/Leonida/issues/3232#issuecomment-7085092261).
+`xmem_test` verifies the shim registrations, committed memory, protection, size and release. `run_tiny_game_alloc`
+checks the same import path from a synthetic mapped executable.
+
 ## Console paths and the write overlay
 
 A title's file calls name the console's drives, so `GAME:\data\x.sps` is a file inside the installed game folder.
