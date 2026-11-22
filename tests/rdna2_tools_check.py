@@ -14,7 +14,7 @@ import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from disasm_rdna2 import disasm_rdna2, decode_instruction, disassemble_binary
-from extract_shaders import extract_shaders, extract_native_rdna2_code
+from extract_shaders import extract_shaders, extract_native_rdna2_code, sanitize_filename
 from pixel_aot import native_program
 from scan_unsupported_shaders import (
     analyze_shader_instructions,
@@ -127,7 +127,22 @@ class TestRdna2Disasm(unittest.TestCase):
             ("007d8080", "s_sub_u32", "s_sub_u32 s0, s0, null"),
             ("006c8080", "s_sub_u32", "s_sub_u32 s0, s0, ttmp0"),
             # GFX10 / RDNA 2 opcode numbers, encodings as in LLVM's gfx10 MC tests
+            ("01020080", "s_add_u32", "s_add_u32 s0, s1, s2"),
+            ("01028080", "s_sub_u32", "s_sub_u32 s0, s1, s2"),
+            ("01020081", "s_add_i32", "s_add_i32 s0, s1, s2"),
+            ("01028081", "s_sub_i32", "s_sub_i32 s0, s1, s2"),
             ("01020083", "s_min_i32", "s_min_i32 s0, s1, s2"),
+            ("01028083", "s_min_u32", "s_min_u32 s0, s1, s2"),
+            ("01020084", "s_max_i32", "s_max_i32 s0, s1, s2"),
+            ("01028084", "s_max_u32", "s_max_u32 s0, s1, s2"),
+            ("01020085", "s_cselect_b32", "s_cselect_b32 s0, s1, s2"),
+            ("01020087", "s_and_b32", "s_and_b32 s0, s1, s2"),
+            ("01020088", "s_or_b32", "s_or_b32 s0, s1, s2"),
+            ("01020089", "s_xor_b32", "s_xor_b32 s0, s1, s2"),
+            ("0102008a", "s_andn2_b32", "s_andn2_b32 s0, s1, s2"),
+            ("0102008f", "s_lshl_b32", "s_lshl_b32 s0, s1, s2"),
+            ("01020090", "s_lshr_b32", "s_lshr_b32 s0, s1, s2"),
+            ("01020091", "s_ashr_i32", "s_ashr_i32 s0, s1, s2"),
             ("01020093", "s_mul_i32", "s_mul_i32 s0, s1, s2"),
             ("341281b1", "s_cmpk_eq_i32", "s_cmpk_eq_i32 s1, 0x1234"),
             # SOPC: [31:23] == 0b101111110. These encodings were previously
@@ -175,6 +190,9 @@ class TestRdna2Disasm(unittest.TestCase):
             # VOP2 mandatory literal FMA forms
             ("01070a5841312111", "v_fmamk_f32", "v_fmamk_f32 v5, v1, 0x11213141, v3"),
             ("01050a5a41312111", "v_fmaak_f32", "v_fmaak_f32 v5, v1, v2, 0x11213141"),
+            # Non-fused literal forms (encodings from LLVM 15 llvm-mc -mcpu=gfx1013 -show-encoding)
+            ("01070a4041312111", "v_madmk_f32", "v_madmk_f32 v5, v1, 0x11213141, v3"),
+            ("01050a4241312111", "v_madak_f32", "v_madak_f32 v5, v1, v2, 0x11213141"),
             # VINTRP: attr is [15:10], chan is [9:8]
             ("000004c8", "v_interp_p1_f32_e32", "v_interp_p1_f32_e32 v1, v0, attr0.x"),
             ("000108c8", "v_interp_p1_f32_e32", "v_interp_p1_f32_e32 v2, v0, attr0.y"),
@@ -1014,6 +1032,34 @@ class TestRdna2Extractor(unittest.TestCase):
             self.assertEqual((output_dir / "pixel" / "PS_CliTest.bin").read_bytes(), known_code)
             self.assertTrue((output_dir / "manifest.json").is_file())
 
+    def test_cli_limit_must_be_positive(self):
+        """A limit below one is rejected instead of extracting a record anyway."""
+        records = [envelope(bytes.fromhex("000080bf 000081bf"), b"PS_First"),
+                   envelope(bytes.fromhex("000382be 000081bf"), b"PS_Second")]
+        script = Path(__file__).resolve().parents[1] / "tools" / "extract_shaders.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            archive = tmp_path / "limit.rpf"
+            archive.write_bytes(b"RPF\0" + b"".join(records))
+            for limit in ("0", "-1"):
+                output_dir = tmp_path / f"limit_{limit}"
+                res = subprocess.run(
+                    [sys.executable, "-B", str(script), str(archive), "--output-dir", str(output_dir),
+                     "--stage", "pixel", "--limit", limit],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+                self.assertIn("--limit", res.stderr)
+                self.assertFalse(output_dir.exists(), "no output may be written for a rejected limit")
+            output_dir = tmp_path / "limit_1"
+            subprocess.run(
+                [sys.executable, "-B", str(script), str(archive), "--output-dir", str(output_dir),
+                 "--stage", "pixel", "--limit", "1"],
+                capture_output=True, text=True, check=True,
+            )
+            manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["total_extracted"], 1)
+
     def test_extracted_names_round_trip_length_prefixed_records(self) -> None:
         code = bytes.fromhex("000080bf 000081bf")
         names = (b"PS_A", b"PS_" + b"S" * 28, b"!" + b"A" * 32,
@@ -1155,6 +1201,33 @@ class TestRdna2Extractor(unittest.TestCase):
             self.assertEqual(len({p.casefold() for p in paths}), 4, f"Colliding output paths: {paths}")
             for entry, expected in zip(manifest["shaders"], codes):
                 self.assertEqual((out_path / entry["native_file"]).read_bytes(), expected)
+
+    def test_overlong_record_names_get_bounded_distinct_files(self):
+        """A record name near the one-byte length limit must not make the output name unwritable."""
+        codes = [bytes.fromhex("000080bf 000081bf"), bytes.fromhex("000382be 000081bf")]
+        names = [b"PS_" + b"a" * 250 + b"1", b"PS_" + b"a" * 250 + b"2"]
+        records = [envelope(code, name) for code, name in zip(codes, names)]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            archive = tmp_path / "long.rpf"
+            archive.write_bytes(b"RPF\0" + b"".join(records))
+
+            out_path, manifest_file = extract_shaders(archive, tmp_path / "extracted_long", target_stages={"pixel"})
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["total_extracted"], 2)
+            self.assertEqual([entry["name"] for entry in manifest["shaders"]],
+                             [name.decode("ascii") for name in names])
+            paths = [entry["native_file"] for entry in manifest["shaders"]]
+            self.assertEqual(len({p.casefold() for p in paths}), 2, f"Colliding output paths: {paths}")
+            for path in paths:
+                self.assertLessEqual(len(Path(path).name.encode("utf-8")), 160, path)
+            for path, expected in zip(paths, codes):
+                self.assertEqual((out_path / path).read_bytes(), expected)
+        # Truncation counts bytes and never splits a multi-byte character.
+        for name in ("é" * 200, "a€" * 100):
+            stem = sanitize_filename(name)
+            self.assertTrue(name.startswith(stem) and 0 < len(stem.encode("utf-8")) <= 128, stem)
 
     def test_empty_archive_produces_empty_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1684,8 +1757,16 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertFalse(is_instruction_supported("s_waitcnt_expcnt null, invalid"))
         self.assertFalse(is_instruction_supported("s_waitcnt expcnt(8)"))
         self.assertFalse(is_instruction_supported("s_waitcnt vmcnt(64)"))
-        self.assertFalse(is_instruction_supported("s_waitcnt vmcnt(7) lgkmcnt(0)"))
+        self.assertFalse(is_instruction_supported("s_waitcnt lgkmcnt(64)"))
+        self.assertTrue(is_instruction_supported("s_waitcnt vmcnt(7) lgkmcnt(0)"))
+        self.assertTrue(is_instruction_supported("s_waitcnt vmcnt(7) lgkmcnt(63)"))
+        self.assertTrue(is_instruction_supported("s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)"))
+        self.assertTrue(is_instruction_supported("s_waitcnt 0"))
+        self.assertTrue(is_instruction_supported("s_waitcnt 0x0"))
         self.assertFalse(is_instruction_supported("s_waitcnt foo"))
+        self.assertFalse(is_instruction_supported("s_waitcnt vmcnt(0) lgkmcnt(0) vmcnt(1)"))
+        self.assertFalse(is_instruction_supported("s_waitcnt lgkmcnt(0)lgkmcnt(1)"))
+        self.assertFalse(is_instruction_supported("s_waitcnt expcnt(0) expcnt(1)"))
 
     def test_gfx1013_waitcnt_expcnt_decode_and_lower(self):
         """Assemble/decode GFX1013 s_waitcnt_expcnt binary bytes and lower with pixel_aot."""
