@@ -199,6 +199,7 @@ class Gen:
         self.lconsts = {}              # 64-bit constants: value -> id
         self.uses_vote = False         # wave-uniform branches (OpGroupNonUniformAny)
         self.uses_ballot = False       # wave mask ballot (OpGroupNonUniformBallot)
+        self.uses_sg_size = False      # the SubgroupSize built-in (ds_swizzle in a pixel shader)
         self.uses_wave_bits = False    # a whole lane mask gathered from the wave (OpGroupNonUniformBitwiseOr)
         self.uses_quad = False         # s_wqm on a lane mask (OpGroupNonUniformQuadSwap)
         self.lane_masks = {}           # id(instruction) -> registers holding a lane mask there (lane_masks.py)
@@ -1314,7 +1315,30 @@ class Gen:
         else:
             raise Unsupported("ds_swizzle " + kind)
         v, r = self.src_u(a[1]), self.tmp()
-        self.g_shuffle(r, v, src)
+        if self.emulate:
+            self.g_shuffle(r, v, src)
+        else:
+            # A source lane that isn't running reads 0, as in ds_bpermute_b32: the missing lanes of a partial wave,
+            # and lanes 16-31 where a driver runs the stage narrower than the wave (#618). SPIR-V leaves a shuffle
+            # from such a lane undefined, so it is redirected to the calling lane and its result masked off.
+            # A pixel shader asks SubgroupSize instead of a ballot: the quad swizzles of a derivative read helper
+            # pixels, and whether a helper invocation counts in a ballot is the implementation's choice before
+            # SPIR-V 1.6, so a ballot could zero a neighbour the hardware reads. Its waves are never partial.
+            ex, safe_src, sh, mask = (self.tmp() for _ in range(4))
+            if self.stage == "ps":
+                size = self.tmp()
+                self.emit(f"{size} = OpLoad %uint %sg_size")
+                self.emit(f"{ex} = OpULessThan %bool {src} {size}")
+                self.uses_sg_size = True
+            else:
+                bal = self.tmp()
+                self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
+                self.emit(f"{ex} = OpGroupNonUniformBallotBitExtract %bool %c3 {bal} {src}")
+                self.uses_ballot = True
+            self.emit(f"{safe_src} = OpSelect %uint {ex} {src} {lane}")
+            self.emit(f"{sh} = OpGroupNonUniformShuffle %uint %c3 {v} {safe_src}")
+            self.emit(f"{mask} = OpSelect %uint {ex} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+            self.emit(f"{r} = OpBitwiseAnd %uint {sh} {mask}")
         self.dst(a[0], r)
 
     def buffer_load(self, op, a, mods):
@@ -10077,7 +10101,7 @@ def assemble(gen):
                  (["%simages"] if gen.uses_storage else []) + (["%images_1d"] if gen.uses_tex_1d else []) + \
                  (["%images_3d"] if gen.uses_tex_3d else []) + (["%simages3d"] if gen.uses_storage3d else [])
     if sg:
-        iface += ["%sg_lane"]
+        iface += ["%sg_lane"] + (["%sg_size"] if gen.uses_sg_size else [])
     if gen.writes_depth:
         iface += ["%out_depth"]
     if vs:
@@ -10318,6 +10342,8 @@ def assemble(gen):
         dec += ["OpDecorate %sg_lane BuiltIn SubgroupLocalInvocationId"]
         if gen.stage == "ps":
             dec += ["OpDecorate %sg_lane Flat"]
+        if gen.uses_sg_size:
+            dec += ["OpDecorate %sg_size BuiltIn SubgroupSize"] + (["OpDecorate %sg_size Flat"] if gen.stage == "ps" else [])
         gen.consts.setdefault(3, "%c3")
     if vs:
         gen.consts.setdefault(3, "%c3")              # the instance index goes to v3
@@ -10532,6 +10558,8 @@ def assemble(gen):
               for n, k in gen.inputs.items()]
     if sg:
         gvars += ["%sg_lane = OpVariable %_ptr_Input_uint Input"]
+        if gen.uses_sg_size:
+            gvars += ["%sg_size = OpVariable %_ptr_Input_uint Input"]
     if tex:
         gvars += ["%images = OpVariable %_ptr_UC_rt_img UniformConstant",
                   "%samplers = OpVariable %_ptr_UC_rt_smp UniformConstant",
