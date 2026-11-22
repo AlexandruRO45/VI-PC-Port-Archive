@@ -38,6 +38,7 @@ OpDecorate %lane BuiltIn SubgroupLocalInvocationId
 %false = OpConstantFalse %bool
 %c0 = OpConstant %uint 0
 %c1 = OpConstant %uint 1
+%c2 = OpConstant %uint 2
 %c3 = OpConstant %uint 3
 %c8 = OpConstant %uint 8
 %c16 = OpConstant %uint 16
@@ -158,6 +159,38 @@ OpStore %out %v
         got = outs(self.BODY, 32)
         for lane in range(32):
             self.assertEqual(got[lane], (expect[lane & 3], (lane & 3) + 1, 0xFFFFFFFF, lane))
+
+
+class QuadOps(unittest.TestCase):
+    """A quad is invocations 4n..4n+3: QuadSwap direction 0/1/2 reads lane ^ 1 / ^ 2 / ^ 3 (SPIR-V spec,
+    OpGroupNonUniformQuadSwap); QuadBroadcast reads lane 4n + index."""
+    BODY = """%h = OpGroupNonUniformQuadSwap %uint %c3 %l %c0
+%v_ = OpGroupNonUniformQuadSwap %uint %c3 %l %c1
+%d = OpGroupNonUniformQuadSwap %uint %c3 %l %c2
+%b = OpGroupNonUniformQuadBroadcast %uint %c3 %l %c3
+%v = OpCompositeConstruct %v4uint %h %v_ %d %b
+OpStore %out %v
+"""
+
+    def test_swap_and_broadcast(self):
+        for wave in (32, 64):
+            got = outs(self.BODY, wave)
+            for lane in range(wave):
+                self.assertEqual(got[lane], (lane ^ 1, lane ^ 2, lane ^ 3, lane | 3))
+
+    def test_swap_with_an_invocation_that_is_not_running_is_undefined(self):
+        body = """%lt = OpULessThan %bool %l %c3
+OpSelectionMerge %merge None
+OpBranchConditional %lt %then %merge
+%then = OpLabel
+%h = OpGroupNonUniformQuadSwap %uint %c3 %l %c2
+%v = OpCompositeConstruct %v4uint %h %c0 %c0 %c0
+OpStore %out %v
+OpBranch %merge
+%merge = OpLabel
+"""
+        with self.assertRaises(UnsupportedConstruct):   # lane 0 reads lane 3, which did not take the branch
+            outs(body, 32)
 
 
 class Kill(unittest.TestCase):

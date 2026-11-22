@@ -69,6 +69,41 @@ MASK_READ_W64 = {
     "s_ff1_i32_b32 of an SGPR mask's high word": [("mread", HALF, "ff1", "sgpr", "b32", "hi", None, [])],
 }
 
+# Whole-quad mode: s_wqm turns on every lane of a quad that has an active one, also lanes an enclosing if turned off.
+WQM_CASES = {
+    "s_wqm of exec after a compare": [("wqm", ("lt", "u32", 5, 0), "exec", "b32", "lo", None, [("probe", 5)])],
+    "s_wqm of vcc into exec + execz": [("wqm", ("eq", "u32", 6, 0), "vcc", "b32", "lo", "s_cbranch_execz",
+                                       [("probe", 5)])],
+    "s_wqm into an SGPR + scc1": [("wqm", ("eq", "u32", 70, 0), "scc", "b32", "lo", "s_cbranch_scc1", [("probe", 5)])],
+    "s_wqm inside an if": [("if", ("gt", "u32", 2, 1), False, [
+        ("wqm", ("eq", "u32", 9, 0), "vcc", "b32", "lo", None, [("probe", 5)])])],
+}
+
+
+@pytest.mark.parametrize("case", sorted(WQM_CASES))
+@pytest.mark.parametrize("wave", (32, 64))
+@pytest.mark.parametrize("structured", (True, False), ids=("structured", "dispatch-loop"))
+def test_whole_quad_mode(case, wave, structured):
+    body = WQM_CASES[case]
+    if wave == 64:      # the wave64 forms: s_wqm_b64 on the whole mask
+        body = [tuple("b64" if x == "b32" else x for x in n) if n[0] == "wqm" else
+                n[:-1] + ([tuple("b64" if x == "b32" else x for x in m) for m in n[-1]],) for n in body]
+    status, detail = cf_diff.run_case("ps_wqm", body, wave, structured)
+    assert status == "match", detail
+
+
+@pytest.mark.parametrize("structured", (True, False), ids=("structured", "dispatch-loop"))
+def test_whole_quad_mode_on_one_half(structured):
+    body = [("wqm", ("lt", "u32", 40, 0), "exec", "b32", "hi", "s_cbranch_scc0", [("probe", 5)])]
+    status, detail = cf_diff.run_case("ps_wqm", body, 64, structured)
+    assert status == "match", detail
+
+
+def test_whole_quad_mode_cases_catch_an_identity_wqm(monkeypatch):
+    """Before #156 SHADER-34 s_wqm was the identity; these cases see the difference."""
+    monkeypatch.setattr(rdna2spirv.Gen, "wqm", lambda self, op, a: self.dst(a[0], self.src_u(a[1])))
+    assert cf_diff.run_case("ps_wqm", WQM_CASES["s_wqm inside an if"], 32)[0] == "mismatch"
+
 
 @pytest.mark.parametrize("case", sorted(MASK_READ_CASES))
 @pytest.mark.parametrize("wave", (32, 64))
@@ -219,7 +254,7 @@ def test_generator_covers_every_shape():
     for i in range(200):
         walk(cf_diff.generate(random.Random(i), 32))
     assert {"if", "ifelse", "cmpx", "saveexec", "vccz", "sif", "sloop", "vloop", "irr", "sccmask", "csel", "probe",
-            "ifs", "cexec", "halfexec", "halfscc", "scmpmask", "cselmask", "vccloop", "cmpxloop", "mread", "waterfall"} <= kinds
+            "ifs", "cexec", "halfexec", "halfscc", "scmpmask", "cselmask", "vccloop", "cmpxloop", "mread", "waterfall", "wqm"} <= kinds
 
 
 @pytest.mark.parametrize("op_name", ("andn2", "orn2", "xor", "nand", "nor", "xnor"))

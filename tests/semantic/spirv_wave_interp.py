@@ -648,6 +648,22 @@ class _Wave:
                 idx = self.int_of(L[i], a[3])
                 L[i].values[res] = src_vals[idx] if idx in src_vals else \
                     _Poison(f"{op[17:]} from invocation {idx}, which is not running")
+        elif op in ("OpGroupNonUniformQuadSwap", "OpGroupNonUniformQuadBroadcast"):
+            # A quad is four consecutive invocations, 4n..4n+3. QuadSwap direction 0 / 1 / 2 (horizontal, vertical,
+            # diagonal) reads invocation i ^ 1 / i ^ 2 / i ^ 3; QuadBroadcast reads 4n + index.
+            src_vals = {i: self.raw(L[i], a[2]) for i in members}
+            for i in members:
+                k = self.int_of(L[i], a[3])
+                if op.endswith("Swap"):
+                    if k not in (0, 1, 2):
+                        raise UnsupportedConstruct(f"{op} direction {k}")
+                    j = i ^ (k + 1)
+                else:
+                    if k not in (0, 1, 2, 3):
+                        raise UnsupportedConstruct(f"{op} index {k}")
+                    j = (i & ~3) | k
+                L[i].values[res] = src_vals[j] if j in src_vals else \
+                    _Poison(f"{op[17:]} from invocation {j}, which is not running")
         elif op == "OpGroupNonUniformBroadcastFirst":
             first = self.raw(L[members[0]], a[2])
             for i in members:

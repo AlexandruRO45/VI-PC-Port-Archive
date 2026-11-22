@@ -925,5 +925,34 @@ class MaskReadTests(CfRefTestCase):
         self.assertEqual([sg[i] for i in range(6)], [23, 41, 0, MASK32, 23, 9])
 
 
+class WholeQuadModeTests(CfRefTestCase):
+    def test_wqm_widens_each_quad_and_sets_scc(self):
+        items = lane_id_prologue(64) + [
+            "v_cmp_eq_u32_e32 vcc, 5, v0",          # lane 5 only
+            "s_wqm_b64 s[0:1], vcc",                # lanes 4..7
+            "v_cmp_eq_u32_e32 vcc, 37, v0",         # lane 37: quad 36..39 in the high half
+            "s_wqm_b32 s2, vcc_hi",
+            "s_wqm_b32 s3, 0",
+            "s_cselect_b32 s4, 1, 2",               # SCC = 0 after a WQM of nothing
+            "s_endpgm",
+        ]
+        sg = self.run_items(items, wave=64)["sgpr"]
+        self.assertEqual((sg[0], sg[1], sg[2], sg[3], sg[4]), (0xF0, 0, 0xF0, 0, 2))
+
+    def test_wqm_of_exec_turns_on_the_rest_of_the_quad(self):
+        items = lane_id_prologue(32) + [
+            "v_mov_b32 v1, 0",
+            "v_cmp_eq_u32_e32 vcc_lo, 9, v0",
+            "s_and_b32 exec_lo, exec_lo, vcc_lo",   # lane 9
+            "s_wqm_b32 exec_lo, exec_lo",           # lanes 8..11
+            "v_mov_b32 v1, 1",
+            "s_mov_b32 exec_lo, -1",
+            "exp mrt0 v0, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        ex = self.run_items(items, wave=32)["exports"]
+        self.assertEqual([lane for lane in range(32) if ex[lane][1] == 1], [8, 9, 10, 11])
+
+
 if __name__ == "__main__":
     unittest.main()

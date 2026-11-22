@@ -227,6 +227,25 @@ class WaveMachine(cpu_ref.Machine):
             return None
         if base.startswith(("v_cmp_", "v_cmpx_")):
             return self._vcmp(ins, base)
+        if base in ("s_wqm_b32", "s_wqm_b64"):
+            # SOP1 whole-quad mode: each 4-bit group of D is all ones when any bit of that group of S0 is set;
+            # SCC = D != 0. A _b32 op reads and writes one 32-bit word (one half of the mask in wave64).
+            self._expect(ins, 2)
+            if base == "s_wqm_b64":
+                self._check_width(base, op)
+                x, width = self._read_mask(a[1]), self.wave
+            else:
+                x, width = self._int_src(a[1], 0, scalar=True) & MASK32, 32
+            r = 0
+            for q in range(0, width, 4):
+                if (x >> q) & 0xF:
+                    r |= 0xF << q
+            if base == "s_wqm_b64" or self._touches_mask(a):
+                self._write_mask(a[0], r)
+            else:
+                self._write_scalar_dst(a[0], r)
+            self.scc = 1 if r else 0
+            return None
         if base == "v_readfirstlane_b32":
             # sD = vS of the lowest lane on in EXEC, or of lane 0 when none is.
             self._expect(ins, 2)

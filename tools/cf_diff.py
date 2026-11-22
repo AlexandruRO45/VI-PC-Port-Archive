@@ -30,6 +30,9 @@ Shapes (each nests, up to --depth):
             uniform SGPR, added to every active lane [-> s_cmp on it -> s_cbranch_scc0/1 over a body]
   waterfall v_readfirstlane of a lane value -> v_cmp_eq -> s_and_saveexec -> body -> s_xor exec, back edge
             s_cbranch_execnz: one round per distinct value (the descriptor-per-group-of-lanes loop)
+  wqm       s_wqm of EXEC (after narrowing it to a compare) or of VCC into EXEC: every lane of a quad with an active
+            lane runs the body, even one an enclosing if had turned off [-> s_cbranch_execz]; EXEC restored with
+            s_mov; or s_wqm of a compare into an SGPR -> s_cbranch_scc0/1 (SCC = any quad on)
 (vloop also closes some loops with s_cbranch_scc1 on the SCC of its s_andn2 exec.)
 Bodies mix integer VALU and SALU ops with "probes": v11 = v11 * 33 + K at each site, so v11 records which sites
 each lane ran, in which order and how often. v8/v9 carry data, v10 the uniform SGPRs. Immediates stay in the
@@ -145,7 +148,13 @@ class Gen:
         kind = r.choice(("if", "if", "ifelse", "ifelse", "cmpx", "saveexec", "vccz", "sif", "sloop", "vloop",
                          "vloop", "irr", "sccmask", "csel", "ifs", "ifs", "cexec", "halfexec", "halfscc", "scmpmask",
                          "cselmask", "vccloop", "cmpxloop", "mread", "mread", "waterfall",
-                         "waterfall"))
+                         "waterfall", "wqm", "wqm"))
+        if kind == "wqm":
+            width = r.choice(("b64", "b32")) if self.wave == 64 else "b32"
+            return ("wqm", self.cmp(), r.choice(("exec", "vcc", "scc")), width,
+                    self.half() if width == "b32" else "lo", r.choice((None, "s_cbranch_execz", "s_cbranch_scc0",
+                                                                       "s_cbranch_scc1")),
+                    [self.probe()] + self.block(depth))
         if kind == "mread":
             width = r.choice(("b64", "b32")) if self.wave == 64 else "b32"
             branch = (r.choice(CCS), r.randrange(0, 66), r.choice(("s_cbranch_scc0", "s_cbranch_scc1"))) \
@@ -410,6 +419,38 @@ class Emitter:
                 self.nodes(body)
                 self.depth -= 1
                 self.place(end)
+        elif kind == "wqm":
+            _, c, src, width, half, mnemonic, body = n
+            save, end = self.sreg(80), self.label()
+            half_reg = width == "b32" and self.wave == 64
+            exm = f"exec_{half}" if half_reg else ex
+            vcm = f"vcc_{half}" if half_reg else self.vcc()
+            if src == "scc":
+                # WQM of a compare into an SGPR: SCC = some quad has a lane on; a uniform branch on it.
+                tmp = self.sreg(50)
+                tmp = f"s{50 + 2 * self.depth + (half == 'hi')}" if half_reg else tmp
+                self.vcmp(c)
+                self.ins(f"s_wqm_{width} {tmp}, {vcm}")
+                self.br(mnemonic if mnemonic and "scc" in mnemonic else "s_cbranch_scc0", end)
+                self.depth += 1
+                self.nodes(body)
+                self.depth -= 1
+                self.place(end)
+            else:
+                self.ins(f"s_mov_{w} {save}, {ex}")
+                self.vcmp(c)
+                if src == "exec":
+                    self.ins(f"s_and_{w} {ex}, {ex}, {self.vcc()}")
+                    self.ins(f"s_wqm_{width} {exm}, {exm}")
+                else:
+                    self.ins(f"s_wqm_{width} {exm}, {vcm}")
+                if mnemonic:
+                    self.br(mnemonic, end)
+                self.depth += 1
+                self.nodes(body)
+                self.depth -= 1
+                self.place(end)
+                self.ins(f"s_mov_{w} {ex}, {save}")
         elif kind == "waterfall":
             # Each round takes the first active lane's value, runs the body for every lane holding it and drops
             # those lanes; the loop ends when EXEC is empty, then EXEC is restored.
