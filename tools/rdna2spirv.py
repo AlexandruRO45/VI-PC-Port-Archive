@@ -6428,28 +6428,36 @@ class Gen:
 
             use_vote = (m0 and m1) or (m0 and _is_u64_zero_or_all_ones(a[1])) or (m1 and _is_u64_zero_or_all_ones(a[0]))
 
-            def halves(s, is_mask):
-                if is_mask and not use_vote:
-                    return self.wave_mask(s)
-                if s["k"] == "sgpr" and s.get("n") == 2:
-                    return self.load_reg("sgpr", s["r"]), self.load_reg("sgpr", s["r"] + 1)
-                if s["k"] == "imm":
-                    v = s["v"] & 0xFFFFFFFFFFFFFFFF
-                    return self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
-                m = self.mask_src(s)
-                return m, m
-
-            (x0, x1), (y0, y1) = halves(a[0], m0), halves(a[1], m1)
-            e0, e1, eq, r = (self.tmp() for _ in range(4))
-            self.emit(f"{e0} = OpIEqual %bool {x0} {y0}")
-            self.emit(f"{e1} = OpIEqual %bool {x1} {y1}")
-            self.emit(f"{eq} = OpLogicalAnd %bool {e0} {e1}")
             if use_vote:
+                # Each lane compares its own mask bit via mask_src (in wave64, a split SGPR pair selects s[r] for
+                # lanes 0..31 and s[r+1] for lanes 32..63 instead of comparing both raw dwords in every lane).
+                x = self.mask_src(a[0]) if m0 else self.cu(0)
+                y = self.mask_src(a[1]) if m1 else self.cu(0)
+                eq = self.tmp()
+                self.emit(f"{eq} = OpIEqual %bool {x} {y}")
                 eq = self.wave_equal(eq, True)
+            else:
+                def halves(s, is_mask):
+                    if is_mask:
+                        return self.wave_mask(s)
+                    if s["k"] == "sgpr" and s.get("n") == 2:
+                        return self.load_reg("sgpr", s["r"]), self.load_reg("sgpr", s["r"] + 1)
+                    if s["k"] == "imm":
+                        v = s["v"] & 0xFFFFFFFFFFFFFFFF
+                        return self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
+                    m = self.mask_src(s)
+                    return m, m
+
+                (x0, x1), (y0, y1) = halves(a[0], m0), halves(a[1], m1)
+                e0, e1, eq = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{e0} = OpIEqual %bool {x0} {y0}")
+                self.emit(f"{e1} = OpIEqual %bool {x1} {y1}")
+                self.emit(f"{eq} = OpLogicalAnd %bool {e0} {e1}")
             if op == "s_cmp_lg_u64":
                 ne = self.tmp()
                 self.emit(f"{ne} = OpLogicalNot %bool {eq}")
                 eq = ne
+            r = self.tmp()
             self.emit(f"{r} = OpSelect %uint {eq} {self.cu(1)} {self.cu(0)}")
             self.emit(f"OpStore %scc {r}")
         elif op.startswith("buffer_atomic_"):

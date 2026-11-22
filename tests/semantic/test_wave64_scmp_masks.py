@@ -823,5 +823,88 @@ class Wave64NegativeControlsTests(unittest.TestCase):
                 self.assertEqual(contradiction, 0)
 
 
+class Wave64SplitPairU64CompareTests(unittest.TestCase):
+    """Wave64 s_cmp_eq_u64 / s_cmp_lg_u64 on SGPR pairs whose lo/hi halves were written independently."""
+
+    def test_split_pair_vs_zero_exec_and_pair(self):
+        asm = (
+            WAVE64_BUILD_VCC_AND_SGPR
+            # Clear lo half of s[12:13] -> effective mask is (0, hi)
+            + "s_mov_b32 s12, 0\n"
+            + "s_cmp_eq_u64 s[12:13], 0\n" + emit_store_scc(0)
+            + "s_cmp_lg_u64 s[12:13], 0\n" + emit_store_scc(1)
+            # Clear hi half of a fresh copy s[14:15] -> effective mask is (lo, 0)
+            + "s_mov_b64 s[14:15], vcc\n"
+            + "s_mov_b32 s15, 0\n"
+            + "s_cmp_eq_u64 s[14:15], 0\n" + emit_store_scc(2)
+            + "s_cmp_lg_u64 s[14:15], 0\n" + emit_store_scc(3)
+            # Compare two split pairs: (0, hi) vs (lo, 0) -> equal iff lo == 0 and hi == 0
+            + "s_cmp_eq_u64 s[12:13], s[14:15]\n" + emit_store_scc(4)
+            + "s_cmp_lg_u64 s[12:13], s[14:15]\n" + emit_store_scc(5)
+            # Compare split pair (lo, 0) against exec narrowed to (lo, 0)
+            + "s_mov_b64 s[16:17], exec\n"
+            + "s_and_b64 exec, exec, s[14:15]\n"
+            + "s_cmp_eq_u64 s[14:15], exec\n"
+            + "s_cselect_b32 s24, 1, 0\n"
+            + "s_cmp_lg_u64 s[14:15], exec\n"
+            + "s_cselect_b32 s25, 1, 0\n"
+            + "s_mov_b64 exec, s[16:17]\n"
+            + "v_mov_b32_e32 v4, s24\nv_mov_b32_e32 v5, 24\nbuffer_store_dword v4, v5, s[0:3], 0 offen\n"
+            + "v_mov_b32_e32 v4, s25\nv_mov_b32_e32 v5, 28\nbuffer_store_dword v4, v5, s[0:3], 0 offen\n"
+            + "s_endpgm\n"
+        )
+        spv = translate_cs("cs_w64_split_u64", asm, threads=64)
+        self.assertIn("OpGroupNonUniformAll", spv)
+        self.assertNotIn("OpGroupNonUniformBitwiseOr", spv)
+        cases = [
+            (0xFFFFFFFF, 0x00000000),  # (0, 0) == 0, (lo, 0) != 0
+            (0x00000000, 0xFFFFFFFF),  # (0, hi) != 0, (0, 0) == 0
+            (0x00000000, 0x00000000),  # both 0
+            (0x0F0F00FF, 0x80000001),  # both non-zero
+            (0x00000001, 0x00000001),  # non-zero equal halves in opposite positions -> unequal pairs
+        ]
+        for lo, hi in cases:
+            with self.subTest(lo=hex(lo), hi=hex(hi)):
+                mem = run_cs(spv, 64, s4=lo, s5=hi)
+                eq_0_hi = int(hi == 0)
+                eq_lo_0 = int(lo == 0)
+                eq_pairs = int(lo == 0 and hi == 0)
+                want = [eq_0_hi, 1 - eq_0_hi, eq_lo_0, 1 - eq_lo_0, eq_pairs, 1 - eq_pairs, 1, 0]
+                self.assertEqual([mem[4 * k] for k in range(8)], want)
+
+    def test_split_pair_spirv_val_native_and_emulate(self):
+        import shutil
+        import subprocess
+        spirv_as = shutil.which("spirv-as")
+        spirv_val = shutil.which("spirv-val")
+        if not (spirv_as and spirv_val):
+            self.skipTest("spirv-as / spirv-val not on PATH")
+        asm = (
+            WAVE64_BUILD_VCC_AND_SGPR
+            + "s_mov_b32 s12, 0\n"
+            + "s_cmp_eq_u64 s[12:13], 0\n"
+            + "s_cmp_lg_u64 s[12:13], exec\n"
+            + "s_endpgm\n"
+        )
+        old_em = rdna2spirv.WAVE64_EMULATE
+        try:
+            for em in (False, True):
+                rdna2spirv.WAVE64_EMULATE = em
+                spv = translate_cs(f"cs_w64_split_val_{int(em)}", asm, threads=64)
+                with tempfile.TemporaryDirectory() as tmp:
+                    spvasm = os.path.join(tmp, "m.spvasm")
+                    spvbin = os.path.join(tmp, "m.spv")
+                    with open(spvasm, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(spv)
+                    r1 = subprocess.run([spirv_as, "--target-env", "vulkan1.2", spvasm, "-o", spvbin],
+                                        capture_output=True, text=True)
+                    self.assertEqual(r1.returncode, 0, r1.stderr)
+                    r2 = subprocess.run([spirv_val, "--target-env", "vulkan1.2", spvbin],
+                                        capture_output=True, text=True)
+                    self.assertEqual(r2.returncode, 0, r2.stderr)
+        finally:
+            rdna2spirv.WAVE64_EMULATE = old_em
+
+
 if __name__ == "__main__":
     unittest.main()
