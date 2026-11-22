@@ -35,6 +35,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 RSC8_MAGIC = b"RSC8"
 RSC8_VERSION = 8001
@@ -1457,7 +1458,7 @@ def scan_rpf(path, *, start=0, limit=None, max_banks=None, deep=True, collect_re
     return records, summary
 
 
-def scan_dir(path, *, max_banks=None, deep=True, collect_records=True):
+def scan_dir(path, *, max_banks=None, deep=True, collect_records=True, report_path=None):
     """Scan a directory of `.awc` banks and/or standalone `.rsc8` files."""
     t0 = time.time()
     summary = _new_summary("directory", path)
@@ -1472,6 +1473,11 @@ def scan_dir(path, *, max_banks=None, deep=True, collect_records=True):
                     continue
                 files.append(fp)
     files.sort()
+
+    if report_path and os.path.exists(report_path):
+        for fp in files:
+            if same_report_path(report_path, fp):
+                raise ValueError(f"output would overwrite a scanned input: {fp}")
 
     for fp in files:
         if max_banks is not None and summary["adat_banks"] >= max_banks:
@@ -1670,6 +1676,7 @@ def main(argv=None):
                 max_banks=args.max_banks,
                 deep=not args.no_deep,
                 collect_records=collect,
+                report_path=args.out,
             )
         except (OSError, ValueError) as e:
             print(f"{args.source}: {e}", file=sys.stderr)

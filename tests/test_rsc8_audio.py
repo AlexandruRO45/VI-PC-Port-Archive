@@ -657,6 +657,20 @@ class AwcAndArchiveScanTest(unittest.TestCase):
             self.assertEqual((w["rsc8_outside_adat"], w["window_starts_in_bank"]), (1, None))
             self.assertEqual((full["adat_banks_past_window"], full["window_starts_in_bank"]), (0, None))
 
+    def test_report_cannot_replace_a_bank_from_a_scanned_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bank = os.path.join(directory, "sample.awc")
+            clip = build_synthetic_rsc8(stream_hash=0x20112233, frames=90)
+            original = build_synthetic_awc([{"id": 0x00112233, "rsc8": clip, "samples": 48000}])
+            with open(bank, "wb") as f:
+                f.write(original)
+            result = subprocess.run([sys.executable, "-I", TOOL, directory, bank, "--quiet"],
+                                    capture_output=True, text=True, timeout=60)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("would overwrite", result.stderr)
+            with open(bank, "rb") as f:
+                self.assertEqual(f.read(), original)
+
     def test_cli_validation_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
             missing = os.path.join(tmp, "missing.rpf")
