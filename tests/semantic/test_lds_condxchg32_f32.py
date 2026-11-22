@@ -800,6 +800,180 @@ class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
                 self.assertEqual(lds.read_dword(lane), ONE_RAW)
                 self.assertNotIn(lane, returns)
 
+@dataclasses.dataclass
+class LDSStatusFlags:
+    """Architectural status flags, wrapping conditions, and bank metrics for LDS operations."""
+    carry_out: bool = False
+    unaligned_address: bool = False
+    oob_wrapped: bool = False
+    bank_conflicts: int = 0
+    address_collisions: int = 0
+    exchange_occurred: bool = False
+    exchange_failed: bool = False
+    result_is_zero: bool = False
+    result_has_sign_bit: bool = False
+
+
+def evaluate_status_flags(
+    wave: SIMDWaveState,
+    inst: DSCondXchg32F32Instruction,
+) -> LDSStatusFlags:
+    """Evaluate architectural flags, address wrap conditions, bank conflicts, and ALU status."""
+    flags = LDSStatusFlags()
+    active_lanes = [l for l in range(wave.wave_size) if wave.is_lane_active(l)]
+
+    bank_to_dwords: Dict[int, Set[int]] = {}
+    dword_to_lanes: Dict[int, List[int]] = {}
+
+    for lane in active_lanes:
+        addr = wave.get_vgpr(lane, inst.vaddr)
+        off = inst.offset.value
+        cmp_val = wave.get_vgpr(lane, inst.vdata0)
+        new_val = wave.get_vgpr(lane, inst.vdata1)
+
+        if (addr + off) > MASK32:
+            flags.carry_out = True
+
+        effective_byte = (addr + off) & MASK32
+        if (effective_byte & 3) != 0:
+            flags.unaligned_address = True
+
+        if effective_byte >= wave.lds.size_bytes:
+            flags.oob_wrapped = True
+
+        dword_idx = wave.lds.get_dword_index(addr, off)
+        bank_idx = wave.lds.get_bank(dword_idx)
+
+        bank_to_dwords.setdefault(bank_idx, set()).add(dword_idx)
+        dword_to_lanes.setdefault(dword_idx, []).append(lane)
+
+        old_val = wave.lds.read_dword(dword_idx)
+        _, new_mem, swapped = oracle_condxchg32_f32(old_val, cmp_val, new_val)
+        if swapped:
+            flags.exchange_occurred = True
+        else:
+            flags.exchange_failed = True
+
+        if (new_mem & 0x7FFFFFFF) == 0:
+            flags.result_is_zero = True
+        if bool(new_mem & 0x80000000):
+            flags.result_has_sign_bit = True
+
+    for bank, dword_set in bank_to_dwords.items():
+        if len(dword_set) > 1:
+            flags.bank_conflicts += (len(dword_set) - 1)
+
+    for dword, lanes in dword_to_lanes.items():
+        if len(lanes) > 1:
+            flags.address_collisions += (len(lanes) - 1)
+
+    return flags
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def test_address_carry_out_generation(self) -> None:
+        wave = SIMDWaveState(wave_size=32, exec_mask=0x1)
+        wave.set_vgpr(0, VGPR(1), 0xFFFFFFFF)
+        wave.set_vgpr(0, VGPR(2), ONE_RAW)
+        wave.set_vgpr(0, VGPR(3), TWO_RAW)
+
+        inst = DSCondXchg32F32Instruction(
+            DSOpcode.DS_CONDXCHG32_F32,
+            vaddr=VGPR(1),
+            vdata0=VGPR(2),
+            vdata1=VGPR(3),
+            offset=OffsetImmediate(16),
+        )
+        flags = evaluate_status_flags(wave, inst)
+        self.assertTrue(flags.carry_out)
+
+    def test_unaligned_byte_address_detection(self) -> None:
+        wave = SIMDWaveState(wave_size=32, exec_mask=0x1)
+        wave.set_vgpr(0, VGPR(1), 7)
+        wave.set_vgpr(0, VGPR(2), ONE_RAW)
+        wave.set_vgpr(0, VGPR(3), TWO_RAW)
+
+        inst = DSCondXchg32F32Instruction(
+            DSOpcode.DS_CONDXCHG32_F32,
+            vaddr=VGPR(1),
+            vdata0=VGPR(2),
+            vdata1=VGPR(3),
+        )
+        flags = evaluate_status_flags(wave, inst)
+        self.assertTrue(flags.unaligned_address)
+
+    def test_oob_address_wrapping_detection(self) -> None:
+        wave = SIMDWaveState(wave_size=32, exec_mask=0x1)
+        wave.set_vgpr(0, VGPR(1), 70000)
+        wave.set_vgpr(0, VGPR(2), ONE_RAW)
+        wave.set_vgpr(0, VGPR(3), TWO_RAW)
+
+        inst = DSCondXchg32F32Instruction(
+            DSOpcode.DS_CONDXCHG32_F32,
+            vaddr=VGPR(1),
+            vdata0=VGPR(2),
+            vdata1=VGPR(3),
+        )
+        flags = evaluate_status_flags(wave, inst)
+        self.assertTrue(flags.oob_wrapped)
+
+    def test_bank_conflicts_detection(self) -> None:
+        wave = SIMDWaveState(wave_size=32, exec_mask=0x7)
+        wave.set_vgpr(0, VGPR(1), 0 * 4)   # bank 0, dword 0
+        wave.set_vgpr(1, VGPR(1), 32 * 4)  # bank 0, dword 32
+        wave.set_vgpr(2, VGPR(1), 64 * 4)  # bank 0, dword 64
+
+        inst = DSCondXchg32F32Instruction(
+            DSOpcode.DS_CONDXCHG32_F32,
+            vaddr=VGPR(1),
+            vdata0=VGPR(2),
+            vdata1=VGPR(3),
+        )
+        flags = evaluate_status_flags(wave, inst)
+        self.assertEqual(flags.bank_conflicts, 2)
+        self.assertEqual(flags.address_collisions, 0)
+
+    def test_address_collisions_detection(self) -> None:
+        wave = SIMDWaveState(wave_size=32, exec_mask=0xF)
+        for l in range(4):
+            wave.set_vgpr(l, VGPR(1), 40)
+
+        inst = DSCondXchg32F32Instruction(
+            DSOpcode.DS_CONDXCHG32_F32,
+            vaddr=VGPR(1),
+            vdata0=VGPR(2),
+            vdata1=VGPR(3),
+        )
+        flags = evaluate_status_flags(wave, inst)
+        self.assertEqual(flags.address_collisions, 3)
+
+    def test_exchange_outcome_and_result_flags(self) -> None:
+        wave = SIMDWaveState(wave_size=32, exec_mask=0x3)
+        wave.lds.write_dword(0, ONE_RAW)
+        wave.lds.write_dword(1, TWO_RAW)
+
+        wave.set_vgpr(0, VGPR(1), 0)
+        wave.set_vgpr(0, VGPR(2), ONE_RAW)
+        wave.set_vgpr(0, VGPR(3), NEG_ZERO_RAW)
+
+        wave.set_vgpr(1, VGPR(1), 4)
+        wave.set_vgpr(1, VGPR(2), THREE_RAW)
+        wave.set_vgpr(1, VGPR(3), ONE_RAW)
+
+        inst = DSCondXchg32F32Instruction(
+            DSOpcode.DS_CONDXCHG32_F32,
+            vaddr=VGPR(1),
+            vdata0=VGPR(2),
+            vdata1=VGPR(3),
+        )
+        flags = evaluate_status_flags(wave, inst)
+        self.assertTrue(flags.exchange_occurred)
+        self.assertTrue(flags.exchange_failed)
+        self.assertTrue(flags.result_is_zero)
+        self.assertTrue(flags.result_has_sign_bit)
+
 
 if __name__ == "__main__":
     unittest.main()
