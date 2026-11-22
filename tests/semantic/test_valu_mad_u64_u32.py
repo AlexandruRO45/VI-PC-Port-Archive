@@ -1103,5 +1103,167 @@ class TestValuMadU64U32SIMDMultiLane(unittest.TestCase):
         self.assertEqual(ws.vcc, 0)
 
 
+class TestValuMadU64U32RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing, self-overlapping operands, and state isolation."""
+
+    def test_in_place_64bit_accumulator_aliasing(self) -> None:
+        # vdst == src2 == v[0:1] (accumulator MAC pattern)
+        rf = ScalarRegisterFile()
+        rf.write_vgpr64(0, 100)
+        rf.write_vgpr32(2, 10)
+        rf.write_vgpr32(3, 20)
+
+        inst = VMadU64U32Instruction(
+            vdst=Operand.vgpr(0, size_bits=64),
+            sdst=Operand.vcc(size_bits=64),
+            src0=Operand.vgpr(2, size_bits=32),
+            src1=Operand.vgpr(3, size_bits=32),
+            src2=Operand.vgpr(0, size_bits=64),
+        )
+        interp = ScalarVALUInterpreter(rf)
+
+        # Execute 5 iterations: each adds 10 * 20 = 200
+        for i in range(5):
+            interp.execute(inst)
+            expected = 100 + (i + 1) * 200
+            self.assertEqual(rf.read_vgpr64(0), expected)
+            self.assertEqual(rf.vcc, 0)
+
+    def test_destination_low_aliases_source0(self) -> None:
+        # vdst.lo (v0) == src0 (v0)
+        rf = ScalarRegisterFile()
+        rf.write_vgpr32(0, 7)
+        rf.write_vgpr32(1, 0)
+        rf.write_vgpr32(2, 9)
+        rf.write_vgpr64(4, 13)
+
+        inst = VMadU64U32Instruction(
+            vdst=Operand.vgpr(0, size_bits=64),
+            sdst=Operand.vcc(size_bits=64),
+            src0=Operand.vgpr(0, size_bits=32),
+            src1=Operand.vgpr(2, size_bits=32),
+            src2=Operand.vgpr(4, size_bits=64),
+        )
+        interp = ScalarVALUInterpreter(rf)
+        interp.execute(inst)
+
+        expected = 7 * 9 + 13
+        self.assertEqual(rf.read_vgpr64(0), expected)
+        self.assertEqual(rf.read_vgpr32(0), expected)
+        self.assertEqual(rf.read_vgpr32(1), 0)
+
+    def test_destination_high_aliases_source0(self) -> None:
+        # vdst.hi (v1) == src0 (v1)
+        rf = ScalarRegisterFile()
+        rf.write_vgpr32(0, 0)
+        rf.write_vgpr32(1, 8)
+        rf.write_vgpr32(2, 11)
+        rf.write_vgpr64(4, 15)
+
+        inst = VMadU64U32Instruction(
+            vdst=Operand.vgpr(0, size_bits=64),
+            sdst=Operand.vcc(size_bits=64),
+            src0=Operand.vgpr(1, size_bits=32),
+            src1=Operand.vgpr(2, size_bits=32),
+            src2=Operand.vgpr(4, size_bits=64),
+        )
+        interp = ScalarVALUInterpreter(rf)
+        interp.execute(inst)
+
+        expected = 8 * 11 + 15
+        self.assertEqual(rf.read_vgpr64(0), expected)
+        self.assertEqual(rf.read_vgpr32(0), expected)
+        self.assertEqual(rf.read_vgpr32(1), 0)
+
+    def test_source_squaring_aliasing(self) -> None:
+        # src0 == src1 == v2 (squaring)
+        rf = ScalarRegisterFile()
+        rf.write_vgpr32(2, 12345)
+        rf.write_vgpr64(4, 6789)
+
+        inst = VMadU64U32Instruction(
+            vdst=Operand.vgpr(0, size_bits=64),
+            sdst=Operand.vcc(size_bits=64),
+            src0=Operand.vgpr(2, size_bits=32),
+            src1=Operand.vgpr(2, size_bits=32),
+            src2=Operand.vgpr(4, size_bits=64),
+        )
+        interp = ScalarVALUInterpreter(rf)
+        interp.execute(inst)
+
+        expected = 12345 * 12345 + 6789
+        self.assertEqual(rf.read_vgpr64(0), expected)
+        # Source register v2 must be preserved
+        self.assertEqual(rf.read_vgpr32(2), 12345)
+
+    def test_full_three_way_aliasing(self) -> None:
+        # vdst == src2 == v[0:1], src0 == v0, src1 == v1
+        rf = ScalarRegisterFile()
+        rf.write_vgpr32(0, 10)
+        rf.write_vgpr32(1, 20)
+        # initial v[0:1] = (20 << 32) | 10
+        initial_s2 = (20 << 32) | 10
+
+        inst = VMadU64U32Instruction(
+            vdst=Operand.vgpr(0, size_bits=64),
+            sdst=Operand.vcc(size_bits=64),
+            src0=Operand.vgpr(0, size_bits=32),
+            src1=Operand.vgpr(1, size_bits=32),
+            src2=Operand.vgpr(0, size_bits=64),
+        )
+        interp = ScalarVALUInterpreter(rf)
+        interp.execute(inst)
+
+        expected = (10 * 20) + initial_s2
+        self.assertEqual(rf.read_vgpr64(0), expected)
+
+    def test_unrelated_vgpr_and_sgpr_preservation(self) -> None:
+        rf = ScalarRegisterFile()
+        for i in range(2, 256):
+            rf.write_vgpr32(i, 0x1000 + i)
+        for i in range(106):
+            rf.write_sgpr32(i, 0x5000 + i)
+
+        inst = VMadU64U32Instruction(
+            vdst=Operand.vgpr(0, size_bits=64),
+            sdst=Operand.vcc(size_bits=64),
+            src0=Operand.inline_int(5, size_bits=32),
+            src1=Operand.inline_int(6, size_bits=32),
+            src2=Operand.inline_int(7, size_bits=64),
+        )
+        interp = ScalarVALUInterpreter(rf)
+        interp.execute(inst)
+
+        self.assertEqual(rf.read_vgpr64(0), 5 * 6 + 7)
+        for i in range(2, 256):
+            self.assertEqual(rf.read_vgpr32(i), 0x1000 + i)
+        for i in range(106):
+            self.assertEqual(rf.read_sgpr32(i), 0x5000 + i)
+
+    def test_simd_multi_lane_aliased_divergence(self) -> None:
+        # Even lanes active, accumulating in-place into v[0:1]
+        ws = SIMDWaveState(wave_size=64, exec_mask=0x5555_5555_5555_5555)
+        for lane in range(64):
+            ws.write_vgpr64(lane, 0, 1000 + lane)
+            ws.write_vgpr32(lane, 2, 3)
+            ws.write_vgpr32(lane, 3, 4)
+
+        inst = VMadU64U32Instruction(
+            vdst=Operand.vgpr(0, size_bits=64),
+            sdst=Operand.vcc(size_bits=64),
+            src0=Operand.vgpr(2, size_bits=32),
+            src1=Operand.vgpr(3, size_bits=32),
+            src2=Operand.vgpr(0, size_bits=64),
+        )
+        interp = SIMDVALUInterpreter(ws)
+        interp.execute(inst)
+
+        for lane in range(64):
+            if lane % 2 == 0:
+                self.assertEqual(ws.read_vgpr64(lane, 0), (1000 + lane) + (3 * 4))
+            else:
+                self.assertEqual(ws.read_vgpr64(lane, 0), 1000 + lane)
+
+
 if __name__ == "__main__":
     unittest.main()
