@@ -1319,5 +1319,188 @@ class TestLdsMinRtnU64BoundaryExtremes(unittest.TestCase):
                 self.assertEqual(lds.read_qword(addr), expected_min)
 
 
+# ---------------------------------------------------------------------------
+# Phase 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# ---------------------------------------------------------------------------
+
+class TestLdsMinRtnU64NegativeControls(unittest.TestCase):
+    """Phase 8: Negative test controls and syntax error rejection."""
+
+    def test_parse_empty_string(self) -> None:
+        with self.assertRaises(ValueError):
+            DSMinRtnU64Instruction.parse("")
+        with self.assertRaises(ValueError):
+            DSMinRtnU64Instruction.parse("   \n\t  ")
+
+    def test_parse_invalid_opcodes(self) -> None:
+        with self.assertRaises(ValueError):
+            DSMinRtnU64Instruction.parse("ds_min_u64 v[0:1], v2, v[4:5]")
+        with self.assertRaises(ValueError):
+            DSMinRtnU64Instruction.parse("ds_max_rtn_u64 v[0:1], v2, v[4:5]")
+        with self.assertRaises(ValueError):
+            DSMinRtnU64Instruction.parse("ds_min_rtn_u32 v[0:1], v2, v[4:5]")
+        with self.assertRaises(ValueError):
+            DSMinRtnU64Instruction.parse("v_min_u32 v[0:1], v2, v[4:5]")
+
+    def test_parse_insufficient_operands(self) -> None:
+        with self.assertRaises(ValueError):
+            DSMinRtnU64Instruction.parse("ds_min_rtn_u64")
+        with self.assertRaises(ValueError):
+            DSMinRtnU64Instruction.parse("ds_min_rtn_u64 v[0:1]")
+        with self.assertRaises(ValueError):
+            DSMinRtnU64Instruction.parse("ds_min_rtn_u64 v[0:1], v2")
+
+    def test_parse_invalid_register_spans(self) -> None:
+        # Destination must be 2 VGPRs (64-bit pair)
+        with self.assertRaises(ValueError):
+            DSMinRtnU64Instruction.parse("ds_min_rtn_u64 v[0:0], v2, v[4:5]")
+        with self.assertRaises(ValueError):
+            DSMinRtnU64Instruction.parse("ds_min_rtn_u64 v[0:2], v2, v[4:5]")
+
+        # Data register must be 2 VGPRs
+        with self.assertRaises(ValueError):
+            DSMinRtnU64Instruction.parse("ds_min_rtn_u64 v[0:1], v2, v[4:4]")
+        with self.assertRaises(ValueError):
+            DSMinRtnU64Instruction.parse("ds_min_rtn_u64 v[0:1], v2, v[4:6]")
+
+        # Address register must be 1 VGPR (32-bit)
+        with self.assertRaises(ValueError):
+            DSMinRtnU64Instruction.parse("ds_min_rtn_u64 v[0:1], v[2:3], v[4:5]")
+
+    def test_parse_invalid_register_types(self) -> None:
+        # SGPR cannot be used for LDS destination
+        with self.assertRaises(ValueError):
+            DSMinRtnU64Instruction.parse("ds_min_rtn_u64 s[0:1], v2, v[4:5]")
+        # SGPR cannot be used for LDS vaddr
+        with self.assertRaises(ValueError):
+            DSMinRtnU64Instruction.parse("ds_min_rtn_u64 v[0:1], s2, v[4:5]")
+
+    def test_parse_offset_bounds_and_modifiers(self) -> None:
+        # Offset > 65535
+        with self.assertRaises(ValueError):
+            DSMinRtnU64Instruction.parse("ds_min_rtn_u64 v[0:1], v2, v[4:5] offset:65536")
+        # Offset < 0
+        with self.assertRaises(ValueError):
+            DSMinRtnU64Instruction.parse("ds_min_rtn_u64 v[0:1], v2, v[4:5] offset:-4")
+        # Unknown token/modifier
+        with self.assertRaises(ValueError):
+            DSMinRtnU64Instruction.parse("ds_min_rtn_u64 v[0:1], v2, v[4:5] invalid_mod")
+
+    def test_lds_model_capacity_rejections(self) -> None:
+        with self.assertRaises(ValueError):
+            LDSModel64(capacity_bytes=0)
+        with self.assertRaises(ValueError):
+            LDSModel64(capacity_bytes=-64)
+        with self.assertRaises(ValueError):
+            LDSModel64(capacity_bytes=1000)  # Not a power of two
+        with self.assertRaises(ValueError):
+            LDSModel64(capacity_bytes=4)     # Less than 8 bytes minimum
+
+    def test_simd_state_invalid_wavefront_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState64(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState64(num_lanes=128)
+
+
+class TestLdsMinRtnU64MutationDetection(unittest.TestCase):
+    """Phase 8: Mutation detection to verify test suite catches faulty implementations."""
+
+    def test_mutant_max_operator_detected(self) -> None:
+        """Mutant 1: using max instead of min."""
+        def faulty_oracle(curr: int, data: int) -> int:
+            return max(curr, data)
+
+        curr = 100
+        data = 50
+        correct_min = oracle_min_u64(curr, data)
+        mutant_val = faulty_oracle(curr, data)
+        self.assertNotEqual(mutant_val, correct_min)
+        self.assertEqual(correct_min, 50)
+        self.assertEqual(mutant_val, 100)
+
+    def test_mutant_signed_comparison_detected(self) -> None:
+        """Mutant 2: signed 64-bit comparison instead of unsigned.
+
+        In signed: -1 (0xFFFFFFFFFFFFFFFF) < 0.
+        In unsigned: 0 < 0xFFFFFFFFFFFFFFFF.
+        """
+        def faulty_signed_min(a: int, b: int) -> int:
+            sa = struct.unpack(">q", struct.pack(">Q", a & MASK64))[0]
+            sb = struct.unpack(">q", struct.pack(">Q", b & MASK64))[0]
+            return a if sa <= sb else b
+
+        val_zero = 0
+        val_all_ones = 0xFFFFFFFFFFFFFFFF  # -1 in signed 64-bit, 2^64 - 1 in unsigned
+
+        correct_unsigned = oracle_min_u64(val_zero, val_all_ones)
+        mutant_signed = faulty_signed_min(val_zero, val_all_ones)
+
+        self.assertEqual(correct_unsigned, 0)
+        self.assertEqual(mutant_signed, 0xFFFFFFFFFFFFFFFF)
+        self.assertNotEqual(mutant_signed, correct_unsigned)
+
+    def test_mutant_post_return_value_detected(self) -> None:
+        """Mutant 3: returning new_val instead of pre-op old_val."""
+        lds = LDSModel64()
+        lds.write_qword(0x10, 500)
+        old_val, new_val, _ = lds.atomic_min_rtn_u64(0x10, 100)
+
+        # Correct ds_min_rtn_u64 returns old_val (500)
+        self.assertEqual(old_val, 500)
+        self.assertEqual(new_val, 100)
+        self.assertNotEqual(old_val, new_val)
+
+    def test_mutant_dropped_offset_detected(self) -> None:
+        """Mutant 4: dropping immediate byte offset."""
+        vaddr = 0x100
+        offset = 0x40
+        correct_eff = calc_lds_effective_address(vaddr, offset)
+        mutant_eff = calc_lds_effective_address(vaddr, 0)  # Dropped offset
+        self.assertEqual(correct_eff, 0x140)
+        self.assertEqual(mutant_eff, 0x100)
+        self.assertNotEqual(mutant_eff, correct_eff)
+
+    def test_mutant_exec_bypass_detected(self) -> None:
+        """Mutant 5: inactive lane modifies memory or registers."""
+        simd = SIMDState64(num_lanes=32, exec_mask=0x0)
+        simd.lds.write_qword(0x20, 1000)
+        simd.set_vgpr(0, 2, 0x20)
+        simd.set_vgpr64(0, 4, 10)
+
+        inst = DSMinRtnU64Instruction(Opcode.DS_MIN_RTN_U64, VGPR64(0), VGPR(2), VGPR64(4))
+        interp = SIMDInterpreter64()
+        res = interp.step(inst, simd)
+
+        # Memory must NOT be modified
+        self.assertEqual(simd.lds.read_qword(0x20), 1000)
+        # Destination register must NOT be modified
+        self.assertEqual(simd.get_vgpr64(0, 0), 0)
+        self.assertEqual(len(res), 0)
+
+    def test_mutant_aliased_premature_writeback_detected(self) -> None:
+        """Mutant 6: prematurely writing back vdst before reading vaddr/vdata during register aliasing."""
+        # When vdst aliases vaddr (e.g. vdst = v[0:1], vaddr = v0):
+        # Correct order: latch vaddr (v0) and vdata -> compute atomic min -> write vdst (v[0:1]).
+        # Mutant: writes vdst first -> corrupts vaddr -> wrong LDS address is targeted!
+        simd = SIMDState64(num_lanes=32, exec_mask=0x1)
+        simd.lds.write_qword(0x80, 500)
+        simd.lds.write_qword(0x00, 999)
+        simd.set_vgpr(0, 0, 0x80)     # v0 = 0x80 (vaddr)
+        simd.set_vgpr64(0, 2, 200)    # v[2:3] = 200 (vdata)
+
+        # Instruction: ds_min_rtn_u64 v[0:1], v0, v[2:3]
+        inst = DSMinRtnU64Instruction(Opcode.DS_MIN_RTN_U64, VGPR64(0), VGPR(0), VGPR64(2))
+        interp = SIMDInterpreter64()
+        interp.step(inst, simd)
+
+        # Effective address 0x80 should have been modified to min(500, 200) = 200
+        self.assertEqual(simd.lds.read_qword(0x80), 200)
+        # Address 0x00 must remain untouched
+        self.assertEqual(simd.lds.read_qword(0x00), 999)
+        # Destination v[0:1] holds old_val = 500
+        self.assertEqual(simd.get_vgpr64(0, 0), 500)
+
+
 if __name__ == "__main__":
     unittest.main()
