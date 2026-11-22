@@ -324,6 +324,60 @@ class DSSubRtnF32Instruction:
 
 
 # ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class DSFloatConditionCodes:
+    """Architectural IEEE 754 condition codes for float operations."""
+    zero: bool
+    negative: bool
+    nan: bool
+    infinity: bool
+    subnormal: bool
+
+
+@dataclass(frozen=True)
+class DSStatusFlags:
+    """Architectural status flags for LDS memory accesses."""
+    address_wrapped: bool
+    dword_aligned: bool
+    bank_index: int
+
+
+def compute_ds_float_condition_codes(result_bits: int) -> DSFloatConditionCodes:
+    """Computes IEEE 754 floating-point condition codes for operation result."""
+    result_bits &= MASK32
+    nan = is_nan(result_bits)
+    inf = is_inf(result_bits)
+    zero = is_zero(result_bits)
+    neg = bool((result_bits & SIGN_MASK) and not nan)
+    subnorm = is_subnormal(result_bits)
+    return DSFloatConditionCodes(
+        zero=zero,
+        negative=neg,
+        nan=nan,
+        infinity=inf,
+        subnormal=subnorm,
+    )
+
+
+def compute_ds_status_flags(vaddr: int, offset: int = 0) -> DSStatusFlags:
+    """Computes memory access status flags."""
+    raw_addr = vaddr + offset
+    effective_byte = raw_addr & MASK32
+    wrapped = (raw_addr > MASK32)
+    aligned = (effective_byte & 3) == 0
+    dword_idx = (effective_byte >> 2)
+    bank_idx = dword_idx % NUM_LDS_BANKS
+    return DSStatusFlags(
+        address_wrapped=wrapped,
+        dword_aligned=aligned,
+        bank_index=bank_idx,
+    )
+
+
+# ==============================================================================
 # Deterministic Scalar Instruction Interpreter
 # ==============================================================================
 
@@ -335,6 +389,8 @@ class ScalarState:
         self.sgprs: list[int] = [0] * DEFAULT_NUM_SGPRS
         self.lds: LDSMemory = LDSMemory(size_dwords=lds_size_dwords)
         self.vcc: int = 0
+        self.last_condition_codes: Optional[DSFloatConditionCodes] = None
+        self.last_status_flags: Optional[DSStatusFlags] = None
 
     def get_vgpr(self, index: int) -> int:
         return self.vgprs[index]
@@ -387,6 +443,9 @@ class ScalarInterpreter:
 
         # 3. Write pre-subtraction value back to destination register
         state.set_reg(instr.vdst, old_val)
+
+        state.last_condition_codes = compute_ds_float_condition_codes(new_mem)
+        state.last_status_flags = compute_ds_status_flags(vaddr, instr.offset)
 
         return old_val, new_mem
 
@@ -1007,6 +1066,116 @@ class TestRegisterAliasing(unittest.TestCase):
             self.assertEqual(simd.get_lane_vgpr(lane, 0), ONE_F32)
 
         self.assertEqual(simd.lds.read_dword(idx), f32_to_bits(6.0))
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Phase 6: Unit tests for condition codes, status flags, and carry/borrow isolation."""
+
+    def setUp(self) -> None:
+        self.state = ScalarState(lds_size_dwords=1024)
+        self.interp = ScalarInterpreter()
+
+    def test_condition_codes_zero_pos_neg(self) -> None:
+        addr = 0x40
+        idx = addr >> 2
+        # 5.0 - 5.0 = +0.0
+        self.state.lds.write_dword(idx, FIVE_F32)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, FIVE_F32)
+
+        instr = DSSubRtnF32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+        )
+        self.interp.execute(instr, self.state)
+
+        cc = self.state.last_condition_codes
+        self.assertIsNotNone(cc)
+        assert cc is not None
+        self.assertTrue(cc.zero)
+        self.assertFalse(cc.negative)
+        self.assertFalse(cc.nan)
+        self.assertFalse(cc.infinity)
+
+        # 2.0 - 5.0 = -3.0
+        self.state.lds.write_dword(idx, TWO_F32)
+        self.interp.execute(instr, self.state)
+        cc_neg = self.state.last_condition_codes
+        self.assertIsNotNone(cc_neg)
+        assert cc_neg is not None
+        self.assertFalse(cc_neg.zero)
+        self.assertTrue(cc_neg.negative)
+
+    def test_condition_codes_nan_and_inf(self) -> None:
+        addr = 0x80
+        idx = addr >> 2
+        # +inf - (+inf) = NaN
+        self.state.lds.write_dword(idx, POS_INF_F32)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, POS_INF_F32)
+
+        instr = DSSubRtnF32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+        )
+        self.interp.execute(instr, self.state)
+
+        cc = self.state.last_condition_codes
+        self.assertIsNotNone(cc)
+        assert cc is not None
+        self.assertTrue(cc.nan)
+        self.assertFalse(cc.infinity)
+
+        # 1.0 - (+inf) = -inf
+        self.state.lds.write_dword(idx, ONE_F32)
+        self.interp.execute(instr, self.state)
+        cc_inf = self.state.last_condition_codes
+        self.assertIsNotNone(cc_inf)
+        assert cc_inf is not None
+        self.assertFalse(cc_inf.nan)
+        self.assertTrue(cc_inf.infinity)
+        self.assertTrue(cc_inf.negative)
+
+    def test_status_flags_alignment_and_wrapping(self) -> None:
+        addr = 0xFFFFFFFF
+        offset = 5
+        self.state.set_vgpr(1, addr)
+
+        instr = DSSubRtnF32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=Immediate(ONE_F32),
+            offset=offset,
+        )
+        self.interp.execute(instr, self.state)
+
+        sf = self.state.last_status_flags
+        self.assertIsNotNone(sf)
+        assert sf is not None
+        self.assertTrue(sf.address_wrapped)
+        # 0xFFFFFFFF + 5 = 0x100000004 -> effective_byte = 4 (aligned)
+        self.assertTrue(sf.dword_aligned)
+        self.assertEqual(sf.bank_index, 1)
+
+    def test_carry_borrow_vcc_isolation(self) -> None:
+        canary = 0xCAFEBABE12345678
+        self.state.vcc = canary
+
+        addr = 0x40
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, TWO_F32)
+
+        instr = DSSubRtnF32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+        )
+        self.interp.execute(instr, self.state)
+
+        # VCC must not be corrupted by LDS operations
+        self.assertEqual(self.state.vcc, canary)
 
 
 if __name__ == "__main__":
