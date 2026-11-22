@@ -6940,6 +6940,24 @@ class Gen:
             self.dst(a[0], self.cu(val))
             if a[0]["k"] == "sgpr" and self.desc_cache_ok():
                 self.sgpr_imm[a[0]["r"]] = val
+        elif op in ("s_cmov_b32", "s_cmovk_i32", "s_cmov_b64") and a[0]["k"] == "special" and \
+                a[0].get("t") in ("exec", "exec_lo"):
+            # EXEC = SCC ? S0 : EXEC (RDNA2 ISA SOP1/SOPK; SCC read, not written), e.g. LLVM's init.exec.from.input
+            # prologue `s_bfm_b64 exec, s0, 0; s_cmp_eq_u32 s0, 64; s_cmov_b64 exec, -1`. S0 is read as a lane mask
+            # (mask_src: a constant or data SGPR gives lane L its bit L) and the old EXEC is this lane's active bit,
+            # as s_cselect_b64 into EXEC does. The 64-bit form writes EXEC, the 32-bit forms EXEC_LO of a wave32;
+            # EXEC_LO of a wave64 and EXEC_HI would be half writes (#663) and stay Unsupported.
+            if (op == "s_cmov_b64") != (a[0]["t"] == "exec") or (op != "s_cmov_b64" and self.wave64):
+                raise Unsupported(op + " destination")
+            src = a[1]
+            if op == "s_cmovk_i32":
+                v = a[1]["v"] & 0xFFFF
+                src = {"k": "imm", "v": v - 0x10000 if v & 0x8000 else v}
+            x = self.mask_src(src, wide=op == "s_cmov_b64")
+            old, c, r = self.exec_value(), self.tmp(), self.tmp()
+            self.emit(f"{c} = OpLoad %uint %scc")
+            self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(c)} {x} {old}")
+            self.mask_dst(a[0], r)
         elif op in ("s_cmov_b32", "s_cmovk_i32"):
             # D = SCC ? S0 : D (s_cmovk_i32: S0 is the 16-bit immediate, sign-extended). SCC is read, not written.
             if a[0]["k"] != "sgpr":

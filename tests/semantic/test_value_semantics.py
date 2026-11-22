@@ -731,5 +731,35 @@ class LaneMaskConstants(unittest.TestCase):
         self.assertEqual(w64, self.WANT["cs_w64_mask_imm"][1])
 
 
+class CmovIntoExec(LaneMaskConstants):
+    """runtime/test/shaders/cs_w32_cmov_exec.asm and cs_w64_cmov_exec.asm: s_cmov_b32 / s_cmovk_i32 into EXEC_LO
+    (wave32) and s_cmov_b64 into EXEC (wave64), EXEC = SCC ? S0 : EXEC, S0 read as a lane mask. Before, the
+    translator raised Unsupported for an EXEC destination. Same harness and word encoding as LaneMaskConstants."""
+
+    WANT = {"cs_w32_cmov_exec": (32, [32, 8, 1032, 19, 2056, 6, 258, 4]),
+            "cs_w64_cmov_exec": (64, [40, 64, 8, 5419, 2056, 1084, 64, 8194])}
+    OLD = {"cs_w32_cmov_exec": None, "cs_w64_cmov_exec": None}     # no translation before (Unsupported)
+
+    def test_words_follow_from_the_masks(self):
+        # Plain-Python reference: EXEC = SCC ? S0 : EXEC on the masks of each case, then the word encoding.
+        def word(m):
+            return 0xFFFFFF00 if m == 0 else bin(m).count("1") | ((m & -m).bit_length() - 1) << 8
+
+        def cmov(scc, s0, ex):
+            return s0 if scc else ex
+        m32, m64 = 0xFFFFFFFF, (1 << 64) - 1
+        lanes = lambda pred, n: sum(1 << i for i in range(n) if pred(i))
+        w32 = [word(cmov(1, m32, 0xFF)), word(cmov(0, m32, 0xFF)), word(cmov(1, 0xF0F0, m32)),
+               word(cmov(1, -0x7FFD & m32, m32)),             # s_cmovk_i32 0x8003 sign-extends to 0xffff8003
+               word(cmov(0, 7, 0xFF00)), word(cmov(1, lanes(lambda i: 6 > i, 32), 0xFF0)),
+               word(cmov(1, 0x80000002, 0)), word(cmov(0, 0xF0F0, 0xF))]
+        bfm = lambda n: ((1 << (n & 63)) - 1) & m64
+        w64 = [word(cmov(40 == 64, m64, bfm(40))), word(cmov(64 == 64, m64, bfm(64))), word(cmov(1, 0xF | 0xF0 << 32, 0xFF)),
+               word(cmov(1, lanes(lambda i: 20 < i, 64), 0xF)), word(cmov(0, m64, 0xFF00)), word(cmov(1, -16 & m64, 0)),
+               word(cmov(0, 0, m64)), word(cmov(1, 0x80000001 << 32, 0xFFFF))]
+        self.assertEqual(w32, self.WANT["cs_w32_cmov_exec"][1])
+        self.assertEqual(w64, self.WANT["cs_w64_cmov_exec"][1])
+
+
 if __name__ == "__main__":
     unittest.main()

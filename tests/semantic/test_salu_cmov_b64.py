@@ -241,7 +241,8 @@ class RejectionTests(unittest.TestCase):
             translate_ps(lines)
 
     def test_invalid_destinations_rejected_with_message(self):
-        for line in ("s_cmov_b64 exec, s[4:5]", "s_cmov_b64 vcc, s[4:5]",
+        # EXEC is a valid destination (EXEC = SCC ? S0 : EXEC, test_value_semantics.CmovIntoExec).
+        for line in ("s_cmov_b64 vcc, s[4:5]",
                      "s_cmov_b64 m0, s[4:5]", "s_cmov_b64 s4, s[4:5]",
                      "s_cmov_b64 null, s[4:5]"):
             with self.subTest(line=line):
