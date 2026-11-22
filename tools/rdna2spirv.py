@@ -95,6 +95,13 @@ PC_TAIL_SET, PC_TAIL_BINDING = 1, 0
 # the validation layer counts it too (VUID-RuntimeSpirv-Location-06272), so (29 + 1) * 4 + 4 = 124 is the most a VS
 # can use there.
 F16_HALVES = False
+
+
+def f16_halves_on():
+    """16-bit interpolation from the producer's decoded f16 halves: --f16-interp-fallback, and --bary-fallback,
+    whose devices lack VK_KHR_fragment_shader_barycentric and so the PerVertexKHR inputs the other path reads (without
+    it, a bary-fallback PS read the halves from the plain 32-bit channel)."""
+    return F16_HALVES or BARY_FALLBACK
 F16_HALF_TOP = 29
 OPT_SPIRV = False       # --opt: run tools/spirv_opt.py basic-block peephole pass on emitted SPIR-V (#884)
 
@@ -12495,7 +12502,7 @@ class Gen:
         self.emit(f"{v} = OpCompositeConstruct %v4float {' '.join(comp or '%f0' for comp in comps)}")
         self.emit(f"{sel} = OpSelect %v4float {self.active_b()} {v} {old}")
         self.emit(f"OpStore {name} {sel}")
-        if F16_HALVES and tgt.startswith("param") and self.stage == "vs":
+        if f16_halves_on() and tgt.startswith("param") and self.stage == "vs":
             n = int(tgt[5:])
             for half, hv in enumerate(self.f16_halves_of(n, v)):
                 hname = f"%out_f16h{n}_{half}"
@@ -12669,7 +12676,7 @@ def assemble(gen):
     gsx = gen.stage == "gs"
     msc = ms and MESH_COMPUTE
     # --f16-interp-fallback, mesh: the params whose decoded halves fit clear of this shader's params (Gen.f16_halves_of)
-    if ms and not msc and F16_HALVES:
+    if ms and not msc and f16_halves_on():
         for n in sorted(gen.ms_params):
             if n not in gen.f16_half_locs and f16_half_location(n, 0) > gen.param_max:
                 gen.f16_half_locs[n] = (f16_half_location(n, 0), f16_half_location(n, 1))
@@ -14609,9 +14616,9 @@ def translate(path):
         mov_delta = {x["a"] for i in insns if base_op(i["op"]) == "v_interp_mov_f32"
                      and any(x.get("k") == "interp" and x.get("t") in ("p10", "p20") for x in i["args"])
                      for x in i["args"] if x["k"] == "attr"}
-        if F16_HALVES:      # decoded halves from the producer: no per-vertex inputs (and no barycentrics)
+        if f16_halves_on():     # decoded halves from the producer: no per-vertex inputs (and no barycentrics)
             g.f16_halves = f16_read
-        elif not BARY_FALLBACK:
+        else:
             # A smooth input alone cannot supply P0 for a MOV reading the same location.
             g.per_vertex = f16_read | mixed_f32 | mov_delta
         for r in layout:
@@ -15594,7 +15601,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         # --bary-fallback: the raw barycentrics are a perspective-interpolated vec3 at this location; the stage
         # before the PS must write (1,0,0), (0,1,0), (0,0,1) at the triangle's vertices (see BARY_FALLBACK).
         m["bary_fallback_input"] = {"location": g.bary_location}
-    if F16_HALVES and g.stage in ("vs", "ms", "ps"):
+    if f16_halves_on() and g.stage in ("vs", "ms", "ps"):
         # --f16-interp-fallback: PS = the attributes whose f16 reads take decoded halves, VS/MS = the params that
         # export them; each as {n: [low-half location, high-half location]}. When a PS's canonical half slots would
         # collide with its raw attributes, assign_f16_half_locations packs them into free locations <= F16_HALF_TOP
@@ -15849,7 +15856,8 @@ def main():
     ap.add_argument("--bary-fallback", action="store_true",
                     help="pixel shaders that read raw barycentrics take them from an ordinary interpolated input "
                          "(metadata: bary_fallback_input) instead of BaryCoordKHR, for devices without "
-                         "VK_KHR_fragment_shader_barycentric (e.g. NVIDIA Pascal)")
+                         "VK_KHR_fragment_shader_barycentric (e.g. NVIDIA Pascal); 16-bit interpolation then reads "
+                         "decoded halves as with --f16-interp-fallback (no PerVertexKHR inputs either)")
     ap.add_argument("--texel-offset-fallback", action="store_true",
                     help="image_sample*_o without VK_KHR_maintenance8 (e.g. NVIDIA Pascal): fold the texel offset into "
                          "the coordinate instead of the Offset operand")
