@@ -150,7 +150,7 @@ DXGI_FORMAT vk_to_dxgi_format(VkFormat fmt) {
 
 // Real ID3D12Resource COM object representing a swapchain backbuffer. Its pointer value is the
 // leonida::ResourceId registered in VulkanContext, matching d3d12_com.h's resource_id(ID3D12Resource*) contract.
-class BackBufferResource final : public ID3D12ResourceStubs {
+class BackBufferResource final : public ID3D12Resource2Stubs {
 public:
     explicit BackBufferResource(const D3D12_RESOURCE_DESC& desc) : desc_(desc) {}
 
@@ -164,8 +164,9 @@ public:
         if (!out) return E_POINTER;
         *out = nullptr;
         if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) || riid == __uuidof(ID3D12DeviceChild) ||
-            riid == __uuidof(ID3D12Pageable) || riid == __uuidof(ID3D12Resource)) {
-            *out = static_cast<ID3D12Resource*>(this);
+            riid == __uuidof(ID3D12Pageable) || riid == __uuidof(ID3D12Resource) ||
+            riid == __uuidof(ID3D12Resource1) || riid == __uuidof(ID3D12Resource2)) {
+            *out = static_cast<ID3D12Resource2*>(this);
             AddRef();
             return S_OK;
         }
@@ -182,6 +183,26 @@ public:
         return ret;
     }
 #endif
+
+    // Resource2: the same description with no sampler-feedback mip region. Resource1: a back buffer has no
+    // protected session; answered as the layer's other resources are (d3d12_vulkan_device.cpp, Resource).
+    D3D12_RESOURCE_DESC1 desc1() const {
+        return {desc_.Dimension, desc_.Alignment, desc_.Width,      desc_.Height, desc_.DepthOrArraySize,
+                desc_.MipLevels, desc_.Format,    desc_.SampleDesc, desc_.Layout, desc_.Flags, {}};
+    }
+#ifdef _MSC_VER
+    D3D12_RESOURCE_DESC1 STDMETHODCALLTYPE GetDesc1(void) override { return desc1(); }
+#else
+    D3D12_RESOURCE_DESC1* STDMETHODCALLTYPE GetDesc1(D3D12_RESOURCE_DESC1* ret) override {
+        if (ret) *ret = desc1();
+        return ret;
+    }
+#endif
+    HRESULT STDMETHODCALLTYPE GetProtectedResourceSession(REFIID, void** session) override {
+        if (!session) return E_POINTER;
+        *session = nullptr;
+        return DXGI_ERROR_NOT_FOUND;
+    }
 
     D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress(void) override { return 0; }
 

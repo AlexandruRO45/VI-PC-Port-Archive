@@ -1707,8 +1707,15 @@ private:
     bool in_arena_ = false;
 };
 
+// D3D12_RESOURCE_DESC1 is D3D12_RESOURCE_DESC plus SamplerFeedbackMipRegion, which is zero here.
+D3D12_RESOURCE_DESC1 resource_desc1(const D3D12_RESOURCE_DESC& desc) {
+    return {desc.Dimension, desc.Alignment, desc.Width,      desc.Height, desc.DepthOrArraySize,
+            desc.MipLevels, desc.Format,    desc.SampleDesc, desc.Layout, desc.Flags, {}};
+}
+
 class Resource final
-    : public Child<Resource, ID3D12ResourceStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12Resource> {
+    : public Child<Resource, ID3D12Resource2Stubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12Resource,
+                   ID3D12Resource1, ID3D12Resource2> {
 public:
     // {9b3e5f12-7c48-4d0e-a6b1-2f8d4c7e9a35}
     static constexpr GUID kTag{0x9b3e5f12, 0x7c48, 0x4d0e, {0xa6, 0xb1, 0x2f, 0x8d, 0x4c, 0x7e, 0x9a, 0x35}};
@@ -2103,6 +2110,26 @@ public:
         return desc;
     }
 
+    // Resource2: the same resolved description in DESC1 form. The sampler-feedback mip region reads back zero for
+    // every resource but a buffer created from a DESC1 that carried one (the PC runtime stores it for buffers; the
+    // DESC1 paths refuse a texture that asks for one). Measured on the default adapter and WARP
+    // (d3d12_resource_desc_test).
+    D3D12_RESOURCE_DESC1 STDMETHODCALLTYPE GetDesc1() override {
+        D3D12_RESOURCE_DESC1 desc = resource_desc1(GetDesc());
+        desc.SamplerFeedbackMipRegion = mip_region_;
+        return desc;
+    }
+    void set_mip_region(const D3D12_MIP_REGION& region) { mip_region_ = region; }
+
+    // Resource1: the layer has no protected sessions, so every resource answers as a session-less D3D12 one: the
+    // out pointer is nulled and the result is DXGI_ERROR_NOT_FOUND, for any riid (measured on the default adapter
+    // and WARP). A null out pointer, which the PC runtime dereferences (access violation), is E_POINTER here.
+    HRESULT STDMETHODCALLTYPE GetProtectedResourceSession(REFIID, void** session) override {
+        if (!session) return E_POINTER;
+        *session = nullptr;
+        return DXGI_ERROR_NOT_FOUND;
+    }
+
     // Both sparse resources and the committed fallback report the reserved layout and have no heap of their own.
     void make_reserved(D3D12_TEXTURE_LAYOUT layout) {
         reserved_ = true;
@@ -2430,6 +2457,7 @@ private:
     D3D12_GPU_VIRTUAL_ADDRESS va_ = 0;
     VkDeviceSize arena_offset_ = 0;
     bool in_arena_ = false;
+    D3D12_MIP_REGION mip_region_{};  // of a buffer created from a DESC1 (GetDesc1)
 };
 
 // DXGI -> Vulkan for vertex attributes, with each element's size for D3D12_APPEND_ALIGNED_ELEMENT.
@@ -2583,7 +2611,8 @@ bool equal_semantic(const std::string& a, const char* b) {
 // name any 64 KiB-aligned offset in it. Textures placed in it still get their own VkDeviceMemory; the offset is only
 // their key, which keeps optimal-tiling images out of the arena's memory type.
 class Heap final
-    : public Child<Heap, ID3D12HeapStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12Heap> {
+    : public Child<Heap, ID3D12Heap1Stubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12Heap,
+                   ID3D12Heap1> {
 public:
     // {5d20c7a4-8e13-4b6d-9f27-3a1c94e0b7d8}
     static constexpr GUID kTag{0x5d20c7a4, 0x8e13, 0x4b6d, {0x9f, 0x27, 0x3a, 0x1c, 0x94, 0xe0, 0xb7, 0xd8}};
@@ -2612,6 +2641,15 @@ public:
         desc.Properties.CreationNodeMask = 1;
         desc.Properties.VisibleNodeMask = 1;
         return desc;
+    }
+
+    // Heap1: a heap has no protected session here; answered as the PC runtime answers a session-less heap
+    // (DXGI_ERROR_NOT_FOUND with the out pointer nulled, for any riid); a null out pointer, which the PC runtime
+    // dereferences, is E_POINTER.
+    HRESULT STDMETHODCALLTYPE GetProtectedResourceSession(REFIID, void** session) override {
+        if (!session) return E_POINTER;
+        *session = nullptr;
+        return DXGI_ERROR_NOT_FOUND;
     }
 
     bool reserved() const { return bool(allocation_); }
@@ -6709,7 +6747,7 @@ public:
         if (session) return refuse_protected_session("CreateCommittedResource2");
         if (texture_mip_region(*desc)) return E_INVALIDARG;
         const D3D12_RESOURCE_DESC base = resource_desc(*desc);
-        return CreateCommittedResource(heap, heap_flags, &base, state, clear, riid, out);
+        return keep_mip_region(CreateCommittedResource(heap, heap_flags, &base, state, clear, riid, out), *desc, out);
     }
 
     HRESULT STDMETHODCALLTYPE CreateCommittedResource3(const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heap_flags,
@@ -6731,8 +6769,9 @@ public:
         }
         // D3D12_BARRIER_LAYOUT has no acceleration-structure value; an AS buffer's state comes through the
         // legacy CreateCommittedResource path. Buffers here start COMMON, as before.
-        return create_committed_validated(method, heap, heap_flags, &base, D3D12_RESOURCE_STATE_COMMON, clear,
-                                          castable_count, castable, riid, out);
+        return keep_mip_region(create_committed_validated(method, heap, heap_flags, &base, D3D12_RESOURCE_STATE_COMMON,
+                                                          clear, castable_count, castable, riid, out),
+                               *desc, out);
     }
 
     // Device9. The creator ID only groups queues for tools; one creator is as good as another here.
@@ -6742,7 +6781,7 @@ public:
     }
 
     // Device8. A texture with a mip region gets the failure answer (every output all ones), as on the PC runtime;
-    // a buffer's mip region is ignored.
+    // a buffer's mip region is kept (GetDesc1).
     void STDMETHODCALLTYPE GetCopyableFootprints1(const D3D12_RESOURCE_DESC1* desc, UINT first, UINT count,
                                                   UINT64 base, D3D12_PLACED_SUBRESOURCE_FOOTPRINT* layouts, UINT* rows,
                                                   UINT64* row_sizes, UINT64* total) override {
@@ -6817,7 +6856,7 @@ public:
     }
 
     // Device8: the DESC1 placed variant without a castable list. A texture with a mip region gets the failure
-    // answer, as on the PC runtime; a buffer's mip region is ignored.
+    // answer, as on the PC runtime; a buffer's mip region is kept (GetDesc1).
     HRESULT STDMETHODCALLTYPE CreatePlacedResource1(ID3D12Heap* heap_interface, UINT64 heap_offset,
                                                     const D3D12_RESOURCE_DESC1* desc, D3D12_RESOURCE_STATES state,
                                                     const D3D12_CLEAR_VALUE* clear, REFIID riid, void** out) override {
@@ -6826,7 +6865,8 @@ public:
         if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
         if (texture_mip_region(*desc)) return d3d12_trace::result(method, E_INVALIDARG);
         const D3D12_RESOURCE_DESC base = resource_desc(*desc);
-        return create_placed(method, heap_interface, heap_offset, &base, state, clear, 0, nullptr, riid, out);
+        return keep_mip_region(
+            create_placed(method, heap_interface, heap_offset, &base, state, clear, 0, nullptr, riid, out), *desc, out);
     }
 
     // Device10: an initial layout instead of a state, and the castable-format list, which the placed texture's
@@ -6846,8 +6886,9 @@ public:
             return d3d12_trace::result(method, E_INVALIDARG);
         }
         // An initial layout replaces the state, so the state rules are not this call's.
-        return create_placed(method, heap_interface, heap_offset, &base, D3D12_RESOURCE_STATE_COMMON, clear,
-                             castable_count, castable, riid, out);
+        return keep_mip_region(create_placed(method, heap_interface, heap_offset, &base, D3D12_RESOURCE_STATE_COMMON,
+                                             clear, castable_count, castable, riid, out),
+                               *desc, out);
     }
 
     // The placed path every CreatePlacedResource variant shares. A castable-format list reaches the placed
@@ -8307,8 +8348,18 @@ private:
                 desc.MipLevels, desc.Format,    desc.SampleDesc, desc.Layout, desc.Flags};
     }
 
+    // A buffer created from a DESC1 keeps its mip region, which GetDesc1 reads back (as on the PC runtime, measured
+    // by d3d12_resource_desc_test); nothing else uses it.
+    static HRESULT keep_mip_region(HRESULT hr, const D3D12_RESOURCE_DESC1& desc, void** out) {
+        if (SUCCEEDED(hr) && out && *out && desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            if (auto* resource = Resource::from<Resource>(static_cast<IUnknown*>(*out)))
+                resource->set_mip_region(desc.SamplerFeedbackMipRegion);
+        }
+        return hr;
+    }
+
     // A sampler-feedback mip region on a texture, which needs a DXGI_FORMAT_SAMPLER_FEEDBACK_* resource the layer
-    // does not have. The PC runtime ignores the region on a buffer.
+    // does not have. A buffer's region is accepted and kept (keep_mip_region).
     static bool texture_mip_region(const D3D12_RESOURCE_DESC1& desc) {
         const D3D12_MIP_REGION& region = desc.SamplerFeedbackMipRegion;
         return desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && (region.Width || region.Height || region.Depth);

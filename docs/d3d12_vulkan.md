@@ -459,7 +459,7 @@ What is implemented (all of it testable without the game):
 - **DXGI Swapchain** (`runtime/shims/dxgi_swapchain.h`, `runtime/shims/dxgi_com.{h,cpp}`): `IDXGIFactory4` and
   `IDXGISwapChain3` over `VK_KHR_win32_surface` + `VkSwapchainKHR`, exposed via `rt::d3d12::create_dxgi_factory`.
   Swapchain backbuffers are real `ID3D12Resource` COM objects (`BackBufferResource` inheriting from
-  `ID3D12ResourceStubs`) registered directly with `VulkanContext`, supporting `CreateSwapChainForHwnd`,
+  `ID3D12Resource2Stubs`) registered directly with `VulkanContext`, supporting `CreateSwapChainForHwnd`,
   `GetCurrentBackBufferIndex`, `GetBuffer`, `CreateRenderTargetView`, `Present`, and `ResizeBuffers` (preserving
   explicit buffer dimensions even when the HWND client size is unchanged via an offscreen backbuffer + blit path,
   and exposing exactly the requested `BufferCount` even when Vulkan's native image count differs, in which case the
@@ -479,7 +479,7 @@ What is implemented (all of it testable without the game):
     |---|---|
     | a protected resource session | `E_INVALIDARG`; the layer reports no `D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_SUPPORT` |
     | `SamplerFeedbackMipRegion` on a texture | `E_INVALIDARG` from `CreateCommittedResource2/3`; `GetCopyableFootprints1` returns its failure answer (every output all ones) |
-    | `SamplerFeedbackMipRegion` on a buffer | ignored |
+    | `SamplerFeedbackMipRegion` on a buffer | accepted and stored; `ID3D12Resource2::GetDesc1` returns it (as the PC runtime does) |
     | a buffer's initial layout other than `UNDEFINED` | `E_INVALIDARG` |
     | a castable-format count with a null list | no list (`S_OK`) |
     | a castable-format list | accepted on a texture when the formats map to Vulkan formats: the image is mutable and carries a `VkImageFormatListCreateInfo`; a buffer or an unmapped format is `E_INVALIDARG`. A cast whose texel size differs from the resource's is also `E_INVALIDARG` — the host refuses other sizes, and a size-mismatched format list is a Vulkan validation error (`VUID-VkImageCreateInfo-pNext-06722`). The list is kept on the resource, so an SRV whose format is neither the resource format nor in the list leaves a null descriptor. The resource's own format is always accepted and is added to the Vulkan format list when the D3D12 list omits it. A listed same-size cross-family cast, such as `R8G8B8A8_UINT` to `R32_UINT`, is accepted. An RTV in a listed RGBA8 family format on a typed `R8G8B8A8_UNORM` texture clears through the cast, the same reinterpretation a typeless RTV uses; without a list a typed resource still refuses a different-format RTV. `D3D12_OPTIONS12` reports `RelaxedFormatCastingSupported = TRUE` (this layer requires Vulkan 1.3, where the format list is core). `CreatePlacedResource2`'s list reaches its placed image through the same rules (D3D-90) |
@@ -2099,8 +2099,8 @@ The trace will enumerate them.
 | `ID3D12RootSignature` | `RootSignature` + `VkPipelineLayout` | Deserialize the blob with the host `D3D12CreateVersionedRootSignatureDeserializer` when possible; clear the measured `0x03000000` flag byte on a copy first; fall back to a local parser. Build the user-SGPR map and static samplers. |
 | `ID3D12PipelineState` | `VkPipeline` + a `PipelineInfo` | Shader hash → SPIR-V + index entry; PSO state → Vulkan state; dynamic state where possible. The BVH builder's compute PSOs arrive at device slot 62 with a plain `D3D12_COMPUTE_PIPELINE_STATE_DESC`. |
 | `ID3D12DescriptorHeap` | `DescriptorHeap` (shadow + optional arena range) | CBV/SRV/UAV and sampler heaps can be shader-visible; RTV/DSV are host-only. Start handles use the measured RAX return at heap slots 9/10. Increments are layer-chosen (32/32) pending the console value. |
-| `ID3D12Resource` | `Resource` (a range in the arena buffer; a separate `VkImage` for textures) | Committed, placed and reserved. Reserved buffers use sparse memory where supported (section 4.2). Xbox textures may arrive through device slot 76. `GetGPUVirtualAddress` returns a console VA (a buffer offset or an image key). |
-| `ID3D12Heap` | `Heap` (a reserved VA range) | Buffer ranges are backed by the arena; images get their own `VkDeviceMemory`. Residency calls are no-ops. True buffer/image aliasing inside a heap is **Open**. |
+| `ID3D12Resource`, `ID3D12Resource1`, `ID3D12Resource2` | `Resource` (a range in the arena buffer; a separate `VkImage` for textures) | Committed, placed and reserved. Reserved buffers use sparse memory where supported (section 4.2). Xbox textures may arrive through device slot 76. `GetGPUVirtualAddress` returns a console VA (a buffer offset or an image key). |
+| `ID3D12Heap`, `ID3D12Heap1` | `Heap` (a reserved VA range) | Buffer ranges are backed by the arena; images get their own `VkDeviceMemory`. Residency calls are no-ops. True buffer/image aliasing inside a heap is **Open**. |
 | `ID3D12Fence` / `ID3D12Fence1` | `Fence` over a timeline `VkSemaphore` | `GetCompletedValue` = counter value; `SetEventOnCompletion` = wait thread + Win32 event; CPU `Signal` = host signal. |
 | Resource barriers (legacy) | `vkCmdPipelineBarrier` | Per-subresource state tracking; `BEGIN_ONLY`/`END_ONLY` become conservative full barriers at the begin point. |
 | Enhanced barriers (`ID3D12GraphicsCommandList7::Barrier`) | `vkCmdPipelineBarrier2` | Direct mapping of sync/access/layout; prefer it when the game uses it. |
@@ -2275,8 +2275,20 @@ The trace will enumerate them.
 - `ID3D12Resource::GetDesc` returns the description with its defaults filled in, as the PC runtime does: `MipLevels`
   0 becomes the full chain, and `Alignment` 0 becomes the placement alignment, 64 KiB, or 4 MiB for a multisampled
   texture (an alignment the description asked for is kept). **Implemented** and compared field by field with the
-  PC runtime and WARP by `d3d12_resource_desc_test`: 25 committed and reserved buffers and 2D, array, volume and
+  PC runtime and WARP by `d3d12_resource_desc_test`: 26 committed and reserved buffers and 2D, array, volume and
   multisampled textures (measured on an RTX 3060 host and WARP, Windows 10).
+- `ID3D12Resource1`, `ID3D12Resource2` and `ID3D12Heap1` are answered by `QueryInterface` on every resource (committed,
+  placed, reserved, swapchain backbuffer) and heap, one object with one `IUnknown` and one added reference per
+  query, as on the PC runtime. `GetDesc1` is `GetDesc` plus `SamplerFeedbackMipRegion`, which is zero unless the
+  resource is a buffer created from a `D3D12_RESOURCE_DESC1` that carried one (the PC runtime stores a buffer's
+  region and reads it back; the layer refuses a texture with a region at creation, section 3.2, which the test
+  does not compare).
+  `GetProtectedResourceSession` on a resource or heap returns `DXGI_ERROR_NOT_FOUND` and nulls the out pointer for
+  any `riid` (the layer has no protected sessions), as the PC runtime does; the PC runtime dereferences a null
+  out pointer (access violation, not compared), where the layer returns `E_POINTER`. Measured on an RTX 4060 Ti host and WARP
+  (Windows 11 build 26300) and compared by `d3d12_resource_desc_test` over committed, placed and reserved
+  buffers and textures (including multisampled, `CreateCommittedResource2/3`, `CreatePlacedResource1` and
+  `CreateReservedResource2`) and two heaps.
 - **Invalid arguments (D3D-49).** `CreateCommittedResource`, `CreateDescriptorHeap`, `CreateCommandQueue`,
   `CreateFence` and `Map` return the host PC runtime's HRESULTs (no debug layer) for the cases in
   `compare_invalid_arguments` (`d3d12_vulkan_device_test`): invalid ones, their valid neighbours, and
