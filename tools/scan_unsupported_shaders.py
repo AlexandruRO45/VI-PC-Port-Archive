@@ -63,6 +63,8 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"s_clause\s+(?:0x[0-3]?[0-9a-f]|[0-5]?[0-9]|6[0-3])",
     r"s_setprio\s+(?:0x[0-3]|[0-3])",
     r"s_sleep\s+(?:0x[0-7]?[0-9a-f]|[0-9]|[1-9][0-9]|1[01][0-9]|12[0-7])",
+    r"s_setreg_imm32_b32\s+hwreg\(HW_REG_FLAT_SCR_(?:LO|HI)\),\s+(?:-?\d+|0x[0-9a-f]{1,8})",
+    r"s_setreg_imm32_b32\s+hwreg\(HW_REG_MODE, 2, 2\),\s+[03]",
     r"s_waitcnt_expcnt\s+(?:(?:null|s\d+),\s*)?(?:0x[0-7]|[0-7])",
     r"s_waitcnt\s+(?:lgkmcnt\(0\)|vmcnt\((?:[0-9]|[1-5][0-9]|6[0-3])\)|expcnt\([0-7]\)|vmcnt\(0\)\s+lgkmcnt\(0\)|lgkmcnt\(0\)\s+vmcnt\(0\))",
     r"s_mov_b64\s+s\[\d+:\d+\],\s+exec",
