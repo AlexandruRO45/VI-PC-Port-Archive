@@ -354,7 +354,42 @@ def check_pure_python_controls() -> None:
         rt.check_compute_pso(Path("dev"), signed_synth, warp_only=False)
         assert mock_run.call_args[0][0] == ["dev", "--compute-pso"]
 
+        # Hardware backend probe helper: exit 5 ("no hardware adapter") maps to None (skip 77),
+        # while other exit codes or warp exit 5 still propagate as failures.
+        mock_run.return_value = subprocess.CompletedProcess(
+            ["dev", "--compute-pso"], 0, b'{"hardware_pso":"0x00000000"}\n', b""
+        )
+        assert _probe_compute_pso(Path("dev"), signed_synth, backend="hardware") == {"hardware_pso": "0x00000000"}
+        assert mock_run.call_args[0][0] == ["dev", "--compute-pso"]
+
+        mock_run.side_effect = subprocess.CalledProcessError(5, ["dev", "--compute-pso"])
+        assert _probe_compute_pso(Path("dev"), signed_synth, backend="hardware") is None
+        try:
+            _probe_compute_pso(Path("dev"), signed_synth, backend="warp")
+        except subprocess.CalledProcessError:
+            pass
+        else:
+            raise AssertionError("_probe_compute_pso swallowed exit 5 on warp backend")
+        mock_run.side_effect = subprocess.CalledProcessError(6, ["dev", "--compute-pso"])
+        try:
+            _probe_compute_pso(Path("dev"), signed_synth, backend="hardware")
+        except subprocess.CalledProcessError:
+            pass
+        else:
+            raise AssertionError("_probe_compute_pso swallowed non-adapter error exit 6")
+        mock_run.side_effect = None
+
     print("pure-python dxil_retarget controls: ok")
+
+
+def _probe_compute_pso(device_probe: Path, blob: bytes, *, backend: str) -> dict | None:
+    """Run root_device_probe --compute-pso; return None on hardware backend exit 5 (no GPU)."""
+    try:
+        return rt.check_compute_pso(device_probe, blob, warp_only=(backend == "warp"))
+    except subprocess.CalledProcessError as exc:
+        if backend == "hardware" and exc.returncode == 5:
+            return None
+        raise
 
 
 def check_validator_fixtures(
@@ -363,9 +398,16 @@ def check_validator_fixtures(
     validator_dll: Path,
     device_probe: Path | None = None,
     offscreen: Path | None = None,
+    backend: str = "warp",
 ) -> int:
     from probe_roots import validate_shader
     from shader_probe_check import file_version, module_outcome
+
+    if backend not in ("warp", "hardware"):
+        raise ValueError(f"Unsupported backend {backend!r}")
+    root_key = f"{backend}_root"
+    pso_key = f"{backend}_pso"
+    sm_key = f"{backend}_shader_model"
 
     tool = Path(__file__).resolve().parents[1] / "tools" / "dxil_retarget.py"
     module_records = []
@@ -440,10 +482,23 @@ def check_validator_fixtures(
             signed_path = tmp_dir / f"{shader_path.stem}_signed.dxbc"
             xb2_path.write_bytes(xb2_blob)
             unsigned_path.write_bytes(retargeted_blob)
+
+            unsigned_pso = None
+            if device_probe is not None:
+                # Negative control 4: unsigned (zero-digest) retargeted DXBC must fail CreateComputePipelineState.
+                unsigned_pso = _probe_compute_pso(device_probe, retargeted_blob, backend=backend)
+                if unsigned_pso is None:
+                    print("No compatible D3D12 hardware adapter visible; skipping hardware DXIL retarget check.")
+                    return SKIP
+                assert unsigned_pso[root_key] == "0x00000000", unsigned_pso
+                assert unsigned_pso[pso_key] != "0x00000000", unsigned_pso
+
             cli_cmd = [sys.executable, "-B", str(tool), str(xb2_path), str(signed_path),
                        "--sign", "--probe", str(probe)]
             if device_probe is not None:
-                cli_cmd.extend(["--pso-probe", str(device_probe), "--warp-only"])
+                cli_cmd.extend(["--pso-probe", str(device_probe)])
+                if backend == "warp":
+                    cli_cmd.append("--warp-only")
             cli_res = json.loads(subprocess.check_output(cli_cmd))
             assert cli_res["signed"] is True
             assert cli_res["digest"] == signed_blob[4:20].hex()
@@ -451,33 +506,37 @@ def check_validator_fixtures(
 
             pso_summary = "skipped"
             if device_probe is not None:
-                # Negative control 4: unsigned (zero-digest) retargeted DXBC must fail CreateComputePipelineState.
-                unsigned_pso = rt.check_compute_pso(device_probe, retargeted_blob, warp_only=True)
-                assert unsigned_pso["warp_root"] == "0x00000000", unsigned_pso
-                assert unsigned_pso["warp_pso"] != "0x00000000", unsigned_pso
-
                 signed_pso = cli_res["pso"]
-                warp_sm = int(signed_pso["warp_shader_model"], 16)
-                if shader_path.name == "compute_root.cso" or warp_sm >= 0x65:
-                    assert signed_pso["warp_root"] == "0x00000000", signed_pso
-                    assert signed_pso["warp_pso"] == "0x00000000", signed_pso
+                adapter_sm = int(signed_pso[sm_key], 16)
+                if shader_path.name == "compute_root.cso" or adapter_sm >= 0x65:
+                    assert signed_pso[root_key] == "0x00000000", signed_pso
+                    assert signed_pso[pso_key] == "0x00000000", signed_pso
 
                     # Negative control 5: flipping one bit in the digest must fail CreateComputePipelineState.
                     tampered_blob = signed_blob[:4] + bytes([signed_blob[4] ^ 1]) + signed_blob[5:]
-                    tampered_pso = rt.check_compute_pso(device_probe, tampered_blob, warp_only=True)
-                    assert tampered_pso["warp_pso"] != "0x00000000", tampered_pso
-                    pso_summary = f"unsigned={unsigned_pso['warp_pso']} signed={signed_pso['warp_pso']} tampered={tampered_pso['warp_pso']}"
+                    tampered_pso = _probe_compute_pso(device_probe, tampered_blob, backend=backend)
+                    assert tampered_pso is not None and tampered_pso[pso_key] != "0x00000000", tampered_pso
+                    pso_summary = (
+                        f"{backend}:unsigned={unsigned_pso[pso_key]} "
+                        f"signed={signed_pso[pso_key]} tampered={tampered_pso[pso_key]}"
+                    )
                 else:
-                    pso_summary = f"skipped_sm=0x{warp_sm:x}"
+                    pso_summary = f"{backend}:skipped_sm=0x{adapter_sm:x}"
 
             if offscreen is not None and shader_path.name == "compute_root.cso":
-                bad_run = subprocess.run([str(offscreen), "warp", "--compute-root-file", str(unsigned_path)],
+                bad_run = subprocess.run([str(offscreen), backend, "--compute-root-file", str(unsigned_path)],
                                          capture_output=True, text=True, timeout=45)
+                if backend == "hardware" and bad_run.returncode == SKIP:
+                    print("No D3D12-capable hardware adapter visible in offscreen_check; skipping.")
+                    return SKIP
                 assert bad_run.returncode == 1 and "Create compute pipeline" in bad_run.stderr, (
                     bad_run.returncode, bad_run.stdout, bad_run.stderr
                 )
-                good_run = subprocess.run([str(offscreen), "warp", "--compute-root-file", str(signed_path)],
+                good_run = subprocess.run([str(offscreen), backend, "--compute-root-file", str(signed_path)],
                                           capture_output=True, text=True, timeout=45)
+                if backend == "hardware" and good_run.returncode == SKIP:
+                    print("No D3D12-capable hardware adapter visible in offscreen_check; skipping.")
+                    return SKIP
                 assert good_run.returncode == 0, (good_run.returncode, good_run.stdout, good_run.stderr)
                 assert "mismatches=0" in good_run.stdout, good_run.stdout
                 pso_summary += " dispatch=ok"
@@ -501,14 +560,15 @@ def main() -> int:
     check_pure_python_controls()
     if len(sys.argv) == 1:
         return 0
-    if len(sys.argv) not in (5, 7):
+    if len(sys.argv) not in (5, 7, 8):
         raise SystemExit(
             "Usage: dxil_retarget_check.py [root_probe.exe shader1.cso shader2.cso dxil.dll "
-            "[root_device_probe.exe offscreen_check.exe]]"
+            "[root_device_probe.exe offscreen_check.exe [warp|hardware]]]"
         )
     probe, shader1, shader2, validator_dll = map(Path, sys.argv[1:5])
-    device_probe, offscreen = (map(Path, sys.argv[5:7]) if len(sys.argv) == 7 else (None, None))
-    return check_validator_fixtures(probe, [shader1, shader2], validator_dll, device_probe, offscreen)
+    device_probe, offscreen = (map(Path, sys.argv[5:7]) if len(sys.argv) >= 7 else (None, None))
+    backend = sys.argv[7] if len(sys.argv) == 8 else "warp"
+    return check_validator_fixtures(probe, [shader1, shader2], validator_dll, device_probe, offscreen, backend=backend)
 
 
 if __name__ == "__main__":
