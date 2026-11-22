@@ -10,6 +10,7 @@
 // A view format the layer does not map yet (its CheckFeatureSupport gives no RENDER_TARGET) is reported and skipped,
 // so the R8 family and the 16-bit integer and normalized formats are covered as soon as their mapping lands.
 // Synthetic data only. LEONIDA_VK_VALIDATION=1 runs it under VK_LAYER_KHRONOS_validation.
+#include "shader_fixture_path.h"
 #include "vk_test_device.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
@@ -263,9 +264,11 @@ int main() {
     const auto library = std::filesystem::temp_directory_path() / "leonida_typeless_families_test";
     std::filesystem::create_directories(library);
     const auto overwrite = std::filesystem::copy_options::overwrite_existing;
-    std::filesystem::copy_file(LEONIDA_TYPELESS_VS_SPV, library / "vs.spv", overwrite);
-    std::filesystem::copy_file(LEONIDA_TYPELESS_PS_FLOAT_SPV, library / "ps_float.spv", overwrite);
-    std::filesystem::copy_file(LEONIDA_TYPELESS_PS_UINT_SPV, library / "ps_uint.spv", overwrite);
+    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TYPELESS_VS_SPV), library / "vs.spv", overwrite);
+    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TYPELESS_PS_FLOAT_SPV), library / "ps_float.spv",
+                               overwrite);
+    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TYPELESS_PS_UINT_SPV), library / "ps_uint.spv",
+                               overwrite);
     {
         std::ofstream index(library / "index.json", std::ios::binary);
         index << "{\"vs\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_program)

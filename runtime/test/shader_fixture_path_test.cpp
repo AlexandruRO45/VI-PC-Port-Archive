@@ -15,6 +15,8 @@ int main() {
         std::ofstream("generated/test.spv") << "packaged";
         const auto original = root / "build" / "test.spv";
         if (vktest::shader_fixture_path(original) != fs::path("generated/test.spv")) result = 1;
+        const auto relocated_ci = fs::path("D:/a/Leonida/Leonida/runtime/build/generated/test.spv");
+        if (vktest::shader_fixture_path(relocated_ci) != fs::path("generated/test.spv")) result = 1;
         fs::create_directory("build");
         std::ofstream(original) << "local";
         if (vktest::shader_fixture_path(original) != original) result = 1;

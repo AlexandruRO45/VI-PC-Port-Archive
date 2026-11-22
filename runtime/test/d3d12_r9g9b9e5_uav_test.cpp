@@ -16,6 +16,7 @@
 //      VK_FORMAT_E5B9G9R9_UFLOAT_PACK32) when glslangValidator compiled the test shader
 //
 // Synthetic data only; no game files. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
+#include "shader_fixture_path.h"
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../src/gfx10_descriptors.h"
@@ -188,7 +189,7 @@ bool run_uav_clear_sequence(ID3D12Device* dev, bool vulkan_device, const std::ve
 }
 
 #ifdef LEONIDA_TEST_CS_R9G9B9E5_UAV_SPV
-bool read_spirv(const char* path, std::vector<std::uint32_t>& out) {
+bool read_spirv(const std::filesystem::path& path, std::vector<std::uint32_t>& out) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) return false;
     const auto size = file.tellg();
@@ -213,7 +214,7 @@ bool run_bindless_roundtrip(vktest::Device& d, VkDescriptorSet set0, VkDescripto
                             const std::array<std::uint32_t, 16>& input_words,
                             std::array<float, 64>& out_rgba) {
     std::vector<std::uint32_t> code;
-    if (!read_spirv(LEONIDA_TEST_CS_R9G9B9E5_UAV_SPV, code)) return false;
+    if (!read_spirv(vktest::shader_fixture_path(LEONIDA_TEST_CS_R9G9B9E5_UAV_SPV), code)) return false;
 
     void* in_ptr = nullptr;
     void* out_ptr = nullptr;

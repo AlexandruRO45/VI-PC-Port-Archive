@@ -6,6 +6,7 @@
 //      hit vs. miss; clean SKIP on GPUs without VK_KHR_acceleration_structure / VK_KHR_ray_query).
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation (Core + Synchronization Validation).
 
+#include "shader_fixture_path.h"
 #include "../shims/d3d12_com.h"
 #include "vulkan_loader.h"
 #include "../src/vulkan_device_filter.h"
@@ -40,7 +41,7 @@ VKAPI_ATTR VkBool32 VKAPI_CALL on_validation(VkDebugUtilsMessageSeverityFlagBits
     return VK_FALSE;
 }
 
-bool read_spv(const char* path, std::vector<std::uint32_t>& words) {
+bool read_spv(const std::filesystem::path& path, std::vector<std::uint32_t>& words) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) return false;
     const auto sz = f.tellg();
@@ -386,7 +387,8 @@ int main() {
 #if defined(LEONIDA_TEST_VS_TRI_SPV) && defined(LEONIDA_TEST_FS_SOLID_SPV)
         if (chosen12.drawIndirectCount) {
             std::vector<std::uint32_t> vs_words, fs_words;
-            if (!read_spv(LEONIDA_TEST_VS_TRI_SPV, vs_words) || !read_spv(LEONIDA_TEST_FS_SOLID_SPV, fs_words))
+            if (!read_spv(vktest::shader_fixture_path(LEONIDA_TEST_VS_TRI_SPV), vs_words) ||
+                !read_spv(vktest::shader_fixture_path(LEONIDA_TEST_FS_SOLID_SPV), fs_words))
                 return fail("read vs_tri/fs_solid spv");
 
             constexpr UINT kW = 16, kH = 16;
@@ -741,7 +743,8 @@ int main() {
 
 #if defined(LEONIDA_TEST_CS_RAYQUERY_SPV)
         std::vector<std::uint32_t> rq_words;
-        if (!read_spv(LEONIDA_TEST_CS_RAYQUERY_SPV, rq_words)) return fail("read cs_rayquery.spv");
+        if (!read_spv(vktest::shader_fixture_path(LEONIDA_TEST_CS_RAYQUERY_SPV), rq_words))
+            return fail("read cs_rayquery.spv");
 
         auto out_desc = make_buf_desc(64);
         ID3D12Resource* out_buf = nullptr;

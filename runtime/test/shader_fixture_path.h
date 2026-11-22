@@ -3,12 +3,15 @@
 #pragma once
 
 #include <filesystem>
+#include <system_error>
 
 namespace vktest {
 inline std::filesystem::path shader_fixture_path(const std::filesystem::path& compiled_path) {
-    if (std::filesystem::is_regular_file(compiled_path)) return compiled_path;
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(compiled_path, ec)) return compiled_path;
     const auto packaged = std::filesystem::path("generated") / compiled_path.filename();
-    if (std::filesystem::is_regular_file(packaged)) return packaged;
+    ec.clear();
+    if (std::filesystem::is_regular_file(packaged, ec)) return packaged;
     // Preserve the original path in the caller's missing-file diagnostic.
     return compiled_path;
 }
