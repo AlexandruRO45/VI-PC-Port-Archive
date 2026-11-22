@@ -5,15 +5,26 @@ using System.Globalization;
 using System.Text.Json;
 using RpfPreview.Core;
 
-if (args.Length < 3) { Console.WriteLine("usage: rpf9dump ttpf|models|textures <source> <outdir> [--start BYTES] [--length BYTES]"); return 2; }
+if (args.Length < 3) { Console.WriteLine("usage: rpf9dump ttpf|models|textures <source> <outdir> [--start BYTES] [--length BYTES] [--history PATH] [--allow-provisional]"); return 2; }
 string mode = args[0], src = Path.GetFullPath(args[1]), outRoot = Path.GetFullPath(args[2]);
 // --start/--length scan one window of the file instead of the whole archive. A window is a raw slice of an
 // archive (`levels.rpf` cut at an offset), so it need not carry the file's header and it is not an
 // ArchiveDocument: models and textures then read every resource from its own compression blocks
 // (tools/rpf9dump/Segments.cs). A window is how a multi-GiB archive is exported a piece at a time.
+// --history (ttpf only) reads local BCPack BC1/BC3/BC4/BC5 initial-history tables, the bc1.json..bc5.json that
+// tools/bcpack_history_calib.py writes, as tools/ttpf_mips.py --history does; --allow-provisional lets BCPack
+// chunks use unconfirmed history entries. Without them the export is strict and uses the built-in tables.
 long scanStart = 0; long? scanLength = null;
+string? historyPath = null; bool allowProvisional = false;
 for (int i = 3; i < args.Length; i += 2)
 {
+    if (args[i] == "--allow-provisional") { allowProvisional = true; i--; continue; }
+    if (args[i] == "--history")
+    {
+        if (i + 1 >= args.Length) { Console.WriteLine("--history needs a JSON file or a folder of bcN.json files."); return 2; }
+        historyPath = args[i + 1];
+        continue;
+    }
     if (i + 1 >= args.Length || !long.TryParse(args[i + 1], NumberStyles.None, CultureInfo.InvariantCulture, out long bytes) || bytes < 0)
     {
         Console.WriteLine($"{args[i]} needs a non-negative byte count.");
@@ -28,6 +39,24 @@ if (window && mode is not ("models" or "textures"))
 {
     Console.WriteLine("--start/--length apply to models and textures; other modes need a recognized archive.");
     return 2;
+}
+if ((historyPath is not null || allowProvisional) && mode != "ttpf")
+{
+    Console.WriteLine("--history/--allow-provisional apply to ttpf.");
+    return 2;
+}
+// Every table is read and checked before the first texture, so a malformed or missing file stops the run instead
+// of turning each BCPack texture into a skip.
+BcpackHistory? history = null;
+if (historyPath is not null)
+{
+    try { history = BcpackHistory.Load(historyPath); }
+    catch (Exception e) when (e is IOException or InvalidDataException or UnauthorizedAccessException)
+    {
+        Console.WriteLine($"--history {historyPath}: {e.Message}");
+        return 2;
+    }
+    Console.WriteLine($"  BCPack history from {history.Source}: {(history.Codecs.Count == 0 ? "no bc1-bc5 tables, built-in tables kept" : string.Join(", ", history.Codecs))}");
 }
 var json = new JsonSerializerOptions { WriteIndented = true };
 var sw = Stopwatch.StartNew();
@@ -60,7 +89,7 @@ if (mode == "ttpf")
                 // Content the decoder cannot handle is a skip like !CanExtract. Pool read errors, DDS write errors,
                 // cancellation and anything unexpected stay failures.
                 byte[]? dds = null;
-                try { dds = TtpfReader.CreateDds(src, t.Index); }
+                try { dds = TtpfReader.CreateDds(src, t.Index, allowProvisional, history); }
                 catch (Exception e) when (e is NotSupportedException or InvalidDataException)
                 { Interlocked.Increment(ref skip); file = null; limitation = e.Message; }
                 if (dds != null) { Util.WriteAllBytes(path, dds); Interlocked.Increment(ref ok); }

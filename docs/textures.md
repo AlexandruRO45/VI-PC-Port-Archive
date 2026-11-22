@@ -39,6 +39,8 @@ data is embedded in the repository). `rpf9dump`'s C# `TtpfReader` (submodule pin
 `breadbbbb/rpf9-explorer#7`) now decodes compact 2D mip tails, multi-slice layouts, DXGI 11,
 and BCPack BC1, BC3, BC4 and BC5 chunks in strict mode; BC6H, BC7 and provisional-history
 chunks remain skipped by `rpf9dump` and can be completed by `tools/ttpf_assets.py`.
+`rpf9dump ttpf` also takes `--history <path>` (the same local `bc1.json`..`bc5.json` tables) and
+`--allow-provisional` (ASSET-316, "Next step" 2).
 
 The compact layout rule moves 206,661 2D textures into complete exports and 1,218 more into
 partial exports (`305,264` complete, `16,419` partial, `35,432` skipped under zlib/raw).
@@ -998,13 +1000,23 @@ DXGI values (the exact-size match supports it).
    fallback when a higher mip is refused in strict mode, and fixing `Core/TtpfReader.cs:70`
    (`Patterns[2]`), which currently uses Navi 1x's `(-3, 3)` at bits 6..7 instead of
    RDNA2/RbPlus `(3, -3)` (`GFX10_SW_64K_D_RBPLUS_PATINFO`).
-2. **Wire optional external `--history` tables into C# `TtpfReader`.** `tools/bcpack_history_calib.py`
-   now derives local `bc1.json`..`bc7.json` history files into `<work>` for the pure-Python
-   decoder (`tools/bcpack.py` / `tools/ttpf_mips.py --history <path>`), either by exact
-   algebraic inversion from reference block/DDS pairs (`--ref-dds`, `--ref-pairs`, yielding
-   confirmed strict-mode entries) or by read-only pool self-calibration across mixed
-   BCPack + raw/zlib mip chains (yielding provisional entries). Once BC6H/BC7 land in
-   `TtpfReader`, it can consume the same local directory.
+2. **Done for BC1/BC3/BC4/BC5 (ASSET-316): external `--history` tables in C# `TtpfReader`.**
+   `tools/bcpack_history_calib.py` derives local `bc1.json`..`bc7.json` history files for the
+   pure-Python decoder (`tools/bcpack.py` / `tools/ttpf_mips.py --history <path>`), either by
+   exact algebraic inversion from reference block/DDS pairs (`--ref-dds`, `--ref-pairs`,
+   yielding confirmed strict-mode entries) or by read-only pool self-calibration across mixed
+   BCPack + raw/zlib mip chains (yielding provisional entries). rpf9-explorer's
+   `BcpackHistory.Load(path)` reads the same file or directory with the same schema, lookup
+   (`bcN.json` in a folder, a `"bcN"` key or `"codec": "bcN"` in a file, built-in tables for a
+   codec without one), merge/`replace` rules and error messages as
+   `bcpack_tables_bptc.load_bc_history`, and `TtpfReader.CreateDds` / `DecodeTexturePixels` /
+   `DecodeTexturePreview` take it next to `allowProvisional`:
+   `rpf9dump ttpf <pool.ttpf> <out> --history <dir> [--allow-provisional]`. Unlike the Python
+   decoder, which reads a codec's table when it first decodes that codec, `rpf9dump` reads every
+   BC1-BC5 table before the first texture and exits 2 on a malformed or missing one. Self-calibrated
+   tables only hold provisional entries, so they change the output only with `--allow-provisional`.
+   What is left: `bc6h.json` / `bc7.json` are ignored until the BC6H/BC7 rebuilders land in
+   `TtpfReader` ("Next step" 1, ASSET-315).
 
 ## Reproduce
 
@@ -1021,6 +1033,7 @@ python -I tools/ttpf_mips.py scan <game root> --json scan.json [--tuples]
 python -I tools/ttpf_mips.py layout <pool.ttpf> <index>
 python -I tools/ttpf_mips.py check <pool.ttpf> <index> [--allow-provisional] [--history <path>]
 python -I tools/ttpf_mips.py export <pool.ttpf> <index> <out.dds> [--allow-provisional] [--history <path>]
+dotnet tools/rpf9dump/bin/Release/net8.0/rpf9dump.dll ttpf <pool.ttpf> <out> [--history <path>] [--allow-provisional]
 python -I tests/test_bcpack.py
 python -I tests/test_bcpack_history_calib.py
 python -I tests/test_tex_headers.py

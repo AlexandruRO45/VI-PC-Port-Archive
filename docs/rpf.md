@@ -97,7 +97,7 @@ not decrypt the TOC either.
 
 ```powershell
 dotnet build tools/rpf9dump/rpf9dump.csproj -c Release
-rpf9dump ttpf    <pool.ttpf>  <out>
+rpf9dump ttpf    <pool.ttpf>  <out> [--history <bcN.json folder>] [--allow-provisional]
 rpf9dump models <archive.rpf> <out>
 rpf9dump textures <archive.rpf> <out>
 rpf9dump audio  <audio.rpf>  <out>

@@ -124,6 +124,94 @@ Check(ScanCounts.IsFullScan(Index(string.Format(System.Globalization.CultureInfo
 Check(!ScanCounts.IsFullScan(null), "no cached index");
 Console.WriteLine("Cached index tests passed.");
 
+// External BCPack history tables (BcpackHistory, rpf9dump --history): the same JSON tools/bcpack_history_calib.py writes
+// and tools/bcpack.py reads. The chunks are one-block BCPack streams from tests/test_bcpack.py's synthetic encoder (zero
+// deltas, so a block's endpoints are its history entry), and every expected result is what tools/bcpack.py returns for
+// the same chunk and table: decoded bytes, then "|" and the provisional labels, or "refused:" and the message.
+string ListForm = System.Text.Json.JsonSerializer.Serialize(new Dictionary<string, object> { ["bc1.json"] = new Dictionary<string, object>
+    { ["codec"] = "bc1", ["replace"] = true, ["confirmed"] = Enumerable.Range(0, 256).Select(i => new[] { i % 32, i % 64, 0, 0, 0, i % 32 }).ToArray() } });
+
+var decodeCases = new (string Name, Func<byte[]> Chunk, int Codec, int Size, string? Docs, bool Folder, bool Provisional, string Expected)[]
+{
+    ("bc1 provisional entry, no tables, strict", Bc1Entry6, 1, 8, null, true, false, "refused:BC1 block 0 references unconfirmed built-in history entry 6"),
+    ("bc1 provisional entry, no tables, provisional", Bc1Entry6, 1, 8, null, true, true, "0B63C639AAAAAAAA|BC1 history 6"),
+    ("bc1 entry confirmed by table", Bc1Entry6, 1, 8, "{\"bc1.json\": {\"codec\": \"bc1\", \"confirmed\": {\"6\": [1, 2, 3, 4, 5, 6]}, \"provisional\": {}}}", true, false, "4308A620AAAAAAAA"),
+    ("bc1 table provisional overrides built-in provisional", Bc1Entry6, 1, 8, "{\"bc1.json\": {\"codec\": \"bc1\", \"provisional\": {\"6\": [31, 63, 31, 0, 1, 2]}}}", true, true, "FFFF2200AAAAAAAA|BC1 history 6"),
+    ("bc1 table provisional never overrides built-in confirmed", Bc1Entry255, 1, 8, "{\"bc1.json\": {\"codec\": \"bc1\", \"provisional\": {\"255\": [31, 63, 31, 0, 1, 2]}}}", true, false, "01000000AAAAAAAA"),
+    ("bc1 replace drops built-in confirmed", Bc1Entry255, 1, 8, "{\"bc1.json\": {\"codec\": \"bc1\", \"replace\": true}}", true, true, "refused:BC1 block 0 references unknown built-in history entry 255"),
+    ("bc1 replace keeps table provisional", Bc1Entry255, 1, 8, "{\"bc1.json\": {\"codec\": \"bc1\", \"replace\": 1, \"provisional\": {\"255\": [3, 4, 5, 6, 7, 8]}}}", true, false, "refused:BC1 block 0 references unconfirmed built-in history entry 255"),
+    ("bc1 replace keeps table provisional, provisional", Bc1Entry255, 1, 8, "{\"bc1.json\": {\"codec\": \"bc1\", \"replace\": 1, \"provisional\": {\"255\": [3, 4, 5, 6, 7, 8]}}}", true, true, "8518E830AAAAAAAA|BC1 history 255"),
+    ("bc1 256-list form", Bc1Entry6, 1, 8, ListForm, true, false, "C0300600AAAAAAAA"),
+    ("bc1 combined file section", Bc1Entry6, 1, 8, "{\"history.json\": {\"bc1\": {\"confirmed\": {\"6\": [9, 9, 9, 9, 9, 9]}}, \"bc7\": {\"historyEndpoints\": {}}}}", false, false, "29492949AAAAAAAA"),
+    ("bc1 combined file without bc1 keeps built-in", Bc1Entry6, 1, 8, "{\"history.json\": {\"bc4\": {\"confirmed\": {}}}}", false, true, "0B63C639AAAAAAAA|BC1 history 6"),
+    ("bc1 file without codec marker keeps built-in", Bc1Entry6, 1, 8, "{\"bc1.json\": {\"confirmed\": {\"6\": [1, 1, 1, 1, 1, 1]}}}", true, true, "0B63C639AAAAAAAA|BC1 history 6"),
+    ("bc1 folder without bc1.json keeps built-in", Bc1Entry6, 1, 8, "{\"bc4.json\": {\"codec\": \"bc4\", \"confirmed\": {\"25\": [1, 2]}}}", true, true, "0B63C639AAAAAAAA|BC1 history 6"),
+    ("bc1 string and float values as Python int()", Bc1Entry6, 1, 8, "{\"bc1.json\": {\"codec\": \"bc1\", \"confirmed\": {\" 6\": [\"7\", 8.9, true, \"+1\", 0, 2]}}}", true, false, "01390208AAAAAAAA"),
+    ("bc4 unknown entry, no tables, strict", Bc4Entry1, 4, 8, null, true, false, "refused:BC4 block 0 references unknown built-in history entry 1"),
+    ("bc4 unknown entry confirmed by table", Bc4Entry1, 4, 8, "{\"bc4.json\": {\"codec\": \"bc4\", \"confirmed\": {\"1\": [200, 17]}}}", true, false, "C811499224499224"),
+    ("bc4 provisional entry confirmed by table", Bc4Entry25, 4, 8, "{\"bc4.json\": {\"codec\": \"bc4\", \"confirmed\": {\"25\": [10, 250]}}}", true, false, "0AFA499224499224"),
+    ("bc4 replace without the entry", Bc4Entry25, 4, 8, "{\"bc4.json\": {\"codec\": \"bc4\", \"replace\": true, \"confirmed\": {\"1\": [1, 1]}}}", true, true, "refused:BC4 block 0 references unknown built-in history entry 25"),
+};
+
+var malformedCases = new (string Name, string Docs, bool Folder, string Message)[]
+{
+    ("value out of range", "{\"bc1.json\": {\"codec\": \"bc1\", \"confirmed\": {\"6\": [32, 0, 0, 0, 0, 0]}}}", true, "bc1 confirmed[6] value 32 outside 0..31"),
+    ("wrong tuple length", "{\"bc1.json\": {\"codec\": \"bc1\", \"confirmed\": {\"6\": [1, 2, 3]}}}", true, "bc1 confirmed[6] must have 6 integers"),
+    ("index out of range", "{\"bc1.json\": {\"codec\": \"bc1\", \"confirmed\": {\"256\": [1, 2, 3, 4, 5, 6]}}}", true, "history entry index 256 outside 0..255"),
+    ("list not 256 entries", "{\"bc1.json\": {\"codec\": \"bc1\", \"confirmed\": [[0, 0, 0, 0, 0, 0]]}}", true, "expected 256 entries, got 1"),
+    ("table not list or dict", "{\"bc1.json\": {\"codec\": \"bc1\", \"provisional\": 5}}", true, "history table must be a 256-element list or index-keyed dict"),
+    ("section not an object", "{\"history.json\": {\"bc1\": [1, 2]}}", false, "bc1 history section must be a JSON object"),
+    ("codec mismatch", "{\"history.json\": {\"bc1\": {\"codec\": \"bc4\"}}}", false, "expected codec 'bc1', got 'bc4'"),
+    ("negative value", "{\"bc1.json\": {\"codec\": \"bc1\", \"provisional\": {\"6\": [-1, 0, 0, 0, 0, 0]}}}", true, "bc1 provisional[6] value -1 outside 0..31"),
+    ("top level not an object", "{\"history.json\": [1, 2, 3]}", false, "<path>: expected a JSON object"),
+};
+
+string historyRoot = Directory.CreateTempSubdirectory("bcpack-history-test").FullName;
+try
+{
+    int n = 0;
+    foreach (var c in decodeCases)
+    {
+        BcpackHistory? history = c.Docs is null ? null : BcpackHistory.Load(WriteDocs(Path.Combine(historyRoot, (n++).ToString()), c.Docs, c.Folder));
+        string actual;
+        try
+        {
+            var r = BcpackDecoder.DecodeWithInfo(c.Chunk(), c.Codec, c.Size, c.Provisional, history);
+            actual = Convert.ToHexString(r.Data) + (r.ProvisionalEntries.Count > 0 ? "|" + string.Join(";", r.ProvisionalEntries.Order(StringComparer.Ordinal)) : "");
+        }
+        catch (BcpackProvisionalException e) { actual = "refused:" + e.Message.TrimEnd('.'); }
+        Check(actual == c.Expected, $"history decode '{c.Name}': expected {c.Expected}, got {actual}");
+    }
+    foreach (var c in malformedCases)
+    {
+        string path = WriteDocs(Path.Combine(historyRoot, (n++).ToString()), c.Docs, c.Folder);
+        try { BcpackHistory.Load(path); Check(false, $"malformed history '{c.Name}' is refused"); }
+        catch (InvalidDataException e) { Check(e.Message.Replace(path, "<path>") == c.Message, $"malformed history '{c.Name}': expected {c.Message}, got {e.Message}"); }
+    }
+    try { BcpackHistory.Load(Path.Combine(historyRoot, "missing")); Check(false, "a missing history path is refused"); }
+    catch (FileNotFoundException) { }
+    var bc7Only = BcpackHistory.Load(WriteDocs(Path.Combine(historyRoot, "bc7"), "{\"bc7.json\": {\"historyEndpoints\": {}}}", true));
+    Check(bc7Only.Codecs.Count == 0, "a folder with only BC6H/BC7 tables loads no BC1-BC5 table");
+    // Without tables (or with a null history) the decode is the built-in one, byte for byte.
+    Check(BcpackDecoder.Decode(Bc1Entry6(), 1, 8, true).AsSpan().SequenceEqual(BcpackDecoder.Decode(Bc1Entry6(), 1, 8, true, null)), "null history is the built-in table");
+}
+finally { Directory.Delete(historyRoot, true); }
+Console.WriteLine("BCPack history table tests passed.");
+
+static string WriteDocs(string dir, string docs, bool folder)
+{
+    Directory.CreateDirectory(dir);
+    string? last = null;
+    foreach (var p in System.Text.Json.JsonDocument.Parse(docs).RootElement.EnumerateObject())
+        File.WriteAllText(last = Path.Combine(dir, p.Name), p.Value.GetRawText());
+    return folder ? dir : last!;
+}
+
+static byte[] Bc1Entry6() => Convert.FromHexString("10101010101010100203030303030303010120402020402000010410040410040B0000000000000002051105051105100310101001030303010101010001010102000000020202");
+static byte[] Bc1Entry255() => Convert.FromHexString("1010101010101010020303030303030301012040202040200001041004041004020000000000000002051105051105100310101001030303010101010001010102000000020202");
+static byte[] Bc4Entry1() => Convert.FromHexString("1010101010101010020303030303030301010101404040400001010110101010010000000000000002020211111111100310101040030303104040400010101011000000111111");
+static byte[] Bc4Entry25() => Convert.FromHexString("1010101010101010020303030303030301010101404040400001010110101010310000000000000002020211111111100310101040030303104040400010101011000000111111");
+
 static void Check(bool ok, string what)
 {
     if (!ok) throw new Exception($"Failed: {what}");
