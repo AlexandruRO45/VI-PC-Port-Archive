@@ -544,6 +544,45 @@ def ldexp_values():
         "v_ldexp_f32 v14, s46, -2",
         "v_ldexp_f32 v15, s47, 3 clamp",
     ])
+# v_sin_f32 and v_cos_f32 take revolutions, sin(2 * pi * x). D3D bounds sin and cos only to 0.0008
+# absolute in [-100 pi, 100 pi], so each result is quantized to 1/32 steps by exact operations
+# (times 32, plus 0.5, floor, times 1/32) and every reference lies at least 0.1 step from a boundary.
+TRIG_BODY = [
+    "v_sin_f32_e32 v12, s44",
+    "v_cos_f32_e32 v13, s45",
+    "v_sin_f32_e64 v14, -|s46|",
+    "v_cos_f32_e64 v15, -s47 clamp",
+] + [line for reg in ("v12", "v13", "v14", "v15") for line in (
+    f"v_mul_f32_e32 {reg}, 0x42000000, {reg}",
+    f"v_add_f32_e32 {reg}, 0.5, {reg}",
+    f"v_floor_f32_e32 {reg}, {reg}",
+    f"v_mul_f32_e32 {reg}, 0x3d000000, {reg}",
+)]
+# Each case covers all four quadrants across its channels and one input of millions of turns, where
+# multiplying the unreduced input by 2 pi in binary32 moves the quantized result by 20 or more steps.
+TRIG_CASES = (
+    (-4000000.25, 0.125, -0.375, 0.5),
+    (-0.125, 4000000.25, 2.75, -0.125),
+    (0.25, -1.625, -4000000.5, 0.0),
+    (-0.375, 0.375, 0.0625, 2000000.75),
+)
+
+
+def trig_reference(case, swap=False):
+    """The quantized four channels of TRIG_BODY, from a double-precision reduction of each input."""
+    channels = []
+    for kind, x, saturate in zip(("sin", "cos", "sin", "cos"), (case[0], case[1], -abs(case[2]), -case[3]),
+                                 (False, False, False, True)):
+        if swap:
+            kind = "cos" if kind == "sin" else "sin"
+        value = (math.sin if kind == "sin" else math.cos)(2 * math.pi * math.remainder(x, 1.0))
+        if saturate:
+            value = min(1.0, max(0.0, value))
+        scaled = value * 32 + 0.5
+        # Only a drawn reference needs the margin; the swapped values merely have to differ from it.
+        assert swap or abs(scaled - round(scaled)) >= 0.1, (case, kind, value)
+        channels.append(math.floor(scaled) / 32)
+    return channels
 
 
 def reciprocal_iflag():
@@ -1898,6 +1937,38 @@ def scalar_body():
     return body
 
 
+def sext_values():
+    body = []
+    for index, width in enumerate((8, 16)):
+        body.extend(["s_cmp_eq_u32 s47, 1", f"s_sext_i32_i{width} s62, s44",
+                     "s_cselect_b32 s63, 0x3f800000, 0",
+                     f"v_mov_b32_e32 v{14 + index}, s63",
+                     f"s_cmp_eq_u32 s62, s{45 + index}", "s_cselect_b32 s63, 0x3f800000, 0",
+                     f"v_mov_b32_e32 v{12 + index}, s63"])
+    return with_constants(body)
+
+
+def check_sext_draw(directory, compiler, renderer, backend):
+    source = directory / "sext.hlsl"
+    shader = directory / "sext.cso"
+    case = directory / "sext.case"
+    source.write_text(translate(sext_values()), encoding="ascii")
+    subprocess.run([compiler, "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    for index, word in enumerate((0xabcd807f, 0xabcd7f80, 0xabcd0000, 0x1234ffff)):
+        flag = index % 2
+        raw = word.to_bytes(4, "little")
+        expected = [int.from_bytes(raw[:size], "little", signed=True) for size in (1, 2)]
+        constants = bytearray(256)
+        struct.pack_into("<IiiI", constants, 12, word, *expected, flag)
+        case.write_bytes(constants + struct.pack("<4f", 1, 1, flag, flag) * 64)
+        subprocess.run(draw, check=True)
+    # Replacing both signed references with their zero-extended values must change both channels.
+    struct.pack_into("<II", constants, 16, 255, 65535)
+    case.write_bytes(constants + struct.pack("<4f", 0, 0, flag, flag) * 64)
+    subprocess.run(draw, check=True)
+
+
 def scalar():
     return with_constants(scalar_body())
 
@@ -2130,6 +2201,95 @@ def check_sdwa_draw(directory, compiler, renderer, backend):
             result = subprocess.run(draw, capture_output=True, text=True)
             if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
                 raise AssertionError(f"A wrong SDWA selection escaped detection for {words} in channel {channel}")
+
+
+# SDWA moves and half widening. In SDWA_PRESERVE_BODY each move writes a 16-bit field into WORD_0 of a register
+# holding 1.0 and keeps its high half, so the word is 1 + f * 2^-23; (v - 1) * 2^23 is split into the low and high
+# bytes of f. Channels 0 and 1 read WORD_1 of S0; channels 2 and 3 read BYTE_2 of S1 sign-extended to 16 bits.
+# SDWA_PAD_BODY writes BYTE_0 of S0 to BYTE_3 and WORD_0 of S2 to WORD_1 with zero padding, and widens each half
+# of S1, the low one through -|x|. Each constant set has wrong references (channel, value) for one selection.
+def sdwa_arith(op, dst, operands, dst_sel="DWORD", unused="UNUSED_PAD", clamp=False):
+    sels = " src0_sel:DWORD src1_sel:DWORD" if len(operands) == 2 else " src0_sel:DWORD"
+    return (f"v_{op}_f32_sdwa {dst}, {', '.join(operands)}{' clamp' if clamp else ''}"
+            f" dst_sel:{dst_sel} dst_unused:{unused}{sels}")
+
+
+SDWA_ARITH = (
+    ([
+        "v_mov_b32_e32 v18, s45",
+        sdwa_arith("add", "v12", ["s44", "v18"]),
+        sdwa_arith("sub", "v13", ["-s44", "v18"]),
+        sdwa_arith("subrev", "v14", ["s46", "v18"], clamp=True),
+        sdwa_arith("mul", "v15", ["-|s46|", "v18"]),
+    ], (1.5, 2.25, -3.0, 0.0), [3.75, -3.75, 1.0, -6.75], ((0, 0.75), (1, -0.75), (2, 5.25), (3, 6.75))),
+    ([
+        "v_mov_b32_e32 v18, s45",
+        "v_mov_b32_e32 v19, s47",
+        sdwa_arith("max", "v12", ["s44", "v18"]),
+        sdwa_arith("min", "v13", ["0.5", "v18"]),
+        sdwa_arith("mul_legacy", "v14", ["s46", "v19"]),
+        sdwa_arith("floor", "v15", ["-s45"]),
+    ], (-0.75, 2.5, 0.0, math.inf), [2.5, 0.5, 0.0, -3.0], ((0, -0.75), (1, 2.5), (2, -0.0), (3, -2.0))),
+    ([
+        sdwa_arith("ceil", "v12", ["s44"]),
+        sdwa_arith("fract", "v13", ["-s45"]),
+        sdwa_arith("trunc", "v14", ["|s46|"]),
+        "v_mov_b32_e32 v19, 0",
+        sdwa_arith("add", "v15", ["s47", "v19"], dst_sel="BYTE_3"),
+    ], (-1.25, 2.75, -2.5, 0x3f800040), [-1.0, 0.25, 2.0, 2.0], ((0, -2.0), (1, 0.75), (2, -2.0), (3, 1.0))),
+    ([
+        "v_mov_b32_e32 v18, s45",
+        "v_mov_b32_e32 v12, 1.0",
+        sdwa_arith("mul", "v12", ["s44", "v18"], "WORD_0", "UNUSED_PRESERVE"),
+        *sdwa_readback("v12", "v13"),
+        "v_mov_b32_e32 v14, 1.0",
+        sdwa_arith("floor", "v14", ["s46"], "BYTE_2", "UNUSED_PRESERVE"),
+        sdwa_arith("mul", "v15", ["s47", "v18"], "WORD_1"),
+    ], (0x3f801234, 1.0, 8388613.0, 0xc0a03fff), [52.0, 18.0, 0.51953125, 1.9921875],
+     ((0, 128.0), (1, 63.0), (2, 1.0), (3, -5.0))),
+)
+
+
+def sdwa_arith_reference(index, inputs):
+    """Python binary32 arithmetic on the constant words, independent of the lowering."""
+    as_float = lambda w: struct.unpack("<f", struct.pack("<I", w))[0]
+    bits = lambda x: struct.unpack("<I", struct.pack("<f", x))[0]
+    x, y, z, w = (as_float(v) if isinstance(v, int) else v for v in inputs)
+    if index == 0:
+        return [x + y, -x - y, min(max(y - z, 0.0), 1.0), -abs(z) * y]
+    if index == 1:
+        return [max(x, y), min(0.5, y), 0.0 if z == 0 or w == 0 else z * w, float(math.floor(-y))]
+    if index == 2:
+        return [float(math.ceil(x)), -y - math.floor(-y), float(math.trunc(abs(z))), as_float((bits(w + 0.0) & 0xff) << 24)]
+    product = bits(x * y) & 0xffff
+    return [float(product & 0xff), float(product >> 8),
+            as_float((0x3f800000 & ~0xff0000) | ((bits(float(math.floor(z))) & 0xff) << 16)), as_float((bits(w * y) & 0xffff) << 16)]
+
+
+def check_sdwa_arith_draws(directory, compiler, renderer, backend):
+    case = directory / "sdwa_arith.case"
+    for index, (body, inputs, expected, wrongs) in enumerate(SDWA_ARITH):
+        assert sdwa_arith_reference(index, inputs) == expected, (index, sdwa_arith_reference(index, inputs))
+        source = directory / f"sdwa_arith{index}.hlsl"
+        shader = directory / f"sdwa_arith{index}.cso"
+        source.write_text(translate(with_constants(body)), encoding="ascii")
+        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        words = [v if isinstance(v, int) else struct.unpack("<I", struct.pack("<f", v))[0] for v in inputs]
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        for x in (*expected, *(value for _, value in wrongs)):
+            assert half_rtz(x) == x, x
+        draw = [renderer, backend, "--check-pixel-case", shader, case]
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+        for channel, value in wrongs:
+            assert struct.pack("<f", value) != struct.pack("<f", expected[channel])
+            wrong_values = list(expected)
+            wrong_values[channel] = value
+            case.write_bytes(constants + struct.pack("<4f", *wrong_values) * 64)
+            result = subprocess.run(draw, capture_output=True, text=True)
+            if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
+                raise AssertionError(f"A wrong SDWA arithmetic result escaped detection in program {index}, channel {channel}")
 
 
 def check_constant_descriptor_bounds() -> None:
@@ -3031,6 +3191,15 @@ def check_controls(directory):
                                      "v_mov_b32_sdwa v20, s44 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:WORD_0",
                                      "v_mov_b32_sdwa v13, v20 dst_sel:DWORD dst_unused:UNUSED_PRESERVE src0_sel:DWORD"])).split("float4 main", 1)[1]
     assert "asuint((-0.5f))" in body, body
+    # SDWA arithmetic takes whole-dword sources only and refuses output modifiers and a src1_sel on a unary op.
+    body = translate(with_constants(SDWA_ARITH[3][0])).split("float4 main", 1)[1]
+    assert body.count("& 0xffff0000u) | ") == 1 and body.count("& 0xff00ffffu) | ") == 1, body
+    must_reject(translate, with_constants(["v_mov_b32_e32 v18, s45", sdwa_arith("add", "v12", ["s44", "v18 mul:2"])]))
+    must_reject(translate, with_constants([sdwa_arith("add", "v12", ["s44", "v13"]).replace("src0_sel:DWORD", "src0_sel:WORD_1")]))
+    must_reject(translate, with_constants([sdwa_arith("floor", "v12", ["s44"]) + " src1_sel:DWORD"]))
+    # A partial UNUSED_PRESERVE result needs a tracked numeric destination, as for SDWA moves.
+    for register in ("v0", "v8", "v20"):
+        must_reject(translate, with_constants([sdwa_arith("floor", register, ["s44"], "BYTE_2", "UNUSED_PRESERVE")]))
 
     program = assembly(False)
     for old, new in (("s_mov_b32 s21, 0", "s_mov_b32 s21, 1"),
@@ -3090,6 +3259,11 @@ def check_controls(directory):
     for register in ("v12", "v13", "v14", "v15"):
         must_reject(translate, program[:wait] + [f"v_mov_b32_e32 {register}, 1.0"] + program[wait:])
     must_reject(translate, program[:wait] + ["v_ceil_f32_e32 v12, 1.0"] + program[wait:])
+    must_reject(translate, program[:wait] + ["v_sin_f32_e32 v12, 1.0"] + program[wait:])
+    must_reject(translate, program[:wait] + ["v_cos_f32_e64 v13, 1.0"] + program[wait:])
+    trig = translate(with_constants(TRIG_BODY))
+    assert trig.count("sin32(") == 3 and trig.count("cos32(") == 3, trig  # two calls plus each definition
+    assert "saturate(cos32((-params" in trig and "sin32((-abs(" in trig and "cos32(params" in trig, trig
     free = translate(program[:wait] + ["v_mov_b32_e32 v21, 1.0"] + program[wait:])
     assert free.index("tex.Sample") < free.index("= 1.0f;") < free.index("= sample16.x;")
     late = translate(program[:wait+1] + ["v_mov_b32_e32 v12, 1.0"] + program[wait+1:])
@@ -3433,7 +3607,9 @@ def check_binary(directory, assembler, objcopy, library):
                 (truncate_values(), translate), (affine_coordinates(), translate), (ceiling(), translate),
                 (scalar64(), translate), (sopk_scalar(), translate)]
     fixtures.append((rgb_sample(), translate))
+    fixtures.append((with_constants(TRIG_BODY), translate))
     fixtures.append((with_constants(CLASS_BODY), translate))
+    fixtures.append((sext_values(), translate))
     fixtures.append((with_constants(RECIPROCAL_BODY), translate))
     fixtures.append((bitwise_program(), translate))
     fixtures.append((fract_values(), translate))
@@ -3468,6 +3644,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((scheduling_hints(), translate))
     fixtures.extend((buffer_color(rg), translate_buffer_color) for rg in (False, True))
     fixtures.extend((attribute_color(rg), translate_attribute) for rg in (False, True))
+    fixtures.extend((with_constants(body), translate) for body, *_ in SDWA_ARITH)
     fixtures.append((with_constants(PK_INT16_BODY), translate))
     fixtures.extend((with_constants(body), translate) for body in (SDWA_PRESERVE_BODY, SDWA_PAD_BODY))
     exp_sync_program = ["s_waitcnt_expcnt null, 0"] + assembly(False)[:-1] + ["s_waitcnt_expcnt null, 0", "s_endpgm"]
@@ -3799,6 +3976,53 @@ def check_offset_nibble_draws(directory, compiler, renderer, backend):
     result = subprocess.run(draw, capture_output=True, text=True)
     if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
         raise AssertionError("Reading the nibble without its sign escaped detection")
+def check_trig_draws(directory, compiler, renderer, backend):
+    source = directory / "trig.hlsl"
+    shader = directory / "trig.cso"
+    case = directory / "trig.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+    instructions = with_constants(TRIG_BODY)
+    hlsl = translate(instructions)
+
+    def write_case(inputs):
+        constants = bytearray(256)
+        struct.pack_into("<4f", constants, 12, *inputs)
+        case.write_bytes(constants + struct.pack("<4f", *trig_reference(inputs)) * 64)
+
+    source.write_text(hlsl, encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    for inputs in TRIG_CASES:
+        write_case(inputs)
+        subprocess.run(draw, check=True)
+
+    def mismatches(text):
+        source.write_text(text, encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        detected = []
+        for inputs in TRIG_CASES:
+            write_case(inputs)
+            wrong = subprocess.run(draw, capture_output=True, text=True)
+            if wrong.returncode not in (0, 1) or (wrong.returncode == 1) != ("pixel_mismatch" in wrong.stderr):
+                raise AssertionError(f"Unexpected renderer result {wrong.returncode}: {wrong.stderr}")
+            detected.append(wrong.returncode == 1)
+        return detected
+
+    # Both controls change at least one quantized channel of every case by many steps.
+    swapped = [line.replace("v_sin_f32", "v_tmp").replace("v_cos_f32", "v_sin_f32").replace("v_tmp", "v_cos_f32")
+               for line in instructions]
+    assert all(trig_reference(inputs, swap=True) != trig_reference(inputs) for inputs in TRIG_CASES)
+    reduced_argument = "(turns(value) * 6.28318548f)"
+    assert hlsl.count(reduced_argument) == 2, hlsl
+    for name, text in (("calls swapped between sine and cosine", translate(swapped)),
+                       ("radians instead of turns", hlsl.replace(reduced_argument, "(value)"))):
+        if not all(mismatches(text)):
+            raise AssertionError(f"Sine and cosine with {name} escaped detection")
+    # Without the reduction, a binary32 x * 2 pi of the large inputs moves each case by 20 or more steps.
+    # Whether the adapter shows it depends on the precision of its own sin and cos argument handling, so
+    # the count is reported rather than required; the reduced draws above must match on every adapter.
+    unreduced = mismatches(hlsl.replace(reduced_argument, "(value * 6.28318548f)"))
+    print(f"trig_unreduced_mismatches={sum(unreduced)}/{len(unreduced)}")
 
 
 def check_rgb_sample_draw(directory: Path, compiler: str, renderer: str, backend: str) -> None:
@@ -3848,6 +4072,7 @@ def check_render(directory, compiler, renderer, backend, *, core_only=False):
         subprocess.run([compiler, "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
         subprocess.run([renderer, backend, "--check-pixel", shader, "rgba"], check=True)
     check_rgb_sample_draw(directory, compiler, renderer, backend)
+    check_trig_draws(directory, compiler, renderer, backend)
     program = arithmetic()
     source.write_text(translate(program), encoding="ascii")
     subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
@@ -4020,6 +4245,7 @@ def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
     check_class_draw(directory, compiler, renderer, backend)
     check_predicate_draws(directory, compiler, renderer, backend)
     check_int_predicate_draws(directory, compiler, renderer, backend)
+    check_sext_draw(directory, compiler, renderer, backend)
     check_int16_predicate_draws(directory, compiler, renderer, backend)
     check_sdwa_predicate_draws(directory, compiler, renderer, backend)
     check_literal_fma_draw(directory, compiler, renderer, backend)
@@ -4045,6 +4271,7 @@ def check_blend_and_scalar_draws(directory, compiler, renderer, backend):
         raise AssertionError("Swapped blend weights escaped detection")
     check_cube_draw(directory, compiler, renderer, backend)
     check_sdwa_draw(directory, compiler, renderer, backend)
+    check_sdwa_arith_draws(directory, compiler, renderer, backend)
     check_fract_draw(directory, compiler, renderer, backend)
     check_reciprocal_draw(directory, compiler, renderer, backend)
     check_int_minmax_draws(directory, compiler, renderer, backend)

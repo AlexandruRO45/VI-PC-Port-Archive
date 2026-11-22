@@ -254,6 +254,16 @@ def check_shader_records():
         pixel.check_controls(Path(tmp))
     assert {"s_nop", "s_clause", "s_setprio", "s_sleep", "image_sample"} <= pixel.ACCEPTED
     assert "s_branch" not in pixel.ACCEPTED and "s_code_end" not in pixel.ACCEPTED
+    # The trigonometry fixture covers both encodings of v_sin_f32 and v_cos_f32 once its test passes.
+    trig = {("VOP1", "v_sin_f32"), ("VOP1", "v_cos_f32"), ("VOP3", "v_sin_f32_e64"), ("VOP3", "v_cos_f32_e64")}
+    assert trig <= gfx and trig <= fc.gfx_forms(pixel.ACCEPTED, gfx)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = sample_repo(Path(tmp) / "repo", {})
+        words = {"v_sin_f32_e32", "v_sin_f32_e64", "v_cos_f32_e32", "v_cos_f32_e64"}
+        assert words <= pixel.ACCEPTED
+        covered = fc.measure({"pixel_aot_warp": "pass"}, root, {"pixel_aot_warp": set(pixel.ACCEPTED)})
+        without = fc.measure({"pixel_aot_warp": "pass"}, root, {"pixel_aot_warp": pixel.ACCEPTED - words})
+        assert covered["gfx1013"]["covered"] == without["gfx1013"]["covered"] + len(trig)
     # Every newly lowered 64-bit SOP1/SOP2 and 32-bit BFE form is counted in both gfx1013 and rdna2,
     # while rejected neighbors (exec save/restore, #257 ops, 64-bit BFE/cselect) stay out of covered.
     scalar64_forms = {

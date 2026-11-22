@@ -107,7 +107,7 @@ CONTROLS = {
     # AND sets PF for odd parity; TEST is unchanged.
     "andparity": (re.compile(r"& 0xfu\)\) & 1u\) == 0;( zero = v == 0;)"), r"& 0xfu)) & 1u) == 1;\1"),
     # FCOMI and FUCOMIP clear C0, C2 and C3.
-    "fcomiclear": (re.compile(r"(carry = r == 0 \|\| r == 3;) \}"), r"\1 x87_sw = 0; }"),
+    "fcomiclear": (re.compile(r"(carry = r == 0 \|\| r == 3; overflow = false;) \}"), r"\1 x87_sw = 0; }"),
 }
 
 

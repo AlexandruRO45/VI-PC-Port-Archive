@@ -166,6 +166,39 @@ class TestRdna2Disasm(unittest.TestCase):
             ("0105063a", "v_xor_b32_e32", "v_xor_b32_e32 v3, v1, v2"),
             ("0105064a", "v_add_nc_u32_e32", "v_add_nc_u32_e32 v3, v1, v2"),
             ("01050656", "v_fmac_f32_e32", "v_fmac_f32_e32 v3, v1, v2"),
+            # VOP1 rounding ops (GFX10 / RDNA 2)
+            ("01410a7e", "v_fract_f32_e32", "v_fract_f32_e32 v5, v1"),
+            ("01430a7e", "v_trunc_f32_e32", "v_trunc_f32_e32 v5, v1"),
+            ("01450a7e", "v_ceil_f32_e32", "v_ceil_f32_e32 v5, v1"),
+            ("01470a7e", "v_rndne_f32_e32", "v_rndne_f32_e32 v5, v1"),
+            ("01490a7e", "v_floor_f32_e32", "v_floor_f32_e32 v5, v1"),
+            # VOP2 mandatory literal FMA forms
+            ("01070a5841312111", "v_fmamk_f32", "v_fmamk_f32 v5, v1, 0x11213141, v3"),
+            ("01050a5a41312111", "v_fmaak_f32", "v_fmaak_f32 v5, v1, v2, 0x11213141"),
+            # VINTRP: attr is [15:10], chan is [9:8]
+            ("000004c8", "v_interp_p1_f32_e32", "v_interp_p1_f32_e32 v1, v0, attr0.x"),
+            ("000108c8", "v_interp_p1_f32_e32", "v_interp_p1_f32_e32 v2, v0, attr0.y"),
+            ("00020cc8", "v_interp_p1_f32_e32", "v_interp_p1_f32_e32 v3, v0, attr0.z"),
+            ("000310c8", "v_interp_p1_f32_e32", "v_interp_p1_f32_e32 v4, v0, attr0.w"),
+            ("01050dc8", "v_interp_p2_f32_e32", "v_interp_p2_f32_e32 v3, v1, attr1.y"),
+            # EXP: en=[3:0], target=[9:4], compr=10, done=11, vm=12
+            ("000000f800000000", "exp", "exp mrt0 off, off, off, off"),
+            ("010800f804000000", "exp", "exp mrt0 v4, off, off, off done"),
+            ("8f0800f804030201", "exp", "exp mrtz v4, v3, v2, v1 done"),
+            ("cf0000f804030201", "exp", "exp pos0 v4, v3, v2, v1"),
+            ("0f1c00f810110000", "exp", "exp mrt0 v16, v16, v17, v17 done compr vm"),
+            # SMEM: register widths per op and soffset vs immediate offset
+            ("01050cf4000000fa", "s_load_dwordx8", "s_load_dwordx8 s[20:27], s[2:3], 0x0"),
+            ("01050cf445230100", "s_load_dwordx8", "s_load_dwordx8 s[20:27], s[2:3], s0 offset:0x12345"),
+            ("420120f400000000", "s_buffer_load_dword", "s_buffer_load_dword s5, s[4:7], s0"),
+            ("020528f4200000fa", "s_buffer_load_dwordx4", "s_buffer_load_dwordx4 s[20:23], s[4:7], 0x20"),
+            # MIMG: contiguous and NSA encodings
+            ("001f00f000000000", "image_load", "image_load v[0:3], v0, s[0:7] dmask:0xf dim:SQ_RSRC_IMG_1D unorm"),
+            ("080100f002000000", "image_load", "image_load v0, v[2:3], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D"),
+            ("000780f020402103", "image_sample", "image_sample v[64:66], v32, s[4:11], s[100:103] dmask:0x7 dim:SQ_RSRC_IMG_1D"),
+            ("220790f02040210310080000", "image_sample_l", "image_sample_l v[64:66], [v32, v16, v8], s[4:11], s[100:103] dmask:0x7 dim:SQ_RSRC_IMG_1D_ARRAY"),
+            ("220794f02040210310080000", "image_sample_b", "image_sample_b v[64:66], [v32, v16, v8], s[4:11], s[100:103] dmask:0x7 dim:SQ_RSRC_IMG_1D_ARRAY"),
+            ("22079cf02040210310000000", "image_sample_lz", "image_sample_lz v[64:66], [v32, v16], s[4:11], s[100:103] dmask:0x7 dim:SQ_RSRC_IMG_1D_ARRAY"),
         ]
         for hex_str, expected_op, expected_asm in vectors:
             raw = bytes.fromhex(hex_str)
@@ -173,6 +206,56 @@ class TestRdna2Disasm(unittest.TestCase):
             self.assertEqual(len(insns), 1, f"Failed for {hex_str}")
             self.assertEqual(insns[0]["opcode"], expected_op, f"Mismatched opcode for {hex_str}")
             self.assertEqual(insns[0]["assembly"], expected_asm, f"Mismatched assembly for {hex_str}")
+
+    def test_compressed_export_keeps_unpaired_mask(self):
+        base = bytes.fromhex("0f1c00f810110000")
+        operands = {
+            0x2: "off, off, off, off",
+            0xa: "off, off, off, off",
+            0x5: "v16, v16, v17, v17",
+        }
+        for mask, registers in operands.items():
+            with self.subTest(mask=mask):
+                raw = bytes([(base[0] & 0xf0) | mask]) + base[1:]
+                records = disasm_rdna2(raw)
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0]["assembly"],
+                                 f"exp mrt0 {registers} done compr vm en:{mask:#x}")
+
+    def test_literal_operands_keep_stream_aligned(self):
+        # SOP1, SOP2, VOP1, VOP2 (src0 == 255) and v_fmaak_f32 each consume a trailing 32-bit literal.
+        stream = bytes.fromhex(
+            "ff0382be 78563412"  # s_mov_b32 s2, 0x12345678
+            "02ff0380 00010000"  # s_add_u32 s3, s2, 0x100
+            "ff02087e 89674523"  # v_mov_b32_e32 v4, 0x23456789
+            "ff040606 0000803f"  # v_add_f32_e32 v3, 0x3f800000, v2
+            "01050a5a 41312111"  # v_fmaak_f32 v5, v1, v2, 0x11213141
+            "000081bf"           # s_endpgm
+        )
+        insns = disasm_rdna2(stream)
+        self.assertEqual(
+            [(i["opcode"], i["length"], i["assembly"]) for i in insns],
+            [
+                ("s_mov_b32", 8, "s_mov_b32 s2, 0x12345678"),
+                ("s_add_u32", 8, "s_add_u32 s3, s2, 0x100"),
+                ("v_mov_b32_e32", 8, "v_mov_b32_e32 v4, 0x23456789"),
+                ("v_add_f32_e32", 8, "v_add_f32_e32 v3, 0x3f800000, v2"),
+                ("v_fmaak_f32", 8, "v_fmaak_f32 v5, v1, v2, 0x11213141"),
+                ("s_endpgm", 4, "s_endpgm"),
+            ],
+        )
+        # Truncated literals and truncated NSA MIMG must report *_truncated instead of crashing.
+        for bad_hex, expected_op in (
+            ("ff0382be", "sop1_truncated"),
+            ("02ff0380", "sop2_truncated"),
+            ("ff02087e", "vop1_truncated"),
+            ("01050a5a", "vop2_truncated"),
+            ("220790f020402103", "mimg_truncated"),
+        ):
+            insns = disasm_rdna2(bytes.fromhex(bad_hex))
+            self.assertEqual(len(insns), 1)
+            self.assertEqual(insns[0]["opcode"], expected_op)
+            self.assertIn("<truncated>", insns[0]["assembly"])
 
     def test_sopc_literal_keeps_the_following_instruction_aligned(self):
         # src1 == literal (255) makes the SOPC encoding 8 bytes. Without
@@ -275,6 +358,28 @@ class TestRdna2Disasm(unittest.TestCase):
             "v_subrev_nc_u32_e32 v3, v1, v2",
             "v_fmac_f32_e32 v3, v1, v2",
             "v_cvt_pkrtz_f16_f32_e32 v3, v1, v2",
+            "v_fract_f32_e32 v5, v1",
+            "v_trunc_f32_e32 v5, v1",
+            "v_ceil_f32_e32 v5, v1",
+            "v_rndne_f32_e32 v5, v1",
+            "v_floor_f32_e32 v5, v1",
+            "v_mov_b32_e32 v4, 0x12345678",
+            "v_fmamk_f32 v5, v1, 0x11213141, v3",
+            "v_fmaak_f32 v5, v1, v2, 0x11213141",
+            "v_interp_p1_f32_e32 v1, v0, attr0.x",
+            "v_interp_p2_f32_e32 v2, v1, attr1.y",
+            "s_mov_b32 s2, 0x12345678",
+            "s_add_u32 s3, s2, 0x100",
+            "s_load_dwordx8 s[20:27], s[2:3], 0x0",
+            "s_buffer_load_dword s5, s[4:7], s0",
+            "s_buffer_load_dwordx4 s[20:23], s[4:7], 0x20",
+            "image_load v0, v[2:3], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D",
+            "image_sample v[12:15], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "image_sample_lz v[64:66], [v32, v16], s[4:11], s[100:103] dmask:0x7 dim:SQ_RSRC_IMG_1D_ARRAY",
+            "image_sample_l v[64:66], [v32, v16, v8], s[4:11], s[100:103] dmask:0x7 dim:SQ_RSRC_IMG_1D_ARRAY",
+            "image_sample_b v[64:66], [v32, v16, v8], s[4:11], s[100:103] dmask:0x7 dim:SQ_RSRC_IMG_1D_ARRAY",
+            "exp mrt0 v4, off, off, off done",
+            "exp mrt0 v16, v16, v17, v17 done compr vm",
             "s_cmp_eq_i32 s0, s1",
             "s_cmp_eq_u32 s0, s1",
             "s_cmp_gt_i32 s2, s3",
@@ -335,7 +440,7 @@ class TestRdna2Disasm(unittest.TestCase):
                 rdna2_op, llvm_op,
                 f"Instruction {i}: disasm_rdna2 opcode '{rdna2_op}' does not match LLVM opcode '{llvm_op}'"
             )
-            if orig_op.startswith("v_"):
+            if orig_op.startswith(("v_", "exp", "image_")):
                 self.assertEqual(
                     " ".join(rdna2_rec["assembly"].lower().split()),
                     " ".join(llvm_line.lower().split()),
@@ -667,6 +772,39 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertTrue(res["translator_accepted"])
         self.assertEqual(res["compatibility_category"], "accepted")
         self.assertTrue(res["is_fully_supported"])
+    def test_trig_instructions_accepted(self):
+        """v_sin_f32 and v_cos_f32 are RDNA 2 opcodes that pixel_aot lowers in both encodings."""
+        trig_shader = [
+            "s_mov_b64 s[50:51], exec",
+            "s_wqm_b64 exec, exec",
+            "s_mov_b32 m0, s24",
+            "v_interp_p1_f32_e32 v8, v0, attr0.x",
+            "v_interp_p1_f32_e32 v9, v0, attr0.y",
+            "v_interp_p2_f32_e32 v9, v1, attr0.y",
+            "v_interp_p2_f32_e32 v8, v1, attr0.x",
+            "s_and_b64 exec, exec, s[50:51]",
+            "s_mov_b32 s21, 0",
+            "s_load_dwordx8 s[28:35], s[20:21], null",
+            "s_mov_b32 s40, 1",
+            "s_mov_b32 s41, 2",
+            "s_mov_b32 s42, 3",
+            "s_mov_b32 s43, 4",
+            "s_waitcnt lgkmcnt(0)",
+            "image_sample v[12:15], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "s_waitcnt vmcnt(0)",
+            "v_sin_f32_e32 v12, v12",
+            "v_cos_f32_e64 v13, -|v13| clamp",
+            "v_cvt_pkrtz_f16_f32_e32 v16, v12, v13",
+            "v_cvt_pkrtz_f16_f32_e32 v17, v14, v15",
+            "exp mrt0 v16, v16, v17, v17 done compr vm",
+            "s_endpgm",
+        ]
+        res = analyze_shader_instructions("trig_ps", trig_shader)
+        self.assertTrue(res["opcodes_recognized"])
+        self.assertTrue(res["translator_accepted"])
+        self.assertEqual(res["compatibility_category"], "accepted")
+        self.assertTrue(res["is_fully_supported"])
+
     def test_opcodes_recognized_but_translator_rejected(self):
         """Shader with valid RDNA 2 opcodes whose structure violates pixel_aot constraints."""
         valid_rdna2_but_rejected = [

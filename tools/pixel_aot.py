@@ -282,6 +282,19 @@ float ldexp32(float value, int delta) {
     }
     return asfloat(sign | ((uint)e << 23) | mant);
 }
+// v_sin_f32 and v_cos_f32 take revolutions: sin(2 * pi * x). Removing the nearest integer is exact in
+// binary32 and keeps the radian argument within [-pi, pi], where D3D bounds the sin and cos error;
+// x * 2 * pi on the unreduced input would round away the fraction of a large argument. Inputs of at
+// most half a turn pass unchanged, so -0 keeps its sign. An infinity reduces to NaN.
+float turns(float value) {
+    return abs(value) > 0.5f ? value - round(value) : value;
+}
+float sin32(float value) {
+    return sin(turns(value) * 6.28318548f);
+}
+float cos32(float value) {
+    return cos(turns(value) * 6.28318548f);
+}
 // Finite binary32 to binary16, round toward zero, then widen for the float target.
 float export16(float value) {
     uint h = f32tof16(value);
@@ -347,6 +360,7 @@ ALU = {
     "floor": (1, "floor({0})"), "ceil": (1, "ceil({0})"), "fract": (1, "fract32({0})"),
     "trunc": (1, "trunc({0})"), "frexp_mant": (1, "frexp_mant32({0})"),
     "rndne": (1, "round({0})"),  # HLSL round is DXIL Round_ne: ties to even
+    "sin": (1, "sin32({0})"), "cos": (1, "cos32({0})"),
     "add": (2, "({0} + {1})"), "mul": (2, "({0} * {1})"),
     "max": (2, "max({0}, {1})"), "min": (2, "min({0}, {1})"), "sub": (2, "({0} - {1})"),
     "subrev": (2, "({1} - {0})"),
@@ -659,6 +673,8 @@ def lane_mask(token):
 # {r} names the result. Shift counts use their low five bits; signed overflow sets SCC for _i32 add/sub.
 NONZERO = "{r} != 0u"
 SCALAR = {
+    "sext_i32_i8": (1, "asuint(asint({0} << 24) >> 24)", None),
+    "sext_i32_i16": (1, "asuint(asint({0} << 16) >> 16)", None),
     "add_u32": (2, "{0} + {1}", "{r} < {0}"), "sub_u32": (2, "{0} - {1}", "{0} < {1}"),
     "add_i32": (2, "{0} + {1}", "(~({0} ^ {1}) & ({0} ^ {r})) >> 31 != 0u"),
     "sub_i32": (2, "{0} - {1}", "(({0} ^ {1}) & ({0} ^ {r})) >> 31 != 0u"),
@@ -1079,6 +1095,8 @@ def sdwa_dest(result, sel, unused, old):
         raise ValueError("UNUSED_PRESERVE needs a tracked numeric destination")
     keep = ~(((1 << width) - 1) << offset) & 0xffffffff
     return f"((asuint({old}) & {keep:#x}u) | {field})"
+# Exact arithmetic with SDWA forms on gfx1013 (docs/coverage/gfx1013.tsv).
+SDWA_ALU = ("add", "sub", "subrev", "mul", "mul_legacy", "max", "min", "floor", "ceil", "fract", "trunc")
 
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *, second_texture_offset=None):
@@ -1446,6 +1464,23 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"(-{expression})"
             if clamp:
                 expression = f"saturate({expression})"
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(rf"v_({'|'.join(SDWA_ALU)})_f32_sdwa (v\d+), (.+?)( clamp)? dst_sel:(BYTE_[0-3]|WORD_[01]|DWORD) dst_unused:(UNUSED_PAD|UNUSED_SEXT|UNUSED_PRESERVE) src0_sel:DWORD( src1_sel:DWORD)?"):
+            # SDWA forms of exact arithmetic take whole-dword sources, so the binary32 denormal mode never applies
+            # to a zero-extended field; the result is placed like an SDWA move.
+            op, dst, operands, clamp, dst_sel, unused, src1_sel = m.groups()
+            tokens = operands.split(", ")
+            arity, template = ALU[op]
+            if mask != "entry" or len(tokens) != arity or bool(src1_sel) != (arity == 2):
+                raise ValueError("Invalid arithmetic operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            expression = template.format(*[fp_operand(t, scalar, vector, pending, sample_dest) for t in tokens])
+            if clamp:
+                expression = f"saturate({expression})"
+            if dst_sel != "DWORD":
+                expression = f"asfloat({sdwa_dest(f'asuint({expression})', dst_sel, unused, vector.get(dst))})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
         elif m := match(r"v_mov_b32(?:_e32|_e64)? (v\d+), (-?\d+(?:\.\d+)?|0x[0-9a-f]{1,8}|[vs]\d+)"):
