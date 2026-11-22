@@ -673,6 +673,9 @@ def lane_mask(token):
 # {r} names the result. Shift counts use their low five bits; signed overflow sets SCC for _i32 add/sub.
 NONZERO = "{r} != 0u"
 SCALAR = {
+    "pack_ll_b32_b16": (2, "({0} & 0xffffu) | ({1} << 16)", None),
+    "pack_lh_b32_b16": (2, "({0} & 0xffffu) | ({1} & 0xffff0000u)", None),
+    "pack_hh_b32_b16": (2, "({0} >> 16) | ({1} & 0xffff0000u)", None),
     "sext_i32_i8": (1, "asuint(asint({0} << 24) >> 24)", None),
     "sext_i32_i16": (1, "asuint(asint({0} << 16) >> 16)", None),
     "add_u32": (2, "{0} + {1}", "{r} < {0}"), "sub_u32": (2, "{0} - {1}", "{0} < {1}"),

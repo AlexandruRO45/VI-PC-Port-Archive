@@ -2004,6 +2004,42 @@ def scalar_body():
     return body
 
 
+PACK_HALVES = ("ll", "lh", "hh")
+
+
+def scalar_pack_values(halves):
+    return with_constants([
+        "s_cmp_eq_u32 s47, 1", f"s_pack_{halves}_b32_b16 s44, s44, s45",
+        "s_cselect_b32 s62, 0x3f800000, 0", "v_mov_b32_e32 v13, s62",
+        "s_cmp_eq_u32 s44, s46", "s_cselect_b32 s62, 0x3f800000, 0",
+        "v_mov_b32_e32 v12, s62", "v_mov_b32_e32 v14, 0", "v_mov_b32_e32 v15, 0",
+    ])
+
+
+def check_scalar_pack_draw(directory, compiler, renderer, backend):
+    source, shader, case = (directory / name for name in ("pack.hlsl", "pack.cso", "pack.case"))
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    for halves in PACK_HALVES:
+        source.write_text(translate(scalar_pack_values(halves)), encoding="ascii")
+        compile_shader(compiler, source, shader, ieee=False)
+        for flag, words in enumerate(((0x1234abcd, 0x5678ef90), (0xffff0000, 0x0000ffff))):
+            selected = [struct.unpack("<HH", struct.pack("<I", word))[half == "h"]
+                        for word, half in zip(words, halves)]
+            constants = bytearray(256)
+            struct.pack_into("<IIHHI", constants, 12, *words, *selected, flag)
+            case.write_bytes(constants + struct.pack("<4f", 1, flag, 0, 0) * 64)
+            subprocess.run(draw, check=True)
+            if halves == "lh" and flag == 0:
+                # Compile LL against the unchanged LH reference; only the selected high half differs.
+                source.write_text(translate(scalar_pack_values("ll")), encoding="ascii")
+                mutant = directory / "wrong-pack.cso"
+                compile_shader(compiler, source, mutant, ieee=False)
+                wrong = subprocess.run([renderer, backend, "--check-pixel-case", mutant, case],
+                                       capture_output=True, text=True)
+                if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+                    raise AssertionError("LL matched the LH reference")
+
+
 def sext_values():
     body = []
     for index, width in enumerate((8, 16)):
@@ -3737,6 +3773,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((with_constants(TRIG_BODY), translate))
     fixtures.append((with_constants(CLASS_BODY), translate))
     fixtures.append((sext_values(), translate))
+    fixtures.extend((scalar_pack_values(halves), translate) for halves in PACK_HALVES)
     fixtures.append((with_constants(RECIPROCAL_BODY), translate))
     fixtures.append((bitwise_program(), translate))
     fixtures.append((fract_values(), translate))
@@ -4582,6 +4619,7 @@ def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
     check_predicate_draws(directory, compiler, renderer, backend)
     check_int_predicate_draws(directory, compiler, renderer, backend)
     check_sext_draw(directory, compiler, renderer, backend)
+    check_scalar_pack_draw(directory, compiler, renderer, backend)
     check_int16_predicate_draws(directory, compiler, renderer, backend)
     check_sdwa_predicate_draws(directory, compiler, renderer, backend)
     check_literal_fma_draw(directory, compiler, renderer, backend)
