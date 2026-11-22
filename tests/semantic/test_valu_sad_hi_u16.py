@@ -856,5 +856,82 @@ class TestValuSadHiU16SIMDMultiLane(unittest.TestCase):
                 self.assertEqual(wave.vgprs[lane][0], 0)
 
 
+class TestValuSadHiU16RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.rf = ScalarRegisterFile()
+        self.interp = ScalarVALUInterpreter(self.rf)
+
+    def test_alias_dst_src0(self) -> None:
+        # v0 = sad_hi_u16(v0, v1, v2)
+        self.rf.vgprs[0] = pack_halfwords_u32(50, 100)
+        self.rf.vgprs[1] = pack_halfwords_u32(20, 40)
+        self.rf.vgprs[2] = 0x0001_0000
+        # diffs: 30 + 60 = 90 -> 90 << 16 = 0x005A_0000. Total = 0x005B_0000
+        instr = VSadHiU16Instruction(Operand.vgpr(0), Operand.vgpr(0), Operand.vgpr(1), Operand.vgpr(2))
+        res = self.interp.step(instr)
+        self.assertEqual(res, 0x005B_0000)
+        self.assertEqual(self.rf.vgprs[0], 0x005B_0000)
+        self.assertEqual(self.rf.vgprs[1], pack_halfwords_u32(20, 40))
+        self.assertEqual(self.rf.vgprs[2], 0x0001_0000)
+
+    def test_alias_dst_src1(self) -> None:
+        # v0 = sad_hi_u16(v1, v0, v2)
+        self.rf.vgprs[0] = pack_halfwords_u32(10, 20)
+        self.rf.vgprs[1] = pack_halfwords_u32(15, 25)
+        self.rf.vgprs[2] = 0x0002_0000
+        # diffs = 5 + 5 = 10 -> 10 << 16 = 0x000A_0000. Total = 0x000C_0000
+        instr = VSadHiU16Instruction(Operand.vgpr(0), Operand.vgpr(1), Operand.vgpr(0), Operand.vgpr(2))
+        res = self.interp.step(instr)
+        self.assertEqual(res, 0x000C_0000)
+        self.assertEqual(self.rf.vgprs[0], 0x000C_0000)
+
+    def test_alias_dst_src2_accumulator_loop(self) -> None:
+        # v0 = sad_hi_u16(v1, v2, v0)
+        self.rf.vgprs[0] = 0x0010_0000
+        self.rf.vgprs[1] = pack_halfwords_u32(1, 2)
+        self.rf.vgprs[2] = pack_halfwords_u32(2, 4)
+        # diffs: 1 + 2 = 3 -> 3 << 16 = 0x0003_0000. Total = 0x0013_0000
+        instr = VSadHiU16Instruction(Operand.vgpr(0), Operand.vgpr(1), Operand.vgpr(2), Operand.vgpr(0))
+        res = self.interp.step(instr)
+        self.assertEqual(res, 0x0013_0000)
+        self.assertEqual(self.rf.vgprs[0], 0x0013_0000)
+
+    def test_alias_all_same_register(self) -> None:
+        # v0 = sad_hi_u16(v0, v0, v0)
+        self.rf.vgprs[0] = 0x1234_5678
+        instr = VSadHiU16Instruction(Operand.vgpr(0), Operand.vgpr(0), Operand.vgpr(0), Operand.vgpr(0))
+        res = self.interp.step(instr)
+        # |v0 - v0| = 0 -> 0 + v0 = v0
+        self.assertEqual(res, 0x1234_5678)
+        self.assertEqual(self.rf.vgprs[0], 0x1234_5678)
+
+    def test_alias_msad_dst_src2(self) -> None:
+        # v0 = msad_hi_u16(v1, v2, v0)
+        self.rf.vgprs[0] = 0x0005_0000
+        self.rf.vgprs[1] = pack_halfwords_u32(100, 200)
+        self.rf.vgprs[2] = pack_halfwords_u32(0, 150)  # low masked
+        # high diff: 50 -> 50 << 16 = 0x0032_0000. Total = 0x0037_0000
+        instr = VMsadHiU16Instruction(Operand.vgpr(0), Operand.vgpr(1), Operand.vgpr(2), Operand.vgpr(0))
+        res = self.interp.step(instr)
+        self.assertEqual(res, 0x0037_0000)
+        self.assertEqual(self.rf.vgprs[0], 0x0037_0000)
+
+    def test_operand_preservation_unmodified_registers(self) -> None:
+        for i in range(256):
+            self.rf.vgprs[i] = 0x2000 + i
+        instr = VSadHiU16Instruction(
+            dst=Operand.vgpr(99),
+            src0=Operand.vgpr(10),
+            src1=Operand.vgpr(20),
+            src2=Operand.vgpr(30),
+        )
+        self.interp.step(instr)
+        for i in range(256):
+            if i != 99:
+                self.assertEqual(self.rf.vgprs[i], 0x2000 + i)
+
+
 if __name__ == "__main__":
     unittest.main()
