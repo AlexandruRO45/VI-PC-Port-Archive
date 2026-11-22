@@ -1323,5 +1323,221 @@ class TestDsIncRtnU64IEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(curr, 0)
 
 
+# ==============================================================================
+# Phase 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+import re
+
+
+_ASM_DS64_RE = re.compile(
+    r"^(ds_inc_rtn_u64|ds_inc_u64)\s+"
+    r"(?:(v\[\d+:\d+\]|v\d+),\s*)?"  # optional vdst
+    r"(v\d+),\s*"                   # vaddr
+    r"(v\[\d+:\d+\]|v\d+)"           # vdata0
+    r"(?:\s+offset:(\d+))?"          # optional offset
+    r"(?:\s+(gds))?$"               # optional gds
+)
+
+
+def parse_ds_inc_rtn_u64_asm(asm_line: str) -> Ds64Instruction:
+    """Parse a single assembly line into a Ds64Instruction node."""
+    line = asm_line.strip()
+    if not line:
+        raise ValueError("Empty assembly instruction line")
+
+    m = _ASM_DS64_RE.match(line)
+    if not m:
+        raise ValueError(f"Malformed ds_inc_u64 instruction syntax: {line!r}")
+
+    op_str, dst_str, addr_str, data_str, off_str, gds_str = m.groups()
+    opcode = Ds64Opcode(op_str)
+
+    def parse_reg(s: str) -> Register:
+        if s.startswith("v[") and ":" in s and s.endswith("]"):
+            lo, hi = s[2:-1].split(":")
+            idx = int(lo)
+            count = int(hi) - idx + 1
+            return Register(RegKind.VGPR, idx, count=count)
+        elif s.startswith("v"):
+            return Register(RegKind.VGPR, int(s[1:]), count=1)
+        raise ValueError(f"Invalid register operand: {s}")
+
+    vaddr = parse_reg(addr_str)
+    vdata0 = parse_reg(data_str)
+    vdst = parse_reg(dst_str) if dst_str else None
+    offset = int(off_str) if off_str else 0
+    gds = (gds_str == "gds")
+
+    return Ds64Instruction(
+        opcode=opcode,
+        vdst=vdst,
+        vaddr=vaddr,
+        vdata0=vdata0,
+        offset=offset,
+        gds=gds,
+    )
+
+
+class TestDsIncRtnU64NegativeControlsAndMutations(unittest.TestCase):
+    """Phase 8: Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_malformed_tokens(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_ds_inc_rtn_u64_asm("")
+        with self.assertRaises(ValueError):
+            parse_ds_inc_rtn_u64_asm("ds_inc_rtn_u64")
+        with self.assertRaises(ValueError):
+            parse_ds_inc_rtn_u64_asm("ds_inc_rtn_u64 v[0:1]")
+        with self.assertRaises(ValueError):
+            parse_ds_inc_rtn_u64_asm("ds_inc_rtn_u64 v[0:1], v2")
+        with self.assertRaises(ValueError):
+            parse_ds_inc_rtn_u64_asm("ds_add_rtn_u64 v[0:1], v2, v[4:5]")
+        with self.assertRaises(ValueError):
+            parse_ds_inc_rtn_u64_asm("ds_inc_rtn_u64 v[0:1], v2, v[4:5] bad_modifier:10")
+
+    def test_syntax_rejection_register_classes_and_counts(self) -> None:
+        # vdst cannot be single 32-bit register for 64-bit atomic with return
+        with self.assertRaises(ValueError):
+            parse_ds_inc_rtn_u64_asm("ds_inc_rtn_u64 v0, v2, v[4:5]")
+        # vdata0 cannot be single 32-bit register
+        with self.assertRaises(ValueError):
+            parse_ds_inc_rtn_u64_asm("ds_inc_rtn_u64 v[0:1], v2, v4")
+
+    def test_syntax_rejection_offset_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            Ds64Instruction(
+                opcode=Ds64Opcode.DS_INC_U64,
+                vaddr=Register(RegKind.VGPR, 2, count=1),
+                vdata0=Register(RegKind.VGPR, 4, count=2),
+                offset=-1,
+            )
+        with self.assertRaises(ValueError):
+            Ds64Instruction(
+                opcode=Ds64Opcode.DS_INC_U64,
+                vaddr=Register(RegKind.VGPR, 2, count=1),
+                vdata0=Register(RegKind.VGPR, 4, count=2),
+                offset=0x1_0000,
+            )
+
+    def test_syntax_rejection_lds_capacity(self) -> None:
+        with self.assertRaises(ValueError):
+            LDSModel64(capacity_qwords=0)
+        with self.assertRaises(ValueError):
+            LDSModel64(capacity_qwords=-16)
+        with self.assertRaises(ValueError):
+            LDSModel64(capacity_qwords=500)  # Non-power-of-two
+
+    def test_syntax_rejection_simd_lane_count(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDLDS64WavefrontInterpreter(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDLDS64WavefrontInterpreter(wave_size=128)
+
+    def test_mutation_detection_wrap_strict_greater(self) -> None:
+        # Mutant: wraps only on `old_val > wrap_limit` instead of `>=`
+        def mutant_inc_u64(old: int, limit: int) -> Tuple[int, int]:
+            u_old = u64(old)
+            u_lim = u64(limit)
+            return u_old, 0 if u_old > u_lim else u64(u_old + 1)
+
+        val, limit = 5, 5
+        c_old, c_mem = oracle_ds_inc_rtn_u64(val, limit)
+        m_old, m_mem = mutant_inc_u64(val, limit)
+
+        self.assertEqual(c_mem, 0)
+        self.assertEqual(m_mem, 6)
+        self.assertNotEqual(c_mem, m_mem)
+
+    def test_mutation_detection_return_new_val(self) -> None:
+        # Mutant: returns new_mem in vdst instead of old_val
+        def mutant_inc_rtn_u64(old: int, limit: int) -> Tuple[int, int]:
+            _, new_mem = oracle_ds_inc_rtn_u64(old, limit)
+            return new_mem, new_mem  # Bug: returns post-increment value
+
+        val, limit = 10, 20
+        c_old, _ = oracle_ds_inc_rtn_u64(val, limit)
+        m_old, _ = mutant_inc_rtn_u64(val, limit)
+        self.assertEqual(c_old, 10)
+        self.assertEqual(m_old, 11)
+        self.assertNotEqual(c_old, m_old)
+
+    def test_mutation_detection_missing_offset_masking(self) -> None:
+        # Mutant: fails to mask 16-bit offset
+        def mutant_eff_addr(vaddr: int, offset: int) -> int:
+            return (vaddr + offset) & MASK_32  # Missing `offset & 0xFFFF`
+
+        vaddr = 0x1000
+        unmasked_offset = 0x1_0020
+        correct_eff = calc_lds_effective_address(vaddr, unmasked_offset)
+        mutant_eff = mutant_eff_addr(vaddr, unmasked_offset)
+
+        self.assertEqual(correct_eff, 0x1020)
+        self.assertEqual(mutant_eff, 0x11020)
+        self.assertNotEqual(correct_eff, mutant_eff)
+
+    def test_mutation_detection_missing_qword_alignment(self) -> None:
+        # Mutant: dword shift `>> 2` instead of qword shift `>> 3`
+        def mutant_qword_idx(eff_addr: int, capacity: int) -> int:
+            return (eff_addr >> 2) & (capacity - 1)  # Bug: uses 32-bit dword shift
+
+        eff_addr = 0x100  # byte address 256
+        correct_idx = calc_lds_qword_index(eff_addr, 512)
+        mutant_idx = mutant_qword_idx(eff_addr, 512)
+
+        self.assertEqual(correct_idx, 32)
+        self.assertEqual(mutant_idx, 64)
+        self.assertNotEqual(correct_idx, mutant_idx)
+
+    def test_mutation_detection_exec_mask_leak(self) -> None:
+        # Mutant: inactive lane touches LDS memory
+        lds = LDSModel64(capacity_qwords=512)
+        simd = SIMDLDS64WavefrontInterpreter(wave_size=32, lds=lds)
+        simd.set_exec_mask(0x1)  # Lane 0 only active
+
+        addr_active = 0x10
+        addr_inactive = 0x20
+        lds.write_qword(addr_active, 10)
+        lds.write_qword(addr_inactive, 50)
+
+        simd.write_lane_vgpr(0, 2, addr_active)
+        simd.write_lane_vgpr_64(0, 4, 100)
+        simd.write_lane_vgpr(1, 2, addr_inactive)
+        simd.write_lane_vgpr_64(1, 4, 100)
+
+        inst = Ds64Instruction(
+            opcode=Ds64Opcode.DS_INC_RTN_U64,
+            vdst=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            vdata0=Register(RegKind.VGPR, 4, count=2),
+        )
+
+        results = simd.step(inst)
+        self.assertEqual(results[0], (10, 11))
+        self.assertIsNone(results[1])
+        self.assertEqual(lds.read_qword(addr_inactive), 50)
+
+    def test_mutation_detection_32bit_carry_truncation(self) -> None:
+        # Mutant: does 32-bit addition instead of 64-bit, dropping upper dword carry
+        def mutant_add(old: int, limit: int) -> Tuple[int, int]:
+            u_old = u64(old)
+            u_lim = u64(limit)
+            if u_old >= u_lim:
+                return u_old, 0
+            # Bug: only low 32-bits incremented
+            lo = (u_old + 1) & MASK_32
+            hi = u_old & ~MASK_32
+            return u_old, hi | lo
+
+        val = 0x0000_0001_FFFF_FFFF  # Low dword overflows into high dword
+        limit = 0xFFFF_FFFF_FFFF_FFFF
+        c_old, c_mem = oracle_ds_inc_rtn_u64(val, limit)
+        m_old, m_mem = mutant_add(val, limit)
+
+        self.assertEqual(c_mem, 0x0000_0002_0000_0000)
+        self.assertEqual(m_mem, 0x0000_0001_0000_0000)
+        self.assertNotEqual(c_mem, m_mem)
+
+
 if __name__ == "__main__":
     unittest.main()
