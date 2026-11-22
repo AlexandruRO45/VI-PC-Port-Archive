@@ -624,5 +624,77 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
         self.assertEqual(state.get_vgpr_pair(1, 0), 0x01)
         self.assertEqual(state.lds.read_qword(common_addr), 0x03)
 
+# ==============================================================================
+# Phase 5: Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasingAndPreservation(unittest.TestCase):
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_alias_dst_overlaps_addr(self) -> None:
+        state = ScalarMachineState()
+        addr = 0x500
+        state.set_vgpr(0, addr)
+        state.set_vgpr(1, 0)
+        state.set_vgpr_pair(2, MASK_64)
+        state.lds.write_qword(addr, 0xAAAA_AAAA_5555_5555)
+
+        instr = DSXor64Instruction(
+            opcode=DSOpcode64.DS_XOR_RTN_B64,
+            dst=VGPRPair(0),
+            addr=VGPR(0),
+            data=VGPRPair(2),
+        )
+        old, mem = self.scalar_interp.step(instr, state)
+        self.assertEqual(old, 0xAAAA_AAAA_5555_5555)
+        self.assertEqual(mem, 0x5555_5555_AAAA_AAAA)
+        self.assertEqual(state.get_vgpr_pair(0), 0xAAAA_AAAA_5555_5555)
+        self.assertEqual(state.lds.read_qword(addr), 0x5555_5555_AAAA_AAAA)
+
+    def test_alias_dst_equals_data(self) -> None:
+        state = ScalarMachineState()
+        addr = 0x600
+        state.set_vgpr(0, addr)
+        state.set_vgpr_pair(2, 0x0F0F0F0F_0F0F0F0F)
+        state.lds.write_qword(addr, 0xF0F0F0F0_F0F0F0F0)
+
+        instr = DSXor64Instruction(
+            opcode=DSOpcode64.DS_XOR_RTN_B64,
+            dst=VGPRPair(2),
+            addr=VGPR(0),
+            data=VGPRPair(2),
+        )
+        old, mem = self.scalar_interp.step(instr, state)
+        self.assertEqual(old, 0xF0F0F0F0_F0F0F0F0)
+        self.assertEqual(mem, 0xFFFFFFFF_FFFFFFFF)
+        self.assertEqual(state.get_vgpr_pair(2), 0xF0F0F0F0_F0F0F0F0)
+        self.assertEqual(state.lds.read_qword(addr), 0xFFFFFFFF_FFFFFFFF)
+
+    def test_unrelated_vgprs_unmodified(self) -> None:
+        state = ScalarMachineState()
+        canary = 0xDEAD0000
+        for r in range(256):
+            state.set_vgpr(r, canary | r)
+
+        addr = 0x100
+        state.set_vgpr(10, addr)
+        state.set_vgpr_pair(12, 0x55)
+        state.lds.write_qword(addr, 0xAA)
+
+        instr = DSXor64Instruction(
+            opcode=DSOpcode64.DS_XOR_RTN_B64,
+            dst=VGPRPair(8),
+            addr=VGPR(10),
+            data=VGPRPair(12),
+        )
+        self.scalar_interp.step(instr, state)
+        self.assertEqual(state.get_vgpr(8), 0xAA)
+        self.assertEqual(state.get_vgpr(9), 0)
+        for r in range(256):
+            if r not in (8, 9, 10, 12, 13):
+                self.assertEqual(state.get_vgpr(r), canary | r)
+
 if __name__ == "__main__":
     unittest.main()
