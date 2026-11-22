@@ -336,5 +336,27 @@ class TestCli(unittest.TestCase):
             self.assertNotIn("Traceback", err.getvalue())
 
 
+class TestBankDiscovery(unittest.TestCase):
+    def test_unreadable_subfolder_fails_instead_of_naming_against_fewer_banks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(os.path.join(tmp, "valid.awc"), make_bank(["alpha"]))
+            words = write(os.path.join(tmp, "words.txt"), "alpha\n")
+            blocked = os.path.join(tmp, "blocked")
+
+            def walk(root, onerror=None):    # os.walk as it behaves when "blocked" cannot be listed
+                yield root, ["blocked"], ["valid.awc"]
+                if onerror:
+                    onerror(PermissionError(13, "Permission denied", blocked))
+
+            err = io.StringIO()
+            with mock.patch.object(A.os, "walk", walk), contextlib.redirect_stderr(err), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                rc = A.main([tmp, "--words", words])
+            self.assertEqual(rc, 2)
+            self.assertIn("blocked", err.getvalue())
+            self.assertIn("Permission denied", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
