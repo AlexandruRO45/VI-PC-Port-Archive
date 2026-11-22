@@ -25,7 +25,8 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mc_command  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container, shader_source
-from check import Skip, clip_test, fmt_1010102_test, fmt_sint32_test, fmt_xy_xyz_test
+from check import Skip, clip_test, f16_frexp_ldexp_test, fmt_1010102_test, fmt_sint32_test, fmt_xy_xyz_test
+from check import F16_FREXP_LDEXP_EXPONENTS   # cs_f16_frexp_ldexp: one dispatch per S1, judged by check.py
 from compute_fixture import compute_header
 from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
 from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
@@ -866,6 +867,11 @@ def run_suite(a, work: str) -> int:
             n = len(CVT_F32_SAT_CASES)
             results.append((name, not wrong, f"{n}/{n} inputs exact" if not wrong
                             else f"{len(wrong)}/{n} inputs wrong, first {wrong[0]}"))
+        elif name == "cs_f16_frexp_ldexp":
+            # f16 frexp/ldexp with denormals kept on every binary16 input: check.py's sweep, one dispatch per S1.
+            problem = f16_frexp_ldexp_test(a.build, spirv_dir, cs_env)
+            n = len(F16_FREXP_LDEXP_EXPONENTS)
+            results.append((name, not problem, problem or f"65536 inputs x {n} exponents, every word exact"))
         elif name == "cs_wavemask":
             # Whole-wave mask test, as in check.py: needs a 64-wide subgroup, skipped where the device has none.
             # With LEONIDA_W64_EMULATE=1 it was translated with --wave64-emulate and runs on any subgroup size.

@@ -18,6 +18,7 @@ vk_sampler_test needs.
 ps_texoff (texel offsets, on vk_texture_test's texture) is skipped on a device without VK_KHR_maintenance8.
 """
 import collections
+import functools
 import json
 import math
 import os
@@ -209,6 +210,63 @@ CVT_F32_SAT_CASES = (
     (0x4F800000, 0xFFFFFFFF, 0x7FFFFFFF), (0xCEFFFFFF, 0, 0x80000080), (0xCF000000, 0, 0x80000000),
     (0xCF000001, 0, 0x80000000), (0x7F800000, 0xFFFFFFFF, 0x7FFFFFFF), (0xFF800000, 0, 0x80000000),
     (0x7F800001, 0, 0), (0xFFC00000, 0, 0))
+# cs_f16_frexp_ldexp.asm: every binary16 input x through v_frexp_mant_f16, v_frexp_exp_i16_f16 and v_ldexp_f16(x, S1)
+# with f16 denormals kept (docs/design.md, measured on gfx1036). One dispatch of 1024 groups per S1 below: zero, the
+# ends of the normal range, the denormal and flush edges, the clamp to [-64, 64] from both sides, and S1 words whose
+# high bits must be ignored. Every dispatch also checks both frexp ops on all inputs.
+F16_FREXP_LDEXP_EXPONENTS = (0, 1, -1, -14, -15, -24, -25, -30, 15, 16, 29, 30, 40, 64, 65, -64, -65,
+                             0x8000, 0x7FFF, 0x00010003, 0xFFFF0005)
+F16_FREXP_LDEXP_WORDS = 4 * 65536
+F16_HIGH_HALF = 0x5A5A0000          # what each destination held before the _e32 op wrote its low half
+
+
+def f16_value(h):
+    return struct.unpack("<e", struct.pack("<H", h & 0xFFFF))[0]
+
+
+def f16_special(h):
+    """Zero, infinity or NaN: frexp gives the input (exponent 0) and ldexp ignores S1."""
+    return not h & 0x7FFF or (h >> 10) & 0x1F == 31
+
+
+def f16_frexp_mant(h):
+    return h if f16_special(h) else struct.unpack("<H", struct.pack("<e", math.frexp(f16_value(h))[0]))[0]
+
+
+def f16_frexp_exp(h):
+    return 0 if f16_special(h) else math.frexp(f16_value(h))[1] & 0xFFFF
+
+
+def f16_ldexp(h, s1):
+    """S0 * 2^S1 with S1 the low 16 bits as a signed integer, clamped to [-64, 64]; exact, then rounded to nearest even
+    into the f16 range (denormals kept, overflow to +-infinity)."""
+    if f16_special(h):
+        return h
+    n = s1 & 0xFFFF
+    n = max(-64, min(64, n - 0x10000 if n & 0x8000 else n))
+    try:
+        return struct.unpack("<H", struct.pack("<e", math.ldexp(f16_value(h), n)))[0]
+    except OverflowError:
+        return (h & 0x8000) | 0x7C00
+
+
+@functools.lru_cache(maxsize=None)
+def f16_frexp_ldexp_words(s1):
+    """The 262144 words cs_f16_frexp_ldexp must leave for exponent S1: per input frexp_mant, frexp_exp, ldexp, x."""
+    words = [0] * F16_FREXP_LDEXP_WORDS
+    words[0::4] = f16_frexp_columns()[0]
+    words[1::4] = f16_frexp_columns()[1]
+    words[2::4] = [F16_HIGH_HALF | f16_ldexp(x, s1) for x in range(65536)]
+    words[3::4] = range(65536)
+    return tuple(words), struct.pack(f"<{F16_FREXP_LDEXP_WORDS}I", *words)
+
+
+@functools.lru_cache(maxsize=None)
+def f16_frexp_columns():
+    return ([F16_HIGH_HALF | f16_frexp_mant(x) for x in range(65536)],
+            [F16_HIGH_HALF | f16_frexp_exp(x) for x in range(65536)])
+
+
 # Wave64-only dump tests (mostly the x = cross-half checks): exact results need 64 lanes, or an emulation of them
 # on narrower subgroups. cs_dpp_w64 is not cross-half, but its lane id needs both halves.
 W64_EMULATED = os.environ.get("LEONIDA_W64_EMULATE") == "1"
@@ -664,6 +722,42 @@ def cvt_f32_sat_test(tools, spirv):
         if problem:
             wrong.append(f"{bits:#010x}: {problem}")
     return f"{len(wrong)} of {len(CVT_F32_SAT_CASES)} inputs wrong, first {wrong[0]}" if wrong else ""
+
+
+def f16_frexp_ldexp_test(tools, spirv, env=None):
+    """cs_f16_frexp_ldexp once per S1 of F16_FREXP_LDEXP_EXPONENTS, 1024 groups each: an empty string when all 262144
+    words of every dump match the model above, else the number of wrong words per op and the first one."""
+    wrong = collections.Counter()
+    first = {}
+    with tempfile.TemporaryDirectory(prefix="leonida-f16-") as tmp:
+        dump = Path(tmp) / "out.bin"
+        for s1 in F16_FREXP_LDEXP_EXPONENTS:
+            dump.unlink(missing_ok=True)
+            child = dict(os.environ if env is None else env, VKC_SGPRS=f"{s1 & 0xFFFFFFFF:#010x}", VKC_DUMP=str(dump),
+                         VKC_OUT_WORDS=str(F16_FREXP_LDEXP_WORDS))
+            code, out = run(os.path.join(tools, "vk_compute_test" + EXE),
+                            os.path.join(spirv, "cs_f16_frexp_ldexp.spv"), "1024", "dump", env=child)
+            if code:
+                return f"S1 {s1:#x}: " + failure(code, out, 3)
+            if not dump.is_file():
+                return f"S1 {s1:#x}: no VKC_DUMP file written"
+            data = dump.read_bytes()
+            if len(data) != 4 * F16_FREXP_LDEXP_WORDS:
+                return f"S1 {s1:#x}: expected {4 * F16_FREXP_LDEXP_WORDS} dump bytes, got {len(data)}"
+            expected, expected_bytes = f16_frexp_ldexp_words(s1)
+            if data == expected_bytes:
+                continue
+            words = struct.unpack(f"<{F16_FREXP_LDEXP_WORDS}I", data)
+            for k, op in enumerate(("frexp_mant", "frexp_exp", "ldexp", "input")):
+                bad = [x for x, (got, want) in enumerate(zip(words[k::4], expected[k::4])) if got != want]
+                if bad:
+                    wrong[op] += len(bad)
+                    x = bad[0]
+                    first.setdefault(op, f"x {x:#06x} S1 {s1:#x}: got {words[4 * x + k]:#010x}, "
+                                         f"expected {expected[4 * x + k]:#010x}")
+    if not wrong:
+        return ""
+    return "; ".join(f"{op}: {wrong[op]} words wrong, first {first[op]}" for op in sorted(wrong))
 
 
 def mesh_w64x_test(tools, spirv, name):
@@ -1228,6 +1322,7 @@ def main():
     results.append(("cs_user_sgprs", compute_test(tools, spirv, "cs_user_sgprs", "1", "dump",
                                                   expected_words=USER_SGPRS_WORDS, env=USER_SGPRS_ENV)))
     results.append(("cs_cvt_f32_sat", cvt_f32_sat_test(tools, spirv)))
+    results.append(("cs_f16_frexp_ldexp", f16_frexp_ldexp_test(tools, spirv)))
     results.append(("cs_fma_fused", compute_test(tools, spirv, "cs_fma_fused", "1", "dump", expected_words=FMA_FUSED,
                                                  env=FMA_FUSED_ENV)))
     for name, want in W64X_DUMPS:   # without --require-wave64 when LEONIDA_W64_EMULATE=1

@@ -1,6 +1,7 @@
 """Exercise the synthetic Vulkan test runner without a Vulkan device."""
 import ast
 import contextlib
+import functools
 import io
 import json
 import struct
@@ -33,8 +34,8 @@ TOTAL = (len(check.COMPUTE) + 4 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 10)  # three mesh fixtures, ps_tex, ps_imgatomic, four compute fixtures and
-         # ps_ssharp
+         + len(check.TEXTURE_CONSTANTS) + 11)  # three mesh fixtures, ps_tex, ps_imgatomic, four compute fixtures,
+         # ps_ssharp and cs_f16_frexp_ldexp
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
 
@@ -53,6 +54,33 @@ def cvt_answer(env, wrong_for=None):
     bits = int((env or {}).get("VKC_SGPRS", "0"), 0)
     words = [0xBAD, 0xBAD] if bits == wrong_for else CVT.get(bits, [0, 0])
     return 0, "out[0..7] = " + " ".join(map(str, words + [0xEEEEEEEE] * 6)) + "\n"
+
+
+F16_DENORMALS = [x for x in range(65536) if not (x >> 10) & 0x1F and x & 0x3FF]
+
+
+@functools.lru_cache(maxsize=None)
+def f16_dump(s1, flush_denormals=False):
+    """The 262144 words cs_f16_frexp_ldexp leaves for exponent S1 on a device that follows check.py's model, or one
+    that reads f16 denormals as zero (what the translator did before #1931)."""
+    data = check.f16_frexp_ldexp_words(s1)[1]
+    if not flush_denormals:
+        return data
+    data, hi = bytearray(data), check.F16_HIGH_HALF
+    for x in F16_DENORMALS:
+        struct.pack_into("<3I", data, 16 * x, hi | (x & 0x8000), hi, hi | (x & 0x8000))
+    return bytes(data)
+
+
+def f16_answer(env, wrong_at=None, flush_denormals=False):
+    """A device running cs_f16_frexp_ldexp with S1 from VKC_SGPRS; wrong_at = (S1, x) changes that input's ldexp."""
+    s1 = int(env["VKC_SGPRS"], 0)
+    data = f16_dump(s1, flush_denormals)
+    if wrong_at and wrong_at[0] & 0xFFFFFFFF == s1:
+        data = bytearray(data)
+        struct.pack_into("<I", data, 4 * (4 * wrong_at[1] + 2), 0xBAD)
+    Path(env["VKC_DUMP"]).write_bytes(data)
+    return 0, ""
 
 
 class Wave64Checks(unittest.TestCase):
@@ -81,6 +109,9 @@ class Wave64Checks(unittest.TestCase):
                 return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
             if name == "cs_cvt_f32_sat":
                 return cvt_answer(env)
+            if name == "cs_f16_frexp_ldexp":
+                self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1024", "dump"), str(check.F16_FREXP_LDEXP_WORDS)))
+                return f16_answer(env)
             if name == "cs_fma_fused":
                 # The operands come in through VKC_SGPRS; without them the fused words are not produced.
                 self.assertEqual((env or {}).get("VKC_SGPRS"), check.FMA_FUSED_ENV["VKC_SGPRS"])
@@ -263,6 +294,77 @@ class FloatToIntSweep(unittest.TestCase):
         cases = next(ast.literal_eval(n.value) for n in ast.walk(ast.parse(src))
                      if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "CASES")
         self.assertEqual(tuple(cases), check.CVT_F32_SAT_CASES)
+
+
+class F16FrexpLdexpSweep(unittest.TestCase):
+    """check.f16_frexp_ldexp_test: one 1024-group dispatch per S1, every word of each dump judged."""
+
+    def sweep(self, **answer):
+        sent = []
+
+        def harness(_tool, shader, *args, env=None):
+            self.assertEqual((Path(shader).stem, args), ("cs_f16_frexp_ldexp", ("1024", "dump")))
+            sent.append(int(env["VKC_SGPRS"], 0))
+            return f16_answer(env, **answer)
+
+        with patch.object(check, "run", side_effect=harness):
+            return check.f16_frexp_ldexp_test("tools", "spirv"), sent
+
+    def test_every_exponent_is_sent_and_exact(self):
+        problem, sent = self.sweep()
+        self.assertEqual(problem, "")
+        self.assertEqual(sent, [s1 & 0xFFFFFFFF for s1 in check.F16_FREXP_LDEXP_EXPONENTS])
+
+    def test_one_wrong_word_fails_and_is_named(self):
+        problem, _ = self.sweep(wrong_at=(-24, 0x3C00))
+        self.assertEqual(problem, "ldexp: 1 words wrong, first x 0x3c00 S1 -0x18: got 0x00000bad, expected 0x5a5a0001")
+
+    def test_denormals_read_as_zero_fail(self):
+        # Every one of the 2046 f16 denormals, in each dispatch: what main's translator gave before #1931. Two
+        # exponents keep the slow (mismatch) path short.
+        with patch.object(check, "F16_FREXP_LDEXP_EXPONENTS", (0, -24)):
+            problem, _ = self.sweep(flush_denormals=True)
+        n = 2046 * 2
+        self.assertIn(f"frexp_mant: {n} words wrong, first x 0x0001", problem)
+        self.assertIn(f"frexp_exp: {n} words wrong", problem)
+
+    def test_model_gives_the_measured_words(self):
+        # The gfx1036 words quoted in docs/design.md and the .asm header.
+        self.assertEqual((check.f16_frexp_mant(0x0001), check.f16_frexp_exp(0x0001)), (0x3800, 0xFFE9))
+        self.assertEqual((check.f16_frexp_mant(0x03FF), check.f16_frexp_exp(0x03FF)), (0x3BFE, 0xFFF2))
+        self.assertEqual(check.f16_ldexp(0x3C00, -15), 0x0200)
+        self.assertEqual(check.f16_ldexp(0x3E00, -24), 0x0002)
+        self.assertEqual(check.f16_ldexp(0x3C00, -25), 0x0000)
+        self.assertEqual(check.f16_ldexp(0x7BFF, -30), 0x0400)
+        self.assertEqual(check.f16_ldexp(0x3C00, 0x00010003), 0x4800)   # only the low 16 bits of S1: 3
+        self.assertEqual(check.f16_ldexp(0x7C05, -1), 0x7C05)           # NaN payload kept, S1 ignored
+
+    def test_model_matches_the_interpreter_reference(self):
+        # The GPU check and tests/semantic/test_alu_frexp_ldexp_f16.py must judge every input the same way. Its
+        # reference functions need only math and struct: take the module's functions and constants, not its import
+        # of the translator (seconds).
+        src = (Path(__file__).resolve().parent / "semantic" / "test_alu_frexp_ldexp_f16.py").read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        def literal(node):   # a constant such as INF, NINF, QNAN = 0x7C00, 0xFC00, 0x7E00
+            if not all(isinstance(t, (ast.Name, ast.Tuple)) for t in node.targets):
+                return False
+            try:
+                ast.literal_eval(node.value)
+                return True
+            except ValueError:
+                return False
+
+        tree.body = [n for n in tree.body if isinstance(n, ast.FunctionDef) or isinstance(n, ast.Assign) and literal(n)]
+        ref = {"math": __import__("math"), "struct": struct}
+        exec(compile(tree, "test_alu_frexp_ldexp_f16.py", "exec"), ref)
+        ref = type("Ref", (), {k: staticmethod(ref[k]) for k in ("ref_mant", "ref_exp", "ref_ldexp")})
+        low = lambda column: [w & 0xFFFF for w in column]   # noqa: E731
+        mant, exp = check.f16_frexp_columns()
+        self.assertEqual(low(mant), [ref.ref_mant(x) for x in range(65536)])
+        self.assertEqual(low(exp), [ref.ref_exp(x) for x in range(65536)])
+        for s1 in check.F16_FREXP_LDEXP_EXPONENTS:
+            words = check.f16_frexp_ldexp_words(s1)[0]
+            self.assertEqual(low(words[2::4]), [ref.ref_ldexp(x, s1) for x in range(65536)], f"S1 {s1:#x}")
 
 
 class MeshWorkgroupChecks(unittest.TestCase):
