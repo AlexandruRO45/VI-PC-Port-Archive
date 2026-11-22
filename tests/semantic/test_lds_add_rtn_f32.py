@@ -265,5 +265,208 @@ class TestLdsAddRtnF32ReferenceOracle(unittest.TestCase):
         self.assertEqual(idx_base, idx_wrapped)
 
 
+# ============================================================================
+# Section 2: Symbolic AST Opcode Definitions and Typed Expressions
+# ============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    IMM = auto()
+
+
+@dataclass(frozen=True)
+class VGPR:
+    index: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index < DEFAULT_NUM_VGPRS):
+            raise ValueError(f"VGPR index out of range [0, {DEFAULT_NUM_VGPRS - 1}]: {self.index}")
+
+    def __str__(self) -> str:
+        return f"v{self.index}"
+
+
+@dataclass(frozen=True)
+class SGPR:
+    index: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index < DEFAULT_NUM_SGPRS):
+            raise ValueError(f"SGPR index out of range [0, {DEFAULT_NUM_SGPRS - 1}]: {self.index}")
+
+    def __str__(self) -> str:
+        return f"s{self.index}"
+
+
+@dataclass(frozen=True)
+class Immediate:
+    value: int  # Stored as unsigned 32-bit dword (can represent float bits)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value", u32(self.value))
+
+    def __str__(self) -> str:
+        return f"0x{self.value:X}"
+
+
+@dataclass(frozen=True)
+class DSAddRtnF32Instruction:
+    dst: VGPR
+    addr: VGPR
+    data0: Union[VGPR, Immediate]
+    offset: int = 0
+    gds: bool = False
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.offset <= OFFSET16_MASK):
+            raise ValueError(f"LDS offset out of 16-bit range [0, 65535]: {self.offset}")
+        if not isinstance(self.dst, VGPR):
+            raise TypeError(f"dst must be a VGPR, got {type(self.dst)}")
+        if not isinstance(self.addr, VGPR):
+            raise TypeError(f"addr must be a VGPR, got {type(self.addr)}")
+        if not isinstance(self.data0, (VGPR, Immediate)):
+            raise TypeError(f"data0 must be VGPR or Immediate, got {type(self.data0)}")
+
+    def disasm(self) -> str:
+        tokens = ["ds_add_rtn_f32", str(self.dst), str(self.addr), str(self.data0)]
+        extra = []
+        if self.offset != 0:
+            extra.append(f"offset:{self.offset}")
+        if self.gds:
+            extra.append("gds")
+        core = f"{tokens[0]} {tokens[1]}, {tokens[2]}, {tokens[3]}"
+        return f"{core} {' '.join(extra)}".rstrip()
+
+
+class ASTExpr:
+    """Base class for symbolic typed expressions in RDNA2 floating-point algebra."""
+
+    def simplify(self) -> ASTExpr:
+        raise NotImplementedError
+
+    def evaluate(self, env: Dict[str, float]) -> float:
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class Symbol(ASTExpr):
+    name: str
+
+    def simplify(self) -> ASTExpr:
+        return self
+
+    def evaluate(self, env: Dict[str, float]) -> float:
+        if self.name not in env:
+            raise KeyError(f"Symbol '{self.name}' not found in evaluation environment")
+        return float(env[self.name])
+
+    def __str__(self) -> str:
+        return self.name
+
+
+@dataclass(frozen=True)
+class FloatConstant(ASTExpr):
+    value: float
+
+    def simplify(self) -> ASTExpr:
+        return self
+
+    def evaluate(self, env: Dict[str, float]) -> float:
+        return self.value
+
+    def __str__(self) -> str:
+        return f"{self.value}"
+
+
+@dataclass(frozen=True)
+class FloatAddExpr(ASTExpr):
+    left: ASTExpr
+    right: ASTExpr
+
+    def simplify(self) -> ASTExpr:
+        s_left = self.left.simplify()
+        s_right = self.right.simplify()
+
+        # Constant folding
+        if isinstance(s_left, FloatConstant) and isinstance(s_right, FloatConstant):
+            u_left = f32_to_u32(s_left.value)
+            u_right = f32_to_u32(s_right.value)
+            sum_u = ieee754_add_f32(u_left, u_right)
+            return FloatConstant(u32_to_f32(sum_u))
+
+        # Identity addition: X + 0.0 -> X (when exactly +0.0)
+        if isinstance(s_right, FloatConstant) and s_right.value == 0.0 and f32_to_u32(s_right.value) == 0:
+            return s_left
+        if isinstance(s_left, FloatConstant) and s_left.value == 0.0 and f32_to_u32(s_left.value) == 0:
+            return s_right
+
+        return FloatAddExpr(s_left, s_right)
+
+    def evaluate(self, env: Dict[str, float]) -> float:
+        u_left = f32_to_u32(self.left.evaluate(env))
+        u_right = f32_to_u32(self.right.evaluate(env))
+        res_u = ieee754_add_f32(u_left, u_right)
+        return u32_to_f32(res_u)
+
+    def __str__(self) -> str:
+        return f"({self.left} + {self.right})"
+
+
+class TestSymbolicASTAndTypedExpressions(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_instruction_valid_creation_and_disassembly(self) -> None:
+        instr = DSAddRtnF32Instruction(
+            dst=VGPR(0),
+            addr=VGPR(1),
+            data0=VGPR(2),
+            offset=16,
+        )
+        self.assertEqual(instr.disasm(), "ds_add_rtn_f32 v0, v1, v2 offset:16")
+
+        instr_imm = DSAddRtnF32Instruction(
+            dst=VGPR(10),
+            addr=VGPR(20),
+            data0=Immediate(f32_to_u32(1.5)),
+            offset=0,
+            gds=True,
+        )
+        self.assertTrue(instr_imm.disasm().startswith("ds_add_rtn_f32 v10, v20, 0x"))
+        self.assertTrue(instr_imm.disasm().endswith("gds"))
+
+    def test_instruction_validation_vgpr_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            VGPR(256)
+        with self.assertRaises(ValueError):
+            VGPR(-1)
+
+    def test_instruction_validation_offset_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            DSAddRtnF32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2), offset=65536)
+        with self.assertRaises(ValueError):
+            DSAddRtnF32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2), offset=-1)
+
+    def test_symbolic_constant_folding(self) -> None:
+        expr = FloatAddExpr(FloatConstant(1.25), FloatConstant(2.5))
+        simplified = expr.simplify()
+        self.assertIsInstance(simplified, FloatConstant)
+        self.assertEqual(simplified.evaluate({}), 3.75)
+
+    def test_symbolic_identity_zero(self) -> None:
+        x = Symbol("X")
+        expr = FloatAddExpr(x, FloatConstant(0.0))
+        simplified = expr.simplify()
+        self.assertEqual(simplified, x)
+
+    def test_symbolic_evaluation_env(self) -> None:
+        x = Symbol("A")
+        y = Symbol("B")
+        expr = FloatAddExpr(x, y)
+        env = {"A": 5.5, "B": 4.5}
+        self.assertEqual(expr.evaluate(env), 10.0)
+
+
+
 if __name__ == "__main__":
     unittest.main()
