@@ -219,6 +219,57 @@ class DSDecRtnInstruction:
         return text
 
 
+# ==============================================================================
+# Deterministic Scalar Interpreter & Machine State
+# ==============================================================================
+
+class ScalarRegisterFile:
+    """Models a 256-register 32-bit scalar VGPR file."""
+
+    def __init__(self) -> None:
+        self.regs: List[int] = [0] * DEFAULT_NUM_VGPRS
+
+    def get_u32(self, reg_idx: int) -> int:
+        return self.regs[reg_idx] & MASK32
+
+    def set_u32(self, reg_idx: int, val: int) -> None:
+        self.regs[reg_idx] = val & MASK32
+
+
+class ScalarMachineState:
+    """Architectural state for scalar single-lane emulation."""
+
+    def __init__(self, lds_dwords: int = LDS_DEFAULT_SIZE_DWORDS) -> None:
+        self.rf = ScalarRegisterFile()
+        self.sgprs = [0] * DEFAULT_NUM_SGPRS
+        self.lds = LDSMemory(lds_dwords)
+
+    def get_vgpr(self, index: int) -> int:
+        return self.rf.get_u32(index)
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        self.rf.set_u32(index, val)
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for ds_dec_rtn_u32."""
+
+    def step(self, instr: DSDecRtnInstruction, state: ScalarMachineState) -> Tuple[int, int]:
+        """Execute a single ds_dec_rtn_u32 instruction deterministically on scalar state.
+
+        Snapshot operands before updating destination to ensure deterministic register handling.
+        """
+        vaddr = state.get_vgpr(instr.vaddr.index)
+        vdata0 = state.get_vgpr(instr.vdata0.index)
+        old_val, new_val = state.lds.atomic_dec_rtn_u32(
+            vaddr=vaddr,
+            vdata0=vdata0,
+            offset=instr.offset,
+        )
+        state.set_vgpr(instr.vdst.index, old_val)
+        return old_val, new_val
+
+
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Unit tests for the reference mathematical oracle and architectural model."""
 
@@ -454,6 +505,129 @@ class TestSymbolicASTAndTypedExpressions(unittest.TestCase):
                 vdata0=RegisterOperand(2),
                 offset=65536,
             )
+
+
+class TestDeterministicScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.state = ScalarMachineState(lds_dwords=1024)
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_execute_basic(self) -> None:
+        # Pre-seed LDS dword 10 with 50
+        self.state.lds.write_dword(10, 50)
+        # v1 = byte address 40 (dword 10), v2 = wrap threshold 100, vdst = v3
+        self.state.set_vgpr(1, 40)
+        self.state.set_vgpr(2, 100)
+
+        instr = DSDecRtnInstruction(
+            vdst=RegisterOperand(3),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+            offset=0,
+        )
+
+        old_val, new_val = self.interp.step(instr, self.state)
+        self.assertEqual(old_val, 50)
+        self.assertEqual(new_val, 49)
+        self.assertEqual(self.state.get_vgpr(3), 50)
+        self.assertEqual(self.state.lds.read_dword(10), 49)
+
+    def test_scalar_execute_wrap_on_zero(self) -> None:
+        self.state.lds.write_dword(10, 0)
+        self.state.set_vgpr(1, 40)
+        self.state.set_vgpr(2, 100)
+
+        instr = DSDecRtnInstruction(
+            vdst=RegisterOperand(3),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+            offset=0,
+        )
+
+        old_val, new_val = self.interp.step(instr, self.state)
+        self.assertEqual(old_val, 0)
+        self.assertEqual(new_val, 100)
+        self.assertEqual(self.state.get_vgpr(3), 0)
+        self.assertEqual(self.state.lds.read_dword(10), 100)
+
+    def test_scalar_determinism_across_identical_runs(self) -> None:
+        state1 = ScalarMachineState(lds_dwords=1024)
+        state2 = ScalarMachineState(lds_dwords=1024)
+        interp1 = ScalarInterpreter()
+        interp2 = ScalarInterpreter()
+
+        for s in (state1, state2):
+            s.lds.write_dword(5, 20)
+            s.set_vgpr(1, 20)
+            s.set_vgpr(2, 50)
+
+        instr = DSDecRtnInstruction(
+            vdst=RegisterOperand(4),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+            offset=0,
+        )
+
+        res1 = interp1.step(instr, state1)
+        res2 = interp2.step(instr, state2)
+
+        self.assertEqual(res1, res2)
+        self.assertEqual(state1.rf.regs, state2.rf.regs)
+        self.assertEqual(state1.lds.data, state2.lds.data)
+
+    def test_scalar_loop_countdown(self) -> None:
+        bound = 3
+        self.state.lds.write_dword(8, bound)
+        self.state.set_vgpr(1, 32)
+        self.state.set_vgpr(2, bound)
+
+        instr = DSDecRtnInstruction(
+            vdst=RegisterOperand(5),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+            offset=0,
+        )
+
+        expected_steps = [(3, 2), (2, 1), (1, 0), (0, 3), (3, 2)]
+        for exp_old, exp_new in expected_steps:
+            old_val, new_val = self.interp.step(instr, self.state)
+            self.assertEqual(old_val, exp_old)
+            self.assertEqual(new_val, exp_new)
+            self.assertEqual(self.state.get_vgpr(5), exp_old)
+            self.assertEqual(self.state.lds.read_dword(8), exp_new)
+
+    def test_scalar_untouched_state_preserved(self) -> None:
+        # Pre-seed adjacent registers and memory locations
+        self.state.set_vgpr(0, 0x11111111)
+        self.state.set_vgpr(1, 40)
+        self.state.set_vgpr(2, 50)
+        self.state.set_vgpr(4, 0x44444444)
+        self.state.lds.write_dword(9, 0xAAAAAAAA)
+        self.state.lds.write_dword(10, 10)
+        self.state.lds.write_dword(11, 0xBBBBBBBB)
+
+        instr = DSDecRtnInstruction(
+            vdst=RegisterOperand(3),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+            offset=0,
+        )
+
+        self.interp.step(instr, self.state)
+
+        # Target register v3 modified
+        self.assertEqual(self.state.get_vgpr(3), 10)
+        # Adjacent registers preserved
+        self.assertEqual(self.state.get_vgpr(0), 0x11111111)
+        self.assertEqual(self.state.get_vgpr(1), 40)
+        self.assertEqual(self.state.get_vgpr(2), 50)
+        self.assertEqual(self.state.get_vgpr(4), 0x44444444)
+        # Adjacent memory preserved
+        self.assertEqual(self.state.lds.read_dword(9), 0xAAAAAAAA)
+        self.assertEqual(self.state.lds.read_dword(10), 9)
+        self.assertEqual(self.state.lds.read_dword(11), 0xBBBBBBBB)
 
 
 if __name__ == "__main__":
