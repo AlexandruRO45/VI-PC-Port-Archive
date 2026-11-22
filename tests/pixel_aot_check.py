@@ -2483,6 +2483,7 @@ def check_scalar_controls():
     at = bfm_program.index("v_mov_b32_e32 v12, s50")
     must_reject(translate_int, bfm_program[:at] + ["s_bfm_b32 s54, 4, 8", "s_cselect_b32 s55, s44, s45"] + bfm_program[at:])
     wait = bfm_program.index("s_waitcnt lgkmcnt(0)", bfm_program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc"))
+    # Before the s_waitcnt, s44..s47 are still pending scalar loads: reading them, or overwriting s44, must be refused.
     for bad in ("s_bfm_b32 s50, s44, 1", "s_bfm_b32 s44, 1, 1", "s_bfm_b32 s50, 1, s47"):
         must_reject(translate_int, bfm_program[:wait] + [bad] + bfm_program[wait:])
     for old, new in (("s_bfm_b32 s50, s44, s45", "s_bfm_b32 v12, s44, s45"),
@@ -6097,7 +6098,7 @@ def check_bfm_draw(directory, compiler, renderer, backend):
         write_words(words)
         subprocess.run(draw, check=True)
     # Controls on the generated HLSL: a narrower count mask and swapped count/offset. Words 1 and 4 distinguish both.
-    for old, new, label in (("& 31u", "& 15u", "b32 count mask"),
+    for old, new, label in (("(1u << (asuint(params[0].w) & 31u))", "(1u << (asuint(params[0].w) & 15u))", "b32 count mask"),
                             ("((1u << (asuint(params[0].w) & 31u)) - 1u) << (asuint(params[1].x) & 31u)",
                              "((1u << (asuint(params[1].x) & 31u)) - 1u) << (asuint(params[0].w) & 31u)", "b32 operand order")):
         mutated = lowered.replace(old, new)
