@@ -301,6 +301,36 @@ class GameCheckTest(PreflightTestBase):
             self.assertIn("custom_loader.exe is not in the folder", stdout_buf.getvalue())
 
 
+class ExecutableStatusTest(unittest.TestCase):
+    def test_realistic_synthetic_image_and_invalid_candidates(self):
+        from test_pe_inspect import build_image
+        import struct
+
+        valid = bytearray(build_image(with_directories=False))
+        nt = struct.unpack_from("<I", valid, 60)[0]
+        struct.pack_into("<H", valid, nt + 22, 2)  # executable rather than DLL
+        opt = nt + 24
+        table = opt + struct.unpack_from("<H", valid, nt + 20)[0]
+        cases = [(valid, "PE32+ executable header found")]
+        truncated = valid[:-1]
+        cases.append((truncated, "payload is truncated"))
+        oversized = bytearray(valid)
+        struct.pack_into("<I", oversized, opt + 56, 1)
+        cases.append((oversized, "bounds"))
+        bad_entry = bytearray(valid)
+        struct.pack_into("<I", bad_entry, opt + 16, 0)
+        cases.append((bad_entry, "no file-backed entry point"))
+        cases.append((b"", "empty"))
+        cases.append((b"MZ", "no MZ header"))
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "candidate.exe")
+            for data, expected in cases:
+                with self.subTest(expected=expected):
+                    with open(path, "wb") as stream:
+                        stream.write(data)
+                    self.assertIn(expected, make_game.executable_status(path))
+
+
 class ToolchainDetectionTest(PreflightTestBase):
     def test_tool_available_direct_file(self):
         self.assertTrue(make_game.tool_available(sys.executable))

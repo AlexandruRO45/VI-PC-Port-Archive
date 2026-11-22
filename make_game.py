@@ -597,6 +597,16 @@ def executable_status(path: str) -> str:
                     return f"Expected an x86-64 PE32+ executable. Candidate machine: {machine}."
                 if image.characteristics & 0x2000 or not image.characteristics & 0x0002:
                     return "Candidate PE header does not identify a standalone executable."
+                if not 0 < image.size_of_headers <= min(len(data), image.size_of_image):
+                    return "Candidate has invalid image header bounds."
+                for section in image.sections:
+                    span = section["vsize"] or section["rawsize"]
+                    if section["rva"] + span > image.size_of_image:
+                        return "Candidate section extends beyond its declared image."
+                    if section["rawsize"] and section["rawptr"] + section["rawsize"] > len(data):
+                        return "Candidate section payload is truncated."
+                if image.entry_rva >= image.size_of_image:
+                    return "Candidate entry point extends beyond its declared image."
                 if image.offset(image.entry_rva) is None or not any(
                     section["exec"] and section["rva"] <= image.entry_rva <
                     section["rva"] + (section["vsize"] or section["rawsize"]) for section in image.sections
