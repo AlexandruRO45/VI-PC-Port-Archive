@@ -584,16 +584,16 @@ class F16RoundingExecutionTests(unittest.TestCase):
         self.assertEqual(run_op("v_ceil_f16_e64 v0, |v1| op_sel:[1,1]", v1), merge_half(OLD, H_2P0, 1))
         self.assertEqual(run_op("v_rndne_f16_e64 v0, -|v1| op_sel:[1,0]", v1), merge_half(OLD, H_NEG_2P0, 0))
 
-        # Output modifiers scale first, then clamp to [0.0, 1.0], then pack to f16.
-        # trunc(2.5) = 2.0 -> mul:2 = 4.0; trunc(2.5) * 0.5 = 1.0; clamp -> 1.0.
-        self.assertEqual(run_op("v_trunc_f16_e64 v0, v1 mul:2", v1), merge_half(OLD, H_4P0, 0))
-        self.assertEqual(run_op("v_trunc_f16_e64 v0, v1 mul:4", v1), merge_half(OLD, f2h(8.0), 0))
-        self.assertEqual(run_op("v_trunc_f16_e64 v0, v1 div:2", v1), merge_half(OLD, H_1P0, 0))
+        # An f16 result takes no omod with f16 denormals kept (gfx1036, SHADER-135/297); clamp to [0.0, 1.0]
+        # still applies before packing to f16. trunc(2.5) = 2.0 with any omod; clamp -> 1.0.
+        self.assertEqual(run_op("v_trunc_f16_e64 v0, v1 mul:2", v1), merge_half(OLD, H_2P0, 0))
+        self.assertEqual(run_op("v_trunc_f16_e64 v0, v1 mul:4", v1), merge_half(OLD, H_2P0, 0))
+        self.assertEqual(run_op("v_trunc_f16_e64 v0, v1 div:2", v1), merge_half(OLD, H_2P0, 0))
         self.assertEqual(run_op("v_trunc_f16_e64 v0, v1 mul:2 clamp", v1), merge_half(OLD, H_1P0, 0))
         # floor(-1.5) = -2.0 -> clamp -> 0.0 (preserving low half when dst_hi=1).
         self.assertEqual(run_op("v_floor_f16_e64 v0, v1 op_sel:[1,1] clamp", v1), merge_half(OLD, H_POS_ZERO, 1))
-        # rndne(0.5) = 0.0 -> div:2 = 0.0; trunc(1.25) = 1.0 -> div:2 = 0.5.
-        self.assertEqual(run_op("v_trunc_f16_e64 v0, v1 div:2", H_1P25), merge_half(OLD, H_0P5, 0))
+        # trunc(1.25) = 1.0, div:2 ignored.
+        self.assertEqual(run_op("v_trunc_f16_e64 v0, v1 div:2", H_1P25), merge_half(OLD, H_1P0, 0))
 
     def test_inline_constants_sgpr_and_aliasing(self):
         # Inline float constants populate the low half as f16 (docs/design.md).
@@ -839,11 +839,11 @@ class FractF16TranslationTests(unittest.TestCase):
         self.assertEqual(run_op("v_fract_f16_e64 v0, |v1| op_sel:[1,1]", v1), merge_half(OLD, H_0P25, 1))
         self.assertEqual(run_op("v_fract_f16_e64 v0, -|v1| op_sel:[1,0]", v1), merge_half(OLD, H_0P75, 0))
 
-        # Output modifiers scale Fract's result; the 0x3c00 fix-up applies to Fract alone, not to omod.
-        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 mul:2", v1), merge_half(OLD, H_1P0, 0))
-        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 mul:4", v1), merge_half(OLD, H_2P0, 0))
-        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 div:2", v1), merge_half(OLD, H_0P25, 0))
-        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 mul:2 clamp", v1), merge_half(OLD, H_1P0, 0))
+        # No omod on an f16 result with f16 denormals kept (gfx1036, SHADER-135/297): fract(2.5) = 0.5 throughout.
+        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 mul:2", v1), merge_half(OLD, H_0P5, 0))
+        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 mul:4", v1), merge_half(OLD, H_0P5, 0))
+        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 div:2", v1), merge_half(OLD, H_0P5, 0))
+        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 mul:2 clamp", v1), merge_half(OLD, H_0P5, 0))
         self.assertEqual(run_op("v_fract_f16_e64 v0, v1 op_sel:[1,1] clamp", v1), merge_half(OLD, H_0P75, 1))
 
     def test_inline_constants_sgpr_and_aliasing(self):
@@ -975,13 +975,14 @@ class TieBreakingSignedZerosAndNegativeControlTests(unittest.TestCase):
         self.assertEqual(got, merge_half(OLD, H_1P0, 0))
 
     def test_negative_control_clamp_omitted(self):
-        """Omitting FClamp in SPIR-V produces out-of-bounds unclamped float."""
+        """Omitting FClamp in SPIR-V produces out-of-bounds unclamped float. The mul:2 does nothing: no omod on an
+        f16 result with f16 denormals kept (SHADER-297), so trunc(2.5) stays 2.0."""
         spv = translate_ps([f"v_mov_b32 v1, {H_2P5:#x}", f"v_mov_b32 v0, {OLD:#x}", "v_trunc_f16_e64 v0, v1 mul:2 clamp"])
         sabotaged, n = re.subn(r"OpExtInst %float %glsl FClamp (%\w+) %f0 %f1", r"OpCopyObject %float \1", spv)
         self.assertEqual(n, 1)
         got = si.run_fragment(sabotaged)["%out_mrt0"][0]
         self.assertNotEqual(got, merge_half(OLD, H_1P0, 0))
-        self.assertEqual(got, merge_half(OLD, H_4P0, 0))
+        self.assertEqual(got, merge_half(OLD, H_2P0, 0))
 
     def test_negative_control_dropped_signed_zero_detected(self):
         """A mutant that strips sign bits from -0.0 results is detected by bitwise check."""

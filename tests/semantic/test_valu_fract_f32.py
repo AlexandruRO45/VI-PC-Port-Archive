@@ -939,14 +939,14 @@ class FractF16AndEdgeCaseExecutionTests(unittest.TestCase):
             run_op("v_fract_f16_e64 v0, |v1| op_sel:[0,0]", v1),
             merge_half(OLD, H_0P25, 0),  # |-0.25| = 0.25 -> 0.25
         )
-        # Output modifiers
+        # Output modifiers do nothing on an f16 result with f16 denormals kept (SHADER-297)
         self.assertEqual(
             run_op("v_fract_f16_e64 v0, v1 mul:2", H_0P5),
-            merge_half(OLD, H_1P0, 0),
+            merge_half(OLD, H_0P5, 0),
         )
         self.assertEqual(
             run_op("v_fract_f16_e64 v0, v1 div:2", H_0P5),
-            merge_half(OLD, H_0P25, 0),
+            merge_half(OLD, H_0P5, 0),
         )
 
     def test_ieee754_zero_sign_clearing_joint(self):
