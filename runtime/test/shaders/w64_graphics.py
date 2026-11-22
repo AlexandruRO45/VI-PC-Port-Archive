@@ -1,7 +1,7 @@
 """SHADER-10 GPU checks: wave64 pixel and vertex shaders on 32-lane subgroups (docs/design.md, "Wave64 graphics:
 partition invariance").
 
-    python3 -I runtime/test/shaders/w64_graphics.py <build dir with spirv/> [tools dir] [name ...]
+    python3 -I runtime/test/shaders/w64_graphics.py <build dir with spirv/> [tools dir] [name[@variant] ...]
 
 A wave64 pixel shader is exact on 32-wide subgroups when its outputs do not change if the wave is cut into two
 32-lane halves. The test draws each ps_w64_* fixture with the fragment stage's required subgroup size set to 64 (one
@@ -36,6 +36,16 @@ the 64-lane waves: a stricter test of tiers A and B, which key every word on the
 The gs_w64_* fixtures are legacy geometry shaders, switched the same way (gewave32 covers the whole NGG stage). Each is
 drawn after vs_ids with VKH_GS, finds its triangle from the vertex number vs_ids passes in TEXCOORD0, and stores four
 words per triangle to the heap; gs_w64_c_lane_id is the geometry probe. RADV puts at most 42 GS invocations in a wave64.
+
+TEST-363 runs the tier A and B pixel fixtures in three more ways, named <fixture>@<variant>:
+  partial      drawn with vs_tri_partial, whose long edge cuts 2x2 quads, so they run with helper invocations. A
+               covered pixel must give its derived words, an uncovered one keeps the clear value (-1.0 in all four
+               channels). On RDNA2 a pixel wave's EXEC holds only the covered pixels until s_wqm_b64; ps_w64_a_quad_live
+               reads that back as the covered count of each quad, and the ballot atomic counts covered pixels only.
+  mr           the fragment shader gets the MaximallyReconvergesKHR execution mode (VK_KHR_shader_maximal_
+               reconvergence, 77 without it), which the translator assumes for waterfall and election loops but does
+               not request. With it a helper invocation must stay active in group operations; without it, it may not.
+  partial+mr   both.
 """
 import os
 import re
@@ -48,6 +58,11 @@ from pathlib import Path
 EXE = ".exe" if os.name == "nt" else ""
 UNSUPPORTED = 77
 W = H = 64
+CLEAR = 0xBF800000            # vk_harness clears the target to -1.0: a pixel no fragment wrote
+PARTIAL_VS = "vs_tri_partial"
+VARIANTS = ("partial", "mr", "partial+mr")
+MAXIMALLY_RECONVERGES = 6023  # SPIR-V execution mode MaximallyReconvergesKHR
+MR_EXTENSION = "SPV_KHR_maximal_reconvergence"
 
 
 class Skip(str):
@@ -155,6 +170,21 @@ def _c_execz_sgpr(i):
     return (7 if _on(i) else None, _on(i), 0, 0)               # r0 = s5: 7 only where the active side ran
 
 
+def _a_quad_live(i):
+    return (4, _x(i), _y(i), 0)                                # every quad covered when drawn with vs_ids
+
+
+def covered(x, y):
+    """Whether vs_tri_partial covers pixel (x, y): its centre (x + 0.5, y + 0.5) has 3x + 4y < 188.5."""
+    return 3 * x + 4 * y <= 188
+
+
+def _quad_covered(i):
+    """How many pixels of pixel i's 2x2 quad vs_tri_partial covers."""
+    qx, qy = _x(i) & ~1, _y(i) & ~1
+    return sum(covered(qx + dx, qy + dy) for dx in (0, 1) for dy in (0, 1))
+
+
 # vs_w64_* fixtures: i is the vertex index, x = i % 64 and y = i // 64 as for a pixel.
 def _vs_a_skip(i):
     x, y = _x(i), _y(i)
@@ -189,6 +219,7 @@ FIXTURES = {
     "ps_w64_a_uniform_vote": ("A", _a_uniform_vote, {"VKH_SGPRS": "0,0,0,0,9"}),
 
     "ps_w64_a_discard": ("A", _a_discard, {}),
+    "ps_w64_a_quad_live": ("A", _a_quad_live, {}),
     "ps_w64_b_waterfall": ("B", _b_waterfall, {}),
     "ps_w64_b_readfirstlane": ("B", _b_readfirstlane, {"VKH_SGPRS": "0,0,0,0,123"}),
     "ps_w64_b_readlane_uniform": ("B", _b_readlane_uniform, {"VKH_SGPRS": "0,0,0,0,123"}),
@@ -215,6 +246,83 @@ FIXTURES = {
 
 PROBES = {"vs": "vs_w64_c_lane_id", "gs": "gs_w64_c_lane_id"}   # per stage: the largest lane id shows the wave size
 _applied = {}
+# TEST-363: the tier A and B pixel fixtures also run as <name>@<variant> (see the module docstring).
+# Listed by hand: each one's words under partial coverage were derived for it (expectation()); a fixture added
+# later joins only once its partial-coverage words are worked out.
+VARIANT_FIXTURES = ["ps_w64_a_one_lane", "ps_w64_a_quad_live", "ps_w64_a_skip", "ps_w64_b_ballot_atomic",
+                    "ps_w64_b_readfirstlane", "ps_w64_b_readlane_uniform", "ps_w64_b_waterfall"]
+CHECKS = sorted(FIXTURES) + [f"{n}@{v}" for v in VARIANTS for n in VARIANT_FIXTURES]
+ONLY_HERE = frozenset(FIXTURES) | {PARTIAL_VS}   # the shaders scripts/run_gpu_tests.py leaves to this runner
+# Checks that fail on main for a known translator gap, reported as XFAIL. A pass is reported as XPASS but does not
+# fail the run: whether a helper invocation joins a ballot without MaximallyReconvergesKHR is up to the driver, so
+# some of these may pass on one GPU and not another. The translator starts a pixel shader with its helper
+# invocations active (rdna2spirv.py's %active is true in every invocation); RDNA2's entry EXEC holds the covered
+# pixels only.
+_HELPERS_IN_EXEC = "helper lanes in the entry EXEC, issues/2078#issuecomment-7082188519"
+KNOWN = {f"{n}@{v}": _HELPERS_IN_EXEC for n in ("ps_w64_a_quad_live", "ps_w64_a_skip", "ps_w64_b_ballot_atomic")
+         for v in ("partial", "partial+mr")}
+
+
+def split_check(check_name):
+    """(fixture, variant) of a check name such as ps_w64_b_waterfall@partial (variant '' for the plain draw)."""
+    name, _, variant = check_name.partition("@")
+    return name, variant
+
+
+def expectation(name, variant=""):
+    """The expected words per pixel of `name` drawn in `variant` (None in a slot: not fixed by the fixture)."""
+    base = FIXTURES[name][1]
+    if "partial" not in variant:
+        return base
+
+    def expect(i):
+        if not covered(_x(i), _y(i)):
+            return (CLEAR,) * 4
+        if name == "ps_w64_a_quad_live":
+            return (_quad_covered(i), _x(i), _y(i), 0)
+        if name == "ps_w64_a_skip":
+            # r1 is s_wqm_b64 of a compare taken under the entry EXEC, where a helper's bit is 0 (a VOPC writes 0
+            # for a lane off in EXEC): 1 only if a covered pixel of the quad has x % 4 == 1.
+            qx, qy = _x(i) & ~1, _y(i) & ~1
+            r1 = int(qx % 4 == 0 and (covered(qx + 1, qy) or covered(qx + 1, qy + 1)))
+            r0, _, r2, r3 = base(i)
+            return (r0, r1, r2, r3)
+        return base(i)
+    return expect
+
+
+def _spirv_string(text):
+    raw = text.encode() + b"\0"
+    raw += b"\0" * (-len(raw) % 4)
+    return list(struct.unpack("<%dI" % (len(raw) // 4), raw))
+
+
+def with_maximal_reconvergence(src, dst):
+    """Writes SPIR-V module `src` to `dst` with OpExtension SPV_KHR_maximal_reconvergence after the capabilities and
+    OpExecutionMode MaximallyReconvergesKHR after the entry point."""
+    data = Path(src).read_bytes()
+    words = list(struct.unpack("<%dI" % (len(data) // 4), data))
+    after_caps = after_entry = entry = None
+    i = 5
+    while i < len(words):
+        count, op = words[i] >> 16, words[i] & 0xFFFF
+        if not count:
+            raise ValueError(f"{src}: malformed instruction at word {i}")
+        if op == 17:                                   # OpCapability
+            after_caps = i + count
+        elif op == 15 and entry is None:               # OpEntryPoint: model, id, name, interface
+            entry, after_entry = words[i + 2], i + count
+        elif op == 16 and words[i + 2] == MAXIMALLY_RECONVERGES:
+            Path(dst).write_bytes(data)                # already there
+            return
+        i += count
+    if after_caps is None or entry is None:
+        raise ValueError(f"{src}: no OpCapability or OpEntryPoint")
+    mode = [(3 << 16) | 16, entry, MAXIMALLY_RECONVERGES]
+    ext = _spirv_string(MR_EXTENSION)
+    words[after_entry:after_entry] = mode              # the later position first, so after_caps stays valid
+    words[after_caps:after_caps] = [((1 + len(ext)) << 16) | 10] + ext
+    Path(dst).write_bytes(struct.pack("<%dI" % len(words), *words))
 
 
 def _radv_perftest(size):
@@ -293,7 +401,7 @@ def live_width(tools, spirv, tmp):
     return max(struct.unpack("<%dI" % (W * H * 4), raw.read_bytes()))
 
 
-def draw(tools, spirv, name, size, tmp):
+def draw(tools, spirv, name, size, tmp, variant=""):
     """(words per pixel, heap words or None, applied) of one draw. `applied`: the required size took effect (size
     None: no size asked, applied is None). The words are None when the draw failed; then `heap` is the message."""
     tier, expect, extra = FIXTURES[name]
@@ -311,11 +419,18 @@ def draw(tools, spirv, name, size, tmp):
     env.pop("VKH_SUBGROUP_SIZE", None)
     if size:
         env["VKH_SUBGROUP_SIZE"] = str(size)
-    raw, heap = Path(tmp) / f"{name}.{size}.raw", Path(tmp) / f"{name}.{size}.heap"
+    tag = f"{name}.{variant.replace('+', '_')}.{size}"
+    raw, heap = Path(tmp) / f"{tag}.raw", Path(tmp) / f"{tag}.heap"
     if "VKH_HEAP" in extra:
         env["VKH_HEAP_DUMP"] = str(heap)
-    cmd = [os.path.join(tools, "vk_harness" + EXE), os.path.join(spirv, "vs_ids.spv"), os.path.join(spirv, name + ".spv"),
-           str(raw)]
+    fs = os.path.join(spirv, name + ".spv")
+    if "mr" in variant:
+        patched = Path(tmp) / f"{name}.mr.spv"
+        if not patched.is_file():
+            with_maximal_reconvergence(fs, patched)
+        fs = str(patched)
+    vs = os.path.join(spirv, (PARTIAL_VS if "partial" in variant else "vs_ids") + ".spv")
+    cmd = [os.path.join(tools, "vk_harness" + EXE), vs, fs, str(raw)]
     r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=120)
     out = r.stdout + r.stderr
     if r.returncode == UNSUPPORTED:
@@ -338,9 +453,9 @@ def draw(tools, spirv, name, size, tmp):
     return words, words_heap, applied
 
 
-def expected_problem(name, words, heap):
+def expected_problem(name, words, heap, variant=""):
     """'' when the words (and heap) are what the fixture's header derives, else the first discrepancy."""
-    tier, expect, _ = FIXTURES[name]
+    expect = expectation(name, variant)
     wrong = []
     for i, w in enumerate(words):
         want = expect(i)
@@ -350,7 +465,8 @@ def expected_problem(name, words, heap):
         i, w, want = wrong[0]
         return f"{len(wrong)} of {len(words)} pixels differ from the derived words, first ({_x(i)},{_y(i)}): got {w}, want {want}"
     if name.endswith("_b_ballot_atomic"):
-        want = sorted(i + 1 for i in range(len(words)) if _x(i) % 4 == 1)
+        partial = "partial" in variant           # only covered pixels are wanted lanes; a helper takes no slot
+        want = sorted(i + 1 for i in range(len(words)) if _x(i) % 4 == 1 and (not partial or covered(_x(i), _y(i))))
         n = len(want)
         if heap[0] != n:
             return f"counter is {heap[0]}, want {n}"
@@ -363,30 +479,33 @@ def expected_problem(name, words, heap):
     return ""
 
 
-def comparable(name, words, heap):
+def comparable(name, words, heap, variant=""):
     """What two draws of the same fixture must share when the shader is partition invariant."""
-    stable = [tuple(0 if g is None else v for g, v in zip(FIXTURES[name][1](i), w)) for i, w in enumerate(words)]
+    expect = expectation(name, variant)
+    stable = [tuple(0 if g is None else v for g, v in zip(expect(i), w)) for i, w in enumerate(words)]
     if name.endswith("_b_ballot_atomic"):
         return stable, sorted(heap[64:64 + heap[0]]), heap[0]
     return stable, None, None
 
 
-def partition_dependent(name, a, b):
+def partition_dependent(name, a, b, variant=""):
     """Whether the words the fixture's header names as partition dependent differ between two draws."""
-    return any(any(g is None and x != y for g, x, y in zip(FIXTURES[name][1](i), p, q))
-               for i, (p, q) in enumerate(zip(a, b)))
+    expect = expectation(name, variant)
+    return any(any(g is None and x != y for g, x, y in zip(expect(i), p, q)) for i, (p, q) in enumerate(zip(a, b)))
 
 
-def check(tools, spirv, name):
-    """"" when `name` behaves as its tier says on this device, a Skip when the device cannot run the comparison."""
+def check(tools, spirv, check_name):
+    """"" when the check behaves as its tier says on this device, a Skip when the device cannot run the comparison."""
+    name, variant = split_check(check_name)
     tier = FIXTURES[name][0]
-    if not os.path.isfile(os.path.join(spirv, name + ".spv")):
-        return f"missing {name}.spv"
+    for shader in (name, PARTIAL_VS) if "partial" in variant else (name,):
+        if not os.path.isfile(os.path.join(spirv, shader + ".spv")):
+            return f"missing {shader}.spv"
     save, ref = os.environ.get("W64G_SAVE_REF"), os.environ.get("W64G_REF")
     with tempfile.TemporaryDirectory(prefix="leonida-w64g-") as tmp:
         runs = {}
         for size in (64, 32, None):
-            words, heap, applied = draw(tools, spirv, name, size, tmp)
+            words, heap, applied = draw(tools, spirv, name, size, tmp, variant)
             if words is None:
                 if heap.startswith("unsupported"):
                     return Skip("SKIP (" + heap + ")")
@@ -413,24 +532,24 @@ def check(tools, spirv, name):
                             f"ps_live_width; this fixture needs {need})")
         if save and 64 in runs:
             Path(save).mkdir(parents=True, exist_ok=True)
-            (Path(save) / (name + ".ref64.raw")).write_bytes(b"".join(struct.pack("<4I", *w) for w in runs[64][0]))
+            (Path(save) / (check_name + ".ref64.raw")).write_bytes(b"".join(struct.pack("<4I", *w) for w in runs[64][0]))
         if tier in ("A", "B"):
             for size, (words, heap) in runs.items():
                 if size is None and len(runs) > 1:
                     continue                      # the default draw repeats one of the forced sizes
-                p = expected_problem(name, words, heap)
+                p = expected_problem(name, words, heap, variant)
                 if p:
                     return f"{size or 'default size'}: {p}"
-            if 64 in runs and 32 in runs and comparable(name, *runs[64]) != comparable(name, *runs[32]):
+            if 64 in runs and 32 in runs and comparable(name, *runs[64], variant) != comparable(name, *runs[32], variant):
                 return "the images at required subgroup size 64 and 32 differ"
         elif 64 in runs and 32 in runs:
-            if comparable(name, *runs[64]) != comparable(name, *runs[32]):
+            if comparable(name, *runs[64], variant) != comparable(name, *runs[32], variant):
                 return "a word that must not depend on the partition differs between 64 and 32"
-            if not partition_dependent(name, runs[64][0], runs[32][0]):
+            if not partition_dependent(name, runs[64][0], runs[32][0], variant):
                 return "tier C but the images at required subgroup size 64 and 32 are equal: the detector is wrong"
             compared = True
-        if ref and (Path(ref) / (name + ".ref64.raw")).is_file():
-            data = (Path(ref) / (name + ".ref64.raw")).read_bytes()
+        if ref and (Path(ref) / (check_name + ".ref64.raw")).is_file():
+            data = (Path(ref) / (check_name + ".ref64.raw")).read_bytes()
             ref_words = list(struct.iter_unpack("<4I", data))
             for size, (words, heap) in runs.items():
                 if size == 64:
@@ -438,12 +557,13 @@ def check(tools, spirv, name):
                 if tier == "C" and comparable(name, ref_words, None) != comparable(name, words, None):
                     return "a partition-invariant word differs from the 64-lane reference"
                 if tier == "C":
-                    if comparable(name, ref_words, None) != comparable(name, words, None):
+                    if comparable(name, ref_words, None, variant) != comparable(name, words, None, variant):
                         return "a word that must not depend on the partition differs from the 64-lane reference"
-                    if not partition_dependent(name, ref_words, words):
+                    if not partition_dependent(name, ref_words, words, variant):
                         return "tier C but the run equals the 64-lane reference: the detector is wrong"
                     compared = True
-                elif not name.endswith("_b_ballot_atomic") and comparable(name, ref_words, None) != comparable(name, words, None):
+                elif (not name.endswith("_b_ballot_atomic")
+                      and comparable(name, ref_words, None, variant) != comparable(name, words, None, variant)):
                     return "the run differs from the 64-lane reference"
         if tier == "C" and not compared:
             return Skip("SKIP (tier C needs a device that can require both 64 and 32, or W64G_REF)")
@@ -457,15 +577,19 @@ def main(argv):
     tools = argv[1] if len(argv) > 1 and os.path.isdir(argv[1]) else os.path.join(os.path.dirname(__file__), "..", "..", "build")
     start = 2 if len(argv) > 1 and os.path.isdir(argv[1]) else 1
     requested = argv[start:]
-    unknown = [a for a in requested if a not in FIXTURES]
+    unknown = [a for a in requested if a not in CHECKS]
     if unknown:
         print(f"Unknown fixture name{'s' if len(unknown) > 1 else ''}: {', '.join(unknown)}", file=sys.stderr)
         return 1
-    names = requested or sorted(FIXTURES)
+    names = requested or CHECKS
     failed = 0
     for name in names:
         problem = check(os.path.abspath(tools), spirv, name)
-        print(f"{name:28} {FIXTURES[name][0]}  {'ok' if not problem else problem}")
+        if name in KNOWN and problem and not isinstance(problem, Skip):
+            problem = Skip(f"XFAIL ({KNOWN[name]}): {problem}")
+        elif name in KNOWN and not problem:
+            problem = Skip(f"XPASS (expected to fail here: {KNOWN[name]}; not a failure, see KNOWN)")
+        print(f"{name:39} {FIXTURES[split_check(name)[0]][0]}  {'ok' if not problem else problem}")
         failed += bool(problem) and not isinstance(problem, Skip)
     return 1 if failed else 0
 

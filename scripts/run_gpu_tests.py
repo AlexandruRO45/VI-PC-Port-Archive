@@ -807,7 +807,7 @@ def _w64_graphics_only() -> frozenset:
         import w64_graphics
     except ImportError:
         return frozenset()
-    return frozenset(w64_graphics.FIXTURES)
+    return getattr(w64_graphics, "ONLY_HERE", frozenset(w64_graphics.FIXTURES))   # fixtures and vs_tri_partial
 
 
 W64_GRAPHICS_ONLY = _w64_graphics_only()

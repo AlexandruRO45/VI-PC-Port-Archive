@@ -28,6 +28,8 @@
 //                                set 0 image index 1 (with 1x1 magenta at index 0), writes a T# at VKH_TSHARP_VA
 //                                (default 0x100) in the 64 KiB heap, and registers VKH_SSHARP (4 comma-separated
 //                                dwords, default 0x92,0xc00000,0x14500000,0) at sampler index 1.
+// A fragment shader with the MaximallyReconvergesKHR execution mode gets VK_KHR_shader_maximal_reconvergence enabled
+// (exit 77 when the device lacks it); w64_graphics.py's @mr checks add the mode (TEST-363).
 //
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
@@ -301,7 +303,7 @@ int main(int argc, char** argv) {
     // (llvmpipe and other software devices), so the suite reports it as unsupported instead. 77 is the existing
     // "this device cannot run the test" code (runtime/test/shaders/check.py, scripts/run_gpu_tests.py).
     const std::vector<uint32_t> fs_code = read_spv(argv[2]);
-    bool needs_barycentric = false, needs_float64 = false;
+    bool needs_barycentric = false, needs_float64 = false, needs_maximal_reconvergence = false;
     for (std::size_t i = 5; i + 1 < fs_code.size();) {   // instructions follow the 5-word SPIR-V header
         const uint32_t words = fs_code[i] >> 16, op = fs_code[i] & 0xffffu;
         if (!words) break;
@@ -309,6 +311,8 @@ int main(int argc, char** argv) {
             needs_barycentric = true;
         if (op == 17 && fs_code[i + 1] == 10)            // OpCapability Float64 (v_add_f64 and friends)
             needs_float64 = true;
+        if (op == 16 && words >= 3 && i + 2 < fs_code.size() && fs_code[i + 2] == 6023)
+            needs_maximal_reconvergence = true;          // OpExecutionMode ... MaximallyReconvergesKHR (TEST-363)
         i += words;
     }
     if (needs_barycentric && !has(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
@@ -341,6 +345,31 @@ int main(int argc, char** argv) {
         enable.push_back(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
         lock.fragmentShaderPixelInterlock = VK_TRUE; lock.pNext = chain; chain = &lock;
     }
+    // A fragment shader with the MaximallyReconvergesKHR execution mode (w64_graphics.py adds it to compare the
+    // translator's waterfall and election loops with and without it) needs VK_KHR_shader_maximal_reconvergence's
+    // feature; 77 without it, as for the barycentric extension.
+#ifdef VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME
+    VkPhysicalDeviceShaderMaximalReconvergenceFeaturesKHR mrf{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MAXIMAL_RECONVERGENCE_FEATURES_KHR};
+    if (needs_maximal_reconvergence) {
+        VkPhysicalDeviceFeatures2 mr_query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        mr_query.pNext = &mrf;
+        vkGetPhysicalDeviceFeatures2(pd, &mr_query);
+        if (!has(VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME) || !mrf.shaderMaximalReconvergence) {
+            std::fprintf(stderr, "unsupported: %s is MaximallyReconvergesKHR and the device has no %s\n", argv[2],
+                         VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
+            return 77;
+        }
+        enable.push_back(VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
+        mrf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MAXIMAL_RECONVERGENCE_FEATURES_KHR};
+        mrf.shaderMaximalReconvergence = VK_TRUE; mrf.pNext = chain; chain = &mrf;
+    }
+#else
+    if (needs_maximal_reconvergence) {
+        std::fprintf(stderr, "unsupported: these Vulkan headers have no VK_KHR_shader_maximal_reconvergence\n");
+        return 77;
+    }
+#endif
     // VKH_MESH_COMPUTE=<vs.spv>: the first shader is a mesh shader translated with rdna2spirv.py --mesh-compute.
     // It is dispatched as compute over the mesh grid (1x1x1, or --mesh-group-readback's), writing its slots to an
     // output buffer (VKH_MESH_SLOT bytes per workgroup, address in push-constant dwords 36..37). Then
