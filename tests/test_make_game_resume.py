@@ -24,9 +24,12 @@ class ResumeShardsTest(unittest.TestCase):
     def part(self, i):
         return os.path.join(self.spirv, f"index.part{i}.json")
 
+    def module(self, i):
+        return os.path.join(self.spirv, f"shader{i}.spv")
+
     def tag(self, i):
         with open(self.part(i), encoding="utf-8") as f:
-            return json.load(f)["tag"]
+            return json.load(f)[f"shader{i}"]["test_tag"]
 
     def translate(self, jobs, emulate=False, digest="d1", tag="a", crash=()):
         """Run translate() with fake shards; returns the shard indices it started. Shards in `crash` exit with 1
@@ -37,14 +40,15 @@ class ResumeShardsTest(unittest.TestCase):
         class FakeProc:
             def __init__(self, args):
                 self.i = int(args[args.index("--shard") + 1].split("/")[0])
-                self.n = int(args[args.index("--shard") + 1].split("/")[1])
                 started.append(self.i)
 
             def wait(self):
                 if self.i in crash:
                     return 1
+                with open(os.path.join(spirv, f"shader{self.i}.spv"), "wb") as f:
+                    f.write(b"\x03\x02\x23\x07" + bytes(32))
                 with open(os.path.join(spirv, f"index.part{self.i}.json"), "w", encoding="utf-8") as f:
-                    json.dump({"tag": tag, "n": self.n}, f)
+                    json.dump({f"shader{self.i}": {"test_tag": tag, "spv_bytes": 36}}, f)
                 return 0
         with mock.patch.object(make_game.subprocess, "Popen", side_effect=FakeProc), \
                 mock.patch.object(make_game, "py") as py, \
@@ -72,6 +76,17 @@ class ResumeShardsTest(unittest.TestCase):
         os.remove(self.part(3))
         self.assertEqual(self.translate(4, tag="b"), [1, 3])
         self.assertEqual([self.tag(i) for i in range(4)], ["a", "b", "a", "b"])
+
+    def test_damaged_cached_outputs_restart_only_the_affected_shards(self):
+        self.translate(4)
+        os.remove(self.module(0))
+        with open(self.module(2), "r+b") as f:
+            f.truncate(32)  # still word-aligned and longer than a header
+        with open(self.part(3), "w", encoding="utf-8", newline="\n") as f:
+            f.write("{")
+        self.assertEqual(self.translate(4, tag="b"), [0, 2, 3])
+        self.assertEqual([self.tag(i) for i in range(4)], ["b", "a", "b", "b"])
+        self.assertEqual(self.translate(4), [])
 
     def test_a_failed_shard_is_retried_alone(self):
         with self.assertRaises(SystemExit), mock.patch("sys.stderr"):

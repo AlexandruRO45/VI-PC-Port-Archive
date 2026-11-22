@@ -13793,6 +13793,7 @@ def main():
                 meta[name] = shader_meta(translate.last_gen, asm, src_path=p, fssm_path=fssm_sidecar)
             except Exception as e:  # noqa: BLE001 - metadata must never cost a translation
                 meta[name] = {"error": f"{type(e).__name__}: {e}"}
+            meta[name]["spv_bytes"] = os.path.getsize(sv)
         else:
             if not write_asm:
                 with open(sa, "w", newline="\n") as f:

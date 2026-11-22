@@ -93,6 +93,8 @@ class ShaderStageResumeTest(unittest.TestCase):
                 json.dump([{"file": "s0.dxbc"}], f)
             elif p == os.path.join(self.dxbc, "fssm_index.json"):
                 json.dump([{"name": "s0"}], f)
+            elif p == os.path.join(self.spirv, "index.json"):
+                json.dump({}, f)
             elif p.endswith(".s"):
                 f.write("synthetic listing\n")
 
@@ -124,6 +126,19 @@ class ShaderStageResumeTest(unittest.TestCase):
     def test_fresh_folder_runs_every_step_then_nothing(self):
         self.assertEqual(self.run_stage(), ["shader_carve.py", "fssm_unpack.py", "shader_disasm.py", "translate"])
         self.assertEqual(self.run_stage(), [])
+
+    def test_missing_indexed_module_invalidates_a_completed_translation(self):
+        self.run_stage()
+        index = os.path.join(self.spirv, "index.json")
+        with open(index, "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"s0": {"stage": "cs"}}, f)
+        module = os.path.join(self.spirv, "s0.spv")
+        with open(module, "wb") as f:
+            f.write(b"\x03\x02\x23\x07" + bytes(32))
+        self.assertTrue(make_game.shader_outputs_reusable(self.work, False, False))
+        os.remove(module)
+        self.assertFalse(make_game.shader_outputs_reusable(self.work, False, False))
+        self.assertEqual(self.run_stage(), ["translate"])
 
     def test_llvm_version_change_at_the_same_path_refreshes_only_the_dependent_steps(self):
         wrapper = os.path.join(self.work, "fake llvm-mc.py")

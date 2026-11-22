@@ -702,6 +702,45 @@ def disassembly_status(dxbc: str, signature: str) -> tuple[bool, bool, set[str]]
     return bool(done) and listings == expected, True, expected
 
 
+def translated_module_sizes(spirv: str) -> dict[str, int]:
+    """Inventory regular module files in one pass, without opening each one on a healthy resume."""
+    sizes = {}
+    try:
+        with os.scandir(spirv) as entries:
+            for entry in entries:
+                if not entry.name.endswith(".spv"):
+                    continue
+                try:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    size = entry.stat(follow_symlinks=False).st_size
+                except OSError:
+                    continue
+                if size > 20 and size % 4 == 0:  # five header words, then whole instruction words
+                    sizes[entry.name[:-4]] = size
+    except OSError:
+        return {}
+    return sizes
+
+
+def translation_index_complete(path: str, module_sizes: dict[str, int]) -> bool:
+    """A finished index must be readable and every indexed module must still be present."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            index = json.load(f)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(index, dict):
+        return False
+    for name, metadata in index.items():
+        size = module_sizes.get(name)
+        if size is None or not isinstance(metadata, dict):
+            return False
+        if "spv_bytes" in metadata and (type(metadata["spv_bytes"]) is not int or metadata["spv_bytes"] != size):
+            return False
+    return True
+
+
 def shader_outputs_reusable(work: str, emulate: bool, keep_emulated: bool,
                             fallbacks: tuple[str, ...] = ()) -> bool:
     """Check whether the shader stage can resume without carving, unpacking or translating again."""
@@ -717,7 +756,8 @@ def shader_outputs_reusable(work: str, emulate: bool, keep_emulated: bool,
             and read_shader_setting(os.path.join(spirv, "translator_flags.txt")) == translator_flags_setting(fallbacks)
             and read_shader_setting(os.path.join(spirv, "translation_sources.sha256")) == translation_sources_digest()
             and os.path.isfile(os.path.join(dxbc, "disasm.done"))
-            and disassembly_status(dxbc, llvm_mc_signature())[0])
+            and disassembly_status(dxbc, llvm_mc_signature())[0]
+            and translation_index_complete(markers[2], translated_module_sizes(spirv)))
 
 
 def prepare_shader_disassembly(work: str, disasm: str, resume: bool) -> None:
@@ -819,6 +859,9 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     if had_flags != want_flags and os.path.isfile(translated):
         log(f"shaders: the fallback flags are now {want_flags or 'none'} (the shaders were translated with "
             f"{had_flags or 'none'}): translating again")
+        drop(translated)
+    if os.path.isfile(translated) and not translation_index_complete(translated, translated_module_sizes(spirv)):
+        log("shaders: the existing index or its SPIR-V modules are incomplete: repairing the translation")
         drop(translated)
     if not os.path.isfile(translated):
         need("spirv-as", "Install the Vulkan SDK (it includes spirv-as and spirv-val) and reopen the terminal.")
@@ -1144,6 +1187,13 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
                 os.remove(os.path.join(spirv, f))
         with open(plan_path, "w", encoding="utf-8", newline="\n") as f:
             json.dump(plan, f)
+    else:
+        module_sizes = translated_module_sizes(spirv)
+        for i in range(jobs):
+            part = os.path.join(spirv, f"index.part{i}.json")
+            if os.path.isfile(part) and not translation_index_complete(part, module_sizes):
+                log(f"  repairing shard {i}: its index or SPIR-V modules are incomplete")
+                drop(part)
     todo = [i for i in range(jobs) if not os.path.isfile(os.path.join(spirv, f"index.part{i}.json"))]
     if len(todo) < jobs:
         log(f"  keeping {jobs - len(todo)} of {jobs} shards finished by the run before")

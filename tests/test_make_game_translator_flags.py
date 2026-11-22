@@ -45,7 +45,7 @@ class TranslateFallbacksTest(unittest.TestCase):
         started = []
         for i in range(pre_parts):
             with open(os.path.join(spirv, f"index.part{i}.json"), "w", encoding="utf-8") as f:
-                json.dump({"old": True}, f)
+                json.dump({}, f)
 
         class FakeProc:
             def __init__(self, args):
@@ -79,7 +79,7 @@ class TranslateFallbacksTest(unittest.TestCase):
             self.shards_in(spirv, fallbacks=ALL_FLAGS)           # writes the plan
             for i in range(2):                                   # as if the shards had finished
                 with open(os.path.join(spirv, f"index.part{i}.json"), "w", encoding="utf-8") as f:
-                    json.dump({"old": True}, f)
+                    json.dump({}, f)
             again = self.shards_in(spirv, fallbacks=ALL_FLAGS)
             self.assertEqual(again, [])
 
@@ -106,6 +106,8 @@ class RecordedFlagsTest(unittest.TestCase):
                 json.dump([{"file": "shader.dxbc"}], f)
             elif p == os.path.join(self.dxbc, "fssm_index.json"):
                 json.dump([{"name": "shader"}], f)
+            elif p == os.path.join(self.spirv, "index.json"):
+                json.dump({}, f)
             elif p.endswith(".s"):
                 f.write("synthetic listing\n")
 
