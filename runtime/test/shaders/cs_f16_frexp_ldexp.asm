@@ -3,7 +3,8 @@
 ; s[0:3] is the output V#, s4 the ldexp exponent S1 (only its low 16 bits count), s5 TGID_X (RSRC2 0x808a: 5 user
 ; SGPRs, TGID_X; group 64x1x1), thread id in v0. Thread g = s5*64 + v0 takes the f16 input x = g, so 1024 groups
 ; cover all 65536 encodings. Each destination starts as 0x5a5a5a5a; the _e32 forms write the low half and keep the
-; high half. out[4g+0..3] = frexp_mant(x), frexp_exp(x), ldexp(x, s4), x, each with 0x5a5a in the high half.
+; high half. out[4g+0..3] = frexp_mant(x), frexp_exp(x), ldexp(x, s4), each with 0x5a5a in the high half, then x
+; itself (high half 0).
 ; Words measured on gfx1036 (the low halves):
 ;   x = 0x0001: frexp_mant 0x3800 (0.5), frexp_exp 0xffe9 (-23)    x = 0x03ff: 0x3bfe, 0xfff2 (-14)
 ;   ldexp(0x3c00 1.0, -15) = 0x0200   ldexp(0x3e00 1.5, -24) = 0x0002   ldexp(0x3c00, -25) = 0x0000
