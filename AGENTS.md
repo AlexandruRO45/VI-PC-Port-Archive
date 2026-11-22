@@ -90,3 +90,6 @@ Shard runs write `index.part*.json`; merge them into `index.json` with `--merge`
   library when numpy is absent).
 - Keep `make_game.py` working on Windows first: paths through `os.path`, no bash in the build.
 - In the pull request, say that it was AI-assisted, what you tested and on which GPU and driver.
+- Write that attribution as exactly `AI-assisted` — in pull request bodies, review and issue comments, commit
+  messages and code comments. Do not name the assistant, model or application that did the work, do not add a
+  "generated with" footer or a bot co-author trailer, and do not describe how the work was prompted.
