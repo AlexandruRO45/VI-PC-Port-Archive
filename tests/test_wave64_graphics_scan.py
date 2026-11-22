@@ -177,6 +177,42 @@ class CliTests(unittest.TestCase):
                     scan.main([src, "--out", src])
             self.assertNotEqual(cm.exception.code, 0)
 
+    def test_out_cannot_overwrite_a_listing_or_carve_index(self):
+        with tempfile.TemporaryDirectory() as root:
+            src = os.path.join(root, "disasm")
+            os.mkdir(src)
+            name, assembly = PS_W64_SENSITIVE
+            listing = os.path.join(src, name)
+            index = os.path.join(root, "index.json")
+            for path, original in ((listing, assembly), (index, "[]")):
+                with open(path, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(original)
+                with self.subTest(path=path):
+                    with self.assertRaises(SystemExit) as cm, contextlib.redirect_stdout(io.StringIO()), \
+                            contextlib.redirect_stderr(io.StringIO()) as err:
+                        scan.main([src, "--out", path])
+                    self.assertEqual(cm.exception.code, 2)
+                    self.assertIn("must not overwrite", err.getvalue())
+                    with open(path, encoding="utf-8") as f:
+                        self.assertEqual(f.read(), original)
+
+    def test_out_cannot_overwrite_a_listing_through_a_hard_link(self):
+        with tempfile.TemporaryDirectory() as src:
+            name, assembly = PS_W64_SENSITIVE
+            listing = os.path.join(src, name)
+            out = os.path.join(src, "report.json")
+            with open(listing, "w", encoding="utf-8", newline="\n") as f:
+                f.write(assembly)
+            try:
+                os.link(listing, out)
+            except OSError as e:
+                self.skipTest(str(e))
+            with self.assertRaises(SystemExit) as cm, contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                scan.main([src, "--out", out])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("must not overwrite", err.getvalue())
+
     def test_cli_execution_with_out_json(self):
         with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as outdir:
             for name, text in (PS_W64_SENSITIVE, VS_W64):

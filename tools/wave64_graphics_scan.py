@@ -42,6 +42,7 @@ from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import rdna2spirv  # noqa: E402  (same directory; WAVE64_RE, stage_of, base_op)
+from report_paths import same_report_path  # noqa: E402
 from shader_ir import parse_file  # noqa: E402
 
 # why each op can depend on lanes outside the executing half is in the docstring; this only gates counting
@@ -90,7 +91,7 @@ def scan_shader(stage, insns):
             "mask_word_source": {"exec_vcc": exec_vcc, "other": other}}
 
 
-def scan_directory(disasm):
+def scan_directory(disasm, *, out=None):
     """Aggregate selected-opcode counts over one carve disasm directory. Returns per-stage dicts; no names."""
     per_stage = {stage: {"shaders": 0, "wave64": 0, "with_selected_op": 0, "occurrences": Counter(),
                          "mask_word_source": {"exec_vcc": Counter(), "other": Counter()}}
@@ -99,6 +100,13 @@ def scan_directory(disasm):
     with os.scandir(disasm) as entries:
         paths = sorted(entry.path for entry in entries
                        if entry.name.endswith(".s") and entry.is_file())
+    if out and os.path.exists(out):
+        # stage_of resolves the listing path before looking for the carve index.
+        indexes = {os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), "index.json")
+                   for path in paths}
+        if any(same_report_path(out, path) for path in paths) or any(
+                same_report_path(out, index) for index in indexes):
+            raise ValueError("the report must not overwrite a source listing or carve index")
     for path in paths:
         info = parse_file(path)
         stage = rdna2spirv.stage_of(info["name"], path)
@@ -140,12 +148,10 @@ def main(argv=None) -> int:
         out_dir = os.path.dirname(os.path.abspath(args.out))
         if not os.path.isdir(out_dir):
             ap.error(f"output directory does not exist: {out_dir}")
-        try:
-            if os.path.samefile(os.path.abspath(args.src), os.path.abspath(args.out)):
-                ap.error("output must not overwrite the source directory")
-        except (FileNotFoundError, OSError):
-            pass
-    report = scan_directory(args.src)
+    try:
+        report = scan_directory(args.src, out=args.out)
+    except ValueError as e:
+        ap.error(str(e))
     for stage, b in report["per_stage"].items():
         occ = ", ".join("%s x%d" % (op, n) for op, n in b["occurrences"].items()) or "none"
         print("%s: %d shaders, %d wave64, %d with a selected opcode (candidates: %s)"
