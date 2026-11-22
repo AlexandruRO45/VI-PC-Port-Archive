@@ -67,6 +67,28 @@ def calc_gws_effective_offset(offset: int = 0, m0: int = 0) -> int:
     return (m0 + (offset & OFFSET16_MASK)) & MASK32
 
 
+def evaluate_gws_sema_status(
+    counter: int,
+    offset: int = 0,
+    m0: int = 0,
+    exec_mask: int = 0xFFFFFFFF,
+) -> dict[str, Union[bool, int]]:
+    """Architectural evaluation of status flags and condition codes for GWS semaphores."""
+    cnt = u32(counter)
+    eff_16 = (m0 & OFFSET16_MASK) + (offset & OFFSET16_MASK)
+    eff_32 = m0 + (offset & OFFSET16_MASK)
+
+    return {
+        "semaphore_available": (cnt > 0),
+        "counter_zero": (cnt == 0),
+        "offset_carry_out_16": (eff_16 > OFFSET16_MASK),
+        "offset_carry_out_32": (eff_32 > MASK32),
+        "active_wave": (exec_mask != 0),
+        "vcc_unmodified": True,
+        "scc_unmodified": True,
+    }
+
+
 def ref_ds_gws_sema_p(current_val: int) -> Tuple[bool, int]:
     """Pure mathematical reference oracle for ds_gws_sema_p (acquire).
 
@@ -823,6 +845,82 @@ class TestRegisterAliasingAndOperandPreservation(unittest.TestCase):
             for r in range(16):
                 expected = ((lane + 1) * 300) + r
                 self.assertEqual(state.get_lane_vgpr(lane, r), expected)
+
+
+class TestConditionCodesStatusFlagsAndCarryBorrow(unittest.TestCase):
+    """Phase 6: Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def test_vcc_and_scc_preserved_scalar(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        state.vcc = 0xDEADBEEF_01234567
+        state.scc = 1
+
+        instr_v = DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_V, offset=0)
+        interp.execute(instr_v, state)
+        self.assertEqual(state.vcc, 0xDEADBEEF_01234567)
+        self.assertEqual(state.scc, 1)
+
+        instr_p = DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_P, offset=0)
+        interp.execute(instr_p, state, wave_id=1)
+        self.assertEqual(state.vcc, 0xDEADBEEF_01234567)
+        self.assertEqual(state.scc, 1)
+
+    def test_vcc_and_scc_preserved_simd(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFFFFFF)
+        interp = SIMDInterpreter()
+
+        state.vcc = 0x88776655
+        state.scc = 0
+
+        instr_v = DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_V, offset=3)
+        interp.execute(instr_v, state)
+        self.assertEqual(state.vcc, 0x88776655)
+        self.assertEqual(state.scc, 0)
+
+    def test_no_carry_borrow_generated(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        state.vcc = 0
+        state.scc = 0
+
+        instr = DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_P, offset=63)
+        interp.execute(instr, state, wave_id=1)
+
+        self.assertEqual(state.vcc, 0)
+        self.assertEqual(state.scc, 0)
+
+    def test_status_flags_semaphore_availability(self) -> None:
+        # Counter 0: not available, counter_zero=True
+        st0 = evaluate_gws_sema_status(counter=0)
+        self.assertFalse(st0["semaphore_available"])
+        self.assertTrue(st0["counter_zero"])
+
+        # Counter 1: available, counter_zero=False
+        st1 = evaluate_gws_sema_status(counter=1)
+        self.assertTrue(st1["semaphore_available"])
+        self.assertFalse(st1["counter_zero"])
+
+    def test_status_flags_offset_carry_out(self) -> None:
+        st_no_carry = evaluate_gws_sema_status(counter=1, offset=10, m0=20)
+        self.assertFalse(st_no_carry["offset_carry_out_16"])
+        self.assertFalse(st_no_carry["offset_carry_out_32"])
+
+        st_carry_16 = evaluate_gws_sema_status(counter=1, offset=0x0020, m0=0xFFF0)
+        self.assertTrue(st_carry_16["offset_carry_out_16"])
+        self.assertFalse(st_carry_16["offset_carry_out_32"])
+
+        st_carry_32 = evaluate_gws_sema_status(counter=1, offset=1, m0=0xFFFFFFFF)
+        self.assertTrue(st_carry_32["offset_carry_out_32"])
+
+    def test_status_flags_wave_activity(self) -> None:
+        st_active = evaluate_gws_sema_status(counter=1, exec_mask=0x1)
+        self.assertTrue(st_active["active_wave"])
+
+        st_inactive = evaluate_gws_sema_status(counter=1, exec_mask=0x0)
+        self.assertFalse(st_inactive["active_wave"])
 
 
 if __name__ == "__main__":
