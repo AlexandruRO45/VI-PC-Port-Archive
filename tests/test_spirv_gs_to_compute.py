@@ -196,3 +196,26 @@ def test_help_is_a_clean_exit_zero(capsys):
         out = capsys.readouterr().out
         assert "spirv_gs_to_compute.py in.spv out.spv" in out
         assert "SPIRV-Tools" in out
+
+
+@pytest.mark.parametrize("missing_tool", [False, True])
+def test_cli_reports_disassembly_failure(tmp_path, monkeypatch, missing_tool):
+    if missing_tool:
+        disassembler = str(tmp_path / "missing-spirv-dis")
+    else:
+        disassembler = shutil.which("spirv-dis")
+        if not disassembler:
+            pytest.skip("needs spirv-dis on PATH")
+    monkeypatch.setenv("SPIRV_DIS", disassembler)
+    source = tmp_path / "missing.spv"
+    output = tmp_path / "capture.spv"
+    layout = tmp_path / "layout.json"
+    result = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "spirv_gs_to_compute.py"),
+                             str(source), str(output), "--layout", str(layout)], capture_output=True, text=True)
+    assert result.returncode == 1, result.stderr
+    assert str(source) in result.stderr
+    assert disassembler in result.stderr
+    assert "Traceback" not in result.stderr
+    assert ("cannot run" if missing_tool else "file does not exist") in result.stderr
+    assert not output.exists()
+    assert not layout.exists()

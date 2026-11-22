@@ -329,7 +329,15 @@ def main(argv):
         return 2
     dis = os.environ.get("SPIRV_DIS", "spirv-dis")
     asm = os.environ.get("SPIRV_AS", "spirv-as")
-    text = subprocess.run([dis, "--raw-id", args[0]], check=True, capture_output=True, text=True).stdout
+    try:
+        text = subprocess.run([dis, "--raw-id", args[0]], check=True, capture_output=True, text=True).stdout
+    except OSError as e:
+        print(f"{args[0]}: cannot run {dis}: {e.strerror or e}", file=sys.stderr)
+        return 1
+    except subprocess.CalledProcessError as e:
+        detail = (e.stderr or "").strip() or f"exit status {e.returncode}"
+        print(f"{args[0]}: {dis}: {detail}", file=sys.stderr)
+        return 1
     try:
         new, lay = rewrite(text)
     except Unsupported as e:
