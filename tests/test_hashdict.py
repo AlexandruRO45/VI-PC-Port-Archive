@@ -189,6 +189,16 @@ class LookupBadInputTest(unittest.TestCase):
                 self.assertIn(path, p.stderr)
                 self.assertNotIn("Traceback", p.stderr)
 
+    def test_lookup_rejects_non_object_dictionary(self):
+        with open(self.hashes_file, "w", encoding="utf-8") as f:
+            f.write("[]")
+        p = self.run_tool("--lookup", self.hashes_file, "1234")
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn(repr(self.hashes_file), p.stderr)
+        self.assertIn("must contain a hash dictionary object", p.stderr)
+        self.assertEqual(len(p.stderr.splitlines()), 1)
+        self.assertEqual(p.stdout, "")
+
 
 class CarveAndExtraCLITest(unittest.TestCase):
     def setUp(self):
