@@ -1265,5 +1265,112 @@ class TestValuMadU32U16IEEE754Boundaries(unittest.TestCase):
         self.assertEqual(carry, 0)
 
 
+class TestValuMadU32U16NegativeRejection(unittest.TestCase):
+    """Negative controls, syntax rejection, and mutation detection for v_mad_u32_u16."""
+
+    def test_rejection_out_of_bounds_registers(self) -> None:
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106)
+
+    def test_rejection_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=128)
+
+    def test_rejection_multiple_literals_in_vop3(self) -> None:
+        with self.assertRaises(ValueError):
+            VMadU32U16Instruction(
+                vdst=Operand.vgpr(0),
+                src0=Operand.literal(1),
+                src1=Operand.literal(2),
+                src2=Operand.vgpr(1),
+            )
+
+    def test_mutation_detect_signed_multiply(self) -> None:
+        # Mutant: treats 16-bit operands as signed integers instead of unsigned
+        def mutant_signed(s0: int, s1: int, s2: int) -> Tuple[int, int]:
+            s0_i = s16(s0 & MASK16)
+            s1_i = s16(s1 & MASK16)
+            full_sum = s0_i * s1_i + (s2 & MASK32)
+            return full_sum & MASK32, (1 if full_sum >= MODULO_32 else 0)
+
+        s0 = MASK16  # 0xFFFF (65535 unsigned, -1 signed)
+        s1 = MASK16  # 0xFFFF
+        s2 = 0
+        expected = ref_mad_u32_u16(s0, s1, s2)
+        mutated = mutant_signed(s0, s1, s2)
+        self.assertNotEqual(expected, mutated)
+        self.assertEqual(expected[0], 0xFFFE_0001)
+        self.assertEqual(mutated[0], 1)
+
+    def test_mutation_detect_ignored_op_sel(self) -> None:
+        # Mutant: ignores op_sel and always uses lower 16 bits
+        def mutant_no_op_sel(s0: int, s1: int, s2: int, op_sel: Tuple[bool, bool]) -> Tuple[int, int]:
+            return ref_mad_u32_u16(s0, s1, s2, op_sel=(False, False))
+
+        s0 = pack_halfwords(10, 20)
+        s1 = pack_halfwords(30, 40)
+        s2 = 0
+        expected = ref_mad_u32_u16(s0, s1, s2, op_sel=(True, True))
+        mutated = mutant_no_op_sel(s0, s1, s2, op_sel=(True, True))
+        self.assertNotEqual(expected, mutated)
+        self.assertEqual(expected[0], 20 * 40)
+        self.assertEqual(mutated[0], 10 * 30)
+
+    def test_mutation_detect_ignored_clamp(self) -> None:
+        # Mutant: ignores clamp and always wraps
+        def mutant_no_clamp(s0: int, s1: int, s2: int) -> Tuple[int, int]:
+            return ref_mad_u32_u16(s0, s1, s2, clamp=False)
+
+        s0 = 0x1000
+        s1 = 0x1000
+        s2 = 0xFF00_0005  # sum = 2^32 + 5 -> clamps to 0xFFFFFFFF
+        expected = ref_mad_u32_u16(s0, s1, s2, clamp=True)
+        mutated = mutant_no_clamp(s0, s1, s2)
+        self.assertNotEqual(expected, mutated)
+        self.assertEqual(expected[0], CLAMP_MAX_U32)
+        self.assertEqual(mutated[0], 5)
+
+    def test_mutation_detect_16bit_truncated_product(self) -> None:
+        # Mutant: truncates product to 16 bits before 32-bit addition
+        def mutant_trunc_prod(s0: int, s1: int, s2: int) -> Tuple[int, int]:
+            prod16 = ((s0 & MASK16) * (s1 & MASK16)) & MASK16
+            full_sum = prod16 + (s2 & MASK32)
+            return full_sum & MASK32, (1 if full_sum >= MODULO_32 else 0)
+
+        s0 = 0x100
+        s1 = 0x100  # prod = 0x10000 (exceeds 16 bits)
+        s2 = 0
+        expected = ref_mad_u32_u16(s0, s1, s2)
+        mutated = mutant_trunc_prod(s0, s1, s2)
+        self.assertNotEqual(expected, mutated)
+        self.assertEqual(expected[0], 0x10000)
+        self.assertEqual(mutated[0], 0)
+
+    def test_mutation_detect_inactive_lane_overwritten(self) -> None:
+        ws = SIMDWaveState(wave_size=32, exec_mask=0x0000_0001)  # only lane 0 active
+        ws.write_vgpr(1, 0, 0x1234_5678)  # lane 1 is inactive
+        ws.write_vgpr(0, 1, 5)
+        ws.write_vgpr(0, 2, 6)
+        ws.write_vgpr(0, 3, 7)
+
+        inst = VMadU32U16Instruction(
+            vdst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+        interp = SIMDVALUInterpreter(ws)
+        interp.execute(inst)
+
+        # Active lane updated
+        self.assertEqual(ws.read_vgpr(0, 0), 5 * 6 + 7)
+        # Inactive lane must remain untouched
+        self.assertEqual(ws.read_vgpr(1, 0), 0x1234_5678)
+
+
 if __name__ == "__main__":
     unittest.main()
