@@ -17,8 +17,8 @@ Float min/max and IEEE 754 / RDNA2 semantics:
 - Signed zeros are ordered with -0.0 below +0.0 (the hardware order measured on AMD RDNA2,
   docs/design.md): min(+0.0, -0.0) = -0.0 and max(+0.0, -0.0) = +0.0 in either operand order.
 - VOP3 input modifiers: absolute value (|src|), negation (-src), and neg-abs (-|src|).
-- VOP3 output modifier: clamp to [0.0, 1.0]. If all operands are NaN, clamp raises
-  UnsupportedConstruct because GLSL.std.450 FClamp on NaN is undefined.
+- VOP3 output modifier: clamp to [0.0, 1.0]. If all operands are NaN, the NaN result clamps to +0
+  (DX10_CLAMP set; SHADER-186).
 
 Integer min/max:
 - v_min3_i32 and v_max3_i32 evaluate operands as signed 32-bit integers in two's complement.
@@ -330,8 +330,7 @@ class FloatNanSkippingTests(unittest.TestCase):
     """GLSL.std.450 NMin and NMax implement IEEE 754-2008 NaN-skipping:
     - If one or two operands are NaN, the non-NaN operand is chosen.
     - If all three operands are NaN, NaN is returned.
-    - If clamp modifier is specified on all-NaN, UnsupportedConstruct is raised because
-      FClamp on NaN is undefined.
+    - If clamp modifier is specified on all-NaN, the NaN clamps to +0 (SHADER-186).
     """
 
     def test_single_nan_operand_skipped(self) -> None:
@@ -370,11 +369,11 @@ class FloatNanSkippingTests(unittest.TestCase):
                 res = run_alu(op, QNAN_BITS, SNAN_BITS, NEG_QNAN_BITS)
                 self.assertTrue(math.isnan(u32_to_f32(res)))
 
-    def test_clamp_on_all_nan_rejected(self) -> None:
+    def test_clamp_on_all_nan_gives_positive_zero(self) -> None:
+        # All three NaN: min3/max3 give a NaN, and clamp of a NaN is +0 with DX10_CLAMP set (SHADER-186).
         for op in FLOAT_OPS:
             with self.subTest(op=op):
-                with self.assertRaises(si.UnsupportedConstruct):
-                    run_alu(op, QNAN_BITS, SNAN_BITS, NEG_QNAN_BITS, clamp=True)
+                self.assertEqual(run_alu(op, QNAN_BITS, SNAN_BITS, NEG_QNAN_BITS, clamp=True), 0)
 
 
 class FloatModifiersTests(unittest.TestCase):

@@ -19,9 +19,8 @@ IEEE-754 binary16 `x - floor(x)` oracle:
     aliasing (v0, v0), single-lane and multi-lane EXEC masking, and SPIR-V
     sabotage negative controls (Fract -> Trunc / Floor).
 
-Note: Under VOP3 `clamp`, GLSL.std.450 FClamp on NaN is undefined in SPIR-V
-and spirv_mini_interp.py raises UnsupportedConstruct (documented in
-docs/design.md), so `clamp` value tests use finite inputs. Standard library
+Note: `clamp` value tests here use finite inputs; clamp of a NaN (+0 with
+DX10_CLAMP set) is covered in test_float_clamp_nan.py (SHADER-186). Standard library
 only; hand-written RDNA2 disassembly listings only; zero game data.
 """
 from fractions import Fraction
