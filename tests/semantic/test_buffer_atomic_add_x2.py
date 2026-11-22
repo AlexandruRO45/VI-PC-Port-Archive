@@ -767,7 +767,7 @@ class TestBufferAtomicAddX2ScalarInterpreter(unittest.TestCase):
         ret, in_bounds = self.interp.step(inst)
         self.assertTrue(in_bounds)
         self.assertEqual(ret, 1000)
-        self.assertEqual(self.interp.mem.read_u64(80), 1500)
+        self.assertEqual(self.mem.read_u64(80), 1500)
 
 
 class TestBufferAtomicAddX2SIMD(unittest.TestCase):
@@ -1124,6 +1124,84 @@ class TestBufferAtomicAddX2ConditionCodes(unittest.TestCase):
         )
         self.interp.step(inst)
         self.assertEqual(self.interp.vcc, canary)
+
+
+class TestBufferAtomicAddX2BoundaryExtremes(unittest.TestCase):
+    """Unit tests for boundary extremes, address wrapping, and 64-bit IEEE 754 bit representations."""
+
+    def setUp(self) -> None:
+        self.mem = BufferMemory(4096)
+
+    def test_last_valid_qword_boundary(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=100)
+        # Last valid 8-byte qword starts at offset 92 (92 + 8 = 100)
+        self.mem.write_u64(92, 42)
+        ret, in_bounds = ref_buffer_atomic_add_x2(
+            self.mem, desc, soffset=0, vaddr=92, add_val=8, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 42)
+        self.assertEqual(self.mem.read_u64(92), 50)
+
+        # Offsets 93 through 100 all exceed num_records (93 + 8 = 101 > 100)
+        for oob_off in range(93, 101):
+            ret, in_bounds = ref_buffer_atomic_add_x2(
+                self.mem, desc, soffset=0, vaddr=oob_off, add_val=10, glc=True
+            )
+            self.assertFalse(in_bounds)
+            self.assertEqual(ret, 0)
+
+    def test_zero_capacity_buffer(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=0)
+        ret, in_bounds = ref_buffer_atomic_add_x2(
+            self.mem, desc, soffset=0, vaddr=0, add_val=1, glc=True
+        )
+        self.assertFalse(in_bounds)
+        self.assertEqual(ret, 0)
+
+    def test_64bit_integer_extremes(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        # INT64_MAX + 1 = INT64_MIN (two's complement wrap)
+        self.mem.write_u64(0, 0x7FFFFFFFFFFFFFFF)
+        ret, in_bounds = ref_buffer_atomic_add_x2(
+            self.mem, desc, soffset=0, vaddr=0, add_val=1, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0x7FFFFFFFFFFFFFFF)
+        self.assertEqual(self.mem.read_u64(0), 0x8000000000000000)
+
+        # 0xFFFFFFFFFFFFFFFF + 0xFFFFFFFFFFFFFFFF = 0xFFFFFFFFFFFFFFFE (-1 + -1 = -2)
+        self.mem.write_u64(8, 0xFFFFFFFFFFFFFFFF)
+        ret, in_bounds = ref_buffer_atomic_add_x2(
+            self.mem, desc, soffset=0, vaddr=8, add_val=0xFFFFFFFFFFFFFFFF, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(self.mem.read_u64(8), 0xFFFFFFFFFFFFFFFE)
+
+    def test_f64_nan_and_subnormal_bit_patterns(self) -> None:
+        # 64-bit untyped buffer atomic add operates purely on 64-bit bit patterns,
+        # without float64 canonicalization or subnormal flushing.
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+
+        # Float64 quiet NaN bits: 0x7FF8000000000000
+        qnan_bits = 0x7FF8000000000000
+        self.mem.write_u64(16, qnan_bits)
+        ret, in_bounds = ref_buffer_atomic_add_x2(
+            self.mem, desc, soffset=0, vaddr=16, add_val=1, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, qnan_bits)
+        self.assertEqual(self.mem.read_u64(16), qnan_bits + 1)
+
+        # Float64 smallest subnormal: 0x0000000000000001
+        subnormal_bits = 0x0000000000000001
+        self.mem.write_u64(24, subnormal_bits)
+        ret, in_bounds = ref_buffer_atomic_add_x2(
+            self.mem, desc, soffset=0, vaddr=24, add_val=subnormal_bits, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, subnormal_bits)
+        self.assertEqual(self.mem.read_u64(24), 0x0000000000000002)
 
 
 if __name__ == "__main__":
