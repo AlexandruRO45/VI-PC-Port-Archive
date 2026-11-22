@@ -205,7 +205,10 @@ What is implemented (all of it testable without the game):
   captured views: the CPU handles are read from the device's RTV/DSV heaps, including a single-handle descriptor
   range, whose stride is the fixed RTV slot size. The queue side of the draw path is wired: the device installs set 0
   and the VA → buffer lookup once its bindless set exists, and every `CreatePipelineState` object registers its
-  `VkPipeline` and layout for the life of the object, so a draw recorded through COM really draws.
+  `VkPipeline` and layout for the life of the object, so a draw recorded through COM really draws. `com_draw_test`
+  drives a whole frame this way: `CreateCommittedResource` for the vertex buffer and the render target, `Map` to fill
+  the vertices, an RTV in a descriptor heap, `CreatePipelineState`, a list with `OMSetRenderTargets` /
+  `IASetVertexBuffers` / `DrawInstanced`, `ExecuteCommandLists`, a fence wait and a `CopyTextureRegion` readback.
 - **Device** (`runtime/shims/d3d12_vulkan_device.cpp`): an `ID3D12Device11` (PC ABI, 80 slots) that the Xbox-ABI
   proxy (`d3d12_xs_device.cpp`) forwards to, so slot 14's heap-handle conversion and slot 76's resource creation
   work unchanged. It creates the objects above, plus:

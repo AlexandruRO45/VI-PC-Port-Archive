@@ -466,6 +466,14 @@ if(Vulkan_FOUND)
   target_compile_definitions(queue_draw_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(queue_draw_test PRIVATE /W4 /permissive- /utf-8)
   add_test(NAME queue_draw COMMAND queue_draw_test)
+  # A frame through the whole D3D12 surface (PR C, step 4): CreateCommittedResource -> Map -> COM command list ->
+  # ExecuteCommandLists -> fence -> CopyTextureRegion readback, with the pixels checked on the CPU.
+  add_executable(com_draw_test test/com_draw_test.cpp)
+  target_include_directories(com_draw_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims ${CMAKE_CURRENT_SOURCE_DIR}/test)
+  target_link_libraries(com_draw_test PRIVATE gta6rt_d3d12_com)
+  target_compile_definitions(com_draw_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(com_draw_test PRIVATE /W4 /permissive- /utf-8)
+  add_test(NAME com_draw COMMAND com_draw_test)
   # PE loader hello triangle: harness EXE -> shim DLL exports -> Vulkan WSI swapchain window.
   find_program(LEONIDA_LIB_EXE NAMES lib)
   find_library(LEONIDA_VULKAN_LIB NAMES vulkan-1 HINTS "$ENV{VULKAN_SDK}/Lib")
