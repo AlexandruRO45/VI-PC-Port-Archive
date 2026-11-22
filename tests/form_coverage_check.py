@@ -154,14 +154,32 @@ def check_unclassified():
         assert ("Integer", "xor") in fc.x64_forms({"xor"}, fc.load_reference("x64_zen2.tsv"))
         assert m["gfx1013"]["covered"] == m["gfx1013"]["known_in_fixtures"] == 0
         report = fc.report(m)
-        assert "Not counted until classified in tools/form_coverage.py: added_later.asm" in report
+        assert "Not counted until classified: added_later.asm" in report
         assert "Shader translation records from this run: none" in report
         assert "Not counted" not in fc.report(fc.measure(every_test_passed, sample_repo(Path(tmp) / "b", {"branch": BRANCH})))
 
 
+def check_local_cpu_registration():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = sample_repo(tmp, {
+            "local": "; coverage: source cpu_local\nxor eax, eax\n",
+            "macro_case": "; coverage: record cpu_macro\nsub eax, eax\n",
+            "register_probe": "; coverage: source cpu_local\nadd eax, eax\n",
+        })
+        for state in ("pass", "skip", "fail", "absent"):
+            results = {} if state == "absent" else {"cpu_local": state, "cpu_macro": state}
+            measured = fc.measure(results, root, {"cpu_macro": {"adc"}})
+            assert measured["fixtures"]["register_probe.asm"] == "not translated"
+            assert measured["fixtures"]["local.asm"] == measured["fixtures"]["macro_case.asm"] == state
+            assert measured["x64_zen2"]["covered"] == (2 if state == "pass" else 0)
+            assert measured["shader_records"] == []
+        assert fc.measure({"cpu_macro": "pass"}, root)["x64_zen2"]["covered"] == 0
+
+
 def check_shader_records():
     """gfx forms come only from programs the translator accepted, recorded by the same run. The review's
-    example: tests/pixel_aot_check.py passes s_nop only to must_reject, so it must stay out of covered."""
+    example: a program that reaches only must_reject (s_nop in place of a wait below, s_branch in the real
+    controls) must stay out of covered."""
     import pixel_aot_check as pixel  # tests/ is on sys.path when this file runs
     gfx = fc.load_reference("gfx1013.tsv")
     assert ("SOPP", "s_nop") in gfx  # so counting s_nop would change the result
@@ -192,30 +210,67 @@ def check_shader_records():
         # A record written outside the JUnit run comes from another run, so it is ignored.
         os.utime(record, (now - 3600, now - 3600))
         assert fc.read_records(record.parent, (now - 60, now + 60)) == {}
-    # The same holds for the review's case in the real controls, which feed s_nop only to must_reject.
+    # The same holds in the real controls. The scheduling-hint fixtures translate programs with s_nop
+    # and the hints, so those forms are recorded; s_branch reaches only must_reject and stays out.
+    assert ("SOPP", "s_branch") in gfx
     pixel.ACCEPTED.clear()
     with tempfile.TemporaryDirectory() as tmp:
         pixel.check_controls(Path(tmp))
-    assert "s_nop" not in pixel.ACCEPTED and "image_sample" in pixel.ACCEPTED
+    assert {"s_nop", "s_clause", "s_setprio", "s_sleep", "image_sample"} <= pixel.ACCEPTED
+    assert "s_branch" not in pixel.ACCEPTED and "s_code_end" not in pixel.ACCEPTED
+    # Every newly lowered 64-bit SOP1/SOP2 and 32-bit BFE form is counted in both gfx1013 and rdna2,
+    # while rejected neighbors (exec save/restore, #257 ops, 64-bit BFE/cselect) stay out of covered.
+    scalar64_forms = {
+        ("SOP1", "s_cmov_b64"), ("SOP1", "s_not_b64"), ("SOP1", "s_brev_b64"),
+        ("SOP2", "s_and_b64"), ("SOP2", "s_or_b64"), ("SOP2", "s_xor_b64"),
+        ("SOP2", "s_andn2_b64"), ("SOP2", "s_orn2_b64"),
+        ("SOP2", "s_nand_b64"), ("SOP2", "s_nor_b64"), ("SOP2", "s_xnor_b64"),
+        ("SOP2", "s_lshl_b64"), ("SOP2", "s_lshr_b64"), ("SOP2", "s_ashr_i64"),
+        ("SOP2", "s_bfm_b64"), ("SOP2", "s_bfe_u32"), ("SOP2", "s_bfe_i32"),
+    }
+    rejected_forms = {
+        "s_and_saveexec_b64", "s_or_saveexec_b64", "s_andn2_saveexec_b64",
+        "s_cselect_b64", "s_bfe_u64", "s_bfe_i64",
+        "s_cmp_eq_u64", "s_bitcmp1_b64", "s_bfm_b32",
+        "s_add_u32", "s_and_b32", "s_not_b32", "s_cmp_eq_i32", "s_cselect_b32",
+    }
+    assert not (pixel.ACCEPTED & rejected_forms), pixel.ACCEPTED & rejected_forms
+    for name in ("gfx1013.tsv", "rdna2.tsv"):
+        covered = fc.gfx_forms(pixel.ACCEPTED, fc.load_reference(name))
+        assert scalar64_forms <= covered, (name, scalar64_forms - covered)
 
 
 def check_parsing():
     with tempfile.TemporaryDirectory() as tmp:
         junit = Path(tmp) / "results.xml"
-        junit.write_text('<testsuite time="32" timestamp="2026-11-21T21:05:21"><testcase name="a" status="run"/>'
-                         '<testcase name="b" status="fail"/><testcase name="c" status="notrun"/></testsuite>',
-                         encoding="utf-8")
+        junit.write_text(
+            '<testsuite time="32" timestamp="2026-11-21T21:05:21">'
+            '<testcase name="a" status="run"/>'
+            '<testcase name="b" status="fail"/>'
+            '<testcase name="c" status="notrun"/>'
+            '<testcase name="d" status="run"><failure message="mismatch"/></testcase>'
+            '<testcase name="e" status="run"><error message="crash"/></testcase>'
+            '<testcase name="f" status="run"><skipped/></testcase>'
+            '</testsuite>',
+            encoding="utf-8",
+        )
         results, window = fc.read_results(junit)
-        assert results == {"a": "pass", "b": "fail", "c": "skip"}
+        assert results == {"a": "pass", "b": "fail", "c": "skip", "d": "fail", "e": "fail", "f": "skip"}, results
         start = datetime(2026, 11, 21, 21, 5, 21).timestamp()  # CTest writes local time
         assert window == (start - 1, start + 34), window
-    asm = ("x PROC FRAME\n    .endprolog\nIFDEF A\n    jae short l\nELSE\n    jnz short l\nENDIF\n"
-           "l:  mov DWORD PTR [rdx], eax ; c\ng:: ud2\nvalue DQ 0\n    dd 1\n    ret\nx ENDP\nEND\n")
-    assert fc.masm_mnemonics(asm) == {"jae", "jne", "mov", "ud2", "ret"}
-    # The real repository measures without error, and the report never calls coverage completion.
+    asm = ("emit MACRO dst\nLOCAL skip\n    lock cmpxchg [rdx], eax\n    rep movsb\nskip:\nENDM\n"
+           "x PROC FRAME\n    .endprolog\nIFDEF A\n    jae short l\nELSE\n    jnz short l\nENDIF\n"
+           "l:  mov DWORD PTR [rdx], eax ; c\ng:: ud2\n    emit rax\nvalue DQ 0\n    dd 1\n    ret\nx ENDP\nEND\n")
+    assert fc.masm_mnemonics(asm) == {"cmpxchg", "movsb", "jae", "jne", "mov", "ud2", "ret"}, fc.masm_mnemonics(asm)
+    with tempfile.TemporaryDirectory() as tmp:
+        isolated = fc.measure({}, sample_repo(tmp, {"branch": asm}))["x64_zen2"]
+        assert isolated["fixture_forms_not_in_reference"] == [], isolated["fixture_forms_not_in_reference"]
+    # The real repository measures without error, with no macro names or LOCAL leaking into unmatched forms.
     full = fc.measure({})
     assert "not a measure of port completion" in fc.report(full)
     assert full["x64_zen2"]["covered"] == full["gfx1013"]["covered"] == 0
+    unmatched = full["x64_zen2"]["fixture_forms_not_in_reference"]
+    assert {"delta", "local", "plane_request"}.isdisjoint(unmatched), unmatched
 
 
 def check_dashboard():
@@ -234,13 +289,58 @@ def check_dashboard():
     held = fc.masm_mnemonics(SWITCH) - fc.masm_mnemonics(BRANCH)
     total = sum(m[key]["total"] for key, _, _ in svg.AREAS)
     assert squares == {svg.COVERED: 8, svg.HELD: len(held), svg.OPEN: total - 8 - len(held)}, squares
+    # Every group, down to the one-form EXP box, keeps its squares and label inside its own box, and is
+    # labelled there or in the panel's "Too small to label" line.
+    root = ET.fromstring(drawn)
+    ns = "{http://www.w3.org/2000/svg}"
+    boxes = [box for box in root.iter(f"{ns}svg") if box is not root]
+    groups = [(name, g) for key, _, _ in svg.AREAS for name, g in m[key]["groups"].items() if g["total"]]
+    assert len(boxes) == len(groups), (len(boxes), len(groups))
+    labels = []
+    for box in boxes:
+        w, h = float(box.get("width")), float(box.get("height"))
+        for cell in box.iter(f"{ns}rect"):
+            right = float(cell.get("x", 0)) + float(cell.get("width"))
+            bottom = float(cell.get("y", 0)) + float(cell.get("height"))
+            assert right <= w + 0.01 and bottom <= h + 0.01, (box.attrib, cell.attrib)
+        for label in box.iter(f"{ns}text"):
+            assert len(label.text) * svg.LABEL_CHAR + 4 <= w and float(label.get("y")) <= h, (box.attrib, label.text)
+            labels.append(label.text)
+    footnotes = "".join(t.text for t in root.iter(f"{ns}text") if t.text.startswith("Too small to label: "))
+    for name, g in groups:
+        entry = f"{name} {g['covered']}/{g['total']}"
+        assert entry in labels or entry in footnotes, entry
+    assert "EXP 0/1" in footnotes  # the smallest group cannot hold its label
 
+
+
+def check_cpu_records():
+    forms = {prefix + cc for prefix in ('j', 'set', 'cmov') for cc in ('o', 'no', 'p', 'np')}
+    test = 'cpu_aot_flag_conditions'
+    with tempfile.TemporaryDirectory() as tmp:
+        # The macro body must not supply guessed forms, even when the test passes.
+        root = sample_repo(tmp, {'flag_conditions': 'set&cc al\noperation eax, edx\n'})
+        missing = fc.measure({test: 'pass'}, root)
+        assert missing['x64_zen2']['covered'] == 0
+        passed = fc.measure({test: 'pass'}, root, {test: forms})
+        assert passed['x64_zen2']['covered'] == 12
+        assert passed['x64_zen2']['fixture_forms_not_in_reference'] == []
+        assert passed['shader_records'] == []
+        assert passed['gfx1013']['covered'] == passed['gfx1030']['covered'] == 0
+        assert passed['unclassified'] == []
+        for state in ('fail', 'skip', 'absent'):
+            results = {} if state == 'absent' else {test: state}
+            report = fc.measure(results, root, {test: forms})
+            assert report['x64_zen2']['covered'] == 0
+            assert len(report['x64_zen2']['blocked_by_skip']) == (12 if state == 'skip' else 0)
 
 if __name__ == "__main__":
     check_denominators()
     check_example()
     check_jump_tables()
     check_unclassified()
+    check_local_cpu_registration()
+    check_cpu_records()
     check_shader_records()
     check_parsing()
     check_dashboard()

@@ -15,12 +15,18 @@ import zlib
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from disasm_rdna2 import disasm_rdna2, decode_instruction, disassemble_binary
 from extract_shaders import extract_shaders, extract_native_rdna2_code
+from pixel_aot import native_program
 from scan_unsupported_shaders import (
     analyze_shader_instructions,
     is_instruction_supported,
     is_opcode_recognized,
     classify_isa_category,
     generate_reports,
+    scan_directory_or_files,
+    detect_shader_stage,
+    generate_progress_dashboard,
+    disassemble_binary_shader,
+    make_failed_shader_record,
 )
 try:
     from pixel_aot import disassemble as llvm_disassemble
@@ -114,9 +120,29 @@ class TestRdna2Disasm(unittest.TestCase):
             ("000081bf", "s_endpgm", "s_endpgm"),
             ("000082bf", "s_branch", "s_branch label_0x4"),
             ("7f008cbf", "s_waitcnt", "s_waitcnt vmcnt(7) lgkmcnt(0)"),
-            ("000082be", "s_mov_b32", "s_mov_b32 s2, s0"),
-            ("000182be", "s_mov_b64", "s_mov_b64 s2, s0"),
+            ("000382be", "s_mov_b32", "s_mov_b32 s2, s0"),
+            ("000482be", "s_mov_b64", "s_mov_b64 s2, s0"),
             ("00008080", "s_sub_u32", "s_sub_u32 s0, s0, s0"),
+            # GFX10 scalar operand codes: 108-123 are ttmp0-15, 125 is null (SOP2 ssrc1)
+            ("007d8080", "s_sub_u32", "s_sub_u32 s0, s0, null"),
+            ("006c8080", "s_sub_u32", "s_sub_u32 s0, s0, ttmp0"),
+            # GFX10 / RDNA 2 opcode numbers, encodings as in LLVM's gfx10 MC tests
+            ("01020083", "s_min_i32", "s_min_i32 s0, s1, s2"),
+            ("01020093", "s_mul_i32", "s_mul_i32 s0, s1, s2"),
+            ("341281b1", "s_cmpk_eq_i32", "s_cmpk_eq_i32 s1, 0x1234"),
+            # SOPC: [31:23] == 0b101111110. These encodings were previously
+            # consumed by the SOPK prefix check (e.g. 000100bf as s_sopk_1e).
+            ("000100bf", "s_cmp_eq_i32", "s_cmp_eq_i32 s0, s1"),
+            ("000106bf", "s_cmp_eq_u32", "s_cmp_eq_u32 s0, s1"),
+            ("020302bf", "s_cmp_gt_i32", "s_cmp_gt_i32 s2, s3"),
+            ("007d00bf", "s_cmp_eq_i32", "s_cmp_eq_i32 s0, null"),
+            ("00010cbf", "s_bitcmp0_b32", "s_bitcmp0_b32 s0, s1"),
+            ("000212bf", "s_cmp_eq_u64", "s_cmp_eq_u64 s[0:1], s[2:3]"),
+            ("04060ebf", "s_bitcmp0_b64", "s_bitcmp0_b64 s[4:5], s6"),
+            ("000080bb", "s_waitcnt_vscnt", "s_waitcnt_vscnt s0, 0x0"),
+            ("0100a0bf", "s_inst_prefetch", "s_inst_prefetch 0x1"),
+            ("0255027e", "v_rcp_f32_e32", "v_rcp_f32_e32 v1, v2"),
+            ("010d007e", "v_cvt_f32_u32_e32", "v_cvt_f32_u32_e32 v0, v1"),
             ("0000027e", "v_nop", "v_nop"),
             # VOP1 9-bit SRC0: 0..255 scalar/constant, 256..511 VGPR
             ("0103007e", "v_mov_b32_e32", "v_mov_b32_e32 v0, v1"),
@@ -124,10 +150,15 @@ class TestRdna2Disasm(unittest.TestCase):
             ("f202047e", "v_mov_b32_e32", "v_mov_b32_e32 v2, 1.0"),
             ("f002067e", "v_mov_b32_e32", "v_mov_b32_e32 v3, 0.5"),
             ("8002087e", "v_mov_b32_e32", "v_mov_b32_e32 v4, 0"),
-            # VOP2 9-bit SRC0 (VGPR vs SGPR vs inline constant)
-            ("01050602", "v_add_f32_e32", "v_add_f32_e32 v3, v1, v2"),
-            ("01040602", "v_add_f32_e32", "v_add_f32_e32 v3, s1, v2"),
-            ("f0040602", "v_add_f32_e32", "v_add_f32_e32 v3, 0.5, v2"),
+            # VOP2 9-bit SRC0 (VGPR vs SGPR vs inline constant) with GFX10/RDNA 2 opcodes
+            ("01050602", "v_cndmask_b32_e32", "v_cndmask_b32_e32 v3, v1, v2, vcc_lo"),
+            ("01050606", "v_add_f32_e32", "v_add_f32_e32 v3, v1, v2"),
+            ("01040606", "v_add_f32_e32", "v_add_f32_e32 v3, s1, v2"),
+            ("f0040606", "v_add_f32_e32", "v_add_f32_e32 v3, 0.5, v2"),
+            ("01050610", "v_mul_f32_e32", "v_mul_f32_e32 v3, v1, v2"),
+            ("01050636", "v_and_b32_e32", "v_and_b32_e32 v3, v1, v2"),
+            ("0105064a", "v_add_nc_u32_e32", "v_add_nc_u32_e32 v3, v1, v2"),
+            ("01050656", "v_fmac_f32_e32", "v_fmac_f32_e32 v3, v1, v2"),
         ]
         for hex_str, expected_op, expected_asm in vectors:
             raw = bytes.fromhex(hex_str)
@@ -135,6 +166,19 @@ class TestRdna2Disasm(unittest.TestCase):
             self.assertEqual(len(insns), 1, f"Failed for {hex_str}")
             self.assertEqual(insns[0]["opcode"], expected_op, f"Mismatched opcode for {hex_str}")
             self.assertEqual(insns[0]["assembly"], expected_asm, f"Mismatched assembly for {hex_str}")
+
+    def test_sopc_literal_keeps_the_following_instruction_aligned(self):
+        # src1 == literal (255) makes the SOPC encoding 8 bytes. Without
+        # consuming the literal dword, the following s_endpgm would be misread.
+        raw = bytes.fromhex("00ff06bf 78563412 000081bf")
+        insns = disasm_rdna2(raw)
+        self.assertEqual(
+            [(i["opcode"], i["length"], i["assembly"]) for i in insns],
+            [
+                ("s_cmp_eq_u32", 8, "s_cmp_eq_u32 s0, 0x12345678"),
+                ("s_endpgm", 4, "s_endpgm"),
+            ],
+        )
 
     def test_cli_hex_entry_point(self):
         script = Path(__file__).resolve().parents[1] / "tools" / "disasm_rdna2.py"
@@ -165,6 +209,35 @@ class TestRdna2Disasm(unittest.TestCase):
             "v_mov_b32_e32 v2, 1.0",
             "v_mov_b32_e32 v3, 0.5",
             "v_mov_b32_e32 v4, 0",
+            "v_cndmask_b32_e32 v3, v1, v2, vcc_lo",
+            "v_add_f32_e32 v3, v1, v2",
+            "v_sub_f32_e32 v3, v1, v2",
+            "v_subrev_f32_e32 v3, v1, v2",
+            "v_mul_legacy_f32_e32 v3, v1, v2",
+            "v_mul_f32_e32 v3, v1, v2",
+            "v_min_f32_e32 v3, v1, v2",
+            "v_max_f32_e32 v3, v1, v2",
+            "v_min_i32_e32 v3, v1, v2",
+            "v_max_i32_e32 v3, v1, v2",
+            "v_min_u32_e32 v3, v1, v2",
+            "v_max_u32_e32 v3, v1, v2",
+            "v_lshrrev_b32_e32 v3, v1, v2",
+            "v_ashrrev_i32_e32 v3, v1, v2",
+            "v_lshlrev_b32_e32 v3, v1, v2",
+            "v_and_b32_e32 v3, v1, v2",
+            "v_or_b32_e32 v3, v1, v2",
+            "v_xor_b32_e32 v3, v1, v2",
+            "v_add_nc_u32_e32 v3, v1, v2",
+            "v_sub_nc_u32_e32 v3, v1, v2",
+            "v_subrev_nc_u32_e32 v3, v1, v2",
+            "v_fmac_f32_e32 v3, v1, v2",
+            "v_cvt_pkrtz_f16_f32_e32 v3, v1, v2",
+            "s_cmp_eq_i32 s0, s1",
+            "s_cmp_eq_u32 s0, s1",
+            "s_cmp_gt_i32 s2, s3",
+            "s_cmp_eq_u64 s[0:1], s[2:3]",
+            "s_bitcmp0_b32 s0, s1",
+            "s_bitcmp0_b64 s[4:5], s6",
             "s_endpgm",
         ]
 
@@ -264,7 +337,7 @@ class TestRdna2Extractor(unittest.TestCase):
     def test_duplicate_record_names(self):
         """Verify that duplicate record names produce distinct files without overwriting."""
         code_1 = bytes.fromhex("000080bf 000081bf")  # s_nop 0, s_endpgm
-        code_2 = bytes.fromhex("000082be 000081bf")  # s_mov_b32, s_endpgm
+        code_2 = bytes.fromhex("000382be 000081bf")  # s_mov_b32, s_endpgm
         record_1 = envelope(code_1, b"PS_DuplicateName")
         record_2 = envelope(code_2, b"PS_DuplicateName")
 
@@ -311,6 +384,55 @@ class TestRdna2Extractor(unittest.TestCase):
             self.assertTrue((output_dir / "pixel" / "PS_CliTest.bin").is_file())
             self.assertEqual((output_dir / "pixel" / "PS_CliTest.bin").read_bytes(), known_code)
             self.assertTrue((output_dir / "manifest.json").is_file())
+
+    def test_extracted_names_round_trip_length_prefixed_records(self) -> None:
+        code = bytes.fromhex("000080bf 000081bf")
+        names = (b"PS_A", b"PS_" + b"S" * 28, b"!" + b"A" * 32,
+                 b"PS_" + b"X" * 122, b"~" + b"B" * 125, b"~" + b"C" * 126)
+        legacy_name = b"PS_Legacy"
+        legacy = envelope(code, legacy_name)[1:]
+        truncated = envelope(code, b"PS_Truncated_Length_Prefix_Fixture")[:-1]
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            archive = work / "source_built.rpf"
+            archive.write_bytes(b"RPF\0" + b"".join(envelope(code, name) for name in names) + legacy + truncated)
+            output, manifest_path = extract_shaders(archive, work / "shaders", target_stages={"pixel"},
+                                                    length_prefixed_names=True)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(manifest["total_extracted"], len(names) + 1)
+            for source_name, record in zip((*names, legacy_name), manifest["shaders"], strict=True):
+                name = source_name.decode("ascii")
+                with self.subTest(length=len(source_name)):
+                    self.assertEqual(record["name"], name)
+                    self.assertEqual(record["native_file"], f"pixel/{name}.bin")
+                    self.assertEqual((output / record["native_file"]).read_bytes(), code)
+                    if source_name != legacy_name:
+                        self.assertEqual(native_program(archive, record["name"])[1], code)
+
+    def test_ambiguous_length_prefix_requires_explicit_mode(self) -> None:
+        code = bytes.fromhex("000080bf 000081bf")
+        legacy_name = b"PS_" + b"L" * 77
+        prefixed_name = legacy_name[1:]
+        data = envelope(code, legacy_name)[1:]
+        self.assertEqual(data, envelope(code, prefixed_name))
+        script = Path(__file__).resolve().parents[1] / "tools" / "extract_shaders.py"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            archive = work / "ambiguous.rpf"
+            archive.write_bytes(b"RPF\0" + data)
+            for expected_name, options in ((legacy_name, []), (prefixed_name, ["--length-prefixed-names"])):
+                name = expected_name.decode("ascii")
+                with self.subTest(options=options):
+                    output = work / name
+                    subprocess.run([sys.executable, "-B", str(script), str(archive), "--output-dir", str(output),
+                                    *options], capture_output=True, check=True)
+                    manifest_path = output / "manifest.json"
+                    record, = json.loads(manifest_path.read_text(encoding="utf-8"))["shaders"]
+                    self.assertEqual(record["name"], name)
+                    self.assertEqual(record["native_file"], f"pixel/{name}.bin")
+                    self.assertEqual((output / record["native_file"]).read_bytes(), code)
 
     def test_stage_filtering(self):
         known_code = bytes.fromhex("000080bf 000081bf")
@@ -620,6 +742,132 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertEqual(summary["total_shaders_scanned"], 2)
             self.assertEqual(summary["translator_accepted"], 1)
             self.assertEqual(summary["opcodes_recognized_translator_rejected"], 1)
+
+    def test_detect_shader_stage(self):
+        """Verify pipeline stage detection from file names and relative paths."""
+        self.assertEqual(detect_shader_stage("shaders/pixel/ps_draw.bin"), "pixel")
+        self.assertEqual(detect_shader_stage("cs_dispatch.bin"), "compute")
+        self.assertEqual(detect_shader_stage("shaders/vertex/vs_main.s"), "vertex")
+        self.assertEqual(detect_shader_stage("unknown_kernel.bin"), "other")
+
+    def test_binary_shader_scanning(self):
+        """Verify scanning raw .bin files directly with disasm_rdna2 without LLVM."""
+        raw_code = bytes.fromhex(
+            "000080bf"  # s_nop 0
+            "7f008cbf"  # s_waitcnt
+            "000081bf"  # s_endpgm
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bin_file = tmp_path / "ps_test.bin"
+            bin_file.write_bytes(raw_code)
+            results = scan_directory_or_files([bin_file])
+            self.assertEqual(len(results), 1)
+            res = results[0]
+            self.assertEqual(res["shader_name"], "ps_test.bin")
+            self.assertEqual(res["stage"], "pixel")
+            self.assertEqual(res["total_instructions"], 3)
+            self.assertTrue(res["opcodes_recognized"])
+
+    def test_disassemble_binary_shader_error(self):
+        """Verify disassemble_binary_shader raises on invalid or empty input."""
+        with self.assertRaises(ValueError):
+            disassemble_binary_shader(b"")
+
+    def test_mixed_binary_shader_scanning(self):
+        """Verify that failed/invalid binary inputs are retained in results and denominator."""
+        valid_code = bytes.fromhex(
+            "000080bf"  # s_nop 0
+            "000081bf"  # s_endpgm
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            good_file = tmp_path / "ps_good.bin"
+            good_file.write_bytes(valid_code)
+            bad_file = tmp_path / "ps_bad.bin"
+            bad_file.write_bytes(b"")  # Empty binary triggers decoder failure
+
+            results = scan_directory_or_files([tmp_path])
+            # Denominator must account for BOTH inputs
+            self.assertEqual(len(results), 2)
+
+            by_name = {r["shader_name"]: r for r in results}
+            good_res = by_name.get("ps_good.bin")
+            bad_res = by_name.get("ps_bad.bin")
+
+            self.assertIsNotNone(good_res)
+            self.assertEqual(good_res["total_instructions"], 2)
+            self.assertEqual(good_res["supported_instructions"], 2)
+            self.assertTrue(good_res["opcodes_recognized"])
+
+            self.assertIsNotNone(bad_res)
+            self.assertEqual(bad_res["total_instructions"], 0)
+            self.assertFalse(bad_res["is_fully_supported"])
+            self.assertFalse(bad_res["translator_accepted"])
+            self.assertEqual(bad_res["lower_status"], "decode_failed")
+            self.assertIn("empty", bad_res["lower_error"].lower())
+
+            # Verify that dashboard accounts for both inputs and clearly labels instruction vs file metrics
+            out_dir = tmp_path / "out"
+            json_file, md_file = generate_progress_dashboard(results, out_dir)
+            data = json.loads(json_file.read_text(encoding="utf-8"))
+
+            # File-level denominator tested separately: two inputs, one decode failure
+            self.assertEqual(data["overall"]["total_shaders"], 2)
+            self.assertEqual(data["overall"]["completely_unsupported"], 1)
+            self.assertEqual(data["overall"]["fully_accepted"], 0)
+
+            # Instruction metric: every decoded instruction in valid_code is supported,
+            # so instruction coverage legitimately reaches 100% while file denominator retains failure.
+            self.assertEqual(data["overall"]["total_instructions"], 2)
+            self.assertEqual(data["overall"]["supported_instructions"], 2)
+            self.assertEqual(data["overall"]["instruction_coverage_percentage"], 100.0)
+            self.assertEqual(data["overall"]["coverage_percentage"], 100.0)
+
+            md_text = md_file.read_text(encoding="utf-8")
+            self.assertIn("| **Total Shaders Analyzed** | 2 | 100.0% |", md_text)
+            self.assertIn("| **Unsupported / Blocked** | 1 | 50.0% |", md_text)
+            self.assertIn("| **Total Decoded Instructions** | 2 | 100.0% |", md_text)
+            self.assertIn("Instruction Coverage:", md_text)
+
+    def test_dashboard_report_generation(self):
+        """Verify generation of PROGRESS.md and progress.json."""
+        canonical_shader = [
+            "s_mov_b64 s[50:51], exec",
+            "s_wqm_b64 exec, exec",
+            "s_mov_b32 m0, s24",
+            "v_interp_p1_f32_e32 v8, v0, attr0.x",
+            "v_interp_p1_f32_e32 v9, v0, attr0.y",
+            "v_interp_p2_f32_e32 v9, v1, attr0.y",
+            "v_interp_p2_f32_e32 v8, v1, attr0.x",
+            "s_and_b64 exec, exec, s[50:51]",
+            "s_mov_b32 s21, 0",
+            "s_load_dwordx8 s[28:35], s[20:21], null",
+            "s_mov_b32 s40, 1",
+            "s_mov_b32 s41, 2",
+            "s_mov_b32 s42, 3",
+            "s_mov_b32 s43, 4",
+            "s_waitcnt lgkmcnt(0)",
+            "image_sample v[12:15], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "s_waitcnt vmcnt(0)",
+            "v_cvt_pkrtz_f16_f32_e32 v16, v12, v13",
+            "v_cvt_pkrtz_f16_f32_e32 v17, v14, v15",
+            "exp mrt0 v16, v16, v17, v17 done compr vm",
+            "s_endpgm",
+        ]
+        results = [analyze_shader_instructions("ps_canonical", canonical_shader)]
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            json_file, md_file = generate_progress_dashboard(results, tmp_path)
+            self.assertTrue(json_file.is_file())
+            self.assertTrue(md_file.is_file())
+            md_content = md_file.read_text(encoding="utf-8")
+            self.assertIn("Instruction Coverage:", md_content)
+            self.assertIn("Pipeline Stage Breakdown", md_content)
+            json_content = json.loads(json_file.read_text(encoding="utf-8"))
+            self.assertIn("overall", json_content)
+            self.assertIn("stages", json_content)
+            self.assertIn("missing_opcodes_ranked", json_content)
 
 
 if __name__ == "__main__":

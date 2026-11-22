@@ -10,6 +10,7 @@ and correlates them with the AMD RDNA 2 Instruction Set Architecture (ISA).
 import argparse
 from collections import Counter, defaultdict
 import ctypes as C
+import datetime
 import json
 import os
 from pathlib import Path
@@ -27,13 +28,16 @@ except ImportError:
     pixel_aot = None
     parts = None
 
+try:
+    from disasm_rdna2 import disasm_rdna2
+except ImportError:
+    disasm_rdna2 = None
+
 
 # Known supported instructions and patterns in pixel_aot.py
-SUPPORTED_ALU = {
-    "v_log_f32", "v_exp_f32", "v_rcp_f32",
-    "v_max_f32", "v_min_f32", "v_sub_f32",
-    "v_mul_legacy_f32", "v_fma_f32", "v_fmac_f32",
-}
+# The floating-point ALU forms come from pixel_aot's own table, so the scanner cannot drift from it.
+PIXEL_ALU_NAMES = tuple(pixel_aot.ALU) if pixel_aot is not None else ()
+SUPPORTED_ALU = {f"v_{name}_f32" for name in PIXEL_ALU_NAMES}
 
 SUPPORTED_INSTRUCTIONS_REGEX = [
     r"s_inst_prefetch\s+.*",
@@ -47,7 +51,7 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"(?:s_load_dwordx4|s_buffer_load_dwordx4)\s+s\[\d+:\d+\],\s+s\[\d+:\d+\],\s+.*",
     r"v_interp_p[12]_f32_e32\s+v\d+,\s+v\d+,\s+attr0\.[xy]",
     r"image_sample\s+v\[\d+:\d+\],\s+v\[\d+:\d+\],\s+s\[\d+:\d+\],\s+s\[\d+:\d+\]\s+dmask:0xf\s+dim:SQ_RSRC_IMG_2D",
-    r"v_(?:log|exp|rcp|max|min|sub|mul_legacy|fma|fmac)_f32(?:_e32|_e64)?\s+v\d+,\s+.*",
+    r"v_(?:" + "|".join(map(re.escape, PIXEL_ALU_NAMES)) + r")_f32(?:_e32|_e64)?\s+v\d+,\s+.*",
     r"v_cvt_pkrtz_f16_f32_e32\s+v\d+,\s+v\d+,\s+v\d+",
     r"exp\s+mrt0\s+v\d+,\s+v\d+,\s+v\d+,\s+v\d+\s+done\s+compr\s+vm",
     r"s_endpgm",
@@ -102,6 +106,9 @@ KNOWN_RDNA2_BASE_OPCODES = {
 }
 
 
+KNOWN_RDNA2_BASE_OPCODES |= SUPPORTED_ALU
+
+
 def is_opcode_recognized(opcode: str) -> bool:
     """Check if opcode belongs to recognized AMD RDNA 2 ISA instructions."""
     clean = opcode.strip().lower()
@@ -149,6 +156,57 @@ def classify_isa_category(opcode: str) -> str:
     return "Other / Unknown"
 
 
+def detect_shader_stage(name_or_path: str) -> str:
+    """Classify shader stage from path or filename."""
+    lower = name_or_path.lower().replace("\\", "/")
+    if "/pixel/" in lower or "/ps/" in lower or "ps_" in lower or lower.startswith("ps_") or "_ps" in lower:
+        return "pixel"
+    if "/compute/" in lower or "/cs/" in lower or "cs_" in lower or lower.startswith("cs_") or "_cs" in lower:
+        return "compute"
+    if "/vertex/" in lower or "/vs/" in lower or "vs_" in lower or lower.startswith("vs_") or "_vs" in lower:
+        return "vertex"
+    return "other"
+
+
+def disassemble_binary_shader(data: bytes) -> list[str]:
+    """Disassemble raw GFX1013 binary shader using disasm_rdna2."""
+    if disasm_rdna2 is None:
+        raise RuntimeError("disasm_rdna2 module unavailable")
+    if not data:
+        raise ValueError("empty binary shader data")
+    records = disasm_rdna2(data)
+    if not records:
+        raise ValueError("no instruction records decoded from binary")
+    return [rec["assembly"] for rec in records]
+
+
+def make_failed_shader_record(shader_name: str, error_message: str) -> dict:
+    """Create a failed-input analysis record to preserve denominator count."""
+    stage = detect_shader_stage(shader_name)
+    return {
+        "shader_name": shader_name,
+        "stage": stage,
+        "total_instructions": 0,
+        "supported_instructions": 0,
+        "unsupported_count": 0,
+        "support_percentage": 0.0,
+        "opcodes_recognized": False,
+        "translator_accepted": False,
+        "compatibility_category": "unsupported_opcodes",
+        "is_fully_supported": False,
+        "lower_status": "decode_failed",
+        "lower_error": error_message,
+        "unsupported_opcodes": {"<decode_error>": 1},
+        "unsupported_details": [{
+            "line_number": 0,
+            "raw": error_message,
+            "opcode": "<decode_error>",
+            "category": "Other / Unknown",
+        }],
+        "opcode_distribution": {},
+    }
+
+
 def extract_opcode(instruction_line: str) -> str:
     """Extract primary opcode token from assembly instruction."""
     line = instruction_line.strip()
@@ -156,7 +214,6 @@ def extract_opcode(instruction_line: str) -> str:
     line = re.split(r"//|[;#]", line)[0].strip()
     if not line:
         return ""
-    # Extract first word
     tokens = line.split()
     return tokens[0] if tokens else ""
 
@@ -212,7 +269,6 @@ def analyze_shader_instructions(shader_name: str, instructions: list[str]) -> di
     lower_error = None
     if pixel_aot is not None:
         try:
-            # Try testing with standard synthetic parameters
             pixel_aot.lower(
                 instructions=instructions,
                 texture_sgpr=20,
@@ -235,8 +291,11 @@ def analyze_shader_instructions(shader_name: str, instructions: list[str]) -> di
     else:
         compatibility_category = "unsupported_opcodes"
 
+    stage = detect_shader_stage(shader_name)
+
     return {
         "shader_name": shader_name,
+        "stage": stage,
         "total_instructions": total,
         "supported_instructions": supported_count,
         "unsupported_count": len(unsupported_translator_items),
@@ -259,14 +318,13 @@ def parse_assembly_file(path: Path) -> list[str]:
     with path.open("r", encoding="utf-8", errors="replace") as f:
         for line in f:
             stripped = line.strip()
-            # Ignore empty lines and pure comments / assembler directives like .text, .globl
             if not stripped or stripped.startswith(("//", ";", "#", "@")):
                 continue
             # Symbol metadata emits no instruction. Keep data and alignment directives visible.
             if stripped == ".text" or stripped.split(None, 1)[0] in (".globl", ".global", ".type", ".size"):
                 continue
             if stripped.endswith(":") and " " not in stripped:
-                continue  # label
+                continue
             lines.append(stripped)
     return lines
 
@@ -286,13 +344,20 @@ def scan_directory_or_files(target_paths: list[Path], llvm_lib: str = None) -> l
                 instructions = parse_assembly_file(path)
                 if instructions:
                     results.append(analyze_shader_instructions(path.name, instructions))
+                else:
+                    results.append(make_failed_shader_record(path.name, "No assembly instructions found in file"))
+            elif suffix == ".bin":
+                try:
+                    data = path.read_bytes()
+                    instructions = disassemble_binary_shader(data)
+                    results.append(analyze_shader_instructions(path.name, instructions))
+                except Exception as e:
+                    results.append(make_failed_shader_record(path.name, str(e)))
             elif suffix == ".rpf" and pixel_aot is not None:
-                # Try scanning archive records
                 print(f"[*] Scanning archive: {path.name}...")
                 archive_results = scan_rpf_archive(path, llvm_lib)
                 results.extend(archive_results)
             else:
-                # Check if it's text
                 try:
                     instructions = parse_assembly_file(path)
                     if instructions and any(" " in line for line in instructions[:5]):
@@ -301,14 +366,30 @@ def scan_directory_or_files(target_paths: list[Path], llvm_lib: str = None) -> l
                     pass
 
         elif path.is_dir():
+            all_files = []
             for root, _, files in os.walk(path):
                 for file in files:
-                    file_path = Path(root) / file
-                    if file_path.suffix.lower() in (".s", ".asm", ".txt", ".isa"):
-                        instructions = parse_assembly_file(file_path)
-                        if instructions:
-                            rel_name = str(file_path.relative_to(path))
-                            results.append(analyze_shader_instructions(rel_name, instructions))
+                    all_files.append(Path(root) / file)
+
+            for idx, file_path in enumerate(all_files, start=1):
+                suffix = file_path.suffix.lower()
+                rel_name = str(file_path.relative_to(path))
+                if suffix in (".s", ".asm", ".txt", ".isa"):
+                    instructions = parse_assembly_file(file_path)
+                    if instructions:
+                        results.append(analyze_shader_instructions(rel_name, instructions))
+                    else:
+                        results.append(make_failed_shader_record(rel_name, "No assembly instructions found in file"))
+                elif suffix == ".bin":
+                    try:
+                        data = file_path.read_bytes()
+                        instructions = disassemble_binary_shader(data)
+                        results.append(analyze_shader_instructions(rel_name, instructions))
+                    except Exception as e:
+                        results.append(make_failed_shader_record(rel_name, str(e)))
+
+                if idx % 500 == 0 or idx == len(all_files):
+                    print(f"[*] Scanned {idx}/{len(all_files)} files ({len(results)} valid shaders)...", flush=True)
 
     return results
 
@@ -320,23 +401,14 @@ def scan_rpf_archive(archive_path: Path, llvm_lib: str = None) -> list[dict]:
         print("    [!] LLVM library path (--llvm) is required to disassemble binary shaders from RPF archives.", file=sys.stderr)
         return archive_results
 
-    # Search for candidate FSSM / XBCH shader records in the archive
     try:
         with archive_path.open("rb") as f:
-            data = f.read(16 << 20)  # Read first 16 MB
-            # Locate record candidates
+            data = f.read(16 << 20)
             pos = 0
             while True:
                 idx = data.find(b"FSSM", pos)
                 if idx < 0:
                     break
-                # Look for record boundary
-                record_name = f"record_offset_0x{idx:x}"
-                try:
-                    # Attempt native_program extraction if envelope matches
-                    pass
-                except Exception:
-                    pass
                 pos = idx + 4
     except Exception as e:
         print(f"    [!] Error scanning archive {archive_path.name}: {e}", file=sys.stderr)
@@ -344,8 +416,225 @@ def scan_rpf_archive(archive_path: Path, llvm_lib: str = None) -> list[dict]:
     return archive_results
 
 
+def make_progress_bar(percentage: float, width: int = 24, unicode_blocks: bool = None) -> str:
+    """Generate visual progress bar: [████████░░░░░░░░] or [========........] 50.0%."""
+    if unicode_blocks is None:
+        try:
+            encoding = sys.stdout.encoding or "utf-8"
+            "█░".encode(encoding)
+            unicode_blocks = True
+        except (UnicodeEncodeError, LookupError):
+            unicode_blocks = False
+
+    fill_char = "█" if unicode_blocks else "="
+    empty_char = "░" if unicode_blocks else "."
+
+    pct = max(0.0, min(100.0, percentage))
+    filled = int(round(width * (pct / 100.0)))
+    filled = max(0, min(width, filled))
+    empty = width - filled
+    return f"[{fill_char * filled}{empty_char * empty}] {pct:5.1f}%"
+
+
+def get_implementation_target(opcode: str, category: str) -> str:
+    """Identify target file and subsystem in Xbox2Windows for an opcode."""
+    op = opcode.lower()
+    if "VALU" in category or "Vector ALU" in category:
+        if any(x in op for x in ["_f32", "_f16", "_i32", "_u32"]):
+            return "`tools/pixel_aot.py` (ALU dictionary / table)"
+        return "`tools/pixel_aot.py` (Vector ALU lowering)"
+    if "SOPP" in category:
+        if "branch" in op:
+            return "`tools/pixel_aot.py` (CFG / control flow lowering)"
+        if "waitcnt" in op or "barrier" in op:
+            return "`tools/pixel_aot.py` (Synchronization lowering)"
+        return "`tools/pixel_aot.py` (Scalar control)"
+    if "MIMG" in category:
+        return "`tools/pixel_aot.py` (Texture/Resource sampling descriptor)"
+    if "SMEM" in category:
+        return "`tools/pixel_aot.py` (Constant buffer / Root signature)"
+    if "VMEM" in category:
+        return "`tools/pixel_aot.py` (UAV / ByteAddressBuffer)"
+    if "VINTRP" in category:
+        return "`tools/pixel_aot.py` (SV_Position / Input attribute)"
+    if "LDS" in category:
+        return "`tools/pixel_aot.py` (Threadgroup shared memory)"
+    return "`tools/pixel_aot.py` (Instruction lowering)"
+
+
+def generate_progress_dashboard(results: list[dict], output_dir: Path) -> tuple[Path, Path]:
+    """Generate AnyPS5-style visual progress dashboard (PROGRESS.md and progress.json)."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    total_shaders = len(results)
+    total_instructions = sum(r["total_instructions"] for r in results)
+    total_supported = sum(r["supported_instructions"] for r in results)
+    overall_coverage = (total_supported / total_instructions * 100.0) if total_instructions > 0 else 0.0
+
+    accepted_shaders = sum(1 for r in results if r["translator_accepted"])
+    partial_shaders = sum(1 for r in results if not r["translator_accepted"] and r["supported_instructions"] > 0)
+    unsupported_shaders = sum(1 for r in results if not r["translator_accepted"] and r["supported_instructions"] == 0)
+
+    # Breakdown by stage
+    stages = ["pixel", "compute", "vertex", "other"]
+    stage_names = {
+        "pixel": "Pixel (`PS`)",
+        "compute": "Compute (`CS`)",
+        "vertex": "Vertex (`VS`)",
+        "other": "Other / Unknown",
+    }
+    stage_data = {}
+    for st in stages:
+        st_res = [r for r in results if r["stage"] == st]
+        count = len(st_res)
+        st_total = sum(r["total_instructions"] for r in st_res)
+        st_supp = sum(r["supported_instructions"] for r in st_res)
+        st_cov = (st_supp / st_total * 100.0) if st_total > 0 else 0.0
+        st_acc = sum(1 for r in st_res if r["translator_accepted"])
+        stage_data[st] = {
+            "name": stage_names[st],
+            "shaders": count,
+            "instructions": st_total,
+            "supported": st_supp,
+            "coverage": round(st_cov, 1),
+            "accepted": st_acc,
+            "bar": make_progress_bar(st_cov, 16, unicode_blocks=True),
+        }
+
+    # Breakdown by ISA category & subsystem
+    category_counts = Counter()
+    category_opcodes = defaultdict(Counter)
+    for r in results:
+        for op, count in r["opcode_distribution"].items():
+            cat = classify_isa_category(op)
+            category_counts[cat] += count
+            category_opcodes[cat][op] += count
+
+    # High-impact missing opcode rankings (blockers)
+    missing_opcode_occurrences = Counter()
+    missing_opcode_shaders = defaultdict(set)
+    for idx, r in enumerate(results):
+        shader_id = r["shader_name"]
+        for item in r.get("unsupported_details", []):
+            op = item.get("opcode", "")
+            if op:
+                missing_opcode_occurrences[op] += 1
+                missing_opcode_shaders[op].add(shader_id)
+        for op, count in r.get("unsupported_opcodes", {}).items():
+            if op not in missing_opcode_shaders or shader_id not in missing_opcode_shaders[op]:
+                missing_opcode_occurrences[op] += count
+                missing_opcode_shaders[op].add(shader_id)
+
+    # Rank by number of distinct shaders blocked
+    ranked_missing = []
+    for rank, (op, count) in enumerate(
+        sorted(missing_opcode_occurrences.items(), key=lambda x: (len(missing_opcode_shaders[x[0]]), x[1]), reverse=True),
+        start=1,
+    ):
+        cat = classify_isa_category(op)
+        blocked = len(missing_opcode_shaders[op])
+        impact_pct = round((blocked / total_shaders * 100.0), 1) if total_shaders > 0 else 0.0
+        ranked_missing.append({
+            "rank": rank,
+            "opcode": op,
+            "category": cat,
+            "occurrences": count,
+            "shaders_blocked": blocked,
+            "impact_percentage": impact_pct,
+            "target": get_implementation_target(op, cat),
+        })
+
+    # progress.json
+    progress_json = {
+        "timestamp": timestamp,
+        "overall": {
+            "total_shaders": total_shaders,
+            "fully_accepted": accepted_shaders,
+            "partially_supported": partial_shaders,
+            "completely_unsupported": unsupported_shaders,
+            "total_instructions": total_instructions,
+            "supported_instructions": total_supported,
+            "instruction_coverage_percentage": round(overall_coverage, 2),
+            "coverage_percentage": round(overall_coverage, 2),
+            "progress_bar": make_progress_bar(overall_coverage, 24, unicode_blocks=True),
+        },
+        "stages": stage_data,
+        "subsystems": {
+            cat: {
+                "total_instructions": count,
+                "distinct_opcodes": len(category_opcodes[cat]),
+                "top_opcodes": [op for op, _ in category_opcodes[cat].most_common(5)],
+            }
+            for cat, count in category_counts.most_common()
+        },
+        "missing_opcodes_ranked": ranked_missing,
+    }
+
+    json_file = output_dir / "progress.json"
+    with json_file.open("w", encoding="utf-8") as f:
+        json.dump(progress_json, f, indent=2)
+
+    # PROGRESS.md
+    md_file = output_dir / "PROGRESS.md"
+    with md_file.open("w", encoding="utf-8") as f:
+        f.write("# Xbox2Windows: RDNA 2 Shader Compatibility Status\n\n")
+        f.write(f"Updated: `{timestamp}` | Reference: AMD RDNA 2 ISA (GFX10) | Scope: Xbox Series X|S Shaders\n\n")
+
+        f.write("## Overall Status\n\n")
+        f.write("```text\n")
+        f.write(f"Instruction Coverage: {make_progress_bar(overall_coverage, 28, unicode_blocks=True)}\n")
+        f.write("```\n\n")
+
+        f.write("| Metric | Count | Percentage |\n")
+        f.write("|:---|---:|---:|\n")
+        f.write(f"| **Total Shaders Analyzed** | {total_shaders:,} | 100.0% |\n")
+        f.write(f"| **Fully Supported / Accepted** | {accepted_shaders:,} | {(accepted_shaders/total_shaders*100.0 if total_shaders else 0):.1f}% |\n")
+        f.write(f"| **Partially Supported** | {partial_shaders:,} | {(partial_shaders/total_shaders*100.0 if total_shaders else 0):.1f}% |\n")
+        f.write(f"| **Unsupported / Blocked** | {unsupported_shaders:,} | {(unsupported_shaders/total_shaders*100.0 if total_shaders else 0):.1f}% |\n")
+        f.write(f"| **Total Decoded Instructions** | {total_instructions:,} | 100.0% |\n")
+        f.write(f"| **Supported Instruction Instances** | {total_supported:,} | {overall_coverage:.1f}% |\n\n")
+
+        f.write("---\n\n")
+        f.write("## Pipeline Stage Breakdown\n\n")
+        f.write("| Stage | Shaders | Instructions | Supported Insns | Coverage | Progress Bar |\n")
+        f.write("|:---|---:|---:|---:|---:|:---|\n")
+        for st in stages:
+            d = stage_data[st]
+            if d["shaders"] > 0:
+                f.write(f"| {d['name']} | {d['shaders']:,} | {d['instructions']:,} | {d['supported']:,} | {d['coverage']:.1f}% | `{d['bar']}` |\n")
+
+        f.write("\n---\n\n")
+        f.write("## AMD RDNA 2 ISA Subsystem Breakdown\n\n")
+        f.write("| Subsystem / ISA Category | Instructions | Distinct Opcodes | % of Total | Top Opcodes |\n")
+        f.write("|:---|---:|---:|---:|:---|---|\n")
+        for cat, count in category_counts.most_common():
+            pct = (count / total_instructions * 100.0) if total_instructions > 0 else 0.0
+            top_ops = ", ".join(f"`{op}`" for op, _ in category_opcodes[cat].most_common(4))
+            f.write(f"| **{cat}** | {count:,} | {len(category_opcodes[cat])} | {pct:.1f}% | {top_ops} |\n")
+
+        f.write("\n---\n\n")
+        f.write("## High-Impact Missing Opcode Rankings (Roadmap)\n\n")
+        f.write("Ranked by number of distinct shaders blocked. Implementing these unlocks the highest number of native shaders:\n\n")
+        f.write("| Rank | Opcode | ISA Category | Occurrences | Shaders Blocked | Blocker Impact % | Target Implementation |\n")
+        f.write("|---:|:---|:---|---:|---:|---:|:---|---|\n")
+        for item in ranked_missing[:35]:
+            f.write(
+                f"| {item['rank']} | `{item['opcode']}` | {item['category']} | {item['occurrences']:,} | "
+                f"{item['shaders_blocked']:,} | {item['impact_percentage']:.1f}% | {item['target']} |\n"
+            )
+
+        f.write("\n---\n\n")
+        f.write("### Methodology Notes\n\n")
+        f.write("- **Shaders Blocked**: Count of distinct shaders that cannot be fully lowered because they contain this opcode.\n")
+        f.write("- **Blocker Impact %**: Percentage of total scanned shaders unblocked or partially enabled by implementing this opcode.\n")
+        f.write("- **Pure Python Pipeline**: Instruction disassembly is executed natively via `tools/disasm_rdna2.py` without requiring external toolchains.\n")
+
+    return json_file, md_file
+
+
 def generate_reports(results: list[dict], output_dir: Path):
-    """Generate both Markdown and JSON reports."""
+    """Generate both Markdown and JSON reports as well as the progress dashboard."""
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
     except PermissionError:
@@ -362,8 +651,8 @@ def generate_reports(results: list[dict], output_dir: Path):
     translator_accepted = sum(1 for r in results if r["translator_accepted"])
     opcodes_recognized_only = sum(1 for r in results if r["compatibility_category"] == "opcode_recognized_translator_rejected")
     unsupported_opcodes_count = sum(1 for r in results if r["compatibility_category"] == "unsupported_opcodes")
-    partially_supported = sum(1 for r in results if not r["is_fully_supported"] and r["unsupported_count"] < r["total_instructions"])
-    unsupported_completely = sum(1 for r in results if r["supported_instructions"] == 0 and r["total_instructions"] > 0)
+    partially_supported = sum(1 for r in results if not r["is_fully_supported"] and r["supported_instructions"] > 0)
+    unsupported_completely = sum(1 for r in results if not r["translator_accepted"] and r["supported_instructions"] == 0)
 
     # Aggregate all unsupported opcodes across all shaders
     global_unsupported_opcodes = Counter()
@@ -438,18 +727,21 @@ def generate_reports(results: list[dict], output_dir: Path):
 
             if r["unsupported_details"]:
                 f.write("\n<details><summary>Click to view unsupported instruction lines</summary>\n\n```asm\n")
-                for item in r["unsupported_details"][:50]:  # Limit preview to 50 lines per shader
+                for item in r["unsupported_details"][:50]:
                     f.write(f"L{item['line_number']:04d}: {item['raw']}\n")
                 if len(r["unsupported_details"]) > 50:
                     f.write(f"... and {len(r['unsupported_details']) - 50} more lines\n")
                 f.write("```\n\n</details>\n\n")
+
+    # Generate AnyPS5-style progress dashboard
+    generate_progress_dashboard(results, output_dir)
 
     return json_path, md_path
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("targets", nargs="+", type=Path, help="Shader files (.s, .asm, .txt), directories, or .rpf archives")
+    parser.add_argument("targets", nargs="+", type=Path, help="Shader files (.s, .asm, .txt, .bin), directories, or .rpf archives")
     parser.add_argument("--llvm", default=None, help="Path to libLLVM with AMDGPU support for disassembling binary shaders")
     parser.add_argument("--output-dir", type=Path, default=Path("out/shader-scan"), help="Directory to save report and logs (default: out/shader-scan)")
 
@@ -464,35 +756,64 @@ def main():
 
     json_path, md_path = generate_reports(results, args.output_dir)
 
-    print("\n" + "=" * 60)
-    print(" SCAN RESULTS SUMMARY ")
-    print("=" * 60)
     total = len(results)
     accepted = sum(1 for r in results if r["translator_accepted"])
     recognized_only = sum(1 for r in results if r["compatibility_category"] == "opcode_recognized_translator_rejected")
     unsupported_opcodes = sum(1 for r in results if r["compatibility_category"] == "unsupported_opcodes")
+    total_insns = sum(r["total_instructions"] for r in results)
+    total_supp_insns = sum(r["supported_instructions"] for r in results)
+    coverage = (total_supp_insns / total_insns * 100.0) if total_insns > 0 else 0.0
 
-    print(f"Total Shaders Scanned:                     {total}")
-    print(f"Full Shaders Accepted by Translator:       {accepted} ({(accepted/total)*100:.1f}%)")
-    print(f"Opcodes Recognized, Translator-Rejected:   {recognized_only}")
-    print(f"Contains Unrecognized Opcodes:             {unsupported_opcodes}")
+    print("\n" + "=" * 65)
+    print(" SCAN RESULTS SUMMARY (AnyPS5 Style Dashboard) ")
+    print("=" * 65)
+    print(f"Instruction Coverage: {make_progress_bar(coverage, 24)}")
+    print(f"Total Shaders Scanned:                     {total:,}")
+    print(f"Full Shaders Accepted by Translator:       {accepted:,} ({(accepted/total)*100:.1f}%)")
+    print(f"Opcodes Recognized, Translator-Rejected:   {recognized_only:,}")
+    print(f"Contains Unrecognized Opcodes:             {unsupported_opcodes:,}")
+    print(f"Total Decoded Instructions:                {total_insns:,}")
+    print(f"Supported Instructions:                    {total_supp_insns:,}")
 
-    # Display top missing opcodes in terminal
-    global_unsupported = Counter()
+    # Stage breakdowns
+    print("\n--- PIPELINE STAGE BREAKDOWN ---")
+    for st, name in [("pixel", "Pixel   [PS]"), ("compute", "Compute [CS]"), ("vertex", "Vertex  [VS]")]:
+        st_res = [r for r in results if r["stage"] == st]
+        if st_res:
+            st_total = sum(r["total_instructions"] for r in st_res)
+            st_supp = sum(r["supported_instructions"] for r in st_res)
+            st_cov = (st_supp / st_total * 100.0) if st_total > 0 else 0.0
+            print(f"  {name:<14} {len(st_res):>5,} shaders | {make_progress_bar(st_cov, 14)} ({st_cov:5.1f}%)")
+
+    # High-impact blockers
+    missing_shaders = defaultdict(set)
+    missing_counts = Counter()
     for r in results:
-        for op, count in r["unsupported_opcodes"].items():
-            global_unsupported[op] += count
+        for item in r.get("unsupported_details", []):
+            op = item.get("opcode", "")
+            if op:
+                missing_counts[op] += 1
+                missing_shaders[op].add(r["shader_name"])
+        for op, count in r.get("unsupported_opcodes", {}).items():
+            if op not in missing_shaders or r["shader_name"] not in missing_shaders[op]:
+                missing_counts[op] += count
+                missing_shaders[op].add(r["shader_name"])
 
-    if global_unsupported:
-        print("\n--- TOP MISSING OPCODES TO IMPLEMENT ---")
-        for op, count in global_unsupported.most_common(10):
+    if missing_counts:
+        print("\n--- TOP HIGH-IMPACT MISSING OPCODES (ROADMAP) ---")
+        top_ranked = sorted(missing_counts.items(), key=lambda x: (len(missing_shaders[x[0]]), x[1]), reverse=True)[:10]
+        for rank, (op, count) in enumerate(top_ranked, start=1):
             cat = classify_isa_category(op)
-            print(f"  * {op:<20} {count:>4}x  [{cat}]")
+            blocked = len(missing_shaders[op])
+            pct = (blocked / total * 100.0) if total else 0.0
+            print(f"  #{rank:<2} {op:<20} {blocked:>4,} shaders blocked ({pct:4.1f}%) | {count:>5,} insns  [{cat}]")
 
     print("\n[+] Full reports written to:")
-    print(f"    - Markdown: {md_path}")
-    print(f"    - JSON:     {json_path}")
-    print("=" * 60)
+    print(f"    - Dashboard:  {args.output_dir / 'PROGRESS.md'}")
+    print(f"    - Raw State:  {args.output_dir / 'progress.json'}")
+    print(f"    - Markdown:   {md_path}")
+    print(f"    - JSON:       {json_path}")
+    print("=" * 65)
 
     return 0
 

@@ -21,6 +21,14 @@ static const char* const categoryNames[CategoryCount]{
     "status", "committed_hit", "candidate_out_of_range", "missing_candidate", "unexpected_candidate",
     "after_shader_commit", "after_opaque_commit"};
 
+static bool matches(double actual, double wanted) {
+    return std::abs(actual - wanted) <= 1e-5 * wanted;
+}
+
+static bool committed_mismatch(bool identity, bool candidateMatches, double distance, double wanted) {
+    return !identity || !candidateMatches || !matches(distance, wanted);
+}
+
 bool check_dxr_opacity(ID3D12Device* device, bool warp) {
     // The geometric reference must reproduce the hand-derived table on every
     // machine, including those that skip the GPU comparison.
@@ -30,6 +38,8 @@ bool check_dxr_opacity(ID3D12Device* device, bool warp) {
     const auto flags = dxr_opacity::geometryFlags();
     if (dxr_opacity::first_reference_mismatch() != probes.size())
         throw std::runtime_error("Opacity reference disagrees with its hand-derived table");
+    if (committed_mismatch(true, true, 2.0, 2.0) || !committed_mismatch(true, true, 2.0 + 0.25, 2.0))
+        throw std::runtime_error("Committed distance control failed to distinguish an injected TMin offset");
     if (!dxr_fixture::supported(device)) return false;
     std::vector<dxr_fixture::Vertex> vertices(mesh.begin(), mesh.end());
     std::vector<D3D12_RAYTRACING_GEOMETRY_FLAGS> geometries;
@@ -57,7 +67,6 @@ bool check_dxr_opacity(ID3D12Device* device, bool warp) {
         float distance, commitT;
         std::memcpy(&distance, value + 3, sizeof(distance));
         std::memcpy(&commitT, value + 2, sizeof(commitT));
-        const auto matches = [](double actual, double wanted) { return std::abs(actual - wanted) <= 1e-5 * wanted; };
         bool failed[CategoryCount]{}, tPlusTMin = false;
         failed[Status] = (value[0] & 0xff0000e0u) != 0 || hit != expected.closest.hit;
         // A closest-hit search has one answer. A first-hit search may end on any committable hit.
@@ -74,7 +83,7 @@ bool check_dxr_opacity(ID3D12Device* device, bool warp) {
             // equals the candidate distance plus TMin.
             tPlusTMin = shaderHit && identity && commitTMatches && !matches(distance, wanted) &&
                         matches(distance, wanted + probes[i].nearT);
-            failed[Committed] = !identity || !commitTMatches || (!matches(distance, wanted) && !tPlusTMin);
+            failed[Committed] = committed_mismatch(identity, commitTMatches, distance, wanted);
         } else {
             failed[Committed] = hit || value[1] != 0 || value[3] != 0 || shaderCommitted || value[0] >> 12 != 0;
         }
@@ -92,9 +101,9 @@ bool check_dxr_opacity(ID3D12Device* device, bool warp) {
         // Known WARP deviation: WARP does not end a first-hit search at a
         // committed hit, automatic or shader. It is reported, not failed, only
         // when the final hit is committable and every other check passes.
+        plusTMin += tPlusTMin;
         if (!other && (!afterCommit || warp)) {
             warpAfterCommit += afterCommit;
-            plusTMin += tPlusTMin;
             continue;
         }
         if (other || afterCommit) {

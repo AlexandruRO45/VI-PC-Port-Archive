@@ -1,0 +1,5 @@
+EXPORTS
+    lea_wrap
+    lea_back
+    load_back
+    store_ahead
