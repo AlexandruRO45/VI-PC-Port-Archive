@@ -770,8 +770,73 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertFalse(flags_even.odd_parity)
 
 
+
+# ==============================================================================
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 float bit pattern handling, boundary extremes, and raw integer casting."""
+
+    F32_POS_ZERO: int = 0x0000_0000
+    F32_NEG_ZERO: int = 0x8000_0000
+    F32_POS_INF: int = 0x7F80_0000
+    F32_NEG_INF: int = 0xFF80_0000
+    F32_QNAN: int = 0x7FC0_0000
+    F32_SNAN: int = 0x7F80_0001
+    F32_MIN_SUBNORMAL: int = 0x0000_0001
+
+    def test_ieee754_special_float_bitcasts_treated_as_raw_integers(self) -> None:
+        # v_add_lshl_u32 is an integer arithmetic instruction. Shaders bit-casting
+        # floats (+0, -0, +/-inf, NaNs) operate on raw 32-bit words without FPU exceptions.
+        specials = [
+            self.F32_POS_ZERO,
+            self.F32_NEG_ZERO,
+            self.F32_POS_INF,
+            self.F32_NEG_INF,
+            self.F32_QNAN,
+            self.F32_SNAN,
+        ]
+        for f in specials:
+            # Identity pass-through: (f + 0) << 0 == f
+            self.assertEqual(oracle_v_add_lshl_u32(f, 0, 0), f)
+            # Self-double and shift: (f + f) << 0 == (f << 1) & 0xFFFFFFFF
+            self.assertEqual(oracle_v_add_lshl_u32(f, f, 0), (f << 1) & MASK32)
+
+    def test_subnormal_float_bits_no_flush_to_zero(self) -> None:
+        # Smallest positive subnormal float (bit 0 = 1): must not be flushed to 0
+        sub = self.F32_MIN_SUBNORMAL
+        res = oracle_v_add_lshl_u32(sub, 0, 1)
+        self.assertEqual(res, 0x0000_0002)
+
+        # Adding two subnormals without flush
+        res2 = oracle_v_add_lshl_u32(sub, sub, 0)
+        self.assertEqual(res2, 0x0000_0002)
+
+    def test_nan_payload_preservation_across_shifts(self) -> None:
+        custom_nan = 0x7FA5_5A3C
+        # (custom_nan + 0) << 0 preserves payload bits exactly
+        self.assertEqual(oracle_v_add_lshl_u32(custom_nan, 0, 0), custom_nan)
+
+    def test_extreme_u32_boundaries(self) -> None:
+        boundaries = [0x0000_0000, 0x0000_0001, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFF]
+        for b in boundaries:
+            # Shift 0
+            self.assertEqual(oracle_v_add_lshl_u32(b, 0, 0), b)
+            # Shift 31
+            expected_shift31 = (b << 31) & MASK32
+            self.assertEqual(oracle_v_add_lshl_u32(b, 0, 31), expected_shift31)
+
+    def test_shift_by_31_boundary(self) -> None:
+        # Shifting 1 by 31 produces 0x80000000 (matches IEEE 754 -0.0f bit pattern)
+        res = oracle_v_add_lshl_u32(1, 0, 31)
+        self.assertEqual(res, 0x8000_0000)
+        self.assertEqual(res, self.F32_NEG_ZERO)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
