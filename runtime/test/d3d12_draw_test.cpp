@@ -6,6 +6,9 @@
 //     constants (a clip-space offset) and a root CBV (a tint) through the 32 user-data dwords;
 //   - a render target cleared blue, two indexed draws with different root arguments (top-left red, bottom-right
 //     green), and one back-facing triangle (bottom-left) that culling must remove;
+//   - D3D-54 (open question 17): a fourth draw (top-right yellow) whose vertex buffer is read straight from an
+//     upload heap, and every draw reads a filter through a descriptor table whose entry is an upload-heap VA, so
+//     both reach memory outside the arena through the -heap_base bias;
 //   - the image read back through CopyTextureRegion and compared pixel by pixel. Where the quadrants land also
 //     checks the viewport flip (D3D clip space is y-up) and the front-face winding.
 // The shaders are GLSL written to the translator's contract (test/glsl/vs_draw.vert, ps_draw.frag). No game data.
@@ -82,15 +85,19 @@ int main() {
                                                            reinterpret_cast<void**>(&device.p))));
         rt::d3d12::set_device_outer(inner, device.p);
 
-        // Root signature: [0] two constants (s0, s1: offset), [1] a root CBV (s2:s3: tint).
-        D3D12_ROOT_PARAMETER params[2] = {};
+        // Root signature: [0] two constants (s0, s1: offset), [1] a root CBV (s2:s3: tint), [2] a one-CBV table
+        // (s4:s5: filter).
+        const D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 2, 0, 0};
+        D3D12_ROOT_PARAMETER params[3] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants = {0, 0, 2};
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         params[1].Descriptor = {1, 0};
+        params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[2].DescriptorTable = {1, &range};
         D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
         root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
-        root_desc.Desc_1_0 = {2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+        root_desc.Desc_1_0 = {3, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
         const auto root_blob = serialize_root_signature(root_desc);
         EXPECT(!root_blob.empty());
         Ref<ID3D12RootSignature> root;
@@ -126,7 +133,8 @@ int main() {
             {-1, 1, 255, 0, 0, 255}, {0, 1, 255, 0, 0, 255}, {-1, 0, 255, 0, 0, 255}, {0, 0, 255, 0, 0, 255},
             {-1, 0, 255, 0, 0, 255}, {-1, -1, 255, 0, 0, 255}, {0, -1, 255, 0, 0, 255}};
         const std::uint16_t indices[6] = {0, 1, 2, 2, 1, 3};
-        const float tints[2][3] = {{1, 0, 1}, {0, 1, 0}};  // red stays red; then green
+        const float tints[3][3] = {{1, 0, 1}, {0, 1, 0}, {1, 1, 1}};  // red stays red; then green; then as-is
+        const float filters[2][3] = {{1, 1, 1}, {1, 1, 0}};               // pass-through; red + green = yellow
 
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
@@ -155,14 +163,34 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &rt_desc,
                                                          D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&target.p))));
 
-        // Upload layout: vertices at 0, indices at 256, the tints at 512 and 768 (CBVs are 256-byte aligned).
+        // Upload layout: vertices at 0, indices at 256, the tints at 512, 768 and 1792, the filters at 1024 and 1280,
+        // and the vertices again at 1536 for the draw that reads them from the upload heap (CBVs are 256-byte
+        // aligned).
         std::uint8_t* up = nullptr;
         EXPECT(SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&up))));
         std::memcpy(up, vertices, sizeof(vertices));
         std::memcpy(up + 256, indices, sizeof(indices));
         std::memcpy(up + 512, tints[0], sizeof(tints[0]));
         std::memcpy(up + 768, tints[1], sizeof(tints[1]));
+        std::memcpy(up + 1792, tints[2], sizeof(tints[2]));
+        std::memcpy(up + 1024, filters[0], sizeof(filters[0]));
+        std::memcpy(up + 1280, filters[1], sizeof(filters[1]));
+        std::memcpy(up + 1536, vertices, sizeof(vertices));
         const D3D12_GPU_VIRTUAL_ADDRESS upload_va = upload->GetGPUVirtualAddress();
+
+        // A shader-visible heap in the arena. Its two slots hold upload-heap VAs, written as raw bytes the way the
+        // application writes descriptors itself: slot 0 the pass-through filter, slot 1 the yellow one.
+        const D3D12_DESCRIPTOR_HEAP_DESC table_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
+                                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        Ref<ID3D12DescriptorHeap> table_heap;
+        EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&table_heap_desc, IID_PPV_ARGS(&table_heap.p))));
+        const std::uint64_t table_cpu = reinterpret_cast<XboxHeapHandleFn>(slot(table_heap.p, 9))(table_heap.p);
+        const std::uint64_t table_gpu = reinterpret_cast<XboxHeapHandleFn>(slot(table_heap.p, 10))(table_heap.p);
+        const UINT step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        EXPECT(table_cpu && table_gpu && step >= 8);
+        const std::uint64_t filter_vas[2] = {upload_va + 1024, upload_va + 1280};
+        std::memcpy(reinterpret_cast<void*>(table_cpu), &filter_vas[0], 8);
+        std::memcpy(reinterpret_cast<void*>(table_cpu + step), &filter_vas[1], 8);
 
         const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
         Ref<ID3D12DescriptorHeap> rtv_heap;
@@ -192,7 +220,10 @@ int main() {
         list->ClearRenderTargetView(rtv, blue, 0, nullptr);
 
         // State for the draws; the pipeline came with CreateCommandList.
+        ID3D12DescriptorHeap* heaps[] = {table_heap.p};
+        list->SetDescriptorHeaps(1, heaps);
         list->SetGraphicsRootSignature(root.p);
+        list->SetGraphicsRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{table_gpu});
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         const D3D12_VERTEX_BUFFER_VIEW vbv{vertex_buffer->GetGPUVirtualAddress(), sizeof(vertices), sizeof(Vertex)};
         list->IASetVertexBuffers(0, 1, &vbv);
@@ -217,6 +248,15 @@ int main() {
         list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
         list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
         list->DrawInstanced(3, 1, 4, 0);
+        // Draw 4 (D3D-54): the quad again, offset (1, 0), its vertices read from the upload heap and the yellow
+        // filter through the table's second slot -> top-right quadrant yellow.
+        const float right[2] = {1, 0};
+        const D3D12_VERTEX_BUFFER_VIEW upload_vbv{upload_va + 1536, sizeof(vertices), sizeof(Vertex)};
+        list->IASetVertexBuffers(0, 1, &upload_vbv);
+        list->SetGraphicsRoot32BitConstants(0, 2, right, 0);
+        list->SetGraphicsRootConstantBufferView(1, upload_va + 1792);
+        list->SetGraphicsRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{table_gpu + step});
+        list->DrawIndexedInstanced(6, 1, 0, 0, 0);
 
         D3D12_RESOURCE_BARRIER to_copy = transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
                                                     D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -249,6 +289,7 @@ int main() {
         pso.reset();
         root.reset();
         rtv_heap.reset();
+        table_heap.reset();
         list.reset();
         allocator.reset();
         queue.reset();
@@ -262,7 +303,8 @@ int main() {
         for (UINT col = 0; col < size; ++col) {
             const bool top = row < size / 2, left = col < size / 2;
             const std::array<std::uint8_t, 4> want = top && left     ? std::array<std::uint8_t, 4>{255, 0, 0, 255}
-                                                     : !top && !left ? std::array<std::uint8_t, 4>{0, 255, 0, 255}
+                                                     : top           ? std::array<std::uint8_t, 4>{255, 255, 0, 255}
+                                                     : !left         ? std::array<std::uint8_t, 4>{0, 255, 0, 255}
                                                                      : std::array<std::uint8_t, 4>{0, 0, 255, 255};
             const std::uint8_t* got = pixels.data() + row * 256 + col * 4;
             if (std::equal(want.begin(), want.end(), got)) continue;
@@ -276,8 +318,9 @@ int main() {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
     }
-    std::printf("M1: two indexed draws and a culled triangle matched all %u pixels: input layout by semantic, root "
-                "constants and a root CBV per draw, vertex buffer in the arena, index buffer in an upload heap\n",
+    std::printf("M1: three indexed draws and a culled triangle matched all %u pixels: input layout by semantic, root "
+                "constants and a root CBV per draw, vertex buffers in the arena and in an upload heap, index buffer "
+                "in an upload heap, a descriptor table pointing into an upload heap\n",
                 size * size);
     return 0;
 }
