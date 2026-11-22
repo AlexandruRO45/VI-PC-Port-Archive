@@ -341,7 +341,8 @@ int main() {
                  "\"component_type\": \"float\"}]},\n"
                  " \"ps_out\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash << "\", \"outputs\": [0, 2]},\n"
                  " \"ps_native\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash2 << "\", \"wave64\": true, "
-                 "\"subgroup_size\": 64},\n"
+                 "\"subgroup_size\": 64, \"push_constant_bytes\": 128, "
+                 "\"pc_tail\": {\"set\": 1, \"binding\": 0, \"bytes\": 16}},\n"
                  " \"cs_emulated\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash2 << "\", \"wave64\": true, "
                  "\"subgroup_size\": null, \"wave64_exchange\": \"workgroup\", \"lds_bytes\": 33332},\n"
                  " \"ps_unhashed\": {\"stage\": \"ps\", \"bindings\": []}}";
@@ -372,6 +373,8 @@ int main() {
     CHECK(!entry->subgroup_size && entry->wave64_exchange.empty() && !entry->emulated());
     const ShaderEntry* native = library.find("ps", hash2);
     CHECK(native && native->wave64 && native->subgroup_size == 64 && !native->emulated());
+    // A --pc-tail-ubo entry: 128 push-constant bytes plus the size of its set-1 tail block; absent reads as 0.
+    CHECK(native->push_constant_bytes == 128 && native->pc_tail_bytes == 16 && !entry->pc_tail_bytes);
     const ShaderEntry* emulated = library.find("cs", hash2);
     CHECK(emulated && emulated->wave64 && emulated->subgroup_size == 0 && emulated->wave64_exchange == "workgroup" &&
           emulated->emulated());
