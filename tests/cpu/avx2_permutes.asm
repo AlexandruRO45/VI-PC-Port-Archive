@@ -1,3 +1,4 @@
+; coverage: source cpu_aot_avx2_permutes
 ; Source-owned differential fixture for AVX2 128-bit lane ops, blends, and cross-lane permutes:
 ; VBROADCASTI128, VEXTRACTI128, VINSERTI128, VPBLENDD, VPERM2I128,
 ; VPERMD, VPERMPS, VPERMQ, VPERMPD.
