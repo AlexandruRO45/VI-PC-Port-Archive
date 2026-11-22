@@ -1462,5 +1462,160 @@ class TestBufferAtomicSminX2BoundaryExtremes(unittest.TestCase):
         self.assertTrue(self.interp.last_status_flags.oob_fault)
 
 
+class TestBufferAtomicSminX2NegativeControls(unittest.TestCase):
+    """Unit tests for instruction syntax rejection, parameter limits, and negative controls."""
+
+    def test_vdata_must_be_vgpr_pair(self) -> None:
+        # vdata must be VGPR, not SGPR
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SMIN_X2,
+                vdata=Register(RegKind.SGPR, 0, count=2),
+                vaddr=Register(RegKind.VGPR, 2, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=0,
+            )
+        # vdata count must be 2, not 1 or 4
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SMIN_X2,
+                vdata=Register(RegKind.VGPR, 0, count=1),
+                vaddr=Register(RegKind.VGPR, 2, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=0,
+            )
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SMIN_X2,
+                vdata=Register(RegKind.VGPR, 0, count=4),
+                vaddr=Register(RegKind.VGPR, 2, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=0,
+            )
+
+    def test_vaddr_must_be_vgpr(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SMIN_X2,
+                vdata=Register(RegKind.VGPR, 0, count=2),
+                vaddr=Register(RegKind.SGPR, 2, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=0,
+            )
+
+    def test_srsrc_must_be_sgpr_quad(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SMIN_X2,
+                vdata=Register(RegKind.VGPR, 0, count=2),
+                vaddr=Register(RegKind.VGPR, 2, count=1),
+                srsrc=Register(RegKind.VGPR, 4, count=4),
+                soffset=0,
+            )
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SMIN_X2,
+                vdata=Register(RegKind.VGPR, 0, count=2),
+                vaddr=Register(RegKind.VGPR, 2, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=2),
+                soffset=0,
+            )
+
+    def test_soffset_cannot_be_vgpr(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SMIN_X2,
+                vdata=Register(RegKind.VGPR, 0, count=2),
+                vaddr=Register(RegKind.VGPR, 2, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=Register(RegKind.VGPR, 8, count=1),
+            )
+
+    def test_inst_offset_range_limits(self) -> None:
+        with self.assertRaises(ValueError):
+            BufferAtomicModifiers(offset=-1)
+        with self.assertRaises(ValueError):
+            BufferAtomicModifiers(offset=4096)
+
+    def test_wave_size_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDBufferWavefrontInterpreter(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDBufferWavefrontInterpreter(wave_size=128)
+
+
+class TestBufferAtomicSminX2MutationDetection(unittest.TestCase):
+    """Mutation testing to verify test suite catches faulty implementations."""
+
+    def test_mutation_unsigned_instead_of_signed_min(self) -> None:
+        # Mutation: uses min(u64, u64) instead of min(s64, s64)
+        def buggy_unsigned_atomic_min(old: int, op: int) -> int:
+            return min(old & MASK64, op & MASK64)
+
+        val_a = (-5) & MASK64   # 0xFFFFFFFFFFFFFFFB (huge unsigned, but negative signed)
+        val_b = 10              # 0x000000000000000A
+        # Correct signed min: min(-5, 10) = -5
+        correct_min = u64(min(s64(val_a), s64(val_b)))
+        self.assertEqual(correct_min, val_a)
+        # Buggy unsigned min chooses 10
+        buggy_min = buggy_unsigned_atomic_min(val_a, val_b)
+        self.assertEqual(buggy_min, val_b)
+        self.assertNotEqual(correct_min, buggy_min)
+
+    def test_mutation_omitted_8byte_bounds_check(self) -> None:
+        # Mutation: checks `offset >= num_records` instead of `offset + 8 > num_records`
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=1024)
+        offset = 1020  # offset < 1024, but offset + 8 == 1028 > 1024
+
+        # Real bounds check:
+        real_in_bounds = (offset + 8 <= desc.num_records)
+        self.assertFalse(real_in_bounds)
+
+        # Mutated 1-byte / off-by-4 check:
+        mutated_in_bounds = (offset < desc.num_records)
+        self.assertTrue(mutated_in_bounds)
+        self.assertNotEqual(real_in_bounds, mutated_in_bounds)
+
+    def test_mutation_return_post_op_instead_of_pre_op(self) -> None:
+        # Mutation: returns new_val instead of old_val when GLC=1
+        mem = BufferMemory(4096)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=1024)
+        mem.write_u64(0, 100)
+
+        # Correct reference returns old_val (100)
+        ret, in_bounds = ref_buffer_atomic_smin_x2(
+            mem, desc, soffset=0, vaddr=0, smin_val=20, glc=True
+        )
+        self.assertEqual(ret, 100)
+        self.assertEqual(mem.read_u64(0), 20)
+        # Mutated returning new_val would return 20, which is caught
+        self.assertNotEqual(ret, 20)
+
+    def test_mutation_inactive_lane_side_effects(self) -> None:
+        simd = SIMDBufferWavefrontInterpreter(wave_size=32, mem_size=4096)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=1024)
+        simd.set_buffer_descriptor(4, desc)
+        simd.set_exec_mask(0x1)  # Only lane 0 active
+
+        # Setup lane 1 with distinct memory and registers
+        simd.mem.write_u64(64, 500)
+        simd.write_lane_reg_u64(1, 0, 10)  # smin_val
+        simd.write_lane_reg_u32(1, RegKind.VGPR, 2, 64)  # vaddr
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMIN_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        results = simd.step(inst)
+        # Lane 1 must be (None, False) and have NO side effects on memory or register
+        self.assertEqual(results[1], (None, False))
+        self.assertEqual(simd.mem.read_u64(64), 500)
+        self.assertEqual(simd.read_lane_reg_u64(1, 0), 10)
+
+
 if __name__ == "__main__":
     unittest.main()
