@@ -3,15 +3,12 @@
 The binary16 versions of the f32 ops covered by test_alu_frexp_ldexp.py: v_frexp_mant_f16 returns the mantissa of S0 in
 [0.5, 1) with its sign, v_frexp_exp_i16_f16 the matching exponent (S0 = mant * 2^exp, as a 16-bit integer) and
 v_ldexp_f16 computes S0 * 2^S1 with S1 a signed 16-bit integer (RDNA2 ISA). Zero gives a signed zero mantissa and
-exponent 0; infinities and NaNs pass through the mantissa and ldexp, and give exponent 0. op_sel picks the high half of
-a source and the last bit sends the result to the high half of the destination; the other half of the destination is
-kept. Each case translates a synthetic pixel shader with tools/rdna2spirv.py, runs it in
-tests/semantic/spirv_mini_interp.py and compares the exported word with a plain-Python reference (math.frexp /
-math.ldexp on the double value of the half).
-
-Not covered because the translator does not model them (docs/design.md): f16 denormal inputs and denormal results.
-ldexp results below the smallest normal are expected to be signed zero here, which is what the translator produces;
-this was not measured on hardware. Neither was the high half of the destination of v_frexp_exp_i16_f16.
+exponent 0; infinities and NaNs pass through the mantissa and ldexp (preserving sNaN payloads under ieee=0), and give
+exponent 0. Subnormal inputs and subnormal ldexp results follow RDNA2 denorm16_64=3 (f16 denormals kept, the
+translator's assumed game float mode, measured natively on gfx1035 wave32 & wave64): subnormals normalize into [0.5, 1)
+with exponents -23..-14, and ldexp underflow rounds to nearest even into subnormals (including carrying 0x03FF.5 into
+MIN_NORMAL 0x0400). op_sel picks the high half of a source and the last bit sends the result to the high half of the
+destination; the other half of the destination is kept (verified on gfx1035 for v_frexp_exp_i16_f16 as well).
 """
 import math
 import os
@@ -88,30 +85,33 @@ def run(line: str, v1: int, v2: int = 0, v0: int = 0) -> int:
 
 
 def ref_mant(h: int) -> int:
-    if not is_normal(h):
-        return (h & 0x8000) if (h >> 10) & 0x1F == 0 else h
+    h &= 0xFFFF
+    if (h & 0x7FFF) == 0 or ((h >> 10) & 0x1F) == 31:
+        return h
     return f2h(math.frexp(h2f(h))[0])
 
 
 def ref_exp(h: int) -> int:
-    return math.frexp(h2f(h))[1] & 0xFFFF if is_normal(h) else 0
+    h &= 0xFFFF
+    if (h & 0x7FFF) == 0 or ((h >> 10) & 0x1F) == 31:
+        return 0
+    return math.frexp(h2f(h))[1] & 0xFFFF
 
 
 def ref_ldexp(h: int, n: int) -> int:
+    h &= 0xFFFF
     e = (h >> 10) & 0x1F
     sgn = h & 0x8000
-    if e == 31:
+    if e == 31 or (h & 0x7FFF) == 0:
         return h
-    if e == 0:
-        return sgn
     n &= 0xFFFF
     n = n - (1 << 16) if n & 0x8000 else n
-    e2 = e + max(-64, min(64, n))
-    if e2 >= 31:
+    n = max(-64, min(64, n))
+    val = math.ldexp(h2f(h), n)
+    try:
+        return f2h(val)
+    except OverflowError:
         return sgn | INF
-    if e2 <= 0:
-        return sgn
-    return f2h(math.ldexp(h2f(h), n))
 
 
 def sample_normals(seed: int, count: int):
@@ -158,14 +158,21 @@ class FrexpTests(unittest.TestCase):
         for h in (0x0000, 0x8000):
             self.assertEqual(run("v_frexp_mant_f16_e32 v0, v1", h), h)       # signed zero
             self.assertEqual(run("v_frexp_exp_i16_f16_e32 v0, v1", h), 0)
-        for h in (INF, NINF, QNAN, QNAN | 0x8000):
+        for h in (INF, NINF, QNAN, QNAN | 0x8000, 0x7C05, 0xFC05):           # including sNaN payloads
             self.assertEqual(run("v_frexp_mant_f16_e32 v0, v1", h), h)       # passed through
             self.assertEqual(run("v_frexp_exp_i16_f16_e32 v0, v1", h), 0)
 
-    def test_denormal_is_read_as_zero(self):
-        for h in (0x0001, 0x03FF, 0x8001, 0x83FF):
-            self.assertEqual(run("v_frexp_mant_f16_e32 v0, v1", h), h & 0x8000)
-            self.assertEqual(run("v_frexp_exp_i16_f16_e32 v0, v1", h), 0)
+    def test_subnormal_inputs(self):
+        # Every subnormal MSB position (0x0001..0x0200), odd/max subnormals, and negative subnormals.
+        subs = [1 << k for k in range(10)] + [0x0003, 0x0010, 0x0155, 0x03FF, 0x8001, 0x8010, 0x83FF]
+        for h in subs:
+            with self.subTest(h=hex(h)):
+                m = run("v_frexp_mant_f16_e32 v0, v1", h)
+                e = run("v_frexp_exp_i16_f16_e32 v0, v1", h)
+                self.assertEqual(m, ref_mant(h))
+                self.assertEqual(e, ref_exp(h))
+                se = e - (1 << 16) if e & 0x8000 else e
+                self.assertEqual(f2h(math.ldexp(h2f(m), se)), h)
 
     def test_high_half_of_the_source_is_ignored_and_the_destination_high_half_kept(self):
         h = f2h(8.0)
@@ -221,11 +228,14 @@ class LdexpTests(unittest.TestCase):
         self.assertEqual(run(L, f2h(-1.0), 16), NINF)
         self.assertEqual(run(L, f2h(1.0), 0x7FFF), INF)
         self.assertEqual(run(L, f2h(1.0), -14), MIN_NORMAL)
-        self.assertEqual(run(L, f2h(1.0), -15), 0)
-        self.assertEqual(run(L, f2h(-1.0), -15), 0x8000)
-        self.assertEqual(run(L, f2h(-1.0), 0x8000), 0x8000)          # INT16_MIN
+        self.assertEqual(run(L, f2h(1.0), -15), 0x0200)               # subnormal 2^-15
+        self.assertEqual(run(L, f2h(-1.0), -15), 0x8200)              # subnormal -2^-15
+        self.assertEqual(run(L, f2h(1.0), -24), 0x0001)               # smallest positive subnormal
+        self.assertEqual(run(L, f2h(1.0), -25), 0)                    # half of min subnormal -> ties to even 0
+        self.assertEqual(run(L, f2h(-1.0), -25), 0x8000)
+        self.assertEqual(run(L, f2h(-1.0), 0x8000), 0x8000)           # INT16_MIN
         self.assertEqual(run(L, MAX_FINITE, 1), INF)
-        self.assertEqual(run(L, MIN_NORMAL, -1), 0)
+        self.assertEqual(run(L, MIN_NORMAL, -1), 0x0200)
 
     def test_the_exponent_is_a_signed_16_bit_integer(self):
         L = "v_ldexp_f16_e64 v0, v1, v2"
@@ -239,13 +249,37 @@ class LdexpTests(unittest.TestCase):
         for h in (0x0000, 0x8000):
             for n in (0, 5, -5, 0x7FFF, 0x8000):
                 self.assertEqual(run("v_ldexp_f16_e64 v0, v1, v2", h, n), h)
-        for h in (INF, NINF, QNAN):
+        for h in (INF, NINF, QNAN, 0x7C05, 0xFC05):
             for n in (0, 5, -200, 0x7FFF):
                 self.assertEqual(run("v_ldexp_f16_e64 v0, v1, v2", h, n), h)
 
-    def test_denormal_input_is_read_as_zero(self):
-        for h in (0x0001, 0x03FF, 0x8001):
-            self.assertEqual(run("v_ldexp_f16_e64 v0, v1, v2", h, 5), h & 0x8000)
+    def test_subnormal_inputs_and_rne_underflow(self):
+        L = "v_ldexp_f16_e64 v0, v1, v2"
+        # Subnormal input scaling (stays subnormal, normalizes, reaches max finite, overflows, underflows)
+        cases = [
+            (0x0001, 0, 0x0001),
+            (0x0001, 5, 0x0020),
+            (0x0001, 10, 0x0400),
+            (0x0001, 39, 0x7800),
+            (0x0001, 40, INF),
+            (0x0010, 10, 0x1400),
+            (0x8010, 10, 0x9400),
+            (0x03FF, 1, 0x07FE),
+            # Exact IEEE-754 RNE ties when shifting into subnormals
+            (0x0401, -1, 0x0200),   # 512.5 -> even 512
+            (0x0403, -1, 0x0202),   # 513.5 -> even 514
+            (0x07FF, -1, 0x0400),   # 1023.5 -> rounds up into MIN_NORMAL 0x0400
+            (0x87FF, -1, 0x8400),   # negative carry into -MIN_NORMAL
+            (0x0400, -11, 0x0000),  # exact 0.5 -> even 0
+            (0x0401, -11, 0x0001),  # > 0.5 -> 1
+            (0x0001, -1, 0x0000),   # 0.5 -> even 0
+            (0x0003, -1, 0x0002),   # 1.5 -> even 2
+            (0x0601, -2, 0x0180),   # 384.25 -> 384
+        ]
+        for h, n, want in cases:
+            with self.subTest(h=hex(h), n=n):
+                self.assertEqual(want, ref_ldexp(h, n))
+                self.assertEqual(run(L, h, n), want)
 
     def test_op_sel(self):
         L = "v_ldexp_f16_e64 v0, v1, v2"
