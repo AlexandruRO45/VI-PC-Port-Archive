@@ -1898,6 +1898,36 @@ def vop2_integer_group() -> list[str]:
     ])
 
 
+def check_sopk_immediates():
+    ops = ["s_cmovk_i32", "s_cmpk_eq_i32", "s_cmpk_lg_i32", "s_cmpk_gt_i32", "s_addk_i32", "s_mulk_i32"]
+    body = [
+        "s_mov_b32 s48, 100",
+        "s_mov_b32 s49, 0",
+        "s_cmpk_eq_i32 s48, 100",
+        "s_cmovk_i32 s49, 0x7fff",
+        "s_cmpk_lg_i32 s48, 0x0001",
+        "s_cmovk_i32 s49, 0x0002",
+        "s_cmpk_gt_i32 s48, 0x0000",
+        "s_cmovk_i32 s49, 0x0003",
+        "s_addk_i32 s48, 0x8000",
+        "s_mulk_i32 s48, -2",
+    ]
+    hlsl = translate(with_constants(body))
+    for op in ops:
+        assert op in ACCEPTED, f"Missing {op} from ACCEPTED"
+    assert "(asint(100u) == 100)" in hlsl
+    assert "(asint(100u) != 1)" in hlsl
+    assert "(asint(100u) > 0)" in hlsl
+    assert "asuint(asint(100u) + -32768)" in hlsl
+    assert "asuint(asint(salu" in hlsl and "* -2" in hlsl
+
+    # Negative controls
+    must_reject(translate, with_constants(["s_addk_i32 s106, 1"]))
+    must_reject(translate, with_constants(["s_addk_i32 s48, 0x10000"]))
+    must_reject(translate, with_constants(["s_cmovk_i32 s48, 1"]))
+    must_reject(translate, with_constants(["s_load_dwordx4 s[48:51], s[20:21], 0x40", "s_addk_i32 s48, 1"]))
+
+
 def check_controls(directory):
     program = bitwise_program()
     for before, after in (("s44, v18", "s44, |v18|"), ("20, v19", "20, v19 clamp"),
@@ -1916,6 +1946,7 @@ def check_controls(directory):
     must_reject(translate_buffer_color, [s for s in program if s != "s_waitcnt lgkmcnt(0)"])
     must_reject(translate_buffer_color, [s.replace("off, off", "off, v26") for s in program])
     check_scheduling_hints()
+    check_sopk_immediates()
     check_constant_descriptor_bounds()
     check_scalar_constant_reads()
     check_affine_coordinates()

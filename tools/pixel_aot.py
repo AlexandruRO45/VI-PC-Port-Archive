@@ -815,6 +815,42 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     raise ValueError("Invalid movk immediate")
                 val = (val if val < 0x8000 else val - 0x10000) & 0xffffffff
             scalar[dst] = val
+        elif m := match(r"(s_cmovk_i32|s_cmpk_eq_i32|s_cmpk_lg_i32|s_cmpk_gt_i32|s_addk_i32|s_mulk_i32) (s\d+), (-?0x[0-9a-fA-F]+|-?\d+)"):
+            op, reg_tok, imm_tok = m.groups()
+            sgpr_name(reg_tok)
+            imm_val = int(imm_tok, 0)
+            if not -0x8000 <= imm_val <= 0xffff:
+                raise ValueError(f"SOPK immediate out of range: {imm_tok}")
+            imm16 = imm_val & 0xffff
+            simm = imm16 if imm16 < 0x8000 else imm16 - 0x10000
+            if op.startswith("s_cmpk_"):
+                val = scalar_u32(reg_tok, scalar, pending)
+                cmp = {"s_cmpk_eq_i32": "==", "s_cmpk_lg_i32": "!=", "s_cmpk_gt_i32": ">"}[op]
+                scc = f"(asint({val}) {cmp} {simm})"
+            elif op == "s_cmovk_i32":
+                if scc is None:
+                    raise ValueError("Conditional move requires a tracked SCC")
+                if reg_tok in pending:
+                    raise ValueError("Write overlaps an outstanding scalar load")
+                existing = scalar_u32(reg_tok, scalar, pending)
+                expr = f"({scc} ? {simm & 0xffffffff}u : {existing})"
+                lines.append(f"    uint salu{i} = {expr};")
+                scalar[reg_tok] = ("uint", f"salu{i}")
+            elif op == "s_addk_i32":
+                if reg_tok in pending:
+                    raise ValueError("Write overlaps an outstanding scalar load")
+                existing = scalar_u32(reg_tok, scalar, pending)
+                expr = f"asuint(asint({existing}) + {simm})"
+                lines.append(f"    uint salu{i} = {expr};")
+                scalar[reg_tok] = ("uint", f"salu{i}")
+                scc = f"(((~(asint({existing}) ^ {simm}) & (asint({existing}) ^ asint(salu{i}))) & 0x80000000u) != 0u)"
+            elif op == "s_mulk_i32":
+                if reg_tok in pending:
+                    raise ValueError("Write overlaps an outstanding scalar load")
+                existing = scalar_u32(reg_tok, scalar, pending)
+                expr = f"asuint(asint({existing}) * {simm})"
+                lines.append(f"    uint salu{i} = {expr};")
+                scalar[reg_tok] = ("uint", f"salu{i}")
         elif m := match(r"s_load_dwordx8 s\[(\d+):(\d+)\], s\[(\d+):(\d+)\], (null|0x[0-9a-f]+)"):
             dst = registers(*m.groups()[:2], 8)
             addr = registers(*m.groups()[2:4], 2)

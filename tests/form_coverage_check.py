@@ -244,6 +244,10 @@ def check_shader_records():
         ("VOP2", "v_and_b32"), ("VOP2", "v_or_b32"), ("VOP2", "v_xor_b32"),
         ("VOP2", "v_add_nc_u32"), ("VOP2", "v_sub_nc_u32"),
     }
+    sopk_forms = {
+        ("SOPK", "s_cmovk_i32"), ("SOPK", "s_cmpk_eq_i32"), ("SOPK", "s_cmpk_lg_i32"),
+        ("SOPK", "s_cmpk_gt_i32"), ("SOPK", "s_addk_i32"), ("SOPK", "s_mulk_i32"),
+    }
     rejected_forms = {
         "s_and_saveexec_b64", "s_or_saveexec_b64", "s_andn2_saveexec_b64",
         "s_cselect_b64", "s_bfe_u64", "s_bfe_i64", "s_bfm_b32",
@@ -255,6 +259,7 @@ def check_shader_records():
         assert scalar64_forms <= covered, (name, scalar64_forms - covered)
         assert sopc_forms <= covered, (name, sopc_forms - covered)
         assert vop2_forms <= covered, (name, vop2_forms - covered)
+        assert sopk_forms <= covered, (name, sopk_forms - covered)
 
 
 def check_parsing():

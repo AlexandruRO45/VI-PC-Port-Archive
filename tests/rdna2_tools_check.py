@@ -129,7 +129,12 @@ class TestRdna2Disasm(unittest.TestCase):
             # GFX10 / RDNA 2 opcode numbers, encodings as in LLVM's gfx10 MC tests
             ("01020083", "s_min_i32", "s_min_i32 s0, s1, s2"),
             ("01020093", "s_mul_i32", "s_mul_i32 s0, s1, s2"),
+            ("341201b1", "s_cmovk_i32", "s_cmovk_i32 s1, 0x1234"),
             ("341281b1", "s_cmpk_eq_i32", "s_cmpk_eq_i32 s1, 0x1234"),
+            ("341201b2", "s_cmpk_lg_i32", "s_cmpk_lg_i32 s1, 0x1234"),
+            ("341281b2", "s_cmpk_gt_i32", "s_cmpk_gt_i32 s1, 0x1234"),
+            ("341281b7", "s_addk_i32", "s_addk_i32 s1, 0x1234"),
+            ("341201b8", "s_mulk_i32", "s_mulk_i32 s1, 0x1234"),
             # SOPC: [31:23] == 0b101111110. These encodings were previously
             # consumed by the SOPK prefix check (e.g. 000100bf as s_sopk_1e).
             ("000100bf", "s_cmp_eq_i32", "s_cmp_eq_i32 s0, s1"),
