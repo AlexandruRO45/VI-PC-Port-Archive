@@ -1017,6 +1017,34 @@ class TestRdna2Extractor(unittest.TestCase):
             self.assertEqual((output_dir / "pixel" / "PS_CliTest.bin").read_bytes(), known_code)
             self.assertTrue((output_dir / "manifest.json").is_file())
 
+    def test_cli_limit_must_be_positive(self):
+        """A limit below one is rejected instead of extracting a record anyway."""
+        records = [envelope(bytes.fromhex("000080bf 000081bf"), b"PS_First"),
+                   envelope(bytes.fromhex("000382be 000081bf"), b"PS_Second")]
+        script = Path(__file__).resolve().parents[1] / "tools" / "extract_shaders.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            archive = tmp_path / "limit.rpf"
+            archive.write_bytes(b"RPF\0" + b"".join(records))
+            for limit in ("0", "-1"):
+                output_dir = tmp_path / f"limit_{limit}"
+                res = subprocess.run(
+                    [sys.executable, "-B", str(script), str(archive), "--output-dir", str(output_dir),
+                     "--stage", "pixel", "--limit", limit],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+                self.assertIn("--limit", res.stderr)
+                self.assertFalse(output_dir.exists(), "no output may be written for a rejected limit")
+            output_dir = tmp_path / "limit_1"
+            subprocess.run(
+                [sys.executable, "-B", str(script), str(archive), "--output-dir", str(output_dir),
+                 "--stage", "pixel", "--limit", "1"],
+                capture_output=True, text=True, check=True,
+            )
+            manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["total_extracted"], 1)
+
     def test_extracted_names_round_trip_length_prefixed_records(self) -> None:
         code = bytes.fromhex("000080bf 000081bf")
         names = (b"PS_A", b"PS_" + b"S" * 28, b"!" + b"A" * 32,

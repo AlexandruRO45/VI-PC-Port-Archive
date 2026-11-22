@@ -1,5 +1,5 @@
 // Map an x64 PE image without LoadLibrary and bind its imports through a host resolver.
-// Scope: DIR64 relocations, ordinary and delay imports by name or ordinal, section protections,
+// Scope: DIR64/HIGHLOW relocations, ordinary and delay imports by name or ordinal, section protections,
 // .pdata registration, TLS callbacks and the entry point. Delay imports are bound eagerly: the
 // image's delay-load helper would call LoadLibrary and bypass the host resolver. TLS data
 // templates are rejected. Header fields are checked against the file or SizeOfImage before use.
@@ -451,12 +451,12 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
 
     // Writes below (relocations, IAT) must land in sections, never in the headers or in the
     // directory that drives them, so validated structures cannot change while they are walked.
-    auto overlaps = [&](std::uint64_t rva, const IMAGE_DATA_DIRECTORY& driver) {
+    auto overlaps = [&](std::uint64_t rva, const IMAGE_DATA_DIRECTORY& driver, std::uint64_t width = 8) {
         const std::uint64_t start = driver.VirtualAddress, end = start + driver.Size;
-        return rva + 8 > start && rva < end;
+        return rva + width > start && rva < end;
     };
-    auto writable = [&](std::uint64_t rva, const IMAGE_DATA_DIRECTORY& driver) {
-        return rva >= opt.SizeOfHeaders && image.at<std::uint64_t>(rva) && !overlaps(rva, driver);
+    auto writable = [&](std::uint64_t rva, const IMAGE_DATA_DIRECTORY& driver, std::uint64_t width = 8) {
+        return rva >= opt.SizeOfHeaders && inside(rva, width, image.size) && !overlaps(rva, driver, width);
     };
 
     // Only complete relocation blocks and complete WORD entries can be applied.
@@ -484,10 +484,23 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
                 const WORD type = entry[k] >> 12;
                 const std::uint64_t target = page + std::uint64_t{entry[k] & 0xfffu};
                 if (type == IMAGE_REL_BASED_ABSOLUTE) continue;
-                if (type != IMAGE_REL_BASED_DIR64 || !writable(target, relocs))
+                const std::uint64_t width = type == IMAGE_REL_BASED_DIR64 ? 8 : type == IMAGE_REL_BASED_HIGHLOW ? 4 : 0;
+                if (width == 0 || !writable(target, relocs, width))
                     return release(fail(MAP_RELOCATION, "unsupported relocation at RVA %#llx",
                                         static_cast<unsigned long long>(target)));
-                *image.at<std::uint64_t>(target) += delta;
+                // Entries need not be naturally aligned. Copy only their architectural
+                // width: HIGHLOW must neither touch nor carry into the next four bytes.
+                if (type == IMAGE_REL_BASED_HIGHLOW) {
+                    std::uint32_t value;
+                    std::memcpy(&value, image.base + target, sizeof(value));
+                    value += static_cast<std::uint32_t>(delta);
+                    std::memcpy(image.base + target, &value, sizeof(value));
+                } else {
+                    std::uint64_t value;
+                    std::memcpy(&value, image.base + target, sizeof(value));
+                    value += delta;
+                    std::memcpy(image.base + target, &value, sizeof(value));
+                }
             }
             offset += length;
         }

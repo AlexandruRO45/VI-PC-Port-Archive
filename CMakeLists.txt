@@ -217,7 +217,7 @@ foreach(width IN ITEMS 0 16 32 64)
 endforeach()
 foreach(entry IN ITEMS CopyBlocks FillBlocks NumberBlocks CopySpan ResetBounds)
     set(header "${CMAKE_CURRENT_BINARY_DIR}/${entry}.h")
-    add_custom_command(OUTPUT "${header}" COMMAND "${DXC_EXECUTABLE}" -T cs_6_5 -E ${entry} -Vn ${entry}
+    add_custom_command(OUTPUT "${header}" COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E ${entry} -Vn ${entry}
         -Fh "${header}" -Fo "${CMAKE_CURRENT_BINARY_DIR}/${entry}.cso"
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/buffer_ops.hlsl" DEPENDS tests/buffer_ops.hlsl
         BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/${entry}.cso" VERBATIM)
@@ -227,12 +227,18 @@ add_custom_command(OUTPUT "${ray_header}"
     COMMAND "${DXC_EXECUTABLE}" -T cs_6_5 -E CSMain -Vn ray_query -Fh "${ray_header}"
             -Fo "${CMAKE_CURRENT_BINARY_DIR}/ray_query.cso" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ray_query.hlsl"
     BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/ray_query.cso" DEPENDS tests/ray_query.hlsl VERBATIM)
+set(ray_pipeline_header "${CMAKE_CURRENT_BINARY_DIR}/ray_pipeline.h")
+add_custom_command(OUTPUT "${ray_pipeline_header}"
+    COMMAND "${DXC_EXECUTABLE}" -T lib_6_3 -D DXR_PIPELINE=1 -Vn ray_pipeline -Fh "${ray_pipeline_header}"
+            -Fo "${CMAKE_CURRENT_BINARY_DIR}/ray_pipeline.cso" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ray_query.hlsl"
+    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/ray_pipeline.cso" DEPENDS tests/ray_query.hlsl VERBATIM)
 set(candidates_header "${CMAKE_CURRENT_BINARY_DIR}/ray_candidates.h")
 add_custom_command(OUTPUT "${candidates_header}"
     COMMAND "${DXC_EXECUTABLE}" -T cs_6_5 -E CSMain -Vn ray_candidates -Fh "${candidates_header}"
             -Fo "${CMAKE_CURRENT_BINARY_DIR}/ray_candidates.cso" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ray_candidates.hlsl"
     BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/ray_candidates.cso" DEPENDS tests/ray_candidates.hlsl VERBATIM)
-target_sources(offscreen_check PRIVATE "${ray_header}" "${candidates_header}" tests/dxr_facing.cpp tests/dxr_opacity.cpp)
+target_sources(offscreen_check PRIVATE "${ray_header}" "${ray_pipeline_header}" "${candidates_header}"
+    tests/dxr_facing.cpp tests/dxr_opacity.cpp)
 foreach(layout IN ITEMS root tables)
     set(header "${CMAKE_CURRENT_BINARY_DIR}/compute_${layout}.h")
     set(binary "${CMAKE_CURRENT_BINARY_DIR}/compute_${layout}.cso")
@@ -294,6 +300,7 @@ foreach(adapter IN ITEMS hardware warp)
     add_test(NAME texture_mips_${adapter} COMMAND offscreen_check ${adapter} --texture-mips)
     set_tests_properties(dual_uav_${adapter} texture_mips_${adapter} PROPERTIES TIMEOUT 45)
     add_test(NAME dxr_query_${adapter} COMMAND offscreen_check ${adapter} --ray-query)
+    add_test(NAME dxr_pipeline_${adapter} COMMAND offscreen_check ${adapter} --dxr-pipeline)
     add_test(NAME dxr_update_${adapter} COMMAND offscreen_check ${adapter} --dxr-update)
     set_tests_properties(dxr_update_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     add_test(NAME dxr_facing_${adapter} COMMAND offscreen_check ${adapter} --dxr-facing)
@@ -316,8 +323,8 @@ foreach(adapter IN ITEMS hardware warp)
     set_tests_properties(bvh_wave64_${adapter} bvh_differential_${adapter} PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME wave_shuffle_${adapter} COMMAND offscreen_check ${adapter} --wave-shuffle)
     set_tests_properties(wave_shuffle_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
-    set_tests_properties(bvh_buffer_ops_${adapter} PROPERTIES TIMEOUT 45)
-    set_tests_properties(dxr_query_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    set_tests_properties(bvh_buffer_ops_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    set_tests_properties(dxr_query_${adapter} dxr_pipeline_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     set_tests_properties(offscreen_${adapter} PROPERTIES TIMEOUT 45)
 endforeach()
 set_tests_properties(offscreen_hardware ffx_device_init_hardware ffx_recurrent_hardware ffx_provider_loop_hardware PROPERTIES SKIP_RETURN_CODE 77)
@@ -325,11 +332,13 @@ set_tests_properties(dual_uav_hardware texture_mips_hardware PROPERTIES SKIP_RET
 set_tests_properties(bvh_root_roundtrip_hardware PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(bvh_atomics_hardware PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(bvh_numeric_hardware bvh_packed_hardware PROPERTIES SKIP_RETURN_CODE 77)
-set_tests_properties(bvh_buffer_ops_hardware PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(bvh_reads_hardware bvh_waves_hardware bvh_hits_hardware PROPERTIES SKIP_RETURN_CODE 77)
 # The cs_6_5 fixtures skip on a WARP below SM 6.5. The Windows 10 in-box WARP reports SM 6.2.
-set_tests_properties(bvh_buffer_ops_warp bvh_reads_warp bvh_waves_warp bvh_hits_warp bvh_packed_warp
+set_tests_properties(bvh_reads_warp bvh_waves_warp bvh_hits_warp bvh_packed_warp
     bvh_numeric_warp bvh_atomics_warp PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(NAME bvh_differential_pipeline_warp COMMAND offscreen_check warp --bvh-differential-pipeline)
+set_tests_properties(bvh_differential_pipeline_warp PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
 
 add_test(NAME offscreen_invalid_operation_warp COMMAND "${CMAKE_COMMAND}"
     "-DRENDERER=$<TARGET_FILE:offscreen_check>" -P "${CMAKE_SOURCE_DIR}/tests/offscreen_invalid_operation.cmake")
@@ -419,6 +428,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             add_test(NAME spirv_address_window_${adapter} COMMAND "${INTAKE_PYTHON}" -B
                 "${CMAKE_SOURCE_DIR}/tests/spirv_window/draw.py" "${SPIRV_WINDOW_AS}" "${SPIRV_WINDOW_VAL}"
                 "${SPIRV_WINDOW_CROSS}" "${DXC_EXECUTABLE}" "$<TARGET_FILE:offscreen_check>" ${adapter})
+            add_test(NAME spirv_ballot_extract_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_SOURCE_DIR}/tests/spirv_window/ballot.py" "${SPIRV_WINDOW_AS}" "${SPIRV_WINDOW_VAL}"
+                "${SPIRV_WINDOW_CROSS}" "${DXC_EXECUTABLE}" "$<TARGET_FILE:offscreen_check>" ${adapter})
+            set_tests_properties(spirv_ballot_extract_${adapter} PROPERTIES SKIP_RETURN_CODE 77)
             set_tests_properties(spirv_address_window_${adapter} PROPERTIES SKIP_RETURN_CODE 77)
         endforeach()
     endif()
@@ -764,7 +777,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         "op_movmskpd_xmm,op_movmskpd_ymm,op_movmskps_xmm,op_movmskps_ymm,"
         "op_maskmovps_load_xmm,op_maskmovps_load_ymm,op_maskmovpd_load_xmm,op_maskmovpd_load_ymm,"
         "op_maskmovps_store_xmm,op_maskmovps_store_ymm,op_maskmovpd_store_xmm,op_maskmovpd_store_ymm,"
-        "op_zeroupper,op_pipeline,op_mov_load32")
+        "op_zeroupper,op_pipeline,op_mov_load32,"
+        "op_zeroupper_ymm1,op_movapd_xmm_dirty,op_mov_store32,op_insertps_s2d3_z1,"
+        "op_extractps_w1_lane2,op_shufpd_xmm_sel1,op_shufps_ymm_sel2,op_negdisp_load")
     string(CONCAT cpu_avx_move_exports ${cpu_avx_move_exports})
     foreach(variant IN ITEMS original altered)
         cpu_asm_fixture(cpu_avx_move_regs_${variant} avx_move_regs)
@@ -1354,6 +1369,18 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_library(cpu_sse2_shifts_pack_lifted SHARED "${sse2_shifts_pack_fixture}")
     add_test(NAME cpu_aot_sse2_shifts_pack COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/sse2_shifts_pack.py"
         check "$<TARGET_FILE:cpu_sse2_shifts_pack>" "$<TARGET_FILE:cpu_sse2_shifts_pack_lifted>")
+
+    cpu_asm_fixture(cpu_fma_packed fma_packed)
+    set(fma_packed_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_fma_packed_lifted.cpp")
+    add_custom_command(OUTPUT "${fma_packed_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/fma_packed.py"
+            emit "$<TARGET_FILE:cpu_fma_packed>" "${fma_packed_fixture}"
+        DEPENDS cpu_fma_packed tests/cpu/fma_packed.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_fma_packed_lifted SHARED "${fma_packed_fixture}")
+    add_test(NAME cpu_aot_fma_packed COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/fma_packed.py"
+        check "$<TARGET_FILE:cpu_fma_packed>" "$<TARGET_FILE:cpu_fma_packed_lifted>")
+    set_tests_properties(cpu_aot_fma_packed PROPERTIES SKIP_RETURN_CODE 77)
     cpu_translation(cpu_callback cpu_chained_aot call_context CALLBACK_OFFSET 8)
     cpu_asm_fixture(cpu_xlatb xlatb)
     # The lifted DLL and three mutated controls that the check requires to mismatch.
@@ -1970,6 +1997,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         --ordinal-control "$<TARGET_FILE:cpu_import_provider>")
     cpu_asm_fixture(cpu_reloc_original reloc_route)
     target_link_libraries(cpu_reloc_original PRIVATE cpu_import_provider)
+    add_test(NAME cpu_native_highlow COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/highlow_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_reloc_original>" "$<TARGET_FILE:cpu_import_provider>")
     cpu_asm_fixture(cpu_two_imports two_imports)
     target_link_libraries(cpu_two_imports PRIVATE cpu_import_provider cpu_register_probe)
     add_library(pe_map SHARED tools/pe_map.cpp)
@@ -2258,6 +2288,14 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/mesh_attribute_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(mesh_attribute_draw_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME mesh_textured_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/mesh_textured_check.py" "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(mesh_textured_draw_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME mesh_depth_pair_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/mesh_depth_pair_check.py" "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(mesh_depth_pair_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME mesh_entry_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/mesh_entry_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -2372,14 +2410,22 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_BINARY_DIR}/triangle_vs.cso" "${DXC_BIN_DIR}/dxil.dll")
     set_tests_properties(shader_metadata_probe PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME shader_metadata_controls COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/shader_probe_check.py")
+    # Keep both shader-model profiles in the retarget probe even though the draw fixture uses SM 6.0.
+    set(retarget_copy_blocks "${CMAKE_CURRENT_BINARY_DIR}/CopyBlocksSM65.cso")
+    add_custom_command(OUTPUT "${retarget_copy_blocks}"
+        COMMAND "${DXC_EXECUTABLE}" -T cs_6_5 -E CopyBlocks -Fo "${retarget_copy_blocks}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/buffer_ops.hlsl"
+        DEPENDS tests/buffer_ops.hlsl VERBATIM)
+    add_custom_target(dxil_retarget_fixture DEPENDS "${retarget_copy_blocks}")
+    add_dependencies(root_device_probe dxil_retarget_fixture)
     add_test(NAME dxil_retarget_probe COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/dxil_retarget_check.py" "$<TARGET_FILE:root_probe>"
-        "${CMAKE_CURRENT_BINARY_DIR}/compute_root.cso" "${CMAKE_CURRENT_BINARY_DIR}/CopyBlocks.cso"
+        "${CMAKE_CURRENT_BINARY_DIR}/compute_root.cso" "${retarget_copy_blocks}"
         "${DXC_BIN_DIR}/dxil.dll" "$<TARGET_FILE:root_device_probe>" "$<TARGET_FILE:offscreen_check>")
     set_tests_properties(dxil_retarget_probe PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME dxil_retarget_probe_hardware COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/dxil_retarget_check.py" "$<TARGET_FILE:root_probe>"
-        "${CMAKE_CURRENT_BINARY_DIR}/compute_root.cso" "${CMAKE_CURRENT_BINARY_DIR}/CopyBlocks.cso"
+        "${CMAKE_CURRENT_BINARY_DIR}/compute_root.cso" "${retarget_copy_blocks}"
         "${DXC_BIN_DIR}/dxil.dll" "$<TARGET_FILE:root_device_probe>" "$<TARGET_FILE:offscreen_check>" hardware)
     set_tests_properties(dxil_retarget_probe_hardware PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
     add_test(NAME dxil_retarget_controls COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/dxil_retarget_check.py")

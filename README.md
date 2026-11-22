@@ -57,7 +57,7 @@ Contributing from macOS or Linux? See the [non-Windows host guide](docs/non-wind
 ### Windows build notes
 
 - **DXC validation.** `shader_metadata_probe` skips when the validator lacks module-only validation. DXC 1.8.2502 is the first verified release that passes. To use a separate DXC installation, configure with `cmake --preset dev -DDXC_EXECUTABLE=C:/path/to/dxc/bin/x64/dxc.exe`. [Results by release](docs/experiments.md#module-only-validation-by-dxc-release) · [Original report](https://github.com/R0Y00/Xbox2Windows/issues/98) · [DXC download](https://github.com/microsoft/DirectXShaderCompiler/releases/tag/v1.8.2502)
-- **Windows 10.** The in-box WARP runtime lacks the features used by the BVH and DXR checks. Use the app-local Agility SDK and WARP packages to run those checks. [Windows 10 setup](docs/experiments.md#windows-10-with-the-app-local-agility-sdk-and-warp)
+- **Windows 10.** The source-built BVH buffer operations run on in-box WARP at SM 6.0. For WARP checks that require SM 6.5 or DXR, use the app-local Agility SDK and WARP packages. [BVH buffer operations](docs/experiments.md#bvh-buffer-operations-on-in-box-warp) · [Windows 10 setup](docs/experiments.md#windows-10-with-the-app-local-agility-sdk-and-warp)
 - **Independent build.** A Windows 11 contributor reproduced the three smoke tests from a clean checkout at `71bb9f4` and again after an incremental rebuild at `2465837`. [Toolchain, full-suite results and capability skips](https://github.com/R0Y00/Xbox2Windows/issues/2#issuecomment-7063351821)
 
 ## Choose an experiment
@@ -69,6 +69,7 @@ After the full [Windows build](#first-build), run one comparison from the reposi
 | Native, mapped and recompiled archive reader | `ctest --preset dev --no-tests=error -R '^cpu_native_archive_blast$' -V` |
 | Indexed mesh draw on WARP | `ctest --preset dev --no-tests=error -R '^mesh_indexed_draw_warp$' -V` |
 | Compute shader buffer writes on WARP | `ctest --preset dev --no-tests=error -R '^compute_store_aot_warp$' -V` |
+| PE 32/64-bit base fixups against Windows | `ctest --preset dev --no-tests=error -R '^cpu_native_highlow$' -V` · [scope and controls](docs/experiments.md#highlow-and-mixed-width-base-relocations) |
 
 The control-flow CPU translator supports [source-built string memory transfers](docs/experiments.md#repeated-memory-copies-in-the-control-flow-cpu-lifter). REP MOVSB/MOVSW/MOVSD/MOVSQ copy 1-, 2-, 4- and 8-byte elements.
 
@@ -181,7 +182,7 @@ Results are grouped by adapter. Open a report for the driver, build and any capa
 | Intel Arc B390 GPU (Panther Lake) | 32 | Skipped, lane range 16–32 | 408 queries passed | [32.0.101.8509 report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7074654193) |
 | NVIDIA GeForce RTX 4080 SUPER | 32 | Skipped, lane range 32–32 | 408 queries passed | [32.0.16.2101 report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7069552323) |
 | NVIDIA GeForce GTX 1650 | 32 | Skipped, lane range 32–32 | Skipped, DXR unsupported | [32.0.16.2124 report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7071119231) |
-| NVIDIA GeForce GTX 1060 6GB | 32 | Skipped, lane range 32–32, Shader Model 6.5 | Skipped, DXR tier 1.0 | [32.0.15.6094 report, Windows 10 build 19045, source build at 6549244](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7071767352) |
+| NVIDIA GeForce GTX 1060 6GB | 32 | Skipped, lane range 32–32, Shader Model 6.5 | 408 comparisons passed via DXR Tier 1.0 | [Tier 1.0 retest](docs/experiments.md#independent-bvh-checks-on-pc) · [Original 32.0.15.6094 report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7071767352) |
 | NVIDIA GeForce RTX 3050 Laptop GPU | 32 | Skipped, lane range 32–32 | 408 queries passed | [32.0.16.2124 report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7074983225) · [32.0.16.2114 report, debug layer enabled](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7076301686) |
 | NVIDIA GeForce RTX 3050 6GB Laptop GPU | 32 | Skipped, lane range 32–32 | 408 queries passed | [32.0.16.1062 report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7075184791) |
 | Microsoft WARP (software) | 4 | Skipped | 408 queries passed | [Maintainer baseline](docs/experiments.md#independent-bvh-checks-on-pc) · [10.0.26100.9711 report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7070173394) · [Independent 10.0.26100.9711 run](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7070473372) · [10.0.26100.9711 source build at bc24dfd](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7071126769) · [10.0.26100.9818 report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7071853781) |
