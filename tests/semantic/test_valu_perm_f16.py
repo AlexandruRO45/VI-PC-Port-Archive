@@ -1486,8 +1486,173 @@ class TestPermF16IEEE754Boundaries(unittest.TestCase):
         self.assertEqual(extract_half(res2, 1), POS_ZERO)  # -2.0 -> +0.0
 
 
+# ==============================================================================
+# Negative Controls, Fault Injection, and Mutation Operators
+# ==============================================================================
+
+def mutated_perm_off_by_one(src0: int, src1: int, selector: int) -> int:
+    """Mutant 1: Off-by-one selector decoding bug."""
+    s0 = src0 & MASK32
+    s1 = src1 & MASK32
+    sel0 = ((selector & 0xFF) + 1) & 0xFF
+    sel1 = (((selector >> 8) & 0xFF) + 1) & 0xFF
+    h0 = permute_single_half(s0, s1, sel0)
+    h1 = permute_single_half(s0, s1, sel1)
+    return pack_halves(h0, h1)
+
+
+def mutated_perm_inverted_sources(src0: int, src1: int, selector: int) -> int:
+    """Mutant 2: Inverted sources bug (src0 and src1 swapped)."""
+    return oracle_v_perm_f16(src0=src1, src1=src0, selector=selector)
+
+
+def mutated_perm_ignore_zero_fill(src0: int, src1: int, selector: int) -> int:
+    """Mutant 3: Fails to generate constant +0.0 on selector code 8."""
+    s0 = src0 & MASK32
+    s1 = src1 & MASK32
+    sel0 = selector & 0xFF
+    sel1 = (selector >> 8) & 0xFF
+    h0 = 0x1234 if sel0 == SEL_POS_ZERO else permute_single_half(s0, s1, sel0)
+    h1 = 0x1234 if sel1 == SEL_POS_ZERO else permute_single_half(s0, s1, sel1)
+    return pack_halves(h0, h1)
+
+
+def mutated_perm_ignore_nan_fill(src0: int, src1: int, selector: int) -> int:
+    """Mutant 4: Fails to generate Canonical Quiet NaN on selector code 12."""
+    s0 = src0 & MASK32
+    s1 = src1 & MASK32
+    sel0 = selector & 0xFF
+    sel1 = (selector >> 8) & 0xFF
+    h0 = POS_ZERO if sel0 == SEL_CANONICAL_QNAN else permute_single_half(s0, s1, sel0)
+    h1 = POS_ZERO if sel1 == SEL_CANONICAL_QNAN else permute_single_half(s0, s1, sel1)
+    return pack_halves(h0, h1)
+
+
+def mutated_perm_wrong_half_packing(src0: int, src1: int, selector: int) -> int:
+    """Mutant 5: Swaps low and high half packing in destination dword."""
+    s0 = src0 & MASK32
+    s1 = src1 & MASK32
+    sel0 = selector & 0xFF
+    sel1 = (selector >> 8) & 0xFF
+    h0 = permute_single_half(s0, s1, sel0)
+    h1 = permute_single_half(s0, s1, sel1)
+    # Bug: packs h1 as low half and h0 as high half
+    return pack_halves(h1, h0)
+
+
+# ==============================================================================
+# Unit Tests: Commit 8 (Negative Controls & Mutation Detection)
+# ==============================================================================
+
+class TestPermF16NegativeControlsAndMutations(unittest.TestCase):
+    """Test suite for negative controls, syntax rejection, and mutation detection."""
+
+    def test_negative_sgpr_destination_rejected(self):
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_F16,
+            dst=ASTOperand.sgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(3),
+        )
+        with self.assertRaises(ValueError):
+            instr.validate()
+
+    def test_negative_multiple_literals_rejected(self):
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.literal(0x1111_1111),
+            src1=ASTOperand.literal(0x2222_2222),
+            src2=ASTOperand.vgpr(3),
+        )
+        with self.assertRaises(ValueError):
+            instr.validate()
+
+    def test_negative_register_index_bounds(self):
+        rf = ScalarRegisterFile()
+        with self.assertRaises(IndexError):
+            rf.get_vgpr(256)
+        with self.assertRaises(IndexError):
+            rf.set_vgpr(-1, 0)
+        with self.assertRaises(IndexError):
+            rf.get_sgpr(106)
+        with self.assertRaises(IndexError):
+            rf.set_sgpr(-1, 0)
+
+    def test_negative_half_index_bounds(self):
+        with self.assertRaises(ValueError):
+            extract_half(0x1234_5678, 2)
+        with self.assertRaises(ValueError):
+            extract_half(0x1234_5678, -1)
+
+    def test_negative_wave_size_rejected(self):
+        with self.assertRaises(ValueError):
+            SIMDWaveState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDWaveState(num_lanes=128)
+
+    def test_mutation_off_by_one_detected(self):
+        src0 = pack_halves(0x1111, 0x2222)
+        src1 = pack_halves(0x3333, 0x4444)
+        sel = PermSelectorF16Word.identity_src1().raw
+        expected = oracle_v_perm_f16(src0, src1, sel)
+        mutated = mutated_perm_off_by_one(src0, src1, sel)
+        self.assertNotEqual(expected, mutated)
+
+    def test_mutation_inverted_sources_detected(self):
+        src0 = pack_halves(0x1111, 0x2222)
+        src1 = pack_halves(0x3333, 0x4444)
+        sel = PermSelectorF16Word.identity_src1().raw
+        expected = oracle_v_perm_f16(src0, src1, sel)
+        mutated = mutated_perm_inverted_sources(src0, src1, sel)
+        self.assertNotEqual(expected, mutated)
+
+    def test_mutation_constant_zero_ignored_detected(self):
+        src0 = 0xFFFF_FFFF
+        src1 = 0xFFFF_FFFF
+        sel = make_selector(SEL_POS_ZERO, SEL_POS_ZERO)
+        expected = oracle_v_perm_f16(src0, src1, sel)
+        mutated = mutated_perm_ignore_zero_fill(src0, src1, sel)
+        self.assertNotEqual(expected, mutated)
+
+    def test_mutation_constant_nan_ignored_detected(self):
+        sel = make_selector(SEL_CANONICAL_QNAN, SEL_CANONICAL_QNAN)
+        expected = oracle_v_perm_f16(0, 0, sel)
+        mutated = mutated_perm_ignore_nan_fill(0, 0, sel)
+        self.assertNotEqual(expected, mutated)
+
+    def test_mutation_exec_mask_ignored_detected(self):
+        # A buggy execution engine that ignores EXEC mask writes all lanes
+        wave = SIMDWaveState(num_lanes=32, exec_mask=0x0000_0001)  # Only lane 0 active
+        wave.set_wave_vgpr(0, [0xCAFE_0000] * 32)
+        wave.set_wave_vgpr(1, [pack_halves(POS_ONE, POS_TWO)] * 32)
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(1),
+            src2=ASTOperand.literal(0),
+        )
+        wave.execute_instruction(instr)
+
+        # Inactive lanes (1..31) must remain 0xCAFE_0000
+        for lane in range(1, 32):
+            self.assertEqual(wave.get_lane_vgpr(0, lane), 0xCAFE_0000)
+
+    def test_mutation_wrong_half_packing_detected(self):
+        src0 = pack_halves(0x1111, 0x2222)
+        src1 = pack_halves(0x3333, 0x4444)
+        sel = make_selector(SEL_SRC1_LO, SEL_SRC0_HI)  # lo gets 0x3333, hi gets 0x2222
+        expected = oracle_v_perm_f16(src0, src1, sel)
+        mutated = mutated_perm_wrong_half_packing(src0, src1, sel)
+        self.assertNotEqual(expected, mutated)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
