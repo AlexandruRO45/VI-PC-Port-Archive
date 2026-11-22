@@ -38,14 +38,16 @@ The decoded export used by the previews contains 13 parts:
 | legacy head | `cs_lucia_legacyheadcs_fr1_001_regular_ws00_full.#dr` | 592 | 1,028 | `0x707771F769AA3542` |
 | jacket (biker) | `cs_lucia_jacketbiker_fr1_000_regular_c_hl_long_full.#dr` | 9,818 | 10,837 | `0xF5073AA039BB3CED` |
 | crop tee | `player_story000_00_tshirtcrop_fr1_001_slim_cc_un_long_full.#dr` | 4,932 | 6,756 | `0x46E8FA9436E9D43C` |
-| jacket (biker) | `cs_lucia_jacketbiker_fr1_000_regular_c_hl_long_full.#dr` | 9,818 | 10,837 | none (normal map only) |
-| crop tee | `player_story000_00_tshirtcrop_fr1_001_slim_cc_un_long_full.#dr` | 4,932 | 6,756 | none (normal map only) |
 | bikini top | `brabikini_fr1_012_regular_ws00_full.#dr` | 6,547 | 5,697 | `0xDF3615ADFB1F4787` |
 | undies | `undiesgstring_fr1_002_slim_hw_full.#dr` | 961 | 913 | `0xCFD339832A9C724A` |
 
 Two caveats that matter for any render:
 
-- **`body` is not a base body.** The only Lucia full-body record in `packs.rpf` is the
+- **`body` is the shared player/cutscene body.** The only `lucia`-named full-body record in
+  `packs.rpf` is `cs_lucia_legacypedcs_fr1_000_fullbody_ws00_full` (874- and 640-vertex rows;
+  1,748 / 1,816 decoded). Its `FragName` is byte-identical to `cs_monalisa` and `cs_mandy`, so it
+  is the shared player/cutscene body, not a unique high-detail mesh. Do not present it as a
+  high-detail hero body.
 - **`body` is not a base body.** The only `lucia`-named full-body record in `packs.rpf` is the
   `cs_lucia_legacypedcs` clothed legacy ped. The decoded part is 1,748 vertices / 1,816
   triangles, and the manifest lists 874- and 640-vertex rows of the same drawable. Do not present
@@ -79,8 +81,6 @@ component table.
 | `pants` | 459 | `pantsjeans`, `pantscargo`, `pantsleggings`, `pantstrack`, … |
 | `jeans` | 157 | `pantsjeans` / `shortsjeans` |
 | `jacket` | 327 | `jacketbiker`, `jacketdenim`, `jacketblazer`, `jackettrack`, … |
-| `uppr` | 17 | all `slod_uppr_*` super-LOD crowd parts |
-| `lowr` | 21 | all `slod_lowr_*` super-LOD crowd parts |
 | `uppr` | 17 | 14 are `slod_uppr_*`; 3 are `char_bipedbounds_female_armor…_uppr_l/r.#ft` |
 | `lowr` | 21 | 17 are `slod_lowr_*`; 4 are `char_bipedbounds_female_armor…_lowr_l/r.#ft` |
 | `jbib` | 0 | the GTA V slot code is not a name token here |
@@ -126,6 +126,28 @@ have **no albedo**, so a preview must render them as clay rather than invent a c
   The blue in an earlier preview came from the authored `baseColorFactor` `(0.200, 0.270, 0.400)`,
   not from this atlas.
 
+## Bodies
+
+A geometry-first census — every `packs.rpf` drawable and fragment, all 50,802 `levels.rpf`
+fragments, 178,073 of 184,778 `levels.rpf` drawables (96.4%; the 6,705 above 3 MB were not
+decoded), all 4,195 `story000.rpf` drawables, and the `anim.rpf` rig dictionaries — found no
+Lucia or Mandy body. `story000.rpf` is mission map cells, not ped actors, and `anim.rpf`'s
+`LOD0_Body_Shapes_Female` is a rig program with no mesh.
+
+The only **nude** continuous human-skeleton meshes are a **generic female mannequin** in
+`levels.rpf`: `gmt_mannequin_proxy_f_01a` (15,488 vertices / 27,725 triangles, 95 bones,
+1.72 m, A-pose) and `gmt_mannequin_f_01b` (the same body posed mid-stride). It has no Lucia or
+Mandy name or texture link, and its rig is a clothing form, not the 596-bone ped skeleton (78
+of 95 bone names are shared, with mirrored limb pivots), so it is a base proxy for a
+reconstruction, not Lucia's body.
+
+The player and cutscene body is a separate shared **clothed** fragment,
+`cs_lucia_legacypedcs_fr1_000_fullbody_ws00_full` (874 v), used by `cs_lucia`, `cs_monalisa`
+and `cs_mandy` (their `FragName` is identical). It is the body the game uses; it is low-poly and
+clothed, so it is not a high-detail nude body. A flat-skin render of the 874-v body with its
+normal map disconnected still shows the modelled top, shorts and ankle boots, so the clothing
+silhouette is geometry, not a painted-on atlas.
+
 ## What is not decoded
 
 - **Fragment children.** All 2,865 fragments export as the 25-vertex bounds cube described above.
@@ -154,8 +176,11 @@ have **no albedo**, so a preview must render them as clay rather than invent a c
   placeholders. Across all characters, 241 of 329 hair rows are 3-vertex placeholders, but 68
   have more than 100 vertices, so real hair geometry does exist for some characters. A static
   export of Lucia is bald by design, not by a missing decode.
-- **`levels.rpf` names.** The archive has not been name-enumerated in this workspace; the negative
-  for a Lucia body is scoped to the named `packs.rpf` records above.
+- **`levels.rpf`.** The full archive was name-enumerated: 1,116,073 streams, 98.32% inflated,
+  235,814 named streams, 318,266 unique names. It contains no Lucia, Mandy, `player_story` or
+  `ambient_female` drawable; the Lucia and Mandy hits are props (photos, frames, luggage, a
+  curtain). The only human-skeleton meshes in `levels.rpf` are the generic mannequin pair in
+  **Bodies**.
 - **Bind pose and full skinning.** The delivered GLBs use identity inverse-bind matrices and do
   not apply the 8-influence bone-palette skinning. Prior art places inverse bind matrices at the
   skeleton header `+0x08`; that is not yet reproduced here, so the reference TRS remains the only

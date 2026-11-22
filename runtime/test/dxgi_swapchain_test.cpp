@@ -9,6 +9,7 @@
 #include "../shims/d3d12_com.h"
 #include "../shims/dxgi_com.h"
 #include "vulkan_loader.h"
+#include "../src/vulkan_device_filter.h"
 
 #include <cmath>
 #include <cstdint>
@@ -184,17 +185,21 @@ int main() {
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     std::uint32_t family = 0;
     VkPhysicalDeviceProperties chosen{};
+    int best_rank = -1;
     for (auto cand : physicals) {
         VkPhysicalDeviceProperties props{};
         get_props(cand, &props);
-        if (props.apiVersion < VK_API_VERSION_1_3) continue;
+        if (props.apiVersion < VK_API_VERSION_1_3 || !leonida::vulkan_device_wanted(props.deviceName)) continue;
         std::uint32_t fcnt = 0;
         get_qf(cand, &fcnt, nullptr);
         std::vector<VkQueueFamilyProperties> fams(fcnt);
         get_qf(cand, &fcnt, fams.data());
         for (std::uint32_t i = 0; i < fcnt; ++i) {
             if (!(fams[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
-            if (!physical || props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+            // the runtime's pick: the first usable device of the highest rank (native driver over Dozen, #915)
+            if (const int rank = leonida::vulkan_device_rank(static_cast<int>(props.deviceType), props.vendorID);
+                rank > best_rank) {
+                best_rank = rank;
                 physical = cand;
                 family = i;
                 chosen = props;
@@ -203,9 +208,12 @@ int main() {
         }
     }
     if (!physical) {
-        std::printf("SKIP: no Vulkan 1.3 GPU found\n");
+        const std::string filter = leonida::vulkan_device_filter();
+        if (filter.empty()) std::printf("SKIP: no Vulkan 1.3 GPU found\n");
+        else std::fprintf(stderr, "LEONIDA_VK_DEVICE=%s: no Vulkan 1.3 GPU matches\n", filter.c_str());
         if (messenger && destroy_dbg) destroy_dbg(instance, messenger, nullptr);
         destroy_inst(instance, nullptr);
+        if (!filter.empty()) return 1;  // a filter matching nothing fails, never skips
         return 77;  // ctest skips
     }
 
@@ -286,6 +294,19 @@ int main() {
             return fail("CreateSwapChainForHwnd returned a swapchain for an invalid buffer count");
         }
         if (hr != DXGI_ERROR_INVALID_CALL) return fail("CreateSwapChainForHwnd invalid buffer count HRESULT");
+    }
+
+    constexpr DXGI_SAMPLE_DESC invalid_samples[] = {{0, 0}, {2, 0}, {4, 0}, {1, 1}};
+    for (const auto& samples : invalid_samples) {
+        DXGI_SWAP_CHAIN_DESC1 invalid = scd;
+        invalid.SampleDesc = samples;
+        IDXGISwapChain1* rejected = nullptr;
+        const HRESULT hr = factory->CreateSwapChainForHwnd(queue, hwnd, &invalid, nullptr, nullptr, &rejected);
+        if (rejected) {
+            rejected->Release();
+            return fail("CreateSwapChainForHwnd returned a swapchain for an invalid sample description");
+        }
+        if (hr != DXGI_ERROR_INVALID_CALL) return fail("CreateSwapChainForHwnd invalid sample description HRESULT");
     }
 
     IDXGISwapChain1* sc1 = nullptr;
@@ -458,6 +479,9 @@ int main() {
 
     // Frame 2: ResizeBuffers to explicit 37x19 on the unchanged 128x128 HWND, clear to green, read back all 703 pixels, Present.
     if (FAILED(sc->ResizeBuffers(2, 37, 19, DXGI_FORMAT_UNKNOWN, 0))) return fail("ResizeBuffers");
+    DXGI_SWAP_CHAIN_DESC1 preserved_format{};
+    if (FAILED(sc->GetDesc1(&preserved_format)) || preserved_format.Format != scd.Format)
+        return fail("ResizeBuffers with DXGI_FORMAT_UNKNOWN changed the format");
     const float green[4] = {0.0f, 1.0f, 0.0f, 1.0f};
     if (run_clear_readback_present(37, 19, green, 0, 255, 0) != 0) return 1;
 
@@ -618,9 +642,28 @@ int main() {
             return fail("GetRotation(nullptr) should return E_INVALIDARG");
     }
 
-    // Unsupported swapchain format must fail explicitly instead of silently downgrading to BGRA8.
-    if (sc->ResizeBuffers(2, 37, 19, DXGI_FORMAT_R32_UINT, 0) != DXGI_ERROR_UNSUPPORTED)
-        return fail("ResizeBuffers should reject unsupported format DXGI_FORMAT_R32_UINT");
+    constexpr DXGI_FORMAT invalid_formats[] = {
+        DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+        DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R32_UINT,
+    };
+    {
+        DXGI_SWAP_CHAIN_DESC1 before{}, after{};
+        if (FAILED(sc->GetDesc1(&before))) return fail("GetDesc1 before invalid formats");
+        const UINT node_masks[2] = {1, 1};
+        IUnknown* const present_queues[2] = {queue, queue};
+        for (DXGI_FORMAT format : invalid_formats) {
+            if (sc->ResizeBuffers(2, 64, 64, format, 0) != E_INVALIDARG ||
+                sc->ResizeBuffers1(2, 64, 64, format, 0, node_masks, present_queues) != E_INVALIDARG)
+                return fail("ResizeBuffers and ResizeBuffers1 should reject invalid flip-model formats");
+        }
+        if (FAILED(sc->GetDesc1(&after)) || after.Format != before.Format || after.BufferCount != before.BufferCount ||
+            after.Width != before.Width || after.Height != before.Height)
+            return fail("Invalid format changed the existing swapchain");
+        ID3D12Resource* buffer = nullptr;
+        if (FAILED(sc->GetBuffer(sc->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&buffer))) || !buffer)
+            return fail("GetBuffer after invalid swapchain formats");
+        buffer->Release();
+    }
 
     // Measured on host DXGI (RTX 5070 and WARP): DXGI_PRESENT_TEST returns S_OK without presenting, so the back
     // buffer index and last present count stay; a sync interval above 4 is DXGI_ERROR_INVALID_CALL and presents nothing.
@@ -798,6 +841,21 @@ int main() {
         HWND hwnd2 = create_test_window(200, 150);
         if (!hwnd2) return fail("CreateWindowExW (second)");
         GetClientRect(hwnd2, &cr);
+        const auto rejects_creation_format = [&](DXGI_FORMAT format) {
+            DXGI_SWAP_CHAIN_DESC1 invalid = scd;
+            invalid.Format = format;
+            IDXGISwapChain1* rejected = nullptr;
+            const HRESULT hr = factory->CreateSwapChainForHwnd(queue, hwnd2, &invalid, nullptr, nullptr, &rejected);
+            if (rejected) {
+                rejected->Release();
+                return false;
+            }
+            return hr == DXGI_ERROR_INVALID_CALL;
+        };
+        if (!rejects_creation_format(DXGI_FORMAT_UNKNOWN))
+            return fail("CreateSwapChainForHwnd accepted DXGI_FORMAT_UNKNOWN");
+        for (DXGI_FORMAT format : invalid_formats)
+            if (!rejects_creation_format(format)) return fail("CreateSwapChainForHwnd invalid flip-model format");
         DXGI_SWAP_CHAIN_DESC1 zd = scd;
         zd.Width = 0;
         zd.Height = 0;
@@ -965,6 +1023,18 @@ int main() {
             return fail("CreateWindowExW (fourth)");
         }
         mock_cw->window_handle = hwnd4;
+        for (const auto& samples : invalid_samples) {
+            DXGI_SWAP_CHAIN_DESC1 invalid = scd;
+            invalid.SampleDesc = samples;
+            IDXGISwapChain1* rejected = nullptr;
+            const HRESULT hr = factory->CreateSwapChainForCoreWindow(queue, mock_cw, &invalid, nullptr, &rejected);
+            if (rejected || hr != DXGI_ERROR_INVALID_CALL) {
+                if (rejected) rejected->Release();
+                mock_cw->Release();
+                DestroyWindow(hwnd4);
+                return fail("CreateSwapChainForCoreWindow should reject invalid sample descriptions");
+            }
+        }
         IDXGISwapChain1* cw_sc1 = nullptr;
         if (FAILED(factory->CreateSwapChainForCoreWindow(queue, mock_cw, &scd, nullptr, &cw_sc1)) || !cw_sc1) {
             mock_cw->Release();
@@ -980,7 +1050,8 @@ int main() {
         }
         cw_sc1->Release();
         DXGI_SWAP_CHAIN_DESC1 cw_desc{};
-        if (FAILED(cw_sc->GetDesc1(&cw_desc)) || cw_desc.Width != scd.Width || cw_desc.Height != scd.Height) {
+        if (FAILED(cw_sc->GetDesc1(&cw_desc)) || cw_desc.Width != scd.Width || cw_desc.Height != scd.Height ||
+            cw_desc.SampleDesc.Count != 1 || cw_desc.SampleDesc.Quality != 0) {
             cw_sc->Release();
             mock_cw->Release();
             DestroyWindow(hwnd4);

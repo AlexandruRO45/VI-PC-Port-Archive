@@ -318,6 +318,8 @@ int main() {
         info.bindless_partially_bound = d.partially_bound;
         info.image_view_min_lod = d.image_view_min_lod;
         info.sampler_filter_minmax = d.sampler_filter_minmax;
+        info.custom_border_color = d.custom_border_color;
+        info.custom_border_color_without_format = d.custom_border_color_without_format;
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
@@ -698,6 +700,42 @@ int main() {
         const auto null_at = [&](UINT i) {
             return std::all_of(view_bytes(i), view_bytes(i) + step, [](std::uint8_t byte) { return byte == 0; });
         };
+        // An explicit D3D12_SRV_DIMENSION_TEXTURE1D view on a 1D texture array selects layer zero (like TEXTURE2D
+        // and TEXTURE2DMS on 2D arrays), while a default (nullptr) SRV on a 1D array remains a null descriptor.
+        {
+            auto line_array_desc = line_desc;
+            line_array_desc.DepthOrArraySize = 3;
+            Ref<ID3D12Resource> line_array;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &line_array_desc,
+                                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                             IID_PPV_ARGS(&line_array.p))));
+            D3D12_DESCRIPTOR_HEAP_DESC la_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
+                                                    D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            Ref<ID3D12DescriptorHeap> la_heap;
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&la_heap_desc, IID_PPV_ARGS(&la_heap.p))));
+            const std::uint64_t la_cpu = reinterpret_cast<XboxHeapHandleFn>(slot(la_heap.p, 9))(la_heap.p);
+            const D3D12_CPU_DESCRIPTOR_HANDLE la_default{SIZE_T(la_cpu)}, la_slice0{SIZE_T(la_cpu + step)};
+            std::memset(reinterpret_cast<void*>(la_default.ptr), 0x77, step);
+            device->CreateShaderResourceView(line_array.p, nullptr, la_default);
+            EXPECT(std::all_of(reinterpret_cast<const std::uint8_t*>(la_default.ptr),
+                               reinterpret_cast<const std::uint8_t*>(la_default.ptr) + step,
+                               [](std::uint8_t byte) { return byte == 0; }));
+            D3D12_SHADER_RESOURCE_VIEW_DESC la_view{};
+            la_view.Format = DXGI_FORMAT_UNKNOWN;
+            la_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+            la_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            la_view.Texture1D = {1, 1, 0};
+            device->CreateShaderResourceView(line_array.p, &la_view, la_slice0);
+            g::ImageWords la_words{};
+            std::memcpy(la_words.data(), reinterpret_cast<const void*>(la_slice0.ptr), sizeof(la_words));
+            g::Image la_image{};
+            EXPECT(g::is_image(la_words) && g::decode(la_words, la_image) &&
+                   la_image.type == g::ImageType::image_1d && la_image.first_mip == 1 && la_image.mip_count == 1 &&
+                   la_image.first_layer == 0 && la_image.layer_count == 1);
+            std::uint32_t la_key[8]{};
+            std::memcpy(la_key, la_words.data(), sizeof(la_key));
+            EXPECT(rt::d3d12::bindless_hash_lookup(device.p, la_key) != 0);
+        }
         D3D12_RESOURCE_DESC ms_desc = texture_desc;
         ms_desc.Width = ms_desc.Height = 4;
         ms_desc.SampleDesc.Count = 4;
@@ -1980,10 +2018,22 @@ int main() {
         };
         constexpr PackedFormat packed_formats[] = {
             {DXGI_FORMAT_B4G4R4A4_UNORM, VK_FORMAT_A4R4G4B4_UNORM_PACK16, "B4G4R4A4"},
+            {DXGI_FORMAT_A4B4G4R4_UNORM, VK_FORMAT_R4G4B4A4_UNORM_PACK16, "A4B4G4R4"},
             {DXGI_FORMAT_B5G5R5A1_UNORM, VK_FORMAT_A1R5G5B5_UNORM_PACK16, "B5G5R5A1"}
         };
         UINT64 packed_signal = 2;
         for (const auto& format : packed_formats) {
+            // Vulkan requires sampling A4R4G4B4 (1.3) and A1R5G5B5 but not R4G4B4A4: skip A4B4G4R4 where the Vulkan
+            // driver can't sample it (the driver's answer, not the layer's, so a dropped mapping still fails).
+            if (format.dxgi == DXGI_FORMAT_A4B4G4R4_UNORM) {
+                VkFormatProperties props{};
+                d.instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties")(
+                    d.physical, format.vk, &props);
+                if (!(props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
+                    std::printf("%s: the Vulkan driver can't sample it, skipped\n", format.name);
+                    continue;
+                }
+            }
             D3D12_RESOURCE_DESC format_desc = texture_desc;
             format_desc.Format = format.dxgi;
             Ref<ID3D12Resource> format_texture;
@@ -2010,7 +2060,10 @@ int main() {
                         rgba = b5_rgba[i];
                     } else {
                         const UINT r = x, g = y + 8, b = (x + y) & 15, a = 15 - x;
-                        word = std::uint16_t(b | (g << 4) | (r << 8) | (a << 12));
+                        // B4G4R4A4 keeps blue in bits 0-3 and alpha in 12-15, A4B4G4R4 alpha in 0-3 and red in 12-15.
+                        word = format.dxgi == DXGI_FORMAT_A4B4G4R4_UNORM
+                                   ? std::uint16_t(a | (b << 4) | (g << 8) | (r << 12))
+                                   : std::uint16_t(b | (g << 4) | (r << 8) | (a << 12));
                         rgba = {std::uint8_t(r * 17), std::uint8_t(g * 17), std::uint8_t(b * 17), std::uint8_t(a * 17)};
                     }
                     std::memcpy(static_cast<std::uint8_t*>(mapped) + format_footprint.Offset +
@@ -2039,6 +2092,7 @@ int main() {
             EXPECT(image_at(null_slot, packed_image));
             EXPECT(packed_image.format == g::format_from_vulkan(format.vk) && packed_image.format != 0);
             if (format.dxgi == DXGI_FORMAT_B5G5R5A1_UNORM) EXPECT(packed_image.swizzle == g::channels_bgra);
+            if (format.dxgi == DXGI_FORMAT_A4B4G4R4_UNORM) EXPECT(packed_image.swizzle == g::channels_abgr);
 #ifdef LEONIDA_TEST_CS_SAMPLE_SPV
             SampleKeys packed_keys{};
             std::memcpy(packed_keys.tsharp, view_bytes(null_slot), sizeof(packed_keys.tsharp));

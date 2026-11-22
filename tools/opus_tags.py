@@ -4,8 +4,9 @@ awc_opus.py writes <out>/<bank>/<stream id>.ogg with an empty OpusTags header. T
 from two local work products:
 
 ``--names``     awc_names.py CSV (source, bank, stream_id, name, rule). A file is matched by its stream id (the file
-                name; awc_opus.py's ``<id>~2.ogg`` for a second stream with the same id gets the same name) and its bank (the folder path below the Opus folder; if that has no match, the path with its
-                leading folders removed one at a time, so the Opus folder may hold several archives' outputs).
+                name; awc_opus.py's ``<id>~2.ogg`` for a second stream with the same id gets the same name) and its
+                bank (the folder path below the Opus folder; if that has no match, the path with its leading folders
+                removed one at a time, so the Opus folder may hold several archives' outputs).
 ``--dialogue``  text_tables.py dialogue CSV (wave, key, label, speaker, text_<lang> ...). A named stream whose name is
                 a dialogue wave gets that line's label, speaker and subtitles.
 
@@ -91,13 +92,17 @@ def retag(data: bytes, packet: bytes) -> bytes:
 
 
 def load_names(path, source=None):
-    """{bank label: {29-bit stream id: name}} from awc_names.py CSV."""
+    """{bank label: {29-bit stream id: name}} from awc_names.py CSV. A bank read from an audio_manifest.json is
+    labelled with its archive path, ".awc" included; that is dropped so it matches awc_opus.py's folder."""
     out = collections.defaultdict(dict)
     with open(path, encoding="utf-8", newline="") as fh:
         for row in csv.DictReader(fh):
             if source and row.get("source") != source:
                 continue
-            out[row["bank"].replace("\\", "/")][int(row["stream_id"], 16) & 0x1FFFFFFF] = row["name"]
+            bank = row["bank"].replace("\\", "/")
+            if bank.lower().endswith(".awc"):
+                bank = bank[:-4]
+            out[bank][int(row["stream_id"], 16) & 0x1FFFFFFF] = row["name"]
     return dict(out)
 
 
