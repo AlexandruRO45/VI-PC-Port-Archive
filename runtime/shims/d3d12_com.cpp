@@ -818,48 +818,30 @@ public:
     void STDMETHODCALLTYPE ExecuteIndirect(ID3D12CommandSignature* signature, UINT max_command_count,
                                            ID3D12Resource* argument_buffer, UINT64 argument_buffer_offset,
                                            ID3D12Resource* count_buffer, UINT64 count_buffer_offset) override {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        // Checked as the application calls it, on a bundle too (Windows validates at recording, so a bad call fails
+        // the bundle's own Close), whatever the parent has bound.
         leonida::IndirectKind kind = leonida::IndirectKind::draw;
         UINT stride = 0;
-        if (!command_signature_info(signature, kind, stride) || !argument_buffer)
+        if (!validate_execute_indirect(signature, max_command_count, argument_buffer, argument_buffer_offset,
+                                       count_buffer, count_buffer_offset, kind, stride))
             return check(false);
-        const auto arg_desc = argument_buffer->GetDesc();
-        if (arg_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || argument_buffer_offset % 4 != 0)
-            return check(false);
-        if (count_buffer) {
-            const auto count_desc = count_buffer->GetDesc();
-            if (count_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || count_buffer_offset % 4 != 0 ||
-                count_desc.Width < sizeof(UINT) || count_buffer_offset > count_desc.Width - sizeof(UINT))
-                return check(false);
-        } else if (count_buffer_offset != 0) {
-            return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
+            // A count buffer is refused: the default adapter and WARP both fail the bundle's Close with one
+            // (d3d12_bundle_test). The pipeline and root signature a dispatch needs are the parent's, so those are
+            // checked when the bundle plays. The held signature and argument buffer are unchanged then, so the
+            // playback does not validate again.
+            if (count_buffer) return check(false);
+            if (defer([=](GraphicsCommandList& l) {
+                    l.record_execute_indirect(kind, stride, max_command_count, argument_buffer,
+                                              argument_buffer_offset, nullptr, 0);
+                }, true)) {
+                hold(signature);
+                hold(argument_buffer);
+                return;
+            }
         }
-        if (max_command_count) {
-            const UINT64 record_size =
-                kind == leonida::IndirectKind::draw ? sizeof(D3D12_DRAW_ARGUMENTS)
-                : kind == leonida::IndirectKind::draw_indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS)
-                : kind == leonida::IndirectKind::dispatch ? sizeof(D3D12_DISPATCH_ARGUMENTS)
-                : 0;
-            if (!record_size || stride < record_size || stride % 4 != 0)
-                return check(false);
-            const UINT64 required = UINT64(max_command_count - 1) * stride + record_size;
-            if (argument_buffer_offset > arg_desc.Width || arg_desc.Width - argument_buffer_offset < required)
-                return check(false);
-        }
-        leonida::ExecuteIndirect cmd{};
-        cmd.kind = kind;
-        cmd.stride = stride;
-        cmd.max_count = max_command_count;
-        cmd.argument_buffer = resource_id(argument_buffer);
-        cmd.argument_offset = argument_buffer_offset;
-        cmd.count_buffer = count_buffer ? resource_id(count_buffer) : 0;
-        cmd.count_offset = count_buffer ? count_buffer_offset : 0;
-        if (kind == leonida::IndirectKind::dispatch && max_command_count) {  // the pipeline and root arguments a Dispatch would record
-            if (!compute_pipeline_ || !compute_.layout) return check(false);
-            cmd.pipeline = compute_pipeline_;
-            cmd.user_data = compute_.data;
-        }
-        check(list_.execute_indirect(cmd));
+        record_execute_indirect(kind, stride, max_command_count, argument_buffer, argument_buffer_offset,
+                                count_buffer, count_buffer_offset);
     }
 
     void STDMETHODCALLTYPE BuildRaytracingAccelerationStructure(
@@ -1402,6 +1384,59 @@ private:
             draw_views_stale_ = false;
         }
         return draw_views_;
+    }
+
+    // What the runtime checks when ExecuteIndirect is recorded: the signature, the buffers and offsets, and that
+    // max_command_count records of the signature's stride fit the argument buffer.
+    bool validate_execute_indirect(ID3D12CommandSignature* signature, UINT max_command_count,
+                                   ID3D12Resource* argument_buffer, UINT64 argument_buffer_offset,
+                                   ID3D12Resource* count_buffer, UINT64 count_buffer_offset,
+                                   leonida::IndirectKind& kind, UINT& stride) {
+        if (!command_signature_info(signature, kind, stride) || !argument_buffer)
+            return false;
+        const auto arg_desc = argument_buffer->GetDesc();
+        if (arg_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || argument_buffer_offset % 4 != 0)
+            return false;
+        if (count_buffer) {
+            const auto count_desc = count_buffer->GetDesc();
+            if (count_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || count_buffer_offset % 4 != 0 ||
+                count_desc.Width < sizeof(UINT) || count_buffer_offset > count_desc.Width - sizeof(UINT))
+                return false;
+        } else if (count_buffer_offset != 0) {
+            return false;
+        }
+        if (max_command_count) {
+            const UINT64 record_size =
+                kind == leonida::IndirectKind::draw ? sizeof(D3D12_DRAW_ARGUMENTS)
+                : kind == leonida::IndirectKind::draw_indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS)
+                : kind == leonida::IndirectKind::dispatch ? sizeof(D3D12_DISPATCH_ARGUMENTS)
+                : 0;
+            if (!record_size || stride < record_size || stride % 4 != 0)
+                return false;
+            const UINT64 required = UINT64(max_command_count - 1) * stride + record_size;
+            if (argument_buffer_offset > arg_desc.Width || arg_desc.Width - argument_buffer_offset < required)
+                return false;
+        }
+        return true;
+    }
+
+    void record_execute_indirect(leonida::IndirectKind kind, UINT stride, UINT max_command_count,
+                                 ID3D12Resource* argument_buffer, UINT64 argument_buffer_offset,
+                                 ID3D12Resource* count_buffer, UINT64 count_buffer_offset) {
+        leonida::ExecuteIndirect cmd{};
+        cmd.kind = kind;
+        cmd.stride = stride;
+        cmd.max_count = max_command_count;
+        cmd.argument_buffer = resource_id(argument_buffer);
+        cmd.argument_offset = argument_buffer_offset;
+        cmd.count_buffer = count_buffer ? resource_id(count_buffer) : 0;
+        cmd.count_offset = count_buffer ? count_buffer_offset : 0;
+        if (kind == leonida::IndirectKind::dispatch && max_command_count) {  // the pipeline and root arguments a Dispatch would record
+            if (!compute_pipeline_ || !compute_.layout) return check(false);
+            cmd.pipeline = compute_pipeline_;
+            cmd.user_data = compute_.data;
+        }
+        check(list_.execute_indirect(cmd));
     }
 
     // A draw needs a graphics pipeline, a graphics root signature and a topology.
