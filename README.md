@@ -62,7 +62,10 @@ work on booting can start as soon as one is available to a developer.
 The table above is written by hand. To measure it on your own checkout (unit and runtime tests, which rows of
 the translator contract were confirmed on a GPU, measured imports, your corpus counts and, with `--github`, CI
 and the `D3D-` items), run `python -I tools/progress_dashboard.py --out <folder outside the repo>` and open
-`progress.html` ([notes](docs/progress_dashboard.md)).
+`progress.html` ([notes](docs/progress_dashboard.md)). The picture below is one such run, drawn by the same tool
+with `--svg docs/progress.svg`: one cell per unit, coloured by status; its footer names the commit and the date.
+
+![Progress by panel: unit tests, translator contract, runtime imports, shader corpus, pull requests into main and D3D12 items](docs/progress.svg)
 
 
 ## Platforms

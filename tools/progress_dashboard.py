@@ -29,6 +29,7 @@ import base64
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -900,6 +901,180 @@ def render_page(snap, history):
     return template.replace("/*__PROGRESS_LOGO__*/", logo_src()).replace("/*__PROGRESS_DATA__*/null", payload)
 
 
+# ----------------------------------------------------------------------------------------------- svg
+# A static picture of the same panels for a README: one treemap per panel, groups by squarified layout, one cell per
+# unit coloured by status (a weighted panel such as the corpus draws areas instead). It carries panel titles, group
+# names, counts and ratios only, no component names or details, and nothing from the machine except the commit.
+SVG_COLORS = {"verified": "#2fa84f", "implemented": "#3d8bfd", "partial": "#e3b11a", "failed": "#e5484d",
+              "blocked": "#a37ef5", "missing": "#7c828c", "unknown": "#454b55"}
+SVG_ORDER = {s: i for i, s in enumerate(("verified", "implemented", "partial", "failed", "blocked", "missing", "unknown"))}
+SVG_W, SVG_PAD, SVG_HEAD, SVG_GROUP_HEAD = 820, 10, 22, 13
+SVG_SKIP = {"ci"}   # a handful of cells that change with every run; the page shows them
+
+
+def squarify(items, x, y, w, h):
+    """Squarified treemap (Bruls et al.), the page's layout: items are dicts with "value"; adds x, y, w, h."""
+    total = sum(i["value"] for i in items)
+    if not total or w <= 0 or h <= 0:
+        return
+    scale = w * h / total
+    rest = sorted(items, key=lambda i: -i["value"])
+    row = []
+
+    def worst(r, side):
+        s = sum(i["value"] * scale for i in r)
+        big, small = max(i["value"] * scale for i in r), min(i["value"] * scale for i in r)
+        return max(side * side * big / (s * s), s * s / (side * side * small))
+
+    while rest:
+        side = min(w, h)
+        if not row or worst(row + [rest[0]], side) <= worst(row, side):
+            row.append(rest.pop(0))
+            continue
+        x, y, w, h = _place(row, scale, x, y, w, h)
+        row = []
+    if row:
+        _place(row, scale, x, y, w, h)
+
+
+def _place(row, scale, x, y, w, h):
+    s = sum(i["value"] * scale for i in row)
+    if w >= h:
+        cw, cy = s / h, y
+        for i in row:
+            ch = i["value"] * scale / cw
+            i.update(x=x, y=cy, w=cw, h=ch)
+            cy += ch
+        return x + cw, y, w - cw, h
+    ch, cx = s / w, x
+    for i in row:
+        cw = i["value"] * scale / ch
+        i.update(x=cx, y=y, w=cw, h=ch)
+        cx += cw
+    return x, y + ch, w, h - ch
+
+
+def fit_grid(n, w, h):
+    """Columns and square cell size that fit n cells in w x h, largest cell first."""
+    if n <= 0 or w <= 0 or h <= 0:
+        return 1, 0.0
+    guess = max(1, round(w / math.sqrt(w * h / n)))
+    best = (1, 0.0)
+    for cols in range(max(1, min(n, guess - 4)), max(1, min(n, guess + 4)) + 1):
+        size = min(w / cols, h / math.ceil(n / cols))
+        if size > best[1]:
+            best = (cols, size)
+    return best
+
+
+def _xml(s):
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _fit_label(text, width, char_w=6.0):
+    n = int((width - 4) // char_w)
+    return "" if n < 2 else text if len(text) <= n else text[:n - 1] + "…"
+
+
+def _n(v):
+    return f"{v:.1f}".rstrip("0").rstrip(".")
+
+
+def svg_panel_height(units, weighted):
+    if weighted:
+        return 150
+    return int(min(330, max(70, 40 + 8.5 * math.sqrt(units))))
+
+
+def render_svg(snap):
+    """The panels of a snapshot as one SVG; returns the text. Deterministic for a given snapshot."""
+    parts, defs = [], []
+    y = SVG_PAD
+    inner = SVG_W - 2 * SVG_PAD
+    present = set()
+    for p in snap["panels"]:
+        comps = [c for c in snap["components"] if c["panel"] == p["id"]]
+        if not comps or p["id"] in SVG_SKIP:
+            continue
+        weighted = bool(p.get("weighted"))
+        head = next((m for m in snap["metrics"] if m["panel"] == p["id"]), None)
+        ratio = "" if head is None or head["value"] is None else \
+            f": {head['value'] * 100:.2f}% ({head['numerator']:,}/{head['denominator']:,})"
+        parts.append(f'<text x="{SVG_PAD + 2}" y="{y + 15}" class="h">{_xml(p["title"] + ratio)}</text>')
+        y += SVG_HEAD
+        th = svg_panel_height(len(comps), weighted)
+        groups = {}
+        for c in comps:
+            groups.setdefault(c["group"], []).append(c)
+        unit = (lambda c: c.get("weight") or 1) if weighted else (lambda c: 1)
+        total = sum(unit(c) for c in comps)
+        items = [{"name": g, "list": sorted(lst, key=lambda c: (SVG_ORDER[c["status"]], str(c.get("name", "")))),
+                  "value": sum(unit(c) for c in lst) + total * 0.015} for g, lst in groups.items()]
+        squarify(items, SVG_PAD, y, inner, th)
+        for gi, g in enumerate(sorted(items, key=lambda i: (i["y"], i["x"]))):
+            gx, gy, gw, gh = g["x"], g["y"], g["w"], g["h"]
+            count = sum(unit(c) for c in g["list"]) if weighted else len(g["list"])
+            parts.append(f'<rect x="{_n(gx)}" y="{_n(gy)}" width="{_n(gw)}" height="{_n(gh)}" class="g"/>')
+            label = _fit_label(f"{g['name']} {count:,}", gw)
+            if label and gh > SVG_GROUP_HEAD + 4:
+                parts.append(f'<text x="{_n(gx + 3)}" y="{_n(gy + 10)}" class="l">{_xml(label)}</text>')
+            ix, iy = gx + 2, gy + SVG_GROUP_HEAD
+            iw, ih = max(0.0, gw - 4), max(0.0, gh - SVG_GROUP_HEAD - 2)
+            for c in g["list"]:
+                present.add(c["status"])
+            if weighted:
+                sub = [{"status": c["status"], "value": unit(c)} for c in g["list"]]
+                squarify(sub, ix, iy, iw, ih)
+                for s in sub:
+                    if "x" in s:
+                        parts.append(f'<rect x="{_n(s["x"])}" y="{_n(s["y"])}" width="{_n(max(0, s["w"] - 1))}" '
+                                     f'height="{_n(max(0, s["h"] - 1))}" fill="{SVG_COLORS[s["status"]]}"/>')
+                continue
+            cols, size = fit_grid(len(g["list"]), iw, ih)
+            if size <= 0:
+                continue
+            # one rectangle per run of a status within a row; a pattern then draws the cell edges over them
+            statuses = [c["status"] for c in g["list"]]
+            for r in range(math.ceil(len(statuses) / cols)):
+                row = statuses[r * cols:(r + 1) * cols]
+                start = 0
+                for k in range(1, len(row) + 1):
+                    if k == len(row) or row[k] != row[start]:
+                        parts.append(f'<rect x="{_n(ix + start * size)}" y="{_n(iy + r * size)}" '
+                                     f'width="{_n((k - start) * size)}" height="{_n(size)}" fill="{SVG_COLORS[row[start]]}"/>')
+                        start = k
+            if size >= 3:
+                pid = f"c{p['id']}{gi}"
+                defs.append(f'<pattern id="{pid}" x="{_n(ix)}" y="{_n(iy)}" width="{_n(size)}" height="{_n(size)}" '
+                            f'patternUnits="userSpaceOnUse"><path d="M{_n(size)} 0V{_n(size)}H0" class="e"/></pattern>')
+                rows = math.ceil(len(statuses) / cols)
+                parts.append(f'<rect x="{_n(ix)}" y="{_n(iy)}" width="{_n(cols * size)}" height="{_n(rows * size)}" '
+                             f'fill="url(#{pid})"/>')
+        y += th + 12
+    # legend and footer
+    lx = SVG_PAD + 2
+    for s in sorted(present, key=SVG_ORDER.get):
+        parts.append(f'<rect x="{lx}" y="{y}" width="10" height="10" fill="{SVG_COLORS[s]}"/>'
+                     f'<text x="{lx + 14}" y="{y + 9}" class="l">{s}</text>')
+        lx += 22 + 6 * len(s) + 12
+    y += 26
+    head = (snap.get("git") or {}).get("head") or ""
+    foot = f"tools/progress_dashboard.py · {snap['generated_at'][:10]}" + (f" · {head[:8]}" if head else "")
+    parts.append(f'<text x="{SVG_PAD + 2}" y="{y}" class="f">{_xml(foot)}</text>')
+    height = y + SVG_PAD
+    style = ("text{font-family:ui-monospace,SFMono-Regular,Consolas,Menlo,monospace}"
+             ".h{font-size:12px;font-weight:600;fill:#e6edf3}.l{font-size:9.5px;fill:#c9d1d9}.f{font-size:9.5px;fill:#8b949e}"
+             ".g{fill:#0d1117;stroke:#30363d;stroke-width:1}.e{fill:none;stroke:#0d1117;stroke-width:1}")
+    return "".join([
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{SVG_W}" height="{_n(height)}" viewBox="0 0 {SVG_W} {_n(height)}" '
+        f'role="img" aria-labelledby="t">',
+        f'<title id="t">Project progress: one treemap per panel, one cell per unit coloured by status</title>',
+        f"<style>{style}</style>",
+        "<defs>" + "".join(defs) + "</defs>" if defs else "",
+        f'<rect width="{SVG_W}" height="{_n(height)}" rx="6" fill="#161b22" stroke="#30363d"/>',
+        *parts, "</svg>\n"])
+
+
 def write_outputs(snap, out_dir):
     os.makedirs(os.path.join(out_dir, "snapshots"), exist_ok=True)
     hist_path = os.path.join(out_dir, "history.json")
@@ -928,6 +1103,8 @@ def main(argv=None):
     ap.add_argument("--github", action="store_true", help="read pull requests into main, CI runs, #313 and the coordination issue through gh")
     ap.add_argument("--repo", default=DEFAULT_REPO, help=f"GitHub repository (default {DEFAULT_REPO})")
     ap.add_argument("--login", help="with --github, show this account's claims and pull requests")
+    ap.add_argument("--svg", metavar="FILE", help="also write the panels as one static SVG (for a README); it holds titles, "
+                                                  "group names and counts only, and may be written inside the repository")
     args = ap.parse_args(argv)
     out_dir = os.path.abspath(args.out)
     if inside(out_dir, ROOT):
@@ -939,6 +1116,10 @@ def main(argv=None):
     os.makedirs(out_dir, exist_ok=True)
     snap = build(args, out_dir)
     new = write_outputs(snap, out_dir)
+    if args.svg:
+        svg = os.path.abspath(args.svg)
+        os.makedirs(os.path.dirname(svg), exist_ok=True)
+        save_text(svg, render_svg(snap))
     n = len(snap["components"])
     print(f"{n} units, {len(snap['metrics'])} metrics -> {os.path.join(out_dir, 'progress.html')}"
           + ("" if new else " (no change since the last snapshot)"))

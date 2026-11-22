@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -270,6 +271,44 @@ class Outputs(unittest.TestCase):
     def test_script_element_cannot_be_closed_by_data(self):
         snap = {"schema": pd.SCHEMA, "x": "</script><b>"}
         self.assertNotIn("</script><b>", pd.render_page(snap, []))
+
+
+
+class Svg(unittest.TestCase):
+    def snapshot(self):
+        col = pd.Collector()
+        col.panel("contract", "Translator contract", "rows")
+        for i in range(30):
+            col.add(f"c{i}", "contract", "GPU-checked" if i < 20 else "CPU test only",
+                    f"{SENTINEL}_row_{i}", "verified" if i < 20 else "implemented", detail=f"{SENTINEL} detail <b>&")
+        col.metric("contract.gpu", "contract", "Rows confirmed on a GPU", 20, 30, "rows / all rows")
+        col.panel("corpus", "Shader corpus", "shaders", weighted=True)
+        col.add("k1", "corpus", "ps", "ps: pass", "implemented", weight=1200)
+        col.add("k2", "corpus", "ps", "ps: fail", "failed", weight=3)
+        col.panel("ci", "CI on main", "workflows")
+        col.add("ci1", "ci", "latest", "ci", "failed")
+        return {"generated_at": "2026-01-02T03:04:05Z", "git": {"head": "0123456789abcdef"}, "panels": list(col.panels.values()),
+                "components": col.components, "metrics": col.metrics}
+
+    def test_well_formed_with_ratios_and_no_unit_names(self):
+        svg = pd.render_svg(self.snapshot())
+        root = ET.fromstring(svg)
+        self.assertTrue(root.tag.endswith("svg"))
+        text = " ".join(t.text or "" for t in root.iter() if t.tag.endswith("text"))
+        self.assertIn("Translator contract: 66.67% (20/30)", text)
+        self.assertIn("GPU-checked 20", text)
+        self.assertIn("ps 1,203", text)            # a weighted panel counts its weights
+        self.assertNotIn(SENTINEL, svg)            # names and details never reach the picture
+        self.assertNotIn("CI on main", text)       # left to the page
+        self.assertIn("0123456789"[:8], text)
+
+    def test_deterministic_and_one_rectangle_per_status_run(self):
+        snap = self.snapshot()
+        svg = pd.render_svg(snap)
+        self.assertEqual(svg, pd.render_svg(snap))
+        root = ET.fromstring(svg)
+        fills = [r.get("fill") for r in root.iter() if r.tag.endswith("rect") and r.get("fill") == pd.SVG_COLORS["verified"]]
+        self.assertLess(len(fills), 20)            # 20 verified cells in a few row runs, not 20 rectangles
 
 
 if __name__ == "__main__":

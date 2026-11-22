@@ -55,6 +55,16 @@ wrong class is visible and the rule list in the tool (`CONFIRMATION`) can be cor
 Each metric is a ratio with its numerator, denominator and formula on the page. There is no overall percentage: the
 panels count different things. The trend chart breaks a line where a metric's formula changed between snapshots.
 
+## A picture for the README
+
+`--svg <file>` also writes the panels as one static SVG, the picture in the README ([`docs/progress.svg`](progress.svg)):
+one treemap per panel, groups laid out as on the page, one cell per unit coloured by status (the corpus panel draws
+areas by count), with the panel's first ratio in its title and the commit and date in the footer. It holds panel
+titles, group names and counts only, never a unit's name or detail, so it is the one output that may be written
+inside the repository. CI on main is left out: a handful of cells that change with every run. To refresh it, run the
+tool with the same options as the page plus `--svg docs/progress.svg`; the picture shows that run, including its
+unit-test outcome and, with `--work`, your corpus counts.
+
 ## No game data
 
 The page and the JSON carry counts, pass/fail, error classes and the project's own document text. The corpus panel
