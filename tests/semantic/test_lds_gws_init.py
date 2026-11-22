@@ -1031,5 +1031,164 @@ class TestIEEE754BoundaryExtremesAndNaNHandling(unittest.TestCase):
         self.assertEqual(state.gws.read_resource(40), self.F32_CUSTOM_NAN_PAYLOAD)
 
 
+class TestNegativeControlsSyntaxRejectionAndMutations(unittest.TestCase):
+    """Phase 8: Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_negative_and_out_of_bounds_registers(self) -> None:
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.VGPR)
+
+        with self.assertRaises(ValueError):
+            RegisterOperand(256, RegType.VGPR)
+
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.SGPR)
+
+        with self.assertRaises(ValueError):
+            RegisterOperand(106, RegType.SGPR)
+
+    def test_syntax_rejection_sgpr_as_vdata0(self) -> None:
+        s0 = RegisterOperand(0, RegType.SGPR)
+        with self.assertRaises(ValueError):
+            DSGWSInitInstruction(vdata0=s0, offset=0, gds=True)
+
+    def test_syntax_rejection_invalid_offset_bounds(self) -> None:
+        v0 = RegisterOperand(0, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            DSGWSInitInstruction(vdata0=v0, offset=-1, gds=True)
+
+        with self.assertRaises(ValueError):
+            DSGWSInitInstruction(vdata0=v0, offset=0x10000, gds=True)
+
+    def test_syntax_rejection_missing_mandatory_gds(self) -> None:
+        v0 = RegisterOperand(0, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            DSGWSInitInstruction(vdata0=v0, offset=0, gds=False)
+
+    def test_invalid_simd_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=48)
+
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_invalid_gws_memory_size(self) -> None:
+        with self.assertRaises(ValueError):
+            GWSMemory(num_resources=0)
+
+        with self.assertRaises(ValueError):
+            GWSMemory(num_resources=-1)
+
+        with self.assertRaises(ValueError):
+            GWSMemory(num_resources=48)  # Not a power of two
+
+    def test_mutation_detection_last_active_lane_elected(self) -> None:
+        # Reference behavior: lane 0 elected.
+        # Mutant: erroneously elects the highest active lane (lane 31).
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFFFFFF)
+        interp = SIMDInterpreter()
+
+        state.set_lane_vgpr(0, 5, 0x1111)
+        state.set_lane_vgpr(31, 5, 0x9999)
+
+        instr = DSGWSInitInstruction(vdata0=RegisterOperand(5, RegType.VGPR), offset=1)
+        res = interp.execute(instr, state)
+        self.assertIsNotNone(res)
+        first_lane, _, val = res  # type: ignore
+
+        # Reference must choose lane 0 and 0x1111
+        self.assertEqual(first_lane, 0)
+        self.assertEqual(val, 0x1111)
+
+        # Mutant behavior check
+        mutant_last_lane = 31
+        mutant_val = state.get_lane_vgpr(mutant_last_lane, 5)
+        self.assertNotEqual(mutant_last_lane, first_lane)
+        self.assertNotEqual(mutant_val, val)
+
+    def test_mutation_detection_multi_lane_overwriting(self) -> None:
+        # A buggy interpreter that runs all active lanes sequentially in a loop
+        # would overwrite the GWS resource with the last active lane's value.
+        state = SIMDState(num_lanes=32, exec_mask=0b11)  # Lanes 0 and 1 active
+        interp = SIMDInterpreter()
+
+        state.set_lane_vgpr(0, 1, 100)
+        state.set_lane_vgpr(1, 1, 200)
+
+        instr = DSGWSInitInstruction(vdata0=RegisterOperand(1, RegType.VGPR), offset=7)
+        interp.execute(instr, state)
+
+        # Reference: resource 7 has lane 0's value (100)
+        self.assertEqual(state.gws.read_resource(7), 100)
+
+        # Simulated mutant loop:
+        mutant_gws = GWSMemory()
+        for lane in (0, 1):
+            mutant_gws.init_resource(offset=7, value=state.get_lane_vgpr(lane, 1))
+
+        self.assertNotEqual(mutant_gws.read_resource(7), state.gws.read_resource(7))
+        self.assertEqual(mutant_gws.read_resource(7), 200)
+
+    def test_mutation_detection_exec_zero_bypass(self) -> None:
+        # Mutant ignores exec_mask == 0 and executes using lane 0
+        state = SIMDState(num_lanes=32, exec_mask=0)
+        interp = SIMDInterpreter()
+
+        state.set_lane_vgpr(0, 2, 0xBEEF)
+        instr = DSGWSInitInstruction(vdata0=RegisterOperand(2, RegType.VGPR), offset=12)
+
+        res = interp.execute(instr, state)
+        self.assertIsNone(res)
+        self.assertEqual(state.gws.read_resource(12), 0)
+
+        # Mutant execution would yield 0xBEEF
+        mutant_executed_val = 0xBEEF
+        self.assertNotEqual(mutant_executed_val, state.gws.read_resource(12))
+
+    def test_mutation_detection_dropped_offset(self) -> None:
+        # Mutant ignores instruction offset and hardcodes resource 0
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        state.set_vgpr(1, 777)
+        target_offset = 25
+        instr = DSGWSInitInstruction(vdata0=RegisterOperand(1, RegType.VGPR), offset=target_offset)
+
+        rid, val = interp.execute(instr, state)
+        self.assertEqual(rid, target_offset)
+        self.assertEqual(state.gws.read_resource(target_offset), 777)
+        self.assertEqual(state.gws.read_resource(0), 0)
+
+        # Mutant writing to 0 would fail
+        mutant_rid = 0
+        self.assertNotEqual(mutant_rid, rid)
+
+    def test_mutation_detection_value_corruption(self) -> None:
+        # Mutant inverts bits of value
+        orig_val = 0x55AA55AA
+        mutant_val = (~orig_val) & MASK32
+
+        self.assertNotEqual(mutant_val, orig_val)
+        ref_val = ref_ds_gws_init(orig_val)
+        self.assertEqual(ref_val, orig_val)
+        self.assertNotEqual(ref_val, mutant_val)
+
+    def test_mutation_detection_snan_quieting(self) -> None:
+        # Mutant sets the quiet bit on signaling NaNs
+        snan = 0x7F800001
+        mutant_quieted = snan | 0x00400000
+
+        state = ScalarState()
+        interp = ScalarInterpreter()
+        state.set_vgpr(0, snan)
+
+        interp.execute(DSGWSInitInstruction(vdata0=RegisterOperand(0, RegType.VGPR), offset=0), state)
+        self.assertEqual(state.gws.read_resource(0), snan)
+        self.assertNotEqual(state.gws.read_resource(0), mutant_quieted)
+
+
 if __name__ == "__main__":
     unittest.main()
