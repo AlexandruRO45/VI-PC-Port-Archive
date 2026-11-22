@@ -756,5 +756,128 @@ class TestValuCvtPkU16U32SIMD(unittest.TestCase):
                 self.assertEqual(val, expected)
 
 
+# ==============================================================================
+# Unit Tests: Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestValuCvtPkU16U32Aliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarVALUInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_dst_aliases_src0(self) -> None:
+        # v0 = v_cvt_pk_u16_u32 v0, v1
+        self.state.write_reg(Register(RegKind.VGPR, 0), 0x1234)
+        self.state.write_reg(Register(RegKind.VGPR, 1), 0x5678)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_U16_U32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 0),
+            src1=Register(RegKind.VGPR, 1),
+        )
+        self.interp.step(inst, self.state)
+        # S0 should have been read before V0 was overwritten
+        self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 0)), 0x56781234)
+        # V1 must remain untouched
+        self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 1)), 0x5678)
+
+    def test_dst_aliases_src1(self) -> None:
+        # v0 = v_cvt_pk_u16_u32 v1, v0
+        self.state.write_reg(Register(RegKind.VGPR, 0), 0x5678)
+        self.state.write_reg(Register(RegKind.VGPR, 1), 0x1234)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_U16_U32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+            src1=Register(RegKind.VGPR, 0),
+        )
+        self.interp.step(inst, self.state)
+        self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 0)), 0x56781234)
+        self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 1)), 0x1234)
+
+    def test_dst_aliases_both_src0_and_src1(self) -> None:
+        # v0 = v_cvt_pk_u16_u32 v0, v0
+        self.state.write_reg(Register(RegKind.VGPR, 0), 0xABCD)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_U16_U32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 0),
+            src1=Register(RegKind.VGPR, 0),
+        )
+        self.interp.step(inst, self.state)
+        self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 0)), 0xABCDABCD)
+
+    def test_dst_aliases_both_with_saturation(self) -> None:
+        # v0 = v_cvt_pk_u16_u32 v0, v0 with v0 > 65535
+        self.state.write_reg(Register(RegKind.VGPR, 0), 0x70000)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_U16_U32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 0),
+            src1=Register(RegKind.VGPR, 0),
+        )
+        self.interp.step(inst, self.state)
+        self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 0)), 0xFFFFFFFF)
+
+    def test_sequential_inplace_chain(self) -> None:
+        # v0 = v_cvt_pk_u16_u32 v0, v1 (in-place update of v0)
+        # v1 = v_cvt_pk_u16_u32 v0, v1 (in-place update of v1 using updated v0)
+        self.state.write_reg(Register(RegKind.VGPR, 0), 10)
+        self.state.write_reg(Register(RegKind.VGPR, 1), 20)
+
+        inst1 = Instruction(
+            opcode=Opcode.V_CVT_PK_U16_U32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 0),
+            src1=Register(RegKind.VGPR, 1),
+        )
+        inst2 = Instruction(
+            opcode=Opcode.V_CVT_PK_U16_U32,
+            dst=Register(RegKind.VGPR, 1),
+            src0=Register(RegKind.VGPR, 0),
+            src1=Register(RegKind.VGPR, 1),
+        )
+        self.interp.step(inst1, self.state)
+        v0_after_1 = (20 << 16) | 10  # 0x0014000A = 1310730 > 65535, so in step 2 it saturates to 0xFFFF!
+        self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 0)), v0_after_1)
+
+        self.interp.step(inst2, self.state)
+        # S0 is v0_after_1 (1310730 > 65535 -> 0xFFFF)
+        # S1 is v1 (20)
+        expected_v1 = (20 << 16) | 0xFFFF
+        self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 1)), expected_v1)
+
+    def test_simd_inplace_aliasing_divergent(self) -> None:
+        state = SIMDState(wave_size=32, exec_mask=0x0000_FFFF)  # low 16 lanes active
+        interp = SIMDWavefrontInterpreter(wave_size=32)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_U16_U32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 0),
+            src1=Register(RegKind.VGPR, 1),
+        )
+
+        for lane in range(32):
+            state.write_lane_reg(lane, Register(RegKind.VGPR, 0), lane + 1)
+            state.write_lane_reg(lane, Register(RegKind.VGPR, 1), 100)
+
+        interp.step(inst, state)
+
+        for lane in range(32):
+            val = state.read_lane_reg(lane, Register(RegKind.VGPR, 0))
+            if lane < 16:
+                expected = (100 << 16) | (lane + 1)
+                self.assertEqual(val, expected)
+            else:
+                self.assertEqual(val, lane + 1)
+
+
 if __name__ == "__main__":
     unittest.main()
