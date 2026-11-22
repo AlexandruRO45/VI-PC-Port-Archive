@@ -286,14 +286,26 @@ def self_test():
     print("self-test OK")
 
 
-def main():
+def wave_sizes(text):
+    """Parse a non-empty comma-separated subset of the wave sizes this probe supports."""
+    try:
+        waves = tuple(int(item.strip()) for item in text.split(",") if item.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must contain only 32 and/or 64") from exc
+    if not waves or any(wave not in (32, 64) for wave in waves):
+        raise argparse.ArgumentTypeError("must be a non-empty list containing only 32 and/or 64")
+    return waves
+
+
+def main(argv=None):
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--waves", default="32,64", help="wave sizes to run (default: 32,64)")
+    ap.add_argument("--waves", type=wave_sizes, default=(32, 64),
+                    help="wave sizes to run (default: 32,64)")
     ap.add_argument("--json", dest="json_out", help="write full JSON report to this path")
     ap.add_argument("--self-test", action="store_true", help="check the Python models without a GPU")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     if args.self_test:
         self_test()
         return 0
@@ -306,7 +318,7 @@ def main():
     if asm.family(oracle.arch) != "gfx10":
         print(f"SKIP: {oracle.arch} is not GFX10 (RDNA1/RDNA2)", file=sys.stderr)
         return 77
-    waves = [int(w) for w in args.waves.split(",") if w.strip()]
+    waves = args.waves
     out = {"arch": oracle.arch, "waves": {}}
     mismatches = 0
     for wave in waves:

@@ -15,6 +15,17 @@ class BufferStoreProbeTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
         self.assertIn("self-test OK", proc.stdout)
 
+    def test_bad_wave_lists_fail_before_hardware_access(self):
+        for value in ("", ",", "16", "32,nope"):
+            with self.subTest(value=value):
+                proc = subprocess.run(
+                    [sys.executable, "-I", PROBE, "--waves", value],
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(proc.returncode, 2, proc.stderr or proc.stdout)
+                self.assertIn("--waves", proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr)
+
     def test_non_gfx10_or_missing_oracle_exits_77(self):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith("LEONIDA_HW_") and k != "LEONIDA_AMD_CLANG"}
