@@ -95,6 +95,7 @@ for t in \
   tests/dxil_retarget_check.py \
   tests/rdna2_tools_check.py \
   tests/pso_readiness_check.py \
+  tests/xmem_attribute_scan_check.py \
   tests/docs_links_check.py \
   tests/bidi_controls_check.py \
   tests/gpu_report_format_check.py; do
