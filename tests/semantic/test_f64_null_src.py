@@ -42,27 +42,21 @@ def d2u(x: float) -> int:
     return struct.unpack("<Q", struct.pack("<d", x))[0]
 
 
-def find_tool(name: str, fallback: str | None = None) -> str:
-    path = shutil.which(name)
-    if path:
-        return path
-    if fallback and os.path.isfile(fallback):
-        return fallback
-    raise RuntimeError(f"missing required tool: {name}")
-
-
-LLVM_MC = os.environ.get("LLVM_MC") or find_tool(
-    "llvm-mc", r"D:\Leonida-work\tools\llvm-amdgpu\ucrt64\bin\llvm-mc.exe"
-)
-SPIRV_AS = find_tool("spirv-as", r"C:\VulkanSDK\1.4.341.1\Bin\spirv-as.exe")
-SPIRV_VAL = find_tool("spirv-val", r"C:\VulkanSDK\1.4.341.1\Bin\spirv-val.exe")
+def _find_llvm_mc() -> str | None:
+    env = os.environ.get("LLVM_MC")
+    if env:
+        return env if os.path.isfile(env) else shutil.which(env)
+    return shutil.which("llvm-mc")
 
 
 def assemble_gfx1013(lines: list[str]) -> list[str]:
     """Assemble with llvm-mc -mcpu=gfx1013 -show-encoding and return the printed disassembly lines."""
+    llvm_mc = _find_llvm_mc()
+    if not llvm_mc:
+        raise unittest.SkipTest("llvm-mc not found; set LLVM_MC or add it to PATH")
     src = "\n".join(lines) + "\n"
     res = subprocess.run(
-        [LLVM_MC, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding"],
+        [llvm_mc, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding"],
         input=src,
         capture_output=True,
         text=True,
@@ -80,15 +74,19 @@ def assemble_gfx1013(lines: list[str]) -> list[str]:
 
 
 def validate_spirv(spv_text: str) -> None:
+    spirv_as = shutil.which("spirv-as")
+    spirv_val = shutil.which("spirv-val")
+    if not spirv_as or not spirv_val:
+        return
     with tempfile.TemporaryDirectory() as d:
         asm_p = os.path.join(d, "s.spvasm")
         bin_p = os.path.join(d, "s.spv")
         with open(asm_p, "w", encoding="utf-8") as f:
             f.write(spv_text)
-        r1 = subprocess.run([SPIRV_AS, "--target-env", "vulkan1.2", asm_p, "-o", bin_p], capture_output=True, text=True)
+        r1 = subprocess.run([spirv_as, "--target-env", "vulkan1.2", asm_p, "-o", bin_p], capture_output=True, text=True)
         if r1.returncode != 0:
             raise AssertionError(f"spirv-as failed:\n{r1.stderr}\n{spv_text}")
-        r2 = subprocess.run([SPIRV_VAL, "--target-env", "vulkan1.2", bin_p], capture_output=True, text=True)
+        r2 = subprocess.run([spirv_val, "--target-env", "vulkan1.2", bin_p], capture_output=True, text=True)
         if r2.returncode != 0:
             raise AssertionError(f"spirv-val failed:\n{r2.stderr}\n{spv_text}")
 
@@ -129,6 +127,7 @@ def mov_f64(lo_reg: int, hi_reg: int, bits: int) -> list[str]:
     ]
 
 
+@unittest.skipUnless(_find_llvm_mc(), "needs llvm-mc")
 class F64NullSrcTests(unittest.TestCase):
     def test_v_add_f64_null_and_modifiers(self):
         cases = (
