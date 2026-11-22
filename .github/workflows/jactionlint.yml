@@ -29,3 +29,15 @@ jobs:
       - uses: jdx/jactionlint@72c00452809bcca05b8bc12acdcf15dd7a9c1c5e # v2.6.0
         with:
           profile: correctness
+      - name: Audit GitHub Actions workflows
+        uses: zizmorcore/zizmor-action@bd12b495c90993a4301c73398142281a61499af3 # v0.9.0
+        env:
+          # Keep ref resolution for suggested fixes offline too.
+          ZIZMOR_OFFLINE: 'true'
+        with:
+          version: '1.33.0'
+          collect: workflows
+          strict-collection: true
+          online-audits: false
+          advanced-security: false
+          annotations: true
