@@ -716,3 +716,81 @@ class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
 
         self.assertEqual(res, u64(initial_val * 2))
         self.assertEqual(state.lds.read_qword_at_byte_addr(addr), u64(initial_val * 2))
+
+
+# ============================================================================
+# Section 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# ============================================================================
+
+@dataclass(frozen=True)
+class AddSrc2U64Flags:
+    """Status flags and condition codes derived from 64-bit dual-source addition."""
+    z: bool            # Zero flag: result == 0
+    n: bool            # Sign flag: bit 63 set
+    carry_out: bool    # 64-bit carry out
+    carry_dword: bool  # 32-bit dword boundary carry
+
+
+def compute_add_src2_u64_flags(val_a: int, val_b: int) -> AddSrc2U64Flags:
+    """Compute condition flags for unsigned 64-bit addition (val_a + val_b)."""
+    a = u64(val_a)
+    b = u64(val_b)
+    res = u64(a + b)
+
+    z = (res == 0)
+    n = bool(res & 0x8000_0000_0000_0000)
+    carry_out = (a + b) > MASK64
+    carry_dword = ((a & MASK32) + (b & MASK32)) > MASK32
+
+    return AddSrc2U64Flags(
+        z=z,
+        n=n,
+        carry_out=carry_out,
+        carry_dword=carry_dword,
+    )
+
+
+class TestConditionCodesStatusFlagsAndCarryBorrow(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow relations."""
+
+    def test_ds_instruction_hardware_flag_isolation(self) -> None:
+        """DS instructions do not modify hardware scalar condition code (SCC)."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        state.set_sgpr(0, 1)  # SCC set
+        state.set_vgpr(1, 0x100)
+        state.lds.write_qword_at_byte_addr(0x100, 10)
+        state.lds.write_qword_at_byte_addr(0x108, 20)
+
+        instr = DSAddSrc2U64Instruction(vaddr=VGPR(1), offset0=0, offset1=1)
+        interp.step(instr, state)
+
+        self.assertEqual(state.get_sgpr(0), 1)
+
+    def test_zero_flag_wrap(self) -> None:
+        """Overflow to 0 sets Z flag."""
+        flags = compute_add_src2_u64_flags(MASK64, 1)
+        self.assertTrue(flags.z)
+        self.assertFalse(flags.n)
+        self.assertTrue(flags.carry_out)
+
+    def test_sign_flag_transitions(self) -> None:
+        """Bit 63 transition sets N flag."""
+        flags = compute_add_src2_u64_flags(0x4000_0000_0000_0000, 0x4000_0000_0000_0000)
+        self.assertTrue(flags.n)
+        self.assertFalse(flags.z)
+
+    def test_carry_out_detection(self) -> None:
+        flags_carry = compute_add_src2_u64_flags(MASK64, 10)
+        self.assertTrue(flags_carry.carry_out)
+
+        flags_nocarry = compute_add_src2_u64_flags(100, 200)
+        self.assertFalse(flags_nocarry.carry_out)
+
+    def test_dword_boundary_carry(self) -> None:
+        a = 0x0000_0000_FFFF_FFFF
+        b = 0x0000_0000_0000_0001
+        flags = compute_add_src2_u64_flags(a, b)
+        self.assertTrue(flags.carry_dword)
+        self.assertFalse(flags.carry_out)
