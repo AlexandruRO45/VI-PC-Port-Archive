@@ -351,9 +351,11 @@ class WorldIndexTest(unittest.TestCase):
             self.assert_report_collision([source, "--out", upper, "--csv", lower],
                                          "--out and --csv must use different paths")
             self.assertEqual(os.listdir(folder), [])
-            accent = os.path.join(folder, "café.json")             # composed é
-            self.assert_report_collision([source, "--out", accent, "--csv", os.path.join(folder, "CAFÉ.json")],
-                                         "--out and --csv must use different paths")
+            if sys.platform == "darwin":   # APFS/HFS+ also fold composed and decomposed accents; NTFS does not
+                accent = os.path.join(folder, "café.json")             # composed é
+                self.assert_report_collision(
+                    [source, "--out", accent, "--csv", os.path.join(folder, "CAFÉ.json")],
+                    "--out and --csv must use different paths")
         else:
             self.assertEqual(WI.main([source, "--out", upper, "--csv", lower]), 0)
             with open(upper, encoding="utf-8") as f:
