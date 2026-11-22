@@ -775,6 +775,101 @@ class TestValuLshlOrB32ConditionCodes(unittest.TestCase):
         self.assertEqual(simd_state.vcc, canary_vcc)
 
 
+# ==============================================================================
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+POS_ZERO_F32: int = 0x00000000
+NEG_ZERO_F32: int = 0x80000000
+POS_INF_F32: int = 0x7F800000
+NEG_INF_F32: int = 0xFF800000
+QNAN_F32: int = 0x7FC00000
+SNAN_F32: int = 0x7F800001
+QNAN_PAYLOAD_F32: int = 0x7FC01234
+SNAN_PAYLOAD_F32: int = 0x7F804321
+SUBNORM_MIN_F32: int = 0x00000001
+SUBNORM_MAX_F32: int = 0x007FFFFF
+
+
+def f32_to_bits(val: float) -> int:
+    """Encode float to IEEE 754 single-precision 32-bit unsigned integer."""
+    return struct.unpack("<I", struct.pack("<f", val))[0]
+
+
+def bits_to_f32(bits: int) -> float:
+    """Decode 32-bit unsigned integer to IEEE 754 single-precision float."""
+    return struct.unpack("<f", struct.pack("<I", bits & MASK32))[0]
+
+
+def is_nan_f32(bits: int) -> bool:
+    """True if 32-bit integer represents an IEEE 754 single-precision NaN."""
+    bits &= MASK32
+    return (bits & 0x7F800000) == 0x7F800000 and (bits & 0x007FFFFF) != 0
+
+
+def is_subnormal_f32(bits: int) -> bool:
+    """True if 32-bit integer represents an IEEE 754 single-precision subnormal."""
+    bits &= MASK32
+    return (bits & 0x7F800000) == 0 and (bits & 0x007FFFFF) != 0
+
+
+class TestValuLshlOrB32IEEE754Boundaries(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_float32_bitfield_composition(self) -> None:
+        # Reconstruct IEEE 754 float: (exponent << 23) | mantissa
+        # Exponent 127 (1.0), mantissa 0 => 0x3F800000 (1.0)
+        res = oracle_v_lshl_or_b32(127, 23, 0)
+        self.assertEqual(res, 0x3F800000)
+        self.assertEqual(bits_to_f32(res), 1.0)
+
+        # Exponent 128 (2.0) with mantissa 0x00400000 => 3.0 (0x40400000)
+        res2 = oracle_v_lshl_or_b32(128, 23, 0x00400000)
+        self.assertEqual(res2, 0x40400000)
+        self.assertEqual(bits_to_f32(res2), 3.0)
+
+    def test_subnormal_mantissa_alignment_no_ftz(self) -> None:
+        # Subnormal float bits shifted left must never be flushed to zero
+        res = oracle_v_lshl_or_b32(SUBNORM_MIN_F32, 4, 0x01)
+        expected = (1 << 4) | 0x01  # 17
+        self.assertEqual(res, expected)
+        self.assertTrue(is_subnormal_f32(res))
+
+        # Shift inside subnormal range without FTZ
+        res_sub = oracle_v_lshl_or_b32(0x00010000, 2, 0)
+        self.assertEqual(res_sub, 0x00040000)
+        self.assertTrue(is_subnormal_f32(res_sub))
+
+    def test_nan_payload_composition(self) -> None:
+        # Assemble Signaling NaN: (0xFF << 23) | sNaN_payload
+        s_payload = 0x00000055  # quiet bit 22 is 0
+        res = oracle_v_lshl_or_b32(0xFF, 23, s_payload)
+        self.assertEqual(res, 0x7F800055)
+        self.assertTrue(is_nan_f32(res))
+        self.assertEqual(res & 0x00400000, 0)
+
+        # Assemble Quiet NaN: (0x1FF << 22) | qNaN_payload
+        q_payload = 0x000000AA
+        res_q = oracle_v_lshl_or_b32(0x1FF, 22, q_payload)
+        self.assertEqual(res_q, 0x7FC000AA)
+        self.assertTrue(is_nan_f32(res_q))
+        self.assertNotEqual(res_q & 0x00400000, 0)
+
+    def test_signed_zero_and_infinities(self) -> None:
+        # Assemble negative zero: (1 << 31) | 0 == 0x80000000
+        neg_zero = oracle_v_lshl_or_b32(1, 31, 0)
+        self.assertEqual(neg_zero, NEG_ZERO_F32)
+
+        # Assemble positive infinity: (0xFF << 23) | 0 == 0x7F800000
+        pos_inf = oracle_v_lshl_or_b32(0xFF, 23, 0)
+        self.assertEqual(pos_inf, POS_INF_F32)
+
+        # Assemble negative infinity: (1 << 31) | POS_INF_F32 == 0xFF800000
+        neg_inf = oracle_v_lshl_or_b32(1, 31, POS_INF_F32)
+        self.assertEqual(neg_inf, NEG_INF_F32)
+
+
+
 
 
 
