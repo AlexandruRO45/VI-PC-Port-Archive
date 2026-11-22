@@ -1100,5 +1100,109 @@ class TestLdsMaxRtnU32StatusFlags(unittest.TestCase):
         self.assertEqual(len(conflicts_none), 0)
 
 
+# ---------------------------------------------------------------------------
+# Phase 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ---------------------------------------------------------------------------
+
+class TestLdsMaxRtnU32BoundaryExtremes(unittest.TestCase):
+    """Phase 7: Unit tests for IEEE 754 boundary bit patterns and unsigned integer ordering."""
+
+    @staticmethod
+    def float_to_u32(f: float) -> int:
+        return struct.unpack("<I", struct.pack("<f", f))[0]
+
+    @staticmethod
+    def u32_to_float(u: int) -> float:
+        return struct.unpack("<f", struct.pack("<I", u & MASK32))[0]
+
+    def test_ieee754_bit_fidelity_preservation(self) -> None:
+        """Verify that floating point bit patterns are never rounded, truncated, or modified."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        # Various IEEE 754 float bit representations
+        float_patterns = [
+            0x00000000,  # +0.0
+            0x80000000,  # -0.0
+            0x3F800000,  # +1.0
+            0xBF800000,  # -1.0
+            0x7F800000,  # +infinity
+            0xFF800000,  # -infinity
+            0x7FC00000,  # positive quiet NaN
+            0xFFC00000,  # negative quiet NaN
+            0x7F800001,  # signaling NaN
+            0x00000001,  # minimum positive subnormal / denormal
+            0x007FFFFF,  # maximum positive subnormal
+        ]
+
+        addr = 0x50
+        for pat in float_patterns:
+            state.lds.write_dword(addr, 0)
+            state.set_vgpr(1, addr)
+            state.set_vgpr(2, pat)
+            inst = DSMaxRtnU32Instruction(Opcode.DS_MAX_RTN_U32, VGPR(0), VGPR(1), VGPR(2))
+            interp.step(inst, state)
+            # Since memory was 0, new value must be exactly pat with no bit alterations
+            self.assertEqual(state.lds.read_dword(addr), pat)
+
+    def test_unsigned_ordering_vs_float_ordering(self) -> None:
+        """Verify that ds_max_rtn_u32 follows strictly unsigned integer ordering, NOT float ordering."""
+        # 1. -0.0 (0x80000000 = 2,147,483,648) vs +0.0 (0x00000000 = 0)
+        # In float: -0.0 == +0.0. In unsigned int: -0.0 > +0.0!
+        self.assertEqual(oracle_max_u32(0x80000000, 0x00000000), 0x80000000)
+
+        # 2. -1.0 (0xBF800000 = 3,212,836,864) vs +1.0 (0x3F800000 = 1,065,353,216)
+        # In float: +1.0 > -1.0. In unsigned int: 0xBF800000 > 0x3F800000!
+        self.assertEqual(oracle_max_u32(0xBF800000, 0x3F800000), 0xBF800000)
+
+        # 3. -infinity (0xFF800000 = 4,286,578,688) vs +infinity (0x7F800000 = 2,139,095,040)
+        # In float: +inf > -inf. In unsigned int: -inf > +inf!
+        self.assertEqual(oracle_max_u32(0xFF800000, 0x7F800000), 0xFF800000)
+
+        # 4. Positive quiet NaN (0x7FC00000) vs +infinity (0x7F800000)
+        # In float: NaN comparison is unordered. In unsigned int: 0x7FC00000 > 0x7F800000!
+        self.assertEqual(oracle_max_u32(0x7FC00000, 0x7F800000), 0x7FC00000)
+
+        # 5. Negative NaN / UINT32_MAX (0xFFFFFFFF) is the strictly maximal unsigned 32-bit int
+        self.assertEqual(oracle_max_u32(0xFFFFFFFF, 0x7FC00000), 0xFFFFFFFF)
+        self.assertEqual(oracle_max_u32(0xFFFFFFFF, 0xFF800000), 0xFFFFFFFF)
+
+    def test_subnormals_denormals_not_flushed(self) -> None:
+        """Verify subnormal bit patterns are preserved and not flushed to zero."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        subnormal = 0x00000001  # Smallest positive subnormal
+        addr = 0x100
+        state.lds.write_dword(addr, 0)
+        state.set_vgpr(0, addr)
+        state.set_vgpr(1, subnormal)
+
+        inst = DSMaxRtnU32Instruction(Opcode.DS_MAX_RTN_U32, VGPR(2), VGPR(0), VGPR(1))
+        interp.step(inst, state)
+
+        # Result in memory must be subnormal, not flushed to 0
+        self.assertEqual(state.lds.read_dword(addr), subnormal)
+        self.assertEqual(state.get_vgpr(2), 0)
+
+    def test_unsigned_integer_extremes_matrix(self) -> None:
+        """Verify exhaustive pairwise maximums across all unsigned integer boundary values."""
+        extremes = [
+            0x00000000,  # 0
+            0x00000001,  # 1
+            0x7FFFFFFF,  # INT32_MAX
+            0x80000000,  # 2^31
+            0x80000001,  # 2^31 + 1
+            0xFFFFFFFE,  # UINT32_MAX - 1
+            0xFFFFFFFF,  # UINT32_MAX
+        ]
+
+        # Verify sorted invariant
+        for i in range(len(extremes)):
+            for j in range(len(extremes)):
+                expected = extremes[max(i, j)]
+                self.assertEqual(oracle_max_u32(extremes[i], extremes[j]), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
