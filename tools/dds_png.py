@@ -1,7 +1,7 @@
 """Pure standard-library DDS to PNG decoder and 2x box-filter downscaler.
 
-Supports legacy and DX10 DDS headers across uncompressed 32-bit formats
-(BGRA8, RGBA8, BGRX8, RGBX8, and arbitrary 32-bit RGB/RGBA bitmasks) and
+Supports legacy and DX10 DDS headers across uncompressed 24-bit and 32-bit formats
+(BGR8, RGB8, BGRA8, RGBA8, BGRX8, RGBX8, and arbitrary RGB/RGBA bitmasks) and
 block-compressed formats (BC1, BC2, BC3, BC4, BC5, BC7).
 
 BC7 covers all eight modes. DXGI 97/98/99 (typeless, UNORM, UNORM_SRGB) emit
@@ -214,8 +214,10 @@ def _parse_header_internal(
             if fmt is None:
                 raise DdsError(f"Unsupported DDS FourCC: {fourcc!r}")
     elif pf_flags & DDPF_RGB:
-        if rgb_bit_count != 32:
-            raise DdsError(f"Unsupported uncompressed RGB bit count: {rgb_bit_count} (only 32-bit supported)")
+        if rgb_bit_count not in (24, 32):
+            raise DdsError(
+                f"Unsupported uncompressed RGB bit count: {rgb_bit_count} (only 24-bit and 32-bit supported)"
+            )
         if not (pf_flags & DDPF_ALPHAPIXELS):
             a_mask = 0
         if (r_mask | g_mask | b_mask) == 0:
@@ -223,9 +225,17 @@ def _parse_header_internal(
         for m in (r_mask, g_mask, b_mask, a_mask):
             _validate_mask(m)
         masks = (r_mask, g_mask, b_mask, a_mask)
-        fmt = _CANONICAL_MASKS.get(masks)
-        if fmt is None:
-            fmt = "RGBA8" if a_mask != 0 else "RGBX8"
+        if rgb_bit_count == 24:
+            if masks == (0x00FF0000, 0x0000FF00, 0x000000FF, 0):
+                fmt = "BGR8"
+            elif masks == (0x000000FF, 0x0000FF00, 0x00FF0000, 0):
+                fmt = "RGB8"
+            else:
+                fmt = "BGR8" if r_mask > b_mask else "RGB8"
+        else:
+            fmt = _CANONICAL_MASKS.get(masks)
+            if fmt is None:
+                fmt = "RGBA8" if a_mask != 0 else "RGBX8"
     else:
         raise DdsError(f"Unsupported DDS pixel format flags: 0x{pf_flags:08X}")
 
@@ -244,6 +254,57 @@ def parse_dds_header(data: bytes) -> dict:
     """Parse a legacy or DX10 DDS header and return format metadata."""
     info, _ = _parse_header_internal(data)
     return info
+
+
+def _decode_uncompressed_24(
+    payload: memoryview,
+    width: int,
+    height: int,
+    fmt: str,
+    masks: tuple[int, int, int, int] | None,
+    pitch: int,
+) -> bytes:
+    pixel_count = width * height
+    row_bytes = width * 3
+    pitch = pitch or row_bytes
+    if pitch < row_bytes:
+        raise DdsError(f"Invalid {fmt} row pitch: {pitch} bytes (need at least {row_bytes})")
+    expected = (height - 1) * pitch + row_bytes
+    if len(payload) < expected:
+        raise DdsError(f"Truncated {fmt} payload: {len(payload)} bytes (need {expected})")
+
+    if pitch == row_bytes:
+        src = bytes(payload[:expected])
+    else:
+        src = b"".join(payload[start : start + row_bytes] for start in range(0, height * pitch, pitch))
+
+    out = bytearray(pixel_count * 4)
+    out[3::4] = b"\xff" * pixel_count
+
+    if fmt == "BGR8" or (masks and masks == (0x00FF0000, 0x0000FF00, 0x000000FF, 0)):
+        # Byte order in memory for little-endian BGR: B, G, R -> RGBA
+        out[0::4] = src[2::3]
+        out[1::4] = src[1::3]
+        out[2::4] = src[0::3]
+        return bytes(out)
+    if fmt == "RGB8" or (masks and masks == (0x000000FF, 0x0000FF00, 0x00FF0000, 0)):
+        out[0::4] = src[0::3]
+        out[1::4] = src[1::3]
+        out[2::4] = src[2::3]
+        return bytes(out)
+
+    assert masks is not None
+    r_shift, r_max = _validate_mask(masks[0])
+    g_shift, g_max = _validate_mask(masks[1])
+    b_shift, b_max = _validate_mask(masks[2])
+
+    for i in range(pixel_count):
+        p = src[i * 3 : i * 3 + 3]
+        val = p[0] | (p[1] << 8) | (p[2] << 16)
+        out[i * 4] = ((val & masks[0]) >> r_shift) * 255 // r_max if r_max else 0
+        out[i * 4 + 1] = ((val & masks[1]) >> g_shift) * 255 // g_max if g_max else 0
+        out[i * 4 + 2] = ((val & masks[2]) >> b_shift) * 255 // b_max if b_max else 0
+    return bytes(out)
 
 
 def _decode_uncompressed_32(
@@ -925,6 +986,10 @@ def decode_dds(data: bytes) -> tuple[int, int, bytes]:
         flags = struct.unpack_from("<I", data, 8)[0]
         pitch = struct.unpack_from("<I", data, 20)[0] if flags & DDSD_PITCH else 0
         rgba = _decode_uncompressed_32(memoryview(data)[offset:], width, height, fmt, masks, pitch)
+    elif fmt in ("BGR8", "RGB8"):
+        flags = struct.unpack_from("<I", data, 8)[0]
+        pitch = struct.unpack_from("<I", data, 20)[0] if flags & DDSD_PITCH else 0
+        rgba = _decode_uncompressed_24(memoryview(data)[offset:], width, height, fmt, masks, pitch)
     elif fmt == "BC1":
         rgba = _decode_bc1(data, offset, width, height)
     elif fmt == "BC2":

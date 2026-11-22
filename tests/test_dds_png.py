@@ -348,13 +348,22 @@ class HeaderTests(unittest.TestCase):
             dds.parse_dds_header(dds_buffer(4, 4, flags=DDPF_FOURCC, fourcc=b"XXXX"))
         self.assertIn("FourCC", str(ctx.exception))
 
-    def test_rejects_non_32_bit_rgb(self):
+    def test_rejects_non_24_or_32_bit_rgb(self):
         with self.assertRaises(dds.DdsError) as ctx:
             dds.parse_dds_header(
-                dds_buffer(4, 4, flags=DDPF_RGB, bit_count=24,
-                           masks=(0x00FF0000, 0x0000FF00, 0x000000FF, 0))
+                dds_buffer(4, 4, flags=DDPF_RGB, bit_count=16,
+                           masks=(0x7C00, 0x03E0, 0x001F, 0))
             )
-        self.assertIn("24", str(ctx.exception))
+        self.assertIn("16", str(ctx.exception))
+
+    def test_accepts_24_bit_bgr_header(self):
+        info = dds.parse_dds_header(
+            dds_buffer(4, 4, flags=DDPF_RGB, bit_count=24,
+                       masks=(0x00FF0000, 0x0000FF00, 0x000000FF, 0))
+        )
+        self.assertEqual(info["format"], "BGR8")
+        self.assertEqual(info["width"], 4)
+        self.assertEqual(info["height"], 4)
 
     def test_rejects_zero_rgb_masks(self):
         with self.assertRaises(dds.DdsError):
@@ -455,6 +464,46 @@ class UncompressedTests(unittest.TestCase):
         unflagged = bytearray(dds_buffer(1, 2, payload, **header))
         struct.pack_into("<I", unflagged, 20, 8)
         self.assertEqual(dds.decode_dds(unflagged), (1, 2, payload))
+
+    def test_bgr8_24bit_decodes_with_opaque_alpha(self):
+        # In 24-bit BGR: byte 0 is Blue (0x10), byte 1 is Green (0x20), byte 2 is Red (0x30)
+        # Expected RGBA8 output: R=0x30, G=0x20, B=0x10, A=0xFF
+        payload = bytes((0x10, 0x20, 0x30, 0x05, 0x50, 0xA0))
+        width, height, rgba = dds.decode_dds(dds_buffer(
+            2, 1, payload, flags=DDPF_RGB, bit_count=24,
+            masks=(0x00FF0000, 0x0000FF00, 0x000000FF, 0),
+        ))
+        self.assertEqual((width, height), (2, 1))
+        self.assertEqual(pixels(rgba), [(0x30, 0x20, 0x10, 0xFF), (0xA0, 0x50, 0x05, 0xFF)])
+
+    def test_rgb8_24bit_decodes_with_opaque_alpha(self):
+        # In 24-bit RGB: byte 0 is Red (0x30), byte 1 is Green (0x20), byte 2 is Blue (0x10)
+        payload = bytes((0x30, 0x20, 0x10))
+        width, height, rgba = dds.decode_dds(dds_buffer(
+            1, 1, payload, flags=DDPF_RGB, bit_count=24,
+            masks=(0x000000FF, 0x0000FF00, 0x00FF0000, 0),
+        ))
+        self.assertEqual((width, height), (1, 1))
+        self.assertEqual(pixels(rgba), [(0x30, 0x20, 0x10, 0xFF)])
+
+    def test_bgr8_24bit_with_row_pitch(self):
+        # 1x2 image: row 1 is 3 bytes + 1 byte padding (pitch=4), row 2 is 3 bytes
+        row1 = bytes((0x10, 0x20, 0x30))
+        padding = b"\x00"
+        row2 = bytes((0x40, 0x50, 0x60))
+        payload = row1 + padding + row2
+        _, _, rgba = dds.decode_dds(dds_buffer(
+            1, 2, payload, flags=DDPF_RGB, bit_count=24, pitch=4,
+            masks=(0x00FF0000, 0x0000FF00, 0x000000FF, 0),
+        ))
+        self.assertEqual(pixels(rgba), [(0x30, 0x20, 0x10, 0xFF), (0x60, 0x50, 0x40, 0xFF)])
+
+    def test_bgr8_24bit_truncated_payload(self):
+        with self.assertRaisesRegex(dds.DdsError, "Truncated"):
+            dds.decode_dds(dds_buffer(
+                2, 2, b"\x00" * 10, flags=DDPF_RGB, bit_count=24,
+                masks=(0x00FF0000, 0x0000FF00, 0x000000FF, 0),
+            ))
 
     def test_rgba8_is_copied(self):
         payload = bytes((1, 2, 3, 4, 5, 6, 7, 8))
