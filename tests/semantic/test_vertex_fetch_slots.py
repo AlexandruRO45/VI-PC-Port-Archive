@@ -136,6 +136,20 @@ class FetchedRegisters(unittest.TestCase):
         with self.assertRaisesRegex(rdna2spirv.Unsupported, "fetch mapping"):
             support.translate_lines("vs_fetch", lines, dxbc=isg1_dxbc(self.SIG))
 
+    def test_two_elements_in_one_register(self):
+        # A packed signature: register 0 holds xy and zw as two elements, register 1 is never read, register 2 is.
+        # Register 0 is one fetch slot and one Vulkan input; register 2 moves down to slot 1.
+        sig = [(0, 3, 3, 0, FLOAT), (0, 12, 12, 0, FLOAT), (1, 15, 0, 0, FLOAT), (2, 15, 15, 0, FLOAT)]
+        lines = ["s_swappc_b64 s[4:5], s[4:5]", "exp pos0 v4, v5, v6, v7 done", "exp param0 v8, v9, v10, v11",
+                 "s_endpgm"]
+        spv, out = run(lines, isg1_dxbc(sig), {0: FLOAT, 1: FLOAT, 2: FLOAT})
+        for prefix in ("%vin0 =", "%vinv0 =", "%vinc0_0 =", "OpDecorate %vin0 Location"):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(sum(ln.strip().startswith(prefix) for ln in spv.splitlines()), 1)
+        self.assertEqual(tuple(out["%out_param0"]), ATTR[2])
+        pos = [v for k, v in out.items() if k != "%out_param0"]
+        self.assertEqual(tuple(pos[0]), ATTR[0])
+
     def test_no_register_read(self):
         sig = [(0, 7, 0, 0, FLOAT)]
         lines = ["s_swappc_b64 s[4:5], s[4:5]", "v_mov_b32 v1, 1.0", "exp pos0 v1, v1, v1, v1 done", "s_endpgm"]
