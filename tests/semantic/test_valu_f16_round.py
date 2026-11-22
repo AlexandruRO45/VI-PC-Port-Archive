@@ -976,9 +976,9 @@ class TieBreakingSignedZerosAndNegativeControlTests(unittest.TestCase):
         self.assertEqual(got, merge_half(OLD, H_1P0, 0))
 
     def test_negative_control_clamp_omitted(self):
-        """Omitting FClamp in SPIR-V produces out-of-bounds unclamped float."""
+        """Omitting the clamp (Gen.clamp01) in SPIR-V produces out-of-bounds unclamped float."""
         spv = translate_ps([f"v_mov_b32 v1, {H_2P5:#x}", f"v_mov_b32 v0, {OLD:#x}", "v_trunc_f16_e64 v0, v1 mul:2 clamp"])
-        sabotaged, n = re.subn(r"OpExtInst %float %glsl FClamp (%\w+) %f0 %f1", r"OpCopyObject %float \1", spv)
+        sabotaged, n = support.drop_clamp01(spv)
         self.assertEqual(n, 1)
         got = si.run_fragment(sabotaged)["%out_mrt0"][0]
         self.assertNotEqual(got, merge_half(OLD, H_1P0, 0))

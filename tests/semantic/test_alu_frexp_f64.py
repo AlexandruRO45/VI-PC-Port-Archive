@@ -26,6 +26,7 @@ sys.path.insert(0, HERE)
 
 import rdna2spirv  # noqa: E402
 import spirv_mini_interp as si  # noqa: E402
+import support  # noqa: E402
 
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 INF = 0x7FF0000000000000
@@ -260,10 +261,8 @@ class FrexpF64Tests(unittest.TestCase):
                     self.assertRegex(spv, r"OpFMul %double")
                 else:
                     self.assertNotRegex(spv, r"OpFMul %double")
-                if want_clamp:
-                    self.assertIn("FClamp", spv)
-                else:
-                    self.assertNotIn("FClamp", spv)
+                self.assertEqual(support.clamp01_f64_count(spv), 1 if want_clamp else 0)
+                self.assertNotIn("FClamp", spv)
                 validate_spirv(spv)
 
     def test_rejects_invalid_forms(self):

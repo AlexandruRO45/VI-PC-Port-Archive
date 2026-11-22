@@ -27,6 +27,7 @@ sys.path.insert(0, HERE)
 
 import rdna2spirv  # noqa: E402
 import spirv_mini_interp as si  # noqa: E402
+import support  # noqa: E402
 
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 SEED_DST = 0xA55A1234
@@ -220,7 +221,7 @@ class DivFixupF64Tests(unittest.TestCase):
             "v_div_fixup_f64 v[0:1], v[2:3], 1.0, 1.0 mul:2 clamp",
         ])
         self.assertIn("OpCapability Float64", spv_mod)
-        self.assertIn("FClamp", spv_mod)
+        self.assertEqual(support.clamp01_f64_count(spv_mod), 1)
         validate_spirv(spv_mod)
 
     def test_rejects_non_pair_destination(self):

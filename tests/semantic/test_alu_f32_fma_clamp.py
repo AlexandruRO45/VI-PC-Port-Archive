@@ -58,6 +58,7 @@ if HERE not in sys.path:
 
 import rdna2spirv  # noqa: E402
 import spirv_mini_interp as si  # noqa: E402
+import support  # noqa: E402
 
 MASK32 = 0xFFFFFFFF
 SIGN_MASK = 0x80000000
@@ -770,14 +771,15 @@ class TestFmaF32ShaderTranslation(unittest.TestCase):
     """Verifies that RDNA2 v_fma_f32 translates to valid SPIR-V and executes accurately."""
 
     def test_translated_spirv_structure(self):
-        """Translating v_fma_f32 with and without clamp generates GLSL Fma and FClamp."""
+        """Translating v_fma_f32 generates GLSL Fma, and with clamp the clamp01 compare-and-select (SHADER-186)."""
         spv_unclamped, _ = run_ps_fma(HALF, HALF, HALF, clamp=False)
         self.assertIn("OpExtInst %float %glsl Fma", spv_unclamped)
-        self.assertNotIn("OpExtInst %float %glsl FClamp", spv_unclamped)
+        self.assertEqual(support.clamp01_count(spv_unclamped), 0)
 
         spv_clamped, _ = run_ps_fma(HALF, HALF, HALF, clamp=True)
         self.assertIn("OpExtInst %float %glsl Fma", spv_clamped)
-        self.assertIn("OpExtInst %float %glsl FClamp", spv_clamped)
+        self.assertEqual(support.clamp01_count(spv_clamped), 1)
+        self.assertNotIn("FClamp", spv_clamped)
 
     def test_shader_execution_normal_vectors(self):
         """End-to-end execution of unclamped v_fma_f32 matches reference oracle."""

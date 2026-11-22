@@ -25,6 +25,7 @@ sys.path.insert(0, HERE)
 
 import rdna2spirv  # noqa: E402
 import spirv_mini_interp as si  # noqa: E402
+import support  # noqa: E402
 
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 
@@ -181,10 +182,8 @@ class DivFmasF64Tests(unittest.TestCase):
                 fmul_count = len(re.findall(r"OpFMul %double", spv))
                 # 3 pre-scale multiplies (2^32, 2^32, 2^64) + 1 post-scale multiply (2^64) + optional omod
                 self.assertEqual(fmul_count, 5 if want_mul else 4)
-                if want_clamp:
-                    self.assertIn("FClamp", spv)
-                else:
-                    self.assertNotIn("FClamp", spv)
+                self.assertEqual(support.clamp01_f64_count(spv), 1 if want_clamp else 0)
+                self.assertNotIn("FClamp", spv)
                 validate_spirv(spv)
 
     def test_f64_rejects_non_pair_destination(self):

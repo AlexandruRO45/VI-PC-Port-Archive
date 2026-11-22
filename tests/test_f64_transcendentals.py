@@ -86,11 +86,17 @@ class F64TranscendentalsTest(unittest.TestCase):
                     if clamp:
                         zero_id = self._double_const_id(spv, 0.0)
                         one_id = self._double_const_id(spv, 1.0)
+                        # The clamp bit (Gen.clamp01, SHADER-186): v > 0 selects v or +0, then lo < 1 selects lo or 1.0,
+                        # so a NaN and -0 give +0.
                         m_cl = re.search(
-                            rf"^ *(%\w+) = OpExtInst %double %glsl FClamp {val} {zero_id} {one_id}$", spv, re.M
+                            rf"^ *(%\w+) = OpFOrdGreaterThan %bool {val} {zero_id}\n"
+                            rf" *(%\w+) = OpSelect %double \1 {val} {zero_id}\n"
+                            rf" *(%\w+) = OpFOrdLessThan %bool \2 {one_id}\n"
+                            rf" *(%\w+) = OpSelect %double \3 \2 {one_id}$", spv, re.M
                         )
-                        self.assertIsNotNone(m_cl)
-                        val = m_cl.group(1)
+                        self.assertIsNotNone(m_cl, f"Missing the clamp01 sequence on {val} in:\n{spv}")
+                        self.assertNotIn("FClamp", spv)
+                        val = m_cl.group(4)
                     else:
                         self.assertNotIn("FClamp", spv)
                     self._check_store_pair(spv, val, 4, 5)

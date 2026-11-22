@@ -40,6 +40,7 @@ if HERE not in sys.path:
 import rdna2spirv  # noqa: E402
 import spirv_mini_interp as si  # noqa: E402
 from support import STUB_DXBC, mrt0_words  # noqa: E402
+import support  # noqa: E402
 
 MASK16 = 0xFFFF
 MASK32 = 0xFFFFFFFF
@@ -765,15 +766,15 @@ class NegativeControlsAndSabotageTests(unittest.TestCase):
         self.assertNotEqual(out_good, out_bad)
 
     def test_clamp_omission_sabotage_fails(self):
-        # Removing FClamp from clamped v_min_f16 translation must fail clamp expectation
+        # Removing the clamp (Gen.clamp01) from clamped v_min_f16 translation must fail clamp expectation
         spv = translate_ps([
             f"v_mov_b32 v1, {POS_TWO:#x}",
             f"v_mov_b32 v2, {POS_THREE:#x}",
             "v_min_f16_e64 v0, v1, v2 clamp",
         ])
-        self.assertIn("FClamp", spv)
-        # Sabotage FClamp by bypassing it with OpCopyObject of its first argument
-        bad_spv, count = re.subn(r"OpExtInst %float %glsl FClamp (%\w+) (%\w+) (%\w+)", r"OpCopyObject %float \1", spv)
+        self.assertEqual(support.clamp01_count(spv), 1)
+        # Sabotage the clamp by bypassing it with OpCopyObject of its input
+        bad_spv, count = support.drop_clamp01(spv)
         self.assertGreaterEqual(count, 1)
 
         out_good = si.run_fragment(spv)["%out_mrt0"][0] & 0xFFFF

@@ -38,6 +38,16 @@ def drop_clamp01(spvasm):
     return CLAMP01_RE.subn(lambda m: f"{m.group(1)}{m.group(6)} = OpCopyObject %float {m.group(3)}", spvasm)
 
 
+# The same sequence on a double (clamp_mods_f64): the 0.0 and 1.0 constants are bitcast ids, not %f0 / %f1.
+CLAMP01_F64_RE = re.compile(r"(?m)^ *(%\w+) = OpFOrdGreaterThan %bool (%\w+) (%\w+)\n *(%\w+) = OpSelect %double \1 \2 \3\n"
+                            r" *(%\w+) = OpFOrdLessThan %bool \4 (%\w+)\n *(%\w+) = OpSelect %double \5 \4 \6$")
+
+
+def clamp01_f64_count(spvasm):
+    """How many f64 clamp-bit sequences the module has."""
+    return len(CLAMP01_F64_RE.findall(spvasm))
+
+
 def translate_fixture(name, dxbc=STUB_DXBC, fssm=None):
     """SPIR-V assembly text for tests/semantic/fixtures/disasm/<name>.s, translated by the translator under test.
 
