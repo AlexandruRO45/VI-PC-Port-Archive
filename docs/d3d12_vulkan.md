@@ -666,7 +666,7 @@ The trace will enumerate them.
 | `ID3D12PipelineState` | `VkPipeline` + a `PipelineInfo` | Shader hash → SPIR-V + index entry; PSO state → Vulkan state; dynamic state where possible. The BVH builder's compute PSOs arrive at device slot 62 with a plain `D3D12_COMPUTE_PIPELINE_STATE_DESC`. |
 | `ID3D12DescriptorHeap` | `DescriptorHeap` (shadow + optional arena range) | CBV/SRV/UAV and sampler heaps can be shader-visible; RTV/DSV are host-only. Start handles use the measured RAX return at heap slots 9/10. Increments are layer-chosen (32/32) pending the console value. |
 | `ID3D12Resource` | `Resource` (a range in the arena buffer; a separate `VkImage` for textures) | Committed and placed; reserved is stubbed as linear for now. Xbox textures may arrive through device slot 76 rather than `CreateCommittedResource` (section 4.2). `GetGPUVirtualAddress` returns a console VA (a buffer offset or an image key). |
-| `ID3D12Heap` | `Heap` (a reserved VA range) | Buffer ranges are backed by the arena; images get their own `VkDeviceMemory`. Residency calls are no-ops. True buffer/image aliasing inside a heap is **Open**. |
+| `ID3D12Heap` | `Heap` (a reserved VA range) | Buffer ranges are backed by the arena; textures share one `VkDeviceMemory` per default heap, bound at their offset with `VK_IMAGE_CREATE_ALIAS_BIT`, so placed textures alias (D3D-88). Placed resources keep the heap's memory alive. Residency calls are no-ops. Buffer/texture aliasing in one heap needs resource heap tier 2 (the layer reports tier 1) and is **Open**. |
 | `ID3D12Fence` / `ID3D12Fence1` | `Fence` over a timeline `VkSemaphore` | `GetCompletedValue` = counter value; `SetEventOnCompletion` = wait thread + Win32 event; CPU `Signal` = host signal. |
 | Resource barriers (legacy) | `vkCmdPipelineBarrier` | Per-subresource state tracking; `BEGIN_ONLY`/`END_ONLY` become conservative full barriers at the begin point. |
 | Enhanced barriers (`ID3D12GraphicsCommandList7::Barrier`) | `vkCmdPipelineBarrier2` | Direct mapping of sync/access/layout; prefer it when the game uses it. |
@@ -711,9 +711,15 @@ The trace will enumerate them.
   for an image; record the initial state. Map `D3D12_HEAP_TYPE_DEFAULT` to device-local memory, `UPLOAD`/`READBACK`
   to separate host-visible buffers. This remains the path for buffers and for any PC-style committed resource.
 - `CreateHeap`: reserve a VA range with the requested size/alignment. `CreatePlacedResource`: assign the resource
-  the range at `heap_va + offset`; a buffer uses that range in the arena, an image uses the offset as a key and
-  binds its own memory. Vulkan image alignment can exceed D3D12's 64 KiB; because images do not share the arena,
-  this mostly affects true aliasing, which is **Open** until tested on the target GPU.
+  the range at `heap_va + offset`; a buffer uses that range in the arena, a texture in a default heap binds into the
+  heap's texture memory (one `VkDeviceMemory` the size of the heap, made by its first placed texture) at that offset,
+  with `VK_IMAGE_CREATE_ALIAS_BIT`, so textures placed over the same bytes share them (D3D-88). As on D3D12 (WARP, an
+  RTX 5070 Ti and an Intel iGPU agree): a texture that runs past the heap's end, or of a kind the heap denies
+  (`DENY_BUFFERS`, `DENY_RT_DS_TEXTURES`, `DENY_NON_RT_DS_TEXTURES`), is refused with `E_INVALIDARG`; placing doesn't
+  add to the heap's reference count, and releasing the heap leaves the resources placed in it working (they keep its
+  memory alive). A texture whose Vulkan alignment the offset doesn't meet, or whose memory types exclude the heap
+  block's, gets memory of its own and a log line: it works, but doesn't alias. `placed_aliasing_test` compares this
+  with native D3D12.
 - `CreateReservedResource`: reserve the full size linearly; tile mapping calls are logged, not emulated, for the
   first boot.
 - `D3D12_RESOURCE_DESC::Layout`: the public `ROW_MAJOR` and `64KB_STANDARD_SWIZZLE` values plus the Xbox `0x101`
@@ -767,10 +773,11 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   (`command_list.h`). Use `VK_KHR_synchronization2` events if profiling needs the overlap.
 - Implicit promotion and decay need no extra barriers: `COMMON` is `GENERAL`, and the layout tracker makes later
   barriers start from it (section 3.2).
-- Aliasing barriers: if image aliasing is implemented (one `VkDeviceMemory` per D3D12 heap range, with
-  `VK_IMAGE_CREATE_ALIAS_BIT`), transition the old image to `UNDEFINED`, issue a global memory barrier, then
-  transition the new image. Until then, log aliasing and allocate distinct memory; do not silently return the
-  wrong contents.
+- Aliasing barriers (D3D-88): a global memory barrier, then the texture taking the bytes over (`pResourceAfter`)
+  is tracked as `UNDEFINED`, so its next use moves it out of `UNDEFINED` (`vulkan_replay.h`, `initialize`): on D3D12
+  its contents are undefined until the application clears, discards or copies into it, and in Vulkan an aliased
+  image's layout means nothing once another image wrote its memory. A null or buffer `pResourceAfter` needs only the
+  memory barrier; buffers keep their bytes across aliasing.
 - Enhanced barriers (`D3D12_BARRIER_SYNC_*`, `D3D12_BARRIER_ACCESS_*`, `D3D12_BARRIER_LAYOUT_*`) map directly to
   `VkPipelineStageFlags2`, `VkAccessFlags2` and `VkImageLayout` (`vulkan_sync`, `vulkan_barrier_access`,
   `vulkan_layout`). Queue-specific layouts map like their generic forms; ray tracing, video and split scopes use

@@ -125,6 +125,11 @@ inline constexpr UINT descriptor_size = 32;
 // ExecuteCommandLists returns void; this is what the last call on the queue did.
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue);
 
+// For tests (D3D-88): the device memory a placed texture of a Vulkan device shares with the other textures of its
+// heap, as an opaque handle, and its offset there. False for anything else (a committed resource, a buffer, or a
+// placed texture that couldn't share its heap's memory).
+bool placed_texture_memory(ID3D12Resource* resource, std::uint64_t& memory, std::uint64_t& offset);
+
 // The front/back stencil references last recorded by ID3D12GraphicsCommandList8::OMSetFrontAndBackStencilRef on
 // `list`. The values are kept for the future pipeline path, which is what would apply them. False when `list` is
 // not one of this module's command lists.

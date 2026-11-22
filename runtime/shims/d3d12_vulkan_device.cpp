@@ -206,9 +206,10 @@ struct DeviceState {
     }
 
     // A memory type with `required`, preferring one that also has `preferred`, in a heap large enough for the
-    // allocation (leonida::memory_type_order).
+    // allocation (leonida::memory_type_order). `chosen_type`, when given, receives the memory type used.
     VkDeviceMemory allocate(const VkMemoryRequirements& requirements, VkMemoryPropertyFlags required,
-                            VkMemoryPropertyFlags preferred, bool device_address = false) const {
+                            VkMemoryPropertyFlags preferred, bool device_address = false,
+                            std::uint32_t* chosen_type = nullptr) const {
         VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
         flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
         for (const std::uint32_t i :
@@ -218,9 +219,56 @@ struct DeviceState {
             allocate.allocationSize = requirements.size;
             allocate.memoryTypeIndex = i;
             VkDeviceMemory out = VK_NULL_HANDLE;
-            if (context->vk.vkAllocateMemory(info.device, &allocate, nullptr, &out) == VK_SUCCESS) return out;
+            if (context->vk.vkAllocateMemory(info.device, &allocate, nullptr, &out) == VK_SUCCESS) {
+                if (chosen_type) *chosen_type = i;
+                return out;
+            }
         }
         return VK_NULL_HANDLE;
+    }
+};
+
+// What a heap's placed resources live in (section 3.3, D3D-88): its range of the GPU address arena, where placed
+// buffers are, and one block of device memory that placed textures bind into at their heap offset. Those images are
+// made with VK_IMAGE_CREATE_ALIAS_BIT, so textures placed over the same bytes alias as they do on D3D12 (an aliasing
+// barrier then hands the bytes from one to the other, vulkan_replay.h). The block is made by the first placed
+// texture, in a memory type its image accepts.
+//
+// Placed resources keep this alive, not the heap object: on D3D12 (WARP, an RTX 5070 Ti and an Intel iGPU agree)
+// placing a resource doesn't add to the heap's reference count, and releasing the heap leaves the resources placed
+// in it working.
+struct HeapBacking {
+    DeviceState& device;
+    D3D12_HEAP_DESC desc;
+    VkDeviceSize arena_offset = 0;
+    bool reserved = false;
+    VkDeviceMemory textures = VK_NULL_HANDLE;
+    std::uint32_t texture_type = 0;
+
+    HeapBacking(DeviceState& state, const D3D12_HEAP_DESC& heap_desc) : device(state), desc(heap_desc) {
+        reserved = device.arena.mapped &&
+                   device.arena_allocate(desc.SizeInBytes, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, arena_offset);
+    }
+    HeapBacking(const HeapBacking&) = delete;
+    HeapBacking& operator=(const HeapBacking&) = delete;
+    ~HeapBacking() {
+        if (textures) device.context->vk.vkFreeMemory(device.info.device, textures, nullptr);
+        if (reserved) device.arena_release(arena_offset, desc.SizeInBytes);
+    }
+
+    // The memory an image with these requirements binds into at `offset`, or null when it can't share the heap's
+    // block: a host-visible heap (textures there keep memory of their own), an offset the image can't be bound at,
+    // an image that runs past the heap's end, or one whose memory types exclude the block's.
+    VkDeviceMemory texture_memory(const VkMemoryRequirements& image, VkDeviceSize offset) {
+        if (desc.Properties.Type != D3D12_HEAP_TYPE_DEFAULT) return VK_NULL_HANDLE;
+        if (!image.alignment || offset % image.alignment || offset + image.size > desc.SizeInBytes) return VK_NULL_HANDLE;
+        if (!textures) {
+            VkMemoryRequirements whole = image;
+            whole.size = desc.SizeInBytes;
+            textures = device.allocate(whole, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false, &texture_type);
+            return textures;
+        }
+        return (image.memoryTypeBits >> texture_type) & 1 ? textures : VK_NULL_HANDLE;
     }
 };
 
@@ -292,11 +340,13 @@ public:
              D3D12_HEAP_FLAGS heap_flags)
         : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags) {}
 
-    // A placed resource lives inside a heap's arena range: the heap owns the range, so only the console VA is kept
-    // here and nothing goes back to the arena when this object dies.
-    Resource(DeviceState& device, const D3D12_RESOURCE_DESC& desc, const D3D12_HEAP_PROPERTIES& heap,
-             D3D12_HEAP_FLAGS heap_flags, VkDeviceSize placed_va)
-        : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags), va_(placed_va) {}
+    // A placed resource lives inside a heap's arena range or texture memory: the heap's backing owns both and this
+    // resource keeps the backing alive, so only the console VA is kept here and nothing goes back to the arena when
+    // this object dies.
+    Resource(DeviceState& device, const D3D12_RESOURCE_DESC& desc, std::shared_ptr<HeapBacking> placed,
+             VkDeviceSize heap_offset, VkDeviceSize placed_va)
+        : device_(device), desc_(desc), heap_(placed->desc.Properties), heap_flags_(placed->desc.Flags),
+          va_(placed_va), placed_(std::move(placed)), placed_offset_(heap_offset) {}
 
     ~Resource() override {
         auto& vk = device_.context->vk;
@@ -306,10 +356,14 @@ public:
         if (image_) vk.vkDestroyImage(dev, image_, nullptr);
         if (buffer_) vk.vkDestroyBuffer(dev, buffer_, nullptr);
         if (memory_) vk.vkFreeMemory(dev, memory_, nullptr);
+        // placed_ goes after this body, once the image no longer uses the heap's memory
     }
 
     leonida::ResourceId id() const { return resource_id(this); }
     VkImage image() const { return image_; }
+    // For tests: the heap memory a placed texture shares, and where in it (null when it has memory of its own).
+    VkDeviceMemory placed_memory() const { return placed_memory_; }
+    VkDeviceSize placed_offset() const { return placed_offset_; }
 
     // Default-heap buffers are ranges of the GPU address arena: console VA = offset, zeroed through the arena's host
     // mapping. Upload and readback buffers keep their own host memory; with buffer device addresses their console
@@ -399,6 +453,7 @@ public:
         }
         VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         info.flags = format.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+        if (placed_) info.flags |= VK_IMAGE_CREATE_ALIAS_BIT;  // other textures may be placed over the same bytes
         info.imageType = volume ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
         info.format = format.format;
         info.extent = {std::uint32_t(desc_.Width), desc_.Height, depth};
@@ -419,9 +474,28 @@ public:
         if (vk.vkCreateImage(device_.info.device, &info, nullptr, &image_) != VK_SUCCESS) return E_OUTOFMEMORY;
         VkMemoryRequirements requirements{};
         vk.vkGetImageMemoryRequirements(device_.info.device, image_, &requirements);
-        memory_ = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (!memory_ || vk.vkBindImageMemory(device_.info.device, image_, memory_, 0) != VK_SUCCESS)
-            return E_OUTOFMEMORY;
+        // A placed texture must fit in its heap, as on D3D12 (which refuses one that runs past the end with
+        // E_INVALIDARG); its size is the image's own, the size GetResourceAllocationInfo reports for it.
+        if (placed_ && placed_offset_ + requirements.size > placed_->desc.SizeInBytes) {
+            log_once("placed texture runs past the end of its heap; size in KiB", int(requirements.size / 1024));
+            return E_INVALIDARG;
+        }
+        // A placed texture binds into its heap's texture memory at its offset, so textures placed over the same
+        // bytes share them (D3D-88). One that can't (see HeapBacking::texture_memory) keeps memory of its own: it
+        // works, but doesn't alias.
+        const VkDeviceMemory shared = placed_ ? placed_->texture_memory(requirements, placed_offset_) : VK_NULL_HANDLE;
+        if (shared) {
+            if (vk.vkBindImageMemory(device_.info.device, image_, shared, placed_offset_) != VK_SUCCESS)
+                return E_OUTOFMEMORY;
+            placed_memory_ = shared;
+        } else {
+            if (placed_)
+                log_once("placed texture can't share its heap's memory, so it won't alias; size in KiB",
+                         int(requirements.size / 1024));
+            memory_ = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (!memory_ || vk.vkBindImageMemory(device_.info.device, image_, memory_, 0) != VK_SUCCESS)
+                return E_OUTOFMEMORY;
+        }
 
         leonida::ResourceBinding binding{};
         binding.image = image_;
@@ -479,6 +553,11 @@ private:
     VkDeviceSize arena_offset_ = 0;
     bool in_arena_ = false;
     D3D12_GPU_VIRTUAL_ADDRESS va_ = 0;
+    // Placed resources: the heap's backing (kept alive by this resource), the offset in the heap, and for a texture
+    // that shares the heap's memory, that memory (not owned).
+    std::shared_ptr<HeapBacking> placed_;
+    VkDeviceSize placed_offset_ = 0;
+    VkDeviceMemory placed_memory_ = VK_NULL_HANDLE;
 };
 
 // DXGI -> Vulkan for vertex attributes, with each element's size for D3D12_APPEND_ALIGNED_ELEMENT.
@@ -600,36 +679,27 @@ bool equal_semantic(const std::string& a, const char* b) {
     return true;
 }
 // A heap (section 3.3): a range of the GPU address arena, as large as the game asked for, so a placed buffer can
-// name any 64 KiB-aligned offset in it. Textures placed in it still get their own VkDeviceMemory; the offset is only
-// their key, which keeps optimal-tiling images out of the arena's memory type.
+// name any 64 KiB-aligned offset in it, and the device memory its placed textures share (HeapBacking). The backing
+// outlives this object while resources are placed in it, as on D3D12.
 class Heap final
     : public Child<Heap, ID3D12HeapStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12Heap> {
 public:
     // {5d20c7a4-8e13-4b6d-9f27-3a1c94e0b7d8}
     static constexpr GUID kTag{0x5d20c7a4, 0x8e13, 0x4b6d, {0x9f, 0x27, 0x3a, 0x1c, 0x94, 0xe0, 0xb7, 0xd8}};
 
-    Heap(DeviceState& device, const D3D12_HEAP_DESC& desc) : device_(device), desc_(desc) {
-        reserved_ = device_.arena.mapped &&
-                    device_.arena_allocate(desc_.SizeInBytes, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, offset_);
-    }
+    Heap(DeviceState& device, const D3D12_HEAP_DESC& desc) : backing_(std::make_shared<HeapBacking>(device, desc)) {}
 
-    ~Heap() override {
-        if (reserved_) device_.arena_release(offset_, desc_.SizeInBytes);
-    }
+    D3D12_HEAP_DESC STDMETHODCALLTYPE GetDesc() override { return backing_->desc; }
 
-    D3D12_HEAP_DESC STDMETHODCALLTYPE GetDesc() override { return desc_; }
-
-    bool reserved() const { return reserved_; }
-    VkDeviceSize offset() const { return offset_; }
-    UINT64 bytes() const { return desc_.SizeInBytes; }
-    const D3D12_HEAP_PROPERTIES& properties() const { return desc_.Properties; }
-    D3D12_HEAP_FLAGS flags() const { return desc_.Flags; }
+    const std::shared_ptr<HeapBacking>& backing() const { return backing_; }
+    bool reserved() const { return backing_->reserved; }
+    VkDeviceSize offset() const { return backing_->arena_offset; }
+    UINT64 bytes() const { return backing_->desc.SizeInBytes; }
+    const D3D12_HEAP_PROPERTIES& properties() const { return backing_->desc.Properties; }
+    D3D12_HEAP_FLAGS flags() const { return backing_->desc.Flags; }
 
 private:
-    DeviceState& device_;
-    D3D12_HEAP_DESC desc_;
-    VkDeviceSize offset_ = 0;
-    bool reserved_ = false;
+    std::shared_ptr<HeapBacking> backing_;
 };
 
 class RootSignature final
@@ -1420,9 +1490,21 @@ public:
             log_once("tiled placed resource not supported yet; dimension", int(desc->Dimension));
             return E_NOTIMPL;
         }
-        // Only buffers are addressable, as in D3D12: a placed texture keeps a null VA and its own Vulkan image.
-        const VkDeviceSize placed_va = desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? heap->offset() + heap_offset : 0;
-        auto* resource = new Resource(state_, *desc, heap->properties(), heap->flags(), placed_va);
+        // What the heap may hold, as D3D12 checks it (E_INVALIDARG on WARP, an RTX 5070 Ti and an Intel iGPU): a
+        // heap that denies buffers, render-target/depth textures or other textures refuses them.
+        const bool is_buffer = desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+        const bool rt_ds = desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+        const D3D12_HEAP_FLAGS heap_flags = heap->flags();
+        if ((is_buffer && (heap_flags & D3D12_HEAP_FLAG_DENY_BUFFERS)) ||
+            (!is_buffer && rt_ds && (heap_flags & D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES)) ||
+            (!is_buffer && !rt_ds && (heap_flags & D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES))) {
+            log_once("placed resource of a kind its heap denies; heap flags", int(heap_flags));
+            return E_INVALIDARG;
+        }
+        // Only buffers are addressable, as in D3D12: a placed texture keeps a null VA and its own Vulkan image,
+        // bound into the heap's texture memory at heap_offset (create_texture).
+        const VkDeviceSize placed_va = is_buffer ? heap->offset() + heap_offset : 0;
+        auto* resource = new Resource(state_, *desc, heap->backing(), heap_offset, placed_va);
         resource->attach_device(identity());
         HRESULT hr = E_NOTIMPL;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
@@ -1671,6 +1753,14 @@ const RootArgumentLayout* root_signature_layout(ID3D12RootSignature* signature) 
 std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline) {
     const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
     return p && p->compute() ? p->id() : 0;
+}
+
+bool placed_texture_memory(ID3D12Resource* resource, std::uint64_t& memory, std::uint64_t& offset) {
+    const Resource* r = Resource::from<Resource>(resource);
+    if (!r || !r->placed_memory()) return false;
+    memory = reinterpret_cast<std::uint64_t>(r->placed_memory());
+    offset = r->placed_offset();
+    return true;
 }
 
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline) {

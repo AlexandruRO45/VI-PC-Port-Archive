@@ -333,6 +333,15 @@ if(Vulkan_FOUND)
     target_compile_definitions(d3d12_vulkan_device_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_vulkan_device_test PRIVATE /W4 /permissive- /utf-8)
 
+    # D3D-88: textures placed over the same heap bytes and aliasing barriers, compared with native D3D12 (WARP and
+    # the hardware adapters). Exit code 77 (skipped) without a Vulkan device.
+    add_executable(placed_aliasing_test test/placed_aliasing_test.cpp)
+    target_link_libraries(placed_aliasing_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(placed_aliasing_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(placed_aliasing_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME placed_aliasing COMMAND placed_aliasing_test)
+    set_tests_properties(placed_aliasing PROPERTIES SKIP_RETURN_CODE 77)
+
     # Descriptors through the proxy: copies between heaps.
     add_executable(d3d12_descriptor_test test/d3d12_descriptor_test.cpp shims/d3d12_xs_device.cpp)
     target_link_libraries(d3d12_descriptor_test PRIVATE gta6rt_d3d12_com)

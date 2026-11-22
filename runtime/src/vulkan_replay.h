@@ -1033,6 +1033,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             } else if (!image_range(p.binding, transition->subresource, p.range)) {
                 return ReplayResult::invalid_subresource;
             }
+        } else if (const auto* alias = std::get_if<AliasingBarrier>(&command)) {
+            // The texture that takes the bytes over (emit makes its contents undefined). A null or unknown `after`,
+            // or a buffer, needs only the memory barrier: buffers keep their bytes across aliasing, as on D3D12.
+            if (alias->after && bind(alias->after) && p.binding.image)
+                image_range(p.binding, all_subresources, p.range);
         } else if (std::holds_alternative<GlobalBarrier>(command) || std::holds_alternative<BufferBarrier>(command)) {
             if (!vk.pipeline_barrier2) return ReplayResult::unsupported;
             if (const auto* buffer_barrier = std::get_if<BufferBarrier>(&command))
@@ -1142,10 +1147,17 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         } else if (std::holds_alternative<UavBarrier>(command)) {
             const VulkanAccess uav = vulkan_access(d3d12_state::unordered_access, false);
             detail::memory_barrier(vk, command_buffer, VK_ACCESS_SHADER_WRITE_BIT, uav.stages, uav.access, uav.stages);
-        } else if (std::holds_alternative<AliasingBarrier>(command)) {
+        } else if (const auto* alias = std::get_if<AliasingBarrier>(&command)) {
+            // Every access to the shared bytes before the barrier finishes before any access after it.
             detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                    VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
                                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            // The texture taking the bytes over starts from UNDEFINED: on D3D12 its contents are undefined until the
+            // application clears, discards or copies into it, and in Vulkan an aliased image's old layout means
+            // nothing once another image wrote its memory. Its next use moves it out of UNDEFINED (initialize).
+            if (p.binding.image && tracker)
+                tracker->set(alias->after, detail::planes_for_layout(p.binding, p.range, separate),
+                             VK_IMAGE_LAYOUT_UNDEFINED);
         } else if (std::holds_alternative<GlobalBarrier>(command) || std::holds_alternative<BufferBarrier>(command)) {
             const auto [sync_before, sync_after, access_before, access_after] = std::visit(
                 [](const auto& c) -> std::array<std::uint32_t, 4> {
