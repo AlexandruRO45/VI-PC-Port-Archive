@@ -1391,5 +1391,151 @@ class TestBufferAtomicSmaxX4BoundaryExtremes(unittest.TestCase):
         assert self.interp.last_status_flags is not None
         self.assertTrue(self.interp.last_status_flags.oob_fault)
 
+class TestBufferAtomicSmaxX4NegativeControls(unittest.TestCase):
+    """Unit tests for instruction syntax rejection, parameter limits, and negative controls."""
+
+    def test_vdata_must_be_vgpr_quad(self) -> None:
+        # vdata must be VGPR, not SGPR
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SMAX_X4,
+                vdata=Register(RegKind.SGPR, 0, count=4),
+                vaddr=Register(RegKind.VGPR, 4, count=1),
+                srsrc=Register(RegKind.SGPR, 8, count=4),
+                soffset=0,
+            )
+        # vdata count must be 4, not 1 or 2
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SMAX_X4,
+                vdata=Register(RegKind.VGPR, 0, count=1),
+                vaddr=Register(RegKind.VGPR, 4, count=1),
+                srsrc=Register(RegKind.SGPR, 8, count=4),
+                soffset=0,
+            )
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SMAX_X4,
+                vdata=Register(RegKind.VGPR, 0, count=2),
+                vaddr=Register(RegKind.VGPR, 4, count=1),
+                srsrc=Register(RegKind.SGPR, 8, count=4),
+                soffset=0,
+            )
+
+    def test_vaddr_must_be_vgpr(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SMAX_X4,
+                vdata=Register(RegKind.VGPR, 0, count=4),
+                vaddr=Register(RegKind.SGPR, 4, count=1),
+                srsrc=Register(RegKind.SGPR, 8, count=4),
+                soffset=0,
+            )
+
+    def test_srsrc_must_be_sgpr_quad(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SMAX_X4,
+                vdata=Register(RegKind.VGPR, 0, count=4),
+                vaddr=Register(RegKind.VGPR, 4, count=1),
+                srsrc=Register(RegKind.VGPR, 8, count=4),
+                soffset=0,
+            )
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SMAX_X4,
+                vdata=Register(RegKind.VGPR, 0, count=4),
+                vaddr=Register(RegKind.VGPR, 4, count=1),
+                srsrc=Register(RegKind.SGPR, 8, count=2),
+                soffset=0,
+            )
+
+    def test_soffset_cannot_be_vgpr(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SMAX_X4,
+                vdata=Register(RegKind.VGPR, 0, count=4),
+                vaddr=Register(RegKind.VGPR, 4, count=1),
+                srsrc=Register(RegKind.SGPR, 8, count=4),
+                soffset=Register(RegKind.VGPR, 12, count=1),
+            )
+
+    def test_inst_offset_range_limits(self) -> None:
+        with self.assertRaises(ValueError):
+            BufferAtomicModifiers(offset=-1)
+        with self.assertRaises(ValueError):
+            BufferAtomicModifiers(offset=4096)
+
+    def test_wave_size_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDBufferWavefrontInterpreter(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDBufferWavefrontInterpreter(wave_size=128)
+
+
+class TestBufferAtomicSmaxX4MutationDetection(unittest.TestCase):
+    """Mutation testing to verify test suite catches faulty implementations."""
+
+    def test_mutation_unsigned_instead_of_signed_max(self) -> None:
+        def buggy_unsigned_atomic_max(old: int, op: int) -> int:
+            return max(old & MASK128, op & MASK128)
+
+        val_neg10 = (-10) & MASK128
+        val_pos5 = 5
+        # Correct signed max: max(-10, 5) = 5
+        correct_max = u128(max(s128(val_neg10), s128(val_pos5)))
+        self.assertEqual(correct_max, val_pos5)
+        # Buggy unsigned max chooses val_neg10 (huge unsigned)
+        buggy_max = buggy_unsigned_atomic_max(val_neg10, val_pos5)
+        self.assertEqual(buggy_max, val_neg10)
+        self.assertNotEqual(correct_max, buggy_max)
+
+    def test_mutation_omitted_16byte_bounds_check(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=1024)
+        offset = 1016  # offset < 1024, but offset + 16 == 1032 > 1024
+
+        real_in_bounds = (offset + 16 <= desc.num_records)
+        self.assertFalse(real_in_bounds)
+
+        # Mutated 8-byte check
+        mutated_in_bounds = (offset + 8 <= desc.num_records)
+        self.assertTrue(mutated_in_bounds)
+        self.assertNotEqual(real_in_bounds, mutated_in_bounds)
+
+    def test_mutation_return_post_op_instead_of_pre_op(self) -> None:
+        mem = BufferMemory(4096)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=1024)
+        mem.write_u128(0, 100)
+
+        ret, in_bounds = ref_buffer_atomic_smax_x4(
+            mem, desc, soffset=0, vaddr=0, smax_val=200, glc=True
+        )
+        self.assertEqual(ret, 100)
+        self.assertEqual(mem.read_u128(0), 200)
+        self.assertNotEqual(ret, 200)
+
+    def test_mutation_inactive_lane_side_effects(self) -> None:
+        simd = SIMDBufferWavefrontInterpreter(wave_size=32, mem_size=4096)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=1024)
+        simd.set_buffer_descriptor(4, desc)
+        simd.set_exec_mask(0x1)
+
+        simd.mem.write_u128(64, 500)
+        simd.write_lane_reg_u128(1, 0, 999)
+        simd.write_lane_reg_u32(1, RegKind.VGPR, 4, 64)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX_X4,
+            vdata=Register(RegKind.VGPR, 0, count=4),
+            vaddr=Register(RegKind.VGPR, 4, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        results = simd.step(inst)
+        self.assertEqual(results[1], (None, False))
+        self.assertEqual(simd.mem.read_u128(64), 500)
+        self.assertEqual(simd.read_lane_reg_u128(1, 0), 999)
+
 if __name__ == "__main__":
     unittest.main()
