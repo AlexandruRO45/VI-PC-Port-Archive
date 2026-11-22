@@ -28,8 +28,8 @@
 #include <fstream>
 #include <vector>
 
-#ifndef LEONIDA_TEST_CS_SET0_SAMPLE_SPV
-#error "LEONIDA_TEST_CS_SET0_SAMPLE_SPV must name the compiled test shader"
+#if !defined(LEONIDA_TEST_CS_SET0_SAMPLE_SPV) || !defined(LEONIDA_TEST_CS_SET0_SAMPLE_TAIL_SPV)
+#error "The 144-byte and --pc-tail-ubo set-0 test shaders must be compiled"
 #endif
 
 #define EXPECT(condition) do { \
@@ -69,12 +69,15 @@ int main() {
     const auto container = shader_container(program);
     const auto library = std::filesystem::temp_directory_path() / "leonida_set0_compute_test";
     std::filesystem::create_directories(library);
-    std::filesystem::copy_file(LEONIDA_TEST_CS_SET0_SAMPLE_SPV, library / "cs_set0_sample.spv",
+    // TEST-465: a --pc-tail-ubo module reads its heap base from set 1, so the PSO builds where push constants stop
+    // at 128 bytes. Set 0 and its sampling path are unchanged.
+    std::filesystem::copy_file(LEONIDA_TEST_CS_SET0_SAMPLE_TAIL_SPV, library / "cs_set0_sample.spv",
                                std::filesystem::copy_options::overwrite_existing);
     {
         std::ofstream index(library / "index.json", std::ios::binary);
         index << "{\"cs_set0_sample\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << leonida::sha256_hex(program)
-              << "\", \"bindings\": [0, 1, 2], \"push_constant_bytes\": 144, \"local_size\": [64, 1, 1], "
+              << "\", \"bindings\": [0, 1, 2], \"push_constant_bytes\": 128, "
+                 "\"pc_tail\": {\"set\": 1, \"binding\": 0, \"bytes\": 16}, \"local_size\": [64, 1, 1], "
                  "\"uses_code_base\": false, \"wave64\": false}}";
     }
 

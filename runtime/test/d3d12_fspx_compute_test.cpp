@@ -22,8 +22,8 @@
 #include <iterator>
 #include <vector>
 
-#ifndef LEONIDA_TEST_CS_SPV
-#error "LEONIDA_TEST_CS_SPV must name the compiled test shader"
+#if !defined(LEONIDA_TEST_CS_SPV) || !defined(LEONIDA_TEST_CS_TAIL_SPV)
+#error "LEONIDA_TEST_CS_SPV and LEONIDA_TEST_CS_TAIL_SPV must name the compiled test shaders"
 #endif
 
 #define EXPECT(condition) do { \
@@ -165,14 +165,16 @@ int main() {
     const auto library = std::filesystem::temp_directory_path() / "leonida_fspx_compute_test";
     std::filesystem::remove_all(library);
     std::filesystem::create_directories(library / "fspx");
-    std::filesystem::copy_file(LEONIDA_TEST_CS_SPV, library / "fspx" / "cs_user_data.spv");
-    std::filesystem::copy_file(LEONIDA_TEST_CS_SPV, library / "fspx" / "cs_user_data_b.spv");
+    // TEST-465: every FSPX fixture is a --pc-tail-ubo module (128 push-constant bytes, set-1 tail) so the same
+    // PSOs also build on devices that only expose the Vulkan minimum of 128 push-constant bytes.
+    std::filesystem::copy_file(LEONIDA_TEST_CS_TAIL_SPV, library / "fspx" / "cs_user_data.spv");
+    std::filesystem::copy_file(LEONIDA_TEST_CS_TAIL_SPV, library / "fspx" / "cs_user_data_b.spv");
     // The review case on #1911: program C in two containers whose kind-0 entries differ, translated to two
     // different modules (the second has another generator word in its header, still a valid module).
     const auto code_c = kind6(9100);
-    std::filesystem::copy_file(LEONIDA_TEST_CS_SPV, library / "fspx" / "cs_c_state1.spv");
+    std::filesystem::copy_file(LEONIDA_TEST_CS_TAIL_SPV, library / "fspx" / "cs_c_state1.spv");
     {
-        std::ifstream in(LEONIDA_TEST_CS_SPV, std::ios::binary);
+        std::ifstream in(LEONIDA_TEST_CS_TAIL_SPV, std::ios::binary);
         std::vector<char> words((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
         EXPECT(words.size() > 12);
         words[8] ^= 0x5a;  // word 2: the generator
@@ -186,7 +188,8 @@ int main() {
         const auto entry = [](const std::vector<std::uint8_t>& code, std::uint8_t state_fill) {
             return "{\"stage\": \"cs\", \"fspx_code_sha256\": \"" + leonida::sha256_hex(code) +
                    "\", \"fspx_state_sha256\": \"" + leonida::sha256_hex(std::vector<std::uint8_t>(28, state_fill)) +
-                   "\", \"bindings\": [], \"push_constant_bytes\": 144, \"local_size\": [64, 1, 1], "
+                   "\", \"bindings\": [], \"push_constant_bytes\": 128, "
+                   "\"pc_tail\": {\"set\": 1, \"binding\": 0, \"bytes\": 16}, \"local_size\": [64, 1, 1], "
                    "\"uses_code_base\": true, \"wave64\": false}";
         };
         sub << "{\"cs_user_data\": " << entry(code_a, 0x11) << ",\n \"cs_user_data_b\": " << entry(code_b, 0x11)

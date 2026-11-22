@@ -18,8 +18,9 @@
 #include <fstream>
 #include <vector>
 
-#if !defined(LEONIDA_TEST_CS_SPV) || !defined(LEONIDA_TEST_VS_SPV) || !defined(LEONIDA_TEST_PS_SPV)
-#error "LEONIDA_TEST_CS_SPV, LEONIDA_TEST_VS_SPV and LEONIDA_TEST_PS_SPV must be defined"
+#if !defined(LEONIDA_TEST_CS_SPV) || !defined(LEONIDA_TEST_VS_SPV) || !defined(LEONIDA_TEST_PS_SPV) || \
+    !defined(LEONIDA_TEST_CS_TAIL_SPV) || !defined(LEONIDA_TEST_VS_TAIL_SPV) || !defined(LEONIDA_TEST_PS_TAIL_SPV)
+#error "The 144-byte and --pc-tail-ubo pipeline-library test shaders must be compiled"
 #endif
 
 #define EXPECT(condition) do { \
@@ -69,24 +70,28 @@ int main() {
 
     const auto lib_dir = std::filesystem::temp_directory_path() / "leonida_pipeline_library_test";
     std::filesystem::create_directories(lib_dir);
-    std::filesystem::copy_file(LEONIDA_TEST_CS_SPV, lib_dir / "cs.spv",
+    // TEST-465: the library cache is exercised with --pc-tail-ubo modules so its PSOs also build under the
+    // 128-byte push-constant limit. The VS reads no tail, the CS and PS read the set-1 block.
+    std::filesystem::copy_file(LEONIDA_TEST_CS_TAIL_SPV, lib_dir / "cs.spv",
                                std::filesystem::copy_options::overwrite_existing);
-    std::filesystem::copy_file(LEONIDA_TEST_VS_SPV, lib_dir / "vs.spv",
+    std::filesystem::copy_file(LEONIDA_TEST_VS_TAIL_SPV, lib_dir / "vs.spv",
                                std::filesystem::copy_options::overwrite_existing);
-    std::filesystem::copy_file(LEONIDA_TEST_PS_SPV, lib_dir / "ps.spv",
+    std::filesystem::copy_file(LEONIDA_TEST_PS_TAIL_SPV, lib_dir / "ps.spv",
                                std::filesystem::copy_options::overwrite_existing);
     {
         std::ofstream idx(lib_dir / "index.json", std::ios::binary);
         idx << "{\"cs\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << leonida::sha256_hex(cs_prog)
-            << "\", \"bindings\": [], \"push_constant_bytes\": 144},\n"
+            << "\", \"bindings\": [], \"push_constant_bytes\": 128, "
+               "\"pc_tail\": {\"set\": 1, \"binding\": 0, \"bytes\": 16}},\n"
                " \"vs\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_prog)
-            << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"input_signature\": ["
+            << "\", \"bindings\": [], \"push_constant_bytes\": 128, \"input_signature\": ["
                "{\"semantic\": \"COLOR\", \"semantic_index\": 0, \"register\": 0, \"mask\": 15, \"rw_mask\": 15, "
                "\"system_value\": 0, \"component_type\": \"float\"}, "
                "{\"semantic\": \"POSITION\", \"semantic_index\": 0, \"register\": 1, \"mask\": 3, \"rw_mask\": 3, "
                "\"system_value\": 0, \"component_type\": \"float\"}]},\n"
                " \"ps\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_prog)
-            << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0]}}";
+            << "\", \"bindings\": [], \"push_constant_bytes\": 128, "
+               "\"pc_tail\": {\"set\": 1, \"binding\": 0, \"bytes\": 16}, \"outputs\": [0]}}";
     }
 
     rt::d3d12::VulkanDeviceInfo info{};

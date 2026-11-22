@@ -25,11 +25,23 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words {
     uint w[];
 };
 
+#ifdef PC_TAIL
+layout(push_constant) uniform UserData {
+    uint s[32];
+} pc;
+layout(set = 1, binding = 0) uniform PcTail {
+    uvec2 heap_base;
+    uvec2 code_base;
+} tail;
+#define HEAP_BASE tail.heap_base
+#else
 layout(push_constant) uniform UserData {
     uint s[32];
     uvec2 heap_base;
     uvec2 code_base;
 } pc;
+#define HEAP_BASE pc.heap_base
+#endif
 
 layout(set = 0, binding = 0) uniform texture2D images[];
 layout(set = 0, binding = 1) uniform sampler samplers[];
@@ -44,7 +56,7 @@ uvec2 add64(uvec2 a, uvec2 b) {
 }
 
 Words at(uvec2 va) {
-    return Words(add64(pc.heap_base, va));
+    return Words(add64(HEAP_BASE, va));
 }
 
 uint lookup(uint key[8]) {
