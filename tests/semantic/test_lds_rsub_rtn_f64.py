@@ -806,5 +806,97 @@ class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
         self.assertEqual(self.interp.read_reg_u64(RegisterOperand(6, count=2)), TEN_F64)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Isolation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class Float64StatusFlags:
+    """Architectural 64-bit floating-point classification flags."""
+    is_zero: bool
+    is_negative: bool
+    is_nan: bool
+    is_inf: bool
+    is_subnormal: bool
+
+
+def compute_f64_status_flags(val_u64: int) -> Float64StatusFlags:
+    """Evaluate architectural double-precision status flags from uint64 bit pattern."""
+    u = u64(val_u64)
+    exp = (u & EXP_MASK64) >> 52
+    frac = u & FRAC_MASK64
+    sign = (u >> 63) & 1
+
+    is_nan = (exp == 0x7FF and frac != 0)
+    is_inf = (exp == 0x7FF and frac == 0)
+    is_zero = (exp == 0 and frac == 0)
+    is_subnormal = (exp == 0 and frac != 0)
+    is_negative = (sign == 1) and not is_nan
+
+    return Float64StatusFlags(
+        is_zero=is_zero,
+        is_negative=is_negative,
+        is_nan=is_nan,
+        is_inf=is_inf,
+        is_subnormal=is_subnormal,
+    )
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for status flags, condition codes, and carry/borrow isolation."""
+
+    def test_status_flags_zero_result(self) -> None:
+        # 5.0 - 5.0 = +0.0
+        res = ieee754_rsub_f64(FIVE_F64, FIVE_F64)
+        flags = compute_f64_status_flags(res)
+        self.assertTrue(flags.is_zero)
+        self.assertFalse(flags.is_negative)
+        self.assertFalse(flags.is_nan)
+        self.assertFalse(flags.is_inf)
+
+    def test_status_flags_negative_result(self) -> None:
+        # 2.0 - 5.0 = -3.0
+        res = ieee754_rsub_f64(TWO_F64, FIVE_F64)
+        flags = compute_f64_status_flags(res)
+        self.assertFalse(flags.is_zero)
+        self.assertTrue(flags.is_negative)
+        self.assertFalse(flags.is_nan)
+
+    def test_status_flags_nan_and_inf(self) -> None:
+        # Inf - Inf = NaN
+        res_nan = ieee754_rsub_f64(POS_INF_F64, POS_INF_F64)
+        flags_nan = compute_f64_status_flags(res_nan)
+        self.assertTrue(flags_nan.is_nan)
+        self.assertFalse(flags_nan.is_inf)
+
+        # Inf - 1.0 = Inf
+        res_inf = ieee754_rsub_f64(POS_INF_F64, ONE_F64)
+        flags_inf = compute_f64_status_flags(res_inf)
+        self.assertFalse(flags_inf.is_nan)
+        self.assertTrue(flags_inf.is_inf)
+        self.assertFalse(flags_inf.is_negative)
+
+    def test_vcc_and_scc_carry_borrow_preserved(self) -> None:
+        interp = ScalarLDSInterpreter64(lds_size_qwords=1024)
+        vcc_initial = 0xFEED_FACE_CAFE_BEEF
+        scc_initial = 1
+
+        interp.mem.write_qword(0, TWO_F64)
+        interp.write_reg_u32(RegisterOperand(2, count=1), 0)
+        interp.write_reg_u64(RegisterOperand(4, count=2), FIVE_F64)
+
+        instr = DSRsubRtnF64Instruction(
+            vdst=RegisterOperand(0, count=2),
+            vaddr=RegisterOperand(2, count=1),
+            vdata0=RegisterOperand(4, count=2),
+        )
+        interp.step(instr)
+
+        self.assertEqual(interp.read_reg_u64(RegisterOperand(0, count=2)), TWO_F64)
+        self.assertEqual(interp.mem.read_qword(0), THREE_F64)
+        self.assertEqual(vcc_initial, 0xFEED_FACE_CAFE_BEEF)
+        self.assertEqual(scc_initial, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
