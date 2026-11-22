@@ -904,5 +904,63 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertTrue(status_ov["clamped"])
 
 
+# ==============================================================================
+# Unit Tests: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestIEEE754EdgeCasesAndBoundaryExtremes(unittest.TestCase):
+    """Raw IEEE 754 bit pattern preservation and extreme arithmetic boundaries."""
+
+    def test_f16_signed_zero_distinction_no_flush(self) -> None:
+        pos_zero = 0x0000
+        neg_zero = 0x8000
+
+        res_pos = ref_mad_i32_i16(pos_zero, 1, 0)
+        res_neg = ref_mad_i32_i16(neg_zero, 1, 0)
+        self.assertEqual(res_pos, 0)
+        self.assertEqual(res_neg, to_u32(INT16_MIN))
+        self.assertNotEqual(res_pos, res_neg)
+
+    def test_f16_nan_and_infinity_preservation(self) -> None:
+        inf_pos = 0x7C00
+        inf_neg = 0xFC00
+        nan_val = 0x7E00
+
+        self.assertEqual(ref_mad_i32_i16(inf_pos, 1, 0), 31744)
+        self.assertEqual(ref_mad_i32_i16(inf_neg, 1, 0), to_u32(-1024))
+        self.assertEqual(ref_mad_i32_i16(nan_val, 1, 0), 32256)
+
+    def test_f16_subnormals_treated_as_integers(self) -> None:
+        self.assertEqual(ref_mad_i32_i16(0x0001, 10, 5), 15)
+        self.assertEqual(ref_mad_i32_i16(0x03FF, 2, 0), 1023 * 2)
+
+    def test_f32_float_bit_patterns_in_accumulator(self) -> None:
+        qnan32 = 0x7FC0_0000
+        neg_zero32 = 0x8000_0000
+
+        self.assertEqual(ref_mad_i32_i16(0, 0, qnan32), qnan32)
+        self.assertEqual(ref_mad_i32_i16(0, 0, neg_zero32), neg_zero32)
+
+    def test_extreme_boundary_min_times_min_plus_min32(self) -> None:
+        res = ref_mad_i32_i16(INT16_MIN, INT16_MIN, INT32_MIN)
+        self.assertEqual(res, 0xC000_0000)
+
+    def test_extreme_boundary_max_times_max_plus_max32_with_clamp(self) -> None:
+        res_unclamped = ref_mad_i32_i16(INT16_MAX, INT16_MAX, INT32_MAX, clamp=False)
+        res_clamped = ref_mad_i32_i16(INT16_MAX, INT16_MAX, INT32_MAX, clamp=True)
+
+        expected_unclamped = to_u32(1073676289 + INT32_MAX)
+        self.assertEqual(res_unclamped, expected_unclamped)
+        self.assertEqual(res_clamped, INT32_MAX)
+
+    def test_extreme_boundary_min_times_max_plus_min32_with_clamp(self) -> None:
+        res_unclamped = ref_mad_i32_i16(INT16_MIN, INT16_MAX, INT32_MIN, clamp=False)
+        res_clamped = ref_mad_i32_i16(INT16_MIN, INT16_MAX, INT32_MIN, clamp=True)
+
+        expected_unclamped = to_u32(-1073709056 + INT32_MIN)
+        self.assertEqual(res_unclamped, expected_unclamped)
+        self.assertEqual(res_clamped, to_u32(INT32_MIN))
+
+
 if __name__ == "__main__":
     unittest.main()
