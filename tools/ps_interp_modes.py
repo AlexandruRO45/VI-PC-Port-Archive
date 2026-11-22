@@ -290,12 +290,12 @@ def shader_row(dxbc_path, fssm_path, disasm_path):
         rows = psv0_inputs(data)
     except ValueError:
         return None
-    isg = isg1_elements(data)
-    rw = {e["register"]: e["rw"] for e in isg}
-    named = {e["register"]: e for e in isg}
+    # Packed semantics can share a register while occupying different components.
+    signature = {(e["register"], e["mask"]): e for e in isg1_elements(data)}
     for r in rows:
-        r["rw"] = rw.get(r["row"], 0)
-        e = named.get(r["row"])
+        mask = ((1 << r["cols"]) - 1) << r["start_col"]
+        e = signature.get((r["row"], mask))
+        r["rw"] = e["rw"] if e else 0
         if e and not r["name"] and e["name"]:
             r["name"] = e["name"]
         r["class"], r["ena_bit"] = interp_class(r["kind"], r["mode"])

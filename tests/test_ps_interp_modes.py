@@ -22,13 +22,14 @@ sys.path.insert(0, TOOLS)
 import ps_interp_modes  # noqa: E402
 
 
-def psv0(elements, inputs=None, strings=b"\0TEXCOORD\0", semidx=(0,), resources=0):
+def psv0(elements, inputs=None, strings=b"\0TEXCOORD\0", semidx=(0,), resources=0, *, start_cols=()):
     """Build a PSV0 chunk payload.  elements are (row, cols, kind, ctype, mode) tuples."""
     if inputs is None:
         inputs = len(elements)
     heap = strings.ljust((len(strings) + 3) & ~3, b"\0")
-    body = b"".join(struct.pack("<II6B2B", 1, 0, 1, row, 0x40 | cols, kind, ctype, mode, 0, 0)
-                    for row, cols, kind, ctype, mode in elements)
+    start_cols = start_cols or (0,) * len(elements)
+    body = b"".join(struct.pack("<II6B2B", 1, 0, 1, row, 0x40 | (start_col << 4) | cols, kind, ctype, mode, 0, 0)
+                    for (row, cols, kind, ctype, mode), start_col in zip(elements, start_cols, strict=True))
     runtime = b"\0" * 24
     r1 = bytes([0, 0, 0, 0, inputs, 0, 0, 0]) + b"\0" * 12
     out = struct.pack("<I", len(runtime) + len(r1)) + runtime + r1
@@ -52,15 +53,16 @@ def dxbc_container(chunks):
     header = b"DXBC" + b"\0" * 16 + struct.pack("<III", 1, total + len(body), len(chunks))
     return header + b"".join(struct.pack("<I", o) for o in offsets) + body
 
-def isg1(elements):
+def isg1(elements, *, masks=()):
     """ISG1 chunk payload; elements are (register, rw, name) with the repo's 32-byte layout."""
     names = [n.encode() + b"\0" for _, _, n in elements]
+    masks = masks or (0xF,) * len(elements)
     first = 8 + 32 * len(elements)
     out = struct.pack("<II", len(elements), 8)
     for i, (reg, rw, name) in enumerate(elements):
         noff = first + sum(len(n) for n in names[:i])
         out += struct.pack("<6I", 0, noff, 0, 0, 3, reg)
-        out += bytes([0xF, rw, 0, 0, 0, 0, 0, 0])
+        out += bytes([masks[i], rw, 0, 0, 0, 0, 0, 0])
     return out + b"".join(names)
 
 
@@ -220,6 +222,21 @@ class ShaderRowTest(unittest.TestCase):
         self.assertEqual([i["rw"] for i in row["inputs"]], [15, 15])
         self.assertEqual([t["p1p2"] for t in row["table"]], [True, True])
         self.assertEqual(row["usage"], {"1": ["p1p2"]})
+
+    def test_packed_inputs_keep_their_own_read_masks(self) -> None:
+        elements = [(0, 2, 0, 3, 2), (0, 2, 0, 3, 2)]
+        with tempfile.TemporaryDirectory() as tmp:
+            dx = os.path.join(tmp, "packed.dxbc")
+            for last_rw in (8, 0):
+                with self.subTest(last_rw=last_rw):
+                    container = dxbc_container({
+                        b"PSV0": psv0(elements, start_cols=(0, 2)),
+                        b"ISG1": isg1([(0, 1, "TEXCOORD"), (0, last_rw, "TEXCOORD")], masks=(3, 12)),
+                    })
+                    with open(dx, "wb") as output:
+                        output.write(container)
+                    row = ps_interp_modes.shader_row(dx, None, None)
+                    self.assertEqual([element["rw"] for element in row["inputs"]], [1, last_rw])
 
     def test_unparsable_psv0_returns_none(self):
         with tempfile.TemporaryDirectory() as tmp:
