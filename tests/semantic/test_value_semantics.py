@@ -692,6 +692,54 @@ class LaneMaskConstants(unittest.TestCase):
         self.assertEqual(w32, self.WANT["cs_w32_mask_imm"][1])
         self.assertEqual(w64, self.WANT["cs_w64_mask_imm"][1])
 
+class F16ExpLogWords(unittest.TestCase):
+    """runtime/test/shaders/cs_w32_f16_exp.asm and cs_w32_f16_log.asm: v_exp_f16 / v_log_f16 on exact inputs read the
+    low half, keep the high half of the destination, take neg/abs, and give the ISA's special values. One lane
+    stores eight words; the words are the GPU check's (check.py CS_DUMPS), derived by hand in each .asm header."""
+
+    WANT = {"cs_w32_f16_exp": [0xBEEF4400, 0x12343800, 0xBEEF4000, 0xBEEF4C00, 0xBEEF3800, 0x00007C00, 0x7C003C00, 1],
+            "cs_w32_f16_log": [0xBEEF4200, 0x1234BC00, 0xBEEF3C00, 0xBEEF4000, 0x40007C00, 0xC4000000, 0x44003C00, 1]}
+
+    @staticmethod
+    def h(x):
+        """f16 bits of a Python float (exact for every value used here)."""
+        return struct.unpack("<H", struct.pack("<e", x))[0]
+
+    def run_words(self, name):
+        sys.path.insert(0, os.path.join(support.ROOT, "runtime", "test", "shaders"))
+        from compute_fixture import compute_header
+        header = compute_header(os.path.join(support.ROOT, "runtime", "test", "shaders", name + ".asm"))
+        spv = support.translate_fixture(name, fssm=bytes(header))
+        memory = {a: 0xEEEEEEEE for a in range(0, 0x100, 4)}
+        # Lane 0 only (a partial subgroup): the shader cuts EXEC to lane 0, and the other lanes' registers are zero, an
+        # operand of Log2 that SPIR-V leaves undefined.
+        si.run_workgroup(spv, 1, 32,
+                         inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+                         push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28, memory=memory)
+        self.assertEqual(set(memory), set(range(0, 0x100, 4)), "nothing written outside the heap")
+        return [memory[4 * i] for i in range(8)]
+
+    def test_words(self):
+        for name, want in self.WANT.items():
+            with self.subTest(shader=name):
+                self.assertEqual([f"{w:#010x}" for w in self.run_words(name)], [f"{w:#010x}" for w in want])
+
+    def test_words_follow_from_the_definitions(self):
+        # Plain-Python reference: D.f16 = 2 ** S0 / log2(S0) of the low half, the high half of D kept, the special
+        # values of IEEE pow / log2 (the hardware's, docs/design.md f16 transcendentals row).
+        h, inf = self.h, math.inf
+        keep = lambda old, lo: old & 0xFFFF0000 | lo
+        pack = lambda lo, hi: lo | hi << 16
+        exp = [keep(0xBEEF5555, h(2.0 ** 2.0)), keep(0x12345555, h(2.0 ** -1.0)), keep(0xBEEF5555, h(2.0 ** -(-1.0))),
+               keep(0xBEEF5555, h(2.0 ** abs(-4.0))), keep(0xBEEF5555, h(2.0 ** -abs(-1.0))),
+               pack(h(inf), h(0.0)), pack(h(2.0 ** 0.0), h(inf)), 1]
+        log = [keep(0xBEEF5555, h(math.log2(8.0))), keep(0x12345555, h(math.log2(0.5))),
+               keep(0xBEEF5555, h(math.log2(abs(-2.0)))), keep(0xBEEF5555, h(math.log2(-(-4.0)))),
+               pack(h(inf), h(math.log2(4.0))), pack(h(math.log2(1.0)), h(math.log2(0.0625))),
+               pack(h(math.log2(2.0)), h(math.log2(16.0))), 1]
+        self.assertEqual(exp, self.WANT["cs_w32_f16_exp"])
+        self.assertEqual(log, self.WANT["cs_w32_f16_log"])
+
 
 if __name__ == "__main__":
     unittest.main()
