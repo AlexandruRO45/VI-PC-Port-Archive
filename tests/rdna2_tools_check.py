@@ -1056,7 +1056,8 @@ class TestRdna2Scanner(unittest.TestCase):
         for line in ("v_madak_f32 v5, v1, v2, 0x11213141", "v_madmk_f32 v5, v1, 0x11213141, v3"):
             self.assertTrue(is_instruction_supported(line), line)
         for line in ("v_madak_f32_e64 v5, v1, v2, 0x11213141", "v_madmk_f32 v5, v1, 0x11213141",
-                     "v_madak_f32_dpp v5, v1, v2, 0x11213141 quad_perm:[0,1,2,3]"):
+                     "v_madak_f32_dpp v5, v1, v2, 0x11213141 quad_perm:[0,1,2,3]",
+                     "v_madak_f32 v5, v1, v2, v3", "v_madmk_f32 v5, v1, v2, v3"):
             self.assertFalse(is_instruction_supported(line), line)
 
     def test_float_to_word_conversions_are_plain_e32_only(self):
