@@ -2,11 +2,13 @@
 
 Supports legacy and DX10 DDS headers across uncompressed 32-bit formats
 (BGRA8, RGBA8, BGRX8, RGBX8, R10G10B10A2_UNORM, and arbitrary 32-bit RGB/RGBA bitmasks) and
-block-compressed formats (BC1, BC2, BC3, BC4, BC5, BC7).
+block-compressed formats (BC1, BC2, BC3, BC4, BC5, BC6H, BC7).
 
 BC7 covers all eight modes. DXGI 97/98/99 (typeless, UNORM, UNORM_SRGB) emit
 the stored RGBA8 values with no sRGB transfer, and the reserved mode (no mode
-bit in the first byte) decodes as transparent black. BC6H is not supported.
+bit in the first byte) decodes as transparent black.
+BC6H UF16/SF16 previews clamp linear RGB to [0, 1], multiply by 255 and
+round to nearest (half up), with opaque alpha and opaque black for reserved modes.
 DXT2, DXT4 and premultiplied DX10 images are converted to straight alpha for PNG; sRGB colors are
 unpremultiplied in linear light and returned in their sRGB encoding.
 
@@ -81,6 +83,8 @@ _DXGI_MAP: dict[int, str] = {
     82: "BC5",
     83: "BC5",
     84: "BC5_SNORM",
+    95: "BC6H_UF16",
+    96: "BC6H_SF16",
     97: "BC7",
     98: "BC7",
     99: "BC7",
@@ -135,7 +139,7 @@ _BC7_UNQUANTIZE = {
 # Output byte for interpolated R, G, B, A under rotation 0-3 (A swaps with R, G or B).
 _BC7_ROTATIONS = ((0, 1, 2, 3), (3, 1, 2, 0), (0, 3, 2, 1), (0, 1, 3, 2))
 _BC7_RESERVED_BLOCK = bytes(64)
-_BC7_BLOCK_CACHE_LIMIT = 4096
+_BPTC_BLOCK_CACHE_LIMIT = 4096
 
 
 def _bc7_partition_layouts() -> tuple:
@@ -864,17 +868,31 @@ def _decode_bc7_block(block: int) -> bytes:
     return bytes(out)
 
 
-def _decode_bc7(data: bytes | bytearray | memoryview, offset: int, width: int, height: int) -> bytes:
+def _decode_bptc(data: bytes | bytearray | memoryview, offset: int, width: int, height: int, fmt: str) -> bytes:
     blocks_x = (width + 3) // 4
     blocks_y = (height + 3) // 4
     expected = blocks_x * blocks_y * 16
     if len(data) - offset < expected:
-        raise DdsError(f"Truncated BC7 payload: {len(data) - offset} bytes (need {expected})")
+        raise DdsError(f"Truncated {fmt} payload: {len(data) - offset} bytes (need {expected})")
 
     out = bytearray(width * height * 4)
     row_stride = width * 4
     cache: dict[bytes, bytes] = {}
-    from_bytes = int.from_bytes
+    if fmt == "BC7":
+        def decode_block(key):
+            return _decode_bc7_block(int.from_bytes(key, "little"))
+    else:
+        from ttpf_mips import decode_bc6h_block
+        signed = fmt == "BC6H_SF16"
+
+        def decode_block(key):
+            rgba = bytearray()
+            for rgb in decode_bc6h_block(key, 0, signed=signed):
+                for value in rgb:
+                    rgba.append(0 if value <= 0 else 255 if value >= 1 else int(value * 255 + 0.5))
+                rgba.append(255)
+            return bytes(rgba)
+
     pos = offset
 
     for by in range(blocks_y):
@@ -889,8 +907,8 @@ def _decode_bc7(data: bytes | bytearray | memoryview, offset: int, width: int, h
             pos += 16
             block_rgba = cache.get(key)
             if block_rgba is None:
-                block_rgba = _decode_bc7_block(from_bytes(key, "little"))
-                if len(cache) < _BC7_BLOCK_CACHE_LIMIT:
+                block_rgba = decode_block(key)
+                if len(cache) < _BPTC_BLOCK_CACHE_LIMIT:
                     cache[key] = block_rgba
 
             px0 = bx * 4
@@ -949,8 +967,8 @@ def decode_dds(data: bytes) -> tuple[int, int, bytes]:
         rgba = _decode_bc5(data, offset, width, height, signed=False)
     elif fmt == "BC5_SNORM":
         rgba = _decode_bc5(data, offset, width, height, signed=True)
-    elif fmt == "BC7":
-        rgba = _decode_bc7(data, offset, width, height)
+    elif fmt in ("BC6H_UF16", "BC6H_SF16", "BC7"):
+        rgba = _decode_bptc(data, offset, width, height, fmt)
     else:
         raise DdsError(f"Unsupported DDS format: {fmt}")
 

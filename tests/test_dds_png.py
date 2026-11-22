@@ -370,8 +370,8 @@ class HeaderTests(unittest.TestCase):
         self.assertIn("DX10", str(ctx.exception))
 
     def test_rejects_unknown_dxgi_format(self):
-        # 94-96 are BC6H typeless/UF16/SF16, which this decoder deliberately does not claim.
-        for dxgi in (94, 95, 96):
+        # Typeless BC6H lacks a signedness interpretation.
+        for dxgi in (94, 0xffff):
             with self.subTest(dxgi=dxgi):
                 with self.assertRaises(dds.DdsError) as ctx:
                     dds.parse_dds_header(dds_buffer(4, 4, flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=dxgi))
@@ -709,6 +709,22 @@ class Bc5Tests(unittest.TestCase):
         ))
         self.assertEqual([p[:2] for p in pixels(rgba)], [(255, 255), (128, 128)])
         self.assertEqual([p[3] for p in pixels(rgba)], [255, 255])
+
+
+class Bc6hTests(unittest.TestCase):
+    def test_linear_signed_and_unsigned_partial_blocks(self):
+        # Mode 11, index zero selects the first RGB endpoint (three 10-bit fields).
+        block = (3 | (512 << 5) | (448 << 15) | (224 << 25)).to_bytes(16, "little")
+        reserved = bytes([0x13]) + bytes(15)
+        black = (0, 0, 0, 255)
+        for fmt, color in ((95, (255, 101, 1, 255)), (96, (0, 255, 102, 255))):
+            data = dds_buffer(5, 5, block + reserved * 2 + block,
+                              flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=fmt)
+            rgba = dds.decode_dds(data)[2]
+            self.assertEqual(pixels(rgba), ([color] * 4 + [black]) * 4 + [black] * 4 + [color])
+            self.assertTrue(dds.dds_to_png_bytes(data).startswith(b"\x89PNG"))
+            with self.assertRaisesRegex(dds.DdsError, "Truncated BC6H"):
+                dds.decode_dds(data[:-1])
 
 
 class Bc7Tests(unittest.TestCase):
