@@ -346,5 +346,155 @@ class TestDsDecSrc2F64AST(unittest.TestCase):
         self.assertEqual(res, f64_to_bits(7.0))
 
 
+# ==============================================================================
+# Phase 3: Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarRegisterFile:
+    def __init__(self) -> None:
+        self.vgprs = [0] * DEFAULT_NUM_VGPRS
+        self.sgprs = [0] * DEFAULT_NUM_SGPRS
+
+    def read_vgpr(self, idx: int) -> int:
+        return self.vgprs[idx]
+
+    def write_vgpr(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = val & MASK32
+
+    def read_sgpr(self, idx: int) -> int:
+        return self.sgprs[idx]
+
+    def write_sgpr(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = val & MASK32
+
+
+class ScalarLDS64Interpreter:
+    def __init__(self, lds: LDSModel64, rf: ScalarRegisterFile | None = None) -> None:
+        self.lds = lds
+        self.rf = rf if rf is not None else ScalarRegisterFile()
+
+    def step(self, inst: DsSrc2F64Instruction) -> int:
+        vaddr = self.rf.read_vgpr(inst.vaddr.index)
+        new_val_a = self.lds.atomic_dec_src2_f64(
+            vaddr=vaddr,
+            offset0=inst.offset0,
+            offset1=inst.offset1,
+        )
+        return new_val_a
+
+
+class TestDsDecSrc2F64ScalarInterpreter(unittest.TestCase):
+    """Phase 3: Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.lds = LDSModel64(capacity_qwords=512)
+        self.rf = ScalarRegisterFile()
+        self.interp = ScalarLDS64Interpreter(self.lds, self.rf)
+
+    def test_scalar_step_normal_decrement(self) -> None:
+        vaddr = 0x80
+        idx_a = 0x80 >> 3
+        idx_b = (0x80 + 8) >> 3
+
+        self.lds.write_qword(idx_a, f64_to_bits(10.0))
+        self.lds.write_qword(idx_b, f64_to_bits(20.0))
+        self.rf.write_vgpr(0, vaddr)
+
+        inst = DsSrc2F64Instruction(
+            opcode=DsSrc2F64Opcode.DS_DEC_SRC2_F64,
+            vaddr=Register(RegKind.VGPR, 0),
+            offset0=0,
+            offset1=1,
+        )
+
+        res = self.interp.step(inst)
+        self.assertEqual(res, f64_to_bits(9.0))
+        self.assertEqual(self.lds.read_qword(idx_a), f64_to_bits(9.0))
+        self.assertEqual(self.lds.read_qword(idx_b), f64_to_bits(20.0))
+
+    def test_scalar_step_wrap_at_zero(self) -> None:
+        vaddr = 0x80
+        idx_a = 0x80 >> 3
+        idx_b = (0x80 + 8) >> 3
+
+        self.lds.write_qword(idx_a, f64_to_bits(0.0))
+        self.lds.write_qword(idx_b, f64_to_bits(15.0))
+        self.rf.write_vgpr(0, vaddr)
+
+        inst = DsSrc2F64Instruction(
+            opcode=DsSrc2F64Opcode.DS_DEC_SRC2_F64,
+            vaddr=Register(RegKind.VGPR, 0),
+            offset0=0,
+            offset1=1,
+        )
+
+        res = self.interp.step(inst)
+        self.assertEqual(res, f64_to_bits(15.0))
+        self.assertEqual(self.lds.read_qword(idx_a), f64_to_bits(15.0))
+
+    def test_scalar_step_reset_on_greater_threshold(self) -> None:
+        vaddr = 0x80
+        idx_a = 0x80 >> 3
+        idx_b = (0x80 + 8) >> 3
+
+        self.lds.write_qword(idx_a, f64_to_bits(50.0))
+        self.lds.write_qword(idx_b, f64_to_bits(10.0))
+        self.rf.write_vgpr(0, vaddr)
+
+        inst = DsSrc2F64Instruction(
+            opcode=DsSrc2F64Opcode.DS_DEC_SRC2_F64,
+            vaddr=Register(RegKind.VGPR, 0),
+            offset0=0,
+            offset1=1,
+        )
+
+        res = self.interp.step(inst)
+        self.assertEqual(res, f64_to_bits(10.0))
+
+    def test_scalar_step_with_offsets(self) -> None:
+        vaddr = 0x100
+        idx_a = (0x100 + 16) >> 3
+        idx_b = (0x100 + 32) >> 3
+
+        self.lds.write_qword(idx_a, f64_to_bits(2.0))
+        self.lds.write_qword(idx_b, f64_to_bits(5.0))
+        self.rf.write_vgpr(1, vaddr)
+
+        inst = DsSrc2F64Instruction(
+            opcode=DsSrc2F64Opcode.DS_DEC_SRC2_F64,
+            vaddr=Register(RegKind.VGPR, 1),
+            offset0=2,
+            offset1=4,
+        )
+
+        res = self.interp.step(inst)
+        self.assertEqual(res, f64_to_bits(1.0))
+        self.assertEqual(self.lds.read_qword(idx_a), f64_to_bits(1.0))
+
+    def test_scalar_step_non_returning_preserves_rf(self) -> None:
+        vaddr = 0x40
+        idx_a = 0x40 >> 3
+        idx_b = (0x40 + 8) >> 3
+
+        self.lds.write_qword(idx_a, f64_to_bits(3.0))
+        self.lds.write_qword(idx_b, f64_to_bits(10.0))
+
+        for i in range(10):
+            self.rf.write_vgpr(i, 0x500 + i)
+        self.rf.write_vgpr(0, vaddr)
+
+        inst = DsSrc2F64Instruction(
+            opcode=DsSrc2F64Opcode.DS_DEC_SRC2_F64,
+            vaddr=Register(RegKind.VGPR, 0),
+            offset0=0,
+            offset1=1,
+        )
+
+        self.interp.step(inst)
+        self.assertEqual(self.rf.read_vgpr(0), vaddr)
+        for i in range(1, 10):
+            self.assertEqual(self.rf.read_vgpr(i), 0x500 + i)
+
+
 if __name__ == "__main__":
     unittest.main()
