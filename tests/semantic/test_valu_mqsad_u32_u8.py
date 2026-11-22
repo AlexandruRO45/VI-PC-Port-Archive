@@ -44,7 +44,9 @@ Mathematical Properties and Bounds:
   - The 8th byte of src0 (bits 63:56) is unused by the 4 windows (window 3 uses bytes 3..6).
 """
 
-from typing import List, Sequence, Tuple
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import List, Sequence, Tuple, Union
 import unittest
 
 # Architectural bitmasks
@@ -128,6 +130,90 @@ def ref_mqsad_full_acc(s0_64: int, s1_32: int, s2_quad: Sequence[int]) -> List[T
         full_sum = acc + sad
         out.append((full_sum & MASK32, (full_sum >> 32) & 1))
     return out
+
+
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    LITERAL = auto()
+
+
+@dataclass(frozen=True)
+class Operand:
+    """Represents a register operand or inline/literal constant."""
+    reg_type: RegType
+    index: int = 0
+    count: int = 1
+    literal_value: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.count <= 0:
+            raise ValueError(f"Operand count must be >= 1, got {self.count}")
+        if self.reg_type == RegType.VGPR:
+            if not (0 <= self.index <= 255):
+                raise ValueError(f"VGPR index {self.index} out of range [0, 255]")
+            if self.index + self.count > 256:
+                raise ValueError(f"VGPR span v[{self.index}:{self.index + self.count - 1}] exceeds 256")
+        elif self.reg_type == RegType.SGPR:
+            if not (0 <= self.index <= 105):
+                raise ValueError(f"SGPR index {self.index} out of range [0, 105]")
+            if self.index + self.count > 106:
+                raise ValueError(f"SGPR span s[{self.index}:{self.index + self.count - 1}] exceeds 106")
+        elif self.reg_type == RegType.LITERAL:
+            if self.literal_value is None:
+                raise ValueError("Literal operand requires literal_value")
+            max_val = (1 << (32 * self.count)) - 1
+            if not (0 <= self.literal_value <= max_val):
+                raise ValueError(f"Literal value {self.literal_value:#x} out of range [0, {max_val:#x}]")
+
+    @classmethod
+    def vgpr(cls, index: int, count: int = 1) -> Operand:
+        return cls(RegType.VGPR, index=index, count=count)
+
+    @classmethod
+    def sgpr(cls, index: int, count: int = 1) -> Operand:
+        return cls(RegType.SGPR, index=index, count=count)
+
+    @classmethod
+    def literal(cls, value: int, count: int = 1) -> Operand:
+        max_val = (1 << (32 * count)) - 1
+        return cls(RegType.LITERAL, count=count, literal_value=value & max_val)
+
+    def disassemble(self) -> str:
+        if self.reg_type == RegType.VGPR:
+            return f"v[{self.index}:{self.index + self.count - 1}]" if self.count > 1 else f"v{self.index}"
+        if self.reg_type == RegType.SGPR:
+            return f"s[{self.index}:{self.index + self.count - 1}]" if self.count > 1 else f"s{self.index}"
+        assert self.literal_value is not None
+        if self.count == 2:
+            return f"0x{self.literal_value:016X}"
+        return f"0x{self.literal_value:08X}"
+
+
+@dataclass(frozen=True)
+class VMqsadU32U8Instruction:
+    """Symbolic AST node for AMD RDNA2 v_mqsad_u32_u8 instruction."""
+    dst: Operand
+    src0: Operand
+    src1: Operand
+    src2: Operand
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR or self.dst.count != 4:
+            raise TypeError(f"Destination must be a 4-VGPR span v[d:d+3], got {self.dst}")
+        if self.src0.count != 2:
+            raise ValueError(f"src0 must be a 64-bit 2-register span or 64-bit literal, got {self.src0}")
+        if self.src1.count != 1:
+            raise ValueError(f"src1 must be a 32-bit single register or literal, got {self.src1}")
+        if self.src2.reg_type != RegType.VGPR or self.src2.count != 4:
+            raise TypeError(f"src2 accumulator must be a 4-VGPR span v[s2:s2+3], got {self.src2}")
+
+    def disassemble(self) -> str:
+        return f"v_mqsad_u32_u8 {self.dst.disassemble()}, {self.src0.disassemble()}, {self.src1.disassemble()}, {self.src2.disassemble()}"
 
 
 # ==============================================================================
@@ -235,6 +321,110 @@ class TestValuMqsadU32U8Oracle(unittest.TestCase):
             ref_mqsad_u32_u8(0, 0, [0, 0, 0])
         with self.assertRaises(ValueError):
             ref_mqsad_full_acc(0, 0, [0, 0, 0, 0, 0])
+
+
+class TestValuMqsadU32U8SymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_operand_creation_and_disassembly(self) -> None:
+        v_quad = Operand.vgpr(8, count=4)
+        v_pair = Operand.vgpr(2, count=2)
+        v_single = Operand.vgpr(1)
+        s_pair = Operand.sgpr(4, count=2)
+        s_single = Operand.sgpr(10)
+        lit64 = Operand.literal(0x0807060504030201, count=2)
+        lit32 = Operand.literal(0x04030201)
+
+        self.assertEqual(v_quad.disassemble(), "v[8:11]")
+        self.assertEqual(v_pair.disassemble(), "v[2:3]")
+        self.assertEqual(v_single.disassemble(), "v1")
+        self.assertEqual(s_pair.disassemble(), "s[4:5]")
+        self.assertEqual(s_single.disassemble(), "s10")
+        self.assertEqual(lit64.disassemble(), "0x0807060504030201")
+        self.assertEqual(lit32.disassemble(), "0x04030201")
+
+    def test_operand_bounds_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            Operand.vgpr(-1)
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+        with self.assertRaises(ValueError):
+            Operand.vgpr(254, count=4)  # 254+4=258 > 256
+        with self.assertRaises(ValueError):
+            Operand.sgpr(-1)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(105, count=2)  # 105+2=107 > 106
+        with self.assertRaises(ValueError):
+            Operand.vgpr(0, count=0)
+
+    def test_instruction_construction_and_disassembly(self) -> None:
+        instr = VMqsadU32U8Instruction(
+            dst=Operand.vgpr(8, count=4),
+            src0=Operand.vgpr(2, count=2),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(4, count=4),
+        )
+        self.assertEqual(instr.disassemble(), "v_mqsad_u32_u8 v[8:11], v[2:3], v1, v[4:7]")
+
+        # With SGPR pair for src0 and literal for src1
+        instr2 = VMqsadU32U8Instruction(
+            dst=Operand.vgpr(0, count=4),
+            src0=Operand.sgpr(2, count=2),
+            src1=Operand.literal(0x04030201),
+            src2=Operand.vgpr(4, count=4),
+        )
+        self.assertEqual(instr2.disassemble(), "v_mqsad_u32_u8 v[0:3], s[2:3], 0x04030201, v[4:7]")
+
+    def test_instruction_validation_rejections(self) -> None:
+        # dst cannot be SGPR
+        with self.assertRaises(TypeError):
+            VMqsadU32U8Instruction(
+                dst=Operand.sgpr(0, count=4),
+                src0=Operand.vgpr(2, count=2),
+                src1=Operand.vgpr(1),
+                src2=Operand.vgpr(4, count=4),
+            )
+        # dst cannot have count != 4
+        with self.assertRaises(TypeError):
+            VMqsadU32U8Instruction(
+                dst=Operand.vgpr(0, count=2),
+                src0=Operand.vgpr(2, count=2),
+                src1=Operand.vgpr(1),
+                src2=Operand.vgpr(4, count=4),
+            )
+        # src0 must have count 2
+        with self.assertRaises(ValueError):
+            VMqsadU32U8Instruction(
+                dst=Operand.vgpr(0, count=4),
+                src0=Operand.vgpr(2, count=1),
+                src1=Operand.vgpr(1),
+                src2=Operand.vgpr(4, count=4),
+            )
+        # src1 must have count 1
+        with self.assertRaises(ValueError):
+            VMqsadU32U8Instruction(
+                dst=Operand.vgpr(0, count=4),
+                src0=Operand.vgpr(2, count=2),
+                src1=Operand.vgpr(1, count=2),
+                src2=Operand.vgpr(4, count=4),
+            )
+        # src2 must be VGPR quad
+        with self.assertRaises(TypeError):
+            VMqsadU32U8Instruction(
+                dst=Operand.vgpr(0, count=4),
+                src0=Operand.vgpr(2, count=2),
+                src1=Operand.vgpr(1),
+                src2=Operand.sgpr(4, count=4),
+            )
+        with self.assertRaises(TypeError):
+            VMqsadU32U8Instruction(
+                dst=Operand.vgpr(0, count=4),
+                src0=Operand.vgpr(2, count=2),
+                src1=Operand.vgpr(1),
+                src2=Operand.vgpr(4, count=2),
+            )
 
 
 if __name__ == "__main__":
