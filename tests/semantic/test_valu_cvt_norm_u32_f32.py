@@ -694,5 +694,93 @@ class TestValuCvtNormU32F32SIMDDivergence(unittest.TestCase):
         self.assertTrue(all(r == UNORM32_HALF for r in results))
 
 
+# ---------------------------------------------------------------------------
+# Register Aliasing and In-Place Operand Preservation
+# ---------------------------------------------------------------------------
+
+class TestValuCvtNormU32F32RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing hazards and in-place operand preservation."""
+
+    def test_inplace_self_aliasing(self) -> None:
+        # v0 = v_cvt_norm_u32_f32 v0
+        interp = ScalarVALUInterpreter()
+        interp.write_reg32(RegKind.VGPR, 0, HALF_F32)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_U32_F32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 0),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, UNORM32_HALF)
+        self.assertEqual(interp.read_reg32(RegKind.VGPR, 0), UNORM32_HALF)
+
+    def test_inplace_self_aliasing_with_modifiers(self) -> None:
+        # v0 = v_cvt_norm_u32_f32 -|v0|
+        interp = ScalarVALUInterpreter()
+        interp.write_reg32(RegKind.VGPR, 0, ONE_F32)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_U32_F32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 0),
+            abs_src0=True,
+            neg_src0=True,
+            encoding=Encoding.VOP3,
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, UNORM32_MIN)
+        self.assertEqual(interp.read_reg32(RegKind.VGPR, 0), UNORM32_MIN)
+
+    def test_sequential_aliasing_pipeline(self) -> None:
+        # Step 1: v0 = v_cvt_norm_u32_f32 v1 (v1 = 0.5f) -> v0 = 0x80000000
+        # Step 2: v1 = v_cvt_norm_u32_f32 v0 (v0 bits reinterpreted as float32: 0x80000000 is -0.0f) -> v1 = 0
+        interp = ScalarVALUInterpreter()
+        interp.write_reg32(RegKind.VGPR, 1, HALF_F32)
+
+        inst1 = Instruction(
+            opcode=Opcode.V_CVT_NORM_U32_F32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+        )
+        inst2 = Instruction(
+            opcode=Opcode.V_CVT_NORM_U32_F32,
+            dst=Register(RegKind.VGPR, 1),
+            src0=Register(RegKind.VGPR, 0),
+        )
+
+        r1 = interp.step(inst1)
+        self.assertEqual(r1, UNORM32_HALF)
+        self.assertEqual(interp.read_reg32(RegKind.VGPR, 0), UNORM32_HALF)
+
+        r2 = interp.step(inst2)
+        # 0x80000000 is -0.0f in f32, which converts to UNORM32_MIN (0)
+        self.assertEqual(r2, UNORM32_MIN)
+        self.assertEqual(interp.read_reg32(RegKind.VGPR, 1), UNORM32_MIN)
+
+    def test_simd_multi_lane_inplace_aliasing(self) -> None:
+        sim = SIMDWavefrontInterpreter(wave_size=32)
+        inputs = [
+            (HALF_F32 if (i % 2 == 0) else ONE_F32)
+            for i in range(32)
+        ]
+
+        for lane in range(32):
+            sim.write_lane_reg32(lane, RegKind.VGPR, 2, inputs[lane])
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_U32_F32,
+            dst=Register(RegKind.VGPR, 2),
+            src0=Register(RegKind.VGPR, 2),
+        )
+        results = sim.step(inst)
+
+        for lane in range(32):
+            expected = UNORM32_HALF if (lane % 2 == 0) else UNORM32_MAX
+            self.assertEqual(results[lane], expected)
+            final_word = sim.read_lane_reg32(lane, RegKind.VGPR, 2)
+            self.assertEqual(final_word, expected)
+
+
 if __name__ == "__main__":
     unittest.main()
