@@ -54,6 +54,9 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
 - `test_saveexec_b64.py` does the same for `s_and_saveexec_b64`, `s_or_saveexec_b64`, `s_andn2_saveexec_b64` and
   `s_andn2_wrexec_b64` with S0 a compare result in VCC or in an SGPR pair (13 pairs of S0 and EXEC for each op and
   source), and runs the GPU test `cs_w64x_saveexec_b64`.
+- `test_w64x_carry_fixture.py` runs the GPU test `cs_w64x_carry` (v_add/sub/subrev_co_u32 and the `_co_ci` forms with
+  SGPR-pair and VCC carry masks over 64 lanes, carry-in differing between the halves) as one 64-wide subgroup and checks
+  all 922 words against hand constants and a plain-Python model.
 - `spirv_wave_interp.py` runs every invocation of one subgroup at once through structured control flow
   (split at a selection, rejoin at its merge, loops until no invocation is left) with the subgroup
   operations the translator emits. It is the SPIR-V side of `tools/cf_diff.py` (FUZZ-8);
