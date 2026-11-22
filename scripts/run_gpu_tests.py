@@ -657,7 +657,8 @@ def run_suite(a, work: str) -> int:
     index = {}
     idx_path = os.path.join(spirv_dir, "index.json")
     if os.path.isfile(idx_path):
-        index = json.load(open(idx_path, encoding="utf-8"))
+        with open(idx_path, encoding="utf-8") as index_file:
+            index = json.load(index_file)
 
     ext = ".exe" if os.name == "nt" else ""
     vk_compute = os.path.join(a.build, "vk_compute_test" + ext)
