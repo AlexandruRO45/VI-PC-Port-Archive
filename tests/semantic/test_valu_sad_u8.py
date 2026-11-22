@@ -451,6 +451,71 @@ class SIMDVALUInterpreter:
 
 
 # ==============================================================================
+# Condition Codes, Status Flags, and Carry Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class VALUStatusFlags:
+    """Architectural condition codes and status flags for 32-bit ALU operations."""
+    zero: bool
+    sign: bool
+    carry: bool
+    overflow: bool
+
+    @classmethod
+    def from_sad_u8(cls, s0: int, s1: int, s2: int) -> VALUStatusFlags:
+        sad = ref_sad_u8_sum(s0, s1)
+        acc = s2 & MASK32
+        full_sum = acc + sad
+        result = full_sum & MASK32
+
+        zero = (result == 0)
+        sign = bool(result & 0x8000_0000)
+        carry = (full_sum >= 0x1_0000_0000)
+        s_acc = s32(acc)
+        s_sad = sad
+        s_res = s32(result)
+        overflow = (s_acc > 0 and s_sad > 0 and s_res < 0)
+
+        return cls(zero=zero, sign=sign, carry=carry, overflow=overflow)
+
+    @classmethod
+    def from_sad_hi_u8(cls, s0: int, s1: int, s2: int) -> VALUStatusFlags:
+        sad = ref_sad_u8_sum(s0, s1)
+        acc = s2 & MASK32
+        shifted = (sad << 16)
+        full_sum = acc + shifted
+        result = full_sum & MASK32
+
+        zero = (result == 0)
+        sign = bool(result & 0x8000_0000)
+        carry = (full_sum >= 0x1_0000_0000)
+        s_acc = s32(acc)
+        s_shifted = s32(shifted)
+        s_res = s32(result)
+        overflow = (s_acc > 0 and s_shifted > 0 and s_res < 0)
+
+        return cls(zero=zero, sign=sign, carry=carry, overflow=overflow)
+
+    @classmethod
+    def from_msad_u8(cls, s0: int, s1: int, s2: int) -> VALUStatusFlags:
+        sad = ref_msad_u8_sum(s0, s1)
+        acc = s2 & MASK32
+        full_sum = acc + sad
+        result = full_sum & MASK32
+
+        zero = (result == 0)
+        sign = bool(result & 0x8000_0000)
+        carry = (full_sum >= 0x1_0000_0000)
+        s_acc = s32(acc)
+        s_sad = sad
+        s_res = s32(result)
+        overflow = (s_acc > 0 and s_sad > 0 and s_res < 0)
+
+        return cls(zero=zero, sign=sign, carry=carry, overflow=overflow)
+
+
+# ==============================================================================
 # Unit Tests: Reference Mathematical Oracles
 # ==============================================================================
 
@@ -1083,6 +1148,73 @@ class TestValuSadU8RegisterAliasing(unittest.TestCase):
         for i in range(256):
             if i != 42:
                 self.assertEqual(self.rf.vgprs[i], 0x1000 + i)
+
+
+class TestValuSadU8StatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry generation."""
+
+    def test_carry_generation_exact_boundary(self) -> None:
+        # Sum = 0xFFFFFFFF -> no carry, sign=True (bit 31=1), zero=False
+        s0 = pack_bytes(1, 0, 0, 0)
+        s1 = pack_bytes(0, 0, 0, 0)  # sad = 1
+        flags_no_carry = VALUStatusFlags.from_sad_u8(s0, s1, 0xFFFF_FFFE)
+        self.assertFalse(flags_no_carry.carry)
+        self.assertFalse(flags_no_carry.zero)
+        self.assertTrue(flags_no_carry.sign)
+
+        # Sum = 0x1_0000_0000 -> carry = True, zero = True, sign = False
+        flags_carry = VALUStatusFlags.from_sad_u8(s0, s1, MASK32)
+        self.assertTrue(flags_carry.carry)
+        self.assertTrue(flags_carry.zero)
+        self.assertFalse(flags_carry.sign)
+
+    def test_carry_generation_sad_hi_u8(self) -> None:
+        # shifted sad = 0x03FC_0000. acc = 0xFC05_0000 -> full_sum = 0x1_0001_0000 -> carry = True
+        s0 = 0xFFFF_FFFF
+        s1 = 0x0000_0000
+        flags = VALUStatusFlags.from_sad_hi_u8(s0, s1, 0xFC05_0000)
+        self.assertTrue(flags.carry)
+        self.assertFalse(flags.zero)
+
+        # No carry case
+        flags_no_carry = VALUStatusFlags.from_sad_hi_u8(s0, s1, 0x0001_0000)
+        self.assertFalse(flags_no_carry.carry)
+
+    def test_zero_flag_behaviors(self) -> None:
+        # Diff = 0, acc = 0 -> zero = True, carry = False, sign = False
+        flags_zero = VALUStatusFlags.from_sad_u8(0x1234_5678, 0x1234_5678, 0)
+        self.assertTrue(flags_zero.zero)
+        self.assertFalse(flags_zero.carry)
+        self.assertFalse(flags_zero.sign)
+
+        # Diff = 5, acc = 0 -> zero = False
+        s0 = pack_bytes(5, 0, 0, 0)
+        s1 = pack_bytes(0, 0, 0, 0)
+        flags_nonzero = VALUStatusFlags.from_sad_u8(s0, s1, 0)
+        self.assertFalse(flags_nonzero.zero)
+
+    def test_sign_flag_behaviors(self) -> None:
+        # Result < 0x80000000 -> sign = False
+        flags_pos = VALUStatusFlags.from_sad_u8(0, 0, 0x7FFF_FFFF)
+        self.assertFalse(flags_pos.sign)
+
+        # Result == 0x80000000 -> sign = True
+        flags_neg = VALUStatusFlags.from_sad_u8(0, 0, 0x8000_0000)
+        self.assertTrue(flags_neg.sign)
+
+    def test_overflow_flag_behavior(self) -> None:
+        # acc is positive signed (0x7FFF_FFFF), adding positive sad wraps into negative signed space
+        s0 = pack_bytes(1, 0, 0, 0)
+        s1 = pack_bytes(0, 0, 0, 0)  # sad = 1
+        flags_ovf = VALUStatusFlags.from_sad_u8(s0, s1, 0x7FFF_FFFF)
+        self.assertTrue(flags_ovf.overflow)
+        self.assertTrue(flags_ovf.sign)
+
+    def test_msad_u8_flags(self) -> None:
+        # all template bytes zero -> sad = 0. acc = 0 -> zero = True
+        flags = VALUStatusFlags.from_msad_u8(0xFFFF_FFFF, 0, 0)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.carry)
 
 
 if __name__ == "__main__":
