@@ -6,8 +6,10 @@
 
 namespace rt::process {
 
-// What the game sees as argv[0..] and GetCommandLine: `program` then `args`, quoted where needed.
-void set_command_line(const std::string& program, const std::vector<std::string>& args);
+// What the game sees as argv[0..] and GetCommandLine: `program` then `args`, quoted where needed. They stay wide
+// (__wargv, GetCommandLineW); the narrow argv and GetCommandLineA are their ANSI code page form, with characters the
+// code page lacks replaced as Windows does for a real process, so no argument can make this throw (RT-84).
+void set_command_line(const std::wstring& program, const std::vector<std::wstring>& args);
 
 // Runs a mapped EXE's entry point on a new thread with `stack_bytes` of reserved stack and returns the game's
 // exit code: the entry point's return value, or what it passed to exit/ExitProcess (3 for abort). Returns when

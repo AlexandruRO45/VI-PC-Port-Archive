@@ -541,6 +541,10 @@ if(BUILD_TESTING)
     add_test(NAME run_tiny_game COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42)
     add_test(NAME run_tiny_game_exit_code COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- wrong args)
     set_tests_properties(run_tiny_game_exit_code PROPERTIES WILL_FAIL TRUE)
+    # A game argument outside the ANSI code page (Greek, CJK) reaches the game instead of crashing gta6rt with
+    # 0xC0000409 (RT-84). The extra argument makes tiny_game exit 1, so this checks that it started with all four.
+    add_test(NAME run_tiny_game_non_acp_argument COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 "α中文")
+    set_tests_properties(run_tiny_game_non_acp_argument PROPERTIES PASS_REGULAR_EXPRESSION "tiny_game: started, argc=4")
     # Two modes at once are refused before anything is mapped (#886). The stand-in game's own arguments are passed,
     # so a gta6rt that ignored the conflict would run it, print "running" and exit 0.
     foreach(modes "dry-run;run" "dry-run;init" "init;run")
