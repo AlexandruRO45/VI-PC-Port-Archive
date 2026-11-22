@@ -301,6 +301,17 @@ def check_shader_records():
         assert {form for _, form in forms} >= scalar, sorted(scalar - {form for _, form in forms})
         assert not {"s_addc_u32", "s_cmp_lt_u64", "s_cmpk_eq_u32", "s_cselect_b64"} & {f for _, f in forms}
         assert {group for group, form in forms if form in scalar} == {"SOP1", "SOP2", "SOPC", "SOPK"}
+    # The rounding fixture covers both encodings of v_ceil_f32 and v_rndne_f32 once its test passes.
+    rounding = {("VOP1", "v_ceil_f32"), ("VOP1", "v_rndne_f32"),
+                ("VOP3", "v_ceil_f32_e64"), ("VOP3", "v_rndne_f32_e64")}
+    assert rounding <= gfx and rounding <= fc.gfx_forms(pixel.ACCEPTED, gfx)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = sample_repo(Path(tmp) / "repo", {})
+        words = {"v_ceil_f32_e32", "v_ceil_f32_e64", "v_rndne_f32_e32", "v_rndne_f32_e64"}
+        assert words <= pixel.ACCEPTED
+        covered = fc.measure({"pixel_aot_warp": "pass"}, root, {"pixel_aot_warp": set(pixel.ACCEPTED)})
+        without = fc.measure({"pixel_aot_warp": "pass"}, root, {"pixel_aot_warp": pixel.ACCEPTED - words})
+        assert covered["gfx1013"]["covered"] == without["gfx1013"]["covered"] + len(rounding)
 
 
 def check_parsing():
