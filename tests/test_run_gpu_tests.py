@@ -310,6 +310,73 @@ class Wave32LaneDumps(unittest.TestCase):
                 self.assertIsNone(rgt.narrow_subgroup_skip(out))
 
 
+class DumpWaveWidth(unittest.TestCase):
+    """Which compute dumps run with --require-wave64 comes from check.py's WAVE32_DUMPS, not a second list in the
+    runner: a wave32 fixture added to check.py only was run as wave64 and reported SKIP on every 32-wide GPU (#3208)."""
+
+    @staticmethod
+    def check_dumps():
+        import check
+        return [n for n, _ in (*check.CS_DUMPS, *check.W64X_DUMPS, *check.W64X_PARTIAL)]
+
+    def dump_commands(self, emulate):
+        """run_suite over every cs_ fixture, with only check.py's dump fixtures translated: the vk_compute_test dump
+        command line of each."""
+        names = set(self.check_dumps())
+        commands = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            def fake_run(cmd, env=None, gpu=True):
+                if not gpu:   # the translator: a .spv for each dump fixture, none for the rest
+                    for name in names:
+                        Path(tmp, "spirv", name + ".spv").touch()
+                    return 0, ""
+                if Path(cmd[0]).stem == "vk_compute_test" and cmd[3] == "dump":
+                    commands[Path(cmd[1]).stem] = cmd
+                return 1, ""
+
+            args = SimpleNamespace(filter="cs_", build=tmp, llvm_mc="unused")
+            env = {"LEONIDA_W64_EMULATE": "1"} if emulate else {}
+            with (patch.dict(rgt.os.environ, env, clear=False),
+                  patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=fake_run),
+                  contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO())):
+                if not emulate:
+                    rgt.os.environ.pop("LEONIDA_W64_EMULATE", None)
+                rgt.run_suite(args, tmp)
+        return commands
+
+    def test_runner_reads_check_py_list(self):
+        import check
+        self.assertIs(rgt.WAVE32_DUMPS, check.WAVE32_DUMPS)
+
+    def test_require_wave64_exactly_for_the_wave64_dumps(self):
+        import check
+        partial = {n for n, _ in check.W64X_PARTIAL}
+        commands = self.dump_commands(emulate=False)
+        for name in self.check_dumps():
+            with self.subTest(name=name):
+                self.assertIn(name, commands, "check.py dump fixture not run as a dump by run_gpu_tests.py")
+                wave64 = name not in check.WAVE32_DUMPS and name not in partial
+                self.assertEqual("--require-wave64" in commands[name], wave64)
+
+    def test_emulated_wave64_requires_no_width(self):
+        commands = self.dump_commands(emulate=True)
+        for name in self.check_dumps():
+            with self.subTest(name=name):
+                self.assertNotIn("--require-wave64", commands[name])
+
+    def test_wave32_fixtures_are_listed(self):
+        # cs_w32_* and cs_*_w32 are wave32 by name; one missing from WAVE32_DUMPS is run as wave64 by both runners
+        import check
+        names = [f[:-4] for f in os.listdir(rgt.SHADER_DIR) if f.endswith(".asm")]
+        wave32 = [n for n in names if n.startswith("cs_w32_") or (n.startswith("cs_") and n.endswith("_w32"))]
+        self.assertTrue(wave32)
+        for name in wave32:
+            with self.subTest(name=name):
+                self.assertIn(name, check.WAVE32_DUMPS)
+
+
 class SubgroupPinSkip(unittest.TestCase):
     """A device that cannot pin the wave size a shader was translated for skips, not fails. GCN3/GCN4 report
     64..64, so cs_barrier_loop's wave32 fixture runs at 64 lanes and its words say nothing; check.py skips it

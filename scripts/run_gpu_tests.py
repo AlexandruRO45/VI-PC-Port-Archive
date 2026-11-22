@@ -39,7 +39,7 @@ from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and
 from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
 from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
 from check import MESH_COMPUTE, mesh_env   # LEONIDA_MESH_COMPUTE=1: mesh shaders as compute + a generated VS
-from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip, narrow_subgroup_skip,
+from check import (WAVE32_DUMPS, WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip, narrow_subgroup_skip,
                    unpinned_subgroup_skip, vcmpx_forms_narrow_skip, wave32_lane_skip)   # as in check.py
 from check import PIXEL_VERTEX, interp_f16_high_problem, ij_computed_problem, mandelbrot_problem   # pixel producers and checks
 from check import barycentric_problem
@@ -1044,24 +1044,16 @@ def run_suite(a, work: str) -> int:
                                       0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF],
             }
             want = cs_dump_wants[name]
-            # Every dump but cs_store / cs_smem_soffset_imm / cs_w32_lane_wrap / cs_movrelsd_2 / cs_w32_permute /
-            # cs_w32_lds_u8_d16 / cs_w32_sincos / cs_w32_int_ext / cs_w32_salu64 / cs_w32_misc_ext / cs_w32_new_ops / cs_signed_zero_nan, the wave32
-            # cs_wqm_w32 / cs_bpermute32 and the DPP tests is a whole-wave (wave64) mask test: ask for a 64-wide subgroup and skip,
-            # as check.py does, where the device has none
-            # (vk_compute_test exits 77) instead of reporting a failure. With LEONIDA_W64_EMULATE=1 they were
-            # translated with --wave64-emulate and run on any subgroup size.
+            # The whole-wave (wave64) mask tests ask for a 64-wide subgroup and skip, as check.py does, where the device
+            # has none (vk_compute_test exits 77) instead of reporting a failure. Which dumps are wave32 is check.py's
+            # WAVE32_DUMPS, the one list both runners read: a wave32 fixture missing from it would run as wave64 and
+            # SKIP on every 32-wide device (#3208). With LEONIDA_W64_EMULATE=1 they were translated with
+            # --wave64-emulate and run on any subgroup size.
             # cs_w64x_partial and cs_w64x_partial_scmp (40-thread groups) can't have full subgroups: they ask for
             # size 64 without them.
             emulated = w64_emulated()
             partial = name in ("cs_w64x_partial", "cs_w64x_partial_scmp")
-            wave64 = name not in ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2",
-                                  "cs_w32_permute", "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop",
-                                  "cs_w32_lds_u8_d16", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops",
-                                  "cs_w32_lds_subdword", "cs_w32_lds_wide",
-                                  "cs_bpermute32", "cs_w32_partial_scmp", "cs_w32_sincos",
-                                  "cs_lds_b64_cmpst", "cs_exec_const", "cs_w32_mask_imm", "cs_mask_vgpr_exec",
-                                  "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8",
-                                  "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi", "cs_w32_andn2_exec") and not emulated and not partial
+            wave64 = name not in WAVE32_DUMPS and not emulated and not partial
             if partial and not emulated:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
             if name in WAVE32_LANE_DUMPS:   # 32 lanes even without index.json, as check.py requests (#774)
