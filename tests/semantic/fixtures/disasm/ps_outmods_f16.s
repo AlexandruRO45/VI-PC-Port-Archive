@@ -7,7 +7,6 @@
 	v_cvt_f16_f32_e64 v3, v1 mul:4
 	v_mov_b32 v8, 0x38000000
 	v_mov_b32 v9, 0x477ff000
-	v_mov_b32 v10, 0x80000000
 	v_mov_b32 v11, 2.0
 	v_mov_b32 v4, 0
 	v_mov_b32 v5, 0
@@ -15,7 +14,7 @@
 	v_mov_b32 v7, 0
 	v_cvt_f16_f32_e64 v4, v8 mul:2
 	v_cvt_f16_f32_e64 v5, v9 div:2
-	v_cvt_f16_f32_e64 v6, v10 mul:2
+	v_cvt_f16_f32_e64 v6, v1 clamp mul:2
 	v_cvt_f16_f32_e64 v7, v11 clamp mul:2
 	v_lshl_or_b32 v4, v5, 16, v4
 	v_lshl_or_b32 v5, v7, 16, v6
