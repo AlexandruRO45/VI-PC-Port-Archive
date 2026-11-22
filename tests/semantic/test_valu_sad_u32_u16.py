@@ -595,5 +595,76 @@ class TestVSadU32U16SIMD(unittest.TestCase):
                 self.assertIsNone(results[lane])
                 self.assertEqual(state.vgprs[lane][0], sentinel)
 
+# ==============================================================================
+# Unit Tests: Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestVSadU32U16RegisterAliasing(unittest.TestCase):
+    """Test suite verifying register aliasing and in-place operand preservation."""
+
+    def test_aliasing_dst_equals_src0(self) -> None:
+        """dst and src0 share the same VGPR: dst must be read before overwritten."""
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        state.vgprs[0] = 300
+        state.vgprs[1] = 0
+        state.sgprs[0] = 0x1234
+
+        instr = VSadU32U16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(1),
+            src2=Operand.sgpr(0),
+        )
+
+        res = interp.step(instr, state)
+        expected = 300 + 0x1234
+        self.assertEqual(res, expected)
+        self.assertEqual(state.vgprs[0], expected)
+
+    def test_aliasing_dst_equals_src2_accumulator_in_place(self) -> None:
+        """dst and src2 share the same VGPR (canonical in-place accumulation loop)."""
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        state.vgprs[0] = 500  # accumulator in v0
+        state.vgprs[1] = 10
+        state.vgprs[2] = 0
+
+        # v0 = v_sad_u32_u16(v1, v2, v0)
+        instr = VSadU32U16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(0),
+        )
+
+        # Iteration 1: + 10 -> 510
+        interp.step(instr, state)
+        self.assertEqual(state.vgprs[0], 510)
+
+        # Iteration 2: + 10 -> 520
+        interp.step(instr, state)
+        self.assertEqual(state.vgprs[0], 520)
+
+    def test_aliasing_src0_equals_src1(self) -> None:
+        """src0 == src1 produces diff=0, preserving accumulator exactly."""
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        state.vgprs[1] = 0xDEADBEEF
+        state.vgprs[2] = 0xCAFEBABE
+
+        instr = VSadU32U16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2),
+        )
+
+        interp.step(instr, state)
+        self.assertEqual(state.vgprs[0], 0xCAFEBABE)
+
 if __name__ == "__main__":
     unittest.main()
