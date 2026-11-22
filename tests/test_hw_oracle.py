@@ -160,15 +160,16 @@ class DefenderQuarantine(unittest.TestCase):
         o.exe, o.dll = os.path.join("tmp", "leonida_hw_oracle_abc.exe"), "amdhip64_7.dll"
         return o
 
-    def test_a_quarantined_launcher_is_a_skip_with_an_exclusion_hint(self):
+    def test_a_quarantined_launcher_is_a_skip_naming_the_executable(self):
         o = self.oracle()
         err = OSError(22, "Operation did not complete successfully because the file contains a virus")
         err.winerror = 225
         with mock.patch.object(subprocess, "run", side_effect=err):
-            with self.assertRaisesRegex(runner.Unavailable, "exclusion") as cm:
+            with self.assertRaisesRegex(runner.Unavailable, "Protection history") as cm:
                 o._launch("k.co", ["probe"])
-        self.assertIn(os.path.dirname(o.exe), str(cm.exception))
+        self.assertIn(o.exe, str(cm.exception))
         self.assertIn("225", str(cm.exception))
+        self.assertNotIn("exclusion", str(cm.exception).lower())
 
     def test_other_launch_errors_still_raise(self):
         o = self.oracle()

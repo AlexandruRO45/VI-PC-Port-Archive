@@ -284,9 +284,8 @@ class Oracle:
                                text=True)
         except OSError as e:
             if getattr(e, "winerror", None) == 225:   # ERROR_VIRUS_INFECTED: Defender quarantined the fresh build
-                raise Unavailable(f"Windows Defender quarantined the launcher {self.exe} (WinError 225): add an exclusion "
-                                  f"for {os.path.dirname(self.exe)} under Windows Security > Virus & threat protection > "
-                                  "Exclusions, then run again") from None
+                raise Unavailable(f"Windows Defender quarantined the launcher {self.exe} (WinError 225): see the detection "
+                                  "under Windows Security > Protection history, then run again") from None
             raise
         return r.returncode, r.stdout, r.stderr
 
