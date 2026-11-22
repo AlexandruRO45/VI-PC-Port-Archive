@@ -106,9 +106,14 @@ struct VulkanDeviceInfo {
     // multiDrawIndirect is enabled: ExecuteIndirect hands all its commands to one vkCmdDraw*Indirect. Without it the
     // layer issues one call per command (a drawCount above 1 is invalid without the feature).
     bool multi_draw_indirect = false;
-    // drawIndirectCount (Vulkan 1.2) is enabled: ExecuteIndirect with a count buffer. True unless the creator says
-    // otherwise (it is the way callers that never set this behaved); without it such a call is unsupported.
-    bool draw_indirect_count = true;
+    // drawIndirectCount (Vulkan 1.2) is enabled: ExecuteIndirect with a count buffer. Without it such a call is
+    // unsupported.
+    bool draw_indirect_count = false;
+    // drawIndirectFirstInstance is enabled: indirect records may have a StartInstanceLocation other than 0. Without
+    // it such a record is invalid Vulkan (the layer cannot see inside the GPU buffer, so it only says so once).
+    bool draw_indirect_first_instance = false;
+    // VkPhysicalDeviceLimits::maxDrawIndirectCount (a call takes at most this many records); 0 means unknown, no cap.
+    std::uint32_t max_draw_indirect_count = 0;
     bool sampler_mirror_clamp_to_edge = false;
     bool sampler_filter_minmax = false;
     // VK_KHR_calibrated_timestamps or VK_EXT_calibrated_timestamps is enabled on `device` (QueueClock).

@@ -602,6 +602,10 @@ struct ExecuteIndirect {
     // binds the pipeline and the dynamic state as for a Draw, and issues the indirect draw. Null: the caller has set
     // all that up (a raw indirect call), as the unit tests of the indirect path do.
     std::shared_ptr<const Draw> state;
+    // A draw kind without `state` is a raw call that the caller has wrapped in rendering and bound a pipeline for
+    // (the unit tests of the indirect path do); only then does replay issue it as it is. Otherwise a draw kind with
+    // no state is unsupported: a bare vkCmdDraw*Indirect outside a render pass is invalid Vulkan.
+    bool raw = false;
     // kind == dispatch: the compute pipeline and root arguments in effect, as Dispatch records them, so the dispatches
     // run that pipeline with those arguments whatever the command buffer had bound. A pipeline of 0 leaves the binding
     // as it is.

@@ -4861,7 +4861,11 @@ public:
                     return (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
                 });
         }
-        state_.context->set_indirect_features(info.multi_draw_indirect, info.draw_indirect_count);
+        state_.context->set_indirect_features(info.multi_draw_indirect, info.draw_indirect_count,
+                                              info.max_draw_indirect_count ? info.max_draw_indirect_count : UINT32_MAX);
+        if (!info.draw_indirect_first_instance)
+            std::fprintf(stderr, "[rt] d3d12: drawIndirectFirstInstance is not enabled: ExecuteIndirect records with "
+                                 "a StartInstanceLocation other than 0 are invalid\n");
         if (info.buffer_device_address && state_.context->loaded() && !create_arena())
             std::fprintf(stderr, "[rt] d3d12: the GPU address arena could not be created\n");
         if (info.conditional_rendering) {
@@ -9000,6 +9004,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     info.multi_draw_indirect = chosen_features.multiDrawIndirect == VK_TRUE;
     info.draw_indirect_count = chosen12.drawIndirectCount == VK_TRUE;
     enable12.drawIndirectCount = info.draw_indirect_count;
+    info.draw_indirect_first_instance = chosen_features.drawIndirectFirstInstance == VK_TRUE;
+    info.max_draw_indirect_count = chosen.limits.maxDrawIndirectCount;
     info.sampler_mirror_clamp_to_edge = chosen12.samplerMirrorClampToEdge;
     info.sampler_filter_minmax = chosen12.samplerFilterMinmax;
     enable12.runtimeDescriptorArray = info.bindless;

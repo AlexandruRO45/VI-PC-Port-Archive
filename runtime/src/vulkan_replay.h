@@ -2228,15 +2228,17 @@ inline void emit_indirect(const ReplayFunctions& vk, VkCommandBuffer command_buf
         return;
     }
     // Without multiDrawIndirect a call draws one command: loop over them.
-    const std::uint32_t per_call = vk.multi_draw_indirect ? ind.max_count : 1;
+    // and a call takes at most maxDrawIndirectCount records.
+    const std::uint32_t per_call =
+        vk.multi_draw_indirect ? std::max<std::uint32_t>(1, std::min(ind.max_count, vk.max_draw_indirect_count)) : 1;
     if (ind.kind == IndirectKind::draw) {
         for (std::uint32_t k = 0; k < ind.max_count; k += per_call)
-            vk.draw_indirect(command_buffer, p.binding.buffer, arguments + VkDeviceSize(k) * ind.stride, per_call,
-                             ind.stride);
+            vk.draw_indirect(command_buffer, p.binding.buffer, arguments + VkDeviceSize(k) * ind.stride,
+                             std::min(per_call, ind.max_count - k), ind.stride);
     } else if (ind.kind == IndirectKind::draw_indexed) {
         for (std::uint32_t k = 0; k < ind.max_count; k += per_call)
             vk.draw_indexed_indirect(command_buffer, p.binding.buffer, arguments + VkDeviceSize(k) * ind.stride,
-                                     per_call, ind.stride);
+                                     std::min(per_call, ind.max_count - k), ind.stride);
     } else if (ind.kind == IndirectKind::dispatch) {
         for (std::uint64_t k = 0; k < ind.max_count; ++k) {
             if (ind.count_buffer)
@@ -2999,6 +3001,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
                 p.pipeline = *pipeline;
             }
+            if (ind->kind != IndirectKind::dispatch && !ind->state && !ind->raw) return ReplayResult::unsupported;
             // A draw with the list's graphics state: prepared as a Draw is (the argument and count buffers stay in
             // p.binding and p.source). Recording uses p.draw, as for a Draw.
             if (ind->state) {

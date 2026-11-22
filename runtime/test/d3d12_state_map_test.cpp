@@ -598,10 +598,10 @@ int main() {
         };
 
         CommandList list;
-        CHECK(list.execute_indirect({IndirectKind::draw, 16, 2, 1, 4, 0, 0}));
-        CHECK(list.execute_indirect({IndirectKind::draw_indexed, 20, 2, 1, 8, 0, 0}));
-        CHECK(list.execute_indirect({IndirectKind::draw, 16, 2, 1, 12, 2, 4}));
-        CHECK(list.execute_indirect({IndirectKind::draw_indexed, 20, 2, 1, 16, 2, 8}));
+        CHECK(list.execute_indirect({IndirectKind::draw, 16, 2, 1, 4, 0, 0, nullptr, true}));
+        CHECK(list.execute_indirect({IndirectKind::draw_indexed, 20, 2, 1, 8, 0, 0, nullptr, true}));
+        CHECK(list.execute_indirect({IndirectKind::draw, 16, 2, 1, 12, 2, 4, nullptr, true}));
+        CHECK(list.execute_indirect({IndirectKind::draw_indexed, 20, 2, 1, 16, 2, 8, nullptr, true}));
         CHECK(list.execute_indirect({IndirectKind::dispatch, 20, 2, 1, 20, 0, 0}));
         CHECK(list.close());
         CHECK(replay(list, VK_NULL_HANDLE, resolve, vk) == ReplayResult::success);
@@ -615,8 +615,8 @@ int main() {
             single.multi_draw_indirect = false;
             offsets.clear();
             CommandList one;
-            CHECK(one.execute_indirect({IndirectKind::draw, 16, 2, 1, 4, 0, 0}));
-            CHECK(one.execute_indirect({IndirectKind::draw_indexed, 20, 3, 1, 8, 0, 0}));
+            CHECK(one.execute_indirect({IndirectKind::draw, 16, 2, 1, 4, 0, 0, nullptr, true}));
+            CHECK(one.execute_indirect({IndirectKind::draw_indexed, 20, 3, 1, 8, 0, 0, nullptr, true}));
             CHECK(one.close());
             CHECK(replay(one, VK_NULL_HANDLE, resolve, single) == ReplayResult::success);
             CHECK((offsets == std::vector<VkDeviceSize>{260, 276, 264, 284, 304}));

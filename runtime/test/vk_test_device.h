@@ -111,6 +111,7 @@ public:
     bool swapchain_maintenance1 = false;
     bool multi_draw_indirect = false;  // multiDrawIndirect enabled, where the device has it
     bool draw_indirect_count = false;  // drawIndirectCount (Vulkan 1.2) enabled, where the device has it
+    std::uint32_t max_draw_indirect_count = 0;  // VkPhysicalDeviceLimits::maxDrawIndirectCount
     bool draw_indirect_first_instance = false;  // drawIndirectFirstInstance enabled: indirect records may start at an instance
     bool shader_fma = false;       // VK_KHR_shader_fma and shaderFmaFloat32 enabled (OpFmaKHR, rdna2spirv.py --fma khr)
     bool occlusion_query_precise = false;    // occlusionQueryPrecise enabled
@@ -439,6 +440,7 @@ public:
         multi_draw_indirect = features.features.multiDrawIndirect == VK_TRUE;
         enable.drawIndirectFirstInstance = features.features.drawIndirectFirstInstance;
         draw_indirect_first_instance = features.features.drawIndirectFirstInstance == VK_TRUE;
+        max_draw_indirect_count = chosen.limits.maxDrawIndirectCount;
         enable.logicOp = features.features.logicOp;  // d3d12_draw_test's logic-op draw, where available
         enable.geometryShader = features.features.geometryShader;  // d3d12_geometry_test, where available
         enable.shaderInt64 = features.features.shaderInt64;  // translated shaders declare Int64 for their addresses
