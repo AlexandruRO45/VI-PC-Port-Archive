@@ -670,5 +670,91 @@ class TestDsDecSrc2F64SIMDMultiLane(unittest.TestCase):
         self.assertEqual(lds.read_qword(idx_a), f64_to_bits(6.0))
 
 
+# ==============================================================================
+# Phase 5: Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestDsDecSrc2F64RegisterAliasing(unittest.TestCase):
+    """Phase 5: Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_vaddr_register_preservation_scalar(self) -> None:
+        lds = LDSModel64(capacity_qwords=512)
+        rf = ScalarRegisterFile()
+        interp = ScalarLDS64Interpreter(lds, rf)
+
+        vaddr = 0x100
+        idx_a = 0x100 >> 3
+        idx_b = (0x100 + 8) >> 3
+        lds.write_qword(idx_a, f64_to_bits(5.0))
+        lds.write_qword(idx_b, f64_to_bits(10.0))
+
+        rf.write_vgpr(0, vaddr)
+
+        inst = DsSrc2F64Instruction(
+            opcode=DsSrc2F64Opcode.DS_DEC_SRC2_F64,
+            vaddr=Register(RegKind.VGPR, 0),
+            offset0=0,
+            offset1=1,
+        )
+
+        res = interp.step(inst)
+        self.assertEqual(res, f64_to_bits(4.0))
+        self.assertEqual(rf.read_vgpr(0), vaddr)
+
+    def test_identical_offsets_location_a_equals_location_b(self) -> None:
+        lds = LDSModel64(capacity_qwords=512)
+        rf = ScalarRegisterFile()
+        interp = ScalarLDS64Interpreter(lds, rf)
+
+        vaddr = 0x200
+        target_idx = (vaddr + 2 * 8) >> 3
+        lds.write_qword(target_idx, f64_to_bits(42.0))
+        rf.write_vgpr(0, vaddr)
+
+        inst = DsSrc2F64Instruction(
+            opcode=DsSrc2F64Opcode.DS_DEC_SRC2_F64,
+            vaddr=Register(RegKind.VGPR, 0),
+            offset0=2,
+            offset1=2,
+        )
+
+        res = interp.step(inst)
+        self.assertEqual(res, f64_to_bits(41.0))
+        self.assertEqual(lds.read_qword(target_idx), f64_to_bits(41.0))
+
+        lds.write_qword(target_idx, f64_to_bits(0.0))
+        res_zero = interp.step(inst)
+        self.assertEqual(res_zero, f64_to_bits(0.0))
+
+    def test_interlaced_memory_locations_across_divergent_lanes(self) -> None:
+        lds = LDSModel64(capacity_qwords=512)
+        simd = SIMDLDS64WavefrontInterpreter(wave_size=32, lds=lds)
+        simd.set_exec_mask(0x3)
+
+        idx_0 = 0x100 >> 3
+        idx_1 = 0x108 >> 3
+        idx_2 = 0x110 >> 3
+
+        lds.write_qword(idx_0, f64_to_bits(10.0))
+        lds.write_qword(idx_1, f64_to_bits(20.0))
+        lds.write_qword(idx_2, f64_to_bits(30.0))
+
+        simd.write_lane_vgpr(0, 0, 0x100)
+        simd.write_lane_vgpr(1, 0, 0x108)
+
+        inst = DsSrc2F64Instruction(
+            opcode=DsSrc2F64Opcode.DS_DEC_SRC2_F64,
+            vaddr=Register(RegKind.VGPR, 0),
+            offset0=0,
+            offset1=1,
+        )
+
+        results = simd.step(inst)
+        self.assertEqual(results[0], f64_to_bits(9.0))
+        self.assertEqual(results[1], f64_to_bits(19.0))
+        self.assertEqual(simd.read_lane_vgpr(0, 0), 0x100)
+        self.assertEqual(simd.read_lane_vgpr(1, 0), 0x108)
+
+
 if __name__ == "__main__":
     unittest.main()
