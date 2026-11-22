@@ -39,6 +39,15 @@ pblendd256 PROC FRAME
     ret
 pblendd256 ENDP
 
+pblendd256_mem PROC FRAME
+    .endprolog
+    vmovups ymm1, ymmword ptr [rcx]
+    vpblendd ymm0, ymm1, ymmword ptr [rdx], 05h
+    vmovups ymmword ptr [r8], ymm0
+    vzeroupper
+    ret
+pblendd256_mem ENDP
+
 ; imm8 = 0x31: low lane = src1_hi (1), high lane = src2_hi (3)
 perm2i128_hi PROC FRAME
     .endprolog
