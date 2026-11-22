@@ -753,5 +753,128 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
         self.assertEqual(lds.read_dword(0), 999)
 
 
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(DEFAULT_LDS_SIZE_BYTES)
+        self.scalar_interp = ScalarDSInterpreter()
+        self.simd_interp = SIMDDSInterpreter()
+
+    def test_alias_vdst_and_vaddr(self) -> None:
+        # ds_min_rtn_i32 v1, v1, v2: vdst == vaddr
+        state = ScalarThreadState(lds=self.lds)
+        # LDS[dword 3] (addr 12) = 150
+        self.lds.write_dword(3, 150)
+        state.set_vgpr(VGPR(1), 12)  # vaddr is v1
+        state.set_vgpr(VGPR(2), 50)  # vdata is v2 (50 < 150)
+
+        inst = DSMinRtnI32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_I32,
+            vdst=VGPR(1),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        ret = self.scalar_interp.execute(state, inst)
+
+        # Must return old memory value 150 into v1
+        self.assertEqual(ret, 150)
+        self.assertEqual(state.get_vgpr(VGPR(1)), 150)
+        # Memory must be updated with min(150, 50) = 50
+        self.assertEqual(self.lds.read_dword(3), 50)
+
+    def test_alias_vdst_and_vdata(self) -> None:
+        # ds_min_rtn_i32 v2, v1, v2: vdst == vdata
+        state = ScalarThreadState(lds=self.lds)
+        # LDS[dword 4] (addr 16) = 200
+        self.lds.write_dword(4, 200)
+        state.set_vgpr(VGPR(1), 16)          # vaddr is v1
+        state.set_vgpr(VGPR(2), u32(-80))    # vdata is v2 (-80 < 200)
+
+        inst = DSMinRtnI32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_I32,
+            vdst=VGPR(2),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        ret = self.scalar_interp.execute(state, inst)
+
+        # Must return old memory value 200 into v2
+        self.assertEqual(ret, 200)
+        self.assertEqual(state.get_vgpr(VGPR(2)), 200)
+        # Memory must be updated with min(200, -80) = -80
+        self.assertEqual(self.lds.read_dword(4), u32(-80))
+
+    def test_alias_all_operands_same_register(self) -> None:
+        # ds_min_rtn_i32 v0, v0, v0: vdst == vaddr == vdata
+        state = ScalarThreadState(lds=self.lds)
+        # Address is 8 (dword 2). We set LDS[2] = 50
+        self.lds.write_dword(2, 50)
+        state.set_vgpr(VGPR(0), 8)  # v0 holds 8
+
+        inst = DSMinRtnI32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_I32,
+            vdst=VGPR(0),
+            vaddr=VGPR(0),
+            vdata=VGPR(0),
+        )
+        ret = self.scalar_interp.execute(state, inst)
+
+        # vaddr = 8, vdata = 8.
+        # LDS was 50. min(50, 8) = 8.
+        # vdst (v0) gets old memory value 50.
+        self.assertEqual(ret, 50)
+        self.assertEqual(state.get_vgpr(VGPR(0)), 50)
+        self.assertEqual(self.lds.read_dword(2), 8)
+
+    def test_simd_wave32_aliasing_vdst_vaddr(self) -> None:
+        wave = SIMDWaveState(wave_size=32, exec_mask=0xFFFFFFFF, lds=self.lds)
+        for lane in range(32):
+            addr = lane * 4
+            self.lds.write_dword(lane, 1000 + lane)
+            wave.set_vgpr(lane, VGPR(1), addr)
+            wave.set_vgpr(lane, VGPR(2), 500)
+
+        inst = DSMinRtnI32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_I32,
+            vdst=VGPR(1),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        results = self.simd_interp.execute(wave, inst)
+
+        for lane in range(32):
+            self.assertEqual(results[lane], 1000 + lane)
+            self.assertEqual(wave.get_vgpr(lane, VGPR(1)), 1000 + lane)
+            self.assertEqual(self.lds.read_dword(lane), 500)
+
+    def test_idempotent_in_place_convergence(self) -> None:
+        state = ScalarThreadState(lds=self.lds)
+        self.lds.write_dword(0, 100)
+        state.set_vgpr(VGPR(1), 0)
+        state.set_vgpr(VGPR(2), 25)
+
+        inst = DSMinRtnI32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_I32,
+            vdst=VGPR(0),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+
+        # Pass 1: returns 100, memory becomes 25
+        ret1 = self.scalar_interp.execute(state, inst)
+        self.assertEqual(ret1, 100)
+        self.assertEqual(self.lds.read_dword(0), 25)
+
+        # Pass 2: memory already 25, vdata is 25. returns 25, memory stays 25
+        ret2 = self.scalar_interp.execute(state, inst)
+        self.assertEqual(ret2, 25)
+        self.assertEqual(self.lds.read_dword(0), 25)
+
+
 if __name__ == "__main__":
     unittest.main()
