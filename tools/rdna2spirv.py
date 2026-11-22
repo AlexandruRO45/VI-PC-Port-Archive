@@ -2697,8 +2697,18 @@ class Gen:
     def cmp_class(self, a, exec_only=False):
         """Test x's class against the mask and write the result to VCC/SGPR or EXEC.
         Bits: 0 sNaN, 1 qNaN, 2 -inf, 3 -normal, 4 -denormal, 5 -0, 6 +0, 7 +denormal, 8 +normal, 9 +inf."""
-        x, mask = self.src_f(a[-2]), self.src_u(a[-1])
-        u = self.tou(x)
+        s, mask = a[-2], self.src_u(a[-1])
+        # Apply abs/neg bitwise on the raw IEEE-754 bits so signalling NaNs stay signalling and denormals
+        # are never flushed (SPIR-V OpFNegate/FAbs do not guarantee sNaN preservation; measured on gfx1036).
+        u = self.src_u({k: v for k, v in s.items() if k not in ("abs", "neg")})
+        if s.get("abs"):
+            g = self.tmp()
+            self.emit(f"{g} = OpBitwiseAnd %uint {u} {self.cu(0x7FFFFFFF)}")
+            u = g
+        if s.get("neg"):
+            g = self.tmp()
+            self.emit(f"{g} = OpBitwiseXor %uint {u} {self.cu(0x80000000)}")
+            u = g
         sign, absu = self.tmp(), self.tmp()
         self.emit(f"{sign} = OpShiftRightLogical %uint {u} {self.cu(31)}")
         self.emit(f"{absu} = OpBitwiseAnd %uint {u} {self.cu(0x7FFFFFFF)}")
@@ -2735,6 +2745,90 @@ class Gen:
             hit = b(f"OpLogicalAnd %bool {on} {c}")
             acc = b(f"OpLogicalOr %bool {acc} {hit}")
         acc = b(f"OpLogicalAnd %bool {acc} {self.active_b()}")   # inactive lanes write 0
+        if exec_only:
+            self.emit(f"OpStore %active {acc}")
+            self.uses_active = True
+            return
+        r = b(f"OpSelect %uint {acc} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+        d = a[0]
+        if len(a) == 2 or (d["k"] == "special" and d["t"] in ("vcc", "vcc_lo")):
+            self.emit(f"OpStore %vcc {r}")
+        else:
+            self.mask_dst(d, r)
+
+    def cmp_class_f64(self, a, exec_only=False):
+        """Test binary64 (lo, hi) class against S1[9:0] using pure 32-bit uint ops (no Float64 capability).
+        Measured natively on RDNA2 (gfx1036, wave32 & wave64, flush & ieee): same 10 class bits as f32,
+        mask bits [31:10] ignored, abs/neg operate bitwise on hi[31] (preserving sNaN), inline ints -16..64
+        sign-extend to 64 bits, 32-bit literals occupy the upper 32 bits (lo = 0, hi = lit)."""
+        s, mask = a[-2], self.src_u(a[-1])
+        k = s["k"]
+        if k in ("vgpr", "sgpr") and s.get("n") == 2:
+            lo, hi = self.load_reg(k, s["r"]), self.load_reg(k, s["r"] + 1)
+        elif s.get("f64_literal"):
+            lo, hi = self.cu(0), self.cu(s["v"] & 0xFFFFFFFF)
+        elif k == "fimm":
+            bits = struct.unpack("<Q", struct.pack("<d", float(s["v"])))[0]
+            lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
+        elif k == "imm":
+            v = s["v"]
+            if -16 <= v <= 64:
+                bits = v & 0xFFFFFFFFFFFFFFFF
+                lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
+            elif -0x80000000 <= v <= 0xFFFFFFFF:
+                lo, hi = self.cu(0), self.cu(v & 0xFFFFFFFF)
+            else:
+                lo, hi = self.cu(v & 0xFFFFFFFF), self.cu((v >> 32) & 0xFFFFFFFF)
+        elif k == "special" and s["t"] == "null":
+            lo, hi = self.cu(0), self.cu(0)
+        else:
+            raise Unsupported("v_cmp_class_f64 operand")
+        if s.get("abs"):
+            g = self.tmp()
+            self.emit(f"{g} = OpBitwiseAnd %uint {hi} {self.cu(0x7FFFFFFF)}")
+            hi = g
+        if s.get("neg"):
+            g = self.tmp()
+            self.emit(f"{g} = OpBitwiseXor %uint {hi} {self.cu(0x80000000)}")
+            hi = g
+        sign, abshi = self.tmp(), self.tmp()
+        self.emit(f"{sign} = OpShiftRightLogical %uint {hi} {self.cu(31)}")
+        self.emit(f"{abshi} = OpBitwiseAnd %uint {hi} {self.cu(0x7FFFFFFF)}")
+        exp_, man_hi = self.tmp(), self.tmp()
+        self.emit(f"{exp_} = OpShiftRightLogical %uint {abshi} {self.cu(20)}")
+        self.emit(f"{man_hi} = OpBitwiseAnd %uint {abshi} {self.cu(0xFFFFF)}")
+        neg = self.tmp_bool_nz(sign)
+
+        def b(cond_line):
+            t = self.tmp()
+            self.emit(f"{t} = {cond_line}")
+            return t
+        lo0 = b(f"OpIEqual %bool {lo} {self.cu(0)}")
+        man_hi0 = b(f"OpIEqual %bool {man_hi} {self.cu(0)}")
+        man0 = b(f"OpLogicalAnd %bool {man_hi0} {lo0}")
+        man_nz = b(f"OpLogicalNot %bool {man0}")
+        exp0 = b(f"OpIEqual %bool {exp_} {self.cu(0)}")
+        expmax = b(f"OpIEqual %bool {exp_} {self.cu(0x7FF)}")
+        is_zero = b(f"OpLogicalAnd %bool {exp0} {man0}")
+        is_inf = b(f"OpLogicalAnd %bool {expmax} {man0}")
+        is_nan = b(f"OpLogicalAnd %bool {expmax} {man_nz}")
+        quiet = b(f"OpUGreaterThanEqual %bool {man_hi} {self.cu(0x80000)}")
+        snan = b(f"OpLogicalAnd %bool {is_nan} " + b(f"OpLogicalNot %bool {quiet}"))
+        qnan = b(f"OpLogicalAnd %bool {is_nan} {quiet}")
+        denorm = b(f"OpLogicalAnd %bool {exp0} {man_nz}")
+        normal = b(f"OpLogicalAnd %bool " + b(f"OpLogicalNot %bool {exp0}") + " " + b(f"OpLogicalNot %bool {expmax}"))
+        pos = b(f"OpLogicalNot %bool {neg}")
+        classes = [snan, qnan, b(f"OpLogicalAnd %bool {is_inf} {neg}"), b(f"OpLogicalAnd %bool {normal} {neg}"),
+                   b(f"OpLogicalAnd %bool {denorm} {neg}"), b(f"OpLogicalAnd %bool {is_zero} {neg}"),
+                   b(f"OpLogicalAnd %bool {is_zero} {pos}"), b(f"OpLogicalAnd %bool {denorm} {pos}"),
+                   b(f"OpLogicalAnd %bool {normal} {pos}"), b(f"OpLogicalAnd %bool {is_inf} {pos}")]
+        acc = "%false"
+        for i, c in enumerate(classes):
+            bit = b(f"OpBitwiseAnd %uint {mask} {self.cu(1 << i)}")
+            on = b(f"OpINotEqual %bool {bit} {self.cu(0)}")
+            hit = b(f"OpLogicalAnd %bool {on} {c}")
+            acc = b(f"OpLogicalOr %bool {acc} {hit}")
+        acc = b(f"OpLogicalAnd %bool {acc} {self.active_b()}")
         if exec_only:
             self.emit(f"OpStore %active {acc}")
             self.uses_active = True
@@ -4649,6 +4743,8 @@ class Gen:
             self.dst(a[0], r)
         elif op in ("v_cmp_class_f32", "v_cmpx_class_f32"):
             self.cmp_class(a, exec_only=op == "v_cmpx_class_f32")
+        elif op in ("v_cmp_class_f64", "v_cmpx_class_f64"):
+            self.cmp_class_f64(a, exec_only=op == "v_cmpx_class_f64")
         elif op in ("v_ffbl_b32", "v_ffbh_u32", "s_flbit_i32_b32") or \
                 (op == "s_ff1_i32_b32" and not self.holds_lane_mask(a[1])):       # of a lane mask: further down
             x = self.src_u(a[1])

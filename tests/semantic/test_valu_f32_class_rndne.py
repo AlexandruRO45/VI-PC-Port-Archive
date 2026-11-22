@@ -30,10 +30,9 @@ Findings & exclusions (no shared files modified):
      - For `v_rndne_f32` on NaN (`qNaN` / `sNaN`), SPIR-V / GLSL.std.450 `RoundEven` leaves NaN payload/quieting
        unspecified (spirv_mini_interp.py returns the input NaN unchanged; hardware quiets `sNaN`). Tests assert
        that the result is a binary32 NaN rather than pinning an exact NaN payload.
-     - For `v_cmp_class_f32` / `v_cmpx_class_f32` VOP3 source modifiers (`-`, `|..|`), tools/rdna2spirv.py emits
-       float `OpFNegate`/`FAbs`, which in spirv_mini_interp.py goes through Python float packing and quiets `sNaN`
-       (see tests/semantic/test_interp.py). Source modifiers are therefore tested on `+-inf`, `+-normal`,
-       `+-subnormal`, `+-0.0`, and `qNaN`; raw `sNaN` (`+sNaN` / `-sNaN`) is tested without float modifiers.
+     - For `v_cmp_class_f32` / `v_cmpx_class_f32` VOP3 source modifiers (`-`, `|..|`, `-|..|`), tools/rdna2spirv.py
+       applies `abs`/`neg` bitwise on the raw IEEE-754 bits (`& 0x7fffffff`, `^ 0x80000000`), matching RDNA2 hardware
+       (`gfx1036`) so signalling NaNs stay signalling (bit 0) and never quiet to `qNaN` (bit 1).
 """
 import gc
 import math
@@ -452,7 +451,7 @@ class CmpClassF32Tests(unittest.TestCase):
         ], ("v10", "v11", "v12", "v13"))
         self.assertEqual(got, (1, 1, 1, 1))
 
-        # Source modifiers (-, |..|, -|..|) apply before classification on non-sNaN values.
+        # Source modifiers (-, |..|, -|..|) apply bitwise before classification (matching RDNA2 hardware).
         mod_cases = [
             (0x80000000, "|v1|", CLASS_PZERO, 1),       # |-0.0| -> +0.0
             (0x80000000, "|v1|", CLASS_NZERO, 0),
@@ -487,6 +486,33 @@ class CmpClassF32Tests(unittest.TestCase):
             "v_mov_b32 v13, 0",
         ], ("v10", "v11", "v12", "v13"))
         self.assertEqual(w64, (1, 1, 0, 0))
+
+    def test_snan_source_modifiers_keep_snan(self):
+        # On RDNA2 (gfx1036), neg/abs on v_cmp(x)_class_f32 flip/clear only the sign bit and
+        # never quiet sNaNs. The translator must lower them bitwise without OpFNegate or FAbs.
+        for x_bits in (0x7F800001, 0xFFA00000, 0x7FBFFFFF):
+            for src_expr in ("-v1", "|v1|", "-|v1|"):
+                with self.subTest(x=f"{x_bits:#010x}", src=src_expr):
+                    lines = [
+                        f"v_mov_b32 v1, {x_bits:#x}",
+                        f"v_cmp_class_f32_e64 s4, {src_expr}, {CLASS_SNAN:#x}",
+                        "v_cndmask_b32_e64 v10, 0, 1, s4",
+                        f"v_cmp_class_f32_e64 s5, {src_expr}, {CLASS_QNAN:#x}",
+                        "v_cndmask_b32_e64 v11, 0, 1, s5",
+                        "v_mov_b32 v12, 0",
+                        f"v_cmpx_class_f32_e64 {src_expr}, {CLASS_SNAN:#x}",
+                        "v_mov_b32 v12, 1",
+                        "s_mov_b32 exec_lo, -1",
+                        "v_mov_b32 v13, 0",
+                        f"v_cmpx_class_f32_e64 {src_expr}, {CLASS_QNAN:#x}",
+                        "v_mov_b32 v13, 1",
+                        "s_mov_b32 exec_lo, -1",
+                    ]
+                    spv = translate_ps(lines + ["exp mrt0 v10, v11, v12, v13 done vm"])
+                    self.assertNotIn("OpFNegate", spv)
+                    self.assertNotIn("FAbs", spv)
+                    got = tuple(si.run_fragment(spv)["%out_mrt0"])
+                    self.assertEqual(got, (1, 0, 1, 0))
 
     def test_inactive_exec_lane_writes_zero_to_mask_dst(self):
         # Hardware VOPC rule: inactive lanes write 0 into the destination mask even when operands match.
