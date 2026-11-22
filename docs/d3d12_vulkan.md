@@ -2768,6 +2768,16 @@ M0–M2 do not need the executable.
 | **M6** | Ray tracing/XDXR: standard AS builds or the shipped `XboxBvhBuilder` compute path; BVH node format; the builder's 52 console `FSSM` programs (51 pass `spirv-val`, one rule left: [embedded_shaders.md](embedded_shaders.md)) | RT shadows and any RT effects | RT output matches a reference; the builder's shaders run through the `FSSM` translator or a substitute; no unknown XDXR call remains |
 | **M7** | HDR, VRS, `PresentX` planes (2-plane HDR + GameDVR compose, `ImmediateThresholdPercent`), resize, alt-tab, `SuspendX`/`ResumeX`, frame pacing and `GetFrameStatisticsX` | Presentation polish | HDR and resize work on the target display; no validation errors over a long run. **Partly met:** `ImmediateThresholdPercent` (late frame flipped at once through `VK_KHR/EXT_swapchain_maintenance1` IMMEDIATE/FIFO_RELAXED, section 4.5; checked on the fake-clock decision and on the Vulkan present mode, 0 VUIDs in our runs with `LEONIDA_VK_VALIDATION=1` on two GPUs, no tearing observed on a display; the console's real semantics are unmeasured). `SuspendX`/`ResumeX`, frame pacing and a minimal `GetFrameStatisticsX` exist; HDR, VRS, plane compose, alt-tab are open |
 
+**M4 storage-image initialization lifetime.** The initialization dependency is a context-owned Vulkan timeline,
+not the `VulkanQueue`'s progress semaphore: D3D12 may release a queue that initialized a storage UAV while other
+queues still have pending waits or have not submitted their first use. Each initializing batch signals the shared
+timeline in the same `vkQueueSubmit` as its zero-fill, with increasing values and a dependency on any prior
+initializer. A queue's later submission waits for the latest initialization value; repeated waits on one timeline
+semaphore coalesce to the maximum value (Vulkan forbids duplicate entries in a submit's wait array). The synthetic
+`d3d12_m4_compute_test` releases the producer compute queue before a separate copy queue's next submission, and
+`d3d12_queue_wait_test` repeats waits on a fence. Both are covered with `LEONIDA_VK_VALIDATION=1`; this fixes
+semaphore *lifetime*, not the independent Wait-before-Signal resource-layout handover problem listed above.
+
 **M3 occlusion portability (D3D-209).** Vulkan's [occlusion query specification](https://registry.khronos.org/vulkan/specs/latest/html/vkspec.html#queries-occlusion)
 permits a count multiplied by the number of written color outputs, even with `VK_QUERY_CONTROL_PRECISE_BIT`.
 The original two-output query returned twice the CPU area on Intel UHD (Windows driver 31.0.101.4146),

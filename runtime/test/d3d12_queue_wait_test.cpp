@@ -57,8 +57,11 @@ int main(int argc, char** argv) {
         FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done_copy.p))) ||
         FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done_direct.p)))) return 1;
 
-    // Submission order is deliberately opposite the dependency order.
+    // Submission order is deliberately opposite the dependency order. Repeated Wait on the same timeline fence
+    // must coalesce to the greatest requested value; Vulkan forbids duplicate entries in pWaitSemaphores.
     const bool submitted = SUCCEEDED(copy->Wait(gate_copy.p, 1)) &&
+        SUCCEEDED(copy->Wait(gate_copy.p, 2)) &&
+        SUCCEEDED(copy->Wait(gate_copy.p, 1)) &&
         SUCCEEDED(copy->Signal(done_copy.p, 1)) &&
         SUCCEEDED(direct_a->Wait(gate_direct.p, 1)) &&
         SUCCEEDED(direct_a->Signal(done_direct.p, 1)) &&

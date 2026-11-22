@@ -916,7 +916,14 @@ public:
         };
         replay_.separate_depth_stencil_layouts = separate_depth_stencil_layouts;
         if (loaded_) {
-            fence_dispatcher_ = std::make_unique<FenceWaitDispatcher>(device_, vk, device_lost_);
+            // Storage-image zero-fill can be submitted by any command queue. Its completion dependency must outlive
+            // that queue: another queue may not observe the new initialization version until after the producer's
+            // ID3D12CommandQueue has been released, or may already have captured a pending wait for it.
+            VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+            type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+            VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
+            loaded_ = vk.vkCreateSemaphore(device_, &info, nullptr, &storage_init_semaphore_) == VK_SUCCESS;
+            if (loaded_) fence_dispatcher_ = std::make_unique<FenceWaitDispatcher>(device_, vk, device_lost_);
         }
     }
 
@@ -924,6 +931,7 @@ public:
         fence_dispatcher_.reset();
         deletion_queue_.drain(UINT64_MAX, device_, vk);
         for (const auto& [key, view] : views_) vk.vkDestroyImageView(device_, view, nullptr);
+        if (storage_init_semaphore_) vk.vkDestroySemaphore(device_, storage_init_semaphore_, nullptr);
     }
 
     VulkanContext(const VulkanContext&) = delete;
@@ -1313,9 +1321,10 @@ private:
     LayoutTracker tracker_;
     std::mutex storage_mutex_;  // a leaf lock: guards storage_pending_ only
     std::unordered_set<ResourceId> storage_pending_;
-    // The last submission that initialized storage images (its queue's progress semaphore and ticket) and a counter
-    // that says which one: every other queue's next submission waits for it, so no queue uses such an image before
-    // the zero-fill that put it in GENERAL has run.
+    // This context-owned timeline outlives all command queues. Every successful storage-image initializer signals
+    // an increasing value in its submission; later queues wait for that value before using bindless storage views.
+    // A queue-owned progress semaphore would dangle after the initializing queue is destroyed, including in waits
+    // already captured by a different queue but not yet submitted.
     VkSemaphore storage_init_semaphore_ = VK_NULL_HANDLE;
     std::uint64_t storage_init_value_ = 0;
     std::uint64_t storage_init_version_ = 0;
@@ -1746,10 +1755,8 @@ public:
         std::vector<ResourceId> storage_images;
         {
             std::lock_guard lock(context_.storage_mutex_);
-            if (context_.storage_init_semaphore_ && context_.storage_init_semaphore_ != progress_ &&
-                context_.storage_init_version_ != storage_init_seen_) {
-                waits_.push_back(context_.storage_init_semaphore_);
-                wait_values_.push_back(context_.storage_init_value_);
+            if (context_.storage_init_version_ != storage_init_seen_) {
+                wait(context_.storage_init_semaphore_, context_.storage_init_value_);
                 storage_init_seen_ = context_.storage_init_version_;
             }
             if (kind_ != QueueKind::copy && runs_shaders)
@@ -1809,15 +1816,19 @@ public:
             waits_.push_back(progress_);
             wait_values_.push_back(submitted_);
         }
-        const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0);
+        // Signal the durable context timeline in the *same* submit as initialization, so its value cannot be
+        // observed before the zero-fill and layout transition complete. tracker_lock serializes version assignment
+        // across queues; a second initializer waits for the preceding value before signalling the next one.
+        const VkSemaphore init_signal = storage_images.empty() ? VK_NULL_HANDLE : context_.storage_init_semaphore_;
+        const std::uint64_t init_value = context_.storage_init_value_ + (init_signal ? 1 : 0);
+        const bool submitted = ended && (!init_signal || init_value != 0) && submit(command_buffer, init_signal, init_value);
         if (!submitted && !storage_images.empty()) {  // not initialized after all: try again with the next submission
             std::lock_guard lock(context_.storage_mutex_);
             context_.storage_pending_.insert(storage_images.begin(), storage_images.end());
         }
         if (submitted && !storage_images.empty()) {
             std::lock_guard lock(context_.storage_mutex_);
-            context_.storage_init_semaphore_ = progress_;
-            context_.storage_init_value_ = submitted_;
+            context_.storage_init_value_ = init_value;
             ++context_.storage_init_version_;
             storage_init_seen_ = context_.storage_init_version_;
         }
@@ -1851,8 +1862,14 @@ public:
     bool signal(VkSemaphore fence, std::uint64_t value) { return submit(VK_NULL_HANDLE, fence, value); }
 
     // ID3D12CommandQueue::Wait: later submissions wait for the fence. A wait in a Vulkan batch only holds back that
-    // batch, so it is kept and attached to the next submission.
+    // batch, so it is kept and attached to the next submission. Coalesce repeated waits on one timeline semaphore:
+    // Vulkan prohibits repeated handles in pWaitSemaphores, and a failed submit can retain a prior storage-init wait.
     void wait(VkSemaphore fence, std::uint64_t value) {
+        for (std::size_t i = 0; i < waits_.size(); ++i) {
+            if (waits_[i] != fence) continue;
+            wait_values_[i] = std::max(wait_values_[i], value);
+            return;
+        }
         waits_.push_back(fence);
         wait_values_.push_back(value);
     }

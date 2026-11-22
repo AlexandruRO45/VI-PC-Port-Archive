@@ -352,6 +352,38 @@ int main() {
         got.assign(static_cast<const std::uint8_t*>(mapped), static_cast<const std::uint8_t*>(mapped) + readback_bytes);
         readback->Unmap(0, nullptr);
 
+        // A storage-image UAV was initialized by the first compute submission. Create the consumer while the
+        // producer still exists (so its progress semaphore handle cannot be recycled for the consumer), then
+        // destroy the producer. The later queue must not wait on that now-destroyed progress semaphore.
+        copy_queue.reset();  // its readback and fence have completed; release the scarce copy queue lease
+        Ref<ID3D12CommandQueue> later_queue;
+        queue_desc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+        EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&later_queue.p))));
+        compute_queue.reset();  // idle and destroy the first compute queue's timeline semaphore
+        Ref<ID3D12CommandAllocator> later_alloc;
+        Ref<ID3D12GraphicsCommandList> later_list;
+        EXPECT(make_list(D3D12_COMMAND_LIST_TYPE_COPY, later_alloc, later_list));
+        EXPECT(later_list->Close() == S_OK);
+        EXPECT(execute(later_queue.p, later_list.p));
+        Ref<ID3D12Fence> later_fence;
+        EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&later_fence.p))));
+        EXPECT(SUCCEEDED(later_queue->Signal(later_fence.p, 1)));
+        const HANDLE later_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        EXPECT(later_event != nullptr);
+        EXPECT(SUCCEEDED(later_fence->SetEventOnCompletion(1, later_event)));
+        if (WaitForSingleObject(later_event, 3000) != WAIT_OBJECT_0) {
+            // The old code can submit a wait on the already destroyed progress semaphore. Do not Release a blocked
+            // VulkanQueue (its destructor waits idle); fail the synthetic regression promptly instead.
+            std::fputs("storage-image queue lifetime: replacement queue did not complete\n", stderr);
+            std::fflush(stderr);
+            std::_Exit(1);
+        }
+        CloseHandle(later_event);
+        later_fence.reset();
+        later_list.reset();
+        later_alloc.reset();
+        later_queue.reset();
+
         for (auto* r : {&upload, &input, &data, &args, &out2, &image, &readback}) r->reset();
         stream_list.reset(); compute_list.reset(); readback_list.reset();
         stream_alloc.reset(); compute_alloc.reset(); readback_alloc.reset();
