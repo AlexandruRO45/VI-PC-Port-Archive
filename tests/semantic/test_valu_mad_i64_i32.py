@@ -1095,5 +1095,92 @@ class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
                     self.assertEqual(actual, sentinel)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry Generation
+# ==============================================================================
+
+def compute_status_flags(s0: int, s1: int, s2: int) -> dict[str, bool]:
+    """Compute condition codes and status flags for v_mad_i64_i32."""
+    prod_s64 = ref_mul_i32(s0, s1)
+    prod_u64 = prod_s64 & MASK64
+    s2_u64 = s2 & MASK64
+    raw_sum = prod_u64 + s2_u64
+    dst_u64 = raw_sum & MASK64
+
+    carry = (raw_sum >= MODULO64)
+    zero = (dst_u64 == 0)
+    negative = bool(dst_u64 & SIGN64)
+    overflow = bool(((prod_u64 ^ dst_u64) & (s2_u64 ^ dst_u64) & SIGN64) != 0)
+
+    prod_zero = (prod_s64 == 0)
+    prod_negative = (prod_s64 < 0)
+
+    return {
+        "carry": carry,
+        "zero": zero,
+        "negative": negative,
+        "overflow": overflow,
+        "prod_zero": prod_zero,
+        "prod_negative": prod_negative,
+    }
+
+
+def ref_mad_128_i32(s0: int, s1: int, s2_lo64: int, s3_hi64: int = 0) -> tuple[int, int]:
+    """128-bit multi-precision multiply-accumulate using carry out."""
+    dst_lo64, carry = ref_mad_i64_i32(s0, s1, s2_lo64)
+    raw_hi = (s3_hi64 & MASK64) + carry
+    dst_hi64 = raw_hi & MASK64
+    return dst_lo64, dst_hi64
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Exhaustive verification of condition codes, carry bits, and status flags."""
+
+    def test_carry_boundary_transition(self) -> None:
+        flags1 = compute_status_flags(1, 1, UINT64_MAX - 1)
+        self.assertFalse(flags1["carry"])
+        self.assertFalse(flags1["zero"])
+
+        flags2 = compute_status_flags(1, 1, UINT64_MAX)
+        self.assertTrue(flags2["carry"])
+        self.assertTrue(flags2["zero"])
+
+    def test_zero_flag_detection(self) -> None:
+        flags = compute_status_flags(-5, 5, 25)
+        self.assertTrue(flags["zero"])
+        self.assertFalse(flags["negative"])
+
+        flags_nz = compute_status_flags(-5, 5, 24)
+        self.assertFalse(flags_nz["zero"])
+
+    def test_negative_sign_flag_detection(self) -> None:
+        flags_neg = compute_status_flags(10, -20, 0)
+        self.assertTrue(flags_neg["negative"])
+        self.assertTrue(flags_neg["prod_negative"])
+
+        flags_pos = compute_status_flags(10, 20, 0)
+        self.assertFalse(flags_pos["negative"])
+        self.assertFalse(flags_pos["prod_negative"])
+
+    def test_signed_overflow_flag_detection(self) -> None:
+        flags = compute_status_flags(INT32_MIN, INT32_MIN, 0x4000_0000_0000_0000)
+        self.assertTrue(flags["overflow"])
+        self.assertTrue(flags["negative"])
+        self.assertFalse(flags["carry"])
+
+        flags_no_ov = compute_status_flags(100, 200, 300)
+        self.assertFalse(flags_no_ov["overflow"])
+
+    def test_multi_precision_128bit_carry_propagation(self) -> None:
+        s0 = -1
+        s1 = 1
+        s2_lo = 1
+        s3_hi = 100
+
+        dst_lo, dst_hi = ref_mad_128_i32(s0, s1, s2_lo, s3_hi)
+        self.assertEqual(dst_lo, 0)
+        self.assertEqual(dst_hi, 101)
+
+
 if __name__ == "__main__":
     unittest.main()
