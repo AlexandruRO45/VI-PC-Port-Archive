@@ -1082,5 +1082,103 @@ class TestBufferAtomicOrConditionCodes(unittest.TestCase):
         self.assertEqual(self.interp.vcc, canary)
 
 
+class TestBufferAtomicOrBoundaryExtremes(unittest.TestCase):
+    """Unit tests for boundary extremes, address wrapping, and IEEE 754 bit representations."""
+
+    def setUp(self) -> None:
+        self.mem = BufferMemory(4096)
+
+    def test_last_valid_dword_boundary(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=100)
+        # Last valid 4-byte dword starts at offset 96 (96 + 4 = 100)
+        self.mem.write_u32(96, 0x00000001)
+        ret, in_bounds = ref_buffer_atomic_or(
+            self.mem, desc, soffset=0, vaddr=96, or_val=0x00000002, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0x00000001)
+        self.assertEqual(self.mem.read_u32(96), 0x00000003)
+
+        # Offsets 97, 98, 99 all exceed num_records (97 + 4 = 101 > 100)
+        for oob_off in (97, 98, 99, 100):
+            ret, in_bounds = ref_buffer_atomic_or(
+                self.mem, desc, soffset=0, vaddr=oob_off, or_val=0xFF, glc=True
+            )
+            self.assertFalse(in_bounds)
+            self.assertEqual(ret, 0)
+
+    def test_zero_capacity_buffer(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=0)
+        ret, in_bounds = ref_buffer_atomic_or(
+            self.mem, desc, soffset=0, vaddr=0, or_val=0xFF, glc=True
+        )
+        self.assertFalse(in_bounds)
+        self.assertEqual(ret, 0)
+
+    def test_bitwise_boundary_patterns(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        # 0x00000000 | 0x00000000 = 0
+        self.mem.write_u32(0, 0)
+        ret, in_bounds = ref_buffer_atomic_or(self.mem, desc, 0, 0, 0, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0)
+        self.assertEqual(self.mem.read_u32(0), 0)
+
+        # 0xFFFFFFFF | 0xFFFFFFFF = 0xFFFFFFFF
+        self.mem.write_u32(4, 0xFFFFFFFF)
+        ret, in_bounds = ref_buffer_atomic_or(self.mem, desc, 0, 4, 0xFFFFFFFF, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0xFFFFFFFF)
+        self.assertEqual(self.mem.read_u32(4), 0xFFFFFFFF)
+
+        # 0x55555555 | 0xAAAAAAAA = 0xFFFFFFFF
+        self.mem.write_u32(8, 0x55555555)
+        ret, in_bounds = ref_buffer_atomic_or(self.mem, desc, 0, 8, 0xAAAAAAAA, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0x55555555)
+        self.assertEqual(self.mem.read_u32(8), 0xFFFFFFFF)
+
+        # 0x80000000 | 0x7FFFFFFF = 0xFFFFFFFF
+        self.mem.write_u32(12, 0x80000000)
+        ret, in_bounds = ref_buffer_atomic_or(self.mem, desc, 0, 12, 0x7FFFFFFF, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0x80000000)
+        self.assertEqual(self.mem.read_u32(12), 0xFFFFFFFF)
+
+    def test_float_nan_and_subnormal_bit_patterns(self) -> None:
+        # Untyped buffer atomic OR operates purely on 32-bit bit patterns,
+        # without floating point canonicalization, flush-to-zero, or NaN signaling.
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+
+        # Quiet NaN (0x7FC00000) | sign bit (0x80000000) -> 0xFFC00000
+        qnan_bits = 0x7FC00000
+        self.mem.write_u32(16, qnan_bits)
+        ret, in_bounds = ref_buffer_atomic_or(
+            self.mem, desc, 0, 16, 0x80000000, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, qnan_bits)
+        self.assertEqual(self.mem.read_u32(16), 0xFFC00000)
+
+        # Signaling NaN (0x7F800001) | bit 2 -> 0x7F800003
+        snan_bits = 0x7F800001
+        self.mem.write_u32(20, snan_bits)
+        ret, in_bounds = ref_buffer_atomic_or(
+            self.mem, desc, 0, 20, 0x00000002, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, snan_bits)
+        self.assertEqual(self.mem.read_u32(20), 0x7F800003)
+
+        # Subnormal bit pattern: 0x00000001 (smallest positive denorm) | 0x00000002 -> 0x00000003
+        self.mem.write_u32(24, 0x00000001)
+        ret, in_bounds = ref_buffer_atomic_or(
+            self.mem, desc, 0, 24, 0x00000002, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0x00000001)
+        self.assertEqual(self.mem.read_u32(24), 0x00000003)
+
+
 if __name__ == "__main__":
     unittest.main()
