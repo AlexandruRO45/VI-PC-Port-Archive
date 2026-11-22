@@ -36,6 +36,7 @@ from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, PK_MUL_
 from check import SIGNED_MIP_TEST, UINT_MIP_TEST
 from check import HEAP_INIT_EXPECTED, heap_init_env   # cs_heap_init: vk_compute_test's VKC_HEAP_INIT
 from check import judged_words, words_match   # dump words not judged on some devices (cs_signed_zero_nan)
+from check import check_d16_texture   # ps_texture_sample_d16, judged as in check.py
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
 from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
@@ -558,24 +559,6 @@ def check_uniform_branch(raw_path: str) -> tuple[bool, str]:
     if not n80:
         return False, "no bit=0 pixel got s5=8: the branch was decided per lane, not by the wave; " + detail
     return (n8 - n80 > 0 and n7 > 0), detail
-
-
-def check_d16_texture(raw_path: str) -> tuple[bool, str]:
-    """Point-sample the 8x8 UNORM gradient and round each component to binary16 before widening."""
-    data = Path(raw_path).read_bytes()
-    if len(data) != 64 * 64 * 16:
-        return False, f"expected a 64x64 RGBA32F frame, got {len(data)} bytes"
-    levels = [struct.unpack("<e", struct.pack("<e", i * 32 / 255.0))[0] for i in range(8)]
-    bad = 0
-    first = ""
-    for i, pixel in enumerate(struct.iter_unpack("<4f", data)):
-        x, y = i % 64, i // 64
-        expected = (levels[x // 8], levels[y // 8], levels[4], 1.0)
-        if pixel != expected:
-            if not bad:
-                first = f"at ({x},{y}): got {pixel}, want {expected}"
-            bad += 1
-    return (False, f"{bad}/4096 mismatches; {first}") if bad else (True, "4096/4096 RGBA pixels exact")
 
 
 def check_grad(raw_path: str, want_b: float, want_a: float) -> tuple[bool, str]:

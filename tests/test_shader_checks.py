@@ -35,8 +35,8 @@ TOTAL = (len(check.COMPUTE) + 7 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + len(check.TEXTURE_MODES) + 15)  # three mesh fixtures, ps_tex, ps_imgatomic, six compute fixtures,
-         # ps_ssharp, vs_base_ids, main's standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case) and cs_fmt_all
+         + len(check.TEXTURE_CONSTANTS) + len(check.TEXTURE_MODES) + 16)  # three mesh fixtures, ps_tex, ps_imgatomic, six compute fixtures,
+         # ps_ssharp, vs_base_ids, main's standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case) and cs_fmt_all, ps_texture_sample_d16
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
 
@@ -184,6 +184,7 @@ class Wave64Checks(unittest.TestCase):
                   patch.object(check, "get_lod_test", return_value=""),
                   patch.object(check, "sampler_test", return_value=""),
                   patch.object(check, "texture_mode_test", return_value=""),
+                  patch.object(check, "texture_sample_d16_test", return_value=""),
                   contextlib.redirect_stdout(output)):
                 status = check.main()
         return status, output.getvalue()
@@ -815,6 +816,43 @@ class TextureModeChecks(unittest.TestCase):
         problem = self.run_mode((77, "unsupported: no Vulkan physical device\n"))
         self.assertIsInstance(problem, check.Skip)
         self.assertIn("no Vulkan physical device", problem)
+
+
+class TextureSampleD16Checks(unittest.TestCase):
+    """ps_texture_sample_d16: every pixel is its gradient texel narrowed to f16 and widened back."""
+
+    @staticmethod
+    def f16(x):
+        return struct.unpack("<e", struct.pack("<e", x))[0]
+
+    def frame(self, damage=None):
+        pixels = [(self.f16(32 * (i % 64 // 8) / 255), self.f16(32 * (i // 64 // 8) / 255), self.f16(128 / 255), 1.0)
+                  for i in range(64 * 64)]
+        if damage is not None:
+            pixels[damage] = (32 * (damage % 64 // 8) / 255,) + pixels[damage][1:]     # f32, not narrowed
+        return b"".join(struct.pack("<4f", *p) for p in pixels)
+
+    def run_d16(self, data, code=0, out=""):
+        def harness(_tool, _vs, _fs, raw, *_words, env=None, cwd=None):
+            if data is not None:
+                Path(raw).write_bytes(data)
+            return code, out
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for shader in ("vs_ids", "ps_texture_sample_d16"):
+                (Path(tmp) / f"{shader}.spv").touch()
+            with patch.object(check, "run", side_effect=harness):
+                return check.texture_sample_d16_test("tools", tmp)
+
+    def test_narrowed_frame_passes(self):
+        self.assertEqual(self.run_d16(self.frame()), "")
+
+    def test_an_unnarrowed_texel_fails(self):
+        problem = self.run_d16(self.frame(damage=64 * 40 + 9))
+        self.assertIn("1/4096 mismatches; at (9,40)", problem)
+
+    def test_unsupported_device_skips(self):
+        self.assertIsInstance(self.run_d16(None, 77, "unsupported: no Vulkan physical device\n"), check.Skip)
 
 
 class TexelOffsetChecks(unittest.TestCase):
