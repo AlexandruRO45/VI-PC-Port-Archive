@@ -125,5 +125,137 @@ class TestLdsSubRtnU32Oracle(unittest.TestCase):
         self.assertEqual(self.mem.read_dword(6), 0x01234567)
 
 
-if __name__ == "__main__":
+
+# ---------------------------------------------------------------------------
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ---------------------------------------------------------------------------
+
+class DSOpcode(Enum):
+    """Supported DS family opcodes."""
+    DS_SUB_RTN_U32 = "ds_sub_rtn_u32"
+
+
+class RegType(Enum):
+    """Register file class."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclass(frozen=True)
+class RegisterOperand:
+    """Symbolic register operand representation."""
+    index: int
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index < DEFAULT_NUM_VGPRS):
+            raise ValueError(
+                f"Register index out of bounds: {self.reg_type.value}{self.index} "
+                f"(expected 0 <= index < {DEFAULT_NUM_VGPRS})"
+            )
+
+    @property
+    def name(self) -> str:
+        return f"{self.reg_type.value}{self.index}"
+
+
+@dataclass(frozen=True)
+class DSSubRtnInstruction:
+    """Symbolic representation of ds_sub_rtn_u32 instruction."""
+    dst: RegisterOperand
+    addr: RegisterOperand
+    data: RegisterOperand
+    offset: int = 0
+    gds: bool = False
+    opcode: DSOpcode = DSOpcode.DS_SUB_RTN_U32
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError("Destination operand must be a VGPR")
+        if self.addr.reg_type != RegType.VGPR:
+            raise TypeError("Address operand must be a VGPR")
+        if self.data.reg_type != RegType.VGPR:
+            raise TypeError("Data operand must be a VGPR")
+        if not (0 <= self.offset <= 0xFFFF):
+            raise ValueError(f"Offset out of 16-bit range: {self.offset} (expected 0 <= offset <= 65535)")
+
+    def disasm(self) -> str:
+        """Render disassembled assembly syntax."""
+        parts = [f"{self.opcode.value} {self.dst.name}, {self.addr.name}, {self.data.name}"]
+        if self.offset != 0:
+            parts.append(f"offset:{self.offset}")
+        if self.gds:
+            parts.append("gds")
+        return " ".join(parts)
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_opcode_enumeration(self) -> None:
+        self.assertEqual(DSOpcode.DS_SUB_RTN_U32.value, "ds_sub_rtn_u32")
+
+    def test_register_operand_validation(self) -> None:
+        v0 = RegisterOperand(index=0, reg_type=RegType.VGPR)
+        self.assertEqual(v0.name, "v0")
+
+        v255 = RegisterOperand(index=255, reg_type=RegType.VGPR)
+        self.assertEqual(v255.name, "v255")
+
+        with self.assertRaises(ValueError):
+            RegisterOperand(index=-1, reg_type=RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(index=256, reg_type=RegType.VGPR)
+
+    def test_instruction_validation(self) -> None:
+        v0 = RegisterOperand(0)
+        v1 = RegisterOperand(1)
+        v2 = RegisterOperand(2)
+
+        instr = DSSubRtnInstruction(dst=v0, addr=v1, data=v2, offset=64)
+        self.assertEqual(instr.offset, 64)
+        self.assertFalse(instr.gds)
+
+        with self.assertRaises(ValueError):
+            DSSubRtnInstruction(dst=v0, addr=v1, data=v2, offset=-1)
+        with self.assertRaises(ValueError):
+            DSSubRtnInstruction(dst=v0, addr=v1, data=v2, offset=65536)
+
+        s0 = RegisterOperand(0, reg_type=RegType.SGPR)
+        with self.assertRaises(TypeError):
+            DSSubRtnInstruction(dst=s0, addr=v1, data=v2)
+        with self.assertRaises(TypeError):
+            DSSubRtnInstruction(dst=v0, addr=s0, data=v2)
+        with self.assertRaises(TypeError):
+            DSSubRtnInstruction(dst=v0, addr=v1, data=s0)
+
+    def test_disasm_rendering(self) -> None:
+        v0 = RegisterOperand(0)
+        v1 = RegisterOperand(1)
+        v2 = RegisterOperand(2)
+
+        instr_basic = DSSubRtnInstruction(dst=v0, addr=v1, data=v2)
+        self.assertEqual(instr_basic.disasm(), "ds_sub_rtn_u32 v0, v1, v2")
+
+        instr_offset = DSSubRtnInstruction(dst=v0, addr=v1, data=v2, offset=16)
+        self.assertEqual(instr_offset.disasm(), "ds_sub_rtn_u32 v0, v1, v2 offset:16")
+
+        instr_gds = DSSubRtnInstruction(dst=v0, addr=v1, data=v2, offset=32, gds=True)
+        self.assertEqual(instr_gds.disasm(), "ds_sub_rtn_u32 v0, v1, v2 offset:32 gds")
+
+    def test_structural_equality_and_immutability(self) -> None:
+        v0 = RegisterOperand(0)
+        v1 = RegisterOperand(1)
+        v2 = RegisterOperand(2)
+
+        i1 = DSSubRtnInstruction(dst=v0, addr=v1, data=v2, offset=10)
+        i2 = DSSubRtnInstruction(dst=v0, addr=v1, data=v2, offset=10)
+        self.assertEqual(i1, i2)
+        self.assertEqual(hash(i1), hash(i2))
+
+        with self.assertRaises(Exception):
+            i1.offset = 20  # type: ignore
+
+
+if __name__ == '__main__':
     unittest.main()
