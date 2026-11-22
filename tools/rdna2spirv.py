@@ -1574,7 +1574,7 @@ class Gen:
         same memory done one dword at a time, so each dword is its own 32-bit atomic and no Int64 atomics are needed;
         the returned pair is two reads, so another lane's 64-bit op on the same element between them could be seen half
         done. The bounds check covers the whole 8-byte element, all or nothing, as for a typed element (a 32_32
-        format): how hardware treats a 64-bit atomic that is only partly in range is not measured."""
+        format): confirmed all-or-nothing on RDNA2 (gfx1036, SHADER-342, tools/buffer_atomic_x2_probe.py)."""
         vd = a[0]
         if vd["k"] != "vgpr" or vd.get("n", 1) != 2:
             raise Unsupported(op + " data")

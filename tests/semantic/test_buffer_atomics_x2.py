@@ -62,12 +62,40 @@ def split(v):
 
 
 def atomic_x2(kind, m, d, glc=True, offset=ELEM, records=RECORDS):
-    body = ["s_mov_b32 s8, 0", "s_mov_b32 s9, 0", f"s_mov_b32 s10, {records:#x}", "s_mov_b32 s11, 0x31016fac",
-            f"v_mov_b32_e32 v1, {offset:#x}", f"v_mov_b32_e32 v2, {d & M32:#x}", f"v_mov_b32_e32 v3, {d >> 32:#x}",
-            f"buffer_atomic_{kind}_x2 v[2:3], v1, s[8:11], 0 offen" + (" glc" if glc else ""), "s_waitcnt vmcnt(0)",
-            f"v_mov_b32_e32 v4, {OUT:#x}", "s_mov_b32 s10, 0x1000", "buffer_store_dwordx2 v[2:3], v4, s[8:11], 0 offen"]
-    mem = run(body, {offset: m & M32, offset + 4: m >> 32})
-    return (mem.get(OUT), mem.get(OUT + 4)), (mem.get(offset), mem.get(offset + 4))
+    return atomic_x2_vsharp(kind, m, d, glc=glc, voff=offset, records=records)
+
+
+def atomic_x2_vsharp(kind, m, d, glc=True, voff=ELEM, records=RECORDS, word3=0x31016FAC, stride=0, idx=None, soff=0):
+    body = [
+        "s_mov_b32 s8, 0",
+        f"s_mov_b32 s9, {(stride & 0x3FFF) << 16:#x}",
+        f"s_mov_b32 s10, {records:#x}",
+        f"s_mov_b32 s11, {word3:#x}",
+        f"s_mov_b32 s12, {soff:#x}",
+        f"v_mov_b32_e32 v2, {d & M32:#x}",
+        f"v_mov_b32_e32 v3, {d >> 32:#x}",
+    ]
+    if idx is not None:
+        body += [f"v_mov_b32_e32 v0, {idx:#x}", f"v_mov_b32_e32 v1, {voff:#x}"]
+        vaddr, mods = "v[0:1]", "idxen offen"
+        eff = soff + voff + idx * stride
+    else:
+        body.append(f"v_mov_b32_e32 v1, {voff:#x}")
+        vaddr, mods = "v1", "offen"
+        eff = soff + voff
+    if glc:
+        mods += " glc"
+    body += [
+        f"buffer_atomic_{kind}_x2 v[2:3], {vaddr}, s[8:11], s12 {mods}",
+        "s_waitcnt vmcnt(0)",
+        f"v_mov_b32_e32 v4, {OUT:#x}",
+        "s_mov_b32 s9, 0",
+        "s_mov_b32 s10, 0x1000",
+        "s_mov_b32 s11, 0x31016fac",
+        "buffer_store_dwordx2 v[2:3], v4, s[8:11], 0 offen",
+    ]
+    mem = run(body, {eff: m & M32, eff + 4: m >> 32})
+    return (mem.get(OUT), mem.get(OUT + 4)), (mem.get(eff), mem.get(eff + 4))
 
 
 class BufferAtomicsX2(unittest.TestCase):
@@ -107,6 +135,68 @@ class BufferAtomicsX2(unittest.TestCase):
             with self.subTest(line=line):
                 with self.assertRaises(rdna2spirv.Unsupported):
                     translate(["v_mov_b32_e32 v1, 0", line])
+
+    def test_raw_aligned_straddling_all_ops(self):
+        m, d = 0x1234055A_1234045A, 0x0F0FF0F0_F0F00F0F
+        for kind, fn in MODEL.items():
+            for glc in (True, False):
+                for records in (0x40, 0x43, 0x44, 0x45, 0x47):
+                    with self.subTest(op=kind, glc=glc, records=hex(records)):
+                        exp_ret = (0, 0) if glc else split(d)
+                        self.assertEqual(
+                            atomic_x2_vsharp(kind, m, d, glc=glc, voff=ELEM, records=records),
+                            (exp_ret, split(m)),
+                        )
+                with self.subTest(op=kind, glc=glc, records="0x48"):
+                    exp_ret = split(m) if glc else split(d)
+                    self.assertEqual(
+                        atomic_x2_vsharp(kind, m, d, glc=glc, voff=ELEM, records=0x48),
+                        (exp_ret, split(fn(m, d))),
+                    )
+
+    def test_oob_select_modes_all_or_nothing(self):
+        m, d = 0x1234055A_1234045A, 0x0F0FF0F0_F0F00F0F
+        # Mode 0 (STRUCTURED_WITH_OFFSET): stride straddling drops, soff excluded from stride check
+        for st in (20, 23):
+            with self.subTest(mode=0, stride=st):
+                self.assertEqual(
+                    atomic_x2_vsharp("xor", m, d, voff=16, records=2, word3=0x01016FAC, stride=st, idx=0),
+                    ((0, 0), split(m)),
+                )
+        self.assertEqual(
+            atomic_x2_vsharp("xor", m, d, voff=16, records=2, word3=0x01016FAC, stride=24, idx=0),
+            (split(m), split(m ^ d)),
+        )
+        self.assertEqual(
+            atomic_x2_vsharp("xor", m, d, voff=0, records=2, word3=0x01016FAC, stride=24, idx=2),
+            ((0, 0), split(m)),
+        )
+        self.assertEqual(
+            atomic_x2_vsharp("xor", m, d, voff=16, records=2, word3=0x01016FAC, stride=24, idx=0, soff=8),
+            (split(m), split(m ^ d)),
+        )
+        self.assertEqual(
+            atomic_x2_vsharp("xor", m, d, voff=16, records=2, word3=0x01016FAC, stride=20, idx=0, soff=8),
+            ((0, 0), split(m)),
+        )
+        # Mode 1 (STRUCTURED): idx < num_records only
+        self.assertEqual(
+            atomic_x2_vsharp("xor", m, d, voff=24, records=2, word3=0x11016FAC, stride=24, idx=0),
+            (split(m), split(m ^ d)),
+        )
+        self.assertEqual(
+            atomic_x2_vsharp("xor", m, d, voff=16, records=2, word3=0x11016FAC, stride=24, idx=2),
+            ((0, 0), split(m)),
+        )
+        # Mode 2 (DISABLED): num_records != 0 only
+        self.assertEqual(
+            atomic_x2_vsharp("xor", m, d, voff=24, records=1, word3=0x21016FAC),
+            (split(m), split(m ^ d)),
+        )
+        self.assertEqual(
+            atomic_x2_vsharp("xor", m, d, voff=16, records=0, word3=0x21016FAC),
+            ((0, 0), split(m)),
+        )
 
 
 if __name__ == "__main__":
