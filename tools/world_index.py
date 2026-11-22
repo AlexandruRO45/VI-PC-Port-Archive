@@ -50,6 +50,7 @@ FIELD = {
     "childLodDist": 0xCA974BCD,
     "priorityLevel": 0x2691F019,
     "name": 0xE6E17F14,
+    "name64": 0x8BFB6095,
     "parent": 0xA99C4651,
     "streamingExtentsMin": 0xDD22821F,
     "streamingExtentsMax": 0xA22EA335,
@@ -241,6 +242,8 @@ def parse_resource(b, collect=None):
             continue
         row["map_name"] = _u32(b, off + mm.get(FIELD["name"], (8,))[0])
         row["parent"] = _u32(b, off + mm.get(FIELD["parent"], (0x68,))[0])
+        if FIELD["name64"] in mm:
+            row["map_name64"] = _u64(b, off + mm[FIELD["name64"]][0])
         for key, field in (("extent_min", "streamingExtentsMin"), ("extent_max", "streamingExtentsMax"),
                            ("entities_min", "entitiesExtentsMin"), ("entities_max", "entitiesExtentsMax")):
             v = _value(b, off, mm.get(FIELD[field]))
@@ -336,7 +339,10 @@ def scan_rpf(path, start=None, limit=None, max_inflate=CAP):
                     mt = ZHDR.match(m, nxt, size)
                     if not mt:
                         break
-                    more, mused, meof, _ = _inflate_stream(m, nxt, size, max_inflate, keep=True)
+                    try:
+                        more, mused, meof, _ = _inflate_stream(m, nxt, size, max_inflate, keep=True)
+                    except zlib.error:
+                        break
                     if not meof or not more:
                         break
                     data += more
@@ -364,8 +370,6 @@ def scan_path(path, start=None, limit=None, max_inflate=CAP):
         for root, _, files in os.walk(path):
             for name in sorted(files):
                 p = os.path.join(root, name)
-                if os.path.getsize(p) > max_inflate:
-                    continue
                 with open(p, "rb") as f:
                     head = f.read(4)
                 if head == b"9FPR":
@@ -373,6 +377,8 @@ def scan_path(path, start=None, limit=None, max_inflate=CAP):
                     rows.extend(more)
                     stats["files"] += 1
                     stats["scanned_bytes"] += sub["scanned_bytes"]
+                    continue
+                if os.path.getsize(p) > max_inflate:
                     continue
                 with open(p, "rb") as f:
                     b = f.read(max_inflate + 1)
@@ -420,7 +426,8 @@ def main(argv=None):
         json.dump(doc, f, indent=1, sort_keys=True)
     if a.csv:
         cols = ["source", "offset", "size", "signature", "version", "kind", "structs", "enums", "blocks",
-                "root_objects", "entities", "entity_size", "archetypes", "map_name", "parent", "map_flags",
+                "root_objects", "entities", "entity_size", "archetypes", "map_name", "map_name64", "parent",
+                "map_flags",
                 "content_flags", "extent_min", "extent_max", "entities_min", "entities_max", "position_min",
                 "position_max", "lod", "lod_dist_min", "lod_dist_max"]
         os.makedirs(os.path.dirname(os.path.abspath(a.csv)), exist_ok=True)

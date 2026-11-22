@@ -118,6 +118,28 @@ class NavmeshIndexTest(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("not an RPF7/8/9 archive", r.stderr)
 
+    def test_limit_below_one_is_refused(self):
+        path = os.path.join(self.root, "nav.rpf")
+        make_rpf(path)
+        for extra in (("--limit", "0"), ("--limit", "-100"), ("--start", "-1")):
+            out = os.path.join(self.root, "x.json")
+            r = subprocess.run([sys.executable, "-I", TOOL, path, "--out", out, *extra],
+                               cwd=ROOT, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertFalse(os.path.exists(out))
+
+
+class MissingInputTest(unittest.TestCase):
+    def test_missing_input_is_a_message_not_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "n.json")
+            p = subprocess.run([sys.executable, "-I", TOOL, os.path.join(tmp, "missing.rpf"), "--out", out],
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(p.returncode, 1, p.stderr)
+            self.assertIn("missing.rpf", p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            self.assertFalse(os.path.exists(out))
+
 
 if __name__ == "__main__":
     unittest.main()
