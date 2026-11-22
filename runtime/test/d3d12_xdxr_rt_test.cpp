@@ -564,7 +564,131 @@ int main(int argc, char** argv) {
             expect(std::all_of(after.begin(), after.end(), [](std::uint8_t b) { return b == 0xa5; }),
                    std::string(r.what) + ": the list ran");
         }
-        std::printf("pointer TLAS: ARRAY_OF_POINTERS compared with ARRAY, three bad pointer arrays\n");
+        // ALLOW_UPDATE builds, then PERFORM_UPDATE with moved instances, through both layouts: the full builds use a
+        // scratch of exactly ScratchDataSizeInBytes and the updates one of exactly UpdateScratchDataSizeInBytes, each
+        // followed by guard bytes in the same buffer. The ARRAY_OF_POINTERS gather (XdxrLayout::gather_off) must stay
+        // inside those sizes, and the pointer update must equal the ARRAY update byte for byte.
+        {
+            D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS update_inputs = tlas_inputs;
+            update_inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
+            D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS update_pointer_inputs = pointer_inputs;
+            update_pointer_inputs.Flags = update_inputs.Flags;
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO array_sizes{}, pointer_sizes{};
+            device->GetRaytracingAccelerationStructurePrebuildInfo(&update_inputs, &array_sizes);
+            device->GetRaytracingAccelerationStructurePrebuildInfo(&update_pointer_inputs, &pointer_sizes);
+            expect(array_sizes.ScratchDataSizeInBytes == pointer_sizes.ScratchDataSizeInBytes &&
+                       array_sizes.UpdateScratchDataSizeInBytes == pointer_sizes.UpdateScratchDataSizeInBytes,
+                   "ALLOW_UPDATE TLAS prebuild sizes differ between ARRAY and ARRAY_OF_POINTERS");
+            const UINT64 full = array_sizes.ScratchDataSizeInBytes, update = array_sizes.UpdateScratchDataSizeInBytes;
+            const UINT64 guard = 256;
+            Ref<ID3D12Resource> moved_upload, scratch_full, scratch_update, full_rb, update_rb;
+            if (FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_UPLOAD, 1024, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                   D3D12_RESOURCE_FLAG_NONE, moved_upload.put())) ||
+                FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, full + guard, D3D12_RESOURCE_STATE_COPY_DEST, uav,
+                                   scratch_full.put())) ||
+                FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, update + guard, D3D12_RESOURCE_STATE_COPY_DEST,
+                                   uav, scratch_update.put())) ||
+                FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_READBACK, full + guard, D3D12_RESOURCE_STATE_COPY_DEST,
+                                   D3D12_RESOURCE_FLAG_NONE, full_rb.put())) ||
+                FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_READBACK, update + guard, D3D12_RESOURCE_STATE_COPY_DEST,
+                                   D3D12_RESOURCE_FLAG_NONE, update_rb.put())))
+                return fail("update-scratch buffers", hr);
+            // 0: the moved descs in order (ARRAY), 192: the same descs 2, 0, 1, 384: pointers to them in instance
+            // order, 640: the guard pattern
+            const UINT64 moved_va = moved_upload->GetGPUVirtualAddress();
+            D3D12_RAYTRACING_INSTANCE_DESC moved_descs[3];
+            std::memcpy(moved_descs, instances, sizeof moved_descs);
+            for (int i = 0; i < 3; ++i) {
+                moved_descs[i].Transform[0][3] += 1.5f + float(i);
+                moved_descs[i].Transform[1][3] -= 0.75f * float(i);
+                moved_descs[i].Transform[2][3] += 0.5f;
+            }
+            const D3D12_GPU_VIRTUAL_ADDRESS moved_pointers[3] = {moved_va + 256, moved_va + 320, moved_va + 192};
+            {
+                char* p = nullptr;
+                if (FAILED(moved_upload->Map(0, nullptr, reinterpret_cast<void**>(&p)))) return fail("Map moved upload");
+                std::memcpy(p, moved_descs, sizeof moved_descs);
+                std::memcpy(p + 192, &moved_descs[2], 64);
+                std::memcpy(p + 256, &moved_descs[0], 64);
+                std::memcpy(p + 320, &moved_descs[1], 64);
+                std::memcpy(p + 384, moved_pointers, sizeof moved_pointers);
+                std::memset(p + 640, 0x5a, std::size_t(guard));
+                moved_upload->Unmap(0, nullptr);
+            }
+            auto transition = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+                D3D12_RESOURCE_BARRIER t{};
+                t.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                t.Transition.pResource = r;
+                t.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                t.Transition.StateBefore = before;
+                t.Transition.StateAfter = after;
+                list->ResourceBarrier(1, &t);
+            };
+            // the full builds
+            if (!reset()) return fail("Reset for the ALLOW_UPDATE builds");
+            list->CopyBufferRegion(scratch_full.p, full, moved_upload.p, 640, guard);
+            list->CopyBufferRegion(scratch_update.p, update, moved_upload.p, 640, guard);
+            transition(scratch_full.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            transition(scratch_update.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            build = {};
+            build.Inputs = update_inputs;
+            build.DestAccelerationStructureData = tlas->GetGPUVirtualAddress();
+            build.ScratchAccelerationStructureData = scratch_full->GetGPUVirtualAddress();
+            list->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
+            list->ResourceBarrier(1, &barrier);
+            build.Inputs = update_pointer_inputs;
+            build.DestAccelerationStructureData = tlas_p->GetGPUVirtualAddress();
+            list->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
+            list->ResourceBarrier(1, &barrier);
+            list->CopyBufferRegion(tlas_a_rb.p, 0, tlas.p, 0, tlas_info.ResultDataMaxSizeInBytes);
+            list->CopyBufferRegion(tlas_p_rb.p, 0, tlas_p.p, 0, tlas_info.ResultDataMaxSizeInBytes);
+            leonida::ReplayResult result = execute();
+            std::vector<std::uint8_t> before;
+            if (expect(result == leonida::ReplayResult::success,
+                       "ALLOW_UPDATE TLAS builds: " + std::to_string(int(result)))) {
+                before = used_bytes(read_back(tlas_a_rb.p, tlas_info.ResultDataMaxSizeInBytes));
+                expect(!before.empty() && before == used_bytes(read_back(tlas_p_rb.p, tlas_info.ResultDataMaxSizeInBytes)),
+                       "ALLOW_UPDATE: the ARRAY_OF_POINTERS TLAS differs from the ARRAY TLAS");
+            }
+            // the updates, in place, from the moved descs
+            if (!reset()) return fail("Reset for the TLAS updates");
+            build = {};
+            build.Inputs = update_inputs;
+            build.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+            build.Inputs.InstanceDescs = moved_va;
+            build.DestAccelerationStructureData = build.SourceAccelerationStructureData = tlas->GetGPUVirtualAddress();
+            build.ScratchAccelerationStructureData = scratch_update->GetGPUVirtualAddress();
+            list->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
+            list->ResourceBarrier(1, &barrier);
+            build.Inputs = update_pointer_inputs;
+            build.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+            build.Inputs.InstanceDescs = moved_va + 384;
+            build.DestAccelerationStructureData = build.SourceAccelerationStructureData = tlas_p->GetGPUVirtualAddress();
+            list->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
+            list->ResourceBarrier(1, &barrier);
+            list->CopyBufferRegion(tlas_a_rb.p, 0, tlas.p, 0, tlas_info.ResultDataMaxSizeInBytes);
+            list->CopyBufferRegion(tlas_p_rb.p, 0, tlas_p.p, 0, tlas_info.ResultDataMaxSizeInBytes);
+            transition(scratch_full.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            transition(scratch_update.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->CopyBufferRegion(full_rb.p, 0, scratch_full.p, 0, full + guard);
+            list->CopyBufferRegion(update_rb.p, 0, scratch_update.p, 0, update + guard);
+            result = execute();
+            if (expect(result == leonida::ReplayResult::success, "TLAS updates: " + std::to_string(int(result)))) {
+                const auto array_update = used_bytes(read_back(tlas_a_rb.p, tlas_info.ResultDataMaxSizeInBytes));
+                const auto pointer_update = used_bytes(read_back(tlas_p_rb.p, tlas_info.ResultDataMaxSizeInBytes));
+                expect(!array_update.empty() && array_update != before, "the ARRAY update changed nothing");
+                expect(array_update == pointer_update,
+                       "the ARRAY_OF_POINTERS update differs from the ARRAY update of the same moved instances");
+                auto guard_intact = [&](ID3D12Resource* rb, UINT64 size) {
+                    const auto bytes = read_back(rb, size + guard);
+                    return std::all_of(bytes.begin() + std::ptrdiff_t(size), bytes.end(),
+                                       [](std::uint8_t b) { return b == 0x5a; });
+                };
+                expect(guard_intact(full_rb.p, full), "a build wrote past ScratchDataSizeInBytes");
+                expect(guard_intact(update_rb.p, update), "an update wrote past UpdateScratchDataSizeInBytes");
+            }
+        }
+        std::printf("pointer TLAS: ARRAY_OF_POINTERS compared with ARRAY (build and update), three bad pointer arrays\n");
     }
 
     // ---- vertex formats ----
