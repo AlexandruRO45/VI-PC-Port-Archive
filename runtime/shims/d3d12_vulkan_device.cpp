@@ -1683,7 +1683,8 @@ public:
                 VkImageFormatProperties image_properties{};
                 const VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-                const VkImageCreateFlags flags = fmt.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+                const bool typeless = fmt.format != VK_FORMAT_UNDEFINED ? fmt.typeless : depth_fmt.typeless;
+            const VkImageCreateFlags flags = typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
                 if (state_.image_format_properties &&
                     state_.image_format_properties(state_.info.physical, vk_fmt, VK_IMAGE_TYPE_2D,
                                                    VK_IMAGE_TILING_OPTIMAL, usage, flags, &image_properties) == VK_SUCCESS &&
@@ -1720,7 +1721,7 @@ public:
                 (levels->SampleCount & (levels->SampleCount - 1)) != 0)
                 return E_INVALIDARG;
             Format format = vulkan_format(levels->Format, false);
-            if (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
+            if (format.format == VK_FORMAT_UNDEFINED || (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) {
                 D3D12_RESOURCE_DESC depth_desc{};
                 depth_desc.Format = levels->Format;
                 depth_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
