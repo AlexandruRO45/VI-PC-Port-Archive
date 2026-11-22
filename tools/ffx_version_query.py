@@ -16,6 +16,14 @@ UPSCALER = "faff02f294a7e9149ce079dffe3dedbcabe99b1f180ab14222aa8689e00a75fa"
 REGS = {getattr(R, n.upper()): n for n in "rax rbx rcx rdx rsi rdi rbp rsp r8 r9 r10 r11 r12 r13 r14 r15".split()}
 HIGH_BYTE = {R.AH, R.BH, R.CH, R.DH}
 UINT = {1: "uint8_t", 2: "uint16_t", 4: "uint32_t", 8: "uint64_t"}
+# String instructions by Code: the SSE2 scalar MOVSD and CMPSD share their mnemonics.
+STRING_OPS = {
+    C.MOVSB_M8_M8: ("movs", 1), C.MOVSW_M16_M16: ("movs", 2), C.MOVSD_M32_M32: ("movs", 4), C.MOVSQ_M64_M64: ("movs", 8),
+    C.STOSB_M8_AL: ("stos", 1), C.STOSW_M16_AX: ("stos", 2), C.STOSD_M32_EAX: ("stos", 4), C.STOSQ_M64_RAX: ("stos", 8),
+    C.LODSB_AL_M8: ("lods", 1), C.LODSW_AX_M16: ("lods", 2), C.LODSD_EAX_M32: ("lods", 4), C.LODSQ_RAX_M64: ("lods", 8),
+    C.SCASB_AL_M8: ("scas", 1), C.SCASW_AX_M16: ("scas", 2), C.SCASD_EAX_M32: ("scas", 4), C.SCASQ_RAX_M64: ("scas", 8),
+    C.CMPSB_M8_M8: ("cmps", 1), C.CMPSW_M16_M16: ("cmps", 2), C.CMPSD_M32_M32: ("cmps", 4), C.CMPSQ_M64_M64: ("cmps", 8),
+}
 
 INTEGER_HEADER = """#include <array>
 #include <cstdint>
@@ -46,6 +54,37 @@ def region(pe, start, end):
     return ins
 
 
+def string_op(i):
+    """One element per iteration in program order, so overlapping copies replicate as on the hardware."""
+    kind, size = STRING_OPS[i.code]
+    if any(i.op_kind(n) not in (K.REGISTER, K.MEMORY_ESRDI, K.MEMORY_SEG_RSI) for n in range(i.op_count)):
+        # A 67h prefix walks ESI, EDI and ECX instead of the full registers.
+        raise ValueError(f"unsupported string address size at {i.ip:#x}: {i}")
+    if kind in ("scas", "cmps"):
+        repeat = "repe" if i.has_repe_prefix else "repne" if i.has_repne_prefix else None
+    elif i.has_repne_prefix:
+        raise ValueError(f"unsupported REPNE string prefix at {i.ip:#x}: {i}")
+    else:
+        repeat = "rep" if i.has_rep_prefix else None
+    t = UINT[size]
+    if kind == "movs":
+        step = f"store<{t}>(rdi, load<{t}>(rsi)); rsi += step; rdi += step;"
+    elif kind == "stos":
+        step = f"store<{t}>(rdi, static_cast<{t}>(rax)); rdi += step;"
+    elif kind == "lods":
+        # AL and AX merge into RAX; a 32-bit load zero-extends.
+        value = f"(rax & ~{(1 << (8*size)) - 1}ull) | load<{t}>(rsi)" if size < 4 else f"load<{t}>(rsi)"
+        step = f"rax = {value}; rsi += step;"
+    else:
+        lhs = f"static_cast<{t}>(rax)" if kind == "scas" else f"load<{t}>(rsi)"
+        advance = "rdi += step;" if kind == "scas" else "rsi += step; rdi += step;"
+        step = f"{{ const {t} a = {lhs}, b = load<{t}>(rdi); zero = a == b; carry = a < b; }} {advance}"
+    stop = {"repe": " if (!zero) break;", "repne": " if (zero) break;"}.get(repeat, "")
+    # A zero count performs no iteration and leaves the pointers and flags unchanged.
+    body = f"while (rcx != 0) {{ {step} --rcx;{stop} }}" if repeat else step
+    return f"{{ const word step = direction ? 0ull - {size}ull : {size}ull; {body} }}"
+
+
 def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
     """Emit only query integer operations. All external edges and calls need named bindings."""
     lines = ["word frame[16]{};", "word " + ", ".join(r + "=0" for r in REGS.values()) + ";",
@@ -62,6 +101,9 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
     # only byte storage on the desktop host.
     wide = {R.YMM0: "wide0", R.YMM1: "wide1", R.YMM2: "wide2"}
     has_wide = any(i.mnemonic == M.VMOVUPS for i in body)
+    if any(i.code in STRING_OPS or i.mnemonic in (M.CLD, M.STD) for i in body):
+        # The x64 software conventions expect DF clear on function exit and before calls, so it starts clear.
+        lines.append("bool direction=false;")
     if has_wide:
         if has_xmm_math:
             raise ValueError("mixed vector arithmetic and wide descriptor copies are unsupported")
@@ -116,6 +158,12 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
             # FS/GS select a thread block base and LOCK makes the access atomic;
             # the flat loads and stores below would silently drop both.
             raise ValueError(f"unsupported instruction prefix at {i.ip:#x}: {i}")
+        elif i.code in STRING_OPS:
+            stmt = string_op(i)
+        elif op == M.CLD:
+            stmt = "direction = false;"
+        elif op == M.STD:
+            stmt = "direction = true;"
         elif op in (M.JE, M.JNE, M.JAE, M.JA, M.JB, M.JBE, M.JMP):
             target = i.near_branch_target
             if target not in allowed:
