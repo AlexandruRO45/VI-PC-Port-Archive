@@ -164,4 +164,24 @@ fcmovnb_st7 PROC FRAME
     ret
 fcmovnb_st7 ENDP
 
+fcmovb_entry PROC FRAME
+    .endprolog
+    fld tbyte ptr [rcx+16]
+    fld tbyte ptr [rcx+0]
+    fcmovb st, st(1)
+    fstp tbyte ptr [rdx+0]
+    fstp tbyte ptr [rdx+16]
+    ret
+fcmovb_entry ENDP
+
+fcmove_entry PROC FRAME
+    .endprolog
+    fld tbyte ptr [rcx+16]
+    fld tbyte ptr [rcx+0]
+    fcmove st, st(1)
+    fstp tbyte ptr [rdx+0]
+    fstp tbyte ptr [rdx+16]
+    ret
+fcmove_entry ENDP
+
 END

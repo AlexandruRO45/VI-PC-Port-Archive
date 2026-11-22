@@ -9,7 +9,9 @@ The profile accepts:
 - FCOMI, FCOMIP, FUCOMI and FUCOMIP ST(0), ST(i), which set ZF and CF for the integer lowering (PF is
   not modelled, and the integer lowering rejects every instruction that reads it);
 - FCMOVB, FCMOVE, FCMOVBE, FCMOVNB, FCMOVNE and FCMOVNBE ST(0), ST(i), which read ZF and CF (FCMOVU
-  and FCMOVNU read PF and stay outside the profile);
+  and FCMOVNU read PF and stay outside the profile). Each flag a move reads must be written by an earlier
+  instruction on every path from the entry: the caller's flags are not an input of the lowered function,
+  and a call leaves them undefined;
 - FADD, FSUB, FSUBR, FMUL, FDIV and FDIVR with an m32 or m64 operand, with ST(0), ST(i) and with
   ST(i), ST(0), and their popping forms FADDP, FSUBP, FSUBRP, FMULP, FDIVP and FDIVRP ST(i), ST(0) for
   i from 1 to 7.
@@ -18,13 +20,14 @@ must return with the stack empty. The stack depth before every instruction is fi
 time, so each register maps to a C++ slot and no TOP is needed at run time. Translation rejects any x87
 instruction outside the profile (including control-word and status-word access, a popping form with
 ST(0) as the destination, and the undocumented FSTP and FXCH alias encodings), a stack overflow or
-underflow, a depth that differs where control flow joins, an x87 instruction it cannot reach from the entry through direct edges, and x87 state that is
+underflow, a depth that differs where control flow joins, an x87 instruction it cannot reach from the entry through direct edges, a conditional move that reads an undefined flag, and x87 state that is
 live at a call, a return, an indirect branch or an external edge. The helpers are in tools/x87_soft.h,
 which the generated source must include before the lowered functions (X87_HEADER).
 """
 from pathlib import Path
 
-from iced_x86 import Code as C, FlowControl, MemorySize as S, Mnemonic as M, OpKind as K, Register as R
+from iced_x86 import Code as C, FlowControl, MemorySize as S, MemorySizeExt, Mnemonic as M, OpKind as K, Register as R
+from iced_x86 import RegisterExt, RflagsBits as F
 
 X87_HEADER = Path(__file__).with_name("x87_soft.h").read_text(encoding="ascii")
 # Conditional register moves and the C++ condition each reads from the integer lowering's flags.
@@ -193,7 +196,78 @@ def depths(body, exits):
     for i in body:
         if i.ip not in depth and is_x87(i):
             raise ValueError(f"unknown x87 stack depth at {i.ip:#x}: {i}")
+    moves = [i for i in body if i.mnemonic in FCMOV]
+    if moves:
+        defined = defined_flags(body)
+        for i in moves:
+            missing = i.rflags_read & ZF_CF & ~defined[i.ip]
+            if missing:
+                names = " and ".join(name for name, bit in (("ZF", F.ZF), ("CF", F.CF)) if missing & bit)
+                raise ValueError(f"{i} at {i.ip:#x} reads {names}, which no instruction defines on every path "
+                                 "from the entry")
     return depth
+
+
+# The flags the integer lowering models and FCMOV reads.
+ZF_CF = F.ZF | F.CF
+# Shifts and rotates leave the flags unchanged when the masked count is 0 (an immediate 0 already writes
+# no flags in iced).
+SHIFTS = frozenset({M.SHL, M.SAL, M.SHR, M.SAR, M.ROL, M.ROR, M.RCL, M.RCR, M.SHLD, M.SHRD})
+
+
+def _width(i):
+    return RegisterExt.size(i.op0_register) * 8 if i.op0_kind == K.REGISTER else MemorySizeExt.size(i.memory_size) * 8
+
+
+def _flags_after(i, before):
+    """ZF and CF (as RflagsBits) defined after i, given those defined before it."""
+    if i.flow_control in (FlowControl.CALL, FlowControl.INDIRECT_CALL):
+        return 0  # the callee may leave any flags
+    undefined = i.rflags_undefined & ZF_CF
+    defines = (i.rflags_written | i.rflags_set | i.rflags_cleared) & ZF_CF & ~undefined
+    if i.mnemonic in SHIFTS and defines:
+        count = i.op2_kind if i.mnemonic in (M.SHLD, M.SHRD) else i.op1_kind
+        width = _width(i)
+        if count == K.REGISTER:  # a CL count of 0 changes nothing, so only flags already defined stay so
+            if i.mnemonic in (M.SHLD, M.SHRD) and width == 16:
+                return 0  # a count above 16 leaves the result and the flags undefined
+            if i.mnemonic in (M.SHL, M.SAL, M.SHR, M.SAR) and width < 32:
+                return before & ~undefined & ~F.CF  # CF is undefined for a count of the width or more
+            return before & ~undefined
+        n = i.immediate8 & (0x3F if width == 64 else 0x1F)
+        if i.mnemonic in (M.SHLD, M.SHRD) and width == 16 and n > 16:
+            return 0
+        if i.mnemonic in (M.SHL, M.SAL, M.SHR, M.SAR) and n >= width:
+            undefined |= F.CF
+            defines &= ~F.CF
+    if (i.has_rep_prefix or i.has_repe_prefix or i.has_repne_prefix) and defines:
+        return before & ~undefined  # a zero count compares nothing and keeps the flags
+    return (before & ~undefined) | defines
+
+
+def defined_flags(body):
+    """The ZF and CF bits defined on entry to each reachable instruction of body: those that an earlier
+    instruction writes on every path from body[0]. The integer lowering starts both as false, which is not
+    what a native caller passes in, so a reader of an undefined flag would see that initializer."""
+    index = {i.ip: i for i in body}
+    defined = {body[0].ip: 0}
+    work = [body[0].ip]
+    while work:
+        i = index[work.pop()]
+        after = _flags_after(i, defined[i.ip])
+        flow = i.flow_control
+        successors = []
+        if flow not in (FlowControl.RETURN, FlowControl.UNCONDITIONAL_BRANCH, FlowControl.INDIRECT_BRANCH):
+            successors.append(i.next_ip)
+        if flow in (FlowControl.CONDITIONAL_BRANCH, FlowControl.UNCONDITIONAL_BRANCH):
+            successors.append(i.near_branch_target)
+        for target in successors:
+            if target in index:
+                joined = after if target not in defined else defined[target] & after
+                if target not in defined or joined != defined[target]:
+                    defined[target] = joined
+                    work.append(target)
+    return defined
 
 
 def statement(i, depth, address):

@@ -9,7 +9,9 @@ Usage:
 The exports, harness and guards follow tests/cpu/x87_add.py, and the other steps use the format of
 tests/cpu/x87_moves.py. emit checks that every decoded x87 instruction is the form its sequence names.
 The flags come from an integer CMP of two input dwords or from FCOMI; the model evaluates each condition
-itself and copies raw encodings, independent of tools/x87_soft.h.
+itself and copies raw encodings, independent of tools/x87_soft.h. Two native-only exports (ENTRY) move
+before any flag writer: they run through x87_call_flags under each caller CF and ZF, and translation must
+reject them.
 """
 from pathlib import Path
 import platform
@@ -52,6 +54,13 @@ SEQUENCES = {
     "fcmovnb_st7": ("m64x8int", [("fld", "m64", 8 * k) for k in range(8)] + [CMP, ("fcmovnb", 7)]
                     + [("fstp", "m64", 8 * k) for k in range(8)]),
 }
+# Native only: no instruction writes the flags before the move, so it reads the caller's CF or ZF. The
+# lowered function has no such input, and translation must reject both.
+ENTRY = {
+    "fcmovb_entry": ("pair80", P2 + [("fcmovb", 1)] + OUT2),
+    "fcmove_entry": ("pair80", P2 + [("fcmove", 1)] + OUT2),
+}
+STEPS = {**SEQUENCES, **ENTRY}
 
 MOVE = r"x87_slot\[(\d)\] = x87_slot\[(\d)\];  // (fcmov\w*) "
 CONTROLS = {
@@ -106,11 +115,11 @@ def write_asm(asm_path, def_path):
              "; Source-owned differential fixture for the ZF/CF forms of FCMOVcc in the x87 leaf-function",
              "; profile. Each export reads an input block at RCX, writes an output block at RDX and returns with",
              "; the x87 stack empty.", ".code", ""]
-    for name, (_, steps) in SEQUENCES.items():
+    for name, (_, steps) in STEPS.items():
         lines += [f"{name} PROC FRAME", "    .endprolog", *(asm_line(s) for s in steps), "    ret", f"{name} ENDP", ""]
     lines.append("END")
     Path(asm_path).write_text("\n".join(lines) + "\n", encoding="ascii")
-    Path(def_path).write_text("EXPORTS\n" + "".join(f"    {name}\n" for name in SEQUENCES), encoding="ascii")
+    Path(def_path).write_text("EXPORTS\n" + "".join(f"    {name}\n" for name in STEPS), encoding="ascii")
 
 
 def emit(image, output, control="lifted"):
@@ -143,15 +152,16 @@ def emit(image, output, control="lifted"):
 
 # ---- Independent model -----------------------------------------------------------------------------
 
-def reference(name, data, moves=True):
-    """The output block; with moves=False every conditional move is skipped, for the moved-case count."""
+def reference(name, data, moves=True, flags=None):
+    """The output block; with moves=False every conditional move is skipped, for the moved-case count.
+    flags gives the caller's (ZF, CF) for the ENTRY exports."""
     slots, out = [], bytearray(b"\xcc" * OUTPUT)
-    zero = carry = None
+    zero, carry = flags if flags is not None else (None, None)
 
     def read(kind, offset):
         return int.from_bytes(data[offset:offset + SIZE[kind]], "little")
 
-    for op, *args in SEQUENCES[name][1]:
+    for op, *args in STEPS[name][1]:
         if op == "cmp":
             a, b = read("m32", 48), read("m32", 52)
             zero, carry = a == b, a < b
@@ -243,6 +253,7 @@ def check(harness_path, native_path, lifted_path, *control_paths):
             raise AssertionError(f"x87_call lost a live caller value or control word around {label} {failed}")
     print(f"x87_call kept a live caller ST(0) value and control word around all {len(first)} native and "
           "translated exports")
+    check_entry_flags(harness_path, native_path)
     for path in control_paths:
         control = Path(path).stem.rsplit("_", 1)[-1]
         run = base.Runner(harness_path, path)
@@ -253,31 +264,105 @@ def check(harness_path, native_path, lifted_path, *control_paths):
     check_rejections()
 
 
+FLAGS = {(False, False): 0x00, (False, True): 0x01, (True, False): 0x40, (True, True): 0x41}  # AH for SAHF
+
+
+def check_entry_flags(harness_path, native_path):
+    """The ENTRY exports natively under each caller ZF and CF, through x87_call_flags, and their rejection."""
+    import ctypes
+    import pefile
+    from cpu_leaf_aot import export_rva
+    from cpu_ranges import function_ranges
+    from ffx_version_query import lower, region
+
+    run = base.Runner(harness_path, native_path)
+    call = run.harness.x87_call_flags
+    call.argtypes, call.restype = [ctypes.c_void_p] * 3 + [ctypes.c_uint64], ctypes.c_uint64
+    rng = random.Random(113)
+    singles = list(base.m80_singles())
+    blocks = []
+    while len(blocks) < 40:
+        a, b = rng.choice(singles), rng.choice(singles)
+        if a != b:
+            blocks.append((m80_bytes(a) + m80_bytes(b)).ljust(INPUT, b"\0"))
+    runs = 0
+    for name in ENTRY:
+        function = ctypes.cast(getattr(run.lib, name), ctypes.c_void_p).value
+        for data in blocks:
+            outputs = set()
+            for flags, ah in FLAGS.items():
+                guard, source, target = run._buffers(data)
+                state = call(function, ctypes.addressof(source) + base.GUARD, ctypes.addressof(target) + base.GUARD, ah)
+                got = run._output(name, data, guard, source, target)
+                if not base.entry_state_ok(state) or got != reference(name, data, flags=flags):
+                    raise AssertionError(f"native {name} with caller ZF, CF = {flags} gave {got[:32].hex()}")
+                outputs.add(got)
+                runs += 1
+            if len(outputs) != 2:
+                raise AssertionError(f"native {name} did not depend on the caller's flags")
+    with pefile.PE(str(native_path), fast_load=True) as pe:
+        for name, flag in (("fcmovb_entry", "CF"), ("fcmove_entry", "ZF")):
+            (bounds,) = function_ranges(pe, export_rva(pe, name))
+            try:
+                lower(region(pe, *bounds), ["rcx = a; rdx = b;"], {}, {}, {}, x87=True)
+            except ValueError as exc:
+                if f"reads {flag}, which no instruction defines" not in str(exc):
+                    raise
+            else:
+                raise AssertionError(f"translation accepted {name}, which reads the caller's {flag}")
+    print(f"native fcmovb_entry and fcmove_entry moved as the caller's CF and ZF (set by SAHF before the call) "
+          f"select in all {runs} runs over {len(blocks)} value pairs and the four flag pairs; translation rejects "
+          "both: the flag each reads is not defined on every path from the entry")
+
+
 def check_rejections():
     from iced_x86 import Decoder
     from ffx_version_query import lower
 
-    def attempt(hex_bytes):
+    def attempt(hex_bytes, calls=None):
         body = list(Decoder(64, bytes.fromhex(hex_bytes), ip=0x1000))
         try:
-            lower(body, [], {}, {}, {}, x87=True)
+            lower(body, [], {}, calls or {}, {}, x87=True)
         except ValueError as exc:
             return str(exc)
         return None
 
     fld, fstp, cmp = "db 29", "db 3a", "8b 41 30 3b 41 34"  # fld/fstp tbyte ptr [rcx]/[rdx]; mov/cmp eax
+    two, out = f"{fld} {fld}", f"{fstp} {fstp} c3"
+    undefined = "which no instruction defines on every path"
     rejected = {
-        "fcmovu st, st(1)": (attempt(f"{fld} {fld} {cmp} da d9 {fstp} {fstp} c3"), "unsupported x87 operation"),
-        "fcmovnu st, st(1)": (attempt(f"{fld} {fld} {cmp} db d9 {fstp} {fstp} c3"), "unsupported x87 operation"),
+        "fcmovu st, st(1)": (attempt(f"{two} {cmp} da d9 {out}"), "unsupported x87 operation"),
+        "fcmovnu st, st(1)": (attempt(f"{two} {cmp} db d9 {out}"), "unsupported x87 operation"),
         "fcmovb st, st(1) with one value": (attempt(f"{fld} {cmp} da c1 {fstp} c3"), "x87 stack underflow"),
-        "fcmove st, st(2) with two values": (attempt(f"{fld} {fld} {cmp} da ca {fstp} {fstp} c3"),
-                                             "x87 stack underflow"),
+        "fcmove st, st(2) with two values": (attempt(f"{two} {cmp} da ca {out}"), "x87 stack underflow"),
         "fcmovnbe on an empty stack": (attempt(f"{cmp} db d1 c3"), "x87 stack underflow"),
+        # Flags that no instruction writes on some path from the entry.
+        "fcmovb before any flag writer": (attempt(f"{two} da c1 {out}"), "reads CF, " + undefined),
+        "fcmove after a join with one undefined predecessor": (attempt(f"{two} e3 06 {cmp} da c9 {out}"),
+                                                               "reads ZF, " + undefined),
+        "fcmovbe after stc, which leaves ZF undefined": (attempt(f"{two} f9 da d1 {out}"), "reads ZF, " + undefined),
+        "fcmovnb after a call": (attempt(f"{cmp} e8 00 00 00 00 {two} db c1 {out}", calls={0x1006: ";"}),
+                                 "reads CF, " + undefined),
+        "fcmove after imul, which leaves ZF undefined": (attempt(f"{two} 0f af c1 da c9 {out}"),
+                                                         "reads ZF, " + undefined),
+        "fcmovb after shl eax, cl with no earlier writer": (attempt(f"{two} d3 e0 da c1 {out}"),
+                                                            "reads CF, " + undefined),
+        "fcmovb after shl ax, 16": (attempt(f"{two} 66 c1 e0 10 da c1 {out}"), "reads CF, " + undefined),
     }
     for case, (message, needle) in rejected.items():
         if message is None or needle not in message:
             raise AssertionError(f"{case}: expected a rejection containing {needle!r}, got {message!r}")
     print(f"rejected {len(rejected)} sequences outside the profile: " + "; ".join(rejected))
+    accepted = {
+        "fcmovb after clc": attempt(f"{two} f8 da c1 {out}"),
+        "fcmove after a join where both paths write ZF": attempt(f"{two} {cmp} e3 06 {cmp} da c9 {out}"),
+        "fcmove after xor eax, eax": attempt(f"{two} 31 c0 da c9 {out}"),
+        "fcmovnbe after fcomi": attempt(f"{two} db f1 db d1 {out}"),
+    }
+    for case, message in accepted.items():
+        if message is not None:
+            raise AssertionError(f"{case}: expected translation, got {message!r}")
+    print(f"translated {len(accepted)} sequences whose flags are written on every path: " + "; ".join(accepted))
 
 
 if __name__ == "__main__":

@@ -11,3 +11,5 @@ EXPORTS
     fcmovne_fcmove
     fcmove_st0
     fcmovnb_st7
+    fcmovb_entry
+    fcmove_entry
