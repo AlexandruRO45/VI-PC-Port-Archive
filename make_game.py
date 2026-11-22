@@ -1223,13 +1223,23 @@ def runtime_gpu_info() -> dict:
 
 def f64_soft_wanted() -> bool:
     """Whether a new translation should use --f64-soft: LEONIDA_F64_SOFT=1 (or 0) decides; unset, it is on where
-    tools/vk_subgroup_info.py reports no shaderFloat64 for the GPU the runtime would use (off when it can't tell)."""
+    tools/vk_subgroup_info.py reports no shaderFloat64 for the GPU the runtime would use. When it can't tell, it is on
+    on macOS (Metal has no double type, so no Vulkan driver there has shaderFloat64) and off elsewhere, with a note."""
     v = (os.environ.get("LEONIDA_F64_SOFT") or "").strip().lower()
     if v in ("1", "true", "yes", "on"):
         return True
     if v in ("0", "false", "no", "off"):
         return False
-    return runtime_gpu_info().get("float64") is False
+    float64 = runtime_gpu_info().get("float64")
+    if float64 is not None:
+        return float64 is False
+    if sys.platform == "darwin":
+        log("shaders: couldn't ask the GPU for shaderFloat64; macOS has no double-precision Vulkan driver, so "
+            "translating with --f64-soft")
+        return True
+    log("shaders: couldn't ask the GPU for shaderFloat64; translating f64 ops natively (LEONIDA_F64_SOFT=1 or "
+        "--f64-soft if the GPU has no shaderFloat64)")
+    return False
 
 
 def runtime_gpu_per_vertex():

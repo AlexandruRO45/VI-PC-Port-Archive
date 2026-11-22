@@ -167,7 +167,7 @@ class MainWiringTest(unittest.TestCase):
                 mock.patch("make_game.wave64_settings", return_value=(False, True)), \
                 mock.patch("make_game.runtime_gpu_per_vertex", return_value=per_vertex), \
                 mock.patch("make_game.runtime_gpu_max_push_constants", return_value=max_push_constants), \
-                mock.patch("make_game.runtime_gpu_info", return_value=gpu_info or {}), \
+                mock.patch("make_game.runtime_gpu_info", return_value={"float64": True} if gpu_info is None else gpu_info), \
                 mock.patch.dict(os.environ, env or {}), \
                 mock.patch("make_game.preflight") as preflight, \
                 mock.patch("make_game.shaders") as shaders, \
@@ -221,7 +221,10 @@ class MainWiringTest(unittest.TestCase):
         no_env = {"LEONIDA_F64_SOFT": ""}
         self.assertEqual(self.run_main(gpu_info={"float64": False}, env=no_env), (("--f64-soft",),) * 2)
         self.assertEqual(self.run_main(gpu_info={"float64": True}, env=no_env), ((), ()))
-        self.assertEqual(self.run_main(gpu_info={}, env=no_env), ((), ()))
+        with mock.patch.object(sys, "platform", "linux"):
+            self.assertEqual(self.run_main(gpu_info={}, env=no_env), ((), ()))
+        with mock.patch.object(sys, "platform", "darwin"):     # no fp64 Vulkan driver exists on macOS
+            self.assertEqual(self.run_main(gpu_info={}, env=no_env), (("--f64-soft",),) * 2)
         self.assertEqual(self.run_main(gpu_info={"float64": False}, env={"LEONIDA_F64_SOFT": "0"}), ((), ()))
         self.assertEqual(self.run_main(gpu_info={"float64": True}, env={"LEONIDA_F64_SOFT": "1"}), (("--f64-soft",),) * 2)
         self.assertEqual(self.run_main("--f64-soft", gpu_info={"float64": True}, env=no_env), (("--f64-soft",),) * 2)
