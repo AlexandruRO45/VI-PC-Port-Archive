@@ -464,9 +464,7 @@ records. No unhandled layout tag appears:
   over the 504 blocks, a floor of exactly 10, and `fAccelerationRating` the only field past 1,000 (22 blocks,
   maximum 1,327).
 
-Not measured here (hypothesis): whether the estimates are precomputed from handling data or measured by
-simulation, and what fixes the top of the rating scale.
-- **The estimates are a separate stored table, not the performance maps.** `common.rpf`'s data area at `0x9580`
+- **The estimates are a generated stats table, not measurements.** `common.rpf`'s data area at `0x9580`
   also holds `CVehiclePerformanceMaps` (285 rows, 10 result fields) and `CTyreDataSet` (40 tyre types). 251 of the
   252 estimate keys join the performance rows, but no field reproduces an estimate exactly: the best OLS over
   all ten gives R^2 0.872, and `fAccelerationTime` against `accelZeroSixty` is R^2 0.811 with a median |residual|
