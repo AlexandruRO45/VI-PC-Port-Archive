@@ -28,6 +28,7 @@ Signed 32-bit Integer Properties:
 """
 
 import math
+import re
 import struct
 import unittest
 from dataclasses import dataclass, field
@@ -139,6 +140,130 @@ class LDSMemory:
         return old_val, new_val
 
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class DSOpcode(Enum):
+    """Data Share (DS) atomic opcodes."""
+    DS_MAX_RTN_I32 = "ds_max_rtn_i32"
+
+
+class RegType(Enum):
+    """Register file types."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclass(frozen=True)
+class RegisterOperand:
+    """Typed symbolic register operand representation."""
+    index: int
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        max_limit = DEFAULT_NUM_VGPRS if self.reg_type == RegType.VGPR else DEFAULT_NUM_SGPRS
+        if not (0 <= self.index < max_limit):
+            raise ValueError(
+                f"Register index out of range for {self.reg_type.name}: {self.index} (limit: {max_limit})"
+            )
+
+    def __str__(self) -> str:
+        return f"{self.reg_type.value}{self.index}"
+
+
+@dataclass(frozen=True)
+class DSMaxRtnI32Instruction:
+    """Symbolic AST node representing a ds_max_rtn_i32 instruction.
+
+    Format:
+        ds_max_rtn_i32 vdst, vaddr, vdata0 [offset:offset16]
+    """
+    vdst: RegisterOperand
+    vaddr: RegisterOperand
+    vdata0: RegisterOperand
+    offset: int = 0
+    opcode: DSOpcode = DSOpcode.DS_MAX_RTN_I32
+
+    def __post_init__(self) -> None:
+        if self.vdst.reg_type != RegType.VGPR:
+            raise ValueError(f"vdst must be a VGPR, got {self.vdst.reg_type}")
+        if self.vaddr.reg_type != RegType.VGPR:
+            raise ValueError(f"vaddr must be a VGPR, got {self.vaddr.reg_type}")
+        if self.vdata0.reg_type != RegType.VGPR:
+            raise ValueError(f"vdata0 must be a VGPR, got {self.vdata0.reg_type}")
+        if not (0 <= self.offset <= 65535):
+            raise ValueError(f"offset out of range [0, 65535]: {self.offset}")
+
+    def to_assembly(self) -> str:
+        """Serialize AST node to standard assembly string."""
+        asm = f"{self.opcode.value} {self.vdst}, {self.vaddr}, {self.vdata0}"
+        if self.offset != 0:
+            asm += f" offset:{self.offset}"
+        return asm
+
+    @classmethod
+    def parse(cls, asm: str) -> DSMaxRtnI32Instruction:
+        """Parse an assembly string into a DSMaxRtnI32Instruction AST node."""
+        cleaned = re.sub(r"[;#].*$", "", asm).strip()
+        if not cleaned:
+            raise ValueError("Empty assembly string")
+
+        tokens = cleaned.split()
+        if not tokens:
+            raise ValueError("Empty instruction")
+
+        op_str = tokens[0].lower()
+        if op_str != DSOpcode.DS_MAX_RTN_I32.value:
+            raise ValueError(f"Unsupported opcode '{tokens[0]}', expected '{DSOpcode.DS_MAX_RTN_I32.value}'")
+
+        rest = " ".join(tokens[1:])
+        parts = [p.strip() for p in rest.split(",") if p.strip()]
+
+        if len(parts) < 3:
+            raise ValueError(f"Insufficient operands for {op_str}: expected at least 3, got {len(parts)}")
+
+        vdst_str = parts[0]
+        vaddr_str = parts[1]
+
+        # Third part might contain vdata0 and optionally offset:offset separated by space or attached
+        vdata_and_mods = parts[2].split()
+        vdata_str = vdata_and_mods[0]
+
+        offset_val = 0
+        mod_tokens = vdata_and_mods[1:] + parts[3:]
+        for m in mod_tokens:
+            m_lower = m.lower()
+            if m_lower.startswith("offset:"):
+                raw_offset = m[len("offset:"):]
+                try:
+                    offset_val = int(raw_offset, 0)
+                except ValueError:
+                    raise ValueError(f"Invalid integer offset value: '{raw_offset}'")
+            else:
+                raise ValueError(f"Unknown modifier or unexpected extra token: '{m}'")
+
+        def parse_vgpr(reg_s: str) -> RegisterOperand:
+            reg_s = reg_s.strip()
+            if not (reg_s.startswith("v") or reg_s.startswith("V")):
+                raise ValueError(f"Expected VGPR starting with 'v', got '{reg_s}'")
+            try:
+                idx = int(reg_s[1:])
+            except ValueError:
+                raise ValueError(f"Invalid VGPR index: '{reg_s}'")
+            return RegisterOperand(idx, RegType.VGPR)
+
+        vdst = parse_vgpr(vdst_str)
+        vaddr = parse_vgpr(vaddr_str)
+        vdata0 = parse_vgpr(vdata_str)
+
+        return cls(vdst=vdst, vaddr=vaddr, vdata0=vdata0, offset=offset_val)
+
+
+# ==============================================================================
+# Unit Tests
+# ==============================================================================
+
 class TestLDSMaxRtnI32OracleAndModel(unittest.TestCase):
     """Phase 1: Unit tests for signed 32-bit integer oracle and LDS architectural model."""
 
@@ -244,6 +369,63 @@ class TestLDSMaxRtnI32OracleAndModel(unittest.TestCase):
             expected_bank = i % 32
             eff_addr = i * 4
             self.assertEqual(calc_lds_bank(eff_addr), expected_bank)
+
+
+class TestDSMaxRtnI32AST(unittest.TestCase):
+    """Phase 2: Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_register_operand_valid(self) -> None:
+        vgpr = RegisterOperand(0, RegType.VGPR)
+        self.assertEqual(str(vgpr), "v0")
+        self.assertEqual(vgpr.index, 0)
+        self.assertEqual(vgpr.reg_type, RegType.VGPR)
+
+        vgpr_max = RegisterOperand(255, RegType.VGPR)
+        self.assertEqual(str(vgpr_max), "v255")
+
+    def test_register_operand_out_of_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(106, RegType.SGPR)
+
+    def test_instruction_construction_and_to_assembly(self) -> None:
+        vdst = RegisterOperand(0, RegType.VGPR)
+        vaddr = RegisterOperand(1, RegType.VGPR)
+        vdata0 = RegisterOperand(2, RegType.VGPR)
+
+        inst1 = DSMaxRtnI32Instruction(vdst=vdst, vaddr=vaddr, vdata0=vdata0)
+        self.assertEqual(inst1.to_assembly(), "ds_max_rtn_i32 v0, v1, v2")
+
+        inst2 = DSMaxRtnI32Instruction(vdst=vdst, vaddr=vaddr, vdata0=vdata0, offset=128)
+        self.assertEqual(inst2.to_assembly(), "ds_max_rtn_i32 v0, v1, v2 offset:128")
+
+    def test_instruction_parsing_valid(self) -> None:
+        inst1 = DSMaxRtnI32Instruction.parse("ds_max_rtn_i32 v0, v1, v2")
+        self.assertEqual(inst1.vdst.index, 0)
+        self.assertEqual(inst1.vaddr.index, 1)
+        self.assertEqual(inst1.vdata0.index, 2)
+        self.assertEqual(inst1.offset, 0)
+
+        inst2 = DSMaxRtnI32Instruction.parse("ds_max_rtn_i32 v10, v20, v30 offset:256")
+        self.assertEqual(inst2.vdst.index, 10)
+        self.assertEqual(inst2.vaddr.index, 20)
+        self.assertEqual(inst2.vdata0.index, 30)
+        self.assertEqual(inst2.offset, 256)
+
+        # Hex offset and case insensitivity
+        inst3 = DSMaxRtnI32Instruction.parse("DS_MAX_RTN_I32 v5, v6, v7 offset:0x40")
+        self.assertEqual(inst3.offset, 64)
+
+    def test_instruction_roundtrip(self) -> None:
+        vdst = RegisterOperand(4, RegType.VGPR)
+        vaddr = RegisterOperand(8, RegType.VGPR)
+        vdata0 = RegisterOperand(12, RegType.VGPR)
+        inst = DSMaxRtnI32Instruction(vdst=vdst, vaddr=vaddr, vdata0=vdata0, offset=60)
+        parsed = DSMaxRtnI32Instruction.parse(inst.to_assembly())
+        self.assertEqual(inst, parsed)
 
 
 if __name__ == "__main__":
