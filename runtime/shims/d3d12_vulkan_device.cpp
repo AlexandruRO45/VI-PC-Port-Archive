@@ -2708,7 +2708,7 @@ public:
             stage_infos.push_back(info);
         }
         UserDataLayout user;
-        if (!user_data_layout({stages[0].entry, stages[1].entry}, user)) return E_NOTIMPL;
+        if (!user_data_layout({stages[0].entry, stages[1].entry, stages[2].entry}, user)) return E_NOTIMPL;
 
         // Input layout -> vertex input, by semantic.
         std::vector<VkVertexInputAttributeDescription> attributes;
