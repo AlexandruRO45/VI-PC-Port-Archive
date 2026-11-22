@@ -1206,5 +1206,165 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
             self.assertEqual(ref_ds_inc_src2_u64(val, val), 0)
 
 
+# ==============================================================================
+# Phase 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestNegativeControlsAndMutationDetection(unittest.TestCase):
+    """Phase 8: Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_malformed_tokens(self) -> None:
+        with self.assertRaises(ValueError):
+            DSIncSrc2U64Instruction.parse("")
+        with self.assertRaises(ValueError):
+            DSIncSrc2U64Instruction.parse("ds_inc_src2_u64")
+        with self.assertRaises(ValueError):
+            DSIncSrc2U64Instruction.parse("ds_inc_src2_u32 v0")
+        with self.assertRaises(ValueError):
+            DSIncSrc2U64Instruction.parse("ds_inc_src2_u64 v0 invalid_modifier:10")
+
+    def test_syntax_rejection_register_classes(self) -> None:
+        s0 = RegisterOperand(0, RegType.SGPR)
+        with self.assertRaises(TypeError):
+            LDSAddressExpression(base_reg=s0)
+
+    def test_syntax_rejection_register_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.SGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(106, RegType.SGPR)
+
+    def test_syntax_rejection_offset_bounds(self) -> None:
+        v0 = RegisterOperand(0, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(base_reg=v0, offset0=-1)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(base_reg=v0, offset0=256)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(base_reg=v0, offset1=-1)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(base_reg=v0, offset1=256)
+
+    def test_syntax_rejection_lds_capacity(self) -> None:
+        with self.assertRaises(ValueError):
+            LDSModel64(capacity_qwords=0)
+        with self.assertRaises(ValueError):
+            LDSModel64(capacity_qwords=-8)
+        with self.assertRaises(ValueError):
+            LDSModel64(capacity_qwords=500)  # Not a power of two
+
+    def test_syntax_rejection_simd_lane_count(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState64(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState64(num_lanes=128)
+
+    def test_mutation_detection_wrap_strict_greater(self) -> None:
+        # Mutant: wraps only on `val_a > val_b` instead of `>=`
+        def mutant_inc(a: int, b: int) -> int:
+            u_a = u64(a)
+            u_b = u64(b)
+            return 0 if u_a > u_b else u64(u_a + 1)
+
+        val_a, val_b = 5, 5
+        correct_res = ref_ds_inc_src2_u64(val_a, val_b)
+        mutant_res = mutant_inc(val_a, val_b)
+
+        self.assertEqual(correct_res, 0)
+        self.assertEqual(mutant_res, 6)
+        self.assertNotEqual(correct_res, mutant_res)
+
+    def test_mutation_detection_offset_stride(self) -> None:
+        # Mutant: erroneously scales by 4 bytes (dword) instead of 8 bytes (qword)
+        def mutant_calc_addresses(vaddr: int, offset0: int, offset1: int) -> Tuple[int, int]:
+            addr_a = u32(vaddr + offset0 * 4) # Bug: multiplied by 4 instead of 8
+            addr_b = u32(vaddr + offset1 * 4)
+            return addr_a, addr_b
+
+        vaddr = 0x100
+        correct_a, correct_b, _, _ = calc_lds_src2_u64_addresses(vaddr, offset0=2, offset1=4)
+        mutant_a, mutant_b = mutant_calc_addresses(vaddr, offset0=2, offset1=4)
+
+        self.assertEqual(correct_a, 0x100 + 16)
+        self.assertEqual(mutant_a, 0x100 + 8)
+        self.assertNotEqual(correct_a, mutant_a)
+
+    def test_mutation_detection_simd_exec_leakage(self) -> None:
+        # Mutant SIMD interpreter that executes regardless of EXEC mask
+        class MutantSIMDInterpreter(SIMDInterpreter64):
+            def execute(
+                self,
+                instr: DSIncSrc2U64Instruction,
+                state: SIMDState64,
+            ) -> list[Optional[int]]:
+                results: list[Optional[int]] = [None] * state.num_lanes
+                for lane in range(state.num_lanes):
+                    # Bug: executes without checking is_lane_active
+                    vaddr = state.get_lane_vgpr(lane, instr.addr.base_reg.index)
+                    new_val = state.lds.atomic_inc_src2_u64(vaddr, instr.addr.offset0, instr.addr.offset1)
+                    results[lane] = new_val
+                return results
+
+        state = SIMDState64(num_lanes=32, exec_mask=0, lds_capacity_qwords=512)
+        state.lds.write_qword(0, 100)
+        state.lds.write_qword(1, 200)
+
+        instr = DSIncSrc2U64Instruction(
+            addr=LDSAddressExpression(
+                base_reg=RegisterOperand(0, RegType.VGPR),
+                offset0=0,
+                offset1=1,
+            )
+        )
+
+        mutant = MutantSIMDInterpreter()
+        mutant.execute(instr, state)
+        # Mutant erroneously incremented qword 0 across all 32 inactive lanes to 132
+        self.assertEqual(state.lds.read_qword(0), 132)
+
+        # Standard interpreter preserves 100
+        state.lds.write_qword(0, 100)
+        standard = SIMDInterpreter64()
+        standard.execute(instr, state)
+        self.assertEqual(state.lds.read_qword(0), 100)
+
+    def test_mutation_detection_vaddr_clobber(self) -> None:
+        # Mutant interpreter that corrupts base VGPR
+        class MutantScalarInterpreter(ScalarInterpreter64):
+            def step(
+                self,
+                instr: DSIncSrc2U64Instruction,
+                state: ScalarMachineState64,
+            ) -> int:
+                val = super().step(instr, state)
+                state.set_vgpr(instr.addr.base_reg.index, 0xDEADBEEF)  # Bug: clobber vaddr
+                return val
+
+        state = ScalarMachineState64(lds_capacity_qwords=512)
+        state.set_vgpr(0, 0x80)
+
+        instr = DSIncSrc2U64Instruction(
+            addr=LDSAddressExpression(
+                base_reg=RegisterOperand(0, RegType.VGPR),
+                offset0=0,
+                offset1=1,
+            )
+        )
+
+        mutant = MutantScalarInterpreter()
+        mutant.step(instr, state)
+        self.assertEqual(state.get_vgpr(0), 0xDEADBEEF)
+
+        # Standard interpreter preserves base register
+        state.set_vgpr(0, 0x80)
+        standard = ScalarInterpreter64()
+        standard.step(instr, state)
+        self.assertEqual(state.get_vgpr(0), 0x80)
+
+
 if __name__ == "__main__":
     unittest.main()
