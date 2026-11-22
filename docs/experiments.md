@@ -1580,6 +1580,17 @@ Not covered: RIP-relative constants, packed operations, `SQRT`, `MIN` and `MAX`,
 
 On Linux, `llvm-ml` assembled the fixture and `lld-link` linked it. The original machine code ran in-process through a Windows-ABI trampoline that loads each slot into both its integer and its XMM register. It matched the lifted C++ built with clang at `-O0`, `-O2` and `-O3` on every call, for both builds, and all rejection controls passed. The generated sources compile without warnings under clang-cl `/W4 /WX`. A Windows run of `cpu_aot_scalar_float` with ML64 and MSVC has not been recorded yet.
 
+## D3D12 pixel-position inputs
+
+`pixel_position_centers` compiles a standalone Shader Model 6.0 pixel shader. Its inputs are `float4 TEXCOORD0` and `float4 SV_Position`, in the order emitted by the existing full-screen vertex shader. Red and green depend only on `SV_Position`. The test reads an 8×8 RGBA32F target with a 5×3 viewport at (2, 1). The CPU reference expects red and green to contain the absolute pixel center coordinates, with a half-pixel offset on each axis. The other 49 pixels retain the clear color. A second shader exchanges red and green and must first disagree at (2, 1), where the expected coordinates are (2.5, 1.5). [HLSL system-value semantics](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-semantics)
+
+The optional viewport in the pixel-case trailer is enabled by bit 1 of the flags byte. Four little-endian uint32 values follow in left, top, width, height order and must fit inside the 8×8 target. Existing optional NaN masks, when present, follow those fields. The fixture measures desktop screen-space coordinates. Scarlett register assignments require separate input-layout evidence.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^pixel_position_centers_(warp|hardware)$' -V
+```
+
 ## Offline pixel shader recompilation
 
 #The bitwise fixture uses AND, OR, XOR, NOT, BFI and three reversed shifts. Two constant sets exercise counts above 31. Exact mantissa bits distinguish the arithmetic and logical right shifts in GPU readback.
