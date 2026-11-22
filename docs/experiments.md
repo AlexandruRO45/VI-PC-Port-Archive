@@ -59,6 +59,15 @@ cmake --build --preset dev --target cpu_exe_framed_lifted cpu_exe_original_lifte
 ctest --preset dev --no-tests=error -R '^cpu_native_exe_(frame_)?chain$' -V
 ```
 
+`cpu_native_exe_image_chain` extends this same call path into writable image data. The no-unwind leaf reads a RIP-relative bias, stores `5 * selector - 5 + bias` in the image, and reloads the result to select the DLL call. The AOT EXE uses a live mapping of the source EXE away from its preferred base. It checks the complete 64-bit value in that mapping before release. Only the generated code executes the entry and leaf in this runner.
+
+The Windows process, the mapped original and the AOT EXE match the two DLL arguments, eight output bytes and process exit. With the linked bias of 5, selectors 0 and 1 return `0x60d` and `0x57`. Changing just the writable bias to 0 in a copy of the original reverses those results with the same AOT binary. Both the range manifest and generated sources come from the unmodified build.
+
+```powershell
+cmake --build --preset dev --target cpu_exe_image_lifted pe_map
+ctest --preset dev --no-tests=error -R '^cpu_native_exe_image_chain$' -V
+```
+
 The first host dependency appears during IAT binding, before any guest instruction runs. Before the startup wrapper was added, the tested MSVC build with an empty binding table stopped at `cpu_exe_io.dll!emit_trace`. Supplying just the I/O DLL stops at `cpu_import_provider.dll!mix_args`. The first import invoked at runtime is `read_selector`.
 
 The PE entry points to a [startup wrapper](../tests/cpu/exe_startup.asm). It calls the same return-based body in both cases. After it returns, the I/O DLL compares the fixture's mapped base with the main process module. A native process exits with the body's DWORD via `ExitProcess`. A host mapping returns that DWORD to `pe_map_run`. The regression starts a worker that signals readiness and stays alive. It checks process termination, both pipe EOFs and exact output and exit status for both selectors and empty input. A separate marker proves that the host gets control back after running the exact same image. A temporary copy with its startup RVA set directly to the body is the negative control, whose live worker and open pipes are sampled before cleanup. [Issue #281](https://github.com/R0Y00/Xbox2Windows/issues/281)

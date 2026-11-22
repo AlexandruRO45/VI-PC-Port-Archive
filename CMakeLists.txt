@@ -1015,12 +1015,18 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_import_original_lifted>" "$<TARGET_FILE:cpu_import_provider>"
         "$<TARGET_FILE:cpu_import_altered>" "$<TARGET_FILE:cpu_register_probe>")
     add_library(cpu_exe_io SHARED tests/cpu/exe_io.cpp)
-    foreach(variant IN ITEMS original inverted pair swapped framed)
+    foreach(variant IN ITEMS original inverted pair swapped framed image)
         set(native cpu_exe_${variant})
         set(lifted ${native}_lifted)
         add_executable(${native} tests/cpu/exe_entry.asm tests/cpu/direct.asm)
         set(entry_options)
-        if(variant STREQUAL "framed")
+        set(image_options)
+        if(variant STREQUAL "image")
+            target_compile_definitions(${native} PRIVATE IMAGE_SELECTOR)
+            target_link_options(${native} PRIVATE /EXPORT:selector_result,DATA /EXPORT:selector_bias,DATA)
+            list(APPEND image_options --image-data)
+        endif()
+        if(variant STREQUAL "framed" OR variant STREQUAL "image")
             target_sources(${native} PRIVATE tests/cpu/bare_calls.asm)
             target_compile_definitions(${native} PRIVATE FRAME_SELECTOR)
             target_link_options(${native} PRIVATE /EXPORT:call_bare "/MAP:${CMAKE_CURRENT_BINARY_DIR}/${native}.map")
@@ -1049,14 +1055,19 @@ if(EXISTS "${INTAKE_PYTHON}")
                 tools/cpu_call_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py tools/ffx_version_query.py
             VERBATIM)
         add_executable(${lifted} "${source}")
-        if(variant STREQUAL "framed")
+        if(variant STREQUAL "image")
+            set_source_files_properties("${source}" PROPERTIES COMPILE_DEFINITIONS "main=translated_entry")
+            target_sources(${lifted} PRIVATE tests/cpu/exe_image_host.cpp)
+            target_link_libraries(${lifted} PRIVATE pe_map)
+        endif()
+        if(variant STREQUAL "framed" OR variant STREQUAL "image")
             set(ranges "${CMAKE_CURRENT_BINARY_DIR}/${native}_ranges.json")
             set(selector "${CMAKE_CURRENT_BINARY_DIR}/${native}_selector.cpp")
             add_custom_command(OUTPUT "${selector}" BYPRODUCTS "${ranges}"
                 COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/range_manifest.py"
                     "$<TARGET_FILE:${native}>" "${CMAKE_CURRENT_BINARY_DIR}/${native}.map" "${ranges}" bare_mix
                 COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_switch_aot.py"
-                    "$<TARGET_FILE:${native}>" call_bare "${selector}" --bind-ranges "${ranges}"
+                    "$<TARGET_FILE:${native}>" call_bare "${selector}" --bind-ranges "${ranges}" ${image_options}
                 DEPENDS ${native} tools/range_manifest.py tools/cpu_switch_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py
                 VERBATIM)
             target_sources(${lifted} PRIVATE "${selector}")
@@ -1093,6 +1104,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/mapped_exe_chain_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_exe_framed>" "$<TARGET_FILE:cpu_exe_framed_lifted>"
         "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:cpu_import_provider>" "$<TARGET_FILE:cpu_exe_original>")
+    add_test(NAME cpu_native_exe_image_chain COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/exe_image_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_exe_image>" "$<TARGET_FILE:cpu_exe_image_lifted>"
+        "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:cpu_import_provider>")
     target_compile_features(pe_map PRIVATE cxx_std_17)
     add_test(NAME cpu_native_exe_termination COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/exe_termination_check.py" "$<TARGET_FILE:pe_map>"
