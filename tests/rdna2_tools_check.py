@@ -205,6 +205,31 @@ class TestRdna2Disasm(unittest.TestCase):
             ("1a8012cc18e10118", "v_pk_max_f16", "v_pk_max_f16 v26, v24, 0.5 clamp"),
             ("0c4013cc12275a1c", "v_dot2_f32_f16", "v_dot2_f32_f16 v12, v18, v19, v22"),
             ("0c0020cc2c265204", "v_fma_mix_f32", "v_fma_mix_f32 v12, s44, v19, v20"),
+            # FLAT, GLOBAL, and SCRATCH memory instructions
+            ("000030dc02007d04", "flat_load_dword", "flat_load_dword v4, v[2:3]"),
+            ("ff173bdc02007d04", "flat_load_dwordx4", "flat_load_dwordx4 v[4:7], v[2:3] offset:2047 glc slc dlc"),
+            ("100088dc02007d04", "flat_load_sbyte_d16", "flat_load_sbyte_d16 v4, v[2:3] offset:16"),
+            ("100070dc02087d00", "flat_store_dword", "flat_store_dword v[2:3], v8 offset:16"),
+            ("00007cdc02087d00", "flat_store_dwordx3", "flat_store_dwordx3 v[2:3], v[8:10]"),
+            ("0000c8dc02087d00", "flat_atomic_add", "flat_atomic_add v[2:3], v8"),
+            ("0000c9dc02087d04", "flat_atomic_add", "flat_atomic_add v4, v[2:3], v8 glc"),
+            ("2000c5dc02087d04", "flat_atomic_cmpswap", "flat_atomic_cmpswap v4, v[2:3], v[8:9] offset:32 glc"),
+            ("000045dd02087d04", "flat_atomic_cmpswap_x2", "flat_atomic_cmpswap_x2 v[4:5], v[2:3], v[8:11] glc"),
+            ("008030dc02007d04", "global_load_dword", "global_load_dword v4, v[2:3], off"),
+            ("f09f33dc01000204", "global_load_dword", "global_load_dword v4, v1, s[2:3] offset:-16 glc slc dlc"),
+            ("00a030dc02007d00", "global_load_dword", "global_load_dword v[2:3], off lds"),
+            ("00a030dc01000200", "global_load_dword", "global_load_dword v1, s[2:3] lds"),
+            ("ff8770dc02087d00", "global_store_dword", "global_store_dword v[2:3], v8, off offset:2047"),
+            ("008864dc01080200", "global_store_byte_d16_hi", "global_store_byte_d16_hi v1, v8, s[2:3] offset:-2048"),
+            ("0080c8dc01080200", "global_atomic_add", "global_atomic_add v1, v8, s[2:3]"),
+            ("0080c9dc01080204", "global_atomic_add", "global_atomic_add v4, v1, v8, s[2:3] glc"),
+            ("008045dd02087d04", "global_atomic_cmpswap_x2", "global_atomic_cmpswap_x2 v[4:5], v[2:3], v[8:11], off glc"),
+            ("104030dc01007d04", "scratch_load_dword", "scratch_load_dword v4, v1, off offset:16"),
+            ("f05f33dc00000204", "scratch_load_dword", "scratch_load_dword v4, off, s2 offset:-16 glc slc dlc"),
+            ("106030dc00000200", "scratch_load_dword", "scratch_load_dword off, s2 offset:16 lds"),
+            ("004020dc00007c04", "scratch_load_ubyte", "scratch_load_ubyte v4, off, m0"),
+            ("104070dc01087d00", "scratch_store_dword", "scratch_store_dword v1, v8, off offset:16"),
+            ("e04f74dc00080200", "scratch_store_dwordx2", "scratch_store_dwordx2 off, v[8:9], s2 offset:-32"),
         ]
         for hex_str, expected_op, expected_asm in vectors:
             raw = bytes.fromhex(hex_str)
@@ -432,6 +457,97 @@ class TestRdna2Disasm(unittest.TestCase):
             self.assertEqual(res_rec["opcode"], "v_pk_add_u16_unsupported")
             self.assertIn("<unsupported_reserved_bits>", res_rec["assembly"])
 
+    def test_flat_global_scratch_opcode_tables_synthetic_forms(self):
+        """All 130 GFX1013 FLAT, GLOBAL, and SCRATCH forms must decode cleanly and keep stream alignment."""
+        from disasm_rdna2 import FLAT_OPS, GLOBAL_OPS, SCRATCH_OPS
+
+        self.assertEqual(len(FLAT_OPS), 54)
+        self.assertEqual(len(GLOBAL_OPS), 54)
+        self.assertEqual(len(SCRATCH_OPS), 22)
+
+        def fmt_v(reg: int, width: int) -> str:
+            return f"v{reg}" if width == 1 else f"v[{reg}:{reg + width - 1}]"
+
+        for seg, ops_table in ((0, FLAT_OPS), (2, GLOBAL_OPS), (1, SCRATCH_OPS)):
+            for op, (expected_name, kind, vdst_w, vdata_w, _) in ops_table.items():
+                with self.subTest(seg=seg, op=op, name=expected_name):
+                    w0 = 0xdc000000 | (op << 18) | (seg << 14)
+                    w1 = (4 << 24) | (0x7d << 16) | (8 << 8) | 2
+                    insns = disasm_rdna2(struct.pack("<2I", w0, w1))
+                    self.assertEqual(len(insns), 1)
+                    self.assertEqual(insns[0]["opcode"], expected_name)
+                    self.assertEqual(insns[0]["length"], 8)
+
+                    vaddr = "v[2:3]" if seg in (0, 2) else "v2"
+                    if kind == "load":
+                        expected_ops = [fmt_v(4, vdst_w), vaddr]
+                    elif kind == "store":
+                        expected_ops = [vaddr, fmt_v(8, vdata_w)]
+                    else:
+                        expected_ops = [vaddr, fmt_v(8, vdata_w)]
+                    if seg in (1, 2):
+                        expected_ops.append("off")
+                    self.assertEqual(insns[0]["assembly"], f"{expected_name} {', '.join(expected_ops)}")
+                    self.assertTrue(is_opcode_recognized(expected_name))
+                    self.assertEqual(classify_isa_category(expected_name), "VMEM (Vector Memory / Buffer)")
+
+        # Truncated FLAT header reports flat_truncated instead of crashing.
+        trunc = disasm_rdna2(struct.pack("<I", 0xdc300000))
+        self.assertEqual(len(trunc), 1)
+        self.assertEqual(trunc[0]["opcode"], "flat_truncated")
+        self.assertIn("<truncated>", trunc[0]["assembly"])
+
+        # Reserved segment=3 and unsupported scratch atomic keep 8-byte alignment before s_endpgm.
+        for w0 in (0xdc30c000, 0xdcc84000):
+            stream = struct.pack("<3I", w0, (0x7d << 16) | 2, 0xbf810000)
+            decoded = disasm_rdna2(stream)
+            self.assertEqual([r["length"] for r in decoded], [8, 4])
+            self.assertEqual(decoded[1]["opcode"], "s_endpgm")
+
+    def test_flat_global_scratch_distinguishes_modifiers_and_addressing(self):
+        """Atomic glc return-value form, signed vs unsigned offsets, saddr, and LDS must stay distinct."""
+        # Atomic glc=0 vs glc=1 controls whether vdst is emitted.
+        for seg, base_w0, expected_no_rtn, expected_rtn in [
+            (0, 0xdc000000 | (0x32 << 18), "flat_atomic_add v[2:3], v8", "flat_atomic_add v4, v[2:3], v8 glc"),
+            (2, 0xdc000000 | (0x32 << 18) | (2 << 14), "global_atomic_add v[2:3], v8, off", "global_atomic_add v4, v[2:3], v8, off glc"),
+        ]:
+            w1 = (4 << 24) | (0x7d << 16) | (8 << 8) | 2
+            no_rtn = disasm_rdna2(struct.pack("<2I", base_w0, w1))[0]["assembly"]
+            rtn = disasm_rdna2(struct.pack("<2I", base_w0 | (1 << 16), w1))[0]["assembly"]
+            self.assertEqual(no_rtn, expected_no_rtn)
+            self.assertEqual(rtn, expected_rtn)
+
+        # FLAT offset is 12-bit unsigned while GLOBAL/SCRATCH offsets are 12-bit signed.
+        w1_off = (4 << 24) | (0x7d << 16) | 2
+        self.assertEqual(disasm_rdna2(struct.pack("<2I", 0xdc300800, w1_off))[0]["assembly"], "flat_load_dword v4, v[2:3] offset:2048")
+        self.assertEqual(disasm_rdna2(struct.pack("<2I", 0xdc308800, w1_off))[0]["assembly"], "global_load_dword v4, v[2:3], off offset:-2048")
+        self.assertEqual(disasm_rdna2(struct.pack("<2I", 0xdc304fff, w1_off))[0]["assembly"], "scratch_load_dword v4, v2, off offset:-1")
+
+        # Global saddr forms: off vs s[2:3] vs vcc vs ttmp[0:1], plus lds/slc/dlc/glc.
+        global_variants = {
+            "off": disasm_rdna2(struct.pack("<2I", 0xdc308000, (4 << 24) | (0x7d << 16) | 2))[0]["assembly"],
+            "s2": disasm_rdna2(struct.pack("<2I", 0xdc308000, (4 << 24) | (2 << 16) | 1))[0]["assembly"],
+            "vcc": disasm_rdna2(struct.pack("<2I", 0xdc308000, (4 << 24) | (106 << 16) | 1))[0]["assembly"],
+            "ttmp0": disasm_rdna2(struct.pack("<2I", 0xdc308000, (4 << 24) | (108 << 16) | 1))[0]["assembly"],
+            "lds": disasm_rdna2(struct.pack("<2I", 0xdc30a000, (0 << 24) | (2 << 16) | 1))[0]["assembly"],
+            "slc_dlc": disasm_rdna2(struct.pack("<2I", 0xdc329010, (4 << 24) | (2 << 16) | 1))[0]["assembly"],
+        }
+        self.assertEqual(len(set(global_variants.values())), len(global_variants))
+        self.assertEqual(global_variants["vcc"], "global_load_dword v4, v1, vcc")
+        self.assertEqual(global_variants["ttmp0"], "global_load_dword v4, v1, ttmp[0:1]")
+        self.assertEqual(global_variants["lds"], "global_load_dword v1, s[2:3] lds")
+        self.assertEqual(global_variants["slc_dlc"], "global_load_dword v4, v1, s[2:3] offset:16 slc dlc")
+
+        # Scratch saddr vs vaddr addressing.
+        self.assertEqual(
+            disasm_rdna2(struct.pack("<2I", 0xdc304000, (4 << 24) | (2 << 16) | 1))[0]["assembly"],
+            "scratch_load_dword v4, off, s2",
+        )
+        self.assertEqual(
+            disasm_rdna2(struct.pack("<2I", 0xdc306010, (0 << 24) | (2 << 16) | 0))[0]["assembly"],
+            "scratch_load_dword off, s2 offset:16 lds",
+        )
+
     def test_cli_hex_entry_point(self):
         script = Path(__file__).resolve().parents[1] / "tools" / "disasm_rdna2.py"
         res = subprocess.run(
@@ -514,6 +630,21 @@ class TestRdna2Disasm(unittest.TestCase):
             "s_bitcmp0_b32 s0, s1",
             "s_bitcmp0_b64 s[4:5], s6",
             "v_pk_add_u16 v4, v3, 1",
+            "flat_load_dword v4, v[2:3]",
+            "flat_load_dwordx4 v[4:7], v[2:3] offset:2047 glc slc dlc",
+            "flat_store_dword v[2:3], v8 offset:16",
+            "flat_atomic_add v[2:3], v8",
+            "flat_atomic_cmpswap_x2 v[4:5], v[2:3], v[8:11] glc",
+            "global_load_dword v4, v[2:3], off",
+            "global_load_dword v4, v1, s[2:3] offset:-16 glc slc dlc",
+            "global_load_dword v1, s[2:3] lds",
+            "global_store_byte_d16_hi v1, v8, s[2:3] offset:-2048",
+            "global_atomic_add v1, v8, s[2:3]",
+            "global_atomic_add v4, v1, v8, s[2:3] glc",
+            "scratch_load_dword v4, v1, off offset:16",
+            "scratch_load_dword v4, off, s2 offset:-16 glc slc dlc",
+            "scratch_load_dword off, s2 offset:16 lds",
+            "scratch_store_dwordx2 off, v[8:9], s2 offset:-32",
             "s_endpgm",
         ]
 
@@ -568,7 +699,7 @@ class TestRdna2Disasm(unittest.TestCase):
                 rdna2_op, llvm_op,
                 f"Instruction {i}: disasm_rdna2 opcode '{rdna2_op}' does not match LLVM opcode '{llvm_op}'"
             )
-            if orig_op.startswith(("v_", "exp", "image_")):
+            if orig_op.startswith(("v_", "exp", "image_", "flat_", "global_", "scratch_")):
                 self.assertEqual(
                     " ".join(rdna2_rec["assembly"].lower().split()),
                     " ".join(llvm_line.lower().split()),

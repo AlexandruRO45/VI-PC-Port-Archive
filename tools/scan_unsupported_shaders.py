@@ -29,8 +29,11 @@ except ImportError:
     parts = None
 
 try:
-    from disasm_rdna2 import disasm_rdna2
+    from disasm_rdna2 import FLAT_OPS, GLOBAL_OPS, SCRATCH_OPS, disasm_rdna2
 except ImportError:
+    FLAT_OPS = {}
+    GLOBAL_OPS = {}
+    SCRATCH_OPS = {}
     disasm_rdna2 = None
 
 
@@ -208,6 +211,9 @@ KNOWN_RDNA2_BASE_OPCODES |= (
     | {f"s_{name}_b64" for name in PIXEL_SALU_BIT64}
     | {f"v_pk_{name}_f16" for name in PIXEL_VOP3P_F16}
     | {f"v_pk_{name}" for name in PIXEL_VOP3P_INT16}
+    | {entry[0] for entry in FLAT_OPS.values()}
+    | {entry[0] for entry in GLOBAL_OPS.values()}
+    | {entry[0] for entry in SCRATCH_OPS.values()}
     | (set(pixel_aot.HINT_LIMITS) if pixel_aot is not None else set())
     | {
         "s_brev_b64", "s_bfm_b64", "s_bfe_u32", "s_bfe_i32",
@@ -267,7 +273,7 @@ def classify_isa_category(opcode: str) -> str:
         return "SALU (Scalar ALU)"
     if op.startswith("image_"):
         return "MIMG (Image / Texture Resource)"
-    if op.startswith("buffer_") or op.startswith("flat_") or op.startswith("global_"):
+    if op.startswith(("buffer_", "flat_", "global_", "scratch_")):
         return "VMEM (Vector Memory / Buffer)"
     if op.startswith("exp"):
         return "EXP (Export)"
