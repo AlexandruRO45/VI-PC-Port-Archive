@@ -193,6 +193,13 @@ def read_skeleton(sys, drawable):
         require(parent == 0xFFFF or parent < i, f"bone {i} parent {parent} is not an earlier bone")
         m = struct.unpack_from("<16f", sys, inverse + 64 * i)
         require(all(math.isfinite(v) for v in m) and m[3] == m[7] == m[11] == 0, f"inverse bind matrix {i}")
+        # RageSkeleton.cs:109 also refuses a degenerate matrix. The stored last column is (0, 0, 0, 1),
+        # so the 4x4 determinant is the determinant of the upper-left 3x3 linear part. As in the C#,
+        # abs() keeps mirrored binds; the epsilon rejects clearly non-invertible ones, not just float32 zero.
+        det = (m[0] * (m[5] * m[10] - m[6] * m[9])
+               - m[1] * (m[4] * m[10] - m[6] * m[8])
+               + m[2] * (m[4] * m[9] - m[5] * m[8]))
+        require(math.isfinite(det) and abs(det) >= 1e-12, f"inverse bind matrix {i} determinant")
         joints.append({
             "hash": u32(sys, r + 0x1C), "name": c_string(sys, r + 0x30), "parent": None if parent == 0xFFFF else parent,
             "rotation": struct.unpack_from("<4f", sys, r), "translation": struct.unpack_from("<3f", sys, r + 0x10),
@@ -543,9 +550,10 @@ def build(joints, meshes, clips, *, root_motion=True, generator="Leonida anim_gl
     for name, channels in clips:
         samplers, out_channels = [], []
         for (target, path), keys in sorted(channels.items(), key=lambda kv: (str(kv[0][0]), kv[0][1])):
-            times = [t for t, _v in keys]
+            time_bytes = _floats([t for t, _v in keys])
+            times = struct.unpack(f"<{len(keys)}f", time_bytes)
             require(all(b > a for a, b in zip(times, times[1:])), "key times are not increasing")
-            tv = _view(buf, views, _floats(times))
+            tv = _view(buf, views, time_bytes)
             ta = _accessor(accessors, tv, COMPONENT_FLOAT, len(times), "SCALAR", min=[min(times)], max=[max(times)])
             values = [x for _t, v in keys for x in v]
             vv = _view(buf, views, _floats(values))
@@ -717,6 +725,8 @@ def main(argv=None):
         for i in inputs:
             if os.path.exists(o) and same_path(i, o):
                 ap.error(f"{o} is an input; refusing to overwrite it")
+    if args.report and os.path.isdir(args.report):
+        ap.error(f"--report is a directory: {args.report}")
     if args.out and args.report and same_path(args.out, args.report):
         ap.error("the GLB and the report are the same path")
     if args.coverage:
@@ -735,9 +745,13 @@ def main(argv=None):
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
     if args.report:
-        with open(args.report, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=1, sort_keys=True)
-            f.write("\n")
+        try:
+            with open(args.report, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(report, f, indent=1, sort_keys=True)
+                f.write("\n")
+        except OSError as e:
+            print(f"ERROR: cannot write report {args.report}: {e.strerror or e}", file=sys.stderr)
+            return 2
     print(json.dumps({k: v for k, v in report.items() if k in ("counts", "skeleton", "seconds")}, sort_keys=True))
     return 0
 
