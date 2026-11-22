@@ -4,7 +4,7 @@ import hashlib
 from pathlib import Path
 
 import pefile
-from iced_x86 import Code as C, Decoder, MemorySizeExt, Mnemonic as M, OpKind as K, Register as R, RegisterExt
+from iced_x86 import Code as C, Decoder, EncodingKind, MemorySizeExt, Mnemonic as M, OpKind as K, Register as R, RegisterExt
 
 from cpu_leaf_aot import export_rva
 from cpu_ranges import function_ranges, image_bytes
@@ -37,8 +37,48 @@ static_assert(sizeof(void*) == sizeof(word));
 template<class T> T load(word address) {
     T v; memcpy(&v, reinterpret_cast<const void*>(address), sizeof v); return v;
 }
+template<class T> T load_always(word address) {
+    T v;
+    const volatile auto* p = reinterpret_cast<const volatile uint8_t*>(address);
+    auto* q = reinterpret_cast<uint8_t*>(&v);
+    for (size_t i = 0; i < sizeof v; ++i) q[i] = p[i];
+    return v;
+}
 template<class T> void store(word address, T v) {
     memcpy(reinterpret_cast<void*>(address), &v, sizeof v);
+}
+static inline uint32_t sha_rol32(uint32_t x, unsigned n) { return (x << n) | (x >> (32u - n)); }
+static inline uint32_t sha_ror32(uint32_t x, unsigned n) { return (x >> n) | (x << (32u - n)); }
+static inline void sha1_rnds4(uint32_t d[4], const uint32_t s[4], unsigned func) {
+    uint32_t a = d[3], b = d[2], c = d[1], dv = d[0], e = 0;
+    const uint32_t w[4] = {s[3], s[2], s[1], s[0]};
+    const uint32_t k = func == 0 ? 0x5a827999u : (func == 1 ? 0x6ed9eba1u : (func == 2 ? 0x8f1bbcdcu : 0xca62c1d6u));
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t f = func == 0 ? ((b & c) ^ (~b & dv))
+                         : (func == 2 ? ((b & c) ^ (b & dv) ^ (c & dv)) : (b ^ c ^ dv));
+        const uint32_t t = f + sha_rol32(a, 5) + w[i] + k + e;
+        e = dv; dv = c; c = sha_rol32(b, 30); b = a; a = t;
+    }
+    d[3] = a; d[2] = b; d[1] = c; d[0] = dv;
+}
+static inline void sha256_rnds2(uint32_t d[4], const uint32_t s[4], const uint32_t wk[4]) {
+    uint32_t a = s[3], b = s[2], c = d[3], dv = d[2], e = s[1], f = s[0], g = d[1], h = d[0];
+    for (int i = 0; i < 2; ++i) {
+        const uint32_t ch = (e & f) ^ (~e & g);
+        const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+        const uint32_t s0 = sha_ror32(a, 2) ^ sha_ror32(a, 13) ^ sha_ror32(a, 22);
+        const uint32_t s1 = sha_ror32(e, 6) ^ sha_ror32(e, 11) ^ sha_ror32(e, 25);
+        const uint32_t t1 = ch + s1 + wk[i] + h;
+        const uint32_t na = t1 + maj + s0, ne = t1 + dv;
+        h = g; g = f; f = e; e = ne; dv = c; c = b; b = a; a = na;
+    }
+    d[3] = a; d[2] = b; d[1] = e; d[0] = f;
+}
+extern "C" __declspec(dllimport) void __stdcall RaiseException(unsigned long, unsigned long, unsigned long, const uintptr_t*);
+[[noreturn]] static void raise_de(bool zero_divisor) {
+    // Windows distinguishes a zero divisor from a quotient that does not fit.
+    RaiseException(zero_divisor ? 0xc0000094ul : 0xc0000095ul, 1, 0, nullptr);
+    __assume(0);
 }
 """
 HEADER = INTEGER_HEADER + "struct Query { word type, next, effect, device, count, ids, names; };\n"
@@ -79,7 +119,8 @@ def string_op(i):
     else:
         lhs = f"static_cast<{t}>(rax)" if kind == "scas" else f"load<{t}>(rsi)"
         advance = "rdi += step;" if kind == "scas" else "rsi += step; rdi += step;"
-        step = f"{{ const {t} a = {lhs}, b = load<{t}>(rdi); zero = a == b; carry = a < b; }} {advance}"
+        step = (f"{{ const {t} a = {lhs}, b = load<{t}>(rdi); zero = a == b; carry = a < b; "
+                f"overflow = (((a ^ b) & (a ^ static_cast<{t}>(a - b))) >> {size * 8 - 1}) != 0; }} {advance}")
     stop = {"repe": " if (!zero) break;", "repne": " if (zero) break;"}.get(repeat, "")
     # A zero count performs no iteration and leaves the pointers and flags unchanged.
     body = f"while (rcx != 0) {{ {step} --rcx;{stop} }}" if repeat else step
@@ -89,10 +130,12 @@ def string_op(i):
 def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
     """Emit only query integer operations. All external edges and calls need named bindings."""
     lines = ["word frame[16]{};", "word " + ", ".join(r + "=0" for r in REGS.values()) + ";",
-             "bool zero=false, carry=false;", "rsp = reinterpret_cast<word>(frame);", *initial]
+             "bool zero=false, carry=false, overflow=false;", "rsp = reinterpret_cast<word>(frame);", *initial]
     allowed = {i.ip for i in body} | set(exits)
-    # The x87 profile checks every x87 instruction of the body before any of it is lowered.
-    x87_depth = x87_lower.depths(body, exits) if x87 and any(map(x87_lower.is_x87, body)) else None
+    # The x87 profile checks every x87 instruction of the body before any of it is lowered. x87 is True for
+    # the fixed control word, or an x87_lower.Checked for the checked entry, which also accepts FLDCW.
+    checked = x87 if isinstance(x87, x87_lower.Checked) else None
+    x87_depth = x87_lower.depths(body, exits, checked) if x87 and any(map(x87_lower.is_x87, body)) else None
     xmm = {R.XMM0: "xmm0", R.XMM1: "xmm1", R.XMM2: "xmm2"}
     has_xmm_math = any(i.mnemonic in (M.VMOVDQU, M.VPSRLDQ, M.VMOVD)
                        or (i.mnemonic == M.VPADDD and i.op2_kind != K.MEMORY) for i in body)
@@ -101,7 +144,14 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
     # Unaligned YMM copies and VEX zeroing in the descriptor builder need
     # only byte storage on the desktop host.
     wide = {R.YMM0: "wide0", R.YMM1: "wide1", R.YMM2: "wide2"}
-    has_wide = any(i.mnemonic == M.VMOVUPS for i in body)
+    wide_xmm = {R.XMM0: "wide0", R.XMM1: "wide1", R.XMM2: "wide2"}
+    sha_ops = {M.SHA1MSG1, M.SHA1MSG2, M.SHA1NEXTE, M.SHA1RNDS4, M.SHA256MSG1, M.SHA256MSG2, M.SHA256RNDS2}
+    wide_any = {**wide, **wide_xmm}
+    avx2_wide_ops = (M.VPBROADCASTB, M.VPBROADCASTW, M.VPBROADCASTD, M.VPBROADCASTQ,
+                     M.VPSLLVD, M.VPSRLVD, M.VPSRAVD, M.VPSLLVQ, M.VPSRLVQ)
+    sse41_ops = (M.PMINSB, M.PMAXSB, M.PMINUW, M.PMAXUW, M.PMINSD, M.PMAXSD,
+                 M.PMINUD, M.PMAXUD, M.PMULLD, M.PMULDQ, M.PCMPEQQ, M.PACKUSDW, M.PBLENDW, M.PBLENDVB)
+    has_wide = any(i.mnemonic in (M.VMOVUPS, M.MOVDQU, *avx2_wide_ops, *sse41_ops) or i.mnemonic in sha_ops for i in body)
     if any(i.code in STRING_OPS or i.mnemonic in (M.CLD, M.STD) for i in body):
         # The x64 software conventions expect DF clear on function exit and before calls, so it starts clear.
         lines.append("bool direction=false;")
@@ -196,12 +246,14 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
             src_bits = 8 * (MemorySizeExt.size(i.memory_size) if i.op1_kind == K.MEMORY else RegisterExt.size(i.op1_register))
             dst_bits = 8 * RegisterExt.size(i.op0_register)
             stmt = write(f"static_cast<int{dst_bits}_t>(static_cast<int{src_bits}_t>({operand(1)}))")
-        elif op == M.CMOVNE:
-            stmt = write(f"zero ? {operand(0)} : {operand(1)}")
-        elif op == M.CMOVE:
-            stmt = write(f"zero ? {operand(1)} : {operand(0)}")
-        elif op == M.CMOVBE:
-            stmt = write(f"(carry || zero) ? {operand(1)} : {operand(0)}")
+        elif op in (M.CMOVE, M.CMOVNE, M.CMOVA, M.CMOVAE, M.CMOVB, M.CMOVBE):
+            cond = {M.CMOVE: "zero", M.CMOVNE: "!zero", M.CMOVA: "!carry && !zero",
+                    M.CMOVAE: "!carry", M.CMOVB: "carry", M.CMOVBE: "carry || zero"}[op]
+            if i.op1_kind == K.MEMORY:
+                width = UINT[MemorySizeExt.size(i.memory_size)]
+                stmt = f"{{ const {width} src = load_always<{width}>({address()}); {write(f'({cond}) ? src : {operand(0)}')} }}"
+            else:
+                stmt = write(f"({cond}) ? {operand(1)} : {operand(0)}")
         elif op == M.LEA:
             stmt = write(address())
         elif op == M.MOVBE:
@@ -213,15 +265,17 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                     f"{write('v')} }}")
         elif op == M.CMP:
             # Sign-extended immediates arrive as 64-bit values; compare at the destination width.
-            width = UINT[MemorySizeExt.size(i.memory_size) if i.op0_kind == K.MEMORY else RegisterExt.size(i.op0_register)]
-            stmt = (f"{{ const {width} a = {operand(0)}, b = static_cast<{width}>({operand(1)}); "
-                    f"zero = a == b; carry = a < b; }}")
+            size = MemorySizeExt.size(i.memory_size) if i.op0_kind == K.MEMORY else RegisterExt.size(i.op0_register)
+            width = UINT[size]
+            stmt = (f"{{ const {width} a = {operand(0)}, b = static_cast<{width}>({operand(1)}), "
+                    f"d = static_cast<{width}>(a - b); "
+                    f"zero = a == b; carry = a < b; overflow = (((a ^ b) & (a ^ d)) >> {8 * size - 1}) != 0; }}")
         elif op == M.TEST:
-            stmt = f"zero = (({operand(0)} & {operand(1)}) == 0); carry = false;"
+            stmt = f"zero = (({operand(0)} & {operand(1)}) == 0); carry = false; overflow = false;"
         elif op == M.IMUL and i.op_count in (2, 3) and RegisterExt.size(i.op0_register) == 4:
             lhs, rhs = operand(i.op_count - 2), operand(i.op_count - 1)
             stmt = (f"{{ const int64_t product = int64_t(int32_t({lhs})) * int32_t({rhs}); "
-                    f"carry = product != int32_t(product); {write('product')} }}")
+                    f"carry = product != int32_t(product); overflow = carry; {write('product')} }}")
         elif op == M.CDQ:
             stmt = "rdx = uint32_t(int32_t(rax) >> 31);"
         elif op == M.CBW:
@@ -238,27 +292,37 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
             count = i.immediate(1) & (bits - 1)
             shift, last = ("<<", bits-count) if op == M.SHL else (">>", count-1)
             lhs = f"int{bits}_t(a)" if op == M.SAR else "a"
+            of_update = ""
+            if count == 1:
+                if op == M.SHL:
+                    of_update = f" overflow = (((v >> {bits - 1}) & 1) != 0) != carry;"
+                elif op == M.SHR:
+                    of_update = f" overflow = ((a >> {bits - 1}) & 1) != 0;"
+                else:
+                    of_update = " overflow = false;"
             stmt = (f"{{ const {UINT[size]} a = {operand(0)}, v = {lhs} {shift} {count}; "
-                    f"carry = ((a >> {last}) & 1) != 0; zero = v == 0; {write('v')} }}") if count else \
+                    f"carry = ((a >> {last}) & 1) != 0;{of_update} zero = v == 0; {write('v')} }}") if count else \
                 write(operand(0))  # A masked zero count keeps the flags but still zero-extends a 32-bit destination.
         elif op in (M.RCL, M.RCR):
             # The 9-, 17-, 33- or 65-bit rotation through CF, one bit per step as in the SDM pseudocode.
             # Counts mask to five bits (six for 64-bit). Reducing 8- and 16-bit counts modulo 9 and 17 only
             # bounds the loop, since those rotations repeat with that period.
-            # A zero step count keeps CF; ZF is never affected. OF (count 1) is not modelled here.
+            # A zero step count keeps CF; ZF is never affected. Only the single-bit rotation defines OF.
             size = MemorySizeExt.size(i.memory_size) if i.op0_kind == K.MEMORY else RegisterExt.size(i.op0_register)
             width, bits = UINT[size], 8 * size
             count = f"(static_cast<unsigned>({operand(1)}) & {0x3f if size == 8 else 0x1f}u)"
-            if size < 4:
-                count = f"({count} % {bits + 1}u)"
+            steps = f"(masked % {bits + 1}u)" if size < 4 else "masked"
             if op == M.RCL:
                 step = (f"const bool out = ((v >> {bits - 1}) & 1) != 0; "
                         f"v = static_cast<{width}>((v << 1) | {width}(c));")
             else:
                 step = (f"const bool out = (v & 1) != 0; "
                         f"v = static_cast<{width}>((v >> 1) | ({width}(c) << {bits - 1}));")
-            stmt = (f"{{ {width} v = {operand(0)}; bool c = carry; "
-                    f"for (unsigned n = {count}; n != 0; --n) {{ {step} c = out; }} carry = c; {write('v')} }}")
+            high = f"((v >> {bits - 1}) & 1u)"
+            other = "c" if op == M.RCL else f"((v >> {bits - 2}) & 1u)"
+            stmt = (f"{{ {width} v = {operand(0)}; bool c = carry; const unsigned masked = {count}; "
+                    f"for (unsigned n = {steps}; n != 0; --n) {{ {step} c = out; }} carry = c; "
+                    f"if (masked == 1) overflow = {high} != {other}; {write('v')} }}")
         elif op == M.CLC:
             stmt = "carry = false;"
         elif op == M.STC:
@@ -268,19 +332,35 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
         elif op in (M.ADD, M.ADC, M.AND, M.OR, M.XOR, M.INC, M.DEC, M.SUB, M.SBB):
             operator = {M.ADD: "+", M.ADC: "+", M.INC: "+", M.DEC: "-", M.AND: "&", M.OR: "|", M.XOR: "^", M.SUB: "-", M.SBB: "-"}[op]
             rhs = "1" if op in (M.INC, M.DEC) else operand(1)
-            width = UINT[MemorySizeExt.size(i.memory_size) if i.op0_kind == K.MEMORY else RegisterExt.size(i.op0_register)]
+            size = MemorySizeExt.size(i.memory_size) if i.op0_kind == K.MEMORY else RegisterExt.size(i.op0_register)
+            width = UINT[size]
+            sign_shift = 8 * size - 1
             expr = f"a {operator} b" + (" + word(carry)" if op == M.ADC else " - word(carry)" if op == M.SBB else "")
-            update = {M.ADD: "carry = v < a;", M.ADC: "carry = v < a || (carry && v == a);",
-                      M.SUB: "carry = a < b;", M.SBB: "carry = a < b || (carry && a == b);",
-                      M.INC: "", M.DEC: "", M.XOR: "carry = false;", M.AND: "carry = false;", M.OR: "carry = false;"}[op]
+            update = {
+                M.ADD: f"carry = v < a; overflow = (((~(a ^ b)) & (a ^ v)) >> {sign_shift}) != 0;",
+                M.ADC: f"carry = v < a || (carry && v == a); overflow = (((~(a ^ b)) & (a ^ v)) >> {sign_shift}) != 0;",
+                M.SUB: f"carry = a < b; overflow = (((a ^ b) & (a ^ v)) >> {sign_shift}) != 0;",
+                M.SBB: f"carry = a < b || (carry && a == b); overflow = (((a ^ b) & (a ^ v)) >> {sign_shift}) != 0;",
+                M.INC: f"overflow = (((~(a ^ b)) & (a ^ v)) >> {sign_shift}) != 0;",
+                M.DEC: f"overflow = (((a ^ b) & (a ^ v)) >> {sign_shift}) != 0;",
+                M.XOR: "carry = false; overflow = false;",
+                M.AND: "carry = false; overflow = false;",
+                M.OR: "carry = false; overflow = false;",
+            }[op]
             stmt = (f"{{ const {width} a = {operand(0)}, b = static_cast<{width}>({rhs}); "
                     f"const {width} v = static_cast<{width}>({expr}); {update} zero = v == 0; {write('v')} }}")
+        elif op in (M.ADCX, M.ADOX) and RegisterExt.size(i.op0_register) in (4, 8):
+            width = UINT[RegisterExt.size(i.op0_register)]
+            flag = "carry" if op == M.ADCX else "overflow"
+            stmt = (f"{{ const {width} a = {operand(0)}, b = {operand(1)}, "
+                    f"v = static_cast<{width}>(a + b + static_cast<{width}>({flag})); "
+                    f"{flag} = v < a || ({flag} && v == a); {write('v')} }}")
         elif op in (M.ANDN, M.BEXTR, M.BLSI, M.BLSMSK, M.BLSR, M.TZCNT) and RegisterExt.size(i.op0_register) in (4, 8):
             size = RegisterExt.size(i.op0_register)
             width, bits = UINT[size], 8 * size
             if op == M.ANDN:
                 stmt = (f"{{ const {width} v = static_cast<{width}>(~static_cast<{width}>({operand(1)}) "
-                        f"& static_cast<{width}>({operand(2)})); carry = false; zero = v == 0; {write('v')} }}")
+                        f"& static_cast<{width}>({operand(2)})); carry = false; overflow = false; zero = v == 0; {write('v')} }}")
             elif op == M.BEXTR:
                 stmt = (f"{{ const {width} a = {operand(1)}, ctrl = {operand(2)}; "
                         f"const unsigned start = static_cast<unsigned>(ctrl & 0xffu), "
@@ -288,20 +368,54 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                         f"{width} v = 0; if (start < {bits}u && len > 0u) {{ "
                         f"const {width} s = a >> start; "
                         f"v = len >= {bits}u ? s : static_cast<{width}>(s & ((static_cast<{width}>(1) << len) - 1)); }} "
-                        f"carry = false; zero = v == 0; {write('v')} }}")
+                        f"carry = false; overflow = false; zero = v == 0; {write('v')} }}")
             elif op == M.BLSI:
                 stmt = (f"{{ const {width} a = {operand(1)}, v = static_cast<{width}>(a & (static_cast<{width}>(0) - a)); "
-                        f"carry = a != 0; zero = v == 0; {write('v')} }}")
+                        f"carry = a != 0; overflow = false; zero = v == 0; {write('v')} }}")
             elif op == M.BLSMSK:
                 stmt = (f"{{ const {width} a = {operand(1)}, v = static_cast<{width}>(a ^ (a - 1)); "
-                        f"carry = a == 0; zero = false; {write('v')} }}")
+                        f"carry = a == 0; overflow = false; zero = false; {write('v')} }}")
             elif op == M.BLSR:
                 stmt = (f"{{ const {width} a = {operand(1)}, v = static_cast<{width}>(a & (a - 1)); "
-                        f"carry = a == 0; zero = v == 0; {write('v')} }}")
+                        f"carry = a == 0; overflow = false; zero = v == 0; {write('v')} }}")
             else:  # M.TZCNT
                 stmt = (f"{{ const {width} a = {operand(1)}; {width} v = 0; "
                         f"if (a == 0) {{ v = {bits}; }} else {{ while (((a >> v) & 1) == 0) ++v; }} "
                         f"carry = a == 0; zero = v == 0; {write('v')} }}")
+        elif op in (M.BSF, M.BSR, M.POPCNT, M.LZCNT) and RegisterExt.size(i.op0_register) in (4, 8):
+            size = RegisterExt.size(i.op0_register)
+            width, bits = UINT[size], 8 * size
+            if op == M.BSF:
+                stmt = (f"{{ const {width} a = {operand(1)}; zero = a == 0; if (a != 0) {{ "
+                        f"{width} v = 0; while (((a >> v) & 1) == 0) ++v; {write('v')} }} }}")
+            elif op == M.BSR:
+                stmt = (f"{{ const {width} a = {operand(1)}; zero = a == 0; if (a != 0) {{ "
+                        f"{width} v = {bits - 1}; while (((a >> v) & 1) == 0) --v; {write('v')} }} }}")
+            elif op == M.POPCNT:
+                stmt = (f"{{ {width} a = {operand(1)}, v = 0; while (a != 0) {{ a &= a - 1; ++v; }} "
+                        f"carry = false; overflow = false; zero = v == 0; {write('v')} }}")
+            else:  # M.LZCNT
+                stmt = (f"{{ const {width} a = {operand(1)}; {width} v = 0; "
+                        f"if (a == 0) {{ v = {bits}; }} else {{ while (((a >> ({bits - 1} - v)) & 1) == 0) ++v; }} "
+                        f"carry = a == 0; zero = v == 0; {write('v')} }}")
+        elif op == M.BSWAP and RegisterExt.size(i.op0_register) in (4, 8):
+            size = RegisterExt.size(i.op0_register)
+            width = UINT[size]
+            stmt = (f"{{ const {width} a = {operand(0)}; {width} v = 0; "
+                    f"for (unsigned b = 0; b < {size}u; ++b) {{ v = (v << 8) | ((a >> (b * 8u)) & 0xffu); }} "
+                    f"{write('v')} }}")
+        elif op in (M.BT, M.BTS, M.BTR, M.BTC) and i.op0_kind == K.REGISTER and RegisterExt.size(i.op0_register) in (4, 8):
+            size = RegisterExt.size(i.op0_register)
+            width, bits = UINT[size], 8 * size
+            bit_expr = f"static_cast<unsigned>({operand(1)}) & {bits - 1}u"
+            if op == M.BT:
+                stmt = f"{{ const {width} a = {operand(0)}; carry = ((a >> ({bit_expr})) & 1u) != 0; }}"
+            else:
+                mut = {M.BTS: "a | m", M.BTR: "a & static_cast<" + width + ">(~m)", M.BTC: "a ^ m"}[op]
+                stmt = (f"{{ const {width} a = {operand(0)}; const unsigned b = {bit_expr}; "
+                        f"const {width} m = static_cast<{width}>(1) << b; carry = (a & m) != 0; "
+                        f"const {width} v = static_cast<{width}>({mut}); {write('v')} }}")
+
         elif (op in (M.ROL, M.ROR) and i.op0_kind == K.REGISTER and RegisterExt.size(i.op0_register) in (4, 8)
               and (i.op1_kind == K.IMMEDIATE8 or i.op1_register == R.CL)):
             size = RegisterExt.size(i.op0_register)
@@ -313,11 +427,11 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                 if op == M.ROL:
                     stmt = (f"{{ const {width} a = {operand(0)}; const unsigned c = {count_expr}; "
                             f"{width} v = a; if (c != 0u) {{ v = static_cast<{width}>((a << c) | (a >> ({bits}u - c))); "
-                            f"carry = (v & 1u) != 0; }} {write('v')} }}")
+                            f"carry = (v & 1u) != 0; if (c == 1) overflow = (v >> {bits - 1}) != carry; }} {write('v')} }}")
                 else:  # M.ROR
                     stmt = (f"{{ const {width} a = {operand(0)}; const unsigned c = {count_expr}; "
                             f"{width} v = a; if (c != 0u) {{ v = static_cast<{width}>((a >> c) | (a << ({bits}u - c))); "
-                            f"carry = ((v >> {bits - 1}u) & 1u) != 0; }} {write('v')} }}")
+                            f"carry = ((v >> {bits - 1}u) & 1u) != 0; if (c == 1) overflow = carry != ((v >> {bits - 2}) & 1u); }} {write('v')} }}")
         elif (op in (M.SHLD, M.SHRD) and i.op0_kind == K.REGISTER and RegisterExt.size(i.op0_register) in (4, 8)
               and (i.op2_kind == K.IMMEDIATE8 or i.op2_register == R.CL)):
             size = RegisterExt.size(i.op0_register)
@@ -329,11 +443,11 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                 if op == M.SHLD:
                     stmt = (f"{{ const {width} a = {operand(0)}, b = {operand(1)}; const unsigned c = {count_expr}; "
                             f"{width} v = a; if (c != 0u) {{ v = static_cast<{width}>((a << c) | (b >> ({bits}u - c))); "
-                            f"carry = ((a >> ({bits}u - c)) & 1u) != 0; zero = v == 0; }} {write('v')} }}")
+                            f"carry = ((a >> ({bits}u - c)) & 1u) != 0; zero = v == 0; if (c == 1) overflow = ((a ^ v) >> {bits - 1}) != 0; }} {write('v')} }}")
                 else:  # M.SHRD
                     stmt = (f"{{ const {width} a = {operand(0)}, b = {operand(1)}; const unsigned c = {count_expr}; "
                             f"{width} v = a; if (c != 0u) {{ v = static_cast<{width}>((a >> c) | (b << ({bits}u - c))); "
-                            f"carry = ((a >> (c - 1u)) & 1u) != 0; zero = v == 0; }} {write('v')} }}")
+                            f"carry = ((a >> (c - 1u)) & 1u) != 0; zero = v == 0; if (c == 1) overflow = ((a ^ v) >> {bits - 1}) != 0; }} {write('v')} }}")
 
         elif op in (M.BZHI, M.MULX, M.PDEP, M.PEXT, M.RORX, M.SARX, M.SHLX, M.SHRX) and RegisterExt.size(i.op0_register) in (4, 8):
             size = RegisterExt.size(i.op0_register)
@@ -341,7 +455,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
             if op == M.BZHI:
                 stmt = (f"{{ const {width} a = {operand(1)}; const unsigned n = static_cast<unsigned>({operand(2)} & 0xffu); "
                         f"const {width} v = n >= {bits}u ? a : static_cast<{width}>(a & ((static_cast<{width}>(1) << n) - 1)); "
-                        f"carry = n >= {bits}u; zero = v == 0; {write('v')} }}")
+                        f"carry = n >= {bits}u; overflow = false; zero = v == 0; {write('v')} }}")
             elif op == M.RORX:
                 count = i.immediate(2) & (bits - 1)
                 expr = "a" if count == 0 else f"static_cast<{width}>((a >> {count}) | (a << {bits - count}))"
@@ -372,6 +486,75 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                             f"const uint64_t mid = (p0 >> 32) + static_cast<uint32_t>(p1) + static_cast<uint32_t>(p2); "
                             f"const uint64_t lo = (p0 & 0xffffffffull) | (mid << 32), hi = p3 + (p1 >> 32) + (p2 >> 32) + (mid >> 32); "
                             f"{lo_dst} = lo; {write('hi')} }}")
+        elif op in (M.MUL, M.DIV, M.IDIV):
+            size = MemorySizeExt.size(i.memory_size) if i.op0_kind == K.MEMORY else RegisterExt.size(i.op0_register)
+            if size not in (4, 8):
+                raise ValueError(f"unsupported query operation at {i.ip:#x}: {i}")
+            if op == M.MUL:
+                if size == 4:
+                    stmt = (f"{{ const uint64_t p = static_cast<uint64_t>(static_cast<uint32_t>(rax)) * static_cast<uint32_t>({operand(0)}); "
+                            f"rax = static_cast<uint32_t>(p); rdx = static_cast<uint32_t>(p >> 32); carry = rdx != 0; overflow = carry; }}")
+                else:
+                    stmt = (f"{{ const uint64_t a = rax, b = {operand(0)}; "
+                            f"const uint64_t a0 = static_cast<uint32_t>(a), a1 = a >> 32, b0 = static_cast<uint32_t>(b), b1 = b >> 32; "
+                            f"const uint64_t p0 = a0 * b0, p1 = a0 * b1, p2 = a1 * b0, p3 = a1 * b1; "
+                            f"const uint64_t mid = (p0 >> 32) + static_cast<uint32_t>(p1) + static_cast<uint32_t>(p2); "
+                            f"rax = (p0 & 0xffffffffull) | (mid << 32); rdx = p3 + (p1 >> 32) + (p2 >> 32) + (mid >> 32); carry = rdx != 0; overflow = carry; }}")
+            elif op == M.DIV:
+                if size == 4:
+                    stmt = (f"{{ const uint32_t hi = static_cast<uint32_t>(rdx), den = {operand(0)}; "
+                            f"if (den == 0u || hi >= den) raise_de(den == 0); "
+                            f"const uint64_t num = (static_cast<uint64_t>(hi) << 32) | static_cast<uint32_t>(rax); "
+                            f"rax = static_cast<uint32_t>(num / den); rdx = static_cast<uint32_t>(num % den); }}")
+                else:
+                    stmt = (f"{{ uint64_t hi = rdx, lo = rax, den = {operand(0)}, q = 0; "
+                            f"if (den == 0ull || hi >= den) raise_de(den == 0); "
+                            f"for (int b = 63; b >= 0; --b) {{ const bool top = (hi >> 63) != 0; "
+                            f"hi = (hi << 1) | ((lo >> b) & 1u); if (top || hi >= den) {{ hi -= den; q |= 1ull << b; }} }} "
+                            f"rax = q; rdx = hi; }}")
+            else:  # M.IDIV
+                if size == 4:
+                    stmt = (f"{{ const int64_t num = static_cast<int64_t>((static_cast<uint64_t>(static_cast<uint32_t>(rdx)) << 32) | static_cast<uint32_t>(rax)); "
+                            f"const int32_t den = static_cast<int32_t>({operand(0)}); "
+                            f"if (den == 0 || (num == (-9223372036854775807ll - 1) && den == -1)) raise_de(den == 0); "
+                            f"const int64_t q = num / den, r = num % den; "
+                            f"if (q < -2147483648ll || q > 2147483647ll) raise_de(false); "
+                            f"rax = static_cast<uint32_t>(static_cast<int32_t>(q)); rdx = static_cast<uint32_t>(static_cast<int32_t>(r)); }}")
+                else:
+                    stmt = (f"{{ uint64_t hi = rdx, lo = rax, d = {operand(0)}; "
+                            f"if (d == 0ull) raise_de(true); "
+                            f"const bool neg_n = (hi >> 63) != 0, neg_d = (d >> 63) != 0; "
+                            f"if (neg_n) {{ lo = 0ull - lo; hi = ~hi + (lo == 0ull ? 1ull : 0ull); }} "
+                            f"if (neg_d) {{ d = 0ull - d; }} "
+                            f"if (hi >= d) raise_de(false); "
+                            f"uint64_t q = 0; "
+                            f"for (int b = 63; b >= 0; --b) {{ const bool top = (hi >> 63) != 0; "
+                            f"hi = (hi << 1) | ((lo >> b) & 1u); if (top || hi >= d) {{ hi -= d; q |= 1ull << b; }} }} "
+                            f"const bool neg_q = neg_n != neg_d; "
+                            f"if ((!neg_q && q > 0x7fffffffffffffffull) || (neg_q && q > 0x8000000000000000ull)) raise_de(false); "
+                            f"rax = neg_q ? (0ull - q) : q; rdx = neg_n ? (0ull - hi) : hi; }}")
+        elif op in (M.XADD, M.CMPXCHG):
+            size = MemorySizeExt.size(i.memory_size) if i.op0_kind == K.MEMORY else RegisterExt.size(i.op0_register)
+            if size not in (4, 8):
+                raise ValueError(f"unsupported query operation at {i.ip:#x}: {i}")
+            width = UINT[size]
+            if op == M.XADD:
+                src_dst = reg(i.op1_register)
+                if i.op0_kind == K.MEMORY:
+                    stmt = (f"{{ const word addr = {address()}; const {width} a = load<{width}>(addr), b = {operand(1)}, "
+                            f"v = static_cast<{width}>(a + b); carry = v < a; zero = v == 0; overflow = ((~(a ^ b) & (a ^ v)) >> {8 * size - 1}) != 0; "
+                            f"{src_dst} = a; store<{width}>(addr, v); }}")
+                else:
+                    stmt = (f"{{ const {width} a = {operand(0)}, b = {operand(1)}, v = static_cast<{width}>(a + b); "
+                            f"carry = v < a; zero = v == 0; overflow = ((~(a ^ b) & (a ^ v)) >> {8 * size - 1}) != 0; {src_dst} = a; {write('v')} }}")
+            else:  # M.CMPXCHG
+                if i.op0_kind == K.MEMORY:
+                    stmt = (f"{{ const word addr = {address()}; const {width} acc = static_cast<{width}>(rax), "
+                            f"d = load<{width}>(addr), s = {operand(1)}; zero = acc == d; carry = acc < d; overflow = (((acc ^ d) & (acc ^ (acc - d))) >> {8 * size - 1}) != 0; "
+                            f"if (zero) {{ store<{width}>(addr, s); }} else {{ rax = d; }} }}")
+                else:
+                    stmt = (f"{{ const {width} acc = static_cast<{width}>(rax), d = {operand(0)}, s = {operand(1)}; "
+                            f"zero = acc == d; carry = acc < d; overflow = (((acc ^ d) & (acc ^ (acc - d))) >> {8 * size - 1}) != 0; if (zero) {{ {write('s')} }} else {{ rax = d; }} }}")
         elif op in (M.VMOVQ, M.VMOVSD, M.VMOVHPD) and has_wide:
             lanes = {R.XMM0: "wide0", R.XMM1: "wide1", R.XMM2: "wide2"}
             if i.op1_kind == K.MEMORY and op != M.VMOVHPD:
@@ -392,6 +575,135 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
             stmt = (f"{{ auto input = {src}; {dst} = {{}}; for (size_t n=0; n<16; n+=4) {{ "
                     f"auto v = load<uint32_t>(reinterpret_cast<word>(input.data()+n)) {operation}; "
                     f"memcpy({dst}.data()+n, &v, 4); }} }}")
+        elif op == M.MOVDQU and i.encoding == EncodingKind.LEGACY and has_wide:
+            if i.op0_kind == K.REGISTER and i.op0_register in wide_xmm and i.op1_kind == K.MEMORY:
+                stmt = f"memcpy({wide_xmm[i.op0_register]}.data(), reinterpret_cast<const void*>({address()}), 16);"
+            elif i.op0_kind == K.MEMORY and i.op1_kind == K.REGISTER and i.op1_register in wide_xmm:
+                stmt = f"memcpy(reinterpret_cast<void*>({address()}), {wide_xmm[i.op1_register]}.data(), 16);"
+            elif (i.op0_kind == K.REGISTER and i.op0_register in wide_xmm
+                  and i.op1_kind == K.REGISTER and i.op1_register in wide_xmm):
+                stmt = f"memcpy({wide_xmm[i.op0_register]}.data(), {wide_xmm[i.op1_register]}.data(), 16);"
+            else:
+                raise ValueError(f"unsupported MOVDQU form at {i.ip:#x}: {i}")
+        elif op in sha_ops and i.encoding == EncodingKind.LEGACY and i.op0_kind == K.REGISTER and i.op0_register in wide_xmm and has_wide:
+            dst = wide_xmm[i.op0_register]
+            if i.op1_kind == K.REGISTER and i.op1_register in wide_xmm:
+                src_init = f"uint32_t s[4]; memcpy(s, {wide_xmm[i.op1_register]}.data(), 16);"
+            elif i.op1_kind == K.MEMORY:
+                src_init = f"uint32_t s[4]; memcpy(s, reinterpret_cast<const void*>({address()}), 16);"
+            else:
+                raise ValueError(f"unsupported SHA source at {i.ip:#x}: {i}")
+            if op == M.SHA1MSG1:
+                stmt = (f"{{ uint32_t d[4]; memcpy(d, {dst}.data(), 16); {src_init} "
+                        f"const uint32_t r[4] = {{d[0] ^ s[2], d[1] ^ s[3], d[2] ^ d[0], d[3] ^ d[1]}}; "
+                        f"memcpy({dst}.data(), r, 16); }}")
+            elif op == M.SHA1MSG2:
+                stmt = (f"{{ uint32_t d[4]; memcpy(d, {dst}.data(), 16); {src_init} "
+                        f"const uint32_t w16 = sha_rol32(d[3] ^ s[2], 1), w17 = sha_rol32(d[2] ^ s[1], 1), "
+                        f"w18 = sha_rol32(d[1] ^ s[0], 1), w19 = sha_rol32(d[0] ^ w16, 1); "
+                        f"const uint32_t r[4] = {{w19, w18, w17, w16}}; memcpy({dst}.data(), r, 16); }}")
+            elif op == M.SHA1NEXTE:
+                stmt = (f"{{ uint32_t d[4]; memcpy(d, {dst}.data(), 16); {src_init} "
+                        f"const uint32_t r[4] = {{s[0], s[1], s[2], s[3] + sha_rol32(d[3], 30)}}; "
+                        f"memcpy({dst}.data(), r, 16); }}")
+            elif op == M.SHA1RNDS4:
+                func = i.immediate(2) & 3
+                stmt = f"{{ uint32_t d[4]; memcpy(d, {dst}.data(), 16); {src_init} sha1_rnds4(d, s, {func}u); memcpy({dst}.data(), d, 16); }}"
+            elif op == M.SHA256MSG1:
+                stmt = (f"{{ uint32_t d[4]; memcpy(d, {dst}.data(), 16); {src_init} "
+                        f"auto sig0 = [](uint32_t x) {{ return sha_ror32(x, 7) ^ sha_ror32(x, 18) ^ (x >> 3); }}; "
+                        f"const uint32_t r[4] = {{d[0] + sig0(d[1]), d[1] + sig0(d[2]), d[2] + sig0(d[3]), d[3] + sig0(s[0])}}; "
+                        f"memcpy({dst}.data(), r, 16); }}")
+            elif op == M.SHA256MSG2:
+                stmt = (f"{{ uint32_t d[4]; memcpy(d, {dst}.data(), 16); {src_init} "
+                        f"auto sig1 = [](uint32_t x) {{ return sha_ror32(x, 17) ^ sha_ror32(x, 19) ^ (x >> 10); }}; "
+                        f"const uint32_t w16 = d[0] + sig1(s[2]), w17 = d[1] + sig1(s[3]), "
+                        f"w18 = d[2] + sig1(w16), w19 = d[3] + sig1(w17); "
+                        f"const uint32_t r[4] = {{w16, w17, w18, w19}}; memcpy({dst}.data(), r, 16); }}")
+            else:  # M.SHA256RNDS2
+                stmt = (f"{{ uint32_t d[4], wk[4]; memcpy(d, {dst}.data(), 16); {src_init} "
+                        f"memcpy(wk, wide0.data(), 16); sha256_rnds2(d, s, wk); memcpy({dst}.data(), d, 16); }}")
+        elif op in avx2_wide_ops and any(i.op_kind(n) == K.REGISTER and i.op_register(n) not in wide_any
+                                          for n in range(i.op_count)):
+            raise ValueError(f"unsupported query operation at {i.ip:#x}: {i}")
+        elif has_wide and i.encoding == EncodingKind.VEX and op in (M.VPBROADCASTB, M.VPBROADCASTW, M.VPBROADCASTD, M.VPBROADCASTQ):
+            elem_size = {M.VPBROADCASTB: 1, M.VPBROADCASTW: 2, M.VPBROADCASTD: 4, M.VPBROADCASTQ: 8}[op]
+            vec_size = RegisterExt.size(i.op0_register)
+            w = UINT[elem_size]
+            dst = wide_any[i.op0_register]
+            src_expr = (f"load<{w}>({address()})" if i.op1_kind == K.MEMORY
+                        else f"load<{w}>(reinterpret_cast<word>({wide_any[i.op1_register]}.data()))")
+            stmt = (f"{{ const {w} elem = {src_expr}; {dst} = {{}}; "
+                    f"for (size_t n = 0; n < {vec_size}; n += {elem_size}) memcpy({dst}.data() + n, &elem, {elem_size}); }}")
+        elif has_wide and i.encoding == EncodingKind.VEX and op in (M.VPSLLVD, M.VPSRLVD, M.VPSRAVD, M.VPSLLVQ, M.VPSRLVQ):
+            elem_size = 8 if op in (M.VPSLLVQ, M.VPSRLVQ) else 4
+            bits, w = 8 * elem_size, UINT[elem_size]
+            vec_size = RegisterExt.size(i.op0_register)
+            dst, src1 = wide_any[i.op0_register], wide_any[i.op1_register]
+            if i.op2_kind == K.MEMORY:
+                cnt_init = f"const word caddr = {address()};"
+                cnt_expr = f"load<{w}>(caddr + n)"
+            else:
+                cnt_init = f"const auto in2 = {wide_any[i.op2_register]};"
+                cnt_expr = f"load<{w}>(reinterpret_cast<word>(in2.data() + n))"
+            if op in (M.VPSLLVD, M.VPSLLVQ):
+                op_expr = f"c >= {bits}u ? static_cast<{w}>(0) : static_cast<{w}>(a << c)"
+            elif op in (M.VPSRLVD, M.VPSRLVQ):
+                op_expr = f"c >= {bits}u ? static_cast<{w}>(0) : static_cast<{w}>(a >> c)"
+            else:
+                op_expr = "static_cast<uint32_t>(static_cast<int32_t>(a) >> (c >= 32u ? 31u : c))"
+            stmt = (f"{{ const auto in1 = {src1}; {cnt_init} {dst} = {{}}; "
+                    f"for (size_t n = 0; n < {vec_size}; n += {elem_size}) {{ "
+                    f"const {w} a = load<{w}>(reinterpret_cast<word>(in1.data() + n)), c = {cnt_expr}; "
+                    f"const {w} v = {op_expr}; memcpy({dst}.data() + n, &v, {elem_size}); }} }}")
+        elif has_wide and i.encoding == EncodingKind.LEGACY and i.op0_register in wide_xmm and op in (
+                M.PMINSB, M.PMAXSB, M.PMINUW, M.PMAXUW, M.PMINSD, M.PMAXSD, M.PMINUD, M.PMAXUD,
+                M.PMULLD, M.PMULDQ, M.PCMPEQQ, M.PACKUSDW, M.PBLENDW, M.PBLENDVB):
+            if i.op1_kind != K.MEMORY and (i.op1_kind != K.REGISTER or i.op1_register not in wide_xmm):
+                raise ValueError(f"unsupported query operation at {i.ip:#x}: {i}")
+            dst = wide_xmm[i.op0_register]
+            s2_init = (f"const auto in2 = load<std::array<uint8_t,16>>({address()});" if i.op1_kind == K.MEMORY
+                       else f"const auto in2 = load<std::array<uint8_t,16>>(reinterpret_cast<word>({wide_xmm[i.op1_register]}.data()));")
+            minmax = {
+                M.PMINSB: ("int8_t", 1, "<"), M.PMAXSB: ("int8_t", 1, ">"),
+                M.PMINUW: ("uint16_t", 2, "<"), M.PMAXUW: ("uint16_t", 2, ">"),
+                M.PMINSD: ("int32_t", 4, "<"), M.PMAXSD: ("int32_t", 4, ">"),
+                M.PMINUD: ("uint32_t", 4, "<"), M.PMAXUD: ("uint32_t", 4, ">"),
+            }
+            if op in minmax:
+                ct, sz, cmp_op = minmax[op]
+                stmt = (f"{{ const auto in1 = {dst}; {s2_init} for (size_t n = 0; n < 16; n += {sz}) {{ "
+                        f"const {ct} a = load<{ct}>(reinterpret_cast<word>(in1.data() + n)), "
+                        f"b = load<{ct}>(reinterpret_cast<word>(in2.data() + n)); "
+                        f"const {ct} v = (a {cmp_op} b) ? a : b; memcpy({dst}.data() + n, &v, {sz}); }} }}")
+            elif op == M.PMULLD:
+                stmt = (f"{{ const auto in1 = {dst}; {s2_init} for (size_t n = 0; n < 16; n += 4) {{ "
+                        f"const uint32_t v = load<uint32_t>(reinterpret_cast<word>(in1.data() + n)) * "
+                        f"load<uint32_t>(reinterpret_cast<word>(in2.data() + n)); memcpy({dst}.data() + n, &v, 4); }} }}")
+            elif op == M.PMULDQ:
+                stmt = (f"{{ const auto in1 = {dst}; {s2_init} for (size_t n = 0; n < 16; n += 8) {{ "
+                        f"const int64_t v = static_cast<int64_t>(load<int32_t>(reinterpret_cast<word>(in1.data() + n))) * "
+                        f"static_cast<int64_t>(load<int32_t>(reinterpret_cast<word>(in2.data() + n))); "
+                        f"memcpy({dst}.data() + n, &v, 8); }} }}")
+            elif op == M.PCMPEQQ:
+                stmt = (f"{{ const auto in1 = {dst}; {s2_init} for (size_t n = 0; n < 16; n += 8) {{ "
+                        f"const uint64_t v = load<uint64_t>(reinterpret_cast<word>(in1.data() + n)) == "
+                        f"load<uint64_t>(reinterpret_cast<word>(in2.data() + n)) ? ~0ull : 0ull; "
+                        f"memcpy({dst}.data() + n, &v, 8); }} }}")
+            elif op == M.PACKUSDW:
+                stmt = (f"{{ const auto in1 = {dst}; {s2_init} for (size_t k = 0; k < 8; ++k) {{ "
+                        f"const uint8_t* src = k < 4 ? in1.data() : in2.data(); "
+                        f"const int32_t s = load<int32_t>(reinterpret_cast<word>(src + (k % 4) * 4)); "
+                        f"const uint16_t v = s < 0 ? 0u : (s > 65535 ? 65535u : static_cast<uint16_t>(s)); "
+                        f"memcpy({dst}.data() + k * 2, &v, 2); }} }}")
+            elif op == M.PBLENDW:
+                imm = i.immediate(2)
+                stmt = (f"{{ const auto in1 = {dst}; {s2_init} for (size_t k = 0; k < 8; ++k) {{ "
+                        f"const uint8_t* src = (({imm}u >> k) & 1u) ? in2.data() : in1.data(); "
+                        f"memcpy({dst}.data() + k * 2, src + k * 2, 2); }} }}")
+            else:  # M.PBLENDVB (implicit XMM0 mask)
+                stmt = (f"{{ const auto in1 = {dst}, m = wide0; {s2_init} for (size_t n = 0; n < 16; ++n) {{ "
+                        f"{dst}[n] = (m[n] & 0x80u) ? in2[n] : in1[n]; }} }}")
         elif op == M.VMOVUPS and i.op1_kind == K.MEMORY:
             stmt = f"{wide[i.op0_register]} = load<std::array<uint8_t,32>>({address()});"
         elif op == M.VMOVUPS and i.op0_kind == K.MEMORY:
@@ -429,8 +741,12 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                                             f"static_cast<{host}>({operand(n)}))")
         elif op == M.NOP or (op == M.XCHG and i.op0_register == i.op1_register == R.AX):
             stmt = ";"
-        elif op == M.SETE:
-            stmt = write("zero")
+        elif op in (M.SETE, M.SETNE, M.SETA, M.SETAE, M.SETB, M.SETBE):
+            cond = {M.SETE: "zero", M.SETNE: "!zero", M.SETA: "!carry && !zero",
+                    M.SETAE: "!carry", M.SETB: "carry", M.SETBE: "carry || zero"}[op]
+            stmt = write(f"({cond})")
+        elif op == M.SETO:
+            stmt = write("overflow")
         elif op == M.CALL:
             stmt = calls[i.ip]
         elif op == M.XLATB:
@@ -441,9 +757,9 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                 table = f"static_cast<uint32_t>({table})"
             stmt = f"rax = (rax & ~0xffull) | load<uint8_t>({table});"
         elif op == M.RET:
-            stmt = "return rax;"
+            stmt = "return rax;" if checked is None or x87_depth is None else x87_lower.return_statement(checked)
         elif x87_depth is not None and op in x87_lower.X87_OPS:
-            stmt = x87_lower.statement(i, x87_depth[i.ip], address)
+            stmt = x87_lower.statement(i, x87_depth[i.ip], address, checked)
         else:
             raise ValueError(f"unsupported query operation at {i.ip:#x}: {i}")
         lines.append(f"block_{i.ip:x}: {stmt}")
@@ -453,7 +769,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                 raise ValueError(f"unbound fallthrough at {i.ip:#x}")
             lines.append(f"goto block_{i.next_ip:x};")
     if x87_depth is not None:
-        lines.insert(3, x87_lower.DECLARATION)
+        lines.insert(3, x87_lower.DECLARATION if checked is None else x87_lower.CHECKED_DECLARATION)
     lines.extend(f"block_{target:x}: {statement}" for target, statement in exits.items())
     return "\n".join("    " + line for line in lines)
 
