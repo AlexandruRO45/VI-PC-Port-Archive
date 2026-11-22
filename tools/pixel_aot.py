@@ -107,7 +107,8 @@ def _check_two_exits(code, llvm):
                                  "s_add", "s_sub", "s_mul", "s_min_", "s_max_", "s_cselect", "s_bfe",
                                  "s_bfm", "s_brev", "s_ff", "s_bcnt", "s_wqm", "s_quadmask"))
                   or op in ("s_nop", "s_inst_prefetch", "s_waitcnt", "s_clause", "s_delay_alu",
-                            "s_setprio", "s_sleep", "s_movk_i32", "s_mulk_i32", "s_flbit_i32_b32",
+                            "s_setprio", "s_sleep", "s_movk_i32", "s_cmovk_i32", "s_mulk_i32",
+                            "s_flbit_i32_b32", "s_abs_i32", "s_cmov_b32", "s_bitset0_b32", "s_bitset1_b32",
                             "s_setreg_imm32_b32")):
             raise ValueError(f"Unverified multi-exit control flow: {op}")
         pending.append(following[pc])
@@ -392,6 +393,16 @@ INTEGER = {
     "not_b32": (1, "~{0}"), "bfi_b32": (3, "({0} & {1}) | (~{0} & {2})"),
     "lshlrev_b32": (2, "{1} << ({0} & 31u)"), "lshrrev_b32": (2, "{1} >> ({0} & 31u)"),
     "ashrrev_i32": (2, "asuint(asint({1}) >> ({0} & 31u))"),
+    "mul_u32_u24": (2, "mul24_u32({0}, {1})"),
+    "mul_i32_i24": (2, "mul24_i32({0}, {1})"),
+    "mul_hi_u32_u24": (2, "mul24_hi_u32({0}, {1})"),
+    "mul_hi_i32_i24": (2, "mul24_hi_i32({0}, {1})"),
+}
+MUL24_HELPERS = {
+    "mul_u32_u24": ("mul24_u32",),
+    "mul_i32_i24": ("mul24_i32",),
+    "mul_hi_u32_u24": ("mul24_hi_u32",),
+    "mul_hi_i32_i24": ("mul24_hi_u32", "mul24_hi_i32"),
 }
 LANE_MASK = r"(vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
 SALU_BIT64 = {
@@ -616,6 +627,46 @@ SALU_HELPERS = {
         "    return sat ? dot_u64_sat(s) : s.x;\n"
         "}"
     ),
+    "mul24_u32": (
+        "uint mul24_u32(uint a, uint b) {\n"
+        "    return (a & 0xffffffu) * (b & 0xffffffu);\n"
+        "}"
+    ),
+    "mul24_i32": (
+        "uint mul24_i32(uint a, uint b) {\n"
+        "    int sa = asint(a << 8u) >> 8;\n"
+        "    int sb = asint(b << 8u) >> 8;\n"
+        "    return asuint(sa) * asuint(sb);\n"
+        "}"
+    ),
+    "mul24_hi_u32": (
+        "uint mul24_hi_u32(uint a, uint b) {\n"
+        "    uint ua = a & 0xffffffu;\n"
+        "    uint ub = b & 0xffffffu;\n"
+        "    uint al = ua & 0xfffu;\n"
+        "    uint ah = ua >> 12u;\n"
+        "    uint bl = ub & 0xfffu;\n"
+        "    uint bh = ub >> 12u;\n"
+        "    uint p0 = al * bl;\n"
+        "    uint p1 = al * bh + ah * bl;\n"
+        "    uint p2 = ah * bh;\n"
+        "    uint mid = (p0 >> 12u) + p1;\n"
+        "    return (p2 + (mid >> 12u)) >> 8u;\n"
+        "}"
+    ),
+    "mul24_hi_i32": (
+        "uint mul24_hi_i32(uint a, uint b) {\n"
+        "    int sa = asint(a << 8u) >> 8;\n"
+        "    int sb = asint(b << 8u) >> 8;\n"
+        "    bool neg = (sa < 0) != (sb < 0);\n"
+        "    uint ua = (uint)(sa < 0 ? -sa : sa);\n"
+        "    uint ub = (uint)(sb < 0 ? -sb : sb);\n"
+        "    uint lo = ua * ub;\n"
+        "    uint hi = mul24_hi_u32(ua, ub);\n"
+        "    if (neg && (lo != 0u || hi != 0u)) return ~hi + (lo == 0u ? 1u : 0u);\n"
+        "    return hi;\n"
+        "}"
+    ),
 }
 DPP_INT32 = {
     "not_b32": (1, "(~{0})", None),
@@ -709,6 +760,19 @@ def scalar_u32(token, scalar, pending):
     raise ValueError(f"Unsupported 32-bit scalar operand {token}")
 
 
+def sopk_imm16(token, *, signed=True):
+    """Parse a 16-bit SOPK immediate as a sign-extended or zero-extended 32-bit word."""
+    word = int(token, 16) if token.startswith("0x") else int(token)
+    if signed:
+        if not -0x8000 <= word <= 0xffff:
+            raise ValueError("Invalid sopk immediate")
+        value = word - 0x10000 if word >= 0 and word & 0x8000 else word
+        return value & 0xffffffff
+    if not 0 <= word <= 0xffff:
+        raise ValueError("Invalid sopk immediate")
+    return word
+
+
 def scalar_u64(token, scalar, pending, *, signed=False):
     if token.startswith("s["):
         lo, hi = sgpr_pair(token)
@@ -744,6 +808,7 @@ SCALAR = {
     "pack_hh_b32_b16": (2, "({0} >> 16) | ({1} & 0xffff0000u)", None),
     "sext_i32_i8": (1, "asuint(asint({0} << 24) >> 24)", None),
     "sext_i32_i16": (1, "asuint(asint({0} << 16) >> 16)", None),
+    "abs_i32": (1, "(asint({0}) < 0 ? (0u - {0}) : {0})", NONZERO),
     "add_u32": (2, "{0} + {1}", "{r} < {0}"), "sub_u32": (2, "{0} - {1}", "{0} < {1}"),
     "add_i32": (2, "{0} + {1}", "(~({0} ^ {1}) & ({0} ^ {r})) >> 31 != 0u"),
     "sub_i32": (2, "{0} - {1}", "(({0} ^ {1}) & ({0} ^ {r})) >> 31 != 0u"),
@@ -1461,6 +1526,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         elif m := match(rf"s_({'|'.join(SCALAR)}) (s\d+), (.+)"):
             # Uniform values become HLSL uint locals; an exec mask does not affect them.
             op, dst, operands = m.groups()
+            sgpr_name(dst)
             arity, template, carry = SCALAR[op]
             tokens = operands.split(", ")
             if dst in pending:
@@ -1481,14 +1547,42 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             values = [scalar_u32(t, scalar, pending) for t in tokens]
             lines.append(f"    uint salu{i} = {scc} ? {values[0]} : {values[1]};")
             scalar[dst] = ("uint", f"salu{i}")
+        elif m := match(r"(s_cmpk_(?:eq|lg|gt|ge|lt|le)_(?:i32|u32)) (s\d+), (-?\d+|0x[0-9a-f]+)"):
+            op, dst, imm = m.groups()
+            operand = scalar_u32(dst, scalar, pending)
+            signed = op.endswith("_i32")
+            op_sym = {"eq": "==", "lg": "!=", "gt": ">", "ge": ">=", "lt": "<", "le": "<="}[op.split("_")[2]]
+            val = sopk_imm16(imm, signed=signed)
+            cond = f"(asint({operand}) {op_sym} asint({val}u))" if signed else f"({operand} {op_sym} {val}u)"
+            lines.append(f"    bool scc{i} = {cond};")
+            scc = f"scc{i}"
+        elif m := match(r"s_cmovk_i32 (s\d+), (-?\d+|0x[0-9a-f]+)"):
+            dst, imm = m.groups()
+            if scc is None:
+                raise ValueError("Select condition is not a tracked scalar result")
+            prev = scalar_u32(dst, scalar, pending)
+            val = sopk_imm16(imm, signed=True)
+            scalar[dst] = ("uint", f"salu{i}")
+            lines.append(f"    uint salu{i} = {scc} ? {val}u : {prev};")
+        elif m := match(r"s_cmov_b32 (s\d+), ([^,]+)"):
+            dst, src = m.groups()
+            if scc is None:
+                raise ValueError("Select condition is not a tracked scalar result")
+            prev = scalar_u32(dst, scalar, pending)
+            val = scalar_u32(src, scalar, pending)
+            lines.append(f"    uint salu{i} = {scc} ? {val} : {prev};")
+            scalar[dst] = ("uint", f"salu{i}")
+        elif m := match(r"(s_bitset[01]_b32) (s\d+), ([^,]+)"):
+            op, dst, src = m.groups()
+            prev = scalar_u32(dst, scalar, pending)
+            bit = scalar_u32(src, scalar, pending)
+            expr = f"({prev} & ~(1u << ({bit} & 31u)))" if op == "s_bitset0_b32" else f"({prev} | (1u << ({bit} & 31u)))"
+            lines.append(f"    uint salu{i} = {expr};")
+            scalar[dst] = ("uint", f"salu{i}")
         elif m := match(r"(s_addk_i32|s_mulk_i32) (s\d+), (-?\d+|0x[0-9a-f]+)"):
             op, dst, imm = m.groups()
             operand = scalar_u32(dst, scalar, pending)
-            word = int(imm, 16) if imm.startswith("0x") else int(imm)
-            if not -0x8000 <= word <= 0xffff:
-                raise ValueError("Invalid sopk immediate")
-            signed = word - 0x10000 if word >= 0 and word & 0x8000 else word
-            addend = signed & 0xffffffff
+            addend = sopk_imm16(imm, signed=True)
             operation = "+" if op == "s_addk_i32" else "*"
             scalar[dst] = ("uint", f"alu{i}")
             lines.append(f"    uint alu{i} = ({operand} {operation} {addend}u);")
@@ -1700,9 +1794,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             op, dst, sources = m.groups()
             tokens = sources.split(", ")
             arity, template = INTEGER[op]
-            if mask != "entry" or dst in sample_dest or len(tokens) != arity:
+            if mask != "entry" or int(dst[1:]) > 255 or dst in sample_dest or len(tokens) != arity:
                 raise ValueError("Invalid integer operation")
             args = [int_operand(t, scalar, vector, pending, sample_dest, signed=False) for t in tokens]
+            if op in MUL24_HELPERS:
+                helpers.update(MUL24_HELPERS[op])
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({template.format(*args)});")
         elif m := match(rf"v_cmp_class_f32(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
@@ -1721,20 +1817,18 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             lines.append(f"    bool cmp{i} = (class32({operand}) & {bits}) != 0u;")
 
-        elif m := match(r"v_(add|sub|subrev)_nc_u32(?:_e32)? (v\d+), ([^,]+), ([^,]+)"):
+        elif m := (match(r"v_(add|sub|subrev)_nc_u32(?:_e32|_e64)? (v\d+), ([^,\s]+), ([^,\s]+)")
+                   or match(r"v_(add|sub)_nc_i32 (v\d+), ([^,\s]+), ([^,\s]+)")):
+            # 32-bit wraparound without carry. v_add_nc_i32 and v_sub_nc_i32 are VOP3-only and the same
+            # bits without clamp. A trailing clamp or an operand modifier is left to the fall-through.
             op, dst, src0, src1 = m.groups()
             if mask != "entry" or dst in sample_dest:
                 raise ValueError("Invalid integer operation")
             a = int_operand(src0, scalar, vector, pending, sample_dest, signed=False)
             b = int_operand(src1, scalar, vector, pending, sample_dest, signed=False)
-            if op == "add":
-                expr = f"{a} + {b}"
-            elif op == "sub":
-                expr = f"{a} - {b}"
-            else:
-                expr = f"{b} - {a}"
+            expression = {"add": f"{a} + {b}", "sub": f"{a} - {b}", "subrev": f"{b} - {a}"}[op]
             vector[dst] = f"alu{i}"
-            lines.append(f"    precise float alu{i} = asfloat({expr});")
+            lines.append(f"    precise float alu{i} = asfloat({expression});")
         elif m := match(r"v_(min|max)_(i32|u32)(?:_e32|_e64)? (v\d+), ([^,]+), ([^,]+)"):
             op, kind, dst, *tokens = m.groups()
             if mask != "entry":

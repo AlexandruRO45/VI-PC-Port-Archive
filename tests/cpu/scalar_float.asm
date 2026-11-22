@@ -207,4 +207,40 @@ ENDIF
     ret
 zero_xorpd ENDP
 
+; unsigned probe_ss(void* out, float a, float b)
+; Compare a and b (b and a in the control): equal=0, unordered=1, above=2, below=3.
+; Inputs: +0 XMM seed, +8 signed dword in a qword, +16 float.
+; Output qwords: +24 after copy, +32 after add, +40 after conversion, +48 after load.
+probe_ss PROC FRAME
+    .endprolog
+    movq xmm3, QWORD PTR [rcx]
+    movaps xmm4, xmm3
+    movq QWORD PTR [rcx+24], xmm4
+    addss xmm4, DWORD PTR [rcx+16]
+    movq QWORD PTR [rcx+32], xmm4
+    cvtsi2ss xmm4, DWORD PTR [rcx+8]
+    movq QWORD PTR [rcx+40], xmm4
+    movss xmm4, DWORD PTR [rcx+16]
+    movq QWORD PTR [rcx+48], xmm4
+    xor eax, eax
+IFDEF SWAP_OPERANDS
+    comiss xmm2, xmm1
+ELSE
+    comiss xmm1, xmm2
+ENDIF
+    jp short probe_unordered
+    ja short probe_above
+    jb short probe_below
+    ret
+probe_unordered:
+    or eax, 1
+    ret
+probe_above:
+    or eax, 2
+    ret
+probe_below:
+    or eax, 3
+    ret
+probe_ss ENDP
+
 END
