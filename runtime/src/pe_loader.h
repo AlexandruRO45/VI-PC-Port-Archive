@@ -32,6 +32,7 @@ struct Module {
     uint64_t preferred_base = 0;
     uint32_t size = 0;
     uint32_t entry_rva = 0;
+    bool is_dll = false;
     bool relocated = false;
     bool initialised = false;
 

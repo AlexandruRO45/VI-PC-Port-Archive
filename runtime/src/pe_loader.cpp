@@ -584,8 +584,7 @@ Loader::~Loader() {
             // error; report it and still let DllMain release resources before the image is freed.
             std::fprintf(stderr, "[rt] TLS process detach failed for %s: %s\n", m.name.c_str(), e.what());
         }
-        auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
-        if ((nt->FileHeader.Characteristics & IMAGE_FILE_DLL) && m.entry_rva) {
+        if (m.is_dll && m.entry_rva) {
             auto entry = reinterpret_cast<BOOL(NTAPI*)(void*, DWORD, void*)>(m.base + m.entry_rva);
             entry(m.base, DLL_PROCESS_DETACH, nullptr);  // explicit unload; the return value is ignored
         }
@@ -780,8 +779,7 @@ void Loader::initialise(Module& m) {
     run_tls_callbacks(m, DLL_PROCESS_ATTACH);
 
     // Only a DLL gets DllMain. An EXE's entry point has a different signature and is the caller's to run.
-    auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
-    if ((nt->FileHeader.Characteristics & IMAGE_FILE_DLL) && m.entry_rva) {
+    if (m.is_dll && m.entry_rva) {
         auto entry = reinterpret_cast<BOOL(NTAPI*)(void*, DWORD, void*)>(m.base + m.entry_rva);
         const BOOL ok = entry(m.base, DLL_PROCESS_ATTACH, nullptr);
         if (startup_trace::enabled())
@@ -835,6 +833,7 @@ Module& Loader::map_image(const std::filesystem::path& path) {
     m->preferred_base = oh.ImageBase;
     m->size = oh.SizeOfImage;
     m->entry_rva = oh.AddressOfEntryPoint;
+    m->is_dll = (nt->FileHeader.Characteristics & IMAGE_FILE_DLL) != 0;
     by_name_[lower(m->name)] = m;
     order_.push_back(m);
 

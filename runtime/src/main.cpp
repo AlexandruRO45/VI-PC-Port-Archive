@@ -105,6 +105,10 @@ int wmain(int argc, wchar_t** argv) {
     try {
         rt::Loader loader(game_dir);
         rt::Module& main_module = loader.load(image);  // maps, binds and installs TLS; runs no image code
+        if (run && main_module.is_dll) {
+            std::fprintf(stderr, "error: --run requires an executable image; use --init for a DLL\n");
+            return 1;
+        }
         if (run) rt::process::set_command_line(image.filename().wstring(), game_args);
         if (init || run) {
             loader.initialise();  // TLS callbacks, then DllMain(DLL_PROCESS_ATTACH) for DLLs

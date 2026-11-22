@@ -467,6 +467,9 @@ if(BUILD_TESTING)
     target_compile_options(tiny_game_exit_code_test PRIVATE /W4 /permissive- /utf-8)
     add_dependencies(tiny_game_exit_code_test gta6rt tiny_game tiny_game_fixed)
     add_test(NAME pe_loader COMMAND pe_loader_test "$<TARGET_FILE:tiny_dll>" "$<TARGET_FILE:tiny_exe>")
+    add_test(NAME gta6rt_rejects_dll_run COMMAND ${CMAKE_COMMAND}
+      "-DLOADER=$<TARGET_FILE:gta6rt>" "-DDLL=$<TARGET_FILE:tiny_dll>"
+      "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_dll_run.cmake")
 
     # Synthetic, hand-built images through Loader::load: range checks, wrapping RVAs, import-table termination and
     # base relocations (HIGHLOW included). No fixture DLL is needed; the images are written to a temporary folder.
