@@ -556,5 +556,202 @@ class TestScalarInterpreter(unittest.TestCase):
         self.assertEqual(self.lds.read_dword(20), 300)
 
 
+# ==============================================================================
+# SIMD Multi-Lane Divergence and 32/64-bit EXEC Masking
+# ==============================================================================
+
+class SIMDWaveState:
+    """Architectural state for a SIMD wavefront (Wave32 or Wave64)."""
+
+    def __init__(
+        self,
+        wave_size: int = 32,
+        exec_mask: Optional[int] = None,
+        lds: Optional[LDSMemory] = None,
+    ) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Wave size must be 32 or 64, got {wave_size}")
+        self.wave_size: int = wave_size
+        default_mask = (1 << wave_size) - 1
+        self.exec_mask: int = default_mask if exec_mask is None else (exec_mask & default_mask)
+        self.lds: LDSMemory = lds if lds is not None else LDSMemory(DEFAULT_LDS_SIZE_BYTES)
+        self.vgprs: List[List[int]] = [[0] * 256 for _ in range(wave_size)]
+
+    def is_lane_active(self, lane: int) -> bool:
+        if not (0 <= lane < self.wave_size):
+            return False
+        return bool((self.exec_mask >> lane) & 1)
+
+    def get_vgpr(self, lane: int, reg: VGPR) -> int:
+        return self.vgprs[lane][reg.index]
+
+    def set_vgpr(self, lane: int, reg: VGPR, val: int) -> None:
+        self.vgprs[lane][reg.index] = u32(val)
+
+
+class SIMDDSInterpreter:
+    """Deterministic SIMD interpreter simulating multi-lane wave execution."""
+
+    def execute(self, state: SIMDWaveState, inst: DSMinRtnI32Instruction) -> Dict[int, Optional[int]]:
+        results: Dict[int, Optional[int]] = {}
+        for lane in range(state.wave_size):
+            if not state.is_lane_active(lane):
+                results[lane] = None
+                continue
+
+            vaddr_val = state.get_vgpr(lane, inst.vaddr)
+            vdata_val = state.get_vgpr(lane, inst.vdata)
+
+            old_val, new_val = state.lds.atomic_min_rtn_i32(
+                byte_addr=vaddr_val,
+                val=vdata_val,
+                offset=inst.offset.value,
+            )
+
+            if inst.opcode.is_return:
+                assert inst.vdst is not None
+                state.set_vgpr(lane, inst.vdst, old_val)
+                results[lane] = old_val
+            else:
+                results[lane] = None
+
+        return results
+
+
+class TestSIMDMultiLaneDivergence(unittest.TestCase):
+    """Unit tests for SIMD execution, 32/64-bit EXEC masking, and divergence."""
+
+    def test_wave32_all_lanes_active_independent_addresses(self) -> None:
+        lds = LDSMemory(DEFAULT_LDS_SIZE_BYTES)
+        state = SIMDWaveState(wave_size=32, exec_mask=0xFFFFFFFF, lds=lds)
+        interp = SIMDDSInterpreter()
+
+        # Each lane has its own unique address: lane * 4
+        for lane in range(32):
+            addr = lane * 4
+            lds.write_dword(lane, 200 + lane)
+            state.set_vgpr(lane, VGPR(1), addr)
+            # Lane adds signed value: 100 - lane (smaller than 200 + lane)
+            state.set_vgpr(lane, VGPR(2), 100 - lane)
+            state.set_vgpr(lane, VGPR(0), 0xCAFE)
+
+        inst = DSMinRtnI32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_I32,
+            vdst=VGPR(0),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        results = interp.execute(state, inst)
+
+        for lane in range(32):
+            self.assertEqual(results[lane], 200 + lane)
+            self.assertEqual(state.get_vgpr(lane, VGPR(0)), 200 + lane)
+            self.assertEqual(lds.read_dword(lane), 100 - lane)
+
+    def test_wave64_divergent_exec_mask(self) -> None:
+        lds = LDSMemory(DEFAULT_LDS_SIZE_BYTES)
+        even_mask = 0x5555555555555555
+        state = SIMDWaveState(wave_size=64, exec_mask=even_mask, lds=lds)
+        interp = SIMDDSInterpreter()
+
+        sentinel = 0xBAADF00D
+        for lane in range(64):
+            addr = lane * 4
+            lds.write_dword(lane, 50)
+            state.set_vgpr(lane, VGPR(1), addr)
+            state.set_vgpr(lane, VGPR(2), u32(-10))  # -10 < 50
+            state.set_vgpr(lane, VGPR(0), sentinel)
+
+        inst = DSMinRtnI32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_I32,
+            vdst=VGPR(0),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        results = interp.execute(state, inst)
+
+        for lane in range(64):
+            if lane % 2 == 0:
+                # Active lane
+                self.assertEqual(results[lane], 50)
+                self.assertEqual(state.get_vgpr(lane, VGPR(0)), 50)
+                self.assertEqual(lds.read_dword(lane), u32(-10))
+            else:
+                # Inactive lane: untouched memory and untouched vdst
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.get_vgpr(lane, VGPR(0)), sentinel)
+                self.assertEqual(lds.read_dword(lane), 50)
+
+    def test_multi_lane_address_collision_serialization(self) -> None:
+        lds = LDSMemory(DEFAULT_LDS_SIZE_BYTES)
+        # 4 lanes active (lanes 0..3)
+        state = SIMDWaveState(wave_size=32, exec_mask=0xF, lds=lds)
+        interp = SIMDDSInterpreter()
+
+        collision_addr = 0x40  # dword 16
+        initial_val = 100
+        lds.write_dword(16, initial_val)
+
+        # Lane inputs:
+        # Lane 0: sends 50
+        # Lane 1: sends -10 (0xFFFFFFF6)
+        # Lane 2: sends 20
+        # Lane 3: sends -50 (0xFFFFFFCE)
+        inputs = [50, u32(-10), 20, u32(-50)]
+        for lane in range(4):
+            state.set_vgpr(lane, VGPR(1), collision_addr)
+            state.set_vgpr(lane, VGPR(2), inputs[lane])
+            state.set_vgpr(lane, VGPR(0), 0)
+
+        inst = DSMinRtnI32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_I32,
+            vdst=VGPR(0),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        results = interp.execute(state, inst)
+
+        # Serialization trace:
+        # Lane 0: reads 100, min(100, 50) = 50 -> returns 100
+        self.assertEqual(results[0], 100)
+        self.assertEqual(state.get_vgpr(0, VGPR(0)), 100)
+        # Lane 1: reads 50, min(50, -10) = -10 -> returns 50
+        self.assertEqual(results[1], 50)
+        self.assertEqual(state.get_vgpr(1, VGPR(0)), 50)
+        # Lane 2: reads -10, min(-10, 20) = -10 -> returns -10
+        self.assertEqual(results[2], u32(-10))
+        self.assertEqual(state.get_vgpr(2, VGPR(0)), u32(-10))
+        # Lane 3: reads -10, min(-10, -50) = -50 -> returns -10
+        self.assertEqual(results[3], u32(-10))
+        self.assertEqual(state.get_vgpr(3, VGPR(0)), u32(-10))
+
+        # Final memory must be -50
+        self.assertEqual(lds.read_dword(16), u32(-50))
+
+    def test_zero_exec_mask(self) -> None:
+        lds = LDSMemory(DEFAULT_LDS_SIZE_BYTES)
+        state = SIMDWaveState(wave_size=32, exec_mask=0, lds=lds)
+        interp = SIMDDSInterpreter()
+
+        lds.write_dword(0, 999)
+        for lane in range(32):
+            state.set_vgpr(lane, VGPR(0), 777)
+            state.set_vgpr(lane, VGPR(1), 0)
+            state.set_vgpr(lane, VGPR(2), 10)
+
+        inst = DSMinRtnI32Instruction(
+            opcode=DSOpcode.DS_MIN_RTN_I32,
+            vdst=VGPR(0),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        results = interp.execute(state, inst)
+
+        for lane in range(32):
+            self.assertIsNone(results[lane])
+            self.assertEqual(state.get_vgpr(lane, VGPR(0)), 777)
+        self.assertEqual(lds.read_dword(0), 999)
+
+
 if __name__ == "__main__":
     unittest.main()
