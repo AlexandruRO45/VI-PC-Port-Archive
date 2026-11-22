@@ -1675,5 +1675,360 @@ class TestVDivFixupF64ReferenceOracle(unittest.TestCase):
             rf.get_vgpr_pair(15)
 
 
+# ==============================================================================
+# Mutation Detection Models for v_div_fixup_f64
+# ==============================================================================
+
+def mutant_omit_0_div_0_nan(s0: int, s1: int, s2: int, **kwargs) -> int:
+    """Mutant 1: returns +0.0 instead of AMD Indefinite QNaN on 0.0 / 0.0."""
+    s1_val = apply_src_mods_f64(s1, neg=kwargs.get("src1_neg", False), abs_val=kwargs.get("src1_abs", False))
+    s2_val = apply_src_mods_f64(s2, neg=kwargs.get("src2_neg", False), abs_val=kwargs.get("src2_abs", False))
+    if is_f64_zero(s1_val) and is_f64_zero(s2_val):
+        return F64_POS_ZERO
+    return ref_div_fixup_f64(s0, s1, s2, **kwargs)
+
+
+def mutant_omit_inf_div_inf_nan(s0: int, s1: int, s2: int, **kwargs) -> int:
+    """Mutant 2: returns 1.0 instead of AMD Indefinite QNaN on Inf / Inf."""
+    s1_val = apply_src_mods_f64(s1, neg=kwargs.get("src1_neg", False), abs_val=kwargs.get("src1_abs", False))
+    s2_val = apply_src_mods_f64(s2, neg=kwargs.get("src2_neg", False), abs_val=kwargs.get("src2_abs", False))
+    if is_f64_inf(s1_val) and is_f64_inf(s2_val):
+        return F64_ONE
+    return ref_div_fixup_f64(s0, s1, s2, **kwargs)
+
+
+def mutant_invert_sign(s0: int, s1: int, s2: int, **kwargs) -> int:
+    """Mutant 3: inverts the output sign for non-NaN results."""
+    res = ref_div_fixup_f64(s0, s1, s2, **kwargs)
+    if not is_f64_nan(res):
+        return res ^ F64_SIGN_MASK
+    return res
+
+
+def mutant_omit_s0_nan_recovery(s0: int, s1: int, s2: int, **kwargs) -> int:
+    """Mutant 4: preserves S0 NaN instead of recovering to signed infinity."""
+    s0_val = apply_src_mods_f64(s0, neg=kwargs.get("src0_neg", False), abs_val=kwargs.get("src0_abs", False))
+    s1_val = apply_src_mods_f64(s1, neg=kwargs.get("src1_neg", False), abs_val=kwargs.get("src1_abs", False))
+    s2_val = apply_src_mods_f64(s2, neg=kwargs.get("src2_neg", False), abs_val=kwargs.get("src2_abs", False))
+    if is_f64_nan(s0_val) and not is_f64_nan(s1_val) and not is_f64_nan(s2_val):
+        return quiet_f64(s0_val)
+    return ref_div_fixup_f64(s0, s1, s2, **kwargs)
+
+
+def mutant_omit_underflow_flush(s0: int, s1: int, s2: int, **kwargs) -> int:
+    """Mutant 5: fails to flush to signed zero when exponent difference is < -1075."""
+    s0_val = apply_src_mods_f64(s0, neg=kwargs.get("src0_neg", False), abs_val=kwargs.get("src0_abs", False))
+    s1_val = apply_src_mods_f64(s1, neg=kwargs.get("src1_neg", False), abs_val=kwargs.get("src1_abs", False))
+    s2_val = apply_src_mods_f64(s2, neg=kwargs.get("src2_neg", False), abs_val=kwargs.get("src2_abs", False))
+    sign_out = (s1_val >> 63) ^ (s2_val >> 63)
+    if not is_f64_nan(s2_val) and not is_f64_nan(s1_val):
+        exp_diff = f64_unbiased_exponent(s2_val) - f64_unbiased_exponent(s1_val)
+        if exp_diff < -1075:
+            mag = s0_val & ~F64_SIGN_MASK
+            return (sign_out << 63) | mag
+    return ref_div_fixup_f64(s0, s1, s2, **kwargs)
+
+
+def mutant_omit_snan_quieting(s0: int, s1: int, s2: int, **kwargs) -> int:
+    """Mutant 6: leaves signaling NaN unquieted."""
+    s2_val = apply_src_mods_f64(s2, neg=kwargs.get("src2_neg", False), abs_val=kwargs.get("src2_abs", False))
+    s1_val = apply_src_mods_f64(s1, neg=kwargs.get("src1_neg", False), abs_val=kwargs.get("src1_abs", False))
+    if is_f64_snan(s2_val):
+        return s2_val
+    if is_f64_snan(s1_val):
+        return s1_val
+    return ref_div_fixup_f64(s0, s1, s2, **kwargs)
+
+
+def mutant_clamp_nan_to_nan(s0: int, s1: int, s2: int, clamp: bool = False, **kwargs) -> int:
+    """Mutant 7: leaves NaN untouched instead of clamping to +0.0."""
+    res = ref_div_fixup_f64(s0, s1, s2, clamp=False, **kwargs)
+    if clamp:
+        if is_f64_nan(res):
+            return res  # Bug: failed to map NaN to +0.0
+        return apply_clamp_f64(res)
+    return res
+
+
+def mutant_clamp_negative_to_negative(s0: int, s1: int, s2: int, clamp: bool = False, **kwargs) -> int:
+    """Mutant 8: fails to clamp negative values to +0.0."""
+    res = ref_div_fixup_f64(s0, s1, s2, clamp=False, **kwargs)
+    if clamp:
+        if not is_f64_nan(res) and (res >> 63) == 1:
+            return res  # Bug: failed to clamp negative to +0.0
+        return apply_clamp_f64(res)
+    return res
+
+
+def mutant_simd_exec_leak(
+    wave: SIMDWavefront,
+    dst_reg: int,
+    src0_reg: int,
+    src1_reg: int,
+    src2_reg: int,
+) -> None:
+    """Mutant 9: SIMD wavefront executor that leaks execution into inactive lanes."""
+    for lane in range(wave.wave_size):
+        # Bug: executes on all lanes regardless of exec_mask
+        s0 = wave.lanes[lane].get_vgpr_pair(src0_reg)
+        s1 = wave.lanes[lane].get_vgpr_pair(src1_reg)
+        s2 = wave.lanes[lane].get_vgpr_pair(src2_reg)
+        res = ref_div_fixup_f64(s0, s1, s2)
+        wave.lanes[lane].set_vgpr_pair(dst_reg, res)
+
+
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection Tests
+# ==============================================================================
+
+class TestNegativeControlsAndSyntaxRejection(unittest.TestCase):
+    """Test suite verifying syntax rejection, malformed inputs, and negative controls."""
+
+    def test_empty_and_comment_lines(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_asm_line("")
+        with self.assertRaises(ValueError):
+            parse_asm_line("   ")
+        with self.assertRaises(ValueError):
+            parse_asm_line("; comment only")
+        with self.assertRaises(ValueError):
+            parse_asm_line("// C-style comment only")
+
+    def test_invalid_opcode(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_div_scale_f64 v[0:1], v[2:3], v[4:5], v[6:7]")
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_add_f64 v[0:1], v[2:3], v[4:5]")
+
+    def test_operand_count_mismatch(self) -> None:
+        # Too few operands
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_div_fixup_f64 v[0:1], v[2:3], v[4:5]")
+        # Too many operands
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_div_fixup_f64 v[0:1], v[2:3], v[4:5], v[6:7], v[8:9]")
+
+    def test_illegal_destination_modifiers(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_div_fixup_f64 -v[0:1], v[2:3], v[4:5], v[6:7]")
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_div_fixup_f64 |v[0:1]|, v[2:3], v[4:5], v[6:7]")
+
+    def test_sgpr_destination_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_div_fixup_f64 s[0:1], v[2:3], v[4:5], v[6:7]")
+
+    def test_register_bounds_checking(self) -> None:
+        # VGPR destination out of range (max 254 for pairs)
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_div_fixup_f64 v[256:257], v[0:1], v[2:3], v[4:5]")
+
+        # VGPR source out of range
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_div_fixup_f64 v[0:1], v[256:257], v[2:3], v[4:5]")
+
+        # SGPR source out of range (max 104 for pairs)
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_div_fixup_f64 v[0:1], s[106:107], v[2:3], v[4:5]")
+
+    def test_malformed_tokens(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_div_fixup_f64 v[0:1], invalid_token_xyz, v[4:5], v[6:7]")
+
+    def test_unknown_instruction_modifier(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_asm_line("v_div_fixup_f64 v[0:1], v[2:3], v[4:5], v[6:7] unknown_mod")
+
+    def test_ast_direct_negative_validation(self) -> None:
+        # Invalid opcode
+        bad_op = ASTInstruction(
+            opcode="v_div_fixup_f32",
+            dst=ASTOperand(OperandKind.VGPR_PAIR, 0),
+            src0=ASTOperand(OperandKind.VGPR_PAIR, 2),
+            src1=ASTOperand(OperandKind.VGPR_PAIR, 4),
+            src2=ASTOperand(OperandKind.VGPR_PAIR, 6),
+        )
+        with self.assertRaises(ValueError):
+            bad_op.validate()
+
+        # Invalid destination kind
+        bad_dst = ASTInstruction(
+            opcode="v_div_fixup_f64",
+            dst=ASTOperand(OperandKind.SGPR_PAIR, 0),
+            src0=ASTOperand(OperandKind.VGPR_PAIR, 2),
+            src1=ASTOperand(OperandKind.VGPR_PAIR, 4),
+            src2=ASTOperand(OperandKind.VGPR_PAIR, 6),
+        )
+        with self.assertRaises(ValueError):
+            bad_dst.validate()
+
+        # Invalid omod
+        bad_omod = ASTInstruction(
+            opcode="v_div_fixup_f64",
+            dst=ASTOperand(OperandKind.VGPR_PAIR, 0),
+            src0=ASTOperand(OperandKind.VGPR_PAIR, 2),
+            src1=ASTOperand(OperandKind.VGPR_PAIR, 4),
+            src2=ASTOperand(OperandKind.VGPR_PAIR, 6),
+            omod=5.0,
+        )
+        with self.assertRaises(ValueError):
+            bad_omod.validate()
+
+    def test_register_file_negative_bounds(self) -> None:
+        rf = VALURegisterFile(num_vgprs=16)
+        with self.assertRaises(IndexError):
+            rf.get_vgpr(-1)
+        with self.assertRaises(IndexError):
+            rf.get_vgpr(16)
+        with self.assertRaises(IndexError):
+            rf.set_vgpr(-1, 0)
+        with self.assertRaises(IndexError):
+            rf.set_vgpr(16, 0)
+        with self.assertRaises(IndexError):
+            rf.get_vgpr_pair(15)
+        with self.assertRaises(IndexError):
+            rf.set_vgpr_pair(15, 0)
+
+    def test_scalar_interpreter_sgpr_negative_bounds(self) -> None:
+        interp = ScalarInterpreter(num_vgprs=16, num_sgprs=16)
+        with self.assertRaises(IndexError):
+            interp.get_sgpr(-1)
+        with self.assertRaises(IndexError):
+            interp.get_sgpr(16)
+        with self.assertRaises(IndexError):
+            interp.set_sgpr(-1, 0)
+        with self.assertRaises(IndexError):
+            interp.set_sgpr(16, 0)
+        with self.assertRaises(IndexError):
+            interp.get_sgpr_pair(15)
+        with self.assertRaises(IndexError):
+            interp.set_sgpr_pair(15, 0)
+
+    def test_wavefront_negative_controls(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDWavefront(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWavefront(wave_size=128)
+
+        wave = SIMDWavefront(wave_size=32)
+        with self.assertRaises(ValueError):
+            wave.store_vgpr_pair_wave(0, [0] * 64)
+
+        with self.assertRaises(ValueError):
+            ref_simd_div_fixup_f64([0] * 32, [0] * 32, [0] * 32, wave_size=64)
+
+
+class TestMutationDetection(unittest.TestCase):
+    """Test suite verifying mutation detection across mathematical and execution rules."""
+
+    def test_detect_omit_0_div_0_nan(self) -> None:
+        correct = ref_div_fixup_f64(F64_ONE, F64_POS_ZERO, F64_POS_ZERO)
+        mutated = mutant_omit_0_div_0_nan(F64_ONE, F64_POS_ZERO, F64_POS_ZERO)
+        self.assertEqual(correct, F64_INDEFINITE_QNAN)
+        self.assertNotEqual(correct, mutated)
+        self.assertEqual(mutated, F64_POS_ZERO)
+
+    def test_detect_omit_inf_div_inf_nan(self) -> None:
+        correct = ref_div_fixup_f64(F64_ONE, F64_POS_INF, F64_POS_INF)
+        mutated = mutant_omit_inf_div_inf_nan(F64_ONE, F64_POS_INF, F64_POS_INF)
+        self.assertEqual(correct, F64_INDEFINITE_QNAN)
+        self.assertNotEqual(correct, mutated)
+        self.assertEqual(mutated, F64_ONE)
+
+    def test_detect_invert_sign(self) -> None:
+        s0 = f64_to_u64(5.0)
+        s1 = f64_to_u64(2.0)
+        s2 = f64_to_u64(-10.0)
+        correct = ref_div_fixup_f64(s0, s1, s2)
+        mutated = mutant_invert_sign(s0, s1, s2)
+        self.assertEqual(u64_to_f64(correct), -5.0)
+        self.assertEqual(u64_to_f64(mutated), 5.0)
+        self.assertNotEqual(correct, mutated)
+
+    def test_detect_omit_s0_nan_recovery(self) -> None:
+        correct = ref_div_fixup_f64(F64_CANONICAL_QNAN, F64_TWO, F64_FOUR)
+        mutated = mutant_omit_s0_nan_recovery(F64_CANONICAL_QNAN, F64_TWO, F64_FOUR)
+        self.assertEqual(correct, F64_POS_INF)
+        self.assertTrue(is_f64_qnan(mutated))
+        self.assertNotEqual(correct, mutated)
+
+    def test_detect_omit_underflow_flush(self) -> None:
+        s2 = F64_MIN_SUBNORMAL
+        s1 = f64_to_u64(1024.0)
+        s0 = f64_to_u64(1.0)
+        correct = ref_div_fixup_f64(s0, s1, s2)
+        mutated = mutant_omit_underflow_flush(s0, s1, s2)
+        self.assertEqual(correct, F64_POS_ZERO)
+        self.assertNotEqual(correct, mutated)
+
+    def test_detect_omit_snan_quieting(self) -> None:
+        snan = 0x7FF0000000000001
+        self.assertTrue(is_f64_snan(snan))
+        correct = ref_div_fixup_f64(F64_ONE, F64_ONE, snan)
+        mutated = mutant_omit_snan_quieting(F64_ONE, F64_ONE, snan)
+        self.assertTrue(is_f64_qnan(correct))
+        self.assertFalse(is_f64_snan(correct))
+        self.assertTrue(is_f64_snan(mutated))
+        self.assertNotEqual(correct, mutated)
+
+    def test_detect_clamp_nan_to_nan(self) -> None:
+        correct = ref_div_fixup_f64(F64_ONE, F64_POS_ZERO, F64_POS_ZERO, clamp=True)
+        mutated = mutant_clamp_nan_to_nan(F64_ONE, F64_POS_ZERO, F64_POS_ZERO, clamp=True)
+        self.assertEqual(correct, F64_POS_ZERO)
+        self.assertTrue(is_f64_nan(mutated))
+        self.assertNotEqual(correct, mutated)
+
+    def test_detect_clamp_negative_to_negative(self) -> None:
+        s0 = f64_to_u64(5.0)
+        s1 = f64_to_u64(2.0)
+        s2 = f64_to_u64(-10.0)
+        correct = ref_div_fixup_f64(s0, s1, s2, clamp=True)
+        mutated = mutant_clamp_negative_to_negative(s0, s1, s2, clamp=True)
+        self.assertEqual(correct, F64_POS_ZERO)
+        self.assertEqual(u64_to_f64(mutated), -5.0)
+        self.assertNotEqual(correct, mutated)
+
+    def test_detect_simd_exec_leak(self) -> None:
+        wave = SIMDWavefront(wave_size=64)
+        # Disable upper 32 lanes (lanes 32..63 inactive)
+        wave.exec_mask = 0x00000000_FFFFFFFF
+        sentinel = 0xDEADBEEF_CAFEF00D
+
+        # Set initial values in v[0:1] across all lanes
+        initial_dst = [sentinel] * 64
+        wave.store_vgpr_pair_wave(0, initial_dst)
+
+        s0_val = f64_to_u64(5.0)
+        s1_val = f64_to_u64(2.0)
+        s2_val = f64_to_u64(10.0)
+        wave.store_vgpr_pair_wave(2, [s0_val] * 64)
+        wave.store_vgpr_pair_wave(4, [s1_val] * 64)
+        wave.store_vgpr_pair_wave(6, [s2_val] * 64)
+
+        # Correct execution
+        wave.step_v_div_fixup_f64(0, 2, 4, 6)
+        dst_correct = wave.load_vgpr_pair_wave(0)
+        # Active lanes updated
+        for lane in range(32):
+            self.assertEqual(u64_to_f64(dst_correct[lane]), 5.0)
+        # Inactive lanes preserved
+        for lane in range(32, 64):
+            self.assertEqual(dst_correct[lane], sentinel)
+
+        # Buggy execution (leaks to inactive lanes)
+        wave_buggy = SIMDWavefront(wave_size=64)
+        wave_buggy.exec_mask = 0x00000000_FFFFFFFF
+        wave_buggy.store_vgpr_pair_wave(0, initial_dst)
+        wave_buggy.store_vgpr_pair_wave(2, [s0_val] * 64)
+        wave_buggy.store_vgpr_pair_wave(4, [s1_val] * 64)
+        wave_buggy.store_vgpr_pair_wave(6, [s2_val] * 64)
+        mutant_simd_exec_leak(wave_buggy, 0, 2, 4, 6)
+        dst_mutant = wave_buggy.load_vgpr_pair_wave(0)
+
+        # Inactive lanes were corrupted by the mutant
+        corrupted_lanes = [lane for lane in range(32, 64) if dst_mutant[lane] != sentinel]
+        self.assertEqual(len(corrupted_lanes), 32)
+
+
 if __name__ == "__main__":
     unittest.main()
