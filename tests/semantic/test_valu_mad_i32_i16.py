@@ -293,6 +293,47 @@ class RegisterFile:
 
 
 # ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarState:
+    """Scalar processor execution state."""
+    rf: RegisterFile = field(default_factory=RegisterFile)
+
+    def read_operand(self, op: Operand) -> int:
+        if op.reg_type == RegType.VGPR:
+            return self.rf.read_vgpr(op.index)
+        if op.reg_type == RegType.SGPR:
+            return self.rf.read_sgpr(op.index)
+        if op.reg_type in (RegType.LITERAL, RegType.INLINE_CONST):
+            assert op.literal_val is not None
+            return to_u32(op.literal_val)
+        raise ValueError(f"Unsupported operand type: {op.reg_type}")
+
+    def write_operand(self, op: Operand, val: int) -> None:
+        if op.reg_type == RegType.VGPR:
+            self.rf.write_vgpr(op.index, val)
+        elif op.reg_type == RegType.SGPR:
+            self.rf.write_sgpr(op.index, val)
+        else:
+            raise TypeError(f"Cannot write value to {op.reg_type}")
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for v_mad_i32_i16."""
+
+    def step(self, instr: VMadI32I16Instruction, state: ScalarState) -> int:
+        s0 = state.read_operand(instr.src0)
+        s1 = state.read_operand(instr.src1)
+        s2 = state.read_operand(instr.src2)
+
+        res = ref_mad_i32_i16(s0, s1, s2, clamp=instr.clamp, op_sel=instr.op_sel)
+        state.write_operand(instr.dst, res)
+        return res
+
+
+# ==============================================================================
 # Unit Tests: Reference Mathematical Oracle
 # ==============================================================================
 
@@ -442,6 +483,69 @@ class TestSymbolicAST(unittest.TestCase):
         self.assertEqual(instr2.disassemble(), asm2)
         self.assertTrue(instr2.clamp)
         self.assertEqual(instr2.op_sel, (1, 1))
+
+
+# ==============================================================================
+# Unit Tests: Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class TestDeterministicScalarInterpreter(unittest.TestCase):
+    """Execution tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+        self.state = ScalarState()
+
+    def test_scalar_interpreter_basic_registers(self) -> None:
+        self.state.rf.write_vgpr(1, 10)
+        self.state.rf.write_sgpr(2, to_u32(-20))
+        self.state.rf.write_vgpr(3, 100)
+
+        instr = VMadI32I16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.sgpr(2),
+            src2=Operand.vgpr(3),
+        )
+
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, to_u32(-100))
+        self.assertEqual(self.state.rf.read_vgpr(0), to_u32(-100))
+
+    def test_scalar_interpreter_with_clamp(self) -> None:
+        self.state.rf.write_vgpr(1, 1000)
+        self.state.rf.write_vgpr(2, 1000)
+        self.state.rf.write_vgpr(3, INT32_MAX)
+
+        instr_clamp = VMadI32I16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+            clamp=True,
+        )
+
+        res = self.interp.step(instr_clamp, self.state)
+        self.assertEqual(res, INT32_MAX)
+        self.assertEqual(self.state.rf.read_vgpr(0), INT32_MAX)
+
+    def test_scalar_interpreter_sequential_chaining(self) -> None:
+        self.state.rf.write_vgpr(0, 0)
+        self.state.rf.write_vgpr(1, 5)
+        self.state.rf.write_vgpr(2, 6)
+
+        instr = VMadI32I16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(0),
+        )
+
+        self.interp.step(instr, self.state)
+        self.assertEqual(self.state.rf.read_vgpr(0), 30)
+
+        self.interp.step(instr, self.state)
+        self.assertEqual(self.state.rf.read_vgpr(0), 60)
 
 
 if __name__ == "__main__":
