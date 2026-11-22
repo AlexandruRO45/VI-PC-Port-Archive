@@ -71,7 +71,8 @@ OUT_SCC = 30   # s_cselect_b32 s30, 1, 0 observes SCC at the end
 BFE_ANY = False    # any s_bfe_* control word (--bfe-any), not only offset + width <= 32
 INLINE64 = False   # inline constants in 64-bit positions (--inline64); the translator reads those as lane masks
 
-LANE_MASK_OPS = ("s_and_b64", "s_or_b64", "s_xor_b64", "s_andn2_b64", "s_orn2_b64", "s_not_b64", "s_wqm_b64",
+LANE_MASK_OPS = ("s_and_b64", "s_or_b64", "s_xor_b64", "s_andn2_b64", "s_orn2_b64", "s_nand_b64", "s_nor_b64",
+                 "s_xnor_b64", "s_not_b64", "s_wqm_b64",
                  "s_wqm_b32", "s_cselect_b64", "s_bfm_b64")
 
 INTERESTING = (0, 1, 2, 3, 31, 32, 33, 63, 64, 0x7FFFFFFF, 0x80000000, 0x80000001, 0xFFFFFFFF, 0xFFFFFFFE,
@@ -88,9 +89,23 @@ def s64(x):
     return x - (1 << 64) if x >> 63 else x
 
 
+def sext8(x):
+    x &= 0xFF
+    return x - 0x100 if x & 0x80 else x
+
+
 def sext16(x):
     x &= 0xFFFF
     return x - 0x10000 if x & 0x8000 else x
+
+
+def flbit32(x):
+    x &= M32
+    sign = x >> 31
+    for n in range(1, 32):
+        if (x >> (31 - n)) & 1 != sign:
+            return n
+    return M32
 
 
 def is_nan(w):
@@ -121,7 +136,7 @@ def bfe(src, ctl, signed):
     off, width = ctl & 31, (ctl >> 16) & 0x7F
     # A field that runs past bit 31 stops there: s_bfe_i32 sign-extends from the top bit that exists (LLVM
     # constantFoldBFE does for v_bfe; 5-bit width there). The s_bfe rule itself rests on the gfx1150 measurement
-    # (4000 random control words, --oracle hw), and RDNA2 agrees: gfx1036, 20,000 programs with --bfe-any.
+    # (4000 random control words, --oracle hw), and RDNA2 agrees: gfx1036 (counts in the s_bfe row of docs/design.md).
     width = min(width, 32 - off)
     if width == 0:
         return 0
@@ -164,15 +179,26 @@ def _sop2():
     add("s_bfm_b32", lambda a, b, c: ((((1 << (a & 31)) - 1) << (b & 31)) & M32, None))
     add("s_mul_i32", lambda a, b, c: ((s32(a) * s32(b)) & M32, None))
     add("s_mul_hi_u32", lambda a, b, c: ((a * b) >> 32, None))
+    add("s_mul_hi_i32", lambda a, b, c: (((s32(a) * s32(b)) >> 32) & M32, None))
+    add("s_absdiff_i32", lambda a, b, c: (abs(s32((a - b) & M32)) & M32, int(abs(s32((a - b) & M32)) & M32 != 0)))
+    add("s_lshl1_add_u32", lambda a, b, c: (((a << 1) + b) & M32, int(((a << 1) + b) >= (1 << 32))))
+    add("s_lshl2_add_u32", lambda a, b, c: (((a << 2) + b) & M32, int(((a << 2) + b) >= (1 << 32))))
+    add("s_lshl3_add_u32", lambda a, b, c: (((a << 3) + b) & M32, int(((a << 3) + b) >= (1 << 32))))
+    add("s_lshl4_add_u32", lambda a, b, c: (((a << 4) + b) & M32, int(((a << 4) + b) >= (1 << 32))))
     add("s_bfe_u32", lambda a, b, c: (bfe(a, b, False), int(bfe(a, b, False) != 0)))
     add("s_bfe_i32", lambda a, b, c: (bfe(a, b, True), int(bfe(a, b, True) != 0)))
+    add("s_pack_ll_b32_b16", lambda a, b, c: (((b & 0xFFFF) << 16) | (a & 0xFFFF), None))
+    add("s_pack_lh_b32_b16", lambda a, b, c: ((b & 0xFFFF0000) | (a & 0xFFFF), None))
+    add("s_pack_hh_b32_b16", lambda a, b, c: ((b & 0xFFFF0000) | ((a >> 16) & 0xFFFF), None))
     return ops
 
 
 def _sop2_64():
     ops = {}
     for name, f in (("and", lambda a, b: a & b), ("or", lambda a, b: a | b), ("xor", lambda a, b: a ^ b),
-                    ("andn2", lambda a, b: a & ~b), ("orn2", lambda a, b: a | ~b)):
+                    ("andn2", lambda a, b: a & ~b), ("orn2", lambda a, b: a | ~b),
+                    ("nand", lambda a, b: ~(a & b)), ("nor", lambda a, b: ~(a | b)),
+                    ("xnor", lambda a, b: ~(a ^ b))):
         ops[f"s_{name}_b64"] = ("sop2_64", lambda a, b, c, f=f: (f(a, b) & M64, int(f(a, b) & M64 != 0)))
     ops["s_cselect_b64"] = ("sop2_64", lambda a, b, c: (a if c else b, None))
     ops["s_lshl_b64"] = ("sop2_64s", lambda a, b, c: ((a << (b & 63)) & M64, int((a << (b & 63)) & M64 != 0)))
@@ -192,6 +218,9 @@ def _sop1():
         "s_ff0_i32_b32": ("sop1", lambda a, b, c: (first_set(~a & M32, 32), None)),
         "s_ff1_i32_b32": ("sop1", lambda a, b, c: (first_set(a, 32), None)),
         "s_flbit_i32_b32": ("sop1", lambda a, b, c: (32 - a.bit_length() if a else M32, None)),
+        "s_flbit_i32": ("sop1", lambda a, b, c: (flbit32(a), None)),
+        "s_sext_i32_i8": ("sop1", lambda a, b, c: (sext8(a) & M32, None)),
+        "s_sext_i32_i16": ("sop1", lambda a, b, c: (sext16(a) & M32, None)),
         "s_abs_i32": ("sop1", lambda a, b, c: (abs(s32(a)) & M32, int(abs(s32(a)) & M32 != 0))),
         "s_wqm_b32": ("sop1", lambda a, b, c: (wqm(a, 32), int(wqm(a, 32) != 0))),
         # D is read: bit S0[4:0] of the destination is cleared or set.
@@ -493,7 +522,7 @@ def translated(lines, name="ps_salu"):
         dis = os.path.join(tmp, "disasm")
         os.mkdir(dis)
         path = os.path.join(dis, name + ".s")
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
             if has_branches(lines):
                 # The translator places branch targets from the encoding sizes; it does not read the bytes.
                 body = listing(lines + ["exp mrt0 v8, v9, v10, v11 done vm", "s_endpgm"])

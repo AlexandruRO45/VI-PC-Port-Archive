@@ -41,20 +41,22 @@ All 16 DLLs in the package map at their preferred base `0x180000000` with no rel
 | `XboxBvhBuilder.dll` | 909,312 | `0x227cc` | 3 | 54 | 0 | 0 |
 | `amd_fidelityfx_upscaler_xbox.dll` | 802,816 | `0x26780` | 5 | 81 | 0 | 0 |
 | `amd_fidelityfx_loader_xbox.dll` | 32,768 | `0x18d0` | 4 | 18 | 0 | 0 |
-| `libHttpClient.GDK.dll` | 999,424 | `0x11f0` | 7 | 191 | 0 | 0 |
-| `XCurl.dll` | 188,416 | `0x17b0` | 7 | 133 | 0 | 0 |
+| `libHttpClient.GDK.dll` | 999,424 | `0x11f0` | 10 | 188 | 0 | 0 |
+| `XCurl.dll` | 188,416 | `0x17b0` | 8 | 132 | 0 | 0 |
 | `concrt140.dll` | 303,104 | `0x29160` | 1 | 102 | 0 | 0 |
-| `msvcp140.dll` | 577,536 | `0x525a0` | 5 | 182 | 0 | 0 |
+| `msvcp140.dll` | 577,536 | `0x525a0` | 9 | 178 | 0 | 0 |
 | `msvcp140_1.dll` | 36,864 | `0x15c0` | 1 | 32 | 0 | 0 |
 | `msvcp140_2.dll` | 192,512 | `0x1efa0` | 1 | 95 | 0 | 0 |
 | `msvcp140_atomic_wait.dll` | 81,920 | `0x3c80` | 3 | 61 | 0 | 0 |
 | `msvcp140_codecvt_ids.dll` | 28,672 | `0x1340` | 1 | 23 | 0 | 0 |
 | `vccorlib140.dll` | 344,064 | `0x27e50` | 6 | 108 | 0 | 0 |
-| `vcomp140.dll` | 86,016 | `0x6580` | 3 | 75 | 0 | 0 |
+| `vcomp140.dll` | 86,016 | `0x6580` | 7 | 71 | 0 | 0 |
 | `vcruntime140.dll` | 110,592 | `0xf890` | 3 | 38 | 0 | 0 |
 | `vcruntime140_1.dll` | 49,152 | `0x3e90` | 1 | 33 | 0 | 0 |
 
 Since the library-loader shims (`runtime/shims/library_loader.cpp`), a module's `LoadLibrary*`, `GetModuleHandle*`, `GetProcAddress` and `FreeLibrary` imports count as shim, through `kernel32`, `kernelbase` or the `api-ms-win-core-libraryloader-*` set it names. That is why every image above has a few more shim and fewer host imports than before; the Xbox-specific imports below are unchanged.
+
+The process shim (`runtime/shims/process.cpp`) serves `ExitProcess` and `GetCommandLineA/W` the same way: through `kernel32`, `kernelbase`, and `api-ms-win-core-processthreads-l1-1-0` and `api-ms-win-core-processenvironment-l1-1-0`, the sets the API-set umbrella libraries (`OneCore_apiset.lib`, `mincore.lib`) bind them to. `vcomp140.dll` imports `ExitProcess` from the first of these. The UCRT's `_get_narrow_winmain_command_line` and `_get_wide_winmain_command_line` are served too, so a `WinMain` executable gets the game's command line as `lpCmdLine`. The table above is `gta6rt --dry-run` on each DLL at the commit that added this paragraph.
 
 The six unique Xbox-specific imports (eight consumer/import pairs) are exactly the set recorded in
 [`d3d12_vulkan.md` §7](d3d12_vulkan.md#7-prior-art-and-measured-xbox-abi):
@@ -93,9 +95,22 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
 - A path that climbs above `GAME:` with `..`, or names another drive, fails with `ERROR_INVALID_NAME`, so a title
   cannot reach outside the package and the overlay.
 
-`runtime/test/file_system_test.cpp` (ctest `file_system`) covers this over folders it makes in `%TEMP%`. Not mapped
-yet: `CreateDirectory*`/`RemoveDirectory*`, `MoveFile*`, `CopyFile*` and `SetFileAttributes*`; a title that makes a
-folder through them gets the host's error for a name like `GAME:\...`.
+- `CreateDirectory*` makes the folder in the overlay. A name the title can already see, including a folder only the
+  package has, fails with `ERROR_ALREADY_EXISTS`; a missing parent with `ERROR_PATH_NOT_FOUND`.
+- `RemoveDirectory*` needs the folder empty in the title's view (`ERROR_DIR_NOT_EMPTY` otherwise). An overlay folder is
+  removed; a package folder is hidden by a `.gta6rt-dir` marker inside its marker folder, and stays on disk. A marker
+  folder on its own (left by a file deleted below it) does not hide anything.
+- `MoveFile*` writes the destination in the overlay. A package file is copied there and its old name deleted by a
+  marker; an overlay file or an overlay-only folder is renamed. An existing destination needs
+  `MOVEFILE_REPLACE_EXISTING` even when only the package has it. Moving a package folder fails with
+  `ERROR_ACCESS_DENIED` (as deleting one does), a move between `GAME:` and a host path with `ERROR_NOT_SAME_DEVICE`, and
+  `MOVEFILE_DELAY_UNTIL_REBOOT` with `ERROR_INVALID_PARAMETER`.
+- `CopyFile`, `CopyFileEx` and `CopyFile2` read the source the way a read does and write a `GAME:` destination in the
+  overlay; fail-if-exists counts a name only the package has. Either side can be a host path.
+- `SetFileAttributes*` sets the attributes on the overlay copy, copying a package file up (or mirroring a package
+  folder) first, so the package keeps its own.
+
+`runtime/test/file_system_test.cpp` (ctest `file_system`) covers this over folders it makes in `%TEMP%`.
 
 ## When an unimplemented import is called
 
@@ -139,10 +154,34 @@ pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name 
 with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
 
 `runtime/shims/xgameruntime.cpp` serves the five entry points. The initializers succeed offline and log the GDK
-version and mode once. `QueryApiImpl` logs each class and interface id it is asked for and returns `0x80070032`, the
-documented error for a class the runtime doesn't provide. The class method layouts are not known yet, so the first
-boot with the executable lists the interfaces to implement next. `xgameruntime_test` drives this path through the
-api-set binding `XCurl.dll` uses.
+version and mode once. `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl` and `XNetworkingImpl` (below); for any
+other class it logs the class and interface id and returns `0x80070032`, the documented error for a class the runtime
+doesn't provide, so the first boot with the executable lists the classes to implement next. `xgameruntime_test` drives
+this path through the api-set binding `XCurl.dll` uses, and calls the served classes slot by slot.
+
+### Class layouts, measured
+
+Each `xgameruntime.lib` function the package's DLLs link is a thunk of the same shape: it calls a helper with the
+class id (passed as both the class and the interface id), which initializes the runtime once and calls
+`QueryApiImpl`; then it calls one vtable slot with `this` followed by the function's own arguments, and calls
+`Release` (slot 2). The helper treats `0x80040154` (class not registered) from `QueryApiImpl` specially: it turns it
+into `0x89240107` and calls an error hook; any other failure is returned as is.
+
+The slots below were read from the thunks statically linked into `libHttpClient.GDK.dll` and `XCurl.dll`
+(disassembled with `llvm-objdump`; no code was run, nothing else read). Every slot called matches, in argument
+count and width, the function at that position of xgameruntime-docs' "Layout" list after IUnknown's three slots:
+
+| Class | Slots called | Checked against the documented order |
+|---|---|---|
+| `XThreadingImpl` (`IXThreadingImpl`, 28 methods, slots 3-30) | 3-7 and 9-30 (`libHttpClient.GDK.dll`), 3, 5, 12, 16-18, 22, 29 (`XCurl.dll`) | e.g. 7 `XAsyncBegin` (5 args), 9 `XAsyncSchedule` (pointer, 32-bit), 10 `XAsyncComplete` (pointer, HRESULT, size), 12 `XTaskQueueCreate` (two 32-bit modes, pointer), 16 `XTaskQueueDispatch` (returns a byte), 19 `XTaskQueueSubmitDelayedCallback` (5 args), 22 `XTaskQueueTerminate` (pointer, bool, two pointers), 27 `XThreadSetTimeSensitive` (bool), 30 `XThreadIsTimeSensitive` (returns a byte). Slot 8 (`XAsyncBeginAlloc`, private) is never called; slot 28 (`XTaskQueueIsEmpty`, private) takes no arguments |
+| `XErrorImpl` (`IXErrorImpl`, slots 3-5) | 3 (`XCurl.dll`) | slot 3, the docs' `_unknown_`, takes an HRESULT and a pointer: `XErrorReport(HRESULT, const char*)` |
+| `XNetworkingImpl` (`IXNetworkingImpl2`, slots 3-20) | 11-17 (`XCurl.dll`) | the Utf16 `XNetworkingQuerySecurityInformationForUrl*` trio, `XNetworkingVerifyServerCertificate`, `XNetworkingGetConnectivityHint`, `XNetworkingRegister/UnregisterConnectivityHintChanged` (pointer, bool) |
+
+`XThreadingImpl` forwards each slot to `third_party/xtaskqueue`, the same implementation the named exports use;
+`XThreadSetTimeSensitive`/`XThreadIsTimeSensitive` keep a per-thread flag and the two private slots log once and
+answer 0. `XErrorImpl` logs each report and hands it to the callback `XErrorSetCallback` set. `XNetworkingImpl`
+reports an initialized network with unrestricted internet access for connectivity hints offline, succeeds certificate
+verification, and tracks hint-change registration tokens.
 
 Which classes the package's GDK modules reference, from a byte search for the class and interface GUIDs that
 xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; counts only, nothing else read):
@@ -157,9 +196,12 @@ So `XCurl.dll` needs threading, error reporting and networking from the runtime,
 `libHttpClient.GDK.dll` date the GDK the package was built with: newer than the first `IXUserImpl5`, older than
 `IXUserImpl6`. The executable's own set is still unmeasured. `QueryApiImpl`'s log gives it on the first boot.
 
-What this does not cover: a title that `LoadLibrary`s one of the package's bundled DLLs (`Bink2Scarlett.dll`,
-`XboxBvhBuilder.dll`, the FidelityFX DLLs) still gets the host loader, which loads the Xbox build without the
-registry's bindings for its own console imports (`xmem.dll`, `d3d12_xs.dll`).
+A title that calls `LoadLibrary*`, `GetModuleHandle*`, `GetProcAddress` or `FreeLibrary` on one of the package's
+bundled DLLs (`Bink2Scarlett.dll`, `XboxBvhBuilder.dll`, the FidelityFX DLLs) is routed through `rt::Loader` instead of
+the host Windows loader (excluding data-file loads and host-preferred CRTs). The loader maps the DLL from `--game-dir`,
+binds its console imports (`xmem.dll`, `d3d12_xs.dll`) through the shim registry, runs its `DllMain` and TLS callbacks,
+and resolves direct, ordinal and forwarded exports from the mapped image. `run_tiny_bundled_load` exercises this path
+end to end with a synthetic bundled DLL importing `xmem.dll!XMemAlloc` and `XMemFree`.
 
 ## What this proves and what it does not
 

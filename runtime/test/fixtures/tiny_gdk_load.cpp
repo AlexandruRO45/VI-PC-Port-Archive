@@ -51,10 +51,49 @@ int main() {
     HRESULT hr = init(0, 0, 0x02, &options);
     if (hr != S_OK) return fail("InitializeApiImplEx2", static_cast<unsigned long>(hr));
 
-    // XThreadingImpl, the first class XCurl.dll references (docs/runtime_imports.md); not provided offline yet.
+    // XThreadingImpl, the first class XCurl.dll references (docs/runtime_imports.md), used as its thunks do: the
+    // class id as both ids, a slot with `this` first, then Release (slot 2). Slot 12 is XTaskQueueCreate, 17
+    // XTaskQueueCloseHandle.
     const GUID threading = {0x073b7dcb, 0x1fcf, 0x4030, {0x94, 0xbe, 0xe3, 0xc9, 0xeb, 0x62, 0x34, 0x28}};
+    void* obj = nullptr;
+    hr = query(&threading, threading, &obj);
+    if (hr != S_OK || !obj) return fail("QueryApiImpl hands out XThreadingImpl", static_cast<unsigned long>(hr));
+    void* const* vtable = *static_cast<void* const* const*>(obj);
+    using Create = HRESULT(STDMETHODCALLTYPE*)(void*, UINT32, UINT32, void**);
+    using Close = void(STDMETHODCALLTYPE*)(void*, void*);
+    using Release = ULONG(STDMETHODCALLTYPE*)(void*);
+    void* queue = nullptr;
+    hr = reinterpret_cast<Create>(vtable[12])(obj, 0, 0, &queue);  // XTaskQueueDispatchMode::Manual twice
+    if (hr != S_OK || !queue) return fail("XThreadingImpl slot 12 (XTaskQueueCreate)", static_cast<unsigned long>(hr));
+    reinterpret_cast<Close>(vtable[17])(obj, queue);
+    reinterpret_cast<Release>(vtable[2])(obj);
+
+    // XNetworkingImpl is served through QueryApiImpl (slot 15: XNetworkingGetConnectivityHint).
+    const GUID networking = {0x37e56907, 0x2f10, 0x41e8, {0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a}};
+    void* net_obj = nullptr;
+    hr = query(&networking, networking, &net_obj);
+    if (hr != S_OK || !net_obj)
+        return fail("QueryApiImpl hands out XNetworkingImpl", static_cast<unsigned long>(hr));
+    void* const* net_vtable = *static_cast<void* const* const*>(net_obj);
+    struct Hint {
+        UINT32 level;
+        UINT32 cost;
+        UINT32 iana;
+        bool init;
+        bool appr;
+        bool over;
+        bool roam;
+    } hint{};
+    using GetHint = HRESULT(STDMETHODCALLTYPE*)(void*, Hint*);
+    hr = reinterpret_cast<GetHint>(net_vtable[15])(net_obj, &hint);
+    if (hr != S_OK || !hint.init)
+        return fail("XNetworkingImpl slot 15 (XNetworkingGetConnectivityHint)", static_cast<unsigned long>(hr));
+    reinterpret_cast<Release>(net_vtable[2])(net_obj);
+
+    // A class not served yet (an unprovided class id) is refused, with the out pointer cleared.
+    const GUID unprovided = {0x973a344e, 0x24bf, 0x4d0f, {0x84, 0x57, 0x56, 0xc5, 0x34, 0x89, 0x2b, 0x29}};
     void* out = reinterpret_cast<void*>(1);
-    hr = query(&threading, threading, &out);
+    hr = query(&unprovided, unprovided, &out);
     if (hr != static_cast<HRESULT>(0x80070032) || out != nullptr)
         return fail("QueryApiImpl refuses an unprovided class and clears its out pointer", static_cast<unsigned long>(hr));
     hr = uninit();

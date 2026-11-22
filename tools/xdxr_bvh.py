@@ -259,7 +259,7 @@ def _write_parents(buf, parents_off, elements_off, end, parent_of, root_ptr):
 
 def _write_header(buf, flags, end, n_elements, bounds, nodes_off, root, elements_off, parents_off):
     lo, hi = bounds
-    struct.pack_into("<4I6fIiIIII", buf, 0, flags, end // UNIT, 0, n_elements, *lo, *hi,
+    struct.pack_into("<4I6fIiIIII", buf, 0, flags, end // UNIT - 1, 0, n_elements, *lo, *hi,
                      nodes_off, 0, root, elements_off, parents_off, 0)
 
 
@@ -651,8 +651,8 @@ def validate(data, expect_bottom=None):
     if flags & (FLAG_COMPRESSED | FLAG_DEHYDRATED):
         errs.append("compressed or dehydrated BVH: not a runtime tree (docs/bvh.md 3.1)")
         return errs
-    if units * UNIT != len(data):
-        errs.append(f"totalSizeIn64BNodes {units} does not cover the {len(data)}-byte buffer")
+    if (units + 1) * UNIT != len(data):   # the field does not count the 64-byte header (docs/bvh.md 3.1)
+        errs.append(f"totalSizeIn64BNodes {units} does not cover the {len(data)}-byte buffer (64 * (field + 1) bytes)")
     for name, off in (("offsetToNodes", nodes_off), ("offsetToElements", elements_off)):
         if off % UNIT or off > len(data):
             errs.append(f"{name} {off:#x} is unaligned or past the end")
@@ -740,11 +740,15 @@ def check_build(directory, rays=300, seed=1):
         return [f"no cases in {directory}"]
     problems = []
     cases = {n: _load_case(directory, n) for n in names}
-    mem = Memory()
-    for n, (desc, data) in cases.items():
-        mem.place(desc["address"], data)
     rng = random.Random(seed)
     for n, (desc, data) in cases.items():
+        # An in-place update leaves two dumps at one address (before and after): the case being checked comes first,
+        # so its own bytes answer reads there.
+        mem = Memory()
+        mem.place(desc["address"], data)
+        for other, (odesc, odata) in cases.items():
+            if other != n:
+                mem.place(odesc["address"], odata)
         errs = validate(data, expect_bottom=desc["kind"] == "blas")
         problems += [f"{n}: {e}" for e in errs]
         if desc["kind"] == "blas":

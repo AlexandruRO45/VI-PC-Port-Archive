@@ -391,15 +391,25 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                 self.assertIn(".NET 8 SDK", err)
                 self.assertIn("Visual Studio 2022", err)
 
+    def test_preflight_accepts_spaced_llvm_mc_resolved_by_which(self):
+        with tempfile.TemporaryDirectory() as tmp_work:
+            mc = os.path.join(tmp_work, "LLVM Tools", "llvm-mc")
+            available = {mc: mc + ".exe", "spirv-as": "spirv-as", "spirv-val": "spirv-val"}
+            with mock.patch.dict(os.environ, {"LLVM_MC": mc}), \
+                 mock.patch("shutil.which", side_effect=available.get), \
+                 mock.patch("shutil.disk_usage", return_value=Usage(100 * 2**30, 0, 100 * 2**30)):
+                make_game.preflight(["shaders"], tmp_work)
+
     def test_preflight_explains_llvm_mc_hidden_in_appdata(self):
         env = {"LOCALAPPDATA": r"C:\Users\u\AppData\Local",
                "LLVM_MC": r"C:\Users\u\AppData\Local\Leonida\llvm-mc\llvm-mc.exe"}
+        available = {"spirv-as": "spirv-as", "spirv-val": "spirv-val"}
         with tempfile.TemporaryDirectory() as tmp_work, \
              mock.patch.dict(os.environ, env), \
              mock.patch("os.name", "nt"), \
              mock.patch("sys.version_info", (3, 12, 0)), \
-             mock.patch("shutil.which", return_value="/usr/bin/tool"), \
-             mock.patch("make_game.tool_available", return_value=False):
+             mock.patch("shutil.which", side_effect=available.get), \
+             mock.patch("os.path.isfile", return_value=False):
             err = self.assert_fails(make_game.preflight, ["shaders"], tmp_work,
                                     match="llvm-mc (LLVM 21+ with the AMDGPU target)")
         self.assertIn("LLVM_MC points into %LOCALAPPDATA%", err)
@@ -487,8 +497,8 @@ class PreflightPrerequisiteTest(PreflightTestBase):
         for name, changed, settings, legacy_layout, reusable in cases:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as work:
                 files = {
-                    "dxbc/index.json": "{}",
-                    "dxbc/fssm_index.json": "{}",
+                    "dxbc/index.json": '[{"file": "shader.dxbc"}]',
+                    "dxbc/fssm_index.json": '[{"name": "shader"}]',
                     "dxbc/disasm.done": "test llvm-mc 21",
                     "spirv/index.json": "{}",
                     "spirv/translation_sources.sha256": fingerprint,
@@ -529,6 +539,19 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                 err = self.assert_fails(make_game.preflight, ["shaders", "assets"], tmp_work, wav=False,
                                         match="about 330 GB is needed")
                 self.assertIn("250 GB free", err)
+
+    def test_preflight_low_space_points_at_run_only_stages(self):
+        with tempfile.TemporaryDirectory() as tmp_work:
+            with mock.patch("sys.version_info", (3, 12, 0)), \
+                 mock.patch("shutil.which", return_value="/usr/bin/tool"), \
+                 mock.patch("make_game.tool_available", return_value=True), \
+                 mock.patch("make_game.ensure_submodule", return_value=None), \
+                 mock.patch("os.path.isfile", return_value=True), \
+                 mock.patch("shutil.disk_usage", return_value=Usage(500 * 2**30, 250 * 2**30, 250 * 2**30)):
+                err = self.assert_fails(make_game.preflight, ["shaders", "assets"], tmp_work, wav=False,
+                                        match="assets stage is optional")
+                self.assertIn("--stages check,shaders,runtime", err)
+                self.assertIn("about 330 GB is needed", err)
 
     def test_ensure_submodule_present_is_noop(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -654,9 +677,41 @@ class PathAndGameSelectionTest(PreflightTestBase):
             self.assert_fails(make_game.choose_game,
                               match="More than one copy found: choose one with --game.")
 
+    def default_out_in(self, platform, icloud_documents, earlier_build=False, call=None):
+        """default_out() (or `call`) with a temporary home folder; icloud_documents makes the folder macOS keeps in
+        iCloud Drive when Desktop & Documents sync is on (~/Library/Mobile Documents/com~apple~CloudDocs/Documents),
+        earlier_build a ~/Documents/Leonida from before the change."""
+        with tempfile.TemporaryDirectory() as home:
+            if icloud_documents:
+                os.makedirs(os.path.join(home, "Library", "Mobile Documents", "com~apple~CloudDocs", "Documents"))
+            if earlier_build:
+                os.makedirs(os.path.join(home, "Documents", "Leonida", "work"))
+            with mock.patch.object(make_game.os.path, "expanduser", lambda p: home + p[1:] if p.startswith("~") else p), \
+                    mock.patch.object(make_game.sys, "platform", platform):
+                if call:
+                    return [note.replace(home, "~") for note in call()]
+                return os.path.relpath(make_game.default_out(), home)
+
+    def test_icloud_note_names_an_earlier_build_in_documents(self):
+        # A Mac that built into ~/Documents/Leonida before the default moved: say where that resumable build is.
+        notes = self.default_out_in("darwin", True, earlier_build=True, call=make_game.icloud_default_notes)
+        self.assertEqual(len(notes), 2, notes)
+        self.assertIn("off iCloud", notes[0])
+        self.assertIn(os.path.join("~", "Documents", "Leonida"), notes[1])
+        self.assertIn(os.path.join("~", "Leonida") + " to resume", notes[1])
+        self.assertIn("--out", notes[1])
+        self.assertEqual(len(self.default_out_in("darwin", True, call=make_game.icloud_default_notes)), 1)
+
     def test_default_out_matches_documents_folder(self):
-        expected = os.path.join(os.path.expanduser("~"), "Documents", "Leonida")
-        self.assertEqual(make_game.default_out(), expected)
+        for platform in ("win32", "linux", "darwin"):
+            self.assertEqual(self.default_out_in(platform, False), os.path.join("Documents", "Leonida"), platform)
+
+    def test_default_out_leaves_icloud_synced_documents_on_a_mac(self):
+        # Before: with iCloud Desktop & Documents sync on, ~/Documents/Leonida (and its work folder, hundreds of GB
+        # made from the game) went into iCloud Drive, which uploads it and can evict the work files from the disk.
+        self.assertEqual(self.default_out_in("darwin", True), "Leonida")
+        # Only macOS keeps Documents in iCloud Drive this way; elsewhere the folder means nothing.
+        self.assertEqual(self.default_out_in("linux", True), os.path.join("Documents", "Leonida"))
 
     def test_constants_definitions(self):
         self.assertEqual(make_game.STAGES, ["check", "shaders", "assets", "runtime", "pipelines"])

@@ -3,7 +3,8 @@
 // The execution side of the D3D12 layer, without COM: the per-device Vulkan context (resources, layout tracker,
 // image views), queues that execute command lists, and timeline-semaphore fences. The COM objects in
 // shims/d3d12_com.cpp are thin wrappers over these. Needs Vulkan 1.2 timeline semaphores; rectangle clears and
-// enhanced barriers need the Vulkan 1.3 functions (dynamicRendering, synchronization2) to be enabled.
+// enhanced barriers need the Vulkan 1.3 functions (dynamicRendering, synchronization2) to be enabled, as core
+// features or through their KHR extensions on a 1.2 device (vulkan13_features.h).
 
 #ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
@@ -12,9 +13,11 @@
 #include "occlusion_sum_spirv.h"
 #include "retire_tickets.h"
 #include "statistics_sum_spirv.h"
+#include "vulkan13_features.h"
 #include "vulkan_depth24.h"
 #include "vulkan_scratch.h"
 #include "vulkan_replay.h"
+#include "resource_tiling.h"
 #include "xdxr_build.h"
 
 #include <algorithm>
@@ -23,10 +26,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <unordered_set>
 #include <shared_mutex>
 #include <span>
 #include <thread>
@@ -75,7 +80,7 @@ struct VulkanDeviceFunctions {
     X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor)                  \
     X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetStencilReference)                          \
     X(vkCmdSetBlendConstants) X(vkCmdDraw)                                                                              \
-    X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines)
+    X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkQueueBindSparse)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -84,7 +89,7 @@ struct VulkanDeviceFunctions {
     // extension is not enabled, and the query functions are optional (a list that uses queries without them is
     // unsupported). The compute and descriptor functions are needed for normalized or summed occlusion results.
     bool load(PFN_vkGetDeviceProcAddr get, VkDevice device) {
-#define LEONIDA_VK_LOAD(name) name = reinterpret_cast<PFN_##name>(get(device, #name));
+#define LEONIDA_VK_LOAD(name) name = reinterpret_cast<PFN_##name>(leonida::device_proc_or_khr(get, device, #name));
         LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_LOAD)
 #undef LEONIDA_VK_LOAD
         return vkCreateCommandPool && vkDestroyCommandPool && vkAllocateCommandBuffers && vkResetCommandBuffer &&
@@ -495,56 +500,79 @@ public:
 
     void enqueue(VkSemaphore sem, std::uint64_t value, void* event_handle) {
         if (!sem || !event_handle) return;
-        if (device_lost_.load(std::memory_order_acquire)) {
-            SignalEventFn fn = nullptr;
-            {
-                std::lock_guard lock(mutex_);
-                fn = signal_event_;
-            }
-            if (fn) fn(event_handle);
-            return;
-        }
+        SignalEventFn immediate_fn = nullptr;
         {
             std::lock_guard lock(mutex_);
-            pending_.push_back({sem, value, event_handle, {}});
-            if (!thread_.joinable() && wakeup_sem_) thread_ = std::thread([this] { run(); });
-            signal_wakeup_locked();
+            if (stop_ || device_lost_.load(std::memory_order_acquire)) {
+                immediate_fn = signal_event_;
+            } else {
+                pending_.push_back({sem, value, event_handle, {}});
+                if (!thread_.joinable() && wakeup_sem_) thread_ = std::thread([this] { run(); });
+                signal_wakeup_locked();
+            }
+        }
+        if (immediate_fn) {
+            immediate_fn(event_handle);
+            return;
         }
         cv_.notify_one();
     }
 
     void enqueue_callback(VkSemaphore sem, std::uint64_t value, std::function<void()> cb) {
         if (!sem || !cb) return;
-        if (device_lost_.load(std::memory_order_acquire)) {
-            cb();
-            return;
-        }
+        std::function<void()> immediate_cb;
         {
             std::lock_guard lock(mutex_);
-            pending_.push_back({sem, value, nullptr, std::move(cb)});
-            if (!thread_.joinable() && wakeup_sem_) thread_ = std::thread([this] { run(); });
-            signal_wakeup_locked();
+            if (stop_ || device_lost_.load(std::memory_order_acquire)) {
+                immediate_cb = std::move(cb);
+            } else {
+                pending_.push_back({sem, value, nullptr, std::move(cb)});
+                if (!thread_.joinable() && wakeup_sem_) thread_ = std::thread([this] { run(); });
+                signal_wakeup_locked();
+            }
+        }
+        if (immediate_cb) {
+            immediate_cb();
+            return;
         }
         cv_.notify_one();
+    }
+
+    // Wakes run() when another path marks the device lost so pending waits complete and stop()/cancel() never hang.
+    void notify_device_lost() {
+        {
+            std::lock_guard lock(mutex_);
+            signal_wakeup_locked();
+        }
+        cv_.notify_all();
     }
 
     // Completes the pending waits for `sem` (a released D3D12 fence counts as reached, as on the PC runtime) and
     // blocks until any in-flight vkWaitSemaphores releases `sem` before the caller destroys the VkSemaphore.
     void cancel(VkSemaphore sem) {
         if (!sem) return;
-        std::unique_lock lock(mutex_);
-        std::erase_if(pending_, [this, sem](const Entry& e) {
-            if (e.semaphore != sem) return false;
-            if (e.callback) e.callback();
-            else if (signal_event_ && e.event_handle) signal_event_(e.event_handle);
-            return true;
-        });
-        if (!thread_.joinable()) return;
-        if (waiting_) {
-            const std::uint64_t target_epoch = epoch_ + 1;
-            signal_wakeup_locked();
-            epoch_cv_.wait(lock, [this, target_epoch] { return !waiting_ || epoch_ >= target_epoch; });
+        std::vector<Entry> cancelled;
+        SignalEventFn fn = nullptr;
+        {
+            std::unique_lock lock(mutex_);
+            fn = signal_event_;
+            std::size_t write = 0;
+            for (std::size_t i = 0; i < pending_.size(); ++i) {
+                if (pending_[i].semaphore == sem) {
+                    cancelled.push_back(std::move(pending_[i]));
+                } else {
+                    if (write != i) pending_[write] = std::move(pending_[i]);
+                    ++write;
+                }
+            }
+            pending_.resize(write);
+            if (thread_.joinable() && waiting_) {
+                const std::uint64_t target_epoch = epoch_ + 1;
+                signal_wakeup_locked();
+                epoch_cv_.wait(lock, [this, target_epoch] { return !waiting_ || epoch_ >= target_epoch; });
+            }
         }
+        dispatch_entries(cancelled, fn);
     }
 
     void stop() {
@@ -559,10 +587,18 @@ public:
     }
 
 private:
+    static void dispatch_entries(std::vector<Entry>& entries, SignalEventFn signal_event) {
+        for (Entry& e : entries) {
+            if (e.callback) e.callback();
+            else if (signal_event && e.event_handle) signal_event(e.event_handle);
+        }
+    }
+
     // Only signals wakeup_sem_ when run() is actively waiting (waiting_ == true) on wakeup_val_ + 1,
-    // eliminating any lost-wakeup race between snapshot construction and vkWaitSemaphores.
+    // eliminating any lost-wakeup race between snapshot construction and vkWaitSemaphores. Keep signaling even if
+    // device_lost_ is already set so a blocked vkWaitSemaphores wakes cleanly for cancel()/stop().
     void signal_wakeup_locked() {
-        if (!waiting_ || !wakeup_sem_ || device_lost_.load(std::memory_order_relaxed)) return;
+        if (!waiting_ || !wakeup_sem_) return;
         const std::uint64_t next = ++wakeup_val_;
         VkSemaphoreSignalInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
         si.semaphore = wakeup_sem_;
@@ -573,7 +609,15 @@ private:
     void run() {
         std::unique_lock lock(mutex_);
         while (true) {
-            cv_.wait(lock, [this] { return stop_ || !pending_.empty(); });
+            cv_.wait(lock, [this] { return stop_ || !pending_.empty() || device_lost_.load(std::memory_order_acquire); });
+            if (device_lost_.load(std::memory_order_acquire)) {
+                std::vector<Entry> drained = std::move(pending_);
+                pending_.clear();
+                const SignalEventFn fn = signal_event_;
+                lock.unlock();
+                dispatch_entries(drained, fn);
+                return;
+            }
             if (stop_) return;
 
             semaphores_.clear();
@@ -600,25 +644,53 @@ private:
             ++epoch_;
             epoch_cv_.notify_all();
 
-            if (res == VK_ERROR_DEVICE_LOST) {
+            if (res == VK_ERROR_DEVICE_LOST || device_lost_.load(std::memory_order_acquire)) {
                 device_lost_.store(true, std::memory_order_release);
-                for (const Entry& e : pending_) {
-                    if (e.callback) e.callback();
-                    else if (signal_event_ && e.event_handle) signal_event_(e.event_handle);
-                }
+                std::vector<Entry> drained = std::move(pending_);
                 pending_.clear();
+                const SignalEventFn fn = signal_event_;
+                lock.unlock();
+                dispatch_entries(drained, fn);
                 return;
             }
             if (stop_) return;
 
-            std::erase_if(pending_, [this](const Entry& e) {
+            std::vector<Entry> ready;
+            bool lost = false;
+            std::size_t write = 0;
+            for (std::size_t i = 0; i < pending_.size(); ++i) {
                 std::uint64_t done = 0;
-                if (vk_.vkGetSemaphoreCounterValue(device_, e.semaphore, &done) != VK_SUCCESS) return false;
-                if (done < e.value) return false;
-                if (e.callback) e.callback();
-                else if (signal_event_ && e.event_handle) signal_event_(e.event_handle);
-                return true;
-            });
+                const VkResult cr = vk_.vkGetSemaphoreCounterValue(device_, pending_[i].semaphore, &done);
+                if (cr == VK_ERROR_DEVICE_LOST) {
+                    lost = true;
+                    for (std::size_t j = i; j < pending_.size(); ++j) ready.push_back(std::move(pending_[j]));
+                    break;
+                }
+                if (cr == VK_SUCCESS && done >= pending_[i].value) {
+                    ready.push_back(std::move(pending_[i]));
+                } else {
+                    if (write != i) pending_[write] = std::move(pending_[i]);
+                    ++write;
+                }
+            }
+            if (lost) {
+                pending_.resize(write);
+                for (Entry& e : pending_) ready.push_back(std::move(e));
+                pending_.clear();
+                device_lost_.store(true, std::memory_order_release);
+                const SignalEventFn fn = signal_event_;
+                lock.unlock();
+                dispatch_entries(ready, fn);
+                return;
+            }
+            pending_.resize(write);
+            if (!ready.empty()) {
+                const SignalEventFn fn = signal_event_;
+                lock.unlock();
+                dispatch_entries(ready, fn);
+                lock.lock();
+                if (stop_) return;
+            }
         }
     }
 
@@ -639,6 +711,47 @@ private:
     bool waiting_ = false;
     bool stop_ = false;
     std::thread thread_;
+};
+
+// A range of a D3D12 heap allocation. Mappings and in-flight unbinds keep the arena range alive.
+struct TileHeapAllocation {
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    VkDeviceSize size = 0;
+    std::uint32_t memory_type = 0;
+};
+
+struct BufferTile {
+    std::shared_ptr<const TileHeapAllocation> heap;
+    VkDeviceSize offset = 0;
+    bool operator==(const BufferTile&) const = default;
+};
+
+struct SparseBuffer {
+    SparseBuffer(VkDevice device, PFN_vkDestroyBuffer destroy) : device(device), destroy(destroy) {}
+    SparseBuffer(const SparseBuffer&) = delete;
+    SparseBuffer& operator=(const SparseBuffer&) = delete;
+    ~SparseBuffer() { if (buffer) destroy(device, buffer, nullptr); }
+
+    VkDevice device;
+    PFN_vkDestroyBuffer destroy;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    std::uint64_t tile_count = 0;
+    std::uint32_t memory_types = 0;
+    std::map<std::uint64_t, BufferTile> mapped;
+};
+
+struct BufferTileRegion {
+    std::uint64_t first = 0;
+    std::uint64_t count = 0;
+};
+
+enum class TileRangeMode { sequential, unmap, skip, reuse };
+
+struct BufferTileRange {
+    TileRangeMode mode;
+    std::uint64_t first;
+    std::uint64_t count;
 };
 
 // Per device: what the queues share. Resources are registered by their stable ID (the COM resource pointer).
@@ -732,14 +845,25 @@ public:
                     const std::uint64_t base = replay_.heap_base;
                     XdxrLayout layout;
                     layout.compute(xdxr_elements(b), b.is_tlas);
+                    // PERFORM_UPDATE refits the source (the destination itself when no source is given, as D3D12
+                    // allows for an in-place update); a full build otherwise.
+                    const std::uint64_t from = b.update ? base + (b.src_va ? b.src_va : b.dst_va) : 0;
                     if (b.is_tlas) {
                         xdxr_->record_tlas(cb, layout, b.instances_va ? base + b.instances_va : 0, base + b.dst_va,
-                                           base + b.scratch_va, base);
+                                           base + b.scratch_va, base, from);
                     } else {
                         std::vector<XdxrTriangles> geometries;
                         xdxr_inputs(b, &geometries, base);
-                        xdxr_->record_blas(cb, layout, geometries, base + b.dst_va, base + b.scratch_va);
+                        xdxr_->record_blas(cb, layout, geometries, base + b.dst_va, base + b.scratch_va, from);
                     }
+                };
+                replay_.xdxr_copy = [this](VkCommandBuffer cb, std::uint64_t src, std::uint64_t dst, std::uint64_t bytes) {
+                    const std::uint64_t base = replay_.heap_base;
+                    xdxr_->record_copy(cb, base + src, base + dst, bytes);
+                };
+                replay_.xdxr_postbuild = [this](VkCommandBuffer cb, std::uint64_t src, std::uint64_t dest) {
+                    const std::uint64_t base = replay_.heap_base;
+                    xdxr_->record_postbuild(cb, base + src, base + dest);
                 };
             } else {
                 xdxr_.reset();
@@ -814,6 +938,21 @@ public:
         }
     }
 
+    // An image that got a storage (unordered-access) view. A shader can write it before any command names it, so the
+    // layer would not know it was used and the first barrier or copy that does would zero-fill it (vulkan_replay.h,
+    // initialize). The next submission therefore moves each such image to GENERAL, the layout its descriptor names,
+    // zero-filled, ahead of its lists. An image already tracked beyond UNDEFINED is left as it is.
+    void note_storage_image(ResourceId id) {
+        std::lock_guard lock(storage_mutex_);
+        storage_pending_.insert(id);
+    }
+
+    void add_sparse_buffer(ResourceId id, const ResourceBinding& binding, std::shared_ptr<SparseBuffer> buffer) {
+        std::unique_lock lock(resource_mutex_);
+        resources_[id] = binding;
+        sparse_buffers_.emplace(id, std::move(buffer));
+    }
+
     void remove_resource(ResourceId id) {
         VkImage img = VK_NULL_HANDLE;
         {
@@ -822,6 +961,7 @@ public:
             if (it == resources_.end()) return;
             img = it->second.image;
             resources_.erase(it);
+            sparse_buffers_.erase(id);
         }
         if (img) {
             std::lock_guard vlock(views_mutex_);
@@ -876,6 +1016,12 @@ public:
         replay_.zero_buffer = buffer;
         replay_.zero_offset = offset;
         replay_.zero_size = size;
+    }
+
+    // Physical-device COLOR_ATTACHMENT format check for reinterpreted UAV clears.
+    void set_color_attachment_format(std::function<bool(VkFormat)> check) {
+        std::unique_lock lock(resource_mutex_);
+        replay_.color_attachment_format = std::move(check);
     }
     std::uint64_t heap_base() {
         std::shared_lock lock(resource_mutex_);
@@ -1053,7 +1199,15 @@ public:
     // Vulkan requires external synchronisation of a VkQueue; every D3D12 queue of the device may share one.
     std::mutex& submit_mutex() { return submit_mutex_; }
 
-    void mark_device_lost() noexcept { device_lost_.store(true, std::memory_order_release); }
+    void mark_device_lost() noexcept {
+        device_lost_.store(true, std::memory_order_release);
+        if (fence_dispatcher_) {
+            try {
+                fence_dispatcher_->notify_device_lost();
+            } catch (...) {
+            }
+        }
+    }
     bool is_device_lost() const noexcept { return device_lost_.load(std::memory_order_acquire); }
 
     void set_signal_event_fn(FenceWaitDispatcher::SignalEventFn fn) {
@@ -1090,10 +1244,10 @@ private:
         info.format = r.format;
         info.subresourceRange = range;
         // Attachment views need only color-attachment usage. Inheriting STORAGE usage from a mutable/extended
-        // resource (typeless RGBA8 sRGB views, or R32_UINT-backed R9G9B9E5 UAV images) would require unrelated usages.
+        // resource (typeless views such as RGBA8 sRGB, or R32_UINT-backed R9G9B9E5 UAV images) would require unrelated usages.
         VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
         usage.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-        if (r.rgba8_typeless || (range.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT && r.color_attachment))
+        if (r.typeless || (range.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT && r.color_attachment))
             info.pNext = &usage;
         VkImageView view = VK_NULL_HANDLE;
         if (vk.vkCreateImageView(device_, &info, nullptr, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
@@ -1115,10 +1269,19 @@ private:
     DeferredDeletionQueue deletion_queue_;
     std::unique_ptr<FenceWaitDispatcher> fence_dispatcher_;
     std::unordered_map<ResourceId, ResourceBinding> resources_;
+    std::unordered_map<ResourceId, std::shared_ptr<SparseBuffer>> sparse_buffers_;
     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
     std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;
     std::unordered_map<std::uint64_t, VkAccelerationStructureKHR> acceleration_structures_;
     LayoutTracker tracker_;
+    std::mutex storage_mutex_;  // a leaf lock: guards storage_pending_ only
+    std::unordered_set<ResourceId> storage_pending_;
+    // The last submission that initialized storage images (its queue's progress semaphore and ticket) and a counter
+    // that says which one: every other queue's next submission waits for it, so no queue uses such an image before
+    // the zero-fill that put it in GENERAL has run.
+    VkSemaphore storage_init_semaphore_ = VK_NULL_HANDLE;
+    std::uint64_t storage_init_value_ = 0;
+    std::uint64_t storage_init_version_ = 0;
     std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>, VkImageView> views_;
     std::function<bool(VkCommandBuffer)> bindless_prepare_;
     std::unique_ptr<Depth24Converter> depth24_;
@@ -1245,6 +1408,68 @@ public:
 
     bool ok() const { return ok_; }
 
+    template<typename GetHeap>
+    bool update_tiles(ResourceId id, std::span<const BufferTileRegion> regions,
+                      std::span<const BufferTileRange> ranges, GetHeap&& get_heap) {
+        std::unique_lock lock(context_.resource_mutex_);
+        const auto it = context_.sparse_buffers_.find(id);
+        if (it == context_.sparse_buffers_.end()) return false;
+        const auto& buffer = it->second;
+        for (const auto& region : regions)
+            if (!valid_tiles(*buffer, region)) return false;
+        const auto heap = get_heap();
+
+        std::map<std::uint64_t, BufferTile> changes;
+        std::size_t region_index = 0;
+        std::uint64_t consumed = 0;
+        for (const auto& range : ranges) {
+            const bool backed = range.mode == TileRangeMode::sequential || range.mode == TileRangeMode::reuse;
+            const std::uint64_t heap_count = heap ? heap->size / tile_size_in_bytes : 0;
+            const std::uint64_t required = range.mode == TileRangeMode::reuse ? 1 : range.count;
+            if (backed && (!heap || range.first > heap_count || required > heap_count - range.first)) return false;
+            for (std::uint64_t i = 0; i < range.count;) {
+                if (region_index == regions.size()) return false;
+                const auto& region = regions[region_index];
+                const auto count = std::min(range.count - i, region.count - consumed);
+                const auto first = region.first + consumed;
+                if (range.mode == TileRangeMode::unmap) {
+                    const auto end = first + count;
+                    for (auto old = buffer->mapped.lower_bound(first); old != buffer->mapped.end() && old->first < end; ++old)
+                        changes[old->first] = {};
+                    for (auto change = changes.lower_bound(first); change != changes.end() && change->first < end; ++change)
+                        change->second = {};
+                } else if (backed) {
+                    for (std::uint64_t j = 0; j < count; ++j) {
+                        const auto page = range.first + (range.mode == TileRangeMode::sequential ? i + j : 0);
+                        changes[first + j] = {heap, heap->offset + page * tile_size_in_bytes};
+                    }
+                }
+                i += count;
+                consumed += count;
+                if (consumed == region.count) {
+                    ++region_index;
+                    consumed = 0;
+                }
+            }
+        }
+        return region_index == regions.size() && bind_tiles(buffer, changes);
+    }
+
+    bool copy_tile_mappings(ResourceId dst, std::uint64_t dst_first, ResourceId src, BufferTileRegion src_region) {
+        std::unique_lock lock(context_.resource_mutex_);
+        const auto source = context_.sparse_buffers_.find(src), target = context_.sparse_buffers_.find(dst);
+        if (source == context_.sparse_buffers_.end() || target == context_.sparse_buffers_.end() ||
+            !valid_tiles(*source->second, src_region) ||
+            !valid_tiles(*target->second, {dst_first, src_region.count})) return false;
+        // Read the complete source mapping before changing any destination slot, including copies within one buffer.
+        std::map<std::uint64_t, BufferTile> changes;
+        for (std::uint64_t i = 0; i < src_region.count; ++i) {
+            const auto page = source->second->mapped.find(src_region.first + i);
+            changes.emplace(dst_first + i, page == source->second->mapped.end() ? BufferTile{} : page->second);
+        }
+        return bind_tiles(target->second, changes);
+    }
+
     // ExecuteCommandLists: every list is checked before any is written, so a failure submits nothing and leaves
     // the layout tracker as it was. Pending Wait()s are attached to this submission.
     ReplayResult execute(std::span<const CommandList* const> lists) {
@@ -1276,7 +1501,10 @@ public:
             }
         } scratch_guard{context_.scratch_.get(), progress_, false};
         bindless_commit = context_.bindless_commit_;
-        std::vector<PreparedList> prepared(lists.size());
+        // Kept between executions: prepare refills each list's entries in the storage the last execution left, where
+        // making them fresh for every command was about half the layer's CPU cost per command (replay_cpu_bench).
+        auto& prepared = prepared_;
+        prepared.resize(lists.size());
         ReplayFunctions replay = context_.replay_;
         std::uint64_t captures = 0;
         for (const auto* list : lists)
@@ -1352,7 +1580,7 @@ public:
         std::uint32_t segments = 0, statistics_segments = 0;
         bool has_queries = false;
         for (std::size_t i = 0; i < lists.size(); ++i) {
-            const auto result = prepare(*lists[i], resolve, replay, prepared[i]);
+            const auto result = prepare(*lists[i], resolve, replay, prepared[i], can_resolve_occlusion);
             if (result != ReplayResult::success) return result;
             if (prepared[i].segment_count > UINT32_MAX - segments ||
                 prepared[i].statistics_segment_count > UINT32_MAX - statistics_segments)
@@ -1434,6 +1662,33 @@ public:
             return ReplayResult::unsupported;
         }
         auto next_tracker = context_.tracker_;
+        // Images with a UAV view are moved to GENERAL (zeroed) by the first submission that can use a shader on them:
+        // not a copy queue (its family may not clear images), and one whose lists dispatch or draw.
+        bool runs_shaders = false;
+        for (const CommandList* list : lists)
+            for (const auto& command : list->commands())
+                runs_shaders |= std::holds_alternative<Dispatch>(command) || std::holds_alternative<Draw>(command) ||
+                                std::holds_alternative<ExecuteIndirect>(command);
+        std::vector<ResourceId> storage_images;
+        {
+            std::lock_guard lock(context_.storage_mutex_);
+            if (context_.storage_init_semaphore_ && context_.storage_init_semaphore_ != progress_ &&
+                context_.storage_init_version_ != storage_init_seen_) {
+                waits_.push_back(context_.storage_init_semaphore_);
+                wait_values_.push_back(context_.storage_init_value_);
+                storage_init_seen_ = context_.storage_init_version_;
+            }
+            if (kind_ != QueueKind::copy && runs_shaders)
+                storage_images.assign(context_.storage_pending_.begin(), context_.storage_pending_.end());
+            if (!storage_images.empty()) context_.storage_pending_.clear();
+        }
+        for (const ResourceId id : storage_images) {
+            const ResourceBinding* image = context_.resolve(id);
+            if (!image || !image->image) continue;
+            const VkImageSubresourceRange range{image->aspects, 0, image->mip_levels, 0, image->array_layers};
+            auto pieces = detail::current(&next_tracker, id, range, VK_IMAGE_LAYOUT_UNDEFINED);
+            detail::initialize(replay, command_buffer, *image, id, pieces, VK_IMAGE_LAYOUT_GENERAL, &next_tracker);
+        }
         bool wrote_readback = false;
         VkPipelineStageFlags2 readback_stages = 0;
         std::uint32_t open_labels = 0;  // events may span the lists of one ExecuteCommandLists
@@ -1476,6 +1731,17 @@ public:
         const bool ended = context_.vk.vkEndCommandBuffer(command_buffer) == VK_SUCCESS;
         resource_lock.unlock();  // release resource_mutex_ before vkQueueSubmit while keeping tracker_lock held
         const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0);
+        if (!submitted && !storage_images.empty()) {  // not initialized after all: try again with the next submission
+            std::lock_guard lock(context_.storage_mutex_);
+            context_.storage_pending_.insert(storage_images.begin(), storage_images.end());
+        }
+        if (submitted && !storage_images.empty()) {
+            std::lock_guard lock(context_.storage_mutex_);
+            context_.storage_init_semaphore_ = progress_;
+            context_.storage_init_value_ = submitted_;
+            ++context_.storage_init_version_;
+            storage_init_seen_ = context_.storage_init_version_;
+        }
         if (submitted) {
             context_.tracker_ = std::move(next_tracker);
             slot->predicate = std::move(batch);
@@ -1542,11 +1808,107 @@ private:
         std::unique_ptr<PredicateReducer::Batch> predicate; // retained until this slot completes
     };
 
+    struct PendingBindings {
+        std::uint64_t ticket = 0;
+        // Vulkan needs the buffer until the bind completes and the previous allocation until it is unmapped.
+        std::vector<std::shared_ptr<const TileHeapAllocation>> old_heaps;
+        std::shared_ptr<SparseBuffer> buffer;
+    };
+
+    static bool valid_tiles(const SparseBuffer& buffer, BufferTileRegion region) {
+        return region.count && region.first < buffer.tile_count && region.count <= buffer.tile_count - region.first;
+    }
+
+    bool bind_tiles(const std::shared_ptr<SparseBuffer>& buffer,
+                    std::map<std::uint64_t, BufferTile>& changes) {
+        auto& vk = context_.vk;
+        if (!vk.vkQueueBindSparse || context_.is_device_lost()) return false;
+        const auto ticket = submitted_ + 1;
+        PendingBindings pending{ticket, {}, buffer};
+        std::vector<VkSparseMemoryBind> binds;
+        for (const auto& [index, page] : changes) {
+            const auto old = buffer->mapped.find(index);
+            if (old != buffer->mapped.end()) {
+                if (old->second == page) continue;
+                pending.old_heaps.push_back(old->second.heap);
+            } else if (!page.heap) {
+                continue;
+            }
+            if (page.heap && !(buffer->memory_types & (1u << page.heap->memory_type))) return false;
+            const VkDeviceMemory memory = page.heap ? page.heap->memory : VK_NULL_HANDLE;
+            const VkDeviceSize resource_offset = index * tile_size_in_bytes;
+            if (!binds.empty()) {
+                auto& previous = binds.back();
+                if (previous.resourceOffset + previous.size == resource_offset && previous.memory == memory &&
+                    (!memory || previous.memoryOffset + previous.size == page.offset)) {
+                    previous.size += tile_size_in_bytes;
+                    continue;
+                }
+            }
+            binds.push_back({resource_offset, tile_size_in_bytes, memory, page.offset, 0});
+        }
+        if (binds.empty()) return true;
+        collect_bindings(completed());
+        auto semaphores = waits_;
+        auto values = wait_values_;
+        // Sparse binds are not ordered against work on the same Vulkan queue by submission order alone.
+        if (submitted_) {
+            semaphores.push_back(progress_);
+            values.push_back(submitted_);
+        }
+        VkTimelineSemaphoreSubmitInfo tickets{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+        tickets.waitSemaphoreValueCount = std::uint32_t(values.size());
+        tickets.pWaitSemaphoreValues = values.data();
+        tickets.signalSemaphoreValueCount = 1;
+        tickets.pSignalSemaphoreValues = &ticket;
+        const VkSparseBufferMemoryBindInfo buffer_bind{buffer->buffer, std::uint32_t(binds.size()), binds.data()};
+        VkBindSparseInfo info{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO, &tickets};
+        info.waitSemaphoreCount = std::uint32_t(semaphores.size());
+        info.pWaitSemaphores = semaphores.data();
+        info.bufferBindCount = 1;
+        info.pBufferBinds = &buffer_bind;
+        info.signalSemaphoreCount = 1;
+        info.pSignalSemaphores = &progress_;
+        pending_bindings_.push_back(std::move(pending));
+        {
+            std::lock_guard lock(context_.submit_mutex());
+            const auto result = vk.vkQueueBindSparse(queue_, 1, &info, VK_NULL_HANDLE);
+            if (result != VK_SUCCESS) {
+                if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
+                pending_bindings_.pop_back();
+                return false;
+            }
+            context_.record_submit_locked(progress_, ticket);
+        }
+        submitted_ = last_sparse_ = ticket;
+        waits_.clear();
+        wait_values_.clear();
+        for (auto it = changes.begin(); it != changes.end();) {
+            buffer->mapped.erase(it->first);
+            if (it->second.heap) ++it;
+            else it = changes.erase(it);
+        }
+        buffer->mapped.merge(changes);
+        return true;
+    }
+
+    std::uint64_t completed() const {
+        std::uint64_t done = 0;
+        context_.vk.vkGetSemaphoreCounterValue(context_.device(), progress_, &done);
+        return done;
+    }
+
+    void collect_bindings(std::uint64_t done) {
+        while (!pending_bindings_.empty() && pending_bindings_.front().ticket <= done)
+            pending_bindings_.pop_front();
+        if (last_sparse_ <= done) last_sparse_ = 0;
+    }
+
     CommandSlot* acquire() {
         if (context_.is_device_lost()) return nullptr;
         context_.drain_deleted_resources(context_.completed_retire_ticket());
-        std::uint64_t done = 0;
-        context_.vk.vkGetSemaphoreCounterValue(context_.device(), progress_, &done);
+        const auto done = completed();
+        collect_bindings(done);
         CommandSlot* reuse = nullptr;
         for (auto& slot : buffers_) {
             if (slot.ticket > done) continue;
@@ -1573,8 +1935,21 @@ private:
 
     bool submit(VkCommandBuffer command_buffer, VkSemaphore fence, std::uint64_t value) {
         if (context_.is_device_lost()) return false;
-        const std::uint64_t ticket = ++submitted_;
-        const std::vector<VkPipelineStageFlags> stages(waits_.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+        const std::uint64_t ticket = submitted_ + 1;
+        if (last_sparse_) collect_bindings(completed());
+        std::span<const VkSemaphore> semaphores = waits_;
+        std::span<const std::uint64_t> values = wait_values_;
+        std::vector<VkSemaphore> sparse_waits;
+        std::vector<std::uint64_t> sparse_values;
+        if (last_sparse_) {
+            sparse_waits = waits_;
+            sparse_values = wait_values_;
+            sparse_waits.push_back(progress_);
+            sparse_values.push_back(last_sparse_);
+            semaphores = sparse_waits;
+            values = sparse_values;
+        }
+        const std::vector<VkPipelineStageFlags> stages(semaphores.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         VkResult res = VK_SUCCESS;
         {
             std::lock_guard lock(context_.submit_mutex());
@@ -1587,13 +1962,13 @@ private:
                 ++signal_count;
             }
             VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
-            timeline.waitSemaphoreValueCount = std::uint32_t(wait_values_.size());
-            timeline.pWaitSemaphoreValues = wait_values_.data();
+            timeline.waitSemaphoreValueCount = std::uint32_t(values.size());
+            timeline.pWaitSemaphoreValues = values.data();
             timeline.signalSemaphoreValueCount = signal_count;
             timeline.pSignalSemaphoreValues = signal_values;
             VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO, &timeline};
-            submit.waitSemaphoreCount = std::uint32_t(waits_.size());
-            submit.pWaitSemaphores = waits_.data();
+            submit.waitSemaphoreCount = std::uint32_t(semaphores.size());
+            submit.pWaitSemaphores = semaphores.data();
             submit.pWaitDstStageMask = stages.data();
             submit.commandBufferCount = command_buffer ? 1 : 0;
             submit.pCommandBuffers = &command_buffer;
@@ -1610,6 +1985,7 @@ private:
         }
         const bool ok = (res == VK_SUCCESS);
         if (ok) {
+            submitted_ = ticket;
             waits_.clear();
             wait_values_.clear();
             for (auto& slot : buffers_)
@@ -1627,8 +2003,14 @@ private:
     std::uint64_t submitted_ = 0;
     std::vector<CommandSlot> buffers_;
     std::unique_ptr<OcclusionResolve> occlusion_resolve_;
+    std::uint64_t storage_init_seen_ = 0;  // the storage_init_version_ this queue has waited for
+    std::uint64_t last_sparse_ = 0;
+    std::deque<PendingBindings> pending_bindings_;
     std::vector<VkSemaphore> waits_;
     std::vector<std::uint64_t> wait_values_;
+    // execute's working storage. Per queue like buffers_: one execute at a time on a queue, as acquire() and
+    // submit() already assume; other queues prepare concurrently with their own.
+    std::vector<PreparedList> prepared_;
     std::uint32_t open_labels_ = 0;  // queue labels begun and not ended
     bool ok_ = false;
 };

@@ -233,9 +233,16 @@ def grass_list(V, P, blocks, structs, buf, lo, R):
         return
     ib, io, n = ref
     isz = structs.get(GRASS_INST, (0x10, {}))[0] or 0x10
-    nx, ny = member(structs, GRASS_INST, "NormalX") or 6, member(structs, GRASS_INST, "NormalY") or 7
-    sz, rot = member(structs, GRASS_INST, "ScaleZ") or 0xC, member(structs, GRASS_INST, "RotationIdx") or 0xD
-    sc = member(structs, GRASS_INST, "Scale") or 0xB
+
+    def field_offset(field: str, default: int) -> int:
+        offset = member(structs, GRASS_INST, field)
+        return default if offset is None else offset
+
+    nx = field_offset("NormalX", 6)
+    ny = field_offset("NormalY", 7)
+    sz = field_offset("ScaleZ", 0xC)
+    rot = field_offset("RotationIdx", 0xD)
+    sc = field_offset("Scale", 0xB)
     add(R, "instances", n)
     rmax = 0
     for i in range(n):
@@ -357,7 +364,7 @@ def main(argv=None):
     if args.json:
         try:
             os.makedirs(os.path.dirname(os.path.abspath(args.json)), exist_ok=True)
-            with open(args.json, "w", encoding="utf-8") as fh:
+            with open(args.json, "w", encoding="utf-8", newline="\n") as fh:
                 json.dump(T, fh, indent=1, sort_keys=True)
         except OSError as exc:
             print(f"error: cannot write {args.json}: {exc.strerror or exc}", file=sys.stderr)

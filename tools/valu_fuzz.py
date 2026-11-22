@@ -303,9 +303,8 @@ def f16_op(name, a, b, c=None):
         pick = (va >= vb) if name == "max" else (va <= vb)
         return (a if pick else b) & M16, False
     if name == "med3":
-        vals = sorted([(va, a), (vb, b), (vc, c)], key=lambda x: x[0])
-        if len({v for v, _ in vals}) < 3 and len({h & M16 for _, h in vals}) == 3:
-            return 0, True
+        # Half decoding loses the sign of zero. The documented med3 ordering puts -0 before +0.
+        vals = sorted(((va, a), (vb, b), (vc, c)), key=lambda item: (item[0], -f16_sign(item[1])))
         return vals[1][1] & M16, False
     raise ValueError(name)
 
@@ -845,7 +844,7 @@ def translate(progs, work, emulate):
     for p in progs:
         text = p.asm()
         asm_path = work / (p.name + ".asm")
-        asm_path.write_text(text, encoding="utf-8")
+        asm_path.write_text(text, encoding="utf-8", newline="\n")
         cmd = mc + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding"]
         if p.wave == 64:
             cmd.append("-mattr=+wavefrontsize64,-wavefrontsize32")
@@ -853,7 +852,7 @@ def translate(progs, work, emulate):
         if r.returncode or "error:" in r.stderr:
             raise RuntimeError(f"{p.name} did not assemble:\n{r.stderr}")
         code = "".join(ln for ln in r.stdout.splitlines(keepends=True) if not ln.lstrip().startswith("."))
-        (disasm / (p.name + ".s")).write_text(f"; {p.name}\n{code}", encoding="utf-8")
+        (disasm / (p.name + ".s")).write_text(f"; {p.name}\n{code}", encoding="utf-8", newline="\n")
         (fssm / (p.name + ".fssm")).write_bytes(compute_header(asm_path))
     cmd = [sys.executable, "-I", os.path.join(HERE, "rdna2spirv.py"), str(disasm), "--out", str(spirv)]
     if emulate:

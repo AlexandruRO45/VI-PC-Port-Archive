@@ -4,8 +4,9 @@ awc_opus.py writes <out>/<bank>/<stream id>.ogg with an empty OpusTags header. T
 from two local work products:
 
 ``--names``     awc_names.py CSV (source, bank, stream_id, name, rule). A file is matched by its stream id (the file
-                name) and its bank (the folder path below the Opus folder; if that has no match, the path with its
-                leading folders removed one at a time, so the Opus folder may hold several archives' outputs).
+                name; awc_opus.py's ``<id>~2.ogg`` for a second stream with the same id gets the same name) and its
+                bank (the folder path below the Opus folder; if that has no match, the path with its leading folders
+                removed one at a time, so the Opus folder may hold several archives' outputs).
 ``--dialogue``  text_tables.py dialogue CSV (wave, key, label, speaker, text_<lang> ...). A named stream whose name is
                 a dialogue wave gets that line's label, speaker and subtitles.
 
@@ -40,7 +41,7 @@ from awc_opus import ogg_page, write_file  # noqa: E402
 VENDOR = b"leonida "
 MARKUP = re.compile(r"~[^~]*~")
 SPACES = re.compile(r"\s+")
-STREAM_FILE = re.compile(r"^([0-9A-Fa-f]{8})\.ogg$")
+STREAM_FILE = re.compile(r"^([0-9A-Fa-f]{8})(?:~\d+)?\.ogg$")   # <id>~2 ...: a later stream with the same id
 MAX_PACKET = 255 * 255 - 1          # lacing values of one page: 254 full segments and a final short one
 
 
@@ -84,6 +85,8 @@ def retag(data: bytes, packet: bytes) -> bytes:
     segments = data[tags_at + 27:tags_at + 27 + data[tags_at + 26]]
     if not segments or segments[-1] == 255:
         raise ValueError("the OpusTags packet continues past page 1")
+    if any(segment != 255 for segment in segments[:-1]):
+        raise ValueError("the OpusTags page contains another packet")
     serial, seq = struct.unpack_from("<II", data, tags_at + 14)
     if seq != 1:
         raise ValueError("the OpusTags page is not page 1")
@@ -93,7 +96,7 @@ def retag(data: bytes, packet: bytes) -> bytes:
 def load_names(path, source=None):
     """{bank label: {29-bit stream id: name}} from awc_names.py CSV."""
     out = collections.defaultdict(dict)
-    with open(path, encoding="utf-8", newline="") as fh:
+    with open(path, encoding="utf-8-sig", newline="") as fh:
         for row in csv.DictReader(fh):
             if source and row.get("source") != source:
                 continue
@@ -103,7 +106,7 @@ def load_names(path, source=None):
 
 def load_dialogue(path):
     """{wave: row} from text_tables.py dialogue CSV, and the language codes in column order."""
-    with open(path, encoding="utf-8", newline="") as fh:
+    with open(path, encoding="utf-8-sig", newline="") as fh:
         reader = csv.DictReader(fh)
         langs = [f[5:] for f in reader.fieldnames or [] if f.startswith("text_")]
         return {row["wave"].lower(): row for row in reader}, langs
@@ -112,7 +115,7 @@ def load_dialogue(path):
 def comments(name, line, langs):
     out = [("TITLE", name)]
     if line:
-        texts = [(lang, clean(line.get(f"text_{lang}", ""))) for lang in langs]
+        texts = [(lang, clean(line.get(f"text_{lang}") or "")) for lang in langs]
         texts = [(lang, t) for lang, t in texts if t]
         main = dict(texts).get("en") or (texts[0][1] if texts else "")
         out += [("LABEL", line.get("label", "")), ("SPEAKER", line.get("speaker", "")), ("SUBTITLE", main)]
@@ -121,12 +124,16 @@ def comments(name, line, langs):
 
 
 def bank_names(names, rel_dir):
-    """The stream names of the bank in `rel_dir`, trying shorter paths from the left when the full path is unknown."""
+    """The stream names of the bank in `rel_dir`, trying shorter paths from the left when the full path is unknown.
+    Each path is tried as is, then with ".awc": awc_names.py labels a bank read from an audio_manifest.json with
+    its archive path, extension included, while awc_opus.py's folder has none. A label as is wins."""
     parts = rel_dir.split("/")
     for i in range(len(parts)):
-        found = names.get("/".join(parts[i:]))
-        if found is not None:
-            return found
+        path = "/".join(parts[i:])
+        for label in (path, path + ".awc"):
+            found = names.get(label)
+            if found is not None:
+                return found
     return None
 
 
