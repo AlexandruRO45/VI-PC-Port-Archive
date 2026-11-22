@@ -4,25 +4,26 @@
 #include <xaudio2.h>
 
 #include "shims.h"
+#include "xaudio2_module.h"
 
 namespace {
 
 using XAudio2CreateFn = HRESULT(WINAPI*)(IXAudio2**, UINT32, XAUDIO2_PROCESSOR);
 
-HMODULE host_xaudio2_module() {
-    static HMODULE module = LoadLibraryExW(L"xaudio2_9.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    return module;
+rt::shims::xaudio2::detail::ModuleLoad host_xaudio2_module() {
+    static const auto result = rt::shims::xaudio2::detail::load_module(
+        [] { return LoadLibraryExW(L"xaudio2_9.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32); });
+    return result;
 }
 
 HRESULT WINAPI create_xaudio2(IXAudio2** out_engine, UINT32 flags, XAUDIO2_PROCESSOR processor) {
-    HMODULE module = host_xaudio2_module();
-    if (!module) {
-        const DWORD error = GetLastError();
+    const auto host = host_xaudio2_module();
+    if (!host.module) {
         if (out_engine) *out_engine = nullptr;
-        return error ? HRESULT_FROM_WIN32(error) : E_FAIL;
+        return host.error ? HRESULT_FROM_WIN32(host.error) : E_FAIL;
     }
 
-    auto create = reinterpret_cast<XAudio2CreateFn>(GetProcAddress(module, "XAudio2Create"));
+    auto create = reinterpret_cast<XAudio2CreateFn>(GetProcAddress(host.module, "XAudio2Create"));
     if (!create) {
         const DWORD error = GetLastError();
         if (out_engine) *out_engine = nullptr;

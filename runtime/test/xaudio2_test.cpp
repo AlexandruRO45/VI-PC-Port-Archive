@@ -5,6 +5,7 @@
 #include <string>
 
 #include "shims.h"
+#include "xaudio2_module.h"
 
 namespace {
 
@@ -34,9 +35,18 @@ void test_factory(const char* dll) {
     if (engine) engine->Release();
 }
 
+void test_load_error_is_cached_with_module_result() {
+    SetLastError(ERROR_MOD_NOT_FOUND);
+    const auto load = rt::shims::xaudio2::detail::load_module([]() -> HMODULE { return nullptr; });
+    SetLastError(ERROR_INVALID_HANDLE);
+    check(load.module == nullptr, "failed host load remains represented as a null module");
+    check(load.error == ERROR_MOD_NOT_FOUND, "failed host load preserves the original error");
+}
+
 }  // namespace
 
 int main() {
+    test_load_error_is_cached_with_module_result();
     test_factory("xaudio2_9.dll");
     test_factory("xaudio2_9redist.dll");
     if (g_failures) {
