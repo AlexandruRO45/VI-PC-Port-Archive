@@ -892,5 +892,78 @@ class TestRegisterAliasingAndOperandPreservation(unittest.TestCase):
                 self.assertEqual(state.get_lane_vgpr(lane, r), expected)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+class TestConditionCodesStatusFlagsAndCarryBorrow(unittest.TestCase):
+    """Phase 6: Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def test_scc_asserted_on_barrier_satisfaction(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        state.scc = 0
+        state.set_vgpr(0, 1)
+
+        instr = DSGWSBarrierPInstruction(vdata0=RegisterOperand(0, RegType.VGPR), offset=0)
+        interp.execute(instr, state, wave_id=1)
+        self.assertEqual(state.scc, 1)
+
+    def test_scc_cleared_when_barrier_pending(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        state.scc = 1
+        state.set_vgpr(0, 3)
+
+        instr = DSGWSBarrierPInstruction(vdata0=RegisterOperand(0, RegType.VGPR), offset=0)
+        interp.execute(instr, state, wave_id=1)
+        self.assertEqual(state.scc, 0)
+
+    def test_vcc_preserved(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        state.vcc = 0x11223344_55667788
+        state.set_vgpr(0, 1)
+
+        instr = DSGWSBarrierPInstruction(vdata0=RegisterOperand(0, RegType.VGPR), offset=0)
+        interp.execute(instr, state, wave_id=1)
+        self.assertEqual(state.vcc, 0x11223344_55667788)
+
+    def test_status_flags_barrier_satisfied_and_zero(self) -> None:
+        st1 = evaluate_gws_barrier_p_status(target_count=2, current_arrived=0)
+        self.assertFalse(st1["barrier_satisfied"])
+        self.assertFalse(st1["predicate_passed"])
+        self.assertFalse(st1["arrived_zero"])
+        self.assertEqual(st1["scc_predicate"], 0)
+
+        st2 = evaluate_gws_barrier_p_status(target_count=2, current_arrived=1)
+        self.assertTrue(st2["barrier_satisfied"])
+        self.assertTrue(st2["predicate_passed"])
+        self.assertTrue(st2["arrived_zero"])
+        self.assertEqual(st2["scc_predicate"], 1)
+
+    def test_status_flags_offset_carry_out(self) -> None:
+        st_no_carry = evaluate_gws_barrier_p_status(target_count=1, current_arrived=0, offset=10, m0=20)
+        self.assertFalse(st_no_carry["offset_carry_out_16"])
+        self.assertFalse(st_no_carry["offset_carry_out_32"])
+
+        st_carry_16 = evaluate_gws_barrier_p_status(target_count=1, current_arrived=0, offset=0x0020, m0=0xFFF0)
+        self.assertTrue(st_carry_16["offset_carry_out_16"])
+        self.assertFalse(st_carry_16["offset_carry_out_32"])
+
+        st_carry_32 = evaluate_gws_barrier_p_status(target_count=1, current_arrived=0, offset=1, m0=0xFFFFFFFF)
+        self.assertTrue(st_carry_32["offset_carry_out_32"])
+
+    def test_status_flags_wave_activity(self) -> None:
+        st_active = evaluate_gws_barrier_p_status(target_count=1, current_arrived=0, exec_mask=0x1)
+        self.assertTrue(st_active["active_wave"])
+
+        st_inactive = evaluate_gws_barrier_p_status(target_count=1, current_arrived=0, exec_mask=0x0)
+        self.assertFalse(st_inactive["active_wave"])
+
+
 if __name__ == "__main__":
     unittest.main()
