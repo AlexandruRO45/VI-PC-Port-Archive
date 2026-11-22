@@ -1088,7 +1088,30 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Use Zig's normal single-threaded console startup, including RtlExitUserProcess.
     enable_language(C)
     set(archive_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/archive")
-    add_library(archive_codec SHARED "${archive_src}/codec.cpp" "${archive_src}/blast/blast.c")
+    # Keep the scalar reference PE identical across the Debug and /O2 host builds.
+    set(blast_obj "${CMAKE_CURRENT_BINARY_DIR}/blast_scalar.obj")
+    add_custom_command(OUTPUT "${blast_obj}"
+        COMMAND "${CMAKE_C_COMPILER}" /nologo /c /MD /Od /GS- /Gs65536 /Zl "/Fo${blast_obj}" "${archive_src}/blast/blast.c"
+        DEPENDS "${archive_src}/blast/blast.c" "${archive_src}/blast/blast.h" VERBATIM)
+    add_library(blast_source SHARED "${blast_obj}" "${archive_src}/blast.def")
+    set_target_properties(blast_source PROPERTIES LINKER_LANGUAGE C)
+    target_link_options(blast_source PRIVATE /NOENTRY /NODEFAULTLIB /INCREMENTAL:NO)
+    target_link_libraries(blast_source PRIVATE msvcrt ucrt vcruntime)
+
+    set(blast_cpp "${CMAKE_CURRENT_BINARY_DIR}/blast_lifted.cpp")
+    add_custom_command(OUTPUT "${blast_cpp}"
+        COMMAND "${CMAKE_COMMAND}" -E env "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/tools"
+            "${INTAKE_PYTHON}" -B "${archive_src}/translate_blast.py" "$<TARGET_FILE:blast_source>" "${blast_cpp}"
+        DEPENDS blast_source "${archive_src}/translate_blast.py" "${archive_src}/blast_runtime.hpp"
+            tools/cpu_switch_aot.py tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(blast_lifted SHARED "${blast_cpp}" "${archive_src}/blast.def")
+    target_include_directories(blast_lifted PRIVATE "${archive_src}")
+
+    add_library(archive_codec_lifted SHARED "${archive_src}/codec.cpp")
+    target_link_libraries(archive_codec_lifted PRIVATE blast_lifted)
+    set_target_properties(archive_codec_lifted PROPERTIES MSVC_RUNTIME_LIBRARY MultiThreadedDLL)
+    add_library(archive_codec SHARED "${archive_src}/codec.cpp")
+    target_link_libraries(archive_codec PRIVATE blast_source)
     set_target_properties(archive_codec PROPERTIES MSVC_RUNTIME_LIBRARY MultiThreadedDLL)
     set(archive_exe "${CMAKE_CURRENT_BINARY_DIR}/archive_reader.exe")
     add_custom_command(OUTPUT "${archive_exe}"
@@ -1107,6 +1130,13 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_native_archive_reader COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/archive_check.py" "$<TARGET_FILE:pe_map>"
         "${archive_exe}" "$<TARGET_FILE:archive_reader_lifted>" "$<TARGET_FILE:archive_codec>")
+
+    add_executable(archive_all_lifted "${archive_cpp}")
+    target_link_libraries(archive_all_lifted PRIVATE archive_codec_lifted ntdll)
+    add_test(NAME cpu_native_archive_blast COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/archive_check.py" "$<TARGET_FILE:pe_map>"
+        "${archive_exe}" "$<TARGET_FILE:archive_all_lifted>" "$<TARGET_FILE:archive_codec>"
+        "$<TARGET_FILE:blast_source>" "$<TARGET_FILE:blast_lifted>" "$<TARGET_FILE:archive_codec_lifted>")
 
     function(crc_line_program target polynomial)
         # Use the same optimized source PE as input to both Debug and Release AOT builds.

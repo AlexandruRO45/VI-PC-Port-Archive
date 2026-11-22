@@ -43,6 +43,19 @@ cmake --build --preset dev --target archive_reader_lifted pe_map
 ctest --preset dev --no-tests=error -R '^cpu_native_archive_reader$' -V
 ```
 
+### Recompiling the blast decoder
+
+The `cpu_native_archive_blast` test starts from the same archive reader and builds the unmodified blast 1.3 C file into a separate scalar x64 DLL with MSVC /Od. The [fixture translator](../tests/cpu/archive/translate_blast.py) follows direct calls from its PE export through the bit reader, Huffman table construction, symbol decoder and decompression loop. It reuses the x64 instruction lifter and frame analysis. Only generated C++ is compiled into the translated decoder. Its initialized data, including relocated table pointers, is separate from the native module. This profile uses per-thread tables, a bounded invocation stack, the six-argument blast ABI and two typed callback targets. The host supplies setjmp/longjmp semantics for a single active recovery point. The file I/O and allocation callbacks remain native.
+
+On the MSVC 19.51 build, tracing the generated callback sites for the two streams reached the input call at RVA `0x11e0` and the final output call at `0x115d`. With the second stream truncated, the input calls returned 4 then 0 bytes, the call at `0x1206` took the longjmp path, and the final output callback received one tentative byte. This byte remained unpublished. The two short streams do not exercise a full 4096-byte window flush.
+
+Windows loads the original decoder for the native run. The mapped child separately maps the original decoder, codec adapter and reader, binding each import to the preceding mapping's export. The AOT reader imports an adapter linked to the translated decoder; PE import checks guard against falling back to the original. Both archive outcomes match the byte and event traces above. A direct callback control on both decoder DLLs refuses output and checks both context pointers, the delivered bytes, and blast's error return of 1.
+
+```powershell
+cmake --build --preset dev --target archive_all_lifted pe_map
+ctest --preset dev --no-tests=error -R '^cpu_native_archive_blast$' -V
+```
+
 ## CRC-32 console program from the PE entry
 
 `cpu_crc_line` reads the first text line from stdin and writes eight uppercase hexadecimal digits and a newline. Its [MASM entry](../tests/cpu/crc_line/entry.asm) handles input, formatting and exit status. MSVC compiles the [CRC update](../tests/cpu/crc_line/crc_step.cpp) as a separate optimized object. The linker imports the real Windows Universal CRT stdio functions through `ucrt.lib`. The source PE has a return-based entry and uses no CRT startup stub.

@@ -40,7 +40,7 @@ class Mapper:
         self.release.restype = ctypes.c_int  # 1 released, 0 unknown or already released
 
     def __call__(self, image, bindings):
-        """Map image; bindings maps a lower-case DLL name to the module that serves its imports."""
+        """Map image; bindings maps a DLL name to a host module or a dictionary of mapped export addresses."""
         requests = []
 
         def resolve(dll, name, ordinal):
@@ -48,6 +48,8 @@ class Mapper:
             module = bindings.get(dll.decode().casefold())
             if module is None:
                 return None
+            if isinstance(module, dict):
+                return module.get(name if name else ordinal)
             return kernel.GetProcAddress(module._handle, name if name else ordinal)
 
         callback = Resolver(resolve)

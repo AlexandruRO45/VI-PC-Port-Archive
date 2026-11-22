@@ -436,7 +436,7 @@ class Function:
         code = image_bytes(self.pe, target, 6, executable=True)
         return target + 6 + int.from_bytes(code[2:], "little", signed=True)
 
-    def explore(self, imports=None):
+    def explore(self, imports=None, *, callback_calls=False):
         pending = [self.entry]
         indirect = []
         while pending or indirect:
@@ -479,6 +479,11 @@ class Function:
                   and not ins.has_segment_prefix and ins.ip_rel_memory_address in imports):
                 self.host_calls[ip] = imports[ins.ip_rel_memory_address]
                 self.calls[ip] = ins.ip_rel_memory_address
+                targets = [ins.next_ip]
+            elif (callback_calls and ins.code == Code.CALL_RM64 and not ins.has_segment_prefix
+                  and ins.op0_kind == OpKind.MEMORY and ins.memory_base != R.RIP):
+                # The callback-aware emitter must check the loaded pointer against its typed bindings.
+                self.calls[ip] = None
                 targets = [ins.next_ip]
             elif flow == FlowControl.RETURN and ins.mnemonic == M.RET and (ins.op_count == 0 or ins.immediate(0) == 0):
                 targets = []
@@ -977,6 +982,9 @@ class Frame:
     8 mod 16: with RSP + 8 a multiple of 16 at entry, as the ABI requires, every array byte then has the address
     residue mod 16 of the stack byte it stands for. It ends with the home space at entry RSP + 40."""
 
+    frame_limit = MAX_FRAME
+    incoming_end = HOME_END
+
     def __init__(self, function):
         self.offsets, self.accesses, self.adjustments, self.released = {function.entry: 0}, {}, set(), {}
         work = [function.entry]
@@ -1002,15 +1010,15 @@ class Frame:
         low = min(self.offsets.values())
         self.start = low - (low + 8) % 16
         self.size = HOME_END - self.start
-        if self.size > MAX_FRAME:
-            raise ValueError(f"frame of {self.size} bytes exceeds the {MAX_FRAME}-byte bound")
+        if self.size > self.frame_limit:
+            raise ValueError(f"frame of {self.size} bytes exceeds the {self.frame_limit}-byte bound")
 
     def access(self, ins, rsp, offset, width, reads, writes):
         if offset < rsp:
             raise ValueError(f"stack access below RSP at RVA {ins.ip:#x}")
         if offset < 8 and offset + width > 0:
             raise ValueError(f"return address slot accessed at RVA {ins.ip:#x}")
-        if offset + width > HOME_END:
+        if offset + width > self.incoming_end:
             raise ValueError(f"unsupported stack argument at RVA {ins.ip:#x}: entry RSP{offset:+#x}")
         self.accesses[ins.ip] = (offset, width, reads, writes)
 
