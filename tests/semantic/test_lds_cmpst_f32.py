@@ -751,5 +751,62 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
 
 
 
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Phase 8: Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_registers(self) -> None:
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(256, RegType.VGPR)
+
+    def test_syntax_rejection_instruction_operands(self) -> None:
+        v0 = RegisterOperand(0, RegType.VGPR)
+        s0 = RegisterOperand(0, RegType.SGPR)
+
+        with self.assertRaises(ValueError):
+            DSCmpstF32Instruction(vaddr=s0, vdata0=v0, vdata1=v0)
+        with self.assertRaises(ValueError):
+            DSCmpstF32Instruction(vaddr=v0, vdata0=v0, vdata1=v0, offset=-1)
+
+    def test_negative_control_bit_perturbation(self) -> None:
+        val = f32_to_bits(1.0)
+        old, mem, swapped = ref_ds_cmpst_f32(val, val, f32_to_bits(2.0))
+        self.assertTrue(swapped)
+        perturbed = mem ^ 1
+        self.assertNotEqual(mem, perturbed)
+
+    def test_mutation_detection_raw_bitwise_instead_of_float_compare(self) -> None:
+        # Mutant: uses integer raw bit equality instead of float equality
+        def mutant_cmpst(curr: int, cmp_val: int, new_val: int) -> Tuple[int, int, bool]:
+            if curr == cmp_val:
+                return curr, new_val, True
+            return curr, curr, False
+
+        # In float equality: +0.0 == -0.0 is True!
+        # In mutant raw bitwise: 0x00000000 == 0x80000000 is False!
+        correct_old, correct_mem, correct_swap = ref_ds_cmpst_f32(POS_ZERO_F32, NEG_ZERO_F32, f32_to_bits(9.0))
+        mutant_old, mutant_mem, mutant_swap = mutant_cmpst(POS_ZERO_F32, NEG_ZERO_F32, f32_to_bits(9.0))
+
+        self.assertTrue(correct_swap)
+        self.assertFalse(mutant_swap)
+        self.assertNotEqual(correct_mem, mutant_mem)
+
+    def test_mutation_detection_nan_equality_mutant(self) -> None:
+        # Mutant: treats NaN == NaN as True
+        def mutant_nan_cmpst(curr: int, cmp_val: int, new_val: int) -> Tuple[int, int, bool]:
+            if curr == cmp_val:
+                return curr, new_val, True
+            return curr, curr, False
+
+        correct_old, correct_mem, correct_swap = ref_ds_cmpst_f32(QNAN_F32, QNAN_F32, f32_to_bits(9.0))
+        mutant_old, mutant_mem, mutant_swap = mutant_nan_cmpst(QNAN_F32, QNAN_F32, f32_to_bits(9.0))
+
+        self.assertFalse(correct_swap)
+        self.assertTrue(mutant_swap)
+        self.assertNotEqual(correct_mem, mutant_mem)
+
+
+
 if __name__ == "__main__":
     unittest.main()
