@@ -71,7 +71,9 @@ jobs:
           cache: true
           cache-dependency-path: "**/packages.lock.json"
       - name: Python tools compile
-        run: python -m compileall -q make_game.py tools tests
+        run: python -m compileall -q make_game.py leonida_gui.py gui tools tests
+      - name: Codebase validation self-check
+        run: python -I tools/validate.py code
       - name: make_game.py help
         run: python -I make_game.py --help
       - name: Tests (standard library only, no game data)
