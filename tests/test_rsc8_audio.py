@@ -606,6 +606,33 @@ class AwcAndArchiveScanTest(unittest.TestCase):
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn("output must not overwrite the source file", result.stderr)
 
+    def test_cli_directory_report_cannot_replace_a_bank(self):
+        clip = build_synthetic_rsc8(stream_hash=0x20112233, frames=90)
+        original = build_synthetic_awc([{"id": 0x00112233, "rsc8": clip, "samples": 48000}])
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.join(tmp, "banks")
+            os.mkdir(folder)
+            source = os.path.join(folder, "bank.awc")
+            with open(source, "wb") as f:
+                f.write(original)
+
+            destinations = [source]
+            alias = os.path.join(tmp, "alias.json")
+            try:
+                os.link(source, alias)
+            except (OSError, NotImplementedError):
+                pass
+            else:
+                destinations.append(alias)
+            for target in destinations:
+                with self.subTest(target=target):
+                    result = subprocess.run([sys.executable, "-I", TOOL, folder, target, "--quiet"],
+                                            capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("output must not overwrite the source file", result.stderr)
+                    with open(source, "rb") as f:
+                        self.assertEqual(f.read(), original)
+
     def test_window_edges_inside_a_bank(self):
         """--start/--limit inside a bank: adat_bytes stays within the span, and RSC8 headers in a bank that
         started before the window are not reported as outside ADAT."""
