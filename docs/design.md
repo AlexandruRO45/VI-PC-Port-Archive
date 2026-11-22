@@ -302,6 +302,28 @@ The runtime is validated without any retail package: `gta6rt --run leonida_test_
 leonida_shims.dll` drives loader → shim tables → D3D12/DXGI → shared-device Vulkan → present window, and is what
 `runtime/README.md` calls the self-check.
 
+### What the container shows (measured, `tools/msixvc_inspect.py`)
+
+`tools/msixvc_inspect.py` is a read-only report of an MSIXVC container: header fields, printable strings, entropy, a
+signature scan (validated, so a four-byte magic in ten gigabytes of noise is not mistaken for a structure) and an
+optional extraction of plaintext XML documents. It performs no decryption and no key or licence handling. Measured
+on the Phantom Dust package:
+
+- header: `EXPH`, `u32` 344 at `0x04`, and at `0x38` a `u64` of 10,206,273,008 — the package size minus 15,517
+  bytes. Cleartext UTF-16 strings at `0x78`: the package identity
+  `Microsoft.MSEsper_0.0.0.0_x64__8wekyb3d8bbwe`, then `XTS-AES` and `http://www.w3.org/2001/04/xmlenc#sha256`;
+- entropy is 7.95–8.00 bits/byte in every window outside the first few kilobytes: the payload is compressed and
+  encrypted, and there is no readable file table in the clear;
+- over the whole 10,206,288,525 bytes: **0 PE images** (the `This program cannot be run in DOS mode` stub never
+  occurs), 0 validated ZIP structures (the two `PK` hits are random bytes), no `AppxManifest.xml`,
+  `AppxBlockMap.xml` or `[Content_Types].xml`;
+- exactly **one plaintext document**: an Xbox `NetworkManifest`
+  (`http://schemas.microsoft.com/xbox/2012/networkmanifest`, 1,446 bytes) at `0x25f11a2c9`, extracted by the tool.
+
+So the executable and the DLLs exist only in encrypted form, and nothing the loader could run is stored in the
+clear. This is the line `AGENTS.md` draws; the tool stops there.
+
+
 ## Day one, in order
 
 1. `scripts\first_look.ps1 -Exe ...` checks the exe is plain, lists the imports to shim, and does a dry run.
