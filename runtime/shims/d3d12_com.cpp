@@ -782,6 +782,29 @@ public:
         check(list_.copy_acceleration_structure({dest, source, static_cast<std::uint32_t>(mode)}));
     }
 
+    // GCL1. Kept for every later draw. 0 samples returns to the standard positions. Otherwise `pixels` is 1 (every
+    // pixel) or 4 (a 2x2 quad repeating from the target's origin), and `positions` holds samples * pixels entries in
+    // 1/16 pixel from the centre, -8..7 on each axis, as D3D12 requires. Anything else is an invalid call.
+    void STDMETHODCALLTYPE SetSamplePositions(UINT samples, UINT pixels, D3D12_SAMPLE_POSITION* positions) override {
+        if (!samples) {
+            sample_count_ = 0;
+            sample_pixels_ = 1;
+            return;
+        }
+        if (samples > 16 || (samples & (samples - 1)) || (pixels != 1 && pixels != 4) || !positions)
+            return check(false);
+        std::array<std::int8_t, 2 * 16 * 4> values{};  // validated whole before any of it is kept
+        for (UINT i = 0; i < samples * pixels; ++i) {
+            if (positions[i].X < -8 || positions[i].X > 7 || positions[i].Y < -8 || positions[i].Y > 7)
+                return check(false);
+            values[2 * i] = positions[i].X;
+            values[2 * i + 1] = positions[i].Y;
+        }
+        sample_count_ = samples;
+        sample_pixels_ = pixels;
+        sample_positions_ = values;
+    }
+
     static GraphicsCommandList* from(IUnknown* object) { return Child::from<GraphicsCommandList>(object); }
 
 private:
@@ -970,6 +993,9 @@ private:
     bool invalid_ = false;
     UINT front_stencil_ref_ = 0;
     UINT back_stencil_ref_ = 0;
+    std::uint32_t sample_count_ = 0;  // SetSamplePositions; 0: the standard positions
+    std::uint32_t sample_pixels_ = 1;
+    std::array<std::int8_t, 2 * 16 * 4> sample_positions_{};
     RootState compute_;
     RootState graphics_;
     std::uintptr_t compute_pipeline_ = 0;
@@ -1036,6 +1062,8 @@ private:
 
     void reset_state(ID3D12PipelineState* state) {
         front_stencil_ref_ = back_stencil_ref_ = 0;
+        sample_count_ = 0;
+        sample_pixels_ = 1;
         compute_ = {};
         graphics_ = {};
         topology_ = 0;
@@ -1076,7 +1104,8 @@ private:
         leonida::Draw draw{graphics_pipeline_, graphics_.data, render_targets_, depth_,
                            vertex_buffers_, index_, topology_, viewport_, scissor_,
                            blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances, first,
-                           base_vertex, first_instance, render_target_count_};
+                           base_vertex, first_instance, render_target_count_, sample_count_, sample_pixels_,
+                           sample_positions_};
         check(list_.draw(std::move(draw)));
     }
 };

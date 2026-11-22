@@ -159,6 +159,10 @@ struct VulkanDeviceInfo {
     // writes the layer or viewport declares ShaderLayer / ShaderViewportIndex (the index's `features`).
     bool shader_output_layer = false;
     bool shader_output_viewport_index = false;
+    // VK_EXT_sample_locations enabled on `device`: the sample counts (its sampleLocationSampleCounts) whose
+    // multisampled pipelines take SetSamplePositions. 0: the extension is off and the positions are the standard
+    // ones whatever the list sets.
+    VkSampleCountFlags sample_locations = 0;
     // The translator's output folder (spirv/index.json + <name>.spv) for pipeline creation; empty: the
     // LEONIDA_SHADERS environment variable.
     std::string shader_dir;

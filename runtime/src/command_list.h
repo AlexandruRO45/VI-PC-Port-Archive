@@ -417,6 +417,12 @@ struct Draw {
     std::int32_t base_vertex = 0;
     std::uint32_t first_instance = 0;
     std::uint32_t render_target_count = 8;
+    // SetSamplePositions (ID3D12GraphicsCommandList1): 0 samples means the standard positions. Otherwise
+    // sample_positions holds x, y pairs in 1/16 pixel from the pixel centre (-8..7), sample_count per pixel, for
+    // sample_pixels pixels (1, or 4 for a 2x2 quad). Inline (16 samples, 4 pixels) so a draw allocates nothing.
+    std::uint32_t sample_count = 0;
+    std::uint32_t sample_pixels = 1;
+    std::array<std::int8_t, 2 * 16 * 4> sample_positions{};
 };
 
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
