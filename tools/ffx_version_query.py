@@ -154,6 +154,10 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
     wide_any = {**wide, **wide_xmm}
     avx2_wide_ops = (M.VPBROADCASTB, M.VPBROADCASTW, M.VPBROADCASTD, M.VPBROADCASTQ,
                      M.VPSLLVD, M.VPSRLVD, M.VPSRAVD, M.VPSLLVQ, M.VPSRLVQ)
+    pmov_ext = {
+        getattr(M, f"PMOV{k.upper()}{p.upper()}"): (k == "sx", {"b": 1, "w": 2, "d": 4}[p[0]], {"w": 2, "d": 4, "q": 8}[p[1]])
+        for k in ("sx", "zx") for p in ("bw", "bd", "bq", "wd", "wq", "dq")
+    }
     sse41_ops = (M.PMINSB, M.PMAXSB, M.PMINUW, M.PMAXUW, M.PMINSD, M.PMAXSD,
                  M.PMINUD, M.PMAXUD, M.PMULLD, M.PMULDQ, M.PCMPEQQ, M.PACKUSDW, M.PBLENDW, M.PBLENDVB)
     sse2_sat_mul_ops = {
@@ -161,7 +165,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
         M.PMULHW, M.PMULHUW, M.PMULLW, M.PMADDWD, M.PMULUDQ,
         M.PMINUB, M.PMAXUB, M.PMINSW, M.PMAXSW, M.PAVGB, M.PAVGW, M.PSADBW,
     }
-    has_wide = any(i.mnemonic in (M.VMOVUPS, M.MOVDQU, *avx2_wide_ops, *sse41_ops) or i.mnemonic in sha_ops or i.mnemonic in sse2_sat_mul_ops for i in body)
+    has_wide = any(i.mnemonic in (M.VMOVUPS, M.MOVDQU, *avx2_wide_ops, *sse41_ops) or i.mnemonic in sha_ops or i.mnemonic in pmov_ext or i.mnemonic in sse2_sat_mul_ops for i in body)
     if any(i.code in STRING_OPS or i.mnemonic in (M.CLD, M.STD) for i in body):
         # The x64 software conventions expect DF clear on function exit and before calls, so it starts clear.
         lines.append("bool direction=false;")
@@ -728,6 +732,21 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
             else:  # M.PBLENDVB (implicit XMM0 mask)
                 stmt = (f"{{ const auto in1 = {dst}, m = wide0; {s2_init} for (size_t n = 0; n < 16; ++n) {{ "
                         f"{dst}[n] = (m[n] & 0x80u) ? in2[n] : in1[n]; }} }}")
+        elif has_wide and i.encoding == EncodingKind.LEGACY and i.op0_register in wide_xmm and op in pmov_ext:
+            signed, src_sz, dst_sz = pmov_ext[op]
+            lanes = 16 // dst_sz
+            src_t = f"int{8 * src_sz}_t" if signed else UINT[src_sz]
+            dst_t = f"int{8 * dst_sz}_t" if signed else UINT[dst_sz]
+            dst = wide_xmm[i.op0_register]
+            if i.op1_kind == K.MEMORY:
+                src_init = f"const auto in1 = load<std::array<uint8_t,{lanes * src_sz}>>({address()});"
+            elif i.op1_kind == K.REGISTER and i.op1_register in wide_xmm:
+                src_init = f"const auto in1 = {wide_xmm[i.op1_register]};"
+            else:
+                raise ValueError(f"unsupported query operation at {i.ip:#x}: {i}")
+            stmt = (f"{{ {src_init} for (size_t k = 0; k < {lanes}; ++k) {{ "
+                    f"const {dst_t} v = static_cast<{dst_t}>(load<{src_t}>(reinterpret_cast<word>(in1.data() + k * {src_sz}))); "
+                    f"memcpy({dst}.data() + k * {dst_sz}, &v, {dst_sz}); }} }}")
         elif op in sse2_sat_mul_ops and i.encoding == EncodingKind.LEGACY and i.op0_kind == K.REGISTER and i.op0_register in wide_xmm and has_wide:
             dst = wide_xmm[i.op0_register]
             if i.op1_kind == K.REGISTER and i.op1_register in wide_xmm:
