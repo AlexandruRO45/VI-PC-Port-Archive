@@ -731,5 +731,54 @@ class TestVSadU32U16ConditionCodesAndFlags(unittest.TestCase):
         flags = compute_flags(0xFFFF, 0x0000, 0xFFFF_0001)
         self.assertTrue(flags.carry)
 
+# ==============================================================================
+# Unit Tests: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestVSadU32U16IEEE754BitPatterns(unittest.TestCase):
+    """Test suite verifying bit-exact integer handling of IEEE 754 float patterns.
+
+    v_sad_u32_u16 operates strictly on integer bitfields. Halfword patterns corresponding
+    to IEEE 754 half-precision (f16) or single-precision (f32) specials (+0.0, -0.0,
+    subnormals, infinities, NaNs) must be evaluated as unsigned binary integers without
+    floating-point normalization or subnormal flush-to-zero (FTZ).
+    """
+
+    @staticmethod
+    def float_to_u32(val: float) -> int:
+        """Convert Python float to 32-bit unsigned integer bitcast."""
+        return struct.unpack("<I", struct.pack("<f", val))[0]
+
+    def test_ieee754_zero_and_negative_zero(self) -> None:
+        """+0.0 (0x00000000) vs -0.0 (0x80000000) in single precision."""
+        pos_zero = self.float_to_u32(+0.0)  # 0x00000000
+        neg_zero = self.float_to_u32(-0.0)  # 0x80000000
+
+        # Low halfword diff: |0x0000 - 0x0000| = 0
+        self.assertEqual(ref_sad_u32_u16(pos_zero, neg_zero, 0), 0)
+
+        # High halfword diff: |0x0000 - 0x8000| = 32768
+        self.assertEqual(
+            ref_sad_u32_u16(pos_zero, neg_zero, 0, op_sel0=True, op_sel1=True),
+            32768,
+        )
+
+    def test_ieee754_f16_half_precision_specials(self) -> None:
+        """Verify packed IEEE 754 half-precision (f16) values."""
+        f16_pos_inf = 0x7C00
+        f16_neg_inf = 0xFC00
+        f16_qnan = 0x7E00
+
+        # Diff between +inf and -inf: |0x7C00 - 0xFC00| = 32768 (0x8000)
+        self.assertEqual(ref_sad_u32_u16(f16_pos_inf, f16_neg_inf, 0), 32768)
+
+        # Diff between NaN and NaN is identically 0
+        self.assertEqual(ref_sad_u32_u16(f16_qnan, f16_qnan, 0x55), 0x55)
+
+    def test_ieee754_subnormals_no_denorm_flushing(self) -> None:
+        """16-bit subnormal bit patterns are never flushed to zero."""
+        f16_subnorm_min = 0x0001
+        self.assertEqual(ref_sad_u32_u16(f16_subnorm_min, 0, 0), 1)
+
 if __name__ == "__main__":
     unittest.main()
