@@ -1031,5 +1031,82 @@ class TestValuMsadU16ConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(flags.diff_sum, 1500)
 
 
+class TestValuMsadU16IEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 float bit pattern handling, 16-bit extremes, and boundary limits."""
+
+    def test_ieee754_special_float_bitpatterns_treated_as_raw_halves(self) -> None:
+        pos_zero = 0x0000_0000
+        neg_zero = 0x8000_0000
+        pos_inf = 0x7F80_0000
+        neg_inf = 0xFF80_0000
+        qnan = 0x7FC0_0000
+        snan = 0x7F80_0001
+
+        special_floats = [pos_zero, neg_zero, pos_inf, neg_inf, qnan, snan]
+        for f0 in special_floats:
+            for f1 in special_floats:
+                with self.subTest(f0=hex(f0), f1=hex(f1)):
+                    res0 = oracle_v_msad_u16(f0, f1, 0)
+                    res1 = oracle_v_msad_u16(f0, f1, 100)
+
+                    h0_lanes = unpack_halves_u32(f0)
+                    h1_lanes = unpack_halves_u32(f1)
+                    expected_diff = sum(
+                        0 if h1 == 0 else abs(h0 - h1)
+                        for h0, h1 in zip(h0_lanes, h1_lanes)
+                    )
+                    self.assertEqual(res0, expected_diff)
+                    self.assertEqual(res1, 100 + expected_diff)
+
+    def test_negative_zero_float_bit_pattern_as_reference(self) -> None:
+        # -0.0f is 0x8000_0000:
+        # half 0 is 0x0000 (masked!)
+        # half 1 is 0x8000 (active!)
+        neg_zero = 0x8000_0000
+        s0 = pack_halves_u32(0xFFFF, 0x1000)
+
+        # When s1 = neg_zero:
+        # lane 0 has s1 = 0 -> masked out (0 contribution)
+        # lane 1 has s1 = 0x8000 -> |0x1000 - 0x8000| = 0x7000 (28672)
+        res = oracle_v_msad_u16(s0, neg_zero, 0)
+        self.assertEqual(res, 28672)
+
+    def test_subnormal_float_bits_no_flush_to_zero(self) -> None:
+        # 0x00000001 has half 0 = 1, half 1 = 0
+        sub1 = 0x0000_0001
+        sub3 = 0x0000_0003
+        res = oracle_v_msad_u16(sub3, sub1, 0)
+        # |3 - 1| = 2 for lane 0; lane 1 is masked
+        self.assertEqual(res, 2)
+
+    def test_nan_payload_treated_as_raw_half_data(self) -> None:
+        nan_payload = 0x7FA5_5A3C
+        # Halves: h0=0x5A3C, h1=0x7FA5 (both non-zero)
+        res = oracle_v_msad_u16(0, nan_payload, 0)
+        expected = 0x5A3C + 0x7FA5
+        self.assertEqual(res, expected)
+
+    def test_extreme_half_boundary_combinations(self) -> None:
+        extreme_halves = [0x0000, 0x0001, 0x0002, 0x7FFE, 0x7FFF, 0x8000, 0x8001, 0xFFFE, 0xFFFF]
+        for h0 in extreme_halves:
+            for h1 in extreme_halves:
+                val = ref_msad_half(h0, h1)
+                self.assertGreaterEqual(val, 0)
+                self.assertLessEqual(val, 65535)
+                if h1 == 0:
+                    self.assertEqual(val, 0)
+                else:
+                    self.assertEqual(val, abs(h0 - h1))
+
+    def test_accumulator_boundary_extremes(self) -> None:
+        s0 = pack_halves_u32(0, 0)
+        s1 = pack_halves_u32(1, 1)  # diff = 2
+        boundaries = [0, 1, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFD, 0xFFFF_FFFF]
+        for acc in boundaries:
+            with self.subTest(acc=hex(acc)):
+                res = oracle_v_msad_u16(s0, s1, acc)
+                self.assertEqual(res, (acc + 2) & MASK32)
+
+
 if __name__ == "__main__":
     unittest.main()
