@@ -696,5 +696,98 @@ class TestRegisterAliasingAndPreservation(unittest.TestCase):
             if r not in (8, 9, 10, 12, 13):
                 self.assertEqual(state.get_vgpr(r), canary | r)
 
+# ==============================================================================
+# Phase 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class AtomicBitwiseFlags64:
+    zero: bool
+    negative: bool
+    old_zero: bool
+    old_negative: bool
+    parity_even: bool
+    popcount: int
+    changed: bool
+    unaligned_addr: bool
+    bank: int
+    carry_or_sum: bool
+    borrow: bool
+
+
+def evaluate_ds_xor_b64_flags(
+    old_val: int,
+    xor_val: int,
+    new_mem: int,
+    eff_addr: int,
+) -> AtomicBitwiseFlags64:
+    u_old = old_val & MASK_64
+    u_xor = xor_val & MASK_64
+    u_new = new_mem & MASK_64
+
+    zero = (u_new == 0)
+    negative = bool(u_new & 0x8000_0000_0000_0000)
+    old_zero = (u_old == 0)
+    old_negative = bool(u_old & 0x8000_0000_0000_0000)
+
+    popcount = bin(u_new).count("1")
+    parity_even = (popcount % 2 == 0)
+    changed = (u_new != u_old)
+
+    unaligned = bool(eff_addr & 0x7)
+    bank = calc_lds_bank(eff_addr)
+
+    carry_or_sum = ((u_old + u_xor) > MASK_64)
+    borrow = (u_old < u_xor)
+
+    return AtomicBitwiseFlags64(
+        zero=zero,
+        negative=negative,
+        old_zero=old_zero,
+        old_negative=old_negative,
+        parity_even=parity_even,
+        popcount=popcount,
+        changed=changed,
+        unaligned_addr=unaligned,
+        bank=bank,
+        carry_or_sum=carry_or_sum,
+        borrow=borrow,
+    )
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    def test_flags_zero_result(self) -> None:
+        flags = evaluate_ds_xor_b64_flags(
+            old_val=0x1234,
+            xor_val=0x1234,
+            new_mem=0,
+            eff_addr=0x100,
+        )
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertTrue(flags.parity_even)
+        self.assertEqual(flags.popcount, 0)
+        self.assertTrue(flags.changed)
+
+    def test_flags_negative_msb_set(self) -> None:
+        flags = evaluate_ds_xor_b64_flags(
+            old_val=0,
+            xor_val=0x8000_0000_0000_0000,
+            new_mem=0x8000_0000_0000_0000,
+            eff_addr=0x200,
+        )
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.negative)
+        self.assertEqual(flags.popcount, 1)
+        self.assertFalse(flags.parity_even)
+
+    def test_flags_unaligned_address_detection(self) -> None:
+        flags_aligned = evaluate_ds_xor_b64_flags(0, 0, 0, eff_addr=0x1000)
+        self.assertFalse(flags_aligned.unaligned_addr)
+
+        for byte_off in range(1, 8):
+            flags_unaligned = evaluate_ds_xor_b64_flags(0, 0, 0, eff_addr=0x1000 + byte_off)
+            self.assertTrue(flags_unaligned.unaligned_addr)
+
 if __name__ == "__main__":
     unittest.main()
