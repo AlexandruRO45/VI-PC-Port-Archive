@@ -27,6 +27,7 @@ Stages, in order (each skips work that is already done, so a stopped build conti
               the driver rejects, and save the pipeline cache next to the port so the first boot doesn't compile
 """
 import argparse
+import errno
 import functools
 import glob
 import hashlib
@@ -40,6 +41,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(ROOT, "tools")
@@ -394,6 +396,37 @@ def pipeline_check_prerequisite(runtime_selected: bool = False) -> str:
                 "stage needs that executable)")
     return ("vk_pipeline_check (needed by the pipelines stage; run the runtime stage on Windows, or build it "
             "with CMake as described in README.md)")
+
+
+@contextmanager
+def lock_build_directories(directories: list[str]):
+    """Reserve shared build folders for one writer until its stage calls finish."""
+    canonical = {}
+    for directory in directories:
+        path = os.path.realpath(directory)
+        canonical.setdefault(os.path.normcase(path), path)
+    with ExitStack() as handles:
+        for _, directory in sorted(canonical.items()):
+            lock_path = os.path.join(directory, ".leonida-build.lock")
+            try:
+                os.makedirs(directory, exist_ok=True)
+                handle = handles.enter_context(open(lock_path, "ab"))
+            except OSError as e:
+                fail(f"Cannot open the build lock in {directory}: {e.strerror or e}")
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as e:
+                if e.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                    fail(f"Another Leonida build is using {directory}. Use a different folder or wait for it to finish.")
+                fail(f"Cannot lock the build folder {directory}: {e.strerror or e}")
+        # Closing the handles releases the OS locks. Keep the empty files so every process locks the same file.
+        yield
 
 
 def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | None = None, *,
@@ -1679,22 +1712,31 @@ def main() -> int:
                 "translating with --pc-tail-ubo")
             a.pc_tail_ubo = True
     fallbacks = fallback_flags(a) if "shaders" in stages else ()
-    preflight(stages, work, a.wav, runtime_build, emulate=emulate, keep_emulated=keep_emulated,
-              fallbacks=fallbacks, jobs=a.jobs)
-    if not a.out and icloud_documents():
-        for note in icloud_default_notes():
-            log(note)
-    log(f"building into {out} (work files in {work})")
-    t0 = time.time()
-    if "shaders" in stages:
-        shaders(game, work, a.jobs, emulate=emulate, keep_emulated=keep_emulated, fallbacks=fallbacks)
-    if "assets" in stages:
-        assets(game, work, a.wav, a.jobs)
-    if "runtime" in stages:
-        runtime(game, out, v, runtime_build, a.jobs)
-    if "pipelines" in stages:
-        pipelines(work, out, a.jobs)
-    log(f"finished in {(time.time() - t0) / 60:.0f} min")
+    directories = []
+    if any(stage in stages for stage in ("shaders", "assets", "pipelines")):
+        directories.append(work)
+    if "runtime" in stages or "pipelines" in stages:
+        directories.append(out)
+    if ("runtime" in stages and not runtime_build) or (
+            "pipelines" in stages and os.name != "nt" and not pipeline_check_exe()):
+        directories.append(os.path.join(ROOT, "runtime", "build"))
+    with lock_build_directories(directories):
+        preflight(stages, work, a.wav, runtime_build, emulate=emulate, keep_emulated=keep_emulated,
+                  fallbacks=fallbacks, jobs=a.jobs)
+        if not a.out and icloud_documents():
+            for note in icloud_default_notes():
+                log(note)
+        log(f"building into {out} (work files in {work})")
+        t0 = time.time()
+        if "shaders" in stages:
+            shaders(game, work, a.jobs, emulate=emulate, keep_emulated=keep_emulated, fallbacks=fallbacks)
+        if "assets" in stages:
+            assets(game, work, a.wav, a.jobs)
+        if "runtime" in stages:
+            runtime(game, out, v, runtime_build, a.jobs)
+        if "pipelines" in stages:
+            pipelines(work, out, a.jobs)
+        log(f"finished in {(time.time() - t0) / 60:.0f} min")
     return 0
 
 

@@ -21,7 +21,8 @@ import make_game
 class ArgparseDefaultsAndTypesTest(unittest.TestCase):
     """Test argument parsing defaults, types, and flags in make_game.py."""
 
-    def test_default_argument_values(self):
+    @patch("make_game.lock_build_directories")
+    def test_default_argument_values(self, _lock):
         with patch.object(sys, "argv", ["make_game.py"]):
             with patch("make_game.below_normal"):
                 with patch("make_game.choose_game", return_value=os.path.abspath("C:/dummy_game")):

@@ -147,6 +147,11 @@ Stages run in order: `check`, `shaders`, `assets`, `runtime`, `pipelines` (creat
 GPU driver and saves a pipeline cache, so the first boot doesn't compile them). The shader translation is the longest step: it runs
 on `--jobs` processes (half the CPU threads by default).
 
+`make_game.py` locks the work and output folders used by its selected stages. If another build is using one of
+those folders, wait for it to finish or choose a different `--work` or `--out`. Builds that compile runtime tools
+in this checkout also share a lock in `runtime/build`. The OS releases the locks when the build process exits.
+The empty `.leonida-build.lock` files stay in place so future builds can reuse them.
+
 `--wav` is off by default because 16-bit PCM WAV is several times larger than Ogg Opus. It decodes the repackaged Ogg
 Opus streams to `work\assets\audio\wav` after the audio bank step; existing WAV files are skipped when a build resumes.
 
