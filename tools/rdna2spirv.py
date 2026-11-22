@@ -319,6 +319,7 @@ class Gen:
         self.uses_long = False
         self.vertex_inputs = []    # (D3D input register, component type 1=uint 2=sint 3=float) for fetch-calling VS
         self.vertex_signature = []   # full ISG1: (register, mask, system value, component type) for PSO lookup
+        self.vertex_slots = {}     # D3D input register -> its place among the registers the shader reads (v(4 + 4k))
         self.dynamic_format = False  # True when a buffer_load used a runtime V# FORMAT (unknown codes -> 0 at runtime)
         self.fixed_format_codes = set()  # static tbuffer/fixed format codes seen (validated against FORMATS)
         self.frag_inputs = {}      # PS: VGPR -> gl_FragCoord component, from the verified system-VGPR layout
@@ -12531,11 +12532,13 @@ def assemble(gen):
             fn += [f"%fc{c} = OpCompositeExtract %float %fc {c}", f"%fcu{c} = OpBitcast %uint %fc{c}",
                    f"%fcp{c} = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(r)}", f"OpStore %fcp{c} %fcu{c}"]
     for reg, ctype in gen.vertex_inputs:
+        if reg not in gen.vertex_slots:     # declared, never read: the fetch program gives it no VGPRs
+            continue
         vt = {1: "%v4uint_in", 2: "%v4int_in"}.get(ctype, "%v4float")
         st = {1: "%uint", 2: "%int"}.get(ctype, "%float")
         fn.append(f"%vinv{reg} = OpLoad {vt} %vin{reg}")
         for c in range(4):
-            vg = 4 + 4 * reg + c
+            vg = 4 + 4 * gen.vertex_slots[reg] + c
             fn += [f"%vinc{reg}_{c} = OpCompositeExtract {st} %vinv{reg} {c}",
                    f"%vinb{reg}_{c} = OpBitcast %uint %vinc{reg}_{c}" if ctype != 1 else
                    f"%vinb{reg}_{c} = OpCopyObject %uint %vinc{reg}_{c}",
@@ -13283,6 +13286,12 @@ def input_signature_full(path, name):
 
 def input_signature(path, name):
     """ISG1 elements of the shader's DXBC container: (register, mask, system value, component type)."""
+    return [e[:4] for e in input_signature_read(path, name)]
+
+
+def input_signature_read(path, name):
+    """ISG1 elements as (register, mask, system value, component type, read mask). The read mask (byte 25 of the
+    element) has a bit for each component the shader reads; 0 means the element is declared and never read."""
     dxbc = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), name + ".dxbc")
     with open(dxbc, "rb") as f:
         d = f.read()
@@ -13295,7 +13304,7 @@ def input_signature(path, name):
             for i in range(cnt):
                 e = p[eo + 32 * i:eo + 32 * i + 32]
                 _, _, _, sysv, ctype, reg = struct.unpack_from("<6I", e, 0)
-                out.append((reg, e[24], sysv, ctype))
+                out.append((reg, e[24], sysv, ctype, e[25]))
             return out
     return []
 
@@ -13312,6 +13321,16 @@ def vertex_input_locations(sig):
         if seen.setdefault(reg, ctype) != ctype:
             raise Unsupported("vertex input register with mixed component types")
     return list(seen.items())
+
+
+def vertex_fetch_slots(sig):
+    """{register: k} for a fetch-calling VS: the fetch program hands out VGPRs only to the input registers the
+    shader reads, in register order, so the k-th register with a non-zero read mask is in v(4 + 4k .. 7 + 4k).
+    `sig` is input_signature_read() without the system values."""
+    read = {}
+    for reg, _, _, _, rmask in sig:
+        read[reg] = read.get(reg, 0) | rmask
+    return {reg: k for k, reg in enumerate(sorted(reg for reg, rmask in read.items() if rmask))}
 
 
 # RDNA2 VOP3_SDST_ENC forms have both VDST and SDST in the printed operands.
@@ -13795,23 +13814,26 @@ def translate(path):
         g.pos_map, g.pos_misc, g.clip_count, g.cull_count = pos_export_layout(
             output_signature_full(path, info["name"]), insns)
     if stage == "vs" and any(base_op(i["op"]) == "s_swappc_b64" for i in insns):
-        # The call goes to a driver-generated fetch program (not in the blob). Verified rule over 788 shaders:
-        # input-signature register r, component c is fetched into v(4 + 4r + c). Replace the call with Vulkan
-        # vertex inputs (location = register) written into those VGPRs at entry.
-        sig = [s for s in input_signature(path, info["name"]) if s[2] == 0]
-        # Any component of a declared register may be read: components the vertex format lacks come back as the
-        # format defaults (0, 0, 1 for y, z, w) from the hardware fetch, and Vulkan fills a vec4 input from a
-        # narrower format the same way. Seen: .w of an xyz position.
-        predicted = {4 + 4 * reg + c for reg, mask, _, _ in sig for c in range(4)}
+        # The call goes to a driver-generated fetch program (not in the blob). It hands out VGPRs only to the
+        # input-signature registers the shader reads (ISG1 read mask != 0): the k-th of them, component c, is
+        # fetched into v(4 + 4k + c). A register that is declared and never read gets none, so the ones above it
+        # move down (docs/design.md, Vertex fetch). Replace the call with Vulkan vertex inputs (location =
+        # register) written into those VGPRs at entry.
+        sig = [s for s in input_signature_read(path, info["name"]) if s[2] == 0]
+        g.vertex_slots = vertex_fetch_slots(sig)
+        # Any component of a register the shader reads may be read: components the vertex format lacks come back
+        # as the format defaults (0, 0, 1 for y, z, w) from the hardware fetch, and Vulkan fills a vec4 input from
+        # a narrower format the same way.
+        predicted = {4 + 4 * k + c for k in g.vertex_slots.values() for c in range(4)}
         reads = {r for r in read_before_write_vgprs(insns) if r >= 4}
         if not reads <= predicted:
             raise Unsupported("fetch mapping")
-        g.vertex_inputs = vertex_input_locations(sig)
+        g.vertex_inputs = vertex_input_locations([s[:4] for s in sig])
         g.vertex_signature = [{"register": reg, "mask": mask, "system_value": sv, "component_type": ctype}
-                              for reg, mask, sv, ctype in sig]
-        for reg, _ in g.vertex_inputs:          # register the VGPR index constants before assembly
+                              for reg, mask, sv, ctype, _ in sig]
+        for k in g.vertex_slots.values():       # register the VGPR index constants before assembly
             for c in range(4):
-                g.cu(4 + 4 * reg + c)
+                g.cu(4 + 4 * k + c)
         insns = [i for i in insns if base_op(i["op"]) != "s_swappc_b64"]
     user_limit = g.cs["user"] if g.cs else USER_SGPRS
     sys_sgprs = (3,) if stage in ("ms", "gs") else ()

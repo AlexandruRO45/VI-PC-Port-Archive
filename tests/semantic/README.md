@@ -85,6 +85,11 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   the pixel must survive exactly when Python's comparison of the operands holds, and on a 16-lane wave with
   one lane switched off beforehand, where the lanes left running and an untouched VCC are checked. It also
   runs the GPU test `ps_vcmpx_forms` and re-derives its four words.
+- `test_vertex_fetch_slots.py` runs hand-written fetch-calling vertex shaders (`s_swappc_b64` first) with
+  hand-built `ISG1` signatures and asserts which input register's words reach which VGPR: the k-th register the
+  shader reads (read mask not 0) is in v(4 + 4k), so the registers above a declared, never-read one move down.
+  Also the locations (still the input registers), a read past the fetched registers being refused, and the
+  cases where the old register-number rule gave the same answer.
 - `test_image_bvh_tri.py` runs `image_bvh64_intersect_ray` on hand-built triangle nodes. It checks the vertex
   slots of each node type (TRI0–TRI3) and every selector of the barycentric remap byte at +60, against weights
   written by hand and a plain-Python solve (docs/design.md, Ray tracing row).
