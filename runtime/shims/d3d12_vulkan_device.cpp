@@ -3342,6 +3342,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     const auto enum_inst_exts = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
         get(nullptr, "vkEnumerateInstanceExtensionProperties"));
     std::vector<const char*> inst_exts;
+    bool has_surface_exts = false;
+    bool has_debug_utils = false;
     if (enum_inst_exts) {
         std::uint32_t ext_cnt = 0;
         enum_inst_exts(nullptr, &ext_cnt, nullptr);
@@ -3351,11 +3353,15 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         for (const auto& e : available) {
             if (!std::strcmp(e.extensionName, VK_KHR_SURFACE_EXTENSION_NAME)) has_surface = true;
             if (!std::strcmp(e.extensionName, VK_KHR_WIN32_SURFACE_EXTENSION_NAME)) has_win32 = true;
+            if (!std::strcmp(e.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) has_debug_utils = true;
         }
         if (has_surface && has_win32) {
+            has_surface_exts = true;
             inst_exts.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
             inst_exts.push_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
         }
+        // VK_EXT_debug_utils when the loader has it, for the game's debug markers (PIX events) in RenderDoc and the like.
+        if (has_debug_utils) inst_exts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     }
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "gta6rt";
@@ -3375,21 +3381,6 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         instance_info.pNext = &validation_features;
         instance_info.enabledLayerCount = 1;
         instance_info.ppEnabledLayerNames = &layer;
-    }
-    // VK_EXT_debug_utils when the loader has it, for the game's debug markers (PIX events) in RenderDoc and the like.
-    const char* debug_utils = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
-    bool has_debug_utils = false;
-    if (const auto enumerate = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
-            get(nullptr, "vkEnumerateInstanceExtensionProperties"))) {
-        std::uint32_t extension_count = 0;
-        enumerate(nullptr, &extension_count, nullptr);
-        std::vector<VkExtensionProperties> extensions(extension_count);
-        enumerate(nullptr, &extension_count, extensions.data());
-        for (const auto& e : extensions) has_debug_utils = has_debug_utils || std::strcmp(e.extensionName, debug_utils) == 0;
-    }
-    if (has_debug_utils) {
-        instance_info.enabledExtensionCount = 1;
-        instance_info.ppEnabledExtensionNames = &debug_utils;
     }
     OwnedRuntime owned{};
     if (create_instance(&instance_info, nullptr, &owned.instance) != VK_SUCCESS) {
@@ -3616,7 +3607,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);
     if (info.host_image_copy) device_extensions.push_back(host_image_copy_name);
     if (calibrated) device_extensions.push_back(calibrated);
-    if (has_swapchain) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    if (has_swapchain && has_surface_exts) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     if (info.ray_tracing) {
         device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
         device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);

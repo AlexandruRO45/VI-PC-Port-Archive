@@ -539,8 +539,96 @@ int main() {
         std::fprintf(stderr, "FAIL: %u Vulkan validation errors\n", validation_errors());
         return 1;
     }
+
+    // Standalone device path: create_vulkan_device_standalone must keep VK_KHR_surface + VK_KHR_win32_surface enabled
+    // alongside VK_EXT_debug_utils so DXGI presentation works without VUID-vkCreateDevice-ppEnabledExtensionNames-01387.
+    {
+        HWND standalone_hwnd = create_test_window(128, 128);
+        if (!standalone_hwnd) return fail("standalone create_test_window");
+        ID3D12Device* sdev = nullptr;
+        IDXGIFactory4* sfactory = nullptr;
+        ID3D12CommandQueue* squeue = nullptr;
+        ID3D12CommandAllocator* salloc = nullptr;
+        ID3D12GraphicsCommandList* scl = nullptr;
+        ID3D12Fence* sfence = nullptr;
+        ID3D12DescriptorHeap* srtv_heap = nullptr;
+        IDXGISwapChain1* ssc1 = nullptr;
+        IDXGISwapChain3* ssc = nullptr;
+        ID3D12Resource* sbb = nullptr;
+        auto cleanup = [&]() {
+            if (sbb) sbb->Release();
+            if (srtv_heap) srtv_heap->Release();
+            if (ssc) ssc->Release();
+            if (ssc1) ssc1->Release();
+            if (sfence) sfence->Release();
+            if (scl) scl->Release();
+            if (salloc) salloc->Release();
+            if (squeue) squeue->Release();
+            if (sfactory) sfactory->Release();
+            if (sdev) sdev->Release();
+            DestroyWindow(standalone_hwnd);
+        };
+        if (FAILED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&sdev))) || !sdev) {
+            cleanup();
+            return fail("create_vulkan_device_standalone");
+        }
+        if (FAILED(rt::d3d12::create_dxgi_factory(sdev, IID_PPV_ARGS(&sfactory))) || !sfactory) {
+            cleanup();
+            return fail("standalone create_dxgi_factory");
+        }
+        if (FAILED(sdev->CreateCommandQueue(&qd, IID_PPV_ARGS(&squeue))) ||
+            FAILED(sdev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&salloc))) ||
+            FAILED(sdev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, salloc, nullptr, IID_PPV_ARGS(&scl))) ||
+            FAILED(sdev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&sfence))) ||
+            FAILED(sdev->CreateDescriptorHeap(&rtv_hd, IID_PPV_ARGS(&srtv_heap)))) {
+            cleanup();
+            return fail("standalone queue/alloc/cl/fence/rtv_heap");
+        }
+        scl->Close();
+        if (FAILED(sfactory->CreateSwapChainForHwnd(squeue, standalone_hwnd, &scd, nullptr, nullptr, &ssc1)) ||
+            !ssc1) {
+            cleanup();
+            return fail("standalone CreateSwapChainForHwnd");
+        }
+        if (FAILED(ssc1->QueryInterface(IID_PPV_ARGS(&ssc))) || !ssc) {
+            cleanup();
+            return fail("standalone QI IDXGISwapChain3");
+        }
+        ssc1->Release();
+        ssc1 = nullptr;
+        if (FAILED(ssc->GetBuffer(ssc->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&sbb))) || !sbb) {
+            cleanup();
+            return fail("standalone GetBuffer");
+        }
+        const D3D12_CPU_DESCRIPTOR_HANDLE sh_rtv = srtv_heap->GetCPUDescriptorHandleForHeapStart();
+        sdev->CreateRenderTargetView(sbb, nullptr, sh_rtv);
+        salloc->Reset();
+        scl->Reset(salloc, nullptr);
+        auto sb_rt = make_transition(sbb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        scl->ResourceBarrier(1, &sb_rt);
+        const float clear_col[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+        scl->ClearRenderTargetView(sh_rtv, clear_col, 0, nullptr);
+        auto sb_pres = make_transition(sbb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+        scl->ResourceBarrier(1, &sb_pres);
+        scl->Close();
+        ID3D12CommandList* slists[1] = {scl};
+        squeue->ExecuteCommandLists(1, slists);
+        squeue->Signal(sfence, 1);
+        if (!wait_fence(sfence, 1)) {
+            cleanup();
+            return fail("standalone wait_fence");
+        }
+        sbb->Release();
+        sbb = nullptr;
+        if (FAILED(ssc->Present(0, 0))) {
+            cleanup();
+            return fail("standalone Present");
+        }
+        cleanup();
+    }
+
     std::printf("device: %s (validation %s)\n", chosen.deviceName, val_active ? "on" : "off");
     std::printf("dxgi_swapchain_test: PASS (CreateSwapChainForHwnd, GetBuffer+GetDesc, clear+readback, Present, "
-                "ResizeBuffers; 0 validation errors)\n");
+                "ResizeBuffers, 0 caller-instance validation errors; standalone device CreateSwapChainForHwnd+Present ok)\n");
     return 0;
 }
