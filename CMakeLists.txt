@@ -73,6 +73,7 @@ find_program(DXC_EXECUTABLE dxc REQUIRED)
 get_filename_component(DXC_BIN_DIR "${DXC_EXECUTABLE}" DIRECTORY)
 target_compile_definitions(root_probe PRIVATE SDK_DXC_DIR=L"${DXC_BIN_DIR}/")
 add_executable(offscreen_check tests/offscreen_check.cpp tests/compute_check.cpp tests/dxr_check.cpp tests/buffer_ops.cpp)
+target_sources(offscreen_check PRIVATE tests/spirv_window/readback.cpp)
 target_compile_features(offscreen_check PRIVATE cxx_std_17)
 target_link_libraries(offscreen_check PRIVATE d3d12 dxgi dxguid)
 target_include_directories(offscreen_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
@@ -410,6 +411,17 @@ endif()
 if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME docs_links COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/docs_links_check.py")
+    find_program(SPIRV_WINDOW_AS spirv-as HINTS "$ENV{VULKAN_SDK}/Bin")
+    find_program(SPIRV_WINDOW_VAL spirv-val HINTS "$ENV{VULKAN_SDK}/Bin")
+    find_program(SPIRV_WINDOW_CROSS spirv-cross HINTS "$ENV{VULKAN_SDK}/Bin")
+    if(SPIRV_WINDOW_AS AND SPIRV_WINDOW_VAL AND SPIRV_WINDOW_CROSS)
+        foreach(adapter IN ITEMS hardware warp)
+            add_test(NAME spirv_address_window_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_SOURCE_DIR}/tests/spirv_window/draw.py" "${SPIRV_WINDOW_AS}" "${SPIRV_WINDOW_VAL}"
+                "${SPIRV_WINDOW_CROSS}" "${DXC_EXECUTABLE}" "$<TARGET_FILE:offscreen_check>" ${adapter})
+            set_tests_properties(spirv_address_window_${adapter} PROPERTIES SKIP_RETURN_CODE 77)
+        endforeach()
+    endif()
     # Outside a Git checkout, such as a source archive, the tracked-path check cannot run.
     set_tests_properties(docs_links PROPERTIES SKIP_RETURN_CODE 77)
 

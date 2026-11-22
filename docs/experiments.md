@@ -337,6 +337,24 @@ With the previous fixed bindings and the `--cb-reads` command above, all 530 rec
 
 The fixed-profile full scan covered 26,503 records. Output-verified totals stayed at 851 PS, 12 CS, 2 MS, 0 VS and 0 GS (865 overall). All 988 previous profile/container files, including selector variants, recurred. Of those, 616 had identical generated source; recompiling the remaining 372 old/new pairs with the same DXC produced identical desktop DXIL. The existing pipeline and readback results apply to the same binaries. The new conversion draws are counted as source-built fixtures.
 
+### SPIR-V physical addresses in a D3D12 buffer window
+
+An optional offline experiment accepts validated Vulkan 1.2 SPIR-V assembly with the named user-data and physical DWORD pointer types emitted by [Leonida at `f85582e`](https://github.com/ItsNotRexed/Leonida/blob/f85582e23d4ab9e19acbf694358f137d6b8531b1/tools/rdna2spirv.py). [SPIRV-Cross at `57e4efc`](https://github.com/KhronosGroup/SPIRV-Cross/tree/57e4efcc84112abcd426dc5ec248b5339bee04f2) rejects the physical addressing model on its HLSL path. The [window adapter](../tools/spirv_address_window.py) converts direct DWORD loads, stores and array element addresses to logical storage-buffer accesses. It validates the input and the result before publishing the output module.
+
+The host contract supplies a read-only raw SRV at `t0, space1` containing the original packed user-data bytes and a raw UAV at `u0, space2` covering the address window. Physical addresses supplied to the adapter are byte offsets relative to this view; an upstream heap base added to these offsets must be zero. The descriptor must have at most 1,073,741,823 DWORDs. The final byte offset `0xfffffffc` lies outside the view. An address above the window, an unaligned access, or an overflowing array-index addition selects this offset. D3D12 descriptor bounds then provide a zero read or discarded write. A production runtime still needs to locate each guest allocation, establish its lifetime and supply its real descriptors. This profile makes no claim about arbitrary GPU virtual addresses or atomics.
+
+The [source-built compute shader](../tests/spirv_window/subtract.spvasm) reads two distinct addresses, subtracts their words and writes to a third. Windows checks all 16 words of the arena, including guards, for eight cases. Swapping the two reads reverses the result; moving the store changes which guard is replaced. High addresses, misalignment, 64-bit index overflow and a write past the actual descriptor exercise the window bounds.
+
+With SPIRV-Tools and SPIRV-Cross on the Windows PATH, reconfigure to register the optional GPU tests:
+
+```powershell
+cmake --preset dev
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^spirv_address_window_' -V
+```
+
+With SPIRV-Tools on Linux, run `python3 -B tests/spirv_window/check.py` to assemble and validate the fixture and exercise the rejection paths. The GPU check can also use WSL tools: generate a logical module with `python3 tools/spirv_address_window.py tests/spirv_window/subtract.spvasm out/window.spv`, then generate HLSL with `spirv-cross out/window.spv --hlsl --shader-model 66 --output out/window.hlsl`. Compile it on Windows with `dxc -T cs_6_6 -E main -Fo out/window.dxil out/window.hlsl` and run `out/build/dev/offscreen_check.exe hardware --spirv-address-window out/window.dxil`, then repeat with `warp`.
+
 ## Offline CPU leaf recompilation
 
 With the Python-enabled Windows dev preset configured, run:
