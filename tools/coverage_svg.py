@@ -2,10 +2,7 @@
 
 Usage:
     python tools/form_coverage.py out/test-results.xml --json out/coverage.json
-    python tools/coverage_svg.py out/coverage.json out/dashboard.svg --source "<commit, OS, adapter>"
-
-On each push to main, the Windows checks draw it and .github/workflows/coverage-dashboard.yml
-publishes it to the coverage-dashboard branch, which the README shows.
+    python tools/coverage_svg.py out/coverage.json docs/coverage/dashboard.svg --source "<commit, OS, adapter>"
 
 Green squares are covered forms, amber squares are forms held back only by skipped tests, and grey
 squares are forms no passing fixture translates. Counts only; the graphic never shows a percentage,
