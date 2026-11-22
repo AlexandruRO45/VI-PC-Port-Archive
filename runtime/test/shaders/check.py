@@ -133,6 +133,8 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # not bit 0 for every lane; word = set lanes | lowest lane << 8 (derivations in each .asm header)
             ("cs_w32_mask_imm", [2056, 20, 2, 6152, 2050, 4112, 258, 32]),
             ("cs_w64_mask_imm", [2056, 1084, 828, 2052, 319, 2104, 516, 2064]),
+            # a wave64 VOP3 lane mask printed in wave32 syntax ("s6" for s[6:7], as shader_disasm.py prints) is the pair
+            ("cs_w64_mask_pair_w32text", [0, 0, 1, 1, 1, 1, 0, 0]),
             # SHADER-99: -0 and NaN survive translation (SignedZeroInfNanPreserve); words 0, 2, 3 on Apple: see below
             ("cs_signed_zero_nan", SIGNED_ZERO_NAN),
             # s_andn2_saveexec_b32 / s_andn2_wrexec_b32: EXEC = S0 & ~EXEC, D old / new EXEC, SCC (cs_w32_andn2_exec.asm)
