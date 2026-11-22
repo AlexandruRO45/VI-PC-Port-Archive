@@ -323,6 +323,36 @@ on the Phantom Dust package:
 So the executable and the DLLs exist only in encrypted form, and nothing the loader could run is stored in the
 clear. This is the line `AGENTS.md` draws; the tool stops there.
 
+### The decrypted files come from outside the AI environment
+
+Security analysis conclusion: the DRM content key (CEK) is delivered by the licence, not by the package. The AI
+side of this project therefore neither reads licences nor derives or uses keys, and it never handles vendor
+decryption tooling. To run a title, the **project director obtains the decrypted `.exe`/`.dll` files outside the AI
+environment** and hands them over as ordinary PE files; from that point the loader, the shim tables and the tests in
+this repository are what run them, exactly as `docs/how_to_test_game.md` describes.
+
+The boundary is deliberate and stays: everything before the decrypted files — analysis, the structure report, the
+decision to stop — is in this repository; the extraction itself is not, and no key, licence blob or decryption tool
+is committed here.
+
+## Runtime layer status: complete and tested
+
+The runtime layer the port needs is built and covered by the test suite (`ctest`, **41/41** on this machine, with
+the GPU paths also clean under `LEONIDA_VK_VALIDATION=1`):
+
+| Layer | Where | Tests |
+|---|---|---|
+| PE loader: mapping, relocations, imports, exports, `.pdata`, TLS/`DllMain`, `--dry-run`/`--init`/`--run` | `src/pe_loader.cpp`, `src/main.cpp` | `loader`, `pe_loader`, `engine_sim`, `pe_hello` |
+| D3D12 → Vulkan: command-list IR, barriers, copies, clears, dynamic rendering, up to eight render targets, pipelines, descriptor heaps, committed resources | `src/command_list.h`, `src/vulkan_replay.h`, `shims/d3d12_*.cpp` | `command_list`, `render_targets`, `queue_draw`, `com_draw`, `mrt`, `pipeline_state`, `root_signature_com`, `d3d12_com`, `d3d12_vulkan_device`, `d3d12_descriptor` |
+| DXGI: factory, adapter, output and display modes, swapchain, `Present`, `ResizeBuffers`, borderless fullscreen | `shims/dxgi.cpp` | `dxgi_window` |
+| Presentation: shared-device WSI (copy/blit into the swapchain, `vkQueuePresentKHR`), PresentX plane composition | `shims/wsi_presenter.*`, `shims/d3d12_present.cpp` | `dxgi_window`, `window_draw` |
+| XInput: pad state, vibration, capabilities, battery, forwarding to a host pad | `shims/xinput.cpp` | `xinput` |
+| Async I/O + IOCP: `CreateFile2`, scatter/gather, completion ports | `shims/async_io.cpp` | `async_io` |
+| XGameRuntime / XTaskQueue / XAsync | `shims/xgameruntime.cpp`, `third_party/xtaskqueue` | `xgameruntime` |
+
+What remains is not layer work: the DXGI/PresentX items listed as **Open** above (the measured queue slot, `Present`
+on a buffer other than 0, composition swapchains, frame statistics), frames in flight for throughput, and whatever
+the first real title reports in `missing_imports.log`.
 
 ## Day one, in order
 
