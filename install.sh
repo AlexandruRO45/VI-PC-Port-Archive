@@ -526,6 +526,19 @@ install_dotnet() {
   export PATH="$DOTNET_ROOT:$PATH"
 }
 
+install_llvm_repo() {
+  . /etc/os-release
+  local codename="${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}"
+  [ -n "$codename" ] || return 1
+  curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o "$RUN_DIR/llvm.key" || return 1
+  gpg --dearmor < "$RUN_DIR/llvm.key" \
+    | "${SUDO[@]}" tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null || return 1
+  printf 'deb https://apt.llvm.org/%s/ llvm-toolchain-%s-21 main\n' "$codename" "$codename" \
+    | "${SUDO[@]}" tee /etc/apt/sources.list.d/llvm.list >/dev/null || return 1
+  run_capture "$LOG" "${APT[@]}" update || return 1
+  run_capture "$LOG" "${APT[@]}" install -y llvm-21 || return 1
+}
+
 ensure_llvm() {
   if llvm_ok; then
     if [ -z "${LLVM_MC:-}" ]; then
@@ -537,8 +550,7 @@ ensure_llvm() {
   fi
   set_label "installing LLVM 21"
   refresh_sudo
-  curl -fsSL https://apt.llvm.org/llvm.sh -o "$RUN_DIR/llvm.sh" || die "could not download llvm.sh"
-  run_capture "$LOG" "${SUDO[@]}" bash "$RUN_DIR/llvm.sh" 21 || die "LLVM 21 install failed"
+  install_llvm_repo || die "LLVM 21 install failed. Install llvm-21 from apt.llvm.org by hand and run again."
   if [ -x /usr/lib/llvm-21/bin/llvm-mc ]; then
     export LLVM_MC=/usr/lib/llvm-21/bin/llvm-mc
   else

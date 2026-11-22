@@ -38,9 +38,9 @@ less /tmp/leonida-install.sh
 bash /tmp/leonida-install.sh
 ```
 
-The installers use the vendors' official sources: `winget` and the distribution's apt repositories,
-`apt.llvm.org/llvm.sh` (run with `sudo`), `dot.net/v1/dotnet-install.sh` (run as your user, into `~/.dotnet`), the
-Kitware apt repository, and the deadsnakes PPA. Those sources are fetched over HTTPS and are not pinned to a
+The installers use the vendors' official sources: `winget` and the distribution's apt repositories, the
+`apt.llvm.org` repository and its signing key, `dot.net/v1/dotnet-install.sh` (run as your user, into `~/.dotnet`),
+the Kitware apt repository, and the deadsnakes PPA. Those sources are fetched over HTTPS and are not pinned to a
 specific revision. The deadsnakes, Kitware and LLVM apt sources stay configured after the install; the Ubuntu
 section below shows how to remove them.
 
@@ -147,7 +147,8 @@ sudo rm -f /etc/apt/sources.list.d/kitware.list /usr/share/keyrings/kitware-arch
 sudo rm -f /etc/apt/sources.list.d/llvm.list /etc/apt/trusted.gpg.d/apt.llvm.org.asc
 ```
 
-The LLVM script's key filename may differ; check `/etc/apt/sources.list.d` and `/etc/apt/trusted.gpg.d`.
+The LLVM repository is added as `/etc/apt/sources.list.d/llvm.list` with the key in
+`/etc/apt/trusted.gpg.d/apt.llvm.org.asc`.
 
 ## Logs and stopping
 
