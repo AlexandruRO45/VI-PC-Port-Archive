@@ -2026,7 +2026,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     target_include_directories(cpu_shim_compute PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
     target_compile_features(cpu_shim_compute PRIVATE cxx_std_17)
     target_link_libraries(cpu_shim_compute PRIVATE xmem_shim dxgi d3d12)
-    add_library(cpu_shim_draw SHARED tests/cpu/shim_draw_provider.cpp tests/cpu/shim_draw_gpu.cpp)
+    add_library(cpu_shim_draw SHARED tests/cpu/shim_draw_provider.cpp tests/cpu/shim_draw_gpu.cpp
+        tests/cpu/shim_chain_gpu.cpp)
     add_dependencies(cpu_shim_draw triangle_headers)
     target_sources(cpu_shim_draw PRIVATE
         "${CMAKE_CURRENT_BINARY_DIR}/triangle_vs.h"
@@ -2075,6 +2076,16 @@ if(EXISTS "${INTAKE_PYTHON}")
             ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=${adapter};X2W_SHIM_COMPUTE_CASE=")
     endforeach()
     set_tests_properties(cpu_shim_draw_hardware PROPERTIES SKIP_RETURN_CODE 77)
+    # The translated compute -> mesh -> pixel chain (#658) from the same EXE entry (#671).
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME cpu_shim_chain_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/shim_chain_check.py" "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:pe_map>" "$<TARGET_FILE:cpu_shim_startup>" "$<TARGET_FILE:cpu_shim_startup_lifted>"
+            "$<TARGET_FILE:cpu_shim_startup_guest>" "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:xmem_shim>"
+            "$<TARGET_FILE:d3d12_xs_shim>" "$<TARGET_FILE:cpu_shim_draw>")
+        set_tests_properties(cpu_shim_chain_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
+            ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=${adapter};X2W_SHIM_COMPUTE_CASE=")
+    endforeach()
 
     add_test(NAME cpu_native_exe_chain COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/mapped_exe_chain_check.py" "$<TARGET_FILE:pe_map>"

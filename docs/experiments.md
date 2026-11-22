@@ -138,6 +138,35 @@ cmake --build --preset dev --target cpu_shim_startup cpu_shim_startup_lifted pe_
 ctest --preset dev --no-tests=error -R '^cpu_shim_draw_warp$' -V
 ```
 
+The same draw contract also runs the translated compute, mesh and pixel chain
+from the [compute-to-mesh texture fixture](#single-group-mesh-entry-specialization).
+The draw cases `chain0`, `chain1` and `chain-stale` send the frame to
+[`shim_chain_gpu.cpp`](../tests/cpu/shim_chain_gpu.cpp). On one direct queue it
+dispatches translated gfx1013 producers that write two packed RGBA8 rows to a
+raw UAV, copies them into a 2x2 texture, and draws with the translated indexed
+mesh and `image_sample_lz` pixel stages into a 32x32 target. The EXE, the AOT
+import table and the `draw_request`/`draw_frame` signatures are unchanged. The
+provider publishes all 4,096 RGBA bytes and the 80-byte mesh export trace, and
+the guest exits 42 only when both match the case reference.
+[The check](../tests/cpu/shim_chain_check.py) builds the shaders and references
+from the generators that `compute_mesh_texture_check.py` uses. It requires the
+native EXE, `pe_map` and the AOT build to agree on the shim bindings, the exit
+status and all 4,176 published bytes, and compares them with the Python
+reference.
+
+| Case | Producers dispatched | Bound texture | Exit | Published bytes |
+|---|---|---|---|---|
+| `chain0` | palette A | A | 42 | match A's reference |
+| `chain1` | A, then B | B | 42 | match B's reference |
+| `chain-stale` | A, then B | A | 20 | equal to A's frame; against B's reference, 276 covered pixels differ, while all 748 clear pixels and the trace match |
+
+Mesh shader tier 1 is required. Without it the test exits 77, reported as a
+skip. `XBOX2WINDOWS_ADAPTER` selects the hardware adapter by part of its name.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_shim_chain_(warp|hardware)$' -V
+```
+
 ## Source-built EXE entry to a DLL import
 
 MSVC assembles a small CRT-free [EXE entry body](../tests/cpu/exe_entry.asm) and links it with the existing `call_mix` fixture. The [translator](../tools/cpu_exe_aot.py) takes the fixture's `native_entry` export through `--entry-export`, reads its unwind-bounded instruction range, follows the relative call to `call_mix`, and resolves its IAT slot against `cpu_import_provider.dll!mix_args`. It emits both functions as C++. The translated EXE uses ordinary Windows C++ startup to enter the generated `main`. Both versions use the same native provider and the same I/O DLL.

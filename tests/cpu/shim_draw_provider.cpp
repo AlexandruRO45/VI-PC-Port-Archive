@@ -8,6 +8,7 @@
 #include <vector>
 
 bool shim_draw_gpu(unsigned mode, std::vector<unsigned char>& rgba);
+bool shim_chain_gpu(unsigned mode, std::vector<unsigned char>& published, unsigned& mismatches);
 
 namespace {
 constexpr unsigned side = 64;
@@ -41,12 +42,23 @@ extern "C" __declspec(dllexport) DWORD draw_request()
     if (len < sizeof(mode)) {
         if (!std::strcmp(mode, "draw")) return 1;
         if (!std::strcmp(mode, "flip")) return 2;
+        // The translated compute -> mesh -> pixel chain (tests/cpu/shim_chain_gpu.cpp).
+        if (!std::strcmp(mode, "chain0")) return 3;
+        if (!std::strcmp(mode, "chain1")) return 4;
+        if (!std::strcmp(mode, "chain-stale")) return 5;
     }
     ExitProcess(21);
 }
 
 extern "C" __declspec(dllexport) DWORD draw_frame(DWORD mode)
 {
+    if (mode >= 3 && mode <= 5) {
+        std::vector<unsigned char> published;
+        unsigned count = 0;
+        if (!shim_chain_gpu(mode, published, count)) return 0xFFFFFFFF;
+        if (!publish(published.data(), static_cast<DWORD>(published.size()))) ExitProcess(23);
+        return count;
+    }
     if (mode != 1 && mode != 2) ExitProcess(22);
     std::vector<unsigned char> rgba;
     if (!shim_draw_gpu(mode, rgba) || rgba.size() != side * side * 4) return 0xFFFFFFFF;
