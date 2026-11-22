@@ -1,0 +1,230 @@
+from __future__ import annotations
+
+"""Semantic reference oracle and architectural model for AMD RDNA2 v_mqsad_pk_u16_u8.
+
+AMD RDNA VALU Instruction Set Architecture:
+  v_mqsad_pk_u16_u8 dst, src0, src1, src2
+
+Format:
+  VOP3 (3-operand vector ALU instruction, 64-bit opcode encoding).
+
+Operands:
+  dst:  64-bit vector register pair (v[d:d+1]) containing 4x packed unsigned 16-bit integers.
+  src0: 64-bit vector register pair (v[s0:s0+1]) containing 8x packed unsigned 8-bit integers (sliding reference window).
+  src1: 32-bit register (s[s1] or v[s1]) containing 4x packed unsigned 8-bit integers (query/template with byte-zero masking).
+  src2: 64-bit vector register pair (v[s2:s2+1]) containing 4x packed unsigned 16-bit accumulator values.
+
+Operation:
+  Computes four overlapping 4-byte Sum of Absolute Differences (SAD) between sliding 4-byte
+  windows in src0 and the 4-byte query pattern in src1, accumulating into 16-bit packed results:
+    D[15:0]  = MSAD_U8(S0[31:0],  S1[31:0], S2[15:0])
+    D[31:16] = MSAD_U8(S0[39:8],  S1[31:0], S2[31:16])
+    D[47:32] = MSAD_U8(S0[47:16], S1[31:0], S2[47:32])
+    D[63:48] = MSAD_U8(S0[55:24], S1[31:0], S2[63:48])
+
+Masking Semantics (MSAD_U8):
+  For each byte k in {0, 1, 2, 3}:
+    If query byte S1.byte[k] == 0:
+      diff_k = 0 (byte comparison is skipped / masked out)
+    Else:
+      diff_k = |S0_window.byte[k] - S1.byte[k]|
+  Accumulation:
+    out_16 = (S2_acc_16 + diff_0 + diff_1 + diff_2 + diff_3) & 0xFFFF
+
+Sliding Window Byte Layout in S0:
+  Window 0: bytes [0, 1, 2, 3] = S0[31:0]
+  Window 1: bytes [1, 2, 3, 4] = S0[39:8]
+  Window 2: bytes [2, 3, 4, 5] = S0[47:16]
+  Window 3: bytes [3, 4, 5, 6] = S0[55:24]
+  Note: S0 byte 7 (bits [63:56]) is not consumed by the 4-window quad-SAD, but S0 is aligned to a 64-bit register pair.
+"""
+
+from typing import Tuple
+import unittest
+
+MASK8: int = 0xFF
+MASK16: int = 0xFFFF
+MASK32: int = 0xFFFF_FFFF
+MASK64: int = 0xFFFF_FFFF_FFFF_FFFF
+
+
+def u8(val: int) -> int:
+    """Normalize integer to unsigned 8-bit byte."""
+    return val & MASK8
+
+
+def u16(val: int) -> int:
+    """Normalize integer to unsigned 16-bit halfword."""
+    return val & MASK16
+
+
+def u32(val: int) -> int:
+    """Normalize integer to unsigned 32-bit dword."""
+    return val & MASK32
+
+
+def u64(val: int) -> int:
+    """Normalize integer to unsigned 64-bit qword."""
+    return val & MASK64
+
+
+def extract_byte(val: int, idx: int) -> int:
+    """Extract byte at index `idx` (0-indexed from LSB)."""
+    return (val >> (8 * idx)) & MASK8
+
+
+def extract_u16(val: int, idx: int) -> int:
+    """Extract 16-bit word at index `idx` (0-indexed from LSB)."""
+    return (val >> (16 * idx)) & MASK16
+
+
+def pack_u16_to_u64(w0: int, w1: int, w2: int, w3: int) -> int:
+    """Pack four unsigned 16-bit halfwords into an unsigned 64-bit qword."""
+    return (
+        (w0 & MASK16)
+        | ((w1 & MASK16) << 16)
+        | ((w2 & MASK16) << 32)
+        | ((w3 & MASK16) << 48)
+    )
+
+
+def ref_abs_diff_u8(b0: int, b1: int) -> int:
+    """Pure-Python reference oracle for 8-bit unsigned absolute difference: |b0 - b1|."""
+    u0 = b0 & MASK8
+    u1 = b1 & MASK8
+    return (u0 - u1) if u0 >= u1 else (u1 - u0)
+
+
+def ref_msad_u8(s0_chunk32: int, s1_q32: int, acc16: int) -> int:
+    """Reference mathematical oracle for a single 4-byte masked SAD lane.
+
+    Computes:
+      acc = acc16 & 0xFFFF
+      for k in 0..3:
+        b_s0 = (s0_chunk32 >> (8*k)) & 0xFF
+        b_s1 = (s1_q32 >> (8*k)) & 0xFF
+        if b_s1 != 0:
+          acc += |b_s0 - b_s1|
+      return acc & 0xFFFF
+    """
+    acc = acc16 & MASK16
+    for k in range(4):
+        b_s0 = extract_byte(s0_chunk32, k)
+        b_s1 = extract_byte(s1_q32, k)
+        if b_s1 != 0:
+            acc += ref_abs_diff_u8(b_s0, b_s1)
+    return acc & MASK16
+
+
+def ref_mqsad_pk_u16_u8(s0_64: int, s1_32: int, s2_64: int) -> Tuple[int, int, int, int]:
+    """Reference mathematical oracle returning 4x packed 16-bit words (w0, w1, w2, w3)."""
+    win0 = (s0_64 >> 0) & MASK32
+    win1 = (s0_64 >> 8) & MASK32
+    win2 = (s0_64 >> 16) & MASK32
+    win3 = (s0_64 >> 24) & MASK32
+
+    acc0 = extract_u16(s2_64, 0)
+    acc1 = extract_u16(s2_64, 1)
+    acc2 = extract_u16(s2_64, 2)
+    acc3 = extract_u16(s2_64, 3)
+
+    out0 = ref_msad_u8(win0, s1_32, acc0)
+    out1 = ref_msad_u8(win1, s1_32, acc1)
+    out2 = ref_msad_u8(win2, s1_32, acc2)
+    out3 = ref_msad_u8(win3, s1_32, acc3)
+
+    return out0, out1, out2, out3
+
+
+def ref_mqsad_pk_u16_u8_u64(s0_64: int, s1_32: int, s2_64: int) -> int:
+    """Reference mathematical oracle returning full packed 64-bit result."""
+    w0, w1, w2, w3 = ref_mqsad_pk_u16_u8(s0_64, s1_32, s2_64)
+    return pack_u16_to_u64(w0, w1, w2, w3)
+
+
+class TestValuMqsadPkU16U8ReferenceOracle(unittest.TestCase):
+    """Architectural reference tests validating mathematical model for v_mqsad_pk_u16_u8."""
+
+    def test_pure_zero_operands(self) -> None:
+        """All zero operands produce zero output across all 4 packed lanes."""
+        w0, w1, w2, w3 = ref_mqsad_pk_u16_u8(0, 0, 0)
+        self.assertEqual((w0, w1, w2, w3), (0, 0, 0, 0))
+        self.assertEqual(ref_mqsad_pk_u16_u8_u64(0, 0, 0), 0)
+
+    def test_accumulator_pass_through_on_all_zero_mask(self) -> None:
+        """When query s1 is 0, all 4 byte diffs are masked out and accumulator passes through unchanged."""
+        s2 = pack_u16_to_u64(0x1234, 0x5678, 0x9ABC, 0xDEF0)
+        s0 = 0xFFFF_FFFF_FFFF_FFFF
+        s1 = 0x0000_0000  # All query bytes are 0 -> all masked out
+        w0, w1, w2, w3 = ref_mqsad_pk_u16_u8(s0, s1, s2)
+        self.assertEqual((w0, w1, w2, w3), (0x1234, 0x5678, 0x9ABC, 0xDEF0))
+        self.assertEqual(ref_mqsad_pk_u16_u8_u64(s0, s1, s2), s2)
+
+    def test_exact_match_zero_difference(self) -> None:
+        """Identical reference and query bytes produce zero difference, preserving accumulator."""
+        # s1 query is [10, 20, 30, 40]
+        s1 = 10 | (20 << 8) | (30 << 16) | (40 << 24)
+        # s0 has [10, 20, 30, 40] repeated at every sliding window offset
+        s0_bytes = [10, 20, 30, 40, 10, 20, 30, 40]
+        s0 = sum(b << (8 * i) for i, b in enumerate(s0_bytes))
+        # For window 0 (bytes 0..3): exact match -> diff = 0
+        w0, _, _, _ = ref_mqsad_pk_u16_u8(s0, s1, 0)
+        self.assertEqual(w0, 0)
+
+    def test_sliding_window_offsets(self) -> None:
+        """Verify that sliding windows 0, 1, 2, 3 correctly sample bytes 0..3, 1..4, 2..5, 3..6."""
+        # Reference bytes: 1, 2, 3, 4, 5, 6, 7, 8
+        s0 = sum((i + 1) << (8 * i) for i in range(8))
+        # Query matches bytes 1..4 exactly: [2, 3, 4, 5]
+        s1 = 2 | (3 << 8) | (4 << 16) | (5 << 24)
+        w0, w1, w2, w3 = ref_mqsad_pk_u16_u8(s0, s1, 0)
+        # Window 0 [1, 2, 3, 4] vs [2, 3, 4, 5]: diffs |1-2|=1, |2-3|=1, |3-4|=1, |4-5|=1 -> sum = 4
+        self.assertEqual(w0, 4)
+        # Window 1 [2, 3, 4, 5] vs [2, 3, 4, 5]: exact match -> sum = 0
+        self.assertEqual(w1, 0)
+        # Window 2 [3, 4, 5, 6] vs [2, 3, 4, 5]: diffs 1, 1, 1, 1 -> sum = 4
+        self.assertEqual(w2, 4)
+        # Window 3 [4, 5, 6, 7] vs [2, 3, 4, 5]: diffs 2, 2, 2, 2 -> sum = 8
+        self.assertEqual(w3, 8)
+
+    def test_masked_byte_zero_skipping(self) -> None:
+        """Verify that only query bytes == 0 are masked, non-zero query bytes are evaluated."""
+        # Query: byte 0 is 10, byte 1 is 0 (masked), byte 2 is 30, byte 3 is 0 (masked)
+        s1 = 10 | (0 << 8) | (30 << 16) | (0 << 24)
+        # S0 window 0: [20, 99, 10, 88]
+        s0 = 20 | (99 << 8) | (10 << 16) | (88 << 24)
+        w0, _, _, _ = ref_mqsad_pk_u16_u8(s0, s1, 0)
+        # Byte 0: |20 - 10| = 10
+        # Byte 1: masked out (0)
+        # Byte 2: |10 - 30| = 20
+        # Byte 3: masked out (0)
+        # Total = 10 + 20 = 30
+        self.assertEqual(w0, 30)
+
+    def test_maximum_byte_difference_and_accumulation(self) -> None:
+        """Max difference per byte is 255. 4 active bytes = 1020 max SAD per step."""
+        # Query: [255, 255, 255, 255]
+        s1 = 0xFFFF_FFFF
+        # S0: all zeros
+        s0 = 0
+        w0, w1, w2, w3 = ref_mqsad_pk_u16_u8(s0, s1, 0)
+        self.assertEqual((w0, w1, w2, w3), (1020, 1020, 1020, 1020))
+
+    def test_accumulator_16bit_modulo_wrapping(self) -> None:
+        """16-bit packed lanes wrap modulo 2^16 (65536) on arithmetic overflow."""
+        # Query diff is 1020
+        s1 = 0xFFFF_FFFF
+        s0 = 0
+        # Accumulator is 0xFFFF (65535). 65535 + 1020 = 66555 = 0x103FB -> wraps to 0x03FB (1019)
+        s2 = pack_u16_to_u64(0xFFFF, 0xFFFE, 0x0000, 0x8000)
+        w0, w1, w2, w3 = ref_mqsad_pk_u16_u8(s0, s1, s2)
+        self.assertEqual(w0, (0xFFFF + 1020) & 0xFFFF)
+        self.assertEqual(w0, 1019)
+        self.assertEqual(w1, (0xFFFE + 1020) & 0xFFFF)
+        self.assertEqual(w1, 1018)
+        self.assertEqual(w2, 1020)
+        self.assertEqual(w3, (0x8000 + 1020) & 0xFFFF)
+
+
+if __name__ == "__main__":
+    unittest.main()
