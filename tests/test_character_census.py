@@ -126,6 +126,18 @@ class CharacterCensusTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(path.read_text(encoding="utf-8"))
 
+    def test_report_write_errors_name_the_output(self):
+        blocker = pathlib.Path(self.temp.name) / "blocker"
+        blocker.write_bytes(b"keep")
+        for flag, extension in (("--json", "json"), ("--csv", "csv")):
+            with self.subTest(flag=flag):
+                out = blocker / f"census.{extension}"
+                result = self.run_tool(self.root, flag, out)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(f"ERROR: cannot write {out}", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(blocker.read_bytes(), b"keep")
+
     def by_name(self, data):
         return {row["name"]: row for row in data["models"]}
 

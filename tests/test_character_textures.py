@@ -62,6 +62,20 @@ class CharacterTextureTests(unittest.TestCase):
                 "synthetic_model", "head", "0x1E77BF4C", "bumptex", "face_bumptex"])
             self.assertNotIn("FLAG", result.stdout)
 
+    def test_report_write_errors_name_the_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_model(tmp, model([]))
+            blocker = pathlib.Path(tmp) / "blocker"
+            blocker.write_bytes(b"keep")
+            for flag, extension in (("--json", "json"), ("--csv", "csv")):
+                with self.subTest(flag=flag):
+                    out = blocker / f"textures.{extension}"
+                    result = run_tool(path, flag, out)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(f"ERROR: cannot write {out}", result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+            self.assertEqual(blocker.read_bytes(), b"keep")
+
     def test_garment_without_albedo_is_flagged(self):
         with tempfile.TemporaryDirectory() as td:
             path = write_model(td, model([{
