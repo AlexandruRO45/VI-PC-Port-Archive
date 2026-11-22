@@ -426,6 +426,56 @@ class SIMDVALUInterpreter:
                 ws.write_vgpr(lane, inst.vdst.index, dst)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class MadU32StatusFlags:
+    """Architectural condition codes and status flags for v_mad_u32_u16."""
+    zero: bool
+    sign: bool
+    carry_out: bool
+    overflow_s32: bool
+    clamped: bool
+    s0_zero: bool
+    s1_zero: bool
+    s2_zero: bool
+
+    @classmethod
+    def from_mad_u32_u16(
+        cls,
+        src0: int,
+        src1: int,
+        src2: int,
+        *,
+        op_sel: Tuple[bool, bool] = (False, False),
+        clamp: bool = False,
+    ) -> MadU32StatusFlags:
+        s0 = extract_halfword(src0, op_sel[0])
+        s1 = extract_halfword(src1, op_sel[1])
+        prod = s0 * s1
+        acc = src2 & MASK32
+        full_sum = prod + acc
+        carry = 1 if full_sum >= MODULO_32 else 0
+
+        dst, _ = ref_mad_u32_u16(src0, src1, src2, op_sel=op_sel, clamp=clamp)
+        _, overflow_s = ref_mad_i32_i16(src0, src1, src2, op_sel=op_sel, clamp=clamp)
+
+        is_clamped = clamp and (full_sum > CLAMP_MAX_U32)
+
+        return cls(
+            zero=(dst == 0),
+            sign=bool(dst & SIGN_BIT_32),
+            carry_out=bool(carry),
+            overflow_s32=bool(overflow_s),
+            clamped=is_clamped,
+            s0_zero=(s0 == 0),
+            s1_zero=(s1 == 0),
+            s2_zero=(acc == 0),
+        )
+
+
 class TestValuMadU32U16Oracle(unittest.TestCase):
     """Unit tests for the reference mathematical oracle and architectural model."""
 
@@ -1066,6 +1116,70 @@ class TestValuMadU32U16RegisterAliasing(unittest.TestCase):
                 self.assertEqual(ws.read_vgpr(lane, 0), (1000 + lane) + (3 * 4))
             else:
                 self.assertEqual(ws.read_vgpr(lane, 0), 1000 + lane)
+
+
+class TestValuMadU32U16StatusFlags(unittest.TestCase):
+    """Unit tests for status flags, condition codes, and carry generation."""
+
+    def test_status_flags_zero_result(self) -> None:
+        flags = MadU32StatusFlags.from_mad_u32_u16(0, 0, 0)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.sign)
+        self.assertFalse(flags.carry_out)
+        self.assertFalse(flags.clamped)
+        self.assertTrue(flags.s0_zero)
+        self.assertTrue(flags.s1_zero)
+        self.assertTrue(flags.s2_zero)
+
+    def test_status_flags_zero_with_carry(self) -> None:
+        flags = MadU32StatusFlags.from_mad_u32_u16(0x1000, 0x1000, 0xFF00_0000)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.sign)
+        self.assertTrue(flags.carry_out)
+        self.assertFalse(flags.clamped)
+        self.assertFalse(flags.s0_zero)
+        self.assertFalse(flags.s1_zero)
+        self.assertFalse(flags.s2_zero)
+
+    def test_status_flags_sign_bit_set(self) -> None:
+        flags = MadU32StatusFlags.from_mad_u32_u16(0, 0, 0x8000_0000)
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.sign)
+        self.assertFalse(flags.carry_out)
+
+    def test_status_flags_clamp_detected(self) -> None:
+        flags_unclamped = MadU32StatusFlags.from_mad_u32_u16(0x1000, 0x1000, 0xFF00_0005, clamp=False)
+        self.assertFalse(flags_unclamped.clamped)
+        self.assertTrue(flags_unclamped.carry_out)
+
+        flags_clamped = MadU32StatusFlags.from_mad_u32_u16(0x1000, 0x1000, 0xFF00_0005, clamp=True)
+        self.assertTrue(flags_clamped.clamped)
+        self.assertTrue(flags_clamped.carry_out)
+
+    def test_status_flags_operand_zeros(self) -> None:
+        flags_s0 = MadU32StatusFlags.from_mad_u32_u16(0, 10, 20)
+        self.assertTrue(flags_s0.s0_zero)
+        self.assertFalse(flags_s0.s1_zero)
+        self.assertFalse(flags_s0.s2_zero)
+
+        flags_s1 = MadU32StatusFlags.from_mad_u32_u16(10, 0, 20)
+        self.assertFalse(flags_s1.s0_zero)
+        self.assertTrue(flags_s1.s1_zero)
+        self.assertFalse(flags_s1.s2_zero)
+
+        flags_s2 = MadU32StatusFlags.from_mad_u32_u16(10, 20, 0)
+        self.assertFalse(flags_s2.s0_zero)
+        self.assertFalse(flags_s2.s1_zero)
+        self.assertTrue(flags_s2.s2_zero)
+
+    def test_status_flags_overflow_s32(self) -> None:
+        # (-32768) * (-32768) = 1,073,741,824 (0x40000000)
+        # 0x40000000 + 0x40000000 = 0x80000000 (-2147483648 in s32 -> signed overflow)
+        s0 = pack_halfwords(0x8000, 0)  # -32768
+        s1 = pack_halfwords(0x8000, 0)  # -32768
+        s2 = 0x4000_0000
+        flags = MadU32StatusFlags.from_mad_u32_u16(s0, s1, s2)
+        self.assertTrue(flags.overflow_s32)
 
 
 if __name__ == "__main__":
