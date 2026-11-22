@@ -12789,6 +12789,8 @@ def assemble(gen):
     bary_builtin = bary and gen.bary_location is None
     if gen.frag_inputs or bary:
         iface += ["%frag_coord"] + (["%front_facing"] if "front" in gen.frag_inputs.values() else []) +             (["%bary"] if bary else [])
+    if gen.stage == "ps":
+        iface += ["%helper_inv"]
     for i in range(USER_SGPRS):          # index constants for the user-data copy at entry
         gen.cu(i)
     # SPIR-V module layout: every OpCapability, then every OpExtension, then imports.
@@ -13215,6 +13217,12 @@ def assemble(gen):
             dec += ["OpDecorate %bary BuiltIn BaryCoordKHR" if bary_builtin
                     else f"OpDecorate %bary Location {gen.bary_location}"]
             gvars += ["%bary = OpVariable %_ptr_Input_v3f Input"]
+    if gen.stage == "ps":
+        # EXEC at entry (see the %active store at entry): RDNA2 starts a pixel wave with only the covered pixels in it.
+        if "%_ptr_Input_bool = OpTypePointer Input %bool" not in types:
+            types += ["%_ptr_Input_bool = OpTypePointer Input %bool"]
+        dec += ["OpDecorate %helper_inv BuiltIn HelperInvocation"]
+        gvars += ["%helper_inv = OpVariable %_ptr_Input_bool Input"]
     if gen.vertex_inputs:
         types += ["%v4uint_in = OpTypeVector %uint 4", "%v4int_in = OpTypeVector %int 4",
                   "%_ptr_Input_v4u = OpTypePointer Input %v4uint_in", "%_ptr_Input_v4i = OpTypePointer Input %v4int_in"]
@@ -13309,6 +13317,13 @@ def assemble(gen):
                f"%ud{i} = OpLoad %uint %ud{i}p",
                f"%ud{i}s = OpAccessChain %_ptr_Function_uint %sgpr {gen.cu(i)}",
                f"OpStore %ud{i}s %ud{i}"]
+    if gen.stage == "ps":
+        # RDNA2 starts a pixel wave with EXEC = the covered pixels: a helper invocation of a partly covered quad is off
+        # until s_wqm turns its quad on (quad_any of the active flag), as the game's prologue does before anything that
+        # needs derivatives. Starting it active put it in every ballot, count and election of the entry EXEC
+        # (w64_graphics.py's @partial checks, TEST-363). Its inputs are stored at entry all the same.
+        fn += ["%helper_at_entry = OpLoad %bool %helper_inv", "%live_at_entry = OpLogicalNot %bool %helper_at_entry",
+               "OpStore %active %live_at_entry"]
     if vs:
         # The hardware's VS input VGPRs are zero-based: v0 is the vertex id without the draw's base vertex and v3
         # the instance id without its first instance (Mesa: ac.vertex_id = load_vertex_id_zero_base, the base in

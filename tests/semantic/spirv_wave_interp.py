@@ -20,10 +20,10 @@ tests/semantic/spirv_mini_interp.py runs one invocation of forward-only code. Th
     composited. Float arithmetic raises, so a NaN payload can never be rewritten by the host.
 
 Inputs: Input variables decorated BuiltIn SubgroupLocalInvocationId read the lane number, SubgroupSize reads the
-wave size; BaseVertex and BaseInstance read 0; other Input variables read zero, except the built-ins named in
-`builtins` (name -> function of the
-lane number giving that lane's integer value, e.g. {"VertexIndex": lambda lane: first + lane}). PushConstant words
-can be seeded (default zero).
+wave size, HelperInvocation reads false (every lane is a covered pixel); BaseVertex and BaseInstance read 0;
+other Input variables read zero, except the built-ins named in `builtins` (name -> function of the lane number
+giving that lane's integer value, e.g. {"VertexIndex": lambda lane: first + lane}; for HelperInvocation, whether
+the lane is a helper). PushConstant words can be seeded (default zero).
 
     run_wave(text, wave=32, push_constants=None, max_steps=2_000_000, builtins=None) ->
         {"outputs": [ {output_name: tuple_of_words} or None (lane killed) for each lane ],
@@ -342,6 +342,8 @@ class _Wave:
                         value = lane.index
                     elif b == "SubgroupSize":
                         value = wave
+                    elif b == "HelperInvocation":   # a covered pixel, unless the test marks the lane as a helper
+                        value = bool(builtins[b](lane.index)) if builtins and b in builtins else False
                     elif builtins and b in builtins:
                         value = builtins[b](lane.index) & MASK
                     elif b in ("BaseVertex", "BaseInstance"):
@@ -648,6 +650,16 @@ class _Wave:
                 idx = self.int_of(L[i], a[3])
                 L[i].values[res] = src_vals[idx] if idx in src_vals else \
                     _Poison(f"{op[17:]} from invocation {idx}, which is not running")
+        elif op == "OpGroupNonUniformQuadSwap":
+            # A quad is invocations 4n..4n+3; direction 0 swaps horizontally (^1), 1 vertically (^2), 2 diagonally (^3).
+            src_vals = {i: self.raw(L[i], a[2]) for i in members}
+            for i in members:
+                direction = self.int_of(L[i], a[3])
+                if direction not in (0, 1, 2):
+                    raise UnsupportedConstruct(f"{op} direction {direction}")
+                src = i ^ (direction + 1)
+                L[i].values[res] = src_vals[src] if src in src_vals else \
+                    _Poison(f"QuadSwap from invocation {src}, which is not running")
         elif op == "OpGroupNonUniformBroadcastFirst":
             first = self.raw(L[members[0]], a[2])
             for i in members:

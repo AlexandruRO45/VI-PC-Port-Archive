@@ -392,6 +392,9 @@ class StructuredBranchInterp:
                 elif cls == "PushConstant":
                     self.var_box[res] = [None]
                     self.pointers[res] = ("pc", None)
+                elif cls == "Input" and self.types.get(pointee, ("",))[0] == "bool":
+                    self.var_box[res] = [False]        # BuiltIn HelperInvocation: every pixel here is covered
+                    self.pointers[res] = (self.var_box[res], 0)
 
     def run(self, max_steps: int = 20000) -> dict[str, tuple]:
         values = dict(self.constants)

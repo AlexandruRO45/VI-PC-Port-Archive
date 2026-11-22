@@ -187,6 +187,8 @@ class FlatSpirvInterp:
                 self.ptr_class[res] = cls
                 if cls == "PushConstant":
                     self.var_box[res] = [None]
+                elif cls == "Input" and self.types.get(pointee, ("",))[0] == "bool":
+                    self.var_box[res] = [False]        # BuiltIn HelperInvocation: every pixel here is covered
                 elif cls == "Input":
                     m_idx = re.search(r"\d+", res)
                     attr_idx = int(m_idx.group()) if m_idx else 0
@@ -294,6 +296,11 @@ class FlatSpirvInterp:
                 for i in a[2:]:
                     v = v[int(i)]
                 self.values[res] = v
+            elif op == "OpLogicalNot":
+                v = self.values[a[1]]
+                if not isinstance(v, bool):
+                    raise UnsupportedConstruct("OpLogicalNot operand must be boolean")
+                self.values[res] = not v
             else:
                 raise UnsupportedConstruct(f"Unhandled opcode in body: {op}")
 

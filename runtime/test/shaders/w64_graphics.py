@@ -243,14 +243,9 @@ VARIANT_FIXTURES = ["ps_w64_a_one_lane", "ps_w64_a_quad_live", "ps_w64_a_skip", 
                     "ps_w64_b_readfirstlane", "ps_w64_b_readlane_uniform", "ps_w64_b_waterfall"]
 CHECKS = sorted(FIXTURES) + [f"{n}@{v}" for v in VARIANTS for n in VARIANT_FIXTURES]
 ONLY_HERE = frozenset(FIXTURES) | {PARTIAL_VS}   # the shaders scripts/run_gpu_tests.py leaves to this runner
-# Checks that fail on main for a known translator gap, reported as XFAIL. A pass is reported as XPASS but does not
-# fail the run: whether a helper invocation joins a ballot without MaximallyReconvergesKHR is up to the driver, so
-# some of these may pass on one GPU and not another. The translator starts a pixel shader with its helper
-# invocations active (rdna2spirv.py's %active is true in every invocation); RDNA2's entry EXEC holds the covered
-# pixels only.
-_HELPERS_IN_EXEC = "helper lanes in the entry EXEC, issues/2078#issuecomment-7082188519"
-KNOWN = {f"{n}@{v}": _HELPERS_IN_EXEC for n in ("ps_w64_a_quad_live", "ps_w64_a_skip", "ps_w64_b_ballot_atomic")
-         for v in ("partial", "partial+mr")}
+# Checks that fail on main for a known translator gap, reported as XFAIL; a pass is reported as XPASS and does not
+# fail the run. Empty: the helper lanes of the entry EXEC (TEST-363) are fixed (SHADER-412).
+KNOWN = {}
 
 
 def split_check(check_name):
