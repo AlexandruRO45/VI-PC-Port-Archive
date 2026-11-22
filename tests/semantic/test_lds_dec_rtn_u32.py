@@ -155,6 +155,70 @@ def oracle_ds_dec_rtn_u32(
     return old_val, new_val
 
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class DSOpcode(Enum):
+    """Supported Data Share (DS) atomic opcodes."""
+    DS_DEC_RTN_U32 = "ds_dec_rtn_u32"
+
+
+class RegType(Enum):
+    """Register file classes."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclass(frozen=True)
+class RegisterOperand:
+    """Typed symbolic register operand representation."""
+    index: int
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        max_limit = DEFAULT_NUM_VGPRS if self.reg_type == RegType.VGPR else DEFAULT_NUM_SGPRS
+        if not (0 <= self.index < max_limit):
+            raise ValueError(
+                f"Register index out of bounds: {self.reg_type.value}{self.index} "
+                f"(expected 0 <= index < {max_limit})"
+            )
+
+    @property
+    def name(self) -> str:
+        return f"{self.reg_type.value}{self.index}"
+
+
+@dataclass(frozen=True)
+class DSDecRtnInstruction:
+    """Symbolic AST node for ds_dec_rtn_u32 atomic instruction."""
+    vdst: RegisterOperand
+    vaddr: RegisterOperand
+    vdata0: RegisterOperand
+    offset: int = 0
+    gds: bool = False
+    opcode: DSOpcode = DSOpcode.DS_DEC_RTN_U32
+
+    def __post_init__(self) -> None:
+        if self.vdst.reg_type != RegType.VGPR:
+            raise TypeError("vdst operand must be a VGPR")
+        if self.vaddr.reg_type != RegType.VGPR:
+            raise TypeError("vaddr operand must be a VGPR")
+        if self.vdata0.reg_type != RegType.VGPR:
+            raise TypeError("vdata0 operand must be a VGPR")
+        if not (0 <= self.offset <= OFFSET16_MASK):
+            raise ValueError(f"offset out of 16-bit range [0, 65535]: {self.offset}")
+
+    def disasm(self) -> str:
+        """Format canonical assembly mnemonic and operand string."""
+        text = f"{self.opcode.value} {self.vdst.name}, {self.vaddr.name}, {self.vdata0.name}"
+        if self.offset != 0:
+            text += f" offset:{self.offset}"
+        if self.gds:
+            text += " gds"
+        return text
+
+
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Unit tests for the reference mathematical oracle and architectural model."""
 
@@ -285,6 +349,111 @@ class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
         self.assertEqual(old_val, 77)
         self.assertEqual(new_val, 50)
         self.assertEqual(struct.unpack_from("<I", self.lds_bytes, addr)[0], 50)
+
+
+class TestSymbolicASTAndTypedExpressions(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_opcode_enumeration(self) -> None:
+        self.assertEqual(DSOpcode.DS_DEC_RTN_U32.value, "ds_dec_rtn_u32")
+
+    def test_register_operands(self) -> None:
+        v0 = RegisterOperand(0, RegType.VGPR)
+        v255 = RegisterOperand(255, RegType.VGPR)
+        s0 = RegisterOperand(0, RegType.SGPR)
+        s105 = RegisterOperand(105, RegType.SGPR)
+
+        self.assertEqual(v0.name, "v0")
+        self.assertEqual(v255.name, "v255")
+        self.assertEqual(s0.name, "s0")
+        self.assertEqual(s105.name, "s105")
+
+    def test_ast_construction_and_disassembly(self) -> None:
+        instr_basic = DSDecRtnInstruction(
+            vdst=RegisterOperand(5),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+            offset=0,
+        )
+        self.assertEqual(instr_basic.disasm(), "ds_dec_rtn_u32 v5, v1, v2")
+
+        instr_offset = DSDecRtnInstruction(
+            vdst=RegisterOperand(5),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+            offset=16,
+        )
+        self.assertEqual(instr_offset.disasm(), "ds_dec_rtn_u32 v5, v1, v2 offset:16")
+
+        instr_gds = DSDecRtnInstruction(
+            vdst=RegisterOperand(5),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+            offset=8,
+            gds=True,
+        )
+        self.assertEqual(instr_gds.disasm(), "ds_dec_rtn_u32 v5, v1, v2 offset:8 gds")
+
+    def test_ast_immutability_and_equality(self) -> None:
+        instr1 = DSDecRtnInstruction(
+            vdst=RegisterOperand(3),
+            vaddr=RegisterOperand(4),
+            vdata0=RegisterOperand(5),
+            offset=64,
+        )
+        instr2 = DSDecRtnInstruction(
+            vdst=RegisterOperand(3),
+            vaddr=RegisterOperand(4),
+            vdata0=RegisterOperand(5),
+            offset=64,
+        )
+        self.assertEqual(instr1, instr2)
+        self.assertEqual(hash(instr1), hash(instr2))
+
+    def test_ast_validation_and_type_checks(self) -> None:
+        # Register index out of bounds
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(106, RegType.SGPR)
+
+        # RegType SGPR in vdst, vaddr, or vdata0
+        with self.assertRaises(TypeError):
+            DSDecRtnInstruction(
+                vdst=RegisterOperand(0, RegType.SGPR),
+                vaddr=RegisterOperand(1),
+                vdata0=RegisterOperand(2),
+            )
+        with self.assertRaises(TypeError):
+            DSDecRtnInstruction(
+                vdst=RegisterOperand(0),
+                vaddr=RegisterOperand(1, RegType.SGPR),
+                vdata0=RegisterOperand(2),
+            )
+        with self.assertRaises(TypeError):
+            DSDecRtnInstruction(
+                vdst=RegisterOperand(0),
+                vaddr=RegisterOperand(1),
+                vdata0=RegisterOperand(2, RegType.SGPR),
+            )
+
+        # Offset out of range
+        with self.assertRaises(ValueError):
+            DSDecRtnInstruction(
+                vdst=RegisterOperand(0),
+                vaddr=RegisterOperand(1),
+                vdata0=RegisterOperand(2),
+                offset=-1,
+            )
+        with self.assertRaises(ValueError):
+            DSDecRtnInstruction(
+                vdst=RegisterOperand(0),
+                vaddr=RegisterOperand(1),
+                vdata0=RegisterOperand(2),
+                offset=65536,
+            )
 
 
 if __name__ == "__main__":
