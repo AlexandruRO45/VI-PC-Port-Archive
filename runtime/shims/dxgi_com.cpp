@@ -60,11 +60,34 @@ DXGI_FORMAT vk_to_dxgi_format(VkFormat fmt) {
     }
 }
 
+// Resolves the owning D3D12 device from either an ID3D12Device or an ID3D12DeviceChild (such as a command queue).
+HRESULT query_owning_device(IUnknown* owner, REFIID riid, void** out) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!owner) return E_NOINTERFACE;
+    ID3D12DeviceChild* child = nullptr;
+    if (SUCCEEDED(owner->QueryInterface(IID_PPV_ARGS(&child))) && child) {
+        const HRESULT hr = child->GetDevice(riid, out);
+        child->Release();
+        return hr;
+    }
+    return owner->QueryInterface(riid, out);
+}
+
 // Real ID3D12Resource COM object representing a swapchain backbuffer. Its pointer value is the
 // leonida::ResourceId registered in VulkanContext, matching d3d12_com.h's resource_id(ID3D12Resource*) contract.
 class BackBufferResource final : public ID3D12ResourceStubs {
 public:
-    explicit BackBufferResource(const D3D12_RESOURCE_DESC& desc) : desc_(desc) {}
+    explicit BackBufferResource(const D3D12_RESOURCE_DESC& desc, IUnknown* owner = nullptr) : desc_(desc) {
+        if (owner) query_owning_device(owner, IID_PPV_ARGS(&device_));
+    }
+
+    ~BackBufferResource() {
+        if (device_) device_->Release();
+    }
+
+    BackBufferResource(const BackBufferResource&) = delete;
+    BackBufferResource& operator=(const BackBufferResource&) = delete;
 
     ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
     ULONG STDMETHODCALLTYPE Release() override {
@@ -85,6 +108,24 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE SetName(LPCWSTR) override { return S_OK; }
+
+    // ID3D12DeviceChild
+    HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!device_) return E_NOINTERFACE;
+        return device_->QueryInterface(riid, out);
+    }
+
+    // Default-heap back buffers are not CPU-mappable (host-measured: E_INVALIDARG with *ppData untouched).
+    HRESULT STDMETHODCALLTYPE Map(UINT, const D3D12_RANGE*, void**) override { return E_INVALIDARG; }
+    void STDMETHODCALLTYPE Unmap(UINT, const D3D12_RANGE*) override {}
+    HRESULT STDMETHODCALLTYPE WriteToSubresource(UINT, const D3D12_BOX*, const void*, UINT, UINT) override {
+        return E_INVALIDARG;
+    }
+    HRESULT STDMETHODCALLTYPE ReadFromSubresource(void*, UINT, UINT, UINT, const D3D12_BOX*) override {
+        return E_INVALIDARG;
+    }
 
 #ifdef _MSC_VER
     D3D12_RESOURCE_DESC STDMETHODCALLTYPE GetDesc(void) override { return desc_; }
@@ -113,6 +154,7 @@ public:
 
 private:
     std::atomic<ULONG> refs_{1};
+    IUnknown* device_ = nullptr;
     D3D12_RESOURCE_DESC desc_{};
 };
 
@@ -189,17 +231,7 @@ public:
 
     // IDXGIDeviceSubObject
     HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void** out) override {
-        if (!out) return E_POINTER;
-        *out = nullptr;
-        if (!device_) return E_NOINTERFACE;
-
-        ID3D12DeviceChild* device_child = nullptr;
-        if (SUCCEEDED(device_->QueryInterface(IID_PPV_ARGS(&device_child)))) {
-            const HRESULT hr = device_child->GetDevice(riid, out);
-            device_child->Release();
-            return hr;
-        }
-        return device_->QueryInterface(riid, out);
+        return query_owning_device(device_, riid, out);
     }
 
     // IDXGISwapChain
@@ -466,7 +498,7 @@ private:
             swapchain_.is_offscreen() ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
         buffers_.reserve(count);
         for (std::uint32_t i = 0; i < count; ++i) {
-            auto* bb = new BackBufferResource(desc);
+            auto* bb = new BackBufferResource(desc, device_);
             context_.add_resource(bb->resource_id(), swapchain_.resource_binding(i), initial_layout);
             buffers_.push_back(bb);
         }

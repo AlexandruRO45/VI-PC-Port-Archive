@@ -418,6 +418,13 @@ int main() {
             bb->Release();
             return fail("BackBuffer GetHeapProperties invalid");
         }
+        ID3D12Device* bb_dev = nullptr;
+        if (FAILED(bb->GetDevice(IID_PPV_ARGS(&bb_dev))) || bb_dev != dev) {
+            if (bb_dev) bb_dev->Release();
+            bb->Release();
+            return fail("BackBuffer GetDevice did not return the owning device");
+        }
+        bb_dev->Release();
 
         dev->CreateRenderTargetView(bb, nullptr, h_rtv);
 
@@ -820,6 +827,116 @@ int main() {
         if (sc->SetMaximumFrameLatency(3) != DXGI_ERROR_INVALID_CALL ||
             sc->SetMaximumFrameLatency(1) != DXGI_ERROR_INVALID_CALL)
             return fail("Non-waitable SetMaximumFrameLatency should return DXGI_ERROR_INVALID_CALL");
+    }
+
+    // BackBuffer::GetDevice and default-heap CPU access methods (host-measured on Windows 11, RTX 4060): GetDevice
+    // returns the owning device's COM identity (E_POINTER on null out, E_NOINTERFACE with null out on an unsupported
+    // IID); Map, WriteToSubresource, and ReadFromSubresource return E_INVALIDARG (leaving *ppData untouched).
+    {
+        ID3D12Resource* bb = nullptr;
+        if (FAILED(sc->GetBuffer(0, IID_PPV_ARGS(&bb))) || !bb) return fail("GetBuffer(0) for BackBuffer checks");
+
+        ID3D12Device* got_bb_dev = nullptr;
+        if (FAILED(bb->GetDevice(IID_PPV_ARGS(&got_bb_dev))) || got_bb_dev != dev) {
+            if (got_bb_dev) got_bb_dev->Release();
+            bb->Release();
+            return fail("BackBuffer::GetDevice(ID3D12Device) mismatch");
+        }
+        got_bb_dev->Release();
+
+        IUnknown* got_bb_unk = nullptr;
+        IUnknown* expected_dev_unk = nullptr;
+        IUnknown* queue_unk = nullptr;
+        if (FAILED(bb->GetDevice(IID_PPV_ARGS(&got_bb_unk))) || !got_bb_unk ||
+            FAILED(dev->QueryInterface(IID_PPV_ARGS(&expected_dev_unk))) || !expected_dev_unk ||
+            FAILED(queue->QueryInterface(IID_PPV_ARGS(&queue_unk))) || !queue_unk) {
+            if (queue_unk) queue_unk->Release();
+            if (expected_dev_unk) expected_dev_unk->Release();
+            if (got_bb_unk) got_bb_unk->Release();
+            bb->Release();
+            return fail("BackBuffer::GetDevice(IUnknown) setup failed");
+        }
+        const bool same_identity = (got_bb_unk == expected_dev_unk) && (got_bb_unk != queue_unk);
+        queue_unk->Release();
+        expected_dev_unk->Release();
+        got_bb_unk->Release();
+        if (!same_identity) {
+            bb->Release();
+            return fail("BackBuffer::GetDevice(IUnknown) identity mismatch");
+        }
+
+        void* wrong_out = reinterpret_cast<void*>(uintptr_t(0xdeadbeef));
+        if (bb->GetDevice(__uuidof(IDXGISwapChain3), &wrong_out) != E_NOINTERFACE || wrong_out != nullptr) {
+            bb->Release();
+            return fail("BackBuffer::GetDevice unsupported IID should return E_NOINTERFACE and null out");
+        }
+        if (bb->GetDevice(__uuidof(ID3D12Device), nullptr) != E_POINTER) {
+            bb->Release();
+            return fail("BackBuffer::GetDevice with null out should return E_POINTER");
+        }
+
+        void* sentinel_ptr = reinterpret_cast<void*>(uintptr_t(0xdeadbeef));
+        if (bb->Map(0, nullptr, &sentinel_ptr) != E_INVALIDARG ||
+            sentinel_ptr != reinterpret_cast<void*>(uintptr_t(0xdeadbeef))) {
+            bb->Release();
+            return fail("BackBuffer::Map(&ptr) should return E_INVALIDARG and preserve *ppData");
+        }
+        if (bb->Map(0, nullptr, nullptr) != E_INVALIDARG) {
+            bb->Release();
+            return fail("BackBuffer::Map(nullptr) should return E_INVALIDARG");
+        }
+        bb->Unmap(0, nullptr);
+
+        std::uint32_t dummy_texels[4] = {};
+        if (bb->WriteToSubresource(0, nullptr, dummy_texels, 4, 16) != E_INVALIDARG) {
+            bb->Release();
+            return fail("BackBuffer::WriteToSubresource should return E_INVALIDARG");
+        }
+        if (bb->ReadFromSubresource(dummy_texels, 4, 16, 0, nullptr) != E_INVALIDARG) {
+            bb->Release();
+            return fail("BackBuffer::ReadFromSubresource should return E_INVALIDARG");
+        }
+        bb->Release();
+
+        // A back buffer must keep returning its owning device even after its SwapChain is released, and release
+        // all device references once the back buffer itself is released.
+        dev->AddRef();
+        const ULONG dev_ref_before = dev->Release();
+        HWND temp_hwnd = create_test_window(64, 64);
+        if (!temp_hwnd) return fail("create_test_window for BackBuffer lifetime test");
+        DXGI_SWAP_CHAIN_DESC1 temp_desc = scd;
+        temp_desc.Width = 64;
+        temp_desc.Height = 64;
+        IDXGISwapChain1* temp_sc = nullptr;
+        if (FAILED(factory->CreateSwapChainForHwnd(queue, temp_hwnd, &temp_desc, nullptr, nullptr, &temp_sc)) ||
+            !temp_sc) {
+            DestroyWindow(temp_hwnd);
+            return fail("CreateSwapChainForHwnd for BackBuffer lifetime test");
+        }
+        ID3D12Resource* temp_bb = nullptr;
+        if (FAILED(temp_sc->GetBuffer(0, IID_PPV_ARGS(&temp_bb))) || !temp_bb) {
+            temp_sc->Release();
+            DestroyWindow(temp_hwnd);
+            return fail("GetBuffer(0) for BackBuffer lifetime test");
+        }
+        temp_sc->Release();
+        ID3D12Device* survived_dev = nullptr;
+        if (FAILED(temp_bb->GetDevice(IID_PPV_ARGS(&survived_dev))) || survived_dev != dev) {
+            if (survived_dev) survived_dev->Release();
+            temp_bb->Release();
+            DestroyWindow(temp_hwnd);
+            return fail("BackBuffer::GetDevice failed after SwapChain was released");
+        }
+        survived_dev->Release();
+        temp_bb->Release();
+        DestroyWindow(temp_hwnd);
+        dev->AddRef();
+        const ULONG dev_ref_after = dev->Release();
+        if (dev_ref_after != dev_ref_before) {
+            std::fprintf(stderr, "FAIL: BackBuffer lifetime leaked device refcount (%lu -> %lu)\n",
+                         static_cast<unsigned long>(dev_ref_before), static_cast<unsigned long>(dev_ref_after));
+            return 1;
+        }
     }
 
     // IDXGIFactory4 adapter enumeration, IDXGIAdapter3 descriptors, EnumAdapterByLuid, and QueryVideoMemoryInfo.
