@@ -132,8 +132,10 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
     lines = ["word frame[16]{};", "word " + ", ".join(r + "=0" for r in REGS.values()) + ";",
              "bool zero=false, carry=false, overflow=false;", "rsp = reinterpret_cast<word>(frame);", *initial]
     allowed = {i.ip for i in body} | set(exits)
-    # The x87 profile checks every x87 instruction of the body before any of it is lowered.
-    x87_depth = x87_lower.depths(body, exits) if x87 and any(map(x87_lower.is_x87, body)) else None
+    # The x87 profile checks every x87 instruction of the body before any of it is lowered. x87 is True for
+    # the fixed control word, or an x87_lower.Checked for the checked entry, which also accepts FLDCW.
+    checked = x87 if isinstance(x87, x87_lower.Checked) else None
+    x87_depth = x87_lower.depths(body, exits, checked) if x87 and any(map(x87_lower.is_x87, body)) else None
     xmm = {R.XMM0: "xmm0", R.XMM1: "xmm1", R.XMM2: "xmm2"}
     has_xmm_math = any(i.mnemonic in (M.VMOVDQU, M.VPSRLDQ, M.VMOVD)
                        or (i.mnemonic == M.VPADDD and i.op2_kind != K.MEMORY) for i in body)
@@ -669,9 +671,9 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                 table = f"static_cast<uint32_t>({table})"
             stmt = f"rax = (rax & ~0xffull) | load<uint8_t>({table});"
         elif op == M.RET:
-            stmt = "return rax;"
+            stmt = "return rax;" if checked is None or x87_depth is None else x87_lower.return_statement(checked)
         elif x87_depth is not None and op in x87_lower.X87_OPS:
-            stmt = x87_lower.statement(i, x87_depth[i.ip], address)
+            stmt = x87_lower.statement(i, x87_depth[i.ip], address, checked)
         else:
             raise ValueError(f"unsupported query operation at {i.ip:#x}: {i}")
         lines.append(f"block_{i.ip:x}: {stmt}")
@@ -681,7 +683,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                 raise ValueError(f"unbound fallthrough at {i.ip:#x}")
             lines.append(f"goto block_{i.next_ip:x};")
     if x87_depth is not None:
-        lines.insert(3, x87_lower.DECLARATION)
+        lines.insert(3, x87_lower.DECLARATION if checked is None else x87_lower.CHECKED_DECLARATION)
     lines.extend(f"block_{target:x}: {statement}" for target, statement in exits.items())
     return "\n".join("    " + line for line in lines)
 
