@@ -441,6 +441,26 @@ Each refused server is logged once (`[rt] winhttp: offline, refused <host>:<port
 tried to reach. `runtime/test/winhttp_offline_test.cpp` (ctest `winhttp_offline`) covers the synchronous and
 asynchronous paths with `.invalid` names; it opens no connection.
 
+## The device type is read from the registry
+
+`XSystemGetDeviceType` is not an import and not a runtime class method: `xgameruntime.lib` links it into the title,
+and that copy asks the registry. It opens `HKEY_LOCAL_MACHINE\Software\Microsoft\Windows NT\CurrentVersion\OEM`,
+reads the DWORD value `ConsoleMode`, and turns it into an `XSystemDeviceType`; when the key or the value is missing
+its answer is PC. The package's `XCurl.dll` and `libHttpClient.GDK.dll` both carry that function: the first imports
+`RegOpenKeyW`, `RegQueryValueExW` and `RegCloseKey` from `api-ms-win-core-registry-l1-1-0.dll` and `-l2-1-0.dll`, the
+second from `advapi32.dll`.
+
+Bound to the host those calls find no such key, so a title was told it runs on a PC whatever the shim's
+`XSystemGetDeviceType` export said.
+[sammwyy/xvalkyrie](https://github.com/sammwyy/xvalkyrie/blob/b883d2d85eb8c239c791f3a5f741b6d1b5762450/docs/research/gdk-titles.md)
+(GPL-3.0; facts only) describes the same read and reports a retail title that indexes a jump table with the result
+and crashes on the PC value.
+
+`runtime/shims/xgameruntime.cpp` therefore answers that one key under those three DLL names, with the `ConsoleMode`
+of the device type the export reports (Series X, or `LEONIDA_DEVICE_TYPE`), and passes every other registry call to
+the host. With `LEONIDA_DEVICE_TYPE=1` the key is left to the host, which is how a PC answers. `xgameruntime_test`
+runs the title's sequence against the registry functions the loader would bind.
+
 ## What this proves and what it does not
 
 - It proves the loader parses real Xbox Series PE files, maps their sections, applies no unnecessary relocation,
