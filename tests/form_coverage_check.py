@@ -207,12 +207,13 @@ def check_shader_records():
         ("SOP1", "s_cmov_b64"), ("SOP1", "s_not_b64"), ("SOP1", "s_brev_b64"),
         ("SOP2", "s_and_b64"), ("SOP2", "s_or_b64"), ("SOP2", "s_xor_b64"),
         ("SOP2", "s_andn2_b64"), ("SOP2", "s_orn2_b64"),
+        ("SOP2", "s_nand_b64"), ("SOP2", "s_nor_b64"), ("SOP2", "s_xnor_b64"),
         ("SOP2", "s_lshl_b64"), ("SOP2", "s_lshr_b64"), ("SOP2", "s_ashr_i64"),
         ("SOP2", "s_bfm_b64"), ("SOP2", "s_bfe_u32"), ("SOP2", "s_bfe_i32"),
     }
     rejected_forms = {
         "s_and_saveexec_b64", "s_or_saveexec_b64", "s_andn2_saveexec_b64",
-        "s_cselect_b64", "s_bfe_u64", "s_bfe_i64", "s_nand_b64", "s_nor_b64", "s_xnor_b64",
+        "s_cselect_b64", "s_bfe_u64", "s_bfe_i64",
         "s_cmp_eq_u64", "s_bitcmp1_b64", "s_bfm_b32",
         "s_add_u32", "s_and_b32", "s_not_b32", "s_cmp_eq_i32", "s_cselect_b32",
     }
@@ -295,11 +296,33 @@ def check_dashboard():
     assert "EXP 0/1" in footnotes  # the smallest group cannot hold its label
 
 
+
+def check_cpu_records():
+    forms = {prefix + cc for prefix in ('j', 'set', 'cmov') for cc in ('o', 'no', 'p', 'np')}
+    test = 'cpu_aot_flag_conditions'
+    with tempfile.TemporaryDirectory() as tmp:
+        # The macro body must not supply guessed forms, even when the test passes.
+        root = sample_repo(tmp, {'flag_conditions': 'set&cc al\noperation eax, edx\n'})
+        missing = fc.measure({test: 'pass'}, root)
+        assert missing['x64_zen2']['covered'] == 0
+        passed = fc.measure({test: 'pass'}, root, {test: forms})
+        assert passed['x64_zen2']['covered'] == 12
+        assert passed['x64_zen2']['fixture_forms_not_in_reference'] == []
+        assert passed['shader_records'] == []
+        assert passed['gfx1013']['covered'] == passed['gfx1030']['covered'] == 0
+        assert passed['unclassified'] == []
+        for state in ('fail', 'skip', 'absent'):
+            results = {} if state == 'absent' else {test: state}
+            report = fc.measure(results, root, {test: forms})
+            assert report['x64_zen2']['covered'] == 0
+            assert len(report['x64_zen2']['blocked_by_skip']) == (12 if state == 'skip' else 0)
+
 if __name__ == "__main__":
     check_denominators()
     check_example()
     check_jump_tables()
     check_unclassified()
+    check_cpu_records()
     check_shader_records()
     check_parsing()
     check_dashboard()
