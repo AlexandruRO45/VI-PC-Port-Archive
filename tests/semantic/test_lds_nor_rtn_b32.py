@@ -395,5 +395,136 @@ class TestSymbolicAST(unittest.TestCase):
         self.assertEqual(inst3.to_assembly(), asm3)
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarThreadState:
+    """Architectural register and local memory state for a single scalar lane."""
+
+    def __init__(self, lds: Optional[LDSMemory] = None) -> None:
+        self.vgprs: List[int] = [0] * 256
+        self.lds: LDSMemory = lds if lds is not None else LDSMemory(DEFAULT_LDS_SIZE_BYTES)
+
+    def get_vgpr(self, reg: VGPR) -> int:
+        return self.vgprs[reg.index]
+
+    def set_vgpr(self, reg: VGPR, val: int) -> None:
+        self.vgprs[reg.index] = u32(val)
+
+
+class ScalarDSInterpreter:
+    """Deterministic scalar interpreter for ds_nor_rtn_b32 and ds_nor_b32."""
+
+    def execute(self, state: ScalarThreadState, inst: DSNorRtnB32Instruction) -> Optional[int]:
+        vaddr_val = state.get_vgpr(inst.vaddr)
+        vdata_val = state.get_vgpr(inst.vdata)
+
+        old_val, new_val = state.lds.atomic_nor_rtn_b32(
+            byte_addr=vaddr_val,
+            val=vdata_val,
+            offset=inst.offset.value,
+        )
+
+        if inst.opcode.is_return:
+            assert inst.vdst is not None
+            state.set_vgpr(inst.vdst, old_val)
+            return old_val
+        return None
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction execution."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(DEFAULT_LDS_SIZE_BYTES)
+        self.state = ScalarThreadState(lds=self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_ds_nor_rtn_b32_execution(self) -> None:
+        # LDS[dword 10] = 0x00000000
+        self.lds.write_dword(10, 0x00000000)
+        # v1 (vaddr) = 40 (byte address 40 -> dword 10)
+        self.state.set_vgpr(VGPR(1), 40)
+        # v2 (vdata) = 0x00000000
+        self.state.set_vgpr(VGPR(2), 0x00000000)
+        # v0 (vdst) = sentinel 0xDEADBEEF
+        self.state.set_vgpr(VGPR(0), 0xDEADBEEF)
+
+        inst = DSNorRtnB32Instruction(
+            opcode=DSOpcode.DS_NOR_RTN_B32,
+            vdst=VGPR(0),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        ret = self.interp.execute(self.state, inst)
+
+        # Old value was 0
+        self.assertEqual(ret, 0)
+        self.assertEqual(self.state.get_vgpr(VGPR(0)), 0)
+        # ~(0 | 0) = 0xFFFFFFFF
+        self.assertEqual(self.lds.read_dword(10), 0xFFFFFFFF)
+
+    def test_ds_nor_b32_non_return(self) -> None:
+        self.lds.write_dword(5, 0x0000FFFF)
+        self.state.set_vgpr(VGPR(1), 20)  # dword 5
+        self.state.set_vgpr(VGPR(2), 0xFFFF0000)
+        self.state.set_vgpr(VGPR(0), 0xCAFEBABE)
+
+        inst = DSNorRtnB32Instruction(
+            opcode=DSOpcode.DS_NOR_B32,
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        ret = self.interp.execute(self.state, inst)
+
+        self.assertIsNone(ret)
+        self.assertEqual(self.state.get_vgpr(VGPR(0)), 0xCAFEBABE)  # untouched
+        # ~(0x0000FFFF | 0xFFFF0000) = ~0xFFFFFFFF = 0
+        self.assertEqual(self.lds.read_dword(5), 0x00000000)
+
+    def test_double_nor_not_identity(self) -> None:
+        # Starting with 0x12345678
+        initial = 0x12345678
+        self.lds.write_dword(2, initial)
+        self.state.set_vgpr(VGPR(1), 8)
+        self.state.set_vgpr(VGPR(2), 0)
+
+        inst = DSNorRtnB32Instruction(
+            opcode=DSOpcode.DS_NOR_RTN_B32,
+            vdst=VGPR(0),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+
+        # First NOR with 0: ~(initial | 0) = ~initial
+        ret1 = self.interp.execute(self.state, inst)
+        self.assertEqual(ret1, initial)
+        inverted = (~initial) & MASK32
+        self.assertEqual(self.lds.read_dword(2), inverted)
+
+        # Second NOR with 0: ~(~initial | 0) = ~(~initial) = initial
+        ret2 = self.interp.execute(self.state, inst)
+        self.assertEqual(ret2, inverted)
+        self.assertEqual(self.lds.read_dword(2), initial)
+
+    def test_offset_immediate_computation(self) -> None:
+        self.lds.write_dword(20, 0x55555555)
+        # vaddr = 64 (dword 16), offset = 16 bytes -> dword 20 (80 bytes)
+        self.state.set_vgpr(VGPR(1), 64)
+        self.state.set_vgpr(VGPR(2), 0xAAAAAAAA)
+
+        inst = DSNorRtnB32Instruction(
+            opcode=DSOpcode.DS_NOR_RTN_B32,
+            vdst=VGPR(0),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+            offset=OffsetImmediate(16),
+        )
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, 0x55555555)
+        self.assertEqual(self.lds.read_dword(20), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
