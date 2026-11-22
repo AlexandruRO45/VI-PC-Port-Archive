@@ -330,8 +330,15 @@ def check_image(data: bytes, manifest: dict) -> dict:
         raise AssertionError(
             f"raw is {len(data)} bytes, expected {width * height * 16}"
         )
-    pixels = struct.unpack(f"<{len(data) // 4}f", data)
-    covered = sum(1 for i in range(3, len(pixels), 4) if pixels[i] > 0.5)
+    # The frame is read through a float view: the readback is little-endian, which is the host byte order on x86
+    # and ARM64, so indexing the view gives the channel value without one Python object per channel (a 512x512
+    # RGBA32F frame is 1,048,576 floats: a tuple of them peaks at 33.5 MB, the view allocates nothing). A
+    # big-endian host keeps the explicit little-endian unpack.
+    if sys.byteorder == "little":
+        pixels = memoryview(data).cast("f")
+    else:
+        pixels = struct.unpack(f"<{len(data) // 4}f", data)
+    covered = sum(1 for alpha in pixels[3::4] if alpha > 0.5)
     ratio = covered / (width * height)
     if (
         not manifest.get("min_coverage", 0.0)
@@ -347,7 +354,7 @@ def check_image(data: bytes, manifest: dict) -> dict:
         want = manifest.get("clear", CLEAR)
         if any(abs(pixels[i + c] - want) > 1e-5 for c in range(4)):
             raise AssertionError(
-                f"clear pixel {clear} is {pixels[i : i + 4]}, expected {want}"
+                f"clear pixel {clear} is {tuple(pixels[i : i + 4])}, expected {want}"
             )
     if (uv := manifest.get("centre_uv")) is not None:
         centre = manifest.get("centre_pixel") or [width // 2, height // 2]
@@ -355,7 +362,7 @@ def check_image(data: bytes, manifest: dict) -> dict:
         for c, want in enumerate((uv[0], uv[1], 0.0, 1.0)):
             if abs(pixels[i + c] - want) > 2e-3:
                 raise AssertionError(
-                    f"centre {centre} is {pixels[i : i + 4]}, expected {want} at {c}"
+                    f"centre {centre} is {tuple(pixels[i : i + 4])}, expected {want} at {c}"
                 )
     for probe in manifest.get("uv_probes", []):
         px, py = probe["pixel"]
@@ -364,7 +371,7 @@ def check_image(data: bytes, manifest: dict) -> dict:
         for c, want in enumerate((u, v, 0.0, 1.0)):
             if abs(pixels[i + c] - want) > 2e-3:
                 raise AssertionError(
-                    f"UV probe {probe['pixel']} is {pixels[i : i + 4]}, expected {want} at {c}"
+                    f"UV probe {probe['pixel']} is {tuple(pixels[i : i + 4])}, expected {want} at {c}"
                 )
     return {"covered": covered, "ratio": ratio, "pixels": pixels}
 
