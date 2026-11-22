@@ -825,5 +825,117 @@ class TestValuCvtPkU16F32SIMDDivergence(unittest.TestCase):
                 self.assertEqual(actual, 0x11111111)
 
 
+class TestValuCvtPkU16F32RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_alias_dst_equals_src0(self) -> None:
+        """v_cvt_pk_u16_f32 v0, v0, v1: D aliases with S0."""
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u32(RegKind.VGPR, 0, f32_to_bits(1234.0))
+        interp.write_reg_u32(RegKind.VGPR, 1, f32_to_bits(5678.0))
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_U16_F32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 0),
+            src1=Register(RegKind.VGPR, 1),
+        )
+        res = interp.step(inst)
+        expected = (5678 << 16) | 1234
+        self.assertEqual(res, expected)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), expected)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 1), f32_to_bits(5678.0))
+
+    def test_alias_dst_equals_src1(self) -> None:
+        """v_cvt_pk_u16_f32 v0, v1, v0: D aliases with S1."""
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u32(RegKind.VGPR, 1, f32_to_bits(50.0))
+        interp.write_reg_u32(RegKind.VGPR, 0, f32_to_bits(100.0))
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_U16_F32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+            src1=Register(RegKind.VGPR, 0),
+        )
+        res = interp.step(inst)
+        expected = (100 << 16) | 50
+        self.assertEqual(res, expected)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), expected)
+
+    def test_alias_dst_equals_src0_and_src1(self) -> None:
+        """v_cvt_pk_u16_f32 v0, v0, v0: Full self-aliasing."""
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u32(RegKind.VGPR, 0, f32_to_bits(70000.0))  # > 65535 -> sat to 0xFFFF
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_U16_F32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 0),
+            src1=Register(RegKind.VGPR, 0),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, 0xFFFFFFFF)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), 0xFFFFFFFF)
+
+    def test_duplicate_sources_distinct_destination(self) -> None:
+        """v_cvt_pk_u16_f32 v2, v0, v0: Duplicate sources."""
+        interp = ScalarVALUInterpreter()
+        interp.write_reg_u32(RegKind.VGPR, 0, f32_to_bits(250.0))
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_U16_F32,
+            dst=Register(RegKind.VGPR, 2),
+            src0=Register(RegKind.VGPR, 0),
+            src1=Register(RegKind.VGPR, 0),
+        )
+        res = interp.step(inst)
+        expected = (250 << 16) | 250
+        self.assertEqual(res, expected)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 2), expected)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 0), f32_to_bits(250.0))
+
+    def test_adjacent_register_preservation(self) -> None:
+        interp = ScalarVALUInterpreter()
+        canary_prev = 0xAAAA5555
+        canary_next = 0x5555AAAA
+        interp.write_reg_u32(RegKind.VGPR, 4, canary_prev)
+        interp.write_reg_u32(RegKind.VGPR, 6, canary_next)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_U16_F32,
+            dst=Register(RegKind.VGPR, 5),
+            src0=Immediate(f32_to_bits(1.0)),
+            src1=Immediate(f32_to_bits(2.0)),
+        )
+        interp.step(inst)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 4), canary_prev)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 6), canary_next)
+        self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 5), 0x00020001)
+
+    def test_simd_multi_lane_self_aliasing(self) -> None:
+        simd = SIMDWavefrontInterpreter(wave_size=32)
+        simd.set_exec_mask(0x0000FFFF)  # Low 16 lanes active
+
+        for lane in range(32):
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 0, f32_to_bits(float(lane * 10)))
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_U16_F32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 0),
+            src1=Register(RegKind.VGPR, 0),
+        )
+        simd.step(inst)
+
+        for lane in range(32):
+            actual = simd.read_lane_reg_u32(lane, RegKind.VGPR, 0)
+            if lane < 16:
+                expected = ref_cvt_pk_u16_f32(f32_to_bits(float(lane * 10)), f32_to_bits(float(lane * 10)))
+                self.assertEqual(actual, expected)
+            else:
+                self.assertEqual(actual, f32_to_bits(float(lane * 10)))
+
+
 if __name__ == "__main__":
     unittest.main()
