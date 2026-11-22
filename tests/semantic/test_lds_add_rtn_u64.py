@@ -459,6 +459,206 @@ class TestSymbolicASTAndTypedExpressions(unittest.TestCase):
         self.assertEqual(expr.evaluate(env), 125)
 
 
+# ============================================================================
+# Section 3: Deterministic Scalar Instruction Interpreter
+# ============================================================================
+
+class ScalarMachineState:
+    """Register and memory state for scalar single-thread RDNA2 execution."""
+
+    def __init__(self, lds_capacity_dwords: int = LDS_SIZE_DWORDS) -> None:
+        self.vgprs: List[int] = [0] * DEFAULT_NUM_VGPRS
+        self.sgprs: List[int] = [0] * DEFAULT_NUM_SGPRS
+        self.lds: LDSModel = LDSModel(capacity_dwords=lds_capacity_dwords)
+
+    def get_vgpr(self, idx: int) -> int:
+        if not (0 <= idx < DEFAULT_NUM_VGPRS):
+            raise IndexError(f"VGPR index out of range: {idx}")
+        return self.vgprs[idx]
+
+    def set_vgpr(self, idx: int, val: int) -> None:
+        if not (0 <= idx < DEFAULT_NUM_VGPRS):
+            raise IndexError(f"VGPR index out of range: {idx}")
+        self.vgprs[idx] = u32(val)
+
+    def get_vgpr_qword(self, base_idx: int) -> int:
+        lo = self.get_vgpr(base_idx)
+        hi = self.get_vgpr(base_idx + 1)
+        return combine_u32s_to_u64(lo, hi)
+
+    def set_vgpr_qword(self, base_idx: int, val: int) -> None:
+        lo, hi = split_u64_to_u32s(val)
+        self.set_vgpr(base_idx, lo)
+        self.set_vgpr(base_idx + 1, hi)
+
+    def get_sgpr(self, idx: int) -> int:
+        if not (0 <= idx < DEFAULT_NUM_SGPRS):
+            raise IndexError(f"SGPR index out of range: {idx}")
+        return self.sgprs[idx]
+
+    def set_sgpr(self, idx: int, val: int) -> None:
+        if not (0 <= idx < DEFAULT_NUM_SGPRS):
+            raise IndexError(f"SGPR index out of range: {idx}")
+        self.sgprs[idx] = u32(val)
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for ds_add_rtn_u64."""
+
+    def resolve_qword_operand(
+        self,
+        op: Union[VGPRPair, Immediate64],
+        state: ScalarMachineState,
+    ) -> int:
+        if isinstance(op, VGPRPair):
+            return state.get_vgpr_qword(op.base)
+        elif isinstance(op, Immediate64):
+            return op.value
+        raise TypeError(f"Unsupported operand type: {type(op)}")
+
+    def step(
+        self,
+        instr: DSAddRtnU64Instruction,
+        state: ScalarMachineState,
+    ) -> Tuple[int, int]:
+        """Execute a single ds_add_rtn_u64 instruction deterministically.
+
+        Latching behavior:
+        Both vaddr and vdata0 operands are latched before memory is updated or
+        the return value is written to vdst register pair.
+        """
+        vaddr = state.get_vgpr(instr.addr.index)
+        data = self.resolve_qword_operand(instr.data0, state)
+
+        # Atomic memory update
+        old_val, new_val = state.lds.atomic_add_u64(vaddr, data, offset=instr.offset)
+
+        # Writeback to destination 64-bit register pair
+        state.set_vgpr_qword(instr.dst.base, old_val)
+
+        return old_val, new_val
+
+    def execute_sequence(
+        self,
+        instructions: List[DSAddRtnU64Instruction],
+        state: ScalarMachineState,
+    ) -> List[Tuple[int, int]]:
+        """Execute an ordered sequence of instructions."""
+        return [self.step(instr, state) for instr in instructions]
+
+
+class TestDeterministicScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.state = ScalarMachineState()
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_basic_execution(self) -> None:
+        addr = 0x80
+        init_mem = 0x1000_0000_2000_0000
+        add_val = 0x2000_0000_3000_0000
+        self.state.lds.write_qword(addr, init_mem)
+        self.state.set_vgpr(4, addr)
+        self.state.set_vgpr_qword(2, add_val)
+
+        # ds_add_rtn_u64 v[0:1], v4, v[2:3]
+        instr = DSAddRtnU64Instruction(dst=VGPRPair(0), addr=VGPR(4), data0=VGPRPair(2))
+        old_val, new_val = self.interp.step(instr, self.state)
+
+        self.assertEqual(old_val, init_mem)
+        self.assertEqual(new_val, init_mem + add_val)
+        self.assertEqual(self.state.get_vgpr_qword(0), init_mem)
+        self.assertEqual(self.state.lds.read_qword(addr), init_mem + add_val)
+
+    def test_scalar_with_immediate_operand(self) -> None:
+        addr = 0x100
+        init_mem = 0x0000_0002_0000_0000
+        imm = 0x0000_0000_0000_0005
+        self.state.lds.write_qword(addr, init_mem)
+        self.state.set_vgpr(5, addr)
+
+        # ds_add_rtn_u64 v[6:7], v5, imm
+        instr = DSAddRtnU64Instruction(
+            dst=VGPRPair(6), addr=VGPR(5), data0=Immediate64(imm)
+        )
+        old_val, new_val = self.interp.step(instr, self.state)
+
+        self.assertEqual(old_val, init_mem)
+        self.assertEqual(new_val, init_mem + imm)
+        self.assertEqual(self.state.get_vgpr_qword(6), init_mem)
+        self.assertEqual(self.state.lds.read_qword(addr), init_mem + imm)
+
+    def test_scalar_offset_applied(self) -> None:
+        base_addr = 0x200
+        offset = 0x18
+        eff_addr = base_addr + offset
+        init_mem = 0x1111_1111_1111_1111
+        self.state.lds.write_qword(eff_addr, init_mem)
+        self.state.set_vgpr(1, base_addr)
+        self.state.set_vgpr_qword(2, 0x2222_2222_2222_2222)
+
+        instr = DSAddRtnU64Instruction(
+            dst=VGPRPair(8), addr=VGPR(1), data0=VGPRPair(2), offset=offset
+        )
+        old_val, new_val = self.interp.step(instr, self.state)
+
+        self.assertEqual(old_val, init_mem)
+        self.assertEqual(new_val, init_mem + 0x2222_2222_2222_2222)
+        self.assertEqual(self.state.get_vgpr_qword(8), init_mem)
+        self.assertEqual(self.state.lds.read_qword(eff_addr), new_val)
+
+    def test_scalar_deterministic_instruction_sequence(self) -> None:
+        addr = 0x300
+        self.state.lds.write_qword(addr, 100)
+        self.state.set_vgpr(1, addr)
+
+        seq = [
+            DSAddRtnU64Instruction(
+                dst=VGPRPair(10), addr=VGPR(1), data0=Immediate64(100)
+            ),
+            DSAddRtnU64Instruction(
+                dst=VGPRPair(12), addr=VGPR(1), data0=Immediate64(200)
+            ),
+            DSAddRtnU64Instruction(
+                dst=VGPRPair(14), addr=VGPR(1), data0=Immediate64(300)
+            ),
+        ]
+        results = self.interp.execute_sequence(seq, self.state)
+
+        self.assertEqual(results[0], (100, 200))
+        self.assertEqual(results[1], (200, 400))
+        self.assertEqual(results[2], (400, 700))
+
+        self.assertEqual(self.state.get_vgpr_qword(10), 100)
+        self.assertEqual(self.state.get_vgpr_qword(12), 200)
+        self.assertEqual(self.state.get_vgpr_qword(14), 400)
+        self.assertEqual(self.state.lds.read_qword(addr), 700)
+
+    def test_scalar_matches_oracle_across_patterns(self) -> None:
+        addr = 0x400
+        patterns = [
+            (0, 0),
+            (10, 5),
+            (0x0_FFFF_FFFF, 1),
+            (MASK_64, 1),
+            (0x1234_5678_9ABC_DEF0, 0x0FED_CBA9_8765_4321),
+            (0x8000_0000_0000_0000, 0x8000_0000_0000_0000),
+        ]
+        for initial, add_v in patterns:
+            self.state.lds.write_qword(addr, initial)
+            self.state.set_vgpr(1, addr)
+            self.state.set_vgpr_qword(2, add_v)
+            instr = DSAddRtnU64Instruction(
+                dst=VGPRPair(0), addr=VGPR(1), data0=VGPRPair(2)
+            )
+            old_interp, new_interp = self.interp.step(instr, self.state)
+            old_oracle, new_oracle = oracle_ds_add_rtn_u64(initial, add_v)
+            self.assertEqual(old_interp, old_oracle)
+            self.assertEqual(new_interp, new_oracle)
+
+
+
 
 if __name__ == "__main__":
     unittest.main()
