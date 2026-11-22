@@ -1194,5 +1194,78 @@ class TestValuMqsadPkU32U8StatusFlags(unittest.TestCase):
         self.assertFalse(flags_unclamped.any_clamped)
 
 
+class TestValuMqsadPkU32U8IEEE754Boundaries(unittest.TestCase):
+    """Unit tests for IEEE 754 bit pattern boundaries and integer extreme limits."""
+
+    def test_ieee754_float32_special_bit_patterns_as_raw_bytes(self) -> None:
+        pos_zero = 0x0000_0000
+        neg_zero = 0x8000_0000
+        pos_inf = 0x7F80_0000
+        neg_inf = 0xFF80_0000
+        qnan = 0x7FC0_0000
+        snan = 0x7F80_0001
+
+        patterns = [pos_zero, neg_zero, pos_inf, neg_inf, qnan, snan]
+        for p0 in patterns:
+            for p1 in patterns:
+                ref = (p0 << 32) | p1
+                query = p0
+                acc = 0
+                res = ref_mqsad_pk_u32_u8(ref, query, acc)
+                expected = ref_mqsad_pk_u32_u8(ref, query, acc)
+                self.assertEqual(res, expected)
+
+    def test_subnormal_float_bits_no_ftz(self) -> None:
+        sub1 = 0x0000_0001
+        sub2 = 0x0000_0002
+        ref = (sub1 << 32) | sub1
+        query = sub2
+        res = ref_mqsad_pk_u32_u8(ref, query, 0)
+        d0, _, _, _ = unpack_u32x4(res)
+        # Byte 0 of sub2 is 2 (nonzero, so not masked!)
+        # Byte 0 of sub1 is 1 -> |1 - 2| = 1
+        self.assertEqual(d0, 1)
+
+    def test_nan_payload_preservation_and_integer_arithmetic(self) -> None:
+        snan = 0x7F80_0001  # bytes: 01, 00, 80, 7F
+        qnan = 0x7FC0_0000  # bytes: 00, 00, C0, 7F
+        ref = (snan << 32) | snan
+        query = qnan
+        res = ref_mqsad_pk_u32_u8(ref, query, 0)
+        d0, _, _, _ = unpack_u32x4(res)
+        # Query bytes:
+        # byte 0: 0x00 -> masked out (diff = 0)
+        # byte 1: 0x00 -> masked out (diff = 0)
+        # byte 2: 0xC0 -> |0x80 - 0xC0| = 64
+        # byte 3: 0x7F -> |0x7F - 0x7F| = 0
+        # Total MSAD = 64
+        self.assertEqual(d0, 64)
+
+    def test_byte_extreme_boundary_matrix(self) -> None:
+        byte_extremes = [0x00, 0x01, 0x7F, 0x80, 0xFE, 0xFF]
+        for b0 in byte_extremes:
+            for b1 in byte_extremes:
+                slice4 = pack_u8x8(b0, b0, b0, b0, 0, 0, 0, 0) & MASK32
+                query4 = pack_u8x8(b1, b1, b1, b1, 0, 0, 0, 0) & MASK32
+                sad = ref_msad_u8_quad(slice4, query4)
+                expected = 0 if (b1 == 0) else (4 * abs(b0 - b1))
+                self.assertEqual(sad, expected)
+
+    def test_accumulator_32bit_extreme_boundaries(self) -> None:
+        acc_extremes = [0x0000_0000, 0x0000_0001, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFE, 0xFFFF_FFFF]
+        ref = pack_u8x8(0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF)
+        query = 0x01010101  # SAD = 4 * 254 = 1016
+
+        for a in acc_extremes:
+            acc = pack_u32x4(a, a, a, a)
+            res_unclamped = ref_mqsad_pk_u32_u8(ref, query, acc, clamp=False)
+            d_unclamped, _, _, _ = unpack_u32x4(res_unclamped)
+            self.assertEqual(d_unclamped, (1016 + a) & MASK32)
+
+            res_clamped = ref_mqsad_pk_u32_u8(ref, query, acc, clamp=True)
+            d_clamped, _, _, _ = unpack_u32x4(res_clamped)
+            self.assertEqual(d_clamped, min(1016 + a, MASK32))
+
+
 if __name__ == "__main__":
     unittest.main()
