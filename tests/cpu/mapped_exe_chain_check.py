@@ -9,8 +9,12 @@ from native_map_check import Mapper, STATUS
 
 
 def mapped_child(mapper_path, image, io, mix):
-    mapper = Mapper(mapper_path)
     providers = {p.name.lower(): ctypes.CDLL(str(p)) for p in (io, mix)}
+    return run_mapped(mapper_path, image, providers)
+
+
+def run_mapped(mapper_path, image, providers):
+    mapper = Mapper(mapper_path)
     base, status, detail, _ = mapper(image, providers)
     if not base or status != STATUS["ok"]:
         raise AssertionError(f"mapping {image.name}: {status}, {detail}")

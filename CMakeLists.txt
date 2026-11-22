@@ -1034,6 +1034,32 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_import_original_lifted>" "$<TARGET_FILE:cpu_import_provider>"
         "$<TARGET_FILE:cpu_import_altered>" "$<TARGET_FILE:cpu_register_probe>")
     add_library(cpu_exe_io SHARED tests/cpu/exe_io.cpp)
+    function(crc_line_program target polynomial)
+        # Use the same optimized source PE as input to both Debug and Release AOT builds.
+        set(crc_object "${CMAKE_CURRENT_BINARY_DIR}/${target}_step.obj")
+        add_custom_command(OUTPUT "${crc_object}"
+            COMMAND "${CMAKE_CXX_COMPILER}" /nologo /c /O1 /GS- /Zl "/DCRC_POLYNOMIAL=${polynomial}" "/Fo${crc_object}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/crc_line/crc_step.cpp"
+            DEPENDS tests/cpu/crc_line/crc_step.cpp VERBATIM)
+        add_executable(${target} tests/cpu/crc_line/entry.asm "${crc_object}")
+        set_target_properties(${target} PROPERTIES LINKER_LANGUAGE CXX)
+        target_link_options(${target} PRIVATE /ENTRY:program_entry /EXPORT:crc_step /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+        target_link_libraries(${target} PRIVATE ucrt)
+        set(crc_source "${CMAKE_CURRENT_BINARY_DIR}/${target}_lifted.cpp")
+        add_custom_command(OUTPUT "${crc_source}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tools/cpu_stdio_exe_aot.py"
+                "$<TARGET_FILE:${target}>" "${crc_source}"
+            DEPENDS ${target} tools/cpu_stdio_exe_aot.py tools/cpu_switch_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py
+            VERBATIM)
+        add_executable(${target}_lifted "${crc_source}")
+        set_target_properties(${target}_lifted PROPERTIES MSVC_RUNTIME_LIBRARY MultiThreadedDLL)
+    endfunction()
+    crc_line_program(cpu_crc_line 0xedb88320u)
+    crc_line_program(cpu_crc_castagnoli 0x82f63b78u)
+    add_test(NAME cpu_native_crc_line COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/crc_line_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_crc_line>" "$<TARGET_FILE:cpu_crc_line_lifted>"
+        "$<TARGET_FILE:cpu_crc_castagnoli>" "$<TARGET_FILE:cpu_crc_castagnoli_lifted>")
     foreach(variant IN ITEMS original inverted pair swapped framed image)
         set(native cpu_exe_${variant})
         set(lifted ${native}_lifted)

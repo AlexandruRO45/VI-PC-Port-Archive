@@ -102,9 +102,10 @@ import hashlib
 import json
 from pathlib import Path
 import struct
+from typing import NamedTuple
 
 import pefile
-from iced_x86 import (ConditionCode as CC, Decoder, FlowControl, InstructionInfoFactory, MemorySizeExt,
+from iced_x86 import (Code, ConditionCode as CC, Decoder, FlowControl, InstructionInfoFactory, MemorySizeExt,
                       Mnemonic as M, OpAccess, OpKind, Register as R, RegisterExt)
 
 from cpu_leaf_aot import export_rva
@@ -129,7 +130,7 @@ MAX_FRAME = 4096
 HOME_SIZE = 32
 HIGH_BYTES = {R.AH, R.BH, R.CH, R.DH}
 # Flow that continues at the next instruction (a direct call does once its callee returns).
-STRAIGHT = (FlowControl.NEXT, FlowControl.CONDITIONAL_BRANCH, FlowControl.CALL)
+STRAIGHT = (FlowControl.NEXT, FlowControl.CONDITIONAL_BRANCH, FlowControl.CALL, FlowControl.INDIRECT_CALL)
 MAX_CALLEES = 256
 ALU = {M.ADD: "+", M.SUB: "-", M.AND: "&", M.OR: "|", M.XOR: "^"}
 SHIFTS = {M.SHL: "<<", M.SHR: ">>", M.SAR: ">>"}
@@ -421,7 +422,7 @@ class Function:
         for address in range(begin, end):
             self.owner[address] = owner
 
-    def explore(self):
+    def explore(self, imports=None):
         pending = [self.entry]
         indirect = []
         while pending or indirect:
@@ -454,6 +455,10 @@ class Function:
                 targets = [ins.near_branch_target]
             elif flow == FlowControl.CALL and ins.is_call_near:
                 self.calls[ip] = self.callee(ins)
+                targets = [ins.next_ip]
+            elif (ins.code == Code.CALL_RM64 and imports and ins.memory_base == R.RIP
+                  and not ins.has_segment_prefix and ins.ip_rel_memory_address in imports):
+                self.calls[ip] = ins.ip_rel_memory_address
                 targets = [ins.next_ip]
             elif flow == FlowControl.RETURN and ins.mnemonic == M.RET and (ins.op_count == 0 or ins.immediate(0) == 0):
                 targets = []
@@ -1152,13 +1157,24 @@ def lift(pe, name, arguments=DEFAULT_ARGUMENTS, program=None, *, image_data=Fals
     return program.lift(entry, f"lifted_{name}", ARGUMENT_REGISTERS[:arguments])
 
 
+class HostImport(NamedTuple):
+    symbol: str
+    widths: tuple
+    return_width: int
+
+    @property
+    def demands(self):
+        return dict(zip(ARGUMENT_REGISTERS, self.widths))
+
+
 class Program:
     """The functions of one image reached from the requested exports through direct calls and tail
     jumps. Each callee is translated once, in internal mode, and its source precedes its callers'."""
 
-    def __init__(self, pe, bindings=None, *, image_data=False):
+    def __init__(self, pe, bindings=None, *, image_data=False, imports=None):
         self.pe = pe
         self.image_data = image_data
+        self.imports = imports or {}
         self.entries = Entries(pe, bindings)
         self.active = []
         self.callees = {}
@@ -1236,7 +1252,7 @@ def lift_function(program, entry, symbol, arguments, internal):
         if first.flow_control == FlowControl.INDIRECT_BRANCH and first.op0_kind == OpKind.MEMORY:
             raise ValueError(f"bound function {function.bound[2]} at RVA {entry:#x} is an import thunk "
                              "(an indirect jump through memory)")
-    edges = function.explore()
+    edges = function.explore(program.imports)
     image_data = program.image_data
     lifter = Lifter(pe if image_data else None)
     # A RIP-relative LEA that loads a recognised table base stays a guest address, with or without image data.
@@ -1257,7 +1273,9 @@ def lift_function(program, entry, symbol, arguments, internal):
                  if ins.flow_control == FlowControl.CONDITIONAL_BRANCH or ins.mnemonic in SETCC | CMOVCC}
     sets_flags = {producer.ip for producer in producers.values()}
     # Callees are translated first: the caller's definedness pass needs their return widths and demands.
-    callees = {ip: program.callee(target, ip) for ip, target in sorted({**function.calls, **function.tails}.items())}
+    callees = {ip: (program.imports[target] if instructions[ip].flow_control == FlowControl.INDIRECT_CALL
+                    else program.callee(target, ip))
+               for ip, target in sorted({**function.calls, **function.tails}.items())}
     loads = {sequence[0]: index for index, _, sequence, _, _, _ in function.dispatches.values()}
     skipped = {ip for _, _, sequence, _, _, _ in function.dispatches.values() for ip in sequence}
     body = {}
@@ -1269,7 +1287,10 @@ def lift_function(program, entry, symbol, arguments, internal):
         body[ip] = ""
         if ip in callees:
             callee = callees[ip]
-            call = f"fn_{callee.entry:x}({', '.join(lifter.reg(r) for r in ARGUMENT_REGISTERS)})"
+            if isinstance(callee, HostImport):
+                call = f"{callee.symbol}({', '.join(lifter.reg(r) for r in callee.demands)})"
+            else:
+                call = f"fn_{callee.entry:x}({', '.join(lifter.reg(r) for r in ARGUMENT_REGISTERS)})"
             lifter.used.add(R.RAX)
             # A tail jump returns the callee's RAX; a call leaves it in RAX.
             body[ip] = f"return {call};" if ip in function.tails else f"rax = {call};"

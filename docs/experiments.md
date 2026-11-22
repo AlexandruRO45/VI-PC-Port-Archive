@@ -28,6 +28,19 @@ dumpbin /imports .\out\build\dev\d3d12_sdk_check.exe
 
 Build outputs and downloaded tool sources live under `out/`. [Microsoft xbdepends documentation](https://learn.microsoft.com/en-us/samples/microsoft/xbox-gdk-samples/xbdepends/)
 
+## CRC-32 console program from the PE entry
+
+`cpu_crc_line` reads the first text line from stdin and writes eight uppercase hexadecimal digits and a newline. Its [MASM entry](../tests/cpu/crc_line/entry.asm) handles input, formatting and exit status. MSVC compiles the [CRC update](../tests/cpu/crc_line/crc_step.cpp) as a separate optimized object. The linker imports the real Windows Universal CRT stdio functions through `ucrt.lib`. The source PE has a return-based entry and uses no CRT startup stub.
+
+The [console translator](../tools/cpu_stdio_exe_aot.py) starts at `AddressOfEntryPoint` with no defined argument registers. On MSVC 19.51 the first refusal before enabling imports was at RVA `0x103d`, the call through the IAT to `getchar`. The translator binds near RIP-relative calls by their IAT slots, DLL and symbol, with the argument widths and defined return bytes of `getchar`, `putchar` and `fflush`. It follows the direct call to the compiled CRC routine and emits both functions from the linked instructions. Only the generated C++ is compiled into the AOT executable. The host supplies the UCRT calls. The test rejects a copy that names a different provider.
+
+The [Windows comparison](../tests/cpu/crc_line_check.py) launches the native EXE, a child running the same PE with `pe_map_run`, and the AOT EXE. The mapped child restores normal UCRT text-mode pipes before entry. All three produced `CBF43926\r\n` for `123456789` and exited 0. They also agreed on CRLF, a final line without a newline, an empty line and a 13,000-byte line. EOF before any input produced no output and exit 1. A read-only stdout handle left the sink unchanged and produced exit 2. A separately linked and retranslated Castagnoli polynomial control produced `E3069283\r\n` on the same standard vector.
+
+```powershell
+cmake --build --preset dev --target cpu_crc_line_lifted cpu_crc_castagnoli_lifted pe_map
+ctest --preset dev --no-tests=error -R '^cpu_native_crc_line$' -V
+```
+
 ## Source-built EXE entry to a DLL import
 
 MSVC assembles a small CRT-free [EXE entry body](../tests/cpu/exe_entry.asm) and links it with the existing `call_mix` fixture. The [translator](../tools/cpu_exe_aot.py) takes the fixture's `native_entry` export through `--entry-export`, reads its unwind-bounded instruction range, follows the relative call to `call_mix`, and resolves its IAT slot against `cpu_import_provider.dll!mix_args`. It emits both functions as C++. The translated EXE uses ordinary Windows C++ startup to enter the generated `main`. Both versions use the same native provider and the same I/O DLL.
