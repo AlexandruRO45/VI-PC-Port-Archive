@@ -1869,7 +1869,7 @@ class Gen:
         elif dst["k"] == "special" and dst["t"] in ("vcc", "vcc_lo"):
             self.emit(f"OpStore %vcc {r}")
         elif dst["k"] == "sgpr":
-            self.mask_dst(dst, r)
+            self.valu_mask_dst(dst, r)
         else:
             raise Unsupported("v_cmp destination")
 
@@ -4371,7 +4371,7 @@ class Gen:
         if len(a) == 2 or (d["k"] == "special" and d["t"] in ("vcc", "vcc_lo")):
             self.emit(f"OpStore %vcc {r}")
         else:
-            self.mask_dst(d, r)
+            self.valu_mask_dst(d, r)
 
     @staticmethod
     def mod_int(mods, name, default):
@@ -6095,6 +6095,11 @@ class Gen:
             self.emit(f"{t} = OpNot %uint {r}")
             r = t
         return r
+
+    def valu_mask_dst(self, d, v):
+        """mask_dst for a VALU lane-mask SDST (v_cmp_*_e64, carry-outs): in wave64 one printed SGPR is the pair
+        (lane_masks.mask_sdst), and both registers are written, as s_and_b64 / mask_src read s[r+1] for lanes 32-63."""
+        self.mask_dst(lane_masks.mask_sdst(d, self.wave64), v)
 
     def mask_dst(self, d, v):
         if d["k"] == "special" and d["t"] in ("exec", "exec_lo"):
@@ -8241,7 +8246,7 @@ class Gen:
             if d["k"] == "special" and d["t"] in ("vcc", "vcc_lo"):
                 self.emit(f"OpStore %vcc {r}")
             else:
-                self.mask_dst(d, r)
+                self.valu_mask_dst(d, r)
         elif op == "v_alignbit_b32":
             # (({src0, src1} as 64 bits) >> (src2 & 31)) low 32 bits
             # (32 - m) & 31 keeps the left shift below 32 when m == 0; that result is discarded by the OpSelect.
@@ -9033,7 +9038,7 @@ class Gen:
                 if d["k"] == "special" and d["t"] in ("vcc", "vcc_lo"):
                     self.emit(f"OpStore %vcc {r}")
                 else:
-                    self.mask_dst(d, r)
+                    self.valu_mask_dst(d, r)
         elif op == "s_not_b32":
             to_mask_dst, dst_half = self._mask_b32_dst_half(a[0], a[1:2])
             x_val = self.imm_val(a[1])
@@ -9174,7 +9179,7 @@ class Gen:
                 cm, m = self.tmp(), self.tmp()
                 self.emit(f"{cm} = OpLogicalAnd %bool {carry_nz} {self.active_b()}")  # inactive lanes write 0
                 self.emit(f"{m} = OpSelect %uint {cm} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
-                self.mask_dst(cd, m)
+                self.valu_mask_dst(cd, m)
         elif op == "v_mul_legacy_f32":
             # The inferred game's f32 denorm mode is flush-in/flush-out. Unlike an IEEE multiply, the legacy
             # zero override gives +0 even when a negative subnormal operand becomes -0 after input flushing.
@@ -11484,7 +11489,7 @@ class Gen:
                 bm, m = self.tmp(), self.tmp()
                 self.emit(f"{bm} = OpLogicalAnd %bool {self.tmp_bool_nz(bit64)} {self.active_b()}")  # inactive lanes write 0
                 self.emit(f"{m} = OpSelect %uint {bm} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
-                self.mask_dst(sd, m)
+                self.valu_mask_dst(sd, m)
         elif op in ("v_mad_u32_u16", "v_mad_i32_i16"):
             # D = S0.half * S1.half + S2 (RDNA ISA pseudocode), wrapping at 32 bits: the 16-bit halves zero-extended
             # (u16) or sign-extended (i16); op_sel bits 0 / 1 read the high half of S0 / S1. Measured on RDNA2

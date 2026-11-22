@@ -136,10 +136,22 @@ def lane_slot(vgpr, lane):
     return ("lane", vgpr["r"], lane["v"] & 63)
 
 
-def step(state, ins, wave64=True):
+def mask_sdst(a, wave64):
+    """The SGPRs a VALU lane-mask destination writes. The shaders are disassembled for wave32 (shader_disasm.py,
+    gfx1013 without +wavefrontsize64), so the 64-bit SDST of a wave64 v_cmp_*_e64 or carry-out prints as one
+    register (v_cmp_gt_f32_e64 s0, ...), while the wave writes s[0:1]. Taken as one register, s1 was unknown, so
+    a later s_and_b64 s[4:5], s[0:1], s[2:3] counted as 64-bit data: its SCC was this lane's bit instead of the
+    wave's, and s_bcnt1_i32_b64 of it counted data bits (GPU test cs_w64_sdst_pair)."""
+    if wave64 and a["k"] == "sgpr" and a.get("n", 1) == 1:
+        return dict(a, n=2)
+    return a
+
+
+def step(state, ins, wave64=None):
     """Update `state` (register -> MASK | MASK_LO | MASK_HI | EITHER) for one instruction. True if it writes a mask to a VGPR.
 
-    `wave64` False: the program runs in 32-lane waves, where a 64-bit s_bfm_b64 result can't be a lane mask."""
+    With no wave size, keep the printed SDST width and the legacy s_bfm_b64 mask classification.
+    Explicit wave32 treats s_bfm_b64 as data; explicit wave64 expands a single-register VALU mask destination."""
     op, a = base_op(ins["op"]), ins["args"]
     if not a or op.startswith(NO_DESTINATION):
         return
@@ -167,7 +179,7 @@ def step(state, ins, wave64=True):
         return
     if op.startswith("v_cmp"):
         # Handle v_cmp before VGPR clobber (defensive for 2-operand forms with implicit vcc).
-        put(state, {"k": "special", "t": "vcc"} if len(a) == 2 else a[0], MASK)
+        put(state, {"k": "special", "t": "vcc"} if len(a) == 2 else mask_sdst(a[0], wave64), MASK)
         return
     if op == "v_swap_b32":
         written = set()
@@ -214,7 +226,7 @@ def step(state, ins, wave64=True):
     elif op == "s_bfm_b64":
         # In wave32 code it is 64-bit data, e.g. the first two words of an S# built in place (the pipeline library's
         # wave32 compute programs: s_bfm_b64 s[88:89], 2, 54); rdna2spirv computes the value there.
-        put(state, a[0], MASK if wave64 else None)
+        put(state, a[0], MASK if wave64 is not False else None)
     elif op.startswith(COPIES) and len(a) > 1:
         k = kind(state, a[1])
         dst_t = a[0].get("t") if a[0]["k"] == "special" else None
@@ -248,7 +260,7 @@ def step(state, ins, wave64=True):
         put(state, a[0], None)
         if ((op.startswith("v_") and "_co_" in op)
                 or op in ("v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64")) and len(a) > 1:
-            put(state, a[1], MASK)                      # carry/sign/scale lane mask of VOP3b ops
+            put(state, mask_sdst(a[1], wave64), MASK)   # carry/sign/scale lane mask of VOP3b ops
 
 
 def parked(blocks, masks):
@@ -264,7 +276,7 @@ def parked(blocks, masks):
     return sorted(found)
 
 
-def analyse(blocks, succ, *, include_either=False, wave64=True):
+def analyse(blocks, succ, *, include_either=False, wave64=None):
     entry = [None] * len(blocks)                        # None: not reached yet
     if blocks:
         entry[0] = {}
