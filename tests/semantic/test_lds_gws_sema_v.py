@@ -553,5 +553,73 @@ class TestGWSSemaVSIMD(unittest.TestCase):
         self.assertEqual(res["final_value"], 2)
 
 
+class TestGWSSemaVRegisterAliasing(unittest.TestCase):
+    """Commit 5: Register aliasing and in-place operand preservation for ds_gws_sema_v."""
+
+    def test_m0_register_invariance(self) -> None:
+        interp = ScalarInterpreter()
+        initial_m0 = 42
+        interp.rf.m0 = initial_m0
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_V, offset=7)
+        interp.step(instr)
+
+        # M0 must remain exactly intact
+        self.assertEqual(interp.rf.m0, initial_m0)
+
+    def test_vdata_operand_invariance(self) -> None:
+        interp = ScalarInterpreter()
+        test_val = 0xDEADBEEF
+        interp.rf.set_vgpr(5, test_val)
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_V, vdata=Register(5, RegKind.VGPR), offset=1)
+        interp.step(instr)
+
+        self.assertEqual(interp.rf.get_vgpr(5), test_val)
+
+    def test_comprehensive_register_file_preservation(self) -> None:
+        interp = ScalarInterpreter()
+        # Seed all 256 VGPRs and 104 SGPRs with pseudo-random pattern
+        for i in range(256):
+            interp.rf.set_vgpr(i, (i * 0x01010101 + 0x5A) & MASK32)
+        for i in range(104):
+            interp.rf.set_sgpr(i, (i * 0x11111111 + 0x3C) & MASK32)
+
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_V, vdata=Register(10, RegKind.VGPR), offset=3)
+        interp.step(instr)
+
+        for i in range(256):
+            expected = (i * 0x01010101 + 0x5A) & MASK32
+            self.assertEqual(interp.rf.get_vgpr(i), expected, f"VGPR v{i} clobbered")
+        for i in range(104):
+            expected = (i * 0x11111111 + 0x3C) & MASK32
+            self.assertEqual(interp.rf.get_sgpr(i), expected, f"SGPR s{i} clobbered")
+
+    def test_simd_multi_lane_vdata_preservation(self) -> None:
+        simd = SIMDInterpreter()
+        wave = SIMDWaveState(wave_id=10, wave_size=32, exec_mask=0x00FF_00FF)
+        for lane in range(32):
+            wave.set_vgpr(lane, 2, (0xCAFE0000 | lane))
+
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_V, vdata=Register(2, RegKind.VGPR), offset=0)
+        simd.step_wave(wave, instr)
+
+        # Every lane (both active and inactive) must preserve its vdata untouched
+        for lane in range(32):
+            expected = 0xCAFE0000 | lane
+            self.assertEqual(wave.get_vgpr(lane, 2), expected, f"Lane {lane} VGPR v2 mutated")
+
+    def test_repeated_in_place_execution_loop(self) -> None:
+        interp = ScalarInterpreter()
+        interp.rf.m0 = 5
+        interp.rf.set_vgpr(0, 0x11223344)
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_V, vdata=Register(0, RegKind.VGPR), offset=0)
+
+        for _ in range(20):
+            interp.step(instr)
+
+        self.assertEqual(interp.rf.get_vgpr(0), 0x11223344)
+        self.assertEqual(interp.rf.m0, 5)
+        self.assertEqual(interp.gws.resources[5].value, 20)
+
+
 if __name__ == "__main__":
     unittest.main()
