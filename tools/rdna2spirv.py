@@ -4064,8 +4064,8 @@ class Gen:
     def div_scale_f64(self, a, mods):
         """v_div_scale_f64 D, sdst, S0, S1, S2 (S1 the denominator, S2 the numerator, S0 one of them): pre-scales
         an operand of a double division by 2**+-128 and sets the sdst lane bit when the later v_div_fmas_f64 must
-        undo a scaling. Measured natively on RDNA2 gfx1036 (tools/hw_oracle, 1,900 operand triples), which differs
-        from the ISA pseudocode. With e1, e2 the biased exponent fields of S1, S2 (0 for zero and denormals, 2047
+        undo a scaling. Measured natively on RDNA2 gfx1036 (tools/hw_oracle, 2,008 operand triples, the same with
+        IEEE on and with the game's MODE: IEEE off), which differs from the ISA pseudocode. With e1, e2 the biased exponent fields of S1, S2 (0 for zero and denormals, 2047
         for inf and NaN; the mantissas play no part), the first rule that matches wins:
           e2 - e1 >= 768             sdst=1, D = S0 == S1 ? S0 * 2**128 : S0
           e1 == 0                    D = S0 * 2**128
