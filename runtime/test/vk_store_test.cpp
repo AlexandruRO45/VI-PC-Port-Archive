@@ -1,6 +1,6 @@
 // Headless Vulkan test for translated typed image stores and loads (runtime/test/shaders/cs_imgstore.asm and
 // cs_imgload.asm).
-// Usage: vk_store_test cs.spv [load|load-d16|words]
+// Usage: vk_store_test cs.spv [load|load-d16|words|sample-l]
 // The shader builds three T#s (word1 FORMAT = 56 rgba8 unorm, 20 r32 uint, 21 r32 sint) and stores to three 8x8
 // images. The translator picks the float / uint / sint view (set 0, bindings 8 / 9 / 10 for 2D) from the FORMAT
 // field, and the bindless index from the descriptor hash table (binding 2). As in the runtime, each image has its
@@ -15,6 +15,11 @@
 // bound for these shaders in every mode: the uint image as an r32ui storage image at set 0 binding 4 and the volume
 // at binding 7, where 2D and 3D image atomics address their image, and at index 4 of the sampled array a 16x4 rgba8
 // image with all five mip levels (never read, only queried), behind the T# the runtime writes for such an image.
+// "sample-l" (cs_sample_l_int.asm): the uint and sint images are filled as for "load" and the rgba8 image with the
+// gradient its check expects. The shader samples them with image_sample_l: the sint image receives the uint plus the
+// sint texel (100 - i) when its 32-bit and D16 samples agree, and the uint image round(r * 255) of the float fallback
+// an unregistered T# selects, which is the rgba8 image at index 0 (round(x / 7 * 255)). The rgba8 image is not
+// written and keeps its gradient.
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
@@ -58,7 +63,7 @@ static void table_insert(std::vector<uint32_t>& t, const uint32_t key[8], uint32
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: vk_store_test cs.spv [load|load-d16|words]\n"); return 2; }
+    if (argc < 2) { std::fprintf(stderr, "usage: vk_store_test cs.spv [load|load-d16|words|sample-l]\n"); return 2; }
     gipa = load_vulkan();
     if (!gipa) return 1;
 #define LOADI(name) auto name = reinterpret_cast<PFN_##name>(gipa(inst, #name))
@@ -115,7 +120,9 @@ int main(int argc, char** argv) {
     const bool load_mode = packed_load || (argc > 2 && !std::strcmp(argv[2], "load"));
     // "words" mode: the two images filled as for "load"; the shader's results are whatever it leaves in them.
     const bool words_mode = argc > 2 && !std::strcmp(argv[2], "words");
-    const bool filled = load_mode || words_mode;
+    // "sample-l" mode: filled as for "load", plus the rgba8 gradient the float fallback reads.
+    const bool sample_mode = argc > 2 && !std::strcmp(argv[2], "sample-l");
+    const bool filled = load_mode || words_mode || sample_mode;
     std::ifstream f(argv[1], std::ios::binary);
     std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
     if (code.size() < 20 || code.size() % 4) { std::fprintf(stderr, "%s: not a SPIR-V module\n", argv[1]); return 1; }
@@ -366,6 +373,16 @@ int main(int argc, char** argv) {
             static_cast<int32_t*>(fillp[1])[i] = edge ? boundary[i % W].s : -2 * int32_t(i);
         }
     }
+    // Sample-l mode: the rgba8 image holds the gradient its check below expects before the dispatch.
+    VkBuffer rgba_fill{}; void* rgba_fillp = nullptr;
+    if (sample_mode) {
+        CHECK(make_buffer(W * W * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &rgba_fill, &rgba_fillp));
+        for (uint32_t i = 0; i < W * W; i++) {
+            uint8_t* c = static_cast<uint8_t*>(rgba_fillp) + 4 * i;
+            c[0] = uint8_t(std::lround(i % W / 7.0 * 255)); c[1] = uint8_t(std::lround(i / W / 7.0 * 255));
+            c[2] = 128; c[3] = 255;
+        }
+    }
     // The volume's fill and its read-back, used in words mode.
     const uint32_t vol_texels = VOL * VOL * VOL;
     VkBuffer vol_fill{}, vol_rb{}; void* vol_fillp = nullptr; void* vol_rbp = nullptr;
@@ -388,7 +405,7 @@ int main(int argc, char** argv) {
         ib[k].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         ib[k].srcQueueFamilyIndex = ib[k].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         ib[k].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        if (filled && k > 0) {   // filled by a copy first
+        if (filled && (k > 0 || sample_mode)) {   // filled by a copy first
             ib[k].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; ib[k].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         }
     }
@@ -421,16 +438,18 @@ int main(int argc, char** argv) {
                              0, nullptr, 1, &vol_ib);
     }
     if (filled) {
-        for (int k = 1; k < 3; k++) {
+        const int first = sample_mode ? 0 : 1;   // sample-l fills the rgba8 image too
+        for (int k = first; k < 3; k++) {
             VkBufferImageCopy bic{};
             bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; bic.imageExtent = {W, W, 1};
-            vkCmdCopyBufferToImage(cmd, fill[k - 1], img[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+            vkCmdCopyBufferToImage(cmd, k ? fill[k - 1] : rgba_fill, img[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                                   &bic);
             ib[k].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; ib[k].newLayout = VK_IMAGE_LAYOUT_GENERAL;
             ib[k].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             ib[k].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         }
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,
-                             nullptr, 0, nullptr, 2, ib + 1);
+                             nullptr, 0, nullptr, 3 - first, ib + first);
     }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &ds, 0, nullptr);
@@ -486,9 +505,12 @@ int main(int argc, char** argv) {
             int er = int(std::lround(x / 7.0 * 255)), eg = int(std::lround(y / 7.0 * 255));
             if (std::abs(c[0] - er) > 1 || std::abs(c[1] - eg) > 1 || std::abs(c[2] - 128) > 1 || c[3] != 255) bad[0]++;
             const bool edge = packed_load && y == W - 1;
-            if (static_cast<const uint32_t*>(rbp[1])[i] != (edge ? boundary[x].u : 100 + i)) bad[1]++;
-            // load: the uint texel (100 + 8y + x) plus the sint one (-2 (8y + x)), both read with image_load
-            const int32_t want_s = edge ? boundary[x].sum : load_mode ? 100 - int32_t(i) : -int32_t(i);
+            // sample-l: the uint image holds round(r * 255) of the float fallback, the rgba8 texel's red byte
+            const uint32_t want_u = sample_mode ? uint32_t(er) : edge ? boundary[x].u : 100 + i;
+            if (static_cast<const uint32_t*>(rbp[1])[i] != want_u) bad[1]++;
+            // load: the uint texel (100 + 8y + x) plus the sint one (-2 (8y + x)), both read with image_load;
+            // sample-l: the same sum, both read with image_sample_l
+            const int32_t want_s = edge ? boundary[x].sum : (load_mode || sample_mode) ? 100 - int32_t(i) : -int32_t(i);
             if (static_cast<const int32_t*>(rbp[2])[i] != want_s) bad[2]++;
         }
     const uint8_t* c = static_cast<const uint8_t*>(rbp[0]) + 4 * (3 * W + 5);
