@@ -875,5 +875,142 @@ class TestIEEE754BoundaryExtremesAndBitwiseLimits(unittest.TestCase):
             self.assertEqual(old, 0)
             self.assertEqual(mem, mask)
 
+# ==============================================================================
+# Phase 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+def parse_ds_xor_b64_assembly(asm_str: str) -> DSXor64Instruction:
+    text = asm_str.strip()
+    if not text:
+        raise ValueError("Empty assembly string")
+
+    parts = text.replace(",", " ").split()
+    if not parts:
+        raise ValueError("Empty assembly string")
+
+    op_str = parts[0].lower()
+    if op_str == "ds_xor_rtn_b64":
+        opcode = DSOpcode64.DS_XOR_RTN_B64
+    elif op_str == "ds_xor_b64":
+        opcode = DSOpcode64.DS_XOR_B64
+    else:
+        raise ValueError(f"Unknown opcode '{op_str}', expected ds_xor_rtn_b64 or ds_xor_b64")
+
+    offset = 0
+    clean_parts: List[str] = [parts[0]]
+    for token in parts[1:]:
+        if token.lower().startswith("offset:"):
+            try:
+                offset_val = int(token.split(":", 1)[1], 0)
+            except ValueError as exc:
+                raise ValueError(f"Invalid offset format: {token}") from exc
+            if not (0 <= offset_val <= 65535):
+                raise ValueError(f"Offset {offset_val} out of 16-bit range [0, 65535]")
+            offset = offset_val
+        else:
+            clean_parts.append(token)
+
+    def parse_reg_pair(token: str, expected_type: str) -> Union[VGPRPair, SGPRPair]:
+        t = token.lower()
+        if t.startswith("v[") and t.endswith("]") and ":" in t:
+            inner = t[2:-1]
+            base_str, hi_str = inner.split(":", 1)
+            prefix = "v"
+        elif t.startswith("s[") and t.endswith("]") and ":" in t:
+            inner = t[2:-1]
+            base_str, hi_str = inner.split(":", 1)
+            prefix = "s"
+        else:
+            raise ValueError(f"Invalid 64-bit register pair syntax: '{token}'")
+
+        if prefix != expected_type:
+            raise TypeError(f"Expected register type '{expected_type}', got '{prefix}' in '{token}'")
+        base_idx = int(base_str)
+        hi_idx = int(hi_str)
+        if hi_idx != base_idx + 1:
+            raise ValueError(f"Register pair must be consecutive, got {base_idx}:{hi_idx}")
+        return VGPRPair(base_idx) if prefix == "v" else SGPRPair(base_idx)
+
+    def parse_vgpr(token: str) -> VGPR:
+        t = token.lower()
+        if t.startswith("v[") and t.endswith("]"):
+            idx = int(t[2:-1])
+        elif t.startswith("v") and t[1:].isdigit():
+            idx = int(t[1:])
+        else:
+            raise ValueError(f"Invalid VGPR syntax: '{token}'")
+        return VGPR(idx)
+
+    def parse_operand64(token: str) -> Operand64:
+        t = token.lower()
+        if t.startswith("v"):
+            return parse_reg_pair(token, "v")
+        if t.startswith("s"):
+            return parse_reg_pair(token, "s")
+        val = int(token, 0)
+        return Immediate64(val)
+
+    if opcode.is_return:
+        if len(clean_parts) != 4:
+            raise ValueError(f"ds_xor_rtn_b64 expects 3 operands, got {len(clean_parts) - 1}")
+        dst_pair = parse_reg_pair(clean_parts[1], "v")
+        assert isinstance(dst_pair, VGPRPair)
+        addr_reg = parse_vgpr(clean_parts[2])
+        data_op = parse_operand64(clean_parts[3])
+        return DSXor64Instruction(opcode=opcode, dst=dst_pair, addr=addr_reg, data=data_op, offset=offset)
+    else:
+        if len(clean_parts) != 3:
+            raise ValueError(f"ds_xor_b64 expects 2 operands, got {len(clean_parts) - 1}")
+        addr_reg = parse_vgpr(clean_parts[1])
+        data_op = parse_operand64(clean_parts[2])
+        return DSXor64Instruction(opcode=opcode, dst=None, addr=addr_reg, data=data_op, offset=offset)
+
+
+class TestNegativeControlsAndMutationDetection(unittest.TestCase):
+    def test_assembly_parser_valid_syntaxes(self) -> None:
+        inst = parse_ds_xor_b64_assembly("ds_xor_rtn_b64 v[0:1], v2, v[4:5]")
+        self.assertEqual(inst.opcode, DSOpcode64.DS_XOR_RTN_B64)
+        self.assertEqual(inst.dst, VGPRPair(0))
+        self.assertEqual(inst.addr, VGPR(2))
+
+    def test_syntax_rejection_invalid_instructions(self) -> None:
+        invalid_cases = [
+            "",
+            "ds_xor_rtn_b64",
+            "ds_xor_rtn_b64 v[0:1], v2",
+            "ds_xor_b64 v2, v[4:5], v[6:7]",
+            "ds_xor_rtn_b64 v0, v2, v[4:5]",
+            "ds_xor_rtn_b64 s[0:1], v2, v[4:5]",
+        ]
+        for case in invalid_cases:
+            with self.subTest(case=case):
+                with self.assertRaises((ValueError, TypeError)):
+                    parse_ds_xor_b64_assembly(case)
+
+    def test_mutation_detection_and_instead_of_xor(self) -> None:
+        def mutant_and(a: int, b: int) -> int:
+            return a & b
+
+        val_a = 0xFF
+        val_b = 0xFF
+        ref_old, ref_new = oracle_ds_xor_b64(val_a, val_b)
+        mutant_res = mutant_and(val_a, val_b)
+        self.assertEqual(ref_new, 0)
+        self.assertEqual(mutant_res, 0xFF)
+        self.assertNotEqual(ref_new, mutant_res)
+
+    def test_mutation_detection_or_instead_of_xor(self) -> None:
+        def mutant_or(a: int, b: int) -> int:
+            return a | b
+
+        val_a = 0xFF
+        val_b = 0xFF
+        ref_old, ref_new = oracle_ds_xor_b64(val_a, val_b)
+        mutant_res = mutant_or(val_a, val_b)
+        self.assertEqual(ref_new, 0)
+        self.assertEqual(mutant_res, 0xFF)
+        self.assertNotEqual(ref_new, mutant_res)
+
+
 if __name__ == "__main__":
     unittest.main()
