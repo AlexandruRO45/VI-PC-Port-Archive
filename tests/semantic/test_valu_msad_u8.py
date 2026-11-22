@@ -1063,5 +1063,90 @@ class TestValuMsadU8ConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(flags.diff_sum, 85)
 
 
+class TestValuMsadU8IEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 float bit pattern handling, byte extremes, and boundary limits."""
+
+    def test_ieee754_special_float_bitpatterns_treated_as_raw_bytes(self) -> None:
+        # v_msad_u8 is an integer byte VALU instruction.
+        # When shaders feed bit-casts of IEEE 754 floats (+0, -0, +inf, -inf, qnan, snan),
+        # hardware treats them strictly as raw byte fields without FPU traps, flushing, or quietening.
+        pos_zero = 0x0000_0000
+        neg_zero = 0x8000_0000
+        pos_inf = 0x7F80_0000
+        neg_inf = 0xFF80_0000
+        qnan = 0x7FC0_0000
+        snan = 0x7F80_0001
+
+        special_floats = [pos_zero, neg_zero, pos_inf, neg_inf, qnan, snan]
+        for f0 in special_floats:
+            for f1 in special_floats:
+                with self.subTest(f0=hex(f0), f1=hex(f1)):
+                    res0 = oracle_v_msad_u8(f0, f1, 0)
+                    res1 = oracle_v_msad_u8(f0, f1, 100)
+
+                    # Compute expected via byte unpack
+                    b0_lanes = unpack_bytes_u32(f0)
+                    b1_lanes = unpack_bytes_u32(f1)
+                    expected_diff = sum(
+                        0 if b1 == 0 else abs(b0 - b1)
+                        for b0, b1 in zip(b0_lanes, b1_lanes)
+                    )
+                    self.assertEqual(res0, expected_diff)
+                    self.assertEqual(res1, 100 + expected_diff)
+
+    def test_negative_zero_float_bit_pattern_as_reference(self) -> None:
+        # -0.0f is 0x8000_0000:
+        # bytes 0, 1, 2 are 0x00 (masked!)
+        # byte 3 is 0x80 (active!)
+        neg_zero = 0x8000_0000
+        s0 = pack_bytes_u32(0xFF, 0xFF, 0xFF, 0x00)
+
+        # When s1 = neg_zero:
+        # lanes 0, 1, 2 have s1 = 0 -> masked out (0 contribution each)
+        # lane 3 has s1 = 0x80 -> |0x00 - 0x80| = 128
+        res = oracle_v_msad_u8(s0, neg_zero, 0)
+        self.assertEqual(res, 128)
+
+    def test_subnormal_float_bits_no_flush_to_zero(self) -> None:
+        # Smallest positive subnormal: 0x00000001 (byte 0 is 1, bytes 1..3 are 0)
+        # Subnormal float 3: 0x00000003 (byte 0 is 3, bytes 1..3 are 0)
+        # If byte 0 were flushed to zero, lane 0 would be masked.
+        # But in integer VALU, byte 0 is 1 and 3, so lane 0 is NOT masked!
+        sub1 = 0x0000_0001
+        sub3 = 0x0000_0003
+        res = oracle_v_msad_u8(sub3, sub1, 0)
+        # |3 - 1| = 2 for lane 0; lanes 1..3 are masked (s1 byte == 0)
+        self.assertEqual(res, 2)
+
+    def test_nan_payload_treated_as_raw_byte_data(self) -> None:
+        nan_payload = 0x7FA5_5A3C
+        # Bytes: b0=0x3C, b1=0x5A, b2=0xA5, b3=0x7F (all non-zero)
+        res = oracle_v_msad_u8(0, nan_payload, 0)
+        # |0 - b| = b for each byte:
+        expected = 0x3C + 0x5A + 0xA5 + 0x7F
+        self.assertEqual(res, expected)
+
+    def test_extreme_byte_boundary_combinations(self) -> None:
+        extreme_bytes = [0x00, 0x01, 0x02, 0x7E, 0x7F, 0x80, 0x81, 0xFE, 0xFF]
+        for b0 in extreme_bytes:
+            for b1 in extreme_bytes:
+                val = ref_msad_byte(b0, b1)
+                self.assertGreaterEqual(val, 0)
+                self.assertLessEqual(val, 255)
+                if b1 == 0:
+                    self.assertEqual(val, 0)
+                else:
+                    self.assertEqual(val, abs(b0 - b1))
+
+    def test_accumulator_boundary_extremes(self) -> None:
+        s0 = pack_bytes_u32(0, 0, 0, 0)
+        s1 = pack_bytes_u32(1, 1, 1, 1)  # diff = 4
+        boundaries = [0, 1, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFB, 0xFFFF_FFFF]
+        for acc in boundaries:
+            with self.subTest(acc=hex(acc)):
+                res = oracle_v_msad_u8(s0, s1, acc)
+                self.assertEqual(res, (acc + 4) & MASK32)
+
+
 if __name__ == "__main__":
     unittest.main()
