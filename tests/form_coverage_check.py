@@ -290,6 +290,20 @@ def check_shader_records():
         assert scalar64_forms <= covered, (name, scalar64_forms - covered)
         assert sopc_forms <= covered, (name, sopc_forms - covered)
         assert vop2_forms <= covered, (name, vop2_forms - covered)
+    # The integer multiplies are counted in both lists: four VOP2 forms with their four VOP3 encodings and seven
+    # VOP3-only forms. The neighbours the controls reject stay out.
+    intmul_forms = {fc.gfx_forms({form}, fc.load_reference("gfx1013.tsv")).pop() for form in pixel.INTMUL_FORMS}
+    assert {group for group, _ in intmul_forms} == {"VOP2", "VOP3"} and len(intmul_forms) == 15
+    assert sum(group == "VOP2" for group, _ in intmul_forms) == 4
+    intmul_neighbours = {"v_mul_lo_u16", "v_mul_lo_i32", "v_mad_u64_u32", "v_mad_i64_i32",
+                         "v_mul_u32_u24_sdwa", "v_mul_hi_i32_i24_dpp"}
+    assert not (pixel.ACCEPTED & intmul_neighbours), pixel.ACCEPTED & intmul_neighbours
+    for name in ("gfx1013.tsv", "rdna2.tsv"):
+        reference = fc.load_reference(name)
+        covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+        assert intmul_forms <= covered, (name, intmul_forms - covered)
+        without = fc.gfx_forms(pixel.ACCEPTED - set(pixel.INTMUL_FORMS), reference)
+        assert len(covered) - len(without) == 15, name
     # The scalar ALU fixture counts its SOP1, SOP2, SOPK and SOPC forms; the neighbours the controls
     # reject (s_addc_u32, s_cmp_eq_u64, s_cmpk_eq_u32, s_cselect_b64) stay out.
     scalar = {"s_movk_i32", "s_not_b32", "s_add_u32", "s_sub_u32", "s_add_i32", "s_sub_i32", "s_mul_i32",

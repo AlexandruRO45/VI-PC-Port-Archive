@@ -352,6 +352,43 @@ INTEGER = {
     "lshlrev_b32": (2, "{1} << ({0} & 31u)"), "lshrrev_b32": (2, "{1} >> ({0} & 31u)"),
     "ashrrev_i32": (2, "asuint(asint({1}) >> ({0} & 31u))"),
 }
+# Integer multiplies (AMD RDNA 2 ISA). The low word wraps modulo 2^32 in uint arithmetic. A high word is bits
+# [63:32] of the 64-bit product, computed from 16-bit limbs so the shader needs no 64-bit integer support. The
+# 24-bit forms read bits [23:0] of each source, zero- or sign-extended; the 16-bit forms read bits [15:0].
+# Signed products multiply the extended values as uint, which gives the same low word without signed overflow.
+SEXT24 = "asuint(asint({0} << 8u) >> 8u)"
+INT_MULTIPLY = {
+    "mul_lo_u32": (2, "{0} * {1}"),
+    "mul_hi_u32": (2, "mul_hi_u32({0}, {1})"),
+    "mul_hi_i32": (2, "mul_hi_i32({0}, {1})"),
+    "mul_u32_u24": (2, "({0} & 0xffffffu) * ({1} & 0xffffffu)"),
+    "mul_hi_u32_u24": (2, "mul_hi_u32({0} & 0xffffffu, {1} & 0xffffffu)"),
+    "mul_i32_i24": (2, f"{SEXT24} * {SEXT24.replace('{0}', '{1}')}"),
+    "mul_hi_i32_i24": (2, f"mul_hi_i32({SEXT24}, {SEXT24.replace('{0}', '{1}')})"),
+    "mad_u32_u24": (3, "({0} & 0xffffffu) * ({1} & 0xffffffu) + {2}"),
+    "mad_i32_i24": (3, f"{SEXT24} * {SEXT24.replace('{0}', '{1}')} + {{2}}"),
+    "mad_u32_u16": (3, "({0} & 0xffffu) * ({1} & 0xffffu) + {2}"),
+    "mad_i32_i16": (3, "asuint(asint({0} << 16u) >> 16u) * asuint(asint({1} << 16u) >> 16u) + {2}"),
+}
+INTEGER_HELPERS = {
+    "mul_hi_u32": (
+        "uint mul_hi_u32(uint a, uint b) {\n"
+        "    uint al = a & 0xffffu, ah = a >> 16, bl = b & 0xffffu, bh = b >> 16;\n"
+        "    uint lh = al * bh, hl = ah * bl;\n"
+        "    uint mid = ((al * bl) >> 16) + (lh & 0xffffu) + (hl & 0xffffu);\n"
+        "    return ah * bh + (lh >> 16) + (hl >> 16) + (mid >> 16);\n"
+        "}"
+    ),
+    # The signed high word is the unsigned one less each operand that the other's sign bit weights by 2^32.
+    "mul_hi_i32": (
+        "uint mul_hi_i32(uint a, uint b) {\n"
+        "    return mul_hi_u32(a, b) - (asuint(asint(a) >> 31) & b) - (asuint(asint(b) >> 31) & a);\n"
+        "}"
+    ),
+}
+INTEGER_HELPER_USES = {"mul_hi_u32": ("mul_hi_u32",), "mul_hi_u32_u24": ("mul_hi_u32",),
+                       "mul_hi_i32": ("mul_hi_u32", "mul_hi_i32"), "mul_hi_i32_i24": ("mul_hi_u32", "mul_hi_i32")}
+INTEGER |= INT_MULTIPLY
 LANE_MASK = r"(vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
 SALU_BIT64 = {
     "and": "uint2({0} & {2}, {1} & {3})",
@@ -1438,6 +1475,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if mask != "entry" or dst in sample_dest or len(tokens) != arity:
                 raise ValueError("Invalid integer operation")
             args = [int_operand(t, scalar, vector, pending, sample_dest, signed=False) for t in tokens]
+            helpers.update(INTEGER_HELPER_USES.get(op, ()))
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({template.format(*args)});")
         elif m := match(rf"v_cmp_class_f32(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
@@ -1757,7 +1795,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     if not ended or samples != len(bindings):
         raise ValueError("Unexpected sample count or missing color export")
     if helpers:
-        defs = [body for name, body in SALU_HELPERS.items() if name in helpers]
+        defs = [body for name, body in (SALU_HELPERS | INTEGER_HELPERS).items() if name in helpers]
         lines[:0] = defs
     return "\n".join([*lines, "}",""])
 

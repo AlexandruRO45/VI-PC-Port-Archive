@@ -38,6 +38,11 @@ def check_scanner_tracks_pixel_aot():
     assert not is_instruction_supported("v_bfi_b32_e32 v0, v1, v2, v3")
     assert not is_instruction_supported("v_xor_b32 v0, v1")
     assert not is_instruction_supported("v_not_b32 v0, -v1")
+    # The integer multiplies come from the same table; other widths and op_sel stay unsupported.
+    assert is_instruction_supported("v_mul_hi_i32_i24_e64 v1, v2, s3")
+    assert is_instruction_supported("v_mad_u32_u16 v1, s2, v3, 0x1234")
+    assert not is_instruction_supported("v_mul_lo_u16 v0, v1, v2")
+    assert not is_instruction_supported("v_mad_u32_u16 v0, v1, v2, v3 op_sel:[1,0,0,0]")
 
 
 def check():

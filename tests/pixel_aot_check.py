@@ -537,6 +537,82 @@ def reciprocal_iflag():
     ])
 
 
+# The gfx1013 integer multiplies in every encoding LLVM prints for them. Each result goes to its own register and
+# intmul_program(k) exports the four bytes of result k through v_cvt_f32_ubyte0-3, so each channel is an exact
+# integer 0..255. v18 holds s45 and v19 holds s46.
+INTMUL_FORMS = ("v_mul_lo_u32", "v_mul_hi_u32", "v_mul_hi_i32", "v_mul_u32_u24_e32", "v_mul_u32_u24_e64",
+                "v_mul_i32_i24_e32", "v_mul_i32_i24_e64", "v_mul_hi_u32_u24_e32", "v_mul_hi_u32_u24_e64",
+                "v_mul_hi_i32_i24_e32", "v_mul_hi_i32_i24_e64", "v_mad_u32_u24", "v_mad_i32_i24",
+                "v_mad_u32_u16", "v_mad_i32_i16")
+INTMUL_OPS = (
+    "v_mul_lo_u32 v20, s44, v18",
+    "v_mul_hi_u32 v21, v18, s44",
+    "v_mul_hi_i32 v22, s44, v18",
+    "v_mul_u32_u24_e32 v23, s44, v18",
+    "v_mul_u32_u24_e64 v24, v18, s47",
+    "v_mul_i32_i24_e32 v25, s44, v18",
+    "v_mul_i32_i24_e64 v26, v18, -7",
+    "v_mul_hi_u32_u24_e32 v27, s44, v18",
+    "v_mul_hi_u32_u24_e64 v28, v18, s47",
+    "v_mul_hi_i32_i24_e32 v29, s44, v18",
+    "v_mul_hi_i32_i24_e64 v30, v18, s47",
+    "v_mad_u32_u24 v31, s44, v18, v19",
+    "v_mad_i32_i24 v32, v18, s47, v19",
+    "v_mad_u32_u16 v33, s44, v18, v19",
+    "v_mad_i32_i16 v34, v18, s47, v19",
+)
+# Constant words 3 to 6 (s44 to s47). The first set multiplies a negative a by a positive b whose bit 23 is set,
+# the second a positive a with bit 23 set by a negative b, so every signed form differs from its unsigned
+# neighbour, and every operand has bits above 23 that the 24-bit forms must drop. Bit 15 of b and d differs
+# between the sets for the 16-bit forms. Every input and every result is the bit pattern of a normal binary32
+# value, except the four 24-bit high words: a 48-bit product has at most 16 significant bits above bit 31, so they
+# are 0x0000xxxx (first set) or 0xffffxxxx, a NaN pattern whose quiet bit is already set (second set).
+INTMUL_WORDS = ((0xa1b0724c, 0x67b3cd54, 0xc3c8b197, 0x4b79f1e5),
+                (0x21ec6d42, 0xb6196e3f, 0x878be4a2, 0xf9cbc760))
+INTMUL_NARROW = (7, 8, 9, 10)
+
+
+def intmul_program(k):
+    return with_constants([
+        "v_mov_b32_e32 v18, s45",
+        "v_mov_b32_e32 v19, s46",
+        *INTMUL_OPS,
+        *(f"v_cvt_f32_ubyte{n}_e32 v{12 + n}, v{20 + k}" for n in range(4)),
+    ])
+
+
+def intmul_reference(a, b, c, d):
+    """Independent CPU model of the RDNA 2 ISA definitions, in Python integers."""
+    mask = 0xffffffff
+
+    def signed(x, bits):
+        x &= (1 << bits) - 1
+        return x - (1 << bits) if x >> (bits - 1) else x
+
+    u24, u16 = (lambda x: x & 0xffffff), (lambda x: x & 0xffff)
+    results = (
+        (a * b) & mask,                                          # v_mul_lo_u32: low word
+        (b * a) >> 32,                                           # v_mul_hi_u32: product bits [63:32]
+        (signed(a, 32) * signed(b, 32) >> 32) & mask,            # v_mul_hi_i32
+        (u24(a) * u24(b)) & mask,                                # v_mul_u32_u24: S0[23:0] * S1[23:0]
+        (u24(b) * u24(d)) & mask,
+        (signed(a, 24) * signed(b, 24)) & mask,                  # v_mul_i32_i24: sign-extended [23:0]
+        (signed(b, 24) * -7) & mask,
+        (u24(a) * u24(b)) >> 32,                                 # v_mul_hi_u32_u24: bits [47:32]
+        (u24(b) * u24(d)) >> 32,
+        (signed(a, 24) * signed(b, 24) >> 32) & mask,            # v_mul_hi_i32_i24
+        (signed(b, 24) * signed(d, 24) >> 32) & mask,
+        (u24(a) * u24(b) + c) & mask,                            # v_mad_u32_u24
+        (signed(b, 24) * signed(d, 24) + c) & mask,              # v_mad_i32_i24
+        (u16(a) * u16(b) + c) & mask,                            # v_mad_u32_u16
+        (signed(b, 16) * signed(d, 16) + c) & mask,              # v_mad_i32_i16
+    )
+    for k, word in enumerate((a, b, c, d, *results)):
+        if k - 4 not in INTMUL_NARROW:
+            assert 0 < (word >> 23) & 0xff < 0xff, hex(word)
+    return results
+
+
 # The gfx10 predicate number is a four-bit truth table. Bits 0..3 select
 # less, equal, greater and unordered respectively, independent of the HLSL.
 PREDICATES = ("f", "lt", "eq", "le", "gt", "lg", "ge", "o",
@@ -3087,6 +3163,95 @@ def check_controls(directory):
     must_reject(translate, base_ld[:lgkm] + ["v_ldexp_f32 v20, 1.0, s45"] + base_ld[lgkm:])
     wqm = base_ld.index("s_wqm_b64 exec, exec") + 1
     must_reject(translate, base_ld[:wqm] + ["v_ldexp_f32 v20, 1.0, 2"] + base_ld[wqm:])
+    check_intmul_controls()
+
+
+def check_intmul_controls():
+    source = translate(intmul_program(0))
+    assert set(INTMUL_FORMS) <= ACCEPTED
+    s44, v18, s47, v19 = "asuint(params[0].w)", "asuint(alu20)", "asuint(params[1].z)", "asuint(alu21)"
+
+    def sext(x, bits):
+        return f"asuint(asint({x} << {32 - bits}u) >> {32 - bits}u)"
+
+    for expected in (
+        f"asfloat({s44} * {v18})",
+        f"asfloat(mul_hi_u32({v18}, {s44}))",
+        f"asfloat(mul_hi_i32({s44}, {v18}))",
+        f"asfloat(({s44} & 0xffffffu) * ({v18} & 0xffffffu))",
+        f"asfloat({sext(v18, 24)} * {sext('4294967289u', 24)})",
+        f"asfloat(mul_hi_u32({v18} & 0xffffffu, {s47} & 0xffffffu))",
+        f"asfloat(mul_hi_i32({sext(s44, 24)}, {sext(v18, 24)}))",
+        f"asfloat(({s44} & 0xffffffu) * ({v18} & 0xffffffu) + {v19})",
+        f"asfloat({sext(v18, 24)} * {sext(s47, 24)} + {v19})",
+        f"asfloat(({s44} & 0xffffu) * ({v18} & 0xffffu) + {v19})",
+        f"asfloat({sext(v18, 16)} * {sext(s47, 16)} + {v19})",
+    ):
+        assert expected in source, expected
+    # The e32 and e64 encodings of a VOP2 multiply lower identically.
+    for op in ("v_mul_u32_u24", "v_mul_i32_i24", "v_mul_hi_u32_u24", "v_mul_hi_i32_i24"):
+        e32, e64 = (translate(with_constants(["v_mov_b32_e32 v18, s45", f"{op}_{enc} v12, s44, v18"]))
+                    for enc in ("e32", "e64"))
+        assert e32 == e64, op
+    # The 16-bit-limb helpers are emitted once, only when a high word is used, with mul_hi_u32 first.
+    helper_u, helper_i = "uint mul_hi_u32(uint a, uint b)", "uint mul_hi_i32(uint a, uint b)"
+    assert source.count(helper_u) == source.count(helper_i) == 1 and source.index(helper_u) < source.index(helper_i)
+    low_only = translate(with_constants(["v_mul_lo_u32 v12, s44, s45", "v_mad_i32_i24 v13, s44, s45, s46"]))
+    assert "mul_hi_u32(" not in low_only and "mul_hi_i32(" not in low_only
+    unsigned_hi = translate(with_constants(["v_mul_hi_u32_u24_e64 v12, s44, s45"]))
+    assert helper_u in unsigned_hi and "mul_hi_i32(" not in unsigned_hi
+    signed_hi = translate(with_constants(["v_mul_hi_i32_i24_e64 v12, s44, s45"]))
+    assert helper_u in signed_hi and helper_i in signed_hi
+    original = "v_mad_u32_u16 v33, s44, v18, v19"
+    for bad in (
+        "v_mad_u32_u16 v33, -s44, v18, v19",
+        "v_mad_u32_u16 v33, s44, |v18|, v19",
+        "v_mad_u32_u16 v33, s44, v18, abs(v19)",
+        "v_mad_u32_u16 v33, s44, v18, v19 clamp",
+        "v_mad_u32_u16 v33, s44, v18, v19 op_sel:[1,0,0,0]",
+        "v_mad_u32_u16 v33, s44, v18",
+        "v_mad_u32_u16 v33, s44, v18, v19, v19",
+        "v_mad_u32_u16 v33, s44, v18, 0x100000000",
+        "v_mad_u32_u16 v33, s44, v18, v40",
+        "v_mad_u32_u16 v33, s44, v18, s106",
+        # Neighbours: other widths, 64-bit results, and SDWA and DPP forms of the 24-bit multiplies.
+        "v_mul_lo_u16 v33, s44, v18",
+        "v_mul_lo_i32 v33, s44, v18",
+        "v_mad_u64_u32 v[33:34], s[0:1], s44, v18, v[18:19]",
+        "v_mad_i64_i32 v[33:34], s[0:1], s44, v18, v[18:19]",
+        "v_mul_u32_u24_sdwa v33, v18, v19 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD",
+        "v_mul_hi_i32_i24_dpp v33, v18, v19 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    ):
+        changed = [line.replace(original, bad) for line in intmul_program(13)]
+        assert changed != intmul_program(13)
+        must_reject(translate, changed)
+    for original, bad in (("v_mul_hi_u32 v21, v18, s44", "v_mul_hi_u32 v21, v18, s44 clamp"),
+                          ("v_mul_u32_u24_e64 v24, v18, s47", "v_mul_u32_u24_e64 v24, v18, s47 clamp"),
+                          ("v_mul_i32_i24_e64 v26, v18, -7", "v_mul_i32_i24_e64 v26, v18, -v19"),
+                          ("v_mul_lo_u32 v20, s44, v18", "v_mul_lo_u32 v20, s44")):
+        changed = [line.replace(original, bad) for line in intmul_program(0)]
+        assert changed != intmul_program(0)
+        must_reject(translate, changed)
+    base = intmul_program(0)
+    wait = base.index("s_waitcnt vmcnt(0)")
+    must_reject(translate, base[:wait] + ["v_mul_lo_u32 v20, v12, 3"] + base[wait:])
+    must_reject(translate, base[:wait] + ["v_mul_hi_u32 v12, 1, 2"] + base[wait:])
+    load = next(i for i, line in enumerate(base) if line.startswith("s_buffer_load_dwordx4"))
+    lgkm = base.index("s_waitcnt lgkmcnt(0)", load)
+    must_reject(translate, base[:lgkm] + ["v_mad_u32_u24 v20, s44, 1, 2"] + base[lgkm:])
+    wqm = base.index("s_wqm_b64 exec, exec") + 1
+    must_reject(translate, base[:wqm] + ["v_mul_u32_u24_e32 v20, 1, v0"] + base[wqm:])
+    # Each draw mutation computes a different word on the first input set.
+    a, b, c, d = INTMUL_WORDS[0]
+    good = intmul_reference(a, b, c, d)
+    mask = 0xffffffff
+    for k, wrong in (
+        (0, (a * b) >> 32), (1, (a * b) & mask), (2, (a * b) >> 32),
+        (3, (a * b) & mask), (5, good[3]), (7, (a * b) >> 32), (9, good[7]),
+        (12, ((b & 0xffffff) * (d & 0xffffff) + c) & mask), (14, ((b & 0xffff) * (d & 0xffff) + c) & mask),
+    ):
+        assert wrong != good[k], k
+    assert [k for k, *_ in INTMUL_MUTATIONS] == [0, 1, 2, 3, 5, 7, 9, 12, 14]
 
 
 def check_program_extent(directory, library):
@@ -3142,6 +3307,7 @@ def check_binary(directory, assembler, objcopy, library):
 
     fixtures.extend((int_minmax_pair(encoding), translate) for encoding in ("e32", "e64"))
     fixtures.extend((int_minmax_triple(kind), translate) for kind in ("i32", "u32"))
+    fixtures.extend((intmul_program(k), translate) for k in (0, len(INTMUL_OPS) - 1))
     fixtures.extend((predicate_group(first, sdwa=True), translate) for first in range(0, 16, 4))
     fixtures.append((with_constants(CUBE_BODY), translate))
     fixtures.append((with_constants(MAD_BODY), translate))
@@ -3297,6 +3463,62 @@ def check_int_minmax_draws(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Replacing v_med3_i32 with v_med3_u32 escaped detection")
+
+# (exported result, old text, new text): lo and hi swapped, signed and unsigned swapped, 24-bit truncation dropped.
+INTMUL_MUTATIONS = (
+    (0, "v_mul_lo_u32 v20", "v_mul_hi_u32 v20"),
+    (1, "v_mul_hi_u32 v21", "v_mul_lo_u32 v21"),
+    (2, "v_mul_hi_i32 v22", "v_mul_hi_u32 v22"),
+    (3, "v_mul_u32_u24_e32 v23", "v_mul_lo_u32 v23"),
+    (5, "v_mul_i32_i24_e32 v25", "v_mul_u32_u24_e32 v25"),
+    (7, "v_mul_hi_u32_u24_e32 v27", "v_mul_hi_u32 v27"),
+    (9, "v_mul_hi_i32_i24_e32 v29", "v_mul_hi_u32_u24_e32 v29"),
+    (12, "v_mad_i32_i24 v32", "v_mad_u32_u24 v32"),
+    (14, "v_mad_i32_i16 v34", "v_mad_u32_u16 v34"),
+)
+
+
+def intmul_case(path, words, word):
+    constants = bytearray(256)
+    struct.pack_into("<4I", constants, 12, *words)
+    path.write_bytes(constants + struct.pack("<4f", *[float((word >> 8 * n) & 0xff) for n in range(4)]) * 64)
+
+
+def check_intmul_draws(directory, compiler, renderer, backend):
+    source = directory / "intmul.hlsl"
+    shader = directory / "intmul.cso"
+    case = directory / "intmul.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+    for k in range(len(INTMUL_OPS)):
+        source.write_text(translate(intmul_program(k)), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        for words in INTMUL_WORDS:
+            intmul_case(case, words, intmul_reference(*words)[k])
+            subprocess.run(draw, check=True)
+    # Each neighbour gives a different word for the first input set (checked in the controls), so the draw
+    # against the correct reference must report a mismatch.
+    for k, old, new in INTMUL_MUTATIONS:
+        mutated = [line.replace(old, new) for line in intmul_program(k)]
+        assert mutated != intmul_program(k), old
+        source.write_text(translate(mutated), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        intmul_case(case, INTMUL_WORDS[0], intmul_reference(*INTMUL_WORDS[0])[k])
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Replacing {old} with {new} escaped detection")
+
+
+def check_intmul_render(directory, compiler, renderer, backend):
+    """The integer multiply draws as their own CTest entry per backend; exit 77 from the renderer is a skip."""
+    try:
+        check_intmul_draws(directory, compiler, renderer, backend)
+    except subprocess.CalledProcessError as error:
+        if error.returncode == 77:
+            return 77
+        raise
+    return 0
+
 
 def check_frexp_ldexp_draws(directory, compiler, renderer, backend):
     source = directory / "frexp_ldexp.hlsl"
@@ -3804,6 +4026,9 @@ def main():
         if mode == "draw-e64":
             # The controls already run in the binary and draw modes; this mode only draws.
             return check_e64_render(directory, *args)
+        if mode == "draw-intmul":
+            # As for draw-e64, the controls run in the binary and draw modes.
+            return check_intmul_render(directory, *args)
         check_controls(directory)
         if mode == "binary":
             check_binary(directory, *args)
@@ -3814,7 +4039,7 @@ def main():
         elif mode == "buffer-color":
             return check_buffer_color_draw(directory, *args)
         else:
-            raise ValueError("Expected binary, draw, draw-e64, three-way or buffer-color mode")
+            raise ValueError("Expected binary, draw, draw-e64, draw-intmul, three-way or buffer-color mode")
 
 
 if __name__ == "__main__":
