@@ -864,5 +864,110 @@ class TestValuCvtPknormU16F32SIMD(unittest.TestCase):
             self.assertEqual(state.get_vgpr(lane, 0), expected)
 
 
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestValuCvtPknormU16F32RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_dst_alias_src0(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr(0, POS_ONE_F32)  # v0 = 1.0f
+        state.set_vgpr(1, HALF_F32)     # v1 = 0.5f
+        # v0 = cvt_pknorm(v0, v1) -> [32768, 65535]
+        instr = VCvtPknormU16F32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+        )
+        res = self.scalar_interp.step(instr, state)
+        expected = (32768 << 16) | 0xFFFF
+        self.assertEqual(res, expected)
+        self.assertEqual(state.get_vgpr(0), expected)
+        # v1 untouched
+        self.assertEqual(state.get_vgpr(1), HALF_F32)
+
+    def test_dst_alias_src1(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr(0, HALF_F32)     # v0 = 0.5f
+        state.set_vgpr(1, POS_ONE_F32)  # v1 = 1.0f
+        # v0 = cvt_pknorm(v1, v0) -> [65535, 32768]
+        instr = VCvtPknormU16F32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(1, RegType.VGPR)),
+            src1=VOP3Operand(Reg(0, RegType.VGPR)),
+        )
+        res = self.scalar_interp.step(instr, state)
+        expected = (32768 << 16) | 0xFFFF
+        self.assertEqual(res, expected)
+        self.assertEqual(state.get_vgpr(0), expected)
+        # v1 untouched
+        self.assertEqual(state.get_vgpr(1), POS_ONE_F32)
+
+    def test_dst_alias_both_srcs(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr(2, QUARTER_F32)  # v2 = 0.25f -> 16384
+        # v2 = cvt_pknorm(v2, v2) -> [16384, 16384]
+        instr = VCvtPknormU16F32Instruction(
+            dst=Reg(2, RegType.VGPR),
+            src0=VOP3Operand(Reg(2, RegType.VGPR)),
+            src1=VOP3Operand(Reg(2, RegType.VGPR)),
+        )
+        res = self.scalar_interp.step(instr, state)
+        expected = (16384 << 16) | 16384
+        self.assertEqual(res, expected)
+        self.assertEqual(state.get_vgpr(2), expected)
+
+    def test_chained_dependency_chain(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr(0, HALF_F32)     # 0.5f
+        state.set_vgpr(1, QUARTER_F32)  # 0.25f
+        state.set_vgpr(2, POS_ONE_F32)  # 1.0f
+
+        # Instr 1: v0 = cvt_pknorm(v0, v1) -> (16384 << 16) | 32768 = 0x40008000
+        instr1 = VCvtPknormU16F32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+        )
+        res1 = self.scalar_interp.step(instr1, state)
+        self.assertEqual(res1, 0x40008000)
+
+        # 0x40008000 as float is ~2.0078 > 1.0 -> clamps to 0xFFFF
+        instr2 = VCvtPknormU16F32Instruction(
+            dst=Reg(3, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(2, RegType.VGPR)),
+        )
+        res2 = self.scalar_interp.step(instr2, state)
+        expected2 = (0xFFFF << 16) | 0xFFFF
+        self.assertEqual(res2, expected2)
+        self.assertEqual(state.get_vgpr(3), expected2)
+
+    def test_simd_multi_lane_aliased_inplace(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        for lane in range(32):
+            state.set_vgpr(lane, 0, f32_to_bits(lane / 32.0))
+            state.set_vgpr(lane, 1, HALF_F32)
+
+        # In-place overwrite of v0 across all 32 lanes
+        instr = VCvtPknormU16F32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+        )
+        self.simd_interp.step(instr, state)
+        for lane in range(32):
+            expected_lo = oracle_cvt_unorm16_f32(f32_to_bits(lane / 32.0))
+            expected = (32768 << 16) | expected_lo
+            self.assertEqual(state.get_vgpr(lane, 0), expected)
+            self.assertEqual(state.get_vgpr(lane, 1), HALF_F32)
+
+
 if __name__ == "__main__":
     unittest.main()
