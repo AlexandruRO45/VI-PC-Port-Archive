@@ -199,7 +199,7 @@ class SetupDialog(QDialog):
         self._clear_rows()
 
         ok = bool(report.get("ok"))
-        pending = pending_install_plan(report)
+        pending = pending_install_plan(report, repo_root=self.repo_root)
         pending_by_key = {p.package_key: p for p in pending}
 
         if ok:

@@ -189,17 +189,18 @@ PREREQ_SPECS: dict[str, dict] = {
     "llvm_mc": {
         "package_key": "llvm_mc",
         "name": "LLVM 21+ llvm-mc (AMDGPU)",
-        "download_url": "https://github.com/llvm/llvm-project/releases",
-        "win32": None,  # Official Windows LLVM lacks AMDGPU; requires scripts/build_llvm_mc.ps1 or WSL llvm-21
-        "darwin": ["brew", "install", "llvm"],
-        "linux": ["pkexec", "apt-get", "install", "-y", "llvm"],
+        "download_url": "https://github.com/FelipeMzero/Leonida/releases/tag/llvm-21.1.8",
+        "win32": ["powershell", "-ExecutionPolicy", "Bypass", "-File", "{ROOT}/scripts/install_llvm.ps1"],
+        "darwin": ["python3", "-I", "{ROOT}/scripts/install_llvm.py"],
+        "linux": ["python3", "-I", "{ROOT}/scripts/install_llvm.py"],
     },
 }
 
 
-def pending_install_plan(env_report: dict, platform_name: str | None = None) -> list[InstallItem]:
+def pending_install_plan(env_report: dict, platform_name: str | None = None, repo_root: str | None = None) -> list[InstallItem]:
     """Return ONLY pending (non-ok, non-skip) installable items deduplicated by package_key."""
     plat = platform_name or ("win32" if sys.platform.startswith("win") else ("darwin" if sys.platform == "darwin" else "linux"))
+    root = repo_root or resolve_repo_root()
     seen: set[str] = set()
     items: list[InstallItem] = []
 
@@ -215,7 +216,8 @@ def pending_install_plan(env_report: dict, platform_name: str | None = None) -> 
         if pkg_key in seen:
             continue
         seen.add(pkg_key)
-        cmd = spec.get(plat)
+        raw_cmd = spec.get(plat)
+        cmd = [os.path.normpath(arg.replace("{ROOT}", root)) if "{ROOT}" in arg else arg for arg in raw_cmd] if raw_cmd else None
         items.append(InstallItem(
             package_key=pkg_key,
             name=spec["name"],
@@ -223,7 +225,7 @@ def pending_install_plan(env_report: dict, platform_name: str | None = None) -> 
             status=st,
             detail=chk.get("detail", ""),
             download_url=spec["download_url"],
-            command=list(cmd) if cmd else None,
+            command=cmd,
             manual_only=(cmd is None),
         ))
     return items

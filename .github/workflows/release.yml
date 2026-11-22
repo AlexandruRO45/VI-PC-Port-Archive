@@ -100,6 +100,7 @@ jobs:
             --add-data "make_game.py:." \
             --add-data "tools:tools" \
             --add-data "gui:gui" \
+            --add-data "scripts:scripts" \
             --add-data "viewer:viewer" \
             leonida_gui.py
           ./dist/Leonida/Leonida --version
@@ -119,6 +120,7 @@ jobs:
             --add-data "make_game.py:." \
             --add-data "tools:tools" \
             --add-data "gui:gui" \
+            --add-data "scripts:scripts" \
             --add-data "viewer:viewer" \
             leonida_gui.py
           ./dist/Leonida.app/Contents/MacOS/Leonida --version

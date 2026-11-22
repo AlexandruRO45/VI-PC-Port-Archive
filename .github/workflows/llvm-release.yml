@@ -1,0 +1,189 @@
+name: Release LLVM llvm-mc (AMDGPU)
+
+on:
+  push:
+    tags:
+      - "llvm-*"
+  workflow_dispatch:
+    inputs:
+      llvm_version:
+        description: "LLVM version tag in llvm/llvm-project (e.g. 21.1.8)"
+        required: true
+        default: "21.1.8"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: llvm-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build llvm-mc (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows-x64
+            artifact: llvm-mc-windows
+          - os: ubuntu-24.04
+            label: linux-x64
+            artifact: llvm-mc-linux
+          - os: macos-latest
+            label: macos-arm64
+            artifact: llvm-mc-macos
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Determine LLVM version
+        id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VER="${{ inputs.llvm_version }}"
+          else
+            VER="${GITHUB_REF_NAME#llvm-}"
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "tag=llvm-$VER" >> "$GITHUB_OUTPUT"
+
+      - name: Build llvm-mc on Windows (AMDGPU, static CRT)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.ver.outputs.version }}"
+          $dest = Join-Path $env:RUNNER_TEMP "llvm-out"
+          & scripts/build_llvm_mc.ps1 -Version $ver -Dest $dest -NoEnv
+          New-Item -ItemType Directory -Force -Path release-out | Out-Null
+          Compress-Archive -Path (Join-Path $dest "llvm-mc.exe") -DestinationPath release-out/llvm-mc-windows-x64.zip -Force
+
+      - name: Install Ninja on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build cmake g++
+
+      - name: Install Ninja on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew install ninja cmake
+
+      - name: Build llvm-mc on Linux / macOS (AMDGPU)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="${{ steps.ver.outputs.version }}"
+          DEST="$RUNNER_TEMP/llvm-out"
+          python3 -I scripts/install_llvm.py --version "$VER" --dest "$DEST" --from-source --no-env
+          mkdir -p release-out
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            tar -czf release-out/llvm-mc-macos-arm64.tar.gz -C "$DEST" llvm-mc
+          else
+            tar -czf release-out/llvm-mc-linux-x64.tar.gz -C "$DEST" llvm-mc
+          fi
+
+      - name: Upload llvm-mc artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.artifact }}
+          path: release-out/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish LLVM Release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums and publish LLVM Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VER: ${{ inputs.llvm_version }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            VER="$INPUT_VER"
+            TAG="llvm-$VER"
+          else
+            TAG="$REF_NAME"
+            VER="${TAG#llvm-}"
+          fi
+          cp scripts/install_llvm.ps1 scripts/install_llvm.py release-assets/
+          cd release-assets
+          sha256sum \
+            llvm-mc-windows-x64.zip \
+            llvm-mc-linux-x64.tar.gz \
+            llvm-mc-macos-arm64.tar.gz \
+            install_llvm.ps1 \
+            install_llvm.py > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+          NOTES=$(cat <<EOF
+          ## LLVM $VER \`llvm-mc\` (AMDGPU / gfx1013) + Automatic Installer
+
+          Built cleanly from [llvm/llvm-project](https://github.com/llvm/llvm-project) (\`llvmorg-$VER\`) with \`-DLLVM_TARGETS_TO_BUILD=AMDGPU\` and verified with the \`gfx1013\` \`s_endpgm\` probe.
+
+          ### Automatic Installation
+          - **Windows (PowerShell):**
+            \`\`\`powershell
+            powershell -ExecutionPolicy Bypass -File install_llvm.ps1
+            \`\`\`
+          - **Cross-platform (Python 3):**
+            \`\`\`bash
+            python3 -I install_llvm.py
+            \`\`\`
+
+          ### Files
+          - \`llvm-mc-windows-x64.zip\` (static CRT, no VC++ redistributable required)
+          - \`llvm-mc-linux-x64.tar.gz\`
+          - \`llvm-mc-macos-arm64.tar.gz\`
+          - \`install_llvm.ps1\` & \`install_llvm.py\`
+          - \`SHA256SUMS.txt\`
+          EOF
+          )
+
+          if gh release view "$TAG" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              llvm-mc-windows-x64.zip \
+              llvm-mc-linux-x64.tar.gz \
+              llvm-mc-macos-arm64.tar.gz \
+              install_llvm.ps1 \
+              install_llvm.py \
+              SHA256SUMS.txt \
+              --clobber --repo "${GITHUB_REPOSITORY}"
+          else
+            gh release create "$TAG" \
+              llvm-mc-windows-x64.zip \
+              llvm-mc-linux-x64.tar.gz \
+              llvm-mc-macos-arm64.tar.gz \
+              install_llvm.ps1 \
+              install_llvm.py \
+              SHA256SUMS.txt \
+              --title "LLVM $VER llvm-mc (AMDGPU)" \
+              --notes "$NOTES" \
+              --repo "${GITHUB_REPOSITORY}"
+          fi
