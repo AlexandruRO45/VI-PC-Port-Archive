@@ -3346,11 +3346,32 @@ public:
     // STUB
     void STDMETHODCALLTYPE RemoveDevice() override { removed_.store(true, std::memory_order_release); }
 
+    // Whether the process token has SE_INC_BASE_PRIORITY_NAME present and enabled (D3D-236).
+    static bool base_priority_privilege_enabled() {
+        LUID luid{};
+        if (!LookupPrivilegeValueW(nullptr, SE_INC_BASE_PRIORITY_NAME, &luid)) return false;
+        HANDLE token = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+        DWORD size = 0;
+        GetTokenInformation(token, TokenPrivileges, nullptr, 0, &size);
+        std::vector<unsigned char> buffer(size);
+        bool enabled = false;
+        if (size && GetTokenInformation(token, TokenPrivileges, buffer.data(), size, &size)) {
+            const auto* privileges = reinterpret_cast<const TOKEN_PRIVILEGES*>(buffer.data());
+            for (DWORD i = 0; i < privileges->PrivilegeCount; ++i)
+                if (privileges->Privileges[i].Luid.LowPart == luid.LowPart &&
+                    privileges->Privileges[i].Luid.HighPart == luid.HighPart)
+                    enabled = (privileges->Privileges[i].Attributes & SE_PRIVILEGE_ENABLED) != 0;
+        }
+        CloseHandle(token);
+        return enabled;
+    }
+
     HRESULT STDMETHODCALLTYPE CreateCommandQueue(const D3D12_COMMAND_QUEUE_DESC* desc, REFIID riid,
                                                  void** out) override {
         constexpr auto method = "ID3D12Device::CreateCommandQueue";
         if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
-        // As the host runtime: no bundle queues, the three D3D12 priorities (realtime refused, below), one flag and
+        // As the host runtime: no bundle queues, the three D3D12 priorities (realtime only with a privilege, below), one flag and
         // one node. A valid description without an output is E_UNEXPECTED there, not a capability check.
         if (desc->Type == D3D12_COMMAND_LIST_TYPE_BUNDLE || UINT(desc->Type) > D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE ||
             (desc->Priority != D3D12_COMMAND_QUEUE_PRIORITY_NORMAL &&
@@ -3360,8 +3381,9 @@ public:
             log_once("CreateCommandQueue refused (type, priority, flags or node mask), type", desc->Type);
             return d3d12_trace::result(method, E_INVALIDARG);
         }
-        // Global realtime priority needs a privilege the host grants only on request; without it, this answer.
-        if (desc->Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME) {
+        // Global realtime priority needs SeIncreaseBasePriorityPrivilege enabled in the process token, as on the host
+        // (accepted on an elevated session that enables it, #1737); without it, this answer.
+        if (desc->Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME && !base_priority_privilege_enabled()) {
             log_once("CreateCommandQueue refused (global realtime priority), type", desc->Type);
             return d3d12_trace::result(method, DXGI_ERROR_ACCESS_DENIED);
         }
