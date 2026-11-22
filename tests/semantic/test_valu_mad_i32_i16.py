@@ -702,5 +702,134 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
             self.assertEqual(state.vgprs[lane][0], sentinel)
 
 
+# ==============================================================================
+# Unit Tests: Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
+    """Register aliasing, overlapping destination/source, and immutability tests."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_accumulator_aliasing_dst_equals_src2(self) -> None:
+        state = ScalarState()
+        state.rf.write_vgpr(0, 500)
+        state.rf.write_vgpr(1, 10)
+        state.rf.write_vgpr(2, 20)
+
+        instr = VMadI32I16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(0),
+        )
+
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(res, 700)
+        self.assertEqual(state.rf.read_vgpr(0), 700)
+        self.assertEqual(state.rf.read_vgpr(1), 10)
+        self.assertEqual(state.rf.read_vgpr(2), 20)
+
+    def test_multiplier_aliasing_dst_equals_src0(self) -> None:
+        state = ScalarState()
+        state.rf.write_vgpr(0, 15)
+        state.rf.write_vgpr(1, 4)
+        state.rf.write_vgpr(2, 100)
+
+        instr = VMadI32I16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2),
+        )
+
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(res, 160)
+        self.assertEqual(state.rf.read_vgpr(0), 160)
+        self.assertEqual(state.rf.read_vgpr(1), 4)
+        self.assertEqual(state.rf.read_vgpr(2), 100)
+
+    def test_multiplicand_aliasing_dst_equals_src1(self) -> None:
+        state = ScalarState()
+        state.rf.write_vgpr(0, 7)
+        state.rf.write_vgpr(1, 9)
+        state.rf.write_vgpr(2, 50)
+
+        instr = VMadI32I16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(0),
+            src2=Operand.vgpr(2),
+        )
+
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(res, 113)
+        self.assertEqual(state.rf.read_vgpr(0), 113)
+
+    def test_total_overlap_all_operands_same_register(self) -> None:
+        state = ScalarState()
+        state.rf.write_vgpr(0, 6)
+
+        instr = VMadI32I16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(0),
+            src2=Operand.vgpr(0),
+        )
+
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(res, 42)
+        self.assertEqual(state.rf.read_vgpr(0), 42)
+
+    def test_unaliased_operands_immutability(self) -> None:
+        state = ScalarState()
+        state.rf.write_vgpr(10, 123)
+        state.rf.write_vgpr(11, 456)
+        state.rf.write_vgpr(12, 789)
+        state.rf.write_sgpr(5, 0xCAFEBABE)
+
+        instr = VMadI32I16Instruction(
+            dst=Operand.vgpr(20),
+            src0=Operand.vgpr(10),
+            src1=Operand.vgpr(11),
+            src2=Operand.vgpr(12),
+        )
+
+        self.scalar_interp.step(instr, state)
+        self.assertEqual(state.rf.read_vgpr(10), 123)
+        self.assertEqual(state.rf.read_vgpr(11), 456)
+        self.assertEqual(state.rf.read_vgpr(12), 789)
+        self.assertEqual(state.rf.read_sgpr(5), 0xCAFEBABE)
+
+    def test_simd_inplace_multi_iteration_accumulation(self) -> None:
+        state = SIMDState(wave_mode=WaveMode.WAVE32, exec_mask=0x00FF_00FF)
+        sentinel = 0x8888_7777
+        for lane in range(32):
+            if bool(state.exec_mask & (1 << lane)):
+                state.write_lane(Operand.vgpr(0), lane, 0)
+                state.write_lane(Operand.vgpr(1), lane, lane)
+                state.write_lane(Operand.vgpr(2), lane, 10)
+            else:
+                state.write_lane(Operand.vgpr(0), lane, sentinel)
+
+        instr = VMadI32I16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(0),
+        )
+
+        for it in range(1, 4):
+            self.simd_interp.step(instr, state)
+            for lane in range(32):
+                if bool(state.exec_mask & (1 << lane)):
+                    expected = (lane * 10) * it
+                    self.assertEqual(state.vgprs[lane][0], expected)
+                else:
+                    self.assertEqual(state.vgprs[lane][0], sentinel)
+
+
 if __name__ == "__main__":
     unittest.main()
