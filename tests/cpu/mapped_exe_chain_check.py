@@ -9,8 +9,12 @@ from native_map_check import Mapper, STATUS
 
 
 def mapped_child(mapper_path, image, io, mix):
-    mapper = Mapper(mapper_path)
     providers = {p.name.lower(): ctypes.CDLL(str(p)) for p in (io, mix)}
+    return run_mapped(mapper_path, image, providers)
+
+
+def run_mapped(mapper_path, image, providers):
+    mapper = Mapper(mapper_path)
     base, status, detail, _ = mapper(image, providers)
     if not base or status != STATUS["ok"]:
         raise AssertionError(f"mapping {image.name}: {status}, {detail}")
@@ -25,7 +29,7 @@ def mapped_child(mapper_path, image, io, mix):
         mapper.release(base)
 
 
-def compare(mapper_path, native, lifted, io, mix):
+def compare(mapper_path, native, lifted, io, mix, bypass=None):
     mapper = Mapper(mapper_path)
     for bindings in ({}, {io.name.lower(): ctypes.CDLL(str(io))}):
         base, status, detail, requests = mapper(native, bindings)
@@ -46,6 +50,13 @@ def compare(mapper_path, native, lifted, io, mix):
         original = run(native, data)
         check("native trace length", len(original.arguments), 16)
         check("native output length", len(original.output), 8)
+        if bypass:
+            # The nested leaf reverses the zero/nonzero branch for selectors 0 and 1.
+            check("frame-selected branch", original, run(bypass, bytes([1 - selector])))
+            skipped = run(bypass, data)
+            for field in Observation._fields:
+                if getattr(skipped, field) == getattr(original, field):
+                    raise AssertionError(f"selector {selector}: {field} missed the bypassed frame")
         check("translated EXE", run(lifted, data), original)
         child = subprocess.run([sys.executable, "-B", __file__, "--child", mapper_path,
                                 native, io, mix], input=data, capture_output=True, timeout=15)
