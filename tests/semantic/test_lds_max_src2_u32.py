@@ -691,6 +691,102 @@ class TestDSMaxSrc2U32RegisterAliasing(unittest.TestCase):
         self.assertEqual(self.lds.read_dword(base + 4), 30)
         self.assertEqual(self.lds.read_dword(base + 8), 30)
 
+@dataclass(frozen=True)
+class DSAtomicConditionCodesSrc2:
+    """Condition codes evaluating dual-source unsigned maximum results."""
+    zero: bool
+    high_bit_set: bool
+    updated: bool
+    operands_equal: bool
+
+
+@dataclass(frozen=True)
+class DSMemoryStatusFlagsSrc2:
+    """Status flags for dual-source LDS address calculations."""
+    bank_a: int
+    bank_b: int
+    same_bank: bool
+    address_a_wrapped: bool
+    address_b_wrapped: bool
+
+
+def evaluate_src2_condition_codes(val_a: int, val_b: int, new_val_a: int) -> DSAtomicConditionCodesSrc2:
+    """Evaluate architectural condition codes for ds_max_src2_u32."""
+    ua = u32(val_a)
+    ub = u32(val_b)
+    unew = u32(new_val_a)
+    return DSAtomicConditionCodesSrc2(
+        zero=(unew == 0),
+        high_bit_set=bool(unew & 0x80000000),
+        updated=(unew != ua),
+        operands_equal=(ua == ub),
+    )
+
+
+def evaluate_src2_status_flags(vaddr: int, offset0: int, offset1: int, capacity_bytes: int = LDS_SIZE_BYTES) -> DSMemoryStatusFlagsSrc2:
+    """Evaluate memory status flags for dual-source address calculations."""
+    raw_a = vaddr + (offset0 & 0xFF) * 4
+    raw_b = vaddr + (offset1 & 0xFF) * 4
+    b_a = calc_lds_bank(raw_a & MASK32)
+    b_b = calc_lds_bank(raw_b & MASK32)
+    return DSMemoryStatusFlagsSrc2(
+        bank_a=b_a,
+        bank_b=b_b,
+        same_bank=(b_a == b_b),
+        address_a_wrapped=(raw_a >= capacity_bytes),
+        address_b_wrapped=(raw_b >= capacity_bytes),
+    )
+
+
+class TestDSMaxSrc2U32ConditionCodesAndFlags(unittest.TestCase):
+    """Phase 6: Unit tests for condition codes, status flags, and carry/borrow isolation."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(size_dwords=1024)
+        self.state = ScalarThreadState(lds=self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_condition_codes_zero_and_high_bit(self) -> None:
+        # Zero condition
+        cc0 = evaluate_src2_condition_codes(0, 0, 0)
+        self.assertTrue(cc0.zero)
+        self.assertFalse(cc0.high_bit_set)
+        self.assertFalse(cc0.updated)
+        self.assertTrue(cc0.operands_equal)
+
+        # High bit set condition
+        cc_hb = evaluate_src2_condition_codes(10, 0x80000000, 0x80000000)
+        self.assertFalse(cc_hb.zero)
+        self.assertTrue(cc_hb.high_bit_set)
+        self.assertTrue(cc_hb.updated)
+        self.assertFalse(cc_hb.operands_equal)
+
+    def test_status_flags_banks_and_wrapping(self) -> None:
+        # Loc A = bank 0, Loc B = bank 1
+        flags = evaluate_src2_status_flags(0, offset0=0, offset1=1)
+        self.assertEqual(flags.bank_a, 0)
+        self.assertEqual(flags.bank_b, 1)
+        self.assertFalse(flags.same_bank)
+        self.assertFalse(flags.address_a_wrapped)
+
+        # Loc A = bank 0, Loc B = bank 0 (same bank: stride 32 dwords)
+        flags_same = evaluate_src2_status_flags(0, offset0=0, offset1=32)
+        self.assertEqual(flags_same.bank_a, 0)
+        self.assertEqual(flags_same.bank_b, 0)
+        self.assertTrue(flags_same.same_bank)
+
+    def test_vcc_and_scc_carry_borrow_isolation(self) -> None:
+        canary_vcc = 0xDEADBEEF12345678
+        canary_scc = 1
+        self.state.vcc = canary_vcc
+        self.state.scc = canary_scc
+
+        inst = DSMaxSrc2U32Instruction.parse("ds_max_src2_u32 v0 offset0:1 offset1:2")
+        self.interp.execute(self.state, inst)
+
+        self.assertEqual(self.state.vcc, canary_vcc)
+        self.assertEqual(self.state.scc, canary_scc)
+
 
 if __name__ == "__main__":
     unittest.main()
