@@ -459,13 +459,26 @@ Target open_target(const std::wstring& path, DWORD access, DWORD disposition, DW
     // The host is asked about the overlay name, which a name only the package has does not have yet, so what a
     // creating open answers for a name that exists is decided here: a folder's name cannot be created as a file,
     // CREATE_NEW fails on a file, and CREATE_ALWAYS replaces it and says so (OPEN_ALWAYS does through its copy-up).
+    // FILE_FLAG_BACKUP_SEMANTICS is how a folder is opened: with it the host refuses CREATE_NEW and CREATE_ALWAYS
+    // on a folder with ERROR_FILE_EXISTS, and OPEN_ALWAYS opens the folder and reports ERROR_ALREADY_EXISTS itself.
+    // That open goes to the package folder when it asks for no write access, as OPEN_EXISTING does, and otherwise
+    // to a mirror of the folder in the overlay, as SetFileAttributes makes one, so the package is not written.
     bool replaces_package_file = false;
     std::vector<std::wstring> parts;
     if (disposition != OPEN_EXISTING && disposition != TRUNCATE_EXISTING &&
         parse_console(path, parts) == Parsed::Console) {
         const View v = view(roots(), parts);
         if (v.in_package && !v.in_overlay) {
-            if (v.kind == Kind::Directory) return fail(ERROR_ACCESS_DENIED);
+            if (v.kind == Kind::Directory) {
+                if ((flags & FILE_FLAG_BACKUP_SEMANTICS) == 0) return fail(ERROR_ACCESS_DENIED);
+                if (disposition != OPEN_ALWAYS) return fail(ERROR_FILE_EXISTS);
+                if (!writes(access, OPEN_EXISTING, flags)) return read_target(path);
+                Target folder = write_target(path, false);
+                std::error_code ec;
+                if (!folder.error) std::filesystem::create_directories(folder.path, ec);
+                if (ec) folder.error = static_cast<DWORD>(ec.value());
+                return folder;
+            }
             if (disposition == CREATE_NEW) return fail(ERROR_FILE_EXISTS);
             replaces_package_file = disposition == CREATE_ALWAYS;
         }
