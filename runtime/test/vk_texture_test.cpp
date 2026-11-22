@@ -66,7 +66,8 @@ int main(int argc, char** argv) {
     const bool signed_mips = argc == 10 && std::strcmp(argv[9], "--two-mip-sint") == 0;
     const bool two_mip = signed_mips || (argc == 10 && std::strcmp(argv[9], "--two-mip") == 0);
     // With vs_ids spanning UV [0,1] over the viewport, adjacent fragments differ by two base texels.
-    const uint32_t texture_side = two_mip ? 2 * W : TW;
+    uint32_t texture_width = two_mip ? 2 * W : TW;
+    uint32_t texture_height = texture_width;
     const uint32_t levels = two_mip ? 2 : 1;
     std::string vs_path, fs_path, out_path;
     int ptr_sgpr = 0;
@@ -111,6 +112,26 @@ int main(int argc, char** argv) {
     } else {
         std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint]\n");
         return 2;
+    }
+    // Optional replay texture: little-endian u32 width and height followed by tightly packed RGBA8.
+    std::vector<uint32_t> replay_texels;
+    if (const char* path = std::getenv("VKT_RGBA8_TEXTURE")) {
+        std::ifstream input(path, std::ios::binary | std::ios::ate);
+        const auto size = input.tellg();
+        input.seekg(0);
+        input.read(reinterpret_cast<char*>(&texture_width), sizeof(texture_width));
+        input.read(reinterpret_cast<char*>(&texture_height), sizeof(texture_height));
+        if (autonomous || two_mip || !input || !texture_width || !texture_height ||
+            texture_width > 4096 || texture_height > 4096 ||
+            size != std::streamoff(8 + uint64_t(texture_width) * texture_height * 4)) {
+            std::fprintf(stderr, "VKT_RGBA8_TEXTURE: expected a packed RGBA8 image (1..4096 per axis) in explicit shader mode\n");
+            return 2;
+        }
+        replay_texels.resize(size_t(texture_width) * texture_height);
+        if (!input.read(reinterpret_cast<char*>(replay_texels.data()), size - std::streamoff(8))) {
+            std::fprintf(stderr, "VKT_RGBA8_TEXTURE: cannot read %s\n", path);
+            return 2;
+        }
     }
     // Word 1 also selects the numeric type when the shader fetches through this key.
     const VkFormat sampled_format = dref ? VK_FORMAT_D32_SFLOAT :
@@ -298,11 +319,15 @@ int main(int argc, char** argv) {
     const uint32_t magenta = 0xFFFF00FFu;
     // R8G8B8A8 in memory: red, green, blue, transparent yellow, then solid cyan in mip 1.
     const uint32_t quadrants[2][2] = {{0xFF0000FFu, 0xFF00FF00u}, {0xFFFF0000u, 0x0000FFFFu}};
-    std::vector<uint32_t> texels(texture_side * texture_side + (two_mip ? (texture_side / 2) * (texture_side / 2) : 0), 0xFFFFFF00u);
-    for (uint32_t y = 0; y < texture_side; y++) {
-        for (uint32_t x = 0; x < texture_side; x++) {
-            texels[y * texture_side + x] = two_mip ? quadrants[y >= texture_side / 2][x >= texture_side / 2]
+    const bool replay = !replay_texels.empty();
+    std::vector<uint32_t> texels = std::move(replay_texels);
+    if (!replay) {
+        texels.resize(texture_width * texture_height + (two_mip ? (texture_width / 2) * (texture_height / 2) : 0), 0xFFFFFF00u);
+        for (uint32_t y = 0; y < texture_height; y++) {
+            for (uint32_t x = 0; x < texture_width; x++) {
+                texels[y * texture_width + x] = two_mip ? quadrants[y >= texture_height / 2][x >= texture_width / 2]
                                          : (x * 32u) | ((y * 32u) << 8) | (128u << 16) | (255u << 24);
+            }
         }
     }
     // The signed two-mip fixture uses 0 or -128 in each channel, including the alpha channel.
@@ -326,7 +351,7 @@ int main(int argc, char** argv) {
                               VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM};
     VkImage timg[4]; VkImageView tview[4];
     CHECK(make_tex(1, 1, 1, 1, VK_IMAGE_VIEW_TYPE_2D, tfmt[0], &timg[0], &tview[0]));
-    CHECK(make_tex(texture_side, texture_side, levels, 1, VK_IMAGE_VIEW_TYPE_2D, tfmt[1], &timg[1], &tview[1]));
+    CHECK(make_tex(texture_width, texture_height, levels, 1, VK_IMAGE_VIEW_TYPE_2D, tfmt[1], &timg[1], &tview[1]));
     CHECK(make_tex(1, 1, 1, 1, VK_IMAGE_VIEW_TYPE_2D_ARRAY, tfmt[2], &timg[2], &tview[2]));
     CHECK(make_tex(TW, TW, 1, CUBE_LAYERS, VK_IMAGE_VIEW_TYPE_2D_ARRAY, tfmt[3], &timg[3], &tview[3]));
     VkBuffer up; VkDeviceMemory upm; void* upp;
@@ -452,7 +477,8 @@ int main(int argc, char** argv) {
     VkCommandBuffer cmd; CHECK(vkAllocateCommandBuffers(dev, &cai, &cmd));
     VkCommandBufferBeginInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; CHECK(vkBeginCommandBuffer(cmd, &cbi));
     const VkDeviceSize up_offset[4] = {0, texture_offset, 0, cube_offset};
-    const uint32_t up_size[4] = {1, texture_side, 1, TW}, up_layers[4] = {1, 1, 1, CUBE_LAYERS};
+    const uint32_t up_width[4] = {1, texture_width, 1, TW}, up_height[4] = {1, texture_height, 1, TW};
+    const uint32_t up_layers[4] = {1, 1, 1, CUBE_LAYERS};
     for (int t = 0; t < 4; t++) {
         VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; ib.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; ib.image = timg[t];
@@ -462,11 +488,11 @@ int main(int argc, char** argv) {
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &ib);
         VkDeviceSize offset = up_offset[t];
         for (uint32_t level = 0; level < mip_levels; ++level) {
-            const uint32_t side = up_size[t] >> level;
+            const uint32_t width = up_width[t] >> level, height = up_height[t] >> level;
             VkBufferImageCopy c{}; c.bufferOffset = offset; c.imageSubresource = {aspect_of(tfmt[t]), level, 0, up_layers[t]};
-            c.imageExtent = {side, side, 1};
+            c.imageExtent = {width, height, 1};
             vkCmdCopyBufferToImage(cmd, up, timg[t], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
-            offset += VkDeviceSize(side) * side * up_layers[t] * sizeof(uint32_t);
+            offset += VkDeviceSize(width) * height * up_layers[t] * sizeof(uint32_t);
         }
         ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; ib.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         ib.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; ib.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
