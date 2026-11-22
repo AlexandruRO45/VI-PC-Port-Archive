@@ -623,6 +623,37 @@ int main() {
             offsets = kept;
         }
 
+        // Chunking of one huge record count (found by @Vonsek in #1865): the calls are counted, not the records. With
+        // maxDrawIndirectCount 0x80000000 and MaxCommandCount UINT32_MAX there are two calls, 0x80000000 records and
+        // then the clipped 0x7fffffff, at 64-bit offsets, and the loop ends. Both draw kinds, and a limit that does not
+        // divide the count.
+        {
+            struct Call { VkDeviceSize offset; std::uint32_t count; };
+            static std::vector<Call> calls;
+            ReplayFunctions huge{};
+            huge.multi_draw_indirect = true;
+            huge.max_draw_indirect_count = 0x80000000u;
+            huge.draw_indirect = [](VkCommandBuffer, VkBuffer, VkDeviceSize offset, std::uint32_t count,
+                                    std::uint32_t) { calls.push_back({offset, count}); };
+            huge.draw_indexed_indirect = huge.draw_indirect;
+            detail::Prepared prepared{};
+            prepared.binding.buffer_offset = 256;
+            for (const IndirectKind kind : {IndirectKind::draw, IndirectKind::draw_indexed}) {
+                calls.clear();
+                ExecuteIndirect command{kind, 20, UINT32_MAX, 1, 4, 0, 0, nullptr, true};
+                detail::emit_indirect(huge, VK_NULL_HANDLE, prepared, command);
+                CHECK(calls.size() == 2);
+                CHECK(calls[0].offset == 260 && calls[0].count == 0x80000000u);
+                CHECK(calls[1].offset == 260 + 0x80000000ull * 20 && calls[1].count == 0x7fffffffu);
+            }
+            calls.clear();
+            huge.max_draw_indirect_count = 1000;
+            ExecuteIndirect uneven{IndirectKind::draw, 16, 2500, 1, 0, 0, 0, nullptr, true};
+            detail::emit_indirect(huge, VK_NULL_HANDLE, prepared, uneven);
+            CHECK(calls.size() == 3 && calls[0].count == 1000 && calls[1].count == 1000 && calls[2].count == 500);
+            CHECK(calls[2].offset == 256 + 2000ull * 16);
+        }
+
         // Reject invalid spans before invoking Vulkan, including after adding the backing-buffer base.
         const auto rejected = [&](const ExecuteIndirect& command) {
             CommandList invalid;

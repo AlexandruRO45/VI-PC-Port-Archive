@@ -2229,16 +2229,22 @@ inline void emit_indirect(const ReplayFunctions& vk, VkCommandBuffer command_buf
     }
     // Without multiDrawIndirect a call draws one command: loop over them.
     // and a call takes at most maxDrawIndirectCount records.
+    // The cursor is 64 bits and advances by the count each call drew, so a short last call cannot wrap it.
     const std::uint32_t per_call =
         vk.multi_draw_indirect ? std::max<std::uint32_t>(1, std::min(ind.max_count, vk.max_draw_indirect_count)) : 1;
     if (ind.kind == IndirectKind::draw) {
-        for (std::uint32_t k = 0; k < ind.max_count; k += per_call)
-            vk.draw_indirect(command_buffer, p.binding.buffer, arguments + VkDeviceSize(k) * ind.stride,
-                             std::min(per_call, ind.max_count - k), ind.stride);
+        for (std::uint64_t k = 0; k < ind.max_count;) {
+            const std::uint32_t n = std::uint32_t(std::min<std::uint64_t>(per_call, ind.max_count - k));
+            vk.draw_indirect(command_buffer, p.binding.buffer, arguments + VkDeviceSize(k) * ind.stride, n, ind.stride);
+            k += n;
+        }
     } else if (ind.kind == IndirectKind::draw_indexed) {
-        for (std::uint32_t k = 0; k < ind.max_count; k += per_call)
-            vk.draw_indexed_indirect(command_buffer, p.binding.buffer, arguments + VkDeviceSize(k) * ind.stride,
-                                     std::min(per_call, ind.max_count - k), ind.stride);
+        for (std::uint64_t k = 0; k < ind.max_count;) {
+            const std::uint32_t n = std::uint32_t(std::min<std::uint64_t>(per_call, ind.max_count - k));
+            vk.draw_indexed_indirect(command_buffer, p.binding.buffer, arguments + VkDeviceSize(k) * ind.stride, n,
+                                     ind.stride);
+            k += n;
+        }
     } else if (ind.kind == IndirectKind::dispatch) {
         for (std::uint64_t k = 0; k < ind.max_count; ++k) {
             if (ind.count_buffer)
