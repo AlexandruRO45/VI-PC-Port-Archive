@@ -6278,7 +6278,7 @@ class Gen:
             self.emit(f"{sh} = OpShiftLeftLogical %uint {bytes_[1]} {self.cu(8)}")
             self.emit(f"{r} = OpBitwiseOr %uint {bytes_[0]} {sh}")
             self.dst(a[0], r)
-        elif op in ("v_cvt_norm_i16_f16", "v_cvt_norm_u16_f16", "v_cvt_pknorm_i16_f16", "v_cvt_pknorm_u16_f16"):
+        elif op in ("v_cvt_pknorm_i16_f16", "v_cvt_pknorm_u16_f16"):
             if any(m == "clamp" or m.startswith(("mul:", "div:")) for m in mods):
                 raise Unsupported(op + " output modifier")
             packed = "pknorm" in op
