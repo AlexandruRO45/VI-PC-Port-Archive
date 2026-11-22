@@ -1080,5 +1080,103 @@ class TestDivFixupF16SIMDMultiLane(unittest.TestCase):
             self.assertEqual(wave.get_lane_vgpr_u16(lane, 0), self.CANARY_OLD)
 
 
+class TestDivFixupF16RegisterAliasing(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def test_dst_equals_src0_inplace_fixup(self):
+        # In-place quotient update: v0 = div_fixup(v0, v1, v2)
+        rf = ScalarRegisterFile()
+        interp = DivFixupF16ScalarInterpreter(rf)
+
+        rf.write_vgpr_f16(0, 3.0)   # initial estimate in v0
+        rf.write_vgpr_f16(1, 2.0)   # denom
+        rf.write_vgpr_f16(2, 6.0)   # num
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_FIXUP_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(1),
+            src2=ASTOperand.vgpr(2),
+        )
+        interp.execute(inst)
+        self.assertEqual(rf.read_vgpr_f16(0), 3.0)
+
+    def test_dst_equals_src1_inplace(self):
+        rf = ScalarRegisterFile()
+        interp = DivFixupF16ScalarInterpreter(rf)
+
+        rf.write_vgpr_f16(0, 2.0)   # denom in v0
+        rf.write_vgpr_f16(1, 4.0)   # estimate in v1
+        rf.write_vgpr_f16(2, 8.0)   # num in v2
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_FIXUP_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(0),
+            src2=ASTOperand.vgpr(2),
+        )
+        interp.execute(inst)
+        self.assertEqual(rf.read_vgpr_f16(0), 4.0)
+
+    def test_dst_equals_src2_inplace(self):
+        rf = ScalarRegisterFile()
+        interp = DivFixupF16ScalarInterpreter(rf)
+
+        rf.write_vgpr_f16(0, 10.0)  # num in v0
+        rf.write_vgpr_f16(1, 5.0)   # estimate in v1
+        rf.write_vgpr_f16(2, 2.0)   # denom in v2
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_FIXUP_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(0),
+        )
+        interp.execute(inst)
+        self.assertEqual(rf.read_vgpr_f16(0), 5.0)
+
+    def test_self_aliasing_dst_equals_all_sources(self):
+        rf = ScalarRegisterFile()
+        interp = DivFixupF16ScalarInterpreter(rf)
+
+        rf.write_vgpr_f16(0, 1.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_FIXUP_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(0),
+            src2=ASTOperand.vgpr(0),
+        )
+        interp.execute(inst)
+        self.assertEqual(rf.read_vgpr_f16(0), 1.0)
+
+    def test_simd_multi_lane_aliased_fixup(self):
+        wave = SIMDWaveState(wave_size=64)
+        wave.exec_lo = 0xFF00FF00
+        wave.exec_hi = 0x00FF00FF
+
+        for lane in range(64):
+            wave.set_lane_vgpr_f16(lane, 0, float(lane) + 1.0)  # estimate in v0
+            wave.set_lane_vgpr_f16(lane, 1, 2.0)                # denom in v1
+            wave.set_lane_vgpr_f16(lane, 2, (float(lane) + 1.0) * 2.0) # num in v2
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_FIXUP_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(0),
+            src1=ASTOperand.vgpr(1),
+            src2=ASTOperand.vgpr(2),
+        )
+        wave.execute(inst)
+
+        for lane in range(64):
+            expected = float(lane) + 1.0
+            self.assertEqual(wave.get_lane_vgpr_f16(lane, 0), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
