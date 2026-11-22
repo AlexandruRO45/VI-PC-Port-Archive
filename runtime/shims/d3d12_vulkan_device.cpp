@@ -40,6 +40,26 @@ void log_once(const char* what, int value) {
     if (seen.insert({what, value}).second) std::fprintf(stderr, "[rt] d3d12: %s %d\n", what, value);
 }
 
+void log_va(D3D12_GPU_VIRTUAL_ADDRESS va, UINT64 size) {
+    static std::mutex mutex;
+    static std::set<D3D12_GPU_VIRTUAL_ADDRESS> seen;
+    std::lock_guard lock(mutex);
+    if (seen.insert(va).second) {
+        std::fprintf(stderr, "[rt] d3d12: GetGPUVirtualAddress: va 0x%llx (size %llu bytes)\n",
+                     static_cast<unsigned long long>(va), static_cast<unsigned long long>(size));
+    }
+}
+
+void log_descriptor_base(UINT64 base, UINT num_descriptors) {
+    static std::mutex mutex;
+    static std::set<UINT64> seen;
+    std::lock_guard lock(mutex);
+    if (seen.insert(base).second) {
+        std::fprintf(stderr, "[rt] d3d12: descriptor heap start: gpu_va 0x%llx (%u descriptors)\n",
+                     static_cast<unsigned long long>(base), num_descriptors);
+    }
+}
+
 struct Format {
     VkFormat format = VK_FORMAT_UNDEFINED;
     VkImageAspectFlags aspects = 0;
@@ -130,6 +150,9 @@ struct DeviceState {
         std::uint8_t* mapped = nullptr;
         VkDeviceAddress address = 0;
         VkDeviceSize size = 0;
+        VkDeviceSize allocated_bytes = 0;
+        VkDeviceSize high_water_bytes = 0;
+        VkDeviceSize highest_offset = 0;
         std::mutex mutex;
         std::map<VkDeviceSize, VkDeviceSize> free;  // offset -> size
     } arena;
@@ -145,6 +168,9 @@ struct DeviceState {
             if (start > block) arena.free[block] = start - block;
             if (start + bytes < end) arena.free[start + bytes] = end - (start + bytes);
             out = start;
+            arena.allocated_bytes += bytes;
+            if (arena.allocated_bytes > arena.high_water_bytes) arena.high_water_bytes = arena.allocated_bytes;
+            if (start + bytes > arena.highest_offset) arena.highest_offset = start + bytes;
             return true;
         }
         return false;
@@ -152,6 +178,10 @@ struct DeviceState {
 
     void arena_release(VkDeviceSize offset, VkDeviceSize bytes) {
         std::lock_guard lock(arena.mutex);
+        if (arena.allocated_bytes >= bytes)
+            arena.allocated_bytes -= bytes;
+        else
+            arena.allocated_bytes = 0;
         auto it = arena.free.emplace(offset, bytes).first;
         if (auto next = std::next(it); next != arena.free.end() && it->first + it->second == next->first) {
             it->second += next->second;
@@ -258,7 +288,9 @@ public:
     D3D12_GPU_DESCRIPTOR_HANDLE STDMETHODCALLTYPE GetGPUDescriptorHandleForHeapStart() override {
         if (!(desc_.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)) return {0};
         if (!in_arena_) log_once("shader-visible heap without a GPU address arena; flags", int(desc_.Flags));
-        return {in_arena_ ? UINT64(arena_offset_) : 0};
+        const UINT64 gpu_va = in_arena_ ? UINT64(arena_offset_) : 0;
+        log_descriptor_base(gpu_va, desc_.NumDescriptors);
+        return {gpu_va};
     }
 
 private:
@@ -413,7 +445,10 @@ public:
     D3D12_RESOURCE_DESC STDMETHODCALLTYPE GetDesc() override { return desc_; }
 
     // Buffers only, as on D3D12; textures have no GPU VA (images are reached through descriptors).
-    D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override { return va_; }
+    D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override {
+        if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) log_va(va_, desc_.Width);
+        return va_;
+    }
 
     HRESULT STDMETHODCALLTYPE GetHeapProperties(D3D12_HEAP_PROPERTIES* properties, D3D12_HEAP_FLAGS* flags) override {
         if (properties) *properties = heap_;
@@ -1045,6 +1080,15 @@ public:
             state_.context->vk.vkDeviceWaitIdle(state_.info.device);
         }
         if (state_.context && state_.arena.buffer) {
+            std::lock_guard lock(state_.arena.mutex);
+            const auto peak_mb = (state_.arena.high_water_bytes + (1 << 20) - 1) >> 20;
+            const auto cap_mb = state_.arena.size >> 20;
+            std::fprintf(stderr,
+                         "[rt] d3d12: arena high-water mark: peak allocated %llu bytes (%llu MiB) of %llu MiB capacity, highest offset 0x%llx\n",
+                         static_cast<unsigned long long>(state_.arena.high_water_bytes),
+                         static_cast<unsigned long long>(peak_mb),
+                         static_cast<unsigned long long>(cap_mb),
+                         static_cast<unsigned long long>(state_.arena.highest_offset));
             auto& vk = state_.context->vk;
             vk.vkDestroyBuffer(state_.info.device, state_.arena.buffer, nullptr);
             if (state_.arena.memory) vk.vkFreeMemory(state_.info.device, state_.arena.memory, nullptr);
