@@ -352,6 +352,80 @@ class ScalarVALUInterpreter:
             self.execute(inst)
 
 
+# ==============================================================================
+# SIMD Multi-Lane Wave State and Divergent Interpreter
+# ==============================================================================
+
+@dataclass
+class SIMDWaveState:
+    """Architectural state for a SIMD wavefront (Wave32 or Wave64)."""
+    wave_size: int = 64
+    exec_mask: int = MASK64
+    vgprs: List[List[int]] = field(default_factory=lambda: [[0] * 64 for _ in range(256)])
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+    vcc: int = 0
+
+    def __post_init__(self) -> None:
+        if self.wave_size not in (32, 64):
+            raise ValueError(f"Wave size must be 32 or 64, got {self.wave_size}")
+        if self.wave_size == 32:
+            self.exec_mask &= MASK32
+            self.vcc &= MASK32
+            if len(self.vgprs[0]) != 32:
+                self.vgprs = [[0] * 32 for _ in range(256)]
+        else:
+            self.exec_mask &= MASK64
+            self.vcc &= MASK64
+
+    def read_vgpr(self, lane: int, idx: int) -> int:
+        return self.vgprs[idx][lane] & MASK32
+
+    def write_vgpr(self, lane: int, idx: int, val: int) -> None:
+        self.vgprs[idx][lane] = val & MASK32
+
+    def read_sgpr(self, idx: int) -> int:
+        return self.sgprs[idx] & MASK32
+
+    def write_sgpr(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = val & MASK32
+
+    def read_lane_operand(self, lane: int, op: Operand) -> int:
+        if op.reg_type == RegType.VGPR:
+            return self.read_vgpr(lane, op.index)
+        elif op.reg_type == RegType.SGPR:
+            return self.read_sgpr(op.index)
+        elif op.reg_type == RegType.VCC:
+            return self.vcc & MASK32
+        elif op.reg_type in (RegType.LITERAL, RegType.INLINE_INT):
+            val = op.literal_val if op.literal_val is not None else 0
+            return val & MASK32
+        raise ValueError(f"Unsupported operand type for lane reading: {op}")
+
+
+class SIMDVALUInterpreter:
+    """SIMD wavefront interpreter enforcing EXEC masking and divergent lane execution."""
+
+    def __init__(self, wave_state: Optional[SIMDWaveState] = None) -> None:
+        self.wave_state = wave_state if wave_state is not None else SIMDWaveState()
+
+    def execute(self, inst: Union[VMadU32U16Instruction, VMadI32I16Instruction]) -> None:
+        ws = self.wave_state
+        for lane in range(ws.wave_size):
+            if not bool(ws.exec_mask & (1 << lane)):
+                continue
+
+            s0 = ws.read_lane_operand(lane, inst.src0)
+            s1 = ws.read_lane_operand(lane, inst.src1)
+            s2 = ws.read_lane_operand(lane, inst.src2)
+
+            if isinstance(inst, VMadU32U16Instruction):
+                dst, _ = ref_mad_u32_u16(s0, s1, s2, op_sel=inst.op_sel, clamp=inst.clamp)
+                ws.write_vgpr(lane, inst.vdst.index, dst)
+            elif isinstance(inst, VMadI32I16Instruction):
+                dst, _ = ref_mad_i32_i16(s0, s1, s2, op_sel=inst.op_sel, clamp=inst.clamp)
+                ws.write_vgpr(lane, inst.vdst.index, dst)
+
+
 class TestValuMadU32U16Oracle(unittest.TestCase):
     """Unit tests for the reference mathematical oracle and architectural model."""
 
@@ -696,6 +770,146 @@ class TestValuMadU32U16ScalarInterpreter(unittest.TestCase):
         self.assertEqual(rf.read_vgpr(0), 100)
         self.assertEqual(rf.read_vgpr(1), 307)
         self.assertEqual(rf.read_vgpr(2), 357)
+
+
+class TestValuMadU32U16SIMDMultiLane(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence, EXEC masking, and vector-scalar interactions."""
+
+    def test_wave64_all_lanes_active(self) -> None:
+        ws = SIMDWaveState(wave_size=64, exec_mask=MASK64)
+        for lane in range(64):
+            ws.write_vgpr(lane, 1, lane * 10)
+            ws.write_vgpr(lane, 2, lane * 20)
+            ws.write_vgpr(lane, 3, lane * 5)
+
+        inst = VMadU32U16Instruction(
+            vdst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+        interp = SIMDVALUInterpreter(ws)
+        interp.execute(inst)
+
+        for lane in range(64):
+            expected = (lane * 10) * (lane * 20) + (lane * 5)
+            self.assertEqual(ws.read_vgpr(lane, 0), expected)
+
+    def test_wave32_divergence_and_exec_masking(self) -> None:
+        ws = SIMDWaveState(wave_size=32, exec_mask=0x5555_5555)
+        sentinel = 0xDEAD_BEEF
+
+        for lane in range(32):
+            ws.write_vgpr(lane, 0, sentinel)
+            ws.write_vgpr(lane, 1, 10)
+            ws.write_vgpr(lane, 2, 20)
+            ws.write_vgpr(lane, 3, 30)
+
+        inst = VMadU32U16Instruction(
+            vdst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+        interp = SIMDVALUInterpreter(ws)
+        interp.execute(inst)
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(ws.read_vgpr(lane, 0), 10 * 20 + 30)
+            else:
+                self.assertEqual(ws.read_vgpr(lane, 0), sentinel)
+
+    def test_sparse_exec_mask_single_lane(self) -> None:
+        target_lane = 23
+        ws = SIMDWaveState(wave_size=64, exec_mask=(1 << target_lane))
+        sentinel = 0xCAFE_BABE
+
+        for lane in range(64):
+            ws.write_vgpr(lane, 0, sentinel)
+            ws.write_vgpr(lane, 1, 7)
+            ws.write_vgpr(lane, 2, 9)
+            ws.write_vgpr(lane, 3, 11)
+
+        inst = VMadU32U16Instruction(
+            vdst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+        interp = SIMDVALUInterpreter(ws)
+        interp.execute(inst)
+
+        for lane in range(64):
+            if lane == target_lane:
+                self.assertEqual(ws.read_vgpr(lane, 0), 7 * 9 + 11)
+            else:
+                self.assertEqual(ws.read_vgpr(lane, 0), sentinel)
+
+    def test_exec_zero_all_lanes_dormant(self) -> None:
+        ws = SIMDWaveState(wave_size=64, exec_mask=0)
+        sentinel = 0x1234_5678
+
+        for lane in range(64):
+            ws.write_vgpr(lane, 0, sentinel)
+            ws.write_vgpr(lane, 1, 100)
+            ws.write_vgpr(lane, 2, 100)
+            ws.write_vgpr(lane, 3, 100)
+
+        inst = VMadU32U16Instruction(
+            vdst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+        interp = SIMDVALUInterpreter(ws)
+        interp.execute(inst)
+
+        for lane in range(64):
+            self.assertEqual(ws.read_vgpr(lane, 0), sentinel)
+
+    def test_shared_sgpr_uniform_broadcast_to_simd_lanes(self) -> None:
+        ws = SIMDWaveState(wave_size=64, exec_mask=MASK64)
+        ws.write_sgpr(4, 42)
+
+        for lane in range(64):
+            ws.write_vgpr(lane, 1, lane)
+            ws.write_vgpr(lane, 2, 10)
+
+        inst = VMadU32U16Instruction(
+            vdst=Operand.vgpr(0),
+            src0=Operand.sgpr(4),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2),
+        )
+        interp = SIMDVALUInterpreter(ws)
+        interp.execute(inst)
+
+        for lane in range(64):
+            self.assertEqual(ws.read_vgpr(lane, 0), 42 * lane + 10)
+
+    def test_simd_divergent_op_sel(self) -> None:
+        ws = SIMDWaveState(wave_size=64, exec_mask=MASK64)
+        for lane in range(64):
+            # lo = lane, hi = lane * 2
+            ws.write_vgpr(lane, 1, pack_halfwords(lane, lane * 2))
+            ws.write_vgpr(lane, 2, pack_halfwords(3, 7))
+            ws.write_vgpr(lane, 3, 5)
+
+        # Select high half of src0 (lane * 2) and high half of src1 (7)
+        inst = VMadU32U16Instruction(
+            vdst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+            op_sel=(True, True),
+        )
+        interp = SIMDVALUInterpreter(ws)
+        interp.execute(inst)
+
+        for lane in range(64):
+            expected = (lane * 2) * 7 + 5
+            self.assertEqual(ws.read_vgpr(lane, 0), expected)
 
 
 if __name__ == "__main__":
