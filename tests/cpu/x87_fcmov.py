@@ -1,0 +1,292 @@
+"""Compare native and translated FCMOVB, FCMOVE, FCMOVBE, FCMOVNB, FCMOVNE and FCMOVNBE of the x87
+leaf-function profile.
+
+Usage:
+    python tests/cpu/x87_fcmov.py asm <asm> <def>             regenerate the MASM source and exports
+    python tests/cpu/x87_fcmov.py emit <dll> <cpp> [control]   translate (and optionally mutate) the fixture
+    python tests/cpu/x87_fcmov.py check <harness> <native> <lifted> [controls...]
+
+The exports, harness and guards follow tests/cpu/x87_add.py, and the other steps use the format of
+tests/cpu/x87_moves.py. emit checks that every decoded x87 instruction is the form its sequence names.
+The flags come from an integer CMP of two input dwords or from FCOMI; the model evaluates each condition
+itself and copies raw encodings, independent of tools/x87_soft.h.
+"""
+from pathlib import Path
+import platform
+import random
+import re
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
+import x87_add as base  # noqa: E402  (tests/cpu is the script directory)
+import x87_compare as compare  # noqa: E402
+import x87_integers as integers  # noqa: E402
+from x87_add import J, Q, from_binary, m80_bytes, to_binary  # noqa: E402
+from x87_div import SIZE  # noqa: E402
+
+INPUT, OUTPUT = base.INPUT, base.OUTPUT
+FCMOV = ("fcmovb", "fcmove", "fcmovbe", "fcmovnb", "fcmovne", "fcmovnbe")
+CONDITION = {"fcmovb": lambda z, c: c, "fcmove": lambda z, c: z, "fcmovbe": lambda z, c: c or z,
+             "fcmovnb": lambda z, c: not c, "fcmovne": lambda z, c: not z, "fcmovnbe": lambda z, c: not c and not z}
+# Integer inputs at offsets 48 and 52 of the input block; m80 values at 0, 16 and 32.
+CMP = ("cmp",)  # mov eax, [rcx+48]; cmp eax, [rcx+52]: ZF = equal, CF = unsigned below
+P2 = [("fld", "m80", 16), ("fld", "m80", 0)]  # ST(0) = a (offset 0), ST(1) = b (offset 16)
+OUT2 = [("fstp", "m80", 0), ("fstp", "m80", 16)]
+
+# ("fcmov...", i) and ("cmp",) are the new steps; ("fcomi", i) is the step of tests/cpu/x87_compare.py,
+# and the others use the x87_moves format.
+SEQUENCES = {
+    **{f"{op}_cmp": ("pairint", P2 + [CMP, (op, 1)] + OUT2) for op in FCMOV},
+    # A third value: the move reads ST(2), and ST(1) must stay as it was.
+    "fcmovb_st2": ("tripleint", [("fld", "m80", 32)] + P2 + [CMP, ("fcmovb", 2), ("fstp", "m80", 0),
+                                                              ("fstp", "m80", 16), ("fstp", "m80", 32)]),
+    # The flags of FCOMI: max(a, b) with FCMOVB, and min(a, b) with FCMOVNBE, as compilers emit them.
+    "fcomi_max": ("pair80", P2 + [("fcomi", 1), ("fcmovb", 1)] + OUT2),
+    "fcomi_min": ("pair80", P2 + [("fcomi", 1), ("fcmovnbe", 1)] + OUT2),
+    # Two moves under the same flags, and a move of ST(0) onto itself.
+    "fcmovne_fcmove": ("tripleint", [("fld", "m80", 32)] + P2 + [CMP, ("fcmovne", 1), ("fcmove", 2),
+                                                                  ("fstp", "m80", 0), ("fstp", "m80", 16),
+                                                                  ("fstp", "m80", 32)]),
+    "fcmove_st0": ("pairint", P2 + [CMP, ("fcmove", 0)] + OUT2),
+    # The deepest operand: ST(7) at depth 8, stored back as m64.
+    "fcmovnb_st7": ("m64x8int", [("fld", "m64", 8 * k) for k in range(8)] + [CMP, ("fcmovnb", 7)]
+                    + [("fstp", "m64", 8 * k) for k in range(8)]),
+}
+
+MOVE = r"x87_slot\[(\d)\] = x87_slot\[(\d)\];  // (fcmov\w*) "
+CONTROLS = {
+    # FCMOVB moves when CF is clear instead of set.
+    "invert": (re.compile(r"if \(carry\) (x87_slot\[\d\] = x87_slot\[\d\];  // fcmovb )"), r"if (!carry) \1"),
+    # FCMOVBE reads only CF.
+    "beonly": (re.compile(r"if \(carry \|\| zero\) (x87_slot)"), r"if (carry) \1"),
+    # FCMOVNBE moves when either flag is clear.
+    "nbeor": (re.compile(r"if \(!carry && !zero\) (x87_slot)"), r"if (!carry || !zero) \1"),
+    # FCMOVNE never moves.
+    "neverne": (re.compile(r"if \(!zero\) (x87_slot\[\d\] = x87_slot\[\d\];  // fcmovne )"), r"if (false) \1"),
+    # Every conditional move moves.
+    "always": (re.compile(r"if \([^)]*\) (" + MOVE + ")"), r"\1"),
+    # The copy quiets a signaling NaN.
+    "quiet": (re.compile(MOVE),
+              r"x87_slot[\1] = x87_is_nan(x87_slot[\2]) ? x87_quiet(x87_slot[\2]) : x87_slot[\2];  // \3 "),
+}
+
+
+# ---- MASM generation and decoding ------------------------------------------------------------------
+
+def asm_line(step):
+    op, *args = step
+    if op == "cmp":
+        return "    mov eax, dword ptr [rcx+48]\n    cmp eax, dword ptr [rcx+52]"
+    if op in FCMOV:
+        return f"    {op} st, st({args[0]})"
+    if op == "fcomi":
+        return f"    fcomi st, st({args[0]})"
+    return integers.asm_line(step)
+
+
+def expected_form(step):
+    op, *args = step
+    if op in FCMOV or op == "fcomi":
+        return op, f"st0,st{args[0]}"
+    return integers.expected_form(step)
+
+
+def decoded_form(i):
+    from iced_x86 import Mnemonic as M, Register as R
+
+    if i.mnemonic in (M.FCMOVB, M.FCMOVE, M.FCMOVBE, M.FCMOVNB, M.FCMOVNE, M.FCMOVNBE, M.FCOMI):
+        name = next(n for n, v in vars(M).items() if v == i.mnemonic).lower()
+        return name, f"st{i.op0_register - R.ST0},st{i.op1_register - R.ST0}"
+    return integers.decoded_form(i)
+
+
+def write_asm(asm_path, def_path):
+    lines = ["; coverage: source cpu_aot_x87_fcmov",
+             "; Generated by tests/cpu/x87_fcmov.py asm; edit SEQUENCES there and regenerate.",
+             "; Source-owned differential fixture for the ZF/CF forms of FCMOVcc in the x87 leaf-function",
+             "; profile. Each export reads an input block at RCX, writes an output block at RDX and returns with",
+             "; the x87 stack empty.", ".code", ""]
+    for name, (_, steps) in SEQUENCES.items():
+        lines += [f"{name} PROC FRAME", "    .endprolog", *(asm_line(s) for s in steps), "    ret", f"{name} ENDP", ""]
+    lines.append("END")
+    Path(asm_path).write_text("\n".join(lines) + "\n", encoding="ascii")
+    Path(def_path).write_text("EXPORTS\n" + "".join(f"    {name}\n" for name in SEQUENCES), encoding="ascii")
+
+
+def emit(image, output, control="lifted"):
+    import pefile
+    from cpu_leaf_aot import export_rva
+    from cpu_ranges import function_ranges
+    from ffx_version_query import INTEGER_HEADER, lower, region
+    from x87_lower import X87_HEADER, is_x87
+
+    parts = [INTEGER_HEADER, X87_HEADER]
+    with pefile.PE(str(image), fast_load=True) as pe:
+        for name, (_, steps) in SEQUENCES.items():
+            (bounds,) = function_ranges(pe, export_rva(pe, name))
+            body = region(pe, *bounds)
+            decoded = [decoded_form(i) for i in body if is_x87(i)]
+            wanted = [expected_form(s) for s in steps if s[0] != "cmp"]
+            if decoded != wanted:
+                raise AssertionError(f"{name} assembled as {decoded}, expected {wanted}")
+            code = lower(body, ["rcx = a; rdx = b;"], {}, {}, {}, x87=True)
+            parts.append(f'extern "C" __declspec(dllexport) word {name}(word a, word b) {{\n{code}\n}}\n')
+    text = "".join(parts)
+    if control != "lifted":
+        expression, replacement = CONTROLS[control]
+        text, count = expression.subn(replacement, text)
+        if not count:
+            raise AssertionError(f"control {control} changed nothing")
+        print(f"control {control}: {count} replacements")
+    output.write_text(text, encoding="ascii")
+
+
+# ---- Independent model -----------------------------------------------------------------------------
+
+def reference(name, data, moves=True):
+    """The output block; with moves=False every conditional move is skipped, for the moved-case count."""
+    slots, out = [], bytearray(b"\xcc" * OUTPUT)
+    zero = carry = None
+
+    def read(kind, offset):
+        return int.from_bytes(data[offset:offset + SIZE[kind]], "little")
+
+    for op, *args in SEQUENCES[name][1]:
+        if op == "cmp":
+            a, b = read("m32", 48), read("m32", 52)
+            zero, carry = a == b, a < b
+        elif op == "fcomi":
+            r = compare.compare(slots[-1], slots[-1 - args[0]])  # 0 less, 1 equal, 2 greater, 3 unordered
+            zero, carry = r in (1, 3), r in (0, 3)
+        elif op in FCMOV:
+            if moves and CONDITION[op](zero, carry):
+                slots[-1] = slots[-1 - args[0]]
+        elif op == "fld":
+            raw = read(*args)
+            slots.append((raw & (2 ** 64 - 1), raw >> 64) if args[0] == "m80" else from_binary(args[0], raw))
+        else:  # ("fstp", kind, offset)
+            kind, offset = args
+            v = slots.pop()
+            encoded = v[0] | v[1] << 64 if kind == "m80" else to_binary(kind, v)
+            out[offset:offset + SIZE[kind]] = encoded.to_bytes(SIZE[kind], "little")
+    assert not slots
+    return bytes(out)
+
+
+# ---- Inputs ----------------------------------------------------------------------------------------
+
+def flag_words(rng):
+    """Dword pairs for the integer CMP: below, equal and above, signed and unsigned orders apart."""
+    rows = [(1, 2), (2, 2), (3, 2), (0, 0xFFFFFFFF), (0xFFFFFFFF, 0), (0x80000000, 0x7FFFFFFF), (7, 7)]
+    rows += [(rng.getrandbits(32), rng.getrandbits(32)) for _ in range(5)]
+    return rows
+
+
+def cases():
+    rng = random.Random(101)
+    specials = base.special_m80()
+    singles = list(base.m80_singles()) + [(J | rng.getrandbits(63), rng.randint(1, 0x7FFE) | rng.choice((0, 0x8000)))
+                                          for _ in range(100)]
+    words = flag_words(rng)
+
+    def ints(a, b):
+        return a.to_bytes(4, "little") + b.to_bytes(4, "little")
+
+    pairs = [(a, b) for a in specials for b in specials]
+    pairint = [m80_bytes(a) + m80_bytes(b) + b"\0" * 16 + ints(*w) for a, b in pairs[::7] for w in words[:3]]
+    pairint += [m80_bytes(rng.choice(singles)) + m80_bytes(rng.choice(singles)) + b"\0" * 16 + ints(*rng.choice(words))
+                for _ in range(300)]
+    tripleint = [m80_bytes(rng.choice(specials)) + m80_bytes(rng.choice(specials)) + m80_bytes(rng.choice(specials))
+                 + ints(*w) for _ in range(150) for w in words[:3]]
+    pair80 = [m80_bytes(a) + m80_bytes(b) for a, b in pairs] + [m80_bytes(rng.choice(singles)) + m80_bytes(rng.choice(singles))
+                                                                 for _ in range(500)]
+    f64 = base.f64_bits()
+    # Eight m64 values fill the 64-byte block, so the CMP dwords at 48 and 52 are the halves of the seventh.
+    m64x8int = [b"".join(rng.choice(f64).to_bytes(8, "little") for _ in range(8)) for _ in range(300)]
+    blocks = {"pairint": pairint, "tripleint": tripleint, "pair80": pair80, "m64x8int": m64x8int}
+    for name, (kind, _) in SEQUENCES.items():
+        for block in blocks[kind]:
+            yield name, bytes(block).ljust(INPUT, b"\0")
+
+
+# ---- Check -----------------------------------------------------------------------------------------
+
+def check(harness_path, native_path, lifted_path, *control_paths):
+    expected = [(name, data, reference(name, data)) for name, data in cases()]
+    for label, path in (("native", native_path), ("lifted", lifted_path)):
+        run = base.Runner(harness_path, path)
+        bad = 0
+        for name, data, want in expected:
+            got, state = run(name, data)
+            if not base.entry_state_ok(state):
+                raise AssertionError(f"{label} {name} left state {state:#014x}; the profile requires control "
+                                     "0x027f and an empty stack at TOP 0")
+            if got != want:
+                if bad < 3:
+                    print(f"{label} mismatch: {name}(input {data.hex()})\n  got      {got[:48].hex()}\n"
+                          f"  expected {want[:48].hex()}")
+                bad += 1
+        if bad:
+            raise AssertionError(f"{label}: {bad}/{len(expected)} mismatches")
+    moved = sum(1 for name, data, want in expected if want != reference(name, data, moves=False))
+    print(f"{len(expected)} cases over {len(SEQUENCES)} exports (output block and guards) matched the reference "
+          "in native and translated DLLs; each export returned with control 0x027f and an empty stack")
+    print(f"cases in which a conditional move changed the output block: {moved} of {len(expected)}")
+    print(f"processor: {platform.processor()}")
+    first = {}
+    for name, data, want in expected:
+        first.setdefault(name, (data, want))
+    for label, path in (("native", native_path), ("lifted", lifted_path)):
+        run = base.Runner(harness_path, path)
+        failed = [name for name, (data, want) in first.items() if not base.preserved(run, "x87_call", name, data, want)]
+        if failed:
+            raise AssertionError(f"x87_call lost a live caller value or control word around {label} {failed}")
+    print(f"x87_call kept a live caller ST(0) value and control word around all {len(first)} native and "
+          "translated exports")
+    for path in control_paths:
+        control = Path(path).stem.rsplit("_", 1)[-1]
+        run = base.Runner(harness_path, path)
+        bad = sum(1 for name, data, want in expected if run(name, data)[0] != want)
+        print(f"control {control}: {bad}/{len(expected)} mismatches")
+        if not bad:
+            raise AssertionError(f"control {control} matched every case")
+    check_rejections()
+
+
+def check_rejections():
+    from iced_x86 import Decoder
+    from ffx_version_query import lower
+
+    def attempt(hex_bytes):
+        body = list(Decoder(64, bytes.fromhex(hex_bytes), ip=0x1000))
+        try:
+            lower(body, [], {}, {}, {}, x87=True)
+        except ValueError as exc:
+            return str(exc)
+        return None
+
+    fld, fstp, cmp = "db 29", "db 3a", "8b 41 30 3b 41 34"  # fld/fstp tbyte ptr [rcx]/[rdx]; mov/cmp eax
+    rejected = {
+        "fcmovu st, st(1)": (attempt(f"{fld} {fld} {cmp} da d9 {fstp} {fstp} c3"), "unsupported x87 operation"),
+        "fcmovnu st, st(1)": (attempt(f"{fld} {fld} {cmp} db d9 {fstp} {fstp} c3"), "unsupported x87 operation"),
+        "fcmovb st, st(1) with one value": (attempt(f"{fld} {cmp} da c1 {fstp} c3"), "x87 stack underflow"),
+        "fcmove st, st(2) with two values": (attempt(f"{fld} {fld} {cmp} da ca {fstp} {fstp} c3"),
+                                             "x87 stack underflow"),
+        "fcmovnbe on an empty stack": (attempt(f"{cmp} db d1 c3"), "x87 stack underflow"),
+    }
+    for case, (message, needle) in rejected.items():
+        if message is None or needle not in message:
+            raise AssertionError(f"{case}: expected a rejection containing {needle!r}, got {message!r}")
+    print(f"rejected {len(rejected)} sequences outside the profile: " + "; ".join(rejected))
+
+
+if __name__ == "__main__":
+    mode, first, second, *rest = sys.argv[1:]
+    if mode == "asm":
+        write_asm(first, second)
+    elif mode == "emit":
+        emit(Path(first), Path(second), *rest)
+    elif mode == "check":
+        check(first, second, *rest)
+    else:
+        raise ValueError(mode)

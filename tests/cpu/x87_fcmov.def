@@ -1,0 +1,13 @@
+EXPORTS
+    fcmovb_cmp
+    fcmove_cmp
+    fcmovbe_cmp
+    fcmovnb_cmp
+    fcmovne_cmp
+    fcmovnbe_cmp
+    fcmovb_st2
+    fcomi_max
+    fcomi_min
+    fcmovne_fcmove
+    fcmove_st0
+    fcmovnb_st7

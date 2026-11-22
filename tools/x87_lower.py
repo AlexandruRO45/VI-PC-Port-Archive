@@ -8,6 +8,8 @@ The profile accepts:
 - FILD, FISTP and FISTTP with an m16, m32 or m64 integer operand, and FIST with m16 or m32;
 - FCOMI, FCOMIP, FUCOMI and FUCOMIP ST(0), ST(i), which set ZF and CF for the integer lowering (PF is
   not modelled, and the integer lowering rejects every instruction that reads it);
+- FCMOVB, FCMOVE, FCMOVBE, FCMOVNB, FCMOVNE and FCMOVNBE ST(0), ST(i), which read ZF and CF (FCMOVU
+  and FCMOVNU read PF and stay outside the profile);
 - FADD, FSUB, FSUBR, FMUL, FDIV and FDIVR with an m32 or m64 operand, with ST(0), ST(i) and with
   ST(i), ST(0), and their popping forms FADDP, FSUBP, FSUBRP, FMULP, FDIVP and FDIVRP ST(i), ST(0) for
   i from 1 to 7.
@@ -25,8 +27,11 @@ from pathlib import Path
 from iced_x86 import Code as C, FlowControl, MemorySize as S, Mnemonic as M, OpKind as K, Register as R
 
 X87_HEADER = Path(__file__).with_name("x87_soft.h").read_text(encoding="ascii")
+# Conditional register moves and the C++ condition each reads from the integer lowering's flags.
+FCMOV = {M.FCMOVB: "carry", M.FCMOVE: "zero", M.FCMOVBE: "carry || zero", M.FCMOVNB: "!carry",
+         M.FCMOVNE: "!zero", M.FCMOVNBE: "!carry && !zero"}
 X87_OPS = frozenset({M.FLD, M.FST, M.FSTP, M.FXCH, M.FCHS, M.FABS, M.FSQRT, M.FRNDINT, M.FLD1, M.FLDZ, M.FLDPI, M.FLDL2T, M.FLDL2E,
-                     M.FLDLG2, M.FLDLN2, M.FILD, M.FIST, M.FISTP, M.FISTTP, M.FXTRACT, M.FSCALE, M.FCOMI,
+                     M.FLDLG2, M.FLDLN2, M.FILD, M.FIST, M.FISTP, M.FISTTP, M.FXTRACT, M.FSCALE, *FCMOV, M.FCOMI,
                      M.FCOMIP, M.FUCOMI, M.FUCOMIP, M.FADD, M.FADDP, M.FSUB, M.FSUBP, M.FSUBR, M.FSUBRP, M.FMUL, M.FMULP,
                      M.FDIV, M.FDIVP, M.FDIVR, M.FDIVRP})
 DECLARATION = "X87Value x87_slot[8]{};"
@@ -79,6 +84,12 @@ def _effect(i, depth):
             raise ValueError(f"x87 stack overflow at {i.ip:#x}: {i}")
         return depth + {M.FLD: 1, M.FST: 0, M.FSTP: -1}[op]
     if op == M.FXCH and i.op_count == 2 and i.op0_register == R.ST0:
+        if depth <= i.op1_register - R.ST0:
+            raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
+        return depth
+    if op in FCMOV:
+        if i.op_count != 2 or i.op0_register != R.ST0:
+            raise ValueError(f"unsupported x87 operand at {i.ip:#x}: {i}")
         if depth <= i.op1_register - R.ST0:
             raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
         return depth
@@ -198,6 +209,10 @@ def statement(i, depth, address):
     if op == M.FXCH:
         k = top - (i.op1_register - R.ST0)
         return f"{{ const X87Value t = x87_slot[{top}]; x87_slot[{top}] = x87_slot[{k}]; x87_slot[{k}] = t; }}  // fxch"
+    if op in FCMOV:  # the whole 80-bit encoding is copied, as for FLD ST(i)
+        k = i.op1_register - R.ST0
+        name = next(n for n, v in vars(M).items() if v == op).lower()
+        return f"if ({FCMOV[op]}) x87_slot[{top}] = x87_slot[{top - k}];  // {name} st({k})"
     if op in COMPARES:  # ZF and CF: 1 and 0 for equal, 0 and 1 for less, 0 and 0 for greater, 1 and 1 unordered
         k = top - (i.op1_register - R.ST0)
         return (f"{{ const int r = x87_compare(x87_slot[{top}], x87_slot[{k}]); "
