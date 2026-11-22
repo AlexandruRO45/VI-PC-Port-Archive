@@ -1401,7 +1401,8 @@ HRESULT build_indirect_signature(const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D1
     if (root_signature && !layout) return E_INVALIDARG;  // a root signature of another device
     auto sig = std::make_shared<leonida::IndirectSignature>();
     std::uint32_t offset = 0;
-    bool action = false, root_arguments = false;
+    bool action = false, root_arguments = false, index_buffer = false;
+    std::uint32_t vertex_slots = 0;
     for (UINT i = 0; i < desc->NumArgumentDescs; ++i) {
         const D3D12_INDIRECT_ARGUMENT_DESC& arg = desc->pArgumentDescs[i];
         if (action) return E_INVALIDARG;  // a draw or dispatch ends the record
@@ -1439,9 +1440,13 @@ HRESULT build_indirect_signature(const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D1
             if (arg.VertexBuffer.Slot >= D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) return E_INVALIDARG;
             a.type = IndirectArgumentType::vertex_buffer, a.size = sizeof(D3D12_VERTEX_BUFFER_VIEW);
             a.slot = arg.VertexBuffer.Slot;
+            if (vertex_slots & (1u << a.slot)) return E_INVALIDARG;  // a slot twice
+            vertex_slots |= 1u << a.slot;
             break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW:
             a.type = IndirectArgumentType::index_buffer, a.size = sizeof(D3D12_INDEX_BUFFER_VIEW);
+            if (index_buffer) return E_INVALIDARG;  // a second index buffer
+            index_buffer = true;
             break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT: {
             const auto& c = arg.Constant;
@@ -1477,6 +1482,9 @@ HRESULT build_indirect_signature(const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D1
         sig->arguments.push_back(a);
     }
     if (!action) return E_INVALIDARG;  // the last argument is a draw or a dispatch
+    // Vertex and index buffers feed a draw (an index buffer a draw indexed), not a dispatch.
+    if (sig->kind == leonida::IndirectKind::dispatch && (vertex_slots || index_buffer)) return E_INVALIDARG;
+    if (index_buffer && sig->kind != leonida::IndirectKind::draw_indexed) return E_INVALIDARG;  // as the host does
     // D3D12: the root signature is required exactly when an argument sets root arguments; the stride covers one
     // record and is a multiple of 4.
     if (root_arguments != (root_signature != nullptr)) return E_INVALIDARG;

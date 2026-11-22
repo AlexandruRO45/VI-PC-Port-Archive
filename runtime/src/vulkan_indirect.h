@@ -189,15 +189,16 @@ public:
             out.patch_offsets[out.patch_count++] = a.offset / 4;
         }
         if (out.patch_count) {
-            const VkDeviceSize bytes = VkDeviceSize(r.max_count) * sig.stride;
-            const VkDeviceSize dwords = bytes / 4;
-            if (dwords > UINT32_MAX / 2 || (dwords + 63) / 64 > max_groups_ ) return false;
+            // Exactly the bytes the records occupy: the last record's tail past its arguments need not exist in the
+            // application's buffer (D3D12 only asks for (n - 1) * stride + the arguments), and the sequences stay
+            // `span` bytes long as in the unpatched case.
+            const VkDeviceSize dwords = span / 4;
+            if (dwords > UINT32_MAX / 2) return false;
             VkBuffer buffer = VK_NULL_HANDLE;
             VkDeviceSize offset = 0;
-            if (!copies_->get(bytes, buffer, offset)) return false;
+            if (!copies_->get(span, buffer, offset)) return false;
             out.patch_source = arguments;
             out.sequences = copies_->address(buffer, offset);
-            out.sequences_size = bytes;
             out.patch_dwords = std::uint32_t(dwords);
             out.patch_stride_dwords = sig.stride / 4;
             if (!patch_ready()) return false;
@@ -215,21 +216,27 @@ public:
         fn_.vkGetGeneratedCommandsMemoryRequirementsEXT(device_, &info, &requirements);
         out.preprocess_size = requirements.memoryRequirements.size;
         if (out.preprocess_size) {
-            if (!preprocess_) {
+            // One pool per set of memory types the requirements allow, and room to align the start (a pool hands out
+            // 256-byte aligned chunks).
+            const std::uint32_t bits = requirements.memoryRequirements.memoryTypeBits;
+            auto& pool = preprocess_[bits];
+            if (!pool) {
                 ScratchBuffers::Config config;
                 config.usage = 0;
                 config.usage2 = VK_BUFFER_USAGE_2_PREPROCESS_BUFFER_BIT_EXT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT;
-                config.memory_type_mask = requirements.memoryRequirements.memoryTypeBits;
-                preprocess_ = std::make_unique<ScratchBuffers>(get_, device_, allocate_, config);
-                if (!preprocess_->loaded()) {
-                    preprocess_.reset();
+                config.memory_type_mask = bits;
+                pool = std::make_unique<ScratchBuffers>(get_, device_, allocate_, config);
+                if (!pool->loaded()) {
+                    preprocess_.erase(bits);
                     return false;
                 }
             }
+            const VkDeviceSize alignment = std::max<VkDeviceSize>(1, requirements.memoryRequirements.alignment);
             VkBuffer buffer = VK_NULL_HANDLE;
             VkDeviceSize offset = 0;
-            if (!preprocess_->get(out.preprocess_size, buffer, offset)) return false;
-            out.preprocess = preprocess_->address(buffer, offset);
+            if (!pool->get(out.preprocess_size + (alignment > 256 ? alignment : 0), buffer, offset)) return false;
+            const VkDeviceAddress start = pool->address(buffer, offset);
+            out.preprocess = (start + alignment - 1) / alignment * alignment;
         }
         return true;
     }
@@ -251,7 +258,10 @@ public:
         std::copy(std::begin(plan.patch_offsets), std::end(plan.patch_offsets), push.offsets);
         fn_.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, patch_pipeline_);
         fn_.vkCmdPushConstants(cb, patch_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-        fn_.vkCmdDispatch(cb, (plan.patch_dwords + 63) / 64, 1, 1);
+        // A 2D grid, rows of 65535 groups (the least maxComputeWorkGroupCount a device has): the shader numbers its
+        // invocations row by row, so any record count fits.
+        const std::uint32_t groups = (plan.patch_dwords + 63) / 64, columns = std::min(groups, 65535u);
+        fn_.vkCmdDispatch(cb, columns, (groups + columns - 1) / columns, 1);
         VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         after.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         after.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -279,17 +289,25 @@ public:
     void collect() {
         std::lock_guard lock(mutex_);
         copies_->collect();
-        if (preprocess_) preprocess_->collect();
+        for (auto& pool : preprocess_) pool.second->collect();
     }
+    // The layouts this submission used are in use until its ticket completes (layout_for evicts only past that).
     void retire(VkSemaphore timeline, std::uint64_t ticket) {
         std::lock_guard lock(mutex_);
         copies_->retire(timeline, ticket);
-        if (preprocess_) preprocess_->retire(timeline, ticket);
+        for (auto& pool : preprocess_) pool.second->retire(timeline, ticket);
+        if (ticket)
+            for (Entry* entry : current_) entry->stamps.push_back({timeline, ticket});
+        current_.clear();
     }
     void forget(VkSemaphore timeline) {
         std::lock_guard lock(mutex_);
         copies_->forget(timeline);
-        if (preprocess_) preprocess_->forget(timeline);
+        for (auto& pool : preprocess_) pool.second->forget(timeline);
+        for (auto& entry : layouts_)
+            entry.second.stamps.erase(std::remove_if(entry.second.stamps.begin(), entry.second.stamps.end(),
+                                                     [&](const auto& stamp) { return stamp.first == timeline; }),
+                                      entry.second.stamps.end());
     }
 
 private:
@@ -299,7 +317,7 @@ private:
     X(vkGetGeneratedCommandsMemoryRequirementsEXT) X(vkCmdExecuteGeneratedCommandsEXT)                             \
     X(vkGetBufferDeviceAddress) X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreatePipelineLayout)         \
     X(vkDestroyPipelineLayout) X(vkCreateComputePipelines) X(vkDestroyPipeline) X(vkCmdPipelineBarrier)            \
-    X(vkCmdBindPipeline) X(vkCmdPushConstants) X(vkCmdDispatch) X(vkDeviceWaitIdle)
+    X(vkCmdBindPipeline) X(vkCmdPushConstants) X(vkCmdDispatch) X(vkDeviceWaitIdle) X(vkGetSemaphoreCounterValue)
 #define LEONIDA_INDIRECT_MEMBER(name) PFN_##name name = nullptr;
         LEONIDA_INDIRECT_FUNCTIONS(LEONIDA_INDIRECT_MEMBER)
 #undef LEONIDA_INDIRECT_MEMBER
@@ -322,17 +340,59 @@ private:
         return fn_.vkGetBufferDeviceAddress(device_, &info);
     }
 
+    // Layouts are shared by signatures that describe the same records (the key is the description, not the object).
+    // At most kMaxLayouts are kept: past that the least recently used one that no submission still running or being
+    // prepared uses is destroyed, and when there is none the call is refused.
+    static constexpr std::size_t kMaxLayouts = 64;
     struct Entry {
-        std::shared_ptr<const IndirectSignature> signature;  // keeps the key's address from being reused
         VkIndirectCommandsLayoutEXT layout = VK_NULL_HANDLE;
+        std::uint64_t last_use = 0;
+        std::vector<std::pair<VkSemaphore, std::uint64_t>> stamps;  // submissions that used it: timeline, ticket
     };
+    using Key = std::vector<std::uint64_t>;
+
+    static Key key_of(const IndirectSignature& sig, VkPipelineLayout pipeline_layout, VkShaderStageFlags stages) {
+        Key key{reinterpret_cast<std::uintptr_t>(pipeline_layout), stages, sig.stride};
+        for (const IndirectArgument& a : sig.arguments)
+            for (const std::uint64_t v : {std::uint64_t(a.type), std::uint64_t(a.offset), std::uint64_t(a.user_dword),
+                                          std::uint64_t(a.dwords), std::uint64_t(a.slot)})
+                key.push_back(v);
+        return key;
+    }
+
+    bool evict_one() {
+        Entry* best = nullptr;
+        Key best_key;
+        for (auto& [key, entry] : layouts_) {
+            if (std::find(current_.begin(), current_.end(), &entry) != current_.end()) continue;
+            bool busy = false;
+            for (auto& stamp : entry.stamps) {
+                std::uint64_t done = 0;
+                if (fn_.vkGetSemaphoreCounterValue(device_, stamp.first, &done) != VK_SUCCESS || done < stamp.second)
+                    busy = true;
+            }
+            if (busy || (best && entry.last_use >= best->last_use)) continue;
+            best = &entry;
+            best_key = key;
+        }
+        if (!best) return false;
+        fn_.vkDestroyIndirectCommandsLayoutEXT(device_, best->layout, nullptr);
+        layouts_.erase(best_key);
+        return true;
+    }
 
     // One token per argument, in record order (the action last, as the layout rules want), at its byte offset.
     VkIndirectCommandsLayoutEXT layout_for(const std::shared_ptr<const IndirectSignature>& signature,
                                            VkPipelineLayout pipeline_layout, VkShaderStageFlags stages, bool compute) {
-        const auto key = std::make_tuple(signature.get(), pipeline_layout, stages);
-        if (const auto found = layouts_.find(key); found != layouts_.end()) return found->second.layout;
         const IndirectSignature& sig = *signature;
+        const Key key = key_of(sig, pipeline_layout, stages);
+        if (const auto found = layouts_.find(key); found != layouts_.end()) {
+            found->second.last_use = ++clock_;
+            if (std::find(current_.begin(), current_.end(), &found->second) == current_.end())
+                current_.push_back(&found->second);
+            return found->second.layout;
+        }
+        if (layouts_.size() >= kMaxLayouts && !evict_one()) return VK_NULL_HANDLE;
         std::vector<VkIndirectCommandsLayoutTokenEXT> tokens;
         std::vector<VkIndirectCommandsPushConstantTokenEXT> pushes(sig.arguments.size());
         std::vector<VkIndirectCommandsVertexBufferTokenEXT> vertices(sig.arguments.size());
@@ -376,7 +436,10 @@ private:
         VkIndirectCommandsLayoutEXT layout = VK_NULL_HANDLE;
         if (fn_.vkCreateIndirectCommandsLayoutEXT(device_, &info, nullptr, &layout) != VK_SUCCESS) return VK_NULL_HANDLE;
         (void)compute;
-        layouts_[key] = {signature, layout};
+        Entry& entry = layouts_[key];
+        entry.layout = layout;
+        entry.last_use = ++clock_;
+        current_.push_back(&entry);
         return layout;
     }
 
@@ -417,10 +480,12 @@ private:
     ScratchBuffers::Allocate allocate_;
     Functions fn_;
     bool loaded_ = false;
-    std::uint32_t max_groups_ = 65535;
+    std::uint64_t clock_ = 0;
+    std::vector<Entry*> current_;  // layouts the submission being prepared uses
     std::mutex mutex_;
-    std::map<std::tuple<const IndirectSignature*, VkPipelineLayout, VkShaderStageFlags>, Entry> layouts_;
-    std::unique_ptr<ScratchBuffers> copies_, preprocess_;
+    std::map<Key, Entry> layouts_;
+    std::unique_ptr<ScratchBuffers> copies_;
+    std::map<std::uint32_t, std::unique_ptr<ScratchBuffers>> preprocess_;  // by allowed memory types
     VkPipelineLayout patch_layout_ = VK_NULL_HANDLE;
     VkPipeline patch_pipeline_ = VK_NULL_HANDLE;
 };

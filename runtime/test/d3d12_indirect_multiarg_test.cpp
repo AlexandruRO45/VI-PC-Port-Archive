@@ -162,7 +162,7 @@ int main() {
     EXPECT(container_of("vs_ma", "vs", vs) && container_of("ps_ma", "ps", ps) && container_of("cs_ma", "cs", cs));
 
     unsigned draw_mismatches = 0, dispatch_mismatches = 0, signature_mismatches = 0, cells_drawn = 0, groups_run = 0;
-    unsigned cases = 0;
+    unsigned cases = 0, skipped_cases = 0;
     std::string host_name = "none";
     {
         rt::d3d12::VulkanDeviceInfo info{};
@@ -325,7 +325,7 @@ int main() {
                     index16.push_back(std::uint16_t(4 * q + i));
                     index32.push_back(4 * q + i);
                 }
-            Ref<ID3D12Resource> vertex_buffer[2], index_buffer[2], arguments_buffer, count_buffer;
+            Ref<ID3D12Resource> vertex_buffer[2], index_buffer[2], arguments_buffer, count_buffer, exact_buffer;
             const UINT64 vertex_bytes = vertices[0].size() * sizeof(float), index16_bytes = index16.size() * 2,
                          index32_bytes = index32.size() * 4;
             EXPECT(new_buffer(default_heap, vertex_bytes, D3D12_RESOURCE_STATE_COPY_DEST, vertex_buffer[0]) &&
@@ -355,6 +355,10 @@ int main() {
             const std::uint32_t counts[4] = {5, 0, 100, 0};
             EXPECT(new_buffer(default_heap, records.size(), D3D12_RESOURCE_STATE_COPY_DEST, arguments_buffer));
             EXPECT(new_buffer(default_heap, 256, D3D12_RESOURCE_STATE_COPY_DEST, count_buffer));
+            // Records 0..7 again in a buffer that ends where the last record's arguments do (D3D12 asks for no more: the
+            // 80 - 72 bytes of its stride past them need not exist).
+            constexpr UINT exact_bytes = 7 * draw_stride + 72;
+            EXPECT(new_buffer(default_heap, exact_bytes, D3D12_RESOURCE_STATE_COPY_DEST, exact_buffer));
 
             Ref<ID3D12CommandAllocator> allocator;
             Ref<ID3D12GraphicsCommandList> list;
@@ -364,6 +368,7 @@ int main() {
             EXPECT(fill(list.p, index_buffer[0].p, index16.data(), index16_bytes));
             EXPECT(fill(list.p, index_buffer[1].p, index32.data(), index32_bytes));
             EXPECT(fill(list.p, arguments_buffer.p, records.data(), records.size()));
+            EXPECT(fill(list.p, exact_buffer.p, records.data() + first_record, exact_bytes));
             std::vector<std::uint8_t> count_bytes(256, 0);
             std::memcpy(count_bytes.data(), counts, sizeof(counts));
             EXPECT(fill(list.p, count_buffer.p, count_bytes.data(), 256));
@@ -373,8 +378,9 @@ int main() {
                 transition(index_buffer[0].p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDEX_BUFFER),
                 transition(index_buffer[1].p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDEX_BUFFER),
                 transition(arguments_buffer.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
-                transition(count_buffer.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)};
-            list->ResourceBarrier(6, to_use);
+                transition(count_buffer.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+                transition(exact_buffer.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)};
+            list->ResourceBarrier(7, to_use);
             const FLOAT clear_colour[4] = {1.0f, 0.0f, 1.0f, 1.0f};
             list->ClearRenderTargetView(rtv, clear_colour, 0, nullptr);
             list->SetGraphicsRootSignature(root.p);
@@ -389,6 +395,7 @@ int main() {
             list->ExecuteIndirect(signature.p, 8, arguments_buffer.p, at + 8 * draw_stride, count_buffer.p, 0);  // 5 of 8
             list->ExecuteIndirect(signature.p, 3, arguments_buffer.p, at + 13 * draw_stride, count_buffer.p, 4);  // count 0
             list->ExecuteIndirect(signature.p, 2, arguments_buffer.p, at + 14 * draw_stride, count_buffer.p, 8);  // 100 of 2
+            list->ExecuteIndirect(signature.p, 8, exact_buffer.p, 0, nullptr, 0);                               // records 0..7 again
             const auto to_copy = transition(image.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
             list->ResourceBarrier(1, &to_copy);
             D3D12_TEXTURE_COPY_LOCATION dst{};
@@ -560,15 +567,20 @@ int main() {
                 {"draw, stride 18", {A(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW)}, 18, false},
                 {"draw, stride 0", {A(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW)}, 0, false},
                 {"constants + dispatch", {C(0, 0, 4), A(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH)}, 28, true},
+                {"vertex buffer + dispatch", {A(D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW, 0), A(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH)}, 28, false},
+                {"index buffer + dispatch", {A(D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW), A(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH)}, 28, false},
+                {"vertex buffer slot twice", {A(D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW, 1), A(D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW, 1), A(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW)}, 48, false},
+                {"two vertex buffers, two slots", {A(D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW, 0), A(D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW, 1), A(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW)}, 48, false},
+                {"two index buffers", {A(D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW), A(D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW), A(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED)}, 52, false},
+                {"index buffer + draw (not indexed)", {A(D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW), A(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW)}, 32, false},
             };
             for (const SignatureCase& c : signature_cases) {
                 D3D12_COMMAND_SIGNATURE_DESC desc{c.stride, UINT(c.arguments.size()), c.arguments.data(), 0};
                 Ref<ID3D12CommandSignature> on_layer, on_host;
                 const HRESULT layer_hr = device->CreateCommandSignature(&desc, c.root ? layer_root.p : nullptr,
                                                                         IID_PPV_ARGS(&on_layer.p));
-                if (!host.p) {
-                    ++cases;
-                    if (FAILED(layer_hr)) std::printf("  (no host runtime) %s: layer 0x%08lx\n", c.name, layer_hr);
+                if (!host.p) {  // nothing to compare with: reported as skipped below, not as agreement
+                    ++skipped_cases;
                     continue;
                 }
                 const HRESULT host_hr = host->CreateCommandSignature(&desc, c.root ? host_root.p : nullptr,
@@ -590,11 +602,16 @@ int main() {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
     }
-    std::printf("multi-argument ExecuteIndirect: %u cells drawn by 4 calls (root constants, a vertex buffer view with a "
+    std::printf("multi-argument ExecuteIndirect: %u cells drawn by 5 calls (root constants, a vertex buffer view with a "
                 "base vertex, a 16- or 32-bit index buffer view and DRAW_INDEXED per record; a count buffer: 5 of 8, "
-                "0, 100 of 2) and %u groups run by 2 dispatch calls (root constants and a root UAV per record; 3 of 4 "
-                "by a count buffer) matched the CPU reference (error 0); %u CreateCommandSignature cases agree with the "
-                "host runtime (%s)\n",
-                cells_drawn, groups_run, cases, host_name.c_str());
+                "0, 100 of 2; one call from an argument buffer exactly (n - 1) * stride + the arguments long) and %u "
+                "groups run by 2 dispatch calls (root constants and a root UAV per record; 3 of 4 by a count buffer) "
+                "matched the CPU reference (error 0)\n",
+                cells_drawn, groups_run);
+    if (skipped_cases)
+        std::printf("CreateCommandSignature comparison SKIPPED: no host D3D12 runtime device (%u cases not compared)\n",
+                    skipped_cases);
+    else
+        std::printf("%u CreateCommandSignature cases agree with the host runtime (%s)\n", cases, host_name.c_str());
     return 0;
 }

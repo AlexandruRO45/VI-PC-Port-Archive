@@ -2112,6 +2112,7 @@ Not implemented yet:
     packed: `CONSTANT` 4 x `Num32BitValuesToSet` bytes, a root CBV/SRV/UAV 8, a vertex or index buffer view 16, then the
     draw 16, draw-indexed 20 or dispatch 12 bytes; `ByteStride` apart) and refuses what D3D12 refuses, compared with the
     host runtime case by case in `d3d12_indirect_multiarg_test`: an action that is not last or comes twice, none at all,
+    a vertex or index buffer in a dispatch signature, a vertex-buffer slot twice, a second index buffer,
     a root-signature argument without a root signature (and a root signature without one), a parameter that does not
     exist or is of another kind (constants on a CBV, a CBV argument on an SRV or a table), constants past the
     parameter, a stride below the record or not a multiple of 4, a vertex-buffer slot of 32 or more.
@@ -2130,9 +2131,16 @@ Not implemented yet:
     smaller of it and `MaxCommandCount`, count 0 draws nothing); this needs no `drawIndirectCount` and works on the
     AMD GPU, whose `deviceGeneratedCommandsMultiDrawIndirectCount` is false. Scratch (the copy and the preprocess
     buffer) is retired with the submission like the copy scratch (`vulkan_scratch.h`); one layout is cached for each
-    signature and pipeline layout and kept until the device goes.
+    description of records and pipeline layout (signatures that describe the same records share it), at most 64: past
+    that the least recently used layout that no running submission uses is destroyed, and when every one is busy the
+    call is refused. The patch pass copies exactly `(MaxCommandCount - 1) * ByteStride + the arguments` bytes (the tail
+    of the last record's stride need not exist in the application's buffer, as D3D12 allows) in a 2D grid, so any
+    `MaxCommandCount` fits; the preprocess buffer comes from a pool for the memory types and with the alignment each
+    layout asks for.
   - Views must point into the GPU address arena (DEFAULT-heap buffers), as for a V# (section 3.3): an upload-heap view
-    is a different `VkBuffer`. Limits of the GPU apply (`maxIndirectCommandsIndirectStride` is 2048 on AMD, 17 views
+    is a different `VkBuffer`. The records are GPU data, so a view outside the arena cannot be detected when the list is
+    recorded or replayed: the pass adds `heap_base` to whatever it finds (which is also how a host buffer's biased VA,
+    section 3.3, comes out right), and an address that names nothing is a GPU fault, not a refusal. Limits of the GPU apply (`maxIndirectCommandsIndirectStride` is 2048 on AMD, 17 views
     a signature, 32 tokens); past them, or on a device without the extension, the call is refused at
     `ExecuteCommandLists` (`unsupported`), as before for any signature the layer cannot run. The strip-cut
     primitive restart is taken from the list's own index buffer format, so a restart-index strip drawn through an
