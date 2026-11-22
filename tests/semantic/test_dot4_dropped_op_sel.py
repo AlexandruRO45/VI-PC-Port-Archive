@@ -77,6 +77,24 @@ class Dot4DroppedOpSelTest(unittest.TestCase):
         # op_sel:[0,1,0] op_sel_hi:[1,0,1]: pairs 0..1 of S1 from its high half (-2, -3), pairs 2..3 from the low one.
         self.assertEqual(result(self.translate("00 50 16 cc 01 05 0e 0c")), 1 * -2 + 2 * -3 + 3 * 2 + 4 * 3 + 100)
 
+    def test_constant_s1_broadcast(self):
+        # The form the FSPX programs store: S1 an inline constant with op_sel_hi[1] = 0, so both byte pairs come from
+        # its low half. -6 reads as its 32-bit value 0xfffffffa, as #2224 measured for packed 16-bit ops: low half
+        # bytes -6, -1. The default would take pairs 2..3 from the high half, -1, -1.
+        program = list(PROGRAM)
+        program[DOT] = ("v_dot4_i32_i8 v0, v1, -6, v3", "00 40 16 cc 01 8d 0d 1c")
+        size = sum(len(bytes.fromhex(enc)) for _, enc in program)
+        head = f"; {NAME}  code 0x{CODE_START:x}..0x{CODE_START + size:x} (scan), gfx1030, 0 invalid words"
+        text = "\n".join([head] + [f"\t{t:<40}; encoding: [{','.join(f'0x{b:02x}' for b in bytes.fromhex(e))}]"
+                                   for t, e in program]) + "\n"
+        stored = bytes(CODE_START) + b"".join(bytes.fromhex(e) for _, e in program[:DOT]) + \
+            bytes.fromhex("00 40 16 cc 01 8d 0d 0c") + b"".join(bytes.fromhex(e) for _, e in program[DOT + 1:])
+        default = bytes(CODE_START) + b"".join(bytes.fromhex(e) for _, e in program)
+        self.assertEqual(result(translate_listing(NAME, text.encode(), fssm=default)),
+                         1 * -6 + 2 * -1 + 3 * -1 + 4 * -1 + 100)
+        self.assertEqual(result(translate_listing(NAME, text.encode(), fssm=stored)),
+                         1 * -6 + 2 * -1 + 3 * -6 + 4 * -1 + 100)
+
     def test_a_restored_addend_select_is_still_refused(self):
         # op_sel_hi[2] = 0 (word 0 bit 14 clear) would half-select the 32-bit addend, which the dot4 rule refuses.
         with self.assertRaises(rdna2spirv.Unsupported) as cm:
