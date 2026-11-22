@@ -357,6 +357,15 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertEqual(insns[0]["opcode"], "vop3p_truncated")
         self.assertIn("<truncated>", insns[0]["assembly"])
 
+    def test_unsupported_vop3p_keeps_literal_stream_aligned(self):
+        # Packed add with a source-0 literal and a reserved source-2 selection bit.
+        first = 0xcc0a0004 | (1 << 13)
+        second = 255 | (129 << 9) | (3 << 27)
+        stream = struct.pack("<4I", first, second, 0x3f800000, 0xbf810000)
+        decoded = disasm_rdna2(stream)
+        self.assertEqual([(row["opcode"], row["length"]) for row in decoded],
+                         [("v_pk_add_u16_unsupported", 12), ("s_endpgm", 4)])
+
     def test_vop3p_distinguishes_non_default_modifiers_and_selections(self):
         """VOP3P instructions must distinguish non-default op_sel, neg, and clamp from default forms."""
         # Base 2-source instruction: v_pk_add_u16 v4, v3, 1 (default op_sel_hi:[1,1])
@@ -981,6 +990,15 @@ class TestRdna2Scanner(unittest.TestCase):
                      "s_addk_i32 s50, -2"):
             self.assertTrue(is_instruction_supported(line), line)
         self.assertFalse(is_instruction_supported("s_mulk_i32 v50, 0x3"))
+
+    def test_float_to_word_conversions_are_plain_e32_only(self):
+        """v_cvt_u32_f32 and v_cvt_i32_f32 are supported as e32 with a register or hex literal source."""
+        for line in ("v_cvt_u32_f32_e32 v12, v13", "v_cvt_i32_f32_e32 v12, s44",
+                     "v_cvt_u32_f32_e32 v12, 0x40400000"):
+            self.assertTrue(is_instruction_supported(line), line)
+        for line in ("v_cvt_u32_f32_e64 v12, v13", "v_cvt_i32_f32_e32 v12, 1",
+                     "v_cvt_u32_f32_e32 v12, 0.5", "v_cvt_u32_f32_e32  v12, v13"):
+            self.assertFalse(is_instruction_supported(line), line)
 
     def test_inline_slash_comments_and_blank_lines(self):
         """Inline // comments must be stripped and blank/comment lines must not inflate counts."""

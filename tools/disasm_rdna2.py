@@ -639,12 +639,6 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         is_3src = op in VOP3P_3SRC
         arity = 3 if is_3src else 2
 
-        # Check for unmodeled / reserved bits in 2-source VOP3P encodings.
-        # Note: bit 14 of w0 is op_sel_hi[2], which LLVM's MC assembler defaults to 1 (op_sel_hi = 0b111)
-        # for all packed VOP3P instructions regardless of arity, so bit 14 is ignored on 2-source forms.
-        if not is_3src and (src2 != 0 or ((w0 >> 10) & 1) or ((w0 >> 13) & 1) or ((w1 >> 31) & 1)):
-            return (8, f"{op_name}_unsupported", f"{op_name} <unsupported_reserved_bits>", "Reserved bitfields set in 2-source VOP3P encoding")
-
         length = 8
         literal = None
         if src0 == 255 or src1 == 255 or (is_3src and src2 == 255):
@@ -652,6 +646,12 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
                 return (8, "vop3p_truncated", f"{op_name} <truncated>", "Incomplete VOP3P literal")
             literal, = struct.unpack_from("<I", data, offset + 8)
             length = 12
+
+        # Check for unmodeled / reserved bits in 2-source VOP3P encodings.
+        # Note: bit 14 of w0 is op_sel_hi[2], which LLVM's MC assembler defaults to 1 (op_sel_hi = 0b111)
+        # for all packed VOP3P instructions regardless of arity, so bit 14 is ignored on 2-source forms.
+        if not is_3src and (src2 != 0 or ((w0 >> 10) & 1) or ((w0 >> 13) & 1) or ((w1 >> 31) & 1)):
+            return (length, f"{op_name}_unsupported", f"{op_name} <unsupported_reserved_bits>", "Reserved bitfields set in 2-source VOP3P encoding")
 
         def vop3p_operand(reg_id: int) -> str:
             if reg_id == 255 and literal is not None:

@@ -726,7 +726,7 @@ def check_rejections():
         "fldcw and an external edge": (attempt(f"{fldcw} e9 00 01 00 00", exits={0x1107: "return 0;"}),
                                        "control word may be live at the external edge"),
         "fldcw and a return with a value": (attempt(f"{fldcw} {fld} c3"), "x87 stack not empty at return"),
-        "fnstsw ax in the checked entry": (attempt(f"{fldcw} {fld} df e0 {fstp} c3"), "unsupported x87 operation"),
+        "fnstsw m16 in the checked entry": (attempt(f"{fldcw} {fld} dd 3a {fstp} c3"), "unsupported x87 operand"),
     }
     for case, (message, needle) in rejected.items():
         if message is None or needle not in message:

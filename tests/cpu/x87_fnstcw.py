@@ -238,8 +238,8 @@ def check_rejections():
     rejected = {
         "fldcw m16": (attempt(f"d9 29 {fld} {fstp} c3"), "unsupported x87 operation"),
         "fstcw then fldcw": (attempt(f"9b d9 3a d9 2a {fld} {fstp} c3"), "unsupported x87 operation"),
-        "fnstsw ax": (attempt(f"{fld} df e0 {fstp} c3"), "unsupported x87 operation"),
-        "fnstsw m16": (attempt(f"{fld} dd 3a {fstp} c3"), "unsupported x87 operation"),
+        "fninit": (attempt(f"{fld} db e3 {fstp} c3"), "unsupported x87 operation"),
+        "fnstsw m16": (attempt(f"{fld} dd 3a {fstp} c3"), "unsupported x87 operand"),
         "fnclex": (attempt(f"db e2 {fld} {fstp} c3"), "unsupported x87 operation"),
     }
     for case, (message, needle) in rejected.items():
