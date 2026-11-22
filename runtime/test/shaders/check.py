@@ -170,7 +170,7 @@ CMPX_CLASS_WORDS = [0xEEEEEEEE] * 3 + [0x22] + [0x11] * 4
 # then untouched words.
 DIV_SCALE_F32_WORDS = [0x5F800005, 1, 0x71800000, 1, 0x2D800003, 1, 0x3F800005, 1, 0x5F000000, 1, 0x5D000009, 0,
                        0xFFC00000, 1, 0x2A000001, 0, 0x20800000, 0, 0xFFC00000, 1, 0x7F800001, 1, 0xBF800005, 1,
-                       0x00000000, 1, 0x3E800000, 0, 0x00000000, 0, 0x7F800000, 0] + [0xEEEEEEEE] * 32
+                       0x00000000, 1, 0x3F000000, 0, 0x00000000, 0, 0x7F800000, 0] + [0xEEEEEEEE] * 32
 # cs_fmt_1010102.asm: descriptor loads, immediate-format load, raw input words and the two packed stores.
 FMT_1010102_WORDS = [0, 0x3F800000, 0, 0x3F800000, 0x3F800000, 0, 0x3F800000, 0,
                      0, 0x3F800000, 0, 0x3F800000, 0xC00FFC00, 0x003FF003, 0xE00003FF, 0xFFE00003]

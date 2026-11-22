@@ -688,7 +688,7 @@ class MeasuredBoundsShaders(unittest.TestCase):
 
 
 def div_scale_f32_reference(s0, s1, s2, clamp=False):
-    """(D, vcc) of v_div_scale_f32 as measured on RDNA2 gfx1036 with f32 denormals flushed (docs/design.md), on
+    """(D, vcc) of v_div_scale_f32 as measured on RDNA2 gfx1036 with IEEE off and f32 denormals flushed (docs/design.md), on
     32-bit patterns after neg."""
     def ex(b):
         return (b >> 23) & 0xFF
@@ -736,14 +736,19 @@ class DivScaleF32(unittest.TestCase):
              (0x00000003, 0x3F800000, 0x00000003, False), (0x0A000001, 0x00800000, 0x0A000001, False),
              (0x00800000, 0x00800000, 0x0A000001, False), (0, 0, 0x3F800000, False),
              (0x7F800001, 0x3F800000, 0x7F800001, False), (0xBF800005, 0x3F800005, 0x71800000, False),
-             (0, 0, 0x3F800000, True), (0x3E800000, 0x3E800000, 0x3F000000, False),
+             (0, 0, 0x3F800000, True), (0x3E800000, 0x3E800000, 0x3F000000, 2.0),
              (0x20000000, 0x7F000000, 0x7D000000, False), (0x1F800000, 0x7F000000, 0x7D000000, False)]
     WANT = [0x5F800005, 1, 0x71800000, 1, 0x2D800003, 1, 0x3F800005, 1, 0x5F000000, 1, 0x5D000009, 0,
             0xFFC00000, 1, 0x2A000001, 0, 0x20800000, 0, 0xFFC00000, 1, 0x7F800001, 1, 0xBF800005, 1,
-            0x00000000, 1, 0x3E800000, 0, 0x00000000, 0, 0x7F800000, 0]
+            0x00000000, 1, 0x3F000000, 0, 0x00000000, 0, 0x7F800000, 0]
 
     def test_reference_gives_the_words(self):
-        got = [w for c in self.CASES for w in div_scale_f32_reference(*c)]
+        got = []
+        for s0, s1, s2, mod in self.CASES:       # mod: True for clamp, a number for omod (applied to D)
+            d, vcc = div_scale_f32_reference(s0, s1, s2, mod is True)
+            if not isinstance(mod, bool):
+                d = struct.unpack("<I", struct.pack("<f", struct.unpack("<f", struct.pack("<I", d))[0] * mod))[0]
+            got += [d, vcc]
         self.assertEqual([f"{w:#010x}" for w in got], [f"{w:#010x}" for w in self.WANT])
 
     def test_translated_fixture(self):

@@ -4035,7 +4035,7 @@ class Gen:
         """v_div_scale_f32 D, sdst, S0, S1, S2 (S1 the denominator, S2 the numerator, S0 one of them): pre-scales
         an operand of a float division by 2**+-64 and sets the sdst lane bit when the later v_div_fmas_f32 must
         undo a scaling. Measured natively on RDNA2 gfx1036 (tools/hw_oracle, 3,074 operand triples) in the game's
-        MODE (f32 denormals flushed), which differs from the ISA pseudocode. A denormal operand (S0 too) reads as
+        MODE (IEEE off, DX10_CLAMP on, f32 denormals flushed), which differs from the ISA pseudocode. A denormal operand (S0 too) reads as
         a zero of its sign. With e1, e2 the exponent fields of S1, S2 after that (0 for zero, 255 for inf and NaN;
         the mantissas play no part), the first rule that matches wins:
           e2 - e1 >= 96              sdst=1, D = S0 == S1 ? S0 * 2**64 : S0
@@ -4049,7 +4049,7 @@ class Gen:
         D the NaN 0xffc00000 and leaves sdst as above. The scaling keeps a NaN (payload included), an inf and a
         zero; x 2**64 overflows to inf from exponent field 191; x 2**-64 gives a zero of S0's sign at exponent
         field 64 (the denormal result is flushed) and inf of S0's sign at 63 or less. clamp gives +0 for NaN,
-        zero and negatives and 1.0 from 1.0 up; omod is ignored. Inactive lanes write 0 to sdst. Integer ops."""
+        zero and negatives and 1.0 from 1.0 up; omod scales the result first (a zero or denormal result becomes +0, a NaN is kept). Inactive lanes write 0 to sdst. Integer ops."""
         u = self.cu
 
         def op(opc, *xs, ty="%uint"):
@@ -4103,6 +4103,16 @@ class Gen:
         d = sel(up, up_w, sel(down, down_w, w0))
         zero = op("OpLogicalOr", cmp("OpIEqual", e1, u(0)), cmp("OpIEqual", e2, u(0)), ty="%bool")
         d = sel(zero, u(0xFFC00000), d)
+        # omod (game MODE, IEEE off): scale a non-NaN result; a zero or denormal result becomes +0, a NaN is kept
+        k = {"mul:2": 2.0, "mul:4": 4.0, "div:2": 0.5}
+        om = [x for x in mods if x in k]
+        if om:
+            e = op("OpBitFieldUExtract", d, u(23), u(8))
+            sc = self.tou(op("OpFMul", self.tof(d), self.fconst(k[om[0]]), ty="%float"))
+            se = op("OpBitFieldUExtract", sc, u(23), u(8))
+            sc = sel(cmp("OpIEqual", se, u(0)), u(0), sc)
+            sc = sel(cmp("OpIEqual", e, u(0)), u(0), sc)
+            d = sel(cmp("OpUGreaterThan", op("OpBitwiseAnd", d, u(0x7FFFFFFF)), u(0x7F800000)), d, sc)
         if "clamp" in mods:
             # measured: NaN, zeros and negatives give +0, 1.0 and up (+inf too) give 1.0
             pos = op("OpLogicalAnd", cmp("OpULessThanEqual", d, u(0x7F800000)), cmp("OpINotEqual", d, u(0)),

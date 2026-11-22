@@ -1,13 +1,13 @@
 ; EGEN-F32-DIV-SCALE: v_div_scale_f32 D, vcc_lo, S0, S1, S2 (S1 denominator, S2 numerator, S0 one of them).
 ; Lane 0 runs 16 cases; case i stores D and vcc as 0/1 (v_cndmask) at out[2i], out[2i+1]. out[32..63] stay 0xeeeeeeee.
-; Rule (docs/design.md, measured on RDNA2 gfx1036 with tools/hw_oracle in the game's MODE, f32 denormals flushed;
+; Rule (docs/design.md, measured on RDNA2 gfx1036 with tools/hw_oracle in the game's MODE: IEEE off, f32 denormals flushed;
 ; the ISA pseudocode differs): a denormal operand reads as a zero of its sign; e1, e2 are the exponent fields
 ; (bits 30:23) of S1, S2 (0 for zero, 255 for inf/NaN). First match wins:
 ;   e2 - e1 >= 96 -> vcc=1, D = S0 == S1 ? S0*2^64 : S0     e1 == 0 -> D = S0*2^64
 ;   e1 >= 253 and e1 - e2 >= 96 -> vcc=1, D = S0 == S1 ? S0*2^-64 : S0     e1 >= 253 -> D = S0*2^-64
 ;   e1 - e2 >= 96 -> vcc=1, D = S0 == S1 ? S0 : S0*2^64     e2 <= 24 -> D = S0*2^64     else D = S0
 ;   S1 or S2 zero -> D = 0xffc00000 (vcc as above). x2^-64 gives +-0 at exponent field 64 and +-inf below.
-;   clamp: NaN -> +0. omod is ignored. x2^+-64 of a normal number adds/subtracts 0x40 in the exponent field
+;   omod scales the result (IEEE off), then clamp: NaN -> +0. x2^+-64 of a normal number adds/subtracts 0x40 in the exponent field
 ;   (0x20000000 in the word).
 ;  0 den: S1 = 0x3f800005 (e1 127), S2 = 0x71800000 (e2 227): 100 >= 96, S0 = S1 -> 0x5f800005, vcc 1
 ;  1 num: same, S0 = S2 != S1 -> D = S2 = 0x71800000, vcc 1
@@ -24,7 +24,7 @@
 ; 10 num: S1 = 1.0, S2 = signalling NaN 0x7f800001 (e2 255): e2 - e1 = 128 -> vcc 1, S0 != S1 -> 0x7f800001 kept
 ; 11 den: S0 = -S1 (neg), S1, S2 as case 0: vcc 1, S0 != S1 -> D = -S1 = 0xbf800005
 ; 12 den clamp: as case 9: vcc 1, D NaN, clamp -> 0x00000000
-; 13 den mul:2: S1 = 0.25 (0x3e800000), S2 = 0.5: no rule -> D = 0x3e800000, vcc 0 (omod would give 0x3f000000)
+; 13 den mul:2: S1 = 0.25 (0x3e800000), S2 = 0.5: no rule -> D = S1, then omod x2 -> 0.5 = 0x3f000000, vcc 0
 ; 14 S0 = v4 = 0x20000000 (e0 64), S1 = 0x7f000000, S2 = 0x7d000000: e1 >= 253, e1 - e2 = 4 -> S0*2^-64 = 2^-127,
 ;         a denormal, flushed -> 0x00000000, vcc 0
 ; 15 as 14 with S0 = 0x1f800000 (e0 63) -> measured +inf 0x7f800000, vcc 0
