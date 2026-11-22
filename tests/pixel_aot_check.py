@@ -1478,6 +1478,20 @@ def check_adapter_skip(directory: Path) -> None:
         assert check_render(work, compiler, renderer, "hardware") == 77
 
 
+def attribute_color(rg):
+    code = ["s_mov_b32 s30, s14", "s_mov_b32 m0, s30"]
+    for phase in (1, 2):
+        for i, channel in enumerate("wzxy"):
+            code.append(f"v_interp_p{phase}_f32_e32 v{8+i}, v{phase-1}, attr0.{channel}")
+    code.extend(["v_cvt_pkrtz_f16_f32_e32 v12, v8, v9", "v_cvt_pkrtz_f16_f32_e32 v13, v10, v11"])
+    tail = "off, off" if rg else "v13, v13"
+    return code + [f"exp mrt0 v12, v12, {tail} done compr vm", "s_endpgm"]
+
+
+def translate_attribute(code):
+    return lower(code, 8, 14, None)
+
+
 def buffer_color(rg):
     # Use a copied low table address and an explicit zero high word.
     tail = "off, off" if rg else "v26, v26"
@@ -1916,6 +1930,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((with_constants(LITERAL_FMA_BODY), translate))
     fixtures.append((scheduling_hints(), translate))
     fixtures.extend((buffer_color(rg), translate_buffer_color) for rg in (False, True))
+    fixtures.extend((attribute_color(rg), translate_attribute) for rg in (False, True))
     for index, (instructions, lower_fixture) in enumerate(fixtures):
         source = directory / "fixture.s"
         obj = directory / "fixture.o"

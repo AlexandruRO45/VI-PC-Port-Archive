@@ -553,6 +553,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     ended = False
     entry_line = len(lines)
     lines.append("float4 main(float2 uv : TEXCOORD0) : SV_Target0 {")
+    attribute_input = False
     for i, line in enumerate(instructions):
         def match(pattern):
             return re.fullmatch(pattern, line)
@@ -717,14 +718,21 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
-        elif m := match(r"v_interp_p([12])_f32_e32 (v\d+), (v\d+), attr0\.([xy])"):
+        elif m := match(r"v_interp_p([12])_f32_e32 (v\d+), (v\d+), attr0\.([xyzw])"):
             phase, dst, src, component = m.groups()
-            if mask != "quad" or scalar.get("m0") != "interp_base":
+            entry_interp = mask == "entry" and sampler is None
+            if ((not entry_interp and (mask != "quad" or component not in "xy"))
+                    or scalar.get("m0") != "interp_base"):
                 raise ValueError("Unknown interpolation context")
-            if phase == "1" and vector[src] == "bary_i":
-                vector[dst] = ("partial", component)
-            elif phase == "2" and vector[src] == "bary_j" and vector[dst] == ("partial", component):
-                vector[dst] = f"uv.{component}"
+            if phase == "1" and vector.get(src) == "bary_i":
+                vector[dst] = ("partial", component, mask)
+            elif phase == "2" and vector.get(src) == "bary_j" and vector.get(dst) == ("partial", component, mask):
+                if entry_interp:
+                    attribute_input = True
+                    vector[dst] = f"alu{i}"
+                    lines.append(f"    float alu{i} = uv.{component};")
+                else:
+                    vector[dst] = f"uv.{component}"
             else:
                 raise ValueError("Unpaired interpolation")
         elif m := match(r"image_sample v\[(\d+):(\d+)\], v\[(\d+):(\d+)\], s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0xf dim:SQ_RSRC_IMG_2D"):
@@ -912,8 +920,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     all(v.startswith(("sample", "alu")) for v in p) for p in pairs):
                 raise ValueError("Unsupported export")
             args = [f"export16({v})" for pair in pairs for v in pair]
-            if len(args) == 2:
-                lines[entry_line] = "float2 main(float2 uv : TEXCOORD0) : SV_Target0 {"
+            input_type = "float4" if attribute_input else "float2"
+            lines[entry_line] = f"float{len(args)} main({input_type} uv : TEXCOORD0) : SV_Target0 {{"
             lines.append(f"    return float{len(args)}({', '.join(args)});")
             exported = True
         elif line == "s_endpgm" and exported:

@@ -339,6 +339,20 @@ void check_pixel_quad_lod(ID3D12Device* device, const char* shader)
     draw_verified(device, shader, {std::move(top), std::move(next)}, {8, 8}, 0, {draw}, nullptr);
 }
 
+void check_attribute_pixel(ID3D12Device* device, const char* shader, const char* reference, bool rg)
+{
+    PixelInput input{32, 32, 1, DXGI_FORMAT_R8G8B8A8_UNORM};
+    if (rg) input.writeMask = D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN;
+    input.rows.resize(input.width * input.height * 4);
+    input.expected.resize(input.width * input.height);
+    std::ifstream file(reference, std::ios::binary);
+    file.read(reinterpret_cast<char*>(input.constants.data()), input.constants.size() * sizeof(Word));
+    file.read(reinterpret_cast<char*>(input.expected.data()), input.expected.size() * sizeof(Color));
+    if (!file || file.peek() != std::char_traits<char>::eof())
+        throw std::runtime_error("Expected a 256-byte constant buffer and 32 by 32 float4 colors");
+    draw_verified(device, shader, {std::move(input)}, 0, 0, nullptr);
+}
+
 void check_dual_pixel(ID3D12Device* device, const char* shader, const char* capture, bool swap)
 {
     PixelInput input{8, 8, 8, DXGI_FORMAT_R8G8B8A8_UNORM};
