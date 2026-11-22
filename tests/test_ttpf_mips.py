@@ -1570,6 +1570,20 @@ class BadPoolTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn(self.bad, err)
 
+    def test_force_export_cannot_replace_the_source_pool(self):
+        with open(self.good, "rb") as f:
+            before = f.read()
+        alias = os.path.join(self.tmp.name, ".", "good.ttpf")
+        for options in ((), ("--calibration", "unused.json")):
+            with self.subTest(options=options):
+                with open(self.good, "wb") as f:
+                    f.write(before)
+                code, err = self.run_main("export", self.good, "0", alias, "--force", *options)
+                self.assertEqual(code, 2, err)
+                self.assertIn("would overwrite the input", err)
+                with open(self.good, "rb") as f:
+                    self.assertEqual(f.read(), before)
+
     def test_scan_json_over_an_input_pool_is_refused(self):
         with open(self.good, "rb") as f:
             before = f.read()

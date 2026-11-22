@@ -1931,6 +1931,9 @@ def main(argv=None):
             print(f"ERROR: {exc}", file=sys.stderr)
             return 2
         return 0
+    if a.cmd == "export" and same_output_path(a.out, a.pool):
+        print(f"ERROR: export would overwrite the input {a.pool}", file=sys.stderr)
+        return 2
     try:
         pool = Pool(a.pool)
     except (OSError, ValueError) as exc:
