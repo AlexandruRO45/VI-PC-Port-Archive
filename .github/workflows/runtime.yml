@@ -95,7 +95,7 @@ jobs:
       - name: Verify the descriptor test shader
         shell: pwsh
         run: |
-          if (!(Test-Path -LiteralPath runtime/build/generated/cs_sample.spv -PathType Leaf)) {
+          if (!(Test-Path -LiteralPath runtime/build/generated/LEONIDA_TEST_CS_SAMPLE_SPV.spv -PathType Leaf)) {
             throw 'The Windows runtime build did not compile the descriptor test shader'
           }
       # For the wine job: the test list, the checkout it was made in, and the built executables and DLLs. Only what
