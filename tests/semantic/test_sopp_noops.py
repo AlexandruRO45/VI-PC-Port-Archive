@@ -6,7 +6,8 @@ bits, which nothing translated reads) and s_atc_probe / s_atc_probe_buffer (an a
 emits nothing for them, as for s_nop or v_nop. Each case translates a synthetic pixel shader with
 tools/rdna2spirv.py, runs it in tests/semantic/spirv_mini_interp.py and checks that values, SCC and VCC set before the
 instruction come out unchanged, and that the program behaves as without it. The data-cache invalidations
-(buffer_gl0_inv, buffer_gl1_inv, s_dcache_inv, s_gl1_inv) are about coherence between waves and stay Unsupported.
+(buffer_gl0_inv, buffer_gl1_inv, s_dcache_inv, s_gl1_inv) are about coherence between waves: not no-ops but a device-scope
+memory barrier (tests/semantic/test_cache_control.py).
 """
 import os
 import struct
@@ -77,11 +78,12 @@ class SoppNoopTests(unittest.TestCase):
         without = si.run_fragment(translate(PROLOGUE + EPILOGUE))
         self.assertEqual(si.run_fragment(translate(PROLOGUE + NOOP_LINES + EPILOGUE)), without)
 
-    def test_data_cache_invalidations_stay_unsupported(self):
+    def test_data_cache_invalidations_are_barriers_not_noops(self):
         for line in ("buffer_gl0_inv", "buffer_gl1_inv", "s_dcache_inv", "s_gl1_inv"):
             with self.subTest(line=line):
-                with self.assertRaises(rdna2spirv.Unsupported):
-                    translate(PROLOGUE + [line] + EPILOGUE)
+                self.assertEqual(translate(PROLOGUE + [line] + EPILOGUE).count("OpMemoryBarrier"), 1)
+                self.assertEqual(si.run_fragment(translate(PROLOGUE + [line] + EPILOGUE))["%out_mrt0"],
+                                 (0x40000001, 0x40000002, 0x40000003, 0x40000004))
 
 
 if __name__ == "__main__":

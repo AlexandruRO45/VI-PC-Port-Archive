@@ -79,6 +79,7 @@ _IGNORED = frozenset({
     "OpCapability", "OpExtension", "OpExtInstImport", "OpMemoryModel", "OpEntryPoint", "OpExecutionMode",
     "OpDecorate", "OpMemberDecorate", "OpTypeVoid", "OpTypeFunction", "OpLabel", "OpSelectionMerge",
     "OpLoopMerge", "OpReturn", "OpFunctionEnd", "OpName", "OpSource",
+    "OpMemoryBarrier",      # lanes run in lockstep over one memory: a barrier orders nothing that is not already ordered
 })
 
 _ATOMICS = frozenset({

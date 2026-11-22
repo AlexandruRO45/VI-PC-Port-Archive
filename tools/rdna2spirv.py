@@ -131,6 +131,10 @@ NOOPS = {"s_sleep", "v_nop", "v_pipeflush", "s_nop", "s_inst_prefetch", "s_endpg
          "s_waitcnt_depctr", "s_icache_inv", "s_ttracedata", "s_ttracedata_imm", "s_code_end", "s_version",
          "ds_nop", "v_clrexcp", "s_atc_probe", "s_atc_probe_buffer"}
 
+# Data-cache control, SMEM and MUBUF (RDNA2 ISA): invalidate the vector L0 / L1 caches, the scalar cache, write the scalar
+# cache back. Translated as a device-scope memory barrier (see _insn), not as a no-op.
+CACHE_CONTROL = frozenset({"buffer_gl0_inv", "buffer_gl1_inv", "s_dcache_inv", "s_gl1_inv", "s_dcache_wb"})
+
 F2 = {"v_add_f32": "OpFAdd", "v_sub_f32": "OpFSub", "v_mul_f32": "OpFMul",
       "v_max_f32": "max", "v_min_f32": "min"}
 U2 = {"v_add_nc_u32": "OpIAdd", "v_sub_nc_u32": "OpISub", "v_and_b32": "OpBitwiseAnd", "v_or_b32": "OpBitwiseOr",
@@ -4465,6 +4469,14 @@ class Gen:
     def _insn(self, ins):
         op, a, mods = base_op(ins["op"]), ins["args"], ins["mods"]
         if op in NOOPS or op.startswith("s_waitcnt"):
+            return
+        if op in CACHE_CONTROL:
+            # Cache invalidate / write-back: no register or memory contents change, but a program that spins on a
+            # location another wave writes depends on the next load really reading it. A device-scope acquire-release
+            # barrier on the buffer-class memory (SPIR-V UniformMemory covers StorageBuffer and PhysicalStorageBuffer,
+            # where every global, buffer and scalar-buffer access lives) keeps the loads after it from being
+            # hoisted above it or served from a copy made before it, and the stores before it from being delayed.
+            self.emit(f"OpMemoryBarrier {self.cu(1)} {self.cu(0x48)}")
             return
         if op == "s_sendmsg" and a and self.stage == "gs":
             t = a[0].get("t", "")
