@@ -104,6 +104,32 @@ def ref_sad_u16_full(s0: int, s1: int, s2: int) -> Tuple[int, int, int]:
 
 
 # ==============================================================================
+# Condition Codes and Architectural Status Flags
+# ==============================================================================
+
+@dataclass(frozen=True)
+class StatusFlags:
+    """Architectural status flags and condition codes for VALU ALU operations."""
+    zero: bool
+    sign: bool
+    carry: bool
+    overflow: bool
+
+
+def compute_flags(s0: int, s1: int, s2: int) -> StatusFlags:
+    """Evaluate condition codes and status flags resulting from v_sad_u16 execution."""
+    dst, carry, _ = ref_sad_u16_full(s0, s1, s2)
+    sum_diff = ref_sad_u16_sum(s0, s1) & MASK32
+    acc = s2 & MASK32
+
+    zero = (dst == 0)
+    sign = bool(dst & 0x8000_0000)
+    overflow = bool((~(sum_diff ^ acc) & (sum_diff ^ dst)) & 0x8000_0000)
+
+    return StatusFlags(zero=zero, sign=sign, carry=bool(carry), overflow=overflow)
+
+
+# ==============================================================================
 # Symbolic AST Opcode Definitions and Typed Expressions
 # ==============================================================================
 
@@ -848,6 +874,82 @@ class TestVSadU16RegisterAliasing(unittest.TestCase):
             else:
                 self.assertIsNone(results[lane])
                 self.assertEqual(state.vgprs[lane][0], initial_acc)
+
+
+# ==============================================================================
+# Unit Tests: Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+class TestVSadU16ConditionCodesAndFlags(unittest.TestCase):
+    """Test suite verifying condition codes, status flags, and carry generation."""
+
+    def test_flags_zero_result(self) -> None:
+        """Zero flag asserted when dst evaluates to 0x00000000."""
+        # Case 1: diff=0 and acc=0
+        flags = compute_flags(0x12345678, 0x12345678, 0)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.sign)
+        self.assertFalse(flags.carry)
+
+        # Case 2: diff=1, acc=0xFFFFFFFF -> sum=0x1_00000000 -> dst=0
+        flags_wrap = compute_flags(pack_halfwords_u32(1, 0), 0, 0xFFFF_FFFF)
+        self.assertTrue(flags_wrap.zero)
+        self.assertFalse(flags_wrap.sign)
+        self.assertTrue(flags_wrap.carry)
+
+    def test_flags_sign_bit_set(self) -> None:
+        """Sign flag asserted when dst MSB (bit 31) is set."""
+        flags = compute_flags(0, 0, 0x8000_0000)
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.sign)
+        self.assertFalse(flags.carry)
+
+    def test_flags_sign_bit_clear(self) -> None:
+        """Sign flag cleared when dst MSB (bit 31) is zero."""
+        flags = compute_flags(0, 0, 0x7FFF_FFFF)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.sign)
+        self.assertFalse(flags.carry)
+
+    def test_flags_carry_out_generated(self) -> None:
+        """Carry flag asserted when full 64-bit sum overflows 32 bits."""
+        # max diff 131070 (0x1FFFE); acc = 0xFFFF_0000
+        # 0x1FFFE + 0xFFFF0000 = 0x1_0000FFFE -> carry = 1
+        flags = compute_flags(0xFFFFFFFF, 0x00000000, 0xFFFF_0000)
+        self.assertTrue(flags.carry)
+
+    def test_flags_carry_out_not_generated(self) -> None:
+        """Carry flag cleared when sum fits in 32 bits."""
+        flags = compute_flags(0xFFFFFFFF, 0x00000000, 0x0000_FFFF)
+        self.assertFalse(flags.carry)
+
+    def test_flags_carry_exact_threshold(self) -> None:
+        """Test exact boundary condition around 0x1_0000_0000 for carry generation."""
+        s0 = pack_halfwords_u32(1, 0)
+        s1 = 0
+        # diff = 1
+
+        # One below wrap threshold: 1 + 0xFFFE_FFFF = 0x0_FFFF_0000
+        flags_below = compute_flags(s0, s1, 0xFFFE_FFFF)
+        self.assertFalse(flags_below.carry)
+        self.assertFalse(flags_below.zero)
+        self.assertTrue(flags_below.sign)
+
+        # Exactly at wrap threshold: 1 + 0xFFFF_FFFF = 0x1_0000_0000
+        flags_exact = compute_flags(s0, s1, 0xFFFF_FFFF)
+        self.assertTrue(flags_exact.carry)
+        self.assertTrue(flags_exact.zero)
+        self.assertFalse(flags_exact.sign)
+
+    def test_flags_vcc_non_pollution(self) -> None:
+        """Architecturally, v_sad_u16 does not consume or overwrite VCC condition registers."""
+        instr = VSadU16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+        self.assertEqual(instr.dst.reg_type, RegType.VGPR)
 
 
 if __name__ == "__main__":
