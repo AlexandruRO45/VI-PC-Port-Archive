@@ -7,12 +7,15 @@ content definition that includes the first, a missing set id, all four documente
 unknown ``common:/`` scheme, two parent locators, a tail-only document and a malformed document.
 No game data is used.
 """
+import contextlib
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "gamedata_graph.py")
@@ -403,6 +406,35 @@ INHERIT = (
     b'<Other><Item key="far" parentPath="../Item[@key=\'base\']"/></Other>'
     b'</Root>'
 )
+
+
+class DirectoryEnumerationTests(unittest.TestCase):
+    def test_unreadable_subdirectory_preserves_existing_reports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = os.path.join(tmp, "xml")
+            os.mkdir(directory)
+            blocked = os.path.join(directory, "blocked")
+            report = os.path.join(tmp, "report.json")
+            with open(report, "wb") as f:
+                f.write(b"previous report")
+
+            def walk(root, onerror=None):
+                if onerror:
+                    onerror(PermissionError(13, "Permission denied", blocked))
+                return iter(())
+
+            for main in (gg.gx.main, gg.main):
+                for flags in ([], ["--json", report]):
+                    with self.subTest(main=main.__module__, flags=flags):
+                        with mock.patch.object(gg.gx.os, "walk", walk), \
+                                mock.patch.object(sys, "argv", ["gamedata", directory, *flags]), \
+                                contextlib.redirect_stdout(io.StringIO()) as out, \
+                                contextlib.redirect_stderr(io.StringIO()) as err:
+                            self.assertEqual(main(), 2)
+                        self.assertIn(blocked, err.getvalue())
+                        self.assertEqual(out.getvalue(), "")
+                        with open(report, "rb") as f:
+                            self.assertEqual(f.read(), b"previous report")
 
 
 class ParentPathInheritanceTest(unittest.TestCase):

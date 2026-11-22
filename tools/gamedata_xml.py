@@ -466,7 +466,10 @@ def carve_documents(directory: str):
 
 
 def xml_files(directory: str):
-    for base, _, names in os.walk(directory):
+    def scan_failed(error):
+        raise error
+
+    for base, _, names in os.walk(directory, onerror=scan_failed):
         for name in sorted(names):
             if name.lower().endswith(".xml"):
                 yield os.path.join(base, name)
@@ -621,20 +624,19 @@ def main() -> int:
     parser.add_argument("--check", action="store_true", help="validate well-formedness and report fragments")
     args = parser.parse_args()
 
-    if args.csv and args.json and same_report_path(args.csv, args.json):
-        parser.error("--csv and --json must use different paths")
-    for flag, path in (("--csv", args.csv), ("--json", args.json)):
-        if not path:
-            continue
-        if os.path.isdir(path):
-            parser.error(f"{flag} is a directory: {path}")
-        for source in input_files(args.targets):
-            if same_report_path(path, source):
-                parser.error(f"{flag} would overwrite the input {source}")
-
     rows = []
     mode = document_mode(args.targets)
     try:
+        if args.csv and args.json and same_report_path(args.csv, args.json):
+            parser.error("--csv and --json must use different paths")
+        for flag, path in (("--csv", args.csv), ("--json", args.json)):
+            if not path:
+                continue
+            if os.path.isdir(path):
+                parser.error(f"{flag} is a directory: {path}")
+            for source in input_files(args.targets):
+                if same_report_path(path, source):
+                    parser.error(f"{flag} would overwrite the input {source}")
         for doc in load_documents(args.targets):
             rows.append(file_row(doc, scan_xml(doc["data"])))
     except FileNotFoundError as exc:
