@@ -302,5 +302,161 @@ class TestSymbolicAST(unittest.TestCase):
                 data=Immediate64(0),
             )
 
+# ==============================================================================
+# Phase 3: Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState:
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+    lds: LDSModel = field(default_factory=LDSModel)
+
+    def get_vgpr(self, index: int) -> int:
+        return self.vgprs[index] & MASK_32
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        self.vgprs[index] = val & MASK_32
+
+    def get_vgpr_pair(self, base_index: int) -> int:
+        low = self.vgprs[base_index] & MASK_32
+        high = self.vgprs[base_index + 1] & MASK_32
+        return ((high << 32) | low) & MASK_64
+
+    def set_vgpr_pair(self, base_index: int, val: int) -> None:
+        self.vgprs[base_index] = val & MASK_32
+        self.vgprs[base_index + 1] = (val >> 32) & MASK_32
+
+    def get_sgpr_pair(self, base_index: int) -> int:
+        low = self.sgprs[base_index] & MASK_32
+        high = self.sgprs[base_index + 1] & MASK_32
+        return ((high << 32) | low) & MASK_64
+
+    def set_sgpr_pair(self, base_index: int, val: int) -> None:
+        self.sgprs[base_index] = val & MASK_32
+        self.sgprs[base_index + 1] = (val >> 32) & MASK_32
+
+
+class ScalarInterpreter:
+    def resolve_operand(self, op: Operand64, state: ScalarMachineState) -> int:
+        if isinstance(op, VGPRPair):
+            return state.get_vgpr_pair(op.base_index)
+        if isinstance(op, SGPRPair):
+            return state.get_sgpr_pair(op.base_index)
+        if isinstance(op, Immediate64):
+            return op.value & MASK_64
+        raise TypeError(f"Unknown operand type: {type(op).__name__}")
+
+    def step(
+        self,
+        instr: DSXor64Instruction,
+        state: ScalarMachineState,
+    ) -> Tuple[Optional[int], int]:
+        vaddr = state.get_vgpr(instr.addr.index)
+        data_val = self.resolve_operand(instr.data, state)
+
+        eff_addr = calc_lds_effective_address(vaddr, instr.offset)
+        curr_mem = state.lds.read_qword(eff_addr)
+
+        old_val, next_mem = oracle_ds_xor_b64(curr_mem, data_val)
+        state.lds.write_qword(eff_addr, next_mem)
+
+        if instr.opcode.is_return:
+            assert instr.dst is not None
+            state.set_vgpr_pair(instr.dst.base_index, old_val)
+            return old_val, next_mem
+
+        return None, next_mem
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    def setUp(self) -> None:
+        self.state = ScalarMachineState()
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_step_returning_vgpr_operand(self) -> None:
+        addr = 0x200
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr_pair(4, 0x00FF00FF_00FF00FF)
+        self.state.lds.write_qword(addr, 0x0F0F0F0F_0F0F0F0F)
+
+        instr = DSXor64Instruction(
+            opcode=DSOpcode64.DS_XOR_RTN_B64,
+            dst=VGPRPair(2),
+            addr=VGPR(1),
+            data=VGPRPair(4),
+        )
+        old, mem = self.interp.step(instr, self.state)
+        self.assertEqual(old, 0x0F0F0F0F_0F0F0F0F)
+        self.assertEqual(mem, 0x0FF00FF0_0FF00FF0)
+        self.assertEqual(self.state.get_vgpr_pair(2), 0x0F0F0F0F_0F0F0F0F)
+        self.assertEqual(self.state.lds.read_qword(addr), 0x0FF00FF0_0FF00FF0)
+
+    def test_scalar_step_returning_sgpr_operand(self) -> None:
+        addr = 0x300
+        self.state.set_vgpr(1, addr)
+        self.state.set_sgpr_pair(10, MASK_64)
+        self.state.lds.write_qword(addr, 0x12345678_9ABCDEF0)
+
+        instr = DSXor64Instruction(
+            opcode=DSOpcode64.DS_XOR_RTN_B64,
+            dst=VGPRPair(2),
+            addr=VGPR(1),
+            data=SGPRPair(10),
+        )
+        old, mem = self.interp.step(instr, self.state)
+        self.assertEqual(old, 0x12345678_9ABCDEF0)
+        self.assertEqual(mem, (~0x12345678_9ABCDEF0) & MASK_64)
+
+    def test_scalar_step_returning_immediate_operand(self) -> None:
+        addr = 0x400
+        self.state.set_vgpr(1, addr)
+        self.state.lds.write_qword(addr, 0xAAAA5555_AAAA5555)
+
+        instr = DSXor64Instruction(
+            opcode=DSOpcode64.DS_XOR_RTN_B64,
+            dst=VGPRPair(4),
+            addr=VGPR(1),
+            data=Immediate64(0),
+        )
+        old, mem = self.interp.step(instr, self.state)
+        self.assertEqual(old, 0xAAAA5555_AAAA5555)
+        self.assertEqual(mem, 0xAAAA5555_AAAA5555)
+
+    def test_scalar_step_non_returning_opcode(self) -> None:
+        addr = 0x500
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr_pair(2, 0xFF00FF00_FF00FF00)
+        self.state.lds.write_qword(addr, 0xFF00FF00_FF00FF00)
+
+        instr = DSXor64Instruction(
+            opcode=DSOpcode64.DS_XOR_B64,
+            dst=None,
+            addr=VGPR(1),
+            data=VGPRPair(2),
+        )
+        old, mem = self.interp.step(instr, self.state)
+        self.assertIsNone(old)
+        self.assertEqual(mem, 0)
+        self.assertEqual(self.state.lds.read_qword(addr), 0)
+
+    def test_scalar_step_with_immediate_offset(self) -> None:
+        base_addr = 0x600
+        offset = 0x10
+        eff_addr = base_addr + offset
+        self.state.set_vgpr(2, base_addr)
+        self.state.lds.write_qword(eff_addr, 0xF0F0F0F0_F0F0F0F0)
+
+        instr = DSXor64Instruction(
+            opcode=DSOpcode64.DS_XOR_RTN_B64,
+            dst=VGPRPair(6),
+            addr=VGPR(2),
+            data=Immediate64(MASK_64),
+            offset=offset,
+        )
+        old, mem = self.interp.step(instr, self.state)
+        self.assertEqual(old, 0xF0F0F0F0_F0F0F0F0)
+        self.assertEqual(mem, 0x0F0F0F0F_0F0F0F0F)
+
 if __name__ == "__main__":
     unittest.main()
