@@ -79,6 +79,10 @@ Add `-Game "D:\path\to\your\package"` on Windows, or `--game /path/to/your/packa
 the usual places. `install.ps1 -Help` and `install.sh --help` list the rest; [docs/install.md](docs/install.md)
 explains each step, what gets installed, and what to do when it stops.
 
+The installer lists what it will install and asks once before changing anything; add `-Yes` / `--yes` for an
+unattended run. The one-liners fetch the current `main` copy, so download and read the script first if you want to
+audit it. Your game, the finished port and the work folder stay on your PC.
+
 **Or by hand:**
 
 1. Install the prerequisites below.

@@ -39,7 +39,7 @@ Usage: install.sh [options]
   --skip-deps          install nothing; use the tools already on PATH
   --plain              no animation or color
   --dry-run            print what would run, change nothing
-  --yes                do not ask for confirmation
+  --yes                skip the install confirmation (required when there is no terminal)
   --self-test          animate every step briefly and exit (used by CI)
   -h, --help           this text
 
@@ -92,6 +92,77 @@ want_stage() {
   case ",$list," in *",$1,"*) return 0 ;; *) return 1 ;; esac
 }
 
+cmake_ok() {
+  command -v cmake >/dev/null 2>&1 || return 1
+  local v
+  v=$(cmake --version 2>/dev/null | head -n 1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1 || true)
+  [ -n "$v" ] || return 1
+  [ "$(printf '%s\n' "3.24" "$v" | sort -V | head -n 1)" = "3.24" ]
+}
+
+find_llvm_mc() {
+  local mc=""
+  if [ -n "${LLVM_MC:-}" ] && [ ! -x "$LLVM_MC" ]; then return 1; fi
+  if [ -n "${LLVM_MC:-}" ]; then mc=$LLVM_MC; fi
+  if [ -z "$mc" ] && command -v llvm-mc >/dev/null 2>&1; then mc=$(command -v llvm-mc); fi
+  if [ -z "$mc" ] && command -v llvm-mc-21 >/dev/null 2>&1; then mc=$(command -v llvm-mc-21); fi
+  if [ -z "$mc" ] && [ -x /usr/lib/llvm-21/bin/llvm-mc ]; then mc=/usr/lib/llvm-21/bin/llvm-mc; fi
+  [ -n "$mc" ] || return 1
+  printf '%s\n' "$mc"
+}
+
+llvm_ok() {
+  if [ -n "${LLVM_MC:-}" ] && [ ! -x "$LLVM_MC" ]; then return 0; fi
+  local mc
+  mc=$(find_llvm_mc) || return 1
+  "$mc" --version 2>/dev/null | grep -q amdgcn
+}
+
+python_ok() {
+  command -v "$1" >/dev/null 2>&1 || return 1
+  "$1" -c 'import sys; sys.exit(0 if sys.version_info >= (3,12) else 1)' >/dev/null 2>&1
+}
+
+dotnet_sdk_ok() {
+  command -v dotnet >/dev/null 2>&1 || return 1
+  dotnet --list-sdks 2>/dev/null | awk -F. '$1 + 0 >= 8 { found = 1 } END { exit found ? 0 : 1 }'
+}
+
+pick_python() {
+  local c
+  for c in python3 python3.12 python3.13 python3.14; do
+    if python_ok "$c"; then PY=$c; return 0; fi
+  done
+  return 1
+}
+
+plan_missing() {
+  local missing=()
+  if ! command -v git >/dev/null 2>&1; then missing+=(git); fi
+  if ! command -v curl >/dev/null 2>&1; then missing+=(curl); fi
+  if ! pick_python; then missing+=("Python 3.12+"); fi
+  if want_stage shaders || want_stage pipelines; then
+    if ! command -v spirv-as >/dev/null 2>&1 || ! command -v spirv-val >/dev/null 2>&1; then
+      missing+=(spirv-tools)
+    fi
+  fi
+  if want_stage runtime || want_stage pipelines; then
+    if ! cmake_ok; then missing+=("CMake 3.24+"); fi
+    if ! command -v ninja >/dev/null 2>&1; then missing+=(ninja-build); fi
+    if ! command -v make >/dev/null 2>&1; then missing+=(build-essential); fi
+  fi
+  if want_stage assets && ! dotnet_sdk_ok; then
+    missing+=(".NET 8 SDK")
+  fi
+  if [ "$WAV" -eq 1 ] && want_stage assets && ! command -v ffmpeg >/dev/null 2>&1; then
+    missing+=(ffmpeg)
+  fi
+  if want_stage shaders && ! llvm_ok; then
+    missing+=("LLVM 21 with AMDGPU")
+  fi
+  if [ "${#missing[@]}" -gt 0 ]; then printf '%s\n' "${missing[@]}"; fi
+}
+
 if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
   printf 'Run this as your normal user, not with sudo. The script uses sudo for packages.\n' >&2
   exit 1
@@ -101,13 +172,13 @@ show_plan() {
   printf 'Leonida installer plan\n'
   printf '  clone:  %s\n' "$DIR"
   if [ "$SKIP_DEPS" -eq 0 ]; then
-    printf '  install: git curl python3'
-    if want_stage shaders || want_stage pipelines; then printf ', spirv-tools, libvulkan-dev, vulkan-tools'; fi
-    if want_stage runtime || want_stage pipelines; then printf ', cmake 3.24+, ninja-build, build-essential'; fi
-    if [ "$WAV" -eq 1 ] && want_stage assets; then printf ', ffmpeg'; fi
-    printf '\n'
-    if want_stage assets; then printf '           .NET 8 SDK\n'; fi
-    if want_stage shaders; then printf '           LLVM 21 if llvm-mc has no AMDGPU target\n'; fi
+    local missing
+    missing=$(plan_missing | awk '!seen[$0]++ { if (n++) printf ", "; printf "%s", $0 }')
+    if [ -z "$missing" ]; then
+      printf '  install: nothing (all prerequisites present)\n'
+    else
+      printf '  install: %s\n' "$missing"
+    fi
   else
     printf '  install: skipped (--skip-deps)\n'
   fi
@@ -398,27 +469,6 @@ SUDO=()
 if [ "$(id -u)" -ne 0 ]; then SUDO=(sudo -n); fi
 APT=("${SUDO[@]}" apt-get)
 
-cmake_ok() {
-  command -v cmake >/dev/null 2>&1 || return 1
-  local v
-  v=$(cmake --version 2>/dev/null | head -n 1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1 || true)
-  [ -n "$v" ] || return 1
-  [ "$(printf '%s\n' "3.24" "$v" | sort -V | head -n 1)" = "3.24" ]
-}
-
-python_ok() {
-  command -v "$1" >/dev/null 2>&1 || return 1
-  "$1" -c 'import sys; sys.exit(0 if sys.version_info >= (3,12) else 1)' >/dev/null 2>&1
-}
-
-pick_python() {
-  local c
-  for c in python3 python3.12 python3.13 python3.14; do
-    if python_ok "$c"; then PY=$c; return 0; fi
-  done
-  return 1
-}
-
 install_python() {
   pick_python && return 0
   . /etc/os-release
@@ -444,8 +494,28 @@ refresh_sudo() {
   fi
 }
 
+confirm_install() {
+  local what=$1
+  local answer=""
+  if [ "$YES" -eq 1 ]; then return 0; fi
+  if [ ! -t 0 ]; then
+    die "no terminal to confirm the package install. Read --help, then re-run with --yes."
+  fi
+  pause_anim
+  printf 'The installer will install:\n  %s\nContinue? [Y/n] ' "$what"
+  if ! read -r answer; then
+    resume_anim
+    die "cancelled"
+  fi
+  resume_anim
+  case "$answer" in
+    ''|y|Y|yes|YES) return 0 ;;
+    *) die "cancelled" ;;
+  esac
+}
+
 install_dotnet() {
-  command -v dotnet >/dev/null 2>&1 && return 0
+  if dotnet_sdk_ok; then return 0; fi
   if run_capture "$LOG" "${APT[@]}" install -y dotnet-sdk-8.0; then return 0; fi
   set_label "installing the .NET 8 SDK"
   curl -fsSL https://dot.net/v1/dotnet-install.sh -o "$RUN_DIR/dotnet-install.sh" \
@@ -457,14 +527,12 @@ install_dotnet() {
 }
 
 ensure_llvm() {
-  local mc=""
-  if [ -n "${LLVM_MC:-}" ] && [ ! -x "$LLVM_MC" ]; then return 0; fi
-  if [ -n "${LLVM_MC:-}" ]; then mc=$LLVM_MC; fi
-  if [ -z "$mc" ] && command -v llvm-mc >/dev/null 2>&1; then mc=$(command -v llvm-mc); fi
-  if [ -z "$mc" ] && command -v llvm-mc-21 >/dev/null 2>&1; then mc=$(command -v llvm-mc-21); fi
-  if [ -z "$mc" ] && [ -x /usr/lib/llvm-21/bin/llvm-mc ]; then mc=/usr/lib/llvm-21/bin/llvm-mc; fi
-  if [ -n "$mc" ] && "$mc" --version 2>/dev/null | grep -q amdgcn; then
-    export LLVM_MC=$mc
+  if llvm_ok; then
+    if [ -z "${LLVM_MC:-}" ]; then
+      local mc
+      mc=$(find_llvm_mc) || true
+      if [ -n "$mc" ]; then export LLVM_MC=$mc; fi
+    fi
     return 0
   fi
   set_label "installing LLVM 21"
@@ -495,23 +563,10 @@ install_cmake_repo() {
 
 verify_tools() {
   set_label "verifying tools"
-  local missing="" t
-  if ! command -v git >/dev/null 2>&1; then missing="$missing git"; fi
-  if ! pick_python; then missing="$missing python3.12+"; fi
-  if want_stage shaders || want_stage pipelines; then
-    for t in spirv-as spirv-val; do
-      command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
-    done
-  fi
-  if want_stage assets && ! command -v dotnet >/dev/null 2>&1; then missing="$missing dotnet"; fi
-  if want_stage runtime || want_stage pipelines; then
-    if ! cmake_ok; then missing="$missing cmake-3.24+"; fi
-  fi
-  if [ "$WAV" -eq 1 ] && want_stage assets && ! command -v ffmpeg >/dev/null 2>&1; then
-    missing="$missing ffmpeg"
-  fi
+  local missing
+  missing=$(plan_missing | awk '!seen[$0]++ { if (n++) printf ", "; printf "%s", $0 }')
   if [ -n "$missing" ]; then
-    die "missing after install:$missing. Open a new terminal and run again, or install them by hand."
+    die "still missing: $missing. Open a new terminal and run again, or install them by hand."
   fi
   if ! python_ok "$PY"; then
     die "Python 3.12 or newer is required (found $("$PY" -V 2>&1))."
@@ -521,6 +576,13 @@ verify_tools() {
 
 install_packages() {
   set_step 2 "installing packages"
+  local missing
+  missing=$(plan_missing | awk '!seen[$0]++ { if (n++) printf ", "; printf "%s", $0 }')
+  if [ -z "$missing" ]; then
+    log "all prerequisites are already installed"
+    set_percent 1000
+    return 0
+  fi
   local pkgs=(git curl ca-certificates gnupg python3)
   if want_stage shaders || want_stage pipelines; then
     pkgs+=(spirv-tools libvulkan-dev vulkan-tools)
@@ -532,13 +594,13 @@ install_packages() {
     pkgs+=(ffmpeg)
   fi
   if [ "$DRY_RUN" -eq 1 ]; then
+    log "would install: $missing"
     log "would run: ${APT[*]} update"
     log "would run: ${APT[*]} install -y ${pkgs[*]}"
-    if want_stage assets; then log "would install the .NET 8 SDK"; fi
-    if want_stage shaders; then log "would install LLVM 21 if llvm-mc has no AMDGPU target"; fi
-    if want_stage runtime || want_stage pipelines; then log "would install CMake 3.24+ if apt's is older"; fi
     return 0
   fi
+  log "missing: $missing"
+  confirm_install "$missing"
   run_capture "$LOG" "${APT[@]}" update || die "apt-get update failed"
   run_capture "$LOG" "${APT[@]}" install -y "${pkgs[@]}" || die "apt-get install failed"
   set_percent 300
@@ -623,20 +685,14 @@ find_game() {
 
 setup_llvm() {
   set_step 5 "checking llvm-mc"
-  local mc=""
   if [ -n "${LLVM_MC:-}" ] && [ ! -x "$LLVM_MC" ]; then
     log "llvm-mc: using LLVM_MC from the environment"
     set_percent 1000
     return 0
   fi
-  if [ -n "${LLVM_MC:-}" ]; then mc=$LLVM_MC; fi
-  if [ -z "$mc" ] && command -v llvm-mc >/dev/null 2>&1; then mc=$(command -v llvm-mc); fi
-  if [ -z "$mc" ] && command -v llvm-mc-21 >/dev/null 2>&1; then mc=$(command -v llvm-mc-21); fi
-  if [ -z "$mc" ] && [ -x /usr/lib/llvm-21/bin/llvm-mc ]; then mc=/usr/lib/llvm-21/bin/llvm-mc; fi
-  if [ -z "$mc" ]; then
-    die "llvm-mc is missing. Install LLVM 21 (llvm-21), or set LLVM_MC."
-  fi
-  if ! "$mc" --version 2>/dev/null | grep -q amdgcn; then
+  local mc
+  mc=$(find_llvm_mc) || die "llvm-mc is missing. Install LLVM 21 (llvm-21), or set LLVM_MC."
+  if ! llvm_ok; then
     die "llvm-mc at $mc has no AMDGPU target. Install LLVM 21, or set LLVM_MC."
   fi
   export LLVM_MC=$mc

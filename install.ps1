@@ -45,6 +45,7 @@ $script:Label = "starting"
 $script:Anim = $false
 $script:Color = $false
 $script:Unicode = $false
+$script:OldCodePage = ""
 $script:ProgressStopped = $false
 $script:Started = Get-Date
 $script:ExitCode = 0
@@ -71,7 +72,7 @@ Usage: install.ps1 [options]
   -SkipDeps            install nothing; use the tools already on PATH
   -Plain               no animation or color
   -DryRun              print what would run, change nothing
-  -Yes                 do not ask for confirmation
+  -Yes                 skip the install confirmation (required when input is redirected)
   -SelfTest            compile the progress helper and exit (used by CI)
   -Help                this text
 
@@ -153,6 +154,12 @@ function Stop-Progress([bool]$Ok, [string]$Text) {
     }
 }
 
+function Restore-CodePage {
+    if ($script:OldCodePage -and $script:OldCodePage -ne "65001") {
+        try { & chcp.com $script:OldCodePage > $null } catch { }
+    }
+}
+
 function Get-Tail([string]$Path, [int]$Lines = 20) {
     if (-not (Test-Path $Path)) { return "" }
     try {
@@ -206,6 +213,7 @@ function Refresh-Path {
         if ($value) { Set-Item -Path ("Env:" + $name) -Value $value }
     }
     Add-VulkanBin
+    Add-BuildToolPath
 }
 
 function Add-VulkanBin {
@@ -213,6 +221,16 @@ function Add-VulkanBin {
     $bin = Join-Path $env:VULKAN_SDK "Bin"
     if ((Test-Path (Join-Path $bin "spirv-as.exe")) -and ($env:Path -notlike ("*" + $bin + "*"))) {
         $env:Path = $bin + ";" + $env:Path
+    }
+}
+
+function Add-BuildToolPath {
+    foreach ($exe in @((Resolve-CMake), (Resolve-Ninja))) {
+        if (-not $exe) { continue }
+        $dir = Split-Path $exe -Parent
+        if ($dir -and ($env:Path -notlike ("*" + $dir + "*"))) {
+            $env:Path = $dir + ";" + $env:Path
+        }
     }
 }
 
@@ -227,8 +245,10 @@ function Find-Python {
         if (Test-Command "py") { $candidates += @{ Exe = "py"; Args = @("-$v") } }
     }
     foreach ($v in @("314", "313", "312")) {
-        $path = Join-Path $env:LOCALAPPDATA ("Programs\Python\Python" + $v + "\python.exe")
-        if (Test-Path $path) { $candidates += @{ Exe = $path; Args = @() } }
+        if ($env:LOCALAPPDATA) {
+            $path = Join-Path $env:LOCALAPPDATA ("Programs\Python\Python" + $v + "\python.exe")
+            if (Test-Path $path) { $candidates += @{ Exe = $path; Args = @() } }
+        }
         $path = "C:\Python" + $v + "\python.exe"
         if (Test-Path $path) { $candidates += @{ Exe = $path; Args = @() } }
     }
@@ -285,14 +305,29 @@ function Test-DotNetSdk {
     return $false
 }
 
-function Test-CMake {
-    if (-not (Test-Command "cmake")) { return $false }
+function Get-VsCmake {
+    $vs = Get-VsInstall
+    if (-not $vs) { return $null }
+    $path = Join-Path $vs "Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+    if (Test-Path $path) { return $path }
+    return $null
+}
+
+function Get-VsNinja {
+    $vs = Get-VsInstall
+    if (-not $vs) { return $null }
+    $path = Join-Path $vs "Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"
+    if (Test-Path $path) { return $path }
+    return $null
+}
+
+function Test-ExeVersion([string]$Exe, [version]$Minimum) {
     $old = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        $first = @(& cmake --version 2>$null)[0]
+        $first = @(& $Exe --version 2>$null)[0]
         if ($first -match '(\d+\.\d+(\.\d+)?)') {
-            return ([version]$Matches[1] -ge [version]"3.24")
+            return ([version]$Matches[1] -ge $Minimum)
         }
     } catch {
     } finally {
@@ -301,8 +336,26 @@ function Test-CMake {
     return $false
 }
 
+function Resolve-CMake {
+    $cmd = Get-Command "cmake" -ErrorAction SilentlyContinue
+    if ($cmd -and (Test-ExeVersion $cmd.Source ([version]"3.24"))) { return $cmd.Source }
+    $vs = Get-VsCmake
+    if ($vs -and (Test-ExeVersion $vs ([version]"3.24"))) { return $vs }
+    return $null
+}
+
+function Test-CMake {
+    return [bool](Resolve-CMake)
+}
+
+function Resolve-Ninja {
+    $cmd = Get-Command "ninja" -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    return (Get-VsNinja)
+}
+
 function Test-Ninja {
-    return (Test-Command "ninja")
+    return [bool](Resolve-Ninja)
 }
 
 function Test-Vulkan {
@@ -326,7 +379,9 @@ function Test-Vulkan {
 }
 
 function Get-VsInstall {
-    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    $root = ${env:ProgramFiles(x86)}
+    if (-not $root) { return $null }
+    $vswhere = Join-Path $root "Microsoft Visual Studio\Installer\vswhere.exe"
     if (-not (Test-Path $vswhere)) { return $null }
     $old = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
@@ -345,7 +400,9 @@ function Test-VsCpp {
 }
 
 function Test-WindowsSdk {
-    $root = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\Include"
+    $base = ${env:ProgramFiles(x86)}
+    if (-not $base) { return $false }
+    $root = Join-Path $base "Windows Kits\10\Include"
     if (-not (Test-Path $root)) { return $false }
     foreach ($d in @(Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue)) {
         $name = $d.Name
@@ -368,8 +425,11 @@ function Test-LlvmMc {
     $candidates = @()
     if ($env:LLVM_MC) { $candidates += $env:LLVM_MC }
     if (Test-Command "llvm-mc") { $candidates += (Get-Command "llvm-mc").Source }
-    $local = Join-Path $env:USERPROFILE ".leonida\llvm-mc\llvm-mc.exe"
-    if (Test-Path $local) { $candidates += $local }
+    $profileDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
+    if ($profileDir) {
+        $local = Join-Path $profileDir ".leonida\llvm-mc\llvm-mc.exe"
+        if (Test-Path $local) { $candidates += $local }
+    }
     foreach ($c in $candidates) {
         if (-not (Test-Path $c)) { continue }
         $old = $ErrorActionPreference
@@ -432,21 +492,43 @@ function Show-Plan {
     if ($SkipDeps) {
         Write-Host "  install: skipped (-SkipDeps)"
     } else {
-        $names = @("Git", "Python 3.12")
-        if ($script:NeedAssets) { $names += ".NET 8 SDK" }
-        if ($script:NeedVulkan) { $names += "Vulkan SDK" }
-        if ($script:NeedBuildTools) { $names += "CMake", "Ninja" }
-        if ($script:NeedWav) { $names += "ffmpeg" }
-        if ($script:NeedRuntime) { $names += "Visual Studio 2022 Build Tools (C++)", "Windows SDK 10.0.26100" }
-        Write-Host ("  install: {0}" -f ($names -join ", "))
+        $packages = @(Get-WantedPackages)
+        if ($packages.Count -eq 0) {
+            Write-Host "  install: nothing (all prerequisites present)"
+        } else {
+            Write-Host ("  install: {0}" -f (($packages | ForEach-Object { $_.Label }) -join ", "))
+        }
         if ($script:NeedShaders) {
-            Write-Host "           llvm-mc 21 with AMDGPU, built from source if it is missing (20 to 40 minutes)"
+            if (Test-LlvmMc) {
+                Write-Host "  llvm-mc: present"
+            } else {
+                Write-Host "  llvm-mc: would build 21 with AMDGPU from source (20 to 40 minutes)"
+            }
         }
     }
     Write-Host ("  build:  {0}" -f (Join-Path $script:Dir "make_game.py"))
     if ($Game) { Write-Host ("  game:   {0}" -f $Game) }
     if ($RuntimeBuild) { Write-Host ("  runtime: using {0}" -f $RuntimeBuild) }
     Write-Host "The installer never downloads the game, keys, or game data."
+}
+
+function Confirm-Install([string[]]$Labels) {
+    if ($Yes) { return }
+    $text = ($Labels -join ", ")
+    if ([Console]::IsInputRedirected) {
+        throw ("Refusing to install packages without confirmation: {0}. Re-run with -Yes after reading -Help." -f $text)
+    }
+    if ($script:Anim) { [LeonidaProgress]::Pause() }
+    try {
+        Write-Host ("The installer will install: {0}" -f $text)
+        Write-Host "winget accepts the package licences and installs them without further prompts."
+        $answer = Read-Host "Continue? [Y/n]"
+    } finally {
+        if ($script:Anim) { [LeonidaProgress]::Resume() }
+    }
+    if ($answer -and $answer -notmatch '^(y|yes)$') {
+        throw "cancelled"
+    }
 }
 
 function Install-Prerequisites {
@@ -465,6 +547,7 @@ function Install-Prerequisites {
         Set-Percent 1000
         return
     }
+    Confirm-Install ($packages | ForEach-Object { $_.Label })
     $index = 0
     foreach ($pkg in $packages) {
         $index++
@@ -494,6 +577,7 @@ function Install-Prerequisites {
 }
 
 function Assert-Prerequisites {
+    Add-BuildToolPath
     $missing = @()
     if (-not (Test-Command "git")) { $missing += "Git" }
     $script:Py = Find-Python
@@ -517,7 +601,12 @@ function Clone-Repo {
         if ($dirty) {
             Note ("local changes in {0}; not updating" -f $script:Dir)
         } else {
-            $null = Invoke-Logged "git" @("-C", $script:Dir, "pull", "--ff-only") $script:Log
+            $upstream = & git -C $script:Dir rev-parse --abbrev-ref --symbolic-full-name "@{u}" 2>$null
+            if ($LASTEXITCODE -ne 0 -or -not $upstream) {
+                Note "the clone has no upstream branch; not updating it"
+            } else {
+                $null = Invoke-Logged "git" @("-C", $script:Dir, "pull", "--ff-only") $script:Log
+            }
             $null = Invoke-Logged "git" @("-C", $script:Dir, "submodule", "update", "--init", "--recursive") $script:Log
         }
     } else {
@@ -594,6 +683,7 @@ function Prepare-LlvmMc {
 }
 
 function Invoke-Build {
+    Add-BuildToolPath
     Set-Step 6 "building the port"
     $buildArgs = @("-I", $script:MakeGame)
     if ($script:GamePath) { $buildArgs += @("--game", $script:GamePath) }
@@ -660,6 +750,7 @@ $script:Anim = (-not $Plain) -and (-not $env:NO_COLOR) -and (-not [Console]::IsO
 if ($script:Anim) {
     $cp = ""
     try { $cp = (& chcp.com) -replace "[^0-9]", "" } catch { $cp = "" }
+    $script:OldCodePage = $cp
     if ($cp -ne "65001") {
         try {
             & chcp.com 65001 > $null
@@ -1028,7 +1119,7 @@ try {
         [LeonidaProgress]::Start($script:Color, $script:Unicode)
     }
 
-    $script:RunDir = Join-Path $env:TEMP ("leonida-install-" + [Guid]::NewGuid().ToString("N"))
+    $script:RunDir = Join-Path ([IO.Path]::GetTempPath()) ("leonida-install-" + [Guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Force -Path $script:RunDir | Out-Null
     $script:Log = Join-Path $script:RunDir "current.log"
     New-Item -ItemType File -Force -Path $script:Log | Out-Null
@@ -1090,6 +1181,7 @@ try {
     $script:ExitCode = 1
 } finally {
     if (-not $script:ProgressStopped) { Stop-Progress $false "installer stopped" }
+    Restore-CodePage
     if ($script:RunDir -and (Test-Path $script:RunDir)) {
         Remove-Item -Path $script:RunDir -Recurse -Force -ErrorAction SilentlyContinue
     }
