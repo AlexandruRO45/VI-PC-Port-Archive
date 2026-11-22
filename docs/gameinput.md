@@ -107,6 +107,43 @@ stick does not jump). `LEONIDA_KEYBOARD_PAD=always` reads them whatever has focu
 
 To try it by hand: `set LEONIDA_KEYBOARD_PAD=always`, then `gameinput_probe --seconds 20` and press keys.
 
+## Keyboard and mouse devices
+
+A title can also read the keyboard and the mouse through GameInput itself: `GameInputKindKeyboard` and
+`GameInputKindMouse` readings, `IGameInputReading::GetKeyState` and `GetMouseState`. With `LEONIDA_KEYBOARD_MOUSE`
+set, the shim connects one keyboard device and one mouse device for that. This is separate from the keyboard pad
+above: the pad turns keys into a gamepad for a title that only reads gamepads, these devices give the title the keys
+and the mouse themselves. Both can be on at once. It is off by default.
+
+- **Devices.** `Keyboard (Leonida)` and `Mouse (Leonida)`, family `GameInputFamilyHid`, usage 0x01/0x06 and
+  0x01/0x02, each with a fixed `AppLocalDeviceId`. They are not gamepads: device and reading callbacks for the
+  gamepad kind are not called for them, a gamepad query with no device named never returns their readings, and
+  `connected_count()` does not count them. Turning the variable off disconnects both (device callbacks with
+  `GameInputDeviceNoStatus`); on again brings back the same objects. `CreateAggregateDevice(GameInputKindKeyboard)`
+  or `(GameInputKindMouse)` reads them.
+- **Keys.** `GetKeyState` lists every key that is down, lowest virtual-key code first, at most 16 at once
+  (`maxSimultaneousKeys`). Generic Shift, Ctrl and Alt are left out; their left and right keys (`VK_LSHIFT` and so
+  on) are reported, as raw keyboard input does. Each key carries its virtual-key code, its scan code
+  (`MapVirtualKeyW(MAPVK_VK_TO_VSC_EX)`: set 1, with 0xE0 in the high byte for an extended key on Windows; Wine 9
+  leaves the prefix out) and the unshifted glyph on it for the active layout (`MAPVK_VK_TO_CHAR`; letters upper
+  case, 0 for keys without one, `isDeadKey` from the dead-key bit).
+- **Keyboard info.** `keyCount` is the number of virtual-key codes read, `functionKeyCount` 24 (F1-F24), `layout`
+  the active layout id (`GetKeyboardLayoutNameW` as a number, 0x00000409 for US), `platformType`/`platformSubtype`
+  from `GetKeyboardType`, `kind` `GameInputUnknownKeyboard`, `nativeLanguage` an empty string.
+- **Mouse.** Left, right, middle, X1 and X2 are `GameInputMouseLeftButton` .. `GameInputMouseButton5`.
+  `positionX`/`positionY` are the cursor's movement summed since the device connected, in pixels, +Y down. GameInput's
+  positions are cumulative (a title takes the difference between two readings), so that is what a title needs. The
+  movement comes from `GetCursorPos`, so it stops at the edge of the screen and includes pointer acceleration.
+- **No wheel.** Without a window or a message loop there is no wheel to read: `wheelX`/`wheelY` stay 0 and
+  `mouseInfo` reports `hasWheelX`/`hasWheelY` false. Raw input on a message-only window would give the wheel and
+  unaccelerated device counts; it is not done here.
+- **Focus.** As for the keyboard pad: with `1`, keys and buttons count only while a window of this process is in the
+  foreground, everything is released when it loses focus, and cursor movement made elsewhere is not added when
+  focus returns. `always` reads them whatever has focus.
+
+Keys and buttons are read with `GetAsyncKeyState` every poll, and a reading is taken when something changes, so the
+history and `GetNextReading`/`GetPreviousReading` work as for a pad.
+
 ## Rumble and triggers
 
 `IGameInputDevice::SetRumbleState` takes four motor levels, 0..1. The two body motors go to `SDL_RumbleGamepad` on
@@ -170,6 +207,7 @@ sensors are enabled when the pad is opened, at SDL's requested rate, and every p
 | `LEONIDA_RUMBLE` | `1` | `0` turns all rumble and trigger output off |
 | `LEONIDA_GAMEINPUT_THREAD` | `1` | `0` stops the background poll thread; only `rt::gameinput::poll()` then reads the pads (tests) |
 | `LEONIDA_KEYBOARD_PAD` | `off` | `1` adds the [keyboard pad](#keyboard-pad), read while this process has focus; `always` reads keys whatever has focus |
+| `LEONIDA_KEYBOARD_MOUSE` | `off` | `1` connects the [keyboard and mouse devices](#keyboard-and-mouse-devices), read while this process has focus; `always` whatever has focus |
 
 SDL's own hints (`SDL_JOYSTICK_*`, see SDL's `SDL_hints.h`) also apply, for example `SDL_JOYSTICK_HIDAPI_PS5=0` to
 leave a DualSense to the generic driver, or `SDL_GAMECONTROLLERCONFIG` to add a mapping for an unknown pad.
@@ -188,7 +226,7 @@ The API surface:
 | interface | implemented | not implemented |
 |---|---|---|
 | `IGameInput` | `GetCurrentTimestamp` (µs), `GetCurrentReading`, `GetNextReading`, `GetPreviousReading`, `RegisterReadingCallback`, `RegisterDeviceCallback` (blocking and async enumeration), `RegisterGuideButtonCallback`, `RegisterKeyboardLayoutCallback` (never fires), `StopCallback`, `UnregisterCallback`, `CreateDispatcher`, `FindDeviceFromId`, `EnableOemDeviceSupport` (no-op), `SetFocusPolicy` (no-op) | `GetTemporalReading`, `CreateAggregateDevice`, `FindDeviceFromObject/PlatformHandle/PlatformString` |
-| `IGameInputReading` | kind, sequence number, timestamp, device, gamepad state, UI navigation state, controller axes and buttons, motion state | raw report, keyboard, mouse, touch, arcade/flight stick, racing wheel (all return nothing) |
+| `IGameInputReading` | kind, sequence number, timestamp, device, gamepad state, UI navigation state, controller axes and buttons, motion state, keys and mouse state (with `LEONIDA_KEYBOARD_MOUSE`) | raw report, touch, arcade/flight stick, racing wheel (all return nothing); the mouse wheel (always 0) |
 | `IGameInputDevice` | device info, status, battery, `SetRumbleState` | force feedback and haptic motors (none reported), raw device I/O, power off, input synchronization (no-ops) |
 | `IGameInputDispatcher` | `Dispatch`, `OpenWaitHandle` | the quota (the queue is short) |
 
@@ -266,7 +304,12 @@ shim fills (`GameInputDeviceInfo` 320 bytes with `deviceFamily` at 96 and the in
   driven through `rt::gameinput::set_keyboard_source` and `set_cursor_source` with fake keys, focus and cursor: every
   binding, two keys at once, each WASD direction, opposite keys cancelling, diagonals, the mouse moving the right
   stick, clamping and decaying to 0, the mouse-button triggers, no input out of focus, release of buttons, sticks and
-  triggers on focus loss, the `always` mode, and turning it off and on again.
+  triggers on focus loss, the `always` mode, and turning it off and on again. The keyboard and mouse devices run on
+  the same fake keys, focus and cursor: off by default, connect and disconnect callbacks for their kinds and none
+  for the gamepad kind, device info, keys in virtual-key order with generic modifiers left out, scan code and glyph
+  as the host maps them, the 16-key cap, `GetKeyState` with a short array, reading callbacks per change, the
+  keyboard's history and an aggregate keyboard, mouse buttons and summed movement, no keys or movement out of focus
+  and no jump when it returns, the `always` mode, and the same objects after off and on.
 - `gameinput_probe [--seconds N] [--rumble]` (by hand, with a pad connected): lists the pads, plays each motor and
   trigger for a second with `--rumble`, then prints the live reading.
 
@@ -301,5 +344,11 @@ These need the game executable or a test on hardware:
 - **Mouse on the right stick**: the scale (1024 units per pixel per poll) and decay (7/8 per poll) are a starting
   point, not tuned in game. The title adds its own stick acceleration and deadzone on top, so aiming may feel slow
   near center or jumpy.
+- **Keyboard and mouse devices**: the family (`GameInputFamilyHid`), the scan-code convention (set 1 with the 0xE0
+  prefix, from `MapVirtualKeyW`), the key order (by virtual-key code), whether a key's `codePoint` follows the
+  layout or is the unshifted glyph, and the pixel units of the mouse position are this shim's choices, not measured
+  against GameInput on a PC. The v0 layouts of `GameInputKeyState`, `GameInputMouseState`, `GameInputKeyboardInfo`
+  and `GameInputMouseInfo` come from Microsoft's documentation and were not compiled against the public v0 header.
+  Whether the game reads the keyboard or the mouse through GameInput at all is unknown until it runs.
 - **DualSense effect parameters**: the `06` (vibration) and `01` (resistance) byte meanings follow SDL's
   `testcontroller.c`; how strong 255 feels and what frequency suits the Xbox signal needs a session on a real pad.

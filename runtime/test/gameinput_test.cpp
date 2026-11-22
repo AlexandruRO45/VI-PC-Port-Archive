@@ -6,7 +6,8 @@
 // without trigger motors. The test covers enumeration and device callbacks, readings and their button/axis mapping,
 // UI navigation, the guide button, rumble and trigger rumble as SDL receives them, the DualSense effect bytes for
 // each LEONIDA_DS_TRIGGERS mode, the lightbar, a dispatcher, unplug/replug, reading history,
-// and identification of two or three otherwise indistinguishable pads. No game data.
+// identification of two or three otherwise indistinguishable pads, and the keyboard and mouse devices on fake keys and
+// a fake cursor. No game data.
 #include <windows.h>
 
 #include <SDL3/SDL.h>
@@ -536,6 +537,245 @@ void test_keyboard_pad(IGameInput* input) {
     rt::gameinput::reload_config();
     rt::gameinput::poll();
     check(rt::gameinput::connected_count() == 0, "keyboard pad: removed at the end");
+    rt::gameinput::set_keyboard_source(nullptr, nullptr);
+    rt::gameinput::set_cursor_source(nullptr);
+}
+
+// ---- keyboard and mouse devices (LEONIDA_KEYBOARD_MOUSE) ----
+std::vector<DeviceEvent> g_km_events;
+int g_keyboard_readings = 0;
+void CALLBACK on_km_device(GameInputCallbackToken token, void*, IGameInputDevice* device, uint64_t, uint32_t current,
+                           uint32_t previous) {
+    g_km_events.push_back({device, current, previous, token});
+}
+void CALLBACK on_keyboard_reading(GameInputCallbackToken, void*, IGameInputReading* reading, bool) {
+    if (reading && reading->GetInputKind() == GameInputKindKeyboard) ++g_keyboard_readings;
+}
+
+// The pressed keys of the keyboard device's current reading, and that reading's key count.
+std::vector<GameInputKeyState> keys_of(IGameInput* input, IGameInputDevice* keyboard, uint32_t* count = nullptr) {
+    std::vector<GameInputKeyState> keys;
+    IGameInputReading* r = nullptr;
+    if (input->GetCurrentReading(GameInputKindKeyboard, keyboard, &r) == S_OK && r) {
+        keys.resize(32);
+        keys.resize(r->GetKeyState(static_cast<uint32_t>(keys.size()), keys.data()));
+        if (count) *count = r->GetKeyCount();
+        r->Release();
+    }
+    return keys;
+}
+
+GameInputMouseState mouse_of(IGameInput* input, IGameInputDevice* mouse) {
+    GameInputMouseState st{};
+    st.buttons = ~0u;
+    IGameInputReading* r = nullptr;
+    if (input->GetCurrentReading(GameInputKindMouse, mouse, &r) == S_OK && r) {
+        r->GetMouseState(&st);
+        r->Release();
+    }
+    return st;
+}
+
+// Runs with no gamepad connected and main's callbacks (gamepad kind) still registered.
+void test_keyboard_mouse(IGameInput* input) {
+    rt::gameinput::set_keyboard_source(fake_key_down, fake_focus);
+    rt::gameinput::set_cursor_source(fake_cursor);
+    std::memset(g_keys, 0, sizeof g_keys);
+    g_focus = true;
+    g_cursor_x = 100;
+    g_cursor_y = 100;
+
+    set_env("LEONIDA_KEYBOARD_MOUSE", nullptr);
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    IGameInputReading* r = nullptr;
+    check(rt::gameinput::config().keyboard_mouse == rt::gameinput::KeyboardPadMode::Off &&
+              input->GetCurrentReading(GameInputKindKeyboard, nullptr, &r) == GAMEINPUT_E_READING_NOT_FOUND && !r &&
+              input->GetCurrentReading(GameInputKindMouse, nullptr, &r) == GAMEINPUT_E_READING_NOT_FOUND && !r,
+          "keyboard/mouse: off by default, no keyboard or mouse reading");
+
+    GameInputCallbackToken device_token = 0, reading_token = 0;
+    check(input->RegisterDeviceCallback(nullptr, GameInputKindKeyboard | GameInputKindMouse, GameInputDeviceConnected,
+                                        GameInputNoEnumeration, nullptr, on_km_device, &device_token) == S_OK &&
+              input->RegisterReadingCallback(nullptr, GameInputKindKeyboard, 0.0f, nullptr, on_keyboard_reading,
+                                             &reading_token) == S_OK,
+          "keyboard/mouse: callbacks for the keyboard and mouse kinds");
+
+    const size_t pad_events = g_device_events.size();
+    const int pad_readings = g_reading_events;
+    set_env("LEONIDA_KEYBOARD_MOUSE", "1");
+    rt::gameinput::reload_config();
+    check(rt::gameinput::config().keyboard_mouse == rt::gameinput::KeyboardPadMode::Focused,
+          "keyboard/mouse: LEONIDA_KEYBOARD_MOUSE=1 is the focused mode");
+    rt::gameinput::poll();
+    IGameInputDevice* keyboard = nullptr;
+    IGameInputDevice* mouse = nullptr;
+    for (const DeviceEvent& e : g_km_events) {
+        const uint32_t kinds = e.device->GetDeviceInfo()->supportedInput;
+        if (kinds == GameInputKindKeyboard) keyboard = e.device;
+        if (kinds == GameInputKindMouse) mouse = e.device;
+    }
+    bool connected = g_km_events.size() == 2;
+    for (const DeviceEvent& e : g_km_events)
+        connected &= (e.current & GameInputDeviceConnected) && e.previous == GameInputDeviceNoStatus;
+    check(connected && keyboard && mouse, "keyboard/mouse: one keyboard and one mouse device connect");
+    check(g_device_events.size() == pad_events, "keyboard/mouse: a gamepad device callback is not told");
+    check(rt::gameinput::connected_count() == 0, "keyboard/mouse: not counted as gamepads");
+    if (!keyboard || !mouse) return;
+
+    const GameInputDeviceInfo* ki = keyboard->GetDeviceInfo();
+    const GameInputDeviceInfo* mi = mouse->GetDeviceInfo();
+    check(ki->infoSize == sizeof(GameInputDeviceInfo) && ki->deviceFamily == GameInputFamilyHid &&
+              ki->usage.page == 0x01 && ki->usage.id == 0x06 && ki->keyboardInfo && !ki->mouseInfo &&
+              !ki->gamepadInfo && ki->controllerAxisCount == 0 && ki->supportedRumbleMotors == 0,
+          "keyboard/mouse: keyboard device info");
+    check(ki->keyboardInfo && ki->keyboardInfo->maxSimultaneousKeys == 16 && ki->keyboardInfo->functionKeyCount == 24 &&
+              ki->keyboardInfo->keyCount > 100 && ki->keyboardInfo->nativeLanguage,
+          "keyboard/mouse: keyboard info (16 keys at once, F1-F24)");
+    check(mi->usage.page == 0x01 && mi->usage.id == 0x02 && mi->mouseInfo && !mi->keyboardInfo &&
+              mi->mouseInfo->supportedButtons == 0x1F && !mi->mouseInfo->hasWheelX && !mi->mouseInfo->hasWheelY,
+          "keyboard/mouse: mouse device info (five buttons, no wheel)");
+    check(ki->displayName && std::strcmp(ki->displayName->data, "Keyboard (Leonida)") == 0 && mi->displayName &&
+              std::strcmp(mi->displayName->data, "Mouse (Leonida)") == 0,
+          "keyboard/mouse: display names");
+    IGameInputDevice* found = nullptr;
+    check(input->FindDeviceFromId(&ki->deviceId, &found) == S_OK && found == keyboard &&
+              std::memcmp(&ki->deviceId, &mi->deviceId, sizeof ki->deviceId) != 0,
+          "keyboard/mouse: FindDeviceFromId, and the two ids differ");
+    if (found) found->Release();
+
+    // At rest.
+    uint32_t count = ~0u;
+    check(keys_of(input, keyboard, &count).empty() && count == 0, "keyboard/mouse: no key down at rest");
+    GameInputGamepadState gp{};
+    GameInputMouseState ms{};
+    check(input->GetCurrentReading(GameInputKindKeyboard, keyboard, &r) == S_OK && r &&
+              r->GetInputKind() == GameInputKindKeyboard && !r->GetGamepadState(&gp) && !r->GetMouseState(&ms) &&
+              r->GetControllerAxisCount() == 0 && r->GetControllerButtonCount() == 0,
+          "keyboard/mouse: a keyboard reading carries only keys");
+    if (r) r->Release(), r = nullptr;
+    check(input->GetCurrentReading(GameInputKindMouse, keyboard, &r) == GAMEINPUT_E_READING_NOT_FOUND && !r,
+          "keyboard/mouse: the keyboard has no mouse reading");
+    check(input->GetCurrentReading(GameInputKindGamepad, nullptr, &r) == GAMEINPUT_E_READING_NOT_FOUND && !r,
+          "keyboard/mouse: a gamepad query with no device does not return them");
+
+    // Keys, lowest virtual-key code first, generic modifiers left out.
+    const int readings_before = g_keyboard_readings;
+    g_keys['A'] = g_keys[VK_LSHIFT] = g_keys[VK_SHIFT] = g_keys[VK_RIGHT] = true;
+    rt::gameinput::poll();
+    std::vector<GameInputKeyState> k = keys_of(input, keyboard, &count);
+    check(count == 3 && k.size() == 3, "keyboard/mouse: three keys down (A, Right, left Shift; not generic Shift)");
+    if (k.size() == 3) {
+        check(k[0].virtualKey == VK_RIGHT && k[1].virtualKey == 'A' && k[2].virtualKey == VK_LSHIFT,
+              "keyboard/mouse: in virtual-key order");
+        check(k[1].scanCode == MapVirtualKeyW('A', MAPVK_VK_TO_VSC_EX) && k[1].scanCode != 0 &&
+                  k[1].codePoint == 'A' && !k[1].isDeadKey,
+              "keyboard/mouse: A's scan code and glyph");
+        // On Windows MAPVK_VK_TO_VSC_EX puts 0xE0 before an extended key's scan code; Wine 9 leaves it out, so the
+        // check is against what the host answers.
+        check(k[0].scanCode == MapVirtualKeyW(VK_RIGHT, MAPVK_VK_TO_VSC_EX) && (k[0].scanCode & 0xFF) == 0x4D &&
+                  k[0].codePoint == 0,
+              "keyboard/mouse: Right's scan code, and no glyph");
+    }
+    check(g_keyboard_readings == readings_before + 1, "keyboard/mouse: one keyboard reading callback per change");
+    rt::gameinput::poll();
+    check(g_keyboard_readings == readings_before + 1, "keyboard/mouse: no reading while nothing changes");
+    GameInputKeyState one[1] = {};
+    check(input->GetCurrentReading(GameInputKindKeyboard, keyboard, &r) == S_OK && r && r->GetKeyState(1, one) == 1 &&
+              one[0].virtualKey == VK_RIGHT && r->GetKeyState(1, nullptr) == 0,
+          "keyboard/mouse: GetKeyState fills at most the array it is given");
+    if (r) r->Release(), r = nullptr;
+    std::memset(g_keys, 0, sizeof g_keys);
+    for (int vk = 'A'; vk <= 'Z'; ++vk) g_keys[vk] = true;
+    rt::gameinput::poll();
+    k = keys_of(input, keyboard, &count);
+    check(count == 16 && k.size() == 16 && k.front().virtualKey == 'A' && k.back().virtualKey == 'P',
+          "keyboard/mouse: at most 16 keys at once");
+    std::memset(g_keys, 0, sizeof g_keys);
+    rt::gameinput::poll();
+
+    // GetPreviousReading with no device and the keyboard kind steps through the keyboard's readings only.
+    IGameInputReading* now = nullptr;
+    IGameInputReading* before = nullptr;
+    check(input->GetCurrentReading(GameInputKindKeyboard, nullptr, &now) == S_OK && now &&
+              input->GetPreviousReading(now, GameInputKindKeyboard, nullptr, &before) == S_OK && before &&
+              device_of(before) == keyboard && before->GetKeyCount() == 16,
+          "keyboard/mouse: the keyboard's history, with no device named");
+    if (now) now->Release();
+    if (before) before->Release();
+    IGameInputDevice* agg = nullptr;
+    check(input->CreateAggregateDevice(GameInputKindKeyboard, &agg) == S_OK && agg &&
+              input->GetCurrentReading(GameInputKindKeyboard, agg, &r) == S_OK && r && device_of(r) == keyboard,
+          "keyboard/mouse: an aggregate keyboard reads the keyboard");
+    if (r) r->Release(), r = nullptr;
+    if (agg) agg->Release();
+
+    // Mouse: buttons, and the position as summed cursor movement.
+    GameInputMouseState m0 = mouse_of(input, mouse);
+    check(m0.buttons == 0, "keyboard/mouse: no mouse button at rest");
+    g_keys[VK_LBUTTON] = g_keys[VK_XBUTTON2] = true;
+    g_cursor_x += 10;
+    g_cursor_y -= 5;
+    rt::gameinput::poll();
+    GameInputMouseState m1 = mouse_of(input, mouse);
+    check(m1.buttons == (GameInputMouseLeftButton | GameInputMouseButton5), "keyboard/mouse: left button and button 5");
+    check(m1.positionX - m0.positionX == 10 && m1.positionY - m0.positionY == -5 && m1.wheelX == 0 && m1.wheelY == 0,
+          "keyboard/mouse: the position moves with the cursor");
+    check(input->GetCurrentReading(GameInputKindMouse, mouse, &r) == S_OK && r &&
+              r->GetInputKind() == GameInputKindMouse && r->GetKeyCount() == 0 && !r->GetGamepadState(&gp),
+          "keyboard/mouse: a mouse reading carries only the mouse");
+    if (r) r->Release(), r = nullptr;
+    check(keys_of(input, keyboard).empty(), "keyboard/mouse: mouse buttons are not keyboard keys");
+    check(g_reading_events == pad_readings, "keyboard/mouse: a gamepad reading callback is not called");
+
+    // Out of focus: nothing pressed, and the cursor moving elsewhere does not count, also when focus returns.
+    g_focus = false;
+    g_keys['W'] = true;
+    g_cursor_x += 300;
+    rt::gameinput::poll();
+    GameInputMouseState m2 = mouse_of(input, mouse);
+    check(keys_of(input, keyboard).empty() && m2.buttons == 0 && m2.positionX == m1.positionX,
+          "keyboard/mouse: no keys, buttons or movement while another window has focus");
+    g_cursor_x += 300;
+    g_focus = true;
+    rt::gameinput::poll();
+    GameInputMouseState m3 = mouse_of(input, mouse);
+    k = keys_of(input, keyboard);
+    check(m3.positionX == m1.positionX && k.size() == 1 && k[0].virtualKey == 'W',
+          "keyboard/mouse: no jump when focus returns, keys read again");
+
+    set_env("LEONIDA_KEYBOARD_MOUSE", "always");
+    rt::gameinput::reload_config();
+    g_focus = false;
+    g_cursor_x += 7;
+    rt::gameinput::poll();
+    check(keys_of(input, keyboard).size() == 1 && mouse_of(input, mouse).positionX == m3.positionX + 7,
+          "keyboard/mouse: LEONIDA_KEYBOARD_MOUSE=always reads them without focus");
+    std::memset(g_keys, 0, sizeof g_keys);
+    g_focus = true;
+
+    // Off disconnects both; on again brings back the same objects.
+    g_km_events.clear();
+    set_env("LEONIDA_KEYBOARD_MOUSE", "off");
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    check(keyboard->GetDeviceStatus() == GameInputDeviceNoStatus && mouse->GetDeviceStatus() == GameInputDeviceNoStatus &&
+              input->GetCurrentReading(GameInputKindKeyboard, keyboard, &r) == GAMEINPUT_E_DEVICE_DISCONNECTED && !r,
+          "keyboard/mouse: off disconnects both");
+    set_env("LEONIDA_KEYBOARD_MOUSE", "1");
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    check(g_km_events.size() == 4 && g_km_events[2].device == keyboard && g_km_events[3].device == mouse &&
+              (keyboard->GetDeviceStatus() & GameInputDeviceConnected),
+          "keyboard/mouse: on again is the same two device objects");
+
+    set_env("LEONIDA_KEYBOARD_MOUSE", nullptr);
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    input->UnregisterCallback(device_token, 0);
+    input->UnregisterCallback(reading_token, 0);
+    check(input->GetCurrentReading(GameInputKindUnknown, nullptr, &r) == GAMEINPUT_E_READING_NOT_FOUND && !r,
+          "keyboard/mouse: removed at the end");
     rt::gameinput::set_keyboard_source(nullptr, nullptr);
     rt::gameinput::set_cursor_source(nullptr);
 }
@@ -1168,6 +1408,7 @@ int main() {
 
     test_twins(input);
     test_keyboard_pad(input);
+    test_keyboard_mouse(input);
     test_motion(input);
     test_aggregate_device(input);
     input->Release();

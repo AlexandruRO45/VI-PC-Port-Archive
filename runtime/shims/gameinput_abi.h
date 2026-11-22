@@ -1,4 +1,4 @@
-// GameInput v0 ABI: the part of Microsoft's GameInput API a title uses for gamepads.
+// GameInput v0 ABI: the part of Microsoft's GameInput API a title uses for gamepads, the keyboard and the mouse.
 //
 // These are Leonida's own declarations, written to match the binary layout of the public v0 GameInput API (the
 // in-box GDK version, also shipped as the Microsoft.GameInput 0.2303.x NuGet package). Only what the shim implements
@@ -264,6 +264,68 @@ struct GameInputMotionState {
     GameInputMotionAccuracy orientationAccuracy;
 };
 
+// Keyboard and mouse: v0 layouts from Microsoft's documentation (learn.microsoft.com GameInputKeyState,
+// GameInputMouseState, GameInputKeyboardInfo, GameInputMouseInfo, GameInputMouseButtons, GameInputKeyboardKind). Those
+// pages show the current (v1+) structs and name what v0 had: GameInputMouseState without `positions` and the
+// absolute positions, GameInputKeyboardInfo with `nativeLanguage` at the end, GameInputMouseInfo with `sensorDpi`
+// after `sampleRate`. VERIFY: against the public v0 header, as the other structs here were.
+enum GameInputMouseButtons : uint32_t {
+    GameInputMouseNone = 0x00000000,
+    GameInputMouseLeftButton = 0x00000001,
+    GameInputMouseRightButton = 0x00000002,
+    GameInputMouseMiddleButton = 0x00000004,
+    GameInputMouseButton4 = 0x00000008,
+    GameInputMouseButton5 = 0x00000010,
+    GameInputMouseWheelTiltLeft = 0x00000020,
+    GameInputMouseWheelTiltRight = 0x00000040,
+};
+
+enum GameInputKeyboardKind : int32_t {
+    GameInputUnknownKeyboard = -1,
+    GameInputAnsiKeyboard = 0,
+    GameInputIsoKeyboard = 1,
+    GameInputKsKeyboard = 2,
+    GameInputAbntKeyboard = 3,
+    GameInputJisKeyboard = 4,
+};
+
+// One pressed key, as IGameInputReading::GetKeyState writes it.
+struct GameInputKeyState {
+    uint32_t scanCode;
+    uint32_t codePoint;  // the Unicode code point of the glyph on the key
+    uint8_t virtualKey;
+    bool isDeadKey;
+};
+
+// What IGameInputReading::GetMouseState writes. Positions and wheels are cumulative: a title takes the difference
+// between two readings, never an absolute position.
+struct GameInputMouseState {
+    uint32_t buttons;  // GameInputMouseButtons
+    int64_t positionX;
+    int64_t positionY;
+    int64_t wheelX;
+    int64_t wheelY;
+};
+
+struct GameInputKeyboardInfo {
+    GameInputKeyboardKind kind;
+    uint32_t layout;  // the keyboard layout id GetKeyboardLayoutName spells, as a number (0x00000409 US)
+    uint32_t keyCount;
+    uint32_t functionKeyCount;
+    uint32_t maxSimultaneousKeys;
+    uint32_t platformType;
+    uint32_t platformSubtype;
+    const GameInputString* nativeLanguage;  // v0 only
+};
+
+struct GameInputMouseInfo {
+    uint32_t supportedButtons;  // GameInputMouseButtons
+    uint32_t sampleRate;
+    uint32_t sensorDpi;  // v0 only
+    bool hasWheelX;
+    bool hasWheelY;
+};
+
 struct GameInputDeviceInfo {
     uint32_t infoSize;
     uint16_t vendorId;
@@ -298,8 +360,8 @@ struct GameInputDeviceInfo {
     const GameInputControllerAxisInfo* controllerAxisInfo;
     const GameInputControllerButtonInfo* controllerButtonInfo;
     const void* controllerSwitchInfo;
-    const void* keyboardInfo;
-    const void* mouseInfo;
+    const GameInputKeyboardInfo* keyboardInfo;
+    const GameInputMouseInfo* mouseInfo;
     const void* touchSensorInfo;
     const void* motionInfo;
     const void* arcadeStickInfo;
@@ -324,6 +386,14 @@ static_assert(sizeof(GameInputMotionInfo) == 12);
 static_assert(sizeof(GameInputMotionState) == 68);
 static_assert(sizeof(GameInputControllerAxisInfo) == 48);
 static_assert(sizeof(GameInputControllerButtonInfo) == 32);
+static_assert(sizeof(GameInputKeyState) == 12 && offsetof(GameInputKeyState, virtualKey) == 8 &&
+              offsetof(GameInputKeyState, isDeadKey) == 9);
+static_assert(sizeof(GameInputMouseState) == 40 && offsetof(GameInputMouseState, positionX) == 8 &&
+              offsetof(GameInputMouseState, wheelY) == 32);
+static_assert(sizeof(GameInputKeyboardInfo) == 40 && offsetof(GameInputKeyboardInfo, nativeLanguage) == 32);
+static_assert(sizeof(GameInputMouseInfo) == 16 && offsetof(GameInputMouseInfo, hasWheelX) == 12 &&
+              offsetof(GameInputMouseInfo, hasWheelY) == 13);
+static_assert(offsetof(GameInputDeviceInfo, keyboardInfo) == 208 && offsetof(GameInputDeviceInfo, mouseInfo) == 216);
 static_assert(offsetof(GameInputDeviceInfo, deviceId) == 32);
 static_assert(offsetof(GameInputDeviceInfo, deviceFamily) == 96);
 static_assert(offsetof(GameInputDeviceInfo, inputReportCount) == 112);

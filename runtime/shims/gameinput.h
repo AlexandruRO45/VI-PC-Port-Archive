@@ -21,6 +21,9 @@ struct Config {
     bool rumble = true;                                 // LEONIDA_RUMBLE=0 turns all rumble off
     bool background_thread = true;                      // LEONIDA_GAMEINPUT_THREAD=0: poll only from poll()
     KeyboardPadMode keyboard_pad = KeyboardPadMode::Off;  // LEONIDA_KEYBOARD_PAD=1|focus|always|off
+    // A GameInput keyboard device and a mouse device, for a title that reads them directly (GetKeyState,
+    // GetMouseState). Same focus rules as the keyboard pad. LEONIDA_KEYBOARD_MOUSE=1|focus|always|off.
+    KeyboardPadMode keyboard_mouse = KeyboardPadMode::Off;
 };
 
 // The configuration in use. Read from the environment on the first GameInputCreate.
@@ -34,10 +37,11 @@ void reload_config();
 // (LEONIDA_GAMEINPUT_THREAD=0) a test calls it, always from the same thread, because SDL's joystick calls must be.
 void poll();
 
-// Number of gamepads currently open by the backend (tests, gameinput_probe).
+// Number of gamepads currently open by the backend (tests, gameinput_probe). The keyboard and mouse devices of
+// LEONIDA_KEYBOARD_MOUSE are not gamepads and are not counted.
 int connected_count();
 
-// What the shim last sent to SDL for the device that is index `i` in connection order. Test seam.
+// What the shim last sent to SDL for the gamepad that is index `i` in connection order. Test seam.
 struct OutputState {
     uint16_t low = 0, high = 0;           // SDL_RumbleGamepad
     uint16_t left = 0, right = 0;         // SDL_RumbleGamepadTriggers
@@ -47,13 +51,15 @@ struct OutputState {
 };
 bool output_state(int i, OutputState* out);
 
-// Where the keyboard pad reads keys from. Test seam: key_down(virtual_key) replaces GetAsyncKeyState, has_focus
-// replaces the foreground-window check of KeyboardPadMode::Focused. nullptr restores the default for either.
+// Where the keyboard pad and the keyboard and mouse devices read keys and mouse buttons from. Test seam:
+// key_down(virtual_key) replaces GetAsyncKeyState, has_focus replaces the foreground-window check of
+// KeyboardPadMode::Focused. nullptr restores the default for either.
 using KeyDownFn = bool (*)(int virtual_key);
 using HasFocusFn = bool (*)();
 void set_keyboard_source(KeyDownFn key_down, HasFocusFn has_focus);
 
-// Where the keyboard pad reads the mouse cursor from (screen pixels; false when it cannot be read). Test seam:
+// Where the keyboard pad and the mouse device read the mouse cursor from (screen pixels; false when it cannot be
+// read). Test seam:
 // replaces GetCursorPos. nullptr restores the default.
 using CursorPosFn = bool (*)(int* x, int* y);
 void set_cursor_source(CursorPosFn cursor_pos);
