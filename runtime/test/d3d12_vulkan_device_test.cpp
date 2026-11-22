@@ -2807,6 +2807,27 @@ HRESULT query_heap(ID3D12Device* device, D3D12_QUERY_HEAP_TYPE type, UINT count,
     return released(device->CreateQueryHeap(&desc, __uuidof(ID3D12QueryHeap), output ? &out : nullptr), &out);
 }
 
+HRESULT command_allocator(ID3D12Device* device, D3D12_COMMAND_LIST_TYPE type) {
+    void* out = nullptr;
+    return released(device->CreateCommandAllocator(type, __uuidof(ID3D12CommandAllocator), &out), &out);
+}
+
+// CreateCommandList with a direct allocator of its own (the allocator is made on `device`, so only the list's
+// arguments vary), or CreateCommandList1 when `closed` is set.
+HRESULT command_list(ID3D12Device* device, UINT node_mask, D3D12_COMMAND_LIST_TYPE type, bool closed = false) {
+    void* out = nullptr;
+    if (closed) {
+        Ref<ID3D12Device4> device4;
+        if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device4.p)))) return E_NOINTERFACE;
+        return released(device4->CreateCommandList1(node_mask, type, D3D12_COMMAND_LIST_FLAG_NONE,
+                                                     __uuidof(ID3D12GraphicsCommandList), &out), &out);
+    }
+    Ref<ID3D12CommandAllocator> allocator;
+    if (FAILED(device->CreateCommandAllocator(type, IID_PPV_ARGS(&allocator.p)))) return E_FAIL;
+    return released(device->CreateCommandList(node_mask, type, allocator.p, nullptr,
+                                              __uuidof(ID3D12GraphicsCommandList), &out), &out);
+}
+
 // A root signature blob from the host's own serializer (version 1.0): empty, or one root CBV at b0, or one table of
 // unbounded SRVs from t0. Empty when d3d12.dll has no serializer, and both devices then get the same refusal.
 std::vector<std::uint8_t> root_signature_blob(int parameters) {
@@ -3922,6 +3943,29 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         {"format support: 192, past A4B4G4R4", [](ID3D12Device* d) { return format_support1(d, 0xc0u); }},
         {"format support: 1000", [](ID3D12Device* d) { return format_support1(d, 0x3e8u); }},
         {"format support: -1", [](ID3D12Device* d) { return format_support1(d, 0xffffffffu); }},
+        // Command allocators and lists: a list type outside D3D12_COMMAND_LIST_TYPE and a node mask naming a node
+        // the single-node adapter does not have are refused (measured on the host runtime and WARP).
+        {"allocator: direct", [](ID3D12Device* d) { return command_allocator(d, D3D12_COMMAND_LIST_TYPE_DIRECT); }},
+        {"allocator: bundle", [](ID3D12Device* d) { return command_allocator(d, D3D12_COMMAND_LIST_TYPE_BUNDLE); }},
+        {"allocator: type 7", [](ID3D12Device* d) { return command_allocator(d, D3D12_COMMAND_LIST_TYPE(7)); }},
+        {"allocator: type 42", [](ID3D12Device* d) { return command_allocator(d, D3D12_COMMAND_LIST_TYPE(42)); }},
+        {"allocator: type -1", [](ID3D12Device* d) { return command_allocator(d, D3D12_COMMAND_LIST_TYPE(-1)); }},
+        {"command list: node mask 0", [](ID3D12Device* d) { return command_list(d, 0, D3D12_COMMAND_LIST_TYPE_DIRECT); }},
+        {"command list: node mask 1", [](ID3D12Device* d) { return command_list(d, 1, D3D12_COMMAND_LIST_TYPE_DIRECT); }},
+        {"command list: node mask 2", [](ID3D12Device* d) { return command_list(d, 2, D3D12_COMMAND_LIST_TYPE_DIRECT); }},
+        {"command list: node mask 3", [](ID3D12Device* d) { return command_list(d, 3, D3D12_COMMAND_LIST_TYPE_DIRECT); }},
+        {"command list 1: node mask 1", [](ID3D12Device* d) {
+             return command_list(d, 1, D3D12_COMMAND_LIST_TYPE_DIRECT, true);
+         }},
+        {"command list 1: node mask 2", [](ID3D12Device* d) {
+             return command_list(d, 2, D3D12_COMMAND_LIST_TYPE_DIRECT, true);
+         }},
+        {"command list 1: node mask 0x80000000", [](ID3D12Device* d) {
+             return command_list(d, 0x80000000u, D3D12_COMMAND_LIST_TYPE_DIRECT, true);
+         }},
+        {"command list 1: type 42", [](ID3D12Device* d) {
+             return command_list(d, 0, D3D12_COMMAND_LIST_TYPE(42), true);
+         }},
         {"fence: null output", [](ID3D12Device* d) {
              return d->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), nullptr);
          }},

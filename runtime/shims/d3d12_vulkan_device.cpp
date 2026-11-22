@@ -4427,21 +4427,29 @@ public:
 
     HRESULT STDMETHODCALLTYPE CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out) override {
         constexpr auto method = "ID3D12Device::CreateCommandAllocator";
+        // As the host runtime and WARP: a type outside D3D12_COMMAND_LIST_TYPE is E_INVALIDARG (also a negative one).
+        if (UINT(type) > D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE) return d3d12_trace::result(method, E_INVALIDARG);
         return d3d12_trace::result(method, create_command_allocator(type, riid, out, identity()));
     }
 
-    HRESULT STDMETHODCALLTYPE CreateCommandList(UINT, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator,
-                                                ID3D12PipelineState* state, REFIID riid, void** out) override {
+    // One adapter node (GetNodeCount is 1): a node mask above 1 names a node that does not exist, which the host
+    // runtime and WARP refuse with E_INVALIDARG. 0 is the single-node default.
+    HRESULT STDMETHODCALLTYPE CreateCommandList(UINT node_mask, D3D12_COMMAND_LIST_TYPE type,
+                                                ID3D12CommandAllocator* allocator, ID3D12PipelineState* state,
+                                                REFIID riid, void** out) override {
         constexpr auto method = "ID3D12Device::CreateCommandList";
+        if (node_mask > 1) return d3d12_trace::result(method, E_INVALIDARG);
         // The initial pipeline state is set as SetPipelineState would set it (a bundle's is its first deferred call).
         HRESULT hr = create_command_list(type, allocator, riid, out, identity(), state);
         return d3d12_trace::result(method, hr);
     }
 
     // Device4: a list created closed, without an allocator.
-    HRESULT STDMETHODCALLTYPE CreateCommandList1(UINT, D3D12_COMMAND_LIST_TYPE type, D3D12_COMMAND_LIST_FLAGS,
-                                                 REFIID riid, void** out) override {
+    HRESULT STDMETHODCALLTYPE CreateCommandList1(UINT node_mask, D3D12_COMMAND_LIST_TYPE type,
+                                                 D3D12_COMMAND_LIST_FLAGS, REFIID riid, void** out) override {
         constexpr auto method = "ID3D12Device4::CreateCommandList1";
+        if (node_mask > 1 || UINT(type) > D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE)
+            return d3d12_trace::result(method, E_INVALIDARG);
         if (!out) return d3d12_trace::result(method, E_POINTER);
         *out = nullptr;
         ID3D12CommandAllocator* allocator = nullptr;
