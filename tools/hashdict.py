@@ -84,8 +84,16 @@ def main():
         p = os.path.join(a.carve, arch, "index.json")
         if not os.path.isfile(p):
             continue
-        with open(p, encoding="utf-8") as f:
-            rows = json.load(f)["files"]
+        try:
+            with open(p, encoding="utf-8") as f:
+                document = json.load(f)
+        except (OSError, ValueError) as e:
+            print(f"ERROR: cannot read {p}: {getattr(e, 'strerror', None) or e}", file=sys.stderr)
+            return 2
+        if not isinstance(document, dict) or not isinstance(document.get("files"), list):
+            print(f"ERROR: cannot read {p}: expected an object with a 'files' list", file=sys.stderr)
+            return 2
+        rows = document["files"]
         for r in rows:
             if r.get("type") == "bink2":
                 continue

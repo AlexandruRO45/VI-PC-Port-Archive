@@ -382,5 +382,34 @@ class LookupDictionaryTest(unittest.TestCase):
         self.assertEqual(p.stdout.strip(), "0x1 Widget")
 
 
+class ArchiveIndexTest(unittest.TestCase):
+    def build(self, contents):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        arch = os.path.join(tmp.name, "arch")
+        os.makedirs(arch)
+        with open(os.path.join(arch, "index.json"), "w", encoding="utf-8") as f:
+            f.write(contents)
+        out = os.path.join(tmp.name, "out", "hashes.json")
+        p = subprocess.run([sys.executable, "-I", TOOL, tmp.name, "--out", out],
+                           capture_output=True, text=True)
+        return p, out
+
+    def test_malformed_archive_index_is_one_error(self):
+        p, out = self.build("not json")
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("ERROR: cannot read", p.stderr)
+        self.assertIn("index.json", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_wrong_shape_archive_index_is_one_error(self):
+        p, out = self.build("[]")
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("expected an object with a 'files' list", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertFalse(os.path.exists(out))
+
+
 if __name__ == "__main__":
     unittest.main()
