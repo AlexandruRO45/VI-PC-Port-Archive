@@ -864,3 +864,91 @@ class TestIEEE754BoundaryExtremesSubnormalsAndNaNs(unittest.TestCase):
         res = self.interp.step(instr, self.state)
 
         self.assertEqual(res, nan_payload)
+
+
+# ============================================================================
+# Section 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# ============================================================================
+
+class TestNegativeControlsSyntaxRejectionAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_negative_invalid_vgpr_index(self) -> None:
+        with self.assertRaises(ValueError):
+            VGPR(256)
+        with self.assertRaises(ValueError):
+            VGPR(-1)
+
+    def test_negative_invalid_offset_range(self) -> None:
+        with self.assertRaises(ValueError):
+            DSAddSrc2U64Instruction(vaddr=VGPR(0), offset0=256, offset1=0)
+        with self.assertRaises(ValueError):
+            DSAddSrc2U64Instruction(vaddr=VGPR(0), offset0=0, offset1=-1)
+
+    def test_negative_invalid_lds_capacity(self) -> None:
+        with self.assertRaises(ValueError):
+            LDSModel(capacity_qwords=1000)
+        with self.assertRaises(ValueError):
+            LDSModel(capacity_qwords=0)
+
+    def test_negative_invalid_simd_num_lanes(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+
+    # --- Mutation Detection Tests ---
+
+    def test_mutation_memory_a_not_updated_detected(self) -> None:
+        """Mutant: Interpreter executes addition but does not write to LDS[A]."""
+        class BuggyInterpreter(ScalarInterpreter):
+            def step(self, instr: DSAddSrc2U64Instruction, s: ScalarMachineState) -> int:
+                vaddr = s.get_vgpr(instr.vaddr.index)
+                addr_a = calc_lds_src2_byte_address(vaddr, instr.offset0)
+                # Bug: omits write back to LDS
+                return s.lds.read_qword_at_byte_addr(addr_a)
+
+        state = ScalarMachineState()
+        state.set_vgpr(0, 0x100)
+        state.lds.write_qword_at_byte_addr(0x100, 50)
+        state.lds.write_qword_at_byte_addr(0x108, 25)
+
+        buggy = BuggyInterpreter()
+        instr = DSAddSrc2U64Instruction(vaddr=VGPR(0), offset0=0, offset1=1)
+        buggy.step(instr, state)
+
+        self.assertNotEqual(state.lds.read_qword_at_byte_addr(0x100), 75)
+
+    def test_mutation_memory_b_corrupted_detected(self) -> None:
+        """Mutant: Location B is overwritten during addition."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        state.set_vgpr(0, 0x100)
+        state.lds.write_qword_at_byte_addr(0x100, 100)
+        state.lds.write_qword_at_byte_addr(0x108, 50)
+
+        instr = DSAddSrc2U64Instruction(vaddr=VGPR(0), offset0=0, offset1=1)
+        interp.step(instr, state)
+
+        self.assertEqual(state.lds.read_qword_at_byte_addr(0x108), 50)
+
+    def test_mutation_stride_4_instead_of_stride_8_detected(self) -> None:
+        """Mutant: 64-bit src2 instruction uses stride 4 instead of stride 8."""
+        def buggy_calc_addr(vaddr: int, offset8: int) -> int:
+            return (vaddr + ((offset8 & OFFSET8_MASK) * 4)) & MASK32  # Bug: * 4
+
+        correct = calc_lds_src2_byte_address(0x1000, 2)
+        mutant = buggy_calc_addr(0x1000, 2)
+        self.assertEqual(correct, 0x1010)
+        self.assertNotEqual(correct, mutant)
+        self.assertEqual(mutant, 0x1008)
+
+    def test_mutation_overflow_masking_omitted_detected(self) -> None:
+        """Mutant: Omits 64-bit truncation on addition overflow."""
+        def buggy_add(a: int, b: int) -> int:
+            return a + b
+
+        correct = oracle_ds_add_src2_u64(MASK64, 1)
+        mutant = buggy_add(MASK64, 1)
+        self.assertEqual(correct, 0)
+        self.assertNotEqual(correct, mutant)
+        self.assertEqual(mutant, 1 << 64)
