@@ -157,5 +157,196 @@ class TestValuCvtPkI32I16Oracle(unittest.TestCase):
             else:
                 self.assertEqual(d0, 1 << bit)
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegKind(enum.Enum):
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclass(frozen=True)
+class Register:
+    kind: RegKind
+    index: int
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        if self.count < 1:
+            raise ValueError(f"Register count must be >= 1, got {self.count}")
+        max_idx = 256 if self.kind == RegKind.VGPR else 106
+        if not (0 <= self.index and self.index + self.count <= max_idx):
+            raise ValueError(f"Register range [{self.index}:{self.index + self.count}] exceeds limit {max_idx}")
+
+    def __str__(self) -> str:
+        if self.count == 1:
+            return f"{self.kind.value}{self.index}"
+        return f"{self.kind.value}[{self.index}:{self.index + self.count - 1}]"
+
+
+@dataclass(frozen=True)
+class Immediate:
+    value: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value", self.value & MASK32)
+
+    def __str__(self) -> str:
+        return f"0x{self.value:08X}"
+
+
+Operand = Union[Register, Immediate]
+
+
+class Opcode(enum.Enum):
+    V_CVT_PK_I32_I16 = "v_cvt_pk_i32_i16"
+    V_MOV_B32 = "v_mov_b32"
+
+
+@dataclass
+class Instruction:
+    opcode: Opcode
+    dst: Register
+    src0: Operand
+    src1: Optional[Operand] = None
+    op_sel: Tuple[int, int] = (0, 0)
+
+    def __post_init__(self) -> None:
+        if self.opcode == Opcode.V_CVT_PK_I32_I16:
+            if self.dst.kind != RegKind.VGPR:
+                raise TypeError(f"Destination must be VGPR, got {self.dst.kind}")
+            if self.dst.count != 2:
+                raise ValueError(f"Destination register count for {self.opcode.value} must be 2, got {self.dst.count}")
+
+    def __str__(self) -> str:
+        if self.src1 is None:
+            return f"{self.opcode.value} {self.dst}, {self.src0}"
+        if self.op_sel != (0, 0):
+            return f"{self.opcode.value} {self.dst}, {self.src0}, {self.src1} op_sel:[{self.op_sel[0]},{self.op_sel[1]}]"
+        return f"{self.opcode.value} {self.dst}, {self.src0}, {self.src1}"
+
+
+class ASTNode:
+    def eval(self, env: Dict[Register, int]) -> int:
+        raise NotImplementedError
+
+
+@dataclass
+class LiteralNode(ASTNode):
+    val: int
+
+    def eval(self, env: Dict[Register, int]) -> int:
+        return self.val & MASK32
+
+
+@dataclass
+class RegReadNode(ASTNode):
+    reg: Register
+
+    def eval(self, env: Dict[Register, int]) -> int:
+        return env.get(self.reg, 0) & MASK32
+
+
+@dataclass
+class SignExtendI16Node(ASTNode):
+    operand: ASTNode
+    high_half: bool = False
+
+    def eval(self, env: Dict[Register, int]) -> int:
+        raw = self.operand.eval(env)
+        half = ((raw >> 16) & MASK16) if self.high_half else (raw & MASK16)
+        return sign_extend_16_to_32(half)
+
+
+@dataclass
+class CvtPkI32I16Node(ASTNode):
+    src0: ASTNode
+    src1: Optional[ASTNode] = None
+    op_sel: Tuple[int, int] = (0, 0)
+
+    def eval(self, env: Dict[Register, int]) -> Tuple[int, int]:
+        s0 = self.src0.eval(env)
+        if self.src1 is None:
+            return ref_cvt_pk_i32_i16(s0)
+        s1 = self.src1.eval(env)
+        return ref_cvt_pk_i32_i16_dual(s0, s1, self.op_sel)
+
+    def to_lowered_ast(self) -> Tuple[ASTNode, ASTNode]:
+        if self.src1 is None:
+            d0_node = SignExtendI16Node(self.src0, high_half=False)
+            d1_node = SignExtendI16Node(self.src0, high_half=True)
+            return d0_node, d1_node
+        d0_node = SignExtendI16Node(self.src0, high_half=bool(self.op_sel[0]))
+        d1_node = SignExtendI16Node(self.src1, high_half=bool(self.op_sel[1]))
+        return d0_node, d1_node
+
+
+def simplify_ast(node: ASTNode) -> ASTNode:
+    if isinstance(node, SignExtendI16Node):
+        sub = simplify_ast(node.operand)
+        if isinstance(sub, LiteralNode):
+            half = ((sub.val >> 16) & MASK16) if node.high_half else (sub.val & MASK16)
+            return LiteralNode(sign_extend_16_to_32(half))
+        return SignExtendI16Node(sub, node.high_half)
+    return node
+
+
+# ==============================================================================
+# Unit Tests: Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class TestValuCvtPkI32I16AST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_instruction_creation_and_string_representation(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_I32_I16,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Register(RegKind.VGPR, 2),
+        )
+        self.assertEqual(inst.opcode, Opcode.V_CVT_PK_I32_I16)
+        self.assertEqual(str(inst), "v_cvt_pk_i32_i16 v[0:1], v2")
+
+    def test_instruction_dual_source(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_I32_I16,
+            dst=Register(RegKind.VGPR, 4, count=2),
+            src0=Register(RegKind.VGPR, 6),
+            src1=Register(RegKind.SGPR, 8),
+            op_sel=(1, 0),
+        )
+        self.assertEqual(str(inst), "v_cvt_pk_i32_i16 v[4:5], v6, s8 op_sel:[1,0]")
+
+    def test_ast_evaluation_matches_oracle(self) -> None:
+        env: Dict[Register, int] = {
+            Register(RegKind.VGPR, 1): 0xFFFF_0005,
+        }
+        node = CvtPkI32I16Node(src0=RegReadNode(Register(RegKind.VGPR, 1)))
+        eval_result = node.eval(env)
+        self.assertEqual(eval_result, (5, 0xFFFF_FFFF))
+        self.assertEqual(eval_result, ref_cvt_pk_i32_i16(0xFFFF_0005))
+
+    def test_lowered_ast_matches_high_level(self) -> None:
+        env: Dict[Register, int] = {
+            Register(RegKind.VGPR, 0): 0x8000_7FFF,
+        }
+        high_level = CvtPkI32I16Node(src0=RegReadNode(Register(RegKind.VGPR, 0)))
+        d0_node, d1_node = high_level.to_lowered_ast()
+        d0_val = d0_node.eval(env)
+        d1_val = d1_node.eval(env)
+        self.assertEqual((d0_val, d1_val), high_level.eval(env))
+        self.assertEqual((d0_val, d1_val), (0x0000_7FFF, 0xFFFF_8000))
+
+    def test_ast_simplification_constant_folding(self) -> None:
+        node_lo = SignExtendI16Node(LiteralNode(0xFFFF_0042), high_half=False)
+        node_hi = SignExtendI16Node(LiteralNode(0xFFFF_0042), high_half=True)
+        s_lo = simplify_ast(node_lo)
+        s_hi = simplify_ast(node_hi)
+        self.assertIsInstance(s_lo, LiteralNode)
+        self.assertIsInstance(s_hi, LiteralNode)
+        self.assertEqual(s_lo.eval({}), 0x0000_0042)
+        self.assertEqual(s_hi.eval({}), 0xFFFF_FFFF)
+
 if __name__ == "__main__":
     unittest.main()
