@@ -3,15 +3,15 @@
 `--wave64-emulate` adds its own Workgroup buffer, `%x_buf` (2L + 6W + 7 dwords for L invocations in W waves), on top
 of the shader's LDS array. With a 64 KiB LDS that made modules over the 64 KiB device limit, which `spirv-val` accepts
 and RADV dies on (#1721: 16,385 uints = 65,540 B). The translator now counts both against
-`rdna2spirv.MAX_SHARED_BYTES` (`--max-shared-memory`, default 65536, the hard cap): the LDS array, a power of two at
-least the program's need, shrinks to the RSRC2 allocation when that still fits; otherwise the shader is refused
-(`Unsupported`, with the byte counts). The device's own limit (32768 on the AMD Windows and Intel drivers) is the
+`rdna2spirv.MAX_SHARED_BYTES` (`--max-shared-memory`, default 65536, the hard cap): the LDS array, the RSRC2
+allocation plus one sink dword (SHADER-715), drops the sink when that is over the cap and the allocation still fits;
+otherwise the shader is refused (`Unsupported`, with the byte counts). The device's own limit (32768 on the AMD Windows and Intel drivers) is the
 runtime's check, against `lds_bytes`, which must be the whole total.
 
 RDNA2 LDS does not wrap: an access outside the allocation reads 0 and its write is dropped (RDNA2 ISA 3.6.1, 3.6.6).
-A shrunk array, or a program whose constant ds offsets reach past its RSRC2 allocation, gets bounds-checked LDS
-accesses (Gen.lds_access); every other shader keeps the wrapped power-of-two array and emits no check. The
-out-of-range cases run through spirv_mini_interp.
+Every compute shader's LDS access is checked against the allocation without a branch: an out-of-range index goes to
+the sink dword and what it returns is 0 (Gen.lds_ptr_ok). Without the sink (it did not fit) the check is a branch
+(Gen.lds_access with lds_bound). The out-of-range cases run through spirv_mini_interp.
 
 The Workgroup bytes are counted from the emitted SPIR-V. The programs are written here; no game data.
 """
@@ -90,6 +90,11 @@ def lds_index_ops(spv):
                           spv))
 
 
+def sink_checks(spv):
+    """How many LDS accesses are checked by redirecting an out-of-range index to the sink dword (Gen.lds_ptr_ok)."""
+    return len(re.findall(r"= OpSelect %uint %\w+ %\w+ %\w+\n\s*%\w+ = OpAccessChain %_ptr_WG_uint\w* %lds ", spv))
+
+
 def bounds_checks(spv):
     """How many LDS accesses are bounds-checked (Gen.lds_access emits one `<id>_lin` in-range block per dword)."""
     return len(re.findall(r"^\s*%\w+_lin = OpLabel$", spv, re.M))
@@ -122,9 +127,9 @@ def out(*regs):
 
 class SharedMemoryLimitTests(unittest.TestCase):
     def test_under_limit_is_unchanged(self):
-        # 32 KiB of LDS + the exchange: well under 64 KiB, the power-of-two array as before
+        # 32 KiB of LDS + the sink dword + the exchange: well under 64 KiB
         wg = workgroup_bytes(translate(64))
-        self.assertEqual(wg, {"%lds": 32768, "%x_buf": X_BUF})
+        self.assertEqual(wg, {"%lds": 32768 + 4, "%x_buf": X_BUF})
         self.assertLessEqual(sum(wg.values()), rdna2spirv.MAX_SHARED_BYTES)
 
     def test_full_64k_lds_is_refused(self):
@@ -137,21 +142,24 @@ class SharedMemoryLimitTests(unittest.TestCase):
         self.assertIn(f"wave64 exchange {X_BUF} B", msg)
         self.assertIn("65536 B", msg)
 
-    def test_rounded_up_lds_shrinks_to_the_allocation(self):
-        # LDS_SIZE 100 units = 51,200 B rounds up to a 64 KiB array, over the cap with the exchange; the allocation
-        # fits, so the array is the allocation and its accesses are bounds-checked (no mask, no wrap)
+    def test_allocation_is_not_rounded_up(self):
+        # LDS_SIZE 100 units = 51,200 B used to round up to a 64 KiB array, over the cap with the exchange. The array
+        # is the allocation plus the sink dword, and its accesses are checked without a branch (no mask, no wrap)
         spv = translate(100)
-        self.assertEqual(workgroup_bytes(spv), {"%lds": 51200, "%x_buf": X_BUF})
+        self.assertEqual(workgroup_bytes(spv), {"%lds": 51200 + 4, "%x_buf": X_BUF})
         self.assertEqual(lds_index_ops(spv), set())
-        self.assertEqual(bounds_checks(spv), 2)              # the ds_write and the ds_read
+        self.assertEqual(sink_checks(spv), 2)                # the ds_write and the ds_read
+        self.assertEqual(bounds_checks(spv), 0)
 
     def test_exact_limit_is_accepted_one_dword_less_is_refused(self):
-        # 32 KiB of LDS (LDS_SIZE 64, all of it needed) + the exchange, against a limit at exactly that sum ...
+        # 32 KiB of LDS (LDS_SIZE 64, all of it needed) + the exchange, against a limit at exactly that sum: no
+        # room for the sink dword, so the array is the allocation and its accesses are checked with a branch ...
         exact = 32768 + X_BUF
         spv = translate(64, limit=exact)
         self.assertEqual(sum(workgroup_bytes(spv).values()), exact)
-        self.assertEqual(lds_index_ops(spv), {"OpBitwiseAnd"})
-        self.assertEqual(bounds_checks(spv), 0)
+        self.assertEqual(lds_index_ops(spv), set())
+        self.assertEqual(sink_checks(spv), 0)
+        self.assertEqual(bounds_checks(spv), 2)
         # ... and one dword under it: the need no longer fits, so there is nothing to shrink to
         with self.assertRaises(rdna2spirv.Unsupported):
             translate(64, limit=exact - 4)
@@ -179,7 +187,8 @@ class SharedMemoryLimitTests(unittest.TestCase):
 
     def test_constant_offset_at_the_end_of_64k_is_counted_exactly(self):
         # A b32 access at offset 65,532 ends at byte 65,536: the need is exactly 16,384 dwords (the estimate used
-        # to add 4 dwords of slack and overcount it), so a 64 KiB allocation is in range and emits no check
+        # to add 4 dwords of slack and overcount it), so a 64 KiB allocation is in range. It leaves no room for the
+        # sink dword, so its accesses are checked with a branch (a dynamic address can still reach past it)
         prog = [ln.replace("ds_write_b32 v1, v0", "ds_write_b32 v1, v0 offset:65532") for ln in PROGRAM]
         prev = rdna2spirv.WAVE64_EMULATE
         rdna2spirv.WAVE64_EMULATE = False
@@ -189,11 +198,11 @@ class SharedMemoryLimitTests(unittest.TestCase):
             rdna2spirv.WAVE64_EMULATE = prev
         self.assertEqual(rdna2spirv.translate.last_gen.lds_need, 16384)
         self.assertEqual(workgroup_bytes(spv), {"%lds": 65536})
-        self.assertEqual(bounds_checks(spv), 0)
+        self.assertEqual(bounds_checks(spv), 2)
 
     def test_constant_offset_past_the_allocation_is_bounds_checked(self):
         # 512 B allocated (LDS_SIZE 1), a write at offset 65,524: on RDNA2 it is out of range. The array is the
-        # allocation, every access is checked, and nothing wraps onto a valid word.
+        # allocation plus the sink dword, every access is checked, and nothing wraps onto a valid word.
         prog = [ln.replace("ds_write_b32 v1, v0", "ds_write_b32 v1, v0 offset:65524") for ln in PROGRAM]
         prev = rdna2spirv.WAVE64_EMULATE
         rdna2spirv.WAVE64_EMULATE = False
@@ -202,8 +211,8 @@ class SharedMemoryLimitTests(unittest.TestCase):
         finally:
             rdna2spirv.WAVE64_EMULATE = prev
         self.assertEqual(rdna2spirv.translate.last_gen.lds_need, 16382)
-        self.assertEqual(workgroup_bytes(spv), {"%lds": 512})
-        self.assertEqual(bounds_checks(spv), 2)
+        self.assertEqual(workgroup_bytes(spv), {"%lds": 512 + 4})
+        self.assertEqual(sink_checks(spv), 2)
         self.assertEqual(lds_index_ops(spv), set())
 
     def test_out_of_range_write_is_dropped_not_aliased(self):
@@ -253,20 +262,24 @@ class SharedMemoryLimitTests(unittest.TestCase):
                           "s_waitcnt lgkmcnt(0)", "ds_read_b32 v7, v1", "s_waitcnt lgkmcnt(0)"] + out(5, 7), 1)
         self.assertEqual((mem.get(0), mem.get(4)), (0, 7))
 
-    def test_in_range_shader_emits_no_bounds_check(self):
-        # The same accesses inside a 4 KiB allocation: the wrapped power-of-two path, no check (main's SPIR-V)
+    def test_in_range_shader_is_checked_without_a_branch(self):
+        # The same accesses inside a 4 KiB allocation: no wrap and no branch, each access redirected past the
+        # allocation only when out of range (a dynamic address can be; SHADER-715)
         spv, mem = run_one(["v_mov_b32_e32 v1, 0", "v_mov_b32_e32 v2, 0x5e17", "ds_write_b32 v1, v2",
                             "s_waitcnt lgkmcnt(0)", "ds_read_b32 v5, v1 offset:1020", "ds_read_b32 v6, v1",
                             "s_waitcnt lgkmcnt(0)"] + out(6), 8)
         self.assertEqual(bounds_checks(spv), 0)
         self.assertIsNone(rdna2spirv.translate.last_gen.lds_bound)
-        self.assertEqual(lds_index_ops(spv), {"OpBitwiseAnd"})
+        self.assertEqual(rdna2spirv.translate.last_gen.lds_sink, 1024)
+        self.assertEqual(lds_index_ops(spv), set())
+        self.assertEqual(sink_checks(spv), 3)
         self.assertEqual(mem.get(0), 0x5E17)
 
     def test_native_wave64_full_64k_lds_still_translates(self):
-        # without the flag there is no %x_buf: a 64 KiB LDS is exactly the limit
-        wg = workgroup_bytes(translate(128, emulate=False))
-        self.assertEqual(wg, {"%lds": 65536})
+        # without the flag there is no %x_buf: a 64 KiB LDS is exactly the limit (no room for the sink dword)
+        spv = translate(128, emulate=False)
+        self.assertEqual(workgroup_bytes(spv), {"%lds": 65536})
+        self.assertEqual(bounds_checks(spv), 2)
 
 
 if __name__ == "__main__":

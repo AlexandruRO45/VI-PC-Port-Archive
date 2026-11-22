@@ -275,6 +275,7 @@ class Gen:
         self.lds_need = 0              # CS: dwords the program needs (LDS_SIZE, largest constant offset)
         self.lds_declared = 0          # CS: dwords RSRC2 LDS_SIZE allocates (the hardware allocation, unclipped)
         self.lds_bound = None          # CS: bounds-checked LDS (dwords): out of range reads 0, writes are dropped
+        self.lds_sink = None           # CS: dword past the allocation that out-of-range accesses go to (SHADER-715)
         self.cs = None             # CS: user SGPR count, enabled workgroup ids, thread-id VGPR count, group size
         self.ms = None             # MS: {"maxv", "maxp", "threads"} from PSV0
         self.ms_params = set()     # MS: param export indices used
@@ -3510,13 +3511,41 @@ class Gen:
         self.emit(f"{p} = OpAccessChain %_ptr_WG_uint %lds {m}")
         return p
 
+    def lds_ptr_ok(self, addr, byte_off, bound=None):
+        """(pointer, in-range bool or None) for the LDS dword at (addr + byte_off) / 4. With lds_sink (SHADER-715: a
+        compute shader, whose array is its RSRC2 allocation plus one sink dword) an index at or past `bound` (default
+        the allocation) points at the sink instead, so a store or atomic there changes nothing the program reads;
+        lds_in_range then gives 0 for what it returned. Otherwise this is lds_ptr and the bool is None."""
+        if self.lds_sink is None:
+            return self.lds_ptr(addr, byte_off), None
+        s1, i, ok, j, p = (self.tmp() for _ in range(5))
+        self.emit(f"{s1} = OpIAdd %uint {addr} {self.cu(byte_off)}")
+        self.emit(f"{i} = OpShiftRightLogical %uint {s1} {self.cu(2)}")
+        self.emit(f"{ok} = OpULessThan %bool {i} {self.cu(self.lds_sink if bound is None else bound)}")
+        self.emit(f"{j} = OpSelect %uint {ok} {i} {self.cu(self.lds_sink)}")
+        self.emit(f"{p} = OpAccessChain %_ptr_WG_uint %lds {j}")
+        return p, ok
+
+    def lds_in_range(self, ok, v):
+        """v (a uint an LDS access returned) where lds_ptr_ok's bool `ok` holds, else 0: out of range reads 0."""
+        if ok is None:
+            return v
+        r = self.tmp()
+        self.emit(f"{r} = OpSelect %uint {ok} {v} {self.cu(0)}")
+        return r
+
     def lds_access(self, addr, byte_off, fn, bound=None):
         """One LDS dword access: fn(pointer) emits it and returns its uint result id (a load, an atomic's old value)
-        or None (a store). Without lds_bound this is fn(lds_ptr(...)), the wrapped access shaders always had. With
-        it (SHADER-309: the program reaches past its RSRC2 allocation, or the array was shrunk to it), the dword
-        index is checked: RDNA2 LDS does not wrap, an access outside the allocation reads 0 and its write is dropped
-        (RDNA2 ISA sections 3.6.1 and 3.6.6), so the access runs only in range and the result is 0 otherwise. `bound`
-        (dwords) checks this one access even when lds_bound is unset."""
+        or None (a store). RDNA2 LDS does not wrap: an access outside the allocation reads 0 and its write is
+        dropped (RDNA2 ISA sections 3.6.1 and 3.6.6; measured on gfx1036 in #3817). A compute shader checks every
+        access without a branch (lds_ptr_ok, SHADER-715). With lds_bound instead (SHADER-309: the array was shrunk
+        to the allocation because the sink dword did not fit), the access runs in a branch only when in range and
+        the result is 0 otherwise. Without either (other stages) this is fn(lds_ptr(...)), the wrapped access.
+        `bound` (dwords) checks this one access against a smaller bound, or even when neither is set."""
+        if self.lds_sink is not None:
+            p, ok = self.lds_ptr_ok(addr, byte_off, bound)
+            r = fn(p)
+            return None if r is None else self.lds_in_range(ok, r)
         bound = self.lds_bound if bound is None else bound
         if bound is None:
             return fn(self.lds_ptr(addr, byte_off))
@@ -3552,6 +3581,8 @@ class Gen:
         even in a shader whose other accesses keep the wrapped power-of-two array."""
         if self.lds_bound is not None:
             return self.lds_bound
+        if self.lds_sink is not None:
+            return self.lds_sink
         return min(self.lds_declared, self.lds_dwords) if self.lds_declared else self.lds_dwords
 
     def lds_store(self, addr, byte_off, val):
@@ -3627,11 +3658,11 @@ class Gen:
             self.emit(f"{base} = OpBitwiseAnd %uint {m0} {self.cu(0xFFFF)}")
             self.emit(f"{lane_bytes} = OpShiftLeftLogical %uint {self.wave_lane()} {self.cu(2)}")
             self.emit(f"{addr} = OpIAdd %uint {base} {lane_bytes}")
-            ptr = self.lds_ptr(addr, off)
+            ptr, ok = self.lds_ptr_ok(addr, off)
             if op == "ds_read_addtid_b32":
                 value = self.tmp()
                 self.emit(f"{value} = OpLoad %uint {ptr}")
-                self.dst(a[0], value)
+                self.dst(a[0], self.lds_in_range(ok, value))
             else:
                 self.emit(f"OpStore {ptr} {self.src_u(a[0])}")
         elif op in ("ds_read_b32", "ds_read_b64", "ds_read_b96", "ds_read_b128"):
@@ -3839,7 +3870,7 @@ class Gen:
             # value it read. How the LDS adder treats denormals and NaN payloads is not measured: OpFAdd's IEEE
             # result is what is computed.
             d, ad, dat = (a[0], a[1], a[2]) if rtn else (None, a[0], a[1])
-            p = self.lds_ptr(self.src_u(ad), off)
+            p, ok = self.lds_ptr_ok(self.src_u(ad), off)
             x = self.tof(self.src_u(dat))
             lbl_hdr, lbl_cont, lbl_exit = (self.tmp() + t for t in ("_hdr", "_cont", "_exit"))
             init = self.tmp()
@@ -3860,7 +3891,7 @@ class Gen:
             self.emit(f"OpBranch {lbl_hdr}")
             self.emit(f"{lbl_exit} = OpLabel")
             if d is not None:
-                self.dst(d, cur)
+                self.dst(d, self.lds_in_range(ok, cur))
         elif op in ("ds_cmpst_rtn_b32", "ds_cmpst_b32"):
             # tmp = M[A]; M[A] = (tmp == DATA) ? DATA2 : tmp; the _rtn_ form returns tmp, ds_cmpst_b32 drops it.
             d, ad, cmp_, src = (a[0], a[1], a[2], a[3]) if rtn else (None, a[0], a[1], a[2])
@@ -3880,7 +3911,7 @@ class Gen:
             if dat["k"] != "vgpr" or dat.get("n", 1) != 1 or \
                     (d is not None and (d["k"] != "vgpr" or d.get("n", 1) != 1)):
                 raise Unsupported(op + " operands")
-            p = self.lds_ptr(self.src_u(ad), off)
+            p, ok = self.lds_ptr_ok(self.src_u(ad), off)
             val = self.src_u(dat)
             val_f = None
             if name in ("ds_min_f32", "ds_max_f32"):
@@ -3923,7 +3954,7 @@ class Gen:
             self.emit(f"OpBranch {lbl_hdr}")
             self.emit(f"{lbl_exit} = OpLabel")
             if d is not None:
-                self.dst(d, cur)
+                self.dst(d, self.lds_in_range(ok, cur))
         else:
             raise Unsupported(op)
         self.emit(f"OpBranch {lbl_end}")
@@ -4022,16 +4053,17 @@ class Gen:
 
     def fit_shared_memory(self):
         """SHADER-309: a compute shader's Workgroup memory, the LDS array plus %x_buf, must fit in MAX_SHARED_BYTES
-        (#1721: RADV dies on a module 4 bytes over 64 KiB; the device's own limit is the runtime's check). Called before any code is generated. The LDS array is a
-        power of two at least the program's need; when that plus %x_buf is over the limit but the need still fits,
-        the array shrinks to the RSRC2 allocation and its accesses are bounds-checked (lds_access), as hardware checks
-        them. %x_buf is already sized to the workgroup, so when even the allocation does not fit, assemble refuses
-        the shader."""
+        (#1721: RADV dies on a module 4 bytes over 64 KiB; the device's own limit is the runtime's check). Called before any code is generated. The LDS array is the
+        RSRC2 allocation plus a sink dword (SHADER-715); when that plus %x_buf is over the limit, the sink is dropped
+        and the accesses are bounds-checked with a branch instead (lds_bound, lds_access). %x_buf is already sized to
+        the workgroup, so when even the allocation does not fit, assemble refuses the shader."""
         if not self.cs:
             return
         room = (MAX_SHARED_BYTES - self.x_buf_bytes()) // 4
-        if self.lds_bound is None and self.lds_dwords > room >= max(self.lds_declared, 1):
+        if self.lds_bound is None and self.lds_dwords > room and (self.lds_sink is not None or
+                                                                   room >= max(self.lds_declared, 1)):
             self.lds_dwords = self.lds_bound = self.lds_declared
+            self.lds_sink = None
             self.cu(self.lds_declared)
 
     def x_split(self):
@@ -13752,17 +13784,13 @@ def translate(path):
                     need = max(need, ds_const_extent(ins["op"], k, int(v, 0)))
         g.lds_declared = ((rsrc2 >> 15) & 0x1FF) * 128
         g.lds_need = need
-        if need > g.lds_declared:
-            # SHADER-309: a constant offset reaches past the RSRC2 allocation. RDNA2 reads 0 and drops the write
-            # there instead of wrapping (ISA 3.6.1, 3.6.6), so the array is the allocation and every access is
-            # bounds-checked (lds_access). Shaders that stay inside it keep the wrapped power-of-two array.
-            g.lds_dwords = g.lds_bound = g.lds_declared
-            g.cu(g.lds_bound)
-        else:
-            n = 16
-            while n < need:
-                n *= 2
-            g.lds_dwords = min(n, 16384)
+        # SHADER-309/715: RDNA2 reads 0 and drops the write outside the RSRC2 allocation instead of wrapping (ISA
+        # 3.6.1, 3.6.6), at a constant offset or a dynamic address. The array is the allocation plus one sink dword
+        # that out-of-range accesses are redirected to (lds_ptr_ok); fit_shared_memory drops the sink for branch
+        # checks (lds_bound) when that dword does not fit.
+        g.lds_sink = g.lds_declared
+        g.lds_dwords = g.lds_declared + 1
+        g.cu(g.lds_sink)
         g.cu(max(g.lds_dwords, 1))
         g.cu(max(g.lds_dwords, 1) - 1)
         for i in range(user, user + 3):

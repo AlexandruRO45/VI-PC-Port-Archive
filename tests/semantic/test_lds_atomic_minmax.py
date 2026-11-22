@@ -1152,6 +1152,7 @@ class TestTranslatorIntegration(unittest.TestCase):
                 self.uses_lds = False
                 self.lds_dwords = 256
                 self.lds_bound = None       # not bounds-checked (SHADER-309): the wrapped access
+                self.lds_sink = None
                 self.wave64 = True
                 self._tmp = 0
                 self.emitted = []

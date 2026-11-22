@@ -676,6 +676,7 @@ class TestTranslatorLdsIntegration(unittest.TestCase):
             def __init__(self):
                 self.lds_dwords = 512
                 self.lds_bound = None       # not bounds-checked (SHADER-309)
+                self.lds_sink = None
                 self._tmp = 0
                 self.emitted = []
 
