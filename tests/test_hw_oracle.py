@@ -527,6 +527,27 @@ class OnHardware(unittest.TestCase):
         self.assertIsInstance(rejected, str)
         self.assertIn("rejected", rejected)
 
+    def test_scratch_memory_is_private_per_lane_and_byte_granular(self):
+        # Kernel(scratch=): 32 lanes each store their id at the same scratch address and read it back (private memory:
+        # every lane gets its own), then a dword at an odd address is four consecutive bytes. The HIP runtime allocates
+        # the scratch from the kernel descriptor; the Linux launcher does not support it.
+        if isinstance(self.oracle, drm.DrmOracle):
+            self.skipTest("the Linux launcher refuses kernels with scratch memory")
+        if asm.family(self.oracle.arch) != "gfx10":
+            self.skipTest("the scratch prologue is the GFX10 one")
+        store = "global_store_dword"
+        lines = ["v_lshlrev_b32 v2, 2, v0", "v_or_b32 v3, 0xA0000000, v0", "v_mov_b32 v1, 0x40",
+                 "scratch_store_dword v1, v3, off", "v_mov_b32 v6, 0x04030201", "v_mov_b32 v7, 0x08070605",
+                 "v_mov_b32 v1, 0x80", "scratch_store_dword v1, v6, off", "v_mov_b32 v1, 0x84",
+                 "scratch_store_dword v1, v7, off", "s_waitcnt_vscnt null, 0x0", "v_mov_b32 v1, 0x40",
+                 "scratch_load_dword v4, v1, off", "v_mov_b32 v1, 0x82", "scratch_load_dword v5, v1, off",
+                 "s_waitcnt vmcnt(0)", f"{store} v2, v4, s[2:3]", "v_add_nc_u32 v2, 128, v2", f"{store} v2, v5, s[2:3]",
+                 "s_endpgm"]
+        got = self.oracle.run([asm.Kernel(lines, wave=32, threads=32, words=64, raw=True, scratch=256, vgprs=64)],
+                              words=64)[0]
+        self.assertEqual(got[:32], [0xA0000000 | lane for lane in range(32)])
+        self.assertEqual(got[32:], [0x06050403] * 32)         # bytes 0x82..0x85 of 01 02 03 04 05 06 07 08
+
 
 class KernelResources(unittest.TestCase):
     """Kernel(vgprs=, sgprs=): the register counts reach the descriptor and the metadata; no hardware needed."""
@@ -542,6 +563,30 @@ class KernelResources(unittest.TestCase):
         self.assertIn(".amdhsa_next_free_vgpr 32", text)      # the second kernel keeps the defaults
         self.assertIn(".amdhsa_next_free_sgpr 40", text)
         self.assertEqual(names, ["k0", "k1"])
+
+    def test_scratch_reaches_the_descriptor_prologue_and_metadata(self):
+        k = asm.Kernel(["s_endpgm"], raw=True, scratch=512)
+        text, names, _ = asm.module_text([k, asm.Kernel(["s_endpgm"], raw=True)], "gfx1030")
+        self.assertIn(".amdhsa_private_segment_fixed_size 512", text)
+        self.assertIn(".amdhsa_user_sgpr_flat_scratch_init 1", text)
+        self.assertIn(".amdhsa_system_sgpr_private_segment_wavefront_offset 1", text)
+        self.assertIn(".private_segment_fixed_size: 512", text)
+        self.assertEqual(text.count(".private_segment_fixed_size: 0"), 1)     # the second kernel asks for none
+        self.assertEqual(text.count(".amdhsa_private_segment_fixed_size"), 1)
+        # the init in s[2:3] is kept in s[6:7] before the output pointer replaces it, then FLAT_SCR is set from it
+        for line in ("s_mov_b64 s[6:7], s[2:3]", "s_load_dwordx2 s[2:3], s[0:1], 0x0", "s_add_u32 s6, s6, s4",
+                     "s_addc_u32 s7, s7, 0", "s_setreg_b32 hwreg(HW_REG_FLAT_SCR_LO), s6",
+                     "s_setreg_b32 hwreg(HW_REG_FLAT_SCR_HI), s7"):
+            self.assertIn(line, text)
+        self.assertLess(text.index("s_mov_b64 s[6:7], s[2:3]"), text.index("s_load_dwordx2 s[2:3]"))
+
+    def test_scratch_is_for_raw_gfx10_kernels(self):
+        with self.assertRaises(ValueError):
+            asm.Kernel(["s_endpgm"], raw=False, scratch=64)
+        with self.assertRaises(ValueError):
+            asm.Kernel(["s_endpgm"], raw=True, scratch=6)
+        with self.assertRaises(ValueError):
+            asm.module_text([asm.Kernel(["s_endpgm"], raw=True, scratch=64)], "gfx1150")
 
 
 if __name__ == "__main__":

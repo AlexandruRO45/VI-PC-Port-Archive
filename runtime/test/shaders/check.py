@@ -84,7 +84,7 @@ WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm
                 "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop", "cs_w32_lds_u8_d16", "cs_bpermute32",
                 "cs_w32_partial_scmp", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext",
                 "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst",
-                "cs_mask_vgpr_exec", "cs_w32_scratch")
+                "cs_mask_vgpr_exec", "cs_w32_scratch", "cs_w32_scratch_unaligned")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
 # narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is. They run with
 # 32 lanes requested (WAVE32_LANE_ENV), as run_gpu_tests.py does: a device with a range like 8..32 (Intel ANV) may
@@ -92,7 +92,7 @@ WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm
 WAVE32_LANE_ENV = {"VKC_SUBGROUP_SIZE": "32"}
 WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute", "cs_bpermute32", "cs_w32_partial_scmp", "cs_exec_const",
                      "cs_w32_mask_imm", "cs_lds_b64_cmpst", "cs_mask_vgpr_exec",
-                     "cs_w32_scratch")
+                     "cs_w32_scratch", "cs_w32_scratch_unaligned")
 CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
           ("cs_dpp_row", [0, 0, 1, 2, 3, 4, 5, 6]),
           ("cs_dpp_mask", [1, 0, 3, 2, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee]),
@@ -125,6 +125,7 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
                                   0xCCCC000C, 0x44440004, 0xBBBB000B, 0x3579BADC]),
             # scratch_load_* / scratch_store_* (cs_w32_scratch.asm header)
             ("cs_w32_scratch", [0x00000020, 0x05060708, 0x090A0B0C, 0x1111AB11, 0xBEEF0000, 0xFFFFFFAB, 0x0000BEEF, 0xFFFFBEEF]),
+            ("cs_w32_scratch_unaligned", [0x85848382, 0x94939291, 0x00008483, 0xBBCCDDC0, 0xC7C6C5AA, 0x1111D1D0, 0x22221111, 0xDBDA2222]),
             # constant EXEC: each lane takes its own bit (Intel got 16-bit constants wrong for lanes 16-31)
             ("cs_exec_const", [16, 8, 2, 16, 0, 16]),
             # a constant lane mask (saveexec, wrexec, s_and/s_not/s_mov_b64 into EXEC or VCC) gives lane L its bit L,

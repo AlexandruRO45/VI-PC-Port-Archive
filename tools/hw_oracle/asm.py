@@ -76,11 +76,20 @@ class Kernel:
     ModeUnavailable while the denormal and rounding fields still work.
     lds: bytes of LDS the kernel allocates (.amdhsa_group_segment_fixed_size and the metadata's
     .group_segment_fixed_size; without it the hardware gives the group no LDS); vgprs, sgprs: registers the kernel uses
-    (default 32 and 40)."""
+    (default 32 and 40).
+    scratch: bytes of private (scratch) memory each lane gets, GFX10 raw kernels only. The kernel descriptor asks the
+    runtime for it (.amdhsa_private_segment_fixed_size and the metadata's .private_segment_fixed_size), the prologue
+    keeps the flat-scratch init the hardware passes in s[2:3] and programs FLAT_SCR from it and from the wave's scratch
+    offset (s4), as AMD clang's own GFX10 prologue does, so scratch_* instructions work in the body. The body must
+    leave s[4:7] alone before the first scratch access and finds the output pointer in s[2:3] as usual."""
 
-    def __init__(self, lines, wave=32, threads=1, words=4, raw=False, mode=None, lds=0, vgprs=32, sgprs=40):
+    def __init__(self, lines, wave=32, threads=1, words=4, raw=False, mode=None, lds=0, vgprs=32, sgprs=40, scratch=0):
         self.lines, self.wave, self.threads, self.words, self.raw = list(lines), wave, threads, words, raw
-        self.lds, self.vgprs, self.sgprs = lds, vgprs, sgprs
+        self.lds, self.vgprs, self.sgprs, self.scratch = lds, vgprs, sgprs, scratch
+        if not 0 <= scratch <= 65536 or scratch % 4:
+            raise ValueError(f"scratch size {scratch} is not a multiple of 4 in 0..65536")
+        if scratch and not raw:
+            raise ValueError("scratch needs a raw kernel")
         if not 0 <= lds <= 65536 or lds % 4:
             raise ValueError(f"LDS size {lds} is not a multiple of 4 in 0..65536")
         if not 1 <= vgprs <= 256:
@@ -141,7 +150,7 @@ def gfx10_spelling(line):
     return _GFX10_NAMES.get(op, op) + sep + rest
 
 
-def raw_kernel_text(name, lines, arch, wave=32, mode=None, lds=0, vgprs=32, sgprs=40):
+def raw_kernel_text(name, lines, arch, wave=32, mode=None, lds=0, vgprs=32, sgprs=40, scratch=0):
     """A kernel whose body does its own stores. s[0:1] is the kernarg pointer, s[2:3] gets the output pointer."""
     fam = family(arch)
     if int(arch[3:], 16) >= 0x1170:
@@ -157,12 +166,23 @@ def raw_kernel_text(name, lines, arch, wave=32, mode=None, lds=0, vgprs=32, sgpr
     if fam == "gfx10":
         lines = [gfx10_spelling(ln) for ln in lines]
     body = "\n".join("  " + ln for ln in lines)
+    if scratch and fam != "gfx10":
+        raise ValueError("scratch kernels are written for GFX10 (GFX11 has architected flat scratch)")
+    if scratch:
+        # user SGPRs: s[0:1] kernarg pointer, s[2:3] flat-scratch init; system SGPR s4 = this wave's scratch offset
+        prologue = (f"  s_mov_b64 s[6:7], s[2:3]\n  {load} s[2:3], s[0:1], 0x0\n  s_add_u32 s6, s6, s4\n"
+                    "  s_addc_u32 s7, s7, 0\n  s_setreg_b32 hwreg(HW_REG_FLAT_SCR_LO), s6\n"
+                    "  s_setreg_b32 hwreg(HW_REG_FLAT_SCR_HI), s7\n  s_waitcnt lgkmcnt(0)")
+        sgpr_setup = (f"\n  .amdhsa_user_sgpr_flat_scratch_init 1\n  .amdhsa_private_segment_fixed_size {scratch}"
+                      "\n  .amdhsa_system_sgpr_private_segment_wavefront_offset 1")
+    else:
+        prologue = f"  {load} s[2:3], s[0:1], 0x0\n  s_waitcnt lgkmcnt(0)"
+        sgpr_setup = ""
     return f""".globl {name}
 .p2align 8
 .type {name},@function
 {name}:
-  {load} s[2:3], s[0:1], 0x0
-  s_waitcnt lgkmcnt(0)
+{prologue}
 {body}
 .rodata
 .p2align 6
@@ -172,7 +192,7 @@ def raw_kernel_text(name, lines, arch, wave=32, mode=None, lds=0, vgprs=32, sgpr
   .amdhsa_next_free_sgpr {sgprs}
   .amdhsa_group_segment_fixed_size {lds}
   .amdhsa_wavefront_size32 {1 if wave == 32 else 0}
-  .amdhsa_system_vgpr_workitem_id 0{modes}
+  .amdhsa_system_vgpr_workitem_id 0{sgpr_setup}{modes}
 .end_amdhsa_kernel
 .text
 """
@@ -208,14 +228,15 @@ def kernel_text(name, lines, arch):
 """
 
 
-def metadata(names, wave=32, lds=None, vgprs=None, sgprs=None):
+def metadata(names, wave=32, lds=None, vgprs=None, sgprs=None, scratch=None):
     """The HSA metadata block. Without it the HIP runtime fails the load with hipErrorNoBinaryForGpu (209).
-    lds / vgprs / sgprs: per kernel (lists as long as names); default 0 bytes of LDS, 32 VGPRs and 40 SGPRs."""
+    lds / vgprs / sgprs / scratch: per kernel (lists as long as names); default 0 bytes of LDS, 32 VGPRs, 40 SGPRs
+    and no scratch."""
     out = [".amdgpu_metadata", "---", "amdhsa.version: [1, 2]", "amdhsa.kernels:"]
     for i, n in enumerate(names):
         out += [f"  - .name: {n}", f"    .symbol: {n}.kd", "    .args:",
                 "      - {.offset: 0, .size: 8, .value_kind: global_buffer, .address_space: global}",
-                f"    .group_segment_fixed_size: {lds[i] if lds else 0}", "    .private_segment_fixed_size: 0",
+                f"    .group_segment_fixed_size: {lds[i] if lds else 0}", f"    .private_segment_fixed_size: {scratch[i] if scratch else 0}",
                 "    .kernarg_segment_align: 8", "    .kernarg_segment_size: 8", "    .max_flat_workgroup_size: 1024",
                 f"    .sgpr_count: {sgprs[i] if sgprs else 40}", f"    .vgpr_count: {vgprs[i] if vgprs else 32}", f"    .wavefront_size: {wave}"]
     out.append(".end_amdgpu_metadata")
@@ -226,14 +247,15 @@ def module_text(programs, arch, prefix="k", wave=32):
     """(assembly text, kernel names, first source line of each kernel) for a list of programs. A program is a list
     of lines (wrapped as a scalar test) or a Kernel."""
     parts = [f'.amdgcn_target "amdgcn-amd-amdhsa--{arch}"', ".text"]
-    names, starts, line_no, lds, vgprs, sgprs = [], [], 2, [], [], []
+    names, starts, line_no, lds, vgprs, sgprs, scratch = [], [], 2, [], [], [], []
     for i, prog in enumerate(programs):
         name = f"{prefix}{i}"
         lds.append(prog.lds if isinstance(prog, Kernel) else 0)
         vgprs.append(prog.vgprs if isinstance(prog, Kernel) else 32)
         sgprs.append(prog.sgprs if isinstance(prog, Kernel) else 40)
+        scratch.append(prog.scratch if isinstance(prog, Kernel) else 0)
         if isinstance(prog, Kernel):
-            text = (raw_kernel_text(name, prog.lines, arch, prog.wave, prog.mode, prog.lds, prog.vgprs, prog.sgprs) if prog.raw
+            text = (raw_kernel_text(name, prog.lines, arch, prog.wave, prog.mode, prog.lds, prog.vgprs, prog.sgprs, prog.scratch) if prog.raw
                     else kernel_text(name, prog.lines, arch))
         else:
             text = kernel_text(name, prog, arch)
@@ -241,7 +263,7 @@ def module_text(programs, arch, prefix="k", wave=32):
         starts.append(line_no + 1)
         parts.append(text.rstrip("\n"))
         line_no += text.count("\n") + 0
-    parts.append(metadata(names, wave, lds, vgprs, sgprs).rstrip("\n"))
+    parts.append(metadata(names, wave, lds, vgprs, sgprs, scratch).rstrip("\n"))
     return "\n".join(parts) + "\n", names, starts
 
 

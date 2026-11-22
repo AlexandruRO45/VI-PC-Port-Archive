@@ -222,6 +222,12 @@ through the kernel driver (`libdrm_amdgpu`), so nothing sits between the instruc
     a sum on the hardware.
   - A descriptor that asks for something the launcher does not provide (LDS, scratch memory, more than the
     kernarg pointer in the user SGPRs) is refused instead of being run differently.
+  - The Windows (HIP) launcher does give a raw GFX10 kernel scratch memory: `asm.Kernel(..., scratch=BYTES)` writes
+    the private segment size into the descriptor and the metadata, asks for the flat-scratch init and the wave's
+    scratch offset in the user and system SGPRs, and starts the body after the usual FLAT_SCR setup (the init is
+    kept in s[6:7], the output pointer is in s[2:3] as for every raw kernel, s[4:7] are the body's to leave alone
+    until its first `scratch_*`). The runtime allocates what the descriptor asks for, but a lane could use at least
+    8 KiB with 4 bytes declared (see the `scratch_*` row of `docs/design.md`). The Linux launcher still refuses it.
   - Every submission gets command memory of its own. While one buffer was rewritten in place, the second kernel of
     a process ran the first one's commands, every time; `tests/test_hw_oracle.py` runs 300 distinct kernels to
     catch that.

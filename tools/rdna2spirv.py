@@ -2298,6 +2298,8 @@ class Gen:
             inst -= 0x1000            # the raw 12-bit field, as for global_*
         if not -0x800 <= inst <= 0x7FF:
             raise Unsupported(f"{op} offset:{inst}")
+        if vaddr["k"] != "special" and saddr["k"] != "special":
+            raise Unsupported(op + ": vaddr and saddr together (the assembler rejects it for GFX10)")
         parts = []
         for x, kind in ((vaddr, "vgpr"), (saddr, "sgpr")):
             if x["k"] == "special" and x["t"] == "off":
@@ -2319,10 +2321,10 @@ class Gen:
     def scratch_mem(self, op, a, mods):
         """scratch_load_* / scratch_store_* [vdata,] vaddr|off, saddr|off offset:N: the lane's own private memory,
         a Private array of SCRATCH_DWORDS dwords in each invocation (zero at the start). Dword, 2-, 3- and 4-dword
-        accesses are dword aligned (the low two address bits are dropped); byte and short accesses (zero or sign
-        extending loads, the `_d16` loads that fill one half of vdst, `_d16_hi` stores) go one byte at a time, so a
-        short can sit across a dword. A store past the array is dropped and a load past it reads 0: the hardware's
-        behaviour there is not measured. Inactive lanes neither store nor load (a load keeps vdst)."""
+        accesses may start at any byte address (measured on gfx1036: the bytes are consecutive, across dword
+        boundaries); byte and short accesses (zero or sign extending loads, the `_d16` loads that fill one half of
+        vdst, `_d16_hi` stores) go one byte at a time, so a short can sit across a dword. A store past the array is dropped and a load past it reads 0; the hardware has
+        no bound at the declared scratch size (measured to 8 KiB per lane), this array stops at 1 KiB. Inactive lanes neither store nor load (a load keeps vdst)."""
         if any(m in mods for m in ("lds", "tfe")):
             raise Unsupported(op + " form")
         load = op.startswith("scratch_load")
@@ -2362,22 +2364,53 @@ class Gen:
         self.emit(f"OpBranchConditional {act} {lbl_do} {lbl_end}")
         self.emit(f"{lbl_do} = OpLabel")
         new = []
-        if nbytes == 4:                                    # whole dwords
+        if nbytes == 4:                                    # whole dwords, at any byte address
             for i in range(n):
-                p, _, inr = word(addr, i)
+                p0, sh, in0 = word(addr, i)
+                p1, _, in1 = word(addr, i + 1)             # the dword after it, for an address that is not 4-aligned
+                inv, = (self.tmp(),)
+                self.emit(f"{inv} = OpISub %uint {self.cu(31)} {sh}")   # 31 - shift: (x << 1) << (31 - s) is x << (32 - s)
                 if store:
                     v = self.load_reg("vgpr", data["r"] + i)
+                    m_lo, n_lo, o0, k0, w0, vs0, nw0 = (self.tmp() for _ in range(7))
                     self.emit(f"OpSelectionMerge {lbl_end}_s{i} None")
-                    self.emit(f"OpBranchConditional {inr} {lbl_end}_w{i} {lbl_end}_s{i}")
+                    self.emit(f"OpBranchConditional {in0} {lbl_end}_w{i} {lbl_end}_s{i}")
                     self.emit(f"{lbl_end}_w{i} = OpLabel")
-                    self.emit(f"OpStore {p} {v}")
+                    self.emit(f"{m_lo} = OpShiftLeftLogical %uint {self.cu(0xFFFFFFFF)} {sh}")
+                    self.emit(f"{n_lo} = OpNot %uint {m_lo}")
+                    self.emit(f"{o0} = OpLoad %uint {p0}")
+                    self.emit(f"{k0} = OpBitwiseAnd %uint {o0} {n_lo}")
+                    self.emit(f"{vs0} = OpShiftLeftLogical %uint {v} {sh}")
+                    self.emit(f"{nw0} = OpBitwiseOr %uint {k0} {vs0}")
+                    self.emit(f"OpStore {p0} {nw0}")
                     self.emit(f"OpBranch {lbl_end}_s{i}")
                     self.emit(f"{lbl_end}_s{i} = OpLabel")
+                    h_msk, h_n, o1, k1, v1a, v1b, nw1 = (self.tmp() for _ in range(7))
+                    self.emit(f"OpSelectionMerge {lbl_end}_t{i} None")
+                    self.emit(f"OpBranchConditional {in1} {lbl_end}_x{i} {lbl_end}_t{i}")
+                    self.emit(f"{lbl_end}_x{i} = OpLabel")
+                    hm = self.tmp()
+                    self.emit(f"{hm} = OpShiftRightLogical %uint {self.cu(0x7FFFFFFF)} {inv}")   # (1 << sh) - 1
+                    self.emit(f"{h_n} = OpNot %uint {hm}")
+                    self.emit(f"{o1} = OpLoad %uint {p1}")
+                    self.emit(f"{k1} = OpBitwiseAnd %uint {o1} {h_n}")
+                    self.emit(f"{v1a} = OpShiftRightLogical %uint {v} {self.cu(1)}")
+                    self.emit(f"{v1b} = OpShiftRightLogical %uint {v1a} {inv}")                 # the bytes of v past this dword
+                    self.emit(f"{nw1} = OpBitwiseOr %uint {k1} {v1b}")
+                    self.emit(f"OpStore {p1} {nw1}")
+                    self.emit(f"OpBranch {lbl_end}_t{i}")
+                    self.emit(f"{lbl_end}_t{i} = OpLabel")
                 else:
-                    v, z = self.tmp(), self.tmp()
-                    self.emit(f"{v} = OpLoad %uint {p}")
-                    self.emit(f"{z} = OpSelect %uint {inr} {v} {self.cu(0)}")
-                    new.append(z)
+                    l0, l1, z0, z1, a1, h1, b1, val = (self.tmp() for _ in range(8))
+                    self.emit(f"{l0} = OpLoad %uint {p0}")
+                    self.emit(f"{z0} = OpSelect %uint {in0} {l0} {self.cu(0)}")
+                    self.emit(f"{l1} = OpLoad %uint {p1}")
+                    self.emit(f"{z1} = OpSelect %uint {in1} {l1} {self.cu(0)}")
+                    self.emit(f"{a1} = OpShiftRightLogical %uint {z0} {sh}")
+                    self.emit(f"{h1} = OpShiftLeftLogical %uint {z1} {self.cu(1)}")
+                    self.emit(f"{b1} = OpShiftLeftLogical %uint {h1} {inv}")
+                    self.emit(f"{val} = OpBitwiseOr %uint {a1} {b1}")
+                    new.append(val)
         else:                                              # bytes, one at a time
             value = None
             for k in range(nbytes):

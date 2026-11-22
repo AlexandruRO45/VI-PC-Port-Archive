@@ -48,7 +48,7 @@ class Scratch(unittest.TestCase):
                    "scratch_store_dword off, v2, s5 offset:4",              # saddr + offset: 0x14
                    "scratch_load_dword v10, off, s5 offset:16",             # saddr + offset: 0x20
                    "v_mov_b32_e32 v3, 0x14", "scratch_load_dword v11, v3, off",
-                   "scratch_load_dword v12, v3, s5 offset:-16",              # vaddr + saddr + offset: 0x14
+                   "scratch_load_dword v12, off, off offset:20",             # the instruction offset alone: 0x14
                    "s_waitcnt vmcnt(0)"], [10, 11, 12])
         self.assertEqual(got, [0xAAAA5555, 0xAAAA5555, 0xAAAA5555])
 
@@ -63,6 +63,23 @@ class Scratch(unittest.TestCase):
         # 0x11111111, byte 0x21 = 0xAB -> 0x1111AB11, short 0x22 = 0xBEEF -> 0xBEEFAB11, byte 0x23 = 0x34 (bits 23:16 of
         # 0x12345678) -> 0x34EFAB11
         self.assertEqual(got, [0x34EFAB11, 0xAB, 0xFFFFFFAB, 0x34EF, 0x34EF])
+
+    def test_unaligned_accesses_are_byte_granular(self):
+        # measured on gfx1036: a dword at an odd address is the four consecutive bytes, across the dword boundary
+        fill = []
+        for i in range(8):
+            w = sum(((0x80 + 4 * i + k) & 0xFF) << (8 * k) for k in range(4))
+            fill += [f"v_mov_b32_e32 v1, {4 * i}", f"v_mov_b32_e32 v3, {w:#x}", "scratch_store_dword v1, v3, off"]
+        got = run(fill + ["v_mov_b32_e32 v1, 2", "scratch_load_dword v10, v1, off", "v_mov_b32_e32 v1, 0x11",
+                          "scratch_load_dword v11, v1, off", "v_mov_b32_e32 v1, 3", "scratch_load_ushort v12, v1, off",
+                          "v_mov_b32_e32 v1, 0x41", "v_mov_b32_e32 v4, 0xaabbccdd", "scratch_store_dword v1, v4, off",
+                          "v_mov_b32_e32 v1, 0x52", "v_mov_b32_e32 v6, 0x11111111", "v_mov_b32_e32 v7, 0x22222222",
+                          "scratch_store_dwordx2 v1, v[6:7], off", "v_mov_b32_e32 v1, 0x40", "scratch_load_dword v13, v1, off",
+                          "v_mov_b32_e32 v1, 0x44", "scratch_load_dword v14, v1, off", "v_mov_b32_e32 v1, 0x50",
+                          "scratch_load_dword v15, v1, off", "v_mov_b32_e32 v1, 0x54", "scratch_load_dword v16, v1, off",
+                          "s_waitcnt vmcnt(0)"], [10, 11, 12, 13, 14, 15, 16])
+        # fill byte k = 0x80 + k; the stores go into zeroed memory
+        self.assertEqual(got, [0x85848382, 0x94939291, 0x8483, 0xBBCCDD00, 0x000000AA, 0x11110000, 0x22221111])
 
     def test_d16_forms_keep_the_other_half(self):
         got = run(["v_mov_b32_e32 v1, 0x40", "v_mov_b32_e32 v2, 0x8081f2f3", "scratch_store_dword v1, v2, off",
@@ -90,13 +107,18 @@ class Scratch(unittest.TestCase):
 
     def test_refused_forms(self):
         for line in ("scratch_load_dword v1, v2, off offset:4096", "scratch_load_dword v1, v2, off lds",
-                     "scratch_load_dword v1, v[2:3], off", "scratch_load_dword v1, v2, s[2:3]"):
+                     "scratch_load_dword v1, v[2:3], off", "scratch_load_dword v1, v2, s[2:3]",
+                     "scratch_load_dword v1, v2, s5"):         # vaddr and saddr together: the assembler rejects it
             with self.subTest(line=line), self.assertRaises(rdna2spirv.Unsupported):
                 run_listing(["v_mov_b32_e32 v2, 0", line])
 
 
-NAME = "cs_w32_scratch"
-GPU = [0x20, 0x05060708, 0x090A0B0C, 0x1111AB11, 0xBEEF0000, 0xFFFFFFAB, 0x0000BEEF, 0xFFFFBEEF]
+GPU_WORDS = {
+    "cs_w32_scratch": [0x20, 0x05060708, 0x090A0B0C, 0x1111AB11, 0xBEEF0000, 0xFFFFFFAB, 0x0000BEEF, 0xFFFFBEEF],
+    # measured on gfx1036: unaligned dwords are byte granular
+    "cs_w32_scratch_unaligned": [0x85848382, 0x94939291, 0x00008483, 0xBBCCDDC0, 0xC7C6C5AA, 0x1111D1D0, 0x22221111,
+                                 0xDBDA2222],
+}
 
 
 class ScratchFixture(unittest.TestCase):
@@ -104,26 +126,30 @@ class ScratchFixture(unittest.TestCase):
         for rel in (("runtime", "test", "shaders", "check.py"), ("scripts", "run_gpu_tests.py")):
             with open(os.path.join(support.ROOT, *rel), encoding="utf-8") as f:
                 text = f.read()
-            m = re.search(r'"%s"\)?[,:]\s*\[([^\]]*)\]' % NAME, text)
-            with self.subTest(file="/".join(rel)):
-                self.assertIsNotNone(m)
-                self.assertEqual([int(v, 0) for v in m.group(1).split(",")], GPU)
+            for name, want in GPU_WORDS.items():
+                m = re.search(r'"%s"\)?[,:]\s*\[([^\]]*)\]' % name, text)
+                with self.subTest(file="/".join(rel), shader=name):
+                    self.assertIsNotNone(m)
+                    self.assertEqual([int(v, 0) for v in m.group(1).split(",")], want)
 
-    def test_translated_shader_lane0(self):
-        # One lane: out[0] counts the lanes that read their own value back, which is 1 here; the rest is lane 0's.
+    def test_translated_shaders_lane0(self):
+        # One lane: out[0] of cs_w32_scratch counts the lanes that read their own value back, which is 1 here; the rest
+        # is lane 0's.
         shaders = os.path.join(support.ROOT, "runtime", "test", "shaders")
         sys.path.insert(0, shaders)
         from compute_fixture import compute_header
-        header = compute_header(os.path.join(shaders, NAME + ".asm"))
-        with open(os.path.join(support.ROOT, "tests", "semantic", "fixtures", "disasm", NAME + ".s"),
-                  encoding="utf-8") as f:
-            lines = [ln for ln in f.read().splitlines()[1:] if ln.strip() and ln.strip() != "s_barrier"]
-        spv = support.translate_lines(NAME, lines, fssm=bytes(header))
-        memory = {a: 0xEEEEEEEE for a in range(0, 0x100, 4)}
-        si.run_workgroup(spv, 1, 32, inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
-                         push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28, memory=memory)
-        want = [1] + GPU[1:]
-        self.assertEqual([f"{memory[4 * i]:#010x}" for i in range(8)], [f"{w:#010x}" for w in want])
+        for name, gpu in GPU_WORDS.items():
+            header = compute_header(os.path.join(shaders, name + ".asm"))
+            with open(os.path.join(support.ROOT, "tests", "semantic", "fixtures", "disasm", name + ".s"),
+                      encoding="utf-8") as f:
+                lines = [ln for ln in f.read().splitlines()[1:] if ln.strip() and ln.strip() != "s_barrier"]
+            with self.subTest(shader=name):
+                spv = support.translate_lines(name, lines, fssm=bytes(header))
+                memory = {a: 0xEEEEEEEE for a in range(0, 0x100, 4)}
+                si.run_workgroup(spv, 1, 32, inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+                                 push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28, memory=memory)
+                want = [1] + gpu[1:] if name == "cs_w32_scratch" else gpu
+                self.assertEqual([f"{memory[4 * i]:#010x}" for i in range(8)], [f"{w:#010x}" for w in want])
 
 
 if __name__ == "__main__":

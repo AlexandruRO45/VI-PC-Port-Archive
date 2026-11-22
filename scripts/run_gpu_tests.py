@@ -895,7 +895,7 @@ def run_suite(a, work: str) -> int:
                       "cs_bpermute32", "cs_w64x_partial_scmp", "cs_w32_partial_scmp", "cs_barrier_early_end",
                       "cs_barrier_loop", "cs_w64x_andn2_exec", "cs_w64x_saveexec_b64", "cs_lds_b64_cmpst",
                       "cs_mask_vgpr_exec",
-                      "cs_w32_scratch"):
+                      "cs_w32_scratch", "cs_w32_scratch_unaligned"):
             cs_dump_wants = {
                 "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800, 0x40FF8000, 0x3FF00000],
                 # base + soffset + imm (cs_smem_soffset_imm.asm); out[4..7] are seeds the shader leaves alone
@@ -922,6 +922,7 @@ def run_suite(a, work: str) -> int:
                                      0xCCCC000C, 0x44440004, 0xBBBB000B, 0x3579BADC],
                 # scratch_load_* / scratch_store_* (cs_w32_scratch.asm header)
                 "cs_w32_scratch": [0x00000020, 0x05060708, 0x090A0B0C, 0x1111AB11, 0xBEEF0000, 0xFFFFFFAB, 0x0000BEEF, 0xFFFFBEEF],
+                "cs_w32_scratch_unaligned": [0x85848382, 0x94939291, 0x00008483, 0xBBCCDDC0, 0xC7C6C5AA, 0x1111D1D0, 0x22221111, 0xDBDA2222],
                 # constant EXEC masks (cs_exec_const.asm): each lane takes its own bit of the constant
                 "cs_exec_const": [16, 8, 2, 16, 0, 16],
                 # constant lane masks: lane L takes bit L (cs_w32_mask_imm.asm / cs_w64_mask_imm.asm headers)
@@ -998,7 +999,7 @@ def run_suite(a, work: str) -> int:
                                   "cs_w32_lds_u8_d16", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops",
                                   "cs_bpermute32", "cs_w32_partial_scmp", "cs_w32_sincos",
                                   "cs_lds_b64_cmpst", "cs_exec_const", "cs_w32_mask_imm", "cs_mask_vgpr_exec",
-                                  "cs_w32_scratch",
+                                  "cs_w32_scratch", "cs_w32_scratch_unaligned",
                                   "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8",
                                   "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi") and not emulated and not partial
             if partial and not emulated:
@@ -1014,7 +1015,7 @@ def run_suite(a, work: str) -> int:
                 ok, detail = judge_cs_dump(rc, msg, want, wave64=wave64, partial=partial, emulated=emulated,
                                            hexwords=name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lds_u8_d16",
                                                              "cs_lds_b64_cmpst", "cs_signed_zero_nan",
-                                                             "cs_w32_scratch"))
+                                                             "cs_w32_scratch", "cs_w32_scratch_unaligned"))
                 if ok and None in want:
                     unjudged = ", ".join(str(i) for i, w in enumerate(want) if w is None)
                     detail += f" (words {unjudged} not judged on this device: UNJUDGED_WORDS in check.py)"
