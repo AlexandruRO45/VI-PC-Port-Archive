@@ -1124,5 +1124,184 @@ class TestBufferAtomicSmaxX2Aliasing(unittest.TestCase):
             self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 1), 0)
 
 
+# ---------------------------------------------------------------------------
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class AtomicSmaxX2Flags:
+    """Architectural condition codes and status flags for buffer_atomic_smax_x2."""
+    zero: bool
+    negative: bool
+    diff: int
+    borrow: bool
+    carry: bool
+    overflow: bool
+    unaligned_addr: bool
+    out_of_bounds: bool
+    operand_was_larger: bool
+
+
+def evaluate_smax_x2_flags(
+    old_val: int,
+    smax_val: int,
+    eff_addr: int,
+    num_records: int,
+) -> AtomicSmaxX2Flags:
+    """Evaluate condition codes, status flags, and arithmetic carry/borrow for 64-bit smax."""
+    u_old = old_val & MASK64
+    u_smax = smax_val & MASK64
+
+    # Zero flag: returned 64-bit value is zero
+    zero = (u_old == 0)
+
+    # Negative flag: MSB (bit 63) is set
+    negative = bool(u_old & SIGN_BIT64)
+
+    # Unsigned difference and borrow
+    diff = (u_old - u_smax) & MASK64
+    borrow = u_old < u_smax
+
+    # Carry generation on 64-bit addition
+    carry = (u_old + u_smax) > MASK64
+
+    # Signed comparison overflow for (s64(old_val) - s64(smax_val))
+    s_old = s64(u_old)
+    s_smax = s64(u_smax)
+    s_diff = s_old - s_smax
+    overflow = s_diff < -0x8000000000000000 or s_diff > 0x7FFFFFFFFFFFFFFF
+
+    # Unaligned address check (low 3 bits must be zero for 8-byte dword alignment)
+    unaligned = bool(eff_addr & 0x7)
+
+    # Bounds check against descriptor limit for 8 bytes
+    oob = (eff_addr + 8) > num_records
+
+    # Signed comparison predicate
+    op_larger = s_smax > s_old
+
+    return AtomicSmaxX2Flags(
+        zero=zero,
+        negative=negative,
+        diff=diff,
+        borrow=borrow,
+        carry=carry,
+        overflow=overflow,
+        unaligned_addr=unaligned,
+        out_of_bounds=oob,
+        operand_was_larger=op_larger,
+    )
+
+
+class TestBufferAtomicSmaxX2Flags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def test_zero_flag_on_zero_return(self) -> None:
+        flags = evaluate_smax_x2_flags(
+            old_val=0,
+            smax_val=100,
+            eff_addr=0x100,
+            num_records=1024,
+        )
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertTrue(flags.borrow)
+        self.assertTrue(flags.operand_was_larger)
+        self.assertFalse(flags.unaligned_addr)
+        self.assertFalse(flags.out_of_bounds)
+
+    def test_negative_flag_when_msb_set(self) -> None:
+        flags = evaluate_smax_x2_flags(
+            old_val=u64(-10),
+            smax_val=10,
+            eff_addr=0x200,
+            num_records=1024,
+        )
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.negative)
+        self.assertTrue(flags.operand_was_larger)
+
+    def test_operand_not_larger(self) -> None:
+        flags = evaluate_smax_x2_flags(
+            old_val=50,
+            smax_val=20,
+            eff_addr=0x300,
+            num_records=1024,
+        )
+        self.assertFalse(flags.operand_was_larger)
+
+    def test_borrow_generation(self) -> None:
+        flags = evaluate_smax_x2_flags(
+            old_val=100,
+            smax_val=250,
+            eff_addr=0x300,
+            num_records=1024,
+        )
+        self.assertTrue(flags.borrow)
+        self.assertEqual(flags.diff, (100 - 250) & MASK64)
+
+    def test_signed_overflow_flag(self) -> None:
+        # s_old = max positive 64-bit int, s_smax = -10
+        flags = evaluate_smax_x2_flags(
+            old_val=0x7FFFFFFFFFFFFFFF,
+            smax_val=u64(-10),
+            eff_addr=0x100,
+            num_records=1024,
+        )
+        self.assertTrue(flags.overflow)
+
+    def test_unaligned_8byte_address_detection(self) -> None:
+        flags_unaligned = evaluate_smax_x2_flags(
+            old_val=0,
+            smax_val=0,
+            eff_addr=0x104,  # Not 8-byte aligned
+            num_records=1024,
+        )
+        self.assertTrue(flags_unaligned.unaligned_addr)
+
+        flags_aligned = evaluate_smax_x2_flags(
+            old_val=0,
+            smax_val=0,
+            eff_addr=0x108,
+            num_records=1024,
+        )
+        self.assertFalse(flags_aligned.unaligned_addr)
+
+    def test_out_of_bounds_detection(self) -> None:
+        # eff_addr 1020 has 1020 + 8 = 1028 > 1024 (OOB)
+        flags_oob = evaluate_smax_x2_flags(
+            old_val=0,
+            smax_val=0,
+            eff_addr=1020,
+            num_records=1024,
+        )
+        self.assertTrue(flags_oob.out_of_bounds)
+
+        flags_in = evaluate_smax_x2_flags(
+            old_val=0,
+            smax_val=0,
+            eff_addr=1016,
+            num_records=1024,
+        )
+        self.assertFalse(flags_in.out_of_bounds)
+
+    def test_carry_generation(self) -> None:
+        flags_carry = evaluate_smax_x2_flags(
+            old_val=0xFFFFFFFFFFFFFFFF,
+            smax_val=1,
+            eff_addr=0x100,
+            num_records=1024,
+        )
+        self.assertTrue(flags_carry.carry)
+
+        flags_no_carry = evaluate_smax_x2_flags(
+            old_val=10,
+            smax_val=20,
+            eff_addr=0x100,
+            num_records=1024,
+        )
+        self.assertFalse(flags_no_carry.carry)
+
+
 if __name__ == "__main__":
     unittest.main()
