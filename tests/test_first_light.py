@@ -297,6 +297,48 @@ class RunFolderTests(unittest.TestCase):
                          other_out_before)
         self.assertEqual((other_out / "ps.dxbc").read_bytes(), b"first")
 
+    def test_a_second_prepare_in_the_same_work_folder_is_refused_not_mixed_in(self) -> None:
+        """Two prepares share <work>/first_light and <work>/shaders, whatever --out each is given (BUILD-1053).
+
+        The second one starts after the first has staged its pair and before the first has unpacked it: the
+        first still gets its own result, the second stops before staging and publishes nothing.
+        """
+        out_a, out_b = self.tmp / "out_a", self.tmp / "out_b"
+        second = []
+
+        def first_run(argv: list[str]) -> None:
+            if not second:
+                second.append(argv)
+                self.assertEqual(self.files(self.staged), ["first.dxbc", "index.json", "vertex.dxbc"])
+                with self.assertRaises(SystemExit) as busy:
+                    self.prepare("second", "--out", str(out_b))
+                self.assertIn("another first_light.py is preparing shaders", str(busy.exception))
+                self.assertIn(str(self.work), str(busy.exception))
+            self.tools(argv)
+
+        with patch.object(fl, "run", side_effect=first_run), redirect_stdout(io.StringIO()):
+            self.assertEqual(fl.main(["--game", str(self.tmp), "--work", str(self.work), "--no-fit",
+                                      "--vs", "vertex", "--ps", "first", "--out", str(out_a)]), 0)
+        self.assertEqual(self.handed, [["first", "vertex"]])  # the translator ran once, for the first run only
+        self.assertEqual((out_a / "ps.spv").read_bytes(), b"spv first")
+        self.assertEqual((out_a / "ps.dxbc").read_bytes(), b"first")
+        self.assertFalse(out_b.exists())
+        self.assertEqual(self.files(self.staged),
+                         ["disasm/first.s", "disasm/vertex.s", "first.dxbc", "fssm/first.fssm",
+                          "fssm/vertex.fssm", "index.json", "vertex.dxbc"])
+
+    def test_the_lock_is_released_after_a_prepare_ends_or_fails(self) -> None:
+        def broken(argv: list[str]) -> None:
+            raise subprocess.CalledProcessError(1, argv)
+
+        with patch.object(fl, "run", side_effect=broken), redirect_stdout(io.StringIO()):
+            with self.assertRaises(subprocess.CalledProcessError):
+                fl.main(["--game", str(self.tmp), "--work", str(self.work), "--no-fit",
+                         "--vs", "vertex", "--ps", "first"])
+        self.prepare("second")  # not refused: the failed run did not leave its lock behind
+        self.prepare("first", "--out", str(self.tmp / "out_again"))
+        self.assertEqual(self.handed[-1], ["first", "vertex"])
+
     def linked(self, kind: str, where: str) -> tuple[Path, Path]:
         """A work folder whose first_light/<where> is a link of this kind to a folder outside it."""
         work, outside = self.tmp / kind / "work", self.tmp / kind / "outside"

@@ -30,6 +30,7 @@ Standard library only; the project's tools run with `python -I`.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -86,6 +87,49 @@ def reset_run_folders(work: str) -> str:
     except OSError as e:
         raise SystemExit(f"cannot create {dxbc}: {e.strerror or e}") from e
     return dxbc
+
+
+@contextlib.contextmanager
+def prepare_lock(work: str):
+    """Hold <work>/first_light/prepare.lock while this process prepares shaders in <work>.
+
+    A prepare reads and writes folders that every prepare on the same --work shares: the carve under
+    <work>/shaders and the staged pair under <work>/first_light. Two of them at once replace each other's inputs
+    (the second run's container is translated, or its index published, under the first run), whatever --out each
+    was given. The second one stops with a message instead, before it touches anything. The lock is an operating
+    system lock on one byte of the file, so it is released when the process ends, however it ends: a crashed run
+    leaves nothing to clean up.
+    """
+    folder = os.path.join(work, "first_light")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, "prepare.lock")
+    handle = open(path, "a+b")
+    try:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            raise SystemExit(
+                f"another first_light.py is preparing shaders in {work} (lock {path}); wait for it to "
+                "finish or give this run its own --work"
+            ) from e
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    finally:
+        handle.close()
 
 
 def carve_index(work: str) -> str:
@@ -500,6 +544,31 @@ def load_json(
     return data
 
 
+def prepare_shaders(game: str, work: str, out_dir: str, vs: str, ps: str) -> tuple[list[dict], dict]:
+    """Carve if needed, translate the chosen pair and publish its files in out_dir (under prepare_lock)."""
+    index = ensure_carve(game, work)
+    picked = choose(index, vs, ps)
+    meta = translate(work, picked)
+    os.makedirs(out_dir, exist_ok=True)
+    for entry in picked:
+        stem = os.path.splitext(entry["file"])[0]
+        stage = entry["stage"]
+        shutil.copy(
+            os.path.join(work, "first_light", "spirv", f"{stem}.spv"),
+            os.path.join(out_dir, f"{stage}.spv"),
+        )
+    # For d3d12_first_light_test: the game's containers (the PSO finds each stage by the FSSM hash inside) and
+    # the translator's index entries, keyed vs/ps so the runtime's shader library reads vs.spv and ps.spv here.
+    for entry in picked:
+        shutil.copy(
+            os.path.join(work, "shaders", "dxbc", entry["file"]),
+            os.path.join(out_dir, f"{entry['stage']}.dxbc"),
+        )
+    with open(os.path.join(out_dir, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+        json.dump({"vs": meta["vs"], "ps": meta["ps"]}, f, indent=1)
+    return picked, meta
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="Draw one real game model with its own translated VS/PS."
@@ -555,7 +624,8 @@ def main(argv=None) -> int:
     if a.list:
         if not a.game:
             raise SystemExit("--list needs --game")
-        index = ensure_carve(os.path.abspath(a.game), work)
+        with prepare_lock(work):
+            index = ensure_carve(os.path.abspath(a.game), work)
         for e in load_json(index, "carve index", list, entry_keys=("stage", "name")):
             if e["stage"] in ("vs", "ps"):
                 print(f"{e['stage']} {e['name']}")
@@ -571,26 +641,8 @@ def main(argv=None) -> int:
     if not a.no_fit and not a.obj:
         raise SystemExit("--obj is required unless --no-fit")
 
-    index = ensure_carve(game, work)
-    picked = choose(index, a.vs, a.ps)
-    meta = translate(work, picked)
-    os.makedirs(out_dir, exist_ok=True)
-    for entry in picked:
-        stem = os.path.splitext(entry["file"])[0]
-        stage = entry["stage"]
-        shutil.copy(
-            os.path.join(work, "first_light", "spirv", f"{stem}.spv"),
-            os.path.join(out_dir, f"{stage}.spv"),
-        )
-    # For d3d12_first_light_test: the game's containers (the PSO finds each stage by the FSSM hash inside) and
-    # the translator's index entries, keyed vs/ps so the runtime's shader library reads vs.spv and ps.spv here.
-    for entry in picked:
-        shutil.copy(
-            os.path.join(work, "shaders", "dxbc", entry["file"]),
-            os.path.join(out_dir, f"{entry['stage']}.dxbc"),
-        )
-    with open(os.path.join(out_dir, "index.json"), "w", encoding="utf-8", newline="\n") as f:
-        json.dump({"vs": meta["vs"], "ps": meta["ps"]}, f, indent=1)
+    with prepare_lock(work):
+        picked, meta = prepare_shaders(game, work, out_dir, a.vs, a.ps)
     vertices, indices = read_obj(a.obj) if a.obj else ([], [])
     obj_sha256 = None
     if a.obj:

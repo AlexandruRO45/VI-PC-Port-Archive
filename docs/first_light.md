@@ -75,6 +75,11 @@ Each run stages its pair in `<work>/first_light/dxbc` and translates it into `<w
 are removed at the start of a run, so they hold that run's two shaders and nothing an earlier run selected; do not
 keep files there. The output folder (`first_light/out` or `--out`) and `<work>/shaders` are not emptied. If either
 folder is a symlink or a junction, or a file in it cannot be removed, the run stops and names it.
+Prepares that share a `--work` also share `<work>/shaders` and those two folders, whatever `--out` each has, so a
+run holds an operating-system lock on `<work>/first_light/prepare.lock` from the carve to the last file it writes into
+its output folder. A second `first_light.py` started in the meantime (also `--list`) stops before touching anything
+and says another is preparing in that work folder; give it its own `--work`, or run it after the first. The lock is
+released when the process ends, even when it crashes, so there is no stale lock to delete.
 
 ## 4. The harness mode
 
