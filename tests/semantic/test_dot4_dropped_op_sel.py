@@ -79,7 +79,7 @@ class Dot4DroppedOpSelTest(unittest.TestCase):
 
     def test_constant_s1_broadcast(self):
         # The form the FSPX programs store: S1 an inline constant with op_sel_hi[1] = 0, so both byte pairs come from
-        # its low half. -6 reads as its 32-bit value 0xfffffffa, as #2224 measured for packed 16-bit ops: low half
+        # its low half. -6 reads as its 32-bit value 0xfffffffa (measured on gfx1036 for v_dot4_i32_i8, #3372): low half
         # bytes -6, -1. The default would take pairs 2..3 from the high half, -1, -1.
         program = list(PROGRAM)
         program[DOT] = ("v_dot4_i32_i8 v0, v1, -6, v3", "00 40 16 cc 01 8d 0d 1c")
