@@ -114,10 +114,11 @@ class PickBuildDir(unittest.TestCase):
         self.assertEqual(self.pick(), (str(self.build), ""))
 
     def test_not_found_message_names_the_searched_subfolders(self):
-        msg = check.not_found_message(str(self.build), ["vk_harness"])
-        self.assertIn(f"Test programs not found in {self.build}: vk_harness", msg)
+        msg = check.not_found_message(str(self.build), PROGRAMS)
+        expected = ", ".join(PROGRAMS)
+        self.assertIn(f"  {self.build}: {expected}", msg.splitlines())
         for c in check.CONFIG_DIRS:
-            self.assertIn(c, msg)
+            self.assertIn(f"  {self.build / c}: {expected}", msg.splitlines())
 
 
 class MainUsesTheResolvedFolder(unittest.TestCase):

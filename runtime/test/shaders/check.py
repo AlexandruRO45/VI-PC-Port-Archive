@@ -38,9 +38,13 @@ TEST_PROGRAMS = ("vk_compute_test", "vk_store_test", "vk_harness")
 CONFIG_DIRS = ("RelWithDebInfo", "Release", "Debug", "MinSizeRel")
 
 
+def build_dir_candidates(build):
+    return (build, *(os.path.join(build, config) for config in CONFIG_DIRS))
+
+
 def complete_build_dirs(build, programs):
     """`build` and its configuration subfolders, in that order, that hold all of `programs` (file names with extension)."""
-    return [d for d in (build, *(os.path.join(build, c) for c in CONFIG_DIRS))
+    return [d for d in build_dir_candidates(build)
             if all(os.path.isfile(os.path.join(d, n)) for n in programs)]
 
 
@@ -66,12 +70,21 @@ def pick_build_dir(build, programs):
     return chosen
 
 
-def not_found_message(build, missing):
-    return (f"Test programs not found in {build}: {', '.join(missing)}\n"
-            f"(its {', '.join(CONFIG_DIRS)} subfolders were searched too)\n"
-            "Build them with cmake -S runtime -B runtime/build, then cmake --build runtime/build.\n"
-            "CMake only builds them when it finds Vulkan. If it printed \"Vulkan SDK not found\", install the "
-            "Vulkan headers (vulkan-headers on Arch) and configure again.")
+def not_found_message(build, programs):
+    lines = [
+        f"Test programs not found in a single build directory at {build}.",
+        "Missing files (the build folder and its subfolders were searched):",
+    ]
+    for directory in build_dir_candidates(build):
+        missing = [name for name in programs if not os.path.isfile(os.path.join(directory, name))]
+        lines.append(f"  {directory}: {', '.join(missing) or 'none'}")
+    lines.extend([
+        "Build them with cmake -S runtime -B runtime/build, then cmake --build runtime/build.",
+        "For a multi-configuration build, use cmake --build runtime/build --config <configuration>.",
+        'CMake only builds them when it finds Vulkan. If it printed "Vulkan SDK not found", install the '
+        "Vulkan headers (vulkan-headers on Arch) and configure again.",
+    ])
+    return "\n".join(lines)
 
 COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh", "1", "bvh"),
            ("cs_workgroup_yz", "2x3x4", "workgroup_yz")]
@@ -526,9 +539,9 @@ def run(*cmd, env=None):
     except OSError as e:
         if isinstance(e, FileNotFoundError):
             tools = os.path.abspath(os.path.dirname(cmd[0]))
-            missing = [t + EXE for t in TEST_PROGRAMS if not os.path.isfile(os.path.join(tools, t + EXE))]
-            if missing:
-                sys.exit(not_found_message(tools, missing))
+            required = tuple(t + EXE for t in TEST_PROGRAMS)
+            if any(not os.path.isfile(os.path.join(tools, t)) for t in required):
+                sys.exit(not_found_message(tools, required))
         return 1, start_failure(cmd[0], e)
     return r.returncode, r.stdout + r.stderr
 
