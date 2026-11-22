@@ -780,10 +780,10 @@ bool layer_checks(ID3D12Device* device, const std::vector<std::uint8_t>& vs, con
 }
 
 // An indirect dispatch recorded in a bundle takes the compute root signature and root arguments of the list that
-// executes it; the pipeline state is the bundle's own, the one it was created with (a bundle created without one
-// dispatches nothing on the host, while the layer would run the parent's, so that case is not run). The shader writes out[i] = s0 + s1 * i from
-// the root constants and a root UAV; the dispatch arguments in the bundle's buffer are 2 groups of 64, so words 0..127
-// are written and nothing after them.
+// executes it; the pipeline state is the bundle's own, the one it was created with. A bundle created without one
+// dispatches nothing, even when the parent has that pipeline bound. The shader writes out[i] = s0 + s1 * i from the
+// root constants and a root UAV; the dispatch arguments in the bundle's buffer are 2 groups of 64, so words 0..127
+// are written and nothing after them (except for the null-pipeline case, where every word stays zero).
 constexpr char hlsl_cs[] =
     "cbuffer Args : register(b0) { uint base; uint step; };\n"
     "RWByteAddressBuffer result : register(u0);\n"
@@ -791,8 +791,9 @@ constexpr char hlsl_cs[] =
 
 const char* const compute_names[] = {
     "dispatch: an indirect dispatch sees the parent's compute root signature and arguments",
-    "dispatch: one bundle executed twice with other root arguments in between"};
-constexpr int compute_count = 2;
+    "dispatch: one bundle executed twice with other root arguments in between",
+    "dispatch: a bundle without a pipeline does not borrow the parent's pipeline"};
+constexpr int compute_count = 3;
 constexpr UINT compute_words = 128;  // 2 groups of 64
 
 // Runs scenario `which` on `device` with compute shader `cs`; "ok", or what differed.
@@ -850,7 +851,7 @@ std::string compute_scenario(ID3D12Device* device, const std::vector<std::uint8_
     Ref<ID3D12GraphicsCommandList> bundle, list;
     if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE, IID_PPV_ARGS(&bundle_allocator.p))) ||
         FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, bundle_allocator.p,
-                                         pso.p, IID_PPV_ARGS(&bundle.p))))
+                                         which == 2 ? nullptr : pso.p, IID_PPV_ARGS(&bundle.p))))
         return "setup: bundle";
     bundle->ExecuteIndirect(signature.p, 1, arguments.p, 0, nullptr, 0);
     if (FAILED(bundle->Close())) return "bundle Close failed";
@@ -865,6 +866,7 @@ std::string compute_scenario(ID3D12Device* device, const std::vector<std::uint8_
     };
     list->SetComputeRootSignature(root.p);
     arguments_at(100, 3, 0);
+    if (which == 2) list->SetPipelineState(pso.p);  // this must not supply the bundle's missing pipeline
     list->ExecuteBundle(bundle.p);
     if (which == 1) {
         arguments_at(7, 1, 1024);
@@ -888,7 +890,7 @@ std::string compute_scenario(ID3D12Device* device, const std::vector<std::uint8_
     std::string result = "ok";
     for (UINT i = 0; i < out_bytes / 4 && result == "ok"; ++i) {
         std::uint32_t want = 0;
-        if (i < compute_words) want = 100 + 3 * i;
+        if (which != 2 && i < compute_words) want = 100 + 3 * i;
         else if (which == 1 && i >= 256 && i < 256 + compute_words) want = 7 + (i - 256);
         if (words[i] != want) {
             char text[80];
