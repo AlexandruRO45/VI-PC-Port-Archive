@@ -1,0 +1,254 @@
+from __future__ import annotations
+
+"""Semantic reference oracle and architectural model for ds_inc_rtn_u32.
+
+RDNA2 / GFX10 Local Data Share (LDS) Atomic 32-bit Increment with Return:
+Performs a 32-bit atomic wrapping increment on LDS memory and returns the original value.
+
+Syntax:
+    ds_inc_rtn_u32 vdst, vaddr, vdata0 [offset:offset16]
+
+Semantics:
+    effective_byte_address = (vaddr + (offset16 & 0xFFFF)) & 0xFFFFFFFF
+    dword_index = (effective_byte_address >> 2) & (lds_dwords - 1)
+    old_val = LDS[dword_index]
+    new_mem = 0 if old_val >= (vdata0 & 0xFFFFFFFF) else (old_val + 1) & 0xFFFFFFFF
+    LDS[dword_index] = new_mem
+    vdst = old_val
+
+Architecture & Specification:
+  - Target: AMD RDNA2 / GFX10 Local Data Share (LDS).
+  - Memory: On-chip software-managed scratchpad shared among threads of a workgroup.
+  - Addressing:
+      Base byte address provided in VGPR vaddr.
+      Optional 16-bit unsigned byte offset added to base address:
+        eff_addr = (vaddr + offset16) mod 2^32.
+      Addresses are dword-aligned: low 2 bits are dropped (eff_addr >> 2).
+      Dword indices wrap modulo the allocated power-of-two capacity.
+  - Wrap Condition:
+      Unsigned 32-bit integer comparison between current memory value (old_val)
+      and the wrap limit operand (vdata0).
+      When old_val >= wrap_limit, memory wraps to 0.
+      Otherwise, memory is incremented by 1 mod 2^32.
+  - Return:
+      The pre-operation memory value (old_val) is returned to vector register vdst.
+"""
+
+import unittest
+from typing import Tuple
+
+# RDNA2 Local Data Share (LDS) Architectural Constants
+LDS_SIZE_BYTES: int = 65536         # 64 KiB default capacity
+LDS_SIZE_DWORDS: int = 16384        # 16,384 32-bit dwords
+LDS_BANK_COUNT: int = 32            # 32 independent memory banks
+MASK_32: int = 0xFFFF_FFFF          # 32-bit unsigned mask
+OFFSET16_MASK: int = 0xFFFF         # 16-bit immediate byte offset mask
+DEFAULT_NUM_VGPRS: int = 256        # Standard GFX10 vector register file size
+DEFAULT_NUM_SGPRS: int = 106        # Standard GFX10 scalar register file size
+DEFAULT_NUM_LANES: int = 64         # Wave64 default width
+
+
+def u32(val: int) -> int:
+    """Normalize integer to unsigned 32-bit dword."""
+    return val & MASK_32
+
+
+def s32(val: int) -> int:
+    """Interpret a 32-bit unsigned dword as a signed two's-complement integer."""
+    val &= MASK_32
+    return val - (1 << 32) if (val & 0x80000000) else val
+
+
+def calc_lds_effective_address(vaddr: int, offset: int = 0) -> int:
+    """Calculate the 32-bit effective byte address into LDS.
+
+    The offset is an unsigned 16-bit immediate. Address wrapping is strictly modulo 2^32.
+    """
+    return (vaddr + (offset & OFFSET16_MASK)) & MASK_32
+
+
+def calc_lds_dword_index(eff_addr: int, capacity_dwords: int = LDS_SIZE_DWORDS) -> int:
+    """Convert an effective byte address to an aligned LDS dword index.
+
+    LDS addresses are dword-aligned; the low 2 bits are ignored by hardware.
+    The index wraps modulo the power-of-two dword capacity.
+    """
+    return (eff_addr >> 2) & (capacity_dwords - 1)
+
+
+def calc_lds_bank(eff_addr: int) -> int:
+    """Determine the LDS memory bank index for an effective address."""
+    return (eff_addr >> 2) & (LDS_BANK_COUNT - 1)
+
+
+def oracle_ds_inc_rtn_u32(
+    current_mem: int,
+    wrap_limit: int,
+) -> Tuple[int, int]:
+    """Pure mathematical reference oracle for ds_inc_rtn_u32.
+
+    Computes:
+        old_val = current_mem & 0xFFFFFFFF
+        limit = wrap_limit & 0xFFFFFFFF
+        new_mem = 0 if old_val >= limit else (old_val + 1) & 0xFFFFFFFF
+
+    Returns:
+        (old_val, new_mem)
+    """
+    old_val = u32(current_mem)
+    limit = u32(wrap_limit)
+    new_mem = 0 if old_val >= limit else u32(old_val + 1)
+    return old_val, new_mem
+
+
+class LDSModel:
+    """Architectural memory model representing the Local Data Share scratchpad."""
+
+    def __init__(self, capacity_dwords: int = LDS_SIZE_DWORDS) -> None:
+        if capacity_dwords <= 0 or (capacity_dwords & (capacity_dwords - 1)) != 0:
+            raise ValueError(f"capacity_dwords must be a positive power of two, got {capacity_dwords}")
+        self.capacity_dwords = capacity_dwords
+        self.memory = [0] * capacity_dwords
+
+    def read_dword(self, eff_addr: int) -> int:
+        """Read a 32-bit dword from LDS given an effective byte address."""
+        idx = calc_lds_dword_index(eff_addr, self.capacity_dwords)
+        return self.memory[idx]
+
+    def write_dword(self, eff_addr: int, val: int) -> None:
+        """Write a 32-bit dword to LDS given an effective byte address."""
+        idx = calc_lds_dword_index(eff_addr, self.capacity_dwords)
+        self.memory[idx] = u32(val)
+
+    def atomic_inc_rtn_u32(
+        self,
+        vaddr: int,
+        wrap_limit: int,
+        offset: int = 0,
+    ) -> Tuple[int, int]:
+        """Execute atomic 32-bit wrapping increment with return on LDS.
+
+        Returns:
+            (old_val, new_mem)
+        """
+        eff_addr = calc_lds_effective_address(vaddr, offset)
+        idx = calc_lds_dword_index(eff_addr, self.capacity_dwords)
+        curr = self.memory[idx]
+        old_val, new_mem = oracle_ds_inc_rtn_u32(curr, wrap_limit)
+        self.memory[idx] = new_mem
+        return old_val, new_mem
+
+
+class TestReferenceOracleAndLDSModel(unittest.TestCase):
+    """Phase 1: Unit tests for reference mathematical oracle and architectural model."""
+
+    def test_oracle_normal_increment(self) -> None:
+        # Incrementing below wrap limit returns old value and increments memory
+        old, new_mem = oracle_ds_inc_rtn_u32(0, 5)
+        self.assertEqual(old, 0)
+        self.assertEqual(new_mem, 1)
+
+        old, new_mem = oracle_ds_inc_rtn_u32(1, 5)
+        self.assertEqual(old, 1)
+        self.assertEqual(new_mem, 2)
+
+        old, new_mem = oracle_ds_inc_rtn_u32(4, 5)
+        self.assertEqual(old, 4)
+        self.assertEqual(new_mem, 5)
+
+    def test_oracle_wrap_on_equal_threshold(self) -> None:
+        # Equal to threshold wraps memory to 0, returns threshold
+        old, new_mem = oracle_ds_inc_rtn_u32(5, 5)
+        self.assertEqual(old, 5)
+        self.assertEqual(new_mem, 0)
+
+    def test_oracle_wrap_on_greater_threshold(self) -> None:
+        # Strictly exceeding threshold wraps memory to 0, returns old value
+        old, new_mem = oracle_ds_inc_rtn_u32(6, 5)
+        self.assertEqual(old, 6)
+        self.assertEqual(new_mem, 0)
+
+        old, new_mem = oracle_ds_inc_rtn_u32(100, 5)
+        self.assertEqual(old, 100)
+        self.assertEqual(new_mem, 0)
+
+    def test_oracle_zero_wrap_limit(self) -> None:
+        # Limit 0: any unsigned value >= 0 wraps to 0
+        old, new_mem = oracle_ds_inc_rtn_u32(0, 0)
+        self.assertEqual(old, 0)
+        self.assertEqual(new_mem, 0)
+
+        old, new_mem = oracle_ds_inc_rtn_u32(10, 0)
+        self.assertEqual(old, 10)
+        self.assertEqual(new_mem, 0)
+
+    def test_oracle_max_u32_limit(self) -> None:
+        # Limit 0xFFFFFFFF
+        old, new_mem = oracle_ds_inc_rtn_u32(0, MASK_32)
+        self.assertEqual(old, 0)
+        self.assertEqual(new_mem, 1)
+
+        old, new_mem = oracle_ds_inc_rtn_u32(MASK_32 - 1, MASK_32)
+        self.assertEqual(old, MASK_32 - 1)
+        self.assertEqual(new_mem, MASK_32)
+
+        old, new_mem = oracle_ds_inc_rtn_u32(MASK_32, MASK_32)
+        self.assertEqual(old, MASK_32)
+        self.assertEqual(new_mem, 0)
+
+    def test_effective_address_calculation_and_wrapping(self) -> None:
+        eff = calc_lds_effective_address(0x1000, 0x0024)
+        self.assertEqual(eff, 0x1024)
+
+        # Modulo 2^32 address wrapping
+        eff_wrap = calc_lds_effective_address(0xFFFF_FFF0, 0x0020)
+        self.assertEqual(eff_wrap, 0x0000_0010)
+
+        # 16-bit offset masking
+        eff_offset_mask = calc_lds_effective_address(0x2000, 0x1_0004)
+        self.assertEqual(eff_offset_mask, 0x2004)
+
+    def test_dword_alignment_and_low_bits_truncation(self) -> None:
+        # Low 2 bits are dropped (dword alignment)
+        self.assertEqual(calc_lds_dword_index(0x1000), 0x400)
+        self.assertEqual(calc_lds_dword_index(0x1001), 0x400)
+        self.assertEqual(calc_lds_dword_index(0x1002), 0x400)
+        self.assertEqual(calc_lds_dword_index(0x1003), 0x400)
+        self.assertEqual(calc_lds_dword_index(0x1004), 0x401)
+
+    def test_capacity_wrapping(self) -> None:
+        capacity_bytes = LDS_SIZE_DWORDS * 4
+        eff = calc_lds_effective_address(capacity_bytes + 0x40)
+        idx = calc_lds_dword_index(eff, LDS_SIZE_DWORDS)
+        self.assertEqual(idx, 0x10)
+
+    def test_bank_distribution(self) -> None:
+        for bank in range(LDS_BANK_COUNT):
+            addr = bank * 4
+            self.assertEqual(calc_lds_bank(addr), bank)
+
+    def test_lds_model_atomic_inc_rtn(self) -> None:
+        lds = LDSModel(capacity_dwords=1024)
+        addr = 0x100  # dword index 64
+
+        lds.write_dword(addr, 2)
+        old, new_mem = lds.atomic_inc_rtn_u32(vaddr=addr, wrap_limit=5, offset=0)
+        self.assertEqual(old, 2)
+        self.assertEqual(new_mem, 3)
+        self.assertEqual(lds.read_dword(addr), 3)
+
+        # Increment with offset
+        old, new_mem = lds.atomic_inc_rtn_u32(vaddr=0xFC, wrap_limit=5, offset=4)
+        self.assertEqual(old, 3)
+        self.assertEqual(new_mem, 4)
+        self.assertEqual(lds.read_dword(addr), 4)
+
+        # Hit wrap condition
+        old, new_mem = lds.atomic_inc_rtn_u32(vaddr=addr, wrap_limit=4, offset=0)
+        self.assertEqual(old, 4)
+        self.assertEqual(new_mem, 0)
+        self.assertEqual(lds.read_dword(addr), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
