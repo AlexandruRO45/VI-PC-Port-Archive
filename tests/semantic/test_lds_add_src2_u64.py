@@ -794,3 +794,73 @@ class TestConditionCodesStatusFlagsAndCarryBorrow(unittest.TestCase):
         flags = compute_add_src2_u64_flags(a, b)
         self.assertTrue(flags.carry_dword)
         self.assertFalse(flags.carry_out)
+
+
+# ============================================================================
+# Section 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ============================================================================
+
+def f64_to_u64(val: float) -> int:
+    return struct.unpack("<Q", struct.pack("<d", val))[0]
+
+
+def u64_to_f64(val: int) -> float:
+    return struct.unpack("<d", struct.pack("<Q", u64(val)))[0]
+
+
+DOUBLE_POS_ZERO: int = 0x0000_0000_0000_0000
+DOUBLE_NEG_ZERO: int = 0x8000_0000_0000_0000
+DOUBLE_POS_ONE: int = 0x3FF0_0000_0000_0000
+DOUBLE_POS_INF: int = 0x7FF0_0000_0000_0000
+DOUBLE_NEG_INF: int = 0xFFF0_0000_0000_0000
+DOUBLE_QNAN_DEFAULT: int = 0x7FF8_0000_0000_0000
+DOUBLE_SNAN_EXAMPLE: int = 0x7FF0_0000_0000_0001
+DOUBLE_MIN_SUBNORMAL: int = 0x0000_0000_0000_0001
+DOUBLE_MAX_SUBNORMAL: int = 0x000F_FFFF_FFFF_FFFF
+
+
+class TestIEEE754BoundaryExtremesSubnormalsAndNaNs(unittest.TestCase):
+    """Unit tests for IEEE 754 double-precision bit patterns manipulated via ds_add_src2_u64."""
+
+    def setUp(self) -> None:
+        self.state = ScalarMachineState()
+        self.interp = ScalarInterpreter()
+
+    def test_double_subnormal_preservation_without_ftz(self) -> None:
+        addr_a = 0x100
+        addr_b = 0x108
+        self.state.lds.write_qword_at_byte_addr(addr_a, DOUBLE_MIN_SUBNORMAL)
+        self.state.lds.write_qword_at_byte_addr(addr_b, 0)  # Identity
+        self.state.set_vgpr(0, addr_a)
+
+        instr = DSAddSrc2U64Instruction(vaddr=VGPR(0), offset0=0, offset1=1)
+        res = self.interp.step(instr, self.state)
+
+        self.assertEqual(res, DOUBLE_MIN_SUBNORMAL)
+        self.assertNotEqual(res, 0)
+
+    def test_double_snan_preserved_without_quietening(self) -> None:
+        addr_a = 0x120
+        addr_b = 0x128
+        self.state.lds.write_qword_at_byte_addr(addr_a, DOUBLE_SNAN_EXAMPLE)
+        self.state.lds.write_qword_at_byte_addr(addr_b, 0)
+        self.state.set_vgpr(0, addr_a)
+
+        instr = DSAddSrc2U64Instruction(vaddr=VGPR(0), offset0=0, offset1=1)
+        res = self.interp.step(instr, self.state)
+
+        self.assertEqual(res, DOUBLE_SNAN_EXAMPLE)
+        self.assertEqual(res & (1 << 51), 0, "Double sNaN was quietened")
+
+    def test_double_nan_payload_preservation(self) -> None:
+        addr_a = 0x140
+        addr_b = 0x148
+        nan_payload = 0x7FF8_0000_CAFE_BABE
+        self.state.lds.write_qword_at_byte_addr(addr_a, nan_payload)
+        self.state.lds.write_qword_at_byte_addr(addr_b, 0)
+        self.state.set_vgpr(0, addr_a)
+
+        instr = DSAddSrc2U64Instruction(vaddr=VGPR(0), offset0=0, offset1=1)
+        res = self.interp.step(instr, self.state)
+
+        self.assertEqual(res, nan_payload)
