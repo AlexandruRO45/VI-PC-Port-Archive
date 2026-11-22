@@ -1202,8 +1202,170 @@ class TestPermB16IEEE754Boundaries(unittest.TestCase):
         self.assertEqual(res, 0x7BFF)
 
 
+# ==============================================================================
+# Negative Controls, Fault Injection, and Mutation Operators
+# ==============================================================================
+
+def mutated_perm_off_by_one(src0: int, src1: int, selector: int) -> int:
+    """Mutant 1: Off-by-one selector decoding bug."""
+    s0 = src0 & MASK16
+    s1 = src1 & MASK16
+    sel0 = ((selector & BYTE_MASK) + 1) & BYTE_MASK
+    sel1 = (((selector >> BYTE_WIDTH) & BYTE_MASK) + 1) & BYTE_MASK
+    b0 = permute_single_byte_16(s0, s1, sel0)
+    b1 = permute_single_byte_16(s0, s1, sel1)
+    return pack_bytes_16(b0, b1)
+
+
+def mutated_perm_inverted_sources(src0: int, src1: int, selector: int) -> int:
+    """Mutant 2: Inverted sources bug (src0 and src1 swapped)."""
+    return oracle_v_perm_b16(src0=src1, src1=src0, selector=selector)
+
+
+def mutated_perm_ignore_zero_fill(src0: int, src1: int, selector: int) -> int:
+    """Mutant 3: Fails to generate constant 0x00 on selector code 8."""
+    s0 = src0 & MASK16
+    s1 = src1 & MASK16
+    sel0 = selector & BYTE_MASK
+    sel1 = (selector >> BYTE_WIDTH) & BYTE_MASK
+    b0 = 0x55 if sel0 == SEL_ZERO else permute_single_byte_16(s0, s1, sel0)
+    b1 = 0x55 if sel1 == SEL_ZERO else permute_single_byte_16(s0, s1, sel1)
+    return pack_bytes_16(b0, b1)
+
+
+def mutated_perm_ignore_ones_fill(src0: int, src1: int, selector: int) -> int:
+    """Mutant 4: Fails to generate constant 0xFF on selector code >= 9."""
+    s0 = src0 & MASK16
+    s1 = src1 & MASK16
+    sel0 = selector & BYTE_MASK
+    sel1 = (selector >> BYTE_WIDTH) & BYTE_MASK
+    b0 = 0x00 if sel0 >= SEL_ONES_MIN else permute_single_byte_16(s0, s1, sel0)
+    b1 = 0x00 if sel1 >= SEL_ONES_MIN else permute_single_byte_16(s0, s1, sel1)
+    return pack_bytes_16(b0, b1)
+
+
+def mutated_perm_wrong_byte_packing(src0: int, src1: int, selector: int) -> int:
+    """Mutant 5: Swaps low and high byte packing in destination word."""
+    s0 = src0 & MASK16
+    s1 = src1 & MASK16
+    sel0 = selector & BYTE_MASK
+    sel1 = (selector >> BYTE_WIDTH) & BYTE_MASK
+    b0 = permute_single_byte_16(s0, s1, sel0)
+    b1 = permute_single_byte_16(s0, s1, sel1)
+    return pack_bytes_16(b1, b0)
+
+
+# ==============================================================================
+# Unit Tests: Commit 8 (Negative Controls & Mutation Detection)
+# ==============================================================================
+
+class TestPermB16NegativeControlsAndMutations(unittest.TestCase):
+    """Test suite for negative controls, syntax rejection, and mutation detection."""
+
+    def test_negative_sgpr_destination_rejected(self):
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B16,
+            dst=ASTOperand.sgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(3),
+        )
+        with self.assertRaises(ValueError):
+            instr.validate()
+
+    def test_negative_multiple_literals_rejected(self):
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.literal(0x1111),
+            src1=ASTOperand.literal(0x2222),
+            src2=ASTOperand.vgpr(3),
+        )
+        with self.assertRaises(ValueError):
+            instr.validate()
+
+    def test_negative_register_index_bounds(self):
+        rf = ScalarRegisterFile()
+        with self.assertRaises(IndexError):
+            rf.get_vgpr(256)
+        with self.assertRaises(IndexError):
+            rf.set_vgpr(-1, 0)
+        with self.assertRaises(IndexError):
+            rf.get_sgpr(106)
+        with self.assertRaises(IndexError):
+            rf.set_sgpr(-1, 0)
+
+    def test_negative_byte_index_bounds(self):
+        with self.assertRaises(ValueError):
+            extract_byte_16(0x1234, 2)
+        with self.assertRaises(ValueError):
+            extract_byte_16(0x1234, -1)
+
+    def test_negative_wave_size_rejected(self):
+        with self.assertRaises(ValueError):
+            SIMDWaveState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDWaveState(num_lanes=128)
+
+    def test_mutation_off_by_one_detected(self):
+        src0 = 0xAABB
+        src1 = 0x1122
+        sel = PermSelectorB16Word.identity_src1().raw
+        expected = oracle_v_perm_b16(src0, src1, sel)
+        mutated = mutated_perm_off_by_one(src0, src1, sel)
+        self.assertNotEqual(expected, mutated)
+
+    def test_mutation_inverted_sources_detected(self):
+        src0 = 0xAABB
+        src1 = 0x1122
+        sel = PermSelectorB16Word.identity_src1().raw
+        expected = oracle_v_perm_b16(src0, src1, sel)
+        mutated = mutated_perm_inverted_sources(src0, src1, sel)
+        self.assertNotEqual(expected, mutated)
+
+    def test_mutation_constant_zero_ignored_detected(self):
+        src0 = 0xFFFF
+        src1 = 0xFFFF
+        sel = make_selector_16(SEL_ZERO, SEL_ZERO)
+        expected = oracle_v_perm_b16(src0, src1, sel)
+        mutated = mutated_perm_ignore_zero_fill(src0, src1, sel)
+        self.assertNotEqual(expected, mutated)
+
+    def test_mutation_constant_ones_ignored_detected(self):
+        sel = make_selector_16(SEL_ONES_MIN, SEL_ONES_MIN)
+        expected = oracle_v_perm_b16(0, 0, sel)
+        mutated = mutated_perm_ignore_ones_fill(0, 0, sel)
+        self.assertNotEqual(expected, mutated)
+
+    def test_mutation_exec_mask_ignored_detected(self):
+        wave = SIMDWaveState(num_lanes=32, exec_mask=0x0000_0001)  # Only lane 0 active
+        wave.set_wave_vgpr(0, [0xCAFE] * 32)
+        wave.set_wave_vgpr(1, [0x1234] * 32)
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(1),
+            src2=ASTOperand.literal(0),
+        )
+        wave.execute_instruction(instr)
+
+        for lane in range(1, 32):
+            self.assertEqual(wave.get_lane_vgpr(0, lane) & MASK16, 0xCAFE)
+
+    def test_mutation_wrong_byte_packing_detected(self):
+        src0 = 0x1122
+        src1 = 0x3344
+        sel = make_selector_16(SEL_SRC1_B0, SEL_SRC0_B1)
+        expected = oracle_v_perm_b16(src0, src1, sel)
+        mutated = mutated_perm_wrong_byte_packing(src0, src1, sel)
+        self.assertNotEqual(expected, mutated)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
