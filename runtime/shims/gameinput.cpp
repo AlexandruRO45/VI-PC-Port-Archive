@@ -29,6 +29,8 @@
 //
 // ASSUMPTION: the console executable is not available, so the DLL it imports GameInputCreate from is unknown. The PC
 // API lives in gameinput.dll; on console the GDK links it through xgameruntime. Both names are registered.
+// gameinput.lib imports GameInputCreate from GameInput.dll by ordinal 1, with no name (docs/gameinput.md, "The import
+// is by ordinal"), so "#1" is registered too: the loader looks an ordinal import up as "#<n>".
 #include <windows.h>
 
 #include <SDL3/SDL.h>
@@ -2197,5 +2199,6 @@ const KeyBinding* keyboard_bindings(int* count) {
 
 SHIM_TABLE(gameinput,
     {"gameinput.dll", "GameInputCreate", reinterpret_cast<void*>(&GameInputCreate)},
+    {"gameinput.dll", "#1", reinterpret_cast<void*>(&GameInputCreate)},
     {"xgameruntime.dll", "GameInputCreate", reinterpret_cast<void*>(&GameInputCreate)},
 );

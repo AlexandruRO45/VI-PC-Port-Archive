@@ -1100,6 +1100,9 @@ int main() {
     check(create != nullptr, "gameinput.dll!GameInputCreate is registered");
     check(rt::shims::find("xgameruntime.dll", "GameInputCreate") == reinterpret_cast<void*>(create),
           "xgameruntime.dll!GameInputCreate is the same function");
+    // gameinput.lib imports it by ordinal 1 and no name; the loader asks the registry for "#1" (pe_loader.cpp resolve).
+    check(rt::shims::find("gameinput.dll", "#1") == reinterpret_cast<void*>(create),
+          "gameinput.dll ordinal 1 is the same function");
     if (!create) return 1;
 
     IGameInput* input = nullptr;

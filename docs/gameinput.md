@@ -362,12 +362,34 @@ rests on a transcription rather than on a side-by-side compile.
 - `gameinput_probe [--seconds N] [--rumble]` (by hand, with a pad connected): lists the pads, plays each motor and
   trigger for a second with `--rumble`, then prints the live reading.
 
+## The import is by ordinal
+
+A title built against `gameinput.lib` has no `GameInputCreate` string in its import table: the library imports it
+from `GameInput.dll` by ordinal 1.
+
+| Measured | Result |
+|---|---|
+| Windows SDK 10.0.26100, `um/x64/gameinput.lib` | one import record: `GameInput.dll`, `GameInputCreate`, ordinal 1, name type "by ordinal" |
+| `System32\GameInput.dll` and `GameInputRedist.dll` (Windows 11 26200) | export ordinal 1 is `GameInputCreate` |
+| A Series-built GDK sample, as [sammwyy/xvalkyrie](https://github.com/sammwyy/xvalkyrie) reports it (GPL-3.0; `docs/research/gdk-titles.md` at `b883d2d`; a fact read there, no code) | imports `GameInput.dll` ordinal 1 and nothing else from that module |
+
+The first two rows were read here with a standard-library parser of the archive's short import records and of the
+export directory; the third is another project's measurement of a console build and is not reproduced here, since
+building a Series sample needs the GDK's Xbox extensions. That the game's executable imports it the same way is a
+hypothesis until the executable is read.
+
+The loader looks an ordinal import up in the shim registry as `#<n>` (`Loader::resolve`, `runtime/src/pe_loader.cpp`),
+so the shim registers `gameinput.dll!#1` beside the name. Before that, such an import found no shim and was bound to
+the host's `GameInput.dll` by ordinal: Xbox pads only, none of the mapping on this page. CTest's `run_tiny_gameinput`
+runs a stand-in that imports `GameInputCreate` by ordinal only (`runtime/test/fixtures/gameinput_stub.def`,
+`NONAME`) under `gta6rt --run` and checks that the loader's report says `shim  GameInput.dll!#1`.
+
 ## VERIFY
 
 These need the game executable or a test on hardware:
 
 - **Which API version and module.** The shim is GameInput v0 and registers `GameInputCreate` under `gameinput.dll`
-  and `xgameruntime.dll`. GameInput v1 and later (NuGet 1.x and up) changed the interfaces; if the executable was
+  (by name and as ordinal 1, see [The import is by ordinal](#the-import-is-by-ordinal)) and `xgameruntime.dll`. GameInput v1 and later (NuGet 1.x and up) changed the interfaces; if the executable was
   built against one of those, the vtables need a second set.
 - **IIDs.** `QueryInterface` answers the v0 IIDs from the public header.
 - **Reading history.** Microsoft's [next reading](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/interfaces/igameinput/methods/igameinput_getnextreading)

@@ -402,6 +402,25 @@ if(BUILD_TESTING)
     set_target_properties(tiny_gdk_load PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
     )
+    # GameInputCreate imported by ordinal 1 with no name, as gameinput.lib links it; only where the shim is built.
+    if(TARGET gameinput_test)
+      add_library(gameinput_stub SHARED test/fixtures/gameinput_stub.cpp test/fixtures/gameinput_stub.def)
+      target_compile_definitions(gameinput_stub PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_compile_options(gameinput_stub PRIVATE /W4 /permissive- /utf-8)
+      set_target_properties(gameinput_stub PROPERTIES
+        OUTPUT_NAME GameInput
+        PREFIX ""
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/stubs/$<CONFIG>"
+        ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/stubs/$<CONFIG>"
+      )
+      add_executable(tiny_gameinput test/fixtures/tiny_gameinput.cpp)
+      target_link_libraries(tiny_gameinput PRIVATE gameinput_stub)
+      target_compile_definitions(tiny_gameinput PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_compile_options(tiny_gameinput PRIVATE /W4 /permissive- /utf-8)
+      set_target_properties(tiny_gameinput PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
+      )
+    endif()
     # Run-time LoadLibrary of a bundled Xbox DLL (importing xmem.dll) through rt::Loader.
     add_library(xmem_stub SHARED test/fixtures/xmem_stub.cpp test/fixtures/xmem_stub.def)
     target_compile_definitions(xmem_stub PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -735,6 +754,11 @@ if(BUILD_TESTING)
     add_test(NAME run_tiny_bundled_load COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_bundled_load>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_loaded_bundled.cmake")
+    if(TARGET tiny_gameinput)
+      add_test(NAME run_tiny_gameinput COMMAND ${CMAKE_COMMAND}
+        "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_gameinput>"
+        "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_loaded_gameinput.cmake")
+    endif()
     add_test(NAME run_tiny_game COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42)
     add_test(NAME run_tiny_game_exit_code COMMAND tiny_game_exit_code_test
              "$<TARGET_FILE:gta6rt>" "$<TARGET_FILE:tiny_game>")
