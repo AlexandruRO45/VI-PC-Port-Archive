@@ -52,6 +52,23 @@ def dds_buffer(width, height, payload=b"", *, flags=0, fourcc=b"\x00\x00\x00\x00
     return raw + payload
 
 
+class Rgba16Tests(unittest.TestCase):
+    def test_padded_rows_and_rounding_in_png(self):
+        first = struct.pack("<4H", 0, 128, 129, 65535)
+        second = struct.pack("<4H", 32767, 32768, 65535, 0)
+        image = dds_buffer(1, 2, first + b"pad!" + second, flags=DDPF_FOURCC,
+                           fourcc=b"DX10", dxgi=11, pitch=12)
+        self.assertEqual(dds.decode_dds(image), (1, 2, bytes([0, 0, 1, 255, 127, 128, 255, 0])))
+        self.assertEqual(dds.dds_to_png_bytes(image),
+                         dds.encode_png(1, 2, bytes([0, 0, 1, 255, 127, 128, 255, 0])))
+
+    def test_invalid_pitch_and_truncated_pixel(self):
+        for pitch, payload, message in ((7, bytes(8), "row pitch"), (None, bytes(7), "Truncated")):
+            with self.subTest(pitch=pitch), self.assertRaisesRegex(dds.DdsError, message):
+                dds.decode_dds(dds_buffer(1, 1, payload, flags=DDPF_FOURCC, fourcc=b"DX10",
+                                          dxgi=11, pitch=pitch))
+
+
 def bc1_block(c0, c1, rows):
     """One BC1 block; rows holds the four per-row index bytes."""
     return struct.pack("<HHI", c0, c1, int.from_bytes(bytes(rows), "little"))

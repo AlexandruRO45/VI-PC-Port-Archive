@@ -1,6 +1,6 @@
 """Pure standard-library DDS to PNG decoder and 2x box-filter downscaler.
 
-Supports legacy and DX10 DDS headers across uncompressed 32-bit formats
+Supports DX10 RGBA16_UNORM and legacy and DX10 DDS headers across uncompressed 32-bit formats
 (BGRA8, RGBA8, BGRX8, RGBX8, and arbitrary 32-bit RGB/RGBA bitmasks) and
 block-compressed formats (BC1, BC2, BC3, BC4, BC5, BC7).
 
@@ -51,6 +51,7 @@ _FOURCC_MAP: dict[bytes, str] = {
 }
 
 _DXGI_MAP: dict[int, str] = {
+    11: "RGBA16_UNORM",
     28: "RGBA8",
     29: "RGBA8",
     87: "BGRA8",
@@ -233,7 +234,7 @@ def parse_dds_header(data: bytes) -> dict:
     return info
 
 
-def _decode_uncompressed_32(
+def _decode_uncompressed(
     payload: memoryview,
     width: int,
     height: int,
@@ -242,13 +243,23 @@ def _decode_uncompressed_32(
     pitch: int,
 ) -> bytes:
     pixel_count = width * height
-    row_bytes = width * 4
+    row_bytes = width * (8 if fmt == "RGBA16_UNORM" else 4)
     pitch = pitch or row_bytes
     if pitch < row_bytes:
         raise DdsError(f"Invalid {fmt} row pitch: {pitch} bytes (need at least {row_bytes})")
     expected = (height - 1) * pitch + row_bytes
     if len(payload) < expected:
         raise DdsError(f"Truncated {fmt} payload: {len(payload)} bytes (need {expected})")
+
+    if fmt == "RGBA16_UNORM":
+        # One output step spans 257 input levels. Round each little-endian channel to nearest.
+        out = bytearray(pixel_count * 4)
+        for y in range(height):
+            row = payload[y * pitch : y * pitch + row_bytes]
+            out[y * width * 4 : (y + 1) * width * 4] = bytes(
+                (value + 128) // 257 for (value,) in struct.iter_unpack("<H", row)
+            )
+        return bytes(out)
 
     if pitch == row_bytes:
         src = bytes(payload[:expected])
@@ -889,10 +900,10 @@ def decode_dds(data: bytes) -> tuple[int, int, bytes]:
     fmt = str(info["format"])
     offset = int(info["data_offset"])  # type: ignore[arg-type]
 
-    if fmt in ("RGBA8", "BGRA8", "BGRX8", "RGBX8"):
+    if fmt in ("RGBA8", "BGRA8", "BGRX8", "RGBX8", "RGBA16_UNORM"):
         flags = struct.unpack_from("<I", data, 8)[0]
         pitch = struct.unpack_from("<I", data, 20)[0] if flags & DDSD_PITCH else 0
-        rgba = _decode_uncompressed_32(memoryview(data)[offset:], width, height, fmt, masks, pitch)
+        rgba = _decode_uncompressed(memoryview(data)[offset:], width, height, fmt, masks, pitch)
     elif fmt == "BC1":
         rgba = _decode_bc1(data, offset, width, height)
     elif fmt == "BC2":
