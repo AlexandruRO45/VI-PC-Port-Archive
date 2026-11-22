@@ -37,7 +37,6 @@ Usage:
 """
 import argparse
 import json
-import mmap
 import os
 import re
 import struct
@@ -63,6 +62,7 @@ FORMATS = {
     6: ("R32G32B32_FLOAT", 12),
     12: ("R16G16B16A16_UINT", 8),
     16: ("R32G32_FLOAT", 8),
+    24: ("R10G10B10A2_UNORM", 4),   # semantic 9 in levels.rpf props: x,y,z 10-bit *2-1 are unit length
     28: ("R8G8B8A8_UNORM", 4),
     30: ("R8G8B8A8_UINT", 4),
     38: ("R16G16_SNORM", 4),
@@ -159,8 +159,9 @@ class Mesh:
         self.gfx_len = gfx_len      # vertex buffer length in bytes
 
 
-def walk_resource(sys, kind):
-    """Walk drawable -> LOD -> model -> geometry -> FVF; return meshes carrying skin slots."""
+def walk_resource(sys, kind, all_meshes=False):
+    """Walk drawable -> LOD -> model -> geometry -> FVF; return meshes carrying skin slots
+    (every mesh with ``all_meshes``, which tools/fvf_layouts.py uses for the layout census)."""
     meshes = []
     for drawable in drawable_offsets(sys, kind):
         seen_lods = set()
@@ -205,7 +206,7 @@ def walk_resource(sys, kind):
                     for size, _fmt, offset in slots.values():
                         check(offset <= gfx_len and size * vertices <= gfx_len - offset)
                     gfx_at = u64(sys, vb + 24) - 0x60000000
-                    if any(i in slots for i in WEIGHT_SLOTS + INDEX_SLOTS):
+                    if all_meshes or any(i in slots for i in WEIGHT_SLOTS + INDEX_SLOTS):
                         meshes.append(Mesh(vertices, bones, slots, gfx_at, gfx_len))
                     check(len(meshes) <= 4096)
     return meshes
@@ -358,28 +359,59 @@ def inflate_at(m, at, size):
         return None, 0
     return data, p - at - len(d.unused_data)
 
+class Window:
+    """Read-only file view backed by seek + read with one bounded block cache (no whole-file mapping:
+    a 70+ GB archive on a network share would fill RAM). Supports the m[a:b] slices the walk uses."""
+    BLOCK = 8 << 20
+
+    def __init__(self, fh):
+        self.fh, self.base, self.block = fh, 0, b""
+
+    def __getitem__(self, s):
+        a, b = s.start, s.stop
+        if b - a > self.BLOCK // 2:
+            self.fh.seek(a)
+            return self.fh.read(b - a)
+        if not (self.base <= a and b <= self.base + len(self.block)):
+            self.fh.seek(a)
+            self.base, self.block = a, self.fh.read(self.BLOCK)
+        return self.block[a - self.base:b - self.base]
+
+    def find_zlib(self, at, size):
+        """Offset of the next zlib header at or after `at`, or None (scans in 1 MB steps)."""
+        while at < size:
+            chunk = self[at:min(at + (1 << 20) + 1, size)]
+            mt = ZHDR.search(chunk)
+            if mt:
+                return at + mt.start()
+            at += 1 << 20
+        return None
+
+
 def next_stream(m, fp, size):
     """The next zlib stream at or after `fp` (padding between streams is zero): (data, start, used)."""
-    mt = ZHDR.search(m, fp, size)
-    if not mt:
+    at = m.find_zlib(fp, size)
+    if at is None:
         return None
-    at = mt.start()
     data, used = inflate_at(m, at, size)
     if data is None:
         return None
     return data, at, used
 
 
-def scan_archive(path, sample, log):
-    """Scan one archive; returns census and validation tallies per skin layout."""
+def scan_archive(path, sample, log, on_mesh=None):
+    """Scan one archive; returns census and validation tallies per skin layout.
+
+    With ``on_mesh(mesh, resource_gfx)`` every mesh is walked (not only skinned ones) and passed to the
+    callback; the skin tallies then cover the skinned ones as usual."""
     stats = {"candidates": 0, "resources": 0, "skipped": 0, "meshes": 0, "vertices": 0,
              "unclassified": 0, "layouts": {}, "signatures": {}, "validated": {}}
     size = os.path.getsize(path)
     if size == 0:
-        return stats    # mmap refuses an empty file; an empty archive has no resources to count
+        return stats    # an empty archive has no resources to count
     t0 = time.time()
     with open(path, "rb") as fh:
-        m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+        m = Window(fh)
         pos = 0
         while pos < size:
             page = (pos + PAGE - 1) & ~(PAGE - 1)
@@ -387,7 +419,7 @@ def scan_archive(path, sample, log):
             if at + 2 > size:
                 break
             pos = page + PAGE
-            if m[at - 16:at] != b"\0" * 16 or not ZHDR.match(m, at):
+            if m[at - 16:at] != b"\0" * 16 or not ZHDR.match(m[at:at + 2]):
                 continue
             data, used = inflate_at(m, at, size)
             if data is None:
@@ -410,12 +442,16 @@ def scan_archive(path, sample, log):
                     fp = start + used2
                 resource_sys = b"".join([data] + following[:system_pages - 1])
                 resource_gfx = b"".join(following[system_pages - 1:])
-                meshes = walk_resource(resource_sys, kind)
+                meshes = walk_resource(resource_sys, kind, all_meshes=on_mesh is not None)
             except (Skip, struct.error):
                 stats["skipped"] += 1
                 continue
             stats["resources"] += 1
             for mesh in meshes:
+                if on_mesh:
+                    on_mesh(mesh, resource_gfx)
+                    if not any(i in mesh.slots for i in WEIGHT_SLOTS + INDEX_SLOTS):
+                        continue
                 layout = classify(mesh) or "unclassified"
                 row = stats["layouts"].setdefault(layout, {"meshes": 0, "vertices": 0})
                 row["meshes"] += 1
