@@ -1009,5 +1009,159 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
                 self.assertEqual(state.lds.read_dword(addr), 0xAA)
 
 
+# ==============================================================================
+# Phase 5: Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasingAndPreservation(unittest.TestCase):
+    """Phase 5: Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_alias_dst_equals_addr(self) -> None:
+        """Destination VGPR aliases Address VGPR: v[0] = ds_or_rtn_b32 v[0], v[1].
+        
+        Address must be latched in the operand stage before v[0] is overwritten with old_val.
+        """
+        state = ScalarMachineState()
+        addr = 0x500
+        state.set_vgpr(0, addr)        # v[0] is address AND destination
+        state.set_vgpr(1, 0x00FF00FF)  # v[1] is data operand
+        state.lds.write_dword(addr, 0xFF00FF00)
+
+        instr = DSOrInstruction(
+            opcode=DSOpcode.DS_OR_RTN_B32,
+            dst=VGPR(0),
+            addr=VGPR(0),
+            data=VGPR(1),
+        )
+        old, mem = self.scalar_interp.step(instr, state)
+        self.assertEqual(old, 0xFF00FF00)
+        self.assertEqual(mem, 0xFFFFFFFF)
+        # v[0] now contains the returned old_val
+        self.assertEqual(state.get_vgpr(0), 0xFF00FF00)
+        # Memory at original addr was properly updated
+        self.assertEqual(state.lds.read_dword(addr), 0xFFFFFFFF)
+
+    def test_alias_dst_equals_data(self) -> None:
+        """Destination VGPR aliases Data VGPR: v[1] = ds_or_rtn_b32 v[0], v[1].
+        
+        Data must be latched before v[1] is overwritten with old_val.
+        """
+        state = ScalarMachineState()
+        addr = 0x600
+        state.set_vgpr(0, addr)
+        state.set_vgpr(1, 0x0F0F0F0F)  # v[1] is data AND destination
+        state.lds.write_dword(addr, 0xF0F0F0F0)
+
+        instr = DSOrInstruction(
+            opcode=DSOpcode.DS_OR_RTN_B32,
+            dst=VGPR(1),
+            addr=VGPR(0),
+            data=VGPR(1),
+        )
+        old, mem = self.scalar_interp.step(instr, state)
+        self.assertEqual(old, 0xF0F0F0F0)
+        self.assertEqual(mem, 0xFFFFFFFF)
+        self.assertEqual(state.get_vgpr(1), 0xF0F0F0F0)
+        self.assertEqual(state.lds.read_dword(addr), 0xFFFFFFFF)
+
+    def test_alias_addr_equals_data(self) -> None:
+        """Address VGPR aliases Data VGPR: v[2] = ds_or_rtn_b32 v[0], v[0]."""
+        state = ScalarMachineState()
+        addr_and_data = 0x200
+        state.set_vgpr(0, addr_and_data)
+        state.lds.write_dword(addr_and_data, 0x01)
+
+        instr = DSOrInstruction(
+            opcode=DSOpcode.DS_OR_RTN_B32,
+            dst=VGPR(2),
+            addr=VGPR(0),
+            data=VGPR(0),
+        )
+        old, mem = self.scalar_interp.step(instr, state)
+        self.assertEqual(old, 0x01)
+        self.assertEqual(mem, 0x01 | 0x200)
+        self.assertEqual(state.get_vgpr(2), 0x01)
+        self.assertEqual(state.lds.read_dword(addr_and_data), 0x01 | 0x200)
+        self.assertEqual(state.get_vgpr(0), addr_and_data)
+
+    def test_full_operand_aliasing_three_way(self) -> None:
+        """Destination, Address, and Data all share the same register: v[5] = ds_or_rtn_b32 v[5], v[5]."""
+        state = ScalarMachineState()
+        val = 0x400
+        state.set_vgpr(5, val)
+        state.lds.write_dword(val, 0x1000)
+
+        instr = DSOrInstruction(
+            opcode=DSOpcode.DS_OR_RTN_B32,
+            dst=VGPR(5),
+            addr=VGPR(5),
+            data=VGPR(5),
+        )
+        old, mem = self.scalar_interp.step(instr, state)
+        self.assertEqual(old, 0x1000)
+        self.assertEqual(mem, 0x1000 | 0x400)
+        # v[5] receives old_val
+        self.assertEqual(state.get_vgpr(5), 0x1000)
+        # Memory at address 0x400 was updated
+        self.assertEqual(state.lds.read_dword(val), 0x1000 | 0x400)
+
+    def test_unrelated_vgprs_unmodified(self) -> None:
+        """Canary test: ensure all 256 VGPRs outside destination remain untouched."""
+        state = ScalarMachineState()
+        canary_base = 0xDEAD0000
+        for r in range(256):
+            state.set_vgpr(r, canary_base | r)
+
+        addr = 0x100
+        state.set_vgpr(10, addr)
+        state.set_vgpr(11, 0x55)
+        state.lds.write_dword(addr, 0xAA)
+
+        instr = DSOrInstruction(
+            opcode=DSOpcode.DS_OR_RTN_B32,
+            dst=VGPR(9),
+            addr=VGPR(10),
+            data=VGPR(11),
+        )
+        self.scalar_interp.step(instr, state)
+
+        # Destination v[9] was updated
+        self.assertEqual(state.get_vgpr(9), 0xAA)
+        # Operands unchanged
+        self.assertEqual(state.get_vgpr(10), addr)
+        self.assertEqual(state.get_vgpr(11), 0x55)
+
+        # Check all other 253 registers
+        for r in range(256):
+            if r not in (9, 10, 11):
+                self.assertEqual(state.get_vgpr(r), canary_base | r)
+
+    def test_simd_multi_lane_aliasing(self) -> None:
+        """All 32 lanes alias destination with address: v[0] = ds_or_rtn_b32 v[0], v[1]."""
+        state = SIMDState(num_lanes=32)
+        for lane in range(32):
+            addr = 0x300 + lane * 4
+            state.set_vgpr(lane, 0, addr)        # v[0] = addr AND dst
+            state.set_vgpr(lane, 1, 1 << lane)   # v[1] = data
+            state.lds.write_dword(addr, 0x8000_0000)
+
+        instr = DSOrInstruction(
+            opcode=DSOpcode.DS_OR_RTN_B32,
+            dst=VGPR(0),
+            addr=VGPR(0),
+            data=VGPR(1),
+        )
+        self.simd_interp.step(instr, state)
+
+        for lane in range(32):
+            addr = 0x300 + lane * 4
+            self.assertEqual(state.get_vgpr(lane, 0), 0x8000_0000)
+            self.assertEqual(state.lds.read_dword(addr), 0x8000_0000 | (1 << lane))
+
+
 if __name__ == "__main__":
     unittest.main()
