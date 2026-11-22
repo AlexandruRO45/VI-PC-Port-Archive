@@ -223,6 +223,33 @@ class DivFixupF64Tests(unittest.TestCase):
         self.assertIn("FClamp", spv_mod)
         validate_spirv(spv_mod)
 
+    def test_literal_source_is_the_high_dword(self):
+        # A 32-bit literal on a binary64 operand supplies bits 63:32, bits 31:0 are zero (docs/design.md,
+        # "f64 literal sources"): the same result as the value in a register pair, in each source position.
+        lit = 0xC0000000                       # high word of -2.0
+        as_pair = lit << 32
+        for pos, insn in enumerate((
+            f"v_div_fixup_f64 v[0:1], {lit:#x}, v[4:5], v[6:7]",
+            f"v_div_fixup_f64 v[0:1], v[2:3], {lit:#x}, v[6:7]",
+            f"v_div_fixup_f64 v[0:1], v[2:3], v[4:5], {lit:#x}",
+        )):
+            with self.subTest(source=pos):
+                srcs = [D_THREE, D_ONE, D_ONE]
+                got = run_f64(*srcs, insn=insn)
+                srcs[pos] = as_pair
+                self.assertEqual(got, run_f64(*srcs))
+        # -2.0 as the denominator flips the sign of the quotient; as a low dword it would be a positive denormal.
+        self.assertEqual(run_f64(D_THREE, 0, D_ONE, f"v_div_fixup_f64 v[0:1], v[2:3], {lit:#x}, v[6:7]"),
+                         D_THREE | (1 << 63))
+
+    def test_inline_integer_source_is_not_a_literal(self):
+        # LLVM prints an inline integer in decimal and the literal dword in hex: inline 1 is the integer 1
+        # sign-extended (a denormal), the printed literal 0x1 is bits 63:32.
+        self.assertEqual(run_f64(D_THREE, 0, D_ONE, "v_div_fixup_f64 v[0:1], v[2:3], 1, v[6:7]"),
+                         run_f64(D_THREE, 1, D_ONE))
+        self.assertEqual(run_f64(D_THREE, 0, D_ONE, "v_div_fixup_f64 v[0:1], v[2:3], 0x1, v[6:7]"),
+                         run_f64(D_THREE, 1 << 32, D_ONE))
+
     def test_rejects_non_pair_destination(self):
         with self.assertRaises(rdna2spirv.Unsupported):
             translate_lines(["v_div_fixup_f64 v0, v[2:3], v[4:5], v[6:7]"])

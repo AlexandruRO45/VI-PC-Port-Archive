@@ -187,6 +187,35 @@ class DivFmasF64Tests(unittest.TestCase):
                     self.assertNotIn("FClamp", spv)
                 validate_spirv(spv)
 
+    def test_f64_literal_source_is_the_high_dword(self):
+        # A 32-bit literal on a binary64 operand supplies bits 63:32, bits 31:0 are zero (docs/design.md,
+        # "f64 literal sources"). 0x40100000 is the high word of 4.0: in each source position the module must
+        # build the operand as (lo 0, hi literal), never (lo literal, hi 0).
+        for pos, insn in enumerate((
+            "v_div_fmas_f64 v[0:1], 0x40100000, v[2:3], v[4:5]",
+            "v_div_fmas_f64 v[0:1], v[2:3], 0x40100000, v[4:5]",
+            "v_div_fmas_f64 v[0:1], v[2:3], v[4:5], 0x40100000",
+        )):
+            with self.subTest(source=pos):
+                spv = translate_lines([
+                    "v_mov_b32 v2, 0", "v_mov_b32 v3, 0x3ff80000",      # 1.5
+                    "v_mov_b32 v4, 0", "v_mov_b32 v5, 0x3ff00000",      # 1.0
+                    "v_cmp_eq_u32_e32 vcc_lo, 1, 0",
+                    insn,
+                ])
+                lit, = re.findall(r"(%\w+) = OpConstant %uint 1074790400\b", spv)      # 0x40100000
+                zero, = re.findall(r"(%\w+) = OpConstant %uint 0\b", spv)
+                self.assertIn(f"OpCompositeConstruct %v2uint_d {zero} {lit}", spv)
+                self.assertNotIn(f"OpCompositeConstruct %v2uint_d {lit} ", spv)
+                validate_spirv(spv)
+        # The printed literal 0x1 is bits 63:32; inline 1 stays the sign-extended integer (low dword).
+        one = lambda src: translate_lines([f"v_div_fmas_f64 v[0:1], v[2:3], {src}, v[4:5]"])    # noqa: E731
+        spv_lit, spv_inline = one("0x1"), one("1")
+        c0, = re.findall(r"(%\w+) = OpConstant %uint 0\b", spv_lit)
+        c1, = re.findall(r"(%\w+) = OpConstant %uint 1\b", spv_lit)
+        self.assertIn(f"OpCompositeConstruct %v2uint_d {c0} {c1}", spv_lit)
+        self.assertIn(f"OpCompositeConstruct %v2uint_d {c1} {c0}", spv_inline)
+
     def test_f64_rejects_non_pair_destination(self):
         with self.assertRaises(rdna2spirv.Unsupported):
             translate_lines(["v_div_fmas_f64 v0, v[2:3], v[4:5], v[6:7]"])
