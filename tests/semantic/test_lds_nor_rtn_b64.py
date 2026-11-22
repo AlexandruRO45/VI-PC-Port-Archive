@@ -181,5 +181,222 @@ class TestLdsNorRtnB64Oracle(unittest.TestCase):
         self.assertEqual(self.lds.read_qword(32), 0xAAAAAAAAAAAAAAAA)
 
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class DSOpcode(str, enum.Enum):
+    """Data Share (DS) 64-bit atomic opcodes for bitwise NOR."""
+    DS_NOR_RTN_B64 = "ds_nor_rtn_b64"
+    DS_NOR_B64 = "ds_nor_b64"
+
+    @property
+    def is_return(self) -> bool:
+        return "rtn" in self.value
+
+
+@dataclasses.dataclass(frozen=True)
+class RegSingle:
+    """Single 32-bit Vector General Purpose Register (v0 - v255)."""
+    index: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"RegSingle index out of range [0, 255]: {self.index}")
+
+    def __str__(self) -> str:
+        return f"v{self.index}"
+
+
+@dataclasses.dataclass(frozen=True)
+class RegPair:
+    """Aligned pair of 32-bit registers forming a 64-bit register (v[n:n+1])."""
+    index: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 254):
+            raise ValueError(f"RegPair base index out of range [0, 254]: {self.index}")
+
+    def __str__(self) -> str:
+        return f"v[{self.index}:{self.index + 1}]"
+
+
+@dataclasses.dataclass(frozen=True)
+class OffsetImmediate:
+    """16-bit unsigned byte offset immediate for DS instructions."""
+    value: int = 0
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.value <= 65535):
+            raise ValueError(f"OffsetImmediate out of range [0, 65535]: {self.value}")
+
+    def __str__(self) -> str:
+        return f"offset:{self.value}"
+
+
+@dataclasses.dataclass
+class DSNorRtnB64Instruction:
+    """Symbolic AST node for ds_nor_rtn_b64 / ds_nor_b64 instruction."""
+    opcode: DSOpcode
+    vaddr: RegSingle
+    vdata: RegPair
+    vdst: Optional[RegPair] = None
+    offset: OffsetImmediate = dataclasses.field(default_factory=lambda: OffsetImmediate(0))
+    gds: bool = False
+
+    def __post_init__(self) -> None:
+        if self.opcode.is_return and self.vdst is None:
+            raise ValueError(f"Return opcode {self.opcode.value} requires vdst register pair")
+        if not self.opcode.is_return and self.vdst is not None:
+            raise ValueError(f"Non-return opcode {self.opcode.value} must not specify vdst register")
+
+    def to_assembly(self) -> str:
+        tokens = [self.opcode.value]
+        if self.opcode.is_return:
+            assert self.vdst is not None
+            tokens.append(f"{self.vdst}, {self.vaddr}, {self.vdata}")
+        else:
+            tokens.append(f"{self.vaddr}, {self.vdata}")
+        suffix_parts = []
+        if self.offset.value != 0:
+            suffix_parts.append(str(self.offset))
+        if self.gds:
+            suffix_parts.append("gds")
+        if suffix_parts:
+            return f"{tokens[0]} {tokens[1]} {' '.join(suffix_parts)}"
+        return f"{tokens[0]} {tokens[1]}"
+
+    @classmethod
+    def parse(cls, asm: str) -> DSNorRtnB64Instruction:
+        text = asm.strip()
+        if not text:
+            raise ValueError("Empty assembly string")
+        parts = text.split(None, 1)
+        op_str = parts[0]
+        try:
+            opcode = DSOpcode(op_str)
+        except ValueError:
+            raise ValueError(f"Unknown or unsupported opcode: {op_str}")
+
+        if len(parts) < 2:
+            raise ValueError("Missing instruction operands")
+
+        rest = parts[1].strip()
+        tokens = rest.split()
+        reg_tokens: List[str] = []
+        mod_tokens: List[str] = []
+        for t in tokens:
+            if t.startswith("offset:") or t == "gds":
+                mod_tokens.append(t)
+            else:
+                reg_tokens.append(t)
+
+        reg_str = " ".join(reg_tokens)
+        reg_names = [r.strip() for r in reg_str.split(",") if r.strip()]
+
+        def parse_single(name: str) -> RegSingle:
+            if not name.startswith("v") or "[" in name:
+                raise ValueError(f"Expected single VGPR, got {name}")
+            return RegSingle(int(name[1:]))
+
+        def parse_pair(name: str) -> RegPair:
+            # Matches v[a:b] or va
+            if name.startswith("v[") and name.endswith("]"):
+                inner = name[2:-1]
+                p = inner.split(":")
+                return RegPair(int(p[0]))
+            elif name.startswith("v"):
+                return RegPair(int(name[1:]))
+            raise ValueError(f"Expected VGPR pair, got {name}")
+
+        offset_val = 0
+        gds = False
+        for mod in mod_tokens:
+            if mod.startswith("offset:"):
+                offset_val = int(mod.split(":", 1)[1])
+            elif mod == "gds":
+                gds = True
+            else:
+                raise ValueError(f"Unknown modifier: {mod}")
+
+        offset = OffsetImmediate(offset_val)
+
+        if opcode.is_return:
+            if len(reg_names) != 3:
+                raise ValueError(f"Expected 3 operands for {opcode.value}, got {len(reg_names)}")
+            vdst = parse_pair(reg_names[0])
+            vaddr = parse_single(reg_names[1])
+            vdata = parse_pair(reg_names[2])
+            return cls(opcode=opcode, vaddr=vaddr, vdata=vdata, vdst=vdst, offset=offset, gds=gds)
+        else:
+            if len(reg_names) != 2:
+                raise ValueError(f"Expected 2 operands for {opcode.value}, got {len(reg_names)}")
+            vaddr = parse_single(reg_names[0])
+            vdata = parse_pair(reg_names[1])
+            return cls(opcode=opcode, vaddr=vaddr, vdata=vdata, offset=offset, gds=gds)
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Unit tests for 64-bit AST opcode definitions, typed operands, and parsing."""
+
+    def test_register_bounds(self) -> None:
+        v0 = RegSingle(0)
+        v255 = RegSingle(255)
+        self.assertEqual(str(v0), "v0")
+        self.assertEqual(str(v255), "v255")
+        with self.assertRaises(ValueError):
+            RegSingle(-1)
+        with self.assertRaises(ValueError):
+            RegSingle(256)
+
+        vp0 = RegPair(0)
+        vp254 = RegPair(254)
+        self.assertEqual(str(vp0), "v[0:1]")
+        self.assertEqual(str(vp254), "v[254:255]")
+        with self.assertRaises(ValueError):
+            RegPair(255)
+
+    def test_instruction_validation(self) -> None:
+        inst_rtn = DSNorRtnB64Instruction(
+            opcode=DSOpcode.DS_NOR_RTN_B64,
+            vaddr=RegSingle(1),
+            vdata=RegPair(2),
+            vdst=RegPair(0),
+            offset=OffsetImmediate(8),
+        )
+        self.assertEqual(inst_rtn.to_assembly(), "ds_nor_rtn_b64 v[0:1], v1, v[2:3] offset:8")
+
+        inst_nortn = DSNorRtnB64Instruction(
+            opcode=DSOpcode.DS_NOR_B64,
+            vaddr=RegSingle(1),
+            vdata=RegPair(2),
+        )
+        self.assertEqual(inst_nortn.to_assembly(), "ds_nor_b64 v1, v[2:3]")
+
+        with self.assertRaises(ValueError):
+            DSNorRtnB64Instruction(
+                opcode=DSOpcode.DS_NOR_RTN_B64,
+                vaddr=RegSingle(1),
+                vdata=RegPair(2),
+                vdst=None,
+            )
+
+    def test_instruction_parsing_and_roundtrip(self) -> None:
+        asm1 = "ds_nor_rtn_b64 v[0:1], v1, v[2:3] offset:16"
+        inst1 = DSNorRtnB64Instruction.parse(asm1)
+        self.assertEqual(inst1.opcode, DSOpcode.DS_NOR_RTN_B64)
+        self.assertEqual(inst1.vdst, RegPair(0))
+        self.assertEqual(inst1.vaddr, RegSingle(1))
+        self.assertEqual(inst1.vdata, RegPair(2))
+        self.assertEqual(inst1.offset.value, 16)
+        self.assertEqual(inst1.to_assembly(), asm1)
+
+        asm2 = "ds_nor_b64 v5, v[6:7]"
+        inst2 = DSNorRtnB64Instruction.parse(asm2)
+        self.assertEqual(inst2.opcode, DSOpcode.DS_NOR_B64)
+        self.assertIsNone(inst2.vdst)
+        self.assertEqual(inst2.to_assembly(), asm2)
+
+
 if __name__ == "__main__":
     unittest.main()
