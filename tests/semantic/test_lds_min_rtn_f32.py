@@ -584,5 +584,191 @@ class TestDSMinRtnF32AST(unittest.TestCase):
             RegisterOperand(-1, RegType.VGPR)
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarThreadState:
+    """Architectural state for a single execution thread with scalar register file and LDS."""
+
+    def __init__(
+        self,
+        lds: Optional[LDSMemory] = None,
+        num_vgprs: int = DEFAULT_NUM_VGPRS,
+        num_sgprs: int = DEFAULT_NUM_SGPRS,
+    ) -> None:
+        self.lds: LDSMemory = lds if lds is not None else LDSMemory()
+        self.vgprs: List[int] = [0] * num_vgprs
+        self.sgprs: List[int] = [0] * num_sgprs
+
+    def get_vgpr(self, reg: Union[RegisterOperand, int]) -> int:
+        idx = reg.index if isinstance(reg, RegisterOperand) else reg
+        return self.vgprs[idx]
+
+    def set_vgpr(self, reg: Union[RegisterOperand, int], val: int) -> None:
+        idx = reg.index if isinstance(reg, RegisterOperand) else reg
+        self.vgprs[idx] = u32(val)
+
+    def get_sgpr(self, reg: Union[RegisterOperand, int]) -> int:
+        idx = reg.index if isinstance(reg, RegisterOperand) else reg
+        return self.sgprs[idx]
+
+    def set_sgpr(self, reg: Union[RegisterOperand, int], val: int) -> None:
+        idx = reg.index if isinstance(reg, RegisterOperand) else reg
+        self.sgprs[idx] = u32(val)
+
+
+class ScalarDSInterpreter:
+    """Deterministic scalar interpreter executing DS instructions."""
+
+    def execute(self, state: ScalarThreadState, inst: DSMinRtnF32Instruction) -> Tuple[int, int]:
+        # 1. Latch input operands before any register update
+        base_addr = state.get_vgpr(inst.vaddr)
+        if isinstance(inst.vdata0, RegisterOperand):
+            vdata_val = state.get_vgpr(inst.vdata0)
+        else:
+            vdata_val = inst.vdata0.value
+
+        # 2. Atomic memory transaction on LDS
+        old_val, new_mem = state.lds.atomic_min_rtn_f32(
+            vaddr=base_addr,
+            vdata0=vdata_val,
+            offset=inst.offset,
+        )
+
+        # 3. Write return value to destination VGPR
+        state.set_vgpr(inst.vdst, old_val)
+
+        return old_val, new_mem
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Phase 3: Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(DEFAULT_LDS_SIZE_BYTES)
+        self.state = ScalarThreadState(lds=self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_scalar_execution_basic(self) -> None:
+        addr = 0x40
+        self.lds.write_dword(addr, TEN_F32)
+
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, TWO_F32)
+        self.state.set_vgpr(0, 0xCAFEBABE)
+
+        inst = DSMinRtnF32Instruction(
+            vdst=RegisterOperand(0),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+        )
+
+        # min(10.0, 2.0) = 2.0
+        old_val, new_mem = self.interp.execute(self.state, inst)
+
+        self.assertEqual(old_val, TEN_F32)
+        self.assertEqual(new_mem, TWO_F32)
+        self.assertEqual(self.state.get_vgpr(0), TEN_F32)
+        self.assertEqual(self.lds.read_dword(addr), TWO_F32)
+
+    def test_scalar_execution_with_offset(self) -> None:
+        base_addr = 0x100
+        offset = 0x14
+        eff_addr = base_addr + offset
+
+        self.lds.write_dword(eff_addr, ONE_F32)
+        self.state.set_vgpr(1, base_addr)
+        self.state.set_vgpr(2, NEG_TWO_F32)
+
+        inst = DSMinRtnF32Instruction(
+            vdst=RegisterOperand(0),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+            offset=offset,
+        )
+
+        # min(1.0, -2.0) = -2.0
+        old_val, new_mem = self.interp.execute(self.state, inst)
+
+        self.assertEqual(old_val, ONE_F32)
+        self.assertEqual(new_mem, NEG_TWO_F32)
+        self.assertEqual(self.state.get_vgpr(0), ONE_F32)
+        self.assertEqual(self.lds.read_dword(eff_addr), NEG_TWO_F32)
+
+    def test_scalar_execution_with_immediate(self) -> None:
+        addr = 0x200
+        self.lds.write_dword(addr, TWO_F32)
+        self.state.set_vgpr(1, addr)
+
+        inst = DSMinRtnF32Instruction(
+            vdst=RegisterOperand(0),
+            vaddr=RegisterOperand(1),
+            vdata0=Immediate(HALF_F32),
+        )
+
+        # min(2.0, 0.5) = 0.5
+        old_val, new_mem = self.interp.execute(self.state, inst)
+
+        self.assertEqual(old_val, TWO_F32)
+        self.assertEqual(new_mem, HALF_F32)
+        self.assertEqual(self.state.get_vgpr(0), TWO_F32)
+        self.assertEqual(self.lds.read_dword(addr), HALF_F32)
+
+    def test_scalar_unaligned_byte_address(self) -> None:
+        self.lds.write_dword(0x300, THREE_F32)
+        self.state.set_vgpr(1, 0x303)
+        self.state.set_vgpr(2, ONE_F32)
+
+        inst = DSMinRtnF32Instruction(
+            vdst=RegisterOperand(0),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+        )
+
+        old_val, new_mem = self.interp.execute(self.state, inst)
+        self.assertEqual(old_val, THREE_F32)
+        self.assertEqual(new_mem, ONE_F32)
+        self.assertEqual(self.lds.read_dword(0x300), ONE_F32)
+
+    def test_scalar_signed_zero_ordering(self) -> None:
+        addr = 0x80
+        self.lds.write_dword(addr, POS_ZERO)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, NEG_ZERO)
+
+        inst = DSMinRtnF32Instruction(
+            vdst=RegisterOperand(0),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+        )
+
+        # min(+0.0, -0.0) = -0.0
+        old_val, new_mem = self.interp.execute(self.state, inst)
+        self.assertEqual(old_val, POS_ZERO)
+        self.assertEqual(new_mem, NEG_ZERO)
+        self.assertEqual(self.state.get_vgpr(0), POS_ZERO)
+        self.assertEqual(self.lds.read_dword(addr), NEG_ZERO)
+
+    def test_scalar_nan_suppression(self) -> None:
+        addr = 0x90
+        self.lds.write_dword(addr, QNAN_PAYLOAD_A)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, ONE_F32)
+
+        inst = DSMinRtnF32Instruction(
+            vdst=RegisterOperand(0),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+        )
+
+        # min(NaN, 1.0) = 1.0
+        old_val, new_mem = self.interp.execute(self.state, inst)
+        self.assertEqual(old_val, QNAN_PAYLOAD_A)
+        self.assertEqual(new_mem, ONE_F32)
+        self.assertEqual(self.state.get_vgpr(0), QNAN_PAYLOAD_A)
+        self.assertEqual(self.lds.read_dword(addr), ONE_F32)
+
+
 if __name__ == "__main__":
     unittest.main()
