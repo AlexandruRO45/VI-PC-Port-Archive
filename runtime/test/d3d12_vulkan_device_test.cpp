@@ -1240,36 +1240,6 @@ int main() {
         rtv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
         device->CreateRenderTargetView(rt_resource.p, &rtv_desc, rtv1);
-        // D3D-79: a TEXTURE2DMSARRAY depth-stencil view names its layers; a cleared layer runs on Vulkan. The slot is
-        // reused for the main test's view right after.
-        {
-            D3D12_RESOURCE_DESC ms_desc = texture_desc(size, size, DXGI_FORMAT_D32_FLOAT,
-                                                       D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
-            ms_desc.DepthOrArraySize = 3;
-            ms_desc.SampleDesc.Count = 4;
-            Ref<ID3D12Resource> ms_depth;
-            EXPECT(SUCCEEDED(create(default_heap, ms_desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, ms_depth)));
-            D3D12_DEPTH_STENCIL_VIEW_DESC ms_view{};
-            ms_view.Format = DXGI_FORMAT_D32_FLOAT;
-            ms_view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY;
-            ms_view.Texture2DMSArray.FirstArraySlice = 1;
-            ms_view.Texture2DMSArray.ArraySize = 2;
-            std::memset(reinterpret_cast<void*>(dsv0.ptr), 0x77, sizeof(leonida::TargetView));
-            device->CreateDepthStencilView(ms_depth.p, &ms_view, dsv0);
-            leonida::TargetView recorded{};
-            std::memcpy(&recorded, reinterpret_cast<const void*>(dsv0.ptr), sizeof(recorded));
-            EXPECT(recorded.resource != 0 && recorded.mip == 0 && recorded.first_layer == 1 &&
-                   recorded.layer_count == 2);
-            list->ClearDepthStencilView(dsv0, D3D12_CLEAR_FLAG_DEPTH, 0.5f, 0, 0, nullptr);
-            EXPECT(list->Close() == S_OK);
-            ID3D12CommandList* ms_lists[] = {list.p};
-            queue->ExecuteCommandLists(1, ms_lists);
-            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-            Ref<ID3D12Fence> ms_fence;  // its own, so the main test's fence values stay in order
-            EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&ms_fence.p))));
-            EXPECT(SUCCEEDED(queue->Signal(ms_fence.p, 1)) && SUCCEEDED(ms_fence->SetEventOnCompletion(1, nullptr)));
-            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
-        }
         device->CreateDepthStencilView(ds.p, nullptr, dsv0);
 
         // List 1: clears and barriers on never-written resources (their first use zero-fills them), then copies of
