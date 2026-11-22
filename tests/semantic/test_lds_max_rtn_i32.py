@@ -1321,5 +1321,169 @@ class TestDSMaxRtnI32IEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(self.lds.read_dword(last_dword_addr), 150)
 
 
+class TestDSMaxRtnI32NegativeControlsAndMutations(unittest.TestCase):
+    """Phase 8: Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_strings(self) -> None:
+        invalid_assemblies = [
+            "",
+            "   ",
+            "v_max_i32 v0, v1, v2",
+            "ds_max_rtn_u32 v0, v1, v2",
+            "ds_min_rtn_i32 v0, v1, v2",
+            "ds_max_i32 v0, v1, v2",
+            "ds_max_rtn_i32",
+            "ds_max_rtn_i32 v0",
+            "ds_max_rtn_i32 v0, v1",
+            "ds_max_rtn_i32 v0, v1, v2, v3",
+            "ds_max_rtn_i32 r0, v1, v2",
+            "ds_max_rtn_i32 v0, s1, v2",
+            "ds_max_rtn_i32 v0, v1, s2",
+            "ds_max_rtn_i32 v256, v1, v2",
+            "ds_max_rtn_i32 v0, v1, v2 offset:-1",
+            "ds_max_rtn_i32 v0, v1, v2 offset:70000",
+            "ds_max_rtn_i32 v0, v1, v2 offset:xyz",
+            "ds_max_rtn_i32 v0, v1, v2 bad_modifier",
+        ]
+        for asm in invalid_assemblies:
+            with self.subTest(asm=asm):
+                with self.assertRaises(ValueError):
+                    DSMaxRtnI32Instruction.parse(asm)
+
+    def test_architectural_model_negative_controls(self) -> None:
+        with self.assertRaises(ValueError):
+            LDSMemory(size_dwords=1000)
+        with self.assertRaises(ValueError):
+            LDSMemory(size_dwords=-64)
+        with self.assertRaises(ValueError):
+            LDSMemory(size_dwords=0)
+
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=128)
+
+    def test_mutation_detection_unsigned_comparison(self) -> None:
+        # Mutant: treats 32-bit values as unsigned integers instead of signed
+        def mutant_max_unsigned(curr_mem: int, data_val: int) -> Tuple[int, int]:
+            old = u32(curr_mem)
+            new = max(u32(curr_mem), u32(data_val))
+            return old, new
+
+        # In signed i32: 0 > -1 (0x00000000 > 0xFFFFFFFF).
+        # In unsigned: 0xFFFFFFFF > 0x00000000.
+        # Mutant returns 0xFFFFFFFF, whereas true oracle returns 0.
+        _, mutant_res = mutant_max_unsigned(0, 0xFFFFFFFF)
+        _, oracle_res = ref_ds_max_rtn_i32(0, 0xFFFFFFFF)
+        self.assertNotEqual(mutant_res, oracle_res)
+        self.assertEqual(oracle_res, 0)
+        self.assertEqual(mutant_res, 0xFFFFFFFF)
+
+    def test_mutation_detection_inverted_min_instead_of_max(self) -> None:
+        # Mutant: computes signed minimum instead of signed maximum
+        def mutant_min_i32(curr_mem: int, data_val: int) -> Tuple[int, int]:
+            old = u32(curr_mem)
+            new = u32(min(s32(curr_mem), s32(data_val)))
+            return old, new
+
+        _, mutant_res = mutant_min_i32(10, 20)
+        _, oracle_res = ref_ds_max_rtn_i32(10, 20)
+        self.assertNotEqual(mutant_res, oracle_res)
+        self.assertEqual(oracle_res, 20)
+        self.assertEqual(mutant_res, 10)
+
+    def test_mutation_detection_destructive_aliasing(self) -> None:
+        # Mutant: overwrites destination register before latching source address
+        class DestructiveMutantInterpreter(ScalarDSInterpreter):
+            def execute(self, state: ScalarThreadState, inst: DSMaxRtnI32Instruction) -> int:
+                # Prematurely clobber vdst before reading vaddr/vdata0
+                state.set_vgpr(inst.vdst.index, 0xBAD00000)
+                return super().execute(state, inst)
+
+        lds = LDSMemory(size_dwords=1024)
+        lds.write_dword(0x20, 100)
+        state = ScalarThreadState(lds=lds)
+        state.set_vgpr(0, 0x20)  # v0 is vdst and vaddr
+        state.set_vgpr(1, 200)   # v1 is vdata0
+
+        inst = DSMaxRtnI32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(0, RegType.VGPR),
+            vdata0=RegisterOperand(1, RegType.VGPR),
+        )
+
+        mutant = DestructiveMutantInterpreter()
+        mutant.execute(state, inst)
+        # Because of premature overwrite, mutant accessed 0xBAD00000 instead of 0x20!
+        # Memory at 0x20 is not updated by the mutant!
+        self.assertNotEqual(lds.read_dword(0x20), 200)
+
+    def test_mutation_detection_ignore_exec_mask(self) -> None:
+        # Mutant: ignores EXEC mask and executes inactive lanes
+        class MutantSIMDInterpreter(SIMDDSInterpreter):
+            def execute(self, state: SIMDWaveState, inst: DSMaxRtnI32Instruction) -> Dict[int, int]:
+                saved_mask = state.exec_mask
+                state.exec_mask = state.full_mask
+                try:
+                    return super().execute(state, inst)
+                finally:
+                    state.exec_mask = saved_mask
+
+        lds = LDSMemory(size_dwords=1024)
+        lds.write_dword(0x40, 10)
+        wave = SIMDWaveState(wave_size=32, exec_mask=0, lds=lds)
+        for l in range(32):
+            wave.set_lane_vgpr(l, 1, 0x40)
+            wave.set_lane_vgpr(l, 2, 500)
+
+        inst = DSMaxRtnI32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+        )
+
+        mutant = MutantSIMDInterpreter()
+        mutant.execute(wave, inst)
+        # Mutant executed despite exec_mask=0
+        self.assertEqual(lds.read_dword(0x40), 500)
+
+        # Standard interpreter with exec_mask=0 does not modify memory
+        lds.write_dword(0x40, 10)
+        SIMDDSInterpreter().execute(wave, inst)
+        self.assertEqual(lds.read_dword(0x40), 10)
+
+    def test_mutation_detection_dropped_immediate_offset(self) -> None:
+        # Mutant: drops instruction offset
+        class DroppedOffsetInterpreter(ScalarDSInterpreter):
+            def execute(self, state: ScalarThreadState, inst: DSMaxRtnI32Instruction) -> int:
+                no_off_inst = DSMaxRtnI32Instruction(
+                    vdst=inst.vdst,
+                    vaddr=inst.vaddr,
+                    vdata0=inst.vdata0,
+                    offset=0,
+                )
+                return super().execute(state, no_off_inst)
+
+        lds = LDSMemory(size_dwords=1024)
+        lds.write_dword(0x10, 50)
+        lds.write_dword(0x20, 50)
+        state = ScalarThreadState(lds=lds)
+        state.set_vgpr(1, 0x10)  # base
+        state.set_vgpr(2, 90)
+
+        inst = DSMaxRtnI32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+            offset=0x10,  # effective addr should be 0x20
+        )
+
+        mutant = DroppedOffsetInterpreter()
+        mutant.execute(state, inst)
+        # Mutant updated 0x10 instead of 0x20
+        self.assertEqual(lds.read_dword(0x10), 90)
+        self.assertEqual(lds.read_dword(0x20), 50)
+
+
 if __name__ == "__main__":
     unittest.main()
