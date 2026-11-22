@@ -34,8 +34,11 @@ Architecture & Specification:
       The pre-operation memory value (old_val) is returned to vector register vdst.
 """
 
+from dataclasses import dataclass, field
+from enum import Enum, auto
+import re
 import unittest
-from typing import Tuple
+from typing import Optional, Tuple
 
 # RDNA2 Local Data Share (LDS) Architectural Constants
 LDS_SIZE_BYTES: int = 65536         # 64 KiB default capacity
@@ -248,6 +251,189 @@ class TestReferenceOracleAndLDSModel(unittest.TestCase):
         self.assertEqual(old, 4)
         self.assertEqual(new_mem, 0)
         self.assertEqual(lds.read_dword(addr), 0)
+
+
+# ==============================================================================
+# Phase 2: Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class DSOpcode(Enum):
+    """Data Share (DS) atomic opcodes."""
+    DS_INC_RTN_U32 = "ds_inc_rtn_u32"
+
+
+class RegType(Enum):
+    """Register file classes."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclass(frozen=True)
+class RegisterOperand:
+    """Typed symbolic register operand representation."""
+    index: int
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        max_limit = DEFAULT_NUM_VGPRS if self.reg_type == RegType.VGPR else DEFAULT_NUM_SGPRS
+        if not (0 <= self.index < max_limit):
+            raise ValueError(
+                f"{self.reg_type.name} index out of architectural bounds [0..{max_limit - 1}]: {self.index}"
+            )
+
+    @property
+    def name(self) -> str:
+        return f"{self.reg_type.value}{self.index}"
+
+    def __str__(self) -> str:
+        return self.name
+
+
+@dataclass(frozen=True)
+class DSIncRtnInstruction:
+    """Symbolic AST node for ds_inc_rtn_u32 instruction."""
+    vdst: RegisterOperand
+    vaddr: RegisterOperand
+    vdata: RegisterOperand
+    offset: int = 0
+    opcode: DSOpcode = DSOpcode.DS_INC_RTN_U32
+
+    def __post_init__(self) -> None:
+        if self.vdst.reg_type != RegType.VGPR:
+            raise TypeError(f"vdst must be VGPR, got {self.vdst.reg_type}")
+        if self.vaddr.reg_type != RegType.VGPR:
+            raise TypeError(f"vaddr must be VGPR, got {self.vaddr.reg_type}")
+        if self.vdata.reg_type != RegType.VGPR:
+            raise TypeError(f"vdata must be VGPR, got {self.vdata.reg_type}")
+        if not (0 <= self.offset <= OFFSET16_MASK):
+            raise ValueError(f"offset out of bounds [0..0xFFFF]: {self.offset}")
+
+    def format_asm(self) -> str:
+        base = f"{self.opcode.value} {self.vdst.name}, {self.vaddr.name}, {self.vdata.name}"
+        if self.offset != 0:
+            base += f" offset:{self.offset}"
+        return base
+
+    @classmethod
+    def parse(cls, asm_line: str) -> DSIncRtnInstruction:
+        clean = re.sub(r"//.*|/\*.*?\*/|;.*", "", asm_line).strip()
+        if not clean:
+            raise ValueError("Empty assembly line")
+
+        tokens = [t.strip() for t in clean.replace(",", " ").split() if t.strip()]
+        if len(tokens) < 4:
+            raise ValueError(f"Too few tokens for ds_inc_rtn_u32 instruction: '{clean}'")
+
+        op_str = tokens[0].lower()
+        if op_str != DSOpcode.DS_INC_RTN_U32.value:
+            raise ValueError(f"Expected opcode {DSOpcode.DS_INC_RTN_U32.value}, got: '{tokens[0]}'")
+
+        def parse_vgpr(reg_str: str) -> RegisterOperand:
+            m = re.match(r"^v(\d+)$", reg_str.lower())
+            if not m:
+                raise ValueError(f"Expected VGPR token (e.g. v0), got: '{reg_str}'")
+            return RegisterOperand(int(m.group(1)), RegType.VGPR)
+
+        vdst = parse_vgpr(tokens[1])
+        vaddr = parse_vgpr(tokens[2])
+        vdata = parse_vgpr(tokens[3])
+        offset = 0
+
+        for extra in tokens[4:]:
+            m = re.match(r"^offset:(\d+|0x[0-9a-fA-F]+)$", extra.lower())
+            if m:
+                val_str = m.group(1)
+                offset = int(val_str, 16 if val_str.startswith("0x") else 10)
+            else:
+                raise ValueError(f"Unrecognized instruction modifier: '{extra}'")
+
+        return cls(vdst=vdst, vaddr=vaddr, vdata=vdata, offset=offset)
+
+
+class TestSymbolicASTAndInstruction(unittest.TestCase):
+    """Phase 2: Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_instantiation_valid(self) -> None:
+        v0 = RegisterOperand(0, RegType.VGPR)
+        v1 = RegisterOperand(1, RegType.VGPR)
+        v2 = RegisterOperand(2, RegType.VGPR)
+        instr = DSIncRtnInstruction(vdst=v0, vaddr=v1, vdata=v2, offset=16)
+
+        self.assertEqual(instr.opcode, DSOpcode.DS_INC_RTN_U32)
+        self.assertEqual(instr.vdst.name, "v0")
+        self.assertEqual(instr.vaddr.name, "v1")
+        self.assertEqual(instr.vdata.name, "v2")
+        self.assertEqual(instr.offset, 16)
+
+    def test_asm_formatting(self) -> None:
+        v0 = RegisterOperand(0, RegType.VGPR)
+        v1 = RegisterOperand(1, RegType.VGPR)
+        v2 = RegisterOperand(2, RegType.VGPR)
+
+        instr_no_offset = DSIncRtnInstruction(vdst=v0, vaddr=v1, vdata=v2, offset=0)
+        self.assertEqual(instr_no_offset.format_asm(), "ds_inc_rtn_u32 v0, v1, v2")
+
+        instr_offset = DSIncRtnInstruction(vdst=v0, vaddr=v1, vdata=v2, offset=32)
+        self.assertEqual(instr_offset.format_asm(), "ds_inc_rtn_u32 v0, v1, v2 offset:32")
+
+    def test_parse_valid_asm_lines(self) -> None:
+        instr1 = DSIncRtnInstruction.parse("ds_inc_rtn_u32 v0, v1, v2")
+        self.assertEqual(instr1.vdst.index, 0)
+        self.assertEqual(instr1.vaddr.index, 1)
+        self.assertEqual(instr1.vdata.index, 2)
+        self.assertEqual(instr1.offset, 0)
+
+        instr2 = DSIncRtnInstruction.parse("ds_inc_rtn_u32 v10, v20, v30 offset:64 ; with comment")
+        self.assertEqual(instr2.vdst.index, 10)
+        self.assertEqual(instr2.vaddr.index, 20)
+        self.assertEqual(instr2.vdata.index, 30)
+        self.assertEqual(instr2.offset, 64)
+
+        instr3 = DSIncRtnInstruction.parse("ds_inc_rtn_u32 v5, v6, v7 offset:0x20 // hex offset")
+        self.assertEqual(instr3.offset, 32)
+
+    def test_register_bounds_and_type_validation(self) -> None:
+        # Valid bounds
+        RegisterOperand(0, RegType.VGPR)
+        RegisterOperand(255, RegType.VGPR)
+        RegisterOperand(105, RegType.SGPR)
+
+        # Out of bounds
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(106, RegType.SGPR)
+
+        # SGPR invalid for LDS vector instructions
+        s0 = RegisterOperand(0, RegType.SGPR)
+        v1 = RegisterOperand(1, RegType.VGPR)
+        v2 = RegisterOperand(2, RegType.VGPR)
+        with self.assertRaises(TypeError):
+            DSIncRtnInstruction(vdst=s0, vaddr=v1, vdata=v2)
+        with self.assertRaises(TypeError):
+            DSIncRtnInstruction(vdst=v1, vaddr=s0, vdata=v2)
+        with self.assertRaises(TypeError):
+            DSIncRtnInstruction(vdst=v1, vaddr=v2, vdata=s0)
+
+        # Offset validation
+        with self.assertRaises(ValueError):
+            DSIncRtnInstruction(vdst=v1, vaddr=v1, vdata=v2, offset=-1)
+        with self.assertRaises(ValueError):
+            DSIncRtnInstruction(vdst=v1, vaddr=v1, vdata=v2, offset=0x10000)
+
+    def test_parse_rejections(self) -> None:
+        with self.assertRaises(ValueError):
+            DSIncRtnInstruction.parse("")
+        with self.assertRaises(ValueError):
+            DSIncRtnInstruction.parse("ds_inc_rtn_u32 v0, v1")  # too few tokens
+        with self.assertRaises(ValueError):
+            DSIncRtnInstruction.parse("ds_add_rtn_u32 v0, v1, v2")  # wrong opcode
+        with self.assertRaises(ValueError):
+            DSIncRtnInstruction.parse("ds_inc_rtn_u32 s0, v1, v2")  # not VGPR
+        with self.assertRaises(ValueError):
+            DSIncRtnInstruction.parse("ds_inc_rtn_u32 v0, v1, v2 bad_modifier")
 
 
 if __name__ == "__main__":
