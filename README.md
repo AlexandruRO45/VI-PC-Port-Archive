@@ -109,7 +109,19 @@ Review `gpu-report-hardware.md` and paste its full contents as a comment on the 
 | Intel Arc B390 GPU (Panther Lake) | 32 | Skipped, lane range 16–32 | 408 queries passed | [32.0.101.8509 report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7074654193) |
 | Microsoft WARP (software) | 4 | Skipped | 408 queries passed | [Maintainer baseline](docs/experiments.md#independent-bvh-checks-on-pc) |
 
-On CachyOS, an RTX 3060 completed 408 comparisons through Proton and vkd3d-proton with NVIDIA driver 620.70.06. The adapter reported a 32-lane maximum and skipped forced wave64. [Linux translation-layer report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7064204388)
+#### Linux translation layers
+
+These runs execute the Windows package on Linux, where vkd3d-proton translates D3D12 to Vulkan. They test the translation layer and the Vulkan driver, not a Windows driver, and are kept apart from the table above. Under Wine's DXGI, the reported adapter driver version is a placeholder. In a headless container, the reported adapter name can be wrong too, so each row names the device that ran the test.
+
+| Device and Vulkan driver | Translation layer | Default native lanes | Forced wave64 | BVH differential | Evidence |
+|---|---|---:|---|---|---|
+| NVIDIA GeForce RTX 3060, NVIDIA 620.70.06 | Proton-CachyOS, vkd3d-proton 3.1.0 | 32 | Skipped, lane range 32–32 | 408 queries passed, `dxr_tier=12` | [CachyOS report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7064204388) |
+| NVIDIA GeForce RTX 4070, NVIDIA 620.70.06 | Wine 11.21 (Staging), vkd3d-proton 3.1; `offscreen_check` cross-built with clang-cl at `861cde5` | 32 | Skipped, lane range 32–32 | 408 queries passed, `dxr_tier=12`. `bvh_root_roundtrip_hardware` failed because vkd3d-proton serializes the undefined root flags `0x03000000`, which the Windows runtime rejects | [Fedora report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7064884397) |
+| NVIDIA GeForce RTX 5060 Ti, NVIDIA 595.99.02 | Wine 11.21 (Staging), vkd3d-proton 3.1, Docker container | 32 | Skipped, lane range 32–32 | 408 queries passed, `dxr_tier=11` | [Container report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7067186626) |
+| AMD Ryzen 5 9600X integrated GPU (`1002:13c0`), Mesa RADV 25.2.8 | Wine 11.21 (Staging), vkd3d-proton 3.1, Docker container | 32 | Passed, 64 lanes | 408 queries passed, `dxr_tier=11` | [RADV container report](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7067289597) |
+| AMD Radeon RX 9070 XT, Mesa RADV | Proton, vkd3d-proton | 32 | Passed, 64 lanes | 408 queries passed, `dxr_tier=11` | [RADV report by barbiscool](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7069870226) |
+
+Every differential run reproduced the hit, miss, `changed` and `witness` values of the Windows reports. On Windows, the RX 9070 XT selects 64-lane waves by default. Under RADV it selects 32 and passes the forced 64-lane case. vkd3d-proton is required: on the RTX 5060 Ti host, Wine's built-in D3D12 failed `bvh_waves_hardware` (`record=1 field=21`) and skipped the differential test with `dxr_tier=0`.
 
 The eight community reports cover seven GPU models at commit `def386a`. Each Radeon completed all 38 forced-wave64 groups with zero mismatches. The RX 9070 XT, RTX 3070 and RTX 5070 driver retest reported zero D3D12 debug warnings and errors in their passing checks.
 
