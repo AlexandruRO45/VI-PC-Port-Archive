@@ -1201,5 +1201,126 @@ class TestRegisterAliasing(unittest.TestCase):
                 self.assertEqual(state.get_vgpr(i), 0x1000 + i)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclasses.dataclass(frozen=True)
+class FloatConditionCodes:
+    """Architectural condition codes evaluating floating-point minimum results."""
+    zero: bool
+    negative: bool
+    nan: bool
+    infinity: bool
+    subnormal: bool
+    updated: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class LDSStatusFlags:
+    """Status flags for LDS addressing and memory bank mapping."""
+    dword_aligned: bool
+    address_wrapped: bool
+    bank_index: int
+
+
+def compute_float_condition_codes(old_val: int, vdata0: int, result: int) -> FloatConditionCodes:
+    """Compute condition codes from float atomic min result."""
+    res_u = u32(result)
+    old_u = u32(old_val)
+    return FloatConditionCodes(
+        zero=is_zero(res_u),
+        negative=bool(res_u & SIGN_MASK),
+        nan=is_nan(res_u),
+        infinity=is_inf(res_u),
+        subnormal=is_subnormal(res_u),
+        updated=(res_u != old_u),
+    )
+
+
+def compute_lds_status_flags(
+    vaddr: int,
+    offset: int = 0,
+    lds_size_bytes: int = DEFAULT_LDS_SIZE_BYTES,
+) -> LDSStatusFlags:
+    """Evaluate alignment, bank assignment, and boundary wrap status for LDS access."""
+    raw_eff = vaddr + (offset & OFFSET16_MASK)
+    eff_addr = raw_eff & MASK32
+    return LDSStatusFlags(
+        dword_aligned=((eff_addr & 3) == 0),
+        address_wrapped=(raw_eff >= lds_size_bytes),
+        bank_index=calc_lds_bank(eff_addr),
+    )
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Phase 6: Unit tests for condition codes, status flags, and update detection."""
+
+    def test_condition_code_zero(self) -> None:
+        cc_pos = compute_float_condition_codes(ONE_F32, POS_ZERO, POS_ZERO)
+        self.assertTrue(cc_pos.zero)
+        self.assertFalse(cc_pos.negative)
+        self.assertTrue(cc_pos.updated)
+
+        cc_neg = compute_float_condition_codes(POS_ZERO, NEG_ZERO, NEG_ZERO)
+        self.assertTrue(cc_neg.zero)
+        self.assertTrue(cc_neg.negative)
+        self.assertTrue(cc_neg.updated)
+
+    def test_condition_code_negative(self) -> None:
+        cc = compute_float_condition_codes(ONE_F32, NEG_TWO_F32, NEG_TWO_F32)
+        self.assertFalse(cc.zero)
+        self.assertTrue(cc.negative)
+        self.assertFalse(cc.nan)
+        self.assertFalse(cc.infinity)
+        self.assertTrue(cc.updated)
+
+    def test_condition_code_nan(self) -> None:
+        # Both NaN results in NaN
+        res_nan = oracle_min_f32(QNAN_PAYLOAD_A, QNAN_PAYLOAD_B)
+        cc = compute_float_condition_codes(QNAN_PAYLOAD_A, QNAN_PAYLOAD_B, res_nan)
+        self.assertTrue(cc.nan)
+        self.assertFalse(cc.zero)
+        self.assertFalse(cc.infinity)
+
+    def test_condition_code_infinity(self) -> None:
+        cc_neg_inf = compute_float_condition_codes(TEN_F32, NEG_INF, NEG_INF)
+        self.assertTrue(cc_neg_inf.infinity)
+        self.assertTrue(cc_neg_inf.negative)
+        self.assertTrue(cc_neg_inf.updated)
+
+        # min(+inf, 10.0) -> 10.0
+        cc_pos_inf = compute_float_condition_codes(POS_INF, TEN_F32, TEN_F32)
+        self.assertFalse(cc_pos_inf.infinity)
+        self.assertTrue(cc_pos_inf.updated)
+
+    def test_condition_code_subnormal(self) -> None:
+        cc = compute_float_condition_codes(ONE_F32, SUBNORM_MIN, SUBNORM_MIN)
+        self.assertTrue(cc.subnormal)
+        self.assertFalse(cc.zero)
+        self.assertTrue(cc.updated)
+
+    def test_condition_code_updated_flag(self) -> None:
+        # Memory had 10.0, operand was 2.0 -> updated to 2.0 (updated=True)
+        cc1 = compute_float_condition_codes(TEN_F32, TWO_F32, TWO_F32)
+        self.assertTrue(cc1.updated)
+
+        # Memory had 1.0, operand was 5.0 -> min is 1.0 -> updated=False
+        cc2 = compute_float_condition_codes(ONE_F32, TEN_F32, ONE_F32)
+        self.assertFalse(cc2.updated)
+
+    def test_lds_status_alignment_and_wrap(self) -> None:
+        st_aligned = compute_lds_status_flags(0x100, 0x0)
+        self.assertTrue(st_aligned.dword_aligned)
+        self.assertFalse(st_aligned.address_wrapped)
+        self.assertEqual(st_aligned.bank_index, (0x100 >> 2) % 32)
+
+        st_unaligned = compute_lds_status_flags(0x101, 0x0)
+        self.assertFalse(st_unaligned.dword_aligned)
+
+        st_wrapped = compute_lds_status_flags(65536, 0x10)
+        self.assertTrue(st_wrapped.address_wrapped)
+
+
 if __name__ == "__main__":
     unittest.main()
