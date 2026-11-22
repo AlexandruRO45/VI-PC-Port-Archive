@@ -641,6 +641,7 @@ struct ShaderEntry {
     std::string wave64_exchange;
     bool emulated() const { return !wave64_exchange.empty(); }
     std::vector<SignatureElement> input_signature;  // vertex shaders: what the input layout must feed
+    std::optional<std::vector<std::uint32_t>> vertex_input_locations;  // declared Vulkan locations, including empty
     std::vector<std::uint32_t> inputs;              // pixel shaders: input locations declared
     std::vector<std::uint32_t> outputs;             // pixel/vertex shaders: output locations written
     // --f16-interp-fallback: param/attr index -> {low_half_location, high_half_location} (SHADER-378).
@@ -803,6 +804,13 @@ private:
                     if (const Json* v = item.find("component_type"); v && v->kind == Json::Kind::string)
                         element.component_type = v->string;
                     e.input_signature.push_back(std::move(element));
+                }
+            }
+            if (const Json* v = meta.find("vertex_inputs"); v && v->kind == Json::Kind::array) {
+                auto& locations = e.vertex_input_locations.emplace();
+                for (const Json& item : v->array) {
+                    if (const Json* loc = item.find("location"); loc && loc->kind == Json::Kind::number)
+                        locations.push_back(u32(loc));
                 }
             }
             if (const Json* in = meta.find("inputs"); in && in->kind == Json::Kind::array)

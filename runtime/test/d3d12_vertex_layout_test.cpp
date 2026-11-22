@@ -1,6 +1,7 @@
 // CPU-only test of the layout builder used by the Vulkan D3D12 PSO.
 #include "../shims/d3d12_vertex_layout.h"
 #include "../src/shader_library.h"
+#include "../src/spirv_f16_halves.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -11,6 +12,33 @@
         return 1;                                                \
     }                                                            \
 } while (0)
+
+// A synthetic module writing Position, with either zero user inputs or one live input at Location 0.
+static std::vector<std::uint32_t> vertex_module(bool with_input) {
+    using namespace leonida::spirv_detail;
+    Module module;
+    module.header = {kSpirvMagic, 0x00010500, 0, 13, 0};
+    auto& inst = module.insts;
+    inst = {make_inst(kOpCapability, {1}), make_inst(kOpMemoryModel, {0, 1}),
+            with_input ? make_inst(kOpEntryPoint, {kExecModelVertex, 7, 0x6e69616d, 0, 9, 11})
+                       : make_inst(kOpEntryPoint, {kExecModelVertex, 7, 0x6e69616d, 0, 9}),
+            make_inst(kOpDecorate, {9, 11, 0})};  // BuiltIn Position
+    if (with_input) inst.push_back(make_inst(kOpDecorate, {11, kDecorationLocation, 0}));
+    inst.insert(inst.end(), {make_inst(19, {1}), make_inst(33, {2, 1}),  // OpTypeVoid, OpTypeFunction
+                             make_inst(kOpTypeFloat, {3, 32}), make_inst(kOpTypeVector, {4, 3, 4}),
+                             make_inst(kOpTypePointer, {5, kStorageOutput, 4}),
+                             make_inst(kOpConstantNull, {4, 6}), make_inst(kOpVariable, {5, 9, kStorageOutput})});
+    if (with_input) {
+        inst.push_back(make_inst(kOpTypePointer, {10, kStorageInput, 4}));
+        inst.push_back(make_inst(kOpVariable, {10, 11, kStorageInput}));
+    }
+    inst.push_back(make_inst(kOpFunction, {1, 7, 0, 2}));
+    inst.push_back(make_inst(248, {8}));  // OpLabel
+    if (with_input) inst.push_back(make_inst(kOpLoad, {4, 12, 11}));
+    inst.insert(inst.end(), {make_inst(kOpStore, {9, with_input ? 12u : 6u}), make_inst(kOpReturn, {}),
+                             make_inst(kOpFunctionEnd, {})});
+    return module.serialize();
+}
 
 int main() {
     using rt::d3d12::build_vertex_layout;
@@ -32,6 +60,7 @@ int main() {
     const auto build = [&](UINT count, bool divisor_supported = false) {
         return build_vertex_layout({elements, count}, vs, limits, divisor_supported, result);
     };
+    vs.vertex_input_locations = std::vector<std::uint32_t>{0, 1, 2};
     CHECK(build(3) == S_OK);
     CHECK(result.attributes.size() == 3 && result.bindings.size() == 2 && result.slots == 9);
     CHECK(result.zero_step_slots == 8 && result.bindings[1].inputRate == VK_VERTEX_INPUT_RATE_INSTANCE);
@@ -73,7 +102,17 @@ int main() {
     CHECK(build(3) == E_INVALIDARG);
     limits.maxVertexInputAttributeOffset = 32;
     vs.input_signature[0].location.reset();
-    CHECK(build(3) == E_INVALIDARG);
+    vs.input_signature[1].location.reset();
+    vs.vertex_input_locations = std::vector<std::uint32_t>{0};  // Old per-register module and index.
+    CHECK(build(3) == E_INVALIDARG && build(2) == E_INVALIDARG);
+    vs.vertex_input_locations->clear();
+    CHECK(build(3) == S_OK && result.attributes.empty() && result.bindings.empty() && !result.slots);
+    CHECK(build(0) == S_OK && result.attributes.empty());
+    vs.vertex_input_locations.reset();
+    CHECK(build_vertex_layout({elements, 3}, vs, limits, false, result, vertex_module(false)) == S_OK);
+    CHECK(result.attributes.empty() && result.bindings.empty() && !result.slots);
+    CHECK(build_vertex_layout({elements, 3}, vs, limits, false, result, vertex_module(true)) == E_INVALIDARG);
+    CHECK(build_vertex_layout({elements, 2}, vs, limits, false, result, vertex_module(true)) == E_INVALIDARG);
 
     // An index without a location field still binds an ordinary input by register.
     vs.input_signature.erase(vs.input_signature.begin(), vs.input_signature.begin() + 2);

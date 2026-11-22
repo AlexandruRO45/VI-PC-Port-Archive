@@ -2,6 +2,8 @@
 
 #include <d3d12.h>
 #include <vulkan/vulkan_core.h>
+#include <cstdint>
+#include <span>
 #include <vector>
 
 namespace leonida { struct ShaderEntry; }
@@ -17,6 +19,7 @@ struct VertexLayout {
 };
 
 HRESULT build_vertex_layout(const D3D12_INPUT_LAYOUT_DESC& layout, const leonida::ShaderEntry& vs,
-                            const VkPhysicalDeviceLimits& limits, bool vertex_attribute_divisor, VertexLayout& out);
+                            const VkPhysicalDeviceLimits& limits, bool vertex_attribute_divisor, VertexLayout& out,
+                            std::span<const std::uint32_t> words = {});
 
 }  // namespace rt::d3d12

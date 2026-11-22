@@ -2236,6 +2236,11 @@ bool matches_input(const leonida::SignatureElement& input, const D3D12_INPUT_ELE
     return input.system_value == 0 && input.semantic_index == element.SemanticIndex &&
            equal_semantic(input.semantic, element.SemanticName);
 }
+
+bool uses_vertex_input(const leonida::SignatureElement& input, const std::vector<std::uint32_t>* locations) {
+    return input.system_value == 0 &&
+           (!locations || std::find(locations->begin(), locations->end(), input.vertex_location()) != locations->end());
+}
 // A heap (section 3.3): a range of the GPU address arena, as large as the game asked for, so a placed buffer can
 // name any 64 KiB-aligned offset in it. Textures placed in it still get their own VkDeviceMemory; the offset is only
 // their key, which keeps optimal-tiling images out of the arena's memory type.
@@ -2331,8 +2336,9 @@ const leonida::ShaderEntry* pick_entry(const std::vector<const leonida::ShaderEn
 // Whether the input layout has an element for every ordinary (non-system-value) input of the vertex shader.
 bool layout_feeds(const leonida::ShaderEntry& vs, const D3D12_INPUT_LAYOUT_DESC& layout) {
     if (layout.NumElements && !layout.pInputElementDescs) return false;
+    const auto* locations = vs.vertex_input_locations ? &*vs.vertex_input_locations : nullptr;
     for (const auto& input : vs.input_signature) {
-        if (input.system_value) continue;
+        if (!uses_vertex_input(input, locations)) continue;
         bool fed = false;
         for (UINT i = 0; i < layout.NumElements && !fed; ++i)
             fed = matches_input(input, layout.pInputElementDescs[i]);
@@ -2661,7 +2667,7 @@ public:
         VertexLayout vertex_layout;
         if (const HRESULT hr = build_vertex_layout(desc.InputLayout, *vs_stage.entry,
                                                    device_.vertex_input_limits, device_.info.vertex_attribute_divisor,
-                                                   vertex_layout);
+                                                   vertex_layout, vs_stage.words);
             FAILED(hr)) return hr;
         graphics_.vertex_slots = vertex_layout.slots;
         graphics_.zero_step_slots = vertex_layout.zero_step_slots;
@@ -7123,9 +7129,31 @@ private:
 }  // namespace
 
 HRESULT build_vertex_layout(const D3D12_INPUT_LAYOUT_DESC& layout, const leonida::ShaderEntry& vs,
-                            const VkPhysicalDeviceLimits& limits, bool vertex_attribute_divisor, VertexLayout& out) {
+                            const VkPhysicalDeviceLimits& limits, bool vertex_attribute_divisor, VertexLayout& out,
+                            std::span<const std::uint32_t> words) {
     if (layout.NumElements && !layout.pInputElementDescs) return E_INVALIDARG;
     VertexLayout result;
+    const auto* locations = vs.vertex_input_locations ? &*vs.vertex_input_locations : nullptr;
+    std::vector<std::uint32_t> legacy_locations;
+    if (!locations) {
+        // Older indices omitted vertex_inputs when the VS had no fetch. For ambiguous legacy signatures only,
+        // check the module so an inputless VS works and a live packed register cannot bind just one semantic.
+        std::set<std::uint32_t> seen;
+        for (const auto& input : vs.input_signature) {
+            if (!uses_vertex_input(input, nullptr) || seen.insert(input.vertex_location()).second) continue;
+            leonida::spirv_detail::Module module;
+            if (!module.parse(words)) return E_INVALIDARG;
+            for (const auto& entry :
+                 leonida::spirv_detail::collect_located_vars(module, leonida::spirv_detail::kStorageInput))
+                legacy_locations.push_back(entry.first);
+            locations = &legacy_locations;
+            break;
+        }
+    }
+    if (locations && locations->empty()) {
+        out = std::move(result);
+        return S_OK;
+    }
     std::vector<bool> fed(vs.input_signature.size());
     std::uint32_t divisor_slots = 0;
     UINT slot_end[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] = {};
@@ -7144,8 +7172,9 @@ HRESULT build_vertex_layout(const D3D12_INPUT_LAYOUT_DESC& layout, const leonida
                                 ? (slot_end[slot] + alignment - 1) / alignment * alignment
                                 : element.AlignedByteOffset;
         slot_end[slot] = offset + bytes;
-        const auto input = std::find_if(vs.input_signature.begin(), vs.input_signature.end(),
-                                       [&](const auto& e) { return matches_input(e, element); });
+        const auto input = std::find_if(vs.input_signature.begin(), vs.input_signature.end(), [&](const auto& e) {
+            return uses_vertex_input(e, locations) && matches_input(e, element);
+        });
         if (input == vs.input_signature.end()) continue;
         const UINT location = input->vertex_location();
         if (location >= limits.maxVertexInputAttributes || slot >= limits.maxVertexInputBindings ||
@@ -7181,12 +7210,13 @@ HRESULT build_vertex_layout(const D3D12_INPUT_LAYOUT_DESC& layout, const leonida
     }
     for (std::size_t i = 0; i < fed.size(); ++i) {
         const auto& input = vs.input_signature[i];
-        if (!fed[i] && input.system_value == 0) {
+        if (!fed[i] && uses_vertex_input(input, locations)) {
             std::fprintf(stderr, "[rt] d3d12: the input layout does not feed %s%u (register %u)\n",
                          input.semantic.c_str(), input.semantic_index, input.register_index);
             return E_INVALIDARG;
         }
     }
+    if (locations && result.attributes.size() != locations->size()) return E_INVALIDARG;
     out = std::move(result);
     return S_OK;
 }

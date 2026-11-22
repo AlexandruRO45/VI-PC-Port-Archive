@@ -20,6 +20,21 @@ pytestmark = requires_tools
 
 VS_PACKED = (Path(__file__).parent / "semantic/fixtures/vs_packed_fetch.asm").read_text(encoding="utf-8")
 
+VS_NO_FETCH = """
+	v_mov_b32_e32 v4, 0
+	v_mov_b32_e32 v5, 1.0
+	exp pos0 v4, v4, v4, v5 done
+	s_endpgm
+"""
+
+VS_SHIFTED = """
+	s_swappc_b64 s[4:5], s[4:5]
+	v_mov_b32_e32 v0, 0
+	exp pos0 v8, v9, v10, v11 done
+	exp param0 v0, v0, v6, v7
+	s_endpgm
+"""
+
 VS_TWO_REGISTERS = """
 	s_swappc_b64 s[4:5], s[4:5]
 	v_add_f32 v1, v4, v8
@@ -41,6 +56,44 @@ def isg1(elements):
         element[24], element[25] = mask, mask & -mask
         payload += element
     return b"ISG1", bytes(payload) + b"TEXCOORD\x00"
+
+
+def test_no_fetch_with_packed_signature_declares_empty_vertex_interface(make_shader):
+    shader = make_shader(VS_NO_FETCH, "vs_packed_unused",
+                         dxbc=make_dxbc([isg1([(0, 0, 0x3, 3, 3), (0, 0, 0xC, 3, 7)])]))
+    spvasm = shader.translate()
+    shader.validate(spvasm)
+    meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spvasm)
+    assert "%vin" not in spvasm
+    assert meta["vertex_inputs"] == []
+    assert [(e["semantic_index"], e["register"], e["mask"]) for e in meta["input_signature"]] == [
+        (3, 0, 0x3), (7, 0, 0xC),
+    ]
+
+
+@pytest.mark.parametrize("ctype, scalar, pair, words", [
+    (1, 0xDEADBEEF, 0x12345678, (0xDEADBEEF, 0x12345678)),
+    (2, -7, -19, (0xFFFFFFF9, 0xFFFFFFED)),
+    (3, -2.5, 0.125, (0xC0200000, 0x3E000000)),
+])
+@pytest.mark.parametrize("narrow", [False, True])
+def test_standalone_shifted_mask_routes_format_components(make_shader, ctype, scalar, pair, words, narrow):
+    shader = make_shader(VS_SHIFTED, "vs_shifted_mask",
+                         dxbc=make_dxbc([isg1([(0, 0, 0xC, ctype, 7), (1, 0, 0x7, 3, 0)])]))
+    spvasm = shader.translate()
+    shader.validate(spvasm)
+    meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spvasm)
+    name, pointer = {1: ("uint", "%_ptr_Input_v4u"), 2: ("sint", "%_ptr_Input_v4i"),
+                     3: ("float", "%_ptr_Input_v4")}[ctype]
+    assert meta["vertex_inputs"] == [{"location": 0, "type": name}, {"location": 1, "type": "float"}]
+    assert "%vin0 = OpVariable " + pointer + " Input" in spvasm
+    assert meta["input_signature"][0]["mask"] == 0xC and meta["input_signature"][0]["location"] == 0
+    # Vulkan supplies y=0 for a scalar format, and z=0, w=1 for both source formats.
+    zero, one = (0.0, 1.0) if ctype == 3 else (0, 1)
+    out = run_fragment(spvasm, inputs={"%vin0": (scalar, zero if narrow else pair, zero, one),
+                                      "%vin1": (0.25, 0.5, 0.75, 1.0)})
+    assert out["%out_param0"] == (0, 0, words[0], 0 if narrow else words[1])
+    assert out["%out_pos"] == (0x3E800000, 0x3F000000, 0x3F400000, 0x3F800000)
 
 
 @pytest.mark.parametrize("reverse", [False, True])

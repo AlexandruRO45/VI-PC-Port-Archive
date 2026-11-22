@@ -317,7 +317,7 @@ class Gen:
         self.uses_pc_tail = False       # --pc-tail-ubo and the shader reads the tail (set in assemble)
         self.uses_long = False
         self.vertex_inputs = []    # (Vulkan location, component type 1=uint 2=sint 3=float) for fetch-calling VS
-        self.vertex_routes = {}    # packed Vulkan location -> (ISG1 register, destination component mask)
+        self.vertex_routes = {}    # routed Vulkan location -> (ISG1 register, destination component mask)
         self.vertex_signature = []   # full ISG1: (register, mask, system value, component type) for PSO lookup
         self.dynamic_format = False  # True when a buffer_load used a runtime V# FORMAT (unknown codes -> 0 at runtime)
         self.fixed_format_codes = set()  # static tbuffer/fixed format codes seen (validated against FORMATS)
@@ -13289,8 +13289,8 @@ def map_vertex_inputs(g, sig):
     registers = sorted(by_register) if any(len(elements) > 1 for elements in by_register.values()) else by_register
     for reg in registers:
         elements = by_register[reg]
-        # Preserve the full vec4 (including Vulkan format defaults) for a standalone semantic.
-        if len(elements) == 1:
+        # A contiguous standalone semantic starting at x keeps the full format vector, including the xyz/.w case.
+        if len(elements) == 1 and elements[0][0] in (0x1, 0x3, 0x7, 0xF):
             g.vertex_inputs.append((reg, elements[0][1]))
             predicted.update(4 + 4 * reg + c for c in range(4))
             continue
@@ -14659,7 +14659,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
     lds = (4 * g.lds_dwords if g.uses_lds else 0) + (g.x_buf_bytes() if g.cs or g.emulate else 0) + (4 if g.ms else 0)
     if lds:
         m["lds_bytes"] = lds
-    if g.vertex_inputs:
+    if g.stage == "vs":
         m["vertex_inputs"] = [{"location": loc, "type": {1: "uint", 2: "sint"}.get(t, "float")}
                               for loc, t in g.vertex_inputs]
     if getattr(g, "vertex_signature", None):
@@ -14718,7 +14718,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
     if g.build_meta:
         m.update(g.build_meta)
     if g.vertex_routes:
-        # The declared masks within each packed register are disjoint, so (register, mask) identifies its semantic.
+        # The declared masks within a register are disjoint, so (register, mask) identifies a routed semantic.
         locations = {route: loc for loc, route in g.vertex_routes.items()}
         m["input_signature"] = [
             dict(e, location=locations[e["register"], e["mask"]])
