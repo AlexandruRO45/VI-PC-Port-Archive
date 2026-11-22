@@ -2019,7 +2019,8 @@ SCALAR_STEPS = (
 # Results that leave SCC unused or unchanged; s_cselect_b32 here selects between two registers.
 SCALAR_VALUES = ("s_mul_i32 s62, s44, s46", "s_or_b32 s62, s45, s46", "s_andn2_b32 s62, s44, s45",
                  "s_orn2_b32 s62, s47, s44", "s_not_b32 s62, s46", "s_lshl_b32 s62, s44, s47",
-                 "s_ashr_i32 s62, s46, s44", "s_cmp_lt_u32 s44, s45", "s_cselect_b32 s62, s46, s47")
+                 "s_ashr_i32 s62, s46, s44", "s_nand_b32 s62, s44, s45", "s_nor_b32 s62, s45, s46",
+                 "s_xnor_b32 s62, s46, s47", "s_cmp_lt_u32 s44, s45", "s_cselect_b32 s62, s46, s47")
 # Two constant sets; every SCC bit differs between them, so both arms of each select are drawn.
 SCALAR_WORDS = ((0xfffffff0, 0x20, 0x80000000, 1), (5, 5, 0x7fffffff, 0xffffffff))
 
@@ -2143,6 +2144,7 @@ def scalar_reference(body, words):
         else:
             result = {"and_b32": lambda: x & y, "or_b32": lambda: x | y, "xor_b32": lambda: x ^ y,
                       "andn2_b32": lambda: x & ~y, "orn2_b32": lambda: x | ~y,
+                      "nand_b32": lambda: ~(x & y), "nor_b32": lambda: ~(x | y), "xnor_b32": lambda: ~(x ^ y),
                       "lshl_b32": lambda: x << (y & 31), "lshr_b32": lambda: x >> (y & 31),
                       "ashr_i32": lambda: signed(x) >> (y & 31)}[name]() & mask
             scc = result != 0
@@ -2168,7 +2170,10 @@ def scalar_case(directory, words):
 
 # Mutations a draw must detect: signedness of a shift and of a comparison, and the sources of a subtraction.
 SCALAR_MUTATIONS = (("s_ashr_i32", "s_lshr_b32"), ("s_cmp_lt_i32", "s_cmp_lt_u32"),
-                    ("s_sub_u32 s62, s46, s47", "s_sub_u32 s62, s47, s46"))
+                    ("s_sub_u32 s62, s46, s47", "s_sub_u32 s62, s47, s46"),
+                    ("s_nand_b32 s62, s44, s45", "s_and_b32 s62, s44, s45"),
+                    ("s_nor_b32 s62, s45, s46", "s_or_b32 s62, s45, s46"),
+                    ("s_xnor_b32 s62, s46, s47", "s_xor_b32 s62, s46, s47"))
 
 
 def scalar_detecting_words(old, new):
@@ -2192,6 +2197,9 @@ def check_scalar_controls():
                      "= (asint(asuint(params[1].z)) == asint(4294967295u));", "? 2097152u : 0u;",
                      "= asuint(params[0].w) & ~asuint(params[1].x);", "= ~asuint(params[1].y);",
                      "= asuint(asint(asuint(params[1].y)) >> (asuint(params[0].w) & 31u));",
+                     "= ~(asuint(params[0].w) & asuint(params[1].x));",
+                     "= ~(asuint(params[1].x) | asuint(params[1].y));",
+                     "= ~(asuint(params[1].y) ^ asuint(params[1].z));",
                      "= 4294967168u * 31u;", "? asuint(params[1].y) : asuint(params[1].z);",
                      " | 1065353216u;", "= asfloat(salu"):
         assert expected in source, expected
@@ -2218,7 +2226,8 @@ def check_scalar_controls():
     # destinations other than plain scalar registers.
     first = "s_add_u32 s62, s44, s45"
     for new in ("s_addc_u32 s62, s44, s45", "s_subb_u32 s62, s44, s45", "s_mul_hi_u32 s62, s44, s45",
-                "s_absdiff_i32 s62, s44, s45", "s_nand_b32 s62, s44, s45", "s_xnor_b32 s62, s44, s45",
+                "s_absdiff_i32 s62, s44, s45",
+                "s_nand_b32 s62, v12, s45", "s_nor_b32 v62, s44, s45", "s_xnor_b32 s62, s44",
                 "s_bfe_u32 s62, v12, s45", "s_lshl1_add_u32 s62, s44, s45", "s_abs_i32 s62, s44",
                 "s_brev_b32 s62, s44", "s_and_b64 s[62:63], s[44:46], s[46:47]",
                 "s_add_u32 s62, s[44:45], s45", "s_add_u32 s62, s44", "s_add_u32 s62, s44, s45, s46",
