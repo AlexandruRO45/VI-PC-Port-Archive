@@ -1443,7 +1443,7 @@ class StructuredEmulationTests(unittest.TestCase):
                              if "OpStore" in l and "OpConvertUToPtr" in "\n".join(blk2_to_end[max(0, i - 15):i]))
             i3_rel = i3 - i2
             load_idx = next(i for i, l in enumerate(blk2_to_end[i3_rel:], i3_rel)
-                            if "OpLoad %uint" in l and "OpConvertUToPtr" in "\n".join(blk2_to_end[max(0, i - 15):i]))
+                            if "OpLoad %uint" in l and "OpConvertUToPtr" in "\n".join(blk2_to_end[max(0, i - 18):i]))
             self.assertTrue(any("OpControlBarrier" in l for l in blk2_to_end[store_idx:load_idx]),
                             f"missing OpControlBarrier between blk2 buffer_store and blk3 buffer_load ({expected_mode})")
             for rev in (False, True):
