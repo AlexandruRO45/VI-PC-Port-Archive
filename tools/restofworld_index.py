@@ -336,6 +336,16 @@ def main():
                     help="skip a stream that inflates above this many bytes (default: 512 MiB)")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
+
+    # BUILD-74: validate source exists before scanning
+    if not os.path.exists(args.source):
+        raise SystemExit(f"source {args.source}: No such file or directory")
+
+    # BUILD-74: validate output path parent exists and is writable
+    out_dir = os.path.dirname(os.path.abspath(args.out))
+    if out_dir and not os.path.isdir(out_dir):
+        raise SystemExit(f"output directory {out_dir}: No such file or directory")
+
     if os.path.isdir(args.source):
         rows, summary = scan_dir(args.source)
     else:

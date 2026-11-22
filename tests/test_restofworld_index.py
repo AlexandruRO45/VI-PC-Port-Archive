@@ -281,6 +281,23 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(doc["summary"]["signatures"]["0drp"]["files"], 1)
         self.assertEqual(doc["summary"]["signatures"]["bink2"]["files"], 1)
 
+    def test_missing_source_exits_cleanly(self):
+        out = os.path.join(self.root, "cli.json")
+        proc = subprocess.run([sys.executable, "-I", TOOL, "/nonexistent/path.rpf", out, "--quiet"],
+                              capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("source", proc.stderr.lower())
+        self.assertIn("no such file or directory", proc.stderr.lower())
+        self.assertNotIn("Traceback", proc.stderr)
+
+    def test_missing_output_dir_exits_cleanly(self):
+        proc = subprocess.run([sys.executable, "-I", TOOL, self.rpf, "/nonexistent/dir/out.json", "--quiet"],
+                              capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("output directory", proc.stderr.lower())
+        self.assertIn("no such file or directory", proc.stderr.lower())
+        self.assertNotIn("Traceback", proc.stderr)
+
     def test_directory_skips_index_and_reads_offsets(self):
         folder = os.path.join(self.root, "carved")
         os.makedirs(folder)
