@@ -979,5 +979,56 @@ class InterpP1lvNegativeControlsTests(unittest.TestCase):
         self.assertNotEqual(rne_odd_bits, rtz_odd_bits)
 
 
+class GeometryShaderF16HalvesTests(unittest.TestCase):
+    """Review on #2086: a PS reading decoded halves can be fed by a translated geometry shader, so the GS writes them
+    too (as VS and mesh params do). Uses runtime/test/shaders/gs_tri.asm, with the ISG1/OSG1 run_gpu_tests.py gives it
+    (SV_Position reg 0, TEXCOORD0 reg 1)."""
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+    def translate_gs(self, **flags):
+        sys.path.insert(0, os.path.join(self.ROOT, "scripts"))
+        try:
+            import run_gpu_tests as gpu
+        finally:
+            sys.path.pop(0)
+        sig = gpu.make_sig_chunk([(1, 3, 0, 0xF, 0xF), (0, 3, 1, 0xF, 0xF)])
+        dxbc = gpu.make_dxbc([(b"ISG1", sig), (b"OSG1", sig)])
+        with open(os.path.join(self.ROOT, "runtime", "test", "shaders", "gs_tri.asm"), encoding="utf-8") as f:
+            lines = [ln for ln in f.read().splitlines() if ln and not ln.startswith(";")]
+        return translate_with_flags("gs_tri", lines, dxbc=dxbc, **flags)
+
+    def test_gs_writes_the_decoded_halves_under_either_fallback(self):
+        for flags in ({"bary_fallback": True}, {"f16_halves": True}):
+            with self.subTest(**flags):
+                spv, meta = self.translate_gs(**flags)
+                self.assertIn("OpDecorate %gs_out_f16h1_0 Location 26", spv)
+                self.assertIn("OpDecorate %gs_out_f16h1_1 Location 27", spv)
+                self.assertEqual(meta["f16_halves"], {"1": [26, 27]})       # what a PS reading attr1 halves lists
+                self.assertEqual(spv.count("OpStore %gs_out_f16h1_0 "), 3)   # at each of the three emits
+                self.assertEqual(spv.count("UnpackHalf2x16"), 3 * 4)        # four channels per emitted vertex
+                self.assertNotIn("%gs_out_f16h0_", spv)                      # position has no halves
+
+    def test_a_ps_fed_by_the_gs_links_its_halves(self):
+        # The PS reads attr1 (gs_tri's TEXCOORD0) as f16 low and high: every location it reads is one the GS writes.
+        ps = ["v_interp_p1ll_f16 v2, v0, attr1.x", "v_interp_p2_f16 v2, v1, attr1.x, v2",
+              "v_interp_p1ll_f16 v3, v0, attr1.x high", "v_interp_p2_f16 v3, v1, attr1.x, v3 high",
+              "exp mrt0 v2, v3, v2, v3 done vm", "s_endpgm"]
+        for flags in ({"bary_fallback": True}, {"f16_halves": True}):
+            with self.subTest(**flags):
+                gs_spv, gs_meta = self.translate_gs(**flags)
+                ps_spv, ps_meta = translate_with_flags("ps_from_gs", ps, dxbc=PS_ATTR01_DXBC, **flags)
+                self.assertEqual(ps_meta["f16_halves"], {"1": [26, 27]})
+                self.assertLessEqual(ps_meta["f16_halves"].items(), gs_meta["f16_halves"].items())
+                gs_out = set(re.findall(r"OpDecorate %gs_out\w* Location (\d+)", gs_spv))
+                ps_in = set(re.findall(r"OpDecorate %in_\w+ Location (\d+)", ps_spv))
+                self.assertTrue(ps_in <= gs_out, (ps_in, gs_out))
+
+    def test_gs_without_the_fallbacks_is_unchanged(self):
+        spv, meta = self.translate_gs()
+        self.assertNotIn("gs_out_f16h", spv)
+        self.assertNotIn("f16_halves", meta)
+
+
 if __name__ == "__main__":
     unittest.main()

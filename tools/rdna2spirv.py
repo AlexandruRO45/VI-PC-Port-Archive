@@ -11978,8 +11978,18 @@ class Gen:
             return
         raise Unsupported(op + " in gs")
 
+    def gs_half_regs(self):
+        """--f16-interp-fallback / --bary-fallback, geometry shader: the output locations whose decoded f16 halves the GS
+        also writes, as VS and mesh params do (f16_halves_of): every non-position output whose half locations stay
+        clear of the GS's own outputs (review on #2086: a PS fed by a GS read halves nothing wrote)."""
+        if not f16_halves_on():
+            return []
+        top = max((r for r, sv in self.gs["out"] if sv != 1), default=-1)
+        return [r for r, sv in self.gs["out"] if sv != 1 and f16_half_location(r, 0) > top]
+
     def gs_emit(self, *, end_primitive: bool) -> None:
         nreg = self.gs["nreg"]
+        halves = self.gs_half_regs()
         act = self.active_b()
         do, end = self.tmp() + "_do", self.tmp() + "_end"
         self.emit(f"OpSelectionMerge {end} None")
@@ -11994,6 +12004,9 @@ class Gen:
             self.emit(f"{pp} = OpAccessChain %_ptr_Function_v4_gs %gs_stage {i}")
             self.emit(f"{v} = OpLoad %v4float {pp}")
             self.emit(f"OpStore {'%gs_out_pos' if sv == 1 else f'%gs_out{reg}'} {v}")
+            if reg in halves and sv != 1:
+                for half, hv in enumerate(self.f16_halves_of(reg, v)):
+                    self.emit(f"OpStore %gs_out_f16h{reg}_{half} {hv}")
         self.emit("OpEmitVertex")
         if end_primitive:
             self.emit("OpEndPrimitive")
@@ -12722,9 +12735,8 @@ def assemble(gen):
          [f"%ms_out_f16h{n}_{h}" for n in ms_halves for h in (0, 1)])) if ms else []) + (
         ["%x_buf"] if gen.emulate or gen.bar_rounds and not gen.bar_counts_in_lds() else []) + (
         ([("%gs_in_pos" if sv == 1 else f"%gs_in{r}") for r, sv in gen.gs["in"]] +
-         [("%gs_out_pos" if sv == 1 else f"%gs_out{r}") for r, sv in gen.gs["out"]]) if gsx else []) +         (["%fmt_uint_mask", "%fmt_sint_mask"] if gen.uses_store_views or gen.uses_int_fetch else []) + \
-        (["%fmt_size_tab"] if gen.uses_fmt_size else []) + \
-        [f"%stv{c}_{d}" for d in sorted(gen.uses_store_views) for c in range(3)] + \
+         [("%gs_out_pos" if sv == 1 else f"%gs_out{r}") for r, sv in gen.gs["out"]] +
+         [f"%gs_out_f16h{r}_{h}" for r in gen.gs_half_regs() for h in (0, 1)]) if gsx else []) +         (["%fmt_uint_mask", "%fmt_sint_mask"] if gen.uses_store_views or gen.uses_int_fetch else []) +         (["%fmt_size_tab"] if gen.uses_fmt_size else []) +         [f"%stv{c}_{d}" for d in sorted(gen.uses_store_views) for c in range(3)] + \
         [f"%itx{c}_{d}" for d in sorted(gen.uses_int_fetch) for c in (1, 2)]
     psb = gen.uses_psb
     tex = gen.uses_tex
@@ -12871,6 +12883,8 @@ def assemble(gen):
             dec.append("OpDecorate %gs_in_pos BuiltIn Position" if sv == 1 else f"OpDecorate %gs_in{r} Location {r}")
         for r, sv in gen.gs["out"]:
             dec.append("OpDecorate %gs_out_pos BuiltIn Position" if sv == 1 else f"OpDecorate %gs_out{r} Location {r}")
+        dec += [f"OpDecorate %gs_out_f16h{r}_{h} Location {f16_half_location(r, h)}" for r in gen.gs_half_regs()
+                for h in (0, 1)]
     ms_clip_member = ms_cull_member = None
     if ms:
         dec += ["OpDecorate %wg_id BuiltIn WorkgroupId", "OpDecorate %num_wg BuiltIn NumWorkgroups",
@@ -13108,6 +13122,8 @@ def assemble(gen):
                   for r, sv in gen.gs["in"]]
         gvars += [("%gs_out_pos" if sv == 1 else f"%gs_out{r}") + " = OpVariable %_ptr_Output_v4_gs Output"
                   for r, sv in gen.gs["out"]]
+        gvars += [f"%gs_out_f16h{r}_{h} = OpVariable %_ptr_Output_v4_gs Output" for r in gen.gs_half_regs()
+                  for h in (0, 1)]
     if ms:
         maxv, maxp = gen.cu(gen.ms["maxv"]), gen.cu(gen.ms["maxp"])
         types += ["%v3uint = OpTypeVector %uint 3", "%_ptr_Input_v3u = OpTypePointer Input %v3uint",
@@ -15601,7 +15617,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         # --bary-fallback: the raw barycentrics are a perspective-interpolated vec3 at this location; the stage
         # before the PS must write (1,0,0), (0,1,0), (0,0,1) at the triangle's vertices (see BARY_FALLBACK).
         m["bary_fallback_input"] = {"location": g.bary_location}
-    if f16_halves_on() and g.stage in ("vs", "ms", "ps"):
+    if f16_halves_on() and g.stage in ("vs", "ms", "gs", "ps"):
         # --f16-interp-fallback: PS = the attributes whose f16 reads take decoded halves, VS/MS = the params that
         # export them; each as {n: [low-half location, high-half location]}. When a PS's canonical half slots would
         # collide with its raw attributes, assign_f16_half_locations packs them into free locations <= F16_HALF_TOP
