@@ -3008,6 +3008,125 @@ def check_scalar_pair_reads() -> None:
     must_reject(translate, alias[:wait + 1] + [load] + alias[wait + 1:])
 
 
+# s_setreg_imm32_b32 writes hardware state. The program opens with the scratch base writes, which no lowered
+# instruction reads. MODE[3:2] then selects round toward zero for an exact widening, restores round to nearest
+# even for two narrowings, and selects round toward zero again before a second exact widening and the
+# truncating pack. Channel 0 widens S0, channels 1 and 2 narrow and widen back (channel 2 a subnormal scaled
+# by 2^24) and channel 3 widens -|S0|.
+FLAT_SCRATCH_WRITES = [
+    "s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 0",
+    "s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_HI), 0x400",
+]
+HALF_RTZ = "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 3"
+HALF_RNE = "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0"
+MODE_BODY = [
+    HALF_RTZ,
+    "v_cvt_f32_f16_e32 v12, s44",
+    HALF_RNE,
+    "v_cvt_f16_f32_e32 v13, s45",
+    "v_cvt_f32_f16_e32 v13, v13",
+    "v_cvt_f16_f32_e32 v14, s46",
+    "v_cvt_f32_f16_e32 v14, v14",
+    "v_mul_f32_e32 v14, 0x4b800000, v14",
+    HALF_RTZ,
+    "v_cvt_f32_f16_e64 v15, -|s47|",
+]
+# Each set: the half in S44, two binary32 inputs whose nearest-even and truncated halves differ, the half in
+# S47, and the wrong references (channel, value) that truncation after the restore would give.
+MODE_SETS = (
+    ((0xdeadc500, 1 + 3 * 2.0 ** -11, 1.5 * 2.0 ** -24, 0xbeef7bff), ((1, 1 + 2.0 ** -10), (2, 1.0))),
+    ((0x00003c01, -(2.0 ** -14 - 2.0 ** -25), 65519.0, 0x00000001), ((1, -1023 * 2.0 ** -24),)),
+)
+
+
+def mode_program():
+    return FLAT_SCRATCH_WRITES + with_constants(MODE_BODY)
+
+
+def check_mode_register_draw(directory, compiler, renderer, backend):
+    source = directory / "mode_register.hlsl"
+    shader = directory / "mode_register.cso"
+    case = directory / "mode_register.case"
+    source.write_text(translate(mode_program()), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    for (first, second, third, last), wrongs in MODE_SETS:
+        words = [first, *(struct.unpack("<I", struct.pack("<f", x))[0] for x in (second, third)), last]
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        narrowed = half_value(narrow_reference(third))
+        expected = [half_value(first), half_value(narrow_reference(second)),
+                    narrowed * 2.0 ** 24 if abs(narrowed) < 2.0 ** -14 else narrowed, -abs(half_value(last))]
+        for x in (*expected, *(value for _, value in wrongs)):
+            assert half_rtz(x) == x, x
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+        for channel, value in wrongs:
+            assert struct.pack("<f", value) != struct.pack("<f", expected[channel])
+            wrong_values = list(expected)
+            wrong_values[channel] = value
+            case.write_bytes(constants + struct.pack("<4f", *wrong_values) * 64)
+            result = subprocess.run(draw, capture_output=True, text=True)
+            if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
+                raise AssertionError(f"A truncated narrowing escaped detection in channel {channel}")
+
+
+def check_mode_register_controls():
+    """s_setreg_imm32_b32 is accepted for the scratch base and for MODE[3:2] as tracked rounding state."""
+    program = mode_program()
+    as_nops = [("s_nop 0" if line.startswith("s_setreg_imm32_b32 ") else line) for line in program]
+    assert as_nops.count("s_nop 0") == 5
+    # Every accepted write here leaves the lowered result unchanged: generated names carry the instruction
+    # index, so the program must translate exactly like s_nop 0 at the same positions.
+    assert translate(program) == translate(as_nops)
+    plain = with_constants(NARROW_BODY)
+    nop = translate(["s_nop 0"] + plain)
+    # The scratch base is a whole 32-bit register with any immediate; a field of it is refused.
+    for value in ("0", "0x400", "-1", "0x41", "0xfffffffe"):
+        for register in ("LO", "HI"):
+            assert translate([f"s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_{register}), {value}"] + plain) == nop
+    for write in ("hwreg(HW_REG_FLAT_SCR_LO, 0, 16), 0", "hwreg(HW_REG_FLAT_SCR_HI, 16, 16), 0",
+                  "hwreg(HW_REG_FLAT_SCR_LO), s48", "hwreg(HW_REG_FLAT_SCR_LO), 0x100000000",
+                  "hwreg(HW_REG_MODE, 0, 2), 3", "hwreg(HW_REG_MODE, 0, 2), 0", "hwreg(HW_REG_MODE, 2, 1), 0",
+                  "hwreg(HW_REG_MODE, 3, 2), 0", "hwreg(HW_REG_MODE, 0, 4), 12", "hwreg(HW_REG_MODE, 4, 4), 15",
+                  "hwreg(HW_REG_MODE), 0", "hwreg(HW_REG_MODE), 0x2f0", "hwreg(HW_REG_STATUS, 2, 2), 0",
+                  "hwreg(HW_REG_STATUS), 0", "hwreg(HW_REG_TRAPSTS, 2, 2), 3", "hwreg(HW_REG_LDS_ALLOC), 0",
+                  "hwreg(HW_REG_SHADER_CYCLES), 0", "hwreg(HW_REG_GPR_ALLOC), 0", "hwreg(HW_REG_IB_STS), 0"):
+        expect_value_error(translate, [f"s_setreg_imm32_b32 {write}"] + plain, "Unsupported hardware register write")
+    # The scratch base stays unobservable: its readers are not lowered.
+    for reader in ("scratch_load_dword v12, off, s48", "scratch_store_dword off, v12, s48 offset:16",
+                   "flat_load_dword v12, v[12:13]", "s_getreg_b32 s48, hwreg(HW_REG_FLAT_SCR_LO)"):
+        expect_value_error(translate, with_constants([*FLAT_SCRATCH_WRITES, reader]), "Unsupported instruction")
+    # Nearest even is the entry state, so writing it first is no change. The directed modes are refused.
+    assert translate([HALF_RNE] + plain) == nop
+    assert translate([HALF_RTZ, HALF_RNE] + plain) == translate(["s_nop 0", "s_nop 0"] + plain)
+    for value in ("1", "2", "4", "7", "-1", "0x103"):
+        expect_value_error(translate, [f"s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), {value}"] + plain,
+                           "Unsupported binary16 rounding mode")
+    # The register forms of the same access stay unsupported.
+    expect_value_error(translate, ["s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s48"] + plain, "Unsupported instruction")
+    expect_value_error(translate, ["s_getreg_b32 s48, hwreg(HW_REG_MODE, 2, 2)"] + plain, "Unsupported instruction")
+    # Like the hints, nothing may sit between the color export and s_endpgm.
+    must_reject(translate, plain[:-1] + [HALF_RNE, plain[-1]])
+    must_reject(translate, plain[:-1] + [FLAT_SCRATCH_WRITES[0], plain[-1]])
+    # The write is state, not a hint: under round toward zero the nearest-even narrowing and the packed
+    # binary16 arithmetic are refused by name, the last write wins, and restoring nearest even first makes
+    # the same programs translate exactly as without the writes.
+    expect_value_error(translate, [HALF_RTZ] + plain, "under round toward zero: v_cvt_f16_f32_e32")
+    expect_value_error(translate, [HALF_RNE, HALF_RTZ] + plain, "under round toward zero: v_cvt_f16_f32_e32")
+    expect_value_error(translate, [line for line in program if line != HALF_RNE],
+                       "under round toward zero: v_cvt_f16_f32_e32")
+    packed = with_constants(VOP3P_BODY)
+    expect_value_error(translate, [HALF_RTZ] + packed, "under round toward zero: v_pk_add_f16")
+    assert translate([HALF_RTZ, HALF_RNE] + packed) == translate(["s_nop 0", "s_nop 0"] + packed)
+    for operation in ("v_cvt_f16_f32_e64 v12, -|s44|", "v_cvt_f16_u16_e32 v12, v12", "v_add_f16_e32 v12, v12, v13",
+                      "v_cvt_f32_f64_e32 v12, v[12:13]", "v_dot2_f32_f16 v12, v12, v13, v14",
+                      "v_fma_mixlo_f16 v12, v12, v13, v14", "v_interp_p2_f16 v12, v1, attr0.x"):
+        expect_value_error(translate, with_constants([HALF_RTZ, operation]), "under round toward zero")
+    # The exact widening and the pack that always truncates do not depend on the mode.
+    assert translate([HALF_RTZ] + with_constants(HALF_BODY)) == translate(["s_nop 0"] + with_constants(HALF_BODY))
+
+
 HINT_NAMES = ("s_clause", "s_setprio", "s_sleep")
 
 
@@ -3947,6 +4066,7 @@ def check_controls(directory):
     must_reject(translate_buffer_color, [s for s in program if s != "s_waitcnt lgkmcnt(0)"])
     must_reject(translate_buffer_color, [s.replace("off, off", "off, v26") for s in program])
     check_scheduling_hints()
+    check_mode_register_controls()
     check_constant_descriptor_bounds()
     check_scalar_constant_reads()
     check_affine_coordinates()
@@ -4902,6 +5022,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((with_constants(VOP3P_BODY), translate))
     fixtures.append((with_constants(FMA_MIX_BODY), translate))
     fixtures.append((with_constants(NARROW_BODY), translate))
+    fixtures.append((mode_program(), translate))
     fixtures.append((dual_program(swap_weights=True), translate_dual))
     fixtures.extend((with_constants(body), translate) for body, *_ in E64_ARITH)
     fixtures.extend((predicate_group_e64(first), translate) for first in range(0, 16, 4))
@@ -6211,6 +6332,7 @@ def check_render(directory, compiler, renderer, backend, *, core_only=False):
     check_dot_draw(directory, compiler, renderer, backend)
     check_pk_int16_draw(directory, compiler, renderer, backend)
     check_narrow_draw(directory, compiler, renderer, backend)
+    check_mode_register_draw(directory, compiler, renderer, backend)
     check_movk_draw(directory, compiler, renderer, backend)
     check_half_draw(directory, compiler, renderer, backend)
     for exp_shader_inst in ("s_waitcnt_expcnt null, 0x3", "s_waitcnt expcnt(0)"):

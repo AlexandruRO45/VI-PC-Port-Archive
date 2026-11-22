@@ -254,6 +254,9 @@ def check_shader_records():
         pixel.check_controls(Path(tmp))
     assert {"s_nop", "s_clause", "s_setprio", "s_sleep", "image_sample"} <= pixel.ACCEPTED
     assert "s_branch" not in pixel.ACCEPTED and "s_code_end" not in pixel.ACCEPTED
+    # The mode-register fixture records the immediate write; the register forms reach only rejections.
+    assert ("SOPK", "s_setreg_imm32_b32") in gfx and "s_setreg_imm32_b32" in pixel.ACCEPTED
+    assert not {"s_setreg_b32", "s_getreg_b32"} & pixel.ACCEPTED
     # The trigonometry fixture covers both encodings of v_sin_f32 and v_cos_f32 once its test passes.
     trig = {("VOP1", "v_sin_f32"), ("VOP1", "v_cos_f32"), ("VOP3", "v_sin_f32_e64"), ("VOP3", "v_cos_f32_e64")}
     assert trig <= gfx and trig <= fc.gfx_forms(pixel.ACCEPTED, gfx)
