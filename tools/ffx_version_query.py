@@ -1294,12 +1294,11 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                 raise ValueError(f"unsupported packed FMA register at {i.ip:#x}: {i}")
             dst, src1 = wide_any[i.op0_register], wide_any[i.op1_register]
             if i.op2_kind == K.MEMORY:
-                s2_init = f"const auto in2 = load_always<std::array<uint8_t,{vec_size}>>({address()});"
+                memory_src = f"const auto in2 = load_always<std::array<uint8_t,{vec_size}>>({address()}); "
+                src2 = "in2"
             else:
-                s2_init = f"const auto in2 = {wide_any[i.op2_register]};"
-            s2_expr = f"load<{ftype}>(reinterpret_cast<word>(in2.data() + n))"
-            s0 = f"load<{ftype}>(reinterpret_cast<word>(in0.data() + n))"
-            s1 = f"load<{ftype}>(reinterpret_cast<word>(in1.data() + n))"
+                memory_src = ""
+                src2 = wide_any[i.op2_register]
             neg_p = "true" if kind in ("nmadd", "nmsub") else "false"
             if kind in ("msub", "nmsub"):
                 neg_c = "true"
@@ -1309,10 +1308,13 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                 neg_c = "(lane & 1u) != 0u"
             else:
                 neg_c = "false"
-            stmt = (f"{{ const auto in0 = {dst}, in1 = {src1}; {s2_init} {dst} = {{}}; "
+            # Read the old register, including when a source aliases it, before committing the VEX write.
+            stmt = (f"{{ {memory_src}std::array<uint8_t,32> result{{}}; "
                     f"for (size_t lane = 0; lane < {vec_size // sz}; ++lane) {{ const size_t n = lane * {sz}; "
-                    f"const {ftype} r = fma_x86<{ftype}, {utype}>({s0}, {s1}, {s2_expr}, {order}, {neg_p}, {neg_c}); "
-                    f"memcpy({dst}.data() + n, &r, {sz}); }} }}")
+                    f"{ftype} s0, s1, s2; memcpy(&s0, {dst}.data() + n, {sz}); "
+                    f"memcpy(&s1, {src1}.data() + n, {sz}); memcpy(&s2, {src2}.data() + n, {sz}); "
+                    f"const {ftype} r = fma_x86<{ftype}, {utype}>(s0, s1, s2, {order}, {neg_p}, {neg_c}); "
+                    f"memcpy(result.data() + n, &r, {sz}); }} {dst} = result; }}")
         elif op == M.VMOVUPS and i.op1_kind == K.MEMORY:
             stmt = f"{wide[i.op0_register]} = load<std::array<uint8_t,32>>({address()});"
         elif op == M.VMOVUPS and i.op0_kind == K.MEMORY:
