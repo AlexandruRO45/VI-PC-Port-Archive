@@ -122,7 +122,16 @@ public:
         if (parent_) parent_->Release();
     }
 
-    bool init(HWND hwnd, const DXGI_SWAP_CHAIN_DESC1& desc) {
+    bool init(HWND hwnd, const DXGI_SWAP_CHAIN_DESC1& desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs_desc = nullptr) {
+        if (fs_desc) {
+            fullscreen_desc_ = *fs_desc;
+        } else {
+            fullscreen_desc_ = {};
+            fullscreen_desc_.RefreshRate = {0, 1};
+            fullscreen_desc_.ScanlineOrdering = DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED;
+            fullscreen_desc_.Scaling = DXGI_MODE_SCALING_UNSPECIFIED;
+            fullscreen_desc_.Windowed = TRUE;
+        }
         hwnd_ = hwnd;
         flags_ = desc.Flags;
         const VkExtent2D size = size_or_client(desc.Width, desc.Height, {256u, 256u});
@@ -182,7 +191,16 @@ public:
     HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void** out) override {
         if (!out) return E_POINTER;
         *out = nullptr;
-        return device_ ? device_->QueryInterface(riid, out) : E_NOINTERFACE;
+        if (!device_) return DXGI_ERROR_UNSUPPORTED;
+        const HRESULT hr = device_->QueryInterface(riid, out);
+        if (SUCCEEDED(hr)) return hr;
+        ID3D12DeviceChild* child = nullptr;
+        if (SUCCEEDED(device_->QueryInterface(IID_PPV_ARGS(&child)))) {
+            const HRESULT hr_child = child->GetDevice(riid, out);
+            child->Release();
+            if (SUCCEEDED(hr_child)) return hr_child;
+        }
+        return E_NOINTERFACE;
     }
 
     // IDXGISwapChain
@@ -210,9 +228,12 @@ public:
         return buffers_[buffer]->QueryInterface(riid, surface);
     }
 
-    HRESULT STDMETHODCALLTYPE SetFullscreenState(BOOL, IDXGIOutput*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE SetFullscreenState(BOOL fs, IDXGIOutput*) override {
+        fullscreen_desc_.Windowed = !fs;
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE GetFullscreenState(BOOL* fs, IDXGIOutput** out) override {
-        if (fs) *fs = FALSE;
+        if (fs) *fs = !fullscreen_desc_.Windowed;
         if (out) *out = nullptr;
         return S_OK;
     }
@@ -292,8 +313,7 @@ public:
     }
     HRESULT STDMETHODCALLTYPE GetFullscreenDesc(DXGI_SWAP_CHAIN_FULLSCREEN_DESC* desc) override {
         if (!desc) return E_INVALIDARG;
-        std::memset(desc, 0, sizeof(*desc));
-        desc->Windowed = TRUE;
+        *desc = fullscreen_desc_;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetHwnd(HWND* out) override { if (!out) return E_INVALIDARG; *out = hwnd_; return S_OK; }
@@ -407,6 +427,7 @@ private:
     std::atomic<UINT> present_count_{0};
     std::atomic<LONGLONG> last_present_qpc_{0};
     std::atomic<UINT> max_frame_latency_{2};
+    DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreen_desc_{};
 };
 
 struct ReservationState {
@@ -749,13 +770,13 @@ public:
     // IDXGIFactory2
     BOOL STDMETHODCALLTYPE IsWindowedStereoEnabled() override { return FALSE; }
     HRESULT STDMETHODCALLTYPE CreateSwapChainForHwnd(IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
-                                                     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*,
+                                                     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs_desc, IDXGIOutput*,
                                                      IDXGISwapChain1** out) override {
         if (!out) return E_POINTER;
         *out = nullptr;
         if (!hwnd || !desc) return E_INVALIDARG;
         auto* sc = new SwapChain(this, device, context_, gipa_, instance_, physical_, gdpa_, queue_, queue_family_);
-        if (!sc->init(hwnd, *desc)) {
+        if (!sc->init(hwnd, *desc, fs_desc)) {
             sc->Release();
             return E_FAIL;
         }

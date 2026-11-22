@@ -580,6 +580,93 @@ int main() {
             return fail("Non-waitable SetMaximumFrameLatency should return DXGI_ERROR_INVALID_CALL");
     }
 
+    // SwapChain::GetDevice (D3D-193): returns the command queue the swapchain was created with,
+    // queries through to the underlying ID3D12Device, and returns E_POINTER on null out pointer.
+    {
+        ID3D12CommandQueue* out_queue = nullptr;
+        if (FAILED(sc->GetDevice(IID_PPV_ARGS(&out_queue))) || out_queue != queue)
+            return fail("SwapChain::GetDevice did not return the command queue");
+        out_queue->Release();
+
+        ID3D12Device* out_dev = nullptr;
+        if (FAILED(sc->GetDevice(IID_PPV_ARGS(&out_dev))) || out_dev != dev)
+            return fail("SwapChain::GetDevice did not query through to ID3D12Device");
+        out_dev->Release();
+
+        if (sc->GetDevice(__uuidof(ID3D12CommandQueue), nullptr) != E_POINTER)
+            return fail("SwapChain::GetDevice with null out should return E_POINTER");
+
+        // An unsupported interface should return E_NOINTERFACE.
+        ID3D12Fence* out_fence = nullptr;
+        if (sc->GetDevice(IID_PPV_ARGS(&out_fence)) != E_NOINTERFACE)
+            return fail("SwapChain::GetDevice for unrelated interface should return E_NOINTERFACE");
+    }
+
+    // SwapChain::GetFullscreenDesc and SetFullscreenState (D3D-193).
+    {
+        DXGI_SWAP_CHAIN_FULLSCREEN_DESC fsd{};
+        if (FAILED(sc->GetFullscreenDesc(&fsd)))
+            return fail("SwapChain::GetFullscreenDesc failed");
+        if (!fsd.Windowed)
+            return fail("SwapChain::GetFullscreenDesc should default to windowed");
+        if (fsd.RefreshRate.Denominator != 1 || fsd.RefreshRate.Numerator != 0)
+            return fail("SwapChain::GetFullscreenDesc unexpected default refresh rate");
+
+        if (sc->GetFullscreenDesc(nullptr) != E_INVALIDARG)
+            return fail("SwapChain::GetFullscreenDesc with null out should return E_INVALIDARG");
+
+        // Toggling fullscreen state updates fullscreen desc and GetFullscreenState.
+        if (FAILED(sc->SetFullscreenState(TRUE, nullptr)))
+            return fail("SetFullscreenState(TRUE) failed");
+        BOOL is_fs = FALSE;
+        if (FAILED(sc->GetFullscreenState(&is_fs, nullptr)) || !is_fs)
+            return fail("GetFullscreenState should report fullscreen");
+        if (FAILED(sc->GetFullscreenDesc(&fsd)) || fsd.Windowed)
+            return fail("GetFullscreenDesc should report Windowed=FALSE after SetFullscreenState(TRUE)");
+
+        // Restore windowed.
+        if (FAILED(sc->SetFullscreenState(FALSE, nullptr)))
+            return fail("SetFullscreenState(FALSE) failed");
+        if (FAILED(sc->GetFullscreenState(&is_fs, nullptr)) || is_fs)
+            return fail("GetFullscreenState should report windowed");
+        if (FAILED(sc->GetFullscreenDesc(&fsd)) || !fsd.Windowed)
+            return fail("GetFullscreenDesc should report Windowed=TRUE after SetFullscreenState(FALSE)");
+    }
+
+    // CreateSwapChainForHwnd with explicit DXGI_SWAP_CHAIN_FULLSCREEN_DESC (D3D-193).
+    {
+        HWND hwnd_fs = create_test_window(64, 64);
+        if (!hwnd_fs) return fail("CreateWindowExW (fullscreen test)");
+
+        DXGI_SWAP_CHAIN_FULLSCREEN_DESC in_fsd{};
+        in_fsd.RefreshRate = {60, 1};
+        in_fsd.ScanlineOrdering = DXGI_MODE_SCANLINE_ORDER_PROGRESSIVE;
+        in_fsd.Scaling = DXGI_MODE_SCALING_CENTERED;
+        in_fsd.Windowed = TRUE;
+
+        IDXGISwapChain1* sc_fs = nullptr;
+        if (FAILED(factory->CreateSwapChainForHwnd(queue, hwnd_fs, &scd, &in_fsd, nullptr, &sc_fs)) || !sc_fs) {
+            DestroyWindow(hwnd_fs);
+            return fail("CreateSwapChainForHwnd with fullscreen desc failed");
+        }
+
+        DXGI_SWAP_CHAIN_FULLSCREEN_DESC out_fsd{};
+        if (FAILED(sc_fs->GetFullscreenDesc(&out_fsd))) {
+            sc_fs->Release();
+            DestroyWindow(hwnd_fs);
+            return fail("GetFullscreenDesc on custom fsd swapchain failed");
+        }
+        if (out_fsd.RefreshRate.Numerator != 60 || out_fsd.RefreshRate.Denominator != 1 ||
+            out_fsd.ScanlineOrdering != DXGI_MODE_SCANLINE_ORDER_PROGRESSIVE ||
+            out_fsd.Scaling != DXGI_MODE_SCALING_CENTERED || !out_fsd.Windowed) {
+            sc_fs->Release();
+            DestroyWindow(hwnd_fs);
+            return fail("GetFullscreenDesc did not match initialized fullscreen desc");
+        }
+        sc_fs->Release();
+        DestroyWindow(hwnd_fs);
+    }
+
     // IDXGIFactory4 adapter enumeration, IDXGIAdapter3 descriptors, EnumAdapterByLuid, and QueryVideoMemoryInfo.
     {
         IDXGIAdapter1* adapter1 = nullptr;
@@ -805,7 +892,7 @@ int main() {
         return 1;
     }
     std::printf("device: %s (validation %s)\n", chosen.deviceName, val_active ? "on" : "off");
-    std::printf("dxgi_swapchain_test: PASS (CreateSwapChainForHwnd, GetBuffer+GetDesc, clear+readback, Present, "
-                "ResizeBuffers; 0 validation errors)\n");
+    std::printf("dxgi_swapchain_test: PASS (CreateSwapChainForHwnd, GetBuffer+GetDesc, GetDevice+GetFullscreenDesc, "
+                "clear+readback, Present, ResizeBuffers; 0 validation errors)\n");
     return 0;
 }
