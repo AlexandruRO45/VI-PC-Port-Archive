@@ -4,6 +4,7 @@
 #include <fstream>
 #include <iterator>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 using Microsoft::WRL::ComPtr;
 
@@ -32,7 +33,8 @@ struct MeshPipeline {
 };
 }
 
-bool check_mesh_entry_draw(ID3D12Device* device, const char* first, const char* second, const char* fixture, bool vertices)
+bool check_mesh_entry_draw(ID3D12Device* device, const char* first, const char* second, const char* fixture,
+                          bool vertices, const char* cbv_order)
 {
     D3D12_FEATURE_DATA_D3D12_OPTIONS7 options{};
     check(check_feature(device, D3D12_FEATURE_D3D12_OPTIONS7, &options, sizeof(options)), "Query mesh tier");
@@ -111,8 +113,19 @@ bool check_mesh_entry_draw(ID3D12Device* device, const char* first, const char* 
     auto* list = commands.list.Get();
     list->SetGraphicsRootSignature(root.Get());
     const auto base = upload->GetGPUVirtualAddress();
-    list->SetGraphicsRootConstantBufferView(0, base);
-    list->SetGraphicsRootConstantBufferView(1, base + cb_bytes);
+    D3D12_GPU_VIRTUAL_ADDRESS cbv[2]{base, base + cb_bytes};
+    ComPtr<ID3D12Resource> buffer_b;
+    if (cbv_order) {
+        // Keep A and B in distinct resources with identical contents across binding orders.
+        buffer_b = make_buffer(device, cb_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        check(buffer_b->Map(0, &empty, &mapped), "Map constant buffer B");
+        std::memcpy(mapped, input.data() + cb_bytes, cb_bytes);
+        buffer_b->Unmap(0, nullptr);
+        cbv[1] = buffer_b->GetGPUVirtualAddress();
+        if (cbv_order[0] == 'b') std::swap(cbv[0], cbv[1]);
+    }
+    list->SetGraphicsRootConstantBufferView(0, cbv[0]);
+    list->SetGraphicsRootConstantBufferView(1, cbv[1]);
     if (vertices) list->SetGraphicsRootShaderResourceView(3, base + 2 * cb_bytes);
     const D3D12_VIEWPORT viewport{0, 0, side, side, 0, 1};
     const D3D12_RECT scissor{0, 0, side, side};

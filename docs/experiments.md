@@ -1315,6 +1315,19 @@ python3 -B tests/mesh_indexed_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM
 ctest --preset dev --no-tests=error -R "^mesh_indexed_draw_" -V
 ```
 
+The source-built `mesh_cbv_order` test binds two separate upload resources as
+root CBVs and exchanges their GPU addresses for the second draw. The mesh entry
+adds the float at byte 4 of b0 to the float at byte 12 of b1. The translated
+pixel entry reads its color from b0 at byte 16. Binding A/B draws red at depth
+0.5 and B/A draws white at depth 0.625. On RTX 4060 Laptop and WARP, the three
+exported depths and all 1,024 RGBA pixels matched for both orders. Comparing
+the swapped draw to the old color detected 1,024 mismatches. Comparing to the
+old depth failed the mesh trace with zero pixel mismatches.
+
+```sh
+ctest --preset dev --no-tests=error -R "^mesh_cbv_order_" -V
+```
+
 The indexed attribute fixture binds three additional float3 colors in the vertex
 buffer. Its mesh entry exports a four-component PARAM0 per vertex. The pixel
 entry interpolates attr0, packs the channels to binary16 and exports MRT0.

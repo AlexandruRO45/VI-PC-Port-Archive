@@ -365,7 +365,8 @@ int main(int argc, char** argv)
     } else if (operation == "--check-pixel-quad-lod") {
         if (argc != 4) return 2;
     } else if (operation == "--mesh-entry" || operation == "--mesh-indexed") {
-        if (argc != 6) return 2;
+        if (argc != 6 && !(operation == "--mesh-entry" && argc == 7 &&
+            (std::string_view(argv[6]) == "ab" || std::string_view(argv[6]) == "ba"))) return 2;
     } else if (operation == "--check-bc7-tail") {
         if (argc < 6) return 2;
     } else if ((operation == "--depth-mask" || operation == "--depth-mask-swapped")) {
@@ -505,7 +506,8 @@ int main(int argc, char** argv)
         } else if (argc == 3 && operation == "--dxr-update") {
             if (!check_dxr_update(device.Get())) return 77;
         } else if (operation == "--mesh-entry" || operation == "--mesh-indexed") {
-            if (!check_mesh_entry_draw(device.Get(), argv[3], argv[4], argv[5], operation == "--mesh-indexed")) return 77;
+            if (!check_mesh_entry_draw(device.Get(), argv[3], argv[4], argv[5],
+                                       operation == "--mesh-indexed", argc == 7 ? argv[6] : nullptr)) return 77;
         } else if (argc == 3 && operation == "--dxr-facing") {
             if (!check_dxr_facing(device.Get())) return 77;
         } else if (argc == 3 && operation == "--dxr-opacity") {
