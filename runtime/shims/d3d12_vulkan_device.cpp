@@ -10,6 +10,8 @@
 #include "../src/retirement.h"          // fence-value deferred release
 #include "../src/vulkan_bindless.h"     // set 0: images, samplers, descriptor table
 #include "../src/pipeline_stream.h"     // D3D12 pipeline-state stream (PR C)
+#include "../src/d3d12_root_signature.h"  // serialized root signature (PR A)
+#include "../src/root_signature_layout.h" // root signature -> Vulkan layout (PR B)
 #include "../src/descriptor_sizes.h"    // per-type slot sizes
 #include "d3d12_stubs.h"  // generated
 #include "d3d12_com_object.h"
@@ -618,6 +620,111 @@ private:
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
 };
 
+// --- PR B: D3D12 root signature object and its Vulkan layout -----------------------------------------------
+
+class RootSignature final
+    : public Child<RootSignature, ID3D12RootSignatureStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
+                   ID3D12RootSignature> {
+public:
+    // {6f1c2a44-8d3e-4c7a-b1f2-2a9d5e6c7b31}
+    static constexpr GUID kTag{0x6f1c2a44, 0x8d3e, 0x4c7a, {0xb1, 0xf2, 0x2a, 0x9d, 0x5e, 0x6c, 0x7b, 0x31}};
+
+    RootSignature(DeviceState& device, VkPipelineLayout layout, std::vector<VkDescriptorSetLayout> sets)
+        : device_(device), layout_(layout), sets_(std::move(sets)) {}
+
+    ~RootSignature() override {
+        auto& vk = device_.context->vk;
+        if (layout_) vk.vkDestroyPipelineLayout(device_.info.device, layout_, nullptr);
+        for (VkDescriptorSetLayout set : sets_)
+            if (set) vk.vkDestroyDescriptorSetLayout(device_.info.device, set, nullptr);
+    }
+
+    VkPipelineLayout layout() const { return layout_; }
+
+private:
+    DeviceState& device_;
+    VkPipelineLayout layout_ = VK_NULL_HANDLE;
+    std::vector<VkDescriptorSetLayout> sets_;
+};
+
+// Deserializer object: holds the parsed description; the Vulkan layout needs a device, so that step stays in
+// CreateRootSignature. Kept separate so a tool can inspect a blob without a device.
+class RootSignatureDeserializer final : public ID3D12RootSignatureDeserializer {
+public:
+    RootSignatureDeserializer(rt::d3d12::RootSignatureDesc desc) : desc_(std::move(desc)) {}
+
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++references_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG remaining = --references_;
+        if (!remaining) delete this;
+        return remaining;
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12RootSignatureDeserializer)) {
+            *out = static_cast<ID3D12RootSignatureDeserializer*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    const D3D12_ROOT_SIGNATURE_DESC* STDMETHODCALLTYPE GetRootSignatureDesc() override {
+        return nullptr;  // the parsed description is exposed through desc(); the D3D12 struct is not rebuilt
+    }
+
+    const rt::d3d12::RootSignatureDesc& desc() const { return desc_; }
+
+private:
+    ~RootSignatureDeserializer() = default;
+    std::atomic<ULONG> references_{1};
+    rt::d3d12::RootSignatureDesc desc_;
+};
+inline HRESULT create_root_layout(DeviceState& state, const rt::d3d12::RootSignatureDesc& desc,
+                                  VkPipelineLayout* layout_out, std::vector<VkDescriptorSetLayout>* sets_out) {
+    rt::d3d12::RootLayoutDesc mapped{};
+    std::string error;
+    if (!rt::d3d12::build_root_layout(desc, mapped, &error)) {
+        std::fprintf(stderr, "[rt] d3d12: root signature rejected: %s\n", error.c_str());
+        return E_INVALIDARG;
+    }
+    auto& vk = state.context->vk;
+    const VkDevice device = state.info.device;
+    sets_out->assign(mapped.set_count, VK_NULL_HANDLE);
+    for (std::uint32_t set = 0; set < mapped.set_count; ++set) {
+        std::vector<VkDescriptorSetLayoutBinding> bindings;
+        for (const auto& binding : mapped.bindings) {
+            if (binding.set != set) continue;
+            VkDescriptorSetLayoutBinding entry{};
+            entry.binding = binding.binding;
+            entry.descriptorType = binding.type;
+            entry.descriptorCount = binding.count;
+            entry.stageFlags = binding.stage;
+            bindings.push_back(entry);
+        }
+        VkDescriptorSetLayoutCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        info.bindingCount = std::uint32_t(bindings.size());
+        info.pBindings = bindings.data();
+        if (vk.vkCreateDescriptorSetLayout(device, &info, nullptr, &(*sets_out)[set]) != VK_SUCCESS) {
+            for (VkDescriptorSetLayout created : *sets_out)
+                if (created) vk.vkDestroyDescriptorSetLayout(device, created, nullptr);
+            sets_out->clear();
+            return E_FAIL;
+        }
+    }
+    VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layout_info.setLayoutCount = std::uint32_t(sets_out->size());
+    layout_info.pSetLayouts = sets_out->data();
+    layout_info.pushConstantRangeCount = std::uint32_t(mapped.push_ranges.size());
+    layout_info.pPushConstantRanges = mapped.push_ranges.data();
+    if (vk.vkCreatePipelineLayout(device, &layout_info, nullptr, layout_out) != VK_SUCCESS) {
+        for (VkDescriptorSetLayout created : *sets_out)
+            if (created) vk.vkDestroyDescriptorSetLayout(device, created, nullptr);
+        sets_out->clear();
+        return E_FAIL;
+    }
+    return S_OK;
+}
 // Builds a VkPipeline from a parsed D3D12 stream. Returns E_INVALIDARG with a log line on a stream this layer cannot
 // express yet; the caller (CreatePipelineState) reports it instead of crashing.
 inline HRESULT build_pipeline(DeviceState& state, const D3D12_PIPELINE_STATE_STREAM_DESC& desc,
@@ -1144,6 +1251,26 @@ public:
         }
     }
 
+    HRESULT STDMETHODCALLTYPE CreateRootSignature(UINT node_mask, const void* blob, SIZE_T size, REFIID riid,
+                                                  void** out) override {
+        (void)node_mask;
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!blob || !size) return E_INVALIDARG;
+        rt::d3d12::RootSignatureDesc desc{};
+        std::string error;
+        if (!rt::d3d12::parse_root_signature(blob, size, desc, &error)) {
+            std::fprintf(stderr, "[rt] d3d12: root signature parse failed: %s\n", error.c_str());
+            return E_INVALIDARG;
+        }
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        std::vector<VkDescriptorSetLayout> sets;
+        const HRESULT hr = create_root_layout(state_, desc, &layout, &sets);
+        if (FAILED(hr)) return hr;
+        auto* object = new RootSignature(state_, layout, std::move(sets));
+        object->attach_device(identity());
+        return hand_out(object, riid, out);
+    }
     HRESULT STDMETHODCALLTYPE CreatePipelineState(const D3D12_PIPELINE_STATE_STREAM_DESC* desc, REFIID riid,
                                                   void** out) override {
         if (!out) return E_POINTER;
@@ -1600,8 +1727,25 @@ public:
     IUnknown* outer_ = nullptr;  // the Xbox-ABI proxy, which owns a reference to this device
 };
 
+inline HRESULT create_root_signature_deserializer_impl(const void* data, SIZE_T size, REFIID riid, void** out) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!data || !size) return E_INVALIDARG;
+    rt::d3d12::RootSignatureDesc desc{};
+    std::string error;
+    if (!rt::d3d12::parse_root_signature(data, size, desc, &error)) {
+        std::fprintf(stderr, "[rt] d3d12: root signature deserializer: %s\n", error.c_str());
+        return E_INVALIDARG;
+    }
+    if (riid != __uuidof(IUnknown) && riid != __uuidof(ID3D12RootSignatureDeserializer)) return E_NOINTERFACE;
+    *out = static_cast<ID3D12RootSignatureDeserializer*>(new RootSignatureDeserializer(std::move(desc)));
+    return S_OK;
+}
 }  // namespace
 
+HRESULT create_root_signature_deserializer(const void* data, SIZE_T size, REFIID riid, void** out) {
+    return create_root_signature_deserializer_impl(data, size, riid, out);
+}
 HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** out) {
     if (!out) return E_POINTER;
     *out = nullptr;
@@ -1637,6 +1781,18 @@ VkImage vulkan_image(ID3D12Resource* resource) {
 VkPipeline vulkan_pipeline(ID3D12PipelineState* state) {
     const PipelineState* p = PipelineState::from<PipelineState>(state);
     return p ? p->pipeline() : VK_NULL_HANDLE;
+}
+
+VkPipelineLayout vulkan_root_signature_layout(ID3D12RootSignature* root_signature) {
+    const RootSignature* r = RootSignature::from<RootSignature>(root_signature);
+    return r ? r->layout() : VK_NULL_HANDLE;
+}
+
+VkDevice vulkan_device(ID3D12Device* device) {
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (!real) real = device;
+    Device* d = Device::from<Device>(real);
+    return d ? d->info().device : VK_NULL_HANDLE;
 }
 
 VkBuffer vulkan_buffer_for_va(ID3D12Device* device, std::uint64_t va, std::uint64_t* base_va) {

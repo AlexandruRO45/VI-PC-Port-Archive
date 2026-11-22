@@ -58,6 +58,11 @@ VkImage vulkan_image(ID3D12Resource* resource);
 // The VkPipeline behind an ID3D12PipelineState created by the device (VK_NULL_HANDLE for anything else).
 VkPipeline vulkan_pipeline(ID3D12PipelineState* state);
 
+// The VkPipelineLayout behind an ID3D12RootSignature, and the VkDevice behind the device (for tests/tools).
+HRESULT create_root_signature_deserializer(const void* data, SIZE_T size, REFIID riid, void** out);
+VkPipelineLayout vulkan_root_signature_layout(ID3D12RootSignature* root_signature);
+VkDevice vulkan_device(ID3D12Device* device);
+
 // The maxPushConstantsSize in bytes of the Vulkan physical device behind `device`, or 0 if not a Vulkan device.
 std::uint32_t device_max_push_constants_size(ID3D12Device* device);
 

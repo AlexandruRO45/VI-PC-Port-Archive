@@ -389,9 +389,9 @@ extern "C" BOOL __stdcall shim_get_file_size_ex(HANDLE file, LARGE_INTEGER* size
 }
 extern "C" BOOL __stdcall shim_close_handle(HANDLE handle) { return ::CloseHandle(handle); }
 
-extern "C" HRESULT __stdcall shim_d3d12_create_root_signature_deserializer(const void*, SIZE_T, const GUID&, void** out) {
-    if (out) *out = nullptr;
-    return E_NOTIMPL;  // root signatures are not modelled as objects yet
+extern "C" HRESULT __stdcall shim_d3d12_create_root_signature_deserializer(const void* data, SIZE_T size,
+                                                                           const GUID& riid, void** out) {
+    return rt::d3d12::create_root_signature_deserializer(data, size, riid, out);
 }
 extern "C" HRESULT __stdcall shim_map(void* resource, UINT subresource, const D3D12_RANGE* read_range, void** data) {
     return static_cast<ID3D12Resource*>(resource)->Map(subresource, read_range, data);

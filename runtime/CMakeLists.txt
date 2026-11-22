@@ -361,7 +361,7 @@ if(Vulkan_FOUND)
       OUTPUT ${LEONIDA_STUBS}
       COMMAND Python3::Interpreter -I ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py --out ${LEONIDA_STUBS}
               ID3D12GraphicsCommandList8 ID3D12CommandQueue ID3D12CommandAllocator ID3D12Fence1
-              ID3D12Device11 ID3D12DescriptorHeap ID3D12Resource ID3D12PipelineState
+              ID3D12Device11 ID3D12DescriptorHeap ID3D12Resource ID3D12PipelineState ID3D12RootSignature ID3D12RootSignatureDeserializer
       DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py
       COMMENT "Generating D3D12 COM stubs"
       VERBATIM)
@@ -427,6 +427,15 @@ if(Vulkan_FOUND)
   target_compile_definitions(pipeline_state_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(pipeline_state_test PRIVATE /W4 /permissive- /utf-8)
   add_test(NAME pipeline_state COMMAND pipeline_state_test)
+  # Root signature COM -> VkPipelineLayout, then a real pipeline with it (PR B).
+  add_executable(root_signature_com_test test/root_signature_com_test.cpp)
+  target_include_directories(root_signature_com_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                                                            ${CMAKE_CURRENT_SOURCE_DIR}/shims
+                                                            ${CMAKE_CURRENT_SOURCE_DIR}/test)
+  target_link_libraries(root_signature_com_test PRIVATE gta6rt_d3d12_com ${LEONIDA_VULKAN_LIB})
+  target_compile_definitions(root_signature_com_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(root_signature_com_test PRIVATE /W4 /permissive- /utf-8)
+  add_test(NAME root_signature_com COMMAND root_signature_com_test)
   # First draw (milestone M1): a real triangle through the bindless set, a pipeline and an offscreen render pass.
   add_executable(first_draw_test test/first_draw_test.cpp)
   target_include_directories(first_draw_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
