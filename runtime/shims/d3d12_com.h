@@ -159,6 +159,14 @@ struct VulkanDeviceInfo {
     // colours fall back to transparent black.
     bool custom_border_color = false;
     bool custom_border_color_without_format = false;
+    // Input-assembler reads past a view read as zero, as in D3D12 (docs/d3d12_vulkan.md, section 3.3). The caller
+    // enables both of these on `device`, or neither: the sized index bind is only valid for a draw past its range with
+    // robustBufferAccess2, so the layer uses it only when both are set and otherwise keeps the unsized bind (reads then
+    // continue into whatever follows the view in the GPU address arena). `index_buffer_size`: VK_KHR_maintenance5.
+    // `robust_buffer_access2`: robustBufferAccess2 with robustBufferAccess (VK_KHR_robustness2 or VK_EXT_robustness2),
+    // which needs robustBufferAccessUpdateAfterBind or no update-after-bind buffer descriptors.
+    bool index_buffer_size = false;
+    bool robust_buffer_access2 = false;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive
@@ -181,6 +189,9 @@ VkBuffer vulkan_buffer(ID3D12Resource* resource);
 const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device);
 // True when `device` has VK_KHR_acceleration_structure + VK_KHR_ray_query enabled.
 bool device_supports_ray_tracing(ID3D12Device* device);
+// True when `device` bounds input-assembler reads at the end of a vertex or index buffer view (index_buffer_size and
+// robust_buffer_access2 both enabled), so a read past a view gives zero as in D3D12. For tests.
+bool device_index_bounds_exact(ID3D12Device* device);
 // The VkAccelerationStructureKHR registered for `va` on `device`, or VK_NULL_HANDLE. For tests.
 VkAccelerationStructureKHR vulkan_acceleration_structure(ID3D12Device* device, D3D12_GPU_VIRTUAL_ADDRESS va);
 

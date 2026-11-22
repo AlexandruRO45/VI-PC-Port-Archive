@@ -764,8 +764,11 @@ public:
     // conditional_rendering: VK_EXT_conditional_rendering is enabled on `device` (SetPredication).
     // ray_tracing: VK_KHR_acceleration_structure + VK_KHR_ray_query are enabled on `device`.
     // xdxr: acceleration-structure builds write XDXR BVH4 records (xdxr_build.h) instead; needs bufferDeviceAddress.
+    // index_buffer_size: VK_KHR_maintenance5 and robustBufferAccess2 are both enabled on `device`, so index buffers are
+    // bound with their view's size (VUID-vkCmdDrawIndexed-robustBufferAccess2-08798: only then can a draw run past it).
     VulkanContext(PFN_vkGetDeviceProcAddr get, VkDevice device, bool separate_depth_stencil_layouts,
-                  bool conditional_rendering = false, bool ray_tracing = false, bool xdxr = false)
+                  bool conditional_rendering = false, bool ray_tracing = false, bool xdxr = false,
+                  bool index_buffer_size = false)
         : device_(device), tracker_(separate_depth_stencil_layouts), ray_tracing_(ray_tracing) {
         loaded_ = vk.load(get, device);
         replay_.pipeline_barrier = vk.vkCmdPipelineBarrier;
@@ -806,6 +809,11 @@ public:
         };
         replay_.bind_vertex_buffers2 = vk.vkCmdBindVertexBuffers2;
         replay_.bind_index_buffer = vk.vkCmdBindIndexBuffer;
+        // The device is created at Vulkan 1.3, so the command is the maintenance5 extension's: its KHR name, which a
+        // driver serves only with the extension enabled (the core name is not valid at 1.3 but may be handed out).
+        if (index_buffer_size)
+            replay_.bind_index_buffer2 =
+                reinterpret_cast<PFN_vkCmdBindIndexBuffer2KHR>(get(device, "vkCmdBindIndexBuffer2KHR"));
         replay_.set_viewport = vk.vkCmdSetViewport;
         replay_.set_scissor = vk.vkCmdSetScissor;
         replay_.set_primitive_topology = vk.vkCmdSetPrimitiveTopology;
