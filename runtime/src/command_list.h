@@ -1,9 +1,9 @@
 #pragma once
 
 // The command-list IR (docs/d3d12_vulkan.md section 3.2): what a D3D12 command list records, kept until
-// ExecuteCommandLists replays it on Vulkan (vulkan_replay.h). This slice covers legacy and enhanced barriers and
-// render-target and depth-stencil clears (whole views or rectangles), copies and resolves. It has no Windows or
-// Vulkan dependency.
+// ExecuteCommandLists replays it on Vulkan (vulkan_replay.h). This slice covers legacy and enhanced barriers,
+// render-target and depth-stencil clears (whole views or rectangles), copies and resolves, the pipeline state and
+// input assembly a draw needs, the draws themselves and OMSetRenderTargets. It has no Windows or Vulkan dependency.
 
 #include <array>
 #include <cstdint>
@@ -347,6 +347,18 @@ struct DrawIndexedInstanced {
     std::uint32_t start_instance;
 };
 
+// D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT.
+inline constexpr std::uint32_t max_render_targets = 8;
+
+// OMSetRenderTargets: the colour views the following draws render into, and the depth-stencil view if the list binds
+// one. Views are captured by value, as the clears capture theirs, because the CPU descriptor slot may be rewritten
+// after the call. Binding no views at all is legal in D3D12 (output-merger writes then go nowhere), and the replay
+// keeps it as the list state: a draw before the next OMSetRenderTargets has no attachment to render into.
+struct OMSetRenderTargets {
+    std::vector<TargetView> render_targets;
+    TargetView depth_stencil{};  // resource == 0: no depth-stencil view bound
+};
+
 // Input assembly (the last D3D12 state the draw path needs). A view names its buffer by console/GPU VA, which the
 // replay resolves to the VkBuffer through the device's VA map; the COM layer only ever sees a VA.
 struct VertexBufferBinding {
@@ -371,7 +383,7 @@ using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, Glo
                              CopyResource, ResolveSubresource, SetDescriptorHeaps, SetGraphicsRootDescriptorTable,
                              SetComputeRootDescriptorTable, SetPipelineState, SetGraphicsRootSignature,
                              SetComputeRootSignature, DrawInstanced, DrawIndexedInstanced, IASetVertexBuffers,
-                             IASetIndexBuffer>;
+                             IASetIndexBuffer, OMSetRenderTargets>;
 
 class CommandList {
 public:
@@ -511,6 +523,20 @@ public:
         if (closed_ || !gpu_va) return false;
         if (format != 57u /*DXGI_FORMAT_R16_UINT*/ && format != 42u /*DXGI_FORMAT_R32_UINT*/) return false;
         return append(IASetIndexBuffer{gpu_va, offset, format});
+    }
+
+    // OMSetRenderTargets: at most eight colour views plus an optional depth-stencil view, every one a valid view.
+    // Binding none is allowed (D3D12 permits it; the replay then has no attachment for a later draw). D3D12 lets the
+    // views differ in size and layer count; the replay renders into the area and layers they share.
+    bool set_render_targets(std::span<const TargetView> render_targets, const TargetView* depth_stencil = nullptr) {
+        if (closed_ || render_targets.size() > max_render_targets) return false;
+        for (const auto& target : render_targets)
+            if (!valid(target)) return false;
+        if (depth_stencil && !valid(*depth_stencil)) return false;
+        OMSetRenderTargets command;
+        command.render_targets.assign(render_targets.begin(), render_targets.end());
+        if (depth_stencil) command.depth_stencil = *depth_stencil;
+        return append(std::move(command));
     }
     // Draws. Only the counts that D3D12 itself requires are checked here: a zero vertex/index count or a zero
     // instance count is invalid; the vertex/index buffers, PSO and root signature are checked at replay.

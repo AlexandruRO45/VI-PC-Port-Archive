@@ -16,8 +16,9 @@
 //
 // Requirements on the device and images:
 // - a queue with graphics support (the stage masks use ALL_GRAPHICS);
-// - images cleared without rectangles have TRANSFER_DST usage; images cleared with rectangles have attachment usage
-//   and image_view must return views for them (dynamicRendering, Vulkan 1.3);
+// - images cleared without rectangles have TRANSFER_DST usage; images cleared with rectangles, and the attachments
+//   OMSetRenderTargets binds, have attachment usage and image_view must return views for them (dynamicRendering,
+//   Vulkan 1.3);
 // - enhanced barriers need pipeline_barrier2 (synchronization2, Vulkan 1.3).
 // A list that needs a missing function fails with ReplayResult::unsupported before anything is written.
 
@@ -460,7 +461,7 @@ struct ReplayFunctions {
     PFN_vkCmdClearDepthStencilImage clear_depth_stencil_image = nullptr;
     // Optional; a list that needs a missing one is rejected with ReplayResult::unsupported.
     PFN_vkCmdPipelineBarrier2 pipeline_barrier2 = nullptr;  // enhanced barriers
-    PFN_vkCmdBeginRendering begin_rendering = nullptr;      // rectangle clears
+    PFN_vkCmdBeginRendering begin_rendering = nullptr;      // rectangle clears and OMSetRenderTargets draws
     PFN_vkCmdEndRendering end_rendering = nullptr;
     PFN_vkCmdClearAttachments clear_attachments = nullptr;
     PFN_vkCmdCopyBuffer copy_buffer = nullptr;                  // copies
@@ -506,6 +507,25 @@ enum class ReplayResult {
 
 namespace detail {
 
+// One attachment of an OMSetRenderTargets command, resolved: the resource, its image range, the view to render into
+// and the layout the attachment expects.
+struct PreparedAttachment {
+    ResourceId id = 0;
+    ResourceBinding binding;
+    VkImageSubresourceRange range{};
+    VkImageView view = VK_NULL_HANDLE;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+};
+
+// The attachments a draw renders into, plus the area inside all of them.
+struct PreparedTargets {
+    std::vector<PreparedAttachment> colors;
+    PreparedAttachment depth{};
+    bool has_depth = false;
+    VkExtent2D extent{};
+    std::uint32_t layers = 0;
+};
+
 struct Prepared {
     ResourceBinding binding;
     VkImageSubresourceRange range{};  // the barrier range, or the cleared view (cleared aspects only)
@@ -518,6 +538,7 @@ struct Prepared {
     std::vector<VkBufferImageCopy> buffer_image_copies;  // one direction, given by which side is an image
     std::vector<VkImageCopy> image_copies;
     VkImageResolve resolve{};  // resolves
+    PreparedTargets targets;   // OMSetRenderTargets
 };
 
 inline bool view_range(const ResourceBinding& resource, const TargetView& view, VkImageAspectFlags aspects,
@@ -551,6 +572,24 @@ inline std::vector<VkClearRect> clip(std::span<const Rect> rects, VkExtent2D ext
                        0, layers});
     }
     return out;
+}
+
+// Resolves one view of an OMSetRenderTargets command: the resource, its range, the layout it is rendered in and the
+// view dynamic rendering binds. `aspects` is what the view has to cover (colour, or the depth-stencil planes).
+template<typename Resolve>
+ReplayResult prepare_attachment(const TargetView& target, VkImageAspectFlags aspects, Resolve&& resolve,
+                                const ReplayFunctions& vk, PreparedAttachment& out) {
+    const ResourceBinding* binding = resolve(target.resource);
+    if (!binding) return ReplayResult::unresolved_resource;
+    if (!binding->image) return ReplayResult::invalid_binding;
+    out.id = target.resource;
+    out.binding = *binding;
+    if (!view_range(*binding, target, aspects, out.range)) return ReplayResult::invalid_subresource;
+    out.layout = image_layout(*binding, (aspects & VK_IMAGE_ASPECT_COLOR_BIT)
+                                             ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                                             : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    out.view = vk.image_view(*binding, out.range);
+    return out.view ? ReplayResult::success : ReplayResult::unsupported;
 }
 
 inline void image_barrier(const ReplayFunctions& vk, VkCommandBuffer command_buffer, VkImage image,
@@ -839,6 +878,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     out.list = &list;
     out.commands.assign(commands.size(), {});
     const bool rendering = vk.begin_rendering && vk.end_rendering && vk.clear_attachments && vk.image_view;
+    const bool attachments = vk.begin_rendering && vk.end_rendering && vk.image_view;
     const bool copies = vk.copy_buffer && vk.copy_buffer_to_image && vk.copy_image_to_buffer && vk.copy_image;
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
@@ -951,6 +991,47 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!draw->vertex_count_per_instance || !draw->instance_count) return ReplayResult::invalid_binding;
         } else if (const auto* draw = std::get_if<DrawIndexedInstanced>(&command)) {
             if (!draw->index_count_per_instance || !draw->instance_count) return ReplayResult::invalid_binding;
+        } else if (const auto* targets = std::get_if<OMSetRenderTargets>(&command)) {
+            if (targets->render_targets.size() > max_render_targets) return ReplayResult::invalid_binding;
+            if (!targets->render_targets.empty() || targets->depth_stencil.resource) {
+                if (!attachments) return ReplayResult::unsupported;
+            }
+            for (const auto& target : targets->render_targets) {
+                detail::PreparedAttachment attachment;
+                const auto result =
+                    detail::prepare_attachment(target, VK_IMAGE_ASPECT_COLOR_BIT, resolve, vk, attachment);
+                if (result != ReplayResult::success) return result;
+                p.targets.colors.push_back(std::move(attachment));
+            }
+            if (targets->depth_stencil.resource) {
+                const ResourceBinding* binding = resolve(targets->depth_stencil.resource);
+                if (!binding) return ReplayResult::unresolved_resource;
+                const VkImageAspectFlags aspects = binding->aspects & depth_stencil_aspects;
+                if (!binding->image || !aspects) return ReplayResult::invalid_binding;
+                if (const auto result = detail::prepare_attachment(targets->depth_stencil, aspects, resolve, vk,
+                                                                   p.targets.depth);
+                    result != ReplayResult::success)
+                    return result;
+                p.targets.has_depth = true;
+            }
+            // D3D12 lets the views differ in size and layer count; Vulkan clips to what they share.
+            p.targets.extent = {UINT32_MAX, UINT32_MAX};
+            p.targets.layers = UINT32_MAX;
+            const auto include = [&](const detail::PreparedAttachment& attachment) {
+                const VkExtent2D extent = detail::mip_extent(attachment.binding, attachment.range.baseMipLevel);
+                p.targets.extent.width = std::min(p.targets.extent.width, extent.width);
+                p.targets.extent.height = std::min(p.targets.extent.height, extent.height);
+                p.targets.layers = std::min(p.targets.layers, attachment.range.layerCount);
+            };
+            for (const auto& attachment : p.targets.colors) include(attachment);
+            if (p.targets.has_depth) include(p.targets.depth);
+            if (!p.targets.colors.empty() || p.targets.has_depth) {
+                if (!p.targets.extent.width || !p.targets.extent.height || !p.targets.layers)
+                    return ReplayResult::invalid_binding;
+            } else {
+                p.targets.extent = {};
+                p.targets.layers = 0;
+            }
         }
     }
     return ReplayResult::success;
@@ -963,6 +1044,45 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
     const bool separate = vk.separate_depth_stencil_layouts;
     const VulkanAccess transfer_dst = vulkan_access(d3d12_state::copy_dest, false);
     VkPipeline bound_pipeline = VK_NULL_HANDLE;
+
+    // Dynamic rendering for OMSetRenderTargets. The attachment set stays bound across state and barrier commands, but
+    // a rendering instance only lives while draws need one: it opens before the first draw that uses the attachments
+    // and closes before any command that cannot run inside it, and at the end of the list. Each opening moves the
+    // attachments to their layout, so a list that copies or samples a render target between draws stays legal.
+    bool attachments_declared = false;  // the list recorded an OMSetRenderTargets
+    bool rendering_open = false;
+    const detail::PreparedTargets* active = nullptr;  // the attachments a draw would render into
+    std::vector<VkRenderingAttachmentInfo> color_infos;
+    VkRenderingAttachmentInfo depth_info{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    VkRenderingAttachmentInfo stencil_info{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    VkRenderingInfo rendering_info{VK_STRUCTURE_TYPE_RENDERING_INFO};
+
+    const auto close_targets = [&] {
+        if (!rendering_open) return;
+        vk.end_rendering(command_buffer);
+        rendering_open = false;
+    };
+    const auto open_targets = [&](const detail::PreparedTargets& targets) {
+        if (rendering_open) return;
+        const auto move = [&](const detail::PreparedAttachment& attachment) {
+            const bool color = (attachment.range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) != 0;
+            const VulkanAccess state =
+                vulkan_access(color ? d3d12_state::render_target : d3d12_state::depth_write, attachment.binding.presentable);
+            auto pieces = detail::current(tracker, attachment.id, attachment.range, attachment.layout);
+            detail::initialize(vk, command_buffer, attachment.binding, attachment.id, pieces, attachment.layout, tracker);
+            for (const auto& piece : pieces) {
+                if (piece.layout == attachment.layout) continue;
+                detail::image_barrier(vk, command_buffer, attachment.binding.image, piece.range, piece.layout,
+                                      attachment.layout, VK_ACCESS_MEMORY_WRITE_BIT,
+                                      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, state.access, state.stages);
+            }
+            if (tracker) tracker->set(attachment.id, attachment.range, attachment.layout);
+        };
+        for (const auto& attachment : targets.colors) move(attachment);
+        if (targets.has_depth) move(targets.depth);
+        vk.begin_rendering(command_buffer, &rendering_info);
+        rendering_open = true;
+    };
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
@@ -1003,6 +1123,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         }
         if (const auto* draw = std::get_if<DrawInstanced>(&command)) {
             if (!vk.draw || !bound_pipeline) continue;
+            // A list that bound no attachment (or none at all) has nothing for the output merger to write into.
+            if (attachments_declared && !active) continue;
+            if (active) open_targets(*active);
             if (vk.bind_pipeline) vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, bound_pipeline);
             if (vk.bindless_set && vk.bind_descriptor_sets)
                 vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.bindless_layout, 0, 1,
@@ -1015,6 +1138,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         }
         if (const auto* draw = std::get_if<DrawIndexedInstanced>(&command)) {
             if (!vk.draw_indexed || !bound_pipeline) continue;
+            if (attachments_declared && !active) continue;
+            if (active) open_targets(*active);
             if (vk.bind_pipeline) vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, bound_pipeline);
             if (vk.bindless_set && vk.bind_descriptor_sets)
                 vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.bindless_layout, 0, 1,
@@ -1025,6 +1150,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                             draw->base_vertex, draw->start_instance);
             continue;
         }
+
+        // Everything below runs outside a rendering instance (barriers, clears, copies and the attachment changes
+        // themselves), so the instance a draw opened ends here; a later draw opens a new one.
+        close_targets();
         const ResourceId id = std::visit(
             [](const auto& c) -> ResourceId {
                 using T = std::decay_t<decltype(c)>;
@@ -1219,8 +1348,47 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
             vk.resolve_image(command_buffer, p.source.image, src_layout, p.binding.image, dst_layout, 1, &p.resolve);
+        } else if (std::holds_alternative<OMSetRenderTargets>(command)) {
+            // Only the list state changes here: rendering opens lazily at the first draw that uses these attachments.
+            attachments_declared = true;
+            active = (p.targets.colors.empty() && !p.targets.has_depth) ? nullptr : &p.targets;
+            color_infos.clear();
+            depth_info = VkRenderingAttachmentInfo{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+            stencil_info = VkRenderingAttachmentInfo{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+            rendering_info = VkRenderingInfo{VK_STRUCTURE_TYPE_RENDERING_INFO};
+            if (!active) continue;
+            color_infos.reserve(p.targets.colors.size());
+            for (const auto& attachment : p.targets.colors) {
+                VkRenderingAttachmentInfo info{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+                info.imageView = attachment.view;
+                info.imageLayout = attachment.layout;
+                info.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;  // D3D12 keeps what the render target holds
+                info.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                color_infos.push_back(info);
+            }
+            if (p.targets.has_depth) {
+                const VkImageAspectFlags aspects = p.targets.depth.range.aspectMask;
+                if (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
+                    depth_info.imageView = p.targets.depth.view;
+                    depth_info.imageLayout = p.targets.depth.layout;
+                    depth_info.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                    depth_info.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                    rendering_info.pDepthAttachment = &depth_info;
+                }
+                if (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) {
+                    stencil_info = depth_info;
+                    stencil_info.imageView = p.targets.depth.view;
+                    stencil_info.imageLayout = p.targets.depth.layout;
+                    rendering_info.pStencilAttachment = &stencil_info;
+                }
+            }
+            rendering_info.renderArea = {{0, 0}, p.targets.extent};
+            rendering_info.layerCount = p.targets.layers;
+            rendering_info.colorAttachmentCount = std::uint32_t(color_infos.size());
+            rendering_info.pColorAttachments = color_infos.empty() ? nullptr : color_infos.data();
         }
     }
+    close_targets();
 }
 
 // prepare + emit for one list. A failed replay leaves the command buffer and the tracker untouched.

@@ -2,6 +2,7 @@
 
 #include "d3d12_stubs.h"  // generated
 #include "d3d12_com_object.h"
+#include "../src/descriptor_sizes.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -239,6 +240,35 @@ public:
         if (!view.ptr) return check(false);
         check(list_.clear_depth_stencil(*reinterpret_cast<const leonida::TargetView*>(view.ptr), u(flags), depth,
                                         stencil, to_rects(count, rects)));
+    }
+
+    // The CPU handles point at TargetView payloads in the device's RTV/DSV heaps, so the list captures the views by
+    // value: rewriting the descriptor slot afterwards cannot change what the recorded list will render into. With
+    // RTsSingleHandleToDescriptorRange the views are consecutive RTV slots; their stride is the fixed RTV slot size.
+    void STDMETHODCALLTYPE OMSetRenderTargets(UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* render_targets,
+                                              BOOL single_range,
+                                              const D3D12_CPU_DESCRIPTOR_HANDLE* depth_stencil) override {
+        if (count && !render_targets) return check(false);
+        if (count > leonida::max_render_targets) return check(false);
+        const std::uintptr_t base = count ? render_targets[0].ptr : 0;
+        if (count && !base) return check(false);
+        std::vector<leonida::TargetView> views;
+        views.reserve(count);
+        for (UINT i = 0; i < count; ++i) {
+            const std::uintptr_t at = single_range
+                                          ? base + std::size_t(i) * rt::d3d12::kDescriptorSlotBytesRtv
+                                          : static_cast<std::uintptr_t>(render_targets[i].ptr);
+            if (!at) return check(false);
+            leonida::TargetView view{};
+            std::memcpy(&view, reinterpret_cast<const void*>(at), sizeof(view));
+            views.push_back(view);
+        }
+        leonida::TargetView depth{};
+        if (depth_stencil) {
+            if (!depth_stencil->ptr) return check(false);
+            std::memcpy(&depth, reinterpret_cast<const void*>(depth_stencil->ptr), sizeof(depth));
+        }
+        check(list_.set_render_targets(views, depth_stencil ? &depth : nullptr));
     }
 
     // GCL8. Vulkan can set the two faces independently with vkCmdSetStencilReference(VK_STENCIL_FACE_FRONT_BIT /

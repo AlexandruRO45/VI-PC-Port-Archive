@@ -146,5 +146,37 @@ int main() {
     CHECK(list.close());
     CHECK(list.commands().size() == 1);
     CHECK(std::get<ClearRenderTarget>(list.commands()[0]).target.resource == 36);
+
+    // OMSetRenderTargets: up to eight colour views plus an optional depth-stencil view, captured by value. Binding
+    // no attachment is legal; an invalid view, more than eight views or an unknown depth-stencil view is not.
+    CHECK(list.reset());
+    const TargetView rtv0{60, 0, 0, 1}, rtv1{64, 0, 0, 1}, dsv{68, 0, 1, 1};
+    const TargetView one_rtv[] = {rtv0};
+    CHECK(list.set_render_targets({}));
+    CHECK(list.set_render_targets(one_rtv, &dsv));
+    TargetView copied[] = {rtv1};
+    CHECK(list.set_render_targets(copied, nullptr));
+    copied[0] = {72, 0, 0, 1};  // the recorded view keeps what the slot held at the call
+    const TargetView no_resource{0, 0, 0, 1};
+    const TargetView no_resource_rtv[] = {no_resource};
+    CHECK(!list.set_render_targets(no_resource_rtv));
+    const TargetView broken{60, 0, 0, 0};  // zero layers: not a view
+    const TargetView broken_rtv[] = {broken};
+    CHECK(!list.set_render_targets(broken_rtv));
+    const TargetView bad_dsv{68, 0, 0, 0};
+    CHECK(!list.set_render_targets({}, &bad_dsv));
+    TargetView nine[9]{};
+    for (auto& view : nine) view = {60, 0, 0, 1};
+    CHECK(!list.set_render_targets(nine));
+    CHECK(list.close());
+    CHECK(list.commands().size() == 3);
+    const auto& unbound = std::get<OMSetRenderTargets>(list.commands()[0]);
+    CHECK(unbound.render_targets.empty() && !unbound.depth_stencil.resource);
+    const auto& with_depth = std::get<OMSetRenderTargets>(list.commands()[1]);
+    CHECK(with_depth.render_targets.size() == 1 && with_depth.render_targets[0].resource == 60);
+    CHECK(with_depth.depth_stencil.resource == 68 && with_depth.depth_stencil.layer_count == 1);
+    const auto& copied_view = std::get<OMSetRenderTargets>(list.commands()[2]);
+    CHECK(copied_view.render_targets.size() == 1 && copied_view.render_targets[0].resource == 64);
+    CHECK(!copied_view.depth_stencil.resource);
     return 0;
 }

@@ -450,6 +450,14 @@ if(Vulkan_FOUND)
   target_compile_definitions(first_texture_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(first_texture_test PRIVATE /W4 /permissive- /utf-8)
   add_test(NAME first_texture COMMAND first_texture_test)
+  # OMSetRenderTargets through the IR: prepare() resolves the views, emit() opens and closes dynamic rendering around
+  # the draw and transitions the attachments itself (PR C, steps 1-2).
+  add_executable(render_targets_test test/render_targets_test.cpp)
+  target_include_directories(render_targets_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(render_targets_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  target_compile_definitions(render_targets_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(render_targets_test PRIVATE /W4 /permissive- /utf-8)
+  add_test(NAME render_targets COMMAND render_targets_test)
   # PE loader hello triangle: harness EXE -> shim DLL exports -> Vulkan WSI swapchain window.
   find_program(LEONIDA_LIB_EXE NAMES lib)
   find_library(LEONIDA_VULKAN_LIB NAMES vulkan-1 HINTS "$ENV{VULKAN_SDK}/Lib")
