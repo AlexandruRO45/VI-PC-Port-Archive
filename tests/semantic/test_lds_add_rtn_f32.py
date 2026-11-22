@@ -100,10 +100,9 @@ def ieee754_add_f32(a_u32: int, b_u32: int) -> int:
 
     try:
         res_f = a_f + b_f
+        return f32_to_u32(res_f)
     except OverflowError:
         return 0x7F80_0000 if (a_f > 0 or b_f > 0) else 0xFF80_0000
-
-    return f32_to_u32(res_f)
 
 
 def calc_lds_effective_address(vaddr: int, offset: int = 0) -> int:
@@ -1045,6 +1044,121 @@ class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
         self.assertEqual(state.get_vgpr(10), 0x400)
         self.assertEqual(state.get_vgpr(11), f32_to_u32(3.14))
         self.assertEqual(state.get_vgpr(12), f32_to_u32(100.0))
+
+
+# ============================================================================
+# Section 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# ============================================================================
+
+@dataclass(frozen=True)
+class FloatConditionFlags:
+    """Status flags and condition codes derived from floating-point addition."""
+    z: bool          # Zero flag: result is +0.0 or -0.0
+    n: bool          # Negative / sign flag: bit 31 set
+    overflow: bool   # Overflow flag: finite inputs produced infinity
+    invalid: bool    # Invalid operation flag: (+Inf) + (-Inf) -> NaN
+    nan: bool        # Result is NaN
+
+
+def compute_f32_add_flags(a_u32: int, b_u32: int) -> FloatConditionFlags:
+    """Compute IEEE 754 condition flags for single-precision addition."""
+    res_u32 = ieee754_add_f32(a_u32, b_u32)
+
+    res_exp = (res_u32 >> 23) & 0xFF
+    res_mant = res_u32 & 0x7F_FFFF
+    is_nan = (res_exp == 0xFF and res_mant != 0)
+    is_inf = (res_exp == 0xFF and res_mant == 0)
+
+    a_exp = (u32(a_u32) >> 23) & 0xFF
+    b_exp = (u32(b_u32) >> 23) & 0xFF
+    a_finite = (a_exp != 0xFF)
+    b_finite = (b_exp != 0xFF)
+
+    # Overflow: finite inputs resulting in infinite output
+    overflow = a_finite and b_finite and is_inf
+
+    # Invalid: (+Inf) + (-Inf) or vice-versa
+    a_is_inf = (a_exp == 0xFF and (u32(a_u32) & 0x7F_FFFF) == 0)
+    b_is_inf = (b_exp == 0xFF and (u32(b_u32) & 0x7F_FFFF) == 0)
+    a_sign = (u32(a_u32) >> 31) & 1
+    b_sign = (u32(b_u32) >> 31) & 1
+    invalid = a_is_inf and b_is_inf and (a_sign != b_sign)
+
+    z = (res_u32 == 0x0000_0000 or res_u32 == 0x8000_0000)
+    n = bool(res_u32 & 0x8000_0000) and not is_nan
+
+    return FloatConditionFlags(
+        z=z,
+        n=n,
+        overflow=overflow,
+        invalid=invalid,
+        nan=is_nan,
+    )
+
+
+class TestConditionCodesStatusFlagsAndCarryBorrow(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow relations."""
+
+    def test_ds_instruction_hardware_flag_isolation(self) -> None:
+        """DS instructions do not modify hardware scalar condition code (SCC)."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        state.set_sgpr(0, 1)  # SCC set
+        state.lds.write_dword(0x10, f32_to_u32(1.0))
+        state.set_vgpr(1, 0x10)
+        state.set_vgpr(2, f32_to_u32(2.0))
+
+        instr = DSAddRtnF32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2))
+        interp.step(instr, state)
+
+        # SCC is preserved unchanged
+        self.assertEqual(state.get_sgpr(0), 1)
+
+    def test_zero_flag_exact_cancellation(self) -> None:
+        """Adding opposite values produces +0.0 and sets Z flag."""
+        val = f32_to_u32(123.456)
+        neg_val = f32_to_u32(-123.456)
+        flags = compute_f32_add_flags(val, neg_val)
+        self.assertTrue(flags.z)
+        self.assertFalse(flags.n)
+        self.assertFalse(flags.nan)
+
+    def test_sign_flag_transitions(self) -> None:
+        """Negative sum sets N flag."""
+        flags_neg = compute_f32_add_flags(f32_to_u32(-10.0), f32_to_u32(2.0))
+        self.assertTrue(flags_neg.n)
+        self.assertFalse(flags_neg.z)
+
+        flags_pos = compute_f32_add_flags(f32_to_u32(10.0), f32_to_u32(-2.0))
+        self.assertFalse(flags_pos.n)
+        self.assertFalse(flags_pos.z)
+
+    def test_overflow_flag_infinity_generation(self) -> None:
+        """Adding two large finite numbers overflows to +Infinity."""
+        max_f = 0x7F7F_FFFF  # ~3.4028235e+38
+        flags = compute_f32_add_flags(max_f, max_f)
+        self.assertTrue(flags.overflow)
+        self.assertFalse(flags.invalid)
+        self.assertFalse(flags.nan)
+
+    def test_invalid_flag_inf_cancellation(self) -> None:
+        """(+Inf) + (-Inf) triggers invalid operation and produces NaN."""
+        pos_inf = 0x7F80_0000
+        neg_inf = 0xFF80_0000
+        flags = compute_f32_add_flags(pos_inf, neg_inf)
+        self.assertTrue(flags.invalid)
+        self.assertTrue(flags.nan)
+        self.assertFalse(flags.z)
+
+    def test_float_addition_inexactness_loss_of_significance(self) -> None:
+        """Adding tiny number to large number in f32: 1.0 + 1e-8 == 1.0."""
+        big = f32_to_u32(1.0)
+        tiny = f32_to_u32(1e-8)
+        sum_u = ieee754_add_f32(big, tiny)
+        # In single precision, 1e-8 is beyond the 24-bit mantissa precision
+        self.assertEqual(sum_u, big)
+
 
 
 
