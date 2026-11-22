@@ -189,6 +189,10 @@ DWORD WINAPI game_thread(void* p) {
 // The host filter is installed once. If something in the host process calls the real SetUnhandledExceptionFilter
 // after that (a driver's DLL, SDL, a CRT initialised later), it replaces this one and the title's filter is lost
 // without a sign: nothing here installs it again.
+// One more window, during the title's first call only: host_top_level_filter is live from the moment
+// SetUnhandledExceptionFilter installs it, and g_host_filter_before is stored right after. A fault on another
+// thread in between, with no title filter set yet, finds both empty and returns EXCEPTION_CONTINUE_SEARCH, the
+// default handling, instead of passing through the filter the host had before.
 std::atomic<LPTOP_LEVEL_EXCEPTION_FILTER> g_game_filter{nullptr};
 std::atomic<LPTOP_LEVEL_EXCEPTION_FILTER> g_host_filter_before{nullptr};
 std::atomic<bool> g_host_filter_installed{false};
