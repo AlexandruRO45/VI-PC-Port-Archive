@@ -4,7 +4,8 @@
 // implicit promotion from common, and enhanced barriers. Part C copies a volume (footprint, box and whole) and
 // resolves a multisampled target. Part D records every D3D12 sync/access pair as enhanced barriers, which the
 // validation layer must accept. Part E (where VK_EXT_conditional_rendering is available) checks SetPredication.
-// Part F (D3D-26) runs immediate buffer writes, atomic copies and discards.
+// Part F (D3D-26) runs immediate buffer writes, atomic copies and discards. Part H checks that a copy into a texture
+// still owed its implicit zero-clear is rejected, not crashed, when vkCmdClearColorImage is missing.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../src/vulkan_replay.h"
@@ -816,12 +817,119 @@ int part_f(vktest::Device& d) {
     return 0;
 }
 
+// A copy into a texture the tracker still holds as UNDEFINED needs the implicit zero-clear of detail::initialize, so
+// it needs vkCmdClearColorImage. That entry point had no prepare gate — whether the clear is owed is tracker state
+// prepare cannot see — so emit called a missing pointer and crashed (finding in #634). The list must be rejected with
+// unsupported and leave the tracker untouched, and it must still run when no clear is owed or the entry point is set.
+int part_h(vktest::Device& d) {
+    constexpr std::uint32_t size = 4, pitch = texture_data_pitch_alignment;
+    constexpr VkDeviceSize placed = VkDeviceSize(size) * pitch;
+    const auto make_image = [&] { return d.image(VK_FORMAT_R8G8B8A8_UNORM, size, size, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT); };
+    const VkImage never_image = make_image(), used_image = make_image(), owed_image = make_image(),
+                  clear_image = make_image();
+    void* up_mapped = nullptr;
+    const VkBuffer up = d.buffer(placed, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &up_mapped);
+    EXPECT(never_image && used_image && owed_image && clear_image && up);
+
+    const auto image_binding = [&](VkImage image) {
+        ResourceBinding b{};
+        b.image = image;
+        b.format = VK_FORMAT_R8G8B8A8_UNORM;
+        b.width = b.height = size;
+        b.depth = 1;
+        b.samples = 1;
+        return b;
+    };
+    ResourceBinding up_binding{};
+    up_binding.buffer = up;
+    up_binding.size = placed;
+    constexpr ResourceId never_id = 40, used_id = 41, owed_id = 42, up_id = 43, clear_id = 44;
+    ResourceBinding clear_binding = image_binding(clear_image);
+    clear_binding.color_attachment = true;  // a render-target clear needs an attachment binding
+    const std::map<ResourceId, ResourceBinding> bindings{{never_id, image_binding(never_image)},
+                                                         {used_id, image_binding(used_image)},
+                                                         {owed_id, image_binding(owed_image)},
+                                                         {up_id, up_binding},
+                                                         {clear_id, clear_binding}};
+    const auto resolve = [&](ResourceId id) -> const ResourceBinding* {
+        const auto it = bindings.find(id);
+        return it == bindings.end() ? nullptr : &it->second;
+    };
+
+    ReplayFunctions vk{};
+    vk.pipeline_barrier = d.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
+    vk.pipeline_barrier2 = d.fn<PFN_vkCmdPipelineBarrier2>("vkCmdPipelineBarrier2");
+    vk.copy_buffer = d.fn<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+    vk.copy_buffer_to_image = d.fn<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage");
+    vk.copy_image_to_buffer = d.fn<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer");
+    vk.copy_image = d.fn<PFN_vkCmdCopyImage>("vkCmdCopyImage");
+    vk.separate_depth_stencil_layouts = true;
+    ReplayFunctions complete = vk;  // the same entry points, plus the clear detail::initialize would call
+    complete.clear_color_image = d.fn<PFN_vkCmdClearColorImage>("vkCmdClearColorImage");
+
+    const auto record_copy = [&](ResourceId image_id, CommandList& list) {
+        const CopyLocation dst{image_id, false, 0, 0, 0, 0, 0, 0};
+        const CopyLocation src{up_id, true, 0, 0, size, size, 1, pitch};
+        return list.copy_texture({dst, 0, 0, 0, src, false, {}}) && list.close();
+    };
+    CommandList never, used, owed;
+    EXPECT(record_copy(never_id, never) && record_copy(used_id, used) && record_copy(owed_id, owed));
+    // A copy that reads a texture still owed its clear initialises the source as well.
+    CommandList from_owed;
+    EXPECT(from_owed.copy_texture({{used_id, false, 0, 0, 0, 0, 0, 0}, 0, 0, 0,
+                                   {never_id, false, 0, 0, 0, 0, 0, 0}, false, {}}) &&
+           from_owed.close());
+    // A whole-view clear calls the entry point itself, even on a texture that owes nothing.
+    CommandList whole_clear;
+    EXPECT(whole_clear.clear_render_target({clear_id, 0, 0, 1}, {0.0f, 0.0f, 0.0f, 0.0f}) && whole_clear.close());
+
+    LayoutTracker never_used(true);
+    never_used.track(never_id, bindings.at(never_id), VK_IMAGE_LAYOUT_UNDEFINED);
+    LayoutTracker already_used(true);
+    already_used.track(used_id, bindings.at(used_id), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    LayoutTracker fresh(true);
+    fresh.track(owed_id, bindings.at(owed_id), VK_IMAGE_LAYOUT_UNDEFINED);
+    LayoutTracker source_owed(true);
+    source_owed.track(used_id, bindings.at(used_id), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    source_owed.track(never_id, bindings.at(never_id), VK_IMAGE_LAYOUT_UNDEFINED);
+    LayoutTracker clear_used(true);
+    clear_used.track(clear_id, bindings.at(clear_id), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+    bool rejected = false, source_rejected = false, clear_rejected = false;
+    const bool ok = d.run([&](VkCommandBuffer cb) {
+        // A texture still owed its clear, and no vkCmdClearColorImage: rejected, and nothing is recorded.
+        if (replay(never, cb, resolve, vk, &never_used) != ReplayResult::unsupported) return false;
+        rejected = true;
+        if (never_used.layout(never_id, 0) != VK_IMAGE_LAYOUT_UNDEFINED) return false;
+        // Nothing is owed once the texture has been used, so the missing entry point does not matter.
+        d.initial_layout(cb, used_image, VK_IMAGE_ASPECT_COLOR_BIT, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        if (replay(used, cb, resolve, vk, &already_used) != ReplayResult::success) return false;
+        // Reading a texture that is still owed its clear initialises the source as well: rejected too.
+        if (replay(from_owed, cb, resolve, vk, &source_owed) != ReplayResult::unsupported) return false;
+        source_rejected = true;
+        // A whole-view clear calls the entry point directly, so it is rejected though nothing is owed.
+        if (replay(whole_clear, cb, resolve, vk, &clear_used) != ReplayResult::unsupported) return false;
+        clear_rejected = true;
+        // With the entry point present, the list that was rejected runs.
+        return replay(owed, cb, resolve, complete, &fresh) == ReplayResult::success;
+    });
+    EXPECT(ok);
+    EXPECT(rejected);
+    EXPECT(source_rejected);
+    EXPECT(clear_rejected);
+    std::printf("H: clears a list cannot emit are rejected, not crashed, without vkCmdClearColorImage: "
+                "copy destination, copy source and whole-view clear\n");
+    return 0;
+}
+
 } // namespace
 
 int main() {
     vktest::Device device;
     EXPECT(device.create());
-    if (part_a(device) || part_b(device) || part_c(device) || part_d(device) || part_e(device) || part_f(device)) return 1;
+    if (part_a(device) || part_b(device) || part_c(device) || part_d(device) || part_e(device) || part_f(device) ||
+        part_h(device))
+        return 1;
     if (g_mismatches) return 1;
     if (device.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", device.validation_errors());
