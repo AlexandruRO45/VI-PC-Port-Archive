@@ -7,7 +7,7 @@ committed: the tool is the recipe, the user's copy is the input.
 
 The default pair is a vertex shader that forwards POSITION and TEXCOORD to clip space and a pixel shader that
 writes the interpolated TEXCOORD, so the first image is the model's own UV map. Both are ordinary game shaders;
-`--vs` and `--ps` take other names from the carve index.
+`--vs` and `--ps` select by name; `--vs-offset` and `--ps-offset` select an exact entry from `--list`.
 
 Usage:
     python -I first_light.py --game "<package>" --obj <model.obj> --work <dir> [--out <dir>] [--run]
@@ -69,17 +69,24 @@ def ensure_carve(game: str, work: str) -> str:
     return index
 
 
-def choose(index_path: str, vs: str, ps: str) -> list[dict]:
+def choose(index_path: str, vs: str, ps: str, *,
+           vs_offset: int | None = None, ps_offset: int | None = None) -> list[dict]:
     with open(index_path, encoding="utf-8") as f:
         entries = json.load(f)
-    by_stage_and_name = {(entry["stage"], entry["name"]): entry for entry in entries}
-    requested = (("vs", vs), ("ps", ps))
-    missing = [f"{stage} {name}" for stage, name in requested if (stage, name) not in by_stage_and_name]
-    if missing:
-        raise SystemExit(
-            f"shader not in the carve index: {', '.join(missing)} (use --list)"
-        )
-    return [by_stage_and_name[key] for key in requested]
+    picked = []
+    for stage, name, offset in (("vs", vs, vs_offset), ("ps", ps, ps_offset)):
+        field, value = ("name", name) if offset is None else ("offset", offset)
+        matches = [e for e in entries if e["stage"] == stage and e.get(field) == value]
+        if not matches:
+            raise SystemExit(f"no {stage} shader with {field} {value!r} in the carve index (use --list)")
+        if len(matches) > 1:
+            if offset is not None:
+                raise SystemExit(f"duplicate {stage} archive offset {offset:#x} in the carve index")
+            offsets = ", ".join(f"{e['offset']:#x}" for e in matches if "offset" in e)
+            hint = f"use --{stage}-offset with one of: {offsets}" if offsets else "regenerate the carve index"
+            raise SystemExit(f"ambiguous {stage} shader {name!r}; {hint}")
+        picked.append(matches[0])
+    return picked
 
 
 def translate(work: str, picked: list[dict]) -> dict:
@@ -389,12 +396,11 @@ def main(argv=None) -> int:
         help="the work folder make_game.py uses (default ~/leonida-work)",
     )
     ap.add_argument("--out", help="output folder (default <work>/first_light/out)")
-    ap.add_argument(
-        "--vs", default=DEFAULT_VS, help="vertex shader name in the carve index"
-    )
-    ap.add_argument(
-        "--ps", default=DEFAULT_PS, help="pixel shader name in the carve index"
-    )
+    for stage, label, default in (("vs", "vertex", DEFAULT_VS), ("ps", "pixel", DEFAULT_PS)):
+        group = ap.add_mutually_exclusive_group()
+        group.add_argument(f"--{stage}", default=default, help=f"{label} shader name in the carve index")
+        group.add_argument(f"--{stage}-offset", type=lambda s: int(s, 0), metavar="OFFSET",
+                           help=f"{label} shader archive offset from --list (decimal or 0x hex)")
     ap.add_argument("--width", type=int, default=128)
     ap.add_argument("--height", type=int, default=128)
     ap.add_argument("--min-coverage", type=float, default=0.5)
@@ -419,7 +425,7 @@ def main(argv=None) -> int:
     ap.add_argument(
         "--list",
         action="store_true",
-        help="list VS/PS names in the carve index and exit",
+        help="list VS/PS names and archive offsets in the carve index and exit",
     )
     a = ap.parse_args(argv)
     work = os.path.abspath(os.path.expanduser(a.work))
@@ -435,7 +441,8 @@ def main(argv=None) -> int:
         with open(ensure_carve(os.path.abspath(a.game), work), encoding="utf-8") as f:
             for e in json.load(f):
                 if e["stage"] in ("vs", "ps"):
-                    print(f"{e['stage']} {e['name']}")
+                    selector = f"\t--{e['stage']}-offset {e['offset']:#x}" if "offset" in e else ""
+                    print(f"{e['stage']} {e['name']}{selector}")
         return 0
     existing = os.path.join(out_dir, "manifest.json")
     if a.check and not a.game and os.path.isfile(existing):
@@ -450,7 +457,7 @@ def main(argv=None) -> int:
         raise SystemExit("--obj is required unless --no-fit")
 
     index = ensure_carve(game, work)
-    picked = choose(index, a.vs, a.ps)
+    picked = choose(index, a.vs, a.ps, vs_offset=a.vs_offset, ps_offset=a.ps_offset)
     meta = translate(work, picked)
     os.makedirs(out_dir, exist_ok=True)
     for entry in picked:
@@ -489,11 +496,13 @@ def main(argv=None) -> int:
     manifest = {
         "vs": {
             "name": picked[0]["name"],
+            "offset": picked[0].get("offset"),
             "fssm_sha256": meta["vs"].get("fssm_sha256"),
             "verified": True,
         },
         "ps": {
             "name": picked[1]["name"],
+            "offset": picked[1].get("offset"),
             "fssm_sha256": meta["ps"].get("fssm_sha256"),
             "verified": True,
         },

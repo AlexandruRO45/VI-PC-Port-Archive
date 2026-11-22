@@ -68,7 +68,9 @@ cases: the two package-gated draw/manifest checks, the `--check` command and fou
 `first_light.py` carves `shaders.rpf` if the work folder does not have it, translates only the chosen pair, converts
 the OBJ to the harness's mesh file (`u32 vertex_count, u32 index_count`, `(x,y,z,u,v) f32` vertices, `u32`
 indices), writes `manifest.json` with the counts and FSSM hashes, and runs `vk_harness`. `--vs` and `--ps` take
-other names from the carve index; `--no-fit` keeps a model that is already in NDC (the sky dome is). The test is
+other names from the carve index. When a stage has multiple entries with the same name, use the
+`--vs-offset` or `--ps-offset` value shown by `--list` to choose the exact program. Decimal and hex offsets work.
+`--no-fit` keeps a model that is already in NDC (the sky dome is). The test is
 package-gated: without `LEONIDA_FIRST_LIGHT_DIR` it skips, and it writes its image to that folder.
 
 ## 4. The harness mode
