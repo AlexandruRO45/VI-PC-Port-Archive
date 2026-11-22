@@ -40,6 +40,7 @@ TOOLS = os.path.join(HERE, "..", "..", "..", "tools")
 TRANSLATOR = os.path.join(TOOLS, "rdna2spirv.py")
 sys.path.insert(0, TOOLS)
 import mc_command  # noqa: E402
+import translator_modes  # noqa: E402
 
 MC = mc_command.mc_command()
 RSRC2, GROUP = 0x8088, (64, 1, 1)
@@ -171,7 +172,7 @@ def translate_tests(work, names):
     # 128-byte push constants: the tail in a set-1 uniform block. The values the test programs accept (vk_pc_tail.h).
     if (os.environ.get("LEONIDA_PC_TAIL_UBO") or "").strip().lower() in ("1", "true", "yes", "on"):
         cmd.append("--pc-tail-ubo")
-    if os.environ.get("LEONIDA_SUBGROUP_TEMPS") == "1":   # subgroup operations kept out of && / ?: (SPIRV-Cross: MoltenVK)
+    if translator_modes.resolve("subgroup_temps"):   # LEONIDA_SUBGROUP_TEMPS, else the device (MoltenVK: SPIRV-Cross)
         cmd.append("--subgroup-temps")
     return subprocess.run(cmd).returncode
 
