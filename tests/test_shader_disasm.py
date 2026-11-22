@@ -53,6 +53,48 @@ class DisasmFailureTest(unittest.TestCase):
             f.write(body)
         return f'"{sys.executable}" "{path}"'  # a command line, not just a path: LLVM_MC must accept both
 
+    def run_madk_check(self, llvm_mc: str, *args: str) -> subprocess.CompletedProcess:
+        env = dict(os.environ, LLVM_MC=llvm_mc)
+        return subprocess.run([sys.executable, "-I", TOOL, "--check-madk", *args],
+                              capture_output=True, text=True, env=env)
+
+    def fake_madk(self, failure=""):
+        return self.fake(
+            "import sys\n"
+            "code = bytes(int(word, 0) for word in sys.stdin.read().split())\n"
+            "assert '--disassemble' in sys.argv and '-mcpu=gfx1013' in sys.argv\n"
+            "assert len(code) == 8 and code[:3] == bytes(3) and code[5:] == bytes(3)\n"
+            "op = {0x6e: 'v_fmamk_f16', 0x70: 'v_fmaak_f16',\n"
+            "      0x58: 'v_fmamk_f32', 0x5a: 'v_fmaak_f32'}[code[3]]\n"
+            "k = code[4]\n"
+            "assert k in (0x80, 0xff)\n"
+            + failure +
+            "fields = ('v0', 's0', hex(k), 'v0') if 'mamk' in op else ('v0', 's0', 'v0', hex(k))\n"
+            "print('  .text')\n"
+            "print(op, ', '.join(fields), '; encoding: [...]', sep=chr(9))\n"
+        )
+
+    def test_madk_check_passes_without_a_source(self):
+        p = self.run_madk_check(self.fake_madk())
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("8 synthetic instructions", p.stdout)
+
+    def test_madk_check_rejects_a_wrong_literal_before_writing(self):
+        mc = self.fake_madk("if op == 'v_fmaak_f32' and k == 0x80: k = 0\n")
+        out = os.path.join(self.dir, "out")
+        p = self.run_madk_check(mc, self.fssm, "--out", out)
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertIn("v_fmaak_f32): expected K=0x80, decoded '0x0'", p.stderr)
+        self.assertIn("LLVM issue #237158", p.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_madk_check_rejects_a_process_failure(self):
+        mc = self.fake_madk("if k == 0xff: sys.exit('synthetic disassembler crash')\n")
+        p = self.run_madk_check(mc)
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertIn("v_fmamk_f16, K=0xff", p.stderr)
+        self.assertIn("synthetic disassembler crash", p.stderr)
+
     def test_missing_tool(self):
         out = os.path.join(self.dir, "out")
         p = self.run_tool("definitely-not-an-llvm-mc", out)

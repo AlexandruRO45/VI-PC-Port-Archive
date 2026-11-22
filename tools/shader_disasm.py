@@ -8,6 +8,7 @@ scanning back from the first s_endpgm to the start that decodes with no invalid 
 Usage:
     python -I shader_disasm.py <fssm dir or file> [--out DIR] [--mcpu gfx1013] [--limit N]
 Writes <out>/<name>.s and prints a summary (decoded cleanly / with invalid words / failed).
+Use --check-madk to test the selected disassembler on synthetic MADK instructions, with or without a shader input.
 Set LLVM_MC to llvm-mc's path, or to a whole command such as
 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc' when the tool is not on PATH.
 """
@@ -79,6 +80,40 @@ def disasm(code: bytes, mcpu: str):
     return p.stdout, bad, p.stderr
 
 
+def check_madk(mcpu: str) -> None:
+    """Detect the K-literal corruption and FP16 crash reported in LLVM issue #237158."""
+    # GFX10 VOP2 encodings: v0 destination, s0 source, v0 second VGPR source. K is the next dword.
+    cases = (("v_fmamk_f16", 0x6e, 2), ("v_fmaak_f16", 0x70, 3),
+             ("v_fmamk_f32", 0x58, 2), ("v_fmaak_f32", 0x5a, 3))
+    tool = " ".join(MC)
+    for op, opcode_byte, k_index in cases:
+        for k in (0x80, 0xff):
+            asm, bad, err = disasm(struct.pack("<II", opcode_byte << 24, k), mcpu)
+            if bad or not asm.strip():
+                why = (err.strip().splitlines() or ["no instruction decoded"])[0]
+                fail(f"MADK check failed with '{tool}' ({mcpu}, {op}, K={k:#x}): {why}. "
+                     "See LLVM issue #237158.")
+            lines = [line.partition(";")[0].strip() for line in asm.splitlines()]
+            instructions = [line for line in lines if line and not line.startswith(".")]
+            if len(instructions) != 1:
+                fail(f"MADK check failed with '{tool}' ({mcpu}, {op}, K={k:#x}): "
+                     f"expected one instruction, decoded {len(instructions)}. See LLVM issue #237158.")
+            mnemonic, *operands = instructions[0].split(maxsplit=1)
+            fields = operands[0].split(",") if operands else []
+            if mnemonic.removesuffix("_e32") != op or len(fields) != 4:
+                fail(f"MADK check failed with '{tool}' ({mcpu}, {op}, K={k:#x}): "
+                     f"unexpected decode {instructions[0]!r}. See LLVM issue #237158.")
+            literal = fields[k_index].strip()
+            try:
+                actual = int(literal, 0)
+            except ValueError:
+                actual = None
+            if actual != k:
+                fail(f"MADK check failed with '{tool}' ({mcpu}, {op}): "
+                     f"expected K={k:#x}, decoded {literal!r}. See LLVM issue #237158.")
+    print(f"MADK check passed with '{tool}' for {mcpu} (8 synthetic instructions).")
+
+
 def code_range(b: bytes):
     """The code section offset is the u32 at 0xC0; instructions start 0x28 bytes into it and run to the last
     4-byte-aligned s_endpgm in the blob (some blobs hold several programs). Found by correlating against
@@ -129,12 +164,19 @@ def one(path, out, mcpu):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("src")
+    ap.add_argument("src", nargs="?", help="shader file or directory (optional with --check-madk)")
+    ap.add_argument("--check-madk", action="store_true", help="probe LLVM issue #237158 before disassembling")
     ap.add_argument("--out")
     ap.add_argument("--mcpu", default="gfx1013")
     ap.add_argument("--limit", type=positive_int)
     ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
     a = ap.parse_args()
+    if a.check_madk:
+        check_madk(a.mcpu)
+        if a.src is None:
+            return 0
+    if a.src is None:
+        ap.error("the following arguments are required: src")
     if os.path.isfile(a.src):
         files = [a.src]
     elif os.path.isdir(a.src):

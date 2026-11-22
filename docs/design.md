@@ -455,6 +455,12 @@ cross-half code on 32-wide subgroups.
 
 ## Disassembling shaders
 
+Run `python -I tools/shader_disasm.py --check-madk` to test the selected `LLVM_MC` on synthetic
+GFX10 instructions. The check exits nonzero if it reads the wrong K literal or the disassembler
+fails. [LLVM #237158](https://github.com/llvm/llvm-project/issues/237158) reports both failure modes:
+K = `0x80` can print as `0x0`, and K = `0xff` can crash the FP16 disassembler. This check can run
+without any shader files. Pass it alongside a source path to check before disassembling that input.
+
 The AMDGPU disassembler needs LLVM 21+ built with the AMDGPU target (`llvm-mc`; on Linux the `llvm-21` package
 installs it at `/usr/lib/llvm-21/bin/llvm-mc`). The official Windows LLVM build has no AMDGPU target and ships no
 `llvm-mc.exe`. On Windows, either build a native one or run it from WSL.
