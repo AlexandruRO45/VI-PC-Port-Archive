@@ -816,6 +816,8 @@ def lane_mask(token):
 # {r} names the result. Shift counts use their low five bits; signed overflow sets SCC for _i32 add/sub.
 NONZERO = "{r} != 0u"
 SCALAR = {
+    "flbit_i32_b32": (1, "dpp_ffbh_u32({0})", None),
+    "flbit_i32": (1, "dpp_ffbh_i32({0})", None),
     "bcnt0_i32_b32": (1, "32u - countbits({0})", NONZERO),
     "bcnt1_i32_b32": (1, "countbits({0})", NONZERO),
     "mul_hi_u32": (2, "mul_hi_u32({0}, {1})", None),
@@ -1546,6 +1548,19 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     raise ValueError("Invalid movk immediate")
                 val = (val if val < 0x8000 else val - 0x10000) & 0xffffffff
             scalar[dst] = val
+        elif m := match(r"s_flbit_i32_([bi])64 (s\d+), ([^,]+)"):
+            kind, dst, src = m.groups()
+            sgpr_name(dst)
+            if dst in pending:
+                raise ValueError("Write overlaps an outstanding scalar load")
+            lo, hi = scalar_u64(src, scalar, pending)
+            if kind == "i":
+                # Normalize both halves using bit 63, including when the high word becomes zero.
+                lines.append(f"    uint signmask{i} = 0u - ({hi} >> 31);")
+                lo, hi = f"({lo} ^ signmask{i})", f"({hi} ^ signmask{i})"
+            lines.append(f"    uint salu{i} = {hi} != 0u ? 31u - firstbithigh({hi}) : "
+                         f"({lo} != 0u ? 63u - firstbithigh({lo}) : 0xffffffffu);")
+            scalar[dst] = ("uint", f"salu{i}")
         elif m := match(r"s_bcnt([01])_i32_b64 (s\d+), ([^,]+)"):
             bit, dst, src = m.groups()
             sgpr_name(dst)
@@ -1569,6 +1584,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Invalid scalar operation")
             if op in ("mul_hi_u32", "mul_hi_i32"):
                 helpers.add("scalar_mul_hi")
+            elif op == "flbit_i32_b32":
+                helpers.add("dpp_ffbh_u32")
+            elif op == "flbit_i32":
+                helpers.add("dpp_ffbh_i32")
             values = [scalar_u32(t, scalar, pending) for t in tokens]
             lines.append(f"    uint salu{i} = {template.format(*values)};")
             if carry:
