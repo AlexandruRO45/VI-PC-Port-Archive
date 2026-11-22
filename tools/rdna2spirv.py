@@ -72,6 +72,13 @@ FLOAT_CONTROLS = True    # False (--no-float-controls): no SignedZeroInfNanPrese
 # in push-constant dwords 36..37 (the block grows from 144 to 152 bytes). The slot layout is mesh_compute_layout();
 # the index records it as "mesh_compute". tools/mesh_compute_vs.py writes the vertex shader that draws the slots.
 MESH_COMPUTE = False
+# --subgroup-temps: a dead OpCopyObject after every OpGroupNonUniform* result (subgroup_temps), for drivers that turn
+# SPIR-V into source through SPIRV-Cross (MoltenVK). SPIRV-Cross forwards a value read once into the expression that
+# reads it, and emits OpLogicalAnd / OpLogicalOr / OpSelect as the short-circuiting && / || / ?:, so a subgroup
+# operation forwarded into their right side ran only in the invocations that evaluate it (MoltenVK 1.4.2 and main,
+# SPIRV-Cross 57e4efcc: a ballot missed the lanes that skipped it; cs_dpp_ops). A second read makes SPIRV-Cross bind
+# the value to a temporary where it is computed, which every invocation of the block runs.
+SUBGROUP_TEMPS = False
 # --f16-interp-fallback: *_f16 interps without PerVertexKHR, for devices that have VK_KHR_fragment_shader_barycentric
 # but can't use its per-vertex inputs (MoltenVK: SPIRV-Cross has no MSL form of PerVertexKHR). Every VS and mesh
 # `exp paramN` also exports the channel's two f16 halves decoded to f32, low halves at f16_half_location(N, 0) and high
@@ -10863,9 +10870,21 @@ def assemble(gen):
                 "%live = OpLabel\n         OpReturn\n         OpFunctionEnd\n")
     else:
         tail = end_lock + "         OpReturn\n         OpFunctionEnd\n"
-    return split_big_switch(no_contraction(dedupe_types(
-        "\n".join("         " + l if not l.startswith("%") or " = " not in l else l for l in out) +
-        "\n" + "\n".join(gen.body) + "\n" + tail)))
+    text = dedupe_types("\n".join("         " + l if not l.startswith("%") or " = " not in l else l for l in out) +
+                        "\n" + "\n".join(gen.body) + "\n" + tail)
+    return split_big_switch(no_contraction(subgroup_temps(text) if SUBGROUP_TEMPS else text))
+
+
+_SUBGROUP_OP = re.compile(r"^(\s*)(%\w+) = OpGroupNonUniform\w+ (%\w+) .*$", re.M)
+
+
+def subgroup_temps(text):
+    """--subgroup-temps: after each OpGroupNonUniform* result r of type T, a dead `r_sgt = OpCopyObject T r` in the
+    same block. The copy is a second read of r, so SPIRV-Cross declares r as a temporary at its own place instead of
+    moving the subgroup operation into a later short-circuiting expression (see SUBGROUP_TEMPS). Nothing reads the
+    copy; the driver's compiler drops it."""
+    return _SUBGROUP_OP.sub(lambda m: f"{m.group(0)}\n{m.group(1)}{m.group(2)}_sgt = OpCopyObject {m.group(3)} "
+                                      f"{m.group(2)}", text)
 
 
 # SPIR-V caps an instruction at 65,535 words. The dispatch loop's OpSwitch has one (literal, label) pair per block,
@@ -12668,6 +12687,9 @@ def main():
                     help="16-bit interpolation without PerVertexKHR inputs, for devices that can't compile them "
                          "(MoltenVK): VS and mesh params also export their f16 halves decoded to f32, which the PS "
                          "reads as ordinary interpolated inputs (metadata: f16_halves)")
+    ap.add_argument("--subgroup-temps", action="store_true",
+                    help="for drivers built on SPIRV-Cross (MoltenVK): a dead copy after each subgroup operation, so "
+                         "SPIRV-Cross keeps it out of a short-circuiting && / || / ?: where only some lanes would run it")
     ap.add_argument("--max-shared-memory", type=int, default=MAX_SHARED_BYTES, metavar="BYTES",
                     help="cap on a compute shader's workgroup memory, its LDS plus what --wave64-emulate adds "
                          "(default %(default)s, the 64 KiB hard cap): over it the LDS array shrinks to the program's "
@@ -12676,6 +12698,8 @@ def main():
     a = ap.parse_args()
     MAX_SHARED_BYTES = a.max_shared_memory
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES
+    global SUBGROUP_TEMPS
+    SUBGROUP_TEMPS = a.subgroup_temps
     FMA_KHR = a.fma == "khr"
     STRUCTURED = not a.dispatch_loop
     global FLOAT_CONTROLS

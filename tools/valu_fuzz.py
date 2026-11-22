@@ -857,6 +857,8 @@ def translate(progs, work, emulate):
     cmd = [sys.executable, "-I", os.path.join(HERE, "rdna2spirv.py"), str(disasm), "--out", str(spirv)]
     if emulate:
         cmd.append("--wave64-emulate")
+    if os.environ.get("LEONIDA_SUBGROUP_TEMPS") == "1":   # as build.py: subgroup operations kept out of && / ?: (MoltenVK)
+        cmd.append("--subgroup-temps")
     r = subprocess.run(cmd, capture_output=True, text=True)
     index = spirv / "index.json"
     if not index.exists():

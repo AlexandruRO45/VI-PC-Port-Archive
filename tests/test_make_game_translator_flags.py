@@ -154,7 +154,7 @@ class RecordedFlagsTest(unittest.TestCase):
 class MainWiringTest(unittest.TestCase):
     """main() parses the four flags and hands the same tuple to preflight() and shaders()."""
 
-    def run_main(self, *extra_argv, per_vertex=None):
+    def run_main(self, *extra_argv, per_vertex=None, driver_id=None):
         argv = ["make_game.py", "--stages", "shaders", *extra_argv]
         with mock.patch.object(sys, "argv", argv), \
                 mock.patch("make_game.below_normal"), \
@@ -162,6 +162,7 @@ class MainWiringTest(unittest.TestCase):
                 mock.patch("make_game.check", return_value={"expected_exe": "game.exe"}), \
                 mock.patch("make_game.wave64_settings", return_value=(False, True)), \
                 mock.patch("make_game.runtime_gpu_per_vertex", return_value=per_vertex), \
+                mock.patch("make_game.runtime_gpu_info", return_value={} if driver_id is None else {"driver_id": driver_id}), \
                 mock.patch("make_game.preflight") as preflight, \
                 mock.patch("make_game.shaders") as shaders, \
                 mock.patch("make_game.log"):
@@ -184,6 +185,14 @@ class MainWiringTest(unittest.TestCase):
         self.assertEqual(self.run_main(per_vertex=False), (("--f16-interp-fallback",),) * 2)
         self.assertEqual(self.run_main(per_vertex=True), ((), ()))
         self.assertEqual(self.run_main("--f16-interp-fallback", per_vertex=True), (("--f16-interp-fallback",),) * 2)
+
+    def test_subgroup_temps_follows_the_driver(self):
+        """On by itself on MoltenVK (driver id 14, SPIRV-Cross), not on other drivers or when it can't tell; asked
+        for explicitly, it is on everywhere."""
+        self.assertEqual(self.run_main(driver_id=14), (("--subgroup-temps",),) * 2)
+        self.assertEqual(self.run_main(driver_id=3), ((), ()))
+        self.assertEqual(self.run_main(), ((), ()))
+        self.assertEqual(self.run_main("--subgroup-temps", driver_id=3), (("--subgroup-temps",),) * 2)
 
 
 if __name__ == "__main__":

@@ -889,6 +889,8 @@ def translate(work, emulate):
     cmd = [sys.executable, "-I", TRANSLATOR[0], os.path.join(work, "disasm"), "--out", out]
     if emulate:
         cmd.append("--wave64-emulate")
+    if os.environ.get("LEONIDA_SUBGROUP_TEMPS") == "1":   # as build.py: subgroup operations kept out of && / ?: (MoltenVK)
+        cmd.append("--subgroup-temps")
     r = subprocess.run(cmd, capture_output=True, text=True)
     return out, r.stdout + r.stderr
 
