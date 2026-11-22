@@ -396,7 +396,7 @@ if(BUILD_TESTING)
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
     )
     add_executable(tiny_pgmptr test/fixtures/tiny_pgmptr.cpp)
-    target_compile_definitions(tiny_pgmptr PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_definitions(tiny_pgmptr PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
     target_compile_options(tiny_pgmptr PRIVATE /W4 /permissive- /utf-8)
     set_target_properties(tiny_pgmptr PROPERTIES
       MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL"
