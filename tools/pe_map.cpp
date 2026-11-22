@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <new>
 #include <string>
@@ -98,6 +99,23 @@ bool executable(const IMAGE_NT_HEADERS64* nt, std::uint64_t rva) {
     return false;
 }
 
+// True if [rva, rva + size) lies inside a section mapped as writable. The Windows loader
+// writes the TLS index to AddressOfIndex, so that slot must be writable: measured on
+// Windows 11, an index in the headers, .text, .rdata or .tlscb fails with ERROR_NOACCESS
+// while another DWORD in writable .data loads. The check is by section characteristics,
+// like executable() above, so it holds both after mapping and on release.
+bool writable_section(const IMAGE_NT_HEADERS64* nt, std::uint64_t rva, std::uint64_t size) {
+    const auto* sections = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        const auto& s = sections[i];
+        const DWORD span = s.Misc.VirtualSize ? s.Misc.VirtualSize : s.SizeOfRawData;
+        if ((s.Characteristics & IMAGE_SCN_MEM_WRITE) && rva >= s.VirtualAddress
+            && size <= span && rva - s.VirtualAddress <= span - size)
+            return true;
+    }
+    return false;
+}
+
 // True if every page of [address, address + size) is committed and currently allows reads.
 // Image bounds alone do not make bytes readable: section protections apply, and the image may
 // change them at run time, so the live protection is queried at each read, including on release.
@@ -160,9 +178,15 @@ const char* tls_callbacks(const Image& image, const IMAGE_NT_HEADERS64* nt, std:
     // Sections are already protected here, both after mapping and on release.
     if (!readable(tls, sizeof(IMAGE_TLS_DIRECTORY64))) return "TLS directory not readable";
     // Each value is read once after its check, so the validated value is the one used.
+    // The loader assigns the TLS index even for an empty template, so the slot must be
+    // validated whenever the directory is present, independent of the callback list.
+    const auto base = reinterpret_cast<std::uint64_t>(image.base);
+    const std::uint64_t index = tls->AddressOfIndex;
+    if (index < base || index - base >= image.size || !image.at<DWORD>(index - base))
+        return "TLS index outside image";
+    if (!writable_section(nt, index - base, sizeof(DWORD))) return "TLS index outside writable section";
     const std::uint64_t list = tls->AddressOfCallBacks;
     if (!list) return nullptr;
-    const auto base = reinterpret_cast<std::uint64_t>(image.base);
     for (std::uint64_t i = 0; i <= MAX_TLS_CALLBACKS; ++i) {
         const std::uint64_t va = list + 8 * i;
         const auto* slot = va >= base ? image.at<std::uint64_t>(va - base) : nullptr;
@@ -342,6 +366,21 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
         || dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > opt.SizeOfHeaders || table_end > opt.SizeOfHeaders
         || opt.SizeOfHeaders > opt.SizeOfImage || opt.SizeOfHeaders > raw.size())
         return fail(MAP_FORMAT, "section table outside headers");
+    // Section protections are applied per page, so a section that started inside a page shared with
+    // the headers or another section would change that page's protection as well. Windows refuses an
+    // alignment that is not a power of two and a section that does not start on it. An alignment
+    // below the page size, which Windows maps as one view when FileAlignment matches, is not modeled.
+    SYSTEM_INFO system{};
+    GetSystemInfo(&system);
+    if (opt.SectionAlignment & (opt.SectionAlignment - 1))
+        return fail(MAP_FORMAT, "section alignment %#lx is not a power of two", opt.SectionAlignment);
+    if (opt.SectionAlignment < system.dwPageSize)
+        return fail(MAP_UNSUPPORTED, "section alignment %#lx below the page size", opt.SectionAlignment);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        if (sections[i].VirtualAddress & (opt.SectionAlignment - 1))
+            return fail(MAP_FORMAT, "section %.8s not aligned to %#lx",
+                        reinterpret_cast<const char*>(sections[i].Name), opt.SectionAlignment);
+    }
 
     if (opt.AddressOfEntryPoint && !executable(nt, opt.AddressOfEntryPoint))
         return fail(MAP_FORMAT, "entry point outside executable section");
@@ -365,24 +404,31 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
     };
 
     std::memcpy(base, raw.data(), opt.SizeOfHeaders);
-    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+    const WORD section_count = nt->FileHeader.NumberOfSections;
+    for (WORD i = 0; i < section_count; ++i) {
         const auto& s = sections[i];
         const DWORD span = s.Misc.VirtualSize ? s.Misc.VirtualSize : s.SizeOfRawData;
-        // Like the Windows loader, a section without a file offset stays zero-filled even when
-        // SizeOfRawData is set; it does not take the headers at file offset 0.
-        const DWORD copy = !s.PointerToRawData ? 0 : s.SizeOfRawData < span ? s.SizeOfRawData : span;
-        if (s.VirtualAddress < opt.SizeOfHeaders || !inside(s.VirtualAddress, span, opt.SizeOfImage)
-            || !inside(s.PointerToRawData, copy, raw.size()))
-            return release(fail(MAP_FORMAT, "section %.8s outside image", reinterpret_cast<const char*>(s.Name)));
-        if (copy) {
-            // Like the Windows loader, read whole 0x200-byte file sectors: round the start of the raw
-            // data down and its end up. Sector bytes past the end of the file stay zero.
-            const std::uint64_t first = s.PointerToRawData & ~std::uint64_t{0x1ff};
-            std::uint64_t end = (std::uint64_t{s.PointerToRawData} + s.SizeOfRawData + 0x1ff) & ~std::uint64_t{0x1ff};
-            if (end > raw.size()) end = raw.size();
-            const std::uint64_t length = end - first < span ? end - first : span;
-            std::memcpy(base + s.VirtualAddress, raw.data() + first, static_cast<std::size_t>(length));
-        }
+        const char* name = reinterpret_cast<const char*>(s.Name);
+        if (s.VirtualAddress < opt.SizeOfHeaders || !inside(s.VirtualAddress, span, opt.SizeOfImage))
+            return release(fail(MAP_FORMAT, "section %.8s outside image", name));
+        // Like the Windows loader, check raw data against the file by two rules only: no raw range
+        // may reach 4 GiB, and the last section's raw data must end inside the file. Raw data of an
+        // earlier section may lie past the end of the file; the missing bytes stay zero.
+        const std::uint64_t raw_end = std::uint64_t{s.PointerToRawData} + s.SizeOfRawData;
+        if (s.SizeOfRawData && raw_end > 0xffffffffull)
+            return release(fail(MAP_FORMAT, "section %.8s raw data reaches 4 GiB", name));
+        if (s.SizeOfRawData && i + 1 == section_count && raw_end > raw.size())
+            return release(fail(MAP_FORMAT, "last section %.8s raw data runs past the file", name));
+        // A section without a file offset stays zero-filled even when SizeOfRawData is set; it does
+        // not take the headers at file offset 0.
+        if (!s.PointerToRawData || !s.SizeOfRawData) continue;
+        // Read whole 0x200-byte file sectors: round the start of the raw data down and its end up.
+        const std::uint64_t first = s.PointerToRawData & ~std::uint64_t{0x1ff};
+        std::uint64_t end = (raw_end + 0x1ff) & ~std::uint64_t{0x1ff};
+        if (end > raw.size()) end = raw.size();
+        if (first >= end) continue;
+        const std::uint64_t length = end - first < span ? end - first : span;
+        std::memcpy(base + s.VirtualAddress, raw.data() + first, static_cast<std::size_t>(length));
     }
 
     // TLS data needs a slot in each thread's ThreadLocalStoragePointer array, which ntdll owns.
@@ -583,11 +629,12 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
             return release(fail(MAP_FUNCTION_TABLE, "cannot register .pdata"));
         const auto count = pdata.Size / sizeof(RUNTIME_FUNCTION);
         auto* table = image.at<RUNTIME_FUNCTION>(pdata.VirtualAddress, count);
+        if (table && !readable(table, pdata.Size))
+            return release(fail(MAP_UNSUPPORTED, "exception table is not readable after section protection"));
         if (!table || !RtlAddFunctionTable(table, static_cast<DWORD>(count),
                                            reinterpret_cast<DWORD64>(base)))
             return release(fail(MAP_FUNCTION_TABLE, "cannot register .pdata"));
     }
-
     std::vector<PIMAGE_TLS_CALLBACK> callbacks;
     const auto* mapped_nt = image.headers();
     if (const char* reason = tls_callbacks(image, mapped_nt, callbacks)) {
@@ -621,35 +668,87 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
     return base;
 }
 
+namespace {
+
+struct ExportLookup {
+    DWORD rva = 0;
+    const char* forwarder = nullptr;
+};
+
+// Finds one named export. The export directory, its three tables and the forwarder string are
+// checked against the live page protection, as the TLS path does.
+bool find_export(const Image& image, const IMAGE_NT_HEADERS64* nt, const char* name, ExportLookup& out) {
+    const auto& exports = directory(nt, IMAGE_DIRECTORY_ENTRY_EXPORT);
+    if (exports.Size < sizeof(IMAGE_EXPORT_DIRECTORY) || !inside(exports.VirtualAddress, exports.Size, image.size))
+        return false;
+    const auto* dir = exports.Size ? image.at<IMAGE_EXPORT_DIRECTORY>(exports.VirtualAddress) : nullptr;
+    if (!dir || !readable(dir, sizeof(IMAGE_EXPORT_DIRECTORY))) return false;
+    const auto* names = image.at<DWORD>(dir->AddressOfNames, dir->NumberOfNames);
+    const auto* ordinals = image.at<WORD>(dir->AddressOfNameOrdinals, dir->NumberOfNames);
+    const auto* functions = image.at<DWORD>(dir->AddressOfFunctions, dir->NumberOfFunctions);
+    if (!names || !ordinals || !functions) return false;
+    if (!readable(names, sizeof(DWORD) * dir->NumberOfNames) ||
+        !readable(ordinals, sizeof(WORD) * dir->NumberOfNames) ||
+        !readable(functions, sizeof(DWORD) * dir->NumberOfFunctions)) return false;
+    for (DWORD i = 0; i < dir->NumberOfNames; ++i) {
+        const char* exported = readable_string(image, names[i]);
+        if (!exported || std::strcmp(exported, name) != 0) continue;
+        if (ordinals[i] >= dir->NumberOfFunctions) return false;
+        const DWORD rva = functions[ordinals[i]];
+        // A forwarded export points back into the export directory, where its target string lives.
+        if (rva >= exports.VirtualAddress && rva - exports.VirtualAddress < exports.Size) {
+            const Image directory_view{image.base, std::uint64_t{exports.VirtualAddress} + exports.Size};
+            out.forwarder = readable_string(directory_view, rva);
+            return out.forwarder != nullptr;
+        }
+        out.rva = rva;
+        return true;
+    }
+    return false;
+}
+
+}  // namespace
+
 // Only valid for a base returned by pe_map_image, whose headers were validated and are read-only.
 extern "C" __declspec(dllexport) void* pe_map_export(void* mapped, const char* name) {
     const auto* nt = Image{static_cast<std::uint8_t*>(mapped), 0}.headers();
     const Image image{static_cast<std::uint8_t*>(mapped), nt->OptionalHeader.SizeOfImage};
-    const auto& exports = directory(nt, IMAGE_DIRECTORY_ENTRY_EXPORT);
-    const auto* dir = exports.Size ? image.at<IMAGE_EXPORT_DIRECTORY>(exports.VirtualAddress) : nullptr;
-    // A mapped section can lack read access, by its characteristics or after a run-time reprotect.
-    // Image bounds alone do not make the export tables readable, so every read below is checked
-    // against the live protection first, as the TLS path already does.
-    if (!dir || !readable(dir, sizeof(IMAGE_EXPORT_DIRECTORY))) return nullptr;
-    const auto* names = image.at<DWORD>(dir->AddressOfNames, dir->NumberOfNames);
-    const auto* ordinals = image.at<WORD>(dir->AddressOfNameOrdinals, dir->NumberOfNames);
-    const auto* functions = image.at<DWORD>(dir->AddressOfFunctions, dir->NumberOfFunctions);
-    if (!names || !ordinals || !functions) return nullptr;
-    if (!readable(names, sizeof(DWORD) * dir->NumberOfNames) ||
-        !readable(ordinals, sizeof(WORD) * dir->NumberOfNames) ||
-        !readable(functions, sizeof(DWORD) * dir->NumberOfFunctions)) return nullptr;
-    for (DWORD i = 0; i < dir->NumberOfNames; ++i) {
-        const char* exported = readable_string(image, names[i]);
-        if (!exported || std::strcmp(exported, name) != 0) continue;
-        if (ordinals[i] >= dir->NumberOfFunctions) return nullptr;
-        const DWORD rva = functions[ordinals[i]];
-        // Forwarded exports point back into the export directory; they are not code here.
-        if (rva >= exports.VirtualAddress && rva - exports.VirtualAddress < exports.Size) return nullptr;
-        // An empty slot (RVA 0) names no code; returning the image base would be wrong. An exported
-        // address must be accessible, but it may be execute-only, so readable() is not used here.
-        return rva && rva < image.size && accessible(image.base + rva) ? image.base + rva : nullptr;
+    ExportLookup found;
+    // A forwarded export is not code in this image, so this entry point keeps returning null.
+    if (!find_export(image, nt, name, found) || found.forwarder) return nullptr;
+    // An empty slot (RVA 0) names no code; returning the image base would be wrong. An exported
+    // address must be accessible, but it may be execute-only, so readable() is not used here.
+    return found.rva && found.rva < image.size && accessible(image.base + found.rva)
+        ? image.base + found.rva : nullptr;
+}
+
+// Like pe_map_export, but a forwarded export is resolved through the host resolver. The forwarder
+// string is "Module.Symbol" or "Module.#ordinal", with the module as the linker recorded it.
+extern "C" __declspec(dllexport) void* pe_map_export_resolved(void* mapped, const char* name, Resolver resolve) {
+    const auto* nt = Image{static_cast<std::uint8_t*>(mapped), 0}.headers();
+    const Image image{static_cast<std::uint8_t*>(mapped), nt->OptionalHeader.SizeOfImage};
+    ExportLookup found;
+    if (!find_export(image, nt, name, found)) return nullptr;
+    if (!found.forwarder)
+        return found.rva && found.rva < image.size && accessible(image.base + found.rva)
+            ? image.base + found.rva : nullptr;
+    if (!resolve) return nullptr;
+    const std::string target(found.forwarder);
+    const auto dot = target.rfind('.');
+    if (dot == std::string::npos || dot == 0 || dot + 1 == target.size()) return nullptr;
+    const std::string module = target.substr(0, dot);
+    const std::string symbol = target.substr(dot + 1);
+    if (symbol.front() == '#') {
+        std::uint32_t ordinal = 0;
+        for (std::size_t i = 1; i < symbol.size(); ++i) {
+            const char digit = symbol[i];
+            if (digit < '0' || digit > '9') return nullptr;
+            ordinal = ordinal * 10 + static_cast<unsigned>(digit - '0');
+            if (ordinal > 65535) return nullptr;
+        }
+        return ordinal ? resolve(module.c_str(), nullptr, ordinal) : nullptr;
     }
-    return nullptr;
+    return resolve(module.c_str(), symbol.c_str(), 0);
 }
 
 // Returns 1 after unregistering an image that pe_map_image returned, and 0 for null, for any
