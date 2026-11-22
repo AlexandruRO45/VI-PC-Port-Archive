@@ -9,12 +9,15 @@ HRESULT check_feature(ID3D12Device* device, D3D12_FEATURE feature, void* data, U
 Microsoft::WRL::ComPtr<ID3D12Resource> resource(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc,
     D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear = nullptr);
 void check_compute(ID3D12Device* device, bool tables);
+void check_compute_file(ID3D12Device* device, const char* path, bool conversion_pair, const char* reference = nullptr);
 void check_ffx_device_init(ID3D12Device* device);
 void check_ffx_recurrent(ID3D12Device* device);
 void check_dual_uav(ID3D12Device* device);
 void check_texture_mips(ID3D12Device* device);
 void check_dual_pixel(ID3D12Device*, const char*, const char*, bool);
-void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference = nullptr);
+void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference = nullptr,
+                            UINT8 writeMask = D3D12_COLOR_WRITE_ENABLE_ALL);
+void check_attribute_pixel(ID3D12Device* device, const char* shader, const char* reference, bool rg);
 void check_pixel_quad_lod(ID3D12Device* device, const char* shader);
 void check_bc7_pixel(ID3D12Device* device, const char* shader, const char* input,
                      const char* capture, const char* mip1 = nullptr);
@@ -31,6 +34,7 @@ bool check_bvh_waves(ID3D12Device* device, bool force64);
 bool check_gpu_alias(ID3D12Device* device);
 bool check_gpu_alias_lookup(ID3D12Device* device);
 bool check_gpu_alias_lookup_writes(ID3D12Device* device);
+bool check_gpu_alias_registry(ID3D12Device* device);
 bool check_wave_shuffle(ID3D12Device* device);
 bool check_ray_query(ID3D12Device* device);
 bool check_dxr_update(ID3D12Device* device);

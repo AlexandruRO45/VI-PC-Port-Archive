@@ -45,6 +45,7 @@ struct PixelInput {
     std::vector<Color> expected;
     std::vector<BYTE> secondRows;
     std::vector<Word> constants = std::vector<Word>(64);
+    UINT8 writeMask = D3D12_COLOR_WRITE_ENABLE_ALL;
 };
 
 struct MipDraw {
@@ -84,7 +85,7 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
     blend.DestBlend = blend.DestBlendAlpha = D3D12_BLEND_ZERO;
     blend.BlendOp = blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
     blend.LogicOp = D3D12_LOGIC_OP_NOOP;
-    blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    blend.RenderTargetWriteMask = input.writeMask;
     desc.SampleMask = UINT_MAX;
     desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     desc.NumRenderTargets = desc.SampleDesc.Count = 1;
@@ -294,9 +295,10 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
 }
 }
 
-void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference)
+void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference, UINT8 writeMask)
 {
     PixelInput input{8, 8, 8, DXGI_FORMAT_R8G8B8A8_UNORM};
+    input.writeMask = writeMask;
     for (auto g : ramp) {
         for (auto r : ramp) {
             input.rows.insert(input.rows.end(), {BYTE(r), BYTE(g), 128, 255});
@@ -335,6 +337,20 @@ void check_pixel_quad_lod(ID3D12Device* device, const char* shader)
     MipDraw draw{0, 1};
     draw.partialQuad = true;
     draw_verified(device, shader, {std::move(top), std::move(next)}, {8, 8}, 0, {draw}, nullptr);
+}
+
+void check_attribute_pixel(ID3D12Device* device, const char* shader, const char* reference, bool rg)
+{
+    PixelInput input{32, 32, 1, DXGI_FORMAT_R8G8B8A8_UNORM};
+    if (rg) input.writeMask = D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN;
+    input.rows.resize(input.width * input.height * 4);
+    input.expected.resize(input.width * input.height);
+    std::ifstream file(reference, std::ios::binary);
+    file.read(reinterpret_cast<char*>(input.constants.data()), input.constants.size() * sizeof(Word));
+    file.read(reinterpret_cast<char*>(input.expected.data()), input.expected.size() * sizeof(Color));
+    if (!file || file.peek() != std::char_traits<char>::eof())
+        throw std::runtime_error("Expected a 256-byte constant buffer and 32 by 32 float4 colors");
+    draw_verified(device, shader, {std::move(input)}, 0, 0, nullptr);
 }
 
 void check_dual_pixel(ID3D12Device* device, const char* shader, const char* capture, bool swap)

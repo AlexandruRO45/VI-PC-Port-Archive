@@ -286,8 +286,8 @@ def check_rejections():
         "fsubr st(2), st with two values": (attempt(f"{fld} {fld} dc e2 {fstp} {fstp} c3"), "x87 stack underflow"),
         "fisub m32": (attempt(f"{fld} da 21 {fstp} c3"), "unsupported x87 operation"),
         "fisubr m16": (attempt(f"{fld} de 29 {fstp} c3"), "unsupported x87 operation"),
-        "fchs": (attempt(f"{fld} d9 e0 {fstp} c3"), "unsupported x87 operation"),
-        "fabs": (attempt(f"{fld} d9 e1 {fstp} c3"), "unsupported x87 operation"),
+        "fxsave": (attempt(f"{fld} 0f ae 01 {fstp} c3"), "unsupported x87 operation"),
+        "fnstenv": (attempt(f"{fld} {fld} d9 31 {fstp} {fstp} c3"), "unsupported x87 operation"),
         "fcom st(1)": (attempt(f"{fld} {fld} d8 d1 {fstp} {fstp} c3"), "unsupported x87 operation"),
     }
     for case, (message, needle) in rejected.items():
