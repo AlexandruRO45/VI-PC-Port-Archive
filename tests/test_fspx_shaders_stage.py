@@ -253,26 +253,27 @@ class ShadersStageWithTheDll(unittest.TestCase):
             ran = []
             dxbc = os.path.join(work, "shaders", "dxbc")
 
-            def touch(*parts):
-                os.makedirs(os.path.dirname(os.path.join(*parts)), exist_ok=True)
-                open(os.path.join(*parts), "w").close()
+            def write_fixture(*parts, contents=None):
+                path = os.path.join(*parts)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    if contents is not None:
+                        json.dump(contents, f)
 
             def fake_py(tool, *args):
                 ran.append(tool)
                 if tool == "shader_carve.py":
-                    touch(dxbc, "index.json")
+                    write_fixture(dxbc, "index.json", contents=[{"file": "fixture.dxbc"}])
                 elif tool == "fssm_unpack.py":
-                    touch(dxbc, "fssm_index.json")
+                    write_fixture(dxbc, "fssm_index.json", contents=[{"name": "fixture"}])
                 elif tool == "shader_disasm.py":
-                    os.makedirs(os.path.join(dxbc, "disasm"), exist_ok=True)
+                    write_fixture(dxbc, "disasm", "fixture.s")
                 elif tool == "rdna2spirv.py":
-                    touch(args[args.index("--out") + 1], "index.json")
-                    with open(os.path.join(args[args.index("--out") + 1], "index.json"), "w") as f:
-                        f.write("{}")
+                    write_fixture(args[args.index("--out") + 1], "index.json", contents={})
 
             def fake_translate(disasm, spirv, jobs, emulate=False, fallbacks=()):
                 ran.append("translate")
-                touch(spirv, "index.json")
+                write_fixture(spirv, "index.json")
 
             def stage():
                 ran.clear()
