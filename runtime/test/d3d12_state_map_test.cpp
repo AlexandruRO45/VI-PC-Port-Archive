@@ -585,6 +585,51 @@ int main() {
         CHECK(memory_type_order(memory, 0x7, host, local, 128 * mib) == (order{1, 2}));     // type 3 not allowed
         CHECK(memory_type_order(memory, 0xF, 0, local, 1 * mib) == (order{0, 3, 1, 2}));
         CHECK(memory_type_order(memory, 0xF, host, local, 64ull << 30).empty());           // nothing that large
+
+        // Budget ordering only changes which compatible allocation is tried first.
+        constexpr VkDeviceSize texture = 128 * mib;
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        budget.heapBudget[0] = 256 * mib;
+        budget.heapBudget[1] = 512 * mib;
+        budget.heapBudget[2] = 192 * mib;
+        budget.heapUsage[0] = budget.heapBudget[0] - texture;
+        budget.heapUsage[1] = budget.heapBudget[1] - texture;
+        budget.heapUsage[2] = budget.heapBudget[2] - texture + 1;
+        const auto texture_order = [&](std::uint32_t type_bits = 0xF, VkMemoryPropertyFlags required = 0) {
+            auto result = memory_type_order(memory, type_bits, required, local, texture);
+            prefer_system_memory_over_budget(result, memory, budget, texture);
+            return result;
+        };
+        CHECK(texture_order() == (order{0, 3, 1, 2}));  // exact fit on the first VRAM heap
+        ++budget.heapUsage[0];
+        --budget.heapUsage[2];
+        CHECK(texture_order() == (order{0, 3, 1, 2}));  // the BAR heap still fits
+        ++budget.heapUsage[2];
+        budget.heapUsage[0] = budget.heapBudget[0] + 1;  // driver already reports this heap over budget
+        CHECK(texture_order() == (order{1, 2, 0, 3}));  // exact fit in RAM; VRAM types remain retries
+        CHECK(texture_order(0xB) == (order{1, 0, 3}));  // only one compatible RAM type
+        CHECK(texture_order(0x9) == (order{0, 3}));     // the image's memory type mask excludes RAM
+        CHECK(texture_order(0xF, local) == (order{0, 3}));  // required property excludes RAM
+        CHECK(texture_order(0x6) == (order{1, 2}));     // a host-only allocation keeps its original order
+        budget.heapUsage[0] = budget.heapBudget[0] - texture;
+        CHECK(texture_order(0xE) == (order{1, 2, 3}));  // the only VRAM heap with headroom is incompatible
+        budget.heapUsage[0] = budget.heapBudget[0] + 1;
+
+        ++budget.heapUsage[1];
+        CHECK(texture_order() == (order{0, 3, 1, 2}));  // insufficient RAM budget
+        --budget.heapUsage[1];
+        budget.heapBudget[1] = 0;
+        CHECK(texture_order() == (order{0, 3, 1, 2}));  // unknown RAM budget
+        budget.heapBudget[1] = 512 * mib;
+        budget.heapBudget[0] = 0;
+        CHECK(texture_order() == (order{0, 3, 1, 2}));  // unknown local budget
+        budget.heapBudget[0] = 256 * mib;
+        memory.memoryHeaps[1].size = texture - 1;
+        budget.heapBudget[1] = texture - 1;
+        budget.heapUsage[1] = 0;
+        CHECK(texture_order() == (order{0, 3}));       // RAM is too small even before considering its budget
+        memory.memoryHeaps[1].size = 32ull << 30;
+
         memory.memoryHeaps[2].size = 24ull << 30;                                         // Resizable BAR on
         CHECK(memory_type_order(memory, 0xF, host, local, 256 * mib) == (order{3, 1, 2}));
     }

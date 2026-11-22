@@ -1032,14 +1032,19 @@ struct DeviceState {
         return properties3.optimalTilingFeatures & VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
     }
 
-    void report_memory_budget(const char* reason, VkDeviceSize request = 0,
-                              std::uint64_t allocations = 0) const {
-        if (!info.memory_budget || !memory_properties2) return;
-        std::lock_guard lock(memory_budget_mutex);
-        VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    bool read_memory_budget(VkPhysicalDeviceMemoryBudgetPropertiesEXT& budget) const {
+        if (!info.memory_budget || !memory_properties2) return false;
         VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &budget};
         memory_properties2(info.physical, &properties);
+        return true;
+    }
+
+    void report_memory_budget(const char* reason, VkDeviceSize request = 0,
+                              std::uint64_t allocations = 0) const {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        if (!read_memory_budget(budget)) return;
+        std::lock_guard lock(memory_budget_mutex);
         if (allocations)
             std::fprintf(stderr,
                          "[rt] d3d12: Vulkan memory budget (%s; after %llu successful VkDeviceMemory allocations)\n",
@@ -1050,8 +1055,8 @@ struct DeviceState {
         else
             std::fprintf(stderr, "[rt] d3d12: Vulkan memory budget (%s)\n", reason);
         constexpr VkDeviceSize mib = 1024 * 1024;
-        for (std::uint32_t i = 0; i < properties.memoryProperties.memoryHeapCount; ++i) {
-            const VkMemoryHeap& heap = properties.memoryProperties.memoryHeaps[i];
+        for (std::uint32_t i = 0; i < memory.memoryHeapCount; ++i) {
+            const VkMemoryHeap& heap = memory.memoryHeaps[i];
             const char* kind = (heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) ? "device-local" : "non-local";
             std::fprintf(stderr,
                          "[rt] d3d12:   heap %u (%s): usage %llu MiB / budget %llu MiB (size %llu MiB)\n", i, kind,
@@ -1061,16 +1066,35 @@ struct DeviceState {
         }
     }
 
+    enum class AllocationPolicy { prefer_requested, sampled_texture_budget };
+
     // A memory type with `required`, preferring one that also has `preferred`, in a heap large enough for the
     // allocation (leonida::memory_type_order). `chosen`, when given, receives the property flags of the type the
     // memory came from.
     VkDeviceMemory allocate(const VkMemoryRequirements& requirements, VkMemoryPropertyFlags required,
                             VkMemoryPropertyFlags preferred, VkMemoryPropertyFlags* chosen = nullptr,
-                            bool device_address = false, std::uint32_t* chosen_type = nullptr) const {
+                            bool device_address = false, std::uint32_t* chosen_type = nullptr,
+                            AllocationPolicy policy = AllocationPolicy::prefer_requested) const {
+        auto order =
+            leonida::memory_type_order(memory, requirements.memoryTypeBits, required, preferred, requirements.size);
+        if (policy == AllocationPolicy::sampled_texture_budget && info.memory_budget) {
+            // Skip the query if the driver offers no choice between VRAM and system memory for this image.
+            const bool has_system_memory = std::any_of(order.begin(), order.end(), [this](std::uint32_t index) {
+                return leonida::is_system_memory_type(memory, index);
+            });
+            const bool has_device_local = std::any_of(order.begin(), order.end(), [this](std::uint32_t index) {
+                return leonida::is_device_local_memory_type(memory, index);
+            });
+            if (has_system_memory && has_device_local) {
+                VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+                if (read_memory_budget(budget))
+                    leonida::prefer_system_memory_over_budget(order, memory, budget, requirements.size);
+            }
+        }
         VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
         flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-        for (const std::uint32_t i :
-             leonida::memory_type_order(memory, requirements.memoryTypeBits, required, preferred, requirements.size)) {
+        for (const std::uint32_t i : order) {
             VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
             if (device_address) allocate.pNext = &flags_info;
             allocate.allocationSize = requirements.size;
@@ -1559,7 +1583,7 @@ public:
         return S_OK;
     }
 
-    HRESULT create_texture(const Format& format, const std::vector<VkFormat>& castable = {}) {
+    HRESULT create_texture(const Format& format, const std::vector<VkFormat>& castable, bool committed = false) {
         auto& vk = device_.context->vk;
         const bool volume = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         const UINT depth = volume ? desc_.DepthOrArraySize : 1;
@@ -1612,7 +1636,19 @@ public:
         }
         VkMemoryRequirements requirements{};
         vk.vkGetImageMemoryRequirements(device_.info.device, image_, &requirements);
-        memory_ = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_);
+        constexpr auto attachment_or_storage = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                               D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        constexpr auto special_heap = D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_ALLOW_DISPLAY |
+                                      D3D12_HEAP_FLAG_HARDWARE_PROTECTED;
+        const bool budget_aware = committed && heap_.Type == D3D12_HEAP_TYPE_DEFAULT &&
+                                  info.imageType == VK_IMAGE_TYPE_2D && samples == VK_SAMPLE_COUNT_1_BIT &&
+                                  (info.usage & VK_IMAGE_USAGE_SAMPLED_BIT) && !(desc_.Flags & attachment_or_storage) &&
+                                  !(heap_flags_ & special_heap);
+        const auto policy = budget_aware ? DeviceState::AllocationPolicy::sampled_texture_budget
+                                         : DeviceState::AllocationPolicy::prefer_requested;
+        memory_ = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_,
+                                   false, nullptr, policy);
         if (!memory_ || vk.vkBindImageMemory(device_.info.device, image_, memory_, 0) != VK_SUCCESS)
             return E_OUTOFMEMORY;
 
@@ -6474,7 +6510,7 @@ private:
             } else {
                 std::vector<VkFormat> cast_formats;
                 hr = castable_view_formats(format, castable_count, castable, cast_formats);
-                if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats);
+                if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats, /*committed=*/true);
             }
         }
         if (FAILED(hr)) {

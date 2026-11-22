@@ -1,7 +1,6 @@
 #pragma once
 
-// Memory-type policy for the D3D12 layer that depends only on VkPhysicalDeviceMemoryProperties, so it can be checked
-// without a GPU (d3d12_state_map_test) on the heap layouts real cards report.
+// Memory-type policy for the D3D12 layer, checked without a GPU (d3d12_state_map_test) on synthetic heap layouts.
 
 #ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
@@ -54,6 +53,42 @@ inline std::vector<std::uint32_t> memory_type_order(const VkPhysicalDeviceMemory
         }
     }
     return order;
+}
+
+inline bool is_device_local_memory_type(const VkPhysicalDeviceMemoryProperties& memory, std::uint32_t index) {
+    const VkMemoryType& type = memory.memoryTypes[index];
+    return (type.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ||
+           (memory.memoryHeaps[type.heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT);
+}
+
+inline bool is_system_memory_type(const VkPhysicalDeviceMemoryProperties& memory, std::uint32_t index) {
+    return (memory.memoryTypes[index].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+           !is_device_local_memory_type(memory, index);
+}
+
+// Reorder the valid candidates from memory_type_order when every compatible local heap would exceed its budget.
+// The driver estimates can change, so all candidates stay available for retries.
+inline void prefer_system_memory_over_budget(std::vector<std::uint32_t>& order,
+                                             const VkPhysicalDeviceMemoryProperties& memory,
+                                             const VkPhysicalDeviceMemoryBudgetPropertiesEXT& budget,
+                                             VkDeviceSize size) {
+    const auto fits_budget = [&](std::uint32_t heap) {
+        return budget.heapUsage[heap] <= budget.heapBudget[heap] &&
+               size <= budget.heapBudget[heap] - budget.heapUsage[heap];
+    };
+    bool local_type = false;
+    for (const std::uint32_t index : order) {
+        if (!is_device_local_memory_type(memory, index)) continue;
+        local_type = true;
+        const auto heap = memory.memoryTypes[index].heapIndex;
+        if (!budget.heapBudget[heap] || fits_budget(heap)) return;
+    }
+    if (!local_type) return;
+
+    std::stable_partition(order.begin(), order.end(), [&](std::uint32_t index) {
+        const auto heap = memory.memoryTypes[index].heapIndex;
+        return is_system_memory_type(memory, index) && budget.heapBudget[heap] && fits_budget(heap);
+    });
 }
 
 }  // namespace leonida

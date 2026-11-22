@@ -129,7 +129,7 @@ struct VulkanDeviceInfo {
     bool fragment_shader_barycentric = false;
     bool fragment_shader_interlock = false;
     bool maintenance8 = false;
-    // VK_EXT_memory_budget is enabled on the logical device for heap-usage diagnostics.
+    // VK_EXT_memory_budget is enabled on the logical device for heap-usage queries.
     bool memory_budget = false;
     // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
     // do nothing.
