@@ -84,6 +84,10 @@ struct RootParameter {
     uint32_t descriptor_space = 0;
     // Descriptor table:
     std::vector<DescriptorRange> ranges;
+    // D3D12_ROOT_PARAMETER_TYPE as the blob stores it (0 table, 1 constants, 2/3/4 CBV/SRV/UAV), which `type`
+    // folds into three kinds; set by parse_rts0, kUnknownD3dType for a parameter built another way.
+    static constexpr uint32_t kUnknownD3dType = 0xFFFFFFFFu;
+    uint32_t d3d_type = kUnknownD3dType;
 };
 
 struct RootSignature {

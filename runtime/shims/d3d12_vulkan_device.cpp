@@ -5211,12 +5211,24 @@ public:
     HRESULT STDMETHODCALLTYPE CreateCommandSignature(const D3D12_COMMAND_SIGNATURE_DESC* desc,
                                                      ID3D12RootSignature* root_signature, REFIID riid,
                                                      void** out) override {
-        if (out) *out = nullptr;
+        // A refused call leaves *out as it was, as the host does (d3d12_command_signature_root_test).
         // The host refuses these with E_INVALIDARG (compare_invalid_arguments, "command signature:"): one node, a
         // known type per argument, exactly one draw or dispatch and it comes last, a root signature for root
         // arguments, and a stride that is a multiple of 4 and holds every argument.
         if (!desc || desc->NumArgumentDescs == 0 || !desc->pArgumentDescs || (desc->NodeMask & ~1u))
             return E_INVALIDARG;
+        // With a root signature (d3d12_command_signature_root_test, RTX 3060 / 610.88), the host also wants: at
+        // least one root argument (a root signature with none is refused), each naming a parameter of the right
+        // type (root constants for CONSTANT, the same root CBV/SRV/UAV for a view), constants that fit their
+        // parameter (at least one value), and root arguments in increasing parameter order, constants into one
+        // parameter in increasing ranges that don't overlap. Vertex buffer views need a slot below 32, each slot
+        // at most once, and no dispatch; an index buffer view comes at most once and not with a plain draw or a
+        // dispatch. The vertex and index buffer rules hold without a root signature too.
+        const RootArgumentLayout* layout = root_signature ? root_signature_layout(root_signature) : nullptr;
+        bool any_root_argument = false;
+        std::uint64_t root_position = 0;   // where the last root argument ended: parameter << 33 | end of its range
+        std::uint32_t vertex_slots = 0;
+        UINT index_buffers = 0;
         UINT64 size = 0;  // 64-bit: a large Num32BitValuesToSet must not wrap past ByteStride
         for (UINT i = 0; i < desc->NumArgumentDescs; ++i) {
             const D3D12_INDIRECT_ARGUMENT_DESC& arg = desc->pArgumentDescs[i];
@@ -5241,9 +5253,51 @@ public:
             const bool root_argument = !draw && arg.Type != D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW &&
                                        arg.Type != D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW;
             if (draw != (i + 1 == desc->NumArgumentDescs) || (root_argument && !root_signature)) return E_INVALIDARG;
+            if (arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW) {
+                const UINT slot = arg.VertexBuffer.Slot;
+                if (slot >= D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT || (vertex_slots >> slot & 1u))
+                    return E_INVALIDARG;
+                vertex_slots |= 1u << slot;
+            }
+            if (arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW && ++index_buffers > 1) return E_INVALIDARG;
+            if (!root_argument) continue;
+            any_root_argument = true;
+            if (!layout) continue;  // a root signature from another device: nothing to check against
+            // Every root argument type keeps its parameter index in the same place (the union's first member).
+            const UINT index = arg.Constant.RootParameterIndex;
+            if (index >= layout->parameters.size()) return E_INVALIDARG;
+            const RootArgumentLayout::Parameter& parameter = layout->parameters[index];
+            std::uint64_t first = 0, end = 1;  // a view takes its whole parameter
+            if (arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT) {
+                first = arg.Constant.DestOffsetIn32BitValues;
+                end = first + arg.Constant.Num32BitValuesToSet;
+                if (parameter.type != rt::rootsig::ParamType::Constants || end == first ||
+                    end > parameter.constant_count)
+                    return E_INVALIDARG;
+            } else if (arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW ||
+                       arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW ||
+                       arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW) {
+                // D3D12_ROOT_PARAMETER_TYPE_CBV/SRV/UAV are 2/3/4, in the order of these argument types.
+                const std::uint32_t wanted =
+                    D3D12_ROOT_PARAMETER_TYPE_CBV + (arg.Type - D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW);
+                if (parameter.type != rt::rootsig::ParamType::Descriptor ||
+                    (parameter.d3d_type != 0xFFFFFFFFu && parameter.d3d_type != wanted))
+                    return E_INVALIDARG;
+            }
+            // Parameter order, then the constants' ranges: each root argument starts where the last one ended or
+            // later (end values fit in 33 bits: a 32-bit offset plus a 32-bit count).
+            const std::uint64_t start = std::uint64_t(index) << 33 | first;
+            if (start < root_position) return E_INVALIDARG;
+            root_position = std::uint64_t(index) << 33 | end;
         }
+        if (root_signature && !any_root_argument) return E_INVALIDARG;
+        const D3D12_INDIRECT_ARGUMENT_TYPE last = desc->pArgumentDescs[desc->NumArgumentDescs - 1].Type;
+        // Measured against DISPATCH and DRAW; with DISPATCH_MESH (E_NOTIMPL below) the host's answer is not.
+        if ((vertex_slots || index_buffers) && last == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH) return E_INVALIDARG;
+        if (index_buffers && last == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW) return E_INVALIDARG;
         if (desc->ByteStride % 4 || desc->ByteStride < size) return E_INVALIDARG;
         if (!out) return E_UNEXPECTED;  // the host's answer for a valid description and no output
+        *out = nullptr;
         leonida::IndirectKind kind;
         switch (desc->pArgumentDescs[desc->NumArgumentDescs - 1].Type) {
         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: kind = leonida::IndirectKind::draw; break;
@@ -5449,7 +5503,8 @@ public:
                     break;
                 }
             layout.parameters.push_back({parsed.sig.params[i].type, first, parsed.sig.params[i].num_values,
-                                         compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr});
+                                         compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr,
+                                         parsed.sig.params[i].d3d_type});
         }
         register_static_samplers(parsed.sig);
         auto* signature = new RootSignature(

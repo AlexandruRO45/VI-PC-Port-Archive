@@ -360,6 +360,7 @@ static DecodeResult parse_rts0_payload(const uint8_t* data, size_t size) {
         }
         RootParameter p;
         p.visibility = static_cast<Visibility>(vis);
+        p.d3d_type = dtype;
         if (dtype == 1) {
             p.type = ParamType::Constants;
             if (!u32_at(poff, p.shader_register) || !u32_at(poff + 4, p.register_space) ||

@@ -3193,6 +3193,18 @@ Not implemented yet:
   one Vulkan indirect call. Use a compute expansion pass that writes a Vulkan-shaped indirect buffer, or
   `VK_NV_device_generated_commands` on NVIDIA. Start with the simple signatures; the trace will show which
   signatures the game creates.
+- `CreateCommandSignature` refuses with `E_INVALIDARG` what the host runtime refuses, with or without a root
+  signature, and a refused call leaves the output as it was. `d3d12_command_signature_root_test` compares 159
+  values (RTX 3060, driver 610.88) beyond `compare_invalid_arguments`' signatures without one. The rules it
+  measured:
+  - A root signature is passed only with at least one root argument (constants, CBV, SRV or UAV); with none it
+    is refused.
+  - A root argument names a parameter of its type (root constants for `CONSTANT`, the same kind of root
+    descriptor for a view), and constants fit their parameter, at least one value.
+  - Root arguments come in increasing parameter order. Constants into one parameter come in increasing ranges
+    that don't overlap.
+  - A vertex buffer view uses a slot below 32, each slot once, and not with a dispatch. An index buffer view comes
+    once and not with a plain draw or a dispatch. Both rules hold without a root signature too.
 - Predication (`SetPredication`) maps to `VK_EXT_conditional_rendering` (D3D-18). Done: `GraphicsCommandList::
   SetPredication` records a `Predication` command (`runtime/src/command_list.h`; offset 8-byte aligned, op
   `EQUAL_ZERO` or `NOT_EQUAL_ZERO`, a null buffer turns it off). The replay (`runtime/src/vulkan_replay.h`) begins

@@ -352,6 +352,8 @@ struct RootArgumentLayout {
         std::uint32_t user_offset;     // graphics: first dword; unused for a parameter with no dwords
         std::uint32_t constant_count;  // constants only
         std::uint32_t compute_offset = rt::rootsig::kNoSgpr;  // compute: first user SGPR
+        // D3D12_ROOT_PARAMETER_TYPE (tells a root CBV, SRV and UAV apart), or UINT32_MAX when it isn't known.
+        std::uint32_t d3d_type = 0xFFFFFFFFu;
     };
     std::vector<Parameter> parameters;
     bool graphics_ok = true;
