@@ -182,6 +182,23 @@ class TestRdna2Disasm(unittest.TestCase):
             ],
         )
 
+    def test_sopc_opcode_table_synthetic_forms(self):
+        from disasm_rdna2 import SOPC_OPS
+        for op, (expected_name, _) in SOPC_OPS.items():
+            w0 = 0xbf000000 | (op << 16) | (2 << 8) | 0
+            raw = struct.pack("<I", w0)
+            insns = disasm_rdna2(raw)
+            self.assertEqual(len(insns), 1, f"Failed decoding SOPC op 0x{op:02x}")
+            self.assertEqual(insns[0]["opcode"], expected_name)
+            self.assertEqual(insns[0]["length"], 4)
+
+        w0_literal = 0xbf000000 | (0x06 << 16) | (255 << 8) | 0
+        truncated_raw = struct.pack("<I", w0_literal)
+        insns = disasm_rdna2(truncated_raw)
+        self.assertEqual(len(insns), 1)
+        self.assertEqual(insns[0]["opcode"], "sopc_truncated")
+        self.assertIn("<truncated>", insns[0]["assembly"])
+
     def test_cli_hex_entry_point(self):
         script = Path(__file__).resolve().parents[1] / "tools" / "disasm_rdna2.py"
         res = subprocess.run(
