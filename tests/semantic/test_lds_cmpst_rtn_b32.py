@@ -767,8 +767,207 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
         self.assertEqual(state.lds.read_dword(addr), 0x1111)
 
 
+class TestRegisterAliasing(unittest.TestCase):
+    """Phase 5: Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+
+    def test_aliasing_vdst_equals_vaddr(self) -> None:
+        # ds_cmpst_rtn_b32 v0, v0, v1, v2
+        state = ScalarState(lds_size_dwords=1024)
+        addr = 0x60
+        initial_mem = 0x1111
+        cmp_val = 0x1111
+        new_val = 0x2222
+
+        state.lds.write_dword(addr, initial_mem)
+        state.set_vgpr(0, addr)    # v0 = addr (also vdst)
+        state.set_vgpr(1, cmp_val) # v1 = cmp_val
+        state.set_vgpr(2, new_val) # v2 = new_val
+
+        instr = DSCmpstRtnInstruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(0, RegType.VGPR),
+            vdata0=RegisterOperand(1, RegType.VGPR),
+            vdata1=RegisterOperand(2, RegType.VGPR),
+            offset=0,
+        )
+
+        old_val, new_mem, swapped = self.interp.execute(instr, state)
+
+        self.assertTrue(swapped)
+        self.assertEqual(old_val, initial_mem)
+        self.assertEqual(new_mem, new_val)
+        self.assertEqual(state.get_vgpr(0), initial_mem) # v0 received old_val
+        self.assertEqual(state.get_vgpr(1), cmp_val)     # v1 preserved
+        self.assertEqual(state.get_vgpr(2), new_val)     # v2 preserved
+        self.assertEqual(state.lds.read_dword(addr), new_val)
+
+    def test_aliasing_vdst_equals_vdata0(self) -> None:
+        # ds_cmpst_rtn_b32 v1, v0, v1, v2
+        state = ScalarState(lds_size_dwords=1024)
+        addr = 0x80
+        initial_mem = 0x3333
+        cmp_val = 0x3333
+        new_val = 0x4444
+
+        state.lds.write_dword(addr, initial_mem)
+        state.set_vgpr(0, addr)    # v0 = addr
+        state.set_vgpr(1, cmp_val) # v1 = cmp_val (also vdst)
+        state.set_vgpr(2, new_val) # v2 = new_val
+
+        instr = DSCmpstRtnInstruction(
+            vdst=RegisterOperand(1, RegType.VGPR),
+            vaddr=RegisterOperand(0, RegType.VGPR),
+            vdata0=RegisterOperand(1, RegType.VGPR),
+            vdata1=RegisterOperand(2, RegType.VGPR),
+            offset=0,
+        )
+
+        old_val, new_mem, swapped = self.interp.execute(instr, state)
+
+        self.assertTrue(swapped)
+        self.assertEqual(old_val, initial_mem)
+        self.assertEqual(new_mem, new_val)
+        self.assertEqual(state.get_vgpr(0), addr)        # v0 preserved
+        self.assertEqual(state.get_vgpr(1), initial_mem) # v1 received old_val
+        self.assertEqual(state.get_vgpr(2), new_val)     # v2 preserved
+        self.assertEqual(state.lds.read_dword(addr), new_val)
+
+    def test_aliasing_vdst_equals_vdata1(self) -> None:
+        # ds_cmpst_rtn_b32 v2, v0, v1, v2
+        state = ScalarState(lds_size_dwords=1024)
+        addr = 0x90
+        initial_mem = 0x5555
+        cmp_val = 0x5555
+        new_val = 0x6666
+
+        state.lds.write_dword(addr, initial_mem)
+        state.set_vgpr(0, addr)    # v0 = addr
+        state.set_vgpr(1, cmp_val) # v1 = cmp_val
+        state.set_vgpr(2, new_val) # v2 = new_val (also vdst)
+
+        instr = DSCmpstRtnInstruction(
+            vdst=RegisterOperand(2, RegType.VGPR),
+            vaddr=RegisterOperand(0, RegType.VGPR),
+            vdata0=RegisterOperand(1, RegType.VGPR),
+            vdata1=RegisterOperand(2, RegType.VGPR),
+            offset=0,
+        )
+
+        old_val, new_mem, swapped = self.interp.execute(instr, state)
+
+        self.assertTrue(swapped)
+        self.assertEqual(old_val, initial_mem)
+        self.assertEqual(new_mem, new_val)
+        self.assertEqual(state.get_vgpr(0), addr)        # v0 preserved
+        self.assertEqual(state.get_vgpr(1), cmp_val)     # v1 preserved
+        self.assertEqual(state.get_vgpr(2), initial_mem) # v2 received old_val
+        self.assertEqual(state.lds.read_dword(addr), new_val)
+
+    def test_aliasing_vdata0_equals_vdata1(self) -> None:
+        # ds_cmpst_rtn_b32 v3, v0, v1, v1 (cmp_val == new_val)
+        state = ScalarState(lds_size_dwords=1024)
+        addr = 0xA0
+        initial_mem = 0x7777
+
+        state.lds.write_dword(addr, initial_mem)
+        state.set_vgpr(0, addr)
+        state.set_vgpr(1, initial_mem) # v1 is both cmp_val and new_val
+
+        instr = DSCmpstRtnInstruction(
+            vdst=RegisterOperand(3, RegType.VGPR),
+            vaddr=RegisterOperand(0, RegType.VGPR),
+            vdata0=RegisterOperand(1, RegType.VGPR),
+            vdata1=RegisterOperand(1, RegType.VGPR),
+        )
+
+        old_val, new_mem, swapped = self.interp.execute(instr, state)
+        self.assertTrue(swapped)
+        self.assertEqual(old_val, initial_mem)
+        self.assertEqual(new_mem, initial_mem)
+        self.assertEqual(state.get_vgpr(3), initial_mem)
+        self.assertEqual(state.get_vgpr(1), initial_mem) # v1 preserved
+
+    def test_quadruple_aliasing_all_v0(self) -> None:
+        # ds_cmpst_rtn_b32 v0, v0, v0, v0
+        state = ScalarState(lds_size_dwords=1024)
+        val = 0x40  # Address, cmp_val, and new_val are all 0x40
+
+        state.lds.write_dword(val, val) # Matches val
+        state.set_vgpr(0, val)
+
+        instr = DSCmpstRtnInstruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(0, RegType.VGPR),
+            vdata0=RegisterOperand(0, RegType.VGPR),
+            vdata1=RegisterOperand(0, RegType.VGPR),
+        )
+
+        old_val, new_mem, swapped = self.interp.execute(instr, state)
+        self.assertTrue(swapped)
+        self.assertEqual(old_val, val)
+        self.assertEqual(new_mem, val)
+        self.assertEqual(state.get_vgpr(0), val)
+        self.assertEqual(state.lds.read_dword(val), val)
+
+    def test_unreferenced_registers_preservation(self) -> None:
+        state = ScalarState(lds_size_dwords=1024)
+        state.set_vgpr(1, 0x100) # vaddr
+        state.set_vgpr(2, 0x10)  # vdata0
+        state.set_vgpr(3, 0x20)  # vdata1
+
+        for r in range(4, 25):
+            state.set_vgpr(r, 0x5000 + r)
+        for s in range(12):
+            state.set_sgpr(s, 0x6000 + s)
+
+        instr = DSCmpstRtnInstruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+            vdata1=RegisterOperand(3, RegType.VGPR),
+        )
+        self.interp.execute(instr, state)
+
+        for r in range(4, 25):
+            self.assertEqual(state.get_vgpr(r), 0x5000 + r)
+        for s in range(12):
+            self.assertEqual(state.get_sgpr(s), 0x6000 + s)
+
+    def test_simd_multi_lane_aliasing(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFFFFFF, lds_size_dwords=1024)
+        simd_interp = SIMDInterpreter()
+
+        # Each lane has vdst == vaddr: v0 is addr and dst
+        for lane in range(32):
+            addr = lane * 4
+            state.lds.write_dword(addr, 0x100 + lane)
+            state.set_lane_vgpr(lane, 0, addr)       # v0 = addr and dst
+            state.set_lane_vgpr(lane, 1, 0x100 + lane) # v1 = cmp_val (match)
+            state.set_lane_vgpr(lane, 2, 0x700 + lane) # v2 = new_val
+
+        instr = DSCmpstRtnInstruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(0, RegType.VGPR),
+            vdata0=RegisterOperand(1, RegType.VGPR),
+            vdata1=RegisterOperand(2, RegType.VGPR),
+        )
+
+        results = simd_interp.execute(instr, state)
+
+        for lane in range(32):
+            self.assertEqual(results[lane], 0x100 + lane)
+            self.assertEqual(state.get_lane_vgpr(lane, 0), 0x100 + lane) # Received old_val
+            self.assertEqual(state.get_lane_vgpr(lane, 1), 0x100 + lane) # Preserved
+            self.assertEqual(state.get_lane_vgpr(lane, 2), 0x700 + lane) # Preserved
+            self.assertEqual(state.lds.read_dword(lane * 4), 0x700 + lane)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
