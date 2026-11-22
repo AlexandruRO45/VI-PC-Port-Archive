@@ -3,6 +3,7 @@
 Uses tools/glb_writer.py to process entire directories of OBJ models
 with multi-core parallelism and progress reporting. Can optionally link
 and embed textures (.png or .dds) directly into glTF materials.
+Inputs that would share an output path are rejected before any models are written.
 
 Usage:
     python -I tools/batch_glb.py <in_dir> <out_dir> [--jobs N] [--up z|y] [--textures <dir>]
@@ -18,6 +19,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import glb_writer
 import dds_png
+from report_paths import path_key
 
 
 def _build_texture_index(texture_dir: str | None) -> dict[str, str]:
@@ -117,10 +119,22 @@ def batch_convert(
     if not os.path.isdir(in_dir):
         raise ValueError(f"Input directory does not exist: {in_dir}")
 
-    os.makedirs(out_dir, exist_ok=True)
-    obj_files = [
+    obj_files = sorted(
         f for f in os.listdir(in_dir) if f.lower().endswith(".obj") and os.path.isfile(os.path.join(in_dir, f))
-    ]
+    )
+
+    # Extension case does not distinguish destinations: model.obj and model.OBJ both write model.glb.
+    # Check the entire batch before workers can replace an earlier result or an existing export.
+    output_sources: dict[str, str] = {}
+    for name in obj_files:
+        out_path = os.path.join(out_dir, os.path.splitext(name)[0] + ".glb")
+        key = path_key(out_path)
+        if key in output_sources:
+            raise ValueError(f"Output collision: {output_sources[key]!r} and {name!r} both write {out_path!r}; "
+                             "rename one input before converting")
+        output_sources[key] = name
+
+    os.makedirs(out_dir, exist_ok=True)
 
     tex_index = _build_texture_index(texture_dir)
     tex_cache: dict[str, bytes] = {}

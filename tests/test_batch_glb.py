@@ -5,12 +5,15 @@ Usage:
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import struct
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
@@ -156,6 +159,97 @@ class TestBatchGlb(unittest.TestCase):
             with open(glb_file, "rb") as f:
                 content = f.read()
             self.assertIn(b"image/png", content)
+
+
+class TestBatchGlbOutputCollisions(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = temporary.name
+        self.in_dir = os.path.join(root, "input")
+        self.out_dir = os.path.join(root, "output")
+        os.mkdir(self.in_dir)
+        os.mkdir(self.out_dir)
+        self.inputs = [os.path.join(self.in_dir, name) for name in ("model.obj", "model.OBJ")]
+        self.output = os.path.join(self.out_dir, "model.glb")
+        self.previous = b"previous model output\x00\xff"
+        with open(self.output, "wb") as output:
+            output.write(self.previous)
+        self.write_obj(self.inputs[0], 1)
+
+    @staticmethod
+    def write_obj(path: str, extent: int) -> None:
+        with open(path, "w", encoding="utf-8", newline="\n") as obj:
+            obj.write(f"v 0 0 0\nv {extent} 0 0\nv 0 {extent} 0\nf 1 2 3\n")
+
+    @contextlib.contextmanager
+    def colliding_listing(self):
+        # A case-sensitive source can contain both names, even when the test host cannot.
+        isfile = os.path.isfile
+        with mock.patch.object(batch_glb.os, "listdir", return_value=["model.obj", "model.OBJ"]), \
+             mock.patch.object(batch_glb.os.path, "isfile",
+                               side_effect=lambda path: path in self.inputs or isfile(path)):
+            yield
+
+    def assert_previous_output(self) -> None:
+        with open(self.output, "rb") as output:
+            self.assertEqual(output.read(), self.previous)
+
+    def test_rejects_collision_before_texture_loading_or_workers(self) -> None:
+        with self.colliding_listing(), \
+             mock.patch.object(batch_glb, "_build_texture_index") as textures, \
+             mock.patch.object(batch_glb.concurrent.futures, "ThreadPoolExecutor") as executor, \
+             mock.patch.object(batch_glb, "convert_single") as convert:
+            with self.assertRaises(ValueError) as error:
+                batch_glb.batch_convert(self.in_dir, self.out_dir, jobs=2, texture_dir="textures")
+            for name in ("model.obj", "model.OBJ", "model.glb"):
+                self.assertIn(name, str(error.exception))
+            textures.assert_not_called()
+            executor.assert_not_called()
+            convert.assert_not_called()
+        self.assert_previous_output()
+
+    def test_cli_reports_collision_once_without_a_success_summary(self) -> None:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with self.colliding_listing(), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr), \
+             mock.patch.object(batch_glb, "convert_single", side_effect=lambda task: (True, task[0], "")) as convert:
+            result = batch_glb.main([self.in_dir, self.out_dir, "--jobs", "2"])
+        self.assertEqual(result, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        lines = stderr.getvalue().splitlines()
+        self.assertEqual(len(lines), 1, stderr.getvalue())
+        self.assertTrue(lines[0].startswith("ERROR: "), lines[0])
+        for name in ("model.obj", "model.OBJ", "model.glb"):
+            self.assertIn(name, lines[0])
+        convert.assert_not_called()
+        self.assert_previous_output()
+
+    def test_cli_rejects_two_distinct_files_with_the_same_output(self) -> None:
+        if os.path.exists(self.inputs[1]):
+            self.skipTest("source volume folds case")
+        self.write_obj(self.inputs[1], 2)
+        result = subprocess.run(
+            [sys.executable, "-I", os.path.join(TOOLS, "batch_glb.py"),
+             self.in_dir, self.out_dir, "--jobs", "2"],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+        self.assertTrue(result.stderr.startswith("ERROR: "), result.stderr)
+        for name in ("model.obj", "model.OBJ", "model.glb"):
+            self.assertIn(name, result.stderr)
+        self.assert_previous_output()
+
+    def test_distinct_stems_with_mixed_case_extensions_export_both_models(self) -> None:
+        self.write_obj(os.path.join(self.in_dir, "other.OBJ"), 2)
+        stats = batch_glb.batch_convert(self.in_dir, self.out_dir, jobs=2)
+        self.assertEqual(stats, {"total": 2, "succeeded": 2, "failed": 0})
+        for name in ("model.glb", "other.glb"):
+            with open(os.path.join(self.out_dir, name), "rb") as output:
+                contents = output.read()
+            magic, version, length = struct.unpack_from("<4sII", contents)
+            self.assertEqual((magic, version, length), (b"glTF", 2, len(contents)))
 
 
 if __name__ == "__main__":
