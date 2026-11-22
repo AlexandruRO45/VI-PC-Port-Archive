@@ -6962,8 +6962,9 @@ class Gen:
                     "image_sample_c_cl_o", "image_sample_c_b_cl_o") or                 op in ("image_sample", "image_sample_lz", "image_sample_l", "image_sample_b", "image_sample_c_lz",
                     "image_sample_c_l", "image_sample_c", "image_sample_c_b", "image_sample_cl", "image_sample_b_cl", "image_sample_c_cl",
                     "image_sample_c_b_cl",
-                    "image_sample_d", "image_sample_d_cl", "image_load", "image_gather4_lz", "image_gather4_l",
-                    "image_gather4_lz_o", "image_gather4_l_o") or op in self.GATHER4_LOD_OPS:
+                    "image_sample_d", "image_sample_d_cl", "image_load", "image_gather4", "image_gather4_o",
+                    "image_gather4_lz", "image_gather4_l", "image_gather4_lz_o", "image_gather4_l_o",
+                    "image_gather4_c", "image_gather4_c_o", "image_gather4_c_lz", "image_gather4_c_lz_o") or op in self.GATHER4_LOD_OPS:
             self.image_op(op, a, mods)
         elif op in ("v_sin_f16", "v_cos_f16"):
             u = self.src_h(a[1])
@@ -12564,7 +12565,8 @@ class Gen:
                 self.emit(f"{sampled} = OpSampledImage %{sampler_type} {image} {smp}")
                 return sampled
 
-            no_sampled_img = op in ("image_gather4_lz", "image_gather4_lz_o", "image_gather4_l", "image_gather4_l_o",
+            no_sampled_img = op in ("image_gather4", "image_gather4_o",
+                                    "image_gather4_lz", "image_gather4_lz_o", "image_gather4_l", "image_gather4_l_o",
                                     "image_gather4_c_l", "image_gather4_c_l_o") or (
                 op in ("image_gather4_cl", "image_gather4_cl_o", "image_gather4_c_cl", "image_gather4_c_cl_o")
                 and self.stage != "ps"
@@ -12576,7 +12578,8 @@ class Gen:
                 self.emit_gather4_lod(op, a, mods, dim, img, img_idx, si, coords, f, ncoord, is3d, dmask, vdata, a16, d16)
                 return
             goff = None
-            if op in ("image_gather4_lz_o", "image_gather4_l_o"):
+            if op in ("image_gather4_o", "image_gather4_lz_o", "image_gather4_l_o",
+                      "image_gather4_c_o", "image_gather4_c_lz_o"):
                 # first address dword: signed 6-bit texel offsets x [5:0], y [13:8]
                 if a16 and ("tfe" in mods or "lwe" in mods):
                     raise Unsupported(op + " a16 status")
@@ -12687,10 +12690,10 @@ class Gen:
                                       0xf, vdata, d16, gather_mip)
                 self.uses_fhalf = True
                 return
-            if op == "image_gather4_lz":
-                # Gather the 2x2 footprint of one channel (dmask picks it) at mip 0 -> 4 results.
+            if op in ("image_gather4", "image_gather4_lz"):
+                # Gather the 2x2 footprint of one channel (dmask picks it) -> 4 results.
                 if bin(dmask).count("1") != 1 or ncoord not in (2, 3) or is3d or len(f) < ncoord:
-                    raise Unsupported("image_gather4_lz form")
+                    raise Unsupported(op + " form")
                 if dim == "dim:SQ_RSRC_IMG_CUBE":
                     f = self.cube_coords(f)
                 uv = self.tmp()
@@ -12714,6 +12717,28 @@ class Gen:
                                           0xf, vdata, d16, gather)
                     return
                 res = gather(img, 0, "%v4float")
+                comps = []
+                for c in range(4):
+                    comp = self.tmp()
+                    self.emit(f"{comp} = OpCompositeExtract %float {res} {c}")
+                    comps.append(comp)
+                self.store_gather_taps(vdata["r"], comps, d16)
+                return
+            if op in ("image_gather4_c", "image_gather4_c_lz"):
+                # Depth-compare gather: single-channel comparison against z-compare reference -> 4 results.
+                if bin(dmask).count("1") != 1 or ncoord not in (2, 3) or is3d or len(f) < ncoord + 1:
+                    raise Unsupported(op + " form")
+                ref, fc = f[0], f[1:]
+                if dim == "dim:SQ_RSRC_IMG_CUBE":
+                    fc = self.cube_coords(fc)
+                uv = self.tmp()
+                if ncoord == 3:
+                    self.emit(f"{uv} = OpCompositeConstruct %v3float {fc[0]} {fc[1]} {fc[2]}")
+                else:
+                    self.emit(f"{uv} = OpCompositeConstruct %v2float {fc[0]} {fc[1]}")
+                offset = f" Offset {goff}" if goff is not None else ""
+                res = self.tmp()
+                self.emit(f"{res} = OpImageDrefGather %v4float {si} {uv} {ref}{offset}")
                 comps = []
                 for c in range(4):
                     comp = self.tmp()
