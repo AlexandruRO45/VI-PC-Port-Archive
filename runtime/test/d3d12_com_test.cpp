@@ -190,7 +190,7 @@ int main(int argc, char** argv) {
                                                          IID_PPV_ARGS(&invalid_bundle.p))));
         const FLOAT forbidden_clear[4] = {0, 0, 0, 1};
         invalid_bundle->ClearRenderTargetView(rtv_handle, forbidden_clear, 0, nullptr);
-        EXPECT(invalid_bundle->Close() == E_INVALIDARG);
+        EXPECT(invalid_bundle->Close() == E_FAIL);  // illegal call in a bundle: the host's code (D3D-377)
         EXPECT(SUCCEEDED(rt::d3d12::create_command_allocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
                                                               IID_PPV_ARGS(&invalid_caller_allocator.p))));
         EXPECT(SUCCEEDED(rt::d3d12::create_command_list(D3D12_COMMAND_LIST_TYPE_DIRECT, invalid_caller_allocator.p,
@@ -248,7 +248,7 @@ int main(int argc, char** argv) {
                                                       IID_PPV_ARGS(&test_bundle.p))))
                 return false;
             record(test_bundle.p);
-            return test_bundle->Close() == E_INVALIDARG;
+            return test_bundle->Close() == E_FAIL;  // D3D-377: illegal in a bundle, not an invalid argument
         };
         EXPECT(invalid_bundle_call([&](auto* b) { b->ResourceBarrier(1, &transition); }));
         EXPECT(invalid_bundle_call([&](auto* b) { b->Barrier(1, &group); }));

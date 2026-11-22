@@ -188,13 +188,17 @@ public:
     D3D12_COMMAND_LIST_TYPE type() const { return type_; }
 
     // E_INVALIDARG when a call during recording was invalid, or a query was begun and not ended, as D3D12's Close
-    // reports it.
+    // reports it. A call that is illegal in a bundle fails that bundle's Close with E_FAIL instead (D3D-377,
+    // measured on the PC runtime without the debug layer by d3d12_bundle_forbidden_test); either way the bundle is
+    // refused by ExecuteBundle.
     HRESULT STDMETHODCALLTYPE Close() override {
         constexpr auto method = "ID3D12GraphicsCommandList::Close";
         if (list_.queries_open()) invalid_ = true;
         if (!list_.close()) return d3d12_trace::result(method, E_FAIL);
         stop_recording();
-        return d3d12_trace::result(method, invalid_ ? E_INVALIDARG : S_OK);
+        HRESULT result = invalid_ ? E_INVALIDARG : S_OK;
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE && bundle_error_) result = E_FAIL;
+        return d3d12_trace::result(method, result);
     }
 
     HRESULT STDMETHODCALLTYPE Reset(ID3D12CommandAllocator* allocator, ID3D12PipelineState* state) override {
@@ -208,6 +212,7 @@ public:
         if (!list_.reset()) return d3d12_trace::result(method, E_FAIL);  // D3D12 resets only closed lists
         record_into(command_allocator);
         invalid_ = false;
+        bundle_error_ = false;
         calls_.clear();
         release_held();  // what the old recording used: it was replayed at ExecuteCommandLists
         reset_state(state);  // Reset returns every list state to its default
@@ -310,7 +315,7 @@ public:
 
     // ClearState returns every piece of list state to its default, as Reset does (stencil references included).
     void STDMETHODCALLTYPE ClearState(ID3D12PipelineState* state) override {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check_bundle(false);
         reset_state(state);
     }
 
@@ -341,7 +346,7 @@ public:
 
     // A count of 0 unbinds the viewports; draws then rasterize nothing (record_draw).
     void STDMETHODCALLTYPE RSSetViewports(UINT count, const D3D12_VIEWPORT* viewports) override {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check_bundle(false);
         if (!count) {
             viewport_ = {};
             return;
@@ -353,7 +358,7 @@ public:
     }
 
     void STDMETHODCALLTYPE RSSetScissorRects(UINT count, const D3D12_RECT* rects) override {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check_bundle(false);
         if (!count || !rects) return;
         if (count > 1) stub("ID3D12GraphicsCommandList::RSSetScissorRects (more than one rectangle; the first is used)");
         scissor_ = {rects[0].left, rects[0].top, rects[0].right, rects[0].bottom};
@@ -362,7 +367,7 @@ public:
     // D3D12 reads render-target and depth descriptors here, so their views are copied now.
     void STDMETHODCALLTYPE OMSetRenderTargets(UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets, BOOL single_range,
                                               const D3D12_CPU_DESCRIPTOR_HANDLE* depth) override {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check_bundle(false);
         if (count > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) return check(false);
         render_targets_.assign(count, {});
         for (UINT i = 0; i < count && targets; ++i) {
@@ -404,7 +409,7 @@ public:
 
     void STDMETHODCALLTYPE ResourceBarrier(UINT count, const D3D12_RESOURCE_BARRIER* barriers) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::ResourceBarrier");
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check_bundle(false);
         for (UINT i = 0; i < count; ++i) {
             const auto& b = barriers[i];
             switch (b.Type) {
@@ -429,7 +434,7 @@ public:
 
     void STDMETHODCALLTYPE Barrier(UINT32 groups, const D3D12_BARRIER_GROUP* group) override {
         d3d12_trace::record("ID3D12GraphicsCommandList7::Barrier");
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check_bundle(false);
         for (UINT32 g = 0; g < groups; ++g) {
             for (UINT32 i = 0; i < group[g].NumBarriers; ++i) {
                 switch (group[g].Type) {
@@ -466,7 +471,7 @@ public:
     void STDMETHODCALLTYPE CopyBufferRegion(ID3D12Resource* dst, UINT64 dst_offset, ID3D12Resource* src,
                                             UINT64 src_offset, UINT64 bytes) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::CopyBufferRegion");
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check_bundle(false);
         check(list_.copy_buffer({resource_id(dst), dst_offset, resource_id(src), src_offset, bytes}));
     }
 
@@ -492,7 +497,7 @@ public:
     void STDMETHODCALLTYPE CopyTextureRegion(const D3D12_TEXTURE_COPY_LOCATION* dst, UINT x, UINT y, UINT z,
                                              const D3D12_TEXTURE_COPY_LOCATION* src, const D3D12_BOX* box) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::CopyTextureRegion");
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check_bundle(false);
         if (!dst || !src) return check(false);
         leonida::CopyTexture copy{location(*dst), x, y, z, location(*src), box != nullptr, {}};
         if (box) copy.box = {box->left, box->top, box->front, box->right, box->bottom, box->back};
@@ -501,7 +506,7 @@ public:
 
     void STDMETHODCALLTYPE CopyResource(ID3D12Resource* dst, ID3D12Resource* src) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::CopyResource");
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check_bundle(false);
         check(list_.copy_resource({resource_id(dst), resource_id(src)}));
     }
 
@@ -509,7 +514,7 @@ public:
     void STDMETHODCALLTYPE ResolveSubresource(ID3D12Resource* dst, UINT dst_subresource, ID3D12Resource* src,
                                               UINT src_subresource, DXGI_FORMAT format) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::ResolveSubresource");
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check_bundle(false);
         const auto integer_color = [](ID3D12Resource* resource) {
             if (!resource) return false;
             const auto desc = resource->GetDesc();
@@ -527,6 +532,7 @@ public:
                                                      ID3D12Resource* src, UINT src_subresource, D3D12_RECT* rect,
                                                      DXGI_FORMAT format, D3D12_RESOLVE_MODE mode) override {
         d3d12_trace::record("ID3D12GraphicsCommandList1::ResolveSubresourceRegion");
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check_bundle(false);
         if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
         leonida::ResolveRegion region{x, y, std::nullopt};
         if (mode != D3D12_RESOLVE_MODE_AVERAGE || !color_resolve_format_matches(format, dst, src)) {
@@ -547,14 +553,15 @@ public:
     // A null buffer turns predication off (docs/d3d12_vulkan.md section 4.7). Bundles may not set it.
     void STDMETHODCALLTYPE SetPredication(ID3D12Resource* buffer, UINT64 offset, D3D12_PREDICATION_OP op) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::SetPredication");
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || type_ == D3D12_COMMAND_LIST_TYPE_COPY) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check_bundle(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_COPY) return check(false);
         check(list_.set_predication({resource_id(buffer), offset, u(op)}));
     }
 
     void STDMETHODCALLTYPE ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE view, const FLOAT color[4], UINT count,
                                                  const D3D12_RECT* rects) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::ClearRenderTargetView");
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check_bundle(false);
         if (!view.ptr || !color) return check(false);
         check(list_.clear_render_target(*reinterpret_cast<const leonida::TargetView*>(view.ptr),
                                         {color[0], color[1], color[2], color[3]}, to_rects(count, rects)));
@@ -564,7 +571,7 @@ public:
                                                  FLOAT depth, UINT8 stencil, UINT count,
                                                  const D3D12_RECT* rects) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::ClearDepthStencilView");
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check_bundle(false);
         if (!view.ptr) return check(false);
         check(list_.clear_depth_stencil(*reinterpret_cast<const leonida::TargetView*>(view.ptr), u(flags), depth,
                                         stencil, to_rects(count, rects)));
@@ -572,7 +579,7 @@ public:
 
     // A null region discards the whole resource. Not allowed in a bundle.
     void STDMETHODCALLTYPE DiscardResource(ID3D12Resource* resource, const D3D12_DISCARD_REGION* region) override {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check_bundle(false);
         if (!region) return check(list_.discard({resource_id(resource), 0, 0, false, true}));
         if (region->NumRects && !region->pRects) return check(false);
         check(list_.discard({resource_id(resource), region->FirstSubresource, region->NumSubresources,
@@ -676,7 +683,7 @@ public:
     void STDMETHODCALLTYPE ExecuteIndirect(ID3D12CommandSignature* signature, UINT max_command_count,
                                            ID3D12Resource* argument_buffer, UINT64 argument_buffer_offset,
                                            ID3D12Resource* count_buffer, UINT64 count_buffer_offset) override {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check_bundle(false);
         leonida::IndirectKind kind = leonida::IndirectKind::draw;
         UINT stride = 0;
         if (!command_signature_info(signature, kind, stride) || !argument_buffer)
@@ -700,7 +707,8 @@ public:
     void STDMETHODCALLTYPE BuildRaytracingAccelerationStructure(
         const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* desc, UINT postbuild_count,
         const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* postbuild) override {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || !desc) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check_bundle(false);
+        if (!desc) return check(false);
         const auto& in = desc->Inputs;
         leonida::BuildAccelerationStructure cmd{};
         cmd.is_tlas = (in.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL);
@@ -772,7 +780,8 @@ public:
     void STDMETHODCALLTYPE EmitRaytracingAccelerationStructurePostbuildInfo(
         const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* desc, UINT count,
         const D3D12_GPU_VIRTUAL_ADDRESS* sources) override {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || !desc || !count || !sources) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check_bundle(false);
+        if (!desc || !count || !sources) return check(false);
         leonida::AccelerationStructurePostbuild info{};
         info.dest_va = desc->DestBuffer;
         info.type = static_cast<std::uint32_t>(desc->InfoType);
@@ -783,7 +792,7 @@ public:
     void STDMETHODCALLTYPE CopyRaytracingAccelerationStructure(D3D12_GPU_VIRTUAL_ADDRESS dest,
                                                                D3D12_GPU_VIRTUAL_ADDRESS source,
                                                                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode) override {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check_bundle(false);
         check(list_.copy_acceleration_structure({dest, source, static_cast<std::uint32_t>(mode)}));
     }
 
@@ -815,6 +824,15 @@ private:
         if (!ok) invalid_ = true;
     }
 
+    // A call not legal in a bundle. It invalidates the bundle like any other refused call, but Close reports the
+    // host's E_FAIL for it, not E_INVALIDARG.
+    void check_bundle(bool ok) {
+        if (!ok) {
+            invalid_ = true;
+            bundle_error_ = true;
+        }
+    }
+
     void stop_recording() {
         if (!allocator_) return;
         if (allocator_->recording() == this) allocator_->set_recording(nullptr);
@@ -825,7 +843,8 @@ private:
     void atomic_copy(std::uint32_t bytes, ID3D12Resource* dst, UINT64 dst_offset, ID3D12Resource* src,
                      UINT64 src_offset, UINT count, ID3D12Resource* const* resources,
                      const D3D12_SUBRESOURCE_RANGE_UINT64* ranges) {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || (count && (!resources || !ranges))) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check_bundle(false);
+        if (count && (!resources || !ranges)) return check(false);
         leonida::AtomicCopyBuffer copy{resource_id(dst), dst_offset, resource_id(src), src_offset, bytes, {}};
         for (UINT i = 0; i < count; ++i)
             copy.dependencies.push_back(
@@ -835,7 +854,7 @@ private:
 
     void clear_unordered_access(D3D12_CPU_DESCRIPTOR_HANDLE view, ID3D12Resource* resource, bool is_float,
                                 const std::array<std::uint32_t, 4>& values, UINT count, const D3D12_RECT* rects) {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);  // no clear is allowed in a bundle
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check_bundle(false);  // no clear is allowed in a bundle
         leonida::UavView target{};
         if (!view.ptr || !resource || !unordered_access_view(view, resource, target)) return check(false);
         check(list_.clear_unordered_access(target, is_float, values, to_rects(count, rects)));
@@ -973,6 +992,7 @@ private:
     CommandAllocator* allocator_ = nullptr;  // referenced while the list is open
     leonida::CommandList list_;
     bool invalid_ = false;
+    bool bundle_error_ = false;
     UINT front_stencil_ref_ = 0;
     UINT back_stencil_ref_ = 0;
     RootState compute_;

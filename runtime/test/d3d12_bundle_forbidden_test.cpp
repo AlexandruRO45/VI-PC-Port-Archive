@@ -6,7 +6,7 @@
 // ClearState and the calls below as not allowed in a bundle; the table is what the PC runtime does without the debug
 // layer (every one of them fails the bundle's Close with E_FAIL, on both adapters, and executing such a bundle
 // crashes the PC runtime, so the parent is only closed for bundles that closed). The layer is held to the same
-// verdict for every call where both host adapters agree; its code for a refused bundle is E_INVALIDARG.
+// verdict and the same code (E_FAIL) for every call where both host adapters agree (D3D-377).
 // Both host adapters always run (LEONIDA_HOST_ADAPTER is not read), except under Wine, where the host is skipped.
 // No game data.
 #include "vk_test_device.h"
@@ -269,7 +269,7 @@ int main() {
             continue;
         }
         ++compared;
-        // The same verdict, not the same code: a refused bundle's Close is E_FAIL on the PC runtime and E_INVALIDARG here.
+        // A refused bundle's Close is E_FAIL here as it is on the PC runtime; E_INVALIDARG stays for bad arguments.
         if (SUCCEEDED(layer.outcomes[i].bundle_close) != SUCCEEDED(a)) {
             std::fprintf(stderr, "FAIL %s: layer bundle Close %s, host %s\n", list[i].name,
                          text(layer.outcomes[i].bundle_close).c_str(), text(a).c_str());
