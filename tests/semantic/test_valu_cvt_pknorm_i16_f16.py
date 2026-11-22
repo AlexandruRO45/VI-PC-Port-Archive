@@ -37,6 +37,8 @@ RDNA2 VALU Specification Rules:
 Standard library Python only (python -I, struct, math, unittest). Zero game data.
 """
 
+import dataclasses
+import enum
 import math
 import struct
 import unittest
@@ -298,6 +300,182 @@ class TestValuCvtPknormI16F16Oracle(unittest.TestCase):
         # abs then neg (-|x|) gives -1.0 -> 0x8001
         res_both = oracle_v_cvt_pknorm_i16_f16(POS_ONE_F16, POS_ZERO_F16, abs0=True, neg0=True)
         self.assertEqual(extract_half(res_both, high_half=False), 0x8001)
+
+
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(enum.Enum):
+    VGPR = "vgpr"
+    SGPR = "sgpr"
+
+
+@dataclasses.dataclass(frozen=True)
+class Reg:
+    """Represents an architectural 32-bit register (VGPR or SGPR)."""
+    index: int
+    reg_type: RegType
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"Register index {self.index} out of range [0, 255]")
+
+    @property
+    def name(self) -> str:
+        prefix = "v" if self.reg_type == RegType.VGPR else "s"
+        return f"{prefix}{self.index}"
+
+
+@dataclasses.dataclass(frozen=True)
+class Literal16:
+    """Represents an immediate 16-bit float or integer constant."""
+    bits: int
+
+    @classmethod
+    def from_f16(cls, val: float) -> Literal16:
+        return cls(f16_to_bits(val))
+
+    @property
+    def name(self) -> str:
+        return f"0x{self.bits & MASK16:04X}"
+
+
+@dataclasses.dataclass(frozen=True)
+class VOP3POperand:
+    """Typed operand for packed 16-bit operations with optional modifiers."""
+    source: Reg | Literal16
+    abs_mod: bool = False
+    neg_mod: bool = False
+
+    def disassemble(self) -> str:
+        s = self.source.name
+        if self.abs_mod:
+            s = f"|{s}|"
+        if self.neg_mod:
+            s = f"-{s}"
+        return s
+
+
+class Opcode(enum.Enum):
+    V_CVT_PKNORM_I16_F16 = "v_cvt_pknorm_i16_f16"
+
+
+@dataclasses.dataclass(frozen=True)
+class VCvtPknormI16F16Instruction:
+    """Symbolic AST node for RDNA2 v_cvt_pknorm_i16_f16."""
+    dst: Reg
+    src0: VOP3POperand
+    src1: VOP3POperand
+    op_sel: tuple[int, int] = (0, 0)
+    clamp: bool = False
+    opcode: Opcode = Opcode.V_CVT_PKNORM_I16_F16
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination of VALU instruction must be VGPR, got {self.dst.reg_type}")
+        if self.clamp:
+            raise ValueError("v_cvt_pknorm_i16_f16 destination cannot have clamp modifier")
+        if self.op_sel[0] not in (0, 1) or self.op_sel[1] not in (0, 1):
+            raise ValueError(f"op_sel values must be 0 or 1, got {self.op_sel}")
+
+    def disassemble(self) -> str:
+        s = f"{self.opcode.value} {self.dst.name}, {self.src0.disassemble()}, {self.src1.disassemble()}"
+        if self.op_sel != (0, 0):
+            s += f" op_sel:[{self.op_sel[0]},{self.op_sel[1]},0,0]"
+        return s
+
+
+@dataclasses.dataclass
+class Program:
+    """Represents an ordered sequence of instructions."""
+    instructions: list[VCvtPknormI16F16Instruction] = dataclasses.field(default_factory=list)
+
+    def append(self, instr: VCvtPknormI16F16Instruction) -> None:
+        self.instructions.append(instr)
+
+    def disassemble(self) -> str:
+        return "\n".join(instr.disassemble() for instr in self.instructions)
+
+
+class TestValuCvtPknormI16F16AST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_register_creation_and_naming(self) -> None:
+        v0 = Reg(0, RegType.VGPR)
+        v255 = Reg(255, RegType.VGPR)
+        s12 = Reg(12, RegType.SGPR)
+        self.assertEqual(v0.name, "v0")
+        self.assertEqual(v255.name, "v255")
+        self.assertEqual(s12.name, "s12")
+
+    def test_register_out_of_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            Reg(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(300, RegType.SGPR)
+
+    def test_literal_operand(self) -> None:
+        lit = Literal16(0x3C00)
+        self.assertEqual(lit.name, "0x3C00")
+        lit_float = Literal16.from_f16(1.0)
+        self.assertEqual(lit_float.bits, POS_ONE_F16)
+        self.assertEqual(lit_float.name, "0x3C00")
+
+    def test_operand_modifiers_disassembly(self) -> None:
+        v1 = Reg(1, RegType.VGPR)
+        op_plain = VOP3POperand(v1)
+        self.assertEqual(op_plain.disassemble(), "v1")
+
+        op_abs = VOP3POperand(v1, abs_mod=True)
+        self.assertEqual(op_abs.disassemble(), "|v1|")
+
+        op_neg = VOP3POperand(v1, neg_mod=True)
+        self.assertEqual(op_neg.disassemble(), "-v1")
+
+        op_both = VOP3POperand(v1, abs_mod=True, neg_mod=True)
+        self.assertEqual(op_both.disassemble(), "-|v1|")
+
+    def test_instruction_disassembly(self) -> None:
+        dst = Reg(0, RegType.VGPR)
+        src0 = VOP3POperand(Reg(1, RegType.VGPR))
+        src1 = VOP3POperand(Reg(2, RegType.VGPR), neg_mod=True)
+
+        instr_default = VCvtPknormI16F16Instruction(dst=dst, src0=src0, src1=src1)
+        self.assertEqual(instr_default.disassemble(), "v_cvt_pknorm_i16_f16 v0, v1, -v2")
+
+        instr_opsel = VCvtPknormI16F16Instruction(dst=dst, src0=src0, src1=src1, op_sel=(1, 0))
+        self.assertEqual(instr_opsel.disassemble(), "v_cvt_pknorm_i16_f16 v0, v1, -v2 op_sel:[1,0,0,0]")
+
+    def test_instruction_validation(self) -> None:
+        # Destination must be VGPR
+        dst_sgpr = Reg(0, RegType.SGPR)
+        src = VOP3POperand(Reg(1, RegType.VGPR))
+        with self.assertRaises(TypeError):
+            VCvtPknormI16F16Instruction(dst=dst_sgpr, src0=src, src1=src)
+
+        # Destination clamp modifier rejected
+        with self.assertRaises(ValueError):
+            VCvtPknormI16F16Instruction(dst=Reg(0, RegType.VGPR), src0=src, src1=src, clamp=True)
+
+        # op_sel must be in {0, 1}
+        with self.assertRaises(ValueError):
+            VCvtPknormI16F16Instruction(dst=Reg(0, RegType.VGPR), src0=src, src1=src, op_sel=(2, 0))
+
+    def test_program_container(self) -> None:
+        prog = Program()
+        v0 = Reg(0, RegType.VGPR)
+        v1 = Reg(1, RegType.VGPR)
+        v2 = Reg(2, RegType.VGPR)
+        prog.append(VCvtPknormI16F16Instruction(v0, VOP3POperand(v1), VOP3POperand(v2)))
+        prog.append(VCvtPknormI16F16Instruction(v1, VOP3POperand(v0, abs_mod=True), VOP3POperand(v2, neg_mod=True), op_sel=(1, 1)))
+        expected_asm = (
+            "v_cvt_pknorm_i16_f16 v0, v1, v2\n"
+            "v_cvt_pknorm_i16_f16 v1, |v0|, -v2 op_sel:[1,1,0,0]"
+        )
+        self.assertEqual(prog.disassemble(), expected_asm)
 
 
 if __name__ == "__main__":
