@@ -816,5 +816,155 @@ class TestValuMqsadU32U8SIMDMultiLane(unittest.TestCase):
                 self.assertEqual(results[lane], [10, 20, 30, 40])
 
 
+class TestValuMqsadU32U8RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_dst_exact_alias_with_src2_accumulator(self) -> None:
+        regs = ScalarRegisterFile()
+        interp = ScalarVALUInterpreter(regs)
+
+        # src0 = 0x0807060504030201, src1 = 0x04030201, src2 = [10, 20, 30, 40]
+        regs.write_operand(Operand.vgpr(2, count=2), [0x04030201, 0x08070605])
+        regs.write_operand(Operand.vgpr(1), 0x04030201)
+        regs.write_operand(Operand.vgpr(4, count=4), [10, 20, 30, 40])
+
+        # dst = v[4:7], src2 = v[4:7] (exact in-place accumulation)
+        instr = VMqsadU32U8Instruction(
+            dst=Operand.vgpr(4, count=4),
+            src0=Operand.vgpr(2, count=2),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(4, count=4),
+        )
+
+        res = interp.step(instr)
+        self.assertEqual(res, [10, 24, 38, 52])
+        self.assertEqual(regs.read_operand(Operand.vgpr(4, count=4)), [10, 24, 38, 52])
+        # src0 and src1 remain uncorrupted
+        self.assertEqual(regs.read_operand(Operand.vgpr(2, count=2)), 0x0807060504030201)
+        self.assertEqual(regs.read_operand(Operand.vgpr(1)), 0x04030201)
+
+    def test_dst_partially_overlaps_src2(self) -> None:
+        regs = ScalarRegisterFile()
+        interp = ScalarVALUInterpreter(regs)
+
+        # dst is v[3:6], src2 is v[4:7]. Overlap on v4, v5, v6.
+        regs.write_operand(Operand.vgpr(0, count=2), [0x04030201, 0x08070605])
+        regs.write_operand(Operand.vgpr(2), 0x04030201)
+        regs.write_operand(Operand.vgpr(4, count=4), [100, 200, 300, 400])
+
+        instr = VMqsadU32U8Instruction(
+            dst=Operand.vgpr(3, count=4),  # writes v3, v4, v5, v6
+            src0=Operand.vgpr(0, count=2),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(4, count=4),  # reads v4, v5, v6, v7
+        )
+
+        res = interp.step(instr)
+        self.assertEqual(res, [100, 204, 308, 412])
+        # v3 gets res[0], v4 gets res[1], v5 gets res[2], v6 gets res[3]
+        self.assertEqual(regs.read_operand(Operand.vgpr(3)), 100)
+        self.assertEqual(regs.read_operand(Operand.vgpr(4)), 204)
+        self.assertEqual(regs.read_operand(Operand.vgpr(5)), 308)
+        self.assertEqual(regs.read_operand(Operand.vgpr(6)), 412)
+        # v7 (not in dst) should still hold original src2[3] = 400
+        self.assertEqual(regs.read_operand(Operand.vgpr(7)), 400)
+
+    def test_dst_aliases_src0_pair(self) -> None:
+        regs = ScalarRegisterFile()
+        interp = ScalarVALUInterpreter(regs)
+
+        # dst = v[0:3], src0 = v[0:1]
+        regs.write_operand(Operand.vgpr(0, count=2), [0x04030201, 0x08070605])
+        regs.write_operand(Operand.vgpr(4), 0x04030201)
+        regs.write_operand(Operand.vgpr(5, count=4), [50, 60, 70, 80])
+
+        instr = VMqsadU32U8Instruction(
+            dst=Operand.vgpr(0, count=4),
+            src0=Operand.vgpr(0, count=2),  # aliased with dst[0:1]
+            src1=Operand.vgpr(4),
+            src2=Operand.vgpr(5, count=4),
+        )
+
+        res = interp.step(instr)
+        self.assertEqual(res, [50, 64, 78, 92])
+        self.assertEqual(regs.read_operand(Operand.vgpr(0, count=4)), [50, 64, 78, 92])
+
+    def test_dst_aliases_src1_single(self) -> None:
+        regs = ScalarRegisterFile()
+        interp = ScalarVALUInterpreter(regs)
+
+        # dst = v[0:3], src1 = v0
+        regs.write_operand(Operand.vgpr(4, count=2), [0x04030201, 0x08070605])
+        regs.write_operand(Operand.vgpr(0), 0x04030201)
+        regs.write_operand(Operand.vgpr(6, count=4), [1, 2, 3, 4])
+
+        instr = VMqsadU32U8Instruction(
+            dst=Operand.vgpr(0, count=4),
+            src0=Operand.vgpr(4, count=2),
+            src1=Operand.vgpr(0),  # aliased with dst[0]
+            src2=Operand.vgpr(6, count=4),
+        )
+
+        res = interp.step(instr)
+        self.assertEqual(res, [1, 6, 11, 16])
+        self.assertEqual(regs.read_operand(Operand.vgpr(0, count=4)), [1, 6, 11, 16])
+
+    def test_dst_aliases_src0_and_src2_simultaneously(self) -> None:
+        regs = ScalarRegisterFile()
+        interp = ScalarVALUInterpreter(regs)
+
+        # dst = v[0:3], src0 = v[0:1], src2 = v[0:3]
+        regs.write_operand(Operand.vgpr(0, count=4), [0x04030201, 0x08070605, 100, 200])
+        regs.write_operand(Operand.vgpr(4), 0x04030201)
+
+        instr = VMqsadU32U8Instruction(
+            dst=Operand.vgpr(0, count=4),
+            src0=Operand.vgpr(0, count=2),
+            src1=Operand.vgpr(4),
+            src2=Operand.vgpr(0, count=4),
+        )
+
+        res = interp.step(instr)
+        expected = [
+            (0x04030201 + 0) & MASK32,
+            (0x08070605 + 4) & MASK32,
+            100 + 8,
+            200 + 12,
+        ]
+        self.assertEqual(res, expected)
+        self.assertEqual(regs.read_operand(Operand.vgpr(0, count=4)), expected)
+
+    def test_simd_aliased_in_place_preservation_with_exec_mask(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0x0000FFFF)  # lanes 0..15 active
+        interp = SIMDInterpreter()
+
+        initial_acc = [1000, 2000, 3000, 4000]
+        for lane in range(32):
+            state.write_lane(Operand.vgpr(0, count=2), lane, [0x04030201, 0x08070605])
+            state.write_lane(Operand.vgpr(2), lane, 0x04030201)
+            state.write_lane(Operand.vgpr(4, count=4), lane, initial_acc)
+
+        instr = VMqsadU32U8Instruction(
+            dst=Operand.vgpr(4, count=4),  # aliased with src2
+            src0=Operand.vgpr(0, count=2),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(4, count=4),
+        )
+
+        interp.step(instr, state)
+
+        for lane in range(32):
+            if lane < 16:
+                self.assertEqual(
+                    state.read_lane(Operand.vgpr(4, count=4), lane),
+                    [1000, 2004, 3008, 4012],
+                )
+            else:
+                self.assertEqual(
+                    state.read_lane(Operand.vgpr(4, count=4), lane),
+                    initial_acc,
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
