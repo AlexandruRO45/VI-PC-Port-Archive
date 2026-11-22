@@ -153,5 +153,20 @@ class HandWrittenCases(unittest.TestCase):
                 self.assertEqual(got, want)
 
 
+    def test_wave64_cndmask_listing_syntax(self):
+        # The corpus prints the VOP3 mask operand in wave32 syntax (`s4` for the pair s[4:5]); lanes 32-63 read s5.
+        body = ["s_mov_b64 exec, -1", "s_mov_b32 s4, 0xff00ff", "s_mov_b32 s5, 0xf0f0f0f0",
+                "v_cndmask_b32_e64 v8, 0, 1, s4", "v_lshlrev_b32 v10, 2, v0",
+                "buffer_store_dword v8, v10, s[0:3], 0 offen"]
+        mem = run(translate("cs_ms_cnd64", 64, lines=body), 64, 64)
+        self.assertEqual([mem.get(4 * i, 0) for i in range(64)], bits(0xFF00FF, 0, 32) + bits(0xF0F0F0F0, 0, 32))
+
+    def test_wave64_cndmask_certified_single_unchanged(self):
+        body = ["s_mov_b64 exec, -1", "v_cmp_eq_u32_e64 s[4:5], v0, 40", "v_cndmask_b32_e64 v8, 0, 1, s4",
+                "v_lshlrev_b32 v10, 2, v0", "buffer_store_dword v8, v10, s[0:3], 0 offen"]
+        mem = run(translate("cs_ms_cnd64c", 64, lines=body), 64, 64)
+        self.assertEqual([mem.get(4 * i, 0) for i in range(64)], [1 if i == 40 else 0 for i in range(64)])
+
+
 if __name__ == "__main__":
     unittest.main()

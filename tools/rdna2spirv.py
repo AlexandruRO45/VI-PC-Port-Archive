@@ -3321,8 +3321,9 @@ class Gen:
             # Plain wave-uniform data: this lane's mask is bit `lane` of the register (of r+1 for lanes 32-63 of a
             # wave64 pair). A register already in per-lane form (all ones or 0) gives the same value this way.
             lane = self.wave_lane()
-            # A single SGPR in wave64 is the low half only: lanes 32-63 read bit lane-32 of r (the shift below uses
-            # lane & 31), the same word as lanes 0-31. The pair form selects r+1 for them.
+            # A single SGPR in wave64 is one 32-lane half: lane L reads bit L & 31 of r, so lanes 32-63 read bit
+            # lane-32 of r (a half-mask operand such as the hi half). The pair form selects r+1 for them. No
+            # corpus caller passes a plain single SGPR here: the VOP3 v_cndmask widens its `sN` to the pair.
             if self.wave64 and a.get("n", 1) == 2:
                 low, w = self.tmp(), self.tmp()
                 hi = self.load_reg("sgpr", a["r"] + 1)
@@ -6876,7 +6877,12 @@ class Gen:
         elif op == "v_cndmask_b32":
             # e32: dst, src0, src1 (vcc) ; e64: dst, src0, src1, sN[:N+1]/vcc
             x, y = self.src_u(a[1]), self.src_u(a[2])
-            c = self.mask_src(a[3]) if len(a) > 3 else self.mask_src({"k": "special", "t": "vcc"})
+            m = a[3] if len(a) > 3 else {"k": "special", "t": "vcc"}
+            if self.wave64 and m["k"] == "sgpr" and m.get("n", 1) == 1 and not self.holds_lane_mask(m):
+                # The corpus listing prints the wave64 mask operand of the VOP3 form in wave32 syntax (`s4`, like
+                # `vcc_lo`), but the hardware reads the 64-bit pair s[4:5]: lanes 32-63 take their bit from r+1.
+                m = dict(m, n=2)
+            c = self.mask_src(m)
             b, r = self.tmp(), self.tmp()
             self.emit(f"{b} = OpINotEqual %bool {c} {self.cu(0)}")
             self.emit(f"{r} = OpSelect %uint {b} {y} {x}")
