@@ -20,7 +20,8 @@
 //     struct's sku field is sized by SKU_ID_SIZE, which no public source gives, so nothing writes into it.
 //
 // ASSUMPTION: the console executable is not available, so which of these slots it calls is unknown until its first
-// boot. The docs' unknown slots and the undocumented IXStoreImpl2 one log once when called, so that boot lists them.
+// boot. The docs' unknown slots and the undocumented IXStoreImpl2 one log once when called, so that boot lists them;
+// the unknown ones answer E_NOTIMPL.
 #include <windows.h>
 
 #include <atomic>
@@ -32,6 +33,7 @@
 #include <iterator>
 #include <mutex>
 #include <set>
+#include <unordered_map>
 
 #include <XAsync.h>
 #include <XAsyncProvider.h>
@@ -70,24 +72,36 @@ constexpr HRESULT kStoreUnreachable = HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHAB
 
 // ---- Handles ----
 
-// Contexts, licenses and product queries are each their own allocation, closed once by their Close function. The
-// magic tells a live handle of the right kind from a closed, foreign or wrong-kind pointer.
-enum class Kind : uint32_t { Context = 0x58435458, License = 0x5843494c, ProductQuery = 0x58515250 };  // "XTCX" ...
-constexpr uint32_t kClosedMagic = 0x44534c43;   // "CLSD"
+// Contexts, licenses and product queries are each their own allocation, closed once by their Close function. A
+// handle is valid while it is in the live map under its kind: it's looked up, never read, so a closed, foreign or
+// wrong-kind pointer is refused without touching its memory, and a double close does nothing. A freed block's address
+// may come back from the heap for a newer handle; a stale handle then names that one, as a stale pointer would.
+enum class Kind : uint32_t { Context, License, ProductQuery };
 struct StoreHandle {
-    uint32_t magic;
+    uint32_t unused;
 };
-std::atomic<long> g_open_handles{0};
+std::mutex g_handles_mutex;
+std::unordered_map<const void*, Kind> g_handles;
 
 StoreHandle* new_handle(Kind kind) {
-    g_open_handles.fetch_add(1);
-    return new StoreHandle{static_cast<uint32_t>(kind)};
+    auto* h = new StoreHandle{};
+    std::lock_guard<std::mutex> lock(g_handles_mutex);
+    g_handles.emplace(h, kind);
+    return h;
 }
-bool valid(const void* h, Kind kind) { return h && static_cast<const StoreHandle*>(h)->magic == static_cast<uint32_t>(kind); }
+bool valid(const void* h, Kind kind) {
+    if (!h) return false;
+    std::lock_guard<std::mutex> lock(g_handles_mutex);
+    auto it = g_handles.find(h);
+    return it != g_handles.end() && it->second == kind;
+}
 void close_handle(void* h, Kind kind) {
-    if (!valid(h, kind)) return;
-    static_cast<StoreHandle*>(h)->magic = kClosedMagic;
-    g_open_handles.fetch_sub(1);
+    {
+        std::lock_guard<std::mutex> lock(g_handles_mutex);
+        auto it = h ? g_handles.find(h) : g_handles.end();
+        if (it == g_handles.end() || it->second != kind) return;   // closed already, not ours, or another kind
+        g_handles.erase(it);
+    }
     delete static_cast<StoreHandle*>(h);
 }
 
@@ -341,8 +355,16 @@ HRESULT STDMETHODCALLTYPE store_package_updates_async(void*, void* ctx, const ch
 
 // ---- Slots without an offline answer ----
 
-// A slot with no public signature (46-48 are the docs' "unknown"; 70 is IXStoreImpl2's undocumented
-// XStoreIsAvailabilityPurchasable): logged once, answers 0 (S_OK / false).
+// A slot with no public signature, logged once. 46-48 (the docs' "unknown") answer E_NOTIMPL, so a caller fails
+// instead of reading outputs nothing wrote. 70, IXStoreImpl2's undocumented XStoreIsAvailabilityPurchasable, is by
+// its name read as a bool, where E_NOTIMPL's low byte (1) would mean true, so it answers 0 (false: nothing can be
+// purchased offline).
+template <int Slot> HRESULT STDMETHODCALLTYPE unknown_slot(void*) {
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XStoreImpl slot %d has no public signature; answering E_NOTIMPL\n", Slot);
+    return E_NOTIMPL;
+}
 template <int Slot> uint64_t STDMETHODCALLTYPE private_slot(void*) {
     static std::atomic<bool> s_logged{false};
     if (!s_logged.exchange(true))
@@ -441,9 +463,9 @@ const void* const kStoreVtable[] = {
     FN(offline_failure<43>),                                                    // 43 XStoreQueryLicenseTokenAsync
     FN(offline_failure<44>),                                                    // 44 ...ResultSize
     FN(offline_failure<45>),                                                    // 45 ...Result
-    FN(private_slot<46>),                                                       // 46 (unknown in the docs)
-    FN(private_slot<47>),                                                       // 47 (unknown in the docs)
-    FN(private_slot<48>),                                                       // 48 (unknown in the docs)
+    FN(unknown_slot<46>),                                                       // 46 (unknown in the docs)
+    FN(unknown_slot<47>),                                                       // 47 (unknown in the docs)
+    FN(unknown_slot<48>),                                                       // 48 (unknown in the docs)
     FN(offline_failure<49>),                                                    // 49 XStoreShowPurchaseUIAsync
     FN(offline_failure<50>),                                                    // 50 ...Result
     FN(offline_failure<51>),                                                    // 51 XStoreShowRateAndReviewUIAsync
@@ -501,6 +523,9 @@ bool xgameruntime_store_query(const GUID& class_id, REFIID interface_id, void** 
 }
 
 // For tests: the store context, license and product-query handles a title holds open.
-long xgameruntime_store_open_handles() { return g_open_handles.load(); }
+long xgameruntime_store_open_handles() {
+    std::lock_guard<std::mutex> lock(g_handles_mutex);
+    return static_cast<long>(g_handles.size());
+}
 
 }  // namespace rt::shims

@@ -214,8 +214,10 @@ The executable's first boot confirms them, or names the slots that differ.
 - **Struct sizes:** the reference names but doesn't give `STORE_SKU_ID_SIZE` and `TRIAL_UNIQUE_ID_MAX_SIZE`. Their
   values (18 and 64) come from `minecraft-linux/xgameruntime-rs` (MIT), whose `XStoreGameLicense` has the
   reference's field order. That makes the license 104 bytes, with `isActive` at 18 and `expirationDate` at 96.
-- **Logged on first use:** the docs' three unknown slots (46-48) and `IXStoreImpl2`'s undocumented
-  `XStoreIsAvailabilityPurchasable` (70).
+- **Logged on first use:** the docs' three unknown slots (46-48), which answer `E_NOTIMPL` so nothing reads outputs
+  they didn't write, and `IXStoreImpl2`'s undocumented `XStoreIsAvailabilityPurchasable` (70, a bool: false).
+- **Validity:** context, license and product-query handles are looked up by kind in a live set, never read, so a
+  closed, foreign or wrong-kind pointer is refused without touching its memory, and a double close does nothing.
 
 `xgameruntime_store_test` calls the served slots with the documented arguments and checks the license bytes at those
 offsets.

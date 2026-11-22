@@ -215,6 +215,15 @@ int main() {
     at<CloseH>(store, 19)(store, associated_products);
     at<CloseH>(store, 4)(store, ctx);
     check(rt::shims::xgameruntime_store_open_handles() == 0, "the Close functions close each of them");
+    at<CloseH>(store, 23)(store, package_license);   // a double close: looked up, not read, so a no-op
+    check(rt::shims::xgameruntime_store_open_handles() == 0 && !at<IsValid>(store, 22)(store, package_license),
+          "a closed license is not valid and closing it again does nothing");
+    using Unknown = HRESULT(STDMETHODCALLTYPE*)(void*, void*, size_t, char*);
+    char probe[8] = "x";
+    check(at<Unknown>(store, 46)(store, nullptr, sizeof(probe), probe) == E_NOTIMPL,
+          "slot 46 (no public signature) answers E_NOTIMPL rather than S_OK with nothing written");
+    using IsPurchasable = bool(STDMETHODCALLTYPE*)(void*, void*);
+    check(!at<IsPurchasable>(store, 70)(store, nullptr), "XStoreIsAvailabilityPurchasable (IXStoreImpl2): false");
 
     std::printf("xgameruntime_store_test: %d of %d checks failed\n", g_failures, g_checks);
     return g_failures ? 1 : 0;
