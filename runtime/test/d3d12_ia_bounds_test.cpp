@@ -41,8 +41,9 @@
 #include <string>
 #include <vector>
 
-#if !defined(LEONIDA_TEST_VS_SPV) || !defined(LEONIDA_TEST_PS_SPV)
-#error "LEONIDA_TEST_VS_SPV and LEONIDA_TEST_PS_SPV must name the compiled test shaders"
+#if !defined(LEONIDA_TEST_VS_SPV) || !defined(LEONIDA_TEST_PS_SPV) || \
+    !defined(LEONIDA_TEST_VS_TAIL_SPV) || !defined(LEONIDA_TEST_PS_TAIL_SPV)
+#error "The 144-byte and --pc-tail-ubo input-assembler bounds test shaders must be compiled"
 #endif
 
 #define EXPECT(condition) do { \
@@ -443,20 +444,22 @@ int main() {
     TempFolder library;
     library.path = std::filesystem::temp_directory_path() / ("leonida_ia_bounds_" + std::to_string(GetCurrentProcessId()));
     std::filesystem::create_directories(library.path);
-    std::filesystem::copy_file(LEONIDA_TEST_VS_SPV, library.path / "vs_ia_bounds.spv",
+    // TEST-544: both shaders read neither heap base nor code base, so the --pc-tail-ubo pair declares 128 push-
+    // constant bytes and no pc_tail. It builds on a device limited to the Vulkan minimum of maxPushConstantsSize.
+    std::filesystem::copy_file(LEONIDA_TEST_VS_TAIL_SPV, library.path / "vs_ia_bounds.spv",
                                std::filesystem::copy_options::overwrite_existing);
-    std::filesystem::copy_file(LEONIDA_TEST_PS_SPV, library.path / "ps_ia_bounds.spv",
+    std::filesystem::copy_file(LEONIDA_TEST_PS_TAIL_SPV, library.path / "ps_ia_bounds.spv",
                                std::filesystem::copy_options::overwrite_existing);
     {
         std::ofstream index(library.path / "index.json", std::ios::binary);
         index << "{\"vs_ia_bounds\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_program)
-              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"input_signature\": ["
+              << "\", \"bindings\": [], \"push_constant_bytes\": 128, \"input_signature\": ["
                  "{\"semantic\": \"COLOR\", \"semantic_index\": 0, \"register\": 0, \"mask\": 15, \"rw_mask\": 15, "
                  "\"system_value\": 0, \"component_type\": \"float\"}, "
                  "{\"semantic\": \"POSITION\", \"semantic_index\": 0, \"register\": 1, \"mask\": 3, \"rw_mask\": 3, "
                  "\"system_value\": 0, \"component_type\": \"float\"}]},\n"
                  " \"ps_ia_bounds\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_program)
-              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0]}}";
+              << "\", \"bindings\": [], \"push_constant_bytes\": 128, \"outputs\": [0]}}";
         if (!index) {
             std::fprintf(stderr, "cannot write the shader index\n");
             return 1;
