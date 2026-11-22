@@ -505,8 +505,8 @@ int main(int argc, char** argv)
             check_texture_mips(device.Get());
         } else if (argc == 3 && operation == "--bvh-root-roundtrip") {
             check_bvh_root_roundtrip(device.Get());
-        } else if (argc == 3 && operation == "--bvh-differential") {
-            if (!check_bvh_differential(device.Get())) return 77;
+        } else if (argc == 3 && (operation == "--bvh-differential" || operation == "--bvh-differential-pipeline")) {
+            if (!check_bvh_differential(device.Get(), operation == "--bvh-differential-pipeline")) return 77;
         } else if (argc == 3 && operation == "--bvh-hits") {
             check_bvh_hits(device.Get());
         } else if (argc == 3 && operation == "--dxr-update") {
@@ -544,8 +544,8 @@ int main(int argc, char** argv)
             if (!check_gpu_alias_registry(device.Get())) return 77;
         } else if (argc == 3 && operation == "--buffer-ops") {
             check_buffer_ops(device.Get());
-        } else if (argc == 3 && operation == "--ray-query") {
-            if (!check_ray_query(device.Get())) return 77;
+        } else if (argc == 3 && (operation == "--ray-query" || operation == "--dxr-pipeline")) {
+            if (!check_dxr_rays(device.Get(), operation == "--dxr-pipeline")) return 77;
         } else if (argc == 3 && operation == "--wave-shuffle") {
             if (!check_wave_shuffle(device.Get())) return 77;
         } else if (operation.substr(0, 2) == "--") {

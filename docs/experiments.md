@@ -2369,7 +2369,7 @@ The inspection reads bytes from two local DLLs. Desktop parsers inspect serializ
 ```powershell
 $pkg = (Get-ChildItem game-files -Directory)[0].FullName
 .\out\pe-env\Scripts\python.exe -B tools/probe_roots.py $pkg --controls out/build/dev
-ctest --preset dev -R 'compute_|dxr_query|shader_metadata|bvh_buffer_ops' -V
+ctest --preset dev -R 'compute_|dxr_(query|pipeline)|shader_metadata|bvh_buffer_ops' -V
 ```
 
 `out/calls/desktop-roots.json` records per-container return codes, root signature summaries, matching desktop fixtures, static call counts and validator diagnostics. It also hashes the input inventory and probe executable. Each container was checked independently.
@@ -2385,7 +2385,7 @@ Both source-built control shaders passed container and module validation. For th
 
 The first synthetic compute layout uses an SRV, a UAV and 16 root constants. Its `RTS0` payload matches 11 BVH containers byte for byte after clearing the two flags. The second uses 13 UAVs, 21 SRVs, four root CBVs and a static sampler. It matches 27 unmodified AMD containers. Both tests access the last registers in the descriptor tables. RTX 2060 and WARP wrote 257 correct integer words per layout and preserved 63 sentinel words.
 
-The native DXR fixture builds a bottom-level structure (BLAS) from one triangle and a top-level structure (TLAS) from two instances. Five inline Shader Model 6.5 queries cover hits, a geometric miss, distance clipping, translation and instance masks. Both backends hit instances 7 and 11 at distance 1 and missed the other three rays. Integration of the game's acceleration structure layout and consumers with desktop DXR remains unverified. [Microsoft DXR specification](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html)
+The native DXR fixture builds a bottom-level structure (BLAS) from one triangle and a top-level structure (TLAS) from two instances. Five rays cover hits, a geometric miss, distance clipping, translation and instance masks. The existing `dxr_query` test uses inline RayQuery on DXR Tier 1.1 with Shader Model 6.5. The `dxr_pipeline` test uses a source-built `lib_6_3` ray generation, miss and closest-hit library with TraceRay and DispatchRays on DXR Tier 1.0 or later with Shader Model 6.3 or later. The standalone GPU check includes `dxr_pipeline`. The original RTX 2060 and WARP inline runs hit instances 7 and 11 at distance 1 and missed the other three rays. The GTX 1060 pipeline and both app-local WARP paths reported the same instance IDs, primitive index 0 and hit distance 1. The three miss rows were all zero. Integration of the game's acceleration structure layout and consumers with desktop DXR remains unverified. [Microsoft DXR specification](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#d3d12_raytracing_tier)
 
 Four priority BVH containers use the first layout, are referenced by the function starting at `0x20270` and use 32×1×1 thread groups. Source-built HLSL reproduces the data operations inferred from static instructions. Independent CPU results supply the expected values.
 
@@ -2485,9 +2485,18 @@ RTX 2060 and WARP agreed with the CPU on every field. Closed intervals, tie brea
 
 ### Independent BVH checks on PC
 
-Each scene sends the same 136 rays through a double-precision brute-force CPU test, a custom shader reading packed nodes, and standard DXR. DXR builds its own BLAS and TLAS from the original accessible vertices and runs inline queries. All paths check hit status and closest distance. The CPU also checks that the specific DXR-selected primitive intersects at that distance, allowing valid ties. Comparisons use triangle interiors and distance margins. Edge and endpoint cases use the preceding fixture's fixed conventions. [DXR ray extents](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#ray-extents)
+Each scene sends the same 136 rays through a double-precision brute-force CPU test, a custom shader reading packed nodes, and standard DXR. DXR builds its own BLAS and TLAS from the original accessible vertices. The differential test prefers inline queries on Tier 1.1 and uses DispatchRays on Tier 1.0. Its custom BVH shader still requires Shader Model 6.5. All paths check hit status and closest distance. The CPU also checks that the specific DXR-selected primitive intersects at that distance, allowing valid ties. Comparisons use triangle interiors and distance margins. Edge and endpoint cases use the preceding fixture's fixed conventions. [DXR ray extents](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#ray-extents)
 
-RTX 2060 and WARP each completed 408 comparisons. In fault controls only the custom shader's input changes. Swapping child 0 and 32 addresses changed four results, replaying the previous scene changed 102 and aliasing invalid address high bits changed one. Each fault must alter its designated witness ray. Run `ctest --preset dev -R bvh_differential -V` for hit counts, changed results and witness indices.
+RTX 2060 and WARP each completed 408 comparisons. In fault controls only the custom shader's input changes. Swapping child 0 and 32 addresses changed four results, replaying the previous scene changed 102 and aliasing invalid address high bits changed one. Each fault must alter its designated witness ray. The GTX 1060 with driver 32.0.15.6094 on Windows 10 build 19045.6456 matched all 408 comparisons through DispatchRays. App-local WARP 1.0.22 with Agility SDK 1.620.2 matched all 408 through each DXR path. All three fault witnesses fired in each run. The five-ray and differential checks reported zero D3D12 debug warnings and errors. In-box WARP 10.0.19041.5794 reports no DXR and skips these checks.
+
+```powershell
+$env:XBOX2WINDOWS_ADAPTER = 'GTX 1060'
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^(dxr_(pipeline|query)|bvh_differential)_hardware$' -V
+# After configuring out/build/w10 with the Windows 10 app-local instructions
+cmake --build out/build/w10 --target offscreen_check
+ctest --test-dir out/build/w10 --no-tests=error -R '^(dxr_(pipeline|query)|bvh_differential(_pipeline)?)_warp$' -V
+```
 
 Project acceptance uses reproducible PC behavior. The next game-specific check is to identify the builder selected by the main executable, its node-buffer inputs and outputs, and the downstream queries, then add the observed constraints to PC tests.
 
