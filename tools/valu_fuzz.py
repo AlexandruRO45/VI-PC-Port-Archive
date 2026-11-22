@@ -54,6 +54,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "runtime", "test", "shaders"))
 import mc_command  # noqa: E402
+import translator_modes  # noqa: E402
 from hw_oracle import asm  # noqa: E402
 from compute_fixture import compute_header, find_test_program, unpinned_subgroup  # noqa: E402
 
@@ -862,7 +863,7 @@ def translate(progs, work, emulate, pc_tail=False):
     cmd = [sys.executable, "-I", os.path.join(HERE, "rdna2spirv.py"), str(disasm), "--out", str(spirv)]
     if emulate:
         cmd.append("--wave64-emulate")
-    if os.environ.get("LEONIDA_SUBGROUP_TEMPS") == "1":   # as build.py: subgroup operations kept out of && / ?: (MoltenVK)
+    if translator_modes.resolve("subgroup_temps"):   # as build.py: LEONIDA_SUBGROUP_TEMPS, else the device (MoltenVK)
         cmd.append("--subgroup-temps")
     if pc_tail:
         cmd.append("--pc-tail-ubo")

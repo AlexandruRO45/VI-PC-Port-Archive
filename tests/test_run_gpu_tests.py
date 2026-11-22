@@ -287,6 +287,26 @@ class UniformBranchCheck(unittest.TestCase):
         self.assertFalse(self.judge([(7, 1, 0.5), (8, 0, 0.1), (7, 0, 0.1)])[0])
 
 
+class SubgroupTempsMode(unittest.TestCase):
+    """--subgroup-temps is chosen as every entry point chooses it (tools/translator_modes.py): LEONIDA_SUBGROUP_TEMPS,
+    then driver id 14 (MoltenVK) from the device query."""
+
+    def choose(self, env, info):
+        with patch.dict(os.environ, env, clear=False), patch.object(rgt, "_device_info", return_value=info):
+            if "LEONIDA_SUBGROUP_TEMPS" not in env:
+                os.environ.pop("LEONIDA_SUBGROUP_TEMPS", None)
+            return rgt.subgroup_temps()
+
+    def test_device_decides_when_unset(self):
+        self.assertTrue(self.choose({}, {"driver_id": 14}))
+        self.assertFalse(self.choose({}, {"driver_id": 3}))
+        self.assertFalse(self.choose({}, {}))
+
+    def test_variable_overrides_the_device(self):
+        self.assertFalse(self.choose({"LEONIDA_SUBGROUP_TEMPS": "0"}, {"driver_id": 14}))
+        self.assertTrue(self.choose({"LEONIDA_SUBGROUP_TEMPS": "1"}, {"driver_id": 3}))
+
+
 class Wave32LaneDumps(unittest.TestCase):
     """run_gpu_tests.py skips cs_wqm_w32 and cs_w32_lane_wrap below 32 lanes with check.py's rule."""
     def test_uses_check_py_rule(self):

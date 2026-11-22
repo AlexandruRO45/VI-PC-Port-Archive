@@ -13483,6 +13483,9 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
             m["f16_halves"] = {str(n): [lo, hi] for n, (lo, hi) in sorted(pairs.items())}
             if "mesh_compute" in m:     # tools/mesh_compute_vs.py exports them from the slot's raw params
                 m["mesh_compute"] = dict(m["mesh_compute"], f16_halves=m["f16_halves"])
+    if SUBGROUP_TEMPS:
+        # Translated with --subgroup-temps (tools/translator_modes.py): check.py compares that with the device.
+        m["subgroup_temps"] = True
     if g.build_meta:
         m.update(g.build_meta)
     return m

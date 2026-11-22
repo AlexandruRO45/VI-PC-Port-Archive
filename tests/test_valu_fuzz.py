@@ -521,6 +521,8 @@ def test_pc_tail_ubo_forwarded_to_translator_and_vk_compute_test(monkeypatch, tm
 
     monkeypatch.setattr(vf.mc_command, "mc_command", lambda: ["llvm-mc"])
     monkeypatch.setattr(vf.subprocess, "run", fake_run)
+    # --subgroup-temps from the variable, so translate() doesn't query the device through the fake run.
+    monkeypatch.setenv("LEONIDA_SUBGROUP_TEMPS", "0")
     vf.translate([], tmp_path, False)
     vf.translate([], tmp_path, False, pc_tail=True)
     assert "--pc-tail-ubo" not in cmds[0][0]
