@@ -17,6 +17,7 @@ AREAS = (("x64_zen2", "x64 (Zen 2 user-mode mnemonics)", 220), ("gfx1013", "gfx1
          ("gfx1030", "gfx1030 (RDNA2) forms", 300))
 WIDTH, BG, PANEL, BORDER, TEXT, MUTED = 1000, "#0d1117", "#161b22", "#30363d", "#e6edf3", "#8b949e"
 COVERED, HELD, OPEN = "#2ea043", "#d29922", "#484f58"
+LABEL_CHAR = 7.0  # px per character at 11 px, generous so a label never runs past its box
 NOTE = "Instruction-form coverage of source-built fixtures; not a measure of port completion."
 
 
@@ -55,27 +56,34 @@ def squarify(items, x, y, w, h):
     return out
 
 
+def fit(total, w, h):
+    """Largest square size (2 px or more, 1 px gaps) and column count that fit `total` squares in w x h."""
+    for size in range(int(min(w, h)), 1, -1):
+        cols = int(w + 1) // (size + 1)
+        if cols and -(-total // cols) * (size + 1) - 1 <= h:
+            return size, cols
+    return None
+
+
 def group(name, counts, x, y, w, h):
-    """A labelled box of squares: covered, then held back, then open."""
+    """A box of squares (covered, then held back, then open), clipped to the box. The label goes inside
+    only when it and the squares both fit; returns (svg, labelled)."""
     covered, held, total = counts
     label = f"{name} {covered}/{total}"
-    room = h - 18 if len(label) * 6.2 < w - 6 else h - 4
-    for size in range(int(min(w, room)) - 4, 1, -1):  # largest square size that fits every form
-        cols = int(w - 3) // (size + 1)
-        if cols and -(-total // cols) * (size + 1) - 1 <= room - 4:
-            break
-    else:
-        size, cols = 1, max(int(w - 4), 1)  # ponytail: overlapping 1px squares only in a degenerate box
-    top = 2 + (h - room)
-    parts = [f'<g transform="translate({x:.1f},{y:.1f})"><rect width="{w:.1f}" height="{h:.1f}" '
-             f'fill="{PANEL}" stroke="{BG}" stroke-width="2"/>']
-    if room < h:
+    layout = fit(total, w - 4, h - 20) if len(label) * LABEL_CHAR <= w - 8 else None
+    labelled = layout is not None
+    layout = layout or fit(total, w - 4, h - 4)
+    size, step, cols = (layout[0], layout[0] + 1, layout[1]) if layout else (1, 1, max(int(w - 4), 1))
+    top = 18 if labelled else 2
+    parts = [f'<svg x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="{h:.1f}"><rect width="{w:.1f}" '
+             f'height="{h:.1f}" fill="{PANEL}" stroke="{BG}" stroke-width="2"/>']
+    if labelled:
         parts.append(text(4, 13, label, 11))
     for color, first, last in ((COVERED, 0, covered), (HELD, covered, covered + held), (OPEN, covered + held, total)):
-        cells = "".join(f'<rect x="{2 + i % cols * (size + 1)}" y="{top + i // cols * (size + 1)}" '
+        cells = "".join(f'<rect x="{2 + i % cols * step}" y="{top + i // cols * step}" '
                         f'width="{size}" height="{size}"/>' for i in range(first, last))
         parts.append(f'<g fill="{color}">{cells}</g>')
-    return "".join(parts) + "</g>"
+    return "".join(parts) + "</svg>", labelled
 
 
 def render(m, source):
@@ -90,13 +98,19 @@ def render(m, source):
             held[form.split()[0]] = held.get(form.split()[0], 0) + 1
         title = (f"{label}: {r['covered']} of {r['total']} covered, "
                  f"{len(r['blocked_by_skip'])} held back by skips")
-        rows.append(f'<rect x="20" y="{y}" width="{WIDTH - 40}" height="{height + 40}" rx="6" '
+        rows.append(f'<rect x="20" y="{y}" width="{WIDTH - 40}" height="{height + 58}" rx="6" '
                     f'fill="{PANEL}" stroke="{BORDER}"/>' + text(32, y + 21, title, 13, bold=True))
         items = sorted(((g, v["total"]) for g, v in r["groups"].items() if v["total"]), key=lambda kv: -kv[1])
+        unlabelled = []
         for name, (gx, gy, gw, gh) in squarify(items, 30, y + 30, WIDTH - 60, height).items():
             g = r["groups"][name]
-            rows.append(group(name, (g["covered"], held.get(name, 0), g["total"]), gx, gy, gw, gh))
-        y += height + 56
+            box, labelled = group(name, (g["covered"], held.get(name, 0), g["total"]), gx, gy, gw, gh)
+            rows.append(box)
+            if not labelled:
+                unlabelled.append(f"{name} {g['covered']}/{g['total']}")
+        if unlabelled:
+            rows.append(text(32, y + height + 47, "Too small to label: " + ", ".join(unlabelled), 11, MUTED))
+        y += height + 74
     return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{WIDTH}" height="{y - 6}" '
             f'viewBox="0 0 {WIDTH} {y - 6}" font-family="Segoe UI,Helvetica,Arial,sans-serif">'
             f'<rect width="{WIDTH}" height="{y - 6}" fill="{BG}"/>' + "".join(rows) + "</svg>\n")

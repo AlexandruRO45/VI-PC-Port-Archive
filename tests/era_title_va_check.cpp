@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <string_view>
+#include <vector>
 
 using namespace std::literals;
 
@@ -73,12 +74,47 @@ int check_registry()
 }
 }
 
+int check_shader()
+{
+    era_title_va::Table table;
+    expect(table.add(0x1'ffff'0000, 0x20000, 0x7000'0000), "add range crossing a 4 GiB line");
+    expect(table.add(0x10000, 0x1000, 0x9000'0000), "add low range");
+    std::vector<era_title_va::ShaderRange> packed;
+    expect(era_title_va::shader_ranges(table.ranges(), packed), "pack table ranges");
+    expect(packed.size() == 2, "two packed ranges");
+    if (packed.size() == 2) {
+        expect(packed[0].begin_low == 0x10000 && packed[0].begin_high == 0 && packed[0].end_low == 0x11000 &&
+                   packed[0].end_high == 0 && packed[0].slot == 0 && packed[0].reserved == 0,
+               "low range words and slot");
+        expect(packed[1].begin_low == 0xffff0000 && packed[1].begin_high == 1 && packed[1].end_low == 0x10000 &&
+                   packed[1].end_high == 2 && packed[1].slot == 1,
+               "high range split into low and high words");
+    }
+    using R = era_title_va::Range;
+    expect(!era_title_va::shader_ranges({R{0x20000, 0x21000, 1}, R{0x10000, 0x11000, 2}}, packed) && packed.empty(),
+           "unsorted ranges rejected");
+    expect(!era_title_va::shader_ranges({R{0x10000, 0x21000, 1}, R{0x20000, 0x30000, 2}}, packed) && packed.empty(),
+           "overlapping ranges rejected");
+    expect(!era_title_va::shader_ranges({R{0x10000, 0x10000 + (1ull << 32), 1}}, packed) && packed.empty(),
+           "4 GiB range rejected");
+    expect(era_title_va::shader_ranges({R{0x10000, 0x10000 + (1ull << 32) - 4, 1}}, packed) && packed.size() == 1,
+           "range just under 4 GiB accepted");
+    expect(!era_title_va::shader_ranges({R{0x10000, 0x10000, 1}}, packed) && packed.empty(), "empty range rejected");
+    expect(!era_title_va::shader_ranges({R{0x10002, 0x11000, 1}}, packed) && packed.empty(),
+           "range not starting on a 4-byte boundary rejected");
+    expect(era_title_va::shader_ranges({R{0x10000, 0x10ffe, 1}}, packed) && packed.size() == 1,
+           "range whose length is not a multiple of 4 accepted");
+    expect(era_title_va::shader_ranges({}, packed) && packed.empty(), "no ranges packs to nothing");
+    return failures;
+}
+
 int main(int argc, char** argv)
 {
     const std::string_view scenario = argc == 2 ? argv[1] : ""sv;
     if (scenario == "translate"sv) return check_translate();
     if (scenario == "bounds"sv) return check_bounds();
     if (scenario == "registry"sv) return check_registry();
-    std::fprintf(stderr, "usage: era_title_va_check translate|bounds|registry\n");
+    if (scenario == "shader"sv) return check_shader();
+    std::fprintf(stderr, "usage: era_title_va_check translate|bounds|registry|shader\n");
     return 2;
 }
