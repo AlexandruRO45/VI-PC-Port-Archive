@@ -302,11 +302,15 @@ def uv_probes(vertices, indices, width: int, height: int, limit: int = 4) -> lis
 
 def find_harness(explicit: str | None) -> str:
     exe = ".exe" if os.name == "nt" else ""
+    # Multi-config CMake generators (Visual Studio, Ninja Multi-Config) nest the binary in a
+    # per-configuration subfolder, so a successful build does not leave vk_harness next to the build dir.
     for candidate in (
         explicit,
         os.environ.get("LEONIDA_VK_HARNESS"),
         os.path.join(ROOT, "runtime", "build", "linux", f"vk_harness{exe}"),
         os.path.join(ROOT, "runtime", "build", "windows", f"vk_harness{exe}"),
+        os.path.join(ROOT, "runtime", "build", "windows", "Release", f"vk_harness{exe}"),
+        os.path.join(ROOT, "runtime", "build", "windows", "RelWithDebInfo", f"vk_harness{exe}"),
         os.path.join(ROOT, "runtime", "build", f"vk_harness{exe}"),
     ):
         if candidate and os.path.isfile(candidate):

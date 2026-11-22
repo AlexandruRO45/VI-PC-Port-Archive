@@ -273,5 +273,47 @@ class ReadObjTests(unittest.TestCase):
                 fl.read_obj(self._write_obj(bad))
 
 
+class FindHarnessTests(unittest.TestCase):
+    """find_harness() on synthetic build trees: multi-config output folders and the priority order."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = tmp.name
+        env = dict(os.environ)
+        env.pop("LEONIDA_VK_HARNESS", None)
+        for patcher in (
+            patch.object(fl, "ROOT", self.root),
+            patch.dict(os.environ, env, clear=True),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.exe = ".exe" if os.name == "nt" else ""
+
+    def _harness(self, *parts) -> str:
+        path = os.path.join(self.root, "runtime", "build", *parts, f"vk_harness{self.exe}")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(b"synthetic harness fixture")
+        return path
+
+    def test_finds_the_multiconfig_release_output(self):
+        path = self._harness("windows", "Release")
+        self.assertEqual(fl.find_harness(None), path)
+
+    def test_finds_the_multiconfig_relwithdebinfo_output(self):
+        path = self._harness("windows", "RelWithDebInfo")
+        self.assertEqual(fl.find_harness(None), path)
+
+    def test_prefers_the_singleconfig_build_over_the_config_subfolder(self):
+        plain = self._harness("windows")
+        self._harness("windows", "Release")
+        self.assertEqual(fl.find_harness(None), plain)
+
+    def test_still_exits_when_no_harness_exists(self):
+        with self.assertRaises(SystemExit):
+            fl.find_harness(None)
+
+
 if __name__ == "__main__":
     sys.exit(unittest.main())
