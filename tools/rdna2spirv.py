@@ -2245,19 +2245,40 @@ class Gen:
                 out += 1
 
     def decode_any_format(self, fmt, words):
-        """Decode every supported format from 4 packed dwords, then pick by FORMAT (0 for one outside FORMATS)."""
-        comps = [self.cu(0)] * 4
-        for code in self.FORMATS:
-            dec = self.decode_format(words, code)
-            e = self.tmp()
-            self.emit(f"{e} = OpIEqual %bool {fmt} {self.cu(code)}")
-            nxt = []
-            for c in range(4):
-                s = self.tmp()
-                self.emit(f"{s} = OpSelect %uint {e} {dec[c]} {comps[c]}")
-                nxt.append(s)
-            comps = nxt
-        return comps
+        """Decode 4 packed dwords by the run-time FORMAT (0 for one outside FORMATS), executing only that format's
+        decode: a binary search over the codes, marked DontFlatten (decoding every format to select one was about
+        770 VALU instructions on every lane). Plain conditional branches, which the test interpreters run too."""
+        return self.decode_format_search(fmt, words, sorted(self.FORMATS))[0]
+
+    def decode_format_search(self, fmt, words, codes):
+        """decode_any_format over the sorted ``codes`` -> (4 ids, the label of the block that defines them, or None
+        for the block the search started in)."""
+        cond, yes, no, end = self.tmp(), self.tmp() + "_fy", self.tmp() + "_fn", self.tmp() + "_fe"
+        leaf = len(codes) == 1
+        if leaf:
+            self.emit(f"{cond} = OpIEqual %bool {fmt} {self.cu(codes[0])}")
+        else:
+            mid = len(codes) // 2
+            self.emit(f"{cond} = OpULessThan %bool {fmt} {self.cu(codes[mid])}")
+        self.emit(f"OpSelectionMerge {end} DontFlatten")
+        self.emit(f"OpBranchConditional {cond} {yes} {no}")
+        self.emit(f"{yes} = OpLabel")
+        if leaf:
+            a, a_end = self.decode_format(words, codes[0]), None
+        else:
+            a, a_end = self.decode_format_search(fmt, words, codes[:mid])
+        self.emit(f"OpBranch {end}")
+        self.emit(f"{no} = OpLabel")
+        if leaf:
+            b, b_end = [self.cu(0)] * 4, None
+        else:
+            b, b_end = self.decode_format_search(fmt, words, codes[mid:])
+        self.emit(f"OpBranch {end}")
+        self.emit(f"{end} = OpLabel")
+        out = [self.tmp() for _ in range(4)]
+        for o, x, y in zip(out, a, b):
+            self.emit(f"{o} = OpPhi %uint {x} {a_end or yes} {y} {b_end or no}")
+        return out, end
 
     def format_decode_call(self, fmt, words):
         """4 uint ids: the element decoded per the run-time FORMAT, through one function in the module.
