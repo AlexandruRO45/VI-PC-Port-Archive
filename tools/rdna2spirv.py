@@ -4950,6 +4950,103 @@ class Gen:
             v = self.flush_f32(self.clamp_mods(v, mods))
         return v
 
+    def f64_words(self, op, sv):
+        """(lo, hi) uint ids of a binary64 source, VOP3 abs/neg applied to the sign bit (as the hardware does, NaN
+        included): a register pair, a float inline constant (its binary64 encoding), an integer constant (sign-extended
+        to 64 bits, as Gen.src64_data reads it) or a literal (the high dword, f64_literal)."""
+        if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
+            lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
+        elif sv.get("f64_literal"):
+            lo, hi = self.cu(0), self.cu(sv["v"] & 0xFFFFFFFF)
+        elif sv["k"] in ("imm", "fimm"):
+            b = (struct.unpack("<Q", struct.pack("<d", sv["v"]))[0] if sv["k"] == "fimm"
+                 else sv["v"] & 0xFFFFFFFFFFFFFFFF)
+            lo, hi = self.cu(b & 0xFFFFFFFF), self.cu(b >> 32)
+        else:
+            raise Unsupported(op + " operand")
+        if sv.get("abs"):
+            t = self.tmp()
+            self.emit(f"{t} = OpBitwiseAnd %uint {hi} {self.cu(0x7FFFFFFF)}")
+            hi = t
+        if sv.get("neg"):
+            t = self.tmp()
+            self.emit(f"{t} = OpBitwiseXor %uint {hi} {self.cu(0x80000000)}")
+            hi = t
+        return lo, hi
+
+    def minmax_f64(self, op, a, mods):
+        """v_min_f64 / v_max_f64 as a selection of one source's 64 bits, with no float arithmetic, as measured natively
+        on RDNA2 gfx1036 with MODE.IEEE off (the MODE inferred for the game): a NaN operand, quiet or signalling, gives
+        the other operand; two NaNs give src0, bits unchanged; -0 < +0; subnormals order as their values (f64 denormals
+        kept). With IEEE on the hardware returns a quieted NaN for a signalling one instead (not modelled). The order
+        is an unsigned compare of the sign-magnitude words mapped to a total order (negative: all bits inverted;
+        positive: sign bit set), so no driver denormal or NaN handling is involved. VOP3 clamp applies to the result
+        (FClamp, as for the other f64 ops); the omod is ignored, as the hardware does while f64 denormals are kept."""
+        if any(m.startswith(("mul:", "div:")) for m in mods):
+            mods = [m for m in mods if m == "clamp"]
+        (xl, xh), (yl, yh) = self.f64_words(op, a[1]), self.f64_words(op, a[2])
+
+        def nan(lo, hi):
+            e, ee, m, mz, mo, r = (self.tmp() for _ in range(6))
+            self.emit(f"{e} = OpBitwiseAnd %uint {hi} {self.cu(0x7FF00000)}")
+            self.emit(f"{ee} = OpIEqual %bool {e} {self.cu(0x7FF00000)}")
+            self.emit(f"{m} = OpBitwiseAnd %uint {hi} {self.cu(0xFFFFF)}")
+            self.emit(f"{mo} = OpBitwiseOr %uint {m} {lo}")
+            self.emit(f"{mz} = OpINotEqual %bool {mo} {self.cu(0)}")
+            self.emit(f"{r} = OpLogicalAnd %bool {ee} {mz}")
+            return r
+
+        def key(lo, hi):
+            neg, nl, nh, ph, kl, kh = (self.tmp() for _ in range(6))
+            self.emit(f"{neg} = OpUGreaterThanEqual %bool {hi} {self.cu(0x80000000)}")
+            self.emit(f"{nl} = OpNot %uint {lo}")
+            self.emit(f"{nh} = OpNot %uint {hi}")
+            self.emit(f"{ph} = OpBitwiseOr %uint {hi} {self.cu(0x80000000)}")
+            self.emit(f"{kl} = OpSelect %uint {neg} {nl} {lo}")
+            self.emit(f"{kh} = OpSelect %uint {neg} {nh} {ph}")
+            return kl, kh
+
+        xn, yn = nan(xl, xh), nan(yl, yh)
+        (kxl, kxh), (kyl, kyh) = key(xl, xh), key(yl, yh)
+        # y_first: y orders before x (y < x for min) or after it (y > x for max)
+        hlt, heq, llt, lt = (self.tmp() for _ in range(4))
+        if op == "v_min_f64":
+            a_, b_ = (kyh, kyl), (kxh, kxl)
+        else:
+            a_, b_ = (kxh, kxl), (kyh, kyl)
+        self.emit(f"{hlt} = OpULessThan %bool {a_[0]} {b_[0]}")
+        self.emit(f"{heq} = OpIEqual %bool {a_[0]} {b_[0]}")
+        self.emit(f"{llt} = OpULessThan %bool {a_[1]} {b_[1]}")
+        t = self.tmp()
+        self.emit(f"{t} = OpLogicalAnd %bool {heq} {llt}")
+        self.emit(f"{lt} = OpLogicalOr %bool {hlt} {t}")
+        # take y: x is NaN and y is not, or neither is NaN and y wins the compare
+        nyn, xnn, both_ok, by_cmp, by_nan, take = (self.tmp() for _ in range(6))
+        self.emit(f"{nyn} = OpLogicalNot %bool {yn}")
+        self.emit(f"{xnn} = OpLogicalNot %bool {xn}")
+        self.emit(f"{by_nan} = OpLogicalAnd %bool {xn} {nyn}")
+        self.emit(f"{both_ok} = OpLogicalAnd %bool {xnn} {nyn}")
+        self.emit(f"{by_cmp} = OpLogicalAnd %bool {both_ok} {lt}")
+        self.emit(f"{take} = OpLogicalOr %bool {by_nan} {by_cmp}")
+        rl, rh = self.tmp(), self.tmp()
+        self.emit(f"{rl} = OpSelect %uint {take} {yl} {xl}")
+        self.emit(f"{rh} = OpSelect %uint {take} {yh} {xh}")
+        if "clamp" in mods:
+            self.uses_f64 = True
+            v2, d = self.tmp(), self.tmp()
+            self.emit(f"{v2} = OpCompositeConstruct %v2uint_d {rl} {rh}")
+            self.emit(f"{d} = OpBitcast %double {v2}")
+            c = self.clamp_mods_f64(d, ["clamp"])
+            o2, rl, rh = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{o2} = OpBitcast %v2uint_d {c}")
+            self.emit(f"{rl} = OpCompositeExtract %uint {o2} 0")
+            self.emit(f"{rh} = OpCompositeExtract %uint {o2} 1")
+        d = a[0]
+        if d["k"] != "vgpr":
+            raise Unsupported(op + " destination")
+        self.dst({"k": "vgpr", "r": d["r"], "n": 1}, rl)
+        self.dst({"k": "vgpr", "r": d["r"] + 1, "n": 1}, rh)
+
     def clamp_mods_f64(self, v, mods):
         """clamp_mods for a %double result (VOP3 f64 arithmetic): omod scales first, then clamp to [0, 1]. As
         for f32 the clamp is GLSL.std.450 FClamp, so a NaN result and the sign of a -0 result are left to the
@@ -6218,6 +6315,8 @@ class Gen:
                 word = self.tmp()
                 self.emit(f"{word} = OpCompositeExtract %uint {words} {index}")
                 self.dst({"k": "vgpr", "r": dst["r"] + index, "n": 1}, word)
+        elif op in ("v_min_f64", "v_max_f64"):
+            self.minmax_f64(op, a, mods)
         elif op in ("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64"):
             # f64: register pairs as doubles (shaderFloat64). neg/abs modifiers apply to the double.
             def f64(sv):
