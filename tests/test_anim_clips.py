@@ -670,7 +670,8 @@ class DecodeTest(unittest.TestCase):
                                   (b + 0x50, "<I", len(s.d)),                       # weights past the pages
                                   (b + 0x58, "<Q", 0),                              # weights without data
                                   (at + 0x114, "<I", len(s.d)),                     # +0x118 past the pages
-                                  (obj + 0xB4, "<I", len(s.d))):                    # +0xB8 past the pages
+                                  (obj + 0xB4, "<I", len(s.d)),                     # +0xB8 past the pages
+                                  (obj + 0xB4, "<I", (len(s.d) - s.ptr(obj + 0xB8)) // 32 + 1)):  # one chunk past
             kept = struct.unpack_from(fmt, s.d, field)[0]
             struct.pack_into(fmt, s.d, field, value)
             with self.assertRaises(anim_clips.DecodeError, msg=hex(field)):
@@ -725,6 +726,16 @@ class DecodeTest(unittest.TestCase):
         self.assertTrue(anim_clips.table_placed_by_key(s, at + 0x170, 8))
         build(False)
         self.assertFalse(anim_clips.table_placed_by_key(s, at + 0x170, 8))
+        # wrapping: 16 entries home in the last group (1), and one more home there that lands in group 0
+        block = bytearray(bytes([0x80]) * 16 + bytes(16 * 8)) * 2
+        for n, h in enumerate([0x80 + i for i in range(17)]):
+            g, i = (1, n) if n < 16 else (0, 0)
+            block[g * size + i] = h & 0x7F
+            struct.pack_into("<II", block, g * size + 16 + 8 * i, h, n)
+        s.d += bytes((-len(s.d)) % 16)
+        struct.pack_into("<IIQ", s.d, at + 0x170, 2, 17, 0x50000000 + len(s.d))
+        s.d += block
+        self.assertTrue(anim_clips.table_placed_by_key(s, at + 0x170, 8))
         self.assertTrue(anim_clips.table_placed_by_key(s, at + 0xA0, 16, anim_clips.clip_slot_hash))
         self.assertFalse(anim_clips.table_placed_by_key(s, at + 0xA0, 16))
         self.assertEqual(anim_clips.fmix64(0), 0)

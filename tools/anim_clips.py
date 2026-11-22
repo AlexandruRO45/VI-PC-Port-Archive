@@ -628,7 +628,7 @@ def count_matcher(c, dictionary_hash, stats):
     stats["matcher_features_0e_1_width_from_kind_bits"] += sum(
         fw == 3 * (k & 1) + 3 * (k >> 1 & 1) + 6 * (k >> 3 & 1) for fw, k, _h in simple)
     for (_c, fw, h), (e, k) in zip(f, m["feature_kinds"]):
-        if e == 5:                                  # not a bone: +0x18 or +0x1C is 0 on all but one
+        if e == 5:                                  # not a bone: one of +0x18 and +0x1C is 0
             stats["matcher_features_0e_5"] += 1
             stats["matcher_features_0e_5_name_a_bone"] += h in names
             stats["matcher_features_0e_5_with_1c_0" if k == 0 else "matcher_features_0e_5_with_18_0" if h == 0 else

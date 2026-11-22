@@ -663,7 +663,7 @@ A `.motionmatcher` object has fields up to `+0x18F`; they are in the object tabl
   probing), on 180 of 180 for each of the three tables (`table_placed_by_key`). The key table and the features'
   `+0x48` table hash an entry by its own first u32. The clip table hashes the u64 of its first two words (clip
   hash low, second word high) with MurmurHash3's 64-bit finaliser (`fmix64`, `clip_slot_hash`): 4,351 of its
-  4,381 entries sit in their home group and the other 30 after full groups.
+  4,381 entries sit in their home group and the other 30 after full groups (measured separately).
 - **Self (`+0x188`).** The clip's own hash and the dictionary's `joaat32(name)` on 180 of 180.
 - **`+0x78` and `+0xB8`.** The u16 array has one item per clip and then one more, on 180 of 180: it starts at 0,
   never decreases and ends at the record count, so item i is clip i's first record. The u8 array has one item per
