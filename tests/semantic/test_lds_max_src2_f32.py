@@ -704,5 +704,65 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
         self.assertEqual(self.lds.read_dword(100), f32_to_bits(10.0))
 
 
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(DEFAULT_LDS_DWORDS)
+        self.state = ScalarMachineState(lds=self.lds)
+        self.interp = ScalarInterpreter()
+
+    def test_base_register_preservation(self) -> None:
+        # Base register v0 must never be modified by non-returning DS instructions
+        self.state.set_vgpr(0, 0x100)
+        self.lds.write_dword(0x100 >> 2, ONE_F32)
+        self.lds.write_dword((0x100 >> 2) + 1, TWO_F32)
+
+        instr = DSSrc2Instruction(
+            opcode=DSOpcode.DS_MAX_SRC2_F32,
+            addr=LDSAddressExpression(base_reg=vgpr(0), offset0=0, offset1=1),
+        )
+        self.interp.execute(instr, self.state)
+        self.assertEqual(self.state.get_vgpr(0), 0x100)
+
+    def test_canary_register_file_isolation(self) -> None:
+        # Fill all 256 VGPRs with unique canary patterns
+        for reg in range(DEFAULT_NUM_VGPRS):
+            self.state.set_vgpr(reg, 0xAA000000 | reg)
+
+        self.state.set_vgpr(5, 40)
+        self.lds.write_dword(10, ONE_F32)
+        self.lds.write_dword(11, TWO_F32)
+
+        instr = DSSrc2Instruction(
+            opcode=DSOpcode.DS_MAX_SRC2_F32,
+            addr=LDSAddressExpression(base_reg=vgpr(5), offset0=0, offset1=1),
+        )
+        self.interp.execute(instr, self.state)
+
+        for reg in range(DEFAULT_NUM_VGPRS):
+            if reg == 5:
+                self.assertEqual(self.state.get_vgpr(reg), 40)
+            else:
+                self.assertEqual(self.state.get_vgpr(reg), 0xAA000000 | reg)
+
+    def test_memory_offset_aliasing_same_location(self) -> None:
+        # offset0 == offset1: location A is compared with itself
+        self.state.set_vgpr(1, 0x80)
+        idx = 0x80 >> 2
+        self.lds.write_dword(idx + 5, TEN_F32)
+
+        instr = DSSrc2Instruction(
+            opcode=DSOpcode.DS_MAX_SRC2_F32,
+            addr=LDSAddressExpression(base_reg=vgpr(1), offset0=5, offset1=5),
+        )
+        self.interp.execute(instr, self.state)
+        self.assertEqual(self.lds.read_dword(idx + 5), TEN_F32)
+
+
 if __name__ == "__main__":
     unittest.main()
