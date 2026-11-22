@@ -5,7 +5,7 @@ import math
 import struct
 import unittest
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # AMD RDNA2 / GFX10 GWS (Global Wavefront Sync) Architectural Constants
 GWS_NUM_RESOURCES: int = 64  # Hardware semaphore / barrier resource slots (0..63)
@@ -253,6 +253,67 @@ class ScalarInterpreter:
         return new_val, awakened
 
 
+# Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking
+
+
+class SIMDWaveState:
+    """Models multi-lane SIMD wave state (Wave32 or Wave64)."""
+
+    def __init__(self, wave_id: int = 0, wave_size: int = 32, exec_mask: int = MASK32) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Wave size must be 32 or 64, got: {wave_size}")
+        self.wave_id: int = wave_id
+        self.wave_size: int = wave_size
+        self.exec_mask: int = exec_mask & (MASK64 if wave_size == 64 else MASK32)
+        self.vgprs: List[List[int]] = [[0] * 256 for _ in range(wave_size)]
+        self.sgprs: List[int] = [0] * 104
+        self.m0: int = 0
+        self.vcc: int = 0
+
+    def is_lane_active(self, lane: int) -> bool:
+        return bool((self.exec_mask >> lane) & 1)
+
+    def get_vgpr(self, lane: int, reg_idx: int) -> int:
+        return self.vgprs[lane][reg_idx] & MASK32
+
+    def set_vgpr(self, lane: int, reg_idx: int, val: int) -> None:
+        self.vgprs[lane][reg_idx] = val & MASK32
+
+
+class SIMDInterpreter:
+    """SIMD instruction interpreter handling multi-lane divergence and EXEC masking."""
+
+    def __init__(self, gws: Optional[GWSSubsystem] = None) -> None:
+        self.gws: GWSSubsystem = gws if gws is not None else GWSSubsystem()
+
+    def step_wave(self, wave: SIMDWaveState, instr: Instruction) -> Dict[str, Any]:
+        if instr.opcode != Opcode.DS_GWS_SEMA_BR:
+            raise NotImplementedError(f"Unsupported opcode in SIMD interpreter: {instr.opcode}")
+
+        rid = ref_gws_resource_id(wave.m0, instr.offset)
+        active_count = 0
+        total_permits = 0
+        all_awakened: List[int] = []
+
+        for lane in range(wave.wave_size):
+            if wave.is_lane_active(lane):
+                active_count += 1
+                permits = 1
+                if instr.vdata is not None:
+                    permits = wave.get_vgpr(lane, instr.vdata.index)
+                total_permits += permits
+                _, awakened = self.gws.bulk_release_br(rid, release_count=permits)
+                all_awakened.extend(awakened)
+
+        return {
+            "resource_id": rid,
+            "active_lanes": active_count,
+            "total_permits_issued": total_permits,
+            "awakened_waves": all_awakened,
+            "final_value": self.gws.resources[rid].value,
+        }
+
+
 class TestGWSSemaBrOracleAndModel(unittest.TestCase):
     """Commit 1: Reference mathematical oracle and architectural model for ds_gws_sema_br."""
 
@@ -410,6 +471,114 @@ class TestGWSSemaBrScalarInterpreter(unittest.TestCase):
             val, _ = self.interp.step(instr)
             self.assertEqual(val, i * 5)
         self.assertEqual(len(self.interp.trace), 3)
+
+
+class TestGWSSemaBrSIMD(unittest.TestCase):
+    """Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking for ds_gws_sema_br."""
+
+    def setUp(self) -> None:
+        self.simd = SIMDInterpreter()
+
+    def test_wave32_full_exec_uniform_count(self) -> None:
+        wave = SIMDWaveState(wave_id=1, wave_size=32, exec_mask=0xFFFF_FFFF)
+        wave.m0 = 0
+        for lane in range(32):
+            wave.set_vgpr(lane, 0, 2)  # Each lane delivers 2 permits
+
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_BR, vdata=Register(0, RegKind.VGPR), offset=1)
+        res = self.simd.step_wave(wave, instr)
+
+        self.assertEqual(res["active_lanes"], 32)
+        self.assertEqual(res["total_permits_issued"], 64)
+        self.assertEqual(res["final_value"], 64)
+        self.assertEqual(self.simd.gws.resources[1].value, 64)
+
+    def test_wave32_divergent_counts_per_lane(self) -> None:
+        wave = SIMDWaveState(wave_id=2, wave_size=32, exec_mask=0xFFFF_FFFF)
+        wave.m0 = 0
+        for lane in range(32):
+            wave.set_vgpr(lane, 1, lane)  # Lane i delivers i permits -> sum(0..31) = 496
+
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_BR, vdata=Register(1, RegKind.VGPR), offset=2)
+        res = self.simd.step_wave(wave, instr)
+
+        self.assertEqual(res["active_lanes"], 32)
+        self.assertEqual(res["total_permits_issued"], 496)
+        self.assertEqual(res["final_value"], 496)
+
+    def test_wave64_full_exec_divergent_counts(self) -> None:
+        wave = SIMDWaveState(wave_id=3, wave_size=64, exec_mask=0xFFFF_FFFF_FFFF_FFFF)
+        wave.m0 = 0
+        for lane in range(64):
+            wave.set_vgpr(lane, 2, lane)  # sum(0..63) = 63 * 64 / 2 = 2016
+
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_BR, vdata=Register(2, RegKind.VGPR), offset=3)
+        res = self.simd.step_wave(wave, instr)
+
+        self.assertEqual(res["active_lanes"], 64)
+        self.assertEqual(res["total_permits_issued"], 2016)
+        self.assertEqual(res["final_value"], 2016)
+
+    def test_partial_exec_masks(self) -> None:
+        # Checkerboard 0x55555555: even lanes 0, 2, 4, ... active
+        wave = SIMDWaveState(wave_id=4, wave_size=32, exec_mask=0x5555_5555)
+        for lane in range(32):
+            wave.set_vgpr(lane, 0, 1)
+
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_BR, vdata=Register(0, RegKind.VGPR), offset=4)
+        res = self.simd.step_wave(wave, instr)
+
+        self.assertEqual(res["active_lanes"], 16)
+        self.assertEqual(res["total_permits_issued"], 16)
+        self.assertEqual(res["final_value"], 16)
+
+    def test_single_active_lane_sweep(self) -> None:
+        # Test each lane active in isolation
+        for lane in range(32):
+            gws = GWSSubsystem()
+            simd = SIMDInterpreter(gws=gws)
+            wave = SIMDWaveState(wave_id=5, wave_size=32, exec_mask=(1 << lane))
+            wave.set_vgpr(lane, 0, 7)
+            instr = Instruction(opcode=Opcode.DS_GWS_SEMA_BR, vdata=Register(0, RegKind.VGPR), offset=0)
+            res = simd.step_wave(wave, instr)
+            self.assertEqual(res["active_lanes"], 1)
+            self.assertEqual(res["total_permits_issued"], 7)
+            self.assertEqual(res["final_value"], 7)
+
+    def test_completely_inactive_wave(self) -> None:
+        wave = SIMDWaveState(wave_id=6, wave_size=32, exec_mask=0)
+        for lane in range(32):
+            wave.set_vgpr(lane, 0, 100)  # Non-zero counts in registers
+
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_BR, vdata=Register(0, RegKind.VGPR), offset=5)
+        res = self.simd.step_wave(wave, instr)
+
+        self.assertEqual(res["active_lanes"], 0)
+        self.assertEqual(res["total_permits_issued"], 0)
+        self.assertEqual(res["final_value"], 0)
+        self.assertEqual(self.simd.gws.resources[5].value, 0)
+
+    def test_simd_bulk_release_waking_waiting_wavefronts(self) -> None:
+        rid = 16
+        # Enqueue 10 waiters
+        for w in range(10):
+            self.simd.gws.wait_p(rid, wave_id=100 + w)
+
+        # 3 active lanes, each delivering 4 permits -> total 12 permits
+        wave = SIMDWaveState(wave_id=7, wave_size=32, exec_mask=0x7)
+        wave.m0 = rid
+        for lane in range(3):
+            wave.set_vgpr(lane, 0, 4)
+
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_BR, vdata=Register(0, RegKind.VGPR), offset=0)
+        res = self.simd.step_wave(wave, instr)
+
+        self.assertEqual(res["active_lanes"], 3)
+        self.assertEqual(res["total_permits_issued"], 12)
+        # All 10 waiters awakened
+        self.assertEqual(len(res["awakened_waves"]), 10)
+        # Remaining 2 permits in counter
+        self.assertEqual(res["final_value"], 2)
 
 
 if __name__ == "__main__":
