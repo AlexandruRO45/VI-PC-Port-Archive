@@ -225,6 +225,8 @@ def parse_matcher(s, at):
     records = [(s.f32(rec + 24 * i), s.f32(rec + 24 * i + 4), s.f32(rec + 24 * i + 8), s.u32(rec + 24 * i + 12))
                for i in range(n)]
     off, no = matcher_array(s, at + 0x68)
+    a78, ng = matcher_array(s, at + 0x78)
+    ab8, nf = matcher_array(s, at + 0xB8)
     refs_at, nr = matcher_array(s, at + 0x98)
     refs = []
     for i in range(nr):
@@ -238,7 +240,28 @@ def parse_matcher(s, at):
         "clips": [(s.u32(o), s.u32(o + 4), s.u32(o + 8)) for o in hash_table(s, at + 0xA0, 16)],  # (clip, ?, record)
         "keys": [(s.u32(o), s.u32(o + 4)) for o in hash_table(s, at + 0x170, 8)],                 # (hash, index)
         "self": (s.u32(at + 0x188), s.u32(at + 0x18C)),                  # own clip hash, joaat32(dictionary)
+        "u16_78": [s.u16(a78 + 2 * i) for i in range(ng)],            # +0x78: from 0 up to the record count
+        "u8_b8": [s.d[ab8 + i] for i in range(nf)],                    # +0xB8: 0 or 1, one per record
+        **matcher_features(s, at),
     }
+
+
+def matcher_features(s, at):
+    """The `.motionmatcher`'s `+0x20` object: the features a pose is compared on. `+0x40` is an array of pointers to
+    0x30-byte features {u32 column at +0x08; u16 width at +0x0C; u16 at +0x0E; u32 name hash at +0x18}, and
+    `+0x48` a hash table of (name hash, feature index) with 8-byte slots, hashed differently from `+0x18`."""
+    obj = s.ptr(at + 0x20)
+    if obj is None:
+        raise DecodeError("motionmatcher without a feature object")
+    arr, n = matcher_array(s, obj + 0x40)
+    features = []
+    for i in range(n):
+        f = s.ptr(arr + 8 * i)
+        if f is None:
+            raise DecodeError("motionmatcher feature pointer is null")
+        features.append((s.u32(f + 0x08), s.u16(f + 0x0C), s.u32(f + 0x18)))
+    names = [(s.u32(o), s.u32(o + 4)) for o in hash_table(s, obj + 0x48, 8)]
+    return {"features": features, "feature_names": names}                   # (column, width, name hash); (hash, index)
 
 
 def count_matcher(c, dictionary_hash, stats):
@@ -266,6 +289,21 @@ def count_matcher(c, dictionary_hash, stats):
     stats["matcher_key_table_entries"] += len(m["keys"])
     stats["matcher_key_table_indices_0_to_n"] += sorted(i for _h, i in m["keys"]) == list(range(len(m["keys"])))
     stats["matcher_self_is_own_key"] += m["self"] == (c["hash"], dictionary_hash)
+    g = m["u16_78"]
+    stats["matcher_u16_78_from_0_to_records"] += bool(g) and g[0] == 0 and g[-1] == n and all(
+        a <= b for a, b in zip(g, g[1:]))
+    stats["matcher_u8_b8_one_per_record"] += len(m["u8_b8"]) == n
+    stats["matcher_u8_b8_set"] += sum(m["u8_b8"])
+    stats["matcher_u8_b8_0_or_1"] += all(f in (0, 1) for f in m["u8_b8"])
+    f = m["features"]
+    stats["matcher_features"] += len(f)
+    stats["matcher_feature_columns"] += f[-1][0] + f[-1][1] if f else 0
+    stats["matcher_feature_columns_chain_from_0"] += bool(f) and f[0][0] == 0 and all(
+        a[0] + a[1] == b[0] for a, b in zip(f, f[1:]))
+    stats["matcher_feature_widths_multiple_of_3"] += all(w % 3 == 0 for _c, w, _h in f)
+    stats["matcher_feature_names_distinct"] += len({h for _c, _w, h in f}) == len(f)
+    stats["matcher_feature_name_table_indices_0_to_f"] += sorted(i for _h, i in m["feature_names"]) == list(
+        range(len(f)))
 
 
 def parse_clip(s, at):
