@@ -290,6 +290,45 @@ class SIMDInterpreter:
 
 
 # ==============================================================================
+# Condition Codes, Status Flags, and Carry Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class Dot4StatusFlags:
+    """Architectural condition codes and status flags for v_dot4_u32_u8."""
+    carry: bool
+    zero: bool
+    dot_zero: bool
+    max_dot: bool
+    active_terms: int
+    dot_sum: int
+    full_sum: int
+
+
+def evaluate_dot4_flags(s0: int, s1: int, s2: int = 0) -> Dot4StatusFlags:
+    """Evaluate architectural condition codes and status flags for v_dot4_u32_u8."""
+    b = unpack_u8(s0)
+    c = unpack_u8(s1)
+    prods = [(b[i] * c[i]) for i in range(4)]
+    dot = sum(prods)
+    acc = s2 & MASK32
+    full_sum = acc + dot
+    carry = bool(full_sum >= (1 << 32))
+    res = full_sum & MASK32
+    active = sum(1 for p in prods if p > 0)
+
+    return Dot4StatusFlags(
+        carry=carry,
+        zero=(res == 0),
+        dot_zero=(dot == 0),
+        max_dot=(dot == MAX_DOT4_SUM),
+        active_terms=active,
+        dot_sum=dot,
+        full_sum=full_sum,
+    )
+
+
+# ==============================================================================
 # Unit Tests: Model and Reference Oracle
 # ==============================================================================
 
@@ -753,6 +792,65 @@ class TestValuDot4U32U8RegisterAliasing(unittest.TestCase):
                 self.assertEqual(state.read_lane(Operand.vgpr(0), lane), initial_acc + 70)
             else:
                 self.assertEqual(state.read_lane(Operand.vgpr(0), lane), initial_acc)
+
+
+class TestValuDot4U32U8StatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry generation."""
+
+    def test_carry_flag_exact_boundary(self) -> None:
+        # acc = 0xFFFFFFFF, dot = 1 -> full_sum = 0x100000000 -> carry = True, zero = True
+        flags = evaluate_dot4_flags(s0=0x00000001, s1=0x00000001, s2=0xFFFF_FFFF)
+        self.assertTrue(flags.carry)
+        self.assertTrue(flags.zero)
+        self.assertEqual(flags.full_sum, 0x1_0000_0000)
+        self.assertEqual(flags.dot_sum, 1)
+
+        # acc = 0xFFFFFFFF, dot = 0 -> full_sum = 0xFFFFFFFF -> carry = False, zero = False
+        flags_no_carry = evaluate_dot4_flags(s0=0, s1=0, s2=0xFFFF_FFFF)
+        self.assertFalse(flags_no_carry.carry)
+        self.assertFalse(flags_no_carry.zero)
+        self.assertEqual(flags_no_carry.full_sum, 0xFFFF_FFFF)
+        self.assertEqual(flags_no_carry.dot_sum, 0)
+
+    def test_max_dot_condition(self) -> None:
+        flags = evaluate_dot4_flags(0xFFFFFFFF, 0xFFFFFFFF, 0)
+        self.assertTrue(flags.max_dot)
+        self.assertEqual(flags.dot_sum, 260100)
+        self.assertEqual(flags.active_terms, 4)
+        self.assertFalse(flags.carry)
+        self.assertFalse(flags.zero)
+
+    def test_all_zero_condition(self) -> None:
+        flags = evaluate_dot4_flags(0, 0, 0)
+        self.assertTrue(flags.zero)
+        self.assertTrue(flags.dot_zero)
+        self.assertFalse(flags.carry)
+        self.assertFalse(flags.max_dot)
+        self.assertEqual(flags.active_terms, 0)
+
+    def test_active_terms_counting(self) -> None:
+        # Term 0 only
+        f1 = evaluate_dot4_flags(0x00000001, 0x00000001, 0)
+        self.assertEqual(f1.active_terms, 1)
+
+        # Terms 0 and 2
+        f2 = evaluate_dot4_flags(0x00010001, 0x00010001, 0)
+        self.assertEqual(f2.active_terms, 2)
+
+        # Terms 0, 1, 2
+        f3 = evaluate_dot4_flags(0x00010101, 0x00010101, 0)
+        self.assertEqual(f3.active_terms, 3)
+
+        # All 4 terms
+        f4 = evaluate_dot4_flags(0x01010101, 0x01010101, 0)
+        self.assertEqual(f4.active_terms, 4)
+
+    def test_carry_without_zero(self) -> None:
+        # acc = 0xFFFFFFFF, dot = 2 -> full_sum = 0x100000001 -> carry = True, zero = False (res = 1)
+        flags = evaluate_dot4_flags(s0=0x00000002, s1=0x00000001, s2=0xFFFF_FFFF)
+        self.assertTrue(flags.carry)
+        self.assertFalse(flags.zero)
+        self.assertEqual(flags.full_sum, 0x1_0000_0001)
 
 
 if __name__ == "__main__":
