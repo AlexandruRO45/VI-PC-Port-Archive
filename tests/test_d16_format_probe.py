@@ -127,6 +127,17 @@ class FakeOracle:
         pass
 
 
+class ShortOracle(FakeOracle):
+    """Returns fewer results than kernels (BUILD-733): `keep` of them, 0 for none."""
+
+    def __init__(self, keep):
+        super().__init__()
+        self.keep = keep
+
+    def run(self, kernels, words=4):
+        return super().run(kernels, words)[:self.keep]
+
+
 def run_main(oracle, *args):
     buf = io.StringIO()
     with mock.patch.object(runner, "open_oracle", return_value=oracle), redirect_stdout(buf):
@@ -216,6 +227,24 @@ class OnHardware(unittest.TestCase):
         self.assertEqual(w32["buffer_d16"][255] & 0xFFFF, 0x3C00)
         self.assertEqual(w32["buffer_d16"][0] & 0xFFFF, 0)
         self.assertEqual(w32["buffer_f32"][255], 0x3F800000)
+
+
+class ShortResults(unittest.TestCase):
+    """BUILD-733: zip() dropped the kernels past the end of a short result list, so a sweep with too few (or no)
+    results looked complete and the run exited 0."""
+
+    def test_sweep_raises_on_a_short_result_list(self):
+        n = len(pr.jobs("unorm8"))
+        for keep in (0, 1, n - 1):
+            with self.subTest(keep=keep):
+                with self.assertRaisesRegex(RuntimeError, f"returned {keep} results for {n} kernels"):
+                    pr.sweep(ShortOracle(keep), "unorm8", 32)
+        self.assertIn("buffer_d16", pr.sweep(ShortOracle(n), "unorm8", 32))     # all results: unchanged
+
+    def test_main_fails_instead_of_passing(self):
+        with redirect_stderr(io.StringIO()):
+            rc, out = run_main(ShortOracle(0))
+        self.assertNotEqual(rc, 0, out)
 
 
 class ReportPathTests(unittest.TestCase):

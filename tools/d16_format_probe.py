@@ -185,6 +185,10 @@ def sweep(oracle, fmt, wave):
     kernels = [asm.Kernel(kernel_lines(inst, fmt, base), wave, THREADS, WORDS, raw=True, vgprs=8, sgprs=16)
                for inst, base in todo]
     got = oracle.run(kernels, words=WORDS)
+    if len(got) != len(todo):
+        # zip() would stop at the shorter list and drop kernels without a word, so a runner that returned too few
+        # results (even none) gave a sweep that looked complete (BUILD-733)
+        raise RuntimeError(f"{fmt} wave{wave}: the oracle returned {len(got)} results for {len(todo)} kernels")
     out = {}
     for (inst, base), words in zip(todo, got):
         if isinstance(words, str) or len(words) != WORDS:
