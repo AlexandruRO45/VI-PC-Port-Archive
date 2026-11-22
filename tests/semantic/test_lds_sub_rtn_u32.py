@@ -189,6 +189,46 @@ class DSSubRtnInstruction:
         return " ".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Deterministic Scalar Instruction Interpreter
+# ---------------------------------------------------------------------------
+
+class ScalarMachineState:
+    """Architectural state for scalar execution context."""
+
+    def __init__(self, lds_dwords: int = DEFAULT_LDS_DWORDS) -> None:
+        self.vgprs: list[int] = [0] * DEFAULT_NUM_VGPRS
+        self.sgprs: list[int] = [0] * DEFAULT_NUM_SGPRS
+        self.lds: LDSMemory = LDSMemory(size_dwords=lds_dwords)
+
+    def get_vgpr(self, index: int) -> int:
+        return self.vgprs[index]
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        self.vgprs[index] = u32(val)
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index]
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        self.sgprs[index] = u32(val)
+
+
+class ScalarInterpreter:
+    """Deterministic scalar interpreter for ds_sub_rtn_u32."""
+
+    def execute(self, instr: DSSubRtnInstruction, state: ScalarMachineState) -> int:
+        """Executes a scalar ds_sub_rtn_u32 instruction."""
+        if instr.opcode != DSOpcode.DS_SUB_RTN_U32:
+            raise NotImplementedError(f"Unsupported opcode: {instr.opcode}")
+
+        vaddr = state.get_vgpr(instr.addr.index)
+        vdata = state.get_vgpr(instr.data.index)
+        old_val = ref_ds_sub_rtn_u32(state.lds, vaddr=vaddr, vdata=vdata, offset=instr.offset)
+        state.set_vgpr(instr.dst.index, old_val)
+        return old_val
+
+
 class TestSymbolicAST(unittest.TestCase):
     """Unit tests for symbolic AST opcode definitions and typed expressions."""
 
@@ -255,6 +295,82 @@ class TestSymbolicAST(unittest.TestCase):
 
         with self.assertRaises(Exception):
             i1.offset = 20  # type: ignore
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.state = ScalarMachineState(lds_dwords=1024)
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_sub_and_return(self) -> None:
+        self.state.lds.write_dword(4, 500)
+        self.state.set_vgpr(1, 16)
+        self.state.set_vgpr(2, 200)
+        self.state.set_vgpr(0, 0)
+
+        instr = DSSubRtnInstruction(
+            dst=RegisterOperand(0),
+            addr=RegisterOperand(1),
+            data=RegisterOperand(2),
+            offset=0,
+        )
+        old_val = self.interp.execute(instr, self.state)
+
+        self.assertEqual(old_val, 500)
+        self.assertEqual(self.state.get_vgpr(0), 500)
+        self.assertEqual(self.state.lds.read_dword(4), 300)
+
+    def test_scalar_underflow_wrapping(self) -> None:
+        self.state.lds.write_dword(8, 10)
+        self.state.set_vgpr(1, 32)
+        self.state.set_vgpr(2, 25)
+
+        instr = DSSubRtnInstruction(
+            dst=RegisterOperand(0),
+            addr=RegisterOperand(1),
+            data=RegisterOperand(2),
+        )
+        old_val = self.interp.execute(instr, self.state)
+
+        self.assertEqual(old_val, 10)
+        self.assertEqual(self.state.get_vgpr(0), 10)
+        self.assertEqual(self.state.lds.read_dword(8), MASK32 - 14)
+
+    def test_scalar_offset_handling(self) -> None:
+        self.state.lds.write_dword(31, 1000)
+        self.state.set_vgpr(1, 100)
+        self.state.set_vgpr(2, 100)
+
+        instr = DSSubRtnInstruction(
+            dst=RegisterOperand(0),
+            addr=RegisterOperand(1),
+            data=RegisterOperand(2),
+            offset=24,
+        )
+        old_val = self.interp.execute(instr, self.state)
+
+        self.assertEqual(old_val, 1000)
+        self.assertEqual(self.state.get_vgpr(0), 1000)
+        self.assertEqual(self.state.lds.read_dword(31), 900)
+
+    def test_scalar_determinism(self) -> None:
+        runs: list[tuple[int, int]] = []
+        for _ in range(50):
+            st = ScalarMachineState(lds_dwords=512)
+            st.lds.write_dword(20, 0x12345678)
+            st.set_vgpr(1, 80)
+            st.set_vgpr(2, 0x00000078)
+            instr = DSSubRtnInstruction(
+                dst=RegisterOperand(0),
+                addr=RegisterOperand(1),
+                data=RegisterOperand(2),
+            )
+            ret = self.interp.execute(instr, st)
+            runs.append((ret, st.lds.read_dword(20)))
+
+        self.assertTrue(all(r == (0x12345678, 0x12345600) for r in runs))
 
 
 if __name__ == '__main__':
