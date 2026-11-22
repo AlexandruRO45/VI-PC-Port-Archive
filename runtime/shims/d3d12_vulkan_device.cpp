@@ -7616,6 +7616,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         bias_control.floatRepresentation = VK_FALSE;
         bias_control.pNext = *v13.next();
         *v13.next() = &bias_control;
+    } else {
+        std::fprintf(stderr, "[rt] d3d12: no VK_EXT_depth_bias_control depthBiasExact; fixed-point DepthBias is the "
+                             "driver's (up to 2x D3D's)\n");
     }
 
     // The pixel-shader extensions translated shaders can declare (VulkanDeviceInfo::fragment_shader_barycentric and
