@@ -879,5 +879,110 @@ class TestValuCvtPkU16U32Aliasing(unittest.TestCase):
                 self.assertEqual(val, lane + 1)
 
 
+# ==============================================================================
+# Unit Tests: Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+class TestValuCvtPkU16U32StatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow generation.
+    
+    Verifies that v_cvt_pk_u16_u32 adheres to RDNA2 VALU specifications:
+    - Never generates carry/borrow.
+    - Never clobbers VCC (Vector Condition Code).
+    - Preserves EXEC mask and scalar SGPR states.
+    - Accurately integrates into downstream condition flag generation (e.g. v_cmp).
+    """
+
+    def setUp(self) -> None:
+        self.interp = ScalarVALUInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_scalar_vcc_preservation_canaries(self) -> None:
+        canaries = [
+            0x0000_0000_0000_0000,
+            0xFFFF_FFFF_FFFF_FFFF,
+            0xAAAA_AAAA_AAAA_AAAA,
+            0x5555_5555_5555_5555,
+            0x1234_5678_9ABC_DEF0,
+        ]
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_U16_U32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Immediate(0x1000),
+            src1=Immediate(0x2000),
+        )
+        for canary in canaries:
+            with self.subTest(canary=hex(canary)):
+                self.state.vcc = canary
+                self.interp.step(inst, self.state)
+                self.assertEqual(self.state.vcc, canary)
+
+    def test_saturation_does_not_generate_carry_or_modify_vcc(self) -> None:
+        # Massive integer overflow past 16-bit range
+        self.state.vcc = 0x1122_3344_5566_7788
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_U16_U32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Immediate(0xFFFF_FFFF),
+            src1=Immediate(0xFFFF_FFFF),
+        )
+        self.interp.step(inst, self.state)
+        # Saturated result written to destination
+        self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 0)), 0xFFFF_FFFF)
+        # VCC remains completely unaltered: NO carry or overflow flag is produced
+        self.assertEqual(self.state.vcc, 0x1122_3344_5566_7788)
+
+    def test_simd_vcc_and_exec_preservation(self) -> None:
+        wave_canary_vcc = 0xCAFE_F00D_DEAD_BEEF
+        exec_mask = 0x00FF_00FF
+        state = SIMDState(wave_size=32, exec_mask=exec_mask)
+        state.vcc = wave_canary_vcc
+        interp = SIMDWavefrontInterpreter(wave_size=32)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_U16_U32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Immediate(0xDEAD),
+            src1=Immediate(0xBEEF),
+        )
+        interp.step(inst, state)
+
+        self.assertEqual(state.vcc, wave_canary_vcc)
+        self.assertEqual(state.exec_mask, exec_mask)
+
+    def test_downstream_condition_code_synthesis(self) -> None:
+        # Downstream emulation of v_cmp_eq_u32 on packed result
+        state = SIMDState(wave_size=32, exec_mask=0xFFFF_FFFF)
+        interp = SIMDWavefrontInterpreter(wave_size=32)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_U16_U32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+            src1=Register(RegKind.VGPR, 2),
+        )
+
+        target_packed = 0xFFFF_0010  # src0=16, src1 saturated
+        for lane in range(32):
+            s0 = 16 if (lane % 2 == 0) else 99
+            s1 = 0x20000 if (lane % 4 == 0) else 50
+            state.write_lane_reg(lane, Register(RegKind.VGPR, 1), s0)
+            state.write_lane_reg(lane, Register(RegKind.VGPR, 2), s1)
+
+        interp.step(inst, state)
+
+        # Synthesize downstream comparison: lanes where result == target_packed
+        vcc_mask = 0
+        for lane in range(32):
+            val = state.read_lane_reg(lane, Register(RegKind.VGPR, 0))
+            if val == target_packed:
+                vcc_mask |= (1 << lane)
+
+        # target_packed requires s0==16 (even lanes) and s1 >= 65536 (lanes % 4 == 0)
+        # So only lanes that are multiples of 4 should match!
+        expected_vcc = sum(1 << lane for lane in range(0, 32, 4))
+        self.assertEqual(vcc_mask, expected_vcc)
+
+
 if __name__ == "__main__":
     unittest.main()
