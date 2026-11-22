@@ -119,7 +119,7 @@ Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` arc
 - [ffmpeg](https://ffmpeg.org/download.html) on PATH (optional: decodes the XMA2 streams, and required for `--wav`).
 
 **Low disk space:** the ~350 GB figure is for the full build. To *run* the port, `--stages check,shaders,runtime`
-needs about 30 GB; the `assets` stage (~300 GB) is only for the asset tools, and `--wav` adds several times the
+needs about 30 GB; the `assets` stage (~350 GB) is only for the asset tools, and `--wav` adds several times the
 Ogg Opus size (the preflight prints this choice when the assets stage is what does not fit). `--work` and `--out`
 can sit on another drive. The runtime maps the package in place, so a read-only package drive needs
 `gta6rt --overlay <writable folder>`; `--overlay` is a `gta6rt` option, not a `make_game.py` one. Leave the `.s`

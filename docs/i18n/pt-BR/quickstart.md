@@ -51,7 +51,7 @@ O projeto está em fase inicial: **o jogo ainda não dá boot**.
 - [ffmpeg](https://ffmpeg.org/download.html) no `PATH` *(opcional: decodifica streams XMA2 e é exigido ao usar `--wav`)*.
 
 **Pouco espaço em disco:** o valor de ~350 GB refere-se ao build completo. Para *executar* o port,
-`--stages check,shaders,runtime` precisa de cerca de **30 GB**; o estágio `assets` (~300 GB) serve apenas para as
+`--stages check,shaders,runtime` precisa de cerca de **30 GB**; o estágio `assets` (~350 GB) serve apenas para as
 ferramentas de extração de assets, e `--wav` adiciona várias vezes o tamanho dos arquivos Ogg Opus. `--work` e `--out`
 podem apontar para outro disco; se o pacote do jogo estiver em uma unidade somente leitura, use `--overlay` em um disco
 gravável. Mantenha os arquivos `.s` em `work/shaders/dxbc/disasm`: apagá-los mantendo a pasta faz o estágio parecer
@@ -101,7 +101,7 @@ Para preparar o runtime e os shaders com cerca de **30 GB livres**, execute na r
 python -I make_game.py --stages check,shaders,runtime
 ```
 
-O estágio `assets` serve às ferramentas de extração e ocupa cerca de 300 GB. A opção `--wav` aumenta ainda mais
+O estágio `assets` serve às ferramentas de extração e ocupa cerca de 350 GB. A opção `--wav` aumenta ainda mais
 o espaço usado pelos áudios. Você pode apontar `--work` e `--out` para outro disco. Se o disco do pacote for
 somente leitura, passe `--overlay` ao iniciar o runtime e aponte para uma pasta em um disco gravável.
 
