@@ -923,5 +923,140 @@ class TestConditionCodesStatusFlagsAndCarryBorrow(unittest.TestCase):
         self.assertFalse(st_inactive["active_wave"])
 
 
+class TestIEEE754BoundaryExtremesAndNaNHandling(unittest.TestCase):
+    """Phase 7: Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    # Canonical IEEE 754 float32 bit representations
+    F32_POS_ZERO: int = 0x0000_0000
+    F32_NEG_ZERO: int = 0x8000_0000
+    F32_MIN_SUBNORMAL: int = 0x0000_0001
+    F32_MAX_SUBNORMAL: int = 0x007F_FFFF
+    F32_NEG_MIN_SUBNORMAL: int = 0x8000_0001
+    F32_NEG_MAX_SUBNORMAL: int = 0x807F_FFFF
+    F32_MIN_NORMAL: int = 0x0080_0000
+    F32_ONE: int = 0x3F80_0000
+    F32_NEG_ONE: int = 0xBF80_0000
+    F32_MAX_NORMAL: int = 0x7F7F_FFFF
+    F32_NEG_MAX_NORMAL: int = 0xFF7F_FFFF
+    F32_POS_INF: int = 0x7F80_0000
+    F32_NEG_INF: int = 0xFF80_0000
+    F32_QNAN_CANONICAL: int = 0x7FC0_0000
+    F32_SNAN: int = 0x7F80_0001
+    F32_NEG_QNAN: int = 0xFFC0_0000
+    F32_CUSTOM_NAN_PAYLOAD: int = 0x7FA5_BEEF
+
+    # Packed 16-bit float patterns
+    F16_PACKED_ONES: int = 0x3C00_3C00
+    F16_PACKED_NANS: int = 0x7E00_7E00
+
+    def test_signed_zeros_preservation(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        state.set_vgpr(0, self.F32_POS_ZERO)
+        state.set_vgpr(1, self.F32_NEG_ZERO)
+
+        instr_v = DSGWSSemaphoreInstruction(
+            opcode=DSOpcode.DS_GWS_SEMA_V,
+            vdata0=RegisterOperand(0, RegType.VGPR),
+            offset=0,
+        )
+        interp.execute(instr_v, state)
+        self.assertEqual(state.get_vgpr(0), self.F32_POS_ZERO)
+
+        instr_p = DSGWSSemaphoreInstruction(
+            opcode=DSOpcode.DS_GWS_SEMA_P,
+            vdata0=RegisterOperand(1, RegType.VGPR),
+            offset=0,
+        )
+        interp.execute(instr_p, state, wave_id=1)
+        self.assertEqual(state.get_vgpr(1), self.F32_NEG_ZERO)
+
+    def test_subnormals_preservation_no_ftz(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        state.set_vgpr(0, self.F32_MIN_SUBNORMAL)
+        instr = DSGWSSemaphoreInstruction(
+            opcode=DSOpcode.DS_GWS_SEMA_V,
+            vdata0=RegisterOperand(0, RegType.VGPR),
+            offset=1,
+        )
+        interp.execute(instr, state)
+        self.assertEqual(state.get_vgpr(0), self.F32_MIN_SUBNORMAL)
+
+    def test_normals_and_infinities_preservation(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        patterns = [
+            self.F32_MIN_NORMAL,
+            self.F32_MAX_NORMAL,
+            self.F32_POS_INF,
+            self.F32_NEG_INF,
+        ]
+
+        for reg_idx, pattern in enumerate(patterns):
+            state.set_vgpr(reg_idx, pattern)
+            instr = DSGWSSemaphoreInstruction(
+                opcode=DSOpcode.DS_GWS_SEMA_V,
+                vdata0=RegisterOperand(reg_idx, RegType.VGPR),
+                offset=reg_idx,
+            )
+            interp.execute(instr, state)
+            self.assertEqual(state.get_vgpr(reg_idx), pattern)
+
+    def test_nans_payload_preservation_no_quieting(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        nan_patterns = [
+            (self.F32_QNAN_CANONICAL, 10),
+            (self.F32_SNAN, 11),
+            (self.F32_NEG_QNAN, 12),
+            (self.F32_CUSTOM_NAN_PAYLOAD, 13),
+        ]
+
+        for pattern, reg_idx in nan_patterns:
+            state.set_vgpr(reg_idx, pattern)
+            instr = DSGWSSemaphoreInstruction(
+                opcode=DSOpcode.DS_GWS_SEMA_V,
+                vdata0=RegisterOperand(reg_idx, RegType.VGPR),
+                offset=reg_idx,
+            )
+            interp.execute(instr, state)
+            self.assertEqual(state.get_vgpr(reg_idx), pattern)
+            if pattern == self.F32_SNAN:
+                self.assertEqual(state.get_vgpr(reg_idx) & 0x0040_0000, 0)
+
+    def test_packed_f16_bit_patterns(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        state.set_vgpr(0, self.F16_PACKED_ONES)
+        interp.execute(
+            DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_V, vdata0=RegisterOperand(0, RegType.VGPR), offset=20),
+            state,
+        )
+        self.assertEqual(state.get_vgpr(0), self.F16_PACKED_ONES)
+
+    def test_simd_nan_preservation_across_all_lanes(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFFFFFF)
+        interp = SIMDInterpreter()
+
+        for lane in range(32):
+            state.set_lane_vgpr(lane, 0, self.F32_CUSTOM_NAN_PAYLOAD)
+
+        instr = DSGWSSemaphoreInstruction(
+            opcode=DSOpcode.DS_GWS_SEMA_V,
+            vdata0=RegisterOperand(0, RegType.VGPR),
+            offset=30,
+        )
+        interp.execute(instr, state)
+
+        for lane in range(32):
+            self.assertEqual(state.get_lane_vgpr(lane, 0), self.F32_CUSTOM_NAN_PAYLOAD)
+
+
 if __name__ == "__main__":
     unittest.main()
