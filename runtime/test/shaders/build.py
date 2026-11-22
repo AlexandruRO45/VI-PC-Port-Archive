@@ -12,7 +12,8 @@ A shader whose header has "; fssm-at: 0xOFFSET" and "; fssm-data: 0xWORD ..." co
 FSSM program (the magic, zeros up to OFFSET, then the words): it is published as <out>/fssm/<name>.fssm and its
 SHA-256 goes into the index as fssm_sha256, which is what the layer looks a PSO's shader up by (the translator
 hashes <work>/fssm/<name>.fssm for the game's programs, and compute shaders here already). A test builds the shader container from that file. The words
-are also what a shader reads through s_getpc_b64 (the code base) at that offset.
+are also what a shader reads through s_getpc_b64 (the code base) at that offset. The generated compute headers
+are published in the same directory for compute PSO tests.
 The stage comes from the name's prefix. Mesh shaders (ms_) also need a DXBC container with their PSV0, which this
 doesn't make; geometry shaders (gs_) get gs_tri's signatures (gs_container).
 The comment at the top of each .asm says which test program to run on the result and what it should print.

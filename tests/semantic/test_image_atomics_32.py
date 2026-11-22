@@ -143,8 +143,9 @@ class ImageAtomics32Tests(unittest.TestCase):
         self.assertNotIn("OpFOrdEqual", spv_3d)
 
     def test_rejected_forms(self):
+        # 64-bit swap (dmask:0x3) is no longer rejected: image_atomic64 lowers it since the
+        # 64-bit typed image atomics change; the PR's test_image_atomic64.py covers it positively.
         for line in (
-            "image_atomic_swap v[2:3], v[4:5], s[4:11] dmask:0x3 dim:SQ_RSRC_IMG_2D unorm",       # 64-bit swap
             "image_atomic_inc v[2:3], v[4:5], s[4:11] dmask:0x3 dim:SQ_RSRC_IMG_2D unorm",        # 64-bit inc
             "image_atomic_fcmpswap v2, v[4:5], s[4:11] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm",       # 1-VGPR fcmpswap
             "image_atomic_fmin v2, v4, s[4:11] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm",               # too few 2D coords
