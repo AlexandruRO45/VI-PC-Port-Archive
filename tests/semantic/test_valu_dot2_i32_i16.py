@@ -764,5 +764,46 @@ class TestValuDot2I32I16ConditionCodesAndFlags(unittest.TestCase):
         self.assertTrue(flags_clamped.overflow)
 
 
+# ==============================================================================
+# IEEE 754 Boundary Extremes and Raw Bit Patterns
+# ==============================================================================
+
+class TestValuDot2I32I16IEEE754BitPatterns(unittest.TestCase):
+    """Verifies integer interpretation of IEEE 754 float bit patterns in registers."""
+
+    POS_ZERO_F16 = 0x0000
+    NEG_ZERO_F16 = 0x8000  # As signed i16: -32768
+    POS_INF_F16 = 0x7C00   # As signed i16: 31744
+    NEG_INF_F16 = 0xFC00   # As signed i16: -1024
+    QNAN_F16 = 0x7E00      # As signed i16: 32256
+
+    def test_signed_zero_float_bits_interpreted_as_int16(self) -> None:
+        """+0.0 (0x0000) is 0, -0.0 (0x8000) is -32768."""
+        s0 = pack_i16x2(self.NEG_ZERO_F16, self.POS_ZERO_F16)
+        s1 = pack_i16x2(1, 0)
+        s2 = 0
+        res = ref_dot2_i32_i16(s0, s1, s2)
+        # (-32768) * 1 + 0 = -32768
+        self.assertEqual(res, u32(-32768))
+
+    def test_infinity_float_bits_arithmetic(self) -> None:
+        """+inf bitfield (0x7C00 = 31744) multiplied as signed int16."""
+        s0 = pack_i16x2(self.POS_INF_F16, 0)
+        s1 = pack_i16x2(2, 0)
+        s2 = 0
+        res = ref_dot2_i32_i16(s0, s1, s2)
+        # 31744 * 2 = 63488
+        self.assertEqual(res, 63488)
+
+    def test_nan_float_bits_arithmetic(self) -> None:
+        """qNaN bitfield (0x7E00 = 32256) multiplied without exception."""
+        s0 = pack_i16x2(self.QNAN_F16, 0)
+        s1 = pack_i16x2(3, 0)
+        s2 = 100
+        res = ref_dot2_i32_i16(s0, s1, s2)
+        # 32256 * 3 + 100 = 96768 + 100 = 96868
+        self.assertEqual(res, 96868)
+
+
 if __name__ == "__main__":
     unittest.main()
