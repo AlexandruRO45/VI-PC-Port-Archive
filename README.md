@@ -1,30 +1,65 @@
 # Xbox2Windows
 
-Xbox2Windows researches **GTA VI static recompilation** from Xbox Series X|S (Scarlett) to x64 Windows. Windows, the mapped original and the recompiled build agree on output and exit codes for source-built programs. Two pixel shaders from the inspected package compiled to desktop DXIL and matched reference pixels on an RTX 4060 Laptop GPU and WARP. Execution of the title's CPU code, full-game startup and frame rate remain unverified.
+Xbox2Windows researches static recompilation from Xbox Series X|S (Scarlett) to x64 Windows. It translates selected x64 machine code into C++ and selected gfx1013 shaders into desktop DXIL. The public tests build their own inputs and run without a game installation.
 
-**Help wanted on Windows:** [Claim a batch of GPU reports in #1](https://github.com/R0Y00/Xbox2Windows/issues/1). Link the reports you will cover, check each original log against the hardware table, and submit one README PR for the batch. You can do this without a GPU or a local copy of the package.
+**Startup status.** Source-built Windows programs run from entry to process exit. The main executable was absent from the inspected package. Execution of the title's CPU code, full-game startup and frame rate remain unverified.
 
-The CPU experiments translate source-built x64 functions from PE machine code through C++ to Windows executables and DLLs. A source-built EXE runs from its translated entry through a nested call that reads and writes globals in a relocated image, then through a named DLL import. Windows, the mapped original and the recompiled EXE agree on the import arguments, output and exit code for two inputs and two initial data states. A [CRC-32 console program](docs/experiments.md#crc-32-console-program-from-the-pe-entry) also runs from its PE entry through a separately compiled C++ checksum routine and Windows UCRT stream I/O, with matching output and exit codes on all three runners. A [multi-record archive reader](docs/experiments.md#two-record-archive-reader-from-standard-startup) runs from standard Zig startup through [recompiled blast decompression](docs/experiments.md#recompiling-the-blast-decoder) to process exit, including the callback sequence and partial-record cleanup. The shader experiment translates selected gfx1013 pixel shaders through HLSL to desktop DXIL. Other experiments test the Windows runtime, render recovered texture levels and read script state data.
-
-New to the project? The [pinned guide in GitHub Discussions](https://github.com/R0Y00/Xbox2Windows/discussions/75) will help you choose a first contribution. Ask build and debugging questions in [Development Q&A](https://github.com/R0Y00/Xbox2Windows/discussions/categories/development-q-a).
-
-[![Instruction-form coverage of source-built fixtures, not a measure of port completion](docs/coverage/dashboard.svg)](tools/coverage_svg.py)
-
-Snapshot measured at [c04e65a](https://github.com/R0Y00/Xbox2Windows/commit/c04e65a8a9c1a6881edaf4bdd283d35e39dac8ce). For the latest chart, open the newest [successful Windows checks run on main](https://github.com/R0Y00/Xbox2Windows/actions/workflows/windows.yml?query=branch%3Amain+event%3Apush+is%3Asuccess) and download `coverage-dashboard` from Artifacts.
+[Build on Windows](#first-build) · [Run the standalone GPU check](#run-the-gpu-check) · [Choose an experiment](#choose-an-experiment) · [Contribute or review a PR](CONTRIBUTING.md)
 
 ## Current results and open work
 
-| Area | Result on Windows | Open question or contribution |
-|---|---|---|
-| FidelityFX upscaler | The recompiled provider creates 11 resources at 720p → 1080p and a twelfth with the debug flag. On RTX 4060 Laptop and WARP, both the per-resource indices and the returned loader and provider handles passed. Recompiled graph pass 26 wrote the RCAS intermediate and the recompiled RCAS shader read it with five integer texel loads per output. Passes 24 and 25 supplied all 72 scratch reads on the 8×4 tile. Both adapters passed the zero and nonzero input comparisons through the final 256 pixels. [Scratch writers](docs/experiments.md#last-writers-of-the-pass-26-scratch-reads) · [Dispatch trace and replay](docs/experiments.md#fsr4-dispatch-through-the-rcas-input) · [RCAS format test](docs/experiments.md#rcas-intermediate-texel-access) · [Provider loop and desktop mappings](docs/experiments.md#provider-resource-loop-and-returned-handles) · [Recurrent texture pixel readback](docs/experiments.md#recurrent-texture-views-and-pixel-readback) | Exercise the full-wave LDS path of pass 26 with a larger tile using the verified scratch producers. |
-| x64 context callbacks | The recompiled FidelityFX loader destroy function calls the bound provider and preserves its 32-bit result across both cleanup paths on Windows. The upscaler slot was identified in the local package. [Provider and Windows comparison](docs/experiments.md#fidelityfx-destroy-provider-and-cleanup) | Verify the upscaler's internal effect teardown with a successfully created graphics context. |
-| CPU translation | The [source-built EXE](docs/experiments.md#source-built-exe-entry-to-a-dll-import) matches native import arguments, output bytes and process status when its entry selects between two internal callers of the same named import. A [leaf function](docs/experiments.md#offline-cpu-leaf-recompilation), a [direct call](docs/experiments.md#recompiling-a-direct-x64-call), a caller that calls one callee twice or two different callees, and cross-DLL imports [by name](docs/experiments.md#calling-another-dll-through-a-named-pe-import) and [by ordinal](docs/experiments.md#calling-an-ordinal-only-export) match the original fixtures on Windows. [Switch dispatch through jump tables](docs/experiments.md#switch-dispatch-through-jump-tables) in the MSVC and LLVM layouts, including from a loop, matches the original fixture on Windows. The same translator supports overflow/parity conditions and lifts `SETcc` and `CMOVcc` that read the flags of an earlier compare or test in the same straight-line run, and matches the original fixture on Windows. It also translates functions with a [fixed stack frame](docs/experiments.md#switch-dispatch-through-jump-tables), saved nonvolatile registers and spilled locals, which match the original fixture on Windows. Direct calls and tail jumps to verified primary runtime functions or code exports of the same image translate each callee once into the same source and match the original fixture on Windows; callees without an unwind entry are accepted only through an opt-in range manifest bound to the image hash, and indirect calls, recursion and frame addresses passed to a callee stay rejected. The import fixtures and a relocated variant also run from an image [mapped without LoadLibrary](docs/experiments.md#mapping-an-image-without-loadlibrary), with imports bound through a host resolver. Mapped images also handle SEH and receive TLS-callback and entry-point notifications in the order Windows uses. The [recompiled Bink allocation and release callers](docs/experiments.md#bink-allocation-and-release-on-the-windows-heap) passed size, alignment, null fallback and release checks on Windows. Blocks allocated through a custom callback retained their release function after callback replacement. A grouped caller rounds a prefix to 32 bytes and places payload pointers inside the allocation or in caller-owned slots. The [frame allocator](docs/experiments.md#frame-buffers-through-the-shared-windows-heap) now reaches the shared Windows heap with success, injected failure and retry checks. A [leaf AVX2 translator](docs/experiments.md#avx2-leaf-recompilation) lifts all 28 AVX2 forms (register-domain ops, VSIB gathers and masked loads/stores) across XMM and YMM widths and matches the native fixture and Python reference on Windows, including guard-page fault suppression. A [leaf AVX packed-integer translator](docs/experiments.md#avx-packed-integer-leaf-recompilation) lifts 90 AVX packed-integer forms (including `vzeroall` and `vzeroupper`) in VEX.128 mode, and a [leaf AVX bit-move translator](docs/experiments.md#avx-bit-move-shuffle-blend-and-logical-leaf-recompilation) lifts 50 AVX move, shuffle, blend, broadcast, lane, permute, unpack, logical and masked load/store forms across XMM and YMM widths (excluding the 33 AVX forms carved out to `cpu_vex_aot.py (PR #325)`), both matching their native fixtures and Python references on Windows, including unaligned paths and guard-page fault suppression. | Trace the producer of odd tagged strides. |
-| Shader translation | Supported pixel programs export RG or RGBA from immediates, four-component interpolated attributes, a constant buffer or sampled textures. Arithmetic coverage includes absolute-value operands and `v_trunc_f32` rounding toward zero. All 16 floating-point comparison predicates have D3D12 readback coverage, including NaN inputs. A two-texture fixture moves the older sample after a partial VM wait and checks the final blend against a CPU reference. [Translation and bindings](docs/experiments.md#offline-pixel-shader-recompilation) | Supply a source-built instruction case with known register inputs and an expected color. |
-| BC7 textures | A translated shader samples recovered mip levels on hardware and WARP. Requests for missing high-resolution levels use the first resident level. [Mip fallback tests](docs/experiments.md#drawing-bc7-textures-with-a-recompiled-pixel-shader) | Match a variable BCPack lane against independently known BC7 blocks. [Issue #15](https://github.com/R0Y00/Xbox2Windows/issues/15) |
-| Script states | A native x64 probe follows state-tree links and reproduces distinct camera limits for front and rear selections. The replay supplies the selection requests. [State replay](docs/experiments.md#state-linked-settings-in-a-script-archive) | Identify an event or caller that supplies a context and state ID, with a control input that takes a different branch. [Issue #19](https://github.com/R0Y00/Xbox2Windows/issues/19) |
-| Windows runtime and GPU | Source-built checks cover PE imports, heap operations, root signatures, compute and ray tracing. 21 Radeon GPU models passed the native wave64 BVH test. [Hardware coverage](#hardware-coverage) · [Experiment notes](docs/experiments.md) | Share a run on a new adapter or a driver retest in [the hardware thread](https://github.com/R0Y00/Xbox2Windows/issues/1). |
+| What runs | What was compared |
+|---|---|
+| **x64 programs from PE entry** | A two-record archive reader runs with blast 1.3 decompression under Windows, the PE mapper and the recompiled build. The three agree on output bytes, callback order, completed records, allocations, releases and exit status, including truncation and a refused output window. [Reproduce the archive comparison](docs/experiments.md#recompiling-the-blast-decoder) |
+| **Pixel shaders** | In one package scan, 334 pixel records compiled to DXIL and produced matching pixels on an RTX 4060 Laptop and WARP under the tested bindings. A separate depth test exchanged two buffers and changed 897 of 1,024 depth samples on both adapters. [Color readback](docs/experiments.md#offline-pixel-shader-recompilation) · [Depth and bindings](docs/experiments.md#buffered-depth-export) |
+| **Compute shaders** | Of 2,689 package records, 12 ran under the tested UAV bindings. Each adapter passed 14 full-buffer comparisons, including dispatches with different group counts. [Dispatch and readback](docs/experiments.md#compute-uav-stores-from-a-native-container) |
+| **Mesh shaders** | A specialized entry fetched indexed vertices from a GPU buffer. Two position sets covered 1,024 and 276 pixels on a 32×32 target, matching the CPU reference on hardware and WARP. [Mesh draw and specialization limits](docs/experiments.md#single-group-mesh-entry-specialization) |
+| **Windows runtime** | Bink frame-buffer allocations reach the Windows heap through the shared provider. The FidelityFX experiment follows scratch writes from two passes through the RCAS output on an 8×4 tile. [Allocation, failure and retry](docs/experiments.md#frame-buffers-through-the-shared-windows-heap) · [Upscaler pixel comparison](docs/experiments.md#last-writers-of-the-pass-26-scratch-reads) |
 
-The public suite builds its own fixtures. A contributor can reproduce the checks below on a PC without a game installation. The standalone release packages the GPU check. To run the script, shader and texture development suite, build from source.
+For current work, check [open issues](https://github.com/R0Y00/Xbox2Windows/issues) and [PRs already in progress](https://github.com/R0Y00/Xbox2Windows/pulls) before claiming a task. To help without a build environment, claim a batch of hardware reports in [issue #1](https://github.com/R0Y00/Xbox2Windows/issues/1), check the original logs and submit the corresponding table updates.
+
+### Instruction coverage
+
+The dashboard counts instruction forms exercised by passing source-built fixtures. Package shader records and end-to-end program results use different units. For the latest measurement, open the newest [successful Windows CI run on main](https://github.com/R0Y00/Xbox2Windows/actions/workflows/windows.yml?query=branch%3Amain+event%3Apush+is%3Asuccess) and download the `coverage-dashboard` artifact.
+
+<details>
+<summary>View the saved chart from commit a46dac3</summary>
+
+![Instruction forms exercised by the Windows fixtures at a46dac3](docs/coverage/dashboard.svg)
+
+[CI run that produced this snapshot](https://github.com/R0Y00/Xbox2Windows/actions/runs/45002764202) · [Find forms without a passing fixture](CONTRIBUTING.md#share-a-reproducible-finding)
+
+</details>
+
+## First build
+
+On x64 Windows, install Python 3.11 or newer and Visual Studio's **Desktop development with C++** workload, including x64 MSVC, CMake, Ninja, and Windows SDK 10.0.26100 with DXC. Windows CI uses Python 3.12. Open PowerShell at the repository root and run the following commands.
+
+```powershell
+.\tools\dev.ps1
+python -m venv out/pe-env
+.\out\pe-env\Scripts\python.exe -m pip install -r requirements-dev.txt
+cmake --preset dev
+cmake --build --preset dev
+ctest --preset dev --no-tests=error -R 'desktop_root_signature|era_heap_allocation|offscreen_warp'
+```
+
+The smoke tests exercise a D3D12 root signature, heap allocation and software rendering. For just those checks, you can omit the two Python setup commands. With the Python environment installed, [run a focused experiment](#choose-an-experiment) or run the full suite with `ctest --preset dev --no-tests=error`.
+
+To build and test at /O2 as Windows CI also does, use the `release` preset in place of `dev`. Its build directory is `out/build/release`.
+
+Contributing from macOS or Linux? See the [non-Windows host guide](docs/non-windows-hosts.md) for the platform-independent Python and LLVM 15 checks.
+
+<details>
+<summary>DXC versions, Windows 10 setup and independent build reports</summary>
+
+`shader_metadata_probe` also needs a DXC validator that accepts module-only validation. The DXC 1.7.2308 shipped with the original Windows SDK 10.0.26100 refuses it with `call_hr 0x80070057`, as do releases 1.8.2403 through 1.8.2407, and the test then reports a skip. A serviced SDK can include a newer validator: Windows SDK 10.0.26100.8249 installs DXC 1.8.2502.11, which passes without a separate download. [DXC 1.8.2502](https://github.com/microsoft/DirectXShaderCompiler/releases/tag/v1.8.2502) is the first release that passes, and the later 1.8 and 1.9 releases through 1.9.2609 pass too. To use a release, extract its zip and configure with `cmake --preset dev -DDXC_EXECUTABLE=C:/path/to/dxc/bin/x64/dxc.exe`. `root_probe` loads `dxil.dll` from the same directory. [Report](https://github.com/R0Y00/Xbox2Windows/issues/98) · [Results by release](docs/experiments.md#module-only-validation-by-dxc-release)
+
+On Windows 10 the in-box D3D12 runtime and WARP lack SM 6.5 and DXR, so the BVH and DXR WARP checks skip. To run them, configure with the app-local Agility SDK and WARP packages. [Windows 10 setup](docs/experiments.md#windows-10-with-the-app-local-agility-sdk-and-warp)
+
+An independent contributor passed all three smoke tests from a clean checkout of `71bb9f4` on Windows 11 build 26300.9974 with VS Build Tools 2022 17.14 and Windows SDK 10.0.26100. The tests passed again after an incremental rebuild at `2465837`. With Python 3.14.10, the full suite had 66 and 68 tests respectively, with zero failures in either run. Each run skipped forced wave64 on the RTX 5080 and WARP because their reported lane ranges excluded 64. [Original clean-build report](https://github.com/R0Y00/Xbox2Windows/issues/2#issuecomment-7063351821)
+
+</details>
 
 ## Run the GPU check
 
@@ -39,6 +74,11 @@ With a package built from current source, use `.\Run-GpuCheck.ps1 -Adapter Radeo
 Review `gpu-report-hardware.md` and paste its full contents as a comment on the [hardware coverage thread (#1)](https://github.com/R0Y00/Xbox2Windows/issues/1). Do not open a new GitHub issue. Reports with a failure or capability skip are welcome. [Package instructions](tools/gpu-check/README.md)
 
 ### Hardware coverage
+
+Results are grouped by adapter. Open a report for the driver, build and any capability skips.
+
+<details>
+<summary>Show adapter results and original reports</summary>
 
 | Adapter or backend | Default native lanes | Forced wave64 | BVH differential | Evidence |
 |---|---:|---|---|---|
@@ -116,42 +156,24 @@ Review `gpu-report-hardware.md` and paste its full contents as a comment on the 
 
 Under Linux translation layers (Wine or Proton with vkd3d-proton), Mesa RADV on an [AMD Ryzen 5 integrated GPU](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7067289597) and an [RX 9070 XT reported by @barbiscool](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7069870226) passed all forced-wave64 groups with zero mismatches; RADV defaults to 32-lane waves on the 9070 XT where Windows drivers default to 64. NVIDIA translation-layer runs on an [RTX 4070](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7064884397), [RTX 5060 Ti](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7067186626) and [RTX 3060](https://github.com/R0Y00/Xbox2Windows/issues/1#issuecomment-7064204388) reported a 32-lane maximum, skipped forced wave64 and passed 408 BVH comparisons.
 
-The eight community reports cover seven GPU models at commit `def386a`. Each Radeon completed all 38 forced-wave64 groups with zero mismatches. The RX 9070 XT, RTX 3070 and RTX 5070 driver retest reported zero D3D12 debug warnings and errors in their passing checks.
+An earlier batch at commit `def386a` covered seven GPU models in eight community reports. Each Radeon completed all 38 forced-wave64 groups with zero mismatches. The RX 9070 XT, RTX 3070 and RTX 5070 driver retest reported zero D3D12 debug warnings and errors in their passing checks.
 
 Maintainers link independent results to the original report and record the adapter, driver, commit and outcome. Names or handles are added on request. The hardware-report and independent-build milestones are complete. The remaining community milestone is a fix verified by the contributor who reported the problem.
 
-## First build
-
-On x64 Windows, install Visual Studio's **Desktop development with C++** workload, including x64 MSVC, the C++ CMake tools with Ninja, and Windows SDK 10.0.26100 with DXC. From the repository root in PowerShell, run:
-
-```powershell
-.\tools\dev.ps1
-cmake --preset dev
-cmake --build --preset dev
-ctest --preset dev --no-tests=error -R 'desktop_root_signature|era_heap_allocation|offscreen_warp'
-```
-
-These three tests exercise a D3D12 root signature, heap allocation and software rendering. CMake warns when the Python executable for the remaining fixture tests is missing. To enable the CPU, script, shader, texture and PE fixture tests, install x64 Python 3.11 or newer and configure again. Windows CI uses Python 3.12.
-
-```powershell
-python -m venv out/pe-env
-.\out\pe-env\Scripts\python.exe -m pip install -r requirements-dev.txt
-cmake --preset dev
-cmake --build --preset dev
-ctest --preset dev --no-tests=error
-```
-
-To build and test at /O2 as Windows CI also does, use the `release` preset in place of `dev`. Its build directory is `out/build/release`.
-
-`shader_metadata_probe` also needs a DXC validator that accepts module-only validation. The DXC 1.7.2308 shipped with the original Windows SDK 10.0.26100 refuses it with `call_hr 0x80070057`, as do releases 1.8.2403 through 1.8.2407, and the test then reports a skip. A serviced SDK can include a newer validator: Windows SDK 10.0.26100.8249 installs DXC 1.8.2502.11, which passes without a separate download. [DXC 1.8.2502](https://github.com/microsoft/DirectXShaderCompiler/releases/tag/v1.8.2502) is the first release that passes, and the later 1.8 and 1.9 releases through 1.9.2609 pass too. To use a release, extract its zip and configure with `cmake --preset dev -DDXC_EXECUTABLE=C:/path/to/dxc/bin/x64/dxc.exe`. `root_probe` loads `dxil.dll` from the same directory. [Report](https://github.com/R0Y00/Xbox2Windows/issues/98) · [Results by release](docs/experiments.md#module-only-validation-by-dxc-release)
-
-On Windows 10 the in-box D3D12 runtime and WARP lack SM 6.5 and DXR, so the BVH and DXR WARP checks skip. To run them, configure with the app-local Agility SDK and WARP packages. [Windows 10 setup](docs/experiments.md#windows-10-with-the-app-local-agility-sdk-and-warp)
-
-An independent contributor passed all three smoke tests from a clean checkout of `71bb9f4` on Windows 11 build 26300.9974 with VS Build Tools 2022 17.14 and Windows SDK 10.0.26100. The tests passed again after an incremental rebuild at `2465837`. With Python 3.14.10, the full suite had 66 and 68 tests respectively, with zero failures in either run. Each run skipped forced wave64 on the RTX 5080 and WARP because their reported lane ranges excluded 64. [Original clean-build report](https://github.com/R0Y00/Xbox2Windows/issues/2#issuecomment-7063351821)
-
-Contributing from macOS or Linux? See the [non-Windows host guide](docs/non-windows-hosts.md) for the platform-independent Python and LLVM 15 checks.
+</details>
 
 ## Choose an experiment
+
+After the full [Windows build](#first-build), run one comparison from the repository root.
+
+| Experiment | Focused test |
+|---|---|
+| Native, mapped and recompiled archive reader | `ctest --preset dev --no-tests=error -R '^cpu_native_archive_blast$' -V` |
+| Indexed mesh draw on WARP | `ctest --preset dev --no-tests=error -R '^mesh_indexed_draw_warp$' -V` |
+| Compute shader buffer writes on WARP | `ctest --preset dev --no-tests=error -R '^compute_store_aot_warp$' -V` |
+
+<details>
+<summary>More experiments and focused test commands</summary>
 
 | Area | A contribution you can verify | Focused CTest command |
 |---|---|---|
@@ -170,7 +192,11 @@ Contributing from macOS or Linux? See the [non-Windows host guide](docs/non-wind
 | PE tooling | Reproduce an import-resolution edge case with a DLL or EXE built from source. | `ctest --preset dev --no-tests=error -R 'static_exe_intake\|conditional_import_paths\|bundled_export_forwarders'` |
 | Build and documentation | Try the first build from a clean clone. Identify the first missing prerequisite or unclear instruction. | Use the three-test command above. |
 
+</details>
+
 For task ownership, evidence requirements and PR review, see the [contribution guide](CONTRIBUTING.md). [Open an issue](https://github.com/R0Y00/Xbox2Windows/issues/new/choose) · [Community conduct](CODE_OF_CONDUCT.md) · [Private security reports](SECURITY.md)
+
+[New contributor guide](https://github.com/R0Y00/Xbox2Windows/discussions/75) · [Build and debugging Q&A](https://github.com/R0Y00/Xbox2Windows/discussions/categories/development-q-a) · [Full experiment notes](docs/experiments.md)
 
 ## Case study and provenance
 
