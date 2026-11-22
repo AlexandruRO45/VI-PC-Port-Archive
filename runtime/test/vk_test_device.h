@@ -104,6 +104,8 @@ public:
     bool debug_utils = false;          // VK_EXT_debug_utils is enabled on the instance
     // The subgroup sizes of the device, with subgroupSizeControl and computeFullSubgroups enabled where it has them.
     leonida::SubgroupSizeCaps subgroup;
+    bool fragment_shading_rate = false;
+    PFN_vkCmdSetFragmentShadingRateKHR set_fragment_shading_rate = nullptr;
 
     Device() = default;
     Device(const Device&) = delete;
@@ -369,6 +371,39 @@ public:
         enable12.samplerFilterMinmax = sampler_filter_minmax;
         enable12.bufferDeviceAddress = VK_TRUE;
 
+        bool has_fsr = false;
+        const auto enum_device_exts =
+            instance_fn<PFN_vkEnumerateDeviceExtensionProperties>("vkEnumerateDeviceExtensionProperties");
+        if (enum_device_exts) {
+            std::uint32_t ext_count = 0;
+            enum_device_exts(physical, nullptr, &ext_count, nullptr);
+            std::vector<VkExtensionProperties> exts(ext_count);
+            enum_device_exts(physical, nullptr, &ext_count, exts.data());
+            for (const auto& e : exts) {
+                if (std::strcmp(e.extensionName, VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME) == 0) {
+                    has_fsr = true;
+                    break;
+                }
+            }
+        }
+
+        VkPhysicalDeviceFragmentShadingRateFeaturesKHR fsr_features{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR};
+        if (has_fsr) {
+            VkPhysicalDeviceFeatures2 features2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fsr_features};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &features2);
+        }
+
+        VkPhysicalDeviceFragmentShadingRateFeaturesKHR enable_fsr{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR};
+        if (has_fsr && fsr_features.pipelineFragmentShadingRate) {
+            enable_fsr.pipelineFragmentShadingRate = VK_TRUE;
+            enable_fsr.primitiveFragmentShadingRate = fsr_features.primitiveFragmentShadingRate;
+            enable_fsr.attachmentFragmentShadingRate = fsr_features.attachmentFragmentShadingRate;
+            enable_fsr.pNext = enable13.pNext;
+            enable13.pNext = &enable_fsr;
+        }
+
         const float priority = 1.0f;
         VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
         queue_info.queueFamilyIndex = family;
@@ -473,11 +508,14 @@ public:
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
         if (shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 #endif
+        if (has_fsr && fsr_features.pipelineFragmentShadingRate) device_extensions.push_back(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
         device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
         device_info.ppEnabledExtensionNames = device_extensions.data();
         result = instance_fn<PFN_vkCreateDevice>("vkCreateDevice")(physical, &device_info, nullptr, &device);
         if (result != VK_SUCCESS) return failure("vkCreateDevice", result);
         device_proc = instance_fn<PFN_vkGetDeviceProcAddr>("vkGetDeviceProcAddr");
+        set_fragment_shading_rate = fn<PFN_vkCmdSetFragmentShadingRateKHR>("vkCmdSetFragmentShadingRateKHR");
+        fragment_shading_rate = (set_fragment_shading_rate != nullptr);
         fn<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(device, family, 0, &queue);
         instance_fn<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties")(physical,
                                                                                                     &memory_);

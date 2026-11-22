@@ -2976,6 +2976,74 @@ public:
             }
         }
 
+        if (state_.info.variable_shading_rate_tier == D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED &&
+            info.physical && info.get_instance_proc) {
+            const auto get_feats2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+                info.get_instance_proc(info.instance, "vkGetPhysicalDeviceFeatures2"));
+            const auto get_props2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+                info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties2"));
+            const auto enum_exts = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+                info.get_instance_proc(info.instance, "vkEnumerateDeviceExtensionProperties"));
+            if (get_feats2 && enum_exts) {
+                uint32_t ext_count = 0;
+                enum_exts(info.physical, nullptr, &ext_count, nullptr);
+                std::vector<VkExtensionProperties> exts(ext_count);
+                enum_exts(info.physical, nullptr, &ext_count, exts.data());
+                bool has_ext = false;
+                for (const auto& e : exts) {
+                    if (std::strcmp(e.extensionName, VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME) == 0) {
+                        has_ext = true;
+                        break;
+                    }
+                }
+                if (has_ext) {
+                    VkPhysicalDeviceFragmentShadingRateFeaturesKHR fsr_features{
+                        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR};
+                    VkPhysicalDeviceFeatures2 feats2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fsr_features};
+                    get_feats2(info.physical, &feats2);
+                    if (fsr_features.pipelineFragmentShadingRate) {
+                        state_.info.fragment_shading_rate_supported = true;
+                        state_.info.physical_variable_shading_rate_tier =
+                            (fsr_features.attachmentFragmentShadingRate && fsr_features.primitiveFragmentShadingRate)
+                                ? D3D12_VARIABLE_SHADING_RATE_TIER_2
+                                : D3D12_VARIABLE_SHADING_RATE_TIER_1;
+                        // Keep advertised Tier 2 separate from physical support until the attachment path is implemented:
+                        // SetShadingRateImage only records the image resource today; it does not attach it during replay.
+                        state_.info.variable_shading_rate_tier = D3D12_VARIABLE_SHADING_RATE_TIER_1;
+                    }
+                    if (state_.info.fragment_shading_rate_supported && get_props2) {
+                        VkPhysicalDeviceFragmentShadingRatePropertiesKHR fsr_props{
+                            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR};
+                        VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &fsr_props};
+                        get_props2(info.physical, &props2);
+                        state_.info.shading_rate_image_tile_size =
+                            fsr_props.maxFragmentShadingRateAttachmentTexelSize.width;
+                        state_.info.per_primitive_shading_rate_with_viewport_indexing =
+                            fsr_props.primitiveFragmentShadingRateWithMultipleViewports ? TRUE : FALSE;
+                        auto get_rates = reinterpret_cast<PFN_vkGetPhysicalDeviceFragmentShadingRatesKHR>(
+                            info.get_instance_proc(info.instance, "vkGetPhysicalDeviceFragmentShadingRatesKHR"));
+                        if (get_rates) {
+                            uint32_t rate_count = 0;
+                            get_rates(info.physical, &rate_count, nullptr);
+                            if (rate_count > 0) {
+                                std::vector<VkPhysicalDeviceFragmentShadingRateKHR> rates(
+                                    rate_count, {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_KHR});
+                                get_rates(info.physical, &rate_count, rates.data());
+                                for (const auto& r : rates) {
+                                    if ((r.fragmentSize.width == 2 && r.fragmentSize.height == 4) ||
+                                        (r.fragmentSize.width == 4 && r.fragmentSize.height == 2) ||
+                                        (r.fragmentSize.width == 4 && r.fragmentSize.height == 4)) {
+                                        state_.info.additional_shading_rates_supported = TRUE;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         state_.context = std::make_unique<leonida::VulkanContext>(get_device, info.device,
                                                                   info.separate_depth_stencil_layouts,
                                                                   info.conditional_rendering, info.ray_tracing,
@@ -5012,6 +5080,18 @@ public:
                 root->HighestVersion = kHighestRootSignatureVersion;
             return S_OK;
         }
+        case D3D12_FEATURE_D3D12_OPTIONS6: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS6)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS6*>(data);
+            *opts = {};
+            opts->AdditionalShadingRatesSupported = state_.info.additional_shading_rates_supported;
+            opts->PerPrimitiveShadingRateSupportedWithViewportIndexing =
+                state_.info.per_primitive_shading_rate_with_viewport_indexing;
+            opts->VariableShadingRateTier = state_.info.variable_shading_rate_tier;
+            opts->ShadingRateImageTileSize = state_.info.shading_rate_image_tile_size;
+            opts->BackgroundProcessingSupported = TRUE;
+            return S_OK;
+        }
         default:
             // Not answered yet. The log above lists every query; answers are added as the trace asks for them.
             return d3d12_trace::result(method, E_INVALIDARG);
@@ -5934,6 +6014,69 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
     enable_as.accelerationStructure = VK_TRUE;
 
+    bool has_fsr_ext = false;
+    if (vkEnumerateDeviceExtensionProperties) {
+        std::uint32_t ext_count = 0;
+        vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &ext_count, nullptr);
+        std::vector<VkExtensionProperties> exts(ext_count);
+        vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &ext_count, exts.data());
+        for (const auto& e : exts) {
+            if (std::strcmp(e.extensionName, VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME) == 0) {
+                has_fsr_ext = true;
+                break;
+            }
+        }
+    }
+    VkPhysicalDeviceFragmentShadingRateFeaturesKHR fsr_features{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR};
+    VkPhysicalDeviceFragmentShadingRatePropertiesKHR fsr_props{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR};
+    if (has_fsr_ext) {
+        VkPhysicalDeviceFeatures2 features2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fsr_features};
+        vkGetPhysicalDeviceFeatures2(info.physical, &features2);
+        if (fsr_features.pipelineFragmentShadingRate) {
+            info.fragment_shading_rate_supported = true;
+            info.physical_variable_shading_rate_tier =
+                (fsr_features.attachmentFragmentShadingRate && fsr_features.primitiveFragmentShadingRate)
+                    ? D3D12_VARIABLE_SHADING_RATE_TIER_2
+                    : D3D12_VARIABLE_SHADING_RATE_TIER_1;
+            // Keep advertised Tier 2 separate from physical support until the attachment path is implemented:
+            // SetShadingRateImage only records the image resource today; it does not attach it during replay.
+            info.variable_shading_rate_tier = D3D12_VARIABLE_SHADING_RATE_TIER_1;
+            VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &fsr_props};
+            const auto get_props2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+                get(owned.instance, "vkGetPhysicalDeviceProperties2"));
+            if (get_props2) {
+                get_props2(info.physical, &props2);
+                info.shading_rate_image_tile_size = fsr_props.maxFragmentShadingRateAttachmentTexelSize.width;
+            }
+            info.per_primitive_shading_rate_with_viewport_indexing =
+                fsr_props.primitiveFragmentShadingRateWithMultipleViewports ? TRUE : FALSE;
+            const auto get_fsr_rates = reinterpret_cast<PFN_vkGetPhysicalDeviceFragmentShadingRatesKHR>(
+                get(owned.instance, "vkGetPhysicalDeviceFragmentShadingRatesKHR"));
+            if (get_fsr_rates) {
+                uint32_t rate_count = 0;
+                get_fsr_rates(info.physical, &rate_count, nullptr);
+                if (rate_count > 0) {
+                    std::vector<VkPhysicalDeviceFragmentShadingRateKHR> rates(
+                        rate_count, {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_KHR});
+                    get_fsr_rates(info.physical, &rate_count, rates.data());
+                    for (const auto& r : rates) {
+                        if ((r.fragmentSize.width == 2 && r.fragmentSize.height == 4) ||
+                            (r.fragmentSize.width == 4 && r.fragmentSize.height == 2) ||
+                            (r.fragmentSize.width == 4 && r.fragmentSize.height == 4)) {
+                            info.additional_shading_rates_supported = TRUE;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    VkPhysicalDeviceFragmentShadingRateFeaturesKHR enable_fsr{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR};
+
     void* ext_chain = nullptr;
     if (info.ray_tracing) {
         enable_rq.pNext = ext_chain;
@@ -5943,6 +6086,13 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (info.conditional_rendering) {
         enable_conditional.pNext = ext_chain;
         ext_chain = &enable_conditional;
+    }
+    if (info.fragment_shading_rate_supported) {
+        enable_fsr.pipelineFragmentShadingRate = fsr_features.pipelineFragmentShadingRate;
+        enable_fsr.primitiveFragmentShadingRate = fsr_features.primitiveFragmentShadingRate;
+        enable_fsr.attachmentFragmentShadingRate = fsr_features.attachmentFragmentShadingRate;
+        enable_fsr.pNext = ext_chain;
+        ext_chain = &enable_fsr;
     }
 
     VkPhysicalDeviceVulkan13Features enable13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, ext_chain};
@@ -6140,6 +6290,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         device_extensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
     }
     info.presentation = has_swapchain && instance_has_surface;
+    if (info.fragment_shading_rate_supported) device_extensions.push_back(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)

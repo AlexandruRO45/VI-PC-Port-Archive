@@ -594,11 +594,50 @@ struct BuildAccelerationStructure {
     std::vector<RtTriangleGeometry> triangles;
 };
 
+// Variable Rate Shading (D3D-32: docs/d3d12_vulkan.md section 3.2).
+namespace shading_rate {
+inline constexpr std::uint32_t rate_1x1 = 0;
+inline constexpr std::uint32_t rate_1x2 = 1;
+inline constexpr std::uint32_t rate_2x1 = 4;
+inline constexpr std::uint32_t rate_2x2 = 5;
+inline constexpr std::uint32_t rate_2x4 = 6;
+inline constexpr std::uint32_t rate_4x2 = 9;
+inline constexpr std::uint32_t rate_4x4 = 0xa;
+
+inline constexpr bool valid(std::uint32_t rate) {
+    return rate == rate_1x1 || rate == rate_1x2 || rate == rate_2x1 || rate == rate_2x2 ||
+           rate == rate_2x4 || rate == rate_4x2 || rate == rate_4x4;
+}
+} // namespace shading_rate
+
+namespace shading_rate_combiner {
+inline constexpr std::uint32_t passthrough = 0;
+inline constexpr std::uint32_t override_val = 1;
+inline constexpr std::uint32_t min = 2;
+inline constexpr std::uint32_t max = 3;
+inline constexpr std::uint32_t sum = 4;
+
+inline constexpr bool valid(std::uint32_t combiner) {
+    return combiner <= sum;
+}
+} // namespace shading_rate_combiner
+
+struct SetShadingRate {
+    std::uint32_t rate;
+    std::array<std::uint32_t, 2> combiners;
+};
+
+// Shading rate image (resource 0 disables / unbinds the image).
+struct SetShadingRateImage {
+    ResourceId resource;
+};
+
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
                              CopyResource, ResolveSubresource, Predication, ClearUnorderedAccess, DiscardResource,
                              WriteImmediate, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries, DebugMarker,
-                             ExecuteIndirect, BuildAccelerationStructure, Dispatch, Draw>;
+                             ExecuteIndirect, BuildAccelerationStructure, Dispatch, Draw,
+                             SetShadingRate, SetShadingRateImage>;
 
 class CommandList {
 public:
@@ -808,6 +847,18 @@ public:
     bool build_acceleration_structure(BuildAccelerationStructure build) {
         if (!build.dst_va || !build.scratch_va) return false;
         return append(std::move(build));
+    }
+
+    bool rs_set_shading_rate(const SetShadingRate& rate) {
+        if (!shading_rate::valid(rate.rate)) return false;
+        if (!shading_rate_combiner::valid(rate.combiners[0]) ||
+            !shading_rate_combiner::valid(rate.combiners[1]))
+            return false;
+        return append(rate);
+    }
+
+    bool rs_set_shading_rate_image(const SetShadingRateImage& image) {
+        return append(image);
     }
     bool close() {
         if (closed_) return false;

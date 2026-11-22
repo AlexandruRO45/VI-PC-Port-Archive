@@ -156,6 +156,12 @@ public:
     const leonida::CommandList& commands() const { return list_; }
     UINT front_stencil_ref() const { return front_stencil_ref_; }
     UINT back_stencil_ref() const { return back_stencil_ref_; }
+    D3D12_SHADING_RATE shading_rate() const { return shading_rate_; }
+    void get_shading_rate_combiners(D3D12_SHADING_RATE_COMBINER out[2]) const {
+        out[0] = shading_rate_combiners_[0];
+        out[1] = shading_rate_combiners_[1];
+    }
+    ID3D12Resource* shading_rate_image() const { return shading_rate_image_; }
 
     D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE GetType() override {
         d3d12_trace::record("ID3D12CommandList::GetType");
@@ -187,6 +193,10 @@ public:
         release_held();  // what the old recording used: it was replayed at ExecuteCommandLists
         reset_state(state);  // Reset returns every list state to its default
         stencil_ref_set_ = false;
+        shading_rate_ = D3D12_SHADING_RATE_1X1;
+        shading_rate_combiners_[0] = D3D12_SHADING_RATE_COMBINER_PASSTHROUGH;
+        shading_rate_combiners_[1] = D3D12_SHADING_RATE_COMBINER_PASSTHROUGH;
+        shading_rate_image_ = nullptr;
         return d3d12_trace::result(method, S_OK);
     }
 
@@ -653,6 +663,43 @@ public:
         check(list_.build_acceleration_structure(cmd));
     }
 
+    // ID3D12GraphicsCommandList5: Variable Rate Shading (D3D-32).
+    void STDMETHODCALLTYPE RSSetShadingRate(D3D12_SHADING_RATE baseShadingRate,
+                                            const D3D12_SHADING_RATE_COMBINER* combiners) override {
+        if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT && type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE) {
+            invalid_ = true;
+            return;
+        }
+        if (!leonida::shading_rate::valid(u(baseShadingRate))) {
+            invalid_ = true;
+            return;
+        }
+        std::array<std::uint32_t, 2> comb{leonida::shading_rate_combiner::passthrough,
+                                          leonida::shading_rate_combiner::passthrough};
+        if (combiners) {
+            if (!leonida::shading_rate_combiner::valid(u(combiners[0])) ||
+                !leonida::shading_rate_combiner::valid(u(combiners[1]))) {
+                invalid_ = true;
+                return;
+            }
+            comb[0] = u(combiners[0]);
+            comb[1] = u(combiners[1]);
+        }
+        shading_rate_ = baseShadingRate;
+        shading_rate_combiners_[0] = static_cast<D3D12_SHADING_RATE_COMBINER>(comb[0]);
+        shading_rate_combiners_[1] = static_cast<D3D12_SHADING_RATE_COMBINER>(comb[1]);
+        check(list_.rs_set_shading_rate({u(baseShadingRate), comb}));
+    }
+
+    void STDMETHODCALLTYPE RSSetShadingRateImage(ID3D12Resource* shadingRateImage) override {
+        if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT && type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE) {
+            invalid_ = true;
+            return;
+        }
+        shading_rate_image_ = shadingRateImage;
+        check(list_.rs_set_shading_rate_image({resource_id(shadingRateImage)}));
+    }
+
     static GraphicsCommandList* from(IUnknown* object) { return Child::from<GraphicsCommandList>(object); }
 
 private:
@@ -884,6 +931,11 @@ private:
                            base_vertex, first_instance};
         check(list_.draw(draw));
     }
+
+    D3D12_SHADING_RATE shading_rate_ = D3D12_SHADING_RATE_1X1;
+    D3D12_SHADING_RATE_COMBINER shading_rate_combiners_[2] = {D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+                                                              D3D12_SHADING_RATE_COMBINER_PASSTHROUGH};
+    ID3D12Resource* shading_rate_image_ = nullptr;
 };
 
 class Fence final
@@ -1334,6 +1386,22 @@ bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT&
     if (!l) return false;
     front = l->front_stencil_ref();
     back = l->back_stencil_ref();
+    return true;
+}
+
+bool command_list_shading_rate(ID3D12GraphicsCommandList* list, D3D12_SHADING_RATE& rate,
+                               D3D12_SHADING_RATE_COMBINER combiners[2]) {
+    const GraphicsCommandList* l = GraphicsCommandList::from(list);
+    if (!l) return false;
+    rate = l->shading_rate();
+    l->get_shading_rate_combiners(combiners);
+    return true;
+}
+
+bool command_list_shading_rate_image(ID3D12GraphicsCommandList* list, ID3D12Resource*& image) {
+    const GraphicsCommandList* l = GraphicsCommandList::from(list);
+    if (!l) return false;
+    image = l->shading_rate_image();
     return true;
 }
 

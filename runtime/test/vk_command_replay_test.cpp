@@ -89,10 +89,14 @@ int part_a(vktest::Device& d) {
     ResourceBinding depth_binding{};
     depth_binding.image = depth;
     depth_binding.aspects = depth_aspects;
-    constexpr ResourceId color_id = 1, depth_id = 2, missing_id = 3;
+    ResourceBinding buffer_binding{};
+    buffer_binding.buffer = buffer;
+    buffer_binding.size = stencil_offset + texels;
+    constexpr ResourceId color_id = 1, depth_id = 2, missing_id = 3, buffer_id = 4;
     const auto resolve = [&](ResourceId id) -> const ResourceBinding* {
         if (id == color_id) return &color_binding;
         if (id == depth_id) return &depth_binding;
+        if (id == buffer_id) return &buffer_binding;
         return nullptr;
     };
     ReplayFunctions vk{};
@@ -146,12 +150,52 @@ int part_a(vktest::Device& d) {
             !rejected([&] { bad.clear_render_target({color_id, 0, 0, 1}, {1, 1, 1, 1}, {&rect, 1}); },
                       ReplayResult::unsupported) ||
             !rejected([&] { bad.barrier(GlobalBarrier{d3d12_sync::all, d3d12_sync::all, 0, 0}); },
-                      ReplayResult::unsupported))
+                      ReplayResult::unsupported) ||
+            // Variable Rate Shading (D3D-32): non-1x1 rates need set_fragment_shading_rate.
+            !rejected([&] { bad.rs_set_shading_rate({shading_rate::rate_2x2, {0, 0}}); },
+                      ReplayResult::unsupported) ||
+            !rejected([&] { bad.rs_set_shading_rate_image({missing_id}); },
+                      ReplayResult::unresolved_resource) ||
+            !rejected([&] { bad.rs_set_shading_rate_image({buffer_id}); },
+                      ReplayResult::invalid_subresource))
             return false;
         LayoutTracker separate(true);
         if (replay(list, cb, resolve, vk, &separate) != ReplayResult::unsupported) return false;  // flag mismatch
 
         if (replay(list, cb, resolve, vk) != ReplayResult::success) return false;
+
+        // Shading rate 1x1 succeeds without set_fragment_shading_rate, as does an unbound shading rate image.
+        CommandList vrs_1x1;
+        if (!vrs_1x1.rs_set_shading_rate({shading_rate::rate_1x1, {0, 0}}) ||
+            !vrs_1x1.rs_set_shading_rate_image({0}) ||
+            !vrs_1x1.close())
+            return false;
+        if (replay(vrs_1x1, cb, resolve, vk) != ReplayResult::success) return false;
+
+        // With set_fragment_shading_rate, rates and combiners map to VkExtent2D and VkFragmentShadingRateCombinerOpKHR.
+        static VkExtent2D called_extent{};
+        static VkFragmentShadingRateCombinerOpKHR called_combiners[2]{};
+        static unsigned called_count = 0;
+        ReplayFunctions vk_with_fsr = vk;
+        vk_with_fsr.set_fragment_shading_rate = [](VkCommandBuffer, const VkExtent2D* size,
+                                                   const VkFragmentShadingRateCombinerOpKHR combiners[2]) {
+            called_extent = *size;
+            called_combiners[0] = combiners[0];
+            called_combiners[1] = combiners[1];
+            ++called_count;
+        };
+        CommandList vrs_list;
+        if (!vrs_list.rs_set_shading_rate({shading_rate::rate_2x4,
+                                          {shading_rate_combiner::override_val, shading_rate_combiner::max}}) ||
+            !vrs_list.rs_set_shading_rate_image({color_id}) ||
+            !vrs_list.close())
+            return false;
+        if (replay(vrs_list, cb, resolve, vk_with_fsr) != ReplayResult::success) return false;
+        if (called_count != 1 || called_extent.width != 2 || called_extent.height != 4 ||
+            called_combiners[0] != VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR ||
+            called_combiners[1] != VK_FRAGMENT_SHADING_RATE_COMBINER_OP_MAX_KHR)
+            return false;
+
         d.read_back(cb, color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, width, height, layers,
                     buffer, 0);
         d.read_back(cb, depth, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT, width, height, 1,

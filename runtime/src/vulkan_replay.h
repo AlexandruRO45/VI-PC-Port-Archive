@@ -795,6 +795,7 @@ struct ReplayFunctions {
     std::function<bool(VkBuffer, VkBuffer, VkDeviceSize, VkDeviceSize, VkDeviceSize,
                        std::vector<PredicatedCopyDispatch>&)> prepare_predicated_copy;
     std::function<void(VkCommandBuffer, const std::vector<PredicatedCopyDispatch>&)> emit_predicated_copy;
+    PFN_vkCmdSetFragmentShadingRateKHR set_fragment_shading_rate = nullptr; // variable rate shading (D3D-32)
     // Returns a 2D-array view of the range (caller-owned, alive until execution completes); rectangle clears.
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
     // Footprint copies of a depth24_as_float texture (depth24.h): `depth24_prepare` makes the scratch and descriptors
@@ -905,6 +906,19 @@ struct Prepared {
     VkAccelerationStructureKHR accel_dst = VK_NULL_HANDLE;
     VkAccelerationStructureKHR accel_src = VK_NULL_HANDLE;
 };
+
+inline VkExtent2D shading_rate_extent(std::uint32_t rate) {
+    switch (rate) {
+    case shading_rate::rate_1x1: return {1, 1};
+    case shading_rate::rate_1x2: return {1, 2};
+    case shading_rate::rate_2x1: return {2, 1};
+    case shading_rate::rate_2x2: return {2, 2};
+    case shading_rate::rate_2x4: return {2, 4};
+    case shading_rate::rate_4x2: return {4, 2};
+    case shading_rate::rate_4x4: return {4, 4};
+    default: return {1, 1};
+    }
+}
 
 // ClearRenderTargetView takes FLOATs even for integer RTVs. Windows D3D12 (WARP and AMD) clamps to the
 // component range and truncates fractions. Vulkan instead interprets the matching union member as an integer
@@ -2254,6 +2268,14 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             p.pipeline = *pipeline;
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
             if (const auto r = detail::prepare_draw(*draw, resolve, vk, p); r != ReplayResult::success) return r;
+        } else if (const auto* rate_cmd = std::get_if<SetShadingRate>(&command)) {
+            if (!vk.set_fragment_shading_rate && rate_cmd->rate != shading_rate::rate_1x1)
+                return ReplayResult::unsupported;
+        } else if (const auto* image_cmd = std::get_if<SetShadingRateImage>(&command)) {
+            if (image_cmd->resource) {
+                if (!bind(image_cmd->resource)) return ReplayResult::unresolved_resource;
+                if (!p.binding.image || p.binding.buffer) return ReplayResult::invalid_subresource;
+            }
         }
     }
     if (ordinary_active) return ReplayResult::invalid_query;
@@ -3105,6 +3127,17 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.draw(command_buffer, draw->count, draw->instances, draw->first, draw->first_instance);
             }
             vk.end_rendering(command_buffer);
+        } else if (const auto* rate_cmd = std::get_if<SetShadingRate>(&command)) {
+            if (vk.set_fragment_shading_rate) {
+                const VkExtent2D extent = detail::shading_rate_extent(rate_cmd->rate);
+                const VkFragmentShadingRateCombinerOpKHR combiners[2] = {
+                    static_cast<VkFragmentShadingRateCombinerOpKHR>(rate_cmd->combiners[0]),
+                    static_cast<VkFragmentShadingRateCombinerOpKHR>(rate_cmd->combiners[1]),
+                };
+                vk.set_fragment_shading_rate(command_buffer, &extent, combiners);
+            }
+        } else if (std::holds_alternative<SetShadingRateImage>(command)) {
+            // Recorded for pipeline/draw path.
         }
     }
     // Predication does not carry over to the next command list.

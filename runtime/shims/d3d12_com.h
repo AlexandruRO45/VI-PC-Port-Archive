@@ -141,6 +141,14 @@ struct VulkanDeviceInfo {
     // The translator's output folder (spirv/index.json + <name>.spv) for pipeline creation; empty: the
     // LEONIDA_SHADERS environment variable.
     std::string shader_dir;
+    bool fragment_shading_rate_supported = false;
+    // Advertised D3D12 tier reported by CheckFeatureSupport (kept at Tier 1 until attachment replay is implemented).
+    D3D12_VARIABLE_SHADING_RATE_TIER variable_shading_rate_tier = D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED;
+    // Physical hardware capability tier from VK_KHR_fragment_shading_rate features.
+    D3D12_VARIABLE_SHADING_RATE_TIER physical_variable_shading_rate_tier = D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED;
+    UINT shading_rate_image_tile_size = 0;
+    BOOL additional_shading_rates_supported = FALSE;
+    BOOL per_primitive_shading_rate_with_viewport_indexing = FALSE;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive
@@ -277,6 +285,13 @@ leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue);
 // `list`. The values are kept for the future pipeline path, which is what would apply them. False when `list` is
 // not one of this module's command lists.
 bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT& back);
+
+// The last shading rate and combiners recorded on `list`. False when `list` is not one of this module's command lists.
+bool command_list_shading_rate(ID3D12GraphicsCommandList* list, D3D12_SHADING_RATE& rate,
+                               D3D12_SHADING_RATE_COMBINER combiners[2]);
+
+// The last shading rate image recorded on `list`. False when `list` is not one of this module's command lists.
+bool command_list_shading_rate_image(ID3D12GraphicsCommandList* list, ID3D12Resource*& image);
 
 inline leonida::ResourceId resource_id(const ID3D12Resource* resource) {
     return reinterpret_cast<leonida::ResourceId>(resource);

@@ -316,6 +316,81 @@ int main(int argc, char** argv) {
         EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
         list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 2.0f, 0, 0, nullptr);
         EXPECT(list->Close() == E_INVALIDARG);
+
+        // Variable Rate Shading (D3D-32): ID3D12GraphicsCommandList5.
+        Ref<ID3D12GraphicsCommandList5> list5;
+        EXPECT(SUCCEEDED(list->QueryInterface(__uuidof(ID3D12GraphicsCommandList5), list5.out())));
+        EXPECT(list5.p != nullptr);
+
+        EXPECT(SUCCEEDED(allocator->Reset()));
+        EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+
+        // Default state after Reset
+        D3D12_SHADING_RATE current_rate = D3D12_SHADING_RATE_2X2;
+        D3D12_SHADING_RATE_COMBINER current_combiners[2] = {D3D12_SHADING_RATE_COMBINER_SUM, D3D12_SHADING_RATE_COMBINER_SUM};
+        EXPECT(rt::d3d12::command_list_shading_rate(list.p, current_rate, current_combiners));
+        EXPECT(current_rate == D3D12_SHADING_RATE_1X1);
+        EXPECT(current_combiners[0] == D3D12_SHADING_RATE_COMBINER_PASSTHROUGH);
+        EXPECT(current_combiners[1] == D3D12_SHADING_RATE_COMBINER_PASSTHROUGH);
+
+        ID3D12Resource* current_image = reinterpret_cast<ID3D12Resource*>(0x1234);
+        EXPECT(rt::d3d12::command_list_shading_rate_image(list.p, current_image));
+        EXPECT(current_image == nullptr);
+
+        // Record RSSetShadingRate with combiners
+        const D3D12_SHADING_RATE_COMBINER test_combiners[2] = {D3D12_SHADING_RATE_COMBINER_OVERRIDE, D3D12_SHADING_RATE_COMBINER_MAX};
+        list5->RSSetShadingRate(D3D12_SHADING_RATE_2X2, test_combiners);
+        EXPECT(rt::d3d12::command_list_shading_rate(list.p, current_rate, current_combiners));
+        EXPECT(current_rate == D3D12_SHADING_RATE_2X2);
+        EXPECT(current_combiners[0] == D3D12_SHADING_RATE_COMBINER_OVERRIDE);
+        EXPECT(current_combiners[1] == D3D12_SHADING_RATE_COMBINER_MAX);
+
+        // Record with nullptr combiners (defaults to PASSTHROUGH)
+        list5->RSSetShadingRate(D3D12_SHADING_RATE_1X2, nullptr);
+        EXPECT(rt::d3d12::command_list_shading_rate(list.p, current_rate, current_combiners));
+        EXPECT(current_rate == D3D12_SHADING_RATE_1X2);
+        EXPECT(current_combiners[0] == D3D12_SHADING_RATE_COMBINER_PASSTHROUGH);
+        EXPECT(current_combiners[1] == D3D12_SHADING_RATE_COMBINER_PASSTHROUGH);
+
+        // Record RSSetShadingRateImage
+        list5->RSSetShadingRateImage(rt_resource);
+        EXPECT(rt::d3d12::command_list_shading_rate_image(list.p, current_image));
+        EXPECT(current_image == rt_resource);
+
+        // Close and execute through queue
+        EXPECT(SUCCEEDED(list->Close()));
+        queue->ExecuteCommandLists(1, lists);
+        EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+
+        // Reset clears shading rate state back to defaults
+        EXPECT(SUCCEEDED(allocator->Reset()));
+        EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+        EXPECT(rt::d3d12::command_list_shading_rate(list.p, current_rate, current_combiners));
+        EXPECT(current_rate == D3D12_SHADING_RATE_1X1);
+        EXPECT(current_combiners[0] == D3D12_SHADING_RATE_COMBINER_PASSTHROUGH);
+        EXPECT(rt::d3d12::command_list_shading_rate_image(list.p, current_image));
+        EXPECT(current_image == nullptr);
+
+        // Invalid shading rate fails Close with E_INVALIDARG
+        list5->RSSetShadingRate(static_cast<D3D12_SHADING_RATE>(7), nullptr);
+        EXPECT(list->Close() == E_INVALIDARG);
+
+        // Invalid combiner fails Close with E_INVALIDARG
+        EXPECT(SUCCEEDED(allocator->Reset()));
+        EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+        const D3D12_SHADING_RATE_COMBINER bad_combiners[2] = {static_cast<D3D12_SHADING_RATE_COMBINER>(5), D3D12_SHADING_RATE_COMBINER_PASSTHROUGH};
+        list5->RSSetShadingRate(D3D12_SHADING_RATE_1X1, bad_combiners);
+        EXPECT(list->Close() == E_INVALIDARG);
+
+        // Calling RSSetShadingRate on a compute list fails Close with E_INVALIDARG
+        Ref<ID3D12CommandAllocator> compute_allocator;
+        Ref<ID3D12GraphicsCommandList> compute_list;
+        EXPECT(SUCCEEDED(rt::d3d12::create_command_allocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, __uuidof(ID3D12CommandAllocator), compute_allocator.out())));
+        EXPECT(SUCCEEDED(rt::d3d12::create_command_list(D3D12_COMMAND_LIST_TYPE_COMPUTE, compute_allocator.p, __uuidof(ID3D12GraphicsCommandList), compute_list.out())));
+        Ref<ID3D12GraphicsCommandList5> compute_list5;
+        EXPECT(SUCCEEDED(compute_list->QueryInterface(__uuidof(ID3D12GraphicsCommandList5), compute_list5.out())));
+        compute_list5->RSSetShadingRate(D3D12_SHADING_RATE_1X1, nullptr);
+        EXPECT(compute_list->Close() == E_INVALIDARG);
     }
 
     EXPECT(d.run([&](VkCommandBuffer cb) {

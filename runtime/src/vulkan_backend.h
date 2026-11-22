@@ -75,7 +75,8 @@ struct VulkanDeviceFunctions {
     X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor)                  \
     X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetStencilReference)                          \
     X(vkCmdSetBlendConstants) X(vkCmdDraw)                                                                              \
-    X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines)
+    X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines)                                                            \
+    X(vkCmdSetFragmentShadingRateKHR)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -752,6 +753,7 @@ public:
                 return it == acceleration_structures_.end() ? VK_NULL_HANDLE : it->second;
             };
         }
+        replay_.set_fragment_shading_rate = vk.vkCmdSetFragmentShadingRateKHR;
         replay_.image_view = [this](const ResourceBinding& r, const VkImageSubresourceRange& range) {
             return view(r, range);
         };

@@ -3288,6 +3288,19 @@ int main() {
         const int format_support_mismatches = compare_format_support(device.p, info);
         EXPECT(format_support_mismatches == 0);
 
+        // Variable Rate Shading (D3D-32): D3D12_FEATURE_D3D12_OPTIONS6.
+        D3D12_FEATURE_DATA_D3D12_OPTIONS6 options6{};
+        EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS6, &options6, sizeof(options6))));
+        EXPECT(options6.BackgroundProcessingSupported == TRUE);
+        if (d.fragment_shading_rate) {
+            EXPECT(options6.VariableShadingRateTier >= D3D12_VARIABLE_SHADING_RATE_TIER_1);
+            if (options6.VariableShadingRateTier >= D3D12_VARIABLE_SHADING_RATE_TIER_2) {
+                EXPECT(options6.ShadingRateImageTileSize > 0);
+            }
+        }
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS6, &options6, sizeof(options6) - 1) == E_INVALIDARG);
+        EXPECT(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS6, nullptr, sizeof(options6)) == E_INVALIDARG);
+
         // Push constants limit check (D3D-14): Vulkan spec guarantees >= 128 bytes.
         EXPECT(rt::d3d12::device_max_push_constants_size(device.p) >= 128);
         EXPECT(rt::d3d12::device_max_push_constants_size(inner) == rt::d3d12::device_max_push_constants_size(device.p));

@@ -283,11 +283,49 @@ int main() {
     CHECK(list.close() && list.queries_open());
     CHECK(list.reset() && !list.queries_open());
     CHECK(list.begin_query({heap, q::pipeline_statistics, 0}));  // free again after the reset
+    CHECK(list.close());
 
     CHECK(query_fits_heap(h::occlusion, q::binary_occlusion) && !query_fits_heap(h::occlusion, q::timestamp));
     CHECK(query_fits_heap(h::copy_queue_timestamp, q::timestamp) && !query_fits_heap(h::timestamp, q::occlusion));
     CHECK(query_fits_heap(h::so_statistics, q::so_statistics_stream3) && !query_fits_heap(6, q::occlusion));
     CHECK(query_result_size(q::occlusion) == 8 && query_result_size(q::timestamp) == 8);
     CHECK(query_result_size(q::pipeline_statistics) == 88 && query_result_size(q::so_statistics_stream0) == 0);
+
+    // Variable Rate Shading (D3D-32): rs_set_shading_rate, rs_set_shading_rate_image.
+    CHECK(list.reset());
+    using namespace shading_rate;
+    namespace comb = shading_rate_combiner;
+    CHECK(list.rs_set_shading_rate({rate_1x1, {comb::passthrough, comb::passthrough}}));
+    CHECK(list.rs_set_shading_rate({rate_1x2, {comb::override_val, comb::min}}));
+    CHECK(list.rs_set_shading_rate({rate_2x1, {comb::max, comb::sum}}));
+    CHECK(list.rs_set_shading_rate({rate_2x2, {comb::passthrough, comb::passthrough}}));
+    CHECK(list.rs_set_shading_rate({rate_2x4, {comb::passthrough, comb::passthrough}}));
+    CHECK(list.rs_set_shading_rate({rate_4x2, {comb::passthrough, comb::passthrough}}));
+    CHECK(list.rs_set_shading_rate({rate_4x4, {comb::passthrough, comb::passthrough}}));
+    // Invalid rates: 2, 3, 7, 8, 11
+    CHECK(!list.rs_set_shading_rate({2, {comb::passthrough, comb::passthrough}}));
+    CHECK(!list.rs_set_shading_rate({3, {comb::passthrough, comb::passthrough}}));
+    CHECK(!list.rs_set_shading_rate({7, {comb::passthrough, comb::passthrough}}));
+    CHECK(!list.rs_set_shading_rate({8, {comb::passthrough, comb::passthrough}}));
+    CHECK(!list.rs_set_shading_rate({11, {comb::passthrough, comb::passthrough}}));
+    // Invalid combiners: 5, 0xff
+    CHECK(!list.rs_set_shading_rate({rate_1x1, {5, comb::passthrough}}));
+    CHECK(!list.rs_set_shading_rate({rate_1x1, {comb::passthrough, 5}}));
+    CHECK(!list.rs_set_shading_rate({rate_1x1, {0xff, 0xff}}));
+    // Shading rate image: with resource and unbind (0)
+    CHECK(list.rs_set_shading_rate_image({50}));
+    CHECK(list.rs_set_shading_rate_image({0}));
+    CHECK(list.close());
+    CHECK(!list.rs_set_shading_rate({rate_1x1, {comb::passthrough, comb::passthrough}}));
+    CHECK(!list.rs_set_shading_rate_image({50}));
+    CHECK(list.commands().size() == 9);
+    const auto* r0 = std::get_if<SetShadingRate>(&list.commands()[0]);
+    CHECK(r0 && r0->rate == rate_1x1 && r0->combiners[0] == comb::passthrough);
+    const auto* r1 = std::get_if<SetShadingRate>(&list.commands()[1]);
+    CHECK(r1 && r1->rate == rate_1x2 && r1->combiners[0] == comb::override_val && r1->combiners[1] == comb::min);
+    const auto* img0 = std::get_if<SetShadingRateImage>(&list.commands()[7]);
+    CHECK(img0 && img0->resource == 50);
+    const auto* img1 = std::get_if<SetShadingRateImage>(&list.commands()[8]);
+    CHECK(img1 && img1->resource == 0);
     return 0;
 }
