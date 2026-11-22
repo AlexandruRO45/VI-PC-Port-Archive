@@ -501,7 +501,33 @@ int main() {
         CHECK(memory_type_order(memory, 0xF, host, local, 256 * mib) == (order{3, 1, 2}));
     }
 
-    std::printf("state map, enhanced barriers, subresource decoding, layout tracking, discard ranges, BAR detection "
-                "and memory types OK\n");
+    // Primitive restart: strips only, and only where the PSO's cut index is Vulkan's restart index for the bound
+    // index type (d3d12_restart_test draws the same cases on a GPU).
+    {
+        using detail::primitive_restart;
+        for (const VkPrimitiveTopology strip :
+             {VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP,
+              VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY}) {
+            CHECK(primitive_restart(0xFFFF, VK_INDEX_TYPE_UINT16, strip));
+            CHECK(primitive_restart(0xFFFFFFFF, VK_INDEX_TYPE_UINT32, strip));
+            CHECK(!primitive_restart(0xFFFFFFFF, VK_INDEX_TYPE_UINT16, strip));  // never matches a 16-bit index
+            CHECK(!primitive_restart(0xFFFF, VK_INDEX_TYPE_UINT32, strip));      // D3D12 cuts at 0x0000FFFF
+            CHECK(!primitive_restart(0, VK_INDEX_TYPE_UINT16, strip) && !primitive_restart(0, VK_INDEX_TYPE_UINT32, strip));
+        }
+        for (const VkPrimitiveTopology list :
+             {VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+              VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY,
+              VK_PRIMITIVE_TOPOLOGY_PATCH_LIST}) {
+            CHECK(!primitive_restart(0xFFFF, VK_INDEX_TYPE_UINT16, list));
+            CHECK(!primitive_restart(0xFFFFFFFF, VK_INDEX_TYPE_UINT32, list));
+        }
+        CHECK(detail::vulkan_topology(3) == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP);  // D3D_PRIMITIVE_TOPOLOGY_LINESTRIP
+        CHECK(detail::vulkan_topology(5) == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP);
+        CHECK(detail::vulkan_topology(11) == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY);
+        CHECK(detail::vulkan_topology(13) == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY);
+    }
+
+    std::printf("state map, enhanced barriers, subresource decoding, layout tracking, discard ranges, BAR detection, "
+                "memory types and primitive restart OK\n");
     return 0;
 }

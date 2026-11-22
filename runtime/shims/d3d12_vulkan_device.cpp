@@ -1635,8 +1635,16 @@ public:
             log_once("primitive topology type not supported:", desc.PrimitiveTopologyType);
             return E_INVALIDARG;
         }
-        if (desc.IBStripCutValue != D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED)
-            log_once("index-buffer strip cuts (primitive restart) are not modelled; value", desc.IBStripCutValue);
+        // The index that cuts an indexed strip; replay turns primitive restart on per draw where Vulkan's restart
+        // index for the bound format is that index (vulkan_replay.h, primitive_restart).
+        switch (desc.IBStripCutValue) {
+        case D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED: break;
+        case D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF: graphics_.strip_cut = 0xFFFF; break;
+        case D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF: graphics_.strip_cut = 0xFFFFFFFF; break;
+        default:  // the host D3D12 runtime refuses these with E_INVALIDARG
+            log_once("index-buffer strip cut value not valid:", desc.IBStripCutValue);
+            return E_INVALIDARG;
+        }
 
         const D3D12_RASTERIZER_DESC& r = desc.RasterizerState;
         VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
@@ -1869,10 +1877,12 @@ private:
     VkPipeline build(std::uint32_t unbound) const {
         // The stride state is last: a pipeline without vertex bindings (a full-screen pass that builds its vertices
         // from SV_VertexID) leaves it out, since no vkCmdBindVertexBuffers2 would ever set it
-        // (VUID-vkCmdDraw-pStrides-04913).
+        // (VUID-vkCmdDraw-pStrides-04913). Primitive restart is dynamic because it depends on the topology and index
+        // format of each draw.
         static constexpr VkDynamicState dynamic_states[] = {
             VK_DYNAMIC_STATE_VIEWPORT,          VK_DYNAMIC_STATE_SCISSOR,          VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
-            VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE};
+            VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
+            VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE};
         const Recipe& r = recipe_;
         std::vector<VkFormat> colors = graphics_.color_formats;
         for (std::size_t slot = 0; slot < colors.size(); ++slot)

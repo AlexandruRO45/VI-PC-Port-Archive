@@ -978,8 +978,31 @@ if(TARGET Vulkan::Headers)
                                  LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}"
                                  LEONIDA_TEST_VS_FULLSCREEN_SPV="${LEONIDA_TEST_VS_FULLSCREEN}")
       target_compile_options(d3d12_draw_test PRIVATE /W4 /permissive- /utf-8)
+      # Primitive restart (IBStripCutValue): indexed strips and lists with cut indices, read back.
+      set(LEONIDA_TEST_RESTART_SHADERS)
+      foreach(source vs_restart.vert ps_restart.frag)
+        string(REGEX REPLACE "\\.[a-z]+$" ".spv" output "${CMAKE_CURRENT_BINARY_DIR}/generated/${source}")
+        add_custom_command(
+          OUTPUT ${output}
+          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${output}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          COMMENT "Compiling the primitive restart test shader ${source}"
+          VERBATIM)
+        list(APPEND LEONIDA_TEST_RESTART_SHADERS ${output})
+      endforeach()
+      list(GET LEONIDA_TEST_RESTART_SHADERS 0 LEONIDA_TEST_RESTART_VS)
+      list(GET LEONIDA_TEST_RESTART_SHADERS 1 LEONIDA_TEST_RESTART_PS)
+      add_executable(d3d12_restart_test test/d3d12_restart_test.cpp shims/d3d12_xs_device.cpp
+                     ${LEONIDA_TEST_RESTART_SHADERS})
+      target_link_libraries(d3d12_restart_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_restart_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_RESTART_VS_SPV="${LEONIDA_TEST_RESTART_VS}"
+                                 LEONIDA_TEST_RESTART_PS_SPV="${LEONIDA_TEST_RESTART_PS}")
+      target_compile_options(d3d12_restart_test PRIVATE /W4 /permissive- /utf-8)
     else()
-      message(STATUS "glslangValidator not found: d3d12_compute_test and d3d12_draw_test are not built")
+      message(STATUS "glslangValidator not found: d3d12_compute_test, d3d12_draw_test and d3d12_restart_test are "
+                     "not built")
     endif()
 
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).

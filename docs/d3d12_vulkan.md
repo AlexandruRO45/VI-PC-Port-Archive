@@ -134,7 +134,7 @@ The command-list surface maps to the IR as follows:
 | `SetGraphicsRootSignature` / `SetComputeRootSignature` | state; select the pipeline layout and root map |
 | `Set*Root32BitConstant(s)` / `Set*Root*View` / `Set*RootDescriptorTable` | update root args; build the push-constant block at the draw/dispatch |
 | `SetDescriptorHeaps` | state; scan/populate the bindless arrays and hash table at execute |
-| `IASetVertexBuffers` / `IASetIndexBuffer` / `IASetPrimitiveTopology` | state; bind arena buffer + offset, dynamic topology |
+| `IASetVertexBuffers` / `IASetIndexBuffer` / `IASetPrimitiveTopology` | state; bind arena buffer + offset, dynamic topology and primitive restart |
 | `RSSetViewports` / `RSSetScissorRects` | state; dynamic viewport/scissor |
 | `OMSetRenderTargets` / `OMSetBlendFactor` / `OMSetStencilRef` | state; rendering scope and dynamic state |
 | `DrawInstanced` / `DrawIndexedInstanced` | command with a state snapshot |
@@ -568,9 +568,21 @@ The compute path, end to end:
     and its location is the element's register (the translator's vertex-fetch rule). An input the layout leaves
     unfed is refused, as D3D12 refuses it.
   - **Fixed-function state:** rasterizer, blend and depth-stencil state map one to one. Viewport, scissor,
-    topology, stencil references and the blend factor are dynamic, and so are vertex strides when the pipeline has
-    vertex bindings. A pipeline without them (a full-screen pass from `SV_VertexID`) does not declare the stride
-    state, since nothing would set it (`VUID-vkCmdDraw-pStrides-04913`).
+    topology, primitive restart, stencil references and the blend factor are dynamic, and so are vertex strides
+    when the pipeline has vertex bindings. A pipeline without them (a full-screen pass from `SV_VertexID`) does not
+    declare the stride state, since nothing would set it (`VUID-vkCmdDraw-pStrides-04913`).
+  - **Primitive restart:** the PSO keeps `IBStripCutValue`; a value outside the enum is refused with
+    `E_INVALIDARG`, as the host runtime refuses it. Replay turns restart on per draw for an indexed strip (line or
+    triangle, with or without adjacency) whose cut value is Vulkan's restart index for the bound format: `0xFFFF`
+    with 16-bit indices, `0xFFFFFFFF` with 32-bit ones. The host D3D12 runtime, measured on a Radeon 680M
+    (31.0.14084.6002), an RTX 3050 Laptop GPU (32.0.16.2101) and WARP, cuts only where an index equals the cut
+    value, so `0xFFFFFFFF` never cuts 16-bit indices there either, and `0xFFFF` leaves a 32-bit `0xFFFFFFFF`
+    uncut. Two cases differ:
+    - `0xFFFF` with 32-bit indices: D3D12 cuts at `0x0000FFFF`, which Vulkan cannot express, so it is drawn
+      uncut. Matching it would mean rewriting the index buffer.
+    - Lists: the drivers disagree. AMD's draws the cut index as a vertex; NVIDIA's and WARP end the list there, as
+      the D3D11.3 functional spec (section 8.12) describes. The layer never restarts a list, as AMD's driver and
+      vkd3d-proton do, which also needs no `VK_EXT_primitive_topology_list_restart`.
   - **Logic ops** come from `RenderTarget[0]`, as in D3D12, and apply to every target (Vulkan has one per
     pipeline; it skips float formats). **`DepthClipEnable = FALSE`** is depth clamping: D3D12 clamps output depth
     to the viewport's range anyway.
@@ -608,7 +620,7 @@ The compute path, end to end:
     dynamic-rendering scope. Its layer count is the smallest layer count of the bound views.
   - **Viewport:** it is flipped (negative height), because translated vertex shaders write D3D clip coordinates;
     front-face winding then matches D3D12's.
-  - Only the first viewport and scissor are used, and primitive restart is not modelled yet.
+  - Only the first viewport and scissor are used.
 
   **Resources and heaps:**
   - A buffer of 0 bytes, or one whose size wraps when aligned, is `E_INVALIDARG`. One the arena cannot hold is
@@ -625,10 +637,11 @@ The compute path, end to end:
 
 Known gaps: set 0 in pipelines (the device keeps the bindless set, but no pipeline declares or binds it yet) and
 therefore every translated shader that declares bindings; tessellation, geometry and mesh pipelines,
-multisampled pipelines, several viewports, primitive restart; `requiredSubgroupSize = 64` for wave64 compute;
-the game's present entry point (DXGI factory/swapchain or `PresentX`; the presenter above is what either
-calls), HDR and fullscreen; buffer and constant-buffer views (UAV clears read the descriptor bytes, so they do
-not wait on view creation), typeless volume RTVs, placed
+multisampled pipelines, several viewports; a strip cut value of `0xFFFF` with 32-bit indices (D3D12 cuts at
+`0x0000FFFF`; drawn uncut) and cut values in lists (never cut, as AMD's driver does); `requiredSubgroupSize = 64`
+for wave64 compute; the game's present entry point (DXGI factory/swapchain or `PresentX`; the presenter above is
+what either calls), HDR and fullscreen; buffer and constant-buffer views (UAV clears read the descriptor bytes, so
+they do not wait on view creation), typeless volume RTVs, placed
 resources, depth-stencil resolves to a destination offset other than the source rectangle's, and 1D
 textures;
 default-heap buffers are not zero-filled yet; a fence cannot be signalled to a lower value (Vulkan timelines only
@@ -653,8 +666,9 @@ Build `runtime/` (Vulkan SDK and Python 3 on `PATH`) and run `ctest --test-dir <
 CPU tests:
 - `command_list_test` covers the recording rules.
 - `d3d12_state_map_test` covers both state tables, subresource and barrier-range decoding, layout tracking, the
-  subresource ranges `DiscardResource` prepares, Resizable BAR detection, and the memory type order on a no-ReBAR
-  heap layout. On Windows it also checks every D3D12 constant the IR copies against the SDK's `d3d12.h`.
+  subresource ranges `DiscardResource` prepares, Resizable BAR detection, the memory type order on a no-ReBAR
+  heap layout, and when a draw turns primitive restart on. On Windows it also checks every D3D12 constant the IR
+  copies against the SDK's `d3d12.h`.
 - `gfx10_descriptors_test` covers the T#, S# and V#: every field alone at its bit position, round trips, what
   decoding refuses and ignores, the T#s the image test shaders build, sampler words as radv writes them, and the
   format table. `tests/test_gfx10_descriptors.py` compares that table with `tools/gfx10_formats.json`.
@@ -845,6 +859,16 @@ and any validation error fails them.
 
   The shaders are GLSL written to the translator's contract (`test/glsl/vs_draw.vert`, `vs_fullscreen.vert`,
   `ps_draw.frag`).
+- `d3d12_restart_test`: primitive restart through the proxy. Each case draws two quads with a cut-valued index
+  between them; an index that does not cut becomes a vertex between the quads (`test/glsl/vs_restart.vert`, from
+  `SV_VertexID`), so an uncut strip bridges them. The 14 cases cover:
+  - triangle and line strips, 16-bit and 32-bit indices, each cut value and none;
+  - the mismatched pairings, a list with a cut value, and a draw without an index buffer.
+
+  The expectations are the host D3D12 runtime's, measured on the same geometry. The exceptions are `0xFFFF` with
+  32-bit indices and lists, where the layer cannot follow every driver; the test names them. A cut value outside
+  the enum must be refused. A device below 144 bytes of push constants refuses the PSOs, and the test then says so
+  and draws nothing.
 - `d3d12_present_test`: milestone M0. It opens a window and presents 60 frames, each one: reset the list, move
   the back buffer `PRESENT` → `RENDER_TARGET`, clear, move it back, execute, present, signal a fence. It then
   resizes the window and presents 10 more (70 in all), which recreates the swapchain, scales the blit and switches

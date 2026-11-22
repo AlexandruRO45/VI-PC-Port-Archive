@@ -654,6 +654,7 @@ struct GraphicsPipeline {
     // and stencil. Null when it cannot be built.
     static constexpr std::uint32_t unbound_depth = 1u << 8;
     std::function<VkPipeline(std::uint32_t unbound)> variant;
+    std::uint32_t strip_cut = 0;          // IBStripCutValue as the index it names (0xFFFF, 0xFFFFFFFF); 0: none
 };
 
 // The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
@@ -698,6 +699,7 @@ struct ReplayFunctions {
     PFN_vkCmdSetViewport set_viewport = nullptr;
     PFN_vkCmdSetScissor set_scissor = nullptr;
     PFN_vkCmdSetPrimitiveTopology set_primitive_topology = nullptr;
+    PFN_vkCmdSetPrimitiveRestartEnable set_primitive_restart_enable = nullptr;
     PFN_vkCmdSetStencilReference set_stencil_reference = nullptr;
     PFN_vkCmdSetBlendConstants set_blend_constants = nullptr;
     PFN_vkCmdDraw draw = nullptr;
@@ -1390,8 +1392,8 @@ template<typename Resolve>
 ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunctions& vk, Prepared& p) {
     if (!vk.graphics_pipeline || !vk.buffer_at || !vk.image_view || !vk.begin_rendering || !vk.end_rendering ||
         !vk.bind_vertex_buffers2 || !vk.bind_index_buffer || !vk.set_viewport || !vk.set_scissor ||
-        !vk.set_primitive_topology || !vk.set_stencil_reference || !vk.set_blend_constants || !vk.draw ||
-        !vk.draw_indexed || !vk.bind_pipeline || !vk.push_constants)
+        !vk.set_primitive_topology || !vk.set_primitive_restart_enable || !vk.set_stencil_reference ||
+        !vk.set_blend_constants || !vk.draw || !vk.draw_indexed || !vk.bind_pipeline || !vk.push_constants)
         return ReplayResult::unsupported;
     const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
     if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
@@ -1505,6 +1507,25 @@ inline VkPrimitiveTopology vulkan_topology(std::uint32_t topology) {
     case 12: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY;
     case 13: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
     default: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    }
+}
+
+// Whether an indexed draw restarts its strip at Vulkan's restart index, all ones for the index type. The host PC
+// D3D12 runtime (AMD, NVIDIA and WARP alike) cuts a strip only where an index equals the PSO's IBStripCutValue, so
+// the two agree when the cut is all ones for the bound format: 0xFFFFFFFF never cuts 16-bit indices, and Vulkan
+// cannot express 0xFFFF with 32-bit indices, which D3D12 cuts at 0x0000FFFF (drawn uncut here; see
+// docs/d3d12_vulkan.md). Lists never restart: D3D12 drivers disagree there (AMD's ignores the cut, NVIDIA's and
+// WARP end the list as the D3D11.3 functional spec, section 8.12, says), and Vulkan would need
+// VK_EXT_primitive_topology_list_restart. This follows AMD and vkd3d-proton.
+inline bool primitive_restart(std::uint32_t strip_cut, VkIndexType type, VkPrimitiveTopology topology) {
+    switch (topology) {
+    case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP:
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP:
+    case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY:
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY:
+        return strip_cut == (type == VK_INDEX_TYPE_UINT16 ? 0xFFFFu : 0xFFFFFFFFu);
+    default:
+        return false;
     }
 }
 
@@ -2716,7 +2737,11 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                    {std::uint32_t(std::max(0, s.right - std::max(0, s.left))),
                                     std::uint32_t(std::max(0, s.bottom - std::max(0, s.top)))}};
             vk.set_scissor(command_buffer, 0, 1, &scissor);
-            vk.set_primitive_topology(command_buffer, detail::vulkan_topology(draw->topology));
+            const VkPrimitiveTopology topology = detail::vulkan_topology(draw->topology);
+            vk.set_primitive_topology(command_buffer, topology);
+            // Dynamic in every pipeline, so every draw sets it; Vulkan applies it to indexed draws only.
+            const bool restart = draw->indexed && detail::primitive_restart(p.graphics.strip_cut, p.index_type, topology);
+            vk.set_primitive_restart_enable(command_buffer, restart ? VK_TRUE : VK_FALSE);
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw->stencil_front);
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);
             vk.set_blend_constants(command_buffer, draw->blend_factor.data());
