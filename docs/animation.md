@@ -454,7 +454,7 @@ u32; u32 count}` with `Entry {u64 key; T *value; Entry *next}`. Hashes are `joaa
 | | without `+0x30`: `+0xFC` u32, `+0x128` u32 | columns, samples (the matrix is in blocks of 8 samples) |
 | | with `+0x30`: `+0x98` pointer, count at `+0x94` | one u32 per sample, the same for every sample of a record |
 | matcher skeleton (feature object `+0x28`) | `+0x18` u32 slots, `+0x1C` u32 entries, `+0x20` pointer | tag table, 8-byte slots `{u32 tag; u32 bone}`, empty tag 0xFFFFFFFF |
-| | `+0x28` pointer, `+0x6C` u16 count (`+0x6E` the same) | the bones, 80 bytes each: `{f32 rotation quaternion[4]; f32 translation[3]; 4 bytes; f32 1.0[4]; char *name at +0x30; s16 parent at +0x46; u16 index at +0x48 and +0x4C; u16 bone id at +0x4A}` |
+| | `+0x28` pointer, `+0x6C` u16 count (`+0x6E` the same, measured separately) | the bones, 80 bytes each: `{f32 rotation quaternion[4]; f32 translation[3]; 4 bytes; f32 1.0[4]; char *name at +0x30; s16 parent at +0x46; u16 index at +0x48 and +0x4C; u16 bone id at +0x4A}` (the 1.0s and the two indices on 180 of 180, measured separately) |
 | | `+0x30`, `+0x38` pointers | per bone a 4x4 f32 matrix: the inverse bind matrix, and the local matrix (row vectors, translation in row 3) |
 | | `+0x40` pointer | the parents, one s16 per bone, −1 for the root |
 | animation | `+0x24` u16 | frame count |
@@ -643,9 +643,9 @@ A `.motionmatcher` object has fields up to `+0x18F`; they are in the object tabl
   (measured separately).
 - **Where an entry sits.** In the key table and the features' `+0x48` table, every entry is where its own hash h
   puts it: control byte h & 0x7F, in group (h >> 7) & (groups − 1), on 180 of 180 each
-  (`tables_placed_by_key`). The clip table doesn't place its entries by the stored clip hash (0 of 180), nor by
-  the slot's second word; that word is not a dictionary hash in the archive (18 of 4,381, chance level, measured
-  separately).
+  (`tables_placed_by_key`). The clip table doesn't place its entries by the stored clip hash (0 of 180). Measured
+  separately: it doesn't place them by the slot's second word either, and that word is not a dictionary hash in
+  the archive (18 of 4,381, chance level).
 - **Self (`+0x188`).** The clip's own hash and the dictionary's `joaat32(name)` on 180 of 180.
 - **`+0x78` and `+0xB8`.** The u16 array starts at 0, never decreases and ends at the record count on 180 of 180;
   on 175 it has one more item than the records, so it is 0, 1, …, n (measured separately). The u8 array has one

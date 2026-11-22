@@ -285,12 +285,12 @@ def matcher_features(s, at):
     second = s.ptr(obj + 0x30) is not None
     columns = features[-1][0] + features[-1][1] if features else 0
     poses = matcher_poses(s, obj, columns, second)
-    tags, nt = matcher_array(s, obj + 0x98)
     sample_u32 = []
-    if second and nt:
-        if tags + 4 * nt > len(s.d):
+    if second:                                                              # not read in the blocks layout
+        tags, nt = matcher_array(s, obj + 0x98)
+        if nt and tags + 4 * nt > len(s.d):
             raise DecodeError("motionmatcher per-sample words run past the pages")
-        sample_u32 = list(struct.unpack_from(f"<{nt}I", s.d, tags))
+        sample_u32 = list(struct.unpack_from(f"<{nt}I", s.d, tags)) if nt else []
     return {"features": features, "feature_names": names,                  # (column, width, name hash); (hash, index)
             "feature_kinds": kinds,                                         # (u16 +0x0E, u32 +0x1C) per feature
             "feature_second": second,                                       # +0x30 object present (not decoded)
@@ -320,9 +320,9 @@ def matcher_skeleton(s, at):
         out.append((s.d[name_at:end].decode("latin-1"), struct.unpack_from("<h", s.d, b + 0x46)[0], s.u16(b + 0x4A),
                     struct.unpack_from("<4f", s.d, b), struct.unpack_from("<3f", s.d, b + 0x10)))
     slots, entries, tt = s.u32(at + 0x18), s.u32(at + 0x1C), s.ptr(at + 0x20)
-    if tt is None or tt + 8 * slots > len(s.d):
+    if tt is None and (slots or entries) or tt is not None and tt + 8 * slots > len(s.d):
         raise DecodeError("motionmatcher skeleton tag table runs past the pages")
-    tags = [struct.unpack_from("<II", s.d, tt + 8 * i) for i in range(slots)]
+    tags = [struct.unpack_from("<II", s.d, tt + 8 * i) for i in range(slots)] if tt is not None else []
     tags = [t for t in tags if t[0] != 0xFFFFFFFF]
     if len(tags) != entries:
         raise DecodeError("motionmatcher skeleton tag table count does not fit")
@@ -337,8 +337,9 @@ def matcher_poses(s, obj, columns, rows_layout):
     with it, row-major, `+0xF8` samples, `+0xFC` columns, `+0x100` chunks per row (the fewest that hold the columns;
     the rest of a row is zero); without it, blocks of 8 samples, column-major inside a block (column c of sample r at
     `(r // 8) * D' * 8 + c * 8 + r % 8`, D' = columns rounded up to even), the samples at `+0x128`, and the lanes
-    after the last sample copy it (and an odd column count's spare column is zero). With rows, `+0xA8` holds one 48-byte `{f32 quaternion[4]; f32 vec3; f32 0; f32
-    1, 1, 1; f32 0}` per sample (count at `+0xA4`). -> {"poses": {...}, "pose_transforms": [...]}"""
+    after the last sample copy it (and an odd column count's spare column is zero). With rows, `+0xA8` holds one
+    48-byte `{f32 quaternion[4]; f32 vec3; f32 0; f32 1, 1, 1; f32 0}` per sample (count at `+0xA4`).
+    -> {"poses": {...}, "pose_transforms": [...]}"""
     chunks, data = s.u32(obj + 0xEC), s.ptr(obj + 0xF0)
     if data is None:
         raise DecodeError("motionmatcher without a pose matrix")
@@ -394,7 +395,7 @@ def quaternion_rows(x, y, z, w):
 
 def skeleton_checks(skel):
     """-> (local matrices are the bones' rotation and translation, inverse binds undo the parent chain), each
-    to 2e-3, for the row-vector convention."""
+    to 2e-3, for the row-vector convention. A parent that isn't an earlier bone makes the chain check False."""
     local_ok, inverse_ok, world = True, True, []
     for i, (_name, parent, _id, q, t) in enumerate(skel["bones"]):
         m = skel["local"][i]
@@ -402,8 +403,11 @@ def skeleton_checks(skel):
         local_ok &= all(abs(m[a][b] - r[a][b]) < 2e-3 for a in range(3) for b in range(3)) and all(
             abs(m[3][a] - t[a]) < 2e-3 for a in range(3))
         lm = [list(m[a][:3]) + [0.0] for a in range(3)] + [list(t) + [1.0]]
-        g = lm if parent < 0 else [[sum(lm[a][k] * world[parent][k][b] for k in range(4)) for b in range(4)]
-                                   for a in range(4)]
+        if parent >= i:
+            inverse_ok, g = False, lm
+        else:
+            g = lm if parent < 0 else [[sum(lm[a][k] * world[parent][k][b] for k in range(4)) for b in range(4)]
+                                       for a in range(4)]
         world.append(g)
         ib = skel["inverse_bind"][i]
         inv = [list(row[:3]) + [0.0] for row in ib[:3]] + [list(ib[3][:3]) + [1.0]]

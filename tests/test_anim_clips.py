@@ -527,6 +527,10 @@ class DecodeTest(unittest.TestCase):
         self.assertEqual(anim_clips.skeleton_checks(sk), (True, False))
         sk["local"][1][0] = (1.0, 0.0, 0.0, 0.0)                                     # not the bone's rotation
         self.assertEqual(anim_clips.skeleton_checks(sk)[0], False)
+        sk["bones"][1] = ("spine", 2) + sk["bones"][1][2:]                           # a parent after its child
+        self.assertEqual(anim_clips.skeleton_checks(sk), (False, False))
+        sk["bones"] = []                                                             # an empty skeleton
+        self.assertEqual(anim_clips.skeleton_checks(sk), (True, True))
 
     def test_motionmatcher_poses_in_blocks_of_8(self):
         s = anim_clips.System(bytearray(two_sequence_dictionary(pose_rows=False)))
