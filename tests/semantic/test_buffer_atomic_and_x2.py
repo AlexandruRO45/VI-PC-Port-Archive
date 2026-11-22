@@ -176,5 +176,166 @@ class TestBufferAtomicAndX2Oracle(unittest.TestCase):
         self.assertEqual(self.mem.read_u64(128), 0)
 
 
+# ---------------------------------------------------------------------------
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ---------------------------------------------------------------------------
+
+class RegKind(enum.Enum):
+    """Register kinds in RDNA2 architecture."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclasses.dataclass(frozen=True)
+class Register:
+    """Register operand with kind, index, and optional multi-register grouping."""
+    kind: RegKind
+    index: int
+    count: int = 1
+
+    def format_asm(self) -> str:
+        if self.count == 1:
+            return f"{self.kind.value}{self.index}"
+        return f"{self.kind.value}[{self.index}:{self.index + self.count - 1}]"
+
+    @property
+    def is_vgpr(self) -> bool:
+        return self.kind == RegKind.VGPR
+
+    @property
+    def is_sgpr(self) -> bool:
+        return self.kind == RegKind.SGPR
+
+
+@dataclasses.dataclass(frozen=True)
+class BufferAtomicModifiers:
+    """Modifiers and options for buffer atomic instructions."""
+    offset: int = 0
+    glc: bool = False
+    slc: bool = False
+    offen: bool = True
+    idxen: bool = False
+
+    def __post_init__(self) -> None:
+        if self.offset < 0 or self.offset > 4095:
+            raise ValueError(f"Immediate inst_offset must be in range [0, 4095]: {self.offset}")
+
+
+class Opcode(enum.Enum):
+    """64-bit buffer atomic opcodes."""
+    BUFFER_ATOMIC_AND_X2 = "buffer_atomic_and_x2"
+
+
+@dataclasses.dataclass(frozen=True)
+class Instruction:
+    """Symbolic AST node representing a buffer_atomic_and_x2 instruction."""
+    opcode: Opcode
+    vdata: Register
+    vaddr: Register
+    srsrc: Register
+    soffset: Register | int
+    mods: BufferAtomicModifiers = dataclasses.field(default_factory=BufferAtomicModifiers)
+
+    def __post_init__(self) -> None:
+        if not self.vdata.is_vgpr or self.vdata.count != 2:
+            raise ValueError(f"vdata must be a 64-bit VGPR pair (count=2): {self.vdata}")
+        if not self.vaddr.is_vgpr:
+            raise ValueError(f"vaddr must be a VGPR: {self.vaddr}")
+        if not self.srsrc.is_sgpr or self.srsrc.count != 4:
+            raise ValueError(f"srsrc must be a 128-bit SGPR group (count=4): {self.srsrc}")
+        if isinstance(self.soffset, Register) and not self.soffset.is_sgpr:
+            raise ValueError(f"soffset register must be an SGPR: {self.soffset}")
+
+    def to_assembly(self) -> str:
+        vd_str = self.vdata.format_asm()
+        va_str = self.vaddr.format_asm()
+        sr_str = self.srsrc.format_asm()
+        so_str = self.soffset.format_asm() if isinstance(self.soffset, Register) else str(self.soffset)
+
+        mod_parts: list[str] = []
+        if self.mods.offen:
+            mod_parts.append("offen")
+        if self.mods.idxen:
+            mod_parts.append("idxen")
+        if self.mods.offset != 0:
+            mod_parts.append(f"offset:{self.mods.offset}")
+        if self.mods.glc:
+            mod_parts.append("glc")
+        if self.mods.slc:
+            mod_parts.append("slc")
+
+        mods_str = (" " + " ".join(mod_parts)) if mod_parts else ""
+        return f"{self.opcode.value} {vd_str}, {va_str}, {sr_str}, {so_str}{mods_str}"
+
+
+@dataclasses.dataclass
+class Program:
+    """Symbolic sequence of buffer instructions."""
+    instructions: list[Instruction] = dataclasses.field(default_factory=list)
+
+    def append(self, inst: Instruction) -> None:
+        self.instructions.append(inst)
+
+    def to_assembly(self) -> str:
+        return "\n".join(inst.to_assembly() for inst in self.instructions)
+
+
+class TestBufferAtomicAndX2AST(unittest.TestCase):
+    """Unit tests for AST data structures and assembly emission."""
+
+    def test_ast_instruction_creation(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_AND_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2),
+            srsrc=Register(RegKind.SGPR, 0, count=4),
+            soffset=0,
+        )
+        self.assertEqual(inst.opcode, Opcode.BUFFER_ATOMIC_AND_X2)
+        self.assertEqual(inst.vdata.format_asm(), "v[0:1]")
+        self.assertEqual(inst.vaddr.format_asm(), "v2")
+        self.assertEqual(inst.srsrc.format_asm(), "s[0:3]")
+        self.assertEqual(inst.to_assembly(), "buffer_atomic_and_x2 v[0:1], v2, s[0:3], 0 offen")
+
+    def test_ast_to_assembly_with_modifiers(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_AND_X2,
+            vdata=Register(RegKind.VGPR, 4, count=2),
+            vaddr=Register(RegKind.VGPR, 6),
+            srsrc=Register(RegKind.SGPR, 8, count=4),
+            soffset=Register(RegKind.SGPR, 12),
+            mods=BufferAtomicModifiers(offset=64, glc=True, slc=True, offen=True),
+        )
+        self.assertEqual(
+            inst.to_assembly(),
+            "buffer_atomic_and_x2 v[4:5], v6, s[8:11], s12 offen offset:64 glc slc",
+        )
+
+    def test_ast_program_assembly(self) -> None:
+        prog = Program()
+        inst1 = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_AND_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2),
+            srsrc=Register(RegKind.SGPR, 0, count=4),
+            soffset=0,
+        )
+        inst2 = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_AND_X2,
+            vdata=Register(RegKind.VGPR, 2, count=2),
+            vaddr=Register(RegKind.VGPR, 4),
+            srsrc=Register(RegKind.SGPR, 0, count=4),
+            soffset=16,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        prog.append(inst1)
+        prog.append(inst2)
+        asm = prog.to_assembly()
+        lines = asm.splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[0].startswith("buffer_atomic_and_x2 v[0:1]"))
+        self.assertTrue(lines[1].endswith("glc"))
+
+
 if __name__ == "__main__":
     unittest.main()
