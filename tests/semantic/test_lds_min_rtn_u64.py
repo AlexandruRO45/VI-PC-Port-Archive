@@ -1163,5 +1163,161 @@ class TestLdsMinRtnU64StatusFlags(unittest.TestCase):
         self.assertEqual(len(conflicts_none), 0)
 
 
+# ---------------------------------------------------------------------------
+# Phase 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ---------------------------------------------------------------------------
+
+def f64_to_u64(val: float) -> int:
+    """Convert a Python float to its IEEE 754 double-precision 64-bit uint representation."""
+    return struct.unpack(">Q", struct.pack(">d", val))[0]
+
+
+def u64_to_f64(bits: int) -> float:
+    """Convert an IEEE 754 double-precision 64-bit uint bit pattern to a Python float."""
+    return struct.unpack(">d", struct.pack(">Q", bits & MASK64))[0]
+
+
+# Well-known IEEE 754 64-bit double-precision floating-point bit constants
+F64_POS_ZERO: int = 0x0000000000000000        # +0.0
+F64_NEG_ZERO: int = 0x8000000000000000        # -0.0
+F64_POS_ONE: int = 0x3FF0000000000000         # +1.0
+F64_NEG_ONE: int = 0xBFF0000000000000         # -1.0
+F64_POS_INF: int = 0x7FF0000000000000         # +infinity
+F64_NEG_INF: int = 0xFFF0000000000000         # -infinity
+F64_POS_QNAN: int = 0x7FF8000000000000        # Quiet NaN (positive)
+F64_NEG_QNAN: int = 0xFFF8000000000000        # Quiet NaN (negative)
+F64_POS_SNAN: int = 0x7FF0000000000001        # Signaling NaN (positive)
+F64_NEG_SNAN: int = 0xFFF0000000000001        # Signaling NaN (negative)
+F64_MIN_SUBNORMAL: int = 0x0000000000000001   # Smallest positive subnormal (2^-1074)
+F64_MAX_SUBNORMAL: int = 0x000FFFFFFFFFFFFF   # Largest positive subnormal ((1 - 2^-52) * 2^-1022)
+F64_MIN_NORMAL: int = 0x0010000000000000      # Smallest positive normal (2^-1022)
+F64_MAX_NORMAL: int = 0x7FEFFFFFFFFFFFFF      # Largest positive normal (1.7976931348623157e+308)
+
+
+class TestLdsMinRtnU64BoundaryExtremes(unittest.TestCase):
+    """Phase 7: Tests for IEEE 754 edge cases, subnormals, NaNs, and unsigned integer extremes."""
+
+    def test_f64_bit_preservation_no_canonicalization(self) -> None:
+        """ds_min_rtn_u64 is an integer operation; float64 bit patterns must not be modified."""
+        lds = LDSModel64()
+        special_patterns = [
+            F64_POS_ZERO,
+            F64_NEG_ZERO,
+            F64_POS_ONE,
+            F64_NEG_ONE,
+            F64_POS_INF,
+            F64_NEG_INF,
+            F64_POS_QNAN,
+            F64_NEG_QNAN,
+            F64_POS_SNAN,
+            F64_NEG_SNAN,
+            F64_MIN_SUBNORMAL,
+            F64_MAX_SUBNORMAL,
+            F64_MIN_NORMAL,
+            F64_MAX_NORMAL,
+        ]
+
+        # For each pattern, write it to LDS and retrieve with self-minimum (value == memory)
+        for i, pattern in enumerate(special_patterns):
+            addr = i * 8
+            lds.write_qword(addr, pattern)
+            old_val, new_val, mod = lds.atomic_min_rtn_u64(addr, pattern)
+            self.assertEqual(old_val, pattern)
+            self.assertEqual(new_val, pattern)
+            self.assertFalse(mod)
+            # Memory must retain exact bit representation without alteration
+            self.assertEqual(lds.read_qword(addr), pattern)
+
+    def test_f64_signed_zeros_unsigned_ordering(self) -> None:
+        """In IEEE 754 +0.0 == -0.0, but in unsigned uint64 +0.0 (0) < -0.0 (0x8000000000000000)."""
+        lds = LDSModel64()
+
+        # Case 1: Memory has -0.0 (0x8000000000000000), input is +0.0 (0)
+        # 0 < 0x8000000000000000 -> memory becomes +0.0 (0), old_val returned is -0.0
+        lds.write_qword(0x10, F64_NEG_ZERO)
+        old_val, new_val, mod = lds.atomic_min_rtn_u64(0x10, F64_POS_ZERO)
+        self.assertEqual(old_val, F64_NEG_ZERO)
+        self.assertEqual(new_val, F64_POS_ZERO)
+        self.assertTrue(mod)
+        self.assertEqual(lds.read_qword(0x10), F64_POS_ZERO)
+
+        # Case 2: Memory has +0.0 (0), input is -0.0 (0x8000000000000000)
+        # 0 <= 0x8000000000000000 -> memory remains +0.0 (0), old_val returned is +0.0
+        old_val2, new_val2, mod2 = lds.atomic_min_rtn_u64(0x10, F64_NEG_ZERO)
+        self.assertEqual(old_val2, F64_POS_ZERO)
+        self.assertEqual(new_val2, F64_POS_ZERO)
+        self.assertFalse(mod2)
+
+    def test_f64_infinities_and_nans_unsigned_ordering(self) -> None:
+        """Verify unsigned ordering of IEEE 754 infinities and NaNs."""
+        lds = LDSModel64()
+
+        # +inf (0x7FF0000000000000) < -inf (0xFFF0000000000000)
+        lds.write_qword(0x20, F64_NEG_INF)
+        old_val, new_val, mod = lds.atomic_min_rtn_u64(0x20, F64_POS_INF)
+        self.assertEqual(old_val, F64_NEG_INF)
+        self.assertEqual(new_val, F64_POS_INF)
+        self.assertTrue(mod)
+
+        # Positive Quiet NaN (0x7FF8000000000000) < Negative Quiet NaN (0xFFF8000000000000)
+        lds.write_qword(0x28, F64_NEG_QNAN)
+        old_val, new_val, mod = lds.atomic_min_rtn_u64(0x28, F64_POS_QNAN)
+        self.assertEqual(old_val, F64_NEG_QNAN)
+        self.assertEqual(new_val, F64_POS_QNAN)
+        self.assertTrue(mod)
+
+        # Signaling NaN (0x7FF0000000000001) < Quiet NaN (0x7FF8000000000000)
+        lds.write_qword(0x30, F64_POS_QNAN)
+        old_val, new_val, mod = lds.atomic_min_rtn_u64(0x30, F64_POS_SNAN)
+        self.assertEqual(old_val, F64_POS_QNAN)
+        self.assertEqual(new_val, F64_POS_SNAN)
+        self.assertTrue(mod)
+
+    def test_f64_subnormal_extremes(self) -> None:
+        """Verify subnormal minimum bounds: smallest subnormal (0x1) vs zero and normal floats."""
+        lds = LDSModel64()
+
+        # 0 < smallest subnormal (1)
+        lds.write_qword(0x40, F64_MIN_SUBNORMAL)
+        old_val, new_val, mod = lds.atomic_min_rtn_u64(0x40, 0)
+        self.assertEqual(old_val, F64_MIN_SUBNORMAL)
+        self.assertEqual(new_val, 0)
+        self.assertTrue(mod)
+
+        # Largest subnormal < Smallest normal
+        lds.write_qword(0x48, F64_MIN_NORMAL)
+        old_val, new_val, mod = lds.atomic_min_rtn_u64(0x48, F64_MAX_SUBNORMAL)
+        self.assertEqual(old_val, F64_MIN_NORMAL)
+        self.assertEqual(new_val, F64_MAX_SUBNORMAL)
+        self.assertTrue(mod)
+
+    def test_u64_boundary_matrix(self) -> None:
+        """Exhaustive boundary testing across 64-bit integer limits."""
+        boundaries = [
+            0,                                   # 0
+            1,                                   # 1
+            0x7FFFFFFFFFFFFFFE,                  # INT64_MAX - 1
+            0x7FFFFFFFFFFFFFFF,                  # INT64_MAX
+            0x8000000000000000,                  # INT64_MIN (as unsigned, 2^63)
+            0x8000000000000001,                  # 2^63 + 1
+            0xFFFFFFFFFFFFFFFE,                  # UINT64_MAX - 1
+            0xFFFFFFFFFFFFFFFF,                  # UINT64_MAX
+        ]
+
+        lds = LDSModel64()
+        for idx_a, val_a in enumerate(boundaries):
+            for idx_b, val_b in enumerate(boundaries):
+                addr = 0x100
+                lds.write_qword(addr, val_a)
+                expected_min = min(val_a, val_b)
+                expected_mod = (expected_min != val_a)
+
+                old_val, new_val, mod = lds.atomic_min_rtn_u64(addr, val_b)
+                self.assertEqual(old_val, val_a)
+                self.assertEqual(new_val, expected_min)
+                self.assertEqual(mod, expected_mod)
+                self.assertEqual(lds.read_qword(addr), expected_min)
+
+
 if __name__ == "__main__":
     unittest.main()
