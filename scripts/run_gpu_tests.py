@@ -894,7 +894,8 @@ def run_suite(a, work: str) -> int:
                       "cs_w64x_mask_reuse", "cs_w64x_mask_reuse2", "cs_w64x_chain_barrier", "cs_barrier_divergent",
                       "cs_bpermute32", "cs_w64x_partial_scmp", "cs_w32_partial_scmp", "cs_barrier_early_end",
                       "cs_barrier_loop", "cs_w64x_andn2_exec", "cs_w64x_saveexec_b64", "cs_lds_b64_cmpst",
-                      "cs_mask_vgpr_exec"):
+                      "cs_mask_vgpr_exec",
+                      "cs_w32_buf_atomics_ops", "cs_w32_buf_atomics_rtn", "cs_w32_glob_atomics_ops", "cs_w32_glob_atomics_rtn", "cs_w32_atomics_x2_ops", "cs_w32_atomics_x2_rtn"):
             cs_dump_wants = {
                 "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800, 0x40FF8000, 0x3FF00000],
                 # base + soffset + imm (cs_smem_soffset_imm.asm); out[4..7] are seeds the shader leaves alone
@@ -919,6 +920,13 @@ def run_suite(a, work: str) -> int:
                 # ds_cmpst_b32 and the b64 2-address forms (cs_lds_b64_cmpst.asm header)
                 "cs_lds_b64_cmpst": [0x11110001, 0x22220002, 0x33330003, 0x44440004,
                                      0xCCCC000C, 0x44440004, 0xBBBB000B, 0x3579BADC],
+                # buffer_atomic_* / global_atomic_* (the cs_w32_buf_atomics_*, cs_w32_glob_atomics_* and cs_w32_atomics_x2_* headers)
+                "cs_w32_buf_atomics_ops": [0x00000000, 0x00000015, 0x80000000, 0x7FFFFFF0, 0x7FFFFFFF, 0x8000000F, 0xF0000000, 0xFFFFFFFF],
+                "cs_w32_buf_atomics_rtn": [0xF0F0F0F0, 0x11111111, 0x22222222, 0x33333333, 0x44444444, 0x55555555, 0x55555554, 0xFFFFFFFF],
+                "cs_w32_glob_atomics_ops": [0x00000000, 0x00000015, 0x80000000, 0x7FFFFFF0, 0x7FFFFFFF, 0x8000000F, 0xF0000000, 0xFFFFFFFF],
+                "cs_w32_glob_atomics_rtn": [0xF0F0F0F0, 0x11111111, 0x22222222, 0x33333333, 0x44444444, 0x55555555, 0x55555554, 0xFFFFFFFF],
+                "cs_w32_atomics_x2_ops": [0xFFFFFFFF, 0x55555555, 0xF0000000, 0xAAAAAAAA, 0xF0F0F0F0, 0xA5A5A5A5, 0xF0F0F0F0, 0xA5A5A5A5],
+                "cs_w32_atomics_x2_rtn": [0x11111111, 0x22222222, 0x33333333, 0x44444444, 0xF000F000, 0x00000FF0, 0x88888888, 0x77777777],
                 # constant EXEC masks (cs_exec_const.asm): each lane takes its own bit of the constant
                 "cs_exec_const": [16, 8, 2, 16, 0, 16],
                 # constant lane masks: lane L takes bit L (cs_w32_mask_imm.asm / cs_w64_mask_imm.asm headers)
@@ -995,6 +1003,7 @@ def run_suite(a, work: str) -> int:
                                   "cs_w32_lds_u8_d16", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops",
                                   "cs_bpermute32", "cs_w32_partial_scmp", "cs_w32_sincos",
                                   "cs_lds_b64_cmpst", "cs_exec_const", "cs_w32_mask_imm", "cs_mask_vgpr_exec",
+                                  "cs_w32_buf_atomics_ops", "cs_w32_buf_atomics_rtn", "cs_w32_glob_atomics_ops", "cs_w32_glob_atomics_rtn", "cs_w32_atomics_x2_ops", "cs_w32_atomics_x2_rtn",
                                   "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8",
                                   "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi") and not emulated and not partial
             if partial and not emulated:
@@ -1009,7 +1018,8 @@ def run_suite(a, work: str) -> int:
                 want = judged_words(name, msg, want)   # cs_signed_zero_nan on Apple and llvmpipe (check.py)
                 ok, detail = judge_cs_dump(rc, msg, want, wave64=wave64, partial=partial, emulated=emulated,
                                            hexwords=name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lds_u8_d16",
-                                                             "cs_lds_b64_cmpst", "cs_signed_zero_nan"))
+                                                             "cs_lds_b64_cmpst", "cs_signed_zero_nan",
+                                                             "cs_w32_buf_atomics_ops", "cs_w32_buf_atomics_rtn", "cs_w32_glob_atomics_ops", "cs_w32_glob_atomics_rtn", "cs_w32_atomics_x2_ops", "cs_w32_atomics_x2_rtn"))
                 if ok and None in want:
                     unjudged = ", ".join(str(i) for i, w in enumerate(want) if w is None)
                     detail += f" (words {unjudged} not judged on this device: UNJUDGED_WORDS in check.py)"
