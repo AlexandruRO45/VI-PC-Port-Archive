@@ -1096,5 +1096,232 @@ class TestDsIncRtnU64ConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertTrue(flags.wrapped)
 
 
+# ==============================================================================
+# Phase 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+# IEEE 754 Double-Precision Boundary Constants
+POS_ZERO_F64 = 0x0000_0000_0000_0000
+NEG_ZERO_F64 = 0x8000_0000_0000_0000
+POS_INF_F64 = 0x7FF0_0000_0000_0000
+NEG_INF_F64 = 0xFFF0_0000_0000_0000
+QNAN_F64 = 0x7FF8_0000_0000_0000
+SNAN_F64 = 0x7FF0_0000_0000_0001
+MIN_NORMAL_F64 = 0x0010_0000_0000_0000
+MIN_SUBNORMAL_F64 = 0x0000_0000_0000_0001
+MAX_SUBNORMAL_F64 = 0x000F_FFFF_FFFF_FFFF
+MAX_NORMAL_F64 = 0x7FEF_FFFF_FFFF_FFFF
+ONE_F64 = 0x3FF0_0000_0000_0000
+
+
+def bits_to_f64(bits: int) -> float:
+    """Interpret 64-bit unsigned integer as IEEE 754 double-precision float."""
+    return struct.unpack("<d", struct.pack("<Q", bits & MASK_64))[0]
+
+
+def f64_to_bits(val: float) -> int:
+    """Pack IEEE 754 double-precision float into 64-bit unsigned integer."""
+    return struct.unpack("<Q", struct.pack("<d", val))[0]
+
+
+def is_f64_nan(bits: int) -> bool:
+    """Test if 64-bit bit pattern is an IEEE 754 double-precision NaN."""
+    return (bits & 0x7FF0_0000_0000_0000) == 0x7FF0_0000_0000_0000 and (bits & 0x000F_FFFF_FFFF_FFFF) != 0
+
+
+def is_f64_subnormal(bits: int) -> bool:
+    """Test if 64-bit bit pattern is an IEEE 754 double-precision subnormal float."""
+    return (bits & 0x7FF0_0000_0000_0000) == 0 and (bits & 0x000F_FFFF_FFFF_FFFF) != 0
+
+
+class TestDsIncRtnU64IEEE754BoundaryExtremes(unittest.TestCase):
+    """Phase 7: Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormal_f64_increment_no_flush_to_zero(self) -> None:
+        # Subnormals are not flushed to zero by LDS bitwise integer atomics
+        lds = LDSModel64(capacity_qwords=512)
+        rf = ScalarRegisterFile()
+        interp = ScalarLDS64Interpreter(lds, rf)
+
+        addr = 0x100
+        lds.write_qword(addr, MIN_SUBNORMAL_F64)
+        rf.write_vgpr(2, addr)
+        rf.write_vgpr_64(4, 0xFFFF_FFFF_FFFF_FFFF)
+
+        self.assertTrue(is_f64_subnormal(MIN_SUBNORMAL_F64))
+
+        inst = Ds64Instruction(
+            opcode=Ds64Opcode.DS_INC_RTN_U64,
+            vdst=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            vdata0=Register(RegKind.VGPR, 4, count=2),
+        )
+
+        old, mem = interp.step(inst)
+        self.assertEqual(old, MIN_SUBNORMAL_F64)
+        self.assertEqual(mem, MIN_SUBNORMAL_F64 + 1)
+        self.assertNotEqual(mem, 0)
+        self.assertTrue(is_f64_subnormal(mem))
+        self.assertEqual(rf.read_vgpr_64(0), MIN_SUBNORMAL_F64)
+
+    def test_subnormal_to_normal_boundary_crossing_f64(self) -> None:
+        lds = LDSModel64(capacity_qwords=512)
+        rf = ScalarRegisterFile()
+        interp = ScalarLDS64Interpreter(lds, rf)
+
+        addr = 0x120
+        lds.write_qword(addr, MAX_SUBNORMAL_F64)
+        rf.write_vgpr(2, addr)
+        rf.write_vgpr_64(4, 0xFFFF_FFFF_FFFF_FFFF)
+
+        self.assertTrue(is_f64_subnormal(MAX_SUBNORMAL_F64))
+
+        inst = Ds64Instruction(
+            opcode=Ds64Opcode.DS_INC_RTN_U64,
+            vdst=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            vdata0=Register(RegKind.VGPR, 4, count=2),
+        )
+
+        old, mem = interp.step(inst)
+        self.assertEqual(old, MAX_SUBNORMAL_F64)
+        self.assertEqual(mem, MIN_NORMAL_F64)
+        self.assertFalse(is_f64_subnormal(mem))
+        self.assertEqual(rf.read_vgpr_64(0), MAX_SUBNORMAL_F64)
+
+    def test_signaling_nan_preserved_without_quietening_f64(self) -> None:
+        lds = LDSModel64(capacity_qwords=512)
+        rf = ScalarRegisterFile()
+        interp = ScalarLDS64Interpreter(lds, rf)
+
+        addr = 0x140
+        lds.write_qword(addr, SNAN_F64)
+        rf.write_vgpr(2, addr)
+        rf.write_vgpr_64(4, 0xFFFF_FFFF_FFFF_FFFF)
+
+        inst = Ds64Instruction(
+            opcode=Ds64Opcode.DS_INC_RTN_U64,
+            vdst=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            vdata0=Register(RegKind.VGPR, 4, count=2),
+        )
+
+        old, mem = interp.step(inst)
+        self.assertEqual(old, SNAN_F64)
+        self.assertEqual(mem, SNAN_F64 + 1)
+        # Verify quiet bit 51 is NOT forced high
+        self.assertEqual(mem & 0x0008_0000_0000_0000, 0)
+        self.assertTrue(is_f64_nan(mem))
+        self.assertEqual(rf.read_vgpr_64(0), SNAN_F64)
+
+    def test_quiet_nan_wrap_boundary_f64(self) -> None:
+        lds = LDSModel64(capacity_qwords=512)
+        rf = ScalarRegisterFile()
+        interp = ScalarLDS64Interpreter(lds, rf)
+
+        addr = 0x160
+        lds.write_qword(addr, QNAN_F64)
+        rf.write_vgpr(2, addr)
+        rf.write_vgpr_64(4, QNAN_F64)
+
+        inst = Ds64Instruction(
+            opcode=Ds64Opcode.DS_INC_RTN_U64,
+            vdst=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            vdata0=Register(RegKind.VGPR, 4, count=2),
+        )
+
+        old, mem = interp.step(inst)
+        self.assertEqual(old, QNAN_F64)
+        self.assertEqual(mem, 0)
+        self.assertEqual(rf.read_vgpr_64(0), QNAN_F64)
+        self.assertEqual(lds.read_qword(addr), 0)
+
+    def test_positive_and_negative_zero_asymmetry_f64(self) -> None:
+        lds = LDSModel64(capacity_qwords=512)
+        rf = ScalarRegisterFile()
+        interp = ScalarLDS64Interpreter(lds, rf)
+
+        # POS_ZERO_F64 is integer 0
+        lds.write_qword(0x200, POS_ZERO_F64)
+        rf.write_vgpr(2, 0x200)
+        rf.write_vgpr_64(4, 100)
+        inst = Ds64Instruction(
+            opcode=Ds64Opcode.DS_INC_RTN_U64,
+            vdst=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            vdata0=Register(RegKind.VGPR, 4, count=2),
+        )
+        old, mem = interp.step(inst)
+        self.assertEqual(old, 0)
+        self.assertEqual(mem, 1)
+
+        # NEG_ZERO_F64 is integer 0x8000_0000_0000_0000
+        lds.write_qword(0x208, NEG_ZERO_F64)
+        rf.write_vgpr(2, 0x208)
+        rf.write_vgpr_64(4, 0xFFFF_FFFF_FFFF_FFFF)
+        old2, mem2 = interp.step(inst)
+        self.assertEqual(old2, 0x8000_0000_0000_0000)
+        self.assertEqual(mem2, 0x8000_0000_0000_0001)
+
+    def test_infinities_bit_patterns_f64(self) -> None:
+        lds = LDSModel64(capacity_qwords=512)
+        rf = ScalarRegisterFile()
+        interp = ScalarLDS64Interpreter(lds, rf)
+
+        # POS_INF_F64 is 0x7FF0_0000_0000_0000
+        addr = 0x300
+        lds.write_qword(addr, POS_INF_F64)
+        rf.write_vgpr(2, addr)
+        rf.write_vgpr_64(4, 0xFFFF_FFFF_FFFF_FFFF)
+        inst = Ds64Instruction(
+            opcode=Ds64Opcode.DS_INC_RTN_U64,
+            vdst=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            vdata0=Register(RegKind.VGPR, 4, count=2),
+        )
+        old, mem = interp.step(inst)
+        self.assertEqual(old, POS_INF_F64)
+        self.assertEqual(mem, POS_INF_F64 + 1)
+
+        # NEG_INF_F64 is 0xFFF0_0000_0000_0000
+        addr2 = 0x308
+        lds.write_qword(addr2, NEG_INF_F64)
+        rf.write_vgpr(2, addr2)
+        rf.write_vgpr_64(4, NEG_INF_F64)
+        old2, mem2 = interp.step(inst)
+        self.assertEqual(old2, NEG_INF_F64)
+        self.assertEqual(mem2, 0)
+
+    def test_uint64_boundary_extremes(self) -> None:
+        u_max = 0xFFFF_FFFF_FFFF_FFFF
+        u_mid = 0x8000_0000_0000_0000
+        u_mid_minus = 0x7FFF_FFFF_FFFF_FFFF
+
+        old, mem = oracle_ds_inc_rtn_u64(u_max - 1, u_max)
+        self.assertEqual(old, u_max - 1)
+        self.assertEqual(mem, u_max)
+
+        old, mem = oracle_ds_inc_rtn_u64(u_max, u_max)
+        self.assertEqual(old, u_max)
+        self.assertEqual(mem, 0)
+
+        old, mem = oracle_ds_inc_rtn_u64(u_mid_minus, u_max)
+        self.assertEqual(old, u_mid_minus)
+        self.assertEqual(mem, u_mid)
+
+    def test_counter_cyclic_trajectory_u64(self) -> None:
+        limit = 5
+        curr = 0
+        for expected in range(limit + 1):
+            old, curr = oracle_ds_inc_rtn_u64(curr, limit)
+            self.assertEqual(old, expected)
+            if expected < limit:
+                self.assertEqual(curr, expected + 1)
+            else:
+                self.assertEqual(curr, 0)
+        self.assertEqual(curr, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
