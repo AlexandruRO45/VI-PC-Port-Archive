@@ -40,6 +40,8 @@ Standard library Python only: unittest, dataclasses, enum, math, struct.
 Zero game data.
 """
 
+from dataclasses import dataclass, field
+from enum import Enum, auto
 import math
 import struct
 import unittest
@@ -162,6 +164,128 @@ def ref_sad_hi_carry_u16(s0: int, s1: int, s2: int) -> int:
 
 
 # ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    LITERAL = auto()
+
+
+@dataclass(frozen=True)
+class Operand:
+    """Represents a register operand or inline literal constant."""
+    reg_type: RegType
+    index: int = 0
+    literal_value: int | None = None
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        if self.reg_type == RegType.VGPR:
+            if not (0 <= self.index <= 255):
+                raise ValueError(f"VGPR index {self.index} out of range [0, 255]")
+            if self.index + self.count > 256:
+                raise ValueError(f"VGPR range [{self.index}:{self.index + self.count - 1}] exceeds 255")
+        elif self.reg_type == RegType.SGPR:
+            if not (0 <= self.index <= 105):
+                raise ValueError(f"SGPR index {self.index} out of range [0, 105]")
+            if self.index + self.count > 106:
+                raise ValueError(f"SGPR range [{self.index}:{self.index + self.count - 1}] exceeds 105")
+        elif self.reg_type == RegType.LITERAL:
+            if self.literal_value is None:
+                raise ValueError("Literal operand requires literal_value")
+
+    @classmethod
+    def vgpr(cls, index: int, count: int = 1) -> Operand:
+        return cls(RegType.VGPR, index=index, count=count)
+
+    @classmethod
+    def sgpr(cls, index: int, count: int = 1) -> Operand:
+        return cls(RegType.SGPR, index=index, count=count)
+
+    @classmethod
+    def literal(cls, value: int) -> Operand:
+        return cls(RegType.LITERAL, literal_value=u32(value), count=1)
+
+    def disassemble(self) -> str:
+        if self.reg_type == RegType.VGPR:
+            if self.count == 1:
+                return f"v{self.index}"
+            return f"v[{self.index}:{self.index + self.count - 1}]"
+        if self.reg_type == RegType.SGPR:
+            if self.count == 1:
+                return f"s{self.index}"
+            return f"s[{self.index}:{self.index + self.count - 1}]"
+        return f"0x{self.literal_value:08X}"
+
+
+@dataclass(frozen=True)
+class VSadHiU16Instruction:
+    """Symbolic AST node for v_sad_hi_u16 dst, src0, src1, src2."""
+    dst: Operand
+    src0: Operand
+    src1: Operand
+    src2: Operand
+    clamp: bool = False
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination must be a VGPR, got {self.dst.reg_type}")
+        if self.dst.count != 1:
+            raise ValueError(f"Destination must be single dword (count=1), got {self.dst.count}")
+        for idx, src in enumerate([self.src0, self.src1, self.src2]):
+            if src.count != 1:
+                raise ValueError(f"src{idx} must be single dword (count=1), got {src.count}")
+
+    def disassemble(self) -> str:
+        parts = [
+            "v_sad_hi_u16",
+            self.dst.disassemble() + ",",
+            self.src0.disassemble() + ",",
+            self.src1.disassemble() + ",",
+            self.src2.disassemble(),
+        ]
+        if self.clamp:
+            parts.append("clamp")
+        return " ".join(parts)
+
+
+@dataclass(frozen=True)
+class VMsadHiU16Instruction:
+    """Symbolic AST node for v_msad_hi_u16 dst, src0, src1, src2."""
+    dst: Operand
+    src0: Operand
+    src1: Operand
+    src2: Operand
+    clamp: bool = False
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination must be a VGPR, got {self.dst.reg_type}")
+        if self.dst.count != 1:
+            raise ValueError(f"Destination must be single dword (count=1), got {self.dst.count}")
+        for idx, src in enumerate([self.src0, self.src1, self.src2]):
+            if src.count != 1:
+                raise ValueError(f"src{idx} must be single dword (count=1), got {src.count}")
+
+    def disassemble(self) -> str:
+        parts = [
+            "v_msad_hi_u16",
+            self.dst.disassemble() + ",",
+            self.src0.disassemble() + ",",
+            self.src1.disassemble() + ",",
+            self.src2.disassemble(),
+        ]
+        if self.clamp:
+            parts.append("clamp")
+        return " ".join(parts)
+
+
+SadHiU16Instruction = Union[VSadHiU16Instruction, VMsadHiU16Instruction]
+
+
+# ==============================================================================
 # Unit Tests: Reference Mathematical Oracles
 # ==============================================================================
 
@@ -268,6 +392,116 @@ class TestValuSadHiU16Oracle(unittest.TestCase):
         sad = ref_sad_u16_sum(s0, s1)  # 50 + 80 = 130
         res_hi = ref_sad_hi_u16(s0, s1, 0)
         self.assertEqual(res_hi, 130 << 16)
+
+
+class TestValuSadHiU16SymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_operand_creation_and_disassembly(self) -> None:
+        v0 = Operand.vgpr(0)
+        self.assertEqual(v0.disassemble(), "v0")
+        v_pair = Operand.vgpr(4, count=2)
+        self.assertEqual(v_pair.disassemble(), "v[4:5]")
+
+        s2 = Operand.sgpr(2)
+        self.assertEqual(s2.disassemble(), "s2")
+        s_pair = Operand.sgpr(10, count=2)
+        self.assertEqual(s_pair.disassemble(), "s[10:11]")
+
+        lit = Operand.literal(0x1234_5678)
+        self.assertEqual(lit.disassemble(), "0x12345678")
+
+    def test_operand_validation_boundaries(self) -> None:
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+        with self.assertRaises(ValueError):
+            Operand.vgpr(-1)
+        with self.assertRaises(ValueError):
+            Operand.vgpr(255, count=2)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(-1)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(105, count=2)
+
+    def test_v_sad_hi_u16_ast_construction_and_disasm(self) -> None:
+        instr = VSadHiU16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.sgpr(2),
+            src2=Operand.literal(100),
+            clamp=False,
+        )
+        self.assertEqual(instr.disassemble(), "v_sad_hi_u16 v0, v1, s2, 0x00000064")
+
+    def test_v_sad_hi_u16_clamp_modifier_disasm(self) -> None:
+        instr = VSadHiU16Instruction(
+            dst=Operand.vgpr(5),
+            src0=Operand.vgpr(6),
+            src1=Operand.vgpr(7),
+            src2=Operand.vgpr(8),
+            clamp=True,
+        )
+        self.assertEqual(instr.disassemble(), "v_sad_hi_u16 v5, v6, v7, v8 clamp")
+
+    def test_v_msad_hi_u16_ast_construction_and_disasm(self) -> None:
+        instr = VMsadHiU16Instruction(
+            dst=Operand.vgpr(10),
+            src0=Operand.vgpr(11),
+            src1=Operand.sgpr(12),
+            src2=Operand.vgpr(13),
+            clamp=False,
+        )
+        self.assertEqual(instr.disassemble(), "v_msad_hi_u16 v10, v11, s12, v13")
+
+        instr_clamped = VMsadHiU16Instruction(
+            dst=Operand.vgpr(10),
+            src0=Operand.vgpr(11),
+            src1=Operand.sgpr(12),
+            src2=Operand.vgpr(13),
+            clamp=True,
+        )
+        self.assertEqual(instr_clamped.disassemble(), "v_msad_hi_u16 v10, v11, s12, v13 clamp")
+
+    def test_instruction_validation_rejects_non_vgpr_dst(self) -> None:
+        with self.assertRaises(TypeError):
+            VSadHiU16Instruction(
+                dst=Operand.sgpr(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.vgpr(3),
+            )
+        with self.assertRaises(TypeError):
+            VSadHiU16Instruction(
+                dst=Operand.literal(42),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.vgpr(3),
+            )
+        with self.assertRaises(TypeError):
+            VMsadHiU16Instruction(
+                dst=Operand.sgpr(5),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.vgpr(3),
+            )
+
+    def test_instruction_validation_rejects_multi_dword_operands(self) -> None:
+        with self.assertRaises(ValueError):
+            VSadHiU16Instruction(
+                dst=Operand.vgpr(0, count=2),
+                src0=Operand.vgpr(2),
+                src1=Operand.vgpr(3),
+                src2=Operand.vgpr(4),
+            )
+        with self.assertRaises(ValueError):
+            VSadHiU16Instruction(
+                dst=Operand.vgpr(0),
+                src0=Operand.vgpr(2, count=2),
+                src1=Operand.vgpr(3),
+                src2=Operand.vgpr(4),
+            )
 
 
 if __name__ == "__main__":
