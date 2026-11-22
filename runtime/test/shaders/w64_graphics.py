@@ -369,8 +369,18 @@ def main(argv):
     if not argv:
         sys.exit(__doc__)
     spirv = os.path.join(argv[0], "spirv")
-    tools = argv[1] if len(argv) > 1 and os.path.isdir(argv[1]) else os.path.join(os.path.dirname(__file__), "..", "..", "build")
-    names = [a for a in argv[1:] if a in FIXTURES] or sorted(FIXTURES)
+    rest = argv[1:]
+    tools = os.path.join(os.path.dirname(__file__), "..", "..", "build")
+    if rest and os.path.isdir(rest[0]):
+        tools = rest[0]
+        rest = rest[1:]
+    # A mistyped fixture name used to be silently dropped (and with no known name at all, silently expanded to
+    # every fixture), so a targeted GPU verification could pass while omitting the intended case.
+    unknown = [a for a in rest if a not in FIXTURES]
+    if unknown:
+        print(f"Unknown test shaders: {', '.join(unknown)} (run with no names for all fixtures)", file=sys.stderr)
+        return 2
+    names = rest or sorted(FIXTURES)
     failed = 0
     for name in names:
         problem = check(os.path.abspath(tools), spirv, name)
