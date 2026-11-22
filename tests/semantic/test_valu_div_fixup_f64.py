@@ -966,6 +966,124 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
 
 
 # ==============================================================================
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestIEEE754Boundaries(unittest.TestCase):
+    """Exhaustive unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_signed_zero_combinations(self) -> None:
+        # 0/0 -> Indefinite QNaN regardless of signs
+        for z1 in (F64_POS_ZERO, F64_NEG_ZERO):
+            for z2 in (F64_POS_ZERO, F64_NEG_ZERO):
+                self.assertEqual(ref_div_fixup_f64(F64_ONE, z1, z2), F64_INDEFINITE_QNAN)
+
+        # x / +-0.0 -> signed Inf
+        self.assertEqual(ref_div_fixup_f64(F64_ONE, F64_POS_ZERO, F64_ONE), F64_POS_INF)
+        self.assertEqual(ref_div_fixup_f64(F64_ONE, F64_POS_ZERO, F64_NEG_ONE), F64_NEG_INF)
+        self.assertEqual(ref_div_fixup_f64(F64_ONE, F64_NEG_ZERO, F64_ONE), F64_NEG_INF)
+        self.assertEqual(ref_div_fixup_f64(F64_ONE, F64_NEG_ZERO, F64_NEG_ONE), F64_POS_INF)
+
+        # +-0.0 / x -> signed zero
+        self.assertEqual(ref_div_fixup_f64(F64_ONE, F64_ONE, F64_POS_ZERO), F64_POS_ZERO)
+        self.assertEqual(ref_div_fixup_f64(F64_ONE, F64_NEG_ONE, F64_POS_ZERO), F64_NEG_ZERO)
+        self.assertEqual(ref_div_fixup_f64(F64_ONE, F64_ONE, F64_NEG_ZERO), F64_NEG_ZERO)
+        self.assertEqual(ref_div_fixup_f64(F64_ONE, F64_NEG_ONE, F64_NEG_ZERO), F64_POS_ZERO)
+
+    def test_infinities_combinations(self) -> None:
+        # Inf / Inf -> Indefinite QNaN
+        for inf1 in (F64_POS_INF, F64_NEG_INF):
+            for inf2 in (F64_POS_INF, F64_NEG_INF):
+                self.assertEqual(ref_div_fixup_f64(F64_ONE, inf1, inf2), F64_INDEFINITE_QNAN)
+
+        # Inf / x -> signed Inf
+        self.assertEqual(ref_div_fixup_f64(F64_ONE, F64_TWO, F64_POS_INF), F64_POS_INF)
+        self.assertEqual(ref_div_fixup_f64(F64_ONE, F64_NEG_TWO, F64_POS_INF), F64_NEG_INF)
+        self.assertEqual(ref_div_fixup_f64(F64_ONE, F64_TWO, F64_NEG_INF), F64_NEG_INF)
+        self.assertEqual(ref_div_fixup_f64(F64_ONE, F64_NEG_TWO, F64_NEG_INF), F64_POS_INF)
+
+        # x / Inf -> signed Zero
+        self.assertEqual(ref_div_fixup_f64(F64_ONE, F64_POS_INF, F64_TWO), F64_POS_ZERO)
+        self.assertEqual(ref_div_fixup_f64(F64_ONE, F64_POS_INF, F64_NEG_TWO), F64_NEG_ZERO)
+        self.assertEqual(ref_div_fixup_f64(F64_ONE, F64_NEG_INF, F64_TWO), F64_NEG_ZERO)
+        self.assertEqual(ref_div_fixup_f64(F64_ONE, F64_NEG_INF, F64_NEG_TWO), F64_POS_ZERO)
+
+    def test_subnormals_and_underflow(self) -> None:
+        # Min subnormal (2^-1074) / 1.0 (2^0) -> diff -1074 >= -1075 -> returns S0 with sign
+        s0 = F64_MIN_SUBNORMAL
+        r = ref_div_fixup_f64(s0, F64_ONE, F64_MIN_SUBNORMAL)
+        self.assertEqual(r, F64_MIN_SUBNORMAL)
+
+        # Min subnormal (2^-1074) / 2.0 (2^1) -> diff -1075 >= -1075 -> returns S0 with sign
+        r_half = ref_div_fixup_f64(s0, F64_TWO, F64_MIN_SUBNORMAL)
+        self.assertEqual(r_half, F64_MIN_SUBNORMAL)
+
+        # Min subnormal (2^-1074) / 4.0 (2^2) -> diff -1076 < -1075 -> underflow to signed zero
+        r_under = ref_div_fixup_f64(s0, F64_FOUR, F64_MIN_SUBNORMAL)
+        self.assertEqual(r_under, F64_POS_ZERO)
+
+        # Underflow with negative numerator produces -0.0
+        r_under_neg = ref_div_fixup_f64(s0, F64_FOUR, F64_MIN_SUBNORMAL, src2_neg=True)
+        self.assertEqual(r_under_neg, F64_NEG_ZERO)
+
+        # Max subnormal / 1.0 -> returns S0
+        s0_max = F64_MAX_SUBNORMAL
+        r_max = ref_div_fixup_f64(s0_max, F64_ONE, F64_MAX_SUBNORMAL)
+        self.assertEqual(r_max, F64_MAX_SUBNORMAL)
+
+    def test_normal_extrema(self) -> None:
+        # Min normal (2^-1022) / 1.0
+        r_min = ref_div_fixup_f64(F64_MIN_NORMAL, F64_ONE, F64_MIN_NORMAL)
+        self.assertEqual(r_min, F64_MIN_NORMAL)
+
+        # Max normal / 1.0
+        r_max = ref_div_fixup_f64(F64_MAX_NORMAL, F64_ONE, F64_MAX_NORMAL)
+        self.assertEqual(r_max, F64_MAX_NORMAL)
+
+        # Max normal / -1.0 -> -Max normal
+        r_max_neg = ref_div_fixup_f64(F64_MAX_NORMAL, F64_NEG_ONE, F64_MAX_NORMAL)
+        self.assertEqual(r_max_neg, F64_MAX_NORMAL | F64_SIGN_MASK)
+
+    def test_nan_hierarchy_and_quieting(self) -> None:
+        snan1 = 0x7FF0000000000001
+        snan2 = 0x7FF0000000000002
+        qnan_custom = 0x7FF8123456789ABC
+
+        # Both S1 and S2 are NaN -> S2 (numerator) takes precedence and is quieted
+        r_both = ref_div_fixup_f64(F64_ONE, snan1, snan2)
+        self.assertEqual(r_both, snan2 | F64_QUIET_BIT)
+
+        # S2 is QNaN -> quieted S2 returned preserving payload
+        r_qnan = ref_div_fixup_f64(F64_ONE, F64_TWO, qnan_custom)
+        self.assertEqual(r_qnan, qnan_custom | F64_QUIET_BIT)
+
+        # S1 is SNaN, S2 is finite -> S1 is quieted
+        r_s1 = ref_div_fixup_f64(F64_ONE, snan1, F64_TWO)
+        self.assertEqual(r_s1, snan1 | F64_QUIET_BIT)
+
+        # S0 is NaN while S1 and S2 are finite non-zero -> recovers to signed Inf
+        r_s0_nan = ref_div_fixup_f64(F64_CANONICAL_QNAN, F64_TWO, F64_FOUR)
+        self.assertEqual(r_s0_nan, F64_POS_INF)
+
+        r_s0_nan_neg = ref_div_fixup_f64(F64_CANONICAL_QNAN, F64_NEG_TWO, F64_FOUR)
+        self.assertEqual(r_s0_nan_neg, F64_NEG_INF)
+
+    def test_exhaustive_sign_combinations(self) -> None:
+        pairs = [
+            (2.0, 10.0, 5.0),
+            (-2.0, 10.0, -5.0),
+            (2.0, -10.0, -5.0),
+            (-2.0, -10.0, 5.0),
+        ]
+        for denom, numer, expected in pairs:
+            s1 = f64_to_u64(denom)
+            s2 = f64_to_u64(numer)
+            s0 = f64_to_u64(abs(expected))
+            r = ref_div_fixup_f64(s0, s1, s2)
+            self.assertEqual(u64_to_f64(r), expected)
+
+
+# ==============================================================================
 # Register Aliasing and In-Place Operand Preservation
 # ==============================================================================
 
