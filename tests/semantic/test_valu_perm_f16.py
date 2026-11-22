@@ -633,6 +633,208 @@ class TestPermF16SymbolicAST(unittest.TestCase):
         self.assertTrue(op.neg_mod)
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarRegisterFile:
+    """Architectural register file for deterministic scalar simulation."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+    scc: int = 0
+    vcc: int = 0
+    exec_mask: int = MASK32
+    status: int = 0
+    mode: int = 0
+
+    def get_vgpr(self, idx: int) -> int:
+        if not 0 <= idx <= 255:
+            raise IndexError(f"VGPR index out of range [0, 255]: {idx}")
+        return self.vgprs[idx] & MASK32
+
+    def set_vgpr(self, idx: int, val: int) -> None:
+        if not 0 <= idx <= 255:
+            raise IndexError(f"VGPR index out of range [0, 255]: {idx}")
+        self.vgprs[idx] = val & MASK32
+
+    def get_sgpr(self, idx: int) -> int:
+        if not 0 <= idx <= 105:
+            raise IndexError(f"SGPR index out of range [0, 105]: {idx}")
+        return self.sgprs[idx] & MASK32
+
+    def set_sgpr(self, idx: int, val: int) -> None:
+        if not 0 <= idx <= 105:
+            raise IndexError(f"SGPR index out of range [0, 105]: {idx}")
+        self.sgprs[idx] = val & MASK32
+
+    def read_operand(self, op: ASTOperand) -> Tuple[int, bool, bool]:
+        """Resolve operand to its 32-bit integer value and associated modifiers."""
+        if op.kind == OperandKind.VGPR:
+            val = self.get_vgpr(op.reg_num)
+        elif op.kind == OperandKind.SGPR:
+            val = self.get_sgpr(op.reg_num)
+        elif op.kind in (OperandKind.LITERAL_CONST, OperandKind.INLINE_CONST):
+            val = op.constant_val & MASK32
+        else:
+            raise ValueError(f"Unknown operand kind: {op.kind}")
+        return val, op.abs_mod, op.neg_mod
+
+
+class ScalarInterpreter:
+    """Deterministic instruction interpreter for single-lane scalar execution."""
+
+    def __init__(self, reg_file: Optional[ScalarRegisterFile] = None):
+        self.rf = reg_file if reg_file is not None else ScalarRegisterFile()
+
+    def execute(self, instr: ASTInstruction) -> None:
+        """Execute a single AST instruction deterministically."""
+        instr.validate()
+        if instr.opcode == Opcode.V_PERM_F16:
+            s0_val, abs0, neg0 = self.rf.read_operand(instr.src0)
+            s1_val, abs1, neg1 = self.rf.read_operand(instr.src1)
+            sel_val, _, _ = self.rf.read_operand(instr.src2)
+
+            res = oracle_v_perm_f16(
+                src0=s0_val,
+                src1=s1_val,
+                selector=sel_val,
+                abs0=abs0,
+                neg0=neg0,
+                abs1=abs1,
+                neg1=neg1,
+                clamp=instr.clamp,
+            )
+            self.rf.set_vgpr(instr.dst.reg_num, res)
+        elif instr.opcode == Opcode.V_NOP:
+            pass
+        else:
+            raise NotImplementedError(f"Opcode not implemented: {instr.opcode}")
+
+
+# ==============================================================================
+# Unit Tests: Commit 3 (Deterministic Scalar Interpreter)
+# ==============================================================================
+
+class TestPermF16ScalarInterpreter(unittest.TestCase):
+    """Test suite for deterministic scalar instruction interpreter."""
+
+    def setUp(self):
+        self.rf = ScalarRegisterFile()
+        self.interp = ScalarInterpreter(self.rf)
+
+    def test_scalar_execute_basic_perm(self):
+        self.rf.set_vgpr(1, pack_halves(0x1111, 0x2222))  # S0
+        self.rf.set_vgpr(2, pack_halves(0x3333, 0x4444))  # S1
+        self.rf.set_vgpr(3, make_selector(SEL_SRC1_LO, SEL_SRC0_HI))  # S2: pick S1.lo and S0.hi
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(3),
+        )
+        self.interp.execute(instr)
+        self.assertEqual(self.rf.get_vgpr(0), pack_halves(0x3333, 0x2222))
+
+    def test_scalar_execute_with_sgpr_sources(self):
+        self.rf.set_sgpr(0, pack_halves(POS_ONE, POS_TWO))
+        self.rf.set_sgpr(1, pack_halves(POS_HALF, MIN_NORMAL))
+        self.rf.set_vgpr(5, make_selector(SEL_SRC1_HI, SEL_SRC0_LO))
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_F16,
+            dst=ASTOperand.vgpr(10),
+            src0=ASTOperand.sgpr(0),
+            src1=ASTOperand.sgpr(1),
+            src2=ASTOperand.vgpr(5),
+        )
+        self.interp.execute(instr)
+        # S1.hi is MIN_NORMAL, S0.lo is POS_ONE
+        self.assertEqual(self.rf.get_vgpr(10), pack_halves(MIN_NORMAL, POS_ONE))
+
+    def test_scalar_execute_with_literal_selector(self):
+        self.rf.set_vgpr(1, pack_halves(0xAAAA, 0xBBBB))
+        self.rf.set_vgpr(2, pack_halves(0xCCCC, 0xDDDD))
+
+        # Identity S1 via literal
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.literal(make_selector(SEL_SRC1_LO, SEL_SRC1_HI)),
+        )
+        self.interp.execute(instr)
+        self.assertEqual(self.rf.get_vgpr(0), pack_halves(0xCCCC, 0xDDDD))
+
+    def test_scalar_execute_with_modifiers(self):
+        self.rf.set_vgpr(1, pack_halves(NEG_ONE, NEG_TWO))
+        self.rf.set_vgpr(2, pack_halves(POS_ONE, POS_TWO))
+        self.rf.set_vgpr(3, make_selector(SEL_SRC0_LO, SEL_SRC1_LO))
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1, abs_mod=True),  # abs(NEG_ONE) -> POS_ONE
+            src1=ASTOperand.vgpr(2, neg_mod=True),  # neg(POS_ONE) -> NEG_ONE
+            src2=ASTOperand.vgpr(3),
+        )
+        self.interp.execute(instr)
+        # Low half gets S0.lo with abs -> POS_ONE
+        # High half gets S1.lo with neg -> NEG_ONE
+        self.assertEqual(self.rf.get_vgpr(0), pack_halves(POS_ONE, NEG_ONE))
+
+    def test_scalar_execute_with_clamp(self):
+        self.rf.set_vgpr(1, pack_halves(POS_TWO, NEG_ONE))
+        self.rf.set_vgpr(2, pack_halves(POS_HALF, POS_ONE))
+        self.rf.set_vgpr(3, make_selector(SEL_SRC0_LO, SEL_SRC0_HI))
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(3),
+            clamp=True,
+        )
+        self.interp.execute(instr)
+        # S0.lo POS_TWO clamps to POS_ONE; S0.hi NEG_ONE clamps to POS_ZERO
+        self.assertEqual(self.rf.get_vgpr(0), pack_halves(POS_ONE, POS_ZERO))
+
+    def test_scalar_execute_sign_extensions(self):
+        self.rf.set_vgpr(1, 0x8000_7FFF)  # S0: bit 31=1, bit 15=0
+        self.rf.set_vgpr(2, 0x7FFF_8000)  # S1: bit 31=0, bit 15=1
+        self.rf.set_vgpr(3, make_selector(SEL_SIGN_EXT_SRC0_HI, SEL_SIGN_EXT_SRC1_LO))
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(3),
+        )
+        self.interp.execute(instr)
+        # Half 0 gets S0 bit 31 sign-ext (0xFFFF)
+        # Half 1 gets S1 bit 15 sign-ext (0xFFFF)
+        self.assertEqual(self.rf.get_vgpr(0), 0xFFFF_FFFF)
+
+    def test_scalar_execute_constants(self):
+        self.rf.set_vgpr(3, make_selector(SEL_POS_ZERO, SEL_CANONICAL_QNAN))
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.inline_const(0),
+            src1=ASTOperand.inline_const(0),
+            src2=ASTOperand.vgpr(3),
+        )
+        self.interp.execute(instr)
+        self.assertEqual(self.rf.get_vgpr(0), pack_halves(POS_ZERO, CANONICAL_QNAN16))
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
