@@ -584,6 +584,41 @@ struct QueryPool {
     std::vector<bool> ended;
 };
 
+// A compute pipeline as replay needs it. code_base is the console VA of the shader's FSSM blob (push-constant
+// dwords 34-35), 0 when the shader does not read it.
+struct ComputePipeline {
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    std::uint64_t code_base = 0;
+};
+
+// A graphics pipeline as replay needs it: the formats its attachments must have and which vertex-input slots it
+// reads. code_base: as for compute (one per pipeline; two stages that both read theirs are refused, question 14).
+struct GraphicsPipeline {
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkShaderStageFlags push_stages = 0;   // the layout's push-constant range; vkCmdPushConstants must name the same
+    std::uint64_t code_base = 0;
+    std::vector<VkFormat> color_formats;  // by render-target slot
+    VkFormat depth_format = VK_FORMAT_UNDEFINED;
+    VkImageAspectFlags depth_aspects = 0;
+    std::uint32_t vertex_slots = 0;       // bit per input slot the input layout uses
+    std::uint32_t zero_step_slots = 0;    // per-instance slots with InstanceDataStepRate 0: stride 0 at draw time
+    // The same pipeline with some attachment formats VK_FORMAT_UNDEFINED, for a draw that leaves those slots
+    // unbound (D3D12 allows it; dynamic rendering needs the formats to agree). Bit i: colour slot i, bit 8: depth
+    // and stencil. Null when it cannot be built.
+    static constexpr std::uint32_t unbound_depth = 1u << 8;
+    std::function<VkPipeline(std::uint32_t unbound)> variant;
+};
+
+// The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
+struct ShaderUserData {
+    std::uint32_t s[32];
+    std::uint64_t heap_base;
+    std::uint64_t code_base;
+};
+static_assert(sizeof(ShaderUserData) == 144);
+
 struct ReplayFunctions {
     PFN_vkCmdPipelineBarrier pipeline_barrier = nullptr;
     PFN_vkCmdClearColorImage clear_color_image = nullptr;
@@ -600,8 +635,6 @@ struct ReplayFunctions {
     PFN_vkCmdResolveImage resolve_image = nullptr;              // resolves
     PFN_vkCmdFillBuffer fill_buffer = nullptr;                  // unordered-access buffer clears, with copy_buffer
     PFN_vkCmdUpdateBuffer update_buffer = nullptr;              // WriteBufferImmediate, unordered-access clears
-    // The buffer and offset holding [va, va + size), from ResourceBinding::va; WriteBufferImmediate.
-    std::function<bool(std::uint64_t va, std::uint64_t size, VkBuffer&, VkDeviceSize&)> buffer_at;
     // VK_EXT_conditional_rendering: SetPredication. The predicate buffer must have been created with
     // VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT.
     PFN_vkCmdBeginConditionalRenderingEXT begin_conditional_rendering = nullptr;
@@ -611,6 +644,29 @@ struct ReplayFunctions {
     PFN_vkCmdEndQuery end_query = nullptr;
     PFN_vkCmdWriteTimestamp write_timestamp = nullptr;
     PFN_vkCmdCopyQueryPoolResults copy_query_pool_results = nullptr;
+    PFN_vkCmdBindPipeline bind_pipeline = nullptr;              // dispatches
+    PFN_vkCmdPushConstants push_constants = nullptr;
+    PFN_vkCmdDispatch dispatch = nullptr;
+    std::function<const ComputePipeline*(std::uintptr_t)> compute_pipeline;
+    PFN_vkCmdBindVertexBuffers2 bind_vertex_buffers2 = nullptr;  // draws
+    PFN_vkCmdBindIndexBuffer bind_index_buffer = nullptr;
+    PFN_vkCmdSetViewport set_viewport = nullptr;
+    PFN_vkCmdSetScissor set_scissor = nullptr;
+    PFN_vkCmdSetPrimitiveTopology set_primitive_topology = nullptr;
+    PFN_vkCmdSetStencilReference set_stencil_reference = nullptr;
+    PFN_vkCmdSetBlendConstants set_blend_constants = nullptr;
+    PFN_vkCmdDraw draw = nullptr;
+    PFN_vkCmdDrawIndexed draw_indexed = nullptr;
+    std::function<const GraphicsPipeline*(std::uintptr_t)> graphics_pipeline;
+    // The buffer and offset a console VA range starts in (from ResourceBinding::va), false when none does. `size` is
+    // cut to what the buffer holds from there: vertex and index views use what fits, WriteBufferImmediate needs all
+    // of it.
+    std::function<bool(std::uint64_t va, std::uint64_t& size, VkBuffer&, VkDeviceSize&)> buffer_at;
+    // Zeroed memory that unbound vertex-buffer slots and an unbound index buffer read (D3D12 reads zeros there).
+    VkBuffer zero_buffer = VK_NULL_HANDLE;
+    VkDeviceSize zero_offset = 0;
+    VkDeviceSize zero_size = 0;
+    std::uint64_t heap_base = 0;  // device address of the GPU address arena (push-constant dwords 32-33)
     // Returns a 2D-array view of the range (caller-owned, alive until execution completes); rectangle clears.
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
     // Returns the query heap with that ID, or nullptr; it stays valid while the lists that use it run.
@@ -652,6 +708,24 @@ struct Prepared {
     VkClearColorValue clear_color{};                 // ... the value that writes it into the image
     std::vector<std::array<VkDeviceSize, 2>> fills;  // ... buffer byte ranges, offset and size
     QueryPool* queries = nullptr;  // query commands: the heap
+    ComputePipeline pipeline;  // dispatches
+    // Draws.
+    struct Attachment {
+        ResourceBinding binding;
+        ResourceId id = 0;
+        VkImageSubresourceRange range{};
+        VkImageView view = VK_NULL_HANDLE;
+    };
+    GraphicsPipeline graphics;
+    std::vector<Attachment> colors;  // by slot; id 0 = unbound
+    Attachment depth;
+    std::vector<VkBuffer> vertex_buffers;
+    std::vector<VkDeviceSize> vertex_offsets, vertex_sizes, vertex_strides;
+    VkBuffer index_buffer = VK_NULL_HANDLE;
+    VkDeviceSize index_offset = 0;
+    VkIndexType index_type = VK_INDEX_TYPE_UINT16;
+    VkExtent2D area{};
+    std::uint32_t layers = 1;  // the fewest layers any bound attachment view has
 };
 
 // ClearRenderTargetView takes FLOATs even for integer RTVs. Windows D3D12 (WARP and AMD) clamps to the
@@ -1028,7 +1102,7 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
         !within(offset + (depth - 1) * slice_pitch, (rows - 1) * placed.row_pitch + row_bytes, buffer.size))
         return ReplayResult::invalid_copy;
     VkBufferImageCopy region{};
-    region.bufferOffset = offset;
+    region.bufferOffset = buffer.buffer_offset + offset;
     region.bufferRowLength = placed.row_pitch / format.bytes * format.block;
     region.bufferImageHeight = depth > 1 ? std::uint32_t(slice_rows * format.block) : 0;
     region.imageSubresource = {range.aspectMask, range.baseMipLevel, range.baseArrayLayer, 1};
@@ -1043,7 +1117,7 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
 inline ReplayResult prepare_resource_copy(Prepared& p) {
     if (p.binding.buffer && p.source.buffer) {
         if (p.binding.size != p.source.size) return ReplayResult::invalid_copy;
-        p.buffer_copies.push_back({0, 0, p.source.size});
+        p.buffer_copies.push_back({p.source.buffer_offset, p.binding.buffer_offset, p.source.size});
         return ReplayResult::success;
     }
     const ResourceBinding &dst = p.binding, &src = p.source;
@@ -1156,6 +1230,153 @@ void round_trip(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const
         image_barrier(vk, command_buffer, resource, piece.range, target, piece.layout, target_access, target_stages,
                       state.access, state.stages);
     }
+}
+
+} // namespace detail
+
+namespace detail {
+
+// Resolves a draw's pipeline, attachments and buffers. Attachment views take the pipeline's formats, so a
+// typeless texture is viewed as the format the pipeline renders.
+template<typename Resolve>
+ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunctions& vk, Prepared& p) {
+    if (!vk.graphics_pipeline || !vk.buffer_at || !vk.image_view || !vk.begin_rendering || !vk.end_rendering ||
+        !vk.bind_vertex_buffers2 || !vk.bind_index_buffer || !vk.set_viewport || !vk.set_scissor ||
+        !vk.set_primitive_topology || !vk.set_stencil_reference || !vk.set_blend_constants || !vk.draw ||
+        !vk.draw_indexed || !vk.bind_pipeline || !vk.push_constants)
+        return ReplayResult::unsupported;
+    const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
+    if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
+    p.graphics = *pipeline;
+    p.area = {UINT32_MAX, UINT32_MAX};
+    std::uint32_t layers = UINT32_MAX;
+    const auto shrink = [&](const ResourceBinding& b, const TargetView& view, const VkImageSubresourceRange& range) {
+        const VkExtent2D e = mip_extent(b, view.mip);
+        p.area = {std::min(p.area.width, e.width), std::min(p.area.height, e.height)};
+        layers = std::min(layers, range.layerCount);
+    };
+
+    p.colors.assign(pipeline->color_formats.size(), {});
+    for (std::size_t slot = 0; slot < draw.render_targets.size() && slot < p.colors.size(); ++slot) {
+        const TargetView& target = draw.render_targets[slot];
+        if (!target.resource) continue;
+        const ResourceBinding* binding = resolve(target.resource);
+        if (!binding) return ReplayResult::unresolved_resource;
+        auto& a = p.colors[slot];
+        a.binding = *binding;
+        a.id = target.resource;
+        if (!a.binding.image || a.binding.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return ReplayResult::invalid_clear;
+        if (!view_range(a.binding, target, VK_IMAGE_ASPECT_COLOR_BIT, a.range)) return ReplayResult::invalid_subresource;
+        ResourceBinding viewed = a.binding;
+        if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED) viewed.format = pipeline->color_formats[slot];
+        a.view = vk.image_view(viewed, a.range);
+        if (!a.view) return ReplayResult::unsupported;
+        shrink(a.binding, target, a.range);
+    }
+    if (draw.depth.resource && pipeline->depth_format != VK_FORMAT_UNDEFINED) {
+        const ResourceBinding* binding = resolve(draw.depth.resource);
+        if (!binding) return ReplayResult::unresolved_resource;
+        auto& a = p.depth;
+        a.binding = *binding;
+        a.id = draw.depth.resource;
+        if (!a.binding.image || !(a.binding.aspects & depth_stencil_aspects)) return ReplayResult::invalid_clear;
+        if (!view_range(a.binding, draw.depth, a.binding.aspects, a.range)) return ReplayResult::invalid_subresource;
+        ResourceBinding viewed = a.binding;
+        viewed.format = pipeline->depth_format;
+        a.view = vk.image_view(viewed, a.range);
+        if (!a.view) return ReplayResult::unsupported;
+        shrink(a.binding, draw.depth, a.range);
+    }
+    if (p.area.width == UINT32_MAX) {  // no attachment: the viewport bounds the rendering
+        p.area = {std::uint32_t(std::max(0.0f, draw.viewport.x + draw.viewport.width)),
+                  std::uint32_t(std::max(0.0f, draw.viewport.y + draw.viewport.height))};
+    }
+    p.layers = layers == UINT32_MAX ? 1 : std::max(1u, layers);
+
+    // Slots the pipeline has a format for but the draw leaves unbound take a variant whose format there is
+    // VK_FORMAT_UNDEFINED: D3D12 discards those writes, Vulkan wants the formats to match the attachments.
+    std::uint32_t unbound = 0;
+    for (std::size_t slot = 0; slot < p.colors.size(); ++slot)
+        if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED && !p.colors[slot].id) unbound |= 1u << slot;
+    if (pipeline->depth_format != VK_FORMAT_UNDEFINED && !p.depth.id) unbound |= GraphicsPipeline::unbound_depth;
+    if (unbound) {
+        p.graphics.pipeline = pipeline->variant ? pipeline->variant(unbound) : VK_NULL_HANDLE;
+        if (!p.graphics.pipeline) return ReplayResult::unsupported;
+    }
+
+    // An unbound vertex-buffer slot reads zeros, as in D3D12: the zero page with stride 0. Per-instance slots with
+    // step rate 0 also take stride 0, so every instance reads element 0.
+    for (std::uint32_t slot = 0; slot < 32; ++slot) {
+        if (!(pipeline->vertex_slots & (1u << slot))) continue;
+        p.vertex_buffers.resize(slot + 1, VK_NULL_HANDLE);
+        p.vertex_offsets.resize(slot + 1, 0);
+        p.vertex_sizes.resize(slot + 1, VK_WHOLE_SIZE);
+        p.vertex_strides.resize(slot + 1, 0);
+        const bool bound = slot < draw.vertex_buffers.size() && draw.vertex_buffers[slot].va;
+        if (!bound) {
+            if (!vk.zero_buffer) return ReplayResult::unresolved_resource;
+            p.vertex_buffers[slot] = vk.zero_buffer;
+            p.vertex_offsets[slot] = vk.zero_offset;
+            p.vertex_sizes[slot] = vk.zero_size;
+            p.vertex_strides[slot] = 0;
+            continue;
+        }
+        const VertexBufferView& view = draw.vertex_buffers[slot];
+        std::uint64_t size = view.size;
+        if (!vk.buffer_at(view.va, size, p.vertex_buffers[slot], p.vertex_offsets[slot]))
+            return ReplayResult::unresolved_resource;
+        p.vertex_sizes[slot] = size;
+        p.vertex_strides[slot] = (pipeline->zero_step_slots & (1u << slot)) ? 0 : view.stride;
+    }
+    if (draw.indexed) {
+        if (draw.index.format == 57) p.index_type = VK_INDEX_TYPE_UINT16;
+        else if (draw.index.format == 42) p.index_type = VK_INDEX_TYPE_UINT32;
+        else if (draw.index.va) return ReplayResult::unsupported;
+        if (!draw.index.va) {  // no index buffer: every index reads 0
+            if (!vk.zero_buffer) return ReplayResult::unresolved_resource;
+            p.index_buffer = vk.zero_buffer;
+            p.index_offset = vk.zero_offset;
+        } else {
+            std::uint64_t size = draw.index.size;
+            if (!vk.buffer_at(draw.index.va, size, p.index_buffer, p.index_offset))
+                return ReplayResult::unresolved_resource;
+        }
+    }
+    return ReplayResult::success;
+}
+
+// D3D_PRIMITIVE_TOPOLOGY -> VkPrimitiveTopology (patch lists are not modelled).
+inline VkPrimitiveTopology vulkan_topology(std::uint32_t topology) {
+    switch (topology) {
+    case 1: return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+    case 2: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+    case 3: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+    case 5: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    case 10: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY;
+    case 11: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY;
+    case 12: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY;
+    case 13: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
+    default: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    }
+}
+
+// Moves an attachment's tracked pieces to `layout` before rendering (first use zero-fills, as everywhere).
+inline void to_attachment(const ReplayFunctions& vk, VkCommandBuffer command_buffer, Prepared::Attachment& a,
+                          VkImageLayout layout, VkAccessFlags access, VkPipelineStageFlags stages,
+                          LayoutTracker* tracker, bool separate) {
+    const VkImageSubresourceRange range = planes_for_layout(a.binding, a.range, separate);
+    auto pieces = current(tracker, a.id, range, layout);
+    initialize(vk, command_buffer, a.binding, a.id, pieces, layout, tracker);
+    for (const auto& piece : pieces) {
+        if (piece.layout == layout) {
+            // Attachment writes of an earlier rendering scope are not ordered with this one without a barrier.
+            memory_barrier(vk, command_buffer, access, stages, access, stages);
+            continue;
+        }
+        image_barrier(vk, command_buffer, a.binding, piece.range, piece.layout, layout,
+                      VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, access, stages);
+    }
+    if (tracker) tracker->set(a.id, range, layout);
 }
 
 } // namespace detail
@@ -1343,7 +1564,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     !detail::within(buffer_copy->dst_offset, buffer_copy->size, p.binding.size) ||
                     !detail::within(buffer_copy->src_offset, buffer_copy->size, p.source.size))
                     return ReplayResult::invalid_copy;
-                p.buffer_copies.push_back({buffer_copy->src_offset, buffer_copy->dst_offset, buffer_copy->size});
+                p.buffer_copies.push_back({p.source.buffer_offset + buffer_copy->src_offset,
+                                           p.binding.buffer_offset + buffer_copy->dst_offset, buffer_copy->size});
             } else if (const auto* texture_copy = std::get_if<CopyTexture>(&command)) {
                 result = detail::prepare_texture_copy(*texture_copy, p);
             } else {
@@ -1378,7 +1600,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
         } else if (const auto* write = std::get_if<WriteImmediate>(&command)) {
             if (!vk.update_buffer || !vk.buffer_at) return ReplayResult::unsupported;
-            if (!vk.buffer_at(write->address, 4, p.write_buffer, p.write_offset)) return ReplayResult::unresolved_resource;
+            std::uint64_t bytes = 4;
+            if (!vk.buffer_at(write->address, bytes, p.write_buffer, p.write_offset) || bytes < 4)
+                return ReplayResult::unresolved_resource;
             if (p.write_offset % 4) return ReplayResult::invalid_copy;
         } else if (const auto* atomic = std::get_if<AtomicCopyBuffer>(&command)) {
             if (!vk.copy_buffer) return ReplayResult::unsupported;
@@ -1430,6 +1654,14 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                                     p.binding.size))
                     return ReplayResult::invalid_query;
             }
+        } else if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
+            if (!vk.bind_pipeline || !vk.push_constants || !vk.dispatch || !vk.compute_pipeline)
+                return ReplayResult::unsupported;
+            const ComputePipeline* pipeline = vk.compute_pipeline(dispatch->pipeline);
+            if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
+            p.pipeline = *pipeline;
+        } else if (const auto* draw = std::get_if<Draw>(&command)) {
+            if (const auto r = detail::prepare_draw(*draw, resolve, vk, p); r != ReplayResult::success) return r;
         }
     }
     return ReplayResult::success;
@@ -1453,7 +1685,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             if (conditional_rendering) {
                 VkConditionalRenderingBeginInfoEXT begin{VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT};
                 begin.buffer = p.binding.buffer;
-                begin.offset = predication->offset;
+                // A default-heap buffer is a range of the GPU address arena's VkBuffer, starting at buffer_offset.
+                begin.offset = p.binding.buffer_offset + predication->offset;
                 // Vulkan discards the commands when the word is 0, which is EQUAL_ZERO; INVERTED gives NOT_EQUAL_ZERO.
                 begin.flags = predication->op == d3d12_predication::not_equal_zero
                                   ? VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT
@@ -1787,6 +2020,86 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     vk.fill_buffer(command_buffer, p.binding.buffer, offset, VkDeviceSize(run) * size, 0);
                 index += run;
             }
+        } else if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
+            ShaderUserData data{};
+            std::copy(dispatch->user_data.begin(), dispatch->user_data.end(), data.s);
+            data.heap_base = vk.heap_base;
+            data.code_base = p.pipeline.code_base;
+            vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.pipeline);
+            vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data), &data);
+            vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
+        } else if (const auto* draw = std::get_if<Draw>(&command)) {
+            auto& prepared_draw = const_cast<detail::Prepared&>(p);
+            constexpr VkAccessFlags color_access =
+                VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            constexpr VkAccessFlags depth_access =
+                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+            constexpr VkPipelineStageFlags depth_stages =
+                VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+            std::vector<VkRenderingAttachmentInfo> colors(p.colors.size(), {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO});
+            for (std::size_t slot = 0; slot < p.colors.size(); ++slot) {
+                auto& a = prepared_draw.colors[slot];
+                if (!a.id) continue;  // an unbound slot: no image view, writes are dropped
+                const VkImageLayout layout = image_layout(a.binding, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+                detail::to_attachment(vk, command_buffer, a, layout, color_access,
+                                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, tracker, separate);
+                colors[slot].imageView = a.view;
+                colors[slot].imageLayout = layout;
+                colors[slot].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                colors[slot].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            }
+            VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+            if (p.depth.id) {
+                const VkImageLayout layout = image_layout(p.depth.binding, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+                detail::to_attachment(vk, command_buffer, prepared_draw.depth, layout, depth_access, depth_stages,
+                                      tracker, separate);
+                depth.imageView = p.depth.view;
+                depth.imageLayout = layout;
+                depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            }
+            VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+            rendering.renderArea = {{0, 0}, p.area};
+            rendering.layerCount = p.layers;  // array views: SV_RenderTargetArrayIndex picks the layer
+            rendering.colorAttachmentCount = std::uint32_t(colors.size());
+            rendering.pColorAttachments = colors.data();
+            if (p.depth.id && (p.graphics.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) rendering.pDepthAttachment = &depth;
+            if (p.depth.id && (p.graphics.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) rendering.pStencilAttachment = &depth;
+            vk.begin_rendering(command_buffer, &rendering);
+
+            ShaderUserData data{};
+            std::copy(draw->user_data.begin(), draw->user_data.end(), data.s);
+            data.heap_base = vk.heap_base;
+            data.code_base = p.graphics.code_base;
+            vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, p.graphics.pipeline);
+            vk.push_constants(command_buffer, p.graphics.layout, p.graphics.push_stages, 0, sizeof(data), &data);
+            // Translated vertex shaders write D3D clip coordinates (y up); a negative-height viewport keeps the
+            // image upright, and winding as D3D12 sees it.
+            const Viewport& v = draw->viewport;
+            const VkViewport viewport{v.x, v.y + v.height, v.width, -v.height, v.min_depth, v.max_depth};
+            vk.set_viewport(command_buffer, 0, 1, &viewport);
+            const Rect& s = draw->scissor;
+            const VkRect2D scissor{{std::max(0, s.left), std::max(0, s.top)},
+                                   {std::uint32_t(std::max(0, s.right - std::max(0, s.left))),
+                                    std::uint32_t(std::max(0, s.bottom - std::max(0, s.top)))}};
+            vk.set_scissor(command_buffer, 0, 1, &scissor);
+            vk.set_primitive_topology(command_buffer, detail::vulkan_topology(draw->topology));
+            vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw->stencil_front);
+            vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);
+            vk.set_blend_constants(command_buffer, draw->blend_factor.data());
+            for (std::uint32_t slot = 0; slot < p.vertex_buffers.size(); ++slot) {
+                if (!p.vertex_buffers[slot]) continue;
+                vk.bind_vertex_buffers2(command_buffer, slot, 1, &p.vertex_buffers[slot], &p.vertex_offsets[slot],
+                                        &p.vertex_sizes[slot], &p.vertex_strides[slot]);
+            }
+            if (draw->indexed) {
+                vk.bind_index_buffer(command_buffer, p.index_buffer, p.index_offset, p.index_type);
+                vk.draw_indexed(command_buffer, draw->count, draw->instances, draw->first, draw->base_vertex,
+                                draw->first_instance);
+            } else {
+                vk.draw(command_buffer, draw->count, draw->instances, draw->first, draw->first_instance);
+            }
+            vk.end_rendering(command_buffer);
         }
     }
     // Predication does not carry over to the next command list.

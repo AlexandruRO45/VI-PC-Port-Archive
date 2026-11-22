@@ -10,6 +10,7 @@
 #endif
 #include "vulkan_replay.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -33,10 +34,15 @@ struct VulkanDeviceFunctions {
     X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateBuffer) X(vkDestroyBuffer)                  \
     X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory)  \
     X(vkUnmapMemory) X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdCopyImage)  \
-    X(vkCmdResolveImage) X(vkCmdFillBuffer) X(vkCmdUpdateBuffer) X(vkCreateSampler) X(vkDestroySampler)     \
-    X(vkCmdBeginConditionalRenderingEXT) X(vkCmdEndConditionalRenderingEXT) X(vkCreateQueryPool)            \
-    X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdWriteTimestamp) \
-    X(vkCmdCopyQueryPoolResults)
+    X(vkCmdResolveImage) X(vkCmdFillBuffer) X(vkCmdUpdateBuffer) X(vkCreateSampler) X(vkDestroySampler)      \
+    X(vkCmdBeginConditionalRenderingEXT) X(vkCmdEndConditionalRenderingEXT) X(vkCreateQueryPool)             \
+    X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdWriteTimestamp)  \
+    X(vkCmdCopyQueryPoolResults) X(vkCmdBindPipeline) X(vkCmdPushConstants) X(vkCmdDispatch)                 \
+    X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout)    \
+    X(vkCreateComputePipelines) X(vkDestroyPipeline) X(vkGetBufferDeviceAddress) X(vkCmdBindVertexBuffers2)  \
+    X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetPrimitiveTopology)              \
+    X(vkCmdSetStencilReference) X(vkCmdSetBlendConstants) X(vkCmdDraw) X(vkCmdDrawIndexed)                   \
+    X(vkCreateGraphicsPipelines)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -57,7 +63,17 @@ struct VulkanDeviceFunctions {
                vkDestroyBuffer && vkGetBufferMemoryRequirements && vkBindBufferMemory && vkAllocateMemory &&
                vkFreeMemory && vkMapMemory && vkUnmapMemory && vkCmdCopyBuffer && vkCmdCopyBufferToImage &&
                vkCmdCopyImageToBuffer && vkCmdCopyImage && vkCmdResolveImage && vkCmdFillBuffer &&
-               vkCmdUpdateBuffer;
+               vkCmdUpdateBuffer && vkCmdBindPipeline && vkCmdPushConstants && vkCmdDispatch &&
+               vkCreateShaderModule && vkDestroyShaderModule && vkCreatePipelineLayout &&
+               vkDestroyPipelineLayout && vkCreateComputePipelines && vkDestroyPipeline &&
+               vkGetBufferDeviceAddress && vkCmdBindIndexBuffer && vkCmdSetViewport && vkCmdSetScissor &&
+               vkCmdSetStencilReference && vkCmdSetBlendConstants && vkCmdDraw && vkCmdDrawIndexed &&
+               vkCreateGraphicsPipelines;
+    }
+
+    // Graphics pipelines also need these Vulkan 1.3 entry points (dynamic rendering, extended dynamic state).
+    bool graphics_complete() const {
+        return vkCmdBeginRendering && vkCmdEndRendering && vkCmdBindVertexBuffers2 && vkCmdSetPrimitiveTopology;
     }
 };
 
@@ -83,17 +99,6 @@ public:
         replay_.resolve_image = vk.vkCmdResolveImage;
         replay_.fill_buffer = vk.vkCmdFillBuffer;
         replay_.update_buffer = vk.vkCmdUpdateBuffer;
-        // Called with mutex_ held. A linear search: fine for the first frames, an interval map when it shows.
-        replay_.buffer_at = [this](std::uint64_t va, std::uint64_t size, VkBuffer& buffer, VkDeviceSize& offset) {
-            for (const auto& [id, b] : resources_) {
-                if (b.image || !b.buffer || !b.va || va < b.va || va - b.va >= b.size || size > b.size - (va - b.va))
-                    continue;
-                buffer = b.buffer;
-                offset = b.buffer_offset + (va - b.va);
-                return true;
-            }
-            return false;
-        };
         if (conditional_rendering) {  // a driver may hand out these pointers even when the extension is off
             replay_.begin_conditional_rendering = vk.vkCmdBeginConditionalRenderingEXT;
             replay_.end_conditional_rendering = vk.vkCmdEndConditionalRenderingEXT;
@@ -103,6 +108,39 @@ public:
         replay_.end_query = vk.vkCmdEndQuery;
         replay_.write_timestamp = vk.vkCmdWriteTimestamp;
         replay_.copy_query_pool_results = vk.vkCmdCopyQueryPoolResults;
+        replay_.bind_pipeline = vk.vkCmdBindPipeline;
+        replay_.push_constants = vk.vkCmdPushConstants;
+        replay_.dispatch = vk.vkCmdDispatch;
+        replay_.compute_pipeline = [this](std::uintptr_t id) -> const ComputePipeline* {
+            const auto it = pipelines_.find(id);
+            return it == pipelines_.end() ? nullptr : &it->second;
+        };
+        replay_.bind_vertex_buffers2 = vk.vkCmdBindVertexBuffers2;
+        replay_.bind_index_buffer = vk.vkCmdBindIndexBuffer;
+        replay_.set_viewport = vk.vkCmdSetViewport;
+        replay_.set_scissor = vk.vkCmdSetScissor;
+        replay_.set_primitive_topology = vk.vkCmdSetPrimitiveTopology;
+        replay_.set_stencil_reference = vk.vkCmdSetStencilReference;
+        replay_.set_blend_constants = vk.vkCmdSetBlendConstants;
+        replay_.draw = vk.vkCmdDraw;
+        replay_.draw_indexed = vk.vkCmdDrawIndexed;
+        replay_.graphics_pipeline = [this](std::uintptr_t id) -> const GraphicsPipeline* {
+            const auto it = graphics_pipelines_.find(id);
+            return it == graphics_pipelines_.end() ? nullptr : &it->second;
+        };
+        // Called with mutex_ held. A linear search: fine for the first frames, an interval map when it shows.
+        // A range that runs past its buffer is cut at the buffer's end (`size` is updated): D3D12 reads past a view's
+        // buffer as out of bounds, which is no reason to drop the submission.
+        replay_.buffer_at = [this](std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
+            for (const auto& [id, b] : resources_) {
+                if (b.image || !b.buffer || !b.va || va < b.va || va - b.va >= b.size) continue;
+                buffer = b.buffer;
+                offset = b.buffer_offset + (va - b.va);
+                size = std::min<std::uint64_t>(size, b.size - (va - b.va));
+                return true;
+            }
+            return false;
+        };
         replay_.image_view = [this](const ResourceBinding& r, const VkImageSubresourceRange& range) {
             return view(r, range);
         };
@@ -167,6 +205,39 @@ public:
     double timestamp_period() const { return timestamp_period_; }
     void set_timestamp_period(double period) { timestamp_period_ = period; }
 
+    // The device address of the GPU address arena: console VAs are offsets from it (docs section 3.3).
+    void set_heap_base(std::uint64_t heap_base) {
+        std::lock_guard lock(mutex_);
+        replay_.heap_base = heap_base;
+    }
+
+    // Zeroed memory for unbound vertex and index buffers to read (ReplayFunctions::zero_buffer).
+    void set_zero_page(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size) {
+        std::lock_guard lock(mutex_);
+        replay_.zero_buffer = buffer;
+        replay_.zero_offset = offset;
+        replay_.zero_size = size;
+    }
+    std::uint64_t heap_base() {
+        std::lock_guard lock(mutex_);
+        return replay_.heap_base;
+    }
+
+    // Pipelines are registered by an opaque id (the PSO object) for as long as the PSO lives.
+    void add_pipeline(std::uintptr_t id, const ComputePipeline& pipeline) {
+        std::lock_guard lock(mutex_);
+        pipelines_[id] = pipeline;
+    }
+    void remove_pipeline(std::uintptr_t id) {
+        std::lock_guard lock(mutex_);
+        pipelines_.erase(id);
+        graphics_pipelines_.erase(id);
+    }
+    void add_graphics_pipeline(std::uintptr_t id, const GraphicsPipeline& pipeline) {
+        std::lock_guard lock(mutex_);
+        graphics_pipelines_[id] = pipeline;
+    }
+
     // For tests and traces.
     VkImageLayout layout(ResourceId id, std::uint32_t subresource) {
         std::lock_guard lock(mutex_);
@@ -229,6 +300,8 @@ private:
     std::mutex mutex_;  // resources, tracker and views; held while a queue prepares and emits
     std::mutex submit_mutex_;
     std::unordered_map<ResourceId, ResourceBinding> resources_;
+    std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
+    std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;
     LayoutTracker tracker_;
     std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>, VkImageView> views_;
     std::function<bool(VkCommandBuffer)> bindless_prepare_;
