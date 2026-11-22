@@ -970,5 +970,161 @@ class TestValuCvtPknormI16F16RegisterAliasing(unittest.TestCase):
             self.assertEqual(state.get_vgpr(lane, 1), NEG_ONE_F16)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclasses.dataclass(frozen=True)
+class CvtPknormStatusFlags:
+    """Status flags and architectural condition codes for packed snorm16 channels."""
+    ch0_zero: bool
+    ch1_zero: bool
+    both_zero: bool
+    ch0_pos_saturated: bool
+    ch1_pos_saturated: bool
+    ch0_neg_saturated: bool
+    ch1_neg_saturated: bool
+    ch0_nan_input: bool
+    ch1_nan_input: bool
+
+
+def evaluate_cvt_pknorm_flags(s0_half_bits: int, s1_half_bits: int, dst32: int) -> CvtPknormStatusFlags:
+    """Evaluate architectural condition codes and status flags for v_cvt_pknorm_i16_f16."""
+    h0 = dst32 & MASK16
+    h1 = (dst32 >> 16) & MASK16
+
+    ch0_z = (h0 == 0x0000)
+    ch1_z = (h1 == 0x0000)
+    ch0_psat = (h0 == SNORM16_MAX)
+    ch1_psat = (h1 == SNORM16_MAX)
+    ch0_nsat = (h0 == SNORM16_MIN)
+    ch1_nsat = (h1 == SNORM16_MIN)
+
+    return CvtPknormStatusFlags(
+        ch0_zero=ch0_z,
+        ch1_zero=ch1_z,
+        both_zero=ch0_z and ch1_z,
+        ch0_pos_saturated=ch0_psat,
+        ch1_pos_saturated=ch1_psat,
+        ch0_neg_saturated=ch0_nsat,
+        ch1_neg_saturated=ch1_nsat,
+        ch0_nan_input=is_nan16(s0_half_bits),
+        ch1_nan_input=is_nan16(s1_half_bits),
+    )
+
+
+def compute_pknorm_half_carry(val0: int, val1: int) -> tuple[int, int]:
+    """Compute 16-bit unsigned carry out from half-channel addition."""
+    total = (val0 & MASK16) + (val1 & MASK16)
+    return total & MASK16, (total >> 16) & 1
+
+
+def compute_pknorm_half_borrow(val0: int, val1: int) -> tuple[int, int]:
+    """Compute 16-bit unsigned borrow out from half-channel subtraction (val0 - val1)."""
+    diff = (val0 & MASK16) - (val1 & MASK16)
+    borrow = 1 if diff < 0 else 0
+    return diff & MASK16, borrow
+
+
+def compute_packed_i16_add(dst32_a: int, dst32_b: int) -> tuple[int, tuple[int, int]]:
+    """Perform SIMD packed 16-bit addition with per-channel carry generation."""
+    h0_a, h1_a = dst32_a & MASK16, (dst32_a >> 16) & MASK16
+    h0_b, h1_b = dst32_b & MASK16, (dst32_b >> 16) & MASK16
+
+    s0, c0 = compute_pknorm_half_carry(h0_a, h0_b)
+    s1, c1 = compute_pknorm_half_carry(h1_a, h1_b)
+    return pack_u16_to_u32(s0, s1), (c0, c1)
+
+
+def compute_packed_i16_sub(dst32_a: int, dst32_b: int) -> tuple[int, tuple[int, int]]:
+    """Perform SIMD packed 16-bit subtraction with per-channel borrow generation."""
+    h0_a, h1_a = dst32_a & MASK16, (dst32_a >> 16) & MASK16
+    h0_b, h1_b = dst32_b & MASK16, (dst32_b >> 16) & MASK16
+
+    d0, b0 = compute_pknorm_half_borrow(h0_a, h0_b)
+    d1, b1 = compute_pknorm_half_borrow(h1_a, h1_b)
+    return pack_u16_to_u32(d0, d1), (b0, b1)
+
+
+class TestValuCvtPknormI16F16ConditionCodes(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def test_zero_flags(self) -> None:
+        dst_both_z = oracle_v_cvt_pknorm_i16_f16(POS_ZERO_F16, NEG_ZERO_F16)
+        flags_both = evaluate_cvt_pknorm_flags(POS_ZERO_F16, NEG_ZERO_F16, dst_both_z)
+        self.assertTrue(flags_both.ch0_zero)
+        self.assertTrue(flags_both.ch1_zero)
+        self.assertTrue(flags_both.both_zero)
+        self.assertFalse(flags_both.ch0_pos_saturated)
+        self.assertFalse(flags_both.ch0_neg_saturated)
+
+        dst_mixed = oracle_v_cvt_pknorm_i16_f16(POS_ONE_F16, POS_ZERO_F16)
+        flags_mixed = evaluate_cvt_pknorm_flags(POS_ONE_F16, POS_ZERO_F16, dst_mixed)
+        self.assertFalse(flags_mixed.ch0_zero)
+        self.assertTrue(flags_mixed.ch1_zero)
+        self.assertFalse(flags_mixed.both_zero)
+
+    def test_saturation_flags(self) -> None:
+        # Positive saturation (1.0) and negative saturation (-1.0)
+        dst_sat = oracle_v_cvt_pknorm_i16_f16(POS_ONE_F16, NEG_ONE_F16)
+        flags_sat = evaluate_cvt_pknorm_flags(POS_ONE_F16, NEG_ONE_F16, dst_sat)
+        self.assertTrue(flags_sat.ch0_pos_saturated)
+        self.assertFalse(flags_sat.ch0_neg_saturated)
+        self.assertFalse(flags_sat.ch1_pos_saturated)
+        self.assertTrue(flags_sat.ch1_neg_saturated)
+
+    def test_nan_input_status_flags(self) -> None:
+        dst = oracle_v_cvt_pknorm_i16_f16(POS_QNAN_F16, HALF_F16)
+        flags = evaluate_cvt_pknorm_flags(POS_QNAN_F16, HALF_F16, dst)
+        self.assertTrue(flags.ch0_nan_input)
+        self.assertFalse(flags.ch1_nan_input)
+        self.assertTrue(flags.ch0_zero)
+        self.assertFalse(flags.ch1_zero)
+
+        dst_snan = oracle_v_cvt_pknorm_i16_f16(POS_ONE_F16, NEG_SNAN_F16)
+        flags_snan = evaluate_cvt_pknorm_flags(POS_ONE_F16, NEG_SNAN_F16, dst_snan)
+        self.assertFalse(flags_snan.ch0_nan_input)
+        self.assertTrue(flags_snan.ch1_nan_input)
+        self.assertTrue(flags_snan.ch1_zero)
+
+    def test_carry_generation_on_packed_channels(self) -> None:
+        # Summing 0x7FFF (+32767) + 0x0001 = 0x8000 -> carry = 0
+        s0, c0 = compute_pknorm_half_carry(0x7FFF, 0x0001)
+        self.assertEqual(s0, 0x8000)
+        self.assertEqual(c0, 0)
+
+        # Summing 0x8000 + 0x8000 = 0x10000 -> carry = 1, sum = 0
+        s1, c1 = compute_pknorm_half_carry(0x8000, 0x8000)
+        self.assertEqual(s1, 0x0000)
+        self.assertEqual(c1, 1)
+
+        # Packed SIMD add
+        w_a = pack_u16_to_u32(0x7FFF, 0x8000)
+        w_b = pack_u16_to_u32(0x0001, 0x8000)
+        sum_packed, (car0, car1) = compute_packed_i16_add(w_a, w_b)
+        self.assertEqual(sum_packed, pack_u16_to_u32(0x8000, 0x0000))
+        self.assertEqual(car0, 0)
+        self.assertEqual(car1, 1)
+
+    def test_borrow_generation_on_packed_channels(self) -> None:
+        # 0x0000 - 0x0001 = -1 -> diff = 0xFFFF, borrow = 1
+        d0, b0 = compute_pknorm_half_borrow(0x0000, 0x0001)
+        self.assertEqual(d0, 0xFFFF)
+        self.assertEqual(b0, 1)
+
+        # 0x7FFF - 0x4000 = 0x3FFF -> borrow = 0
+        d1, b1 = compute_pknorm_half_borrow(0x7FFF, 0x4000)
+        self.assertEqual(d1, 0x3FFF)
+        self.assertEqual(b1, 0)
+
+        # Packed SIMD sub
+        w_a = pack_u16_to_u32(0x0000, 0x7FFF)
+        w_b = pack_u16_to_u32(0x0001, 0x4000)
+        diff_packed, (bor0, bor1) = compute_packed_i16_sub(w_a, w_b)
+        self.assertEqual(diff_packed, pack_u16_to_u32(0xFFFF, 0x3FFF))
+        self.assertEqual(bor0, 1)
+        self.assertEqual(bor1, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
