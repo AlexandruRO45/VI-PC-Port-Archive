@@ -531,8 +531,7 @@ install_llvm_repo() {
   local codename="${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}"
   [ -n "$codename" ] || return 1
   curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o "$RUN_DIR/llvm.key" || return 1
-  gpg --dearmor < "$RUN_DIR/llvm.key" \
-    | "${SUDO[@]}" tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null || return 1
+  "${SUDO[@]}" install -m 0644 "$RUN_DIR/llvm.key" /etc/apt/trusted.gpg.d/apt.llvm.org.asc || return 1
   printf 'deb https://apt.llvm.org/%s/ llvm-toolchain-%s-21 main\n' "$codename" "$codename" \
     | "${SUDO[@]}" tee /etc/apt/sources.list.d/llvm.list >/dev/null || return 1
   run_capture "$LOG" "${APT[@]}" update || return 1
