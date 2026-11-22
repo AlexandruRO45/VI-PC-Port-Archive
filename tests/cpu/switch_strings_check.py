@@ -191,6 +191,7 @@ def faults(guard_path, native_path, *lifted_paths):
         kernel.VirtualFree(page, 0, 0x8000)
         raise C.WinError(C.get_last_error())
     count = 0
+    split_element_results = {}
     try:
         for path in (native_path, *lifted_paths):
             lib = C.CDLL(str(Path(path).resolve()))
@@ -208,6 +209,23 @@ def faults(guard_path, native_path, *lifted_paths):
                         code = guarded(function, C.addressof(context), 1, trace, C.byref(result))
                         assert code == 0xc0000005 and tuple(trace) == (MASK,)*4, (kind, suffix, hex(code), tuple(trace))
                         count += 1
+            # A word, dword or qword can straddle a page. Match native bytes even
+            # when the faulting access is within one element, not between iterations.
+            for suffix in ("w", "d", "q"):
+                function = getattr(lib, prefix + "rep_movs" + suffix + "_forward")
+                for access in ("source", "destination"):
+                    C.memset(page, 0xa5, 4096)
+                    C.memset(page + 16, 0x6c, 8)
+                    edge = page + 4095
+                    source, destination = (edge, page + 32) if access == "source" else (page + 16, edge)
+                    context = (WORD * 4)(source, destination, 0, 0)
+                    trace, result = (WORD * 4)(MASK, MASK, MASK, MASK), WORD()
+                    code = guarded(function, C.addressof(context), 1, trace, C.byref(result))
+                    assert code == 0xc0000005 and tuple(trace) == (MASK,) * 4, (suffix, access, hex(code))
+                    written = C.string_at(page + 32, 8) + C.string_at(edge, 1)
+                    key = (suffix, access)
+                    assert written == split_element_results.setdefault(key, written), (key, written)
+                    count += 1
             # Three byte iterations complete before a source page fault. The trace
             # follows REP, so no trace store may move before the faulting instruction.
             C.memmove(page+4093, b'abc', 3)

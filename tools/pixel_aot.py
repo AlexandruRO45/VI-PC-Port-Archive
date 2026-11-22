@@ -823,6 +823,10 @@ SCALAR = {
     "xnor_b32": (2, "~({0} ^ {1})", NONZERO),
     "lshl_b32": (2, "{0} << ({1} & 31u)", NONZERO), "lshr_b32": (2, "{0} >> ({1} & 31u)", NONZERO),
     "ashr_i32": (2, "asuint(asint({0}) >> ({1} & 31u))", NONZERO),
+    "lshl1_add_u32": (2, "({0} << 1u) + {1}", "({0} >> 31u != 0u) || ({r} < {1})"),
+    "lshl2_add_u32": (2, "({0} << 2u) + {1}", "({0} >> 30u != 0u) || ({r} < {1})"),
+    "lshl3_add_u32": (2, "({0} << 3u) + {1}", "({0} >> 29u != 0u) || ({r} < {1})"),
+    "lshl4_add_u32": (2, "({0} << 4u) + {1}", "({0} >> 28u != 0u) || ({r} < {1})"),
 }
 
 
@@ -1699,16 +1703,17 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for j, n in enumerate(dest):
                 vector[f"v{n}"] = f"sample{i}.{'xyzw'[j]}"
                 sample_dest[f"v{n}"] = samples
-        elif m := match(r"v_(fmaak|fmamk)_f32 (v\d+), ([^,]+), ([^,]+), ([^,]+)"):
+        elif m := match(r"v_(fmaak|fmamk|madak|madmk)_f32 (v\d+), ([^,]+), ([^,]+), ([^,]+)"):
+            # The mad forms use the unfused, denormal-flushing helper; the fma forms are fused.
             op, dst, *tokens = m.groups()
-            literal = tokens[2] if op == "fmaak" else tokens[1]
+            literal = tokens[2] if op.endswith("ak") else tokens[1]
             if mask != "entry" or not re.fullmatch(r"0x[0-9a-f]{1,8}", literal):
                 raise ValueError("Invalid literal multiply-add")
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
             values = [fp_operand(t, scalar, vector, pending, sample_dest) for t in tokens]
             vector[dst] = f"alu{i}"
-            lines.append(f"    precise float alu{i} = {ALU['fma'][1].format(*values)};")
+            lines.append(f"    precise float alu{i} = {ALU['fma' if op.startswith('fma') else 'mad'][1].format(*values)};")
         elif m := match(r"v_mov_b32_sdwa (v\d+), (sext\()?([vs]\d+|-?\d+(?:\.\d+)?)(\))? dst_sel:(BYTE_[0-3]|WORD_[01]|DWORD) dst_unused:(UNUSED_PAD|UNUSED_SEXT|UNUSED_PRESERVE) src0_sel:(BYTE_[0-3]|WORD_[01]|DWORD)"):
             dst, sext, src, close, dst_sel, unused, src_sel = m.groups()
             if mask != "entry" or bool(sext) != bool(close):
@@ -1817,20 +1822,18 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             lines.append(f"    bool cmp{i} = (class32({operand}) & {bits}) != 0u;")
 
-        elif m := match(r"v_(add|sub|subrev)_nc_u32(?:_e32)? (v\d+), ([^,]+), ([^,]+)"):
+        elif m := (match(r"v_(add|sub|subrev)_nc_u32(?:_e32|_e64)? (v\d+), ([^,\s]+), ([^,\s]+)")
+                   or match(r"v_(add|sub)_nc_i32 (v\d+), ([^,\s]+), ([^,\s]+)")):
+            # 32-bit wraparound without carry. v_add_nc_i32 and v_sub_nc_i32 are VOP3-only and the same
+            # bits without clamp. A trailing clamp or an operand modifier is left to the fall-through.
             op, dst, src0, src1 = m.groups()
             if mask != "entry" or dst in sample_dest:
                 raise ValueError("Invalid integer operation")
             a = int_operand(src0, scalar, vector, pending, sample_dest, signed=False)
             b = int_operand(src1, scalar, vector, pending, sample_dest, signed=False)
-            if op == "add":
-                expr = f"{a} + {b}"
-            elif op == "sub":
-                expr = f"{a} - {b}"
-            else:
-                expr = f"{b} - {a}"
+            expression = {"add": f"{a} + {b}", "sub": f"{a} - {b}", "subrev": f"{b} - {a}"}[op]
             vector[dst] = f"alu{i}"
-            lines.append(f"    precise float alu{i} = asfloat({expr});")
+            lines.append(f"    precise float alu{i} = asfloat({expression});")
         elif m := match(r"v_(min|max)_(i32|u32)(?:_e32|_e64)? (v\d+), ([^,]+), ([^,]+)"):
             op, kind, dst, *tokens = m.groups()
             if mask != "entry":

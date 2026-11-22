@@ -980,7 +980,8 @@ class Lifter:
             value = f"load_always<{unsigned(width)}>(rsi)"
             # One element at a time: neither memcpy nor memmove reproduces a forward
             # overlapping MOVS that reads the bytes just written by earlier iterations.
-            step = (f"*reinterpret_cast<volatile {unsigned(width)}*>(rdi) = {value}; "
+            alignment = " __unaligned" if width > 1 else ""
+            step = (f"*reinterpret_cast<volatile {unsigned(width)}{alignment}*>(rdi) = {value}; "
                     + ("rsi += step; " if kind == "movs" else "") + "rdi += step;")
             if ins.has_rep_prefix:
                 self.used.add(R.RCX)
@@ -1716,7 +1717,7 @@ template <class T> static T load(word address) {
 // Every guest read, once per instruction: the compiler must perform it even when its value is unused,
 // because the original faults on an inaccessible address either way.
 template <class T> static T load_always(word address) {
-    return *reinterpret_cast<const volatile T*>(address);
+    return *reinterpret_cast<const volatile T __unaligned*>(address);
 }
 template <class T> static void store(word address, T value) {
     std::memcpy(reinterpret_cast<void*>(address), &value, sizeof(value));
