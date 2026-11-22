@@ -1364,5 +1364,135 @@ class TestDivScaleF32RegisterAliasing(unittest.TestCase):
             self.assertEqual(rf.read_vgpr(i), sentinel)
 
 
+class StatusFlags:
+    """Architectural condition codes and status flags for single-precision float operations."""
+
+    def __init__(
+        self,
+        *,
+        is_zero: bool = False,
+        is_negative: bool = False,
+        is_nan: bool = False,
+        is_inf: bool = False,
+        is_subnormal: bool = False,
+        is_scaled: bool = False,
+        vcc_bit: int = 0,
+    ) -> None:
+        self.is_zero = is_zero
+        self.is_negative = is_negative
+        self.is_nan = is_nan
+        self.is_inf = is_inf
+        self.is_subnormal = is_subnormal
+        self.is_scaled = is_scaled
+        self.vcc_bit = vcc_bit
+
+    @classmethod
+    def from_f32_bits(cls, bits: int, vcc_bit: int = 0) -> StatusFlags:
+        sign = bool(bits & F32_NEG_ZERO)
+        exp = (bits >> 23) & 0xFF
+        mant = bits & F32_SUB_MAX
+
+        is_zero = False
+        is_negative = sign
+        is_nan = False
+        is_inf = False
+        is_subnormal = False
+
+        if exp == 0xFF:
+            if mant == 0:
+                is_inf = True
+            else:
+                is_nan = True
+        elif exp == 0:
+            if mant == 0:
+                is_zero = True
+            else:
+                is_subnormal = True
+
+        return cls(
+            is_zero=is_zero,
+            is_negative=is_negative,
+            is_nan=is_nan,
+            is_inf=is_inf,
+            is_subnormal=is_subnormal,
+            is_scaled=bool(vcc_bit),
+            vcc_bit=vcc_bit,
+        )
+
+
+class TestDivScaleF32StatusFlagsAndConditionCodes(unittest.TestCase):
+    """Test suite for condition codes, status flags, and carry/borrow (VCC/SCC) isolation."""
+
+    def test_status_flags_classification(self):
+        # Zero
+        flags_zero = StatusFlags.from_f32_bits(F32_POS_ZERO)
+        self.assertTrue(flags_zero.is_zero)
+        self.assertFalse(flags_zero.is_negative)
+        self.assertFalse(flags_zero.is_nan)
+
+        # Negative Zero
+        flags_neg_zero = StatusFlags.from_f32_bits(F32_NEG_ZERO)
+        self.assertTrue(flags_neg_zero.is_zero)
+        self.assertTrue(flags_neg_zero.is_negative)
+
+        # Infinity
+        flags_inf = StatusFlags.from_f32_bits(F32_POS_INF)
+        self.assertTrue(flags_inf.is_inf)
+        self.assertFalse(flags_inf.is_nan)
+
+        # NaN
+        flags_nan = StatusFlags.from_f32_bits(F32_CANONICAL_QNAN)
+        self.assertTrue(flags_nan.is_nan)
+        self.assertFalse(flags_nan.is_inf)
+
+        # Subnormal
+        flags_sub = StatusFlags.from_f32_bits(F32_SUB_MIN)
+        self.assertTrue(flags_sub.is_subnormal)
+        self.assertFalse(flags_sub.is_zero)
+
+    def test_vcc_condition_flag_generation(self):
+        small = 2.0 ** -100
+
+        # Scaled case -> vcc = 1
+        d_scaled, vcc_s = ref_div_scale_f32(small, small, 1.0)
+        flags_s = StatusFlags.from_f32_bits(f32_to_u32(d_scaled), vcc_s)
+        self.assertEqual(vcc_s, 1)
+        self.assertTrue(flags_s.is_scaled)
+
+        # Unscaled case -> vcc = 0
+        d_unscaled, vcc_u = ref_div_scale_f32(2.0, 2.0, 10.0)
+        flags_u = StatusFlags.from_f32_bits(f32_to_u32(d_unscaled), vcc_u)
+        self.assertEqual(vcc_u, 0)
+        self.assertFalse(flags_u.is_scaled)
+
+    def test_scc_isolation_and_preservation(self):
+        # VALU instructions do not modify SCC (Scalar Condition Code)
+        rf = ScalarRegisterFile()
+        interp = DivScaleF32ScalarInterpreter(rf)
+
+        # Arbitrary simulated SCC stored in SGPR 105
+        scc_sentinel = 1
+        rf.write_sgpr(105, scc_sentinel)
+
+        small = 2.0 ** -100
+        rf.write_vgpr_f32(1, small)
+        rf.write_vgpr_f32(2, 1.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F32,
+            dst=ASTOperand.vgpr(0),
+            sdst=ASTOperand.vcc(),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(1),
+            src2=ASTOperand.vgpr(2),
+        )
+
+        interp.step(inst)
+
+        # VCC is modified, but SCC (SGPR 105) is preserved
+        self.assertEqual(rf.vcc, 1)
+        self.assertEqual(rf.read_sgpr(105), scc_sentinel)
+
+
 if __name__ == "__main__":
     unittest.main()
