@@ -31,9 +31,11 @@ Clamp Modifier:
     elif res > 1.0:             res = 1.0
 """
 
+from dataclasses import dataclass, field
+from enum import Enum, auto
 import math
 import struct
-from typing import Tuple
+from typing import List, Optional, Tuple, Union
 import unittest
 
 MASK16: int = 0xFFFF
@@ -172,6 +174,149 @@ class TestValuDot2F32F16ReferenceOracle(unittest.TestCase):
         # 0.5 * 1.0 + 0.25 = 0.75
         res = ref_dot2_f32_f16(s0, s1, s2, clamp=True)
         self.assertAlmostEqual(res, 0.75, places=5)
+
+
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    LITERAL = auto()
+
+
+@dataclass(frozen=True)
+class Operand:
+    """Represents a register operand or inline literal constant."""
+    reg_type: RegType
+    index: int = 0
+    count: int = 1
+    literal_value: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.count <= 0:
+            raise ValueError(f"Operand count must be >= 1, got {self.count}")
+        if self.reg_type == RegType.VGPR:
+            if not (0 <= self.index <= 255):
+                raise ValueError(f"VGPR index {self.index} out of range [0, 255]")
+            if self.index + self.count > 256:
+                raise ValueError(f"VGPR range exceeds 255")
+        elif self.reg_type == RegType.SGPR:
+            if not (0 <= self.index <= 105):
+                raise ValueError(f"SGPR index {self.index} out of range [0, 105]")
+            if self.index + self.count > 106:
+                raise ValueError(f"SGPR range exceeds 105")
+        elif self.reg_type == RegType.LITERAL:
+            if self.literal_value is None:
+                raise ValueError("Literal operand requires literal_value")
+            if not (0 <= self.literal_value <= MASK32):
+                raise ValueError(f"Literal value {self.literal_value:#x} out of range [0, 0xFFFFFFFF]")
+
+    @classmethod
+    def vgpr(cls, index: int, count: int = 1) -> Operand:
+        return cls(RegType.VGPR, index=index, count=count)
+
+    @classmethod
+    def sgpr(cls, index: int, count: int = 1) -> Operand:
+        return cls(RegType.SGPR, index=index, count=count)
+
+    @classmethod
+    def literal(cls, value: int, count: int = 1) -> Operand:
+        return cls(RegType.LITERAL, count=count, literal_value=value & MASK32)
+
+    def disassemble(self) -> str:
+        if self.reg_type == RegType.VGPR:
+            if self.count == 1:
+                return f"v{self.index}"
+            return f"v[{self.index}:{self.index + self.count - 1}]"
+        if self.reg_type == RegType.SGPR:
+            if self.count == 1:
+                return f"s{self.index}"
+            return f"s[{self.index}:{self.index + self.count - 1}]"
+        assert self.literal_value is not None
+        return f"0x{self.literal_value:08X}"
+
+
+@dataclass(frozen=True)
+class VDot2F32F16Instruction:
+    """Symbolic AST node for AMD RDNA2 v_dot2_f32_f16 instruction."""
+    dst: Operand
+    src0: Operand
+    src1: Operand
+    src2: Operand
+    clamp: bool = False
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination must be a VGPR, got {self.dst.reg_type}")
+        if self.dst.count != 1:
+            raise ValueError(f"Destination must be a 32-bit VGPR (count=1), got {self.dst.count}")
+        if self.src0.count != 1:
+            raise ValueError(f"src0 must be a 32-bit operand (count=1), got {self.src0.count}")
+        if self.src1.count != 1:
+            raise ValueError(f"src1 must be a 32-bit operand (count=1), got {self.src1.count}")
+        if self.src2.count != 1:
+            raise ValueError(f"src2 must be a 32-bit operand (count=1), got {self.src2.count}")
+
+    def disassemble(self) -> str:
+        base = (
+            f"v_dot2_f32_f16 {self.dst.disassemble()}, "
+            f"{self.src0.disassemble()}, {self.src1.disassemble()}, "
+            f"{self.src2.disassemble()}"
+        )
+        return f"{base} clamp" if self.clamp else base
+
+
+class TestValuDot2F32F16SymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_instruction_creation(self) -> None:
+        instr = VDot2F32F16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.sgpr(2),
+            src2=Operand.vgpr(3),
+        )
+        self.assertEqual(instr.dst.index, 0)
+        self.assertEqual(instr.src0.index, 1)
+        self.assertEqual(instr.src1.index, 2)
+        self.assertEqual(instr.src2.index, 3)
+        self.assertEqual(
+            instr.disassemble(),
+            "v_dot2_f32_f16 v0, v1, s2, v3",
+        )
+
+    def test_ast_disassembly_with_clamp_and_literal(self) -> None:
+        instr = VDot2F32F16Instruction(
+            dst=Operand.vgpr(5),
+            src0=Operand.vgpr(6),
+            src1=Operand.literal(0x3C003C00),
+            src2=Operand.vgpr(7),
+            clamp=True,
+        )
+        self.assertEqual(
+            instr.disassemble(),
+            "v_dot2_f32_f16 v5, v6, 0x3C003C00, v7 clamp",
+        )
+
+    def test_ast_immutability(self) -> None:
+        instr = VDot2F32F16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+        with self.assertRaises(Exception):
+            instr.dst = Operand.vgpr(4)  # type: ignore[misc]
+
+    def test_ast_operand_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106)
+        with self.assertRaises(ValueError):
+            Operand.vgpr(-1)
 
 
 if __name__ == "__main__":
