@@ -1512,8 +1512,11 @@ public:
     }
 
     // ExecuteCommandLists: every list is checked before any is written, so a failure submits nothing and leaves
-    // the layout tracker as it was. Pending Wait()s are attached to this submission.
-    ReplayResult execute(std::span<const CommandList* const> lists) {
+    // the layout tracker as it was. Pending Wait()s are attached to this submission. A command the replay does not
+    // support is left out instead (ReplayFunctions::skip_unsupported): the rest of its list runs in order, the result
+    // is skipped_unsupported and `skipped`, if given, lists what was left out.
+    ReplayResult execute(std::span<const CommandList* const> lists, std::vector<SkippedCommand>* skipped = nullptr) {
+        if (skipped) skipped->clear();
         if (context_.is_device_lost()) return ReplayResult::unsupported;
         if (kind_ != QueueKind::direct)
             for (const auto* list : lists)
@@ -1554,6 +1557,7 @@ public:
         auto& prepared = prepared_;
         prepared.resize(lists.size());
         ReplayFunctions replay = context_.replay_;
+        replay.skip_unsupported = true;
         replay.queue_stages = kind_ == QueueKind::copy      ? detail::queue_stages_copy
                               : kind_ == QueueKind::compute ? detail::queue_stages_compute
                                                             : 0;
@@ -1844,7 +1848,15 @@ public:
         }
         tracker_lock.unlock();
         if (bindless_commit) bindless_commit(submitted);
-        return submitted ? ReplayResult::success : ReplayResult::unsupported;
+        if (!submitted) return ReplayResult::unsupported;
+        bool left_out = false;
+        for (std::size_t i = 0; i < prepared.size(); ++i)
+            for (SkippedCommand command : prepared[i].skipped) {
+                left_out = true;
+                command.list = i;
+                if (skipped) skipped->push_back(command);
+            }
+        return left_out ? ReplayResult::skipped_unsupported : ReplayResult::success;
     }
 
     // ID3D12CommandQueue::Signal: the fence reaches `value` after all work submitted so far.

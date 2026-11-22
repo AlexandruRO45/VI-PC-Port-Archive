@@ -402,6 +402,7 @@ const char* result_name(ReplayResult r) {
         case ReplayResult::invalid_query: return "invalid_query";
         case ReplayResult::invalid_indirect_arguments: return "invalid_indirect_arguments";
         case ReplayResult::unsupported: return "unsupported";
+        case ReplayResult::skipped_unsupported: return "skipped_unsupported";
     }
     return "?";
 }
