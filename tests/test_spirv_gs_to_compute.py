@@ -6,7 +6,9 @@ import sys
 
 import pytest
 
-from conftest import make_dxbc, signature_chunk
+from conftest import make_dxbc, requires_tools, signature_chunk
+
+pytestmark = requires_tools
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
