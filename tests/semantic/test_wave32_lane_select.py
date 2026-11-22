@@ -12,11 +12,13 @@ run by spirv_mini_interp.run_workgroup as one 32-thread workgroup on one 32-wide
 a driver's wrap.
 """
 import re
+from pathlib import Path
 import struct
 import unittest
 
 import support
 import spirv_mini_interp as si
+from spirv_wave_interp import run_wave
 
 # 4 user SGPRs (the output V#), workgroup id in s4, 512 bytes of LDS, 32x1x1 threads (the .asm's "; group:").
 FSSM = bytearray(0x148)
@@ -44,6 +46,14 @@ def run(spv):
 
 
 class Wave32LaneSelect(unittest.TestCase):
+    def test_parked_mask_uses_the_same_lane_as_the_physical_write(self) -> None:
+        fixture = Path(__file__).parent / "fixtures" / "wave32_mask_spill.asm"
+        spv = support.translate_listing("vs_wave32_mask_spill", fixture.read_bytes())
+        result = run_wave(spv, wave=32, builtins={"VertexIndex": lambda i: i, "InstanceIndex": lambda _: 0})
+        for lane, output in enumerate(result["outputs"]):
+            with self.subTest(lane=lane):
+                self.assertEqual(output["%out_pos"], (0x3f800000 if lane % 2 else 0, 0, 0, 0x3f800000))
+
     def test_lane_select_uses_bits_4_0(self):
         self.assertEqual(run(translate()), EXPECTED)
 

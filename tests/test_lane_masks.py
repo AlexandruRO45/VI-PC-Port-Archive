@@ -82,6 +82,18 @@ def test_joins():
     assert masks_at_last([[mask], [use]], [[], []]) == set()
 
 
+def test_parked_mask_lane_alias_depends_on_wave_size() -> None:
+    save = ins("s_mov_b32", s(8), sp("exec_lo"))
+    write = ins("v_writelane_b32", v(6), s(8), imm(40))
+    read = ins("v_readlane_b32", s(9), v(6), imm(8))
+    use = ins("s_mov_b32", sp("exec_lo"), s(9))
+    blocks = [[save, write, read, use]]
+    for wave64 in (False, True):
+        masks, _ = L.analyse(blocks, [[]], wave64=wave64)
+        assert (9 in masks[id(use)]) == (not wave64)
+        assert L.parked(blocks, masks, wave64=wave64) == ([] if wave64 else [(6, 8)])
+
+
 def test_parked_masks():
     save = ins("s_mov_b64", s(0, 2), sp("exec"))
     park = [ins("v_writelane_b32", v(128), s(0), imm(0)), ins("v_writelane_b32", v(128), s(1), imm(1))]
@@ -190,6 +202,7 @@ if __name__ == "__main__":
     test_straight_line()
     test_joins()
     test_parked_masks()
+    test_parked_mask_lane_alias_depends_on_wave_size()
     test_masks_through_a_vgpr()
     test_vmov_mask_copy_is_exec_gated()
     test_bfm64_and_half_kinds()
