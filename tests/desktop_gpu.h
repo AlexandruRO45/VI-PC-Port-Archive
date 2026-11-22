@@ -1,5 +1,6 @@
 #pragma once
 #include <d3d12.h>
+#include <stdexcept>
 #include <wrl/client.h>
 
 void check(HRESULT hr, const char* stage);
@@ -9,15 +10,27 @@ HRESULT check_feature(ID3D12Device* device, D3D12_FEATURE feature, void* data, U
 Microsoft::WRL::ComPtr<ID3D12Resource> resource(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc,
     D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear = nullptr);
 void check_compute(ID3D12Device* device, bool tables);
+void check_spirv_window(ID3D12Device* device, const char* shader_path);
 void check_compute_file(ID3D12Device* device, const char* path, bool conversion_pair, const char* reference = nullptr);
 void check_ffx_device_init(ID3D12Device* device);
 void check_ffx_recurrent(ID3D12Device* device);
 void check_dual_uav(ID3D12Device* device);
+enum class MeshConstantBinding { root, root_pair, swapped_root_pair, table, swapped_table };
+bool check_mesh_entry_draw(ID3D12Device*, const char*, const char*, const char*, bool,
+                           MeshConstantBinding = MeshConstantBinding::root);
 void check_texture_mips(ID3D12Device* device);
+void check_depth_mask_draw(ID3D12Device*, const char*, const char*, const char*, bool);
+void check_sampled_coverage(ID3D12Device*, const char*, const char*);
 void check_dual_pixel(ID3D12Device*, const char*, const char*, bool);
+struct PixelMismatch : std::runtime_error {
+    PixelMismatch() : std::runtime_error("AOT color export differs from CPU reference") {}
+};
+
 void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference = nullptr,
                             UINT8 writeMask = D3D12_COLOR_WRITE_ENABLE_ALL);
 void check_attribute_pixel(ID3D12Device* device, const char* shader, const char* reference, bool rg);
+void check_compute_to_pixel(ID3D12Device* device, const char* compute, const char* pixel,
+                            const char* reference, const char* previous);
 void check_pixel_quad_lod(ID3D12Device* device, const char* shader);
 void check_bc7_pixel(ID3D12Device* device, const char* shader, const char* input,
                      const char* capture, const char* mip1 = nullptr);
@@ -39,6 +52,7 @@ bool check_wave_shuffle(ID3D12Device* device);
 bool check_ray_query(ID3D12Device* device);
 bool check_dxr_update(ID3D12Device* device);
 bool check_dxr_facing(ID3D12Device* device);
+bool check_dxr_opacity(ID3D12Device* device, bool warp);
 
 Microsoft::WRL::ComPtr<ID3D12Resource> make_buffer(ID3D12Device* device, UINT64 length, D3D12_HEAP_TYPE heap,
     D3D12_RESOURCE_STATES state, D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE);

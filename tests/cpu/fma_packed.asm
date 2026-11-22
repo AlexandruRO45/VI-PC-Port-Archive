@@ -398,4 +398,25 @@ vfmsubadd231pd_op PROC FRAME
     ret
 vfmsubadd231pd_op ENDP
 
+vfmadd132ps_xmm_op PROC FRAME
+    .endprolog
+    vmovups ymm0, ymmword ptr [rcx]
+    vmovups ymm1, ymmword ptr [rdx]
+    vmovups ymm2, ymmword ptr [r8]
+    vfmadd132ps xmm0, xmm1, xmm2
+    vmovups ymmword ptr [r9], ymm0
+    vzeroupper
+    ret
+vfmadd132ps_xmm_op ENDP
+
+vfmsub213ps_mem_op PROC FRAME
+    .endprolog
+    vmovups ymm0, ymmword ptr [rcx]
+    vmovups ymm1, ymmword ptr [rdx]
+    vfmsub213ps ymm0, ymm1, ymmword ptr [r8]
+    vmovups ymmword ptr [r9], ymm0
+    vzeroupper
+    ret
+vfmsub213ps_mem_op ENDP
+
 END
