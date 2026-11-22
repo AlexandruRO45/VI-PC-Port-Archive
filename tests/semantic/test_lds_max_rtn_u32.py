@@ -126,6 +126,132 @@ class LDSModel:
         return old_val, new_val, modified
 
 
+# ---------------------------------------------------------------------------
+# Phase 2: Symbolic AST Opcode Definitions and Typed Expressions
+# ---------------------------------------------------------------------------
+
+class Opcode(str, enum.Enum):
+    DS_MAX_RTN_U32 = "ds_max_rtn_u32"
+
+
+class RegKind(str, enum.Enum):
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclasses.dataclass(frozen=True)
+class Register:
+    """Typed AST representation of a GPU hardware register."""
+    kind: RegKind
+    index: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"Register index out of range [0, 255]: {self.index}")
+
+    def __str__(self) -> str:
+        return f"{self.kind.value}{self.index}"
+
+
+def VGPR(index: int) -> Register:
+    return Register(RegKind.VGPR, index)
+
+
+def SGPR(index: int) -> Register:
+    return Register(RegKind.SGPR, index)
+
+
+@dataclasses.dataclass(frozen=True)
+class Immediate:
+    """Typed AST representation of a 32-bit immediate literal."""
+    val: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "val", self.val & MASK32)
+
+    def __str__(self) -> str:
+        return f"0x{self.val:X}" if self.val > 9 else str(self.val)
+
+
+Operand = Union[Register, Immediate]
+
+
+@dataclasses.dataclass
+class DSMaxRtnU32Instruction:
+    """AST node for ds_max_rtn_u32 instruction:
+
+    ds_max_rtn_u32 vdst, vaddr, vdata [offset:offset16]
+    """
+    opcode: Opcode
+    dst: Register
+    addr: Register
+    data: Operand
+    offset: int = 0
+
+    def __post_init__(self) -> None:
+        if self.opcode != Opcode.DS_MAX_RTN_U32:
+            raise ValueError(f"Unsupported opcode for ds_max_rtn_u32: {self.opcode}")
+        if self.dst.kind != RegKind.VGPR:
+            raise ValueError(f"Destination must be a VGPR, got {self.dst}")
+        if self.addr.kind != RegKind.VGPR:
+            raise ValueError(f"Address must be a VGPR, got {self.addr}")
+        if isinstance(self.data, Register) and self.data.kind != RegKind.VGPR:
+            raise ValueError(f"Register data operand must be a VGPR, got {self.data}")
+        if not (0 <= self.offset <= 65535):
+            raise ValueError(f"Offset out of range [0, 65535]: {self.offset}")
+
+    @classmethod
+    def parse(cls, asm: str) -> DSMaxRtnU32Instruction:
+        """Parse an assembly statement into a typed DSMaxRtnU32Instruction AST node."""
+        tokens = asm.strip().replace(",", " ").split()
+        if not tokens:
+            raise ValueError("Empty assembly string")
+        if tokens[0] != Opcode.DS_MAX_RTN_U32.value:
+            raise ValueError(f"Expected opcode '{Opcode.DS_MAX_RTN_U32.value}', got '{tokens[0]}'")
+
+        if len(tokens) < 4:
+            raise ValueError(f"Too few operands for ds_max_rtn_u32: {asm}")
+
+        def parse_reg(tok: str) -> Register:
+            if tok.startswith("v"):
+                return VGPR(int(tok[1:]))
+            if tok.startswith("s"):
+                return SGPR(int(tok[1:]))
+            raise ValueError(f"Invalid register operand: {tok}")
+
+        dst = parse_reg(tokens[1])
+        addr = parse_reg(tokens[2])
+
+        # Parse data operand: either VGPR or immediate
+        data_tok = tokens[3]
+        if data_tok.startswith("v") or data_tok.startswith("s"):
+            data: Operand = parse_reg(data_tok)
+        else:
+            data = Immediate(int(data_tok, 0))
+
+        offset = 0
+        for tok in tokens[4:]:
+            if tok.startswith("offset:"):
+                val_str = tok[len("offset:"):]
+                offset = int(val_str, 0)
+            else:
+                raise ValueError(f"Unknown modifier or trailing token: {tok}")
+
+        return cls(
+            opcode=Opcode.DS_MAX_RTN_U32,
+            dst=dst,
+            addr=addr,
+            data=data,
+            offset=offset,
+        )
+
+    def __str__(self) -> str:
+        s = f"{self.opcode.value} {self.dst}, {self.addr}, {self.data}"
+        if self.offset != 0:
+            s += f" offset:{self.offset}"
+        return s
+
+
 class TestLdsMaxRtnU32ReferenceOracle(unittest.TestCase):
     """Phase 1: Unit tests for reference mathematical oracle and architectural model."""
 
@@ -228,6 +354,81 @@ class TestLdsMaxRtnU32ReferenceOracle(unittest.TestCase):
         self.assertEqual(lds.read_dword(0x204), 5000)
         # original dword 0x200 remains 2500
         self.assertEqual(lds.read_dword(addr), 2500)
+
+
+class TestLdsMaxRtnU32AST(unittest.TestCase):
+    """Phase 2: Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_construction_and_attributes(self) -> None:
+        inst = DSMaxRtnU32Instruction(
+            opcode=Opcode.DS_MAX_RTN_U32,
+            dst=VGPR(0),
+            addr=VGPR(1),
+            data=VGPR(2),
+            offset=16,
+        )
+        self.assertEqual(inst.opcode, Opcode.DS_MAX_RTN_U32)
+        self.assertEqual(inst.dst, VGPR(0))
+        self.assertEqual(inst.addr, VGPR(1))
+        self.assertEqual(inst.data, VGPR(2))
+        self.assertEqual(inst.offset, 16)
+        self.assertEqual(str(inst), "ds_max_rtn_u32 v0, v1, v2 offset:16")
+
+    def test_ast_parse_valid_registers(self) -> None:
+        inst = DSMaxRtnU32Instruction.parse("ds_max_rtn_u32 v5, v12, v20")
+        self.assertEqual(inst.opcode, Opcode.DS_MAX_RTN_U32)
+        self.assertEqual(inst.dst, VGPR(5))
+        self.assertEqual(inst.addr, VGPR(12))
+        self.assertEqual(inst.data, VGPR(20))
+        self.assertEqual(inst.offset, 0)
+        self.assertEqual(str(inst), "ds_max_rtn_u32 v5, v12, v20")
+
+    def test_ast_parse_with_offset(self) -> None:
+        inst = DSMaxRtnU32Instruction.parse("ds_max_rtn_u32 v0, v1, v2 offset:64")
+        self.assertEqual(inst.offset, 64)
+        inst_hex = DSMaxRtnU32Instruction.parse("ds_max_rtn_u32 v10, v11, v12 offset:0x100")
+        self.assertEqual(inst_hex.offset, 256)
+
+    def test_ast_parse_with_immediate_data(self) -> None:
+        inst = DSMaxRtnU32Instruction.parse("ds_max_rtn_u32 v0, v1, 42")
+        self.assertEqual(inst.data, Immediate(42))
+        inst2 = DSMaxRtnU32Instruction.parse("ds_max_rtn_u32 v0, v1, 0xFFFFFFFF")
+        self.assertEqual(inst2.data, Immediate(0xFFFFFFFF))
+
+    def test_ast_validation_errors(self) -> None:
+        # Destination must be VGPR
+        with self.assertRaises(ValueError):
+            DSMaxRtnU32Instruction(
+                opcode=Opcode.DS_MAX_RTN_U32,
+                dst=SGPR(0),
+                addr=VGPR(1),
+                data=VGPR(2),
+            )
+        # Address must be VGPR
+        with self.assertRaises(ValueError):
+            DSMaxRtnU32Instruction(
+                opcode=Opcode.DS_MAX_RTN_U32,
+                dst=VGPR(0),
+                addr=SGPR(1),
+                data=VGPR(2),
+            )
+        # Register data operand cannot be SGPR
+        with self.assertRaises(ValueError):
+            DSMaxRtnU32Instruction(
+                opcode=Opcode.DS_MAX_RTN_U32,
+                dst=VGPR(0),
+                addr=VGPR(1),
+                data=SGPR(2),
+            )
+        # Offset out of range
+        with self.assertRaises(ValueError):
+            DSMaxRtnU32Instruction(
+                opcode=Opcode.DS_MAX_RTN_U32,
+                dst=VGPR(0),
+                addr=VGPR(1),
+                data=VGPR(2),
+                offset=70000,
+            )
 
 
 if __name__ == "__main__":
