@@ -40,6 +40,9 @@ ISA semantics used (AMD RDNA2 ISA reference, VALU/VOP3/VOP3P chapters):
   v_subrev_f16          D.lo = S1.lo - S0.lo; the high half of D is kept in the VOP2 and the VOP3 form.
   op_sel destination    on v_pack_b32_f16 / v_alignbit_b32 / v_alignbyte_b32 (whole-dword results): D = result << 16,
     bit, dword result     the old D is not kept. Measured on gfx1036 (EGEN-HW-OPSEL-DST32, ps_opsel_dst32.asm).
+  source op_sel bits on  bits 0 and 1 pick the byte of S2 that is the shift amount, k = op_sel[0] + 2 * op_sel[1]:
+    v_alignbit_b32 /      S2 >> 8k, then & 31 (alignbit) or & 3 bytes (alignbyte); bit 2 changes nothing. Measured
+    v_alignbyte_b32       on gfx1036 (SHADER-447, ps_align_srcsel.asm).
   s_*_saveexec_b32/b64, a constant used as a lane mask gives lane L its bit L: of the 32-bit value for a b32 op,
   s_andn2_wrexec_*,       of the 64-bit value for a b64 op (inline constants sign-extended, literals with a zero
   s_mov/s_not/s_and_b64   high word). cs_w32_mask_imm / cs_w64_mask_imm run every lane of a wave (LaneMaskConstants).
@@ -82,6 +85,7 @@ EXPECTED_SFF_IMM = [0x00000002, 0x00000001, 0x00000014, 0x00000010]
 EXPECTED_VALU16_MAD = [0x00000002, 0x00030002, 0x00008000, 0x00000004]
 EXPECTED_VALU16_SUBREV = [0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800]
 EXPECTED_OPSEL_DST32 = [0x12340000, 0xCDEF0000, 0x9ABC0000, 0xF37B0000]        # hardware-measured
+EXPECTED_ALIGN_SRCSEL = [0xF13579BD, 0x2468ACF1, 0x56789ABC, 0x35790000]       # hardware-measured
 
 
 def _f32_bits(x):
@@ -325,6 +329,22 @@ def reference_opsel_dst32():
     return [(r << 16) & 0xFFFFFFFF for r in results]       # the op_sel destination bit: result << 16
 
 
+def reference_align(op, s0, s1, s2, sel):
+    """v_alignbit_b32 / v_alignbyte_b32 under op_sel:[sel0, sel1, sel2, dst] as measured on gfx1036 (SHADER-447)."""
+    k = sel[0] + 2 * sel[1]                                 # source bits 0 and 1: the byte of S2 that is read
+    amount = (s2 >> (8 * k)) & 31 if op == "v_alignbit_b32" else 8 * ((s2 >> (8 * k)) & 3)
+    r = ((s0 << 32 | s1) >> amount) & 0xFFFFFFFF
+    return (r << 16) & 0xFFFFFFFF if sel[3] else r          # the destination bit: result << 16
+
+
+def reference_align_srcsel():
+    v0, v1, v5, v6 = 0x12345678, 0x9ABCDEF0, 0x1D0F0703, 0x03020100
+    return [reference_align("v_alignbit_b32", v0, v1, v5, (1, 0, 0, 0)),
+            reference_align("v_alignbit_b32", v0, v1, 0x3F800000, (1, 1, 0, 0)),     # inline 1.0
+            reference_align("v_alignbyte_b32", v0, v1, v6, (0, 1, 1, 0)),
+            reference_align("v_alignbit_b32", v0, v1, v5, (0, 1, 0, 1))]
+
+
 def _isg1_dxbc(elements):
     """A DXBC container with one ISG1 input signature. elements: (register, mask, system value, component type)."""
     payload = bytearray(struct.pack("<II", len(elements), 8))
@@ -376,6 +396,7 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_valu16_mad(), EXPECTED_VALU16_MAD)
         self.assertEqual(reference_valu16_subrev(), EXPECTED_VALU16_SUBREV)
         self.assertEqual(reference_opsel_dst32(), EXPECTED_OPSEL_DST32)
+        self.assertEqual(reference_align_srcsel(), EXPECTED_ALIGN_SRCSEL)
 
 
 class TranslatorValueSemantics(unittest.TestCase):
@@ -521,14 +542,23 @@ class TranslatorValueSemantics(unittest.TestCase):
         # left by 16 with a zero low half; the destinations' 0xaaaa5555 is not kept.
         self.check("ps_opsel_dst32", EXPECTED_OPSEL_DST32)
 
-    def test_alignbit_alignbyte_source_op_sel_is_refused(self):
-        # A source op_sel bit changes v_alignbit_b32 / v_alignbyte_b32 on gfx1036 in a way not modelled.
-        for op in ("v_alignbit_b32", "v_alignbyte_b32"):
-            for sel in ("op_sel:[1,0,0,0]", "op_sel:[0,1,0,0]", "op_sel:[0,0,1,1]"):
-                with self.subTest(op=op, sel=sel), self.assertRaisesRegex(Exception, "op_sel on a source"):
-                    support.translate_lines("ps_align_sel", [f"{op} v2, v0, v1, v3 {sel}",
-                                                             "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"])
+    def test_alignbit_alignbyte_source_op_sel_picks_a_byte_of_s2(self):
+        # SHADER-447: read S2's low byte instead and the words are 0x13579bde, 0x9abcdef0, 0x9abcdef0, 0x9bde0000.
+        self.check("ps_align_srcsel", EXPECTED_ALIGN_SRCSEL)
 
+    def test_alignbit_alignbyte_every_op_sel_against_the_reference(self):
+        # Every op_sel combination, with S2 in a VGPR (the dynamic shift) and as a literal (the constant shift).
+        s0, s1, s2 = 0x12345678, 0x9ABCDEF0, 0x1D0E0B06
+        for op in ("v_alignbit_b32", "v_alignbyte_b32"):
+            for n in range(16):
+                sel = tuple((n >> b) & 1 for b in range(4))
+                for src in ("v3", hex(s2)):
+                    with self.subTest(op=op, sel=sel, src=src):
+                        spv = support.translate_lines("ps_align_sel", [
+                            f"v_mov_b32 v0, {hex(s0)}", f"v_mov_b32 v1, {hex(s1)}", f"v_mov_b32 v3, {hex(s2)}",
+                            f"{op} v2, v0, v1, {src} op_sel:[{','.join(map(str, sel))}]",
+                            "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"])
+                        self.assertEqual(support.mrt0_words(spv)[0], reference_align(op, s0, s1, s2, sel))
 
 class ReadLog(dict):
     """A {byte_address: word} memory for run_fragment that records the address of every load."""

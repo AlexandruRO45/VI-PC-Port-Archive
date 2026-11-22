@@ -291,6 +291,8 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_f16_pack_mods": (0x4400b400, 0xc4003400, 0x4400c200, 0xb400b400),
               # op_sel destination bit on a dword result: result << 16 (EGEN-HW-OPSEL-DST32, measured on gfx1036)
               "ps_opsel_dst32": (0x12340000, 0xcdef0000, 0x9abc0000, 0xf37b0000),
+              # source op_sel bits 0/1 on v_alignbit/alignbyte pick a byte of S2 (SHADER-447, measured on gfx1036)
+              "ps_align_srcsel": (0xf13579bd, 0x2468acf1, 0x56789abc, 0x35790000),
               "ps_sff_imm": (2, 1, 20, 16),
               "ps_fnan_med3": (0x40a00000, 0xc0200000, 0xc0200000, 0x40600000),
               "ps_fnan_fract": (0x3f7fffff, 0x00003bff, 0xc0200000, 0xc0200000),
