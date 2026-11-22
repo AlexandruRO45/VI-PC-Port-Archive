@@ -184,7 +184,7 @@ USER_SGPRS = 32
 # and nothing is written (RDNA2 ISA, SMEM). s_incperflevel / s_decperflevel step a performance counter and s_wakeup
 # pings the other waves of the threadgroup out of an s_sleep (itself a no-op here): neither touches a register,
 # memory, SCC, VCC or EXEC (RDNA2 ISA, SOPP).
-NOOPS = {"s_sleep", "v_nop", "v_pipeflush", "s_nop", "s_inst_prefetch", "s_endpgm", "s_setprio", "s_clause",
+NOOPS = {"s_wait_idle", "s_sleep", "v_nop", "v_pipeflush", "s_nop", "s_inst_prefetch", "s_endpgm", "s_setprio", "s_clause",
          "s_delay_alu", "s_waitcnt", "s_waitcnt_vscnt", "s_waitcnt_vmcnt", "s_waitcnt_expcnt", "s_waitcnt_lgkmcnt",
          "s_waitcnt_depctr", "s_icache_inv", "s_ttracedata", "s_ttracedata_imm", "s_code_end", "s_version",
          "ds_nop", "v_clrexcp", "s_atc_probe", "s_atc_probe_buffer", "s_incperflevel", "s_decperflevel", "s_wakeup"}
@@ -12899,10 +12899,31 @@ def halves_analysis(g, blocks, succ):
         raise Unsupported("wave64 graphics tier C: " + ", ".join(g.w64g["reasons"]))
 
 
+# SOPP forms with a plain equivalent (normalize_sopp): s_endpgm_ordered_ps_done ends the program and signals the
+# end of the ordered pixel-shader section, which is already a no-op here (the fragment-shader interlock ends at shader
+# exit), so it is s_endpgm. The s_cbranch_cdbg* branches test the debugger-present bits (RDNA ISA: CDBG_SYS /
+# CDBG_USER in STATUS), which are clear without an attached shader debugger, so they are never taken: an s_nop in
+# place (no branch edge). s_wait_idle waits for every outstanding operation; with no asynchronous counters here it has no effect.
+SOPP_NEVER_TAKEN = {"s_cbranch_cdbgsys", "s_cbranch_cdbguser", "s_cbranch_cdbgsys_or_user", "s_cbranch_cdbgsys_and_user"}
+
+
+def normalize_sopp(insns):
+    out = []
+    for ins in insns:
+        op = base_op(ins["op"])
+        if op in SOPP_NEVER_TAKEN:
+            ins = dict(ins, op="s_nop", args=[])      # keeps its pc and encoding: the fall-through chain stays
+        if op == "s_endpgm_ordered_ps_done":
+            ins = dict(ins, op="s_endpgm", args=[])
+        out.append(ins)
+    return out
+
+
 def fold_far_branches(insns):
     """s_getpc_b64 s[a:a+1]; s_add_u32 sa, sa, K; s_addc_u32 sa+1, sa+1, 0|-1; s_setpc_b64 s[a:a+1] is a far
     branch (s_branch only reaches +-32K dwords): the target is the address after s_getpc plus K. Fold the four
     instructions into one s_branch with an explicit byte target so the CFG sees an ordinary branch."""
+    insns = normalize_sopp(insns)
     out, i = [], 0
     while i < len(insns):
         w = insns[i:i + 4]
