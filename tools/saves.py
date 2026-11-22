@@ -289,24 +289,52 @@ def verify(p):
     return False
 
 
+def keyed_blocks(d, entries):
+    """Blocks keyed by (group, hash, occurrence), in file order.
+
+    A (group, hash) pair is not unique in every file, so keying on it alone would keep only the last block of each
+    pair and hide changes to the others. The n-th block with a pair is matched with the n-th one in the other save.
+    """
+    seen, out = {}, {}
+    for e, b in zip(entries, jsav_blocks(d, entries)):
+        pair = (e['group'], e['hash'])
+        n = seen.get(pair, 0)
+        seen[pair] = n + 1
+        out[pair + (n,)] = b
+    return out, {p for p, c in seen.items() if c > 1}
+
+
 def diff(pa, pb):
     da, db = read(pa), read(pb)
     (_, ea), (_, eb) = parse_jsav(da), parse_jsav(db)
-    ma = {(e['group'], e['hash']): b for e, b in zip(ea, jsav_blocks(da, ea))}
-    mb = {(e['group'], e['hash']): b for e, b in zip(eb, jsav_blocks(db, eb))}
-    for k in ma.keys() - mb.keys():
-        print('only in A:', *k, len(ma[k]))
-    for k in mb.keys() - ma.keys():
-        print('only in B:', *k, len(mb[k]))
+    (ma, dup_a), (mb, dup_b) = keyed_blocks(da, ea), keyed_blocks(db, eb)
+    dup = dup_a | dup_b
+
+    def name(k):
+        # '#n' is shown only for pairs that repeat, so the output of ordinary saves is unchanged.
+        return f'{k[0]} {k[1]}' + (f' #{k[2]}' if k[:2] in dup else '')
+
+    order = list(ma) + [k for k in mb if k not in ma]
+    for k in order:
+        if k in ma and k not in mb:
+            print('only in A:', name(k), len(ma[k]))
+    for k in order:
+        if k in mb and k not in ma:
+            print('only in B:', name(k), len(mb[k]))
     same = 0
-    for k in ma.keys() & mb.keys():
+    for k in order:
+        if k not in ma or k not in mb:
+            continue
         if ma[k] == mb[k]:
             same += 1
             continue
         a, b = ma[k], mb[k]
         n = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
-        print(f'changed: {k[0]} {k[1]} {len(a)} -> {len(b)} bytes, first difference near: '
+        print(f'changed: {name(k)} {len(a)} -> {len(b)} bytes, first difference near: '
               f'A {a[max(0, n - 40):n + 40]!r}  B {b[max(0, n - 40):n + 40]!r}')
+    if dup:
+        print(f'note: {len(dup)} (group, hash) pair(s) occur more than once; '
+              'their blocks are matched by order of appearance (#0, #1, ...)')
     print(f'{same} blocks identical')
 
 

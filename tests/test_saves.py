@@ -158,6 +158,49 @@ class JsavTest(unittest.TestCase):
             out = quiet(saves.diff, pa, pb)
         self.assertIn("changed: code 10000002", out)
         self.assertIn("4 blocks identical", out)
+        self.assertNotIn("#", out.replace("#0x", ""))
+
+    def _diff_pair(self, hashes_a, blocks_a, hashes_b, blocks_b, n_code=3, n_code_b=None):
+        a = saves.build_jsav(3, n_code, hashes_a, [1] * len(blocks_a), blocks_a)
+        b = saves.build_jsav(3, n_code if n_code_b is None else n_code_b, hashes_b, [1] * len(blocks_b), blocks_b)
+        with tempfile.TemporaryDirectory() as tmp:
+            pa, pb = os.path.join(tmp, "a"), os.path.join(tmp, "b")
+            write(pa, a)
+            write(pb, b)
+            return quiet(saves.diff, pa, pb)
+
+    def test_diff_repeated_pair_change_is_reported(self):
+        # Two code blocks share hash 0x10000001: a change to the first one used to vanish because the second
+        # overwrote it in the (group, hash) map.
+        h = [0x10000000, 0x10000001, 0x10000001, 0x20000000, 0x20000001]
+        blocks = [block(CODE_GROUP, x, {"$0xaaaa0000": i}) for i, x in enumerate(h)]
+        edited = list(blocks)
+        edited[1] = block(CODE_GROUP, h[1], {"$0xaaaa0000": 99})
+        out = self._diff_pair(h, blocks, h, edited)
+        self.assertIn("changed: code 10000001 #0", out)
+        self.assertNotIn("10000001 #1", out)
+        self.assertIn("4 blocks identical", out)
+        self.assertIn("1 (group, hash) pair(s) occur more than once", out)
+
+    def test_diff_repeated_pair_count_change(self):
+        # B has one more block with a repeated pair: it shows up as added, not as nothing.
+        h_a = [0x10000000, 0x10000001, 0x10000002]
+        blocks_a = [block(CODE_GROUP, x, {"$0xaaaa0000": i}) for i, x in enumerate(h_a)]
+        h_b = h_a + [0x10000001]
+        blocks_b = blocks_a + [block(CODE_GROUP, 0x10000001, {"$0xaaaa0000": 5})]
+        out = self._diff_pair(h_a, blocks_a, h_b, blocks_b, n_code=3, n_code_b=4)
+        self.assertIn("only in B: code 10000001 #1", out)
+        self.assertIn("3 blocks identical", out)
+
+    def test_diff_same_hash_in_both_groups_is_not_merged(self):
+        h = [0x10000000, 0x10000001, 0x10000002, 0x10000001, 0x20000001]
+        blocks = [block(CODE_GROUP if i < 3 else SCRIPT_GROUP, x, {"$0xaaaa0000": i}) for i, x in enumerate(h)]
+        edited = list(blocks)
+        edited[3] = block(SCRIPT_GROUP, h[3], {"$0xaaaa0000": 42})
+        out = self._diff_pair(h, blocks, h, edited)
+        self.assertIn("changed: script 10000001", out)
+        self.assertNotIn("changed: code", out)
+        self.assertIn("4 blocks identical", out)
 
 
 class AsavTest(unittest.TestCase):

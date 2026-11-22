@@ -144,11 +144,14 @@ python -I tools/saves.py info    <file or folder>...
 python -I tools/saves.py verify  <JSAV>                 # parse every block, rebuild, compare byte for byte
 python -I tools/saves.py extract <JSAV|ASAV> <outdir>   # blocks/*.json, index.json, save.pretty.json
 python -I tools/saves.py pack    <outdir> <JSAV>        # after editing blocks/*.json
-python -I tools/saves.py diff    <JSAV a> <JSAV b>
+python -I tools/saves.py diff    <JSAV a> <JSAV b>       # blocks matched by (group, hash, occurrence)
 python -I tools/saves.py import  <save folder>... [--out DIR] [--map OLD=CONTAINER/BLOB] [--dry-run] [--force]
 python -I tools/save_keys.py collect <save file or extract folder>...           # distinct $0x… keys
 python -I tools/save_keys.py resolve <saves>... --dict <files>... [--compose N] [--out FILE]
 ```
+
+`diff` does not assume a (group, hash) pair is unique: the n-th block with a pair in A is compared with the n-th in
+B, and a repeated pair is printed with its occurrence (`code 1a2b3c4d #1`). Pairs that occur once print as before.
 
 `tests/test_saves.py` and `tests/test_save_keys.py` cover all of it on synthetic containers and names built in the
 tests.
