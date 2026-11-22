@@ -817,7 +817,46 @@ class DownscaleTests(unittest.TestCase):
                 self.assertEqual(pixels(out), [(20, 20, 20, 255), (180, 180, 180, 255)])
 
         rgba = bytes(4 * 8) + bytes((90, 180, 0, 255))
-        self.assertEqual(dds.downscale_rgba(3, 3, rgba, 1), (1, 1, bytes((10, 20, 0, 28))))
+        self.assertEqual(dds.downscale_rgba(3, 3, rgba, 1), (1, 1, bytes((90, 180, 0, 28))))
+
+    def test_transparent_color_does_not_bleed_into_a_visible_pixel(self):
+        rgba = bytes((255, 0, 0, 0)) * 3 + bytes((0, 0, 255, 255))
+        self.assertEqual(dds.downscale_rgba(2, 2, rgba, 1), (1, 1, bytes((0, 0, 255, 64))))
+
+    def test_single_axis_filter_weights_color_by_alpha(self):
+        rgba = bytes((255, 0, 0, 0, 0, 0, 255, 255))
+        for width, height in ((1, 2), (2, 1)):
+            with self.subTest(width=width, height=height):
+                self.assertEqual(dds.downscale_rgba(width, height, rgba, 1),
+                                 (1, 1, bytes((0, 0, 255, 128))))
+
+    def test_partial_alpha_weights_are_preserved(self):
+        # Total alpha is 256: red contributes one quarter, blue contributes three quarters.
+        rgba = bytes((255, 0, 0, 64, 0, 0, 255, 192))
+        self.assertEqual(dds.downscale_rgba(2, 1, rgba, 1), (1, 1, bytes((64, 0, 191, 128))))
+
+    def test_fully_transparent_filtered_pixels_are_black(self):
+        rgba = bytes((255, 0, 0, 0, 0, 255, 0, 0, 0, 0, 255, 0, 255, 255, 255, 0))
+        self.assertEqual(dds.downscale_rgba(2, 2, rgba, 1), (1, 1, bytes(4)))
+
+    def test_odd_edge_alpha_uses_the_same_area_weights_as_color(self):
+        rgba = bytes((255, 0, 0, 0)) * 4 + bytes((0, 0, 255, 255))
+        for width, height in ((5, 1), (1, 5)):
+            with self.subTest(width=width, height=height):
+                self.assertEqual(dds.downscale_rgba(width, height, rgba, 2),
+                                 (max(1, width // 2), max(1, height // 2),
+                                  bytes((0, 0, 0, 0, 0, 0, 255, 102))))
+
+    def test_repeated_halving_keeps_the_visible_color(self):
+        rgba = bytes((255, 0, 0, 0)) * 15 + bytes((0, 0, 255, 255))
+        self.assertEqual(dds.downscale_rgba(4, 4, rgba, 1), (1, 1, bytes((0, 0, 255, 16))))
+
+    def test_downscaled_png_contains_the_alpha_weighted_color(self):
+        rgba = bytes((255, 0, 0, 0)) * 3 + bytes((0, 0, 255, 255))
+        data = dds_buffer(2, 2, rgba, flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=28)
+        chunks = png_chunks(dds.dds_to_png_bytes(data, max_size=1))
+        raw = zlib.decompress(b"".join(payload for kind, payload, _ in chunks if kind == b"IDAT"))
+        self.assertEqual(raw, bytes((0, 0, 0, 255, 64)))  # filter byte, then straight RGBA
 
     def test_repeated_halving(self):
         w, h, out = dds.downscale_rgba(8, 8, self.rgba_grid(8, 8), 2)

@@ -9,6 +9,7 @@ the stored RGBA8 values with no sRGB transfer, and the reserved mode (no mode
 bit in the first byte) decodes as transparent black. BC6H is not supported.
 DX10 premultiplied alpha is converted to straight alpha for PNG; sRGB colors are
 unpremultiplied in linear light and returned in their sRGB encoding.
+Downscaling weights RGB by alpha so hidden transparent colors do not bleed into previews.
 
 Usage:
     python -I tools/dds_png.py <in.dds> <out.png> [--max-size N]
@@ -972,6 +973,7 @@ def _box_spans(source: int, target: int) -> list:
 
 
 def _resample_box(width: int, height: int, rgba: bytes, nw: int, nh: int) -> bytes:
+    """Area-weighted box filter: average associated color, then return straight RGBA8."""
     x_spans = _box_spans(width, nw)
     y_spans = _box_spans(height, nh)
     area = width * height
@@ -980,9 +982,13 @@ def _resample_box(width: int, height: int, rgba: bytes, nw: int, nh: int) -> byt
         for x, cols in enumerate(x_spans):
             samples = [(4 * (sy * width + sx), wx * wy) for sy, wy in rows for sx, wx in cols]
             dst = 4 * (y * nw + x)
-            for channel in range(4):
-                total = sum(rgba[offset + channel] * weight for offset, weight in samples)
-                out[dst + channel] = (total + area // 2) // area
+            alpha = sum(rgba[offset + 3] * weight for offset, weight in samples)
+            out[dst + 3] = (alpha + area // 2) // area
+            if alpha:
+                for channel in range(3):
+                    total = sum(rgba[offset + channel] * rgba[offset + 3] * weight
+                                for offset, weight in samples)
+                    out[dst + channel] = (total + alpha // 2) // alpha
     return bytes(out)
 
 
@@ -991,9 +997,32 @@ def _halve_rgba(width: int, height: int, rgba: bytes) -> tuple[int, int, bytes]:
     nh = max(1, height // 2)
     if (width > 1 and width % 2) or (height > 1 and height % 2):
         return nw, nh, _resample_box(width, height, rgba, nw, nh)
+    opaque = rgba[3::4].count(b"\xff") == width * height
     row_bytes = width * 4
     out_row_bytes = nw * 4
     out = bytearray(nw * nh * 4)
+
+    if not opaque:
+        next_x = 4 if width > 1 else 0
+        for oy in range(nh):
+            p0 = oy * 2 * row_bytes
+            p2 = p0 + row_bytes if height > 1 else p0
+            dst = oy * out_row_bytes
+            for _ in range(nw):
+                p1, p3 = p0 + next_x, p2 + next_x
+                a0, a1, a2, a3 = rgba[p0 + 3], rgba[p1 + 3], rgba[p2 + 3], rgba[p3 + 3]
+                alpha = a0 + a1 + a2 + a3
+                out[dst + 3] = (alpha + 2) // 4
+                if alpha:
+                    half = alpha // 2
+                    for c in range(3):
+                        total = (rgba[p0 + c] * a0 + rgba[p1 + c] * a1
+                                 + rgba[p2 + c] * a2 + rgba[p3 + c] * a3)
+                        out[dst + c] = (total + half) // alpha
+                p0 += 8
+                p2 += 8
+                dst += 4
+        return nw, nh, bytes(out)
 
     if width == 1:
         for oy in range(nh):
@@ -1028,7 +1057,7 @@ def _halve_rgba(width: int, height: int, rgba: bytes) -> tuple[int, int, bytes]:
 
 
 def downscale_rgba(width: int, height: int, rgba: bytes, max_size: int) -> tuple[int, int, bytes]:
-    """Repeatedly halve RGBA8 via a full-image box filter until max(w, h) <= max_size."""
+    """Repeatedly halve RGBA8 via a full-image box filter with alpha-weighted RGB until max(w, h) <= max_size."""
     if width <= 0 or height <= 0:
         raise DdsError(f"Invalid image dimensions: {width}x{height}")
     expected = width * height * 4

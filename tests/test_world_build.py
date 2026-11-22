@@ -539,7 +539,7 @@ class DdsPngTest(unittest.TestCase):
                 self.assertLess(b15, 200)
 
     def test_downscale_rgba_4x4_to_2x2_exact(self):
-        # 4 quadrants whose 2x2 channel sums are exact multiples of 4.
+        # Alpha is averaged; RGB is alpha-weighted. Bottom-left red is 13200/280, rounded to 47.
         grid = [
             (0, 40, 80, 200), (4, 44, 84, 204), (100, 0, 200, 252), (100, 0, 200, 252),
             (8, 48, 88, 208), (12, 52, 92, 212), (200, 40, 100, 252), (200, 40, 100, 252),
@@ -552,7 +552,7 @@ class DdsPngTest(unittest.TestCase):
         expected = bytes([
             6, 46, 86, 206,
             150, 20, 150, 252,
-            40, 50, 60, 70,
+            47, 57, 67, 70,
             255, 255, 255, 255,
         ])
         self.assertEqual(out, expected)
