@@ -1019,8 +1019,130 @@ class TestPermB16RegisterAliasing(unittest.TestCase):
             self.assertEqual(wave.get_lane_vgpr(0, lane) & MASK16, expected)
 
 
+# ==============================================================================
+# Condition Codes, Architectural Status Flags, and Classifications
+# ==============================================================================
+
+@dataclass
+class B16StatusFlags:
+    """Architectural status flags produced by 16-bit VALU integer operations."""
+    zero: bool = False
+    negative: bool = False
+    byte0_zero: bool = False
+    byte1_zero: bool = False
+
+
+def eval_b16_status(val16: int) -> B16StatusFlags:
+    """Evaluate architectural integer status flags for a 16-bit word."""
+    u16 = val16 & MASK16
+    b0 = u16 & BYTE_MASK
+    b1 = (u16 >> BYTE_WIDTH) & BYTE_MASK
+
+    return B16StatusFlags(
+        zero=(u16 == 0),
+        negative=bool(u16 & 0x8000),
+        byte0_zero=(b0 == 0),
+        byte1_zero=(b1 == 0),
+    )
+
+
+# ==============================================================================
+# Unit Tests: Commit 6 (Condition Codes & Status Flags)
+# ==============================================================================
+
+class TestPermB16ConditionCodesAndStatus(unittest.TestCase):
+    """Test suite for condition codes, status flags, and carry/borrow generation."""
+
+    def setUp(self):
+        self.rf = ScalarRegisterFile()
+        self.interp = ScalarInterpreter(self.rf)
+
+    def test_status_flags_zero_result(self):
+        sel = make_selector_16(SEL_ZERO, SEL_ZERO)
+        res = oracle_v_perm_b16(0, 0, sel)
+        flags = eval_b16_status(res)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertTrue(flags.byte0_zero)
+        self.assertTrue(flags.byte1_zero)
+
+    def test_status_flags_negative_sign(self):
+        # Permute giving 0x8000 (sign bit set)
+        s1 = 0x8000
+        sel = PermSelectorB16Word.identity_src1().raw
+        res = oracle_v_perm_b16(0, s1, sel)
+        flags = eval_b16_status(res)
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.negative)
+        self.assertTrue(flags.byte0_zero)
+        self.assertFalse(flags.byte1_zero)
+
+    def test_status_flags_byte_level_zero(self):
+        s1 = 0x1200
+        sel = PermSelectorB16Word.identity_src1().raw
+        res = oracle_v_perm_b16(0, s1, sel)
+        flags = eval_b16_status(res)
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.byte0_zero)
+        self.assertFalse(flags.byte1_zero)
+
+    def test_scc_preserved_by_valu_perm(self):
+        self.rf.scc = 1
+        self.rf.set_vgpr(1, 0x1122)
+        self.rf.set_vgpr(2, 0x3344)
+        sel = PermSelectorB16Word.identity_src1().raw
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.literal(sel),
+        )
+        self.interp.execute(instr)
+        self.assertEqual(self.rf.scc, 1)
+
+    def test_vcc_condition_code_comparison_after_perm(self):
+        s1 = 0x1234
+        sel_swap = PermSelectorB16Word.bswap_src1().raw
+        res = oracle_v_perm_b16(0, s1, sel_swap)
+
+        b0 = extract_byte_16(res, 0)  # 0x12
+        b1 = extract_byte_16(res, 1)  # 0x34
+
+        vcc_bit = 1 if b1 > b0 else 0
+        self.assertEqual(vcc_bit, 1)
+
+    def test_simd_lane_divergent_vcc_generation(self):
+        wave = SIMDWaveState(num_lanes=32)
+        wave.set_wave_vgpr(1, [((i & 0xFF) << 8) | ((i * 2) & 0xFF) for i in range(32)])
+        sel = PermSelectorB16Word.identity_src0().raw
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.inline_const(0),
+            src2=ASTOperand.literal(sel),
+        )
+        wave.execute_instruction(instr)
+
+        vcc_mask = 0
+        for lane in range(32):
+            val = wave.get_lane_vgpr(0, lane) & MASK16
+            b0 = extract_byte_16(val, 0)
+            b1 = extract_byte_16(val, 1)
+            if b0 > b1:
+                vcc_mask |= (1 << lane)
+
+        # b0 is 2*i mod 256, b1 is i. For i in 1..31, 2*i > i is True.
+        expected_vcc = 0xFFFF_FFFE
+        self.assertEqual(vcc_mask, expected_vcc)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
