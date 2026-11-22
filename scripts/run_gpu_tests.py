@@ -272,21 +272,40 @@ def f16_interp_fallback() -> bool:
     return _device_per_vertex() is False
 
 
-_PER_VERTEX = []
+def subgroup_temps() -> bool:
+    """LEONIDA_SUBGROUP_TEMPS=1 (or 0): translate with --subgroup-temps, so MoltenVK's SPIRV-Cross can't move a
+    subgroup operation into a short-circuiting && / ?: (cs_dpp_ops on MoltenVK 1.4.2). Unset, it is on where
+    tools/vk_subgroup_info.py reports driver_id 14 (VK_DRIVER_ID_MOLTENVK)."""
+    v = (os.environ.get("LEONIDA_SUBGROUP_TEMPS") or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return _device_info().get("driver_id") == 14
+
+
+_DEVICE_INFO = []
+
+
+def _device_info() -> dict:
+    """tools/vk_subgroup_info.py's answer for the device the tests run on (cached); {} when it can't tell."""
+    if not _DEVICE_INFO:
+        answer = {}
+        try:
+            r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "vk_subgroup_info.py")],
+                               capture_output=True, text=True, timeout=60)
+            answer = json.loads(r.stdout.strip().splitlines()[-1])
+            if not isinstance(answer, dict) or "error" in answer:
+                answer = {}
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+            pass
+        _DEVICE_INFO.append(answer)
+    return _DEVICE_INFO[0]
 
 
 def _device_per_vertex():
     """per_vertex_inputs from tools/vk_subgroup_info.py for the device the tests run on (cached), or None."""
-    if not _PER_VERTEX:
-        answer = None
-        try:
-            r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "vk_subgroup_info.py")],
-                               capture_output=True, text=True, timeout=60)
-            answer = json.loads(r.stdout.strip().splitlines()[-1]).get("per_vertex_inputs")
-        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
-            pass
-        _PER_VERTEX.append(answer)
-    return _PER_VERTEX[0]
+    return _device_info().get("per_vertex_inputs")
 
 
 def w64_emulated() -> bool:
@@ -719,6 +738,8 @@ def run_suite(a, work: str) -> int:
             cmd.append("--f16-interp-fallback")
         if TEXOFF_FALLBACK:   # image_sample*_o: offset folded into the coordinate, no VK_KHR_maintenance8
             cmd.append("--texel-offset-fallback")
+        if subgroup_temps():   # subgroup operations kept out of SPIRV-Cross's && / ?: (MoltenVK)
+            cmd.append("--subgroup-temps")
         if MESH_COMPUTE:   # mesh shaders as compute writing to a buffer, drawn by tools/mesh_compute_vs.py
             cmd.append("--mesh-compute")
         if os.environ.get("LEONIDA_FMA") in ("glsl", "khr"):   # fused multiply-add: GLSL Fma or OpFmaKHR (docs/design.md)

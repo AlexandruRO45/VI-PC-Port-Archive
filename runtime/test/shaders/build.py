@@ -165,6 +165,8 @@ def translate_tests(work, names):
         cmd.append("--f16-interp-fallback")
     if os.environ.get("LEONIDA_TEXOFF_FALLBACK") == "1":   # texel offsets without VK_KHR_maintenance8
         cmd.append("--texel-offset-fallback")
+    if os.environ.get("LEONIDA_SUBGROUP_TEMPS") == "1":   # subgroup operations kept out of && / ?: (SPIRV-Cross: MoltenVK)
+        cmd.append("--subgroup-temps")
     return subprocess.run(cmd).returncode
 
 
