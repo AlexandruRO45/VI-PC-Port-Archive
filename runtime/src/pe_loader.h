@@ -5,6 +5,7 @@
 // ~Loader() delivers process detach before unmapping initialised modules. The TLS slot and template are set up by load().
 // gta6rt_tls_host.dll must sit next to the executable; the loader reuses the module TLS index the OS assigns it.
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -36,6 +37,17 @@ struct Module {
     uint32_t entry_rva = 0;
     bool relocated = false;
     bool initialised = false;
+
+    // Thread events (DLL_THREAD_ATTACH/DETACH). Once initialise() has run the module, every thread the process starts
+    // or ends is announced to it: its TLS callbacks first, then its DllMain, as the Windows loader orders them.
+    // has_dll_main and has_tls_directory are set by initialise(); thread_calls_disabled by the loader's
+    // DisableThreadLibraryCalls shim. receives_thread_events is set once DllMain(DLL_PROCESS_ATTACH) has succeeded.
+    bool has_dll_main = false;
+    bool has_tls_directory = false;
+    bool receives_thread_events = false;
+    uint64_t events_generation = 0;  // unique per registration, so a thread's record of "attached" cannot be mistaken
+                                     // for a later module that reuses the address
+    std::atomic<bool> thread_calls_disabled{false};
 
     // The image's exception directory (.pdata), registered with RtlAddFunctionTable by load() so that exception
     // dispatch and stack walks can unwind through its frames. Removed when the loader is destroyed.
@@ -127,6 +139,11 @@ public:
     void* load_runtime_module_w(const std::wstring& basename, uint32_t flags, bool& handled);
     void* resolve_module_export(void* module_handle, const std::string& sym, bool& owns_handle);
     bool owns_module_handle(void* module_handle) const;
+    // DisableThreadLibraryCalls for a module this loader mapped (the shim calls it through the bundled-loader ops).
+    // Returns false for a handle that is not one of ours. Records that the module's DllMain wants no thread events,
+    // except for a module with a TLS directory: Windows answers TRUE for it and keeps sending the events (measured by
+    // thread_events_test), and so does the loader. The request is still answered TRUE.
+    bool disable_thread_calls(void* module_handle);
 
 private:
     void initialise(Module& m);

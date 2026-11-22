@@ -69,6 +69,9 @@ struct BundledModuleOps {
     // (library_loader's W entries use them when a name has a character outside ASCII). Either may be null.
     void* (*find_loaded_w)(void* ctx, const std::wstring& basename);
     void* (*load_bundled_w)(void* ctx, const std::wstring& basename, uint32_t flags, bool& handled);
+    // DisableThreadLibraryCalls(module) for a module this loader mapped: records it and returns true; false when the
+    // loader did not map `module`. Optional (null: never claims a module).
+    bool (*disable_thread_calls)(void* ctx, void* module);
 };
 void add_bundled_loader(void* ctx, const BundledModuleOps* ops);
 void remove_bundled_loader(void* ctx);
@@ -79,6 +82,7 @@ void* find_loaded_bundled_module_w(const std::wstring& basename);
 void* load_bundled_module_w(const std::wstring& basename, uint32_t flags, bool& handled);
 void* get_bundled_proc_address(void* module, const std::string& sym, bool& owns_handle);
 bool owns_bundled_module_handle(void* module);
+bool disable_bundled_thread_calls(void* module);
 
 // Test seam: called at the top of every unimplemented-import call with the address of rt_unimplemented's return
 // address slot (so a test can check stack alignment) and from inside the call (so it can walk the stack).

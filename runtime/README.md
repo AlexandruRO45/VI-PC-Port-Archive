@@ -146,12 +146,21 @@ Current limits, by design:
 - Every thread started after `load()` gets its own copy of the TLS template, from
   `gta6rt_tls_host.dll`'s `DLL_THREAD_ATTACH`, and gives it back at `DLL_THREAD_DETACH`, also when the
   thread outlives its `Loader`. From `initialise()` until `~Loader` starts the process detach, those
-  events also run the module's TLS callbacks, with the thread's copy already in place. A thread that
-  was already running when `load()` ran, such as a worker of the process thread pool that the task queue later runs a
+  events also reach every initialised module (DLLs with or without a TLS directory, and an EXE's TLS
+  callbacks): its TLS callbacks first, then its `DllMain(DLL_THREAD_ATTACH / DLL_THREAD_DETACH)`, with the
+  thread's TLS copies already in place. Attach goes in initialisation order, detach in the reverse order,
+  and a thread is detached only from the modules whose attach it saw. This is the order and the set of
+  events the Windows loader sends; `thread_events_test` loads the same fixture DLLs with both loaders and
+  compares the logs. `DisableThreadLibraryCalls` called from a mapped `DllMain` switches that module's
+  `DllMain` events off, except for a module that has a TLS directory: Windows answers `TRUE` there and
+  keeps sending them, and so does the loader. The thread events need `gta6rt_tls_host.dll` next to the
+  executable (a DLL without TLS gets none without it). A thread that was
+  already running when `load()` ran, such as a worker of the process thread pool that the task queue later runs a
   title's callback on, gets its copy from `load()` itself, the way Windows gives one to running threads for a DLL it
   loads: a block, no `DLL_THREAD_ATTACH`, `DLL_THREAD_DETACH` when it ends, and `~Loader` takes the block back.
-  `install_tls_for_thread()` and `uninstall_tls_for_thread()` are no-ops on such a thread. Mapped DLLs' `DllMain` is not called with thread events. Destroy the `Loader` on the thread that
-  called `load()`.
+  `install_tls_for_thread()` and `uninstall_tls_for_thread()` are no-ops on such a thread.
+  Thread events run under the Windows loader lock, so a `DllMain` that handles one must not load another mapped
+  module. Destroy the `Loader` on the thread that called `load()`.
 - The TOC of the game's RPF archives is encrypted and is not read here. The loader works on the PE
   files and on any images the caller passes it.
 

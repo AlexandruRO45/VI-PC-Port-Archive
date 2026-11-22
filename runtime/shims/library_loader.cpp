@@ -284,12 +284,13 @@ BOOL WINAPI free_library(HMODULE module) {
 
 // DisableThreadLibraryCalls(hinstance) from a mapped image's DllMain. The real function only accepts a module the
 // Windows loader mapped, so for ours it fails, and a DllMain that returns its result (the MSVC runtime's satellite
-// DLLs do) fails Loader::initialise() with "DllMain returned FALSE". Owned and mapped modules answer TRUE. The loader
-// sends no thread events to a DllMain, so there is nothing further to switch off; every other handle goes to the
-// real function.
+// DLLs do) fails Loader::initialise() with "DllMain returned FALSE". A module the shims own answers TRUE; a module the
+// loader mapped answers TRUE too, and the loader records the request, so that module's DllMain gets no
+// DLL_THREAD_ATTACH/DETACH (as on Windows, except for a module with a TLS directory: see Loader::disable_thread_calls).
+// Every other handle goes to the real function.
 BOOL WINAPI disable_thread_calls(HMODULE module) {
     if (pseudo(module)) return TRUE;
-    if (owns_bundled_module_handle(module)) return TRUE;
+    if (disable_bundled_thread_calls(module)) return TRUE;
     return DisableThreadLibraryCalls(module);
 }
 

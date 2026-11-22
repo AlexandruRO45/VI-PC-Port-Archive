@@ -804,6 +804,46 @@ if(BUILD_TESTING)
       set_tests_properties(gameinput_host PROPERTIES SKIP_RETURN_CODE 77)  # Windows cannot load GameInput.dll
     endif()
 
+    # DLL_THREAD_ATTACH/DETACH for a mapped DLL's DllMain (RT-170). One CRT-free fixture source, three variants; the test
+    # compares the loader's event log with the Windows loader's for the same file. Needs gta6rt_tls_host.dll next to the
+    # test EXE (the loader's thread-event hook). No game files.
+    foreach(_variant IN ITEMS plain:THREAD_EVENTS_PLAIN tls:THREAD_EVENTS_TLS disabled:THREAD_EVENTS_DISABLE
+                               disabled_tls:THREAD_EVENTS_DISABLE_TLS)
+      string(REPLACE ":" ";" _parts "${_variant}")
+      list(GET _parts 0 _suffix)
+      list(GET _parts 1 _define)
+      add_library(thread_events_${_suffix} SHARED test/fixtures/thread_events.cpp)
+      target_compile_definitions(thread_events_${_suffix} PRIVATE ${_define})
+      target_compile_options(thread_events_${_suffix} PRIVATE /W4 /permissive- /utf-8 /GS-)
+      target_link_options(thread_events_${_suffix} PRIVATE /NODEFAULTLIB /ENTRY:thread_events_main)
+      target_link_libraries(thread_events_${_suffix} PRIVATE kernel32)
+      set_target_properties(thread_events_${_suffix} PROPERTIES
+        OUTPUT_NAME thread_events_${_suffix}
+        PREFIX ""
+        RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+        ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      )
+    endforeach()
+    add_executable(thread_events_test
+      test/thread_events_test.cpp
+      src/pe_loader.cpp
+      shims/library_loader.cpp
+      shims/registry.cpp
+    )
+    target_include_directories(thread_events_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/shims
+    )
+    target_compile_definitions(thread_events_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(thread_events_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    target_link_options(thread_events_test PRIVATE /OPT:NOREF)
+    add_dependencies(thread_events_test thread_events_plain thread_events_tls thread_events_disabled
+                     thread_events_disabled_tls gta6rt_tls_host)
+    add_test(NAME thread_events
+      COMMAND thread_events_test "$<TARGET_FILE:thread_events_plain>" "$<TARGET_FILE:thread_events_tls>"
+              "$<TARGET_FILE:thread_events_disabled>" "$<TARGET_FILE:thread_events_disabled_tls>"
+    )
+
     # LEONIDA_UNIMPLEMENTED=log|fail|stop: builds its own image with two imports that bind to nothing, calls them in
     # process (log, fail) and in child processes (default/env parsing, stop). No game files, no GPU.
     add_executable(unimplemented_policy_test
