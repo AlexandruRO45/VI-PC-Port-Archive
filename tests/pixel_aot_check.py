@@ -1076,6 +1076,116 @@ def check_scheduling_hints():
     must_reject(translate, plain[:-1] + ["s_setprio 0", plain[-1]])
 
 
+# Quad-local DPP16 (quad_perm) and DPP8 (dpp8) fixture covering all 20 supported VOP1/VOP2 DPP forms.
+# Derives per-quad lane ID {0, 1, 2, 3} from interpolated uv.x (v8) and uv.y (v9) so every 2x2 quad
+# carries 4 distinct values across all 4,096 pixels while exporting uniform exact binary16 results.
+DPP_BODY = [
+    "v_subrev_f32_dpp v18, v8, v8 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf",
+    "v_subrev_f32_dpp v19, v9, v9 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf",
+    "v_mul_f32_e32 v18, 0x42800000, v18",
+    "v_fma_f32 v20, 0x43000000, v19, v18",
+    "v_sub_f32_dpp v21, v20, v20 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_add_f32_dpp v21, |v21|, |v21| quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_sub_f32_dpp v22, v20, v20 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_max_f32_dpp v22, |v22|, v22 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_add_f32_dpp v23, v20, v20 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf",
+    "v_mov_b32_dpp v24, v20 dpp8:[1,2,3,0,5,6,7,4]",
+    "v_sub_f32_e32 v25, v24, v20",
+    "v_add_f32_e32 v26, 4.0, v25",
+    "v_cmp_gt_f32_e32 vcc_lo, 0, v25",
+    "v_cndmask_b32_dpp v27, v25, v26, vcc_lo quad_perm:[1,2,0,3] row_mask:0xf bank_mask:0xf",
+    "v_add_f32_e32 v12, v21, v22",
+    "v_add_f32_e32 v12, v12, v23",
+    "v_add_f32_e32 v12, v12, v27",
+    "v_add_f32_e32 v12, s44, v12",
+    "v_mov_b32_e32 v28, s45",
+    "v_mov_b32_e32 v29, s46",
+    "v_mov_b32_e32 v30, s47",
+    "v_mul_f32_dpp v31, v20, v28 quad_perm:[3,3,3,3] row_mask:0xf bank_mask:0xf",
+    "v_mul_legacy_f32_dpp v32, v20, v28 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf",
+    "v_min_f32_dpp v33, -v31, v30 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_cvt_f32_f16_dpp v34, -|v29| quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_mov_b32_e32 v13, v32",
+    "v_fmac_f32_dpp v13, v33, v34 dpp8:[1,0,3,2,5,4,7,6]",
+    "v_add_f32_e32 v35, s44, v30",
+    "v_floor_f32_dpp v36, v35 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_ceil_f32_dpp v37, v35 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_trunc_f32_dpp v38, v35 dpp8:[3,2,1,0,7,6,5,4]",
+    "v_fract_f32_dpp v39, v35 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf",
+    "v_fma_f32 v14, 2.0, v37, v36",
+    "v_fma_f32 v14, 4.0, v38, v14",
+    "v_add_f32_e32 v14, v14, v39",
+    "v_log_f32_dpp v40, v28 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_exp_f32_dpp v41, v40 dpp8:[2,3,0,1,6,7,4,5]",
+    "v_rcp_f32_dpp v42, v41 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf",
+    "v_sqrt_f32_dpp v43, v28 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_rsq_f32_dpp v44, v28 dpp8:[3,2,1,0,7,6,5,4]",
+    "v_add_f32_e32 v15, v40, v41",
+    "v_fma_f32 v15, 0x41800000, v42, v15",
+    "v_add_f32_e32 v15, v15, v43",
+    "v_fma_f32 v15, 4.0, v44, v15",
+    "v_add_f32_e32 v15, 0.5, v15",
+    "v_floor_f32_e32 v15, v15",
+]
+
+DPP_SETS = (
+    # (a: f32, b: power-of-2 f32, h_bits: packed f16 in low half, c: f32)
+    (0.25, 4.0, 0x4000, 1.5),
+    (-2.25, 16.0, 0xbe00, 0.5),
+)
+
+
+def dpp_reference(a, b, h_bits, c):
+    h = struct.unpack("<e", struct.pack("<H", h_bits & 0xffff))[0]
+    ch0 = 8.0 + a
+    ch1 = 3.0 * b * abs(h)
+    x = a + c
+    ch2 = math.floor(x) + 2.0 * math.ceil(x) + 4.0 * math.trunc(x) + (x - math.floor(x))
+    log_b = math.log2(b)
+    ch3 = math.floor(log_b + (2.0 ** log_b) + 16.0 / (2.0 ** log_b) + math.sqrt(b) + 4.0 / math.sqrt(b) + 0.5)
+    return (half_rtz(ch0), half_rtz(ch1), half_rtz(ch2), half_rtz(ch3))
+
+
+def check_dpp_draw(directory, compiler, renderer, backend):
+    program = with_constants(DPP_BODY)
+    source = directory / "dpp.hlsl"
+    shader = directory / "dpp.cso"
+    case = directory / "dpp.case"
+    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    source.write_text(translate(program), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    for a, b, h_bits, c in DPP_SETS:
+        constants = bytearray(256)
+        struct.pack_into("<2fIf", constants, 12, a, b, h_bits, c)
+        expected = dpp_reference(a, b, h_bits, c)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+    for set_idx, old, new, label in (
+        (0, "v_sub_f32_dpp v21, v20, v20 quad_perm:[1,0,3,2]",
+         "v_sub_f32_dpp v21, v20, v20 quad_perm:[2,3,0,1]", "AcrossX vs AcrossY"),
+        (0, "v_sub_f32_dpp v22, v20, v20 quad_perm:[2,3,0,1]",
+         "v_sub_f32_dpp v22, v20, v20 quad_perm:[1,0,3,2]", "AcrossY vs AcrossX"),
+        (0, "dpp8:[1,2,3,0,5,6,7,4]", "dpp8:[3,0,1,2,7,4,5,6]", "cyclic dpp8 rotation"),
+        (0, "v_mul_f32_dpp v31, v20, v28 quad_perm:[3,3,3,3]",
+         "v_mul_f32_dpp v31, v20, v28 quad_perm:[1,1,1,1]", "lane broadcast"),
+        (0, "v_min_f32_dpp v33, -v31, v30", "v_min_f32_dpp v33, v31, v30", "DPP16 neg modifier"),
+        (1, "v_floor_f32_dpp v36, v35", "v_ceil_f32_dpp v36, v35", "floor vs ceil DPP"),
+    ):
+        a, b, h_bits, c = DPP_SETS[set_idx]
+        constants = bytearray(256)
+        struct.pack_into("<2fIf", constants, 12, a, b, h_bits, c)
+        expected = dpp_reference(a, b, h_bits, c)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        mutated = [line.replace(old, new) for line in program]
+        assert mutated != program, label
+        source.write_text(translate(mutated), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Mutation of {label} escaped detection")
+
+
 def check_controls(directory):
     check_scheduling_hints()
     check_constant_descriptor_bounds()
@@ -1307,6 +1417,43 @@ def check_controls(directory):
     cnd_pos = sel.index("v_cndmask_b32_e64 v13, v13, s46, s[52:53]")
     must_reject(translate, sel[:cnd_pos] + ["s_not_b64 s[52:53], 0"] + sel[cnd_pos:])
 
+    # Quad-local DPP16 and DPP8 controls.
+    dpp = with_constants(DPP_BODY)
+    source = translate(dpp)
+    for expected in ("QuadReadAcrossX(", "QuadReadAcrossY(", "QuadReadAcrossDiagonal(",
+                     "QuadReadLaneAt(", "WaveGetLaneIndex() & 3u"):
+        assert expected in source, expected
+    # Accept optional bound_ctrl:[01] and fi:[01] on quad-local DPP16/DPP8.
+    assert "QuadReadAcrossX(" in translate(with_constants([
+        "v_mov_b32_dpp v12, v13 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:1 fi:1",
+    ]))
+    assert "QuadReadAcrossX(" in translate(with_constants([
+        "v_mov_b32_dpp v12, v13 dpp8:[1,0,3,2,5,4,7,6] fi:1",
+    ]))
+    for bad in (
+        "v_mov_b32_dpp v22, v18 dpp8:[4,5,6,7,0,1,2,3]",  # cross-quad DPP8
+        "v_mov_b32_dpp v22, v18 dpp8:[1,0,3,2,4,5,6,7]",  # mismatched high-quad perm
+        "v_mov_b32_dpp v22, v18 row_shr:1 row_mask:0xf bank_mask:0xf",  # non-quad DPP16
+        "v_mov_b32_dpp v22, v18 wave_shr:1 row_mask:0xf bank_mask:0xf",
+        "v_mov_b32_dpp v22, v18 quad_perm:[1,0,3,2] row_mask:0xe bank_mask:0xf",  # partial row_mask
+        "v_mov_b32_dpp v22, v18 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0x7",  # partial bank_mask
+        "v_mov_b32_dpp v22, -v18 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",  # neg on mov
+        "v_add_f32_dpp v22, -v18, v19 dpp8:[1,0,3,2,5,4,7,6]",  # neg on DPP8
+        "v_add_f32_dpp v22, s44, v19 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",  # SGPR in DPP
+        "v_add_f32_dpp v22, 1.0, v19 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",  # inline const in DPP
+        "v_cndmask_b32_dpp v22, v18, v19, s52 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",  # non-vcc
+        "v_cndmask_b32_dpp v22, v18, v19, vcc_lo quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",  # untracked vcc
+        "v_fmac_f32_dpp v25, v18, v19 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",  # unset fmac dst
+        "v_add_f32_dpp v256, v18, v19 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+        "v_add_nc_u32_dpp v22, v18, v19 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",  # unsupported DPP op
+    ):
+        must_reject(translate, with_constants(["v_mov_b32_e32 v18, s44", "v_mov_b32_e32 v19, s45", bad]))
+    wait_vm = dpp.index("s_waitcnt vmcnt(0)")
+    must_reject(translate, dpp[:wait_vm] + ["v_mov_b32_dpp v12, v8 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"] + dpp[wait_vm:])
+    must_reject(translate, dpp[:wait_vm] + ["v_mov_b32_dpp v22, v12 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"] + dpp[wait_vm:])
+    wqm_idx = dpp.index("s_wqm_b64 exec, exec") + 1
+    must_reject(translate, dpp[:wqm_idx] + ["v_mov_b32_dpp v22, v8 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"] + dpp[wqm_idx:])
+
 
 def check_binary(directory, assembler, objcopy, library):
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
@@ -1320,6 +1467,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((dual_program(swap_weights=True), translate_dual))
     fixtures.append((with_constants(LITERAL_FMA_BODY), translate))
     fixtures.append((scheduling_hints(), translate))
+    fixtures.append((with_constants(DPP_BODY), translate))
     for index, (instructions, lower_fixture) in enumerate(fixtures):
         source = directory / "fixture.s"
         obj = directory / "fixture.o"
@@ -1368,6 +1516,7 @@ def check_ceiling_draws(directory, compiler, renderer, backend):
 def check_render(directory, compiler, renderer, backend):
     check_movk_draw(directory, compiler, renderer, backend)
     check_half_draw(directory, compiler, renderer, backend)
+    check_dpp_draw(directory, compiler, renderer, backend)
     for swap in (False, True):
         source = directory / "fixture.hlsl"
         shader = directory / "fixture.cso"

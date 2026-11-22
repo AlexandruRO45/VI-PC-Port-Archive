@@ -181,6 +181,7 @@ ALU = {
     "mul_legacy": (2, "(({0} == 0 || {1} == 0) ? 0.0f : {0} * {1})"),
     "fma": (3, "mad({0}, {1}, {2})"), "fmac": (3, "mad({0}, {1}, {2})"),
 }
+DPP_ALU = {k: v for k, v in ALU.items() if k != "fma"}
 # N-prefixed predicates include unordered operands. Keep NLG's NaN case explicit in DXIL.
 COMPARE = {
     "f": "false", "tru": "true",
@@ -350,6 +351,99 @@ def fp_operand(token, scalar, vector, pending, sample_pending):
     if re.fullmatch(r"\d+\.\d+", token):
         return token + "f"
     raise ValueError(f"Unsupported arithmetic operand {token}")
+
+
+def dpp_vgpr(token, vector, sample_pending, *, allow_mods):
+    """Parse one DPP VGPR operand (allowing completed uv.* interpolation outputs in DPP)."""
+    neg = False
+    use_abs = False
+    raw = token
+    if raw.startswith("-"):
+        if not allow_mods:
+            raise ValueError(f"Source modifiers are not allowed on {token}")
+        neg = True
+        raw = raw[1:]
+    if m := re.fullmatch(r"abs\(([^()|]+)\)|\|([^()|]+)\|", raw):
+        if not allow_mods:
+            raise ValueError(f"Source modifiers are not allowed on {token}")
+        use_abs = True
+        raw = m.group(1) or m.group(2)
+    m = re.fullmatch(r"v(\d+)", raw)
+    if not m or not 0 <= int(m.group(1)) <= 255:
+        raise ValueError(f"DPP operand must be a VGPR, got {token}")
+    value = vector[raw]
+    if not isinstance(value, str) or not value.startswith(("sample", "alu", "uv.")):
+        raise ValueError(f"Expected a numeric VGPR in DPP, got {raw}")
+    if sample_pending and value.startswith("sample"):
+        raise ValueError("Sample used before vmcnt wait")
+    return value, use_abs, neg
+
+
+def parse_dpp(rest, operand_count):
+    """Parse operands and quad-local DPP16 (quad_perm) or DPP8 (dpp8) modifiers."""
+    parts_ = rest.split(", ")
+    if len(parts_) != operand_count:
+        raise ValueError("Invalid DPP operand count")
+    last_op, _, mod_text = parts_[-1].partition(" ")
+    operands = [*parts_[:-1], last_op]
+    mods = mod_text.split()
+    if not mods:
+        raise ValueError("Missing DPP control modifiers")
+    if m := re.fullmatch(r"dpp8:\[([0-7](?:,[0-7]){7})\]", mods[0]):
+        perm8 = [int(b) for b in m.group(1).split(",")]
+        seen_fi = False
+        for mod in mods[1:]:
+            if re.fullmatch(r"fi:[01]", mod) and not seen_fi:
+                seen_fi = True
+            else:
+                raise ValueError(f"Unsupported DPP8 modifier {mod}")
+        if not all(p < 4 for p in perm8[:4]) or perm8[4:] != [p + 4 for p in perm8[:4]]:
+            raise ValueError(f"Cross-quad DPP8 permutation is unsupported: {mods[0]}")
+        return operands, perm8[:4], True
+    if m := re.fullmatch(r"quad_perm:\[([0-3],[0-3],[0-3],[0-3])\]", mods[0]):
+        perm4 = [int(b) for b in m.group(1).split(",")]
+        seen = set()
+        for mod in mods[1:]:
+            if mod in ("row_mask:0xf", "bank_mask:0xf"):
+                key = mod.split(":", 1)[0]
+                if key in seen:
+                    raise ValueError(f"Duplicate DPP16 modifier {mod}")
+                seen.add(key)
+            elif re.fullmatch(r"(bound_ctrl|fi):[01]", mod):
+                key = mod.split(":", 1)[0]
+                if key in seen:
+                    raise ValueError(f"Duplicate DPP16 modifier {mod}")
+                seen.add(key)
+            else:
+                raise ValueError(f"Unsupported DPP16 modifier {mod}")
+        return operands, perm4, False
+    raise ValueError(f"Unsupported DPP control {mods[0]}")
+
+
+def emit_quad_swizzle_u32(lines, idx, base_expr, perm):
+    """Swizzle a 32-bit value across a 2x2 quad as uint bits so subnormals/bit patterns stay exact."""
+    bits = f"asuint({base_expr})"
+    if perm == [0, 1, 2, 3]:
+        return bits
+    if perm == [1, 0, 3, 2]:
+        return f"QuadReadAcrossX({bits})"
+    if perm == [2, 3, 0, 1]:
+        return f"QuadReadAcrossY({bits})"
+    if perm == [3, 2, 1, 0]:
+        return f"QuadReadAcrossDiagonal({bits})"
+    if len(set(perm)) == 1:
+        return f"QuadReadLaneAt({bits}, {perm[0]})"
+    lines.append(f"    uint dpp{idx}_in = {bits};")
+    lines.append(f"    uint dpp{idx}_q = WaveGetLaneIndex() & 3u;")
+    lane_vars = {}
+    for lane in sorted(set(perm)):
+        lv = f"dpp{idx}_l{lane}"
+        lines.append(f"    uint {lv} = QuadReadLaneAt(dpp{idx}_in, {lane});")
+        lane_vars[lane] = lv
+    l0, l1, l2, l3 = (lane_vars[p] for p in perm)
+    svar = f"dpp{idx}_s"
+    lines.append(f"    uint {svar} = (dpp{idx}_q == 0u ? {l0} : (dpp{idx}_q == 1u ? {l1} : (dpp{idx}_q == 2u ? {l2} : {l3})));")
+    return svar
 
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *, second_texture_offset=None):
@@ -647,6 +741,61 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(rf"v_(mov_b32|cvt_f32_f16|cndmask_b32|(?:{'|'.join(DPP_ALU)})_f32)_dpp (v\d+), (.+)"):
+            op, dst, rest = m.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid DPP operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            if op in ("mov_b32", "cvt_f32_f16"):
+                operand_count = 1
+            elif op == "cndmask_b32":
+                operand_count = 3
+            else:
+                base_op = op[:-4]
+                operand_count = 2 if base_op == "fmac" else DPP_ALU[base_op][0]
+            tokens, perm, is_dpp8 = parse_dpp(rest, operand_count)
+            allow_mods = (not is_dpp8) and op not in ("mov_b32", "cndmask_b32")
+            src0_val, abs0, neg0 = dpp_vgpr(tokens[0], vector, sample_pending, allow_mods=allow_mods)
+            swz_bits = emit_quad_swizzle_u32(lines, i, src0_val, perm)
+            if op == "mov_b32":
+                expr = f"asfloat({swz_bits})"
+            elif op == "cvt_f32_f16":
+                expr = f"widen16({swz_bits})"
+                if abs0:
+                    expr = f"abs({expr})"
+                if neg0:
+                    expr = f"(-{expr})"
+            elif op == "cndmask_b32":
+                src1_val, _, _ = dpp_vgpr(tokens[1], vector, sample_pending, allow_mods=False)
+                if tokens[2] not in ("vcc", "vcc_lo"):
+                    raise ValueError(f"v_cndmask_b32_dpp requires vcc/vcc_lo, got {tokens[2]}")
+                condition = scalar.get("vcc")
+                if not isinstance(condition, tuple) or condition[0] != "condition" or condition[3] != 1:
+                    raise ValueError("Select mask is not a tracked comparison")
+                expr = f"{condition[1]} ? {src1_val} : asfloat({swz_bits})"
+            else:
+                base_op = op[:-4]
+                s0 = f"asfloat({swz_bits})"
+                if abs0:
+                    s0 = f"abs({s0})"
+                if neg0:
+                    s0 = f"(-{s0})"
+                args = [s0]
+                if operand_count == 2:
+                    src1_val, abs1, neg1 = dpp_vgpr(tokens[1], vector, sample_pending, allow_mods=allow_mods)
+                    s1 = src1_val
+                    if abs1:
+                        s1 = f"abs({s1})"
+                    if neg1:
+                        s1 = f"(-{s1})"
+                    args.append(s1)
+                if base_op == "fmac":
+                    acc_val, _, _ = dpp_vgpr(dst, vector, sample_pending, allow_mods=False)
+                    args.append(acc_val)
+                expr = DPP_ALU[base_op][1].format(*args)
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = {expr};")
         elif m := match(r"v_cvt_pkrtz_f16_f32_e32 (v\d+), (v\d+), (v\d+)"):
             dst, lo, hi = m.groups()
             pair = (vector[lo], vector[hi])
