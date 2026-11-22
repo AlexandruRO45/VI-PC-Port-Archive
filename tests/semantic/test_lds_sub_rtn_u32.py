@@ -89,6 +89,26 @@ def compute_sub_sign_u32(a: int, b: int) -> int:
     return 1 if bool(u32(a - b) & 0x80000000) else 0
 
 
+def bits_to_f32(bits: int) -> float:
+    """Interpret 32-bit unsigned integer as IEEE 754 single-precision float."""
+    return struct.unpack("<f", struct.pack("<I", bits & MASK32))[0]
+
+
+def f32_to_bits(val: float) -> int:
+    """Pack IEEE 754 single-precision float into 32-bit unsigned integer."""
+    return struct.unpack("<I", struct.pack("<f", val))[0]
+
+
+def is_f32_nan(bits: int) -> bool:
+    """Test if 32-bit bit pattern represents an IEEE 754 NaN."""
+    return (bits & 0x7F800000) == 0x7F800000 and (bits & 0x007FFFFF) != 0
+
+
+def is_f32_subnormal(bits: int) -> bool:
+    """Test if 32-bit bit pattern represents an IEEE 754 subnormal float."""
+    return (bits & 0x7F800000) == 0 and (bits & 0x007FFFFF) != 0
+
+
 def ref_ds_sub_rtn_u32(
     mem: LDSMemory,
     vaddr: int,
@@ -676,6 +696,89 @@ class TestConditionCodesAndBorrow(unittest.TestCase):
 
         self.assertEqual(compute_sub_sign_u32(10, 20), 1)
         self.assertEqual(compute_sub_sign_u32(20, 10), 0)
+
+
+class TestIEEE754BitPatternHandling(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+
+    def test_float_helper_utilities(self) -> None:
+        self.assertTrue(is_f32_nan(QNAN_F32))
+        self.assertTrue(is_f32_nan(SNAN_F32))
+        self.assertFalse(is_f32_nan(POS_INF_F32))
+        self.assertFalse(is_f32_nan(POS_ZERO_F32))
+
+        self.assertTrue(is_f32_subnormal(MIN_SUBNORMAL_F32))
+        self.assertTrue(is_f32_subnormal(MAX_SUBNORMAL_F32))
+        self.assertFalse(is_f32_subnormal(MIN_NORMAL_F32))
+        self.assertFalse(is_f32_subnormal(POS_ZERO_F32))
+
+    def test_zeros_handling(self) -> None:
+        state = ScalarMachineState(lds_dwords=256)
+        state.lds.write_dword(1, POS_ZERO_F32)
+        state.set_vgpr(1, 4)
+        state.set_vgpr(2, NEG_ZERO_F32)
+
+        instr = DSSubRtnInstruction(
+            dst=RegisterOperand(0),
+            addr=RegisterOperand(1),
+            data=RegisterOperand(2),
+        )
+        old_val = self.interp.execute(instr, state)
+
+        self.assertEqual(old_val, POS_ZERO_F32)
+        self.assertEqual(state.get_vgpr(0), POS_ZERO_F32)
+        self.assertEqual(state.lds.read_dword(1), NEG_ZERO_F32)
+
+    def test_infinities_handling(self) -> None:
+        state = ScalarMachineState(lds_dwords=256)
+        state.lds.write_dword(2, POS_INF_F32)
+        state.set_vgpr(1, 8)
+        state.set_vgpr(2, 1)
+
+        instr = DSSubRtnInstruction(
+            dst=RegisterOperand(0),
+            addr=RegisterOperand(1),
+            data=RegisterOperand(2),
+        )
+        old_val = self.interp.execute(instr, state)
+
+        self.assertEqual(old_val, POS_INF_F32)
+        self.assertEqual(state.lds.read_dword(2), MAX_NORMAL_F32)
+
+    def test_nans_payload_preservation_without_quietening(self) -> None:
+        state = ScalarMachineState(lds_dwords=256)
+        state.lds.write_dword(3, SNAN_F32)
+        state.set_vgpr(1, 12)
+        state.set_vgpr(2, 1)
+
+        instr = DSSubRtnInstruction(
+            dst=RegisterOperand(0),
+            addr=RegisterOperand(1),
+            data=RegisterOperand(2),
+        )
+        old_val = self.interp.execute(instr, state)
+
+        self.assertEqual(old_val, SNAN_F32)
+        self.assertEqual(state.lds.read_dword(3), POS_INF_F32)
+
+    def test_subnormals_without_flushing_to_zero(self) -> None:
+        state = ScalarMachineState(lds_dwords=256)
+        state.lds.write_dword(4, MIN_SUBNORMAL_F32)
+        state.set_vgpr(1, 16)
+        state.set_vgpr(2, MIN_SUBNORMAL_F32)
+
+        instr = DSSubRtnInstruction(
+            dst=RegisterOperand(0),
+            addr=RegisterOperand(1),
+            data=RegisterOperand(2),
+        )
+        old_val = self.interp.execute(instr, state)
+
+        self.assertEqual(old_val, MIN_SUBNORMAL_F32)
+        self.assertEqual(state.lds.read_dword(4), 0)
 
 
 if __name__ == '__main__':
