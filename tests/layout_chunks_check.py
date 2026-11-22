@@ -112,6 +112,7 @@ def check_decode_torrent():
     assert decoded[b"info"][b"piece length"] == 262144
     assert len(decoded[b"info"][b"files"]) == 2
     assert decode_torrent(b"d1:Z1:x1:a1:ye") == {b"Z": b"x", b"a": b"y"}
+    assert decode_torrent(b"l" * 32 + b"e" * 32) is not None
 
     for malformed in (
         b"",
@@ -138,6 +139,9 @@ def check_decode_torrent():
         b"d1:a1:x",
         b"l1:x",
         b"i0ei1e",
+        b"l" * 5000 + b"e" * 5000,
+        b"l" * 5000,
+        b"d1:a" * 5000,
     ):
         try:
             decode_torrent(malformed)

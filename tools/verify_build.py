@@ -11,10 +11,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+MAX_TORRENT_DEPTH = 64
+
+
 def decode_torrent(data):
     offset = 0
 
-    def read():
+    def read(depth=0):
         nonlocal offset
         token = data[offset:offset + 1]
         offset += 1
@@ -26,19 +29,23 @@ def decode_torrent(data):
             value = int(raw)
             offset = end + 1
         elif token == b"d":
+            if depth >= MAX_TORRENT_DEPTH:
+                raise ValueError("Torrent nesting too deep")
             value = {}
             previous_key = None
             while data[offset:offset + 1] != b"e":
-                key = read()
+                key = read(depth + 1)
                 if not isinstance(key, bytes) or (previous_key is not None and key <= previous_key):
                     raise ValueError("Invalid torrent dictionary key")
                 previous_key = key
-                value[key] = read()
+                value[key] = read(depth + 1)
             offset += 1
         elif token == b"l":
+            if depth >= MAX_TORRENT_DEPTH:
+                raise ValueError("Torrent nesting too deep")
             value = []
             while data[offset:offset + 1] != b"e":
-                value.append(read())
+                value.append(read(depth + 1))
             offset += 1
         elif token.isdigit():
             end = data.index(b":", offset)
