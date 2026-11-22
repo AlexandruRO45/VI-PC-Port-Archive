@@ -107,5 +107,113 @@ class TestAndOrB32ModelAndOracle(unittest.TestCase):
             self.assertEqual(oracle_v_and_or_b32(a, b, c), oracle_v_and_or_b32(b, a, c))
 
 
+
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+
+
+@dataclass(frozen=True)
+class Reg:
+    """Represents an architectural 32-bit register (VGPR or SGPR)."""
+    index: int
+    reg_type: RegType
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"Register index {self.index} out of range [0, 255]")
+
+    @property
+    def name(self) -> str:
+        prefix = "v" if self.reg_type == RegType.VGPR else "s"
+        return f"{prefix}{self.index}"
+
+
+@dataclass(frozen=True)
+class Literal32:
+    """Represents a 32-bit integer literal or inline constant."""
+    value: int
+
+    def __post_init__(self) -> None:
+        if not (-0x8000_0000 <= self.value <= 0xFFFF_FFFF):
+            raise ValueError(f"Literal32 value {self.value} out of 32-bit range")
+
+    @property
+    def name(self) -> str:
+        return f"0x{self.value & MASK32:08X}" if self.value > 9 or self.value < 0 else str(self.value)
+
+
+@dataclass(frozen=True)
+class VOP3Operand:
+    """Typed expression operand representing a register or literal source."""
+    source: Union[Reg, Literal32]
+
+    def disassemble(self) -> str:
+        return self.source.name
+
+
+class Opcode(Enum):
+    V_AND_OR_B32 = "v_and_or_b32"
+
+
+@dataclass(frozen=True)
+class VAndOrB32Instruction:
+    """Symbolic AST node representing an RDNA2 v_and_or_b32 VALU instruction."""
+    dst: Reg
+    src0: VOP3Operand
+    src1: VOP3Operand
+    src2: VOP3Operand
+    opcode: Opcode = Opcode.V_AND_OR_B32
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination of VALU instruction must be VGPR, got {self.dst.reg_type}")
+
+    def disassemble(self) -> str:
+        return f"{self.opcode.value} {self.dst.name}, {self.src0.disassemble()}, {self.src1.disassemble()}, {self.src2.disassemble()}"
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_register_creation_and_disassembly(self) -> None:
+        v0 = Reg(0, RegType.VGPR)
+        s5 = Reg(5, RegType.SGPR)
+        self.assertEqual(v0.name, "v0")
+        self.assertEqual(s5.name, "s5")
+
+    def test_register_bounds_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            Reg(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(256, RegType.VGPR)
+
+    def test_literal_operand(self) -> None:
+        lit = Literal32(0x1234)
+        self.assertEqual(lit.name, "0x00001234")
+        lit_small = Literal32(7)
+        self.assertEqual(lit_small.name, "7")
+
+    def test_instruction_disassembly(self) -> None:
+        dst = Reg(0, RegType.VGPR)
+        src0 = VOP3Operand(Reg(1, RegType.VGPR))
+        src1 = VOP3Operand(Reg(2, RegType.VGPR))
+        src2 = VOP3Operand(Literal32(0xFF))
+
+        inst = VAndOrB32Instruction(dst=dst, src0=src0, src1=src1, src2=src2)
+        self.assertEqual(inst.disassemble(), "v_and_or_b32 v0, v1, v2, 0x000000FF")
+
+    def test_instruction_validation(self) -> None:
+        dst_sgpr = Reg(0, RegType.SGPR)
+        src = VOP3Operand(Reg(1, RegType.VGPR))
+        with self.assertRaises(TypeError):
+            VAndOrB32Instruction(dst=dst_sgpr, src0=src, src1=src, src2=src)
+
+
 if __name__ == "__main__":
     unittest.main()
+
