@@ -153,6 +153,9 @@ def step(state, ins, wave64=False):
         # A mask only when every source is one (or a constant 0 / -1) on every path: no EITHER for VGPRs, whose
         # plain writes skip inactive lanes. The sources are looked at first: the destination can be one of them.
         kinds = [kind(state, x) for x in a[1:]] if op in VECTOR_BITWISE and a[0].get("n", 1) == 1 else [None]
+        if op == "v_mov_b32" and a[1]["k"] != "vgpr":
+            kinds = [None]      # v_mov_b32 vN, <mask SGPR / VCC / EXEC> writes the wave's bits to the active lanes, as
+                                # data: data_reads gathers them before the copy, the store is EXEC-gated (#210, #2290)
         written = range(a[0]["r"], a[0]["r"] + a[0].get("n", 1))
         vw = {k for k in state if isinstance(k, tuple) and k[0] == "vw"}
         for key in [k for k in state if isinstance(k, tuple) and k[1] in written]:
@@ -240,7 +243,8 @@ def data_reads(ins, state):
     if op.startswith(("s_", "v_")) and not op.startswith("v_cmp") and a[0]["k"] == "special" and \
             a[0].get("t", "").startswith(("exec", "vcc")):
         return {}
-    if op.startswith(BITWISE) or (op in VECTOR_BITWISE and a[0].get("n", 1) == 1):
+    if op.startswith(BITWISE) or (op in VECTOR_BITWISE and a[0].get("n", 1) == 1 and
+                                  not (op == "v_mov_b32" and a[1]["k"] != "vgpr")):
         kinds = [kind(state, x) for x in a[1:]]
         if None not in kinds and any(k in MASK_KINDS for k in kinds):
             return {}                                   # the result is a mask too
