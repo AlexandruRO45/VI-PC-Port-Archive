@@ -150,7 +150,7 @@ Do not work around this by stubbing `cl`, MASM, D3D12, or WARP to make CMake con
 
 ### Compile check with msvc-wine
 
-[msvc-wine](https://github.com/mstorsjo/msvc-wine) runs the real MSVC toolchain and Windows SDK under Wine. This is not a stub, so you can use it to confirm that a C++ or HLSL change compiles with `cl` and DXC before Windows CI runs. Its `vsdownload.py` asks you to accept the Visual Studio Build Tools license.
+[msvc-wine](https://github.com/mstorsjo/msvc-wine) runs the real MSVC toolchain and Windows SDK under Wine. This is not a stub, so you can use it to confirm that a C++ or HLSL change compiles with `cl` and DXC before Windows CI runs. Review the Visual Studio Build Tools license before using the unattended acceptance option below.
 
 ```bash
 python3 vsdownload.py --accept-license --dest ~/.local/msvc
@@ -164,7 +164,7 @@ The SDK's `dxc.exe` is not wrapped. Save this script as `~/.local/msvc/bin/x64/d
 DXC="$HOME/.local/msvc/Windows Kits/10/bin/10.0.26100.0/x64/dxc.exe"
 args=()
 for a in "$@"; do
-  if [[ $a == /* && -e $(dirname "$a") ]]; then args+=("z:${a//\//\\}"); else args+=("$a"); fi
+  if [[ -e $a && $a == /* || $a == /*/* && -d ${a%/*} ]]; then args+=("z:${a//\//\\}"); else args+=("$a"); fi
 done
 WINEDEBUG=-all exec wine "$DXC" "${args[@]}"
 ```

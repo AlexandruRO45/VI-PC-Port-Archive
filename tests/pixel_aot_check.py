@@ -63,7 +63,7 @@ def assembly(swap):
     ]
 
 
-DUAL_CASES = ("forward", "reverse", "reuse")
+DUAL_CASES = ("forward", "reverse", "reuse", "partial")
 
 
 def dual_program(case="forward", *, swap_weights=False):
@@ -77,8 +77,8 @@ def dual_program(case="forward", *, swap_weights=False):
         program[first:first+1] = [sample_a, "s_waitcnt vmcnt(0)",
                                   load_b.replace("56:63", "28:35"), "s_waitcnt lgkmcnt(0)",
                                   sample_b.replace("56:63", "28:35")]
-    elif case in ("forward", "reverse"):
-        program[first:first+1] = [sample_a, sample_b] if case == "forward" else [sample_b, sample_a]
+    elif case in ("forward", "reverse", "partial"):
+        program[first:first+1] = [sample_a, sample_b] if case != "reverse" else [sample_b, sample_a]
         program.insert(program.index("s_mov_b32 s40, 1"), load_b)
     else:
         raise ValueError(f"Unknown dual-texture case: {case}")
@@ -88,6 +88,12 @@ def dual_program(case="forward", *, swap_weights=False):
     for i in range(4):
         ops.extend([f"v_mul_legacy_f32_e32 v{12+i}, {a}, v{12+i}",
                     f"v_fma_f32 v{12+i}, {b}, v{20+i}, v{12+i}"])
+    if case == "partial":
+        # Scale A's red channel while B is still outstanding.
+        wait = program.index("s_waitcnt vmcnt(0)")
+        first_mul = ops.pop(0).replace(", v12", ", v24")
+        program[wait:wait] = ["s_waitcnt vmcnt(1)", "v_mov_b32_e32 v24, v12", first_mul]
+        pos += 3
     program[pos:pos] = ops
     return program
 
@@ -103,7 +109,8 @@ def shader_record(blob: bytes, name: bytes) -> bytes:
             + struct.pack("<4I", len(payload), 0, len(payload), len(blob)) + payload)
 
 
-def envelope(code: bytes, name: bytes = b"fixture", *, private_data: bytes | None = None, directory_end=None) -> bytes:
+def envelope(code: bytes, name: bytes = b"fixture", *, private_data: bytes | None = None, directory_end=None,
+             compute_width=None) -> bytes:
     program_start = 288 if directory_end is not None else 256
     image = bytearray(program_start) + code
     image[:4] = b"FSSM"
@@ -116,7 +123,15 @@ def envelope(code: bytes, name: bytes = b"fixture", *, private_data: bytes | Non
     native = b"XBCH" + bytes(12) + struct.pack("<II", len(image), 0) + zlib.compress(image)
     program = (bytes(24) + b"XDAT" + struct.pack("<II", 1, 0)
                + struct.pack("<III", 13, 48, len(native)) + native)
+    if compute_width is not None:
+        program = program[:2] + struct.pack("<H", 5) + program[4:]
     sections = [b"DXIL" + struct.pack("<I", len(program)) + program]
+    if compute_width is not None:
+        psv = bytearray(52)
+        struct.pack_into("<I", psv, 0, 48)
+        psv[28] = 5
+        struct.pack_into("<3I", psv, 40, compute_width, 1, 1)
+        sections.append(b"PSV0" + struct.pack("<I", len(psv)) + psv)
     if private_data is not None:
         sections.append(b"PRIV" + struct.pack("<I", len(private_data)) + private_data)
     offset = 32 + 4 * len(sections)
@@ -542,6 +557,37 @@ def fract_values():
         "v_fract_f32_e64 v14, -|s46|",
         "v_fract_f32_e32 v15, s47",
     ])
+
+
+RECIPROCAL_BODY = [
+    "v_rcp_f32_e64 v12, |s44|",
+    "v_rcp_f32_e64 v13, -|s45|",
+    "v_rsq_f32_e64 v14, |s46|",
+    "v_rsq_f32_e64 v15, |s47| clamp",
+]
+
+
+def check_reciprocal_draw(directory, compiler, renderer, backend):
+    source = directory / "reciprocal.hlsl"
+    shader = directory / "reciprocal.cso"
+    case = directory / "reciprocal.case"
+    constants = bytearray(256)
+    struct.pack_into("<4f", constants, 12, -4.0, 8.0, -16.0, -0.25)
+    case.write_bytes(constants + struct.pack("<4f", 0.25, -0.125, 0.25, 1.0) * 64)
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    for mutation in (False, True):
+        body = RECIPROCAL_BODY.copy()
+        if mutation:
+            # 1 / abs(-16) is 1/16, while its reciprocal square root is 1/4.
+            body[2] = body[2].replace("v_rsq", "v_rcp")
+        source.write_text(translate(with_constants(body)), encoding="ascii")
+        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        if mutation:
+            wrong = subprocess.run(draw, capture_output=True, text=True)
+            if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+                raise AssertionError("Substituting reciprocal for reciprocal square root escaped detection")
+        else:
+            subprocess.run(draw, check=True)
 
 
 def check_fract_draw(directory, compiler, renderer, backend):
@@ -1488,6 +1534,20 @@ def check_adapter_skip(directory: Path) -> None:
         assert check_render(work, compiler, renderer, "hardware") == 77
 
 
+def attribute_color(rg):
+    code = ["s_mov_b32 s30, s14", "s_mov_b32 m0, s30"]
+    for phase in (1, 2):
+        for i, channel in enumerate("wzxy"):
+            code.append(f"v_interp_p{phase}_f32_e32 v{8+i}, v{phase-1}, attr0.{channel}")
+    code.extend(["v_cvt_pkrtz_f16_f32_e32 v12, v8, v9", "v_cvt_pkrtz_f16_f32_e32 v13, v10, v11"])
+    tail = "off, off" if rg else "v13, v13"
+    return code + [f"exp mrt0 v12, v12, {tail} done compr vm", "s_endpgm"]
+
+
+def translate_attribute(code):
+    return lower(code, 8, 14, None)
+
+
 def buffer_color(rg):
     # Use a copied low table address and an explicit zero high word.
     tail = "off, off" if rg else "v26, v26"
@@ -1568,6 +1628,35 @@ def check_controls(directory):
     for invalid in (record[:-1], record + b"\0" + record, envelope(code + code)):
         archive.write_bytes(invalid)
         must_reject(native_program, archive, "fixture")
+
+    partial = dual_program("partial")
+    wait = partial.index("s_waitcnt vmcnt(1)")
+    # Keep the early read of A but issue B first. Now A is still pending.
+    reversed_samples = partial.copy()
+    reversed_samples[wait - 2:wait] = reversed(reversed_samples[wait - 2:wait])
+    must_reject(translate_dual, reversed_samples)
+    for count in (2, 63):
+        changed = partial.copy()
+        changed[wait] = f"s_waitcnt vmcnt({count})"
+        must_reject(translate_dual, changed)
+    for early_use in ("v_mov_b32_e32 v24, v20", "v_mov_b32_e32 v20, v12",
+                      "v_mul_legacy_f32_e32 v12, 1.0, v20",
+                      "v_cvt_pkrtz_f16_f32_e32 v24, v12, v20"):
+        changed = partial.copy()
+        changed.insert(wait + 1, early_use)
+        must_reject(translate_dual, changed)
+    # Each of B's four destinations remains protected from a constant write.
+    for reg in range(20, 24):
+        changed = partial.copy()
+        changed.insert(wait + 1, f"v_mov_b32_e32 v{reg}, 0")
+        must_reject(translate_dual, changed)
+    # Packing A is legal here even though B is outstanding.
+    translate_dual(partial[:wait + 1] + ["v_cvt_pkrtz_f16_f32_e32 v24, v12, v13"] + partial[wait + 1:])
+    # A larger legal wait after draining does not invalidate completed samples.
+    end_wait = partial.index("s_waitcnt vmcnt(0)")
+    drained = partial[:end_wait + 1] + ["s_waitcnt vmcnt(63)"] + partial[end_wait + 1:]
+    translate_dual(drained)
+    must_reject(translate_dual, [op.replace("vmcnt(63)", "vmcnt(64)") for op in drained])
 
     # LLVM 15 prints "exp mrt0 v16, ..."; newer LLVM prints "exp mrt0, v16, ...".
     for program in (assembly(False), assembly(True), curve(), shaping(), arithmetic(), three_way()):
@@ -1950,6 +2039,7 @@ def check_binary(directory, assembler, objcopy, library):
                 (truncate_values(), translate), (affine_coordinates(), translate), (ceiling(), translate),
                 (scalar64(), translate)]
     fixtures.append((with_constants(CLASS_BODY), translate))
+    fixtures.append((with_constants(RECIPROCAL_BODY), translate))
     fixtures.append((fract_values(), translate))
     fixtures.extend([(frexp_mant_values(), translate), (ldexp_values(), translate)])
     fixtures.append((three_way(), translate))
@@ -1968,6 +2058,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((with_constants(LITERAL_FMA_BODY), translate))
     fixtures.append((scheduling_hints(), translate))
     fixtures.extend((buffer_color(rg), translate_buffer_color) for rg in (False, True))
+    fixtures.extend((attribute_color(rg), translate_attribute) for rg in (False, True))
     for index, (instructions, lower_fixture) in enumerate(fixtures):
         source = directory / "fixture.s"
         obj = directory / "fixture.o"
@@ -2358,6 +2449,7 @@ def check_render(directory, compiler, renderer, backend):
         raise AssertionError("Swapped blend weights escaped detection")
     check_cube_draw(directory, compiler, renderer, backend)
     check_fract_draw(directory, compiler, renderer, backend)
+    check_reciprocal_draw(directory, compiler, renderer, backend)
     check_int_minmax_draws(directory, compiler, renderer, backend)
 
     check_frexp_ldexp_draws(directory, compiler, renderer, backend)
