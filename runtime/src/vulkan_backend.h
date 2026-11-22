@@ -2394,7 +2394,9 @@ private:
         }
         replay.bindless_set = context_.bindless_current_ ? context_.bindless_current_() : VK_NULL_HANDLE;
         const bool bindless_uploaded = std::exchange(context_.bindless_upload_pending_, false);
-        auto next_tracker = context_.tracker_;
+        // Mutate context_.tracker_ in place under tracker_lock with an O(touched) undo journal instead of cloning the
+        // entire device texture map on every ExecuteCommandLists.
+        LayoutTracker::Transaction tracker_tx(context_.tracker_);
         // Bindless images that may already be visible to shaders are initialized on a submission that runs shaders.
         // initialize() zeroes committed storage images and only transitions sparse images.
         bool runs_shaders = false;
@@ -2439,15 +2441,15 @@ private:
             const ResourceBinding* image = context_.resolve(id);
             if (!image || !image->image) continue;
             const VkImageSubresourceRange range{image->aspects, 0, image->mip_levels, 0, image->array_layers};
-            auto pieces = detail::current(&next_tracker, id, range, VK_IMAGE_LAYOUT_UNDEFINED);
-            detail::initialize(replay, command_buffer, *image, id, pieces, VK_IMAGE_LAYOUT_GENERAL, &next_tracker);
+            auto pieces = detail::current(&context_.tracker_, id, range, VK_IMAGE_LAYOUT_UNDEFINED);
+            detail::initialize(replay, command_buffer, *image, id, pieces, VK_IMAGE_LAYOUT_GENERAL, &context_.tracker_);
         }
         bool wrote_readback = false;
         VkPipelineStageFlags2 readback_stages = 0;
         std::uint32_t open_labels = 0;  // events may span the lists of one ExecuteCommandLists
         for (std::size_t i = 0; i < lists.size(); ++i) {
             const auto& list = prepared[i];
-            emit(list, command_buffer, replay, &next_tracker, &open_labels);
+            emit(list, command_buffer, replay, &context_.tracker_, &open_labels);
             wrote_readback |= list.wrote_readback;
             readback_stages |= list.readback_src_stages;
         }
@@ -2515,13 +2517,14 @@ private:
             wait_values_.pop_back();
         }
         if (submitted) {
-            context_.tracker_ = std::move(next_tracker);
+            tracker_tx.commit();
             slot->predicate = std::move(batch);
             slot->predicated_copy = std::move(copy_batch);
             slot->counted_dispatch = std::move(counted_batch);
             queries.commit();
             slot->segments = std::move(queries.retained);
         } else {
+            tracker_tx.rollback();
             discard();
         }
         if (depth24_guard.active) {
