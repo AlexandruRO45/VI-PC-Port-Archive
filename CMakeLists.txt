@@ -1168,6 +1168,25 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_x87_fcmov COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_fcmov.py"
         check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_fcmov>"
         "$<TARGET_FILE:cpu_x87_fcmov_lifted>" ${x87_fcmov_control_files})
+    cpu_asm_fixture(cpu_x87_iarith x87_iarith)
+    # The lifted DLL and six mutated controls that the check requires to mismatch.
+    set(x87_iarith_control_files "")
+    foreach(variant IN ITEMS lifted subrev divrev zext16 zext32 wide16 pc64)
+        set(x87_iarith_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_x87_iarith_${variant}.cpp")
+        add_custom_command(OUTPUT "${x87_iarith_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_iarith.py"
+                emit "$<TARGET_FILE:cpu_x87_iarith>" "${x87_iarith_fixture}" ${variant}
+            DEPENDS cpu_x87_iarith tests/cpu/x87_iarith.py tests/cpu/x87_integers.py tests/cpu/x87_moves.py tests/cpu/x87_sub.py
+                tests/cpu/x87_div.py tests/cpu/x87_mul.py tests/cpu/x87_add.py tools/ffx_version_query.py
+                tools/x87_lower.py tools/x87_soft.h tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_x87_iarith_${variant} SHARED "${x87_iarith_fixture}")
+        if(NOT variant STREQUAL "lifted")
+            list(APPEND x87_iarith_control_files "$<TARGET_FILE:cpu_x87_iarith_${variant}>")
+        endif()
+    endforeach()
+    add_test(NAME cpu_aot_x87_iarith COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_iarith.py"
+        check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_iarith>"
+        "$<TARGET_FILE:cpu_x87_iarith_lifted>" ${x87_iarith_control_files})
     cpu_asm_fixture(cpu_create create_context)
     set(create_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_create_lifted.cpp")
     add_custom_command(OUTPUT "${create_fixture}"
