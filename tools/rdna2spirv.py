@@ -7333,13 +7333,20 @@ class Gen:
         if 2 in want:
             res[2] = self.tmp()
             self.emit(f"{res[2]} = OpExtInst %int %glsl SClamp {c} {zero} {nm1}")
+        def floor_mod(x, m):
+            # ((x srem m) + m) srem m, not OpSMod: an AMD Windows driver gives OpSMod a negative result for a
+            # negative x (all-zero ps_gather_wrap there, SHADER-369). OpSRem's sign follows x, so the sum is positive.
+            r, s, out = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{r} = OpSRem %int {x} {m}")
+            self.emit(f"{s} = OpIAdd %int {r} {m}")
+            self.emit(f"{out} = OpSRem %int {s} {m}")
+            return out
         if 0 in want:
-            res[0] = self.tmp()
-            self.emit(f"{res[0]} = OpSMod %int {c} {n}")
+            res[0] = floor_mod(c, n)
         if 1 in want:
-            n2, p, hi, rf, lt, res[1] = (self.tmp() for _ in range(6))
+            n2, hi, rf, lt, res[1] = (self.tmp() for _ in range(5))
             self.emit(f"{n2} = OpIAdd %int {n} {n}")
-            self.emit(f"{p} = OpSMod %int {c} {n2}")
+            p = floor_mod(c, n2)
             self.emit(f"{hi} = OpISub %int {n2} {one}")
             self.emit(f"{rf} = OpISub %int {hi} {p}")
             self.emit(f"{lt} = OpSLessThan %bool {p} {n}")

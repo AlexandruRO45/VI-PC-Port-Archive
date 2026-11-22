@@ -780,11 +780,13 @@ def _gather_address_bit_offsets(text: str) -> list[int]:
 @pytest.mark.parametrize("my", range(4))
 def test_gather4_l_literal_sampler_emits_only_the_code_its_modes_need(mx, my, make_shader):
     """CLAMP_X = bits [2:0], CLAMP_Y = [5:3]; 0 wrap, 1 mirror, 2 clamp, 3 mirror once. Each axis maps its two
-    texel coordinates: wrap = 1 OpSMod, mirror = 1 OpSMod + 1 OpSLessThan, mirror once = 1 OpSGreaterThanEqual."""
+    texel coordinates: wrap = 2 OpSRem, mirror = 2 OpSRem + 1 OpSLessThan, mirror once = 1 OpSGreaterThanEqual.
+    No OpSMod: an AMD driver returns it negative for a negative coordinate (SHADER-369)."""
     shader = make_shader(_gather_l(mx | my << 3))
     text = shader.translate()
     shader.validate(text)
-    assert _count(text, "OpSMod") == 2 * (mx in (0, 1)) + 2 * (my in (0, 1))
+    assert _count(text, "OpSMod") == 0
+    assert _count(text, "OpSRem") == 4 * (mx in (0, 1)) + 4 * (my in (0, 1))
     assert _count(text, "OpSLessThan") == 2 * (mx == 1) + 2 * (my == 1)
     assert _count(text, "OpSGreaterThanEqual") == 2 * (mx == 3) + 2 * (my == 3)
     assert _gather_address_bit_offsets(text) == []      # the sampler modes are literals
@@ -831,7 +833,7 @@ def test_gather4_l_run_time_sampler_selects_the_mode_from_the_sgpr(make_shader):
     text = shader.translate()
     shader.validate(text)
     assert _gather_address_bit_offsets(text) == [0, 3]      # CLAMP_X and CLAMP_Y
-    assert _count(text, "OpSMod") == 8 and _count(text, "OpSLessThan") == 4 and _count(text, "OpSGreaterThanEqual") == 4
+    assert _count(text, "OpSMod") == 0 and _count(text, "OpSRem") == 16 and _count(text, "OpSLessThan") == 4 and _count(text, "OpSGreaterThanEqual") == 4
 
 
 @pytest.mark.parametrize("word0", [4, 0x30, 0x7, 0x8000])
