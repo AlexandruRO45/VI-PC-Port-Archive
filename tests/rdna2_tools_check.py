@@ -1120,6 +1120,16 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertTrue(is_opcode_recognized("v_cvt_f32_f16_sdwa"))
         self.assertTrue(is_opcode_recognized("v_pk_add_f16"))
         self.assertTrue(is_opcode_recognized("v_dot4_i32_i8"))
+        self.assertTrue(is_instruction_supported("v_cvt_f32_u32_e32 v1, v2"))
+        self.assertTrue(is_instruction_supported("v_cvt_f32_u32_e64 v1, v2 clamp"))
+        self.assertTrue(is_instruction_supported("v_cvt_f32_i32_e32 v1, v2"))
+        self.assertTrue(is_instruction_supported("v_cvt_f32_i32_e64 v1, v2 clamp"))
+        for unsupported in ("v_cvt_f32_i32 v1, v2",
+                            "v_cvt_f32_i32_e32 v1, v2 clamp",
+                            "v_cvt_f32_u32_e64 v1, -v2",
+                            "v_cvt_f32_u32_e64 v1, v2 omod:2",
+                            "v_cvt_f32_i32_e32 v1, 1.5"):
+            self.assertFalse(is_instruction_supported(unsupported), unsupported)
 
         # Verify unsupported operands or spellings are rejected by scanner
         self.assertFalse(is_opcode_recognized("v_imaginary_opcode_sdwa"))

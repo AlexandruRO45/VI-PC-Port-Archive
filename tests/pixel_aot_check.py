@@ -624,6 +624,33 @@ def int_minmax_triple(kind):
     ])
 
 
+def cvt_int_fixture(encoding):
+    if encoding == "e32":
+        return with_constants([
+            "v_cvt_f32_i32_e32 v12, s44",
+            "v_cvt_f32_u32_e32 v13, s45",
+            "v_mov_b32_e32 v18, s46",
+            "v_cvt_f32_i32_e32 v14, v18",
+            "v_cvt_f32_u32_e32 v15, s47",
+        ])
+    return with_constants([
+        "v_cvt_f32_i32_e64 v12, s44",
+        "v_cvt_f32_u32_e64 v13, s45 clamp",
+        "v_mov_b32_e32 v18, s46",
+        "v_cvt_f32_i32_e64 v14, v18 clamp",
+        "v_cvt_f32_u32_e64 v15, s47",
+    ])
+
+
+def cvt_int_literals():
+    return with_constants([
+        "v_cvt_f32_i32_e32 v12, -7",
+        "v_cvt_f32_u32_e32 v13, 25",
+        "v_cvt_f32_i32_e64 v14, -100 clamp",
+        "v_cvt_f32_u32_e64 v15, 50 clamp",
+    ])
+
+
 def frexp_mant_values():
     return with_constants([
         "v_frexp_mant_f32_e32 v12, s44",
@@ -3208,6 +3235,40 @@ def check_controls(directory):
         entry = with_constants([])
         entry.insert(entry.index("s_and_b64 exec, exec, s[50:51]") + 1, f"v_cvt_{op}_f32_e32 v20, 0x40400000")
         translate(entry)
+    # v_cvt_f32_u32 and v_cvt_f32_i32 reject float modifiers, float literals, out-of-range immediates and bad registers.
+    body = translate(with_constants([
+        "v_cvt_f32_i32_e32 v12, -42",
+        "v_cvt_f32_u32_e32 v13, 42",
+        "v_cvt_f32_i32_e64 v14, 0x80000000",
+        "v_cvt_f32_u32_e64 v15, 0x80000000 clamp",
+    ])).split("float4 main", 1)[1]
+    assert "float(asint(asfloat(4294967254u)))" in body and "float(asuint(asfloat(42u)))" in body, body
+    assert "float(asint(asfloat(2147483648u)))" in body and "saturate(float(asuint(asfloat(2147483648u))))" in body, body
+    plain_body = translate(with_constants(["v_cvt_f32_i32_e32 v12, s44", "v_cvt_f32_u32_e32 v13, s45"]))
+    assert "float(asint(params[0].w))" in plain_body and "float(asuint(params[1].x))" in plain_body, plain_body
+    for op in ("v_cvt_f32_u32_e32", "v_cvt_f32_i32_e32"):
+        must_reject(translate, with_constants([f"{op} v12, -v18"]))
+        must_reject(translate, with_constants([f"{op} v12, |v18|"]))
+        must_reject(translate, with_constants([f"{op} v12, abs(v18)"]))
+        must_reject(translate, with_constants([f"{op} v12, -s44"]))
+        must_reject(translate, with_constants([f"{op} v12, |s44|"]))
+        must_reject(translate, with_constants([f"{op} v12, abs(s44)"]))
+        must_reject(translate, with_constants([f"{op} v12, 1.5"]))
+        must_reject(translate, with_constants([f"{op} v12, 0x100000000"]))
+        must_reject(translate, with_constants([f"{op} s40, v18"]))
+    must_reject(translate, with_constants(["v_cvt_f32_u32_sdwa v12, s44 src0_sel:WORD_1"]))
+    must_reject(translate, with_constants(["v_cvt_f32_i32_sdwa v12, s44 src0_sel:WORD_1"]))
+    ctrl_prog = assembly(False)
+    ctrl_wait = ctrl_prog.index("s_waitcnt vmcnt(0)")
+    must_reject(translate, ctrl_prog[:ctrl_wait] + ["v_cvt_f32_u32_e32 v12, 0"] + ctrl_prog[ctrl_wait:])
+    must_reject(translate, ctrl_prog[:ctrl_wait] + ["v_cvt_f32_i32_e32 v12, 0"] + ctrl_prog[ctrl_wait:])
+    ctrl_pos = ctrl_prog.index("s_wqm_b64 exec, exec") + 1
+    must_reject(translate, ctrl_prog[:ctrl_pos] + ["v_cvt_f32_u32_e32 v20, 0"] + ctrl_prog[ctrl_pos:])
+    must_reject(translate, ctrl_prog[:ctrl_pos] + ["v_cvt_f32_i32_e32 v20, 0"] + ctrl_prog[ctrl_pos:])
+    ctrl_base = with_constants([])
+    ctrl_lgkm = ctrl_base.index("s_waitcnt lgkmcnt(0)")
+    must_reject(translate, ctrl_base[:ctrl_lgkm] + ["v_cvt_f32_u32_e32 v12, s44"] + ctrl_base[ctrl_lgkm:])
+    must_reject(translate, ctrl_base[:ctrl_lgkm] + ["v_cvt_f32_i32_e32 v12, s44"] + ctrl_base[ctrl_lgkm:])
     archive = directory / "input.bin"
     code = bytes.fromhex("000080bf 000081bf")  # s_nop 0 followed by s_endpgm
     check_container_selector(directory, code)
@@ -3812,6 +3873,8 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((int_minmax_pair(encoding), translate) for encoding in ("e32", "e64"))
     fixtures.extend((int_minmax_triple(kind), translate) for kind in ("i32", "u32"))
     fixtures.extend((predicate_group(first, sdwa=True), translate) for first in range(0, 16, 4))
+    fixtures.extend((cvt_int_fixture(encoding), translate) for encoding in ("e32", "e64"))
+    fixtures.append((cvt_int_literals(), translate))
     fixtures.append((with_constants(CUBE_BODY), translate))
     fixtures.append((with_constants(MAD_BODY), translate))
     fixtures.extend((dual_program(case), translate_dual) for case in DUAL_CASES)
@@ -4282,6 +4345,90 @@ def check_int_minmax_draws(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Replacing v_med3_i32 with v_med3_u32 escaped detection")
+
+
+def check_cvt_int_draws(directory, compiler, renderer, backend):
+    source = directory / "cvt_int.hlsl"
+    shader = directory / "cvt_int.cso"
+    case = directory / "cvt_int.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+
+    # Two distinct constant sets: Set 1 tests negative numbers and values > 1.0;
+    # Set 2 tests boundary zero, one, and an exact integer (1000).
+    sets = [
+        ((-20, 15, -50, 200), [-20.0, 15.0, -50.0, 200.0], [-20.0, 1.0, 0.0, 200.0]),
+        ((0, 1, 1000, 0), [0.0, 1.0, 1000.0, 0.0], [0.0, 1.0, 1.0, 0.0]),
+    ]
+    for _, e32_vals, e64_vals in sets:
+        for x in (*e32_vals, *e64_vals):
+            assert half_rtz(x) == x, x
+
+    # e32: unclamped conversions of SGPRs and VGPR.
+    source.write_text(translate(cvt_int_fixture("e32")), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    for (c0, c1, c2, c3), expected, _ in sets:
+        constants = bytearray(256)
+        struct.pack_into("<4i", constants, 12, c0, c1, c2, c3)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+
+    # Negative control: swapping signed v_cvt_f32_i32 with unsigned v_cvt_f32_u32 must fail.
+    swapped = [line.replace("v_cvt_f32_i32", "v_cvt_f32_u32") for line in cvt_int_fixture("e32")]
+    source.write_text(translate(swapped), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    constants = bytearray(256)
+    struct.pack_into("<4i", constants, 12, -20, 15, -50, 200)
+    case.write_bytes(constants + struct.pack("<4f", *sets[0][1]) * 64)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Replacing v_cvt_f32_i32 with v_cvt_f32_u32 escaped detection")
+
+    # e64: includes clamp modifier (15.0 clamped -> 1.0; -50.0 clamped -> 0.0).
+    source.write_text(translate(cvt_int_fixture("e64")), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    for (c0, c1, c2, c3), _, expected in sets:
+        constants = bytearray(256)
+        struct.pack_into("<4i", constants, 12, c0, c1, c2, c3)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+
+    # Negative control: dropping clamp on e64 must fail.
+    unclamped = [line.replace(" clamp", "") for line in cvt_int_fixture("e64")]
+    source.write_text(translate(unclamped), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    constants = bytearray(256)
+    struct.pack_into("<4i", constants, 12, -20, 15, -50, 200)
+    case.write_bytes(constants + struct.pack("<4f", *sets[0][2]) * 64)
+    wrong_clamp = subprocess.run(draw, capture_output=True, text=True)
+    if wrong_clamp.returncode != 1 or "pixel_mismatch" not in wrong_clamp.stderr:
+        raise AssertionError("Dropping clamp on v_cvt_f32_u32_e64/v_cvt_f32_i32_e64 escaped detection")
+
+    # Direct literal operands with and without clamp.
+    literal_expected = [-7.0, 25.0, 0.0, 1.0]
+    source.write_text(translate(cvt_int_literals()), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    case.write_bytes(constants + struct.pack("<4f", *literal_expected) * 64)
+    subprocess.run(draw, check=True)
+
+    # Negative control: swapping signed literal to unsigned must report pixel mismatch.
+    mutated_lit = [line.replace("v_cvt_f32_i32_e32 v12, -7", "v_cvt_f32_u32_e32 v12, -7")
+                   for line in cvt_int_literals()]
+    source.write_text(translate(mutated_lit), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    wrong_lit = subprocess.run(draw, capture_output=True, text=True)
+    if wrong_lit.returncode != 1 or "pixel_mismatch" not in wrong_lit.stderr:
+        raise AssertionError("Literal signed-to-unsigned conversion mismatch escaped detection")
+
+    # Negative control: dropping clamp on negative literal must report pixel mismatch.
+    mutated_clamp = [line.replace("v_cvt_f32_i32_e64 v14, -100 clamp", "v_cvt_f32_i32_e64 v14, -100")
+                     for line in cvt_int_literals()]
+    source.write_text(translate(mutated_clamp), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    wrong_lit_clamp = subprocess.run(draw, capture_output=True, text=True)
+    if wrong_lit_clamp.returncode != 1 or "pixel_mismatch" not in wrong_lit_clamp.stderr:
+        raise AssertionError("Literal clamp removal escaped detection")
+
 
 def check_frexp_ldexp_draws(directory, compiler, renderer, backend):
     source = directory / "frexp_ldexp.hlsl"
@@ -4779,6 +4926,7 @@ def check_blend_and_scalar_draws(directory, compiler, renderer, backend):
     check_fract_draw(directory, compiler, renderer, backend)
     check_reciprocal_draw(directory, compiler, renderer, backend)
     check_int_minmax_draws(directory, compiler, renderer, backend)
+    check_cvt_int_draws(directory, compiler, renderer, backend)
 
     check_frexp_ldexp_draws(directory, compiler, renderer, backend)
 
