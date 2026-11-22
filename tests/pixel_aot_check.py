@@ -1937,6 +1937,38 @@ def scalar_body():
     return body
 
 
+def sext_values():
+    body = []
+    for index, width in enumerate((8, 16)):
+        body.extend(["s_cmp_eq_u32 s47, 1", f"s_sext_i32_i{width} s62, s44",
+                     "s_cselect_b32 s63, 0x3f800000, 0",
+                     f"v_mov_b32_e32 v{14 + index}, s63",
+                     f"s_cmp_eq_u32 s62, s{45 + index}", "s_cselect_b32 s63, 0x3f800000, 0",
+                     f"v_mov_b32_e32 v{12 + index}, s63"])
+    return with_constants(body)
+
+
+def check_sext_draw(directory, compiler, renderer, backend):
+    source = directory / "sext.hlsl"
+    shader = directory / "sext.cso"
+    case = directory / "sext.case"
+    source.write_text(translate(sext_values()), encoding="ascii")
+    subprocess.run([compiler, "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    for index, word in enumerate((0xabcd807f, 0xabcd7f80, 0xabcd0000, 0x1234ffff)):
+        flag = index % 2
+        raw = word.to_bytes(4, "little")
+        expected = [int.from_bytes(raw[:size], "little", signed=True) for size in (1, 2)]
+        constants = bytearray(256)
+        struct.pack_into("<IiiI", constants, 12, word, *expected, flag)
+        case.write_bytes(constants + struct.pack("<4f", 1, 1, flag, flag) * 64)
+        subprocess.run(draw, check=True)
+    # Replacing both signed references with their zero-extended values must change both channels.
+    struct.pack_into("<II", constants, 16, 255, 65535)
+    case.write_bytes(constants + struct.pack("<4f", 0, 0, flag, flag) * 64)
+    subprocess.run(draw, check=True)
+
+
 def scalar():
     return with_constants(scalar_body())
 
@@ -3577,6 +3609,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((rgb_sample(), translate))
     fixtures.append((with_constants(TRIG_BODY), translate))
     fixtures.append((with_constants(CLASS_BODY), translate))
+    fixtures.append((sext_values(), translate))
     fixtures.append((with_constants(RECIPROCAL_BODY), translate))
     fixtures.append((bitwise_program(), translate))
     fixtures.append((fract_values(), translate))
@@ -4212,6 +4245,7 @@ def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
     check_class_draw(directory, compiler, renderer, backend)
     check_predicate_draws(directory, compiler, renderer, backend)
     check_int_predicate_draws(directory, compiler, renderer, backend)
+    check_sext_draw(directory, compiler, renderer, backend)
     check_int16_predicate_draws(directory, compiler, renderer, backend)
     check_sdwa_predicate_draws(directory, compiler, renderer, backend)
     check_literal_fma_draw(directory, compiler, renderer, backend)
