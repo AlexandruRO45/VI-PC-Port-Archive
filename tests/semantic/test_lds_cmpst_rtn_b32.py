@@ -211,6 +211,76 @@ class DSCmpstRtnInstruction:
         return f"{parts[0]} {', '.join(parts[1:])}"
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarState:
+    """Scalar machine state comprising register files and LDS memory."""
+
+    def __init__(self, lds_size_dwords: int = LDS_SIZE_DWORDS) -> None:
+        self.vgprs: list[int] = [0] * DEFAULT_NUM_VGPRS
+        self.sgprs: list[int] = [0] * DEFAULT_NUM_SGPRS
+        self.lds: LDSMemory = LDSMemory(size_dwords=lds_size_dwords)
+
+    def get_vgpr(self, index: int) -> int:
+        return self.vgprs[index]
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        self.vgprs[index] = u32(val)
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index]
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        self.sgprs[index] = u32(val)
+
+    def get_reg(self, reg: RegisterOperand) -> int:
+        if reg.reg_type == RegType.VGPR:
+            return self.get_vgpr(reg.index)
+        return self.get_sgpr(reg.index)
+
+    def set_reg(self, reg: RegisterOperand, val: int) -> None:
+        if reg.reg_type == RegType.VGPR:
+            self.set_vgpr(reg.index, val)
+        else:
+            self.set_sgpr(reg.index, val)
+
+    def resolve_operand(self, op: Operand) -> int:
+        if isinstance(op, Immediate):
+            return op.val
+        return self.get_reg(op)
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for ds_cmpst_rtn_b32."""
+
+    def execute(self, instr: DSCmpstRtnInstruction, state: ScalarState) -> Tuple[int, int, bool]:
+        """Execute a single ds_cmpst_rtn_b32 instruction on scalar state.
+
+        Returns:
+            Tuple[int, int, bool]: (old_val, new_mem, swapped)
+        """
+        # 1. Latch inputs prior to any register writeback
+        vaddr = state.get_reg(instr.vaddr)
+        cmp_val = state.resolve_operand(instr.vdata0)
+        new_val = state.resolve_operand(instr.vdata1)
+
+        # 2. Perform atomic LDS compare-and-swap
+        old_val, new_mem, swapped = state.lds.atomic_cmpst_rtn_b32(
+            vaddr=vaddr,
+            cmp_val=cmp_val,
+            new_val=new_val,
+            offset=instr.offset,
+        )
+
+        # 3. Write pre-operation original value back to destination register
+        state.set_reg(instr.vdst, old_val)
+
+        return old_val, new_mem, swapped
+
+
+
 
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Phase 1: Unit tests for reference mathematical oracle and architectural model."""
@@ -351,6 +421,127 @@ class TestSymbolicAST(unittest.TestCase):
             DSCmpstRtnInstruction(vdst=v0, vaddr=v0, vdata0=v0, vdata1=v0, offset=65536)
 
 
+class TestScalarInterpreter(unittest.TestCase):
+    """Phase 3: Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.state = ScalarState(lds_size_dwords=1024)
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_cmpst_match_execution(self) -> None:
+        addr = 0x40
+        self.state.lds.write_dword(addr, 0x1234)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, 0x1234)      # cmp_val matches
+        self.state.set_vgpr(3, 0x9999)      # new_val
+        self.state.set_vgpr(0, 0xDEADBEEF)  # sentinel
+
+        instr = DSCmpstRtnInstruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+            vdata1=RegisterOperand(3, RegType.VGPR),
+            offset=0,
+        )
+
+        old_val, new_mem, swapped = self.interp.execute(instr, self.state)
+
+        self.assertTrue(swapped)
+        self.assertEqual(old_val, 0x1234)
+        self.assertEqual(new_mem, 0x9999)
+        self.assertEqual(self.state.get_vgpr(0), 0x1234)  # vdst received old_val
+        self.assertEqual(self.state.lds.read_dword(addr), 0x9999)
+
+    def test_scalar_cmpst_mismatch_execution(self) -> None:
+        addr = 0x40
+        self.state.lds.write_dword(addr, 0x1234)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, 0x5555)      # cmp_val does not match
+        self.state.set_vgpr(3, 0x9999)      # new_val
+        self.state.set_vgpr(0, 0xDEADBEEF)  # sentinel
+
+        instr = DSCmpstRtnInstruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+            vdata1=RegisterOperand(3, RegType.VGPR),
+            offset=0,
+        )
+
+        old_val, new_mem, swapped = self.interp.execute(instr, self.state)
+
+        self.assertFalse(swapped)
+        self.assertEqual(old_val, 0x1234)
+        self.assertEqual(new_mem, 0x1234)
+        self.assertEqual(self.state.get_vgpr(0), 0x1234)  # vdst still gets old_val
+        self.assertEqual(self.state.lds.read_dword(addr), 0x1234)
+
+    def test_scalar_execution_with_offset(self) -> None:
+        base_addr = 0x100
+        offset = 0x10
+        eff_addr = base_addr + offset
+
+        self.state.lds.write_dword(eff_addr, 0x7777)
+        self.state.set_vgpr(1, base_addr)
+        self.state.set_vgpr(2, 0x7777)
+        self.state.set_vgpr(3, 0x8888)
+
+        instr = DSCmpstRtnInstruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+            vdata1=RegisterOperand(3, RegType.VGPR),
+            offset=offset,
+        )
+
+        old_val, new_mem, swapped = self.interp.execute(instr, self.state)
+
+        self.assertTrue(swapped)
+        self.assertEqual(old_val, 0x7777)
+        self.assertEqual(new_mem, 0x8888)
+        self.assertEqual(self.state.get_vgpr(0), 0x7777)
+        self.assertEqual(self.state.lds.read_dword(eff_addr), 0x8888)
+
+    def test_scalar_execution_with_immediate_operands(self) -> None:
+        addr = 0x200
+        self.state.lds.write_dword(addr, 50)
+        self.state.set_vgpr(1, addr)
+
+        instr = DSCmpstRtnInstruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=Immediate(50),
+            vdata1=Immediate(100),
+            offset=0,
+        )
+
+        old_val, new_mem, swapped = self.interp.execute(instr, self.state)
+
+        self.assertTrue(swapped)
+        self.assertEqual(old_val, 50)
+        self.assertEqual(new_mem, 100)
+        self.assertEqual(self.state.get_vgpr(0), 50)
+        self.assertEqual(self.state.lds.read_dword(addr), 100)
+
+    def test_scalar_unaligned_byte_address(self) -> None:
+        self.state.lds.write_dword(0x300, 42)
+        self.state.set_vgpr(1, 0x302)  # Unaligned address: low 2 bits dropped -> 0x300
+
+        instr = DSCmpstRtnInstruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=Immediate(42),
+            vdata1=Immediate(99),
+        )
+
+        old_val, new_mem, swapped = self.interp.execute(instr, self.state)
+        self.assertTrue(swapped)
+        self.assertEqual(old_val, 42)
+        self.assertEqual(new_mem, 99)
+        self.assertEqual(self.state.lds.read_dword(0x300), 99)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
