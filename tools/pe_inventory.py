@@ -65,11 +65,34 @@ def api_sets(system):
 
 
 def exports(pe):
-    directory = getattr(pe, "DIRECTORY_ENTRY_EXPORT", None)
-    if not directory:
+    """Read the export directory and its tables as stored.
+
+    pefile stops reading names at the first one outside its character set, lists the remaining
+    named exports as bare ordinals, cuts names at 512 bytes and gives up after 8,192 entries.
+    It also drops a name or forwarder it cannot read, or the whole table, with only a warning.
+    Here a table, name or forwarder that does not lie in section file data is an error.
+    """
+    start, size = pe.OPTIONAL_HEADER.DATA_DIRECTORY[0].VirtualAddress, pe.OPTIONAL_HEADER.DATA_DIRECTORY[0].Size
+    if not start:
         return []
-    return [dict(ordinal=s.ordinal, name=label(s.name), forwarder=label(s.forwarder))
-            for s in directory.symbols if s.address]
+    (base, count, name_count, functions_rva, names_rva,
+     ordinals_rva) = struct.unpack("<16x6I", read_rva(pe, start, 40, "Export directory"))
+
+    def array(form, rva, count, what):
+        return struct.unpack(f"<{count}{form}", read_rva(pe, rva, struct.calcsize(form) * count, what))
+
+    functions = array("I", functions_rva, count, "Export address table")
+    names = array("I", names_rva, name_count, "Export name pointer table")
+    indices = array("H", ordinals_rva, name_count, "Export name ordinal table")
+    if any(i >= len(functions) for i in indices):
+        raise ValueError("Export name ordinal is outside the export address table")
+    entries = [(i, read_name(pe, rva, "export name")) for rva, i in zip(names, indices)]
+    named = set(indices)
+    entries += [(i, None) for i in range(len(functions)) if i not in named]
+    return [dict(ordinal=base + i, name=label(name),
+                 forwarder=label(read_name(pe, functions[i], "export forwarder", end=start + size))
+                 if start <= functions[i] < start + size else None)
+            for i, name in entries if functions[i]]
 
 
 def export_keys(rows):
@@ -128,19 +151,23 @@ def resolve_desktop(dll, symbol, importer, contracts, system_exports, package_ex
     return dict(status=status, chain=chain)
 
 
-def read_rva(pe, rva, size):
+def read_rva(pe, rva, size, what="Import data"):
     section = pe.get_section_by_rva(rva)
     data = section.get_data(rva, size) if section else b""
     if len(data) != size:
-        raise ValueError(f"Import data at RVA {rva:#x} is outside the file's sections")
+        raise ValueError(f"{what} at RVA {rva:#x} is outside the file's sections")
     return data
 
 
-def read_name(pe, rva):
+def read_name(pe, rva, what="import name", *, end=None):
     section = pe.get_section_by_rva(rva)
-    name, terminator, _ = (section.get_data(rva, 0x10000) if section else b"").partition(b"\0")
+    limit = 0x10000 if end is None else min(0x10000, end - rva)
+    data = section.get_data(rva, limit) if section and limit > 0 else b""
+    if not data:
+        raise ValueError(f"{what.capitalize()} at RVA {rva:#x} is outside the file's sections")
+    name, terminator, _ = data.partition(b"\0")
     if not terminator:
-        raise ValueError(f"Unterminated import name at RVA {rva:#x}")
+        raise ValueError(f"Unterminated {what} at RVA {rva:#x}")
     return name
 
 

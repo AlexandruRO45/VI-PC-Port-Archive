@@ -44,9 +44,12 @@ jobs:
       - name: Run Python checks
         run: |
           python -B tests/script_state_check.py
+          python -B tests/resource_root_check.py
           python -B tests/bcpack_check.py
+          python -B tests/bc7_blocks_check.py
           python -B tests/form_coverage_check.py
           python -B tests/resource_ranges_check.py
+          python -B tests/awc_metadata_check.py
           python -B tests/sgd5_effects_check.py
           python -B tests/dxcontainer_part_offsets_check.py
           python -B tests/layout_chunks_check.py
@@ -56,6 +59,7 @@ jobs:
           python -B tests/dxil_retarget_check.py
           python -B tests/rdna2_tools_check.py
           python -B tests/pso_readiness_check.py
+          python -B tests/xmem_attribute_scan_check.py
           python -B tests/docs_links_check.py
           python -B tests/bidi_controls_check.py
   build-and-test:
