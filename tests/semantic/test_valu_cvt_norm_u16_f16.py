@@ -939,5 +939,161 @@ class TestValuCvtNormU16F16RegisterAliasing(unittest.TestCase):
             self.assertEqual(final_word & 0xFFFF, expected)
 
 
+# ---------------------------------------------------------------------------
+# Condition Codes, Status Flags, and Carry/Borrow Isolation
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class ConditionCodes:
+    """Architectural condition codes evaluating properties of converted UNORM16 results."""
+    zero: bool
+    max_val: bool
+    even: bool
+    negative: bool
+    midpoint: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class FPStatusFlags:
+    """IEEE 754 and hardware status flags for f16 to unorm16 conversion."""
+    invalid: bool       # e.g., sNaN operand
+    denormal: bool      # e.g., subnormal f16 operand
+    inexact: bool       # non-integer scaling requiring rounding
+    overflow: bool      # finite input > 1.0 clamped to 65535
+    underflow: bool     # positive finite input rounded to 0
+
+
+def compute_condition_codes_u16(result: int) -> ConditionCodes:
+    """Computes condition codes evaluating attributes of a 16-bit UNORM result."""
+    u16 = result & MASK16
+    return ConditionCodes(
+        zero=(u16 == UNORM16_MIN),
+        max_val=(u16 == UNORM16_MAX),
+        even=(u16 % 2 == 0),
+        negative=False,  # Unsigned values cannot be negative
+        midpoint=(u16 == UNORM16_HALF),
+    )
+
+
+def compute_fp_status_flags_cvt_norm_u16_f16(src16: int, result16: int) -> FPStatusFlags:
+    """Computes IEEE 754 / architectural exception status flags."""
+    src16 &= MASK16
+    result16 &= MASK16
+
+    invalid = is_snan_f16(src16)
+    denormal = is_subnormal_f16(src16)
+
+    is_src_nan = is_nan_f16(src16)
+    is_src_inf = is_inf_f16(src16)
+
+    overflow = False
+    underflow = False
+    inexact = False
+
+    if not is_src_nan and not is_src_inf:
+        f_val = bits_to_f16(src16)
+        if f_val > 1.0:
+            overflow = True
+            inexact = True
+        elif 0.0 < f_val < 1.0:
+            scaled = Fraction(f_val) * 65535
+            if scaled.denominator != 1:
+                inexact = True
+            if result16 == UNORM16_MIN:
+                underflow = True
+
+    return FPStatusFlags(
+        invalid=invalid,
+        denormal=denormal,
+        inexact=inexact,
+        overflow=overflow,
+        underflow=underflow,
+    )
+
+
+class TestValuCvtNormU16F16ConditionCodes(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow isolation."""
+
+    def test_condition_codes(self) -> None:
+        # Zero result
+        cc_zero = compute_condition_codes_u16(UNORM16_MIN)
+        self.assertTrue(cc_zero.zero)
+        self.assertTrue(cc_zero.even)
+        self.assertFalse(cc_zero.max_val)
+        self.assertFalse(cc_zero.negative)
+        self.assertFalse(cc_zero.midpoint)
+
+        # Max result
+        cc_max = compute_condition_codes_u16(UNORM16_MAX)
+        self.assertFalse(cc_max.zero)
+        self.assertFalse(cc_max.even)
+        self.assertTrue(cc_max.max_val)
+        self.assertFalse(cc_max.negative)
+
+        # Midpoint result (0x8000 = 32768)
+        cc_mid = compute_condition_codes_u16(UNORM16_HALF)
+        self.assertFalse(cc_mid.zero)
+        self.assertTrue(cc_mid.even)
+        self.assertTrue(cc_mid.midpoint)
+
+    def test_status_flags_snan_invalid(self) -> None:
+        res = ref_cvt_norm_u16_f16(SNAN_F16)
+        flags = compute_fp_status_flags_cvt_norm_u16_f16(SNAN_F16, res)
+        self.assertTrue(flags.invalid)
+        self.assertFalse(flags.denormal)
+        self.assertFalse(flags.overflow)
+
+        # Quiet NaN should not set invalid flag
+        res_qnan = ref_cvt_norm_u16_f16(QNAN_F16)
+        flags_qnan = compute_fp_status_flags_cvt_norm_u16_f16(QNAN_F16, res_qnan)
+        self.assertFalse(flags_qnan.invalid)
+
+    def test_status_flags_denormal(self) -> None:
+        res = ref_cvt_norm_u16_f16(MIN_SUBNORMAL_F16)
+        flags = compute_fp_status_flags_cvt_norm_u16_f16(MIN_SUBNORMAL_F16, res)
+        self.assertTrue(flags.denormal)
+        self.assertFalse(flags.invalid)
+        self.assertTrue(flags.underflow)
+
+    def test_status_flags_overflow(self) -> None:
+        # Input 2.0 exceeds 1.0
+        res = ref_cvt_norm_u16_f16(TWO_F16)
+        self.assertEqual(res, UNORM16_MAX)
+        flags = compute_fp_status_flags_cvt_norm_u16_f16(TWO_F16, res)
+        self.assertTrue(flags.overflow)
+        self.assertTrue(flags.inexact)
+        self.assertFalse(flags.invalid)
+
+    def test_status_flags_inexact(self) -> None:
+        # 1.0 * 65535 is exact integer 65535 (no inexact)
+        res_one = ref_cvt_norm_u16_f16(ONE_F16)
+        flags_one = compute_fp_status_flags_cvt_norm_u16_f16(ONE_F16, res_one)
+        self.assertFalse(flags_one.inexact)
+
+        # 0.5 * 65535 = 32767.5 is not an integer (inexact)
+        res_half = ref_cvt_norm_u16_f16(HALF_F16)
+        flags_half = compute_fp_status_flags_cvt_norm_u16_f16(HALF_F16, res_half)
+        self.assertTrue(flags_half.inexact)
+
+    def test_carry_borrow_vcc_isolation(self) -> None:
+        # Floating point conversion instructions in RDNA2 never generate carry/borrow or alter VCC
+        interp = ScalarVALUInterpreter()
+        canary_vcc = 0xFEDCBA9876543210
+        interp.vcc = canary_vcc
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_U16_F16,
+            dst=Register(RegKind.VGPR, 0, SubWord.LO),
+            src0=Immediate(1.0),
+        )
+        interp.step(inst)
+        self.assertEqual(interp.vcc, canary_vcc)
+
+        simd = SIMDWavefrontInterpreter(wave_size=64)
+        simd.vcc = canary_vcc
+        simd.step(inst)
+        self.assertEqual(simd.vcc, canary_vcc)
+
+
 if __name__ == "__main__":
     unittest.main()
