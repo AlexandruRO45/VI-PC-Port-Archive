@@ -2,8 +2,9 @@
 // set 0's r64ui binding (vulkan_bindless.h, binding 26 for 2D), on a caller-owned device with and without
 // VK_EXT_shader_image_atomic_int64.
 //
-//   1. OPTIONS9.AtomicInt64OnTypedResourceSupported follows VulkanDeviceInfo::shader_image_int64_atomics; the
-//      group-shared one and OPTIONS11.AtomicInt64OnDescriptorHeapResourceSupported stay FALSE. FORMAT_SUPPORT for
+//   1. OPTIONS9.AtomicInt64OnTypedResourceSupported stays FALSE with and without the extension (buffer and 3D
+//      texture UAVs, which D3D12 also covers by it, are not exposed yet); the group-shared one and
+//      OPTIONS11.AtomicInt64OnDescriptorHeapResourceSupported stay FALSE too. FORMAT_SUPPORT for
 //      R32G32_UINT/SINT has no UAV atomic bit, as on the host (RTX 3060, NVIDIA 32.0.16.1714).
 //   2. R32G32_UINT, _SINT and _TYPELESS UAV textures (2D and 3D, and a 2D one with a castable-format list) are
 //      created, GetResourceAllocationInfo answers for each, and 2D UAVs of them (R32G32_UINT or _SINT views) get a
@@ -266,7 +267,7 @@ int main() {
     EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))));
     Options options;
     EXPECT(query_options(device.p, options));
-    EXPECT(bool(options.typed) == wide && !options.group_shared && !options.descriptor_heap);
+    EXPECT(!options.typed && !options.group_shared && !options.descriptor_heap);
     std::printf("OPTIONS9: AtomicInt64OnTypedResourceSupported %d, AtomicInt64OnGroupSharedSupported %d; OPTIONS11: "
                 "AtomicInt64OnDescriptorHeapResourceSupported %d\n",
                 options.typed, options.group_shared, options.descriptor_heap);

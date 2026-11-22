@@ -4936,7 +4936,10 @@ public:
             // R64_UINT views of set 0's r64ui bindings, where the device enabled VK_EXT_shader_image_atomic_int64
             // (D3D-251). The host runtime answers TRUE on an RTX 3060 (NVIDIA 32.0.16.1714), as it does for the
             // group-shared one, which stays FALSE: the translator has no 64-bit LDS add, min, max or compare-swap.
-            opts->AtomicInt64OnTypedResourceSupported = state_.info.shader_image_int64_atomics && state_.bindless;
+            // FALSE until every typed-resource form D3D12 allows is exposed: 64-bit atomics on typed, raw and
+            // structured buffer UAVs and on 3D texture UAVs (the layer creates neither view yet). The 2D texture path
+            // (D3D-251, set 0 binding 26) and the translator's 3D one (binding 27) are in place for when they are.
+            opts->AtomicInt64OnTypedResourceSupported = FALSE;
             opts->AtomicInt64OnGroupSharedSupported = FALSE;
             opts->DerivativesInMeshAndAmplificationShadersSupported = FALSE;
             opts->WaveMMATier = D3D12_WAVE_MMA_TIER_NOT_SUPPORTED;
@@ -6405,7 +6408,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     }
 #endif
     // VK_EXT_shader_image_atomic_int64: the translator's 64-bit image atomics (Int64ImageEXT, an R64ui storage image
-    // at set 0 bindings 26/27) and D3D12_OPTIONS9.AtomicInt64OnTypedResourceSupported (D3D-251). Needs shaderInt64
+    // at set 0 bindings 26/27), D3D-251; OPTIONS9 still answers FALSE (see CheckFeatureSupport). Needs shaderInt64
     // and the bindless set those bindings live in.
     VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_int64{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT};

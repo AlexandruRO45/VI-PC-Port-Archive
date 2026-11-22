@@ -1452,9 +1452,10 @@ The trace will enumerate them.
   "supported" is worse than a false "unsupported" at boot. For `OPTIONS2`–`5`, `7`, `9`, `11`, `13`–`16`, and
   `18`–`21` (D3D-86; leaving `OPTIONS1` to #745, `OPTIONS6`/`10` to #469, `OPTIONS8` to #715, and `OPTIONS12` to
   #693):
-  - `OPTIONS9.AtomicInt64OnTypedResourceSupported` is TRUE where the device enabled
+  - `OPTIONS9.AtomicInt64OnTypedResourceSupported` stays FALSE: D3D12 covers typed, raw and structured buffers and
+    3D textures by it, and the layer exposes no buffer UAV and no 3D texture UAV yet. Where the device enabled
     `VK_EXT_shader_image_atomic_int64` (`VulkanDeviceInfo::shader_image_int64_atomics`) and the bindless set
-    (D3D-251): R32G32_UINT/SINT/TYPELESS UAV textures (2D and 3D) are then mutable images with an `R64_UINT` view
+    (D3D-251), R32G32_UINT/SINT/TYPELESS UAV textures (2D and 3D) are already mutable images with an `R64_UINT` view
     in set 0's r64ui bindings (26 for 2D, 27 for 3D), where the translator's 64-bit image atomics address them.
     `AtomicInt64OnGroupSharedSupported` and `OPTIONS11.AtomicInt64OnDescriptorHeapResourceSupported` stay FALSE: the
     translator has no 64-bit LDS or raw-buffer add/min/max/compare-swap. The host D3D12 runtime answers TRUE to all
