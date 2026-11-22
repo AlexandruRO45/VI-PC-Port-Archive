@@ -485,7 +485,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             elif cls == "Input":
                 init = inputs.get(res, types.zero(pointee))
                 var_box[res] = [list(init) if isinstance(init, (list, tuple)) else init]
-            elif cls in ("Function", "Output", "Workgroup"):
+            elif cls in ("Function", "Output", "Workgroup", "Private"):
                 if len(a) > 2:
                     init = values[a[2]]
                     var_box[res] = [list(init) if isinstance(init, list) else init]

@@ -51,6 +51,7 @@ WAVE64_EMULATE = False   # --wave64-emulate: wave64 compute/mesh shaders exact o
 # Vulkan minimum is 16384. The translator runs offline, so it records the exact total as lds_bytes in index.json and
 # the runtime compares that with the device's limit before it creates the pipeline. spirv-val checks neither.
 MAX_SHARED_BYTES = 65536
+SCRATCH_DWORDS = 256   # scratch_*: dwords of private memory each invocation gets (1 KiB); see Gen.scratch_mem
 WAVE64_GRAPHICS = "warn"   # --wave64-graphics: tier C wave64 VS/PS/GS (not exact on 32-wide subgroups): warn | error | off
 W64G_COUNTS = Counter()   # tiers of the wave64 VS/PS/GS translated so far, for the summary line
 # --bary-fallback: raw barycentric reads come from an ordinary perspective-interpolated vec3 input (the location is
@@ -209,6 +210,7 @@ class Gen:
         self.dpp_guard = None       # per-lane bool: a DPP instruction's row/bank/valid write mask
         self.parked = {}               # (vgpr, lane) a mask is parked in -> the spare SGPR slot that keeps it per lane
         self.uses_lds = False
+        self.uses_scratch = False      # a scratch_* access: the Private %scratch array
         self.lds_dwords = 16384        # CS: set from RSRC2 LDS_SIZE (power of two, covers every offset used)
         self.lds_need = 0              # CS: dwords the program needs (LDS_SIZE, largest constant offset)
         self.lds_declared = 0          # CS: dwords RSRC2 LDS_SIZE allocates (the hardware allocation, unclipped)
@@ -2272,6 +2274,166 @@ class Gen:
             ph = self.tmp()
             self.emit(f"{ph} = OpPhi %uint {new} {lbl_do} {old} {pre}")
             self.store_reg("vgpr", data["r"], ph)
+
+    SCRATCH_SUB = {  # op: (bytes, store?, signed, VGPR half the data comes from / lands in, or None = whole register)
+        "scratch_load_ubyte": (1, False, False, None), "scratch_load_sbyte": (1, False, True, None),
+        "scratch_load_ushort": (2, False, False, None), "scratch_load_sshort": (2, False, True, None),
+        "scratch_store_byte": (1, True, False, None), "scratch_store_byte_d16_hi": (1, True, False, 1),
+        "scratch_store_short": (2, True, False, None), "scratch_store_short_d16_hi": (2, True, False, 1),
+        "scratch_load_ubyte_d16": (1, False, False, 0), "scratch_load_ubyte_d16_hi": (1, False, False, 1),
+        "scratch_load_sbyte_d16": (1, False, True, 0), "scratch_load_sbyte_d16_hi": (1, False, True, 1),
+        "scratch_load_short_d16": (2, False, False, 0), "scratch_load_short_d16_hi": (2, False, False, 1)}
+
+    def scratch_address(self, op, vaddr, saddr, mods):
+        """Byte address in the lane's private scratch memory (uint id): vaddr (32-bit, unless `off`) + saddr (32-bit
+        SGPR, unless `off`) + the signed 12-bit instruction offset, wrapping at 32 bits."""
+        inst = [m.split(":", 1)[1] for m in mods if m.startswith("offset:")]
+        if len(inst) > 1:
+            raise Unsupported(f"{op} offset form")
+        try:
+            inst = int(inst[0], 0) if inst else 0
+        except ValueError:
+            raise Unsupported(f"{op} offset:{inst[0]}") from None
+        if 0x800 <= inst <= 0xFFF:
+            inst -= 0x1000            # the raw 12-bit field, as for global_*
+        if not -0x800 <= inst <= 0x7FF:
+            raise Unsupported(f"{op} offset:{inst}")
+        parts = []
+        for x, kind in ((vaddr, "vgpr"), (saddr, "sgpr")):
+            if x["k"] == "special" and x["t"] == "off":
+                continue
+            if x["k"] != kind or x.get("n", 1) != 1:
+                raise Unsupported(op + " addressing")
+            parts.append(self.src_u(x))
+        addr = parts[0] if parts else self.cu(0)
+        for x in parts[1:]:
+            t = self.tmp()
+            self.emit(f"{t} = OpIAdd %uint {addr} {x}")
+            addr = t
+        if inst:
+            t = self.tmp()
+            self.emit(f"{t} = OpIAdd %uint {addr} {self.cu(inst & 0xFFFFFFFF)}")
+            addr = t
+        return addr
+
+    def scratch_mem(self, op, a, mods):
+        """scratch_load_* / scratch_store_* [vdata,] vaddr|off, saddr|off offset:N: the lane's own private memory,
+        a Private array of SCRATCH_DWORDS dwords in each invocation (zero at the start). Dword, 2-, 3- and 4-dword
+        accesses are dword aligned (the low two address bits are dropped); byte and short accesses (zero or sign
+        extending loads, the `_d16` loads that fill one half of vdst, `_d16_hi` stores) go one byte at a time, so a
+        short can sit across a dword. A store past the array is dropped and a load past it reads 0: the hardware's
+        behaviour there is not measured. Inactive lanes neither store nor load (a load keeps vdst)."""
+        if any(m in mods for m in ("lds", "tfe")):
+            raise Unsupported(op + " form")
+        load = op.startswith("scratch_load")
+        if op in self.SCRATCH_SUB:
+            nbytes, store, signed, half = self.SCRATCH_SUB[op]
+            n = 1
+        elif op.startswith(("scratch_load_dword", "scratch_store_dword")) and not op.endswith("_addtid"):
+            nbytes, signed, half = 4, False, None
+            n = 1 if op.endswith("dword") else int(op.rsplit("x", 1)[1])
+            store = not load
+        else:
+            raise Unsupported(op)
+        data, vaddr, saddr = (a[0], a[1], a[2]) if load else (a[1], a[0], a[2])
+        if data["k"] != "vgpr" or data.get("n", 1) != n:
+            raise Unsupported(op + " data")
+        addr = self.scratch_address(op, vaddr, saddr, mods)
+        self.uses_scratch = True
+        act = self.active_b()
+        olds = [self.load_reg("vgpr", data["r"] + i) for i in range(n)]
+        lim = self.cu(SCRATCH_DWORDS)
+
+        def word(byte_addr, extra_dwords=0):
+            """(pointer to the dword holding byte_addr, its bit shift in it, in-range bool)."""
+            w, wi, inr, idx, p, sh0, sh = (self.tmp() for _ in range(7))
+            self.emit(f"{w} = OpShiftRightLogical %uint {byte_addr} {self.cu(2)}")
+            self.emit(f"{wi} = OpIAdd %uint {w} {self.cu(extra_dwords)}")
+            self.emit(f"{inr} = OpULessThan %bool {wi} {lim}")
+            self.emit(f"{idx} = OpSelect %uint {inr} {wi} {self.cu(0)}")
+            self.emit(f"{p} = OpAccessChain %_ptr_Private_uint_scr %scratch {idx}")
+            self.emit(f"{sh0} = OpBitwiseAnd %uint {byte_addr} {self.cu(3)}")
+            self.emit(f"{sh} = OpShiftLeftLogical %uint {sh0} {self.cu(3)}")
+            return p, sh, inr
+
+        lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
+        pre = self.current_label_placeholder()
+        self.emit(f"OpSelectionMerge {lbl_end} None")
+        self.emit(f"OpBranchConditional {act} {lbl_do} {lbl_end}")
+        self.emit(f"{lbl_do} = OpLabel")
+        new = []
+        if nbytes == 4:                                    # whole dwords
+            for i in range(n):
+                p, _, inr = word(addr, i)
+                if store:
+                    v = self.load_reg("vgpr", data["r"] + i)
+                    self.emit(f"OpSelectionMerge {lbl_end}_s{i} None")
+                    self.emit(f"OpBranchConditional {inr} {lbl_end}_w{i} {lbl_end}_s{i}")
+                    self.emit(f"{lbl_end}_w{i} = OpLabel")
+                    self.emit(f"OpStore {p} {v}")
+                    self.emit(f"OpBranch {lbl_end}_s{i}")
+                    self.emit(f"{lbl_end}_s{i} = OpLabel")
+                else:
+                    v, z = self.tmp(), self.tmp()
+                    self.emit(f"{v} = OpLoad %uint {p}")
+                    self.emit(f"{z} = OpSelect %uint {inr} {v} {self.cu(0)}")
+                    new.append(z)
+        else:                                              # bytes, one at a time
+            value = None
+            for k in range(nbytes):
+                ba = addr
+                if k:
+                    ba = self.tmp()
+                    self.emit(f"{ba} = OpIAdd %uint {addr} {self.cu(k)}")
+                p, sh, inr = word(ba)
+                if store:
+                    byte, mk, inv, vs, w, t1, t2 = (self.tmp() for _ in range(7))
+                    self.emit(f"{byte} = OpBitFieldUExtract %uint {olds[0]} {self.cu(16 * (half or 0) + 8 * k)} {self.cu(8)}")
+                    self.emit(f"OpSelectionMerge {lbl_end}_s{k} None")
+                    self.emit(f"OpBranchConditional {inr} {lbl_end}_w{k} {lbl_end}_s{k}")
+                    self.emit(f"{lbl_end}_w{k} = OpLabel")
+                    self.emit(f"{mk} = OpShiftLeftLogical %uint {self.cu(0xFF)} {sh}")
+                    self.emit(f"{inv} = OpNot %uint {mk}")
+                    self.emit(f"{vs} = OpShiftLeftLogical %uint {byte} {sh}")
+                    self.emit(f"{w} = OpLoad %uint {p}")
+                    self.emit(f"{t1} = OpBitwiseAnd %uint {w} {inv}")
+                    self.emit(f"{t2} = OpBitwiseOr %uint {t1} {vs}")
+                    self.emit(f"OpStore {p} {t2}")
+                    self.emit(f"OpBranch {lbl_end}_s{k}")
+                    self.emit(f"{lbl_end}_s{k} = OpLabel")
+                else:
+                    w, b, bz = self.tmp(), self.tmp(), self.tmp()
+                    self.emit(f"{w} = OpLoad %uint {p}")
+                    self.emit(f"{b} = OpBitFieldUExtract %uint {w} {sh} {self.cu(8)}")
+                    self.emit(f"{bz} = OpSelect %uint {inr} {b} {self.cu(0)}")
+                    if value is None:
+                        value = bz
+                    else:
+                        hi8, v2 = self.tmp(), self.tmp()
+                        self.emit(f"{hi8} = OpShiftLeftLogical %uint {bz} {self.cu(8 * k)}")
+                        self.emit(f"{v2} = OpBitwiseOr %uint {value} {hi8}")
+                        value = v2
+            if not store:
+                if signed:
+                    sx = self.tmp()
+                    self.emit(f"{sx} = OpBitFieldSExtract %uint {value} {self.cu(0)} {self.cu(8 * nbytes)}")
+                    value = sx
+                if half is None:
+                    new.append(value)
+                else:
+                    r = self.tmp()
+                    self.emit(f"{r} = OpBitFieldInsert %uint {olds[0]} {value} {self.cu(16 * half)} {self.cu(16)}")
+                    new.append(r)
+        self.emit(f"OpBranch {lbl_end}")
+        self.emit(f"{lbl_end} = OpLabel")
+        if not store:
+            phis = []
+            for i in range(n):                              # all OpPhi first: they must open the merge block
+                ph = self.tmp()
+                self.emit(f"{ph} = OpPhi %uint {new[i]} {lbl_do} {olds[i]} {pre}")
+                phis.append(ph)
+            for i, ph in enumerate(phis):
+                self.store_reg("vgpr", data["r"] + i, ph)
 
     def global_mem(self, op, a, mods):
         """global_load_dword[xN] vD, vaddr, saddr|off offset:N / global_store_dword[xN] vaddr, vD, saddr|off.
@@ -6585,6 +6747,8 @@ class Gen:
             z = self.tmp()
             self.emit(f"{z} = OpSelect %uint {self.tmp_bool_nz(r)} {self.cu(1)} {self.cu(0)}")
             self.emit(f"OpStore %scc {z}")
+        elif op.startswith("scratch_"):
+            self.scratch_mem(op, a, mods)
         elif op.startswith("global_atomic_"):
             self.global_atomic(op, a, mods)
         elif op in self.GLOBAL_SUB:
@@ -10059,7 +10223,7 @@ def assemble(gen):
             gen.cu(v)
     model = "Vertex" if vs else "GLCompute" if cs or msc else "MeshEXT" if ms else "Geometry" if gsx else "Fragment"
     ms_blk = ms and not msc and (gen.uses_clip or gen.uses_cull)
-    iface = list(gen.outputs) + list(gen.inputs) + (["%vertex_index", "%instance_index"] if vs else []) +        (["%wg_id", "%local_id"] if cs else []) + (["%lds"] if gen.uses_lds else []) + (
+    iface = list(gen.outputs) + list(gen.inputs) + (["%vertex_index", "%instance_index"] if vs else []) +        (["%wg_id", "%local_id"] if cs else []) + (["%lds"] if gen.uses_lds else []) + (["%scratch"] if gen.uses_scratch else []) + (
         (["%wg_id", "%num_wg", "%local_index", "%ms_counts"] + ([] if msc else
          [("%ms_out_vtx" if ms_blk else "%ms_out_pos"), "%ms_prim_idx", "%ms_cull"] +
          [f"%ms_out_param{n}" for n in sorted(gen.ms_params)] +
@@ -10363,6 +10527,12 @@ def assemble(gen):
         types += ["%fhalf_g = OpConstant %float 0.5"]
     if gen.uses_f64:
         types += ["%double = OpTypeFloat 64", "%v2uint_d = OpTypeVector %uint 2"]
+    if gen.uses_scratch:
+        types += [f"%scratch_arr = OpTypeArray %uint {gen.cu(SCRATCH_DWORDS)}",
+                  "%_ptr_Private_scratch = OpTypePointer Private %scratch_arr",
+                  "%_ptr_Private_uint_scr = OpTypePointer Private %uint",
+                  "%scratch_init = OpConstantNull %scratch_arr"]
+        gvars += ["%scratch = OpVariable %_ptr_Private_scratch Private %scratch_init"]
     if gen.uses_ballot:
         types += ["%v4uint_bal = OpTypeVector %uint 4"]
     if gen.uses_store_views or gen.uses_int_fetch:
@@ -11084,7 +11254,7 @@ def read_before_write_vgprs(insns):
         if not a:
             continue
         reads_all = op.startswith(("exp", "buffer_store", "tbuffer_store", "image_store", "v_cmp", "v_cmpx", "ds_write",
-                                   "global_store")) \
+                                   "global_store", "scratch_store")) \
             or (op.startswith("global_atomic_") and "glc" not in ins["mods"])   # no vdst without glc
         regs = []
         for x in (a if reads_all else a[1:]):
@@ -11093,7 +11263,7 @@ def read_before_write_vgprs(insns):
             elif x["k"] == "vlist":
                 regs += x["r"]
         if (base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8", "v_pk_fmac_f16") or
-                (op.startswith("global_load_") and "_d16" in op)) and a[0]["k"] == "vgpr":   # d16 keeps a half
+                (op.startswith(("global_load_", "scratch_load_")) and "_d16" in op)) and a[0]["k"] == "vgpr":   # d16 keeps a half
             regs.append(a[0]["r"])
         for r in regs:
             if r not in written and r not in first:
@@ -11143,7 +11313,7 @@ def interp_ij_analysis(insns, g):
         if not a:
             continue
         reads_all = op.startswith(("exp", "buffer_store", "tbuffer_store", "image_store", "v_cmp", "v_cmpx", "ds_write",
-                                   "global_store"))
+                                   "global_store", "scratch_store"))
         if not reads_all and a[0]["k"] == "vgpr":
             for r in range(a[0]["r"], a[0]["r"] + a[0].get("n", 1)):
                 writes[r].append(n)
@@ -11315,7 +11485,7 @@ def reg_reads_writes(insns):
         if not a:
             continue
         reads_all = op.startswith(("exp", "buffer_store", "tbuffer_store", "image_store", "v_cmp", "v_cmpx", "ds_write",
-                                   "global_store"))
+                                   "global_store", "scratch_store"))
         regs = []
         for x in (a if reads_all else a[1:]):
             if x["k"] == "vgpr":
