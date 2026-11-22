@@ -1010,6 +1010,163 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertFalse(flags_aligned.unaligned_addr_b)
 
 
+# ==============================================================================
+# Phase 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+# IEEE 754 Single-Precision Boundary Constants
+POS_ZERO_F32 = 0x0000_0000
+NEG_ZERO_F32 = 0x8000_0000
+POS_INF_F32 = 0x7F80_0000
+NEG_INF_F32 = 0xFF80_0000
+QNAN_F32 = 0x7FC0_0000
+SNAN_F32 = 0x7F80_0001
+MIN_NORMAL_F32 = 0x0080_0000
+MIN_SUBNORMAL_F32 = 0x0000_0001
+MAX_SUBNORMAL_F32 = 0x007F_FFFF
+MAX_NORMAL_F32 = 0x7F7F_FFFF
+ONE_F32 = 0x3F80_0000
+
+
+def bits_to_f32(bits: int) -> float:
+    """Interpret 32-bit unsigned integer as IEEE 754 single-precision float."""
+    return struct.unpack("<f", struct.pack("<I", bits & MASK32))[0]
+
+
+def f32_to_bits(val: float) -> int:
+    """Pack IEEE 754 single-precision float into 32-bit unsigned integer."""
+    return struct.unpack("<I", struct.pack("<f", val))[0]
+
+
+def is_f32_nan(bits: int) -> bool:
+    """Test if 32-bit bit pattern is an IEEE 754 single-precision NaN."""
+    return (bits & 0x7F80_0000) == 0x7F80_0000 and (bits & 0x007F_FFFF) != 0
+
+
+def is_f32_subnormal(bits: int) -> bool:
+    """Test if 32-bit bit pattern is an IEEE 754 single-precision subnormal float."""
+    return (bits & 0x7F80_0000) == 0 and (bits & 0x007F_FFFF) != 0
+
+
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Phase 7: Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormal_decrement_no_flush_to_zero(self) -> None:
+        state = ScalarMachineState32(lds_capacity_dwords=512)
+        interp = ScalarInterpreter32()
+
+        state.lds.write_dword(10, MIN_SUBNORMAL_F32 + 1)
+        state.lds.write_dword(11, MASK32)
+        state.set_vgpr(0, 10 * 4)
+
+        instr = DSDecSrc2U32Instruction(
+            addr=LDSAddressExpression(
+                base_reg=RegisterOperand(0, RegType.VGPR),
+                offset0=0,
+                offset1=1,
+            )
+        )
+
+        new_val = interp.step(instr, state)
+        self.assertEqual(new_val, MIN_SUBNORMAL_F32)
+        self.assertTrue(is_f32_subnormal(new_val))
+        self.assertEqual(state.lds.read_dword(10), MIN_SUBNORMAL_F32)
+
+    def test_normal_to_subnormal_boundary_crossing(self) -> None:
+        state = ScalarMachineState32(lds_capacity_dwords=512)
+        interp = ScalarInterpreter32()
+
+        state.lds.write_dword(12, MIN_NORMAL_F32)
+        state.lds.write_dword(13, MASK32)
+        state.set_vgpr(0, 12 * 4)
+
+        instr = DSDecSrc2U32Instruction(
+            addr=LDSAddressExpression(
+                base_reg=RegisterOperand(0, RegType.VGPR),
+                offset0=0,
+                offset1=1,
+            )
+        )
+
+        new_val = interp.step(instr, state)
+        self.assertEqual(new_val, MAX_SUBNORMAL_F32)
+        self.assertTrue(is_f32_subnormal(new_val))
+        self.assertEqual(state.lds.read_dword(12), MAX_SUBNORMAL_F32)
+
+    def test_signaling_nan_preserved_without_quietening(self) -> None:
+        state = ScalarMachineState32(lds_capacity_dwords=512)
+        interp = ScalarInterpreter32()
+
+        state.lds.write_dword(14, SNAN_F32 + 1)
+        state.lds.write_dword(15, MASK32)
+        state.set_vgpr(0, 14 * 4)
+
+        instr = DSDecSrc2U32Instruction(
+            addr=LDSAddressExpression(
+                base_reg=RegisterOperand(0, RegType.VGPR),
+                offset0=0,
+                offset1=1,
+            )
+        )
+
+        new_val = interp.step(instr, state)
+        self.assertEqual(new_val, SNAN_F32)
+        # Quiet bit 22 is bit 0x0040_0000; must not be forced high
+        self.assertEqual(new_val & 0x0040_0000, 0)
+        self.assertTrue(is_f32_nan(new_val))
+
+    def test_quiet_nan_wrap_boundary(self) -> None:
+        state = ScalarMachineState32(lds_capacity_dwords=512)
+        interp = ScalarInterpreter32()
+
+        state.lds.write_dword(16, 0)
+        state.lds.write_dword(17, QNAN_F32) # 0 wraps to QNAN_F32
+        state.set_vgpr(0, 16 * 4)
+
+        instr = DSDecSrc2U32Instruction(
+            addr=LDSAddressExpression(
+                base_reg=RegisterOperand(0, RegType.VGPR),
+                offset0=0,
+                offset1=1,
+            )
+        )
+
+        new_val = interp.step(instr, state)
+        self.assertEqual(new_val, QNAN_F32)
+        self.assertEqual(state.lds.read_dword(16), QNAN_F32)
+
+    def test_single_precision_infinities(self) -> None:
+        state = ScalarMachineState32(lds_capacity_dwords=512)
+        interp = ScalarInterpreter32()
+
+        # POS_INF_F32
+        state.lds.write_dword(20, POS_INF_F32)
+        state.lds.write_dword(21, MASK32)
+        state.set_vgpr(0, 20 * 4)
+
+        instr = DSDecSrc2U32Instruction(
+            addr=LDSAddressExpression(
+                base_reg=RegisterOperand(0, RegType.VGPR),
+                offset0=0,
+                offset1=1,
+            )
+        )
+
+        new_val = interp.step(instr, state)
+        self.assertEqual(new_val, POS_INF_F32 - 1)
+
+    def test_integer_32bit_boundary_extremes(self) -> None:
+        extremes = [
+            0x0000_0000,
+            0x7FFF_FFFF,
+            0x8000_0000,
+            0xFFFF_FFFE,
+            0xFFFF_FFFF,
+        ]
+        for val in extremes:
+            self.assertEqual(ref_ds_dec_src2_u32(val, val), val if val == 0 else val - 1)
+
+
 
 if __name__ == "__main__":
     unittest.main()
