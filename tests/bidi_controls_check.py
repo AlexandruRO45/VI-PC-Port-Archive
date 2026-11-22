@@ -1,10 +1,11 @@
 """Reject explicit bidirectional text controls in tracked source, scripts and build/CI configuration.
 
-The explicit controls are the embeddings and overrides U+202A..U+202E and the isolates
-U+2066..U+2069. They reorder how text is displayed without changing what a compiler or an
-interpreter reads, so a reviewer can see different code from what runs. Each finding is
-reported as path:line: code point and name. Files are read as UTF-8 with replacement, so the
-check does not enforce an encoding, and Markdown documentation is out of scope.
+The explicit controls are the embeddings and overrides U+202A..U+202E, the isolates
+U+2066..U+2069 and the Arabic letter mark U+061C. They reorder how text is displayed without
+changing what a compiler or an interpreter reads, so a reviewer can see different code from
+what runs. Each finding is reported as path:line: code point and name. Files are read as UTF-8
+with replacement, so the check does not enforce an encoding, and Markdown documentation is out
+of scope.
 """
 
 import argparse
@@ -14,7 +15,7 @@ import subprocess
 import tempfile
 import unicodedata
 
-CONTROLS = frozenset([*range(0x202A, 0x202F), *range(0x2066, 0x206A)])
+CONTROLS = frozenset([0x061C, *range(0x202A, 0x202F), *range(0x2066, 0x206A)])
 SOURCE_SUFFIXES = frozenset({
     ".asm", ".c", ".cc", ".cpp", ".cxx", ".def", ".h", ".hh", ".hlsl", ".hlsli", ".hpp", ".inc",
     ".inl", ".py",                                     # sources
@@ -54,6 +55,7 @@ def tracked_files(root):
 def self_test():
     override = chr(0x202E)
     isolate = chr(0x2066)
+    arabic_letter_mark = chr(0x061C)
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         files = {
@@ -64,6 +66,7 @@ def self_test():
             "docs/notes.md": f"Markdown is out of scope {override}\n",
             "CMakeLists.txt": "project(sample)\n",
             ".github/workflows/ci.yml": f"name: ci{override}\n",
+            "tools/mark.py": f"label = 'r\u00e9sum\u00e9{arabic_letter_mark}'\n",
         }
         for name, text in files.items():
             (root / name).parent.mkdir(parents=True, exist_ok=True)
@@ -74,9 +77,11 @@ def self_test():
             ".github/workflows/ci.yml:1: U+202E RIGHT-TO-LEFT OVERRIDE",
             "tests/isolate.cpp:2: U+2066 LEFT-TO-RIGHT ISOLATE",
             "tools/hidden.py:2: U+202E RIGHT-TO-LEFT OVERRIDE",
+            "tools/mark.py:1: U+061C ARABIC LETTER MARK",
         ], list(findings(root, scoped))
-    # The two ranges are the nine explicit controls, nothing more.
-    assert sorted(CONTROLS) == [0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069]
+    # Two ranges and one code point: the ten explicit controls, nothing more.
+    assert sorted(CONTROLS) == [0x061C, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E,
+                                0x2066, 0x2067, 0x2068, 0x2069]
     print("Self-test passed.")
 
 

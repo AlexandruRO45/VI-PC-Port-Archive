@@ -35,11 +35,9 @@ except ImportError:
 
 
 # Known supported instructions and patterns in pixel_aot.py
-SUPPORTED_ALU = {
-    "v_log_f32", "v_exp_f32", "v_rcp_f32",
-    "v_max_f32", "v_min_f32", "v_sub_f32",
-    "v_mul_legacy_f32", "v_fma_f32", "v_fmac_f32",
-}
+# The floating-point ALU forms come from pixel_aot's own table, so the scanner cannot drift from it.
+PIXEL_ALU_NAMES = tuple(pixel_aot.ALU) if pixel_aot is not None else ()
+SUPPORTED_ALU = {f"v_{name}_f32" for name in PIXEL_ALU_NAMES}
 
 SUPPORTED_INSTRUCTIONS_REGEX = [
     r"s_inst_prefetch\s+.*",
@@ -53,7 +51,7 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"(?:s_load_dwordx4|s_buffer_load_dwordx4)\s+s\[\d+:\d+\],\s+s\[\d+:\d+\],\s+.*",
     r"v_interp_p[12]_f32_e32\s+v\d+,\s+v\d+,\s+attr0\.[xy]",
     r"image_sample\s+v\[\d+:\d+\],\s+v\[\d+:\d+\],\s+s\[\d+:\d+\],\s+s\[\d+:\d+\]\s+dmask:0xf\s+dim:SQ_RSRC_IMG_2D",
-    r"v_(?:log|exp|rcp|max|min|sub|mul_legacy|fma|fmac)_f32(?:_e32|_e64)?\s+v\d+,\s+.*",
+    r"v_(?:" + "|".join(map(re.escape, PIXEL_ALU_NAMES)) + r")_f32(?:_e32|_e64)?\s+v\d+,\s+.*",
     r"v_cvt_pkrtz_f16_f32_e32\s+v\d+,\s+v\d+,\s+v\d+",
     r"exp\s+mrt0\s+v\d+,\s+v\d+,\s+v\d+,\s+v\d+\s+done\s+compr\s+vm",
     r"s_endpgm",
@@ -106,6 +104,9 @@ KNOWN_RDNA2_BASE_OPCODES = {
     # MIMG
     "image_sample", "image_sample_l", "image_sample_b", "image_sample_c", "image_load", "image_store",
 }
+
+
+KNOWN_RDNA2_BASE_OPCODES |= SUPPORTED_ALU
 
 
 def is_opcode_recognized(opcode: str) -> bool:
