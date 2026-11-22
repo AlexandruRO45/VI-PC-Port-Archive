@@ -59,6 +59,13 @@ class DesignTableRows(unittest.TestCase):
                 self.assertEqual(repeated, [], f"rows to merge into one in docs/{page} (topic, lines): " +
                                  "; ".join(f"{k[:60]!r} at {v}" for k, v in repeated))
 
+    def test_design_contract_unique_prefix_topics(self):
+        with open(os.path.join(ROOT, "docs", "design.md"), encoding="utf-8") as f:
+            lines = f.read().split("\n")
+        for prefix in ("No-op SOPP/SMEM", "Scalar select and pack"):
+            matches = [n for n, l in enumerate(lines, 1) if l.startswith(f"| {prefix}")]
+            self.assertEqual(len(matches), 1, f"Expected exactly 1 row for '{prefix}', found at lines {matches}")
+
 
 if __name__ == "__main__":
     unittest.main()
