@@ -778,6 +778,24 @@ def same_report_path(first, second):
         return False
 
 
+
+def _publish_summary(path, text):
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    staged = path + ".partial"
+    try:
+        with open(staged, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        os.replace(staged, path)
+    except BaseException:
+        if os.path.exists(staged):
+            try:
+                os.remove(staged)
+            except OSError:
+                pass
+        raise
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("archive")
@@ -805,6 +823,19 @@ def main(argv=None):
         return 2
     if a.out and a.lights_out and same_report_path(a.out, a.lights_out):
         ap.error("--out and --lights-out must use different paths")
+    for rname, rpath in (("--out", a.out), ("--lights-out", a.lights_out)):
+        if not rpath:
+            continue
+        if os.path.isdir(rpath):
+            print(f"ERROR: {rname} is a directory: {rpath}", file=sys.stderr)
+            return 2
+        parent = os.path.dirname(os.path.abspath(rpath))
+        probe = parent
+        while probe and not os.path.exists(probe):
+            probe = os.path.dirname(probe)
+        if probe and not os.path.isdir(probe):
+            print(f"ERROR: {rname} parent is not a directory: {probe}", file=sys.stderr)
+            return 2
     total = scan(a.archive, a.jobs, a.start, a.limit, bool(a.lights_out))
     try:
         summary = summarize(total, a.entities, a.lights_out)
@@ -816,8 +847,11 @@ def main(argv=None):
         return 2
     text = json.dumps(summary, indent=1, sort_keys=True)
     if a.out:
-        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-            f.write(text + "\n")
+        try:
+            _publish_summary(a.out, text + "\n")
+        except OSError as e:
+            print(f"ERROR: cannot write {a.out}: {e}", file=sys.stderr)
+            return 2
     else:
         sys.stdout.write(text + "\n")
     return 0

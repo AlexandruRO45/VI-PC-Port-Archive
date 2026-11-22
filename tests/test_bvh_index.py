@@ -413,6 +413,35 @@ class ScanTest(unittest.TestCase):
         self.assertIn("is a folder, not a report file", err.getvalue())
 
 
+
+    def test_report_parent_is_a_file_is_rejected(self):
+        blocker = os.path.join(self.dir, "blocker.txt")
+        with open(blocker, "w", encoding="utf-8") as f:
+            f.write("blocker")
+        cases = [
+            (["--out", os.path.join(blocker, "out.json")], "--out parent is not a directory"),
+            (["--csv", os.path.join(blocker, "out.csv")], "--csv parent is not a directory"),
+            (["--out", os.path.join(blocker, "sub", "out.json")], "--out parent is not a directory"),
+        ]
+        for args, expected_msg in cases:
+            err = io.StringIO()
+            with mock.patch.object(bvh_index, "scan_dir", side_effect=AssertionError("scan started")) as scan, \
+                    contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    bvh_index.main([self.dir] + args)
+            scan.assert_not_called()
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn(expected_msg, err.getvalue())
+
+    def test_write_outputs_oserror_returns_2(self):
+        err = io.StringIO()
+        with mock.patch.object(bvh_index, "write_outputs", side_effect=OSError("simulated disk full")), \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            rc = bvh_index.main([self.dir, "--out", os.path.join(self.dir, "out.json")])
+        self.assertEqual(rc, 2)
+        self.assertIn("error: simulated disk full", err.getvalue())
+
+
 class _Unprintable:
     """A cell whose str() fails part-way through the CSV, standing in for a write that dies mid-report."""
 

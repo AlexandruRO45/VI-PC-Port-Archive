@@ -526,6 +526,34 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(len(err.getvalue().strip().splitlines()), 1, err.getvalue())
         self.assertNotIn("Traceback", err.getvalue())
 
+    def test_report_destination_directory_or_file_parent_rejected(self):
+        blocker = os.path.join(self.tmp.name, "blocker.txt")
+        with open(blocker, "w", encoding="utf-8") as f:
+            f.write("content")
+        folder = os.path.join(self.tmp.name, "folder_dest")
+        os.makedirs(folder, exist_ok=True)
+        cases = [
+            (["--out", folder], "ERROR: --out is a directory"),
+            (["--lights-out", folder], "ERROR: --lights-out is a directory"),
+            (["--out", os.path.join(blocker, "out.json")], "ERROR: --out parent is not a directory"),
+            (["--lights-out", os.path.join(blocker, "lights.jsonl")], "ERROR: --lights-out parent is not a directory"),
+        ]
+        for args, expected_msg in cases:
+            err = io.StringIO()
+            with mock.patch.object(T, "scan", side_effect=AssertionError("scan started")) as scan, \
+                    contextlib.redirect_stderr(err):
+                rc = T.main([self.rpf] + args)
+            scan.assert_not_called()
+            self.assertEqual(rc, 2)
+            self.assertIn(expected_msg, err.getvalue())
+
+    def test_out_summary_nested_directory_creation_and_atomic_replace(self):
+        nested = os.path.join(self.tmp.name, "sub1", "sub2", "summary.json")
+        rc = T.main([self.rpf, "--out", nested])
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.isfile(nested))
+        self.assertFalse(os.path.exists(nested + ".partial"))
+
     def test_bad_input_is_one_line(self):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):

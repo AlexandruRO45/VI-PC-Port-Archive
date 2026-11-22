@@ -486,8 +486,16 @@ def main(argv=None):
     if a.csv and same_output_path(a.target, a.csv):
         ap.error("--csv must not overwrite the source")
     for flag, path in (("--out", a.out), ("--csv", a.csv)):
-        if path and os.path.isdir(path):
+        if not path:
+            continue
+        if os.path.isdir(path):
             ap.error(f"{flag} is a folder, not a report file: {path}")
+        parent = os.path.dirname(os.path.abspath(path))
+        probe = parent
+        while probe and not os.path.exists(probe):
+            probe = os.path.dirname(probe)
+        if probe and not os.path.isdir(probe):
+            ap.error(f"{flag} parent is not a directory: {probe}")
     if os.path.isdir(a.target):
         manifest = os.path.join(a.target, "index.json")
         for flag, path in (("--out", a.out), ("--csv", a.csv)):
@@ -515,7 +523,11 @@ def main(argv=None):
             return 2
     for s in summaries:
         print(json.dumps(s, indent=1))
-    write_outputs(rows, summaries, a.out, a.csv)
+    try:
+        write_outputs(rows, summaries, a.out, a.csv)
+    except OSError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     if not rows:
         print("no zlib streams found", file=sys.stderr)
     return 0
