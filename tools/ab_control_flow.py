@@ -22,6 +22,7 @@ import argparse
 import collections
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -108,13 +109,41 @@ def main():
     ap.add_argument("--names", help="run exactly the shaders listed in this file (one per line), no selection")
     ap.add_argument("--runs", type=int, default=1, help="render each form this many times; all must agree")
     a = ap.parse_args()
+
+    # BUILD-95: validate inputs before starting, exit with clean error (no traceback)
+    if not os.path.isdir(a.repo):
+        raise SystemExit(f"repo directory not found: {a.repo}")
+    if not os.path.isdir(a.shaders):
+        raise SystemExit(f"shaders directory not found: {a.shaders}")
     disasm = os.path.join(a.shaders, "dxbc", "disasm")
+    if not os.path.isdir(disasm):
+        raise SystemExit(f"shaders/dxbc/disasm not found: {disasm}")
     old = os.path.join(a.shaders, "spirv")
-    new = os.path.join(a.out, "new")
-    os.makedirs(new, exist_ok=True)
-    # The texture test's harness: it binds a heap, a descriptor table, a fallback texture and a sampler.
+    if not os.path.isdir(old):
+        raise SystemExit(f"shaders/spirv not found: {old}")
+    index_path = os.path.join(old, "index.json")
+    if not os.path.isfile(index_path):
+        raise SystemExit(f"shaders/spirv/index.json not found: {index_path}")
+    if not os.path.exists(a.out):
+        try:
+            os.makedirs(a.out, exist_ok=True)
+        except OSError as e:
+            raise SystemExit(f"cannot create output directory {a.out}: {e}")
+    if not os.access(a.out, os.W_OK):
+        raise SystemExit(f"output directory not writable: {a.out}")
+
+    if a.names and not os.path.isfile(a.names):
+        raise SystemExit(f"names file not found: {a.names}")
+
     exe = "vk_texture_test.exe" if os.name == "nt" else "vk_texture_test"
     harness = a.harness or os.path.join(a.repo, "runtime", "build", exe)
+    if not os.path.isfile(harness):
+        raise SystemExit(f"harness not found: {harness} (build runtime/ or pass --harness)")
+
+    for tool in ("spirv-as", "spirv-val"):
+        if not shutil.which(tool):
+            raise SystemExit(f"{tool} not found on PATH; Vulkan SDK required")
+
     vs = test_vertex_shader(a.out)
 
     import json
