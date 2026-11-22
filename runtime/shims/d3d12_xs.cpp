@@ -217,7 +217,28 @@ static_assert(std::is_same_v<decltype(&serialize_root_signature), SerializeFn>);
 static_assert(std::is_same_v<decltype(&create_root_signature_deserializer), DeserializerFn>);
 static_assert(std::is_same_v<decltype(&serialize_root_signature_legacy), LegacySerializeFn>);
 
+// The runtime's 93 GUID data exports (docs/d3d12_xs_surface.md section 2.2): 83 the Windows SDK also defines, with
+// the same bytes, and 10 console-only ones. A title linked against the console import library imports them as data,
+// so the import address table slot holds the address of the GUID itself; an import nobody serves is bound to the
+// unimplemented-import thunk, and the title would read that thunk's code as its interface id without ever calling
+// it. The values come from tools/d3d12_xs_surface.py, which checks the standard ones against the SDK headers.
+#define LEONIDA_D3D12_XS_GUID(name, d1, d2, d3, b0, b1, b2, b3, b4, b5, b6, b7) \
+    const GUID kExport_##name = {d1, d2, d3, {b0, b1, b2, b3, b4, b5, b6, b7}};
+#include "d3d12_xs_guids.inc"
+#undef LEONIDA_D3D12_XS_GUID
+
 }  // namespace
+
+// Served by name. The ordinals are not: 34 of the 93 are derived from an ordering rule, not read from the runtime.
+#define LEONIDA_D3D12_XS_GUID(name, ...) \
+    {"d3d12_xs.dll", #name, const_cast<void*>(static_cast<const void*>(&kExport_##name))},
+static const ::rt::shims::Entry d3d12_xs_guid_entries[] = {
+#include "d3d12_xs_guids.inc"
+};
+#undef LEONIDA_D3D12_XS_GUID
+static_assert(sizeof(d3d12_xs_guid_entries) / sizeof(d3d12_xs_guid_entries[0]) == 93, "the runtime exports 93 GUIDs");
+static ::rt::shims::Table d3d12_xs_guid_table(d3d12_xs_guid_entries,
+                                              sizeof(d3d12_xs_guid_entries) / sizeof(d3d12_xs_guid_entries[0]));
 
 SHIM_TABLE(d3d12_xs,
     {"d3d12_xs.dll", "D3D12SerializeVersionedRootSignature", reinterpret_cast<void*>(&serialize_root_signature)},

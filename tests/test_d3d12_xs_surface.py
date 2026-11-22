@@ -38,6 +38,17 @@ def test_unrecovered_console_iids_stay_outside_the_table():
     assert S.check_unrecovered_console_iids() == []
 
 
+def test_runtime_guid_table_is_the_tools_output():
+    """runtime/shims/d3d12_xs_guids.inc, which the runtime serves as d3d12_xs.dll's data exports, is `--inc`."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "runtime", "shims", "d3d12_xs_guids.inc"), encoding="utf-8", newline="") as f:
+        committed = f.read()
+    assert committed.replace("\r\n", "\n") == S.inc_text()
+    calls = [line for line in S.inc_text().splitlines() if line.startswith(S.INC_MACRO + "(")]
+    assert len(calls) == 93 == len(S.DATA_EXPORTS)
+    assert sum(1 for line in calls if line.split("(")[1].split(",")[0] in S.CONSOLE_IIDS) == 10
+
+
 def test_standard_iids_match_sdk():
     um, _shared = S.find_sdk_include()
     if not um:
