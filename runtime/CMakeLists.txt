@@ -942,6 +942,7 @@ if(TARGET Vulkan::Headers)
 
     add_executable(d3d12_com_test test/d3d12_com_test.cpp)
     target_link_libraries(d3d12_com_test PRIVATE gta6rt_d3d12_com)
+    target_include_directories(d3d12_com_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)  # ID3D12ResourceStubs
     target_compile_definitions(d3d12_com_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_com_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_com COMMAND d3d12_com_test)
@@ -1626,10 +1627,20 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_pipeline_library COMMAND d3d12_pipeline_library_test)
       set_tests_properties(d3d12_pipeline_library PROPERTIES SKIP_RETURN_CODE 77)
       # ExecuteBundle: what a bundle's draws inherit and hand back, against the host runtime and WARP.
-      add_executable(d3d12_bundle_test test/d3d12_bundle_test.cpp ${LEONIDA_TEST_VS} ${LEONIDA_TEST_PS})
+      set(LEONIDA_TEST_CS_BUNDLE ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_bundle_dispatch.spv)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_CS_BUNDLE}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_CS_BUNDLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_bundle_dispatch.comp
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_bundle_dispatch.comp
+        COMMENT "Compiling the bundle test's compute shader"
+        VERBATIM)
+      add_executable(d3d12_bundle_test test/d3d12_bundle_test.cpp ${LEONIDA_TEST_VS} ${LEONIDA_TEST_PS}
+                     ${LEONIDA_TEST_CS_BUNDLE})
       target_link_libraries(d3d12_bundle_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
       target_compile_definitions(d3d12_bundle_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
-                                 LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}")
+                                 LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}"
+                                 LEONIDA_TEST_CS_SPV="${LEONIDA_TEST_CS_BUNDLE}")
       target_compile_options(d3d12_bundle_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_bundle COMMAND d3d12_bundle_test)
       set_tests_properties(d3d12_bundle PROPERTIES SKIP_RETURN_CODE 77)

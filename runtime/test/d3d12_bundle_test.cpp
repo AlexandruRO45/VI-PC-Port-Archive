@@ -37,6 +37,9 @@
 #if !defined(LEONIDA_TEST_VS_SPV) || !defined(LEONIDA_TEST_PS_SPV)
 #error "LEONIDA_TEST_VS_SPV and LEONIDA_TEST_PS_SPV must name the compiled test shaders"
 #endif
+#ifndef LEONIDA_TEST_CS_SPV
+#error "LEONIDA_TEST_CS_SPV must name the compiled compute test shader"
+#endif
 
 #define CHECK(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return false; } \
@@ -66,6 +69,9 @@ constexpr UINT64 ib_half = 144;      // 3 2 1: the lower-right half
 constexpr UINT64 tint_red = 256;     // (1, 0, 1): the red vertices stay red
 constexpr UINT64 tint_green = 512;   // (0, 1, 0)
 constexpr UINT64 tint_yellow = 768;  // (1, 1, 1)
+constexpr UINT64 args_draw = 1024;   // D3D12_DRAW_ARGUMENTS {4, 1, 0, 0}, then {0, 0, 0, 0}
+constexpr UINT64 args_indexed = 1088;  // D3D12_DRAW_INDEXED_ARGUMENTS {6, 1, 0, 0, 0}
+constexpr UINT64 args_count = 1152;  // a count of 1
 
 // An expected grid: eight rows of eight letters, rows separated by a space.
 #define BLANK4 "BBBBBBBB BBBBBBBB BBBBBBBB BBBBBBBB"
@@ -77,6 +83,7 @@ struct Rig {
     ID3D12Device* device = nullptr;
     Ref<ID3D12RootSignature> root1, root2;  // root2 adds a third parameter, so it is a different signature
     Ref<ID3D12PipelineState> pso_a, pso_b, pso_a2;  // b writes only green and alpha; a2 is a on root2
+    Ref<ID3D12CommandSignature> sig_draw, sig_indexed;  // one DRAW or DRAW_INDEXED argument
     Ref<ID3D12CommandQueue> queue;
     Ref<ID3D12Fence> fence;
     Ref<ID3D12Resource> upload, target, readback;
@@ -179,6 +186,12 @@ struct Rig {
         std::memcpy(up + tint_red, tints[0], sizeof(tints[0]));
         std::memcpy(up + tint_green, tints[1], sizeof(tints[1]));
         std::memcpy(up + tint_yellow, tints[2], sizeof(tints[2]));
+        const UINT draw_args[4] = {4, 1, 0, 0};
+        const UINT indexed_args[5] = {6, 1, 0, 0, 0};
+        const UINT count = 1;
+        std::memcpy(up + args_draw, draw_args, sizeof(draw_args));
+        std::memcpy(up + args_indexed, indexed_args, sizeof(indexed_args));
+        std::memcpy(up + args_count, &count, sizeof(count));
         upload->Unmap(0, nullptr);
         upload_va = upload->GetGPUVirtualAddress();
 
@@ -189,6 +202,12 @@ struct Rig {
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
         CHECK(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
         CHECK(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+        D3D12_INDIRECT_ARGUMENT_DESC argument{D3D12_INDIRECT_ARGUMENT_TYPE_DRAW};
+        D3D12_COMMAND_SIGNATURE_DESC signature{sizeof(D3D12_DRAW_ARGUMENTS), 1, &argument, 0};
+        CHECK(SUCCEEDED(device->CreateCommandSignature(&signature, nullptr, IID_PPV_ARGS(&sig_draw.p))));
+        argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
+        signature.ByteStride = sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
+        CHECK(SUCCEEDED(device->CreateCommandSignature(&signature, nullptr, IID_PPV_ARGS(&sig_indexed.p))));
         return true;
     }
 
@@ -304,6 +323,7 @@ struct Scenario {
     const char* name;
     Recorder record;
     const char* expected;  // null: print only
+    bool layer = true;     // false: the host only (the layer records no state for an indirect draw yet)
 };
 
 constexpr auto strip = D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
@@ -444,6 +464,45 @@ std::vector<Scenario> scenarios() {
                      r.vertices(l, vb_other);
                      l->DrawInstanced(4, 1, 0, 0);
                  }, ROWS4("YYYYBBBB") " " ROWS4("BBBBYYYY")});
+    // ExecuteIndirect of a draw records no pipeline, render targets or vertex state on the layer, even on a direct
+    // list, so these run on the host only; d3d12_com_test checks how the layer records and replays the call.
+    s.push_back({"indirect: a bundle's ExecuteIndirect draw sees the parent's state",
+                 [parent_state](Rig& r, ID3D12GraphicsCommandList* l) {
+                     auto* b = r.bundle(r.pso_a.p, [&](ID3D12GraphicsCommandList* b) {
+                         b->IASetPrimitiveTopology(strip);
+                         b->ExecuteIndirect(r.sig_draw.p, 1, r.upload.p, args_draw, nullptr, 0);
+                     });
+                     parent_state(r, l, tlist);
+                     r.execute(l, b);
+                 }, ROWS4("RRRRBBBB") " " BLANK4, false});
+    s.push_back({"indirect: a bundle's ExecuteIndirect indexed draw sees the parent's index buffer",
+                 [parent_state](Rig& r, ID3D12GraphicsCommandList* l) {
+                     auto* b = r.bundle(r.pso_a.p, [&](ID3D12GraphicsCommandList* b) {
+                         b->IASetPrimitiveTopology(tlist);
+                         b->ExecuteIndirect(r.sig_indexed.p, 1, r.upload.p, args_indexed, nullptr, 0);
+                     });
+                     parent_state(r, l, strip);
+                     r.indices(l, ib_quad);
+                     r.execute(l, b);
+                 }, ROWS4("RRRRBBBB") " " BLANK4, false});
+    // Both host adapters fail the bundle's Close when its ExecuteIndirect has a count buffer, so nothing is drawn.
+    s.push_back({"indirect: a bundle's ExecuteIndirect with a count buffer is refused at Close",
+                 [parent_state](Rig& r, ID3D12GraphicsCommandList* l) {
+                     auto* b = r.bundle(r.pso_a.p, [&](ID3D12GraphicsCommandList* b) {
+                         b->IASetPrimitiveTopology(strip);
+                         b->ExecuteIndirect(r.sig_draw.p, 2, r.upload.p, args_draw, r.upload.p, args_count);
+                     });
+                     parent_state(r, l, tlist);
+                     r.execute(l, b);
+                 }, "bundle Close failed " ROWS4("BBBBBBBB") " " ROWS4("BBBBBBBB")});
+    // The control: the same signature, buffers and count buffer on a direct list are accepted, so the refusal above is
+    // the bundle's rule.
+    s.push_back({"indirect: the same count buffer on a direct list is accepted",
+                 [parent_state](Rig& r, ID3D12GraphicsCommandList* l) {
+                     parent_state(r, l, strip);
+                     l->SetPipelineState(r.pso_a.p);
+                     l->ExecuteIndirect(r.sig_draw.p, 2, r.upload.p, args_draw, r.upload.p, args_count);
+                 }, ROWS4("RRRRBBBB") " " BLANK4, false});
     return s;
 }
 
@@ -482,6 +541,11 @@ constexpr char hlsl[] =
 bool run_all(ID3D12Device* shared, bool own_device, IDXGIAdapter* adapter, const std::vector<std::uint8_t>& vs, const std::vector<std::uint8_t>& ps,
              const std::vector<Scenario>& list, std::vector<std::string>& grids, std::vector<HRESULT>& closes) {
     for (const Scenario& scenario : list) {
+        if (!own_device && !scenario.layer) {
+            grids.emplace_back();
+            closes.push_back(S_OK);
+            continue;
+        }
         Rig rig;
         Ref<ID3D12Device> own;
         if (own_device) D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&own.p));
@@ -715,6 +779,127 @@ bool layer_checks(ID3D12Device* device, const std::vector<std::uint8_t>& vs, con
     return true;
 }
 
+// An indirect dispatch recorded in a bundle takes the compute root signature and root arguments of the list that
+// executes it; the pipeline state is the bundle's own, the one it was created with (a bundle created without one
+// dispatches nothing on the host, while the layer would run the parent's, so that case is not run). The shader writes out[i] = s0 + s1 * i from
+// the root constants and a root UAV; the dispatch arguments in the bundle's buffer are 2 groups of 64, so words 0..127
+// are written and nothing after them.
+constexpr char hlsl_cs[] =
+    "cbuffer Args : register(b0) { uint base; uint step; };\n"
+    "RWByteAddressBuffer result : register(u0);\n"
+    "[numthreads(64, 1, 1)] void cs(uint3 id : SV_DispatchThreadID) { result.Store(id.x * 4, base + step * id.x); }\n";
+
+const char* const compute_names[] = {
+    "dispatch: an indirect dispatch sees the parent's compute root signature and arguments",
+    "dispatch: one bundle executed twice with other root arguments in between"};
+constexpr int compute_count = 2;
+constexpr UINT compute_words = 128;  // 2 groups of 64
+
+// Runs scenario `which` on `device` with compute shader `cs`; "ok", or what differed.
+std::string compute_scenario(ID3D12Device* device, const std::vector<std::uint8_t>& cs, int which) {
+    Ref<ID3D12RootSignature> root;
+    Ref<ID3D12PipelineState> pso;
+    Ref<ID3D12CommandSignature> signature;
+    Ref<ID3D12Resource> arguments, out, readback;
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12Fence> fence;
+    D3D12_ROOT_PARAMETER params[2] = {};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants = {0, 0, 2};
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    params[1].Descriptor = {0, 0};
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
+    root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
+    root_desc.Desc_1_0 = {2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    const auto blob = serialize_root_signature(root_desc);
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc{};
+    D3D12_INDIRECT_ARGUMENT_DESC argument{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH};
+    const D3D12_COMMAND_SIGNATURE_DESC signature_desc{sizeof(D3D12_DISPATCH_ARGUMENTS), 1, &argument, 0};
+    const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD}, default_heap{D3D12_HEAP_TYPE_DEFAULT},
+        readback_heap{D3D12_HEAP_TYPE_READBACK};
+    constexpr UINT64 out_bytes = 2048;
+    const auto args_desc = buffer_desc(256);
+    const auto out_desc = buffer_desc(out_bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    const auto readback_desc = buffer_desc(out_bytes);
+    if (blob.empty() || FAILED(device->CreateRootSignature(0, blob.data(), blob.size(), IID_PPV_ARGS(&root.p))))
+        return "setup: root signature";
+    pso_desc.pRootSignature = root.p;
+    pso_desc.CS = {cs.data(), cs.size()};
+    if (FAILED(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&pso.p)))) return "setup: pipeline";
+    if (FAILED(device->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature.p))))
+        return "setup: command signature";
+    if (FAILED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &args_desc,
+                                               D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&arguments.p))) ||
+        FAILED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &out_desc,
+                                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&out.p))) ||
+        FAILED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
+                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback.p))))
+        return "setup: buffers";
+    const D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    if (FAILED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))) ||
+        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))))
+        return "setup: queue";
+    {
+        std::uint32_t* up = nullptr;
+        if (FAILED(arguments->Map(0, nullptr, reinterpret_cast<void**>(&up)))) return "setup: map";
+        up[0] = 2, up[1] = 1, up[2] = 1;
+        arguments->Unmap(0, nullptr);
+    }
+
+    Ref<ID3D12CommandAllocator> bundle_allocator, allocator;
+    Ref<ID3D12GraphicsCommandList> bundle, list;
+    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE, IID_PPV_ARGS(&bundle_allocator.p))) ||
+        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, bundle_allocator.p,
+                                         pso.p, IID_PPV_ARGS(&bundle.p))))
+        return "setup: bundle";
+    bundle->ExecuteIndirect(signature.p, 1, arguments.p, 0, nullptr, 0);
+    if (FAILED(bundle->Close())) return "bundle Close failed";
+    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))) ||
+        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr, IID_PPV_ARGS(&list.p))))
+        return "setup: list";
+    const D3D12_GPU_VIRTUAL_ADDRESS va = out->GetGPUVirtualAddress();
+    const auto arguments_at = [&](std::uint32_t base, std::uint32_t step, UINT64 offset) {
+        const std::uint32_t values[2] = {base, step};
+        list->SetComputeRoot32BitConstants(0, 2, values, 0);
+        list->SetComputeRootUnorderedAccessView(1, va + offset);
+    };
+    list->SetComputeRootSignature(root.p);
+    arguments_at(100, 3, 0);
+    list->ExecuteBundle(bundle.p);
+    if (which == 1) {
+        arguments_at(7, 1, 1024);
+        list->ExecuteBundle(bundle.p);
+    }
+    D3D12_RESOURCE_BARRIER to_copy = transition(out.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                                D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->ResourceBarrier(1, &to_copy);
+    list->CopyBufferRegion(readback.p, 0, out.p, 0, out_bytes);
+    if (const HRESULT closed = list->Close(); FAILED(closed)) {
+        char text[40];
+        std::snprintf(text, sizeof(text), "parent Close 0x%08lx", static_cast<unsigned long>(closed));
+        return text;
+    }
+    ID3D12CommandList* lists[] = {list.p};
+    queue->ExecuteCommandLists(1, lists);
+    if (FAILED(queue->Signal(fence.p, 1)) || FAILED(fence->SetEventOnCompletion(1, nullptr))) return "setup: wait";
+    const std::uint32_t* words = nullptr;
+    if (FAILED(readback->Map(0, nullptr, const_cast<void**>(reinterpret_cast<const void* const*>(&words)))))
+        return "setup: readback";
+    std::string result = "ok";
+    for (UINT i = 0; i < out_bytes / 4 && result == "ok"; ++i) {
+        std::uint32_t want = 0;
+        if (i < compute_words) want = 100 + 3 * i;
+        else if (which == 1 && i >= 256 && i < 256 + compute_words) want = 7 + (i - 256);
+        if (words[i] != want) {
+            char text[80];
+            std::snprintf(text, sizeof(text), "word %u is %u, expected %u", i, words[i], want);
+            result = text;
+        }
+    }
+    readback->Unmap(0, nullptr);
+    return result;
+}
+
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     vktest::Device vk;
@@ -729,7 +914,9 @@ int main() {
     // Layer shaders: FSSM-shaped containers found by hash in a translator-style index.
     const auto vs_program = fssm_program({0x56530101, 0xbf810000});
     const auto ps_program = fssm_program({0x50530101, 0xbf810000});
+    const auto cs_program = fssm_program({0x43530101, 0xbf810000});
     const auto vs_container = shader_container(vs_program), ps_container = shader_container(ps_program);
+    const auto cs_container = shader_container(cs_program);
     // Removed on every way out of main.
     struct Scratch {
         std::filesystem::path path = std::filesystem::temp_directory_path() / "leonida_bundle_test";
@@ -742,6 +929,7 @@ int main() {
     const auto& library = scratch.path;
     std::filesystem::copy_file(LEONIDA_TEST_VS_SPV, library / "vs_draw.spv", std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_TEST_PS_SPV, library / "ps_draw.spv", std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(LEONIDA_TEST_CS_SPV, library / "cs_bundle.spv", std::filesystem::copy_options::overwrite_existing);
     {
         std::ofstream index(library / "index.json", std::ios::binary);
         index << "{\"vs_draw\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_program)
@@ -751,11 +939,14 @@ int main() {
                  "{\"semantic\": \"POSITION\", \"semantic_index\": 0, \"register\": 1, \"mask\": 3, \"rw_mask\": 3, "
                  "\"system_value\": 0, \"component_type\": \"float\"}]},\n"
                  " \"ps_draw\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_program)
-              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0]}}";
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0]},\n"
+                 " \"cs_bundle\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << leonida::sha256_hex(cs_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"local_size\": [64, 1, 1]}}";
     }
     const unsigned errors_before = vk.validation_errors();
     std::vector<std::string> layer_grids;
     std::vector<HRESULT> layer_closes;
+    std::vector<std::string> layer_compute;
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = vk.instance_proc;
@@ -770,18 +961,21 @@ int main() {
         REQUIRE(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p))));
         REQUIRE(run_all(ours.p, false, nullptr, vs_container, ps_container, list, layer_grids, layer_closes));
         REQUIRE(layer_checks(ours.p, vs_container, ps_container, library));
+        for (int i = 0; i < compute_count; ++i) layer_compute.push_back(compute_scenario(ours.p, cs_container, i));
     }
 
     // The host: Windows' D3D12 on the default adapter and on WARP.
-    std::vector<std::uint8_t> host_vs, host_ps;
+    std::vector<std::uint8_t> host_vs, host_ps, host_cs;
     const bool wine = hostwine::host_is_wine();
     const bool host_shaders = !wine && compile_hlsl(hlsl, "vs", "vs_5_0", host_vs) &&
-                              compile_hlsl(hlsl, "ps", "ps_5_0", host_ps);
+                              compile_hlsl(hlsl, "ps", "ps_5_0", host_ps) &&
+                              compile_hlsl(hlsl_cs, "cs", "cs_5_0", host_cs);
     struct HostRun {
         const char* name = "";
         bool ran = false;
         std::vector<std::string> grids;
         std::vector<HRESULT> closes;
+        std::vector<std::string> compute;
     } hosts[2];
     hosts[0].name = "the default adapter";
     hosts[1].name = "WARP";
@@ -794,6 +988,7 @@ int main() {
             if (i == 1 && FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter.p)))) continue;
             if (FAILED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) continue;
             REQUIRE(run_all(nullptr, true, adapter.p, host_vs, host_ps, list, hosts[i].grids, hosts[i].closes));
+            for (int c = 0; c < compute_count; ++c) hosts[i].compute.push_back(compute_scenario(host.p, host_cs, c));
             hosts[i].ran = true;
         }
     } else if (!wine) {
@@ -820,10 +1015,24 @@ int main() {
             ++failures;
             continue;
         }
-        verdict("the layer", list[i], layer_grids[i], layer_closes[i]);
+        if (list[i].layer) verdict("the layer", list[i], layer_grids[i], layer_closes[i]);
         for (const auto& host : hosts) {
             if (!host.ran) continue;
             verdict(host.name, list[i], host.grids[i], host.closes[i]);
+            ++compared;
+        }
+    }
+    for (int i = 0; i < compute_count; ++i) {
+        const auto check = [&](const char* who, const std::string& got) {
+            if (got != "ok") {
+                std::fprintf(stderr, "FAIL %s on %s: %s\n", compute_names[i], who, got.c_str());
+                ++failures;
+            }
+        };
+        check("the layer", layer_compute[i]);
+        for (const auto& host : hosts) {
+            if (!host.ran) continue;
+            check(host.name, host.compute[i]);
             ++compared;
         }
     }
@@ -834,7 +1043,16 @@ int main() {
     }
     if (!hosts[0].ran && !hosts[1].ran && !hostwine::host_is_wine())
         std::fprintf(stderr, "no D3D12 reference device (default adapter or WARP)\n");
-    std::printf("bundles: %zu scenarios on the layer, %u host comparisons, %u failures\n", list.size(), compared,
+    std::size_t layer_scenarios = compute_count, host_only = 0;
+    for (const Scenario& scenario : list) (scenario.layer ? layer_scenarios : host_only) += 1;
+    std::printf("bundles: %zu scenarios on the layer, %u host comparisons, %u failures\n", layer_scenarios, compared,
                 failures);
+    if (host_only) {
+        if (hosts[0].ran || hosts[1].ran)
+            std::printf("bundles: %zu host-only scenarios (the layer records no state for an indirect draw)\n",
+                        host_only);
+        else
+            std::printf("bundles: %zu host-only scenarios NOT CHECKED (no D3D12 reference device)\n", host_only);
+    }
     return failures ? 1 : 0;
 }

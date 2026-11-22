@@ -4,12 +4,15 @@
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
+#include "d3d12_stubs.h"
 #include "../shims/d3d12_trace.h"
 #include "../src/gfx10_descriptors.h"
 
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <variant>
+#include <vector>
 
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return 1; } \
@@ -25,6 +28,26 @@ struct Ref {
     }
     T* operator->() const { return p; }
     void** out() { return reinterpret_cast<void**>(&p); }
+};
+
+// A buffer that only counts references: a list's ExecuteIndirect needs a real object to hold, not an address.
+struct FakeBuffer final : ID3D12ResourceStubs {
+    ULONG refs = 1;
+    bool* gone;
+    explicit FakeBuffer(bool* gone_flag) : gone(gone_flag) {}
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG left = --refs;
+        if (!left) {
+            *gone = true;
+            delete this;
+        }
+        return left;
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void** out) override {
+        if (out) *out = nullptr;
+        return E_NOINTERFACE;
+    }
 };
 
 }  // namespace
@@ -197,6 +220,87 @@ int main(int argc, char** argv) {
                                                          IID_PPV_ARGS(&invalid_caller.p))));
         invalid_caller->ExecuteBundle(invalid_bundle.p);
         EXPECT(invalid_caller->Close() == E_INVALIDARG);
+        // ExecuteIndirect in a bundle: kept as the application called it and played on the parent, which holds
+        // the pipeline for a dispatch. A count buffer is refused at Close (the host does the same, d3d12_bundle_test).
+        {
+            Ref<ID3D12CommandSignature> draw_signature, dispatch_signature;
+            EXPECT(SUCCEEDED(rt::d3d12::create_command_signature(IndirectKind::draw, sizeof(D3D12_DRAW_ARGUMENTS),
+                                                                  IID_PPV_ARGS(&draw_signature.p))));
+            EXPECT(SUCCEEDED(rt::d3d12::create_command_signature(IndirectKind::dispatch,
+                                                                  sizeof(D3D12_DISPATCH_ARGUMENTS),
+                                                                  IID_PPV_ARGS(&dispatch_signature.p))));
+            bool gone = false;
+            auto* arguments = new FakeBuffer(&gone);
+            const auto make_bundle = [&](Ref<ID3D12CommandAllocator>& allocator, Ref<ID3D12GraphicsCommandList8>& list) {
+                return SUCCEEDED(rt::d3d12::create_command_allocator(D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                                                                      IID_PPV_ARGS(&allocator.p))) &&
+                       SUCCEEDED(rt::d3d12::create_command_list(D3D12_COMMAND_LIST_TYPE_BUNDLE, allocator.p,
+                                                                 IID_PPV_ARGS(&list.p)));
+            };
+            const auto make_parent = [&](Ref<ID3D12CommandAllocator>& allocator, Ref<ID3D12GraphicsCommandList8>& list) {
+                return SUCCEEDED(rt::d3d12::create_command_allocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                                      IID_PPV_ARGS(&allocator.p))) &&
+                       SUCCEEDED(rt::d3d12::create_command_list(D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p,
+                                                                 IID_PPV_ARGS(&list.p)));
+            };
+            Ref<ID3D12CommandAllocator> draw_bundle_allocator, draw_parent_allocator;
+            Ref<ID3D12GraphicsCommandList8> draw_bundle, draw_parent;
+            EXPECT(make_bundle(draw_bundle_allocator, draw_bundle) && make_parent(draw_parent_allocator, draw_parent));
+            draw_bundle->ExecuteIndirect(draw_signature.p, 3, arguments, 16, nullptr, 0);
+            EXPECT(arguments->refs == 2);  // the bundle holds its argument buffer
+            EXPECT(draw_bundle->Close() == S_OK);
+            draw_parent->ExecuteBundle(draw_bundle.p);
+            draw_parent->ExecuteBundle(draw_bundle.p);  // played again, not recorded again
+            EXPECT(draw_parent->Close() == S_OK);
+            std::vector<Command> played;
+            EXPECT(rt::d3d12::recorded_commands(draw_parent.p, played) && played.size() == 2);
+            for (const Command& command : played) {
+                const auto* indirect = std::get_if<ExecuteIndirect>(&command);
+                EXPECT(indirect && indirect->kind == IndirectKind::draw && indirect->max_count == 3 &&
+                       indirect->argument_buffer == rt::d3d12::resource_id(arguments) &&
+                       indirect->argument_offset == 16 && indirect->stride == sizeof(D3D12_DRAW_ARGUMENTS) &&
+                       !indirect->count_buffer);
+            }
+
+            // A dispatch needs the parent's compute pipeline and root signature, which the bundle cannot know:
+            // the parent's Close fails when the bundle plays, not the bundle's.
+            Ref<ID3D12CommandAllocator> dispatch_bundle_allocator, dispatch_parent_allocator;
+            Ref<ID3D12GraphicsCommandList8> dispatch_bundle, dispatch_parent;
+            EXPECT(make_bundle(dispatch_bundle_allocator, dispatch_bundle) &&
+                   make_parent(dispatch_parent_allocator, dispatch_parent));
+            dispatch_bundle->ExecuteIndirect(dispatch_signature.p, 1, arguments, 0, nullptr, 0);
+            EXPECT(dispatch_bundle->Close() == S_OK);
+            dispatch_parent->ExecuteBundle(dispatch_bundle.p);
+            EXPECT(dispatch_parent->Close() == E_INVALIDARG);
+
+            // Arguments that need nothing from the parent fail the bundle's own Close.
+            Ref<ID3D12CommandAllocator> count_allocator, null_allocator, zero_allocator;
+            Ref<ID3D12GraphicsCommandList8> count_bundle, null_bundle, zero_bundle;
+            EXPECT(make_bundle(count_allocator, count_bundle) && make_bundle(null_allocator, null_bundle) &&
+                   make_bundle(zero_allocator, zero_bundle));
+            count_bundle->ExecuteIndirect(draw_signature.p, 1, arguments, 0, arguments, 0);
+            EXPECT(count_bundle->Close() == E_INVALIDARG);
+            null_bundle->ExecuteIndirect(draw_signature.p, 1, nullptr, 0, nullptr, 0);
+            EXPECT(null_bundle->Close() == E_INVALIDARG);
+            zero_bundle->ExecuteIndirect(dispatch_signature.p, 0, arguments, 0, nullptr, 0);  // no-op, as on a direct list
+            EXPECT(zero_bundle->Close() == S_OK);
+
+            // The application may release the buffer once recorded; the bundle's reference is the last.
+            EXPECT(arguments->refs > 1);
+            arguments->Release();
+            EXPECT(!gone);
+            draw_bundle.p->Release();
+            draw_bundle.p = nullptr;
+            dispatch_bundle.p->Release();
+            dispatch_bundle.p = nullptr;
+            count_bundle.p->Release();
+            count_bundle.p = nullptr;
+            null_bundle.p->Release();
+            null_bundle.p = nullptr;
+            zero_bundle.p->Release();
+            zero_bundle.p = nullptr;
+            EXPECT(gone);
+        }
         constexpr GUID kTestData{0x0badf00d, 0x1, 0x2, {3, 4, 5, 6, 7, 8, 9, 10}};
         const std::uint32_t tag = 0x1234abcd;
         std::uint32_t read = 0;

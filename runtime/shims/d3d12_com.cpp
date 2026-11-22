@@ -670,25 +670,25 @@ public:
     void STDMETHODCALLTYPE ExecuteIndirect(ID3D12CommandSignature* signature, UINT max_command_count,
                                            ID3D12Resource* argument_buffer, UINT64 argument_buffer_offset,
                                            ID3D12Resource* count_buffer, UINT64 count_buffer_offset) override {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
-        leonida::IndirectKind kind = leonida::IndirectKind::draw;
-        UINT stride = 0;
-        if (!command_signature_info(signature, kind, stride) || !argument_buffer)
-            return check(false);
-        leonida::ExecuteIndirect cmd{};
-        cmd.kind = kind;
-        cmd.stride = stride;
-        cmd.max_count = max_command_count;
-        cmd.argument_buffer = resource_id(argument_buffer);
-        cmd.argument_offset = argument_buffer_offset;
-        cmd.count_buffer = count_buffer ? resource_id(count_buffer) : 0;
-        cmd.count_offset = count_buffer ? count_buffer_offset : 0;
-        if (kind == leonida::IndirectKind::dispatch && max_command_count) {  // the pipeline and root arguments a Dispatch would record
-            if (!compute_pipeline_ || !compute_.layout) return check(false);
-            cmd.pipeline = compute_pipeline_;
-            cmd.user_data = compute_.data;
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
+            // Checked as the application calls it, whatever the parent has bound. A count buffer is refused: the
+            // default adapter and WARP both fail the bundle's Close with one (d3d12_bundle_test). The pipeline and
+            // root signature a dispatch needs are the parent's, so those are checked when the bundle plays.
+            leonida::IndirectKind kind = leonida::IndirectKind::draw;
+            UINT stride = 0;
+            if (!command_signature_info(signature, kind, stride) || !argument_buffer || count_buffer)
+                return check(false);
+            if (defer([=](GraphicsCommandList& l) {
+                    l.record_execute_indirect(signature, max_command_count, argument_buffer, argument_buffer_offset,
+                                              nullptr, 0);
+                }, true)) {
+                hold(signature);
+                hold(argument_buffer);
+                return;
+            }
         }
-        check(list_.execute_indirect(cmd));
+        record_execute_indirect(signature, max_command_count, argument_buffer, argument_buffer_offset, count_buffer,
+                                count_buffer_offset);
     }
 
     void STDMETHODCALLTYPE BuildRaytracingAccelerationStructure(
@@ -1062,6 +1062,29 @@ private:
     void record_dispatch(UINT x, UINT y, UINT z) {
         if (!compute_pipeline_ || !compute_.layout) return check(false);
         check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
+    }
+
+    void record_execute_indirect(ID3D12CommandSignature* signature, UINT max_command_count,
+                                 ID3D12Resource* argument_buffer, UINT64 argument_buffer_offset,
+                                 ID3D12Resource* count_buffer, UINT64 count_buffer_offset) {
+        leonida::IndirectKind kind = leonida::IndirectKind::draw;
+        UINT stride = 0;
+        if (!command_signature_info(signature, kind, stride) || !argument_buffer)
+            return check(false);
+        leonida::ExecuteIndirect cmd{};
+        cmd.kind = kind;
+        cmd.stride = stride;
+        cmd.max_count = max_command_count;
+        cmd.argument_buffer = resource_id(argument_buffer);
+        cmd.argument_offset = argument_buffer_offset;
+        cmd.count_buffer = count_buffer ? resource_id(count_buffer) : 0;
+        cmd.count_offset = count_buffer ? count_buffer_offset : 0;
+        if (kind == leonida::IndirectKind::dispatch && max_command_count) {  // the pipeline and root arguments a Dispatch would record
+            if (!compute_pipeline_ || !compute_.layout) return check(false);
+            cmd.pipeline = compute_pipeline_;
+            cmd.user_data = compute_.data;
+        }
+        check(list_.execute_indirect(cmd));
     }
 
     // A draw needs a graphics pipeline, a graphics root signature and a topology.
