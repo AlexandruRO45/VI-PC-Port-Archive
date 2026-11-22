@@ -324,9 +324,20 @@ class MqsadU32Tests(unittest.TestCase):
         ])
         self.assertEqual(got, [0x11111111, 0x22222222, 0x33333333, 0x44444444])
 
-    def test_clamp_is_rejected_not_guessed(self):
+    def test_clamp_saturates_per_u32_lane_and_bad_mods_rejected(self):
+        got = run_lines([
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "v_mov_b32 v1, 0xff00ffff",
+            "v_mov_b32 v4, 0xfffffd02",
+            "v_mov_b32 v5, 0xfffffd03",
+            "v_mov_b32 v6, 0xffffffff",
+            "v_mov_b32 v7, 0x00000010",
+            "v_mqsad_u32_u8 v[8:11], v[2:3], v1, v[4:7] clamp",
+        ])
+        self.assertEqual(got, [0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x0000030D])
         with self.assertRaises(rdna2spirv.Unsupported):
-            run_lines(["v_mqsad_u32_u8 v[8:11], v[2:3], v1, v[4:7] clamp"])
+            run_lines(["v_mqsad_u32_u8 v[8:11], v[2:3], v1, v[4:7] mul:2"])
 
 
 class MqsadPkU16Tests(unittest.TestCase):
@@ -533,11 +544,33 @@ class MqsadByteShiftingExtremesTests(unittest.TestCase):
 class MqsadNegativeControlsTests(unittest.TestCase):
     """Negative controls, operand validations, and semantic sensitivity."""
 
-    def test_clamp_modifier_rejection_all_forms(self):
+    def test_clamp_saturates_all_forms_and_bad_mods_rejected(self):
+        got_u32 = run_lines([
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "v_mov_b32 v1, 0xffffffff",
+            "v_mov_b32 v4, 0xffffffff",
+            "v_mov_b32 v5, 0xfffffc03",
+            "v_mov_b32 v6, 0x00000000",
+            "v_mov_b32 v7, 0xfffffc04",
+            "v_mqsad_u32_u8 v[8:11], v[2:3], v1, v[4:7] clamp",
+        ])
+        self.assertEqual(got_u32, [0xFFFFFFFF, 0xFFFFFFFF, 0x000003FC, 0xFFFFFFFF])
+
+        got_pk = run_lines_pk_u16([
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "v_mov_b32 v1, 0xff00ffff",
+            "v_mov_b32 v4, 0x0000fd03",
+            "v_mov_b32 v5, 0xfd02ffff",
+            "v_mqsad_pk_u16_u8 v[8:9], v[2:3], v1, v[4:5] clamp",
+        ])
+        self.assertEqual(got_pk, (0x02FDFFFF, 0xFFFFFFFF))
+
         with self.assertRaises(rdna2spirv.Unsupported):
-            run_lines(["v_mqsad_u32_u8 v[8:11], v[2:3], v1, v[4:7] clamp"])
+            run_lines(["v_mqsad_u32_u8 v[8:11], v[2:3], v1, v[4:7] mul:2"])
         with self.assertRaises(rdna2spirv.Unsupported):
-            run_lines_pk_u16(["v_mqsad_pk_u16_u8 v[8:9], v[2:3], v1, v[4:5] clamp"])
+            run_lines_pk_u16(["v_mqsad_pk_u16_u8 v[8:9], v[2:3], v1, v[4:5] mul:2"])
 
     def test_invalid_register_groupings_rejected(self):
         with self.assertRaises(rdna2spirv.Unsupported):

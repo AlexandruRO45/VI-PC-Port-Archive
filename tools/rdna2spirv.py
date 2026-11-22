@@ -6152,10 +6152,14 @@ class Gen:
             self.f16_out(a[0], r, dhi)    # opsel-capable VOP3: keeps the other half (Mesa ACO can_use_opsel)
         elif op in ("v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8"):
             # Four byte-SADs packed as u16 (RDNA ISA pseudocode): for k = 0..3, D.u16[k] = (S2.u16[k] + SAD of the
-            # 32-bit window S0[8k+31 : 8k] of the 64-bit S0 against S1) & 0xFFFF. The m form is masked: a byte where
-            # S1's byte is 0 is skipped (as v_msad_u8). clamp is not modelled: rejected rather than guessed.
-            if a[0].get("n") != 2 or "clamp" in mods:
+            # 32-bit window S0[8k+31 : 8k] of the 64-bit S0 against S1), wrapping at 16 bits or (with VOP3 clamp,
+            # measured natively on RDNA2 gfx1036 wave32/wave64) saturating each u16 lane independently to 0xFFFF with
+            # no carry between halves. The m form is masked: a byte where S1's byte is 0 is skipped (as v_msad_u8).
+            if a[0].get("n") != 2:
                 raise Unsupported(op + " operands")
+            if any(m != "clamp" for m in mods):
+                raise Unsupported(op + " modifiers")
+            clamp = "clamp" in mods
 
             def pair(sv):
                 if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
@@ -6191,7 +6195,10 @@ class Gen:
                     self.emit(f"{t} = OpIAdd %uint {total} {d}")
                     total = t
                 w = self.tmp()
-                self.emit(f"{w} = OpBitwiseAnd %uint {total} {self.cu(0xFFFF)}")
+                if clamp:
+                    self.emit(f"{w} = OpExtInst %uint %glsl UMin {total} {self.cu(0xFFFF)}")
+                else:
+                    self.emit(f"{w} = OpBitwiseAnd %uint {total} {self.cu(0xFFFF)}")
                 words.append(w)
             out = []
             for lo16, hi16 in ((words[0], words[1]), (words[2], words[3])):
@@ -6202,15 +6209,17 @@ class Gen:
             self.dst({"k": "vgpr", "r": a[0]["r"], "n": 1}, out[0])
             self.dst({"k": "vgpr", "r": a[0]["r"] + 1, "n": 1}, out[1])
         elif op in ("v_sad_u8", "v_sad_hi_u8", "v_sad_u16", "v_sad_u32", "v_msad_u8"):
-            # Sums of absolute differences (RDNA ISA pseudocode), all unsigned and wrapping at 32 bits:
+            # Sums of absolute differences (RDNA ISA pseudocode), all unsigned, wrapping at 32 bits or (with VOP3
+            # clamp, measured natively on RDNA2 gfx1036 wave32/wave64) saturating the full 32-bit result to
+            # 0xFFFFFFFF on overflow (including v_sad_hi_u8 when (byte_sum << 16) + S2 >= 2^32):
             #   v_sad_u8:    S2 + sum over the 4 bytes of |S0.b - S1.b|
             #   v_sad_hi_u8: S2 + (that byte sum << 16)
             #   v_sad_u16:   S2 + sum over the 2 halves of |S0.h - S1.h|
             #   v_sad_u32:   S2 + |S0 - S1|
             #   v_msad_u8:   v_sad_u8, skipping each byte where S1's byte is 0 (masked SAD)
-            # clamp is not modelled: rejected rather than guessed.
-            if "clamp" in mods:
-                raise Unsupported(op + " clamp")
+            if any(m != "clamp" for m in mods):
+                raise Unsupported(op + " modifiers")
+            clamp = "clamp" in mods
             x, y, acc = (self.src_u(t) for t in a[1:4])
             width = {"v_sad_u16": 16, "v_sad_u32": 32}.get(op, 8)
             total = None
@@ -6241,14 +6250,22 @@ class Gen:
                 total = t
             r = self.tmp()
             self.emit(f"{r} = OpIAdd %uint {total} {acc}")
+            if clamp:
+                ov, sr = self.tmp(), self.tmp()
+                self.emit(f"{ov} = OpULessThan %bool {r} {acc}")
+                self.emit(f"{sr} = OpSelect %uint {ov} {self.cu(0xFFFFFFFF)} {r}")
+                r = sr
             self.dst(a[0], r)
         elif op == "v_mqsad_u32_u8":
             # Four masked byte-SADs with full 32-bit accumulators (RDNA ISA pseudocode): for k = 0..3,
             # D[k] = S2[k] + v_msad_u8 of the 32-bit window S0[8k+31 : 8k] of the 64-bit S0 against S1, wrapping at
-            # 32 bits; a byte where S1's byte is 0 adds nothing. S2 and D are 128-bit (four VGPRs).
-            # clamp is not modelled: rejected rather than guessed.
-            if a[0].get("n") != 4 or "clamp" in mods:
+            # 32 bits or (with VOP3 clamp, measured natively on RDNA2 gfx1036 wave32/wave64) saturating each 32-bit
+            # lane independently to 0xFFFFFFFF on overflow; a byte where S1's byte is 0 adds nothing. S2 and D are 128-bit.
+            if a[0].get("n") != 4:
                 raise Unsupported(op + " operands")
+            if any(m != "clamp" for m in mods):
+                raise Unsupported(op + " modifiers")
+            clamp = "clamp" in mods
             s0, s2 = a[1], a[3]
             if s0["k"] in ("vgpr", "sgpr") and s0.get("n") == 2:
                 x_lo, x_hi = self.load_reg(s0["k"], s0["r"]), self.load_reg(s0["k"], s0["r"] + 1)
@@ -6282,6 +6299,11 @@ class Gen:
                     self.emit(f"{md} = OpSelect %uint {self.tmp_bool_nz(yb)} {d} {self.cu(0)}")
                     self.emit(f"{t} = OpIAdd %uint {total} {md}")
                     total = t
+                if clamp:
+                    ov, sr = self.tmp(), self.tmp()
+                    self.emit(f"{ov} = OpULessThan %bool {total} {accs[k]}")
+                    self.emit(f"{sr} = OpSelect %uint {ov} {self.cu(0xFFFFFFFF)} {total}")
+                    total = sr
                 outs.append(total)
             for k in range(4):               # every source is read before the first write
                 self.dst({"k": "vgpr", "r": a[0]["r"] + k, "n": 1}, outs[k])

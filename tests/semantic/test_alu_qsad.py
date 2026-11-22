@@ -124,9 +124,18 @@ class QsadTests(unittest.TestCase):
                          "v_qsad_pk_u16_u8 v[0:1], s[2:3], v4, 1"])
         self.assertEqual(got, ref("v_qsad_pk_u16_u8", 0x0807060504030201, 0x04030201, 1))
 
-    def test_clamp_is_rejected_not_guessed(self):
+    def test_clamp_saturates_per_u16_lane_and_bad_mods_rejected(self):
+        got = run_lines([
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "v_mov_b32 v4, 0xffffffff",
+            "v_mov_b32 v6, 0x0000ffff",
+            "v_mov_b32 v7, 0xfc03fc04",
+            "v_qsad_pk_u16_u8 v[0:1], v[2:3], v4, v[6:7] clamp",
+        ])
+        self.assertEqual(got, 0xFFFFFFFF03FCFFFF)
         with self.assertRaises(rdna2spirv.Unsupported):
-            run_lines(["v_qsad_pk_u16_u8 v[0:1], v[2:3], v4, v[6:7] clamp"])
+            run_lines(["v_qsad_pk_u16_u8 v[0:1], v[2:3], v4, v[6:7] mul:2"])
 
 
 if __name__ == "__main__":

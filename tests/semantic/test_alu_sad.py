@@ -123,9 +123,18 @@ class SadTests(unittest.TestCase):
         self.assertEqual(run_lines(["s_mov_b32 s2, 0x01010101", "v_mov_b32 v1, 0x03030303", "v_sad_u8 v0, s2, v1, 7"]),
                          7 + 4 * 2)
 
-    def test_clamp_is_rejected_not_guessed(self):
+    def test_clamp_saturates_to_u32_max_and_bad_mods_rejected(self):
+        self.assertEqual(
+            run_lines(["v_mov_b32 v1, 0xff00ff00", "v_mov_b32 v2, 0x00ff00ff",
+                       "v_mov_b32 v3, 0xfffffc04", "v_sad_u8 v0, v1, v2, v3 clamp"]),
+            0xFFFFFFFF,
+        )
+        self.assertEqual(
+            run_lines(["v_mov_b32 v1, 1", "v_sad_u8 v0, v1, v1, v1 clamp"]),
+            1,
+        )
         with self.assertRaises(rdna2spirv.Unsupported):
-            run_lines(["v_mov_b32 v1, 1", "v_sad_u8 v0, v1, v1, v1 clamp"])
+            run_lines(["v_mov_b32 v1, 1", "v_sad_u8 v0, v1, v1, v1 mul:2"])
 
 
 if __name__ == "__main__":
