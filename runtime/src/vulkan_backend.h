@@ -922,6 +922,18 @@ public:
 
     ~VulkanContext() {
         fence_dispatcher_.reset();
+        // Reconfigured scratch/conversion helpers own buffers, descriptor pools and pipelines referenced by
+        // previously recorded command buffers. Keep every generation until the device is idle, and serialize
+        // that idle with *all* queues' submissions while submit_mutex_ is still alive.
+        {
+            std::lock_guard lock(submit_mutex_);
+            if (loaded_ && (scratch_ || depth24_ || !retired_scratch_.empty() || !retired_depth24_.empty()))
+                vk.vkDeviceWaitIdle(device_);
+            retired_scratch_.clear();
+            retired_depth24_.clear();
+            scratch_.reset();
+            depth24_.reset();
+        }
         deletion_queue_.drain(UINT64_MAX, device_, vk);
         for (const auto& [key, view] : views_) vk.vkDestroyImageView(device_, view, nullptr);
     }
@@ -1162,11 +1174,12 @@ public:
     void enable_depth24(PFN_vkGetDeviceProcAddr get, Depth24Converter::Allocate allocate,
                        std::uint64_t max_storage_range = 1u << 27) {
         std::unique_lock lock(resource_mutex_);
-        depth24_ = std::make_unique<Depth24Converter>(get, device_, std::move(allocate), max_storage_range);
-        if (!depth24_->loaded()) {
-            depth24_.reset();
-            return;
-        }
+        auto replacement = std::make_unique<Depth24Converter>(get, device_, std::move(allocate), max_storage_range);
+        if (!replacement->loaded()) return;
+        // execute() may have already released resource_mutex_ before submitting a command buffer that refers
+        // to the old converter. Even vkDeviceWaitIdle here cannot protect that not-yet-submitted work.
+        if (depth24_) retired_depth24_.push_back(std::move(depth24_));
+        depth24_ = std::move(replacement);
         replay_.depth24_prepare = [this](Depth24Job& job, std::vector<Depth24Job>& parts) { return depth24_->prepare(job, parts); };
         replay_.depth24_run = [this](VkCommandBuffer command_buffer, const Depth24Job& job) {
             depth24_->run(command_buffer, job);
@@ -1177,8 +1190,12 @@ public:
     // `allocate`. Without this such a copy is refused as unsupported.
     void enable_copy_scratch(PFN_vkGetDeviceProcAddr get, ScratchBuffers::Allocate allocate) {
         std::unique_lock lock(resource_mutex_);
-        scratch_ = std::make_unique<ScratchBuffers>(get, device_, std::move(allocate));
-        if (!scratch_->loaded()) scratch_.reset();
+        auto replacement = std::make_unique<ScratchBuffers>(get, device_, std::move(allocate));
+        if (!replacement->loaded()) return;
+        // Retain superseded allocations until context teardown: recording can outlive the resource read lock,
+        // and a completed vkQueueSubmit does not imply the GPU has finished using its scratch buffers.
+        if (scratch_) retired_scratch_.push_back(std::move(scratch_));
+        scratch_ = std::move(replacement);
     }
 
     // Called after that command buffer's submit: true when it was accepted, false when vkQueueSubmit failed. The
@@ -1323,6 +1340,10 @@ private:
     std::function<bool(VkCommandBuffer)> bindless_prepare_;
     std::unique_ptr<Depth24Converter> depth24_;
     std::unique_ptr<ScratchBuffers> scratch_;  // copies staged through a buffer (depth <-> colour)
+    // Infrequent device reconfiguration retains old generations until device idle at context destruction.
+    // This bounds their lifetime by the device without introducing an idle stall while queues are submitting.
+    std::vector<std::unique_ptr<Depth24Converter>> retired_depth24_;
+    std::vector<std::unique_ptr<ScratchBuffers>> retired_scratch_;
     std::function<void(bool)> bindless_commit_;
     std::unordered_map<QueryHeapId, QueryPool> query_pools_;  // element pointers stay valid across inserts
     double timestamp_period_ = 0;
@@ -1434,9 +1455,16 @@ public:
             }
         }
         if (progress_) {
+            // Reconfiguration edits retired_* under resource_mutex_. Keep its reader lock before the tracker lock,
+            // matching execute() and preventing a retired-vector reallocation while we forget a queue's timeline.
+            std::shared_lock resource_lock(context_.resource_mutex_);
             std::lock_guard lock(context_.tracker_mutex_);
             if (context_.depth24_) context_.depth24_->forget(progress_);  // its scratch is idle now
             if (context_.scratch_) context_.scratch_->forget(progress_);
+            // Old generations cannot be destroyed yet (another queue may have recorded commands using them),
+            // but no longer need to query this soon-to-be-destroyed progress semaphore on any future collect().
+            for (auto& old : context_.retired_depth24_) old->forget(progress_);
+            for (auto& old : context_.retired_scratch_) old->forget(progress_);
         }
         if (pool_) vk.vkDestroyCommandPool(context_.device(), pool_, nullptr);
         if (progress_) vk.vkDestroySemaphore(context_.device(), progress_, nullptr);
@@ -1589,26 +1617,29 @@ public:
                 };
             }
         }
-        if (context_.scratch_) {
-            replay.copy_scratch = [this, &tracker_lock, &scratch_guard](VkDeviceSize bytes, VkBuffer& buffer,
-                                                                        VkDeviceSize& offset) {
+        if (scratch_guard.scratch) {
+            replay.copy_scratch = [&tracker_lock, &scratch_guard](VkDeviceSize bytes, VkBuffer& buffer,
+                                                                  VkDeviceSize& offset) {
                 if (!tracker_lock.owns_lock()) tracker_lock.lock();
                 if (!scratch_guard.active) {
-                    context_.scratch_->collect();
+                    scratch_guard.scratch->collect();
                     scratch_guard.active = true;
                 }
-                return context_.scratch_->get(bytes, buffer, offset);
+                return scratch_guard.scratch->get(bytes, buffer, offset);
             };
         }
-        if (context_.depth24_ && !transfer_only) {
-            replay.depth24_prepare = [this, &tracker_lock, &depth24_guard](Depth24Job& job,
-                                                                           std::vector<Depth24Job>& parts) {
+        if (depth24_guard.d24 && !transfer_only) {
+            replay.depth24_prepare = [&tracker_lock, &depth24_guard](Depth24Job& job,
+                                                                     std::vector<Depth24Job>& parts) {
                 if (!tracker_lock.owns_lock()) tracker_lock.lock();
                 if (!depth24_guard.active) {
-                    context_.depth24_->collect();
+                    depth24_guard.d24->collect();
                     depth24_guard.active = true;
                 }
-                return context_.depth24_->prepare(job, parts);
+                return depth24_guard.d24->prepare(job, parts);
+            };
+            replay.depth24_run = [d24 = depth24_guard.d24](VkCommandBuffer cb, const Depth24Job& job) {
+                d24->run(cb, job);
             };
         }
         const auto& occlusion_memory = context_.occlusion_resolve_memory_;
@@ -1724,11 +1755,11 @@ public:
             const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0);
             if (!submitted) discard();
             if (depth24_guard.active) {
-                context_.depth24_->retire(progress_, 0);
+                depth24_guard.d24->retire(progress_, 0);
                 depth24_guard.active = false;
             }
             if (scratch_guard.active) {
-                context_.scratch_->retire(progress_, 0);
+                scratch_guard.scratch->retire(progress_, 0);
                 scratch_guard.active = false;
             }
             tracker_lock.unlock();
@@ -1835,11 +1866,11 @@ public:
             discard();
         }
         if (depth24_guard.active) {
-            context_.depth24_->retire(progress_, submitted ? submitted_ : 0);
+            depth24_guard.d24->retire(progress_, submitted ? submitted_ : 0);
             depth24_guard.active = false;
         }
         if (scratch_guard.active) {
-            context_.scratch_->retire(progress_, submitted ? submitted_ : 0);
+            scratch_guard.scratch->retire(progress_, submitted ? submitted_ : 0);
             scratch_guard.active = false;
         }
         tracker_lock.unlock();

@@ -862,6 +862,23 @@ if(TARGET Vulkan::Headers)
     add_test(NAME vk_queue_query_sync COMMAND vk_queue_query_sync_test)
     set_tests_properties(vk_queue_query_sync PROPERTIES SKIP_RETURN_CODE 77)
   endif()
+  # Reconfiguring depth24/copy scratch while the old helper is referenced by a recorded and
+  # not-yet-submitted command buffer must preserve its lifetime and serialize any device idle.
+  add_executable(vk_helper_reconfigure_test test/vk_helper_reconfigure_test.cpp)
+  target_link_libraries(vk_helper_reconfigure_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(vk_helper_reconfigure_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(vk_helper_reconfigure_test PRIVATE Threads::Threads)
+  endif()
+  if(MSVC)
+    target_compile_options(vk_helper_reconfigure_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME vk_helper_reconfigure COMMAND vk_helper_reconfigure_test)
+    set_tests_properties(vk_helper_reconfigure PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
   # With LEONIDA_VK_VALIDATION=1: synchronization validation reports a missing barrier (and not a present one), so
   # the other GPU tests' "0 validation errors" was checked by an active layer. 77 without validation or a device.
   add_executable(vk_sync_validation_selftest test/vk_sync_validation_selftest.cpp)
