@@ -49,9 +49,11 @@ the channel order of the 10:10:10:2 typed-buffer formats: the names list the cha
 """
 import math
 import os
+import re
 import struct
 import sys
 import unittest
+from fractions import Fraction
 
 import support
 import spirv_mini_interp as si
@@ -666,6 +668,86 @@ class LaneMaskConstants(unittest.TestCase):
         self.assertEqual(w32, self.WANT["cs_w32_mask_imm"][1])
         self.assertEqual(w64, self.WANT["cs_w64_mask_imm"][1])
 
+
+
+class FmaMix(unittest.TestCase):
+    """runtime/test/shaders/cs_w32_fma_mix.asm: v_fma_mix_f32, v_fma_mixlo_f16 and v_fma_mixhi_f16 with op_sel /
+    op_sel_hi source selection, neg, clamp, f16 overflow, the kept destination half, and two inputs where rounding
+    once differs from rounding through f32 first. The words are the GPU check's (check.py CS_DUMPS), derived in the
+    .asm header; a plain-Python reference (exact Fraction arithmetic, one round to nearest even) gives the same."""
+
+    WANT = [0x40D00000, 0x3A000400, 0xABCD4440, 0x46801234, 0xABCD3C01, 0xBC011234, 0xABCD0000, 0xABCD7C00]
+
+    @staticmethod
+    def val(bits, f16):
+        return Fraction(struct.unpack("<e" if f16 else "<f", struct.pack("<H" if f16 else "<I", bits))[0])
+
+    @staticmethod
+    def round_ne(x, mant_bits, min_exp, max_finite):
+        """x rounded once to nearest even in a binary format with mant_bits fraction bits; None for overflow."""
+        if x == 0:
+            return Fraction(0)
+        e = max(math.floor(math.log2(abs(x))), min_exp)
+        while Fraction(2) ** e > abs(x):
+            e -= 1
+        while Fraction(2) ** (e + 1) <= abs(x):
+            e += 1
+        ulp = Fraction(2) ** (max(e, min_exp) - mant_bits)
+        q, r = divmod(abs(x), ulp)
+        if r * 2 > ulp or (r * 2 == ulp and q % 2):
+            q += 1
+        y = q * ulp
+        return None if y > max_finite else (y if x > 0 else -y)
+
+    def f16_bits(self, x):
+        y = self.round_ne(x, 10, -14, Fraction(65504))
+        if y is None:
+            return 0x7C00 if x > 0 else 0xFC00
+        return struct.unpack("<H", struct.pack("<e", float(y)))[0]
+
+    def f32_bits(self, x):
+        return struct.unpack("<I", struct.pack("<f", float(self.round_ne(x, 23, -126, Fraction(2) ** 128))))[0]
+
+    def test_reference(self):
+        v1, v2, v4 = 0x40003C00, 0x44004200, 0x38003400
+        hi = lambda w: self.val(w >> 16, True)
+        lo = lambda w: self.val(w & 0xFFFF, True)
+        f = lambda w: self.val(w, False)
+        seed = 0xABCD1234
+        mixlo = lambda x: (seed & 0xFFFF0000) | self.f16_bits(x)
+        mixhi = lambda x: (self.f16_bits(x) << 16) | (seed & 0xFFFF)
+        got = [self.f32_bits(hi(v1) * lo(v2) + f(0x3F000000)),
+               self.f32_bits(f(0x3F800800) * f(0x3F800800) + f(0xBF800000)),
+               mixlo(lo(v1) * hi(v2) + lo(v4)),
+               mixhi(hi(v1) * lo(v2) + hi(v4)),
+               mixlo(f(0x3F801000) * f(0x3F800000) + f(0x2B800000)),
+               mixhi(-f(0x3F801000) * f(0x3F800000) + f(0xAB800000)),
+               mixlo(min(max(-lo(v1) * lo(v2) + lo(v4), Fraction(0)), Fraction(1))),
+               mixlo(f(0x43960000) * f(0x43960000) + 0)]
+        self.assertEqual([f"{w:#010x}" for w in got], [f"{w:#010x}" for w in self.WANT])
+        # The two words that need one rounding: rounding through f32 first gives these instead.
+        self.assertEqual(self.f32_bits(self.val(self.f32_bits(f(0x3F800800) * f(0x3F800800)), False) - 1), 0x3A000000)
+        self.assertEqual(self.f16_bits(self.val(self.f32_bits(f(0x3F801000) + f(0x2B800000)), False)), 0x3C00)
+
+    def test_gpu_runners_expect_the_same_words(self):
+        for rel in (("runtime", "test", "shaders", "check.py"), ("scripts", "run_gpu_tests.py")):
+            with open(os.path.join(support.ROOT, *rel), encoding="utf-8") as fh:
+                m = re.search(r'"cs_w32_fma_mix"\)?[,:]\s*\[([^\]]*)\]', fh.read())
+            with self.subTest(file="/".join(rel)):
+                self.assertIsNotNone(m)
+                self.assertEqual([int(v, 0) for v in m.group(1).split(",")], self.WANT)
+
+    def test_translated_shader(self):
+        sys.path.insert(0, os.path.join(support.ROOT, "runtime", "test", "shaders"))
+        from compute_fixture import compute_header
+        header = compute_header(os.path.join(support.ROOT, "runtime", "test", "shaders", "cs_w32_fma_mix.asm"))
+        spv = support.translate_fixture("cs_w32_fma_mix", fssm=bytes(header))
+        memory = {a: 0xEEEEEEEE for a in range(0, 0x100, 4)}
+        si.run_workgroup(spv, 32, 32,
+                         inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+                         push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28, memory=memory)
+        self.assertEqual([f"{memory[4 * i]:#010x}" for i in range(8)], [f"{w:#010x}" for w in self.WANT])
+        self.assertEqual(set(memory), set(range(0, 0x100, 4)), "nothing written outside the heap")
 
 if __name__ == "__main__":
     unittest.main()
