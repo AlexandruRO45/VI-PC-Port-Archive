@@ -1172,5 +1172,180 @@ class TestValuMqsadU32U8IEEE754Boundaries(unittest.TestCase):
                 self.assertEqual(sad, expected)
 
 
+class TestValuMqsadU32U8NegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Operand.vgpr(-1)
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(-1)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106)
+        with self.assertRaises(ValueError):
+            Operand.vgpr(253, count=4)  # 253+4 = 257 > 256
+        with self.assertRaises(ValueError):
+            Operand.sgpr(105, count=2)  # 105+2 = 107 > 106
+
+    def test_syntax_rejection_invalid_operand_counts(self) -> None:
+        # dst must be count 4
+        with self.assertRaises(TypeError):
+            VMqsadU32U8Instruction(
+                dst=Operand.vgpr(0, count=1),
+                src0=Operand.vgpr(2, count=2),
+                src1=Operand.vgpr(1),
+                src2=Operand.vgpr(4, count=4),
+            )
+        # src0 must be count 2
+        with self.assertRaises(ValueError):
+            VMqsadU32U8Instruction(
+                dst=Operand.vgpr(0, count=4),
+                src0=Operand.vgpr(2, count=4),
+                src1=Operand.vgpr(1),
+                src2=Operand.vgpr(4, count=4),
+            )
+        # src1 must be count 1
+        with self.assertRaises(ValueError):
+            VMqsadU32U8Instruction(
+                dst=Operand.vgpr(0, count=4),
+                src0=Operand.vgpr(2, count=2),
+                src1=Operand.vgpr(1, count=2),
+                src2=Operand.vgpr(4, count=4),
+            )
+        # src2 must be count 4
+        with self.assertRaises(TypeError):
+            VMqsadU32U8Instruction(
+                dst=Operand.vgpr(0, count=4),
+                src0=Operand.vgpr(2, count=2),
+                src1=Operand.vgpr(1),
+                src2=Operand.vgpr(4, count=2),
+            )
+
+    def test_syntax_rejection_invalid_types(self) -> None:
+        # dst cannot be SGPR or literal
+        with self.assertRaises(TypeError):
+            VMqsadU32U8Instruction(
+                dst=Operand.sgpr(0, count=4),
+                src0=Operand.vgpr(2, count=2),
+                src1=Operand.vgpr(1),
+                src2=Operand.vgpr(4, count=4),
+            )
+        # src2 cannot be SGPR
+        with self.assertRaises(TypeError):
+            VMqsadU32U8Instruction(
+                dst=Operand.vgpr(0, count=4),
+                src0=Operand.vgpr(2, count=2),
+                src1=Operand.vgpr(1),
+                src2=Operand.sgpr(4, count=4),
+            )
+
+    def test_mutation_omitted_zero_mask_detected(self) -> None:
+        """Mutant: accumulates byte diff even when mask byte is zero."""
+        def mutant_sad(win32: int, mask32: int) -> int:
+            total = 0
+            for i in range(4):
+                b_win = (win32 >> (8 * i)) & 0xFF
+                b_mask = (mask32 >> (8 * i)) & 0xFF
+                # Bug: forgets `if b_mask != 0:`
+                total += abs(b_win - b_mask)
+            return total
+
+        # win = 0xFFFFFFFF, mask = 0x00000000
+        # Oracle returns 0 (all bytes skipped)
+        # Mutant returns 4 * 255 = 1020
+        oracle_res = ref_masked_byte_sad_u32(0xFFFFFFFF, 0x00000000)
+        mutant_res = mutant_sad(0xFFFFFFFF, 0x00000000)
+        self.assertEqual(oracle_res, 0)
+        self.assertEqual(mutant_res, 1020)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_window_stride_error_detected(self) -> None:
+        """Mutant: uses 16-bit stride instead of 8-bit stride for sliding window."""
+        def mutant_window(val64: int, k: int) -> int:
+            # Bug: shifts by 16 * k instead of 8 * k
+            return (val64 >> (16 * k)) & 0xFFFFFFFF
+
+        src0 = 0x0807060504030201
+        oracle_w1 = byte_window_u32(src0, 1)  # 0x05040302
+        mutant_w1 = mutant_window(src0, 1)   # 0x06050403
+        self.assertEqual(oracle_w1, 0x05040302)
+        self.assertEqual(mutant_w1, 0x06050403)
+        self.assertNotEqual(oracle_w1, mutant_w1)
+
+    def test_mutation_signed_byte_difference_detected(self) -> None:
+        """Mutant: interprets bytes as signed int8 before taking difference."""
+        def mutant_byte_sad(win32: int, mask32: int) -> int:
+            total = 0
+            for i in range(4):
+                b_win = (win32 >> (8 * i)) & 0xFF
+                b_mask = (mask32 >> (8 * i)) & 0xFF
+                if b_mask != 0:
+                    # Bug: signed cast
+                    s_win = b_win - 256 if b_win >= 128 else b_win
+                    s_mask = b_mask - 256 if b_mask >= 128 else b_mask
+                    total += abs(s_win - s_mask)
+            return total
+
+        # win byte = 0x80 (unsigned 128, signed -128), mask byte = 0x01 (unsigned 1, signed 1)
+        # Unsigned diff = |128 - 1| = 127
+        # Signed diff = |-128 - 1| = |-129| = 129
+        oracle_res = ref_masked_byte_sad_u32(0x80, 0x01)
+        mutant_res = mutant_byte_sad(0x80, 0x01)
+        self.assertEqual(oracle_res, 127)
+        self.assertEqual(mutant_res, 129)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_omitted_accumulator_detected(self) -> None:
+        """Mutant: forgets to add src2 accumulator."""
+        def mutant_mqsad(s0: int, s1: int, s2: Sequence[int]) -> List[int]:
+            res = []
+            for k in range(4):
+                win = byte_window_u32(s0, k)
+                sad = ref_masked_byte_sad_u32(win, s1)
+                # Bug: forgets + s2[k]
+                res.append(sad & 0xFFFFFFFF)
+            return res
+
+        s0 = 0x0807060504030201
+        s1 = 0x04030201
+        accs = [1000, 2000, 3000, 4000]
+        oracle_res = ref_mqsad_u32_u8(s0, s1, accs)
+        mutant_res = mutant_mqsad(s0, s1, accs)
+        self.assertEqual(oracle_res, [1000, 2004, 3008, 4012])
+        self.assertEqual(mutant_res, [0, 4, 8, 12])
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_ignore_simd_exec_mask_detected(self) -> None:
+        """Mutant: SIMD interpreter overwrites inactive lanes ignoring EXEC mask."""
+        sentinel = [0xCAFEBABE, 0xCAFEBABE, 0xCAFEBABE, 0xCAFEBABE]
+        state = SIMDState(num_lanes=32, exec_mask=0x00000000)
+        for lane in range(32):
+            state.write_lane(Operand.vgpr(0, count=4), lane, sentinel)
+
+        class BuggySIMDInterpreter(SIMDInterpreter):
+            def step(self, instr: VMqsadU32U8Instruction, state: SIMDState) -> List[Optional[List[int]]]:
+                results = []
+                for lane in range(state.num_lanes):
+                    # Bug: no exec mask check
+                    res = ref_mqsad_u32_u8(0, 0, [0, 0, 0, 0])
+                    state.write_lane(instr.dst, lane, res)
+                    results.append(res)
+                return results
+
+        buggy = BuggySIMDInterpreter()
+        instr = VMqsadU32U8Instruction(
+            dst=Operand.vgpr(0, count=4),
+            src0=Operand.literal(0, count=2),
+            src1=Operand.literal(0),
+            src2=Operand.vgpr(4, count=4),
+        )
+        buggy.step(instr, state)
+
+        corrupted = [lane for lane in range(32) if state.read_lane(Operand.vgpr(0, count=4), lane) != sentinel]
+        self.assertEqual(len(corrupted), 32)
+
+
 if __name__ == "__main__":
     unittest.main()
