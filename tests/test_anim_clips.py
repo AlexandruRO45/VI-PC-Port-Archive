@@ -206,8 +206,47 @@ def animation(page, frames, tracks, sequences):
     return a
 
 
+def table(p, field, groups, slot, entries):
+    """An open-addressing table at `field`: {u32 groups; u32 entries; ptr}, each group 16 control bytes (0x80 empty)
+    then 16 slots of `slot` bytes. `entries` are (group, slot index, slot bytes)."""
+    block = bytearray(bytes([0x80]) * 16 + bytes(16 * slot)) * groups
+    for g, i, data in entries:
+        base = g * (16 + 16 * slot)
+        block[base + i] = 0x11
+        block[base + 16 + slot * i:base + 16 + slot * i + len(data)] = data
+    struct.pack_into("<II", p.b, field, groups, len(entries))
+    p.ptr(field + 8, p.alloc(bytes(block)))
+
+
+def matcher_array(p, field, data, count):
+    """A `.motionmatcher` array: pointer at `field`, u32 count at `field - 4`, u32 capacity at `field - 8`."""
+    struct.pack_into("<II", p.b, field - 8, count, count)
+    p.ptr(field, p.alloc(data))
+
+
+def motion_matcher(p, name, motion, refs=True):
+    """A `.motionmatcher` with two records: record 0 is the dictionary's own `.clip` (hash 1), record 1 a clip that
+    is not in the archive. Its own key is (3, joaat32(name))."""
+    m = p.alloc(bytes(0x190))
+    p.ptr(m + 0x20, motion)                           # a pointer at +0x20, like `.motion`
+    p.b[m + 0x28:m + 0x38] = bytes(range(0x80, 0x90))   # 16-byte id; +0x30 is not a pointer
+    p.string(m + 0x38, "pack:/one.motionmatcher")
+    records = struct.pack("<fffIQ", 0.0, 30.0, -1.0, 0, 0) + struct.pack("<fffIQ", 0.5, 15.0, -1.0, 1, 0)
+    matcher_array(p, m + 0x58, records, 2)
+    matcher_array(p, m + 0x68, struct.pack("<3I", 0, 4, 9), 3)
+    clips = [(1, joaat32(name)), (0xC1105, 0xD1C7)]
+    if refs:
+        matcher_array(p, m + 0x98, b"".join(struct.pack("<QII", 0, ch, dh) for ch, dh in clips), 2)
+    table(p, m + 0xA0, 1, 16, [(0, 3, struct.pack("<IIII", clips[0][0], 0x77, 0, 0)),
+                               (0, 9, struct.pack("<IIII", clips[1][0], 0x78, 1, 0))])
+    table(p, m + 0x170, 2, 8, [(0, 0, struct.pack("<II", 0x5A, 2)), (1, 5, struct.pack("<II", 1, 0)),
+                               (1, 6, struct.pack("<II", 0x5B, 1))])
+    struct.pack_into("<II", p.b, m + 0x188, 3, joaat32(name))
+    return m
+
+
 def dictionary(name="synthetic@dict", sequences=None, frames=None, tracks=None, external=0, children=(),
-               external_hashes=(), parameters=1, times=None, axis=None):
+               external_hashes=(), parameters=1, times=None, axis=None, matcher_refs=True):
     """One clip dictionary page: one `.clip`, one `.motion`, one `.motionmatcher`, one local pack with one animation."""
     p = Page()
     pm = p.alloc(bytes(16))
@@ -265,10 +304,7 @@ def dictionary(name="synthetic@dict", sequences=None, frames=None, tracks=None, 
             p.ptr(block + 0x18, node)
             p.ptr(motion + 0x120, block)
             struct.pack_into("<HH", p.b, motion + 0x128, 1, 1)
-    matcher = p.alloc(bytes(0x50))
-    p.ptr(matcher + 0x20, motion)                     # a pointer at +0x20, like `.motion`
-    p.b[matcher + 0x28:matcher + 0x38] = bytes(range(0x80, 0x90))   # 16-byte id; +0x30 is not a pointer
-    p.string(matcher + 0x38, "pack:/one.motionmatcher")
+    matcher = motion_matcher(p, name, motion, refs=matcher_refs)
     p.atmap(0x48, [(joaat32(name) << 32 | 1, clip), (joaat32(name) << 32 | 2, motion),
                    (joaat32(name) << 32 | 3, matcher)])
     hashes = [0x1000 + i for i in range(external)] + list(external_hashes)
@@ -353,6 +389,39 @@ class DecodeTest(unittest.TestCase):
     def setUp(self):
         self.s = anim_clips.System(two_sequence_dictionary())
         self.d = anim_clips.parse_dictionary(self.s)
+
+    def test_motionmatcher(self):
+        c = [c for c in self.d["clips"] if c["kind"] == "motionmatcher"][0]
+        m = c["matcher"]
+        self.assertEqual(m["records"], [(0.0, 30.0, -1.0, 0), (0.5, 15.0, -1.0, 1)])
+        self.assertEqual(m["offsets"], [0, 4, 9])
+        self.assertEqual(m["refs"], [(1, joaat32("synthetic@dict")), (0xC1105, 0xD1C7)])
+        self.assertEqual(m["clips"], [(1, 0x77, 0), (0xC1105, 0x78, 1)])            # in slot order
+        self.assertEqual(m["keys"], [(0x5A, 2), (1, 0), (0x5B, 1)])
+        self.assertEqual(m["self"], (c["hash"], self.d["hash"]))
+        stats = anim_clips.new_stats()
+        anim_clips.count_matcher(c, self.d["hash"], stats)
+        for k in ("matcher_record_index_is_position", "matcher_record_third_is_minus_one",
+                  "matcher_offsets_one_more_than_records", "matcher_offsets_from_0_nondecreasing",
+                  "matcher_clip_table_one_per_record", "matcher_refs_one_per_record",
+                  "matcher_refs_name_the_table_clip", "matcher_key_table_indices_0_to_n", "matcher_self_is_own_key"):
+            self.assertEqual(stats[k], 1, k)
+        self.assertEqual((stats["matcher_records"], stats["matcher_clip_table_entries"], stats["matcher_refs"],
+                          stats["matcher_key_table_entries"]), (2, 2, 2, 3))
+
+    def test_motionmatcher_without_refs_and_with_a_bad_table(self):
+        d = anim_clips.parse_dictionary(anim_clips.System(two_sequence_dictionary(matcher_refs=False)))
+        c = [c for c in d["clips"] if c["kind"] == "motionmatcher"][0]
+        self.assertEqual(c["matcher"]["refs"], [])
+        self.assertEqual(len(c["matcher"]["clips"]), 2)
+        s = anim_clips.System(bytearray(two_sequence_dictionary()))
+        at = [v for k, v in s.atmap(0x48) if k & 0xFFFFFFFF == 3][0]                # the matcher's key
+        s.d[s.ptr(at + 0xA8) + 5] = 0x81                                            # neither empty nor full
+        with self.assertRaises(anim_clips.DecodeError):
+            anim_clips.parse_matcher(s, at)
+        s.d[s.ptr(at + 0xA8) + 5] = 0x22                                            # a third full slot for 2 entries
+        with self.assertRaises(anim_clips.DecodeError):
+            anim_clips.parse_matcher(s, at)
 
     def test_structure(self):
         d = self.d
@@ -576,6 +645,10 @@ class ArchiveTest(unittest.TestCase):
         # `.motion` children are {clip hash, dictionary hash}; root refs without a pointer name dictionaries
         self.assertEqual((c["motion_children"], c["motion_children_in_external_refs"],
                           c["motion_children_dictionary_here"], c["motion_children_resolved_to_clip"]), (3, 3, 2, 1))
+        # `.motionmatcher`: each has one clip in this archive (its dictionary's own) and one that is not
+        self.assertEqual((c["matcher_records"], c["matcher_refs"], c["matcher_table_clips_found_here"],
+                          c["matcher_refs_resolved_to_clip"], c["matcher_self_is_own_key"], c.get("matcher_unreadable", 0)),
+                         (4, 4, 2, 2, 2, 0))
         self.assertEqual((c["external_refs_to_a_dictionary_here"], c["external_hashes_distinct"],
                           c["external_hashes_distinct_found_here"]), (1, 2, 1))
         self.assertEqual(c["motion_parameters:1"], 2)

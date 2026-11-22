@@ -435,7 +435,13 @@ u32; u32 count}` with `Entry {u64 key; T *value; Entry *next}`. Hashes are `joaa
 | | `+0x120` pointer (`+0x58` = 2) | a block whose `+0x18` points at the parameter node |
 | | `+0x138` pointer (`+0x58` = 1) | the parameter node: `{u64 0; u32 type; u32 0; ...}` |
 | parameter node, type 3 | `+0x10` array of u32, `+0x20` array of 8-byte items, `+0x30`/`+0x34` f32 | one sampled axis: its name hash(es), then `{u32 sample index; f32 value}` sorted by value, then min and max |
-| `.motionmatcher` (`+0x20` is a pointer) | `+0x28` 16 bytes, `+0x38` atString | an id, then `pack:/<name>.motionmatcher`; the rest is not decoded |
+| `.motionmatcher` (`+0x20` is a pointer) | `+0x28` 16 bytes, `+0x38` atString | an id, then `pack:/<name>.motionmatcher` |
+| | `+0x58` pointer, u32 count at `+0x54` | records `{f32; f32; f32 −1.0; u32 index; u64 0}`, 24 bytes. A `.motionmatcher` array keeps its u32 count just before the pointer, and a u32 capacity before that |
+| | `+0x68` pointer, count at `+0x64` | u32 offsets, one more than the records, from 0 and never decreasing |
+| | `+0x98` pointer, count at `+0x94` | on 36 of 180: one `{u64 0; u32 clip hash; u32 dictionary hash}` per record, like `.motion` children |
+| | `+0xA0` u32 groups, `+0xA4` u32 entries, `+0xA8` pointer | a hash table of the clips: per group 16 control bytes (0x80 empty, below 0x80 full), then 16 slots `{u32 clip hash; u32 not decoded; u32 record index; u32 0}` |
+| | `+0x170`/`+0x174`/`+0x178` | the same kind of table with 8-byte slots `{u32 hash; u32 index}` |
+| | `+0x188` u32, `+0x18C` u32 | the clip's own hash and the dictionary's `joaat32(name)`, as `.motion` has at `+0x28`/`+0x2C` |
 | animation | `+0x24` u16 | frame count |
 | | `+0x28` f32 | duration = (frames − 1) / fps |
 | | `+0x50` array | sequence pointers |
@@ -594,7 +600,33 @@ fields are in the object table above. Measured on all 17,247 `.motion` clips:
 The 180 `.motionmatcher` clips sit in 142 dictionaries that hold only `.motionmatcher` clips and no local pack.
 The three motion matcher streams in [Bone tables and motion matchers](#bone-tables-and-motion-matchers)
 (`0x101c379a0`, `0x101c41d50`, `0x101ea66c0`) are the second system pages of three of those dictionaries, with 2, 1 and 2
-`.motionmatcher` clips. Their layout after the name is not decoded.
+`.motionmatcher` clips.
+
+A `.motionmatcher` object has fields up to `+0x18F`; they are in the object table above, and `anim_clips.py` decodes them
+(`parse_matcher`) and counts them as `matcher_*`. Measured by `parse_matcher` on the pages of all 142 dictionaries
+(180 clips):
+
+- **Arrays** keep a u32 count at pointer − 4 and a u32 capacity at pointer − 8, not the `{ptr; u16 count}` of the
+  rest of the dictionary.
+- **Records (`+0x58`).** 4,562 records, 1–346 per clip. The third float is −1.0 in all of them, and the u32 is the
+  record's position on 175 of 180 clips. The first float is 0 or 0.03–2.37 and the second one of 2.5, 5, 6.667, 10,
+  15, 20, 30 or 40; that they are a start time and a sample rate is a hypothesis.
+- **Offsets (`+0x68`).** One more than the records on 180 of 180, starting at 0 and never decreasing, so an offset
+  table into data not decoded here.
+- **Clip table (`+0xA0`).** An open-addressing hash table: the group count is a power of two (2 on 151 clips), every
+  control byte is 0x80 or below 0x80, and the full slots equal the entry count on 180 of 180. Its 4,381 slots hold
+  a clip hash that is a clip in anim.rpf (4,381 of 4,381) and a record index; the indices are 0..n−1 on 180 of 180,
+  and one per record on 175. How the control byte and the group come from the hash is not known (the low 7 bits and
+  hash mod groups don't fit).
+- **References (`+0x98`).** 36 clips have one `{clip hash, dictionary hash}` per record (439). All 439 resolve to a
+  clip of that dictionary in anim.rpf, and the item at each table slot's record index names that slot's clip on all
+  36. The other 144 clips have only the table, which gives the clip hash without its dictionary.
+- **Key table (`+0x170`).** The same table with 8-byte slots, 2 groups on all 180: 403 entries of `{u32 hash, u32
+  index}`, the indices 0..n−1 on 180 of 180. 23 distinct hashes; 38 entries are clip hashes.
+- **Self (`+0x188`).** The clip's own hash and the dictionary's `joaat32(name)` on 180 of 180.
+- Not decoded: the `+0x20` object (two pointers and a u32 count/capacity pair), the one 0x28-byte item at `+0x48`,
+  the u16 array at `+0x78`, the u8 array at `+0xB8`, the arrays at `+0x118` and `+0x128`, the second word of a clip
+  table slot, and how the key-table hashes are made.
 
 ### Other archives
 

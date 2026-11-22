@@ -187,6 +187,86 @@ def parameter_node(s, at, parameters):
     return kind, axis
 
 
+def matcher_array(s, field):
+    """A `.motionmatcher` array: the pointer at `field`, its u32 count at `field - 4`. -> (offset or None, count)"""
+    p, n = s.ptr(field), s.u32(field - 4)
+    if p is None and n:
+        raise DecodeError(f"array at 0x{field:x} has {n} items and no data")
+    return p, n
+
+
+def hash_table(s, field, slot):
+    """An open-addressing table: u32 group count at `field`, u32 entry count at +4, pointer at +8. Each group is 16
+    control bytes (0x80 empty, below 0x80 full) and then 16 slots of `slot` bytes. -> offsets of the full slots"""
+    groups, count, p = s.u32(field), s.u32(field + 4), s.ptr(field + 8)
+    if p is None:
+        if groups or count:
+            raise DecodeError(f"table at 0x{field:x} has no data")
+        return []
+    if groups & (groups - 1) or p + groups * (16 + 16 * slot) > len(s.d):
+        raise DecodeError(f"table at 0x{field:x} has {groups} groups")
+    full = []
+    for g in range(groups):
+        base = p + g * (16 + 16 * slot)
+        for i, b in enumerate(s.d[base:base + 16]):
+            if b < 0x80:
+                full.append(base + 16 + slot * i)
+            elif b != 0x80:
+                raise DecodeError(f"table at 0x{field:x}: control byte 0x{b:02x}")
+    if len(full) != count:
+        raise DecodeError(f"table at 0x{field:x}: {len(full)} full slots for {count} entries")
+    return full
+
+
+def parse_matcher(s, at):
+    """The measured part of a `.motionmatcher` after its name (docs/animation.md, "`.motion` and `.motionmatcher`
+    clips"). Arrays keep their u32 count just before the pointer. -> dict, values only for local inspection"""
+    rec, n = matcher_array(s, at + 0x58)
+    records = [(s.f32(rec + 24 * i), s.f32(rec + 24 * i + 4), s.f32(rec + 24 * i + 8), s.u32(rec + 24 * i + 12))
+               for i in range(n)]
+    off, no = matcher_array(s, at + 0x68)
+    refs_at, nr = matcher_array(s, at + 0x98)
+    refs = []
+    for i in range(nr):
+        if s.u64(refs_at + 16 * i) != 0:
+            raise DecodeError("motionmatcher clip reference does not start with 8 zero bytes")
+        refs.append((s.u32(refs_at + 16 * i + 8), s.u32(refs_at + 16 * i + 12)))
+    return {
+        "records": records,                                              # {f32; f32; f32; u32 index; u64 0}
+        "offsets": [s.u32(off + 4 * i) for i in range(no)],              # +0x68: u32, one more than the records
+        "refs": refs,                                                    # +0x98: {u64 0; clip hash; dictionary hash}
+        "clips": [(s.u32(o), s.u32(o + 4), s.u32(o + 8)) for o in hash_table(s, at + 0xA0, 16)],  # (clip, ?, record)
+        "keys": [(s.u32(o), s.u32(o + 4)) for o in hash_table(s, at + 0x170, 8)],                 # (hash, index)
+        "self": (s.u32(at + 0x188), s.u32(at + 0x18C)),                  # own clip hash, joaat32(dictionary)
+    }
+
+
+def count_matcher(c, dictionary_hash, stats):
+    """Counts for a `.motionmatcher`'s decoded fields (no values)."""
+    m = c.get("matcher")
+    if m is None:
+        stats["matcher_unreadable"] += 1
+        return
+    n = len(m["records"])
+    stats["matcher_records"] += n
+    stats["matcher_record_index_is_position"] += [r[3] for r in m["records"]] == list(range(n))
+    stats["matcher_record_third_is_minus_one"] += all(r[2] == -1.0 for r in m["records"])
+    o = m["offsets"]
+    stats["matcher_offsets_one_more_than_records"] += len(o) == n + 1
+    stats["matcher_offsets_from_0_nondecreasing"] += bool(o) and o[0] == 0 and all(a <= b for a, b in zip(o, o[1:]))
+    stats["matcher_clip_table_entries"] += len(m["clips"])
+    stats["matcher_clip_table_one_per_record"] += sorted(i for _c, _k, i in m["clips"]) == list(range(n))
+    stats["matcher_with_refs"] += bool(m["refs"])
+    stats["matcher_refs"] += len(m["refs"])
+    if m["refs"]:
+        stats["matcher_refs_one_per_record"] += len(m["refs"]) == n
+        stats["matcher_refs_name_the_table_clip"] += all(
+            i < len(m["refs"]) and m["refs"][i][0] == ch for ch, _k, i in m["clips"])
+    stats["matcher_key_table_entries"] += len(m["keys"])
+    stats["matcher_key_table_indices_0_to_n"] += sorted(i for _h, i in m["keys"]) == list(range(len(m["keys"])))
+    stats["matcher_self_is_own_key"] += m["self"] == (c["hash"], dictionary_hash)
+
+
 def parse_clip(s, at):
     kind = s.u32(at + 0x20)
     if kind >= 16:  # +0x20 is a pointer: a parametric clip that refers to packs outside the dictionary
@@ -212,7 +292,12 @@ def parse_clip(s, at):
                 motion["times"], motion["node"] = None, None
             return motion
         # `.motionmatcher`: a 16-byte id at +0x28, name at +0x38
-        return {"kind": "motionmatcher", "name": s.string(at + 0x38), "animations": []}
+        matcher = {"kind": "motionmatcher", "name": s.string(at + 0x38), "animations": [], "matcher": None}
+        try:
+            matcher["matcher"] = parse_matcher(s, at)
+        except (DecodeError, struct.error):
+            pass
+        return matcher
     clip = {"kind": "clip", "name": s.string(at + 0x28), "duration": s.f32(at + 0x78), "animations": []}
     lst = s.ptr(at + 0x68)
     if lst is not None:
@@ -674,6 +759,9 @@ def decode_resource(path, segments, budget=None):
     stats["clips"] += len(d["clips"])
     stats["clips_motion"] += sum(c["kind"] == "motion" for c in d["clips"])
     stats["clips_motionmatcher"] += sum(c["kind"] == "motionmatcher" for c in d["clips"])
+    for c in d["clips"]:
+        if c["kind"] == "motionmatcher":
+            count_matcher(c, d["hash"], stats)
     external = set(d["external_hashes"])
     for c in d["clips"]:
         if c["kind"] != "motion":
@@ -721,6 +809,9 @@ def decode_resource(path, segments, budget=None):
     row["_child_durations"] = [t[0] if t else None for c in d["clips"] if c["kind"] == "motion" and c["children"]
                                for t in child_times(c)]
     row["_external"] = d["external_hashes"]
+    matchers = [c["matcher"] for c in d["clips"] if c["kind"] == "motionmatcher" and c.get("matcher")]
+    row["_matcher_clips"] = [ch for m in matchers for ch, _k, _i in m["clips"]]
+    row["_matcher_refs"] = [r for m in matchers for r in m["refs"]]
     row.update(hash=f"0x{d['hash']:08x}", name=d["name"], clips=len(d["clips"]), packs=len(d["packs"]),
                external_packs=d["external_packs"], animations=ok + failed + skipped, decoded=ok,
                seconds=round(time.monotonic() - started, 3))
@@ -737,6 +828,7 @@ def join_references(rows, stats):
             clips_by_dict[int(r["hash"], 16)].update(r["_clip_hashes"])
             for h, t in zip(r["_clip_hashes"], r.get("_clip_durations", [])):
                 duration[(int(r["hash"], 16), h)] = t
+    all_clips = set().union(*clips_by_dict.values()) if clips_by_dict else set()
     ext_seen = set()
     for r in rows:
         for h in r.pop("_external", []):
@@ -752,6 +844,10 @@ def join_references(rows, stats):
                 stats["motion_children_resolved_to_clip"] += ch in clips_by_dict[dh]
                 if ch in clips_by_dict[dh] and t is not None:
                     stats["motion_child_duration_equals_clip"] += duration.get((dh, ch)) == t
+        for ch in r.pop("_matcher_clips", []):
+            stats["matcher_table_clips_found_here"] += ch in all_clips
+        for ch, dh in r.pop("_matcher_refs", []):
+            stats["matcher_refs_resolved_to_clip"] += ch in clips_by_dict.get(dh, ())
         r.pop("_clip_hashes", None)
         r.pop("_clip_durations", None)
 
