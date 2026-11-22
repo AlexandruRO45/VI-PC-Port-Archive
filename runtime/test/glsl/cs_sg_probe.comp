@@ -11,11 +11,23 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words {
     uint w[];
 };
 
+#ifdef PC_TAIL
+layout(push_constant) uniform UserData {
+    uint s[32];
+} pc;
+layout(set = 1, binding = 0) uniform PcTail {
+    uvec2 heap_base;
+    uvec2 code_base;
+} tail;
+#define HEAP_BASE tail.heap_base
+#else
 layout(push_constant) uniform UserData {
     uint s[32];
     uvec2 heap_base;
     uvec2 code_base;
 } pc;
+#define HEAP_BASE pc.heap_base
+#endif
 
 uvec2 add64(uvec2 a, uvec2 b) {
     uint carry;
@@ -24,6 +36,6 @@ uvec2 add64(uvec2 a, uvec2 b) {
 }
 
 void main() {
-    Words out_words = Words(add64(pc.heap_base, uvec2(pc.s[0], pc.s[1])));
+    Words out_words = Words(add64(HEAP_BASE, uvec2(pc.s[0], pc.s[1])));
     if (gl_LocalInvocationIndex == 0u) out_words.w[0] = gl_SubgroupSize;
 }

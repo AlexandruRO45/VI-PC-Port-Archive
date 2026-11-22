@@ -157,6 +157,8 @@ def translate_tests(work, names):
     cmd = [sys.executable, "-I", TRANSLATOR, disasm, "--out", spirv]
     if os.environ.get("LEONIDA_W64_EMULATE") == "1":   # wave64 on 32-wide subgroups (compute shaders only)
         cmd.append("--wave64-emulate")
+    if os.environ.get("LEONIDA_PC_TAIL_UBO") == "1":   # --pc-tail-ubo: 128-byte push constants, tail in set 1 (#2046)
+        cmd.append("--pc-tail-ubo")
     if os.environ.get("LEONIDA_BARY_FALLBACK") == "1":   # raw barycentrics without VK_KHR_fragment_shader_barycentric
         cmd.append("--bary-fallback")
     if os.environ.get("LEONIDA_FMA") in ("glsl", "khr"):   # fused multiply-add as GLSL Fma (default) or OpFmaKHR

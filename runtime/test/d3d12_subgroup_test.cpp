@@ -26,6 +26,10 @@
 #error "LEONIDA_TEST_SUBGROUP_SHADERS must name the folder with the translated test shaders"
 #endif
 
+#if !defined(LEONIDA_TEST_SG_PROBE_TAIL_SPV)
+#error "LEONIDA_TEST_SG_PROBE_TAIL_SPV must name the --pc-tail-ubo compute probe shader"
+#endif
+
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return 1; } \
 } while (0)
@@ -312,6 +316,8 @@ struct LibraryEntry {
 };
 
 // A translator-style folder with the entries' modules, every entry keyed by the fixture program's hash.
+// TEST-599: every entry here is a --pc-tail-ubo module (128 push-constant bytes); only entries whose tail string
+// declares pc_tail read the heap base from set 1. The other probe shaders declare no push constants.
 std::filesystem::path make_library(const std::string& tag, const std::vector<LibraryEntry>& entries) {
     const auto dir = std::filesystem::temp_directory_path() / ("leonida_subgroup_" + tag);
     std::filesystem::remove_all(dir);
@@ -322,7 +328,7 @@ std::filesystem::path make_library(const std::string& tag, const std::vector<Lib
     for (const LibraryEntry& e : entries) {
         std::filesystem::copy_file(e.spv, dir / (e.name + ".spv"), std::filesystem::copy_options::overwrite_existing);
         index << (first ? "" : ",\n") << "\"" << e.name << "\": {\"stage\": \"" << e.stage << "\", \"fssm_sha256\": \""
-              << leonida::sha256_hex(fixture_fssm()) << "\", \"bindings\": [], \"push_constant_bytes\": 144, "
+              << leonida::sha256_hex(fixture_fssm()) << "\", \"bindings\": [], \"push_constant_bytes\": 128, "
               << e.tail << "}";
         first = false;
     }
@@ -334,11 +340,13 @@ std::filesystem::path glsl_spv(const char* name) {
     return std::filesystem::path(LEONIDA_TEST_SUBGROUP_SHADERS) / "glsl" / (std::string(name) + ".spv");
 }
 
-// The compute probe: a library with cs_sg_probe in the given mode.
+// The compute probe: a library with cs_sg_probe in the given mode, using the --pc-tail-ubo variant — the probe
+// reads its heap base from set 1, so the PSO builds where push constants stop at 128 bytes.
 std::filesystem::path compute_probe_library(const Mode& mode) {
     return make_library("cs_probe", {{"cs_sg_probe", "cs",
-                                      "\"local_size\": [64, 1, 1], \"uses_code_base\": false, " + mode_json(mode),
-                                      glsl_spv("cs_sg_probe.comp")}});
+                                      "\"local_size\": [64, 1, 1], \"uses_code_base\": false, "
+                                      "\"pc_tail\": {\"set\": 1, \"binding\": 0, \"bytes\": 16}, " + mode_json(mode),
+                                      LEONIDA_TEST_SG_PROBE_TAIL_SPV}});
 }
 
 constexpr UINT draw_size = 64;

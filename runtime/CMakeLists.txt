@@ -1676,6 +1676,9 @@ if(TARGET Vulkan::Headers)
     if(LEONIDA_LLVM_MC AND Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
       set(LEONIDA_SG_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/subgroup_shaders)
       set(LEONIDA_SG_INDEXES "")
+      # TEST-599: the subgroup shaders are translated with --pc-tail-ubo (#2046), so the test runs where push
+      # constants stop at 128 bytes. They read neither heap base nor code base, so their tail modules declare
+      # 128 bytes with no pc_tail block.
       foreach(case "w64_native;cs_w64x_readlane;0" "w64_emulated;cs_w64x_readlane;1" "w32_native;cs_wqm_w32;0"
                        "ps_w64_native;ps_w64x_readlane;0")
         list(GET case 0 folder)
@@ -1685,6 +1688,7 @@ if(TARGET Vulkan::Headers)
         add_custom_command(
           OUTPUT ${index}
           COMMAND ${CMAKE_COMMAND} -E env LLVM_MC=${LEONIDA_LLVM_MC} LEONIDA_W64_EMULATE=${emulate}
+                  LEONIDA_PC_TAIL_UBO=1
                   $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                   ${LEONIDA_SG_DIR}/${folder} ${shader}
           DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
@@ -1707,10 +1711,23 @@ if(TARGET Vulkan::Headers)
           VERBATIM)
         list(APPEND LEONIDA_SG_INDEXES ${output})
       endforeach()
+      # TEST-599: cs_sg_probe reads its heap base, so it needs the set-1 tail variant too. The other probe shaders
+      # declare no push constants.
+      set(LEONIDA_SG_PROBE_TAIL ${LEONIDA_SG_DIR}/glsl/cs_sg_probe_tail.spv)
+      add_custom_command(
+        OUTPUT ${LEONIDA_SG_PROBE_TAIL}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${LEONIDA_SG_DIR}/glsl
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -DPC_TAIL -o ${LEONIDA_SG_PROBE_TAIL}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_sg_probe.comp
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_sg_probe.comp
+        COMMENT "Compiling cs_sg_probe (set-1 tail)"
+        VERBATIM)
+      list(APPEND LEONIDA_SG_INDEXES ${LEONIDA_SG_PROBE_TAIL})
       add_executable(d3d12_subgroup_test test/d3d12_subgroup_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_SG_INDEXES})
       target_link_libraries(d3d12_subgroup_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_subgroup_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
-                                 LEONIDA_TEST_SUBGROUP_SHADERS="${LEONIDA_SG_DIR}")
+                                 LEONIDA_TEST_SUBGROUP_SHADERS="${LEONIDA_SG_DIR}"
+                                 LEONIDA_TEST_SG_PROBE_TAIL_SPV="${LEONIDA_SG_PROBE_TAIL}")
       target_compile_options(d3d12_subgroup_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_subgroup COMMAND d3d12_subgroup_test)
       set_tests_properties(d3d12_subgroup PROPERTIES SKIP_RETURN_CODE 77)
