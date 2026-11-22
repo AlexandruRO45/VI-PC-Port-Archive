@@ -12,7 +12,8 @@ from ffx_version_query import INTEGER_HEADER, lower, region
 
 U64 = ctypes.c_uint64
 EXPORTS = ("adcx32_op", "adcx64_op", "adox32_op", "adox64_op", "adx_dual64",
-           "shl1_adox32", "imul_seto32", "andn_clears_of32")
+           "shl1_adox32", "imul_seto32", "andn_clears_of32",
+           "mul_seto32", "xadd_seto32", "cmpxchg_seto32")
 
 
 def emit(image, output):
@@ -128,6 +129,17 @@ def check(native_path, lifted_path):
         if got != 0:
             raise AssertionError(f"{label} andn_clears_of32 = {got}, expected 0")
     cases += 1
+
+    for name, a, b, expected in (
+        ("mul_seto32", 65536, 65536, 1), ("mul_seto32", 9, 7, 0),
+        ("xadd_seto32", 0x7fffffff, 1, 1), ("xadd_seto32", 0xffffffff, 1, 0),
+        ("cmpxchg_seto32", 0x80000000, 1, 1), ("cmpxchg_seto32", 3, 3, 0),
+    ):
+        for lib in (native, lifted):
+            actual = getattr(lib, name)(a, b, 0, ctypes.byref(slot))
+            if actual != expected:
+                raise AssertionError(f"{name}({a:#x}, {b:#x}): {actual}, expected {expected}")
+        cases += 1
 
     print(f"{cases} ADX cases (ADCX, ADOX, dual-carry chains, and OF producer compositions) matched native and translated DLLs")
 

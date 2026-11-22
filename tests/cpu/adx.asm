@@ -125,4 +125,30 @@ andn_clears_of32 PROC FRAME
     ret
 andn_clears_of32 ENDP
 
+mul_seto32 PROC FRAME
+    .endprolog
+    mov eax, ecx
+    mul edx
+    mov eax, 0
+    seto al
+    ret
+mul_seto32 ENDP
+
+xadd_seto32 PROC FRAME
+    .endprolog
+    xadd ecx, edx
+    mov eax, 0
+    seto al
+    ret
+xadd_seto32 ENDP
+
+cmpxchg_seto32 PROC FRAME
+    .endprolog
+    mov eax, ecx
+    cmpxchg edx, r8d
+    mov eax, 0
+    seto al
+    ret
+cmpxchg_seto32 ENDP
+
 END
