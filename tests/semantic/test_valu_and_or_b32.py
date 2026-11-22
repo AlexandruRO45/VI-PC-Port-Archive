@@ -663,8 +663,122 @@ class TestRegisterAliasing(unittest.TestCase):
             self.assertEqual(state.get_vgpr(lane, 0), expected)
 
 
+
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class AndOrStatusFlags:
+    """Architectural condition codes and status flags for v_and_or_b32."""
+    result_zero: bool
+    result_negative: bool
+    and_term_zero: bool
+    or_term_zero: bool
+    all_bits_set: bool
+    parity_odd: bool
+
+
+def evaluate_and_or_flags(s0: int, s1: int, s2: int, res32: int) -> AndOrStatusFlags:
+    """Evaluate condition codes, term status, and bitwise characteristics."""
+    u0 = s0 & MASK32
+    u1 = s1 & MASK32
+    u2 = s2 & MASK32
+    and_term = u0 & u1
+
+    return AndOrStatusFlags(
+        result_zero=(res32 == 0),
+        result_negative=bool(res32 & SIGN32),
+        and_term_zero=(and_term == 0),
+        or_term_zero=(u2 == 0),
+        all_bits_set=(res32 == MASK32),
+        parity_odd=bool(res32 & 1),
+    )
+
+
+def compute_bitwise_carry_synthesis(a: int, b: int, c_in: int) -> int:
+    """Synthesize full-adder carry-out using bitwise logic and v_and_or_b32 logic.
+
+    Carry-out: Cout = (A & B) | (Cin & (A ^ B))
+    Can be computed as: (A & B) | (Cin & (A | B))
+    """
+    g = a & b           # generate
+    p = a | b           # propagate
+    carry_term = c_in & p
+    return oracle_v_and_or_b32(a, b, carry_term)
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry generation synthesis."""
+
+    def test_zero_flags(self) -> None:
+        # All zero
+        flags_all_zero = evaluate_and_or_flags(0, 0, 0, oracle_v_and_or_b32(0, 0, 0))
+        self.assertTrue(flags_all_zero.result_zero)
+        self.assertTrue(flags_all_zero.and_term_zero)
+        self.assertTrue(flags_all_zero.or_term_zero)
+        self.assertFalse(flags_all_zero.all_bits_set)
+
+        # AND term non-zero, but canceled out? No, OR can only add bits.
+        # So result_zero implies both AND term is zero and S2 is zero.
+        flags_disjoint = evaluate_and_or_flags(0xAAAA, 0x5555, 0, oracle_v_and_or_b32(0xAAAA, 0x5555, 0))
+        self.assertTrue(flags_disjoint.result_zero)
+        self.assertTrue(flags_disjoint.and_term_zero)
+        self.assertTrue(flags_disjoint.or_term_zero)
+
+    def test_negative_sign_flag(self) -> None:
+        # Sign bit 31 set via S2
+        res_s2 = oracle_v_and_or_b32(0, 0, 0x8000_0000)
+        flags_s2 = evaluate_and_or_flags(0, 0, 0x8000_0000, res_s2)
+        self.assertTrue(flags_s2.result_negative)
+        self.assertFalse(flags_s2.result_zero)
+
+        # Sign bit 31 set via S0 & S1
+        res_and = oracle_v_and_or_b32(0x8000_0000, 0x8000_0000, 0)
+        flags_and = evaluate_and_or_flags(0x8000_0000, 0x8000_0000, 0, res_and)
+        self.assertTrue(flags_and.result_negative)
+        self.assertFalse(flags_and.and_term_zero)
+        self.assertTrue(flags_and.or_term_zero)
+
+    def test_all_bits_set_flag(self) -> None:
+        # All 32 bits set via S2
+        res_ones = oracle_v_and_or_b32(0x1234, 0x5678, 0xFFFF_FFFF)
+        flags_ones = evaluate_and_or_flags(0x1234, 0x5678, 0xFFFF_FFFF, res_ones)
+        self.assertTrue(flags_ones.all_bits_set)
+        self.assertTrue(flags_ones.result_negative)
+        self.assertTrue(flags_ones.parity_odd)
+
+    def test_parity_flag(self) -> None:
+        # Bit 0 set (odd)
+        res_odd = oracle_v_and_or_b32(1, 1, 0)
+        self.assertTrue(evaluate_and_or_flags(1, 1, 0, res_odd).parity_odd)
+
+        # Bit 0 clear (even)
+        res_even = oracle_v_and_or_b32(2, 2, 0)
+        self.assertFalse(evaluate_and_or_flags(2, 2, 0, res_even).parity_odd)
+
+    def test_carry_generator_synthesis(self) -> None:
+        # Test full adder carry truth table across bits
+        # A B Cin -> Cout
+        # 0 0  0  -> 0
+        # 0 0  1  -> 0
+        # 0 1  0  -> 0
+        # 0 1  1  -> 1
+        # 1 0  0  -> 0
+        # 1 0  1  -> 1
+        # 1 1  0  -> 1
+        # 1 1  1  -> 1
+        for a in (0, 1):
+            for b in (0, 1):
+                for cin in (0, 1):
+                    expected_cout = 1 if (a + b + cin) >= 2 else 0
+                    cout = compute_bitwise_carry_synthesis(a, b, cin)
+                    self.assertEqual(cout, expected_cout)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
