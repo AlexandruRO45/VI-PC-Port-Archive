@@ -17,11 +17,13 @@ The profile accepts:
   ST(i), ST(0), and their popping forms FADDP, FSUBP, FSUBRP, FMULP, FDIVP and FDIVRP ST(i), ST(0) for
   i from 1 to 7;
 - FIADD, FISUB, FISUBR, FIMUL, FIDIV and FIDIVR with an m16 or m32 integer operand, which is converted
-  exactly, as FILD converts it, before the arithmetic.
+  exactly, as FILD converts it, before the arithmetic;
+- FNSTCW m16, which stores the profile's control word 0x027F, and WAIT, which does nothing because
+  every exception is masked, so none can be pending (FSTCW m16 decodes as WAIT and FNSTCW).
 A function starts with control word 0x027F, TOP 0, eight empty registers and a clear status word, and
 must return with the stack empty. The stack depth before every instruction is fixed at translation
 time, so each register maps to a C++ slot and no TOP is needed at run time. Translation rejects any x87
-instruction outside the profile (including control-word and status-word access, a popping form with
+instruction outside the profile (including FLDCW, status-word and environment access, a popping form with
 ST(0) as the destination, and the undocumented FSTP and FXCH alias encodings), a stack overflow or
 underflow, a depth that differs where control flow joins, an x87 instruction it cannot reach from the entry through direct edges, an undefined flag read in a function with a conditional move, and x87 state that is
 live at a call, a return, an indirect branch or an external edge. The helpers are in tools/x87_soft.h,
@@ -42,7 +44,7 @@ FCMOV = {M.FCMOVB: "carry", M.FCMOVE: "zero", M.FCMOVBE: "carry || zero", M.FCMO
 X87_OPS = frozenset({M.FLD, M.FST, M.FSTP, M.FXCH, M.FCHS, M.FABS, M.FSQRT, M.FRNDINT, M.FLD1, M.FLDZ, M.FLDPI, M.FLDL2T, M.FLDL2E,
                      M.FLDLG2, M.FLDLN2, M.FILD, M.FIST, M.FISTP, M.FISTTP, M.FXTRACT, M.FSCALE, *FCMOV, M.FCOMI,
                      M.FCOMIP, M.FUCOMI, M.FUCOMIP, M.FADD, M.FADDP, M.FSUB, M.FSUBP, M.FSUBR, M.FSUBRP, M.FMUL, M.FMULP,
-                     M.FDIV, M.FDIVP, M.FDIVR, M.FDIVRP, *IARITHMETIC})
+                     M.FDIV, M.FDIVP, M.FDIVR, M.FDIVRP, *IARITHMETIC, M.FNSTCW, M.WAIT})
 DECLARATION = "X87Value x87_slot[8]{};"
 
 LOADS = {S.FLOAT32: "x87_from_f32(load<uint32_t>(a))", S.FLOAT64: "x87_from_f64(load<uint64_t>(a))",
@@ -86,6 +88,8 @@ def _effect(i, depth):
     op = i.mnemonic
     if i.code in ALIASES:
         raise ValueError(f"unsupported x87 encoding at {i.ip:#x}: {i}")
+    if op in (M.FNSTCW, M.WAIT):  # neither touches the register stack
+        return depth
     if op in (M.FLD, M.FST, M.FSTP) and i.op0_kind == K.REGISTER:  # ST(i) copies
         if depth <= i.op0_register - R.ST0:
             raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
@@ -293,6 +297,10 @@ def statement(i, depth, address):
     op = i.mnemonic
     _effect(i, depth)
     top = depth - 1  # ST(k) is x87_slot[top - k]
+    if op == M.FNSTCW:  # the control word is fixed at 0x027F
+        return f"{{ const word a = {address()}; store<uint16_t>(a, 0x027f); }}  // fnstcw"
+    if op == M.WAIT:  # every exception is masked, so none is pending
+        return ";  // wait"
     if op in (M.FLD, M.FST, M.FSTP) and i.op0_kind == K.REGISTER:
         k = i.op0_register - R.ST0
         if op == M.FLD:  # push a copy of ST(k): every encoding is copied as it is
