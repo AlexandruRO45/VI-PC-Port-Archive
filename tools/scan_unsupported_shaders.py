@@ -71,6 +71,7 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     rf"(?:s_bitcmp0_b32|s_bitcmp1_b32)\s+{SCALAR32_SOURCE},\s+{SCALAR32_SOURCE}",
     rf"s_cmp_(?:eq|lg|gt|ge|lt|le)_(?:i32|u32)\s+{SCALAR32_SOURCE},\s+{SCALAR32_SOURCE}",
     rf"s_cselect_b32\s+s\d+,\s+{SCALAR32_SOURCE},\s+{SCALAR32_SOURCE}",
+    rf"s_(?:cmov|bitset0|bitset1)_b32\s+s\d+,\s+{SCALAR32_SOURCE}",
     r"(?:s_mov_b32|s_movk_i32)\s+(?:s\d+|m0),\s+.*",
     r"(?:s_addk_i32|s_mulk_i32)\s+s\d+,\s+(?:-?\d+|0x[0-9a-f]+)",
     r"s_load_dwordx8\s+s\[\d+:\d+\],\s+s\[\d+:\d+\],\s+(?:null|0x[0-9a-f]+)",
@@ -151,6 +152,7 @@ KNOWN_RDNA2_BASE_OPCODES = {
     "s_waitcnt_vmcnt", "s_waitcnt_expcnt", "s_waitcnt_lgkmcnt", "s_trap", "s_round_mode",
     # SOP1
     "s_mov_b32", "s_mov_b64", "s_cmov_b32", "s_cmov_b64", "s_not_b32", "s_not_b64",
+    "s_bitset0_b32", "s_bitset1_b32",
     "s_wqm_b32", "s_wqm_b64", "s_swappc_b64", "s_setpc_b64", "s_rfe_b64",
     "s_and_saveexec_b64", "s_or_saveexec_b64", "s_xor_saveexec_b64",
     # SOP2

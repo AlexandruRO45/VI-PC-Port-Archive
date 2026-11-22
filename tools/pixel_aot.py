@@ -108,6 +108,7 @@ def _check_two_exits(code, llvm):
                                  "s_bfm", "s_brev", "s_ff", "s_bcnt", "s_wqm", "s_quadmask"))
                   or op in ("s_nop", "s_inst_prefetch", "s_waitcnt", "s_clause", "s_delay_alu",
                             "s_setprio", "s_sleep", "s_movk_i32", "s_mulk_i32", "s_flbit_i32_b32",
+                            "s_abs_i32", "s_cmov_b32", "s_bitset0_b32", "s_bitset1_b32",
                             "s_setreg_imm32_b32")):
             raise ValueError(f"Unverified multi-exit control flow: {op}")
         pending.append(following[pc])
@@ -744,6 +745,7 @@ SCALAR = {
     "pack_hh_b32_b16": (2, "({0} >> 16) | ({1} & 0xffff0000u)", None),
     "sext_i32_i8": (1, "asuint(asint({0} << 24) >> 24)", None),
     "sext_i32_i16": (1, "asuint(asint({0} << 16) >> 16)", None),
+    "abs_i32": (1, "(asint({0}) < 0 ? (0u - {0}) : {0})", NONZERO),
     "add_u32": (2, "{0} + {1}", "{r} < {0}"), "sub_u32": (2, "{0} - {1}", "{0} < {1}"),
     "add_i32": (2, "{0} + {1}", "(~({0} ^ {1}) & ({0} ^ {r})) >> 31 != 0u"),
     "sub_i32": (2, "{0} - {1}", "(({0} ^ {1}) & ({0} ^ {r})) >> 31 != 0u"),
@@ -1453,6 +1455,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         elif m := match(rf"s_({'|'.join(SCALAR)}) (s\d+), (.+)"):
             # Uniform values become HLSL uint locals; an exec mask does not affect them.
             op, dst, operands = m.groups()
+            sgpr_name(dst)
             arity, template, carry = SCALAR[op]
             tokens = operands.split(", ")
             if dst in pending:
@@ -1472,6 +1475,21 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Write overlaps an outstanding scalar load")
             values = [scalar_u32(t, scalar, pending) for t in tokens]
             lines.append(f"    uint salu{i} = {scc} ? {values[0]} : {values[1]};")
+            scalar[dst] = ("uint", f"salu{i}")
+        elif m := match(r"s_cmov_b32 (s\d+), ([^,]+)"):
+            dst, src = m.groups()
+            if scc is None:
+                raise ValueError("Select condition is not a tracked scalar result")
+            prev = scalar_u32(dst, scalar, pending)
+            val = scalar_u32(src, scalar, pending)
+            lines.append(f"    uint salu{i} = {scc} ? {val} : {prev};")
+            scalar[dst] = ("uint", f"salu{i}")
+        elif m := match(r"(s_bitset[01]_b32) (s\d+), ([^,]+)"):
+            op, dst, src = m.groups()
+            prev = scalar_u32(dst, scalar, pending)
+            bit = scalar_u32(src, scalar, pending)
+            expr = f"({prev} & ~(1u << ({bit} & 31u)))" if op == "s_bitset0_b32" else f"({prev} | (1u << ({bit} & 31u)))"
+            lines.append(f"    uint salu{i} = {expr};")
             scalar[dst] = ("uint", f"salu{i}")
         elif m := match(r"(s_addk_i32|s_mulk_i32) (s\d+), (-?\d+|0x[0-9a-f]+)"):
             op, dst, imm = m.groups()

@@ -2124,6 +2124,42 @@ def check_sext_draw(directory, compiler, renderer, backend):
     subprocess.run(draw, check=True)
 
 
+SOP1_WORDS = (
+    (0, 0x2468ace1, 0x12400009, 3),
+    (0xfffffffb, 0x2468ace1, 0x12400009, 35),
+    (5, 0x11223344, 0x81400008, 0),
+    (0x80000000, 0x55667788, 0x81400009, 31),
+)
+
+
+def sop1_scalar_ops() -> list[str]:
+    return uncompressed_export([
+        "s_abs_i32 s50, s44",
+        "s_mov_b32 s51, s46",
+        "s_cmov_b32 s51, s45",
+        "s_mov_b32 s52, s46",
+        "s_bitset0_b32 s52, s47",
+        "s_bitset1_b32 s52, 31",
+        "s_mov_b32 s53, s46",
+        "s_cmov_b32 s53, 0x12345678",
+        "v_mov_b32_e32 v12, s50",
+        "v_mov_b32_e32 v13, s51",
+        "v_mov_b32_e32 v14, s52",
+        "v_mov_b32_e32 v15, s53",
+    ])
+
+
+def sop1_scalar_ops_reference(words):
+    s44, s45, s46, s47 = words
+    signed44 = s44 - (1 << 32) if s44 >> 31 else s44
+    abs44 = (-signed44 if signed44 < 0 else signed44) & 0xffffffff
+    scc = abs44 != 0
+    cmov_reg = s45 if scc else s46
+    bitset = (s46 & ~(1 << (s47 & 31))) | (1 << 31)
+    cmov_lit = 0x12345678 if scc else s46
+    return (abs44, cmov_reg, bitset & 0xffffffff, cmov_lit)
+
+
 def scalar():
     return with_constants(scalar_body())
 
@@ -2269,7 +2305,8 @@ def check_scalar_controls():
     for new in ("s_addc_u32 s62, s44, s45", "s_subb_u32 s62, s44, s45", "s_mul_hi_u32 s62, s44, s45",
                 "s_absdiff_i32 s62, s44, s45",
                 "s_nand_b32 s62, v12, s45", "s_nor_b32 v62, s44, s45", "s_xnor_b32 s62, s44",
-                "s_bfe_u32 s62, v12, s45", "s_lshl1_add_u32 s62, s44, s45", "s_abs_i32 s62, s44",
+                "s_bfe_u32 s62, v12, s45", "s_lshl1_add_u32 s62, s44, s45",
+                "s_quadmask_b32 s62, s44", "s_bitset0_b64 s[62:63], s44",
                 "s_brev_b32 s62, s44", "s_and_b64 s[62:63], s[44:46], s[46:47]",
                 "s_add_u32 s62, s[44:45], s45", "s_add_u32 s62, s44", "s_add_u32 s62, s44, s45, s46",
                 "s_add_u32 s62, -s44, s45", "s_add_u32 s62, s28, s45", "s_add_u32 s62, s20, s45",
@@ -2291,6 +2328,37 @@ def check_scalar_controls():
                  "s_cselect_b32 s47, 1, 0"):
         must_reject(translate, program[:load] + ["s_cmp_eq_u32 1, 1", line] + program[load:])
     translate(program[:load] + ["s_cmp_eq_u32 1, 1", "s_cselect_b32 s62, 1, 0"] + program[load:])
+
+    sop1_program = sop1_scalar_ops()
+    sop1_source = translate_int(sop1_program)
+    for expected in ("(asint(asuint(params[0].w)) < 0 ? (0u - asuint(params[0].w)) : asuint(params[0].w))",
+                     "& ~(1u << (", "| (1u << (31u & 31u))", "? 305419896u :"):
+        assert expected in sop1_source, expected
+    sop1_refs = [sop1_scalar_ops_reference(words) for words in SOP1_WORDS]
+    assert any(r[0] == 0 for r in sop1_refs) and any(r[0] == 0x80000000 for r in sop1_refs)
+    assert any(r[3] == 0x12400009 for r in sop1_refs) and any(r[3] == 0x12345678 for r in sop1_refs)
+    must_reject(translate, base[:andexec] + ["s_mov_b32 s51, 0", "s_cmov_b32 s51, s40"] + base[andexec:])
+    must_reject(translate, base[:andexec] + ["s_cmp_eq_u32 1, 1"] + base[andexec:andexec + 1]
+                + ["s_mov_b32 s51, 0", "s_cmov_b32 s51, s40"] + base[andexec + 1:])
+    must_reject(translate, base[:wqm] + ["s_cmp_eq_u32 1, 1"] + base[wqm:wqm + 1]
+                + ["s_mov_b32 s51, 0", "s_cmov_b32 s51, s40"] + base[wqm + 1:])
+    for uninit in ("s_cmov_b32 s60, s44", "s_bitset0_b32 s60, 1", "s_bitset1_b32 s60, 1"):
+        must_reject(translate, base[:andexec] + ["s_cmp_eq_u32 1, 1", uninit] + base[andexec:])
+    sop1_wait = sop1_program.index("s_waitcnt lgkmcnt(0)", sop1_program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc"))
+    for bad in ("s_abs_i32 s50, s44", "s_cmov_b32 s44, 1", "s_bitset0_b32 s44, 1", "s_bitset1_b32 s44, 1"):
+        must_reject(translate_int, sop1_program[:sop1_wait] + ["s_cmp_eq_u32 1, 1", bad] + sop1_program[sop1_wait:])
+    for old, new in (("s_abs_i32 s50, s44", "s_abs_i32 v12, s44"),
+                     ("s_abs_i32 s50, s44", "s_abs_i32 s106, s44"),
+                     ("s_cmov_b32 s51, s45", "s_cmov_b32 vcc_lo, s45"),
+                     ("s_cmov_b32 s51, s45", "s_cmov_b32 s106, s45"),
+                     ("s_bitset0_b32 s52, s47", "s_bitset0_b32 v12, 1"),
+                     ("s_bitset1_b32 s52, 31", "s_bitset1_b32 s106, 1"),
+                     ("s_bitset0_b32 s52, s47", "s_bitset0_b64 s[52:53], 1"),
+                     ("s_bitset1_b32 s52, 31", "s_bitset1_b64 s[52:53], 1"),
+                     ("s_bitset0_b32 s52, s47", "s_bitset0_b32 s52, v12")):
+        changed = [line.replace(old, new) for line in sop1_program]
+        assert changed != sop1_program, new
+        must_reject(translate_int, changed)
 
 
 # SDWA moves and half widening. In SDWA_PRESERVE_BODY each move writes a 16-bit field into WORD_0 of a register
@@ -4226,6 +4294,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((with_constants(TRIG_BODY), translate))
     fixtures.append((with_constants(CLASS_BODY), translate))
     fixtures.append((sext_values(), translate))
+    fixtures.append((sop1_scalar_ops(), translate_int))
     fixtures.extend((scalar_pack_values(halves), translate) for halves in PACK_HALVES)
     fixtures.append((with_constants(RECIPROCAL_BODY), translate))
     fixtures.append((bitwise_program(), translate))
@@ -5418,7 +5487,43 @@ def check_blend_and_scalar_draws(directory, compiler, renderer, backend):
         wrong = subprocess.run([renderer, backend, "--check-pixel-case", shader, case], capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError(f"Replacing {old} with {new} escaped detection")
+    check_sop1_scalar_ops_draw(directory, compiler, renderer, backend)
     return 0
+
+
+def check_sop1_scalar_ops_draw(directory, compiler, renderer, backend):
+    source = directory / "sop1_scalar_ops.hlsl"
+    shader = directory / "sop1_scalar_ops.cso"
+    case = directory / "sop1_scalar_ops.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    program = sop1_scalar_ops()
+
+    def write_words(words, expected):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        for word in expected:
+            assert struct.unpack("<I", struct.pack("<f", as_float(word)))[0] == word, hex(word)
+        write_case(case, bytes(constants), tuple(as_float(word) for word in expected), integer_rt=True)
+
+    source.write_text(translate_int(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    for words in SOP1_WORDS:
+        write_words(words, sop1_scalar_ops_reference(words))
+        subprocess.run(draw, check=True)
+
+    words = SOP1_WORDS[1]
+    write_words(words, sop1_scalar_ops_reference(words))
+    for old, new, label in (
+        ("s_abs_i32 s50, s44", "s_not_b32 s50, s44", "signed scalar abs"),
+        ("s_bitset0_b32 s52, s47", "s_bitset1_b32 s52, s47", "scalar bitset clear"),
+    ):
+        mutated = [line.replace(old, new) for line in program]
+        assert mutated != program, label
+        source.write_text(translate_int(mutated), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Mutating {label} escaped detection")
 
 
 def check_e64_render(directory, compiler, renderer, backend):
