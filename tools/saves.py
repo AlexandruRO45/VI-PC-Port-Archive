@@ -459,6 +459,13 @@ def import_saves(args):
 
 
 def main(argv):
+    # On Windows, redirected stdout uses the active ANSI code page. Match stderr's fallback so a Unicode path
+    # outside that code page is escaped instead of making an otherwise successful command fail while printing.
+    try:
+        sys.stdout.reconfigure(errors='backslashreplace')
+    except (AttributeError, OSError, ValueError):
+        pass
+
     if len(argv) < 2 or argv[1] in ('-h', '--help'):
         print(__doc__)
         return 0
