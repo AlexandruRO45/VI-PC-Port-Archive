@@ -38,6 +38,20 @@ class FallbackFlagsTest(unittest.TestCase):
         self.assertEqual(make_game.fallback_flags(self.args_with(*reversed(ALL_FLAGS))), ALL_FLAGS)
 
 
+class Wave32HalvesFallbackTest(unittest.TestCase):
+    """--no-wave32-halves is a forwarded fallback flag, chosen by itself on MoltenVK (no vertex subgroup lane)."""
+
+    def test_is_a_fallback_flag(self):
+        self.assertIn(("--no-wave32-halves", "no_wave32_halves"), make_game.FALLBACK_FLAGS)
+
+    def test_moltenvk_has_no_vertex_lane(self):
+        self.assertTrue(make_game.vertex_lane_unavailable({"driver_id": 14}))
+
+    def test_other_drivers_and_unknown_keep_halves(self):
+        for info in ({"driver_id": 1}, {"driver_id": 3}, {"driver_id": None}, {}):
+            self.assertFalse(make_game.vertex_lane_unavailable(info), info)
+
+
 class TranslateFallbacksTest(unittest.TestCase):
     """translate() passes the fallback flags to every shard, and re-plans when they change."""
 
