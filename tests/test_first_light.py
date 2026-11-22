@@ -47,6 +47,26 @@ def harness() -> str | None:
     return None
 
 
+class MeshOutputTests(unittest.TestCase):
+    def test_fit_keeps_relative_depth_for_an_offset_mesh(self) -> None:
+        import tempfile
+
+        vertices = [(-2.0, -1.0, 900.0, 0.0, 0.0),
+                    (2.0, -1.0, 901.0, 1.0, 0.0),
+                    (0.0, 1.0, 902.0, 0.5, 1.0)]
+        fitted = fl.fit(vertices, 128, 128, True, False)
+        with tempfile.TemporaryDirectory() as directory:
+            mesh = os.path.join(directory, "mesh.bin")
+            fl.write_mesh(mesh, fitted, [0, 1, 2])
+            with open(mesh, "rb") as handle:
+                encoded = handle.read()
+
+        records = encoded[fl.MESH_HEADER.size:fl.MESH_HEADER.size + 3 * 20]
+        depth = b"".join(records[offset + 8:offset + 12] for offset in (0, 20, 40))
+        self.assertEqual(depth, struct.pack("<3f", 0.05, 0.5, 0.95))
+        self.assertEqual(encoded[-12:], struct.pack("<3I", 0, 1, 2))
+
+
 class FirstLightTests(unittest.TestCase):
     def setUp(self):
         self.out = os.environ.get("LEONIDA_FIRST_LIGHT_DIR")
@@ -211,6 +231,46 @@ class OracleTests(unittest.TestCase):
     def test_rejects_a_short_image(self):
         with self.assertRaises(AssertionError):
             check_image(b"", self.manifest)
+
+
+class ReadObjTests(unittest.TestCase):
+    """Wavefront OBJ parsing in tools/first_light.py without a GPU or game package."""
+
+    def _write_obj(self, text: str) -> str:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "mesh.obj")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        return path
+
+    def test_negative_relative_indices_inline_comments_and_continuations(self):
+        positive = self._write_obj(
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\n"
+            "vt 0.1 0.2\nvt 0.3 0.4\nvt 0.5 0.6\n"
+            "f 1/1 2/2 3/3\n"
+        )
+        relative = self._write_obj(
+            "v 0 0 0 # origin\n"
+            "v 1 0 0\n"
+            "v 0 1 0\n"
+            "vt 0.1 0.2 # uv0\n"
+            "vt 0.3 0.4\n"
+            "vt 0.5 0.6\n"
+            "f -3/-3 \\\n"
+            "  -2/-2 -1/-1 # trailing comment\n"
+        )
+        self.assertEqual(fl.read_obj(relative), fl.read_obj(positive))
+
+    def test_rejects_zero_and_out_of_range_vertex_indices(self):
+        for bad in (
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 0 1 2\n",
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 4\n",
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nf -4 -2 -1\n",
+            "v 0 0\nf 1 1 1\n",
+        ):
+            with self.subTest(bad=bad), self.assertRaises(SystemExit):
+                fl.read_obj(self._write_obj(bad))
 
 
 if __name__ == "__main__":

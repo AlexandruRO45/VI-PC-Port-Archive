@@ -137,26 +137,71 @@ def translate(work: str, picked: list[dict]) -> dict:
     return result
 
 
+def _obj_lines(handle):
+    """Yield logical OBJ lines with trailing-backslash continuations joined and # comments stripped."""
+    pending = ""
+    for raw_line in handle:
+        stripped = raw_line.rstrip("\r\n")
+        if stripped.endswith("\\"):
+            pending += stripped[:-1]
+            continue
+        yield (pending + stripped).split("#", 1)[0]
+        pending = ""
+    if pending:
+        yield pending.split("#", 1)[0]
+
+
+def _parse_obj_int(token: str, path: str, kind: str) -> int:
+    try:
+        return int(token)
+    except ValueError:
+        raise SystemExit(f"{path}: invalid {kind} index {token!r}") from None
+
+
 def read_obj(
     path: str,
 ) -> tuple[list[tuple[float, float, float, float, float]], list[int]]:
     """Positions, UVs and triangles as (x, y, z, u, v) vertices plus a u32 index list."""
     positions, uvs, faces = [], [], []
     with open(path, encoding="utf-8", errors="replace") as f:
-        for line in f:
+        for line in _obj_lines(f):
             p = line.split()
             if not p:
                 continue
             if p[0] == "v":
-                positions.append(tuple(float(x) for x in p[1:4]))
+                if len(p) < 4:
+                    raise SystemExit(f"{path}: short vertex line: {line.strip()!r}")
+                try:
+                    positions.append(tuple(float(x) for x in p[1:4]))
+                except ValueError:
+                    raise SystemExit(f"{path}: invalid vertex coordinates: {line.strip()!r}") from None
             elif p[0] == "vt":
-                uvs.append(tuple(float(x) for x in p[1:3]))
+                if len(p) < 3:
+                    raise SystemExit(f"{path}: short texture-coordinate line: {line.strip()!r}")
+                try:
+                    uvs.append(tuple(float(x) for x in p[1:3]))
+                except ValueError:
+                    raise SystemExit(f"{path}: invalid texture coordinates: {line.strip()!r}") from None
             elif p[0] == "f":
                 face = []
                 for word in p[1:]:
                     parts = word.split("/")
-                    vi = int(parts[0]) - 1
-                    ti = int(parts[1]) - 1 if len(parts) > 1 and parts[1] else -1
+                    raw_vi = _parse_obj_int(parts[0], path, "vertex")
+                    if raw_vi == 0:
+                        raise SystemExit(f"{path}: vertex index 0 is out of range (OBJ indices are 1-based)")
+                    vi = len(positions) + raw_vi if raw_vi < 0 else raw_vi - 1
+                    if raw_vi < 0 and vi < 0:
+                        raise SystemExit(f"{path}: vertex index {raw_vi} is out of range for {len(positions)} vertex(es)")
+                    if len(parts) > 1 and parts[1]:
+                        raw_ti = _parse_obj_int(parts[1], path, "texture-coordinate")
+                        if raw_ti == 0:
+                            ti = -1
+                        else:
+                            ti = len(uvs) + raw_ti if raw_ti < 0 else raw_ti - 1
+                            if raw_ti < 0 and ti < 0:
+                                ti = -1
+                    else:
+                        ti = -1
                     face.append((vi, ti))
                 for k in range(1, len(face) - 1):
                     faces.extend((face[0], face[k], face[k + 1]))
@@ -164,6 +209,8 @@ def read_obj(
         raise SystemExit(f"no vertices or faces in {path}")
     unique, vertices, indices = {}, [], []
     for vi, ti in faces:
+        if not 0 <= vi < len(positions):
+            raise SystemExit(f"{path}: vertex index {vi + 1} is out of range for {len(positions)} vertex(es)")
         key = (vi, ti)
         if key not in unique:
             unique[key] = len(vertices)
@@ -181,7 +228,7 @@ def fit(vertices, width: int, height: int, fit_xy: bool, flatten_z: bool):
     cx, cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
     span = max(max(xs) - min(xs), max(ys) - min(ys)) or 1.0
     scale = 1.8 / span
-    cz = (min(zs) + max(zs)) / 2 if flatten_z else 0.0
+    cz = (min(zs) + max(zs)) / 2 if not flatten_z else 0.0
     aspect = width / height if height else 1.0
     out = []
     for x, y, z, u, v in vertices:
@@ -384,6 +431,47 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
     return result
 
 
+def load_json(
+    path: str,
+    kind: str,
+    expect: type,
+    keys: tuple[str, ...] = (),
+    entry_keys: tuple[str, ...] = (),
+):
+    """Read a JSON file from the user's folders; a bad read exits naming it, never a traceback.
+
+    Invalid or truncated JSON, non-UTF-8 bytes, the wrong top-level shape, a missing required
+    key, and an array entry that is not an object or lacks one are the user's broken files, so
+    they fail like the tool's other errors: one SystemExit line with the path and the reason.
+    """
+    wanted = "an object" if expect is dict else "an array"
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except UnicodeDecodeError as e:
+        raise SystemExit(f"the {kind} {path} is not valid UTF-8 ({e.reason})") from e
+    except json.JSONDecodeError as e:
+        raise SystemExit(
+            f"the {kind} {path} is not valid JSON ({e.msg} at line {e.lineno} column {e.colno})"
+        ) from e
+    if not isinstance(data, expect):
+        raise SystemExit(f"the {kind} {path} is a {type(data).__name__}, expected {wanted}")
+    if expect is dict:
+        if gaps := [k for k in keys if k not in data]:
+            raise SystemExit(f"the {kind} {path} has no key {', '.join(repr(k) for k in gaps)}")
+    else:
+        for i, entry in enumerate(data):
+            if not isinstance(entry, dict):
+                raise SystemExit(
+                    f"the {kind} {path} entry {i} is a {type(entry).__name__}, expected an object"
+                )
+            if gaps := [k for k in entry_keys if k not in entry]:
+                raise SystemExit(
+                    f"the {kind} {path} entry {i} has no key {', '.join(repr(k) for k in gaps)}"
+                )
+    return data
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="Draw one real game model with its own translated VS/PS."
@@ -438,16 +526,15 @@ def main(argv=None) -> int:
     if a.list:
         if not a.game:
             raise SystemExit("--list needs --game")
-        with open(ensure_carve(os.path.abspath(a.game), work), encoding="utf-8") as f:
-            for e in json.load(f):
-                if e["stage"] in ("vs", "ps"):
-                    selector = f"\t--{e['stage']}-offset {e['offset']:#x}" if "offset" in e else ""
-                    print(f"{e['stage']} {e['name']}{selector}")
+        index = ensure_carve(os.path.abspath(a.game), work)
+        for e in load_json(index, "carve index", list, entry_keys=("stage", "name")):
+            if e["stage"] in ("vs", "ps"):
+                selector = f"\t--{e['stage']}-offset {e['offset']:#x}" if "offset" in e else ""
+                print(f"{e['stage']} {e['name']}{selector}")
         return 0
     existing = os.path.join(out_dir, "manifest.json")
     if a.check and not a.game and os.path.isfile(existing):
-        with open(existing, encoding="utf-8") as f:
-            manifest = json.load(f)
+        manifest = load_json(existing, "first-light manifest", dict, keys=("width", "height"))
         run_draw(a, manifest, out_dir)
         return 0
     if not a.game:
