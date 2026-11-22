@@ -36,9 +36,15 @@ happens **on your PC, from your own copy of the game**.
 Discord: https://discord.gg/rexed
 <br>
 
-[![Leonida implementation and contribution tracker](https://raw.githubusercontent.com/omdev74/leonida-progress/main/data/dashboard.svg)](https://github.com/omdev74/leonida-progress)
+[![Method bodies](https://raw.githubusercontent.com/omdev74/leonida-progress/main/data/badge-methods.svg)](https://github.com/omdev74/leonida-progress/blob/main/data/report.md)
+[![Tracker refresh](https://github.com/omdev74/leonida-progress/actions/workflows/refresh.yml/badge.svg)](https://github.com/omdev74/leonida-progress/actions/workflows/refresh.yml)
+[![Last successful check](https://raw.githubusercontent.com/omdev74/leonida-progress/main/data/badge-updated.svg)](https://github.com/omdev74/leonida-progress/actions/workflows/refresh.yml)
 
-Automatically refreshed from the public coordination tables. Implementation status, not game completion; [sources and definitions](https://github.com/omdev74/leonida-progress/blob/main/data/report.md).
+[![Leonida source tracker](https://raw.githubusercontent.com/omdev74/leonida-progress/main/data/dashboard.svg)](https://github.com/omdev74/leonida-progress)
+
+[![D3D12 source history](https://raw.githubusercontent.com/omdev74/leonida-progress/main/data/history.svg)](https://github.com/omdev74/leonida-progress/blob/main/data/history.md)
+
+Automatically scanned from upstream source. Body presence, not verified correctness or game completion; [counting rules and evidence](https://github.com/omdev74/leonida-progress/blob/main/data/report.md).
 
 ## Project status
 
