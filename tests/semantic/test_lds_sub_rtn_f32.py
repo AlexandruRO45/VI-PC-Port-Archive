@@ -193,6 +193,136 @@ def ref_ds_sub_rtn_f32(
     return old_val
 
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class DSOpcode(Enum):
+    """Data Share (DS) atomic opcodes."""
+    DS_SUB_RTN_F32 = "ds_sub_rtn_f32"
+
+
+class RegType(Enum):
+    """Register file classes."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclass(frozen=True)
+class RegisterOperand:
+    """Typed symbolic register operand representation."""
+    index: int
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        max_limit = DEFAULT_NUM_VGPRS if self.reg_type == RegType.VGPR else DEFAULT_NUM_SGPRS
+        if not (0 <= self.index < max_limit):
+            raise ValueError(
+                f"Register index out of bounds: {self.reg_type.value}[{self.index}] "
+                f"(expected 0 <= index < {max_limit})"
+            )
+
+    @property
+    def name(self) -> str:
+        return f"{self.reg_type.value}[{self.index}]"
+
+    def __str__(self) -> str:
+        return self.name
+
+
+@dataclass(frozen=True)
+class Immediate:
+    """32-bit immediate constant operand."""
+    val: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "val", u32(self.val))
+
+    def __str__(self) -> str:
+        return f"0x{self.val:X}"
+
+
+Operand = Union[RegisterOperand, Immediate]
+
+
+@dataclass(frozen=True)
+class DSSubRtnF32Instruction:
+    """Symbolic AST node for ds_sub_rtn_f32 instruction."""
+    vdst: RegisterOperand
+    vaddr: RegisterOperand
+    vdata0: Operand
+    offset: int = 0
+    gds: bool = False
+    opcode: DSOpcode = DSOpcode.DS_SUB_RTN_F32
+
+    def __post_init__(self) -> None:
+        if self.vdst.reg_type != RegType.VGPR:
+            raise ValueError(f"vdst must be a VGPR, got {self.vdst.reg_type}")
+        if self.vaddr.reg_type != RegType.VGPR:
+            raise ValueError(f"vaddr must be a VGPR, got {self.vaddr.reg_type}")
+        if not (0 <= self.offset <= OFFSET16_MASK):
+            raise ValueError(
+                f"offset out of bounds: {self.offset} (expected 0 <= offset <= {OFFSET16_MASK})"
+            )
+
+    def disassemble(self) -> str:
+        """Emit canonical AMD assembly string."""
+        parts = [self.opcode.value, str(self.vdst), str(self.vaddr), str(self.vdata0)]
+        if self.offset != 0:
+            parts.append(f"offset:{self.offset}")
+        if self.gds:
+            parts.append("gds")
+        return f"{parts[0]} {', '.join(parts[1:])}"
+
+    @classmethod
+    def parse(cls, asm: str) -> DSSubRtnF32Instruction:
+        """Parse canonical AMD assembly string into AST."""
+        tokens = [t.strip().rstrip(",") for t in asm.strip().split() if t.strip()]
+        if not tokens:
+            raise ValueError("Empty assembly string")
+        op = tokens[0]
+        if op != DSOpcode.DS_SUB_RTN_F32.value:
+            raise ValueError(f"Unsupported opcode: {op}")
+        if len(tokens) < 4:
+            raise ValueError(f"Instruction requires vdst, vaddr, vdata operands: {asm}")
+
+        def parse_reg(token: str) -> RegisterOperand:
+            clean = token.rstrip(",")
+            if clean.startswith("v[") and clean.endswith("]"):
+                idx = int(clean[2:-1])
+                return RegisterOperand(idx, RegType.VGPR)
+            if clean.startswith("v") and clean[1:].isdigit():
+                return RegisterOperand(int(clean[1:]), RegType.VGPR)
+            if clean.startswith("s[") and clean.endswith("]"):
+                idx = int(clean[2:-1])
+                return RegisterOperand(idx, RegType.SGPR)
+            if clean.startswith("s") and clean[1:].isdigit():
+                return RegisterOperand(int(clean[1:]), RegType.SGPR)
+            raise ValueError(f"Invalid register operand: {token}")
+
+        vdst = parse_reg(tokens[1])
+        vaddr = parse_reg(tokens[2])
+
+        vdata_token = tokens[3].rstrip(",")
+        if vdata_token.startswith("v") or vdata_token.startswith("s"):
+            vdata0: Operand = parse_reg(vdata_token)
+        else:
+            vdata0 = Immediate(int(vdata_token, 0))
+
+        offset = 0
+        gds = False
+        for opt in tokens[4:]:
+            clean = opt.rstrip(",")
+            if clean.startswith("offset:"):
+                offset = int(clean.split(":", 1)[1], 0)
+            elif clean == "gds":
+                gds = True
+            else:
+                raise ValueError(f"Unknown modifier: {clean}")
+
+        return cls(vdst=vdst, vaddr=vaddr, vdata0=vdata0, offset=offset, gds=gds)
+
+
 class TestLdsSubRtnF32Oracle(unittest.TestCase):
     """Phase 1: Unit tests for reference mathematical oracle and architectural model."""
 
@@ -228,6 +358,80 @@ class TestLdsSubRtnF32Oracle(unittest.TestCase):
         ret = ref_ds_sub_rtn_f32(self.mem, vaddr=16, vdata_bits=ONE_F32, offset=8)
         self.assertEqual(ret, THREE_F32)
         self.assertEqual(self.mem.read_dword(6), TWO_F32)
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Phase 2: Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_valid_ast_construction(self) -> None:
+        vdst = RegisterOperand(0, RegType.VGPR)
+        vaddr = RegisterOperand(1, RegType.VGPR)
+        vdata0 = RegisterOperand(2, RegType.VGPR)
+        instr = DSSubRtnF32Instruction(vdst=vdst, vaddr=vaddr, vdata0=vdata0, offset=16)
+
+        self.assertEqual(instr.opcode, DSOpcode.DS_SUB_RTN_F32)
+        self.assertEqual(instr.vdst.index, 0)
+        self.assertEqual(instr.vaddr.index, 1)
+        self.assertEqual(instr.offset, 16)
+        self.assertFalse(instr.gds)
+
+    def test_ast_with_immediate_operand(self) -> None:
+        vdst = RegisterOperand(5, RegType.VGPR)
+        vaddr = RegisterOperand(6, RegType.VGPR)
+        imm = Immediate(ONE_F32)
+        instr = DSSubRtnF32Instruction(vdst=vdst, vaddr=vaddr, vdata0=imm, offset=0)
+
+        self.assertEqual(instr.vdata0, Immediate(ONE_F32))
+
+    def test_disassembly_formatting(self) -> None:
+        vdst = RegisterOperand(0, RegType.VGPR)
+        vaddr = RegisterOperand(1, RegType.VGPR)
+        vdata0 = RegisterOperand(2, RegType.VGPR)
+
+        instr_no_offset = DSSubRtnF32Instruction(vdst=vdst, vaddr=vaddr, vdata0=vdata0, offset=0)
+        self.assertEqual(
+            instr_no_offset.disassemble(),
+            "ds_sub_rtn_f32 v[0], v[1], v[2]",
+        )
+
+        instr_with_offset = DSSubRtnF32Instruction(vdst=vdst, vaddr=vaddr, vdata0=vdata0, offset=32)
+        self.assertEqual(
+            instr_with_offset.disassemble(),
+            "ds_sub_rtn_f32 v[0], v[1], v[2], offset:32",
+        )
+
+        instr_gds = DSSubRtnF32Instruction(vdst=vdst, vaddr=vaddr, vdata0=vdata0, offset=4, gds=True)
+        self.assertEqual(
+            instr_gds.disassemble(),
+            "ds_sub_rtn_f32 v[0], v[1], v[2], offset:4, gds",
+        )
+
+    def test_ast_parse(self) -> None:
+        instr = DSSubRtnF32Instruction.parse("ds_sub_rtn_f32 v[0], v[1], v[2], offset:64, gds")
+        self.assertEqual(instr.vdst.index, 0)
+        self.assertEqual(instr.vaddr.index, 1)
+        self.assertEqual(instr.offset, 64)
+        self.assertTrue(instr.gds)
+
+    def test_ast_validation_errors(self) -> None:
+        v0 = RegisterOperand(0, RegType.VGPR)
+        s0 = RegisterOperand(0, RegType.SGPR)
+
+        # vdst cannot be SGPR
+        with self.assertRaises(ValueError):
+            DSSubRtnF32Instruction(vdst=s0, vaddr=v0, vdata0=v0)
+
+        # vaddr cannot be SGPR
+        with self.assertRaises(ValueError):
+            DSSubRtnF32Instruction(vdst=v0, vaddr=s0, vdata0=v0)
+
+        # Negative offset
+        with self.assertRaises(ValueError):
+            DSSubRtnF32Instruction(vdst=v0, vaddr=v0, vdata0=v0, offset=-1)
+
+        # Offset exceeding 16 bits
+        with self.assertRaises(ValueError):
+            DSSubRtnF32Instruction(vdst=v0, vaddr=v0, vdata0=v0, offset=65536)
 
 
 if __name__ == "__main__":
