@@ -369,5 +369,115 @@ class TestValuCvtNormI32F16AST(unittest.TestCase):
                 src0=Register(RegKind.VGPR, 1),
             )
 
+# ---------------------------------------------------------------------------
+# Deterministic Scalar VALU Interpreter
+# ---------------------------------------------------------------------------
+
+class ScalarVALUInterpreter:
+    """Architectural scalar register file and execution engine for VALU conversion instructions."""
+
+    def __init__(self) -> None:
+        self.vgprs: List[int] = [0] * 256
+        self.sgprs: List[int] = [0] * 106
+        self.vcc: int = 0
+        self.exec_mask: int = MASK64
+        self.m0: int = 0
+        self.status: int = 0
+
+    def read_reg32(self, kind: RegKind, index: int) -> int:
+        if kind == RegKind.VGPR:
+            return self.vgprs[index] & MASK32
+        return self.sgprs[index] & MASK32
+
+    def write_reg32(self, kind: RegKind, index: int, val32: int) -> None:
+        val32 &= MASK32
+        if kind == RegKind.VGPR:
+            self.vgprs[index] = val32
+        else:
+            self.sgprs[index] = val32
+
+    def read_reg16(self, reg: Register) -> int:
+        raw32 = self.read_reg32(reg.kind, reg.index)
+        if reg.subword == SubWord.HI:
+            return (raw32 >> 16) & MASK16
+        return raw32 & MASK16
+
+    def read_operand16(self, op: Union[Register, Immediate]) -> int:
+        if isinstance(op, Immediate):
+            return op.bits16()
+        return self.read_reg16(op)
+
+    def step(self, inst: Instruction) -> int:
+        if inst.opcode != Opcode.V_CVT_NORM_I32_F16:
+            raise ValueError(f"Unsupported opcode in VALU interpreter: {inst.opcode}")
+
+        src_bits = self.read_operand16(inst.src0)
+        res_snorm32 = ref_cvt_norm_i32_f16(
+            src_bits,
+            clamp=inst.clamp,
+            neg=inst.neg_src0,
+            abs_val=inst.abs_src0,
+        )
+        self.write_reg32(inst.dst.kind, inst.dst.index, res_snorm32)
+        return res_snorm32
+
+
+class TestValuCvtNormI32F16ScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar VALU instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarVALUInterpreter()
+
+    def test_basic_vgpr_execution(self) -> None:
+        self.interp.write_reg32(RegKind.VGPR, 1, ONE_F16)
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_I32_F16,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1, SubWord.LO),
+        )
+        res = self.interp.step(inst)
+        self.assertEqual(res, SNORM32_MAX)
+        self.assertEqual(self.interp.read_reg32(RegKind.VGPR, 0), SNORM32_MAX)
+
+    def test_negative_vgpr_execution(self) -> None:
+        self.interp.write_reg32(RegKind.VGPR, 1, NEG_ONE_F16)
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_I32_F16,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1, SubWord.LO),
+        )
+        res = self.interp.step(inst)
+        self.assertEqual(res, SNORM32_MIN_RAW)
+
+    def test_sgpr_source_execution(self) -> None:
+        self.interp.write_reg32(RegKind.SGPR, 4, HALF_F16)
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_I32_F16,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.SGPR, 4, SubWord.LO),
+        )
+        res = self.interp.step(inst)
+        self.assertEqual(res, SNORM32_HALF)
+
+    def test_immediate_source_execution(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_I32_F16,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Immediate(0.25),
+        )
+        res = self.interp.step(inst)
+        self.assertEqual(res, 536870912)
+
+    def test_vcc_unmodified(self) -> None:
+        canary = 0x1234567890ABCDEF
+        self.interp.vcc = canary
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_I32_F16,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Immediate(1.0),
+        )
+        self.interp.step(inst)
+        self.assertEqual(self.interp.vcc, canary)
+
 if __name__ == "__main__":
     unittest.main()
