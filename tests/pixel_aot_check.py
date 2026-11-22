@@ -18,6 +18,11 @@ from pixel_aot import ALU, disassemble, native_program
 # First word of each line of every program lower() accepted in this run. tools/form_coverage.py counts
 # these when this test passes; a program a check expects to be rejected raises before it is recorded.
 ACCEPTED = set()
+VOP2_INT_OPS = (
+    "v_lshrrev_b32_e32", "v_ashrrev_i32_e32", "v_lshlrev_b32_e32",
+    "v_and_b32_e32", "v_or_b32_e32", "v_xor_b32_e32",
+    "v_add_nc_u32_e32", "v_sub_nc_u32_e32",
+)
 
 
 def lower(instructions, *args, **kwargs):
@@ -1596,6 +1601,20 @@ def check_three_way_templates():
                                 "med3": sorted((a, b, c))[1]}, (a, b, c)
 
 
+def vop2_integer_group() -> list[str]:
+    return with_constants([
+        "v_mov_b32_e32 v18, s45",
+        "v_lshrrev_b32_e32 v12, s44, v18",
+        "v_ashrrev_i32_e32 v13, s44, v18",
+        "v_lshlrev_b32_e32 v14, s44, v18",
+        "v_and_b32_e32 v15, s44, v18",
+        "v_or_b32_e32 v12, s44, v18",
+        "v_xor_b32_e32 v13, s44, v18",
+        "v_add_nc_u32_e32 v14, s44, v18",
+        "v_sub_nc_u32_e32 v15, s44, v18",
+    ])
+
+
 def check_controls(directory):
     program = buffer_color(True)
     assert "float2 main(" in translate_buffer_color(program)
@@ -1614,6 +1633,26 @@ def check_controls(directory):
     check_scalar_helpers_with_vector_arithmetic()
     check_adapter_skip(directory)
     check_scalar_pair_reads()
+    vop2_source = translate(vop2_integer_group())
+    assert set(VOP2_INT_OPS) <= ACCEPTED
+    for expected in (
+        "(asuint(alu20) >> (asuint(params[0].w) & 31u))",
+        "(asint(alu20) >> (asuint(params[0].w) & 31u))",
+        "(asuint(alu20) << (asuint(params[0].w) & 31u))",
+        "(asuint(params[0].w) & asuint(alu20))",
+        "(asuint(params[0].w) | asuint(alu20))",
+        "(asuint(params[0].w) ^ asuint(alu20))",
+        "(asuint(params[0].w) + asuint(alu20))",
+        "(asuint(params[0].w) - asuint(alu20))",
+    ):
+        assert expected in vop2_source, expected
+    for bad_vop2 in (
+        "v_and_b32_e32 v12, -v18, v18",
+        "v_and_b32_e32 v12, abs(v18), v18",
+        "v_and_b32_e32 v12, v106, v18",
+        "v_and_b32_e32 v12, s44, v106",
+    ):
+        must_reject(translate, with_constants(["v_mov_b32_e32 v18, s45", bad_vop2]))
     # v_cvt_f32_f16 widens the low half through widen16 and applies modifiers after widening.
     body = translate(with_constants(HALF_BODY)).split("float4 main", 1)[1]
     assert body.count("widen16(asuint(") == 4 and "(-abs(widen16(" in body, body
@@ -2497,6 +2536,10 @@ def check_render(directory, compiler, renderer, backend):
 
 
 def main():
+    if len(sys.argv) == 1:
+        with tempfile.TemporaryDirectory() as tmp:
+            check_controls(Path(tmp))
+        return 0
     mode, *args = sys.argv[1:]
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)

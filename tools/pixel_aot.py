@@ -832,6 +832,46 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             lines.append(f"    bool cmp{i} = (class32({operand}) & {bits}) != 0u;")
 
+        elif m := match(r"(v_lshrrev_b32|v_ashrrev_i32|v_lshlrev_b32|v_and_b32|v_or_b32|v_xor_b32|v_add_nc_u32|v_sub_nc_u32)(?:_e32)? (v\d+), ([^,]+), ([^,]+)"):
+            op, dst, src0, src1 = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid integer arithmetic operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            if op == "v_ashrrev_i32":
+                s0 = int_operand(src0, scalar, vector, pending, sample_dest, signed=False)
+                s1 = int_operand(src1, scalar, vector, pending, sample_dest, signed=True)
+                expr = f"({s1} >> ({s0} & 31u))"
+            elif op == "v_lshrrev_b32":
+                s0 = int_operand(src0, scalar, vector, pending, sample_dest, signed=False)
+                s1 = int_operand(src1, scalar, vector, pending, sample_dest, signed=False)
+                expr = f"({s1} >> ({s0} & 31u))"
+            elif op == "v_lshlrev_b32":
+                s0 = int_operand(src0, scalar, vector, pending, sample_dest, signed=False)
+                s1 = int_operand(src1, scalar, vector, pending, sample_dest, signed=False)
+                expr = f"({s1} << ({s0} & 31u))"
+            elif op == "v_and_b32":
+                s0 = int_operand(src0, scalar, vector, pending, sample_dest, signed=False)
+                s1 = int_operand(src1, scalar, vector, pending, sample_dest, signed=False)
+                expr = f"({s0} & {s1})"
+            elif op == "v_or_b32":
+                s0 = int_operand(src0, scalar, vector, pending, sample_dest, signed=False)
+                s1 = int_operand(src1, scalar, vector, pending, sample_dest, signed=False)
+                expr = f"({s0} | {s1})"
+            elif op == "v_xor_b32":
+                s0 = int_operand(src0, scalar, vector, pending, sample_dest, signed=False)
+                s1 = int_operand(src1, scalar, vector, pending, sample_dest, signed=False)
+                expr = f"({s0} ^ {s1})"
+            elif op == "v_add_nc_u32":
+                s0 = int_operand(src0, scalar, vector, pending, sample_dest, signed=False)
+                s1 = int_operand(src1, scalar, vector, pending, sample_dest, signed=False)
+                expr = f"({s0} + {s1})"
+            else:
+                s0 = int_operand(src0, scalar, vector, pending, sample_dest, signed=False)
+                s1 = int_operand(src1, scalar, vector, pending, sample_dest, signed=False)
+                expr = f"({s0} - {s1})"
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat({expr});")
         elif m := match(r"v_(min|max)_(i32|u32)(?:_e32|_e64)? (v\d+), ([^,]+), ([^,]+)"):
             op, kind, dst, *tokens = m.groups()
             if mask != "entry":

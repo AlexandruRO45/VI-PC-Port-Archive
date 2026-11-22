@@ -228,6 +228,11 @@ def check_shader_records():
         ("SOP2", "s_lshl_b64"), ("SOP2", "s_lshr_b64"), ("SOP2", "s_ashr_i64"),
         ("SOP2", "s_bfm_b64"), ("SOP2", "s_bfe_u32"), ("SOP2", "s_bfe_i32"),
     }
+    vop2_forms = {
+        ("VOP2", "v_lshrrev_b32"), ("VOP2", "v_ashrrev_i32"), ("VOP2", "v_lshlrev_b32"),
+        ("VOP2", "v_and_b32"), ("VOP2", "v_or_b32"), ("VOP2", "v_xor_b32"),
+        ("VOP2", "v_add_nc_u32"), ("VOP2", "v_sub_nc_u32"),
+    }
     rejected_forms = {
         "s_and_saveexec_b64", "s_or_saveexec_b64", "s_andn2_saveexec_b64",
         "s_cselect_b64", "s_bfe_u64", "s_bfe_i64",
@@ -238,6 +243,7 @@ def check_shader_records():
     for name in ("gfx1013.tsv", "rdna2.tsv"):
         covered = fc.gfx_forms(pixel.ACCEPTED, fc.load_reference(name))
         assert scalar64_forms <= covered, (name, scalar64_forms - covered)
+        assert vop2_forms <= covered, (name, vop2_forms - covered)
 
 
 def check_parsing():
