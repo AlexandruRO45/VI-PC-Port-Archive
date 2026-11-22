@@ -864,10 +864,75 @@ aggregate counts, sizes and schema/category names belong in git, issues or pull 
 synthetic data; CI never reads a game folder. This is the same rule as `AGENTS.md` and `CONTRIBUTING.md`, and
 it applies to this note as well.
 
+## Streaming reader (ASSET-139)
+
+`tools/gamedata_reader.py` provides a standard-library event reader for one XML document, supplied as an
+iterable of byte chunks. It dispatches each element's start, text and end events by **document root and that
+element's own `type` attribute**. It does not infer RTTI classes, convert strings to numbers, resolve references,
+or load includes. Unknown schemas can be handled by a fallback without dropping their fields.
+
+For example, with synthetic schema names (import from the `tools` directory):
+
+```python
+from gamedata_reader import file_chunks, read_xml
+
+def config_event(event):
+    # Consume the event into temporary application state.
+    pass
+
+def numeric_event(event):
+    # Validate and interpret this synthetic type in the consumer.
+    pass
+
+with open(local_xml_path, "rb") as stream:
+    summary = read_xml(file_chunks(stream), {
+        ("ExampleConfig", None): config_event,
+        ("ExampleConfig", "ExampleNumber"): numeric_event,
+    }, default=config_event)
+# Only commit temporary application state after read_xml returns successfully.
+```
+
+An exact `(root, type)` handler wins over `(root, None)`, then the optional default. Missing and explicitly
+empty `type` values are distinct; types are not inherited by children. Unhandled events are still parsed and
+counted. Namespaced tags and attributes use `{uri}local` notation, while only the unqualified `type` attribute
+selects a handler. Attributes are read-only snapshots. Text events may split at arbitrary byte-chunk or parser
+boundaries; concatenate them in the consumer when needed. Text after a child's closing tag belongs to its parent.
+Comments and processing instructions are not configuration events.
+
+The reader retains open-element metadata, not a tree or a list of completed siblings. Its memory depends on
+nesting depth, open attributes, the current input chunk and Expat's current token; an unusually long token can
+still require substantial memory. The default depth limit is 256 and can be changed with `max_depth`. It refuses
+DTDs and never resolves external entities. Caller-owned input streams stay open. Malformed, truncated, empty or
+multiple-root input raises `XmlReadError`; diagnostics contain no input values. Consumer exceptions propagate.
+Events delivered before an error are **provisional**, so handlers must not publish partial configuration.
+
+The CLI reads ordinary local XML files in 64 KiB chunks and prints aggregate counts only (no roots, values or
+paths). It exits nonzero if any document is invalid or unreadable; element counts include successful documents only:
+
+```powershell
+python -I tools/gamedata_reader.py <local.xml> [<another.xml> ...]
+python -I tests/test_gamedata_reader.py
+```
+
+For a local archive/carve, use the existing `gamedata_index.ArchiveSource` or `DirectorySource` and `build_rows`
+to identify payloads. For each XML row, locate its `offset` in `source.rows` and pass the next `chunks` source
+rows as `(source.read(row) for row in group)` to `read_xml`. Close an `ArchiveSource` in `finally`. This streams
+the reader's input one inflated block at a time; **the existing grouping step itself is not a streaming parser**
+and can assemble a full document. It also retains the existing carver's recovery limitations. No encrypted table
+of contents is read or bypassed.
+
+Validation on the complete local Xbox Series 1.0.2.1 `common.rpf` XML carve (267 payloads), compared with
+`gamedata_xml.scan_xml` on each assembled payload: **259 accepted, 8 rejected, zero acceptance or metadata
+disagreements**. Accepted documents contain **428,611 elements**, **7,181 elements with `type`**, **111 distinct
+roots**, and maximum depth **17**. These successful-document counts do not replace the catalog's counts that
+also describe partially recoverable input. The synthetic tests cover dispatch precedence, mixed content,
+UTF-8/UTF-16 split into individual bytes, namespaces, malformed input, DTD refusal, incremental delivery,
+consumer exceptions, and bounded memory across 20,000 sibling elements. No GPU is involved.
+
 ## Next step
 
-The most useful next step is a **schema bridge**, not more carving: check whether the 118 XML root tags match
-RTTI class names in the executable, then build a streaming reader that dispatches on root and `type`. That
-turns the measured XML into the runtime's config layer without hand-writing 5,293 tags. The `MHIU`/`PAMH`
+The streaming dispatch layer above is available; the remaining **schema bridge** work is to check whether the
+118 XML root tags match RTTI class names in the executable and implement the corresponding consumers. Their
+field semantics and runtime integration remain unimplemented. The `MHIU`/`PAMH`
 heightmaps are decoded by `tools/gamedata_maps.py`; every MHIU header field is identified (0x28 is the
 default height), and the row-table layouts and the value-to-Z mapping are measured.
