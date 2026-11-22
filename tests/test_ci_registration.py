@@ -26,6 +26,7 @@ Only the tracked test files and the workflow are read; no game files, no build t
 """
 import ast
 import fnmatch
+import importlib.util
 import os
 import re
 import subprocess
@@ -347,6 +348,55 @@ class RepositoryRegistrationTest(unittest.TestCase):
                                             require_test_case=True))
             self.assertFalse(has_main_guard(read(tmp, "tests/test_inequality_guard.py")))
             self.assertEqual(selected["tests/test_nested_dir/test_nested.cjs"], None)
+
+
+def load_stdlib_runner(root):
+    spec = importlib.util.spec_from_file_location(
+        "run_stdlib_tests", os.path.join(root, "scripts", "run_stdlib_tests.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def check_job_text(workflow):
+    match = re.search(r"^  check:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", workflow, re.M | re.S)
+    if not match:
+        raise AssertionError("ci.yml no longer has a `check:` job; update tests/test_ci_registration.py")
+    return match.group(1)
+
+
+class StdlibRunnerRegistrationTest(unittest.TestCase):
+    """The check job's parallel runner stays aligned with translator-tests and avoids rpf9dump re-runs."""
+
+    def test_runner_defaults_and_discovery_match_ci_rules(self):
+        rules = ci_rules(ROOT)
+        markers, pruned, loop_glob, _, _ = rules
+        runner = load_stdlib_runner(ROOT)
+        self.assertEqual(runner.DEFAULT_PYTEST_MARKERS, markers)
+        self.assertEqual(runner.DEFAULT_PRUNE_DIR, pruned)
+        self.assertEqual(runner.DEFAULT_GLOB, loop_glob)
+        tracked = set(tracked_under_tests(ROOT))
+        expected = [f for f in claimed_test_files(ROOT) if job_of(ROOT, f, rules) == "stdlib"]
+        discovered = [f for f in runner.discover_tests(ROOT, pytest_markers=markers) if f in tracked]
+        self.assertEqual(discovered, expected)
+
+    def test_check_job_builds_rpf9dump_before_parallel_stdlib_runner_without_duplicate_steps(self):
+        check = check_job_text(read(ROOT, WORKFLOW))
+        build_pos = check.find("- name: Build rpf9dump")
+        stdlib_pos = check.find("- name: Tests (standard library only, no game data)")
+        self.assertGreaterEqual(build_pos, 0, "check job must have a Build rpf9dump step")
+        self.assertGreaterEqual(stdlib_pos, 0, "check job must have the stdlib tests step")
+        self.assertLess(build_pos, stdlib_pos,
+                        "Build rpf9dump must precede the stdlib tests step so RPF9DUMP_DLL tests run once")
+
+        next_step = re.search(r"\n      - name:", check[stdlib_pos + 1:])
+        stdlib_block = check[stdlib_pos:stdlib_pos + 1 + next_step.start()] if next_step else check[stdlib_pos:]
+        self.assertIn("RPF9DUMP_DLL: tools/rpf9dump/bin/Release/net8.0/rpf9dump.dll", stdlib_block)
+        self.assertIn("python -I scripts/run_stdlib_tests.py", stdlib_block)
+
+        # Neither rpf9dump-only stdlib test should be invoked a second time in a separate CI step.
+        self.assertNotIn("tests/test_rpf9dump_exit_codes.py", check)
+        self.assertNotIn("tests/test_ttpf_export_resume.py", check)
 
 
 if __name__ == "__main__":

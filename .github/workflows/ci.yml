@@ -74,27 +74,16 @@ jobs:
         run: python -m compileall -q make_game.py tools tests
       - name: make_game.py help
         run: python -I make_game.py --help
-      - name: Tests (standard library only, no game data)
-        shell: bash
-        run: |
-          while IFS= read -r t; do
-            if grep -Eq "$PYTEST_FILE_MARKERS" "$t" || ! grep -q '__main__' "$t"; then
-              continue
-            fi
-            echo "== $t"
-            python -I "$t" || exit 1
-          done < <(find tests -path 'tests/semantic' -prune -o -type f -name 'test_*.py' -print | LC_ALL=C sort)  # pytest-based files run in the translator-tests job
       - name: Build rpf9dump
         run: dotnet build tools/rpf9dump/rpf9dump.csproj -c Release
-      - name: Test TTPF export retry
+      # Build rpf9dump first and pass RPF9DUMP_DLL here so rpf9dump-gated stdlib tests
+      # (test_rpf9dump_exit_codes.py, test_ttpf_export_resume.py) run once for real instead of
+      # skipping in the stdlib pass and rerunning in separate steps.
+      # pytest-based files run in the translator-tests job.
+      - name: Tests (standard library only, no game data)
         env:
           RPF9DUMP_DLL: tools/rpf9dump/bin/Release/net8.0/rpf9dump.dll
-        run: python -I tests/test_ttpf_export_resume.py
-      # The standard-library loop above runs this file before rpf9dump is built, where it skips for lack of the DLL.
-      - name: Test rpf9dump exit codes
-        env:
-          RPF9DUMP_DLL: tools/rpf9dump/bin/Release/net8.0/rpf9dump.dll
-        run: python -I tests/test_rpf9dump_exit_codes.py
+        run: python -I scripts/run_stdlib_tests.py
       - name: Build the calibrated BCPack reader and test the texture pipeline
         env:
           RPF9DUMP_DLL: tools/rpf9dump/bin/Release/net8.0/rpf9dump.dll
