@@ -14,7 +14,7 @@ import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from disasm_rdna2 import disasm_rdna2, decode_instruction, disassemble_binary
-from extract_shaders import extract_shaders, extract_native_rdna2_code
+from extract_shaders import extract_shaders, extract_native_rdna2_code, sanitize_filename
 from pixel_aot import native_program
 from scan_unsupported_shaders import (
     analyze_shader_instructions,
@@ -1186,6 +1186,33 @@ class TestRdna2Extractor(unittest.TestCase):
             self.assertEqual(len({p.casefold() for p in paths}), 4, f"Colliding output paths: {paths}")
             for entry, expected in zip(manifest["shaders"], codes):
                 self.assertEqual((out_path / entry["native_file"]).read_bytes(), expected)
+
+    def test_overlong_record_names_get_bounded_distinct_files(self):
+        """A record name near the one-byte length limit must not make the output name unwritable."""
+        codes = [bytes.fromhex("000080bf 000081bf"), bytes.fromhex("000382be 000081bf")]
+        names = [b"PS_" + b"a" * 250 + b"1", b"PS_" + b"a" * 250 + b"2"]
+        records = [envelope(code, name) for code, name in zip(codes, names)]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            archive = tmp_path / "long.rpf"
+            archive.write_bytes(b"RPF\0" + b"".join(records))
+
+            out_path, manifest_file = extract_shaders(archive, tmp_path / "extracted_long", target_stages={"pixel"})
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["total_extracted"], 2)
+            self.assertEqual([entry["name"] for entry in manifest["shaders"]],
+                             [name.decode("ascii") for name in names])
+            paths = [entry["native_file"] for entry in manifest["shaders"]]
+            self.assertEqual(len({p.casefold() for p in paths}), 2, f"Colliding output paths: {paths}")
+            for path in paths:
+                self.assertLessEqual(len(Path(path).name.encode("utf-8")), 160, path)
+            for path, expected in zip(paths, codes):
+                self.assertEqual((out_path / path).read_bytes(), expected)
+        # Truncation counts bytes and never splits a multi-byte character.
+        for name in ("é" * 200, "a€" * 100):
+            stem = sanitize_filename(name)
+            self.assertTrue(name.startswith(stem) and 0 < len(stem.encode("utf-8")) <= 128, stem)
 
     def test_empty_archive_produces_empty_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
