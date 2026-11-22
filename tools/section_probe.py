@@ -73,7 +73,7 @@ def inspect(path, first, last):
 
 def section_tag(value):
     if not re.fullmatch("[A-Z0-9_]{4}", value):
-        raise argparse.ArgumentTypeError(f"{value!r} is not a section tag: use four characters from A-Z, 0-9 and _")
+        raise argparse.ArgumentTypeError(f"{value!a} is not a section tag: use four characters from A-Z, 0-9 and _")
     return value
 
 
