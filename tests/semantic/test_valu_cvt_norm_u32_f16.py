@@ -543,5 +543,111 @@ class TestValuCvtNormU32F16AST(unittest.TestCase):
         self.assertEqual(ast.op_sel, (0, 1))
         self.assertTrue(ast.clamp)
 
+
+# ---------------------------------------------------------------------------
+# Deterministic scalar instruction interpreter for v_cvt_norm_u32_f16
+# ---------------------------------------------------------------------------
+
+class ScalarVALUInterpreter:
+    """Deterministic scalar instruction interpreter for RDNA2 VALU instructions."""
+
+    def __init__(self) -> None:
+        self.num_vgprs = 256
+        self.num_sgprs = 106
+        self.vgprs: list[int] = [0] * self.num_vgprs
+        self.sgprs: list[int] = [0] * self.num_sgprs
+
+    def get_vgpr_u32(self, idx: int) -> int:
+        return self.vgprs[idx & 0xFF] & MASK32
+
+    def set_vgpr_u32(self, idx: int, val: int) -> int:
+        self.vgprs[idx & 0xFF] = val & MASK32
+        return self.vgprs[idx & 0xFF]
+
+    def get_vgpr_half(self, idx: int, is_hi: bool) -> int:
+        dword = self.get_vgpr_u32(idx)
+        return (dword >> 16) & MASK16 if is_hi else dword & MASK16
+
+    def get_sgpr_u32(self, idx: int) -> int:
+        return self.sgprs[idx % self.num_sgprs] & MASK32
+
+    def set_sgpr_u32(self, idx: int, val: int) -> int:
+        self.sgprs[idx % self.num_sgprs] = val & MASK32
+        return self.sgprs[idx % self.num_sgprs]
+
+    def get_sgpr_half(self, idx: int, is_hi: bool) -> int:
+        dword = self.get_sgpr_u32(idx)
+        return (dword >> 16) & MASK16 if is_hi else dword & MASK16
+
+    def resolve_src0_half(self, src: Union[RegOperand, ImmediateOperand], src_hi: bool) -> int:
+        """Fetch and apply modifiers to source halfword operand."""
+        if isinstance(src, ImmediateOperand):
+            val = src.value & MASK16
+            abs_mod = src.abs_mod
+            neg_mod = src.neg_mod
+        elif isinstance(src, RegOperand):
+            abs_mod = src.abs_mod
+            neg_mod = src.neg_mod
+            if src.reg_type == RegType.VGPR:
+                val = self.get_vgpr_half(src.index, src_hi)
+            else:
+                val = self.get_sgpr_half(src.index, src_hi)
+        else:
+            raise TypeError(f"Unknown source operand type: {type(src)}")
+        return apply_f16_modifiers(val, abs_mod, neg_mod)
+
+    def execute(self, ast: InstructionAST) -> int:
+        ast.validate()
+        if ast.opcode == "v_cvt_norm_u32_f16":
+            src0_hi = bool(ast.op_sel[1]) or (isinstance(ast.src0, RegOperand) and ast.src0.is_hi)
+            src0_val = self.resolve_src0_half(ast.src0, src0_hi)
+            res = oracle_v_cvt_norm_u32_f16(src0_val)
+            return self.set_vgpr_u32(ast.dst.index, res)
+        raise NotImplementedError(f"Opcode '{ast.opcode}' not implemented in scalar interpreter")
+
+    def execute_asm(self, asm_line: str) -> int:
+        ast = parse_vop_cvt_norm_u32_f16(asm_line)
+        return self.execute(ast)
+
+
+class TestValuCvtNormU32F16ScalarInterpreter(unittest.TestCase):
+    """Test suite for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarVALUInterpreter()
+
+    def test_basic_scalar_execution(self) -> None:
+        self.interp.set_vgpr_u32(1, ONE_F16)
+        res = self.interp.execute_asm("v_cvt_norm_u32_f16 v0, v1")
+        self.assertEqual(res, 4294967295)
+        self.assertEqual(self.interp.get_vgpr_u32(0), 4294967295)
+
+    def test_scalar_negative_execution(self) -> None:
+        self.interp.set_vgpr_u32(1, NEG_ONE_F16)
+        res = self.interp.execute_asm("v_cvt_norm_u32_f16 v0, v1")
+        self.assertEqual(res, 0)
+        self.assertEqual(self.interp.get_vgpr_u32(0), 0)
+
+    def test_scalar_sgpr_source(self) -> None:
+        self.interp.set_sgpr_u32(5, HALF_F16)
+        res = self.interp.execute_asm("v_cvt_norm_u32_f16 v2, s5")
+        self.assertEqual(res, 2147483648)
+
+    def test_scalar_literal_source(self) -> None:
+        res = self.interp.execute_asm("v_cvt_norm_u32_f16 v3, 0.5")
+        self.assertEqual(res, 2147483648)
+
+    def test_scalar_op_sel_routing(self) -> None:
+        # v4 holds high half = 1.0 (0x3C00), low half = -1.0 (0xBC00)
+        self.interp.set_vgpr_u32(4, (ONE_F16 << 16) | NEG_ONE_F16)
+
+        # Read high half (1.0)
+        res_hi = self.interp.execute_asm("v_cvt_norm_u32_f16 v5, v4.h")
+        self.assertEqual(res_hi, 4294967295)
+
+        # Read low half (-1.0) -> clamps to 0
+        res_lo = self.interp.execute_asm("v_cvt_norm_u32_f16 v6, v4.l")
+        self.assertEqual(res_lo, 0)
+
 if __name__ == "__main__":
     unittest.main()
