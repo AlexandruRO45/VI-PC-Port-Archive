@@ -1718,6 +1718,22 @@ void test_touch(IGameInput* input) {
         r->Release();
     }
 
+    // NaN coordinates leave a contact where it was; a NaN pressure reads 0.
+    rt::gameinput::touch_contact(1, std::nanf(""), 0.9f, 0.5f, true);
+    rt::gameinput::touch_contact(2, 0.3f, 0.3f, std::nanf(""), true);
+    rt::gameinput::poll();
+    if (input->GetCurrentReading(GameInputKindTouch, tch, &r) == S_OK && r) {
+        GameInputTouchState pts[10]{};
+        r->GetTouchState(10, pts);
+        check(pts[0].touchId == 1 && approx(pts[0].positionX, 0.1f) && approx(pts[0].positionY, 0.1f),
+              "touch: a NaN coordinate leaves the contact unchanged");
+        check(pts[1].touchId == 2 && approx(pts[1].positionX, 0.3f) && pts[1].pressure == 0.0f,
+              "touch: a NaN pressure reads 0");
+        r->Release();
+    } else {
+        check(false, "touch: reading after NaN contacts");
+    }
+
     // Out of focus reports zero contacts; LEONIDA_TOUCH=always reads them without focus.
     g_focus = false;
     rt::gameinput::poll();

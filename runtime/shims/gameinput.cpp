@@ -2959,6 +2959,9 @@ void touch_contact(uint64_t id, float x, float y, float pressure, bool down) {
         if (it != g_touch_contacts.end()) g_touch_contacts.erase(it);
         return;
     }
+    // std::clamp passes NaN through; a contact with no usable position is dropped, an unknown pressure reads 0.
+    if (!std::isfinite(x) || !std::isfinite(y)) return;
+    if (!std::isfinite(pressure)) pressure = 0.0f;
     const float cx = std::clamp(x, 0.0f, 1.0f);
     const float cy = std::clamp(y, 0.0f, 1.0f);
     const float cp = std::clamp(pressure, 0.0f, 1.0f);

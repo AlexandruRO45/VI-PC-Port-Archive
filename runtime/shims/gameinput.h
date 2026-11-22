@@ -143,7 +143,8 @@ void set_hid_backend(const HidBackend* backend);
 
 // Reports or removes a touch contact on the Touch (Leonida) device (RT-167). Any window owner (a future presenter or
 // PresentX window's WndProc on WM_POINTER*) or test may call this from any thread; the next poll publishes a reading
-// when the active contacts changed. Coordinates and pressure are clamped to 0..1; `down == false` removes `id`.
+// when the active contacts changed. Coordinates and pressure are clamped to 0..1; `down == false` removes `id`. A
+// non-finite coordinate leaves the contact table unchanged; a non-finite pressure reads 0.
 void touch_contact(uint64_t id, float x, float y, float pressure, bool down);
 void clear_touch_contacts();
 
