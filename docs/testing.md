@@ -259,6 +259,16 @@ MoltenVK can't convert to Metal ("PerVertexKHR decoration is not supported in MS
 on or off; `build.py` (for `check.py`) translates with the flag only when that variable is `1`. `ms_f16_pack` also runs
 on a Mac with `LEONIDA_MESH_COMPUTE=1 LEONIDA_W64_EMULATE=1`.
 
+`ps_ij_computed` uses a pre-expanded triangle with three flat vertex values per computed attribute under either
+interpolation fallback. It also supplies the native weights as an ordinary interpolated varying, so the fixture
+can run without fragment barycentrics or geometry shaders. To exercise that path on any Vulkan GPU:
+
+```sh
+LEONIDA_F16_INTERP_FALLBACK=1 python3 -I scripts/run_gpu_tests.py --build runtime/build/linux --filter ps_ij_computed
+```
+
+The runner compares all 4,096 pixels, including a channel that keeps the native I and halves J before interpolating.
+
 ## GPUs without VK_KHR_maintenance8 (NVIDIA Pascal and older)
 
 `ps_texoff` and `ps_texoff_implicit` sample with a run-time texel offset, which needs `VK_KHR_maintenance8`;

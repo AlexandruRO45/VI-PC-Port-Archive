@@ -27,6 +27,7 @@ sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container, shader_source
 from check import Skip, clip_test, fmt_1010102_test, fmt_int_narrow_test, fmt_sint32_test, fmt_xy_xyz_test, tbuffer_store_test
 from compute_fixture import compute_header
+import computed_ij_fixture
 from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
 from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
                    TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, TEXTURE_CONSTANTS, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
@@ -719,6 +720,8 @@ def run_suite(a, work: str) -> int:
             cmd.append("--f16-interp-fallback")
         if TEXOFF_FALLBACK:   # image_sample*_o: offset folded into the coordinate, no VK_KHR_maintenance8
             cmd.append("--texel-offset-fallback")
+        if computed_ij_fixture.NAME + ".asm" in asm_files:
+            cmd.append("--computed-ij-flat-inputs")
         if MESH_COMPUTE:   # mesh shaders as compute writing to a buffer, drawn by tools/mesh_compute_vs.py
             cmd.append("--mesh-compute")
         if os.environ.get("LEONIDA_FMA") in ("glsl", "khr"):   # fused multiply-add: GLSL Fma or OpFmaKHR (docs/design.md)
@@ -752,6 +755,8 @@ def run_suite(a, work: str) -> int:
         with open(idx_path, encoding="utf-8") as source:
             index = json.load(source)
 
+    ij_vertex = computed_ij_fixture.build_vertex(spirv_dir, index.get(computed_ij_fixture.NAME, {}))
+
     ext = ".exe" if os.name == "nt" else ""
     vk_compute = os.path.join(a.build, "vk_compute_test" + ext)
     vk_store = os.path.join(a.build, "vk_store_test" + ext)
@@ -762,12 +767,6 @@ def run_suite(a, work: str) -> int:
     for fname in asm_files:
         name = os.path.splitext(fname)[0]
         spv = os.path.join(spirv_dir, f"{name}.spv")
-        if name == "ps_ij_computed" and (bary_fallback() or f16_interp_fallback()):
-            # Before the .spv check: without PerVertexKHR inputs the translator refuses a computed I/J pair, so there
-            # is no .spv (the f16 fallback is on by default where PerVertexKHR doesn't compile: MoltenVK).
-            results.append((name, None, "SKIP (computed I/J pairs need PerVertexKHR inputs: "
-                                        "no --bary-fallback / --f16-interp-fallback)"))
-            continue
         if not os.path.isfile(spv):
             results.append((name, False, "missing .spv (translation failed)"))
             continue
@@ -1108,7 +1107,9 @@ def run_suite(a, work: str) -> int:
                 vs = os.path.join(spirv_dir, PIXEL_VERTEX[name] + ".spv")
             env = dict(gfx_env or os.environ, **PIXEL_ENV[name]) if name in PIXEL_ENV else gfx_env
             bary_gs = os.path.join(spirv_dir, f"{name}.bary_gs.spv")
-            if bary_fallback() and os.path.isfile(bary_gs):   # --bary-fallback PS: barycentrics from this GS
+            if name == computed_ij_fixture.NAME and ij_vertex is not None:
+                vs = ij_vertex
+            elif bary_fallback() and os.path.isfile(bary_gs):   # --bary-fallback PS: barycentrics from this GS
                 env = dict(env or os.environ, VKH_GS=bary_gs, VKH_GS_HELPER="1")
             rc, msg = run_cmd([vk_harness, vs, spv, raw], env=env)
             if rc == 77:   # vk_harness: the device lacks a feature this shader needs (e.g. barycentrics)

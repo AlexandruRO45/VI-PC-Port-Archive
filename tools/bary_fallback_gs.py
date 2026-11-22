@@ -6,7 +6,8 @@ pair a pixel shader reads as an ordinary vec3 input, at the location its index.j
 "bary_fallback_input". This module writes the stage that fills it: a geometry shader that copies Position and the
 pixel shader's vec4 inputs from each vertex unchanged and adds (1,0,0), (0,1,0), (0,0,1) at the triangle's three
 vertices. Default (perspective) interpolation of those gives the perspective-correct barycentrics, the value
-BaryCoordKHR has, so the pixel shader's .y/.z are AMD's i/j.
+BaryCoordKHR has, so the pixel shader's .y/.z are AMD's i/j. When the index also lists
+"computed_ij_flat_inputs", the helper forwards all three raw values of each such input to every output vertex.
 
     python -I tools/bary_fallback_gs.py <spirv dir>      # <name>.bary_gs.spv per such PS in index.json
 
@@ -24,14 +25,22 @@ import sys
 SUFFIX = ".bary_gs"   # <ps name>.bary_gs.spvasm / .spv next to the pixel shader
 
 
-def gs_spvasm(locations, bary_location, clip_count: int = 0, cull_count: int = 0):
-    """SPIR-V assembly for a triangle pass-through GS: Position and the vec4 inputs at `locations`, copied per vertex,
-    plus the one-hot barycentric vec3 at `bary_location`."""
+def gs_spvasm(locations, bary_location, clip_count: int = 0, cull_count: int = 0, *, computed_ij=None):
+    """Triangle passthrough with optional one-hot barycentrics and raw per-vertex flat attributes."""
     locations = sorted(set(int(n) for n in locations))
-    if bary_location in locations:
-        raise ValueError(f"bary location {bary_location} collides with a pass-through location")
-    ins = [f"%in{n}" for n in locations]
+    computed_ij = {int(n): tuple(int(loc) for loc in ls) for n, ls in (computed_ij or {}).items()}
+    flat_outputs = [(attr, v, loc) for attr, ls in sorted(computed_ij.items()) for v, loc in enumerate(ls)]
+    flat_locations = {loc for _, _, loc in flat_outputs}
+    if (any(len(ls) != 3 for ls in computed_ij.values()) or len(flat_locations) != len(flat_outputs)
+            or flat_locations.intersection(locations)):
+        raise ValueError("computed I/J needs three distinct locations clear of pass-through outputs per attribute")
+    if bary_location in locations or bary_location in flat_locations:
+        raise ValueError(f"bary location {bary_location} collides with another output location")
+    sources = sorted(set(locations) | computed_ij.keys())
+    ins = [f"%in{n}" for n in sources]
     outs = [f"%out{n}" for n in locations]
+    flat = [f"%flat{loc}" for _, _, loc in flat_outputs]
+    bary = bary_location is not None
     if type(clip_count) is not int or not 0 <= clip_count <= 8:
         raise ValueError("clip distance count must be an integer from 0 to 8")
     if type(cull_count) is not int or not 0 <= cull_count <= 8:
@@ -42,7 +51,8 @@ def gs_spvasm(locations, bary_location, clip_count: int = 0, cull_count: int = 0
     kind = "cull" if cull_count else "clip"
     builtin = kind.title() + "Distance"
     distance_iface = [f"%in_{kind}", f"%out_{kind}"] if count else []
-    iface = " ".join(["%in_pos", "%out_pos", *ins, *outs, "%out_bary", *distance_iface])
+    iface = " ".join(["%in_pos", "%out_pos", *ins, *outs, *flat,
+                      *(["%out_bary"] if bary else []), *distance_iface])
     lines = [
         "OpCapability Geometry",
         *([f"OpCapability {builtin}"] if count else []),
@@ -56,9 +66,10 @@ def gs_spvasm(locations, bary_location, clip_count: int = 0, cull_count: int = 0
         "OpDecorate %out_pos BuiltIn Position",
         *([f"OpDecorate %in_{kind} BuiltIn {builtin}", f"OpDecorate %out_{kind} BuiltIn {builtin}"]
           if count else []),
-        *[f"OpDecorate %in{n} Location {n}" for n in locations],
+        *[f"OpDecorate %in{n} Location {n}" for n in sources],
         *[f"OpDecorate %out{n} Location {n}" for n in locations],
-        f"OpDecorate %out_bary Location {int(bary_location)}",
+        *[f"OpDecorate %flat{loc} Location {loc}" for _, _, loc in flat_outputs],
+        *([f"OpDecorate %out_bary Location {int(bary_location)}"] if bary else []),
         "%void = OpTypeVoid",
         "%fn = OpTypeFunction %void",
         "%uint = OpTypeInt 32 0",
@@ -87,22 +98,28 @@ def gs_spvasm(locations, bary_location, clip_count: int = 0, cull_count: int = 0
         "%in_pos = OpVariable %ptr_in_arr Input",
         "%out_pos = OpVariable %ptr_out_v4 Output",
         *[f"{v} = OpVariable %ptr_in_arr Input" for v in ins],
-        *[f"{v} = OpVariable %ptr_out_v4 Output" for v in outs],
-        "%out_bary = OpVariable %ptr_out_v3 Output",
+        *[f"{v} = OpVariable %ptr_out_v4 Output" for v in outs + flat],
+        *(["%out_bary = OpVariable %ptr_out_v3 Output"] if bary else []),
         *([f"%in_{kind} = OpVariable %ptr_in_triangle_{kind} Input", f"%out_{kind} = OpVariable %ptr_out_{kind} Output"]
           if count else []),
         "%main = OpFunction %void None %fn",
         "%entry = OpLabel",
     ]
+    for attr, v, loc in flat_outputs:
+        lines += [f"%flat_ptr{loc} = OpAccessChain %ptr_in_v4 %in{attr} %int_{v}",
+                  f"%flat_value{loc} = OpLoad %v4float %flat_ptr{loc}"]
     for v in range(3):
-        for src, dst in (("%in_pos", "%out_pos"), *zip(ins, outs)):
+        for src, dst in (("%in_pos", "%out_pos"), *((f"%in{n}", f"%out{n}") for n in locations)):
             p, x = f"%p{v}_{src[1:]}", f"%x{v}_{src[1:]}"
             lines += [f"{p} = OpAccessChain %ptr_in_v4 {src} %int_{v}", f"{x} = OpLoad %v4float {p}",
                       f"OpStore {dst} {x}"]
         if count:
             lines += [f"%{kind}_ptr{v} = OpAccessChain %ptr_in_{kind} %in_{kind} %int_{v}",
                       f"%distances{v} = OpLoad %{kind} %{kind}_ptr{v}", f"OpStore %out_{kind} %distances{v}"]
-        lines += [f"OpStore %out_bary %bary{v}", "OpEmitVertex"]
+        lines.extend(f"OpStore %flat{loc} %flat_value{loc}" for _, _, loc in flat_outputs)
+        if bary:
+            lines.append(f"OpStore %out_bary %bary{v}")
+        lines.append("OpEmitVertex")
     lines += ["OpEndPrimitive", "OpReturn", "OpFunctionEnd"]
     return "\n".join(lines) + "\n"
 
@@ -121,8 +138,12 @@ def write_for_index(spirv_dir, pair: tuple[str, str] | None = None):
         vertex, pixel = pair
         producer = index.get(vertex, {})
         consumer = index.get(pixel, {})
-        if producer.get("stage") != "vs" or consumer.get("stage") != "ps" or not consumer.get("bary_fallback_input"):
+        fallback = consumer.get("bary_fallback_input") or consumer.get("computed_ij_flat_inputs")
+        if producer.get("stage") != "vs" or consumer.get("stage") != "ps" or not fallback:
             raise ValueError("--pair requires a translated VS and a barycentric-fallback PS from the index")
+        flat_attrs = {int(n) for n in (consumer.get("computed_ij_flat_inputs") or {})}
+        if not flat_attrs.issubset(producer.get("outputs", [])):
+            raise ValueError("VS does not export all computed I/J attributes required by the PS")
         caps = set(producer.get("capabilities", []))
         unsupported = caps & {"ShaderLayer", "ShaderViewportIndex"}
         if unsupported:
@@ -143,11 +164,15 @@ def write_for_index(spirv_dir, pair: tuple[str, str] | None = None):
     written = []
     for name in names:
         meta = index[name]
-        fb = meta.get("bary_fallback_input") if isinstance(meta, dict) else None
-        if not fb:
+        if not isinstance(meta, dict):
             continue
+        bary = (meta.get("bary_fallback_input") or {}).get("location")
+        flat = meta.get("computed_ij_flat_inputs") or {}
+        if bary is None and not flat:
+            continue
+        locations = set(meta.get("inputs", [])) - {loc for ls in flat.values() for loc in ls}
         path = os.path.join(spirv_dir, name + SUFFIX + suffix + ".spvasm")
-        shader = gs_spvasm(meta.get("inputs", []), fb["location"], clip_count, cull_count)
+        shader = gs_spvasm(locations, bary, clip_count, cull_count, computed_ij=flat)
         with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write(shader)
         written.append(path)

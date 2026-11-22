@@ -19,13 +19,15 @@ written, or a pristine copy in the wrong role, is the #1224 guard's refusal (int
 emission); here: a computed pair whose p1 partial is rewritten or read between the ops (its hardware value P10*I is then
 observable), one whose ops are not in a single basic block (the captured I would not dominate the p2), a
 dangling op without its partner, and any computed pair under --bary-fallback, which has no PerVertexKHR
-inputs. A pristine pair (v0/v1 nothing writes) keeps the interpolated-input read: no PerVertexKHR.
+inputs. With a producer that supplies three flat inputs, SHADER-574 also runs computed pairs on the
+fallback paths. A pristine pair (v0/v1 nothing writes) keeps the interpolated-input read: no PerVertexKHR.
 
 Pipodi's straight-line scan over the corpus found the affected 213 PS (upper bound; issue #1218,
 comment 7076614458); the classification and counts are in docs/design.md's SHADER-177 row.
 """
 import struct
 import unittest
+from unittest.mock import patch
 
 import support
 import rdna2spirv
@@ -129,6 +131,65 @@ class ComputedIJ(unittest.TestCase):
         self.assertEqual(floats(w[:2]), (2 * I, 2 * J))
         self.assertNotIn("PerVertexKHR", spv)
         self.assertNotIn("%bary", spv)
+
+
+class ComputedIJFlatInputs(unittest.TestCase):
+    def translate_flat(self, asm, *, bary_fallback, f16_fallback):
+        with patch.multiple(rdna2spirv, BARY_FALLBACK=bary_fallback, F16_HALVES=f16_fallback,
+                            COMPUTED_IJ_FLAT_INPUTS=True):
+            spv = support.translate_lines("ps_ij_flat", asm)
+            meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv)
+        self.assertNotIn("PerVertexKHR", spv)
+        locations = meta["computed_ij_flat_inputs"]["0"]
+        self.assertEqual(len(set(locations)), 3)
+        for vertex, location in enumerate(locations):
+            self.assertIn(f"OpDecorate %in_ij0_{vertex} Flat", spv)
+            self.assertIn(f"OpDecorate %in_ij0_{vertex} Location {location}", spv)
+        if bary_fallback:
+            self.assertNotIn("BaryCoordKHR", spv)
+        if "bary_fallback_input" in meta:
+            self.assertNotIn(meta["bary_fallback_input"]["location"], locations)
+        return spv, locations
+
+    def test_computed_pair_with_pristine_and_provoking_vertex_reads(self):
+        asm = ["v_interp_p1_f32_e32 v2, v0, attr0.z", "v_interp_p2_f32_e32 v2, v1, attr0.z",
+               "v_interp_mov_f32_e32 v3, p0, attr0.z",
+               "v_interp_p1_f32_e32 v4, v0, attr1.x", "v_interp_p2_f32_e32 v4, v1, attr1.x",
+               "v_mov_b32_e32 v0, 0.25", "v_interp_p1_f32_e32 v5, v0, attr0.y",
+               "v_mul_f32_e32 v1, 0.5, v1", "v_interp_p2_f32_e32 v5, v1, attr0.y",
+               "exp mrt0 v2, v3, v4, v5 done vm", "s_endpgm"]
+        inputs = {f"%in_ij0_{vertex}": value for vertex, value in enumerate(UV)}
+        inputs.update({"%bary": BARY, "%in_attr1": (0.75, 0.0, 0.0, 0.0)})
+        for bary_fallback, f16_fallback in ((False, True), (True, False), (True, True)):
+            with self.subTest(bary_fallback=bary_fallback, f16_fallback=f16_fallback):
+                spv, locations = self.translate_flat(asm, bary_fallback=bary_fallback, f16_fallback=f16_fallback)
+                self.assertNotIn(1, locations)
+                words = support.mrt0_words(spv, inputs=inputs)
+                # Native weights blend 1/3/5 to 3.5, p0 reads 1, the smooth location reads 0.75,
+                # and the last coordinate uses J/2 to get 0.5.
+                self.assertEqual(floats(words), (3.5, 1.0, 0.75, 0.5))
+
+    def test_untouched_j_is_read_from_the_producer(self):
+        asm = ["v_mov_b32_e32 v0, 0.5",
+               "v_interp_p1_f32_e32 v2, v0, attr0.y", "v_interp_p2_f32_e32 v2, v1, attr0.y",
+               "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"]
+        inputs = {f"%in_ij0_{vertex}": value for vertex, value in enumerate(UV)}
+        inputs["%bary"] = BARY
+        spv, _ = self.translate_flat(asm, bary_fallback=False, f16_fallback=True)
+        self.assertEqual(floats(support.mrt0_words(spv, inputs=inputs)), (2 * J,) * 4)
+
+    def test_computed_pair_decodes_both_halves_of_each_flat_vertex(self):
+        asm = ["v_mov_b32_e32 v0, 0.5", "v_mov_b32_e32 v1, 0",
+               "v_interp_p1ll_f16 v2, v0, attr0.x", "v_interp_p2_f16 v2, v1, attr0.x, v2",
+               "v_interp_p1ll_f16 v3, v0, attr0.x high", "v_interp_p2_f16 v3, v1, attr0.x, v3 high",
+               "exp mrt0 v2, v3, v2, v3 done vm", "s_endpgm"]
+        pairs = ((0.5, -4.0), (1.5, 8.0), (2.5, 16.0))
+        inputs = {f"%in_ij0_{vertex}": (*struct.unpack("<f", struct.pack("<ee", *pair)), 0.0, 0.0, 0.0)
+                  for vertex, pair in enumerate(pairs)}
+        spv, _ = self.translate_flat(asm, bary_fallback=True, f16_fallback=True)
+        words = support.mrt0_words(spv, inputs=inputs)
+        # The midpoint of vertices 0 and 1 gives 1.0 in the low halves and 2.0 in the high halves.
+        self.assertEqual([word & 0xFFFF for word in words[:2]], [0x3C00, 0x4000])
 
 
 class ComputedIJRefusals(unittest.TestCase):

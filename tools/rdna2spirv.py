@@ -85,6 +85,8 @@ MESH_COMPUTE = False
 # can use there.
 F16_HALVES = False
 F16_HALF_TOP = 29
+# The last pre-raster stage must supply three flat vec4s per computed attribute.
+COMPUTED_IJ_FLAT_INPUTS = False
 
 
 def f16_half_location(n, half):
@@ -169,6 +171,8 @@ class Gen:
         self.param_max = -1         # VS/MS: the highest exp paramN (--f16-interp-fallback keeps halves above it)
         self.f16_half_outs = {}     # VS/MS, --f16-interp-fallback: param n -> its two decoded-half output names
         self.ij_capture = {}        # computed-I/J pairs: pair key -> the I float id the p1 loaded (SHADER-177)
+        self.ij_flat_inputs = {}    # attr -> locations for the three raw vertex values
+        self.ij_uses_bary = False   # a pristine pair also reads one of those attributes
         self.uses_psb = False
         self.uses_active = False
         self.vm_latch = False      # PS: EXEC can change after a `vm` export, so that export's EXEC is kept
@@ -9153,7 +9157,11 @@ class Gen:
 
         --f16-interp-fallback: an f16 read (`half` 0/1) of an attribute in f16_halves is component `comp` of the smooth
         input at f16_half_location(n, half), which the producer fills with that half decoded to f32 (F16_HALVES).
-        Other reads of such an attribute take the raw word as on any location (smooth, or flat = provoking vertex)."""
+        Other reads of such an attribute take the raw word as on any location (smooth, or flat = provoking vertex).
+
+        --computed-ij-flat-inputs: the three vertex values arrive in ordinary flat inputs. Use the same
+        weighting and half decoding as PerVertexKHR, including for pristine pairs on a shared attribute."""
+        locations = self.ij_flat_inputs.get(n)
         if half is not None and n in self.f16_halves:
             loc = f16_half_location(n, half)
             if loc < 0:
@@ -9165,20 +9173,27 @@ class Gen:
             self.emit(f"{p} = OpAccessChain %_ptr_Input_float {name} {self.cu(comp)}")
             self.emit(f"{v} = OpLoad %float {p}")
             return v
-        name = f"%in_attr{n}"
-        self.inputs[name] = n
-        if not flat:
-            self.interpolated.add(name)
-        if n not in self.per_vertex:
-            p, v = self.tmp(), self.tmp()
-            self.emit(f"{p} = OpAccessChain %_ptr_Input_float {name} {self.cu(comp)}")
-            self.emit(f"{v} = OpLoad %float {p}")
-            return v
-        self.cu(3)      # the array length
+        if locations is None:
+            name = f"%in_attr{n}"
+            self.inputs[name] = n
+            if not flat:
+                self.interpolated.add(name)
+            if n not in self.per_vertex:
+                p, v = self.tmp(), self.tmp()
+                self.emit(f"{p} = OpAccessChain %_ptr_Input_float {name} {self.cu(comp)}")
+                self.emit(f"{v} = OpLoad %float {p}")
+                return v
+            self.cu(3)      # the array length
         pv = []
         for k in range(1 if flat else 3):
             p, v = self.tmp(), self.tmp()
-            self.emit(f"{p} = OpAccessChain %_ptr_Input_float {name} {self.cu(k)} {self.cu(comp)}")
+            if locations is not None:
+                name = f"%in_ij{n}_{k}"
+                self.inputs[name] = locations[k]
+                indices = self.cu(comp)
+            else:
+                indices = f"{self.cu(k)} {self.cu(comp)}"
+            self.emit(f"{p} = OpAccessChain %_ptr_Input_float {name} {indices}")
             self.emit(f"{v} = OpLoad %float {p}")
             if half is not None:
                 h2, w = self.tmp(), self.tmp()
@@ -9191,6 +9206,8 @@ class Gen:
         if ij is not None:
             i, j = ij
         else:
+            if locations is not None:
+                self.ij_uses_bary = True
             bc = self.tmp()
             self.emit(f"{bc} = OpLoad %v3float %bary")
             i, j = self.tmp(), self.tmp()
@@ -10100,7 +10117,8 @@ def assemble(gen):
         if gen.uses_viewport:
             iface += ["%out_viewport"]
     iface += [f"%vin{reg}" for reg, _ in gen.vertex_inputs] + ["%user_data"]
-    bary = any(str(c).startswith("bary") for c in gen.frag_inputs.values()) or bool(gen.per_vertex)
+    bary = (any(str(c).startswith("bary") for c in gen.frag_inputs.values())
+            or bool(gen.per_vertex) or gen.ij_uses_bary)
     # --bary-fallback: %bary is a plain input at the lowest location no attribute uses, so no capability or
     # extension. Lowest free, not one past the highest: a PS whose only input is attr30 would otherwise put it at 31,
     # past what drivers with 128 input components accept (#804 review).
@@ -10112,7 +10130,13 @@ def assemble(gen):
     reserved = {f16_half_location(n, h) for n in gen.f16_halves for h in (0, 1)}
     if any(not k.startswith("%in_f16h") and v in reserved for k, v in gen.inputs.items()):
         raise Unsupported("--f16-interp-fallback: a decoded-half location is also read as an attribute")
-    gen.bary_location = next(n for n in range(len(used) + 1) if n not in used) if bary and BARY_FALLBACK else None
+    if gen.ij_flat_inputs:
+        used |= reserved | {loc for locations in gen.ij_flat_inputs.values() for loc in locations}
+    gen.bary_location = None
+    if bary and (BARY_FALLBACK or gen.ij_flat_inputs):
+        gen.bary_location = next(n for n in range(len(used) + 1) if n not in used)
+        if gen.ij_flat_inputs and gen.bary_location > F16_HALF_TOP:
+            raise Unsupported("computed I/J: no location for fallback barycentrics")
     bary_builtin = bary and gen.bary_location is None
     if gen.frag_inputs or bary:
         iface += ["%frag_coord"] + (["%front_facing"] if "front" in gen.frag_inputs.values() else []) +             (["%bary"] if bary else [])
@@ -11138,12 +11162,12 @@ def interp_ij_analysis(insns, g):
     whose ops are not in one basic block (the captured I would not dominate the p2), whose shared
     partial register -- the f32 vdst, or the f16 p2's fourth operand naming the p1's vdst -- is written
     between the ops, or read between them by anything but a p2's partial operand, any computed site
-    under --bary-fallback or --f16-interp-fallback (neither has PerVertexKHR inputs), and a computed v_interp_*_f32 on a 16-bit-flagged
+    under a fallback without opted-in flat inputs, and a computed v_interp_*_f32 on a 16-bit-flagged
     interpolant (which half the 32-bit op reads is not established). Over the corpus all of these are
     empty: 213 PS hold computed pairs, every pair sits in one block, and no partial is touched
     between the ops.
 
-    Returns the set of attribute numbers the computed pairs need in g.per_vertex."""
+    Returns the set of attribute numbers the computed pairs need from all three vertices."""
     P1 = ("v_interp_p1_f32", "v_interp_p1ll_f16", "v_interp_p1lv_f16")
     P2_OF = {"v_interp_p1_f32": "v_interp_p2_f32",
              "v_interp_p1ll_f16": "v_interp_p2_f16", "v_interp_p1lv_f16": "v_interp_p2_f16"}
@@ -11309,12 +11333,18 @@ def interp_ij_analysis(insns, g):
         s["ins"]["ij"] = ("p1" if s["op"] in P1 else "p2", (p1["vdst"], p1["attr"], p1["chan"]),
                           p1["src"], p2["src"])
         attrs.add(s["attr"])
-    if attrs and BARY_FALLBACK:
-        raise Unsupported("computed I/J pair under --bary-fallback: no PerVertexKHR inputs")
-    if attrs and F16_HALVES:
-        # --f16-interp-fallback reads decoded halves from the producer: no per-vertex inputs either
-        raise Unsupported("computed I/J pair under --f16-interp-fallback: no PerVertexKHR inputs")
     return attrs
+
+
+def computed_ij_inputs(g, insns, attrs):
+    """Allocate three flat locations per computed attribute below the fallback vertex output limit."""
+    g.f16_halves -= attrs
+    used = set(g.inputs.values()) | {arg["a"] for ins in insns for arg in ins["args"] if arg["k"] == "attr"}
+    used |= {f16_half_location(n, half) for n in g.f16_halves for half in (0, 1)}
+    free = [loc for loc in range(F16_HALF_TOP + 1) if loc not in used]
+    if len(free) < 3 * len(attrs):
+        raise Unsupported("computed I/J: not enough flat input locations")
+    return {attr: free[3 * i:3 * i + 3] for i, attr in enumerate(sorted(attrs))}
 
 
 def reg_reads_writes(insns):
@@ -11839,9 +11869,21 @@ def translate(path):
     insns = fold_far_branches(insns)
     if stage == "ps":
         g.v_interp_copy = interp_copy_sources(insns)   # before v_interp runs: I/J guards (SHADER-177)
-        # SHADER-177: annotate v_interp sites whose I/J operand is a computed pair, and let those
-        # attributes be read per-vertex (attribute() weights them with the operand values).
-        g.per_vertex |= interp_ij_analysis(insns, g)
+        # SHADER-177: mark sites whose weights are computed. Their attributes need all three vertex values.
+        computed_ij = interp_ij_analysis(insns, g)
+        if computed_ij and (BARY_FALLBACK or F16_HALVES):
+            if not COMPUTED_IJ_FLAT_INPUTS:
+                mode = "--bary-fallback" if BARY_FALLBACK else "--f16-interp-fallback"
+                raise Unsupported(f"computed I/J pair under {mode}: no PerVertexKHR inputs")
+            g.ij_flat_inputs = computed_ij_inputs(g, insns, computed_ij)
+            # A computed pair can still consume an untouched entry weight, including on a branch that bypasses
+            # its write. The earlier scan of system inputs excludes the interpolation operands themselves.
+            weights = {reg for ins in insns if "ij" in ins for reg in ins["ij"][2:]}
+            for reg, name in ((0, "bary_i"), (1, "bary_j")):
+                if reg in weights:
+                    g.frag_inputs.setdefault(reg, name)
+        else:
+            g.per_vertex |= computed_ij
     branchy = any(base_op(i["op"]) in BRANCHES for i in insns)
     if any(base_op(i["op"]) in BRANCHES and not i.get("enc") for i in insns):
         # A branch target is relative to the next PC, which needs the branch's `; encoding:` bytes (missing in a
@@ -12430,6 +12472,8 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         # --bary-fallback: the raw barycentrics are a perspective-interpolated vec3 at this location; the stage
         # before the PS must write (1,0,0), (0,1,0), (0,0,1) at the triangle's vertices (see BARY_FALLBACK).
         m["bary_fallback_input"] = {"location": g.bary_location}
+    if g.ij_flat_inputs:
+        m["computed_ij_flat_inputs"] = {str(n): locations for n, locations in g.ij_flat_inputs.items()}
     if F16_HALVES and g.stage in ("vs", "ms", "ps"):
         # --f16-interp-fallback: PS = the attributes whose f16 reads take decoded halves, VS/MS = the params that
         # export them; each as {n: [low-half location, high-half location]}. A pipeline links when every PS entry
@@ -12668,6 +12712,9 @@ def main():
                     help="16-bit interpolation without PerVertexKHR inputs, for devices that can't compile them "
                          "(MoltenVK): VS and mesh params also export their f16 halves decoded to f32, which the PS "
                          "reads as ordinary interpolated inputs (metadata: f16_halves)")
+    ap.add_argument("--computed-ij-flat-inputs", action="store_true",
+                    help="under --bary-fallback or --f16-interp-fallback, read computed I/J attributes from "
+                         "three flat vertex values supplied by the preceding stage (metadata: computed_ij_flat_inputs)")
     ap.add_argument("--max-shared-memory", type=int, default=MAX_SHARED_BYTES, metavar="BYTES",
                     help="cap on a compute shader's workgroup memory, its LDS plus what --wave64-emulate adds "
                          "(default %(default)s, the 64 KiB hard cap): over it the LDS array shrinks to the program's "
@@ -12678,8 +12725,9 @@ def main():
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES
     FMA_KHR = a.fma == "khr"
     STRUCTURED = not a.dispatch_loop
-    global FLOAT_CONTROLS
+    global FLOAT_CONTROLS, COMPUTED_IJ_FLAT_INPUTS
     FLOAT_CONTROLS = not a.no_float_controls
+    COMPUTED_IJ_FLAT_INPUTS = a.computed_ij_flat_inputs
     WAVE64_EMULATE = a.wave64_emulate
     WAVE64_GRAPHICS = a.wave64_graphics
     BARY_FALLBACK = a.bary_fallback

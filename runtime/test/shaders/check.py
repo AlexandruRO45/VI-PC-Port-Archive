@@ -29,6 +29,9 @@ import tempfile
 from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)  # also run with python -I
+import computed_ij_fixture  # noqa: E402
+
 EXE = ".exe" if os.name == "nt" else ""
 UNSUPPORTED = 77                                       # a test tool exits with this when the device lacks a feature
 
@@ -259,8 +262,7 @@ W64_EMULATED = os.environ.get("LEONIDA_W64_EMULATE") == "1"
 # LEONIDA_BARY_FALLBACK=1 (set for build.py too): a pixel shader that reads raw barycentrics was translated with
 # --bary-fallback and is drawn through its pass-through geometry shader, <name>.bary_gs.spv.
 BARY_FALLBACK = os.environ.get("LEONIDA_BARY_FALLBACK") == "1"
-# LEONIDA_F16_INTERP_FALLBACK=1 (as build.py reads it): *_f16 interps were translated from decoded-half inputs, with no
-# PerVertexKHR inputs at all, so the translator refuses a computed I/J pair (ps_ij_computed) there.
+# LEONIDA_F16_INTERP_FALLBACK=1 (as build.py reads it): ordinary *_f16 interps use decoded-half inputs.
 F16_HALVES = os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1"
 W64X_DUMPS = [("cs_dpp_w64", [1, 0, 3, 2, 5, 4, 7, 6]),
               ("cs_w64x_readlane", [121, 121, 16, 97, 16, 100, 100, 121]),
@@ -785,13 +787,18 @@ def mesh_w64x_test(tools, spirv, name):
     return "" if not wrong else f"{wrong} of {len(px)} pixels differ (blue {px[0][2]:.3g} at pixel 0, want 0.5)"
 
 
-def subgroup_size(spirv, name):
-    """The wave size the translator recorded for a shader (index.json), or None."""
+def shader_index_entry(spirv, name):
+    """The translator's metadata for a shader or an empty entry."""
     try:
         with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
-            return json.load(f).get(name, {}).get("subgroup_size")
+            return json.load(f).get(name, {})
     except (OSError, ValueError):
-        return None
+        return {}
+
+
+def subgroup_size(spirv, name):
+    """The wave size the translator recorded for a shader (index.json), or None."""
+    return shader_index_entry(spirv, name).get("subgroup_size")
 
 
 def bindless_test(tools, spirv, pixel="ps_tex"):
@@ -935,12 +942,15 @@ def sampler_test(tools, spirv):
 def pixels(tools, spirv, name, fmt, vertex="vs_ids"):
     # Draw at the shader's own wave size, as run_gpu_tests.py does (#146): a wave32 pixel shader run as wave64
     # (RADV's default on RDNA1) reads lanes it was never written for.
-    sg = subgroup_size(spirv, name)
+    entry = shader_index_entry(spirv, name)
+    sg = entry.get("subgroup_size")
     env = dict(os.environ, VKH_SUBGROUP_SIZE=str(sg)) if sg else None
     if name in PIXEL_ENV:
         env = dict(env or os.environ, **PIXEL_ENV[name])
     gs = os.path.join(spirv, name + ".bary_gs.spv")
-    if BARY_FALLBACK and os.path.isfile(gs):
+    if name == computed_ij_fixture.NAME and entry.get("computed_ij_flat_inputs"):
+        vertex = computed_ij_fixture.VERTEX_NAME
+    elif BARY_FALLBACK and os.path.isfile(gs):
         env = dict(env or os.environ, VKH_GS=gs, VKH_GS_HELPER="1")
     with tempfile.TemporaryDirectory(prefix="leonida-pixels-") as tmp:
         raw = Path(tmp) / "pixels.raw"
@@ -1149,11 +1159,12 @@ def texture_mip_test(tools: str, spirv: str, test: str = TEXTURE_MIP_TEST) -> st
 def ij_computed_problem(px):
     """ps_ij_computed.asm: (snapped 0.5, zeroed pair 0.0, v/2 from (i, j/2), 0.5 control) per pixel; "" when right.
     Shared with scripts/run_gpu_tests.py."""
-    n = len(px)
-    if not n:
-        return "no pixels"
-    w = int(n ** 0.5)
+    w = 64
+    if len(px) != w * w:
+        return f"{len(px)} pixels, expected {w * w}"
     f32 = lambda b: struct.unpack("<f", struct.pack("<I", b))[0]      # noqa: E731
+    if any(not math.isfinite(f32(c)) for _, _, c, _ in px):
+        return "computed J produced a non-finite value"
     wrong = sum((a != 0x3F000000 or b != 0 or d != 0x3F000000) for a, b, _, d in px)
     err = max(abs(f32(c) - (i // w + 0.5) / (2 * w)) for i, (_, _, c, _) in enumerate(px))
     return "" if not wrong and err < 1e-6 else f"{wrong} pixels without the computed-pair words, v/2 off by {err:.3g}"
@@ -1231,9 +1242,6 @@ def mandelbrot_problem(px):
 
 def pixel_test(tools, spirv, name):
     path = os.path.join(spirv, name + ".spv")
-    if name == "ps_ij_computed" and (BARY_FALLBACK or F16_HALVES):
-        # Before the .spv check: without PerVertexKHR inputs the translator refuses a computed I/J pair (no .spv).
-        return Skip("SKIP (computed I/J pairs need PerVertexKHR inputs: no --bary-fallback / --f16-interp-fallback)")
     if not os.path.isfile(path):
         return f"missing {name}.spv"
     if name in ("ps_texoff", "ps_texoff_implicit"):

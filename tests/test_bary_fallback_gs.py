@@ -305,6 +305,23 @@ class TestWriteForIndex(unittest.TestCase):
                 ["index.json", "ps_a.bary_gs.spvasm", "ps_z.bary_gs.spvasm"],
             )
 
+    def test_computed_ij_helper_reads_each_source_vertex_and_exports_it_everywhere(self):
+        index = {
+            "vs": {"stage": "vs", "outputs": [0]},
+            "ps": {"stage": "ps", "inputs": [1, 2, 3], "computed_ij_flat_inputs": {"0": [1, 2, 3]}},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_index(tmp, index)
+            path, = bary_fallback_gs.write_for_index(tmp, pair=("vs", "ps"))
+            with open(path, encoding="utf-8") as shader:
+                code = shader.read()
+            self.assertIn("OpDecorate %in0 Location 0", code)
+            self.assertNotIn("%out_bary", code)
+            for vertex, location in enumerate((1, 2, 3)):
+                self.assertIn(f"OpDecorate %flat{location} Location {location}", code)
+                self.assertIn(f"%flat_ptr{location} = OpAccessChain %ptr_in_v4 %in0 %int_{vertex}", code)
+                self.assertEqual(code.count(f"OpStore %flat{location} %flat_value{location}"), 3)
+
     def test_index_without_bary_fallback_entries_returns_empty(self):
         index = {
             "vs_a": {"stage": "vs"},

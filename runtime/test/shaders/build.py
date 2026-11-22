@@ -20,8 +20,8 @@ With LEONIDA_FMA=khr (or glsl), the fused multiply-adds are translated with --fm
 VK_KHR_shader_fma; the test programs enable it when the device has it, else they exit 77) or --fma glsl.
 With LEONIDA_BARY_FALLBACK=1, pixel shaders that read raw barycentrics are translated with --bary-fallback, and
 each gets a pass-through geometry shader, <name>.bary_gs.spv, that check.py draws it with (tools/bary_fallback_gs.py).
-Under that or LEONIDA_F16_INTERP_FALLBACK=1, ps_ij_computed isn't built: its computed I/J pair needs PerVertexKHR
-inputs, and check.py reports it as SKIP.
+Under either fallback, ps_ij_computed is linked with a pre-expanded triangle that exports its three flat
+vertex values and barycentrics without requiring a geometry stage.
 """
 import json
 import os
@@ -40,10 +40,9 @@ import mc_command  # noqa: E402
 
 MC = mc_command.mc_command()
 RSRC2, GROUP = 0x8088, (64, 1, 1)
-# Not built under LEONIDA_BARY_FALLBACK=1 or LEONIDA_F16_INTERP_FALLBACK=1 (see main).
-NEEDS_PER_VERTEX_INPUTS = ("ps_ij_computed",)
 sys.path.insert(0, HERE)  # this script is also run with python -I
 from compute_fixture import compute_header  # noqa: E402
+import computed_ij_fixture  # noqa: E402
 
 
 def asm_mattr(path):
@@ -163,6 +162,8 @@ def translate_tests(work, names):
         cmd += ["--fma", os.environ["LEONIDA_FMA"]]
     if os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1":   # f16 interpolation without PerVertexKHR (MoltenVK)
         cmd.append("--f16-interp-fallback")
+    if computed_ij_fixture.NAME in names:
+        cmd.append("--computed-ij-flat-inputs")
     if os.environ.get("LEONIDA_TEXOFF_FALLBACK") == "1":   # texel offsets without VK_KHR_maintenance8
         cmd.append("--texel-offset-fallback")
     return subprocess.run(cmd).returncode
@@ -185,14 +186,6 @@ def main():
     if skipped:
         print("not built (need a DXBC container with signatures):", ", ".join(skipped))
     names = [n for n in names if n not in skipped]
-    # A computed I/J pair needs PerVertexKHR inputs, which both fallbacks take away: the translator refuses it there,
-    # and check.py and run_gpu_tests.py report it as SKIP. Leave it out instead of losing the whole batch.
-    if os.environ.get("LEONIDA_BARY_FALLBACK") == "1" or os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1":
-        per_vertex = [n for n in names if n in NEEDS_PER_VERTEX_INPUTS]
-        if per_vertex:
-            print("not built (computed I/J pairs need PerVertexKHR inputs, off under the fallback):",
-                  ", ".join(per_vertex))
-        names = [n for n in names if n not in per_vertex]
     if not names:
         return 0
     out.mkdir(parents=True, exist_ok=True)
@@ -226,6 +219,8 @@ def main():
         sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "tools"))
         import spirv_stubs
         spirv_stubs.generate_for_index(str(spirv), combined)
+        if computed_ij_fixture.NAME in validated:
+            computed_ij_fixture.build_vertex(spirv, validated[computed_ij_fixture.NAME])
         if os.environ.get("LEONIDA_BARY_FALLBACK") == "1":
             # The pass-through geometry shader each --bary-fallback PS is drawn with (<name>.bary_gs.spv).
             import bary_fallback_gs
