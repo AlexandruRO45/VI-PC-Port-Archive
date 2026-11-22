@@ -53,9 +53,19 @@ HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator
                             void** out, IUnknown* device = nullptr);
 HRESULT create_fence(leonida::VulkanContext& context, UINT64 initial_value, D3D12_FENCE_FLAGS flags, REFIID riid,
                      void** out, IUnknown* device = nullptr);
-HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride, REFIID riid, void** out,
+HRESULT create_command_signature(std::shared_ptr<const leonida::IndirectSignature> signature, REFIID riid, void** out,
                                  IUnknown* device = nullptr);
-bool command_signature_info(ID3D12CommandSignature* signature, leonida::IndirectKind& kind, UINT& byte_stride);
+// What a command list needs of a signature: kind and stride, and the full description (null for a signature of only
+// a draw or dispatch argument, which replays as a plain vkCmd*Indirect call).
+bool command_signature_info(ID3D12CommandSignature* signature, leonida::IndirectKind& kind, UINT& byte_stride,
+                            std::shared_ptr<const leonida::IndirectSignature>* full = nullptr);
+// CreateCommandSignature's checks and layout (D3D12_COMMAND_SIGNATURE_DESC against `root_signature`, which must come
+// from a Vulkan device): E_INVALIDARG for what D3D12 refuses (an action that is not last or that comes twice, a root
+// argument without a root signature or one the root signature does not have, a stride below the arguments or not a
+// multiple of 4), E_NOTIMPL for the argument types the layer does not replay (mesh and ray dispatch, incrementing
+// constants).
+HRESULT build_indirect_signature(const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D12RootSignature* root_signature,
+                                 std::shared_ptr<const leonida::IndirectSignature>& out);
 
 // ID3D12Device1::SetEventOnMultipleFenceCompletion on fences from create_fence: sets `event` once every fence
 // (D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL) or any fence (_ANY) has reached its value; a null event blocks until then.

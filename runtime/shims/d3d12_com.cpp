@@ -98,15 +98,16 @@ public:
     // {9a4e1c2b-55d8-4f7a-b012-3c8e7a1f6d90}
     static constexpr GUID kTag{0x9a4e1c2b, 0x55d8, 0x4f7a, {0xb0, 0x12, 0x3c, 0x8e, 0x7a, 0x1f, 0x6d, 0x90}};
 
-    CommandSignature(leonida::IndirectKind kind, UINT byte_stride) : kind_(kind), stride_(byte_stride) {}
+    explicit CommandSignature(std::shared_ptr<const leonida::IndirectSignature> signature)
+        : signature_(std::move(signature)) {}
 
-    leonida::IndirectKind kind() const { return kind_; }
-    UINT stride() const { return stride_; }
+    leonida::IndirectKind kind() const { return signature_->kind; }
+    UINT stride() const { return signature_->stride; }
+    const std::shared_ptr<const leonida::IndirectSignature>& signature() const { return signature_; }
     static CommandSignature* from(IUnknown* object) { return Child::from<CommandSignature>(object); }
 
 private:
-    leonida::IndirectKind kind_;
-    UINT stride_;
+    std::shared_ptr<const leonida::IndirectSignature> signature_;
 };
 
 class CommandAllocator final
@@ -591,9 +592,14 @@ public:
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         leonida::IndirectKind kind = leonida::IndirectKind::draw;
         UINT stride = 0;
-        if (!command_signature_info(signature, kind, stride) || !argument_buffer)
-            return check(false);
+        std::shared_ptr<const leonida::IndirectSignature> full;
+        if (!command_signature_info(signature, kind, stride, &full) || !argument_buffer) return check(false);
         leonida::ExecuteIndirect cmd{};
+        cmd.signature = full;
+        // A dispatch takes the list's compute state, as Dispatch does.
+        if (kind == leonida::IndirectKind::dispatch && max_command_count && compute_pipeline_ && compute_.layout)
+            cmd.compute = std::make_shared<const leonida::Dispatch>(
+                leonida::Dispatch{compute_pipeline_, compute_.data, 0, 0, 0});
         // A draw takes the list's graphics state, as DrawInstanced does; with nothing to rasterize it is dropped. A
         // list with no pipeline, root signature or topology yet records the bare call (it closes, as on the PC
         // runtime; it is not a call replay can run).
@@ -1330,21 +1336,119 @@ bool queue_uses_calibrated_timestamps(ID3D12CommandQueue* queue) {
     return q && q->uses_calibrated_timestamps();
 }
 
-HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride, REFIID riid, void** out,
+HRESULT create_command_signature(std::shared_ptr<const leonida::IndirectSignature> signature, REFIID riid, void** out,
                                  IUnknown* device) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    auto* sig = new CommandSignature(kind, byte_stride);
+    if (!signature) return E_INVALIDARG;
+    auto* sig = new CommandSignature(std::move(signature));
     sig->attach_device(device);
     return hand_out(sig, riid, out);
 }
 
-bool command_signature_info(ID3D12CommandSignature* signature, leonida::IndirectKind& kind, UINT& byte_stride) {
+bool command_signature_info(ID3D12CommandSignature* signature, leonida::IndirectKind& kind, UINT& byte_stride,
+                            std::shared_ptr<const leonida::IndirectSignature>* full) {
     const CommandSignature* s = CommandSignature::from(signature);
     if (!s) return false;
     kind = s->kind();
     byte_stride = s->stride();
+    if (full) {
+        full->reset();
+        if (!s->signature()->simple()) *full = s->signature();
+    }
     return true;
+}
+
+HRESULT build_indirect_signature(const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D12RootSignature* root_signature,
+                                 std::shared_ptr<const leonida::IndirectSignature>& out) {
+    using leonida::IndirectArgumentType;
+    out.reset();
+    if (!desc || !desc->pArgumentDescs || desc->NumArgumentDescs == 0 || desc->ByteStride == 0) return E_INVALIDARG;
+    const RootArgumentLayout* layout = root_signature ? root_signature_layout(root_signature) : nullptr;
+    if (root_signature && !layout) return E_INVALIDARG;  // a root signature of another device
+    auto sig = std::make_shared<leonida::IndirectSignature>();
+    std::uint32_t offset = 0;
+    bool action = false, root_arguments = false;
+    for (UINT i = 0; i < desc->NumArgumentDescs; ++i) {
+        const D3D12_INDIRECT_ARGUMENT_DESC& arg = desc->pArgumentDescs[i];
+        if (action) return E_INVALIDARG;  // a draw or dispatch ends the record
+        leonida::IndirectArgument a;
+        a.offset = offset;
+        // The user-data dwords [first, first + count) of root parameter `index`, which must be of `type`.
+        const auto root_dwords = [&](UINT index, rt::rootsig::ParamType type, UINT dest, UINT count,
+                                     UINT limit) -> HRESULT {
+            root_arguments = true;
+            if (!layout || index >= layout->parameters.size() || layout->parameters[index].type != type)
+                return E_INVALIDARG;
+            const RootArgumentLayout::Parameter& p = layout->parameters[index];
+            if (!count || std::uint64_t(dest) + count > limit) return E_INVALIDARG;
+            a.user_dword = p.user_offset + dest;
+            a.dwords = count;
+            // Dwords past the 32 user registers are what the console spills to memory (not modelled).
+            return std::uint64_t(a.user_dword) + count > rt::rootsig::kMaxUserSgprs ? E_NOTIMPL : S_OK;
+        };
+        HRESULT hr = S_OK;
+        switch (arg.Type) {
+        case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW:
+            a.type = IndirectArgumentType::draw, a.size = sizeof(D3D12_DRAW_ARGUMENTS), action = true;
+            sig->kind = leonida::IndirectKind::draw;
+            break;
+        case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED:
+            a.type = IndirectArgumentType::draw_indexed, a.size = sizeof(D3D12_DRAW_INDEXED_ARGUMENTS), action = true;
+            sig->kind = leonida::IndirectKind::draw_indexed;
+            break;
+        case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH:
+            a.type = IndirectArgumentType::dispatch, a.size = sizeof(D3D12_DISPATCH_ARGUMENTS), action = true;
+            sig->kind = leonida::IndirectKind::dispatch;
+            break;
+        case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW:
+            if (arg.VertexBuffer.Slot >= D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) return E_INVALIDARG;
+            a.type = IndirectArgumentType::vertex_buffer, a.size = sizeof(D3D12_VERTEX_BUFFER_VIEW);
+            a.slot = arg.VertexBuffer.Slot;
+            break;
+        case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW:
+            a.type = IndirectArgumentType::index_buffer, a.size = sizeof(D3D12_INDEX_BUFFER_VIEW);
+            break;
+        case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT: {
+            const auto& c = arg.Constant;
+            const UINT limit = layout && c.RootParameterIndex < layout->parameters.size()
+                                   ? layout->parameters[c.RootParameterIndex].constant_count
+                                   : 0;
+            hr = root_dwords(c.RootParameterIndex, rt::rootsig::ParamType::Constants, c.DestOffsetIn32BitValues,
+                             c.Num32BitValuesToSet, limit);
+            a.type = IndirectArgumentType::constants;
+            a.size = 4 * c.Num32BitValuesToSet;
+            break;
+        }
+        case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW:
+        case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW:
+        case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW: {
+            const UINT index = arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW
+                                   ? arg.ConstantBufferView.RootParameterIndex
+                               : arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW
+                                   ? arg.ShaderResourceView.RootParameterIndex
+                                   : arg.UnorderedAccessView.RootParameterIndex;
+            hr = root_dwords(index, rt::rootsig::ParamType::Descriptor, 0, 2, 2);
+            a.type = IndirectArgumentType::root_view;
+            a.size = sizeof(D3D12_GPU_VIRTUAL_ADDRESS);
+            break;
+        }
+        default: return E_NOTIMPL;  // DISPATCH_MESH, DISPATCH_RAYS, INCREMENTING_CONSTANT
+        }
+        if (FAILED(hr)) return hr;
+        if (a.size > UINT32_MAX - offset) return E_INVALIDARG;
+        offset += a.size;
+        sig->arguments.push_back(a);
+    }
+    if (!action) return E_INVALIDARG;  // the last argument is a draw or a dispatch
+    // D3D12: the root signature is required exactly when an argument sets root arguments; the stride covers one
+    // record and is a multiple of 4.
+    if (root_arguments != (root_signature != nullptr)) return E_INVALIDARG;
+    if (desc->ByteStride < offset || desc->ByteStride % 4) return E_INVALIDARG;
+    sig->stride = desc->ByteStride;
+    sig->arguments_size = offset;
+    out = std::move(sig);
+    return S_OK;
 }
 
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue) {

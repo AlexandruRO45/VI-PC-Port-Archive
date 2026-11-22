@@ -3570,33 +3570,14 @@ public:
                                                         identity()));
     }
 
-    HRESULT STDMETHODCALLTYPE CreateCommandSignature(const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D12RootSignature*,
-                                                     REFIID riid, void** out) override {
+    HRESULT STDMETHODCALLTYPE CreateCommandSignature(const D3D12_COMMAND_SIGNATURE_DESC* desc,
+                                                     ID3D12RootSignature* root_signature, REFIID riid,
+                                                     void** out) override {
         if (!out) return E_POINTER;
         *out = nullptr;
-        if (!desc || desc->NumArgumentDescs == 0 || !desc->pArgumentDescs || desc->ByteStride == 0)
-            return E_INVALIDARG;
-        leonida::IndirectKind kind = leonida::IndirectKind::draw;
-        bool found = false;
-        for (UINT i = 0; i < desc->NumArgumentDescs; ++i) {
-            switch (desc->pArgumentDescs[i].Type) {
-            case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW:
-                kind = leonida::IndirectKind::draw;
-                found = true;
-                break;
-            case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED:
-                kind = leonida::IndirectKind::draw_indexed;
-                found = true;
-                break;
-            case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH:
-                kind = leonida::IndirectKind::dispatch;
-                found = true;
-                break;
-            default: break;
-            }
-        }
-        if (!found) return E_NOTIMPL;
-        return create_command_signature(kind, desc->ByteStride, riid, out, identity());
+        std::shared_ptr<const leonida::IndirectSignature> signature;
+        if (const HRESULT hr = build_indirect_signature(desc, root_signature, signature); FAILED(hr)) return hr;
+        return create_command_signature(std::move(signature), riid, out, identity());
     }
 
     void STDMETHODCALLTYPE GetRaytracingAccelerationStructurePrebuildInfo(
