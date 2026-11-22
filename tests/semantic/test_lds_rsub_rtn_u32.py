@@ -239,6 +239,54 @@ class Program:
 
 
 # ---------------------------------------------------------------------------
+# Condition Codes, Status Flags, and Carry/Borrow Isolation
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class LdsRsubConditionCodes:
+    """Architectural integer condition codes evaluating the atomic reverse subtraction result."""
+    zero: bool
+    negative: bool
+    positive: bool
+    borrow_wrapped: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class LdsRsubStatusFlags:
+    """LDS memory addressing and bank routing status flags."""
+    effective_address: int
+    dword_index: int
+    bank_index: int
+
+
+def compute_lds_rsub_condition_codes(vdata0: int, old_val: int, new_mem: int) -> LdsRsubConditionCodes:
+    """Computes arithmetic condition codes for the reverse subtraction (vdata0 - old_val)."""
+    v0 = vdata0 & MASK32
+    old = old_val & MASK32
+    res = new_mem & MASK32
+    signed_res = s32(res)
+    borrow = v0 < old
+    return LdsRsubConditionCodes(
+        zero=(res == 0),
+        negative=(signed_res < 0),
+        positive=(signed_res > 0),
+        borrow_wrapped=borrow,
+    )
+
+
+def compute_lds_rsub_status_flags(eff_addr: int, capacity_dwords: int = DEFAULT_LDS_NUM_DWORDS) -> LdsRsubStatusFlags:
+    """Computes LDS address and bank status flags."""
+    eff = eff_addr & MASK32
+    d_idx = calc_lds_dword_index(eff, capacity_dwords)
+    b_idx = calc_lds_bank(eff)
+    return LdsRsubStatusFlags(
+        effective_address=eff,
+        dword_index=d_idx,
+        bank_index=b_idx,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Deterministic Scalar Instruction Interpreter
 # ---------------------------------------------------------------------------
 
@@ -250,8 +298,8 @@ class ScalarLDSInterpreter:
         self.sgprs: list[int] = [0] * DEFAULT_NUM_SGPRS
         self.lds: LDSMemory = LDSMemory(lds_size_bytes)
         self.vcc: int = 0
-        self.last_condition_codes: Any | None = None
-        self.last_status_flags: Any | None = None
+        self.last_condition_codes: LdsRsubConditionCodes | None = None
+        self.last_status_flags: LdsRsubStatusFlags | None = None
         self.trace: list[str] = []
 
     def read_reg_u32(self, kind: RegKind, idx: int) -> int:
@@ -280,6 +328,12 @@ class ScalarLDSInterpreter:
         )
 
         self.write_reg_u32(RegKind.VGPR, inst.vdst.index, old_val)
+
+        eff_addr = calc_lds_effective_address(vaddr, inst.offset.offset16)
+        self.last_condition_codes = compute_lds_rsub_condition_codes(vdata0, old_val, new_mem)
+        self.last_status_flags = compute_lds_rsub_status_flags(eff_addr, self.lds.num_dwords)
+        # Note: LDS operations never modify scalar condition codes or VCC.
+
         self.trace.append(f"{inst.to_assembly()} => old={old_val:#010x}, new={new_mem:#010x}")
         return old_val, new_mem
 
@@ -564,6 +618,120 @@ class TestLdsRsubRtnRegisterAliasing(unittest.TestCase):
             self.assertEqual(results[lane], (expected_old, expected_new))
             self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), expected_old)
             self.assertEqual(simd.lds.read_dword(lane * 4), expected_new)
+
+
+class TestLdsRsubRtnConditionCodes(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow isolation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarLDSInterpreter(lds_size_bytes=4096)
+
+    def test_condition_codes_zero_pos_neg(self) -> None:
+        # Zero condition: vdata0 = 50, memory = 50 -> new_mem = 0
+        self.interp.lds.write_dword(0, 50)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 0)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 50)
+
+        inst = Instruction(
+            opcode=Opcode.DS_RSUB_RTN_U32,
+            vdst=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata0=Register(RegKind.VGPR, 2),
+        )
+        self.interp.step(inst)
+        cc = self.interp.last_condition_codes
+        self.assertIsNotNone(cc)
+        assert cc is not None
+        self.assertTrue(cc.zero)
+        self.assertFalse(cc.negative)
+        self.assertFalse(cc.positive)
+
+        # Positive condition: vdata0 = 100, memory = 40 -> new_mem = 60
+        self.interp.lds.write_dword(0, 40)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 100)
+        self.interp.step(inst)
+        cc_pos = self.interp.last_condition_codes
+        self.assertIsNotNone(cc_pos)
+        assert cc_pos is not None
+        self.assertFalse(cc_pos.zero)
+        self.assertFalse(cc_pos.negative)
+        self.assertTrue(cc_pos.positive)
+
+        # Negative condition: vdata0 = 40, memory = 100 -> new_mem = -60 (0xFFFFFFC4)
+        self.interp.lds.write_dword(0, 100)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 40)
+        self.interp.step(inst)
+        cc_neg = self.interp.last_condition_codes
+        self.assertIsNotNone(cc_neg)
+        assert cc_neg is not None
+        self.assertFalse(cc_neg.zero)
+        self.assertTrue(cc_neg.negative)
+        self.assertFalse(cc_neg.positive)
+
+    def test_borrow_wrapped_flag(self) -> None:
+        # Borrow condition: vdata0 < memory -> 40 < 100
+        self.interp.lds.write_dword(0, 100)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 0)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 40)
+
+        inst = Instruction(
+            opcode=Opcode.DS_RSUB_RTN_U32,
+            vdst=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata0=Register(RegKind.VGPR, 2),
+        )
+        self.interp.step(inst)
+        cc = self.interp.last_condition_codes
+        self.assertIsNotNone(cc)
+        assert cc is not None
+        self.assertTrue(cc.borrow_wrapped)
+
+        # No borrow condition: vdata0 >= memory -> 100 >= 40
+        self.interp.lds.write_dword(0, 40)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 100)
+        self.interp.step(inst)
+        cc_noborrow = self.interp.last_condition_codes
+        self.assertIsNotNone(cc_noborrow)
+        assert cc_noborrow is not None
+        self.assertFalse(cc_noborrow.borrow_wrapped)
+
+    def test_status_flags_address_and_bank(self) -> None:
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 0)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x80)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 10)
+
+        inst = Instruction(
+            opcode=Opcode.DS_RSUB_RTN_U32,
+            vdst=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata0=Register(RegKind.VGPR, 2),
+            offset=DSOffset(offset16=0x14),
+        )
+        self.interp.step(inst)
+        flags = self.interp.last_status_flags
+        self.assertIsNotNone(flags)
+        assert flags is not None
+        # eff_addr = 0x80 + 0x14 = 0x94 (148)
+        self.assertEqual(flags.effective_address, 0x94)
+        # dword_index = 0x94 >> 2 = 37
+        self.assertEqual(flags.dword_index, 37)
+        # bank_index = 37 % 32 = 5
+        self.assertEqual(flags.bank_index, 5)
+
+    def test_carry_borrow_vcc_isolation(self) -> None:
+        canary = 0xDEADBEEFCAFEBABE
+        self.interp.vcc = canary
+
+        inst = Instruction(
+            opcode=Opcode.DS_RSUB_RTN_U32,
+            vdst=Register(RegKind.VGPR, 0),
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata0=Register(RegKind.VGPR, 2),
+        )
+        self.interp.step(inst)
+        self.assertEqual(self.interp.vcc, canary)
 
 
 class TestLdsRsubRtnScalarInterpreter(unittest.TestCase):
