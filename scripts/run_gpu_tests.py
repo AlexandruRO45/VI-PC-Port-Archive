@@ -38,10 +38,21 @@ from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: tex
 from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
 from check import MESH_COMPUTE, mesh_env   # LEONIDA_MESH_COMPUTE=1: mesh shaders as compute + a generated VS
 from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip, narrow_subgroup_skip,
-                   vcmpx_forms_narrow_skip, wave32_lane_skip)   # as in check.py
+                   unpinned_subgroup_skip, vcmpx_forms_narrow_skip, wave32_lane_skip)   # as in check.py
 from check import PIXEL_VERTEX, interp_f16_high_problem, ij_computed_problem, mandelbrot_problem   # pixel producers and checks
 from check import GET_LOD_TESTS, STORE_WORDS, get_lod_test, store_words_problem   # TEST-184: image atomics and queries
 from check import wide_pixel_skip   # ps_w64x_readlane: judged only where the fragment stage was required 64-wide
+
+# cs_barrier_loop's words are four waves of 32 lanes, so on a device that cannot pin 32 (GCN3/GCN4 on RADV report
+# exactly 64..64) the dispatch still runs 64-wide and the dump says nothing about the shader. check.py skips every
+# dump whose subgroup size it pinned; the runner applies that only to these fixtures, because cs_store and the
+# cs_w32_* dumps are judged correctly at 64 lanes and skipping them would cost real coverage (#2407).
+WAVE32_PIN_DUMPS = ("cs_barrier_loop",)
+
+
+def subgroup_pin_skip(name, out, pinned):
+    """check.py's unpinned-subgroup skip for the wave-width fixtures, when a subgroup size was actually pinned."""
+    return unpinned_subgroup_skip(out) if pinned and name in WAVE32_PIN_DUMPS else None
 
 
 def make_dxbc(chunks: list[tuple[bytes, bytes]]) -> bytes:
@@ -1003,6 +1014,8 @@ def run_suite(a, work: str) -> int:
                 cs_env = dict(os.environ, **WAVE32_LANE_ENV)
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"] + (["--require-wave64"] if wave64 else []), env=cs_env)
             skip = wave32_lane_skip(msg) if name in WAVE32_LANE_DUMPS else None
+            if skip is None:   # #2407: a wave-width dump whose pinned size the device refused, as check.py skips it
+                skip = subgroup_pin_skip(name, msg, bool(cs_env and "VKC_SUBGROUP_SIZE" in cs_env))
             if skip:   # e.g. Mesa llvmpipe's 8-wide subgroups: these 32-lane masks can't come out right
                 ok, detail = None, str(skip)
             else:

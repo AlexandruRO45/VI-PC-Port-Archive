@@ -310,6 +310,38 @@ class Wave32LaneDumps(unittest.TestCase):
                 self.assertIsNone(rgt.narrow_subgroup_skip(out))
 
 
+class WaveWidthPinnedDumps(unittest.TestCase):
+    """#2407: cs_barrier_loop's words are four waves of 32 lanes, so a device that cannot pin the 32 lanes the
+    translator asked for reports a failure where check.py skips the same dump. The runner reuses check.py's skip,
+    but only when a size was actually pinned and only for this fixture: cs_store and the cs_w32_* dumps are still
+    judged correctly at 64 lanes."""
+    UNPINNED = "device: AMD Radeon RX 570 Series (subgroup 64..64)\ncompute subgroup size: 32 not available\n"
+    HONOURED = "device: X (subgroup 32..32)\ncompute subgroup size: 32\n"
+
+    def test_only_the_wave_width_fixture_carries_the_rule(self):
+        self.assertEqual(rgt.WAVE32_PIN_DUMPS, ("cs_barrier_loop",))
+        self.assertFalse(set(rgt.WAVE32_PIN_DUMPS) & set(rgt.WAVE32_LANE_DUMPS))
+
+    def test_uses_check_py_rule(self):
+        import check
+        self.assertIs(rgt.unpinned_subgroup_skip, check.unpinned_subgroup_skip)
+
+    def test_unpinned_size_skips(self):
+        self.assertEqual(rgt.subgroup_pin_skip("cs_barrier_loop", self.UNPINNED, True),
+                         "SKIP (the device can't run this shader at 32 lanes on request)")
+
+    def test_no_size_pinned_judges_as_before(self):
+        self.assertIsNone(rgt.subgroup_pin_skip("cs_barrier_loop", self.UNPINNED, False))
+
+    def test_honoured_pin_judges_as_before(self):
+        self.assertIsNone(rgt.subgroup_pin_skip("cs_barrier_loop", self.HONOURED, True))
+
+    def test_other_fixtures_keep_their_rule(self):
+        for name in ("cs_store", "cs_w32_lane_wrap", "cs_w64x_readlane"):
+            with self.subTest(name=name):
+                self.assertIsNone(rgt.subgroup_pin_skip(name, self.UNPINNED, True))
+
+
 class ComputedIJWithoutPerVertexInputs(unittest.TestCase):
     """ps_ij_computed (SHADER-177): without PerVertexKHR inputs (--bary-fallback, --f16-interp-fallback, the latter on
     by default on MoltenVK) the translator refuses the computed I/J pair, so there is no .spv. Both runners SKIP it
