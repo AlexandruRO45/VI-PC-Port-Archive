@@ -44,9 +44,9 @@ Mathematical Properties and Bounds:
   - The 8th byte of src0 (bits 63:56) is unused by the 4 windows (window 3 uses bytes 3..6).
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import List, Sequence, Tuple, Union
+from typing import List, Optional, Sequence, Tuple, Union
 import unittest
 
 # Architectural bitmasks
@@ -294,6 +294,99 @@ class ScalarVALUInterpreter:
         # Write-back phase
         self.regs.write_operand(instr.dst, result)
         return result
+
+
+# ==============================================================================
+# SIMD Multi-Lane Execution Engine and EXEC Masking
+# ==============================================================================
+
+@dataclass
+class SIMDState:
+    """Multi-lane SIMD register state representing Wave32 or Wave64."""
+    num_lanes: int
+    exec_mask: Optional[int] = None
+    vgprs: List[List[int]] = field(default_factory=list)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+
+    def __post_init__(self) -> None:
+        if self.num_lanes not in (32, 64):
+            raise ValueError(f"num_lanes must be 32 or 64, got {self.num_lanes}")
+        if not self.vgprs:
+            self.vgprs = [[0] * 256 for _ in range(self.num_lanes)]
+        if self.exec_mask is None:
+            self.exec_mask = (1 << self.num_lanes) - 1
+
+    def read_lane(self, op: Operand, lane: int) -> Union[int, List[int]]:
+        """Read operand for a specific SIMD lane."""
+        if op.reg_type == RegType.LITERAL:
+            assert op.literal_value is not None
+            return op.literal_value
+
+        if op.count == 1:
+            if op.reg_type == RegType.VGPR:
+                return self.vgprs[lane][op.index] & MASK32
+            if op.reg_type == RegType.SGPR:
+                return self.sgprs[op.index] & MASK32
+        elif op.count == 2:
+            if op.reg_type == RegType.VGPR:
+                lo = self.vgprs[lane][op.index] & MASK32
+                hi = self.vgprs[lane][op.index + 1] & MASK32
+                return (hi << 32) | lo
+            if op.reg_type == RegType.SGPR:
+                lo = self.sgprs[op.index] & MASK32
+                hi = self.sgprs[op.index + 1] & MASK32
+                return (hi << 32) | lo
+        elif op.count == 4:
+            if op.reg_type == RegType.VGPR:
+                return [self.vgprs[lane][op.index + k] & MASK32 for k in range(4)]
+            if op.reg_type == RegType.SGPR:
+                return [self.sgprs[op.index + k] & MASK32 for k in range(4)]
+
+        raise ValueError(f"Unsupported operand: {op}")
+
+    def write_lane(self, op: Operand, lane: int, values: Union[int, Sequence[int]]) -> None:
+        """Write value(s) to a register operand for a specific SIMD lane."""
+        if op.reg_type == RegType.LITERAL:
+            raise TypeError("Cannot write to literal operand")
+
+        val_list: Sequence[int] = [values] if isinstance(values, int) else values
+        if len(val_list) != op.count:
+            raise ValueError(f"Value count {len(val_list)} does not match operand count {op.count}")
+
+        if op.reg_type == RegType.VGPR:
+            for k in range(op.count):
+                self.vgprs[lane][op.index + k] = u32(val_list[k])
+        elif op.reg_type == RegType.SGPR:
+            for k in range(op.count):
+                self.sgprs[op.index + k] = u32(val_list[k])
+
+
+class SIMDInterpreter:
+    """SIMD instruction interpreter handling multi-lane divergence and EXEC masking."""
+
+    def step(self, instr: VMqsadU32U8Instruction, state: SIMDState) -> List[Optional[List[int]]]:
+        results: List[Optional[List[int]]] = [None] * state.num_lanes
+
+        # Atomic read phase across all lanes
+        s0_vals = [state.read_lane(instr.src0, lane) for lane in range(state.num_lanes)]
+        s1_vals = [state.read_lane(instr.src1, lane) for lane in range(state.num_lanes)]
+        s2_vals = [state.read_lane(instr.src2, lane) for lane in range(state.num_lanes)]
+
+        # Execution and selective write-back phase
+        for lane in range(state.num_lanes):
+            if (state.exec_mask & (1 << lane)) != 0:
+                s0 = s0_vals[lane]
+                s1 = s1_vals[lane]
+                s2 = s2_vals[lane]
+                assert isinstance(s0, int)
+                assert isinstance(s1, int)
+                assert isinstance(s2, list)
+
+                res = ref_mqsad_u32_u8(s0, s1, s2)
+                state.write_lane(instr.dst, lane, res)
+                results[lane] = res
+
+        return results
 
 
 # ==============================================================================
@@ -591,6 +684,136 @@ class TestValuMqsadU32U8ScalarInterpreter(unittest.TestCase):
         self.interp.step(instr2)
         # Should double the SADs: [0, 8, 16, 24]
         self.assertEqual(self.regs.read_operand(Operand.vgpr(12, count=4)), [0, 8, 16, 24])
+
+
+class TestValuMqsadU32U8SIMDMultiLane(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and EXEC masking."""
+
+    def test_wave32_all_lanes_active(self) -> None:
+        state = SIMDState(num_lanes=32)
+        interp = SIMDInterpreter()
+
+        # Each lane has distinct accumulator offset
+        for lane in range(32):
+            state.write_lane(Operand.vgpr(2, count=2), lane, [0x04030201, 0x08070605])
+            state.write_lane(Operand.vgpr(1), lane, 0x04030201)
+            state.write_lane(Operand.vgpr(4, count=4), lane, [lane, lane * 2, lane * 3, lane * 4])
+
+        instr = VMqsadU32U8Instruction(
+            dst=Operand.vgpr(8, count=4),
+            src0=Operand.vgpr(2, count=2),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(4, count=4),
+        )
+
+        results = interp.step(instr, state)
+        self.assertEqual(len(results), 32)
+        for lane in range(32):
+            expected = [lane + 0, lane * 2 + 4, lane * 3 + 8, lane * 4 + 12]
+            self.assertEqual(results[lane], expected)
+            self.assertEqual(state.read_lane(Operand.vgpr(8, count=4), lane), expected)
+
+    def test_wave64_all_lanes_active(self) -> None:
+        state = SIMDState(num_lanes=64)
+        interp = SIMDInterpreter()
+
+        for lane in range(64):
+            # Lower 32 lanes use one pattern, upper 32 lanes use another
+            src0_hi = 0x08070605 if lane < 32 else 0x18171615
+            state.write_lane(Operand.vgpr(2, count=2), lane, [0x04030201, src0_hi])
+            state.write_lane(Operand.vgpr(1), lane, 0x04030201)
+            state.write_lane(Operand.vgpr(4, count=4), lane, [0, 0, 0, 0])
+
+        instr = VMqsadU32U8Instruction(
+            dst=Operand.vgpr(8, count=4),
+            src0=Operand.vgpr(2, count=2),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(4, count=4),
+        )
+
+        results = interp.step(instr, state)
+        self.assertEqual(len(results), 64)
+        for lane in range(32):
+            self.assertEqual(results[lane], [0, 4, 8, 12])
+        for lane in range(32, 64):
+            self.assertIsNotNone(results[lane])
+            assert results[lane] is not None
+            self.assertEqual(results[lane][0], 0)
+
+    def test_partial_exec_mask_even_lanes(self) -> None:
+        sentinel = [0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF]
+        state = SIMDState(num_lanes=32, exec_mask=0x55555555)  # only even lanes active
+        interp = SIMDInterpreter()
+
+        for lane in range(32):
+            state.write_lane(Operand.vgpr(8, count=4), lane, sentinel)
+            state.write_lane(Operand.vgpr(2, count=2), lane, [0x04030201, 0x08070605])
+            state.write_lane(Operand.vgpr(1), lane, 0x04030201)
+            state.write_lane(Operand.vgpr(4, count=4), lane, [0, 0, 0, 0])
+
+        instr = VMqsadU32U8Instruction(
+            dst=Operand.vgpr(8, count=4),
+            src0=Operand.vgpr(2, count=2),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(4, count=4),
+        )
+
+        results = interp.step(instr, state)
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(results[lane], [0, 4, 8, 12])
+                self.assertEqual(state.read_lane(Operand.vgpr(8, count=4), lane), [0, 4, 8, 12])
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.read_lane(Operand.vgpr(8, count=4), lane), sentinel)
+
+    def test_exec_mask_zero_no_lanes_modified(self) -> None:
+        sentinel = [0xCAFEBABE, 0xCAFEBABE, 0xCAFEBABE, 0xCAFEBABE]
+        state = SIMDState(num_lanes=32, exec_mask=0)
+        interp = SIMDInterpreter()
+
+        for lane in range(32):
+            state.write_lane(Operand.vgpr(8, count=4), lane, sentinel)
+
+        instr = VMqsadU32U8Instruction(
+            dst=Operand.vgpr(8, count=4),
+            src0=Operand.vgpr(2, count=2),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(4, count=4),
+        )
+
+        results = interp.step(instr, state)
+        self.assertTrue(all(r is None for r in results))
+        for lane in range(32):
+            self.assertEqual(state.read_lane(Operand.vgpr(8, count=4), lane), sentinel)
+
+    def test_shared_sgpr_src0_across_divergent_vgpr_lanes(self) -> None:
+        state = SIMDState(num_lanes=32)
+        interp = SIMDInterpreter()
+
+        # Shared SGPR pair for src0: s[2:3] = 0x0807060504030201
+        state.write_lane(Operand.sgpr(2, count=2), 0, [0x04030201, 0x08070605])
+
+        for lane in range(32):
+            # Divergent src1 per lane: lane 0 has 0x04030201, lane 1 has 0 (all masked out)
+            src1_val = 0x04030201 if (lane % 2 == 0) else 0x00000000
+            state.write_lane(Operand.vgpr(1), lane, src1_val)
+            state.write_lane(Operand.vgpr(4, count=4), lane, [10, 20, 30, 40])
+
+        instr = VMqsadU32U8Instruction(
+            dst=Operand.vgpr(8, count=4),
+            src0=Operand.sgpr(2, count=2),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(4, count=4),
+        )
+
+        results = interp.step(instr, state)
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(results[lane], [10, 24, 38, 52])
+            else:
+                self.assertEqual(results[lane], [10, 20, 30, 40])
 
 
 if __name__ == "__main__":
