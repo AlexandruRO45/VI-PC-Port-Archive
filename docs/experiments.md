@@ -275,6 +275,53 @@ foreach ($adapter in 'hardware','warp') {
 }
 ```
 
+### First unresolved constant-buffer read
+
+At `26544c6` the first general profile stopped at an unresolved constant buffer for 2,927 PS records after all profiles had been tried. These records contained 1,925 distinct native streams. All first stops were 16-byte scalar descriptor loads. Tracking scalar moves and the zero high word back to entry gave 1,896 records using s8, 1,011 using s9 and 20 using s10.
+
+| First descriptor location (entry pointer + bytes) | Records |
+| --- | ---: |
+| s9 + 0 | 565 |
+| s8 + 0xa80 | 430 |
+| s8 + 0xac0 | 379 |
+| s8 + 0x6e0 | 268 |
+| s9 + 0x20 | 229 |
+| Other locations | 1,056 |
+
+Across the original cohort, the straight-line trace established a completed first consumer for 1,765 records. Immediate-offset reads comprised 508 one-word, 69 two-word, 604 four-word and four eight-word reads. Another 580 read one word with an SGPR offset. For 1,162 records the trace stopped before it could establish a completed first consumer.
+
+In the largest group, **529 of 565** records load the descriptor at byte zero of the table supplied by s9, wait for it, then read four DWORDs from that buffer at bytes 16, 20, 24 and 28. The Windows probe binds that slot to root CBV b0 and a distinct buffer to b1. These are explicit desktop bindings. The PSV0 declarations vary across the group. They do not establish one original HLSL register and space for the traced native slot.
+
+The diagnostic PS exposes the four traced words as repeating depth columns. Its diagnostic export makes each word observable independently of the remaining shader. All other words contain a sentinel. Changing b0 changes the expected picture, changing b1 alone preserves it, and swapping the GPU addresses produces 1,024 mismatches against the old picture and zero against the swapped reference. Both RTX 4060 Laptop (32.0.16.1656) and WARP (10.0.26100.9818) passed the 32×32 D32 readbacks on Windows 11 build 26200.9974 with the D3D12 debug layer enabled.
+
+The full-record scan at `c849f7a` used the original bindings. It had 2,928 records in the first-profile unresolved-CB group. Binding s9 and descriptor byte zero in the existing unsampled profile yields zero complete PS from the largest group. Its most frequent next stop is `v_cvt_u32_f32_e32`. The diagnostic is counted separately.
+
+| Stage | Records | DXIL | D3D12 pipelines | Matched output on both adapters | Delta from `26544c6` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| PS | 12,101 | 851 | 851 | 851 | +2 |
+| CS | 2,689 | 12 | 12 | 12 | 0 |
+| MS | 9,282 | 2 | 2 | 2 | 0 |
+| VS | 2,236 | 0 | 0 | 0 | 0 |
+| GS | 195 | 0 | 0 | 0 | 0 |
+| Total | 26,503 | 865 | 865 | 865 | +2 |
+
+Both additional PS already translated on the new base, using explicit level-zero texture sampling. Each passed the color ramp and rejected a red/blue exchange on each adapter. All previous accepted identities remained present. Across the previous 986 distinct profile/container source files (including selector variants), 616 generated sources were byte-identical and the remaining 370 produced byte-identical desktop DXIL with the same DXC flags. Their existing readbacks therefore cover the same executables.
+
+Run the fixed scan with LLVM 15, then pass the emitted diagnostic to the Windows readback runner. The CTest exercises the same access using a source-built fixture.
+
+```sh
+python3 -B tools/shader_profile_audit.py "$ARCHIVE" --llvm libLLVM-15.so.1 --cb-reads --source-dir out/cb-scan > out/cb-counts.json
+```
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^pixel_cb_read_' -V
+foreach ($adapter in 'hardware','warp') {
+    python -B tests/pixel_cb_read_check.py dxc out/build/dev/offscreen_check.exe $adapter out/cb-scan/s9-slot0-read-probe.hlsl
+    if ($LASTEXITCODE) { exit $LASTEXITCODE }
+}
+```
+
 ## Offline CPU leaf recompilation
 
 With the Python-enabled Windows dev preset configured, run:

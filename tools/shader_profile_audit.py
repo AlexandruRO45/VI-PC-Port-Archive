@@ -12,6 +12,7 @@ import compute_store_aot
 import depth_mask_aot
 import mesh_entry_aot
 import pixel_aot
+import pixel_cb_read
 from resource_inventory import scene_records
 import sampled_coverage_aot
 
@@ -33,6 +34,13 @@ def coverage_bindings(slot):
     ])
 
 
+def first_diagnostic(exc):
+    reason = str(exc)
+    if reason.startswith("Unsupported instruction "):
+        return "unsupported " + reason.partition(": ")[2].split()[0]
+    return reason
+
+
 def pixel_profiles(code, llvm, emit):
     decoded = pixel_aot.disassemble(code, llvm, offsets=True)
     lines = [line for _, line in decoded]
@@ -43,9 +51,7 @@ def pixel_profiles(code, llvm, emit):
             source = pixel_aot.lower(lines, table, interp, sampler, cb, second_texture_offset=second)
         except (KeyError, ValueError) as exc:
             if first_general is None:
-                first_general = str(exc)
-                if first_general.startswith("Unsupported instruction "):
-                    first_general = "unsupported " + first_general.partition(": ")[2].split()[0]
+                first_general = first_diagnostic(exc)
             continue
         emit("general", source)
         profiles.append("general")
@@ -127,12 +133,40 @@ def classify(blob, sections, stage, llvm, emit):
     return profiles, "outside 1200-byte indexed survey"
 
 
-def scan(archive, llvm, source_dir=None):
+def cb_diagnostic(program, llvm):
+    code = pixel_aot.container_code(program, stage=0, llvm=llvm)
+    lines = pixel_aot.disassemble(code, llvm)
+    desc = pixel_cb_read.first_descriptor(lines)
+    if desc is None:
+        return "untraced descriptor", None, None, None, None
+    group = f"entry s{desc.table} + {desc.offset:#x}"
+    read = pixel_cb_read.first_read(lines, desc)
+    if (desc.table, desc.offset) != (9, 0):
+        return group, read, None, None, None
+    method = "untraced consumer or completion"
+    if read is not None:
+        offset = read.offset if isinstance(read.offset, str) else hex(read.offset)
+        method = f"{read.width} DWORD(s) at {offset}"
+    probe = pixel_cb_read.depth_probe(desc, read) if read == pixel_cb_read.Read(4, 16) else None
+    try:
+        pixel_aot.lower(lines, 9, 24, None, 0)
+    except (KeyError, ValueError) as exc:
+        stop = first_diagnostic(exc)
+    else:
+        stop = "complete"
+    return group, read, method, stop, probe
+
+
+def scan(archive, llvm, source_dir=None, *, cb_reads=False):
     cache = {}
     records, accepted = Counter(), Counter()
     profiles, first_stops = defaultdict(Counter), defaultdict(Counter)
+    cb_cache = {}
+    groups, modes, consumers, after_binding = Counter(), Counter(), Counter(), Counter()
+    probe_source = None
 
     def observe(stage, blob, sections):
+        nonlocal probe_source
         name = STAGES.get(stage, str(stage))
         records[name] += 1
         digest = hashlib.sha256(blob).digest()
@@ -154,10 +188,29 @@ def scan(archive, llvm, source_dir=None):
             profiles[name].update(hits)
         else:
             first_stops[name][reason] += 1
+            if cb_reads and stage == 0 and reason == "pixel lowering / first general profile: Unresolved constant buffer binding":
+                if digest not in cb_cache:
+                    cb_cache[digest] = cb_diagnostic(sections[b"DXIL"], llvm)
+                group, read, method, stop, probe = cb_cache[digest]
+                groups[group] += 1
+                modes[read.mode() if read else "untraced consumer or completion"] += 1
+                if method is not None:
+                    consumers[method] += 1
+                    after_binding[stop] += 1
+                if probe is not None:
+                    probe_source = probe
 
     scene_records(archive, observe=observe)
-    return dict(records=records, hlsl_records=accepted, profiles=profiles,
-                first_stops={stage: counts.most_common() for stage, counts in first_stops.items()})
+    result = dict(records=records, hlsl_records=accepted, profiles=profiles,
+                  first_stops={stage: counts.most_common() for stage, counts in first_stops.items()})
+    if cb_reads:
+        result["cb_reads"] = dict(first_descriptor=groups.most_common(), read_modes=modes.most_common(),
+                                  s9_zero_reads=consumers.most_common(),
+                                  s9_zero_full_shader_stops=after_binding.most_common())
+        if probe_source is not None and source_dir is not None:
+            source_dir.mkdir(parents=True, exist_ok=True)
+            (source_dir / "s9-slot0-read-probe.hlsl").write_text(probe_source, encoding="ascii")
+    return result
 
 
 if __name__ == "__main__":
@@ -165,11 +218,12 @@ if __name__ == "__main__":
     parser.add_argument("archive", type=Path)
     parser.add_argument("--llvm", required=True, help="Path or loader name for the LLVM 15 library")
     parser.add_argument("--source-dir", type=Path, help="Optional local directory for accepted HLSL by profile and container hash")
+    parser.add_argument("--cb-reads", action="store_true", help="Trace first-profile unresolved constant buffer reads")
     args = parser.parse_args()
     with args.archive.open("rb") as f:
         if f.seek(0, 2):
             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
-                result = scan(data, args.llvm, args.source_dir)
+                result = scan(data, args.llvm, args.source_dir, cb_reads=args.cb_reads)
         else:
-            result = scan(b"", args.llvm)
+            result = scan(b"", args.llvm, args.source_dir, cb_reads=args.cb_reads)
     print(json.dumps(result, indent=2))
