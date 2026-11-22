@@ -166,6 +166,32 @@ def _disk_free_gb(path: str) -> float | None:
         return None
 
 
+def _external_python_312() -> tuple[str | None, str | None]:
+    """Find an external Python 3.12+ interpreter on PATH (needed when running from a frozen executable)."""
+    candidates = ["py", "python", "python3"] if os.name == "nt" else ["python3", "python"]
+    for name in candidates:
+        path = shutil.which(name)
+        if not path:
+            continue
+        cmd = [path, "-3.12"] if name == "py" else [path]
+        try:
+            r = subprocess.run(
+                [
+                    *cmd, "-c",
+                    "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}'); "
+                    "print(sys.executable); sys.exit(0 if sys.version_info >= (3, 12) else 1)",
+                ],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode == 0:
+                lines = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+                if len(lines) >= 2:
+                    return lines[0], lines[1]
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return None, None
+
+
 def check_environment(
     stages: list[str] | tuple[str, ...] = ALL_STAGES,
     work_dir: str | None = None,
@@ -175,13 +201,23 @@ def check_environment(
     """Inspect system prerequisites without starting a build."""
     checks: list[CheckItem] = []
 
-    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-    py_ok = sys.version_info >= (3, 12)
+    if getattr(sys, "frozen", False):
+        ext_ver, ext_path = _external_python_312()
+        py_ok = ext_ver is not None
+        py_detail = (
+            f"Python {ext_ver} ({ext_path})"
+            if py_ok
+            else "Not found on PATH (install Python 3.12+ and add to PATH)"
+        )
+    else:
+        py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+        py_ok = sys.version_info >= (3, 12)
+        py_detail = f"Python {py_ver} ({sys.executable})"
     checks.append(CheckItem(
         id="python",
         name="Python 3.12+",
         status="ok" if py_ok else "error",
-        detail=f"Python {py_ver} ({sys.executable})",
+        detail=py_detail,
         required=True,
     ))
 

@@ -70,7 +70,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --clean --onefile --windowed `
+          pyinstaller --noconfirm --clean --onefile --windowed --uac-admin `
             --name Leonida-windows-x64 `
             --add-data "assets/fonts;assets/fonts" `
             --add-data "assets/logo.png;assets" `
@@ -78,6 +78,7 @@ jobs:
             --add-data "make_game.py;." `
             --add-data "tools;tools" `
             --add-data "gui;gui" `
+            --add-data "scripts;scripts" `
             --add-data "viewer;viewer" `
             leonida_gui.py
           New-Item -ItemType Directory -Force -Path release-out | Out-Null

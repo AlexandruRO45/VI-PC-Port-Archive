@@ -1,4 +1,4 @@
-"""Leonida Desktop GUI (PySide6) with bundled Outfit typography and integrated validation."""
+"""Leonida Desktop GUI (PySide6) with Outfit typography, OS language detection, and startup setup check."""
 from __future__ import annotations
 
 import json
@@ -8,7 +8,7 @@ import sys
 import time
 import webbrowser
 
-from PySide6.QtCore import QThread, Qt, Signal
+from PySide6.QtCore import QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QFont, QFontDatabase, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -45,12 +45,13 @@ from gui.core import (
     save_config,
     tr,
 )
+from gui.setup_dialog import SetupDialog
 
 STYLESHEET = """
 * {
     font-family: "Outfit", "Segoe UI", sans-serif;
 }
-QMainWindow, QWidget#RootWindow {
+QMainWindow, QDialog, QWidget#RootWindow {
     background-color: #090b11;
     color: #eef1f8;
 }
@@ -297,7 +298,7 @@ class LeonidaWindow(QMainWindow):
         self.repo_root = repo_root
         self.font_family = font_family
         self.config = load_config()
-        self.lang = self.config.language
+        self.lang = self.config.resolved_language()
         self.build_worker: SubprocessWorker | None = None
         self.val_worker: ValidationWorker | None = None
         self.viewer_proc: subprocess.Popen | None = None
@@ -336,7 +337,7 @@ class LeonidaWindow(QMainWindow):
         brand_text.setSpacing(0)
         title_lbl = QLabel(APP_NAME)
         title_lbl.setStyleSheet("font-size: 20px; font-weight: 700; color: #ffffff;")
-        ver_lbl = QLabel(f"v{APP_VERSION} · Outfit UI")
+        ver_lbl = QLabel(f"v{APP_VERSION} · {self.lang}")
         ver_lbl.setStyleSheet("font-size: 11px; color: #7e8aa8;")
         brand_text.addWidget(title_lbl)
         brand_text.addWidget(ver_lbl)
@@ -374,6 +375,18 @@ class LeonidaWindow(QMainWindow):
         main_layout.addWidget(self.pages, 1)
 
         self._refresh_disk_label()
+        QTimer.singleShot(250, self.open_setup_wizard)
+
+    def open_setup_wizard(self) -> None:
+        dlg = SetupDialog(
+            self.repo_root,
+            self.lang,
+            work_dir=self.work_edit.text().strip() or self.out_edit.text().strip(),
+            parent=self,
+        )
+        dlg.exec()
+        if dlg.last_report:
+            self.last_reports["environment"] = dlg.last_report
 
     def switch_page(self, index: int) -> None:
         self.pages.setCurrentIndex(index)
@@ -403,7 +416,6 @@ class LeonidaWindow(QMainWindow):
         lay.addWidget(h)
         lay.addWidget(sub)
 
-        # Paths card
         paths_card, pc = self._card()
         grid = QGridLayout()
         grid.setHorizontalSpacing(10)
@@ -450,7 +462,6 @@ class LeonidaWindow(QMainWindow):
         pc.addWidget(self.disk_label)
         lay.addWidget(paths_card)
 
-        # Stages card
         stages_card, sc = self._card()
         st_title = QLabel(tr(self.lang, "stages_title"))
         st_title.setProperty("section", True)
@@ -459,11 +470,11 @@ class LeonidaWindow(QMainWindow):
         st_row = QHBoxLayout()
         self.stage_checks: dict[str, QCheckBox] = {}
         stage_labels = {
-            "check": "check (Validar)",
+            "check": "check",
             "shaders": "shaders (RDNA2 → SPIR-V)",
-            "assets": "assets (OBJ / DDS / Áudio)",
+            "assets": "assets (OBJ / DDS / Audio)",
             "runtime": "runtime (PE Loader)",
-            "pipelines": "pipelines (Cache Vulkan)",
+            "pipelines": "pipelines (Vulkan Cache)",
         }
         for s in ALL_STAGES:
             cb = QCheckBox(stage_labels[s])
@@ -473,7 +484,6 @@ class LeonidaWindow(QMainWindow):
         sc.addLayout(st_row)
         lay.addWidget(stages_card)
 
-        # Action bar + progress
         act_card, ac = self._card()
         btn_row = QHBoxLayout()
         self.start_btn = QPushButton(tr(self.lang, "start_build"))
@@ -503,7 +513,6 @@ class LeonidaWindow(QMainWindow):
         self.mini_log = QPlainTextEdit()
         self.mini_log.setReadOnly(True)
         self.mini_log.setMaximumHeight(165)
-        self.mini_log.setPlaceholderText("Build output will stream here in real time...")
         ac.addWidget(self.mini_log)
         lay.addWidget(act_card, 1)
         return page
@@ -519,6 +528,12 @@ class LeonidaWindow(QMainWindow):
         lay.addWidget(h)
 
         bar = QHBoxLayout()
+        btn_setup = QPushButton(tr(self.lang, "val_setup_btn"))
+        btn_setup.setProperty("primary", True)
+        btn_setup.setCursor(Qt.PointingHandCursor)
+        btn_setup.clicked.connect(self.open_setup_wizard)
+        bar.addWidget(btn_setup)
+
         for label, fn in (
             (tr(self.lang, "val_env_btn"), lambda: self.run_validation("env")),
             (tr(self.lang, "val_game_quick"), lambda: self.run_validation("game", False)),
@@ -526,7 +541,7 @@ class LeonidaWindow(QMainWindow):
             (tr(self.lang, "val_code_btn"), lambda: self.run_validation("code")),
         ):
             b = QPushButton(label)
-            b.setProperty("primary" if label == tr(self.lang, "val_env_btn") else "secondary", True)
+            b.setProperty("secondary", True)
             b.setCursor(Qt.PointingHandCursor)
             b.clicked.connect(fn)
             bar.addWidget(b)
@@ -542,7 +557,7 @@ class LeonidaWindow(QMainWindow):
         self.val_progress.setValue(0)
         lay.addWidget(self.val_progress)
 
-        self.val_summary = QLabel("Clique em um botão acima para validar ambiente, jogo ou código.")
+        self.val_summary = QLabel(tr(self.lang, "val_prompt"))
         self.val_summary.setStyleSheet("font-size: 14px; font-weight: 600; color: #00d4ff;")
         lay.addWidget(self.val_summary)
 
@@ -589,8 +604,12 @@ class LeonidaWindow(QMainWindow):
         btn_rt.clicked.connect(lambda: self._pick_dir(self.runtime_build_edit))
 
         self.lang_combo = QComboBox()
-        self.lang_combo.addItems(["pt-BR", "en"])
-        self.lang_combo.setCurrentText(self.config.language)
+        self.lang_combo.addItem(tr(self.lang, "lang_auto"), "")
+        self.lang_combo.addItem("Português (Brasil)", "pt-BR")
+        self.lang_combo.addItem("English", "en")
+        self.lang_combo.addItem("Español", "es")
+        idx = self.lang_combo.findData(self.config.language)
+        self.lang_combo.setCurrentIndex(idx if idx >= 0 else 0)
 
         grid.addWidget(QLabel("CPU Jobs (--jobs)"), 0, 0)
         grid.addWidget(self.jobs_slider, 0, 1)
@@ -603,13 +622,13 @@ class LeonidaWindow(QMainWindow):
         grid.addWidget(self.runtime_build_edit, 2, 1)
         grid.addWidget(btn_rt, 2, 2)
 
-        grid.addWidget(QLabel("Idioma / Language"), 3, 0)
+        grid.addWidget(QLabel(tr(self.lang, "lang_label")), 3, 0)
         grid.addWidget(self.lang_combo, 3, 1, 1, 2)
         c.addLayout(grid)
 
-        self.cb_full_check = QCheckBox("--full-check (SHA-256 de todos os arquivos antes do build)")
+        self.cb_full_check = QCheckBox("--full-check (SHA-256)")
         self.cb_full_check.setChecked(self.config.full_check)
-        self.cb_wav = QCheckBox("--wav (Decodificar Ogg Opus para PCM WAV 16-bit)")
+        self.cb_wav = QCheckBox("--wav (Ogg Opus -> PCM WAV 16-bit)")
         self.cb_wav.setChecked(self.config.wav)
         self.cb_no_fc = QCheckBox("--no-float-controls")
         self.cb_no_fc.setChecked(self.config.no_float_controls)
@@ -628,7 +647,7 @@ class LeonidaWindow(QMainWindow):
         ):
             c.addWidget(cb)
 
-        save_btn = QPushButton("Salvar Configurações")
+        save_btn = QPushButton(tr(self.lang, "save_settings"))
         save_btn.setProperty("primary", True)
         save_btn.clicked.connect(self._save_current_config)
         c.addWidget(save_btn, alignment=Qt.AlignLeft)
@@ -677,11 +696,8 @@ class LeonidaWindow(QMainWindow):
         card, c = self._card()
         info = QLabel(
             f"<b>{APP_NAME} Desktop v{APP_VERSION}</b><br><br>"
-            "Interface gráfica nativa multiplataforma (Windows, Linux e macOS) construída com fonte <b>Outfit</b>, "
-            "integrada ao pipeline <code>make_game.py</code>, ao motor de validação <code>tools/validate.py</code> "
-            "e ao visualizador de mapa 3D.<br><br>"
-            f"Repositório: <a style='color:#00d4ff;' href='{REPO_URL}'>{REPO_URL}</a><br>"
-            f"Site Oficial: <a style='color:#ff4d8d;' href='{SITE_URL}'>{SITE_URL}</a>"
+            f"GitHub: <a style='color:#00d4ff;' href='{REPO_URL}'>{REPO_URL}</a><br>"
+            f"Website: <a style='color:#ff4d8d;' href='{SITE_URL}'>{SITE_URL}</a>"
         )
         info.setWordWrap(True)
         info.setOpenExternalLinks(True)
@@ -710,13 +726,13 @@ class LeonidaWindow(QMainWindow):
         return page
 
     def _pick_dir(self, target: QLineEdit) -> None:
-        chosen = QFileDialog.getExistingDirectory(self, "Selecionar Pasta", target.text() or os.path.expanduser("~"))
+        chosen = QFileDialog.getExistingDirectory(self, APP_NAME, target.text() or os.path.expanduser("~"))
         if chosen:
             target.setText(os.path.normpath(chosen))
 
     def _refresh_disk_label(self) -> None:
         p = self.work_edit.text().strip() or self.out_edit.text().strip()
-        self.disk_label.setText(f"Espaço em disco disponível: {format_free_space(p)}")
+        self.disk_label.setText(f"{tr(self.lang, 'disk_avail')} {format_free_space(p, self.lang)}")
 
     def _collect_config(self) -> BuildConfig:
         stages = [s for s, cb in self.stage_checks.items() if cb.isChecked()]
@@ -735,14 +751,14 @@ class LeonidaWindow(QMainWindow):
             texel_offset_fallback=self.cb_tex.isChecked(),
             f16_interp_fallback=self.cb_f16.isChecked(),
             mesh_compute=self.cb_mesh.isChecked(),
-            language=self.lang_combo.currentText(),
+            language=str(self.lang_combo.currentData() or ""),
         ).normalized()
 
     def _save_current_config(self) -> None:
         self.config = self._collect_config()
         path = save_config(self.config)
-        self.append_log(f"Configurações salvas em {path}")
-        QMessageBox.information(self, APP_NAME, f"Configurações salvas em:\n{path}")
+        self.append_log(f"{tr(self.lang, 'settings_saved')} {path}")
+        QMessageBox.information(self, APP_NAME, f"{tr(self.lang, 'settings_saved')}\n{path}")
 
     def append_log(self, text: str) -> None:
         stamp = time.strftime("%H:%M:%S")
@@ -757,14 +773,10 @@ class LeonidaWindow(QMainWindow):
 
         found = make_game.find_dumps()
         if not found:
-            QMessageBox.warning(
-                self, APP_NAME,
-                "Nenhuma cópia suportada (Xbox Series 1.0.2.1) foi encontrada automaticamente.\n"
-                "Selecione a pasta que contém MicrosoftGame.Config e os arquivos .rpf.",
-            )
+            QMessageBox.warning(self, APP_NAME, tr(self.lang, "no_game_found"))
             return
         self.game_edit.setText(found[0][0])
-        self.append_log(f"Detectado: {found[0][1]['title']} {found[0][1]['version']} em {found[0][0]}")
+        self.append_log(f"Found: {found[0][1]['title']} {found[0][1]['version']} in {found[0][0]}")
 
     def start_build(self) -> None:
         if self.build_worker and self.build_worker.isRunning():
@@ -773,13 +785,11 @@ class LeonidaWindow(QMainWindow):
         save_config(cfg)
         py = locate_python()
         if not py:
-            QMessageBox.critical(
-                self, APP_NAME,
-                "Python 3.12+ não encontrado no PATH.\nInstale o Python 3.12+ para executar o pipeline de build.",
-            )
+            QMessageBox.warning(self, APP_NAME, tr(self.lang, "py_missing"))
+            self.open_setup_wizard()
             return
         args = build_make_game_args(cfg, repo_root=self.repo_root, python_exe=py)
-        self.append_log("Comando: " + " ".join(args))
+        self.append_log("$ " + " ".join(args))
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.status_lbl.setText(tr(self.lang, "running"))
@@ -793,7 +803,7 @@ class LeonidaWindow(QMainWindow):
     def stop_build(self) -> None:
         if self.build_worker and self.build_worker.isRunning():
             self.build_worker.stop()
-            self.append_log("Build cancelado pelo usuário.")
+            self.append_log("Build cancelled.")
 
     def _on_build_finished(self, code: int) -> None:
         self.start_btn.setEnabled(True)
@@ -809,9 +819,9 @@ class LeonidaWindow(QMainWindow):
             return
         cfg = self._collect_config()
         if mode == "game" and not cfg.game_dir:
-            QMessageBox.warning(self, APP_NAME, "Informe primeiro a pasta do jogo na aba Compilar.")
+            QMessageBox.warning(self, APP_NAME, tr(self.lang, "select_game_first"))
             return
-        self.val_summary.setText("Validando...")
+        self.val_summary.setText(tr(self.lang, "val_running"))
         self.val_progress.setRange(0, 0 if mode != "game" else 100)
         self.val_progress.setValue(0)
 
@@ -823,7 +833,7 @@ class LeonidaWindow(QMainWindow):
     def _on_val_progress(self, current: int, total: int, label: str) -> None:
         self.val_progress.setRange(0, max(1, total))
         self.val_progress.setValue(current)
-        self.val_summary.setText(f"Verificando ({current}/{total}): {label}")
+        self.val_summary.setText(f"({current}/{total}): {label}")
 
     def _on_val_completed(self, report: dict) -> None:
         self.val_progress.setRange(0, 100)
@@ -832,8 +842,8 @@ class LeonidaWindow(QMainWindow):
         ok = report.get("ok", False)
         color = "#22c55e" if ok else "#f43f5e"
         self.val_summary.setStyleSheet(f"font-size: 14px; font-weight: 600; color: {color};")
-        self.val_summary.setText(f"[{'OK' if ok else 'FALHA'}] {report.get('summary', '')}")
-        self.append_log(f"Validação ({report['kind']}): {report.get('summary', '')}")
+        self.val_summary.setText(f"[{'OK' if ok else 'FAIL'}] {report.get('summary', '')}")
+        self.append_log(f"Validation ({report['kind']}): {report.get('summary', '')}")
 
         while self.val_list.count():
             item = self.val_list.takeAt(0)
@@ -864,14 +874,13 @@ class LeonidaWindow(QMainWindow):
 
     def export_validation_report(self) -> None:
         if not self.last_reports:
-            QMessageBox.information(self, APP_NAME, "Execute ao menos uma validação antes de exportar.")
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Salvar Relatório JSON", "leonida_validation.json", "JSON (*.json)")
+        path, _ = QFileDialog.getSaveFileName(self, APP_NAME, "leonida_validation.json", "JSON (*.json)")
         if not path:
             return
         with open(path, "w", encoding="utf-8", newline="\n") as f:
             json.dump(self.last_reports, f, indent=2, ensure_ascii=False)
-        QMessageBox.information(self, APP_NAME, f"Relatório salvo em:\n{path}")
+        QMessageBox.information(self, APP_NAME, path)
 
     def _copy_logs(self) -> None:
         QApplication.clipboard().setText(self.full_log.toPlainText())
@@ -881,7 +890,7 @@ class LeonidaWindow(QMainWindow):
         self.mini_log.clear()
 
     def _save_logs(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(self, "Salvar Log", "leonida_build.log", "Log (*.log);;Text (*.txt)")
+        path, _ = QFileDialog.getSaveFileName(self, APP_NAME, "leonida_build.log", "Log (*.log);;Text (*.txt)")
         if path:
             with open(path, "w", encoding="utf-8", newline="\n") as f:
                 f.write(self.full_log.toPlainText())
