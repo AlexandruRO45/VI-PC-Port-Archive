@@ -1153,7 +1153,14 @@ if(TARGET Vulkan::Headers)
       target_compile_options(vk_presenter_sync_test PRIVATE /W4 /permissive- /utf-8)
     endif()
     add_test(NAME vk_presenter_sync COMMAND vk_presenter_sync_test)
-    set_tests_properties(vk_presenter_sync PROPERTIES SKIP_RETURN_CODE 77)
+    # TEST-840: the test has a watchdog (60 s by default); the ctest timeout is the backstop, since a run that stalls
+    # in a driver call would otherwise stall the whole suite behind it.
+    set_tests_properties(vk_presenter_sync PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+    # The watchdog itself: step 3 stalls on purpose and the test must report that and exit, not run into TIMEOUT.
+    add_test(NAME vk_presenter_sync_watchdog COMMAND vk_presenter_sync_test)
+    set_tests_properties(vk_presenter_sync_watchdog PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60
+      ENVIRONMENT "LEONIDA_PRESENTER_SYNC_STALL=1;LEONIDA_PRESENTER_SYNC_WATCHDOG_S=2"
+      PASS_REGULAR_EXPRESSION "step 3 did not finish in 2 s: [0-9]+ of 40 presents done")
   endif()
   if(NOT Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
     find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")

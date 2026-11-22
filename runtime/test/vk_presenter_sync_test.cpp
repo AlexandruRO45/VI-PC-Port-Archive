@@ -7,6 +7,10 @@
 //   3. Concurrent present() + VulkanQueue::execute() + add_resource()/remove_resource() follows VulkanContext's
 //      resource_mutex_ -> tracker_mutex_ -> submit_mutex_ lock hierarchy without data races or deadlocks.
 //   4. A swapchain-destroy WSI layer which calls vkDeviceWaitIdle cannot overlap vkQueueSubmit on another thread.
+// Step 3 has a watchdog: if it has not finished after LEONIDA_PRESENTER_SYNC_WATCHDOG_S seconds (default 60) the
+// test prints where it is (presents done, worker rounds) and exits with 3 instead of spinning until someone kills it
+// (TEST-840: on an AMD Windows 26.11.2 iGPU about half the runs never left step 3, at full CPU, and stalled `ctest`).
+// LEONIDA_PRESENTER_SYNC_STALL=1 makes step 3 stall on purpose, which is how the watchdog itself is tested.
 // Skips with exit code 77 when no Vulkan 1.3 device with Win32 presentation is available. No game data.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -20,6 +24,7 @@
 #include "vk_test_device.h"
 #include "../src/vulkan_present.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -29,6 +34,7 @@
 #include <cstdlib>
 #include <functional>
 #include <mutex>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
@@ -41,6 +47,12 @@ namespace {
 
 LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w, LPARAM l) {
     return DefWindowProcW(window, message, w, l);
+}
+
+std::string env_value(const char* name) {  // a short setting, empty when unset
+    char buffer[32];
+    const DWORD length = GetEnvironmentVariableA(name, buffer, sizeof(buffer));
+    return length > 0 && length < sizeof(buffer) ? std::string(buffer, length) : std::string();
 }
 
 void pump() {
@@ -349,6 +361,23 @@ int main() {
         // 3. Concurrent present() + VulkanQueue::execute() + add/remove_resource() hammering LayoutTracker.
         std::atomic<bool> stop{false};
         std::atomic<bool> worker_failed{false};
+        std::atomic<std::uint64_t> worker_rounds{0};
+        std::atomic<int> presents_done{0};
+        std::mutex watchdog_mutex;
+        std::condition_variable watchdog_wake;
+        bool step_done = false;
+        int watchdog_seconds = 60;
+        if (const std::string value = env_value("LEONIDA_PRESENTER_SYNC_WATCHDOG_S"); !value.empty())
+            watchdog_seconds = std::max(1, std::atoi(value.c_str()));
+        std::thread watchdog([&] {
+            std::unique_lock lock(watchdog_mutex);
+            if (watchdog_wake.wait_for(lock, std::chrono::seconds(watchdog_seconds), [&] { return step_done; })) return;
+            std::printf("presenter sync: step 3 did not finish in %d s: %d of 40 presents done, %llu worker rounds, "
+                        "worker failed: %d\n", watchdog_seconds, presents_done.load(),
+                        static_cast<unsigned long long>(worker_rounds.load()), int(worker_failed.load()));
+            std::fflush(stdout);
+            std::_Exit(3);
+        });
         std::thread worker([&] {
             std::uint64_t round = 0;
             while (!stop.load(std::memory_order_relaxed)) {
@@ -368,17 +397,27 @@ int main() {
                 (void)context.layout(base, 0);
                 for (ResourceId i = 0; i < 32; ++i) context.remove_resource(base + i);
                 ++round;
+                worker_rounds.store(round, std::memory_order_relaxed);
             }
         });
 
         VkResult present_err = VK_SUCCESS;
+        const bool stall = env_value("LEONIDA_PRESENTER_SYNC_STALL") == "1";
         for (int i = 0; i < 40; ++i) {
             pump();
+            if (stall) std::this_thread::sleep_for(std::chrono::hours(1));  // the watchdog test
             present_err = presenter.present(1, false);
             if (present_err != VK_SUCCESS) break;
+            presents_done.store(i + 1, std::memory_order_relaxed);
         }
         stop.store(true, std::memory_order_relaxed);
         worker.join();
+        {
+            const std::lock_guard lock(watchdog_mutex);
+            step_done = true;
+        }
+        watchdog_wake.notify_one();
+        watchdog.join();
         EXPECT(present_err == VK_SUCCESS);
         EXPECT(!worker_failed.load());
         EXPECT(queue.idle() && worker_queue.idle());
