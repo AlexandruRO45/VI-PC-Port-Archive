@@ -16232,7 +16232,9 @@ def dropped_op_sel(raw, printed, op):
     """(op_sel, op_sel_hi) as stored in ``raw`` when llvm-mc printed ``op`` with the default selects instead, else None.
 
     Only the select bits may differ: the printed instruction carries the defaults, the stored one doesn't, and with
-    the printed selects put back the bytes are the printed instruction (same_encoding). Any other difference still
+    the printed selects put back the bytes are exactly the printed instruction. same_encoding's exceptions don't
+    apply here: its SRC1/SRC2 one (stored 0, printed 0x80) is for fields an instruction doesn't read, and all three
+    of v_dot4's sources are live, so a stored s0 there must not read as the constant 0. Any other difference still
     refuses."""
     if op not in SELECTS_LLVM_DROPS or len(raw) != len(printed) or len(raw) < 8 or printed[3] != 0xCC:
         return None
@@ -16240,7 +16242,7 @@ def dropped_op_sel(raw, printed, op):
     if p & VOP3P_SELECT_BITS != VOP3P_SELECT_DEFAULT or r & VOP3P_SELECT_BITS == VOP3P_SELECT_DEFAULT:
         return None
     merged = (r & ~VOP3P_SELECT_BITS) | (p & VOP3P_SELECT_BITS)
-    if not same_encoding(merged.to_bytes(8, "little") + raw[8:], printed, op):
+    if merged.to_bytes(8, "little") + raw[8:] != printed:
         return None
     return [(r >> b) & 1 for b in (11, 12, 13)], [(r >> b) & 1 for b in (59, 60, 14)]
 

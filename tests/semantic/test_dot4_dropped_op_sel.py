@@ -111,6 +111,31 @@ class Dot4DroppedOpSelTest(unittest.TestCase):
             self.translate("00 40 16 cc 01 05 0e 3c", invalid=True)
         self.assertIn("normalized encoding", str(cm.exception))
 
+    def test_a_live_source_stored_as_s0_is_still_refused(self):
+        # same_encoding lets an unused SRC1/SRC2 stored as 0 (s0) match a printed 0x80 (inline 0). v_dot4 reads all
+        # three sources, so with a dropped select as well the stored s0 must not be translated as the constant 0.
+        # Printed: v_dot4_i32_i8 v0, v1, 0, v3 (SRC1 = 0x80) and v_dot4_i32_i8 v0, v1, v2, 0 (SRC2 = 0x80).
+        for field, printed_hex, stored_hex in (
+                ("SRC1", "00 40 16 cc 01 01 0d 1c", "00 40 16 cc 01 01 0c 0c"),
+                ("SRC2", "00 40 16 cc 01 05 02 1a", "00 40 16 cc 01 05 02 08")):
+            printed, stored = bytes.fromhex(printed_hex), bytes.fromhex(stored_hex)
+            self.assertIsNone(rdna2spirv.dropped_op_sel(stored, printed, "v_dot4_i32_i8"), field)
+            program = list(PROGRAM)
+            program[DOT] = (program[DOT][0], printed_hex)
+            size = sum(len(bytes.fromhex(enc)) for _, enc in program)
+            for invalid in (False, True):
+                with self.subTest(field=field, re_anchored=invalid):
+                    lines = [f"; {NAME}  code 0x{CODE_START:x}..0x{CODE_START + size:x} (scan), gfx1030, "
+                             f"{int(invalid)} invalid words"]
+                    lines += [f"\t{t:<40}; encoding: [{','.join(f'0x{b:02x}' for b in bytes.fromhex(e))}]"
+                              for t, e in program]
+                    if invalid:
+                        lines += ["; --- llvm-mc", "; <stdin>:1:1: warning: invalid instruction encoding"]
+                    fssm = bytes(CODE_START) + b"".join(stored if i == DOT else bytes.fromhex(e)
+                                                        for i, (_, e) in enumerate(program))
+                    with self.assertRaises(rdna2spirv.Unsupported):
+                        translate_listing(NAME, ("\n".join(lines) + "\n").encode(), fssm=fssm)
+
     def test_only_the_listed_ops(self):
         stored = bytes.fromhex("00 40 16 cc 01 05 0e 0c")
         printed = bytes.fromhex("00 40 16 cc 01 05 0e 1c")
