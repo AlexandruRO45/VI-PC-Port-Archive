@@ -950,5 +950,189 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(self.lds.read_dword(last_idx), TWO_F32)
 
 
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class MinInsteadOfMaxMutant(ScalarInterpreter):
+    """Mutant 1: Performs float minimum instead of maximum."""
+
+    def execute(self, instr: DSSrc2Instruction, state: ScalarMachineState) -> int:
+        base_addr = state.get_vgpr(instr.addr.base_reg.index)
+        _, _, idx_a, idx_b = calc_lds_src2_addresses(
+            vaddr=base_addr,
+            offset0=instr.addr.offset0,
+            offset1=instr.addr.offset1,
+            lds_dwords=state.lds.size_dwords,
+        )
+        val_a = state.lds.read_dword(idx_a)
+        val_b = state.lds.read_dword(idx_b)
+        # Mutation: min instead of max
+        fa = bits_to_f32(val_a)
+        fb = bits_to_f32(val_b)
+        new_a = val_a if fa < fb else val_b
+        state.lds.write_dword(idx_a, new_a)
+        return new_a
+
+
+class IntegerComparisonMutant(ScalarInterpreter):
+    """Mutant 2: Compares operands as unsigned 32-bit integers."""
+
+    def execute(self, instr: DSSrc2Instruction, state: ScalarMachineState) -> int:
+        base_addr = state.get_vgpr(instr.addr.base_reg.index)
+        _, _, idx_a, idx_b = calc_lds_src2_addresses(
+            vaddr=base_addr,
+            offset0=instr.addr.offset0,
+            offset1=instr.addr.offset1,
+            lds_dwords=state.lds.size_dwords,
+        )
+        val_a = state.lds.read_dword(idx_a)
+        val_b = state.lds.read_dword(idx_b)
+        # Mutation: uint32 comparison
+        new_a = val_a if val_a > val_b else val_b
+        state.lds.write_dword(idx_a, new_a)
+        return new_a
+
+
+class DestructiveLocationBMutant(ScalarInterpreter):
+    """Mutant 3: Erroneously overwrites location B instead of location A."""
+
+    def execute(self, instr: DSSrc2Instruction, state: ScalarMachineState) -> int:
+        base_addr = state.get_vgpr(instr.addr.base_reg.index)
+        _, _, idx_a, idx_b = calc_lds_src2_addresses(
+            vaddr=base_addr,
+            offset0=instr.addr.offset0,
+            offset1=instr.addr.offset1,
+            lds_dwords=state.lds.size_dwords,
+        )
+        val_a = state.lds.read_dword(idx_a)
+        val_b = state.lds.read_dword(idx_b)
+        new_val = oracle_max_f32(val_a, val_b)
+        # Mutation: write to B instead of A
+        state.lds.write_dword(idx_b, new_val)
+        return new_val
+
+
+class DroppedOffset1Mutant(ScalarInterpreter):
+    """Mutant 4: Ignores offset1."""
+
+    def execute(self, instr: DSSrc2Instruction, state: ScalarMachineState) -> int:
+        base_addr = state.get_vgpr(instr.addr.base_reg.index)
+        _, _, idx_a, idx_b = calc_lds_src2_addresses(
+            vaddr=base_addr,
+            offset0=instr.addr.offset0,
+            offset1=0,  # Mutation: dropped offset1
+            lds_dwords=state.lds.size_dwords,
+        )
+        val_a = state.lds.read_dword(idx_a)
+        val_b = state.lds.read_dword(idx_b)
+        new_a = oracle_max_f32(val_a, val_b)
+        state.lds.write_dword(idx_a, new_a)
+        return new_a
+
+
+class NaNAggressivePropagationMutant(ScalarInterpreter):
+    """Mutant 5: Propagates NaN if either operand is NaN, violating IEEE 754 maxNum."""
+
+    def execute(self, instr: DSSrc2Instruction, state: ScalarMachineState) -> int:
+        base_addr = state.get_vgpr(instr.addr.base_reg.index)
+        _, _, idx_a, idx_b = calc_lds_src2_addresses(
+            vaddr=base_addr,
+            offset0=instr.addr.offset0,
+            offset1=instr.addr.offset1,
+            lds_dwords=state.lds.size_dwords,
+        )
+        val_a = state.lds.read_dword(idx_a)
+        val_b = state.lds.read_dword(idx_b)
+        # Mutation: propagate NaN
+        if is_f32_nan(val_a) or is_f32_nan(val_b):
+            new_a = CANONICAL_QNAN
+        else:
+            new_a = oracle_max_f32(val_a, val_b)
+        state.lds.write_dword(idx_a, new_a)
+        return new_a
+
+
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(DEFAULT_LDS_DWORDS)
+        self.state = ScalarMachineState(lds=self.lds)
+
+    def test_syntax_rejection_negative_controls(self) -> None:
+        with self.assertRaises(ValueError):
+            vgpr(-5)
+        with self.assertRaises(ValueError):
+            vgpr(300)
+        with self.assertRaises(ValueError):
+            sgpr(120)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(vgpr(0), offset0=-1)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(vgpr(0), offset0=300)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(vgpr(0), offset1=-1)
+        with self.assertRaises(ValueError):
+            LDSAddressExpression(vgpr(0), offset1=300)
+        with self.assertRaises(TypeError):
+            LDSAddressExpression(sgpr(0))
+        with self.assertRaises(ValueError):
+            LDSMemory(0)
+        with self.assertRaises(ValueError):
+            LDSMemory(12345)
+
+    def test_mutation_1_min_instead_of_max_detected(self) -> None:
+        mutant = MinInsteadOfMaxMutant()
+        self.lds.write_dword(10, ONE_F32)
+        self.lds.write_dword(20, TWO_F32)
+        self.state.set_vgpr(0, 40)
+        instr = DSSrc2Instruction(DSOpcode.DS_MAX_SRC2_F32, LDSAddressExpression(vgpr(0), offset0=0, offset1=10))
+        mutant.execute(instr, self.state)
+        # Mutant stored min (1.0f) instead of max (2.0f)
+        self.assertNotEqual(self.lds.read_dword(10), TWO_F32, "Min instead of max mutant must be caught")
+
+    def test_mutation_2_integer_comparison_detected(self) -> None:
+        mutant = IntegerComparisonMutant()
+        # 1.0f vs -10.0f: in float 1.0f > -10.0f; in uint32 0xC1200000 > 0x3F800000
+        self.lds.write_dword(10, ONE_F32)
+        self.lds.write_dword(20, NEG_TEN_F32)
+        self.state.set_vgpr(0, 40)
+        instr = DSSrc2Instruction(DSOpcode.DS_MAX_SRC2_F32, LDSAddressExpression(vgpr(0), offset0=0, offset1=10))
+        mutant.execute(instr, self.state)
+        self.assertNotEqual(self.lds.read_dword(10), ONE_F32, "Integer comparison mutant must be caught")
+
+    def test_mutation_3_destructive_location_b_detected(self) -> None:
+        mutant = DestructiveLocationBMutant()
+        self.lds.write_dword(10, ONE_F32)
+        self.lds.write_dword(20, HALF_F32)
+        self.state.set_vgpr(0, 40)
+        instr = DSSrc2Instruction(DSOpcode.DS_MAX_SRC2_F32, LDSAddressExpression(vgpr(0), offset0=0, offset1=10))
+        mutant.execute(instr, self.state)
+        # Location A should have become 1.0f, location B should have stayed 0.5f
+        # Mutant overwrote B with 1.0f!
+        self.assertNotEqual(self.lds.read_dword(20), HALF_F32, "Destructive location B mutant must be caught")
+
+    def test_mutation_4_dropped_offset1_detected(self) -> None:
+        mutant = DroppedOffset1Mutant()
+        self.lds.write_dword(10, ONE_F32)
+        self.lds.write_dword(20, TWO_F32)
+        self.state.set_vgpr(0, 40)
+        instr = DSSrc2Instruction(DSOpcode.DS_MAX_SRC2_F32, LDSAddressExpression(vgpr(0), offset0=0, offset1=10))
+        mutant.execute(instr, self.state)
+        # Mutant compared 10 with 10 instead of 10 with 20, leaving location A at 1.0f instead of 2.0f
+        self.assertNotEqual(self.lds.read_dword(10), TWO_F32, "Dropped offset1 mutant must be caught")
+
+    def test_mutation_5_nan_propagation_detected(self) -> None:
+        mutant = NaNAggressivePropagationMutant()
+        self.lds.write_dword(10, ONE_F32)
+        self.lds.write_dword(20, QNAN_F32)
+        self.state.set_vgpr(0, 40)
+        instr = DSSrc2Instruction(DSOpcode.DS_MAX_SRC2_F32, LDSAddressExpression(vgpr(0), offset0=0, offset1=10))
+        mutant.execute(instr, self.state)
+        # Mutant stored NaN instead of suppressing it to 1.0f
+        self.assertNotEqual(self.lds.read_dword(10), ONE_F32, "NaN propagation mutant must be caught")
+
+
 if __name__ == "__main__":
     unittest.main()
