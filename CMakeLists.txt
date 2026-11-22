@@ -1248,20 +1248,21 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:blast_source>" "$<TARGET_FILE:blast_lifted>" "$<TARGET_FILE:archive_codec_lifted>")
 
     function(crc_line_program target polynomial)
-        # Use the same optimized source PE as input to both Debug and Release AOT builds.
+        # Use the same CRC object optimization flags in Debug and Release.
         set(crc_object "${CMAKE_CURRENT_BINARY_DIR}/${target}_step.obj")
         add_custom_command(OUTPUT "${crc_object}"
             COMMAND "${CMAKE_CXX_COMPILER}" /nologo /c /O1 /GS- /Zl "/DCRC_POLYNOMIAL=${polynomial}" "/Fo${crc_object}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/crc_line/crc_step.cpp"
             DEPENDS tests/cpu/crc_line/crc_step.cpp VERBATIM)
-        add_executable(${target} tests/cpu/crc_line/entry.asm "${crc_object}")
+        add_executable(${target} tests/cpu/crc_line/entry.asm tests/cpu/exe_startup.asm "${crc_object}")
         set_target_properties(${target} PROPERTIES LINKER_LANGUAGE CXX)
-        target_link_options(${target} PRIVATE /ENTRY:program_entry /EXPORT:crc_step /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
-        target_link_libraries(${target} PRIVATE ucrt)
+        target_link_options(${target} PRIVATE /ENTRY:native_startup /EXPORT:native_entry /EXPORT:crc_step
+            /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+        target_link_libraries(${target} PRIVATE ucrt cpu_exe_io)
         set(crc_source "${CMAKE_CURRENT_BINARY_DIR}/${target}_lifted.cpp")
         add_custom_command(OUTPUT "${crc_source}"
             COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tools/cpu_stdio_exe_aot.py"
-                "$<TARGET_FILE:${target}>" "${crc_source}"
+                "$<TARGET_FILE:${target}>" "${crc_source}" --entry-export native_entry
             DEPENDS ${target} tools/cpu_stdio_exe_aot.py tools/cpu_switch_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py
             VERBATIM)
         add_executable(${target}_lifted "${crc_source}")
@@ -1271,7 +1272,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     crc_line_program(cpu_crc_castagnoli 0x82f63b78u)
     add_test(NAME cpu_native_crc_line COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/crc_line_check.py" "$<TARGET_FILE:pe_map>"
-        "$<TARGET_FILE:cpu_crc_line>" "$<TARGET_FILE:cpu_crc_line_lifted>"
+        "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:cpu_crc_line>" "$<TARGET_FILE:cpu_crc_line_lifted>"
         "$<TARGET_FILE:cpu_crc_castagnoli>" "$<TARGET_FILE:cpu_crc_castagnoli_lifted>")
     foreach(variant IN ITEMS original inverted pair swapped framed image)
         set(native cpu_exe_${variant})
