@@ -419,6 +419,18 @@ class Gen:
         bits = [int(x) for x in sel.split("[")[1].rstrip("]").split(",")] + [0] * (nsrc + 1)
         return bits[:nsrc], bits[nsrc]
 
+    def opsel_dst32(self, mods, nsrc, r):
+        """The op_sel destination bit of a VOP3 op whose result is a whole dword (v_pack_b32_f16, v_alignbit_b32,
+        v_alignbyte_b32): RDNA2 writes the result shifted left by 16, its low half into D's high half and zero into
+        D's low half; nothing of D's old value is kept. Measured on gfx1036 with raw kernels, wave32 and wave64
+        (EGEN-HW-OPSEL-DST32): v_alignbit_b32 of 0x8fffffff gives 0xffff0000, v_pack_b32_f16 of 0x00035678 gives
+        0x56780000. Returns ``r`` itself when the bit is clear."""
+        if not self.opsel_bits(mods, nsrc)[1]:
+            return r
+        t = self.tmp()
+        self.emit(f"{t} = OpShiftLeftLogical %uint {r} {self.cu(16)}")
+        return t
+
     def src_h(self, s):
         """Raw 32 bits of an operand of a 16-bit float op, before its neg/abs. An inline float constant (0.5, 1.0,
         -2.0, ...) is the f16 value in the low half over a zero high half, not f32 bits. Measured on an RX 6800
@@ -4646,7 +4658,7 @@ class Gen:
             hi, r = self.tmp(), self.tmp()
             self.emit(f"{hi} = OpShiftLeftLogical %uint {halves[1]} {self.cu(16)}")
             self.emit(f"{r} = OpBitwiseOr %uint {halves[0]} {hi}")
-            self.dst(a[0], r)
+            self.dst(a[0], self.opsel_dst32(mods, 2, r))
         elif op in ("v_cmp_class_f32", "v_cmpx_class_f32"):
             self.cmp_class(a, exec_only=op == "v_cmpx_class_f32")
         elif op in ("v_ffbl_b32", "v_ffbh_u32", "s_flbit_i32_b32") or \
@@ -5258,12 +5270,16 @@ class Gen:
             self.dst(a[0], r)
         elif op == "v_alignbyte_b32":
             # (({src0, src1} as 64 bits) >> (8 * (src2 & 3))) low 32 bits
+            # op_sel on a source changes the result on RDNA2 (gfx1036: op_sel[1] shifts by S2[31:16]; op_sel[0]
+            # gave neither S2 half) and is not modelled: refused. The destination bit is opsel_dst32.
+            if any(self.opsel_bits(mods, 3)[0]):
+                raise Unsupported("v_alignbyte_b32 op_sel on a source")
             # (32 - b) & 31 keeps the left shift below 32 when b == 0; that result is discarded by the OpSelect.
             sh_val = self.imm_val(a[3])
             if sh_val is not None:
                 sel = sh_val & 3
                 if sel == 0:
-                    self.dst(a[0], self.src_u(a[2]))
+                    self.dst(a[0], self.opsel_dst32(mods, 3, self.src_u(a[2])))
                 else:
                     hi_, lo_ = self.src_u(a[1]), self.src_u(a[2])
                     b = sel * 8
@@ -5272,7 +5288,7 @@ class Gen:
                     self.emit(f"{a1} = OpShiftRightLogical %uint {lo_} {self.cu(b)}")
                     self.emit(f"{b1} = OpShiftLeftLogical %uint {hi_} {self.cu(inv)}")
                     self.emit(f"{r} = OpBitwiseOr %uint {a1} {b1}")
-                    self.dst(a[0], r)
+                    self.dst(a[0], self.opsel_dst32(mods, 3, r))
             else:
                 hi_, lo_, sh = (self.src_u(t) for t in a[1:4])
                 m, b, inv0, inv, a1, b1, nz, r0, r = (self.tmp() for _ in range(9))
@@ -5285,7 +5301,7 @@ class Gen:
                 self.emit(f"{r0} = OpBitwiseOr %uint {a1} {b1}")
                 self.emit(f"{nz} = OpINotEqual %bool {b} {self.cu(0)}")
                 self.emit(f"{r} = OpSelect %uint {nz} {r0} {lo_}")
-                self.dst(a[0], r)
+                self.dst(a[0], self.opsel_dst32(mods, 3, r))
         elif op == "v_swap_b32":
             # exchange two VGPRs (active lanes only, through dst)
             x, y = self.src_u(a[0]), self.src_u(a[1])
@@ -5359,12 +5375,16 @@ class Gen:
                 self.mask_dst(d, r)
         elif op == "v_alignbit_b32":
             # (({src0, src1} as 64 bits) >> (src2 & 31)) low 32 bits
+            # op_sel on a source changes the result on RDNA2 (gfx1036: op_sel[1] shifts by S2[31:16]; op_sel[0]
+            # gave neither S2 half) and is not modelled: refused. The destination bit is opsel_dst32.
+            if any(self.opsel_bits(mods, 3)[0]):
+                raise Unsupported("v_alignbit_b32 op_sel on a source")
             # (32 - m) & 31 keeps the left shift below 32 when m == 0; that result is discarded by the OpSelect.
             sh_val = self.imm_val(a[3])
             if sh_val is not None:
                 m_val = sh_val & 31
                 if m_val == 0:
-                    self.dst(a[0], self.src_u(a[2]))
+                    self.dst(a[0], self.opsel_dst32(mods, 3, self.src_u(a[2])))
                 else:
                     hi_, lo_ = self.src_u(a[1]), self.src_u(a[2])
                     inv_val = 32 - m_val
@@ -5372,7 +5392,7 @@ class Gen:
                     self.emit(f"{a1} = OpShiftRightLogical %uint {lo_} {self.cu(m_val)}")
                     self.emit(f"{b1} = OpShiftLeftLogical %uint {hi_} {self.cu(inv_val)}")
                     self.emit(f"{r} = OpBitwiseOr %uint {a1} {b1}")
-                    self.dst(a[0], r)
+                    self.dst(a[0], self.opsel_dst32(mods, 3, r))
             else:
                 hi_, lo_, sh = (self.src_u(t) for t in a[1:4])
                 m, inv0, inv, a1, b1, nz, r0, r = (self.tmp() for _ in range(8))
@@ -5384,7 +5404,7 @@ class Gen:
                 self.emit(f"{r0} = OpBitwiseOr %uint {a1} {b1}")
                 self.emit(f"{nz} = OpINotEqual %bool {m} {self.cu(0)}")
                 self.emit(f"{r} = OpSelect %uint {nz} {r0} {lo_}")
-                self.dst(a[0], r)
+                self.dst(a[0], self.opsel_dst32(mods, 3, r))
         elif op in ("v_lshlrev_b64", "v_lshrrev_b64", "v_ashrrev_i64"):
             # v[d:d+1] = v[s:s+1] << / >> (src0 & 63): logical left, logical right, or arithmetic right (the sign
             # bit 63 is copied in).
