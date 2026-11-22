@@ -44,6 +44,7 @@ class DisassemblyMatchesTest(unittest.TestCase):
     def assembly(self, *stems):
         for stem in stems:
             write(os.path.join(self.disasm, stem + ".s"), "s_endpgm\n")
+        write(os.path.join(self.disasm, "stems.json"), json.dumps(list(stems)))
 
     def test_a_signed_disassembly_of_the_unpacked_shaders_matches(self):
         self.indexes()
@@ -52,18 +53,27 @@ class DisassemblyMatchesTest(unittest.TestCase):
         self.assertTrue(make_game.disassembly_matches(self.dxbc, SIGNATURE))
 
     def test_an_emptied_disassembly_does_not_match(self):
-        # The folder and its signature survive when the .s files are deleted to save disk: decode them again.
+        # The folder, its signature and the listing survive when the .s files are deleted to save disk: decode again.
         self.indexes()
         self.sign()
-        os.makedirs(self.disasm)
+        self.assembly("shader_0")
+        os.remove(os.path.join(self.disasm, "shader_0.s"))
         self.assertFalse(make_game.disassembly_matches(self.dxbc, SIGNATURE))
 
     def test_a_partly_emptied_disassembly_does_not_match(self):
-        # Two unpacked shaders, one .s left: translating this would publish a corpus that lacks the other silently.
+        # Two listings written, one .s left: translating this would publish a corpus that lacks the other silently.
+        self.indexes(carved=("shader_0", "shader_1"), unpacked=("shader_0", "shader_1"))
+        self.sign()
+        self.assembly("shader_0", "shader_1")
+        os.remove(os.path.join(self.disasm, "shader_1.s"))
+        self.assertFalse(make_game.disassembly_matches(self.dxbc, SIGNATURE))
+
+    def test_a_blob_that_wrote_no_listing_is_not_a_redo(self):
+        # An unpacked blob with no s_endpgm produces no .s and the run still succeeds; the listing is the baseline.
         self.indexes(carved=("shader_0", "shader_1"), unpacked=("shader_0", "shader_1"))
         self.sign()
         self.assembly("shader_0")
-        self.assertFalse(make_game.disassembly_matches(self.dxbc, SIGNATURE))
+        self.assertTrue(make_game.disassembly_matches(self.dxbc, SIGNATURE))
 
     def test_assembly_for_a_shader_that_is_no_longer_unpacked_does_not_match(self):
         self.indexes()
@@ -126,11 +136,18 @@ class TranslateTest(unittest.TestCase):
         with self.assertRaises(SystemExit) as cm:
             self.translate_with_index("{}")
         self.assertEqual(cm.exception.code, 1)
+        # The empty file must not survive to be read as a finished translation by the next run.
+        self.assertFalse(os.path.exists(os.path.join(self.spirv, "index.json")))
+        with self.assertRaises(SystemExit) as cm:
+            self.translate_with_index("{}")
+        self.assertEqual(cm.exception.code, 1)
+        self.assertFalse(os.path.exists(os.path.join(self.spirv, "index.json")))
 
     def test_an_unreadable_merge_fails(self):
         with self.assertRaises(SystemExit) as cm:
             self.translate_with_index("")
         self.assertEqual(cm.exception.code, 1)
+        self.assertFalse(os.path.exists(os.path.join(self.spirv, "index.json")))
 
     def test_a_non_empty_merge_passes(self):
         self.translate_with_index(json.dumps({"shader_0": {"stage": "ps"}}))

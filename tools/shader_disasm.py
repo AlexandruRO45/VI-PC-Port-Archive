@@ -12,6 +12,7 @@ Set LLVM_MC to llvm-mc's path, or to a whole command such as
 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc' when the tool is not on PATH.
 """
 import argparse
+import json
 import os
 import struct
 import subprocess
@@ -175,6 +176,13 @@ def main():
         fail(f"{len(FAILED)} shader(s) produced no disassembly, first {path}: {reason}")
     if not (res["clean"] or res["invalid words"]):
         fail(f"no disassembly produced for {a.src}")
+    # What this run actually wrote. An unpacked blob with no s_endpgm (or no scannable code) produces no .s and is not
+    # a failure while another blob decoded, so make_game.py cannot derive the expected stems from the unpack index.
+    stems = {os.path.splitext(os.path.basename(p))[0] for p in files}
+    written = sorted(stem for stem in stems if os.path.isfile(os.path.join(out, stem + ".s")))
+    with open(os.path.join(out, "stems.json"), "w", encoding="utf-8", newline="\n") as f:
+        json.dump(written, f, indent=0)
+        f.write("\n")
     return 0
 
 

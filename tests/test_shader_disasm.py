@@ -120,7 +120,7 @@ class DisasmFailureTest(unittest.TestCase):
         p = self.run_tool(mc, out)
         self.assertEqual(p.returncode, 0, p.stderr)
         written = os.listdir(out)
-        self.assertEqual(written, ["one.s"])
+        self.assertEqual(written, ["one.s", "stems.json"])
         with open(os.path.join(out, "one.s"), encoding="utf-8") as f:
             body = f.read()
         self.assertIn("s_endpgm", body)
@@ -171,7 +171,9 @@ class DisasmInputTest(unittest.TestCase):
         p = self.run_tool(self.src, "--out", out, "--jobs", "1")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertNotIn("Traceback", p.stderr)
-        self.assertEqual(sorted(os.listdir(out)), ["a_good.s", "c_good.s"])
+        self.assertEqual(sorted(os.listdir(out)), ["a_good.s", "c_good.s", "stems.json"])
+        with open(os.path.join(out, "stems.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f), ["a_good", "c_good"])   # b_short wrote none and is not listed
         self.assertIn("'clean': 2", p.stdout)
         self.assertIn("'scan failed': 1", p.stdout)
 
@@ -183,7 +185,7 @@ class DisasmInputTest(unittest.TestCase):
         result = self.run_tool(self.src, "--out", out, "--limit", "1")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(os.listdir(out), ["b_shader.s"])
+        self.assertEqual(sorted(os.listdir(out)), ["b_shader.s", "stems.json"])
 
     def test_unpack_index_selects_current_blobs(self):
         self.write("current.fssm", fssm())
@@ -194,7 +196,7 @@ class DisasmInputTest(unittest.TestCase):
         out = os.path.join(self.dir, "out")
         result = self.run_tool(self.src, "--out", out, "--unpack-index", index)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(os.listdir(out), ["current.s"])
+        self.assertEqual(sorted(os.listdir(out)), ["current.s", "stems.json"])
         self.assertTrue(os.path.isfile(os.path.join(self.src, "obsolete.fssm")))
 
     def test_jobs_and_limit_must_be_at_least_one(self):

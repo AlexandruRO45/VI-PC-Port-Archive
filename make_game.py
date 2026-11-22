@@ -666,12 +666,18 @@ def disassembly_matches(dxbc: str, signature: str) -> bool:
     try:
         with os.scandir(os.path.join(dxbc, "disasm")) as entries:
             found = {entry.name[:-2] for entry in entries if entry.name.endswith(".s") and entry.is_file()}
-    except OSError:
+        # What the last successful shader_disasm.py wrote. A blob with no s_endpgm legitimately produces no .s while
+        # the run still succeeds, so the unpack index alone cannot say how many listings to expect; the manifest can.
+        with open(os.path.join(dxbc, "disasm", "stems.json"), encoding="utf-8") as f:
+            wrote = json.load(f)
+    except (OSError, ValueError):
         return False
-    # One .s per unpacked shader: an emptied folder (the .s files deleted to save disk), or one with a few of them
-    # deleted, is not a finished disassembly. Decode it again instead of translating a corpus that silently lacks
-    # the missing shaders and publishing an index that says it is complete.
-    return found == names
+    if not isinstance(wrote, list) or not wrote or not all(isinstance(stem, str) and stem for stem in wrote):
+        return False
+    # An emptied folder (the .s files deleted to save disk), or one with some of the listed files deleted, is not a
+    # finished disassembly. Decode it again instead of translating a corpus that silently lacks them and publishing
+    # an index that says it is complete.
+    return found == set(wrote) and set(wrote) <= names
 
 
 def shader_outputs_reusable(work: str, emulate: bool, keep_emulated: bool,
@@ -701,6 +707,8 @@ def clear_shader_disassembly(work: str, disasm: str) -> None:
         with os.scandir(disasm) as entries:
             for entry in entries:
                 if entry.name.endswith(".s") and (entry.is_file(follow_symlinks=False) or entry.is_symlink()):
+                    os.unlink(entry.path)
+                elif entry.name == "stems.json" and entry.is_file(follow_symlinks=False):
                     os.unlink(entry.path)
 
 
@@ -1105,8 +1113,11 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
             with open(index, encoding="utf-8") as f:
                 merged = json.load(f)
         except ValueError as e:
+            os.remove(index)
             fail(f"rdna2spirv.py --merge wrote an unreadable {index}: {e}")
         if not merged:
+            # A marker left behind would look like a finished translation to the next run; drop it with the failure.
+            os.remove(index)
             fail("rdna2spirv.py translated 0 shaders, so the empty index is not kept. Run the shaders stage again; "
                  "if it happens again, the disassembly logged above is why.")
 

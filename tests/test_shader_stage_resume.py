@@ -104,6 +104,9 @@ class ShaderStageResumeTest(unittest.TestCase):
         elif tool == "shader_disasm.py":
             self.assertEqual(args[1:3], ("--unpack-index", os.path.join(self.dxbc, "fssm_index.json")))
             self.touch(self.dxbc, "disasm", "s0.s")   # a successful decode leaves assembly, not an empty folder
+            self.touch(self.dxbc, "disasm", "stems.json")
+            with open(os.path.join(self.dxbc, "disasm", "stems.json"), "w", encoding="utf-8") as f:
+                json.dump(["s0"], f)
 
     def fake_translate(self, disasm, spirv, jobs, emulate=False, fallbacks=()):
         self.ran.append("translate (emulated)" if emulate else "translate")

@@ -388,6 +388,8 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
         os.makedirs(spirv_dir, exist_ok=True)
         with open(os.path.join(dxbc_dir, "disasm", "shader.s"), "w", encoding="utf-8") as f:
             f.write("s_endpgm\n")   # an emptied disassembly is decoded again (disassembly_matches)
+        with open(os.path.join(dxbc_dir, "disasm", "stems.json"), "w", encoding="utf-8") as f:
+            f.write('["shader"]')    # what shader_disasm.py wrote, so the folder counts as complete
 
         with open(os.path.join(dxbc_dir, "index.json"), "w", encoding="utf-8") as f:
             f.write('[{"file": "shader.dxbc"}]')
