@@ -639,8 +639,21 @@ def predicate_group_e64(first):
 def check_e64_draws(directory, compiler, renderer, backend):
     source = directory / "e64.hlsl"
     shader = directory / "e64.cso"
-    case = directory / "e64.case"
-    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    def add_case(cases, constants, expected, status):
+        path = directory / f"e64-{len(cases)}.case"
+        path.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        cases.append((path, status))
+
+    def run_cases(cases):
+        command = [renderer, backend, "--check-pixel-batch", shader, *(path for path, _ in cases)]
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode == 77:
+            result.check_returncode()
+        expected = [f"case={i} status={status}" for i, (_, status) in enumerate(cases)]
+        actual = [line for line in result.stdout.splitlines() if line.startswith("case=")]
+        if actual != expected or result.returncode != int(any(status != "pass" for _, status in cases)):
+            raise AssertionError(f"Expected {expected}\n{result.stdout}\n{result.stderr}")
+
     x, y, z, w = E64_ARITH_INPUTS
     assert [math.floor(-abs(x)), -y - math.floor(-y), max(-z, abs(w)), min(z, -abs(w))] == E64_ARITH[0][1]
     assert [-x * abs(y) + z, 0.0, 0.0, 0.0] == E64_ARITH[1][1]
@@ -649,33 +662,30 @@ def check_e64_draws(directory, compiler, renderer, backend):
         subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
         constants = bytearray(256)
         struct.pack_into("<4f", constants, 12, *E64_ARITH_INPUTS)
-        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
-        subprocess.run(draw, check=True)
+        cases = []
+        add_case(cases, constants, expected, "pass")
         for channel, value in wrongs:
             wrong_values = list(expected)
             wrong_values[channel] = value
-            case.write_bytes(constants + struct.pack("<4f", *wrong_values) * 64)
-            result = subprocess.run(draw, capture_output=True, text=True)
-            if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
-                raise AssertionError(f"A wrong e64 result escaped detection in channel {channel}")
+            add_case(cases, constants, wrong_values, "mismatch")
+        add_case(cases, constants, expected, "pass")
+        run_cases(cases)
     inputs = ((-1, 1, 0), (-0.0, 0.0, 1), (1, -1, 2), (math.nan, 1, 3), (1, math.nan, 3))
     negated = {0: 2, 1: 1, 2: 0, 3: 3}
     for first in range(0, 16, 4):
         source.write_text(translate(predicate_group_e64(first)), encoding="ascii")
         subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        cases = []
         for left, right, relation in inputs:
             constants = bytearray(256)
             struct.pack_into("<4f", constants, 12, left, right, 0, 1)
             expected = [float((op >> negated[relation]) & 1) for op in range(first, first + 4)]
-            case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
-            subprocess.run(draw, check=True)
+            add_case(cases, constants, expected, "pass")
             # A lowering that dropped the negations would follow the original relation.
             unnegated = [float((op >> relation) & 1) for op in range(first, first + 4)]
             if unnegated != expected:
-                case.write_bytes(constants + struct.pack("<4f", *unnegated) * 64)
-                result = subprocess.run(draw, capture_output=True, text=True)
-                if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
-                    raise AssertionError(f"Dropped e64 negation escaped detection, first={first}, left={left}")
+                add_case(cases, constants, unnegated, "mismatch")
+        run_cases(cases)
 
 
 def bitwise_program():

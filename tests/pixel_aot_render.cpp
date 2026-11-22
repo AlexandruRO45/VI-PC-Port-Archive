@@ -1,4 +1,5 @@
 #include "bvh_fixture.h"
+#include "desktop_gpu.h"
 #include "pixel_aot_vs.h"
 #include <algorithm>
 #include <charconv>
@@ -305,7 +306,7 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
                     std::fprintf(stderr, "pixel_mismatch x=%u y=%u\n", x, y);
                     for (size_t c = 0; c < actual.size(); ++c)
                         std::fprintf(stderr, "channel=%zu expected=%g actual=%g\n", c, expected[c], actual[c]);
-                    throw std::runtime_error("AOT color export differs from CPU reference");
+                    throw PixelMismatch();
                 }
                 if (capture) {
                     for (float value : actual) image.push_back(static_cast<BYTE>(std::lround(value * 255)));
