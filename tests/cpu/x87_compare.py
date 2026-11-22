@@ -319,21 +319,24 @@ def check_rejections():
         return attempt(f"{fld} {fld} db e9 {consumer} {pop2}")
 
     rejected = {
-        # Readers of PF, SF, OF or the whole flags register: the comparison does not model them.
+        # Readers of PF, SF, OF or the whole flags register: the comparison does not model them. JP and JNP
+        # are lowered only when an 8-bit TEST, AND or SAHF wrote PF last.
+        **{f"fucomi then {name}": (after_fucomi(code), "reads PF, which the integer lowering models only after")
+           for name, code in (("jp", "7a 00"), ("jnp", "7b 00"))},
         **{f"fucomi then {name}": (after_fucomi(code), "unsupported query operation")
-           for name, code in (("jp", "7a 00"), ("jnp", "7b 00"), ("setp", "0f 9a c0"), ("cmovp", "0f 4a c1"),
-                              ("js", "78 00"), ("jl", "7c 00"), ("lahf", "9f"), ("sahf", "9e"), ("pushfq", "9c"))},
+           for name, code in (("setp", "0f 9a c0"), ("cmovp", "0f 4a c1"), ("js", "78 00"), ("jl", "7c 00"),
+                              ("lahf", "9f"), ("jo", "70 00"), ("pushfq", "9c"))},
         "fcomi st, st(1) with one value": (attempt(f"{fld} db f1 dd d8 c3"), "x87 stack underflow"),
         "fucomip st, st(2) with two values": (attempt(f"{fld} {fld} df ea dd d8 c3"), "x87 stack underflow"),
         "fcomip on an empty stack": (attempt("df f0 c3"), "x87 stack underflow"),
-        # Comparisons into the status word only: nothing in the profile can read C0, C2 and C3.
-        "fcom st(1)": (attempt(f"{fld} {fld} d8 d1 {pop2}"), "unsupported x87 operation"),
-        "fucom st(1)": (attempt(f"{fld} {fld} dd e1 {pop2}"), "unsupported x87 operation"),
-        "fucompp": (attempt(f"{fld} {fld} da e9 c3"), "unsupported x87 operation"),
+        # Comparisons into the status word that stay outside the profile.
+        "ficomp m32": (attempt(f"{fld} da 19 dd d8 c3"), "unsupported x87 operation"),
+        "fcom st(1) as DC D1": (attempt(f"{fld} {fld} dc d1 {pop2}"), "unsupported x87 encoding"),
+        "fucompp with one value": (attempt(f"{fld} da e9 c3"), "x87 stack underflow"),
         "ftst": (attempt(f"{fld} d9 e4 dd d8 c3"), "unsupported x87 operation"),
         "fxam": (attempt(f"{fld} d9 e5 dd d8 c3"), "unsupported x87 operation"),
         "ficom m16": (attempt(f"{fld} de 11 dd d8 c3"), "unsupported x87 operation"),
-        "fnstsw ax": (attempt(f"{fld} df e0 dd d8 c3"), "unsupported x87 operation"),
+        "fnstsw m16": (attempt(f"{fld} dd 3a dd d8 c3"), "unsupported x87 operand"),
     }
     for case, (message, needle) in rejected.items():
         if message is None or needle not in message:

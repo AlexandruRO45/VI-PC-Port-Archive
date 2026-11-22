@@ -8,7 +8,9 @@ import sys
 from tempfile import TemporaryDirectory
 
 from ffx_dispatch_aot_check import CONVERSIONS
-from pixel_aot_check import assembly, translate, translate_buffer_color, unsigned_conversion, write_record
+from pixel_aot_check import (
+    assembly, compile_shader, translate, translate_buffer_color, unsigned_conversion, write_record,
+)
 
 
 CASES = [(bits, word) for bits, word, _ in CONVERSIONS] + [
@@ -80,7 +82,7 @@ def run(dxc, renderer, adapter, directory):
             expected = ["mismatch", "mismatch"]  # 1.875 and 3.75 would become 2 and 4
         source, shader = directory / "shader.hlsl", directory / "shader.dxil"
         source.write_text(text)
-        subprocess.run([dxc, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        compile_shader(dxc, source, shader)
         result = subprocess.run([renderer, adapter, "--check-pixel-batch", shader, *selected],
                                 capture_output=True, text=True, timeout=90)
         if result.returncode == 77 and adapter == "hardware" and variant == "entry":

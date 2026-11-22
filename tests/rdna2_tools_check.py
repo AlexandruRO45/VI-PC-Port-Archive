@@ -1102,12 +1102,18 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertTrue(is_instruction_supported("s_waitcnt expcnt(7)"))
         self.assertTrue(is_instruction_supported("s_waitcnt lgkmcnt(0)"))
         self.assertTrue(is_instruction_supported("s_waitcnt vmcnt(0)"))
+        self.assertTrue(is_instruction_supported("s_waitcnt vmcnt(63)"))
         self.assertTrue(is_instruction_supported("s_waitcnt vmcnt(0) lgkmcnt(0)"))
         self.assertTrue(is_instruction_supported("s_waitcnt lgkmcnt(0) vmcnt(0)"))
         self.assertTrue(is_instruction_supported("v_subrev_f32_e32 v1, v2, v3"))
         self.assertTrue(is_instruction_supported("v_subrev_f32_e64 v1, v2, v3 clamp"))
+        self.assertTrue(is_opcode_recognized("v_mov_b32_sdwa"))
+        self.assertTrue(is_opcode_recognized("v_cvt_f32_f16_sdwa"))
+        self.assertTrue(is_opcode_recognized("v_pk_add_f16"))
+        self.assertTrue(is_opcode_recognized("v_dot4_i32_i8"))
 
         # Verify unsupported operands or spellings are rejected by scanner
+        self.assertFalse(is_opcode_recognized("v_imaginary_opcode_sdwa"))
         self.assertFalse(is_instruction_supported("s_waitcnt_expcnt null, 0x8"))
         self.assertFalse(is_instruction_supported("s_waitcnt_expcnt null, 8"))
         self.assertFalse(is_instruction_supported("s_waitcnt_expcnt 0x8"))
@@ -1115,6 +1121,7 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertFalse(is_instruction_supported("s_waitcnt_expcnt invalid"))
         self.assertFalse(is_instruction_supported("s_waitcnt_expcnt null, invalid"))
         self.assertFalse(is_instruction_supported("s_waitcnt expcnt(8)"))
+        self.assertFalse(is_instruction_supported("s_waitcnt vmcnt(64)"))
         self.assertFalse(is_instruction_supported("s_waitcnt vmcnt(7) lgkmcnt(0)"))
         self.assertFalse(is_instruction_supported("s_waitcnt foo"))
 
