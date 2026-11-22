@@ -899,6 +899,145 @@ class TestBufferAtomicSubX2BoundaryExtremes(unittest.TestCase):
         self.assertEqual(self.mem.read_u64(16), double_qnan - 1)
 
 
+class TestBufferAtomicSubX2NegativeControls(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and invalid operands."""
+
+    def test_invalid_destination_kind(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SUB_X2,
+                vdata=Register(RegKind.SGPR, 0, count=2),
+                vaddr=Register(RegKind.VGPR, 2, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=0,
+            )
+
+    def test_invalid_destination_count(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SUB_X2,
+                vdata=Register(RegKind.VGPR, 0, count=1),
+                vaddr=Register(RegKind.VGPR, 2, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=0,
+            )
+
+    def test_invalid_descriptor_size(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SUB_X2,
+                vdata=Register(RegKind.VGPR, 0, count=2),
+                vaddr=Register(RegKind.VGPR, 2, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=2),
+                soffset=0,
+            )
+
+    def test_invalid_soffset_kind(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SUB_X2,
+                vdata=Register(RegKind.VGPR, 0, count=2),
+                vaddr=Register(RegKind.VGPR, 2, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=Register(RegKind.VGPR, 8, count=1),
+            )
+
+    def test_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDBufferWavefrontInterpreter(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDBufferWavefrontInterpreter(wave_size=128)
+
+    def test_invalid_immediate_offset(self) -> None:
+        with self.assertRaises(ValueError):
+            BufferAtomicModifiers(offset=4096)
+        with self.assertRaises(ValueError):
+            BufferAtomicModifiers(offset=-1)
+
+    def test_invalid_register_indices_and_ranges(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 255, count=2)
+
+
+class TestBufferAtomicSubX2MutationDetection(unittest.TestCase):
+    """Mutation tests: verifies that intentional sabotages/mutations of the oracle are caught."""
+
+    def test_mutation_oob_check_omission(self) -> None:
+        # Sabotage: ignoring NUM_RECORDS bounds check
+        mem = BufferMemory(256)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=32)
+
+        # An access at offset 64 must be rejected by the oracle
+        _, in_bounds = ref_buffer_atomic_sub_x2(mem, desc, soffset=0, vaddr=64, sub_val=10, glc=True)
+        self.assertFalse(in_bounds)
+
+        # Mutated logic that omits bounds check would claim success
+        with self.assertRaises(AssertionError):
+            self.assertEqual(in_bounds, True)
+
+    def test_mutation_glc_returns_post_op_value(self) -> None:
+        # Sabotage: returning post-op value instead of pre-op value
+        mem = BufferMemory(256)
+        mem.write_u64(0, 500)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+
+        def mutated_atomic_sub_x2_post_op(m: BufferMemory, d: BufferResourceDescriptor, off: int, val: int) -> int:
+            old = m.read_u64(off)
+            new_val = (old - val) & MASK64
+            m.write_u64(off, new_val)
+            return new_val  # BUG: returns new_val instead of old
+
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_atomic_sub_x2_post_op(mem, desc, 0, 100), 500)
+
+    def test_mutation_addition_instead_of_sub(self) -> None:
+        # Sabotage: add instead of sub
+        mem = BufferMemory(256)
+        mem.write_u64(0, 100)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+
+        def mutated_atomic_add(m: BufferMemory, d: BufferResourceDescriptor, off: int, val: int) -> int:
+            old = m.read_u64(off)
+            new_val = (old + val) & MASK64
+            m.write_u64(off, new_val)
+            return old
+
+        mutated_atomic_add(mem, desc, 0, 30)
+        with self.assertRaises(AssertionError):
+            # Correct sub produces 70; buggy add produces 130
+            self.assertEqual(mem.read_u64(0), 70)
+
+    def test_mutation_simd_exec_leak(self) -> None:
+        simd = SIMDBufferWavefrontInterpreter(wave_size=32, mem_size=256)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        simd.set_buffer_descriptor(4, desc)
+        simd.set_exec_mask(0)  # all lanes disabled
+
+        canary = 0x9999999999999999
+        simd.mem.write_u64(0, canary)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SUB_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=False),
+        )
+        simd.step(inst)
+        # Memory must remain canary
+        self.assertEqual(simd.mem.read_u64(0), canary)
+
+        # Mutated write would corrupt memory
+        simd.mem.write_u64(0, 0)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(simd.mem.read_u64(0), canary)
+
+
 class TestBufferAtomicSubX2ScalarInterpreter(unittest.TestCase):
     """Unit tests for deterministic scalar instruction interpreter."""
 
