@@ -524,23 +524,34 @@ private:
         if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR_(physical_, surface_, &caps) != VK_SUCCESS) return false;
         VkSwapchainKHR old = swapchain_;
         swapchain_ = VK_NULL_HANDLE;
+        struct OldSwapchainGuard {
+            VulkanPresenter* self;
+            VkSwapchainKHR handle;
+            bool active = true;
+            void dismiss() {
+                if (!active) return;
+                active = false;
+                self->release(handle);
+                handle = VK_NULL_HANDLE;
+            }
+            ~OldSwapchainGuard() { dismiss(); }
+        } old_guard{this, old};
         if (caps.currentExtent.width == 0 || caps.currentExtent.height == 0) {
-            release(old);
+            old_guard.dismiss();
             vsync_ = vsync;
             swapchain_srgb_ = srgb;
             stale_ = false;
             return true;
         }
-        if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
-            release(old);
-            return false;
-        }
+        if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return false;
 
         std::uint32_t count = 0;
-        vkGetPhysicalDeviceSurfaceFormatsKHR_(physical_, surface_, &count, nullptr);
+        if (vkGetPhysicalDeviceSurfaceFormatsKHR_(physical_, surface_, &count, nullptr) != VK_SUCCESS || !count)
+            return false;
         std::vector<VkSurfaceFormatKHR> formats(count);
-        vkGetPhysicalDeviceSurfaceFormatsKHR_(physical_, surface_, &count, formats.data());
-        if (formats.empty()) return false;
+        if (vkGetPhysicalDeviceSurfaceFormatsKHR_(physical_, surface_, &count, formats.data()) != VK_SUCCESS || !count)
+            return false;
+        formats.resize(count);
         // An sRGB source wants an sRGB swapchain (the blit decodes and encodes, which cancel); any other source
         // wants UNORM (the bytes go through as they are). BGRA before RGBA, as the surface lists them.
         VkSurfaceFormatKHR chosen = formats[0];
@@ -599,7 +610,7 @@ private:
         info.oldSwapchain = old;
         VkSwapchainKHR fresh = VK_NULL_HANDLE;
         const VkResult created = vkCreateSwapchainKHR_(device, &info, nullptr, &fresh);
-        release(old);  // retired by the creation attempt, whether or not it succeeded
+        old_guard.dismiss();  // retired by the creation attempt, whether or not it succeeded
         if (created != VK_SUCCESS) return false;
 
         std::vector<VkImage> images;

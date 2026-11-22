@@ -63,11 +63,16 @@ PFN_vkQueueSubmit real_submit = nullptr;
 PFN_vkQueuePresentKHR real_present = nullptr;
 PFN_vkCreateSemaphore real_create_semaphore = nullptr;
 PFN_vkDestroySemaphore real_destroy_semaphore = nullptr;
+PFN_vkCreateSwapchainKHR real_create_swapchain = nullptr;
+PFN_vkDestroySwapchainKHR real_destroy_swapchain = nullptr;
+PFN_vkGetPhysicalDeviceSurfaceFormatsKHR real_surface_formats = nullptr;
 VkResult fail_next_submit = VK_SUCCESS;  // armed: the next vkQueueSubmit returns this and submits nothing
 VkResult next_present = VK_SUCCESS;      // armed: the next present that succeeds reports this instead
 int fail_semaphore_in = 0;               // armed: the n-th vkCreateSemaphore from now fails
+bool empty_next_formats = false;         // armed: next vkGetPhysicalDeviceSurfaceFormatsKHR reports 0 formats
 unsigned out_of_date = 0;                // presents the real driver reported out of date
 std::vector<VkSemaphore> binary;         // binary semaphores alive (the device's fences are timeline ones)
+std::vector<VkSwapchainKHR> swapchains;  // swapchains alive
 
 VKAPI_ATTR VkResult VKAPI_CALL queue_submit(VkQueue queue, std::uint32_t count, const VkSubmitInfo* submits,
                                             VkFence fence) {
@@ -108,27 +113,63 @@ VKAPI_ATTR void VKAPI_CALL destroy_semaphore(VkDevice device, VkSemaphore semaph
     real_destroy_semaphore(device, semaphore, allocator);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL create_swapchain(VkDevice device, const VkSwapchainCreateInfoKHR* info,
+                                                const VkAllocationCallbacks* allocator, VkSwapchainKHR* out) {
+    const VkResult result = real_create_swapchain(device, info, allocator, out);
+    if (result == VK_SUCCESS && out && *out) swapchains.push_back(*out);
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL destroy_swapchain(VkDevice device, VkSwapchainKHR swapchain,
+                                             const VkAllocationCallbacks* allocator) {
+    std::erase(swapchains, swapchain);
+    real_destroy_swapchain(device, swapchain, allocator);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL surface_formats(VkPhysicalDevice physical, VkSurfaceKHR surface,
+                                               std::uint32_t* count, VkSurfaceFormatKHR* formats) {
+    if (empty_next_formats) {
+        if (!formats) {
+            if (count) *count = 0;
+            return VK_SUCCESS;
+        }
+        empty_next_formats = false;
+        if (count) *count = 0;
+        return VK_SUCCESS;
+    }
+    return real_surface_formats(physical, surface, count, formats);
+}
+
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device(VkDevice device, const char* name) {
     const std::string_view n = name;
     if (n == "vkQueueSubmit") return reinterpret_cast<PFN_vkVoidFunction>(queue_submit);
     if (n == "vkQueuePresentKHR") return reinterpret_cast<PFN_vkVoidFunction>(queue_present);
     if (n == "vkCreateSemaphore") return reinterpret_cast<PFN_vkVoidFunction>(create_semaphore);
     if (n == "vkDestroySemaphore") return reinterpret_cast<PFN_vkVoidFunction>(destroy_semaphore);
+    if (n == "vkCreateSwapchainKHR") return reinterpret_cast<PFN_vkVoidFunction>(create_swapchain);
+    if (n == "vkDestroySwapchainKHR") return reinterpret_cast<PFN_vkVoidFunction>(destroy_swapchain);
     return real_get_device(device, name);
 }
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_instance(VkInstance instance, const char* name) {
-    if (std::string_view(name) == "vkGetDeviceProcAddr") return reinterpret_cast<PFN_vkVoidFunction>(get_device);
+    const std::string_view n = name;
+    if (n == "vkGetDeviceProcAddr") return reinterpret_cast<PFN_vkVoidFunction>(get_device);
+    if (n == "vkGetPhysicalDeviceSurfaceFormatsKHR") return reinterpret_cast<PFN_vkVoidFunction>(surface_formats);
     return real_get_instance(instance, name);
 }
 
 void install(PFN_vkGetInstanceProcAddr instance_proc, VkInstance instance, VkDevice device) {
     real_get_instance = instance_proc;
     real_get_device = reinterpret_cast<PFN_vkGetDeviceProcAddr>(instance_proc(instance, "vkGetDeviceProcAddr"));
+    real_surface_formats = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceFormatsKHR>(
+        instance_proc(instance, "vkGetPhysicalDeviceSurfaceFormatsKHR"));
     real_submit = reinterpret_cast<PFN_vkQueueSubmit>(real_get_device(device, "vkQueueSubmit"));
     real_present = reinterpret_cast<PFN_vkQueuePresentKHR>(real_get_device(device, "vkQueuePresentKHR"));
     real_create_semaphore = reinterpret_cast<PFN_vkCreateSemaphore>(real_get_device(device, "vkCreateSemaphore"));
     real_destroy_semaphore = reinterpret_cast<PFN_vkDestroySemaphore>(real_get_device(device, "vkDestroySemaphore"));
+    real_create_swapchain = reinterpret_cast<PFN_vkCreateSwapchainKHR>(real_get_device(device, "vkCreateSwapchainKHR"));
+    real_destroy_swapchain =
+        reinterpret_cast<PFN_vkDestroySwapchainKHR>(real_get_device(device, "vkDestroySwapchainKHR"));
 }
 }  // namespace driver
 
@@ -291,6 +332,17 @@ int main() {
         for (int i = 0; i < 4; ++i) EXPECT(frame(1));  // both frames in flight come round again
         EXPECT(presenter->presented() == before + 4 - (driver::out_of_date - out_of_date_before));
         EXPECT(SUCCEEDED(fence->SetEventOnCompletion(signalled, nullptr)));
+        // 4. An early recreate() failure (surface reports 0 formats) must still release the old swapchain and its
+        //    per-image semaphores so nothing leaks and the next present can recreate cleanly.
+        EXPECT(driver::swapchains.size() == 1);
+        EXPECT(!frame(0, [] { driver::empty_next_formats = true; }));
+        driver::empty_next_formats = false;
+        EXPECT(driver::swapchains.empty());
+        EXPECT(driver::binary.size() == 2);
+        before = presenter->presented();
+        EXPECT(frame(0));
+        EXPECT(presenter->presented() == before + 1 && driver::swapchains.size() == 1);
+
         std::printf("injected: out-of-date and suboptimal presents counted apart, a failed swapchain recreation "
                     "released and retried, a failed blit submission recovered (%u real out-of-date presents)\n",
                     real_out_of_date);
