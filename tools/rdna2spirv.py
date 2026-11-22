@@ -10565,21 +10565,36 @@ class Gen:
         e(f"OpBranchConditional {is_box} {L['box']} {L['oth']}")
         e(f"{L['box']} = OpLabel")
         invc = [fext("FClamp", d, NEGMAX, POSMAX) for d in inv]
+        # The four boxes: box32 = min/max f32 at 16 + 24 i, box16 = 6 halves at 16 + 12 i (min x,y,z, max x,y,z).
+        # Each node type reads only its own words: a box16 node is 64 bytes, and box32 offsets (up to byte 112)
+        # would read past it, off the end of the buffer for the last node, and load bytes it doesn't use.
+        kids = [ldw(i) for i in range(4)]
+        l16, l32, lbe = T() + "_b16", T() + "_b32", T() + "_bxe"
+        e(f"OpSelectionMerge {lbe} None")
+        e(f"OpBranchConditional {is_b16} {l16} {l32}")
+        e(f"{l16} = OpLabel")
+        v16 = []
+        for w in [ldw(4 + k) for k in range(12)]:
+            v2 = T()
+            e(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {w}")
+            for c in range(2):
+                x = T()
+                e(f"{x} = OpCompositeExtract %float {v2} {c}")
+                v16.append(x)
+        e(f"OpBranch {lbe}")
+        e(f"{l32} = OpLabel")
+        v32 = [self.tof(ldw(4 + k)) for k in range(24)]
+        e(f"OpBranch {lbe}")
+        e(f"{lbe} = OpLabel")
+        boxes = []
+        for a16, a32 in zip(v16, v32):
+            r = T()
+            e(f"{r} = OpPhi %float {a16} {l16} {a32} {l32}")
+            boxes.append(r)
         dist, idx = [], []
         for i in range(4):
-            child = ldw(i)
-            # box32: min/max f32 at 16 + 24 i; box16: 6 halves at 16 + 12 i (min x,y,z, max x,y,z)
-            m32 = [self.tof(ldw(4 + 6 * i + c)) for c in range(6)]
-            h = [ldw(4 + 3 * i + c) for c in range(3)]
-            m16 = []
-            for w in h:
-                v2 = T()
-                e(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {w}")
-                for c in range(2):
-                    x = T()
-                    e(f"{x} = OpCompositeExtract %float {v2} {c}")
-                    m16.append(x)
-            mm = [sel(is_b16, m16[c], m32[c]) for c in range(6)]
+            child = kids[i]
+            mm = boxes[6 * i:6 * i + 6]
             b0 = [fop("OpFMul", fop("OpFSub", mm[c], org[c]), invc[c]) for c in range(3)]
             b1 = [fop("OpFMul", fop("OpFSub", mm[3 + c], org[c]), invc[c]) for c in range(3)]
             tmin = fext("FMax", fext("FMax", fext("FMin", b0[0], b1[0]), fext("FMin", b0[1], b1[1])),
