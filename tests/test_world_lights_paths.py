@@ -526,6 +526,109 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(len(err.getvalue().strip().splitlines()), 1, err.getvalue())
         self.assertNotIn("Traceback", err.getvalue())
 
+    @contextlib.contextmanager
+    def _exclusive_lock(self, path):
+        if sys.platform == "win32":
+            import ctypes
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            handle = kernel32.CreateFileW(path, 0xC0000000, 0, None, 3, 0x80, None)
+            if handle == -1 or handle == 0xFFFFFFFFFFFFFFFF:
+                raise ctypes.WinError(ctypes.get_last_error())
+            try:
+                yield
+            finally:
+                kernel32.CloseHandle(handle)
+        else:
+            orig_replace = os.replace
+            def fake_replace(src, dst):
+                if os.path.abspath(dst) == os.path.abspath(path):
+                    raise PermissionError(13, f"Permission denied: '{dst}'")
+                return orig_replace(src, dst)
+            with mock.patch.object(os, "replace", side_effect=fake_replace):
+                yield
+
+    def test_locked_summary_preserves_both_reports(self):
+        out = os.path.join(self.tmp.name, "summary.json")
+        lights = os.path.join(self.tmp.name, "lights.jsonl")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write("old summary\n")
+        with open(lights, "w", encoding="utf-8") as f:
+            f.write("old lights\n")
+
+        with self._exclusive_lock(out):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = T.main([self.rpf, "--out", out, "--entities", self.entities, "--lights-out", lights])
+            self.assertEqual(rc, 2)
+            self.assertIn(f"cannot write {out}", err.getvalue())
+
+        with open(out, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "old summary\n")
+        with open(lights, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "old lights\n")
+
+    def test_locked_lights_out_preserves_both_reports(self):
+        out = os.path.join(self.tmp.name, "summary.json")
+        lights = os.path.join(self.tmp.name, "lights.jsonl")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write("old summary\n")
+        with open(lights, "w", encoding="utf-8") as f:
+            f.write("old lights\n")
+
+        with self._exclusive_lock(lights):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = T.main([self.rpf, "--out", out, "--entities", self.entities, "--lights-out", lights])
+            self.assertEqual(rc, 2)
+            self.assertIn(f"cannot write {lights}", err.getvalue())
+
+        with open(out, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "old summary\n")
+        with open(lights, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "old lights\n")
+
+    def test_locked_lights_with_new_summary_rolls_back_summary_creation(self):
+        out = os.path.join(self.tmp.name, "new_summary.json")
+        lights = os.path.join(self.tmp.name, "existing_lights.jsonl")
+        with open(lights, "w", encoding="utf-8") as f:
+            f.write("previous lights\n")
+
+        with self._exclusive_lock(lights):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = T.main([self.rpf, "--out", out, "--entities", self.entities, "--lights-out", lights])
+            self.assertEqual(rc, 2)
+            self.assertIn(f"cannot write {lights}", err.getvalue())
+            self.assertFalse(os.path.exists(out))
+
+        with open(lights, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "previous lights\n")
+
+    def test_locked_summary_preserves_existing_partial_sibling(self):
+        out = os.path.join(self.tmp.name, "summary.json")
+        partial = out + ".partial"
+        lights = os.path.join(self.tmp.name, "lights.jsonl")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write("old summary\n")
+        with open(partial, "w", encoding="utf-8") as f:
+            f.write("existing partial\n")
+        with open(lights, "w", encoding="utf-8") as f:
+            f.write("old lights\n")
+
+        with self._exclusive_lock(out):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = T.main([self.rpf, "--out", out, "--entities", self.entities, "--lights-out", lights])
+            self.assertEqual(rc, 2)
+            self.assertIn(f"cannot write {out}", err.getvalue())
+
+        with open(out, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "old summary\n")
+        with open(lights, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "old lights\n")
+        with open(partial, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "existing partial\n")
+
     def test_report_destination_directory_or_file_parent_rejected(self):
         blocker = os.path.join(self.tmp.name, "blocker.txt")
         with open(blocker, "w", encoding="utf-8") as f:

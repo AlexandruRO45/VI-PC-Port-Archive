@@ -33,10 +33,13 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import json
 import math
 import mmap
 import os
+import shutil
+import stat
 import statistics
 import struct
 import sys
@@ -44,11 +47,13 @@ import tempfile
 import zlib
 from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import suppress
 
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
+from file_mode import published_mode  # noqa: E402
 from pool_workers import process_workers  # noqa: E402
 import world_census as WC  # noqa: E402
 import world_index as WI  # noqa: E402
@@ -668,6 +673,113 @@ def scan(path, jobs=1, start=None, limit=None, lights_out=False):
     return total
 
 
+@contextlib.contextmanager
+def _staged_lights_out(target):
+    """Write placed lights into a private temporary file next to `target` (or directly into `target` if open)
+    and swap it in upon completion. A failed run (corrupt entity rows, I/O error, Ctrl+C) leaves any
+    pre-existing report at `target` intact."""
+    if not target:
+        yield None
+        return
+    if hasattr(target, "write"):
+        yield target
+        return
+
+    dest = os.path.abspath(target)
+    parent = os.path.dirname(dest)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n", dir=parent,
+                                         prefix=".world_lights-", suffix=".tmp", delete=False) as f:
+            temp = f.name
+            yield f
+        os.chmod(temp, published_mode(dest))
+        os.replace(temp, dest)
+        temp = None
+    finally:
+        if temp is not None:
+            with suppress(OSError):
+                os.unlink(temp)
+
+
+def _publish_file(src_tmp, dest_path):
+    """Publish a single staged file to its destination atomically."""
+    dest = os.path.abspath(dest_path)
+    parent = os.path.dirname(dest)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    os.chmod(src_tmp, published_mode(dest))
+    os.replace(src_tmp, dest)
+
+
+def _publish_reports(summary_text, out_path, summary_tmp, lights_path, lights_tmp):
+    """Publish summary and placed-lights reports atomically with rollback if either fails."""
+    if not out_path and not lights_path:
+        sys.stdout.write(summary_text)
+        return
+
+    if not out_path and lights_path:
+        sys.stdout.write(summary_text)
+        try:
+            _publish_file(lights_tmp, lights_path)
+        except OSError as e:
+            raise OSError(f"cannot write {lights_path}: {e.strerror or e}") from e
+        return
+
+    if out_path and not lights_path:
+        try:
+            _publish_file(summary_tmp, out_path)
+        except OSError as e:
+            raise OSError(f"cannot write {out_path}: {e.strerror or e}") from e
+        return
+
+    # Both out_path and lights_path are requested.
+    # Back up the existing summary first so we can restore it if publishing lights fails.
+    recovery = tempfile.mkdtemp(prefix=".world_lights-recovery-", dir=os.path.dirname(os.path.abspath(out_path)))
+    backup = os.path.join(recovery, "summary.backup")
+    keep_backup = False
+    try:
+        try:
+            mode = os.lstat(out_path).st_mode
+        except FileNotFoundError:
+            backup = None
+        else:
+            if not (stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
+                raise OSError(f"cannot back up non-file report {out_path}")
+            try:
+                shutil.copy2(out_path, backup, follow_symlinks=False)
+            except OSError as e:
+                raise OSError(f"cannot write {out_path}: {e.strerror or e}") from e
+
+        # Publish summary first
+        try:
+            _publish_file(summary_tmp, out_path)
+        except OSError as e:
+            raise OSError(f"cannot write {out_path}: {e.strerror or e}") from e
+
+        # Then publish lights
+        try:
+            _publish_file(lights_tmp, lights_path)
+        except OSError as publish_error:
+            # Restore previous summary
+            try:
+                if backup is None:
+                    os.unlink(out_path)
+                else:
+                    os.replace(backup, out_path)
+            except OSError as restore_error:
+                keep_backup = backup is not None
+                raise OSError(f"cannot write {lights_path}: {publish_error.strerror or publish_error}; "
+                              f"restoring {out_path} failed: {restore_error}") from publish_error
+            raise OSError(f"cannot write {lights_path}: {publish_error.strerror or publish_error}") from publish_error
+    finally:
+        if not keep_backup:
+            with suppress(OSError):
+                shutil.rmtree(recovery)
+
+
 def summarize(total, entities=None, lights_out=None):
     """Build the counts-only summary, and place archetype lights through the entity rows if given."""
     lights = dict(total["lights"])
@@ -682,13 +794,8 @@ def summarize(total, entities=None, lights_out=None):
                                                   if len(sets) > 1 and any(len(s) != len(sets[0]) for s in sets)),
     }
     placed = collections.Counter()
-    out = None
-    staged = None
-    try:
-        if lights_out:
-            # Stage the report: a bad --entities row below must not truncate a report from an earlier run.
-            staged = lights_out + ".partial"
-            out = open(staged, "w", encoding="utf-8", newline="\n")
+    with _staged_lights_out(lights_out) as out:
+        if out is not None:
             for row in total["world_lights"]:
                 out.write(json.dumps(row, separators=(",", ":")) + "\n")
         placed["entity_lights_in_maps"] = len(total["world_lights"]) if lights_out else lights.get("lights_entity_in_map_placed", 0)
@@ -714,27 +821,6 @@ def summarize(total, entities=None, lights_out=None):
                                          e.get("scale_xy"), e.get("scale_z"))
                             out.write(json.dumps(_light_row(p, d, L, "archetype", a),
                                                  separators=(",", ":")) + "\n")
-    except BaseException:
-        if out is not None:
-            try:
-                out.close()
-            except OSError:
-                pass
-            out = None
-        if staged is not None and os.path.exists(staged):
-            os.remove(staged)
-        raise
-    finally:
-        if out is not None:
-            out.close()
-    if staged is not None:
-        try:
-            os.replace(staged, lights_out)
-        except BaseException:
-            # A destination that is a directory (or read-only) must not leave the staged copy behind.
-            if os.path.exists(staged):
-                os.remove(staged)
-            raise
     summary["placement"] = dict(placed)
     nodes = [n for part in total["nodes"] for n in part]
     links = [l for part in total["links"] for l in part]
@@ -778,24 +864,6 @@ def same_report_path(first, second):
         return False
 
 
-
-def _publish_summary(path, text):
-    parent = os.path.dirname(os.path.abspath(path))
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    staged = path + ".partial"
-    try:
-        with open(staged, "w", encoding="utf-8", newline="\n") as f:
-            f.write(text)
-        os.replace(staged, path)
-    except BaseException:
-        if os.path.exists(staged):
-            try:
-                os.remove(staged)
-            except OSError:
-                pass
-        raise
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("archive")
@@ -837,23 +905,55 @@ def main(argv=None):
             print(f"ERROR: {rname} parent is not a directory: {probe}", file=sys.stderr)
             return 2
     total = scan(a.archive, a.jobs, a.start, a.limit, bool(a.lights_out))
+    lights_tmp = None
     try:
-        summary = summarize(total, a.entities, a.lights_out)
-    except ValueError as e:            # a bad --entities row, or an archetype that is not a number
-        print(f"ERROR: {a.entities}: {e}", file=sys.stderr)
-        return 2
-    except OSError as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        return 2
-    text = json.dumps(summary, indent=1, sort_keys=True)
-    if a.out:
+        if a.lights_out:
+            dest = os.path.abspath(a.lights_out)
+            parent = os.path.dirname(dest)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", dir=parent,
+                                             prefix=".world_lights-", suffix=".tmp", delete=False) as lights_f:
+                lights_tmp = lights_f.name
+                try:
+                    summary = summarize(total, a.entities, lights_f)
+                except ValueError as e:
+                    print(f"ERROR: {a.entities}: {e}", file=sys.stderr)
+                    return 2
+        else:
+            try:
+                summary = summarize(total, a.entities, None)
+            except ValueError as e:
+                print(f"ERROR: {a.entities}: {e}", file=sys.stderr)
+                return 2
+
+        text = json.dumps(summary, indent=1, sort_keys=True) + "\n"
+        summary_tmp = None
         try:
-            _publish_summary(a.out, text + "\n")
-        except OSError as e:
-            print(f"ERROR: cannot write {a.out}: {e}", file=sys.stderr)
-            return 2
-    else:
-        sys.stdout.write(text + "\n")
+            if a.out:
+                dest = os.path.abspath(a.out)
+                parent = os.path.dirname(dest)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", dir=parent,
+                                                 prefix=".world_lights-", suffix=".tmp", delete=False) as f:
+                    summary_tmp = f.name
+                    f.write(text)
+            try:
+                _publish_reports(text, a.out, summary_tmp, a.lights_out, lights_tmp)
+            except OSError as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 2
+            lights_tmp = None
+            summary_tmp = None
+        finally:
+            if summary_tmp is not None:
+                with suppress(OSError):
+                    os.unlink(summary_tmp)
+    finally:
+        if lights_tmp is not None:
+            with suppress(OSError):
+                os.unlink(lights_tmp)
     return 0
 
 
