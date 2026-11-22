@@ -136,19 +136,16 @@ clone of the helper from `%TEMP%\leonida_tls_host_<pid>_<slot>.dll`, so up to 16
 once and a further one is rejected with an error instead of sharing a slot. Images without a TLS
 directory (or with an all-zero one) load normally.
 
-`load()` also records the image's `OptionalHeader.SizeOfStackReserve` (and `SizeOfStackCommit`). With `--run`, the
-entry-point thread and any thread a title creates with stack size 0 get that reserve: Windows gives a size-0 thread
-the main image's reserve, but gta6rt maps the title into a host EXE with a smaller one. The `CreateThread` (`kernel32`,
-`kernelbase`, `api-ms-win-core-processthreads-l1-1-{0,1,2,3}`), `_beginthreadex` and `_beginthread` (the UCRT names
-and `msvcrt`) shims supply it for size 0. A nonzero `CreateThread` commit without `STACK_SIZE_PARAM_IS_A_RESERVATION`
-also gets the image reserve, raised to a 1 MiB-rounded commit if that is larger, and is passed on with the flag: real
-Windows keeps the image reserve in that case too. The host's smaller default commit replaces the caller's commit; the
-stack grows to the reserve, which is what matters. A size that already has the flag is left alone (RT-119).
-`_beginthread` has no flag argument, so the CRT forwards the reserve as a commit to the host's CreateThread; the
-reserve still reaches the image size, at the cost of a larger initial commit. The CRT starters now initialise their
-per-thread state in gta6rt's static UCRT rather than in `msvcrt.dll`. The `run_stack_reserve` CTest fixture is linked
-with `/STACK:64MB` and checks `GetCurrentThreadStackLimits` on the entry point, the size-0 and nonzero-commit
-`CreateThread` paths and both CRT thread paths; `stack_reserve_shim` checks the import names and the nonzero paths.
+`load()` also records the image's `OptionalHeader.SizeOfStackReserve` and `SizeOfStackCommit`. With `--run`, the
+entry-point thread and size-0 calls through the `CreateThread` and `_beginthreadex` shims use the mapped image's
+reserve. A nonzero commit without `STACK_SIZE_PARAM_IS_A_RESERVATION` gets the larger of the image reserve and the
+commit rounded up to 1 MiB. The shims set that reserve with the flag and use the host's default commit. A nonzero
+size with the flag remains the caller's explicit reservation (RT-119).
+
+`_beginthread` uses the native CRT stack policy and does not inherit the mapped image's reserve. It takes a commit
+size and exposes no reservation flag. Passing the image reserve would commit that much per thread, and replacing it
+with `_beginthreadex` would change CRT handle ownership and `_endthread` behavior. The `run_stack_reserve` CTest
+fixture links with a 64 MiB reserve and measures the entry-point, shimmed and native thread paths.
 
 Current limits, by design:
 

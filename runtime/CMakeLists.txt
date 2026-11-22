@@ -224,7 +224,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_link_options(process_cmdline_test PRIVATE /OPT:NOREF)
   target_link_libraries(process_cmdline_test PRIVATE shell32)
 
-  # RT-119: the CreateThread / _beginthreadex stack shims, their import names and the size-0 substitution.
+  # RT-119: the CreateThread / _beginthreadex stack shims, their import names and reserve selection.
   add_executable(stack_reserve_shim_test
     test/stack_reserve_shim_test.cpp
     shims/process.cpp
@@ -681,8 +681,7 @@ if(BUILD_TESTING)
     set_target_properties(tiny_game_fixed PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
     )
-    # RT-119: a stand-in game linked with a large /STACK. run_entry's thread and the threads it creates with size 0
-    # must inherit that reserve, not gta6rt.exe's default. The fixture checks GetCurrentThreadStackLimits itself.
+    # RT-119: a stand-in game linked with a large /STACK, measured with GetCurrentThreadStackLimits.
     add_executable(stack_reserve_fixture test/fixtures/stack_reserve_fixture.cpp)
     target_compile_definitions(stack_reserve_fixture PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(stack_reserve_fixture PRIVATE /W4 /permissive- /utf-8)
@@ -1117,8 +1116,6 @@ if(BUILD_TESTING)
         set_tests_properties(run_argv_modes PROPERTIES TIMEOUT 90)
       endif()
     endif()
-  endif()
-  if(WIN32 AND TARGET gta6rt AND TARGET tiny_game AND TARGET stack_reserve_fixture)
     add_test(NAME run_startup_cmdline COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_startup_cmdline>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_startup_cmdline.cmake")
@@ -1139,8 +1136,9 @@ if(BUILD_TESTING)
     add_test(NAME run_tiny_game_console_paths COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_game>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_console_paths.cmake")
-    # RT-119: the fixture exits 0 only when the entry point and both size-0 thread paths see its 64 MiB /STACK.
-    add_test(NAME run_stack_reserve COMMAND gta6rt --run $<TARGET_FILE:stack_reserve_fixture> --)
+    if(TARGET stack_reserve_fixture)
+      add_test(NAME run_stack_reserve COMMAND gta6rt --run $<TARGET_FILE:stack_reserve_fixture> --)
+    endif()
     add_test(NAME run_tiny_game_exit_code COMMAND tiny_game_exit_code_test
              "$<TARGET_FILE:gta6rt>" "$<TARGET_FILE:tiny_game>")
     add_test(NAME run_tiny_game_abort_exit_codes COMMAND tiny_game_abort_test

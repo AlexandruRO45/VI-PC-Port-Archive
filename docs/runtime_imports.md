@@ -611,10 +611,11 @@ asynchronous paths with `.invalid` names; it opens no connection.
 ## Thread stack imports
 
 `CreateThread` is registered for `kernel32.dll`, `kernelbase.dll` and `api-ms-win-core-processthreads-l1-1-{0,1,2,3}.dll`;
-`_beginthreadex` and `_beginthread` for `api-ms-win-crt-runtime-l1-1-0.dll`, `ucrtbase.dll`, `ucrtbased.dll` and
-`msvcrt.dll` (`runtime/shims/process.cpp`). They supply the mapped image's `SizeOfStackReserve` for a size of 0 and
-for a nonzero commit without `STACK_SIZE_PARAM_IS_A_RESERVATION`; a size with the flag is left alone. Imports under
-other names, `CreateRemoteThread(Ex)` and threads started inside host DLLs fall through to the host.
+`_beginthreadex` is registered for `api-ms-win-crt-runtime-l1-1-0.dll`, `ucrtbase.dll`, `ucrtbased.dll` and
+`msvcrt.dll` (`runtime/shims/process.cpp`). Both shims set the reserve for a size of 0 or a nonzero commit without
+`STACK_SIZE_PARAM_IS_A_RESERVATION`. A nonzero size with the flag remains the caller's explicit reservation.
+`_beginthread`, `CreateRemoteThread(Ex)`, imports under other names and threads started inside host DLLs use the
+host's stack policy.
 
 ## What this proves and what it does not
 

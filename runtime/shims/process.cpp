@@ -14,22 +14,12 @@
 //     CRT's exit lock. Not covered yet: at_quick_exit() handlers (quick_exit() runs none) and the thread-local
 //     destructor callback (_register_thread_local_exe_atexit_callback); both still reach the host CRT.
 // Covered CRTs: the Universal CRT (api-ms-win-crt-runtime-l1-1-0.dll / ucrtbase.dll, what MSVC links; ucrtbased.dll in Debug) and
-// msvcrt.dll (MinGW). Calls made inside host DLLs, not through the game's imports, are not seen here. Shimming the CRT
-// thread starters means their per-thread CRT init now runs in gta6rt's static UCRT, not in msvcrt.dll (gta6rt is /MT);
-// exit/abort/argv already resolve there, so this is consistent.
+// msvcrt.dll (MinGW). Calls made inside host DLLs, not through the game's imports, are not seen here.
 // The loader matches imports by exact DLL name, so GetCommandLineA/W and ExitProcess are served under every name a
 // title can import them by: kernel32.dll (the classic import libraries), kernelbase.dll, and the API sets that the
 // umbrella libraries a GDK title links (OneCore_apiset.lib, mincore.lib) bind them to. The retail package's own DLLs
 // import ExitProcess from api-ms-win-core-processthreads-l1-1-0.dll.
-// CreateThread, _beginthreadex and _beginthread are served too (RT-119): on Windows a thread created with size 0
-// inherits the main image's SizeOfStackReserve. gta6rt maps the game into a host EXE with a smaller reserve, so a
-// size-0 thread would otherwise get gta6rt.exe's stack. The shims supply the game image's reserve, set by the loader
-// before any mapped code runs. A nonzero size without STACK_SIZE_PARAM_IS_A_RESERVATION is on real Windows an initial
-// commit: the reserve stays the image's, grown to a 1 MiB-rounded commit if that is larger, so the shim sets that
-// reserve with the flag (the host's smaller default commit is close; the report notes the difference). A size that
-// already carries the flag is left alone. The loader matches imports by exact DLL name, so each function is
-// registered under every name a title can import it by: kernel32/kernelbase/API sets for CreateThread, the CRTs for
-// the CRT starters.
+// CreateThread and _beginthreadex supply the mapped image's stack reserve (RT-119).
 #include <windows.h>
 
 #include <process.h>
@@ -42,6 +32,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
+#include <limits>
 #include <mutex>
 #include <new>
 #include <string>
@@ -359,44 +350,31 @@ int __cdecl game_wgetmainargs(int* argc, wchar_t*** argv, wchar_t*** env, int, v
 }
 
 // ---- thread stacks (RT-119)
-// Size 0 is the case Windows resolves from the main image's reserve; the shim supplies it. A nonzero size without
-// STACK_SIZE_PARAM_IS_A_RESERVATION is an initial commit on real Windows: the reserve is the image's
-// SizeOfStackReserve, raised to a 1 MiB-rounded commit if that is larger. gta6rt's host image has a smaller reserve,
-// so supply that reserve explicitly with the flag. The host's own (small) default commit is used instead of the
-// caller's commit; the stack still grows to the reserve, which is the behaviour that matters. A size that already
-// carries the flag is the caller's explicit reservation and is left alone.
+// A nonzero explicit reserve is caller-owned. For a default reserve or a commit request, pass a reserve
+// explicitly so Windows uses the mapped image's size and the host's default commit.
+template <typename Size, typename Flags>
+void use_image_stack_reserve(Size& stack, Flags& flags) {
+    if (stack != 0 && (flags & STACK_SIZE_PARAM_IS_A_RESERVATION)) return;
+
+    constexpr std::size_t rounding_mask = (1u << 20) - 1;
+    constexpr auto max_size = std::numeric_limits<std::size_t>::max();
+    constexpr std::size_t argument_limit = std::numeric_limits<Size>::max();
+    const std::size_t commit = stack;
+    const auto rounded_commit = commit > max_size - rounding_mask ? max_size : (commit + rounding_mask) & ~rounding_mask;
+    stack = static_cast<Size>(std::min(std::max(game_stack_reserve(), rounded_commit), argument_limit));
+    flags |= STACK_SIZE_PARAM_IS_A_RESERVATION;
+}
+
 HANDLE __stdcall game_create_thread(LPSECURITY_ATTRIBUTES attributes, SIZE_T stack, LPTHREAD_START_ROUTINE start,
                                     LPVOID parameter, DWORD flags, LPDWORD thread_id) {
-    constexpr SIZE_T kMiB = 1u << 20;
-    if (stack == 0) {
-        stack = static_cast<SIZE_T>(game_stack_reserve());
-        flags |= STACK_SIZE_PARAM_IS_A_RESERVATION;
-    } else if (!(flags & STACK_SIZE_PARAM_IS_A_RESERVATION)) {
-        const SIZE_T max_size = static_cast<SIZE_T>(-1);
-        const SIZE_T rounded = stack > max_size - (kMiB - 1) ? max_size : (stack + kMiB - 1) & ~(kMiB - 1);
-        stack = std::max(static_cast<SIZE_T>(game_stack_reserve()), rounded);
-        flags |= STACK_SIZE_PARAM_IS_A_RESERVATION;
-    }
+    use_image_stack_reserve(stack, flags);
     return CreateThread(attributes, stack, start, parameter, flags, thread_id);
 }
 
 uintptr_t __cdecl game_begin_threadex(void* security, unsigned stack, unsigned(__stdcall* start)(void*), void* arg,
                                       unsigned flags, unsigned* thread_id) {
-    if (stack == 0) {
-        stack = static_cast<unsigned>(std::min<std::size_t>(game_stack_reserve(), 0xFFFFFFFFu));
-        flags |= STACK_SIZE_PARAM_IS_A_RESERVATION;
-    }
+    use_image_stack_reserve(stack, flags);
     return _beginthreadex(security, stack, start, arg, flags, thread_id);
-}
-
-// _beginthread has no init-flag argument, so the CRT forwards stack_size to CreateThread as a commit size. Passing
-// the image reserve makes the host commit that much and grow the reserve to match; on real Windows the same size-0
-// call gets that reserve with a small commit. Functionally the stack is the requested size; the larger initial
-// commit is a known trade-off (documented in README and the report). The real CRT starter is called, so its
-// auto-close and _endthread semantics stay intact.
-uintptr_t __cdecl game_begin_thread(void(__cdecl* start)(void*), unsigned stack, void* arg) {
-    if (stack == 0) stack = static_cast<unsigned>(std::min<std::size_t>(game_stack_reserve(), 0xFFFFFFFFu));
-    return _beginthread(start, stack, arg);
 }
 
 struct EntryCall {
@@ -443,13 +421,13 @@ int run_entry(void* entry, size_t stack_bytes) {
         g_atexit.clear();  // a run never sees the handlers of an earlier one
     }
     g_exiting_thread = 0;
-    if (!stack_bytes) stack_bytes = game_stack_reserve();  // the mapped image's /STACK, not gta6rt.exe's default
     g_exited = false;
     g_exit_code = 0;
     g_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!g_done) return -1;
     g_running = true;
     EntryCall call{entry};
+    if (!stack_bytes) stack_bytes = game_stack_reserve();  // the mapped image's /STACK
     HANDLE thread = CreateThread(nullptr, stack_bytes, game_thread, &call, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
     if (!thread) {
         g_running = false;
@@ -503,7 +481,6 @@ using namespace rt::process;
     {dll, "GetCommandLineW", reinterpret_cast<void*>(&game_get_command_line_w)}
 #define CREATE_THREAD(dll) {dll, "CreateThread", reinterpret_cast<void*>(&game_create_thread)}
 #define BEGIN_THREADEX(dll) {dll, "_beginthreadex", reinterpret_cast<void*>(&game_begin_threadex)}
-#define BEGIN_THREAD(dll) {dll, "_beginthread", reinterpret_cast<void*>(&game_begin_thread)}
 }  // namespace
 
 SHIM_TABLE(process,
@@ -535,8 +512,4 @@ SHIM_TABLE(process,
     BEGIN_THREADEX("ucrtbase.dll"),
     BEGIN_THREADEX("ucrtbased.dll"),
     BEGIN_THREADEX("msvcrt.dll"),
-    BEGIN_THREAD("api-ms-win-crt-runtime-l1-1-0.dll"),
-    BEGIN_THREAD("ucrtbase.dll"),
-    BEGIN_THREAD("ucrtbased.dll"),
-    BEGIN_THREAD("msvcrt.dll"),
 );

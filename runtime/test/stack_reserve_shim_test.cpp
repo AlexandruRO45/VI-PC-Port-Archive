@@ -51,19 +51,10 @@ DWORD WINAPI flagged_thread(void* p) {
     return 0;
 }
 
-unsigned __stdcall crt_thread(void* p) {
+unsigned __stdcall measure_crt_thread(void* p) {
     auto* r = static_cast<Result*>(p);
     measure(*r);
-    r->ok = r->mib >= kReserveMib;
     return 0;
-}
-
-HANDLE g_begin_done = nullptr;
-void __cdecl begin_thread(void* p) {
-    auto* r = static_cast<Result*>(p);
-    measure(*r);
-    r->ok = r->mib >= kReserveMib;
-    if (g_begin_done) SetEvent(g_begin_done);
 }
 
 }  // namespace
@@ -82,13 +73,11 @@ int main() {
     for (const char* dll : {"api-ms-win-crt-runtime-l1-1-0.dll", "ucrtbase.dll", "ucrtbased.dll", "msvcrt.dll"})
         check(rt::shims::find(dll, "_beginthreadex") == ucrt_begin, "_beginthreadex is shimmed under every name");
 
-    void* ucrt_begin_thread = rt::shims::find("api-ms-win-crt-runtime-l1-1-0.dll", "_beginthread");
-    check(ucrt_begin_thread != nullptr, "api-ms-win-crt-runtime-l1-1-0.dll!_beginthread is shimmed");
     for (const char* dll : {"api-ms-win-crt-runtime-l1-1-0.dll", "ucrtbase.dll", "ucrtbased.dll", "msvcrt.dll"})
-        check(rt::shims::find(dll, "_beginthread") == ucrt_begin_thread, "_beginthread is shimmed under every name");
+        check(rt::shims::find(dll, "_beginthread") == nullptr, "_beginthread stays in the native CRT");
 
     rt::process::set_thread_stack(static_cast<std::size_t>(kReserveMib << 20));
-    if (!kernel_create || !ucrt_begin || !ucrt_begin_thread) return 1;
+    if (!kernel_create || !ucrt_begin) return 1;
 
     using CreateThreadFn = HANDLE(WINAPI*)(LPSECURITY_ATTRIBUTES, SIZE_T, LPTHREAD_START_ROUTINE, LPVOID, DWORD,
                                            LPDWORD);
@@ -121,29 +110,26 @@ int main() {
     using BeginThreadExFn = uintptr_t(__cdecl*)(void*, unsigned, unsigned(__stdcall*)(void*), void*, unsigned,
                                                unsigned*);
     auto begin_ex = reinterpret_cast<BeginThreadExFn>(ucrt_begin);
-    Result crt;
-    const uintptr_t h = begin_ex(nullptr, 0, crt_thread, &crt, 0, nullptr);
-    if (h) {
-        auto* handle = reinterpret_cast<HANDLE>(h);
-        WaitForSingleObject(handle, INFINITE);
-        CloseHandle(handle);
-    }
-    std::printf("stack_shim: size-0 _beginthreadex stack = %llu MiB\n", crt.mib);
-    check(crt.ok, "size 0 through _beginthreadex gets the game image's reserve");
-
-    using BeginThreadFn = uintptr_t(__cdecl*)(void(__cdecl*)(void*), unsigned, void*);
-    auto begin_thread_api = reinterpret_cast<BeginThreadFn>(ucrt_begin_thread);
-    g_begin_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    Result begin;
-    const uintptr_t bh = begin_thread_api(begin_thread, 0, &begin);
-    if (bh == static_cast<uintptr_t>(-1)) {
-        check(false, "_beginthread with size 0 succeeded");
-    } else if (g_begin_done) {
-        WaitForSingleObject(g_begin_done, INFINITE);  // _beginthread closes its own handle on exit
-    }
-    std::printf("stack_shim: size-0 _beginthread stack = %llu MiB\n", begin.mib);
-    check(begin.ok, "size 0 through _beginthread gets the game image's reserve");
-    if (g_begin_done) CloseHandle(g_begin_done);
+    const auto check_crt = [begin_ex](unsigned stack, unsigned flags, unsigned long long expected_mib,
+                                     const char* label) {
+        Result result;
+        unsigned thread_id = 0;
+        if (const uintptr_t thread = begin_ex(nullptr, stack, measure_crt_thread, &result, flags, &thread_id)) {
+            auto* handle = reinterpret_cast<HANDLE>(thread);
+            check(thread_id != 0 && thread_id == GetThreadId(handle), "_beginthreadex reports the thread ID");
+            if (flags & CREATE_SUSPENDED)
+                check(ResumeThread(handle) == 1, "_beginthreadex preserves CREATE_SUSPENDED");
+            WaitForSingleObject(handle, INFINITE);
+            CloseHandle(handle);
+        }
+        std::printf("stack_shim: _beginthreadex stack = %llu MiB\n", result.mib);
+        check(result.mib == expected_mib, label);
+    };
+    check_crt(0, 0, kReserveMib, "size 0 through _beginthreadex gets the game image's reserve");
+    check_crt(64u << 10, CREATE_SUSPENDED, kReserveMib, "a small _beginthreadex commit keeps the image reserve");
+    check_crt((static_cast<unsigned>(kReserveMib) << 20) + 1u, 0, kReserveMib + 1,
+              "a larger _beginthreadex commit rounds up to 1 MiB");
+    check_crt(1u << 20, STACK_SIZE_PARAM_IS_A_RESERVATION, 1, "an explicit _beginthreadex reserve is left alone");
 
     std::printf("stack_shim: %s\n", g_failures ? "FAILED" : "OK");
     return g_failures ? 1 : 0;
