@@ -336,11 +336,12 @@ int main(int argc, char** argv) {
         EXPECT(context.layout(rt::d3d12::resource_id(ds_resource), 0) == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         EXPECT(context.layout(rt::d3d12::resource_id(ds_resource), 1) == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 
-        // A depth outside [0, 1] makes Close report the invalid call, as D3D12 does.
+        // Native D3D12 accepts out-of-range clear depths at Close (including 2.0). Replay
+        // preserves them with VK_EXT_depth_range_unrestricted, or clamps for Vulkan without it.
         EXPECT(SUCCEEDED(allocator->Reset()));
         EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
         list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 2.0f, 0, 0, nullptr);
-        EXPECT(list->Close() == E_INVALIDARG);
+        EXPECT(list->Close() == S_OK);
     }
 
     EXPECT(d.run([&](VkCommandBuffer cb) {
