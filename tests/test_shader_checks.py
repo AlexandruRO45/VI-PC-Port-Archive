@@ -79,6 +79,7 @@ class Wave64Checks(unittest.TestCase):
             if name == "cs_cvt16":
                 self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "64"))
                 Path(env["VKC_DUMP"]).write_bytes(struct.pack("<64I", *(check.CVT16_WORDS + [0xEEEEEEEE] * 40)))
+                return 0, ""
             if name in ("cs_fmt_xy_xyz", "cs_tbuffer_store"):
                 self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "192"))
                 Path(env["VKC_DUMP"]).write_bytes(GOOD_XY_XYZ if name == "cs_fmt_xy_xyz" else GOOD_TBUFFER_STORE)
