@@ -1255,6 +1255,9 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertTrue(is_instruction_supported("s_waitcnt vmcnt(63)"))
         self.assertTrue(is_instruction_supported("s_waitcnt vmcnt(0) lgkmcnt(0)"))
         self.assertTrue(is_instruction_supported("s_waitcnt lgkmcnt(0) vmcnt(0)"))
+        self.assertTrue(is_instruction_supported("v_nop"))
+        self.assertFalse(is_instruction_supported("v_nop 0"))
+        self.assertFalse(is_instruction_supported("v_nop v0"))
         self.assertTrue(is_instruction_supported("v_subrev_f32_e32 v1, v2, v3"))
         self.assertTrue(is_instruction_supported("v_subrev_f32_e64 v1, v2, v3 clamp"))
         self.assertTrue(is_opcode_recognized("v_mov_b32_sdwa"))
@@ -1335,6 +1338,60 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertTrue(res_full["translator_accepted"])
         hlsl = lower(full_shader, 20, 24, [1, 2, 3, 4])
         self.assertIn("return float4(", hlsl)
+
+    def test_gfx1013_v_nop_decode_and_lower(self):
+        """Assemble/decode GFX1013 v_nop binary bytes and lower with pixel_aot."""
+        from pixel_aot import lower
+        code_bytes = bytes.fromhex(
+            "0000007e"  # v_nop
+            "000080bf"  # s_nop 0
+            "000081bf"  # s_endpgm
+        )
+        decoded = disassemble_binary_shader(code_bytes)
+        self.assertEqual(decoded[0], "v_nop")
+        self.assertEqual(decoded[1], "s_nop 0")
+        self.assertEqual(decoded[2], "s_endpgm")
+
+        res = analyze_shader_instructions("v_nop_test", decoded)
+        self.assertTrue(res["opcodes_recognized"])
+        self.assertEqual(res["supported_instructions"], 3)
+        self.assertEqual(res["unsupported_count"], 0)
+        self.assertEqual(res["support_percentage"], 100.0)
+
+        full_shader = ["v_nop"] + [
+            "s_mov_b64 s[50:51], exec",
+            "s_wqm_b64 exec, exec",
+            "s_mov_b32 m0, s24",
+            "v_interp_p1_f32_e32 v8, v0, attr0.x",
+            "v_interp_p1_f32_e32 v9, v0, attr0.y",
+            "v_interp_p2_f32_e32 v9, v1, attr0.y",
+            "v_interp_p2_f32_e32 v8, v1, attr0.x",
+            "s_and_b64 exec, exec, s[50:51]",
+            "v_nop",
+            "s_mov_b32 s21, 0",
+            "s_load_dwordx8 s[28:35], s[20:21], null",
+            "s_mov_b32 s40, 1",
+            "s_mov_b32 s41, 2",
+            "s_mov_b32 s42, 3",
+            "s_mov_b32 s43, 4",
+            "s_waitcnt lgkmcnt(0)",
+            "image_sample v[12:15], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "s_waitcnt vmcnt(0)",
+            "v_cvt_pkrtz_f16_f32_e32 v16, v12, v13",
+            "v_cvt_pkrtz_f16_f32_e32 v17, v14, v15",
+            "exp mrt0 v16, v16, v17, v17 done compr vm",
+            "s_endpgm",
+        ]
+        res_full = analyze_shader_instructions("canonical_ps_with_v_nop", full_shader)
+        self.assertTrue(res_full["is_fully_supported"])
+        self.assertTrue(res_full["translator_accepted"])
+        hlsl = lower(full_shader, 20, 24, [1, 2, 3, 4])
+        self.assertIn("return float4(", hlsl)
+
+        # Negative control: v_nop after color export must be rejected
+        with_v_nop_after_exp = full_shader[:-1] + ["v_nop", "s_endpgm"]
+        with self.assertRaises(ValueError):
+            lower(with_v_nop_after_exp, 20, 24, [1, 2, 3, 4])
 
 
 if __name__ == "__main__":

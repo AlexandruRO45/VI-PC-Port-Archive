@@ -113,7 +113,7 @@ def _check_two_exits(code, llvm):
         pending.append(following[pc])
     # A direct branch may skip alignment NOPs. Keep them in the original span.
     unreachable = instructions.keys() - visited
-    if exits[0] + 4 not in targets or any(instructions[pc].split()[0] != "s_nop" for pc in unreachable):
+    if exits[0] + 4 not in targets or any(instructions[pc].split()[0] not in ("s_nop", "v_nop") for pc in unreachable):
         raise ValueError("Unreachable code or unverified alternate exit")
 
 
@@ -1248,6 +1248,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             continue
         if exported and line != "s_endpgm":
             raise ValueError("Unexpected instruction after color export")
+        if line == "v_nop":
+            if mask != "entry":
+                raise ValueError("Unexpected v_nop with non-entry mask")
+            continue
         # Scheduling hints with no effect on results. Each operand is limited to the width
         # of its RDNA 2 field: clause length minus one, wave priority and sleep duration.
         if m := match(r"(s_clause|s_setprio|s_sleep) (0x[0-9a-f]+|\d+)"):
