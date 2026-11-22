@@ -1288,5 +1288,95 @@ class TestDSMaxRtnF32StatusFlags(unittest.TestCase):
         self.assertEqual(len(pairs), 0)
 
 
+class TestDSMaxRtnF32IEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 float boundary extremes, subnormals, and NaN handling."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(65536)
+        self.state = ScalarThreadState(lds=self.lds)
+        self.interp = ScalarDSInterpreter(state=self.state)
+
+    def test_signed_zeros_ordering(self) -> None:
+        # In IEEE 754 maxNum, -0.0 < +0.0, so maximum of +0.0 and -0.0 is always +0.0
+        self.assertEqual(oracle_max_f32(POS_ZERO, NEG_ZERO), POS_ZERO)
+        self.assertEqual(oracle_max_f32(NEG_ZERO, POS_ZERO), POS_ZERO)
+        self.assertEqual(oracle_max_f32(POS_ZERO, POS_ZERO), POS_ZERO)
+        self.assertEqual(oracle_max_f32(NEG_ZERO, NEG_ZERO), NEG_ZERO)
+
+        # Test in memory
+        self.lds.write_by_byte_addr(0x10, NEG_ZERO)
+        old, new = ref_ds_max_rtn_f32(NEG_ZERO, POS_ZERO)
+        self.assertEqual(old, NEG_ZERO)
+        self.assertEqual(new, POS_ZERO)
+
+    def test_infinities_and_extreme_magnitudes(self) -> None:
+        # +infinity is strictly greater than FLT_MAX
+        self.assertEqual(oracle_max_f32(FLT_MAX, POS_INF), POS_INF)
+        self.assertEqual(oracle_max_f32(POS_INF, FLT_MAX), POS_INF)
+
+        # -infinity is strictly less than -FLT_MAX
+        self.assertEqual(oracle_max_f32(NEG_INF, NEG_FLT_MAX), NEG_FLT_MAX)
+        self.assertEqual(oracle_max_f32(NEG_FLT_MAX, NEG_INF), NEG_FLT_MAX)
+
+        # +infinity vs -infinity
+        self.assertEqual(oracle_max_f32(POS_INF, NEG_INF), POS_INF)
+        self.assertEqual(oracle_max_f32(NEG_INF, POS_INF), POS_INF)
+
+    def test_subnormals_and_no_flush_to_zero(self) -> None:
+        # Positive subnormals must not be flushed to zero
+        self.assertEqual(oracle_max_f32(POS_ZERO, SUBNORM_MIN), SUBNORM_MIN)
+        self.assertEqual(oracle_max_f32(SUBNORM_MIN, POS_ZERO), SUBNORM_MIN)
+        self.assertEqual(oracle_max_f32(NEG_ZERO, SUBNORM_MIN), SUBNORM_MIN)
+        self.assertEqual(oracle_max_f32(SUBNORM_MAX, SUBNORM_MIN), SUBNORM_MAX)
+
+        # Negative subnormals: -0.0 is greater than any negative subnormal
+        self.assertEqual(oracle_max_f32(NEG_ZERO, NEG_SUBNORM_MIN), NEG_ZERO)
+        self.assertEqual(oracle_max_f32(NEG_SUBNORM_MIN, NEG_ZERO), NEG_ZERO)
+        # Closer to zero is greater: -2^-149 (NEG_SUBNORM_MIN) > largest neg subnormal
+        self.assertEqual(oracle_max_f32(NEG_SUBNORM_MAX, NEG_SUBNORM_MIN), NEG_SUBNORM_MIN)
+
+    def test_nan_suppression_and_quieting(self) -> None:
+        # Number vs Quiet NaN
+        self.assertEqual(oracle_max_f32(ONE_F32, QNAN_PAYLOAD_A), ONE_F32)
+        self.assertEqual(oracle_max_f32(QNAN_PAYLOAD_A, ONE_F32), ONE_F32)
+
+        # Number vs Signaling NaN
+        self.assertEqual(oracle_max_f32(TWO_F32, SNAN_PAYLOAD_A), TWO_F32)
+        self.assertEqual(oracle_max_f32(SNAN_PAYLOAD_A, TWO_F32), TWO_F32)
+
+        # Negative float vs NaN: negative float is chosen over NaN
+        self.assertEqual(oracle_max_f32(NEG_TEN_F32, QNAN_PAYLOAD_B), NEG_TEN_F32)
+        self.assertEqual(oracle_max_f32(QNAN_PAYLOAD_B, NEG_TEN_F32), NEG_TEN_F32)
+
+        # Both NaNs: returns a quieted NaN
+        both_nan = oracle_max_f32(SNAN_PAYLOAD_A, SNAN_PAYLOAD_B)
+        self.assertTrue(is_qnan(both_nan))
+
+    def test_finite_boundary_extremes(self) -> None:
+        # FLT_MAX vs FLT_MIN
+        self.assertEqual(oracle_max_f32(FLT_MAX, FLT_MIN), FLT_MAX)
+        self.assertEqual(oracle_max_f32(FLT_MIN, FLT_MAX), FLT_MAX)
+
+        # NEG_FLT_MIN (-2^-126) vs NEG_FLT_MAX (-FLT_MAX): NEG_FLT_MIN is greater!
+        self.assertEqual(oracle_max_f32(NEG_FLT_MIN, NEG_FLT_MAX), NEG_FLT_MIN)
+        self.assertEqual(oracle_max_f32(NEG_FLT_MAX, NEG_FLT_MIN), NEG_FLT_MIN)
+
+    def test_address_boundary_extremes_and_wrapping(self) -> None:
+        # Last valid dword in 64 KiB LDS is index 16383 (byte 65532)
+        last_byte = 65532
+        self.lds.write_by_byte_addr(last_byte, ONE_F32)
+        self.assertEqual(self.lds.read_by_byte_addr(last_byte), ONE_F32)
+
+        # Byte 65536 wraps to byte 0
+        self.lds.write_by_byte_addr(0, TWO_F32)
+        self.assertEqual(self.lds.read_by_byte_addr(65536), TWO_F32)
+
+        # 32-bit address overflow with 16-bit offset
+        eff = calc_lds_effective_address(0xFFFFFFFF, 1)
+        self.assertEqual(eff, 0)
+        eff2 = calc_lds_effective_address(0xFFFFFFF0, 32)
+        self.assertEqual(eff2, 16)
+
+
 if __name__ == "__main__":
     unittest.main()
