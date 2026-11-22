@@ -2146,7 +2146,8 @@ if(TARGET Vulkan::Headers)
                                  LEONIDA_TEST_M5_MESH_DIR="${LEONIDA_M5_MESH_DIR}")
       target_compile_options(d3d12_m5_mesh_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_m5_mesh COMMAND d3d12_m5_mesh_test)
-      set_tests_properties(d3d12_m5_mesh PROPERTIES SKIP_RETURN_CODE 77)
+      add_test(NAME d3d12_m5_mesh_fallbacks COMMAND d3d12_m5_mesh_test --single-calls --no-count-buffers)
+      set_tests_properties(d3d12_m5_mesh d3d12_m5_mesh_fallbacks PROPERTIES SKIP_RETURN_CODE 77)
       # M4 (synthetic part): compute PSOs, a UAV table (structured and raw buffers, an R32_UINT storage image), an indirect
       # dispatch from arguments a first dispatch wrote, and a copy queue that streams the input in and reads the results
       # back across queue fences. cs_m4_fill.asm and cs_m4_indirect.asm go through the same build; build.py publishes

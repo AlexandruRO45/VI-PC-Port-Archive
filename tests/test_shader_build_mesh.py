@@ -54,6 +54,13 @@ class MeshContainerTest(unittest.TestCase):
         for name in ("ms_tri", "ms_v5_workgroup", "ms_clip"):  # run_gpu_tests.py makes their containers
             self.assertIsNone(self.build.asm_psv0(os.path.join(here, name + ".asm")))
 
+    def test_run_gpu_tests_reads_the_same_header(self):
+        # run_gpu_tests.py translates every .asm in the folder itself; without the header's PSV0 ms_m5 fails there.
+        here = os.path.dirname(BUILD)
+        for name in ("ms_m5", "ms_tri"):
+            path = os.path.join(here, name + ".asm")
+            self.assertEqual(self.gpu.asm_psv0(path), self.build.asm_psv0(path))
+
 
 if __name__ == "__main__":
     unittest.main()
