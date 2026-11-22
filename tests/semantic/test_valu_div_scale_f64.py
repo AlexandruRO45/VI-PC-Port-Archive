@@ -1689,5 +1689,138 @@ class TestDivScaleF64IEEE754Boundaries(unittest.TestCase):
         self.assertEqual(d_nan, F64_POS_ZERO)
 
 
+def mutant_omit_scale(u0: int, u1: int, u2: int, **kwargs) -> tuple[int, int]:
+    """Mutant 1: Omits scaling logic and returns unscaled s0."""
+    _, vcc = ref_div_scale_f64_u64(u0, u1, u2, **kwargs)
+    return u0, vcc
+
+
+def mutant_invert_scale_direction(u0: int, u1: int, u2: int, **kwargs) -> tuple[int, int]:
+    """Mutant 2: Scales down (2^-128) when it should scale up (2^128)."""
+    d, vcc = ref_div_scale_f64_u64(u0, u1, u2, **kwargs)
+    if vcc == 1 and ex_f64(u2) - ex_f64(u1) >= 768 and u0 == u1:
+        return scale_f64_bits(u0, -128), 1
+    return d, vcc
+
+
+def mutant_omit_vcc_flag(u0: int, u1: int, u2: int, **kwargs) -> tuple[int, int]:
+    """Mutant 3: Computes scaled result but fails to set VCC flag."""
+    d, _ = ref_div_scale_f64_u64(u0, u1, u2, **kwargs)
+    return d, 0
+
+
+def mutant_zero_not_nan(u0: int, u1: int, u2: int, **kwargs) -> tuple[int, int]:
+    """Mutant 4: Zero S1 or S2 returns S0 instead of 0xFFF8000000000000."""
+    if not (u1 & ~(1 << 63)) or not (u2 & ~(1 << 63)):
+        return u0, 1
+    return ref_div_scale_f64_u64(u0, u1, u2, **kwargs)
+
+
+def mutant_clamp_nan_to_nan(u0: int, u1: int, u2: int, *, clamp: bool = False, **kwargs) -> tuple[int, int]:
+    """Mutant 5: Clamps numbers but fails to map NaN to +0.0."""
+    res_u64, vcc = ref_div_scale_f64_u64(u0, u1, u2, clamp=False, **kwargs)
+    if clamp:
+        x = u64_to_f64(res_u64)
+        if math.isnan(x):
+            return res_u64, vcc
+        elif x < 0.0:
+            return F64_POS_ZERO, vcc
+        elif x > 1.0:
+            return F64_ONE, vcc
+    return res_u64, vcc
+
+
+class TestDivScaleF64NegativeControlsAndMutations(unittest.TestCase):
+    """Test suite for syntax rejection, negative controls, and mutation detection."""
+
+    def test_syntax_rejection_bad_opcodes(self):
+        for bad_op in ("v_div_scale_f32", "v_add_f64", "s_div_scale_f64", "foo_bar"):
+            with self.assertRaises(ValueError):
+                parse_div_scale_asm(f"{bad_op} v[0:1], vcc, v[2:3], v[2:3], v[4:5]")
+
+    def test_syntax_rejection_operand_count(self):
+        # Too few operands
+        with self.assertRaises(ValueError):
+            parse_div_scale_asm("v_div_scale_f64 v[0:1], vcc, v[2:3], v[4:5]")
+        # Too many operands
+        with self.assertRaises(ValueError):
+            parse_div_scale_asm("v_div_scale_f64 v[0:1], vcc, v[2:3], v[4:5], v[6:7], v[8:9]")
+
+    def test_syntax_rejection_destination_modifiers(self):
+        with self.assertRaises(ValueError):
+            parse_div_scale_asm("v_div_scale_f64 -v[0:1], vcc, v[2:3], v[4:5], v[6:7]")
+        with self.assertRaises(ValueError):
+            parse_div_scale_asm("v_div_scale_f64 |v[0:1]|, vcc, v[2:3], v[4:5], v[6:7]")
+
+    def test_syntax_rejection_destination_sgpr(self):
+        with self.assertRaises(TypeError):
+            parse_div_scale_asm("v_div_scale_f64 s[0:1], vcc, v[2:3], v[4:5], v[6:7]")
+
+    def test_syntax_rejection_non_consecutive_register_pair(self):
+        with self.assertRaises(ValueError):
+            parse_div_scale_asm("v_div_scale_f64 v[0:2], vcc, v[2:3], v[4:5], v[6:7]")
+        with self.assertRaises(ValueError):
+            parse_div_scale_asm("v_div_scale_f64 v[0:1], vcc, v[2:4], v[4:5], v[6:7]")
+
+    def test_syntax_rejection_register_out_of_bounds(self):
+        with self.assertRaises(ValueError):
+            parse_div_scale_asm("v_div_scale_f64 v[256:257], vcc, v[2:3], v[4:5], v[6:7]")
+
+    def test_mutation_detection_all_mutants_caught(self):
+        one5 = 0x3FF0000000000005
+        big = 0x71F0000000000000
+
+        # Mutant 1: omit scale
+        good_res, good_vcc = ref_div_scale_f64_u64(one5, one5, big)
+        bad_res1, bad_vcc1 = mutant_omit_scale(one5, one5, big)
+        self.assertNotEqual(good_res, bad_res1)
+        self.assertEqual(bad_res1, one5)
+
+        # Mutant 2: invert scale direction
+        bad_res2, _ = mutant_invert_scale_direction(one5, one5, big)
+        self.assertNotEqual(good_res, bad_res2)
+
+        # Mutant 3: omit VCC flag
+        _, bad_vcc3 = mutant_omit_vcc_flag(one5, one5, big)
+        self.assertEqual(good_vcc, 1)
+        self.assertEqual(bad_vcc3, 0)
+        self.assertNotEqual(good_vcc, bad_vcc3)
+
+        # Mutant 4: zero denominator does not return 0xFFF8000000000000
+        good_z, _ = ref_div_scale_f64_u64(one5, F64_POS_ZERO, one5)
+        bad_z, _ = mutant_zero_not_nan(one5, F64_POS_ZERO, one5)
+        self.assertEqual(good_z, 0xFFF8000000000000)
+        self.assertNotEqual(good_z, bad_z)
+
+        # Mutant 5: clamp NaN to NaN
+        good_clamp, _ = ref_div_scale_f64_u64(F64_CANONICAL_QNAN, F64_ONE, F64_ONE, clamp=True)
+        bad_clamp, _ = mutant_clamp_nan_to_nan(F64_CANONICAL_QNAN, F64_ONE, F64_ONE, clamp=True)
+        self.assertEqual(good_clamp, F64_POS_ZERO)
+        self.assertNotEqual(good_clamp, bad_clamp)
+
+    def test_mutation_detection_simd_exec_mask_leak(self):
+        wave = SIMDWaveState(wave_size=32)
+        wave.exec_mask = 0  # All lanes inactive
+        sentinel = 0xCAFEBABE12345678
+        for l in range(32):
+            wave.set_lane_vgpr_pair_u64(l, 0, sentinel)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F64,
+            dst=ASTOperand.vgpr(0),
+            sdst=ASTOperand.vcc(is_wave32=True),
+            src0=ASTOperand.vgpr(2),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(4),
+        )
+
+        interp = SIMDInterpreter(wave)
+        interp.step(inst)
+
+        # Inactive lanes must be strictly preserved
+        for l in range(32):
+            self.assertEqual(wave.get_lane_vgpr_pair_u64(l, 0), sentinel)
+
+
 if __name__ == "__main__":
     unittest.main()
