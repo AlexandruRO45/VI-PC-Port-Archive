@@ -80,6 +80,20 @@ def has_uv(path: str) -> bool:
         return any(line.startswith("vt ") for line in f)
 
 
+def _front(items: list[dict], models_dir: str, keep: int) -> list[dict]:
+    """The first `keep` items in rule order whose OBJ exists and has UVs. Each OBJ is opened at most once."""
+    out = []
+    for item in sorted(items, key=rank):
+        if "_usable" not in item:
+            path = os.path.join(models_dir, item["File"])
+            item["_usable"] = os.path.isfile(path) and has_uv(path)
+        if item["_usable"]:
+            out.append(item)
+            if len(out) == keep:
+                break
+    return out
+
+
 def pick(models_dir: str, limit: int = 1) -> list[dict]:
     """The best `limit` candidates (rule order) whose OBJ exists and has UVs."""
     best: list[dict] = []
@@ -87,15 +101,13 @@ def pick(models_dir: str, limit: int = 1) -> list[dict]:
         for item in stream_items(f):
             if qualifies(item):
                 best.append(item)
-                if len(best) > 4 * limit + 64:  # bounded memory: keep the front of the ranking
-                    best = sorted(best, key=rank)[: 2 * limit + 32]
-    found = []
-    for item in sorted(best, key=rank):
-        path = os.path.join(models_dir, item["File"])
-        if os.path.isfile(path) and has_uv(path):
-            found.append(item)
-            if len(found) == limit:
-                break
+                if len(best) > 4 * limit + 64:
+                    # Bounded memory. Only usable items are kept, so an item dropped here ranks below
+                    # 2 * limit + 32 usable ones and can't be among the best `limit`.
+                    best = _front(best, models_dir, 2 * limit + 32)
+    found = _front(best, models_dir, limit)
+    for item in found:
+        item.pop("_usable", None)
     return found
 
 

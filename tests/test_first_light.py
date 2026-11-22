@@ -391,6 +391,87 @@ class PropRuleTests(unittest.TestCase):
         passing = sorted((p for p in parsed if prop.qualifies(p)), key=prop.rank)
         self.assertEqual([p["File"] for p in passing], ["h.obj", "i.obj", "g.obj"])  # 900 and 1100 tie; name breaks it
 
+    @staticmethod
+    def box_obj(n=7, size=(2.0, 1.5, 1.0)):
+        """A hand-made prop: a box whose six faces are n x n grids with UVs. -> (OBJ text, vertices, triangles)"""
+        sx, sy, sz = (s / 2 for s in size)
+        faces = [  # origin and the two edge vectors of each face
+            ((-sx, -sy, -sz), (2 * sx, 0, 0), (0, 2 * sy, 0)), ((-sx, -sy, sz), (0, 2 * sy, 0), (2 * sx, 0, 0)),
+            ((-sx, -sy, -sz), (0, 0, 2 * sz), (2 * sx, 0, 0)), ((-sx, sy, -sz), (2 * sx, 0, 0), (0, 0, 2 * sz)),
+            ((-sx, -sy, -sz), (0, 2 * sy, 0), (0, 0, 2 * sz)), ((sx, -sy, -sz), (0, 0, 2 * sz), (0, 2 * sy, 0)),
+        ]
+        lines, base = [], 0
+        for o, a, b in faces:
+            for j in range(n + 1):
+                for i in range(n + 1):
+                    p = [o[k] + a[k] * i / n + b[k] * j / n for k in range(3)]
+                    lines.append("v %.6f %.6f %.6f" % tuple(p))
+                    lines.append("vt %.6f %.6f" % (i / n, j / n))
+            for j in range(n):
+                for i in range(n):
+                    q = [base + j * (n + 1) + i + 1, base + j * (n + 1) + i + 2,
+                         base + (j + 1) * (n + 1) + i + 2, base + (j + 1) * (n + 1) + i + 1]
+                    lines.append("f " + " ".join(f"{v}/{v}" for v in q))
+            base += (n + 1) ** 2
+        return "\n".join(lines) + "\n", 6 * (n + 1) ** 2, 12 * n * n
+
+    def write_folder(self, folder, entries):
+        """manifest.json plus OBJs: entries are (file, tris, OBJ text or None for a missing file)."""
+        items = []
+        for name, tris, text in entries:
+            items.append(self.item(name, tris=tris, hi=(2, 1.5, 1)))
+            if text is not None:
+                with open(os.path.join(folder, name), "w", encoding="utf-8", newline="\n") as f:
+                    f.write(text)
+        with open(os.path.join(folder, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
+            f.write('{\n  "Count": %d,\n  "Items": [\n' % len(items) + ",\n".join(items) + "\n  ]\n}\n")
+
+    def test_a_hand_made_prop_through_pick_the_cli_and_the_oracle(self):
+        import first_light_prop as prop
+        import tempfile
+
+        text, nverts, ntris = self.box_obj()
+        self.assertEqual(ntris, 588)
+        no_uv = "".join(line + "\n" for line in text.splitlines() if not line.startswith("vt "))
+        with tempfile.TemporaryDirectory() as folder:
+            # The two decoys rank above the box (closer to 1,000 triangles) but can't be drawn with UVs.
+            self.write_folder(folder, [("box.obj", ntris, text), ("flat.obj", 1000, no_uv), ("gone.obj", 990, None)])
+            self.assertTrue(prop.has_uv(os.path.join(folder, "box.obj")))
+            self.assertFalse(prop.has_uv(os.path.join(folder, "flat.obj")))
+            found = prop.pick(folder)
+            self.assertEqual([p["File"] for p in found], ["box.obj"])
+            self.assertNotIn("_usable", found[0])
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(prop.main([folder]), 0)
+            self.assertIn(f"\t500 vertices\t{ntris} triangles\tsha256 ", out.getvalue())
+            vertices, indices = fl.read_obj(os.path.join(folder, "box.obj"))
+        self.assertEqual((len(vertices), len(indices) // 3), (nverts, ntris))
+        world, viewproj = fl.camera_matrices(vertices, 128, 128, 30.0, 25.0, 50.0)
+        projected = fl.project(vertices, world, viewproj)
+        certain, possible = fl.coverage_masks(projected, indices, 128, 128)
+        self.assertGreater(sum(certain), 1000)
+        self.assertTrue(all(p or not c for c, p in zip(certain, possible)))
+        self.assertLess(sum(possible), 128 * 128)
+
+    def test_pick_finds_a_usable_prop_ranked_past_the_trimmed_front(self):
+        import first_light_prop as prop
+        import tempfile
+
+        text, _nverts, ntris = self.box_obj(n=7)
+        no_uv = "v 0 0 0\nv 1 0 0\nv 0 1 1\nf 1 2 3\n"
+        # 70 candidates, best first; only the last two have UVs. pick() trims to 2 * limit + 32 = 34 while it
+        # streams, so a trim that kept unusable items would lose both.
+        entries = [(f"p{i:02d}.obj", 1000 + i, no_uv if i % 3 else None) for i in range(68)]
+        entries += [("p68.obj", 1068, text), ("p69.obj", 1069, text)]
+        with tempfile.TemporaryDirectory() as folder:
+            self.write_folder(folder, entries)
+            self.assertEqual([p["File"] for p in prop.pick(folder)], ["p68.obj"])
+            self.assertEqual([p["File"] for p in prop.pick(folder, limit=2)], ["p68.obj", "p69.obj"])
+            os.remove(os.path.join(folder, "p68.obj"))
+            self.assertEqual([p["File"] for p in prop.pick(folder)], ["p69.obj"])
+        self.assertEqual(ntris, 588)
+
 
 def vs_on_cpu(sgprs: str, heap: str, layout: dict, x: float, y: float, z: float):
     """A matrix VS's arithmetic, reading its constants the way its scalar loads do: the table address from its SGPR,

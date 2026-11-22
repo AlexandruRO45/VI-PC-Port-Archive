@@ -63,8 +63,10 @@ python -I tools/first_light.py --check --out ~/leonida-work/first_light/out
 
 `--check` on an existing folder re-runs the harness through the same fresh path and `check_image` as the test; a
 harness that exits 0 without writing, an all-opaque image and a swapped-U/V image all exit 1. The test has
-27 cases: the three package-gated checks, four oracle fixtures, the CPU checks of `--camera` (section 6) and, from
-section 7, the layout derivation, the constant-colour oracle and the prop rule, all without a package.
+36 cases. Three are package-gated and skip without `LEONIDA_FIRST_LIGHT_DIR`. The other 33 need no package:
+the oracle fixtures, the CPU checks of `--camera` (section 6) and, from section 7, the layout derivation, the
+constant-colour oracle and the prop rule. The prop rule is checked end to end on a box built in the test (six 7 x 7
+grids with UVs, 588 triangles): manifest, `pick()`, the CLI line, `read_obj` and the coverage masks.
 
 `first_light.py` carves `shaders.rpf` if the work folder does not have it, translates only the chosen pair, converts
 the OBJ to the harness's mesh file (`u32 vertex_count, u32 index_count`, `(x,y,z,u,v) f32` vertices, `u32`
