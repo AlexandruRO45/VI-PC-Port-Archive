@@ -29,6 +29,9 @@ def check_denominators():
         reference = fc.load_reference(name)
         assert {group for group, _ in reference} == ENCODINGS, name
         assert ("SOPP", "s_endpgm") in reference and ("EXP", "exp") in reference
+        assert ("SOPK", "s_addk_i32") in reference and ("SOPK", "s_mulk_i32") in reference
+        assert fc.gfx_forms({"s_addk_i32", "s_mulk_i32"}, reference) == {
+            ("SOPK", "s_addk_i32"), ("SOPK", "s_mulk_i32")}
     gfx1013, rdna2 = fc.load_reference("gfx1013.tsv"), fc.load_reference("rdna2.tsv")
     assert ("SMEM", "s_atomic_add") in gfx1013 and ("SMEM", "s_atomic_add") not in rdna2
     # The LLVM syntax-doc parser: short headings, operand-less instructions, and the trailing index.
@@ -141,6 +144,39 @@ def check_jump_tables():
         assert mixed["blocked_by_skip"] == sorted(f"Integer {m}" for m in switch - fc.masm_mnemonics(BRANCH))
 
 
+def check_scalar_float():
+    """scalar_float.asm: the first SSE and SSE2 forms, counted only while cpu_aot_scalar_float passes."""
+    root = Path(fc.__file__).resolve().parents[1]
+    forms = fc.masm_mnemonics((root / "tests" / "cpu" / "scalar_float.asm").read_text(encoding="utf-8"))
+    reference = fc.load_reference("x64_zen2.tsv")
+    groups = {}
+    for group, form in fc.x64_forms(forms, reference):
+        groups.setdefault(group, set()).add(form)
+    assert not [form for form in forms if not fc.x64_forms({form}, reference)]
+    assert groups["SSE"] == {"movss", "movaps", "addss", "subss", "mulss", "divss", "cvtsi2ss", "cvttss2si",
+                             "ucomiss", "comiss", "xorps"}, sorted(groups["SSE"])
+    assert groups["SSE2"] == {"addsd", "subsd", "mulsd", "divsd", "cvtsi2sd", "cvttsd2si", "cvtss2sd", "cvtsd2ss",
+                              "ucomisd", "comisd", "xorpd"}, sorted(groups["SSE2"])
+    # The reference files a mnemonic under its oldest encoding, so these three sit outside both groups.
+    assert groups["MMX"] == {"movd", "movq", "pxor"} and "movsd" in groups["Integer"]
+    with tempfile.TemporaryDirectory() as tmp:
+        sample = sample_repo(tmp, {"scalar_float": "; coverage: source cpu_aot_scalar_float\nf PROC\n    xorps xmm0, xmm0\n    cvtsi2sd xmm0, ecx\n"
+                                                   "    ucomisd xmm0, xmm1\n    jp short l\nl:  ret\nf ENDP\nEND\n"})
+        passed = fc.measure({"cpu_aot_scalar_float": "pass"}, sample)["x64_zen2"]
+        skipped = fc.measure({"cpu_aot_scalar_float": "skip"}, sample)["x64_zen2"]
+        failed = fc.measure({"cpu_aot_jump_tables": "pass", "cpu_aot_scalar_float": "fail"}, sample)["x64_zen2"]
+        assert passed["covered"] == 5 and passed["groups"]["SSE"]["covered"] == 1
+        assert passed["groups"]["SSE2"]["covered"] == 2 and passed["groups"]["Integer"]["covered"] == 2
+        assert skipped["covered"] == 0 and skipped["blocked_by_skip"] == [
+            "Integer jp", "Integer ret", "SSE xorps", "SSE2 cvtsi2sd", "SSE2 ucomisd"]
+        assert failed["covered"] == 0 and failed["blocked_by_skip"] == []
+    # In the real repository the fixture is classified and counts with its own test only.
+    real = fc.measure({"cpu_aot_scalar_float": "pass"})
+    assert real["fixtures"]["scalar_float.asm"] == "pass" and "scalar_float.asm" not in real["unclassified"]
+    assert [real["x64_zen2"]["groups"][group]["covered"] for group in ("SSE", "SSE2")] == [11, 11]
+    assert fc.measure({"cpu_aot_jump_tables": "pass"})["x64_zen2"]["groups"]["SSE"]["covered"] == 0
+
+
 def check_unclassified():
     """A CPU fixture missing from CPU_FIXTURES is reported, never counted, never fatal. Shader text in a
     test file counts for nothing: only translation records do."""
@@ -218,6 +254,16 @@ def check_shader_records():
         pixel.check_controls(Path(tmp))
     assert {"s_nop", "s_clause", "s_setprio", "s_sleep", "image_sample"} <= pixel.ACCEPTED
     assert "s_branch" not in pixel.ACCEPTED and "s_code_end" not in pixel.ACCEPTED
+    # The trigonometry fixture covers both encodings of v_sin_f32 and v_cos_f32 once its test passes.
+    trig = {("VOP1", "v_sin_f32"), ("VOP1", "v_cos_f32"), ("VOP3", "v_sin_f32_e64"), ("VOP3", "v_cos_f32_e64")}
+    assert trig <= gfx and trig <= fc.gfx_forms(pixel.ACCEPTED, gfx)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = sample_repo(Path(tmp) / "repo", {})
+        words = {"v_sin_f32_e32", "v_sin_f32_e64", "v_cos_f32_e32", "v_cos_f32_e64"}
+        assert words <= pixel.ACCEPTED
+        covered = fc.measure({"pixel_aot_warp": "pass"}, root, {"pixel_aot_warp": set(pixel.ACCEPTED)})
+        without = fc.measure({"pixel_aot_warp": "pass"}, root, {"pixel_aot_warp": pixel.ACCEPTED - words})
+        assert covered["gfx1013"]["covered"] == without["gfx1013"]["covered"] + len(trig)
     # Every newly lowered 64-bit SOP1/SOP2 and 32-bit BFE form is counted in both gfx1013 and rdna2,
     # while rejected neighbors (exec save/restore, #257 ops, 64-bit BFE/cselect) stay out of covered.
     scalar64_forms = {
@@ -226,18 +272,86 @@ def check_shader_records():
         ("SOP2", "s_andn2_b64"), ("SOP2", "s_orn2_b64"),
         ("SOP2", "s_nand_b64"), ("SOP2", "s_nor_b64"), ("SOP2", "s_xnor_b64"),
         ("SOP2", "s_lshl_b64"), ("SOP2", "s_lshr_b64"), ("SOP2", "s_ashr_i64"),
-        ("SOP2", "s_bfm_b64"), ("SOP2", "s_bfe_u32"), ("SOP2", "s_bfe_i32"),
+        ("SOP2", "s_bfm_b32"), ("SOP2", "s_bfm_b64"), ("SOP2", "s_bfe_u32"), ("SOP2", "s_bfe_i32"),
+    }
+    sopc_forms = {
+        ("SOPC", "s_cmp_eq_i32"), ("SOPC", "s_cmp_lg_i32"),
+        ("SOPC", "s_cmp_gt_i32"), ("SOPC", "s_cmp_ge_i32"),
+        ("SOPC", "s_cmp_lt_i32"), ("SOPC", "s_cmp_le_i32"),
+        ("SOPC", "s_cmp_eq_u32"), ("SOPC", "s_cmp_lg_u32"),
+        ("SOPC", "s_cmp_gt_u32"), ("SOPC", "s_cmp_ge_u32"),
+        ("SOPC", "s_cmp_lt_u32"), ("SOPC", "s_cmp_le_u32"),
+        ("SOPC", "s_cmp_eq_u64"), ("SOPC", "s_cmp_lg_u64"),
+        ("SOPC", "s_bitcmp0_b32"), ("SOPC", "s_bitcmp1_b32"),
+        ("SOPC", "s_bitcmp0_b64"), ("SOPC", "s_bitcmp1_b64"),
+    }
+    vop2_forms = {
+        ("VOP2", "v_lshrrev_b32"), ("VOP2", "v_ashrrev_i32"), ("VOP2", "v_lshlrev_b32"),
+        ("VOP2", "v_and_b32"), ("VOP2", "v_or_b32"), ("VOP2", "v_xor_b32"),
+        ("VOP2", "v_add_nc_u32"), ("VOP2", "v_sub_nc_u32"), ("VOP2", "v_subrev_nc_u32"),
+    }
+    mul24_forms = {
+        ("VOP2", "v_mul_i32_i24"), ("VOP3", "v_mul_i32_i24_e64"),
+        ("VOP2", "v_mul_u32_u24"), ("VOP3", "v_mul_u32_u24_e64"),
+        ("VOP2", "v_mul_hi_i32_i24"), ("VOP3", "v_mul_hi_i32_i24_e64"),
+        ("VOP2", "v_mul_hi_u32_u24"), ("VOP3", "v_mul_hi_u32_u24_e64"),
+    }
+    sop2_lshl_add_forms = {
+        ("SOP2", "s_lshl1_add_u32"), ("SOP2", "s_lshl2_add_u32"),
+        ("SOP2", "s_lshl3_add_u32"), ("SOP2", "s_lshl4_add_u32"),
     }
     rejected_forms = {
         "s_and_saveexec_b64", "s_or_saveexec_b64", "s_andn2_saveexec_b64",
         "s_cselect_b64", "s_bfe_u64", "s_bfe_i64",
-        "s_cmp_eq_u64", "s_bitcmp1_b64", "s_bfm_b32",
-        "s_add_u32", "s_and_b32", "s_not_b32", "s_cmp_eq_i32", "s_cselect_b32",
+        "v_mul_i32_i24_sdwa",
+        "s_lshl0_add_u32", "s_lshl5_add_u32",
     }
     assert not (pixel.ACCEPTED & rejected_forms), pixel.ACCEPTED & rejected_forms
     for name in ("gfx1013.tsv", "rdna2.tsv"):
         covered = fc.gfx_forms(pixel.ACCEPTED, fc.load_reference(name))
         assert scalar64_forms <= covered, (name, scalar64_forms - covered)
+        assert sopc_forms <= covered, (name, sopc_forms - covered)
+        assert vop2_forms <= covered, (name, vop2_forms - covered)
+        assert mul24_forms <= covered, (name, mul24_forms - covered)
+        assert sop2_lshl_add_forms <= covered, (name, sop2_lshl_add_forms - covered)
+    # Integer comparisons: e32 counts as VOPC and e64 as VOP3, for every 16- and 32-bit predicate the
+    # translator lowers; the rejected exec-writing, 64-bit and f16 class neighbours stay out.
+    int_compares = {f"v_cmp_{op}_{kind}" for op in ("eq", "ne", "lt", "le", "gt", "ge")
+                    for kind in ("i16", "u16", "i32", "u32")}
+    int_compares |= {f"v_cmp_{op}_{kind}" for op in ("f", "t") for kind in ("i32", "u32")}
+    compare_forms = {("VOPC", form) for form in int_compares} | {("VOP3", f"{form}_e64") for form in int_compares}
+    assert len(compare_forms) == 56
+    compare_neighbours = {"v_cmpx_lt_i16", "v_cmpx_lt_i32", "v_cmp_lt_i64", "v_cmp_lt_u64",
+                          "v_cmp_class_f16", "v_cmp_lt_f16"}
+    for name in ("gfx1013.tsv", "rdna2.tsv"):
+        reference = fc.load_reference(name)
+        assert compare_forms | {("VOPC", n) for n in compare_neighbours} <= reference, name
+        covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+        assert compare_forms <= covered, (name, sorted(compare_forms - covered))
+        assert not {form for _, form in covered} & (compare_neighbours | {f"{n}_e64" for n in compare_neighbours})
+    # The scalar ALU fixture counts its SOP1, SOP2, SOPK and SOPC forms; the neighbours the controls
+    # reject (s_addc_u32, s_cmp_eq_u64, s_getreg_b32, s_cselect_b64) stay out.
+    scalar = {"s_movk_i32", "s_cmovk_i32", "s_not_b32", "s_add_u32", "s_sub_u32", "s_add_i32", "s_sub_i32",
+              "s_mul_i32", "s_min_u32", "s_max_u32", "s_min_i32", "s_max_i32", "s_and_b32", "s_or_b32",
+              "s_xor_b32", "s_andn2_b32", "s_orn2_b32", "s_lshl_b32", "s_lshr_b32", "s_ashr_i32",
+              "s_cselect_b32", *(f"s_cmp_{r}_{t}32" for r in ("eq", "lg", "gt", "ge", "lt", "le") for t in "iu"),
+              *(f"s_cmpk_{r}_{t}32" for r in ("eq", "lg", "gt", "ge", "lt", "le") for t in "iu")}
+    for name in ("gfx1013.tsv", "rdna2.tsv"):
+        forms = fc.gfx_forms(pixel.ACCEPTED, fc.load_reference(name))
+        assert {form for _, form in forms} >= scalar, sorted(scalar - {form for _, form in forms})
+        assert not {"s_addc_u32", "s_cmp_lt_u64", "s_getreg_b32", "s_cselect_b64"} & {f for _, f in forms}
+        assert {group for group, form in forms if form in scalar} == {"SOP1", "SOP2", "SOPC", "SOPK"}
+    # The rounding fixture covers both encodings of v_ceil_f32 and v_rndne_f32 once its test passes.
+    rounding = {("VOP1", "v_ceil_f32"), ("VOP1", "v_rndne_f32"),
+                ("VOP3", "v_ceil_f32_e64"), ("VOP3", "v_rndne_f32_e64")}
+    assert rounding <= gfx and rounding <= fc.gfx_forms(pixel.ACCEPTED, gfx)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = sample_repo(Path(tmp) / "repo", {})
+        words = {"v_ceil_f32_e32", "v_ceil_f32_e64", "v_rndne_f32_e32", "v_rndne_f32_e64"}
+        assert words <= pixel.ACCEPTED
+        covered = fc.measure({"pixel_aot_warp": "pass"}, root, {"pixel_aot_warp": set(pixel.ACCEPTED)})
+        without = fc.measure({"pixel_aot_warp": "pass"}, root, {"pixel_aot_warp": pixel.ACCEPTED - words})
+        assert covered["gfx1013"]["covered"] == without["gfx1013"]["covered"] + len(rounding)
 
 
 def check_parsing():
@@ -271,6 +385,20 @@ def check_parsing():
     assert full["x64_zen2"]["covered"] == full["gfx1013"]["covered"] == 0
     unmatched = full["x64_zen2"]["fixture_forms_not_in_reference"]
     assert {"delta", "local", "plane_request"}.isdisjoint(unmatched), unmatched
+
+
+def check_gaps():
+    reference = {("VOP1", "v_a"), ("VOP3", "v_a_e64"), ("VOP3", "v_b_e64"), ("VOP1", "v_c")}
+    fixtures = {"passing": ({"v_a_e32"}, "pass"),
+                "skipping": ({"v_a_e32", "v_a_e64"}, "skip"),
+                "failing": ({"v_a_e64", "v_b_e64"}, "fail")}
+    measured = fc.summarize(reference, fixtures, fc.gfx_forms, include_gaps=True)
+    assert measured.pop("gaps") == [
+        ("VOP1", "v_c", "unobserved"),
+        ("VOP3", "v_a_e64", "skipped"),
+        ("VOP3", "v_b_e64", "observed_without_pass"),
+    ]
+    assert measured == fc.summarize(reference, fixtures, fc.gfx_forms)
 
 
 def check_dashboard():
@@ -333,15 +461,178 @@ def check_cpu_records():
             report = fc.measure(results, root, {test: forms})
             assert report['x64_zen2']['covered'] == 0
             assert len(report['x64_zen2']['blocked_by_skip']) == (12 if state == 'skip' else 0)
+def check_avx2_regs():
+    """avx2_regs.asm covers all 28 AVX2 forms in docs/coverage/x64_zen2.tsv group AVX2."""
+    expected_avx2 = {
+        "vbroadcasti128", "vextracti128", "vinserti128", "vperm2i128",
+        "vpbroadcastb", "vpbroadcastw", "vpbroadcastd", "vpbroadcastq",
+        "vpermd", "vpermpd", "vpermps", "vpermq",
+        "vpblendd",
+        "vpsllvd", "vpsllvq", "vpsravd", "vpsrlvd", "vpsrlvq",
+        "vgatherdpd", "vgatherdps", "vgatherqpd", "vgatherqps",
+        "vpgatherdd", "vpgatherdq", "vpgatherqd", "vpgatherqq",
+        "vpmaskmovd", "vpmaskmovq",
+    }
+    reference = fc.load_reference("x64_zen2.tsv")
+    all_avx2 = {form for group, form in reference if group == "AVX2"}
+    assert expected_avx2 == all_avx2 and len(all_avx2) == 28
+
+    asm_text = (fc.ROOT / "tests" / "cpu" / "avx2_regs.asm").read_text(encoding="utf-8")
+    found = fc.masm_mnemonics(asm_text)
+    assert expected_avx2 <= found, expected_avx2 - found
+
+    passed = fc.measure({"cpu_aot_avx2_regs": "pass"})
+    assert passed["fixtures"]["avx2_regs.asm"] == "pass"
+    assert "avx2_regs.asm" not in passed["unclassified"]
+    avx2_group = passed["x64_zen2"]["groups"]["AVX2"]
+    assert avx2_group == {"covered": 28, "total": 28}, avx2_group
+    with tempfile.TemporaryDirectory() as tmp:
+        root = sample_repo(tmp, {"avx2_regs": asm_text})
+        only_pass = fc.measure({"cpu_aot_avx2_regs": "pass"}, root)["x64_zen2"]
+        only_skip = fc.measure({"cpu_aot_avx2_regs": "skip"}, root)["x64_zen2"]
+        only_fail = fc.measure({"cpu_aot_avx2_regs": "fail"}, root)["x64_zen2"]
+        assert only_pass["groups"]["AVX2"] == {"covered": 28, "total": 28}
+        assert only_pass["fixture_forms_not_in_reference"] == []
+        assert only_skip["groups"]["AVX2"] == {"covered": 0, "total": 28}
+        for form in expected_avx2:
+            assert f"AVX2 {form}" in only_skip["blocked_by_skip"]
+        assert only_fail["groups"]["AVX2"] == {"covered": 0, "total": 28}
+        assert only_fail["blocked_by_skip"] == []
+
+def check_avx_int_regs():
+    """avx_int_regs.asm covers 90 surviving AVX packed-integer forms in docs/coverage/x64_zen2.tsv group AVX."""
+    expected_avx_int = {
+        "vmpsadbw",
+        "vpabsb", "vpabsd", "vpabsw",
+        "vpackssdw", "vpacksswb", "vpackusdw",
+        "vpaddb", "vpaddq", "vpaddsb", "vpaddusb", "vpaddusw",
+        "vpalignr",
+        "vpblendvb", "vpblendw",
+        "vpcmpeqb", "vpcmpeqd", "vpcmpeqq", "vpcmpeqw",
+        "vpcmpgtb", "vpcmpgtd", "vpcmpgtq", "vpcmpgtw",
+        "vpextrb", "vpextrd", "vpextrq", "vpextrw",
+        "vphaddd", "vphaddsw", "vphaddw", "vphminposuw", "vphsubd", "vphsubsw", "vphsubw",
+        "vpinsrb", "vpinsrd", "vpinsrq", "vpinsrw",
+        "vpmaddwd",
+        "vpmaxsb", "vpmaxsd", "vpmaxub", "vpmaxud", "vpmaxuw",
+        "vpminsb", "vpminsd", "vpminub", "vpminud", "vpminuw",
+        "vpmovmskb",
+        "vpmovsxbd", "vpmovsxbq", "vpmovsxbw", "vpmovsxdq", "vpmovsxwd", "vpmovsxwq",
+        "vpmovzxbd", "vpmovzxbq", "vpmovzxbw", "vpmovzxdq", "vpmovzxwd", "vpmovzxwq",
+        "vpmuldq", "vpmulhrsw", "vpmulhuw", "vpmulld", "vpmuludq",
+        "vpsadbw",
+        "vpshufhw", "vpshuflw",
+        "vpsignb", "vpsignd", "vpsignw",
+        "vpslld", "vpsllq", "vpsrld", "vpsrlq",
+        "vpsubb", "vpsubd", "vpsubq", "vpsubsb", "vpsubsw", "vpsubusb", "vpsubusw",
+        "vpunpckhdq", "vpunpckhqdq", "vpunpckldq", "vpunpcklqdq",
+        "vzeroall", "vzeroupper",
+    }
+    carved_avx_int = {
+        "vpackuswb", "vpaddd", "vpaddw", "vpand", "vpor", "vpxor", "vpavgw",
+        "vpmaxsw", "vpminsw", "vpmulhw", "vpsllw", "vpsraw", "vpsrlw", "vpsubw",
+        "vpunpckhbw", "vpunpckhwd", "vpunpcklbw", "vpunpcklwd", "vpavgb",
+        "vpshufb", "vpmaddubsw", "vpaddsw", "vpmullw", "vpandn", "vpsrad",
+        "vpsrldq", "vpslldq", "vpshufd",
+    }
+    assert len(expected_avx_int) == 90 and len(carved_avx_int) == 28
+    assert expected_avx_int.isdisjoint(carved_avx_int)
+    reference = fc.load_reference("x64_zen2.tsv")
+    all_avx = {form for group, form in reference if group == "AVX"}
+    assert expected_avx_int <= all_avx, expected_avx_int - all_avx
+
+    asm_text = (fc.ROOT / "tests" / "cpu" / "avx_int_regs.asm").read_text(encoding="utf-8")
+    found = fc.masm_mnemonics(asm_text)
+    assert expected_avx_int <= found, expected_avx_int - found
+    assert carved_avx_int.isdisjoint(found), carved_avx_int & found
+    # avx_int_regs.asm covers the 90 surviving AVX packed-integer forms plus transport vmovdqu (91 AVX total).
+    expected_avx_total = expected_avx_int | {"vmovdqu"}
+    assert (found & all_avx) == expected_avx_total, (found & all_avx) ^ expected_avx_total
+
+    passed = fc.measure({"cpu_aot_avx_int_regs": "pass"})
+    assert passed["fixtures"]["avx_int_regs.asm"] == "pass"
+    assert "avx_int_regs.asm" not in passed["unclassified"]
+    assert passed["x64_zen2"]["groups"]["AVX"]["covered"] == len(expected_avx_total), passed["x64_zen2"]["groups"]["AVX"]
+    with tempfile.TemporaryDirectory() as tmp:
+        root = sample_repo(tmp, {"avx_int_regs": asm_text})
+        only_pass = fc.measure({"cpu_aot_avx_int_regs": "pass"}, root)["x64_zen2"]
+        only_skip = fc.measure({"cpu_aot_avx_int_regs": "skip"}, root)["x64_zen2"]
+        only_fail = fc.measure({"cpu_aot_avx_int_regs": "fail"}, root)["x64_zen2"]
+        assert only_pass["groups"]["AVX"]["covered"] == len(expected_avx_total)
+        assert only_pass["fixture_forms_not_in_reference"] == []
+        assert only_skip["groups"]["AVX"]["covered"] == 0
+        for form in expected_avx_int:
+            assert f"AVX {form}" in only_skip["blocked_by_skip"]
+        assert only_fail["groups"]["AVX"]["covered"] == 0
+        assert only_fail["blocked_by_skip"] == []
+
+
+def check_avx_move_regs():
+    """avx_move_regs.asm covers 50 surviving AVX move/shuffle/blend/logical forms in docs/coverage/x64_zen2.tsv group AVX."""
+    expected_avx_move = {
+        "vandnpd", "vandnps", "vandpd", "vandps",
+        "vblendpd", "vblendps", "vblendvpd", "vblendvps",
+        "vbroadcastf128", "vbroadcastsd", "vbroadcastss",
+        "vextractf128", "vextractps", "vinsertf128", "vinsertps",
+        "vlddqu", "vmaskmovpd", "vmaskmovps",
+        "vmovapd", "vmovddup",
+        "vmovhlps", "vmovhpd", "vmovhps", "vmovlhps", "vmovlpd", "vmovlps",
+        "vmovmskpd", "vmovmskps",
+        "vmovntdq", "vmovntdqa", "vmovntpd", "vmovntps",
+        "vmovsd", "vmovshdup", "vmovsldup", "vmovss", "vmovupd",
+        "vorpd", "vorps",
+        "vperm2f128", "vpermilpd", "vpermilps",
+        "vshufpd", "vshufps",
+        "vunpckhpd", "vunpckhps", "vunpcklpd", "vunpcklps",
+        "vxorpd", "vxorps",
+    }
+    carved_avx_move_rejected = {"vmovdqa", "vmovups", "vmovaps", "vmovq", "vmovd"}
+    assert len(expected_avx_move) == 50
+    assert expected_avx_move.isdisjoint(carved_avx_move_rejected | {"vmovdqu"})
+    reference = fc.load_reference("x64_zen2.tsv")
+    all_avx = {form for group, form in reference if group == "AVX"}
+    assert expected_avx_move <= all_avx, expected_avx_move - all_avx
+
+    asm_text = (fc.ROOT / "tests" / "cpu" / "avx_move_regs.asm").read_text(encoding="utf-8")
+    found = fc.masm_mnemonics(asm_text)
+    assert expected_avx_move <= found, expected_avx_move - found
+    assert carved_avx_move_rejected.isdisjoint(found), carved_avx_move_rejected & found
+    # 50 surviving AVX move/shuffle/blend/logical forms plus vmovdqu and vzeroupper ABI glue (52 AVX total).
+    expected_avx_total = expected_avx_move | {"vmovdqu", "vzeroupper"}
+    assert (found & all_avx) == expected_avx_total, (found & all_avx) ^ expected_avx_total
+
+    passed = fc.measure({"cpu_aot_avx_move_regs": "pass"})
+    assert passed["fixtures"]["avx_move_regs.asm"] == "pass"
+    assert "avx_move_regs.asm" not in passed["unclassified"]
+    avx_group = passed["x64_zen2"]["groups"]["AVX"]
+    assert avx_group["covered"] == len(expected_avx_total), avx_group
+    with tempfile.TemporaryDirectory() as tmp:
+        root = sample_repo(tmp, {"avx_move_regs": asm_text})
+        only_pass = fc.measure({"cpu_aot_avx_move_regs": "pass"}, root)["x64_zen2"]
+        only_skip = fc.measure({"cpu_aot_avx_move_regs": "skip"}, root)["x64_zen2"]
+        only_fail = fc.measure({"cpu_aot_avx_move_regs": "fail"}, root)["x64_zen2"]
+        assert only_pass["groups"]["AVX"]["covered"] == len(expected_avx_total)
+        assert only_pass["fixture_forms_not_in_reference"] == []
+        assert only_skip["groups"]["AVX"]["covered"] == 0
+        for form in expected_avx_move:
+            assert f"AVX {form}" in only_skip["blocked_by_skip"]
+        assert only_fail["groups"]["AVX"]["covered"] == 0
+        assert only_fail["blocked_by_skip"] == []
+
 
 if __name__ == "__main__":
     check_denominators()
     check_example()
     check_jump_tables()
+    check_scalar_float()
     check_unclassified()
     check_local_cpu_registration()
     check_cpu_records()
     check_shader_records()
     check_parsing()
+    check_gaps()
     check_dashboard()
+    check_avx2_regs()
+    check_avx_int_regs()
+    check_avx_move_regs()
     print("form coverage checks passed")
