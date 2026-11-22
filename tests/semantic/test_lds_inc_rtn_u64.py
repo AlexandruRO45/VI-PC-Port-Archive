@@ -416,5 +416,188 @@ class TestDsIncRtnU64AST(unittest.TestCase):
         self.assertEqual(lds.read_qword(addr), 11)
 
 
+# ==============================================================================
+# Phase 3: Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarRegisterFile:
+    """Scalar register file maintaining 256 VGPRs and 106 SGPRs."""
+
+    def __init__(self) -> None:
+        self.vgprs = [0] * DEFAULT_NUM_VGPRS
+        self.sgprs = [0] * DEFAULT_NUM_SGPRS
+
+    def read_vgpr(self, idx: int) -> int:
+        return self.vgprs[idx]
+
+    def write_vgpr(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = val & MASK_32
+
+    def read_vgpr_64(self, idx: int) -> int:
+        lo = self.vgprs[idx] & MASK_32
+        hi = self.vgprs[idx + 1] & MASK_32
+        return lo | (hi << 32)
+
+    def write_vgpr_64(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = val & MASK_32
+        self.vgprs[idx + 1] = (val >> 32) & MASK_32
+
+    def read_sgpr(self, idx: int) -> int:
+        return self.sgprs[idx]
+
+    def write_sgpr(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = val & MASK_32
+
+
+class ScalarLDS64Interpreter:
+    """Deterministic scalar interpreter executing 64-bit LDS atomic instructions."""
+
+    def __init__(self, lds: LDSModel64, rf: ScalarRegisterFile | None = None) -> None:
+        self.lds = lds
+        self.rf = rf if rf is not None else ScalarRegisterFile()
+
+    def step(self, inst: Ds64Instruction) -> Tuple[int, int]:
+        vaddr = self.rf.read_vgpr(inst.vaddr.index)
+        wrap_limit = self.rf.read_vgpr_64(inst.vdata0.index)
+
+        old_val, new_mem = self.lds.atomic_inc_rtn_u64(
+            vaddr=vaddr,
+            wrap_limit=wrap_limit,
+            offset=inst.offset,
+        )
+
+        if inst.opcode == Ds64Opcode.DS_INC_RTN_U64 and inst.vdst is not None:
+            self.rf.write_vgpr_64(inst.vdst.index, old_val)
+
+        return old_val, new_mem
+
+
+class TestDsIncRtnU64ScalarInterpreter(unittest.TestCase):
+    """Phase 3: Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.lds = LDSModel64(capacity_qwords=512)
+        self.rf = ScalarRegisterFile()
+        self.interp = ScalarLDS64Interpreter(self.lds, self.rf)
+
+    def test_scalar_step_normal_increment_u64(self) -> None:
+        addr = 0x100
+        self.lds.write_qword(addr, 0x1_0000_0000)
+        self.rf.write_vgpr(2, addr)
+        self.rf.write_vgpr_64(4, 0x2_0000_0000)
+
+        inst = Ds64Instruction(
+            opcode=Ds64Opcode.DS_INC_RTN_U64,
+            vdst=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            vdata0=Register(RegKind.VGPR, 4, count=2),
+            offset=0,
+        )
+
+        old, new_mem = self.interp.step(inst)
+        self.assertEqual(old, 0x1_0000_0000)
+        self.assertEqual(new_mem, 0x1_0000_0001)
+        self.assertEqual(self.rf.read_vgpr_64(0), 0x1_0000_0000)
+        self.assertEqual(self.lds.read_qword(addr), 0x1_0000_0001)
+
+    def test_scalar_step_wrap_equal_threshold_u64(self) -> None:
+        addr = 0x140
+        self.lds.write_qword(addr, 50)
+        self.rf.write_vgpr(2, addr)
+        self.rf.write_vgpr_64(4, 50)
+
+        inst = Ds64Instruction(
+            opcode=Ds64Opcode.DS_INC_RTN_U64,
+            vdst=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            vdata0=Register(RegKind.VGPR, 4, count=2),
+        )
+
+        old, new_mem = self.interp.step(inst)
+        self.assertEqual(old, 50)
+        self.assertEqual(new_mem, 0)
+        self.assertEqual(self.rf.read_vgpr_64(0), 50)
+        self.assertEqual(self.lds.read_qword(addr), 0)
+
+    def test_scalar_step_wrap_greater_threshold_u64(self) -> None:
+        addr = 0x180
+        self.lds.write_qword(addr, 100)
+        self.rf.write_vgpr(2, addr)
+        self.rf.write_vgpr_64(4, 50)
+
+        inst = Ds64Instruction(
+            opcode=Ds64Opcode.DS_INC_RTN_U64,
+            vdst=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            vdata0=Register(RegKind.VGPR, 4, count=2),
+        )
+
+        old, new_mem = self.interp.step(inst)
+        self.assertEqual(old, 100)
+        self.assertEqual(new_mem, 0)
+        self.assertEqual(self.rf.read_vgpr_64(0), 100)
+
+    def test_scalar_step_with_offset_u64(self) -> None:
+        base = 0x200
+        offset = 0x18  # 24 bytes = 3 qwords
+        target = base + offset
+
+        self.lds.write_qword(target, 42)
+        self.rf.write_vgpr(2, base)
+        self.rf.write_vgpr_64(4, 1000)
+
+        inst = Ds64Instruction(
+            opcode=Ds64Opcode.DS_INC_RTN_U64,
+            vdst=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            vdata0=Register(RegKind.VGPR, 4, count=2),
+            offset=offset,
+        )
+
+        old, new_mem = self.interp.step(inst)
+        self.assertEqual(old, 42)
+        self.assertEqual(new_mem, 43)
+        self.assertEqual(self.lds.read_qword(target), 43)
+
+    def test_scalar_step_non_returning_does_not_modify_vdst(self) -> None:
+        addr = 0x80
+        self.lds.write_qword(addr, 5)
+        self.rf.write_vgpr(2, addr)
+        self.rf.write_vgpr_64(4, 10)
+        # Pre-seed v[0:1]
+        self.rf.write_vgpr_64(0, 0xDEAD_BEEF_CAFE_BABE)
+
+        inst = Ds64Instruction(
+            opcode=Ds64Opcode.DS_INC_U64,
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            vdata0=Register(RegKind.VGPR, 4, count=2),
+        )
+
+        old, new_mem = self.interp.step(inst)
+        self.assertEqual(old, 5)
+        self.assertEqual(new_mem, 6)
+        self.assertEqual(self.lds.read_qword(addr), 6)
+        self.assertEqual(self.rf.read_vgpr_64(0), 0xDEAD_BEEF_CAFE_BABE)
+
+    def test_scalar_step_destination_writeback_both_dwords(self) -> None:
+        addr = 0xC0
+        val64 = 0x1234_5678_9ABC_DEF0
+        self.lds.write_qword(addr, val64)
+        self.rf.write_vgpr(2, addr)
+        self.rf.write_vgpr_64(4, MASK_64)
+
+        inst = Ds64Instruction(
+            opcode=Ds64Opcode.DS_INC_RTN_U64,
+            vdst=Register(RegKind.VGPR, 10, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            vdata0=Register(RegKind.VGPR, 4, count=2),
+        )
+
+        self.interp.step(inst)
+        self.assertEqual(self.rf.read_vgpr(10), 0x9ABC_DEF0)
+        self.assertEqual(self.rf.read_vgpr(11), 0x1234_5678)
+        self.assertEqual(self.rf.read_vgpr_64(10), val64)
+
+
 if __name__ == "__main__":
     unittest.main()
