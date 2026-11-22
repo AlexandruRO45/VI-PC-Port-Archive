@@ -902,5 +902,165 @@ class TestValuDot2F32F16IEEE754Boundaries(unittest.TestCase):
         self.assertEqual(res_nan_clamped, 0.0)
 
 
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestValuDot2F32F16NegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_dst_cannot_be_sgpr(self) -> None:
+        with self.assertRaises(TypeError):
+            VDot2F32F16Instruction(
+                dst=Operand.sgpr(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.vgpr(3),
+            )
+
+    def test_syntax_rejection_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106)
+        with self.assertRaises(ValueError):
+            Operand.vgpr(-1)
+
+    def test_syntax_rejection_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=128)
+
+    def test_syntax_rejection_lane_bounds(self) -> None:
+        wave = SIMDWaveState(wave_size=32)
+        with self.assertRaises(IndexError):
+            wave.is_lane_active(32)
+        with self.assertRaises(IndexError):
+            wave.is_lane_active(-1)
+
+    def test_negative_control_bit_flip_detection(self) -> None:
+        s0 = pack_f16x2(f16_to_bits(1.0), f16_to_bits(2.0))
+        s1 = pack_f16x2(f16_to_bits(3.0), f16_to_bits(4.0))
+        s2 = f32_to_bits(5.0)
+        correct = ref_dot2_f32_f16_bits(s0, s1, s2)
+        # Flip LSB
+        corrupted = correct ^ 1
+        self.assertNotEqual(correct, corrupted)
+        # Flip MSB (sign bit)
+        corrupted_sign = correct ^ 0x8000_0000
+        self.assertNotEqual(correct, corrupted_sign)
+
+    def test_mutation_detection_mul_tampered_to_add(self) -> None:
+        """Mutant computes (a+b) + (c+d) + acc instead of a*b + c*d + acc."""
+        def mutant_dot2(s0: int, s1: int, s2: int) -> float:
+            a0, a1 = unpack_f16x2(s0)
+            b0, b1 = unpack_f16x2(s1)
+            # Bug: addition instead of multiplication
+            return (f16_to_f32(a0) + f16_to_f32(b0)) + (f16_to_f32(a1) + f16_to_f32(b1)) + bits_to_f32(s2)
+
+        s0 = pack_f16x2(f16_to_bits(2.0), f16_to_bits(3.0))
+        s1 = pack_f16x2(f16_to_bits(4.0), f16_to_bits(5.0))
+        s2 = f32_to_bits(0.0)
+
+        correct = ref_dot2_f32_f16(s0, s1, s2)
+        mutant = mutant_dot2(s0, s1, s2)
+        # Correct: 2*4 + 3*5 = 8 + 15 = 23.0
+        # Mutant: (2+4) + (3+5) = 6 + 8 = 14.0
+        self.assertAlmostEqual(correct, 23.0, places=5)
+        self.assertAlmostEqual(mutant, 14.0, places=5)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_fadd_tampered_to_fsub(self) -> None:
+        """Mutant subtracts products instead of adding them: prod0 - prod1 + acc."""
+        def mutant_dot2(s0: int, s1: int, s2: int) -> float:
+            a0, a1 = unpack_f16x2(s0)
+            b0, b1 = unpack_f16x2(s1)
+            # Bug: subtraction
+            return (f16_to_f32(a0) * f16_to_f32(b0)) - (f16_to_f32(a1) * f16_to_f32(b1)) + bits_to_f32(s2)
+
+        s0 = pack_f16x2(f16_to_bits(3.0), f16_to_bits(2.0))
+        s1 = pack_f16x2(f16_to_bits(2.0), f16_to_bits(1.0))
+        s2 = f32_to_bits(0.0)
+
+        correct = ref_dot2_f32_f16(s0, s1, s2)
+        mutant = mutant_dot2(s0, s1, s2)
+        # Correct: 3*2 + 2*1 = 6 + 2 = 8.0
+        # Mutant: 3*2 - 2*1 = 6 - 2 = 4.0
+        self.assertAlmostEqual(correct, 8.0, places=5)
+        self.assertAlmostEqual(mutant, 4.0, places=5)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_omitted_accumulator(self) -> None:
+        """Mutant ignores accumulator src2."""
+        def mutant_dot2(s0: int, s1: int, s2: int) -> float:
+            # Bug: forgets s2
+            return ref_dot2_f32_f16(s0, s1, 0)
+
+        s0 = pack_f16x2(f16_to_bits(1.0), f16_to_bits(1.0))
+        s1 = pack_f16x2(f16_to_bits(1.0), f16_to_bits(1.0))
+        s2 = f32_to_bits(10.0)
+
+        correct = ref_dot2_f32_f16(s0, s1, s2)
+        mutant = mutant_dot2(s0, s1, s2)
+        # Correct: 1*1 + 1*1 + 10 = 12.0
+        # Mutant: 1*1 + 1*1 + 0 = 2.0
+        self.assertAlmostEqual(correct, 12.0, places=5)
+        self.assertAlmostEqual(mutant, 2.0, places=5)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_crossed_lanes(self) -> None:
+        """Mutant multiplies crossed lane pairs: (a0 * b1) + (a1 * b0) + c."""
+        def mutant_dot2(s0: int, s1: int, s2: int) -> float:
+            a0, a1 = unpack_f16x2(s0)
+            b0, b1 = unpack_f16x2(s1)
+            # Bug: crossed multiplication
+            return (f16_to_f32(a0) * f16_to_f32(b1)) + (f16_to_f32(a1) * f16_to_f32(b0)) + bits_to_f32(s2)
+
+        s0 = pack_f16x2(f16_to_bits(1.0), f16_to_bits(4.0))
+        s1 = pack_f16x2(f16_to_bits(2.0), f16_to_bits(3.0))
+        s2 = f32_to_bits(0.0)
+
+        correct = ref_dot2_f32_f16(s0, s1, s2)
+        mutant = mutant_dot2(s0, s1, s2)
+        # Correct: 1*2 + 4*3 = 2 + 12 = 14.0
+        # Mutant: 1*3 + 4*2 = 3 + 8 = 11.0
+        self.assertAlmostEqual(correct, 14.0, places=5)
+        self.assertAlmostEqual(mutant, 11.0, places=5)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_exec_mask_bypass(self) -> None:
+        """Mutant SIMD interpreter writes to inactive lanes ignoring EXEC mask."""
+        class BuggySIMDInterpreter(SIMDInterpreter):
+            def step(self, instr: VDot2F32F16Instruction, state: SIMDWaveState) -> List[Optional[int]]:
+                results: List[Optional[int]] = []
+                for lane in range(state.wave_size):
+                    # Bug: no is_lane_active check
+                    s0 = state.read_lane_operand_32(instr.src0, lane)
+                    s1 = state.read_lane_operand_32(instr.src1, lane)
+                    s2 = state.read_lane_operand_32(instr.src2, lane)
+                    res = ref_dot2_f32_f16_bits(s0, s1, s2, clamp=instr.clamp)
+                    state.write_lane_vgpr_32(instr.dst.index, lane, res)
+                    results.append(res)
+                return results
+
+        sentinel = 0x55AA_55AA
+        state = SIMDWaveState(wave_size=32, exec_mask=0x0000_0000)
+        for lane in range(32):
+            state.write_lane_vgpr_32(0, lane, sentinel)
+
+        buggy = BuggySIMDInterpreter()
+        instr = VDot2F32F16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.literal(0),
+            src1=Operand.literal(0),
+            src2=Operand.literal(0),
+        )
+        buggy.step(instr, state)
+
+        corrupted = [lane for lane in range(32) if state.vgprs[lane][0] != sentinel]
+        self.assertEqual(len(corrupted), 32)
+
+
 if __name__ == "__main__":
     unittest.main()
