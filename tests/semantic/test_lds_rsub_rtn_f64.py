@@ -430,5 +430,144 @@ class TestSymbolicASTAndTypedExpressions(unittest.TestCase):
             )
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarLDSInterpreter64:
+    """Deterministic scalar architectural interpreter for 64-bit LDS instructions."""
+
+    def __init__(self, lds_size_qwords: int = LDS_SIZE_QWORDS) -> None:
+        self.vgprs: List[int] = [0] * DEFAULT_NUM_VGPRS
+        self.sgprs: List[int] = [0] * DEFAULT_NUM_SGPRS
+        self.mem: LDSMemory64 = LDSMemory64(size_qwords=lds_size_qwords)
+
+    def read_reg_u32(self, op: RegisterOperand) -> int:
+        if op.reg_type == RegType.VGPR:
+            return self.vgprs[op.index]
+        return self.sgprs[op.index]
+
+    def read_reg_u64(self, op: RegisterOperand) -> int:
+        idx = op.index
+        if op.reg_type == RegType.VGPR:
+            lo = self.vgprs[idx]
+            hi = self.vgprs[idx + 1]
+            return u64((hi << 32) | lo)
+        lo = self.sgprs[idx]
+        hi = self.sgprs[idx + 1]
+        return u64((hi << 32) | lo)
+
+    def write_reg_u32(self, op: RegisterOperand, val: int) -> None:
+        val32 = u32(val)
+        if op.reg_type == RegType.VGPR:
+            self.vgprs[op.index] = val32
+        else:
+            self.sgprs[op.index] = val32
+
+    def write_reg_u64(self, op: RegisterOperand, val: int) -> None:
+        val64 = u64(val)
+        lo = val64 & MASK32
+        hi = (val64 >> 32) & MASK32
+        idx = op.index
+        if op.reg_type == RegType.VGPR:
+            self.vgprs[idx] = lo
+            self.vgprs[idx + 1] = hi
+        else:
+            self.sgprs[idx] = lo
+            self.sgprs[idx + 1] = hi
+
+    def step(self, instr: DSRsubRtnF64Instruction) -> Tuple[int, int]:
+        """Execute a single ds_rsub_rtn_f64 instruction deterministically."""
+        vaddr_val = self.read_reg_u32(instr.vaddr)
+        vdata0_val = self.read_reg_u64(instr.vdata0)
+        old_val, new_val = self.mem.atomic_rsub_rtn_f64(
+            vaddr=vaddr_val,
+            vdata0=vdata0_val,
+            offset=instr.offset,
+        )
+        self.write_reg_u64(instr.vdst, old_val)
+        return old_val, new_val
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarLDSInterpreter64(lds_size_qwords=1024)
+
+    def test_scalar_rsub_step_execution(self) -> None:
+        # Pre-seed memory qword index 5 (byte address 40) with 2.0
+        self.interp.mem.write_qword(5, TWO_F64)
+        # v2 (vaddr) = 40
+        self.interp.write_reg_u32(RegisterOperand(2, count=1), 40)
+        # v[4:5] (vdata0) = 5.0
+        self.interp.write_reg_u64(RegisterOperand(4, count=2), FIVE_F64)
+
+        instr = DSRsubRtnF64Instruction(
+            vdst=RegisterOperand(0, count=2),
+            vaddr=RegisterOperand(2, count=1),
+            vdata0=RegisterOperand(4, count=2),
+            offset=0,
+        )
+        old_val, new_val = self.interp.step(instr)
+
+        # Pre-op memory value was 2.0 -> returned into v[0:1]
+        self.assertEqual(old_val, TWO_F64)
+        self.assertEqual(self.interp.read_reg_u64(RegisterOperand(0, count=2)), TWO_F64)
+        # Post-op memory value is 5.0 - 2.0 = 3.0
+        self.assertEqual(new_val, THREE_F64)
+        self.assertEqual(self.interp.mem.read_qword(5), THREE_F64)
+
+    def test_scalar_multi_step_sequence(self) -> None:
+        # Pre-seed memory index 10 (byte address 80) with 1.0
+        self.interp.mem.write_qword(10, ONE_F64)
+        self.interp.write_reg_u32(RegisterOperand(10, count=1), 80)
+
+        # Step 1: vdata0 = 4.0 -> new = 4.0 - 1.0 = 3.0
+        four_f64 = f64_to_u64(4.0)
+        self.interp.write_reg_u64(RegisterOperand(12, count=2), four_f64)
+        instr1 = DSRsubRtnF64Instruction(
+            vdst=RegisterOperand(8, count=2),
+            vaddr=RegisterOperand(10, count=1),
+            vdata0=RegisterOperand(12, count=2),
+        )
+        old1, new1 = self.interp.step(instr1)
+        self.assertEqual(old1, ONE_F64)
+        self.assertEqual(self.interp.read_reg_u64(RegisterOperand(8, count=2)), ONE_F64)
+        self.assertEqual(new1, THREE_F64)
+        self.assertEqual(self.interp.mem.read_qword(10), THREE_F64)
+
+        # Step 2: vdata0 = 10.0 -> new = 10.0 - 3.0 = 7.0
+        self.interp.write_reg_u64(RegisterOperand(12, count=2), TEN_F64)
+        instr2 = DSRsubRtnF64Instruction(
+            vdst=RegisterOperand(8, count=2),
+            vaddr=RegisterOperand(10, count=1),
+            vdata0=RegisterOperand(12, count=2),
+        )
+        old2, new2 = self.interp.step(instr2)
+        self.assertEqual(old2, THREE_F64)
+        self.assertEqual(self.interp.read_reg_u64(RegisterOperand(8, count=2)), THREE_F64)
+        self.assertAlmostEqual(u64_to_f64(new2), 7.0, places=9)
+        self.assertAlmostEqual(u64_to_f64(self.interp.mem.read_qword(10)), 7.0, places=9)
+
+    def test_scalar_immediate_offset(self) -> None:
+        # vaddr = 0x100, offset = 16 -> effective = 0x110 -> qword index = 0x110 >> 3 = 0x22
+        self.interp.mem.write_qword(0x22, TWO_F64)
+        self.interp.write_reg_u32(RegisterOperand(6, count=1), 0x100)
+        self.interp.write_reg_u64(RegisterOperand(8, count=2), TEN_F64)
+
+        instr = DSRsubRtnF64Instruction(
+            vdst=RegisterOperand(4, count=2),
+            vaddr=RegisterOperand(6, count=1),
+            vdata0=RegisterOperand(8, count=2),
+            offset=16,
+        )
+        old_val, new_val = self.interp.step(instr)
+        self.assertEqual(old_val, TWO_F64)
+        self.assertEqual(self.interp.read_reg_u64(RegisterOperand(4, count=2)), TWO_F64)
+        self.assertAlmostEqual(u64_to_f64(new_val), 8.0, places=9)
+        self.assertAlmostEqual(u64_to_f64(self.interp.mem.read_qword(0x22)), 8.0, places=9)
+
+
 if __name__ == "__main__":
     unittest.main()
