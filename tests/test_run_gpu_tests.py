@@ -319,11 +319,25 @@ class DumpWaveWidth(unittest.TestCase):
         import check
         return [n for n, _ in (*check.CS_DUMPS, *check.W64X_DUMPS, *check.W64X_PARTIAL)]
 
+    # check.py's WAVE32_DUMPS, pinned: a fixture's wave size is not in its name or file (cs_store, cs_dpp, ...), so an
+    # entry dropped or misspelt there would quietly run that fixture as wave64. A new wave32 dump is added to both.
+    WAVE32 = {"cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2",
+              "cs_w32_permute", "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop", "cs_w32_lds_u8_d16",
+              "cs_bpermute32", "cs_w32_lds_subdword", "cs_w32_lds_wide", "cs_w32_partial_scmp", "cs_exec_const",
+              "cs_w32_mask_imm", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos",
+              "cs_lds_b64_cmpst", "cs_w32_andn2_exec", "cs_mask_vgpr_exec", "cs_dpp", "cs_dpp_row", "cs_dpp_mask",
+              "cs_dpp8", "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi"}
+
     def dump_commands(self, emulate):
         """run_suite over every cs_ fixture, with only check.py's dump fixtures translated: the vk_compute_test dump
-        command line of each."""
+        command line of each. Device-independent: LEONIDA_F16_INTERP_FALLBACK is set, so the runner does not ask
+        tools/vk_subgroup_info.py (a Vulkan instance) about the device, and any subprocess fails the test."""
         names = set(self.check_dumps())
         commands = {}
+
+        def no_subprocess(cmd, *_args, **_kw):
+            raise AssertionError(f"subprocess started: {cmd}")
+
         with tempfile.TemporaryDirectory() as tmp:
             def fake_run(cmd, env=None, gpu=True):
                 if not gpu:   # the translator: a .spv for each dump fixture, none for the rest
@@ -335,8 +349,11 @@ class DumpWaveWidth(unittest.TestCase):
                 return 1, ""
 
             args = SimpleNamespace(filter="cs_", build=tmp, llvm_mc="unused")
-            env = {"LEONIDA_W64_EMULATE": "1"} if emulate else {}
+            env = {"LEONIDA_F16_INTERP_FALLBACK": "0", **({"LEONIDA_W64_EMULATE": "1"} if emulate else {})}
             with (patch.dict(rgt.os.environ, env, clear=False),
+                  patch.object(rgt, "_PER_VERTEX", []),   # no cached answer: an unset variable would ask the device
+                  patch.object(rgt.subprocess, "run", side_effect=no_subprocess),
+                  patch.object(rgt.subprocess, "Popen", side_effect=no_subprocess),
                   patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
                   patch.object(rgt, "spirv_as"),
                   patch.object(rgt, "run_cmd", side_effect=fake_run),
@@ -349,6 +366,21 @@ class DumpWaveWidth(unittest.TestCase):
     def test_runner_reads_check_py_list(self):
         import check
         self.assertIs(rgt.WAVE32_DUMPS, check.WAVE32_DUMPS)
+
+    def test_wave32_list_is_pinned(self):
+        import check
+        self.assertEqual(len(check.WAVE32_DUMPS), len(set(check.WAVE32_DUMPS)), "duplicate in WAVE32_DUMPS")
+        self.assertEqual(set(check.WAVE32_DUMPS), self.WAVE32,
+                         "check.py WAVE32_DUMPS changed: update DumpWaveWidth.WAVE32 if that is intended")
+
+    def test_wave32_entries_are_dump_fixtures(self):
+        # a misspelt entry names no fixture: every one is a CS_DUMPS name with its .asm in runtime/test/shaders
+        import check
+        cs_dumps = {n for n, _ in check.CS_DUMPS}
+        for name in check.WAVE32_DUMPS:
+            with self.subTest(name=name):
+                self.assertIn(name, cs_dumps)
+                self.assertTrue(os.path.isfile(os.path.join(rgt.SHADER_DIR, name + ".asm")))
 
     def test_require_wave64_exactly_for_the_wave64_dumps(self):
         import check
