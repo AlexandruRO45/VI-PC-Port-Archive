@@ -4,7 +4,7 @@ Xbox2Windows researches static recompilation from Xbox Series X|S (Scarlett) to 
 
 **Startup status.** Source-built Windows programs run from entry to process exit. The main executable was absent from the inspected package. Execution of the title's CPU code, full-game startup and frame rate remain unverified.
 
-[Build on Windows](#first-build) · [Run the standalone GPU check](#run-the-gpu-check) · [Choose an experiment](#choose-an-experiment) · [Contribute or review a PR](CONTRIBUTING.md)
+[Results](#current-results-and-open-work) · [Coverage chart](#instruction-coverage) · [Community and contributions](#community-and-contributions) · [Build on Windows](#first-build) · [Choose an experiment](#choose-an-experiment) · [Run the GPU check](#run-the-gpu-check)
 
 ## Current results and open work
 
@@ -16,20 +16,24 @@ Xbox2Windows researches static recompilation from Xbox Series X|S (Scarlett) to 
 | **Mesh shaders** | A specialized entry fetched indexed vertices from a GPU buffer. Two position sets covered 1,024 and 276 pixels on a 32×32 target, matching the CPU reference on hardware and WARP. [Mesh draw and specialization limits](docs/experiments.md#single-group-mesh-entry-specialization) |
 | **Windows runtime** | Bink frame-buffer allocations reach the Windows heap through the shared provider. The FidelityFX experiment follows scratch writes from two passes through the RCAS output on an 8×4 tile. [Allocation, failure and retry](docs/experiments.md#frame-buffers-through-the-shared-windows-heap) · [Upscaler pixel comparison](docs/experiments.md#last-writers-of-the-pass-26-scratch-reads) |
 
-For current work, check [open issues](https://github.com/R0Y00/Xbox2Windows/issues) and [PRs already in progress](https://github.com/R0Y00/Xbox2Windows/pulls) before claiming a task. To help without a build environment, claim a batch of hardware reports in [issue #1](https://github.com/R0Y00/Xbox2Windows/issues/1), check the original logs and submit the corresponding table updates.
-
 ### Instruction coverage
 
-The dashboard counts instruction forms exercised by passing source-built fixtures. Package shader records and end-to-end program results use different units. For the latest measurement, open the newest [successful Windows CI run on main](https://github.com/R0Y00/Xbox2Windows/actions/workflows/windows.yml?query=branch%3Amain+event%3Apush+is%3Asuccess) and download the `coverage-dashboard` artifact.
-
-<details>
-<summary>View the saved chart from commit a46dac3</summary>
+The chart counts instruction forms exercised by passing source-built fixtures. The experiments above measure program outputs and package shader records.
 
 ![Instruction forms exercised by the Windows fixtures at a46dac3](docs/coverage/dashboard.svg)
 
-[CI run that produced this snapshot](https://github.com/R0Y00/Xbox2Windows/actions/runs/45002764202) · [Find forms without a passing fixture](CONTRIBUTING.md#share-a-reproducible-finding)
+[Snapshot at `a46dac3`](https://github.com/R0Y00/Xbox2Windows/actions/runs/45002764202) · [Latest successful Windows runs on main](https://github.com/R0Y00/Xbox2Windows/actions/workflows/windows.yml?query=branch%3Amain+event%3Apush+is%3Asuccess) · [Find forms without a passing fixture](CONTRIBUTING.md#share-a-reproducible-finding)
 
-</details>
+To see a newer measurement, download `coverage-dashboard` from the run's **Artifacts** section.
+
+## Community and contributions
+
+- **Claim a task.** Search for the behavior or test name in [open issues](https://github.com/R0Y00/Xbox2Windows/issues) and [open PRs](https://github.com/R0Y00/Xbox2Windows/pulls). On the issue, say what you will test, on which platform, and which shared interface or other PR your work depends on. For a first patch, start with [good first issues](https://github.com/R0Y00/Xbox2Windows/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22).
+- **Submit a change.** Keep the PR focused on one behavior. Link the task it advances and any prerequisite PR. Include the exact command, expected and observed results, and a negative control for a new fixture. [Patch and evidence guide](CONTRIBUTING.md#submit-and-review-a-patch)
+- **Review a PR.** For CPU translation or PE loading, reproduce the comparison with the original fixture. For shaders or GPU compatibility, check the DXIL and relevant WARP or hardware results. Both reviewers cover shared CPU/GPU interfaces. Record your verdict and the commit you tested. The Maintainer merges after review threads are resolved and the required Windows check passes. [Review responsibilities](CONTRIBUTING.md#who-reviews-and-merges-a-pr)
+- **Contribute a hardware result.** Run the [standalone GPU check](#run-the-gpu-check) and post the report in [issue #1](https://github.com/R0Y00/Xbox2Windows/issues/1). You can also claim a batch there without owning a GPU. Verify the original logs, add new adapters as rows in the [hardware table](#hardware-coverage), and link driver retests in the existing row.
+
+[New contributor guide](https://github.com/R0Y00/Xbox2Windows/discussions/75) · [Build and debugging Q&A](https://github.com/R0Y00/Xbox2Windows/discussions/categories/development-q-a) · [Report a bug or propose research](https://github.com/R0Y00/Xbox2Windows/issues/new/choose) · [Community conduct](CODE_OF_CONDUCT.md) · [Private security reports](SECURITY.md)
 
 ## First build
 
@@ -50,16 +54,42 @@ To build and test at /O2 as Windows CI also does, use the `release` preset in pl
 
 Contributing from macOS or Linux? See the [non-Windows host guide](docs/non-windows-hosts.md) for the platform-independent Python and LLVM 15 checks.
 
-<details>
-<summary>DXC versions, Windows 10 setup and independent build reports</summary>
+### Windows build notes
 
-`shader_metadata_probe` also needs a DXC validator that accepts module-only validation. The DXC 1.7.2308 shipped with the original Windows SDK 10.0.26100 refuses it with `call_hr 0x80070057`, as do releases 1.8.2403 through 1.8.2407, and the test then reports a skip. A serviced SDK can include a newer validator: Windows SDK 10.0.26100.8249 installs DXC 1.8.2502.11, which passes without a separate download. [DXC 1.8.2502](https://github.com/microsoft/DirectXShaderCompiler/releases/tag/v1.8.2502) is the first release that passes, and the later 1.8 and 1.9 releases through 1.9.2609 pass too. To use a release, extract its zip and configure with `cmake --preset dev -DDXC_EXECUTABLE=C:/path/to/dxc/bin/x64/dxc.exe`. `root_probe` loads `dxil.dll` from the same directory. [Report](https://github.com/R0Y00/Xbox2Windows/issues/98) · [Results by release](docs/experiments.md#module-only-validation-by-dxc-release)
+- **DXC validation.** `shader_metadata_probe` skips when the validator lacks module-only validation. DXC 1.8.2502 is the first verified release that passes. To use a separate DXC installation, configure with `cmake --preset dev -DDXC_EXECUTABLE=C:/path/to/dxc/bin/x64/dxc.exe`. [Results by release](docs/experiments.md#module-only-validation-by-dxc-release) · [Original report](https://github.com/R0Y00/Xbox2Windows/issues/98) · [DXC download](https://github.com/microsoft/DirectXShaderCompiler/releases/tag/v1.8.2502)
+- **Windows 10.** The in-box WARP runtime lacks the features used by the BVH and DXR checks. Use the app-local Agility SDK and WARP packages to run those checks. [Windows 10 setup](docs/experiments.md#windows-10-with-the-app-local-agility-sdk-and-warp)
+- **Independent build.** A Windows 11 contributor reproduced the three smoke tests from a clean checkout at `71bb9f4` and again after an incremental rebuild at `2465837`. [Toolchain, full-suite results and capability skips](https://github.com/R0Y00/Xbox2Windows/issues/2#issuecomment-7063351821)
 
-On Windows 10 the in-box D3D12 runtime and WARP lack SM 6.5 and DXR, so the BVH and DXR WARP checks skip. To run them, configure with the app-local Agility SDK and WARP packages. [Windows 10 setup](docs/experiments.md#windows-10-with-the-app-local-agility-sdk-and-warp)
+## Choose an experiment
 
-An independent contributor passed all three smoke tests from a clean checkout of `71bb9f4` on Windows 11 build 26300.9974 with VS Build Tools 2022 17.14 and Windows SDK 10.0.26100. The tests passed again after an incremental rebuild at `2465837`. With Python 3.14.10, the full suite had 66 and 68 tests respectively, with zero failures in either run. Each run skipped forced wave64 on the RTX 5080 and WARP because their reported lane ranges excluded 64. [Original clean-build report](https://github.com/R0Y00/Xbox2Windows/issues/2#issuecomment-7063351821)
+After the full [Windows build](#first-build), run one comparison from the repository root.
 
-</details>
+| Experiment | Focused test |
+|---|---|
+| Native, mapped and recompiled archive reader | `ctest --preset dev --no-tests=error -R '^cpu_native_archive_blast$' -V` |
+| Indexed mesh draw on WARP | `ctest --preset dev --no-tests=error -R '^mesh_indexed_draw_warp$' -V` |
+| Compute shader buffer writes on WARP | `ctest --preset dev --no-tests=error -R '^compute_store_aot_warp$' -V` |
+
+### Tests by area
+
+| Area | A contribution you can verify | Focused CTest command |
+|---|---|---|
+| Static CPU recompilation | Compare leaf, chained-range and cross-function translations with their source-built originals and negative controls, including [Bink frame plane requests](docs/experiments.md#frame-plane-requests-in-binkallocateframebuffers) and the [Bink group descriptor builders](docs/experiments.md#grouped-allocation-descriptor-builders). | `ctest --preset dev --no-tests=error -R '^cpu_' -V` |
+| Script states | Reproduce a parent/child lookup, an ambiguous selection or a damaged sibling link with a synthetic tree. | `ctest --preset dev --no-tests=error -R '^script_(state_literals\|path_links)$' -V` |
+| Resource metadata | Check a [relocated resource root](docs/experiments.md#relocated-resource-root) against its block directory and type schema. | `ctest --preset dev --no-tests=error -R '^resource_relocated_root$' -V` |
+| Texture recovery | Check a packed mip tail, a first refill byte, the fields of a generated BC7 block, or a resident mip drawn on the software adapter. [Look up a texture key across archives and inspect a matching descriptor](docs/experiments.md#reading-logical-ranges-and-probing-structured-resources). | `ctest --preset dev --no-tests=error -R '^(bcpack_prefix_and_mip_tail\|bc7_block_reference\|bc7_draw_warp\|resource_range_controls)$' -V` |
+| Audio metadata | Inventory stream counts, codec IDs and sample rates in a bounded [AWC sound-effect bank](docs/experiments.md#awc-sound-effect-format-metadata). | `ctest --preset dev --no-tests=error -R '^audio_awc_metadata$' -V` |
+| Compute shader recompilation | Translate fixed and indexed raw UAV stores and compare the complete buffer on D3D12. [Bindings and commands](docs/experiments.md#compute-uav-stores-from-a-native-container) | `ctest --preset dev --no-tests=error -R '^compute_store_aot_'` |
+| Static shader recompilation | Translate the single-texture pixel shader fixtures to desktop DXIL and check every output channel. Select a local record by name and, for duplicate names, by decoded DXBC SHA-256. [Supported instructions, bindings and record selection](docs/experiments.md#offline-pixel-shader-recompilation) | `ctest --preset dev -R '^pixel_aot_' -V` |
+| Shader effect metadata | Inventory the [candidate programs for a named SGD5 effect](docs/experiments.md#candidate-programs-for-a-named-sgd5-effect) using independently located archive ranges. | `ctest --preset dev --no-tests=error -R "^sgd5_effect_candidates$" -V` |
+| Pipeline readiness | Join explicit pipeline references to the native shader manifest and identify blockers for PSO creation. [Inputs and WARP control](docs/experiments.md#pipeline-readiness-from-shader-manifests) | `ctest --preset dev -R '^pso_' -V` |
+| D3D12 and ray tracing | Compare the CPU reference, custom BVH shader and DXR on another adapter. Record the driver and native wave width. | `ctest --preset dev -R '^bvh_(differential\|wave64)_hardware$' -V` |
+| Upscaler memory accounting | Compare [post-query counter writes](docs/experiments.md#upscaler-working-set-counter-updates) on success and failure. | `ctest --preset dev --no-tests=error -R 'working_set_delta$'` |
+| Windows runtime | Add a source-built allocation case with a measurable Windows result. | `ctest --preset dev -R 'era_heap\|desktop_memory_query'` |
+| PE tooling | Reproduce an import-resolution edge case with a DLL or EXE built from source. | `ctest --preset dev --no-tests=error -R 'static_exe_intake\|conditional_import_paths\|bundled_export_forwarders'` |
+| Build and documentation | Try the first build from a clean clone. Identify the first missing prerequisite or unclear instruction. | Use the three-test command above. |
+
+[Full experiment notes and reproduction commands](docs/experiments.md)
 
 ## Run the GPU check
 
@@ -161,42 +191,6 @@ An earlier batch at commit `def386a` covered seven GPU models in eight community
 Maintainers link independent results to the original report and record the adapter, driver, commit and outcome. Names or handles are added on request. The hardware-report and independent-build milestones are complete. The remaining community milestone is a fix verified by the contributor who reported the problem.
 
 </details>
-
-## Choose an experiment
-
-After the full [Windows build](#first-build), run one comparison from the repository root.
-
-| Experiment | Focused test |
-|---|---|
-| Native, mapped and recompiled archive reader | `ctest --preset dev --no-tests=error -R '^cpu_native_archive_blast$' -V` |
-| Indexed mesh draw on WARP | `ctest --preset dev --no-tests=error -R '^mesh_indexed_draw_warp$' -V` |
-| Compute shader buffer writes on WARP | `ctest --preset dev --no-tests=error -R '^compute_store_aot_warp$' -V` |
-
-<details>
-<summary>More experiments and focused test commands</summary>
-
-| Area | A contribution you can verify | Focused CTest command |
-|---|---|---|
-| Static CPU recompilation | Compare leaf, chained-range and cross-function translations with their source-built originals and negative controls, including [Bink frame plane requests](docs/experiments.md#frame-plane-requests-in-binkallocateframebuffers) and the [Bink group descriptor builders](docs/experiments.md#grouped-allocation-descriptor-builders). | `ctest --preset dev --no-tests=error -R '^cpu_' -V` |
-| Script states | Reproduce a parent/child lookup, an ambiguous selection or a damaged sibling link with a synthetic tree. | `ctest --preset dev --no-tests=error -R '^script_(state_literals\|path_links)$' -V` |
-| Resource metadata | Check a [relocated resource root](docs/experiments.md#relocated-resource-root) against its block directory and type schema. | `ctest --preset dev --no-tests=error -R '^resource_relocated_root$' -V` |
-| Texture recovery | Check a packed mip tail, a first refill byte, the fields of a generated BC7 block, or a resident mip drawn on the software adapter. [Look up a texture key across archives and inspect a matching descriptor](docs/experiments.md#reading-logical-ranges-and-probing-structured-resources). | `ctest --preset dev --no-tests=error -R '^(bcpack_prefix_and_mip_tail\|bc7_block_reference\|bc7_draw_warp\|resource_range_controls)$' -V` |
-| Audio metadata | Inventory stream counts, codec IDs and sample rates in a bounded [AWC sound-effect bank](docs/experiments.md#awc-sound-effect-format-metadata). | `ctest --preset dev --no-tests=error -R '^audio_awc_metadata$' -V` |
-| Compute shader recompilation | Translate fixed and indexed raw UAV stores and compare the complete buffer on D3D12. [Bindings and commands](docs/experiments.md#compute-uav-stores-from-a-native-container) | `ctest --preset dev --no-tests=error -R '^compute_store_aot_'` |
-| Static shader recompilation | Translate the single-texture pixel shader fixtures to desktop DXIL and check every output channel. Select a local record by name and, for duplicate names, by decoded DXBC SHA-256. [Supported instructions, bindings and record selection](docs/experiments.md#offline-pixel-shader-recompilation) | `ctest --preset dev -R '^pixel_aot_' -V` |
-| Shader effect metadata | Inventory the [candidate programs for a named SGD5 effect](docs/experiments.md#candidate-programs-for-a-named-sgd5-effect) using independently located archive ranges. | `ctest --preset dev --no-tests=error -R "^sgd5_effect_candidates$" -V` |
-| Pipeline readiness | Join explicit pipeline references to the native shader manifest and identify blockers for PSO creation. [Inputs and WARP control](docs/experiments.md#pipeline-readiness-from-shader-manifests) | `ctest --preset dev -R '^pso_' -V` |
-| D3D12 and ray tracing | Compare the CPU reference, custom BVH shader and DXR on another adapter. Record the driver and native wave width. | `ctest --preset dev -R '^bvh_(differential\|wave64)_hardware$' -V` |
-| Upscaler memory accounting | Compare [post-query counter writes](docs/experiments.md#upscaler-working-set-counter-updates) on success and failure. | `ctest --preset dev --no-tests=error -R 'working_set_delta$'` |
-| Windows runtime | Add a source-built allocation case with a measurable Windows result. | `ctest --preset dev -R 'era_heap\|desktop_memory_query'` |
-| PE tooling | Reproduce an import-resolution edge case with a DLL or EXE built from source. | `ctest --preset dev --no-tests=error -R 'static_exe_intake\|conditional_import_paths\|bundled_export_forwarders'` |
-| Build and documentation | Try the first build from a clean clone. Identify the first missing prerequisite or unclear instruction. | Use the three-test command above. |
-
-</details>
-
-For task ownership, evidence requirements and PR review, see the [contribution guide](CONTRIBUTING.md). [Open an issue](https://github.com/R0Y00/Xbox2Windows/issues/new/choose) · [Community conduct](CODE_OF_CONDUCT.md) · [Private security reports](SECURITY.md)
-
-[New contributor guide](https://github.com/R0Y00/Xbox2Windows/discussions/75) · [Build and debugging Q&A](https://github.com/R0Y00/Xbox2Windows/discussions/categories/development-q-a) · [Full experiment notes](docs/experiments.md)
 
 ## Case study and provenance
 
