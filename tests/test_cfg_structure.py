@@ -175,5 +175,5 @@ def test_shapes():
 
 if __name__ == "__main__":
     test_shapes()
-    print("ok: %d graphs structured and run, %d irreducible (%d split-structured, %d capped), %d with loops" %
-          (lambda s, r, l, ok, cap: (s, r, ok, cap, l))(*test_random_graphs()))
+    test_random_graphs()
+    print("ok: random graphs structured and run, irreducible ones split or capped")
