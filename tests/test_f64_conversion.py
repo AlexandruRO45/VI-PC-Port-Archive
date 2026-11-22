@@ -46,7 +46,11 @@ class F64ConversionTest(unittest.TestCase):
             scale = result(rf"OpBitcast %float {constant}")
             value = result(rf"OpFMul %float {value} {scale}")
         if clamp:
-            value = result(rf"OpExtInst %float %glsl FClamp {value} %f0 %f1")
+            # clamp to [0, 1] as compares and selects, so a NaN and -0 give +0 (SHADER-186)
+            positive = result(rf"OpFOrdGreaterThan %bool {value} %f0")
+            low = result(rf"OpSelect %float {positive} {value} %f0")
+            below = result(rf"OpFOrdLessThan %bool {low} %f1")
+            value = result(rf"OpSelect %float {below} {low} %f1")
         word = result(rf"OpBitcast %uint {value}")
         dest = result(r"OpAccessChain %_ptr_Function_uint %vgpr %c3")
         old_word = result(rf"OpLoad %uint {dest}")

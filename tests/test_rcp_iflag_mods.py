@@ -76,9 +76,14 @@ class RcpIflagModsTest(unittest.TestCase):
             self.assertNotRegex(spv, r"\bOpFMul %float\b")
 
         if clamp:
-            value = match_result(rf"OpExtInst %float %glsl FClamp {value} %f0 %f1")
+            # clamp to [0, 1] as compares and selects, so a NaN and -0 give +0 (SHADER-186)
+            positive = match_result(rf"OpFOrdGreaterThan %bool {value} %f0")
+            low = match_result(rf"OpSelect %float {positive} {value} %f0")
+            below = match_result(rf"OpFOrdLessThan %bool {low} %f1")
+            value = match_result(rf"OpSelect %float {below} {low} %f1")
         else:
-            self.assertNotIn("FClamp", spv)
+            self.assertNotRegex(spv, r"OpFOrdLessThan %bool %\w+ %f1")
+        self.assertNotIn("FClamp", spv)
 
         word = match_result(rf"OpBitcast %uint {value}")
         dest = match_result(r"OpAccessChain %_ptr_Function_uint %vgpr %c0")
