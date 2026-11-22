@@ -888,5 +888,79 @@ class TestBufferAtomicAndX2ConditionCodes(unittest.TestCase):
         self.assertEqual(self.interp.vcc, canary)
 
 
+# ---------------------------------------------------------------------------
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ---------------------------------------------------------------------------
+
+class TestBufferAtomicAndX2BoundaryExtremes(unittest.TestCase):
+    """Unit tests for boundary extremes, address wrapping, and 64-bit IEEE 754 bit representations."""
+
+    def setUp(self) -> None:
+        self.mem = BufferMemory(4096)
+
+    def test_last_valid_qword_boundary(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=100)
+        self.mem.write_u64(92, 0xFFFFFFFFFFFFFFFF)
+        ret, in_bounds = ref_buffer_atomic_and_x2(
+            self.mem, desc, soffset=0, vaddr=92, and_val=0x1234567890ABCDEF, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0xFFFFFFFFFFFFFFFF)
+        self.assertEqual(self.mem.read_u64(92), 0x1234567890ABCDEF)
+
+        for oob_off in range(93, 101):
+            ret, in_bounds = ref_buffer_atomic_and_x2(
+                self.mem, desc, soffset=0, vaddr=oob_off, and_val=0x10, glc=True
+            )
+            self.assertFalse(in_bounds)
+            self.assertEqual(ret, 0)
+
+    def test_zero_capacity_buffer(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=0)
+        ret, in_bounds = ref_buffer_atomic_and_x2(
+            self.mem, desc, soffset=0, vaddr=0, and_val=0xFF, glc=True
+        )
+        self.assertFalse(in_bounds)
+        self.assertEqual(ret, 0)
+
+    def test_64bit_integer_extremes(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        self.mem.write_u64(0, 0xFFFFFFFFFFFFFFFF)
+        ret, in_bounds = ref_buffer_atomic_and_x2(
+            self.mem, desc, soffset=0, vaddr=0, and_val=0x7FFFFFFFFFFFFFFF, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0xFFFFFFFFFFFFFFFF)
+        self.assertEqual(self.mem.read_u64(0), 0x7FFFFFFFFFFFFFFF)
+
+        self.mem.write_u64(8, 0x8000000000000000)
+        ret, in_bounds = ref_buffer_atomic_and_x2(
+            self.mem, desc, soffset=0, vaddr=8, and_val=0x8000000000000000, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(self.mem.read_u64(8), 0x8000000000000000)
+
+    def test_f64_nan_and_subnormal_bit_patterns(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+
+        qnan_bits = 0x7FF8000000000000
+        self.mem.write_u64(16, qnan_bits)
+        ret, in_bounds = ref_buffer_atomic_and_x2(
+            self.mem, desc, soffset=0, vaddr=16, and_val=MASK64, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, qnan_bits)
+        self.assertEqual(self.mem.read_u64(16), qnan_bits)
+
+        subnormal_bits = 0x0000000000000001
+        self.mem.write_u64(24, subnormal_bits)
+        ret, in_bounds = ref_buffer_atomic_and_x2(
+            self.mem, desc, soffset=0, vaddr=24, and_val=subnormal_bits, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, subnormal_bits)
+        self.assertEqual(self.mem.read_u64(24), subnormal_bits)
+
+
 if __name__ == "__main__":
     unittest.main()
