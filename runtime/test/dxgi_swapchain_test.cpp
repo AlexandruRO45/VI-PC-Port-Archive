@@ -270,6 +270,49 @@ int main() {
     if (FAILED(sc1->QueryInterface(IID_PPV_ARGS(&sc))) || !sc) return fail("QI IDXGISwapChain3");
     sc1->Release();
 
+    // D3D-193: IDXGISwapChain::GetDevice and GetFullscreenDesc.
+    if (sc->GetDevice(__uuidof(ID3D12CommandQueue), nullptr) != E_POINTER)
+        return fail("GetDevice with null out should return E_POINTER");
+    ID3D12CommandQueue* got_queue = nullptr;
+    if (FAILED(sc->GetDevice(IID_PPV_ARGS(&got_queue))) || got_queue != queue) {
+        if (got_queue) got_queue->Release();
+        return fail("GetDevice(ID3D12CommandQueue) did not return creation queue");
+    }
+    got_queue->Release();
+
+    ID3D12Device* got_dev = nullptr;
+    if (FAILED(sc->GetDevice(IID_PPV_ARGS(&got_dev))) || got_dev != dev) {
+        if (got_dev) got_dev->Release();
+        return fail("GetDevice(ID3D12Device) did not return queue parent device");
+    }
+    got_dev->Release();
+
+    ID3D12Fence* got_fence = nullptr;
+    if (sc->GetDevice(IID_PPV_ARGS(&got_fence)) != E_NOINTERFACE || got_fence != nullptr) {
+        if (got_fence) got_fence->Release();
+        return fail("GetDevice(unrelated IID) should return E_NOINTERFACE");
+    }
+
+    if (sc->GetFullscreenDesc(nullptr) != E_INVALIDARG)
+        return fail("GetFullscreenDesc with null out should return E_INVALIDARG");
+    DXGI_SWAP_CHAIN_FULLSCREEN_DESC fs_desc{};
+    if (FAILED(sc->GetFullscreenDesc(&fs_desc)) || fs_desc.Windowed != TRUE)
+        return fail("GetFullscreenDesc default should have Windowed = TRUE");
+
+    BOOL is_fullscreen = TRUE;
+    if (FAILED(sc->GetFullscreenState(&is_fullscreen, nullptr)) || is_fullscreen != FALSE)
+        return fail("GetFullscreenState should report FALSE for windowed swapchain");
+    if (FAILED(sc->SetFullscreenState(TRUE, nullptr)))
+        return fail("SetFullscreenState(TRUE) failed");
+    if (FAILED(sc->GetFullscreenState(&is_fullscreen, nullptr)) || is_fullscreen != TRUE)
+        return fail("GetFullscreenState should report TRUE after SetFullscreenState(TRUE)");
+    if (FAILED(sc->GetFullscreenDesc(&fs_desc)) || fs_desc.Windowed != FALSE)
+        return fail("GetFullscreenDesc should report Windowed = FALSE after SetFullscreenState(TRUE)");
+    if (FAILED(sc->SetFullscreenState(FALSE, nullptr)))
+        return fail("SetFullscreenState(FALSE) failed");
+    if (FAILED(sc->GetFullscreenState(&is_fullscreen, nullptr)) || is_fullscreen != FALSE)
+        return fail("GetFullscreenState should report FALSE after SetFullscreenState(FALSE)");
+
     D3D12_DESCRIPTOR_HEAP_DESC rtv_hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     ID3D12DescriptorHeap* rtv_heap = nullptr;
     if (FAILED(dev->CreateDescriptorHeap(&rtv_hd, IID_PPV_ARGS(&rtv_heap)))) return fail("CreateDescriptorHeap");
@@ -733,12 +776,21 @@ int main() {
         wdesc.Height = 96;
         wdesc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;  // also tests presenting an untouched offscreen backbuffer
         wdesc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        DXGI_SWAP_CHAIN_FULLSCREEN_DESC wfs_desc{};
+        wfs_desc.RefreshRate.Numerator = 60;
+        wfs_desc.RefreshRate.Denominator = 1;
+        wfs_desc.Windowed = TRUE;
         IDXGISwapChain1* wsc1 = nullptr;
-        if (FAILED(factory->CreateSwapChainForHwnd(queue, hwnd3, &wdesc, nullptr, nullptr, &wsc1)) || !wsc1)
+        if (FAILED(factory->CreateSwapChainForHwnd(queue, hwnd3, &wdesc, &wfs_desc, nullptr, &wsc1)) || !wsc1)
             return fail("CreateSwapChainForHwnd (tearing + waitable)");
         IDXGISwapChain3* wsc = nullptr;
         if (FAILED(wsc1->QueryInterface(IID_PPV_ARGS(&wsc))) || !wsc) return fail("QI IDXGISwapChain3 (waitable)");
         wsc1->Release();
+
+        DXGI_SWAP_CHAIN_FULLSCREEN_DESC got_fs{};
+        if (FAILED(wsc->GetFullscreenDesc(&got_fs)) || got_fs.RefreshRate.Numerator != 60 ||
+            got_fs.RefreshRate.Denominator != 1 || got_fs.Windowed != TRUE)
+            return fail("GetFullscreenDesc did not preserve custom fullscreen desc");
 
         DXGI_SWAP_CHAIN_DESC1 got_desc{};
         if (FAILED(wsc->GetDesc1(&got_desc)) || got_desc.Flags != wdesc.Flags)
@@ -785,7 +837,7 @@ int main() {
         return 1;
     }
     std::printf("device: %s (validation %s)\n", chosen.deviceName, val_active ? "on" : "off");
-    std::printf("dxgi_swapchain_test: PASS (CreateSwapChainForHwnd, GetBuffer+GetDesc, clear+readback, Present, "
-                "ResizeBuffers; 0 validation errors)\n");
+    std::printf("dxgi_swapchain_test: PASS (CreateSwapChainForHwnd, GetBuffer+GetDesc, GetDevice+GetFullscreenDesc, "
+                "clear+readback, Present, ResizeBuffers; 0 validation errors)\n");
     return 0;
 }

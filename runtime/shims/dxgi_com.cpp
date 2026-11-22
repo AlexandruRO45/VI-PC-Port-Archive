@@ -104,24 +104,34 @@ private:
 
 class SwapChain final : public IDXGISwapChain3 {
 public:
-    SwapChain(IDXGIFactory4* parent, leonida::VulkanContext& context, PFN_vkGetInstanceProcAddr gipa,
-              VkInstance instance, VkPhysicalDevice physical, PFN_vkGetDeviceProcAddr gdpa, VkQueue queue,
-              std::uint32_t queue_family)
+    SwapChain(IDXGIFactory4* parent, IUnknown* device, leonida::VulkanContext& context,
+              PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical,
+              PFN_vkGetDeviceProcAddr gdpa, VkQueue queue, std::uint32_t queue_family)
         : parent_(parent),
+          device_(device),
           context_(context),
           swapchain_(gipa, instance, physical, gdpa, context.device(), queue, queue_family, context.submit_mutex()) {
         if (parent_) parent_->AddRef();
+        if (device_) device_->AddRef();
     }
 
     ~SwapChain() {
         unregister_buffers();
         if (waitable_) CloseHandle(waitable_);
+        if (device_) device_->Release();
         if (parent_) parent_->Release();
     }
 
-    bool init(HWND hwnd, const DXGI_SWAP_CHAIN_DESC1& desc) {
+    bool init(HWND hwnd, const DXGI_SWAP_CHAIN_DESC1& desc,
+              const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen_desc = nullptr) {
         hwnd_ = hwnd;
         flags_ = desc.Flags;
+        if (fullscreen_desc) {
+            fullscreen_desc_ = *fullscreen_desc;
+        } else {
+            fullscreen_desc_ = {};
+            fullscreen_desc_.Windowed = TRUE;
+        }
         const VkExtent2D size = size_or_client(desc.Width, desc.Height, {256u, 256u});
         const std::uint32_t w = size.width;
         const std::uint32_t h = size.height;
@@ -176,7 +186,27 @@ public:
     }
 
     // IDXGIDeviceSubObject
-    HRESULT STDMETHODCALLTYPE GetDevice(REFIID, void**) override { stub("IDXGISwapChain::GetDevice"); return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!device_) return E_NOINTERFACE;
+        if (riid == __uuidof(ID3D12Device) || riid == __uuidof(ID3D12Device1)) {
+            ID3D12DeviceChild* child = nullptr;
+            if (SUCCEEDED(device_->QueryInterface(__uuidof(ID3D12DeviceChild), reinterpret_cast<void**>(&child)))) {
+                const HRESULT hr = child->GetDevice(riid, out);
+                child->Release();
+                return hr;
+            }
+        }
+        if (SUCCEEDED(device_->QueryInterface(riid, out))) return S_OK;
+        ID3D12DeviceChild* child = nullptr;
+        if (SUCCEEDED(device_->QueryInterface(__uuidof(ID3D12DeviceChild), reinterpret_cast<void**>(&child)))) {
+            const HRESULT hr = child->GetDevice(riid, out);
+            child->Release();
+            return hr;
+        }
+        return E_NOINTERFACE;
+    }
 
     // IDXGISwapChain
     HRESULT STDMETHODCALLTYPE Present(UINT sync, UINT flags) override {
@@ -201,9 +231,12 @@ public:
         return buffers_[buffer]->QueryInterface(riid, surface);
     }
 
-    HRESULT STDMETHODCALLTYPE SetFullscreenState(BOOL, IDXGIOutput*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE SetFullscreenState(BOOL fs, IDXGIOutput*) override {
+        fullscreen_desc_.Windowed = !fs;
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE GetFullscreenState(BOOL* fs, IDXGIOutput** out) override {
-        if (fs) *fs = FALSE;
+        if (fs) *fs = !fullscreen_desc_.Windowed;
         if (out) *out = nullptr;
         return S_OK;
     }
@@ -218,7 +251,7 @@ public:
         desc->BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         desc->BufferCount = swapchain_.image_count();
         desc->OutputWindow = hwnd_;
-        desc->Windowed = TRUE;
+        desc->Windowed = fullscreen_desc_.Windowed;
         desc->SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         desc->Flags = flags_;
         return S_OK;
@@ -272,7 +305,11 @@ public:
         desc->Flags = flags_;
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE GetFullscreenDesc(DXGI_SWAP_CHAIN_FULLSCREEN_DESC*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetFullscreenDesc(DXGI_SWAP_CHAIN_FULLSCREEN_DESC* desc) override {
+        if (!desc) return E_INVALIDARG;
+        *desc = fullscreen_desc_;
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE GetHwnd(HWND* out) override { if (!out) return E_INVALIDARG; *out = hwnd_; return S_OK; }
     HRESULT STDMETHODCALLTYPE GetCoreWindow(REFIID, void**) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE Present1(UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS*) override {
@@ -374,10 +411,12 @@ private:
 
     std::atomic<ULONG> refs_{1};
     IDXGIFactory4* parent_ = nullptr;
+    IUnknown* device_ = nullptr;
     leonida::VulkanContext& context_;
     leonida::VulkanSwapchain swapchain_;
     HWND hwnd_ = nullptr;
     UINT flags_ = 0;
+    DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreen_desc_{};
     HANDLE waitable_ = nullptr;
     std::vector<BackBufferResource*> buffers_;
     std::atomic<UINT> present_count_{0};
@@ -723,14 +762,14 @@ public:
 
     // IDXGIFactory2
     BOOL STDMETHODCALLTYPE IsWindowedStereoEnabled() override { return FALSE; }
-    HRESULT STDMETHODCALLTYPE CreateSwapChainForHwnd(IUnknown*, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
-                                                     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*,
+    HRESULT STDMETHODCALLTYPE CreateSwapChainForHwnd(IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
+                                                     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen_desc, IDXGIOutput*,
                                                      IDXGISwapChain1** out) override {
         if (!out) return E_POINTER;
         *out = nullptr;
         if (!hwnd || !desc) return E_INVALIDARG;
-        auto* sc = new SwapChain(this, context_, gipa_, instance_, physical_, gdpa_, queue_, queue_family_);
-        if (!sc->init(hwnd, *desc)) {
+        auto* sc = new SwapChain(this, device, context_, gipa_, instance_, physical_, gdpa_, queue_, queue_family_);
+        if (!sc->init(hwnd, *desc, fullscreen_desc)) {
             sc->Release();
             return E_FAIL;
         }
