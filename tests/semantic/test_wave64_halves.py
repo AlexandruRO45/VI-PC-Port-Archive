@@ -227,9 +227,12 @@ class Classification(unittest.TestCase):
 
     def test_c_data_sgpr_as_lane_mask(self):
         # Gen.mask_src reads a data SGPR pair as bits (lanes 32-63 from r+1); a 32-lane half cannot tell which half
-        # it is, so both v_cndmask forms are refused, while a certified mask is not (SHADER-200).
+        # it is, so the v_cndmask and carry-in forms are refused, while a certified mask is not (SHADER-200).
         self.tier("ps_c_datamask", ps(["s_mov_b32 s4, 0xff00ff", "s_mov_b32 s5, 0xf0f0f0f0",
                                        "v_cndmask_b32_e64 v6, 0, 1, s4"]), "C",
+                  contains=["mask-data"])
+        self.tier("ps_c_datacarry", ps(["s_mov_b32 s4, 0xff00ff", "s_mov_b32 s5, 0xf0f0f0f0",
+                                        "v_add_co_ci_u32_e64 v6, s[6:7], 0, 0, s4"]), "C",
                   contains=["mask-data"])
         self.tier("ps_a_certmask", ps(["v_cmp_eq_u32_e64 s[4:5], 1, v0", "v_cndmask_b32_e64 v6, 0, 1, s4"]), "A", [], [])
 

@@ -3413,6 +3413,15 @@ class Gen:
         self.emit(f"{hi_in} = OpSelect %uint {low} {self.cu(0)} {v}")
         return lo_in, hi_in
 
+    def vop3_mask_operand(self, m):
+        """The carry-in / select mask operand of a VOP3 v_cndmask_b32 or v_add/sub/subrev_co_ci_u32. The corpus listing
+        prints it in wave32 syntax in wave64 (`s4`, like `vcc_lo`), but the hardware reads the 64-bit pair s[4:5]
+        (llvm-mc gfx1030 encodes both spellings the same): a single SGPR that is not a certified mask becomes the pair,
+        so lanes 32-63 take their bit from r+1."""
+        if self.wave64 and m["k"] == "sgpr" and m.get("n", 1) == 1 and not self.holds_lane_mask(m):
+            return dict(m, n=2)
+        return m
+
     def mask_src(self, a, wide=True):
         """A lane mask operand (sgpr pair, vcc, exec, imm) as one uint for this lane. A constant is a mask with one
         bit per lane, so lane L takes its bit L: of the 64-bit value (`wide`, the default: a 64-bit SALU operand or
@@ -5826,7 +5835,7 @@ class Gen:
                 x, y = y, x
             sub = "sub" in op
             if op.endswith("ci_u32"):
-                cin_m = self.mask_src(srcs[2]) if len(srcs) > 2 else self.mask_src({"k": "special", "t": "vcc"})
+                cin_m = self.mask_src(self.vop3_mask_operand(srcs[2] if len(srcs) > 2 else {"k": "special", "t": "vcc"}))
                 cin = self.tmp()
                 self.emit(f"{cin} = OpSelect %uint {self.tmp_bool_nz(cin_m)} {self.cu(1)} {self.cu(0)}")
             else:
@@ -7000,12 +7009,7 @@ class Gen:
         elif op == "v_cndmask_b32":
             # e32: dst, src0, src1 (vcc) ; e64: dst, src0, src1, sN[:N+1]/vcc
             x, y = self.src_u(a[1]), self.src_u(a[2])
-            m = a[3] if len(a) > 3 else {"k": "special", "t": "vcc"}
-            if self.wave64 and m["k"] == "sgpr" and m.get("n", 1) == 1 and not self.holds_lane_mask(m):
-                # The corpus listing prints the wave64 mask operand of the VOP3 form in wave32 syntax (`s4`, like
-                # `vcc_lo`), but the hardware reads the 64-bit pair s[4:5]: lanes 32-63 take their bit from r+1.
-                m = dict(m, n=2)
-            c = self.mask_src(m)
+            c = self.mask_src(self.vop3_mask_operand(a[3] if len(a) > 3 else {"k": "special", "t": "vcc"}))
             b, r = self.tmp(), self.tmp()
             self.emit(f"{b} = OpINotEqual %bool {c} {self.cu(0)}")
             self.emit(f"{r} = OpSelect %uint {b} {y} {x}")
