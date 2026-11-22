@@ -310,6 +310,9 @@ def main(argv):
     lay_path = None
     if "--layout" in args:
         i = args.index("--layout")
+        if i + 1 == len(args) or not args[i + 1]:
+            print("--layout requires a path", file=sys.stderr)
+            return 2
         lay_path = args[i + 1]
         del args[i:i + 2]
     if len(args) != 2:

@@ -190,6 +190,17 @@ def test_cli_accepts_distinct_module_and_layout_paths(tmp_path, gs_module):
     subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(output)], check=True)
 
 
+@pytest.mark.parametrize("value", [[], [""]], ids=["missing", "empty"])
+def test_cli_rejects_missing_layout_path(tmp_path, value):
+    output = tmp_path / "cs.spv"
+    result = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "spirv_gs_to_compute.py"),
+                             str(tmp_path / "gs.spv"), str(output), "--layout", *value],
+                            capture_output=True, text=True)
+    assert result.returncode == 2, result.stderr
+    assert "--layout requires a path" in result.stderr
+    assert not output.exists()
+
+
 def test_help_is_a_clean_exit_zero(capsys):
     for flag in ("-h", "--help"):
         assert gsc.main(["spirv_gs_to_compute.py", flag]) == 0
