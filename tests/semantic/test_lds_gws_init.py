@@ -902,5 +902,134 @@ class TestConditionCodesStatusFlagsAndCarryBorrow(unittest.TestCase):
         self.assertFalse(st_inactive["active_wave"])
 
 
+class TestIEEE754BoundaryExtremesAndNaNHandling(unittest.TestCase):
+    """Phase 7: Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    # Canonical IEEE 754 float32 bit representations
+    F32_POS_ZERO: int = 0x0000_0000
+    F32_NEG_ZERO: int = 0x8000_0000
+    F32_MIN_SUBNORMAL: int = 0x0000_0001
+    F32_MAX_SUBNORMAL: int = 0x007F_FFFF
+    F32_NEG_MIN_SUBNORMAL: int = 0x8000_0001
+    F32_NEG_MAX_SUBNORMAL: int = 0x807F_FFFF
+    F32_MIN_NORMAL: int = 0x0080_0000
+    F32_ONE: int = 0x3F80_0000
+    F32_NEG_ONE: int = 0xBF80_0000
+    F32_MAX_NORMAL: int = 0x7F7F_FFFF
+    F32_NEG_MAX_NORMAL: int = 0xFF7F_FFFF
+    F32_POS_INF: int = 0x7F80_0000
+    F32_NEG_INF: int = 0xFF80_0000
+    F32_QNAN_CANONICAL: int = 0x7FC0_0000
+    F32_SNAN: int = 0x7F80_0001
+    F32_NEG_QNAN: int = 0xFFC0_0000
+    F32_CUSTOM_NAN_PAYLOAD: int = 0x7FA5_BEEF
+
+    # Packed 16-bit float patterns
+    F16_PACKED_ONES: int = 0x3C00_3C00
+    F16_PACKED_NANS: int = 0x7E00_7E00
+
+    def test_signed_zeros_preservation(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        # +0.0 (0x00000000)
+        state.set_vgpr(0, self.F32_POS_ZERO)
+        interp.execute(DSGWSInitInstruction(vdata0=RegisterOperand(0, RegType.VGPR), offset=0), state)
+        self.assertEqual(state.gws.read_resource(0), self.F32_POS_ZERO)
+
+        # -0.0 (0x80000000) - sign bit must NOT be cleared
+        state.set_vgpr(1, self.F32_NEG_ZERO)
+        interp.execute(DSGWSInitInstruction(vdata0=RegisterOperand(1, RegType.VGPR), offset=1), state)
+        self.assertEqual(state.gws.read_resource(1), self.F32_NEG_ZERO)
+
+    def test_subnormals_preservation_no_ftz(self) -> None:
+        # RDNA2 GWS data path is bit-exact; no Flush-To-Zero (FTZ) may occur
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        subnormals = [
+            (2, self.F32_MIN_SUBNORMAL),
+            (3, self.F32_MAX_SUBNORMAL),
+            (4, self.F32_NEG_MIN_SUBNORMAL),
+            (5, self.F32_NEG_MAX_SUBNORMAL),
+        ]
+
+        for rid, pattern in subnormals:
+            state.set_vgpr(0, pattern)
+            interp.execute(DSGWSInitInstruction(vdata0=RegisterOperand(0, RegType.VGPR), offset=rid), state)
+            self.assertEqual(state.gws.read_resource(rid), pattern)
+            self.assertNotEqual(state.gws.read_resource(rid), 0)
+
+    def test_normal_boundaries_and_infinities(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        patterns = [
+            (10, self.F32_MIN_NORMAL),
+            (11, self.F32_ONE),
+            (12, self.F32_NEG_ONE),
+            (13, self.F32_MAX_NORMAL),
+            (14, self.F32_NEG_MAX_NORMAL),
+            (15, self.F32_POS_INF),
+            (16, self.F32_NEG_INF),
+        ]
+
+        for rid, pattern in patterns:
+            state.set_vgpr(0, pattern)
+            interp.execute(DSGWSInitInstruction(vdata0=RegisterOperand(0, RegType.VGPR), offset=rid), state)
+            self.assertEqual(state.gws.read_resource(rid), pattern)
+
+    def test_nans_payload_preservation_no_quieting(self) -> None:
+        # Signaling NaNs must NOT be quieted; payload bits must be preserved intact
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        nan_patterns = [
+            (20, self.F32_QNAN_CANONICAL),
+            (21, self.F32_SNAN),
+            (22, self.F32_NEG_QNAN),
+            (23, self.F32_CUSTOM_NAN_PAYLOAD),
+        ]
+
+        for rid, pattern in nan_patterns:
+            state.set_vgpr(0, pattern)
+            interp.execute(DSGWSInitInstruction(vdata0=RegisterOperand(0, RegType.VGPR), offset=rid), state)
+            self.assertEqual(state.gws.read_resource(rid), pattern)
+            # Verify signaling NaN did not have its quiet bit set
+            if pattern == self.F32_SNAN:
+                self.assertEqual(state.gws.read_resource(rid) & 0x0040_0000, 0)
+
+    def test_packed_f16_bit_patterns(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        state.set_vgpr(0, self.F16_PACKED_ONES)
+        interp.execute(DSGWSInitInstruction(vdata0=RegisterOperand(0, RegType.VGPR), offset=30), state)
+        self.assertEqual(state.gws.read_resource(30), self.F16_PACKED_ONES)
+
+        state.set_vgpr(0, self.F16_PACKED_NANS)
+        interp.execute(DSGWSInitInstruction(vdata0=RegisterOperand(0, RegType.VGPR), offset=31), state)
+        self.assertEqual(state.gws.read_resource(31), self.F16_PACKED_NANS)
+
+    def test_simd_nan_transmission_from_first_active_lane(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0x8)  # Only lane 3 active
+        interp = SIMDInterpreter()
+
+        # Seed other lanes with 0, lane 3 with custom NaN
+        for lane in range(32):
+            state.set_lane_vgpr(lane, 0, 0)
+        state.set_lane_vgpr(3, 0, self.F32_CUSTOM_NAN_PAYLOAD)
+
+        instr = DSGWSInitInstruction(vdata0=RegisterOperand(0, RegType.VGPR), offset=40)
+        res = interp.execute(instr, state)
+
+        self.assertIsNotNone(res)
+        first_lane, rid, val = res  # type: ignore
+        self.assertEqual(first_lane, 3)
+        self.assertEqual(rid, 40)
+        self.assertEqual(val, self.F32_CUSTOM_NAN_PAYLOAD)
+        self.assertEqual(state.gws.read_resource(40), self.F32_CUSTOM_NAN_PAYLOAD)
+
+
 if __name__ == "__main__":
     unittest.main()
