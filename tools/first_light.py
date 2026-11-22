@@ -358,15 +358,22 @@ def constant_layout(listing: str, name: str = "the VS") -> dict:
         if op == "s_mov_b32" and dst and len(ops) == 2:
             src = _sregs(ops[1])
             origin = None
+            held = None
             if src and src[0] == src[1]:
-                origin = copy.get(src[0], src[0])
-                if origin == src[0] and src[0] in written:
-                    fail(f"s{src[0]} is copied after an earlier instruction wrote it, so it is not a user SGPR")
+                # A copy of a user SGPR feeds a table pointer; a copy of anything the VS wrote does not, and
+                # only passes a loaded constant on (followed below), so the table check refuses a bad pointer.
+                if src[0] in copy:
+                    origin = copy[src[0]]
+                elif src[0] not in written:
+                    origin = src[0]
+                held = holds.get(src[0])
             clobber(*dst)
             if _imm(ops[1]) == 0 and ops[1].strip() != "null":
                 zero.add(dst[0])
             elif origin is not None:
                 copy[dst[0]] = origin
+            elif held is not None:
+                holds[dst[0]] = held  # a copy of a loaded constant is still that constant
         elif op.startswith("s_load_dword") and dst and len(ops) == 3:
             base, off = _sregs(ops[1]), _imm(ops[2])
             if op == "s_load_dwordx4" and base and base[1] == base[0] + 1 and off is not None:

@@ -235,6 +235,21 @@ class LayoutTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             fl.constant_layout(DIRECT_TABLE_WITH_COLOUR.replace("s15", "s14"))
 
+    def test_a_copy_of_a_loaded_colour_dword_is_still_the_colour(self):
+        listing = DIRECT_TABLE_WITH_COLOUR.replace(", s15", ", s62").replace(
+            "    v_cvt_f32_ubyte3", "    s_mov_b32 s62, s15\n    v_cvt_f32_ubyte3", 1)
+        layout = fl.constant_layout(listing)
+        self.assertEqual(layout["colour_offset"], 0x2C)
+        self.assertEqual(layout["table_sgpr"], 4)
+
+    def test_a_copy_of_a_loaded_coefficient_is_ignored(self):
+        listing = COPIED_TABLE + "    s_mov_b32 s60, s28\n    v_mul_f32_e32 v3, s60, v4\n"
+        self.assertEqual(fl.constant_layout(listing), fl.constant_layout(COPIED_TABLE))
+
+    def test_a_copy_of_a_written_register_that_feeds_nothing_does_not_refuse(self):
+        listing = "    s_mov_b32 s60, 5\n" + COPIED_TABLE + "    s_mov_b32 s61, s60\n"
+        self.assertEqual(fl.constant_layout(listing)["table_sgpr"], 6)
+
     def test_a_table_pointer_must_be_a_user_sgpr_not_one_the_vs_wrote(self):
         cases = {
             "copy of a written register": "    s_mov_b32 s6, 5\n" + COPIED_TABLE,
