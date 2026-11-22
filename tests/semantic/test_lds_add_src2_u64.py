@@ -660,3 +660,59 @@ class TestSIMDMultiLaneDivergenceAndExecMasking(unittest.TestCase):
 
         res0 = interp.step(instr0, state)
         self.assertEqual(state.lds.read_qword_at_byte_addr(common_base), 130)
+
+
+# ============================================================================
+# Section 5: Register Aliasing and In-Place Operand Preservation
+# ============================================================================
+
+class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
+    """Unit tests for operand preservation: vaddr preservation, self-aliased memory A == B."""
+
+    def test_vaddr_preservation(self) -> None:
+        """vaddr VGPR must remain strictly untouched (non-returning instruction)."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        vaddr_val = 0x400
+        state.set_vgpr(7, vaddr_val)
+        state.lds.write_qword_at_byte_addr(vaddr_val, 100)
+        state.lds.write_qword_at_byte_addr(vaddr_val + 8, 50)
+
+        instr = DSAddSrc2U64Instruction(vaddr=VGPR(7), offset0=0, offset1=1)
+        interp.step(instr, state)
+
+        # VGPR 7 must be preserved bit-for-bit
+        self.assertEqual(state.get_vgpr(7), vaddr_val)
+
+    def test_all_vgprs_unmodified(self) -> None:
+        """Every VGPR in the register file is preserved unchanged."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        for i in range(DEFAULT_NUM_VGPRS):
+            state.set_vgpr(i, 0x1000 + i)
+        state.set_vgpr(0, 0x100)
+
+        instr = DSAddSrc2U64Instruction(vaddr=VGPR(0), offset0=0, offset1=0)
+        interp.step(instr, state)
+
+        for i in range(1, DEFAULT_NUM_VGPRS):
+            self.assertEqual(state.get_vgpr(i), 0x1000 + i)
+
+    def test_self_aliased_memory_locations(self) -> None:
+        """offset0 == offset1: Location A and Location B reference the same memory qword."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        addr = 0x200
+        initial_val = 0x0123_4567_89AB_CDEF
+        state.lds.write_qword_at_byte_addr(addr, initial_val)
+        state.set_vgpr(2, addr)
+
+        # LDS[A] = LDS[A] + LDS[A] = 2 * LDS[A]
+        instr = DSAddSrc2U64Instruction(vaddr=VGPR(2), offset0=0, offset1=0)
+        res = interp.step(instr, state)
+
+        self.assertEqual(res, u64(initial_val * 2))
+        self.assertEqual(state.lds.read_qword_at_byte_addr(addr), u64(initial_val * 2))
