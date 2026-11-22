@@ -142,5 +142,165 @@ class TestLdsXorRtnB64ReferenceOracle(unittest.TestCase):
         self.assertEqual(new_val, 0x00FFFF00_00FFFF00)
         self.assertEqual(lds.read_qword(addr), 0x00FFFF00_00FFFF00)
 
+# ==============================================================================
+# Phase 2: Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+@dataclass(frozen=True)
+class VGPR:
+    index: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"VGPR index {self.index} out of architectural range [0, 255]")
+
+    @property
+    def name(self) -> str:
+        return f"v[{self.index}]"
+
+
+@dataclass(frozen=True)
+class VGPRPair:
+    base_index: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.base_index <= 254):
+            raise ValueError(f"VGPRPair base_index {self.base_index} out of range [0, 254]")
+
+    @property
+    def name(self) -> str:
+        return f"v[{self.base_index}:{self.base_index + 1}]"
+
+
+@dataclass(frozen=True)
+class SGPRPair:
+    base_index: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.base_index <= 104):
+            raise ValueError(f"SGPRPair base_index {self.base_index} out of range [0, 104]")
+
+    @property
+    def name(self) -> str:
+        return f"s[{self.base_index}:{self.base_index + 1}]"
+
+
+@dataclass(frozen=True)
+class Immediate64:
+    value: int
+
+    @property
+    def name(self) -> str:
+        return f"0x{self.value & MASK_64:X}"
+
+
+Operand64 = Union[VGPRPair, SGPRPair, Immediate64]
+
+
+class DSOpcode64(Enum):
+    DS_XOR_RTN_B64 = auto()
+    DS_XOR_B64 = auto()
+
+    @property
+    def is_return(self) -> bool:
+        return self == DSOpcode64.DS_XOR_RTN_B64
+
+    @property
+    def op_name(self) -> str:
+        return "ds_xor_rtn_b64" if self.is_return else "ds_xor_b64"
+
+
+@dataclass(frozen=True)
+class DSXor64Instruction:
+    opcode: DSOpcode64
+    dst: Optional[VGPRPair]
+    addr: VGPR
+    data: Operand64
+    offset: int = 0
+
+    def __post_init__(self) -> None:
+        if self.opcode.is_return:
+            if not isinstance(self.dst, VGPRPair):
+                raise TypeError(f"Destination must be a VGPRPair for returning opcode, got {type(self.dst).__name__}")
+        else:
+            if self.dst is not None:
+                raise ValueError("Destination must be None for non-returning ds_xor_b64 opcode")
+        if not isinstance(self.addr, VGPR):
+            raise TypeError(f"Address operand must be a 32-bit VGPR, got {type(self.addr).__name__}")
+        if not isinstance(self.data, (VGPRPair, SGPRPair, Immediate64)):
+            raise TypeError(f"Data operand must be VGPRPair, SGPRPair, or Immediate64, got {type(self.data).__name__}")
+        if not (0 <= self.offset <= 65535):
+            raise ValueError(f"Offset {self.offset} out of 16-bit range [0, 65535]")
+
+    def disassemble(self) -> str:
+        offset_part = f" offset:{self.offset}" if self.offset != 0 else ""
+        if self.opcode.is_return:
+            assert self.dst is not None
+            return f"ds_xor_rtn_b64 {self.dst.name}, {self.addr.name}, {self.data.name}{offset_part}"
+        return f"ds_xor_b64 {self.addr.name}, {self.data.name}{offset_part}"
+
+
+class TestSymbolicAST(unittest.TestCase):
+    def test_instruction_ast_construction_returning(self) -> None:
+        instr = DSXor64Instruction(
+            opcode=DSOpcode64.DS_XOR_RTN_B64,
+            dst=VGPRPair(0),
+            addr=VGPR(2),
+            data=VGPRPair(4),
+            offset=16,
+        )
+        self.assertEqual(instr.opcode, DSOpcode64.DS_XOR_RTN_B64)
+        self.assertTrue(instr.opcode.is_return)
+        self.assertEqual(instr.dst.base_index, 0)
+        self.assertEqual(instr.addr.index, 2)
+        self.assertEqual(instr.offset, 16)
+
+    def test_instruction_ast_construction_non_returning(self) -> None:
+        instr = DSXor64Instruction(
+            opcode=DSOpcode64.DS_XOR_B64,
+            dst=None,
+            addr=VGPR(10),
+            data=Immediate64(0x1234_5678_9ABC_DEF0),
+        )
+        self.assertEqual(instr.opcode, DSOpcode64.DS_XOR_B64)
+        self.assertFalse(instr.opcode.is_return)
+        self.assertIsNone(instr.dst)
+
+    def test_disassembly_returning_with_and_without_offset(self) -> None:
+        instr_no_off = DSXor64Instruction(
+            opcode=DSOpcode64.DS_XOR_RTN_B64,
+            dst=VGPRPair(6),
+            addr=VGPR(5),
+            data=Immediate64(0x1234),
+        )
+        self.assertEqual(instr_no_off.disassemble(), "ds_xor_rtn_b64 v[6:7], v[5], 0x1234")
+
+        instr_off = DSXor64Instruction(
+            opcode=DSOpcode64.DS_XOR_RTN_B64,
+            dst=VGPRPair(12),
+            addr=VGPR(14),
+            data=SGPRPair(10),
+            offset=64,
+        )
+        self.assertEqual(instr_off.disassemble(), "ds_xor_rtn_b64 v[12:13], v[14], s[10:11] offset:64")
+
+    def test_disassembly_non_returning_with_and_without_offset(self) -> None:
+        instr_no_off = DSXor64Instruction(
+            opcode=DSOpcode64.DS_XOR_B64,
+            dst=None,
+            addr=VGPR(2),
+            data=VGPRPair(4),
+        )
+        self.assertEqual(instr_no_off.disassemble(), "ds_xor_b64 v[2], v[4:5]")
+
+    def test_dst_type_enforcement_rejects_sgpr(self) -> None:
+        with self.assertRaises(TypeError):
+            DSXor64Instruction(
+                opcode=DSOpcode64.DS_XOR_RTN_B64,
+                dst=SGPRPair(0),
+                addr=VGPR(1),
+                data=Immediate64(0),
+            )
+
 if __name__ == "__main__":
     unittest.main()
