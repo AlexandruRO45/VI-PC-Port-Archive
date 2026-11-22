@@ -756,5 +756,115 @@ class TestDsDecSrc2F64RegisterAliasing(unittest.TestCase):
         self.assertEqual(simd.read_lane_vgpr(1, 0), 0x108)
 
 
+# ==============================================================================
+# Phase 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclasses.dataclass(frozen=True)
+class AtomicDecSrc2F64StatusFlags:
+    """Architectural condition codes and status flags for ds_dec_src2_f64."""
+    wrapped: bool
+    zero: bool
+    negative: bool
+    borrow: bool
+    threshold_reset: bool
+    nan_flag: bool
+    unaligned_addr: bool
+
+
+def evaluate_ds_dec_src2_f64_flags(
+    val_a: int,
+    val_b: int,
+    eff_addr: int,
+) -> AtomicDecSrc2F64StatusFlags:
+    u_a = u64(val_a)
+    u_b = u64(val_b)
+
+    nan_flag = is_f64_nan(u_a) or is_f64_nan(u_b)
+    if nan_flag:
+        return AtomicDecSrc2F64StatusFlags(
+            wrapped=True,
+            zero=False,
+            negative=False,
+            borrow=False,
+            threshold_reset=False,
+            nan_flag=True,
+            unaligned_addr=bool(eff_addr & 0x7),
+        )
+
+    f_a = bits_to_f64(u_a)
+    f_b = bits_to_f64(u_b)
+
+    wrapped = (f_a <= 0.0 or f_a > f_b)
+    threshold_reset = (f_a > f_b)
+    borrow = (f_a <= 0.0)
+
+    new_val_bits = u_b if wrapped else f64_to_bits(f_a - 1.0)
+    zero = (bits_to_f64(new_val_bits) == 0.0)
+    negative = bool(new_val_bits & 0x8000_0000_0000_0000)
+    unaligned_addr = bool(eff_addr & 0x7)
+
+    return AtomicDecSrc2F64StatusFlags(
+        wrapped=wrapped,
+        zero=zero,
+        negative=negative,
+        borrow=borrow,
+        threshold_reset=threshold_reset,
+        nan_flag=False,
+        unaligned_addr=unaligned_addr,
+    )
+
+
+class TestDsDecSrc2F64ConditionCodesAndStatusFlags(unittest.TestCase):
+    """Phase 6: Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def test_normal_decrement_flags(self) -> None:
+        flags = evaluate_ds_dec_src2_f64_flags(
+            val_a=f64_to_bits(10.0),
+            val_b=f64_to_bits(20.0),
+            eff_addr=0x100,
+        )
+        self.assertFalse(flags.wrapped)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertFalse(flags.borrow)
+        self.assertFalse(flags.threshold_reset)
+        self.assertFalse(flags.nan_flag)
+        self.assertFalse(flags.unaligned_addr)
+
+    def test_zero_wrap_flags(self) -> None:
+        flags = evaluate_ds_dec_src2_f64_flags(
+            val_a=f64_to_bits(0.0),
+            val_b=f64_to_bits(15.0),
+            eff_addr=0x200,
+        )
+        self.assertTrue(flags.wrapped)
+        self.assertTrue(flags.borrow)
+        self.assertFalse(flags.threshold_reset)
+
+    def test_greater_threshold_reset_flags(self) -> None:
+        flags = evaluate_ds_dec_src2_f64_flags(
+            val_a=f64_to_bits(100.0),
+            val_b=f64_to_bits(50.0),
+            eff_addr=0x300,
+        )
+        self.assertTrue(flags.wrapped)
+        self.assertTrue(flags.threshold_reset)
+        self.assertFalse(flags.borrow)
+
+    def test_nan_flag_detection(self) -> None:
+        qnan = 0x7FF8_0000_0000_0000
+        flags = evaluate_ds_dec_src2_f64_flags(qnan, f64_to_bits(10.0), 0x400)
+        self.assertTrue(flags.nan_flag)
+        self.assertTrue(flags.wrapped)
+
+    def test_unaligned_qword_address_detection(self) -> None:
+        for offset in range(1, 8):
+            flags = evaluate_ds_dec_src2_f64_flags(f64_to_bits(5.0), f64_to_bits(10.0), 0x100 + offset)
+            self.assertTrue(flags.unaligned_addr)
+        flags_aligned = evaluate_ds_dec_src2_f64_flags(f64_to_bits(5.0), f64_to_bits(10.0), 0x108)
+        self.assertFalse(flags_aligned.unaligned_addr)
+
+
 if __name__ == "__main__":
     unittest.main()
