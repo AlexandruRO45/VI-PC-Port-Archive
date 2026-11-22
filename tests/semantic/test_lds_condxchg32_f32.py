@@ -528,6 +528,185 @@ class TestDeterministicScalarInterpreter(unittest.TestCase):
         self.assertTrue(swapped)
         self.assertEqual(self.lds.read_dword(2), ONE_RAW)
 
+class SIMDWaveState:
+    """Architectural wavefront execution state for 32 or 64 lanes."""
+
+    def __init__(self, wave_size: int = 32, exec_mask: int = 0xFFFFFFFF, lds: Optional[LDSMemory] = None) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Wavefront size must be 32 or 64, got {wave_size}")
+        self.wave_size: int = wave_size
+        self.exec_mask: int = exec_mask & ((1 << wave_size) - 1)
+        self.vgprs: List[List[int]] = [[0] * 256 for _ in range(wave_size)]
+        self.lds: LDSMemory = lds if lds is not None else LDSMemory()
+
+    def is_lane_active(self, lane: int) -> bool:
+        """Return True if the given lane is enabled in the current EXEC mask."""
+        return bool((self.exec_mask >> lane) & 1)
+
+    def get_vgpr(self, lane: int, reg: VGPR) -> int:
+        """Read 32-bit VGPR for a specific lane."""
+        return self.vgprs[lane][reg.index] & MASK32
+
+    def set_vgpr(self, lane: int, reg: VGPR, val: int) -> None:
+        """Write 32-bit VGPR for a specific lane."""
+        self.vgprs[lane][reg.index] = val & MASK32
+
+
+class SIMDDSInterpreter:
+    """Multi-lane SIMD instruction interpreter modeling RDNA2 lockstep execution and non-returning LDS atomics."""
+
+    def execute(self, state: SIMDWaveState, inst: DSCondXchg32F32Instruction) -> Dict[int, bool]:
+        """Execute non-returning DS conditional exchange f32 across active lanes."""
+        active_lanes = [lane for lane in range(state.wave_size) if state.is_lane_active(lane)]
+        latched_inputs = [
+            (
+                lane,
+                state.get_vgpr(lane, inst.vaddr),
+                state.get_vgpr(lane, inst.vdata0),
+                state.get_vgpr(lane, inst.vdata1),
+            )
+            for lane in active_lanes
+        ]
+
+        returns: Dict[int, bool] = {}
+
+        for lane, addr, cmp_val, new_val in latched_inputs:
+            old_val, new_mem, exchanged = state.lds.atomic_condxchg32_f32(
+                addr, cmp_val, new_val, offset=inst.offset.value
+            )
+            returns[lane] = exchanged
+
+        return returns
+
+
+class TestSIMDMultiLaneDivergenceAndExecMasking(unittest.TestCase):
+    """Unit tests for SIMD lockstep execution, 32/64-bit EXEC masking, and address convergence."""
+
+    def test_wave32_full_mask_divergent_addresses(self) -> None:
+        lds = LDSMemory(65536)
+        wave = SIMDWaveState(wave_size=32, exec_mask=0xFFFFFFFF, lds=lds)
+        interp = SIMDDSInterpreter()
+
+        for i in range(32):
+            lds.write_dword(i, ONE_RAW)
+
+        for lane in range(32):
+            wave.set_vgpr(lane, VGPR(1), lane * 4)
+            wave.set_vgpr(lane, VGPR(2), ONE_RAW)
+            wave.set_vgpr(lane, VGPR(3), f32_to_raw_u32(float(lane + 10)))
+
+        inst = DSCondXchg32F32Instruction(
+            DSOpcode.DS_CONDXCHG32_F32,
+            vaddr=VGPR(1),
+            vdata0=VGPR(2),
+            vdata1=VGPR(3),
+        )
+        returns = interp.execute(wave, inst)
+
+        for i in range(32):
+            self.assertTrue(returns[i])
+            self.assertEqual(lds.read_dword(i), f32_to_raw_u32(float(i + 10)))
+
+    def test_wave64_full_mask_divergent_addresses(self) -> None:
+        lds = LDSMemory(65536)
+        wave = SIMDWaveState(wave_size=64, exec_mask=0xFFFFFFFFFFFFFFFF, lds=lds)
+        interp = SIMDDSInterpreter()
+
+        for i in range(64):
+            lds.write_dword(i, TWO_RAW)
+
+        for lane in range(64):
+            wave.set_vgpr(lane, VGPR(1), lane * 4)
+            wave.set_vgpr(lane, VGPR(2), TWO_RAW)
+            wave.set_vgpr(lane, VGPR(3), THREE_RAW)
+
+        inst = DSCondXchg32F32Instruction(
+            DSOpcode.DS_CONDXCHG32_F32,
+            vaddr=VGPR(1),
+            vdata0=VGPR(2),
+            vdata1=VGPR(3),
+        )
+        returns = interp.execute(wave, inst)
+
+        for i in range(64):
+            self.assertTrue(returns[i])
+            self.assertEqual(lds.read_dword(i), THREE_RAW)
+
+    def test_wave32_partial_exec_masking(self) -> None:
+        lds = LDSMemory(65536)
+        wave = SIMDWaveState(wave_size=32, exec_mask=0x55555555, lds=lds)
+        interp = SIMDDSInterpreter()
+
+        for i in range(32):
+            lds.write_dword(i, ONE_RAW)
+
+        for lane in range(32):
+            wave.set_vgpr(lane, VGPR(1), lane * 4)
+            wave.set_vgpr(lane, VGPR(2), ONE_RAW)
+            wave.set_vgpr(lane, VGPR(3), TWO_RAW)
+
+        inst = DSCondXchg32F32Instruction(
+            DSOpcode.DS_CONDXCHG32_F32,
+            vaddr=VGPR(1),
+            vdata0=VGPR(2),
+            vdata1=VGPR(3),
+        )
+        returns = interp.execute(wave, inst)
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(lds.read_dword(lane), TWO_RAW)
+                self.assertTrue(returns[lane])
+            else:
+                self.assertEqual(lds.read_dword(lane), ONE_RAW)
+                self.assertNotIn(lane, returns)
+
+    def test_zero_exec_mask_no_mutation(self) -> None:
+        lds = LDSMemory(65536)
+        wave = SIMDWaveState(wave_size=32, exec_mask=0x0, lds=lds)
+        interp = SIMDDSInterpreter()
+
+        lds.write_dword(0, ONE_RAW)
+        for lane in range(32):
+            wave.set_vgpr(lane, VGPR(1), 0)
+            wave.set_vgpr(lane, VGPR(2), ONE_RAW)
+            wave.set_vgpr(lane, VGPR(3), TWO_RAW)
+
+        inst = DSCondXchg32F32Instruction(
+            DSOpcode.DS_CONDXCHG32_F32,
+            vaddr=VGPR(1),
+            vdata0=VGPR(2),
+            vdata1=VGPR(3),
+        )
+        returns = interp.execute(wave, inst)
+
+        self.assertEqual(len(returns), 0)
+        self.assertEqual(lds.read_dword(0), ONE_RAW)
+
+    def test_convergent_collision_cas_daisy_chain(self) -> None:
+        lds = LDSMemory(65536)
+        wave = SIMDWaveState(wave_size=32, exec_mask=0xFFFFFFFF, lds=lds)
+        interp = SIMDDSInterpreter()
+
+        lds.write_dword(4, POS_ZERO_RAW)
+
+        for lane in range(32):
+            wave.set_vgpr(lane, VGPR(1), 16)  # dword 4
+            wave.set_vgpr(lane, VGPR(2), f32_to_raw_u32(float(lane)))
+            wave.set_vgpr(lane, VGPR(3), f32_to_raw_u32(float(lane + 1)))
+
+        inst = DSCondXchg32F32Instruction(
+            DSOpcode.DS_CONDXCHG32_F32,
+            vaddr=VGPR(1),
+            vdata0=VGPR(2),
+            vdata1=VGPR(3),
+        )
+        returns = interp.execute(wave, inst)
+
+        self.assertEqual(lds.read_dword(4), f32_to_raw_u32(32.0))
+        for lane in range(32):
+            self.assertTrue(returns[lane])
+
 
 if __name__ == "__main__":
     unittest.main()
