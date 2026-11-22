@@ -156,6 +156,20 @@ FMT_XY_XYZ_WORDS = [
     0x3F800000, 0xA5A50284, 0xA5A50288, 0xA5A5028C, 0x0000FFFF, 0xA5A50294, 0xA5A50298, 0xA5A5029C,
     0x00030201, 0xA5A502A4, 0xA5A502A8, 0xA5A502AC, 0xA5A502B0, 0xA5A502B4, 0xA5A502B8, 0xA5A502BC,
     0xA5A502C0, 0xA5A502C4, 0xA5A502C8, 0xA5A502CC]
+# cs_fmt_xy_xyz_sel.asm: 14 xy/xyz loads (32_32 and 32_32_32 UINT/FLOAT, UNORM, DST_SEL, an out-of-range index, the
+# 12-byte element at num_records), then the 8 store regions read back. Derived by hand in the .asm header.
+FMT_XY_XYZ_SEL_WORDS = [
+    0x11111111, 0x22222222, 0x5A5A0008, 0x5A5A000C, 0x11111111, 0x22222222, 0x33333333, 0x5A5A001C,
+    0x3FC00000, 0xC0000000, 0x3E800000, 0x5A5A002C, 0x3F000080, 0x3F800000, 0x5A5A0038, 0x5A5A003C,
+    0x3E4CCCCD, 0x00000000, 0x3F008081, 0x5A5A004C, 0x44444444, 0x00000001, 0x5A5A0058, 0x5A5A005C,
+    0x3E800000, 0x3FC00000, 0x3F800000, 0x5A5A006C, 0x33333333, 0x44444444, 0x5A5A0078, 0x5A5A007C,
+    0x3FC00000, 0xC0000000, 0x3E800000, 0x5A5A008C, 0x11111111, 0x22222222, 0x33333333, 0x5A5A009C,
+    0x3FC00000, 0xC0000000, 0x3E800000, 0x5A5A00AC, 0x00000000, 0x00000000, 0x00000000, 0x5A5A00BC,
+    0x00000000, 0x00000000, 0x5A5A00C8, 0x5A5A00CC, 0x3FC00000, 0xC0000000, 0x5A5A00D8, 0x5A5A00DC,
+    0xDEADBEEF, 0x01234567, 0xA5A50288, 0xA5A5028C, 0x00000007, 0x00000008, 0x00000009, 0xA5A5029C,
+    0x3FC00000, 0xC0000000, 0x3E800000, 0xA5A502AC, 0x3FC00000, 0xC0000000, 0x00000000, 0xA5A502BC,
+    0xFFFF4000, 0xA5A502C4, 0xA5A502C8, 0xA5A502CC, 0x3FC00000, 0xC0000000, 0x3E800000, 0xA5A502DC,
+    0xA5A502E0, 0xA5A502E4, 0xA5A502E8, 0xA5A502EC, 0xA5A502F0, 0xA5A502F4, 0xA5A502F8, 0xA5A502FC]
 # Negative global_load/global_store offsets (cs_global_neg_offset.asm): 40 groups make a 0x2800-byte heap that holds
 # both the right addresses and the 4096-lower ones; only group 0 thread 0 runs, so no wave64 requirement.
 GLOBAL_OFFSET = [("cs_global_neg_offset", "40", [0x5EED1FFC, 0x8BAD1800, 0x5EED1FF0, 0x5EED1FF4,
@@ -375,6 +389,12 @@ def fmt_xy_xyz_test(tools, spirv, env=None):
     """TEST-185: the 84 result words and the untouched words after them, up to the inputs at 0x200. The heap needs
     0x2d0 bytes, so it is 192 words."""
     return dump_test(tools, spirv, "cs_fmt_xy_xyz", FMT_XY_XYZ_WORDS + [0xEEEEEEEE] * 44, 192, env)
+
+
+def fmt_xy_xyz_sel_test(tools, spirv, env=None):
+    """The 88 result words of cs_fmt_xy_xyz_sel and the untouched words after them, up to the inputs at 0x200. The
+    heap needs 0x300 bytes, so it is 192 words."""
+    return dump_test(tools, spirv, "cs_fmt_xy_xyz_sel", FMT_XY_XYZ_SEL_WORDS + [0xEEEEEEEE] * 40, 192, env)
 
 
 class Skip(str):
@@ -925,6 +945,7 @@ def main():
                                                       expected_words=CMPX_CLASS_WORDS)))
     results.append(("cs_fmt_1010102", fmt_1010102_test(tools, spirv)))
     results.append(("cs_fmt_xy_xyz", fmt_xy_xyz_test(tools, spirv)))
+    results.append(("cs_fmt_xy_xyz_sel", fmt_xy_xyz_sel_test(tools, spirv)))
     for name, groups, want in GLOBAL_OFFSET:
         results.append((name, compute_test(tools, spirv, name, groups, "dump", expected_words=want)))
     results.append(("cs_user_sgprs", compute_test(tools, spirv, "cs_user_sgprs", "1", "dump",
