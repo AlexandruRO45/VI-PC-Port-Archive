@@ -1390,8 +1390,105 @@ class TestPermF16ConditionCodesAndStatus(unittest.TestCase):
         self.assertEqual(vcc_mask, expected_vcc)
 
 
+# ==============================================================================
+# Unit Tests: Commit 7 (IEEE 754 Boundaries, Subnormals, and NaN Handling)
+# ==============================================================================
+
+class TestPermF16IEEE754Boundaries(unittest.TestCase):
+    """Test suite for IEEE 754 boundary extremes, subnormals, and NaN preservation."""
+
+    def test_subnormal_half_preservation(self):
+        # Permute must preserve subnormal bit patterns exactly
+        src1 = pack_halves(MIN_SUBNORMAL, MAX_SUBNORMAL)
+        src0 = pack_halves(MIN_SUBNORMAL_NEG, MAX_SUBNORMAL_NEG)
+        sel = PermSelectorF16Word.identity_src1().raw
+        res = oracle_v_perm_f16(src0, src1, sel)
+        self.assertEqual(extract_half(res, 0), MIN_SUBNORMAL)
+        self.assertEqual(extract_half(res, 1), MAX_SUBNORMAL)
+
+        # Cross-select negative subnormals
+        sel_neg = make_selector(SEL_SRC0_LO, SEL_SRC0_HI)
+        res_neg = oracle_v_perm_f16(src0, src1, sel_neg)
+        self.assertEqual(extract_half(res_neg, 0), MIN_SUBNORMAL_NEG)
+        self.assertEqual(extract_half(res_neg, 1), MAX_SUBNORMAL_NEG)
+
+    def test_infinities_preservation(self):
+        src1 = pack_halves(POS_INF, NEG_INF)
+        sel = PermSelectorF16Word.swap_halves_src1().raw
+        res = oracle_v_perm_f16(0, src1, sel)
+        self.assertEqual(extract_half(res, 0), NEG_INF)
+        self.assertEqual(extract_half(res, 1), POS_INF)
+
+    def test_quiet_nan_payload_preservation(self):
+        # Custom NaN payloads: quiet NaN with payload bits
+        qnan1 = 0x7E55  # Exponent all 1s, quiet bit set, payload 0x55
+        qnan2 = 0x7EFF  # Exponent all 1s, quiet bit set, payload 0xFF
+        src0 = pack_halves(qnan1, qnan2)
+        sel = PermSelectorF16Word.identity_src0().raw
+        res = oracle_v_perm_f16(src0, 0, sel)
+        self.assertEqual(extract_half(res, 0), qnan1)
+        self.assertEqual(extract_half(res, 1), qnan2)
+
+    def test_signaling_nan_payload_preservation(self):
+        # Signaling NaNs: quiet bit 9 is 0, payload non-zero
+        snan1 = 0x7C01  # Smallest signaling NaN
+        snan2 = 0x7DF0  # Signaling NaN with custom payload
+        src1 = pack_halves(snan1, snan2)
+        sel = PermSelectorF16Word.identity_src1().raw
+        res = oracle_v_perm_f16(0, src1, sel)
+        # Permutation does not quiet signaling NaNs
+        self.assertEqual(extract_half(res, 0), snan1)
+        self.assertEqual(extract_half(res, 1), snan2)
+
+    def test_signed_zero_sign_preservation(self):
+        src1 = pack_halves(POS_ZERO, NEG_ZERO)
+        sel = PermSelectorF16Word.identity_src1().raw
+        res = oracle_v_perm_f16(0, src1, sel)
+        self.assertEqual(extract_half(res, 0), POS_ZERO)
+        self.assertEqual(extract_half(res, 1), NEG_ZERO)
+        self.assertEqual(extract_half(res, 0) & SIGN16, 0)
+        self.assertEqual(extract_half(res, 1) & SIGN16, SIGN16)
+
+    def test_max_min_finite_boundaries(self):
+        src0 = pack_halves(MAX_FINITE, MIN_NORMAL)
+        sel = PermSelectorF16Word.identity_src0().raw
+        res = oracle_v_perm_f16(src0, 0, sel)
+        self.assertEqual(extract_half(res, 0), MAX_FINITE)
+        self.assertEqual(extract_half(res, 1), MIN_NORMAL)
+
+    def test_ieee754_modifiers_on_nan_and_inf(self):
+        # abs modifier clears sign bit even on NaNs and -Inf
+        src1 = pack_halves(NEG_INF, NEG_QNAN)
+        sel = PermSelectorF16Word.identity_src1().raw
+        res = oracle_v_perm_f16(0, src1, sel, abs1=True)
+        self.assertEqual(extract_half(res, 0), POS_INF)
+        self.assertEqual(extract_half(res, 1), POS_QNAN)
+
+        # neg modifier inverts sign bit of +Inf to -Inf
+        src0 = pack_halves(POS_INF, POS_QNAN)
+        sel0 = PermSelectorF16Word.identity_src0().raw
+        res_neg = oracle_v_perm_f16(src0, 0, sel0, neg0=True)
+        self.assertEqual(extract_half(res_neg, 0), NEG_INF)
+        self.assertEqual(extract_half(res_neg, 1), NEG_QNAN)
+
+    def test_clamp_behavior_on_nans_and_infinities(self):
+        # In RDNA2, clamping NaN yields +0.0; clamping +Inf yields 1.0; clamping -Inf yields +0.0
+        src1 = pack_halves(POS_QNAN, POS_INF)
+        src0 = pack_halves(NEG_INF, NEG_TWO)
+        sel = make_selector(SEL_SRC1_LO, SEL_SRC1_HI)
+        res1 = oracle_v_perm_f16(src0, src1, sel, clamp=True)
+        self.assertEqual(extract_half(res1, 0), POS_ZERO)  # NaN -> +0.0
+        self.assertEqual(extract_half(res1, 1), POS_ONE)   # +Inf -> 1.0
+
+        sel2 = make_selector(SEL_SRC0_LO, SEL_SRC0_HI)
+        res2 = oracle_v_perm_f16(src0, src1, sel2, clamp=True)
+        self.assertEqual(extract_half(res2, 0), POS_ZERO)  # -Inf -> +0.0
+        self.assertEqual(extract_half(res2, 1), POS_ZERO)  # -2.0 -> +0.0
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
