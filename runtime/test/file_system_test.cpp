@@ -5,6 +5,7 @@
 // folder that stands in for the game install, an overlay folder, and a "GAME:" path in each variant.
 #include <windows.h>
 
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <string>
@@ -297,6 +298,28 @@ int main() {
             create_w(L"GAME:\\pkgonly\\b.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
         check(h != INVALID_HANDLE_VALUE, "and its other files still open");
         if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+    }
+
+    // RT-257: a large package folder, listed with one probe of its marker folder and a hash set for names. Every
+    // package file once, minus the deleted ones; the overlay's copy wins, a name differing only in case included.
+    {
+        constexpr int files = 1000;
+        for (int i = 0; i < files; ++i) write_path(package / "big" / ("f" + std::to_string(i) + ".txt"), "package");
+        write_path(overlay / "big" / "f1.txt", "overlay");
+        write_path(overlay / "big" / "F4.TXT", "overlay");
+        check(delete_w(L"GAME:\\big\\f2.txt") != FALSE && delete_w(L"GAME:\\big\\f3.txt") != FALSE,
+              "DeleteFileW hides two files of the large folder");
+        const auto start = std::chrono::steady_clock::now();
+        const std::vector<std::wstring> names = list(first_w, next_w, find_close, L"GAME:\\big\\*");
+        const auto took = std::chrono::steady_clock::now() - start;
+        check(names.size() == std::size_t(files) - 2 + 2,
+              "the large folder lists each file once, minus the two deleted, plus . and ..");
+        check(count(names, L"f1.txt") == 1 && count(names, L"f4.txt") == 1,
+              "a file in both folders is listed once, whatever the case of its overlay name");
+        check(!contains(names, L"f2.txt") && !contains(names, L"f3.txt") && contains(names, L"f999.txt"),
+              "the deleted files are not listed and the others are");
+        std::printf("  listing %d package files took %.2f ms\n", files,
+                    std::chrono::duration<double, std::milli>(took).count());
     }
 
     // Folders, moves, copies and attributes: the same mapping, through the names a title imports.

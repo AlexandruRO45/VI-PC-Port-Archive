@@ -32,6 +32,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "file_system.h"
@@ -435,6 +436,28 @@ bool unregister_enumeration(HANDLE h) {
     return g_enumerations.erase(h) != 0;
 }
 
+// The package names deleted from the folder `dirs`, lowered as listed names are compared: one listing of its marker
+// folder, where deleted(dirs + name) would probe two paths for every package entry (RT-257). The same rule as
+// deleted(): a marker that is a file, or a marker folder holding kRemovedDirMarker. No marker folder, nothing probed.
+std::unordered_set<std::wstring> deleted_names(const std::filesystem::path& overlay,
+                                               const std::vector<std::wstring>& dirs) {
+    std::unordered_set<std::wstring> names;
+    if (overlay.empty()) return names;
+    const std::filesystem::path folder = marker(overlay, dirs);
+    WIN32_FIND_DATAW found{};
+    const HANDLE h = ::FindFirstFileW((folder / L"*").c_str(), &found);
+    if (h == INVALID_HANDLE_VALUE) return names;
+    do {
+        if (same_name(found.cFileName, L".") || same_name(found.cFileName, L"..")) continue;
+        std::error_code ec;
+        const bool file = !(found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+        if (file || std::filesystem::is_regular_file(folder / found.cFileName / kRemovedDirMarker, ec))
+            names.insert(lower(found.cFileName));
+    } while (::FindNextFileW(h, &found));
+    ::FindClose(h);
+    return names;
+}
+
 bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts, std::vector<WIN32_FIND_DATAW>& out,
              DWORD& error) {
     // "GAME:" and "GAME:\\dir\\" name the folder itself: list everything in it.
@@ -455,6 +478,10 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
         return false;
     }
 
+    // Names already listed (the overlay's win), and the package names deleted from this folder.
+    std::unordered_set<std::wstring> listed;
+    for (const auto& e : out) listed.insert(lower(e.cFileName));
+    const std::unordered_set<std::wstring> gone = deleted_names(r.overlay, dirs);
     auto add_root = [&](const std::filesystem::path& root, bool overlay_root) {
         if (root.empty()) return;
         std::filesystem::path search = join(root, dirs);
@@ -465,18 +492,9 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
         do {
             if (overlay_root && internal_dir(found.cFileName)) continue;
             const bool dot = same_name(found.cFileName, L".") || same_name(found.cFileName, L"..");
-            if (!overlay_root && !dot) {
-                std::vector<std::wstring> entry_parts = dirs;
-                entry_parts.push_back(found.cFileName);
-                if (deleted(r.overlay, entry_parts)) continue;
-            }
-            bool duplicate = false;
-            for (const auto& e : out)
-                if (same_name(e.cFileName, found.cFileName)) {
-                    duplicate = true;
-                    break;
-                }
-            if (!duplicate) out.push_back(found);
+            std::wstring key = lower(found.cFileName);
+            if (!overlay_root && !dot && gone.count(key)) continue;
+            if (listed.insert(std::move(key)).second) out.push_back(found);
         } while (::FindNextFileW(h, &found));
         ::FindClose(h);
     };
