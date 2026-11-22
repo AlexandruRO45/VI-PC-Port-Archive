@@ -11,9 +11,9 @@ covering a form in one fixture does not prove every operand variant or any title
 Rules:
 - A fixture's forms are covered only when its test passed. A skipped or failed test (or one that is
   not registered) leaves them uncovered; forms held back only by a skip are listed separately.
-- x64: the mnemonics of a tests/cpu/*.asm source count for the test CPU_FIXTURES names. An unlisted
-  .asm is never counted; it is reported as unclassified so it can be added, without failing the run.
-  Parameterized fixtures in CPU_RECORD_FIXTURES instead require decoded-instruction records
+- x64: new fixtures declare their test in a first-line MASM comment (see CONTRIBUTING.md).
+  Existing CPU_FIXTURES classifications take precedence. Unclassified files are reported.
+  Fixtures registered in record mode instead require decoded-instruction records
   emitted by their differential test during the JUnit run; source macro tokens are not counted.
 - gfx: only programs the translator accepted count. tests/pixel_aot_check.py records the first word
   of each line of every program tools/pixel_aot.py lowered without an error, in the file CTest names
@@ -196,15 +196,22 @@ def measure(results, root=ROOT, records=None):
     records = records or {}
     cpu_tests = set(CPU_FIXTURES.values()) - {None}
     for asm in sorted((root / "tests" / "cpu").glob("*.asm")):
-        if asm.stem not in CPU_FIXTURES:
-            status = "unclassified"
-        else:
+        source = asm.read_text(encoding="utf-8-sig")
+        record = asm.stem in CPU_RECORD_FIXTURES
+        if asm.stem in CPU_FIXTURES:
             test = CPU_FIXTURES[asm.stem]
             status = fixture_status(results, [test]) if test else "not translated"
-        if asm.stem in CPU_RECORD_FIXTURES:
-            forms = {x64_canonical(m) for m in records.get(CPU_FIXTURES[asm.stem], set())}
         else:
-            forms = masm_mnemonics(asm.read_text(encoding="utf-8"))
+            header = re.fullmatch(r"; coverage: (source|record) (cpu_[a-zA-Z0-9_]+)", source.partition("\n")[0].strip())
+            test = header[2] if header else None
+            record = bool(header and header[1] == "record")
+            status = fixture_status(results, [test]) if test else "unclassified"
+            if test:
+                cpu_tests.add(test)
+        if record:
+            forms = {x64_canonical(m) for m in records.get(test, set())}
+        else:
+            forms = masm_mnemonics(source)
         cpu[asm.name] = (forms, status)
     shaders = {test: (forms, fixture_status(results, [test]))
                for test, forms in records.items() if test not in cpu_tests}
@@ -233,7 +240,7 @@ def report(m):
     lines += ["", "Shader translation records from this run: "
               + (", ".join(m["shader_records"]) or "none, so no gfx form is covered")]
     if m["unclassified"]:
-        lines.append("Not counted until classified in tools/form_coverage.py: " + ", ".join(m["unclassified"]))
+        lines.append("Not counted until classified: " + ", ".join(m["unclassified"]))
     return "\n".join(lines)
 
 

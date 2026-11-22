@@ -154,9 +154,26 @@ def check_unclassified():
         assert ("Integer", "xor") in fc.x64_forms({"xor"}, fc.load_reference("x64_zen2.tsv"))
         assert m["gfx1013"]["covered"] == m["gfx1013"]["known_in_fixtures"] == 0
         report = fc.report(m)
-        assert "Not counted until classified in tools/form_coverage.py: added_later.asm" in report
+        assert "Not counted until classified: added_later.asm" in report
         assert "Shader translation records from this run: none" in report
         assert "Not counted" not in fc.report(fc.measure(every_test_passed, sample_repo(Path(tmp) / "b", {"branch": BRANCH})))
+
+
+def check_local_cpu_registration():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = sample_repo(tmp, {
+            "local": "; coverage: source cpu_local\nxor eax, eax\n",
+            "macro_case": "; coverage: record cpu_macro\nsub eax, eax\n",
+            "register_probe": "; coverage: source cpu_local\nadd eax, eax\n",
+        })
+        for state in ("pass", "skip", "fail", "absent"):
+            results = {} if state == "absent" else {"cpu_local": state, "cpu_macro": state}
+            measured = fc.measure(results, root, {"cpu_macro": {"adc"}})
+            assert measured["fixtures"]["register_probe.asm"] == "not translated"
+            assert measured["fixtures"]["local.asm"] == measured["fixtures"]["macro_case.asm"] == state
+            assert measured["x64_zen2"]["covered"] == (2 if state == "pass" else 0)
+            assert measured["shader_records"] == []
+        assert fc.measure({"cpu_macro": "pass"}, root)["x64_zen2"]["covered"] == 0
 
 
 def check_shader_records():
@@ -322,6 +339,7 @@ if __name__ == "__main__":
     check_example()
     check_jump_tables()
     check_unclassified()
+    check_local_cpu_registration()
     check_cpu_records()
     check_shader_records()
     check_parsing()
