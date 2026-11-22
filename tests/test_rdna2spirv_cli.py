@@ -160,6 +160,92 @@ class CommandLine(unittest.TestCase):
                     self.assertFalse(os.path.exists(out))     # 9/8 used to write an empty index.part9.json
 
 
+class MergeShards(unittest.TestCase):
+    """--merge publishes index.json only from a complete --shard set (BUILD-501)."""
+
+    def setUp(self):
+        self.out = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def part(self, file_index, i, n, entries):
+        (self.out / f"index.part{file_index}.json").write_text(
+            json.dumps({"shard": [i, n], "index": entries}), encoding="utf-8")
+
+    def merge(self):
+        return subprocess.run([sys.executable, "-I", TOOL, str(self.out), "--out", str(self.out), "--merge"],
+                              capture_output=True, text=True)
+
+    def refused(self, message):
+        p = self.merge()
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertIn(message, p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertFalse((self.out / "index.json").exists())
+        self.assertFalse((self.out / "stubs").exists())     # nothing is published before the check
+
+    def test_a_complete_set_merges(self):
+        self.part(0, 0, 2, {"cs_a": {"stage": "cs"}})
+        self.part(1, 1, 2, {"cs_b": {"stage": "cs"}})
+        p = self.merge()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("merged 2 entries", p.stdout)
+        self.assertEqual(json.loads((self.out / "index.json").read_text(encoding="utf-8")),
+                         {"cs_a": {"stage": "cs"}, "cs_b": {"stage": "cs"}})
+
+    def test_a_missing_shard_is_refused(self):
+        self.part(0, 0, 2, {"cs_a": {"stage": "cs"}})      # the finding's case: 1 of 2 parts merged as finished
+        self.refused("1 of 2 shards missing (1)")
+
+    def test_many_missing_shards_are_listed_briefly(self):
+        self.part(0, 0, 100, {})
+        self.refused("99 of 100 shards missing (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, ...)")
+
+    def test_parts_from_another_shard_count_are_refused(self):
+        self.part(0, 0, 2, {})
+        self.part(1, 1, 2, {})
+        self.part(2, 2, 4, {})                               # left over from an earlier 4-way run
+        self.refused("parts from different --shard counts (2 of 2; 1 of 4)")
+
+    def test_a_part_without_a_shard_record_is_refused(self):
+        (self.out / "index.part0.json").write_text(json.dumps({"cs_a": {"stage": "cs"}}), encoding="utf-8")
+        self.refused("index.part0.json has no shard record")
+
+    def test_a_renamed_part_is_refused(self):
+        self.part(0, 0, 2, {})
+        self.part(1, 0, 2, {})                               # a copy of part 0 named as part 1
+        self.refused("index.part1.json holds shard 0/2")
+
+    def test_an_unreadable_part_is_refused(self):
+        self.part(0, 0, 2, {})
+        (self.out / "index.part1.json").write_text("{", encoding="utf-8")
+        self.refused("index.part1.json: unreadable")
+
+    def test_no_parts_is_refused(self):
+        self.refused("no index.part*.json in")
+
+    def test_shard_runs_record_their_place_and_merge(self):
+        src = self.out / "disasm"
+        src.mkdir()
+        for name in ("ps_a", "ps_b", "ps_c"):
+            (src / f"{name}.s").write_text("\ts_endpgm\n", encoding="utf-8")
+            (self.out / f"{name}.dxbc").write_bytes(b"DXBC" + bytes(28))   # an empty signature, as above
+        spirv = self.out / "spirv"
+
+        def spirv_tool(cmd, **kwargs):
+            if cmd[0] == "spirv-as":
+                Path(cmd[3]).write_bytes(b"module")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        for shard in ("1/2", "0/2"):
+            with mock.patch.object(sys, "argv", [TOOL, str(src), "--out", str(spirv), "--shard", shard]), \
+                    mock.patch.object(rdna2spirv.subprocess, "run", side_effect=spirv_tool), \
+                    redirect_stdout(io.StringIO()):
+                rdna2spirv.main()
+        part1 = json.loads((spirv / "index.part1.json").read_text(encoding="utf-8"))
+        self.assertEqual(part1["shard"], [1, 2])
+        self.assertEqual(sorted(part1["index"]), ["ps_b"])
+        self.assertEqual(sorted(rdna2spirv.merge_parts(str(spirv))), ["ps_a", "ps_b", "ps_c"])
+
+
 class ValidatedOutput(unittest.TestCase):
     def setUp(self):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))

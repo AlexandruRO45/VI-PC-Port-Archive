@@ -419,7 +419,7 @@ class MergePublishesLastTest(unittest.TestCase):
     def test_a_failed_stub_write_leaves_no_index_and_a_retry_publishes_it(self):
         with tempfile.TemporaryDirectory() as out:
             with open(os.path.join(out, "index.part0.json"), "w", encoding="utf-8") as f:
-                json.dump({"s0": {"stage": "ps", "inputs": [0]}}, f)
+                json.dump({"shard": [0, 1], "index": {"s0": {"stage": "ps", "inputs": [0]}}}, f)
             blocker = os.path.join(out, "stubs")
             open(blocker, "w").close()                      # a plain file where the stubs folder goes
             r = self.merge(out)

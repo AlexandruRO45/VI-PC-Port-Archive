@@ -11267,6 +11267,51 @@ def write_index(path, index):
     os.replace(tmp, path)   # ponytail: no retry; add one if a scanner on Windows ever holds the new file open
 
 
+SHARD_PART = re.compile(r"index\.part(\d+)\.json")
+
+
+def merge_parts(out):
+    """The index entries of every index.part<i>.json in `out`, once they form one complete --shard set.
+
+    Each part is {"shard": [i, n], "index": {...}}, written by --shard i/n as its last step. A missing shard, parts
+    from different shard counts, a part whose name or record doesn't match, or one without a record (an older
+    rdna2spirv.py, or not a part) raises ValueError: a partial index.json would look like a finished translation."""
+    try:
+        names = sorted(f for f in os.listdir(out) if f.startswith("index.part") and f.endswith(".json"))
+    except OSError as e:
+        raise ValueError(f"cannot read {out}: {e.strerror or e}") from None
+    if not names:
+        raise ValueError(f"no index.part*.json in {out}")
+    counts, have, merged = {}, set(), {}
+    for name in names:
+        m = SHARD_PART.fullmatch(name)
+        try:
+            with open(os.path.join(out, name), encoding="utf-8") as f:
+                doc = _json.load(f)
+        except (OSError, ValueError) as e:
+            raise ValueError(f"{name}: unreadable ({e})") from None
+        shard = doc.get("shard") if isinstance(doc, dict) else None
+        if (not isinstance(shard, list) or len(shard) != 2 or not all(type(v) is int for v in shard)
+                or not 0 <= shard[0] < shard[1] or not isinstance(doc.get("index"), dict)):
+            raise ValueError(f"{name} has no shard record (written by an older rdna2spirv.py?); run its shard again")
+        i, n = shard
+        if m is None or int(m.group(1)) != i:
+            raise ValueError(f"{name} holds shard {i}/{n}, which belongs in index.part{i}.json")
+        counts.setdefault(n, []).append(i)
+        have.add(i)
+        merged.update(doc["index"])
+    if len(counts) > 1:
+        mixed = "; ".join(f"{len(v)} of {n}" for n, v in sorted(counts.items()))
+        raise ValueError(f"parts from different --shard counts ({mixed}); remove the stale ones")
+    (n,) = counts
+    missing = sorted(set(range(n)) - have)
+    if missing:
+        shown = ", ".join(str(i) for i in missing[:10]) + (", ..." if len(missing) > 10 else "")
+        raise ValueError(f"{len(missing)} of {n} shards missing ({shown}); run --shard <i>/{n} for each, "
+                         "then --merge again")
+    return merged
+
+
 def assemble_spirv(sa, sv):
     """Keep the assembled module out of the final path until validation succeeds."""
     with tempfile.NamedTemporaryFile(prefix=".spirv-", suffix=".tmp", dir=os.path.dirname(sv), delete=False) as f:
@@ -11362,11 +11407,11 @@ def main():
     MESH_COMPUTE = a.mesh_compute
     F16_HALVES = a.f16_interp_fallback
     if a.merge:
-        import glob as _gl, json as _js
-        merged = {}
-        for part in sorted(_gl.glob(os.path.join(a.out, "index.part*.json"))):
-            with open(part, encoding="utf-8") as f:
-                merged.update(_js.load(f))
+        try:
+            merged = merge_parts(a.out)
+        except ValueError as e:
+            print(f"error: --merge: {e}; no index.json written", file=sys.stderr)
+            return 2
         # The stubs go first: index.json is what tells make_game.py the translation finished.
         import spirv_stubs
         spirv_stubs.generate_for_index(a.out, merged)
@@ -11427,7 +11472,8 @@ def main():
         for name in invalid:
             old.pop(name, None)
     old.update(meta)
-    write_index(idx_path, old)
+    # A part records which shard of how many it is, so --merge can tell a complete set from a partial one.
+    write_index(idx_path, old if shard is None else {"shard": list(a.shard), "index": old})
     if shard is None:
         import spirv_stubs
         spirv_stubs.generate_for_index(a.out, old)
