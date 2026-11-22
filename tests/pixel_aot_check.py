@@ -6460,6 +6460,21 @@ def check_legacy_multiply_add_draws(directory, compiler, renderer, backend):
     case = directory / "mad_legacy.case"
     draw = [renderer, backend, "--check-pixel-case", shader, case]
     compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+
+    edge_program = uncompressed_export([
+        "v_mov_b32_e32 v19, s47",
+        "v_mad_legacy_f32 v12, s44, s45, 1.0",
+        "v_mad_legacy_f32 v13, s46, 1.0, 1.0",
+        "v_madak_f32 v14, s44, v19, 0x3f400000",
+        "v_mad_legacy_f32 v15, 1.0, |v19|, 0.0",
+    ])
+    constants = bytearray(256)
+    struct.pack_into("<4f", constants, 12, -0.0, math.inf, math.nan, -1.0)
+    write_case(case, constants, (1.0, math.nan, 0.75, 1.0), nan_mask=0b0010)
+    source.write_text(translate(edge_program), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    subprocess.run(draw, check=True)
+
     source.write_text(translate(instructions), encoding="ascii")
     subprocess.run(compile_shader, check=True)
 
@@ -6475,7 +6490,7 @@ def check_legacy_multiply_add_draws(directory, compiler, renderer, backend):
     sets = ((0.0, inf, 1.5, -2.0), (2.0, 3.0, 0.5, 0.25), (0.0, nan, -0.75, 4.0),
             (-1.5, 0.0, 2.0, 0.5), (1 + delta, 1 - delta, -1.0, 0.0))
 
-    def write_case(values, *, fused_first_channel=False):
+    def write_legacy_case(values, *, fused_first_channel=False):
         a, b, c, d = values
         constants = bytearray(256)
         struct.pack_into("<4f", constants, 12, a, b, c, d)
@@ -6486,10 +6501,10 @@ def check_legacy_multiply_add_draws(directory, compiler, renderer, backend):
         assert not any(math.isnan(v) for v in expected), expected
         case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
     for values in sets:
-        write_case(values)
+        write_legacy_case(values)
         subprocess.run(draw, check=True)
 
-    write_case(sets[-1], fused_first_channel=True)
+    write_legacy_case(sets[-1], fused_first_channel=True)
     result = subprocess.run(draw, capture_output=True, text=True)
     if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
         raise AssertionError("The renderer accepted the fused reference despite intermediate rounding")
@@ -6498,7 +6513,7 @@ def check_legacy_multiply_add_draws(directory, compiler, renderer, backend):
     wrong = [line.replace("v_mad_legacy_f32", "v_fma_f32") for line in instructions]
     source.write_text(translate(wrong), encoding="ascii")
     subprocess.run(compile_shader, check=True)
-    write_case(sets[0])
+    write_legacy_case(sets[0])
     result = subprocess.run(draw, capture_output=True, text=True)
     if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
         raise AssertionError("Replacing the legacy multiply-add lost the zero rule without detection")
