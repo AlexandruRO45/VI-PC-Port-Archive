@@ -897,10 +897,6 @@ class SamplerMipChecks(unittest.TestCase):
         self.assertTrue(check.sampler_mismatch(swapped, words, view).startswith("(32,0):"))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class PixelTestRegistry(unittest.TestCase):
     def test_pixel_tests_include_every_pixel_fixture(self):
         # A repeated PIXEL_TESTS assignment silently dropped ps_texoff once; keep the registry explicit.
@@ -918,3 +914,7 @@ class PixelTestRegistry(unittest.TestCase):
             with patch.object(check, "pixels", return_value=([want], "")) as pixels:
                 self.assertEqual(check.pixel_test("tools", tmp, "ps_legacy_mul"), "")
             self.assertEqual(pixels.call_count, 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
