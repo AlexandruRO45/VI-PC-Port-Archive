@@ -205,9 +205,9 @@ def disassemble(code, library, *, cpu=b"gfx1013", offsets=False):
     return instructions
 
 
-PREAMBLE = """Texture2D<float4> tex : register(t0);
-SamplerState samp : register(s0);
-// v_cmp_class_f32: the ten binary32 classes of LLVM SIInstrFlags::ClassFlags, from the raw encoding:
+SAMPLED_RESOURCES = """Texture2D<float4> tex : register(t0);
+SamplerState samp : register(s0);"""
+PREAMBLE = """// v_cmp_class_f32: the ten binary32 classes of LLVM SIInstrFlags::ClassFlags, from the raw encoding:
 // signaling NaN, quiet NaN, -inf, -normal, -denormal, -0, +0, +denormal, +normal, +inf.
 uint class32(float value) {
     uint bits = asuint(value);
@@ -296,7 +296,7 @@ float widen16(uint word) {
     uint wide = exponent == 0x1fu ? 0xffu : exponent + 112u;
     return asfloat(sign | (wide << 23) | (mantissa << 13));
 }
-float4 main(float2 uv : TEXCOORD0) : SV_Target0 {"""
+"""
 
 
 def registers(first, last, count):
@@ -517,21 +517,24 @@ def int_operand(token, scalar, vector, pending, sample_pending, *, signed):
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *, second_texture_offset=None):
     """Track descriptor provenance, interpolation and packed exports through register writes."""
-    if (texture_sgpr == interp_sgpr or not 0 <= texture_sgpr <= 105 or not 0 <= interp_sgpr <= 105
-            or len(sampler) != 4 or any(not 0 <= word <= 0xffffffff for word in sampler)):
-        raise ValueError("Invalid scalar inputs or sampler descriptor words")
+    if texture_sgpr == interp_sgpr or not 0 <= texture_sgpr <= 105 or not 0 <= interp_sgpr <= 105:
+        raise ValueError("Invalid scalar inputs")
+    if sampler is not None and (len(sampler) != 4 or any(not 0 <= word <= 0xffffffff for word in sampler)):
+        raise ValueError("Invalid sampler descriptor words")
     scalar = {f"s{texture_sgpr}": "texture_ptr", f"s{interp_sgpr}": "interp_base"}
     vector = {"v0": "bary_i", "v1": "bary_j"}
     # Each emitted value has a unique identity. Entry-only writes never gain a helper definition.
     # The boolean records whether the quad value depends on interpolated coordinates.
     quad_values = {"uv.x": True, "uv.y": True}
-    lines = [PREAMBLE]
+    lines = [PREAMBLE] if sampler is None else [SAMPLED_RESOURCES, PREAMBLE]
     if constant_descriptor is not None:
         if constant_descriptor < 0 or constant_descriptor % 4:
             raise ValueError("Invalid constant descriptor offset")
         lines.insert(0, "cbuffer Constants : register(b0) { float4 params[16]; };")
-    bindings = {0: "tex"}
+    bindings = {} if sampler is None else {0: "tex"}
     if second_texture_offset is not None:
+        if sampler is None:
+            raise ValueError("Second texture requires a sampler")
         if second_texture_offset < 32 or second_texture_offset % 32:
             raise ValueError("Second texture descriptor must have a distinct aligned offset")
         bindings[second_texture_offset] = "tex1"
@@ -548,6 +551,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     sample_dest = set()
     exported = False
     ended = False
+    entry_line = len(lines)
+    lines.append("float4 main(float2 uv : TEXCOORD0) : SV_Target0 {")
     for i, line in enumerate(instructions):
         def match(pattern):
             return re.fullmatch(pattern, line)
@@ -901,24 +906,25 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if mask != "entry" or sample_pending or not all(isinstance(v, str) and v.startswith(("sample", "alu")) for v in pair):
                 raise ValueError("Unsupported pack operand")
             vector[dst] = pair
-        elif m := match(r"exp mrt0,? (v\d+), \1, (v\d+), \2 done compr vm"):
-            pairs = [vector[v] for v in m.groups()]
+        elif m := match(r"exp mrt0,? (v\d+), \1, (v\d+|off), \2 done compr vm"):
+            pairs = [vector[v] for v in m.groups() if v != "off"]
             if mask != "entry" or exported or not all(isinstance(p, tuple) and len(p)==2 and
                     all(v.startswith(("sample", "alu")) for v in p) for p in pairs):
                 raise ValueError("Unsupported export")
             args = [f"export16({v})" for pair in pairs for v in pair]
-            lines.append(f"    return float4({', '.join(args)});")
+            if len(args) == 2:
+                lines[entry_line] = "float2 main(float2 uv : TEXCOORD0) : SV_Target0 {"
+            lines.append(f"    return float{len(args)}({', '.join(args)});")
             exported = True
         elif line == "s_endpgm" and exported:
             ended = True
         else:
             raise ValueError(f"Unsupported instruction {i}: {line}")
-    if not ended or samples != (2 if second_texture_offset is not None else 1):
+    if not ended or samples != len(bindings):
         raise ValueError("Unexpected sample count or missing color export")
     if helpers:
         defs = [body for name, body in SALU_HELPERS.items() if name in helpers]
-        pos = lines.index(PREAMBLE)
-        lines[pos:pos] = defs
+        lines[:0] = defs
     return "\n".join([*lines, "}",""])
 
 
@@ -928,9 +934,11 @@ def main():
     parser.add_argument("record")
     parser.add_argument("--container-sha256", help="SHA-256 of the full decoded DXBC container to select by name")
     parser.add_argument("--llvm", required=True, help="LLVM C library with AMDGPU support")
-    parser.add_argument("--texture-sgpr", type=int, required=True, help="Entry register for the low texture address")
+    parser.add_argument("--texture-sgpr", type=int, required=True, help="Entry register for the low descriptor-table address")
     parser.add_argument("--interp-sgpr", type=int, required=True, help="Entry register for the interpolation base")
-    parser.add_argument("--sampler-words", nargs=4, type=lambda s: int(s, 0), required=True,
+    profile = parser.add_mutually_exclusive_group(required=True)
+    profile.add_argument("--no-texture", action="store_true", help="Require zero texture samples")
+    profile.add_argument("--sampler-words", nargs=4, type=lambda s: int(s, 0),
                         help="Four descriptor words to bind to the supplied desktop sampler at s0")
     parser.add_argument("--output", type=Path, required=True, help="Destination .hlsl in a local output directory")
     parser.add_argument("--constant-descriptor", type=lambda s: int(s, 0),

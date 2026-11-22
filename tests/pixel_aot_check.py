@@ -1478,7 +1478,35 @@ def check_adapter_skip(directory: Path) -> None:
         assert check_render(work, compiler, renderer, "hardware") == 77
 
 
+def buffer_color(rg):
+    # Use a copied low table address and an explicit zero high word.
+    tail = "off, off" if rg else "v26, v26"
+    return [
+        "s_mov_b32 s30, s9", "s_mov_b32 s31, 0",
+        "s_load_dwordx4 s[12:15], s[30:31], null", "s_waitcnt lgkmcnt(0)",
+        "s_buffer_load_dwordx4 s[4:7], s[12:15], 0x10", "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v20, s7", "v_mov_b32_e32 v21, s4",
+        "v_cvt_pkrtz_f16_f32_e32 v25, v20, v21",
+        "v_cvt_pkrtz_f16_f32_e32 v26, v21, v20",
+        f"exp mrt0 v25, v25, {tail} done compr vm", "s_endpgm",
+    ]
+
+
+def translate_buffer_color(instructions):
+    return lower(instructions, 9, 24, None, 0)
+
+
 def check_controls(directory):
+    program = buffer_color(True)
+    assert "float2 main(" in translate_buffer_color(program)
+    assert "SamplerState" not in translate_buffer_color(program)
+    must_reject(lambda p: lower(p, 8, 24, None, 0), program)
+    must_reject(lambda p: lower(p, 9, 24, None, 32), program)
+    must_reject(lambda p: lower(p, 9, 24, None, 0, second_texture_offset=32), program)
+    must_reject(lambda p: lower(p, 9, 24, [0] * 4, 0), program)
+    must_reject(lambda p: lower(p, 20, 24, None), assembly(False))
+    must_reject(translate_buffer_color, [s for s in program if s != "s_waitcnt lgkmcnt(0)"])
+    must_reject(translate_buffer_color, [s.replace("off, off", "off, v26") for s in program])
     check_scheduling_hints()
     check_constant_descriptor_bounds()
     check_scalar_constant_reads()
@@ -1887,6 +1915,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((dual_program(swap_weights=True), translate_dual))
     fixtures.append((with_constants(LITERAL_FMA_BODY), translate))
     fixtures.append((scheduling_hints(), translate))
+    fixtures.extend((buffer_color(rg), translate_buffer_color) for rg in (False, True))
     for index, (instructions, lower_fixture) in enumerate(fixtures):
         source = directory / "fixture.s"
         obj = directory / "fixture.o"
@@ -2071,6 +2100,28 @@ def check_frexp_ldexp_draws(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Inverting the v_ldexp_f32 exponent sign escaped detection")
+
+
+def check_buffer_color_draw(directory, compiler, renderer, backend):
+    source, shader, case = (directory / name for name in ("buffer.hlsl", "buffer.cso", "buffer.case"))
+    for rg in (False, True):
+        source.write_text(translate_buffer_color(buffer_color(rg)), encoding="ascii")
+        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        draw = [renderer, backend, "--check-pixel-case-rg" if rg else "--check-pixel-case", shader, case]
+        for red, green in ((0.25, 0.75), (-0.5, 0.125)):
+            constants = bytearray(256)
+            struct.pack_into("<4f", constants, 16, green, 2, 3, red)
+            blue, alpha = (-1, -1) if rg else (green, red)
+            expected = struct.pack("<4f", red, green, blue, alpha) * 64
+            case.write_bytes(constants + expected)
+            result = subprocess.run(draw)
+            if result.returncode:
+                return result.returncode
+        struct.pack_into("<f", constants, 28, green)
+        case.write_bytes(constants + expected)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError("Wrong buffer color escaped detection")
 
 
 def check_render(directory, compiler, renderer, backend):
@@ -2281,8 +2332,10 @@ def main():
             check_binary(directory, *args)
         elif mode == "draw":
             return check_render(directory, *args)
+        elif mode == "buffer-color":
+            return check_buffer_color_draw(directory, *args)
         else:
-            raise ValueError("Expected binary or draw mode")
+            raise ValueError("Expected binary, draw or buffer-color mode")
 
 
 if __name__ == "__main__":

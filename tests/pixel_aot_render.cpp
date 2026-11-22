@@ -45,6 +45,7 @@ struct PixelInput {
     std::vector<Color> expected;
     std::vector<BYTE> secondRows;
     std::vector<Word> constants = std::vector<Word>(64);
+    UINT8 writeMask = D3D12_COLOR_WRITE_ENABLE_ALL;
 };
 
 struct MipDraw {
@@ -84,7 +85,7 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
     blend.DestBlend = blend.DestBlendAlpha = D3D12_BLEND_ZERO;
     blend.BlendOp = blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
     blend.LogicOp = D3D12_LOGIC_OP_NOOP;
-    blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    blend.RenderTargetWriteMask = input.writeMask;
     desc.SampleMask = UINT_MAX;
     desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     desc.NumRenderTargets = desc.SampleDesc.Count = 1;
@@ -294,9 +295,10 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
 }
 }
 
-void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference)
+void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference, UINT8 writeMask)
 {
     PixelInput input{8, 8, 8, DXGI_FORMAT_R8G8B8A8_UNORM};
+    input.writeMask = writeMask;
     for (auto g : ramp) {
         for (auto r : ramp) {
             input.rows.insert(input.rows.end(), {BYTE(r), BYTE(g), 128, 255});

@@ -433,6 +433,9 @@ int main(int argc, char** argv)
             check_dual_pixel(device.Get(), argv[3], argv[4], operation == "--dual-pixel-swapped");
         } else if (argc == 5 && operation == "--check-pixel-case") {
             check_translated_pixel(device.Get(), argv[3], false, argv[4]);
+        } else if (argc == 5 && operation == "--check-pixel-case-rg") {
+            check_translated_pixel(device.Get(), argv[3], false, argv[4],
+                                   D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN);
         } else if (operation == "--check-pixel-quad-lod") {
             check_pixel_quad_lod(device.Get(), argv[3]);
         } else if (operation == "--check-pixel") {

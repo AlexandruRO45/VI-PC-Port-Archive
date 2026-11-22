@@ -932,6 +932,18 @@ Two independently located local effects yielded 5 and 81 candidates across all g
 
 ## Offline pixel shader recompilation
 
+### Pixel color without a texture sample
+
+Use `--no-texture` in place of `--sampler-words` for a program that writes MRT0 without sampling. For a constant-buffer program, `--texture-sgpr` identifies the entry register holding the low descriptor-table address and `--constant-descriptor` gives the byte offset of the four-word descriptor in that table. Offset zero is valid with this profile. At a tested call site the program copies entry s9 to the low address register, sets the high word to zero, fetches the descriptor and loads color words. Bind the test buffer at b0. Other programs can copy s9 to m0 for interpolation. Select the binding from the program's use of the register.
+
+An RG-only compressed MRT0 export produces a two-component output. Match it with a red/green render-target write mask. The Windows fixture clears all four channels to -1, draws with two different constant buffers and compares every channel, including preserved blue and alpha. A stale reference must fail. A second draw profile checks the four-component export with all channels enabled. To reproduce:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^pixel_aot_buffer_color_' -V
+```
+
+A local audit against the 3310cb8 baseline retained the four sampled profiles and added six zero-sample profiles (entry table register 8 or 9, interpolation register 24, and no constant descriptor or a descriptor at byte 0 or 32). Of 26,503 records, 334 pixel records compiled with DXC `-Gis -T ps_6_0` and created D3D12 pipelines, up from 2. These represent 333 distinct containers and 21 distinct native instruction streams. Of the 332 additional records, 315 exported immediate values and 17 read the constant buffer; 298 wrote RG and 34 wrote RGBA. Each was drawn on an RTX 4060 Laptop (32.0.16.1656) and WARP (10.0.26100.9818). Reference colors for the new records were computed from the decoded operands, test buffer words and truncation to binary16. Two buffer inputs per constant-buffer record plus the original copy and day/night cases gave 352 draws per adapter. Each draw matched all 4,096 float4 pixels. These results use controlled buffers and render-target masks.
+
 ### Pixel programs with two exits
 
 For FSSM version 0x101 the pixel extractor reads the 64-bit code offset, byte count and section end at 0xC0, 0xC8 and 0xE8. Instructions start 40 bytes after the code offset. The end must agree with offset plus count. For the unset end sentinel the extractor also checks for four padding words at the computed end. It strips aligned trailing `s_code_end` words inside that extent and requires a terminal `s_endpgm`. A marker in the following metadata cannot extend or terminate the code. The field interpretation agrees with the [independent FSSM cross-check](https://github.com/ItsNotRexed/Leonida/blob/dcd8ecf10b138566d567020562b7afd853a89024/docs/fssm_crosscheck.md).
