@@ -5231,7 +5231,8 @@ class Gen:
         return v
 
     def flush_f32(self, f):
-        """v_mad_f32, v_mac_f32, v_mad_legacy_f32 and default-mode v_mul_legacy_f32 flush f32 denormals:
+        """v_mad_f32, v_mac_f32, v_madak_f32, v_madmk_f32, v_mad_legacy_f32 and default-mode v_mul_legacy_f32
+        flush f32 denormals:
         a subnormal operand or result
         reads as signed zero, whatever the MODE register says. LLVM's SITargetLowering::isFMADLegal forms
         v_mad_f32/v_mac_f32 only when f32 denormals are flushed (SIISelLowering.cpp, llvm-project 1922c0c);
@@ -6206,11 +6207,14 @@ class Gen:
             # madak D = S0 * S1 + K, printed `vdst, src0, vsrc1, K`; madmk D = S0 * K + S1, printed
             # `vdst, src0, K, vsrc1`. In print order both are a[1] * a[2] + a[3]. Until 2026-11-21 madmk read
             # a[3] as the factor, so it computed S0 * S1 + K.
-            x, y, z = (self.src_f(t) for t in a[1:4])
+            # The VOP2 form of v_mad_f32 with a literal (LLVM only forms it by shrinking a V_MAD_F32,
+            # SIShrinkInstructions), so it flushes f32 denormals like v_mad_f32 (flush_f32, SHADER-118): the
+            # operands, the rounded product and the sum. VOP2 only: no clamp or omod.
+            x, y, z = (self.flush_f32(self.src_f(t)) for t in a[1:4])
             m, r = self.tmp(), self.tmp()
             self.emit(f"{m} = OpFMul %float {x} {y}")
-            self.emit(f"{r} = OpFAdd %float {m} {z}")
-            self.dst(a[0], self.tou(r))
+            self.emit(f"{r} = OpFAdd %float {self.flush_f32(m)} {z}")
+            self.dst(a[0], self.tou(self.flush_f32(r)))
         elif op == "v_bfi_b32":
             mask = None if "sdwa_sel" in a[1] else self.imm_val(a[1])
             y, z = (self.src_u(t) for t in a[2:4])

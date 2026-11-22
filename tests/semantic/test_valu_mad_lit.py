@@ -742,10 +742,12 @@ class NegativeControlsTests(unittest.TestCase):
         ])
         want_mk = f32_to_bits(13.0)
         self.assertEqual(si.run_fragment(spv_mk)["%out_mrt0"][0], want_mk)
+        # The add's first operand is the product or its flushed copy (flush_f32, SHADER-118): swap the product's
+        # second factor with the add's addend either way.
         bad_mk, count = re.subn(
-            r"(%\w+) = OpFMul %float (%\w+) (%\w+)\n(\s*)(%\w+) = OpFAdd %float \1 (%\w+)",
-            r"\1 = OpFMul %float \2 \6\n\4\5 = OpFAdd %float \1 \3",
-            spv_mk,
+            r"(%\w+) = OpFMul %float (%\w+) (%\w+)\n(.*?)(%\w+) = OpFAdd %float (%\w+) (%\w+)",
+            r"\1 = OpFMul %float \2 \7\n\4\5 = OpFAdd %float \6 \3",
+            spv_mk, count=1, flags=re.S,
         )
         self.assertEqual(count, 1)
         self.assertEqual(si.run_fragment(bad_mk)["%out_mrt0"][0], want_ak)
@@ -759,9 +761,9 @@ class NegativeControlsTests(unittest.TestCase):
         ])
         self.assertEqual(si.run_fragment(spv_unfused)["%out_mrt0"][0], POS_ZERO)
         bad_fused, fcnt = re.subn(
-            r"(%\w+) = OpFMul %float (%\w+) (%\w+)\n(\s*)(%\w+) = OpFAdd %float \1 (%\w+)",
-            r"\5 = OpExtInst %float %glsl Fma \2 \3 \6",
-            spv_unfused,
+            r"(%\w+) = OpFMul %float (%\w+) (%\w+)\n(.*?)(%\w+) = OpFAdd %float (%\w+) (%\w+)",
+            r"\1 = OpFMul %float \2 \3\n\4\5 = OpExtInst %float %glsl Fma \2 \3 \7",
+            spv_unfused, count=1, flags=re.S,
         )
         self.assertEqual(fcnt, 1)
         # Drop any dangling OpDecorate on the removed OpFMul id so spirv_mini_interp parses cleanly.
