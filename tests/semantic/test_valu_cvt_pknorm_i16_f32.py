@@ -531,5 +531,221 @@ class TestValuCvtPknormI16F32SymbolicAST(unittest.TestCase):
             VCvtPknormI16F32Instruction(Reg(0, RegType.VGPR), "bad", VOP3Operand(Reg(1, RegType.VGPR)))  # type: ignore
 
 
+# ==============================================================================
+# Commit 3: Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState:
+    """Architectural register file for a single wavefront execution lane."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 256)
+
+    def get_vgpr(self, index: int) -> int:
+        if not (0 <= index <= 255):
+            raise IndexError(f"VGPR index {index} out of range [0, 255]")
+        return self.vgprs[index] & MASK32
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        if not (0 <= index <= 255):
+            raise IndexError(f"VGPR index {index} out of range [0, 255]")
+        self.vgprs[index] = val & MASK32
+
+    def get_sgpr(self, index: int) -> int:
+        if not (0 <= index <= 255):
+            raise IndexError(f"SGPR index {index} out of range [0, 255]")
+        return self.sgprs[index] & MASK32
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        if not (0 <= index <= 255):
+            raise IndexError(f"SGPR index {index} out of range [0, 255]")
+        self.sgprs[index] = val & MASK32
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for v_cvt_pknorm_i16_f32."""
+
+    def resolve_operand(self, op: VOP3Operand, state: ScalarMachineState) -> int:
+        if isinstance(op.source, Reg):
+            if op.source.reg_type == RegType.VGPR:
+                return state.get_vgpr(op.source.index)
+            elif op.source.reg_type == RegType.SGPR:
+                return state.get_sgpr(op.source.index)
+            else:
+                raise ValueError(f"Unknown register type: {op.source.reg_type}")
+        elif isinstance(op.source, Literal32):
+            return op.source.bits & MASK32
+        else:
+            raise TypeError(f"Unsupported operand source type: {type(op.source)}")
+
+    def step(self, instr: VCvtPknormI16F32Instruction, state: ScalarMachineState) -> int:
+        # Atomic read phase
+        s0_raw = self.resolve_operand(instr.src0, state)
+        s1_raw = self.resolve_operand(instr.src1, state)
+
+        # Computation phase via oracle
+        result = oracle_v_cvt_pknorm_i16_f32(
+            src0_bits=s0_raw,
+            src1_bits=s1_raw,
+            abs0=instr.src0.abs_mod,
+            neg0=instr.src0.neg_mod,
+            abs1=instr.src1.abs_mod,
+            neg1=instr.src1.neg_mod,
+            clamp=instr.clamp,
+        )
+
+        # Writeback phase
+        state.set_vgpr(instr.dst.index, result)
+        return result
+
+
+class TestValuCvtPknormI16F32ScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_vgpr_sources_execution(self) -> None:
+        """Verify execution with VGPR sources."""
+        self.state.set_vgpr(1, POS_ONE_F32)
+        self.state.set_vgpr(2, NEG_ONE_F32)
+
+        instr = VCvtPknormI16F32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(1, RegType.VGPR)),
+            src1=VOP3Operand(Reg(2, RegType.VGPR)),
+        )
+
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 0x80017FFF)
+        self.assertEqual(self.state.get_vgpr(0), 0x80017FFF)
+
+    def test_sgpr_sources_execution(self) -> None:
+        """Verify execution reading from scalar register file."""
+        self.state.set_sgpr(10, POS_HALF_F32)
+        self.state.set_sgpr(11, NEG_HALF_F32)
+
+        instr = VCvtPknormI16F32Instruction(
+            dst=Reg(3, RegType.VGPR),
+            src0=VOP3Operand(Reg(10, RegType.SGPR)),
+            src1=VOP3Operand(Reg(11, RegType.SGPR)),
+        )
+
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 0xC0004000)
+        self.assertEqual(self.state.get_vgpr(3), 0xC0004000)
+        # Verify SGPRs were not modified
+        self.assertEqual(self.state.get_sgpr(10), POS_HALF_F32)
+        self.assertEqual(self.state.get_sgpr(11), NEG_HALF_F32)
+
+    def test_literal_sources_execution(self) -> None:
+        """Verify execution with Literal32 inline constants."""
+        instr = VCvtPknormI16F32Instruction(
+            dst=Reg(4, RegType.VGPR),
+            src0=VOP3Operand(Literal32(POS_ONE_F32)),
+            src1=VOP3Operand(Literal32.from_float(0.0)),
+        )
+
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 0x00007FFF)
+        self.assertEqual(self.state.get_vgpr(4), 0x00007FFF)
+
+    def test_mixed_sources(self) -> None:
+        """Verify execution with mixed VGPR, SGPR, and Literal32 operands."""
+        self.state.set_vgpr(1, POS_ONE_F32)
+        self.state.set_sgpr(2, NEG_ONE_F32)
+
+        # VGPR and SGPR
+        instr1 = VCvtPknormI16F32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(1, RegType.VGPR)),
+            src1=VOP3Operand(Reg(2, RegType.SGPR)),
+        )
+        res1 = self.interp.step(instr1, self.state)
+        self.assertEqual(res1, 0x80017FFF)
+
+        # SGPR and Literal
+        instr2 = VCvtPknormI16F32Instruction(
+            dst=Reg(1, RegType.VGPR),
+            src0=VOP3Operand(Reg(2, RegType.SGPR)),
+            src1=VOP3Operand(Literal32.from_float(1.0)),
+        )
+        res2 = self.interp.step(instr2, self.state)
+        self.assertEqual(res2, 0x7FFF8001)
+
+    def test_input_modifiers_in_interpreter(self) -> None:
+        """Verify abs and neg input modifiers evaluated properly by interpreter."""
+        self.state.set_vgpr(1, NEG_ONE_F32)
+        self.state.set_vgpr(2, POS_HALF_F32)
+
+        instr = VCvtPknormI16F32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(1, RegType.VGPR), abs_mod=True),
+            src1=VOP3Operand(Reg(2, RegType.VGPR), neg_mod=True),
+        )
+
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 0xC0007FFF)
+        self.assertEqual(self.state.get_vgpr(0), 0xC0007FFF)
+
+    def test_clamp_modifier_in_interpreter(self) -> None:
+        """Verify clamp modifier evaluated properly by interpreter."""
+        self.state.set_vgpr(1, NEG_ONE_F32)
+        self.state.set_vgpr(2, NEG_HALF_F32)
+
+        instr = VCvtPknormI16F32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(1, RegType.VGPR)),
+            src1=VOP3Operand(Reg(2, RegType.VGPR)),
+            clamp=True,
+        )
+
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 0x00000000)
+        self.assertEqual(self.state.get_vgpr(0), 0x00000000)
+
+    def test_register_state_isolation(self) -> None:
+        """Verify only destination VGPR is written and all other registers remain unchanged."""
+        for i in range(256):
+            self.state.set_vgpr(i, 0x11111111 * (i % 7 + 1))
+            self.state.set_sgpr(i, 0x22222222 * (i % 5 + 1))
+
+        self.state.set_vgpr(10, POS_ONE_F32)
+        self.state.set_vgpr(20, POS_ONE_F32)
+
+        instr = VCvtPknormI16F32Instruction(
+            dst=Reg(30, RegType.VGPR),
+            src0=VOP3Operand(Reg(10, RegType.VGPR)),
+            src1=VOP3Operand(Reg(20, RegType.VGPR)),
+        )
+
+        self.interp.step(instr, self.state)
+        self.assertEqual(self.state.get_vgpr(30), 0x7FFF7FFF)
+
+        # Check all other VGPRs
+        for i in range(256):
+            if i in (10, 20, 30):
+                continue
+            expected = 0x11111111 * (i % 7 + 1)
+            self.assertEqual(self.state.get_vgpr(i), expected)
+
+        # Check all SGPRs
+        for i in range(256):
+            expected = 0x22222222 * (i % 5 + 1)
+            self.assertEqual(self.state.get_sgpr(i), expected)
+
+    def test_out_of_bounds_register_access(self) -> None:
+        """Verify out of range register indices raise IndexError."""
+        with self.assertRaises(IndexError):
+            self.state.get_vgpr(256)
+        with self.assertRaises(IndexError):
+            self.state.set_vgpr(-1, 0)
+        with self.assertRaises(IndexError):
+            self.state.get_sgpr(300)
+        with self.assertRaises(IndexError):
+            self.state.set_sgpr(-5, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
