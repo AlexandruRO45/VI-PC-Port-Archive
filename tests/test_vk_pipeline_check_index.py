@@ -55,10 +55,19 @@ class IndexTest(unittest.TestCase):
     def test_malformed_index_is_still_an_error(self):
         self.assert_index_error(self.run_tool('{"a": '))
 
+    def test_trailing_content_is_an_error(self):
+        for index_text in ("{} {}", '{"shader":{"stage":"cs"}}\nextra'):
+            with self.subTest(index_text=index_text):
+                r = self.run_tool(index_text)
+                self.assert_index_error(r)
+                self.assertIn("unexpected content after top-level object", r.stderr)
+
     def test_valid_empty_object_is_an_empty_corpus(self):
-        r = self.run_tool("{}")
-        self.assertNotIn("cannot use", r.stderr)
-        self.assertIn("0 shaders in index", r.stderr)
+        for index_text in ("{}", "{} \n\t"):
+            with self.subTest(index_text=index_text):
+                r = self.run_tool(index_text)
+                self.assertNotIn("cannot use", r.stderr)
+                self.assertIn("0 shaders in index", r.stderr)
 
 
 if __name__ == "__main__":

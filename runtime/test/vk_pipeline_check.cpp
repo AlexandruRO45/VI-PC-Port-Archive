@@ -299,15 +299,21 @@ std::map<std::string, ShaderMeta> read_index(const std::string& path, std::strin
     p.ws();
     if (p.i >= s.size()) { err = "the file is empty (an intentionally empty index is {})"; return out; }
     if (!p.consume('{')) { err = "expected '{' at byte " + std::to_string(p.i); return out; }
+    auto finish = [&]() -> std::map<std::string, ShaderMeta> {
+        p.ws();
+        if (p.i == s.size()) return std::move(out);
+        err = "unexpected content after top-level object at byte " + std::to_string(p.i);
+        return {};
+    };
     while (!p.error && p.i < s.size()) {
-        if (p.consume('}')) return out;
+        if (p.consume('}')) return finish();
         const size_t before = p.i;
         std::string name = p.parse_string();
         if (p.error) break;
         if (!p.consume(':')) { p.fail("expected ':' after shader name"); break; }
         out[name] = p.parse_meta();
         if (p.error) break;
-        if (p.consume('}')) return out;
+        if (p.consume('}')) return finish();
         if (!p.consume(',') || p.i == before) { p.fail("expected ',' or '}' in index.json"); break; }
     }
     if (p.error) { err = p.error_msg; return {}; }
