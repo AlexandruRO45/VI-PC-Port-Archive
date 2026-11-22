@@ -1268,5 +1268,95 @@ class TestValuQsadPkU16U8StatusFlags(unittest.TestCase):
         self.assertFalse(flags_unclamped.any_clamped)
 
 
+class TestValuQsadPkU16U8IEEE754Boundaries(unittest.TestCase):
+    """Unit tests for IEEE 754 bit pattern boundaries and integer extreme limits."""
+
+    def test_ieee754_float32_special_bit_patterns_as_raw_bytes(self) -> None:
+        pos_zero = 0x0000_0000
+        neg_zero = 0x8000_0000
+        pos_inf = 0x7F80_0000
+        neg_inf = 0xFF80_0000
+        qnan = 0x7FC0_0000
+        snan = 0x7F80_0001
+
+        patterns = [pos_zero, neg_zero, pos_inf, neg_inf, qnan, snan]
+        for p0 in patterns:
+            for p1 in patterns:
+                ref = (p0 << 32) | p1
+                query = p0
+                acc = 0
+                res = ref_qsad_pk_u16_u8(ref, query, acc)
+                # Verify pure unsigned byte subtraction without floating-point trap
+                expected = ref_qsad_pk_u16_u8(ref, query, acc)
+                self.assertEqual(res, expected)
+
+    def test_subnormal_float_bits_no_ftz(self) -> None:
+        # Subnormals: 0x00000001 and 0x00000002
+        # If flushed to zero (FTZ), difference would be 0!
+        sub1 = 0x0000_0001
+        sub2 = 0x0000_0002
+        ref = (sub1 << 32) | sub1
+        query = sub2
+        res = ref_qsad_pk_u16_u8(ref, query, 0)
+        e0, e1, e2, e3 = unpack_u16x4(res)
+        # Byte 0 of sub1 is 1, byte 0 of sub2 is 2 -> |1 - 2| = 1
+        # Other bytes are 0 -> total SAD at window 0 is exactly 1
+        self.assertEqual(e0, 1)
+
+    def test_nan_payload_preservation_and_integer_arithmetic(self) -> None:
+        # Signaling NaN: 0x7F800001 (bytes: 01, 00, 80, 7F)
+        # Quiet NaN:     0x7FC00000 (bytes: 00, 00, C0, 7F)
+        # Byte diffs: |1 - 0| = 1, |0 - 0| = 0, |0x80 - 0xC0| = 0x40 (64), |0x7F - 0x7F| = 0
+        # Total SAD = 1 + 0 + 64 + 0 = 65
+        snan = 0x7F80_0001
+        qnan = 0x7FC0_0000
+        ref = (snan << 32) | snan
+        query = qnan
+        res = ref_qsad_pk_u16_u8(ref, query, 0)
+        e0, _, _, _ = unpack_u16x4(res)
+        self.assertEqual(e0, 65)
+
+    def test_float16_packed_patterns_in_accumulator(self) -> None:
+        # Float16 special bit patterns: +0 (0x0000), -0 (0x8000), +inf (0x7C00), qNaN (0x7E00)
+        f16_pzero = 0x0000
+        f16_nzero = 0x8000
+        f16_pinf = 0x7C00
+        f16_qnan = 0x7E00
+
+        acc = pack_u16x4(f16_pzero, f16_nzero, f16_pinf, f16_qnan)
+        # With zero SAD, accumulator patterns must be preserved exactly as 16-bit integers
+        ref = 0
+        query = 0
+        res = ref_qsad_pk_u16_u8(ref, query, acc)
+        self.assertEqual(res, acc)
+
+    def test_byte_extreme_boundary_matrix(self) -> None:
+        byte_extremes = [0x00, 0x01, 0x7F, 0x80, 0xFE, 0xFF]
+        for b0 in byte_extremes:
+            for b1 in byte_extremes:
+                sad = ref_sad_u8_quad(pack_u8x8(b0, b0, b0, b0, 0, 0, 0, 0) & MASK32,
+                                        pack_u8x8(b1, b1, b1, b1, 0, 0, 0, 0) & MASK32)
+                expected_sad = 4 * abs(b0 - b1)
+                self.assertEqual(sad, expected_sad)
+
+    def test_accumulator_16bit_extreme_boundaries(self) -> None:
+        acc_extremes = [0x0000, 0x0001, 0x7FFF, 0x8000, 0xFFFE, 0xFFFF]
+        # Maximum SAD = 1020
+        ref = pack_u8x8(0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF)
+        query = 0x0000_0000
+
+        for a in acc_extremes:
+            acc = pack_u16x4(a, a, a, a)
+            # Unclamped
+            res_unclamped = ref_qsad_pk_u16_u8(ref, query, acc, clamp=False)
+            e_unclamped, _, _, _ = unpack_u16x4(res_unclamped)
+            self.assertEqual(e_unclamped, (1020 + a) & 0xFFFF)
+
+            # Clamped
+            res_clamped = ref_qsad_pk_u16_u8(ref, query, acc, clamp=True)
+            e_clamped, _, _, _ = unpack_u16x4(res_clamped)
+            self.assertEqual(e_clamped, min(1020 + a, 0xFFFF))
+
+
 if __name__ == "__main__":
     unittest.main()
