@@ -352,6 +352,76 @@ class ScalarVALUInterpreter:
 
 
 # ==============================================================================
+# SIMD Multi-Lane Divergence and 32/64-bit EXEC Masking
+# ==============================================================================
+
+class SIMDWaveState:
+    """Represents the execution state of an AMD RDNA2 wavefront (Wave32 or Wave64)."""
+
+    def __init__(self, wave_size: int = 32, exec_mask: int | None = None) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Invalid wave_size {wave_size}; must be 32 or 64")
+        self.wave_size: int = wave_size
+        default_mask = MASK32 if wave_size == 32 else MASK64
+        self.exec_mask: int = (exec_mask & default_mask) if exec_mask is not None else default_mask
+        self.vgprs: List[List[int]] = [[0] * 256 for _ in range(wave_size)]
+        self.sgprs: List[int] = [0] * 106
+
+    def is_lane_active(self, lane: int) -> bool:
+        if not (0 <= lane < self.wave_size):
+            raise IndexError(f"Lane index {lane} out of range [0, {self.wave_size - 1}]")
+        return bool((self.exec_mask >> lane) & 1)
+
+    def read_lane(self, lane: int, op: Operand) -> int:
+        if op.reg_type == RegType.LITERAL:
+            assert op.literal_value is not None
+            return op.literal_value
+        if op.reg_type == RegType.VGPR:
+            return self.vgprs[lane][op.index] & MASK32
+        if op.reg_type == RegType.SGPR:
+            return self.sgprs[op.index] & MASK32
+        raise ValueError(f"Unknown operand type: {op.reg_type}")
+
+    def write_lane(self, lane: int, op: Operand, value: int) -> None:
+        if op.reg_type != RegType.VGPR:
+            raise TypeError("VALU SIMD write must target VGPRs")
+        self.vgprs[lane][op.index] = u32(value)
+
+
+class SIMDVALUInterpreter:
+    """SIMD wavefront instruction interpreter honoring 32/64-bit EXEC masking."""
+
+    def __init__(self, wave: SIMDWaveState) -> None:
+        self.wave: SIMDWaveState = wave
+
+    def step(self, instr: SadHiU16Instruction) -> List[int | None]:
+        results: List[int | None] = []
+        for lane in range(self.wave.wave_size):
+            if not self.wave.is_lane_active(lane):
+                results.append(None)
+                continue
+
+            s0 = self.wave.read_lane(lane, instr.src0)
+            s1 = self.wave.read_lane(lane, instr.src1)
+            s2 = self.wave.read_lane(lane, instr.src2)
+
+            if isinstance(instr, VSadHiU16Instruction):
+                res = ref_sad_hi_u16(s0, s1, s2, clamp=instr.clamp)
+            elif isinstance(instr, VMsadHiU16Instruction):
+                res = ref_msad_hi_u16(s0, s1, s2, clamp=instr.clamp)
+            else:
+                raise TypeError(f"Unsupported instruction AST: {type(instr)}")
+
+            self.wave.write_lane(lane, instr.dst, res)
+            results.append(res)
+        return results
+
+    def run_program(self, instructions: Sequence[SadHiU16Instruction]) -> None:
+        for instr in instructions:
+            self.step(instr)
+
+
+# ==============================================================================
 # Unit Tests: Reference Mathematical Oracles
 # ==============================================================================
 
@@ -665,6 +735,125 @@ class TestValuSadHiU16ScalarInterpreter(unittest.TestCase):
     def test_unsupported_instruction_type_raises(self) -> None:
         with self.assertRaises(TypeError):
             self.interp.step("invalid")  # type: ignore
+
+
+class TestValuSadHiU16SIMDMultiLane(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_all_lanes_active(self) -> None:
+        wave = SIMDWaveState(wave_size=32, exec_mask=0xFFFF_FFFF)
+        interp = SIMDVALUInterpreter(wave)
+        for lane in range(32):
+            wave.vgprs[lane][1] = pack_halfwords_u32(lane, lane)
+            wave.vgprs[lane][2] = pack_halfwords_u32(0, 0)
+            wave.vgprs[lane][3] = 0x0001_0000
+
+        instr = VSadHiU16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+        results = interp.step(instr)
+        for lane in range(32):
+            expected = (((2 * lane) << 16) + 0x0001_0000) & MASK32
+            self.assertEqual(results[lane], expected)
+            self.assertEqual(wave.vgprs[lane][0], expected)
+
+    def test_wave32_divergent_mask_preserves_inactive_lanes(self) -> None:
+        mask = 0x5555_5555  # even lanes active
+        wave = SIMDWaveState(wave_size=32, exec_mask=mask)
+        interp = SIMDVALUInterpreter(wave)
+
+        for lane in range(32):
+            wave.vgprs[lane][0] = 0xCAFE_0000 + lane
+            wave.vgprs[lane][1] = pack_halfwords_u32(20, 30)
+            wave.vgprs[lane][2] = pack_halfwords_u32(10, 15)  # diff = 10 + 15 = 25 -> 25 << 16 = 0x0019_0000
+            wave.vgprs[lane][3] = 0x0001_0000
+
+        instr = VSadHiU16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+        results = interp.step(instr)
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(results[lane], 0x001A_0000)
+                self.assertEqual(wave.vgprs[lane][0], 0x001A_0000)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(wave.vgprs[lane][0], 0xCAFE_0000 + lane)
+
+    def test_wave32_all_inactive_lanes(self) -> None:
+        wave = SIMDWaveState(wave_size=32, exec_mask=0)
+        interp = SIMDVALUInterpreter(wave)
+        for lane in range(32):
+            wave.vgprs[lane][0] = 0xDEAD_BEEF
+        instr = VSadHiU16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.literal(1),
+            src1=Operand.literal(2),
+            src2=Operand.literal(3),
+        )
+        results = interp.step(instr)
+        self.assertTrue(all(r is None for r in results))
+        for lane in range(32):
+            self.assertEqual(wave.vgprs[lane][0], 0xDEAD_BEEF)
+
+    def test_wave64_multi_lane_divergence(self) -> None:
+        mask64 = 0x0123_4567_89AB_CDEF
+        wave = SIMDWaveState(wave_size=64, exec_mask=mask64)
+        interp = SIMDVALUInterpreter(wave)
+
+        for lane in range(64):
+            wave.vgprs[lane][0] = 0x8888 * (lane + 1)
+            wave.vgprs[lane][1] = pack_halfwords_u32(lane * 5, 0)
+            wave.vgprs[lane][2] = pack_halfwords_u32(10, 0)
+            wave.vgprs[lane][3] = 0x1000
+
+        instr = VSadHiU16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+        results = interp.step(instr)
+        for lane in range(64):
+            is_active = bool((mask64 >> lane) & 1)
+            if is_active:
+                expected = ref_sad_hi_u16(wave.vgprs[lane][1], wave.vgprs[lane][2], 0x1000)
+                self.assertEqual(results[lane], expected)
+                self.assertEqual(wave.vgprs[lane][0], expected)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(wave.vgprs[lane][0], 0x8888 * (lane + 1))
+
+    def test_wave32_msad_hi_u16_simd_divergence(self) -> None:
+        mask = 0x00FF_00FF
+        wave = SIMDWaveState(wave_size=32, exec_mask=mask)
+        interp = SIMDVALUInterpreter(wave)
+        for lane in range(32):
+            wave.vgprs[lane][0] = 0
+            wave.vgprs[lane][1] = pack_halfwords_u32(50, 100)
+            wave.vgprs[lane][2] = pack_halfwords_u32(0, 80)  # low masked out, high diff 20 -> 20 << 16 = 0x0014_0000
+            wave.vgprs[lane][3] = 0x0001_0000
+
+        instr = VMsadHiU16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+        results = interp.step(instr)
+        for lane in range(32):
+            if bool((mask >> lane) & 1):
+                self.assertEqual(results[lane], 0x0015_0000)
+                self.assertEqual(wave.vgprs[lane][0], 0x0015_0000)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(wave.vgprs[lane][0], 0)
 
 
 if __name__ == "__main__":
