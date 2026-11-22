@@ -16,6 +16,7 @@ fs_passthru.spv; here the mesh checks run when those files are in <out dir>/spir
 ps_tex is skipped when the device lacks a feature the bindless set or the shader needs, ps_ssharp when it lacks one
 vk_sampler_test needs.
 ps_texoff (texel offsets, on vk_texture_test's texture) is skipped on a device without VK_KHR_maintenance8.
+The TEXTURE_MODES shaders run in one of vk_texture_test's own modes, which judges every pixel itself.
 """
 import collections
 import json
@@ -1280,6 +1281,25 @@ def bary_persp_problem(px):
     return f"{wrong} pixels off the perspective-correct reference ({covered} covered); {first}" if wrong else ""
 
 
+# Shaders vk_texture_test draws and judges in one of its own modes (it loads vs_ids.spv and the shader from its
+# working directory and prints PASSED), as scripts/run_gpu_tests.py runs them: name -> mode.
+TEXTURE_MODES = {"ps_sample_c_lz": "dref"}
+
+
+def texture_mode_test(tools, spirv, name):
+    """One of the TEXTURE_MODES shaders on vk_texture_test."""
+    for shader in ("vs_ids", name):
+        if not os.path.isfile(os.path.join(spirv, shader + ".spv")):
+            return f"missing {shader}.spv"
+    tool = os.path.abspath(os.path.join(tools, "vk_texture_test" + EXE))
+    with tempfile.TemporaryDirectory(prefix="leonida-texture-") as tmp:
+        code, out = run(tool, TEXTURE_MODES[name], str(Path(tmp) / "pixels.raw"), cwd=spirv)
+    if code == UNSUPPORTED:
+        m = re.search(r"unsupported: .*", out)
+        return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
+    return "" if code == 0 and "PASSED" in out else failure(code, out, 3)
+
+
 def pixels(tools, spirv, name, fmt, vertex="vs_ids"):
     # Draw at the shader's own wave size, as run_gpu_tests.py does (#146): a wave32 pixel shader run as wave64
     # (RADV's default on RDNA1) reads lanes it was never written for.
@@ -1817,6 +1837,8 @@ def main():
     results.append(("ps_table_fetch", table_fetch_test(tools, spirv)))
     for name in GRADIENT_TESTS:
         results.append((name, texture_gradient_a16_test(tools, spirv, name)))
+    for name in TEXTURE_MODES:
+        results.append((name, texture_mode_test(tools, spirv, name)))
     for name, problem in results:
         if problem is None:
             problem = "SKIP (full 64-wide compute subgroups unavailable)"
