@@ -642,6 +642,123 @@ class TestValuOr3B32RegisterAliasing(unittest.TestCase):
             self.assertEqual(state.get_vgpr(lane, 1), 0x100)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class Or3StatusFlags:
+    """Architectural condition codes and status flags for v_or3_b32."""
+    zero: bool
+    sign: bool
+    all_ones: bool
+    parity: bool
+    pairwise_overlap: bool
+    vcc_modified: bool = False
+
+
+def evaluate_or3_flags(
+    res32: int,
+    s0: int,
+    s1: int,
+    s2: int,
+) -> Or3StatusFlags:
+    """Evaluate condition codes, parity, and pairwise bit collision."""
+    res = res32 & MASK32
+    s0_u = s0 & MASK32
+    s1_u = s1 & MASK32
+    s2_u = s2 & MASK32
+
+    bits_set = bin(res).count("1")
+    overlap = ((s0_u & s1_u) | (s0_u & s2_u) | (s1_u & s2_u)) != 0
+
+    return Or3StatusFlags(
+        zero=(res == 0),
+        sign=bool(res & 0x8000_0000),
+        all_ones=(res == MASK32),
+        parity=(bits_set % 2) == 0,
+        pairwise_overlap=overlap,
+        vcc_modified=False,
+    )
+
+
+def compute_u32_or3_carry(s0: int, s1: int, s2: int) -> int:
+    """Compute majority function carry across 3 operands: (s0&s1)|(s0&s2)|(s1&s2)."""
+    a = s0 & MASK32
+    b = s1 & MASK32
+    c = s2 & MASK32
+    return (a & b) | (a & c) | (b & c)
+
+
+class TestValuOr3B32ConditionCodes(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow isolation."""
+
+    def test_condition_codes_zero_flag(self) -> None:
+        res = oracle_v_or3_b32(0, 0, 0)
+        flags = evaluate_or3_flags(res, 0, 0, 0)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.sign)
+        self.assertFalse(flags.all_ones)
+        self.assertTrue(flags.parity)
+        self.assertFalse(flags.pairwise_overlap)
+
+    def test_condition_codes_sign_flag(self) -> None:
+        res = oracle_v_or3_b32(0x80000000, 0x10, 0x20)
+        flags = evaluate_or3_flags(res, 0x80000000, 0x10, 0x20)
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.sign)
+        self.assertFalse(flags.all_ones)
+
+    def test_condition_codes_all_ones_flag(self) -> None:
+        res = oracle_v_or3_b32(0xFFFF0000, 0x0000FF00, 0x000000FF)
+        flags = evaluate_or3_flags(res, 0xFFFF0000, 0x0000FF00, 0x000000FF)
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.all_ones)
+        self.assertTrue(flags.sign)
+        self.assertTrue(flags.parity)  # 32 bits set -> even parity
+
+    def test_condition_codes_parity(self) -> None:
+        # 0 bits -> even (True)
+        self.assertTrue(evaluate_or3_flags(0, 0, 0, 0).parity)
+        # 1 bit -> odd (False)
+        self.assertFalse(evaluate_or3_flags(1, 1, 0, 0).parity)
+        # 2 bits -> even (True)
+        self.assertTrue(evaluate_or3_flags(3, 1, 2, 0).parity)
+
+    def test_pairwise_overlap_and_majority_carry(self) -> None:
+        # No overlap across operands: disjoint bits
+        res = oracle_v_or3_b32(0x01, 0x02, 0x04)
+        flags = evaluate_or3_flags(res, 0x01, 0x02, 0x04)
+        self.assertFalse(flags.pairwise_overlap)
+        self.assertEqual(compute_u32_or3_carry(0x01, 0x02, 0x04), 0)
+
+        # Overlap between S0 and S2
+        res2 = oracle_v_or3_b32(0x05, 0x02, 0x04)
+        flags2 = evaluate_or3_flags(res2, 0x05, 0x02, 0x04)
+        self.assertTrue(flags2.pairwise_overlap)
+        self.assertEqual(compute_u32_or3_carry(0x05, 0x02, 0x04), 0x04)
+
+    def test_vcc_isolation(self) -> None:
+        interp = ScalarVALUInterpreter()
+        canary_vcc = 0xFEEDFACECAFEBEEF
+        state = ScalarMachineState(vcc=canary_vcc)
+
+        instr = VOr3B32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Literal32(0xFFFFFFFF)),
+            src1=VOP3Operand(Literal32(0xFFFFFFFF)),
+            src2=VOP3Operand(Literal32(0xFFFFFFFF)),
+        )
+        interp.step(instr, state)
+        self.assertEqual(state.vcc, canary_vcc)
+
+        simd = SIMDInterpreter()
+        simd_state = SIMDState(num_lanes=64, vcc=canary_vcc)
+        simd.step(instr, simd_state)
+        self.assertEqual(simd_state.vcc, canary_vcc)
+
+
+
 
 
 
