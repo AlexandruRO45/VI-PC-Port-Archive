@@ -17,6 +17,13 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 namespace {
 
 int failures = 0;
@@ -35,15 +42,17 @@ using leonida::MoltenVKSettings;
 using Words = std::vector<std::uint32_t>;
 
 constexpr std::uint32_t kNoContraction = 42, kSzinp = 4461, kSzinpCapability = 4466;
-constexpr std::uint32_t kDecorate = 71, kDecorationGroup = 73, kGroupDecorate = 74, kCopyObject = 83,
-                        kFNegate = 127, kFAdd = 129, kFSub = 131, kFMul = 133;
+constexpr std::uint32_t kConstant = 43, kDecorate = 71, kDecorationGroup = 73, kGroupDecorate = 74,
+                        kCompositeExtract = 81, kCopyObject = 83, kFNegate = 127, kFAdd = 129, kFSub = 131,
+                        kFMul = 133, kVectorTimesScalar = 142, kDot = 148;
 
-// The ids every module has; a test's own values start at kFirstValue.
-enum : std::uint32_t { kVoid = 1, kFloat, kFunctionType, kA, kB, kC, kMain, kLabel, kFirstValue };
+// The ids every module has; a test's own values start at kFirstValue. kV is the vec2 (a, b).
+enum : std::uint32_t { kVoid = 1, kFloat, kFunctionType, kA, kB, kC, kMain, kLabel, kVec2, kV, kFirstValue };
 
 std::uint32_t opcode(std::uint32_t code, std::size_t operands) { return std::uint32_t(operands + 1) << 16 | code; }
 
-// A GLCompute module, SPIR-V 1.4, whose function computes `body` on the constants a = 1, b = 2 and c = 3.
+// A GLCompute module, SPIR-V 1.4, whose function computes `body` on the constants a = 1, b = 2, c = 3 and the
+// vec2 v = (a, b).
 struct Module {
     bool signed_zero_inf_nan_preserve = true;
     std::set<std::uint32_t> decorated;     // OpDecorate %id NoContraction
@@ -52,7 +61,10 @@ struct Module {
     std::uint32_t next = kFirstValue;
 
     std::uint32_t value(std::uint32_t code, std::initializer_list<std::uint32_t> operands) {
-        Words op{opcode(code, operands.size() + 2), kFloat, next};
+        return typed(kFloat, code, operands);
+    }
+    std::uint32_t typed(std::uint32_t type, std::uint32_t code, std::initializer_list<std::uint32_t> operands) {
+        Words op{opcode(code, operands.size() + 2), type, next};
         op.insert(op.end(), operands);
         body.push_back(op);
         return next++;
@@ -80,10 +92,12 @@ struct Module {
         for (const Words& a : annotations) w.insert(w.end(), a.begin(), a.end());
         op(19, {kVoid});                           // OpTypeVoid
         op(22, {kFloat, 32});                      // OpTypeFloat 32
+        op(23, {kVec2, kFloat, 2});                // OpTypeVector %float 2
         op(33, {kFunctionType, kVoid});            // OpTypeFunction
         op(43, {kFloat, kA, 0x3f800000});          // OpConstant 1.0
         op(43, {kFloat, kB, 0x40000000});          // 2.0
         op(43, {kFloat, kC, 0x40400000});          // 3.0
+        op(44, {kVec2, kV, kA, kB});               // OpConstantComposite (a, b)
         op(54, {kVoid, kMain, 0, kFunctionType});  // OpFunction
         op(248, {kLabel});                         // OpLabel
         for (const Words& b : body) w.insert(w.end(), b.begin(), b.end());
@@ -113,9 +127,25 @@ void validate(const Words& words, const char* what) {
         expect(false, ("cannot write " + path).c_str());
         return;
     }
-    const std::string command =
-        std::string("\"") + spirv_val + "\" --target-env vulkan1.2 \"" + path + "\"";
-    if (std::system(command.c_str()) != 0) {
+    // Run directly, not through a shell, so nothing in the paths is expanded or split.
+#ifdef _WIN32
+    // _spawnvp searches PATH as execvp does, and joins its arguments with spaces; quoting keeps a path with
+    // spaces whole ('"' cannot be in one).
+    const std::string program = std::string("\"") + spirv_val + "\"", file = "\"" + path + "\"";
+    const char* const args[] = {program.c_str(), "--target-env", "vulkan1.2", file.c_str(), nullptr};
+    const bool passes = _spawnvp(_P_WAIT, spirv_val, args) == 0;
+#else
+    const pid_t child = fork();
+    if (child == 0) {
+        const char* const args[] = {spirv_val, "--target-env", "vulkan1.2", path.c_str(), nullptr};
+        execvp(spirv_val, const_cast<char* const*>(args));
+        _exit(127);
+    }
+    int status = 0;
+    const bool passes = child > 0 && waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+                        WEXITSTATUS(status) == 0;
+#endif
+    if (!passes) {
         std::fprintf(stderr, "spirv-val rejects %s (%s)\n", path.c_str(), what);
         ++failures;
     }
@@ -247,6 +277,60 @@ void test_decorated_consumer() {
     expect_rewrite(m, MetalSafeMath::if_declared, m.with_decorated({sum, difference}), "on demand, same");
 }
 
+// The other SPIR-V multiplies fuse into an add as OpFMul does: v * c + v, dot(v, v) + a, (v * b).x + c.
+void test_vector_multiplies() {
+    Module m;
+    const std::uint32_t scaled = m.typed(kVec2, kVectorTimesScalar, {kV, kC});
+    const std::uint32_t sum = m.typed(kVec2, kFAdd, {scaled, kV});
+    const std::uint32_t dot = m.value(kDot, {kV, kV});
+    const std::uint32_t dot_sum = m.add(dot, kA);
+    const std::uint32_t lane_product = m.typed(kVec2, kVectorTimesScalar, {kV, kB});
+    const std::uint32_t lane = m.value(kCompositeExtract, {lane_product, 0});
+    const std::uint32_t lane_sum = m.add(lane, kC);
+    const std::uint32_t lone = m.typed(kVec2, kVectorTimesScalar, {kV, kA});  // used by nothing
+
+    // Only the adds are decorated: each keeps it, since dropping it would let the product fuse in.
+    const Module adds = m.with_decorated({sum, dot_sum, lane_sum, lone});
+    expect_rewrite(adds, MetalSafeMath::always, m.with_decorated({sum, dot_sum, lane_sum}),
+                   "OpVectorTimesScalar, OpDot and an extracted lane into a decorated add");
+    expect_rewrite(adds, MetalSafeMath::if_declared, m.with_decorated({sum, dot_sum, lane_sum}), "same, on demand");
+
+    // Every operation decorated: the products keep theirs, and so do the adds. SPIRV-Cross writes only OpFMul as
+    // spvFMul; a decorated OpVectorTimesScalar or OpDot is a plain `*` or dot(), which Metal still fuses into the
+    // add's expression unless the add is spvFAdd.
+    const Module all = m.with_decorated({scaled, sum, dot, dot_sum, lane_product, lane, lane_sum, lone});
+    expect_rewrite(all, MetalSafeMath::always, m.with_decorated({scaled, sum, dot, dot_sum, lane_product, lane_sum}),
+                   "decorated vector products and their adds keep theirs");
+
+    // The smallest case: v * c + v with both decorated keeps both.
+    Module pair;
+    const std::uint32_t pair_product = pair.typed(kVec2, kVectorTimesScalar, {kV, kC});
+    const std::uint32_t pair_sum = pair.typed(kVec2, kFAdd, {pair_product, kV});
+    pair.decorated = {pair_product, pair_sum};
+    expect_rewrite(pair, MetalSafeMath::always, pair, "decorated OpVectorTimesScalar into a decorated OpFAdd");
+    expect_rewrite(pair, MetalSafeMath::if_declared, pair, "same, on demand");
+}
+
+// Inserts `mode` after the module's OpEntryPoint.
+Words with_execution_mode(Words words, std::initializer_list<std::uint32_t> mode) {
+    for (std::size_t i = 5; i < words.size(); i += words[i] >> 16)
+        if ((words[i] & 0xffff) == 15) {
+            words.insert(words.begin() + static_cast<std::ptrdiff_t>(i + (words[i] >> 16)), mode);
+            break;
+        }
+    return words;
+}
+
+// Sets word `k` of the first instruction with opcode `code`.
+Words with_word(Words words, std::uint32_t code, std::size_t k, std::uint32_t word) {
+    for (std::size_t i = 5; i < words.size(); i += words[i] >> 16)
+        if ((words[i] & 0xffff) == code) {
+            words[i + k] = word;
+            break;
+        }
+    return words;
+}
+
 void test_malformed() {
     const Words valid = Basic().m.words();
 
@@ -255,7 +339,18 @@ void test_malformed() {
     expect_unchanged(truncated, "truncated module");
     expect_unchanged({1, 2, 3, 4, 5, 6}, "not SPIR-V");
     expect_unchanged({0x07230203, 0x00010400, 0, 16}, "a header of four words");
+    expect_unchanged({0x07230203, 0x00010400, 0, 2, 0}, "a header of five words, no instruction");
     expect_unchanged({}, "empty");
+
+    // The header: version 0x00MMmm00 for SPIR-V 1.0 to 1.6, schema 0.
+    for (const std::uint32_t version : {0x01010400u, 0x00010401u, 0x00020000u, 0x00000400u, 0x00010700u}) {
+        Words bad_version = valid;
+        bad_version[1] = version;
+        expect_unchanged(bad_version, "version word");
+    }
+    Words schema = valid;
+    schema[4] = 1;
+    expect_unchanged(schema, "schema word not 0");
 
     // A bound of 0xffffffff must not size the tables: 16 GiB for four words of header.
     const auto start = std::chrono::steady_clock::now();
@@ -269,18 +364,23 @@ void test_malformed() {
     zero_count.insert(zero_count.begin() + 5, 0);  // an instruction of zero words
     expect_unchanged(zero_count, "instruction word count 0");
 
-    // OpExecutionMode %main SignedZeroInfNanPreserve without its bit width.
+    // OpExecutionMode %main SignedZeroInfNanPreserve without its bit width, with two, or with a width that is not
+    // 16, 32 or 64.
     Module module = Basic().m;
     module.signed_zero_inf_nan_preserve = false;
-    Words no_width = module.words();
-    for (std::size_t i = 5; i < no_width.size(); i += no_width[i] >> 16)
-        if ((no_width[i] & 0xffff) == 14) {  // after OpMemoryModel's three words, OpEntryPoint's five
-            const std::size_t at = i + 3 + 5;
-            no_width.insert(no_width.begin() + at, {opcode(16, 2), kMain, kSzinp});
-            break;
-        }
-    expect_unchanged(no_width, "SignedZeroInfNanPreserve without its width");
-    expect(leonida::drop_no_contraction(no_width, MetalSafeMath::if_declared) == no_width, "same, on demand");
+    const Words undeclared = module.words();
+    for (const Words& bad_mode : {with_execution_mode(undeclared, {opcode(16, 2), kMain, kSzinp}),
+                                  with_execution_mode(undeclared, {opcode(16, 4), kMain, kSzinp, 32, 32}),
+                                  with_execution_mode(undeclared, {opcode(16, 3), kMain, kSzinp, 8}),
+                                  with_execution_mode(undeclared, {opcode(16, 3), kMain, kSzinp, 0})}) {
+        expect_unchanged(bad_mode, "malformed SignedZeroInfNanPreserve");
+        expect(leonida::drop_no_contraction(bad_mode, MetalSafeMath::if_declared) == bad_mode, "same, on demand");
+    }
+
+    // A result id at the bound, 0, or defined twice (the OpConstant of a defines b's id).
+    expect_unchanged(with_word(valid, kConstant, 2, valid[3]), "OpConstant result id at the bound");
+    expect_unchanged(with_word(valid, kConstant, 2, 0), "OpConstant result id 0");
+    expect_unchanged(with_word(valid, kConstant, 2, kB), "a result id defined twice");
 
     Words out_of_bound = valid;
     for (std::size_t i = 5; i < out_of_bound.size(); i += out_of_bound[i] >> 16)
@@ -299,16 +399,36 @@ void test_malformed() {
         }
     expect_unchanged(decorate_operand, "NoContraction with an operand");
 
-    // A copy that is its own operand: invalid, and must not hang.
+    // NoContraction, another decoration or an execution mode on an id below the bound that nothing defines.
+    Module ghost = Basic().m;
+    const std::uint32_t undefined = ghost.next++;
+    Module ghost_decorated = ghost;
+    ghost_decorated.decorated.insert(undefined);
+    expect_unchanged(ghost_decorated.words(), "NoContraction on an id nothing defines");
+    Module ghost_annotated = ghost;
+    ghost_annotated.annotations = {{opcode(kDecorate, 2), undefined, 0}};  // RelaxedPrecision
+    expect_unchanged(ghost_annotated.words(), "a decoration on an id nothing defines");
+    expect_unchanged(with_execution_mode(ghost.words(), {opcode(16, 5), undefined, 17, 1, 1, 1}),
+                     "an execution mode on an id nothing defines");
+
+    // A copy that is its own operand, and two copies of each other: each reads a value not defined before it,
+    // which only an invalid module does. The module stays as it is, and the rewrite ends.
     Module cycle;
-    const std::uint32_t self = cycle.next;
+    const std::uint32_t self = cycle.next++;
     cycle.body.push_back({opcode(kCopyObject, 3), kFloat, self, self});
-    cycle.next++;
-    const std::uint32_t sum = cycle.add(self, kA);
-    cycle.decorated = {sum};
-    const Words cyclic = cycle.words();
-    expect(leonida::drop_no_contraction(cyclic, MetalSafeMath::always) == cycle.with_decorated({}).words(),
-           "a cycle of copies ends without a multiply");
+    const std::uint32_t first = cycle.next++, second = cycle.next++;
+    cycle.body.push_back({opcode(kCopyObject, 3), kFloat, first, second});
+    cycle.body.push_back({opcode(kCopyObject, 3), kFloat, second, first});
+    cycle.decorated = {cycle.add(self, kA), cycle.add(second, kB), cycle.mul(kA, kB)};
+    expect_unchanged(cycle.words(), "a cycle of copies");
+
+    // An add that reads a multiply defined after it.
+    Module forward;
+    const std::uint32_t later = forward.next++;
+    const std::uint32_t early_sum = forward.add(later, kA);
+    forward.body.push_back({opcode(kFMul, 4), kFloat, later, kB, kC});
+    forward.decorated = {early_sum, later};
+    expect_unchanged(forward.words(), "an operand defined after its use");
 }
 
 }  // namespace
@@ -326,6 +446,7 @@ int main(int argc, char** argv) {
     test_copy_chain();
     test_group();
     test_decorated_consumer();
+    test_vector_multiplies();
     test_malformed();
     if (failures) return 1;
     if (spirv_val) std::printf("moltenvk_no_contraction: %d modules pass spirv-val\n", validated);

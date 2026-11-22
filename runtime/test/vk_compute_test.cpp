@@ -170,10 +170,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "full 64-wide compute subgroups unavailable\n");
         return 77;
     }
-    // Empty after a failed read, or for a file under 20 bytes, not a whole number of words or without the magic.
+    // Empty after a failed read, or for a file under 20 bytes, not a whole number of words or without the magic;
+    // a header of five words alone has no instruction to make a module of.
     std::ifstream f(argv[1], std::ios::binary | std::ios::ate);
     const std::vector<uint32_t> spirv = leonida::read_spirv_words(f, f ? static_cast<std::streamoff>(f.tellg()) : -1);
-    if (spirv.empty()) {
+    if (spirv.size() <= 5) {
         std::fprintf(stderr, "%s: not a SPIR-V module\n", argv[1]);
         return 1;
     }
