@@ -58,6 +58,28 @@ def calc_gws_effective_offset(offset: int = 0, m0: int = 0) -> int:
     return (m0 + (offset & OFFSET16_MASK)) & MASK32
 
 
+def evaluate_gws_init_status(
+    value: int,
+    offset: int = 0,
+    m0: int = 0,
+    exec_mask: int = 0xFFFFFFFF,
+) -> dict[str, Union[bool, int]]:
+    """Architectural evaluation of status flags and condition codes for ds_gws_init."""
+    val = u32(value)
+    eff_16 = (m0 & OFFSET16_MASK) + (offset & OFFSET16_MASK)
+    eff_32 = m0 + (offset & OFFSET16_MASK)
+
+    return {
+        "zero_flag": (val == 0),
+        "sign_flag": bool(val & 0x8000_0000),
+        "offset_carry_out_16": (eff_16 > OFFSET16_MASK),
+        "offset_carry_out_32": (eff_32 > MASK32),
+        "active_wave": (exec_mask != 0),
+        "vcc_unmodified": True,
+        "scc_unmodified": True,
+    }
+
+
 def ref_ds_gws_init(init_val: int) -> int:
     """Pure mathematical reference oracle for ds_gws_init.
 
@@ -211,6 +233,8 @@ class ScalarState:
         self.vgprs: list[int] = [0] * DEFAULT_NUM_VGPRS
         self.sgprs: list[int] = [0] * DEFAULT_NUM_SGPRS
         self.m0: int = 0
+        self.vcc: int = 0
+        self.scc: int = 0
         self.gws: GWSMemory = GWSMemory(num_resources=num_gws_resources)
 
     def get_vgpr(self, index: int) -> int:
@@ -293,6 +317,8 @@ class SIMDState:
         self.vgprs: list[list[int]] = [[0] * DEFAULT_NUM_VGPRS for _ in range(num_lanes)]
         self.sgprs: list[int] = [0] * DEFAULT_NUM_SGPRS
         self.m0: int = 0
+        self.vcc: int = 0
+        self.scc: int = 0
         self.gws: GWSMemory = GWSMemory(num_resources=num_gws_resources)
 
     def is_lane_active(self, lane: int) -> bool:
@@ -780,6 +806,100 @@ class TestRegisterAliasingAndOperandPreservation(unittest.TestCase):
             for r in range(16):
                 expected = ((lane + 1) * 1000) + r
                 self.assertEqual(state.get_lane_vgpr(lane, r), expected)
+
+
+class TestConditionCodesStatusFlagsAndCarryBorrow(unittest.TestCase):
+    """Phase 6: Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def test_vcc_and_scc_preserved_scalar(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        # Pre-seed condition codes with sentinel values
+        state.vcc = 0xDEADBEEF_CAFEBABE
+        state.scc = 1
+        state.set_vgpr(0, 42)
+
+        instr = DSGWSInitInstruction(vdata0=RegisterOperand(0, RegType.VGPR), offset=0)
+        interp.execute(instr, state)
+
+        # Neither VCC nor SCC should be modified by ds_gws_init
+        self.assertEqual(state.vcc, 0xDEADBEEF_CAFEBABE)
+        self.assertEqual(state.scc, 1)
+
+    def test_vcc_and_scc_preserved_simd(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFFFFFF)
+        interp = SIMDInterpreter()
+
+        state.vcc = 0x12345678
+        state.scc = 0
+        state.set_lane_vgpr(0, 1, 99)
+
+        instr = DSGWSInitInstruction(vdata0=RegisterOperand(1, RegType.VGPR), offset=4)
+        interp.execute(instr, state)
+
+        self.assertEqual(state.vcc, 0x12345678)
+        self.assertEqual(state.scc, 0)
+
+    def test_no_carry_borrow_generated(self) -> None:
+        # Carry and borrow generation is an arithmetic operation (VOP2 / SALU).
+        # DS instructions never emit carry or borrow bits to condition code registers.
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        # Initialize with max values that in normal addition would produce carry
+        state.set_vgpr(0, 0xFFFFFFFF)
+        state.vcc = 0
+        state.scc = 0
+
+        instr = DSGWSInitInstruction(vdata0=RegisterOperand(0, RegType.VGPR), offset=63)
+        interp.execute(instr, state)
+
+        self.assertEqual(state.vcc, 0)
+        self.assertEqual(state.scc, 0)
+
+    def test_status_flags_zero_and_sign(self) -> None:
+        # Value 0: zero_flag=True, sign_flag=False
+        st0 = evaluate_gws_init_status(value=0, offset=0, m0=0)
+        self.assertTrue(st0["zero_flag"])
+        self.assertFalse(st0["sign_flag"])
+
+        # Value 100: zero_flag=False, sign_flag=False
+        st1 = evaluate_gws_init_status(value=100, offset=0, m0=0)
+        self.assertFalse(st1["zero_flag"])
+        self.assertFalse(st1["sign_flag"])
+
+        # Value 0x80000000 (sign bit set): zero_flag=False, sign_flag=True
+        st_sign = evaluate_gws_init_status(value=0x80000000, offset=0, m0=0)
+        self.assertFalse(st_sign["zero_flag"])
+        self.assertTrue(st_sign["sign_flag"])
+
+        # Value 0xFFFFFFFF: zero_flag=False, sign_flag=True
+        st_max = evaluate_gws_init_status(value=0xFFFFFFFF, offset=0, m0=0)
+        self.assertFalse(st_max["zero_flag"])
+        self.assertTrue(st_max["sign_flag"])
+
+    def test_status_flags_offset_carry_out(self) -> None:
+        # No carry out
+        st_no_carry = evaluate_gws_init_status(value=1, offset=10, m0=20)
+        self.assertFalse(st_no_carry["offset_carry_out_16"])
+        self.assertFalse(st_no_carry["offset_carry_out_32"])
+
+        # 16-bit offset carry out (e.g. m0=0xFFF0 + offset=0x0020 = 0x10010 > 0xFFFF)
+        st_carry_16 = evaluate_gws_init_status(value=1, offset=0x0020, m0=0xFFF0)
+        self.assertTrue(st_carry_16["offset_carry_out_16"])
+        self.assertFalse(st_carry_16["offset_carry_out_32"])
+
+        # 32-bit wrap carry out
+        st_carry_32 = evaluate_gws_init_status(value=1, offset=1, m0=0xFFFFFFFF)
+        self.assertTrue(st_carry_32["offset_carry_out_32"])
+
+    def test_status_flags_wave_activity(self) -> None:
+        st_active = evaluate_gws_init_status(value=1, exec_mask=0x1)
+        self.assertTrue(st_active["active_wave"])
+
+        st_inactive = evaluate_gws_init_status(value=1, exec_mask=0x0)
+        self.assertFalse(st_inactive["active_wave"])
 
 
 if __name__ == "__main__":
