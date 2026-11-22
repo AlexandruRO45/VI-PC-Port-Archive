@@ -1182,5 +1182,81 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(dst_hi, 101)
 
 
+# ==============================================================================
+# Unit Tests: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestIEEE754BitPatternsAndBoundaryExtremes(unittest.TestCase):
+    """Raw IEEE 754 bit pattern preservation and extreme arithmetic boundaries."""
+
+    def test_float32_zero_distinction_no_flush(self) -> None:
+        pos_zero = struct.unpack(">I", struct.pack(">f", 0.0))[0]
+        neg_zero = struct.unpack(">I", struct.pack(">f", -0.0))[0]
+        self.assertEqual(pos_zero, 0x0000_0000)
+        self.assertEqual(neg_zero, 0x8000_0000)
+
+        dst_pos, _ = ref_mad_i64_i32(pos_zero, 1, 0)
+        dst_neg, _ = ref_mad_i64_i32(neg_zero, 1, 0)
+        self.assertEqual(dst_pos, 0)
+        self.assertEqual(dst_neg, to_u64(INT32_MIN))
+        self.assertNotEqual(dst_pos, dst_neg)
+
+    def test_float32_nan_and_infinity_bit_preservation(self) -> None:
+        qnan_bits = 0x7FC0_0000
+        snan_bits = 0x7F80_0001
+        ninf_bits = 0xFF80_0000
+
+        dst_qnan, _ = ref_mad_i64_i32(qnan_bits, 1, 0)
+        self.assertEqual(dst_qnan, qnan_bits)
+
+        dst_snan, _ = ref_mad_i64_i32(snan_bits, 1, 0)
+        self.assertEqual(dst_snan, snan_bits)
+
+        dst_ninf, _ = ref_mad_i64_i32(ninf_bits, 1, 0)
+        self.assertEqual(dst_ninf, to_u64(-8388608))
+
+    def test_float32_subnormals_treated_as_integers(self) -> None:
+        subnormal_min = 0x0000_0001
+        subnormal_max = 0x007F_FFFF
+
+        dst, c = ref_mad_i64_i32(subnormal_min, 10, 5)
+        self.assertEqual(dst, 15)
+        self.assertEqual(c, 0)
+
+        dst_max, _ = ref_mad_i64_i32(subnormal_max, 2, 0)
+        self.assertEqual(dst_max, 8388607 * 2)
+
+    def test_float64_double_bit_patterns_in_accumulator(self) -> None:
+        double_qnan = 0x7FF8_0000_0000_0000
+        double_neg_zero = 0x8000_0000_0000_0000
+
+        dst, c = ref_mad_i64_i32(0, 0, double_qnan)
+        self.assertEqual(dst, double_qnan)
+        self.assertEqual(c, 0)
+
+        dst, c = ref_mad_i64_i32(0, 0, double_neg_zero)
+        self.assertEqual(dst, double_neg_zero)
+        self.assertEqual(c, 0)
+
+    def test_extreme_boundary_min_times_min_plus_min64(self) -> None:
+        dst, c = ref_mad_i64_i32(INT32_MIN, INT32_MIN, INT64_MIN)
+        self.assertEqual(dst, 0xC000_0000_0000_0000)
+        self.assertEqual(c, 0)
+
+    def test_extreme_boundary_max_times_max_plus_max_u64(self) -> None:
+        expected_prod = INT32_MAX * INT32_MAX
+        dst, c = ref_mad_i64_i32(INT32_MAX, INT32_MAX, UINT64_MAX)
+        expected_dst = (expected_prod - 1) & MASK64
+        self.assertEqual(dst, expected_dst)
+        self.assertEqual(c, 1)
+
+    def test_extreme_boundary_min_times_max_plus_max_i64(self) -> None:
+        prod = INT32_MIN * INT32_MAX
+        expected_dst = (prod + INT64_MAX) & MASK64
+        dst, c = ref_mad_i64_i32(INT32_MIN, INT32_MAX, INT64_MAX)
+        self.assertEqual(dst, expected_dst)
+        self.assertEqual(c, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
