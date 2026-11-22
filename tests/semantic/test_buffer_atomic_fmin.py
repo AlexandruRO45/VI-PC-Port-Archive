@@ -892,6 +892,125 @@ class TestBufferAtomicFminConditionCodes(unittest.TestCase):
         self.assertEqual(self.interp.vcc, canary)
 
 
+class TestBufferAtomicFminBoundaryExtremes(unittest.TestCase):
+    """Unit tests for boundary extremes, subnormals, infinities, and NaN handling."""
+
+    def setUp(self) -> None:
+        self.mem = BufferMemory(4096)
+
+    def test_last_valid_dword_boundary(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=100)
+        # Last valid 4-byte dword starts at offset 96 (96 + 4 = 100)
+        self.mem.write_u32(96, f32_to_bits(10.0))
+        ret, in_bounds = ref_buffer_atomic_fmin(
+            self.mem, desc, soffset=0, vaddr=96, fmin_val=f32_to_bits(4.0), glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, f32_to_bits(10.0))
+        self.assertEqual(self.mem.read_u32(96), f32_to_bits(4.0))
+
+        # Offsets 97, 98, 99, 100 all exceed num_records (97 + 4 = 101 > 100)
+        for oob_off in (97, 98, 99, 100):
+            ret, in_bounds = ref_buffer_atomic_fmin(
+                self.mem, desc, soffset=0, vaddr=oob_off, fmin_val=f32_to_bits(1.0), glc=True
+            )
+            self.assertFalse(in_bounds)
+            self.assertEqual(ret, 0)
+
+    def test_zero_capacity_buffer(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=0)
+        ret, in_bounds = ref_buffer_atomic_fmin(
+            self.mem, desc, soffset=0, vaddr=0, fmin_val=f32_to_bits(1.0), glc=True
+        )
+        self.assertFalse(in_bounds)
+        self.assertEqual(ret, 0)
+
+    def test_subnormal_scale_ordering(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        subnorm_min = 0x00000001
+        subnorm_max = 0x007FFFFF
+        flt_min = 0x00800000
+
+        # +0.0 < smallest positive subnormal
+        self.mem.write_u32(0, subnorm_min)
+        ret, in_bounds = ref_buffer_atomic_fmin(
+            self.mem, desc, soffset=0, vaddr=0, fmin_val=POS_ZERO, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(self.mem.read_u32(0), POS_ZERO)
+
+        # subnorm_min < subnorm_max
+        self.mem.write_u32(4, subnorm_max)
+        ret, in_bounds = ref_buffer_atomic_fmin(
+            self.mem, desc, soffset=0, vaddr=4, fmin_val=subnorm_min, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(self.mem.read_u32(4), subnorm_min)
+
+        # subnorm_max < FLT_MIN (smallest normal)
+        self.mem.write_u32(8, flt_min)
+        ret, in_bounds = ref_buffer_atomic_fmin(
+            self.mem, desc, soffset=0, vaddr=8, fmin_val=subnorm_max, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(self.mem.read_u32(8), subnorm_max)
+
+        # Negative subnormal is less than -0.0
+        neg_subnorm = 0x80000001
+        self.mem.write_u32(12, NEG_ZERO)
+        ret, in_bounds = ref_buffer_atomic_fmin(
+            self.mem, desc, soffset=0, vaddr=12, fmin_val=neg_subnorm, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(self.mem.read_u32(12), neg_subnorm)
+
+    def test_infinity_extremes(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+
+        # min(+inf, 100.0) = 100.0
+        self.mem.write_u32(0, POS_INF)
+        ret, in_bounds = ref_buffer_atomic_fmin(
+            self.mem, desc, soffset=0, vaddr=0, fmin_val=f32_to_bits(100.0), glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(self.mem.read_u32(0), f32_to_bits(100.0))
+
+        # min(-inf, 100.0) = -inf
+        self.mem.write_u32(4, f32_to_bits(100.0))
+        ret, in_bounds = ref_buffer_atomic_fmin(
+            self.mem, desc, soffset=0, vaddr=4, fmin_val=NEG_INF, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(self.mem.read_u32(4), NEG_INF)
+
+        # min(-inf, +inf) = -inf
+        self.mem.write_u32(8, POS_INF)
+        ret, in_bounds = ref_buffer_atomic_fmin(
+            self.mem, desc, soffset=0, vaddr=8, fmin_val=NEG_INF, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(self.mem.read_u32(8), NEG_INF)
+
+    def test_signaling_nan_handling(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+
+        # min(SNAN, 7.0) = 7.0
+        self.mem.write_u32(0, SNAN)
+        ret, in_bounds = ref_buffer_atomic_fmin(
+            self.mem, desc, soffset=0, vaddr=0, fmin_val=f32_to_bits(7.0), glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(self.mem.read_u32(0), f32_to_bits(7.0))
+
+        # min(7.0, SNAN) = 7.0
+        self.mem.write_u32(4, f32_to_bits(7.0))
+        ret, in_bounds = ref_buffer_atomic_fmin(
+            self.mem, desc, soffset=0, vaddr=4, fmin_val=SNAN, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(self.mem.read_u32(4), f32_to_bits(7.0))
+
+
 class TestBufferAtomicFminScalarInterpreter(unittest.TestCase):
     """Unit tests for the deterministic scalar instruction interpreter."""
 
