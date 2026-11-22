@@ -14,17 +14,26 @@
 //       command line are <exe name> plus the arguments after "--"; exit/ExitProcess from the game end the run
 //       (shims/process.cpp). gta6rt prints the binding report first and returns the game's exit code.
 //
+//   gta6rt --splash <game-dir> [--seconds N]
+//       Opens the title's window the way the console shell does before the first frame: the SplashScreenImage of
+//       <game-dir>/MicrosoftGame.Config, centred on its BackgroundColor, titled after the title's display name. It
+//       stays until closed (Esc or the close button) or N seconds pass. Reads the config and the image only; no game
+//       code runs.
+//
 // --game-dir is also where a title's GAME: paths read from; anything it writes or deletes goes to the overlay
 // (--overlay, default <game-dir>/overlay) so the package is never modified (shims/file_system.cpp).
 #include <windows.h>
 
+#include <algorithm>
 #include <cstdio>
+#include <cwchar>
 #include <map>
 #include <string>
 #include <vector>
 
 #include "base_reservation.h"
 #include "pe_loader.h"
+#include "shell_visuals.h"
 #include "../shims/d3d12_trace.h"
 #include "../shims/file_system.h"
 #include "../shims/process_shim.h"
@@ -45,13 +54,37 @@ int usage() {
     std::fprintf(stderr,
                  "usage: gta6rt --dry-run <image> [--game-dir DIR] [--overlay DIR]\n"
                  "       gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [--trace-d3d12]\n"
-                 "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--trace-d3d12] [-- game arguments...]\n");
+                 "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--trace-d3d12] [-- game arguments...]\n"
+                 "       gta6rt --splash <game-dir> [--seconds N]\n");
     return 2;
+}
+
+// --splash: the title's splash window, from its MicrosoftGame.Config (shell_visuals.h).
+int splash_mode(int argc, wchar_t** argv) {
+    std::filesystem::path dir;
+    unsigned long seconds = 0;
+    for (int i = 2; i < argc; ++i) {
+        const std::wstring a = argv[i];
+        if (a == L"--seconds" && i + 1 < argc) seconds = std::wcstoul(argv[++i], nullptr, 10);
+        else if (dir.empty()) dir = a;
+        else return usage();
+    }
+    if (dir.empty()) return usage();
+    const rt::shell::ShellVisuals visuals = rt::shell::read_shell_visuals(dir);
+    if (!visuals.found) {
+        std::fprintf(stderr, "error: no <ShellVisuals> in %ls\\MicrosoftGame.Config\n", dir.c_str());
+        return 1;
+    }
+    std::printf("%ls: splash %ls, background #%06x\n", visuals.display_name.c_str(),
+                visuals.splash.empty() ? L"(none)" : visuals.splash.c_str(), static_cast<unsigned>(visuals.background));
+    std::fflush(stdout);
+    return rt::shell::show_splash(visuals, static_cast<uint32_t>(std::min<unsigned long>(seconds, 86400) * 1000));
 }
 
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    if (argc >= 2 && std::wstring(argv[1]) == L"--splash") return splash_mode(argc, argv);
     std::filesystem::path image, game_dir, overlay_dir;
     bool dry_run = false, init = false, run = false, trace_d3d12 = false;
     std::vector<std::wstring> game_args;  // wide: path::string() throws on a character the code page lacks (RT-84)

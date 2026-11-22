@@ -89,6 +89,7 @@ if(WIN32)
   add_executable(gta6rt
     src/main.cpp
     src/pe_loader.cpp
+    src/shell_visuals.cpp
     shims/registry.cpp
     shims/file_system.cpp
     shims/xmem.cpp
@@ -106,7 +107,7 @@ if(WIN32)
   # without relocations wants to go. Windows moves the EXE with ASLR anyway; Wine loads it at its preferred base.
   set(GTA6RT_HOST_BASE /BASE:0x10000000000)
   target_link_options(gta6rt PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE})
-  target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_xs_rootsig gta6rt_xtaskqueue psapi)
+  target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_xs_rootsig gta6rt_xtaskqueue psapi windowscodecs ole32 gdi32 user32)
 
   # Root-signature forwarding test: needs a real PC d3d12.lib to serialize the synthetic descriptors.
   # find_library searches %LIB% (a Developer Prompt), not the Windows SDK the Visual Studio generator links
@@ -315,6 +316,12 @@ if(BUILD_TESTING)
     target_link_options(loader_test PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE})
     add_dependencies(loader_test gta6rt_tls_host)
     add_test(NAME loader COMMAND loader_test)
+    # The title's shell visuals (splash window) from a synthetic MicrosoftGame.Config and a PNG the test writes.
+    add_executable(shell_visuals_test test/shell_visuals_test.cpp src/shell_visuals.cpp)
+    target_compile_definitions(shell_visuals_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+    target_compile_options(shell_visuals_test PRIVATE /W4 /permissive- /utf-8)
+    target_link_libraries(shell_visuals_test PRIVATE windowscodecs ole32 gdi32 user32)
+    add_test(NAME shell_visuals COMMAND shell_visuals_test)
     # PE loader tests use two locally built fixtures: a DLL with exports, imports and relocations, and an EXE that
     # imports it so Loader::load exercises recursive module loading. They contain no game data.
     set(TINY_FIXTURE_DIR "${CMAKE_CURRENT_BINARY_DIR}/fixtures/$<CONFIG>")
