@@ -161,6 +161,13 @@ CMPX_CLASS_WORDS = [0xEEEEEEEE] * 3 + [0x22] + [0x11] * 4
 # cs_fmt_1010102.asm: descriptor loads, immediate-format load, raw input words and the two packed stores.
 FMT_1010102_WORDS = [0, 0x3F800000, 0, 0x3F800000, 0x3F800000, 0, 0x3F800000, 0,
                      0, 0x3F800000, 0, 0x3F800000, 0xC00FFC00, 0x003FF003, 0xE00003FF, 0xFFE00003]
+# cs_div_scale_f64.asm: D.lo, D.hi, vcc for 13 v_div_scale_f64 cases (derived in the .asm header, measured on RDNA2
+# gfx1036), then untouched words.
+DIV_SCALE_F64_WORDS = [0x00000005, 0x47F00000, 1, 0x00000000, 0x71F00000, 1, 0x00000003, 0x15F00000, 1,
+                       0x00000005, 0x3FF00000, 1, 0x00000000, 0x77E00000, 1, 0x00000009, 0x77800000, 0,
+                       0x00000000, 0x04FC0000, 0, 0x00000001, 0x09400000, 0, 0x00000000, 0xFFF80000, 1,
+                       0x00000001, 0x7FF00000, 1, 0x00000005, 0xBFF00000, 1, 0x00000000, 0x00000000, 1,
+                       0x00000000, 0x3FD00000, 0] + [0xEEEEEEEE] * 25
 # cs_fmt_sint32.asm: hand-derived full-width and D16 load results, inputs, stores, and untouched words.
 FMT_SINT32_WORDS = [
     0x80000000, 0x7FFFFFFF, 0x80000000, 1,
@@ -473,6 +480,10 @@ def dump_test(tools, spirv, name, want, words, env=None):
 def fmt_1010102_test(tools, spirv, env=None):
     """Check both packed stores and the untouched tail of a single group's 64 words."""
     return dump_test(tools, spirv, "cs_fmt_1010102", FMT_1010102_WORDS + [0xEEEEEEEE] * 48, 64, env)
+
+
+def div_scale_f64_test(tools, spirv, env=None):
+    return dump_test(tools, spirv, "cs_div_scale_f64", DIV_SCALE_F64_WORDS, len(DIV_SCALE_F64_WORDS), env)
 
 
 def fmt_sint32_test(tools, spirv, env=None):
@@ -1290,6 +1301,7 @@ def main():
                                                       expected_words=CMPX_CLASS_WORDS)))
     results.append(("cs_fmt_1010102", fmt_1010102_test(tools, spirv)))
     results.append(("cs_fmt_sint32", fmt_sint32_test(tools, spirv)))
+    results.append(("cs_div_scale_f64", div_scale_f64_test(tools, spirv)))
     results.append(("cs_fmt_xy_xyz", fmt_xy_xyz_test(tools, spirv)))
     results.append(("cs_tbuffer_store", tbuffer_store_test(tools, spirv)))
     for name, groups, want in GLOBAL_OFFSET:

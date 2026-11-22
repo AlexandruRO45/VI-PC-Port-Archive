@@ -3797,6 +3797,156 @@ class Gen:
             return g
         return v
 
+    def f64_words(self, sv, op):
+        """(lo, hi) uint words of an f64 source: a VGPR/SGPR pair or an inline constant (a float one is its f64
+        encoding, an integer one is sign-extended to 64 bits). A 32-bit literal is Unsupported here: which half
+        it fills is SHADER-366 (#2057). The VOP3 neg modifier flips the sign bit, so a NaN keeps its payload."""
+        if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
+            lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
+        elif sv["k"] == "fimm" or (sv["k"] == "imm" and -16 <= sv["v"] <= 64):
+            bits = (struct.unpack("<Q", struct.pack("<d", float(sv["v"])))[0] if sv["k"] == "fimm"
+                    else sv["v"] & 0xFFFFFFFFFFFFFFFF)
+            lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
+        else:
+            raise Unsupported(op + " operand")
+        if sv.get("abs"):
+            raise Unsupported(op + " abs")    # VOP3b has no abs field (the assembler rejects it)
+        if sv.get("neg"):
+            n = self.tmp()
+            self.emit(f"{n} = OpBitwiseXor %uint {hi} {self.cu(0x80000000)}")
+            hi = n
+        return lo, hi
+
+    def div_scale_f64(self, a, mods):
+        """v_div_scale_f64 D, sdst, S0, S1, S2 (S1 the denominator, S2 the numerator, S0 one of them): pre-scales
+        an operand of a double division by 2**+-128 and sets the sdst lane bit when the later v_div_fmas_f64 must
+        undo a scaling. Measured natively on RDNA2 gfx1036 (tools/hw_oracle, 1,900 operand triples), which differs
+        from the ISA pseudocode. With e1, e2 the biased exponent fields of S1, S2 (0 for zero and denormals, 2047
+        for inf and NaN; the mantissas play no part), the first rule that matches wins:
+          e2 - e1 >= 768             sdst=1, D = S0 == S1 ? S0 * 2**128 : S0
+          e1 == 0                    D = S0 * 2**128
+          e1 >= 2045, e1 - e2 >= 768 sdst=1, D = S0 == S1 ? S0 * 2**-128 : S0
+          e1 >= 2045                 D = S0 * 2**-128
+          e1 - e2 >= 768             sdst=1, D = S0 == S1 ? S0 : S0 * 2**128
+          e2 <= 53                   D = S0 * 2**128
+          otherwise                  D = S0
+        S0 == S1 compares the values after neg (a copy of S1 in another register counts). A zero S1 or S2 makes
+        D the NaN 0xfff8000000000000 and leaves sdst as above. The scaling keeps a NaN (payload included), an inf
+        and a zero; x 2**128 overflows to inf from exponent field 1919; x 2**-128 rounds to nearest even into the
+        denormals down to exponent field 117 and gives inf of S0's sign at 116 or less (denormals included).
+        clamp gives +0 for NaN, zero and negatives and 1.0 from 1.0 up; omod is ignored. Inactive lanes write 0 to
+        sdst. All in 32-bit integer words: no Float64 capability, and no dependence on a device's f64 denormals."""
+        (l0, h0), (l1, h1), (l2, h2) = (self.f64_words(s, "v_div_scale_f64") for s in a[2:5])
+        u = self.cu
+
+        def op(opc, *xs, ty="%uint"):
+            r = self.tmp()
+            self.emit(f"{r} = {opc} {ty} {' '.join(xs)}")
+            return r
+
+        def cmp(opc, x, y):
+            return op(opc, x, y, ty="%bool")
+
+        def sel(c, x, y, ty="%uint"):
+            return op("OpSelect", c, x, y, ty=ty)
+
+        def expo(h):
+            return op("OpBitFieldUExtract", h, u(20), u(11))
+
+        def is_zero(lo, hi):
+            return cmp("OpIEqual", op("OpBitwiseOr", op("OpBitwiseAnd", hi, u(0x7FFFFFFF)), lo), u(0))
+
+        e0, e1, e2 = expo(h0), expo(h1), expo(h2)
+        big_q = cmp("OpUGreaterThanEqual", e2, op("OpIAdd", e1, u(768)))      # e2 - e1 >= 768
+        small_q = cmp("OpUGreaterThanEqual", e1, op("OpIAdd", e2, u(768)))    # e1 - e2 >= 768
+        den_tiny = cmp("OpIEqual", e1, u(0))
+        den_huge = cmp("OpUGreaterThanEqual", e1, u(2045))
+        num_tiny = cmp("OpULessThanEqual", e2, u(53))
+        eq01 = op("OpLogicalAnd", cmp("OpIEqual", l0, l1), cmp("OpIEqual", h0, h1), ty="%bool")
+        ne01 = op("OpLogicalNot", eq01, ty="%bool")
+        # Each rule as (up: x 2**128, down: x 2**-128), lowest priority first so that a later one overrides.
+        up, down = "%false", "%false"
+        for cond, scale_up, scale_down in ((num_tiny, "%true", "%false"),
+                                           (small_q, ne01, "%false"),
+                                           (den_huge, "%false", "%true"),
+                                           (op("OpLogicalAnd", den_huge, small_q, ty="%bool"), "%false", eq01),
+                                           (den_tiny, "%true", "%false"),
+                                           (big_q, eq01, "%false")):
+            up, down = sel(cond, scale_up, up, "%bool"), sel(cond, scale_down, down, "%bool")
+        vcc = op("OpLogicalOr", big_q, small_q, ty="%bool")
+
+        sign = op("OpBitwiseAnd", h0, u(0x80000000))
+        inf_hi = op("OpBitwiseOr", sign, u(0x7FF00000))
+        mh = op("OpBitwiseAnd", h0, u(0xFFFFF))
+        special = op("OpLogicalOr", cmp("OpIEqual", e0, u(2047)), is_zero(l0, h0), ty="%bool")   # kept as is
+        # S0 * 2**128. A normal S0 gains 128 in its exponent field (inf from 1919 up). A denormal one is
+        # normalised: with p the top set bit of its 52-bit mantissa m, the result is m * 2**-946, exponent field
+        # p + 77 and mantissa m << (52 - p) without its leading bit.
+        hz = cmp("OpIEqual", mh, u(0))
+        p = sel(hz, op("OpExtInst", "%glsl", "FindUMsb", l0),
+                op("OpIAdd", op("OpExtInst", "%glsl", "FindUMsb", mh), u(32)))
+        s = op("OpISub", u(52), p)                                          # 1..52 for a nonzero m
+        wide = cmp("OpUGreaterThanEqual", s, u(32))
+        sh_lo = op("OpShiftLeftLogical", l0, op("OpBitwiseAnd", s, u(31)))
+        nh_w = op("OpShiftLeftLogical", l0, op("OpBitwiseAnd", op("OpISub", s, u(32)), u(31)))
+        nh_n = op("OpBitwiseOr", op("OpShiftLeftLogical", mh, op("OpBitwiseAnd", s, u(31))),
+                  op("OpShiftRightLogical", l0, op("OpBitwiseAnd", op("OpISub", u(32), s), u(31))))
+        dn_hi = op("OpBitwiseOr", op("OpBitwiseOr", sign, op("OpShiftLeftLogical", op("OpIAdd", p, u(77)), u(20))),
+                   op("OpBitwiseAnd", sel(wide, nh_w, nh_n), u(0xFFFFF)))
+        dn_lo = sel(wide, u(0), sh_lo)
+        overflow = cmp("OpUGreaterThanEqual", e0, u(1919))
+        up_hi = sel(cmp("OpIEqual", e0, u(0)), dn_hi, sel(overflow, inf_hi, op("OpIAdd", h0, u(0x08000000))))
+        up_lo = sel(cmp("OpIEqual", e0, u(0)), dn_lo, sel(overflow, u(0), l0))
+        # S0 * 2**-128. Exponent field 129 and up loses 128; 117..128 becomes a denormal: the 53-bit significand
+        # shifted right by k = 129 - e0 (1..12), rounded to nearest even (a carry into bit 52 gives the smallest
+        # normal, as it should); 116 and below gives inf.
+        k = op("OpBitwiseAnd", op("OpISub", u(129), e0), u(31))
+        sig_hi = op("OpBitwiseOr", mh, u(0x100000))
+        rl = op("OpBitwiseOr", op("OpShiftRightLogical", l0, k),
+                op("OpShiftLeftLogical", sig_hi, op("OpBitwiseAnd", op("OpISub", u(32), k), u(31))))
+        rh = op("OpShiftRightLogical", sig_hi, k)
+        rem = op("OpBitwiseAnd", l0, op("OpISub", op("OpShiftLeftLogical", u(1), k), u(1)))
+        half = op("OpShiftLeftLogical", u(1), op("OpBitwiseAnd", op("OpISub", k, u(1)), u(31)))
+        tie_odd = op("OpLogicalAnd", cmp("OpIEqual", rem, half),
+                     cmp("OpIEqual", op("OpBitwiseAnd", rl, u(1)), u(1)), ty="%bool")
+        rnd = op("OpLogicalOr", cmp("OpUGreaterThan", rem, half), tie_odd, ty="%bool")
+        inc = sel(rnd, u(1), u(0))
+        rl2 = op("OpIAdd", rl, inc)
+        carry = sel(op("OpLogicalAnd", rnd, cmp("OpIEqual", rl2, u(0)), ty="%bool"), u(1), u(0))
+        sub_hi = op("OpBitwiseOr", sign, op("OpIAdd", rh, carry))
+        normal_dn = cmp("OpUGreaterThanEqual", e0, u(129))
+        to_inf = cmp("OpULessThanEqual", e0, u(116))
+        down_hi = sel(normal_dn, op("OpISub", h0, u(0x08000000)), sel(to_inf, inf_hi, sub_hi))
+        down_lo = sel(normal_dn, l0, sel(to_inf, u(0), rl2))
+
+        up = op("OpLogicalAnd", up, op("OpLogicalNot", special, ty="%bool"), ty="%bool")
+        down = op("OpLogicalAnd", down, op("OpLogicalNot", special, ty="%bool"), ty="%bool")
+        dl = sel(up, up_lo, sel(down, down_lo, l0))
+        dh = sel(up, up_hi, sel(down, down_hi, h0))
+        zero = op("OpLogicalOr", is_zero(l1, h1), is_zero(l2, h2), ty="%bool")
+        dl, dh = sel(zero, u(0), dl), sel(zero, u(0xFFF80000), dh)
+        if "clamp" in mods:
+            # measured: NaN, zeros and negatives give +0, 1.0 and up (+inf too) give 1.0
+            mag = op("OpBitwiseAnd", dh, u(0x7FFFFFFF))
+            nan = op("OpLogicalOr", cmp("OpUGreaterThan", mag, u(0x7FF00000)),
+                     op("OpLogicalAnd", cmp("OpIEqual", mag, u(0x7FF00000)), cmp("OpINotEqual", dl, u(0)),
+                        ty="%bool"), ty="%bool")
+            pos = op("OpLogicalAnd", cmp("OpULessThan", dh, u(0x80000000)),
+                     op("OpLogicalNot", op("OpLogicalOr", nan, is_zero(dl, dh), ty="%bool"), ty="%bool"),
+                     ty="%bool")
+            ge1 = cmp("OpUGreaterThanEqual", dh, u(0x3FF00000))
+            dl = sel(pos, sel(ge1, u(0), dl), u(0))
+            dh = sel(pos, sel(ge1, u(0x3FF00000), dh), u(0))
+        dst = a[0]
+        if dst["k"] != "vgpr":
+            raise Unsupported("v_div_scale_f64 destination")
+        self.dst({"k": "vgpr", "r": dst["r"], "n": 1}, dl)
+        self.dst({"k": "vgpr", "r": dst["r"] + 1, "n": 1}, dh)
+        cd = a[1]
+        if not (cd["k"] == "special" and cd["t"] == "null"):
+            cm = op("OpLogicalAnd", vcc, self.active_b(), ty="%bool")       # inactive lanes write 0
+            self.mask_dst(cd, sel(cm, u(0xFFFFFFFF), u(0)))
+
     def turn_angle(self, x):
         """Reduce a turn count to [-0.5, 0.5] before scaling by 2*pi (SHADER-88).
 
@@ -4978,6 +5128,8 @@ class Gen:
                 r = self.tmp()
                 self.emit(f"{r} = OpFConvert %float {x}")
                 self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
+        elif op == "v_div_scale_f64":
+            self.div_scale_f64(a, mods)
         elif op in ("image_bvh_intersect_ray", "image_bvh64_intersect_ray"):
             self.image_bvh(op, a, mods)
         elif op == "s_bfm_b64":

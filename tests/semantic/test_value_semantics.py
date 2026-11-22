@@ -693,5 +693,81 @@ class LaneMaskConstants(unittest.TestCase):
         self.assertEqual(w64, self.WANT["cs_w64_mask_imm"][1])
 
 
+def div_scale_f64_reference(s0, s1, s2, clamp=False):
+    """(D, vcc) of v_div_scale_f64 as measured on RDNA2 gfx1036 (docs/design.md), on 64-bit patterns after neg."""
+    def ex(b):
+        return (b >> 52) & 0x7FF
+
+    def scale(b, n):
+        if ex(b) == 0x7FF or not b & ~(1 << 63):
+            return b                                   # NaN (payload kept), inf, zero
+        if n < 0 and ex(b) <= 116:
+            return (b & 1 << 63) | 0x7FF0000000000000  # measured: inf
+        x = struct.unpack("<d", struct.pack("<Q", b))[0]
+        try:
+            return struct.unpack("<Q", struct.pack("<d", math.ldexp(x, n)))[0]
+        except OverflowError:
+            return (b & 1 << 63) | 0x7FF0000000000000
+    e1, e2 = ex(s1), ex(s2)
+    vcc, d = 0, s0
+    if e2 - e1 >= 768:
+        vcc, d = 1, scale(s0, 128) if s0 == s1 else s0
+    elif e1 == 0:
+        d = scale(s0, 128)
+    elif e1 >= 2045 and e1 - e2 >= 768:
+        vcc, d = 1, scale(s0, -128) if s0 == s1 else s0
+    elif e1 >= 2045:
+        d = scale(s0, -128)
+    elif e1 - e2 >= 768:
+        vcc, d = 1, s0 if s0 == s1 else scale(s0, 128)
+    elif e2 <= 53:
+        d = scale(s0, 128)
+    if not s1 & ~(1 << 63) or not s2 & ~(1 << 63):
+        d = 0xFFF8000000000000
+    if clamp:
+        x = struct.unpack("<d", struct.pack("<Q", d))[0]
+        d = struct.unpack("<Q", struct.pack("<d", min(x, 1.0)))[0] if x > 0 else 0
+    return d, vcc
+
+
+class DivScaleF64(unittest.TestCase):
+    """v_div_scale_f64 (cs_div_scale_f64.asm): the 39 words the GPU check expects, measured on RDNA2 gfx1036."""
+
+    # (S0, S1, S2, clamp) of the 13 cases, neg already applied; S0 is S1 or S2 except in case 10 (-S1)
+    ONE5, BIG, TINY = 0x3FF0000000000005, 0x71F0000000000000, 0x0DF0000000000003
+    CASES = [(ONE5, ONE5, BIG, False), (BIG, ONE5, BIG, False), (TINY, ONE5, TINY, False), (ONE5, ONE5, TINY, False),
+             (0x7FE0000000000000, 0x7FE0000000000000, 0x3FF0000000000000, False),
+             (0x7F80000000000009, 0x7FE0000000000000, 0x7F80000000000009, False),
+             (7, 7, 0x2580000000000000, False), (0x0140000000000001, 0x0010000000000000, 0x0140000000000001, False),
+             (0, 0, 0x3FF0000000000000, False), (0x7FF0000000000001, 0x3FF0000000000000, 0x7FF0000000000001, False),
+             (ONE5 | 1 << 63, ONE5, BIG, False), (0, 0, 0x3FF0000000000000, True),
+             (0x3FD0000000000000, 0x3FD0000000000000, 0x3FE0000000000000, False)]
+    WANT = [0x00000005, 0x47F00000, 1, 0x00000000, 0x71F00000, 1, 0x00000003, 0x15F00000, 1,
+            0x00000005, 0x3FF00000, 1, 0x00000000, 0x77E00000, 1, 0x00000009, 0x77800000, 0,
+            0x00000000, 0x04FC0000, 0, 0x00000001, 0x09400000, 0, 0x00000000, 0xFFF80000, 1,
+            0x00000001, 0x7FF00000, 1, 0x00000005, 0xBFF00000, 1, 0x00000000, 0x00000000, 1,
+            0x00000000, 0x3FD00000, 0]
+
+    def test_reference_gives_the_words(self):
+        got = []
+        for s0, s1, s2, clamp in self.CASES:
+            d, vcc = div_scale_f64_reference(s0, s1, s2, clamp)
+            got += [d & 0xFFFFFFFF, d >> 32, vcc]
+        self.assertEqual([f"{w:#010x}" for w in got], [f"{w:#010x}" for w in self.WANT])
+
+    def test_translated_fixture(self):
+        sys.path.insert(0, os.path.join(support.ROOT, "runtime", "test", "shaders"))
+        from compute_fixture import compute_header
+        header = compute_header(os.path.join(support.ROOT, "runtime", "test", "shaders", "cs_div_scale_f64.asm"))
+        spv = support.translate_fixture("cs_div_scale_f64", fssm=bytes(header))
+        self.assertNotIn("Float64", spv)          # 32-bit integer words only: no shaderFloat64 needed
+        memory = {a: 0xEEEEEEEE for a in range(0, 0x100, 4)}
+        support.run_fragment(spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+                             push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28, memory=memory)
+        got = [memory[4 * i] for i in range(len(self.WANT))]
+        self.assertEqual([f"{w:#010x}" for w in got], [f"{w:#010x}" for w in self.WANT])
+        self.assertEqual({memory[a] for a in range(4 * len(self.WANT), 0x100, 4)}, {0xEEEEEEEE})
+
+
 if __name__ == "__main__":
     unittest.main()
