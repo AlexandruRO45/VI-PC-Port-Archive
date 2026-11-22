@@ -103,7 +103,7 @@ class BufferAtomicsX2(unittest.TestCase):
 
     def test_carrying_forms_and_bad_data_rejected(self):
         for line in ("buffer_atomic_add_x2 v[2:3], v1, s[8:11], 0 offen glc",
-                     "buffer_atomic_cmpswap_x2 v[2:5], v1, s[8:11], 0 offen glc",
+                     "buffer_atomic_fmin_x2 v[2:3], v1, s[8:11], 0 offen glc",
                      "buffer_atomic_or_x2 v2, v1, s[8:11], 0 offen glc"):
             with self.subTest(line=line):
                 with self.assertRaises(rdna2spirv.Unsupported):

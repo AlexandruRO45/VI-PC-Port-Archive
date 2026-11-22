@@ -61,7 +61,9 @@ class GlobalAtomicsX2(unittest.TestCase):
                 self.assertEqual(atomic_x2(kind, m, d), (split(m), split(MODEL[kind](m, d))))
 
     def test_carrying_and_comparing_forms_rejected(self):
-        for kind in ("add", "sub", "smin", "umax", "cmpswap"):
+        # smin/umin/smax/umax/inc/dec/cmpswap_x2 are real 64-bit atomics now (test_atomic64_x2.py); cmpswap_x2 with a
+        # two-VGPR vdata (no CMP pair) is still rejected
+        for kind in ("add", "sub", "cmpswap"):
             with self.subTest(op=kind):
                 with self.assertRaises(rdna2spirv.Unsupported):
                     translate(["v_mov_b32_e32 v1, 0", f"global_atomic_{kind}_x2 v[6:7], v1, v[2:3], s[0:1] glc"])

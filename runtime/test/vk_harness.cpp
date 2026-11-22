@@ -235,7 +235,7 @@ int main(int argc, char** argv) {
     // (llvmpipe and other software devices), so the suite reports it as unsupported instead. 77 is the existing
     // "this device cannot run the test" code (runtime/test/shaders/check.py, scripts/run_gpu_tests.py).
     const std::vector<uint32_t> fs_code = read_spv(argv[2]);
-    bool needs_barycentric = false, needs_float64 = false;
+    bool needs_barycentric = false, needs_float64 = false, needs_int64_atomics = false;
     for (std::size_t i = 5; i + 1 < fs_code.size();) {   // instructions follow the 5-word SPIR-V header
         const uint32_t words = fs_code[i] >> 16, op = fs_code[i] & 0xffffu;
         if (!words) break;
@@ -243,6 +243,8 @@ int main(int argc, char** argv) {
             needs_barycentric = true;
         if (op == 17 && fs_code[i + 1] == 10)            // OpCapability Float64 (v_add_f64 and friends)
             needs_float64 = true;
+        if (op == 17 && fs_code[i + 1] == 12)            // OpCapability Int64Atomics (64-bit buffer atomics)
+            needs_int64_atomics = true;
         i += words;
     }
     if (needs_barycentric && !has(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
@@ -366,6 +368,14 @@ int main(int argc, char** argv) {
             return 77;
         }
         f12.bufferDeviceAddress = VK_TRUE;
+        if (needs_int64_atomics) {
+            if (!f12q.shaderBufferInt64Atomics) {
+                std::fprintf(stderr, "unsupported: %s uses Int64Atomics and the device has no shaderBufferInt64Atomics\n",
+                             argv[2]);
+                return 77;
+            }
+            f12.shaderBufferInt64Atomics = VK_TRUE;
+        }
         f12.pNext = chain;
         chain = &f12;
     }

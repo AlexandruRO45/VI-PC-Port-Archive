@@ -7478,6 +7478,12 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     enable12.bufferDeviceAddress = info.buffer_device_address ? VK_TRUE : VK_FALSE;
     info.storage_buffer_8bit = chosen12.storageBuffer8BitAccess == VK_TRUE;
     enable12.storageBuffer8BitAccess = info.storage_buffer_8bit;
+    // 64-bit atomics on buffer device addresses (rdna2spirv.py's smin/umin/smax/umax/inc/dec/cmpswap _x2 declare
+    // Int64Atomics); without the feature those shaders do not load, and --no-int64-atomics keeps them Unsupported.
+    info.shader_buffer_int64_atomics = chosen12.shaderBufferInt64Atomics == VK_TRUE;
+    enable12.shaderBufferInt64Atomics = info.shader_buffer_int64_atomics ? VK_TRUE : VK_FALSE;
+    if (!info.shader_buffer_int64_atomics)
+        std::fprintf(stderr, "[rt] d3d12: the GPU has no shaderBufferInt64Atomics (64-bit buffer atomics)\n");
     // Where the GPU has them: what the bindless set 0 needs (VulkanDeviceInfo::bindless), and the sampler features
     // D3D12 samplers can ask for.
     info.bindless = chosen12.runtimeDescriptorArray && chosen_features.shaderSampledImageArrayDynamicIndexing &&

@@ -27,6 +27,7 @@ sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container, shader_source
 from check import Skip, clip_test, fmt_1010102_test, fmt_int_narrow_test, fmt_sint32_test, fmt_xy_xyz_test, tbuffer_store_test
 from compute_fixture import compute_header
+from check import atomic64_x2_test
 from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
 from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
                    TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, TEXTURE_CONSTANTS, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
@@ -869,6 +870,11 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_fmt_sint32":
             problem = fmt_sint32_test(a.build, spirv_dir, cs_env)
             results.append((name, not problem, problem or "64/64 dumped words exact"))
+        elif name == "cs_atomic64_x2":
+            # 64-bit buffer/global atomics: needs shaderBufferInt64Atomics (vk_compute_test exits 77 without it)
+            problem = atomic64_x2_test(a.build, spirv_dir, cs_env)
+            ok = None if isinstance(problem, Skip) else not problem
+            results.append((name, ok, problem or "64/64 dumped words exact"))
         elif name == "cs_fmt_int_narrow":
             problem = fmt_int_narrow_test(a.build, spirv_dir, cs_env)
             results.append((name, not problem, problem or "136/136 dumped words exact"))

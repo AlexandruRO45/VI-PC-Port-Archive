@@ -188,9 +188,8 @@ class GlobalAtomicIncDec(unittest.TestCase):
                 rdna2spirv.read_before_write_vgprs([parse(f"\tglobal_atomic_{kind} v5, v1, v2, s[0:1] glc")]),
                 {1, 2},
             )
+        # (the 64-bit inc/dec_x2 forms are real Int64 atomics now: test_atomic64_x2.py)
         for line in (
-            "global_atomic_inc_x2 v[4:5], v1, v[2:3], s[0:1] glc",
-            "global_atomic_dec_x2 v[4:5], v1, v[2:3], s[0:1] glc",
             "global_atomic_inc v5, v1, v2, s[0:1] glc slc",
             "global_atomic_dec v5, v1, v2, s[0:1] glc dlc",
             "global_atomic_inc v1, v2, s[0:1] glc",
@@ -238,9 +237,8 @@ class BufferAtomicIncDec(unittest.TestCase):
         self.assertEqual(mem.get(BOUT + 12), 2)
 
     def test_rejected_forms(self):
+        # (the 64-bit inc/dec_x2 forms are real Int64 atomics now: test_atomic64_x2.py)
         for line in (
-            "buffer_atomic_inc_x2 v[2:3], v1, s[8:11], 0 offen glc",
-            "buffer_atomic_dec_x2 v[2:3], v1, s[8:11], 0 offen glc",
             "buffer_atomic_inc v[2:3], v1, s[8:11], 0 offen glc",
         ):
             with self.subTest(line=line):

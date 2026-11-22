@@ -376,6 +376,7 @@ public:
         enable12.bufferDeviceAddress = buffer_device_address;
         storage_buffer_8bit = features12.storageBuffer8BitAccess == VK_TRUE;
         enable12.storageBuffer8BitAccess = storage_buffer_8bit;
+        enable12.shaderBufferInt64Atomics = features12.shaderBufferInt64Atomics;   // translated _x2 atomics
         // What the bindless set 0 of the translated shaders needs, where the device has it: runtime arrays of
         // images indexed dynamically, updated while the set is bound; and, to leave slots empty, partially bound
         // bindings.

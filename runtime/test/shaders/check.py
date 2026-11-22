@@ -190,6 +190,11 @@ FMT_INT_NARROW_WORDS = [
     0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE,
     0x7F01FF80, 0x8000FFFF, 0x12345678, 0x9ABCDEF0, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE,
 ]
+# cs_atomic64_x2.asm: 64-bit buffer/global atomics (smin/umin/smax/umax/inc/dec/cmpswap _x2), measured on RDNA2
+# gfx1036 (derivations in the .asm header); out[0..31] and out[58..63] are untouched.
+ATOMIC64_X2_WORDS = [0xEEEEEEEE] * 32 + [
+    0x5D, 0x1F, 0x10, 0x2, 0xFFFFFFE1, 0xFFFFFFFF, 0xCCCCDDDD, 0xAAAABBBB, 0x0, 0x1, 0x7, 0x0, 0xFFFFFFFF, 0x0,
+    0x1, 0x0, 0x9ABCDEF0, 0x12345678, 0x0, 0x1, 0x0, 0x0, 0x0, 0x1, 0x0, 0x80000000] + [0xEEEEEEEE] * 6
 # cs_fmt_sint32.asm: hand-derived full-width and D16 load results, inputs, stores, and untouched words.
 FMT_SINT32_WORDS = [
     0x80000000, 0x7FFFFFFF, 0x80000000, 1,
@@ -520,6 +525,14 @@ def fmt_1010102_test(tools, spirv, env=None):
 
 def fmt_int_narrow_test(tools, spirv, env=None):
     return dump_test(tools, spirv, "cs_fmt_int_narrow", FMT_INT_NARROW_WORDS, len(FMT_INT_NARROW_WORDS), env)
+
+
+def atomic64_x2_test(tools, spirv, env=None):
+    """cs_atomic64_x2 needs shaderBufferInt64Atomics: vk_compute_test exits 77 (SKIP) on a device without it."""
+    problem = dump_test(tools, spirv, "cs_atomic64_x2", ATOMIC64_X2_WORDS, len(ATOMIC64_X2_WORDS), env)
+    if problem.startswith("exit 77:"):
+        return Skip("SKIP (no shaderBufferInt64Atomics)")
+    return problem
 
 
 def fmt_sint32_test(tools, spirv, env=None):
@@ -1389,6 +1402,7 @@ def main():
                                                       expected_words=CMPX_CLASS_WORDS)))
     results.append(("cs_fmt_1010102", fmt_1010102_test(tools, spirv)))
     results.append(("cs_fmt_sint32", fmt_sint32_test(tools, spirv)))
+    results.append(("cs_atomic64_x2", atomic64_x2_test(tools, spirv)))
     results.append(("cs_fmt_int_narrow", fmt_int_narrow_test(tools, spirv)))
     results.append(("cs_fmt_xy_xyz", fmt_xy_xyz_test(tools, spirv)))
     results.append(("cs_tbuffer_store", tbuffer_store_test(tools, spirv)))

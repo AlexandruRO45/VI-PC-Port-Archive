@@ -685,6 +685,29 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             p = pointers[a[1]]
             if p[0] == "pc":
                 raise UnsupportedConstruct(f"{op} on a PushConstant")
+            if types.bits(a[0]) == 64 and p[0] == "psb":
+                # Int64Atomics on a PhysicalStorageBuffer uint64: two little-endian words, one atomic step here
+                lo_a = psb_word(p[1])
+                old = memory.get(lo_a, 0) | memory.get(lo_a + 4, 0) << 32
+                m64 = (1 << 64) - 1
+
+                def s64(x):
+                    return x - (1 << 64) if x >> 63 else x
+                if op == "OpAtomicLoad":
+                    values[res] = old
+                    continue
+                if op == "OpAtomicCompareExchange":
+                    new = val(a[5]) & m64 if old == val(a[6]) & m64 else old
+                else:
+                    v = val(a[4]) & m64
+                    new = {"OpAtomicIAdd": old + v, "OpAtomicISub": old - v, "OpAtomicUMin": min(old, v),
+                           "OpAtomicUMax": max(old, v), "OpAtomicSMin": old if s64(old) <= s64(v) else v,
+                           "OpAtomicSMax": old if s64(old) >= s64(v) else v, "OpAtomicAnd": old & v,
+                           "OpAtomicOr": old | v, "OpAtomicXor": old ^ v, "OpAtomicExchange": v}[op]
+                new &= m64
+                memory[lo_a], memory[lo_a + 4] = new & MASK, new >> 32
+                values[res] = old
+                continue
             if types.bits(a[0]) != 32:
                 raise UnsupportedConstruct(f"{op} on a non-32-bit integer")
             if p[0] == "psb":

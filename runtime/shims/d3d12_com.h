@@ -159,6 +159,9 @@ struct VulkanDeviceInfo {
     // writes the layer or viewport declares ShaderLayer / ShaderViewportIndex (the index's `features`).
     bool shader_output_layer = false;
     bool shader_output_viewport_index = false;
+    // Vulkan 1.2 shaderBufferInt64Atomics enabled on `device`: rdna2spirv.py's 64-bit compare/carry buffer and global
+    // atomics declare Int64Atomics.
+    bool shader_buffer_int64_atomics = false;
     // The translator's output folder (spirv/index.json + <name>.spv) for pipeline creation; empty: the
     // LEONIDA_SHADERS environment variable.
     std::string shader_dir;

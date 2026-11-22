@@ -66,6 +66,8 @@ FMA_KHR = False          # --fma khr: fused multiply-adds are OpFmaKHR (SPV_KHR_
 # coordinate, so a per-pixel offset doesn't change the LOD. Gathers keep their Offset (shaderImageGatherExtended).
 TEXEL_OFFSET_FALLBACK = False
 FLOAT_CONTROLS = True    # False (--no-float-controls): no SignedZeroInfNanPreserve, for drivers without the property
+INT64_ATOMICS = True     # False (--no-int64-atomics): the 64-bit compare/carry buffer and global atomics stay
+                         # Unsupported, for devices without shaderBufferInt64Atomics
 # --mesh-compute: mesh shaders become compute shaders (same workgroup size and code) for devices without
 # VK_EXT_mesh_shader. Instead of SetMeshOutputs and the mesh outputs, the epilogue writes the vertex and primitive
 # counts, each lane's vertex and each lane's primitive into this workgroup's slot of a buffer whose device address is
@@ -226,6 +228,7 @@ class Gen:
         self.f16_half_outs = {}     # VS/MS, --f16-interp-fallback: param n -> its two decoded-half output names
         self.ij_capture = {}        # computed-I/J pairs: pair key -> the I float id the p1 loaded (SHADER-177)
         self.uses_psb = False
+        self.uses_int64_atomics = False    # Int64Atomics (shaderBufferInt64Atomics)
         self.uses_active = False
         self.vm_latch = False      # PS: EXEC can change after a `vm` export, so that export's EXEC is kept
         self.uses_perm = False     # emulate: ds_permute_b32 parks its winning source lane in %x_perm
@@ -1844,33 +1847,34 @@ class Gen:
                    "and": ("OpAtomicAnd", 0xFFFFFFFF), "or": ("OpAtomicOr", 0), "xor": ("OpAtomicXor", 0),
                    "swap": ("OpAtomicExchange", None), "cmpswap": ("OpAtomicCompareExchange", None)}
 
-    def atomic_inc_dec_cas(self, p, val, kind, lbl_do):
+    def atomic_inc_dec_cas(self, p, val, kind, lbl_do, ty="%uint"):
         """Structured OpAtomicCompareExchange CAS loop on `%_ptr_PSB_uint` pointer `p` for RDNA2 32-bit unsigned
-        wrapping atomic inc/dec (RDNA2 ISA):
+        wrapping atomic inc/dec (RDNA2 ISA), or with ty="%ulong" on a `%_ptr_PSB_ulong` for the 64-bit _x2 forms:
           inc: M = (M >= DATA) ? 0 : M + 1
           dec: M = (M == 0 || M > DATA) ? DATA : M - 1
         Returns `(old_val, exit_label)` where `old_val` is the pre-op word in memory."""
+        k = self.cl if ty == "%ulong" else self.cu
         lbl_hdr, lbl_cont, lbl_exit = (self.tmp() + s for s in ("_hdr", "_cont", "_exit"))
         init = self.tmp()
-        self.emit(f"{init} = OpAtomicLoad %uint {p} {self.cu(1)} {self.cu(0)}")
+        self.emit(f"{init} = OpAtomicLoad {ty} {p} {self.cu(1)} {self.cu(0)}")
         self.emit(f"OpBranch {lbl_hdr}")
         self.emit(f"{lbl_hdr} = OpLabel")
         cur, got = self.tmp(), self.tmp()
-        self.emit(f"{cur} = OpPhi %uint {init} {lbl_do} {got} {lbl_cont}")
+        self.emit(f"{cur} = OpPhi {ty} {init} {lbl_do} {got} {lbl_cont}")
         if kind == "inc":
             wrap, step, new_u = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{wrap} = OpUGreaterThanEqual %bool {cur} {val}")
-            self.emit(f"{step} = OpIAdd %uint {cur} {self.cu(1)}")
-            self.emit(f"{new_u} = OpSelect %uint {wrap} {self.cu(0)} {step}")
+            self.emit(f"{step} = OpIAdd {ty} {cur} {k(1)}")
+            self.emit(f"{new_u} = OpSelect {ty} {wrap} {k(0)} {step}")
         else:
             is_z, gt, wrap, step, new_u = (self.tmp() for _ in range(5))
-            self.emit(f"{is_z} = OpIEqual %bool {cur} {self.cu(0)}")
+            self.emit(f"{is_z} = OpIEqual %bool {cur} {k(0)}")
             self.emit(f"{gt} = OpUGreaterThan %bool {cur} {val}")
             self.emit(f"{wrap} = OpLogicalOr %bool {is_z} {gt}")
-            self.emit(f"{step} = OpISub %uint {cur} {self.cu(1)}")
-            self.emit(f"{new_u} = OpSelect %uint {wrap} {val} {step}")
+            self.emit(f"{step} = OpISub {ty} {cur} {k(1)}")
+            self.emit(f"{new_u} = OpSelect {ty} {wrap} {val} {step}")
         done = self.tmp()
-        self.emit(f"{got} = OpAtomicCompareExchange %uint {p} {self.cu(1)} {self.cu(0)} {self.cu(0)} {new_u} {cur}")
+        self.emit(f"{got} = OpAtomicCompareExchange {ty} {p} {self.cu(1)} {self.cu(0)} {self.cu(0)} {new_u} {cur}")
         self.emit(f"{done} = OpIEqual %bool {got} {cur}")
         self.emit(f"OpLoopMerge {lbl_exit} {lbl_cont} None")
         self.emit(f"OpBranchConditional {done} {lbl_exit} {lbl_cont}")
@@ -1878,6 +1882,114 @@ class Gen:
         self.emit(f"OpBranch {lbl_hdr}")
         self.emit(f"{lbl_exit} = OpLabel")
         return cur, lbl_exit
+
+    INT64_ATOMIC_KINDS = ("smin", "umin", "smax", "umax", "inc", "dec", "cmpswap")
+
+    def atomic64_body(self, addr, data_reg, kind, lbl_do):
+        """One real 64-bit atomic for the compare/carry _x2 forms (Int64Atomics on a uint64 PhysicalStorageBuffer
+        pointer; the device needs shaderBufferInt64Atomics). DATA is the VGPR pair at data_reg (low dword first),
+        cmpswap's CMP the pair after it: M = (M == CMP) ? DATA : M. smin/smax compare signed, umin/umax unsigned,
+        inc/dec wrap against DATA as the 32-bit forms do (a CAS loop). Returns (old 64 bits, exit label); measured
+        natively on RDNA2 gfx1036 (docs/design.md, 64-bit buffer and global atomics)."""
+        self.uses_int64_atomics = True
+        self.uses_psb = True
+
+        def u64(r):
+            lo, hi, l64, h64, sh, v = (self.tmp() for _ in range(6))
+            self.emit(f"{lo} = OpCopyObject %uint {self.load_reg('vgpr', r)}")
+            self.emit(f"{hi} = OpCopyObject %uint {self.load_reg('vgpr', r + 1)}")
+            self.emit(f"{l64} = OpUConvert %ulong {lo}")
+            self.emit(f"{h64} = OpUConvert %ulong {hi}")
+            self.emit(f"{sh} = OpShiftLeftLogical %ulong {h64} %c64_32")
+            self.emit(f"{v} = OpBitwiseOr %ulong {sh} {l64}")
+            return v
+
+        d = u64(data_reg)
+        p = self.tmp()
+        self.emit(f"{p} = OpConvertUToPtr %_ptr_PSB_ulong {self.host_addr(addr)}")
+        if kind in ("inc", "dec"):
+            return self.atomic_inc_dec_cas(p, d, kind, lbl_do, ty="%ulong")
+        r = self.tmp()
+        if kind == "cmpswap":
+            c = u64(data_reg + 2)
+            self.emit(f"{r} = OpAtomicCompareExchange %ulong {p} {self.cu(1)} {self.cu(0)} {self.cu(0)} {d} {c}")
+        else:
+            self.emit(f"{r} = {self.BUF_ATOMICS[kind][0]} %ulong {p} {self.cu(1)} {self.cu(0)} {d}")
+        return r, lbl_do
+
+    def split64(self, v):
+        """(low, high) uint words of a %ulong."""
+        lo, sh, hi = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{lo} = OpUConvert %uint {v}")
+        self.emit(f"{sh} = OpShiftRightLogical %ulong {v} %c64_32")
+        self.emit(f"{hi} = OpUConvert %uint {sh}")
+        return lo, hi
+
+    def global_atomic64(self, op, kind, a, mods):
+        """global_atomic_{smin,umin,smax,umax,inc,dec,cmpswap}_x2 [vdst[0:1],] vaddr, vdata, saddr|off [glc]: one
+        64-bit atomic on the element (atomic64_body). With glc the old 64 bits land in vdst; an inactive lane keeps
+        vdst and does not touch memory."""
+        if not INT64_ATOMICS:
+            raise Unsupported(op + " (--no-int64-atomics)")
+        if any(m in mods for m in ("slc", "dlc", "lds")):
+            raise Unsupported(op + " form")
+        rtn = "glc" in mods
+        if len(a) != (4 if rtn else 3):
+            raise Unsupported(op + " operands")
+        vdst, vaddr, vdata, saddr = a if rtn else (None,) + tuple(a)
+        if vdata["k"] != "vgpr" or vdata.get("n", 1) != (4 if kind == "cmpswap" else 2) or \
+                (vdst is not None and (vdst["k"] != "vgpr" or vdst.get("n", 1) != 2)):
+            raise Unsupported(op + " operands")
+        full = self.global_address(op, vaddr, saddr, mods)
+        keep = [self.load_reg("vgpr", vdst["r"] + w) for w in range(2)] if vdst is not None else [self.cu(0)] * 2
+        lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
+        pre = self.current_label_placeholder()
+        act = self.active_b()      # loaded before the merge: OpSelectionMerge must directly precede the branch
+        self.emit(f"OpSelectionMerge {lbl_end} None")
+        self.emit(f"OpBranchConditional {act} {lbl_do} {lbl_end}")
+        self.emit(f"{lbl_do} = OpLabel")
+        res, done_lbl = self.atomic64_body(full, vdata["r"], kind, lbl_do)
+        lo, hi = self.split64(res)
+        self.emit(f"OpBranch {lbl_end}")
+        self.emit(f"{lbl_end} = OpLabel")
+        olds = []
+        for w, v in enumerate((lo, hi)):       # both OpPhi first: they must open the merge block
+            old = self.tmp()
+            self.emit(f"{old} = OpPhi %uint {v} {done_lbl} {keep[w]} {pre}")
+            olds.append(old)
+        if vdst is not None:
+            for w in range(2):
+                self.store_reg("vgpr", vdst["r"] + w, olds[w])
+
+    def buffer_atomic64(self, op, kind, a, mods):
+        """buffer_atomic_{smin,umin,smax,umax,inc,dec,cmpswap}_x2 vdata, vaddr, s[V#], soffset [glc]: one 64-bit
+        atomic on the element (atomic64_body), bounds-checked for the whole 8-byte element as the other _x2 forms.
+        With glc the old 64 bits are returned in vdata[0:1]; an inactive or out-of-range lane returns 0 there."""
+        if not INT64_ATOMICS:
+            raise Unsupported(op + " (--no-int64-atomics)")
+        vd = a[0]
+        if vd["k"] != "vgpr" or vd.get("n", 1) != (4 if kind == "cmpswap" else 2):
+            raise Unsupported(op + " data")
+        addr, _, in_b, _ = self.buffer_address(a, mods, elem="fmt", fixed_fmt=62)  # step: as buffer_atomic
+        cond = self.tmp()
+        self.emit(f"{cond} = OpLogicalAnd %bool {self.active_b()} {in_b}")
+        lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
+        pre = self.current_label_placeholder()
+        self.emit(f"OpSelectionMerge {lbl_end} None")
+        self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
+        self.emit(f"{lbl_do} = OpLabel")
+        res, done_lbl = self.atomic64_body(addr, vd["r"], kind, lbl_do)
+        lo, hi = self.split64(res)
+        self.emit(f"OpBranch {lbl_end}")
+        self.emit(f"{lbl_end} = OpLabel")
+        olds = []
+        for v in (lo, hi):                     # both OpPhi first: they must open the merge block
+            old = self.tmp()
+            self.emit(f"{old} = OpPhi %uint {v} {done_lbl} {self.cu(0)} {pre}")
+            olds.append(old)
+        if "glc" in mods:
+            for w in range(2):
+                self.dst({"k": "vgpr", "r": vd["r"] + w, "n": 1}, olds[w])
 
     def global_atomic(self, op, a, mods):
         """global_atomic_<op> [vdst,] vaddr, vdata, saddr|off [offset:N] [glc]: a 32-bit atomic at the global_* address
@@ -1893,6 +2005,8 @@ class Gen:
         kind = op[len("global_atomic_"):]
         if kind in ("and_x2", "or_x2", "xor_x2", "swap_x2"):
             return self.global_atomic_x2(op, kind[:-3], a, mods)
+        if kind.endswith("_x2") and kind[:-3] in self.INT64_ATOMIC_KINDS:
+            return self.global_atomic64(op, kind[:-3], a, mods)
         if kind in ("fmin", "fmax"):
             return self.global_atomic_float(op, kind, a, mods)
         is_inc_dec = kind in ("inc", "dec")
@@ -2027,6 +2141,8 @@ class Gen:
         kind = op[len("buffer_atomic_"):]
         if kind in ("and_x2", "or_x2", "xor_x2", "swap_x2"):
             return self.buffer_atomic_x2(op, kind[:-3], a, mods)
+        if kind.endswith("_x2") and kind[:-3] in self.INT64_ATOMIC_KINDS:
+            return self.buffer_atomic64(op, kind[:-3], a, mods)
         is_inc_dec = kind in ("inc", "dec")
         if (kind not in self.BUF_ATOMICS and not is_inc_dec) or "x2" in kind:
             raise Unsupported(op)
@@ -11086,6 +11202,8 @@ def assemble(gen):
         caps += [c for c in ("GroupNonUniform", "GroupNonUniformQuad") if c not in caps]
     if gen.uses_f64:
         caps.append("Float64")
+    if gen.uses_int64_atomics:
+        caps.append("Int64Atomics")
     if gen.uses_fma_khr:
         caps.append("FMAKHR")
     if gen.uses_store_views:
@@ -11230,6 +11348,8 @@ def assemble(gen):
         types += ["%ulong = OpTypeInt 64 0", "%c64_32 = OpConstant %ulong 32", "%long = OpTypeInt 64 1",
                   "%rt_uint = OpTypeRuntimeArray %uint", "%_ptr_PSB_arr = OpTypePointer PhysicalStorageBuffer %rt_uint",
                   "%_ptr_PSB_uint = OpTypePointer PhysicalStorageBuffer %uint"]
+        if gen.uses_int64_atomics:
+            types.append("%_ptr_PSB_ulong = OpTypePointer PhysicalStorageBuffer %ulong")
         dec.append("OpDecorate %rt_uint ArrayStride 4")
         types += [f"{name} = OpConstant %ulong {v}" for v, name in sorted(gen.lconsts.items())]
     if tex:
@@ -13347,7 +13467,8 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
              "ClipDistance": "shaderClipDistance", "CullDistance": "shaderCullDistance",
              "ShaderLayer": "shaderOutputLayer", "ShaderViewportIndex": "shaderOutputViewportIndex",
              "DrawParameters": "shaderDrawParameters",
-             "FMAKHR": "shaderFmaFloat32"}     # VkPhysicalDeviceShaderFmaFeaturesKHR (VK_KHR_shader_fma)
+             "FMAKHR": "shaderFmaFloat32",
+             "Int64Atomics": "shaderBufferInt64Atomics"}     # VkPhysicalDeviceShaderFmaFeaturesKHR (VK_KHR_shader_fma)
     m = {"stage": g.stage, "wave64": bool(g.wave64), "control_flow": getattr(g, "control_flow", "straight line"),
          "capabilities": caps, "extensions": exts,
          "features": sorted({feats[c] for c in caps if c in feats and not feats[c].startswith(("core", "shaderImage1D"))}),
@@ -13657,6 +13778,9 @@ def main():
                     help="optional dir with <name>.fssm sidecars: records fssm_sha256 per shader in the index")
     ap.add_argument("--dispatch-loop", action="store_true",
                     help="emit control flow the old way, as one loop around a switch (to compare with the default)")
+    ap.add_argument("--no-int64-atomics", action="store_true",
+                    help="leave the 64-bit compare/carry buffer and global atomics (smin/umin/smax/umax/inc/dec/cmpswap "
+                         "_x2) Unsupported, for a device without shaderBufferInt64Atomics")
     ap.add_argument("--no-float-controls", action="store_true",
                     help="don't declare SignedZeroInfNanPreserve (for a driver whose "
                          "shaderSignedZeroInfNanPreserveFloat32 is false); NaN, inf and -0 are then not guaranteed")
@@ -13718,8 +13842,9 @@ def main():
     PC_TAIL_UBO = a.pc_tail_ubo
     FMA_KHR = a.fma == "khr"
     STRUCTURED = not a.dispatch_loop
-    global FLOAT_CONTROLS
+    global FLOAT_CONTROLS, INT64_ATOMICS
     FLOAT_CONTROLS = not a.no_float_controls
+    INT64_ATOMICS = not a.no_int64_atomics
     WAVE64_EMULATE = a.wave64_emulate
     WAVE64_GRAPHICS = a.wave64_graphics
     BARY_FALLBACK = a.bary_fallback

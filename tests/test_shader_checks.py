@@ -35,7 +35,7 @@ TOTAL = (len(check.COMPUTE) + 6 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 12)  # three mesh fixtures, ps_tex, ps_imgatomic, five compute fixtures,
+         + len(check.TEXTURE_CONSTANTS) + 13)  # three mesh fixtures, ps_tex, ps_imgatomic, five compute fixtures,
          # ps_ssharp and vs_base_ids
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
@@ -68,6 +68,10 @@ class Wave64Checks(unittest.TestCase):
                 if fmt[1] is not None:
                     dump.write_bytes(fmt[1])
                 return fmt[0], "out[0..7] = 0 0 0 0 0 0 0 0\n"   # stdout is not the oracle
+            if name == "cs_atomic64_x2":
+                self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "64"))
+                Path(env["VKC_DUMP"]).write_bytes(struct.pack("<64I", *check.ATOMIC64_X2_WORDS))
+                return 0, ""
             if name == "cs_fmt_sint32":
                 self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "64"))
                 Path(env["VKC_DUMP"]).write_bytes(struct.pack("<64I", *check.FMT_SINT32_WORDS))
