@@ -7489,11 +7489,14 @@ class Gen:
             self.dst(a[0], r)
         elif op in ("v_cvt_f16_u16", "v_cvt_f16_i16", "v_cvt_u16_f16", "v_cvt_i16_f16"):
             # 16-bit <-> f16 conversions of the low half (op_sel:[src,dst] picks the high half of the source / of the
-            # destination); the other half of the destination is kept, as for the other 16-bit-result ops. No clamp or
-            # output multiplier (rejected rather than guessed). f16 -> int truncates toward zero, saturates to the 16-bit
-            # range (an f16 infinity too) and gives 0 for NaN, as the 32-bit conversions do (docs/design.md,
-            # "Float-to-int saturation"). int -> f16 rounds like every f16 result (f16_out).
-            if any(m == "clamp" or m.startswith(("mul:", "div:")) for m in mods):
+            # destination); the other half of the destination is kept, as for the other 16-bit-result ops. f16 -> int
+            # truncates toward zero, saturates to the 16-bit range (an f16 infinity too) and gives 0 for NaN, as the
+            # 32-bit conversions do (docs/design.md, "Float-to-int saturation"). int -> f16 rounds like every f16
+            # result (f16_out). On the f16 -> int forms the VOP3 clamp and omod leave the integer result unchanged
+            # (measured natively on RDNA2 gfx1036, wave32 and wave64, IEEE off and on: 1,456 programs), so they are
+            # accepted and ignored. On the int -> f16 forms they are still rejected rather than guessed.
+            if op in ("v_cvt_f16_u16", "v_cvt_f16_i16") and \
+                    any(m == "clamp" or m.startswith(("mul:", "div:")) for m in mods):
                 raise Unsupported(op + " output modifier")
             sel, dhi = self.opsel_bits(mods, 1)
             if op in ("v_cvt_f16_u16", "v_cvt_f16_i16"):

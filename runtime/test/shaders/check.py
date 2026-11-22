@@ -251,6 +251,8 @@ CVT_F32_SAT_CASES = (
     (0x4F800000, 0xFFFFFFFF, 0x7FFFFFFF), (0xCEFFFFFF, 0, 0x80000080), (0xCF000000, 0, 0x80000000),
     (0xCF000001, 0, 0x80000000), (0x7F800000, 0xFFFFFFFF, 0x7FFFFFFF), (0xFF800000, 0, 0x80000000),
     (0x7F800001, 0, 0), (0xFFC00000, 0, 0))
+# cs_cvt16_int_mods.asm: v_cvt_i16/u16_f16 with clamp/omod (no effect), measured on RDNA2 gfx1036 (the .asm header).
+CVT16_INT_MODS_WORDS = [0xDEAD0001, 0xDEADFFFE, 0xDEAD0064, 0xDEAD0002, 0xDEAD0064, 0xDEAD8000, 0xDEAD0000, 0xDEADFFE0]
 # v_cvt_pk_u8_f32 (cs_cvt_pk_u8.asm), measured natively on RDNA2 (gfx1036): halves round to even, NaN gives 0.
 CVT_PK_U8_WORDS = [0x1122330C, 0x11220E44, 0x11003344, 0xFE223344, 0x1122330D, 0x11220044, 0x11FF3344, 0x00223344]
 # Wave64-only dump tests (mostly the x = cross-half checks): exact results need 64 lanes, or an emulation of them
@@ -1401,6 +1403,8 @@ def main():
                                                  env=FMA_FUSED_ENV)))
     results.append(("cs_cvt_pk_u8", compute_test(tools, spirv, "cs_cvt_pk_u8", "1", "dump",
                                                  expected_words=CVT_PK_U8_WORDS)))
+    results.append(("cs_cvt16_int_mods", compute_test(tools, spirv, "cs_cvt16_int_mods", "1", "dump",
+                                                      expected_words=CVT16_INT_MODS_WORDS)))
     for name, want in W64X_DUMPS:   # without --require-wave64 when LEONIDA_W64_EMULATE=1
         results.append((name, compute_test(tools, spirv, name, "1", "dump", require_wave64=not W64_EMULATED,
                                            expected_words=want)))
