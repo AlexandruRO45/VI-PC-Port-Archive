@@ -38,8 +38,10 @@ class BuildRuntimeBatchTest(unittest.TestCase):
             batch = batch_path.read_bytes()
             self.assertTrue(batch.startswith(b"@echo off\r\n"))
             self.assertIn(str(checkout).encode("utf-8"), batch)
+            # `.\` and not the full path: cmd.exe /c splits a temp path holding ` & `. Not a bare name either:
+            # with NoDefaultCurrentDirectoryInExePath set, cmd.exe does not look in the current folder for one.
             subprocess.run(
-                ["cmd.exe", "/d", "/c", str(batch_path)], cwd=directory,
+                ["cmd.exe", "/d", "/c", r".\_build.cmd"], cwd=directory,
                 env={**os.environ, "NoDefaultCurrentDirectoryInExePath": "1"}, check=True, timeout=30,
             )
 

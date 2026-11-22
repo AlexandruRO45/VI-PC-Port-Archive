@@ -30,9 +30,12 @@ class BuildBatchTest(unittest.TestCase):
                 + writer,
                 encoding="utf-8", newline="\n",
             )
+            # `.\` on both names, the wrapper's and the one it calls: with NoDefaultCurrentDirectoryInExePath set,
+            # cmd.exe does not look in the current folder for a bare name. Not the full path either: cmd.exe /c
+            # splits a temp path holding ` & `.
             (work / "check-console.cmd").write_bytes(
                 b"@echo off\r\nchcp 437 >nul || exit /b 99\r\nchcp >before.txt\r\n"
-                b"call _build.cmd\r\nset \"build_exit=%errorlevel%\"\r\nchcp >after.txt\r\nexit /b %build_exit%\r\n"
+                b"call .\\_build.cmd\r\nset \"build_exit=%errorlevel%\"\r\nchcp >after.txt\r\nexit /b %build_exit%\r\n"
             )
             startup = subprocess.STARTUPINFO()
             startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
@@ -48,7 +51,8 @@ class BuildBatchTest(unittest.TestCase):
                     self.assertTrue(batch.startswith(b"@echo off\r\n"))
                     self.assertIn(str(work).encode("utf-8"), batch)
                     result = subprocess.run(
-                        ["cmd.exe", "/d", "/c", "check-console.cmd"], cwd=work, timeout=30,
+                        ["cmd.exe", "/d", "/c", r".\check-console.cmd"], cwd=work, timeout=30,
+                        env={**os.environ, "NoDefaultCurrentDirectoryInExePath": "1"},
                         creationflags=subprocess.CREATE_NEW_CONSOLE, startupinfo=startup, capture_output=True,
                     )
                     self.assertEqual(result.returncode, code, result.stdout + result.stderr)
