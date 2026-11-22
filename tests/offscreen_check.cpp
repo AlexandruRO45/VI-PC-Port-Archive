@@ -417,6 +417,8 @@ int main(int argc, char** argv)
             check_compute(device.Get(), operation == "--compute-tables");
         } else if (argc == 4 && (operation == "--compute-root-file" || operation == "--ffx-immediate-conversion")) {
             check_compute_file(device.Get(), argv[3], operation == "--ffx-immediate-conversion");
+        } else if (argc == 5 && operation == "--compute-store-case") {
+            check_compute_file(device.Get(), argv[3], false, argv[4]);
         } else if (argc == 3 && operation == "--ffx-device-init") {
             check_ffx_device_init(device.Get());
         } else if (argc == 3 && operation == "--ffx-provider-loop") {

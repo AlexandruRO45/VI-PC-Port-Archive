@@ -135,9 +135,13 @@ def native_program(archive: Path, record: str, *, container_sha256: str | None =
             blob = _read_named_container(data, end)
         else:
             blob = _select_named_container(data, needle, container_sha256.lower())
-    program = parts(blob)[b"DXIL"]
-    if len(program) < 24 or struct.unpack_from("<H", program, 2)[0] != 0:
-        raise ValueError("Expected a pixel shader")
+    return blob, container_code(parts(blob)[b"DXIL"], stage=0, llvm=llvm)
+
+
+def container_code(program, *, stage, llvm=None):
+    """Extract the stage-specific instruction stream from a DXIL program part."""
+    if len(program) < 24 or struct.unpack_from("<H", program, 2)[0] != stage:
+        raise ValueError("Unexpected shader stage")
     table = program.index(b"XDAT", 24)
     if table + 12 > len(program):
         raise ValueError("Truncated XDAT header")
@@ -162,16 +166,18 @@ def native_program(archive: Path, record: str, *, container_sha256: str | None =
         code = _bounded_code(image, start)
         markers = sum(word == 0xbf810000 for word, in struct.iter_unpack("<I", code))
         if markers == 1:
-            return blob, code
-        if markers == 2 and llvm is not None:
+            return code
+        if stage == 0 and markers == 2 and llvm is not None:
             _check_two_exits(code, llvm)
-            return blob, code
+            return code
         raise ValueError("Unverified multi-exit program")
     # Older fixtures lack the section extent; preserve their unique-marker rule.
+    if stage != 0:
+        raise ValueError("Compute requires a bounded FSSM section")
     ends = [i+4 for i in range(start, len(image)-3, 4) if image[i:i+4] == b"\0\0\x81\xbf"]
     if len(ends) != 1:
         raise ValueError("Expected one aligned, terminated program")
-    return blob, image[start:ends[0]]
+    return image[start:ends[0]]
 
 
 def disassemble(code, library, *, cpu=b"gfx1013", offsets=False):

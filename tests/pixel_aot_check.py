@@ -103,7 +103,8 @@ def shader_record(blob: bytes, name: bytes) -> bytes:
             + struct.pack("<4I", len(payload), 0, len(payload), len(blob)) + payload)
 
 
-def envelope(code: bytes, name: bytes = b"fixture", *, private_data: bytes | None = None, directory_end=None) -> bytes:
+def envelope(code: bytes, name: bytes = b"fixture", *, private_data: bytes | None = None, directory_end=None,
+             compute_width=None) -> bytes:
     program_start = 288 if directory_end is not None else 256
     image = bytearray(program_start) + code
     image[:4] = b"FSSM"
@@ -116,7 +117,15 @@ def envelope(code: bytes, name: bytes = b"fixture", *, private_data: bytes | Non
     native = b"XBCH" + bytes(12) + struct.pack("<II", len(image), 0) + zlib.compress(image)
     program = (bytes(24) + b"XDAT" + struct.pack("<II", 1, 0)
                + struct.pack("<III", 13, 48, len(native)) + native)
+    if compute_width is not None:
+        program = program[:2] + struct.pack("<H", 5) + program[4:]
     sections = [b"DXIL" + struct.pack("<I", len(program)) + program]
+    if compute_width is not None:
+        psv = bytearray(52)
+        struct.pack_into("<I", psv, 0, 48)
+        psv[28] = 5
+        struct.pack_into("<3I", psv, 40, compute_width, 1, 1)
+        sections.append(b"PSV0" + struct.pack("<I", len(psv)) + psv)
     if private_data is not None:
         sections.append(b"PRIV" + struct.pack("<I", len(private_data)) + private_data)
     offset = 32 + 4 * len(sections)
