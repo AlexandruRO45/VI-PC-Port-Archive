@@ -22,9 +22,10 @@ definition of RDX, the attribute word argument:
   ends that path as unknown.
 - An immediate (including xor edx, edx) is a constant.
 - A 32- or 64-bit load from RIP-relative image data is a constant when the data lies in a
-  read-only section. In a writable section it is a constant only when no RIP-relative instruction
-  in the image writes it; otherwise it is reported as data with its initial value and writers.
-  Writes through pointers are not tracked.
+  read-only section. In a writable section it is data, never a constant: a write through a
+  pointer can change the word before the call, and writes through pointers are not tracked. The
+  report keeps the initial value and the RIP-relative writes found (written_at, possibly empty)
+  as evidence only.
 - A register copy is followed.
 - Reaching the function entry means the caller supplies RDX. Direct calls and jumps to the entry
   are then resolved, one level deep. Exported functions may also have callers outside the image.
@@ -393,13 +394,11 @@ class Scan:
         """Fill in writers and callers for queries that have run."""
         source = result.get("source")
         if source == "data" and "writers" in result and int(result["data"], 16) in self.scanned_data:
-            writers = self.data_writers.get(int(result["data"], 16), [])
+            # Evidence only: with no RIP-relative writer the word can still be written through a
+            # pointer before the call, so the path stays data (unresolved).
             result.pop("writers")
-            if writers:
-                result["written_at"] = [hex(w) for w in writers]
-            else:
-                result["source"] = "constant"
-                result["certainty"] = "writable section, no RIP-relative write in the image"
+            result["written_at"] = [hex(w) for w in self.data_writers.get(int(result["data"], 16), [])]
+            result["detail"] = "writable section: initial value only, writes through pointers are not tracked"
         if source == "argument" and result.get("callers", []) is None \
                 and int(result["function"], 16) in self.scanned_callers:
             callers = []

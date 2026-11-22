@@ -1,7 +1,8 @@
 EXPORTS
     immediate_iat
     thunk_call
-    data_constant
+    data_unwritten
+    pointer_written
     data_written
     set_word
     register_copy

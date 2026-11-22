@@ -94,8 +94,13 @@ def check_fixture(path):
     constant("immediate_iat", BINK_WORD, HEAP32)
     check(site("thunk_call")["route"] == "thunk", "thunk_call goes through the import thunk")
     constant("thunk_call", AMD_WORD, GRAPHICS)
-    constant("data_constant", AMD_WORD, GRAPHICS, certainty="writable section, no RIP-relative write in the image")
     constant("read_only_constant", 0x20004000, GRAPHICS, certainty="read-only section")
+    # Writable data is never a constant. The initial value and the RIP-relative writers found
+    # are reported as evidence, with no desktop classification.
+    unwritten = attributes("data_unwritten", "data", word=AMD_WORD, written_at=[])
+    check("desktop" not in unwritten and "pointers" in unwritten["detail"], f"data_unwritten: {unwritten}")
+    pointer = attributes("pointer_written", "data", word=AMD_WORD, written_at=[])
+    check("desktop" not in pointer, f"pointer_written must not classify the initial value: {pointer}")
     written = attributes("data_written", "data", word=BINK_WORD)
     check(written.get("written_at") and "desktop" not in written, f"data_written: {written}")
     check("via" in constant("register_copy", 0xE0000000, PHYSICAL), "register_copy follows r8")
@@ -132,20 +137,22 @@ def check_fixture(path):
     check(passthrough["callers"] == [], f"exported_passthrough: {passthrough}")
     for name in ("forward_free", "set_word"):
         check(name not in by_export, f"{name} has no xmem call site")
-    check(len(report["sites"]) == 22, f"expected 22 sites, found {len(report['sites'])}")
+    check(len(report["sites"]) == 23, f"expected 23 sites, found {len(report['sites'])}")
 
     summary = report["summary"]
-    check(summary["sites"] == 22, "summary site count")
+    check(summary["sites"] == 23, "summary site count")
     check(sorted(summary["null_words"]) == ["0x2a8004000", "0xe0000000"], f"null words {summary['null_words']}")
+    # --fail-on-unresolved exits with 1 exactly when this list is not empty.
     unresolved = {int(s, 16) for s in summary["sites_not_fully_constant"]}
     expected_unresolved = {int(site(n)["site"], 16) for n in
-                           ("data_written", "tail_argument", "computed_word", "indirect_reached", "call_clobber",
-                            "partial_write", "exported_passthrough")}
+                           ("data_unwritten", "pointer_written", "data_written", "tail_argument", "computed_word",
+                            "indirect_reached", "call_clobber", "partial_write", "exported_passthrough")}
     check(unresolved == expected_unresolved, f"not fully constant: {summary['sites_not_fully_constant']}")
     words = {w["word_hex"]: w for w in summary["words"]}
     check(set(words) == {"0x0", "0x1", "0x5e50000", "0xa8004000", "0x20004000", "0xe0000000", "0x2a8004000"},
           f"distinct words {sorted(words)}")
-    check(len(words["0xa8004000"]["sites"]) == 5, f"0xa8004000 sites {words['0xa8004000']['sites']}")
+    # Not counted: data_unwritten and pointer_written, whose 0xa8004000 is only an initial value.
+    check(len(words["0xa8004000"]["sites"]) == 4, f"0xa8004000 sites {words['0xa8004000']['sites']}")
 
     for flag, code in ((None, 0), ("--fail-on-null", 1), ("--fail-on-unresolved", 1)):
         command = [sys.executable, "-B", str(TOOL), str(path), "--output", str(Path(path).with_suffix(".scan.json"))]
@@ -161,7 +168,13 @@ def check_delay(path):
     check(len(report["sites"]) == 1, f"delay sites {report['sites']}")
     a = report["sites"][0]["attributes"]
     check(a["source"] == "constant" and a["word"] == BINK_WORD, f"delay site: {a}")
-    print("delay-load fixture: 1 site passed")
+    check(report["summary"]["sites_not_fully_constant"] == [], f"delay summary {report['summary']}")
+    # Control for the fixture's exit codes: with every site constant and valid, both flags pass.
+    for flag in ("--fail-on-null", "--fail-on-unresolved"):
+        command = [sys.executable, "-B", str(TOOL), str(path), "--output", str(Path(path).with_suffix(".scan.json")), flag]
+        result = subprocess.run(command, capture_output=True, text=True)
+        check(result.returncode == 0, f"delay exit code with {flag}: {result.returncode}, stderr {result.stderr}")
+    print("delay-load fixture: 1 site and exit codes passed")
 
 
 def main():

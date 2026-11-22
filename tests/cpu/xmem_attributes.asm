@@ -5,8 +5,9 @@ EXTERN __imp_XMemFree:QWORD
 EXTERN XMemAlloc:PROC
 
 .data
-fixed_word QWORD 0A8004000h      ; writable, never written: a constant
+unwritten_word QWORD 0A8004000h  ; writable, no RIP-relative write: still not a constant
 varying_word QWORD 05E50000h     ; written by set_word: not a constant
+pointer_word DWORD 0A8004000h    ; written through a register in pointer_written: not a constant
 
 CONST SEGMENT
 read_only_word QWORD 020004000h  ; read-only section: a constant
@@ -32,12 +33,23 @@ thunk_call PROC
     ret
 thunk_call ENDP
 
-; Word loaded from data that nothing writes.
-data_constant PROC
-    mov rdx, fixed_word
+; Word loaded from writable data that no RIP-relative instruction writes. A write through a
+; pointer elsewhere could still change it, so it is data, not a constant.
+data_unwritten PROC
+    mov rdx, unwritten_word
     call QWORD PTR __imp_XMemAlloc
     ret
-data_constant ENDP
+data_unwritten ENDP
+
+; The word is written through an address held in a register, then loaded RIP-relative into EDX.
+; No RIP-relative instruction writes it (lea only takes its address), and the load must stay data.
+pointer_written PROC
+    lea rax, pointer_word
+    mov DWORD PTR [rax], 05E50000h
+    mov edx, pointer_word
+    call QWORD PTR __imp_XMemAlloc
+    ret
+pointer_written ENDP
 
 ; Word loaded from a read-only section.
 read_only_constant PROC
