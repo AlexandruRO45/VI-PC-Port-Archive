@@ -42,7 +42,8 @@ SUPPORTED_ALU = {f"v_{name}_f32" for name in PIXEL_ALU_NAMES}
 SUPPORTED_INSTRUCTIONS_REGEX = [
     r"s_inst_prefetch\s+.*",
     r"s_nop\s+.*",
-    r"s_waitcnt\s+(?:lgkmcnt\(0\)|vmcnt\(0\))",
+    r"s_waitcnt_expcnt\s+(?:(?:null|s\d+),\s*)?(?:0x[0-7]|[0-7])",
+    r"s_waitcnt\s+(?:lgkmcnt\(0\)|vmcnt\(0\)|expcnt\([0-7]\)|vmcnt\(0\)\s+lgkmcnt\(0\)|lgkmcnt\(0\)\s+vmcnt\(0\))",
     r"s_mov_b64\s+s\[\d+:\d+\],\s+exec",
     r"s_wqm_b64\s+exec,\s+exec",
     r"s_and_b64\s+exec,\s+exec,\s+s\[\d+:\d+\]",
@@ -51,7 +52,7 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"(?:s_load_dwordx4|s_buffer_load_dwordx4)\s+s\[\d+:\d+\],\s+s\[\d+:\d+\],\s+.*",
     r"v_interp_p[12]_f32_e32\s+v\d+,\s+v\d+,\s+attr0\.[xy]",
     r"image_sample\s+v\[\d+:\d+\],\s+v\[\d+:\d+\],\s+s\[\d+:\d+\],\s+s\[\d+:\d+\]\s+dmask:0xf\s+dim:SQ_RSRC_IMG_2D",
-    r"v_(?:" + "|".join(map(re.escape, PIXEL_ALU_NAMES)) + r"|ceil|rndne)_f32(?:_e32|_e64)?\s+v\d+,\s+.*",
+    r"v_(?:" + "|".join(map(re.escape, PIXEL_ALU_NAMES)) + r")_f32(?:_e32|_e64)?\s+v\d+,\s+.*",
     r"v_cvt_pkrtz_f16_f32_e32\s+v\d+,\s+v\d+,\s+v\d+",
     r"exp\s+mrt0\s+v\d+,\s+v\d+,\s+v\d+,\s+v\d+\s+done\s+compr\s+vm",
     r"s_endpgm",
@@ -81,7 +82,7 @@ KNOWN_RDNA2_BASE_OPCODES = {
     # VOP1
     "v_nop", "v_mov_b32", "v_readfirstlane_b32", "v_not_b32", "v_cls_i32",
     "v_log_f32", "v_exp_f32", "v_rcp_f32", "v_rsq_f32", "v_sqrt_f32",
-    "v_sin_f32", "v_cos_f32", "v_bfrev_b32", "v_ffbh_u32", "v_ffbl_b32", "v_ceil_f32", "v_rndne_f32",
+    "v_sin_f32", "v_cos_f32", "v_bfrev_b32", "v_ffbh_u32", "v_ffbl_b32",
     "v_cvt_f32_i32", "v_cvt_f32_u32", "v_cvt_i32_f32", "v_cvt_u32_f32",
     "v_cvt_f16_f32", "v_cvt_f32_f16", "v_cvt_rpi_i32_f32", "v_cvt_flr_i32_f32",
     "v_cvt_pkrtz_f16_f32",

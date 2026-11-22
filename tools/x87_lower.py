@@ -15,7 +15,9 @@ The profile accepts:
   and CMC carry an undefined CF on into the flags and registers they write;
 - FADD, FSUB, FSUBR, FMUL, FDIV and FDIVR with an m32 or m64 operand, with ST(0), ST(i) and with
   ST(i), ST(0), and their popping forms FADDP, FSUBP, FSUBRP, FMULP, FDIVP and FDIVRP ST(i), ST(0) for
-  i from 1 to 7.
+  i from 1 to 7;
+- FIADD, FISUB, FISUBR, FIMUL, FIDIV and FIDIVR with an m16 or m32 integer operand, which is converted
+  exactly, as FILD converts it, before the arithmetic.
 A function starts with control word 0x027F, TOP 0, eight empty registers and a clear status word, and
 must return with the stack empty. The stack depth before every instruction is fixed at translation
 time, so each register maps to a C++ slot and no TOP is needed at run time. Translation rejects any x87
@@ -31,13 +33,16 @@ from iced_x86 import Code as C, FlowControl, MemorySize as S, MemorySizeExt, Mne
 from iced_x86 import RegisterExt, RflagsBits as F
 
 X87_HEADER = Path(__file__).with_name("x87_soft.h").read_text(encoding="ascii")
+# Arithmetic with an m16 or m32 integer operand: mnemonic -> helper, with ST(0) as the destination.
+IARITHMETIC = {M.FIADD: "x87_add", M.FISUB: "x87_sub", M.FISUBR: "x87_subr", M.FIMUL: "x87_mul",
+               M.FIDIV: "x87_div", M.FIDIVR: "x87_divr"}
 # Conditional register moves and the C++ condition each reads from the integer lowering's flags.
 FCMOV = {M.FCMOVB: "carry", M.FCMOVE: "zero", M.FCMOVBE: "carry || zero", M.FCMOVNB: "!carry",
          M.FCMOVNE: "!zero", M.FCMOVNBE: "!carry && !zero"}
 X87_OPS = frozenset({M.FLD, M.FST, M.FSTP, M.FXCH, M.FCHS, M.FABS, M.FSQRT, M.FRNDINT, M.FLD1, M.FLDZ, M.FLDPI, M.FLDL2T, M.FLDL2E,
                      M.FLDLG2, M.FLDLN2, M.FILD, M.FIST, M.FISTP, M.FISTTP, M.FXTRACT, M.FSCALE, *FCMOV, M.FCOMI,
                      M.FCOMIP, M.FUCOMI, M.FUCOMIP, M.FADD, M.FADDP, M.FSUB, M.FSUBP, M.FSUBR, M.FSUBRP, M.FMUL, M.FMULP,
-                     M.FDIV, M.FDIVP, M.FDIVR, M.FDIVRP})
+                     M.FDIV, M.FDIVP, M.FDIVR, M.FDIVRP, *IARITHMETIC})
 DECLARATION = "X87Value x87_slot[8]{};"
 
 LOADS = {S.FLOAT32: "x87_from_f32(load<uint32_t>(a))", S.FLOAT64: "x87_from_f64(load<uint64_t>(a))",
@@ -147,6 +152,12 @@ def _effect(i, depth):
         if depth == 0:
             raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
         return depth - 1
+    if op in IARITHMETIC:
+        if i.op0_kind != K.MEMORY or i.memory_size not in (S.INT16, S.INT32):
+            raise ValueError(f"unsupported x87 operand at {i.ip:#x}: {i}")
+        if depth == 0:
+            raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
+        return depth
     if op in TWO_FORM and i.op_count == 1:
         if i.op0_kind != K.MEMORY or i.memory_size not in OPERANDS:
             raise ValueError(f"unsupported x87 operand at {i.ip:#x}: {i}")
@@ -306,6 +317,11 @@ def statement(i, depth, address):
         chop = "true" if op == M.FISTTP else "false"
         return (f"{{ const word a = {address()}; "
                 f"store<{unsigned}>(a, static_cast<{unsigned}>(x87_to_integer(x87_slot[{top}], {bits}, {chop}))); }}")
+    if op in IARITHMETIC:  # ST(0) = ST(0) op integer, the integer converted exactly as for FILD
+        signed, unsigned, bits = INTEGERS[i.memory_size]
+        name = next(n for n, v in vars(M).items() if v == op).lower()
+        return (f"{{ const word a = {address()}; x87_slot[{top}] = {IARITHMETIC[op]}(x87_slot[{top}], "
+                f"x87_from_integer(static_cast<{signed}>(load<{unsigned}>(a)))); }}  // {name} m{bits}")
     if op == M.FSCALE:
         return f"x87_slot[{top}] = x87_scale(x87_slot[{top}], x87_slot[{top - 1}]);"
     if op == M.FXTRACT:  # ST(1) becomes the exponent and the pushed ST(0) the significand
