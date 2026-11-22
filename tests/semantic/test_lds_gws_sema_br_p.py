@@ -901,5 +901,100 @@ class TestSIMDMultiLaneDivergenceAndExecMasking(unittest.TestCase):
         self.assertEqual(len(self.gws.resources[rid].wait_queue), 0)
 
 
+class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
+    """Commit 5: Register aliasing and in-place operand preservation for ds_gws_sema_br_p."""
+
+    def setUp(self) -> None:
+        self.gws = GWSSubsystem()
+        self.scalar_interp = ScalarGWSInterpreter()
+        self.simd_interp = SIMDGWSInterpreter()
+
+    def test_m0_preservation_after_successful_probe(self) -> None:
+        rid = 4
+        self.gws.init_resource(rid, init_val=5)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_P, offset=0, gds=True)
+
+        self.scalar_interp.execute(state, inst)
+        self.assertEqual(state.m0, rid)
+
+    def test_m0_preservation_after_failed_probe(self) -> None:
+        rid = 7
+        self.gws.init_resource(rid, init_val=0)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_P, offset=0, gds=True)
+
+        self.scalar_interp.execute(state, inst)
+        self.assertEqual(state.m0, rid)
+
+    def test_all_sgprs_preserved_in_place(self) -> None:
+        rid = 9
+        self.gws.init_resource(rid, init_val=3)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        for s in range(106):
+            state.set_sgpr(s, (0xFEED0000 + s * 31) & MASK32)
+        saved_sgprs = dict(state.sgprs)
+
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_P, offset=0, gds=True)
+        self.scalar_interp.execute(state, inst)
+
+        self.assertEqual(state.sgprs, saved_sgprs)
+
+    def test_all_lane_vgprs_preserved_in_simd(self) -> None:
+        rid = 12
+        self.gws.init_resource(rid, init_val=1)
+        wave = SIMDWaveState(wave_id=5, wave_size=32, m0=rid, gws=self.gws)
+        for lane in range(32):
+            for v in range(0, 256, 16):
+                wave.set_vgpr(lane, v, (lane << 16) | (v * 7))
+        saved_vgprs = [dict(lane_dict) for lane_dict in wave.lane_vgprs]
+
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_P, offset=0, gds=True)
+        self.simd_interp.execute(wave, inst)
+
+        self.assertEqual(wave.lane_vgprs, saved_vgprs)
+
+    def test_vdata_operand_preservation(self) -> None:
+        rid = 15
+        self.gws.init_resource(rid, init_val=10)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        state.set_vgpr(4, 3)  # request 3 permits
+
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_P, offset=0, gds=True, vdata=Register(4, RegKind.VGPR))
+        success, val, branch = self.scalar_interp.execute(state, inst)
+        self.assertTrue(success)
+        self.assertEqual(val, 7)
+        # vdata register 4 must be preserved intact with value 3
+        self.assertEqual(state.get_vgpr(4), 3)
+
+    def test_aliased_m0_and_sgpr_integrity(self) -> None:
+        rid = 18
+        self.gws.init_resource(rid, init_val=2)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        state.set_sgpr(0, rid)
+        state.set_sgpr(1, rid)
+
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_P, offset=0, gds=True)
+        self.scalar_interp.execute(state, inst)
+
+        self.assertEqual(state.m0, rid)
+        self.assertEqual(state.get_sgpr(0), rid)
+        self.assertEqual(state.get_sgpr(1), rid)
+
+    def test_consecutive_probe_pipeline_preservation(self) -> None:
+        rid = 20
+        self.gws.init_resource(rid, init_val=4)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        state.set_sgpr(10, 0x12345678)
+        state.set_vgpr(20, 0x9ABCDEF0)
+
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_P, offset=0, gds=True)
+        for _ in range(5):
+            self.scalar_interp.execute(state, inst)
+            self.assertEqual(state.m0, rid)
+            self.assertEqual(state.get_sgpr(10), 0x12345678)
+            self.assertEqual(state.get_vgpr(20), 0x9ABCDEF0)
+
+
 if __name__ == "__main__":
     unittest.main()
