@@ -75,6 +75,27 @@ class CarveEdgeTest(unittest.TestCase):
         self.assertEqual(doc["summary"]["files"], 0)
         self.assertEqual(doc["summary"]["span"], 0)
 
+    def test_data_offset_past_end_of_file(self):
+        # Header claims data offset past EOF -> clean error exit
+        data = bytearray(0x40)
+        data[0:4] = b"RPF9"
+        struct.pack_into("<I", data, 4, 0x100)   # data offset 0x100 > file size 0x40
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "x.rpf")
+            out = os.path.join(tmp, "out")
+            with open(arc, "wb") as f:
+                f.write(data)
+            p = subprocess.run([sys.executable, "-I", TOOL, arc, out, "--index-only"],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 1)
+            self.assertIn("data offset", p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            # index.json should still be written with zero files
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                doc = json.load(f)
+            self.assertEqual(doc["summary"]["files"], 0)
+            self.assertEqual(doc["summary"]["span"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

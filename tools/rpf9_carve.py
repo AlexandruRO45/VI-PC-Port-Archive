@@ -42,6 +42,23 @@ def main() -> int:
         m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
         size = len(m)
         pos = a.start if a.start is not None else struct.unpack_from("<I", m, 4)[0]
+        # BUILD-70: validate data offset against file size
+        if pos > size:
+            summary = {"archive": a.archive, "files": 0, "compressed_bytes": 0,
+                       "inflated_bytes": 0, "bink2_bytes": 0, "bink2_files": 0,
+                       "zero_padding": 0, "unread_bytes": 0, "span": 0}
+            with open(os.path.join(a.out, "index.json"), "w", encoding="utf-8") as f:
+                json.dump({"summary": summary, "files": []}, f)
+            raise SystemExit(f"archive {a.archive}: data offset 0x{pos:x} past end of file (size {size})")
+        if pos == size:
+            summary = {"archive": a.archive, "files": 0, "compressed_bytes": 0,
+                       "inflated_bytes": 0, "bink2_bytes": 0, "bink2_files": 0,
+                       "zero_padding": 0, "unread_bytes": 0, "span": 0}
+            with open(os.path.join(a.out, "index.json"), "w", encoding="utf-8") as f:
+                json.dump({"summary": summary, "files": []}, f)
+            print(json.dumps(summary, indent=1))
+            print("readable: 0.0%, zero padding 0.0%, unread 0.0%")
+            return 0
         end = min(size, pos + a.limit) if a.limit else size
         rows, last, unread, zero = [], pos, 0, 0
         t0 = time.time()
