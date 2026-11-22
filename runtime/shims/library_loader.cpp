@@ -92,61 +92,135 @@ const Pseudo* pseudo(HMODULE h) {
 
 namespace {
 
+constexpr DWORD kDataFileLoadFlags =
+    LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE | LOAD_LIBRARY_AS_IMAGE_RESOURCE;
+
+HMODULE load_shim_or_bundled(const std::string& path, bool& handled) {
+    handled = false;
+    if (HMODULE h = owned_handle(path)) {
+        handled = true;
+        return h;
+    }
+    const std::string dll = module_name(path);
+    if (!dll.empty()) {
+        if (void* h = load_bundled_module(dll, handled); handled) return reinterpret_cast<HMODULE>(h);
+    }
+    return nullptr;
+}
+
 HMODULE WINAPI load_library_a(LPCSTR name) {
-    if (HMODULE h = name ? owned_handle(name) : nullptr) return h;
+    if (name) {
+        bool handled = false;
+        HMODULE h = load_shim_or_bundled(name, handled);
+        if (handled) return h;
+    }
     return LoadLibraryA(name);
 }
 
 HMODULE WINAPI load_library_w(LPCWSTR name) {
-    if (HMODULE h = name ? owned_handle(narrow(name)) : nullptr) return h;
+    if (name) {
+        bool handled = false;
+        HMODULE h = load_shim_or_bundled(narrow(name), handled);
+        if (handled) return h;
+    }
     return LoadLibraryW(name);
 }
 
 HMODULE WINAPI load_library_ex_a(LPCSTR name, HANDLE file, DWORD flags) {
-    if (HMODULE h = name ? owned_handle(name) : nullptr) return h;
+    if (name && (flags & kDataFileLoadFlags) == 0) {
+        bool handled = false;
+        HMODULE h = load_shim_or_bundled(name, handled);
+        if (handled) return h;
+    }
     return LoadLibraryExA(name, file, flags);
 }
 
 HMODULE WINAPI load_library_ex_w(LPCWSTR name, HANDLE file, DWORD flags) {
-    if (HMODULE h = name ? owned_handle(narrow(name)) : nullptr) return h;
+    if (name && (flags & kDataFileLoadFlags) == 0) {
+        bool handled = false;
+        HMODULE h = load_shim_or_bundled(narrow(name), handled);
+        if (handled) return h;
+    }
     return LoadLibraryExW(name, file, flags);
 }
 
-// GetModuleHandle answers for an owned module as if it were loaded: the GDK may probe before it loads.
+// GetModuleHandle answers for an owned module as if it were loaded (the GDK may probe before it loads), and for any
+// bundled package module already mapped by the native loader.
 HMODULE WINAPI get_module_handle_a(LPCSTR name) {
-    if (HMODULE h = name ? owned_handle(name) : nullptr) return h;
+    if (name) {
+        if (HMODULE h = owned_handle(name)) return h;
+        const std::string dll = module_name(name);
+        if (!dll.empty())
+            if (void* h = find_loaded_bundled_module(dll)) return reinterpret_cast<HMODULE>(h);
+    }
     return GetModuleHandleA(name);
 }
 
 HMODULE WINAPI get_module_handle_w(LPCWSTR name) {
-    if (HMODULE h = name ? owned_handle(narrow(name)) : nullptr) return h;
+    if (name) {
+        const std::string path = narrow(name);
+        if (HMODULE h = owned_handle(path)) return h;
+        const std::string dll = module_name(path);
+        if (!dll.empty())
+            if (void* h = find_loaded_bundled_module(dll)) return reinterpret_cast<HMODULE>(h);
+    }
     return GetModuleHandleW(name);
 }
 
 FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
-    const Pseudo* p = pseudo(module);
-    if (!p) return GetProcAddress(module, name);
-    if (!name) {
+    if (const Pseudo* p = pseudo(module)) {
+        if (!name) {
+            SetLastError(ERROR_PROC_NOT_FOUND);
+            return nullptr;
+        }
+        // A value below 0x10000 is an ordinal (IS_INTRESOURCE), as in the real GetProcAddress.
+        const std::string what =
+            IS_INTRESOURCE(name) ? "#" + std::to_string(reinterpret_cast<uintptr_t>(name)) : name;
+        if (void* fn = find(p->dll, what)) return reinterpret_cast<FARPROC>(fn);
+        {
+            static auto* m = new std::mutex;
+            static auto* seen = new std::set<std::string>;
+            std::lock_guard lock(*m);
+            if (seen->insert(p->dll + "!" + what).second)
+                std::fprintf(stderr, "[rt] loader: GetProcAddress(%s, %s): not served\n", p->dll.c_str(), what.c_str());
+        }
         SetLastError(ERROR_PROC_NOT_FOUND);
         return nullptr;
     }
-    // A value below 0x10000 is an ordinal (IS_INTRESOURCE), as in the real GetProcAddress.
-    const std::string what = IS_INTRESOURCE(name) ? "#" + std::to_string(reinterpret_cast<uintptr_t>(name)) : name;
-    if (void* fn = find(p->dll, what)) return reinterpret_cast<FARPROC>(fn);
-    {
-        static auto* m = new std::mutex;
-        static auto* seen = new std::set<std::string>;
-        std::lock_guard lock(*m);
-        if (seen->insert(p->dll + "!" + what).second)
-            std::fprintf(stderr, "[rt] loader: GetProcAddress(%s, %s): not served\n", p->dll.c_str(), what.c_str());
+
+    if (!name) {
+        if (owns_bundled_module_handle(module)) {
+            SetLastError(ERROR_PROC_NOT_FOUND);
+            return nullptr;
+        }
+        return GetProcAddress(module, name);
     }
-    SetLastError(ERROR_PROC_NOT_FOUND);
-    return nullptr;
+
+    const std::string what = IS_INTRESOURCE(name) ? "#" + std::to_string(reinterpret_cast<uintptr_t>(name)) : name;
+    bool owns_handle = false;
+    void* fn = get_bundled_proc_address(module, what, owns_handle);
+    if (owns_handle) {
+        if (fn) return reinterpret_cast<FARPROC>(fn);
+        SetLastError(ERROR_PROC_NOT_FOUND);
+        return nullptr;
+    }
+    return GetProcAddress(module, name);
 }
 
 BOOL WINAPI free_library(HMODULE module) {
     if (pseudo(module)) return TRUE;   // owned modules are never unloaded
+    if (owns_bundled_module_handle(module)) return TRUE;  // mapped modules stay live until ~Loader detaches them
     return FreeLibrary(module);
+}
+
+// DisableThreadLibraryCalls(hinstance) from a mapped image's DllMain. The real function only accepts a module the
+// Windows loader mapped, so for ours it fails, and a DllMain that returns its result (the MSVC runtime's satellite DLLs
+// do) fails Loader::initialise() with "DllMain returned FALSE". Owned and mapped modules answer TRUE. The loader sends
+// no thread events to a DllMain, so there is nothing further to switch off; every other handle goes to the real function.
+BOOL WINAPI disable_thread_calls(HMODULE module) {
+    if (pseudo(module)) return TRUE;
+    if (owns_bundled_module_handle(module)) return TRUE;
+    return DisableThreadLibraryCalls(module);
 }
 
 #define LOADER(dll)                                                                         \
@@ -157,7 +231,7 @@ BOOL WINAPI free_library(HMODULE module) {
     {dll, "GetModuleHandleA", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_handle_a)},               \
     {dll, "GetModuleHandleW", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_handle_w)},               \
     {dll, "GetProcAddress", reinterpret_cast<void*>(&rt::shims::library_loader::get_proc_address)},                    \
-    {dll, "FreeLibrary", reinterpret_cast<void*>(&rt::shims::library_loader::free_library)}
+    {dll, "FreeLibrary", reinterpret_cast<void*>(&rt::shims::library_loader::free_library)},                              {dll, "DisableThreadLibraryCalls", reinterpret_cast<void*>(&rt::shims::library_loader::disable_thread_calls)}
 
 }  // namespace
 }  // namespace rt::shims::library_loader
