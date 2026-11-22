@@ -49,6 +49,7 @@ def trace(report, entry):
                                            if s["package"] and s["provider"]))
                 if hops:
                     known_hops.add((kind, hops))
+                if any(s["package"] for s in package["chain"][1:]):
                     if package["status"] != "export_present":
                         findings.append(dict(path=path, reasons=reasons + (kind,),
                                              conditional=conditional or kind == "delay", dll=dll, symbol=symbol,

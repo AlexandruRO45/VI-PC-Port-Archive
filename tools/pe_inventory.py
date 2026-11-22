@@ -375,14 +375,16 @@ def scan(root, *, extra_image=None, system=None):
             "bundle_exports_in": sorted(p for p, keys in bundled[dll] if symbol in keys),
             "desktop_provider": first["provider"], "desktop_export": status, "desktop_candidate": candidate,
             "desktop_resolution": resolution,
-            # Follow forwarders in a packaged provider. Absent when the package lacks the module.
+            # A KnownDLL forwarder may lead into the package even without a same-name package file.
             "package_resolution": resolve_desktop(dll, symbol, importer, contracts, system_exports,
-                                                  package_exports, known) if bundled[dll] else None,
+                                                  package_exports, known)
+                                  if bundled[dll] or (dll in known and "forwarder" in first) else None,
         })
     # A packaged forwarder satisfies an edge only when its chain reaches a terminal export.
     unresolved = [r for r in rows if r["desktop_resolution"]["status"] != "export_present"
-                  and not (r["bundle_exports_in"] and r["package_resolution"]["status"]
-                           in {"export_present", "ambiguous_package_basename"})]
+                  and not (r["package_resolution"] and
+                           (r["package_resolution"]["status"] == "export_present" or
+                            (r["bundle_exports_in"] and r["package_resolution"]["status"] == "ambiguous_package_basename")))]
     return {
         "schema": 1, "host_windows_build": sys.getwindowsversion().build, "pefile": pefile.__version__,
         "behavior": "Scarlett behavior unverified for every import. Static export matches include forwarders.",
