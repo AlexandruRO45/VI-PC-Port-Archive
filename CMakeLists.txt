@@ -682,7 +682,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         "op_pextrd_reg,op_pextrd_mem,op_pextrq_reg,op_pextrq_mem,"
         "op_pinsrb_reg,op_pinsrb_mem,op_pinsrw_reg,op_pinsrw_mem,"
         "op_pinsrd_reg,op_pinsrd_mem,op_pinsrq_reg,op_pinsrq_mem,"
-        "op_zeroupper,op_zeroall,op_pipeline,op_movdqu_copy128,op_mov_store32,op_movdqu_regcopy,op_movdqu_store128")
+        "op_zeroupper,op_zeroall,op_pipeline,op_movdqu_copy128,op_mov_store32,op_movdqu_regcopy,op_movdqu_store128,"
+        "op_palignr_69,op_mpsadbw_6,op_pshuflw_1b,op_psllq_imm_129,op_pextrw_reg_2,op_pextrd_reg_2,"
+        "op_pinsrb_reg_upper,op_pinsrw_reg_3,op_zeroupper_ymm1,op_movdqu_load128")
     string(CONCAT cpu_avx_int_exports ${cpu_avx_int_exports})
     foreach(variant IN ITEMS original altered)
         cpu_asm_fixture(cpu_avx_int_regs_${variant} avx_int_regs)

@@ -29,8 +29,13 @@ except ImportError:
     parts = None
 
 try:
-    from disasm_rdna2 import disasm_rdna2
+    from disasm_rdna2 import FLAT_OPS, GLOBAL_OPS, MTBUF_OPS, MUBUF_OPS, SCRATCH_OPS, disasm_rdna2
 except ImportError:
+    MTBUF_OPS = {}
+    MUBUF_OPS = {}
+    FLAT_OPS = {}
+    GLOBAL_OPS = {}
+    SCRATCH_OPS = {}
     disasm_rdna2 = None
 
 
@@ -84,6 +89,9 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"image_sample\s+v\[\d+:\d+\],\s+v\[\d+:\d+\],\s+s\[\d+:\d+\],\s+s\[\d+:\d+\]\s+dmask:0x[7f]\s+dim:SQ_RSRC_IMG_2D",
     r"v_cube(?:id|sc|tc|ma)_f32(?:_e64)?\s+v\d+,\s+[^,]+,\s+[^,]+,\s+[^,]+?(?:\s+clamp)?",
     r"v_(?:fmaak|fmamk)_f32\s+v\d+,\s+[^,]+,\s+[^,]+,\s+[^,]+",
+    # K must be a 32-bit literal: last operand of v_madak_f32, second of v_madmk_f32 (as pixel_aot requires).
+    r"v_madak_f32\s+v\d+,\s+[^,]+,\s+[^,]+,\s+0x[0-9a-f]{1,8}",
+    r"v_madmk_f32\s+v\d+,\s+[^,]+,\s+0x[0-9a-f]{1,8},\s+[^,]+",
     r"v_mov_b32(?:_e32|_e64)?\s+v\d+,\s+(?:-?\d+(?:\.\d+)?|0x[0-9a-f]{1,8}|[vs]\d+)",
     rf"v_mov_b32_sdwa\s+v\d+,\s+(?:sext\((?:[vs]\d+|-?\d+(?:\.\d+)?)\)|[vs]\d+|-?\d+(?:\.\d+)?)\s+dst_sel:{SDWA_SEL_PATTERN}\s+dst_unused:(?:UNUSED_PAD|UNUSED_PRESERVE)\s+src0_sel:{SDWA_SEL_PATTERN}",
     r"v_cvt_f32_f16(?:_e32|_e64)?\s+v\d+,\s+-?(?:\|(?:[vs]\d+|0x[0-9a-f]{1,8}|\d+)\||abs\((?:[vs]\d+|0x[0-9a-f]{1,8}|\d+)\)|[vs]\d+|0x[0-9a-f]{1,8}|\d+)(?:\s+clamp)?",
@@ -165,6 +173,7 @@ KNOWN_RDNA2_BASE_OPCODES = {
     "s_andn2_b32", "s_andn2_b64", "s_orn2_b32", "s_orn2_b64", "s_nand_b32", "s_nand_b64",
     "s_nor_b32", "s_nor_b64", "s_lshl_b32", "s_lshl_b64", "s_lshr_b32", "s_lshr_b64",
     "s_ashr_i32", "s_ashr_i64", "s_mul_i32",
+    "s_lshl1_add_u32", "s_lshl2_add_u32", "s_lshl3_add_u32", "s_lshl4_add_u32",
     # SOPK
     "s_movk_i32", "s_cmovk_i32", "s_addk_i32", "s_mulk_i32", "s_cbranch_i_fork",
     # VOP1
@@ -212,6 +221,11 @@ KNOWN_RDNA2_BASE_OPCODES |= (
     | {f"s_{name}_b64" for name in PIXEL_SALU_BIT64}
     | {f"v_pk_{name}_f16" for name in PIXEL_VOP3P_F16}
     | {f"v_pk_{name}" for name in PIXEL_VOP3P_INT16}
+    | {name for name, _, _ in MUBUF_OPS.values()}
+    | {name for name, _, _ in MTBUF_OPS.values()}
+    | {entry[0] for entry in FLAT_OPS.values()}
+    | {entry[0] for entry in GLOBAL_OPS.values()}
+    | {entry[0] for entry in SCRATCH_OPS.values()}
     | (set(pixel_aot.HINT_LIMITS) if pixel_aot is not None else set())
     | {
         "s_brev_b64", "s_bfm_b64", "s_bfe_u32", "s_bfe_i32",
@@ -273,7 +287,7 @@ def classify_isa_category(opcode: str) -> str:
         return "SALU (Scalar ALU)"
     if op.startswith("image_"):
         return "MIMG (Image / Texture Resource)"
-    if op.startswith("buffer_") or op.startswith("flat_") or op.startswith("global_"):
+    if op.startswith(("buffer_", "tbuffer_", "flat_", "global_", "scratch_")):
         return "VMEM (Vector Memory / Buffer)"
     if op.startswith("exp"):
         return "EXP (Export)"
