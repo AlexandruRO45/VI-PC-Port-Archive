@@ -1076,6 +1076,135 @@ def check_scheduling_hints():
     must_reject(translate, plain[:-1] + ["s_setprio 0", plain[-1]])
 
 
+# Packed 16-bit integer VOP3P fixture covering all 14 forms: add/sub/min/max (i16/u16),
+# mul_lo_u16, mad (i16/u16), and lshlrev/lshrrev/ashrrev shifts, plus op_sel/op_sel_hi, clamp,
+# and inline -1. Exports all four bytes of the packed accumulator as exact [0, 255] integers.
+PK_INT16_BODY = [
+    "v_mov_b32_e32 v18, s44",
+    "v_mov_b32_e32 v19, s45",
+    "v_mov_b32_e32 v20, s46",
+    "v_mov_b32_e32 v21, s47",
+    "v_pk_add_i16 v22, v18, v19 op_sel:[1,0] op_sel_hi:[0,1] clamp",
+    "v_pk_add_u16 v23, v18, v19 clamp",
+    "v_pk_sub_i16 v24, v18, v19 clamp",
+    "v_pk_sub_u16 v25, v18, v19 clamp",
+    "v_pk_mad_i16 v26, v18, v19, v20 clamp",
+    "v_pk_mad_u16 v27, v18, v19, v20 clamp",
+    "v_pk_min_i16 v28, v22, v24",
+    "v_pk_max_i16 v29, v28, v26",
+    "v_pk_min_u16 v28, v23, v25",
+    "v_pk_max_u16 v28, v28, v27",
+    "v_pk_mul_lo_u16 v29, v29, v28",
+    "v_pk_add_i16 v29, v29, -1",
+    "v_pk_lshlrev_b16 v22, v21, v29 op_sel:[0,1] op_sel_hi:[1,0]",
+    "v_pk_lshrrev_b16 v23, v21, v28",
+    "v_pk_ashrrev_i16 v24, v21, v18",
+    "v_pk_add_u16 v30, v22, v23",
+    "v_pk_sub_u16 v30, v30, v24",
+    "v_pk_add_u16 v30, v30, v25",
+    "v_pk_add_u16 v30, v30, v26",
+    "v_pk_add_u16 v30, v30, v29",
+    "v_pk_lshlrev_b16 v25, 8, v30 op_sel_hi:[0,1]",
+    "v_pk_lshrrev_b16 v25, 8, v25 op_sel_hi:[0,1]",
+    "v_pk_lshrrev_b16 v26, 8, v30 op_sel_hi:[0,1]",
+    "v_pk_add_u16 v27, v25, 0 op_sel:[1,0] op_sel_hi:[0,0]",
+    "v_pk_add_u16 v28, v26, 0 op_sel:[1,0] op_sel_hi:[0,0]",
+    "v_cvt_f32_f16_e32 v12, v25",
+    "v_mul_f32_e32 v12, 0x4b800000, v12",
+    "v_cvt_f32_f16_e32 v13, v26",
+    "v_mul_f32_e32 v13, 0x4b800000, v13",
+    "v_cvt_f32_f16_e32 v14, v27",
+    "v_mul_f32_e32 v14, 0x4b800000, v14",
+    "v_cvt_f32_f16_e32 v15, v28",
+    "v_mul_f32_e32 v15, 0x4b800000, v15",
+]
+
+PK_INT16_SETS = (
+    # Set 1: mixed signed/unsigned lanes + shift counts >= 16 (testing & 15 masking and ashrrev sign fill).
+    (0xf0080015, 0x0010fffe, 0x0007fff9, 0x00130012),
+    # Set 2: saturates all 6 clamping ops (signed +/-32767/-32768 and unsigned 0/65535 boundaries).
+    (0x70009000, 0x7000a000, 0x4000c000, 0x00020003),
+    # Set 3: signed/unsigned extremes (INT16_MIN/MAX, UINT16_MAX) and max 4-bit shift count 15.
+    (0x80007fff, 0xffff0001, 0x0002fffd, 0x000f0001),
+)
+
+
+def pk_int16_reference(w18, w19, w20, w21):
+    def u16(w, hi):
+        return (w >> 16) & 0xffff if hi else w & 0xffff
+
+    def i16(w, hi):
+        v = u16(w, hi)
+        return v - 0x10000 if v >= 0x8000 else v
+
+    def pack(lo, hi):
+        return (lo & 0xffff) | ((hi & 0xffff) << 16)
+
+    def sat_i(v):
+        return max(-32768, min(32767, v)) & 0xffff
+
+    def sat_u(v):
+        return max(0, min(65535, v)) & 0xffff
+
+    v22 = pack(sat_i(i16(w18, 1) + i16(w19, 0)), sat_i(i16(w18, 0) + i16(w19, 1)))
+    v23 = pack(sat_u(u16(w18, 0) + u16(w19, 0)), sat_u(u16(w18, 1) + u16(w19, 1)))
+    v24 = pack(sat_i(i16(w18, 0) - i16(w19, 0)), sat_i(i16(w18, 1) - i16(w19, 1)))
+    v25 = pack(sat_u(u16(w18, 0) - u16(w19, 0)), sat_u(u16(w18, 1) - u16(w19, 1)))
+    v26 = pack(sat_i(i16(w18, 0) * i16(w19, 0) + i16(w20, 0)), sat_i(i16(w18, 1) * i16(w19, 1) + i16(w20, 1)))
+    v27 = pack(sat_u(u16(w18, 0) * u16(w19, 0) + u16(w20, 0)), sat_u(u16(w18, 1) * u16(w19, 1) + u16(w20, 1)))
+    v28 = pack(min(i16(v22, 0), i16(v24, 0)), min(i16(v22, 1), i16(v24, 1)))
+    v29 = pack(max(i16(v28, 0), i16(v26, 0)), max(i16(v28, 1), i16(v26, 1)))
+    v28 = pack(min(u16(v23, 0), u16(v25, 0)), min(u16(v23, 1), u16(v25, 1)))
+    v28 = pack(max(u16(v28, 0), u16(v27, 0)), max(u16(v28, 1), u16(v27, 1)))
+    v29 = pack((u16(v29, 0) * u16(v28, 0)) & 0xffff, (u16(v29, 1) * u16(v28, 1)) & 0xffff)
+    v29 = pack((i16(v29, 0) - 1) & 0xffff, (i16(v29, 1) - 1) & 0xffff)
+    v22 = pack((u16(v29, 1) << (u16(w21, 0) & 15)) & 0xffff, (u16(v29, 0) << (u16(w21, 1) & 15)) & 0xffff)
+    v23 = pack(u16(v28, 0) >> (u16(w21, 0) & 15), u16(v28, 1) >> (u16(w21, 1) & 15))
+    v24 = pack((i16(w18, 0) >> (u16(w21, 0) & 15)) & 0xffff, (i16(w18, 1) >> (u16(w21, 1) & 15)) & 0xffff)
+    v30 = pack((u16(v22, 0) + u16(v23, 0)) & 0xffff, (u16(v22, 1) + u16(v23, 1)) & 0xffff)
+    v30 = pack((u16(v30, 0) - u16(v24, 0)) & 0xffff, (u16(v30, 1) - u16(v24, 1)) & 0xffff)
+    v30 = pack((u16(v30, 0) + u16(v25, 0)) & 0xffff, (u16(v30, 1) + u16(v25, 1)) & 0xffff)
+    v30 = pack((u16(v30, 0) + u16(v26, 0)) & 0xffff, (u16(v30, 1) + u16(v26, 1)) & 0xffff)
+    v30 = pack((u16(v30, 0) + u16(v29, 0)) & 0xffff, (u16(v30, 1) + u16(v29, 1)) & 0xffff)
+    return tuple(float((v30 >> (8 * k)) & 0xff) for k in range(4))
+
+
+def check_pk_int16_draw(directory, compiler, renderer, backend):
+    program = with_constants(PK_INT16_BODY)
+    source = directory / "pk_int16.hlsl"
+    shader = directory / "pk_int16.cso"
+    case = directory / "pk_int16.case"
+    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    source.write_text(translate(program), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    for values in PK_INT16_SETS:
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *values)
+        expected = pk_int16_reference(*values)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+    for set_idx, old, new, label in (
+        (0, "v_pk_ashrrev_i16 v24, v21, v18", "v_pk_lshrrev_b16 v24, v21, v18", "ashrrev sign extension"),
+        (0, "v_pk_min_i16 v28, v22, v24", "v_pk_min_u16 v28, v22, v24", "signed vs unsigned min"),
+        (1, "v_pk_sub_u16 v25, v18, v19 clamp", "v_pk_sub_u16 v25, v18, v19", "sub_u16 clamp"),
+        (0, "op_sel:[1,0] op_sel_hi:[0,1] clamp", "op_sel_hi:[1,1] clamp", "op_sel cross-lane swap"),
+        (1, "v_pk_mad_i16 v26, v18, v19, v20 clamp", "v_pk_mad_i16 v26, v18, v19, v20", "mad_i16 clamp"),
+    ):
+        values = PK_INT16_SETS[set_idx]
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *values)
+        expected = pk_int16_reference(*values)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        mutated = [line.replace(old, new) for line in program]
+        assert mutated != program, label
+        source.write_text(translate(mutated), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Mutation of {label} escaped detection")
+
+
 def check_controls(directory):
     check_scheduling_hints()
     check_constant_descriptor_bounds()
@@ -1307,6 +1436,42 @@ def check_controls(directory):
     cnd_pos = sel.index("v_cndmask_b32_e64 v13, v13, s46, s[52:53]")
     must_reject(translate, sel[:cnd_pos] + ["s_not_b64 s[52:53], 0"] + sel[cnd_pos:])
 
+    # Packed 16-bit integer VOP3P controls.
+    pk_int = with_constants(PK_INT16_BODY)
+    source = translate(pk_int)
+    assert "clamp(" in source and "4294967295u" in source  # inline -1 -> 0xffffffff
+    for bad in (
+        "v_pk_min_i16 v22, v18, v19 clamp",  # clamp not valid on min/max/mul_lo/shifts
+        "v_pk_max_u16 v22, v18, v19 clamp",
+        "v_pk_mul_lo_u16 v22, v18, v19 clamp",
+        "v_pk_lshlrev_b16 v22, v18, v19 clamp",
+        "v_pk_lshrrev_b16 v22, v18, v19 clamp",
+        "v_pk_ashrrev_i16 v22, v18, v19 clamp",
+        "v_pk_add_i16 v22, v18, v19 neg_lo:[1,0]",
+        "v_pk_add_i16 v22, v18, v19 neg_hi:[0,1]",
+        "v_pk_add_i16 v22, -v18, v19",
+        "v_pk_add_i16 v22, |v18|, v19",
+        "v_pk_add_i16 v22, 0.5, v19",
+        "v_pk_add_i16 v22, 65, v19",
+        "v_pk_add_i16 v22, v18, v19 op_sel:[0,1,0]",
+        "v_pk_mad_i16 v22, v18, v19",
+        "v_pk_add_i16 v22, v18, v19 clamp clamp",
+        "v_pk_add_i16 v256, v18, v19",
+        "v_pk_add_i16 v22, s28, v19",
+        "v_pk_add_f16 v22, v18, v19",
+        "v_fma_mix_f32 v22, v18, v19, v20",
+        "v_dot2_i32_i16 v22, v18, v19, v20",
+    ):
+        must_reject(translate, with_constants(["v_mov_b32_e32 v18, s44", "v_mov_b32_e32 v19, s45",
+                                               "v_mov_b32_e32 v20, s46", bad]))
+    wait_vm = pk_int.index("s_waitcnt vmcnt(0)")
+    must_reject(translate, pk_int[:wait_vm] + ["v_pk_add_u16 v12, s44, 1"] + pk_int[wait_vm:])
+    must_reject(translate, pk_int[:wait_vm] + ["v_pk_add_u16 v22, v12, 1"] + pk_int[wait_vm:])
+    wqm_idx = pk_int.index("s_wqm_b64 exec, exec") + 1
+    must_reject(translate, pk_int[:wqm_idx] + ["v_pk_add_u16 v22, 1, 2"] + pk_int[wqm_idx:])
+    lgkm_idx = pk_int.index("s_waitcnt lgkmcnt(0)", pk_int.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc"))
+    must_reject(translate, pk_int[:lgkm_idx] + ["v_pk_add_u16 v22, s44, 1"] + pk_int[lgkm_idx:])
+
 
 def check_binary(directory, assembler, objcopy, library):
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
@@ -1320,6 +1485,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((dual_program(swap_weights=True), translate_dual))
     fixtures.append((with_constants(LITERAL_FMA_BODY), translate))
     fixtures.append((scheduling_hints(), translate))
+    fixtures.append((with_constants(PK_INT16_BODY), translate))
     for index, (instructions, lower_fixture) in enumerate(fixtures):
         source = directory / "fixture.s"
         obj = directory / "fixture.o"
@@ -1368,6 +1534,7 @@ def check_ceiling_draws(directory, compiler, renderer, backend):
 def check_render(directory, compiler, renderer, backend):
     check_movk_draw(directory, compiler, renderer, backend)
     check_half_draw(directory, compiler, renderer, backend)
+    check_pk_int16_draw(directory, compiler, renderer, backend)
     for swap in (False, True):
         source = directory / "fixture.hlsl"
         shader = directory / "fixture.cso"

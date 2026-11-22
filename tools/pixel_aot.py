@@ -253,6 +253,15 @@ SALU_HELPERS = {
         "}"
     ),
 }
+VOP3P_INT16 = {
+    "add_i16": (2, True), "add_u16": (2, True),
+    "sub_i16": (2, True), "sub_u16": (2, True),
+    "min_i16": (2, False), "min_u16": (2, False),
+    "max_i16": (2, False), "max_u16": (2, False),
+    "mul_lo_u16": (2, False),
+    "mad_i16": (3, True), "mad_u16": (3, True),
+    "lshlrev_b16": (2, False), "lshrrev_b16": (2, False), "ashrrev_i16": (2, False),
+}
 
 
 def sgpr_name(token):
@@ -350,6 +359,100 @@ def fp_operand(token, scalar, vector, pending, sample_pending):
     if re.fullmatch(r"\d+\.\d+", token):
         return token + "f"
     raise ValueError(f"Unsupported arithmetic operand {token}")
+
+
+def vop3p_int_word(token, scalar, vector, pending, sample_pending):
+    """Return a 32-bit uint HLSL expression for one packed 16-bit integer VOP3P source operand."""
+    if m := re.fullmatch(r"([vs])(\d+)", token):
+        limit = 255 if m.group(1) == "v" else 105
+        if not 0 <= int(m.group(2)) <= limit:
+            raise ValueError(f"Register out of range: {token}")
+        if token in pending:
+            raise ValueError("Constant read before load completion")
+        value = (vector if m.group(1) == "v" else scalar)[token]
+        if isinstance(value, int):
+            return f"{value}u"
+        if isinstance(value, tuple) and len(value) == 2 and value[0] == "uint":
+            return value[1]
+        if not isinstance(value, str) or not value.startswith(("sample", "alu", "params[")):
+            raise ValueError("Expected a numeric register")
+        if sample_pending and value.startswith("sample"):
+            raise ValueError("Sample used before vmcnt wait")
+        return f"asuint({value})"
+    if re.fullmatch(r"0x[0-9a-f]{1,8}", token):
+        return f"{int(token, 16)}u"
+    if re.fullmatch(r"-?\d+", token):
+        value = int(token)
+        if not -16 <= value <= 64:
+            raise ValueError(f"Unsupported packed integer inline constant {token}")
+        return f"{value & 0xffffffff}u"
+    raise ValueError(f"Unsupported packed integer operand {token}")
+
+
+def parse_vop3p_int16(rest, arity, *, allow_clamp):
+    parts_ = rest.split(", ")
+    if len(parts_) != arity:
+        raise ValueError("Invalid packed integer operand count")
+    last_op, _, mod_text = parts_[-1].partition(" ")
+    operands = [*parts_[:-1], last_op]
+    opts = {}
+    clamp = False
+    for mod in mod_text.split():
+        if mod == "clamp":
+            if clamp or not allow_clamp:
+                raise ValueError("Invalid clamp modifier")
+            clamp = True
+        elif m := re.fullmatch(r"(op_sel|op_sel_hi):\[([01](?:,[01])*)\]", mod):
+            name = m.group(1)
+            bits = [int(b) for b in m.group(2).split(",")]
+            if name in opts or len(bits) != arity:
+                raise ValueError(f"Invalid packed integer modifier {mod}")
+            opts[name] = bits
+        else:
+            raise ValueError(f"Unsupported packed integer modifier {mod}")
+    return operands, opts, clamp
+
+
+def pk_int16_lane_expr(op, word_vars, sel, clamp):
+    def u16(w, hi):
+        return f"(({w} >> 16) & 0xffffu)" if hi else f"({w} & 0xffffu)"
+
+    def i16(w, hi):
+        return f"(asint({w}) >> 16)" if hi else f"(asint({w} << 16) >> 16)"
+
+    if op == "add_i16":
+        r = f"({i16(word_vars[0], sel[0])} + {i16(word_vars[1], sel[1])})"
+        return f"(asuint(clamp({r}, -32768, 32767)) & 0xffffu)" if clamp else f"(asuint({r}) & 0xffffu)"
+    if op == "add_u16":
+        r = f"({u16(word_vars[0], sel[0])} + {u16(word_vars[1], sel[1])})"
+        return f"min({r}, 65535u)" if clamp else f"({r} & 0xffffu)"
+    if op == "sub_i16":
+        r = f"({i16(word_vars[0], sel[0])} - {i16(word_vars[1], sel[1])})"
+        return f"(asuint(clamp({r}, -32768, 32767)) & 0xffffu)" if clamp else f"(asuint({r}) & 0xffffu)"
+    if op == "sub_u16":
+        a, b = u16(word_vars[0], sel[0]), u16(word_vars[1], sel[1])
+        return f"({a} < {b} ? 0u : ({a} - {b}))" if clamp else f"(({a} - {b}) & 0xffffu)"
+    if op == "min_i16":
+        return f"(asuint(min({i16(word_vars[0], sel[0])}, {i16(word_vars[1], sel[1])})) & 0xffffu)"
+    if op == "min_u16":
+        return f"min({u16(word_vars[0], sel[0])}, {u16(word_vars[1], sel[1])})"
+    if op == "max_i16":
+        return f"(asuint(max({i16(word_vars[0], sel[0])}, {i16(word_vars[1], sel[1])})) & 0xffffu)"
+    if op == "max_u16":
+        return f"max({u16(word_vars[0], sel[0])}, {u16(word_vars[1], sel[1])})"
+    if op == "mul_lo_u16":
+        return f"(({u16(word_vars[0], sel[0])} * {u16(word_vars[1], sel[1])}) & 0xffffu)"
+    if op == "mad_i16":
+        r = f"({i16(word_vars[0], sel[0])} * {i16(word_vars[1], sel[1])} + {i16(word_vars[2], sel[2])})"
+        return f"(asuint(clamp({r}, -32768, 32767)) & 0xffffu)" if clamp else f"(asuint({r}) & 0xffffu)"
+    if op == "mad_u16":
+        r = f"({u16(word_vars[0], sel[0])} * {u16(word_vars[1], sel[1])} + {u16(word_vars[2], sel[2])})"
+        return f"min({r}, 65535u)" if clamp else f"({r} & 0xffffu)"
+    if op == "lshlrev_b16":
+        return f"(({u16(word_vars[1], sel[1])} << ({u16(word_vars[0], sel[0])} & 15u)) & 0xffffu)"
+    if op == "lshrrev_b16":
+        return f"({u16(word_vars[1], sel[1])} >> ({u16(word_vars[0], sel[0])} & 15u))"
+    return f"(asuint({i16(word_vars[1], sel[1])} >> ({u16(word_vars[0], sel[0])} & 15u)) & 0xffffu)"
 
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *, second_texture_offset=None):
@@ -647,6 +750,26 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(rf"v_pk_({'|'.join(VOP3P_INT16)}) (v\d+), (.+)"):
+            op, dst, rest = m.groups()
+            arity, allow_clamp = VOP3P_INT16[op]
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid packed integer operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            tokens, opts, clamp = parse_vop3p_int16(rest, arity, allow_clamp=allow_clamp)
+            words = [vop3p_int_word(t, scalar, vector, pending, sample_pending) for t in tokens]
+            word_vars = []
+            for k, expr in enumerate(words):
+                wvar = f"pki{i}_{k}"
+                lines.append(f"    uint {wvar} = {expr};")
+                word_vars.append(wvar)
+            lo_expr = pk_int16_lane_expr(op, word_vars, opts.get("op_sel", [0] * arity), clamp)
+            hi_expr = pk_int16_lane_expr(op, word_vars, opts.get("op_sel_hi", [1] * arity), clamp)
+            lines.append(f"    uint pki{i}_l0 = {lo_expr};")
+            lines.append(f"    uint pki{i}_l1 = {hi_expr};")
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat(pki{i}_l0 | (pki{i}_l1 << 16));")
         elif m := match(r"v_cvt_pkrtz_f16_f32_e32 (v\d+), (v\d+), (v\d+)"):
             dst, lo, hi = m.groups()
             pair = (vector[lo], vector[hi])
