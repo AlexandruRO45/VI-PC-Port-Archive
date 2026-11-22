@@ -944,7 +944,8 @@ WAVE64_MODES = ("auto", "on", "off")
 # The translator's fallback flags make_game.py can forward, and the argparse attribute each one reads.
 FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--bary-fallback", "bary_fallback"),
                   ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"),
-                  ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"))
+                  ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"),
+                  ("--subgroup-temps", "subgroup_temps"))
 
 
 def fallback_flags(a) -> tuple[str, ...]:
@@ -1035,6 +1036,15 @@ def runtime_gpu_info() -> dict:
         return info if isinstance(info, dict) and "error" not in info else {}
     except (OSError, ValueError, IndexError, subprocess.SubprocessError):
         return {}
+
+
+VK_DRIVER_ID_MOLTENVK = 14
+
+
+def runtime_gpu_spirv_cross() -> bool:
+    """Whether the GPU the runtime would use turns SPIR-V into source through SPIRV-Cross (MoltenVK, driver id 14),
+    which needs --subgroup-temps (tools/rdna2spirv.py, SUBGROUP_TEMPS). False when it can't tell."""
+    return runtime_gpu_info().get("driver_id") == VK_DRIVER_ID_MOLTENVK
 
 
 def runtime_gpu_per_vertex():
@@ -1605,6 +1615,9 @@ def main() -> int:
                     help="keep s0..s31 in 128 push-constant bytes and move heap/code base to a set-1 uniform "
                          "block; on by itself when the runtime's GPU reports maxPushConstantsSize below what "
                          "the shaders need (144, or 152 with --mesh-compute)")
+    ap.add_argument("--subgroup-temps", action="store_true",
+                    help="keep subgroup operations out of SPIRV-Cross's short-circuiting && / || / ?:; on by itself "
+                         "when the runtime's GPU is on MoltenVK")
     a = ap.parse_args()
     stages = STAGES
     if a.stages is not None:
@@ -1678,6 +1691,10 @@ def main() -> int:
             log(f"shaders: the GPU the runtime would use reports maxPushConstantsSize = {max_pc} (< {need_pc}): "
                 "translating with --pc-tail-ubo")
             a.pc_tail_ubo = True
+    if "shaders" in stages and not a.subgroup_temps and runtime_gpu_spirv_cross():
+        log("shaders: the GPU the runtime would use is on MoltenVK, whose SPIRV-Cross can move a subgroup operation "
+            "into a short-circuiting expression: translating with --subgroup-temps")
+        a.subgroup_temps = True
     fallbacks = fallback_flags(a) if "shaders" in stages else ()
     preflight(stages, work, a.wav, runtime_build, emulate=emulate, keep_emulated=keep_emulated,
               fallbacks=fallbacks, jobs=a.jobs)

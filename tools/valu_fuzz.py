@@ -864,6 +864,8 @@ def translate(progs, work, emulate, pc_tail=False):
         cmd.append("--wave64-emulate")
     if pc_tail:
         cmd.append("--pc-tail-ubo")
+    if os.environ.get("LEONIDA_SUBGROUP_TEMPS") == "1":   # as build.py: subgroup operations kept out of && / ?: (MoltenVK)
+        cmd.append("--subgroup-temps")
     r = subprocess.run(cmd, capture_output=True, text=True)
     index = spirv / "index.json"
     if not index.exists():

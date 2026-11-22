@@ -156,7 +156,7 @@ class RecordedFlagsTest(unittest.TestCase):
 class MainWiringTest(unittest.TestCase):
     """main() parses the fallback flags and hands the same tuple to preflight() and shaders()."""
 
-    def run_main(self, *extra_argv, per_vertex=None, max_push_constants=None):
+    def run_main(self, *extra_argv, per_vertex=None, max_push_constants=None, driver_id=None):
         argv = ["make_game.py", "--stages", "shaders", *extra_argv]
         with mock.patch.object(sys, "argv", argv), \
                 mock.patch("make_game.below_normal"), \
@@ -165,6 +165,7 @@ class MainWiringTest(unittest.TestCase):
                 mock.patch("make_game.wave64_settings", return_value=(False, True)), \
                 mock.patch("make_game.runtime_gpu_per_vertex", return_value=per_vertex), \
                 mock.patch("make_game.runtime_gpu_max_push_constants", return_value=max_push_constants), \
+                mock.patch("make_game.runtime_gpu_info", return_value={} if driver_id is None else {"driver_id": driver_id}), \
                 mock.patch("make_game.preflight") as preflight, \
                 mock.patch("make_game.shaders") as shaders, \
                 mock.patch("make_game.log"):
@@ -210,6 +211,14 @@ class MainWiringTest(unittest.TestCase):
                           ({"max_push_constants_size": "128"}, None)):
             with self.subTest(raw=raw), mock.patch("make_game.runtime_gpu_info", return_value=raw):
                 self.assertEqual(make_game.runtime_gpu_max_push_constants(), want)
+
+    def test_subgroup_temps_follows_the_driver(self):
+        """On by itself on MoltenVK (driver id 14, SPIRV-Cross), not on other drivers or when it can't tell; asked
+        for explicitly, it is on everywhere."""
+        self.assertEqual(self.run_main(driver_id=14), (("--subgroup-temps",),) * 2)
+        self.assertEqual(self.run_main(driver_id=3), ((), ()))
+        self.assertEqual(self.run_main(), ((), ()))
+        self.assertEqual(self.run_main("--subgroup-temps", driver_id=3), (("--subgroup-temps",),) * 2)
 
 
 if __name__ == "__main__":

@@ -171,6 +171,8 @@ def translate_tests(work, names):
     # 128-byte push constants: the tail in a set-1 uniform block. The values the test programs accept (vk_pc_tail.h).
     if (os.environ.get("LEONIDA_PC_TAIL_UBO") or "").strip().lower() in ("1", "true", "yes", "on"):
         cmd.append("--pc-tail-ubo")
+    if os.environ.get("LEONIDA_SUBGROUP_TEMPS") == "1":   # subgroup operations kept out of && / ?: (SPIRV-Cross: MoltenVK)
+        cmd.append("--subgroup-temps")
     return subprocess.run(cmd).returncode
 
 
