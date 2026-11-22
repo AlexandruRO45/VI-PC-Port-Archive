@@ -128,6 +128,30 @@ stick does not jump). `LEONIDA_KEYBOARD_PAD=always` reads them whatever has focu
 
 To try it by hand: `set LEONIDA_KEYBOARD_PAD=always`, then `gameinput_probe --seconds 20` and press keys.
 
+## Keyboard and mouse devices
+
+For a title that reads the keyboard and mouse through GameInput itself (RT-159), `LEONIDA_KEYBOARD_MOUSE` connects
+two more devices, `Keyboard (Leonida)` and `Mouse (Leonida)`, next to the pads. It is off by default; the keyboard pad
+above is the route for a title that reads only gamepads, and the two can be on together.
+
+- Their readings carry `GameInputKindKeyboard` or `GameInputKindMouse` and nothing else: no gamepad, UI navigation or
+  controller state. A reading is added when the keys, buttons or position change.
+- Keyboard: `GetKeyCount`/`GetKeyState` list the held keys in virtual-key order, at most 16
+  (`maxSimultaneousKeys`). The side-neutral Shift, Ctrl and Alt and the mouse buttons are left out; the left and right
+  keys are listed themselves. `scanCode` is `MapVirtualKey`'s scan code (0xE0xx for extended keys), `codePoint` its
+  unshifted character (upper case for letters), `isDeadKey` its dead-key flag.
+- Mouse: `GetMouseState` gives the left, right, middle and X1/X2 buttons, and `positionX`/`positionY` as the sum of the
+  cursor's movement between polls, as GameInput's relative positions are. There is no wheel (no window, so no wheel
+  messages); the mouse info says so (`hasWheelX`/`hasWheelY` false).
+- Keys and buttons come from `GetAsyncKeyState` with the keyboard pad's focus rule: with `1` only while this
+  process's window has focus, with `always` whatever has focus. Out of focus nothing is held and cursor movement is
+  not counted. Cursor deltas stop at the screen edge, as the keyboard pad's do.
+- They are not gamepads: `connected_count` does not count them, and a gamepad query never answers with their
+  readings. Enumeration, `GetCurrentReading`/`GetNextReading`/`GetPreviousReading`, aggregate devices,
+  `FindDeviceFromId` and reading callbacks registered for their kind cover them.
+- **VERIFY:** the device family (`GameInputFamilyHid` here), keyboard kind and layout a console title expects, and
+  whether it reads `codePoint` (shifted or not).
+
 ## Rumble and triggers
 
 `IGameInputDevice::SetRumbleState` takes four motor levels, 0..1. The two body motors go to `SDL_RumbleGamepad` on
@@ -252,6 +276,7 @@ sensors are enabled when the pad is opened, at SDL's requested rate, and every p
 | `LEONIDA_GAMEINPUT_THREAD` | `1` | `0` stops the background poll thread; only `rt::gameinput::poll()` then reads the pads (tests) |
 | `LEONIDA_KEYBOARD_PAD` | `off` | `1` adds the [keyboard pad](#keyboard-pad), read while this process has focus; `always` reads keys whatever has focus |
 | `LEONIDA_MOUSE_SENSITIVITY` | `1` | scales how far the mouse moves the keyboard pad's right stick, 0.1..10 |
+| `LEONIDA_KEYBOARD_MOUSE` | `off` | `1` adds the [keyboard and mouse devices](#keyboard-and-mouse-devices), read while this process has focus; `always` whatever has focus |
 
 SDL's own hints (`SDL_JOYSTICK_*`, see SDL's `SDL_hints.h`) also apply, for example `SDL_JOYSTICK_HIDAPI_PS5=0` to
 leave a DualSense to the generic driver, or `SDL_GAMECONTROLLERCONFIG` to add a mapping for an unknown pad.
@@ -272,7 +297,7 @@ The API surface:
 | interface | implemented | not implemented |
 |---|---|---|
 | `IGameInput` | `GetCurrentTimestamp` (µs), `GetCurrentReading`, `GetNextReading`, `GetPreviousReading`, `RegisterReadingCallback`, `RegisterDeviceCallback` (blocking and async enumeration), `RegisterGuideButtonCallback`, `RegisterKeyboardLayoutCallback` (never fires), `StopCallback`, `UnregisterCallback`, `CreateDispatcher`, `FindDeviceFromId`, `EnableOemDeviceSupport` (no-op), `SetFocusPolicy` (no-op) | `GetTemporalReading` (`E_NOTIMPL`, as in GameInput v0 itself; see below), `CreateAggregateDevice`, `FindDeviceFromObject/PlatformHandle/PlatformString` |
-| `IGameInputReading` | kind, sequence number, timestamp, device, gamepad state, UI navigation state, controller axes and buttons, motion state | raw report, keyboard, mouse, touch, arcade/flight stick, racing wheel (all return nothing) |
+| `IGameInputReading` | kind, sequence number, timestamp, device, gamepad state, UI navigation state, controller axes and buttons, motion state, keys and mouse state (with `LEONIDA_KEYBOARD_MOUSE`) | raw report, touch, arcade/flight stick, racing wheel (all return nothing) |
 | `IGameInputDevice` | device info, status, battery, `SetRumbleState`, force-feedback motors with `CreateForceFeedbackEffect`/`IGameInputForceFeedbackEffect`, `IsForceFeedbackMotorPoweredOn`, `SetForceFeedbackMotorGain`, haptic trigger motors with `SetHapticMotorState` | raw device I/O, power off, input synchronization (no-ops) |
 | `IGameInputDispatcher` | `Dispatch`, `OpenWaitHandle` | the quota (the queue is short) |
 | `IGameInputDevice` | device info, status, battery, `SetRumbleState` | force feedback and haptic motors (none reported), raw device I/O, power off, input synchronization (no-ops) |

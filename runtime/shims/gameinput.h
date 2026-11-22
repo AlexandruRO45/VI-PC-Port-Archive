@@ -22,6 +22,9 @@ struct Config {
     bool rumble = true;                                 // LEONIDA_RUMBLE=0 turns all rumble off
     bool background_thread = true;                      // LEONIDA_GAMEINPUT_THREAD=0: poll only from poll()
     KeyboardPadMode keyboard_pad = KeyboardPadMode::Off;  // LEONIDA_KEYBOARD_PAD=1|focus|always|off
+    // A keyboard device and a mouse device whose readings carry keys and mouse state (RT-159), for a title that
+    // reads them through GameInput. Same focus modes as the keyboard pad. LEONIDA_KEYBOARD_MOUSE=1|focus|always|off
+    KeyboardPadMode keyboard_mouse = KeyboardPadMode::Off;
 };
 
 // The configuration in use. Read from the environment on the first GameInputCreate.

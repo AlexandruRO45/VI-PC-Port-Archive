@@ -56,7 +56,9 @@ namespace {
 
 constexpr uint32_t kBaseKinds =
     GameInputKindControllerAxis | GameInputKindControllerButton | GameInputKindGamepad | GameInputKindUiNavigation;
-constexpr uint32_t kSupportedKinds = kBaseKinds | GameInputKindMotion;  // everything a reading may carry
+constexpr uint32_t kSupportedKinds = kBaseKinds | GameInputKindMotion;  // everything a pad reading may carry
+// What a reading search may ask for: a pad's kinds, or the keyboard and mouse devices'.
+constexpr uint32_t kReadableKinds = kSupportedKinds | GameInputKindKeyboard | GameInputKindMouse;
 constexpr uint32_t kAxisCount = 6;  // LX, LY, RX, RY, LT, RT
 constexpr uint32_t kButtonCount = SDL_GAMEPAD_BUTTON_COUNT;
 constexpr uint32_t kConnectedStatus = GameInputDeviceConnected | GameInputDeviceInputEnabled | GameInputDeviceOutputEnabled;
@@ -163,6 +165,12 @@ rt::gameinput::Config read_config() {
     }
     if (env("LEONIDA_RUMBLE") == "0") c.rumble = false;
     if (env("LEONIDA_GAMEINPUT_THREAD") == "0") c.background_thread = false;
+    const std::string km = env("LEONIDA_KEYBOARD_MOUSE");
+    if (km == "1" || km == "on" || km == "focus") c.keyboard_mouse = rt::gameinput::KeyboardPadMode::Focused;
+    else if (km == "always") c.keyboard_mouse = rt::gameinput::KeyboardPadMode::Always;
+    else if (!km.empty() && km != "0" && km != "off")
+        std::fprintf(stderr, "[rt] gameinput: LEONIDA_KEYBOARD_MOUSE=%s unknown (1, always or off), keyboard and mouse "
+                             "devices off\n", km.c_str());
     const std::string k = env("LEONIDA_KEYBOARD_PAD");
     if (k == "1" || k == "on" || k == "focus") c.keyboard_pad = rt::gameinput::KeyboardPadMode::Focused;
     else if (k == "always") c.keyboard_pad = rt::gameinput::KeyboardPadMode::Always;
@@ -177,7 +185,15 @@ rt::gameinput::Config read_config() {
 class Device;
 class ForceFeedbackEffect;
 
+constexpr uint32_t kMaxKeys = 16;  // keys one keyboard reading holds (GameInputKeyboardInfo::maxSimultaneousKeys)
+
 struct Snapshot {
+    // Set on the keyboard and mouse devices' readings only (GameInputKindKeyboard or GameInputKindMouse): such a
+    // reading carries keys or mouse state and none of the pad parts below.
+    uint32_t kbm_kind = 0;
+    uint32_t key_count = 0;
+    GameInputKeyState keys[kMaxKeys]{};
+    GameInputMouseState mouse{};
     GameInputGamepadState gamepad{};
     uint32_t ui = 0;
     float axes[kAxisCount] = {};
@@ -217,6 +233,7 @@ public:
     }
 
     uint32_t STDMETHODCALLTYPE GetInputKind() override {
+        if (s_.kbm_kind) return s_.kbm_kind;  // a keyboard or mouse reading
         return s_.has_motion ? kSupportedKinds : kBaseKinds;  // a reading of a pad without sensors carries no motion
     }
     uint64_t STDMETHODCALLTYPE GetSequenceNumber(uint32_t) override { return seq_; }
@@ -226,23 +243,36 @@ public:
         if (report) *report = nullptr;
         return false;
     }
-    uint32_t STDMETHODCALLTYPE GetControllerAxisCount() override { return kAxisCount; }
+    // A keyboard or mouse reading has no controller axes or buttons, no gamepad and no UI navigation state.
+    uint32_t STDMETHODCALLTYPE GetControllerAxisCount() override { return s_.kbm_kind ? 0 : kAxisCount; }
     uint32_t STDMETHODCALLTYPE GetControllerAxisState(uint32_t count, float* out) override {
-        const uint32_t n = out ? std::min(count, kAxisCount) : 0;
-        std::memcpy(out, s_.axes, n * sizeof(float));
+        const uint32_t n = out && !s_.kbm_kind ? std::min(count, kAxisCount) : 0;
+        if (n) std::memcpy(out, s_.axes, n * sizeof(float));
         return n;
     }
-    uint32_t STDMETHODCALLTYPE GetControllerButtonCount() override { return kButtonCount; }
+    uint32_t STDMETHODCALLTYPE GetControllerButtonCount() override { return s_.kbm_kind ? 0 : kButtonCount; }
     uint32_t STDMETHODCALLTYPE GetControllerButtonState(uint32_t count, bool* out) override {
-        const uint32_t n = out ? std::min(count, kButtonCount) : 0;
-        std::memcpy(out, s_.buttons, n * sizeof(bool));
+        const uint32_t n = out && !s_.kbm_kind ? std::min(count, kButtonCount) : 0;
+        if (n) std::memcpy(out, s_.buttons, n * sizeof(bool));
         return n;
     }
     uint32_t STDMETHODCALLTYPE GetControllerSwitchCount() override { return 0; }
     uint32_t STDMETHODCALLTYPE GetControllerSwitchState(uint32_t, GameInputSwitchPosition*) override { return 0; }
-    uint32_t STDMETHODCALLTYPE GetKeyCount() override { return 0; }
-    uint32_t STDMETHODCALLTYPE GetKeyState(uint32_t, void*) override { return 0; }
-    bool STDMETHODCALLTYPE GetMouseState(void*) override { return false; }
+    // The pressed keys, in virtual-key order. Copies at most `count` and returns how many it copied.
+    uint32_t STDMETHODCALLTYPE GetKeyCount() override {
+        return (s_.kbm_kind & GameInputKindKeyboard) ? s_.key_count : 0;
+    }
+    uint32_t STDMETHODCALLTYPE GetKeyState(uint32_t count, void* out) override {
+        if (!out || !(s_.kbm_kind & GameInputKindKeyboard)) return 0;
+        const uint32_t n = std::min(count, s_.key_count);
+        std::memcpy(out, s_.keys, n * sizeof(GameInputKeyState));
+        return n;
+    }
+    bool STDMETHODCALLTYPE GetMouseState(void* out) override {
+        if (!out || !(s_.kbm_kind & GameInputKindMouse)) return false;
+        *static_cast<GameInputMouseState*>(out) = s_.mouse;
+        return true;
+    }
     uint32_t STDMETHODCALLTYPE GetTouchCount() override { return 0; }
     uint32_t STDMETHODCALLTYPE GetTouchState(uint32_t, void*) override { return 0; }
     bool STDMETHODCALLTYPE GetMotionState(void* state) override {
@@ -253,19 +283,20 @@ public:
     bool STDMETHODCALLTYPE GetArcadeStickState(void*) override { return false; }
     bool STDMETHODCALLTYPE GetFlightStickState(void*) override { return false; }
     bool STDMETHODCALLTYPE GetGamepadState(GameInputGamepadState* state) override {
-        if (!state) return false;
+        if (!state || s_.kbm_kind) return false;
         *state = s_.gamepad;
         return true;
     }
     bool STDMETHODCALLTYPE GetRacingWheelState(void*) override { return false; }
     bool STDMETHODCALLTYPE GetUiNavigationState(GameInputUiNavigationState* state) override {
-        if (!state) return false;
+        if (!state || s_.kbm_kind) return false;
         state->buttons = s_.ui;
         return true;
     }
 
     Device* device() const { return device_; }
     uint64_t order() const { return order_; }
+    uint32_t kbm_kind() const { return s_.kbm_kind; }
 
 private:
     std::atomic<ULONG> refs_{1};
@@ -483,6 +514,8 @@ public:
     GameInputForceFeedbackMotorInfo ff_motor_info{};  // filled when SDL opened the pad as a haptic device
     GameInputHapticFeedbackMotorInfo haptic_motor_info[kHapticMotors]{};   // the trigger motors, when the pad has them
     GameInputHapticWaveformInfo haptic_waveform_info[kHapticMotors]{};     // one waveform each, an intensity
+    GameInputKeyboardInfo keyboard_info{};  // the keyboard device's; info.keyboardInfo points at it
+    GameInputMouseInfo mouse_info{};        // the mouse device's; info.mouseInfo points at it
     std::atomic<uint32_t> status{GameInputDeviceNoStatus};
     std::deque<Reading*> history;  // one reference each, oldest first; the newest is the current reading
     uint64_t evicted_order = 0;    // order of the newest reading dropped from history
@@ -605,6 +638,11 @@ struct State {
     std::recursive_mutex deliver_mu;  // held while callbacks run; UnregisterCallback waits on it
     std::vector<Device*> devices;  // every device seen, for the process lifetime
     std::vector<Device*> connected;  // open now, in connection order
+    // The keyboard and mouse devices (LEONIDA_KEYBOARD_MOUSE), kept apart from the pads: nothing that drives a pad
+    // (SDL, rumble, battery, player slots) applies to them. kbm_devices lives for the process, kbm is the connected
+    // ones. Every reading search and enumeration covers both lists (readable()).
+    Device* kbm_devices[2] = {nullptr, nullptr};  // keyboard, mouse
+    std::vector<Device*> kbm;
     std::vector<Callback> callbacks;
     std::vector<Event> queue;
     GameInputCallbackToken next_token = 1;
@@ -624,6 +662,13 @@ State& g() {
     return *s;
 }
 
+// The connected devices a reading search or an enumeration covers: the pads, then the keyboard and mouse. Under mu.
+std::vector<Device*> readable() {
+    std::vector<Device*> all = g().connected;
+    all.insert(all.end(), g().kbm.begin(), g().kbm.end());
+    return all;
+}
+
 void queue_event(const Event& e) {
     if (e.device) e.device->AddRef();
     if (e.reading) e.reading->AddRef();
@@ -639,6 +684,9 @@ bool matches(const Callback& c, const Event& e) {
             if (!(c.kind & e.device->info.supportedInput) && c.kind != GameInputKindUnknown) return false;
             return e.only || ((e.current ^ e.previous) & c.status_filter);
         case CbType::Reading:
+            // A keyboard or mouse reading goes to callbacks for its own kind (or any); pad readings as before.
+            if (e.reading && e.reading->kbm_kind())
+                return c.kind == GameInputKindUnknown || (c.kind & e.reading->kbm_kind());
             return (c.kind & kSupportedKinds) || c.kind == GameInputKindUnknown;
         default:
             return true;
@@ -1479,6 +1527,172 @@ void update_keyboard_pad() {
     SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, fire ? 32767 : -32768);
 }
 
+// ---- keyboard and mouse devices (poll thread only) --------------------------------------------------------------
+//
+// RT-159. With LEONIDA_KEYBOARD_MOUSE the shim connects one keyboard device and one mouse device, for a title that
+// reads keys and the mouse through GameInput itself (the keyboard pad above is for a title that reads only pads).
+// Their readings carry GameInputKindKeyboard or GameInputKindMouse and nothing else. Keys and mouse buttons come from
+// the same source as the keyboard pad (GetAsyncKeyState, or the test's set_keyboard_source) under the same focus
+// rule; mouse motion is the cursor's movement between polls (set_cursor_source in tests), summed into GameInput's
+// relative positionX/Y. There is no wheel: without a window there are no wheel messages, and the mouse info says
+// so (hasWheelX/Y false). A reading is pushed when the state changes.
+//
+// VERIFY: the device family, keyboard kind and layout a console title expects, and whether it reads codePoint;
+// codePoint is MapVirtualKey's unshifted character (upper case for letters), not ToUnicode's shifted one.
+struct KbmPoll {
+    int cursor_x = 0, cursor_y = 0;
+    bool have_cursor = false;  // false after focus loss, so the first poll after it moves nothing
+    int64_t position_x = 0, position_y = 0;
+    Snapshot keyboard{}, mouse{};
+    bool keyboard_read = false, mouse_read = false;  // a reading exists for this connection
+};
+KbmPoll g_kbm;
+
+constexpr const char* kKbmNames[2] = {"Keyboard (Leonida)", "Mouse (Leonida)"};
+
+Device* kbm_device(int which) {
+    State& s = g();
+    if (s.kbm_devices[which]) return s.kbm_devices[which];
+    Device* d = new Device;
+    GameInputDeviceInfo& i = d->info;
+    i.infoSize = sizeof(GameInputDeviceInfo);
+    AppLocalDeviceId id{};
+    id_bytes(which == 0 ? "leonida-keyboard" : "leonida-mouse", SDL_GUID{}, &id);
+    i.deviceId = id;
+    i.deviceRootId = id;
+    i.deviceFamily = GameInputFamilyHid;  // VERIFY
+    if (which == 0) {
+        i.usage = {0x01, 0x06};  // HID generic desktop / keyboard
+        i.supportedInput = GameInputKindKeyboard;
+        d->keyboard_info = {GameInputUnknownKeyboard, 0, 0, 12, kMaxKeys, 0, 0, nullptr};
+        d->keyboard_info.platformType = static_cast<uint32_t>(std::max(0, GetKeyboardType(0)));
+        d->keyboard_info.platformSubtype = static_cast<uint32_t>(std::max(0, GetKeyboardType(1)));
+        i.keyboardInfo = &d->keyboard_info;
+    } else {
+        i.usage = {0x01, 0x02};  // HID generic desktop / mouse
+        i.supportedInput = GameInputKindMouse;
+        d->mouse_info = {GameInputMouseLeftButton | GameInputMouseRightButton | GameInputMouseMiddleButton |
+                             GameInputMouseButton4 | GameInputMouseButton5,
+                         0, 0, false, false};
+        i.mouseInfo = &d->mouse_info;
+    }
+    d->name = kKbmNames[which];
+    d->display_name = {static_cast<uint32_t>(d->name.size()), static_cast<uint32_t>(d->name.size()), d->name.c_str()};
+    i.displayName = &d->display_name;
+    s.kbm_devices[which] = d;
+    return d;
+}
+
+// Under g().mu.
+void kbm_connect(Device* d, uint64_t ts) {
+    State& s = g();
+    if (d->status != GameInputDeviceNoStatus) return;
+    d->status = GameInputDeviceConnected | GameInputDeviceInputEnabled;
+    s.kbm.push_back(d);
+    queue_event({CbType::Device, d, nullptr, ts, d->status, GameInputDeviceNoStatus, false, 0});
+    std::fprintf(stderr, "[rt] gameinput: connected %s\n", d->name.c_str());
+}
+
+// Under g().mu.
+void kbm_disconnect(Device* d, uint64_t ts) {
+    State& s = g();
+    const uint32_t old = d->status.exchange(GameInputDeviceNoStatus);
+    if (old == GameInputDeviceNoStatus) return;
+    if (!d->history.empty()) d->evicted_order = d->history.back()->order();
+    for (Reading* r : d->history) r->Release();
+    d->history.clear();
+    s.kbm.erase(std::remove(s.kbm.begin(), s.kbm.end(), d), s.kbm.end());
+    queue_event({CbType::Device, d, nullptr, ts, GameInputDeviceNoStatus, old, false, 0});
+    std::fprintf(stderr, "[rt] gameinput: disconnected %s\n", d->name.c_str());
+}
+
+bool same_keys(const Snapshot& a, const Snapshot& b) {
+    if (a.key_count != b.key_count) return false;
+    for (uint32_t k = 0; k < a.key_count; ++k)
+        if (a.keys[k].virtualKey != b.keys[k].virtualKey) return false;
+    return true;
+}
+
+bool same_mouse(const Snapshot& a, const Snapshot& b) {
+    return a.mouse.buttons == b.mouse.buttons && a.mouse.positionX == b.mouse.positionX &&
+           a.mouse.positionY == b.mouse.positionY;
+}
+
+// The mouse buttons GetAsyncKeyState reports as virtual keys: they are the mouse's, not the keyboard's.
+bool is_mouse_key(int vk) {
+    return vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON || vk == VK_XBUTTON1 || vk == VK_XBUTTON2;
+}
+
+void update_keyboard_mouse(uint64_t now) {
+    State& s = g();
+    rt::gameinput::KeyboardPadMode mode;
+    {
+        std::lock_guard lock(s.mu);
+        mode = s.config.keyboard_mouse;
+        if (mode == rt::gameinput::KeyboardPadMode::Off) {
+            for (Device* d : s.kbm_devices)
+                if (d) kbm_disconnect(d, now);
+            g_kbm = {};
+            return;
+        }
+        for (int which = 0; which < 2; ++which) kbm_connect(kbm_device(which), now);
+    }
+    const bool focus = mode == rt::gameinput::KeyboardPadMode::Always || g_has_focus.load()();
+    const rt::gameinput::KeyDownFn key_down = g_key_down.load();
+
+    Snapshot keys{};
+    keys.kbm_kind = GameInputKindKeyboard;
+    Snapshot mouse{};
+    mouse.kbm_kind = GameInputKindMouse;
+    if (focus) {
+        // Every virtual key but the mouse buttons and the side-neutral Shift/Ctrl/Alt (their left and right keys are
+        // reported themselves), in virtual-key order, up to kMaxKeys.
+        for (int vk = 1; vk < 255 && keys.key_count < kMaxKeys; ++vk) {
+            if (is_mouse_key(vk) || vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU || !key_down(vk)) continue;
+            GameInputKeyState& k = keys.keys[keys.key_count++];
+            k.virtualKey = static_cast<uint8_t>(vk);
+            k.scanCode = MapVirtualKeyW(static_cast<UINT>(vk), MAPVK_VK_TO_VSC_EX);
+            const UINT ch = MapVirtualKeyW(static_cast<UINT>(vk), MAPVK_VK_TO_CHAR);
+            k.isDeadKey = (ch & 0x80000000u) != 0;
+            k.codePoint = ch & 0xFFFFu;
+        }
+        uint32_t buttons = GameInputMouseNone;
+        if (key_down(VK_LBUTTON)) buttons |= GameInputMouseLeftButton;
+        if (key_down(VK_RBUTTON)) buttons |= GameInputMouseRightButton;
+        if (key_down(VK_MBUTTON)) buttons |= GameInputMouseMiddleButton;
+        if (key_down(VK_XBUTTON1)) buttons |= GameInputMouseButton4;
+        if (key_down(VK_XBUTTON2)) buttons |= GameInputMouseButton5;
+        mouse.mouse.buttons = buttons;
+        int x = 0, y = 0;
+        const bool have = g_cursor_pos.load()(&x, &y);
+        if (have && g_kbm.have_cursor) {
+            g_kbm.position_x += x - g_kbm.cursor_x;
+            g_kbm.position_y += y - g_kbm.cursor_y;
+        }
+        g_kbm.have_cursor = have;
+        g_kbm.cursor_x = x;
+        g_kbm.cursor_y = y;
+    } else {
+        g_kbm.have_cursor = false;  // out of focus nothing is held, and the cursor is read afresh on return
+    }
+    mouse.mouse.positionX = g_kbm.position_x;
+    mouse.mouse.positionY = g_kbm.position_y;
+
+    std::lock_guard lock(s.mu);
+    Device* kd = s.kbm_devices[0];
+    Device* md = s.kbm_devices[1];
+    if (!g_kbm.keyboard_read || !same_keys(g_kbm.keyboard, keys)) {
+        g_kbm.keyboard = keys;
+        g_kbm.keyboard_read = true;
+        queue_event({CbType::Reading, kd, push_reading(kd, keys, now), now, 0, 0, false, 0});
+    }
+    if (!g_kbm.mouse_read || !same_mouse(g_kbm.mouse, mouse)) {
+        g_kbm.mouse = mouse;
+        g_kbm.mouse_read = true;
+        queue_event({CbType::Reading, md, push_reading(md, mouse, now), now, 0, 0, false, 0});
+    }
+}
+
 bool init_sdl() {
     State& s = g();
     if (s.sdl_ready) return true;
@@ -1558,6 +1772,7 @@ void poll_once() {
         refresh_battery(d, now);
         apply_output(d, now);
     }
+    update_keyboard_mouse(now);
 }
 
 void poll_and_deliver() {
@@ -1863,11 +2078,13 @@ HRESULT find_reading(IGameInputReading* ref, uint32_t kind, IGameInputDevice* de
     if (!out) return E_POINTER;
     *out = nullptr;
     if (!ref) return E_INVALIDARG;
-    if (kind != GameInputKindUnknown && !(kind & kSupportedKinds)) return GAMEINPUT_E_READING_NOT_FOUND;
+    if (kind != GameInputKindUnknown && !(kind & kReadableKinds)) return GAMEINPUT_E_READING_NOT_FOUND;
     const Reading* r = static_cast<Reading*>(ref);
     State& s = g();
     std::lock_guard lock(s.mu);
-    std::vector<Device*> scope = s.connected;
+    std::vector<Device*> scope;
+    for (Device* d : readable())  // without a device, the devices that do this kind
+        if (kind == GameInputKindUnknown || (kind & d->info.supportedInput)) scope.push_back(d);
     uint64_t horizon = 0;
     if (device) {
         Device* dev = as_device(device);
@@ -1876,7 +2093,7 @@ HRESULT find_reading(IGameInputReading* ref, uint32_t kind, IGameInputDevice* de
                 return GAMEINPUT_E_READING_NOT_FOUND;
             const uint32_t effective_kind = (kind != GameInputKindUnknown) ? (kind & dev->info.supportedInput) : dev->info.supportedInput;
             scope.clear();
-            for (Device* cd : s.connected) {
+            for (Device* cd : readable()) {
                 if (effective_kind & cd->info.supportedInput) {
                     scope.push_back(cd);
                 }
@@ -1924,7 +2141,7 @@ public:
     HRESULT STDMETHODCALLTYPE GetCurrentReading(uint32_t kind, IGameInputDevice* device, IGameInputReading** out) override {
         if (!out) return E_POINTER;
         *out = nullptr;
-        if (kind != GameInputKindUnknown && !(kind & kSupportedKinds)) return GAMEINPUT_E_READING_NOT_FOUND;
+        if (kind != GameInputKindUnknown && !(kind & kReadableKinds)) return GAMEINPUT_E_READING_NOT_FOUND;
         std::lock_guard lock(g().mu);
         Reading* best = nullptr;
         if (device) {
@@ -1933,7 +2150,7 @@ public:
                 if (kind != GameInputKindUnknown && !(kind & d->info.supportedInput))
                     return GAMEINPUT_E_READING_NOT_FOUND;
                 const uint32_t effective_kind = (kind != GameInputKindUnknown) ? (kind & d->info.supportedInput) : d->info.supportedInput;
-                for (Device* cd : g().connected) {
+                for (Device* cd : readable()) {
                     if (!(effective_kind & cd->info.supportedInput)) continue;
                     if (Reading* r = cd->latest(); r && (!best || r->GetTimestamp() >= best->GetTimestamp())) best = r;
                 }
@@ -1944,8 +2161,12 @@ public:
                 best = d->latest();
             }
         } else {
-            for (Device* d : g().connected)  // the most recent reading from any gamepad
+            // The most recent reading from any device that does this kind: a gamepad query never answers with a
+            // keyboard reading.
+            for (Device* d : readable()) {
+                if (kind != GameInputKindUnknown && !(kind & d->info.supportedInput)) continue;
                 if (Reading* r = d->latest(); r && (!best || r->GetTimestamp() >= best->GetTimestamp())) best = r;
+            }
         }
         if (!best) return GAMEINPUT_E_READING_NOT_FOUND;
         best->AddRef();
@@ -1993,7 +2214,7 @@ public:
                                    reinterpret_cast<void*>(fn), true});
             if (enumeration != GameInputNoEnumeration) {
                 const uint64_t ts = now_us();
-                for (Device* d : s.connected) {
+                for (Device* d : readable()) {
                     if (device && as_device(device) != d) continue;
                     if (kind != GameInputKindUnknown && !(kind & d->info.supportedInput)) continue;
                     const uint32_t st = d->status;
@@ -2100,7 +2321,10 @@ public:
         *out = nullptr;
         if (!id) return E_INVALIDARG;
         std::lock_guard lock(g().mu);
-        for (Device* d : g().devices)
+        std::vector<Device*> known = g().devices;
+        for (Device* d : g().kbm_devices)
+            if (d) known.push_back(d);
+        for (Device* d : known)
             if (std::memcmp(&d->info.deviceId, id, sizeof *id) == 0) {
                 d->AddRef();
                 *out = d;
