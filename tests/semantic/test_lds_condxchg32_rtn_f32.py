@@ -238,5 +238,198 @@ class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
         self.assertEqual(lds.read_dword(5), TWO_RAW)
 
 
+class DSOpcode(str, enum.Enum):
+    """Opcode enumerations for 32-bit floating-point conditional exchange."""
+    DS_CONDXCHG32_RTN_F32 = "ds_condxchg32_rtn_f32"
+    DS_CMPST_RTN_F32 = "ds_cmpst_rtn_f32"
+
+    @property
+    def is_return(self) -> bool:
+        """True if instruction returns prior LDS value to destination VGPR."""
+        return True
+
+    @property
+    def bit_width(self) -> int:
+        """Operand bit width."""
+        return 32
+
+
+@dataclasses.dataclass(frozen=True)
+class VGPR:
+    """Vector General Purpose Register operand v[0] .. v[255]."""
+    index: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"VGPR index out of range [0, 255]: {self.index}")
+
+    def __str__(self) -> str:
+        return f"v{self.index}"
+
+
+@dataclasses.dataclass(frozen=True)
+class OffsetImmediate:
+    """Unsigned 16-bit byte offset immediate [0, 65535]."""
+    value: int = 0
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.value <= 65535):
+            raise ValueError(f"Offset immediate out of range [0, 65535]: {self.value}")
+
+    def __str__(self) -> str:
+        return f"offset:{self.value}" if self.value != 0 else ""
+
+
+@dataclasses.dataclass(frozen=True)
+class DSCondXchg32F32Instruction:
+    """Symbolic AST node representing an RDNA2 DS conditional exchange float instruction."""
+    opcode: DSOpcode
+    vaddr: VGPR
+    vdata0: VGPR
+    vdata1: VGPR
+    vdst: Optional[VGPR] = None
+    offset: OffsetImmediate = OffsetImmediate(0)
+
+    def __post_init__(self) -> None:
+        if self.vdst is None:
+            raise ValueError(f"Returning opcode {self.opcode.value} requires destination vdst")
+
+    def disasm(self) -> str:
+        """Format symbolic instruction into canonical RDNA2 assembly text."""
+        parts = [self.opcode.value, f"{self.vdst}, {self.vaddr}, {self.vdata0}, {self.vdata1}"]
+        if self.offset.value != 0:
+            parts.append(str(self.offset))
+        return " ".join(parts)
+
+    @classmethod
+    def parse(cls, text: str) -> DSCondXchg32F32Instruction:
+        """Parse canonical RDNA2 assembly string into a DSCondXchg32F32Instruction AST."""
+        tokens = text.strip().split(None, 1)
+        if not tokens:
+            raise ValueError("Empty assembly string")
+        op_str = tokens[0]
+        try:
+            opcode = DSOpcode(op_str)
+        except ValueError:
+            raise ValueError(f"Unknown or unsupported DS opcode: {op_str}")
+
+        if len(tokens) == 1:
+            raise ValueError(f"Missing operands for {op_str}")
+
+        rest = tokens[1].strip()
+        offset_val = 0
+        if "offset:" in rest:
+            m = rest.split("offset:")
+            rest = m[0].strip()
+            offset_part = m[1].split()
+            if not offset_part:
+                raise ValueError("Malformed offset immediate")
+            offset_tok = offset_part[0].rstrip(",")
+            try:
+                offset_val = int(offset_tok, 0)
+            except ValueError:
+                raise ValueError(f"Invalid offset integer: {offset_tok}")
+
+        reg_tokens = [tok.strip().rstrip(",") for tok in rest.split(",") if tok.strip()]
+
+        def parse_vgpr(s: str) -> VGPR:
+            s = s.strip()
+            if not s.startswith("v") or not s[1:].isdigit():
+                raise ValueError(f"Invalid VGPR syntax: {s}")
+            return VGPR(int(s[1:]))
+
+        if len(reg_tokens) != 4:
+            raise ValueError(f"{opcode.value} expects 4 registers (vdst, vaddr, vdata0, vdata1), got {reg_tokens}")
+
+        vdst = parse_vgpr(reg_tokens[0])
+        vaddr = parse_vgpr(reg_tokens[1])
+        vdata0 = parse_vgpr(reg_tokens[2])
+        vdata1 = parse_vgpr(reg_tokens[3])
+        return cls(
+            opcode=opcode,
+            vaddr=vaddr,
+            vdata0=vdata0,
+            vdata1=vdata1,
+            vdst=vdst,
+            offset=OffsetImmediate(offset_val),
+        )
+
+
+class TestSymbolicASTAndTypedExpressions(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions, registers, and assembly parsing."""
+
+    def test_opcode_properties(self) -> None:
+        self.assertTrue(DSOpcode.DS_CONDXCHG32_RTN_F32.is_return)
+        self.assertEqual(DSOpcode.DS_CONDXCHG32_RTN_F32.bit_width, 32)
+        self.assertTrue(DSOpcode.DS_CMPST_RTN_F32.is_return)
+        self.assertEqual(DSOpcode.DS_CMPST_RTN_F32.bit_width, 32)
+
+    def test_vgpr_validation(self) -> None:
+        v0 = VGPR(0)
+        v255 = VGPR(255)
+        self.assertEqual(str(v0), "v0")
+        self.assertEqual(str(v255), "v255")
+
+        with self.assertRaises(ValueError):
+            VGPR(-1)
+        with self.assertRaises(ValueError):
+            VGPR(256)
+
+    def test_offset_immediate_validation(self) -> None:
+        off0 = OffsetImmediate(0)
+        off64 = OffsetImmediate(64)
+        off_max = OffsetImmediate(65535)
+        self.assertEqual(str(off0), "")
+        self.assertEqual(str(off64), "offset:64")
+        self.assertEqual(str(off_max), "offset:65535")
+
+        with self.assertRaises(ValueError):
+            OffsetImmediate(-1)
+        with self.assertRaises(ValueError):
+            OffsetImmediate(65536)
+
+    def test_instruction_post_init_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            DSCondXchg32F32Instruction(
+                opcode=DSOpcode.DS_CONDXCHG32_RTN_F32,
+                vaddr=VGPR(0),
+                vdata0=VGPR(1),
+                vdata1=VGPR(2),
+                vdst=None,
+            )
+
+    def test_disasm_and_parse_roundtrip(self) -> None:
+        test_cases = [
+            DSCondXchg32F32Instruction(
+                DSOpcode.DS_CONDXCHG32_RTN_F32,
+                vaddr=VGPR(1),
+                vdata0=VGPR(2),
+                vdata1=VGPR(3),
+                vdst=VGPR(0),
+            ),
+            DSCondXchg32F32Instruction(
+                DSOpcode.DS_CONDXCHG32_RTN_F32,
+                vaddr=VGPR(1),
+                vdata0=VGPR(2),
+                vdata1=VGPR(3),
+                vdst=VGPR(0),
+                offset=OffsetImmediate(16),
+            ),
+            DSCondXchg32F32Instruction(
+                DSOpcode.DS_CMPST_RTN_F32,
+                vaddr=VGPR(10),
+                vdata0=VGPR(11),
+                vdata1=VGPR(12),
+                vdst=VGPR(9),
+                offset=OffsetImmediate(64),
+            ),
+        ]
+        for inst in test_cases:
+            with self.subTest(inst=inst):
+                asm = inst.disasm()
+                parsed = DSCondXchg32F32Instruction.parse(asm)
+                self.assertEqual(inst, parsed)
+
+
 if __name__ == "__main__":
     unittest.main()
