@@ -600,8 +600,109 @@ class TestRegisterAliasing(unittest.TestCase):
             self.assertEqual(state.get_vgpr(lane, 0), expected)
 
 
+
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class XnorStatusFlags:
+    """Architectural condition codes and status flags for v_xnor_b32."""
+    result_zero: bool
+    result_negative: bool
+    all_bits_set: bool
+    operands_equal: bool
+    operands_complementary: bool
+    matching_bits_count: int
+    parity_odd: bool
+
+
+def evaluate_xnor_flags(s0: int, s1: int, res32: int) -> XnorStatusFlags:
+    """Evaluate condition codes, bit equality metrics, and parity flags."""
+    u0 = s0 & MASK32
+    u1 = s1 & MASK32
+    popcount = bin(res32).count("1")
+
+    return XnorStatusFlags(
+        result_zero=(res32 == 0),
+        result_negative=bool(res32 & SIGN32),
+        all_bits_set=(res32 == MASK32),
+        operands_equal=(u0 == u1),
+        operands_complementary=(u0 == ((~u1) & MASK32)),
+        matching_bits_count=popcount,
+        parity_odd=bool(res32 & 1),
+    )
+
+
+def compute_matching_bit_metrics(s0: int, s1: int) -> Tuple[int, int]:
+    """Compute number of matching bits and differing bits between two 32-bit words."""
+    res = oracle_v_xnor_b32(s0, s1)
+    matching = bin(res).count("1")
+    differing = 32 - matching
+    return matching, differing
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and bit equality metrics."""
+
+    def test_all_matching_flags(self) -> None:
+        val = 0x1234_5678
+        res = oracle_v_xnor_b32(val, val)
+        flags = evaluate_xnor_flags(val, val, res)
+        self.assertTrue(flags.all_bits_set)
+        self.assertTrue(flags.operands_equal)
+        self.assertFalse(flags.operands_complementary)
+        self.assertFalse(flags.result_zero)
+        self.assertEqual(flags.matching_bits_count, 32)
+
+    def test_no_matching_flags(self) -> None:
+        val = 0xAAAA_5555
+        comp = (~val) & MASK32
+        res = oracle_v_xnor_b32(val, comp)
+        flags = evaluate_xnor_flags(val, comp, res)
+        self.assertTrue(flags.result_zero)
+        self.assertTrue(flags.operands_complementary)
+        self.assertFalse(flags.operands_equal)
+        self.assertFalse(flags.all_bits_set)
+        self.assertEqual(flags.matching_bits_count, 0)
+
+    def test_negative_sign_flag(self) -> None:
+        # High bits match (both have bit 31 = 1) -> result has bit 31 = 1
+        s0 = 0x8000_0000
+        s1 = 0x8000_0000
+        res = oracle_v_xnor_b32(s0, s1)
+        flags = evaluate_xnor_flags(s0, s1, res)
+        self.assertTrue(flags.result_negative)
+
+        # High bits differ -> result has bit 31 = 0
+        s0_pos = 0x0000_0000
+        res_diff = oracle_v_xnor_b32(s0_pos, s1)
+        flags_diff = evaluate_xnor_flags(s0_pos, s1, res_diff)
+        self.assertFalse(flags_diff.result_negative)
+
+    def test_parity_flag(self) -> None:
+        # Low bits match -> bit 0 of result is 1 (odd)
+        res_odd = oracle_v_xnor_b32(1, 1)
+        self.assertTrue(evaluate_xnor_flags(1, 1, res_odd).parity_odd)
+
+        # Low bits differ -> bit 0 of result is 0 (even)
+        res_even = oracle_v_xnor_b32(1, 0)
+        self.assertFalse(evaluate_xnor_flags(1, 0, res_even).parity_odd)
+
+    def test_matching_bit_metrics_sum_to_32(self) -> None:
+        pairs = [
+            (0x0000_0000, 0xFFFF_FFFF),
+            (0x1234_5678, 0x8765_4321),
+            (0x0F0F_0F0F, 0x00FF_00FF),
+        ]
+        for a, b in pairs:
+            matching, differing = compute_matching_bit_metrics(a, b)
+            self.assertEqual(matching + differing, 32)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
