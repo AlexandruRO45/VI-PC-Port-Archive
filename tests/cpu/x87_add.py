@@ -488,7 +488,7 @@ def check_rejections():
         "fnstsw ax": (attempt(f"{fld} df e0 {fstp} c3"), "unsupported x87 operation"),
         "fldcw": (attempt(f"d9 29 {fld} {fstp} c3"), "fldcw"),
         "fninit": (attempt(f"{fld} db e3 {fstp} c3"), "unsupported x87 operation"),
-        "wait": (attempt(f"{fld} 9b {fstp} c3"), "unsupported x87 operation"),
+        "ffree st(1)": (attempt(f"{fld} dd c1 {fstp} c3"), "unsupported x87 operation"),
         "a ninth push": (attempt(f"{fld} " * 9 + f"{fstp} " * 9 + "c3"), "x87 stack overflow"),
         "fstp on an empty stack": (attempt(f"{fstp} c3"), "x87 stack underflow"),
         "faddp with one value": (attempt(f"{fld} de c1 {fstp} c3"), "x87 stack underflow"),
