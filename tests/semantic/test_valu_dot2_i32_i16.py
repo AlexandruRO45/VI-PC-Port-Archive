@@ -589,5 +589,92 @@ class TestValuDot2I32I16SIMDDivergence(unittest.TestCase):
                 self.assertEqual(state.vgprs[lane][0], sentinel)
 
 
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestValuDot2I32I16RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing hazards and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.state = ScalarRegisterState()
+        self.interp = ScalarInterpreter()
+
+    def test_aliasing_dst_equals_src2_inplace_accumulator(self) -> None:
+        """v0 = v_dot2_i32_i16 v1, v2, v0 (in-place accumulator)."""
+        acc_initial = 100
+        self.state.vgprs[0] = acc_initial
+        self.state.vgprs[1] = pack_i16x2(4, 5)
+        self.state.vgprs[2] = pack_i16x2(6, 7)
+
+        instr = VDot2I32I16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(0),
+        )
+
+        res = self.interp.step(instr, self.state)
+        # 4*6 + 5*7 + 100 = 24 + 35 + 100 = 159
+        self.assertEqual(res, 159)
+        self.assertEqual(self.state.vgprs[0], 159)
+
+    def test_aliasing_dst_equals_src0_vector_overwrite(self) -> None:
+        """v0 = v_dot2_i32_i16 v0, v1, v2 (destination overwrites src0)."""
+        s0_val = pack_i16x2(-10, 20)
+        self.state.vgprs[0] = s0_val
+        self.state.vgprs[1] = pack_i16x2(3, 2)
+        self.state.vgprs[2] = 50
+
+        instr = VDot2I32I16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2),
+        )
+
+        res = self.interp.step(instr, self.state)
+        # (-10)*3 + 20*2 + 50 = -30 + 40 + 50 = 60
+        self.assertEqual(res, 60)
+        self.assertEqual(self.state.vgprs[0], 60)
+
+    def test_aliasing_src0_equals_src1_self_dot_product(self) -> None:
+        """v0 = v_dot2_i32_i16 v1, v1, v2 (squared magnitude |v1|^2 + v2)."""
+        val_v1 = pack_i16x2(30, -40)
+        self.state.vgprs[1] = val_v1
+        self.state.vgprs[2] = 100
+
+        instr = VDot2I32I16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2),
+        )
+
+        res = self.interp.step(instr, self.state)
+        # 30^2 + (-40)^2 + 100 = 900 + 1600 + 100 = 2600
+        self.assertEqual(res, 2600)
+        self.assertEqual(self.state.vgprs[1], val_v1)
+
+    def test_aliasing_quadruple_collision(self) -> None:
+        """v0 = v_dot2_i32_i16 v0, v0, v0."""
+        # v0 holds (2, 3) -> 2 | (3 << 16) = 0x00030002
+        # As 32-bit signed int: 0x00030002 = 196610
+        val = pack_i16x2(2, 3)
+        self.state.vgprs[0] = val
+
+        instr = VDot2I32I16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(0),
+            src2=Operand.vgpr(0),
+        )
+
+        expected = ref_dot2_i32_i16(val, val, val)
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, expected)
+        self.assertEqual(self.state.vgprs[0], expected)
+
+
 if __name__ == "__main__":
     unittest.main()
