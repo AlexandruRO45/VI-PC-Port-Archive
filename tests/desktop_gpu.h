@@ -16,8 +16,10 @@ void check_ffx_device_init(ID3D12Device* device);
 void check_ffx_recurrent(ID3D12Device* device);
 void check_dual_uav(ID3D12Device* device);
 enum class MeshConstantBinding { root, root_pair, swapped_root_pair, table, swapped_table };
+enum class MeshDrawMode { color, textured, depth_pair };
 bool check_mesh_entry_draw(ID3D12Device*, const char*, const char*, const char*, bool,
-                           MeshConstantBinding = MeshConstantBinding::root, bool textured = false);
+                           MeshConstantBinding = MeshConstantBinding::root,
+                           MeshDrawMode = MeshDrawMode::color);
 void check_texture_mips(ID3D12Device* device);
 void check_depth_mask_draw(ID3D12Device*, const char*, const char*, const char*, bool);
 void check_sampled_coverage(ID3D12Device*, const char*, const char*);
