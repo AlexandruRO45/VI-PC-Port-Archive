@@ -1001,5 +1001,76 @@ class TestValuCvtNormI32F32StatusFlags(unittest.TestCase):
         self.assertFalse(cc_neg.carry)
 
 
+# ---------------------------------------------------------------------------
+# IEEE 754 boundary extremes, subnormals, and NaN handling
+# ---------------------------------------------------------------------------
+
+class TestValuCvtNormI32F32IEEE754Boundaries(unittest.TestCase):
+    """Comprehensive IEEE 754 boundary, subnormal, and NaN handling tests."""
+
+    def test_signed_zeros(self) -> None:
+        self.assertEqual(oracle_v_cvt_norm_i32_f32(POS_ZERO_F32), 0)
+        self.assertEqual(oracle_v_cvt_norm_i32_f32(NEG_ZERO_F32), 0)
+
+    def test_infinities(self) -> None:
+        # +inf clamps to +1.0 (2147483647 = 0x7FFFFFFF)
+        self.assertEqual(oracle_v_cvt_norm_i32_f32(POS_INF_F32), 2147483647)
+        # -inf clamps to -1.0 (-2147483647 = 0x80000001)
+        self.assertEqual(oracle_v_cvt_norm_i32_f32(NEG_INF_F32), u32(-2147483647))
+        self.assertEqual(oracle_v_cvt_norm_i32_f32(NEG_INF_F32), 0x80000001)
+
+    def test_quiet_and_signaling_nans_with_payloads(self) -> None:
+        nans = [
+            QNAN_F32,
+            SNAN_F32,
+            0x7F800001, 0x7F800010, 0x7FBFFFFF,  # SNaNs
+            0x7FC00000, 0x7FC00001, 0x7FFFFFFF,  # QNaNs
+            0xFF800001, 0xFF800010, 0xFFBFFFFF,  # Negative SNaNs
+            0xFFC00000, 0xFFC00001, 0xFFFFFFFF,  # Negative QNaNs
+        ]
+        for n in nans:
+            res = oracle_v_cvt_norm_i32_f32(n)
+            self.assertEqual(res, 0, f"Expected 0 for NaN {n:#010x}, got {res:#010x}")
+
+    def test_finite_extremes_and_saturation(self) -> None:
+        # Max positive finite single float (~3.4e38) -> clamps to 2147483647
+        self.assertEqual(oracle_v_cvt_norm_i32_f32(MAX_FINITE_F32), 2147483647)
+        # Min negative finite single float (~-3.4e38) -> clamps to -2147483647
+        self.assertEqual(oracle_v_cvt_norm_i32_f32(MIN_FINITE_NEG_F32), u32(-2147483647))
+
+        # Values just above 1.0 (0x3F800001) clamp to 2147483647
+        self.assertEqual(oracle_v_cvt_norm_i32_f32(0x3F800001), 2147483647)
+        # Values just below -1.0 (0xBF800001) clamp to -2147483647
+        self.assertEqual(oracle_v_cvt_norm_i32_f32(0xBF800001), u32(-2147483647))
+
+    def test_subnormal_precision_and_underflow(self) -> None:
+        # Smallest positive subnormal (2^-149) rounds to 0
+        self.assertEqual(oracle_v_cvt_norm_i32_f32(MIN_SUBNORMAL_F32), 0)
+        # Smallest negative subnormal (-2^-149) rounds to 0
+        self.assertEqual(oracle_v_cvt_norm_i32_f32(0x80000001), 0)
+
+        # Largest subnormal (0x007FFFFF ~ 1.1754942e-38) * 2147483647 -> 0
+        self.assertEqual(oracle_v_cvt_norm_i32_f32(MAX_SUBNORMAL_F32), 0)
+
+        # Minimum normal (0x00800000 = 2^-126) * 2147483647 -> 0
+        self.assertEqual(oracle_v_cvt_norm_i32_f32(MIN_NORMAL_F32), 0)
+
+    def test_ties_to_even_single_precision(self) -> None:
+        # 0.5f * 2147483647 = 1073741823.5 -> ties to even integer 1073741824 (0x40000000)
+        self.assertEqual(oracle_v_cvt_norm_i32_f32(HALF_F32), 1073741824)
+        self.assertEqual(oracle_v_cvt_norm_i32_f32(HALF_F32), 0x40000000)
+        # -0.5f * 2147483647 = -1073741823.5 -> ties to even integer -1073741824 (0xC0000000)
+        self.assertEqual(oracle_v_cvt_norm_i32_f32(NEG_HALF_F32), u32(-1073741824))
+        self.assertEqual(oracle_v_cvt_norm_i32_f32(NEG_HALF_F32), 0xC0000000)
+
+    def test_boundary_values_near_unit(self) -> None:
+        # 0x3F7FFFFF (1.0f - ulp) * 2147483647 = 2147483519.0 -> 2147483519
+        self.assertEqual(oracle_v_cvt_norm_i32_f32(0x3F7FFFFF), 2147483519)
+        # 0x3F800000 (1.0f) -> 2147483647
+        self.assertEqual(oracle_v_cvt_norm_i32_f32(ONE_F32), 2147483647)
+        # 0xBF800000 (-1.0f) -> -2147483647
+        self.assertEqual(oracle_v_cvt_norm_i32_f32(NEG_ONE_F32), u32(-2147483647))
+
+
 if __name__ == "__main__":
     unittest.main()
