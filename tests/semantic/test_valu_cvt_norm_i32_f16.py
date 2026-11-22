@@ -629,5 +629,63 @@ class TestValuCvtNormI32F16SIMDDivergence(unittest.TestCase):
             self.assertEqual(results[lane], SNORM32_MAX)
             self.assertEqual(sim.read_lane_reg32(lane, RegKind.VGPR, 0), SNORM32_MAX)
 
+# ---------------------------------------------------------------------------
+# Register Aliasing and In-Place Operand Preservation
+# ---------------------------------------------------------------------------
+
+class TestValuCvtNormI32F16RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing hazards and in-place operand preservation."""
+
+    def test_inplace_self_aliasing(self) -> None:
+        # v0 = v_cvt_norm_i32_f16 v0.l
+        interp = ScalarVALUInterpreter()
+        interp.write_reg32(RegKind.VGPR, 0, HALF_F16)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_I32_F16,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 0, SubWord.LO),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, SNORM32_HALF)
+        self.assertEqual(interp.read_reg32(RegKind.VGPR, 0), SNORM32_HALF)
+
+    def test_cross_half_source_aliasing(self) -> None:
+        # v0 = v_cvt_norm_i32_f16 v0.h
+        interp = ScalarVALUInterpreter()
+        interp.write_reg32(RegKind.VGPR, 0, (NEG_ONE_F16 << 16) | 0x1234)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_I32_F16,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 0, SubWord.HI),
+            encoding=Encoding.VOP3,
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, SNORM32_MIN_RAW)
+        self.assertEqual(interp.read_reg32(RegKind.VGPR, 0), SNORM32_MIN_RAW)
+
+    def test_sequential_pipeline_aliasing(self) -> None:
+        interp = ScalarVALUInterpreter()
+        interp.write_reg32(RegKind.VGPR, 1, HALF_F16)
+
+        inst1 = Instruction(
+            opcode=Opcode.V_CVT_NORM_I32_F16,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1, SubWord.LO),
+        )
+        inst2 = Instruction(
+            opcode=Opcode.V_CVT_NORM_I32_F16,
+            dst=Register(RegKind.VGPR, 1),
+            src0=Register(RegKind.VGPR, 0, SubWord.LO),
+        )
+
+        r1 = interp.step(inst1)
+        self.assertEqual(r1, SNORM32_HALF)
+
+        r2 = interp.step(inst2)
+        # v0 low half is 0x0000 (+0.0f), which converts to 0
+        self.assertEqual(r2, SNORM32_ZERO)
+
 if __name__ == "__main__":
     unittest.main()
