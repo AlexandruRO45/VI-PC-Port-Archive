@@ -396,6 +396,111 @@ class ScalarVALUInterpreter:
 
 
 # ==============================================================================
+# SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# ==============================================================================
+
+class SIMDState:
+    """Architectural state for a SIMD wavefront (Wave32 or Wave64)."""
+
+    def __init__(self, wave_size: int = 32, exec_mask: Optional[int] = None) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Wavefront size must be 32 or 64, got {wave_size}")
+        self.wave_size: int = wave_size
+        self.mask_limit: int = MASK32 if wave_size == 32 else MASK64
+        self.exec_mask: int = self.mask_limit if exec_mask is None else (exec_mask & self.mask_limit)
+        self.vgprs: List[List[int]] = [[0] * 256 for _ in range(wave_size)]
+        self.sgprs: List[int] = [0] * 106
+        self.vcc: int = 0
+
+    def read_lane_reg(self, lane: int, reg: Register) -> int:
+        """Read register value for a specific lane."""
+        if not 0 <= lane < self.wave_size:
+            raise IndexError(f"Lane {lane} out of range [0, {self.wave_size - 1}]")
+        if reg.kind == RegKind.VGPR:
+            if not 0 <= reg.index + reg.count - 1 < 256:
+                raise IndexError(f"VGPR range [{reg.index}:{reg.index + reg.count}] out of bounds")
+            if reg.count == 1:
+                return self.vgprs[lane][reg.index] & MASK32
+            elif reg.count == 2:
+                lo = self.vgprs[lane][reg.index] & MASK32
+                hi = self.vgprs[lane][reg.index + 1] & MASK32
+                return (hi << 32) | lo
+        elif reg.kind == RegKind.SGPR:
+            if not 0 <= reg.index + reg.count - 1 < 106:
+                raise IndexError(f"SGPR range [{reg.index}:{reg.index + reg.count}] out of bounds")
+            if reg.count == 1:
+                return self.sgprs[reg.index] & MASK32
+            elif reg.count == 2:
+                lo = self.sgprs[reg.index] & MASK32
+                hi = self.sgprs[reg.index + 1] & MASK32
+                return (hi << 32) | lo
+        raise TypeError(f"Unknown register kind: {reg.kind}")
+
+    def write_lane_reg(self, lane: int, reg: Register, val: int) -> None:
+        """Write register value for a specific lane."""
+        if not 0 <= lane < self.wave_size:
+            raise IndexError(f"Lane {lane} out of range [0, {self.wave_size - 1}]")
+        if reg.kind == RegKind.VGPR:
+            if not 0 <= reg.index + reg.count - 1 < 256:
+                raise IndexError(f"VGPR range [{reg.index}:{reg.index + reg.count}] out of bounds")
+            if reg.count == 1:
+                self.vgprs[lane][reg.index] = val & MASK32
+            elif reg.count == 2:
+                self.vgprs[lane][reg.index] = val & MASK32
+                self.vgprs[lane][reg.index + 1] = (val >> 32) & MASK32
+        elif reg.kind == RegKind.SGPR:
+            if not 0 <= reg.index + reg.count - 1 < 106:
+                raise IndexError(f"SGPR range [{reg.index}:{reg.index + reg.count}] out of bounds")
+            if reg.count == 1:
+                self.sgprs[reg.index] = val & MASK32
+            elif reg.count == 2:
+                self.sgprs[reg.index] = val & MASK32
+                self.sgprs[reg.index + 1] = (val >> 32) & MASK32
+        else:
+            raise TypeError(f"Unknown register kind: {reg.kind}")
+
+    def read_lane_operand(self, lane: int, op: Operand) -> int:
+        """Resolve operand for a specific lane."""
+        if isinstance(op, Register):
+            return self.read_lane_reg(lane, op)
+        if isinstance(op, Immediate):
+            return op.value & MASK32
+        raise TypeError(f"Invalid operand type: {type(op)}")
+
+
+class SIMDWavefrontInterpreter:
+    """SIMD wavefront execution engine modeling multi-lane divergence and EXEC masking."""
+
+    def __init__(self, wave_size: int = 32) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Wavefront size must be 32 or 64, got {wave_size}")
+        self.wave_size: int = wave_size
+
+    def step(self, inst: Instruction, state: SIMDState) -> None:
+        """Execute a single instruction across active lanes in wavefront."""
+        for lane in range(self.wave_size):
+            lane_active = bool((state.exec_mask >> lane) & 1)
+            if not lane_active:
+                # Inactive lane: destination VGPR pair must NOT be modified
+                continue
+
+            if inst.opcode == Opcode.V_CVT_PK_U32_U16:
+                s0 = state.read_lane_operand(lane, inst.src0)
+                if inst.src1 is None:
+                    d0, d1 = ref_cvt_pk_u32_u16(s0)
+                else:
+                    s1 = state.read_lane_operand(lane, inst.src1)
+                    d0, d1 = ref_cvt_pk_u32_u16_dual(s0, s1, inst.op_sel)
+                state.write_lane_reg(lane, Register(inst.dst.kind, inst.dst.index, count=1), d0)
+                state.write_lane_reg(lane, Register(inst.dst.kind, inst.dst.index + 1, count=1), d1)
+            elif inst.opcode == Opcode.V_MOV_B32:
+                s0 = state.read_lane_operand(lane, inst.src0)
+                state.write_lane_reg(lane, inst.dst, s0)
+            else:
+                raise NotImplementedError(f"Unsupported opcode: {inst.opcode}")
+
+
+# ==============================================================================
 # Unit Tests: Reference Mathematical Oracle and Architectural Model
 # ==============================================================================
 
@@ -594,6 +699,114 @@ class TestValuCvtPkU32U16ScalarInterpreter(unittest.TestCase):
         self.interp.run(program, fresh_state)
         self.assertEqual(fresh_state.read_reg(Register(RegKind.VGPR, 0)), res_v0)
         self.assertEqual(fresh_state.read_reg(Register(RegKind.VGPR, 1)), res_v1)
+
+
+# ==============================================================================
+# Unit Tests: SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# ==============================================================================
+
+class TestValuCvtPkU32U16SIMD(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_all_lanes_active(self) -> None:
+        state = SIMDState(wave_size=32, exec_mask=0xFFFF_FFFF)
+        interp = SIMDWavefrontInterpreter(wave_size=32)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_U32_U16,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Register(RegKind.VGPR, 2),
+        )
+
+        for lane in range(32):
+            packed = ((lane * 100) << 16) | (lane * 10)
+            state.write_lane_reg(lane, Register(RegKind.VGPR, 2), packed)
+
+        interp.step(inst, state)
+
+        for lane in range(32):
+            self.assertEqual(state.read_lane_reg(lane, Register(RegKind.VGPR, 0)), lane * 10)
+            self.assertEqual(state.read_lane_reg(lane, Register(RegKind.VGPR, 1)), lane * 100)
+
+    def test_wave32_divergence_canary_preservation(self) -> None:
+        # Alternating mask (even lanes active)
+        state = SIMDState(wave_size=32, exec_mask=0x5555_5555)
+        interp = SIMDWavefrontInterpreter(wave_size=32)
+        canary0 = 0xDEAD_BEEF
+        canary1 = 0xCAFE_BABE
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_U32_U16,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Register(RegKind.VGPR, 2),
+        )
+
+        for lane in range(32):
+            state.write_lane_reg(lane, Register(RegKind.VGPR, 0), canary0)
+            state.write_lane_reg(lane, Register(RegKind.VGPR, 1), canary1)
+            state.write_lane_reg(lane, Register(RegKind.VGPR, 2), 0x0020_0010)
+
+        interp.step(inst, state)
+
+        for lane in range(32):
+            v0 = state.read_lane_reg(lane, Register(RegKind.VGPR, 0))
+            v1 = state.read_lane_reg(lane, Register(RegKind.VGPR, 1))
+            if lane % 2 == 0:
+                self.assertEqual(v0, 0x0010)
+                self.assertEqual(v1, 0x0020)
+            else:
+                self.assertEqual(v0, canary0)
+                self.assertEqual(v1, canary1)
+
+    def test_wave32_all_inactive_lanes(self) -> None:
+        state = SIMDState(wave_size=32, exec_mask=0x0000_0000)
+        interp = SIMDWavefrontInterpreter(wave_size=32)
+        canary = 0xBAAD_F00D
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_U32_U16,
+            dst=Register(RegKind.VGPR, 4, count=2),
+            src0=Immediate(0xFFFF_FFFF),
+        )
+
+        for lane in range(32):
+            state.write_lane_reg(lane, Register(RegKind.VGPR, 4), canary)
+            state.write_lane_reg(lane, Register(RegKind.VGPR, 5), canary)
+
+        interp.step(inst, state)
+
+        for lane in range(32):
+            self.assertEqual(state.read_lane_reg(lane, Register(RegKind.VGPR, 4)), canary)
+            self.assertEqual(state.read_lane_reg(lane, Register(RegKind.VGPR, 5)), canary)
+
+    def test_wave64_full_and_divergent_execution(self) -> None:
+        # Wave64 with upper half active (lanes 32..63)
+        state = SIMDState(wave_size=64, exec_mask=0xFFFF_FFFF_0000_0000)
+        interp = SIMDWavefrontInterpreter(wave_size=64)
+        canary = 0x1122_3344
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_U32_U16,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Register(RegKind.VGPR, 2),
+        )
+
+        for lane in range(64):
+            state.write_lane_reg(lane, Register(RegKind.VGPR, 0), canary)
+            state.write_lane_reg(lane, Register(RegKind.VGPR, 1), canary)
+            state.write_lane_reg(lane, Register(RegKind.VGPR, 2), 0x7777_3333)
+
+        interp.step(inst, state)
+
+        for lane in range(64):
+            v0 = state.read_lane_reg(lane, Register(RegKind.VGPR, 0))
+            v1 = state.read_lane_reg(lane, Register(RegKind.VGPR, 1))
+            if lane < 32:
+                self.assertEqual(v0, canary)
+                self.assertEqual(v1, canary)
+            else:
+                self.assertEqual(v0, 0x3333)
+                self.assertEqual(v1, 0x7777)
 
 
 if __name__ == "__main__":
