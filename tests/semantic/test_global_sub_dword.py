@@ -319,8 +319,8 @@ class TestGlobalSubDwordInterpreterExecution(unittest.TestCase):
 
         data = 0xAABBCCDD
         body = [
-            f"v_mov_b32_e32 v1, {BASE + 1:#x}",
-            f"v_mov_b32_e32 v2, {data:#x}",
+            f"v_mov_b32_e32 v1, {data:#x}",
+            f"v_mov_b32_e32 v2, {BASE + 1:#x}",
             "global_store_byte v1, v2, s[0:1]",
         ]
         actual_mem = run(body, memory=mem_init)
@@ -330,8 +330,8 @@ class TestGlobalSubDwordInterpreterExecution(unittest.TestCase):
         bank = GlobalSubDwordMemoryBank(mem_init)
         oracle = GlobalSubDwordReferenceOracle(bank)
         body = [
-            f"v_mov_b32_e32 v1, {BASE + 2:#x}",
-            f"v_mov_b32_e32 v2, {data:#x}",
+            f"v_mov_b32_e32 v1, {data:#x}",
+            f"v_mov_b32_e32 v2, {BASE + 2:#x}",
             "global_store_short v1, v2, s[0:1]",
         ]
         actual_mem = run(body, memory=mem_init)
@@ -356,7 +356,7 @@ class TestGlobalSubDwordInterpreterExecution(unittest.TestCase):
             f"v_mov_b32_e32 v1, {BASE + 2:#x}",
             "v_mov_b32_e32 v2, 0",
             "v_mov_b32_e32 v5, 0x55",
-            "global_store_byte v[1:2], v5, off",
+            "global_store_byte v5, v[1:2], off",
         ]
         mem = run(body, memory=mem_init)
         self.assertEqual(mem[BASE], 0xCA55BABE)
@@ -367,8 +367,8 @@ class TestGlobalSubDwordInterpreterExecution(unittest.TestCase):
             for byte in range(1, 8):
                 with self.subTest(op=op, byte=byte):
                     mem = run([
-                        f"v_mov_b32_e32 v1, {BASE + byte:#x}",
-                        f"v_mov_b32_e32 v2, {data:#x}",
+                        f"v_mov_b32_e32 v1, {data:#x}",
+                        f"v_mov_b32_e32 v2, {BASE + byte:#x}",
                         f"{op} v1, v2, s[0:1]",
                     ])
                     want = seed_bytes()
@@ -399,8 +399,8 @@ class TestGlobalSubDwordInterpreterExecution(unittest.TestCase):
     def test_inactive_lane_does_nothing(self):
         body = [
             "v_cmpx_eq_u32_e32 1, v0",
-            f"v_mov_b32_e32 v1, {BASE + 1:#x}",
-            "v_add_nc_u32_e32 v2, 0x70, v0",
+            "v_add_nc_u32_e32 v1, 0x70, v0",
+            f"v_mov_b32_e32 v2, {BASE + 1:#x}",
             "global_store_byte v1, v2, s[0:1]",
         ]
         mem = {BASE + 4 * k: w for k, w in enumerate(SEED)}
@@ -410,7 +410,7 @@ class TestGlobalSubDwordInterpreterExecution(unittest.TestCase):
         self.assertEqual(mem[BASE], (SEED[0] & ~0xFF00) | 0x71 << 8)
 
     def test_rejected_forms(self):
-        for line in ("global_load_dword_addtid v0, s[0:1]", "global_store_byte v1, v[2:3], s[0:1]",
+        for line in ("global_load_dword_addtid v0, s[0:1]", "global_store_byte v[2:3], v1, s[0:1]",
                      "global_store_short v1, v2, s[0:1] slc"):
             with self.subTest(line=line):
                 with self.assertRaises(rdna2spirv.Unsupported):

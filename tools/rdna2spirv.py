@@ -3389,7 +3389,9 @@ class Gen:
         if any(m in mods for m in ("lds", "tfe", "slc", "dlc")):
             raise Unsupported(op + " form")
         nbytes, store, signed, half = self.GLOBAL_SUB[op]
-        data, vaddr, saddr = (a[1], a[0], a[2]) if store else (a[0], a[1], a[2])
+        # LLVM prints the four sub-dword stores as `global_store_<n> vdata, vaddr, saddr` (VDATA first, unlike
+        # global_store_dword), so operand 0 is the data and operand 1 the address for both loads and stores.
+        data, vaddr, saddr = a[0], a[1], a[2]
         if data["k"] != "vgpr" or data.get("n", 1) != 1:
             raise Unsupported(op + " data")
         full = self.global_address(op, vaddr, saddr, mods)
