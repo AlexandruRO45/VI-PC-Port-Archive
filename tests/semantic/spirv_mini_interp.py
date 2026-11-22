@@ -175,6 +175,27 @@ def bits_f32(b):
     return _F32(b & MASK)
 
 
+class _F64(float):
+    """A binary64 value that came from a bit pattern (OpBitcast) and still carries that exact pattern."""
+
+    __slots__ = ("bits",)
+
+    def __new__(cls, bits):
+        self = super().__new__(cls, struct.unpack("<d", struct.pack("<Q", bits))[0])
+        self.bits = bits
+        return self
+
+
+def f64_bits(x):
+    if isinstance(x, _F64):
+        return x.bits
+    return struct.unpack("<Q", struct.pack("<d", x))[0]
+
+
+def bits_f64(b):
+    return _F64(b & 0xFFFFFFFFFFFFFFFF)
+
+
 def half_to_float(h):
     return struct.unpack("<e", struct.pack("<H", h & 0xFFFF))[0]
 
@@ -251,9 +272,9 @@ class _Types:
         """Byte size of a concrete type. Runtime arrays have no size of their own; the element size is used."""
         k = self.t[name]
         if k[0] in ("int", "float"):
-            return 4
+            return k[1] // 8
         if k[0] == "vec":
-            return 4 * k[2]
+            return self.size(k[1]) * k[2]
         if k[0] == "arr":
             return self.size(k[1]) * k[2]
         if k[0] == "rarr":
@@ -266,6 +287,14 @@ class _Types:
         k = self.t[name]
         if k[0] != "int":
             raise UnsupportedConstruct(f"integer width of type {name} ({k[0]})")
+        return k[1]
+
+    def float_bits(self, name):
+        k = self.t[name]
+        if k[0] == "vec":
+            k = self.t[k[1]]
+        if k[0] != "float":
+            raise UnsupportedConstruct(f"float width of type {name} ({k[0]})")
         return k[1]
 
 
@@ -444,9 +473,10 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 raise UnsupportedConstruct("integer type that is not 32 or 64 bits")
             types.t[res] = ("int", bits, int(a[1]))
         elif op == "OpTypeFloat":
-            if int(a[0]) != 32:
-                raise UnsupportedConstruct("non-32-bit float type")
-            types.t[res] = ("float",)
+            bits = int(a[0])
+            if bits not in (32, 64):
+                raise UnsupportedConstruct("non-32/64-bit float type")
+            types.t[res] = ("float", bits)
         elif op == "OpTypeBool":
             types.t[res] = ("bool",)
         elif op == "OpTypeVector":
@@ -462,7 +492,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
         elif op == "OpConstant":
             k = types.t[a[0]]
             if k[0] == "float":
-                constants[res] = values[res] = f32(float(a[1]))
+                constants[res] = values[res] = f32(float(a[1])) if k[1] == 32 else float(a[1])
             elif k[0] == "int":
                 constants[res] = values[res] = int(a[1]) & ((1 << k[1]) - 1)
                 id_type[res] = a[0]
@@ -714,10 +744,18 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             values[res] = val(a[1])
         elif op == "OpBitcast":
             k, v = types.t[a[0]], val(a[1])
-            if k[0] == "float" and isinstance(v, int):
+            if k[0] == "float" and k[1] == 32 and isinstance(v, int):
                 values[res] = bits_f32(v)
+            elif (k[0] == "float" and k[1] == 64 and isinstance(v, tuple)
+                  and len(v) == 2 and all(isinstance(w, int) for w in v)):
+                values[res] = bits_f64((v[0] & MASK) | ((v[1] & MASK) << 32))
+            elif k[0] == "float" and k[1] == 64 and isinstance(v, int):
+                values[res] = bits_f64(v)
+            elif k[0] == "vec" and k[2] == 2 and types.t[k[1]] == ("int", 32, 0) and isinstance(v, float):
+                bits = f64_bits(v)
+                values[res] = (bits & MASK, (bits >> 32) & MASK)
             elif k[0] == "int" and isinstance(v, float):
-                values[res] = f32_bits(v)
+                values[res] = f32_bits(v) if k[1] == 32 else f64_bits(v)
             elif k[0] == "int" and isinstance(v, int):
                 values[res] = v & wmask(a[0])
             else:
@@ -865,6 +903,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             values[res] = not val(a[1])
         elif op in ("OpFAdd", "OpFSub", "OpFMul", "OpFDiv"):
             x, y = val(a[1]), val(a[2])
+            round_f = f32 if types.float_bits(a[0]) == 32 else (lambda v: v)
 
             def _fdiv(p, q):
                 # SPIR-V leaves OpFDiv by zero undefined: refuse it, as the interpreter does for every undefined case
@@ -872,10 +911,10 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                     raise UnsupportedConstruct("OpFDiv by zero (undefined in SPIR-V)")
                 if math.isinf(p) and math.isinf(q):
                     return math.nan
-                return f32(p / q)       # x/inf is a signed zero, as in Python
+                return round_f(p / q)       # x/inf is a signed zero, as in Python
 
-            fn = {"OpFAdd": (lambda p, q: f32(p + q)), "OpFSub": (lambda p, q: f32(p - q)),
-                  "OpFMul": (lambda p, q: f32(p * q)), "OpFDiv": _fdiv}[op]
+            fn = {"OpFAdd": (lambda p, q: round_f(p + q)), "OpFSub": (lambda p, q: round_f(p - q)),
+                  "OpFMul": (lambda p, q: round_f(p * q)), "OpFDiv": _fdiv}[op]
             if isinstance(x, tuple) and isinstance(y, tuple) and len(x) == len(y) and all(
                     isinstance(p, float) and isinstance(q, float) for p, q in zip(x, y)):
                 values[res] = tuple(fn(p, q) for p, q in zip(x, y))
@@ -891,7 +930,13 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             else:
                 values[res] = fma_f32(x, y, z)
         elif op == "OpFNegate":
-            values[res] = f32(-val(a[1]))
+            round_f = f32 if types.float_bits(a[0]) == 32 else (lambda v: v)
+            values[res] = round_f(-val(a[1]))
+        elif op == "OpFConvert":
+            x = val(a[1])
+            if not isinstance(x, float):
+                raise UnsupportedConstruct("OpFConvert on non-float")
+            values[res] = f32(float(x)) if types.float_bits(a[0]) == 32 else float(x)
         elif op == "OpQuantizeToF16":
             # Single-instruction f32 -> f16 -> f32 round to nearest, with the
             # SPIR-V subnormal rule: a magnitude too small for a normal f16
@@ -970,7 +1015,8 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             elif name in ("Sin", "Cos"):
                 values[res] = f32(math.sin(args[0]) if name == "Sin" else math.cos(args[0]))
             elif name == "FAbs":
-                values[res] = f32(abs(args[0]))
+                round_f = f32 if types.float_bits(a[0]) == 32 else (lambda v: v)
+                values[res] = round_f(abs(args[0]))
             elif name == "FSign":
                 # GLSL.std.450: 1.0 if x > 0, 0.0 if x = 0 (keeping the zero's sign), -1.0 if x < 0
                 x = args[0]
@@ -981,13 +1027,14 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 # Two's complement: the most negative value is its own absolute value (as on the hardware).
                 values[res] = abs(_s32(args[0])) & MASK
             elif name in ("FMax", "FClamp"):
+                round_f = f32 if types.float_bits(a[0]) == 32 else (lambda v: v)
                 def fmax_clamp(*xs):
                     if any(math.isnan(v) for v in xs) or (name == "FClamp" and xs[1] > xs[2]):
                         raise UnsupportedConstruct(f"GLSL.std.450 {name} with these operands (undefined)")
                     # Equal zeros: -0 is ordered below +0, as in NMin/NMax above (the order RDNA2 hardware uses,
                     # so a med3 built from these ops is the hardware's median for signed zeros too).
                     v = _nmin_nmax("NMax", xs[0], xs[1])
-                    return f32(v if name == "FMax" else _nmin_nmax("NMin", v, xs[2]))
+                    return round_f(v if name == "FMax" else _nmin_nmax("NMin", v, xs[2]))
                 # Vector operands (v_pk_* clamp) are component-wise.
                 values[res] = (tuple(fmax_clamp(*c) for c in zip(*args)) if isinstance(args[0], tuple)
                                else fmax_clamp(*args))
@@ -1005,27 +1052,29 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 # inputs whose result is exact). GLSL.std.450 leaves Log2 of x <= 0, Sqrt of x < 0 and
                 # InverseSqrt of x <= 0 undefined; those raise.
                 x = args[0]
+                round_f = f32 if types.float_bits(a[0]) == 32 else (lambda v: v)
                 if math.isnan(x):
                     values[res] = x
                 elif name == "Exp2":
                     if math.isinf(x):
                         values[res] = math.inf if x > 0 else 0.0
                     else:
-                        values[res] = f32(2.0 ** x) if x < 1024.0 else math.inf
+                        values[res] = round_f(2.0 ** x) if x < 1024.0 else math.inf
                 elif (name == "Sqrt" and x < 0.0) or (name != "Sqrt" and x <= 0.0):
                     raise UnsupportedConstruct(f"GLSL.std.450 {name} of {x!r} (undefined)")
                 elif math.isinf(x):
                     values[res] = {"Log2": math.inf, "Sqrt": math.inf, "InverseSqrt": 0.0}[name]
                 elif name == "Log2":
-                    values[res] = f32(math.log2(x))
+                    values[res] = round_f(math.log2(x))
                 elif name == "Sqrt":
-                    values[res] = f32(math.sqrt(x))         # sqrt(-0.0) is -0.0
+                    values[res] = round_f(math.sqrt(x))         # sqrt(-0.0) is -0.0
                 else:
-                    values[res] = f32(1.0 / math.sqrt(x))
+                    values[res] = round_f(1.0 / math.sqrt(x))
             elif name == "FMin":
+                round_f = f32 if types.float_bits(a[0]) == 32 else (lambda v: v)
                 if any(math.isnan(x) for x in args):
                     raise UnsupportedConstruct(f"GLSL.std.450 {name} of NaN (undefined)")
-                values[res] = f32(_nmin_nmax("NMin", *args))
+                values[res] = round_f(_nmin_nmax("NMin", *args))
             elif name in ("NMin", "NMax"):
                 x, y = args
                 if isinstance(x, tuple):

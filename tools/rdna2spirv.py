@@ -4083,6 +4083,20 @@ class Gen:
         self.emit(f"{d} = OpBitcast %double {v2}")
         return d
 
+    def src_f64_words(self, sv, op):
+        """Low and high 32-bit words of a binary64 VALU source operand (before abs/neg modifiers)."""
+        if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
+            return self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
+        if sv.get("f64_literal"):
+            return self.cu(0), self.cu(sv["v"] & 0xFFFFFFFF)
+        if sv["k"] in ("imm", "fimm"):
+            bits = (struct.unpack("<Q", struct.pack("<d", float(sv["v"])))[0]
+                    if sv["k"] == "fimm" else sv["v"] & 0xFFFFFFFFFFFFFFFF)
+            return self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
+        if sv["k"] == "special" and sv.get("t") == "null":
+            return self.cu(0), self.cu(0)
+        raise Unsupported(op + " operand")
+
     def round_f32_flushed(self, fn, x):
         """v_floor_f32 / v_ceil_f32 / v_fract_f32 of the operand x (source modifiers applied) as RDNA2 computes them in
         the MODE inferred for the game (IEEE 0, f32 denormals flushed), measured natively on gfx1036: a denormal
@@ -5220,16 +5234,7 @@ class Gen:
         elif op in ("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64"):
             # f64: register pairs as doubles (shaderFloat64). neg/abs modifiers apply to the double.
             def f64(sv):
-                if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
-                    lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
-                elif sv.get("f64_literal"):
-                    lo, hi = self.cu(0), self.cu(sv["v"] & 0xFFFFFFFF)
-                elif sv["k"] in ("imm", "fimm"):
-                    bits = (struct.unpack("<Q", struct.pack("<d", sv["v"]))[0]
-                            if sv["k"] == "fimm" else sv["v"] & 0xFFFFFFFFFFFFFFFF)
-                    lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
-                else:
-                    raise Unsupported(op + " operand")
+                lo, hi = self.src_f64_words(sv, op)
                 v2, d = self.tmp(), self.tmp()
                 self.emit(f"{v2} = OpCompositeConstruct %v2uint_d {lo} {hi}")
                 self.emit(f"{d} = OpBitcast %double {v2}")
@@ -7433,14 +7438,7 @@ class Gen:
             # Normal inputs have biased exponent 1..2046; zero and denormals give +-0 / exp 0, infinities and NaNs
             # pass through unchanged / exp 0 (RDNA2 ISA, V_FREXP_MANT_F64 / V_FREXP_EXP_I32_F64).
             sv = a[1]
-            if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
-                lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
-            elif sv["k"] in ("imm", "fimm"):
-                bits = (struct.unpack("<Q", struct.pack("<d", float(sv["v"])))[0]
-                        if sv["k"] == "fimm" else sv["v"] & 0xFFFFFFFFFFFFFFFF)
-                lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
-            else:
-                raise Unsupported(op + " operand")
+            lo, hi = self.src_f64_words(sv, op)
             if sv.get("abs"):
                 t = self.tmp()
                 self.emit(f"{t} = OpBitwiseAnd %uint {hi} {self.cu(0x7FFFFFFF)}")
