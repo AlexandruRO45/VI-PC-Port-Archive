@@ -458,5 +458,171 @@ class TestScalarInterpreter(unittest.TestCase):
         self.assertEqual(old, 0xF0F0F0F0_F0F0F0F0)
         self.assertEqual(mem, 0x0F0F0F0F_0F0F0F0F)
 
+# ==============================================================================
+# Phase 4: SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# ==============================================================================
+
+@dataclass
+class SIMDState:
+    num_lanes: int = 32
+    exec_mask: int = 0xFFFF_FFFF
+    vgprs: List[List[int]] = field(default_factory=lambda: [])
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+    lds: LDSModel = field(default_factory=LDSModel)
+
+    def __post_init__(self) -> None:
+        if self.num_lanes not in (32, 64):
+            raise ValueError(f"num_lanes must be 32 or 64, got {self.num_lanes}")
+        if not self.vgprs:
+            self.vgprs = [[0] * 256 for _ in range(self.num_lanes)]
+
+    def is_lane_active(self, lane: int) -> bool:
+        return bool((self.exec_mask >> lane) & 1)
+
+    def get_vgpr(self, lane: int, reg: int) -> int:
+        return self.vgprs[lane][reg] & MASK_32
+
+    def set_vgpr(self, lane: int, reg: int, val: int) -> None:
+        self.vgprs[lane][reg] = val & MASK_32
+
+    def get_vgpr_pair(self, lane: int, base_index: int) -> int:
+        low = self.vgprs[lane][base_index] & MASK_32
+        high = self.vgprs[lane][base_index + 1] & MASK_32
+        return ((high << 32) | low) & MASK_64
+
+    def set_vgpr_pair(self, lane: int, base_index: int, val: int) -> None:
+        self.vgprs[lane][base_index] = val & MASK_32
+        self.vgprs[lane][base_index + 1] = (val >> 32) & MASK_32
+
+    def get_sgpr_pair(self, base_index: int) -> int:
+        low = self.sgprs[base_index] & MASK_32
+        high = self.sgprs[base_index + 1] & MASK_32
+        return ((high << 32) | low) & MASK_64
+
+    def set_sgpr_pair(self, base_index: int, val: int) -> None:
+        self.sgprs[base_index] = val & MASK_32
+        self.sgprs[base_index + 1] = (val >> 32) & MASK_32
+
+
+class SIMDInterpreter:
+    def resolve_lane_operand(self, op: Operand64, lane: int, state: SIMDState) -> int:
+        if isinstance(op, VGPRPair):
+            return state.get_vgpr_pair(lane, op.base_index)
+        if isinstance(op, SGPRPair):
+            return state.get_sgpr_pair(op.base_index)
+        if isinstance(op, Immediate64):
+            return op.value & MASK_64
+        raise TypeError(f"Unknown operand type: {type(op).__name__}")
+
+    def step(
+        self,
+        instr: DSXor64Instruction,
+        state: SIMDState,
+    ) -> List[Tuple[int, Optional[int], int]]:
+        results: List[Tuple[int, Optional[int], int]] = []
+
+        for lane in range(state.num_lanes):
+            if not state.is_lane_active(lane):
+                continue
+
+            vaddr = state.get_vgpr(lane, instr.addr.index)
+            data_val = self.resolve_lane_operand(instr.data, lane, state)
+
+            eff_addr = calc_lds_effective_address(vaddr, instr.offset)
+
+            curr_mem = state.lds.read_qword(eff_addr)
+            old_val, next_mem = oracle_ds_xor_b64(curr_mem, data_val)
+            state.lds.write_qword(eff_addr, next_mem)
+
+            if instr.opcode.is_return:
+                assert instr.dst is not None
+                state.set_vgpr_pair(lane, instr.dst.base_index, old_val)
+                results.append((lane, old_val, next_mem))
+            else:
+                results.append((lane, None, next_mem))
+
+        return results
+
+
+class TestSIMDMultiLaneDivergence(unittest.TestCase):
+    def test_wave32_uniform_independent_addresses(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        interp = SIMDInterpreter()
+
+        for lane in range(32):
+            addr = 0x200 + lane * 8
+            state.set_vgpr(lane, 1, addr)
+            state.set_vgpr_pair(lane, 4, MASK_64)
+            state.lds.write_qword(addr, 1 << lane)
+
+        instr = DSXor64Instruction(
+            opcode=DSOpcode64.DS_XOR_RTN_B64,
+            dst=VGPRPair(2),
+            addr=VGPR(1),
+            data=VGPRPair(4),
+        )
+        results = interp.step(instr, state)
+        self.assertEqual(len(results), 32)
+
+        for lane in range(32):
+            addr = 0x200 + lane * 8
+            self.assertEqual(state.get_vgpr_pair(lane, 2), 1 << lane)
+            self.assertEqual(state.lds.read_qword(addr), (~(1 << lane)) & MASK_64)
+
+    def test_wave32_exec_mask_alternating_lanes(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0x5555_5555)
+        interp = SIMDInterpreter()
+
+        sentinel = 0xDEAD_BEEF_CAFE_0000
+        for lane in range(32):
+            addr = 0x400 + lane * 8
+            state.set_vgpr_pair(lane, 0, sentinel)
+            state.set_vgpr(lane, 2, addr)
+            state.set_vgpr_pair(lane, 4, 0xFF)
+            state.lds.write_qword(addr, 0xFF)
+
+        instr = DSXor64Instruction(
+            opcode=DSOpcode64.DS_XOR_RTN_B64,
+            dst=VGPRPair(0),
+            addr=VGPR(2),
+            data=VGPRPair(4),
+        )
+        results = interp.step(instr, state)
+        self.assertEqual(len(results), 16)
+
+        for lane in range(32):
+            addr = 0x400 + lane * 8
+            if lane % 2 == 0:
+                self.assertEqual(state.get_vgpr_pair(lane, 0), 0xFF)
+                self.assertEqual(state.lds.read_qword(addr), 0)
+            else:
+                self.assertEqual(state.get_vgpr_pair(lane, 0), sentinel)
+                self.assertEqual(state.lds.read_qword(addr), 0xFF)
+
+    def test_wave32_same_address_collision_atomic_serialization(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0x0000_0003)
+        interp = SIMDInterpreter()
+        common_addr = 0x800
+        state.lds.write_qword(common_addr, 0)
+
+        # Lane 0: XOR 0x01 -> old = 0, mem = 0x01
+        # Lane 1: XOR 0x02 -> old = 0x01, mem = 0x03
+        state.set_vgpr(0, 1, common_addr)
+        state.set_vgpr_pair(0, 2, 0x01)
+        state.set_vgpr(1, 1, common_addr)
+        state.set_vgpr_pair(1, 2, 0x02)
+
+        instr = DSXor64Instruction(
+            opcode=DSOpcode64.DS_XOR_RTN_B64,
+            dst=VGPRPair(0),
+            addr=VGPR(1),
+            data=VGPRPair(2),
+        )
+        results = interp.step(instr, state)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(state.get_vgpr_pair(0, 0), 0)
+        self.assertEqual(state.get_vgpr_pair(1, 0), 0x01)
+        self.assertEqual(state.lds.read_qword(common_addr), 0x03)
+
 if __name__ == "__main__":
     unittest.main()
