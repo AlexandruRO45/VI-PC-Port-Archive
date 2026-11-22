@@ -587,6 +587,7 @@ enum class IndirectKind : std::uint8_t {
     draw = 0,
     draw_indexed = 1,
     dispatch = 2,
+    dispatch_mesh = 3,  // D3D12_DISPATCH_MESH_ARGUMENTS, the same 12 bytes as VkDrawMeshTasksIndirectCommandEXT
 };
 
 struct ExecuteIndirect {
@@ -598,7 +599,7 @@ struct ExecuteIndirect {
     ResourceId count_buffer = 0;  // 0: fixed max_count; non-zero: vkCmdDraw*IndirectCount
     std::uint64_t count_offset = 0;
     // The list's graphics state at the call (its count, instances and first fields are unused: the argument buffer
-    // holds them), for the draw kinds. Replay then makes the call a whole draw: it begins rendering into the targets,
+    // holds them), for the draw kinds and dispatch_mesh (whose state has `mesh` set, as DispatchMesh records it). Replay then makes the call a whole draw: it begins rendering into the targets,
     // binds the pipeline and the dynamic state as for a Draw, and issues the indirect draw. Null: the caller has set
     // all that up (a raw indirect call), as the unit tests of the indirect path do.
     std::shared_ptr<const Draw> state;
