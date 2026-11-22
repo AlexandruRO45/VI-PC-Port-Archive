@@ -1160,6 +1160,155 @@ class TestConditionCodesStatusFlagsAndCarryBorrow(unittest.TestCase):
         self.assertEqual(sum_u, big)
 
 
+# ============================================================================
+# Section 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ============================================================================
+
+FLOAT32_POS_ZERO: int = 0x0000_0000
+FLOAT32_NEG_ZERO: int = 0x8000_0000
+FLOAT32_POS_ONE: int = 0x3F80_0000
+FLOAT32_NEG_ONE: int = 0xBF80_0000
+FLOAT32_POS_INF: int = 0x7F80_0000
+FLOAT32_NEG_INF: int = 0xFF80_0000
+FLOAT32_QNAN: int = 0x7FC0_0000
+FLOAT32_SNAN: int = 0x7F80_0001
+FLOAT32_MIN_SUBNORMAL: int = 0x0000_0001
+FLOAT32_MAX_SUBNORMAL: int = 0x007F_FFFF
+FLOAT32_MIN_NORMAL: int = 0x0080_0000
+FLOAT32_MAX_NORMAL: int = 0x7F7F_FFFF
+
+
+class TestIEEE754BoundaryExtremesSubnormalsAndNaNs(unittest.TestCase):
+    """Unit tests for IEEE 754 single-precision arithmetic boundaries in ds_add_rtn_f32."""
+
+    def setUp(self) -> None:
+        self.state = ScalarMachineState()
+        self.interp = ScalarInterpreter()
+
+    def test_signed_zeros_addition(self) -> None:
+        """IEEE 754 rules for additions involving signed zeros."""
+        addr = 0x100
+        # +0.0 + +0.0 = +0.0
+        self.state.lds.write_dword(addr, FLOAT32_POS_ZERO)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, FLOAT32_POS_ZERO)
+        instr = DSAddRtnF32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2))
+        _, new_val = self.interp.step(instr, self.state)
+        self.assertEqual(new_val, FLOAT32_POS_ZERO)
+
+        # -0.0 + -0.0 = -0.0
+        self.state.lds.write_dword(addr, FLOAT32_NEG_ZERO)
+        self.state.set_vgpr(2, FLOAT32_NEG_ZERO)
+        _, new_val = self.interp.step(instr, self.state)
+        self.assertEqual(new_val, FLOAT32_NEG_ZERO)
+
+        # +0.0 + -0.0 = +0.0
+        self.state.lds.write_dword(addr, FLOAT32_POS_ZERO)
+        self.state.set_vgpr(2, FLOAT32_NEG_ZERO)
+        _, new_val = self.interp.step(instr, self.state)
+        self.assertEqual(new_val, FLOAT32_POS_ZERO)
+
+    def test_infinities_addition(self) -> None:
+        """Infinities propagation and cancellation."""
+        addr = 0x110
+        # +Inf + 1.0 = +Inf
+        self.state.lds.write_dword(addr, FLOAT32_POS_INF)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, FLOAT32_POS_ONE)
+        instr = DSAddRtnF32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2))
+        _, new_val = self.interp.step(instr, self.state)
+        self.assertEqual(new_val, FLOAT32_POS_INF)
+
+        # -Inf + -1.0 = -Inf
+        self.state.lds.write_dword(addr, FLOAT32_NEG_INF)
+        self.state.set_vgpr(2, FLOAT32_NEG_ONE)
+        _, new_val = self.interp.step(instr, self.state)
+        self.assertEqual(new_val, FLOAT32_NEG_INF)
+
+        # +Inf + (-Inf) = NaN
+        self.state.lds.write_dword(addr, FLOAT32_POS_INF)
+        self.state.set_vgpr(2, FLOAT32_NEG_INF)
+        _, new_val = self.interp.step(instr, self.state)
+        self.assertEqual(new_val, FLOAT32_QNAN)
+
+    def test_nan_propagation(self) -> None:
+        """Adding any NaN operand results in canonical quiet NaN."""
+        addr = 0x120
+        # qNaN + 5.0 = qNaN
+        self.state.lds.write_dword(addr, FLOAT32_QNAN)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, f32_to_u32(5.0))
+        instr = DSAddRtnF32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2))
+        _, new_val = self.interp.step(instr, self.state)
+        self.assertEqual(new_val, FLOAT32_QNAN)
+
+        # 5.0 + sNaN = qNaN
+        self.state.lds.write_dword(addr, f32_to_u32(5.0))
+        self.state.set_vgpr(2, FLOAT32_SNAN)
+        _, new_val = self.interp.step(instr, self.state)
+        self.assertEqual(new_val, FLOAT32_QNAN)
+
+    def test_subnormals_gradual_underflow(self) -> None:
+        """Subnormal precision is maintained without flushing to zero."""
+        addr = 0x130
+        # Smallest subnormal + smallest subnormal = 2 * smallest subnormal (0x2)
+        self.state.lds.write_dword(addr, FLOAT32_MIN_SUBNORMAL)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, FLOAT32_MIN_SUBNORMAL)
+        instr = DSAddRtnF32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2))
+        old_val, new_val = self.interp.step(instr, self.state)
+        self.assertEqual(old_val, FLOAT32_MIN_SUBNORMAL)
+        self.assertEqual(new_val, 0x0000_0002)
+
+    def test_float_boundaries_max_normal_overflow(self) -> None:
+        """Adding positive float to MAX_NORMAL triggers overflow to Infinity."""
+        addr = 0x140
+        self.state.lds.write_dword(addr, FLOAT32_MAX_NORMAL)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, FLOAT32_MAX_NORMAL)
+        instr = DSAddRtnF32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2))
+        old_val, new_val = self.interp.step(instr, self.state)
+        self.assertEqual(old_val, FLOAT32_MAX_NORMAL)
+        self.assertEqual(new_val, FLOAT32_POS_INF)
+
+    def test_simd_wavefront_mixed_floating_point_lanes(self) -> None:
+        """SIMD wavefront where different lanes hold distinct IEEE 754 special values."""
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        interp = SIMDInterpreter()
+
+        special_values = [
+            FLOAT32_POS_ZERO,
+            FLOAT32_NEG_ZERO,
+            FLOAT32_POS_ONE,
+            FLOAT32_NEG_ONE,
+            FLOAT32_POS_INF,
+            FLOAT32_NEG_INF,
+            FLOAT32_QNAN,
+            FLOAT32_SNAN,
+            FLOAT32_MIN_SUBNORMAL,
+            FLOAT32_MAX_SUBNORMAL,
+            FLOAT32_MIN_NORMAL,
+            FLOAT32_MAX_NORMAL,
+        ]
+
+        for lane in range(32):
+            val = special_values[lane % len(special_values)]
+            addr = 0x300 + lane * 4
+            state.lds.write_dword(addr, val)
+            state.set_vgpr(lane, 1, addr)
+            state.set_vgpr(lane, 2, FLOAT32_POS_ZERO)  # Add +0.0 (identity for valid numbers)
+
+        instr = DSAddRtnF32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2))
+        results = interp.step(instr, state)
+
+        for lane in range(32):
+            orig_val = special_values[lane % len(special_values)]
+            res = results[lane]
+            self.assertIsNotNone(res)
+            self.assertEqual(state.get_vgpr(lane, 0), orig_val)
+
+
+
 
 
 
