@@ -769,8 +769,93 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
             self.assertEqual(oracle_v_xnor_b32(b, MASK32), b)
 
 
+
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Reg(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(999, RegType.SGPR)
+
+    def test_syntax_rejection_valu_destination_must_be_vgpr(self) -> None:
+        dst_sgpr = Reg(0, RegType.SGPR)
+        src = VOP2Operand(Reg(1, RegType.VGPR))
+        with self.assertRaises(TypeError):
+            VXnorB32Instruction(dst=dst_sgpr, src0=src, src1=src)
+
+    def test_syntax_rejection_invalid_simd_lane_count(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_negative_control_xor_instead_of_xnor(self) -> None:
+        s0, s1 = 0xAAAA_AAAA, 0xAAAA_AAAA
+        correct = oracle_v_xnor_b32(s0, s1)  # 0xFFFFFFFF
+        wrong_xor = (s0 ^ s1) & MASK32       # 0x00000000
+        self.assertNotEqual(correct, wrong_xor)
+
+    def test_negative_control_nor_instead_of_xnor(self) -> None:
+        s0, s1 = 0x01, 0x01
+        correct = oracle_v_xnor_b32(s0, s1) & 1  # 1 XNOR 1 = 1
+        wrong_nor = (~(s0 | s1)) & 1             # ~(1 | 1) = 0
+        self.assertNotEqual(correct, wrong_nor)
+
+    def test_negative_control_nand_instead_of_xnor(self) -> None:
+        s0, s1 = 0x00, 0x00
+        correct = oracle_v_xnor_b32(s0, s1) & 1  # 0 XNOR 0 = 1
+        wrong_nand = (~(s0 & s1)) & 1            # ~(0 & 0) = 1 (matches for 0, 0)
+        # But for 1, 0:
+        correct_10 = oracle_v_xnor_b32(1, 0) & 1  # 1 XNOR 0 = 0
+        wrong_nand_10 = (~(1 & 0)) & 1            # ~(1 & 0) = 1
+        self.assertNotEqual(correct_10, wrong_nand_10)
+
+    def test_mutation_plain_xor_detected(self) -> None:
+        """Mutant: Executes XOR instead of XNOR."""
+        def mutant_xor(s0: int, s1: int) -> int:
+            return (s0 ^ s1) & MASK32
+
+        s0, s1 = 0x1234, 0x1234
+        oracle_res = oracle_v_xnor_b32(s0, s1)  # 0xFFFFFFFF
+        mutant_res = mutant_xor(s0, s1)         # 0x00000000
+        self.assertEqual(oracle_res, 0xFFFF_FFFF)
+        self.assertEqual(mutant_res, 0x0000_0000)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_nor_detected(self) -> None:
+        """Mutant: Executes NOR (~(A | B)) instead of XNOR."""
+        def mutant_nor(s0: int, s1: int) -> int:
+            return (~(s0 | s1)) & MASK32
+
+        s0, s1 = 1, 1
+        oracle_res = oracle_v_xnor_b32(s0, s1) & 1  # 1
+        mutant_res = mutant_nor(s0, s1) & 1         # 0
+        self.assertEqual(oracle_res, 1)
+        self.assertEqual(mutant_res, 0)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_off_by_one_bit_flip(self) -> None:
+        """Mutant: Flips a bit in the result."""
+        def mutant_bit_corrupt(s0: int, s1: int) -> int:
+            return oracle_v_xnor_b32(s0, s1) ^ 1
+
+        s0, s1 = 0x5555_5555, 0x5555_5555
+        oracle_res = oracle_v_xnor_b32(s0, s1)
+        mutant_res = mutant_bit_corrupt(s0, s1)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
