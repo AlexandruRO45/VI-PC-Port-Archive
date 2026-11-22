@@ -268,6 +268,27 @@ SALU_HELPERS = {
         "}"
     ),
 }
+# v_cvt_u32_f32 and v_cvt_i32_f32 truncate toward zero, map NaN to 0 and saturate (issue #360 reading of
+# the RDNA 2 ISA). The float limits are exact binary32 values; HLSL leaves out-of-range and NaN casts
+# undefined (LLVM fptoui/fptosi give poison), so the cast is applied only to an operand clamped to the
+# largest binary32 below 2^32 (4294967040 = 0xffffff00) or 2^31 (2147483520 = 0x7fffff80) and made NaN-free,
+# and the guards then select the saturated or zero result. NaN fails every compare, so it reaches the cast
+# as y = 0 and gives 0; the isnan in y is the only NaN handling.
+CVT_HELPERS = {
+    "cvt_u32_f32": (
+        "uint cvt_u32_f32(float x) {\n"
+        "    float y = isnan(x) ? 0.0f : clamp(x, 0.0f, 4294967040.0f);\n"
+        "    return x <= 0.0f ? 0u : x >= 4294967296.0f ? 0xffffffffu : uint(y);\n"
+        "}"
+    ),
+    "cvt_i32_f32": (
+        "uint cvt_i32_f32(float x) {\n"
+        "    float y = isnan(x) ? 0.0f : clamp(x, -2147483648.0f, 2147483520.0f);\n"
+        "    return x <= -2147483648.0f ? 0x80000000u\n"
+        "         : x >= 2147483648.0f ? 0x7fffffffu : asuint(int(y));\n"
+        "}"
+    ),
+}
 
 
 def sgpr_name(token):
@@ -720,6 +741,18 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             expression = f"float(asuint({source}))" if op == "u32" else f"float(asint({source}))"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(r"v_cvt_(u32|i32)_f32_e32 (v\d+), ([vs]\d+|0x[0-9a-f]{1,8})"):
+            # Binary32 to word, plain e32 only. Decimal inline constants are refused because
+            # fp_operand reads them as bit patterns and the f32 reading is unchecked.
+            op, dst, src = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid conversion")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            source = fp_operand(src, scalar, vector, pending, sample_pending)
+            helpers.add(f"cvt_{op}_f32")
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat(cvt_{op}_f32({source}));")
         elif m := match(r"v_cvt_pkrtz_f16_f32_e32 (v\d+), (v\d+), (v\d+)"):
             dst, lo, hi = m.groups()
             pair = (vector[lo], vector[hi])
@@ -752,7 +785,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     if not ended or samples != (2 if second_texture_offset is not None else 1):
         raise ValueError("Unexpected sample count or missing color export")
     if helpers:
-        defs = [body for name, body in SALU_HELPERS.items() if name in helpers]
+        defs = [body for table in (SALU_HELPERS, CVT_HELPERS) for name, body in table.items() if name in helpers]
         pos = lines.index(preamble)
         lines[pos:pos] = defs
     return "\n".join([*lines, "}",""])
