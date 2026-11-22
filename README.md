@@ -57,7 +57,7 @@ Contributing from macOS or Linux? See the [non-Windows host guide](docs/non-wind
 ### Windows build notes
 
 - **DXC validation.** `shader_metadata_probe` skips when the validator lacks module-only validation. DXC 1.8.2502 is the first verified release that passes. To use a separate DXC installation, configure with `cmake --preset dev -DDXC_EXECUTABLE=C:/path/to/dxc/bin/x64/dxc.exe`. [Results by release](docs/experiments.md#module-only-validation-by-dxc-release) · [Original report](https://github.com/R0Y00/Xbox2Windows/issues/98) · [DXC download](https://github.com/microsoft/DirectXShaderCompiler/releases/tag/v1.8.2502)
-- **Windows 10.** The in-box WARP runtime lacks the features used by the BVH and DXR checks. Use the app-local Agility SDK and WARP packages to run those checks. [Windows 10 setup](docs/experiments.md#windows-10-with-the-app-local-agility-sdk-and-warp)
+- **Windows 10.** The source-built BVH buffer operations run on in-box WARP at SM 6.0. For WARP checks that require SM 6.5 or DXR, use the app-local Agility SDK and WARP packages. [BVH buffer operations](docs/experiments.md#bvh-buffer-operations-on-in-box-warp) · [Windows 10 setup](docs/experiments.md#windows-10-with-the-app-local-agility-sdk-and-warp)
 - **Independent build.** A Windows 11 contributor reproduced the three smoke tests from a clean checkout at `71bb9f4` and again after an incremental rebuild at `2465837`. [Toolchain, full-suite results and capability skips](https://github.com/R0Y00/Xbox2Windows/issues/2#issuecomment-7063351821)
 
 ## Choose an experiment
@@ -69,6 +69,7 @@ After the full [Windows build](#first-build), run one comparison from the reposi
 | Native, mapped and recompiled archive reader | `ctest --preset dev --no-tests=error -R '^cpu_native_archive_blast$' -V` |
 | Indexed mesh draw on WARP | `ctest --preset dev --no-tests=error -R '^mesh_indexed_draw_warp$' -V` |
 | Compute shader buffer writes on WARP | `ctest --preset dev --no-tests=error -R '^compute_store_aot_warp$' -V` |
+| PE 32/64-bit base fixups against Windows | `ctest --preset dev --no-tests=error -R '^cpu_native_highlow$' -V` · [scope and controls](docs/experiments.md#highlow-and-mixed-width-base-relocations) |
 
 The control-flow CPU translator supports [source-built string memory transfers](docs/experiments.md#string-memory-transfers-in-the-control-flow-cpu-lifter). MOVS and STOS, with and without REP, copy and fill 1-, 2-, 4- and 8-byte elements in either direction.
 
