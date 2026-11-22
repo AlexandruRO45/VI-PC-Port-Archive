@@ -1155,5 +1155,171 @@ class TestDSMaxRtnI32ConditionCodesAndFlags(unittest.TestCase):
         self.assertEqual(self.state.scc, canary_scc)
 
 
+class TestDSMaxRtnI32IEEE754BoundaryExtremes(unittest.TestCase):
+    """Phase 7: Unit tests for IEEE 754 boundary extremes, subnormals, and NaN bit patterns."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(size_dwords=16384)  # full 64 KiB
+        self.state = ScalarThreadState(lds=self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_signed_zero_bit_patterns_as_integers(self) -> None:
+        # In IEEE 754: +0.0 is 0x00000000, -0.0 is 0x80000000.
+        # In signed 32-bit int: 0x00000000 is 0, 0x80000000 is INT32_MIN (-2147483648).
+        # max(0, -2147483648) = 0 (+0.0 bit pattern)
+        addr = 0x100
+        self.lds.write_dword(addr, 0x00000000)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, 0x80000000)
+        inst = DSMaxRtnI32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+        )
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, 0x00000000)
+        self.assertEqual(self.lds.read_dword(addr), 0x00000000)
+
+        # Reverse: memory has -0.0 (INT32_MIN), operand is +0.0 (0)
+        self.lds.write_dword(addr, 0x80000000)
+        self.state.set_vgpr(2, 0x00000000)
+        ret2 = self.interp.execute(self.state, inst)
+        self.assertEqual(ret2, 0x80000000)
+        self.assertEqual(self.lds.read_dword(addr), 0x00000000)
+
+    def test_signed_infinities_as_integers(self) -> None:
+        # Single precision float:
+        # +Inf: 0x7F800000 (+2139095040 in i32)
+        # -Inf: 0xFF800000 (-8388608 in i32)
+        pos_inf = 0x7F800000
+        neg_inf = 0xFF800000
+
+        # max(+Inf, -Inf) -> +Inf (since +2139095040 > -8388608)
+        addr = 0x200
+        self.lds.write_dword(addr, pos_inf)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, neg_inf)
+        inst = DSMaxRtnI32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+        )
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, pos_inf)
+        self.assertEqual(self.lds.read_dword(addr), pos_inf)
+
+        # max(-Inf, 0) -> 0 (since 0 > -8388608)
+        self.lds.write_dword(addr, neg_inf)
+        self.state.set_vgpr(2, 0)
+        ret2 = self.interp.execute(self.state, inst)
+        self.assertEqual(ret2, neg_inf)
+        self.assertEqual(self.lds.read_dword(addr), 0)
+
+        # max(-Inf, -1) -> -1 (since -1 > -8388608)
+        self.lds.write_dword(addr, neg_inf)
+        self.state.set_vgpr(2, 0xFFFFFFFF)
+        ret3 = self.interp.execute(self.state, inst)
+        self.assertEqual(ret3, neg_inf)
+        self.assertEqual(self.lds.read_dword(addr), 0xFFFFFFFF)
+
+    def test_nan_bit_patterns_unaltered_and_no_traps(self) -> None:
+        # Float NaNs:
+        # qNaN: 0x7FC00000 (+2143289344 in i32)
+        # sNaN: 0x7F800001 (+2139095041 in i32)
+        # neg_NaN: 0xFFC00000 (-4194304 in i32)
+        qnan = 0x7FC00000
+        snan = 0x7F800001
+        neg_nan = 0xFFC00000
+        pos_inf = 0x7F800000
+
+        addr = 0x300
+        inst = DSMaxRtnI32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+        )
+
+        # In signed i32: 2143289344 (qNaN) > 2139095040 (+Inf)
+        self.lds.write_dword(addr, pos_inf)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, qnan)
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, pos_inf)
+        self.assertEqual(self.lds.read_dword(addr), qnan)
+
+        # sNaN vs +100 -> sNaN (+2139095041 > 100)
+        self.lds.write_dword(addr, 100)
+        self.state.set_vgpr(2, snan)
+        ret2 = self.interp.execute(self.state, inst)
+        self.assertEqual(ret2, 100)
+        self.assertEqual(self.lds.read_dword(addr), snan)
+
+        # neg_NaN (-4194304) vs -Inf (-8388608): -4194304 > -8388608 -> neg_NaN
+        self.lds.write_dword(addr, 0xFF800000)
+        self.state.set_vgpr(2, neg_nan)
+        ret3 = self.interp.execute(self.state, inst)
+        self.assertEqual(ret3, 0xFF800000)
+        self.assertEqual(self.lds.read_dword(addr), neg_nan)
+
+    def test_subnormal_bit_patterns_as_integers(self) -> None:
+        # Smallest positive subnormal: 0x00000001 (+1 in i32)
+        # Largest positive subnormal: 0x007FFFFF (+8388607 in i32)
+        # Smallest negative subnormal: 0x80000001 (-2147483647 in i32)
+        addr = 0x400
+        inst = DSMaxRtnI32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+        )
+
+        # +1 vs -10 -> max is +1 (0x00000001)
+        self.lds.write_dword(addr, u32(-10))
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, 0x00000001)
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, u32(-10))
+        self.assertEqual(self.lds.read_dword(addr), 0x00000001)
+
+        # -2147483647 (0x80000001) vs INT32_MIN (-2147483648) -> max is 0x80000001
+        self.lds.write_dword(addr, u32(INT32_MIN))
+        self.state.set_vgpr(2, 0x80000001)
+        ret2 = self.interp.execute(self.state, inst)
+        self.assertEqual(ret2, u32(INT32_MIN))
+        self.assertEqual(self.lds.read_dword(addr), 0x80000001)
+
+    def test_max_offset_and_last_dword_boundary(self) -> None:
+        # Maximum 16-bit offset = 0xFFFF (65535)
+        # Last valid 4-byte dword boundary in 64 KiB LDS starts at byte 65532 (0xFFFC)
+        last_dword_addr = 65532
+        self.lds.write_dword(last_dword_addr, 50)
+
+        # Use base 0 and offset 65532
+        self.state.set_vgpr(1, 0)
+        self.state.set_vgpr(2, 99)
+        inst = DSMaxRtnI32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+            offset=last_dword_addr,
+        )
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, 50)
+        self.assertEqual(self.lds.read_dword(last_dword_addr), 99)
+
+        # Test offset 65535 (0xFFFF): effective address is 65535 -> dword index (65535 >> 2) & 16383 = 16383
+        # Which is byte 65532!
+        self.state.set_vgpr(1, 0)
+        self.state.set_vgpr(2, 150)
+        inst_max_off = DSMaxRtnI32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+            offset=0xFFFF,
+        )
+        ret2 = self.interp.execute(self.state, inst_max_off)
+        self.assertEqual(ret2, 99)
+        self.assertEqual(self.lds.read_dword(last_dword_addr), 150)
+
+
 if __name__ == "__main__":
     unittest.main()
