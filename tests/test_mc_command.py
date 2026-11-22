@@ -59,7 +59,7 @@ class SplitCommandTest(unittest.TestCase):
         want = ['"keep these quotes"', "C:\\output folder\\", ""]
         command = [sys.executable, "-c", "import json, sys; print(json.dumps(sys.argv[1:]))", *want]
         args = mc_command.split_command(subprocess.list2cmdline(command))
-        result = mc_command.run(args, capture_output=True, check=True, text=True)
+        result = mc_command.run(args, capture_output=True, check=True, text=True, errors="replace")
         self.assertEqual(json.loads(result.stdout), want)
 
     def test_windows_quoted_option_value_keeps_spaces_and_backslashes(self) -> None:
@@ -142,7 +142,7 @@ class MissingLlvmMcTest(unittest.TestCase):
 
     def test_run_names_the_command_and_how_to_set_it(self):
         with self.assertRaises(SystemExit) as cm:
-            mc_command.run([self.missing, "-show-encoding"], input="", capture_output=True, text=True)
+            mc_command.run([self.missing, "-show-encoding"], input="", capture_output=True, text=True, errors="replace")
         message = str(cm.exception.code)
         self.assertIn(f"'{self.missing}' could not be started", message)
         self.assertIn("LLVM_MC", message)
@@ -151,12 +151,12 @@ class MissingLlvmMcTest(unittest.TestCase):
 
     def test_run_names_the_tools_own_option(self):
         with self.assertRaises(SystemExit) as cm:
-            mc_command.run([self.missing], flag="--llvm-mc", input="", capture_output=True, text=True)
+            mc_command.run([self.missing], flag="--llvm-mc", input="", capture_output=True, text=True, errors="replace")
         self.assertIn("set LLVM_MC (or pass --llvm-mc)", str(cm.exception.code))
 
     def test_run_passes_a_command_that_starts_through(self):
         r = mc_command.run([sys.executable, "-c", "import sys; print(sys.stdin.read()); sys.exit(3)"],
-                           input="hi", capture_output=True, text=True)
+                           input="hi", capture_output=True, text=True, errors="replace")
         self.assertEqual((r.returncode, r.stdout.strip()), (3, "hi"))
 
     def test_every_tool_that_assembles_gives_one_line(self):
@@ -178,8 +178,8 @@ class MissingLlvmMcTest(unittest.TestCase):
         env = dict(os.environ, LLVM_MC=self.missing)
         for name, argv in tools.items():
             with self.subTest(tool=name):
-                p = subprocess.run([sys.executable, "-I", *argv], capture_output=True, text=True, env=env,
-                                   cwd=self.tmp.name, timeout=300)
+                p = subprocess.run([sys.executable, "-I", *argv], capture_output=True, text=True,
+                                   errors="replace", env=env, cwd=self.tmp.name, timeout=300)
                 self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
                 self.assertNotIn("Traceback", p.stderr)
                 self.assertIn("could not be started", p.stderr)
