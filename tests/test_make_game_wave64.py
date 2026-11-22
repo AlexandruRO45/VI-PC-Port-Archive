@@ -229,6 +229,66 @@ class Rdna2AmdWindowsTest(unittest.TestCase):
         self.assertTrue(self.decide(real_format(("AMD Radeon RX 6700", 64, ALL)), self.RX6700, mode="on")[0])
 
 
+class MeshComputeTest(unittest.TestCase):
+    """BUILD-629: with --mesh-compute every mesh shader is a compute shader, so auto needs only a 64-wide compute
+    path. An RX 5000 (RDNA1) has no mesh stage, so native64 is false there; compute_native64 decides instead."""
+
+    RX5700 = ('{"device": "AMD Radeon RX 5700", "native64": false, "compute_native64": true, '
+              '"mesh_in_supported_stages": false, "rdna2_amd_windows": false}')
+
+    def decide(self, vulkaninfo, tool, mesh_compute, mode="auto"):
+        def fake_run(args, **kw):
+            if os.path.basename(str(args[-1])) == "vk_subgroup_info.py":
+                return subprocess.CompletedProcess(args, 0 if "native64" in tool else 1, stdout=tool, stderr="")
+            return subprocess.CompletedProcess(args, 0, stdout=vulkaninfo, stderr="")
+        logged = []
+        with mock.patch.object(make_game.shutil, "which", return_value="vulkaninfo"), \
+                mock.patch.object(make_game.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(make_game, "log", logged.append):
+            return make_game.wave64_emulate(mode, mesh_compute), logged
+
+    def test_rdna1_with_mesh_compute_leaves_emulation_off(self):
+        on, logged = self.decide(vulkaninfo_text(64), self.RX5700, mesh_compute=True)
+        self.assertFalse(on)
+        self.assertIn("wave64 emulation off", logged[-1])
+
+    def test_rdna1_without_mesh_compute_is_unchanged(self):
+        on, logged = self.decide(vulkaninfo_text(64), self.RX5700, mesh_compute=False)
+        self.assertTrue(on)
+        self.assertIn("both compute and mesh", logged[-1])
+
+    def test_mesh_compute_without_a_64_wide_compute_path_turns_it_on(self):
+        tool = '{"native64": false, "compute_native64": false}'
+        on, logged = self.decide(vulkaninfo_text(64), tool, mesh_compute=True)
+        self.assertTrue(on)
+        self.assertIn("compute (--mesh-compute)", logged[-1])
+
+    def test_an_older_tool_without_compute_native64_falls_back_to_native64(self):
+        self.assertTrue(self.decide(vulkaninfo_text(64), '{"native64": false}', mesh_compute=True)[0])
+        self.assertFalse(self.decide(vulkaninfo_text(64), '{"native64": true}', mesh_compute=True)[0])
+
+    def test_a_32_wide_device_still_turns_it_on(self):
+        # vulkaninfo's smallest maximum wins, as without --mesh-compute: compute_native64 can't override it.
+        self.assertTrue(self.decide(vulkaninfo_text(64, 32), self.RX5700, mesh_compute=True)[0])
+
+    def test_rdna2_exemption_uses_the_compute_answer_with_mesh_compute(self):
+        tool = ('{"device": "AMD Radeon RX 6700", "native64": false, "compute_native64": true, '
+                '"rdna2_amd_windows": true}')
+        two = vulkaninfo_text(32, 64)
+        self.assertFalse(self.decide(two, tool, mesh_compute=True)[0])
+        self.assertTrue(self.decide(two, tool, mesh_compute=False)[0])
+
+    def test_explicit_modes_ignore_mesh_compute(self):
+        self.assertTrue(self.decide(vulkaninfo_text(64), self.RX5700, mesh_compute=True, mode="on")[0])
+        self.assertFalse(self.decide(vulkaninfo_text(32), self.RX5700, mesh_compute=True, mode="off")[0])
+
+    def test_native64_of(self):
+        self.assertIs(make_game.native64_of({"native64": True, "compute_native64": False}), True)
+        self.assertIs(make_game.native64_of({"native64": True, "compute_native64": False}, True), False)
+        self.assertIs(make_game.native64_of({"native64": False}, True), False)
+        self.assertIsNone(make_game.native64_of({}, True))
+
+
 class KeepEmulatedFlagTest(unittest.TestCase):
     """Only the default auto may keep emulated shaders; an explicit on or off is taken as given."""
 

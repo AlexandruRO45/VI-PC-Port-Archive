@@ -723,6 +723,9 @@ class QueryTest(unittest.TestCase):
             ("missing_mesh_stage_bit", True, 32, 64, vk_info.VK_SHADER_STAGE_COMPUTE_BIT, True, False, False, 32),
             ("no_required_stage_bits", True, 32, 64, 0, False, False, False, 32),
         ]
+        # compute_native64 only needs the compute stage: the RDNA1 case (no mesh stage) is the one that differs.
+        compute_only_true = {"typical_32_64_both_stages", "exact_64_64_boundary", "range_16_128_includes_64",
+                             "extra_stage_bits_allowed", "missing_mesh_stage_bit"}
         for label, sgc, lo, hi, stages, want_comp, want_mesh, want_native64, subgroup_size in cases:
             with self.subTest(case=label):
                 dev = FakeDevice(
@@ -745,12 +748,35 @@ class QueryTest(unittest.TestCase):
                     "compute_in_supported_stages": True,
                     "mesh_in_supported_stages": True,
                     "native64": want_native64,
+                    "compute_native64": label in compute_only_true,
                     "per_vertex_inputs": True,
                     "vendor_id": 0,
                     "device_id": 0,
                     "driver_id": 1,
                     "rdna2_amd_windows": False,
                 })
+
+    def test_rdna1_without_a_mesh_stage(self):
+        """BUILD-629: an RX 5000 (RDNA1) has no mesh shaders, so neither stage mask has the mesh bit. Compute still
+        runs 64-wide, by default or by required size, which is all --mesh-compute output needs."""
+        compute = vk_info.VK_SHADER_STAGE_COMPUTE_BIT
+        for label, sgc, required, default_size, want in (
+                ("required_size", True, compute, 32, True),
+                ("default_64", False, 0, 64, True),
+                ("neither", False, 0, 32, False)):
+            with self.subTest(case=label):
+                res, _vk = self._run_query(FakeDevice(subgroup_size_control=sgc, subgroup_size=default_size,
+                                                      subgroup_supported_stages=compute | 0x10,
+                                                      required_subgroup_size_stages=required))
+                self.assertFalse(res["mesh_in_supported_stages"])
+                self.assertFalse(res["native64"])
+                self.assertIs(res["compute_native64"], want)
+
+    def test_compute_native64_needs_compute_in_the_supported_stages(self):
+        # Required-size control alone isn't enough: subgroup operations must be supported in compute.
+        res, _vk = self._run_query(FakeDevice(subgroup_size=64, subgroup_supported_stages=0x10,
+                                              required_subgroup_size_stages=vk_info.VK_SHADER_STAGE_COMPUTE_BIT))
+        self.assertFalse(res["compute_native64"])
 
     def test_per_vertex_inputs(self):
         """PerVertexKHR needs fragmentShaderBarycentric, and MoltenVK can't compile it to MSL either way."""

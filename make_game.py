@@ -915,18 +915,20 @@ def smallest_max_subgroup(vulkaninfo_text: str):
     return min(per_device)
 
 
-def wave64_settings(mode: str) -> tuple[bool, bool]:
+def wave64_settings(mode: str, mesh_compute: bool = False) -> tuple[bool, bool]:
     """Return whether to translate with emulation and whether to reuse emulated shaders. A wave64 compute or mesh
     shader is only exact without it when the GPU gives it 64-wide subgroups; with it, it is exact on any subgroup
     size, at the cost of a workgroup barrier per segment. "auto" keeps emulation off on native-wave64 RDNA2
     under the AMD Windows driver. Elsewhere it turns emulation on unless every Vulkan device reports
-    maxSubgroupSize >= 64 and the runtime probe does not rule out native wave64."""
+    maxSubgroupSize >= 64 and the runtime probe does not rule out native wave64. With mesh_compute
+    (--mesh-compute) every mesh shader becomes a compute shader, so a 64-wide compute path is enough: that is
+    what lets RDNA1, which has no mesh stage, keep native wave64 (BUILD-629)."""
     if mode == "on":
         return True, False
     if mode == "off":
         return False, False
     gpu = runtime_gpu_info()
-    native64 = bool(gpu["native64"]) if "native64" in gpu else None
+    native64 = native64_of(gpu, mesh_compute)
     if gpu.get("rdna2_amd_windows") and native64:
         # #857: AMD's Windows compiler for RDNA2 crashes on many emulated LDS compute pipelines.
         # The runtime probe can identify that GPU even when vulkaninfo is unavailable.
@@ -948,16 +950,26 @@ def wave64_settings(mode: str) -> tuple[bool, bool]:
         return True, True
     on = size < 64
     if not on and native64 is False:
-        log(f"shaders: smallest maximum subgroup size is {size}, but the Vulkan query found no 64-wide path for both "
-            "compute and mesh (fixed default size or required-size control): wave64 emulation on")
+        stages = "compute (--mesh-compute)" if mesh_compute else "both compute and mesh"
+        log(f"shaders: smallest maximum subgroup size is {size}, but the Vulkan query found no 64-wide path for "
+            f"{stages} (fixed default size or required-size control): wave64 emulation on")
         return True, True
     log(f"shaders: smallest maximum subgroup size is {size}: wave64 emulation {'on' if on else 'off'}")
     return on, True
 
 
-def wave64_emulate(mode: str) -> bool:
+def wave64_emulate(mode: str, mesh_compute: bool = False) -> bool:
     """Whether a new translation uses wave64 emulation."""
-    return wave64_settings(mode)[0]
+    return wave64_settings(mode, mesh_compute)[0]
+
+
+def native64_of(info: dict, mesh_compute: bool = False):
+    """vk_subgroup_info.py's native64, or its compute_native64 when mesh shaders are translated to compute
+    (--mesh-compute). An answer without compute_native64 (an older tool) falls back to native64. None when the
+    answer has neither key."""
+    if mesh_compute and "compute_native64" in info:
+        return bool(info["compute_native64"])
+    return bool(info["native64"]) if "native64" in info else None
 
 
 def runtime_gpu_info() -> dict:
@@ -1589,7 +1601,7 @@ def main() -> int:
             stages = [s for s in stages if s not in WINDOWS_ONLY]
             log(f"{', '.join(WINDOWS_ONLY)}: left out, the cross-build needs {'; '.join(lacking)} "
                 "(or pass --runtime-build)")
-    emulate, keep_emulated = (wave64_settings(a.wave64_emulate) if "shaders" in stages
+    emulate, keep_emulated = (wave64_settings(a.wave64_emulate, a.mesh_compute) if "shaders" in stages
                               else (False, a.wave64_emulate == "auto"))
     if "shaders" in stages and not a.f16_interp_fallback and runtime_gpu_per_vertex() is False:
         log("shaders: the GPU the runtime would use can't take PerVertexKHR inputs (MoltenVK, or no "

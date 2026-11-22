@@ -19,6 +19,9 @@ narrows which drivers the loader offers.
 native64 matches the current translated SPIR-V 1.5 modules, which do not allow varying subgroup sizes: either 64 can
 be required for both compute and mesh, or the default subgroupSize is 64 and subgroup operations are supported in
 both stages. SPIR-V 1.6 modules or stages created with ALLOW_VARYING_SUBGROUP_SIZE need a different check.
+compute_native64 is the same test for the compute stage alone: what make_game.py --mesh-compute needs, since every
+mesh shader is then a compute shader. A GPU without mesh shaders (RDNA1, the RX 5000 series) never has the mesh stage
+bit, so native64 is false there even when compute runs 64-wide.
 
 rdna2_amd_windows says whether the device is RDNA2 (gfx103x, by PCI device ID) under AMD's proprietary Windows driver.
 That driver's shader compiler crashes (an access violation in vkCreateComputePipelines) on many --wave64-emulate
@@ -260,6 +263,8 @@ def query() -> dict:
         can_require_64 = (sgc and lo <= 64 <= hi and compute_required and mesh_required and
                           compute_supported and mesh_supported)
         has_default_64 = subgroup_size == 64 and compute_supported and mesh_supported
+        compute_native64 = ((sgc and lo <= 64 <= hi and compute_required and compute_supported)
+                            or (subgroup_size == 64 and compute_supported))
         return {
             "device": name,
             "subgroup_size": subgroup_size,
@@ -271,6 +276,7 @@ def query() -> dict:
             "compute_in_supported_stages": compute_supported,
             "mesh_in_supported_stages": mesh_supported,
             "native64": bool(can_require_64 or has_default_64),
+            "compute_native64": bool(compute_native64),
             "per_vertex_inputs": per_vertex,
             "vendor_id": vendor,
             "device_id": device,
