@@ -1104,6 +1104,7 @@ public:
 
     bool ok() const { return fence_.semaphore() != VK_NULL_HANDLE; }
     VkSemaphore semaphore() const { return fence_.semaphore(); }
+    std::shared_ptr<void> retain_timeline() const { return fence_.retain(); }
 
     // A Vulkan timeline only increases; D3D12 allows setting a fence lower. Such a signal is reported and dropped.
     // A queue's claim also records the value as one the GPU will signal, which a later CPU signal must not overtake.
@@ -1132,7 +1133,10 @@ public:
         // the queue value may not be reached, and signalling then would break the same rule: the signal is dropped.
         leonida::VulkanContext* context = &context_;
         const VkSemaphore semaphore = fence_.semaphore();
-        context_.enqueue_fence_callback(semaphore, queued, [context, semaphore, queued, value, held = held_] {
+        context_.enqueue_fence_callback(semaphore, queued,
+                                        [context, semaphore, queued, value, held = held_,
+                                         lifetime = fence_.retain()] {
+            (void)lifetime;  // a cancelled asynchronous CPU signal must never see a destroyed VkSemaphore
             std::uint64_t now = 0;
             context->vk.vkGetSemaphoreCounterValue(context->device(), semaphore, &now);
             if (now >= queued && now < value) {
@@ -1302,7 +1306,7 @@ public:
         if (!f) return d3d12_trace::result(method, E_INVALIDARG);
         std::lock_guard lock(mutex_);
         if (!f->claim(value, true)) return d3d12_trace::result(method, S_OK);
-        return d3d12_trace::result(method, queue_.signal(f->semaphore(), value) ? S_OK : E_FAIL);
+        return d3d12_trace::result(method, queue_.signal(f->semaphore(), value, f->retain_timeline()) ? S_OK : E_FAIL);
     }
 
     HRESULT STDMETHODCALLTYPE Wait(ID3D12Fence* fence, UINT64 value) override {
@@ -1310,7 +1314,7 @@ public:
         Fence* f = Fence::from(fence);
         if (!f) return d3d12_trace::result(method, E_INVALIDARG);
         std::lock_guard lock(mutex_);
-        queue_.wait(f->semaphore(), value);
+        queue_.wait(f->semaphore(), value, f->retain_timeline());
         return d3d12_trace::result(method, S_OK);
     }
 

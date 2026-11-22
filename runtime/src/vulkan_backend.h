@@ -1377,28 +1377,42 @@ private:
 // A Vulkan timeline semaphore with D3D12 fence semantics for the host side.
 class VulkanFence {
 public:
+    // A queue may still have a Wait in CPU-side storage, or a Signal/Wait in flight, after the last
+    // ID3D12Fence COM reference is released. Own the Vulkan timeline separately from the COM wrapper.
+    // A queue retains this owner until its progress ticket completes; do not wait for the device here.
+    struct Timeline {
+        explicit Timeline(VulkanContext& ctx) : context(ctx) {}
+        ~Timeline() {
+            if (semaphore) context.vk.vkDestroySemaphore(context.device(), semaphore, nullptr);
+        }
+        VulkanContext& context;
+        VkSemaphore semaphore = VK_NULL_HANDLE;
+    };
+
     VulkanFence(VulkanContext& context, std::uint64_t initial) : context_(context) {
         VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
         type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
         type.initialValue = initial;
         VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
-        if (context.vk.vkCreateSemaphore(context.device(), &info, nullptr, &semaphore_) != VK_SUCCESS)
-            semaphore_ = VK_NULL_HANDLE;
-        if (semaphore_) context.holds().add_fence(semaphore_, initial);
+        timeline_ = std::make_shared<Timeline>(context);
+        if (context.vk.vkCreateSemaphore(context.device(), &info, nullptr, &timeline_->semaphore) != VK_SUCCESS)
+            timeline_.reset();
+        if (timeline_) context.holds().add_fence(semaphore(), initial);
     }
     ~VulkanFence() {
-        if (!semaphore_) return;
-        context_.holds().remove_fence(semaphore_);  // batches held on it can never run: dropped and reported
-        context_.vk.vkDestroySemaphore(context_.device(), semaphore_, nullptr);
+        if (!semaphore()) return;
+        context_.holds().remove_fence(semaphore());  // batches held on it can never run: dropped and reported
+        // Deferred destruction: an outstanding queue wait/signal holds timeline_ beyond this COM release.
     }
     VulkanFence(const VulkanFence&) = delete;
     VulkanFence& operator=(const VulkanFence&) = delete;
 
-    VkSemaphore semaphore() const { return semaphore_; }
+    VkSemaphore semaphore() const { return timeline_ ? timeline_->semaphore : VK_NULL_HANDLE; }
+    std::shared_ptr<void> retain() const { return timeline_; }
 
     std::uint64_t completed() const {
         std::uint64_t value = 0;
-        context_.vk.vkGetSemaphoreCounterValue(context_.device(), semaphore_, &value);
+        context_.vk.vkGetSemaphoreCounterValue(context_.device(), semaphore(), &value);
         return value;
     }
 
@@ -1407,10 +1421,10 @@ public:
     bool signal(std::uint64_t value) {
         if (value <= completed()) return false;
         VkSemaphoreSignalInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
-        info.semaphore = semaphore_;
+        info.semaphore = semaphore();
         info.value = value;
         if (context_.vk.vkSignalSemaphore(context_.device(), &info) != VK_SUCCESS) return false;
-        context_.holds().signaled(semaphore_, value);  // queues that held a batch for this value run it now
+        context_.holds().signaled(semaphore(), value);  // queues that held a batch for this value run it now
         context_.holds().pump_ready();
         return true;
     }
@@ -1419,14 +1433,15 @@ public:
     bool wait(std::uint64_t value, std::uint64_t timeout_ns) const {
         VkSemaphoreWaitInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
         info.semaphoreCount = 1;
-        info.pSemaphores = &semaphore_;
+        const VkSemaphore sem = semaphore();
+        info.pSemaphores = &sem;
         info.pValues = &value;
         return context_.vk.vkWaitSemaphores(context_.device(), &info, timeout_ns) == VK_SUCCESS;
     }
 
 private:
     VulkanContext& context_;
-    VkSemaphore semaphore_ = VK_NULL_HANDLE;
+    std::shared_ptr<Timeline> timeline_;
 };
 
 // One D3D12 command queue on one VkQueue. D3D12 lets one thread use a queue at a time per call and the COM wrapper
@@ -1593,7 +1608,7 @@ public:
 
     // ID3D12CommandQueue::Signal: the fence reaches `value` after all work submitted so far. Held behind earlier
     // held operations, so the fence does not run ahead of the work it follows.
-    bool signal(VkSemaphore fence, std::uint64_t value) {
+    bool signal(VkSemaphore fence, std::uint64_t value, std::shared_ptr<void> lifetime = {}) {
         bool ok = true;
         {
             std::lock_guard state(state_mutex_);
@@ -1602,9 +1617,10 @@ public:
                 op.kind = Deferred::Kind::signal;
                 op.fence = fence;
                 op.value = value;
+                op.signal_lifetime = std::move(lifetime);
                 hold(std::move(op));
             } else {
-                ok = submit(VK_NULL_HANDLE, fence, value);
+                ok = submit(VK_NULL_HANDLE, fence, value, std::move(lifetime));
             }
         }
         context_.holds().pump_ready();  // this Signal, or the hold above, may have made a held batch ready
@@ -1613,10 +1629,11 @@ public:
 
     // ID3D12CommandQueue::Wait: later submissions wait for the fence. A wait in a Vulkan batch only holds back that
     // batch, so it is kept and attached to the next submission (held on the CPU if no Signal reaches it yet).
-    void wait(VkSemaphore fence, std::uint64_t value) {
+    void wait(VkSemaphore fence, std::uint64_t value, std::shared_ptr<void> lifetime = {}) {
         std::lock_guard state(state_mutex_);
         waits_.push_back(fence);
         wait_values_.push_back(value);
+        if (lifetime) wait_lifetimes_.push_back(std::move(lifetime));
     }
 
     // ID3D12CommandQueue::SetMarker/BeginEvent/EndEvent: queue labels, between the submissions around them. An end
@@ -2000,9 +2017,11 @@ private:
         Kind kind = Kind::batch;
         std::vector<VkSemaphore> waits;
         std::vector<std::uint64_t> wait_values;
+        std::vector<std::shared_ptr<void>> wait_lifetimes;
         std::vector<CommandList> lists;  // batch: copies, so the application may Reset its lists after the call
         VkSemaphore fence = VK_NULL_HANDLE;  // signal
         std::uint64_t value = 0;
+        std::shared_ptr<void> signal_lifetime;
         DebugMarker::Kind marker_kind = DebugMarker::Kind::set;  // marker
         std::string label;
     };
@@ -2022,8 +2041,10 @@ private:
         if (op.kind != Deferred::Kind::marker) {
             op.waits = std::move(waits_);
             op.wait_values = std::move(wait_values_);
+            op.wait_lifetimes = std::move(wait_lifetimes_);
             waits_.clear();
             wait_values_.clear();
+            wait_lifetimes_.clear();
         }
         held_.push_back(std::move(op));
         context_.holds().held_changed(1);
@@ -2033,8 +2054,10 @@ private:
     void run(Deferred& op) {
         auto later_waits = std::move(waits_);
         auto later_values = std::move(wait_values_);
+        auto later_lifetimes = std::move(wait_lifetimes_);
         waits_ = std::move(op.waits);
         wait_values_ = std::move(op.wait_values);
+        wait_lifetimes_ = std::move(op.wait_lifetimes);
         switch (op.kind) {
         case Deferred::Kind::batch: {
             std::vector<const CommandList*> lists;
@@ -2046,7 +2069,7 @@ private:
             break;
         }
         case Deferred::Kind::signal:
-            if (!submit(VK_NULL_HANDLE, op.fence, op.value))
+            if (!submit(VK_NULL_HANDLE, op.fence, op.value, std::move(op.signal_lifetime)))
                 std::fprintf(stderr, "[rt] d3d12: a held Signal failed when it was released\n");
             break;
         case Deferred::Kind::marker:
@@ -2055,6 +2078,7 @@ private:
         }
         waits_ = std::move(later_waits);  // a failed submission leaves its waits behind: drop them with the batch
         wait_values_ = std::move(later_values);
+        wait_lifetimes_ = std::move(later_lifetimes);
     }
 
     bool ready(const Deferred& op) const { return !waits_pending(op.waits, op.wait_values); }
@@ -2119,6 +2143,25 @@ private:
         std::vector<std::shared_ptr<const TileHeapAllocation>> old_heaps;
         std::shared_ptr<SparseBuffer> buffer;
     };
+    struct InFlightFences {
+        std::uint64_t ticket = 0;  // the queue's own progress timeline value
+        std::vector<std::shared_ptr<void>> lifetimes;
+    };
+
+    // Called under state_mutex_, after a successful queue submission. Each guest fence used by the
+    // submission must survive until the queue progress timeline reaches ticket, independently of the
+    // application's COM references and of other queues' completion order.
+    void retain_submitted_fences(std::uint64_t ticket, std::shared_ptr<void> signaled = {}) {
+        auto lifetimes = std::move(wait_lifetimes_);
+        wait_lifetimes_.clear();
+        if (signaled) lifetimes.push_back(std::move(signaled));
+        if (!lifetimes.empty()) in_flight_fences_.push_back({ticket, std::move(lifetimes)});
+    }
+
+    void collect_fences(std::uint64_t done) {
+        while (!in_flight_fences_.empty() && in_flight_fences_.front().ticket <= done)
+            in_flight_fences_.pop_front();
+    }
 
     static bool valid_tiles(const SparseBuffer& buffer, BufferTileRegion region) {
         return region.count && region.first < buffer.tile_count && region.count <= buffer.tile_count - region.first;
@@ -2153,7 +2196,9 @@ private:
             binds.push_back({resource_offset, tile_size_in_bytes, memory, page.offset, 0});
         }
         if (binds.empty()) return true;
-        collect_bindings(completed());
+        const auto completed_ticket = completed();
+        collect_bindings(completed_ticket);
+        collect_fences(completed_ticket);
         auto semaphores = waits_;
         auto values = wait_values_;
         // Sparse binds are not ordered against work on the same Vulkan queue by submission order alone.
@@ -2186,6 +2231,7 @@ private:
             context_.record_submit_locked(progress_, ticket);
         }
         submitted_ = last_sparse_ = ticket;
+        retain_submitted_fences(ticket);
         waits_.clear();
         wait_values_.clear();
         for (auto it = changes.begin(); it != changes.end();) {
@@ -2214,6 +2260,7 @@ private:
         context_.drain_deleted_resources(context_.completed_retire_ticket());
         const auto done = completed();
         collect_bindings(done);
+        collect_fences(done);
         CommandSlot* reuse = nullptr;
         for (auto& slot : buffers_) {
             if (slot.ticket > done) continue;
@@ -2256,8 +2303,10 @@ private:
         return event;
     }
 
-    bool submit(VkCommandBuffer command_buffer, VkSemaphore fence, std::uint64_t value) {
+    bool submit(VkCommandBuffer command_buffer, VkSemaphore fence, std::uint64_t value,
+                std::shared_ptr<void> lifetime = {}) {
         if (context_.is_device_lost()) return false;
+        if (!in_flight_fences_.empty()) collect_fences(completed());
         const std::uint64_t ticket = submitted_ + 1;
         if (last_sparse_) collect_bindings(completed());
         std::span<const VkSemaphore> semaphores = waits_;
@@ -2304,12 +2353,14 @@ private:
             context_.mark_device_lost();
             waits_.clear();
             wait_values_.clear();
+            wait_lifetimes_.clear();
             return false;
         }
         const bool ok = (res == VK_SUCCESS);
         if (ok) {
             if (fence) context_.holds().signaled(fence, value);  // held batches waiting for it: the caller pumps
             submitted_ = ticket;
+            retain_submitted_fences(ticket, std::move(lifetime));
             waits_.clear();
             wait_values_.clear();
             for (auto& slot : buffers_)
@@ -2333,6 +2384,8 @@ private:
     std::deque<PendingBindings> pending_bindings_;
     std::vector<VkSemaphore> waits_;
     std::vector<std::uint64_t> wait_values_;
+    std::vector<std::shared_ptr<void>> wait_lifetimes_;  // pending guest Waits (not every internal wait)
+    std::deque<InFlightFences> in_flight_fences_;  // retired against this queue's progress semaphore
     // execute's working storage. Per queue like buffers_: one execute at a time on a queue, as acquire() and
     // submit() already assume; other queues prepare concurrently with their own.
     std::vector<PreparedList> prepared_;
