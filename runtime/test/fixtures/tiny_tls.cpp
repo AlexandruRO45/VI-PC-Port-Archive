@@ -22,6 +22,7 @@ volatile DWORD g_watched_thread = 0;
 int g_thread_attach_count = 0;
 int g_thread_detach_count = 0;
 int g_value_at_thread_attach = -1;
+int g_dllmain_thread_events = 0;
 
 void NTAPI tls_callback(PVOID base, DWORD reason, PVOID reserved) {
     ++g_callback_count;
@@ -60,7 +61,13 @@ extern "C" __declspec(dllexport) int __cdecl tiny_tls_thread_attach_count() { re
 extern "C" __declspec(dllexport) int __cdecl tiny_tls_thread_detach_count() { return g_thread_detach_count; }
 extern "C" __declspec(dllexport) int __cdecl tiny_tls_value_at_thread_attach() { return g_value_at_thread_attach; }
 
-BOOL WINAPI DllMain(HINSTANCE, DWORD, LPVOID) {
+extern "C" __declspec(dllexport) int __cdecl tiny_tls_dllmain_thread_events() { return g_dllmain_thread_events; }
+
+BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
     ++g_dllmain_count;
+    if (GetCurrentThreadId() == g_watched_thread && g_last_reason == reason) {
+        if (reason == DLL_THREAD_ATTACH && g_tls_value == 7) g_dllmain_thread_events |= 1;
+        if (reason == DLL_THREAD_DETACH && g_tls_value == 3) g_dllmain_thread_events |= 2;
+    }
     return TRUE;
 }

@@ -5,6 +5,7 @@
 // ~Loader() delivers process detach before unmapping initialised modules. The TLS slot and template are set up by load().
 // gta6rt_tls_host.dll must sit next to the executable; the loader reuses the module TLS index the OS assigns it.
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -34,6 +35,11 @@ struct Module {
     uint32_t entry_rva = 0;
     bool relocated = false;
     bool initialised = false;
+    bool is_dll = false;
+    bool thread_events_ready = false;  // read and updated under the TLS lock
+    std::atomic<bool> thread_calls_disabled{false};
+    Module* previous_thread_module = nullptr;
+    Module* next_thread_module = nullptr;
 
     // The image's exception directory (.pdata), registered with RtlAddFunctionTable by load() so that exception
     // dispatch and stack walks can unwind through its frames. Removed when the loader is destroyed.
@@ -84,8 +90,8 @@ public:
     const std::vector<Module*>& initialisation_order() const { return init_order_; }
 
     // Runs each loaded module's TLS callbacks and then its DllMain(DLL_PROCESS_ATTACH), dependencies first.
-    // Only DLLs get DllMain called: an EXE's entry point is the caller's to run. Throws on a corrupt TLS
-    // directory, a TLS callback outside its image, or a DllMain that returns FALSE.
+    // Initialised DLLs also receive thread notifications unless disabled. An EXE's entry point is the caller's.
+    // Throws on a corrupt TLS directory, a TLS callback outside its image, or a DllMain that returns FALSE.
     // TLS was already installed by load(), so this is safe to call on the loading thread without a second install.
     void initialise();
 
@@ -100,7 +106,7 @@ public:
     // Installs/removes this module's template copy in the calling thread's TEB slot. load() does this for its caller
     // and the thread events for threads started after it; both are no-ops on a thread that already has this module's
     // copy. Call install on a thread that existed before load(), before mapped code runs there, and uninstall before
-    // that thread exits. Only one TLS module can be installed in a thread. These do not run TLS callbacks (use
+    // that thread exits. These do not run TLS callbacks (use
     // run_tls_callbacks with DLL_THREAD_ATTACH/DETACH for that).
     void install_tls_for_thread(Module& m);
     void uninstall_tls_for_thread(Module& m);
@@ -113,7 +119,7 @@ public:
 
 private:
     void initialise(Module& m);
-    static void set_initialised(Module& m, bool value);
+    static void set_initialised(Module& m, bool value, bool thread_events_ready = false);
     Module& map_image(const std::filesystem::path& path);
     void initialize_tls(Module& m);
     void bind_imports(Module& m);

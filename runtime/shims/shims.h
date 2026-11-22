@@ -65,6 +65,7 @@ struct BundledModuleOps {
     void* (*load_bundled)(void* ctx, const std::string& dll_lower, bool& handled);
     void* (*get_proc)(void* ctx, void* module, const std::string& sym, bool& owns_handle);
     bool (*owns_handle)(void* ctx, void* module);
+    bool (*disable_thread_calls)(void* module);
 };
 void add_bundled_loader(void* ctx, const BundledModuleOps* ops);
 void remove_bundled_loader(void* ctx);
@@ -73,6 +74,7 @@ void* find_loaded_bundled_module(const std::string& dll_lower);
 void* load_bundled_module(const std::string& dll_lower, bool& handled);
 void* get_bundled_proc_address(void* module, const std::string& sym, bool& owns_handle);
 bool owns_bundled_module_handle(void* module);
+bool disable_bundled_thread_calls(void* module);
 
 // Test seam: called at the top of every unimplemented-import call with the address of rt_unimplemented's return
 // address slot (so a test can check stack alignment) and from inside the call (so it can walk the stack).

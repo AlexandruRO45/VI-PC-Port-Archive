@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "pe_loader.h"
+#include "../shims/shims.h"
 
 namespace {
 
@@ -241,10 +242,13 @@ void test_thread_events(const fs::path& dll) {
     const auto thread_attach = find_export<int(__cdecl*)()>(m, "tiny_tls_thread_attach_count");
     const auto thread_detach = find_export<int(__cdecl*)()>(m, "tiny_tls_thread_detach_count");
     const auto value_at_attach = find_export<int(__cdecl*)()>(m, "tiny_tls_value_at_thread_attach");
+    const auto dllmain_events = find_export<int(__cdecl*)()>(m, "tiny_tls_dllmain_thread_events");
 
     set(11);
     loader.initialise();
     check(m.initialised, "initialise() ran the module");
+    check(rt::shims::disable_bundled_thread_calls(m.base),
+          "the opt-out call recognizes the mapped DLL with static TLS");
 
     int seen = -1;
     int attach_inside = -1;
@@ -261,6 +265,7 @@ void test_thread_events(const fs::path& dll) {
     check(value_at_attach() == 7, "its TLS copy is in place when the callback runs (template value 7)");
     check(seen == 7, "the thread reads the template value, not the main thread's 11");
     check(detach_inside == 0 && thread_detach() == 1, "DLL_THREAD_DETACH runs once, when the thread ends");
+    check(dllmain_events() == 3, "after opt-out with static TLS, DllMain follows each callback with live worker TLS");
     check(get() == 11, "the main thread's value is unchanged");
 }
 

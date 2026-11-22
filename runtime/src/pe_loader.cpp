@@ -173,8 +173,12 @@ TlsHostModule load_tls_host_image(const std::filesystem::path& path, bool hook_t
     if (hook_thread_events) {
         // Only the primary helper reports thread attach/detach events; on_host_thread_event iterates all active slots.
         using SetThreadEvent = void(__cdecl*)(void(__cdecl*)(DWORD));
-        if (auto set = reinterpret_cast<SetThreadEvent>(GetProcAddress(host.module, "gta6rt_tls_host_set_thread_event")))
-            set(&on_host_thread_event);
+        auto set = reinterpret_cast<SetThreadEvent>(GetProcAddress(host.module, "gta6rt_tls_host_set_thread_event"));
+        if (!set) {
+            FreeLibrary(host.module);
+            return {};
+        }
+        set(&on_host_thread_event);
     }
     return host;
 }
@@ -244,13 +248,18 @@ struct ThreadTlsSlot {
 // Per-thread installation state for each reserved TLS slot.
 thread_local std::array<ThreadTlsSlot, kMaxMappedTlsModules> g_thread_tls_slots{};
 
-// Orders the TLS owners' publication, their `initialised` flags and their retirement against the thread events. Shared
-// in on_host_thread_event, exclusive only for those short writes (no allocation and no call that takes the Windows
-// loader lock, which the events run under).
+// Orders TLS slots, the thread notification list and module retirement against thread events. Exclusive
+// sections never call into the Windows loader. A mapped DllMain can disable notifications while dispatch
+// already holds a shared lock on this thread.
 SRWLOCK g_tls_lock = SRWLOCK_INIT;
+thread_local unsigned g_tls_shared_depth = 0;
 struct SharedTlsLock {
-    SharedTlsLock() { AcquireSRWLockShared(&g_tls_lock); }
-    ~SharedTlsLock() { ReleaseSRWLockShared(&g_tls_lock); }
+    SharedTlsLock() {
+        if (g_tls_shared_depth++ == 0) AcquireSRWLockShared(&g_tls_lock);
+    }
+    ~SharedTlsLock() {
+        if (--g_tls_shared_depth == 0) ReleaseSRWLockShared(&g_tls_lock);
+    }
     SharedTlsLock(const SharedTlsLock&) = delete;
     SharedTlsLock& operator=(const SharedTlsLock&) = delete;
 };
@@ -260,6 +269,39 @@ struct ExclusiveTlsLock {
     ExclusiveTlsLock(const ExclusiveTlsLock&) = delete;
     ExclusiveTlsLock& operator=(const ExclusiveTlsLock&) = delete;
 };
+
+Module* g_first_thread_module = nullptr;
+Module* g_last_thread_module = nullptr;
+
+// Appended in dependency order by load(). Map-only modules can answer DisableThreadLibraryCalls, but
+// dispatch reaches them only after their process attach has succeeded.
+void add_thread_module(Module& m) {
+    ExclusiveTlsLock lock;
+    m.previous_thread_module = g_last_thread_module;
+    if (g_last_thread_module) g_last_thread_module->next_thread_module = &m;
+    else g_first_thread_module = &m;
+    g_last_thread_module = &m;
+}
+
+void remove_thread_module(Module& m) {
+    ExclusiveTlsLock lock;
+    if (m.previous_thread_module) m.previous_thread_module->next_thread_module = m.next_thread_module;
+    else if (g_first_thread_module != &m) return;
+    else g_first_thread_module = m.next_thread_module;
+    if (m.next_thread_module) m.next_thread_module->previous_thread_module = m.previous_thread_module;
+    else g_last_thread_module = m.previous_thread_module;
+}
+
+bool disable_mapped_thread_calls(void* handle) {
+    SharedTlsLock lock;
+    for (Module* m = g_first_thread_module; m; m = m->next_thread_module) {
+        if (m->base != handle || !m->is_dll) continue;
+        // Windows 11 returned success for the static-TLS fixture but kept delivering its notifications.
+        if (m->tls_index == kNoTlsIndex) m->thread_calls_disabled.store(true, std::memory_order_relaxed);
+        return true;
+    }
+    return false;
+}
 
 // Puts the helper DLL's own block back in this thread's slot and frees the copy that replaced it. Uses only this
 // thread's record, so it also works after the module that installed the copy is gone.
@@ -351,36 +393,50 @@ void run_callbacks(Module& m, uint32_t reason, bool trace = false) {
     }
 }
 
-// Runs in gta6rt_tls_host.dll's DllMain for each thread the process starts or ends once the helper is loaded, under
-// the Windows loader lock, on that thread. A new thread gets its own copy of each active TLS owner's template; an
-// ending one gives each helper's block back before the Windows loader frees it. TLS callbacks get the thread events
-// only after the module's DLL_PROCESS_ATTACH (initialise()), as the Windows loader orders them.
+// Runs under the Windows loader lock in the host helper's DllMain. Install every TLS block before
+// guest code runs and keep them all available through detach. Callback and DllMain order follows
+// process attach order (reversed on detach).
 void __cdecl on_host_thread_event(DWORD reason) {
     SharedTlsLock lock;
-    try {
-        if (reason == DLL_THREAD_ATTACH) {
-            for (size_t slot = 0; slot < kMaxMappedTlsModules; ++slot) {
-                Module* m = g_tls_slot_owners[slot].load();
-                if (!m) continue;
-                install_thread_block(*m);
-                if (m->initialised) run_callbacks(*m, DLL_THREAD_ATTACH);
-            }
-        } else if (reason == DLL_THREAD_DETACH) {
-            for (size_t i = kMaxMappedTlsModules; i-- > 0;) {
-                Module* m = g_tls_slot_owners[i].load();
-                if (m && g_thread_tls_slots[i].module == m &&
-                    g_thread_tls_slots[i].generation == m->tls_generation) {
-                    if (m->initialised) run_callbacks(*m, DLL_THREAD_DETACH);
-                    uninstall_thread_block(*m);
-                } else {
-                    release_thread_slot(i);  // installed by a module whose Loader is gone (or nothing to do)
+    const bool attaching = reason == DLL_THREAD_ATTACH;
+    auto log_error = [&](const char* error) {
+        std::fprintf(stderr, "[rt] loader: thread %s: %s\n", attaching ? "attach" : "detach", error);
+    };
+    if (attaching) {
+        for (auto& owner : g_tls_slot_owners) {
+            if (Module* m = owner.load()) {
+                try {
+                    install_thread_block(*m);
+                } catch (const std::exception& e) {
+                    log_error(e.what());
                 }
             }
         }
-    } catch (const std::exception& e) {
-        // Nothing may leave DllMain. The thread runs on without the module's TLS (attach) or keeps the copy (detach).
-        std::fprintf(stderr, "[rt] loader: thread %s: %s\n", reason == DLL_THREAD_ATTACH ? "attach" : "detach",
-                     e.what());
+    }
+    for (Module* m = attaching ? g_first_thread_module : g_last_thread_module; m;
+         m = attaching ? m->next_thread_module : m->previous_thread_module) {
+        if (!m->thread_events_ready) continue;
+        if (m->tls_slot < kMaxMappedTlsModules) {
+            const auto& entry = g_thread_tls_slots[m->tls_slot];
+            if (entry.module != m || entry.generation != m->tls_generation) continue;
+        }
+        try {
+            run_callbacks(*m, reason);
+            if (m->is_dll && m->entry_rva && !m->thread_calls_disabled.load(std::memory_order_relaxed)) {
+                auto entry = reinterpret_cast<BOOL(NTAPI*)(void*, DWORD, void*)>(m->base + m->entry_rva);
+                entry(m->base, reason, nullptr);
+            }
+        } catch (const std::exception& e) {
+            log_error(e.what());
+        } catch (...) {
+            log_error("mapped thread callback threw");
+        }
+    }
+    if (!attaching) {
+        for (size_t slot = kMaxMappedTlsModules; slot-- > 0;) {
+            if (Module* m = g_tls_slot_owners[slot].load()) uninstall_thread_block(*m);
+            release_thread_slot(slot);  // also releases a copy left by a retired module
+        }
     }
 }
 
@@ -493,6 +549,7 @@ const shims::BundledModuleOps kBundledOps{
     &bundled_load,
     &bundled_get_proc,
     &bundled_owns_handle,
+    &disable_mapped_thread_calls,
 };
 }  // namespace
 
@@ -508,7 +565,7 @@ Loader::~Loader() {
     for (auto it = init_order_.rbegin(); it != init_order_.rend(); ++it) {
         Module& m = **it;
         if (!m.initialised) continue;  // a map-only load never opts in to running image code
-        set_initialised(m, false);  // under the TLS lock: thread events stop running its callbacks
+        set_initialised(m, false);  // stop thread notifications before process detach
         try {
             run_tls_callbacks(m, DLL_PROCESS_DETACH);
         } catch (const std::exception& e) {
@@ -516,8 +573,7 @@ Loader::~Loader() {
             // error; report it and still let DllMain release resources before the image is freed.
             std::fprintf(stderr, "[rt] TLS process detach failed for %s: %s\n", m.name.c_str(), e.what());
         }
-        auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
-        if ((nt->FileHeader.Characteristics & IMAGE_FILE_DLL) && m.entry_rva) {
+        if (m.is_dll && m.entry_rva) {
             auto entry = reinterpret_cast<BOOL(NTAPI*)(void*, DWORD, void*)>(m.base + m.entry_rva);
             entry(m.base, DLL_PROCESS_DETACH, nullptr);  // explicit unload; the return value is ignored
         }
@@ -525,6 +581,7 @@ Loader::~Loader() {
     shims::remove_bundled_loader(this);
     shims::remove_module_lookup(this);
     for (auto* m : order_) {
+        remove_thread_module(*m);
         // TLS state must go away before the image and its TLS block are unmapped.
         if (m->tls_index != kNoTlsIndex && m->tls_slot < kMaxMappedTlsModules) {
             // Retired first, under the lock: no thread event installs it or runs its callbacks after this, and a
@@ -554,6 +611,7 @@ Module& Loader::load(const std::filesystem::path& image) {
     protect_sections(m);
     register_unwind(m);
     init_order_.push_back(&m);
+    if (m.is_dll || m.tls_index != kNoTlsIndex) add_thread_module(m);
     if (startup_trace::enabled())
         startup_trace::event("map", "\"module\":" + startup_trace::quote(m.name) +
                                         ",\"base\":" + startup_trace::quote(startup_trace::hex(reinterpret_cast<uint64_t>(m.base))) +
@@ -687,13 +745,17 @@ void Loader::initialise() {
 
 void Loader::initialise(Module& m) {
     if (m.initialised) return;
-
+    if (m.is_dll && m.entry_rva && m.tls_index == kNoTlsIndex) {
+        // A DLL without static TLS still needs the primary helper to forward thread events.
+        std::lock_guard alloc_lock(g_tls_alloc_mutex);
+        if (!ensure_tls_host(0).module)
+            throw std::runtime_error(m.name + ": gta6rt_tls_host.dll is required for thread notifications");
+    }
     // TLS was installed by load(); initialise() only delivers the events, so no slot is allocated or written twice.
     run_tls_callbacks(m, DLL_PROCESS_ATTACH);
 
     // Only a DLL gets DllMain. An EXE's entry point has a different signature and is the caller's to run.
-    auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
-    if ((nt->FileHeader.Characteristics & IMAGE_FILE_DLL) && m.entry_rva) {
+    if (m.is_dll && m.entry_rva) {
         if (m.entry_rva >= m.size) throw std::runtime_error(m.name + ": the entry point is outside the image");
         auto entry = reinterpret_cast<BOOL(NTAPI*)(void*, DWORD, void*)>(m.base + m.entry_rva);
         const BOOL ok = entry(m.base, DLL_PROCESS_ATTACH, nullptr);
@@ -705,14 +767,14 @@ void Loader::initialise(Module& m) {
             throw std::runtime_error(m.name + ": DllMain returned FALSE");
         }
     }
-    set_initialised(m, true);
+    set_initialised(m, true, /*thread_events_ready=*/true);
 }
 
-// Under the TLS lock, which orders it against the thread events: they run a module's TLS callbacks only while this is
-// true (from initialise() until ~Loader starts the process detach).
-void Loader::set_initialised(Module& m, bool value) {
+// A failed process attach still gets process detach, but never enters thread notification dispatch.
+void Loader::set_initialised(Module& m, bool value, bool thread_events_ready) {
     ExclusiveTlsLock lock;
     m.initialised = value;
+    m.thread_events_ready = thread_events_ready;
 }
 
 Module& Loader::map_image(const std::filesystem::path& path) {
@@ -746,6 +808,7 @@ Module& Loader::map_image(const std::filesystem::path& path) {
     m->preferred_base = oh.ImageBase;
     m->size = oh.SizeOfImage;
     m->entry_rva = oh.AddressOfEntryPoint;
+    m->is_dll = (nt->FileHeader.Characteristics & IMAGE_FILE_DLL) != 0;
     by_name_[lower(m->name)] = m;
     order_.push_back(m);
 
