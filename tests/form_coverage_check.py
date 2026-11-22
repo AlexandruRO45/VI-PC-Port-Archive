@@ -141,6 +141,39 @@ def check_jump_tables():
         assert mixed["blocked_by_skip"] == sorted(f"Integer {m}" for m in switch - fc.masm_mnemonics(BRANCH))
 
 
+def check_scalar_float():
+    """scalar_float.asm: the first SSE and SSE2 forms, counted only while cpu_aot_scalar_float passes."""
+    root = Path(fc.__file__).resolve().parents[1]
+    forms = fc.masm_mnemonics((root / "tests" / "cpu" / "scalar_float.asm").read_text(encoding="utf-8"))
+    reference = fc.load_reference("x64_zen2.tsv")
+    groups = {}
+    for group, form in fc.x64_forms(forms, reference):
+        groups.setdefault(group, set()).add(form)
+    assert not [form for form in forms if not fc.x64_forms({form}, reference)]
+    assert groups["SSE"] == {"movss", "movaps", "addss", "subss", "mulss", "divss", "cvtsi2ss", "cvttss2si",
+                             "ucomiss", "comiss", "xorps"}, sorted(groups["SSE"])
+    assert groups["SSE2"] == {"addsd", "subsd", "mulsd", "divsd", "cvtsi2sd", "cvttsd2si", "cvtss2sd", "cvtsd2ss",
+                              "ucomisd", "comisd", "xorpd"}, sorted(groups["SSE2"])
+    # The reference files a mnemonic under its oldest encoding, so these three sit outside both groups.
+    assert groups["MMX"] == {"movd", "movq", "pxor"} and "movsd" in groups["Integer"]
+    with tempfile.TemporaryDirectory() as tmp:
+        sample = sample_repo(tmp, {"scalar_float": "; coverage: source cpu_aot_scalar_float\nf PROC\n    xorps xmm0, xmm0\n    cvtsi2sd xmm0, ecx\n"
+                                                   "    ucomisd xmm0, xmm1\n    jp short l\nl:  ret\nf ENDP\nEND\n"})
+        passed = fc.measure({"cpu_aot_scalar_float": "pass"}, sample)["x64_zen2"]
+        skipped = fc.measure({"cpu_aot_scalar_float": "skip"}, sample)["x64_zen2"]
+        failed = fc.measure({"cpu_aot_jump_tables": "pass", "cpu_aot_scalar_float": "fail"}, sample)["x64_zen2"]
+        assert passed["covered"] == 5 and passed["groups"]["SSE"]["covered"] == 1
+        assert passed["groups"]["SSE2"]["covered"] == 2 and passed["groups"]["Integer"]["covered"] == 2
+        assert skipped["covered"] == 0 and skipped["blocked_by_skip"] == [
+            "Integer jp", "Integer ret", "SSE xorps", "SSE2 cvtsi2sd", "SSE2 ucomisd"]
+        assert failed["covered"] == 0 and failed["blocked_by_skip"] == []
+    # In the real repository the fixture is classified and counts with its own test only.
+    real = fc.measure({"cpu_aot_scalar_float": "pass"})
+    assert real["fixtures"]["scalar_float.asm"] == "pass" and "scalar_float.asm" not in real["unclassified"]
+    assert [real["x64_zen2"]["groups"][group]["covered"] for group in ("SSE", "SSE2")] == [11, 11]
+    assert fc.measure({"cpu_aot_jump_tables": "pass"})["x64_zen2"]["groups"]["SSE"]["covered"] == 0
+
+
 def check_unclassified():
     """A CPU fixture missing from CPU_FIXTURES is reported, never counted, never fatal. Shader text in a
     test file counts for nothing: only translation records do."""
@@ -247,7 +280,6 @@ def check_shader_records():
     rejected_forms = {
         "s_and_saveexec_b64", "s_or_saveexec_b64", "s_andn2_saveexec_b64",
         "s_cselect_b64", "s_bfe_u64", "s_bfe_i64", "s_bfm_b32",
-        "s_add_u32", "s_and_b32", "s_not_b32", "s_cselect_b32",
     }
     assert not (pixel.ACCEPTED & rejected_forms), pixel.ACCEPTED & rejected_forms
     for name in ("gfx1013.tsv", "rdna2.tsv"):
@@ -255,6 +287,17 @@ def check_shader_records():
         assert scalar64_forms <= covered, (name, scalar64_forms - covered)
         assert sopc_forms <= covered, (name, sopc_forms - covered)
         assert vop2_forms <= covered, (name, vop2_forms - covered)
+    # The scalar ALU fixture counts its SOP1, SOP2, SOPK and SOPC forms; the neighbours the controls
+    # reject (s_addc_u32, s_cmp_eq_u64, s_cmpk_eq_u32, s_cselect_b64) stay out.
+    scalar = {"s_movk_i32", "s_not_b32", "s_add_u32", "s_sub_u32", "s_add_i32", "s_sub_i32", "s_mul_i32",
+              "s_min_u32", "s_max_u32", "s_min_i32", "s_max_i32", "s_and_b32", "s_or_b32", "s_xor_b32",
+              "s_andn2_b32", "s_orn2_b32", "s_lshl_b32", "s_lshr_b32", "s_ashr_i32", "s_cselect_b32",
+              *(f"s_cmp_{r}_{t}32" for r in ("eq", "lg", "gt", "ge", "lt", "le") for t in "iu")}
+    for name in ("gfx1013.tsv", "rdna2.tsv"):
+        forms = fc.gfx_forms(pixel.ACCEPTED, fc.load_reference(name))
+        assert {form for _, form in forms} >= scalar, sorted(scalar - {form for _, form in forms})
+        assert not {"s_addc_u32", "s_cmp_lt_u64", "s_cmpk_eq_u32", "s_cselect_b64"} & {f for _, f in forms}
+        assert {group for group, form in forms if form in scalar} == {"SOP1", "SOP2", "SOPC", "SOPK"}
 
 
 def check_parsing():
@@ -527,6 +570,7 @@ if __name__ == "__main__":
     check_denominators()
     check_example()
     check_jump_tables()
+    check_scalar_float()
     check_unclassified()
     check_local_cpu_registration()
     check_cpu_records()

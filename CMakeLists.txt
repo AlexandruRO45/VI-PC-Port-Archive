@@ -756,6 +756,19 @@ if(EXISTS "${INTAKE_PYTHON}")
     target_compile_definitions(cpu_tail_altered_provider PRIVATE ALTER_RETURN)
     add_test(NAME cpu_aot_import_tail_jump COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/tail_import_check.py" "$<TARGET_FILE:cpu_register_probe>" ${tail_files})
+
+    foreach(variant IN ITEMS original swapped)
+        cpu_asm_fixture(cpu_float_${variant} scalar_float)
+        cpu_translation(cpu_float_${variant} cpu_sse_aot
+            "blend_ss=f:ffqf,blend_sd=d:ddqd,convert=q:fdq,from_int=d:qq,classify_ss=q:ff,classify_sd=q:dq,round_trip=f:f,zero_xorps=d:d,zero_pxor=d:d,zero_xorpd=d:d")
+        add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/cpu_float_${variant}_lifted.cpp" APPEND
+            DEPENDS tools/cpu_switch_aot.py)
+    endforeach()
+    target_compile_definitions(cpu_float_swapped PRIVATE SWAP_OPERANDS)
+    add_test(NAME cpu_aot_scalar_float COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/scalar_float_check.py"
+        "$<TARGET_FILE:cpu_float_original>" "$<TARGET_FILE:cpu_float_original_lifted>"
+        "$<TARGET_FILE:cpu_float_swapped>" "$<TARGET_FILE:cpu_float_swapped_lifted>")
     cpu_asm_fixture(cpu_chained chained)
     cpu_translation(cpu_chained cpu_chained_aot choose_value)
     cpu_asm_fixture(cpu_chained_jne chained)
@@ -782,6 +795,25 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME xmem_attribute_scan COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/xmem_attribute_scan_check.py" "$<TARGET_FILE:cpu_xmem_attributes>"
         "$<TARGET_FILE:cpu_xmem_delay>")
+
+    # VEX.128 16-bit packed-integer leaf functions, an arithmetic-shift control, and their C++.
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_vex_words_${variant} vex_words)
+        set(vex_lifted "${CMAKE_CURRENT_BINARY_DIR}/cpu_vex_words_${variant}_lifted.cpp")
+        add_custom_command(OUTPUT "${vex_lifted}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_vex_aot.py"
+                "$<TARGET_FILE:cpu_vex_words_${variant}>" "${vex_lifted}" widen_mix word_ops shift_edges
+                store_reload aligned_ops
+            DEPENDS cpu_vex_words_${variant} tools/cpu_vex_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py
+            VERBATIM)
+        add_library(cpu_vex_words_${variant}_lifted SHARED "${vex_lifted}")
+    endforeach()
+    target_compile_definitions(cpu_vex_words_altered PRIVATE LOGICAL_SHIFT)
+    add_test(NAME cpu_aot_vex_words COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/vex_words_check.py"
+        "$<TARGET_FILE:cpu_vex_words_original>" "$<TARGET_FILE:cpu_vex_words_original_lifted>"
+        "$<TARGET_FILE:cpu_vex_words_altered>" "$<TARGET_FILE:cpu_vex_words_altered_lifted>")
+    set_tests_properties(cpu_aot_vex_words PROPERTIES SKIP_RETURN_CODE 77)
     cpu_asm_fixture(cpu_bink_heap bink_heap)
     add_library(cpu_bink_heap_provider SHARED tests/cpu/bink_heap_provider.cpp src/era_heap.cpp)
     target_include_directories(cpu_bink_heap_provider PRIVATE src)
@@ -1075,6 +1107,17 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_crypto_sha COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/crypto_sha.py"
         check "$<TARGET_FILE:cpu_crypto_sha>" "$<TARGET_FILE:cpu_crypto_sha_lifted>")
     set_tests_properties(cpu_aot_crypto_sha PROPERTIES SKIP_RETURN_CODE 77)
+
+    cpu_asm_fixture(cpu_mul_div mul_div)
+    set(mul_div_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_mul_div_lifted.cpp")
+    add_custom_command(OUTPUT "${mul_div_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/mul_div.py"
+            emit "$<TARGET_FILE:cpu_mul_div>" "${mul_div_fixture}"
+        DEPENDS cpu_mul_div tests/cpu/mul_div.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_mul_div_lifted SHARED "${mul_div_fixture}")
+    add_test(NAME cpu_aot_mul_div COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/mul_div.py"
+        check "$<TARGET_FILE:cpu_mul_div>" "$<TARGET_FILE:cpu_mul_div_lifted>")
     cpu_translation(cpu_callback cpu_chained_aot call_context CALLBACK_OFFSET 8)
     cpu_asm_fixture(cpu_xlatb xlatb)
     # The lifted DLL and three mutated controls that the check requires to mismatch.
