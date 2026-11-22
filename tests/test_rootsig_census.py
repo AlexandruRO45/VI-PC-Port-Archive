@@ -271,6 +271,68 @@ class TestCensus(unittest.TestCase):
                 self.assertEqual(len(lines), 1, r.stderr)
                 self.assertTrue(lines[0].startswith(f"error: {state}: "), lines[0])
 
+    def test_json_cannot_overwrite_inputs(self):
+        self.write("sig", [(b"RTS0", rts0(params=[("cbv", 0)]))], user_sgprs=8)
+        disasm = os.path.join(self.tmp.name, "disasm")
+        os.makedirs(disasm, exist_ok=True)
+        asm_path = os.path.join(disasm, "sig.s")
+        with open(asm_path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("s_endpgm\n")
+        dxbc_path = os.path.join(self.tmp.name, "sig.dxbc")
+        meta_path = os.path.join(self.tmp.name, "fspx", "sig.json")
+        for target in (dxbc_path, meta_path, asm_path, self.tmp.name, disasm):
+            with self.subTest(target=target):
+                if os.path.isfile(target):
+                    with open(target, "rb") as fh:
+                        before = fh.read()
+                else:
+                    before = None
+                cmd = [sys.executable, "-I", TOOL, self.tmp.name, "--disasm", disasm, "--json", target]
+                r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+                if before is not None:
+                    with open(target, "rb") as fh:
+                        self.assertEqual(fh.read(), before)
+
+    def test_json_creates_missing_folder_and_reports_write_failure(self):
+        self.write("sig", [(b"RTS0", rts0(params=[("cbv", 0)]))], user_sgprs=8)
+        nested = os.path.join(self.tmp.name, "reports", "sub", "census.json")
+        ok = subprocess.run([sys.executable, "-I", TOOL, self.tmp.name, "--json", nested],
+                            capture_output=True, text=True, errors="replace")
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        with open(nested, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["summary"]["parsed"], 1)
+
+        blocker = os.path.join(self.tmp.name, "blocker")
+        with open(blocker, "wb") as fh:
+            fh.write(b"keep")
+        bad = os.path.join(blocker, "census.json")
+        r = subprocess.run([sys.executable, "-I", TOOL, self.tmp.name, "--json", bad],
+                           capture_output=True, text=True, errors="replace")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("cannot write", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        with open(blocker, "rb") as fh:
+            self.assertEqual(fh.read(), b"keep")
+
+    def test_json_cannot_overwrite_hardlink_to_input(self):
+        self.write("sig", [(b"RTS0", rts0(params=[("cbv", 0)]))], user_sgprs=8)
+        meta_path = os.path.join(self.tmp.name, "fspx", "sig.json")
+        hard_path = os.path.join(self.tmp.name, "hard.json")
+        try:
+            os.link(meta_path, hard_path)
+        except OSError as exc:
+            self.skipTest(f"os.link unavailable: {exc}")
+        with open(meta_path, "rb") as fh:
+            before = fh.read()
+        r = subprocess.run([sys.executable, "-I", TOOL, self.tmp.name, "--json", hard_path],
+                           capture_output=True, text=True, errors="replace")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        with open(meta_path, "rb") as fh:
+            self.assertEqual(fh.read(), before)
+
 
 if __name__ == "__main__":
     unittest.main()

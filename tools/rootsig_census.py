@@ -223,6 +223,32 @@ def _read_summary(rows):
     }
 
 
+def _same_output_path(first, second):
+    """True when writing ``second`` would truncate ``first`` (same path or hard link)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
+def _input_files(root, disasm=None):
+    """Paths in `root` and `disasm` that `census()` reads."""
+    dxbc = sorted(glob.glob(os.path.join(glob.escape(root), "*.dxbc")))
+    paths = list(dxbc)
+    for path in dxbc:
+        name = os.path.basename(path)[:-5]
+        state_path = os.path.join(root, "fspx", name + ".json")
+        if os.path.exists(state_path):
+            paths.append(state_path)
+        if disasm:
+            asm_path = os.path.join(disasm, name + ".s")
+            if os.path.exists(asm_path):
+                paths.append(asm_path)
+    return paths
+
+
 def census(root, disasm=None):
     """Rows for every container in `root`, joined with the program's measured USER_SGPR count.
 
@@ -295,16 +321,17 @@ def main(argv=None):
     ap.add_argument("--json", help="also write the rows and the summary here")
     ap.add_argument("--disasm", help="a tools/fspx_unpack.py --disasm folder; adds each program's reads")
     a = ap.parse_args(argv)
-    if a.json:
-        try:
-            if os.path.samefile(a.root, a.json):
-                ap.error("--json must not be the input folder")
-        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
-            pass
     if not os.path.isdir(a.root):
         ap.error(f"not a folder: {a.root}")
     if a.disasm and not os.path.isdir(a.disasm):
         ap.error(f"not a folder: {a.disasm}")
+    if a.json:
+        if os.path.isdir(a.json):
+            ap.error(f"--json is a folder, not a file: {a.json}")
+        protected = [a.root] + ([a.disasm] if a.disasm else []) + _input_files(a.root, a.disasm)
+        for input_path in protected:
+            if _same_output_path(input_path, a.json):
+                ap.error(f"--json would overwrite the input {input_path}")
     rows, errors = census(a.root, a.disasm)
     summary = summarize(rows)
     for row in rows:
@@ -329,9 +356,16 @@ def main(argv=None):
     for line in errors:
         print(f"error: {line}", file=sys.stderr)
     if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump({"rows": rows, "summary": summary}, fh, indent=1, sort_keys=True)
-            fh.write("\n")
+        try:
+            parent = os.path.dirname(os.path.abspath(a.json))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(a.json, "w", encoding="utf-8", newline="\n") as fh:
+                json.dump({"rows": rows, "summary": summary}, fh, indent=1, sort_keys=True)
+                fh.write("\n")
+        except OSError as e:
+            print(f"ERROR: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
+            return 2
     return 1 if errors else 0
 
 
