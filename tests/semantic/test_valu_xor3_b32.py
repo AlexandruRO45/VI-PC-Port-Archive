@@ -748,5 +748,81 @@ class TestValuXor3B32ConditionCodes(unittest.TestCase):
         self.assertEqual(simd_state.vcc, canary_vcc)
 
 
+# ==============================================================================
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+POS_ZERO_F32: int = 0x00000000
+NEG_ZERO_F32: int = 0x80000000
+POS_INF_F32: int = 0x7F800000
+NEG_INF_F32: int = 0xFF800000
+QNAN_F32: int = 0x7FC00000
+SNAN_F32: int = 0x7F800001
+QNAN_PAYLOAD_F32: int = 0x7FC01234
+SNAN_PAYLOAD_F32: int = 0x7F804321
+SUBNORM_MIN_F32: int = 0x00000001
+SUBNORM_MAX_F32: int = 0x007FFFFF
+
+
+def f32_to_bits(val: float) -> int:
+    """Encode float to IEEE 754 single-precision 32-bit unsigned integer."""
+    return struct.unpack("<I", struct.pack("<f", val))[0]
+
+
+def bits_to_f32(bits: int) -> float:
+    """Decode 32-bit unsigned integer to IEEE 754 single-precision float."""
+    return struct.unpack("<f", struct.pack("<I", bits & MASK32))[0]
+
+
+def is_nan_f32(bits: int) -> bool:
+    """True if 32-bit integer represents an IEEE 754 single-precision NaN."""
+    bits &= MASK32
+    return (bits & 0x7F800000) == 0x7F800000 and (bits & 0x007FFFFF) != 0
+
+
+def is_subnormal_f32(bits: int) -> bool:
+    """True if 32-bit integer represents an IEEE 754 single-precision subnormal."""
+    bits &= MASK32
+    return (bits & 0x7F800000) == 0 and (bits & 0x007FFFFF) != 0
+
+
+class TestValuXor3B32IEEE754Boundaries(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_float32_sign_inversion(self) -> None:
+        # Invert sign bit of +1.0 (0x3F800000) -> -1.0 (0xBF800000)
+        one_bits = f32_to_bits(1.0)
+        neg_one_bits = oracle_v_xor3_b32(one_bits, 0x80000000, 0)
+        self.assertEqual(neg_one_bits, f32_to_bits(-1.0))
+        self.assertEqual(bits_to_f32(neg_one_bits), -1.0)
+
+    def test_subnormal_toggle_without_ftz(self) -> None:
+        # Toggle subnormal bits without flush-to-zero (FTZ)
+        res = oracle_v_xor3_b32(SUBNORM_MIN_F32, 0x00000002, 0)
+        self.assertEqual(res, 0x00000003)
+        self.assertTrue(is_subnormal_f32(res))
+
+    def test_nan_payload_masking(self) -> None:
+        # Toggle signaling NaN payload bit without altering NaN status
+        snan = SNAN_PAYLOAD_F32
+        res = oracle_v_xor3_b32(snan, 0x00000002, 0)
+        self.assertTrue(is_nan_f32(res))
+        self.assertEqual(res & 0x00400000, 0)  # still sNaN
+
+        # Convert sNaN to qNaN by setting quiet bit (bit 22) via XOR
+        qnan_converted = oracle_v_xor3_b32(snan, 0x00400000, 0)
+        self.assertTrue(is_nan_f32(qnan_converted))
+        self.assertNotEqual(qnan_converted & 0x00400000, 0)  # qNaN
+
+    def test_signed_zero_and_infinities(self) -> None:
+        # Toggle sign bit of +0.0 -> -0.0
+        neg_zero = oracle_v_xor3_b32(POS_ZERO_F32, 0x80000000, 0)
+        self.assertEqual(neg_zero, NEG_ZERO_F32)
+
+        # Toggle sign bit of +inf -> -inf
+        neg_inf = oracle_v_xor3_b32(POS_INF_F32, 0x80000000, 0)
+        self.assertEqual(neg_inf, NEG_INF_F32)
+
+
 if __name__ == "__main__":
     unittest.main()
