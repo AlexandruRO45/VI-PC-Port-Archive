@@ -53,6 +53,56 @@ def make_carve(folder):
     return carve, cpu_path, gpu_path
 
 
+class OutParentPreflightTest(unittest.TestCase):
+    """A missing --out parent is made before the scan; an unusable one is one line and no scan."""
+
+    def run_tool(self, *args):
+        return subprocess.run([sys.executable, "-I", str(TOOL), *map(str, args)],
+                              cwd=ROOT, capture_output=True, text=True, timeout=60)
+
+    def test_missing_parent_is_created_before_a_failing_scan(self):
+        with tempfile.TemporaryDirectory() as td:
+            carve, _, _ = make_carve(td)
+            (carve / "common" / "index.json").write_text("{}", encoding="utf-8")
+            out = pathlib.Path(td) / "new" / "nested" / "report.json"
+            result = self.run_tool(carve, "--out", out)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("ERROR: cannot read", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertTrue(out.parent.is_dir())
+            self.assertFalse(out.exists())
+
+    def test_parent_that_is_a_file_is_refused_before_scanning(self):
+        with tempfile.TemporaryDirectory() as td:
+            carve, _, _ = make_carve(td)
+            blocker = pathlib.Path(td) / "blocked"
+            blocker.write_text("keep", encoding="utf-8")
+            for out in (blocker / "report.json", blocker / "sub" / "report.json"):
+                with self.subTest(out=out):
+                    result = self.run_tool(carve, "--out", out)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+                    lines = result.stderr.strip().splitlines()
+                    self.assertEqual(len(lines), 1, result.stderr)
+                    self.assertTrue(lines[0].startswith("ERROR: cannot create output folder"), lines[0])
+                    self.assertNotIn("texture headers", result.stdout)
+                    self.assertEqual(blocker.read_text(encoding="utf-8"), "keep")
+                    self.assertFalse(out.exists())
+
+    def test_out_alias_of_a_scanned_blob_is_still_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            carve, cpu_path, _ = make_carve(td)
+            alias = pathlib.Path(td) / "report.json"
+            os.link(cpu_path, alias)
+            before = cpu_path.read_bytes()
+            result = self.run_tool(carve, "--out", alias)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("would overwrite an input blob", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertNotIn("texture headers", result.stdout)
+            self.assertEqual(cpu_path.read_bytes(), before)
+
+
 class ReportPathTest(unittest.TestCase):
     def run_tool(self, *args):
         return subprocess.run([sys.executable, "-I", str(TOOL), *map(str, args)],

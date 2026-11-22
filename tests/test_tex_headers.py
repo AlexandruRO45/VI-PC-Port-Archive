@@ -974,7 +974,7 @@ class CliInputTest(unittest.TestCase):
                 f.write("existing file")
             result = self.run_tool(carve, "--out", os.path.join(blocker, "out.json"))
             self.assertEqual(result.returncode, 2, result.stderr)
-            self.assertIn("ERROR: cannot write", result.stderr)
+            self.assertIn("ERROR: cannot create output folder", result.stderr)
             self.assertNotIn("Traceback", result.stderr)
 
     def test_out_that_is_a_directory_is_refused(self):

@@ -901,12 +901,23 @@ def main():
     if not archs:
         ap.error(f"no carved archive (a folder with index.json) in {a.carve}")
     path = a.out or os.path.join(a.carve, "textures_index.json")
+    parent = os.path.dirname(os.path.abspath(path))
     if os.path.isdir(path):
         ap.error(f"{path} is a directory, not a .json file")
     if report_needs_input_check(a.carve, archs, path):
         for kind, source in input_files(a.carve, archs):
             if same_output_path(source, path):
                 ap.error(f"output would overwrite an input {kind}: {path}")
+    if a.out:
+        # Preflight the report folder: losing a finished scan to a missing or unwritable parent is worse.
+        if os.path.exists(parent) and not os.path.isdir(parent):
+            print(f"ERROR: cannot create output folder {parent}: not a folder", file=sys.stderr)
+            return 2
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as e:
+            print(f"ERROR: cannot create output folder {parent}: {e.strerror or e}", file=sys.stderr)
+            return 2
     allt = []
     for arch in archs:
         try:
@@ -917,7 +928,6 @@ def main():
             return 2
         print(f"{arch}: {len(t)} texture headers", flush=True)
         allt += t
-    parent = os.path.dirname(os.path.abspath(path))
     try:
         os.makedirs(parent, exist_ok=True)
         with open(path, "w", encoding="utf-8", newline="\n") as f:
