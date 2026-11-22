@@ -1120,6 +1120,137 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertTrue(swapped)
         self.assertEqual(self.lds.read_dword(9), flt_min)
 
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_syntax(self) -> None:
+        invalid_assemblies = [
+            "",
+            "   ",
+            "v_condxchg_f32 v0, v1, v2",
+            "ds_condxchg64_f32 v0, v1, v2",
+            "ds_min_f32 v0, v1",
+            "ds_condxchg32_f32 v0, v1",  # Missing 3rd operand
+            "ds_condxchg32_f32 v0, v1, v2, v3",  # 4 operands (only valid for returning variant!)
+            "ds_condxchg32_f32 r0, v1, v2",
+            "ds_condxchg32_f32 v0, s1, v2",
+            "ds_condxchg32_f32 v256, v1, v2",
+            "ds_condxchg32_f32 v0, v1, v2 offset:70000",
+            "ds_condxchg32_f32 v0, v1, v2 offset:-1",
+            "ds_condxchg32_f32 v0, v1, v2 offset:",
+        ]
+        for asm in invalid_assemblies:
+            with self.subTest(asm=asm):
+                with self.assertRaises((ValueError, IndexError)):
+                    DSCondXchg32F32Instruction.parse(asm)
+
+    def test_ast_and_model_negative_controls(self) -> None:
+        with self.assertRaises(ValueError):
+            LDSMemory(1000)
+        with self.assertRaises(ValueError):
+            LDSMemory(-64)
+        with self.assertRaises(ValueError):
+            LDSMemory(0)
+
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=128)
+
+        with self.assertRaises(ValueError):
+            DSCondXchg32F32Instruction(
+                opcode=DSOpcode.DS_CONDXCHG32_F32,
+                vaddr=VGPR(0),
+                vdata0=VGPR(1),
+                vdata1=VGPR(2),
+                vdst=VGPR(3),
+            )
+
+    def test_mutation_detection_raw_integer_equality_mutant(self) -> None:
+        def mutant_condxchg(mem: int, cmp_val: int, new_val: int) -> Tuple[int, int, bool]:
+            if (mem & MASK32) == (cmp_val & MASK32):
+                return mem & MASK32, new_val & MASK32, True
+            return mem & MASK32, mem & MASK32, False
+
+        _, _, correct_swap = oracle_condxchg32_f32(NEG_ZERO_RAW, POS_ZERO_RAW, ONE_RAW)
+        _, _, mutant_swap = mutant_condxchg(NEG_ZERO_RAW, POS_ZERO_RAW, ONE_RAW)
+        self.assertTrue(correct_swap)
+        self.assertFalse(mutant_swap)
+        self.assertNotEqual(correct_swap, mutant_swap)
+
+        _, _, correct_nan_swap = oracle_condxchg32_f32(QNAN_RAW, QNAN_RAW, TWO_RAW)
+        _, _, mutant_nan_swap = mutant_condxchg(QNAN_RAW, QNAN_RAW, TWO_RAW)
+        self.assertFalse(correct_nan_swap)
+        self.assertTrue(mutant_nan_swap)
+        self.assertNotEqual(correct_nan_swap, mutant_nan_swap)
+
+    def test_mutation_detection_ignore_exec_mask(self) -> None:
+        class MutantSIMDInterpreter(SIMDDSInterpreter):
+            def execute(self, state: SIMDWaveState, inst: DSCondXchg32F32Instruction) -> Dict[int, bool]:
+                saved = state.exec_mask
+                state.exec_mask = (1 << state.wave_size) - 1
+                try:
+                    return super().execute(state, inst)
+                finally:
+                    state.exec_mask = saved
+
+        lds = LDSMemory(65536)
+        lds.write_dword(5, ONE_RAW)
+        wave = SIMDWaveState(wave_size=32, exec_mask=0x0, lds=lds)
+        for l in range(32):
+            wave.set_vgpr(l, VGPR(1), 20)
+            wave.set_vgpr(l, VGPR(2), ONE_RAW)
+            wave.set_vgpr(l, VGPR(3), TWO_RAW)
+
+        inst = DSCondXchg32F32Instruction(
+            DSOpcode.DS_CONDXCHG32_F32,
+            vaddr=VGPR(1),
+            vdata0=VGPR(2),
+            vdata1=VGPR(3),
+        )
+        mutant = MutantSIMDInterpreter()
+        mutant.execute(wave, inst)
+
+        self.assertEqual(lds.read_dword(5), TWO_RAW)
+
+        lds.write_dword(5, ONE_RAW)
+        SIMDDSInterpreter().execute(wave, inst)
+        self.assertEqual(lds.read_dword(5), ONE_RAW)
+
+    def test_mutation_detection_dropped_offset(self) -> None:
+        class DroppedOffsetInterpreter(ScalarDSInterpreter):
+            def execute(self, state: ScalarThreadState, inst: DSCondXchg32F32Instruction) -> bool:
+                no_off = DSCondXchg32F32Instruction(
+                    opcode=inst.opcode,
+                    vaddr=inst.vaddr,
+                    vdata0=inst.vdata0,
+                    vdata1=inst.vdata1,
+                    vdst=None,
+                    offset=OffsetImmediate(0),
+                )
+                return super().execute(state, no_off)
+
+        lds = LDSMemory(65536)
+        lds.write_dword(1, ONE_RAW)
+        lds.write_dword(2, ONE_RAW)
+        state = ScalarThreadState(lds=lds)
+        state.set_vgpr(VGPR(1), 4)        # dword 1
+        state.set_vgpr(VGPR(2), ONE_RAW)  # cmp_val
+        state.set_vgpr(VGPR(3), TWO_RAW)  # new_val
+
+        inst = DSCondXchg32F32Instruction(
+            DSOpcode.DS_CONDXCHG32_F32,
+            vaddr=VGPR(1),
+            vdata0=VGPR(2),
+            vdata1=VGPR(3),
+            offset=OffsetImmediate(4),  # offset 4 -> dword 2
+        )
+        mutant = DroppedOffsetInterpreter()
+        mutant.execute(state, inst)
+
+        self.assertEqual(lds.read_dword(1), TWO_RAW)
+        self.assertEqual(lds.read_dword(2), ONE_RAW)
+
 
 if __name__ == "__main__":
     unittest.main()
