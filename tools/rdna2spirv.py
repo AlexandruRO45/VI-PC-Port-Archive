@@ -854,7 +854,7 @@ class Gen:
         self.emit(f"{base} = OpBitwiseOr %ulong {sh} {l64}")
         self.emit(f"{r} = OpIAdd %ulong {base} {xbox_va}")
         self.uses_heap = True
-        self.cu(1), self.cu(2)        # member indices of the push-constant block, declared before assembly
+        self.cu(1), self.cu(2)        # struct member indices of the push-constant block, declared before assembly
         return r
 
     def tof(self, u):
@@ -9494,11 +9494,13 @@ def assemble(gen):
                "%x_bar = OpVariable %_ptr_Function_bool Function %false"]
         fn += [f"{var} = OpVariable {ptr} Function" for var, ptr in gen.x_spills]
     # User data: s0..s31 are loaded at entry from a push-constant block (the driver's user-SGPR setup).
-    if gen.uses_heap:
-        gen.consts.setdefault(1, "%c1")
-        gen.consts.setdefault(2, "%c2")
-        fn += ["%ud_base_lo_p = OpAccessChain %_ptr_PC_uint %user_data %c1",
-               "%ud_base_hi_p = OpAccessChain %_ptr_PC_uint %user_data %c2"]
+    # Heap base lives at UserData members 1..2 (push-constant dwords 32..33; host_addr reads it).
+    # Register the member-index constants unconditionally so host_addr can emit the access chain
+    # at any point during translation.
+    gen.consts.setdefault(1, gen.cu(1))
+    gen.consts.setdefault(2, gen.cu(2))
+    fn += [f"%ud_base_lo_p = OpAccessChain %_ptr_PC_uint %user_data {gen.cu(1)}",
+           f"%ud_base_hi_p = OpAccessChain %_ptr_PC_uint %user_data {gen.cu(2)}"]
     if gen.uses_codebase:
         fn += ["%ud_code_lo_p = OpAccessChain %_ptr_PC_uint %user_data %c3",
                "%ud_code_hi_p = OpAccessChain %_ptr_PC_uint %user_data %c4"]
