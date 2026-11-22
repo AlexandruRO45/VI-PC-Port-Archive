@@ -1,5 +1,7 @@
 """Pin the BC7 block reference to hand-derived vectors, the mode-6 draw fixture and fixed digests."""
 import hashlib
+import os
+import subprocess
 from pathlib import Path
 import sys
 import unittest
@@ -7,6 +9,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from bc7_blocks import (ANCHORS_2, ANCHORS_3, MODES, PARTITIONS_2, PARTITIONS_3, anchors, decode,
                         fixture, fixture_fields, layout, pack, subsets, unpack)
+import bcpack_mode6_vector as mode6
 from bc7_draw_check import make_block
 
 try:
@@ -42,6 +45,16 @@ def random_block(mode, case):
 
 
 class BlockChecks(unittest.TestCase):
+    def test_bcpack_mode6_vector(self):
+        self.assertEqual(decode(mode6.BLOCK), mode6.RGBA)
+        # Change the last selector from 15 to 0; only the final pixel changes.
+        changed = mode6.BLOCK[:-1] + bytes([mode6.BLOCK[-1] & 0x0f])
+        self.assertEqual(decode(changed), mode6.RGBA[:-4] + bytes((197, 71, 41, 25)))
+
+    @unittest.skipUnless(os.environ.get("BCPACK_REFERENCE_TOOLS"), "optional Leonida reference decoder")
+    def test_bcpack_mode6_strict_reference(self):
+        subprocess.run([sys.executable, "-B", mode6.__file__, os.environ["BCPACK_REFERENCE_TOOLS"]], check=True)
+
     def test_field_offsets(self):
         for mode, expected in enumerate(OFFSETS):
             for partition in range(1 << MODES[mode][1]):
@@ -154,6 +167,12 @@ class BlockChecks(unittest.TestCase):
         with self.assertRaises(ValueError):
             fixture(0, 1)
 
+    def test_rectangular_fixture_raster(self):
+        # The reference decodes the 5-by-7 block grid as one 20-by-28 image
+        # with texture2ddecoder 1.0.6 and converts its BGRA output to RGBA.
+        _, _, pixels = fixture(columns=5, rows=7)
+        self.assertEqual(hashlib.sha256(pixels).hexdigest(), RECTANGULAR_PIXELS_SHA256)
+
     @unittest.skipUnless(texture2ddecoder, "Optional comparison: pip install texture2ddecoder")
     def test_independent_decoder(self):
         rows = fixture()[1] + b"".join(random_block(mode, case) for mode in range(8) for case in range(2048))
@@ -170,6 +189,7 @@ class BlockChecks(unittest.TestCase):
 
 ROWS_SHA256 = "184fc0970dc8e1b91f79639d820bd0eb7df2659427bb8b17ce66f61fd7e969ba"
 PIXELS_SHA256 = "79fe13df3cf1a31914c7a08d0e02d78840347d5e2dcbaa51b35c44afc7210383"
+RECTANGULAR_PIXELS_SHA256 = "3aac1b30ad79ea78d6dc76b4ad137122441129ea98d797126c45c017e49b1e19"
 
 
 if __name__ == "__main__":
