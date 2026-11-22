@@ -18,6 +18,7 @@
 #include "d3d12_com.h"
 #include "d3d12_present.h"
 #include "dxgi_stubs.h"  // generated from dxgi.h/dxgi1_2.h at build time
+#include "shims.h"
 #include "wsi_presenter.h"
 
 namespace rt::d3d12 {

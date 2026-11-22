@@ -15,6 +15,11 @@ namespace rt::d3d12 {
 // CreateDXGIFactory / CreateDXGIFactory1 / CreateDXGIFactory2 behind the exported functions below.
 HRESULT create_dxgi_factory(REFIID riid, void** out);
 
+// Keeps this file's shim table in the link and says so at run time. The table registers itself through a static
+// initialiser, which the linker drops with the object unless something references it; gta6rt and the shim DLL call
+// this once at startup, which is why the dxgi.dll imports of a game resolve to the functions below.
+void link_dxgi_shims();
+
 }  // namespace rt::d3d12
 
 // The dxgi.dll exports a game imports. A game's import is bound to these through the shim registry

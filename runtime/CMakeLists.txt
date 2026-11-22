@@ -60,6 +60,7 @@ if(WIN32)
     shims/d3d12_xs_device.cpp
     shims/xgameruntime.cpp
   )
+  target_include_directories(gta6rt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/shims)
   target_compile_definitions(gta6rt PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
   target_compile_options(gta6rt PRIVATE /W4 /permissive- /utf-8)
   # Static shim tables register themselves at startup; keep the linker from dropping their objects.
@@ -411,6 +412,8 @@ if(Vulkan_FOUND)
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
     if(TARGET gta6rt)
       target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_com)
+      # dxgi_shims.cpp registers the dxgi.dll table and keeps dxgi.cpp in the static library's link.
+      target_sources(gta6rt PRIVATE shims/dxgi_shims.cpp)
       target_compile_definitions(gta6rt PRIVATE LEONIDA_VULKAN_DEVICE)
     endif()
   else()
@@ -498,7 +501,8 @@ if(Vulkan_FOUND)
   if(LEONIDA_LIB_EXE)
     set(LEONIDA_SHIMS_DEF ${CMAKE_CURRENT_BINARY_DIR}/leonida_shims.def)
     file(WRITE ${LEONIDA_SHIMS_DEF} "LIBRARY leonida_shims.dll\nEXPORTS\n  VirtualAlloc=shim_virtual_alloc\n  Sleep=shim_sleep\n  CreateFileW=shim_create_file_w\n  CreateFileA=shim_create_file_a\n  ReadFile=shim_read_file\n  WriteFile=shim_write_file\n  SetFilePointerEx=shim_set_file_pointer_ex\n  GetFileSizeEx=shim_get_file_size_ex\n  CloseHandle=shim_close_handle\n  CreateThread=shim_create_thread\n  WaitForSingleObject=shim_wait_for_single_object\n  QueryPerformanceCounter=shim_query_performance_counter\n  QueryPerformanceFrequency=shim_query_performance_frequency\n  GetTickCount64=shim_get_tick_count64\n  CreateWindowExW=shim_create_window_ex_w\n  D3D12CreateDevice=shim_d3d12_create_device\n  D3D12CreateRootSignatureDeserializer=shim_d3d12_create_root_signature_deserializer\n  Map=shim_map\n  Unmap=shim_unmap\n  ExecuteCommandLists=shim_execute_command_lists\n  CreateCommittedResource=shim_create_committed_resource\n  CreateDXGIFactory=CreateDXGIFactory\n  CreateDXGIFactory1=CreateDXGIFactory1\n  CreateDXGIFactory2=CreateDXGIFactory2\n  LeonidaRunAnimation\n  LeonidaRenderTriangle\n  LeonidaPresentWindow\n")
-    add_library(leonida_shims SHARED test/pe_hello_shims.cpp test/wsi_animation.cpp shims/registry.cpp)
+    add_library(leonida_shims SHARED test/pe_hello_shims.cpp test/wsi_animation.cpp shims/dxgi_shims.cpp
+                shims/registry.cpp)
     target_include_directories(leonida_shims PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
                                                      ${CMAKE_CURRENT_SOURCE_DIR}/shims
                                                      ${CMAKE_CURRENT_SOURCE_DIR}/test)

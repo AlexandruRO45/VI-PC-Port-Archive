@@ -64,6 +64,10 @@ public:
     // directory, a TLS callback outside its image, or a DllMain that returns FALSE.
     void initialise();
 
+    // Where unimplemented imports are recorded: <game dir>/missing_imports.log, one "dll!name" per line, rewritten
+    // on every load() so the file always describes the run that just happened.
+    std::filesystem::path missing_import_log() const { return game_dir_ / "missing_imports.log"; }
+
 private:
     void initialise(Module& m);
     Module& map_image(const std::filesystem::path& path);

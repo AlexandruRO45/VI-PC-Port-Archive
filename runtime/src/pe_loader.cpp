@@ -69,6 +69,8 @@ Loader::~Loader() {
 Module& Loader::load(const std::filesystem::path& image) {
     std::string key = lower(image.filename().string());
     if (auto it = by_name_.find(key); it != by_name_.end()) return *it->second;
+    // A fresh log for this load: the file names what this run could not bind, so it is rewritten, not appended to.
+    { std::ofstream truncate(missing_import_log(), std::ios::trunc); }
     Module& m = map_image(image);
     bind_imports(m);  // loads every bundled module m imports first, so they land in init_order_ before m
     protect_sections(m);
@@ -407,7 +409,7 @@ void* Loader::resolve(Module& m, const std::string& dll, const std::string& name
     m.imports.push_back({dll, sym, Binding::Unimplemented});
     {
         // Missing API log: the game keeps running on the stub, and the name is recorded for the next shim.
-        std::ofstream log("missing_imports.log", std::ios::app);
+        std::ofstream log(missing_import_log(), std::ios::app);
         if (log) log << dll << "!" << sym << "\n";
     }
     return shims::make_unimplemented_thunk(dll, sym);

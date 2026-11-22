@@ -28,13 +28,28 @@ other machine.
 ## Dry run
 
 ```powershell
-gta6rt --dry-run <image.exe|image.dll> [--game-dir <package>]
+gta6rt --dry-run <image.exe|image.dll> [--game-dir <package>] [--shims <dll>]
+gta6rt --init    <image.exe|image.dll> [--game-dir <package>] [--shims <dll>]
+gta6rt --run     <image.exe|image.dll> [--game-dir <package>] [--shims <dll>]
 ```
 
-The dry run maps the image and the bundled modules it imports, applies base relocations, binds every
+`--dry-run` maps the image and the bundled modules it imports, applies base relocations, binds every
 import through the shim registry, a host DLL, or another bundled module, parses exports, applies
 section protections, and prints a per-module report. It does **not** call `DllMain`, TLS callbacks,
-or the entry point, so no image code runs.
+or the entry point, so no image code runs. `--init` additionally runs each loaded DLL's TLS callbacks
+and `DllMain(DLL_PROCESS_ATTACH)`, dependencies first. `--run` then calls the image's entry point: the
+whole start sequence, in one process.
+
+`--shims <dll>` loads a shim DLL before anything is mapped, so its table (for example the test
+harness's `kernel32`/`user32`/`d3d12`/`dxgi` entries) is registered. Real targets link their shims into
+`gta6rt` itself; the flag is for the PE harness and for experiments.
+
+The run prints which shim tables made it into the link (`shim tables linked: dxgi.dll=yes ...`), because
+a table silently dropped by the linker is the difference between a bound import and a stub.
+
+Every import that cannot be bound is also appended to `<game dir>/missing_imports.log` as `dll!name`,
+and the file is rewritten on each load, so it always describes the run that just happened. At run time
+a call into an unimplemented import prints `[rt] unimplemented: dll!name` once.
 
 The report line is:
 
@@ -45,6 +60,23 @@ The report line is:
 Shim and unimplemented imports are listed by name. A non-zero `unimplemented` count is the useful
 signal: it names the next shim that is missing. The measured result for the 16 DLLs shipped in the
 package is recorded in the runtime-imports documentation.
+
+## Self-check without a game
+
+The PE harness exercises the same chain (loader → shim tables → D3D12/DXGI → Vulkan → window) with no
+game files at all:
+
+```powershell
+cd runtime/build
+gta6rt --dry-run leonida_test_harness.exe --game-dir . --shims leonida_shims.dll
+gta6rt --run     leonida_test_harness.exe --game-dir . --shims leonida_shims.dll
+```
+
+Expected: `0 unimplemented import(s)`, an animated triangle in a window, and `leonida_window.log` with
+`wsi=1 shared_device=1 frames=N` (about 220 frames in 4 s here).
+
+How to test with a game you legally own (files from a developer-mode console or your own disc, no DRM
+workarounds) is in [`docs/how_to_test_game.md`](../docs/how_to_test_game.md).
 
 ## PE loader
 
@@ -78,6 +110,12 @@ Current limits, by design:
   Vulkan SDK and Python 3. The Vulkan device covers command submission, descriptor heaps, render-target and
   depth views, committed resources and copies (uploads, readbacks, BC textures); see `docs/d3d12_vulkan.md`
   section 3.2 for what is missing.
+- `dxgi.dll` — `CreateDXGIFactory`, `CreateDXGIFactory1` and `CreateDXGIFactory2` (`shims/dxgi.cpp`,
+  registered in `shims/dxgi_shims.cpp` so the linker keeps it): one adapter, and swapchains whose back
+  buffers are D3D12 committed render targets presented through the shared-device WSI presenter
+  (`vkCmdCopyImage` into the swapchain image + `vkQueuePresentKHR`), with `ResizeBuffers`. `PresentX`
+  presents through the same path (`rt::d3d12::present_x`). `docs/d3d12_vulkan.md` section 4.5 has the
+  details and what is still a stub.
 
 The two serializer functions and `D3D12XboxCreateDevice` are the only `d3d12_xs` imports used by the
 shipped DLLs (measured; see `docs/design.md` and `docs/d3d12_vulkan.md`). The game executable's own
