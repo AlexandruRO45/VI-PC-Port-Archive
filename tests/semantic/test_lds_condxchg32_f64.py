@@ -1043,6 +1043,133 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertTrue(flags.result_is_zero)
         self.assertTrue(flags.result_has_sign_bit)
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(65536)
+        self.state = ScalarThreadState(lds=self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_snan_preservation_without_quietening(self) -> None:
+        snan64 = 0x7FF00000_00000001
+        self.assertEqual(snan64 & QNAN_BIT_F64, 0)
+
+        self.lds.write_qword(16, snan64)
+        self.state.rf.set_u32(VGPR(1), 16)
+        self.state.rf.set_u64(VGPRPair(4), snan64)
+        self.state.rf.set_u64(VGPRPair(6), ONE_RAW_F64)
+
+        inst = DSCondXchg32F64Instruction(
+            DSOpcode.DS_CONDXCHG32_F64,
+            vaddr=VGPR(1),
+            vdata0=VGPRPair(4),
+            vdata1=VGPRPair(6),
+        )
+        swapped = self.interp.execute(self.state, inst)
+        self.assertFalse(swapped)
+        self.assertEqual(self.lds.read_qword(16), snan64)
+
+    def test_qnan_payload_preservation_and_comparison_failure(self) -> None:
+        qnan64 = 0x7FF8DEAD_BEEFCAFE
+        self.assertNotEqual(qnan64 & QNAN_BIT_F64, 0)
+
+        self.lds.write_qword(24, qnan64)
+        self.state.rf.set_u32(VGPR(1), 24)
+        self.state.rf.set_u64(VGPRPair(4), qnan64)
+        self.state.rf.set_u64(VGPRPair(6), TWO_RAW_F64)
+
+        inst = DSCondXchg32F64Instruction(
+            DSOpcode.DS_CONDXCHG32_F64,
+            vaddr=VGPR(1),
+            vdata0=VGPRPair(4),
+            vdata1=VGPRPair(6),
+        )
+        swapped = self.interp.execute(self.state, inst)
+        self.assertFalse(swapped)
+        self.assertEqual(self.lds.read_qword(24), qnan64)
+
+    def test_signed_zeros_both_directions(self) -> None:
+        self.lds.write_qword(32, NEG_ZERO_RAW_F64)
+        self.state.rf.set_u32(VGPR(1), 32)
+        self.state.rf.set_u64(VGPRPair(4), POS_ZERO_RAW_F64)
+        self.state.rf.set_u64(VGPRPair(6), THREE_RAW_F64)
+
+        inst1 = DSCondXchg32F64Instruction(
+            DSOpcode.DS_CONDXCHG32_F64,
+            vaddr=VGPR(1),
+            vdata0=VGPRPair(4),
+            vdata1=VGPRPair(6),
+        )
+        swapped1 = self.interp.execute(self.state, inst1)
+        self.assertTrue(swapped1)
+        self.assertEqual(self.lds.read_qword(32), THREE_RAW_F64)
+
+        self.lds.write_qword(40, POS_ZERO_RAW_F64)
+        self.state.rf.set_u32(VGPR(1), 40)
+        self.state.rf.set_u64(VGPRPair(4), NEG_ZERO_RAW_F64)
+        self.state.rf.set_u64(VGPRPair(6), TWO_RAW_F64)
+
+        inst2 = DSCondXchg32F64Instruction(
+            DSOpcode.DS_CONDXCHG32_F64,
+            vaddr=VGPR(1),
+            vdata0=VGPRPair(4),
+            vdata1=VGPRPair(6),
+        )
+        swapped2 = self.interp.execute(self.state, inst2)
+        self.assertTrue(swapped2)
+        self.assertEqual(self.lds.read_qword(40), TWO_RAW_F64)
+
+    def test_infinities_matching_and_sign_distinction(self) -> None:
+        self.lds.write_qword(48, POS_INF_RAW_F64)
+        self.state.rf.set_u32(VGPR(1), 48)
+        self.state.rf.set_u64(VGPRPair(4), POS_INF_RAW_F64)
+        self.state.rf.set_u64(VGPRPair(6), ONE_RAW_F64)
+
+        inst = DSCondXchg32F64Instruction(
+            DSOpcode.DS_CONDXCHG32_F64,
+            vaddr=VGPR(1),
+            vdata0=VGPRPair(4),
+            vdata1=VGPRPair(6),
+        )
+        swapped = self.interp.execute(self.state, inst)
+        self.assertTrue(swapped)
+        self.assertEqual(self.lds.read_qword(48), ONE_RAW_F64)
+
+        self.lds.write_qword(56, NEG_INF_RAW_F64)
+        self.state.rf.set_u32(VGPR(1), 56)
+        self.state.rf.set_u64(VGPRPair(4), POS_INF_RAW_F64)
+        self.state.rf.set_u64(VGPRPair(6), TWO_RAW_F64)
+
+        inst_neg = DSCondXchg32F64Instruction(
+            DSOpcode.DS_CONDXCHG32_F64,
+            vaddr=VGPR(1),
+            vdata0=VGPRPair(4),
+            vdata1=VGPRPair(6),
+        )
+        swapped_neg = self.interp.execute(self.state, inst_neg)
+        self.assertFalse(swapped_neg)
+        self.assertEqual(self.lds.read_qword(56), NEG_INF_RAW_F64)
+
+    def test_subnormals_preservation_and_exact_match(self) -> None:
+        subnorm_min = 0x00000000_00000001
+        subnorm_max = 0x000FFFFF_FFFFFFFF
+
+        self.lds.write_qword(64, subnorm_min)
+        self.state.rf.set_u32(VGPR(1), 64)
+        self.state.rf.set_u64(VGPRPair(4), subnorm_min)
+        self.state.rf.set_u64(VGPRPair(6), subnorm_max)
+
+        inst = DSCondXchg32F64Instruction(
+            DSOpcode.DS_CONDXCHG32_F64,
+            vaddr=VGPR(1),
+            vdata0=VGPRPair(4),
+            vdata1=VGPRPair(6),
+        )
+        swapped = self.interp.execute(self.state, inst)
+        self.assertTrue(swapped)
+        self.assertEqual(self.lds.read_qword(64), subnorm_max)
+
 
 if __name__ == "__main__":
     unittest.main()
