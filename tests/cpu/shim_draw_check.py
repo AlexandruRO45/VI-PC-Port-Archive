@@ -30,6 +30,7 @@ def reference(flip=False):
 
 
 def verify(case, result, expected_pixels):
+    check("startup output before draw", result.stdout[:len(EXPECTED.output)], EXPECTED.output)
     pixels = result.stdout[len(EXPECTED.output):]
     if case == "bogus":
         check("unknown draw case exits", result.returncode, 21)
@@ -62,6 +63,12 @@ def compare(mapper, exe, lifted, companion, io, xmem, d3d12):
         for runner, command in (("native", [exe]), ("pe_map", map_command), ("AOT", [lifted])):
             child = subprocess.run(command, env=env, capture_output=True, timeout=120)
             lines = child.stderr.decode(errors="replace").splitlines()
+            if (case == "draw" and runner == "native" and child.returncode == 77
+                    and env.get("X2W_SHIM_DRAW_ADAPTER") == "hardware"):
+                check("hardware capability diagnostic", lines, ["no D3D12 physical adapter"])
+                check("startup before hardware capability skip", child.stdout, EXPECTED.output)
+                print(lines[0])
+                return 77
             if runner == "pe_map":
                 if case == "bogus":
                     # ExitProcess(21) kills the mapped child before it prints the
@@ -84,4 +91,4 @@ def compare(mapper, exe, lifted, companion, io, xmem, d3d12):
 if __name__ == "__main__":
     # The draw provider path is passed so the test depends on its build; the guest
     # locates it next to the EXE, like the compute provider.
-    compare(*map(Path, sys.argv[1:-1]))
+    sys.exit(compare(*map(Path, sys.argv[1:-1])))
