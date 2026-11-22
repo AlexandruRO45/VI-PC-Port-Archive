@@ -787,5 +787,157 @@ class TestValuCvtNormU16F16SIMDDivergence(unittest.TestCase):
         self.assertTrue(all(r == UNORM16_HALF for r in results))
 
 
+# ---------------------------------------------------------------------------
+# Register Aliasing and In-Place Operand Preservation
+# ---------------------------------------------------------------------------
+
+class TestValuCvtNormU16F16RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing hazards and in-place operand preservation."""
+
+    def test_inplace_low_half_aliasing(self) -> None:
+        # v0.l = v_cvt_norm_u16_f16 v0.l
+        interp = ScalarVALUInterpreter()
+        canary_hi = 0x89AB
+        initial_v0 = (canary_hi << 16) | HALF_F16
+        interp.write_reg32(RegKind.VGPR, 0, initial_v0)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_U16_F16,
+            dst=Register(RegKind.VGPR, 0, SubWord.LO),
+            src0=Register(RegKind.VGPR, 0, SubWord.LO),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, UNORM16_HALF)
+
+        final_v0 = interp.read_reg32(RegKind.VGPR, 0)
+        self.assertEqual(final_v0 >> 16, canary_hi)
+        self.assertEqual(final_v0 & 0xFFFF, UNORM16_HALF)
+
+    def test_inplace_high_half_aliasing(self) -> None:
+        # v0.h = v_cvt_norm_u16_f16 v0.h
+        interp = ScalarVALUInterpreter()
+        canary_lo = 0xCDEF
+        initial_v0 = (ONE_F16 << 16) | canary_lo
+        interp.write_reg32(RegKind.VGPR, 0, initial_v0)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_U16_F16,
+            dst=Register(RegKind.VGPR, 0, SubWord.HI),
+            src0=Register(RegKind.VGPR, 0, SubWord.HI),
+            encoding=Encoding.VOP3,
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, UNORM16_MAX)
+
+        final_v0 = interp.read_reg32(RegKind.VGPR, 0)
+        self.assertEqual(final_v0 & 0xFFFF, canary_lo)
+        self.assertEqual(final_v0 >> 16, UNORM16_MAX)
+
+    def test_cross_half_aliasing_hi_to_lo(self) -> None:
+        # v0.l = v_cvt_norm_u16_f16 v0.h
+        interp = ScalarVALUInterpreter()
+        initial_v0 = (QUARTER_F16 << 16) | 0x1111
+        interp.write_reg32(RegKind.VGPR, 0, initial_v0)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_U16_F16,
+            dst=Register(RegKind.VGPR, 0, SubWord.LO),
+            src0=Register(RegKind.VGPR, 0, SubWord.HI),
+            encoding=Encoding.VOP3,
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, 16384)
+
+        final_v0 = interp.read_reg32(RegKind.VGPR, 0)
+        # High half must remain identical to source QUARTER_F16
+        self.assertEqual(final_v0 >> 16, QUARTER_F16)
+        self.assertEqual(final_v0 & 0xFFFF, 16384)
+
+    def test_cross_half_aliasing_lo_to_hi(self) -> None:
+        # v0.h = v_cvt_norm_u16_f16 v0.l
+        interp = ScalarVALUInterpreter()
+        initial_v0 = (0x9999 << 16) | THREE_QUARTERS_F16
+        interp.write_reg32(RegKind.VGPR, 0, initial_v0)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_U16_F16,
+            dst=Register(RegKind.VGPR, 0, SubWord.HI),
+            src0=Register(RegKind.VGPR, 0, SubWord.LO),
+            encoding=Encoding.VOP3,
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, 49151)
+
+        final_v0 = interp.read_reg32(RegKind.VGPR, 0)
+        # Low half must remain identical to source THREE_QUARTERS_F16
+        self.assertEqual(final_v0 & 0xFFFF, THREE_QUARTERS_F16)
+        self.assertEqual(final_v0 >> 16, 49151)
+
+    def test_sequential_aliasing_pipeline(self) -> None:
+        # Step 1: v0.l = v_cvt_norm_u16_f16 v1.l (v1.l = 0.5) -> v0.l = 0x8000
+        # Step 2: v1.l = v_cvt_norm_u16_f16 v1.h (v1.h = 1.0) -> v1.l = 0xFFFF
+        # Step 3: v0.h = v_cvt_norm_u16_f16 v0.l (v0.l bits reinterpreted as f16 0x8000 = -0.0) -> v0.h = 0
+        interp = ScalarVALUInterpreter()
+        interp.write_reg32(RegKind.VGPR, 1, (ONE_F16 << 16) | HALF_F16)
+        interp.write_reg32(RegKind.VGPR, 0, 0x12345678)
+
+        inst1 = Instruction(
+            opcode=Opcode.V_CVT_NORM_U16_F16,
+            dst=Register(RegKind.VGPR, 0, SubWord.LO),
+            src0=Register(RegKind.VGPR, 1, SubWord.LO),
+        )
+        inst2 = Instruction(
+            opcode=Opcode.V_CVT_NORM_U16_F16,
+            dst=Register(RegKind.VGPR, 1, SubWord.LO),
+            src0=Register(RegKind.VGPR, 1, SubWord.HI),
+            encoding=Encoding.VOP3,
+        )
+        inst3 = Instruction(
+            opcode=Opcode.V_CVT_NORM_U16_F16,
+            dst=Register(RegKind.VGPR, 0, SubWord.HI),
+            src0=Register(RegKind.VGPR, 0, SubWord.LO),
+            encoding=Encoding.VOP3,
+        )
+
+        r1 = interp.step(inst1)
+        self.assertEqual(r1, UNORM16_HALF)
+        self.assertEqual(interp.read_reg32(RegKind.VGPR, 0) >> 16, 0x1234)
+
+        r2 = interp.step(inst2)
+        self.assertEqual(r2, UNORM16_MAX)
+        self.assertEqual(interp.read_reg32(RegKind.VGPR, 1) >> 16, ONE_F16)
+
+        r3 = interp.step(inst3)
+        # 0x8000 is -0.0 in f16, which converts to UNORM16_MIN (0)
+        self.assertEqual(r3, UNORM16_MIN)
+        self.assertEqual(interp.read_reg32(RegKind.VGPR, 0) & 0xFFFF, UNORM16_HALF)
+        self.assertEqual(interp.read_reg32(RegKind.VGPR, 0) >> 16, UNORM16_MIN)
+
+    def test_simd_multi_lane_inplace_aliasing(self) -> None:
+        sim = SIMDWavefrontInterpreter(wave_size=32)
+        canaries = [(0x1000 + i) for i in range(32)]
+        inputs = [
+            (HALF_F16 if (i % 2 == 0) else ONE_F16)
+            for i in range(32)
+        ]
+
+        for lane in range(32):
+            sim.write_lane_reg32(lane, RegKind.VGPR, 2, (canaries[lane] << 16) | inputs[lane])
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_U16_F16,
+            dst=Register(RegKind.VGPR, 2, SubWord.LO),
+            src0=Register(RegKind.VGPR, 2, SubWord.LO),
+        )
+        results = sim.step(inst)
+
+        for lane in range(32):
+            expected = UNORM16_HALF if (lane % 2 == 0) else UNORM16_MAX
+            self.assertEqual(results[lane], expected)
+            final_word = sim.read_lane_reg32(lane, RegKind.VGPR, 2)
+            self.assertEqual(final_word >> 16, canaries[lane])
+            self.assertEqual(final_word & 0xFFFF, expected)
+
+
 if __name__ == "__main__":
     unittest.main()
