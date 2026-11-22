@@ -12,7 +12,7 @@ import sys
 import tempfile
 import unittest
 import zlib
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -270,6 +270,23 @@ class CliTest(unittest.TestCase):
         with open(path, "wb") as f:
             f.write(rpf([defs, m]))
         self.check(self.run_cli(path))
+
+    def test_report_cannot_replace_a_directory_input(self):
+        folder = os.path.join(self.tmp.name, "carved")
+        os.mkdir(folder)
+        path = os.path.join(folder, "a.bin")
+        defs, _ = scene()
+        with open(path, "wb") as f:
+            f.write(defs)
+        for source in (path, folder):
+            with self.subTest(source=source):
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+                    with self.assertRaises(SystemExit) as code:
+                        WA.main([source, "--out", path])
+                self.assertEqual(code.exception.code, 2)
+                self.assertIn("would overwrite", err.getvalue())
+                with open(path, "rb") as f:
+                    self.assertEqual(f.read(), defs)
 
     def test_missing_path_is_an_error(self):
         with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):

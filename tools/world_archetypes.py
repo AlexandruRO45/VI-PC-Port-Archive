@@ -114,7 +114,7 @@ def member_table(b, struct_hash):
     return sorted(((h, m[0], m[1]) for h, m in structs[struct_hash][1].items()), key=lambda t: (t[1], t[0]))
 
 
-def iter_resources(path, start=None, limit=None):
+def iter_resources(path, start=None, limit=None, *, directory_files=None):
     """Yield (row, data) for every validated 0x7a resource: an RPF9 window, a carved file or a folder."""
     magic = b""
     if os.path.isfile(path):
@@ -128,7 +128,7 @@ def iter_resources(path, start=None, limit=None):
                 if res and res.get("complete"):
                     yield r, res["data"]
         return
-    rows, _ = WI.scan_path(path, start, limit)
+    rows, _ = WI.scan_path(path, start, limit, directory_files=directory_files)
     for r in rows:
         p = os.path.join(path, r["file"]) if os.path.isdir(path) else path
         with open(p, "rb") as f:
@@ -226,12 +226,12 @@ def check_extents(maps, defs):
     return out
 
 
-def run(path, start=None, limit=None, extents=False):
+def run(path, start=None, limit=None, extents=False, *, directory_files=None):
     defs, maps, resources = {}, [], []
     stats = {"resources": 0, "maptypes": 0, "archetype_resources": 0, "archetypes": 0, "kinds": {},
              "asset_types": {}, "names": 0, "names_with_differing_boxes": 0}
     schemas = {}
-    for row, data in iter_resources(path, start, limit):
+    for row, data in iter_resources(path, start, limit, directory_files=directory_files):
         stats["resources"] += 1
         if row.get("kind") == "map":
             if extents:
@@ -282,7 +282,13 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if not os.path.exists(a.path):
         ap.error("no such file or folder: %s" % a.path)
-    doc = run(a.path, a.start, a.limit, a.check_extents)
+    try:
+        directory_files = list(WI._directory_files(a.path)) if os.path.isdir(a.path) else None
+        WI._check_report_paths(ap, (("--out", a.out),), a.path, directory_files)
+        doc = run(a.path, a.start, a.limit, a.check_extents, directory_files=directory_files)
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     doc["summary"].update({"path": os.path.abspath(a.path), "start": a.start, "limit": a.limit})
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     with open(a.out, "w", encoding="utf-8", newline="\n") as f:
