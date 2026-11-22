@@ -12952,7 +12952,8 @@ def translate(path):
             if op == "s_endpgm" or op in BRANCHES:
                 last = ins
                 break
-            if full_lds and op.startswith("ds_") and op not in ("ds_swizzle_b32", "ds_bpermute_b32", "ds_permute_b32"):
+            if (full_lds and op.startswith("ds_") and op not in NOOPS
+                    and op not in ("ds_swizzle_b32", "ds_bpermute_b32", "ds_permute_b32")):
                 g.borrow_lds = True
         fall = [n + 1] if n + 1 < len(blocks) else []
         if last is None:

@@ -13,6 +13,16 @@ import test_loop_ballot_barrier as wave
 
 
 class FullLdsWave64Tests(unittest.TestCase):
+    def test_ds_nop_does_not_borrow_undeclared_guest_storage(self):
+        program = ["s_mov_b64 exec, -1", "ds_nop",
+                   "v_readfirstlane_b32 s8, v0", "s_endpgm"]
+        asm, gen = wave._translate_cs("cs_full_nop", program, 64,
+                                      lds_bytes=65536, emulate=True)
+        self.assertFalse(gen.borrow_lds)
+        self.assertFalse(gen.uses_lds)
+        self.assertNotIn("%lds", asm)
+        self.assertEqual(workgroup_bytes(asm), {"%x_buf": gen.x_buf_bytes()})
+
     def check_kernel(self, name, program, expected):
         threads = len(expected)
         asm, gen = wave._translate_cs("cs_" + name, program, threads, lds_bytes=65536, emulate=True)
