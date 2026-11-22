@@ -942,5 +942,87 @@ class TestValuCvtPkI32I16IEEE754EdgeCases(unittest.TestCase):
                 self.assertEqual(d0, exp0)
                 self.assertEqual(d1, exp1)
 
+# ==============================================================================
+# Unit Tests: Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestValuCvtPkI32I16NegativeRejection(unittest.TestCase):
+    """Unit tests for syntax validation and negative error rejection."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarVALUInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_sgpr_destination_rejected(self) -> None:
+        with self.assertRaises(TypeError):
+            Instruction(
+                opcode=Opcode.V_CVT_PK_I32_I16,
+                dst=Register(RegKind.SGPR, 0, count=2),
+                src0=Register(RegKind.VGPR, 2),
+            )
+
+    def test_destination_count_must_be_two(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_CVT_PK_I32_I16,
+                dst=Register(RegKind.VGPR, 0, count=1),
+                src0=Register(RegKind.VGPR, 2),
+            )
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_CVT_PK_I32_I16,
+                dst=Register(RegKind.VGPR, 0, count=3),
+                src0=Register(RegKind.VGPR, 2),
+            )
+
+    def test_out_of_bounds_register_indices(self) -> None:
+        with self.assertRaises((ValueError, IndexError)):
+            Register(RegKind.VGPR, 255, count=2)
+
+    def test_invalid_wavefront_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWavefrontInterpreter(wave_size=48)
+
+    def test_invalid_lane_index(self) -> None:
+        simd = SIMDState(wave_size=32)
+        with self.assertRaises(IndexError):
+            simd.read_lane_reg(-1, Register(RegKind.VGPR, 0))
+        with self.assertRaises(IndexError):
+            simd.read_lane_reg(32, Register(RegKind.VGPR, 0))
+
+
+class TestValuCvtPkI32I16MutationDetection(unittest.TestCase):
+    """Unit tests detecting potential implementation mutations and regressions."""
+
+    def test_mutant_zero_extension_detection(self) -> None:
+        # Mutant: zero-extending instead of sign-extending negative 16-bit values
+        src = 0x8000_8000
+        d0, d1 = ref_cvt_pk_i32_i16(src)
+        self.assertEqual(d0, 0xFFFF_8000, "Must be sign-extended to 32 bits")
+        self.assertEqual(d1, 0xFFFF_8000, "Must be sign-extended to 32 bits")
+        self.assertNotEqual(d0, 0x0000_8000, "Zero-extension mutant must be rejected")
+        self.assertNotEqual(d1, 0x0000_8000, "Zero-extension mutant must be rejected")
+
+    def test_mutant_swapped_halves_detection(self) -> None:
+        src = 0x0001_FFFF
+        d0, d1 = ref_cvt_pk_i32_i16(src)
+        self.assertEqual((d0, d1), (0xFFFF_FFFF, 1))
+        self.assertNotEqual((d0, d1), (1, 0xFFFF_FFFF), "Swapped dwords mutant must be rejected")
+
+    def test_mutant_shift_amount_detection(self) -> None:
+        src = 0x0001_0000
+        d0, d1 = ref_cvt_pk_i32_i16(src)
+        self.assertEqual(d1, 1)
+        self.assertNotEqual(d1, 2, "Shift-15 mutant must be rejected")
+        self.assertNotEqual(d1, 0, "Shift-17 mutant must be rejected")
+
+    def test_mutant_mask_width_detection(self) -> None:
+        src = 0x7FFF_7FFF
+        d0, d1 = ref_cvt_pk_i32_i16(src)
+        self.assertEqual(d0, 0x7FFF)
+        self.assertNotEqual(d0, 0x3FFF, "14-bit mask mutant must be rejected")
+
 if __name__ == "__main__":
     unittest.main()
