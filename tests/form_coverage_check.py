@@ -290,6 +290,20 @@ def check_parsing():
     assert {"delta", "local", "plane_request"}.isdisjoint(unmatched), unmatched
 
 
+def check_gaps():
+    reference = {("VOP1", "v_a"), ("VOP3", "v_a_e64"), ("VOP3", "v_b_e64"), ("VOP1", "v_c")}
+    fixtures = {"passing": ({"v_a_e32"}, "pass"),
+                "skipping": ({"v_a_e32", "v_a_e64"}, "skip"),
+                "failing": ({"v_a_e64", "v_b_e64"}, "fail")}
+    measured = fc.summarize(reference, fixtures, fc.gfx_forms, include_gaps=True)
+    assert measured.pop("gaps") == [
+        ("VOP1", "v_c", "unobserved"),
+        ("VOP3", "v_a_e64", "skipped"),
+        ("VOP3", "v_b_e64", "observed_without_pass"),
+    ]
+    assert measured == fc.summarize(reference, fixtures, fc.gfx_forms)
+
+
 def check_dashboard():
     """tools/coverage_svg.py draws one square per reference form, coloured by its measured state."""
     import coverage_svg as svg
@@ -518,6 +532,7 @@ if __name__ == "__main__":
     check_cpu_records()
     check_shader_records()
     check_parsing()
+    check_gaps()
     check_dashboard()
     check_avx2_regs()
     check_avx_int_regs()
