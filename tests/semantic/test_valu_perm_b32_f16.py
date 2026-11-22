@@ -744,5 +744,81 @@ class TestPermB32F16RegisterAliasing(unittest.TestCase):
         self.interp.execute(instr)
         self.assertEqual(self.rf.get_vgpr(0), pack_halves(POS_TWO, POS_ONE))
 
+# ==============================================================================
+# Condition Codes, Status Flags, and FP Classifications
+# ==============================================================================
+
+@dataclass
+class FPStatusFlags:
+    zero: bool = False
+    nan: bool = False
+    subnormal: bool = False
+    negative: bool = False
+    infinity: bool = False
+
+
+def is_nan16(bits: int) -> bool:
+    return ((bits & EXP_MASK16) == EXP_MASK16) and ((bits & FRAC_MASK16) != 0)
+
+
+def is_inf16(bits: int) -> bool:
+    return ((bits & EXP_MASK16) == EXP_MASK16) and ((bits & FRAC_MASK16) == 0)
+
+
+def is_subnormal16(bits: int) -> bool:
+    return ((bits & EXP_MASK16) == 0) and ((bits & FRAC_MASK16) != 0)
+
+
+def is_zero16(bits: int) -> bool:
+    return (bits & ~SIGN16) == 0
+
+
+def eval_fp_status(val32: int) -> FPStatusFlags:
+    h0 = val32 & MASK16
+    h1 = (val32 >> 16) & MASK16
+
+    both_zero = is_zero16(h0) and is_zero16(h1)
+    has_nan = is_nan16(h0) or is_nan16(h1)
+    has_subnormal = is_subnormal16(h0) or is_subnormal16(h1)
+    has_inf = is_inf16(h0) or is_inf16(h1)
+    is_neg = bool(h0 & SIGN16) or bool(h1 & SIGN16)
+
+    return FPStatusFlags(
+        zero=both_zero,
+        nan=has_nan,
+        subnormal=has_subnormal,
+        negative=is_neg,
+        infinity=has_inf,
+    )
+
+
+class TestPermB32F16ConditionCodesAndStatus(unittest.TestCase):
+    def setUp(self):
+        self.rf = ScalarRegisterFile()
+        self.interp = ScalarInterpreter(self.rf)
+
+    def test_status_flags_zero_result(self):
+        sel = make_selector(SEL_POS_ZERO, SEL_NEG_ZERO)
+        res = oracle_v_perm_b32_f16(0, 0, sel)
+        flags = eval_fp_status(res)
+        self.assertTrue(flags.zero)
+        self.assertTrue(flags.negative)
+
+    def test_scc_preserved_by_valu_perm(self):
+        self.rf.scc = 1
+        self.rf.set_vgpr(1, pack_halves(POS_ONE, POS_ONE))
+        self.rf.set_vgpr(2, pack_halves(POS_TWO, POS_TWO))
+        sel = PermSelectorWord.identity_src1().raw
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B32_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.literal(sel),
+        )
+        self.interp.execute(instr)
+        self.assertEqual(self.rf.scc, 1)
+
 if __name__ == "__main__":
     unittest.main()
