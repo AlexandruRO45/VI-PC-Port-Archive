@@ -1717,15 +1717,20 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             lines.append(f"    bool cmp{i} = (class32({operand}) & {bits}) != 0u;")
 
-        elif m := match(r"v_(add|sub)_nc_u32(?:_e32)? (v\d+), ([^,]+), ([^,]+)"):
+        elif m := match(r"v_(add|sub|subrev)_nc_u32(?:_e32)? (v\d+), ([^,]+), ([^,]+)"):
             op, dst, src0, src1 = m.groups()
             if mask != "entry" or dst in sample_dest:
                 raise ValueError("Invalid integer operation")
             a = int_operand(src0, scalar, vector, pending, sample_dest, signed=False)
             b = int_operand(src1, scalar, vector, pending, sample_dest, signed=False)
-            operator = "+" if op == "add" else "-"
+            if op == "add":
+                expr = f"{a} + {b}"
+            elif op == "sub":
+                expr = f"{a} - {b}"
+            else:
+                expr = f"{b} - {a}"
             vector[dst] = f"alu{i}"
-            lines.append(f"    precise float alu{i} = asfloat({a} {operator} {b});")
+            lines.append(f"    precise float alu{i} = asfloat({expr});")
         elif m := match(r"v_(min|max)_(i32|u32)(?:_e32|_e64)? (v\d+), ([^,]+), ([^,]+)"):
             op, kind, dst, *tokens = m.groups()
             if mask != "entry":

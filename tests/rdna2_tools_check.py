@@ -295,7 +295,7 @@ class TestRdna2Disasm(unittest.TestCase):
 
     def test_vop2_integer_opcode_table_synthetic_forms(self):
         from disasm_rdna2 import VOP2_OPS
-        target_ops = {0x16, 0x18, 0x1a, 0x1b, 0x1c, 0x1d, 0x25, 0x26}
+        target_ops = {0x16, 0x18, 0x1a, 0x1b, 0x1c, 0x1d, 0x25, 0x26, 0x27}
         for op in target_ops:
             expected_name, _ = VOP2_OPS[op]
             w0 = (op << 25) | (2 << 17) | (1 << 9) | 0
@@ -1260,6 +1260,7 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertFalse(is_instruction_supported("v_nop v0"))
         self.assertTrue(is_instruction_supported("v_subrev_f32_e32 v1, v2, v3"))
         self.assertTrue(is_instruction_supported("v_subrev_f32_e64 v1, v2, v3 clamp"))
+        self.assertTrue(is_instruction_supported("v_subrev_nc_u32_e32 v1, v2, v3"))
         self.assertTrue(is_opcode_recognized("v_mov_b32_sdwa"))
         self.assertTrue(is_opcode_recognized("v_cvt_f32_f16_sdwa"))
         self.assertTrue(is_opcode_recognized("v_pk_add_f16"))
