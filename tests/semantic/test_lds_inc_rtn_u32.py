@@ -1346,5 +1346,157 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(mem2, 0)
 
 
+# ==============================================================================
+# Phase 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestNegativeControlsAndMutationDetection(unittest.TestCase):
+    """Phase 8: Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_malformed_tokens(self) -> None:
+        with self.assertRaises(ValueError):
+            DSIncRtnInstruction.parse("")
+        with self.assertRaises(ValueError):
+            DSIncRtnInstruction.parse("ds_inc_rtn_u32")
+        with self.assertRaises(ValueError):
+            DSIncRtnInstruction.parse("ds_inc_rtn_u32 v0")
+        with self.assertRaises(ValueError):
+            DSIncRtnInstruction.parse("ds_inc_rtn_u32 v0, v1")
+        with self.assertRaises(ValueError):
+            DSIncRtnInstruction.parse("ds_add_rtn_u32 v0, v1, v2")
+        with self.assertRaises(ValueError):
+            DSIncRtnInstruction.parse("ds_inc_rtn_u32 v0, v1, v2 invalid_modifier:10")
+
+    def test_syntax_rejection_register_classes(self) -> None:
+        s0 = RegisterOperand(0, RegType.SGPR)
+        v0 = RegisterOperand(0, RegType.VGPR)
+        v1 = RegisterOperand(1, RegType.VGPR)
+
+        # vdst cannot be SGPR
+        with self.assertRaises(TypeError):
+            DSIncRtnInstruction(vdst=s0, vaddr=v0, vdata=v1)
+        # vaddr cannot be SGPR
+        with self.assertRaises(TypeError):
+            DSIncRtnInstruction(vdst=v0, vaddr=s0, vdata=v1)
+        # vdata cannot be SGPR
+        with self.assertRaises(TypeError):
+            DSIncRtnInstruction(vdst=v0, vaddr=v1, vdata=s0)
+
+    def test_syntax_rejection_register_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.SGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(106, RegType.SGPR)
+
+    def test_syntax_rejection_offset_bounds(self) -> None:
+        v0 = RegisterOperand(0, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            DSIncRtnInstruction(vdst=v0, vaddr=v0, vdata=v0, offset=-1)
+        with self.assertRaises(ValueError):
+            DSIncRtnInstruction(vdst=v0, vaddr=v0, vdata=v0, offset=0x1_0000)
+
+    def test_syntax_rejection_lds_capacity(self) -> None:
+        with self.assertRaises(ValueError):
+            LDSModel(capacity_dwords=0)
+        with self.assertRaises(ValueError):
+            LDSModel(capacity_dwords=-16)
+        with self.assertRaises(ValueError):
+            LDSModel(capacity_dwords=1000)  # Not a power of two
+
+    def test_syntax_rejection_simd_lane_count(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_mutation_detection_wrap_strict_greater(self) -> None:
+        # Mutant: wraps only on `old_val > wrap_limit` instead of `>=`
+        def mutant_inc(old: int, limit: int) -> Tuple[int, int]:
+            u_old = u32(old)
+            u_lim = u32(limit)
+            return u_old, 0 if u_old > u_lim else u32(u_old + 1)
+
+        val, limit = 5, 5
+        correct_old, correct_mem = oracle_ds_inc_rtn_u32(val, limit)
+        mutant_old, mutant_mem = mutant_inc(val, limit)
+
+        self.assertEqual(correct_mem, 0)
+        self.assertEqual(mutant_mem, 6)
+        self.assertNotEqual(correct_mem, mutant_mem)
+
+    def test_mutation_detection_return_new_val(self) -> None:
+        # Mutant: returns new_mem in vdst instead of old_val
+        def mutant_inc_rtn(old: int, limit: int) -> Tuple[int, int]:
+            _, new_mem = oracle_ds_inc_rtn_u32(old, limit)
+            return new_mem, new_mem  # Bug: returned new_mem instead of old
+
+        val, limit = 10, 20
+        c_old, _ = oracle_ds_inc_rtn_u32(val, limit)
+        m_old, _ = mutant_inc_rtn(val, limit)
+        self.assertEqual(c_old, 10)
+        self.assertEqual(m_old, 11)
+        self.assertNotEqual(c_old, m_old)
+
+    def test_mutation_detection_missing_offset_masking(self) -> None:
+        # Mutant: fails to mask 16-bit offset
+        def mutant_eff_addr(vaddr: int, offset: int) -> int:
+            return (vaddr + offset) & MASK_32  # Missing `offset & 0xFFFF`
+
+        vaddr = 0x1000
+        unmasked_offset = 0x1_0020
+        correct_eff = calc_lds_effective_address(vaddr, unmasked_offset)
+        mutant_eff = mutant_eff_addr(vaddr, unmasked_offset)
+
+        self.assertEqual(correct_eff, 0x1020)
+        self.assertEqual(mutant_eff, 0x11020)
+        self.assertNotEqual(correct_eff, mutant_eff)
+
+    def test_mutation_detection_missing_dword_alignment(self) -> None:
+        # Mutant: byte index directly instead of shifting right by 2
+        def mutant_dword_idx(eff_addr: int, capacity: int) -> int:
+            return eff_addr & (capacity - 1)  # Missing `>> 2`
+
+        eff_addr = 0x103  # byte address 259
+        correct_idx = calc_lds_dword_index(eff_addr, 1024)
+        mutant_idx = mutant_dword_idx(eff_addr, 1024)
+
+        self.assertEqual(correct_idx, 0x40)  # 64
+        self.assertEqual(mutant_idx, 0x103)  # 259
+        self.assertNotEqual(correct_idx, mutant_idx)
+
+    def test_mutation_detection_exec_mask_leak(self) -> None:
+        # Mutant: inactive lane erroneously updates LDS memory
+        state = SIMDState(num_lanes=32, exec_mask=0x1, lds_capacity_dwords=1024)  # Lane 0 only active
+        interp = SIMDInterpreter()
+
+        addr_active = 0x10
+        addr_inactive = 0x20
+        state.lds.write_dword(addr_active, 10)
+        state.lds.write_dword(addr_inactive, 50)
+
+        # Lane 0 targets addr_active
+        state.set_lane_vgpr(0, 1, addr_active)
+        state.set_lane_vgpr(0, 2, 100)
+        # Lane 1 targets addr_inactive
+        state.set_lane_vgpr(1, 1, addr_inactive)
+        state.set_lane_vgpr(1, 2, 100)
+
+        instr = DSIncRtnInstruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata=RegisterOperand(2, RegType.VGPR),
+        )
+
+        results = interp.execute(instr, state)
+        self.assertEqual(results[0], (10, 11))
+        self.assertIsNone(results[1])
+        # Inactive lane must not have touched LDS memory
+        self.assertEqual(state.lds.read_dword(addr_inactive), 50)
+
+
 if __name__ == "__main__":
     unittest.main()
