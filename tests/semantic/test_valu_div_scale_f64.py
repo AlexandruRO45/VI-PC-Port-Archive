@@ -1063,5 +1063,257 @@ class TestDivScaleF64ScalarInterpreter(unittest.TestCase):
         self.assertEqual(rf.read_vgpr_pair_u64(0), F64_ONE)
 
 
+class SIMDWaveState:
+    """Architectural model of a SIMD wavefront (Wave32 or Wave64) with EXEC masking."""
+
+    def __init__(self, wave_size: int = 64) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Wave size must be 32 or 64, got {wave_size}")
+        self.wave_size = wave_size
+        self._exec_mask = (1 << wave_size) - 1
+        self.vgprs = [[0] * 256 for _ in range(wave_size)]
+        self.sgprs = [0] * 108
+
+    @property
+    def exec_mask(self) -> int:
+        return self._exec_mask
+
+    @exec_mask.setter
+    def exec_mask(self, val: int) -> None:
+        mask_limit = (1 << self.wave_size) - 1
+        self._exec_mask = val & mask_limit
+
+    @property
+    def exec_lo(self) -> int:
+        return self._exec_mask & MASK32
+
+    @exec_lo.setter
+    def exec_lo(self, val: int) -> None:
+        self._exec_mask = (self._exec_mask & ~MASK32) | (val & MASK32)
+
+    @property
+    def exec_hi(self) -> int:
+        return (self._exec_mask >> 32) & MASK32
+
+    @exec_hi.setter
+    def exec_hi(self, val: int) -> None:
+        if self.wave_size == 32:
+            raise ValueError("Cannot set exec_hi on Wave32")
+        self._exec_mask = (self._exec_mask & MASK32) | ((val & MASK32) << 32)
+
+    def set_lane_vgpr_pair_u64(self, lane: int, idx: int, val: int) -> None:
+        lo, hi = u64_to_dwords(val)
+        self.vgprs[lane][idx] = lo
+        self.vgprs[lane][idx + 1] = hi
+
+    def get_lane_vgpr_pair_u64(self, lane: int, idx: int) -> int:
+        return dwords_to_u64(self.vgprs[lane][idx], self.vgprs[lane][idx + 1])
+
+    def set_lane_vgpr_pair_f64(self, lane: int, idx: int, val: float) -> None:
+        self.set_lane_vgpr_pair_u64(lane, idx, f64_to_u64(val))
+
+    def get_lane_vgpr_pair_f64(self, lane: int, idx: int) -> float:
+        return u64_to_f64(self.get_lane_vgpr_pair_u64(lane, idx))
+
+    def set_sgpr_pair_u64(self, idx: int, val: int) -> None:
+        lo, hi = u64_to_dwords(val)
+        self.sgprs[idx] = lo
+        self.sgprs[idx + 1] = hi
+
+    def get_sgpr_pair_u64(self, idx: int) -> int:
+        return dwords_to_u64(self.sgprs[idx], self.sgprs[idx + 1])
+
+    def set_sgpr_pair_f64(self, idx: int, val: float) -> None:
+        self.set_sgpr_pair_u64(idx, f64_to_u64(val))
+
+    def get_sgpr_pair_f64(self, idx: int) -> float:
+        return u64_to_f64(self.get_sgpr_pair_u64(idx))
+
+    @property
+    def vcc(self) -> int:
+        if self.wave_size == 32:
+            return self.sgprs[106]
+        return dwords_to_u64(self.sgprs[106], self.sgprs[107])
+
+    @vcc.setter
+    def vcc(self, val: int) -> None:
+        if self.wave_size == 32:
+            self.sgprs[106] = val & MASK32
+        else:
+            self.sgprs[106], self.sgprs[107] = u64_to_dwords(val)
+
+
+class SIMDInterpreter:
+    """Multi-lane SIMD wavefront interpreter with EXEC masking."""
+
+    def __init__(self, wave: SIMDWaveState) -> None:
+        self.wave = wave
+
+    def resolve_lane_source_u64(self, lane: int, src: ASTOperand) -> int:
+        if src.kind == OperandKind.VGPR_PAIR:
+            val_u64 = self.wave.get_lane_vgpr_pair_u64(lane, src.index)
+        elif src.kind == OperandKind.SGPR_PAIR:
+            val_u64 = self.wave.get_sgpr_pair_u64(src.index)
+        elif src.kind in (OperandKind.INLINE_CONST, OperandKind.LITERAL_CONST):
+            val_u64 = f64_to_u64(float(src.value)) if src.value is not None else 0
+        else:
+            raise ValueError(f"Unsupported operand kind: {src.kind}")
+
+        return apply_src_mods_u64(val_u64, neg=src.neg, abs_=src.abs_)
+
+    def step(self, inst: ASTInstruction) -> int:
+        inst.validate()
+        sdst_mask = 0
+
+        for lane in range(self.wave.wave_size):
+            is_active = bool((self.wave.exec_mask >> lane) & 1)
+            if not is_active:
+                # Inactive lanes: destination is not modified, and sdst bit is 0
+                continue
+
+            u0 = self.resolve_lane_source_u64(lane, inst.src0)
+            u1 = self.resolve_lane_source_u64(lane, inst.src1)
+            u2 = self.resolve_lane_source_u64(lane, inst.src2)
+
+            d_u64, vcc_bit = ref_div_scale_f64_u64(
+                u0,
+                u1,
+                u2,
+                clamp=inst.clamp,
+                omod=inst.omod.value,
+            )
+
+            self.wave.set_lane_vgpr_pair_u64(lane, inst.dst.index, d_u64)
+            if vcc_bit:
+                sdst_mask |= (1 << lane)
+
+        # Write sdst mask
+        if inst.sdst.kind == OperandKind.VCC:
+            self.wave.vcc = sdst_mask
+        elif inst.sdst.kind == OperandKind.SGPR_PAIR:
+            self.wave.set_sgpr_pair_u64(inst.sdst.index, sdst_mask)
+        elif inst.sdst.kind == OperandKind.SGPR_SINGLE:
+            self.wave.sgprs[inst.sdst.index] = sdst_mask & MASK32
+
+        return sdst_mask
+
+
+class TestDivScaleF64SIMDMultiLane(unittest.TestCase):
+    """Test suite for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_simd_wave32_all_active(self):
+        wave = SIMDWaveState(wave_size=32)
+        interp = SIMDInterpreter(wave)
+
+        one5 = 0x3FF0000000000005
+        big = 0x71F0000000000000
+
+        for l in range(32):
+            wave.set_lane_vgpr_pair_u64(l, 2, one5)
+            wave.set_lane_vgpr_pair_u64(l, 4, big)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F64,
+            dst=ASTOperand.vgpr(0),
+            sdst=ASTOperand.vcc(is_wave32=True),
+            src0=ASTOperand.vgpr(2),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(4),
+        )
+
+        vcc_mask = interp.step(inst)
+        self.assertEqual(vcc_mask, MASK32)
+        self.assertEqual(wave.vcc, MASK32)
+
+        for l in range(32):
+            self.assertEqual(wave.vgprs[l][0], 0x00000005)
+            self.assertEqual(wave.vgprs[l][1], 0x47F00000)
+
+    def test_simd_wave64_divergent_exec_mask(self):
+        wave = SIMDWaveState(wave_size=64)
+        interp = SIMDInterpreter(wave)
+
+        # Alternating mask: 0x55555555_55555555 (even lanes active, odd lanes inactive)
+        alt_mask = 0x5555555555555555
+        wave.exec_mask = alt_mask
+
+        one5 = 0x3FF0000000000005
+        big = 0x71F0000000000000
+        sentinel = 0xDEADBEEFCAFEBABE
+
+        for l in range(64):
+            wave.set_lane_vgpr_pair_u64(l, 0, sentinel)
+            wave.set_lane_vgpr_pair_u64(l, 2, one5)
+            wave.set_lane_vgpr_pair_u64(l, 4, big)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F64,
+            dst=ASTOperand.vgpr(0),
+            sdst=ASTOperand.vcc(),
+            src0=ASTOperand.vgpr(2),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(4),
+        )
+
+        vcc_mask = interp.step(inst)
+        # sdst receives scale bit only for active lanes
+        self.assertEqual(vcc_mask, alt_mask)
+        self.assertEqual(wave.vcc, alt_mask)
+
+        for l in range(64):
+            if l % 2 == 0:
+                # Active lane: updated
+                self.assertEqual(wave.vgprs[l][0], 0x00000005)
+                self.assertEqual(wave.vgprs[l][1], 0x47F00000)
+            else:
+                # Inactive lane: strictly preserved sentinel
+                self.assertEqual(wave.get_lane_vgpr_pair_u64(l, 0), sentinel)
+
+    def test_simd_divergent_operands_across_lanes(self):
+        wave = SIMDWaveState(wave_size=32)
+        interp = SIMDInterpreter(wave)
+
+        one5 = 0x3FF0000000000005
+        big = 0x71F0000000000000
+        normal = 0x3FF0000000000000
+
+        for l in range(32):
+            if l < 16:
+                # First 16 lanes: e2 - e1 >= 768 -> scale up and vcc = 1
+                wave.set_lane_vgpr_pair_u64(l, 2, one5)
+                wave.set_lane_vgpr_pair_u64(l, 4, big)
+            else:
+                # Last 16 lanes: normal 1.0 / 1.0 -> no scale, vcc = 0
+                wave.set_lane_vgpr_pair_u64(l, 2, normal)
+                wave.set_lane_vgpr_pair_u64(l, 4, normal)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F64,
+            dst=ASTOperand.vgpr(0),
+            sdst=ASTOperand.vcc(is_wave32=True),
+            src0=ASTOperand.vgpr(2),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(4),
+        )
+
+        vcc_mask = interp.step(inst)
+        self.assertEqual(vcc_mask, 0x0000FFFF)
+        self.assertEqual(wave.vcc, 0x0000FFFF)
+
+        for l in range(16):
+            self.assertEqual(wave.vgprs[l][0], 0x00000005)
+            self.assertEqual(wave.vgprs[l][1], 0x47F00000)
+        for l in range(16, 32):
+            self.assertEqual(wave.get_lane_vgpr_pair_u64(l, 0), normal)
+
+    def test_exec_lo_hi_properties(self):
+        wave = SIMDWaveState(wave_size=64)
+        wave.exec_lo = 0x12345678
+        wave.exec_hi = 0x9ABCDEF0
+        self.assertEqual(wave.exec_mask, 0x9ABCDEF012345678)
+        self.assertEqual(wave.exec_lo, 0x12345678)
+        self.assertEqual(wave.exec_hi, 0x9ABCDEF0)
+
+
 if __name__ == "__main__":
     unittest.main()
