@@ -1,6 +1,6 @@
 """Pure standard-library DDS to PNG decoder and 2x box-filter downscaler.
 
-Supports legacy and DX10 DDS headers across uncompressed 32-bit formats
+Supports DX10 R8, R8G8 and A8 UNORM, plus legacy and DX10 uncompressed 32-bit formats
 (BGRA8, RGBA8, BGRX8, RGBX8, and arbitrary 32-bit RGB/RGBA bitmasks) and
 block-compressed formats (BC1, BC2, BC3, BC4, BC5, BC7).
 
@@ -53,6 +53,9 @@ _FOURCC_MAP: dict[bytes, str] = {
 _DXGI_MAP: dict[int, str] = {
     28: "RGBA8",
     29: "RGBA8",
+    49: "RG8",
+    61: "R8",
+    65: "A8",
     87: "BGRA8",
     91: "BGRA8",
     88: "BGRX8",
@@ -76,6 +79,8 @@ _DXGI_MAP: dict[int, str] = {
     98: "BC7",
     99: "BC7",
 }
+
+_PIXEL_BYTES = {"R8": 1, "A8": 1, "RG8": 2, "RGBA8": 4, "RGBX8": 4, "BGRA8": 4, "BGRX8": 4}
 
 _CANONICAL_MASKS: dict[tuple[int, int, int, int], str] = {
     (0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000): "BGRA8",
@@ -233,7 +238,7 @@ def parse_dds_header(data: bytes) -> dict:
     return info
 
 
-def _decode_uncompressed_32(
+def _decode_uncompressed(
     payload: memoryview,
     width: int,
     height: int,
@@ -242,7 +247,7 @@ def _decode_uncompressed_32(
     pitch: int,
 ) -> bytes:
     pixel_count = width * height
-    row_bytes = width * 4
+    row_bytes = width * _PIXEL_BYTES[fmt]
     pitch = pitch or row_bytes
     if pitch < row_bytes:
         raise DdsError(f"Invalid {fmt} row pitch: {pitch} bytes (need at least {row_bytes})")
@@ -254,6 +259,17 @@ def _decode_uncompressed_32(
         src = bytes(payload[:expected])
     else:
         src = b"".join(payload[start : start + row_bytes] for start in range(0, height * pitch, pitch))
+
+    if fmt in ("R8", "RG8", "A8"):
+        out = bytearray(pixel_count * 4)
+        if fmt == "A8":
+            out[3::4] = src
+        else:
+            out[0::4] = src[::_PIXEL_BYTES[fmt]]
+            if fmt == "RG8":
+                out[1::4] = src[1::2]
+            out[3::4] = b"\xff" * pixel_count
+        return bytes(out)
 
     if masks is None or masks in _CANONICAL_MASKS:
         if fmt == "RGBA8":
@@ -889,10 +905,10 @@ def decode_dds(data: bytes) -> tuple[int, int, bytes]:
     fmt = str(info["format"])
     offset = int(info["data_offset"])  # type: ignore[arg-type]
 
-    if fmt in ("RGBA8", "BGRA8", "BGRX8", "RGBX8"):
+    if fmt in _PIXEL_BYTES:
         flags = struct.unpack_from("<I", data, 8)[0]
         pitch = struct.unpack_from("<I", data, 20)[0] if flags & DDSD_PITCH else 0
-        rgba = _decode_uncompressed_32(memoryview(data)[offset:], width, height, fmt, masks, pitch)
+        rgba = _decode_uncompressed(memoryview(data)[offset:], width, height, fmt, masks, pitch)
     elif fmt == "BC1":
         rgba = _decode_bc1(data, offset, width, height)
     elif fmt == "BC2":

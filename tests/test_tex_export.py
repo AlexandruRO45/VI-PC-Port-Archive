@@ -198,7 +198,7 @@ def test_export_picks_the_top_mip_placement_and_writes_dds(eq, tmp_path, fmt, na
 def test_fmt_reuses_the_indexer_table_without_12_byte_rgb32():
     from tex_headers import FMT_INFO
     assert T.FMT == {f: v for f, v in FMT_INFO.items() if f not in (6, 7, 8)}
-    assert len(T.FMT) == 56
+    assert len(T.FMT) == 57
 
 
 @pytest.mark.parametrize("fmt", sorted(T.FMT))
@@ -400,6 +400,21 @@ def test_png_is_written_beside_the_dds_with_the_texels(eq, tmp_path, monkeypatch
     log = json.loads((out / "export_log.json").read_text(encoding="utf-8"))
     assert log[0]["export"]["png"] == "written"
     assert text.splitlines() == ["1 textures: {'ok:first': 1} -> " + str(out), "png: {'written': 1}"]
+
+
+@pytest.mark.parametrize("fmt,name,texels,rgba", [
+    (61, "R8_UNORM", [17, 33], [17, 0, 0, 255, 33, 0, 0, 255]),
+    (49, "R8G8_UNORM", [17, 25, 33, 51], [17, 25, 0, 255, 33, 51, 0, 255]),
+    (65, "A8_UNORM", [17, 33], [0, 0, 0, 17, 0, 0, 0, 33]),
+])
+def test_byte_channel_png_export(eq, tmp_path, monkeypatch, capsys, fmt, name, texels, rgba):
+    eq(T.FMT[fmt][0])
+    carve = str(tmp_path / "carve")
+    write_blob(carve, "x.rpf", 0x1000, bytes(texels).ljust(4096, b"\0"))
+    out, code, _ = png_main(tmp_path, monkeypatch, capsys, [texture(fmt, name, 2, 1, 1)], carve, "--png")
+    assert code is None
+    assert read_png(next(out.rglob("*.png"))) == (2, 1, bytes(rgba))
+    assert next(out.rglob("*.dds")).read_bytes()[148:] == bytes(texels)
 
 
 def test_undecodable_format_keeps_the_dds_and_counts_unsupported(eq, tmp_path, monkeypatch, capsys):

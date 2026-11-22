@@ -395,6 +395,18 @@ class HeaderTests(unittest.TestCase):
 
 
 class UncompressedTests(unittest.TestCase):
+    def test_dx10_byte_channels_ignore_row_padding(self):
+        for dxgi, first, second, rgba in (
+                (61, b"\x17", b"\xa9", (23, 0, 0, 255, 169, 0, 0, 255)),
+                (49, b"\x17\x31", b"\xa9\x42", (23, 49, 0, 255, 169, 66, 0, 255)),
+                (65, b"\x17", b"\xa9", (0, 0, 0, 23, 0, 0, 0, 169))):
+            with self.subTest(dxgi=dxgi):
+                header = dict(flags=DDPF_FOURCC, fourcc=b"DX10", dxgi=dxgi, pitch=4)
+                payload = first.ljust(4, b"\xff") + second
+                self.assertEqual(dds.decode_dds(dds_buffer(1, 2, payload, **header)), (1, 2, bytes(rgba)))
+                with self.assertRaisesRegex(dds.DdsError, "Truncated"):
+                    dds.decode_dds(dds_buffer(1, 2, payload[:-1], **header))
+
     def test_padded_rows_are_removed_before_channel_conversion(self):
         first_row = bytes((1, 2, 3, 4))
         second_row = bytes((5, 6, 7, 8))
