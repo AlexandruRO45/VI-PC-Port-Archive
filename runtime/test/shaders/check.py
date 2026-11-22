@@ -297,8 +297,58 @@ def _w64x_carry_words():
 
 
 W64X_CARRY_WORDS = _w64x_carry_words()
+
+
+def _w64x_vcmp_words():
+    """cs_w64x_vcmp.asm's 430 words, from the formulas in its header (the ISA pseudocode, plain integers and floats)."""
+    m32, all64 = 0xFFFFFFFF, (1 << 64) - 1
+    lanes = range(64)
+
+    def f32(bits):
+        return struct.unpack("<f", struct.pack("<I", bits))[0]
+
+    def signed(x, bits):
+        return x - (1 << bits) if x >> (bits - 1) else x
+
+    def klass(bits):
+        """The class bit of an f32 (ISA: 0 sNaN, 1 qNaN, 2 -inf, 3 -normal, 4 -denormal, 5 -0, 6 +0, 7 +denormal, ...)."""
+        exp, frac, neg = (bits >> 23) & 0xFF, bits & 0x7FFFFF, bits >> 31
+        if exp == 255:
+            return (1 << 2 if neg else 1 << 9) if not frac else (1 << 1 if frac >> 22 else 1)
+        if exp == 0:
+            return (1 << 5 if neg else 1 << 6) if not frac else (1 << 4 if neg else 1 << 7)
+        return 1 << 3 if neg else 1 << 8
+
+    def mask(pred):
+        return sum(1 << lane for lane in lanes if pred(lane))
+
+    v2 = [(lane - 32) & m32 for lane in lanes]                       # L - 32
+    h = [(lane * 0x9E3779B1) & m32 for lane in lanes]
+    a64 = [((lane >> 5) << 32) | (~lane & m32) for lane in lanes]
+    i64 = [(((-(lane >> 5)) & m32) << 32) | lane for lane in lanes]
+    fbits = [{5: 0x7FC00000, 37: 0x7FC00000, 1: 0xFF800000, 33: 0xFF800000, 63: 0x7F800001}.get(
+        lane, struct.unpack("<I", struct.pack("<f", float(lane)))[0]) for lane in lanes]
+    f = [f32(b) for b in fbits]
+    s1 = [0xC if lane < 32 else 0x300 for lane in lanes]
+    m = [mask(lambda l: signed(v2[l], 32) < 0), mask(lambda l: v2[l] > 0), mask(lambda l: signed(h[l], 32) < 0),
+         mask(lambda l: h[l] <= 0x55555555), mask(lambda l: l == 37), mask(lambda l: l & 31 != 0),
+         mask(lambda l: signed(v2[l], 32) >= 5), mask(lambda l: a64[l] < (1 << 32 | 0x80000000)),
+         mask(lambda l: signed(i64[l], 64) > 16), mask(lambda l: f[l] < 32.0), mask(lambda l: not f[l] < 32.0),
+         mask(lambda l: f[l] != f[l]), mask(lambda l: f[l] == f[l]), mask(lambda l: not f[l] == 40.0),
+         mask(lambda l: f[l] < 40.0 or f[l] > 40.0), mask(lambda l: klass(fbits[l]) & s1[l] != 0)]
+    m += [m[1] & m[2], m[0] | m[4], m[2] ^ m[3], m[1] & ~m[3] & all64, (m[0] | ~m[3]) & all64,
+          ~(m[7] | m[9]) & all64, ~(m[8] ^ m[15]) & all64]
+    words = [sum(((m[k] >> lane) & 1) << k for k in range(len(m))) for lane in lanes]
+    for k in (0, 7, 15, 20, 5):                                      # v_cndmask(L, L | 0x100, Mk)
+        words += [lane | 0x100 if (m[k] >> lane) & 1 else lane for lane in lanes]
+    words += [bin(x).count("1") for x in m]                          # s_bcnt1_i32_b64
+    words += [((x & -x).bit_length() - 1) & m32 for x in m]          # s_ff1_i32_b64
+    return words
+
+
+W64X_VCMP_WORDS = _w64x_vcmp_words()
 # Wave64 dump tests that compare the whole dump (heap of len(words) words), not just out[0..7]: name -> words.
-W64X_FULL = [("cs_w64x_carry", W64X_CARRY_WORDS)]
+W64X_FULL = [("cs_w64x_carry", W64X_CARRY_WORDS), ("cs_w64x_vcmp", W64X_VCMP_WORDS)]
 # A 40-thread group (one partial wave) cannot use --require-wave64 (full subgroups), so it asks for subgroup size 64.
 W64X_PARTIAL = [("cs_w64x_partial", [40, 40, 528, 0, 0, 532, 539, 524820]),
                 ("cs_w64x_partial_scmp", [0, 1, 0, 1, 1, 1, 1, 0])]
