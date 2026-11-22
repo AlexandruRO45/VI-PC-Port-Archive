@@ -4,6 +4,8 @@ Uses tools/glb_writer.py to process entire directories of OBJ models
 with multi-core parallelism and progress reporting. Can optionally link
 and embed textures (.png or .dds) directly into glTF materials.
 Inputs that would share an output path are rejected before any models are written.
+Collision checks use the shared report-path rules. On Windows they treat case-only
+names as conflicting even in directories with case sensitivity enabled.
 
 Usage:
     python -I tools/batch_glb.py <in_dir> <out_dir> [--jobs N] [--up z|y] [--textures <dir>]
