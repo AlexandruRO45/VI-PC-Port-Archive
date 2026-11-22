@@ -529,9 +529,13 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
         "ratio": result["ratio"],
         "ppm": ppm,
     }
+    write_manifest(manifest, out_dir)
+    return result
+
+
+def write_manifest(manifest: dict, out_dir: str) -> None:
     with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(manifest, f, indent=1)
-    return result
 
 
 def load_json(
@@ -761,8 +765,7 @@ def main(argv=None) -> int:
                 }
                 for p in probes
             ]
-    with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
-        json.dump(manifest, f, indent=1)
+    write_manifest(manifest, out_dir)
     print(f"{len(vertices)} vertices, {len(indices) // 3} triangles -> {out_dir}")
     if not (a.run or a.check):
         env_preview = harness_env(manifest, out_dir, base_env={})
