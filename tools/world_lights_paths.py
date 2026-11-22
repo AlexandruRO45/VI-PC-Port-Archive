@@ -708,7 +708,7 @@ def summarize(total, entities=None, lights_out=None):
         try:
             if out is not None:
                 out.close()
-            if ok:
+            if ok and tmp is not None:
                 os.replace(tmp, lights_out)
                 tmp = None
         finally:
