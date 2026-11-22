@@ -1,5 +1,5 @@
 {
- "about": "Method names of the ID3D12 interfaces (Windows SDK d3d12.h) and the DXGI_FORMAT names (dxgiformat.h). Names only, no declarations. Regenerate with tools/graphics_progress.py --refresh-data --d3d12-header <d3d12.h> --dxgi-header <dxgiformat.h>.",
+ "about": "Method names of the ID3D12 interfaces (Windows SDK d3d12.h) and the DXGI_FORMAT names (dxgiformat.h). Names only, no declarations or other SDK text. Regenerate with tools/graphics_progress.py --refresh-data --d3d12-header <d3d12.h> --dxgi-header <dxgiformat.h>.",
  "d3d12": {
   "ID3D12CommandAllocator": {
    "base": "ID3D12Pageable",
@@ -795,5 +795,6 @@
   "SAMPLER_FEEDBACK_MIN_MIP_OPAQUE",
   "SAMPLER_FEEDBACK_MIP_REGION_USED_OPAQUE",
   "A4B4G4R4_UNORM"
- ]
+ ],
+ "source": "Windows SDK 10.0.26100.0 (d3d12.h, dxgiformat.h)"
 }

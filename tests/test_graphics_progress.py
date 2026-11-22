@@ -109,6 +109,9 @@ class Gen:
     FORMATS = {22: (4, "f32", (32,)), 1: (1, "unorm", (8,)),
                5: (1, "uint", (8,)), 5: (1, "uint", (8,)), 99: (4, "f32", (32,))}
 
+    def fmt_field(self, lit3):
+        return lit3 >> 12 & 0x7F
+
     def _insn(self, op):
         if op == "v_add_f32":
             return 1
@@ -133,7 +136,15 @@ def helper():
 '''
 
 GFX10 = {"0": "GFX10_FORMAT_INVALID", "1": "GFX10_FORMAT_8_UNORM", "5": "GFX10_FORMAT_8_UINT",
-         "22": "GFX10_FORMAT_32_FLOAT", "23": "GFX10_FORMAT_16_16_UNORM"}
+         "22": "GFX10_FORMAT_32_FLOAT", "23": "GFX10_FORMAT_16_16_UNORM",
+         "128": "GFX10_FORMAT_8_SRGB", "129": "GFX10_FORMAT_8_8_SRGB"}
+
+DESCRIPTORS_H = """
+    {22, VK_FORMAT_R32_SFLOAT, channels_r},      // below 128: not an image-only code
+    {128, VK_FORMAT_R8_SRGB, channels_r},        // GFX10_FORMAT_8_SRGB
+    {128, VK_FORMAT_R8_SRGB, channels_bgr},      // the same code twice counts once
+    // {129, VK_FORMAT_R8G8_SRGB, channels_rg},  commented out
+"""
 
 DEVICE_CPP = """
 Format vulkan_format(DXGI_FORMAT format, bool depth) {
@@ -188,6 +199,7 @@ const char* s = "plain"; /* E_NOTIMPL */
     "tests/semantic/fixtures/f1.asm": "",
     "tools/rdna2spirv.py": TRANSLATOR_SRC,
     "tools/gfx10_formats.json": json.dumps(GFX10),
+    "runtime/src/gfx10_descriptors.h": DESCRIPTORS_H,
     "docs/d3d12_vulkan.md": MILESTONES,
     "docs/isa_coverage.md": ISA_DOC,
 }
@@ -298,9 +310,32 @@ class Formats(Fixture):
 
     def test_buffer_format_codes_against_the_json_table(self):
         g = gp.count_formats(self.tree, DXGI_LIST)["gfx10_buffer"]
-        self.assertEqual((g["handled"], g["total"]), (3, 4))      # INVALID left out; 99 is not in the table
+        # INVALID (0) and the image-only codes 128 and 129 are not buffer codes; 99 is not in the table
+        self.assertEqual((g["handled"], g["total"]), (3, 4))
         self.assertEqual(g["codes_outside_table"], [99])
+        self.assertEqual([c["code"] for c in g["cells"]], [1, 5, 22, 23])
         self.assertEqual([c["name"] for c in g["cells"] if not c["handled"]], ["16_16_UNORM"])
+        self.assertEqual(g["field_bits"], 7)
+        self.assertTrue(g["field_bits_seen_in_translator"])
+        self.assertEqual(g["codes_in_table_total"], 7)
+
+    def test_image_only_codes_are_listed_apart_and_counted_from_the_runtime_table(self):
+        im = gp.count_formats(self.tree, DXGI_LIST)["gfx10_buffer"]["image_only"]
+        self.assertEqual((im["mapped"], im["total"]), (1, 2))
+        self.assertEqual([(c["code"], c["mapped"]) for c in im["cells"]], [(128, True), (129, False)])
+
+    def test_a_translator_covering_every_buffer_code_reports_all_of_them(self):
+        table = {str(c): f"GFX10_FORMAT_X{c}" for c in range(1, 78)}
+        table.update({"0": "GFX10_FORMAT_INVALID", "128": "GFX10_FORMAT_8_SRGB"})
+        keys = ", ".join(f"{c}: (4, 'f32', (32,))" for c in range(1, 78))
+        files = {"tools/gfx10_formats.json": json.dumps(table),
+                 "tools/rdna2spirv.py": "class Gen:\n    FORMATS = {" + keys + "}\n"
+                                        "    def f(self, w):\n        return w >> 12 & 0x7F\n"}
+        with tempfile.TemporaryDirectory() as tmp:
+            write_tree(tmp, files)
+            g = gp.count_formats(gp.WorkTree(tmp), [])["gfx10_buffer"]
+        self.assertEqual((g["handled"], g["total"]), (77, 77))
+        self.assertEqual(g["handled_outside_buffer_range"], [])
 
     def test_dxgi_formats_are_those_in_the_two_functions_only(self):
         d = gp.count_formats(self.tree, DXGI_LIST)["dxgi"]
@@ -554,6 +589,18 @@ class RealTree(unittest.TestCase):
                 data = json.load(f)
         self.assertEqual(data["d3d12"]["ID3D12Thing"], {"base": "IUnknown", "methods": ["GetDesc", "Other"]})
         self.assertEqual(data["dxgi_formats"], ["R32_FLOAT", "A8_UNORM"])
+
+    def test_data_file_holds_names_only(self):
+        data = gp.load_data()
+        self.assertEqual(set(data), {"about", "source", "d3d12", "dxgi_formats"})
+        self.assertIn("Windows SDK", data["source"])
+        for name, entry in data["d3d12"].items():
+            self.assertRegex(name, r"^ID3D12\w+$")
+            self.assertEqual(set(entry), {"base", "methods"})
+            self.assertRegex(entry["base"], r"^\w+$")
+            self.assertTrue(all(re.fullmatch(r"[A-Za-z_]\w*", m) for m in entry["methods"]), name)
+            self.assertEqual(len(entry["methods"]), len(set(entry["methods"])), name)
+        self.assertTrue(all(re.fullmatch(r"[A-Z0-9_]+", n) for n in data["dxgi_formats"]))
 
     def test_every_interface_cmake_builds_is_in_the_data_file(self):
         with open(os.path.join(ROOT, "runtime", "CMakeLists.txt"), encoding="utf-8") as f:

@@ -17,7 +17,8 @@ What is counted (every number on the page says how, next to it):
   RDNA2 ISA    tools/isa_coverage.py used as a library on the translator text; the instruction total comes from AMD's
                XML, which is not in the repository, so the share is the one docs/isa_coverage.md states (or a fresh
                one with --isa);
-  formats      GFX10 buffer format codes the translator decodes (Gen.FORMATS) out of tools/gfx10_formats.json, and
+  formats      GFX10 buffer format codes the translator decodes (Gen.FORMATS) out of the codes a 7-bit buffer V# FORMAT
+               field can carry (1 to 127 in tools/gfx10_formats.json; the image-only codes from 128 are listed apart), and
                DXGI formats the layer maps to Vulkan out of the DXGI list in tools/graphics_progress_data.json;
   tests        add_test() names in runtime/CMakeLists.txt, per area (registered, not passing);
   unsupported  places that refuse work: raise Unsupported in the translator, E_NOTIMPL and "unsupported" / "not
@@ -48,6 +49,9 @@ ISA_DOC = "docs/isa_coverage.md"
 TRANSLATOR = "tools/rdna2spirv.py"
 CMAKE = "runtime/CMakeLists.txt"
 GFX10_JSON = "tools/gfx10_formats.json"
+GFX10_DESCRIPTORS = "runtime/src/gfx10_descriptors.h"
+# Width of the FORMAT field of a buffer V# (word3[18:12]); the translator masks it with 0x7F.
+BUFFER_FORMAT_BITS = 7
 VK_DEVICE = "runtime/shims/d3d12_vulkan_device.cpp"
 # Sources that implement the D3D12 COM objects; the common one carries ID3D12Object and GetDevice for every object.
 COM_SOURCES = ["runtime/shims/d3d12_com.cpp", "runtime/shims/d3d12_vulkan_device.cpp", "runtime/shims/dxgi_com.cpp"]
@@ -333,15 +337,12 @@ def count_isa(tree, isa_xml=None):
         with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write(source)
         scan = ic.scan_translator(path)
-        # Names compared or tabled, minus those in a test whose whole body refuses. (isa_coverage's accepted_names()
-        # drops names held in a tuple whenever the file has such a test, so it is not used for the live count.)
-        refused = set(scan["refused"])
-        accepted = set(scan["exact"]) - refused
-        live = {"rule_names": len(accepted), "refused_names": len(refused),
+        accepted = ic.accepted_names(path)   # names compared or tabled outside a test that only raises Unsupported
+        live = {"rule_names": len(accepted), "refused_names": len(set(scan["refused"]) - accepted),
                 "branches_that_raise": len(scan["partial"]), "prefix_families": len(scan["prefixes"])}
         full = None
         if isa_xml:
-            report = ic.build_report(ic.read_isa(isa_xml), scan, ic.accepted_names(path))
+            report = ic.build_report(ic.read_isa(isa_xml), scan, accepted)
             t = report["totals"]
             full = {"total": report["instructions"], "handled_exact": t["handled-exact"],
                     "handled_family": t["handled-family"], "refused": t["refused"], "unknown": t["unknown"],
@@ -370,10 +371,25 @@ def count_formats(tree, dxgi_list):
     if names is not None and translator is not None:
         table = {int(k): v for k, v in json.loads(names).items()}
         handled = gen_formats(translator)
-        codes = sorted(c for c, n in table.items() if not n.endswith("_INVALID"))
+        # A buffer V# carries FORMAT[6:0] (the translator reads `word3 >> 12 & 0x7F`), so only codes below 2^7 can be
+        # a buffer format; the table's higher codes (sRGB, BC, FMASK, ...) exist for images only.
+        limit = 1 << BUFFER_FORMAT_BITS
+        codes = sorted(c for c, n in table.items() if 0 < c < limit and not n.endswith("_INVALID"))
         cells = [{"code": c, "name": table[c].replace("GFX10_FORMAT_", ""), "handled": c in handled} for c in codes]
+        image_codes = sorted(c for c in table if c >= limit)
+        mapped_by_runtime = set()
+        for m in re.finditer(r"^\s*\{(\d+),\s*VK_FORMAT_", mask_cpp(tree.text(GFX10_DESCRIPTORS) or ""), re.M):
+            mapped_by_runtime.add(int(m.group(1)))
         gfx = {"total": len(codes), "handled": sum(1 for c in cells if c["handled"]),
-               "codes_outside_table": sorted(handled - set(table)), "cells": cells}
+               "field_bits": BUFFER_FORMAT_BITS,
+               "field_bits_seen_in_translator": bool(re.search(r">>\s*12\s*&\s*0x7[Ff]\b", translator)),
+               "codes_in_table_total": len(table),
+               "handled_outside_buffer_range": sorted(c for c in handled if not 0 < c < limit),
+               "codes_outside_table": sorted(handled - set(table)), "cells": cells,
+               "image_only": {"total": len(image_codes),
+                              "mapped": sum(1 for c in image_codes if c in mapped_by_runtime),
+                              "cells": [{"code": c, "name": table[c].replace("GFX10_FORMAT_", ""),
+                                         "mapped": c in mapped_by_runtime} for c in image_codes]}}
     dxgi = None
     device = tree.text(VK_DEVICE)
     if device is not None and dxgi_list:
@@ -572,7 +588,7 @@ def headline(counts):
     if fm["gfx10_buffer"]:
         tiles.append({"id": "formats", "label": "Buffer formats", "value": fm["gfx10_buffer"]["handled"],
                       "total": fm["gfx10_buffer"]["total"], "unit": "decoded",
-                      "note": "GFX10 codes in the translator"})
+                      "note": "GFX10 codes 1 to 77 in the translator"})
     t = counts["tests"]
     tiles.append({"id": "tests", "label": "Graphics tests", "value": t["graphics_path"], "total": None,
                   "unit": "registered", "note": f"{t['registered']} in all"})
@@ -628,7 +644,7 @@ def fmt(n):
     return "-" if n is None else f"{n:,}"
 
 
-def sections(counts, history):
+def sections(counts, history, data_source=""):
     """[{id, title, how, blocks}], blocks being ('table', ...), ('raster', ...), ('details', ...) or ('note', text)."""
     out = []
 
@@ -667,7 +683,7 @@ def sections(counts, history):
     out.append({"id": "interfaces", "title": "D3D12 interface coverage",
                 "how": "Interfaces are the ones handed to tools/gen_d3d12_stubs.py in runtime/CMakeLists.txt. Methods "
                        "are the names of each interface and its bases (IUnknown left out) in "
-                       "tools/graphics_progress_data.json, from the Windows SDK d3d12.h. Real: an override with a body "
+                       "tools/graphics_progress_data.json (names only, taken from the " + (data_source or "Windows SDK headers") + "); a method is counted once per vtable slot, so the two spellings of GetDesc in the SDK header are one. Real: an override with a body "
                        "in the class that derives from the interface's generated stub class, or in the shared object "
                        "template. Refuses: an override whose body only returns E_NOTIMPL. Stub: no override, so the "
                        "generated stub answers (E_NOTIMPL, or nothing) and logs once. Matching is by method name, "
@@ -722,6 +738,19 @@ def sections(counts, history):
         have = [f"{c['code']} {c['name']}" for c in g["cells"] if c["handled"]]
         missing = [f"{c['code']} {c['name']}" for c in g["cells"] if not c["handled"]]
         blocks += [("details", f"Decoded ({len(have)})", have), ("details", f"Not decoded ({len(missing)})", missing)]
+        im = g["image_only"]
+        if im["total"]:
+            blocks += [("table", ["Kind", "Mapped", "Total", "Share"],
+                        [["Image-only codes the runtime maps to Vulkan (gfx10_descriptors.h)", fmt(im["mapped"]),
+                          fmt(im["total"]), {"bar": im["mapped"] / im["total"],
+                                             "t": f"{pct(im['mapped'], im['total'])}%"}]], {"num": [1, 2, 3]}),
+                       ("raster", "Image-only format codes",
+                        [{"state": "y" if c["mapped"] else "n", "title": f"{c['code']} {c['name']}"}
+                         for c in im["cells"]],
+                        f"Image-only format codes: {im['mapped']} of {im['total']} mapped"),
+                       ("legend", "format")]
+            unmapped = [f"{c['code']} {c['name']}" for c in im["cells"] if not c["mapped"]]
+            blocks.append(("details", f"Image-only codes not mapped ({len(unmapped)})", unmapped))
     d = fm["dxgi"]
     if d:
         blocks += [("table", ["Kind", "Mapped", "Total", "Share"],
@@ -734,12 +763,18 @@ def sections(counts, history):
         unmapped = [c["name"] for c in d["cells"] if not c["mapped"]]
         blocks.append(("details", f"Not mapped ({len(unmapped)})", unmapped))
     out.append({"id": "formats", "title": "Formats",
-                "how": "Buffer: the integer keys of the FORMATS dict in class Gen of the translator (read with ast), "
-                       "out of the codes in tools/gfx10_formats.json except the INVALID one. Image formats are not "
-                       "counted. DXGI: names in a case label or table row of vulkan_format() and vertex_format() in "
-                       f"{VK_DEVICE}, out of the DXGI_FORMAT names (UNKNOWN left out) in "
-                       "tools/graphics_progress_data.json. Mapped means a Vulkan format is chosen, not that every "
-                       "usage of it works.", "blocks": blocks})
+                "how": "Buffer: a buffer V# holds its format in a 7-bit field (word3[18:12]; the translator reads it "
+                       "with `& 0x7F`), so only codes 1 to 127 of tools/gfx10_formats.json can be a buffer format, "
+                       "INVALID (0) left out; in the table those are the contiguous codes 1 to 77, and 78 to 127 are "
+                       "reserved. Handled is the integer keys of the FORMATS dict in class Gen of the translator "
+                       "(read with ast). Codes from 128 (sRGB, BC, FMASK and others) exist for images only and are "
+                       "not in the buffer count; they are listed apart as image-only codes, counted as the codes "
+                       "the runtime table in runtime/src/gfx10_descriptors.h maps to a Vulkan format. DXGI: names in "
+                       f"a case label or table row of vulkan_format() and vertex_format() in {VK_DEVICE}, out of the "
+                       "DXGI_FORMAT enum names (UNKNOWN left out) in tools/graphics_progress_data.json"
+                       + (f", which holds names only and comes from the {data_source}" if data_source else "")
+                       + ". The DXGI total is that enum's size, not a list this project chose. Mapped means a "
+                         "Vulkan format is chosen, not that every usage of it works.", "blocks": blocks})
 
     t = counts["tests"]
     rows = [[name, fmt(a["count"]), "yes" if a["graphics"] else "no"] for name, a in t["areas"].items()]
@@ -1011,10 +1046,13 @@ def refresh_data(d3d12_header, dxgi_header, out_path=DATA_FILE):
     with open(dxgi_header, encoding="utf-8", errors="replace") as f:
         enum = re.findall(r"\bDXGI_FORMAT_(\w+)\s*=\s*(\d+)", gen.COMMENTS_OR_LITERALS.sub(" ", f.read()))
     formats = [n for n, v in sorted(set(enum), key=lambda x: int(x[1])) if n not in ("UNKNOWN", "FORCE_UINT")]
+    version = re.search(r"[/\\](\d+\.\d+\.\d+\.\d+)[/\\]", d3d12_header.replace("\\", "/") + "/")
+    source = (f"Windows SDK {version.group(1)} (d3d12.h, dxgiformat.h)" if version
+              else "Windows SDK headers (d3d12.h, dxgiformat.h)")
     data = {"about": "Method names of the ID3D12 interfaces (Windows SDK d3d12.h) and the DXGI_FORMAT names "
-                     "(dxgiformat.h). Names only, no declarations. Regenerate with tools/graphics_progress.py "
-                     "--refresh-data --d3d12-header <d3d12.h> --dxgi-header <dxgiformat.h>.",
-            "d3d12": d3d12, "dxgi_formats": formats}
+                     "(dxgiformat.h). Names only, no declarations or other SDK text. Regenerate with "
+                     "tools/graphics_progress.py --refresh-data --d3d12-header <d3d12.h> --dxgi-header <dxgiformat.h>.",
+            "source": source, "d3d12": d3d12, "dxgi_formats": formats}
     with open(out_path, "w", encoding="utf-8", newline="\n") as f:
         f.write(json.dumps(data, indent=1, sort_keys=True, ensure_ascii=True) + "\n")
     return len(d3d12), len(formats)
@@ -1037,6 +1075,8 @@ def build_report(tree, data, isa_xml=None, date=None):
         meta["commit"] = tree.commit
     if date:
         meta["date"] = date
+    if data.get("source"):
+        meta["data_source"] = data["source"]
     report = {"meta": meta, "counts": counts}
     report["headline"] = headline(counts)
     return report
@@ -1091,7 +1131,7 @@ def main(argv=None):
     if args.date:
         history = merge_history(history, history_point(args.date, report["counts"]))
         put_text(history_path, dumps({"points": history, "schema": SCHEMA}))
-    secs = sections(report["counts"], history)
+    secs = sections(report["counts"], history, report["meta"].get("data_source", ""))
     # the JSON keeps the raw counts; the per-interface cell strings are page-only
     json_report = json.loads(json.dumps(report))
     for i in json_report["counts"]["interfaces"]:
