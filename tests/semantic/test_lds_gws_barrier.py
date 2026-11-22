@@ -64,6 +64,29 @@ def calc_gws_effective_offset(offset: int = 0, m0: int = 0) -> int:
     return (m0 + (offset & OFFSET16_MASK)) & MASK32
 
 
+def evaluate_gws_barrier_status(
+    target_count: int,
+    current_arrived: int,
+    offset: int = 0,
+    m0: int = 0,
+    exec_mask: int = 0xFFFFFFFF,
+) -> dict[str, Union[bool, int]]:
+    """Architectural evaluation of status flags and condition codes for ds_gws_barrier."""
+    satisfied, next_arr = ref_ds_gws_barrier(current_arrived, target_count)
+    eff_16 = (m0 & OFFSET16_MASK) + (offset & OFFSET16_MASK)
+    eff_32 = m0 + (offset & OFFSET16_MASK)
+
+    return {
+        "barrier_satisfied": satisfied,
+        "arrived_zero": (next_arr == 0),
+        "offset_carry_out_16": (eff_16 > OFFSET16_MASK),
+        "offset_carry_out_32": (eff_32 > MASK32),
+        "active_wave": (exec_mask != 0),
+        "vcc_unmodified": True,
+        "scc_unmodified": True,
+    }
+
+
 def ref_ds_gws_barrier(current_arrived: int, target_count: int) -> Tuple[bool, int]:
     """Pure mathematical reference oracle for ds_gws_barrier.
 
@@ -819,6 +842,82 @@ class TestRegisterAliasingAndOperandPreservation(unittest.TestCase):
             for r in range(16):
                 expected = ((lane + 1) * 500) + r
                 self.assertEqual(state.get_lane_vgpr(lane, r), expected)
+
+
+class TestConditionCodesStatusFlagsAndCarryBorrow(unittest.TestCase):
+    """Phase 6: Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def test_vcc_and_scc_preserved_scalar(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        state.vcc = 0x11223344_55667788
+        state.scc = 1
+        state.set_vgpr(0, 1)
+
+        instr = DSGWSBarrierInstruction(vdata0=RegisterOperand(0, RegType.VGPR), offset=0)
+        interp.execute(instr, state, wave_id=1)
+
+        self.assertEqual(state.vcc, 0x11223344_55667788)
+        self.assertEqual(state.scc, 1)
+
+    def test_vcc_and_scc_preserved_simd(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFFFFFF)
+        interp = SIMDInterpreter()
+
+        state.vcc = 0xCAFEBABE
+        state.scc = 0
+        state.set_lane_vgpr(0, 1, 1)
+
+        instr = DSGWSBarrierInstruction(vdata0=RegisterOperand(1, RegType.VGPR), offset=2)
+        interp.execute(instr, state, wave_id=1)
+
+        self.assertEqual(state.vcc, 0xCAFEBABE)
+        self.assertEqual(state.scc, 0)
+
+    def test_no_carry_borrow_generated(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        state.vcc = 0
+        state.scc = 0
+        state.set_vgpr(0, 0xFFFFFFFF)
+
+        instr = DSGWSBarrierInstruction(vdata0=RegisterOperand(0, RegType.VGPR), offset=63)
+        interp.execute(instr, state, wave_id=1)
+
+        self.assertEqual(state.vcc, 0)
+        self.assertEqual(state.scc, 0)
+
+    def test_status_flags_barrier_satisfied_and_zero(self) -> None:
+        # Target count 2, currently 0 -> next is 1, not satisfied, not arrived_zero
+        st1 = evaluate_gws_barrier_status(target_count=2, current_arrived=0)
+        self.assertFalse(st1["barrier_satisfied"])
+        self.assertFalse(st1["arrived_zero"])
+
+        # Target count 2, currently 1 -> next is 2, satisfied, arrived_zero=True
+        st2 = evaluate_gws_barrier_status(target_count=2, current_arrived=1)
+        self.assertTrue(st2["barrier_satisfied"])
+        self.assertTrue(st2["arrived_zero"])
+
+    def test_status_flags_offset_carry_out(self) -> None:
+        st_no_carry = evaluate_gws_barrier_status(target_count=1, current_arrived=0, offset=10, m0=20)
+        self.assertFalse(st_no_carry["offset_carry_out_16"])
+        self.assertFalse(st_no_carry["offset_carry_out_32"])
+
+        st_carry_16 = evaluate_gws_barrier_status(target_count=1, current_arrived=0, offset=0x0020, m0=0xFFF0)
+        self.assertTrue(st_carry_16["offset_carry_out_16"])
+        self.assertFalse(st_carry_16["offset_carry_out_32"])
+
+        st_carry_32 = evaluate_gws_barrier_status(target_count=1, current_arrived=0, offset=1, m0=0xFFFFFFFF)
+        self.assertTrue(st_carry_32["offset_carry_out_32"])
+
+    def test_status_flags_wave_activity(self) -> None:
+        st_active = evaluate_gws_barrier_status(target_count=1, current_arrived=0, exec_mask=0x1)
+        self.assertTrue(st_active["active_wave"])
+
+        st_inactive = evaluate_gws_barrier_status(target_count=1, current_arrived=0, exec_mask=0x0)
+        self.assertFalse(st_inactive["active_wave"])
 
 
 if __name__ == "__main__":
