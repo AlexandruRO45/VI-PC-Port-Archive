@@ -1269,6 +1269,21 @@ python3 -B tests/mesh_indexed_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM
 ctest --preset dev --no-tests=error -R "^mesh_indexed_draw_" -V
 ```
 
+The indexed attribute fixture binds three additional float3 colors in the vertex
+buffer. Its mesh entry exports a four-component PARAM0 per vertex. The pixel
+entry interpolates attr0, packs the channels to binary16 and exports MRT0.
+The two 32×32 CPU references below differ only in the uploaded vertex colors.
+Both matched every RGBA byte on RTX 4060 and WARP. Comparing the swapped
+upload to the original reference produces 992 mismatches and a matching mesh
+trace. The 32 equal-channel pixels lie on one diagonal.
+
+![Two CPU reference gradients verified by GPU readback](mesh-attribute-reference.png)
+
+```sh
+python3 -B tests/mesh_attribute_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+ctest --preset dev --no-tests=error -R "^mesh_attribute_draw_" -V
+```
+
 A local 1,028-byte entry (197 instructions) read three distinct vertex
 positions and produced visible geometry with controlled indices, transforms and
 vertex data. The two sets of positions cover 1,024 and 276 of the 1,024 pixel
