@@ -117,6 +117,9 @@ class RecordedFlagsTest(unittest.TestCase):
                 self.touch(self.dxbc, "fssm_index.json")
             elif tool == "shader_disasm.py":
                 self.touch(self.dxbc, "disasm", "shader.s")   # a successful decode leaves assembly
+                self.touch(self.dxbc, "disasm", "stems.json")
+                with open(os.path.join(self.dxbc, "disasm", "stems.json"), "w", encoding="utf-8") as f:
+                    json.dump(["shader"], f)
 
         def fake_translate(disasm, spirv, jobs, emulate=False, fallbacks=()):
             ran.append("translate")
