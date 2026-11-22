@@ -252,6 +252,70 @@ class SpirvAsmUnitTests(unittest.TestCase):
                 self.assertTrue(os.path.isfile(os.path.join(out_dir, "cs_tiny.spv")))
                 self.assertFalse(os.path.exists(os.path.join(out_dir, "cs_tiny.spvasm")))
 
+    def test_integer_literals_use_spirv_as_grammar(self):
+        # spirv-as reads a leading 0 as C octal and rejects Python's 0o/0b prefixes and
+        # digit separators. int(tok, 0) did the opposite.
+        def module(signed, literal):
+            return (
+                "OpCapability Shader\n"
+                "OpMemoryModel Logical GLSL450\n"
+                f"%t = OpTypeInt 32 {signed}\n"
+                f"%c = OpConstant %t {literal}\n"
+            )
+
+        accepted = (
+            (0, "017", 15),
+            (0, "07", 7),
+            (0, "+017", 15),
+            (0, "00017", 15),
+            (1, "-017", 0xFFFFFFF1),
+            (1, "-07", 0xFFFFFFF9),
+            (0, "10", 10),
+            (0, "0x10", 16),
+            (0, "0X10", 16),
+        )
+        for signed, literal, word in accepted:
+            spv = spirv_asm.assemble(module(signed, literal))
+            words = struct.unpack(f"<{len(spv) // 4}I", spv)
+            self.assertEqual(words[-1], word, literal)
+            if SPIRV_AS:
+                with tempfile.TemporaryDirectory() as d:
+                    sa, sv = os.path.join(d, "m.spvasm"), os.path.join(d, "m.spv")
+                    with open(sa, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(module(signed, literal))
+                    subprocess.run([SPIRV_AS, sa, "-o", sv, "--target-env", "vulkan1.2"], check=True)
+                    with open(sv, "rb") as f:
+                        ref = struct.unpack(f"<{os.path.getsize(sv) // 4}I", f.read())
+                self.assertEqual(words[:2] + words[3:], ref[:2] + ref[3:], literal)
+
+        # An untyped literal (LocalSize) takes the same tokens.
+        sized = (
+            "OpCapability Shader\nOpMemoryModel Logical GLSL450\n"
+            'OpEntryPoint GLCompute %main "main"\n'
+            "OpExecutionMode %main LocalSize 017 1 1\n"
+            "%void = OpTypeVoid\n%fn = OpTypeFunction %void\n"
+            "%main = OpFunction %void None %fn\n%entry = OpLabel\nOpReturn\nOpFunctionEnd\n"
+        )
+        spv = spirv_asm.assemble(sized)
+        words = struct.unpack(f"<{len(spv) // 4}I", spv)
+        self.assertIn(15, words)
+        _validate(spv)
+        if SPIRV_AS:
+            with tempfile.TemporaryDirectory() as d:
+                sa, sv = os.path.join(d, "m.spvasm"), os.path.join(d, "m.spv")
+                with open(sa, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(sized)
+                subprocess.run([SPIRV_AS, sa, "-o", sv, "--target-env", "vulkan1.2"], check=True)
+                with open(sv, "rb") as f:
+                    ref = struct.unpack(f"<{os.path.getsize(sv) // 4}I", f.read())
+            self.assertEqual(words[:2] + words[3:], ref[:2] + ref[3:])
+        with self.assertRaises(spirv_asm.SpirvAsmError):
+            spirv_asm.assemble(sized.replace("017", "0o17"))
+
+        for literal in ("0o17", "0O17", "0b11", "0B11", "1_000", "08", "0x", "-017"):
+            with self.assertRaises(spirv_asm.SpirvAsmError, msg=literal):
+                spirv_asm.assemble(module(0, literal))
+
     def test_cli_and_error_cases(self):
         with self.assertRaises(spirv_asm.SpirvAsmError):
             spirv_asm.assemble("OpNotARealOpcode %x\n")

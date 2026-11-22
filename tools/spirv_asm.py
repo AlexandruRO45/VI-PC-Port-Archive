@@ -139,11 +139,58 @@ def _encode_string_words(text: str) -> list[int]:
     return list(struct.unpack(f"<{len(raw) // 4}I", raw))
 
 
+def _negative_c_octal(tok: str) -> bool:
+    """True for a minus sign in front of a non-zero C octal token, such as `-017`.
+
+    `int("-017", 0)` already fails, so parsing it and then masking the bits would turn that
+    rejection into a wrapped constant. `-00` is zero; the unsigned minus-sign rule for it
+    belongs with the literal range check.
+    """
+    if not tok.startswith("-"):
+        return False
+    body = tok[1:]
+    return len(body) > 1 and body[0] == "0" and body[1] not in "xX" and any(c != "0" for c in body)
+
+
 def _parse_int(tok: str, lineno: int) -> int:
+    """A SPIR-V integer token: optional sign, then decimal, `0x` hex, or C octal.
+
+    spirv-as reads a leading 0 as octal (`017` is 15). Python's `int(tok, 0)` rejects that
+    and accepts `0o`/`0b` prefixes and `_` separators, which spirv-as rejects.
+    """
+    if not tok or "_" in tok:
+        raise SpirvAsmError(f"line {lineno}: invalid integer literal {tok!r}")
+    sign = 1
+    body = tok
+    if tok[0] in "+-":
+        sign = -1 if tok[0] == "-" else 1
+        body = tok[1:]
+    if not body:
+        raise SpirvAsmError(f"line {lineno}: invalid integer literal {tok!r}")
     try:
-        return int(tok, 0)
-    except ValueError as exc:
-        raise SpirvAsmError(f"line {lineno}: invalid integer literal {tok!r}") from exc
+        if len(body) > 1 and body[0] == "0" and body[1] in "xX":
+            digits = body[2:]
+            if not digits or any(c not in "0123456789abcdefABCDEF" for c in digits):
+                raise ValueError
+            value = int(digits, 16)
+        elif body[0] == "0":
+            if any(c not in "01234567" for c in body):
+                raise ValueError
+            value = int(body, 8)
+        else:
+            if not body.isdigit():
+                raise ValueError
+            value = int(body, 10)
+    except ValueError:
+        raise SpirvAsmError(f"line {lineno}: invalid integer literal {tok!r}") from None
+    return sign * value
+
+
+def _parse_masked_literal(tok: str, lineno: int) -> int:
+    """An untyped SPIR-V literal word. A negative C octal token stays an error."""
+    if _negative_c_octal(tok):
+        raise SpirvAsmError(f"line {lineno}: invalid integer literal {tok!r}")
+    return _parse_int(tok, lineno) & 0xFFFFFFFF
 
 
 _HEX_FLOAT_RE = re.compile(r"^([+-]?)0[xX]([0-9a-fA-F]*)(?:\.([0-9a-fA-F]*))?[pP]([+-]?\d+)$")
@@ -212,6 +259,9 @@ def _encode_context_number(tok: str, type_info, lineno: int) -> list[int]:
     kind, width = type_info[0], type_info[1]
     if kind == "int":
         val = _parse_int(tok, lineno)
+        signed = type_info[2] if len(type_info) > 2 else 0
+        if not signed and _negative_c_octal(tok):
+            raise SpirvAsmError(f"line {lineno}: invalid integer literal {tok!r}")
         if width <= 32:
             return [val & 0xFFFFFFFF]
         if width == 64:
@@ -260,7 +310,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             out.append(get_id(toks[idx], lineno))
             return idx + 1
         if kind == "LiteralInteger":
-            out.append(_parse_int(toks[idx], lineno) & 0xFFFFFFFF)
+            out.append(_parse_masked_literal(toks[idx], lineno))
             return idx + 1
         if kind == "LiteralFloat":
             out.append(_parse_float_bits(toks[idx], 32, lineno))
@@ -276,10 +326,12 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             if cur_ext_table is not None and tok in cur_ext_table:
                 out.append(cur_ext_table[tok])
             else:
-                out.append(_parse_int(tok, lineno) & 0xFFFFFFFF)
+                out.append(_parse_masked_literal(tok, lineno))
             return idx + 1
         if kind == "PairLiteralIntegerIdRef":
             val = _parse_int(toks[idx], lineno)
+            if _negative_c_octal(toks[idx]) and not switch_signed:
+                raise SpirvAsmError(f"line {lineno}: invalid integer literal {toks[idx]!r}")
             if switch_width == 64:
                 u64 = val & 0xFFFFFFFFFFFFFFFF
                 out.append(u64 & 0xFFFFFFFF)
@@ -300,7 +352,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             if idx + 1 >= len(toks):
                 raise SpirvAsmError(f"line {lineno}: missing literal in {kind}")
             out.append(get_id(toks[idx], lineno))
-            out.append(_parse_int(toks[idx + 1], lineno) & 0xFFFFFFFF)
+            out.append(_parse_masked_literal(toks[idx + 1], lineno))
             return idx + 2
         if kind == "LiteralSpecConstantOpInteger":
             opname = toks[idx]
@@ -330,7 +382,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             if entry is None:
                 # Allow raw numeric value fallback (e.g. hex enum value)
                 if tok[:1].isdigit() or tok.startswith(("0x", "0X")):
-                    out.append(_parse_int(tok, lineno) & 0xFFFFFFFF)
+                    out.append(_parse_masked_literal(tok, lineno))
                     return idx + 1
                 raise SpirvAsmError(f"line {lineno}: unknown {kind} value {tok!r}")
             val, params = entry
@@ -351,7 +403,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
                 entry = benum.get(part)
                 if entry is None:
                     if part[:1].isdigit() or part.startswith(("0x", "0X")):
-                        mask |= _parse_int(part, lineno) & 0xFFFFFFFF
+                        mask |= _parse_masked_literal(part, lineno)
                         continue
                     raise SpirvAsmError(f"line {lineno}: unknown {kind} flag {part!r} in {tok!r}")
                 bval, params = entry
@@ -453,6 +505,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
 
         cur_ext_table = None
         switch_width = 32
+        switch_signed = False
         if opname == "OpExtInst" and arg_idx < len(toks):
             cur_ext_table = ext_imports.get(get_id(toks[arg_idx], lineno))
         elif opname == "OpSwitch" and arg_idx < len(toks):
@@ -460,6 +513,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             sel_ti = type_info.get(id_to_type.get(sel_id))
             if sel_ti and sel_ti[0] == "int":
                 switch_width = sel_ti[1]
+                switch_signed = bool(sel_ti[2]) if len(sel_ti) > 2 else False
 
         for kind, quant in op_specs:
             if quant == "*":
