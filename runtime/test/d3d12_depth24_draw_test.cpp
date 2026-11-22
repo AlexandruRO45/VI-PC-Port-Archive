@@ -7,11 +7,11 @@
 // WARP): with the target cleared to 0.15625 + 2^-24 and a LESS test, a flat triangle at 0.15625 passes with bias 0
 // and fails everywhere with bias +1 and +2; an EQUAL test at exactly the cleared 0.15625 passes everywhere. Passing
 // pixels are counted through the stencil plane (INCR on pass), so pipelines without a pixel shader count too. Then
-// stored depth is read back through a footprint: a flat triangle with a constant bias, a sloped one with a
-// slope-scaled bias (with and without DepthBiasClamp, within one 24-bit step: the slope is the GPU's), and a pixel
-// shader that writes its own depth (stored quantised, not biased). Each runs with and without a pixel shader. The
-// finding's cases run once more through a pass-through geometry shader without a pixel shader, which also gets the
-// built-in depth stage.
+// stored depth is read back through a footprint: a flat triangle with a constant bias, and triangles sloped in x, in y
+// and in both with a slope-scaled bias (with and without DepthBiasClamp). All of these run without a pixel shader,
+// with one, and through a pass-through geometry shader without one (which also gets the built-in depth stage). Lines
+// and points must not be biased, and a pixel shader that writes its own depth gets it quantised, not biased. With
+// LEONIDA_VK_VALIDATION=1 any validation error fails the test.
 //
 // The shaders are GLSL written to the translator's contract (test/glsl/vs_depth.vert, ps_depth_empty.frag,
 // ps_depth_write.frag, gs_depth.geom). No game data.
@@ -20,6 +20,7 @@
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../src/depth24.h"
+#include "../src/depth24_fragment.h"
 #include "../src/shader_library.h"
 
 #include <algorithm>
@@ -69,12 +70,14 @@ struct Pass {
     bool pixel_shader = false;     // ps_depth_empty, else no pixel shader
     bool shader_depth = false;     // ps_depth_write instead
     bool geometry_shader = false;  // gs_depth between the VS and the (absent) pixel shader
+    enum Shape : std::uint32_t { triangle, line, points } shape = triangle;  // vs_depth's s3
     int bias = 0;
     float slope = 0.0f, clamp = 0.0f;
     D3D12_COMPARISON_FUNC func = D3D12_COMPARISON_FUNC_ALWAYS;
     bool write = true;
     float clear = 1.0f;
-    float z = 0.5f, dz = 0.0f, shader_z = 0.0f;  // s0, s1 (vs_depth.vert), s2 (ps_depth_write.frag)
+    // s0, s1, s4 (vs_depth.vert: depth, its slope in clip-space x and y), s2 (ps_depth_write.frag)
+    float z = 0.5f, dz = 0.0f, dzy = 0.0f, shader_z = 0.0f;
 };
 
 struct Result {
@@ -121,7 +124,9 @@ struct Harness {
         const D3D12_DEPTH_STENCILOP_DESC count{D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
                                               D3D12_STENCIL_OP_INCR_SAT, D3D12_COMPARISON_FUNC_ALWAYS};
         desc.DepthStencilState.FrontFace = desc.DepthStencilState.BackFace = count;
-        desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        desc.PrimitiveTopologyType = p.shape == Pass::line     ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
+                                     : p.shape == Pass::points ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT
+                                                               : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         desc.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
         desc.SampleDesc.Count = 1;
         Ref<ID3D12PipelineState> pso;
@@ -138,15 +143,17 @@ struct Harness {
         list->ResourceBarrier(1, &to_write);
         list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, p.clear, 0, 0, nullptr);
         list->SetGraphicsRootSignature(root);
-        const std::uint32_t constants[3] = {f2u(p.z), f2u(p.dz), f2u(p.shader_z)};
-        list->SetGraphicsRoot32BitConstants(0, 3, constants, 0);
-        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        const std::uint32_t constants[5] = {f2u(p.z), f2u(p.dz), f2u(p.shader_z), p.shape, f2u(p.dzy)};
+        list->SetGraphicsRoot32BitConstants(0, 5, constants, 0);
+        list->IASetPrimitiveTopology(p.shape == Pass::line     ? D3D_PRIMITIVE_TOPOLOGY_LINELIST
+                                     : p.shape == Pass::points ? D3D_PRIMITIVE_TOPOLOGY_POINTLIST
+                                                               : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         const D3D12_VIEWPORT viewport{0, 0, float(target_side), float(target_side), 0, 1};
         const D3D12_RECT scissor{0, 0, LONG(target_side), LONG(target_side)};
         list->RSSetViewports(1, &viewport);
         list->RSSetScissorRects(1, &scissor);
         list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
-        list->DrawInstanced(3, 1, 0, 0);
+        list->DrawInstanced(p.shape == Pass::line ? 2 : p.shape == Pass::points ? target_side : 3, 1, 0, 0);
         D3D12_RESOURCE_BARRIER to_copy = transition(depth.p, D3D12_RESOURCE_STATE_DEPTH_WRITE,
                                                     D3D12_RESOURCE_STATE_COPY_SOURCE);
         list->ResourceBarrier(1, &to_copy);
@@ -196,17 +203,35 @@ struct Harness {
 
 std::string describe(const Pass& p) {
     char text[200];
-    const char* stages = p.shader_depth      ? "PS writes depth"
+    const char* stages = p.shape != Pass::triangle ? (p.pixel_shader ? "with PS" : "no PS")
+                         : p.shader_depth    ? "PS writes depth"
                          : p.pixel_shader    ? "with PS"
                          : p.geometry_shader ? "GS, no PS"
                                              : "no PS";
-    std::snprintf(text, sizeof(text), "%s, bias %d, slope %g, clamp %g", stages, p.bias, p.slope, p.clamp);
+    std::snprintf(text, sizeof(text), "%s, bias %d, slope %g, clamp %g, dz/dx %g, dz/dy %g", stages, p.bias, p.slope,
+                  p.clamp, p.dz, p.dzy);
     return text;
 }
 
 }  // namespace
 
 int main() {
+    // On the CPU first, so it runs without a GPU too: the slope term (and its derivatives) only when its factor is
+    // non-zero, since 0 * an edge-on triangle's infinite slope would be NaN (D3D11.3 15.10).
+    {
+        const auto derivatives = [](const std::vector<std::uint32_t>& words) {
+            int n = 0;
+            for (std::size_t w = 5; w < words.size() && (words[w] >> 16); w += words[w] >> 16)
+                n += (words[w] & 0xffff) == 207 || (words[w] & 0xffff) == 208;  // OpDPdx, OpDPdy
+            return n;
+        };
+        const int constant_only = derivatives(leonida::depth24_depth_only_fragment({3, 0.0f, 0.0f}));
+        const int sloped = derivatives(leonida::depth24_depth_only_fragment({3, 1.0f, 0.0f}));
+        check(constant_only == 0 && sloped == 2, "built-in depth stage: " + std::to_string(constant_only) +
+                                                     " derivative(s) for a constant-only bias (0 expected), " +
+                                                     std::to_string(sloped) + " with a slope factor (2 expected)");
+        if (g_failures) return 1;
+    }
     vktest::Device d;
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) {
@@ -258,7 +283,7 @@ int main() {
         info.buffer_device_address = true;
         info.subgroup = d.subgroup;
         info.shader_dir = library.string();
-        info.features = d.enabled;  // depthBiasClamp and geometryShader among them
+        info.features = d.enabled;  // what the test device enabled (geometryShader for the GS cases)
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
@@ -268,7 +293,7 @@ int main() {
 
         D3D12_ROOT_PARAMETER param{};
         param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        param.Constants = {0, 0, 3};
+        param.Constants = {0, 0, 5};
         D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
         root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
         root_desc.Desc_1_0 = {1, &param, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
@@ -332,9 +357,10 @@ int main() {
                 std::printf("SKIP the geometry-shader cases: no geometryShader on this GPU\n");
                 continue;
             }
-            // The finding's cases: one 24-bit step above 0.15625, LESS, bias 0, +1, +2.
+            // The finding's cases: one 24-bit step above 0.15625, LESS, bias 0, +1, +2; bias -1 is the positive control
+            // that this pipeline draws at all.
             const float above = 0.15625f + 5.9604645e-8f;  // 0.15625 + 2^-24
-            for (int bias : {0, 1, 2}) {
+            for (int bias : {-1, 0, 1, 2}) {
                 Pass p;
                 p.pixel_shader = ps;
                 p.geometry_shader = gs;
@@ -346,7 +372,7 @@ int main() {
                 Result r;
                 std::string error;
                 EXPECT(h.run(p, r, error) || (std::fprintf(stderr, "%s\n", error.c_str()), false));
-                const int expected = bias == 0 ? all : 0;
+                const int expected = bias <= 0 ? all : 0;
                 check(passing(r) == expected, "LESS against 0.15625 + 2^-24, " + describe(p) + ": " +
                                                   std::to_string(passing(r)) + " of " + std::to_string(all) +
                                                   " pass, expected " + std::to_string(expected));
@@ -390,18 +416,34 @@ int main() {
                                       " of " + std::to_string(all) + " differ from code " + std::to_string(expected) +
                                       " (first " + std::to_string(r.depth[0]) + ")");
             }
-            // Stored depth, sloped: z = 0.5 + 0.25 * x_clip, so 1/128 per pixel in x. Within one 24-bit step without a
-            // slope term; with one, within two: on the D32 path the slope comes from the derivatives of the
-            // interpolated depth (a few float ulps), where D24 hardware uses the triangle's plane.
-            for (const auto& [slope, clamp] : {std::pair{0.0f, 0.0f}, {1.0f, 0.0f}, {1.0f, 0.004f}, {-2.0f, -0.01f}}) {
+            // Stored depth, sloped: z = 0.5 + dx * x_clip + dy * y_clip (0.125 is 1/256 per pixel), with all three
+            // vertices of the full-screen triangle (clip x, y of -1 and 3) inside 0..1, so no clipping moves them: a
+            // clipped vertex shifts the interpolated depth by up to ~140 steps on both GPUs here. Within one 24-bit
+            // step without a slope term; with one, within 1 + |SlopeScaledDepthBias|: on the D32 path the slope is
+            // the derivative of the interpolated float depth, about one ulp (one 24-bit step above 0.5) off the
+            // plane's, and the slope factor scales that. Slopes in x, in y and in both with different sizes check
+            // that MaxDepthSlope is max(|dz/dx|, |dz/dy|). The slope and clamp cases have no constant bias, so a
+            // native D24 is held to them too; only the constant term is KNOWN there.
+            struct Sloped {
+                int bias;
+                float slope, clamp, dx, dy;
+            };
+            for (const auto& [bias, slope, clamp, dx, dy] :
+                 {Sloped{2, 0.0f, 0.0f, 0.125f, 0.0f}, Sloped{0, 1.0f, 0.0f, 0.125f, 0.0f},
+                  Sloped{0, 1.0f, 0.0f, 0.0f, 0.125f}, Sloped{0, 1.0f, 0.0f, 0.125f, -0.0625f},
+                  Sloped{0, 1.0f, 0.0f, 0.0625f, 0.125f}, Sloped{0, 8.0f, 0.0f, 0.125f, 0.0f},
+                  Sloped{0, 16.0f, 0.0f, 0.15f, 0.0f},  // depth off the float grid: the bound is reached (@CharlyRien)
+                  Sloped{0, 1.0f, 0.002f, 0.125f, 0.0f}, Sloped{0, -2.0f, -0.005f, 0.125f, 0.0f},
+                  Sloped{2, 1.0f, 0.0f, 0.125f, 0.0f}}) {
                 Pass p;
                 p.pixel_shader = ps;
                 p.geometry_shader = gs;
-                p.bias = 2;
+                p.bias = bias;
                 p.slope = slope;
                 p.clamp = clamp;
                 p.z = 0.5f;
-                p.dz = 0.25f;
+                p.dz = dx;
+                p.dzy = dy;
                 if (clamp != 0.0f && native && !d.enabled.depthBiasClamp) {
                     // The native path clamps in the rasterizer, which needs the feature this device left off.
                     std::printf("SKIP stored depth, sloped, %s: no depthBiasClamp on a native D24\n",
@@ -413,13 +455,16 @@ int main() {
                 EXPECT(h.run(p, r, error) || (std::fprintf(stderr, "%s\n", error.c_str()), false));
                 int wrong = 0;
                 std::uint32_t first_bad = 0, first_expected = 0, worst = 0;
-                const std::uint32_t tolerance = slope != 0.0f ? 2 : 1;
+                const std::uint32_t tolerance = 1 + std::uint32_t(std::ceil(std::fabs(slope)));
+                const float max_slope = std::fmax(std::fabs(dx), std::fabs(dy)) * 2.0f / float(target_side);
                 for (UINT y = 0; y < target_side; ++y)
                     for (UINT x = 0; x < target_side; ++x) {
+                        // Row 0 is the top: clip-space y = +1 (the layer flips the viewport as D3D12 does).
                         const float x_clip = (float(x) + 0.5f) * 2.0f / float(target_side) - 1.0f;
-                        const float z = 0.5f + 0.25f * x_clip;
+                        const float y_clip = 1.0f - (float(y) + 0.5f) * 2.0f / float(target_side);
+                        const float z = 0.5f + dx * x_clip + dy * y_clip;
                         const std::uint32_t expected =
-                            leonida::depth24_quantize(z + d3d_bias(p.bias, slope, clamp, 0.25f * 2.0f / float(target_side)));
+                            leonida::depth24_quantize(z + d3d_bias(p.bias, slope, clamp, max_slope));
                         const std::uint32_t got = r.depth[y * target_side + x];
                         const std::uint32_t diff = got > expected ? got - expected : expected - got;
                         worst = std::max(worst, diff);
@@ -428,7 +473,8 @@ int main() {
                             ++wrong;
                         }
                     }
-                if (native && wrong) {
+                if (native && bias != 0 && wrong) {
+                    // As in the flat cases: the constant term on a native D24 (VK_EXT_depth_bias_control, D3D-325).
                     std::printf("KNOWN stored depth, sloped, %s: native D24 bias not exact (code %u, D3D gives %u)\n",
                                 describe(p).c_str(), first_bad, first_expected);
                     continue;
@@ -441,23 +487,100 @@ int main() {
                                              : std::string()));
             }
         }
-        // A pixel shader that writes its own depth: stored quantised, and D3D adds no bias to it.
+        // Lines and points: D3D biases triangles only (wireframe ones included), so a LINE or POINT pipeline keeps its
+        // depth whatever its bias, and on the D32 path it is still quantised. vs_depth's line crosses row 31 and its 64
+        // points sit on it; the pixels drawn are the ones whose stencil the draw incremented. LESS one step above
+        // 0.15625 must pass the same pixels with bias 0, +1 and +2/slope 1 (and some must pass); EQUAL at the cleared
+        // 0.15625 passes only if the depth is quantised (0.15625 is not on a 24-bit step); a bias of 1000 must leave
+        // the stored code alone.
+        for (const Pass::Shape shape : {Pass::line, Pass::points}) {
+            const std::string name = shape == Pass::line ? "line" : "points";
+            for (bool ps : {false, true}) {
+                int covered = -1;
+                for (const auto& [bias, slope] : {std::pair{0, 0.0f}, std::pair{1, 0.0f}, std::pair{2, 1.0f}}) {
+                    Pass p;
+                    p.shape = shape;
+                    p.pixel_shader = ps;
+                    p.bias = bias;
+                    p.slope = slope;
+                    p.func = D3D12_COMPARISON_FUNC_LESS;
+                    p.write = false;
+                    p.clear = 0.15625f + 5.9604645e-8f;  // one 24-bit step above
+                    p.z = 0.15625f;
+                    Result r;
+                    std::string error;
+                    EXPECT(h.run(p, r, error) || (std::fprintf(stderr, "%s\n", error.c_str()), false));
+                    if (covered < 0) covered = passing(r);
+                    check(covered > 0 && passing(r) == covered,
+                          name + ", LESS against 0.15625 + 2^-24, " + describe(p) + ": " + std::to_string(passing(r)) +
+                              " pixels pass, expected the " + std::to_string(covered) + " drawn (no bias)");
+                }
+                {
+                    Pass p;
+                    p.shape = shape;
+                    p.pixel_shader = ps;
+                    p.func = D3D12_COMPARISON_FUNC_EQUAL;
+                    p.write = false;
+                    p.clear = 0.15625f;
+                    p.z = 0.15625f;
+                    Result r;
+                    std::string error;
+                    EXPECT(h.run(p, r, error) || (std::fprintf(stderr, "%s\n", error.c_str()), false));
+                    check(covered > 0 && passing(r) == covered,
+                          name + ", EQUAL at the cleared 0.15625, " + describe(p) + ": " + std::to_string(passing(r)) +
+                              " pixels pass, expected the " + std::to_string(covered) + " drawn");
+                }
+                Pass p;
+                p.shape = shape;
+                p.pixel_shader = ps;
+                p.bias = 1000;
+                p.z = leonida::depth24_to_float(5033000);
+                Result r;
+                std::string error;
+                EXPECT(h.run(p, r, error) || (std::fprintf(stderr, "%s\n", error.c_str()), false));
+                int drawn = 0, wrong = 0;
+                std::uint32_t first = 0;
+                for (std::size_t i = 0; i < r.depth.size(); ++i) {
+                    if (!r.stencil[i]) continue;
+                    if (!drawn++) first = r.depth[i];
+                    wrong += r.depth[i] != 5033000;
+                }
+                check(drawn > 0 && wrong == 0, name + ", stored depth, " + describe(p) + ": " + std::to_string(wrong) +
+                                                   " of " + std::to_string(drawn) +
+                                                   " drawn pixels differ from code 5033000 (first " +
+                                                   std::to_string(first) + ")");
+            }
+        }
+        // A pixel shader that writes its own depth: quantised, and D3D adds no bias to it. With the target cleared to
+        // 0.15625 (stored as its D24 code) and an EQUAL test, the raw 0.15625 the shader writes, which is not on a 24-bit
+        // step, passes only once quantised, and a bias would move it off. The stored code is checked too.
         for (int bias : {0, 7}) {
             Pass p;
             p.shader_depth = true;
             p.bias = bias;
-            p.shader_z = 0.7f;
+            p.func = D3D12_COMPARISON_FUNC_EQUAL;
+            p.write = false;
+            p.clear = 0.15625f;
+            p.shader_z = 0.15625f;
             Result r;
             std::string error;
             EXPECT(h.run(p, r, error) || (std::fprintf(stderr, "%s\n", error.c_str()), false));
-            const std::uint32_t expected = leonida::depth24_quantize(0.7f);
+            check(passing(r) == all, "EQUAL at the cleared 0.15625, " + describe(p) + " 0.15625: " +
+                                         std::to_string(passing(r)) + " of " + std::to_string(all) + " pass");
+            p.func = D3D12_COMPARISON_FUNC_ALWAYS;
+            p.write = true;
+            p.clear = 1.0f;
+            EXPECT(h.run(p, r, error) || (std::fprintf(stderr, "%s\n", error.c_str()), false));
+            const std::uint32_t expected = leonida::depth24_quantize(0.15625f);
             int wrong = 0;
             for (std::uint32_t c : r.depth) wrong += c != expected;
-            check(wrong == 0, "stored depth, " + describe(p) + " 0.7: " + std::to_string(wrong) + " of " +
+            check(wrong == 0, "stored depth, " + describe(p) + " 0.15625: " + std::to_string(wrong) + " of " +
                                   std::to_string(all) + " differ from code " + std::to_string(expected) + " (first " +
                                   std::to_string(r.depth[0]) + ")");
         }
     }
+    const unsigned validation_errors = d.validation_errors();  // counted under LEONIDA_VK_VALIDATION=1
+    check(validation_errors == 0, std::to_string(validation_errors) + " validation error(s)");
     std::filesystem::remove_all(library);
     std::printf("%d failure(s)\n", g_failures);
     return g_failures ? 1 : 0;

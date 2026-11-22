@@ -2770,9 +2770,14 @@ public:
                      int(samples));
             depth24_fragment = false;
         }
-        const leonida::Depth24Bias depth24_bias{desc.RasterizerState.DepthBias,
-                                                desc.RasterizerState.SlopeScaledDepthBias,
-                                                desc.RasterizerState.DepthBiasClamp};
+        // D3D biases triangles only, wireframe ones included, never points or lines. A geometry shader takes and emits
+        // triangles (checked above), so the topology type alone decides.
+        const bool point_or_line = desc.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT ||
+                                   desc.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+        const leonida::Depth24Bias depth24_bias =
+            point_or_line ? leonida::Depth24Bias{}
+                          : leonida::Depth24Bias{desc.RasterizerState.DepthBias, desc.RasterizerState.SlopeScaledDepthBias,
+                                                 desc.RasterizerState.DepthBiasClamp};
         for (Stage& stage : stages) {
             if (!stage.code.pShaderBytecode || !stage.code.BytecodeLength) continue;  // no PS: depth only
             stage.fssm = leonida::fssm_program(
@@ -3075,8 +3080,7 @@ public:
         }
         if (desc.DSVFormat != DXGI_FORMAT_UNKNOWN) {
             Format f = vulkan_format(desc.DSVFormat, true);
-            if (f.format == VK_FORMAT_D24_UNORM_S8_UINT && !device_.depth_usable(f.format))
-                f.format = VK_FORMAT_D32_SFLOAT_S8_UINT;  // as CreateCommittedResource does
+            if (d24_as_float) f.format = VK_FORMAT_D32_SFLOAT_S8_UINT;  // as CreateCommittedResource does
             graphics_.depth_format = f.format;
             graphics_.depth_aspects = f.aspects;
         }

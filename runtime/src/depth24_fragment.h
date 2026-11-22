@@ -19,10 +19,12 @@
 // no dependency beyond the standard library; d3d12_depth24_draw_test runs them (with LEONIDA_VK_VALIDATION=1 the
 // validation layer checks the modules).
 //
-// Not covered (logged by the caller): a pixel shader with EarlyFragmentTests (its FragDepth write would be ignored),
-// multisampled targets (FragDepth is per pixel, which would flatten per-sample depth), and a viewport depth range
-// narrower than the biased depth (D3D clamps to MinDepth..MaxDepth before quantising; the quantisation here clamps
-// to 0..1 and Vulkan's clamp to the viewport range follows it).
+// Not covered. Logged by the caller: a pixel shader with EarlyFragmentTests (its FragDepth write would be ignored)
+// and multisampled targets (FragDepth is per pixel, which would flatten per-sample depth). Not logged: a viewport
+// depth range narrower than the biased depth (D3D clamps to MinDepth..MaxDepth before quantising; the quantisation
+// here clamps to 0..1, and Vulkan clamps a FragDepth write to the viewport range only with depthClampEnable, that is
+// DepthClipEnable = FALSE), and wireframe triangles' slope term, which comes from the derivatives along the edge
+// being drawn rather than from the triangle's plane (their constant term is exact).
 
 #include <array>
 #include <cmath>
@@ -58,13 +60,17 @@ enum : std::uint32_t {
     op_return = 253, op_no_line = 317, op_execution_mode_id = 331,
 };
 enum : std::uint32_t { storage_input = 1, storage_output = 3 };
-enum : std::uint32_t { decoration_builtin = 11, builtin_frag_coord = 15, builtin_frag_depth = 22 };
+enum : std::uint32_t {
+    decoration_builtin = 11, decoration_no_contraction = 42, builtin_frag_coord = 15, builtin_frag_depth = 22,
+};
 enum : std::uint32_t { model_fragment = 4 };
 enum : std::uint32_t {
     mode_origin_upper_left = 7, mode_early_fragment_tests = 9, mode_depth_replacing = 12, mode_depth_greater = 14,
     mode_depth_less = 15, mode_depth_unchanged = 16,
 };
-enum : std::uint32_t { glsl_round_even = 2, glsl_fabs = 4, glsl_fmin = 37, glsl_fmax = 40, glsl_find_umsb = 75 };
+enum : std::uint32_t {
+    glsl_round_even = 2, glsl_fabs = 4, glsl_fmin = 37, glsl_fmax = 40, glsl_find_umsb = 75, glsl_nmin = 79, glsl_nmax = 80,
+};
 
 using Inst = std::vector<std::uint32_t>;  // a whole instruction, word 0 included
 
@@ -222,6 +228,7 @@ public:
         return id;
     }
     void ensure_interface(std::uint32_t id) { interface_.push_back(id); }
+    void no_contraction(std::uint32_t id) { decorations_.push_back(make(op_decorate, {id, decoration_no_contraction})); }
     void mode(std::uint32_t m) { modes_.push_back(make(op_execution_mode, {entry_, m})); }
 
     // Instructions in a function body: emit returns the result id.
@@ -250,8 +257,9 @@ public:
         const std::uint32_t b = emit(code, op_bitcast, tu, {z});
         const std::uint32_t product = emit(code, op_f_mul, tf, {z, f32(16777215.0f)});
         const std::uint32_t rounded = ext(code, tf, glsl_round_even, {product});
-        // Clamped before the conversion so an out-of-range float never reaches OpConvertFToU (undefined there).
-        const std::uint32_t safe = ext(code, tf, glsl_fmin, {ext(code, tf, glsl_fmax, {rounded, f32(0.0f)}),
+        // Clamped before the conversion so an out-of-range float never reaches OpConvertFToU (undefined there). NMin and
+        // NMax are defined for a NaN too (it gives 0 here; the select below replaces that case anyway).
+        const std::uint32_t safe = ext(code, tf, glsl_nmin, {ext(code, tf, glsl_nmax, {rounded, f32(0.0f)}),
                                                             f32(16777215.0f)});
         const std::uint32_t code_mid = emit(code, op_convert_f_to_u, tu, {safe});
         const std::uint32_t at_least_one = emit(code, op_u_greater_than_equal, tb, {b, u32(0x3f800000u)});
@@ -391,15 +399,24 @@ inline std::vector<std::uint32_t> depth24_patch_fragment(const std::vector<std::
         const std::uint32_t coord = p.emit(entry_code, op_load, tv4, {frag_coord});
         std::uint32_t z = p.emit(entry_code, op_composite_extract, tf, {coord, 2});
         if (bias.any()) {
-            // In the entry block: uniform control flow, so the derivatives are defined.
-            const std::uint32_t dx = p.ext(entry_code, tf, glsl_fabs, {p.emit(entry_code, op_dpdx, tf, {z})});
-            const std::uint32_t dy = p.ext(entry_code, tf, glsl_fabs, {p.emit(entry_code, op_dpdy, tf, {z})});
-            const std::uint32_t max_slope = p.ext(entry_code, tf, glsl_fmax, {dx, dy});
-            std::uint32_t amount = p.emit(entry_code, op_f_mul, tf, {p.f32(bias.slope), max_slope});
-            amount = p.emit(entry_code, op_f_add, tf, {amount, p.f32(depth24_bias_constant(bias.constant))});
+            std::uint32_t amount = p.f32(depth24_bias_constant(bias.constant));
+            // The slope term only when its factor is non-zero (D3D11.3 15.10): an edge-on triangle's slope can be
+            // infinite, and 0 * inf would turn a constant-only bias into NaN.
+            if (bias.slope != 0.0f) {
+                // In the entry block: uniform control flow, so the derivatives are defined.
+                const std::uint32_t dx = p.ext(entry_code, tf, glsl_fabs, {p.emit(entry_code, op_dpdx, tf, {z})});
+                const std::uint32_t dy = p.ext(entry_code, tf, glsl_fabs, {p.emit(entry_code, op_dpdy, tf, {z})});
+                const std::uint32_t max_slope = p.ext(entry_code, tf, glsl_fmax, {dx, dy});
+                // NoContraction, as the translator puts on its float ops: no fused multiply-add changes the rounding.
+                const std::uint32_t slope = p.emit(entry_code, op_f_mul, tf, {p.f32(bias.slope), max_slope});
+                p.no_contraction(slope);
+                amount = p.emit(entry_code, op_f_add, tf, {slope, amount});
+                p.no_contraction(amount);
+            }
             if (bias.clamp > 0.0f) amount = p.ext(entry_code, tf, glsl_fmin, {amount, p.f32(bias.clamp)});
             if (bias.clamp < 0.0f) amount = p.ext(entry_code, tf, glsl_fmax, {amount, p.f32(bias.clamp)});
             z = p.emit(entry_code, op_f_add, tf, {z, amount});
+            p.no_contraction(z);
         }
         const std::uint32_t q = p.quantise(entry_code, z);
         entry_code.push_back(make(op_store, {frag_depth, q}));
