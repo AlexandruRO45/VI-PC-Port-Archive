@@ -163,34 +163,32 @@ class OracleTests(unittest.TestCase):
             check_image(b"", self.manifest)
 
 
+# Hand-written listings in the shape constant_layout reads; registers, offsets and order are the test's own.
 COPIED_TABLE = """
-    s_swappc_b64 s[4:5], s[4:5]
-    s_mov_b32 s2, s9
-    s_mov_b32 s3, 0
-    s_load_dwordx4 s[4:7], s[2:3], 0x20
-    s_load_dwordx4 s[0:3], s[2:3], 0x60
+    s_mov_b32 s12, s6
+    s_mov_b32 s13, 0
+    s_load_dwordx4 s[20:23], s[12:13], 0x20
+    s_load_dwordx4 s[24:27], s[12:13], 0x60
     s_waitcnt lgkmcnt(0)
-    s_buffer_load_dwordx4 s[16:19], s[4:7], null
-    s_buffer_load_dwordx4 s[20:23], s[4:7], 0x10
-    s_buffer_load_dwordx4 s[24:27], s[4:7], 0x20
-    s_buffer_load_dwordx4 s[28:31], s[4:7], 0x30
-    s_buffer_load_dwordx16 s[0:15], s[0:3], 0x160
-    v_mul_legacy_f32_e32 v3, s16, v4
+    s_buffer_load_dwordx4 s[32:35], s[20:23], 0x30
+    s_buffer_load_dwordx4 s[36:39], s[20:23], 0x10
+    s_buffer_load_dwordx4 s[28:31], s[20:23], null
+    s_buffer_load_dwordx4 s[40:43], s[20:23], 0x20
+    s_buffer_load_dwordx16 s[44:59], s[24:27], 0x160
 """
 
 DIRECT_TABLE_WITH_COLOUR = """
-    s_mov_b32 s9, 0
-    s_load_dwordx4 s[28:31], s[8:9], null
-    s_load_dwordx4 s[0:3], s[8:9], 0x40
+    s_mov_b32 s5, 0
+    s_load_dwordx4 s[8:11], s[4:5], 0x10
+    s_load_dwordx4 s[40:43], s[4:5], 0x50
     s_waitcnt lgkmcnt(0)
-    s_buffer_load_dwordx16 s[0:15], s[0:3], 0x1a0
-    s_buffer_load_dwordx4 s[16:19], s[28:31], null
-    s_buffer_load_dwordx4 s[20:23], s[28:31], 0x10
-    s_buffer_load_dwordx4 s[24:27], s[28:31], 0x20
-    s_buffer_load_dwordx4 s[28:31], s[28:31], 0x30
-    v_cvt_f32_ubyte2_e32 v6, s19
-    v_cvt_f32_ubyte0_e32 v1, s19
-    v_cvt_f32_ubyte3_e32 v7, s19
+    s_buffer_load_dwordx4 s[12:15], s[8:11], 0x20
+    s_buffer_load_dwordx4 s[16:19], s[8:11], null
+    s_buffer_load_dwordx4 s[20:23], s[8:11], 0x30
+    s_buffer_load_dwordx4 s[24:27], s[8:11], 0x10
+    s_buffer_load_dwordx16 s[44:59], s[40:43], 0x1a0
+    v_cvt_f32_ubyte3_e32 v2, s15
+    v_cvt_f32_ubyte1_e32 v9, s15
 """
 
 
@@ -201,7 +199,7 @@ class LayoutTests(unittest.TestCase):
         layout = fl.constant_layout(COPIED_TABLE)
         self.assertEqual(
             layout,
-            {"table_sgpr": 9, "world_vsharp": 0x20, "view_vsharp": 0x60, "world_size": 0x40, "view_size": 0x1A0,
+            {"table_sgpr": 6, "world_vsharp": 0x20, "view_vsharp": 0x60, "world_size": 0x40, "view_size": 0x1A0,
              "viewproj": 0x160, "colour_offset": None},
         )
 
@@ -209,20 +207,24 @@ class LayoutTests(unittest.TestCase):
         layout = fl.constant_layout(DIRECT_TABLE_WITH_COLOUR)
         self.assertEqual(
             (layout["table_sgpr"], layout["world_vsharp"], layout["view_vsharp"], layout["viewproj"]),
-            (8, 0x00, 0x40, 0x1A0),
+            (4, 0x10, 0x50, 0x1A0),
         )
-        self.assertEqual((layout["view_size"], layout["colour_offset"]), (0x1E0, 0x0C))
+        self.assertEqual((layout["view_size"], layout["colour_offset"]), (0x1E0, 0x2C))
+
+    def test_the_colour_may_be_the_w_of_the_translation_row(self):
+        listing = DIRECT_TABLE_WITH_COLOUR.replace("s15", "s23")
+        self.assertEqual(fl.constant_layout(listing)["colour_offset"], 0x3C)
 
     def test_a_vs_that_does_not_fit_is_named_in_the_error(self):
         cases = {
             "no table": "    v_mov_b32_e32 v0, 0\n",
-            "high half": COPIED_TABLE.replace("    s_mov_b32 s3, 0\n", ""),
-            "no world rows": COPIED_TABLE.replace("    s_buffer_load_dwordx4 s[28:31], s[4:7], 0x30\n", ""),
+            "high half": COPIED_TABLE.replace("    s_mov_b32 s13, 0\n", ""),
+            "no world rows": COPIED_TABLE.replace("    s_buffer_load_dwordx4 s[32:35], s[20:23], 0x30\n", ""),
             "no view-projection": COPIED_TABLE.replace(
-                "s_buffer_load_dwordx16 s[0:15], s[0:3], 0x160", "s_buffer_load_dwordx4 s[0:3], s[0:3], 0x160"
+                "s_buffer_load_dwordx16 s[44:59], s[24:27], 0x160", "s_buffer_load_dwordx4 s[44:47], s[24:27], 0x160"
             ),
-            "raw V#": COPIED_TABLE.replace("    s_load_dwordx4 s[4:7], s[2:3], 0x20\n", ""),
-            "colour in the view buffer": COPIED_TABLE + "    v_cvt_f32_ubyte0_e32 v1, s5\n",
+            "raw V#": COPIED_TABLE.replace("    s_load_dwordx4 s[20:23], s[12:13], 0x20\n", ""),
+            "colour in the view buffer": COPIED_TABLE + "    v_cvt_f32_ubyte0_e32 v1, s45\n",
         }
         for label, listing in cases.items():
             with self.subTest(label), self.assertRaises(SystemExit) as cm:
@@ -230,11 +232,20 @@ class LayoutTests(unittest.TestCase):
             self.assertIn("VS_x", str(cm.exception))
 
     def test_the_colour_must_be_a_row_w(self):
-        listing = DIRECT_TABLE_WITH_COLOUR.replace("v_cvt_f32_ubyte2_e32 v6, s19", "v_cvt_f32_ubyte2_e32 v6, s18").replace(
-            "v_cvt_f32_ubyte0_e32 v1, s19", "v_cvt_f32_ubyte0_e32 v1, s18").replace(
-            "v_cvt_f32_ubyte3_e32 v7, s19", "v_cvt_f32_ubyte3_e32 v7, s18")
         with self.assertRaises(SystemExit):
-            fl.constant_layout(listing)
+            fl.constant_layout(DIRECT_TABLE_WITH_COLOUR.replace("s15", "s14"))
+
+    def test_a_table_pointer_must_be_a_user_sgpr_not_one_the_vs_wrote(self):
+        cases = {
+            "copy of a written register": "    s_mov_b32 s6, 5\n" + COPIED_TABLE,
+            "source overwritten after the copy": COPIED_TABLE.replace(
+                "    s_mov_b32 s13, 0\n", "    s_mov_b32 s13, 0\n    s_mov_b32 s6, 1\n"
+            ),
+            "direct pointer written": "    s_mov_b32 s4, 1\n" + DIRECT_TABLE_WITH_COLOUR,
+        }
+        for label, listing in cases.items():
+            with self.subTest(label), self.assertRaises(SystemExit):
+                fl.constant_layout(listing, "VS_x")
 
     def test_constants_for_a_colour_vs_need_a_colour_and_vice_versa(self):
         eye = [[1.0 if i == j else 0.0 for j in range(4)] for i in range(4)]
@@ -245,9 +256,9 @@ class LayoutTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             fl.camera_constants(eye, eye, plain, 0xFF000000)
         sgprs, heap = fl.camera_constants(eye, eye, with_colour, 0xC0C08040)
-        self.assertEqual(len(sgprs.split(",")), 9)  # s0..s8, the table address in s8
-        self.assertEqual(sgprs.split(",")[8], str(fl.TABLE_VA))
-        self.assertIn(f"{fl.WORLD_VA + 0x0C:#x}=0xc0c08040", heap)
+        self.assertEqual(len(sgprs.split(",")), 5)  # s0..s4, the table address in s4
+        self.assertEqual(sgprs.split(",")[4], str(fl.TABLE_VA))
+        self.assertIn(f"{fl.WORLD_VA + 0x2C:#x}=0xc0c08040", heap)
 
 
 class ColourOracleTests(unittest.TestCase):
@@ -307,6 +318,20 @@ class ColourOracleTests(unittest.TestCase):
             check_image(self.image(covered=(5, 6, 9)), self.manifest)
         with self.assertRaises(AssertionError):
             check_image(self.image(covered=(5, 6, 9, 10, 15)), self.manifest)
+
+    def test_rejects_a_garbage_edge_pixel(self):
+        for bad in ([0.4, 0.4, 0.4, 0.4], [0.25, 0.5, 0.75, 0.5], [float("nan")] * 4):
+            with self.subTest(bad=bad):
+                data = bytearray(self.image())
+                data[11 * 16 : 11 * 16 + 16] = struct.pack("<4f", *bad)
+                with self.assertRaises(AssertionError):
+                    check_image(bytes(data), self.manifest)
+
+    def test_rejects_a_nan_pixel_outside_every_triangle(self):
+        data = bytearray(self.image())
+        data[0:16] = struct.pack("<4f", *([float("nan")] * 4))
+        with self.assertRaises(AssertionError):
+            check_image(bytes(data), self.manifest)
 
     def test_rejects_the_uv_map_in_place_of_the_constant(self):
         with self.assertRaises(AssertionError):

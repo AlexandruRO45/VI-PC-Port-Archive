@@ -5,6 +5,7 @@
 Every byte here is built by the test: a synthetic drawable system page, a synthetic graphics page and a
 synthetic RPF9-style archive made of page-aligned zlib streams. No game file, value or name is used.
 """
+import io
 import json
 import os
 import struct
@@ -354,6 +355,47 @@ class TestFormatTable(unittest.TestCase):
             20: (8, 30, 104, bytes(16))}, 2, 6)            # format 30 with 8 bytes must be refused
         with self.assertRaises(ss.Skip):
             ss.walk_resource(system, "drawable")
+
+
+class TestWindow(unittest.TestCase):
+    class Small(ss.Window):
+        BLOCK = 64
+
+    @staticmethod
+    def data(n):
+        return bytes((i * 7 + 3) % 251 for i in range(n))
+
+    def test_reads_that_straddle_a_block_boundary(self):
+        raw = self.data(1000)
+        w = self.Small(io.BytesIO(raw))
+        for a, b in ((0, 10), (60, 70), (63, 65), (64, 128), (100, 130), (5, 40), (30, 62), (990, 1000)):
+            with self.subTest(a=a, b=b):
+                self.assertEqual(w[a:b], raw[a:b])
+        self.assertEqual(w[10:20], raw[10:20])  # back to an earlier block
+
+    def test_a_large_read_bypasses_the_cache(self):
+        raw = self.data(1000)
+        w = self.Small(io.BytesIO(raw))
+        self.assertEqual(w[3:503], raw[3:503])
+        self.assertEqual(w.block, b"")
+        self.assertEqual(w[500:520], raw[500:520])
+
+    def test_a_read_past_the_end_is_short(self):
+        raw = self.data(100)
+        w = self.Small(io.BytesIO(raw))
+        self.assertEqual(w[90:110], raw[90:])
+
+    def test_find_zlib_scans_in_one_megabyte_steps(self):
+        mb = 1 << 20
+        size = 3 * mb + 100
+        for at in (5, mb - 1, mb, mb + 1, 2 * mb + 17, 3 * mb + 50):
+            with self.subTest(at=at):
+                raw = bytearray(size)
+                raw[at:at + 2] = b"\x78\x9c"
+                w = ss.Window(io.BytesIO(bytes(raw)))
+                self.assertEqual(w.find_zlib(0, size), at)
+                self.assertIsNone(w.find_zlib(at + 1, size))
+        self.assertIsNone(ss.Window(io.BytesIO(bytes(size))).find_zlib(0, size))
 
 
 class TestCli(unittest.TestCase):

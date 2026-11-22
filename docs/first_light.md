@@ -166,15 +166,14 @@ its own world and view-projection matrices too. **Measured** on an RTX 4090 (Win
 `Meshes` = 1, 300 to 3,000 triangles, every bounding-box extent at least 5% of the longest (so no flat card or thin
 rod), and an OBJ with UVs; of those, the triangle count closest to 1,000, ties by file name. Of the 149,811 items in
 the manifest, 4,174 pass; four are at exactly 1,000. The pick is one mesh of **543 vertices and 1,000 triangles**,
-OBJ SHA-256 `136cbc6e7069492ea3a54ca768387caa0661a48c57fcf18a8a792abfdbea8384`. The census of `levels.rpf` layouts
+(`first_light_prop.py` prints the pick and its SHA-256 on the user's machine; they are not recorded here). The census of `levels.rpf` layouts
 (`tools/fvf_layouts.py`) shows its vertex streams hold quantized positions (16-bit formats) and packed normals and
 UVs; the OBJ already holds the dequantized floats. They are fed as float3 and float2 (`VKH_VERTEX_LAYOUT=0:3f,1:2f`),
 which is what the VS reads: in the game the input layout's format does that conversion, and `vk_harness` has no
 packed-format path to exercise it.
 
 **The pair** is `sga_dr_vs_pos_tex` with section 1's UV-writing PS: both pass `shader_link_check.py check`
-("1 compatible, 0 incompatible"). The VS (FSSM SHA-256 `175b59adebeb128526c6401567c0fc170969bae498a2a85699bd589ff4a24711`)
-reads POSITION and TEXCOORD, exports a clip position and two parameters, and param0 is not the UV: it is four bytes
+("1 compatible, 0 incompatible"). The VS reads POSITION and TEXCOORD, exports a clip position and two parameters, and param0 is not the UV: it is four bytes
 unpacked from a constant (`v_cvt_f32_ubyte0..3` of one SGPR, times 1/255), UV goes to param1. The PS writes
 param0 as the colour, so the image is a constant colour, not a UV map. The task's alternative, `sga_dr_vs_pos_feff6b5f`
 with `sga_dr_ps_feff6b5f`, has the same constant-colour shape (also param0 from `v_cvt_f32_ubyte` of an SGPR); it was
@@ -190,7 +189,7 @@ fit is rejected with an error naming it (`VS_main_170e32e6`, which loads no V#, 
 
 | VS | table SGPR | world V# | view V# | view-projection | colour dword |
 |---|---|---|---|---|---|
-| `VS_TransformVT_e6ebb353` (section 6) | s9, via `s_mov_b32 s2, s9` | table + 0x20 | table + 0x60 | 0x160 | none |
+| `VS_TransformVT_e6ebb353` (section 6) | s9, copied to s2 | table + 0x20 | table + 0x60 | 0x160 | none |
 | `sga_dr_vs_pos_tex_90997d1b` | s8 | table + 0x00 | table + 0x40 | 0x160 | world + 0x0C |
 | `sga_dr_vs_pos_feff6b5f` | s8 | table + 0x00 | table + 0x20 | 0x160 | world + 0x0C |
 
@@ -201,7 +200,9 @@ table, a colour outside a row's w).
 **The oracle** is CPU-derived, like section 6: the prop is projected with the same float32 matrices, and a
 rasterization of the projected triangles gives two masks over the 128×128 pixel centres. A pixel is *certain* when
 its centre is more than 0.02 px inside some triangle and *possible* when it is not more than 0.02 px outside every
-one (the band stands for the GPU's sub-pixel snap and top-left rule). The image must cover every certain pixel,
+one (the band stands for the GPU's sub-pixel snap and top-left rule; 0.02 px assumes 8 `subPixelPrecisionBits`, as on the
+RTX 4090, and a 4-bit device would need about 1/32 px). A pixel in the band must be exactly the clear value or exactly
+the constant. The image must cover every certain pixel,
 leave every non-possible pixel at the clear value, and carry the set constant **exactly** (all four channels,
 bit-equal) on every covered pixel. The constant is packed `0xC0C08040`, so the expected pixel is the CPU's
 `ubyte / 255` in float32 rounded toward zero to f16 (the PS's `v_cvt_pkrtz_f16_f32`): `(0.2509766, 0.5019531,
@@ -228,7 +229,7 @@ pixel. The default constant therefore avoids one; a PS that needs 1.0 exactly wo
 constant to be exact, which is an open question about the translator's lowering, not about this tool.
 
 ```sh
-python -I tools/first_light_prop.py ~/leonida-work/assets/levels/models      # the pick, with its SHA-256
+python -I tools/first_light_prop.py ~/leonida-work/assets/levels/models      # the pick and its SHA-256, printed locally
 python -I tools/first_light.py --game "<package>" --work ~/leonida-work \
     --obj <the pick> --vs "#sga_dr_vs_pos_tex_90997d1b_Wrapped" --camera --min-coverage 0.05 --run
 LEONIDA_FIRST_LIGHT_DIR=~/leonida-work/first_light/camera python -I tests/test_first_light.py -v

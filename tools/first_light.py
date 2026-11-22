@@ -335,11 +335,16 @@ def constant_layout(listing: str, name: str = "the VS") -> dict:
     ubytes: set[tuple[int, int]] = set()
     tables: set[int] = set()
 
+    written: set[int] = set()  # SGPRs some earlier instruction wrote: not the user SGPRs the draw sets
+
     def clobber(lo, hi):
         for r in range(lo, hi + 1):
             copy.pop(r, None)
             zero.discard(r)
             holds.pop(r, None)
+            written.add(r)
+        for k in [k for k, v in copy.items() if lo <= v <= hi]:
+            del copy[k]  # a copy of a register that is overwritten no longer holds the user value
         for first in [f for f in vsharps if f <= hi and f + 3 >= lo]:
             del vsharps[first]
 
@@ -352,15 +357,22 @@ def constant_layout(listing: str, name: str = "the VS") -> dict:
         dst = _sregs(ops[0]) if ops else None
         if op == "s_mov_b32" and dst and len(ops) == 2:
             src = _sregs(ops[1])
+            origin = None
+            if src and src[0] == src[1]:
+                origin = copy.get(src[0], src[0])
+                if origin == src[0] and src[0] in written:
+                    fail(f"s{src[0]} is copied after an earlier instruction wrote it, so it is not a user SGPR")
             clobber(*dst)
             if _imm(ops[1]) == 0 and ops[1].strip() != "null":
                 zero.add(dst[0])
-            elif src and src[0] == src[1]:
-                copy[dst[0]] = copy.get(src[0], src[0])
+            elif origin is not None:
+                copy[dst[0]] = origin
         elif op.startswith("s_load_dword") and dst and len(ops) == 3:
             base, off = _sregs(ops[1]), _imm(ops[2])
             if op == "s_load_dwordx4" and base and base[1] == base[0] + 1 and off is not None:
                 low = copy.get(base[0], base[0])
+                if low == base[0] and low in written:
+                    fail(f"the table pointer s{low} was written by an earlier instruction, not set by the draw")
                 if base[1] not in zero:
                     fail(f"the high half of the table pointer s{base[1]} is not set to 0")
                 tables.add(low)
@@ -400,7 +412,8 @@ def constant_layout(listing: str, name: str = "the VS") -> dict:
     if len(colour) > 1 or len(ubytes) != len(colour):
         fail("it unpacks more than one constant dword, or one outside the world buffer")
     vp_off = reads[viewproj[0]][0][0]
-    if colour and next(iter(colour)) not in (0x0C, 0x1C, 0x2C):
+    # The w of any of the four rows: the VS reads xyz of each, so a fourth-column dword is free for the colour.
+    if colour and next(iter(colour)) not in (0x0C, 0x1C, 0x2C, 0x3C):
         fail(f"its colour constant is at world buffer offset {next(iter(colour)):#x}, not the w of a row")
     return {
         "table_sgpr": tables.pop(),
@@ -437,9 +450,9 @@ def camera_constants(world, viewproj, layout: dict, colour: int | None = None) -
     """
     if (colour is None) != (layout["colour_offset"] is None):
         raise SystemExit(
-            "a colour constant needs a VS that unpacks one, and such a VS needs one"
+            "a colour constant needs a VS that unpacks one"
             if colour is not None
-            else "this VS unpacks a colour constant: pass --colour"
+            else "this VS unpacks a colour constant: the caller must supply one"
         )
     sgprs = [0] * (layout["table_sgpr"] + 1)
     sgprs[layout["table_sgpr"]] = TABLE_VA
@@ -687,15 +700,18 @@ def check_image(data: bytes, manifest: dict) -> dict:
         for n in range(width * height):
             px, py = n % width, n // width
             got = pixels[4 * n : 4 * n + 4]
-            drawn = got[3] > 0.5
-            if certain[n] and not drawn:
-                raise AssertionError(f"pixel {[px, py]} is inside a triangle but is {got}")
-            if not possible[n]:
-                if any(abs(got[c] - CLEAR) > 1e-5 for c in range(4)):
+            is_constant = all(got[c] == want[c] for c in range(4))
+            is_clear = all(abs(got[c] - CLEAR) <= 1e-5 for c in range(4))  # false for a NaN
+            if certain[n]:
+                if not is_constant:
+                    raise AssertionError(f"pixel {[px, py]} is inside a triangle but is {got}, not {want}")
+            elif not possible[n]:
+                if not is_clear:
                     raise AssertionError(f"pixel {[px, py]} is outside every triangle but is {got}")
-            elif drawn and any(got[c] != want[c] for c in range(4)):
-                raise AssertionError(f"pixel {[px, py]} is {got}, expected the constant {want}")
-            undecided += possible[n] and not certain[n]
+            else:  # the edge band: either the clear value or the constant, nothing else
+                undecided += 1
+                if not (is_constant or is_clear):
+                    raise AssertionError(f"edge pixel {[px, py]} is {got}, neither the clear value nor {want}")
     return {"covered": covered, "ratio": ratio, "pixels": pixels, "undecided": undecided}
 
 
