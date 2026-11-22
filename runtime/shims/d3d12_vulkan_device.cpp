@@ -3197,7 +3197,8 @@ public:
             stage_infos.push_back(info);
         }
         UserDataLayout user;
-        if (!user_data_layout({stages[0].entry, stages[1].entry}, user)) return E_NOTIMPL;
+        // Every stage of {vs, gs, ps} (#2109): the PS is stages[2], and its pc_tail must reach the layout.
+        if (!user_data_layout({stages[0].entry, stages[1].entry, stages[2].entry}, user)) return E_NOTIMPL;
 
         // Input layout -> vertex input, by semantic.
         std::vector<VkVertexInputAttributeDescription> attributes;
