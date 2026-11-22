@@ -40,7 +40,7 @@ data is embedded in the repository). `rpf9dump`'s C# `TtpfReader` (submodule pin
 and BCPack BC1, BC3, BC4 and BC5 chunks in strict mode; BC6H, BC7 and provisional-history
 chunks remain skipped by `rpf9dump` and can be completed by `tools/ttpf_assets.py`.
 `rpf9dump ttpf` also takes `--history <path>` (the same local `bc1.json`..`bc5.json` tables) and
-`--allow-provisional` (ASSET-316, "Next step" 2).
+`--allow-provisional` (ASSET-316, `breadbbbb/rpf9-explorer#22`, "Next step" 2).
 
 The compact layout rule moves 206,661 2D textures into complete exports and 1,218 more into
 partial exports (`305,264` complete, `16,419` partial, `35,432` skipped under zlib/raw).
