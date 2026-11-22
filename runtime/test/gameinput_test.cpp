@@ -993,6 +993,30 @@ int main() {
               input->GetPreviousReading(nullptr, GameInputKindGamepad, dev, &hit) == E_INVALIDARG && !hit,
           "history: a null output is E_POINTER, a null reference E_INVALIDARG");
 
+    // GetTemporalReading: the reading nearest in time to a timestamp, from the one device's history (the v0 header
+    // takes the device as required and has no kind filter). seen[0] is the tap's press, seen[1] its release.
+    IGameInputReading* at = nullptr;
+    const uint64_t press_ts = seen[0]->GetTimestamp(), release_ts = seen[1]->GetTimestamp();
+    check(input->GetTemporalReading(press_ts, dev, &at) == S_OK && at == seen[0],
+          "history: GetTemporalReading at a reading's own timestamp is that reading");
+    if (at) at->Release();
+    check(input->GetTemporalReading((press_ts + release_ts) / 2, dev, &at) == S_OK && at == seen[0],
+          "history: GetTemporalReading between two readings takes the nearer one (older on a tie)");
+    if (at) at->Release();
+    IGameInputReading* newest = current(input, dev);
+    check(newest && input->GetTemporalReading(newest->GetTimestamp() + 5'000, dev, &at) == S_OK && at == newest,
+          "history: a future timestamp returns the newest reading (the nearest one there is)");
+    newest->Release();
+    if (at) at->Release();
+    check(input->GetTemporalReading(press_ts - 600'000, dev, &at) == GAMEINPUT_E_REFERENCE_READING_TOO_OLD && !at,
+          "history: a timestamp older than the buffered half second is REFERENCE_READING_TOO_OLD");
+    check(input->GetTemporalReading(press_ts, dev, nullptr) == E_POINTER &&
+              input->GetTemporalReading(press_ts, nullptr, &at) == E_INVALIDARG && !at,
+          "history: a null output is E_POINTER, a null device E_INVALIDARG");
+    check(input->GetTemporalReading(press_ts, dsdev, &at) == S_OK && at && device_of(at) == dsdev,
+          "history: GetTemporalReading searches only the device it is given");
+    if (at) at->Release();
+
     // Two pads in one stream, one poll each: A on the Xbox pad, B on the DualSense, Y on the Xbox pad.
     IGameInputReading* start = current(input, dev);
     SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_SOUTH, true);

@@ -1256,10 +1256,32 @@ public:
                                                  IGameInputReading** out) override {
         return find_reading(ref, kind, device, out, false);
     }
-    HRESULT STDMETHODCALLTYPE GetTemporalReading(uint64_t, IGameInputDevice*, IGameInputReading** out) override {
+    // GetTemporalReading: the reading nearest in time to the given timestamp, from the device's own history. Unlike
+    // its neighbours the v0 header takes the device as required and has no kind filter. A timestamp older than the
+    // oldest buffered reading asks for one that has left the half-second stream, the way a too-old reference fails
+    // for GetNext/GetPrevious; a future one clamps to the newest, which is the nearest reading there is.
+    HRESULT STDMETHODCALLTYPE GetTemporalReading(uint64_t timestamp, IGameInputDevice* device,
+                                                 IGameInputReading** out) override {
         if (!out) return E_POINTER;
         *out = nullptr;
-        return E_NOTIMPL;
+        if (!device) return E_INVALIDARG;
+        Device* d = as_device(device);
+        State& s = g();
+        std::lock_guard lock(s.mu);
+        if (d->status == GameInputDeviceNoStatus) return GAMEINPUT_E_DEVICE_DISCONNECTED;
+        if (d->history.empty()) return GAMEINPUT_E_READING_NOT_FOUND;
+        if (timestamp < d->history.front()->GetTimestamp()) return GAMEINPUT_E_REFERENCE_READING_TOO_OLD;
+        Reading* best = d->history.front();
+        for (Reading* r : d->history) {
+            const uint64_t a = r->GetTimestamp() > timestamp ? r->GetTimestamp() - timestamp
+                                                             : timestamp - r->GetTimestamp();
+            const uint64_t b = best->GetTimestamp() > timestamp ? best->GetTimestamp() - timestamp
+                                                                : timestamp - best->GetTimestamp();
+            if (a < b) best = r;  // the nearest one; on a tie the older reading stays
+        }
+        best->AddRef();
+        *out = best;
+        return S_OK;
     }
 
     HRESULT STDMETHODCALLTYPE RegisterReadingCallback(IGameInputDevice* device, uint32_t kind, float, void* context,

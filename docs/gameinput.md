@@ -187,7 +187,7 @@ The API surface:
 
 | interface | implemented | not implemented |
 |---|---|---|
-| `IGameInput` | `GetCurrentTimestamp` (µs), `GetCurrentReading`, `GetNextReading`, `GetPreviousReading`, `RegisterReadingCallback`, `RegisterDeviceCallback` (blocking and async enumeration), `RegisterGuideButtonCallback`, `RegisterKeyboardLayoutCallback` (never fires), `StopCallback`, `UnregisterCallback`, `CreateDispatcher`, `FindDeviceFromId`, `EnableOemDeviceSupport` (no-op), `SetFocusPolicy` (no-op) | `GetTemporalReading`, `CreateAggregateDevice`, `FindDeviceFromObject/PlatformHandle/PlatformString` |
+| `IGameInput` | `GetCurrentTimestamp` (µs), `GetCurrentReading`, `GetNextReading`, `GetPreviousReading`, `GetTemporalReading`, `RegisterReadingCallback`, `RegisterDeviceCallback` (blocking and async enumeration), `RegisterGuideButtonCallback`, `RegisterKeyboardLayoutCallback` (never fires), `StopCallback`, `UnregisterCallback`, `CreateDispatcher`, `FindDeviceFromId`, `EnableOemDeviceSupport` (no-op), `SetFocusPolicy` (no-op) | `CreateAggregateDevice`, `FindDeviceFromObject/PlatformHandle/PlatformString` |
 | `IGameInputReading` | kind, sequence number, timestamp, device, gamepad state, UI navigation state, controller axes and buttons, motion state | raw report, keyboard, mouse, touch, arcade/flight stick, racing wheel (all return nothing) |
 | `IGameInputDevice` | device info, status, battery, `SetRumbleState` | force feedback and haptic motors (none reported), raw device I/O, power off, input synchronization (no-ops) |
 | `IGameInputDispatcher` | `Dispatch`, `OpenWaitHandle` | the quota (the queue is short) |
@@ -209,13 +209,19 @@ holds stays valid after it leaves the history.
 - `GetNextReading` returns the first reading after the reference, `GetPreviousReading` the last one before it.
 - The horizon is the newest reading dropped from the histories searched (with no device, the reference's pad counts
   too, even unplugged). A step that would cross it fails rather than skip input.
+- `GetTemporalReading` takes no kind filter and, unlike its neighbours, a required device (the v0 header marks it
+  `_In_`). It returns the reading nearest in time to the given timestamp; a timestamp older than the oldest buffered
+  one asks for a reading that has left the stream, and a future one returns the newest reading, which is the nearest
+  there is.
 
 | situation | result |
 |---|---|
 | output null; reference null | `E_POINTER`; `E_INVALIDARG` |
+| temporal: output null; device null | `E_POINTER`; `E_INVALIDARG` |
 | no supported kind in the mask | `GAMEINPUT_E_READING_NOT_FOUND` |
 | the device given is unplugged | `GAMEINPUT_E_DEVICE_DISCONNECTED` |
 | next: the horizon is after the reference; previous: it is not before it | `GAMEINPUT_E_REFERENCE_READING_TOO_OLD` |
+| temporal: the timestamp is older than the oldest buffered reading | `GAMEINPUT_E_REFERENCE_READING_TOO_OLD` |
 | nothing newer, or nothing older after the horizon | `GAMEINPUT_E_READING_NOT_FOUND` |
 
 After a pad is plugged back in, its last reading before the unplug leads to the reconnect snapshot, older ones are
@@ -280,7 +286,8 @@ These need the game executable or a test on hardware:
 - **IIDs.** `QueryInterface` answers the v0 IIDs from the public header.
 - **Reading history.** Microsoft's [next reading](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/interfaces/igameinput/methods/igameinput_getnextreading)
   and [previous reading](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/interfaces/igameinput/methods/igameinput_getpreviousreading) pages describe half a second of readings per device and failure when old readings leave the stream. The table above records the shim's HRESULT choices. Changes faster than the poll are not seen, and
-  `GetTemporalReading` is not implemented.
+  `GetTemporalReading` takes the reading nearest in time to a timestamp; the nearest-in-time rule itself is this
+  shim's choice, since Microsoft's own page for the method is not public.
 - **UI navigation mapping** and the **controller-axis convention** (0..1 with sticks at 0.5) are this shim's choice,
   not measured from a console.
 - **Battery capacity** is reported as a fraction (remaining 0..1 of full 1), not in device units.
