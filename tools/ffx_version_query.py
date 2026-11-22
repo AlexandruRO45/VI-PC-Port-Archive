@@ -26,6 +26,7 @@ STRING_OPS = {
 }
 
 INTEGER_HEADER = """#include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <intrin.h>
@@ -148,6 +149,21 @@ static inline void pclmul_x86(uint8_t out[16], const uint8_t lhs[16], const uint
     }
     memcpy(out, &lo, 8); memcpy(out + 8, &hi, 8);
 }
+template<class F, class U> static F quiet_nan(F x) {
+    U bits; memcpy(&bits, &x, sizeof bits);
+    bits |= (sizeof(U) == 4) ? static_cast<U>(0x00400000u) : static_cast<U>(0x0008000000000000ull);
+    memcpy(&x, &bits, sizeof bits);
+    return x;
+}
+template<class F, class U> static F fma_x86(F s0, F s1, F s2, int order, bool neg_p, bool neg_c) {
+    if (std::isnan(s0)) return quiet_nan<F, U>(s0);
+    if (std::isnan(s1)) return quiet_nan<F, U>(s1);
+    if (std::isnan(s2)) return quiet_nan<F, U>(s2);
+    const F a = order == 132 ? s0 : s1;
+    const F b = order == 213 ? s0 : s2;
+    const F c = order == 231 ? s0 : (order == 132 ? s1 : s2);
+    return std::fma(neg_p ? -a : a, b, neg_c ? -c : c);
+}
 """
 HEADER = INTEGER_HEADER + "struct Query { word type, next, effect, device, count, ids, names; };\n"
 
@@ -240,7 +256,11 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
     }
     crypto_legacy_ops = {M.AESENC, M.AESENCLAST, M.AESDEC, M.AESDECLAST, M.AESIMC, M.AESKEYGENASSIST, M.PCLMULQDQ}
     crypto_vex_ops = {M.VAESENC, M.VAESENCLAST, M.VAESDEC, M.VAESDECLAST, M.VAESIMC, M.VAESKEYGENASSIST, M.VPCLMULQDQ}
-    has_wide = any(i.mnemonic in (M.VMOVUPS, M.MOVDQU, *avx2_wide_ops, *sse41_ops) or i.mnemonic in sha_ops or i.mnemonic in pmov_ext or i.mnemonic in sse2_sat_mul_ops or i.mnemonic in crypto_legacy_ops or i.mnemonic in crypto_vex_ops for i in body)
+    fma_scalar = {
+        getattr(M, f"VF{k.upper()}{o}{s.upper()}"): (k, o, s == "sd")
+        for k in ("madd", "msub", "nmadd", "nmsub") for o in ("132", "213", "231") for s in ("ss", "sd")
+    }
+    has_wide = any(i.mnemonic in (M.VMOVUPS, M.MOVDQU, *avx2_wide_ops, *sse41_ops) or i.mnemonic in sha_ops or i.mnemonic in pmov_ext or i.mnemonic in sse2_sat_mul_ops or i.mnemonic in crypto_legacy_ops or i.mnemonic in crypto_vex_ops or i.mnemonic in fma_scalar for i in body)
     if any(i.code in STRING_OPS or i.mnemonic in (M.CLD, M.STD) for i in body):
         # The x64 software conventions expect DF clear on function exit and before calls, so it starts clear.
         lines.append("bool direction=false;")
@@ -931,6 +951,23 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                     last = "true" if op in (M.AESENCLAST, M.AESDECLAST, M.VAESENCLAST, M.VAESDECLAST) else "false"
                     stmt = (f"{{ uint8_t s1[16], o[16]; memcpy(s1, {src1}.data(), 16); {s2_init} "
                             f"aes_round(o, s1, s2, {dec}, {last}); memcpy({dst}.data(), o, 16);{zero_hi} }}")
+        elif has_wide and i.encoding == EncodingKind.VEX and op in fma_scalar:
+            if (i.op0_kind != K.REGISTER or i.op0_register not in wide_xmm
+                    or i.op1_kind != K.REGISTER or i.op1_register not in wide_xmm
+                    or (i.op2_kind != K.MEMORY and
+                        (i.op2_kind != K.REGISTER or i.op2_register not in wide_xmm))):
+                raise ValueError(f"unsupported query operation at {i.ip:#x}: {i}")
+            kind, order, is_f64 = fma_scalar[op]
+            ftype, utype, sz = ("double", "uint64_t", 8) if is_f64 else ("float", "uint32_t", 4)
+            dst, src1 = wide_xmm[i.op0_register], wide_xmm[i.op1_register]
+            s0 = f"load<{ftype}>(reinterpret_cast<word>({dst}.data()))"
+            s1 = f"load<{ftype}>(reinterpret_cast<word>({src1}.data()))"
+            s2 = (f"load<{ftype}>({address()})" if i.op2_kind == K.MEMORY
+                  else f"load<{ftype}>(reinterpret_cast<word>({wide_xmm[i.op2_register]}.data()))")
+            neg_p = "true" if kind in ("nmadd", "nmsub") else "false"
+            neg_c = "true" if kind in ("msub", "nmsub") else "false"
+            stmt = (f"{{ const {ftype} r = fma_x86<{ftype}, {utype}>({s0}, {s1}, {s2}, {order}, {neg_p}, {neg_c}); "
+                    f"auto keep = {dst}; {dst} = {{}}; memcpy({dst}.data(), keep.data(), 16); memcpy({dst}.data(), &r, {sz}); }}")
         elif op in sse2_int_ops and i.encoding == EncodingKind.LEGACY and i.op0_kind == K.REGISTER and i.op0_register in wide_xmm and has_wide:
             dst = wide_xmm[i.op0_register]
             if i.op1_kind == K.REGISTER and i.op1_register in wide_xmm:
