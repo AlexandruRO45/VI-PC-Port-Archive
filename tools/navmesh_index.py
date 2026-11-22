@@ -198,13 +198,13 @@ def _make_parent(path):
 
 def write_outputs(rows, summary, out_path, csv_path):
     _make_parent(out_path)
-    with open(out_path, "w", encoding="utf-8") as f:
+    with open(out_path, "w", encoding="utf-8", newline="\n") as f:
         json.dump({"summary": summary, "pages": rows}, f, indent=1)
     written = []
     if csv_path:
         _make_parent(csv_path)
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
+            w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore", lineterminator="\n")
             w.writeheader()
             w.writerows(rows)
         written.append(csv_path)
@@ -258,8 +258,14 @@ def is_scanned_input(path, input_path, pattern):
             return False
         root = parent
     pattern = pattern or "*.bin"
-    return (fnmatch.fnmatch(os.path.relpath(target, root), pattern)
-            or fnmatch.fnmatch(os.path.basename(target), pattern))
+    if (fnmatch.fnmatch(os.path.relpath(target, root), pattern)
+            or fnmatch.fnmatch(os.path.basename(target), pattern)):
+        return True
+    # The spelling may not match while the file is still one the scan reads: fnmatch folds case only on Windows,
+    # so CARVE/PAGE.BIN on a case-insensitive macOS or Linux volume, or a hard link, slips past the pattern. Ask
+    # the scan's own glob whether any file it reads is this one.
+    return any(same_report_path(target, scanned)
+               for scanned in glob.iglob(os.path.join(input_path, "**", pattern), recursive=True))
 
 
 def main() -> int:

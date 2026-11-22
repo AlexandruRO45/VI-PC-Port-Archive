@@ -3,7 +3,8 @@
 // The execution side of the D3D12 layer, without COM: the per-device Vulkan context (resources, layout tracker,
 // image views), queues that execute command lists, and timeline-semaphore fences. The COM objects in
 // shims/d3d12_com.cpp are thin wrappers over these. Needs Vulkan 1.2 timeline semaphores; rectangle clears and
-// enhanced barriers need the Vulkan 1.3 functions (dynamicRendering, synchronization2) to be enabled.
+// enhanced barriers need the Vulkan 1.3 functions (dynamicRendering, synchronization2) to be enabled, as core
+// features or through their KHR extensions on a 1.2 device (vulkan13_features.h).
 
 #ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
@@ -12,6 +13,7 @@
 #include "occlusion_sum_spirv.h"
 #include "retire_tickets.h"
 #include "statistics_sum_spirv.h"
+#include "vulkan13_features.h"
 #include "vulkan_depth24.h"
 #include "vulkan_scratch.h"
 #include "vulkan_replay.h"
@@ -27,6 +29,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <unordered_set>
 #include <shared_mutex>
 #include <span>
 #include <thread>
@@ -84,7 +87,7 @@ struct VulkanDeviceFunctions {
     // extension is not enabled, and the query functions are optional (a list that uses queries without them is
     // unsupported). The compute and descriptor functions are needed for normalized or summed occlusion results.
     bool load(PFN_vkGetDeviceProcAddr get, VkDevice device) {
-#define LEONIDA_VK_LOAD(name) name = reinterpret_cast<PFN_##name>(get(device, #name));
+#define LEONIDA_VK_LOAD(name) name = reinterpret_cast<PFN_##name>(leonida::device_proc_or_khr(get, device, #name));
         LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_LOAD)
 #undef LEONIDA_VK_LOAD
         return vkCreateCommandPool && vkDestroyCommandPool && vkAllocateCommandBuffers && vkResetCommandBuffer &&
@@ -732,14 +735,25 @@ public:
                     const std::uint64_t base = replay_.heap_base;
                     XdxrLayout layout;
                     layout.compute(xdxr_elements(b), b.is_tlas);
+                    // PERFORM_UPDATE refits the source (the destination itself when no source is given, as D3D12
+                    // allows for an in-place update); a full build otherwise.
+                    const std::uint64_t from = b.update ? base + (b.src_va ? b.src_va : b.dst_va) : 0;
                     if (b.is_tlas) {
                         xdxr_->record_tlas(cb, layout, b.instances_va ? base + b.instances_va : 0, base + b.dst_va,
-                                           base + b.scratch_va, base);
+                                           base + b.scratch_va, base, from);
                     } else {
                         std::vector<XdxrTriangles> geometries;
                         xdxr_inputs(b, &geometries, base);
-                        xdxr_->record_blas(cb, layout, geometries, base + b.dst_va, base + b.scratch_va);
+                        xdxr_->record_blas(cb, layout, geometries, base + b.dst_va, base + b.scratch_va, from);
                     }
+                };
+                replay_.xdxr_copy = [this](VkCommandBuffer cb, std::uint64_t src, std::uint64_t dst, std::uint64_t bytes) {
+                    const std::uint64_t base = replay_.heap_base;
+                    xdxr_->record_copy(cb, base + src, base + dst, bytes);
+                };
+                replay_.xdxr_postbuild = [this](VkCommandBuffer cb, std::uint64_t src, std::uint64_t dest) {
+                    const std::uint64_t base = replay_.heap_base;
+                    xdxr_->record_postbuild(cb, base + src, base + dest);
                 };
             } else {
                 xdxr_.reset();
@@ -814,6 +828,15 @@ public:
         }
     }
 
+    // An image that got a storage (unordered-access) view. A shader can write it before any command names it, so the
+    // layer would not know it was used and the first barrier or copy that does would zero-fill it (vulkan_replay.h,
+    // initialize). The next submission therefore moves each such image to GENERAL, the layout its descriptor names,
+    // zero-filled, ahead of its lists. An image already tracked beyond UNDEFINED is left as it is.
+    void note_storage_image(ResourceId id) {
+        std::lock_guard lock(storage_mutex_);
+        storage_pending_.insert(id);
+    }
+
     void remove_resource(ResourceId id) {
         VkImage img = VK_NULL_HANDLE;
         {
@@ -845,7 +868,10 @@ public:
         query_pools_[id] = pool;
     }
     void remove_query_pool(QueryHeapId id) {
+        // Lock hierarchy: resource_mutex_ -> tracker_mutex_. Holding tracker_mutex_ before erasing keeps the
+        // QueryPool node alive until any in-flight execute() that unlocked resource_mutex_ finishes QueryReplay::commit().
         std::unique_lock lock(resource_mutex_);
+        std::lock_guard tlock(tracker_mutex_);
         query_pools_.erase(id);
     }
     // The heap's d3d12_query_heap type, or ~0u for a heap that is not registered.
@@ -1024,6 +1050,7 @@ public:
 
     std::uint64_t completed_retire_ticket() {
         std::lock_guard lock(submit_mutex_);
+        if (is_device_lost()) return 0;
         return retire_tickets_.completed([this](VkSemaphore semaphore, std::uint64_t value) {
             std::uint64_t done = 0;
             return vk.vkGetSemaphoreCounterValue(device_, semaphore, &done) == VK_SUCCESS && done >= value;
@@ -1115,6 +1142,14 @@ private:
     std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;
     std::unordered_map<std::uint64_t, VkAccelerationStructureKHR> acceleration_structures_;
     LayoutTracker tracker_;
+    std::mutex storage_mutex_;  // a leaf lock: guards storage_pending_ only
+    std::unordered_set<ResourceId> storage_pending_;
+    // The last submission that initialized storage images (its queue's progress semaphore and ticket) and a counter
+    // that says which one: every other queue's next submission waits for it, so no queue uses such an image before
+    // the zero-fill that put it in GENERAL has run.
+    VkSemaphore storage_init_semaphore_ = VK_NULL_HANDLE;
+    std::uint64_t storage_init_value_ = 0;
+    std::uint64_t storage_init_version_ = 0;
     std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>, VkImageView> views_;
     std::function<bool(VkCommandBuffer)> bindless_prepare_;
     std::unique_ptr<Depth24Converter> depth24_;
@@ -1220,8 +1255,12 @@ public:
         if (queue_) {
             std::lock_guard lock(context_.submit_mutex());
             for (; open_labels_; --open_labels_) context_.labels_.queue_end(queue_);
-            vk.vkQueueWaitIdle(queue_);
-            if (progress_) context_.retire_queue_idle_locked(progress_);
+            const VkResult idle_result = vk.vkQueueWaitIdle(queue_);
+            if (idle_result == VK_SUCCESS) {
+                if (progress_) context_.retire_queue_idle_locked(progress_);
+            } else {
+                context_.mark_device_lost();
+            }
         }
         if (progress_) {
             std::lock_guard lock(context_.tracker_mutex_);
@@ -1342,6 +1381,7 @@ public:
         }
         const auto resolve = [this](ResourceId id) { return context_.resolve(id); };
         std::uint32_t segments = 0, statistics_segments = 0;
+        bool has_queries = false;
         for (std::size_t i = 0; i < lists.size(); ++i) {
             const auto result = prepare(*lists[i], resolve, replay, prepared[i]);
             if (result != ReplayResult::success) return result;
@@ -1350,6 +1390,7 @@ public:
                 return ReplayResult::unsupported;
             segments += prepared[i].segment_count;
             statistics_segments += prepared[i].statistics_segment_count;
+            has_queries = has_queries || !prepared[i].queries.empty();
         }
         const auto segment_pool = [this](VkQueryType type, std::uint32_t count,
                                          std::shared_ptr<OcclusionSegmentPool>& out) {
@@ -1371,6 +1412,10 @@ public:
         if (statistics_segments && can_resolve_occlusion &&
             !segment_pool(VK_QUERY_TYPE_PIPELINE_STATISTICS, statistics_segments, statistics))
             return ReplayResult::unsupported;
+        // QueryReplay::plan() reads QueryPool::ended / occlusion and QueryReplay::commit() writes them after
+        // resource_lock is unlocked. Hold tracker_mutex_ across plan -> emit -> submit -> commit so concurrent queues
+        // see submission-order query state and remove_query_pool() waits until commit finishes.
+        if (has_queries && !tracker_lock.owns_lock()) tracker_lock.lock();
         QueryReplay queries;
         std::uint32_t base = 0, statistics_base = 0;
         for (auto& list : prepared) {
@@ -1420,6 +1465,33 @@ public:
             return ReplayResult::unsupported;
         }
         auto next_tracker = context_.tracker_;
+        // Images with a UAV view are moved to GENERAL (zeroed) by the first submission that can use a shader on them:
+        // not a copy queue (its family may not clear images), and one whose lists dispatch or draw.
+        bool runs_shaders = false;
+        for (const CommandList* list : lists)
+            for (const auto& command : list->commands())
+                runs_shaders |= std::holds_alternative<Dispatch>(command) || std::holds_alternative<Draw>(command) ||
+                                std::holds_alternative<ExecuteIndirect>(command);
+        std::vector<ResourceId> storage_images;
+        {
+            std::lock_guard lock(context_.storage_mutex_);
+            if (context_.storage_init_semaphore_ && context_.storage_init_semaphore_ != progress_ &&
+                context_.storage_init_version_ != storage_init_seen_) {
+                waits_.push_back(context_.storage_init_semaphore_);
+                wait_values_.push_back(context_.storage_init_value_);
+                storage_init_seen_ = context_.storage_init_version_;
+            }
+            if (kind_ != QueueKind::copy && runs_shaders)
+                storage_images.assign(context_.storage_pending_.begin(), context_.storage_pending_.end());
+            if (!storage_images.empty()) context_.storage_pending_.clear();
+        }
+        for (const ResourceId id : storage_images) {
+            const ResourceBinding* image = context_.resolve(id);
+            if (!image || !image->image) continue;
+            const VkImageSubresourceRange range{image->aspects, 0, image->mip_levels, 0, image->array_layers};
+            auto pieces = detail::current(&next_tracker, id, range, VK_IMAGE_LAYOUT_UNDEFINED);
+            detail::initialize(replay, command_buffer, *image, id, pieces, VK_IMAGE_LAYOUT_GENERAL, &next_tracker);
+        }
         bool wrote_readback = false;
         VkPipelineStageFlags2 readback_stages = 0;
         std::uint32_t open_labels = 0;  // events may span the lists of one ExecuteCommandLists
@@ -1462,6 +1534,17 @@ public:
         const bool ended = context_.vk.vkEndCommandBuffer(command_buffer) == VK_SUCCESS;
         resource_lock.unlock();  // release resource_mutex_ before vkQueueSubmit while keeping tracker_lock held
         const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0);
+        if (!submitted && !storage_images.empty()) {  // not initialized after all: try again with the next submission
+            std::lock_guard lock(context_.storage_mutex_);
+            context_.storage_pending_.insert(storage_images.begin(), storage_images.end());
+        }
+        if (submitted && !storage_images.empty()) {
+            std::lock_guard lock(context_.storage_mutex_);
+            context_.storage_init_semaphore_ = progress_;
+            context_.storage_init_value_ = submitted_;
+            ++context_.storage_init_version_;
+            storage_init_seen_ = context_.storage_init_version_;
+        }
         if (submitted) {
             context_.tracker_ = std::move(next_tracker);
             slot->predicate = std::move(batch);
@@ -1595,10 +1678,12 @@ private:
             return false;
         }
         const bool ok = (res == VK_SUCCESS);
-        waits_.clear();
-        wait_values_.clear();
-        for (auto& slot : buffers_)
-            if (slot.buffer == command_buffer) slot.ticket = ticket;
+        if (ok) {
+            waits_.clear();
+            wait_values_.clear();
+            for (auto& slot : buffers_)
+                if (slot.buffer == command_buffer) slot.ticket = ticket;
+        }
         return ok;
     }
 
@@ -1611,6 +1696,7 @@ private:
     std::uint64_t submitted_ = 0;
     std::vector<CommandSlot> buffers_;
     std::unique_ptr<OcclusionResolve> occlusion_resolve_;
+    std::uint64_t storage_init_seen_ = 0;  // the storage_init_version_ this queue has waited for
     std::vector<VkSemaphore> waits_;
     std::vector<std::uint64_t> wait_values_;
     std::uint32_t open_labels_ = 0;  // queue labels begun and not ended

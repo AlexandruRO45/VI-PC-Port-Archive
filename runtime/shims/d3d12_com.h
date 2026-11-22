@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "../src/root_signature.h"
+#include "../src/subgroup_size.h"
 
 namespace leonida {
 class VulkanPresenter;
@@ -77,6 +78,9 @@ struct VulkanDeviceInfo {
     bool separate_depth_stencil_layouts = true;
     std::uint32_t max_push_constants_size = 0;
     bool push_constants_need_fallback = false;
+    // The subgroup sizes the device offers and whether subgroupSizeControl / computeFullSubgroups are enabled on it
+    // (src/subgroup_size.h). Default: nothing, so pipelines request no size.
+    leonida::SubgroupSizeCaps subgroup;
     // Enabled: runtimeDescriptorArray, the dynamic indexing of sampled- and storage-image arrays, and update after
     // bind for sampled images, storage images and storage buffers. The device then keeps the bindless set 0 of
     // the translated shaders (docs section 3.4), and texture views and samplers are put in it as they are
@@ -260,12 +264,20 @@ struct RootArgumentLayout {
 const RootArgumentLayout* root_signature_layout(ID3D12RootSignature* signature);
 std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline);
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline);
+// What each stage of a Vulkan device's PSO asked for (src/subgroup_size.h), in creation order; null for another PSO.
+const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline);
 
 // The size of every descriptor slot (GetDescriptorHandleIncrementSize), for handle ranges.
 inline constexpr UINT descriptor_size = 32;
 
 // ExecuteCommandLists returns void; this is what the last call on the queue did.
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue);
+
+// True when the current thread or process token has SeIncreaseBasePriorityPrivilege enabled (or the test override
+// forces it), which D3D12 requires for D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME.
+bool has_global_realtime_privilege();
+// Test override for has_global_realtime_privilege(): -1 queries the token (default), 0 forces denied, 1 forces granted.
+void set_global_realtime_privilege_override_for_test(int state);
 
 // The front/back stencil references last recorded by ID3D12GraphicsCommandList8::OMSetFrontAndBackStencilRef on
 // `list`. The values are kept for the future pipeline path, which is what would apply them. False when `list` is

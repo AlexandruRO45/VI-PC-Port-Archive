@@ -297,15 +297,21 @@ def rewrite(text):
     return "\n".join(out) + "\n", public
 
 
+USAGE = "\n".join(__doc__.strip().splitlines()[-2:])
+
+
 def main(argv):
     args = argv[1:]
+    if args and args[0] in ("-h", "--help"):
+        print(USAGE)
+        return 0
     lay_path = None
     if "--layout" in args:
         i = args.index("--layout")
         lay_path = args[i + 1]
         del args[i:i + 2]
     if len(args) != 2:
-        print("usage: spirv_gs_to_compute.py in.spv out.spv [--layout out.json]", file=sys.stderr)
+        print(USAGE, file=sys.stderr)
         return 2
     dis = os.environ.get("SPIRV_DIS", "spirv-dis")
     asm = os.environ.get("SPIRV_AS", "spirv-as")
@@ -319,7 +325,7 @@ def main(argv):
     target = f"spv{ver.group(1)}.{ver.group(2)}" if ver else "vulkan1.2"
     subprocess.run([asm, "--target-env", target, "-", "-o", args[1]], input=new, check=True, text=True)
     if lay_path:
-        with open(lay_path, "w") as f:
+        with open(lay_path, "w", newline="\n") as f:
             json.dump(lay, f, indent=1)
     print(json.dumps(lay))
     return 0

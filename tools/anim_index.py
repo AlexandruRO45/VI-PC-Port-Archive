@@ -454,11 +454,11 @@ def write_output(path, rows, summary):
     """Write CSV or JSON from the file extension. CSV writes one summary line to stderr."""
     ext = os.path.splitext(path)[1].lower()
     if ext == ".json":
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"summary": summary, "files": rows}, f, indent=1)
         return
     with open(path, "w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
+        w = csv.writer(f, lineterminator="\n")
         w.writerow(COLUMNS)
         for r in rows:
             w.writerow([f"0x{r['offset']:x}" if i == 0 else ("" if r[c] is None else r[c])
@@ -570,7 +570,7 @@ def main():
             print(f"{a.source}: RBF0 stream: {e}", file=sys.stderr)
             return 2
         try:
-            with open(a.rigs, "w", encoding="utf-8") as f:
+            with open(a.rigs, "w", encoding="utf-8", newline="\n") as f:
                 json.dump({"rbf0": rbf0, "skeletons": skeletons}, f, indent=1)
         except OSError as e:
             sys.exit(f"{a.rigs}: cannot write: {e.strerror or e}")
