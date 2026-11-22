@@ -285,6 +285,49 @@ class SIMDInterpreter:
         return results
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class VMsadU32StatusFlags:
+    """Architectural condition codes, status flags, and carry generation for v_msad_u32."""
+    zero: bool
+    sign: bool
+    carry_out: bool
+    masked: bool
+    diff: int
+
+
+def evaluate_v_msad_u32_flags(src0: int, src1: int, src2: int, result: int) -> VMsadU32StatusFlags:
+    """Evaluate architectural condition codes, masking status, and 32-bit carry generation."""
+    u0 = src0 & MASK32
+    u1 = src1 & MASK32
+    acc = src2 & MASK32
+
+    masked = (u1 == 0)
+    if masked:
+        diff = 0
+    else:
+        diff = (u0 - u1) if u0 >= u1 else (u1 - u0)
+
+    full_sum = acc + diff
+    carry_out = full_sum > MASK32
+    res32 = result & MASK32
+
+    zero = (res32 == 0)
+    sign = bool(res32 & 0x8000_0000)
+
+    return VMsadU32StatusFlags(
+        zero=zero,
+        sign=sign,
+        carry_out=carry_out,
+        masked=masked,
+        diff=diff,
+    )
+
+
+
 
 # ==============================================================================
 # Unit Tests: Model and Reference Oracle
@@ -798,6 +841,69 @@ class TestValuMsadU32RegisterAliasing(unittest.TestCase):
             res = interp.step(instr, state)
             self.assertEqual(res, 100 * i)
             self.assertEqual(state.get_vgpr(0), 100 * i)
+
+
+class TestValuMsadU32ConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry generation."""
+
+    def test_zero_flag_when_result_is_zero(self) -> None:
+        # Case 1: 0 + 0 = 0
+        res = oracle_v_msad_u32(0, 0, 0)
+        flags = evaluate_v_msad_u32_flags(0, 0, 0, res)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.sign)
+        self.assertFalse(flags.carry_out)
+        self.assertTrue(flags.masked)
+        self.assertEqual(flags.diff, 0)
+
+        # Case 2: exact 32-bit overflow wrapping to 0:
+        # acc = 1, diff = 0xFFFFFFFF -> full sum = 0x1_0000_0000 -> res = 0
+        res_wrap = oracle_v_msad_u32(0, 0xFFFFFFFF, 1)
+        self.assertEqual(res_wrap, 0)
+        flags_wrap = evaluate_v_msad_u32_flags(0, 0xFFFFFFFF, 1, res_wrap)
+        self.assertTrue(flags_wrap.zero)
+        self.assertFalse(flags_wrap.sign)
+        self.assertTrue(flags_wrap.carry_out)  # Overflowed!
+        self.assertEqual(flags_wrap.diff, 0xFFFFFFFF)
+
+    def test_sign_flag_high_bit_set(self) -> None:
+        acc_neg = 0x8000_0000
+        res = oracle_v_msad_u32(0, 0, acc_neg)
+        flags = evaluate_v_msad_u32_flags(0, 0, acc_neg, res)
+        self.assertTrue(flags.sign)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.carry_out)
+
+        # acc just below bit 31 (0x7FFF_FFFF) + diff 1 -> 0x8000_0000
+        res_trans = oracle_v_msad_u32(1, 2, 0x7FFF_FFFF)
+        self.assertEqual(res_trans, 0x8000_0000)
+        flags_trans = evaluate_v_msad_u32_flags(1, 2, 0x7FFF_FFFF, res_trans)
+        self.assertTrue(flags_trans.sign)
+
+    def test_carry_out_32bit_overflow(self) -> None:
+        # 0xFFFFFFFF + diff 1 -> carry_out True
+        res = oracle_v_msad_u32(1, 2, 0xFFFFFFFF)
+        self.assertEqual(res, 0)
+        flags = evaluate_v_msad_u32_flags(1, 2, 0xFFFFFFFF, res)
+        self.assertTrue(flags.carry_out)
+        self.assertTrue(flags.zero)
+
+    def test_carry_out_no_overflow(self) -> None:
+        # 0x00001000 + diff 100 -> no overflow
+        res = oracle_v_msad_u32(0, 0, 0x1000)
+        flags = evaluate_v_msad_u32_flags(0, 0, 0x1000, res)
+        self.assertFalse(flags.carry_out)
+
+    def test_masking_detection(self) -> None:
+        # Unmasked: src1 != 0
+        flags_unmasked = evaluate_v_msad_u32_flags(100, 200, 0, 100)
+        self.assertFalse(flags_unmasked.masked)
+        self.assertEqual(flags_unmasked.diff, 100)
+
+        # Masked: src1 == 0
+        flags_masked = evaluate_v_msad_u32_flags(100, 0, 0, 0)
+        self.assertTrue(flags_masked.masked)
+        self.assertEqual(flags_masked.diff, 0)
 
 
 if __name__ == "__main__":
