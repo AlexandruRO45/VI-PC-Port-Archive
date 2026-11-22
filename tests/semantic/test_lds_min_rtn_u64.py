@@ -1036,5 +1036,132 @@ class TestLdsMinRtnU64SIMD(unittest.TestCase):
         self.assertEqual(state.lds.read_qword(target_addr), 30)
 
 
+# ---------------------------------------------------------------------------
+# Phase 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class StatusFlags64:
+    """Architectural status flags and condition codes for 64-bit atomic minimum."""
+    zero: bool
+    sign: bool
+    modified: bool
+    borrow: bool
+    bank_conflict: bool
+
+
+def compute_status_flags64(
+    old_val: int,
+    new_val: int,
+    input_val: int,
+    has_conflict: bool = False,
+) -> StatusFlags64:
+    """Compute condition codes and status flags for ds_min_rtn_u64 operation.
+
+    - Zero Flag (Z): True if resulting 64-bit qword is 0.
+    - Sign Flag (N): True if MSB (bit 63) of resulting 64-bit qword is 1.
+    - Modified Flag (M): True if input_val caused memory to update (input_val < old_val).
+    - Borrow Flag (B): True if unsigned comparison old_val > input_val (borrow on subtraction).
+    - Bank Conflict: True if 2 or more active wavefront lanes collide on the same LDS bank.
+    """
+    res = new_val & MASK64
+    u_old = old_val & MASK64
+    u_in = input_val & MASK64
+    return StatusFlags64(
+        zero=(res == 0),
+        sign=bool(res & SIGN_BIT64),
+        modified=(res != u_old),
+        borrow=(u_old > u_in),
+        bank_conflict=has_conflict,
+    )
+
+
+def detect_simd_bank_conflicts64(
+    instr: DSMinRtnU64Instruction,
+    state: SIMDState64,
+) -> Set[int]:
+    """Detect LDS bank conflicts across active lanes in a wavefront for 64-bit access.
+
+    Each 64-bit access occupies two consecutive 32-bit dwords (2 adjacent banks).
+    """
+    accessed_banks: Dict[int, List[int]] = {}
+    for lane in range(state.num_lanes):
+        if not state.is_lane_active(lane):
+            continue
+        vaddr = state.get_vgpr(lane, instr.addr.index)
+        eff_addr = calc_lds_effective_address(vaddr, instr.offset)
+        bank_lo = calc_lds_bank(eff_addr)
+        bank_hi = calc_lds_bank(eff_addr + 4)
+        accessed_banks.setdefault(bank_lo, []).append(lane)
+        accessed_banks.setdefault(bank_hi, []).append(lane)
+
+    conflicts: Set[int] = set()
+    for bank, lanes in accessed_banks.items():
+        if len(lanes) > 1:
+            conflicts.add(bank)
+    return conflicts
+
+
+class TestLdsMinRtnU64StatusFlags(unittest.TestCase):
+    """Phase 6: Unit tests for condition codes, status flags, and borrow generation."""
+
+    def test_status_flags_zero_result(self) -> None:
+        flags = compute_status_flags64(old_val=0, new_val=0, input_val=0)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.sign)
+        self.assertFalse(flags.modified)
+        self.assertFalse(flags.borrow)
+
+    def test_status_flags_nonzero_clears_zero_flag(self) -> None:
+        flags = compute_status_flags64(old_val=10, new_val=5, input_val=5)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.sign)
+        self.assertTrue(flags.modified)
+        self.assertTrue(flags.borrow)
+
+    def test_status_flags_sign_flag_msb_set(self) -> None:
+        # 0x8000000000000000 has MSB (bit 63) set
+        flags = compute_status_flags64(old_val=0xFFFFFFFFFFFFFFFF, new_val=0x8000000000000000, input_val=0x8000000000000000)
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.sign)
+        self.assertTrue(flags.modified)
+        self.assertTrue(flags.borrow)
+
+        # 0x7FFFFFFFFFFFFFFF has bit 63 clear
+        flags2 = compute_status_flags64(old_val=0xFFFFFFFFFFFFFFFF, new_val=0x7FFFFFFFFFFFFFFF, input_val=0x7FFFFFFFFFFFFFFF)
+        self.assertFalse(flags2.sign)
+
+    def test_status_flags_borrow_and_modified(self) -> None:
+        # Memory had 100, input is 200 -> input >= old_val
+        # Result = 100, unmodified, no borrow
+        flags_no_mod = compute_status_flags64(old_val=100, new_val=100, input_val=200)
+        self.assertFalse(flags_no_mod.modified)
+        self.assertFalse(flags_no_mod.borrow)
+
+        # Memory had 200, input is 100 -> input < old_val
+        # Result = 100, modified, borrow generated
+        flags_mod = compute_status_flags64(old_val=200, new_val=100, input_val=100)
+        self.assertTrue(flags_mod.modified)
+        self.assertTrue(flags_mod.borrow)
+
+    def test_simd_bank_conflict_detection_64bit(self) -> None:
+        # Bank conflict when active lanes touch the same 32-bit LDS bank
+        state = SIMDState64(num_lanes=32, exec_mask=0x3)  # Lanes 0 and 1 active
+        # Lane 0 targets byte address 0x00 -> dword 0 (bank 0) and dword 1 (bank 1)
+        # Lane 1 targets byte address 0x80 -> dword 32 (bank 0) and dword 33 (bank 1)
+        state.set_vgpr(0, 2, 0x00)
+        state.set_vgpr(1, 2, 0x80)
+
+        inst = DSMinRtnU64Instruction(Opcode.DS_MIN_RTN_U64, VGPR64(0), VGPR(2), Immediate64(10))
+        conflicts = detect_simd_bank_conflicts64(inst, state)
+        self.assertIn(0, conflicts)
+        self.assertIn(1, conflicts)
+
+        # Non-conflicting: Lane 0 targets 0x00 (banks 0, 1), Lane 1 targets 0x08 (banks 2, 3)
+        state.set_vgpr(1, 2, 0x08)
+        conflicts_none = detect_simd_bank_conflicts64(inst, state)
+        self.assertEqual(len(conflicts_none), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
