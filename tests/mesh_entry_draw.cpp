@@ -32,7 +32,7 @@ struct MeshPipeline {
 };
 }
 
-bool check_mesh_entry_draw(ID3D12Device* device, const char* first, const char* second, const char* fixture)
+bool check_mesh_entry_draw(ID3D12Device* device, const char* first, const char* second, const char* fixture, bool vertices)
 {
     D3D12_FEATURE_DATA_D3D12_OPTIONS7 options{};
     check(check_feature(device, D3D12_FEATURE_D3D12_OPTIONS7, &options, sizeof(options)), "Query mesh tier");
@@ -44,18 +44,20 @@ bool check_mesh_entry_draw(ID3D12Device* device, const char* first, const char* 
     constexpr UINT cb_bytes = 512;
     constexpr UINT trace_bytes = 80;
     const auto input = read_bytes(fixture);
-    if (input.size() != 2 * cb_bytes + trace_bytes + side * side * 4)
+    const UINT input_bytes = 2 * cb_bytes + (vertices ? 512 : 0);
+    if (input.size() != input_bytes + trace_bytes + side * side * 4)
         throw std::runtime_error("Invalid draw fixture size");
     auto shader = read_bytes(first);
     auto pixel = read_bytes(second);
-    D3D12_ROOT_PARAMETER params[3]{};
+    D3D12_ROOT_PARAMETER params[4]{};
     for (UINT i = 0; i < 2; ++i) {
         params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         params[i].Descriptor.ShaderRegister = i;
     }
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
     D3D12_ROOT_SIGNATURE_DESC layout{};
-    layout.NumParameters = 3;
+    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    layout.NumParameters = vertices ? 4 : 3;
     layout.pParameters = params;
     ComPtr<ID3DBlob> blob;
     check(D3D12SerializeRootSignature(&layout, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr), "Serialize draw root");
@@ -98,12 +100,12 @@ bool check_mesh_entry_draw(ID3D12Device* device, const char* first, const char* 
     UINT64 size = 0;
     device->GetCopyableFootprints(&texture, 0, 1, 0, &footprint, nullptr, nullptr, &size);
     auto readback = make_buffer(device, size + trace_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-    auto upload = make_buffer(device, 2 * cb_bytes + trace_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    auto upload = make_buffer(device, input_bytes + trace_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     void* mapped = nullptr;
     D3D12_RANGE empty{};
     check(upload->Map(0, &empty, &mapped), "Map draw input");
-    std::memcpy(mapped, input.data(), 2 * cb_bytes);
-    std::memset(static_cast<char*>(mapped) + 2 * cb_bytes, 0xcd, trace_bytes);
+    std::memcpy(mapped, input.data(), input_bytes);
+    std::memset(static_cast<char*>(mapped) + input_bytes, 0xcd, trace_bytes);
     upload->Unmap(0, nullptr);
     ComputeCommands commands(device, pipeline.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
     auto* list = commands.list.Get();
@@ -111,13 +113,14 @@ bool check_mesh_entry_draw(ID3D12Device* device, const char* first, const char* 
     const auto base = upload->GetGPUVirtualAddress();
     list->SetGraphicsRootConstantBufferView(0, base);
     list->SetGraphicsRootConstantBufferView(1, base + cb_bytes);
+    if (vertices) list->SetGraphicsRootShaderResourceView(3, base + 2 * cb_bytes);
     const D3D12_VIEWPORT viewport{0, 0, side, side, 0, 1};
     const D3D12_RECT scissor{0, 0, side, side};
     list->RSSetViewports(1, &viewport);
     list->RSSetScissorRects(1, &scissor);
     auto trace = make_buffer(device, trace_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
                              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    list->CopyBufferRegion(trace.Get(), 0, upload.Get(), 2 * cb_bytes, trace_bytes);
+    list->CopyBufferRegion(trace.Get(), 0, upload.Get(), input_bytes, trace_bytes);
     transition(list, trace.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     list->SetGraphicsRootUnorderedAccessView(2, trace->GetGPUVirtualAddress());
     list->OMSetRenderTargets(1, &handle, FALSE, nullptr);
@@ -138,7 +141,7 @@ bool check_mesh_entry_draw(ID3D12Device* device, const char* first, const char* 
     commands.submit_and_wait(device);
     check(readback->Map(0, nullptr, &mapped), "Map draw result");
     const char* rows = static_cast<const char*>(mapped);
-    const char* reference = input.data() + 2 * cb_bytes;
+    const char* reference = input.data() + input_bytes;
     const bool trace_ok = std::memcmp(rows + size, reference, trace_bytes) == 0;
     reference += trace_bytes;
     unsigned mismatches = 0;

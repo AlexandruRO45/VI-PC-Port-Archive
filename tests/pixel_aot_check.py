@@ -603,6 +603,50 @@ def check_reciprocal_draw(directory, compiler, renderer, backend):
             subprocess.run(draw, check=True)
 
 
+def bitwise_program():
+    # Emit exact finite binary32 colors by placing result bits directly in their mantissas.
+    return with_constants([
+        "v_mov_b32_e32 v18, s46",
+        "v_mov_b32_e32 v19, s47",
+        "v_lshlrev_b32_e32 v20, s44, v18",
+        "v_lshrrev_b32_e32 v20, s45, v20",
+        "v_ashrrev_i32_e32 v21, 20, v19",
+        "v_not_b32_e32 v22, v18",
+        "v_bfi_b32 v23, 0x00700000, v18, v19",
+        "v_xor_b32_e32 v22, v19, v22",
+        *[instruction for index in range(4) for instruction in (
+            f"v_and_b32_e32 v{12+index}, 0x007f0000, v{20+index}",
+            f"v_or_b32_e32 v{12+index}, 0x3f800000, v{12+index}",
+        )],
+    ])
+
+
+def check_bitwise_draw(directory, compiler, renderer, backend):
+    shader = directory / "bits.cso"
+    source = directory / "bits.hlsl"
+    case = directory / "bits.case"
+    for logical in (False, True):
+        program = bitwise_program()
+        if logical:
+            program = [line.replace("v_ashrrev_i32", "v_lshrrev_b32") for line in program]
+        source.write_text(translate(program), encoding="ascii")
+        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        for left, right, a, b in ((36, 33, 0x40d10000, 0xc0250000), (35, 37, 0x3e270000, 0xbf620000)):
+            words = (((a << (left % 32)) & 0xffffffff) >> (right % 32),
+                     (b - 2**32) >> 20, ~a ^ b, (a & 0x00700000) | (b & ~0x00700000))
+            colors = struct.pack("<4I", *[0x3f800000 | (value & 0x007f0000) for value in words])
+            constants = bytearray(256)
+            struct.pack_into("<4I", constants, 12, left, right, a, b)
+            case.write_bytes(constants + colors * 64)
+            draw = [renderer, backend, "--check-pixel-case", shader, case]
+            if logical:
+                wrong = subprocess.run(draw, capture_output=True, text=True)
+                if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+                    raise AssertionError("Logical shift substituted for arithmetic shift escaped detection")
+            else:
+                subprocess.run(draw, check=True)
+
+
 def check_fract_draw(directory, compiler, renderer, backend):
     source = directory / "fract.hlsl"
     shader = directory / "fract.cso"
@@ -1721,6 +1765,12 @@ def check_three_way_templates():
 
 
 def check_controls(directory):
+    program = bitwise_program()
+    for before, after in (("s44, v18", "s44, |v18|"), ("20, v19", "20, v19 clamp"),
+                          ("0x00700000, v18, v19", "0x00700000, v18")):
+        altered = [line.replace(before, after) for line in program]
+        assert altered != program
+        must_reject(translate, altered)
     program = buffer_color(True)
     assert "float2 main(" in translate_buffer_color(program)
     assert "SamplerState" not in translate_buffer_color(program)
@@ -2179,6 +2229,7 @@ def check_binary(directory, assembler, objcopy, library):
                 (scalar64(), translate)]
     fixtures.append((with_constants(CLASS_BODY), translate))
     fixtures.append((with_constants(RECIPROCAL_BODY), translate))
+    fixtures.append((bitwise_program(), translate))
     fixtures.append((fract_values(), translate))
     fixtures.extend([(frexp_mant_values(), translate), (ldexp_values(), translate)])
     fixtures.append((three_way(), translate))
@@ -2477,6 +2528,7 @@ def check_render(directory, compiler, renderer, backend):
             if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
                 raise AssertionError("The renderer failed to detect the changed channel order")
     check_vop3p_draw(directory, compiler, renderer, backend)
+    check_bitwise_draw(directory, compiler, renderer, backend)
     check_movk_draw(directory, compiler, renderer, backend)
     check_half_draw(directory, compiler, renderer, backend)
     for exp_shader_inst in ("s_waitcnt_expcnt null, 0x3", "s_waitcnt expcnt(0)"):
