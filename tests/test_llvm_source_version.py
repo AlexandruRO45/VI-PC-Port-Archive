@@ -3,8 +3,12 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from make_game import windows_powershell  # noqa: E402
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "build_llvm_mc.ps1"
@@ -47,7 +51,7 @@ class SourceVersionTest(unittest.TestCase):
         before = {str(p.relative_to(self.work)): p.read_bytes()
                   for p in self.work.rglob("*") if p.is_file()}
         result = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+            [windows_powershell(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
              "-File", str(self.driver), "-Temp", str(self.work), "-Version", version],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20)
         self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)

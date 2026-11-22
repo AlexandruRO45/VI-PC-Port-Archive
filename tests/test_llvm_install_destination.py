@@ -1,8 +1,12 @@
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from make_game import windows_powershell  # noqa: E402
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "build_llvm_mc.ps1"
@@ -21,7 +25,7 @@ class InstallDestinationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as cwd:
             for dest, keep, rejected in cases:
                 with self.subTest(dest=dest, keep=keep):
-                    cmd = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                    cmd = [windows_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass",
                            "-File", str(SCRIPT), "-Temp", "work", "-Dest", dest, "-NoEnv"]
                     if keep:
                         cmd.append("-Keep")

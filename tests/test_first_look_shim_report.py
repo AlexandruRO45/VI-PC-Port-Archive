@@ -8,6 +8,9 @@ import sys
 import tempfile
 import unittest
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from make_game import windows_powershell  # noqa: E402
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_pe_inspect import build_image
 
@@ -39,7 +42,7 @@ Set-Alias -Name (Join-Path $PWD 'runtime\build\gta6rt.exe') -Value Write-Output
 
             def run_first_look():
                 run = subprocess.run(
-                    ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                    [windows_powershell(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                      "-Command", script], cwd=root, env=env, capture_output=True, timeout=30,
                 )
                 self.assertEqual(run.returncode, 0, run.stderr)

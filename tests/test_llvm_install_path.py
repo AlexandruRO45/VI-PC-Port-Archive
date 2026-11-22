@@ -3,8 +3,12 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from make_game import windows_powershell  # noqa: E402
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "build_llvm_mc.ps1"
@@ -35,7 +39,7 @@ class InstallPathTest(unittest.TestCase):
                 '$ErrorActionPreference = "Stop"\n$Keep = $true\n$script:saved = $null\n'
                 + tail + '\nWrite-Output ("RESULT:" + (@{final=$final; saved=$script:saved} | ConvertTo-Json -Compress))\n',
                 encoding="utf-8", newline="\n")
-            command = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+            command = [windows_powershell(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                        "-File", str(driver), "-Dest", dest_arg, "-exe", str(source)]
             if no_env:
                 command.append("-NoEnv")
@@ -54,7 +58,7 @@ class InstallPathTest(unittest.TestCase):
                 self.assertEqual(data["saved"], data["final"])
                 # Resolve the saved path from a different process working directory.
                 check = subprocess.run(
-                    ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                    [windows_powershell(), "-NoProfile", "-NonInteractive", "-Command",
                      "if (-not (Test-Path -LiteralPath $env:LLVM_MC)) { exit 1 }"],
                     cwd=other, env={**os.environ, "LLVM_MC": data["saved"]},
                     capture_output=True, timeout=20)

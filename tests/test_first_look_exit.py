@@ -7,9 +7,12 @@ import sys
 import tempfile
 import unittest
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from make_game import windows_powershell  # noqa: E402
+
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "first_look.ps1"
-POWERSHELL = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass"]
+POWERSHELL = [windows_powershell(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass"]
 
 
 @unittest.skipUnless(os.name == "nt", "Windows PowerShell diagnostics script")

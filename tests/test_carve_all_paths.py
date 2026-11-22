@@ -3,8 +3,12 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from make_game import windows_powershell  # noqa: E402
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "carve_all.ps1"
@@ -26,7 +30,7 @@ class CarveAllGamePathTest(unittest.TestCase):
             coverage = out / "coverage.json"
             coverage.write_bytes(b"[]\n")
             result = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
+                [windows_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
                  "-Game", str(game), "-Out", str(out)],
                 env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ["PATH"]},
                 capture_output=True, text=True, timeout=30,
@@ -54,7 +58,7 @@ class CarveAllGamePathTest(unittest.TestCase):
             for arg in args:
                 with self.subTest(game=arg):
                     result = subprocess.run(
-                        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
+                        [windows_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
                          "-Game", arg, "-Out", str(out)], cwd=tmp, capture_output=True, text=True)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertNotIn("carving", result.stdout)
@@ -86,7 +90,7 @@ class CarveAllGamePathTest(unittest.TestCase):
             if short_game == str(game) + "\\":
                 self.skipTest("8.3 short names are unavailable on this volume")
             result = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
+                [windows_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
                  "-Game", short_game, "-Out", str(out)], cwd=tmp, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertNotIn("carving", result.stdout)
@@ -106,7 +110,7 @@ class CarveAllGamePathTest(unittest.TestCase):
             coverage.write_bytes(b"[]\n")
 
             result = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
+                [windows_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
                  "-Game", str(game), "-Out", str(out)], capture_output=True, text=True, timeout=30,
             )
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)

@@ -2,8 +2,12 @@
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from make_game import windows_powershell  # noqa: E402
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "build_llvm_mc.ps1"
@@ -40,7 +44,7 @@ class BuildBatchTest(unittest.TestCase):
             for code in (0, 17):
                 with self.subTest(exit_code=code):
                     subprocess.run(
-                        ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                        [windows_powershell(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                          "-File", str(driver), "-Temp", str(work), "-Code", str(code)],
                         check=True, timeout=30,
                     )

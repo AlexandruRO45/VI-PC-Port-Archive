@@ -3,8 +3,12 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from make_game import windows_powershell  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "carve_all.ps1"
 INDEX = {"summary": {"files": 1, "bink2_files": 0, "span": 10, "compressed_bytes": 5, "unread_bytes": 5,
@@ -21,7 +25,7 @@ class CarveAllBracketPathTest(unittest.TestCase):
             (out / "common").mkdir(parents=True)
             (out / "common" / "index.json").write_text(json.dumps(INDEX), encoding="utf-8")
             result = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
+                [windows_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
                  "-Game", str(game), "-Out", str(out)], cwd=tmp, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             text = (out / "coverage.json").read_text(encoding="utf-8-sig").strip()
