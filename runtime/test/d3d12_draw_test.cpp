@@ -6,9 +6,11 @@
 //     constants (a clip-space offset) and a root CBV (a tint) through the 32 user-data dwords;
 //   - a render target cleared blue, two indexed draws with different root arguments (top-left red, bottom-right
 //     green), and one back-facing triangle (bottom-left) that culling must remove;
-//   - D3D-54 (open question 17): a fourth draw (top-right yellow) whose vertex buffer is read straight from an
-//     upload heap, and every draw reads a filter through a descriptor table whose entry is an upload-heap VA, so
-//     both reach memory outside the arena through the -heap_base bias;
+//   - D3D-54 (open question 17): a fourth draw (top-right) whose vertex buffer is read straight from an upload
+//     heap, and every draw reads a filter through a descriptor table whose entry is an upload-heap VA, so both
+//     reach memory outside the arena through the -heap_base bias. The upload vertices and the second filter differ
+//     from the arena vertices and the first filter in every channel the draw shows, so a stale vertex buffer or a
+//     stale table changes the quadrant's colour (thanks to @Vonsek's review of #648);
 //   - the image read back through CopyTextureRegion and compared pixel by pixel. Where the quadrants land also
 //     checks the viewport flip (D3D clip space is y-up) and the front-face winding.
 // The shaders are GLSL written to the translator's contract (test/glsl/vs_draw.vert, ps_draw.frag). No game data.
@@ -134,7 +136,7 @@ int main() {
             {-1, 0, 255, 0, 0, 255}, {-1, -1, 255, 0, 0, 255}, {0, -1, 255, 0, 0, 255}};
         const std::uint16_t indices[6] = {0, 1, 2, 2, 1, 3};
         const float tints[3][3] = {{1, 0, 1}, {0, 1, 0}, {1, 1, 1}};  // red stays red; then green; then as-is
-        const float filters[2][3] = {{1, 1, 1}, {1, 1, 0}};               // pass-through; red + green = yellow
+        const float filters[2][3] = {{1, 1, 1}, {1, 0, 1}};               // pass-through; drops green
 
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
@@ -175,11 +177,18 @@ int main() {
         std::memcpy(up + 1792, tints[2], sizeof(tints[2]));
         std::memcpy(up + 1024, filters[0], sizeof(filters[0]));
         std::memcpy(up + 1280, filters[1], sizeof(filters[1]));
-        std::memcpy(up + 1536, vertices, sizeof(vertices));
+        // Draw 4's vertices: the same positions, coloured (64, 0, 255) instead of red.
+        Vertex upload_vertices[7];
+        std::memcpy(upload_vertices, vertices, sizeof(vertices));
+        for (Vertex& v : upload_vertices) {
+            v.r = 64;
+            v.b = 255;
+        }
+        std::memcpy(up + 1536, upload_vertices, sizeof(upload_vertices));
         const D3D12_GPU_VIRTUAL_ADDRESS upload_va = upload->GetGPUVirtualAddress();
 
         // A shader-visible heap in the arena. Its two slots hold upload-heap VAs, written as raw bytes the way the
-        // application writes descriptors itself: slot 0 the pass-through filter, slot 1 the yellow one.
+        // application writes descriptors itself: slot 0 the pass-through filter, slot 1 the one that drops green.
         const D3D12_DESCRIPTOR_HEAP_DESC table_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
                                                          D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         Ref<ID3D12DescriptorHeap> table_heap;
@@ -248,8 +257,9 @@ int main() {
         list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
         list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
         list->DrawInstanced(3, 1, 4, 0);
-        // Draw 4 (D3D-54): the quad again, offset (1, 0), its vertices read from the upload heap and the yellow
-        // filter through the table's second slot -> top-right quadrant yellow.
+        // Draw 4 (D3D-54): the quad again, offset (1, 0), its vertices read from the upload heap and the filter
+        // through the table's second slot -> top-right (64, 0, 255). The arena vertices would give red in that
+        // quadrant, and the first filter would keep green, so either stale binding changes the colour.
         const float right[2] = {1, 0};
         const D3D12_VERTEX_BUFFER_VIEW upload_vbv{upload_va + 1536, sizeof(vertices), sizeof(Vertex)};
         list->IASetVertexBuffers(0, 1, &upload_vbv);
@@ -303,7 +313,7 @@ int main() {
         for (UINT col = 0; col < size; ++col) {
             const bool top = row < size / 2, left = col < size / 2;
             const std::array<std::uint8_t, 4> want = top && left     ? std::array<std::uint8_t, 4>{255, 0, 0, 255}
-                                                     : top           ? std::array<std::uint8_t, 4>{255, 255, 0, 255}
+                                                     : top           ? std::array<std::uint8_t, 4>{64, 0, 255, 255}
                                                      : !left         ? std::array<std::uint8_t, 4>{0, 255, 0, 255}
                                                                      : std::array<std::uint8_t, 4>{0, 0, 255, 255};
             const std::uint8_t* got = pixels.data() + row * 256 + col * 4;
