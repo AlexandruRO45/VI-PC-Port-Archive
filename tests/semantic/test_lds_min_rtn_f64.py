@@ -1315,5 +1315,65 @@ class TestConditionCodesAndStatusFlags64(unittest.TestCase):
         self.assertTrue(st_wrapped.address_wrapped)
 
 
+# ==============================================================================
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestIEEE754BoundaryExtremes64(unittest.TestCase):
+    """Phase 7: Unit tests for double-precision IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_signed_zeros_comprehensive(self) -> None:
+        self.assertEqual(oracle_min_f64(POS_ZERO64, NEG_ZERO64), NEG_ZERO64)
+        self.assertEqual(oracle_min_f64(NEG_ZERO64, POS_ZERO64), NEG_ZERO64)
+        self.assertEqual(oracle_min_f64(POS_ZERO64, POS_ZERO64), POS_ZERO64)
+        self.assertEqual(oracle_min_f64(NEG_ZERO64, NEG_ZERO64), NEG_ZERO64)
+
+    def test_infinities_comprehensive(self) -> None:
+        self.assertEqual(oracle_min_f64(POS_INF64, POS_INF64), POS_INF64)
+        self.assertEqual(oracle_min_f64(NEG_INF64, NEG_INF64), NEG_INF64)
+        self.assertEqual(oracle_min_f64(POS_INF64, NEG_INF64), NEG_INF64)
+        self.assertEqual(oracle_min_f64(NEG_INF64, POS_INF64), NEG_INF64)
+        self.assertEqual(oracle_min_f64(POS_INF64, DBL_MAX), DBL_MAX)
+        self.assertEqual(oracle_min_f64(NEG_INF64, NEG_DBL_MAX), NEG_INF64)
+
+    def test_subnormals_preservation_and_comparison(self) -> None:
+        self.assertEqual(oracle_min_f64(SUBNORM_MIN64, DBL_MIN), SUBNORM_MIN64)
+        self.assertNotEqual(oracle_min_f64(SUBNORM_MIN64, DBL_MIN), POS_ZERO64)
+
+        self.assertEqual(oracle_min_f64(SUBNORM_MAX64, DBL_MIN), SUBNORM_MAX64)
+        self.assertEqual(oracle_min_f64(SUBNORM_MIN64, POS_ZERO64), POS_ZERO64)
+        self.assertEqual(oracle_min_f64(SUBNORM_MIN64, NEG_ZERO64), NEG_ZERO64)
+
+        self.assertEqual(oracle_min_f64(NEG_SUBNORM_MIN64, POS_ZERO64), NEG_SUBNORM_MIN64)
+        self.assertEqual(oracle_min_f64(NEG_SUBNORM_MAX64, NEG_SUBNORM_MIN64), NEG_SUBNORM_MAX64)
+
+    def test_nan_suppression_comprehensive(self) -> None:
+        for normal_val in (ONE_F64, NEG_ONE_F64, POS_INF64, NEG_INF64, POS_ZERO64, NEG_ZERO64, SUBNORM_MIN64):
+            with self.subTest(val=hex(normal_val)):
+                self.assertEqual(oracle_min_f64(QNAN_PAYLOAD_A64, normal_val), normal_val)
+                self.assertEqual(oracle_min_f64(normal_val, QNAN_PAYLOAD_A64), normal_val)
+
+        for normal_val in (TWO_F64, NEG_TWO_F64, DBL_MAX, NEG_DBL_MAX):
+            with self.subTest(val=hex(normal_val)):
+                self.assertEqual(oracle_min_f64(SNAN_PAYLOAD_A64, normal_val), normal_val)
+                self.assertEqual(oracle_min_f64(normal_val, SNAN_PAYLOAD_A64), normal_val)
+
+    def test_dual_nans(self) -> None:
+        q_q = oracle_min_f64(QNAN_PAYLOAD_A64, QNAN_PAYLOAD_B64)
+        self.assertTrue(is_qnan64(q_q))
+
+        s_s = oracle_min_f64(SNAN_PAYLOAD_A64, SNAN_PAYLOAD_B64)
+        self.assertTrue(is_qnan64(s_s))
+
+        q_s = oracle_min_f64(QNAN_PAYLOAD_A64, SNAN_PAYLOAD_A64)
+        self.assertTrue(is_qnan64(q_s))
+
+    def test_floating_point_normal_extremes(self) -> None:
+        self.assertEqual(oracle_min_f64(DBL_MAX, NEG_DBL_MAX), NEG_DBL_MAX)
+        self.assertEqual(oracle_min_f64(NEG_DBL_MAX, DBL_MAX), NEG_DBL_MAX)
+        self.assertEqual(oracle_min_f64(DBL_MIN, NEG_DBL_MIN), NEG_DBL_MIN)
+        self.assertEqual(oracle_min_f64(NEG_DBL_MIN, DBL_MIN), NEG_DBL_MIN)
+
+
 if __name__ == "__main__":
     unittest.main()
