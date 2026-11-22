@@ -2056,6 +2056,10 @@ class Gen:
                     is_signed = signed
         dst1 = self.tmp()
         self.emit(f"{dst1} = OpSelect %uint {is_int_fmt} {self.cu(1)} {self.cu(0x3F800000)}")
+        # Out of range (and, for MTBUF, an unbound V#) the load was skipped and every raw word is 0, which each format
+        # decodes to 0; DST_SEL still applies, so a constant-1 channel reads 1 and the data channels 0 (SHADER-429,
+        # measured on gfx1036 in wave32 and wave64). MTBUF's identity selectors have no constant 1, so its results
+        # stay 0 there.
         outs = []
         for c in range(ncomp):
             sel = self.tmp()
@@ -2066,8 +2070,7 @@ class Gen:
                 self.emit(f"{e} = OpIEqual %bool {sel} {self.cu(code_v)}")
                 self.emit(f"{s} = OpSelect %uint {e} {src} {r}")
                 r = s
-            rb = self.tmp()
-            self.emit(f"{rb} = OpSelect %uint {in_b} {r} {self.cu(0)}")
+            rb = r
             if d16:
                 outs.append(rb)
             else:

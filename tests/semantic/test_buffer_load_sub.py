@@ -5,7 +5,8 @@ Covers the remaining translator rules needed by XboxBvhBuilder.dll (#1813 follow
     (all byte offsets 0..7 including dword-crossing 16-bit loads at addr % 4 == 3, zero/sign extension,
     OOB_SELECT modes 0/1/2/3 at exact element-end boundaries, inactive lanes preserving vdst, and rejected forms)
   - tbuffer_load_format_* and buffer_load_format_* with GFX10_FORMAT_8_UINT (code 5: 1-byte unsigned integer,
-    byte offsets 0..3, OOB check, invalid V# format 0 suppression, and DST_SEL integer 1).
+    byte offsets 0..3, OOB check, invalid V# format 0 suppression, and DST_SEL integer 1)
+  - DST_SEL constant 1 on out-of-range typed loads: integer 1, 1.0f and d16 f16 1.0 (SHADER-429).
 
 Standard library only; no GPU, no LLVM, no game files.
 """
@@ -210,6 +211,55 @@ class Format8UintTests(unittest.TestCase):
         ]
         mem = run_cs(body)
         self.assertEqual([mem.get(OUT + 4 * i) for i in range(4)], [BYTES[2], 0, 1, 1])
+
+    # SHADER-429: out of range, the raw channels read 0 but DST_SEL still applies, so a channel selected as constant 1
+    # reads 1 (integer formats), 1.0f (float and norm formats) or f16 1.0 (d16), as measured on gfx1036.
+    def oob_format_load(self, vfmt, dst_sel, load, store):
+        w3 = (3 << 28) | (vfmt << 12) | dst_sel   # RAW bounds, 4 records: the element at byte 4 is out of range
+        body = [
+            f"s_mov_b32 s4, {BASE:#x}", "s_mov_b32 s5, 0", "s_mov_b32 s6, 4", f"s_mov_b32 s7, {w3:#x}",
+            "v_mov_b32_e32 v1, 4",
+            "v_mov_b32_e32 v8, 0", "v_mov_b32_e32 v9, 0", "v_mov_b32_e32 v10, 0", "v_mov_b32_e32 v11, 0",
+            load,
+            "s_waitcnt vmcnt(0)",
+            f"v_mov_b32_e32 v6, {OUT:#x}",
+            store,
+        ]
+        return run_cs(body)
+
+    def test_mubuf_oob_dst_sel_integer_one(self):
+        # 8_UINT, DST_SEL = (X, 0, 1, 1): X reads 0, the two constant channels integer 1.
+        mem = self.oob_format_load(5, DST_SEL_X_0_1_1, "buffer_load_format_xyzw v[8:11], v1, s[4:7], 0 offen",
+                                   "global_store_dwordx4 v6, v[8:11], s[0:1]")
+        self.assertEqual([mem.get(OUT + 4 * i) for i in range(4)], [0, 0, 1, 1])
+
+    def test_mubuf_oob_dst_sel_float_one(self):
+        # 32_FLOAT (code 22), DST_SEL = (1, X, 0, W): the constant channel reads 1.0f, the others 0.
+        dst_sel = 1 | (4 << 3) | (0 << 6) | (7 << 9)
+        mem = self.oob_format_load(22, dst_sel, "buffer_load_format_xyzw v[8:11], v1, s[4:7], 0 offen",
+                                   "global_store_dwordx4 v6, v[8:11], s[0:1]")
+        self.assertEqual([mem.get(OUT + 4 * i) for i in range(4)], [0x3F800000, 0, 0, 0])
+
+    def test_mubuf_oob_d16_dst_sel_one(self):
+        # 32_FLOAT with d16_xy, DST_SEL = (1, X): the low half is f16 1.0, the high half 0.
+        dst_sel = 1 | (4 << 3)
+        mem = self.oob_format_load(22, dst_sel, "buffer_load_format_d16_xy v8, v1, s[4:7], 0 offen",
+                                   "global_store_dword v6, v8, s[0:1]")
+        self.assertEqual(mem.get(OUT), 0x3C00)
+
+    def test_mubuf_in_range_d16_dst_sel_one(self):
+        # The same load in range: the constant channel is the same f16 1.0, X the decoded float (bytes 0..3).
+        dst_sel = 1 | (4 << 3)
+        w3 = (3 << 28) | (22 << 12) | dst_sel
+        body = [
+            f"s_mov_b32 s4, {BASE:#x}", "s_mov_b32 s5, 0", "s_mov_b32 s6, 8", f"s_mov_b32 s7, {w3:#x}",
+            "v_mov_b32_e32 v1, 0", "v_mov_b32_e32 v8, 0",
+            "buffer_load_format_d16_xy v8, v1, s[4:7], 0 offen",
+            "s_waitcnt vmcnt(0)",
+            f"v_mov_b32_e32 v6, {OUT:#x}",
+            "global_store_dword v6, v8, s[0:1]",
+        ]
+        self.assertEqual(run_cs(body).get(OUT) & 0xFFFF, 0x3C00)
 
 
 if __name__ == "__main__":
