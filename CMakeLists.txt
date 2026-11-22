@@ -1864,6 +1864,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_native_section COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_section_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_register_probe>")
+    # A load that never returns ends the test; its last "start" line names the case.
+    set_tests_properties(cpu_native_section PROPERTIES TIMEOUT 120)
     add_library(cpu_tls_sink SHARED tests/cpu/tls_sink.cpp)
     foreach(variant IN ITEMS original refuse)
         add_library(cpu_tls_${variant} SHARED tests/cpu/tls_route.asm tests/cpu/tls_route.def)

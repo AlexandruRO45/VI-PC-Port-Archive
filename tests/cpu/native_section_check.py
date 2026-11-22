@@ -10,6 +10,7 @@ import ctypes
 from ctypes import wintypes
 from pathlib import Path
 import struct
+import sys
 from tempfile import TemporaryDirectory
 
 import pefile
@@ -226,6 +227,9 @@ def main():
     parser.add_argument("mapper", type=Path)
     parser.add_argument("probe", type=Path, help="source-built image with no entry point and no imports")
     args = parser.parse_args()
+    # Each case prints "start" before it loads anything. With line buffering, the output CTest shows
+    # after its TIMEOUT names a case that started but never returned.
+    sys.stdout.reconfigure(line_buffering=True)
     # Refused images must return loader errors instead of a Bad Image dialog on interactive runners.
     kernel.SetErrorMode(kernel.GetErrorMode() | 0x0001)  # SEM_FAILCRITICALERRORS
     mapper = Mapper(args.mapper)
@@ -239,6 +243,7 @@ def main():
         for index, (case, name, edits, cut, discriminating) in enumerate(CASES):
             image = Path(folder) / f"section_case{index}.dll"
             exact = patch(args.probe, image, name, edits, cut)
+            print(f"start {name} {case}")
             try:
                 after = compare(mapper, f"{name} {case}", image, exact, name)
             except AssertionError as error:
@@ -255,6 +260,7 @@ def main():
         for index, (case, name, edits, cut) in enumerate(REJECTIONS):
             image = Path(folder) / f"section_refused{index}.dll"
             patch(args.probe, image, name, edits, cut)
+            print(f"start {name} {case}")
             try:
                 refused(mapper, f"{name} {case}", image)
             except AssertionError as error:
