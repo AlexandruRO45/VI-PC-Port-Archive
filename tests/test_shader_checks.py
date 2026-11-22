@@ -30,7 +30,7 @@ WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n
 
 # All check.py cases, including the four vk_store_test shaders and the three mesh fixtures, and TEST-184's
 # vk_store_test "words" fixtures and image_get_lod draws.
-TOTAL = (len(check.COMPUTE) + 5 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 4
+TOTAL = (len(check.COMPUTE) + 5 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_FULL) + len(check.W64X_PARTIAL) + 4
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
@@ -71,6 +71,14 @@ class Wave64Checks(unittest.TestCase):
                 self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "64"))
                 Path(env["VKC_DUMP"]).write_bytes(struct.pack("<64I", *check.FMT_SINT32_WORDS))
                 return 0, ""
+            if name in dict(check.W64X_FULL):   # a 64-lane shader judged on its whole heap
+                want = dict(check.W64X_FULL)[name]
+                self.assertEqual((args[:2], env["VKC_OUT_WORDS"]), (("1", "dump"), str(len(want))))
+                self.assertEqual("--require-wave64" in args, not emulated)
+                if wavemask[0] == 77 and not emulated:
+                    return wavemask
+                Path(env["VKC_DUMP"]).write_bytes(struct.pack(f"<{len(want)}I", *want))
+                return 0, "compute subgroup size: 64\nout[0..7] = 0 0 0 0 0 0 0 0\n"
             if name in ("cs_fmt_xy_xyz", "cs_tbuffer_store"):
                 self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "192"))
                 Path(env["VKC_DUMP"]).write_bytes(GOOD_XY_XYZ if name == "cs_fmt_xy_xyz" else GOOD_TBUFFER_STORE)
@@ -170,7 +178,9 @@ class Wave64Checks(unittest.TestCase):
         self.assertRegex(out, r"cs_wavemask +SKIP")
         self.assertRegex(out, r"cs_wave64_ballot +SKIP")
         self.assertRegex(out, r"cs_exec64 +ok")
-        self.assertIn(f"{TOTAL - 5 - len(WAVE64_DUMPS)} of {TOTAL} pass, {5 + len(WAVE64_DUMPS)} skipped", out)
+        skipped = 5 + len(WAVE64_DUMPS) + len(check.W64X_FULL)
+        self.assertRegex(out, r"cs_w64x_carry +SKIP")
+        self.assertIn(f"{TOTAL - skipped} of {TOTAL} pass, {skipped} skipped", out)
 
     def test_full_wave_checks_pass_with_expected_results(self):
         status, out = self.run_checks(*FULL_WAVE)

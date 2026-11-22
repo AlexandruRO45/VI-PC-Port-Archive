@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mc_command  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container, shader_source
-from check import Skip, clip_test, fmt_1010102_test, fmt_sint32_test, fmt_xy_xyz_test, tbuffer_store_test
+from check import Skip, W64X_FULL, clip_test, fmt_1010102_test, fmt_sint32_test, fmt_xy_xyz_test, tbuffer_store_test, w64x_full_test
 from compute_fixture import compute_header
 from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
 from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
@@ -839,6 +839,16 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_fmt_sint32":
             problem = fmt_sint32_test(a.build, spirv_dir, cs_env)
             results.append((name, not problem, problem or "64/64 dumped words exact"))
+        elif name in dict(W64X_FULL):
+            # Wave64 cross-half dumps judged on every heap word (derivations in the .asm); skipped where the device has no
+            # 64-wide subgroup, unless LEONIDA_W64_EMULATE=1 translated them with --wave64-emulate.
+            want = dict(W64X_FULL)[name]
+            problem = w64x_full_test(a.build, spirv_dir, name, want, cs_env)
+            if problem is None:
+                results.append((name, None, "SKIP (no 64-wide compute subgroup on this device)"))
+            else:
+                ok = None if isinstance(problem, Skip) else not problem
+                results.append((name, ok, problem or f"{len(want)}/{len(want)} dumped words exact"))
         elif name == "cs_fmt_xy_xyz":
             # TEST-185: xy/xyz format loads and stores, words measured natively on a Radeon 680M (the .asm header)
             problem = fmt_xy_xyz_test(a.build, spirv_dir, cs_env)

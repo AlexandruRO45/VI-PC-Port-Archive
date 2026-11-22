@@ -254,6 +254,51 @@ W64X_DUMPS = [("cs_dpp_w64", [1, 0, 3, 2, 5, 4, 7, 6]),
               ("cs_w64x_andn2_exec", [1, 16, 32, 4144, 2052, 3, 8, 1544]),
               # s_and/s_or_saveexec_b64 (VCC and SGPR-pair sources), s_andn2_saveexec/wrexec_b64 (SGPR pair): D, EXEC, SCC
               ("cs_w64x_saveexec_b64", [6160, 12304, 5120, 2088, 6168, 8192, 7176, 1837171])]
+
+
+def _w64x_carry_words():
+    """cs_w64x_carry.asm's 922 words, from the formulas in its header (the ISA pseudocode, plain integers)."""
+    m32 = 0xFFFFFFFF
+    lanes = range(64)
+    cin = [(0x0FF0A55B5A5A5A5A >> lane) & 1 for lane in lanes]
+    arrays, masks = [], []
+
+    def add(sums, borrow=False):
+        flags = [(s < 0) if borrow else (s > m32) for s in sums]
+        arrays.append([s & m32 for s in sums])
+        masks.append(flags)
+
+    b0 = [((lane >> 5) ^ lane) & 1 for lane in lanes]
+    add([0xFFFFFFE0 + lane for lane in lanes])                                    # 0 v_add_co_u32
+    add([0xFFFFFFE9 + lane + cin[lane] for lane in lanes])                        # 1 v_add_co_ci_u32
+    s0 = [m32 + b0[lane] for lane in lanes]                                       # 2, 3, 4: the carry ripples
+    s1 = [m32 + (s > m32) for s in s0]
+    s2 = [0x7FFFFFFF + (s > m32) for s in s1]
+    add(s0)
+    add(s1)
+    add(s2)
+    add([48 - lane for lane in lanes], borrow=True)                               # 5 v_sub_co_u32
+    add([lane - 16 for lane in lanes], borrow=True)                               # 6 v_subrev_co_u32
+    add([lane - 32 - cin[lane] for lane in lanes], borrow=True)                   # 7 v_sub_co_ci_u32
+    add([lane - 47 - cin[lane] for lane in lanes], borrow=True)                   # 8 v_subrev_co_ci_u32
+    add([lane - 40 - cin[lane] for lane in lanes], borrow=True)                   # 9 v_sub_co_ci_u32_e32 (VCC)
+    t0 = [0xFFFFFFEB + lane for lane in lanes]                                    # 10, 11, 12: the VCC chain
+    t1 = [m32 + (t > m32) for t in t0]
+    t2 = [0x7FFFFFFF + 0x7FFFFFFF + (t > m32) for t in t1]
+    add(t0)
+    add(t1)
+    add(t2)
+    words = [w for arr in arrays for w in arr]
+    words += [sum(int(masks[k][lane]) << k for k in range(13)) for lane in lanes]          # flag word per lane
+    packed = [sum(1 << lane for lane in lanes if flags[lane]) for flags in masks]
+    words += [bin(m).count("1") for m in packed]                                              # s_bcnt1_i32_b64
+    words += [((m & -m).bit_length() - 1) & m32 for m in packed]                              # s_ff1_i32_b64 (-1 if none)
+    return words
+
+
+W64X_CARRY_WORDS = _w64x_carry_words()
+# Wave64 dump tests that compare the whole dump (heap of len(words) words), not just out[0..7]: name -> words.
+W64X_FULL = [("cs_w64x_carry", W64X_CARRY_WORDS)]
 # A 40-thread group (one partial wave) cannot use --require-wave64 (full subgroups), so it asks for subgroup size 64.
 W64X_PARTIAL = [("cs_w64x_partial", [40, 40, 528, 0, 0, 532, 539, 524820]),
                 ("cs_w64x_partial_scmp", [0, 1, 0, 1, 1, 1, 1, 0])]
@@ -448,17 +493,23 @@ def failure(code, output, lines):
     return f"exit {code}: {details or 'no test output'}"
 
 
-def dump_test(tools, spirv, name, want, words, env=None):
+def dump_test(tools, spirv, name, want, words, env=None, wave64=False):
     """Run one group with a heap of `words` words and compare the first len(want) words of the whole dump. The
-    console dump stops at word 7."""
+    console dump stops at word 7. wave64: the shader needs a 64-wide subgroup (--require-wave64): None where the
+    device has none, unless LEONIDA_W64_EMULATE=1 (it was translated with --wave64-emulate and runs on any width)."""
     with tempfile.TemporaryDirectory(prefix="leonida-fmt-") as tmp:
         dump = Path(tmp) / "out.bin"
         # VKC_OUT_WORDS sets a minimum. Pin this dispatch to exactly `words` words.
         child = dict(os.environ if env is None else env, VKC_DUMP=str(dump), VKC_OUT_WORDS=str(words))
+        need64 = wave64 and not W64_EMULATED
         code, out = run(os.path.join(tools, "vk_compute_test" + EXE), os.path.join(spirv, name + ".spv"),
-                        "1", "dump", env=child)
+                        "1", "dump", *(["--require-wave64"] if need64 else []), env=child)
+        if need64 and code == 77:   # vk_compute_test: the device cannot run a 64-wide compute subgroup
+            return None
         if code:
             return failure(code, out, 3)
+        if need64 and "compute subgroup size: 64" not in out.splitlines():
+            return "64-wide subgroup was not confirmed (rebuild vk_compute_test)"
         if not dump.is_file():
             return "no VKC_DUMP file written"
         data = dump.read_bytes()
@@ -477,6 +528,11 @@ def fmt_1010102_test(tools, spirv, env=None):
 
 def fmt_sint32_test(tools, spirv, env=None):
     return dump_test(tools, spirv, "cs_fmt_sint32", FMT_SINT32_WORDS, len(FMT_SINT32_WORDS), env)
+
+
+def w64x_full_test(tools, spirv, name, want, env=None):
+    """A wave64 dump test judged on every word of its heap (W64X_FULL); None where the device has no 64-wide subgroup."""
+    return dump_test(tools, spirv, name, want, len(want), env, wave64=True)
 
 
 def fmt_xy_xyz_test(tools, spirv, env=None):
@@ -1304,6 +1360,8 @@ def main():
     for name, want in W64X_DUMPS:   # without --require-wave64 when LEONIDA_W64_EMULATE=1
         results.append((name, compute_test(tools, spirv, name, "1", "dump", require_wave64=not W64_EMULATED,
                                            expected_words=want)))
+    for name, want in W64X_FULL:   # whole-heap dumps of 64-lane shaders, likewise without --require-wave64 when emulated
+        results.append((name, w64x_full_test(tools, spirv, name, want)))
     for name, want in W64X_PARTIAL:
         results.append((name, partial_wave_test(tools, spirv, name, want)))
     results.append(("ms_w64x_ballot", mesh_w64x_test(tools, spirv, "ms_w64x_ballot")))
