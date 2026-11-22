@@ -5,7 +5,7 @@ EXTERN __imp_putchar:QWORD
 EXTERN __imp_fflush:QWORD
 
 .code
-program_entry PROC FRAME
+native_entry PROC FRAME
     push rbx
     .pushreg rbx
     push rsi
@@ -66,5 +66,5 @@ finished:
     pop rsi
     pop rbx
     ret
-program_entry ENDP
+native_entry ENDP
 END
