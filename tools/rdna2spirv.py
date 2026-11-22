@@ -150,6 +150,55 @@ def base_op(op):
     return op
 
 
+def vcc_hi_fresh(blocks, succ):
+    """id() of the instructions before which %vcc_hi holds VCC[63:32] on every path, for Gen.mask_src in wave64.
+    A write to vcc_hi (or a 64-bit scalar load into VCC) stores that word in %vcc_hi; any other write to the whole
+    VCC (v_cmp, a carry-out, s_mov_b64 / s_and_b64 into vcc, ...) keeps the high lanes' bits in %vcc and leaves
+    %vcc_hi stale. Both start at 0, which agree."""
+    def is_vcc(x, names):
+        if x["k"] == "special":
+            return x.get("t") in names
+        return x["k"] == "slist" and any(r in names for r in x["r"] if isinstance(r, str))
+
+    def step(fresh, ins):
+        op, a = base_op(ins["op"]), ins["args"]
+        if not a or op.startswith(lane_masks.NO_DESTINATION):
+            return fresh
+        dsts = [a[0]]
+        if len(a) > 1 and ("_co_" in op or "div_scale" in op or op.startswith(("v_mad_u64", "v_mad_i64"))):
+            dsts.append(a[1])
+        if op.startswith(("s_load_", "s_buffer_load_")) and is_vcc(a[0], ("vcc", "vcc_hi")):
+            return True                             # the high dword lands in %vcc_hi (Gen.smem)
+        if any(is_vcc(d, ("vcc_hi",)) for d in dsts):
+            return True                             # Gen.dst stores the word in %vcc_hi
+        if any(is_vcc(d, ("vcc",)) for d in dsts) or (op.startswith("v_cmp") and len(a) == 2):
+            return False
+        return fresh
+
+    entry = [None] * len(blocks)
+    if blocks:
+        entry[0] = True
+    work = [0] if blocks else []
+    while work:
+        n = work.pop()
+        fresh = entry[n]
+        for ins in blocks[n]:
+            fresh = step(fresh, ins)
+        for s in succ[n]:
+            new = fresh if entry[s] is None else (entry[s] and fresh)
+            if new != entry[s]:
+                entry[s] = new
+                work.append(s)
+    out = set()
+    for n, blk in enumerate(blocks):
+        fresh = bool(entry[n])
+        for ins in blk:
+            if fresh:
+                out.add(id(ins))
+            fresh = step(fresh, ins)
+    return out
+
+
 class Unsupported(Exception):
     pass
 
@@ -203,6 +252,8 @@ class Gen:
         self.lane_masks = {}           # id(instruction) -> registers holding a lane mask there (lane_masks.py)
         self.ever_mask = set()         # SGPRs that held a lane mask anywhere in the shader (conservative)
         self.cur_masks = {}
+        self.vcc_hi_fresh = set()      # id(instruction) before which %vcc_hi holds VCC[63:32] (vcc_hi_fresh())
+        self.cur_vcc_hi = False
         self.mask_writes = set()       # id(instruction) of the ones that write a lane mask to a VGPR
         self.write_all_lanes = False
         self.dpp_guard = None       # per-lane bool: a DPP instruction's row/bank/valid write mask
@@ -275,7 +326,7 @@ class Gen:
     def emit(self, s):
         self.body.append("         " + s)
         if self.emulate:
-            if s.startswith(("OpStore %vcc ", "OpStore %active ")):
+            if s.startswith(("OpStore %vcc ", "OpStore %vcc_hi ", "OpStore %active ")):
                 reg, val = s.split()[1:3]
                 self.x_tok[reg] = val
             elif s.endswith("= OpLabel"):
@@ -3382,6 +3433,7 @@ class Gen:
         self.ever_mask = {r for m in self.lane_masks.values() for r in m if isinstance(r, int)}
         slots = lane_masks.parked(blocks[0], self.lane_masks)
         self.parked = {slot: self.SGPRS + i for i, slot in enumerate(slots)}
+        self.vcc_hi_fresh = vcc_hi_fresh(*blocks)
 
     def mask_half(self, a):
         """For a 32-bit lane-mask operand in wave64, return 'lo' (lanes 0-31), 'hi' (lanes 32-63), or None."""
@@ -3458,7 +3510,8 @@ class Gen:
             elif a["k"] == "sgpr":
                 key = ("v", self.x_gen, self.x_tok.get(("sgpr", a["r"]), ("start", a["r"])))
             elif a["k"] == "special" and a["t"] in ("vcc", "vcc_lo", "vcc_hi"):
-                key = ("v", self.x_gen, self.x_tok.get("%vcc", ("start", "vcc")))
+                key = ("v", self.x_gen, self.x_tok.get("%vcc", ("start", "vcc")),
+                       self.x_tok.get("%vcc_hi", ("start", "vcc_hi")), self.cur_vcc_hi)
             if key in self.x_mcache:
                 return self.x_mcache[key]
         mine = self.tmp_bool_nz(self.exec_value() if special else self.mask_src(a))
@@ -3673,6 +3726,30 @@ class Gen:
                 self.emit(f"{shr} = OpShiftRightLogical %uint {v} {lane}")
                 self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
                 self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+                return r
+            if self.wave64 and wide and a["t"] in ("vcc", "vcc_lo") and "vcc" not in self.cur_masks:
+                # Wave64 VCC that lane_masks.py does not certify as a mask. Lanes 0-31 take bit L of %vcc: a 32-bit
+                # scalar write to vcc_lo put the word there, a mask the analysis missed has 0 or ~0 there. Lanes
+                # 32-63 take bit L-32 of %vcc_hi where that holds VCC[63:32] (vcc_hi_fresh: written by s_mov_b32
+                # vcc_hi, K or a load), else %vcc as before (the high half written as a whole-VCC mask keeps each
+                # lane's bit there). Until 2026-11-22 every lane used the raw %vcc word, so s_mov_b32 vcc_lo, 0xa
+                # selected all 64 lanes.
+                lane, sh, up = self.wave_lane(), self.tmp(), self.tmp()
+                self.emit(f"{sh} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
+                self.emit(f"{up} = OpUGreaterThanEqual %bool {lane} {self.cu(32)}")
+                word = v
+                if self.cur_vcc_hi:
+                    hi, word = self.tmp(), self.tmp()
+                    self.emit(f"{hi} = OpLoad %uint %vcc_hi")
+                    self.emit(f"{word} = OpSelect %uint {up} {hi} {v}")
+                shr, bit, r = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{shr} = OpShiftRightLogical %uint {word} {sh}")
+                self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
+                self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+                if not self.cur_vcc_hi:
+                    keep = self.tmp()
+                    self.emit(f"{keep} = OpSelect %uint {up} {v} {r}")
+                    r = keep
                 return r
             return v
         if a["k"] == "special" and a["t"] in ("exec", "exec_lo", "exec_hi"):
@@ -3899,6 +3976,7 @@ class Gen:
         deciding the other bits (PAD = zero, SEXT = sign-extend, PRESERVE = keep the old bits). VOPC has no
         dst_sel; v_cmpx (GFX10) has no written destination operand."""
         self.cur_masks = self.lane_masks.get(id(ins), {})
+        self.cur_vcc_hi = id(ins) in self.vcc_hi_fresh
         self.write_all_lanes = id(ins) in self.mask_writes
         self.cur_uniform_readlane = bool(self.w64g) and id(ins) in self.w64g["uniform_readlane"]
         if self.emulate:

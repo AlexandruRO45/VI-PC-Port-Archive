@@ -653,19 +653,24 @@ class LaneMaskConstants(unittest.TestCase):
     """runtime/test/shaders/cs_w32_mask_imm.asm and cs_w64_mask_imm.asm: a constant read as a lane mask (saveexec,
     wrexec, s_and_b64 / s_not_b64 / s_mov_b64 into EXEC or VCC) gives lane L its bit L, not bit 0 for every lane.
     cs_w32_vcc_data.asm: the same for a wave32 VCC holding data (s_mov_b32 vcc_lo, K) read by v_cndmask_b32, a
-    carry-in and s_and_saveexec_b32.
+    carry-in and s_and_saveexec_b32. cs_w64_vcc_data.asm: the wave64 form, lanes 32-63 reading vcc_hi.
     Run on all lanes of one wave (32 on a 32-wide subgroup, 64 on a 64-wide one, no --wave64-emulate) with a heap
     of 0xee bytes; the words are the GPU check's (check.py CS_DUMPS), derived by hand in each .asm header."""
 
     WANT = {"cs_w32_mask_imm": (32, [2056, 20, 2, 6152, 2050, 4112, 258, 32]),
             "cs_w64_mask_imm": (64, [2056, 1084, 828, 2052, 319, 2104, 516, 2064]),
             # wave32 VCC holding data (s_mov_b32 vcc_lo, K; a copy of a data SGPR) read as a lane mask
-            "cs_w32_vcc_data": (32, [258, 1032, 2, 1052, 0xFFFFFF00, 5, 4104, 781])}
+            "cs_w32_vcc_data": (32, [258, 1032, 2, 1052, 0xFFFFFF00, 5, 4104, 781]),
+            # wave64: s_mov_b32 vcc_lo, K and s_mov_b32 vcc_hi, K, read by v_cndmask_b32, a carry-in, s_and_saveexec_b64
+            "cs_w64_vcc_data": (64, [260, 1033, 3, 1068, 10241, 40, 4108, 800])}
     # Bit 0 of the constant for every lane, the translation before the fix (in the .asm headers).
     OLD = {"cs_w32_mask_imm": [0xFFFFFF00, 32, 32, 0xFFFFFF00, 2072, 0xFFFFFF00, 0xFFFFFF00, 32],
            "cs_w64_mask_imm": [0xFFFFFF00] * 7 + [2080],
            # the raw VCC word for every lane: a non-zero value selected all 32 lanes
-           "cs_w32_vcc_data": [32, 32, 32, 32, 0xFFFFFF00, 5, 32, 32]}
+           "cs_w32_vcc_data": [32, 32, 32, 32, 0xFFFFFF00, 5, 32, 32],
+           # the raw vcc_lo word in every lane (lanes 32-63 kept the bits of a mask VCC held just before, cases 3
+           # and 6): non-zero selected all of them, vcc_hi was ignored
+           "cs_w64_vcc_data": [64, 64, 64, 32, 0xFFFFFF00, 40, 40, 800]}
 
     def run_words(self, name, lanes):
         sys.path.insert(0, os.path.join(support.ROOT, "runtime", "test", "shaders"))
@@ -703,6 +708,14 @@ class LaneMaskConstants(unittest.TestCase):
         wv = [word(0xA), word(0xF0F0), word(0x80000001), word(-16 & m32), word(0),
               word(sum(1 << l for l in lanes if l < 5)), word(0xFF0000 & m32), word(0x12345678)]
         self.assertEqual(wv, self.WANT["cs_w32_vcc_data"][1])
+        # cs_w64_vcc_data: VCC = vcc_hi << 32 | vcc_lo, lane L reads bit L of the 64 bits; case 2 adds 0 + 0 + VCC[L],
+        # case 5 is a compare (lanes 0-39), case 6 is EXEC = VCC & all lanes, case 7 is s_mov_b64 vcc of a data pair.
+        def vcc(lo, hi):
+            return (hi & m32) << 32 | (lo & m32)
+        w6 = [word(vcc(0xA, 0x30000)), word(vcc(0xF0F0, 0x80000000)), word(vcc(0x80000001, 1)),
+              word(vcc(-16, 0xFFFF)), word(vcc(0, 0x100)), word(sum(1 << l for l in range(64) if l < 40)),
+              word(vcc(0xFF0000, 0xF) & m64), word(vcc(0x12345678, 0x9ABCDEF0))]
+        self.assertEqual(w6, self.WANT["cs_w64_vcc_data"][1])
 
 
 if __name__ == "__main__":

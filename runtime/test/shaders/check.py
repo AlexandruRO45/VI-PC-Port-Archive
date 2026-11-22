@@ -127,6 +127,8 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             ("cs_w64_mask_imm", [2056, 1084, 828, 2052, 319, 2104, 516, 2064]),
             # wave32 VCC holding data (s_mov_b32 vcc_lo, K) read as a lane mask: lane L takes bit L (.asm header)
             ("cs_w32_vcc_data", [258, 1032, 2, 1052, 0xffffff00, 5, 4104, 781]),
+            # the same in wave64: lanes 0-31 take bit L of vcc_lo, lanes 32-63 bit L-32 of vcc_hi (.asm header)
+            ("cs_w64_vcc_data", [260, 1033, 3, 1068, 10241, 40, 4108, 800]),
             ("cs_wave64_ballot", [32, 16, 24, 40, 8, 48]),
             ("cs_wm_half_ops", [32, 16, 16, 0, 16]), ("cs_wm_half_cmp", [1, 0, 1, 1]),
             ("cs_wm_bfm64", [16, 8, 8, 40]), ("cs_wm_scc_rfl", [55, 48]),
