@@ -12,6 +12,7 @@
 
 #include "d3d12_stubs.h"  // generated
 #include "d3d12_com_object.h"
+#include "d3d12_console_feature.h"
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
 #include "dxgi_com.h"
@@ -6763,9 +6764,11 @@ public:
             return d3d12_trace::result(method, S_OK);
         }
         case D3D12_FEATURE_D3D12_OPTIONS: {
-            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS)) return d3d12_trace::result(method, E_INVALIDARG);
-            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS*>(data);
-            *opts = {};
+            // The console asks with a larger structure (0x40 against the PC's 0x3C): the PC fields, then zeros for
+            // the console's extra bytes. Smaller than the PC structure is E_INVALIDARG, as on the host.
+            if (size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS)) return d3d12_trace::result(method, E_INVALIDARG);
+            D3D12_FEATURE_DATA_D3D12_OPTIONS answer{};
+            auto* opts = &answer;
             opts->DoublePrecisionFloatShaderOps = TRUE;
             opts->OutputMergerLogicOp = TRUE;
             opts->MinPrecisionSupport = D3D12_SHADER_MIN_PRECISION_SUPPORT_NONE;
@@ -6781,6 +6784,10 @@ public:
             opts->CrossAdapterRowMajorTextureSupported = FALSE;
             opts->VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation = TRUE;
             opts->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_1;
+            rt::d3d12::store_with_console_tail(data, size, &answer, sizeof(answer));
+            if (rt::d3d12::is_console_sized_feature_request(feature, size))
+                log_once("CheckFeatureSupport(D3D12_OPTIONS) asked for more bytes than the PC structure has (60), "
+                         "extra bytes zeroed; size", int(size));
             return d3d12_trace::result(method, S_OK);
         }
         case D3D12_FEATURE_D3D12_OPTIONS1: {

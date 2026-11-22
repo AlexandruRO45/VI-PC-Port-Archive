@@ -140,7 +140,7 @@ the de-duplicated 1–22. It maps each question to the event to look for; it doe
 | 8 | XDXR desc layouts | measured in [xdxr.md](xdxr.md); the live signal is a non-empty stream desc at slot 62 |
 | 9 | Tiled textures / DCC | slot 76, `CopyTextureRegion`, resource descs; a `0x101` layout or tiled address |
 | 10 | Binning, DCC, VRS, wave MMA, stream output | shader-side answered by `tools/feature_scan.py`; the trace adds PSO/stream subobjects |
-| 11 | `CheckFeatureSupport` answers | the call's `ok`/`failed` and the `[rt]` feature-id line; the answer itself is not logged yet |
+| 11 | `CheckFeatureSupport` answers | the call's `ok`/`failed` and the `[rt]` feature-id line; the answer itself is not logged yet. A `D3D12_OPTIONS` call with more than the PC's 60 bytes logs its size (`[rt] d3d12: ... asked for more bytes ...; size N`), and gets the PC answer with the extra bytes zeroed |
 | 12 | Async compute / copy queues | queue creation and cross-queue fences |
 | 13 | 144-byte push constants | device creation `[rt]` line; `push_constants_need_fallback` when the device reports fewer |
 | 14 | Two code-base stages in one PSO | PSO creation log; the index metadata (`uses_code_base`) |

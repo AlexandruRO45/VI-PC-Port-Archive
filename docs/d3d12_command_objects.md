@@ -811,7 +811,10 @@ Vulkan device does not share fences (the test prints "not checked" there). Each 
 process and is compared with the real object's HRESULT. The test also includes a console-style client: it makes a heap through slot 14 (handle in
 RAX) and buffers through slot 76 (layout word 0x1). It then copies through the queue proxy, finishes through
 the fence proxy, reads the data back, and makes residency calls that carry the heap, queue and fence proxies.
-`device_proxy_test` gets its queue and fence through the registered `D3D12XboxCreateDevice` shim.
+`device_proxy_test` gets its queue and fence through the registered `D3D12XboxCreateDevice` shim. It also checks device
+slot 13, `CheckFeatureSupport`: a `D3D12_OPTIONS` request larger than the PC's 0x3C bytes (the console's is 0x40) is
+answered from the PC runtime's structure with the extra bytes zeroed, a smaller size and any other feature stay
+refused (see [d3d12_vulkan.md](d3d12_vulkan.md) section 4.1).
 
 The package-gated `bvh_builder_test` and `fsr_dispatch_test` stay at `SKIP (no package)` without
 `LEONIDA_GAME_DIR`, and they would not cover these paths if they ran. Neither creates a queue or a fence:
