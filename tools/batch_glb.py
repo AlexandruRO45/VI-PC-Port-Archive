@@ -125,6 +125,10 @@ def batch_convert(
 
     # Extension case does not distinguish destinations: model.obj and model.OBJ both write model.glb.
     # Check the entire batch before workers can replace an earlier result or an existing export.
+    # path_key decides what counts as one destination, with two known limits. On Windows it folds case even
+    # where the output directory has per-directory case sensitivity turned on, so a pair that could coexist
+    # there is refused (never overwritten). On Linux it keeps case, so two stems that differ only in case are
+    # not caught on a case-insensitive mount (VFAT, CIFS).
     output_sources: dict[str, str] = {}
     for name in obj_files:
         out_path = os.path.join(out_dir, os.path.splitext(name)[0] + ".glb")
