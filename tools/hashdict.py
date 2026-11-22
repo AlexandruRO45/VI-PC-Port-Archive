@@ -64,6 +64,10 @@ def main():
             print(f"ERROR: cannot read the dictionary {a.lookup[0]}: {getattr(e, 'strerror', None) or e}",
                   file=sys.stderr)
             return 2
+        if not isinstance(d, dict):
+            print(f"ERROR: cannot read the dictionary {a.lookup[0]}: expected a JSON object of hash -> name",
+                  file=sys.stderr)
+            return 2
         for h, v in values:
             print(h, d.get(f"{v:08x}", "?"))
         return 0

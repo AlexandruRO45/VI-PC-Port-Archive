@@ -355,5 +355,32 @@ class OutputPathTest(unittest.TestCase):
                 self.assertEqual(json.load(f), {})
 
 
+class LookupDictionaryTest(unittest.TestCase):
+    def lookup(self, contents):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "dict.json")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(contents)
+            return subprocess.run([sys.executable, "-I", TOOL, "--lookup", path, "0x1"],
+                                  capture_output=True, text=True)
+
+    def test_malformed_dictionary_is_one_error(self):
+        p = self.lookup("not json")
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("ERROR: cannot read the dictionary", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+    def test_wrong_shape_dictionary_is_one_error(self):
+        p = self.lookup("[]")
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("expected a JSON object", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+    def test_valid_dictionary_still_resolves(self):
+        p = self.lookup('{"00000001": "Widget"}')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.strip(), "0x1 Widget")
+
+
 if __name__ == "__main__":
     unittest.main()
