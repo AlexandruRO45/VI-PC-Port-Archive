@@ -165,6 +165,7 @@ def rewrite(text):
     out_vars = {v: f"%gsc_out{i}" for i, v in enumerate(outs)}
     types += [f"{nv} = OpVariable %gsc_ptr_pv_v4 Private" for nv in out_vars.values()]
     in_slot = {v: i for i, v in enumerate(ins)}
+    lowered_input_pointers = set()
     gone = set(ins) | set(outs) | {v for v, b in builtins.items() if b in ("PrimitiveId", "InvocationId")}
     new_globals = ["%gsc_gid", "%gsc_in", "%gsc_rec", "%gsc_meta", "%gsc_n"] + list(out_vars.values())
 
@@ -237,23 +238,29 @@ def rewrite(text):
             ops[1::2] = ["%gsc_body" if lbl == entry_label else lbl for lbl in ops[1::2]]
             s = f"{m.group(1)} {' '.join(ops)}"
             ln = s
-        m = re.match(r"(%\w+) = Op(?:InBounds)?AccessChain (%\w+) (%\w+) (.*)$", s)
-        if m and m.group(3) in in_slot:
-            idx = m.group(4).split()
-            vtx = idx[0]
-            if defs.get(vtx, (None, [None]))[1][:1] != [uint]:
-                vtx = tmp()
-                out.append(f"{vtx} = OpBitcast {uint} {idx[0]}")
-            a, b, c = tmp(), tmp(), tmp()
-            ptr = "%gsc_ptr_sb_f" if m.group(2) in float_ptrs else "%gsc_ptr_sb_v4"
-            out += [f"{a} = OpIAdd {uint} %gsc_inbase {vtx}", f"{b} = OpIMul {uint} {a} {k(nin)}",
-                    f"{c} = OpIAdd {uint} {b} {k(in_slot[m.group(3)])}",
-                    " ".join([f"{m.group(1)} = OpAccessChain {ptr} %gsc_in {k(2)} {c}"] + idx[1:])]
-            continue
-        if m and m.group(3) in out_vars:
-            ptr = "%gsc_ptr_pv_f" if m.group(2) in float_ptrs else "%gsc_ptr_pv_v4"
-            out.append(f"{m.group(1)} = OpAccessChain {ptr} {out_vars[m.group(3)]} {m.group(4)}")
-            continue
+        m = re.match(r"(%\w+) = (Op(?:InBounds)?AccessChain) (%\w+) (%\w+)( .*)?$", s)
+        if m:
+            result, chain, result_type, base, indices = m.groups()
+            if (base in in_slot and indices is not None) or base in lowered_input_pointers:
+                lowered_input_pointers.add(result)
+                ptr = "%gsc_ptr_sb_f" if result_type in float_ptrs else "%gsc_ptr_sb_v4"
+                if base in in_slot:
+                    idx = indices.split()
+                    vtx = idx[0]
+                    if defs.get(vtx, (None, [None]))[1][:1] != [uint]:
+                        vtx = tmp()
+                        out.append(f"{vtx} = OpBitcast {uint} {idx[0]}")
+                    a, b, c = tmp(), tmp(), tmp()
+                    out += [f"{a} = OpIAdd {uint} %gsc_inbase {vtx}", f"{b} = OpIMul {uint} {a} {k(nin)}",
+                            f"{c} = OpIAdd {uint} {b} {k(in_slot[base])}",
+                            " ".join([f"{result} = OpAccessChain {ptr} %gsc_in {k(2)} {c}"] + idx[1:])]
+                else:
+                    out.append(f"{result} = {chain} {ptr} {base}{indices or ''}")
+                continue
+            if base in out_vars and indices is not None:
+                ptr = "%gsc_ptr_pv_f" if result_type in float_ptrs else "%gsc_ptr_pv_v4"
+                out.append(f"{result} = OpAccessChain {ptr} {out_vars[base]}{indices}")
+                continue
         m = re.match(r"(%\w+) = OpLoad (%\w+) (%\w+)(?:\s+.*)?$", s)
         if m and builtins.get(m.group(3)) in ("PrimitiveId", "InvocationId"):
             val = "%gsc_prim" if builtins[m.group(3)] == "PrimitiveId" else k(0)

@@ -140,7 +140,15 @@ def test_phi_from_entry_block_names_the_split_block(tmp_path):
 
 
 @pytest.mark.skipif(not HAVE_SPIRV, reason="needs spirv-as and spirv-val on PATH")
-def test_lowers_in_bounds_geometry_interface_access_chains(tmp_path: Path) -> None:
+@pytest.mark.parametrize(("component_chain", "use_alias"), [
+    (None, False),
+    ("OpAccessChain", False),
+    ("OpInBoundsAccessChain", False),
+    ("OpAccessChain", True),
+    ("OpInBoundsAccessChain", True),
+])
+def test_lowers_in_bounds_geometry_interface_access_chains(
+        tmp_path: Path, component_chain: str | None, use_alias: bool) -> None:
     geometry = PHI_GS.replace(
         "%p = OpAccessChain %ptr_in_v4 %in_pos %x",
         "%p = OpInBoundsAccessChain %ptr_in_v4 %in_pos %x",
@@ -155,6 +163,19 @@ def test_lowers_in_bounds_geometry_interface_access_chains(tmp_path: Path) -> No
         "OpStore %out_x %x_value",
     )
 
+    if component_chain:
+        component_base = "%alias" if use_alias else "%p"
+        alias = f"%alias = {component_chain} %ptr_in_v4 %p\n" if use_alias else ""
+        geometry = geometry.replace(
+            "%in_pos = OpVariable %ptr_in_arr Input",
+            "%ptr_in_float = OpTypePointer Input %float\n%in_pos = OpVariable %ptr_in_arr Input",
+        ).replace(
+            "%v = OpLoad %v4float %p",
+            f"{alias}%in_x = {component_chain} %ptr_in_float {component_base} %u1\n"
+            "%value = OpLoad %float %in_x\n"
+            "%v = OpCompositeConstruct %v4float %value %value %value %value",
+        )
+
     def validate(name: str, assembly: str) -> None:
         module = tmp_path / f"{name}.spv"
         subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-", "-o", str(module)],
@@ -168,6 +189,10 @@ def test_lowers_in_bounds_geometry_interface_access_chains(tmp_path: Path) -> No
     assert "%p = OpAccessChain %gsc_ptr_sb_v4 %gsc_in " in lowered
     assert "%out_x = OpAccessChain %gsc_ptr_pv_f %gsc_out0 %u0" in lowered
     validate("compute", lowered)
+    if component_chain:
+        assert f"%in_x = {component_chain} %gsc_ptr_sb_f {component_base} %u1" in lowered
+        if use_alias:
+            assert f"%alias = {component_chain} %gsc_ptr_sb_v4 %p" in lowered
 
 
 @pytest.fixture
