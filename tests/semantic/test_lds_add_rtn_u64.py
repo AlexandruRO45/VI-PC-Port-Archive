@@ -928,6 +928,163 @@ class TestSIMDMultiLaneDivergenceAndExecMasking(unittest.TestCase):
         self.assertEqual(state.lds.read_qword(target_addr), 625)
 
 
+# ============================================================================
+# Section 5: Register Aliasing and In-Place Operand Preservation
+# ============================================================================
+
+class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
+    """Unit tests for operand aliasing: vdst == vaddr, vdst == vdata, partial pair overlap."""
+
+    def test_dst_pair_overlaps_addr_scalar(self) -> None:
+        """vdst pair overlaps with vaddr (e.g. vaddr is v0, vdst is v[0:1])."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        addr = 0x300
+        initial_mem = 0x1111_2222_3333_4444
+        add_val = 0x0000_0000_0000_1000
+
+        state.lds.write_qword(addr, initial_mem)
+        state.set_vgpr(0, addr)       # v0 = address (will be overwritten by low dword of return)
+        state.set_vgpr(1, 0xAAAA)     # v1 = dummy (will be overwritten by high dword of return)
+        state.set_vgpr_qword(2, add_val)  # v[2:3] = add_val
+
+        # ds_add_rtn_u64 v[0:1], v0, v[2:3]
+        instr = DSAddRtnU64Instruction(
+            dst=VGPRPair(0), addr=VGPR(0), data0=VGPRPair(2)
+        )
+        old_val, new_val = interp.step(instr, state)
+
+        self.assertEqual(old_val, initial_mem)
+        self.assertEqual(new_val, initial_mem + add_val)
+        self.assertEqual(state.get_vgpr_qword(0), initial_mem)
+        self.assertEqual(state.lds.read_qword(addr), initial_mem + add_val)
+        self.assertEqual(state.get_vgpr_qword(2), add_val)
+
+    def test_dst_pair_overlaps_data_pair_exact_scalar(self) -> None:
+        """vdst == vdata0: v[0:1] is both data to add and receives returned old value."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        addr = 0x400
+        initial_mem = 0x1000_0000_0000_0000
+        add_val = 0x2000_0000_0000_0000
+
+        state.lds.write_qword(addr, initial_mem)
+        state.set_vgpr(4, addr)
+        state.set_vgpr_qword(0, add_val)  # v[0:1] = add_val
+
+        # ds_add_rtn_u64 v[0:1], v4, v[0:1]
+        instr = DSAddRtnU64Instruction(
+            dst=VGPRPair(0), addr=VGPR(4), data0=VGPRPair(0)
+        )
+        old_val, new_val = interp.step(instr, state)
+
+        self.assertEqual(old_val, initial_mem)
+        self.assertEqual(new_val, initial_mem + add_val)
+        self.assertEqual(state.get_vgpr_qword(0), initial_mem)
+        self.assertEqual(state.get_vgpr(4), addr)
+        self.assertEqual(state.lds.read_qword(addr), initial_mem + add_val)
+
+    def test_dst_pair_partially_overlaps_data_pair_scalar(self) -> None:
+        """Partial overlap: vdst is v[2:3] and vdata0 is v[3:4]."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        addr = 0x500
+        initial_mem = 0x1111_2222_3333_0000
+        v3_val = 0x1234_5678
+        v4_val = 0x0000_0001
+        data_val = combine_u32s_to_u64(v3_val, v4_val)
+
+        state.lds.write_qword(addr, initial_mem)
+        state.set_vgpr(1, addr)
+        state.set_vgpr(2, 0)
+        state.set_vgpr(3, v3_val)
+        state.set_vgpr(4, v4_val)
+
+        # ds_add_rtn_u64 v[2:3], v1, v[3:4]
+        instr = DSAddRtnU64Instruction(
+            dst=VGPRPair(2), addr=VGPR(1), data0=VGPRPair(3)
+        )
+        old_val, new_val = interp.step(instr, state)
+
+        self.assertEqual(old_val, initial_mem)
+        self.assertEqual(new_val, initial_mem + data_val)
+        self.assertEqual(state.get_vgpr_qword(2), initial_mem)
+        self.assertEqual(state.lds.read_qword(addr), initial_mem + data_val)
+        self.assertEqual(state.get_vgpr(4), v4_val)
+
+    def test_addr_inside_data_pair_scalar(self) -> None:
+        """vaddr is v2 and data is v[2:3]. dst is v[0:1]."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        addr = 0x240
+        initial_mem = 0x8888_8888_8888_8888
+        state.lds.write_qword(addr, initial_mem)
+        state.set_vgpr(2, addr)  # v2 = addr (also lo dword of data)
+        state.set_vgpr(3, 0)     # v3 = 0 (hi dword of data)
+        data_val = addr
+
+        # ds_add_rtn_u64 v[0:1], v2, v[2:3]
+        instr = DSAddRtnU64Instruction(
+            dst=VGPRPair(0), addr=VGPR(2), data0=VGPRPair(2)
+        )
+        old_val, new_val = interp.step(instr, state)
+
+        self.assertEqual(old_val, initial_mem)
+        self.assertEqual(new_val, initial_mem + data_val)
+        self.assertEqual(state.get_vgpr_qword(0), initial_mem)
+        self.assertEqual(state.get_vgpr(2), addr)
+        self.assertEqual(state.get_vgpr(3), 0)
+
+    def test_simd_dst_overlaps_addr_across_lanes(self) -> None:
+        """SIMD wavefront where each lane has vdst pair v[0:1] overlapping with vaddr v0."""
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        interp = SIMDInterpreter()
+
+        for lane in range(32):
+            addr = 0x600 + lane * 8
+            state.lds.write_qword(addr, 0x1000 + lane)
+            state.set_vgpr(lane, 0, addr)       # v0 = addr (also dst lo)
+            state.set_vgpr(lane, 1, 0)          # v1 = dst hi
+            state.set_vgpr_qword(lane, 2, 10)   # v[2:3] = data
+
+        instr = DSAddRtnU64Instruction(
+            dst=VGPRPair(0), addr=VGPR(0), data0=VGPRPair(2)
+        )
+        results = interp.step(instr, state)
+
+        for lane in range(32):
+            addr = 0x600 + lane * 8
+            expected_old = 0x1000 + lane
+            expected_new = expected_old + 10
+            self.assertEqual(results[lane], (expected_old, expected_new))
+            self.assertEqual(state.get_vgpr_qword(lane, 0), expected_old)
+            self.assertEqual(state.lds.read_qword(addr), expected_new)
+
+    def test_inplace_operand_preservation_when_not_dst(self) -> None:
+        """All source registers not aliased with vdst remain completely unchanged."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        state.set_vgpr(10, 0x400)
+        state.set_vgpr_qword(12, 0x1111_2222_3333_4444)
+        state.set_vgpr_qword(0, 0)
+        state.lds.write_qword(0x400, 0x5555_6666_7777_8888)
+
+        instr = DSAddRtnU64Instruction(
+            dst=VGPRPair(0), addr=VGPR(10), data0=VGPRPair(12)
+        )
+        interp.step(instr, state)
+
+        self.assertEqual(state.get_vgpr(10), 0x400)
+        self.assertEqual(state.get_vgpr_qword(12), 0x1111_2222_3333_4444)
+        self.assertEqual(state.get_vgpr_qword(0), 0x5555_6666_7777_8888)
+
+
+
 
 
 
