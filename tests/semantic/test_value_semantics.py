@@ -692,6 +692,44 @@ class LaneMaskConstants(unittest.TestCase):
         self.assertEqual(w32, self.WANT["cs_w32_mask_imm"][1])
         self.assertEqual(w64, self.WANT["cs_w64_mask_imm"][1])
 
+class TbufferD16StoreWords(unittest.TestCase):
+    """runtime/test/shaders/cs_w32_tbuf_d16_store.asm: tbuffer_store_format_d16_x and d16_xyz. One lane stores into
+    regions of a heap of 0xee bytes and reads eight dwords back; the words are the GPU check's (check.py CS_DUMPS),
+    derived by hand in the .asm header (d16 data are f16 values, a store writes its format's whole element)."""
+
+    WANT = [0xEEEE3C00, 0xEEEEEEFF, 0x40003C00, 0x00004200, 0x00FF00FF, 0x40003C00, 0xEEEEEEEE, 0x00003C00]
+
+    def test_words(self):
+        sys.path.insert(0, os.path.join(support.ROOT, "runtime", "test", "shaders"))
+        from compute_fixture import compute_header
+        name = "cs_w32_tbuf_d16_store"
+        header = compute_header(os.path.join(support.ROOT, "runtime", "test", "shaders", name + ".asm"))
+        spv = support.translate_fixture(name, fssm=bytes(header))
+        memory = {a: 0xEEEEEEEE for a in range(0, 0x100, 4)}
+        si.run_workgroup(spv, 1, 32,
+                         inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+                         push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28, memory=memory)
+        self.assertEqual(set(memory), set(range(0, 0x100, 4)), "nothing written outside the heap")
+        self.assertEqual([f"{memory[4 * i]:#010x}" for i in range(8)], [f"{w:#010x}" for w in self.WANT])
+
+    def test_words_follow_from_the_definitions(self):
+        # Plain-Python reference: the bytes each store writes, from the rules in the header, over a 0xee heap.
+        heap = bytearray(b"\xee" * 0x100)
+
+        def store(addr, elem):
+            heap[addr:addr + len(elem)] = bytes(elem)
+        h16 = lambda v: list(struct.pack("<e", v))
+        unorm8 = lambda v: round(min(max(v, 0.0), 1.0) * 255)
+        store(0x40, h16(1.0))                                           # d16_x, 16_FLOAT
+        store(0x44, [unorm8(1.0)])                                      # d16_x, 8_UNORM
+        store(0x48, h16(1.0) + h16(2.0) + h16(3.0) + h16(0.0))          # d16_xyz, 16_16_16_16_FLOAT, w = 0
+        store(0x50, [unorm8(1.0), unorm8(0.0), unorm8(1.0), 0])         # d16_xyz, 8_8_8_8_UNORM, w = 0
+        store(0x58, h16(1.0) + h16(2.0))                                # d16_xyz, 16_16_FLOAT: z dropped
+        store(0x60, h16(1.0) + h16(0.0))                                # d16_x, 16_16_FLOAT: y = 0
+        dw = lambda a: struct.unpack_from("<I", heap, a)[0]
+        got = [dw(0x40), dw(0x44), dw(0x48), dw(0x4C), dw(0x50), dw(0x58), dw(0x5C), dw(0x60)]
+        self.assertEqual(got, self.WANT)
+
 
 if __name__ == "__main__":
     unittest.main()
