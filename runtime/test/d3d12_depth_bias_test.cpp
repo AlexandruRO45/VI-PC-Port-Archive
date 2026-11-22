@@ -35,7 +35,7 @@ using XboxHeapHandleFn = std::uint64_t(WINAPI*)(void* heap);  // heap slot 9: ha
 
 namespace {
 
-constexpr UINT size = 16;
+constexpr UINT kSide = 16;
 int g_failures = 0;
 
 std::uint32_t f2u(float f) {
@@ -141,7 +141,7 @@ int main() {
             }
             D3D12_RESOURCE_DESC desc{};
             desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-            desc.Width = desc.Height = size;
+            desc.Width = desc.Height = kSide;
             desc.DepthOrArraySize = 1;
             desc.MipLevels = 1;
             desc.Format = f.format;
@@ -199,8 +199,8 @@ int main() {
                 const std::uint32_t constants[2] = {f2u(z), 0};
                 list->SetGraphicsRoot32BitConstants(0, 2, constants, 0);
                 list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                const D3D12_VIEWPORT viewport{0, 0, float(size), float(size), 0, 1};
-                const D3D12_RECT scissor{0, 0, LONG(size), LONG(size)};
+                const D3D12_VIEWPORT viewport{0, 0, float(kSide), float(kSide), 0, 1};
+                const D3D12_RECT scissor{0, 0, LONG(kSide), LONG(kSide)};
                 list->RSSetViewports(1, &viewport);
                 list->RSSetScissorRects(1, &scissor);
                 list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
@@ -227,13 +227,13 @@ int main() {
                 EXPECT(SUCCEEDED(fence->SetEventOnCompletion(fence_value, nullptr)));
                 std::uint8_t* mapped = nullptr;
                 EXPECT(SUCCEEDED(readback->Map(0, nullptr, reinterpret_cast<void**>(&mapped))));
-                std::vector<std::uint32_t> texels(size * size);
-                for (UINT y = 0; y < size; ++y)
-                    for (UINT x = 0; x < size; ++x) {
+                std::vector<std::uint32_t> texels(kSide * kSide);
+                for (UINT y = 0; y < kSide; ++y)
+                    for (UINT x = 0; x < kSide; ++x) {
                         std::uint32_t word = 0;
                         std::memcpy(&word, mapped + foot.Offset + y * foot.Footprint.RowPitch + x * f.texel_bytes,
                                     f.texel_bytes);
-                        texels[y * size + x] = f.bits == 24 ? word & 0xffffffu : word;
+                        texels[y * kSide + x] = f.bits == 24 ? word & 0xffffffu : word;
                     }
                 readback->Unmap(0, nullptr);
 
@@ -261,7 +261,7 @@ int main() {
                 } else if (!d.depth_bias_exact) {
                     std::printf("INFO %s (no depthBiasExact on this device: not checked)\n", line);
                 } else {
-                    std::printf("FAIL %s, %d of %u texels\n", line, wrong, size * size);
+                    std::printf("FAIL %s, %d of %u texels\n", line, wrong, kSide * kSide);
                     ++g_failures;
                 }
             }
