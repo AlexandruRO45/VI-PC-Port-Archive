@@ -1413,5 +1413,179 @@ class TestValuCvtPknormU16F16IEEE754Boundaries(unittest.TestCase):
         self.assertEqual(f16_to_unorm16(step_neg), 0x0000)
 
 
+# ==============================================================================
+# Commit 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestValuCvtPknormU16F16NegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for syntax rejection, invalid operand handling, and mutation sensitivity."""
+
+    def test_syntax_rejection_sgpr_destination(self) -> None:
+        """Verify VALU instructions reject scalar registers (SGPR) as destination."""
+        s0 = Reg(0, RegType.SGPR)
+        v1 = Reg(1, RegType.VGPR)
+        with self.assertRaises(TypeError):
+            VCvtPknormU16F16Instruction(
+                dst=s0,
+                src0=VOP3Operand(v1),
+                src1=VOP3Operand(v1),
+            )
+
+    def test_syntax_rejection_invalid_operand_types(self) -> None:
+        """Verify instruction construction rejects non-VOP3Operand objects."""
+        v0 = Reg(0, RegType.VGPR)
+        v1 = Reg(1, RegType.VGPR)
+
+        with self.assertRaises(TypeError):
+            VCvtPknormU16F16Instruction(dst=v0, src0=v1, src1=VOP3Operand(v1))  # type: ignore
+        with self.assertRaises(TypeError):
+            VCvtPknormU16F16Instruction(dst=v0, src0=VOP3Operand(v1), src1=456)  # type: ignore
+        with self.assertRaises(TypeError):
+            VOP3Operand(source="invalid_reg")  # type: ignore
+
+    def test_syntax_rejection_register_bounds(self) -> None:
+        """Verify registers reject out-of-bound indices."""
+        with self.assertRaises(ValueError):
+            Reg(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Literal32(-1)
+        with self.assertRaises(ValueError):
+            Literal32(0x1_0000_0000)
+
+    def test_syntax_rejection_op_sel_bounds(self) -> None:
+        """Verify op_sel values must be 0 or 1."""
+        v0 = Reg(0, RegType.VGPR)
+        v1 = Reg(1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            VCvtPknormU16F16Instruction(v0, VOP3Operand(v1), VOP3Operand(v1), op_sel=(3, 0))
+
+    def test_simd_invalid_configuration(self) -> None:
+        """Verify SIMD machine state rejects non-standard wave sizes."""
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_mutation_incorrect_scale_factor(self) -> None:
+        """Mutation detection: verify test suite detects incorrect 32767.0 scale factor."""
+        def mutated_f16_to_unorm16(bits16: int) -> int:
+            if is_nan_f16(bits16):
+                return 0
+            val = bits_to_f16(bits16)
+            clamped = max(0.0, min(1.0, val))
+            # MUTATION: using 32767.0 instead of 65535.0
+            return int(round(clamped * 32767.0)) & MASK16
+
+        correct_val = f16_to_unorm16(POS_ONE_F16)
+        mutated_val = mutated_f16_to_unorm16(POS_ONE_F16)
+
+        self.assertEqual(correct_val, 0xFFFF)
+        self.assertEqual(mutated_val, 0x7FFF)
+        self.assertNotEqual(correct_val, mutated_val)
+
+    def test_mutation_missing_lower_clamp(self) -> None:
+        """Mutation detection: verify test suite detects omitted lower bound clamp."""
+        def mutated_f16_to_unorm16_nolow(bits16: int) -> int:
+            if is_nan_f16(bits16):
+                return 0
+            val = bits_to_f16(bits16)
+            # MUTATION: missing lower clamp to 0.0
+            clamped = min(1.0, val)
+            return int(round(clamped * 65535.0)) & MASK16
+
+        correct_val = f16_to_unorm16(NEG_ONE_F16)
+        mutated_val = mutated_f16_to_unorm16_nolow(NEG_ONE_F16)
+
+        self.assertEqual(correct_val, 0x0000)
+        self.assertNotEqual(correct_val, mutated_val)
+
+    def test_mutation_missing_upper_clamp(self) -> None:
+        """Mutation detection: verify test suite detects omitted upper bound clamp."""
+        def mutated_f16_to_unorm16_nohigh(bits16: int) -> int:
+            if is_nan_f16(bits16):
+                return 0
+            val = bits_to_f16(bits16)
+            # MUTATION: missing upper clamp to 1.0
+            clamped = max(0.0, val)
+            return int(round(clamped * 65535.0)) & MASK16
+
+        correct_val = f16_to_unorm16(POS_TWO_F16)
+        mutated_val = mutated_f16_to_unorm16_nohigh(POS_TWO_F16)
+
+        self.assertEqual(correct_val, 0xFFFF)
+        self.assertNotEqual(correct_val, mutated_val)
+
+    def test_mutation_truncation_instead_of_round_to_even(self) -> None:
+        """Mutation detection: verify test suite detects truncation (round-toward-zero)."""
+        def mutated_f16_to_unorm16_trunc(bits16: int) -> int:
+            if is_nan_f16(bits16):
+                return 0
+            val = max(0.0, min(1.0, bits_to_f16(bits16)))
+            # MUTATION: truncation
+            return int(val * 65535.0) & MASK16
+
+        # For +0.5: 0.5 * 65535.0 = 32767.5.
+        # roundTiesToEven rounds to 32768 (0x8000). Truncation yields 32767 (0x7FFF).
+        correct_val = f16_to_unorm16(POS_HALF_F16)
+        mutated_val = mutated_f16_to_unorm16_trunc(POS_HALF_F16)
+
+        self.assertEqual(correct_val, 0x8000)
+        self.assertEqual(mutated_val, 0x7FFF)
+        self.assertNotEqual(correct_val, mutated_val)
+
+    def test_mutation_inverted_channel_packing(self) -> None:
+        """Mutation detection: verify test suite detects swapped destination channels."""
+        def mutated_pack(s0: int, s1: int) -> int:
+            u0 = f16_to_unorm16(s0)
+            u1 = f16_to_unorm16(s1)
+            # MUTATION: inverted channel placement (u0 in high 16, u1 in low 16)
+            return ((u0 & MASK16) << 16) | (u1 & MASK16)
+
+        correct_packed = oracle_v_cvt_pknorm_u16_f16(POS_ONE_F16, POS_ZERO_F16)
+        mutated_packed = mutated_pack(POS_ONE_F16, POS_ZERO_F16)
+
+        self.assertEqual(correct_packed, 0x0000FFFF)
+        self.assertEqual(mutated_packed, 0xFFFF0000)
+        self.assertNotEqual(correct_packed, mutated_packed)
+
+    def test_mutation_nan_leak(self) -> None:
+        """Mutation detection: verify test suite detects failure to zero NaNs."""
+        def mutated_f16_to_unorm16_nan_leak(bits16: int) -> int:
+            # MUTATION: NaNs convert to 0xFFFF instead of 0
+            if is_nan_f16(bits16):
+                return 0xFFFF
+            return f16_to_unorm16(bits16)
+
+        correct_val = f16_to_unorm16(CANONICAL_QNAN_F16)
+        mutated_val = mutated_f16_to_unorm16_nan_leak(CANONICAL_QNAN_F16)
+
+        self.assertEqual(correct_val, 0x0000)
+        self.assertEqual(mutated_val, 0xFFFF)
+        self.assertNotEqual(correct_val, mutated_val)
+
+    def test_mutation_exec_mask_bypass(self) -> None:
+        """Mutation detection: verify test suite detects inactive lane write violation."""
+        state = SIMDState(num_lanes=32, exec_mask=0x00000001)  # Only lane 0 active
+        sentinel = 0x55555555
+        for lane in range(32):
+            state.set_vgpr(lane, 0, sentinel)
+
+        def mutated_step(instr: VCvtPknormU16F16Instruction, st: SIMDState) -> None:
+            for lane in range(st.num_lanes):
+                # Bug: ignoring st.exec_mask
+                st.set_vgpr(lane, instr.dst.index, 0xFFFFFFFF)
+
+        instr = VCvtPknormU16F16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Literal32(POS_ONE_F16)),
+            src1=VOP3Operand(Literal32(POS_ONE_F16)),
+        )
+
+        mutated_step(instr, state)
+        self.assertNotEqual(state.get_vgpr(1, 0), sentinel)
+
+
 if __name__ == "__main__":
     unittest.main()
