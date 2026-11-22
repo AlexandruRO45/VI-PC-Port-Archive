@@ -39,9 +39,9 @@ Sliding Window Byte Layout in S0:
   Note: S0 byte 7 (bits [63:56]) is not consumed by the 4-window quad-SAD, but S0 is aligned to a 64-bit register pair.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Tuple, Union
+from typing import List, Sequence, Tuple, Union
 import unittest
 
 MASK8: int = 0xFF
@@ -274,8 +274,8 @@ class Operand:
         return cls(RegType.SGPR, index=index, count=count)
 
     @classmethod
-    def literal(cls, value: int) -> Operand:
-        return cls(RegType.LITERAL, literal_value=u64(value))
+    def literal(cls, value: int, count: int = 1) -> Operand:
+        return cls(RegType.LITERAL, count=count, literal_value=u64(value))
 
     def disassemble(self) -> str:
         if self.reg_type == RegType.VGPR:
@@ -369,6 +369,160 @@ class TestValuMqsadPkU16U8SymbolicAST(unittest.TestCase):
             Operand.sgpr(105, count=2)  # 105 + 2 = 107 > 106
         with self.assertRaises(ValueError):
             Operand.vgpr(-1)
+
+
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarRegisterState:
+    """Architectural register state for a single thread/scalar core."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+
+    def read_operand_32(self, op: Operand) -> int:
+        if op.reg_type == RegType.VGPR:
+            return self.vgprs[op.index] & MASK32
+        if op.reg_type == RegType.SGPR:
+            return self.sgprs[op.index] & MASK32
+        assert op.literal_value is not None
+        return op.literal_value & MASK32
+
+    def read_operand_64(self, op: Operand) -> int:
+        if op.reg_type == RegType.VGPR:
+            lo = self.vgprs[op.index] & MASK32
+            hi = self.vgprs[op.index + 1] & MASK32
+            return lo | (hi << 32)
+        if op.reg_type == RegType.SGPR:
+            lo = self.sgprs[op.index] & MASK32
+            hi = self.sgprs[op.index + 1] & MASK32
+            return lo | (hi << 32)
+        assert op.literal_value is not None
+        return op.literal_value & MASK64
+
+    def write_vgpr_64(self, index: int, val64: int) -> None:
+        self.vgprs[index] = val64 & MASK32
+        self.vgprs[index + 1] = (val64 >> 32) & MASK32
+
+
+class ScalarInterpreter:
+    """Deterministic scalar interpreter executing single VALU instructions."""
+
+    def step(self, instr: VMqsadPkU16U8Instruction, state: ScalarRegisterState) -> int:
+        s0 = state.read_operand_64(instr.src0)
+        s1 = state.read_operand_32(instr.src1)
+        s2 = state.read_operand_64(instr.src2)
+        res = ref_mqsad_pk_u16_u8_u64(s0, s1, s2)
+        state.write_vgpr_64(instr.dst.index, res)
+        return res
+
+
+class TestValuMqsadPkU16U8ScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction execution."""
+
+    def setUp(self) -> None:
+        self.state = ScalarRegisterState()
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_execution_from_vgprs(self) -> None:
+        # Load src0 (64-bit) into v[2:3]: bytes 1..8
+        s0_val = sum((i + 1) << (8 * i) for i in range(8))
+        self.state.write_vgpr_64(2, s0_val)
+
+        # Load src1 (32-bit query) into v4: [2, 3, 4, 5]
+        s1_val = 2 | (3 << 8) | (4 << 16) | (5 << 24)
+        self.state.vgprs[4] = s1_val
+
+        # Load src2 (64-bit accumulator) into v[6:7]: all zero
+        self.state.write_vgpr_64(6, 0)
+
+        instr = VMqsadPkU16U8Instruction(
+            dst=Operand.vgpr(0, count=2),
+            src0=Operand.vgpr(2, count=2),
+            src1=Operand.vgpr(4, count=1),
+            src2=Operand.vgpr(6, count=2),
+        )
+
+        res = self.interp.step(instr, self.state)
+        # S0 windows: win0=4, win1=0, win2=4, win3=8
+        expected = pack_u16_to_u64(4, 0, 4, 8)
+        self.assertEqual(res, expected)
+        self.assertEqual(self.state.read_operand_64(Operand.vgpr(0, count=2)), expected)
+
+    def test_scalar_execution_with_sgpr_and_literal(self) -> None:
+        # src0 in v[4:5]
+        s0_val = 0x0102030405060708
+        self.state.write_vgpr_64(4, s0_val)
+
+        # src1 query in s10 (SGPR)
+        self.state.sgprs[10] = 0x01020304
+
+        # src2 accumulator as literal 0x0010002000300040
+        acc_lit = pack_u16_to_u64(0x40, 0x30, 0x20, 0x10)
+
+        instr = VMqsadPkU16U8Instruction(
+            dst=Operand.vgpr(0, count=2),
+            src0=Operand.vgpr(4, count=2),
+            src1=Operand.sgpr(10, count=1),
+            src2=Operand.literal(acc_lit, count=2),
+        )
+
+        res = self.interp.step(instr, self.state)
+        expected = ref_mqsad_pk_u16_u8_u64(s0_val, 0x01020304, acc_lit)
+        self.assertEqual(res, expected)
+
+    def test_multi_step_chained_accumulation(self) -> None:
+        """Sequential chained accumulation into the same destination register pair."""
+        # Initial accumulation: v[0:1] = mqsad(v[2:3], s4, 0)
+        s0_1 = 0x11111111_22222222
+        self.state.write_vgpr_64(2, s0_1)
+        self.state.sgprs[4] = 0x11111111
+        self.state.write_vgpr_64(6, 0)
+
+        instr1 = VMqsadPkU16U8Instruction(
+            dst=Operand.vgpr(0, count=2),
+            src0=Operand.vgpr(2, count=2),
+            src1=Operand.sgpr(4, count=1),
+            src2=Operand.vgpr(6, count=2),
+        )
+        res1 = self.interp.step(instr1, self.state)
+
+        # Second step: feed v[0:1] as accumulator src2
+        s0_2 = 0x33333333_44444444
+        self.state.write_vgpr_64(8, s0_2)
+        instr2 = VMqsadPkU16U8Instruction(
+            dst=Operand.vgpr(0, count=2),
+            src0=Operand.vgpr(8, count=2),
+            src1=Operand.sgpr(4, count=1),
+            src2=Operand.vgpr(0, count=2),
+        )
+        res2 = self.interp.step(instr2, self.state)
+
+        expected2 = ref_mqsad_pk_u16_u8_u64(s0_2, 0x11111111, res1)
+        self.assertEqual(res2, expected2)
+        self.assertEqual(self.state.read_operand_64(Operand.vgpr(0, count=2)), expected2)
+
+    def test_scalar_interpreter_determinism(self) -> None:
+        """Executing identical instruction sequences from identical state yields deterministic results."""
+        state_a = ScalarRegisterState()
+        state_b = ScalarRegisterState()
+        val = 0xAA55AA55_55AA55AA
+        state_a.write_vgpr_64(2, val)
+        state_b.write_vgpr_64(2, val)
+        state_a.sgprs[0] = 0x12345678
+        state_b.sgprs[0] = 0x12345678
+
+        instr = VMqsadPkU16U8Instruction(
+            dst=Operand.vgpr(0, count=2),
+            src0=Operand.vgpr(2, count=2),
+            src1=Operand.sgpr(0, count=1),
+            src2=Operand.literal(0x1000200030004000, count=2),
+        )
+        res_a = self.interp.step(instr, state_a)
+        res_b = self.interp.step(instr, state_b)
+        self.assertEqual(res_a, res_b)
+        self.assertEqual(state_a.vgprs, state_b.vgprs)
 
 
 if __name__ == "__main__":
