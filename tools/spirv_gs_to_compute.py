@@ -165,7 +165,7 @@ def rewrite(text):
     out_vars = {v: f"%gsc_out{i}" for i, v in enumerate(outs)}
     types += [f"{nv} = OpVariable %gsc_ptr_pv_v4 Private" for nv in out_vars.values()]
     in_slot = {v: i for i, v in enumerate(ins)}
-    lowered_input_pointers = set()
+    lowered_input_pointers = {}
     gone = set(ins) | set(outs) | {v for v, b in builtins.items() if b in ("PrimitiveId", "InvocationId")}
     new_globals = ["%gsc_gid", "%gsc_in", "%gsc_rec", "%gsc_meta", "%gsc_n"] + list(out_vars.values())
 
@@ -177,6 +177,7 @@ def rewrite(text):
         return f"%gsc_t{count}"
 
     out = []
+    id_metadata = re.compile(r"\s*Op(?:Decorate|MemberDecorate|Name) (%\w+)\b")
     entry_label = None
     state = "header"        # header -> body (in main, entry block) -> after the entry check
     for ln in text.splitlines():
@@ -191,7 +192,7 @@ def rewrite(text):
             continue
         if re.match(rf"OpExecutionMode {re.escape(main)} ", s):
             continue
-        m = re.match(r"Op(?:Decorate|MemberDecorate|Name) (%\w+)\b", s)
+        m = id_metadata.match(s)
         if m and m.group(1) in gone:
             continue
         m = re.match(r"(%\w+) = (Op\w+)", s)
@@ -241,9 +242,13 @@ def rewrite(text):
         m = re.match(r"(%\w+) = (Op(?:InBounds)?AccessChain) (%\w+) (%\w+)( .*)?$", s)
         if m:
             result, chain, result_type, base, indices = m.groups()
-            if (base in in_slot and indices is not None) or base in lowered_input_pointers:
-                lowered_input_pointers.add(result)
+            if base in in_slot and indices is None:
+                # An alias of the whole per-vertex array still needs a vertex index before it has a buffer address.
+                in_slot[result] = in_slot[base]
+                continue
+            if base in in_slot or base in lowered_input_pointers:
                 ptr = "%gsc_ptr_sb_f" if result_type in float_ptrs else "%gsc_ptr_sb_v4"
+                lowered_input_pointers[result] = ptr
                 if base in in_slot:
                     idx = indices.split()
                     vtx = idx[0]
@@ -261,6 +266,13 @@ def rewrite(text):
                 ptr = "%gsc_ptr_pv_f" if result_type in float_ptrs else "%gsc_ptr_pv_v4"
                 out.append(f"{result} = OpAccessChain {ptr} {out_vars[base]}{indices}")
                 continue
+        m = re.match(r"(%\w+) = OpCopyObject %\w+ (%\w+)$", s)
+        if m and m.group(2) in lowered_input_pointers:
+            result, source = m.groups()
+            ptr = lowered_input_pointers[source]
+            lowered_input_pointers[result] = ptr
+            out.append(f"{result} = OpCopyObject {ptr} {source}")
+            continue
         m = re.match(r"(%\w+) = OpLoad (%\w+) (%\w+)(?:\s+.*)?$", s)
         if m and builtins.get(m.group(3)) in ("PrimitiveId", "InvocationId"):
             val = "%gsc_prim" if builtins[m.group(3)] == "PrimitiveId" else k(0)
@@ -301,6 +313,9 @@ def rewrite(text):
         if s in ("OpKill", "OpTerminateInvocation", "OpReturnValue"):
             raise Unsupported(s)
         out.append(s)
+    if folded_arrays := in_slot.keys() - gone:
+        # Debug names and decorations precede the function, where the aliases are discovered.
+        out = [ln for ln in out if not ((m := id_metadata.match(ln)) and m.group(1) in folded_arrays)]
     public = {key: lay[key] for key in ("verts_in", "max_verts", "topology", "inputs", "outputs")}
     public["local_size"] = LOCAL_SIZE
     return "\n".join(out) + "\n", public

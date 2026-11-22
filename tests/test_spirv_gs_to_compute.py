@@ -176,23 +176,120 @@ def test_lowers_in_bounds_geometry_interface_access_chains(
             "%v = OpCompositeConstruct %v4float %value %value %value %value",
         )
 
-    def validate(name: str, assembly: str) -> None:
-        module = tmp_path / f"{name}.spv"
-        subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-", "-o", str(module)],
-                       input=assembly, text=True, check=True)
-        result = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(module)],
-                                capture_output=True, text=True)
-        assert result.returncode == 0, result.stderr
-
-    validate("geometry", geometry)
+    validate_vulkan12(tmp_path / "geometry.spv", geometry)
     lowered, _ = gsc.rewrite(geometry)
     assert "%p = OpAccessChain %gsc_ptr_sb_v4 %gsc_in " in lowered
     assert "%out_x = OpAccessChain %gsc_ptr_pv_f %gsc_out0 %u0" in lowered
-    validate("compute", lowered)
+    validate_vulkan12(tmp_path / "compute.spv", lowered)
     if component_chain:
         assert f"%in_x = {component_chain} %gsc_ptr_sb_f {component_base} %u1" in lowered
         if use_alias:
             assert f"%alias = {component_chain} %gsc_ptr_sb_v4 %p" in lowered
+
+
+def validate_vulkan12(module: Path, assembly: str) -> None:
+    subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-", "-o", str(module)],
+                   input=assembly, text=True, check=True)
+    result = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(module)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+def geometry_input_alias(array_chain: str) -> str:
+    return PHI_GS.replace(
+        '"main" %in_pos %out_pos', '"main" %in_pos %in_color %out_pos',
+    ).replace(
+        "OpDecorate %in_pos BuiltIn Position",
+        'OpName %array_alias "array_alias"\nOpName %nested_alias "nested_alias"\n'
+        'OpName %p "vertex_ptr"\nOpDecorate %in_color Location 0\nOpDecorate %in_pos BuiltIn Position',
+    ).replace(
+        "%in_pos = OpVariable %ptr_in_arr Input",
+        "%in_pos = OpVariable %ptr_in_arr Input\n%in_color = OpVariable %ptr_in_arr Input",
+    ).replace(
+        "%p = OpAccessChain %ptr_in_v4 %in_pos %x",
+        f"%array_alias = {array_chain} %ptr_in_arr %in_color\n"
+        f"%nested_alias = {array_chain} %ptr_in_arr %array_alias\n"
+        f"%p = {array_chain} %ptr_in_v4 %nested_alias %u1",
+    )
+
+
+@pytest.mark.skipif(not HAVE_SPIRV, reason="needs spirv-as and spirv-val on PATH")
+@pytest.mark.parametrize("array_chain", ["OpAccessChain", "OpInBoundsAccessChain"])
+def test_lowers_alias_of_geometry_input_array(tmp_path, array_chain):
+    geometry = geometry_input_alias(array_chain)
+    validate_vulkan12(tmp_path / "geometry.spv", geometry)
+    lowered, layout = gsc.rewrite(geometry)
+    validate_vulkan12(tmp_path / "compute.spv", lowered)
+
+    assert "%array_alias" not in lowered and "%nested_alias" not in lowered
+    assert 'OpName %p "vertex_ptr"' in lowered
+    assert layout["inputs"] == ["position", "location 0"]
+    defs, _ = gsc.parse(lowered)
+    op, (ptr, base, member, offset) = defs["%p"]
+    assert (op, ptr, base, member) == ("OpAccessChain", "%gsc_ptr_sb_v4", "%gsc_in", "%gsc_k2")
+    assert defs[ptr] == ("OpTypePointer", ["StorageBuffer", "%v4float"])
+    op, (result_type, vertex_stride, slot) = defs[offset]
+    assert (op, result_type, slot) == ("OpIAdd", "%uint", "%gsc_k1")
+    op, (result_type, vertex, stride) = defs[vertex_stride]
+    assert (op, result_type, stride) == ("OpIMul", "%uint", "%gsc_k2")
+    assert defs[vertex] == ("OpIAdd", ["%uint", "%gsc_inbase", "%u1"])
+    assert defs["%v"] == ("OpLoad", ["%v4float", "%p"])
+
+
+@pytest.mark.skipif(not HAVE_SPIRV, reason="needs spirv-as and spirv-val on PATH")
+def test_rejects_whole_geometry_input_array_load_through_alias(tmp_path):
+    geometry = geometry_input_alias("OpAccessChain").replace(
+        "%v = OpLoad %v4float %p",
+        "%array = OpLoad %arr %nested_alias\n%v = OpCompositeExtract %v4float %array 1",
+    )
+    validate_vulkan12(tmp_path / "geometry.spv", geometry)
+    with pytest.raises(gsc.Unsupported, match=r"unhandled use of %nested_alias: .*OpLoad"):
+        gsc.rewrite(geometry)
+
+
+@pytest.mark.skipif(not HAVE_SPIRV, reason="needs spirv-as and spirv-val on PATH")
+@pytest.mark.parametrize("component_chain", ["OpAccessChain", "OpInBoundsAccessChain"])
+def test_lowers_copies_of_geometry_input_element_pointers(tmp_path, component_chain):
+    geometry = PHI_GS.replace(
+        "OpDecorate %in_pos BuiltIn Position",
+        'OpName %copied_vertex "vertex_copy"\nOpName %local_copy "local_copy"\n'
+        "OpDecorate %in_pos BuiltIn Position",
+    ).replace(
+        "%in_pos = OpVariable %ptr_in_arr Input",
+        "%ptr_in_float = OpTypePointer Input %float\n"
+        "%ptr_fn_v4 = OpTypePointer Function %v4float\n%ptr_fn_float = OpTypePointer Function %float\n"
+        "%in_pos = OpVariable %ptr_in_arr Input",
+    ).replace(
+        "%entry = OpLabel", "%entry = OpLabel\n%local = OpVariable %ptr_fn_v4 Function",
+    ).replace(
+        "%v = OpLoad %v4float %p",
+        "%copied_vertex = OpCopyObject %ptr_in_v4 %p\n"
+        f"%component = {component_chain} %ptr_in_float %copied_vertex %u1\n"
+        "%copied_component = OpCopyObject %ptr_in_float %component\n"
+        "%value = OpLoad %float %copied_component\n"
+        "%local_copy = OpCopyObject %ptr_fn_v4 %local\n"
+        f"%local_component = {component_chain} %ptr_fn_float %local_copy %u1\n"
+        "OpStore %local_component %value\n"
+        "%local_value = OpLoad %float %local_component\n"
+        "%v = OpCompositeConstruct %v4float %value %local_value %value %value",
+    )
+    validate_vulkan12(tmp_path / "geometry.spv", geometry)
+    lowered, _ = gsc.rewrite(geometry)
+    validate_vulkan12(tmp_path / "compute.spv", lowered)
+
+    defs, _ = gsc.parse(lowered)
+    assert defs["%p"][1][:3] == ["%gsc_ptr_sb_v4", "%gsc_in", "%gsc_k2"]
+    assert defs["%gsc_ptr_sb_v4"] == ("OpTypePointer", ["StorageBuffer", "%v4float"])
+    assert defs["%gsc_ptr_sb_f"] == ("OpTypePointer", ["StorageBuffer", "%float"])
+    assert defs["%copied_vertex"] == ("OpCopyObject", ["%gsc_ptr_sb_v4", "%p"])
+    assert defs["%component"] == (component_chain, ["%gsc_ptr_sb_f", "%copied_vertex", "%u1"])
+    assert defs["%copied_component"] == ("OpCopyObject", ["%gsc_ptr_sb_f", "%component"])
+    assert defs["%value"] == ("OpLoad", ["%float", "%copied_component"])
+    assert 'OpName %copied_vertex "vertex_copy"' in lowered
+    assert 'OpName %local_copy "local_copy"' in lowered
+    original_defs, _ = gsc.parse(geometry)
+    for local in ("%ptr_fn_v4", "%ptr_fn_float", "%local", "%local_copy", "%local_component"):
+        assert defs[local] == original_defs[local]
 
 
 @pytest.fixture
