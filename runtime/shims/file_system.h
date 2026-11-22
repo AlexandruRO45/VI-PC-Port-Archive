@@ -3,13 +3,16 @@
 // A title's file API sees the console's drives: "GAME:\\data\\shaders\\x.sps" is a file inside the installed game
 // folder. ivall/xcl (GPL-2.0-only; facts only here) documents for Xbox Series GDK titles that GAME: names the game
 // folder and that writes go to a writable overlay rather than to the package, which is read-only. gta6rt does the
-// same:
+// same, and also accepts the drive forms other Xbox layers use:
 //   GAME:<rest>    a read opens the overlay copy when one exists, else <game dir>\<rest>;
-//                  an open that can write opens <overlay dir>\<rest>, copying the package file there first when the
-//                  disposition keeps its contents, so the package is never modified;
+//   G:<rest>       the same package drive: reads and listings behave like GAME:, writes go to the overlay;
+//   T:<rest>       the writable scratch drive: <overlay dir>\<rest>, with no package fallback;
+//                  on GAME:/G:, an open that can write opens <overlay dir>\<rest>, copying the package file there
+//                  first when the disposition keeps its contents, so the package is never modified;
 //                  a delete leaves a marker in the overlay instead of removing a package file.
-//   anything else  is a host path and is passed through unchanged.
-// A GAME: path that climbs above the root with ".." or names another drive is refused with ERROR_INVALID_NAME.
+//   anything else  is a host path and is passed through unchanged. Only "G:\", "T:\" and "GAME:" are console drives:
+//                  "G:file" (drive-relative), UNC paths and other drive letters stay host paths.
+// A console path that climbs above its root with ".." or names another drive is refused with ERROR_INVALID_NAME.
 //
 // The shims that use this live in file_system.cpp: CreateFile*, FindFirstFile*/FindNextFile*/FindClose,
 // GetFileAttributes*/GetFileAttributesEx*, DeleteFile*, CreateDirectory*/RemoveDirectory*, MoveFile*/MoveFileEx*,

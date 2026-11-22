@@ -32,8 +32,9 @@ other machine.
 gta6rt --dry-run <image.exe|image.dll> [--game-dir <package>] [--overlay <dir>]
 ```
 
-`--overlay` is where a mapped title's writes go (default `<game-dir>\overlay`); `GAME:` paths read from
-`--game-dir`. See [Console paths and the write overlay](../docs/runtime_imports.md#console-paths-and-the-write-overlay).
+`--overlay` is where a mapped title's writes go (default `<game-dir>\overlay`); `GAME:` and `G:\` paths read from
+`--game-dir`, and `T:\` is the overlay. See
+[Console paths and the write overlay](../docs/runtime_imports.md#console-paths-and-the-write-overlay).
 
 The dry run maps the image and the bundled modules it imports, applies base relocations, binds every
 import through the shim registry, a host DLL, or another bundled module, parses exports, installs static
@@ -150,9 +151,9 @@ Current limits, by design:
   virtual-query outputs fill the observed 64-byte structures and return `FALSE`/`0` on a null or bad
   address.
 - The `kernel32.dll` file API — `CreateFileA/W`, `FindFirstFileA/W`/`FindNextFileA/W`/`FindClose`,
-  `GetFileAttributesA/W`, `GetFileAttributesExA/W` and `DeleteFileA/W`: a `GAME:` path maps under `--game-dir`, an
-  open that can write and a delete go to `--overlay DIR` (default `<game-dir>\overlay`), which reads prefer, and a path
-  that climbs above `GAME:` is refused. The package is never modified. See
+  `GetFileAttributesA/W`, `GetFileAttributesExA/W` and `DeleteFileA/W`: `GAME:` and `G:\` map under `--game-dir`,
+  `T:\` maps under `--overlay DIR` (default `<game-dir>\overlay`), an open that can write and a delete go to the
+  overlay, which reads prefer, and a path that climbs above its root is refused. The package is never modified. See
   [docs/runtime_imports.md](../docs/runtime_imports.md#console-paths-and-the-write-overlay).
 - `d3d12_xs.dll` — `D3D12SerializeVersionedRootSignature` and
   `D3D12CreateRootSignatureDeserializer`, with the console root-signature high byte (`0x03000000`)

@@ -14,8 +14,8 @@
 //       command line are <exe name> plus the arguments after "--"; exit/ExitProcess from the game end the run
 //       (shims/process.cpp). gta6rt prints the binding report first and returns the game's exit code.
 //
-// --game-dir is also where a title's GAME: paths read from; anything it writes or deletes goes to the overlay
-// (--overlay, default <game-dir>/overlay) so the package is never modified (shims/file_system.cpp).
+// --game-dir is also where a title's GAME: and G:\ paths read from; anything it writes or deletes goes to the overlay
+// (--overlay, default <game-dir>/overlay), which is also T:\, so the package is never modified (shims/file_system.cpp).
 #include <windows.h>
 
 #include <cstdio>
@@ -81,7 +81,7 @@ int wmain(int argc, wchar_t** argv) {
     // process that has the range reserved from the start (base_reservation.h); that process does not do this again.
     if (!rt::base_reservation::inherited())
         if (const auto range = rt::base_reservation::needed(image)) return rt::base_reservation::relaunch(*range);
-    // GAME: paths read under --game-dir; whatever a title writes lands in the overlay, never in the package.
+    // GAME: and G:\ paths read under --game-dir; T:\ and whatever a title writes use the overlay, never the package.
     if (overlay_dir.empty()) overlay_dir = game_dir / "overlay";
     rt::fs::configure(game_dir, overlay_dir);
     rt::d3d12_trace::set_enabled(trace_d3d12);
@@ -129,7 +129,7 @@ int wmain(int argc, wchar_t** argv) {
             std::fprintf(stderr, "error: %s has no entry point\n", main_module.name.c_str());
             return 1;
         }
-        std::printf("console paths: GAME: -> %ls, writes -> %ls\n", game_dir.c_str(), overlay_dir.c_str());
+        std::printf("console paths: GAME:/G: -> %ls, T:/writes -> %ls\n", game_dir.c_str(), overlay_dir.c_str());
         std::printf("running %s\n", main_module.name.c_str());
         std::fflush(stdout);
         const int code = rt::process::run_entry(main_module.base + main_module.entry_rva);

@@ -6,6 +6,7 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -106,6 +107,16 @@ int count(const std::vector<std::wstring>& names, const wchar_t* name) {
 }
 
 bool contains(const std::vector<std::wstring>& names, const wchar_t* name) { return count(names, name) != 0; }
+
+// A drive letter no volume uses today, other than the two the shim owns (G: and T:).
+wchar_t free_drive_letter() {
+    const DWORD mask = GetLogicalDrives();
+    for (wchar_t c = L'D'; c <= L'Y'; ++c) {
+        if (c == L'G' || c == L'T') continue;
+        if ((mask & (1u << (c - L'A'))) == 0) return c;
+    }
+    return 0;
+}
 
 }  // namespace
 
@@ -316,6 +327,136 @@ int main() {
     check(mkdir_w && mkdir_a && mkdir_ex_w && rmdir_w && rmdir_a && move_w && move_ex_w && move_a && copy_w &&
               copy_a && copy_ex_w && copy2 && setattr_w && setattr_a,
           "the folder, move, copy and attribute calls resolve through the registry");
+
+    // The console's other drives: G:\ is the package (the same volume as GAME:), T:\ is the writable scratch drive,
+    // which is the overlay. Neither may reach a host drive that happens to have the same letter.
+    {
+        write_path(package / "drive" / "pkg.txt", "package-drive");
+        write_path(package / "drive_only.txt", "package-only");
+
+        HANDLE h = create_w(L"G:\\drive\\pkg.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE && read_handle(h) == "package-drive",
+              "CreateFileW opens G:\\drive\\pkg.txt from the package");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        h = create_w(L"g:/drive/pkg.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE, "the G: drive is case-insensitive and accepts forward slashes");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        const DWORD g_root = attributes_w(L"G:\\");
+        check(g_root != INVALID_FILE_ATTRIBUTES && (g_root & FILE_ATTRIBUTE_DIRECTORY) != 0,
+              "G:\\ is the package root");
+        check(contains(list(first_w, next_w, find_close, L"G:\\*"), L"drive"), "G:\\ lists the package");
+
+        // A write on G: is a write to the package volume: it lands in the overlay, as GAME: writes do.
+        DWORD written = 0;
+        h = create_w(L"G:\\drive\\written.txt", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE, "CreateFileW creates a file on G:");
+        if (h != INVALID_HANDLE_VALUE) {
+            ::WriteFile(h, "g-write", 7, &written, nullptr);
+            ::CloseHandle(h);
+        }
+        check(read_path(overlay / "drive" / "written.txt") == "g-write" &&
+                  !std::filesystem::exists(package / "drive" / "written.txt"),
+              "a G: write lands in the overlay, not the package");
+
+        // T: is the writable scratch drive: it maps to the overlay only and never falls back to the package.
+        h = create_w(L"T:\\scratch.txt", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE, "CreateFileW creates a file on T:");
+        if (h != INVALID_HANDLE_VALUE) {
+            ::WriteFile(h, "scratch", 7, &written, nullptr);
+            ::CloseHandle(h);
+        }
+        check(read_path(overlay / "scratch.txt") == "scratch", "a T: write lands at the overlay root");
+        h = create_w(L"t:/scratch.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE && read_handle(h) == "scratch",
+              "T: is case-insensitive and accepts forward slashes");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(contains(list(first_w, next_w, find_close, L"T:\\*"), L"scratch.txt"), "T:\\ lists the overlay");
+        SetLastError(0);
+        check(attributes_w(L"T:\\drive_only.txt") == INVALID_FILE_ATTRIBUTES, "T: does not read the package");
+        check(delete_w(L"T:\\scratch.txt") != FALSE && !std::filesystem::exists(overlay / "scratch.txt"),
+              "DeleteFileW removes a T: file from the overlay");
+
+        check(copy_w(L"G:\\drive\\pkg.txt", L"T:\\copy_from_pkg.txt", TRUE) != FALSE &&
+                  read_path(overlay / "copy_from_pkg.txt") == "package-drive",
+              "CopyFileW writes a G: source to T: in the overlay");
+        check(copy_w(L"T:\\copy_from_pkg.txt", L"G:\\drive\\from_t.txt", FALSE) != FALSE &&
+                  read_path(overlay / "drive" / "from_t.txt") == "package-drive",
+              "CopyFileW writes a T: source to G: in the overlay");
+        check(setattr_w(L"T:\\copy_from_pkg.txt", FILE_ATTRIBUTE_READONLY) != FALSE &&
+                  (attributes_w(L"T:\\copy_from_pkg.txt") & FILE_ATTRIBUTE_READONLY) != 0,
+              "SetFileAttributesW sets attributes on a T: file");
+
+        // G: is the same volume as GAME:, so a delete hides the package name and leaves the package in place.
+        check(delete_w(L"G:\\drive_only.txt") != FALSE, "DeleteFileW accepts a G: package file");
+        check(std::filesystem::exists(package / "drive_only.txt"), "the package file survives a G: delete");
+        SetLastError(0);
+        check(attributes_w(L"G:\\drive_only.txt") == INVALID_FILE_ATTRIBUTES &&
+                  GetLastError() == ERROR_FILE_NOT_FOUND,
+              "the deleted G: name no longer resolves");
+
+        check(mkdir_w(L"T:\\tdir", nullptr) != FALSE && std::filesystem::is_directory(overlay / "tdir"),
+              "CreateDirectoryW makes a T: folder in the overlay");
+        check(rmdir_w(L"T:\\tdir") != FALSE && !std::filesystem::exists(overlay / "tdir"),
+              "RemoveDirectoryW removes a T: folder");
+        check(mkdir_w(L"G:\\gdir", nullptr) != FALSE && std::filesystem::is_directory(overlay / "gdir") &&
+                  !std::filesystem::exists(package / "gdir"),
+              "CreateDirectoryW makes a G: folder in the overlay");
+        check(rmdir_w(L"G:\\gdir") != FALSE, "RemoveDirectoryW removes a G: folder");
+
+        // The package and scratch are different volumes, as they are on the console.
+        write_path(package / "drive" / "move.txt", "move");
+        SetLastError(0);
+        check(move_w(L"G:\\drive\\move.txt", L"T:\\move.txt") == FALSE && GetLastError() == ERROR_NOT_SAME_DEVICE,
+              "G: and T: are different volumes for MoveFileW");
+    }
+
+    // A host G: drive, when the machine has a free G: to map, must not be what G:\ names. subst is per-session and
+    // needs no administrator rights; a G: already in use is skipped.
+    {
+        const bool g_free = (GetLogicalDrives() & (1u << ('G' - L'A'))) == 0;
+        const std::filesystem::path host_g = root / "host_g";
+        bool substituted = false;
+        if (g_free) {
+            write_path(host_g / "decoy.txt", "host");
+            const std::wstring command = L"subst G: \"" + host_g.wstring() + L"\"";
+            substituted = _wsystem(command.c_str()) == 0;
+        }
+        if (substituted) {
+            check(::GetFileAttributesW(L"G:\\decoy.txt") != INVALID_FILE_ATTRIBUTES,
+                  "the host G: drive holds the decoy before the shim is asked");
+            SetLastError(0);
+            check(attributes_w(L"G:\\decoy.txt") == INVALID_FILE_ATTRIBUTES,
+                  "G:\\decoy.txt does not reach the host G: drive");
+            check(read_path(host_g / "decoy.txt") == "host", "the host G: decoy is untouched");
+            _wsystem(L"subst G: /D");
+        } else {
+            std::printf("SKIP host G: drive decoy (G: is in use or subst failed)\n");
+        }
+    }
+
+    // Paths that are not console drives stay host paths.
+    {
+        const std::filesystem::path plain = root / "host_plain.txt";
+        write_path(plain, "host");
+        check(read_path(plain) == "host" && attributes_w(plain.c_str()) != INVALID_FILE_ATTRIBUTES,
+              "an ordinary host path is unchanged");
+        const std::filesystem::path extended = L"\\\\?\\" + plain.wstring();
+        check(attributes_w(extended.c_str()) != INVALID_FILE_ATTRIBUTES,
+              "an extended-length host path is unchanged");
+
+        write_path(package / "other_drive_probe.txt", "package");
+        const wchar_t other = free_drive_letter();
+        if (other) {
+            const std::wstring path = std::wstring(1, other) + L":\\other_drive_probe.txt";
+            SetLastError(0);
+            check(attributes_w(path.c_str()) == INVALID_FILE_ATTRIBUTES,
+                  "another drive letter does not resolve under the package");
+        }
+        write_path(package / "drive_relative_probe.txt", "package");
+        SetLastError(0);
+        check(attributes_w(L"G:drive_relative_probe.txt") == INVALID_FILE_ATTRIBUTES,
+              "a drive-relative G: path is not G:\\");
+    }
 
     write_path(package / "misc" / "one.txt", "one");
     write_path(package / "misc" / "two.txt", "two");
@@ -533,6 +674,29 @@ int main() {
         check(first_w(L"GAME:\\data\\*", nullptr) == INVALID_HANDLE_VALUE &&
                   GetLastError() == ERROR_INVALID_PARAMETER,
               "a null listing buffer is refused");
+    }
+
+    // The drive forms keep the same containment: a mapped path cannot climb above its root or name another drive.
+    {
+        SetLastError(0);
+        const HANDLE g_escape =
+            create_w(L"G:\\..\\g_escape.txt", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        check(g_escape == INVALID_HANDLE_VALUE && GetLastError() == ERROR_INVALID_NAME, "a path above G: is refused");
+        if (g_escape != INVALID_HANDLE_VALUE) ::CloseHandle(g_escape);
+        SetLastError(0);
+        const HANDLE t_escape =
+            create_w(L"T:\\..\\t_escape.txt", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        check(t_escape == INVALID_HANDLE_VALUE && GetLastError() == ERROR_INVALID_NAME, "a path above T: is refused");
+        if (t_escape != INVALID_HANDLE_VALUE) ::CloseHandle(t_escape);
+        check(!std::filesystem::exists(root / "g_escape.txt") && !std::filesystem::exists(root / "t_escape.txt"),
+              "nothing was created outside the mapped roots");
+        SetLastError(0);
+        check(attributes_w(L"G:\\drive\\..\\..\\x") == INVALID_FILE_ATTRIBUTES &&
+                  GetLastError() == ERROR_INVALID_NAME,
+              "a G: path that climbs above the package is refused");
+        SetLastError(0);
+        check(attributes_w(L"T:\\C:\\x") == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_INVALID_NAME,
+              "a drive inside T: is refused");
     }
 
     // CreateFile2 and FindFirstFileExA/W (used by GDK/OneCore titles and std::filesystem).
