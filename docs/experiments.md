@@ -1002,6 +1002,36 @@ A local scan of 2,689 compute records accepted 12 records (10 distinct instructi
 
 ## Two-table depth-only pixel shaders
 
+### Coverage-only texture sampling
+
+`tools/sampled_coverage_aot.py` translates a two-exit PS which selects a texture
+through a buffer word, samples an interpolated UV and compares the scaled sample
+with a threshold. Both exits export only coverage. The selector, table pointers
+and point-clamp sampler are specialized for a supplied snapshot. The texture
+and two comparison inputs remain GPU resources. Changing the selector requires
+another translation. The tested inputs are finite and the textures have one mip.
+
+The JSON bindings used by the source-built fixture are constructed by
+`bindings(slot)` in `tests/sampled_coverage_check.py`. A descriptor entry lists
+the table's entry SGPR, its byte offset, the descriptor kind and its value.
+For a CB the value is a word offset into desktop b0. For a texture it selects
+t0 or t1. `words` supplies concrete entry SGPR values and `selector_byte`
+identifies the known word in the selector buffer.
+
+```sh
+python3 -B tools/sampled_coverage_aot.py local.dxbc --bindings snapshot.json --llvm libLLVM-15.so.1 --output out/coverage.hlsl
+python3 -B tests/sampled_coverage_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+ctest --preset dev --no-tests=error -R '^sampled_coverage_' -V
+```
+
+The Windows fixture measures a complete triangle with a D3D12 occlusion query,
+then checks all 64 pixel locations with individual scissored draws. The color
+target must retain its clear value. It exercises both bound textures, mixed
+coverage, full survival and full rejection. A reference computed for the
+opposite texture must fail at the sample comparison.
+
+### Buffered depth export
+
 `tools/depth_mask_aot.py` follows the two entry table pointers through scalar
 moves, four-word descriptor loads and completed constant-buffer reads. Supply the
 two `--table SGPR BYTE_OFFSET` pairs in desktop b0, b1 order. The destination
