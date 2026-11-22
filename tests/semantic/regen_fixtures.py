@@ -26,6 +26,7 @@ SHADERS = ("cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_bu
            "ps_f32_mods", "ps_f64_mods", "ps_sff_imm", "cs_w32_lds_u8_d16", "cs_w32_lane_wrap", "ps_bary",
            "cs_oob_select", "cs_oob_tail", "cs_w32_mask_imm", "cs_w64_mask_imm",
            "cs_w32_getreg_mode",   # s_getreg_b32 of MODE.FP_ROUND (test_value_semantics.GetregMode)
+           "cs_w32_setreg_sgpr",   # s_setreg_b32 of MODE.FP_ROUND from an SGPR (test_value_semantics.SetregFromSgpr)
            "cs_buf_swizzle",   # swizzled MUBUF / ADD_TID (test_buffer_swizzle.py)
            "cs_tbuffer_store",                 # tbuffer_store_format_*, words measured natively on a Radeon 680M
            # TEST-175: GPU fixtures for the docs/design.md rules that were checked on the CPU only

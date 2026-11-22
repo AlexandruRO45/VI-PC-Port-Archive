@@ -759,5 +759,38 @@ class GetregMode(LaneMaskConstants):
                     support.translate_lines("ps_getreg", [line, "exp mrt0 v0, v0, v0, v0 done vm", "s_endpgm"])
 
 
+
+class SetregFromSgpr(LaneMaskConstants):
+    """runtime/test/shaders/cs_w32_setreg_sgpr.asm: s_setreg_b32 of MODE.FP_ROUND from an SGPR, the save/restore pair
+    (s_getreg_b32 of a field, later s_setreg_b32 of the same field) and a constant SGPR, observed through the f16
+    rounding of v_cvt_f16_f32 and through s_getreg_b32. The words are the GPU check's; RDNA2 gfx1036 gave the same
+    words natively. Before, every s_setreg_b32 from a register raised Unsupported."""
+
+    WANT = {"cs_w32_setreg_sgpr": (32, [15361, 15360, 3, 15360, 12, 15361, 0, 5])}
+    OLD = {"cs_w32_setreg_sgpr": None}
+
+    def test_words_follow_from_the_masks(self):
+        # Plain-Python reference: 1 + 0.75 * 2^-10 to f16 is 0x3c01 to nearest even, 0x3c00 toward zero (FP_ROUND[3:2]
+        # = 3); a restore gives back the saved field, a constant 0 gives nearest even.
+        x = 1 + 0.75 * 2 ** -10
+        rne = 0x3C00 + round((x - 1) * 2 ** 10)
+        rtz = 0x3C00 + int((x - 1) * 2 ** 10)
+        want = [rne, rtz, 3, rtz, 3 << 2, rne, 0, 5]
+        self.assertEqual(want, self.WANT["cs_w32_setreg_sgpr"][1])
+
+    def test_other_register_sources_are_refused(self):
+        import rdna2spirv
+        for lines, msg in ((["v_readfirstlane_b32 s6, v0", "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s6"], "neither a constant"),
+                           (["s_getreg_b32 s6, hwreg(HW_REG_MODE, 2, 2)", "s_add_u32 s6, s6, 0",
+                             "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s6"], "neither a constant"),
+                           (["s_getreg_b32 s6, hwreg(HW_REG_MODE, 2, 2)", "s_setreg_b32 hwreg(HW_REG_MODE, 0, 4), s6"],
+                            "neither a constant"),
+                           (["s_mov_b32 s6, 1", "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s6"], "directed rounding"),
+                           (["s_mov_b32 s6, 0xd", "s_setreg_b32 hwreg(HW_REG_MODE, 0, 4), s6"], "f32 rounding")):
+            with self.subTest(lines=lines):
+                with self.assertRaisesRegex(rdna2spirv.Unsupported, msg):
+                    support.translate_lines("ps_setreg", lines + ["exp mrt0 v0, v0, v0, v0 done vm", "s_endpgm"])
+
+
 if __name__ == "__main__":
     unittest.main()

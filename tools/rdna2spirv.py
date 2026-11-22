@@ -260,6 +260,7 @@ class Gen:
         self.tbuffer_norm_fns: dict[int, list[str]] = {}  # one exact quotient per used magnitude width
         self.fmt_fn = None    # lines of the typed-buffer format-decode function, once a dynamic-format load needs it
         self.sgpr_imm = {}    # SGPR -> literal an s_mov_b32 put there earlier in this basic block (see gather_addr_modes)
+        self.sgpr_mode = {}   # SGPR -> (offset, size) of the MODE field an s_getreg_b32 put there earlier in this block
         self.desc_cache = {}  # (first SGPR, dwords) -> id of the %desc_lookup_fn result in the current basic block
         self._scan = (None, 0, [])   # (body list, lines already seen, open merge labels): see desc_cache_ok
         self.block_label = "%entry"   # label of the SPIR-V block the current instruction starts in
@@ -295,6 +296,7 @@ class Gen:
     def store_reg(self, kind, r, val):
         if kind == "sgpr":
             self.sgpr_imm.pop(r, None)
+            self.sgpr_mode.pop(r, None)
             self.x_tok[("sgpr", r)] = val
             if self.desc_cache:          # every write to the %sgpr array comes through here (see desc_lookup_sgpr)
                 self.desc_cache = {k: v for k, v in self.desc_cache.items() if not (k[0] <= r < k[0] + k[1])}
@@ -724,19 +726,40 @@ class Gen:
 
     def mode_write(self, op, a):
         """s_setreg* on HW_REG_MODE. Only FP_ROUND[3:2] (f16/f64 rounding) is modelled, the one MODE field the
-        corpus writes (9,417 writes: value 3 = toward zero 6,694, value 0 = nearest even 2,723). A write that
-        reaches another MODE bit or only part of the field, sets directed rounding (+inf/-inf), or takes its value
-        from an SGPR is refused, so nothing changes silently. Other hardware registers (FLAT_SCR, POPS packer) are not MODE: ignored."""
+        corpus writes (9,417 writes: value 3 = toward zero 6,694, value 0 = nearest even 2,723). The field written
+        is (S0 & ((1 << size) - 1)) << offset (measured on gfx1036, hunt6/hw_setreg.py). Accepted fields cover
+        FP_ROUND[3:2] whole and stay inside FP_ROUND[3:0]: (2, 2), (1, 3), (0, 4); the f32 bits they include must
+        be written 0 (f32 is always nearest even here). The value is an immediate, an SGPR holding a constant
+        (s_mov_b32 earlier in the block), or an SGPR that s_getreg_b32 of the same field filled earlier in the block
+        (a save/restore of FP_ROUND: the saved value can only hold what the translator tracks, so it is restored
+        at run time). Anything else (another MODE bit, directed rounding +inf/-inf, any other register value) is
+        refused, so nothing changes silently. Other hardware registers (FLAT_SCR, POPS packer) are not MODE: ignored."""
         t = a[0].get("t", "") if a and a[0]["k"] == "special" else ""
         m = re.match(r"hwreg\((\w+)(?:,\s*(\d+),\s*(\d+))?\)", t)
         if not m or m.group(1) != "HW_REG_MODE":
             return
         off, size = (int(m.group(2)), int(m.group(3))) if m.group(2) else (0, 32)
-        if (off, size) != (2, 2):
+        if off > 2 or off + size != 4:
             raise Unsupported(f"{op} on MODE bits {off}..{off + size - 1} (only FP_ROUND[3:2] as a whole is modelled)")
-        if op != "s_setreg_imm32_b32" or a[1]["k"] != "imm":
-            raise Unsupported(f"{op} with a register value on MODE.FP_ROUND")
-        new = a[1]["v"] & 3
+        src, val = a[1], None
+        if op == "s_setreg_imm32_b32" and src["k"] == "imm":
+            val = src["v"]
+        elif op == "s_setreg_b32" and src["k"] == "sgpr" and src.get("n", 1) == 1:
+            val = self.sgpr_imm.get(src["r"])
+            if val is None and self.sgpr_mode.get(src["r"]) == (off, size):
+                # Restore of a value s_getreg_b32 saved from this very field: FP_ROUND[3:2] = its top two bits.
+                v, sh, r16 = self.load_reg("sgpr", src["r"]), self.tmp(), self.tmp()
+                self.emit(f"{sh} = OpShiftRightLogical %uint {v} {self.cu(2 - off)}")
+                self.emit(f"{r16} = OpBitwiseAnd %uint {sh} {self.cu(3)}")
+                self.emit(f"OpStore %mode_r16 {r16}")
+                return
+        if val is None:
+            raise Unsupported(f"{op} on MODE.FP_ROUND from a register that is neither a constant nor a value "
+                              "s_getreg_b32 saved from the same field")
+        bits = ((val & 0xFFFFFFFF) & ((1 << size) - 1)) << off
+        if bits & 3:
+            raise Unsupported(f"{op}: MODE.FP_ROUND[1:0] (f32 rounding) other than nearest even")
+        new = bits >> 2
         if new in (1, 2):
             raise Unsupported("MODE.FP_ROUND[3:2] directed rounding (+inf/-inf)")
         self.emit(f"OpStore %mode_r16 {self.cu(new)}")
@@ -768,6 +791,7 @@ class Gen:
         else:
             val = self.cu(0)          # no MODE write in the program: FP_ROUND stays 0 (nearest even)
         self.dst(a[0], val)
+        self.sgpr_mode[a[0]["r"]] = (off, size)     # for a later s_setreg_b32 restore of the same field
 
     def emit_ne0(self, v):
         r = self.tmp()
@@ -3309,6 +3333,7 @@ class Gen:
         self.x_marks.append((len(self.body), seg))
         self.desc_cache.clear()
         self.sgpr_imm.clear()
+        self.sgpr_mode.clear()
         self.block_label = f"%blk{seg}"
         self.x_dirty = set()
 
@@ -11966,6 +11991,7 @@ def translate(path):
         g.x_gen += 1
         g.desc_cache.clear()            # a cached lookup is only good inside the block that made it
         g.sgpr_imm.clear()
+        g.sgpr_mode.clear()
         term = None
         for ins in blk:
             op = base_op(ins["op"])
