@@ -204,7 +204,16 @@ def run(spvasm):
         "OpIEqual": lambda a, b: a == b, "OpINotEqual": lambda a, b: a != b,
     }
 
-    F64 = {"OpFAdd": lambda a, b: a + b, "OpFSub": lambda a, b: a - b, "OpFMul": lambda a, b: a * b}
+    def div64(a, b):
+        """IEEE binary64 division: x / +-0 is a signed infinity (NaN for 0 / 0 or a NaN operand)."""
+        if b:
+            return a / b
+        if a == 0 or math.isnan(a) or math.isnan(b):
+            return math.nan
+        return math.copysign(math.inf, a) * math.copysign(1.0, b)
+
+    F64 = {"OpFAdd": lambda a, b: a + b, "OpFSub": lambda a, b: a - b, "OpFMul": lambda a, b: a * b,
+           "OpFDiv": div64}
 
     def float_bits(rt):
         t = types.get(rt)
@@ -230,8 +239,17 @@ def run(spvasm):
         rounding = {"Floor": math.floor, "Ceil": math.ceil, "Trunc": math.trunc, "RoundEven": round}
         if fn in rounding:      # a zero result keeps the sign of the operand (IEEE 754; RDNA2 and Vulkan GPUs do)
             return a[0] if math.isnan(a[0]) or math.isinf(a[0]) else math.copysign(float(rounding[fn](a[0])), a[0])
+        def sqrt(x):        # IEEE: sqrt of a negative is NaN (math.sqrt raises), sqrt(-0) is -0
+            return math.nan if x < 0 else math.sqrt(x)
+
+        def inverse_sqrt(x):    # 1 / sqrt(x): +-0 gives +-inf, a negative operand NaN
+            if x == 0:
+                return math.copysign(math.inf, x)
+            r = sqrt(x)
+            return r if math.isnan(r) else 1 / r
+
         simple = {"FMin": min, "FMax": max, "FAbs": abs, "Sin": math.sin, "Cos": math.cos,
-                  "Sqrt": math.sqrt, "InverseSqrt": lambda x: 1 / math.sqrt(x), "Exp2": lambda x: 2.0 ** x,
+                  "Sqrt": sqrt, "InverseSqrt": inverse_sqrt, "Exp2": lambda x: 2.0 ** x,
                   "Log2": math.log2}
         if fn in ("NMin", "NMax"):
             # A NaN operand gives the other operand (both NaN: a NaN); zeros ordered -0 < +0 as on RDNA2.
@@ -318,6 +336,9 @@ def run(spvasm):
             val[res] = (get(args[1]) >> get(args[2])) & ((1 << get(args[3])) - 1)
         elif op == "OpBitCount":
             val[res] = bin(get(args[1]) & M32).count("1")
+        elif op == "OpFConvert":
+            x = get(args[1])
+            val[res] = f32(x) if float_bits(args[0]) == 32 else float(x)      # binary64 -> binary32 rounds to nearest even
         elif op == "OpConvertUToF":
             val[res] = f32(float(get(args[1])))
         elif op == "OpConvertSToF":
